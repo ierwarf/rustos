@@ -8,6 +8,13 @@ use super::*;
 
 const ACTIVE_BALANCE_INTERVAL_OPPORTUNITIES: u8 = 8;
 
+/// The custody conservation check (`runqueue::conservation`) for the periodic
+/// timer/RTC scheduler entry: lock-free, one relaxed load when not due, a full
+/// pass every 256 ticks on one CPU at a time. Report-only; never repairs.
+pub(in crate::multitask) fn custody_conservation_scan(now_ticks: u64) {
+    runqueue::conservation::scan(now_ticks);
+}
+
 /// Notification only; the caller retains the original lifecycle owner.
 pub(super) fn request_owner_reschedule(slot: usize) {
     #[cfg(not(test))]
@@ -206,19 +213,40 @@ pub(super) const fn fallback_slot_for(
     }
 }
 
-/// How many times a dispatch fell back to idle because the current slot had
-/// lost custody, and whether any has happened at all this window.
-static FALLBACK_IDLE_DISPATCHES: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0);
+/// How many dispatches fell back to idle because neither a selected task nor
+/// the outgoing one could be claimed (the outgoing task blocked or lost its
+/// custody and nothing else was runnable here), per CPU.
+///
+/// One monotonic counter per CPU, written only by that CPU's dispatcher: a
+/// load and a store on a CPU-private line. It used to be one global
+/// `fetch_add`, a locked RMW bouncing one cache line between every CPU on
+/// each dispatch to idle. The window drain (one drainer at a time: it holds
+/// the runtime-profile window token) subtracts its own previous reading.
+type CpuCounters = [nucleus_core::util::cache_padded::CachePadded<core::sync::atomic::AtomicU64>;
+    nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
+static FALLBACK_IDLE_DISPATCHES: CpuCounters =
+    [const { nucleus_core::util::cache_padded::CachePadded::new(core::sync::atomic::AtomicU64::new(0)) };
+        nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
+static FALLBACK_IDLE_DRAINED: [core::sync::atomic::AtomicU64; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 
-pub(super) fn latch_fallback_idle_dispatch() {
-    // ORDERING: Relaxed; a diagnostic counter drained once per profile window.
-    FALLBACK_IDLE_DISPATCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+pub(super) fn latch_fallback_idle_dispatch(cpu: usize) {
+    if let Some(count) = FALLBACK_IDLE_DISPATCHES.get(cpu) {
+        // ORDERING: Relaxed; single-writer diagnostic counter.
+        count.store(count.load(core::sync::atomic::Ordering::Relaxed).wrapping_add(1),
+            core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
-/// Takes the window's idle-fallback count, clearing it for the next window.
+/// Takes the window's idle-fallback count over all CPUs.
 pub(in crate::multitask) fn take_fallback_idle_dispatch_window() -> u64 {
-    FALLBACK_IDLE_DISPATCHES.swap(0, core::sync::atomic::Ordering::Relaxed)
+    FALLBACK_IDLE_DISPATCHES.iter().zip(&FALLBACK_IDLE_DRAINED).fold(0, |total, (count, drained)| {
+        // ORDERING: Relaxed; diagnostic, drained by one window owner at a time.
+        let now = count.load(core::sync::atomic::Ordering::Relaxed);
+        let delta = now.wrapping_sub(drained.load(core::sync::atomic::Ordering::Relaxed));
+        drained.store(now, core::sync::atomic::Ordering::Relaxed);
+        total.wrapping_add(delta)
+    })
 }
 
 

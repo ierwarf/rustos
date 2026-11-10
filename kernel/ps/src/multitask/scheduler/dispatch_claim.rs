@@ -369,7 +369,7 @@ pub(super) fn claim_fallback(turn: &CpuDispatchTurn<'static>, idle_slot: usize, 
         funded.claim(),
         "idle fallback lost exact frame/placement/queue custody"
     );
-    super::runqueue_policy::latch_fallback_idle_dispatch();
+    super::runqueue_policy::latch_fallback_idle_dispatch(cpu);
     idle_slot
 }
 

@@ -2,20 +2,20 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `5062c0a7746fe083c5e99b9eaf0c76e4bbec9885fdf2b203825422155f4f55a1`
-- Models: `156`
-- Whole flows: `81`
-- Transitions: `1004`
+- Registry SHA-256: `b3edb76f942f9d9dd776cdd86c300c4c30271e15ab73d6da1d227e8dd2e30265`
+- Models: `157`
+- Whole flows: `82`
+- Transitions: `1011`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `1501`
+- Exact source witnesses: `1511`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
 - Intentional-terminal exceptions: `87` (ceiling `87`)
-- Cyclic strongly connected components: `56`
-- Supporting model bindings: `134`
+- Cyclic strongly connected components: `57`
+- Supporting model bindings: `135`
 - Explicit critical/high risk surfaces: `252`
-- Additional source mappings: `388`
+- Additional source mappings: `389`
 
 | Flow | Severity | Owners | Models | Requirements | Hazards | Sinks |
 | --- | --- | --- | --- | ---: | ---: | --- |
@@ -83,6 +83,7 @@
 | `scheduler-lifecycle` | `critical` | kernel-compat, kernel-hal, kernel-ps | scheduler-terminal-claim/SchedulerTerminalClaim, scheduler-wakeup/SchedulerWakeup, task-retirement-cleanup-owner/TaskRetirementCleanupOwner | 22 | 22 | cleanup-acked |
 | `scheduler-owner-word` | `critical` | kernel-ps | scheduler-owner-word/SchedulerOwnerWord | 7 | 7 | dormant, withdrawn |
 | `scheduler-resident-cell` | `critical` | kernel-ps | scheduler-resident-cell/SchedulerResidentCell | 6 | 6 | evicted, released, resumed |
+| `scheduler-terminal-producer` | `critical` | kernel-ps | scheduler-terminal-producer/SchedulerTerminalProducer | 7 | 7 | published |
 | `service-bootstrap` | `critical` | initd, kernel-compat, rootd | service-bootstrap-lifecycle/ServiceBootstrapLifecycle | 10 | 10 | denied, entry-rejected, ready |
 | `service-call-authority` | `critical` | kernel-compat, kernel-ipc-runtime | service-call-authority/ServiceCallAuthority | 6 | 6 | admitted, cleared, denied, stale |
 | `service-heap-lifecycle` | `critical` | rootd, svc-runtime, syscalld, xtask-kvm | service-heap-lifecycle/ServiceHeapLifecycle | 12 | 12 | failed |

@@ -136,7 +136,8 @@ pub(in crate::multitask::scheduler) fn actual_peer_exec_publishes_owned_frame_me
             (0x55, 0, 0)
         );
         assert!(
-            stack_resources::context::lease_execution_root(slot, ROOT, turn.cpu()).is_none(),
+            !stack_resources::frame_readers::with_claim_activation(slot, turn.cpu(), || ())
+                .is_some_and(|attempt| attempt.is_claimed()),
             "exec image admitted a new execution root before image release"
         );
         // The common driver finalizes using this exact once-only publication.

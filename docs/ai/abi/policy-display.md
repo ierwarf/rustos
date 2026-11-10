@@ -241,6 +241,12 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
   `cpusetsize`, forged owner, empty effective mask, stale version, count
   mismatch, or task mask outside Online fails closed. Returning the whole
   Online mask for a pinned thread or fabricating CPU zero is forbidden.
+  After the Online intersection, ring0 refuses (`EINVAL`) rather than
+  intersects a mask with a CPU outside the target's process mask or, for a
+  task with a budgeted scheduling context, outside that context's `cpu_mask`:
+  the scheduler cannot fund the task on such a CPU, so admitting it would
+  leave the task runnable where it never runs. rootd's current manifests use
+  an all-CPU `cpu_mask`, so this refusal is not reachable with them.
 - Linux futex WAIT and WAIT_BITSET accept validated relative/absolute timeout
   timespecs and block on the RTC waiter substrate; timeout-bearing futex calls
   must not return `ENOSYS` or spin in libc retry loops. Any waiter table read by
@@ -316,7 +322,9 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
   `GetProcessAffinityMask` returns the scheduler-owned process mask and exact
   Online system mask; `SetProcessAffinityMask` atomically updates every live
   thread in the current process; `SetThreadAffinityMask` returns the previous
-  nonzero mask and rejects escape from the process mask; and
+  nonzero mask and rejects escape from the process mask; both refuse a mask
+  outside a budgeted thread's scheduling-context `cpu_mask` (as for Linux
+  `sched_setaffinity` above); and
   `GetCurrentProcessorNumber` returns the dense logical CPU that executes the
   syscall return path. The private ntdll transport normalizes NTSTATUS failures
   before kernelbase applies Win32 BOOL/zero/previous-mask semantics. Other

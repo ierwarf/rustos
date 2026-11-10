@@ -165,3 +165,59 @@ fn competing_disjoint_cohorts_cannot_overflow_one_cpu_priority_queue_after_same_
     assert_eq!(policy.atomic_activation_pick_hints.len(), CAP);
     assert_eq!(policy.atomic_activation_handoff_remaining, CAP);
 }
+
+/// An activation (or spawn) first-turn record is ordering metadata for a task
+/// queued on THIS CPU. Once that task has left the queue (it ran elsewhere
+/// first, was pulled by an idle CPU, or ran here before the record landed and
+/// then blocked), the record named a task no frame token on this CPU can ever
+/// match, the first-turn arm answered `Incomplete` without consuming it, and
+/// every later dispatch on the CPU fell back to idle until the task happened to
+/// be queued here again: a CPU-wide stall of every other queued task (the
+/// "new task never runs" boot family). The stale record must be consumed and
+/// dispatch must continue to the remaining policy.
+#[test]
+fn a_first_turn_record_for_a_task_no_longer_queued_here_never_idles_the_cpu() {
+    use super::super::{dispatch_policy, dispatcher, frame_publication, irq_entry_tests,
+        local_dispatch::policy_witnesses, runqueue};
+    for atomic in [false, true] {
+        policy_witnesses::family(|_root, first, second| {
+            let id = identity::read_dispatch(first).unwrap().task_id.unwrap();
+            let weight = runqueue::weight::value(first);
+            // Earlier complete transition: the hinted task ran and blocked.
+            runqueue::wait::set_blocked(first, true);
+            runqueue::publish_blocked(first, 0, weight);
+            frame_publication::bind_local_owner_generation(first, runqueue::owner(first).generation);
+            assert!(frame_publication::local_frame_token(first, 0).is_none());
+            let record = super::super::handoff_queue::FirstTurnHandoff { slot: first, task_id: id };
+            {
+                let mut policy = dispatch_policy::lock(0);
+                if atomic {
+                    assert!(enqueue_priority(&mut policy, record));
+                    dispatch_policy::publish_atomic_activation_pending(0);
+                } else {
+                    assert!(policy.spawn_pick_hints.enqueue(record).unwrap());
+                }
+            }
+            let entry = crate::multitask::cpu_local::irq_entry::DispatchEntry::from_scope(
+                irq_entry_tests::scope(),
+            );
+            entry.turn().begin_priority_choice();
+            let ticks = crate::arch::rtc::ticks_per_second().max(1).saturating_mul(2);
+            // Before the fix this panicked with "actual policy observation
+            // incomplete": production would have dispatched idle instead.
+            let chosen = dispatcher::test_policy_choice(entry.turn(), ticks);
+            assert!(chosen.is_some() && chosen != Some(first), "chosen={chosen:?}");
+            {
+                let policy = dispatch_policy::lock(0);
+                assert!(policy.spawn_pick_hints.is_empty());
+                assert!(policy.atomic_activation_pick_hints.is_empty());
+                assert_eq!(policy.atomic_activation_handoff_remaining, 0);
+            }
+            assert!(!dispatch_policy::atomic_activation_pending(0));
+            let _ = second;
+            runqueue::wait::set_blocked(first, false);
+            let _ = runqueue::publish_local_wake(first, 0, weight);
+            frame_publication::bind_local_owner_generation(first, runqueue::owner(first).generation);
+        });
+    }
+}

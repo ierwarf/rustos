@@ -64,42 +64,29 @@ pub(in crate::multitask::scheduler) fn publish_local_wake(
     super::return_publication::publish_blocked_wake(slot, cpu, weight)
 }
 
-/// Exact scalar handoff CAS. The caller owns the ORIGINAL receiver binding,
-/// reader and typed wait phase; this helper never retries a newer observation.
-/// FIFO56 -> Wait58 encloses the CAS, and both leaves end before mailbox work.
-pub(in crate::multitask::scheduler) fn claim_blocked_handoff(
+/// Exact scalar handoff CAS returning the enqueue duty it creates (I1). The
+/// caller owns the ORIGINAL receiver binding, reader and typed wait phase; this
+/// never retries a newer observation. FIFO56 -> Wait58 encloses the CAS, and
+/// both leaves end before mailbox work. The duty is a
+/// `HandoffFifo` duty for a same-CPU receiver (discharged by the FIFO publisher
+/// with `handoff_recorded`, or carried by a `DirectSwitch`) or a `Mailbox` duty
+/// for a remote one (discharged by `EnqueueDuty::publish_mailbox`).
+pub(in crate::multitask::scheduler) fn claim_blocked_handoff_duty(
     slot: usize,
     expected: RunOwnerSnapshot,
     cpu: usize,
     local: bool,
-) -> Option<RunOwnerSnapshot> {
+) -> Option<(RunOwnerSnapshot, EnqueueDuty)> {
     validate_cpu(cpu);
     if expected.state != RunOwnerState::Blocked || expected.wait_armed {
         return None;
     }
-    let state = if local { RunOwnerState::DirectHandoff } else { RunOwnerState::RemoteQueued };
-    let next = expected.next_preserving_wait(state, Some(cpu));
-    OWNER_WORDS[slot].compare_exchange(expected, next).ok()?;
+    let event = if local { OwnerEvent::HandoffDirect } else { OwnerEvent::HandoffRemote };
+    let committed = transition(slot, expected, event, Some(cpu)).ok()?;
+    let next = committed.next;
     // Receipt of this CAS plus the enclosing typed clear, NOT a fresh owner
     // lookup. Terminal cancellation can subsequently make the FIFO token stale.
-    Some(next.with_wait(false, 0).with_runnable(true))
-}
-
-/// Publish only the mailbox record belonging to the original successful CAS.
-/// A retained physical reader excludes execution until this publication ends.
-pub(in crate::multitask::scheduler) fn publish_handoff_mailbox(
-    slot: usize,
-    original: RunOwnerSnapshot,
-    weight: u32,
-) -> bool {
-    assert_eq!(original.state, RunOwnerState::RemoteQueued);
-    let cpu = original.cpu.expect("original remote handoff lost target");
-    REMOTE_WAKE_MAILBOXES[cpu].lock().publish(RunTransfer {
-        slot,
-        generation: original.generation,
-        weight,
-    });
-    MAILBOX_PENDING[cpu].compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    Some((next.with_wait(false, 0).with_runnable(true), committed.into_duty()))
 }
 
 /// Transfers a blocked task directly to the current CPU's synchronous IPC
@@ -122,8 +109,10 @@ pub(in crate::multitask::scheduler) fn publish_direct_handoff(
         if owner.state != RunOwnerState::Blocked {
             return RemoteWakeOutcome::Rejected;
         }
-        let next = owner.next_preserving_wait(RunOwnerState::DirectHandoff, Some(cpu));
-        if OWNER_WORDS[slot].compare_exchange(owner, next).is_ok() {
+        if let Ok(committed) = transition(slot, owner, OwnerEvent::HandoffDirect, Some(cpu)) {
+            let next = committed.next;
+            // Fixture: the caller publishes the matching FIFO record.
+            committed.into_duty().handoff_recorded();
             // Publish the exact direct generation only after the owner CAS.
             // A reader between the two steps rejects the stale frame token.
             frame_publication::bind_local_owner_generation(slot, next.generation);
@@ -157,36 +146,35 @@ pub(in crate::multitask::scheduler) fn materialize_direct_handoff_with_generatio
     if expected_generation.is_some_and(|generation| generation != observed.generation)
         || observed.state != RunOwnerState::DirectHandoff
         || observed.cpu != Some(cpu)
-        || !observed.runnable
     {
         return false;
     }
     let mut rq = RUN_QUEUES[cpu].inner.lock();
     // No other writer may gain new queue custody while this lock is held;
-    // the owner CAS nevertheless rechecks lock-free metadata writers.
-    loop {
+    // the owner CAS nevertheless rechecks lock-free metadata writers. Run
+    // intent cannot be withdrawn from a DirectHandoff word in place (see
+    // `RunOwnerState::may_lower_run_intent`), so only a custody change ends
+    // this consumed record's claim on the task: a metadata write retries.
+    let next = loop {
         rq.insert(slot, weight);
-        let next = observed.next(RunOwnerState::Local, Some(cpu));
-        match OWNER_WORDS[slot].compare_exchange(observed, next) {
-            Ok(()) => break,
+        match transition(slot, observed, OwnerEvent::Materialize, Some(cpu)) {
+            Ok(committed) => {
+                let next = committed.next;
+                committed.into_duty().run_queue_inserted(&rq);
+                break next;
+            }
             Err(winner) => {
                 rq.remove(slot, weight);
                 RUN_QUEUES[cpu].publish_load(&rq);
-                // A run-intent or wait-metadata write of the SAME custody
-                // must not strand a consumed handoff record outside every
-                // queue: retry against the fresh word. A custody change or a
-                // withdrawn run intent ends this record's claim on the task.
                 if winner.generation != observed.generation
                     || winner.state != RunOwnerState::DirectHandoff
-                    || !winner.runnable
                 {
                     return false;
                 }
                 observed = winner;
             }
         }
-    }
-    let next = observed.next(RunOwnerState::Local, Some(cpu));
+    };
     frame_publication::bind_local_owner_generation(slot, next.generation);
     RUN_QUEUES[cpu].publish_load(&rq);
     true
@@ -202,11 +190,8 @@ pub(in crate::multitask::scheduler) fn rollback_direct_handoff(slot: usize, cpu:
     if owner.state != RunOwnerState::DirectHandoff || owner.cpu != Some(cpu) || !owner.runnable {
         return false;
     }
-    OWNER_WORDS[slot]
-        .compare_exchange(
-            owner,
-            owner.next_preserving_wait(RunOwnerState::Blocked, None),
-        )
+    transition(slot, owner, OwnerEvent::RollbackHandoff, None)
+        .map(Transition::settled)
         .is_ok()
 }
 
@@ -227,23 +212,10 @@ pub(in crate::multitask::scheduler) fn publish_remote_wake(
         if owner.state != RunOwnerState::Blocked {
             return RemoteWakeOutcome::Rejected;
         }
-        let next = owner.next_preserving_wait(RunOwnerState::RemoteQueued, Some(target_cpu));
-        if OWNER_WORDS[slot].compare_exchange(owner, next).is_err() {
+        let Ok(committed) = transition(slot, owner, OwnerEvent::WakeRemote, Some(target_cpu)) else {
             continue;
-        }
-        {
-            let mut mailbox = REMOTE_WAKE_MAILBOXES[target_cpu].lock();
-            mailbox.publish(RunTransfer {
-                slot,
-                generation: next.generation,
-                weight,
-            });
-        }
-        // ORDERING: the mailbox lock release publishes the record before this
-        // 0-to-1 edge grants notification custody to the winning producer.
-        let notify = MAILBOX_PENDING[target_cpu]
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
+        };
+        let notify = committed.into_duty().publish_mailbox(weight);
         return RemoteWakeOutcome::Published {
             cpu: target_cpu,
             notify,
@@ -299,7 +271,6 @@ pub(in crate::multitask::scheduler) fn drain_remote_wakes(cpu: usize) -> usize {
             );
         }
         rq.insert(record.slot, record.weight);
-        let next = observed.next(RunOwnerState::Local, Some(cpu));
         // Lock-free run-intent and wait writers may change metadata bits of
         // the `RemoteQueued` owner under this adoption; custody (state, CPU,
         // generation) can only end in a terminal withdrawal while the exact
@@ -313,25 +284,32 @@ pub(in crate::multitask::scheduler) fn drain_remote_wakes(cpu: usize) -> usize {
             retire(record.slot, record.weight);
         }
         let mut expected = observed;
-        let mut adopted = true;
-        while let Err(winner) = OWNER_WORDS[record.slot].compare_exchange(expected, next) {
-            if winner.state.is_terminal() || winner.generation > record.generation {
-                // A remote terminal withdrawal (possibly already released and
-                // the slot reused) took the task off its mailbox custody after
-                // the load above; it no longer needs the queue.
-                rq.remove(record.slot, record.weight);
-                adopted = false;
-                break;
+        let adopted = loop {
+            match transition(record.slot, expected, OwnerEvent::Adopt, Some(cpu)) {
+                Ok(committed) => {
+                    let next = committed.next;
+                    committed.into_duty().run_queue_inserted(&rq);
+                    break Some(next);
+                }
+                Err(winner) if winner.state.is_terminal() || winner.generation > record.generation => {
+                    // A remote terminal withdrawal (possibly already released and
+                    // the slot reused) took the task off its mailbox custody after
+                    // the load above; it no longer needs the queue.
+                    rq.remove(record.slot, record.weight);
+                    break None;
+                }
+                Err(winner) => {
+                    if winner.state != RunOwnerState::RemoteQueued
+                        || winner.cpu != Some(cpu)
+                        || winner.generation != record.generation
+                    {
+                        panic!("scheduler mailbox adoption lost owner race observed={winner:?}");
+                    }
+                    expected = winner;
+                }
             }
-            if winner.state != RunOwnerState::RemoteQueued
-                || winner.cpu != Some(cpu)
-                || winner.generation != record.generation
-            {
-                panic!("scheduler mailbox adoption lost owner race observed={winner:?}");
-            }
-            expected = winner;
-        }
-        if adopted {
+        };
+        if let Some(next) = adopted {
             frame_publication::bind_local_owner_generation(record.slot, next.generation);
         }
     }
@@ -358,14 +336,13 @@ pub(in crate::multitask::scheduler) fn rehome_queued_frame(
     }
     let mut source = RUN_QUEUES[source_cpu].inner.lock();
     if !source.contains(slot) || !frame.is_current() { return RemoteWakeOutcome::Rejected; }
-    let migrating = owner.next(RunOwnerState::Migrating, Some(target_cpu));
     let admitted = super::affinity_payload::with_rehome_admission(slot, target_cpu, None, || {
         // The original physical reader is still live here; this cannot spend
         // a replacement generation or wake a continuation that became blocked.
         if !frame.is_current() { return Err(super::owner(slot)); }
-        OWNER_WORDS[slot].compare_exchange(owner, migrating)
+        transition(slot, owner, OwnerEvent::Rehome, Some(target_cpu))
     });
-    if !matches!(admitted, Some(Ok(_))) { return RemoteWakeOutcome::Rejected; }
+    let Some(Ok(committed)) = admitted else { return RemoteWakeOutcome::Rejected; };
     // Read-only native witness observes the ACTUAL intermediate owner CAS,
     // not its repaired final mailbox target or the proposed descriptor.
     #[cfg(test)]
@@ -375,7 +352,7 @@ pub(in crate::multitask::scheduler) fn rehome_queued_frame(
     drop(source);
     #[cfg(test)]
     record_test_local_migrating_owner(transferred);
-    publish_migrating_record(slot, migrating, target_cpu, weight)
+    publish_migration(committed, weight)
 }
 
 #[cfg(test)]
@@ -429,26 +406,25 @@ fn rehome_queued_inner(
                         "scheduler rehome found Local owner without source membership slot={slot} cpu={source_cpu}"
                     );
                 }
-                let migrating = owner.next(RunOwnerState::Migrating, Some(target_cpu));
                 // Identity/cohort and live affinity qualify the SAME owner CAS.
                 // Ordinary source policy cannot spend a stale pre-seal target.
                 let admitted = super::affinity_payload::with_rehome_admission(
                     slot,
                     target_cpu,
                     custody,
-                    || OWNER_WORDS[slot].compare_exchange(owner, migrating),
+                    || transition(slot, owner, OwnerEvent::Rehome, Some(target_cpu)),
                 );
-                match admitted {
+                let committed = match admitted {
                     None => return RemoteWakeOutcome::Rejected,
                     Some(Err(_)) => continue,
-                    Some(Ok(_)) => {}
-                }
+                    Some(Ok(committed)) => committed,
+                };
                 source.remove(slot, weight);
                 #[cfg(test)]
-                record_test_local_migrating_owner(migrating);
+                record_test_local_migrating_owner(committed.next);
                 RUN_QUEUES[source_cpu].publish_load(&source);
                 drop(source);
-                return publish_migrating_record(slot, migrating, target_cpu, weight);
+                return publish_migration(committed, weight);
             }
             RunOwnerState::RemoteQueued | RunOwnerState::DirectHandoff => {
                 if owner.cpu == Some(target_cpu) {
@@ -456,18 +432,15 @@ fn rehome_queued_inner(
                         cpu: Some(target_cpu),
                     };
                 }
-                let migrating = owner.next(RunOwnerState::Migrating, Some(target_cpu));
                 match super::affinity_payload::with_rehome_admission(
                     slot,
                     target_cpu,
                     custody,
-                    || OWNER_WORDS[slot].compare_exchange(owner, migrating),
+                    || transition(slot, owner, OwnerEvent::Rehome, Some(target_cpu)),
                 ) {
                     None => return RemoteWakeOutcome::Rejected,
                     Some(Err(_)) => continue,
-                    Some(Ok(_)) => {
-                        return publish_migrating_record(slot, migrating, target_cpu, weight);
-                    }
+                    Some(Ok(committed)) => return publish_migration(committed, weight),
                 }
             }
             RunOwnerState::Migrating => core::hint::spin_loop(),
@@ -478,47 +451,48 @@ fn rehome_queued_inner(
     }
 }
 
+/// Discharges a `Migration` duty: publishes the `Migrating` word as
+/// `RemoteQueued` on its target and that generation's mailbox record. A
+/// terminal withdrawal that beat the publication voids the migration (the
+/// withdrawal owns the task now), which also ends the duty.
+fn publish_migration(committed: Transition, weight: u32) -> RemoteWakeOutcome {
+    let migrating = committed.next;
+    let duty = committed.into_duty();
+    let slot = duty.slot();
+    let target_cpu = duty.cpu();
+    duty.discharge(DutyKind::Migration);
+    publish_migrating_record(slot, migrating, target_cpu, weight)
+}
+
 pub(super) fn publish_migrating_record(
     slot: usize,
     migrating: RunOwnerSnapshot,
     target_cpu: usize,
     weight: u32,
 ) -> RemoteWakeOutcome {
-    let queued = migrating.next(RunOwnerState::RemoteQueued, Some(target_cpu));
-    if let Err(mut observed) = OWNER_WORDS[slot].compare_exchange(migrating, queued) {
-        // Lock-free run-intent and wait writers may change metadata bits of
-        // the `Migrating` owner without a custody change; only a different
-        // custody generation is a broken transfer.
-        loop {
+    let mut observed = migrating;
+    // Lock-free run-intent and wait writers may change metadata bits of the
+    // `Migrating` owner without a custody change; only a different custody
+    // generation is a broken transfer.
+    let queued = loop {
+        match transition(slot, observed, OwnerEvent::PublishMigration, Some(target_cpu)) {
+            Ok(committed) => break committed,
             // A terminal stop beat the publication, and the slot may already
             // have been released and reused: either way the record is void.
-            if observed.state.is_terminal() || observed.generation > migrating.generation {
+            Err(current) if current.state.is_terminal() || current.generation > migrating.generation => {
                 return RemoteWakeOutcome::Rejected;
             }
-            if observed.state != RunOwnerState::Migrating
-                || observed.generation != migrating.generation
-            {
-                panic!("scheduler migration publication raced observed={observed:?}");
-            }
-            match OWNER_WORDS[slot].compare_exchange(observed, queued) {
-                Ok(()) => break,
-                Err(current) => observed = current,
+            Err(current) => {
+                if current.state != RunOwnerState::Migrating
+                    || current.generation != migrating.generation
+                {
+                    panic!("scheduler migration publication raced observed={current:?}");
+                }
+                observed = current;
             }
         }
-    }
-    {
-        let mut mailbox = REMOTE_WAKE_MAILBOXES[target_cpu].lock();
-        mailbox.publish(RunTransfer {
-            slot,
-            generation: queued.generation,
-            weight,
-        });
-    }
-    // ORDERING: the mailbox lock release publishes the exact generation before
-    // the pending edge makes that record visible to the target CPU.
-    let notify = MAILBOX_PENDING[target_cpu]
-        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok();
+    };
+    let notify = queued.into_duty().publish_mailbox(weight);
     RemoteWakeOutcome::Published {
         cpu: target_cpu,
         notify,

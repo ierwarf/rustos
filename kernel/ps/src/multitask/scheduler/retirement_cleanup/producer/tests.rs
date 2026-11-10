@@ -153,8 +153,7 @@ fn stale_claim_rollback_cannot_begin_effects_or_erase_next_claim_nonce_despite_s
             reason: TaskRetireReason::Exited,
             detach: true,
             turn: None,
-            claimed: true,
-            waited_for_executor: false,
+            origin: Some(Origin::Withdrawn),
             effects: false,
             live: true,
         };
@@ -270,5 +269,37 @@ fn kernel_uid_zero_is_an_exact_producer_not_absence_and_reset_never_rewinds_next
         let next = begin();
         assert!(next.key.nonce > epoch);
         drop(next);
+    });
+}
+/// A claimed producer restores exactly its origin on untouched rollback, and
+/// a producer that withdrew under the claim is a withdrawn stop from then on:
+/// rolling it back restores `Deferred`, never the park it was claimed from,
+/// and it can never be parked again as if nothing had been withdrawn.
+#[test]
+fn claimed_producer_rolls_back_to_its_exact_origin_and_a_withdrawal_overrides_it() {
+    fixture(|| {
+        begin().park_unwithdrawn();
+        assert_eq!(CELLS[SLOT].state.lock().producer.unwrap().phase, Phase::Parked);
+        let parked = Producer::claim(SLOT, Some(ID)).unwrap();
+        assert_eq!(parked.origin(), Some(Origin::Parked));
+        assert!(!parked.waited_for_executor());
+        drop(parked);
+        assert_eq!(CELLS[SLOT].state.lock().producer.unwrap().phase, Phase::Parked);
+
+        let mut resumed = Producer::claim(SLOT, Some(ID)).unwrap();
+        assert_eq!(resumed.origin(), Some(Origin::Parked));
+        resumed.begin_effects(); // the restarted withdrawal succeeded
+        let retained = resumed.retain_stopped();
+        assert_eq!(retained.origin(), Some(Origin::Withdrawn));
+        drop(retained);
+        assert_eq!(CELLS[SLOT].state.lock().producer.unwrap().phase, Phase::Deferred);
+
+        let withdrawn = Producer::claim(SLOT, Some(ID)).unwrap();
+        assert_eq!(withdrawn.origin(), Some(Origin::Withdrawn));
+        let refused =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| withdrawn.park_unwithdrawn()));
+        assert!(refused.is_err(), "a withdrawn stop cannot be parked as untouched");
+        // The refused park unwound through Drop with the claim untouched.
+        assert_eq!(CELLS[SLOT].state.lock().producer.unwrap().phase, Phase::Deferred);
     });
 }

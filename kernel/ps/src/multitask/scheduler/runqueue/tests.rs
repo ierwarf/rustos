@@ -738,7 +738,7 @@ fn budget_refusal_after_consuming_a_direct_handoff_retains_claimable_custody() {
     ));
     assert_eq!(published_runnable_count(cpu), 0);
     assert_eq!(
-        fifo.take_next_ready_with_competitor(false, |_| true),
+        fifo.take_next_ready(|_| true),
         Some(slot)
     );
     assert_eq!(fifo.len(), 0, "the sole ordering token was consumed");
@@ -834,9 +834,8 @@ fn migrating_owner_remains_runnable_until_mailbox_admission() {
     let target_cpu = 4;
     admit_blocked(slot);
     let blocked = owner(slot);
-    let migrating = blocked.next(RunOwnerState::Migrating, Some(target_cpu));
-    OWNER_WORDS[slot]
-        .compare_exchange(blocked, migrating)
+    let migrating = ownership::test_successor(blocked, RunOwnerState::Migrating, Some(target_cpu));
+    ownership::test_force_word(slot, blocked, migrating)
         .expect("test migration owner publication");
 
     assert_eq!(owner(slot), migrating);
@@ -864,9 +863,8 @@ fn terminal_stop_between_migrating_cas_and_mailbox_publication_refuses_without_r
     let target = 4;
     admit_blocked(slot);
     let blocked = owner(slot);
-    let migrating = blocked.next(RunOwnerState::Migrating, Some(target));
-    OWNER_WORDS[slot]
-        .compare_exchange(blocked, migrating)
+    let migrating = ownership::test_successor(blocked, RunOwnerState::Migrating, Some(target));
+    ownership::test_force_word(slot, blocked, migrating)
         .unwrap();
     retire(slot, 100);
     let stopped = owner(slot);
@@ -1138,8 +1136,8 @@ fn lock_free_metadata_writers_leave_a_terminal_owner_word_untouched() {
     assert_eq!(owner(SLOT), dormant_word, "a Dormant word was modified");
     for state in [RunOwnerState::Retiring, RunOwnerState::Retired] {
         let before = owner(SLOT);
-        let terminal = before.next(state, None);
-        OWNER_WORDS[SLOT].compare_exchange(before, terminal).unwrap();
+        let terminal = ownership::test_successor(before, state, None);
+        ownership::test_force_word(SLOT, before, terminal).unwrap();
         // One writer at a time: a later writer must not be able to undo the
         // damage of an earlier one before the word is compared.
         let writers: [(&str, &dyn Fn()); 7] = [
@@ -1155,8 +1153,8 @@ fn lock_free_metadata_writers_leave_a_terminal_owner_word_untouched() {
             write();
             assert_eq!(owner(SLOT), terminal, "{name} modified the {state:?} word");
         }
-        let dormant = terminal.next(RunOwnerState::Dormant, None);
-        OWNER_WORDS[SLOT].compare_exchange(terminal, dormant).unwrap();
+        let dormant = ownership::test_successor(terminal, RunOwnerState::Dormant, None);
+        ownership::test_force_word(SLOT, terminal, dormant).unwrap();
     }
 }
 
@@ -1184,15 +1182,15 @@ fn in_place_edits_keep_custody_and_apply_to_a_live_word() {
 }
 
 #[test]
-fn a_custody_transition_must_advance_the_generation() {
+fn an_event_outside_the_owner_table_panics_without_writing_the_word() {
     const SLOT: usize = 115;
     let _serial = test_serial_guard();
     reset_before_publication();
     let before = owner(SLOT);
     let refused = catch_unwind(AssertUnwindSafe(|| {
-        let _ = OWNER_WORDS[SLOT].compare_exchange(before, before.with_runnable(!before.runnable));
+        let _ = transition(SLOT, before, OwnerEvent::Claim, Some(0));
     }));
-    assert!(refused.is_err(), "a same-generation word must not pass as a transition");
+    assert!(refused.is_err(), "a Dormant word must not be claimable");
     assert_eq!(owner(SLOT), before, "the refused transition wrote the word");
     reset_before_publication();
 }
@@ -1213,7 +1211,7 @@ fn mailbox_adoption_survives_a_terminal_withdrawal_that_beats_its_owner_cas() {
     force_adoption_retire(slot);
     assert_eq!(drain_remote_wakes(cpu), 1);
     assert_eq!(owner(slot).state, RunOwnerState::Retired);
-    assert!(!published_local_member_for_test(cpu, slot));
+    assert!(!published_local_membership(slot, cpu));
     assert_eq!(published_runnable_count(cpu), 0, "the rolled-back insertion must leave no queue weight");
     release_retired(slot);
     reset_before_publication();

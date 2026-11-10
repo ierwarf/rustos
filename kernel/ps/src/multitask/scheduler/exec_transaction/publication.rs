@@ -9,7 +9,7 @@ use super::super::*;
 use super::{ExecImageLease, ExecPublication};
 use crate::multitask::{cpu_local, current_identity as identity};
 use nucleus_core::util::lockdep::DispatchPreemption;
-#[cfg(not(test))]
+#[cfg(rustos_boot_image)]
 use x86_64::{PhysAddr, registers::model_specific::FsBase};
 
 pub(in crate::multitask::scheduler) fn commit(

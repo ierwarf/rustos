@@ -145,6 +145,104 @@ pub(super) fn ui_readiness_settled(log: &str) -> bool {
     })
 }
 
+/// One observable step of the boot-to-desktop path, in causal order.
+///
+/// `marker` is a substring of a line the owning component prints. `optional`
+/// stages exist only on builds that print them; they count as reached when
+/// present but are never reported as the first missing stage, so an older log
+/// is not blamed for a line it could not contain.
+struct BootStage {
+    name: &'static str,
+    marker: &'static str,
+    optional: bool,
+}
+
+const fn stage(name: &'static str, marker: &'static str) -> BootStage {
+    BootStage {
+        name,
+        marker,
+        optional: false,
+    }
+}
+
+const fn optional_stage(name: &'static str, marker: &'static str) -> BootStage {
+    BootStage {
+        name,
+        marker,
+        optional: true,
+    }
+}
+
+const BOOT_STAGES: &[BootStage] = &[
+    stage("rootd-core-ready", "rootd: core services ready, spawning initd"),
+    stage("initd-supervising", "initd: supervisor loop enter"),
+    stage("netd-spawned", "initd: loader spawn returned exec=services/netd/netd.elf"),
+    stage(
+        "devmgrd-spawned",
+        "initd: loader spawn returned exec=services/devmgrd/devmgrd.elf",
+    ),
+    stage(
+        "inputd-spawned",
+        "initd: loader spawn returned exec=services/inputd/inputd.elf",
+    ),
+    stage("devmgrd-running", "devmgrd: service start"),
+    optional_stage("devmgrd-workers-started", "devmgrd: ioctl workers started"),
+    stage("devmgrd-registered", "devmgrd: device policy endpoint registered"),
+    stage("inputd-registered", "inputd: input policy endpoint registered"),
+    optional_stage("inputd-ingress-running", "inputd: DVM ingress worker running"),
+    stage("input-policy-consumer-live", "name=dvm-input-policy-ready"),
+    stage(
+        "devmgrd-admitted",
+        "initd: service endpoint ready exec=services/devmgrd/devmgrd.elf",
+    ),
+    stage("runtimed-told-ui-ready", "ui ready received"),
+    stage("uiserver-settled", "uiserver: readiness v1 state=ready"),
+    stage(
+        "wayclick-spawned",
+        "loaderd: spawn done exec=/apps/wayclick/wayclick.elf",
+    ),
+    stage("wayclick-running", "wayclick: main enter"),
+    stage("wayclick-first-frame", "wayclick: first frame presented"),
+];
+
+/// Where a boot stopped: the last stage that was reached and the first required
+/// stage after the start that was not. A stage after a missing one can still be
+/// present (stages overlap), so both are reported instead of one cut-off point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct BootProgress {
+    pub(super) last_reached: Option<&'static str>,
+    pub(super) first_missing: Option<&'static str>,
+}
+
+pub(super) fn boot_progress(log: &str) -> BootProgress {
+    let mut last_reached = None;
+    let mut first_missing = None;
+    for stage in BOOT_STAGES {
+        if log.contains(stage.marker) {
+            last_reached = Some(stage.name);
+        } else if !stage.optional && first_missing.is_none() {
+            first_missing = Some(stage.name);
+        }
+    }
+    BootProgress {
+        last_reached,
+        first_missing,
+    }
+}
+
+/// One-line attribution for a run that did not reach readiness. It names a
+/// component's missing step; it does not claim a cause.
+pub(super) fn boot_stage_summary(log: &str) -> String {
+    let progress = boot_progress(log);
+    match progress.first_missing {
+        None => "boot-stage: every observed stage reached".to_owned(),
+        Some(missing) => format!(
+            "boot-stage: first-missing={missing} last-reached={}",
+            progress.last_reached.unwrap_or("none")
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +318,60 @@ mod tests {
         ] {
             assert!(parse_ui_readiness_record(bad).is_none(), "{bad}");
         }
+    }
+
+    // Real lines of the round-2 failures (4 vCPU, 2026-11-09).
+    // lane2 run 28: rootd never got an initd.
+    const ROOTD_STUCK: &str = "user-debug payload=rootd: job memory charge ok\\n\nuser-debug payload=rootd: core services ready, spawning initd via loaderd\\n\n";
+    // lane3 run 22: inputd registered, its ingestion worker never armed.
+    const INPUTD_NO_CONSUMER: &str = "\
+user-debug payload=rootd: core services ready, spawning initd via loaderd\\n
+user-debug payload=initd: supervisor loop enter\\n
+user-debug payload=initd: loader spawn returned exec=services/netd/netd.elf pid=24\\n
+user-debug payload=initd: loader spawn returned exec=services/devmgrd/devmgrd.elf pid=25\\n
+user-debug payload=initd: loader spawn returned exec=services/inputd/inputd.elf pid=26\\n
+user-debug payload=inputd: input policy endpoint registered\\n
+user-debug payload=devmgrd: service start\\n
+";
+
+    #[test]
+    fn a_boot_that_never_started_initd_is_attributed_to_rootd_not_inputd() {
+        let progress = boot_progress(ROOTD_STUCK);
+        assert_eq!(progress.last_reached, Some("rootd-core-ready"));
+        assert_eq!(progress.first_missing, Some("initd-supervising"));
+        assert_eq!(
+            boot_stage_summary(ROOTD_STUCK),
+            "boot-stage: first-missing=initd-supervising last-reached=rootd-core-ready"
+        );
+    }
+
+    #[test]
+    fn a_registered_inputd_without_a_live_consumer_and_a_silent_devmgrd_are_separated() {
+        let progress = boot_progress(INPUTD_NO_CONSUMER);
+        assert_eq!(progress.first_missing, Some("devmgrd-registered"));
+        assert_eq!(progress.last_reached, Some("inputd-registered"));
+        let with_consumer = format!(
+            "{INPUTD_NO_CONSUMER}devmgrd: device policy endpoint registered\ninputd: DVM ingress worker running\nname=dvm-input-policy-ready\n"
+        );
+        assert_eq!(
+            boot_progress(&with_consumer).first_missing,
+            Some("devmgrd-admitted")
+        );
+    }
+
+    #[test]
+    fn optional_stages_are_never_blamed_on_a_log_that_could_not_print_them() {
+        let progress = boot_progress(INPUTD_NO_CONSUMER);
+        assert_ne!(progress.first_missing, Some("inputd-ingress-running"));
+        assert_ne!(progress.first_missing, Some("devmgrd-workers-started"));
+    }
+
+    #[test]
+    fn a_spawned_app_that_never_reached_main_is_named() {
+        let log = "uiserver: readiness v1 state=ready gen=13 assets=ready display=ready input=ready wayland=ready runtime=ready gpu=ready\nloaderd: spawn done exec=/apps/wayclick/wayclick.elf pid=83\n";
+        let progress = boot_progress(log);
+        assert_eq!(progress.last_reached, Some("wayclick-spawned"));
+        assert!(boot_progress(&format!("{log}wayclick: main enter\n")).last_reached
+            == Some("wayclick-running"));
     }
 }

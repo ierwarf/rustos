@@ -423,6 +423,13 @@ pub(super) fn publish_binding(slot: usize, task_id: u64, view: PublishedFrameVie
 
 /// Irreversible close for this binding. New frame observations cannot revive
 /// it; existing pins retain the allocation until their last release.
+///
+/// Host fixture seam, kept deliberately: production closes a slot only through
+/// `reuse::begin_retired`, which requires a retired-qualified identity binding
+/// (terminal publication) and an exact start/binding/context. Native fixtures
+/// born through `tests::admit*` never publish that terminal state, so the
+/// production gate refuses them by design; ~70 fixture teardowns across the
+/// scheduler tests use this close + drainability probe instead.
 #[cfg(test)]
 pub(super) fn close_for_reclaim(slot: usize) -> bool {
     RESOURCES[slot].with(|resources| {

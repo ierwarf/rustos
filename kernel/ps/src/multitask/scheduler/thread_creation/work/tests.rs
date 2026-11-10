@@ -310,3 +310,20 @@ fn dying_original_user_cannot_orphan_real_capsule_and_kernel_cancels_before_fail
         assert_eq!(process_table::thread_count_by_pid(ID), Some(count));
     });
 }
+/// A user creator can only yield and poll, so the durable row must wake the
+/// housekeeping Executor that materializes it, instead of waiting for its nap.
+#[test]
+fn submitted_thread_row_kicks_the_housekeeping_executor() {
+    affinity_fixture(UserAbi::Linux, UserAbi::Linux, false, |handle| {
+        let _ = crate::multitask::take_housekeeping_kick();
+        let receipt = pending();
+        assert!(crate::multitask::housekeeping_kicked(), "durable thread row left unkicked");
+        assert_eq!(poll(receipt), None);
+        kernel(|executor| {
+            assert_eq!(service(executor), 1);
+        });
+        assert_eq!(poll(receipt), Some(true));
+        release_born(receipt.slot, receipt.id, handle);
+        let _ = crate::multitask::take_housekeeping_kick();
+    });
+}

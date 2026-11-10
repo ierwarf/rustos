@@ -19,9 +19,27 @@ pub struct ProcessAffinitySnapshot {
     pub system_mask: u64,
 }
 
+/// Besides the online CPUs and the process mask, a budgeted task's affinity
+/// must stay inside its scheduling context's CPU mask (`funded`; `None` when
+/// unbudgeted). Admission refuses funding on any other CPU as an unresolved
+/// observation, so a mask that escaped it placed a runnable task on a CPU that
+/// never dispatches it (`sched_setaffinity` / `SetProcessAffinityMask` only
+/// checked the process mask, which creation does not narrow to the budget).
+pub(super) const fn funded_mask_admits(requested: u64, funded: Option<u64>) -> bool {
+    match funded { Some(mask) => requested & !mask == 0, None => true }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{process_affinity::tests as process, thread_affinity::tests as thread};
+    #[test]
+    fn affinity_cannot_escape_the_scheduling_context_cpu_mask() {
+        use super::funded_mask_admits as ok;
+        assert!(ok(0b011, None), "an unbudgeted task is not narrowed");
+        assert!(ok(0b001, Some(0b001)));
+        assert!(ok(0b010, Some(0b011)));
+        assert!(!ok(0b011, Some(0b001)), "budget mask excludes CPU 1");
+    }
     #[test]
     fn task_affinity_snapshot_is_exact_and_online_bounded() {
         thread::linux_query_and_peer_set_preserve_process_mask_and_other_thread();

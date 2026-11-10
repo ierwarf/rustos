@@ -9,16 +9,8 @@ use super::super::process_placement::exit_membership::{self, PendingExit, Reason
 use super::*;
 
 /// Original non-yielding admission transfers its membership pin to the row.
-/// The receipt alone may cross a yield; requester PID is diagnostic data.
-pub(in crate::multitask) fn request(
-    scope: &nucleus_core::util::lockdep::DispatchPreemption<'_>,
-    pid: u64,
-    requested_by_pid: Option<u64>,
-) -> Option<Receipt> {
-    request_marked(scope, pid, requested_by_pid).map(|(receipt, _fresh)| receipt)
-}
-
-/// `request`, also saying whether this call published the termination.
+/// The receipt alone may cross a yield; requester PID is diagnostic data. Also
+/// says whether this call published the termination.
 ///
 /// A request that finds one already queued returns that request's receipt, so
 /// two terminators both wait for the same exit. Only the one that published it

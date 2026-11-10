@@ -110,7 +110,6 @@ use rustos_user_abi::syscall::{
     SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
     SYS_RUSTOS_PROC_VALIDATE_DEFERRED_SPAWN_BROKER, SYS_RUSTOS_PRODUCT_MILESTONE,
     SYS_RUSTOS_ROOTD_MEMORY_BROKER, SYS_RUSTOS_ROOTD_TERMINATE_BROKER,
-    SYS_RUSTOS_ROOTD_WAIT_BROKER,
     SYS_RUSTOS_SCHEDULING_CONTEXT_GRANT_BROKER, SYS_RUSTOS_SPAWN_EXEC,
 };
 use service_checkpoint::ServiceCheckpointStore;
@@ -325,13 +324,21 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
             &mut service_checkpoints,
         );
         supervise_core_readiness(&mut leases, &mut next_core_readiness_poll_ns);
-        if !service_dependencies_ready(INITD_LEASE_INDEX) && served == 0 {
-            wait_for_core_readiness_with(
-                || service_dependencies_ready(INITD_LEASE_INDEX),
-                wait_for_restart_backoff,
+        if !service_dependencies_ready(INITD_LEASE_INDEX) {
+            bootstrap_idle_boundary(
+                served,
+                |timeout_ms| {
+                    serve_rootd_once(
+                        endpoint,
+                        &leases,
+                        &mut post_init_leases,
+                        &mut service_checkpoints,
+                        false,
+                        Some(timeout_ms),
+                    )
+                },
+                yield_now,
             );
-        } else if !service_dependencies_ready(INITD_LEASE_INDEX) {
-            yield_now();
         }
     }
 
@@ -2766,24 +2773,30 @@ fn cleanup_failed_initial_activation(
     Ok(())
 }
 
-/// Observe endpoint publication inside one existing readiness-budget window.
-/// Only bootstrap readiness may end this wait early. The outer supervisor still charges at most one poll per window.
-fn wait_for_core_readiness_with(mut ready: impl FnMut() -> bool, mut wait: impl FnMut(u32)) {
-    let mut remaining = CORE_READINESS_POLL_INTERVAL_MS;
-    while remaining != 0 && !ready() {
-        let slice =
-            remaining.min(rustos_user_abi::performance::ROOTD_SUPERVISOR_IDLE_POLL_MS as u32);
-        wait(slice);
-        remaining -= slice;
-    }
-}
-
-/// Apply the rootd-owned retry delay with a capability-gated timer substrate.
-/// A rejected wait would make the published restart contract unenforceable, so
-/// it is a supervisor-fatal condition rather than a busy-loop fallback.
-fn wait_for_restart_backoff(backoff_ms: u32) {
-    if syscall1(SYS_RUSTOS_ROOTD_WAIT_BROKER, u64::from(backoff_ms)) < 0 {
-        fail_closed(b"rootd: fatal restart backoff wait rejected\n");
+/// The idle boundary of the bootstrap readiness loop, the same shape as the
+/// post-init supervisor's: after a nonblocking drain found nothing, wait for the
+/// next control message for at most one idle poll, and serve it if it arrives.
+///
+/// Rootd's supervisor endpoint stays live while it waits for the core services.
+/// Their heartbeat threads (`rustos_svc_runtime::heartbeat`, 250 ms call limit)
+/// and readiness reports start calling it during this phase. The earlier wait
+/// slept the whole 250 ms readiness window (the since-deleted rootd timer broker in
+/// 10 ms slices) without receiving, so every call made in that window expired as
+/// `ipc-service-reply-timeout` before rootd looked at its endpoint again.
+/// Readiness is re-checked by the caller after every boundary (at most one idle
+/// poll apart, as before), and the readiness budget is charged by monotonic time
+/// in `supervise_core_readiness`, not by the number of boundaries, so serving
+/// traffic early cannot shorten or extend a service's readiness deadline. A
+/// drain that hit its budget yields instead: more requests may already be queued.
+fn bootstrap_idle_boundary(
+    served: usize,
+    serve_bounded: impl FnOnce(u64) -> bool,
+    yield_now: impl FnOnce(),
+) {
+    if served == 0 {
+        let _ = serve_bounded(rustos_user_abi::performance::ROOTD_SUPERVISOR_IDLE_POLL_MS);
+    } else {
+        yield_now();
     }
 }
 
@@ -4372,36 +4385,45 @@ mod tests {
         assert_eq!(initial.exit_status, -11);
     }
 
+    /// The bootstrap readiness loop must keep serving its supervisor endpoint.
+    /// The heartbeat of every core service is a 250 ms bounded call to rootd;
+    /// a wait that does not receive for a whole readiness window expires all of
+    /// them (the 0.64 s `ipc-service-reply-timeout` burst of the 4-vCPU boots).
     #[test]
-    fn core_readiness_wait_observes_publication_without_spending_the_full_window() {
-        let elapsed = core::cell::Cell::new(0_u32);
-        wait_for_core_readiness_with(
-            || elapsed.get() >= 30,
-            |millis| elapsed.set(elapsed.get() + millis),
-        );
-        assert_eq!(elapsed.get(), 30);
-
-        wait_for_core_readiness_with(|| true, |_| panic!("ready services must not sleep"));
+    fn bootstrap_readiness_wait_serves_the_supervisor_endpoint_within_one_idle_poll() {
+        let idle = rustos_user_abi::performance::ROOTD_SUPERVISOR_IDLE_POLL_MS;
+        assert!(idle < rustos_svc_runtime::heartbeat::CALL_LIMIT_MS,
+            "a queued heartbeat must be received well inside its call limit");
+        // Nothing drained: the boundary is one bounded receive, never a sleep.
+        let mut received = None;
+        bootstrap_idle_boundary(0, |timeout| { received = Some(timeout); true },
+            || panic!("an idle boundary must not merely yield"));
+        assert_eq!(received, Some(idle));
+        // A drain that served requests yields; more may already be queued.
+        let mut yielded = false;
+        bootstrap_idle_boundary(3, |_| panic!("a busy drain must not block"), || yielded = true);
+        assert!(yielded);
+        // The loop itself: no non-serving timer wait remains before initd.
+        let source = include_str!("main.rs");
+        let bootstrap = source
+            .split("rootd: core services spawned, waiting for readiness")
+            .nth(1)
+            .and_then(|rest| rest.split("jobs::selfcheck(").next())
+            .expect("bootstrap readiness loop");
+        assert!(bootstrap.contains("bootstrap_idle_boundary("));
+        assert!(!bootstrap.contains("wait_for_restart_backoff"));
+        assert!(!bootstrap.contains("SYS_RUSTOS_ROOTD_WAIT_BROKER"));
     }
 
     #[test]
-    fn core_readiness_wait_preserves_the_unready_supervision_window() {
-        let mut elapsed = 0_u32;
-        wait_for_core_readiness_with(
-            || false,
-            |millis| {
-                assert!(millis > 0);
-                assert!(
-                    u64::from(millis)
-                        <= rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS
-                );
-                elapsed += millis;
-            },
-        );
-        assert_eq!(elapsed, CORE_READINESS_POLL_INTERVAL_MS);
+    fn core_readiness_budget_is_twenty_time_charged_windows() {
         assert_eq!(
-            u64::from(elapsed) * u64::from(CORE_READINESS_POLL_MAX),
+            u64::from(CORE_READINESS_POLL_INTERVAL_MS) * u64::from(CORE_READINESS_POLL_MAX),
             5_000
+        );
+        assert!(
+            rustos_user_abi::performance::ROOTD_SUPERVISOR_IDLE_POLL_MS
+                <= rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS
         );
     }
 

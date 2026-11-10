@@ -392,3 +392,11 @@ service + commit queue, input-ring arm watch/tracker, 16 mutation rows, docs in
 killed manually (runner `--only` blocked by stale scheduler anchors).
 Disconnected/deferred: initd 5 s endpoint barrier, harness reading
 `readiness v1`, acked OP_NOTIFY_READY. See the doc's section 9.
+
+### Round 2 triage (2026-11-09, b82b50eb)
+
+Typed records classified 6 of 8 UI-class failures as new-task-no-progress stalls
+below userland (see `docs/ai/ui-startup-readiness.md` section 11). Added harness
+`boot-stage` attribution and two evidence-only log lines (devmgrd, inputd).
+Deferred: runtimed I/O thread (no evidence), initd bounded respawn (policy),
+per-call watchdog accounting in uiserver Wayland dispatch. Unverified: no boot.

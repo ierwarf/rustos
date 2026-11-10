@@ -10,10 +10,6 @@ use rustos_user_abi::syscall::{ServiceCapability,
     RustosRootdTerminateBrokerArgs,
 };
 
-/// A supervisor may defer a restart but must not turn the timer substrate into
-/// an unbounded privileged sleep primitive. The backoff value is published by
-/// rootd and deliberately fits below this cap.
-const ROOTD_WAIT_MAX_MILLIS: u64 = 1_000;
 pub(crate) const RETIRED_TASK_CLEANUP_BUDGET: usize = 4;
 
 /// Remove every task-scoped runtime registration that lives outside the
@@ -101,10 +97,6 @@ fn retired_process_fault_vector(process_terminal: bool, user_fault_vector: Optio
     if process_terminal { user_fault_vector } else { None }
 }
 
-fn rootd_wait_delay_is_valid(millis: u64) -> bool {
-    (1..=ROOTD_WAIT_MAX_MILLIS).contains(&millis)
-}
-
 fn rootd_terminate_args_are_valid(args: &RustosRootdTerminateBrokerArgs) -> bool {
     args.abi_version == ROOTD_TERMINATE_BROKER_ABI_VERSION
         && args.reserved0 == 0
@@ -150,21 +142,6 @@ pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 
         Ok(count) => count,
         Err(errno) => linux_errno(errno),
     }
-}
-
-/// Sleep the calling root supervisor for one bounded restart-backoff interval.
-/// The kernel does not select a delay, retain retry state, or restart a
-/// process: those remain rootd policy. Keeping this timer primitive here
-/// avoids depending on syscalld while syscalld itself is being recovered.
-pub(super) fn syscall_linux_rustos_rootd_wait_broker(millis: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(ServiceCapability::RootSupervisor) {
-        return linux_errno(LINUX_EPERM);
-    }
-    if !rootd_wait_delay_is_valid(millis) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    crate::arch::rtc::sleep(millis);
-    0
 }
 
 /// Finalize one rootd-selected service process.  Rootd decides whether a
@@ -331,7 +308,6 @@ mod tests {
         MemoryPressureStats, build_memory_reply, lifecycle_drain_args_are_valid,
         memory_census_fault_gate,
         retired_process_fault_vector, rootd_memory_args_are_valid, rootd_terminate_args_are_valid,
-        rootd_wait_delay_is_valid,
     };
     use crate::multitask;
     use rustos_user_abi::syscall::{
@@ -439,13 +415,6 @@ mod tests {
         assert_eq!(short.entries[2].process_id, 0);
     }
 
-    #[test]
-    fn rootd_wait_delay_is_strictly_bounded() {
-        assert!(!rootd_wait_delay_is_valid(0));
-        assert!(rootd_wait_delay_is_valid(250));
-        assert!(rootd_wait_delay_is_valid(1_000));
-        assert!(!rootd_wait_delay_is_valid(1_001));
-    }
 
     #[test]
     fn rootd_terminate_args_require_exact_version_nonzero_target_without_flags() {

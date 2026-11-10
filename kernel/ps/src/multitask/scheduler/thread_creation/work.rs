@@ -60,7 +60,12 @@ pub(in crate::multitask) struct Receipt {
 
 fn enqueue(work: Work) -> Result<Receipt, Work> {
     let slot = work.reservation.as_ref().unwrap().ticket().slot();
-    enqueue_into(&mut ROWS[slot].lock(), work)
+    let receipt = enqueue_into(&mut ROWS[slot].lock(), work)?;
+    // A user creator can only yield and poll; the housekeeping Executor is what
+    // materializes the row. Wake it now (after the row leaf is released)
+    // instead of leaving the new thread to the next housekeeping nap.
+    crate::multitask::kick_housekeeping();
+    Ok(receipt)
 }
 fn enqueue_into(row: &mut Row, work: Work) -> Result<Receipt, Work> {
     let r = work.reservation.as_ref().unwrap();

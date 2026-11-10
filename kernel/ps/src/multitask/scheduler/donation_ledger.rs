@@ -865,7 +865,7 @@ pub(super) fn test_charge_publication_is_empty(slot: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::donation_publication::tests::{ledger_witnesses as owned, legacy_witnesses};
+    use super::super::donation_publication::tests::ledger_witnesses as owned;
 
     #[test]
     fn class_claims_on_different_cpus_do_not_wait_for_each_other() {
@@ -948,10 +948,6 @@ mod tests {
     #[test]
     fn ordinary_nested_calls_borrow_one_root_context_without_system_promotion() {
         owned::ordinary();
-    }
-    #[test]
-    fn root_reply_revokes_every_nested_priority_boost_exactly_once() {
-        legacy_witnesses::transitive();
     }
     #[test]
     fn multithreaded_server_charge_tokens_restore_the_previous_live_reply() {

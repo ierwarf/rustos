@@ -1,7 +1,7 @@
 //! Owner: SAME production FIFO/priority consumers over original born resources.
 //! Boundary: explicit earlier FIFO/IRQ inputs are not activation or IPC grants.
 //! Lifecycle: exact published UID/frame/funding -> physical claim; lower queues retained.
-//! Failure: incomplete prefix retains ordering, stale UID drains without mutation.
+//! Failure: incomplete queued-here prefix retains ordering; stale UID or unqueued record drains without mutation.
 //! Evidence: historical IDs; native bank completion is NOT architecture/RSP ACK.
 use super::*;
 use super::super::{dispatch_claim, execution_interval, local_dispatch::policy_witnesses};
@@ -96,6 +96,12 @@ pub(in crate::multitask::scheduler) fn first_turn_fifo() {
     }
 }
 
+/// A record for a slot that is not queued on this CPU (here: an unknown,
+/// unpublished slot) can never become claimable here. It used to answer
+/// `Incomplete` and keep the FIFO front, which idled the CPU on every later
+/// turn; it is now consumed without a claim, identity grant or capture, and the
+/// atomic prefix count and pending flag drain with it. A queued-here record
+/// whose claim is only transiently refused keeps its place (`reader_exclusion`).
 pub(in crate::multitask::scheduler) fn incomplete_first_turn() {
     for atomic in [true, false] {
         dispatch_claim::tests::fixture(false, |_slot, turn| {
@@ -104,10 +110,13 @@ pub(in crate::multitask::scheduler) fn incomplete_first_turn() {
             assert!(current_identity::read_dispatch(unknown).is_none());
             assert!(matches!(local_candidate(unknown, 0, Urgency::Spawn), Decision::Incomplete));
             enqueue(unknown, ID + 2, atomic);
-            assert!(matches!(first_turn(turn, 0, atomic, donation_ledger::class_publication_sequence()), Decision::Incomplete));
-            assert!(!empty(atomic));
+            assert!(matches!(first_turn(turn, 0, atomic, donation_ledger::class_publication_sequence()), Decision::Empty));
+            assert!(empty(atomic), "an unqueued record must not hold the FIFO front");
             assert!(turn.claimed_return().is_none());
-            if atomic { assert!(dispatch_policy::atomic_activation_pending(0)); }
+            if atomic {
+                assert!(!dispatch_policy::atomic_activation_pending(0));
+                assert_eq!(dispatch_policy::lock(0).atomic_activation_handoff_remaining, 0);
+            }
             dispatch_policy::remove_reclaimed_slot(unknown);
         });
     }

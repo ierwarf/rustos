@@ -150,7 +150,6 @@ mod tests {
             syscall::SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER,
             syscall::SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER
         );
-        assert_eq!(syscall::SYS_RUSTOS_ROOTD_WAIT_BROKER, 0x5255_003b);
         assert_eq!(syscall::SYS_RUSTOS_ROOTD_TERMINATE_BROKER, 0x5255_003c);
         assert_eq!(syscall::SYS_RUSTOS_ROOTD_MEMORY_BROKER, 0x5255_0056);
         assert_eq!(syscall::SYS_RUSTOS_JOB, 0x5255_0057);

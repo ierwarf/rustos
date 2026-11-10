@@ -586,7 +586,9 @@ fn wait_for_parallel_boot(
             .all(|marker| dvm_log.contains(marker));
         let dvm_gpu_ready = required_dvm_gpu_ready(options, &dvm_log, gpu_evidence);
         if let Err(error) = poll_input_relay(control_relay, &mut control_ready) {
-            let reason = format!("{error:#}");
+            // The relay only knows the ring was not armed; the log says which
+            // earlier boot step never happened.
+            let reason = format!("{error:#}; {}", boot_stage_summary(&rustos_log));
             let evidence = write_kvm_failure_summary(
                 layout,
                 &reason,

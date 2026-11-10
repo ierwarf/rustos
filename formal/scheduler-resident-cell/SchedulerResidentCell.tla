@@ -16,8 +16,8 @@ current word, because a lost CAS changes nothing.
 Concrete owners:
   * resident.rs     park, claim_empty, take, on_owner_transition, permit_units,
                     commit_outgoing
-  * runqueue.rs     RunOwnerWord::compare_exchange (the revoking hook runs AFTER
-                    the owner CAS), lane_cas (raw CAS, no hook)
+  * runqueue/ownership.rs  transition (the revoking hook runs AFTER the owner
+                    CAS), except the LaneClaim row (no hook; ResidentTake duty)
   * ipc_lane.rs     lane take after the owner claim
   * exec_transaction.rs evict_parked_target (eviction without an owner transition)
 

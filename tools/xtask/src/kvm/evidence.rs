@@ -6,7 +6,9 @@ mod smp_qualification;
 #[path = "evidence/startup_readiness.rs"]
 mod startup_readiness;
 
-use startup_readiness::{startup_failure_detail, ui_readiness_failure, ui_readiness_settled};
+use startup_readiness::{
+    boot_stage_summary, startup_failure_detail, ui_readiness_failure, ui_readiness_settled,
+};
 use smp_qualification::{KvmLaunchEvidenceSnapshot, KvmSuccessSummary, SmpEvidenceArchive};
 fn required_dvm_gpu_ready(
     options: &SmokeOptions,
@@ -1012,6 +1014,7 @@ fn runtime_stall_or_crash_observed(log: &str) -> bool {
         "uiserver panic:",
         "scheduler long ready wait:",
         "scheduler stall:",
+        SCHEDULER_CUSTODY_LOST,
         "rustos-dvm-display: relay stopped",
         "[drm:virtio_gpu_dequeue_ctrl_func] *ERROR*",
         "panicked at ",
@@ -1028,16 +1031,52 @@ fn runtime_stall_or_crash_observed(log: &str) -> bool {
         || ui_readiness_failure(log).is_some()
 }
 
+/// Kernel custody-conservation report (`runqueue::conservation`): a runnable
+/// task whose queue / mailbox / handoff / CPU record was missing for >= 2 s.
+/// Its own failure kind: it names a lost enqueue below userland, so it outranks
+/// the userland symptoms (startup timeouts) it causes.
+const SCHEDULER_CUSTODY_LOST: &str = "name=scheduler-custody-lost ";
+
+/// `scheduler custody lost: slot=.. gap=.. age_ticks=.. word=..` for the first
+/// conservation report, decoding arg0 = slot | gap << 8 | age << 16.
+fn scheduler_custody_lost_detail(log: &str) -> Option<String> {
+    let line = log.lines().find(|line| line.contains(SCHEDULER_CUSTODY_LOST))?;
+    let field = |key: &str| {
+        line.split_whitespace()
+            .find_map(|field| field.strip_prefix(key))
+            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+    };
+    let arg0 = field("arg0=")?;
+    let gap = match (arg0 >> 8) & 0xff {
+        1 => "local-without-membership",
+        2 => "remote-without-mailbox",
+        3 => "direct-without-fifo",
+        4 => "migrating-stuck",
+        5 => "blocked-with-run-intent",
+        6 => "running-without-cpu",
+        _ => "unknown",
+    };
+    Some(format!(
+        "scheduler custody lost: slot={} gap={gap} age_ticks={} word={:#x}",
+        arg0 & 0xff,
+        arg0 >> 16,
+        field("arg1=").unwrap_or(0)
+    ))
+}
+
 /// What to print next to a `runtime_stall_or_crash_observed` verdict: the typed
 /// startup cause when one exists, otherwise the first crash/stall marker line.
 fn runtime_failure_detail(log: &str) -> String {
-    startup_failure_detail(log)
+    scheduler_custody_lost_detail(log)
+        .or_else(|| startup_failure_detail(log))
         .or_else(|| {
             log.lines()
                 .find(|line| runtime_stall_or_crash_observed(line))
                 .map(|line| format!("first marker: {}", line.trim()))
         })
-        .unwrap_or_else(|| "no failure marker".to_owned())
+        // No failure marker: the run simply stopped. Say where, so a stall is
+        // attributed to the component whose step is missing.
+        .unwrap_or_else(|| format!("no failure marker; {}", boot_stage_summary(log)))
 }
 
 fn uiserver_display_field_is(fields: &str, name: &str, expected: u32) -> bool {
@@ -1379,6 +1418,17 @@ fn network_exercise_ready(exercise_network: bool, exercise_google_ping: bool, co
 #[cfg(test)]
 mod lossy_log_tests {
     use super::*;
+
+    #[test]
+    fn a_scheduler_custody_report_is_its_own_failure_kind() {
+        let log = "[     1.0] milestone: output_seq=9 seq=9 ts_us=1 tick=1 cat=sched \
+                   name=scheduler-custody-lost arg0=0x8000020d arg1=0x1a2 pid=- tid=- msg=\"\"\n";
+        assert!(runtime_stall_or_crash_observed(log));
+        assert_eq!(
+            runtime_failure_detail(log),
+            "scheduler custody lost: slot=13 gap=remote-without-mailbox age_ticks=32768 word=0x1a2"
+        );
+    }
 
     #[test]
     fn a_non_utf8_console_byte_does_not_hide_later_markers() {

@@ -213,7 +213,7 @@ pub(in crate::multitask) fn call(
 
     // Committed from here: every failure is `Generic`.
     let generic = || {
-        let _ = wake_publication::wake(scope, receiver_id, &super::runqueue_policy::online_affinity_mask);
+        let _ = call_fallback(scope, endpoint, receiver_id, &super::runqueue_policy::online_affinity_mask);
     };
     // SAFETY: masked lane scope; `c` is Current on this CPU (checked above).
     unsafe { runqueue::simd_tls::save_simd_state_lane(c, c_id) };
@@ -280,14 +280,55 @@ pub(in crate::multitask) fn reply(
     // ordinary reply wake does first, and every failure is `Generic`.
     let _ = donation_ledger::release_reply_lane(c, caller_id, reply);
     let generic = || {
-        let _ = wake_publication::reply_with(scope, reply, caller_id,
-            &super::runqueue_policy::online_affinity_mask);
+        let _ = reply_fallback(scope, reply, caller_id, &super::runqueue_policy::online_affinity_mask);
     };
     // SAFETY: masked lane scope; `s` is Current on this CPU (checked above).
     unsafe { runqueue::simd_tls::save_simd_state_lane(s, s_id) };
     let from = Party { slot: s, id: s_id, arch: prev_arch };
     let to = Target { slot: c, id: caller_id, owner: c_owner, wait: (REPLY, reply) };
     finish(cpu, from, to, rsp, &clock, generic)
+}
+
+/// The `Generic` fallback of a committed lane: wake `task_id` through the
+/// ordinary producer, and keep a refusal as a retry of its exact `wait`.
+///
+/// By the time a lane falls back, the other side is already committed: on a call
+/// the caller is Blocked on its reply and the request is queued to this receiver;
+/// on a reply the response is published. The ordinary wake can still refuse in a
+/// transient window (the target's frame between two publications, a busy frame
+/// reader, a raced Current return). Nothing else wakes a receiver parked on an
+/// endpoint, and a caller would otherwise sleep until its reply deadline and then
+/// discard the response it was sent as ETIMEDOUT. So the refusal is recorded like
+/// every other refused terminal wake (`wake_retry`). The record is
+/// epoch-exact: a wait that has already been withdrawn or completed records nothing.
+fn wake_or_retry(
+    scope: &DispatchPreemption<'_>, task_id: u64, wait: (u8, u64), wake: impl FnOnce() -> bool,
+) -> bool {
+    let woken = wake();
+    if !woken {
+        let _ = super::wake_retry::record_in(scope, task_id, Some(wait));
+    }
+    woken
+}
+
+/// `Generic` fallback of a committed lane call: the caller is Blocked on its
+/// reply, so the receiver must wake for the request queued to it.
+pub(super) fn call_fallback(
+    scope: &DispatchPreemption<'_>, endpoint: u64, receiver_id: u64, eligible_cpus: &dyn Fn(usize) -> u64,
+) -> bool {
+    wake_or_retry(scope, receiver_id, (runqueue::wait::REASON_ENDPOINT_RECEIVE, endpoint), || {
+        wake_publication::wake(scope, receiver_id, eligible_cpus)
+    })
+}
+
+/// `Generic` fallback of a committed lane reply: the response is published and
+/// the reply's donation released, so the caller must wake to take it.
+pub(super) fn reply_fallback(
+    scope: &DispatchPreemption<'_>, reply: u64, caller_id: u64, eligible_cpus: &dyn Fn(usize) -> u64,
+) -> bool {
+    wake_or_retry(scope, caller_id, (runqueue::wait::REASON_ENDPOINT_REPLY, reply), || {
+        wake_publication::reply_with(scope, reply, caller_id, eligible_cpus)
+    })
 }
 
 /// Whether `slot` may run: its published lifecycle is dispatchable for `id`.
@@ -346,31 +387,32 @@ fn finish(
             }
         }
     };
-    // The point of no return: the parked task leaves its wait and becomes Running.
-    let generation = to.owner.generation;
-    let running = to.owner.lane_running(cpu);
+    // The point of no return: the parked task leaves its wait and becomes Running
+    // (owner-table row `Blocked --LaneClaim--> Running`, duty `ResidentTake`).
     let (kind, key) = to.wait;
     let claim = || {
         runqueue::affinity_payload::with_placement_admission(to.slot, Some(to.id), cpu, || {
             runqueue::wait::lane_wake_clear(to.slot, kind, key, || {
-                runqueue::lane_cas(to.slot, to.owner, running).ok()
+                runqueue::lane_claim(to.slot, to.owner, cpu).ok()
             })
         })
-        .and_then(|(claimed, grant)| claimed.map(|()| grant))
+        .and_then(|(claimed, grant)| claimed.map(|claimed| (claimed, grant)))
     };
     let now = clock.monotonic_nanos;
-    let grant = match (funding.as_ref(), shuttled) {
+    let claimed = match (funding.as_ref(), shuttled) {
         (Some(pin), false) => pin.with_dispatch_admission(cpu, now, claim),
         _ => claim(),
     };
-    let Some(mut grant) = grant else {
+    let Some((claimed, mut grant)) = claimed else {
         generic();
         return Outcome::Generic;
     };
+    let running = claimed.running();
     // The cell is parked for this CPU (`parked_cpu`), so its own `park` call has
     // returned and no self-take races this one; exec's intent excludes the CAS
-    // above before it evicts (see docs/ai/smp/scheduler.md 7.9).
-    let loans = resident::take(to.slot, generation).expect("lane claim won the owner CAS without its cell");
+    // above before it evicts (see docs/ai/smp/scheduler.md 7.9). Taking it is the
+    // claim's duty.
+    let loans = claimed.take_resident().expect("lane claim won the owner CAS without its cell");
     grant.bind_claimed(running);
 
     // Infallible from here: bank moves, publication, registers.

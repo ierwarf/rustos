@@ -51,6 +51,24 @@ stop reason without an unlocked defer/reclaim gap; abandonment restores that
 stop, never the live task. This closes a real capture-after-count window: the
 Terminal50 reservation alone excludes wake/kernel/reset, not every constructor.
 
+A deferred stop has exactly one typed origin (`producer::Origin`):
+`Withdrawn` (owner `Retired`, lifecycle retired, then deferred for quiescence
+or process election), `ExecutorWait` (reserved behind a kernel executor resume
+loan) or `Parked` (reserved while another CPU's dispatch claim of the task was
+in flight; `withdraw` returned before any CAS). The two untouched origins have
+withdrawn nothing. A withdrawn producer cannot be parked, because its owner
+word is `Retired` and `retire_unless_claim_in_flight` never reports
+`ClaimInFlight` for it, and `park_unwithdrawn` also asserts this. Every
+claimant (housekeeping drain, group exit, own exit or fault, terminate,
+wake/IPC quarantine, exec quiescence) restarts the withdrawal from the top and
+parks again while the claim is still in flight. Untouched rollback restores
+exactly the claimed origin. `retain_stopped` makes the origin `Withdrawn`, so
+a retained stop never rolls back to an executor wait or a park. The drain
+asserts that the lifecycle is retired exactly for a `Withdrawn` origin. Before
+`Parked` existed, a park was recorded as a withdrawn deferral, and the drain
+assertion panicked the kernel (4-vCPU boot, 2026-11-09). Model:
+`formal/scheduler-terminal-producer/`.
+
 #### Independent wake and final terminal effects
 
 `wake_publication.rs` now owns exact Terminal50 -> Identity51 -> Resources53
@@ -413,6 +431,10 @@ Policy42 leaf. Full/duplicate/exhausted priority custody degrades to ordinary
 spawn hints without panic, and never grants Running; pending Cohort still gates
 the real CAS. Hint insertion precedes its pending notification under the same
 leaf. Whole group admission remains atomic despite optional latency priority.
+A member gets a first-turn record only on the CPU its own wake `Published`
+into. An `AlreadyOwned` member was placed by another waker and gets none,
+because a record on a CPU that does not queue the task is ordering metadata
+for nothing (see `docs/ai/smp/scheduler.md` 7.3).
 
 Actual local/remote publication uses unchanged affinity admission and checks
 real runnable membership, not merely a copied wake outcome. JobStopped and

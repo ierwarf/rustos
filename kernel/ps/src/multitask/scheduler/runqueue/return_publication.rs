@@ -53,10 +53,11 @@ fn publish_return_inner(
         if observed.runnable && allow_local {
             break;
         }
-        let next = observed.next_preserving_wait(RunOwnerState::Blocked, None);
-        frame_publication::bind_local_owner_generation(slot, next.generation);
+        // I3: the ReturnBlocked row publishes exactly the next generation.
+        frame_publication::bind_local_owner_generation(slot, observed.generation + 1);
         before_cas(slot);
-        if OWNER_WORDS[slot].compare_exchange(observed, next).is_ok() {
+        if let Ok(blocked) = transition(slot, observed, OwnerEvent::ReturnBlocked, None) {
+            let _ = blocked.settled();
             return ReturnPublication::Blocked {
                 was_runnable: observed.runnable,
             };
@@ -76,14 +77,21 @@ fn publish_return_inner(
             "CPU return lacks original Running custody slot={slot} owner={observed:?} cpu={cpu}"
         );
         let local = observed.runnable && allow_local;
-        let next = if local {
+        let committed = if local {
             rq.insert(slot, weight);
-            observed.next(RunOwnerState::Local, Some(cpu))
+            before_cas(slot);
+            transition(slot, observed, OwnerEvent::ReturnLocal, Some(cpu))
         } else {
-            observed.next_preserving_wait(RunOwnerState::Blocked, None)
+            before_cas(slot);
+            transition(slot, observed, OwnerEvent::ReturnBlocked, None)
         };
-        before_cas(slot);
-        if OWNER_WORDS[slot].compare_exchange(observed, next).is_ok() {
+        if let Ok(committed) = committed {
+            let next = committed.next;
+            if local {
+                committed.into_duty().run_queue_inserted(&rq);
+            } else {
+                let _ = committed.settled();
+            }
             // The complete outgoing frame also belongs to a blocked return.
             // Original Current/Transition still excludes reads until RSP ACK;
             // afterwards a typed wake must observe THIS committed generation.
@@ -137,9 +145,10 @@ fn publish_blocked_wake_inner(
             return RemoteWakeOutcome::Rejected;
         }
         rq.insert(slot, weight);
-        let next = observed.next(RunOwnerState::Local, Some(cpu));
         before_cas(slot);
-        if OWNER_WORDS[slot].compare_exchange(observed, next).is_ok() {
+        if let Ok(committed) = transition(slot, observed, OwnerEvent::WakeLocal, Some(cpu)) {
+            let next = committed.next;
+            committed.into_duty().run_queue_inserted(&rq);
             frame_publication::bind_local_owner_generation(slot, next.generation);
             RUN_QUEUES[cpu].publish_load(&rq);
             return RemoteWakeOutcome::Published { cpu, notify: false };
@@ -157,9 +166,9 @@ pub(in crate::multitask::scheduler) fn test_running_claim(slot: usize, cpu: usiz
     let observed = owner(slot);
     assert_eq!(observed.state, RunOwnerState::Local);
     assert_eq!(observed.cpu, Some(cpu));
-    OWNER_WORDS[slot]
-        .compare_exchange(observed, observed.next(RunOwnerState::Running, Some(cpu)))
-        .unwrap();
+    let _ = transition(slot, observed, OwnerEvent::Claim, Some(cpu))
+        .unwrap()
+        .settled();
     rq.remove(slot, weight);
     RUN_QUEUES[cpu].publish_load(&rq);
 }

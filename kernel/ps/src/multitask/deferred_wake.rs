@@ -47,11 +47,33 @@ unsafe impl Sync for DeferredWakeQueues {}
 static DEFERRED_WAKES: DeferredWakeQueues =
     DeferredWakeQueues([const { UnsafeCell::new(DeferredWakeBatch::new()) }; CPU_COUNT]);
 
-/// Appends one unique task identity to the exact CPU-owned batch.
+/// Appends one unique task identity to the exact CPU-owned batch and makes the
+/// deferral visible to every check that may skip a scheduler entry.
+///
+/// The batch is drained only by `DispatchEntry` (a scheduler entry on this
+/// CPU). The periodic continuation fast return (`irq::retain_periodic_continuation`)
+/// and the syscall tail (`irq::claim_interruptible_syscall_reschedule`) decide to
+/// skip that entry from the CPU's durable reschedule request bit, not from this
+/// batch, so a deferral that published no request could wait indefinitely on a
+/// CPU running one compute-bound task or idling. Every deferral therefore
+/// publishes this CPU's request after its append, duplicate or not: a request
+/// claimed since the original append is always followed by a drain (see
+/// `DispatchEntry::from_scope`), but re-publishing keeps that argument local.
+///
+/// `publish_request` is one CAS loop on this CPU's own cache-padded request
+/// word plus a lock-free lifecycle snapshot: no lock, no allocation and no lock
+/// order, so it is legal under a raw leaf, with IRQs masked and inside a
+/// `DispatchPreemption` scope - every context that defers.
 ///
 /// Callers provide the local-IRQ exclusion that makes the mutable queue access
 /// safe. Keeping the batch operation separate makes the static CPU-local
 /// storage testable without executing CLI on a host process.
+fn defer_and_request(queue: &mut DeferredWakeBatch, cpu: usize, task_id: u64) -> bool {
+    let queued = defer_into_queue(queue, cpu, task_id);
+    super::irq::request_local_reschedule_on(cpu);
+    queued
+}
+
 fn defer_into_queue(queue: &mut DeferredWakeBatch, cpu: usize, task_id: u64) -> bool {
     assert_ne!(task_id, 0, "deferred scheduler wake requires task identity");
     if queue.tasks[..queue.len].contains(&task_id) {
@@ -78,7 +100,7 @@ pub(super) fn defer_current_cpu(task_id: u64) -> bool {
         let cpu = nucleus_core::util::lockdep::current_cpu_index();
         // SAFETY: local interrupts are excluded for this CPU-owned queue.
         let queue = unsafe { &mut *DEFERRED_WAKES.0[cpu].get() };
-        defer_into_queue(queue, cpu, task_id)
+        defer_and_request(queue, cpu, task_id)
     })
 }
 
@@ -95,6 +117,17 @@ pub(super) fn take_masked(
     // SAFETY: original same-CPU masked custody excludes local queue writers.
     let queue = unsafe { &mut *DEFERRED_WAKES.0[cpu].get() };
     (queue.len != 0).then(|| take_queue(queue))
+}
+
+/// Whether this original masked CPU's batch holds a deferral the entry has not
+/// taken yet (a wake published by the entry itself deferred another).
+pub(super) fn queued_masked(scope: &nucleus_core::util::lockdep::DispatchPreemption<'_>) -> bool {
+    assert!(scope.is_masked(), "deferred wake probe requires original masked scope");
+    let cpu = scope.cpu();
+    assert!(cpu < CPU_COUNT, "deferred wake probe CPU exceeds capacity");
+    // SAFETY: original same-CPU masked custody excludes local queue writers;
+    // this reads one word of the CPU-owned batch.
+    unsafe { (*DEFERRED_WAKES.0[cpu].get()).len != 0 }
 }
 
 #[cfg(test)]
@@ -136,7 +169,7 @@ impl TestDeferredWakeQueuesRestore {
         // SAFETY: this fixture holds the test serialization guard and owns the
         // saved/restored lifetime of every static CPU-local queue.
         let queue = unsafe { &mut *DEFERRED_WAKES.0[cpu].get() };
-        defer_into_queue(queue, cpu, task_id)
+        defer_and_request(queue, cpu, task_id)
     }
 
     fn take(&mut self, cpu: usize) -> DeferredWakeBatch {
@@ -196,6 +229,44 @@ mod tests {
             [0x401],
             "draining one CPU must not consume another CPU's deferred wake"
         );
+    }
+
+    /// A deferral is invisible to the periodic continuation fast return and
+    /// the syscall tail unless it publishes this CPU's durable request; before
+    /// that publication a compute-bound or idle CPU kept the wake forever.
+    #[test]
+    fn deferral_publishes_the_request_that_defeats_every_scheduler_skip() {
+        let mut queues = TestDeferredWakeQueuesRestore::new();
+        let cpu = CPU_COUNT - 3;
+        let _ = crate::multitask::reschedule_observation::claim_pending(cpu);
+        assert!(!crate::multitask::reschedule_observation::request_pending(cpu));
+        assert!(queues.defer(cpu, 0x601));
+        assert!(
+            crate::multitask::reschedule_observation::request_pending(cpu),
+            "a deferred wake must force the next periodic tick / syscall tail into the scheduler"
+        );
+        let _ = crate::multitask::reschedule_observation::claim_pending(cpu);
+    }
+
+    /// The drain and a new deferral are ordered on one CPU: a deferral made by
+    /// work running after the drain read the batch (a nested wake inside the
+    /// same scheduler entry) re-publishes the request even when the earlier one
+    /// was already claimed, so the claim cannot have consumed it unseen.
+    #[test]
+    fn deferral_racing_after_a_drain_and_claim_republishes_its_request() {
+        let mut queues = TestDeferredWakeQueuesRestore::new();
+        let cpu = CPU_COUNT - 3;
+        assert!(queues.defer(cpu, 0x701));
+        let drained = queues.take(cpu);
+        assert_eq!(drained.len(), 1);
+        assert!(crate::multitask::reschedule_observation::claim_pending(cpu).is_some());
+        // A wake deferred after the drain and after the claim (or a duplicate
+        // of an entry whose request was claimed) must leave a pending edge.
+        assert!(queues.defer(cpu, 0x702));
+        assert!(queues.defer(cpu, 0x702));
+        assert!(crate::multitask::reschedule_observation::request_pending(cpu));
+        assert_eq!(queues.batch(cpu).iter().collect::<std::vec::Vec<_>>(), [0x702]);
+        let _ = crate::multitask::reschedule_observation::claim_pending(cpu);
     }
 
     #[test]

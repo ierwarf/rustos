@@ -1,6 +1,6 @@
 //! Owner: exact terminal producer loan, before withdrawal through final consumer publication.
 //! Boundary: Class50 metadata custody, not process-last-live, exec, CPU/MM or IRQ grant.
-//! Lifecycle: Reserved -> Effects -> Deferred -> Claimed -> Effects -> Published.
+//! Lifecycle: Reserved -> {Effects -> Deferred | WaitingExecutor | Parked} -> Claimed -> ... -> Published.
 //! Concurrency: scalar leaves only; no leaf spans scheduler/process/queue callbacks or Drop.
 //! Failure: untouched rollback exact; effect abandonment quarantines; all epochs checked.
 //! Forbidden: copied reasons/UIDs, descriptor absence or empty deferred queue are not producer ACKs.
@@ -33,8 +33,46 @@ pub(super) enum Phase {
     WaitingExecutor,
     Effects,
     Deferred,
+    /// A stop parked behind another CPU's in-flight dispatch claim: nothing has
+    /// been withdrawn, so the lifecycle is still live (unlike `Deferred`).
+    Parked,
     Claimed,
     Poisoned,
+}
+/// Where a claimed or retained producer came from, and therefore what it has
+/// already done. Exactly one origin is restored when an untouched claimant
+/// rolls back, so a resumed stop can never be mistaken for another kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::multitask::scheduler) enum Origin {
+    /// Withdrawn (owner `Retired`, lifecycle retired), then deferred because
+    /// quiescence or process election failed.
+    Withdrawn,
+    /// Reserved while a kernel executor held a resume loan; nothing withdrawn.
+    ExecutorWait,
+    /// Reserved while another CPU's dispatch claim of the task was in flight;
+    /// nothing withdrawn.
+    Parked,
+}
+impl Origin {
+    const fn of(phase: Phase) -> Option<Self> {
+        match phase {
+            Phase::Deferred => Some(Self::Withdrawn),
+            Phase::WaitingExecutor => Some(Self::ExecutorWait),
+            Phase::Parked => Some(Self::Parked),
+            _ => None,
+        }
+    }
+    const fn phase(self) -> Phase {
+        match self {
+            Self::Withdrawn => Phase::Deferred,
+            Self::ExecutorWait => Phase::WaitingExecutor,
+            Self::Parked => Phase::Parked,
+        }
+    }
+    /// Whether this origin has withdrawn the run owner and the lifecycle.
+    pub(in crate::multitask::scheduler) const fn withdrawn(self) -> bool {
+        matches!(self, Self::Withdrawn)
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Record {
@@ -50,8 +88,9 @@ pub(in crate::multitask::scheduler) struct Producer {
     reason: TaskRetireReason,
     detach: bool,
     turn: Option<Credential>,
-    claimed: bool,
-    waited_for_executor: bool,
+    /// `None` for a fresh reservation (rollback vacates the row); otherwise the
+    /// exact origin a claimed or retained producer restores on rollback.
+    origin: Option<Origin>,
     effects: bool,
     live: bool,
 }
@@ -102,8 +141,7 @@ impl Producer {
             reason,
             detach,
             turn: None,
-            claimed: false,
-            waited_for_executor: false,
+            origin: None,
             effects: false,
             live: true,
         })
@@ -115,8 +153,8 @@ impl Producer {
         let record = {
             let mut row = CELLS.get(slot)?.state.lock();
             let record = row.producer?;
+            let origin = Origin::of(record.phase)?;
             if row.reset_seal.is_some()
-                || !matches!(record.phase, Phase::Deferred | Phase::WaitingExecutor)
                 || record.key.task_id != task_id
                 || row.task_id != task_id
                 || row.generation != record.key.generation
@@ -128,7 +166,7 @@ impl Producer {
             {
                 return None;
             }
-            if record.phase == Phase::WaitingExecutor
+            if origin == Origin::ExecutorWait
                 && !super::super::stack_resources::terminal_binding_matches(slot, task_id)
             {
                 return None;
@@ -141,17 +179,16 @@ impl Producer {
             row.producer = Some(admitted);
             row.deferred = None;
             row.producing = true;
-            (admitted, record.phase == Phase::WaitingExecutor)
+            (admitted, origin)
         };
-        let (record, waited_for_executor) = record;
+        let (record, origin) = record;
         Some(Self {
             slot,
             key: record.key,
             reason: record.reason,
             detach: record.detach,
             turn: record.turn,
-            claimed: true,
-            waited_for_executor,
+            origin: Some(origin),
             effects: false,
             live: true,
         })
@@ -162,7 +199,7 @@ impl Producer {
         let mut row = CELLS[self.slot].state.lock();
         if self.exact(&row)
             && !self.effects
-            && !self.claimed
+            && self.origin.is_none()
             && row.producer.unwrap().phase == Phase::Reserved
             && crate::multitask::current_identity::execution::kernel_executor::admit_stop_wait(
                 self.slot,
@@ -180,8 +217,14 @@ impl Producer {
         // Otherwise the untouched producer rolls back; no descriptor inference
         // or user continuation is converted into executor retirement custody.
     }
+    #[cfg(test)]
     pub(in crate::multitask::scheduler) fn waited_for_executor(&self) -> bool {
-        self.waited_for_executor
+        self.origin == Some(Origin::ExecutorWait)
+    }
+    /// The exact origin of a claimed or retained producer; `None` for a fresh
+    /// reservation. Every claimant restarts the withdrawal from the top.
+    pub(in crate::multitask::scheduler) fn origin(&self) -> Option<Origin> {
+        self.origin
     }
     pub(super) fn waiting_executor(record: Record) -> bool {
         record.phase == Phase::WaitingExecutor
@@ -190,16 +233,24 @@ impl Producer {
     /// Acknowledgement of the retained ORIGINAL first producer, not admission
     /// or a replacement lifetime. Caller still owns its original Current loan.
     pub(in crate::multitask::scheduler) fn waiting_for_original(slot: usize, id: u64) -> bool {
-        let Some(cell) = CELLS.get(slot) else { return false; };
+        let Some(cell) = CELLS.get(slot) else {
+            return false;
+        };
         let row = cell.state.lock();
-        let Some(record) = row.producer else { return false; };
+        let Some(record) = row.producer else {
+            return false;
+        };
         record.phase == Phase::WaitingExecutor
-            && record.key.task_id == Some(id) && row.task_id == Some(id)
+            && record.key.task_id == Some(id)
+            && row.task_id == Some(id)
             && row.generation == record.key.generation
             && row.producer_nonce == record.key.nonce
-            && row.deferred == Some(record.reason) && row.reason == Some(record.reason)
-            && !row.producing && row.reset_seal.is_none()
-            && row.cleanup == CleanupState::Vacant && row.kernel == KernelState::Vacant
+            && row.deferred == Some(record.reason)
+            && row.reason == Some(record.reason)
+            && !row.producing
+            && row.reset_seal.is_none()
+            && row.cleanup == CleanupState::Vacant
+            && row.kernel == KernelState::Vacant
     }
     pub(in crate::multitask::scheduler) fn slot(&self) -> usize {
         self.slot
@@ -265,8 +316,11 @@ impl Producer {
         {
             let mut row = CELLS[self.slot].state.lock();
             assert!(
-                self.exact(&row) && self.effects && self.turn.is_none()
-                    && row.producing && row.producer.unwrap().phase == Phase::Effects,
+                self.exact(&row)
+                    && self.effects
+                    && self.turn.is_none()
+                    && row.producing
+                    && row.producer.unwrap().phase == Phase::Effects,
                 "terminal stop retention lost original effects owner"
             );
             row.reason = Some(self.reason);
@@ -274,7 +328,10 @@ impl Producer {
             row.producer.as_mut().unwrap().phase = Phase::Claimed;
         }
         self.effects = false;
-        self.claimed = true;
+        // Withdrawn now, whatever the claim origin was: an untouched rollback
+        // from here restores a withdrawn `Deferred` stop, never an executor
+        // wait or a park.
+        self.origin = Some(Origin::Withdrawn);
         self
     }
 
@@ -292,6 +349,7 @@ impl Producer {
             assert!(
                 self.exact(&cell)
                     && !self.effects
+                    && self.origin.is_none_or(|origin| !origin.withdrawn())
                     && cell.producing
                     && cell
                         .producer
@@ -299,7 +357,7 @@ impl Producer {
                 "terminal park lacks an untouched original producer"
             );
             if let Some(record) = cell.producer.as_mut() {
-                record.phase = Phase::Deferred;
+                record.phase = Phase::Parked;
             }
             cell.reason = parked;
             cell.deferred = parked;
@@ -374,12 +432,8 @@ impl Drop for Producer {
         if self.effects {
             row.producer.as_mut().unwrap().phase = Phase::Poisoned;
             row.producing = true;
-        } else if self.claimed {
-            row.producer.as_mut().unwrap().phase = if self.waited_for_executor {
-                Phase::WaitingExecutor
-            } else {
-                Phase::Deferred
-            };
+        } else if let Some(origin) = self.origin {
+            row.producer.as_mut().unwrap().phase = origin.phase();
             row.deferred = Some(self.reason);
             row.producing = false;
         } else {

@@ -66,10 +66,12 @@ pub(in crate::multitask::scheduler) fn actual_original_ordering_preserves_spawn_
         runqueue::raise_vruntime_floor(child, 100_000_000);
         assert!(!spawn_in(scope, CHILD));
         assert_eq!(runqueue::vruntime(child), 100_000_000, "deduplicated spawn cannot donate twice");
-        assert!(spawn_in(scope, PARENT));
+        // The parent is Running here: it has had its first turn, so a spawn
+        // record for it would only stall the consumer once it blocks.
+        assert_eq!(runqueue::owner(root).state, runqueue::RunOwnerState::Running);
+        assert!(!spawn_in(scope, PARENT));
         let mut policy = dispatch_policy::lock(0);
         assert_eq!(policy.spawn_pick_hints.pop().unwrap().task_id, CHILD);
-        assert_eq!(policy.spawn_pick_hints.pop().unwrap().task_id, PARENT);
         assert!(policy.spawn_pick_hints.is_empty());
         drop(policy);
         assert!(stack_resources::cpu_leases::owns_current(0, root));

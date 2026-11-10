@@ -45,6 +45,24 @@ fn stage(handle: ProcessHandle, root: u64) -> (process::ExecReservation, process
     .unwrap();
     (reservation, staged)
 }
+/// Runs the production activation capture for the fixture task inside an open
+/// modeled dispatch turn on `cpu` (the capture refuses outside one, as the
+/// claim path only runs inside one).
+fn in_turn<R>(cpu: usize, f: impl FnOnce() -> R) -> R {
+    let mut f = Some(f);
+    let mut result = None;
+    crate::multitask::cpu_local::with_test_activation_return(cpu, SLOT, SLOT, |phase| {
+        if phase == 0 { result = f.take().map(|f| f()); }
+    });
+    result.unwrap()
+}
+/// Root of that capture, or `None` when it refuses (closed, foreign or
+/// replaced MM).
+fn current_root(cpu: usize) -> Option<u64> {
+    in_turn(cpu, || {
+        test_capture_activation(SLOT, cpu).flatten().and_then(|credential| credential.root_for(SLOT, PID))
+    })
+}
 pub(super) fn admit(
     handle: ProcessHandle,
 ) -> super::super::super::context_validation::PublishedFrameView {
@@ -55,6 +73,7 @@ pub(super) fn admit(
 #[test]
 fn staged_mm_closes_old_selection_but_cpu_bank_retains_old_root_until_context_release() {
     let _isolation = process::tests::isolate_process_table();
+    let _cpu = crate::multitask::cpu_local::test_publication_lock();
     let _serial = scheduling_runtime::test_serial_guard();
     let _queue = runqueue::test_serial_guard();
     runqueue::reset_before_publication();
@@ -63,13 +82,10 @@ fn staged_mm_closes_old_selection_but_cpu_bank_retains_old_root_until_context_re
     runqueue::address_space::initialize(SLOT, 0x2000);
     runqueue::admit_blocked(SLOT);
     let selected = stack_resources::pin_view(SLOT, PID, view).unwrap();
-    let captured_root = stack_resources::cpu_leases::with_test_bank(3, selected, false, || {
-        let captured_root = lease_execution_root(SLOT, 0x2000, 3).unwrap();
-        assert_eq!(captured_root.root(), 0x2000);
-        assert!(execution_root_is_current(SLOT, 0x2000, 3));
-        assert!(!execution_root_is_current(SLOT, 0x3000, 3));
+    stack_resources::cpu_leases::with_test_bank(3, selected, false, || {
+        assert_eq!(current_root(3), Some(0x2000));
         let (reservation, staged) = stage(handle, 0x3000);
-        assert!(!execution_root_is_current(SLOT, 0x2000, 3));
+        assert_eq!(current_root(3), None, "staged exec closed the old selection");
         assert!(stack_resources::pin_view(SLOT, PID, view).is_none());
         assert!(process::pin_process_mm(handle, PID).is_none());
         let next = staged.pin_execution_mm(reservation, 0x3000);
@@ -88,22 +104,16 @@ fn staged_mm_closes_old_selection_but_cpu_bank_retains_old_root_until_context_re
                 .is_some_and(|pin| pin.root() == 0x2000 && !pin.is_open())
         }));
         assert!(std::panic::catch_unwind(|| clear(SLOT)).is_err());
-        assert!(!captured_root._pin.as_ref().unwrap().is_open());
-        assert!(lease_execution_root(SLOT, 0x2000, 3).is_none());
-        captured_root
+        assert_eq!(current_root(3), None, "a sealed root is never fresh activation authority");
     });
-    assert!(!execution_root_is_current(SLOT, 0x2000, 3));
     release(SLOT);
-    // Copied root authority retains its own physical MM outside the resource
-    // leaf/context; it is not fresh permission to reactivate a sealed root.
-    assert_eq!(captured_root._pin.as_ref().unwrap().root(), 0x2000);
-    drop(captured_root);
     process::detach_task(handle).unwrap();
     assert_eq!(process::reap_exited_processes(), 1);
 }
 #[test]
 fn exec_receipt_moves_mm_generation_after_root_publication_and_before_old_state_release() {
     let _isolation = process::tests::isolate_process_table();
+    let _cpu = crate::multitask::cpu_local::test_publication_lock();
     let _serial = scheduling_runtime::test_serial_guard();
     let _queue = runqueue::test_serial_guard();
     runqueue::reset_before_publication();
@@ -149,14 +159,14 @@ fn exec_receipt_moves_mm_generation_after_root_publication_and_before_old_state_
     old.retire_execution_state();
     let frame = stack_resources::pin_view(SLOT, PID, view).unwrap();
     stack_resources::cpu_leases::with_test_bank(3, frame, true, || {
-        assert!(execution_root_is_current(SLOT, 0x3000, 3));
-        assert!(!execution_root_is_current(SLOT, 0x2000, 3));
+        assert_eq!(current_root(3), Some(0x3000));
+        // A user context that lost its process binding has no kernel-root
+        // exception: the production capture refuses it outright.
         RESOURCES[SLOT].with(|resources| resources.context.as_mut().unwrap().process_handle = None);
-        assert!(!execution_root_is_current(SLOT, 0x3000, 3));
+        assert!(in_turn(3, || test_capture_activation(SLOT, 3).is_none()));
         RESOURCES[SLOT]
             .with(|resources| resources.context.as_mut().unwrap().process_handle = Some(handle));
     });
-    assert!(!execution_root_is_current(SLOT, 0x3000, 3));
     drop(old_mm);
     release(SLOT);
     current_identity::clear(SLOT);

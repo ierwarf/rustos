@@ -112,9 +112,10 @@ Do not reorder without reading `kernel/src/main.rs` and
   after raw unlock/deferred IPI, then restores caller IF only for unchanged
   returns. Changed returns park the unique unit until post-RSP Committing releases
   it without restoring outgoing IF. Cold directory/MM transactions still remain.
-  Architecture consumes `ExecutionRootLease`: exact bank/context/MM-root capture
-  retained outside leaves through hardware work, not a sampled boolean. A closed
-  root refuses fresh capture; backing pins do not replace MM close arbitration.
+  Architecture consumes the claim's `ActivationCredential`: exact
+  bank/context/MM capture retained by the claimed turn through hardware work,
+  not a sampled boolean. A closed root refuses fresh capture; backing pins do
+  not replace MM close arbitration.
 - **Scheduler wait primitives:** use `current_task_id`,
   `arm_block_current_task`, condition publication/recheck,
   `commit_block_current_task_and_yield`, and `wake_task`. The commit and

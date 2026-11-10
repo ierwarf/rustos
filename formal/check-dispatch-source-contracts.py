@@ -134,7 +134,7 @@ choose = body(dispatch, 'choose')
 ordered(choose, ['dispatch_policy::atomic_activation_pending(cpu)',
     'first_turn(turn, cpu, true, class_sequence)', 'result => return result',
     'synchronous(cpu)', 'result => return result',
-    'local_dispatch::retry_incomplete_policy(|| local_dispatch::choose_overdue_system(',
+    'local_dispatch::retry_incomplete_policy(|unresolved| local_dispatch::choose_overdue_system(',
     'runqueue::local_runnable_sequence(cpu)', 'donation_ledger::class_publication_sequence()',
     'selected_candidate(slot, cpu, id, generation', 'Err(_) => return Decision::Incomplete',
     'first_turn(turn, cpu, false, class_sequence)', 'latency(cpu)'], 'complete early priority')
@@ -153,7 +153,7 @@ ordered(body(dispatch, 'fair'), ['local_dispatch::choose_local_next_with(',
     'Ok((slot, generation))', 'current_identity::read_dispatch(slot)',
     'candidate.slot != slot || candidate.generation != generation',
     'Ok(Some(candidate))'], 'fair winner retains its exact original physical loan')
-ordered(body(dispatch, 'retry_fair'), ['local_dispatch::retry_incomplete_policy(|| fair('],
+ordered(body(dispatch, 'retry_fair'), ['local_dispatch::retry_incomplete_policy(|unresolved| fair('],
     'shared bounded fair retry')
 ordered(body(dispatch, 'dispatch'), ['turn.begin_priority_choice()',
     'prologue(outgoing, rsp, voluntary)', 'match choose(', 'Decision::Selected(candidate)',
@@ -259,7 +259,7 @@ sync_consumer = body(sync[sync.index("/// Consumes this CPU's FIFO"):], 'take_ne
 ordered(sync_consumer, ['SYNC_HANDOFF_BUDGET[cpu].streak', '>= MAX_SYNC_HANDOFF_CHAIN_TICKS',
     '&& fair_competitor_ready()', 'for attempt in 0..MAX_TASK',
     'let taken = {', 'state_for_cpu(cpu).lock()',
-    'take_next_ready_record_with_competitor(false, |_| true)',
+    'take_next_ready_record(|_| true)',
     'if state.len == 0', 'pending.store(false,', 'taken\n        };',
     'let Some(record) = taken', 'if ready(record)', 'return Some(record)'],
     'bounded exact FIFO pop ends raw leaf before original frame qualification')
@@ -274,7 +274,7 @@ for anchor in ['owner.state == runqueue::RunOwnerState::DirectHandoff',
         raise SystemExit('Direct FIFO custody lost ' + anchor)
 owner = (base / 'runqueue/ipc_handoff.rs').read_text()
 ordered(body(owner, 'publish_direct_handoff'), [
-    'OWNER_WORDS[slot].compare_exchange(owner, next).is_ok()',
+    'transition(slot, owner, OwnerEvent::HandoffDirect, Some(cpu))',
     'frame_publication::bind_local_owner_generation(slot, next.generation)'],
     'Direct CAS before frame generation binding')
 frame = (base / 'frame_publication.rs').read_text()
@@ -356,9 +356,9 @@ ordered(body(maintenance, 'transfer'), ['frame_publication::pin_for_identity(tok
 ordered(body(owner, 'rehome_queued_frame'), ['owner.generation != frame.token.owner_generation',
     'RUN_QUEUES[source_cpu].inner.lock()', '!source.contains(slot) || !frame.is_current()',
     'with_rehome_admission(slot, target_cpu, None', 'if !frame.is_current()',
-    'compare_exchange(owner, migrating)', 'source.remove(slot, weight)',
+    'transition(slot, owner, OwnerEvent::Rehome, Some(target_cpu))', 'source.remove(slot, weight)',
     'publish_load(&source)', 'drop(source)',
-    'publish_migrating_record(slot, migrating, target_cpu, weight)'],
+    'publish_migration(committed, weight)'],
     'exact source-generation migration CAS and mailbox')
 # Whole fixed-fault exception producer and resumed Current architecture. Native
 # capture witnesses cannot execute the blocking trap or privileged registers;
@@ -406,9 +406,9 @@ ordered(body(producer, 'publish_with'), ['publish_switching(scope, binding, type
 ordered(body(producer, 'publish_switching'), ['frame_publication::read_for_identity(token, binding.id(), cpu)',
     'dispatch_claim::validate_held_frame(', 'direct_switch_admitted(cpu)',
     'Publication::begin(scope, target)', 'sync_handoff::publish_original(',
-    'typed.publish_and_clear(', 'claim_blocked_handoff(slot, expected, target, local)',
+    'typed.publish_and_clear(', 'claim_blocked_handoff_duty(slot, expected, target, local)',
     'bind_local_owner_generation(slot, original.generation)',
-    'publish_handoff_mailbox(slot, original,', 'last_effect()',
+    'duty.publish_mailbox(runqueue::weight::value(slot))', 'last_effect()',
     'drop(publication)', 'direct_handoff_frame_token(slot, cpu)', 'FrameSelection::from_held(',
     'sync_handoff::enqueue(target', 'drop(reader)'], 'reader/phase/FIFO through pager floor')
 ordered(body(producer, 'direct_switch_admitted'), ['!sync_handoff::pending(cpu)',
@@ -569,11 +569,11 @@ queue_claim = (base / 'runqueue/claim.rs').read_text()
 ordered(body(queue_claim, 'claim_dispatch_inner'), ['RunOwnerState::DirectHandoff',
     'admitted_claim(frame, funding,', 'with_claim_activation_for_reader(slot, cpu,',
     'frame.map(|frame| frame.original_reader())',
-    'frame.is_current()', 'compare_exchange(owner, owner.next(',
+    'frame.is_current()', 'transition(slot, owner, OwnerEvent::Claim, Some(cpu))',
     'retain_mm_activation(cpu, activation)', 'RUN_QUEUES[cpu].inner.lock()',
     'admitted_claim(frame, funding,', 'with_claim_activation_for_reader(slot, cpu,',
     'frame.map(|frame| frame.original_reader())',
-    'frame.is_current()', 'compare_exchange(owner, next)', 'drop(rq)',
+    'frame.is_current()', 'transition(slot, owner, OwnerEvent::Claim, Some(cpu))', 'drop(rq)',
     'retain_mm_activation(cpu, activation)'], 'rq40 before admission and exact CAS before bank publication')
 frame_readers = (base / 'stack_resources/frame_readers.rs').read_text()
 ordered(body(frame, 'read_for_identity'), ['frame_readers::pin_and_acquire(',
@@ -781,8 +781,8 @@ initial_admission = (base / 'runqueue/admission.rs').read_text()
 ordered(body(initial_admission, 'admit_initial'), ['image.assert_materializing()',
     'let slot = image.slot()', 'let cpu = image.cpu()', 'Some(image.id())',
     'admission::is_reserved(slot)', 'RunOwnerState::Blocked', '!wait::armed(slot)',
-    'owner.next(RunOwnerState::Running, Some(cpu))',
-    'compare_exchange(owner, running)', 'bind_local_owner_generation(slot, running.generation)'],
+    'transition(slot, owner, OwnerEvent::AdmitInitial, Some(cpu))',
+    'bind_local_owner_generation(slot, running.generation)'],
     'original initial image alone admits exact CPU Running after hidden descriptor ACK')
 ordered(body(initial, 'initialize_owners'), ['image.assert_effects()',
     'stack_resources::assert_boot_vacant()', 'runqueue::reset_before_publication()',
@@ -884,8 +884,8 @@ ordered(body(interval, 'consume'), ['assert!(!cell.current_borrowed', 'cell.acti
 ordered(body(interval, 'install'), ['assert!(!cell.current_borrowed', 'cell.active',
     'cell.active = incoming.take()'], 'no replacement during original Current effects')
 group_api = (base.parent / 'current/group_exit.rs').read_text()
-ordered(body(group_api, 'request'), ['request_marked(scope, pid, requested_by_pid)'],
-    'group admission request delegates to the single marked admission')
+if re.search(r'\bfn\s+request\s*\(', group_api):
+    raise SystemExit('second group admission entry beside request_marked')
 ordered(body(group_api, 'request_marked'), ['held_spin_lock_depth()', 'target_by_pid(pid)',
     'queued_for(handle)', 'PendingExit::begin(handle, member)',
     'mark_process_exiting_for_handle(handle, pid)?', 'pending.publish(pid, Reason::Terminated'],
@@ -1130,7 +1130,7 @@ ordered(body(dispatch, 'hint'), ['next_pick_hint.take()', 'current_identity::rea
 # Blocked outgoing custody must bind the same CAS generation before its later
 # reply; requiring a process activation pin for a pure kernel image is invalid.
 returned = body((base / 'runqueue/return_publication.rs').read_text(), 'publish_return_inner')
-ordered(returned, ['OWNER_WORDS[slot].compare_exchange(observed, next).is_ok()',
+ordered(returned, ['if let Ok(committed) = committed {',
     'frame_publication::bind_local_owner_generation(slot, next.generation)'],
     'successful outgoing CAS binds Blocked and Local frame generation')
 if 'if local { frame_publication::bind_local_owner_generation' in ' '.join(returned.split()):
@@ -1186,8 +1186,9 @@ ordered(body(fifo, 'first_turn_fifo'), ['dispatch_claim::tests::fixture(false',
     'sync_handoff::model_len(0)', 'finish_modeled_preparation(slot, 121)'],
     'historical FIFO witness reaches SAME original born frame/funding claim before lower queues')
 ordered(body(fifo, 'incomplete_first_turn'), ['Decision::Incomplete', 'enqueue(unknown,',
-    'first_turn(turn', 'Decision::Incomplete', 'assert!(!empty(atomic))', 'turn.claimed_return().is_none()'],
-    'unknown original FIFO cannot be consumed or admit a later arm')
+    'first_turn(turn', 'Decision::Empty', 'assert!(empty(atomic)', 'turn.claimed_return().is_none()',
+    'atomic_activation_handoff_remaining, 0'],
+    'unqueued FIFO record is consumed without a claim instead of idling the CPU')
 ordered(body(fifo, 'synchronous_fifo'), ['policy_witnesses::family(', 'match synchronous(0)',
     'sync_handoff::model_len(0), 2', 'Some((first,', 'Some((second,',
     'sync_handoff::record_dispatch(0, true, 1)', 'MAX_SYNC_HANDOFF_CHAIN_TICKS',
@@ -1362,8 +1363,8 @@ ordered(body(lane, 'reply'), ['cpu_local::lane_idle(cpu)', 'reply_context_custod
     'release_reply_lane(c, caller_id, reply)', 'runqueue::simd_tls::save_simd_state_lane(s, s_id)', 'finish(cpu, from, to, rsp, &clock, generic)'],
     'lane reply releases the donation only after every decline check')
 ordered(body(lane, 'finish'), ['funding_label(to.slot, to.id)', 'can_forward(', 'settle(cpu, from.slot, from.id, clock)',
-    'prepare_grant(to.slot, cpu)', 'with_placement_admission(', 'lane_wake_clear(', 'lane_cas(',
-    'resident::take(to.slot, generation)', 'cpu_leases::prepare(cpu, loans.pin)',
+    'prepare_grant(to.slot, cpu)', 'with_placement_admission(', 'lane_wake_clear(', 'lane_claim(',
+    'claimed.take_resident()', 'cpu_leases::prepare(cpu, loans.pin)',
     'banks::prepare_lane(cpu, loans.permit)', 'execution_interval::forward(', 'open_lane(',
     'publish_blocked(cpu, from.slot, rsp)', 'lane_install(', 'note_installed(', 'cpu_local::lane_publish(',
     'lane_install_placement(', 'complete(cpu, from.slot'],
@@ -1375,9 +1376,10 @@ ordered(body(resident_source, 'park'), ['claim_empty(cell, generation)', 'cell.p
 ordered(body(resident_source, 'take'), ['compare_exchange(generation, BUSY', 'cell.drain()',
     'cell.generation.store(0, Ordering::Release)'],
     'the generation CAS decides who owns the parked loans and the word frees only after the payload read')
-runq = (base / 'runqueue.rs').read_text()
-ordered(body(runq, 'compare_exchange'), ['next.generation > expected.generation',
-    'self.compare_exchange_raw(expected, next)?', 'resident::on_owner_transition(self.slot(), expected.generation)'],
+runq = (base / 'runqueue/ownership.rs').read_text()
+ordered(body(runq, 'transition'), ['let next = expected.successor(row, cpu)',
+    'owner.cas(expected, next)?', 'if row.duty != DutyKind::ResidentTake',
+    'resident::on_owner_transition(slot, expected.generation)'],
     'every owner transition out of a generation revokes its parked cell')
 ordered(body(cpu_source, 'commit_context_switch_at_rsp'), ['LANE_ACK_FROM[logical_index].load(',
     'TRANSITION_ACTIVE[logical_index].store(false', 'resident::commit_outgoing_lane(',

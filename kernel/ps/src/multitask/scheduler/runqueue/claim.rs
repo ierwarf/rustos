@@ -101,26 +101,25 @@ fn claim_dispatch_inner(
                     #[cfg(test)]
                     observe_claim_admission(slot, funding);
                     if frame.is_some_and(|frame| !frame.is_current()) { return Err(owner); }
-                    OWNER_WORDS[slot]
-                        .compare_exchange(owner, owner.next(RunOwnerState::Running, Some(cpu)))
+                    transition(slot, owner, OwnerEvent::Claim, Some(cpu)).map(Transition::settled)
                 })
             }).and_then(|attempt| attempt.into_claimed())
         else {
             return false;
         };
-        if claim.is_err() {
+        let Ok(running) = claim else {
             drop(activation);
             drop(execution);
             return false;
-        }
+        };
         if let Some(mut activation) = activation {
-            activation.bind_claimed_owner(owner.next(RunOwnerState::Running, Some(cpu)));
+            activation.bind_claimed_owner(running);
             crate::multitask::cpu_local::retain_mm_activation(cpu, activation);
         }
         if let Some(execution) = execution {
             crate::multitask::current_identity::execution::banks::prepare(cpu, execution);
         }
-        placement.bind_claimed(owner.next(RunOwnerState::Running, Some(cpu)));
+        placement.bind_claimed(running);
         crate::multitask::cpu_local::retain_placement(cpu, placement);
         return true;
     }
@@ -150,7 +149,6 @@ fn claim_dispatch_inner(
         // lock is acquired and before its exact owner CAS.
         set_runnable(slot, false);
     }
-    let next = owner.next(RunOwnerState::Running, Some(cpu));
     // The owner CAS is the claim's linearization point. A lock-free writer
     // can still update runnable/wait metadata while the rq lock is held.
     // Do not remove and reinsert queue custody across a failed CAS: that
@@ -162,7 +160,7 @@ fn claim_dispatch_inner(
                 #[cfg(test)]
                 observe_claim_admission(slot, funding);
                 if frame.is_some_and(|frame| !frame.is_current()) { return Err(owner); }
-                OWNER_WORDS[slot].compare_exchange(owner, next)
+                transition(slot, owner, OwnerEvent::Claim, Some(cpu)).map(Transition::settled)
             })
         })
     else {
@@ -174,15 +172,18 @@ fn claim_dispatch_inner(
         return false;
     }
     let (claim, activation, execution, mut placement) = attempt.into_claimed().unwrap();
-    if let Err(observed) = claim {
-        drop(rq);
-        drop(activation);
-        drop(execution);
-        if expected_generation.is_some() || observed.state.is_terminal() {
-            return false;
+    let next = match claim {
+        Ok(next) => next,
+        Err(observed) => {
+            drop(rq);
+            drop(activation);
+            drop(execution);
+            if expected_generation.is_some() || observed.state.is_terminal() {
+                return false;
+            }
+            panic!("scheduler dispatch lost owner race observed={observed:?}");
         }
-        panic!("scheduler dispatch lost owner race observed={observed:?}");
-    }
+    };
     // A reader can briefly see Running with old published membership; its
     // frame/owner qualification fails closed until this removal is published.
     rq.remove(slot, weight);

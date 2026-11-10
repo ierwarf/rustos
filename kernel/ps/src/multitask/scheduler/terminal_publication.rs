@@ -12,7 +12,9 @@ use retirement_cleanup::producer::Producer;
 fn quiescent(slot: usize) -> bool {
     // Preserve the SAME terminal producer until the outgoing image has been
     // sealed/published. Detaching its process metadata mid-return is forbidden.
-    if outgoing_image::frozen(slot) { return false; }
+    if outgoing_image::frozen(slot) {
+        return false;
+    }
     let cpu = nucleus_core::util::lockdep::current_cpu_index();
     let own_current = cpu_local::task_execution_owner(slot)
         == Some(cpu_local::TaskExecutionOwner::Current(cpu))
@@ -169,7 +171,9 @@ pub(super) unsafe fn guarded(mut owner: Producer, eligible_cpus: &dyn Fn(usize) 
     runqueue::wait::set_reason(slot, 0, 0);
     let terminal_pid = context.process_id.filter(|_| process_terminal);
     if terminal_pid.is_some() {
-        let census = process_turn.as_ref().expect("process terminal lost original census");
+        let census = process_turn
+            .as_ref()
+            .expect("process terminal lost original census");
         for &(_, member_id) in census.final_donation_members() {
             donation_ledger::release_task(member_id);
         }
@@ -209,9 +213,17 @@ pub(super) unsafe fn drain_guarded(eligible_cpus: &dyn Fn(usize) -> u64) {
         let Some(owner) = terminal_quarantine::claim(slot, id) else {
             continue;
         };
-        assert!(
-            identity::lifecycle(slot).retired || owner.waited_for_executor(),
-            "deferred retirement lost its terminal lifecycle or kernel resume loan"
+        // A deferred stop has exactly one of three origins, and the lifecycle
+        // must agree with it: only a withdrawn stop has retired the lifecycle;
+        // an executor wait and a park behind another CPU's in-flight dispatch
+        // claim are untouched. The claimant restarts the withdrawal from the top.
+        let origin = owner
+            .origin()
+            .expect("claimed deferred retirement lacks its origin");
+        assert_eq!(
+            identity::lifecycle(slot).retired,
+            origin.withdrawn(),
+            "deferred retirement origin {origin:?} disagrees with its terminal lifecycle"
         );
         // SAFETY: same caller custody and same original claimed producer.
         unsafe {

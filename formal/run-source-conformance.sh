@@ -533,8 +533,8 @@ if ! grep -Fq 'let previous = receiver_owner.cpu.unwrap_or_else' <<<"$ipc_fast_h
     || ! grep -Fq 'runqueue::affinity_payload::last_cpu(binding.slot())' <<<"$ipc_fast_handoff_body" \
     || ! grep -Fq 'if eligible(&binding, cpu) { cpu } else { previous }' <<<"$ipc_fast_handoff_body" \
     || ! grep -Fq 'if target != cpu && !eligible(&binding, target)' <<<"$ipc_fast_handoff_body" \
-    || ! grep -Fq 'runqueue::claim_blocked_handoff(slot, expected, target, local)' <<<"$ipc_fast_handoff_body" \
-    || ! grep -Fq 'runqueue::publish_handoff_mailbox(slot, original,' <<<"$ipc_fast_handoff_body" \
+    || ! grep -Fq 'runqueue::claim_blocked_handoff_duty(slot, expected, target, local)' <<<"$ipc_fast_handoff_body" \
+    || ! grep -Fq 'duty.publish_mailbox(runqueue::weight::value(slot))' <<<"$ipc_fast_handoff_body" \
     || ! grep -Fq 'request_target_reschedule(target)' <<<"$ipc_fast_handoff_body"; then
     echo 'synchronous IPC must prefer an eligible caller CPU while retaining the admitted previous-CPU remote wake fallback' >&2
     exit 1
@@ -1938,10 +1938,9 @@ scheduler-local-authority/SchedulerLocalAuthority|rustos-scheduler-frame-gate|te
 scheduler-local-authority/SchedulerLocalAuthority|rustos-scheduler-frame-gate|tests::budget_denial_requires_exact_unreplaced_reply_custody
 scheduler-local-authority/SchedulerLocalAuthority|rustos-scheduler-frame-gate|tests::selected_frame_must_match_both_owner_and_saved_stack
 scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::tests::final_local_frame_rechecks_exact_generation_rsp_and_validated_payload
-scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::tests::empty_fair_scan_claims_only_the_exact_local_idle_generation
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::policy_witnesses::one_persistently_unresolved_candidate_cannot_idle_the_cpu
 scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::tests::overdue_system_prefers_oldest_age_then_vruntime_without_reordering_ties
-scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::tests::deferred_catalog_fair_scan_runs_only_for_incomplete_local_observations
-scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::fair_retry::tests::torn_fair_observations_retry_without_authorizing_a_partial_candidate
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::fair_retry::tests::only_a_candidate_unresolved_in_every_observation_is_omitted
 scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::fair_retry::tests::incomplete_early_policy_never_means_no_due_peer
 scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::hint_priority::tests::incomplete_system_presence_cannot_release_a_user_hint
 scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::hint_priority::tests::latency_class_requires_a_stable_user_publication
@@ -2841,7 +2840,12 @@ job-policy-publication/JobPolicyPublication|kernel-ps|multitask::process_table::
 job-policy-publication/JobPolicyPublication|kernel-ps|multitask::process_table::jobs::policy::tests::policy_cache_checks_all_words_and_rejects_missing_stale_or_revoked_identity
 job-policy-publication/JobPolicyPublication|kernel-ps|multitask::process_table::jobs::policy::tests::current_binding_ceiling_read_never_borrows_table_or_recovers_hidden_membership
 scheduler-owner-word/SchedulerOwnerWord|kernel-ps|multitask::scheduler::runqueue::tests::in_place_edits_keep_custody_and_apply_to_a_live_word
-scheduler-owner-word/SchedulerOwnerWord|kernel-ps|multitask::scheduler::runqueue::tests::a_custody_transition_must_advance_the_generation
+scheduler-owner-word/SchedulerOwnerWord|kernel-ps|multitask::scheduler::runqueue::ownership::tests::the_table_is_exhaustive_over_live_words_every_row_advances_one_generation_and_others_panic
+scheduler-owner-word/SchedulerOwnerWord|kernel-ps|multitask::scheduler::runqueue::ownership::tests::every_state_event_pair_has_at_most_one_row_and_rows_follow_the_duty_rule
+scheduler-owner-word/SchedulerOwnerWord|kernel-ps|multitask::scheduler::runqueue::ownership::tests::a_dropped_enqueue_duty_panics_instead_of_stranding_the_task
+scheduler-owner-word/SchedulerOwnerWord|kernel-ps|multitask::scheduler::runqueue::ownership::tests::a_second_withdrawal_waits_for_the_first_ones_exact_completion
+scheduler-owner-word/SchedulerOwnerWord|kernel-ps|multitask::scheduler::runqueue::ownership::tests::run_intent_is_never_raised_on_a_blocked_word
+scheduler-owner-word/SchedulerOwnerWord|kernel-ps|multitask::scheduler::runqueue::ownership::tests::a_direct_handoff_keeps_run_intent_so_its_consumed_record_always_materializes
 scheduler-owner-word/SchedulerOwnerWord|kernel-ps|multitask::scheduler::runqueue::tests::lock_free_metadata_writers_leave_a_terminal_owner_word_untouched
 scheduler-owner-word/SchedulerOwnerWord|kernel-ps|multitask::scheduler::runqueue::tests::mailbox_adoption_survives_a_terminal_withdrawal_that_beats_its_owner_cas
 scheduler-resident-cell/SchedulerResidentCell|kernel-ps|multitask::scheduler::irq_entry_tests::lane::a_park_never_displaces_a_newer_cell_and_never_waits_on_a_busy_one
@@ -2850,6 +2854,12 @@ scheduler-resident-cell/SchedulerResidentCell|kernel-ps|multitask::scheduler::ir
 scheduler-resident-cell/SchedulerResidentCell|kernel-ps|multitask::scheduler::irq_entry_tests::lane::exec_eviction_drops_the_parked_cell_of_the_current_generation
 scheduler-resident-cell/SchedulerResidentCell|kernel-ps|multitask::scheduler::irq_entry_tests::lane::actual_lane_call_switches_to_the_parked_receiver_and_parks_the_caller_at_the_ack
 scheduler-resident-cell/SchedulerResidentCell|kernel-ps|multitask::scheduler::irq_entry_tests::lane::actual_lane_reply_returns_to_the_parked_caller_and_both_hops_share_one_funding
+scheduler-terminal-producer/SchedulerTerminalProducer|kernel-ps|multitask::scheduler::return_architecture::tests::actual_housekeeping_drain_resumes_a_stop_parked_behind_an_in_flight_claim
+scheduler-terminal-producer/SchedulerTerminalProducer|kernel-ps|multitask::scheduler::return_architecture::tests::actual_remote_terminal_cannot_retire_a_slot_whose_dispatch_claim_is_in_flight
+scheduler-terminal-producer/SchedulerTerminalProducer|kernel-ps|multitask::scheduler::stack_resources::kernel_executor_tests::queued_kernel_stop_preserves_original_request_dispatch_and_nested_executor_until_last_release
+scheduler-terminal-producer/SchedulerTerminalProducer|kernel-ps|multitask::scheduler::terminal_publication::tests::actual_terminal_frozen_outgoing_defers_same_producer_before_detach_or_consumers
+scheduler-terminal-producer/SchedulerTerminalProducer|kernel-ps|multitask::scheduler::terminal_publication::tests::actual_terminal_effects_publish_both_consumers_last_and_retain_current_backing_until_ack
+scheduler-terminal-producer/SchedulerTerminalProducer|kernel-ps|multitask::scheduler::retirement_cleanup::producer::tests::claimed_producer_rolls_back_to_its_exact_origin_and_a_withdrawal_overrides_it
 EOF
 
 # Every group is an independent Cargo selection over an already-built target

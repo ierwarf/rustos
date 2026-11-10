@@ -330,18 +330,20 @@ IRQ/APIC execution, outer raw locks or the complete joint claim/grant/MM/registe
 transaction. MM/CR3/TLB and cold cross-owner directory
 transactions remain guarded; this is not authorization for guard deletion.
 
-MM architecture preparation additionally retains a private non-Copy,
-non-migrating `ExecutionRootLease`, acquired from exact Current/Prepared context
-custody. The user-root reference is cloned under resource admission through the
-MM owner's open/close CAS, then retained outside the leaf through CR3/TSS/TLS
-installation or the same-task fast return. Kernel/bootstrap roots still require
-the external architecture owner; absent user-process custody is not permission.
-CPU turn custody is required for production architecture entry. This is physical
-root retention and exact credential capture, **not independent MM close versus
-complete activation/publication arbitration**: image/sibling quiescence and the
-cold directory still provide that transaction. Captured sealed roots retain
-backing but cannot grant a fresh architecture lease. The real context/MM-bank
-witness independently checks the lease pin survives context release.
+MM architecture preparation consumes the `ActivationCredential` that the claim
+captures (`stack_resources::activation::capture`, inside
+`frame_readers::with_claim_activation` under the slot's resource leaf, only in an
+open CPU dispatch turn) and the claimed turn retains
+(`cpu_local::retain_mm_activation`) through CR3/TSS/TLS installation or the
+same-task fast return. A closed, replaced or foreign MM refuses the capture; a
+user context without process custody is refused, and only a kernel context
+without MM is admitted as "no activation". This is exact credential capture
+and retention, **not independent MM close versus complete
+activation/publication arbitration**: image/sibling quiescence and the cold
+directory still provide that transaction. The former host-only
+`ExecutionRootLease` copy of this path is deleted; host witnesses
+(`context::mm_tests`, `context::activation_tests`) drive the production capture
+through the `context::test_capture_activation` seam inside a modeled turn.
 
 
 The same class-53 cell now owns the immutable task ID and kernel entry descriptor

@@ -325,3 +325,69 @@ netd reply froze all of it. `accept4` and `SO_PEERCRED` now run on
 bounded queue (back-pressure to the listener backlog); the request clock starts
 at accept time and the acceptor never exits on an accept error. Not fixed (see
 section 9): reads of admitted clients and reply writes still run on the broker.
+
+## 11. Round 2 evidence (4 vCPU, 100 boots of b82b50eb, 92/100)
+
+Logs: `/home/hongii2/rustos-evidence/4vcpu-100-round2-2026-11-09/` and
+`/tmp/rk/lane-{2,3}/kvm/debugcon-history/`. Lane 2 run 30 was a scheduler panic
+(`terminal_publication.rs:212`) and is outside this contract; lane 3 runs 2 and
+6 had rotated out of the history, so only their harness summary (gpu-scene and
+`ipcbench: end` missing, everything else ready, `startup-detail=no failure
+marker`) is known. What the typed records settled:
+
+| Run | Typed evidence | Verdict |
+| --- | --- | --- |
+| lane2 #28 (`input ring ... missing a live inputd policy consumer`) | Log ends at `rootd: core services ready, spawning initd via loaderd` (0.7 s). No `initd:` line ever; 30 s of idle census milestones; `ipc-service-reply-timeout` (250 ms class) from four core services at 0.6 s and 2.6 s. | Proven: inputd never existed, because initd never started, because rootd's loaderd call to spawn initd never returned. Not an inputd or lease defect. Cause below the userland: inferred, kernel IPC/activation. |
+| lane3 #22 (same host message) | initd spawned netd/devmgrd/inputd; inputd registered its endpoint and sent its first rootd health pulse (so its main and heartbeat threads ran); no `dvm-input-policy-ready`, no `DVM ingress arm` line; devmgrd printed `service start` and nothing more; `initd: endpoint wait pending ... slice=1..5` for devmgrd, 25 s. `ipc-service-reply-timeout` for devmgrd's main thread at 0.9 s (1 ms deadline) and a service printing `reply-recv reply failed`. | Proven: the policy consumer is created by exactly one event, inputd's `inputd-dvm-ingress` thread entering `SYS_RUSTOS_INPUT_WAIT_BROKER` (`input_broker_ops.rs`, `mark_dvm_policy_consumer_ready`), and that thread never reached it. No `AUTHORIZE_READ` path is involved. Whether the thread never ran or stalled earlier is not separable from this log (new markers below). |
+| lane2 #20 (`rustos-runtime=false`) | `initd endpoint admission failed: exec=devmgrd pid=25 errno=110 cause=budget-exhausted waited_ms=30005 slices=6`; rootd restarted initd and the second incarnation (devmgrd pid 49) was admitted. | Proven: devmgrd was permanently stuck after `service start`, not slow; the 30 s budget only delayed the verdict. Same stall as the round-1 run. Not an ordering bug (workers are created before registration on purpose). |
+| lane3 #20 (`rustos-runtime=false`) | `readiness v1 state=ready` first; wayclick connected; then `uiserver watchdog panic: phase=wayland step=dispatch elapsed_ms=7129`; 39 session calls of ~251 ms each (`ipc slow service: endpoint=65539 total_ms=251`) where passing boots have none. | Proven: uiserver was ready and then killed by its own watchdog during a Wayland dispatch whose socket calls (netd-backed) each took ~250 ms. UI-side weakness (below), kernel-side trigger. |
+| lane2 #36 (wayclick first frame missing) | `readiness v1 state=ready`; runtimed `launched wayclick.desktop`; `spawn-user-process` and `proc-activate-committed` for pid 83 present; no `wayclick: main enter` and no later milestone for pid 83, while netprobe and shell, spawned right after, ran. | Proven: the app was activated and never reached its first user line. Not uiserver, not runtimed. Inferred: kernel start of a new task. |
+| lane3 #6 | `ipcbench: end` missing only. | Not diagnosable from retained logs. |
+
+Common pattern (inferred, not proven): in four of the five diagnosable runs a
+newly created task (a process: initd, wayclick; or a thread of a fresh process:
+devmgrd's workers, inputd's ingestion worker) did not make progress after
+creation. `ipc-reply-wake-refused` / `ipc-service-reply-timeout` milestones are
+present in 47/48 and 39/48 boots of lane 2, passing ones included, so those
+markers alone do not discriminate failing boots. This belongs to the scheduler
+owner, who is already looking at the reply-timeout stalls; no `kernel/ps` file
+was touched.
+
+### 11.1 What changed
+
+- The harness names where a boot stopped (`boot-stage: first-missing=<stage>
+  last-reached=<stage>`) in the input-relay failure and in `startup-detail`
+  when no failure marker exists, from an ordered list of observable boot
+  stages (`startup_readiness.rs`). The input-relay failure above would now say
+  `first-missing=initd-supervising` (lane2 #28) or
+  `first-missing=devmgrd-registered last-reached=inputd-registered` (lane3
+  #22) instead of blaming inputd.
+- New evidence-only log lines to split the remaining ambiguity next round:
+  `devmgrd: ioctl workers started` (thread creation vs endpoint
+  registration) and `inputd: DVM ingress worker running` (worker never ran vs
+  never reached the wait broker). Both are optional stages: older logs are not
+  blamed for lacking them.
+
+### 11.2 Decisions
+
+- runtimed control-socket I/O thread + reply writer: **not justified.** The
+  acceptor move is the only runtimed change in this build. Across all 96
+  retained lane 2/3 boots there is no `slow broker pass` of 1 s or more and no
+  `accept failed` (largest pass 164 ms); the 5 s passes of round 1 exist only
+  in the older lane 0/1 logs. A rewrite of `socket.rs` for a failure that no
+  longer occurs would be speculative. Revisit if a broker pass of 1 s or more
+  reappears.
+- initd bounded respawn of a stuck child: **not implemented.** A child that
+  stops after `service start` never recovered inside 30 s, so the longer budget
+  buys nothing and a respawn would shorten the failure to one retry; but that
+  changes the supervisor policy (`fail-closed` becomes `retry once, then
+  fail-closed`) and would mask a kernel start-up bug. This is a product decision
+  for after the scheduler fix; the evidence for it is lane2 #20 (rootd's
+  restart of initd recovered the same boot).
+- uiserver watchdog: the dispatch budget (5 s netd stream lease + slack) is
+  justified for one socket call, but the watchdog measures the whole
+  `dispatch_single_client` burst, which issues many such calls. Under a kernel
+  that makes each call ~250 ms the compositor is killed while it is making
+  progress (lane3 #20). The sound fix is per-call progress accounting in the
+  Wayland server I/O layer, which needs the wayland-backend dispatch split per
+  request; deferred, single occurrence.

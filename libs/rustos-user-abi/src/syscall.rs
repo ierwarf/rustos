@@ -82,9 +82,8 @@ pub const SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER: u64 = 0x5255_0036;
 pub const SYS_RUSTOS_IPC_RECV_WITH_SENDER: u64 = 0x5255_0038;
 pub const SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT: u64 = 0x5255_0039;
 pub const SYS_RUSTOS_PROC_ACTIVATE_BROKER: u64 = 0x5255_003a;
-/// Capability-gated timer substrate for rootd's bounded restart backoff.
-/// Restart policy remains in rootd; ring0 only waits for the supplied interval.
-pub const SYS_RUSTOS_ROOTD_WAIT_BROKER: u64 = 0x5255_003b;
+// 0x5255_003b is permanently retired with the removed rootd timer-wait broker
+// (rootd's supervisor waits only in its bounded endpoint receive); do not reuse it.
 /// Rootd-only final process teardown.  Admission and target selection remain
 /// rootd lease policy; ring0 atomically performs the process-resource cleanup.
 pub const SYS_RUSTOS_ROOTD_TERMINATE_BROKER: u64 = 0x5255_003c;

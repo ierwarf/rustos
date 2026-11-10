@@ -35,7 +35,8 @@ fn fair(root: usize) -> usize {
 }
 fn overdue(root: usize, ticks: u64) -> Option<usize> {
     choose_overdue_system(0, root, ticks, crate::arch::clock::monotonic_nanos(),
-        runqueue::local_runnable_sequence(0), donation_ledger::class_publication_sequence())
+        runqueue::local_runnable_sequence(0), donation_ledger::class_publication_sequence(),
+        &mut UnresolvedCandidates::strict())
         .unwrap().map(|(slot, _)| slot)
 }
 // Explicit earlier complete wait/queue transition on the original born slot.
@@ -249,4 +250,37 @@ pub(in crate::multitask::scheduler) fn dispatch_fairness_and_handoff_state_is_cp
     assert_eq!(dispatch_policy::lock(1).next_pick_hint.unwrap().slot, 7);
     dispatch_policy::store_dispatch_streaks(1, 0, 0);
     dispatch_policy::lock(1).next_pick_hint = None;
+}
+
+/// One queued candidate whose admission never resolves (here a withdrawn class
+/// publication, the terminal-withdrawal answer) used to fail every observation of the
+/// whole fair set, so the CPU fell back to idle / the outgoing task on every
+/// turn and every other task queued there starved. The strict single
+/// observation still refuses; the bounded retry omits only that candidate.
+#[test]
+fn one_persistently_unresolved_candidate_cannot_idle_the_cpu() {
+    let mut observed = None;
+    family(|root, first, stuck| {
+        let weight = runqueue::weight::observe(stuck).unwrap();
+        let queued = runqueue::published_local_membership(stuck, 0)
+            && runqueue::published_local_membership(first, 0);
+        runqueue::weight::clear(stuck);
+        let scan = |unresolved: &mut UnresolvedCandidates| choose_local_next_with(
+            0, root, false, super::super::SCHED_MAX_BURST_NS,
+            crate::arch::clock::monotonic_nanos(), runqueue::local_runnable_sequence(0),
+            donation_ledger::class_publication_sequence(), false, false, unresolved,
+            candidate_is_qualified,
+        ).map(Some);
+        let strict = scan(&mut UnresolvedCandidates::strict());
+        let retried = retry_incomplete_policy(scan);
+        runqueue::weight::replace(stuck, weight);
+        observed = Some((queued, strict, retried, root, stuck));
+    });
+    let (queued, strict, retried, root, stuck) = observed.unwrap();
+    assert!(queued, "fixture must queue both peers on CPU 0");
+    assert_eq!(strict, Err(LocalFallbackReason::PublicationUnavailable),
+        "one strict observation still refuses a partial candidate set");
+    let picked = retried.expect("a persistently unresolved peer must not leave the CPU without a choice")
+        .map(|(slot, _)| slot);
+    assert!(matches!(picked, Some(slot) if slot != stuck), "picked {picked:?}, root {root}");
 }

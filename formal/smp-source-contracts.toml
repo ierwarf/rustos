@@ -6,7 +6,7 @@ path = "kernel/ps/src/multitask/scheduler/pager_handoff.rs"
 tokens = ["fn latency_floor(", "sender.original_pin()", "worker.original_pin()", "!sender.committed_pager(token)", "ready_floor(cpu,", "lower_vruntime_ceiling(receiver, donor_floor.min(class_floor))", "fn handoff(", "handoff_with(scope, sender, token, worker_id", "fn handoff_with(", "!ipc_publication::scoped(scope)", "!sender.committed_pager(token)", "Binding::resolve(worker_id)", "retained_wake_matching(worker,", "Some((runqueue::wait::REASON_PAGER_SERVICE, 0))", "latency_floor(sender, token, worker, scope.cpu())", "TypedWake::capture(&worker,", "REASON_PAGER_SERVICE, 0", "ipc_publication::eligible(&worker, target)", "ipc_publication::publish_with(scope, &worker, &typed, target", "latency_floor(sender, token, &worker, target)", "drop(typed)", "drop(worker)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/ipc_publication.rs"
-tokens = ["fn publish_with(", "frame_publication::read_for_identity(token, binding.id(), cpu)", "Publication::begin(scope, target)", "sync_handoff::publish_original(", "typed.publish_and_clear(", "claim_blocked_handoff(slot, expected, target, local)", "bind_local_owner_generation(slot, original.generation)", "publish_handoff_mailbox(slot, original,", "last_effect()", "drop(publication)", "drop(reader)"]
+tokens = ["fn publish_with(", "frame_publication::read_for_identity(token, binding.id(), cpu)", "Publication::begin(scope, target)", "sync_handoff::publish_original(", "typed.publish_and_clear(", "claim_blocked_handoff_duty(slot, expected, target, local)", "bind_local_owner_generation(slot, original.generation)", "duty.publish_mailbox(runqueue::weight::value(slot))", "last_effect()", "drop(publication)", "drop(reader)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/return_architecture.rs"
 tokens = ["struct CurrentArchitecture<'a>", "current: &'a super::CurrentWait", "scope: &'a", "!super::ipc_publication::scoped(scope)", "current.original_pin()", "return_view(pin.slot())", "!view.user_mode_task", "retained_architecture(", "pin.slot(), pin.id(), view", "Some(Self { current, scope, state })", "fn install(self)", "self.current.cpu()", "self.scope.is_masked()", "load_address_space_phys(PhysAddr::new(self.state.root))", "set_privilege_stack(self.state.stack_top)", "set_kernel_stack_top(self.state.stack_top, self.state.register_ipc)", "install_segments(self.state, true)", "fn install_segments(", "DS::set_reg(selector)", "FsBase::write(VirtAddr::new(state.fs))", "prepare_for_context_return(user, state.gs)"]
@@ -23,13 +23,13 @@ reason = "The entire legacy fault worker/floor/resume authority bodies are genui
 # loans/reader/CPU phase precede a bounded leaf join, never a fresh owner retry.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/ipc_publication.rs"
-tokens = ["fn publish_with(", "pub(super) fn publish_switching(", "let expected = runqueue::owner(slot)", "frame_publication::read_for_identity(token, binding.id(), cpu)", "dispatch_claim::validate_held_frame(", "terminal_quarantine::publish(stop)", "dispatch_priority::Publication::begin(scope, target)", "current_identity::with_ipc_handoff_binding(slot, binding.id()", "runqueue::affinity_payload::with_placement_admission(", "sync_handoff::publish_original(", "typed.publish_and_clear(", "runqueue::claim_blocked_handoff(slot, expected, target, local)", "frame_publication::bind_local_owner_generation(slot, original.generation)", "runqueue::publish_handoff_mailbox(slot, original,", "drop(publication)", "drop(reader)", "request_target_reschedule(target)", "fn call_published(", "current_wait::CurrentWait::capture()", "sender.matches_armed_reply(reply)", "sender.original_pin().duplicate_donation()", "donation_publication::participant(receiver_id)", "wake_publication::Binding::from_original(receiver)", "runqueue::wait::TypedWake::capture(", "donation_publication::bind_original(", "publish_switching(scope, &binding, &typed, target, || {}, switch)", "before_commit()", "sender.commit()", "drop(typed)", "drop(binding)", "drop(donor)", "drop(sender)"]
+tokens = ["fn publish_with(", "pub(super) fn publish_switching(", "let expected = runqueue::owner(slot)", "frame_publication::read_for_identity(token, binding.id(), cpu)", "dispatch_claim::validate_held_frame(", "terminal_quarantine::publish(stop)", "dispatch_priority::Publication::begin(scope, target)", "current_identity::with_ipc_handoff_binding(slot, binding.id()", "runqueue::affinity_payload::with_placement_admission(", "sync_handoff::publish_original(", "typed.publish_and_clear(", "runqueue::claim_blocked_handoff_duty(slot, expected, target, local)", "frame_publication::bind_local_owner_generation(slot, original.generation)", "duty.publish_mailbox(runqueue::weight::value(slot))", "drop(publication)", "drop(reader)", "request_target_reschedule(target)", "fn call_published(", "current_wait::CurrentWait::capture()", "sender.matches_armed_reply(reply)", "sender.original_pin().duplicate_donation()", "donation_publication::participant(receiver_id)", "wake_publication::Binding::from_original(receiver)", "runqueue::wait::TypedWake::capture(", "donation_publication::bind_original(", "publish_switching(scope, &binding, &typed, target, || {}, switch)", "before_commit()", "sender.commit()", "drop(typed)", "drop(binding)", "drop(donor)", "drop(sender)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/ipc_handoff.rs"
-tokens = ["fn claim_blocked_handoff(", "expected.state != RunOwnerState::Blocked || expected.wait_armed", "expected.next_preserving_wait(state, Some(cpu))", "OWNER_WORDS[slot].compare_exchange(expected, next).ok()?", "Some(next.with_wait(false, 0).with_runnable(true))", "fn publish_handoff_mailbox(", "generation: original.generation"]
+tokens = ["fn claim_blocked_handoff_duty(", "expected.state != RunOwnerState::Blocked || expected.wait_armed", "transition(slot, expected, event, Some(cpu)).ok()?", "Some((next.with_wait(false, 0).with_runnable(true), committed.into_duty()))"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/sync_handoff.rs"
-tokens = ["fn publish_original(", "state_for_cpu(target_cpu).lock()", "let duplicate =", "if !duplicate && state.len == MAX_TASK", "let owner = commit()?", "state.enqueue_with_direct_owner(record, Some((owner, target_cpu)))", "SYNC_HANDOFF_PENDING[target_cpu].store(true", "Some(owner)"]
+tokens = ["fn publish_original(", "state_for_cpu(target_cpu).lock()", "let duplicate =", "if !duplicate && state.len == MAX_TASK", "let (owner, duty) = commit()?", "state.enqueue_with_direct_owner(record, Some((owner, target_cpu)))", "SYNC_HANDOFF_PENDING[target_cpu].store(true", "duty.kind() == runqueue::DutyKind::HandoffFifo", "duty.handoff_recorded()", "Some((owner, duty))"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/wait/epoch.rs"
 tokens = ["fn publish_and_clear<R>(", "state.pending != Some(self.serial)", "state.serial != self.serial", "super::reason_locked(self.binding.slot()) != (self.kind, self.id)", "owner(self.binding.slot()).state.is_terminal()", "let result = publish()?", "state.advance()", "super::clear_wake_locked(self.binding.slot())", "self.cleared.set(true)"]
@@ -48,7 +48,7 @@ path = "kernel/ps/src/multitask/process_placement/terminal.rs"
 tokens = ["fn begin(", "state.reclaiming.iter().any(Option::is_some)", "state.terminal_nonce.checked_add(1)?", "state.terminal = Some(Record", "fn final_donation_members(", "self.live && self.effects && self.last", "self.exact(state) && state.terminal.unwrap().phase == Phase::Stopped", "&self.members[..self.len]", "fn finish(", "state.terminal = None", "state.prune_terminal_detached()"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/terminal_publication.rs"
-tokens = ["let terminal_pid =", "if terminal_pid.is_some()", "process_turn.as_ref()", "census.final_donation_members()", "donation_ledger::release_task(member_id)", "owner.publish(cleanup, effects)", "turn.finish(publication)"]
+tokens = ["let terminal_pid =", "if terminal_pid.is_some()", "let census = process_turn", "census.final_donation_members()", "donation_ledger::release_task(member_id)", "owner.publish(cleanup, effects)", "turn.finish(publication)"]
 [[forbidden_patterns]]
 scope = "kernel/ps/src/multitask/scheduler/terminal_publication.rs"
 regex = 'for member in 0\.\.MAX_TASK|c\.process_id == Some\(pid\)'
@@ -125,7 +125,7 @@ path = "kernel/ps/src/multitask/scheduler/dispatcher/maintenance.rs"
 tokens = ["struct MigrationFrame<'a>", "turn: &'a CpuDispatchTurn", "token: frame_publication::StableFrameToken", "_reader: stack_resources::frame_readers::FrameReader<'a>", "fn transfer(", "frame_publication::pin_for_identity(token, id)", "frame_readers::acquire(&pin, cpu)", "context_validation::validate_published_saved_context", "MigrationFrame { turn, token, id, source, _reader: reader }", "runqueue::rehome_queued_frame(&frame", "drop(frame)", "drop(pin)", "request_target_reschedule(cpu)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/ipc_handoff.rs"
-tokens = ["fn rehome_queued_frame(", "frame: &super::super::dispatcher::maintenance::MigrationFrame", "owner.generation != frame.token.owner_generation", "RUN_QUEUES[source_cpu].inner.lock()", "!source.contains(slot) || !frame.is_current()", "with_rehome_admission(slot, target_cpu, None", "if !frame.is_current()", "compare_exchange(owner, migrating)", "source.remove(slot, weight)", "publish_load(&source)", "drop(source)", "publish_migrating_record(slot, migrating, target_cpu, weight)"]
+tokens = ["fn rehome_queued_frame(", "frame: &super::super::dispatcher::maintenance::MigrationFrame", "owner.generation != frame.token.owner_generation", "RUN_QUEUES[source_cpu].inner.lock()", "!source.contains(slot) || !frame.is_current()", "with_rehome_admission(slot, target_cpu, None", "if !frame.is_current()", "transition(slot, owner, OwnerEvent::Rehome, Some(target_cpu))", "source.remove(slot, weight)", "publish_load(&source)", "drop(source)", "publish_migration(committed, weight)"]
 
 # Actual selected transaction retains UID/frame/funding, with final epoch
 # qualification inside BOTH resource-excluded owner CAS branches. These are
@@ -135,7 +135,7 @@ path = "kernel/ps/src/multitask/scheduler/dispatch_claim.rs"
 tokens = ["struct FrameSelection", "reader: stack_resources::frame_readers::PinnedFrameReader", "unsafe fn capture(", "rustos_scheduler_frame_gate::selected_local_frame_identity(", "generation, token.owner_generation, rsp, token.saved_rsp,", "id != expected_id", "frame_publication::read_for_identity(token, id, cpu)", "validate_held_frame(slot, rsp, token.view, &reader)", "DispatchFrame::token_current(token, cpu, custody)", "validation.map_err(Invalid)?", "unsafe fn from_held(", "DispatchFrame::token_current(now, cpu, custody)", "fn validate_held_frame(", "reader.owned_canary_intact()", "view.stack_canary_intact &= intact", "validate_published_saved_context(slot, rsp, view)", "struct DirectSwitch", "impl Drop for DirectSwitch", "materialize_direct_handoff_with_generation(", "struct DispatchFrame<'a>", "turn: &'a CpuDispatchTurn<'static>", "reader: stack_resources::frame_readers::PinnedFrameReader", "fn capture_selected(", "turn.original_current()", "slot != original", "FrameSelection::capture(", "fn from_selection(", "cpu != selection.cpu", "Self::token_current(selection.token, cpu, selection.custody)", "FrameSelection { cpu, id, token, custody, return_to_user, reader } = selection", "class_sequence, reader", "fn is_current(", "self.turn.original_current()", "Self::token_current(self.token, self.cpu, self.custody)", "p.task_id == Some(self.id)", "fn prepare(", "prepare_grant(self.token.slot, self.cpu)", "funding.task_id != self.id || !self.is_current()", "fn with_admission", "with_class_claim(self.class_sequence", "pin.with_dispatch_admission(self.cpu", "fn claim(", "claim_validated_dispatch(&self.frame", "cpu_leases::prepare(cpu, self.frame.reader.into_pin())", "retain_claimed_return", "id: self.frame.id", "token: self.frame.token", "running_generation: self.frame.token.owner_generation.checked_add(1)", "execution_interval::open_claimed(self.frame.turn, self.funding.funding)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/claim.rs"
-tokens = ["fn claim_validated_dispatch(", "Some(frame.generation()), Some(frame), funding", "fn admitted_claim", "frame.with_admission(funding, claim)", "fn claim_dispatch_inner(", "with_claim_activation_for_reader(slot, cpu,", "frame.map(|frame| frame.original_reader())", "if frame.is_some_and(|frame| !frame.is_current())", "compare_exchange(owner, owner.next(RunOwnerState::Running, Some(cpu)))", "with_claim_activation_for_reader(slot, cpu,", "frame.map(|frame| frame.original_reader())", "if frame.is_some_and(|frame| !frame.is_current())", "compare_exchange(owner, next)"]
+tokens = ["fn claim_validated_dispatch(", "Some(frame.generation()), Some(frame), funding", "fn admitted_claim", "frame.with_admission(funding, claim)", "fn claim_dispatch_inner(", "with_claim_activation_for_reader(slot, cpu,", "frame.map(|frame| frame.original_reader())", "if frame.is_some_and(|frame| !frame.is_current())", "transition(slot, owner, OwnerEvent::Claim, Some(cpu)).map(Transition::settled)", "with_claim_activation_for_reader(slot, cpu,", "frame.map(|frame| frame.original_reader())", "if frame.is_some_and(|frame| !frame.is_current())", "transition(slot, owner, OwnerEvent::Claim, Some(cpu)).map(Transition::settled)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/scheduling_runtime.rs"
 tokens = ["impl FundingPin {", "fn with_dispatch_admission", "with_published_budget_pair(self.stamp, cpu", "!context.is_eligible(now_ns) || !domain.is_eligible(now_ns)", "claim()"]
@@ -174,7 +174,7 @@ reason = "Fast IPC must publish through original return CAS and carry its receip
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn fair(", "local_dispatch::choose_local_next_with(cpu, current, voluntary, runtime", "runqueue::local_runnable_sequence(cpu)", "donation_ledger::class_publication_sequence()", "local_candidate(slot, cpu, Urgency::Fair)", "selected = Some(candidate)", "Ok((slot, generation))", "current_identity::read_dispatch(slot).and_then(|p| p.task_id).ok_or", "candidate.slot != slot || candidate.generation != generation", "Ok(Some(candidate))", "fn retry_fair(", "local_dispatch::retry_incomplete_policy(|| fair("]
+tokens = ["fn fair(", "local_dispatch::choose_local_next_with(cpu, current, voluntary, runtime", "runqueue::local_runnable_sequence(cpu)", "donation_ledger::class_publication_sequence()", "local_candidate(slot, cpu, Urgency::Fair)", "selected = Some(candidate)", "Ok((slot, generation))", "current_identity::read_dispatch(slot).and_then(|p| p.task_id).ok_or", "candidate.slot != slot || candidate.generation != generation", "Ok(Some(candidate))", "fn retry_fair(", "local_dispatch::retry_incomplete_policy(|unresolved| fair("]
 
 # Complete exec image producer owns exact physical fields and unchanged Current return.
 [[forbidden_patterns]]
@@ -323,7 +323,7 @@ tokens = [
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/admission.rs"
-tokens = ["fn admit_initial(", "image: &super::super::bootstrap::InitialCpu", "image.assert_materializing()", "let cpu = image.cpu()", "Some(image.id())", "admission::is_reserved(slot)", "RunOwnerState::Blocked", "!wait::armed(slot)", "owner.next(RunOwnerState::Running, Some(cpu))", "compare_exchange(owner, running)", "bind_local_owner_generation(slot, running.generation)"]
+tokens = ["fn admit_initial(", "image: &super::super::bootstrap::InitialCpu", "image.assert_materializing()", "let cpu = image.cpu()", "Some(image.id())", "admission::is_reserved(slot)", "RunOwnerState::Blocked", "!wait::armed(slot)", "transition(slot, owner, OwnerEvent::AdmitInitial, Some(cpu))", "bind_local_owner_generation(slot, running.generation)"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/stack_resources.rs"
@@ -1423,13 +1423,6 @@ tokens = [
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
 tokens = ["fn synchronous(", "sync_handoff::take_next_ready_with(", "record.has_current_dispatch_custody()", "local_dispatch::published_candidate_admission(", "record.bound_direct_generation().is_some()", "FrameCustody::Direct", "FrameCustody::Local", "record.bound_direct_generation().unwrap_or_else", "selected_candidate(slot, cpu, record.task_id(), generation, custody", "selected = Some(candidate)", "materialize(record, cpu)", "record.bind_selected_local_owner(", "record.slot() == candidate.slot && record.task_id() == candidate.id", "record.claim_generation() == Some(candidate.generation)"]
 
-[[required_sequences]]
-path = "kernel/ps/src/multitask/scheduler/local_dispatch/fair_retry.rs"
-tokens = [
-    "fn complete_hint_generation(",
-    "qualification.ok().flatten()",
-]
-
 # Latency exceptions can be enqueued and consumed only for a stable published
 # User class and the producer's exact task ID; a torn class record cannot
 # spend the bounded latency budget on an inherited System owner.
@@ -1575,27 +1568,19 @@ tokens = [
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
 tokens = ["fn synchronous(", "p.task_id == Some(record.task_id()) && p.lifecycle_dispatchable()", "record.has_current_dispatch_custody()", "published_candidate_admission(", "record.bound_direct_generation().is_some()", "FrameCustody::Direct", "FrameCustody::Local", "selected_candidate(slot, cpu, record.task_id(), generation, custody", "selected = Some(candidate)", "materialize(record, cpu)", "Some(record) => match selected", "record.slot() == candidate.slot && record.task_id() == candidate.id", "record.claim_generation() == Some(candidate.generation)"]
 
-[[required_sequences]]
-path = "kernel/ps/src/multitask/scheduler/handoffs.rs"
-tokens = [
-    "pub(super) fn published_handoff_lifecycle(",
-    ".filter(|identity| identity.task_id.is_some())",
-    ".map(|identity| identity.lifecycle_dispatchable())",
-]
-
 # Strict overdue System and due User reservations use complete CPU-local
 # evidence even in phase-profile builds. An incomplete earlier decision retries
 # fresh epochs, then blocks later hints/fair arms and chooses only an exact
 # current/idle owner (or marks an unavailable idle frame stale).
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn choose(", "runqueue::drain_remote_wakes(cpu)", "dispatch_policy::atomic_activation_pending(cpu)", "first_turn(turn, cpu, true, class_sequence)", "match synchronous(cpu)", "let overdue = local_dispatch::retry_incomplete_policy(|| local_dispatch::choose_overdue_system(", "runqueue::local_runnable_sequence(cpu), donation_ledger::class_publication_sequence()", "Err(_) => return Decision::Incomplete", "first_turn(turn, cpu, false, class_sequence)", "match latency(cpu)", "local_dispatch::user_reservation_due(cpu)", "class_sequence & 1 != 0", "match retry_fair(", "donation_ledger::class_publication_sequence() != class_sequence", "Ok(local_dispatch::LocalClass::User) => return Decision::Selected(candidate)", "Err(_) => return Decision::Incomplete", "match hint(cpu, current)", "match retry_fair("]
+tokens = ["fn choose(", "runqueue::drain_remote_wakes(cpu)", "dispatch_policy::atomic_activation_pending(cpu)", "first_turn(turn, cpu, true, class_sequence)", "match synchronous(cpu)", "let overdue = local_dispatch::retry_incomplete_policy(|unresolved| local_dispatch::choose_overdue_system(", "runqueue::local_runnable_sequence(cpu), donation_ledger::class_publication_sequence()", "Err(_) => return Decision::Incomplete", "first_turn(turn, cpu, false, class_sequence)", "match latency(cpu)", "local_dispatch::user_reservation_due(cpu)", "class_sequence & 1 != 0", "match retry_fair(", "donation_ledger::class_publication_sequence() != class_sequence", "Ok(local_dispatch::LocalClass::User) => return Decision::Selected(candidate)", "Err(_) => return Decision::Incomplete", "match hint(cpu, current)", "match retry_fair("]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/local_dispatch/fair_retry.rs"
 tokens = [
     "fn retry_incomplete_policy<T>(",
-    "Ok(choice) => return Ok(choice),",
+    "return Ok(choice);",
     "Err(LocalFallbackReason::NoLocalCandidate) => return Ok(None),",
     "Err(LocalFallbackReason::CustodyUnavailable) // unresolved earlier class",
 ]
@@ -1605,15 +1590,17 @@ tokens = [
 # only a generation-bound Local candidate or the guarded idle/current fallback.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn fair(", "local_dispatch::choose_local_next_with(", "runqueue::local_runnable_sequence(cpu)", "donation_ledger::class_publication_sequence()", "Ok((slot, generation))", "FrameCustody::Current", "FrameCustody::Local", "fn retry_fair(", "local_dispatch::retry_incomplete_policy(|| fair(", "pub(in crate::multitask) fn dispatch(", "Decision::Empty | Decision::Incomplete", "dispatch_claim::claim_fallback(turn, idle, class_sequence)"]
+tokens = ["fn fair(", "local_dispatch::choose_local_next_with(", "runqueue::local_runnable_sequence(cpu)", "donation_ledger::class_publication_sequence()", "Ok((slot, generation))", "FrameCustody::Current", "FrameCustody::Local", "fn retry_fair(", "local_dispatch::retry_incomplete_policy(|unresolved| fair(", "pub(in crate::multitask) fn dispatch(", "Decision::Empty | Decision::Incomplete", "dispatch_claim::claim_fallback(turn, idle, class_sequence)"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/local_dispatch/fair_retry.rs"
 tokens = [
     "const MAX_LOCAL_FAIR_OBSERVATIONS: usize = 4;",
+    "fn excludes(&mut self, slot: usize) -> bool {",
+    "self.observation == MAX_LOCAL_FAIR_OBSERVATIONS",
+    "fn retry_incomplete_policy<T>(",
     "for _ in 0..MAX_LOCAL_FAIR_OBSERVATIONS {",
-    "Ok(choice) => return choice,",
-    "Err(LocalFallbackReason::NoLocalCandidate) => return None,",
+    "unresolved.begin_observation();",
     "Err(_) => continue,",
 ]
 
@@ -1915,7 +1902,7 @@ path = "kernel/ps/src/multitask/scheduler/terminal_quarantine.rs"
 tokens = ["fn claim(", "Producer::claim(slot, id)?", "terminal_binding_matches(slot, owner.task_id())", "fn begin(", "claim(slot, id)", "Producer::begin(slot, id, reason, detach)?", "terminal_binding_matches(slot, owner.task_id())", "owner.wait_for_executor()", "fn request(", "task_start::read(slot).map(|s| s.id) != Some(id)", "begin(slot, Some(id), reason, false)", "publish(owner)", "fn publish(", "withdraw(&mut owner)", "owner.defer()", "fn retain_for_finalization(", "withdraw(&mut owner)", "owner.retain_stopped()", "fn withdraw(", ".task_id()", "terminal_binding_matches(slot, Some(id))", "context::read(slot)", "runqueue::retire_unless_claim_in_flight(", "owner.begin_effects()", "LifecycleGate::Retired, true", "set_ready_since_ticks(slot, 0)", "set_blocked(slot, false)", "set_armed(slot, false)", "set_reason(slot, 0, 0)", "Some(context.process_handle)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/producer.rs"
-tokens = ["fn begin(", "Phase::Reserved", "fn claim(", "Phase::Deferred | Phase::WaitingExecutor", "record.key.task_id != task_id", "Phase::Claimed", "fn publish(", "self.exact(&row)", "row.cleanup = cleanup", "row.kernel = KernelState::Pending(effects)", "row.producer = None", "self.live = false"]
+tokens = ["fn begin(", "Phase::Reserved", "fn claim(", "Origin::of(record.phase)?", "record.key.task_id != task_id", "Phase::Claimed", "fn publish(", "self.exact(&row)", "row.cleanup = cleanup", "row.kernel = KernelState::Pending(effects)", "row.producer = None", "self.live = false"]
 
 # Terminal50 retains exact stop/borrower custody, not a host catalog fallback.
 [[required_sequences]]
@@ -1954,20 +1941,11 @@ tokens = [
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/ipc_handoff.rs"
-tokens = [
-    "let next = owner.next_preserving_wait(RunOwnerState::DirectHandoff, Some(cpu));",
-    "if OWNER_WORDS[slot].compare_exchange(owner, next).is_ok() {",
-    "frame_publication::bind_local_owner_generation(slot, next.generation);",
-]
+tokens = ["if let Ok(committed) = transition(slot, owner, OwnerEvent::HandoffDirect, Some(cpu)) {", "let next = committed.next;", "frame_publication::bind_local_owner_generation(slot, next.generation);"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue.rs"
-tokens = [
-    "let next = owner.next(RunOwnerState::Local, Some(cpu));",
-    "frame_publication::bind_local_owner_generation(slot, next.generation);",
-    "RUN_QUEUES[cpu].publish_load(&rq);",
-    "frame_publication::clear(slot);",
-]
+tokens = ["let next = transition.next;", "frame_publication::bind_local_owner_generation(slot, next.generation);", "RUN_QUEUES[cpu].publish_load(&rq);", "frame_publication::clear(slot);"]
 
 # Only the exact locked runtime pair can report a stable budget denial;
 # missing/stale context/domain identity or a disallowed CPU stays unknown.
@@ -2060,14 +2038,6 @@ tokens = [
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
 tokens = ["struct Candidate { slot: usize, id: u64, generation: u64, custody: FrameCustody", "frame: FrameSelection", "fn selected_candidate(", "FrameCustody::Local => frame_publication::local_frame_token", "FrameCustody::Direct => frame_publication::direct_handoff_frame_token", "FrameCustody::Current => frame_publication::current_local_frame_token", "FrameSelection::capture(cpu, slot, id, generation, token.saved_rsp, custody)", "fn first_turn(", "DispatchFrame::from_selection(turn, candidate.frame, class_sequence)", "funded.claim()", "Decision::Claimed(candidate.urgency)", "fn claim(", "DispatchFrame::from_selection(outgoing.original_turn(), candidate.frame, class_sequence)", "funded.claim()", "pub(in crate::multitask) fn dispatch(", "dispatch_claim::claim_fallback(turn, idle, class_sequence)"]
-
-[[required_sequences]]
-path = "kernel/ps/src/multitask/scheduler/local_dispatch.rs"
-tokens = [
-    "pub(super) fn qualified_catalog_idle_generation(",
-    "prior_generation.is_some() || slot == current_slot || target_idle_slot != Some(slot)",
-    "qualify().ok().flatten()",
-]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatch_claim.rs"
@@ -2167,15 +2137,7 @@ tokens = ["fn synchronous(",
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/ipc_handoff.rs"
-tokens = [
-    "fn materialize_direct_handoff_with_generation(",
-    "expected_generation.is_some_and(|generation| generation != observed.generation)",
-    "observed.state != RunOwnerState::DirectHandoff",
-    "rq.insert(slot, weight)",
-    "OWNER_WORDS[slot].compare_exchange(observed, next)",
-    "rq.remove(slot, weight)",
-    "frame_publication::bind_local_owner_generation(slot, next.generation)",
-]
+tokens = ["fn materialize_direct_handoff_with_generation(", "expected_generation.is_some_and(|generation| generation != observed.generation)", "observed.state != RunOwnerState::DirectHandoff", "rq.insert(slot, weight)", "transition(slot, observed, OwnerEvent::Materialize, Some(cpu))", "rq.remove(slot, weight)", "frame_publication::bind_local_owner_generation(slot, next.generation)"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/sync_handoff.rs"
@@ -2187,15 +2149,7 @@ tokens = [
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/claim.rs"
-tokens = [
-    "let owner = owner(slot);",
-    "if expected_generation.is_some_and(|generation| generation != owner.generation) {",
-    "let mut rq = RUN_QUEUES[cpu].inner.lock();",
-    "if !rq.contains(slot) {",
-    "OWNER_WORDS[slot].compare_exchange(owner, next)",
-    "if expected_generation.is_some() || observed.state.is_terminal() {",
-    "rq.remove(slot, weight);",
-]
+tokens = ["let owner = owner(slot);", "if expected_generation.is_some_and(|generation| generation != owner.generation) {", "let mut rq = RUN_QUEUES[cpu].inner.lock();", "if !rq.contains(slot) {", "transition(slot, owner, OwnerEvent::Claim, Some(cpu)).map(Transition::settled)", "if expected_generation.is_some() || observed.state.is_terminal() {", "rq.remove(slot, weight);"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/local_dispatch.rs"
@@ -2882,7 +2836,7 @@ path = "kernel/ps/src/multitask/scheduler/stack_resources/context.rs"
 tokens = [
     "process_table::pin_process_mm(", "resources.mm_pin = mm_pin",
     "fn replace_exec_mm(", "incoming.matches_exec(reservation, root)", "resources.frame_writing", "resources.mm_pin, incoming.take()", "drop(old)",
-    "fn lease_for_architecture(", "cpu_leases::owns_current(cpu, slot)", "cpu_leases::owns_prepared(cpu, slot)", "pin.matches(handle, root)",
+    "fn test_capture_activation(", "super::activation::capture(resources, slot, cpu)",
     "fn clear(", "pins.load(Ordering::Acquire)", "resources.mm_pin.take()", "drop(mm_pin)", "drop(process_pin)",
 ]
 
@@ -2911,13 +2865,7 @@ tokens = [
 ]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/claim.rs"
-tokens = [
-    "owner.state == RunOwnerState::DirectHandoff", "with_claim_activation_for_reader(slot, cpu,",
-    "frame.map(|frame| frame.original_reader())", "OWNER_WORDS[slot]", ".compare_exchange(owner, owner.next(RunOwnerState::Running, Some(cpu)))",
-    "let mut rq = RUN_QUEUES[cpu].inner.lock()", "with_claim_activation_for_reader(slot, cpu,",
-    "frame.map(|frame| frame.original_reader())",
-    "OWNER_WORDS[slot].compare_exchange(owner, next)", "if let Err(observed) = claim", "rq.remove(slot, weight)",
-]
+tokens = ["owner.state == RunOwnerState::DirectHandoff", "with_claim_activation_for_reader(slot, cpu,", "frame.map(|frame| frame.original_reader())", "transition(slot, owner, OwnerEvent::Claim, Some(cpu)).map(Transition::settled)", "let mut rq = RUN_QUEUES[cpu].inner.lock()", "with_claim_activation_for_reader(slot, cpu,", "frame.map(|frame| frame.original_reader())", "transition(slot, owner, OwnerEvent::Claim, Some(cpu)).map(Transition::settled)", "Err(observed) => {", "rq.remove(slot, weight)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/frame_observation.rs"
 tokens = [
@@ -2956,11 +2904,11 @@ tokens = [
     "struct CpuReturnCompletion", "after_directory_unlock", "finish(self.changed)",
 ]
 [[required_sequences]]
-path = "kernel/ps/src/multitask/scheduler/stack_resources/context.rs"
+path = "kernel/ps/src/multitask/scheduler/stack_resources/activation.rs"
 tokens = [
-    "struct ExecutionRootLease", "Option<crate::multitask::process_table::MmExecutionPin>",
-    "PhantomData<*mut ()>", "fn lease_for_architecture(", "owns_current(cpu, slot)", "owns_prepared(cpu, slot)",
-    "RESOURCES.get(slot)?.with", "pin.matches(handle, root)", "Some(Some(pin.try_clone()?))", "!context.user_mode && resources.mm_pin.is_none()", "_pin: pin",
+    "pub(super) fn capture(", "let mm: &MmExecutionPin = resources.mm_pin.as_ref()?;",
+    "!mm.matches(handle, mm.root())", "can_retain_mm_identity(cpu, slot, start.id, mm)",
+    "mm: mm.try_activate()?", "(!context.user_mode && resources.mm_pin.is_none()).then_some(None)",
 ]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/return_architecture.rs"
@@ -3047,16 +2995,11 @@ tokens = [
 ]
 
 [[required_sequences]]
-path = "kernel/ps/src/multitask/scheduler/stack_resources/context.rs"
+path = "kernel/ps/src/multitask/scheduler/stack_resources/frame_readers.rs"
 tokens = [
-    "fn lease_for_architecture",
-    "lease_root_inner(slot, root, cpu, true)",
-    "fn lease_root_inner",
-    "pin.matches(handle, root)",
-    "pin.try_clone()",
-    "activation::capture(resources, slot, cpu)",
-    "retain_mm_activation(cpu, activation)",
-    "_pin: pin",
+    "fn with_claim_activation_for_reader<R>(",
+    "claim_eligible(&RESOURCES[slot], resources, original)",
+    "let activation = super::activation::capture(resources, slot, cpu)?;",
 ]
 
 [[required_sequences]]
@@ -3142,7 +3085,7 @@ regex = 'scheduler_mut\(\)\.(?:arm_block_current_task_with_reason|cancel_block_c
 reason = "Masked Current wait capture replaces original catalog arm/cancel fallback."
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/return_publication.rs"
-tokens = ["fn publish_return_inner(", "RUN_QUEUES[cpu].inner.lock()", "loop {", "let observed = owner(slot)", "observed.state.is_terminal()", "observed.state == RunOwnerState::Running && observed.cpu == Some(cpu)", "let local = observed.runnable && allow_local", "rq.insert(slot, weight)", "next_preserving_wait(RunOwnerState::Blocked, None)", "compare_exchange(observed, next)", "bind_local_owner_generation(slot, next.generation)", "if local {", "rq.remove(slot, weight)", "fn publish_blocked_wake_inner(", "RUN_QUEUES[cpu].inner.lock()", "loop {", "let observed = owner(slot)", "local_wake_owner_is_already_owned(observed.state)", "observed.state != RunOwnerState::Blocked", "rq.insert(slot, weight)", "compare_exchange(observed, next)", "bind_local_owner_generation(slot, next.generation)", "rq.remove(slot, weight)"]
+tokens = ["fn publish_return_inner(", "RUN_QUEUES[cpu].inner.lock()", "loop {", "let observed = owner(slot)", "observed.state.is_terminal()", "observed.state == RunOwnerState::Running && observed.cpu == Some(cpu)", "let local = observed.runnable && allow_local", "rq.insert(slot, weight)", "transition(slot, observed, OwnerEvent::ReturnBlocked, None)", "if let Ok(committed) = committed {", "bind_local_owner_generation(slot, next.generation)", "if local {", "rq.remove(slot, weight)", "fn publish_blocked_wake_inner(", "RUN_QUEUES[cpu].inner.lock()", "loop {", "let observed = owner(slot)", "local_wake_owner_is_already_owned(observed.state)", "observed.state != RunOwnerState::Blocked", "rq.insert(slot, weight)", "transition(slot, observed, OwnerEvent::WakeLocal, Some(cpu))", "bind_local_owner_generation(slot, next.generation)", "rq.remove(slot, weight)"]
 [[forbidden_patterns]]
 scope = "kernel/ps/src/multitask/scheduler/runqueue/return_publication.rs"
 regex = 'scheduler_(?:mut|ref)|Scheduler::'
@@ -3226,7 +3169,7 @@ path = "kernel/ps/src/multitask/scheduler/terminal_publication.rs"
 tokens = ["fn quiescent(", "TaskExecutionOwner::Current(cpu)", "cpu_leases::owns_current(cpu, slot)", "execution::banks::owns_current(cpu, slot)", "execution::count(slot) == current_ref", "fn guarded(", "retain_for_finalization(owner)", "if !quiescent(slot)", "terminal::Turn::begin(handle, (slot, id))"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/producer.rs"
-tokens = ["fn retain_stopped(", "self.exact(&row)", "self.effects", "self.turn.is_none()", "row.producing", "Phase::Effects", "row.reason = Some(self.reason)", "row.deferred = Some(self.reason)", "phase = Phase::Claimed", "self.effects = false", "self.claimed = true"]
+tokens = ["fn retain_stopped(", "self.exact(&row)", "self.effects", "self.turn.is_none()", "row.producing", "Phase::Effects", "row.reason = Some(self.reason)", "row.deferred = Some(self.reason)", "phase = Phase::Claimed", "self.effects = false", "self.origin = Some(Origin::Withdrawn)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/linux_thread_state.rs"
 tokens = ["fn transfer_terminal_sigchld(", "terminal_snapshot(owner)", "candidates[..len].sort_unstable_by_key", "Binding::capture(slot, id)", "context.user_abi != Some(UserAbi::Linux)", "cell.owner_tid != Some(binding.id())", "state.pending_sigchld_events |= events", "state.pending_signals |= bit", "raise_signal_pending(slot)", "state.signal_mask & bit == 0", "guarded_owned(binding, eligible_cpus)", "source.owner_tid, owner.task_id()", "state.pending_sigchld_events = 0", "state.pending_signals &= !bit"]
@@ -3238,10 +3181,10 @@ path = "kernel/ps/src/multitask/scheduler/terminal_publication.rs"
 tokens = ["fn guarded(", "terminal_binding_matches(slot, Some(id))", "terminal_quarantine::retain_for_finalization(owner)", "if !quiescent(slot)", "Turn::begin(handle, (slot, id))", "owner.bind_process_turn(turn.credential())", "owner.begin_effects()", "turn.mark_stopped()", "owner.publish(cleanup, effects)", "turn.finish(publication)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/producer.rs"
-tokens = ["fn begin(", "row.reset_seal.is_some()", "row.producer.is_some()", "row.generation.checked_add(1)?", "row.producer_nonce.checked_add(1)?", "Phase::Reserved", "fn claim(", "!matches!(record.phase, Phase::Deferred | Phase::WaitingExecutor)", "record.key.task_id != task_id", "row.producer_nonce.checked_add(1)?", "admitted.key.nonce = nonce;", "Phase::Claimed", "row.deferred = None;", "fn publish(", "self.exact(&row)", "self.effects", "row.cleanup = cleanup", "row.kernel = KernelState::Pending(effects);", "row.producer = None;", "row.producing = false;", "self.live = false;"]
+tokens = ["fn begin(", "row.reset_seal.is_some()", "row.producer.is_some()", "row.generation.checked_add(1)?", "row.producer_nonce.checked_add(1)?", "Phase::Reserved", "fn claim(", "let origin = Origin::of(record.phase)?;", "record.key.task_id != task_id", "row.producer_nonce.checked_add(1)?", "admitted.key.nonce = nonce;", "Phase::Claimed", "row.deferred = None;", "fn publish(", "self.exact(&row)", "self.effects", "row.cleanup = cleanup", "row.kernel = KernelState::Pending(effects);", "row.producer = None;", "row.producing = false;", "self.live = false;"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/producer.rs"
-tokens = ["impl Drop for Producer", "self.exact(&row)", "if self.effects", "Phase::Poisoned", "else if self.claimed", "Phase::Deferred", "row.deferred = Some(self.reason);", "row.producer = None;"]
+tokens = ["impl Drop for Producer", "self.exact(&row)", "if self.effects", "Phase::Poisoned", "else if let Some(origin) = self.origin", "origin.phase()", "row.deferred = Some(self.reason);", "row.producer = None;"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/stack_resources.rs"
 tokens = ["fn terminal_binding_matches(", "current_identity::with_terminal_binding", "!r.closing", "r.reclaim.is_none()", "r.reservation.is_none()", "!r.frame_writing", "r.context.is_some()", "r.start.is_some_and", "r.binding.is_some_and"]
@@ -3308,7 +3251,7 @@ path = "kernel/ps/src/multitask/scheduler/thread_creation.rs"
 tokens = ["impl Publication", "fn capture(", "CommitGrant::capture_ticket(", "Cohort::begin(&[r.parent])?", "context.user_abi != Some(abi)", "fn publish(", "scheduling_context.admit(", "publication.parent.begin_effects()", "execution_image::reserved_user_entry(", "r.ticket().begin_commit()", "r.ticket().install_context(context)", "initialize_simd_state(slot, id)", "r.ticket().publish_start(", "stack_resources::publish_binding(", "identity::publish_metadata(", "linux_thread_state::install_reserved(", "publication.membership.register(r.ticket())", "runqueue::admit_blocked(slot)", "frame_publication::bind_local_owner_generation(", "before_ack(&r, &publication)", "finish_commit()", "r.live = false", "publication.parent.complete()", "fn commit(", "DispatchPreemption::enter()", "Publication::capture(&reservation, bootstrap.abi)", "cancel_owned(reservation, &preemption)", "flush_deferred_target_reschedules()"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/current/group_exit.rs"
-tokens = ["fn request(", "request_marked(scope, pid, requested_by_pid)", "fn request_marked(", "held_spin_lock_depth()", "target_by_pid(pid)", "queued_for(handle)", "PendingExit::begin(handle, member)", "mark_process_exiting_for_handle(handle, pid)?", "pending.publish(pid, Reason::Terminated", "fn terminate(", "terminate_marked(pid)", "fn terminate_marked(", "DispatchPreemption::enter()", "request_marked(&preemption, pid, super::current_user_id())", "wait(receipt)", "fn exit_current()", "DispatchPreemption::enter()", "owned_current_user_binding()", "PendingExit::begin(handle, (slot, tid))", "mark_process_exiting_for_handle(handle, pid)", "pending.publish(", "wait(receipt)", "halt_current_retired_task()", "fn wait(", "receipt.complete()", "DispatchPreemption::enter()", "scope.mask_irqs()", "group_exit::service(&scope)", "drop(scope)", "if receipt.complete()", "yield_now()"]
+tokens = ["fn request_marked(", "held_spin_lock_depth()", "target_by_pid(pid)", "queued_for(handle)", "PendingExit::begin(handle, member)", "mark_process_exiting_for_handle(handle, pid)?", "pending.publish(pid, Reason::Terminated", "fn terminate(", "terminate_marked(pid)", "fn terminate_marked(", "DispatchPreemption::enter()", "request_marked(&preemption, pid, super::current_user_id())", "wait(receipt)", "fn exit_current()", "DispatchPreemption::enter()", "owned_current_user_binding()", "PendingExit::begin(handle, (slot, tid))", "mark_process_exiting_for_handle(handle, pid)", "pending.publish(", "wait(receipt)", "halt_current_retired_task()", "fn wait(", "receipt.complete()", "DispatchPreemption::enter()", "scope.mask_irqs()", "group_exit::service(&scope)", "drop(scope)", "if receipt.complete()", "yield_now()"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/group_exit.rs"
 tokens = ["struct MemberLoan<'census>", "census: &'census ExitMembership", "BindingPin", "fn capture(", "census.members().contains(&(slot, id))", "pin_donation(slot, id)?", "context::read(pin.slot())?", "Some(census.handle())", "fn stop(", "terminal_quarantine::begin(self.pin.slot(), Some(self.pin.id())", "drop(self)", "fn service(", "scope.is_masked()", "held_spin_lock_depth()", "exit_membership::claim_next()", "published_current_slot(scope.cpu())", "census.effects_started()", "census.begin_effects()", "for current_pass in [false, true]", "MemberLoan::capture(&census, member.0, member.1)", "census.suspend()", "loan.observe(reason)", "loan.stop(retire_reason)", "census.suspend()", "terminal_publication::guarded(producer", "census.finish()", "fn service_deferred(", "service(scope)", "terminal_publication::drain_guarded"]
@@ -3342,7 +3285,7 @@ path = "kernel/ps/src/multitask/current_identity/execution/kernel_executor.rs"
 tokens = ["fn check_metadata(", "writer.kernel_executors == 0", "fn admit_stop_wait(", "writer.bound_task_id != Some(id)", "with_kernel_executor_binding(slot, id, ||", "struct Executor", "BindingPin", "PhantomData<*mut ()>", "fn capture_binding(", "with_writer(slot", "identity.user_mode", "identity.abi.is_some()", "writer.lifecycle.dispatchable()", "cohort::admission_ready(slot)", "existing_only && writer.kernel_executors == 0", "writer.kernel_executors.checked_add(1)?", "with_kernel_executor_binding", "let permit = acquire(slot)?", "writer.kernel_executors = next", "fn assert_current(", "self.assert_current_in(&preemption)", "fn assert_current_in(", "preemption.cpu()", "current_cpu_task_slot_admitted()", "impl Drop for Executor", "writer.kernel_executors -= 1", "retirement_cleanup::mark_reap_pending()"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/producer.rs"
-tokens = ["fn claim(", "Phase::Deferred | Phase::WaitingExecutor", "record.phase == Phase::WaitingExecutor", "stack_resources::terminal_binding_matches(slot, task_id)", "row.producer_nonce.checked_add(1)?", "fn wait_for_executor(", "self.exact(&row)", "kernel_executor::admit_stop_wait(", "phase = Phase::WaitingExecutor", "row.deferred = Some(self.reason)", "self.live = false", "mark_reap_pending()", "impl Drop for Producer", "else if self.claimed", "self.waited_for_executor", "Phase::WaitingExecutor"]
+tokens = ["fn claim(", "Origin::of(record.phase)?", "origin == Origin::ExecutorWait", "stack_resources::terminal_binding_matches(slot, task_id)", "row.producer_nonce.checked_add(1)?", "fn wait_for_executor(", "self.exact(&row)", "kernel_executor::admit_stop_wait(", "phase = Phase::WaitingExecutor", "row.deferred = Some(self.reason)", "self.live = false", "mark_reap_pending()", "impl Drop for Producer", "else if let Some(origin) = self.origin", "origin.phase()"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/current.rs"
 tokens = ["fn service_deferred_work()", "DispatchPreemption::enter()", "scope.mask_irqs()", "group_exit::service_deferred(&scope)", "executor::capture_current()", "return group_exit", "claim_next_kernel(&executor)", "fn complete_retirement_side_effects()", "executor::capture_current()", "claim_next_kernel(&executor)", "executor::Fence::capture", "fence.complete()", "super::yield_now()"]
@@ -3411,7 +3354,7 @@ path = "kernel/ps/src/multitask/scheduler/runqueue/affinity_payload.rs"
 tokens = ["fn with_rehome_admission<R>(", "task_start::read(slot)", "owner.is_some_and", "id != Some(expected)", "with_affinity_replacement(", "owner.map(|(cohort, _)| cohort)", "with_placement_admission(slot, id, cpu, claim)", "Some(result)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/ipc_handoff.rs"
-tokens = ["fn rehome_queued_owned(", "Some((cohort, id))", "fn rehome_queued_inner(", "RunOwnerState::Blocked if custody.is_some()", "RunOwnerState::Local", "with_rehome_admission(", "compare_exchange(owner, migrating)", "None => return RemoteWakeOutcome::Rejected", "source.remove(slot, weight)", "drop(source)", "publish_migrating_record(slot, migrating, target_cpu, weight)", "fn publish_migrating_record(", "compare_exchange(migrating, queued)", "if observed.state.is_terminal()", "return RemoteWakeOutcome::Rejected", "mailbox.publish(RunTransfer"]
+tokens = ["fn rehome_queued_owned(", "Some((cohort, id))", "fn rehome_queued_inner(", "RunOwnerState::Blocked if custody.is_some()", "RunOwnerState::Local", "with_rehome_admission(", "transition(slot, owner, OwnerEvent::Rehome, Some(target_cpu))", "None => return RemoteWakeOutcome::Rejected", "source.remove(slot, weight)", "drop(source)", "publish_migration(committed, weight)", "fn publish_migrating_record(", "transition(slot, observed, OwnerEvent::PublishMigration, Some(target_cpu))", "current.state.is_terminal()", "return RemoteWakeOutcome::Rejected", "queued.into_duty().publish_mailbox(weight)"]
 
 # Original typed wait loans arbitrate payload/arm without RunOwner generation churn.
 [[required_sequences]]
@@ -3564,7 +3507,7 @@ tokens = [
     "local_dispatch::local_fair_competitor_ready(cpu)", "pub(super) fn publish_switching(",
     "dispatch_claim::validate_held_frame(", "let fused = local && switch.is_some() && direct_switch_admitted(cpu)",
     "let publication = (!fused).then(|| dispatch_priority::Publication::begin(scope, target))",
-    "if fused {", "typed.publish_and_clear(", "claim_blocked_handoff(slot, expected, target, local)",
+    "if fused {", "typed.publish_and_clear(", "claim_blocked_handoff_duty(slot, expected, target, local)",
     "sync_handoff::publish_original(", "frame_publication::bind_local_owner_generation(slot, original.generation)",
     "last_effect();", "drop(publication);", "frame_publication::direct_handoff_frame_token(slot, cpu)",
     "dispatch_claim::FrameSelection::from_held(", "dispatch_claim::DirectSwitch::new(selection)",
@@ -3640,7 +3583,7 @@ tokens = [
     "pub(in crate::multitask) fn reply(", "reply_context_custody(context_owner, context)",
     "recent_sleeper(", "release_reply_lane(c, caller_id, reply)", "finish(cpu, from, to, rsp, &clock, generic)",
     "fn finish(", "can_forward(", "settle(cpu, from.slot, from.id, clock)", "prepare_grant(to.slot, cpu)",
-    "lane_wake_clear(", "lane_cas(", "resident::take(to.slot, generation)", "banks::prepare_lane(cpu, loans.permit)",
+    "lane_wake_clear(", "lane_claim(", "claimed.take_resident()", "banks::prepare_lane(cpu, loans.permit)",
     "execution_interval::forward(", "publish_blocked(cpu, from.slot, rsp)", "lane_install(", "cpu_local::lane_publish(",
 ]
 

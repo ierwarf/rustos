@@ -270,6 +270,23 @@ pub fn complete_fast_ipc_reply_wake_handoff_with_custody(
     reply: u64,
     completion: kernel_ipc_runtime::api::ReplyCompletion,
 ) -> bool {
+    let mut scope = nucleus_core::util::lockdep::DispatchPreemption::enter();
+    scope.mask_irqs();
+    let woken = publish_fast_reply_in(&scope, reply, completion);
+    #[cfg(not(test))]
+    crate::multitask::irq::flush_deferred_target_reschedules();
+    woken
+}
+
+/// The one fast-reply wake, under the producer's ORIGINAL masked scope: the
+/// immediate reply syscall and the scheduler-entry settlement of a deferred
+/// reply both come here. A refusal's retry is recorded by `ipc_publication`
+/// inside that same scope; diagnostics never open a second dispatch owner.
+fn publish_fast_reply_in(
+    scope: &nucleus_core::util::lockdep::DispatchPreemption<'_>,
+    reply: u64,
+    completion: kernel_ipc_runtime::api::ReplyCompletion,
+) -> bool {
     let custody = completion
         .scheduling_context
         .expect("fast synchronous IPC reply completed without scheduling-context custody");
@@ -278,23 +295,22 @@ pub fn complete_fast_ipc_reply_wake_handoff_with_custody(
         completion.caller_task_id,
         "fast reply returned scheduling-context custody to a different caller"
     );
-    let mut scope = nucleus_core::util::lockdep::DispatchPreemption::enter();
-    scope.mask_irqs();
     let outcome = scheduler::ipc_publication::reply(
-        &scope,
+        scope,
         reply,
         completion.caller_task_id,
         custody.context_owner_task_id(),
         custody.identity(),
     ).expect("fast reply returned stale scheduling-context custody");
-    #[cfg(not(test))]
-    crate::multitask::irq::flush_deferred_target_reschedules();
     // No generic fresh-lookup fallback after ORIGINAL typed-wait refusal.
-    let woken = outcome != scheduler::FastIpcReplyHandoffOutcome::Rejected;
+    let woken = outcome == scheduler::FastIpcReplyHandoffOutcome::LocalFallback;
     if !woken {
-        // The common producer already recorded the retry in this scope.
-        // Diagnostics must not acquire a second dispatch-preemption owner.
-        note_refused_reply_wake("ipc-fast-reply-wake-refused", reply, completion.caller_task_id);
+        let refusal = if outcome == scheduler::FastIpcReplyHandoffOutcome::Rejected {
+            ReplyWakeRefusal::Deferred
+        } else {
+            ReplyWakeRefusal::NotWaiting
+        };
+        note_refused_reply_wake("ipc-fast-reply-wake-deferred", reply, completion.caller_task_id, refusal);
     }
     woken
 }
@@ -367,24 +383,14 @@ pub fn settle_deferred_fast_ipc_reply() {
 }
 
 /// [`settle_deferred_fast_ipc_reply`] at a scheduler entry: the entry's own masked
-/// scope publishes the wake and its dispatcher picks the caller next.
+/// scope publishes the wake and its dispatcher picks the caller next. A stash
+/// always carries custody (`pending_reply::stash` refuses one without it), so a
+/// missing one is the same invariant violation as on the immediate path.
 pub(in crate::multitask) fn settle_deferred_fast_ipc_reply_in(
     scope: &nucleus_core::util::lockdep::DispatchPreemption<'_>,
 ) {
     let Some((reply, completion)) = scheduler::pending_reply::take_any() else { return };
-    let Some(custody) = completion.scheduling_context else { return };
-    let outcome = scheduler::ipc_publication::reply(
-        scope,
-        reply,
-        completion.caller_task_id,
-        custody.context_owner_task_id(),
-        custody.identity(),
-    )
-    .expect("deferred fast reply returned stale scheduling-context custody");
-    if outcome == scheduler::FastIpcReplyHandoffOutcome::Rejected {
-        // `scope` is the scheduler entry's original owner, still live here.
-        note_refused_reply_wake("ipc-fast-reply-wake-refused", reply, completion.caller_task_id);
-    }
+    let _ = publish_fast_reply_in(scope, reply, completion);
 }
 
 /// Withdraws exact reply donation and retains the original wake lifetime loan
@@ -392,7 +398,7 @@ pub(in crate::multitask) fn settle_deferred_fast_ipc_reply_in(
 pub fn complete_ipc_reply_wake_handoff(reply: u64, task_id: u64) -> bool {
     let woken = scheduler::wake_publication::reply(reply, task_id);
     if !woken {
-        record_refused_reply_wake("ipc-reply-wake-refused", reply, task_id, REPLY_WAIT);
+        let _ = record_refused_reply_wake("ipc-reply-wake-deferred", reply, task_id, REPLY_WAIT);
     }
     woken
 }
@@ -403,37 +409,73 @@ pub fn complete_ipc_reply_wake_handoff(reply: u64, task_id: u64) -> bool {
 const REPLY_WAIT: fn(u64, u64) -> bool = scheduler::wake_retry::record_refused_reply;
 const PAGER_FAULT_WAIT: fn(u64, u64) -> bool = scheduler::wake_retry::record_refused_pager_fault;
 
+/// What a refused terminal (reply or pager-fault) wake means for its target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplyWakeRefusal {
+    /// The target still waits on exactly this object and the wake refused in a
+    /// transient window; a retry of that wait instance was recorded.
+    Deferred,
+    /// No wait instance names this object: the completion raced ahead of the
+    /// target's arm (its post-arm poll takes the result), or the wait already
+    /// completed, was cancelled or retired. A legitimate protocol outcome.
+    NotWaiting,
+}
+
 fn record_refused_reply_wake(
     name: &'static str,
     reply: u64,
     task_id: u64,
     retry: fn(u64, u64) -> bool,
-) {
+) -> ReplyWakeRefusal {
     // Retry this exact reply/fault wait at this CPU's next scheduler entry.
     // A pager-fault wait has no deadline waiter, so without this a refused
     // fault completion parked the faulting task indefinitely.
-    let _ = retry(task_id, reply);
-    note_refused_reply_wake(name, reply, task_id);
+    let refusal = if retry(task_id, reply) {
+        ReplyWakeRefusal::Deferred
+    } else {
+        ReplyWakeRefusal::NotWaiting
+    };
+    note_refused_reply_wake(name, reply, task_id, refusal);
+    refusal
 }
+
+/// Total refused terminal wakes whose target was not waiting on the object.
+static NOT_WAITING_REFUSALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Total refused terminal wakes kept as an exact-wait retry.
+static DEFERRED_REFUSALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Log/expedite only: the producer may still hold its original dispatch scope.
 /// Retry recording belongs to that producer, never a nested scope here.
-fn note_refused_reply_wake(name: &'static str, reply: u64, task_id: u64) {
-    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    // A refused exact wake can leave the caller blocked with its response
-    // already queued (the refusal paths give up before clearing the wait when
-    // the caller's frame is between publications). Make its armed reply
-    // deadline due now, so the next clockevent wakes it to re-poll instead of
-    // leaving it parked for the full 100 ms-30 s deadline. Harmless when the
-    // caller was not blocked yet: it re-polls after arming anyway.
-    #[cfg(not(test))]
-    let _ = crate::arch::rtc::expedite_sleep_waiter(task_id);
-    static REFUSED: AtomicU64 = AtomicU64::new(0);
-    let total = REFUSED.fetch_add(1, Relaxed) + 1;
+///
+/// Both classes are counted and reported at exponentially spaced totals
+/// (`arg0` = total << 32 | task, `arg1` = reply or fault token) so neither is
+/// silent nor floods the log.
+/// Only a deferred refusal expedites the target's armed deadline: the target is
+/// then blocked on this exact object with its result already published, and the
+/// expedited deadline wakes it to re-poll if the retry keeps refusing. A
+/// not-waiting target has no such wait, and expediting its deadline would cut an
+/// unrelated timed wait (a later call, a sleep) short.
+fn note_refused_reply_wake(name: &'static str, reply: u64, task_id: u64, refusal: ReplyWakeRefusal) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let (name, counter) = match refusal {
+        ReplyWakeRefusal::Deferred => {
+            #[cfg(not(test))]
+            let _ = crate::arch::rtc::expedite_sleep_waiter(task_id);
+            (name, &DEFERRED_REFUSALS)
+        }
+        ReplyWakeRefusal::NotWaiting => ("ipc-terminal-wake-not-waiting", &NOT_WAITING_REFUSALS),
+    };
+    // ORDERING: Relaxed is exact; the counters order nothing.
+    let total = counter.fetch_add(1, Relaxed) + 1;
     if total > 16 && !total.is_power_of_two() {
         return;
     }
-    crate::debug::record_milestone(crate::debug::LogCategory::Sched, name, task_id, reply);
+    crate::debug::record_milestone(
+        crate::debug::LogCategory::Sched,
+        name,
+        (total << 32) | (task_id & 0xffff_ffff),
+        reply,
+    );
 }
 
 /// Returns only the exact original pager wait epoch; a pending publication
@@ -441,7 +483,7 @@ fn note_refused_reply_wake(name: &'static str, reply: u64, task_id: u64) {
 pub fn complete_pager_fault_wake_handoff(fault_token: u64, task_id: u64) -> bool {
     let woken = scheduler::wake_publication::pager_reply(fault_token, task_id);
     if !woken {
-        record_refused_reply_wake("pager-fault-wake-refused", fault_token, task_id, PAGER_FAULT_WAIT);
+        let _ = record_refused_reply_wake("pager-fault-wake-deferred", fault_token, task_id, PAGER_FAULT_WAIT);
     }
     woken
 }
@@ -524,12 +566,46 @@ mod tests {
                 assert_eq!(outcome.ok(), Some(false));
             });
         // The scheduler-entry variant borrows a scope and cannot drop/reopen
-        // it. Pin its logging-only refusal route as well as the real call above.
+        // it. It must share the immediate path's scoped producer, whose refusal
+        // route is logging-only, rather than a recording wrapper of its own.
         let source = include_str!("ipc.rs").split("#[cfg(test)]").next().unwrap();
         let deferred = source.split("fn settle_deferred_fast_ipc_reply_in(").nth(1).unwrap()
             .split("pub fn complete_ipc_reply_wake_handoff(").next().unwrap();
-        assert!(deferred.contains("note_refused_reply_wake("));
+        assert!(deferred.contains("publish_fast_reply_in(scope, reply, completion)"));
         assert!(!deferred.contains("record_refused_reply_wake("));
+        let scoped = source.split("fn publish_fast_reply_in(").nth(1).unwrap()
+            .split("pub fn publish_fast_ipc_reply(").next().unwrap();
+        assert!(scoped.contains("note_refused_reply_wake("));
+        assert!(!scoped.contains("record_refused_reply_wake("));
+    }
+
+    /// A completion that reaches a target not waiting on its object (the reply
+    /// raced ahead of the caller's arm, or the wait already finished) is a
+    /// legitimate outcome: classified `NotWaiting`, counted under its own name,
+    /// and never expedites the target's (unrelated) deadline. Only a recorded
+    /// exact-wait retry is `Deferred`. The retry recorder's own contract (true
+    /// only while that exact wait is published) is pinned in
+    /// `ipc_publication::tests::slow_reply_retry_records_only_the_exact_published_wait`.
+    #[test]
+    fn refused_terminal_wake_is_deferred_only_when_a_retry_was_recorded() {
+        use core::sync::atomic::Ordering::Relaxed;
+        let (deferred, waiting) = (super::DEFERRED_REFUSALS.load(Relaxed),
+            super::NOT_WAITING_REFUSALS.load(Relaxed));
+        assert_eq!(super::record_refused_reply_wake("t", 0x9a9a, 132303, |_, _| false),
+            super::ReplyWakeRefusal::NotWaiting);
+        assert_eq!(super::record_refused_reply_wake("t", 0x9a9a, 132303, |_, _| true),
+            super::ReplyWakeRefusal::Deferred);
+        // Other tests may refuse concurrently; each class moved by at least one.
+        assert!(super::DEFERRED_REFUSALS.load(Relaxed) > deferred);
+        assert!(super::NOT_WAITING_REFUSALS.load(Relaxed) > waiting);
+        // The expedite belongs to the deferred arm only.
+        let source = include_str!("ipc.rs").split("#[cfg(test)]").next().unwrap();
+        let note = source.split("fn note_refused_reply_wake(").nth(1).unwrap()
+            .split("ReplyWakeRefusal::NotWaiting =>").next().unwrap();
+        assert!(note.contains("expedite_sleep_waiter(task_id)"));
+        let not_waiting = source.split("ReplyWakeRefusal::NotWaiting =>").last().unwrap()
+            .split("// ORDERING").next().unwrap();
+        assert!(!not_waiting.contains("expedite_sleep_waiter"));
     }
 
     #[test]

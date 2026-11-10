@@ -116,6 +116,37 @@ is independently release/acquire published; a concurrent enqueue still owns a
 directed IPI. This keeps quiescent CPUs on their local continuation path without
 opening a dispatch turn or polling away a real wake or idle-steal opportunity.
 
+Liveness rule for every skip-the-scheduler check (the periodic continuation
+fast return, the syscall tail and the idle task's `hlt`, which never polls):
+all per-CPU pending work must be visible to it, because the next periodic tick
+is the universal backstop for a coalesced or deferred IPI and for an
+`Incomplete` turn. Hence:
+
+- a wake deferred under a raw lock or inside a `DispatchPreemption` scope
+  (`deferred_wake`) publishes the CPU's own durable reschedule request after
+  its append (one CAS on the CPU's request line, deferral path only; lock- and
+  allocation-free, legal in every deferring context). Every claim of that
+  request is followed by a `DispatchEntry`, which drains the batch until empty
+  (also after `wake_retry::service`), so a claim cannot consume a deferral's
+  request without publishing its wake;
+- a stashed fast IPC reply (`pending_reply`) defeats the periodic fast return,
+  so a replier that returns to compute cannot hold its caller's wake;
+- a dispatch turn makes progress whenever some candidate is resolvable: the
+  first-turn FIFO consumes records for tasks not queued here (7.3), and the
+  fair and overdue scans omit, on their final observation only, a candidate
+  that stayed unresolved through every earlier observation of the turn
+  (`local_dispatch::UnresolvedCandidates`; epoch tears stay strict). Omission
+  is reported by the `scheduler-candidate-unresolved` milestone
+  (arg0 turns, arg1 `cpu<<32 | reason<<16 | slot`);
+- a budgeted task's affinity stays inside its scheduling context's
+  `cpu_mask`: `sched_setaffinity` and Windows process/thread affinity refuse a
+  mask outside it (funding on any other CPU is refused, so such a task would
+  sit runnable on a CPU that never runs it).
+
+The custody conservation scan (`runqueue::conservation::scan`) runs from the
+timer/RTC scheduler entry, outside every leaf, reusing that entry's tick
+sample; ticks that keep their continuation do not scan.
+
 ### 7.1 Dispatch, raw-guard, and CPU-affinity linearization
 
 The executable refinement is
@@ -248,7 +279,18 @@ Activation is a scheduler transaction, not a replaceable optimization hint:
   does not consume it, so boot handoff cannot suspend admitted recovery;
 - absent an overdue System continuation, the oldest live activation receives
   its first turn before unrelated latency or IPC hints. User progress remains
-  a bounded-burst plus charged-vruntime property, not an unadmitted deadline.
+  a bounded-burst plus charged-vruntime property, not an unadmitted deadline;
+- a first-turn record is ordering metadata, never dispatch custody. Activation
+  appends one only to the CPU its own wake `Published` into (none for an
+  `AlreadyOwned` wake), and `ordering_publication::spawn` only for a task that
+  is `Local` on that CPU. The record is still published after the wake, so it
+  can name a task that has since run, blocked or been pulled to another CPU.
+  The consumer therefore drops every record whose owner is not runnable
+  custody of this CPU (`Local`, `RemoteQueued` or `Migrating` here). A stale
+  record that stayed at the FIFO front as `Incomplete` sent the CPU to idle on
+  every turn and starved everything queued there (the 2026-11-09 "new task
+  never runs" boot family; witness
+  `activation::tests::a_first_turn_record_for_a_task_no_longer_queued_here_never_idles_the_cpu`).
 
 This uses the same explicit queue ownership found in the seL4 scheduler
 (runnable peers are FIFO within priority) and Linux dispatch queues (a task is
@@ -362,7 +404,16 @@ by seL4 while preserving RustOS sender identity and deadline semantics:
   custody and compares the observed serial under the same epoch leaf that
   establishes the pending phase; a changed epoch or recycled task invalidates it.
   Refusal diagnostics inside a live dispatch scope only log/expedite: they must
-  not acquire a nested dispatch owner to record an already-retained retry;
+  not acquire a nested dispatch owner to record an already-retained retry.
+  A refusal is classified by that record: `Deferred` (retry recorded; the
+  caller's armed deadline is expedited as a backstop) or `NotWaiting` (no wait
+  instance names the reply: the completion raced ahead of a slow caller's
+  post-enqueue arm, or the wait already finished). `NotWaiting` is a legitimate
+  outcome, counted (`ipc-terminal-wake-not-waiting`) and never expedites, since
+  the task's armed deadline then belongs to an unrelated wait. The same rule
+  covers the IPC lane: a committed lane whose claim lost falls back to the
+  ordinary wake, and a refusal of that wake records the exact retry too
+  (`ipc_lane::{call,reply}_fallback`);
 - the sender-stamped receive half arms the scheduler first, then under one
   endpoint slot guard consumes the exact fast frame or priority-queue head, or
   publishes a bounded receiver waiter. Every non-waiting result cancels the
@@ -477,21 +528,27 @@ continues to prove general FIFO first-turn custody after publication.
 
 ### 7.9 Owner-word writers and the resident IPC cell
 
-Every write to a task's owner word is one of three kinds, and each kind has one
-code path in `scheduler/runqueue.rs`:
+`OWNER_WORDS` is private to `scheduler/runqueue/ownership.rs`. Every write to a
+task's owner word is one of three kinds, and each kind has one code path there:
 
-- **Custody transition** (`RunOwnerWord::compare_exchange`): the new word has a
-  strictly greater generation. It revokes the resident cell parked for the
-  generation it leaves (`resident::on_owner_transition`) after the CAS.
-- **Lane claim** (`lane_cas`, the raw CAS): the caller settles the cell of the
-  generation it leaves itself, by taking it.
+- **Custody transition** (`ownership::transition(slot, expected, OwnerEvent,
+  cpu)`): accepted only as a row of the const table `TRANSITIONS` (section
+  7.10); the new word has exactly the next generation. After the exact-value CAS
+  it revokes the resident cell parked for the generation it leaves
+  (`resident::on_owner_transition`), except for the lane's `LaneClaim` row,
+  whose `ResidentTake` duty makes the lane take that cell itself
+  (`runqueue::lane_claim` -> `LaneClaim::take_resident`).
 - **In-place metadata edit** (`RunOwnerWord::edit_in_place`): run intent and
   wait-arm bits only. It keeps state, CPU and generation, and it never writes a
-  `Retiring` or `Retired` word. Retire completion and slot release are
+  `Dormant`, `Retiring` or `Retired` word. Retire completion and slot release are
   exact-value CASes; a late `publish_frame` run-intent write or wait write into
-  a terminal word made them lose and panic. `set_runnable`, the wait-arm
-  writers, `commit_wait` and `wake_wait_locked` are the only callers, so a new
-  metadata writer cannot reintroduce that race without bypassing the helper.
+  a terminal word made them lose and panic. Run intent may be raised only in a
+  state whose custody record a dispatcher can find (`Running`, `Local`,
+  `RemoteQueued`, `Migrating`, `DirectHandoff`) and lowered only in `Running`
+  and `Local`; `set_runnable` panics on any other request instead of silently
+  ignoring it. `set_runnable`, the wait-arm writers, `commit_wait` and
+  `wake_wait_locked` are the only callers.
+- **Boot reset** (`reset_before_publication`), before any publication.
 
 Mailbox adoption (`drain_remote_wakes`) can lose its CAS to a remote terminal
 withdrawal as well as to a metadata edit; it rolls the queue insertion back on a
@@ -517,7 +574,7 @@ owner generation) or `BUSY` (one CPU is filling or draining the payload). Rules:
   published generation or the parker sees the new owner word.
 - `BUSY` counts no parked permit unit (`permit_units`): quiescence observers
   count an in-flight unit as live, and `exec` re-evicts until the cell is empty.
-- The lane's `take` after winning `lane_cas` never loses the cell: the lane runs
+- The lane's `take_resident` after winning `lane_claim` never loses the cell: the lane runs
   only for a cell parked on its own CPU (`parked_cpu == Some(cpu)`), and that
   CPU's `park` call (including its owner re-read and self-take) has returned by
   then because both run with IRQs masked on one CPU; `exec` excludes the lane's
@@ -530,3 +587,72 @@ owner generation) or `BUSY` (one CPU is filling or draining the payload). Rules:
   `resident_cell_delayed_hook_reparks_without_overwrite_or_double_drop`, and the
   herd7 litmus `scheduler_resident_cell_publication`.
 
+
+
+### 7.10 Owner transition table, enqueue duties and custody conservation
+
+The single definition of task custody is `ownership::TRANSITIONS`:
+
+| from | event | to | wait | cpu | duty |
+| --- | --- | --- | --- | --- | --- |
+| Dormant | Admit | Blocked | clear | none | - |
+| Dormant | AdmitRunning (fixture) | Running | clear | target | - |
+| Blocked | AdmitInitial | Running | clear | target | - |
+| Blocked | WakeLocal | Local | clear | target | RunQueue |
+| Blocked | WakeRemote | RemoteQueued | keep | target | Mailbox |
+| Blocked | HandoffDirect | DirectHandoff | keep | target | HandoffFifo |
+| Blocked | HandoffRemote | RemoteQueued | keep | target | Mailbox |
+| Blocked | LaneClaim | Running | clear | target | ResidentTake |
+| Local, DirectHandoff | Claim | Running | clear | target | - |
+| Running | ReturnLocal | Local | clear | target | RunQueue |
+| Running | ReturnBlocked | Blocked | keep | none | - |
+| RemoteQueued | Adopt | Local | clear | target | RunQueue |
+| DirectHandoff | Materialize | Local | clear | target | RunQueue |
+| DirectHandoff | RollbackHandoff (fixture) | Blocked | keep | none | - |
+| Local, RemoteQueued, DirectHandoff | Rehome | Migrating | clear | target | Migration |
+| Migrating | PublishMigration | RemoteQueued | clear | target | Mailbox |
+| every live state | Withdraw | Retiring | clear | keep | - |
+| Retiring | CompleteRetire | Retired | clear | none | - |
+| Retired | Release | Dormant | clear | none | - |
+
+Invariants:
+
+- **I1 (enqueue duty).** A transition into runnable custody other than CPU
+  execution returns exactly one `EnqueueDuty` (`#[must_use]`, not `Clone`). It
+  is consumed only by the path that performs that enqueue: `RunQueue` by the rq
+  insertion made under the held rq lock before the CAS (checked against the
+  locked queue), `Mailbox` by `EnqueueDuty::publish_mailbox` (record, then the
+  0-to-1 pending edge; the winner owes the IPI), `HandoffFifo` by
+  `sync_handoff::publish_original` after the FIFO insert or by a `DirectSwitch`
+  (`handoff_recorded`), `Migration` by the `PublishMigration` row (or voided by a
+  terminal winner). Dropping a duty panics with slot, generation and kind.
+- **I2.** `Dormant`, `Retiring` and `Retired` change only through their table
+  rows by exact-value CAS. A second withdrawal that observes `Retiring` waits
+  for the first one's exact completion instead of re-withdrawing the word.
+- **I3.** Every row advances the generation by exactly one; nothing else changes
+  it.
+
+Effects run in a fixed order after the CAS: resident-cell settle, flight-recorder
+store, the duty, the caller's frame-generation bind and published-load update
+under the rq lock, and the IPI outside every leaf.
+
+**Flight recorder.** The owner word's own 64-byte line carries a 7-entry ring
+indexed by `generation % 7`; the CAS winner of a generation is that entry's only
+writer, so a transition costs one relaxed store into a line it already owns (no
+RMW, no lock, no extra cache line, no clock read). An entry packs the new word's
+low 17 bits, the event, the actor CPU (or "the new word's CPU"), the generation's
+low 16 bits and the old state/CPU/run intent. In-place edits are not recorded.
+
+**Custody conservation** (`runqueue/conservation.rs`). `scan(now_ticks)` runs
+from the timer and RTC interrupt dispatch (`irq.rs`, after the runtime-profile
+publication, outside every scheduler leaf, via
+`runqueue_policy::custody_conservation_scan`), one CPU at a time, at most every
+256 ticks. A word naming run custody without its record (Local without published
+rq membership, RemoteQueued with no pending mailbox edge, DirectHandoff with no
+FIFO record of its generation, Migrating, Blocked with run intent, Running with
+no executing CPU) whose exact value stays unchanged for 2048 ticks is reported
+once as milestone `scheduler-custody-lost` (arg0 = slot | gap << 8 | age << 16,
+arg1 = word) plus up to 7 `scheduler-custody-ring` entries; at most 4 per scan
+and 32 per boot. It never panics and never repairs. Ticks that keep their
+continuation do not scan, so a CPU that never enters the scheduler never scans.
+xtask classifies the milestone as the failure kind "scheduler custody lost".

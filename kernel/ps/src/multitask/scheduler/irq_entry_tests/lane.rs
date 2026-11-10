@@ -37,6 +37,9 @@ fn park_receiver(slot: usize, peer: usize) {
     runqueue::publish_blocked(peer, 0, runqueue::weight::value(peer));
     frame_publication::bind_local_owner_generation(peer, runqueue::owner(peer).generation);
     let view = frame_publication::return_view(slot).unwrap();
+    // Only the CPU whose Current/Prepared bank retains the allocation may
+    // snapshot it; CPU 1 holds no bank for this slot.
+    assert!(stack_resources::context::retained_architecture(1, slot, ID, view).is_none());
     let arch = stack_resources::context::retained_architecture(0, slot, ID, view).unwrap();
     ipc_lane::note_installed(0, slot, arch);
     let token = frame_publication::observed_frame_token(peer, 0, false).unwrap();

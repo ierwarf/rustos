@@ -333,18 +333,21 @@ fn actual_raced_owner_cannot_be_reacquired_by_original_typed_handoff_cas() {
         let pin = frame_publication::pin_for_identity(token, RECEIVER).unwrap();
         // SAFETY: actual original masked caller, born allocation and UID pin.
         let reader = unsafe { stack_resources::frame_readers::acquire(&pin, 0) }.unwrap();
-        // Actual competing runnable intent changes the authoritative owner word
-        // without clearing our original pending typed wait. A fresh-CAS retry
-        // must not spend even this same-generation winner as the old claim.
-        runqueue::set_runnable(receiver, true);
+        // The producer's observation differs from the authoritative word in a
+        // same-generation field while our original pending typed wait stays
+        // published. (Run intent can no longer be raised in place on a Blocked
+        // word, so the race is modeled on the observation side.) The exact-value
+        // claim must not spend this differing word, nor retry with a fresh read.
         let winner = runqueue::owner(receiver);
         let winner_wait = runqueue::wait::reason(receiver);
+        let stale = runqueue::RunOwnerSnapshot { runnable: !expected.runnable, ..expected };
         assert_eq!(winner.state, runqueue::RunOwnerState::Blocked);
-        assert_ne!(winner, expected);
-        assert!(typed.publish_and_clear(|| runqueue::claim_blocked_handoff(
-            receiver, expected, 0, true)).is_none());
+        assert_eq!(stale.generation, winner.generation);
+        assert_ne!(winner, stale);
+        assert!(typed.publish_and_clear(|| runqueue::claim_blocked_handoff_duty(
+            receiver, stale, 0, true)).is_none());
         assert_eq!(runqueue::owner(receiver), winner);
-        assert!(!runqueue::published_local_member_for_test(0, receiver));
+        assert!(!runqueue::published_local_membership(receiver, 0));
         assert_eq!(runqueue::wait::reason(receiver), winner_wait);
         drop(reader);
         drop(pin);
@@ -478,7 +481,8 @@ fn actual_reverse_reply_uses_original_typed_wait_fair_owner_and_exact_fifo() {
         assert_eq!(current_identity::execution::count(receiver), refs);
         // Duplicate completion may withdraw no new edge or wait incarnation.
         assert_eq!(reply(scope, REPLY, RECEIVER, RECEIVER, context),
-            Some(FastIpcReplyHandoffOutcome::Rejected));
+            Some(FastIpcReplyHandoffOutcome::NotWaiting));
+        assert_eq!(wake_retry::pending_on(scope), 0, "a finished wait records no retry");
         assert_eq!(runqueue::owner(receiver), local);
     });
 }
@@ -532,9 +536,73 @@ fn actual_reply_foreign_context_and_wrong_wait_refuse_without_generic_fallback()
         assert_eq!(reply(scope, REPLY, RECEIVER, RECEIVER, context), None);
         let before = runqueue::owner(receiver);
         assert_eq!(reply(scope, REPLY, RECEIVER, SENDER, context),
-            Some(FastIpcReplyHandoffOutcome::Rejected));
+            Some(FastIpcReplyHandoffOutcome::NotWaiting));
         assert_eq!(runqueue::owner(receiver), before);
+        assert_eq!(wake_retry::pending_on(scope), 0, "a wait on another object records no retry");
         assert_eq!(runqueue::wait::reason(receiver), (runqueue::wait::REASON_ENDPOINT_RECEIVE, ENDPOINT));
         assert!(!sync_handoff::pending(0));
+    });
+}
+
+/// The contract the refusal classification in `current/ipc.rs` relies on: a
+/// retry is recorded (true) only while the target's published wait instance is
+/// exactly the refused one. A completion that raced ahead of the arm, or a wait
+/// on another object, records nothing (false) and is a `NotWaiting` outcome.
+#[test]
+fn slow_reply_retry_records_only_the_exact_published_wait() {
+    peers(|_, receiver, scope| {
+        let reply = Some((runqueue::wait::REASON_ENDPOINT_REPLY, REPLY));
+        // Still on its receive wait: the reply is not what it waits for.
+        assert!(!wake_retry::record_in(scope, RECEIVER, reply));
+        runqueue::wait::set_reason(receiver, runqueue::wait::REASON_ENDPOINT_REPLY, REPLY + 1);
+        assert!(!wake_retry::record_in(scope, RECEIVER, reply));
+        assert_eq!(wake_retry::pending_on(scope), 0);
+        runqueue::wait::set_reason(receiver, runqueue::wait::REASON_ENDPOINT_REPLY, REPLY);
+        assert!(wake_retry::record_in(scope, RECEIVER, reply));
+        assert_eq!(wake_retry::pending_on(scope), 1);
+        assert_eq!(wake_retry::service_with(scope, &|_| 1), 1);
+        assert_eq!(runqueue::wait::reason(receiver).0, runqueue::wait::REASON_NONE);
+        assert!(runqueue::owner(receiver).runnable);
+    });
+}
+
+/// A committed lane reply whose claim lost falls back to the ordinary reply
+/// wake. When that wake refuses (here the frame-generation publication gap) the
+/// response is already published and the caller is Blocked on it: before this
+/// fallback recorded a retry, nothing woke the caller until its reply deadline,
+/// where the response was discarded as ETIMEDOUT.
+#[test]
+fn refused_lane_reply_fallback_keeps_an_exact_retry_of_the_callers_wait() {
+    peers(|_, receiver, scope| {
+        runqueue::wait::set_reason(receiver, runqueue::wait::REASON_ENDPOINT_REPLY, REPLY);
+        let owner = runqueue::owner(receiver);
+        frame_publication::bind_local_owner_generation(receiver, owner.generation + 1);
+        assert!(!ipc_lane::reply_fallback(scope, REPLY, RECEIVER, &|_| 1));
+        assert_eq!(runqueue::owner(receiver), owner);
+        assert_eq!(wake_retry::pending_on(scope), 1, "a refused lane fallback lost its only wake");
+        frame_publication::bind_local_owner_generation(receiver, owner.generation);
+        assert_eq!(wake_retry::service_with(scope, &|_| 1), 1);
+        assert_eq!(runqueue::wait::reason(receiver).0, runqueue::wait::REASON_NONE);
+        assert!(runqueue::owner(receiver).runnable);
+    });
+}
+
+/// The call direction: the caller is committed Blocked on its reply and the
+/// request is queued to this receiver, which nothing else wakes (an endpoint
+/// receive has no deadline). A refused fallback wake keeps a retry of the
+/// receiver's exact receive wait, which the next scheduler entry completes.
+#[test]
+fn refused_lane_call_fallback_keeps_an_exact_retry_of_the_receivers_wait() {
+    peers(|_, receiver, scope| {
+        let owner = runqueue::owner(receiver);
+        frame_publication::bind_local_owner_generation(receiver, owner.generation + 1);
+        assert!(!ipc_lane::call_fallback(scope, ENDPOINT, RECEIVER, &|_| 1));
+        assert_eq!(runqueue::owner(receiver), owner);
+        assert_eq!(runqueue::wait::reason(receiver), (runqueue::wait::REASON_ENDPOINT_RECEIVE, ENDPOINT));
+        assert_eq!(wake_retry::pending_on(scope), 1, "a refused lane fallback stranded its receiver");
+        frame_publication::bind_local_owner_generation(receiver, owner.generation);
+        assert_eq!(wake_retry::service_with(scope, &|_| 1), 1);
+        assert_eq!(runqueue::wait::reason(receiver).0, runqueue::wait::REASON_NONE);
+        assert_eq!(wake_retry::pending_on(scope), 0);
     });
 }

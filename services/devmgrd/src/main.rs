@@ -106,6 +106,8 @@ fn main() {
     // service's late reply was rejected, and the capability it carried was
     // never installed, which surfaced much later as a permission error.
     let sessiond_workers = start_sessiond_ioctl_workers();
+    // Separates a stall in thread creation from one in endpoint registration.
+    debug_line("devmgrd: ioctl workers started");
     let register =
         rustos_svc_runtime::ipc::register_service_endpoint(IPC_SERVICE_DEVMGRD, endpoint as u64);
     if register < 0 {

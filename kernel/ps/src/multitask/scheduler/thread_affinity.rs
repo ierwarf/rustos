@@ -101,6 +101,9 @@ impl Grant {
         if requested == 0 || requested & !online != 0 || requested & !process_mask != 0 {
             return Err(AffinityError::InvalidMask);
         }
+        if !super::affinity::funded_mask_admits(requested, super::scheduling_runtime::context_cpu_mask(self.slot)) {
+            return Err(AffinityError::InvalidMask);
+        }
         let previous_mask = self.mask(online)?;
         self.cohort.begin_effects();
         // Ordinary source transfer/dispatch CAS share Identity/cohort admission;

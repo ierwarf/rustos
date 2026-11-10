@@ -5,7 +5,7 @@
 //! Failure: duplicate, foreign CPU/UID, reservation or typed wait fails closed.
 //! Forbidden: Blocked ACK and copied owner generations never grant execution.
 //! Evidence: actual born initial descriptor/interval/bank witnesses; HAL modeled.
-use super::{OWNER_WORDS, RunOwnerState, frame_publication, owner, validate_cpu, wait};
+use super::{OwnerEvent, RunOwnerState, frame_publication, owner, transition, validate_cpu, wait};
 
 pub(in crate::multitask::scheduler) fn admit_blocked(slot: usize) {
     let owner = owner(slot);
@@ -14,9 +14,9 @@ pub(in crate::multitask::scheduler) fn admit_blocked(slot: usize) {
         RunOwnerState::Dormant,
         "scheduler slot admitted twice"
     );
-    OWNER_WORDS[slot]
-        .compare_exchange(owner, owner.next(RunOwnerState::Blocked, None))
-        .unwrap_or_else(|observed| panic!("scheduler slot admission raced observed={observed:?}"));
+    let _ = transition(slot, owner, OwnerEvent::Admit, None)
+        .unwrap_or_else(|observed| panic!("scheduler slot admission raced observed={observed:?}"))
+        .settled();
 }
 
 /// The original one-shot CPU image, not a queue hint or copied generation,
@@ -44,10 +44,9 @@ pub(in crate::multitask::scheduler) fn admit_initial(
         !wait::armed(slot) && wait::reason(slot) == (wait::REASON_NONE, 0),
         "initial image acquired a typed wait intent"
     );
-    let running = owner.next(RunOwnerState::Running, Some(cpu));
-    OWNER_WORDS[slot]
-        .compare_exchange(owner, running)
-        .expect("initial image Running publication raced");
+    let running = transition(slot, owner, OwnerEvent::AdmitInitial, Some(cpu))
+        .expect("initial image Running publication raced")
+        .settled();
     frame_publication::bind_local_owner_generation(slot, running.generation);
 }
 
@@ -60,9 +59,9 @@ pub(in crate::multitask::scheduler) fn admit_running(slot: usize, cpu: usize) {
         RunOwnerState::Dormant,
         "scheduler slot admitted twice"
     );
-    OWNER_WORDS[slot]
-        .compare_exchange(owner, owner.next(RunOwnerState::Running, Some(cpu)))
+    let _ = transition(slot, owner, OwnerEvent::AdmitRunning, Some(cpu))
         .unwrap_or_else(|observed| {
             panic!("scheduler running admission raced observed={observed:?}")
-        });
+        })
+        .settled();
 }

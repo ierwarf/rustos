@@ -470,11 +470,10 @@ pub fn drain_scheduler_runtime_profile() -> usize {
             charged_ns,
         );
     }
-    // A CPU that parked on idle because its current task lost run-queue custody
-    // made a correct choice, but the task must then be woken elsewhere. A run
-    // that misses its deadline without panicking is either accompanied by this
-    // or it is not, and that is the difference between a scheduler stall and an
-    // unrelated one.
+    // Dispatches that fell back to the CPU's idle task because neither a
+    // selected task nor the outgoing one could be claimed. Ordinary blocking
+    // with nothing else runnable lands here too, so the absolute rate is not a
+    // stall signal; a stalled run with runnable work AND a high rate is.
     let fallback_idle = super::runqueue_policy::take_fallback_idle_dispatch_window();
     if fallback_idle != 0 {
         crate::debug::record_milestone(
@@ -482,6 +481,18 @@ pub fn drain_scheduler_runtime_profile() -> usize {
             "scheduler-fallback-idle",
             fallback_idle,
             0,
+        );
+    }
+    // A dispatch turn that had to leave out a candidate unresolved through
+    // every strict observation (see `local_dispatch::UnresolvedCandidates`):
+    // the CPU kept running its other work, but that task's own liveness is at
+    // risk. arg0=omitting turns this window, arg1=(cpu<<32)|(reason<<16)|slot.
+    if let Some((turns, last)) = super::local_dispatch::take_omitted_candidate_window() {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "scheduler-candidate-unresolved",
+            turns,
+            last,
         );
     }
     // A domain that refuses a dispatch it was admitted for is a lost race the

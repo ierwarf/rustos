@@ -9,8 +9,10 @@ use super::super::dispatch_claim::{
     FrameCustody,
     tests::{capture, finish_modeled_preparation, fixture, fixture_with_release},
 };
+use super::super::{
+    TaskRetireReason, retirement_cleanup, terminal_publication, terminal_quarantine,
+};
 use super::*;
-use super::super::{retirement_cleanup, terminal_publication, terminal_quarantine, TaskRetireReason};
 use crate::multitask::{cpu_local, current_identity as identity};
 const KERNEL: usize = 121;
 fn result(slot: usize, original: usize) -> SchedulerDispatch {
@@ -64,7 +66,9 @@ fn actual_local_peer_plan_uses_original_frame_mm_and_placement_banks() {
         assert!(plan.changed);
         assert!(plan.incoming.register_ipc); // original Linux context, not a PID hint
         let mut effects = std::vec::Vec::new();
-        lane_effects(plan.receipt.previous, plan.incoming, slot, |effect| effects.push(effect));
+        lane_effects(plan.receipt.previous, plan.incoming, slot, |effect| {
+            effects.push(effect)
+        });
         assert!(effects.iter().any(|effect| matches!(effect,
             ArchitectureEffect::SyscallStack(top, true) if *top == plan.incoming.stack_top)));
         // The actual fixture actor is a kernel continuation in the SAME
@@ -162,25 +166,40 @@ fn actual_claimed_return_requires_original_physical_prepared_bank() {
         // witness cannot pass merely because interval admission also refused.
         stack_resources::cpu_leases::publish(0, slot, slot);
         stack_resources::cpu_leases::commit(0);
-        assert!(super::super::execution_interval::original_claim_is_active(turn));
+        assert!(super::super::execution_interval::original_claim_is_active(
+            turn
+        ));
         assert!(ReturnArchitecture::capture(turn, good).is_none());
-        assert!(matches!(super::super::execution_interval::consume(0, slot, turn.claimed_return().unwrap().id),
-            super::super::execution_interval::ConsumedInterval::Active(_)));
+        assert!(matches!(
+            super::super::execution_interval::consume(0, slot, turn.claimed_return().unwrap().id),
+            super::super::execution_interval::ConsumedInterval::Active(_)
+        ));
     });
 }
 #[test]
 fn actual_settled_original_grant_cannot_admit_architecture_with_retained_frame_banks() {
     fixture(true, |slot, turn| {
-        assert!(capture(slot, turn, FrameCustody::Current).prepare().unwrap().claim());
+        assert!(
+            capture(slot, turn, FrameCustody::Current)
+                .prepare()
+                .unwrap()
+                .claim()
+        );
         let good = result(slot, slot);
         assert!(ReturnArchitecture::capture(turn, good).is_some());
-        assert!(matches!(super::super::execution_interval::consume(0, slot, turn.claimed_return().unwrap().id),
-            super::super::execution_interval::ConsumedInterval::Active(_)));
+        assert!(matches!(
+            super::super::execution_interval::consume(0, slot, turn.claimed_return().unwrap().id),
+            super::super::execution_interval::ConsumedInterval::Active(_)
+        ));
         assert!(stack_resources::cpu_leases::owns_prepared(0, slot));
         assert!(crate::multitask::current_identity::execution::banks::owns_execution(0, slot));
         assert!(ReturnArchitecture::capture(turn, good).is_none());
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
-            super::super::execution_interval::finish_return(turn, slot))).is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::super::execution_interval::finish_return(turn, slot)
+            }))
+            .is_err()
+        );
         // Model the earlier architecture/RSP ACK only for fixture teardown.
         stack_resources::cpu_leases::publish(0, slot, slot);
         stack_resources::cpu_leases::commit(0);
@@ -297,25 +316,35 @@ fn actual_remote_terminal_cannot_retire_a_slot_whose_dispatch_claim_is_in_flight
             );
             let id = turn.claimed_return().unwrap().id;
             // The claim is in flight: Running, and not yet any CPU's Current.
-            assert_eq!(runqueue::owner(slot).state, runqueue::RunOwnerState::Running);
+            assert_eq!(
+                runqueue::owner(slot).state,
+                runqueue::RunOwnerState::Running
+            );
             assert_eq!(cpu_local::task_execution_owner(slot), None);
             assert_eq!(
                 runqueue::retire_unless_claim_in_flight(slot, runqueue::weight::value(slot)),
                 runqueue::RetireOutcome::ClaimInFlight
             );
 
-            let stop =
-                terminal_quarantine::begin(slot, Some(id), TaskRetireReason::Exited, false)
-                    .unwrap();
+            let stop = terminal_quarantine::begin(slot, Some(id), TaskRetireReason::Exited, false)
+                .unwrap();
             // SAFETY: the fixture's original masked scope is retained throughout.
-            unsafe { terminal_publication::guarded(stop, &|_| 1); }
+            unsafe {
+                terminal_publication::guarded(stop, &|_| 1);
+            }
 
             // Nothing was withdrawn under the claimer...
-            assert_eq!(runqueue::owner(slot).state, runqueue::RunOwnerState::Running);
+            assert_eq!(
+                runqueue::owner(slot).state,
+                runqueue::RunOwnerState::Running
+            );
             assert!(!identity::lifecycle(slot).retired);
             assert!(ReturnArchitecture::capture(turn, result(slot, KERNEL)).is_some());
             // ...and the stop request was kept, not dropped.
-            assert_eq!(retirement_cleanup::deferred(slot), Some(TaskRetireReason::Exited));
+            assert_eq!(
+                retirement_cleanup::deferred(slot),
+                Some(TaskRetireReason::Exited)
+            );
 
             // The claimer finishes. Natively this models the install and the
             // switch publication; it is not a hardware acceptance.
@@ -323,18 +352,16 @@ fn actual_remote_terminal_cannot_retire_a_slot_whose_dispatch_claim_is_in_flight
 
             // The parked stop is resumed by the next claimant and now retires
             // the task, exactly once, from the top.
-            let resumed = terminal_quarantine::begin(
-                slot,
-                Some(id),
-                TaskRetireReason::Exited,
-                false,
-            )
-            .expect("the parked stop is resumable");
+            let resumed =
+                terminal_quarantine::begin(slot, Some(id), TaskRetireReason::Exited, false)
+                    .expect("the parked stop is resumable");
             // The switch has published the task as CPU 0's Current (modeled by
             // the scalar), which is what makes the remote stop applicable.
             cpu_local::with_test_current_scalar(0, slot, || {
                 // SAFETY: as above.
-                unsafe { terminal_publication::guarded(resumed, &|_| 1); }
+                unsafe {
+                    terminal_publication::guarded(resumed, &|_| 1);
+                }
             });
             assert!(identity::lifecycle(slot).retired);
             assert!(runqueue::owner(slot).state.is_terminal());
@@ -344,6 +371,47 @@ fn actual_remote_terminal_cannot_retire_a_slot_whose_dispatch_claim_is_in_flight
         // time. Only the external cleanup is injected here: the actual seals,
         // bank, context and process detachment still run and still refuse any
         // outstanding loan.
+        release_withdrawn_stop,
+    );
+}
+
+/// The housekeeping drain claims every deferred producer. A stop parked behind
+/// an in-flight dispatch claim has withdrawn nothing (lifecycle not retired, no
+/// executor wait), and the drain used to assert one of those two and panic
+/// ("deferred retirement lost its terminal lifecycle or kernel resume loan").
+#[test]
+fn actual_housekeeping_drain_resumes_a_stop_parked_behind_an_in_flight_claim() {
+    fixture_with_release(
+        false,
+        |slot, turn| {
+            assert!(
+                capture(slot, turn, FrameCustody::Local)
+                    .prepare()
+                    .unwrap()
+                    .claim()
+            );
+            let id = turn.claimed_return().unwrap().id;
+            let stop = terminal_quarantine::begin(slot, Some(id), TaskRetireReason::Exited, false)
+                .unwrap();
+            // SAFETY: the fixture's original masked scope is retained throughout.
+            unsafe {
+                terminal_publication::guarded(stop, &|_| 1);
+            }
+            assert!(!identity::lifecycle(slot).retired);
+            assert_eq!(
+                retirement_cleanup::deferred(slot),
+                Some(TaskRetireReason::Exited)
+            );
+            finish_modeled_preparation(slot, KERNEL);
+            cpu_local::with_test_current_scalar(0, slot, || {
+                // SAFETY: as above; this is the housekeeping entry point.
+                unsafe {
+                    terminal_publication::drain_guarded(&|_| 1);
+                }
+            });
+            assert!(identity::lifecycle(slot).retired);
+            assert!(runqueue::owner(slot).state.is_terminal());
+        },
         release_withdrawn_stop,
     );
 }
@@ -391,7 +459,11 @@ fn a_reclaimed_published_current_is_not_stopped_while_its_claim_is_announced() {
             runqueue::RetireOutcome::ClaimInFlight,
             "an announced re-claim of a published Current is a claim in flight"
         );
-        assert_eq!(runqueue::owner(slot), before, "a deferred stop changes nothing");
+        assert_eq!(
+            runqueue::owner(slot),
+            before,
+            "a deferred stop changes nothing"
+        );
         // Once the turn ends the claim is installed and the ordinary remote stop applies.
         turn.retract_claim();
         assert_eq!(
@@ -405,13 +477,19 @@ fn a_reclaimed_published_current_is_not_stopped_while_its_claim_is_announced() {
 /// Teardown for a task whose stop was withdrawn and deferred by the test: it
 /// completes the same cleanup as the default release but finishes the retained
 /// producer instead of beginning a new one.
-fn release_withdrawn_stop(slot: usize, id: u64, handle: crate::multitask::process_table::ProcessHandle) {
+fn release_withdrawn_stop(
+    slot: usize,
+    id: u64,
+    handle: crate::multitask::process_table::ProcessHandle,
+) {
     let masked = nucleus_core::util::lockdep::DispatchPreemption::enter();
     let mut masked = masked;
     masked.mask_irqs();
     // SAFETY: a fresh masked same-CPU scope drains the retained original stop;
     // no source UID, context or execution grant is reacquired.
-    unsafe { terminal_publication::drain_guarded(&|_| 1); }
+    unsafe {
+        terminal_publication::drain_guarded(&|_| 1);
+    }
     drop(masked);
     terminal_publication::tests::release_published(slot, id, handle);
 }

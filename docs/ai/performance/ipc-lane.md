@@ -61,8 +61,10 @@ end state; each phase is measured and reported, none is promised.
    moves the payload; the cell is valid only for that generation. Every custody
    transition of the owner word (`RunOwnerWord::compare_exchange`) evicts the cell
    of the generation it leaves after its CAS, so wake, terminal, migration and
-   every legacy claim stay correct without edits; only the lane's raw CAS
-   (`lane_cas`) followed by `resident::take` keeps the loans. Payload access
+   every legacy claim stay correct without edits; only the lane's claim
+   (`runqueue::lane_claim`, owner-table row `Blocked --LaneClaim--> Running`)
+   keeps the loans, and its `ResidentTake` duty is discharged by
+   `LaneClaim::take_resident`. Payload access
    always follows a winning CAS of the word, and nothing waits for `BUSY`: a park
    that finds the cell busy or holding a newer generation releases its own loans
    and the task simply stays non-resident (contract:
@@ -74,7 +76,11 @@ end state; each phase is measured and reported, none is promised.
    before opening a `CpuDispatchTurn`. `Switched` returns the peer's saved RSP;
    `Declined` leaves the handoff to the ordinary producer. Once donation/wait
    publication commits, a later refusal is `Generic`: ordinary dispatch finishes
-   that same transaction, never a rollback-and-replay of the request. Direct
+   that same transaction, never a rollback-and-replay of the request. The
+   `Generic` wake itself (`ipc_lane::{call,reply}_fallback`) can still refuse in
+   a transient window; it then records an epoch-exact `wake_retry` of the
+   target's exact wait (receiver `EndpointReceive(E)`, caller `EndpointReply(R)`),
+   because the other side is already committed and nothing else wakes it. Direct
    register stubs use this same handler and the common parked-resume tail.
 3. **Preconditions.** Same CPU; S resident on this CPU
    and waiting on exactly this endpoint/reply; no older sync FIFO work, no

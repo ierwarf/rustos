@@ -319,13 +319,14 @@ impl ReplyWakeHandoff {
 }
 
 /// The sole per-CPU ordering state for synchronous IPC handoffs.
+///
+/// The bounded-chain fairness budget is NOT here: it is the CPU-owned
+/// `SYNC_HANDOFF_BUDGET`, charged by `record_dispatch` and consulted by
+/// `take_next_ready_with` before this leaf is taken.
 pub(super) struct SyncHandoffState {
     records: [Option<SyncHandoffRecord>; MAX_TASK],
     head: usize,
     len: usize,
-    handoff_streak: u8,
-    #[cfg(test)]
-    last_handoff_tick: u64,
 }
 
 impl SyncHandoffState {
@@ -334,9 +335,6 @@ impl SyncHandoffState {
             records: [None; MAX_TASK],
             head: 0,
             len: 0,
-            handoff_streak: 0,
-            #[cfg(test)]
-            last_handoff_tick: 0,
         }
     }
 
@@ -393,33 +391,15 @@ impl SyncHandoffState {
         &mut self,
         ready: impl FnMut(SyncHandoffRecord) -> bool,
     ) -> Option<usize> {
-        self.take_next_ready_with_competitor(true, ready)
-    }
-
-    #[cfg(test)]
-    pub(super) fn take_next_ready_with_competitor(
-        &mut self,
-        fair_competitor_ready: bool,
-        ready: impl FnMut(SyncHandoffRecord) -> bool,
-    ) -> Option<usize> {
-        self.take_next_ready_record_with_competitor(fair_competitor_ready, ready)
-            .map(SyncHandoffRecord::slot)
+        self.take_next_ready_record(ready).map(SyncHandoffRecord::slot)
     }
 
     /// Preserve the exact FIFO proof through selection. Returning only a slot
     /// discards the generation that a final dispatch claim must compare.
-    pub(super) fn take_next_ready_record_with_competitor(
+    pub(super) fn take_next_ready_record(
         &mut self,
-        fair_competitor_ready: bool,
         mut ready: impl FnMut(SyncHandoffRecord) -> bool,
     ) -> Option<SyncHandoffRecord> {
-        if fair_competitor_ready && self.handoff_streak >= MAX_SYNC_HANDOFF_CHAIN_TICKS {
-            #[cfg(rustos_scheduler_phase_profile)]
-            super::locality::record_sync_handoff_miss(
-                super::locality::SyncHandoffMissReason::ChainBudgetExhausted,
-            );
-            return None;
-        }
         if self.len == 0 {
             #[cfg(rustos_scheduler_phase_profile)]
             super::locality::record_sync_handoff_miss(
@@ -445,27 +425,18 @@ impl SyncHandoffState {
         None
     }
 
-    #[cfg(test)]
-    pub(super) fn record_dispatch(&mut self, synchronous_handoff: bool, now_ticks: u64) {
-        if !synchronous_handoff {
-            self.handoff_streak = 0;
-            self.last_handoff_tick = 0;
-            return;
-        }
-        let now_ticks = now_ticks.max(1);
-        if self.last_handoff_tick == 0 {
-            self.handoff_streak = 1;
-            self.last_handoff_tick = now_ticks;
-            return;
-        }
-        let elapsed = now_ticks.saturating_sub(self.last_handoff_tick);
-        if elapsed != 0 {
-            self.handoff_streak = self
-                .handoff_streak
-                .saturating_add(u8::try_from(elapsed).unwrap_or(u8::MAX))
-                .min(MAX_SYNC_HANDOFF_CHAIN_TICKS);
-            self.last_handoff_tick = now_ticks;
-        }
+    /// Whether a record that carries this exact owner generation as custody
+    /// (Direct or ReplyWake) is queued for `slot`.
+    fn holds_generation(&self, slot: usize, owner_generation: u64) -> bool {
+        (0..self.len).any(|offset| {
+            self.records[(self.head + offset) % MAX_TASK].is_some_and(|record| {
+                record.slot == slot
+                    && matches!(record.custody,
+                        SyncHandoffCustody::Direct { owner_generation: queued, .. }
+                        | SyncHandoffCustody::ReplyWake { owner_generation: queued, .. }
+                        if queued == owner_generation)
+            })
+        })
     }
 
     pub(super) fn remove_slot(&mut self, slot: usize) {
@@ -492,17 +463,6 @@ impl SyncHandoffState {
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.len
-    }
-
-    #[cfg(test)]
-    pub(super) fn handoff_streak(&self) -> u8 {
-        self.handoff_streak
-    }
-
-    #[cfg(test)]
-    pub(super) fn set_handoff_streak(&mut self, handoff_streak: u8) {
-        self.handoff_streak = handoff_streak;
-        self.last_handoff_tick = (handoff_streak != 0) as u64;
     }
 }
 
@@ -583,11 +543,17 @@ fn enqueue_and_publish(target_cpu: usize, record: SyncHandoffRecord) -> bool {
 /// owner CAS/wait clear, under the same FIFO leaf; no rollback or incomplete
 /// prefix is exposed. `commit` may acquire only Wait58 and perform scalar CAS.
 /// Physical reader/binding loans and masked CPU custody remain outside leaves.
+///
+/// `commit` returns the committed owner and the enqueue duty its CAS created,
+/// if any. A `HandoffFifo` duty is exactly the record published here, so it is
+/// discharged inside this FIFO transaction; any other duty (a remote receiver's
+/// `Mailbox`) is returned for the caller to discharge after the leaves end. A
+/// commit without a CAS (a hint behind an ordinary wake) has no duty.
 pub(super) fn publish_original(
     target_cpu: usize,
     record: SyncHandoffRecord,
-    commit: impl FnOnce() -> Option<runqueue::RunOwnerSnapshot>,
-) -> Option<runqueue::RunOwnerSnapshot> {
+    commit: impl FnOnce() -> Option<(runqueue::RunOwnerSnapshot, Option<runqueue::EnqueueDuty>)>,
+) -> Option<(runqueue::RunOwnerSnapshot, Option<runqueue::EnqueueDuty>)> {
     let mut state = state_for_cpu(target_cpu).lock();
     let duplicate = (0..state.len).any(|offset| {
         state.records[(state.head + offset) % MAX_TASK]
@@ -596,11 +562,18 @@ pub(super) fn publish_original(
     if !duplicate && state.len == MAX_TASK {
         return None;
     }
-    let owner = commit()?;
+    let (owner, duty) = commit()?;
     assert!(state.enqueue_with_direct_owner(record, Some((owner, target_cpu))));
     // ORDERING: publish the committed FIFO prefix before any pending consumer.
     SYNC_HANDOFF_PENDING[target_cpu].store(true, core::sync::atomic::Ordering::Release);
-    Some(owner)
+    let duty = match duty {
+        Some(duty) if duty.kind() == runqueue::DutyKind::HandoffFifo => {
+            duty.handoff_recorded();
+            None
+        }
+        duty => duty,
+    };
+    Some((owner, duty))
 }
 
 /// Explicit native exhausted-capacity input only. No UID/record is backing,
@@ -634,6 +607,18 @@ pub(super) fn pending(cpu: usize) -> bool {
         // observing the flag also observes the record it advertises.
         pending.load(core::sync::atomic::Ordering::Acquire)
     })
+}
+
+/// Whether `cpu`'s FIFO holds a record for `slot` that carries exactly
+/// `owner_generation` as custody (Direct, or a ReplyWake proof of the same
+/// word). A DirectHandoff owner has no fair membership, so this record (or an
+/// in-flight `DirectSwitch`, which this cannot see) is its only route to
+/// dispatch. One FIFO leaf acquisition and a bounded scan: for the periodic
+/// conservation scan of an already suspect slot only, never the dispatch path.
+pub(in crate::multitask::scheduler) fn holds_direct_record(
+    cpu: usize, slot: usize, owner_generation: u64,
+) -> bool {
+    SYNC_HANDOFFS.get(cpu).is_some_and(|state| state.lock().holds_generation(slot, owner_generation))
 }
 
 /// Publishes an original caller-qualified handoff into the actual per-CPU
@@ -713,9 +698,8 @@ pub(super) fn take_next_ready_with(
     for attempt in 0..MAX_TASK {
         let taken = {
             let mut state = state_for_cpu(cpu).lock();
-            debug_assert_eq!(state.handoff_streak, 0);
             let taken = if state.len != 0 {
-                state.take_next_ready_record_with_competitor(false, |_| true)
+                state.take_next_ready_record(|_| true)
             } else {
                 None
             };
@@ -806,8 +790,8 @@ pub(super) fn reset_all_cpus() {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SYNC_HANDOFF_CHAIN_TICKS, ReplyWakeHandoff, SyncHandoffRecord, SyncHandoffState,
-        runqueue,
+        MAX_SYNC_HANDOFF_CHAIN_TICKS, MAX_TRACKED_CPUS, ReplyWakeHandoff, SyncHandoffRecord,
+        SyncHandoffState, runqueue,
     };
 
     #[test]
@@ -837,32 +821,54 @@ mod tests {
         assert!(state.enqueue(second));
         assert_eq!(state.len(), 2);
         assert_eq!(state.take_next_ready(|_| true), Some(4));
-        state.record_dispatch(true, 1);
-        state.record_dispatch(true, 1);
+        assert_eq!(state.take_next_ready(|_| true), Some(5));
+        assert_eq!(state.len(), 0);
+
+        // The fairness bound is the CPU-owned production budget, exercised on a
+        // CPU index no other witness uses.
+        let cpu = MAX_TRACKED_CPUS - 1;
+        super::record_dispatch(cpu, false, 1);
+        assert!(super::enqueue(cpu, first));
+        assert!(super::enqueue(cpu, second));
+        super::record_dispatch(cpu, true, 1);
+        super::record_dispatch(cpu, true, 1);
         assert_eq!(
-            state.handoff_streak(),
+            super::SYNC_HANDOFF_BUDGET[cpu].streak.load(core::sync::atomic::Ordering::Relaxed),
             1,
             "message count within one clock quantum must not consume more budget"
         );
-        assert_eq!(state.take_next_ready(|_| true), Some(5));
-        state.record_dispatch(true, u64::from(MAX_SYNC_HANDOFF_CHAIN_TICKS));
-        assert_eq!(state.handoff_streak(), MAX_SYNC_HANDOFF_CHAIN_TICKS);
+        super::record_dispatch(cpu, true, 1 + u64::from(MAX_SYNC_HANDOFF_CHAIN_TICKS));
+        assert_eq!(super::take_next_ready_with(cpu, || true, |_| true), None,
+            "an exhausted chain owes a ready fair competitor its turn");
+        assert_eq!(super::model_len(cpu), 2, "an exhausted budget drains nothing");
+        assert!(super::pending(cpu), "an exhausted budget must not clear the advertisement");
+        assert_eq!(super::take_next_ready_with(cpu, || false, |_| true).map(SyncHandoffRecord::slot),
+            Some(4), "an uncontended IPC execution chain must remain work-conserving");
+        super::record_dispatch(cpu, false, 1);
+        assert_eq!(super::take_next_ready_with(cpu, || true, |_| true).map(SyncHandoffRecord::slot),
+            Some(5), "a fair dispatch resets the chain budget");
+        assert!(super::take_next_ready_with(cpu, || true, |_| true).is_none());
+        assert!(!super::pending(cpu));
+    }
 
-        assert!(state.enqueue(first));
-        assert!(state.enqueue(second));
-        assert_eq!(state.take_next_ready(|_| true), None);
-        assert_eq!(state.len(), 2);
-        assert_eq!(
-            state.take_next_ready_with_competitor(false, |_| true),
-            Some(4),
-            "an uncontended IPC execution chain must remain work-conserving"
-        );
-        state.set_handoff_streak(MAX_SYNC_HANDOFF_CHAIN_TICKS);
-        assert_eq!(state.take_next_ready(|_| true), None);
-        assert_eq!(state.len(), 1);
-        state.record_dispatch(false, 1);
-        assert_eq!(state.handoff_streak(), 0);
-        assert_eq!(state.take_next_ready(|_| true), Some(5));
+    #[test]
+    fn holds_direct_record_names_only_the_exact_queued_generation() {
+        let cpu = MAX_TRACKED_CPUS - 2;
+        let reply = ReplyWakeHandoff::new(6, 60, 9, cpu).record;
+        {
+            let mut state = super::state_for_cpu(cpu).lock();
+            *state = SyncHandoffState::new();
+            assert!(state.enqueue(SyncHandoffRecord::new(7, 70)));
+            assert!(state.enqueue(reply));
+        }
+        assert!(super::holds_direct_record(cpu, 6, 9));
+        assert!(!super::holds_direct_record(cpu, 6, 8), "another generation is not this word's record");
+        assert!(!super::holds_direct_record(cpu, 7, 0), "a Generic hint carries no custody");
+        assert!(!super::holds_direct_record(MAX_TRACKED_CPUS, 6, 9));
+        *super::state_for_cpu(cpu).lock() = SyncHandoffState::new();
+        // The consumer withdraws the advertisement after observing the empty FIFO.
+        assert!(super::take_next_ready_with(cpu, || false, |_| false).is_none());
+        assert!(!super::pending(cpu));
     }
 
     #[test]
@@ -1075,7 +1081,7 @@ mod tests {
             Some(generic.bind_direct_owner(newer, 2))
         );
         assert_eq!(
-            state.take_next_ready_with_competitor(false, |record| {
+            state.take_next_ready(|record| {
                 record.matches_dispatch_owner(newer)
             }),
             Some(12),
@@ -1098,7 +1104,7 @@ mod tests {
             state.enqueue_with_direct_owner(SyncHandoffRecord::new(12, 121), Some((direct, 2)),)
         );
         let record = state
-            .take_next_ready_record_with_competitor(false, |record| {
+            .take_next_ready_record(|record| {
                 record.matches_dispatch_owner(direct)
             })
             .expect("current direct owner must retain FIFO custody");
@@ -1132,7 +1138,7 @@ mod tests {
             "queued hint is ordering only"
         );
         let consumed = state
-            .take_next_ready_record_with_competitor(false, |_| true)
+            .take_next_ready_record(|_| true)
             .expect("live generic hint");
         assert_eq!(consumed.claim_generation(), None);
         let bound = consumed.bind_selected_local_owner(local, 2);
@@ -1267,22 +1273,6 @@ mod tests {
         );
         assert_eq!(owner_observations, 2, "the owner is sampled on both sides");
         assert_eq!(target_enqueue_calls, 1, "only the captured CPU is touched");
-    }
-
-    #[test]
-    fn an_exhausted_handoff_budget_must_not_clear_a_queue_that_still_holds_records() {
-        // `take_next_ready` returns None on an exhausted budget without draining.
-        // Clearing the pending hint there would strand every queued reply
-        // until something else happened to enqueue again.
-        let mut state = SyncHandoffState::new();
-        assert!(state.enqueue(SyncHandoffRecord::new(1, 7)));
-        state.set_handoff_streak(MAX_SYNC_HANDOFF_CHAIN_TICKS);
-
-        assert_eq!(state.take_next_ready(|_| true), None);
-        assert_ne!(
-            state.len, 0,
-            "an exhausted chain budget must leave the record queued"
-        );
     }
 
     #[test]

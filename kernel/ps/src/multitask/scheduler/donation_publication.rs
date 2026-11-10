@@ -190,24 +190,12 @@ pub(in crate::multitask) fn bind_with(
     bind_original(scope, reply, donor, &receiver, inherit).is_some()
 }
 
-/// Lane bind for a donor funded by its own context: one ledger acquisition and
-/// no root pin or context re-read. `None` leaves the decision to `bind_original`.
-pub(super) fn bind_lane(
-    scope: &DispatchPreemption<'_>,
-    reply: u64,
-    donor: &identity::execution::BindingPin,
-    receiver: &identity::execution::BindingPin,
-) -> Option<bool> {
-    if !scope_valid(scope) || reply == 0 || donor.id() == receiver.id() {
-        return Some(false);
-    }
-    donation_ledger::bind_own_funding(reply, donor.slot(), donor.id(), receiver.slot(), receiver.id())
-}
-
-/// [`bind_lane`] for a donor that is the lane's Current task: its exact slot and
-/// id were qualified against the owner bank by the caller, so no donor permit is
-/// taken. The receiver pin is kept: it is what stops the parked receiver's slot
-/// from being retired and reused between this bind and the claim CAS.
+/// Lane bind for a donor funded by its own context that is the lane's Current
+/// task: one ledger acquisition, no root pin or context re-read, and no donor
+/// permit, because its exact slot and id were qualified against the owner bank
+/// by the caller. The receiver pin is kept: it is what stops the parked
+/// receiver's slot from being retired and reused between this bind and the
+/// claim CAS. `None` leaves the decision to `bind_original`.
 pub(super) fn bind_lane_current(
     scope: &DispatchPreemption<'_>,
     reply: u64,

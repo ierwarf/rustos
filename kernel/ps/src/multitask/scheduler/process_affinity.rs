@@ -56,6 +56,9 @@ impl Grant {
             if context.user_abi != Some(UserAbi::Windows) {
                 return Err(AffinityError::WrongAbi);
             }
+            if !super::affinity::funded_mask_admits(requested, super::scheduling_runtime::context_cpu_mask(slot)) {
+                return Err(AffinityError::InvalidMask);
+            }
         }
         Ok(Self {
             change,

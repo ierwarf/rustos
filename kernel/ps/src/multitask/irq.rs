@@ -103,11 +103,16 @@ fn cpu_lifecycle_generation(logical_index: usize) -> u64 {
 }
 
 fn set_local_deferred_reschedule() {
-    let logical_index = current_cpu_index();
-    let _ = super::reschedule_observation::publish_request(
-        logical_index,
-        cpu_lifecycle_generation(logical_index),
-    );
+    request_local_reschedule_on(current_cpu_index());
+}
+
+/// Publish `cpu`'s own durable reschedule request. The caller runs ON `cpu`
+/// (IRQs masked or preemption excluded), so no IPI is owed: the next periodic
+/// tick, syscall tail or safe point consumes it. Lock-free and allocation-free
+/// (one CAS loop on the CPU's cache-padded request word and a lock-free
+/// lifecycle snapshot), hence legal under raw leaves and in IRQ context.
+pub(super) fn request_local_reschedule_on(cpu: usize) {
+    let _ = super::reschedule_observation::publish_request(cpu, cpu_lifecycle_generation(cpu));
 }
 
 const fn remote_notification_required(target: usize, current: usize) -> bool {
@@ -148,7 +153,13 @@ fn retain_periodic_continuation(logical_index: usize, context_ptr: *const SavedC
         unsafe { &*context_ptr }.cs == crate::arch::gdt::user_code_selector().0 as u64;
     let interrupted_kernel_frame = !interrupted_user_frame;
     let local_work_pending = super::scheduler::local_dispatch_work_pending(logical_index);
-    let deferred_reschedule_pending = super::reschedule_observation::request_pending(logical_index);
+    // A fast IPC reply stashed by the running replier is settled only at its
+    // next syscall or scheduler entry. A replier that returns to user code and
+    // computes never makes either, so the stash counts as a request here: the
+    // tick enters the scheduler, whose entry settles the waiting caller's wake.
+    // (Deferred wakes need no term: every deferral publishes the request bit.)
+    let deferred_reschedule_pending = super::reschedule_observation::request_pending(logical_index)
+        || super::scheduler::pending_reply::present();
     let user_return_reschedule_pending =
         user_return_reschedule_flag(logical_index).load(Ordering::Acquire) != 0;
     // An IRQ-off anonymous fault only raises this lock-free low-water bit.  A
@@ -292,7 +303,7 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
     // SAFETY: the interrupt stub supplied a complete CPU-local frame. The
     // original masked turn retains Current/Transition and physical banks;
     // independent owner leaves serialize their bounded cross-CPU effects.
-    let (next_rsp, user_dispatch, runtime_profile, reschedule_goal) = unsafe {
+    let (next_rsp, user_dispatch, runtime_profile, reschedule_goal, now_ticks) = unsafe {
         let mut entry = DispatchEntry::enter();
         if timer_interrupted_kernel_frame(context_ptr, &entry) {
             complete_clockevent(logical_index);
@@ -313,16 +324,22 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
         // selected continuation is restored.
         user_return_reschedule_flag(logical_index).store(0, Ordering::Release);
         super::scheduler::runtime_profile::record_entry(super::scheduler::SchedulerEntryCause::Timer);
-        let runtime_profile = super::scheduler::runtime_profile::take_owned(entry.turn(), crate::arch::rtc::ticks());
+        let now_ticks = crate::arch::rtc::ticks();
+        let runtime_profile = super::scheduler::runtime_profile::take_owned(entry.turn(), now_ticks);
         let (dispatch, _) = entry.dispatch(current_rsp, false, None);
         if logical_index == 0 {
             crate::arch::pit::set_divisor(0, dispatch.tick_divisor);
         }
         let user = entry.install(dispatch, false);
-        (dispatch.next_rsp, user, runtime_profile, reschedule_goal)
+        (dispatch.next_rsp, user, runtime_profile, reschedule_goal, now_ticks)
     };
 
     super::scheduler::publish_scheduler_runtime_profile(runtime_profile);
+    // Outside the turn and every scheduler leaf, reusing this entry's tick
+    // sample (no extra clock read). Ticks that keep their continuation skip
+    // it, so a CPU that never enters the scheduler never scans: some CPU in a
+    // live system does every tick or so.
+    super::scheduler::runqueue_policy::custody_conservation_scan(now_ticks);
     super::reschedule_observation::record_consumption(
         logical_index,
         reschedule_goal,
@@ -425,17 +442,19 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
     );
     let reschedule_goal = super::reschedule_observation::claim_pending(logical_index)
         .expect("RTC request lost before same-CPU scheduling safe point");
-    let (next_rsp, user_dispatch, runtime_profile) = {
+    let (next_rsp, user_dispatch, runtime_profile, now_ticks) = {
         super::scheduler::runtime_profile::record_entry(super::scheduler::SchedulerEntryCause::Rtc);
-        let runtime_profile = super::scheduler::runtime_profile::take_owned(entry.turn(), crate::arch::rtc::ticks());
+        let now_ticks = crate::arch::rtc::ticks();
+        let runtime_profile = super::scheduler::runtime_profile::take_owned(entry.turn(), now_ticks);
         let (dispatch, _) = entry.dispatch(current_rsp, false, None);
         let user = entry.install(dispatch, false);
-        let result = (dispatch.next_rsp, user, runtime_profile);
+        let result = (dispatch.next_rsp, user, runtime_profile, now_ticks);
         drop(entry);
         result
     };
 
     super::scheduler::publish_scheduler_runtime_profile(runtime_profile);
+    super::scheduler::runqueue_policy::custody_conservation_scan(now_ticks);
     super::reschedule_observation::record_consumption(
         logical_index,
         reschedule_goal,

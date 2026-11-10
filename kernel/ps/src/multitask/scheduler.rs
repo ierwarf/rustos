@@ -421,8 +421,15 @@ pub enum FastIpcCallHandoffOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FastIpcReplyHandoffOutcome {
+    /// The caller was woken (typed wake, fair custody and best-effort FIFO).
     LocalFallback,
+    /// The caller still waits on this reply but the wake refused in a transient
+    /// window; an exact retry of that wait instance was recorded.
     Rejected,
+    /// The caller's wait does not name this reply: not armed yet (the response
+    /// raced ahead of the caller's arm and its post-arm poll takes it), already
+    /// completed, cancelled or retired. There is nothing to wake or retry.
+    NotWaiting,
 }
 impl FastIpcReplyHandoffOutcome {
     /// Request a fast attempt after the actual typed wake/FIFO publication.
@@ -430,7 +437,7 @@ impl FastIpcReplyHandoffOutcome {
     /// FIFO, checks chain/atomic priority, and claims the original frame/funding.
     /// Remote custody, early Current wake or refusal falls back normally.
     pub(in crate::multitask) fn dispatch_hint(self, caller: u64) -> Option<u64> {
-        (self != Self::Rejected).then_some(caller)
+        (self == Self::LocalFallback).then_some(caller)
     }
 }
 

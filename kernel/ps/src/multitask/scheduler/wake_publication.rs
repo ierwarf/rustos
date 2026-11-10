@@ -214,13 +214,18 @@ fn publish_reply_binding(
         binding.id(),
         runqueue::owner(binding.slot()),
     );
-    let retained = token.is_some_and(|token| {
+    // The FIFO token carries urgency only: the wake above already published
+    // fair custody (rq or mailbox) for this exact owner, so a refused or
+    // unbuildable token (owner already RemoteQueued, claimed elsewhere, or a
+    // newer generation) must not turn that successful wake into a reported
+    // failure. Same rule as `ipc_publication::call_before_arm`.
+    if let Some(token) = token {
         let _publication = dispatch_priority::Publication::begin(scope, token.target_cpu());
-        sync_handoff::enqueue_reply_wake(token)
-    });
+        let _urgency_retained = sync_handoff::enqueue_reply_wake(token);
+    }
     // Retain ORIGINAL physical loan across both generation checks and FIFO leaf.
     // Terminal seal can forbid execution meanwhile, but cannot reuse its backing.
-    retained
+    true
 }
 
 fn typed_scope_valid(scope: &nucleus_core::util::lockdep::DispatchPreemption<'_>) -> bool {

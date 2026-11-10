@@ -81,7 +81,13 @@ fn spawn_in(scope: &DispatchPreemption<'_>, id: u64) -> bool {
     let Some(target) = Target::capture(id) else { return false; };
     let current = current_terminal::OriginalCurrent::borrow(scope);
     let _publication = dispatch_priority::Publication::begin(scope, target.cpu);
-    if !target.ready() { return false; }
+    // A first-turn record names a task that is queued on that CPU and has not
+    // been dispatched yet. A child another CPU already pulled and runs (Running)
+    // has had its first turn; a record for it only stalls the consumer once the
+    // child blocks. The consumer still tolerates a claim that races this check.
+    if !target.ready() || runqueue::owner(target.binding.slot()).state != runqueue::RunOwnerState::Local {
+        return false;
+    }
     let inserted = dispatch_policy::lock(target.cpu).spawn_pick_hints.enqueue(target.record())
         .expect("scheduler spawn handoff queue overflow");
     if inserted && target.cpu == scope.cpu() { floor(current.as_ref(), &target); }

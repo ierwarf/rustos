@@ -54,7 +54,6 @@ pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_DEVICE_OPEN_BROKER
             | linux_abi::SYS_RUSTOS_DEVICE_IOCTL_BROKER
             | linux_abi::SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER
-            | linux_abi::SYS_RUSTOS_ROOTD_WAIT_BROKER
             | linux_abi::SYS_RUSTOS_ROOTD_TERMINATE_BROKER
             | linux_abi::SYS_RUSTOS_ROOTD_MEMORY_BROKER
             | linux_abi::SYS_RUSTOS_JOB
@@ -89,9 +88,6 @@ pub(super) fn dispatch_linux_rustos_broker_syscall(frame: &SyscallFrame) -> u64 
         }
         linux_abi::SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER => {
             syscall_linux_rustos_lifecycle_drain_broker(frame.rdi)
-        }
-        linux_abi::SYS_RUSTOS_ROOTD_WAIT_BROKER => {
-            syscall_linux_rustos_rootd_wait_broker(frame.rdi)
         }
         linux_abi::SYS_RUSTOS_ROOTD_TERMINATE_BROKER => {
             syscall_linux_rustos_rootd_terminate_broker(frame.rdi)

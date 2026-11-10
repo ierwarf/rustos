@@ -39,18 +39,30 @@ impl DispatchEntry {
         // captures its own original binding, outside every raw leaf.
         #[cfg(rustos_scheduler_phase_profile)]
         let started = crate::arch::clock::monotonic_nanos();
-        let wakes = super::super::deferred_wake::take_masked(entry.preemption());
-        let count = wakes.as_ref().map_or(0, |wakes| wakes.len());
-        for id in wakes.iter().flat_map(|wakes| wakes.iter()) {
-            // A refused deferred wake used to be dropped here, leaving its
-            // waiter parked until an unrelated event; retry its exact wait.
-            if !scheduler::wake_publication::wake(
-                entry.preemption(), id, &scheduler::runqueue_policy::online_affinity_mask,
-            ) {
-                let _ = scheduler::wake_retry::record_in(entry.preemption(), id, None);
+        // Drain until empty. A wake published here (or by the retry service
+        // below) runs inside this entry's DispatchPreemption scope, so anything
+        // it wakes in turn defers into the SAME batch after the take; the
+        // timer/RTC routes claim the request bit only after this entry exists,
+        // so a single take would let that claim consume the nested deferral's
+        // request without its wake. Nested deferrals come only from distinct
+        // wake producers (the housekeeping kick is deduplicated), so this ends.
+        let mut count = 0;
+        loop {
+            while let Some(wakes) = super::super::deferred_wake::take_masked(entry.preemption()) {
+                count += wakes.len();
+                for id in wakes.iter() {
+                    // A refused deferred wake used to be dropped here, leaving its
+                    // waiter parked until an unrelated event; retry its exact wait.
+                    if !scheduler::wake_publication::wake(
+                        entry.preemption(), id, &scheduler::runqueue_policy::online_affinity_mask,
+                    ) {
+                        let _ = scheduler::wake_retry::record_in(entry.preemption(), id, None);
+                    }
+                }
             }
+            let _ = scheduler::wake_retry::service(entry.preemption());
+            if !super::super::deferred_wake::queued_masked(entry.preemption()) { break; }
         }
-        let _ = scheduler::wake_retry::service(entry.preemption());
         // Prologue wall time is a diagnosis-build phase; shipping keeps only
         // the deferred-wake count, and only when there was one.
         #[cfg(rustos_scheduler_phase_profile)]

@@ -12,7 +12,7 @@ mod fair_retry;
 #[cfg(test)]
 pub(super) mod policy_witnesses;
 mod hint_priority;
-pub(super) use fair_retry::retry_incomplete_policy;
+pub(super) use fair_retry::{UnresolvedCandidates, retry_incomplete_policy, take_omitted_candidate_window};
 pub(super) use hint_priority::{
     refuse_unproven_hint_priority, stable_user_hint_class, user_hint_blocked_by_system,
 };
@@ -298,24 +298,6 @@ pub(super) fn local_fair_competitor_ready(cpu: usize) -> bool {
 }
 
 
-/// A guarded catalog fallback may name the *target CPU's* noncurrent idle
-/// owner. Only a complete published Local qualification can promote that
-/// choice to an exact-generation frame validation and final claim; otherwise
-/// the original guarded validation retains custody.
-#[cfg(test)]
-pub(super) fn qualified_catalog_idle_generation(
-    slot: usize,
-    current_slot: usize,
-    target_idle_slot: Option<usize>,
-    prior_generation: Option<u64>,
-    qualify: impl FnOnce() -> Result<Option<u64>, LocalFallbackReason>,
-) -> Option<u64> {
-    if prior_generation.is_some() || slot == current_slot || target_idle_slot != Some(slot) {
-        return None;
-    }
-    qualify().ok().flatten()
-}
-
 /// Validates the saved frame behind one exact FIFO handoff. The caller
 /// separately checks record identity and lifecycle/budget/affinity admission.
 #[cfg(test)]
@@ -399,7 +381,8 @@ pub(super) fn choose_local_next(
 ) -> Result<(usize, u64), LocalFallbackReason> {
     choose_local_next_with(cpu, current_slot, voluntary_yield, current_runtime_ns,
         eligibility_now_ns, expected_queue_sequence, expected_class_sequence,
-        atomic_activation_pending, synchronous_handoff_pending, candidate_is_qualified)
+        atomic_activation_pending, synchronous_handoff_pending, &mut UnresolvedCandidates::strict(),
+        candidate_is_qualified)
 }
 
 /// The production consumer retains its winner's actual frame loan through
@@ -409,6 +392,7 @@ pub(super) fn choose_local_next_with(
     cpu: usize, current_slot: usize, voluntary_yield: bool, current_runtime_ns: u64,
     eligibility_now_ns: u64, expected_queue_sequence: u64, expected_class_sequence: u64,
     atomic_activation_pending: bool, synchronous_handoff_pending: bool,
+    unresolved: &mut UnresolvedCandidates,
     mut qualify: impl FnMut(usize, usize, u64) -> Result<Option<u64>, LocalFallbackReason>,
 ) -> Result<(usize, u64), LocalFallbackReason> {
     if atomic_activation_pending {
@@ -460,7 +444,7 @@ pub(super) fn choose_local_next_with(
     let mut current_candidate = None;
     let mut first_revalidation_failure = None;
     for slot in runqueue::local_runnable_slots(cpu) {
-        if runqueue::is_idle_slot(slot) {
+        if runqueue::is_idle_slot(slot) || unresolved.excludes(slot) {
             continue;
         }
         // The outgoing slot is still the CPU's live execution frame and must
@@ -485,13 +469,23 @@ pub(super) fn choose_local_next_with(
             // Only a complete, stable negative lifecycle/affinity or exact
             // budget denial can be omitted. Missing identity, transitioning
             // affinity, stale donor/budget or frame evidence still invalidates
-            // the entire scan.
+            // the entire scan, unless it persisted through every earlier
+            // observation of this turn (`UnresolvedCandidates`).
             Ok(None) => continue,
             Err(reason) => {
+                unresolved.record(slot, reason);
                 first_revalidation_failure.get_or_insert(reason);
                 continue;
             }
         }
+        let candidate_class = match observed_class(slot) {
+            Ok(class) => class,
+            Err(reason) => {
+                unresolved.record(slot, reason);
+                first_revalidation_failure.get_or_insert(reason);
+                continue;
+            }
+        };
         let vruntime = runqueue::vruntime(slot);
         // Match legacy selection's same-slot turn bias. Voluntary yields omit
         // the current slot above and use circular-distance tie breaking.
@@ -500,7 +494,6 @@ pub(super) fn choose_local_next_with(
         } else {
             vruntime
         };
-        let candidate_class = observed_class(slot)?;
         let is_local =
             slot == current_slot || usize::from(runqueue::affinity_payload::last_cpu(slot)) == cpu;
         if reserve_user && candidate_class == LocalClass::User {
@@ -551,20 +544,22 @@ pub(super) fn choose_local_next_with(
         }
     }
 
-    if yielded_current_deferred && best_system.is_none() && best_user.is_none() {
+    if yielded_current_deferred && best_system.is_none() && best_user.is_none()
+        && !unresolved.excludes(current_slot)
+    {
         let slot = current_slot;
         let qualification = if current_is_live!() {
             Ok(Some(runqueue::owner(slot).generation))
         } else {
             candidate_is_admitted(slot, cpu, eligibility_now_ns)
         };
-        match qualification {
+        match qualification.and_then(|q| observed_class(slot).map(|_| q)) {
             Ok(Some(_)) => {
-                observed_class(slot)?;
                 current_candidate = Some((slot, runqueue::vruntime(slot).saturating_add(1), 0));
             }
             Ok(None) => {}
             Err(reason) => {
+                unresolved.record(slot, reason);
                 first_revalidation_failure.get_or_insert(reason);
             }
         }
@@ -644,7 +639,12 @@ pub(super) fn choose_local_next_with(
             match qualify(slot, cpu, eligibility_now_ns) {
                 Ok(Some(generation)) => generation,
                 Ok(None) => return fallback(LocalFallbackReason::LifecycleIneligible),
-                Err(reason) => return fallback(reason),
+                Err(reason) => {
+                    // A winner whose frame keeps failing its final proof would
+                    // otherwise be re-selected, and fail, on every turn.
+                    unresolved.record(slot, reason);
+                    return fallback(reason);
+                }
             }
         };
         if runqueue::local_runnable_sequence(cpu) != expected_queue_sequence
@@ -685,6 +685,7 @@ pub(super) fn choose_overdue_system(
     now_ns: u64,
     expected_queue_sequence: u64,
     expected_class_sequence: u64,
+    unresolved: &mut UnresolvedCandidates,
 ) -> Result<Option<(usize, u64)>, LocalFallbackReason> {
     if expected_queue_sequence & 1 != 0
         || expected_class_sequence & 1 != 0
@@ -695,9 +696,14 @@ pub(super) fn choose_overdue_system(
     }
     let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
     let mut oldest = None;
+    let mut first_failure = None;
     for slot in runqueue::local_runnable_slots(cpu) {
-        if slot == current_slot || runqueue::is_idle_slot(slot) { continue; }
-        if observed_class(slot)? != LocalClass::System { continue; }
+        if slot == current_slot || runqueue::is_idle_slot(slot) || unresolved.excludes(slot) { continue; }
+        let class = match observed_class(slot) {
+            Ok(class) => class,
+            Err(reason) => { unresolved.record(slot, reason); first_failure.get_or_insert(reason); continue; }
+        };
+        if class != LocalClass::System { continue; }
         let since = runqueue::wait::ready_since_ticks(slot);
         let elapsed_ms = now_ticks
             .saturating_sub(since)
@@ -706,10 +712,17 @@ pub(super) fn choose_overdue_system(
         if since == 0 || elapsed_ms < super::SYSTEM_READY_LATENCY_BOUND_MS {
             continue;
         }
-        let Some(generation) = candidate_is_qualified(slot, cpu, now_ns)? else {
-            continue;
+        let generation = match candidate_is_qualified(slot, cpu, now_ns) {
+            Ok(Some(generation)) => generation,
+            Ok(None) => continue,
+            Err(reason) => { unresolved.record(slot, reason); first_failure.get_or_insert(reason); continue; }
         };
         oldest = older_overdue_system(oldest, (slot, since, runqueue::vruntime(slot), generation));
+    }
+    // A failed eligible System candidate may be the oldest one: the set is
+    // authoritative only without it (or once it is persistently omitted).
+    if let Some(reason) = first_failure {
+        return Err(reason);
     }
     if runqueue::local_runnable_sequence(cpu) != expected_queue_sequence
         || donation_ledger::class_publication_sequence() != expected_class_sequence
@@ -717,53 +730,6 @@ pub(super) fn choose_overdue_system(
         return Err(LocalFallbackReason::CustodyUnavailable);
     }
     Ok(oldest.map(|(slot, _, _, generation)| (slot, generation)))
-}
-
-/// An empty, stable fair bitmap can use this CPU's exact Local idle owner
-/// instead of rescanning a catalog that contains no local fair candidate.
-/// Generation zero, remote, nonrunnable, and direct-handoff custody cannot
-/// manufacture an idle claim.
-#[cfg(test)]
-pub(super) fn empty_fair_idle_generation(
-    owner: runqueue::RunOwnerSnapshot,
-    cpu: usize,
-) -> Option<u64> {
-    (owner.state == runqueue::RunOwnerState::Local
-        && owner.cpu == Some(cpu)
-        && owner.runnable
-        && owner.generation != 0)
-        .then_some(owner.generation)
-}
-
-/// Host-only catalog fair fixture. Production retries CPU-local observations
-/// and defers to its exact idle/current fallback on repeated torn snapshots.
-#[cfg(test)]
-#[inline]
-pub(super) fn catalog_fair_fallback(
-    deferred: bool,
-    local_pick: Option<usize>,
-    catalog_pick: impl FnOnce() -> Option<usize>,
-    idle_slot: impl FnOnce() -> usize,
-) -> Option<usize> {
-    (deferred && local_pick.is_none()).then(|| catalog_pick().unwrap_or_else(idle_slot))
-}
-
-/// Host-only legacy min-granularity comparator. Production's published fair
-/// picker includes its own class-aware minimum slice and burst limit.
-#[cfg(test)]
-#[inline]
-pub(super) fn catalog_min_granularity_fallback(
-    profile: bool,
-    local_pick: Option<usize>,
-    exact_yield_or_reserved: bool,
-    selected: usize,
-    catalog_guard: impl FnOnce() -> usize,
-) -> usize {
-    if exact_yield_or_reserved || (!profile && local_pick.is_some()) {
-        selected
-    } else {
-        catalog_guard()
-    }
 }
 
 /// Compare a qualified local observation with the preserved catalog policy.
@@ -958,83 +924,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_fair_scan_claims_only_the_exact_local_idle_generation() {
-        use super::super::runqueue::{RunOwnerSnapshot, RunOwnerState};
-
-        let owner = RunOwnerSnapshot {
-            state: RunOwnerState::Local,
-            cpu: Some(2),
-            generation: 9,
-            runnable: true,
-            wait_reason_kind: 0,
-            wait_armed: false,
-        };
-        assert_eq!(super::empty_fair_idle_generation(owner, 2), Some(9));
-        assert_eq!(super::empty_fair_idle_generation(owner, 1), None);
-        assert_eq!(
-            super::empty_fair_idle_generation(
-                RunOwnerSnapshot {
-                    runnable: false,
-                    ..owner
-                },
-                2
-            ),
-            None,
-        );
-        assert_eq!(
-            super::empty_fair_idle_generation(
-                RunOwnerSnapshot {
-                    state: RunOwnerState::DirectHandoff,
-                    ..owner
-                },
-                2
-            ),
-            None,
-        );
-        assert_eq!(
-            super::empty_fair_idle_generation(
-                RunOwnerSnapshot {
-                    generation: 0,
-                    ..owner
-                },
-                2
-            ),
-            None,
-        );
-    }
-
-    #[test]
-    fn catalog_idle_promotes_only_an_exact_noncurrent_target_local_publication() {
-        let target_idle = Some(15);
-        assert_eq!(
-            super::qualified_catalog_idle_generation(15, 3, target_idle, None, || Ok(Some(27))),
-            Some(27),
-        );
-        for (slot, current, idle, prior) in [
-            (15, 15, target_idle, None),
-            (15, 3, Some(16), None),
-            (15, 3, target_idle, Some(21)),
-        ] {
-            assert_eq!(
-                super::qualified_catalog_idle_generation(slot, current, idle, prior, || {
-                    panic!("a noneligible catalog idle must not observe a published frame")
-                }),
-                None,
-            );
-        }
-        assert_eq!(
-            super::qualified_catalog_idle_generation(15, 3, target_idle, None, || {
-                Err(super::LocalFallbackReason::FrameUnavailable)
-            }),
-            None,
-        );
-        assert_eq!(
-            super::qualified_catalog_idle_generation(15, 3, target_idle, None, || Ok(None)),
-            None,
-        );
-    }
-
-    #[test]
     fn borrowed_context_selects_published_owner_stamp_or_fails_closed() {
         use crate::multitask::current_identity::{DispatchPublication, PagerChargeStamp};
 
@@ -1064,62 +953,6 @@ mod tests {
         assert_eq!(super::effective_charge_stamp(own, Some(None)), None);
         owner.task_id = None;
         assert_eq!(super::effective_charge_stamp(own, Some(Some(owner))), None);
-    }
-
-    #[test]
-    fn deferred_catalog_fair_scan_runs_only_for_incomplete_local_observations() {
-        assert_eq!(
-            super::catalog_fair_fallback(
-                true,
-                Some(3),
-                || panic!("duplicate fair scan"),
-                || { panic!("idle not required") }
-            ),
-            None
-        );
-        assert_eq!(
-            super::catalog_fair_fallback(
-                false,
-                None,
-                || panic!("not a fair arm"),
-                || { panic!("idle not required") }
-            ),
-            None
-        );
-        assert_eq!(
-            super::catalog_fair_fallback(true, None, || Some(7), || panic!("not idle")),
-            Some(7)
-        );
-        assert_eq!(
-            super::catalog_fair_fallback(true, None, || None, || 5),
-            Some(5)
-        );
-    }
-
-    #[test]
-    fn qualified_local_pick_drops_only_the_discarded_catalog_granularity_check() {
-        use super::catalog_min_granularity_fallback as choose;
-
-        assert_eq!(
-            choose(false, Some(9), false, 9, || panic!(
-                "discarded catalog guard"
-            )),
-            9
-        );
-        // An incomplete observation still needs the old guard on its actual
-        // catalog fair/idle selection, not a made-up local result.
-        assert_eq!(choose(false, None, false, 9, || 5), 5);
-        // Instrumented builds retain the comparison even for a qualified
-        // choice, but local authority still wins after the shadow result.
-        assert_eq!(choose(true, Some(9), false, 9, || 5), 5);
-        for (profile, local) in [(false, None), (false, Some(9)), (true, Some(9))] {
-            assert_eq!(
-                choose(profile, local, true, 9, || panic!(
-                    "exact arm cannot use CFS guard"
-                )),
-                9
-            );
-        }
     }
 
     #[test]

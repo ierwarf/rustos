@@ -212,7 +212,6 @@ pub(in crate::multitask::scheduler) fn wrong_uid_missing_target_and_retired_call
 #[test]
 pub(in crate::multitask::scheduler) fn queued_transfer_borrows_exact_target_cohort_until_real_queue_ack_without_process_publication() {
     fixture(UserAbi::Linux, |h| {
-        runqueue::set_runnable(PEER, true);
         runqueue::publish_local_wake(PEER, 0, 100);
         let result = capture(h, ID + 1, UserAbi::Linux)
             .finish_with(4, 7, |slot, id, cohort| {
@@ -267,7 +266,6 @@ pub(in crate::multitask::scheduler) fn actual_running_target_keeps_current_custo
             }
             let (_, current) = identity::execution::with_claim(ROOT, |_| ()).unwrap();
             identity::execution::banks::initialize(0, current.unwrap());
-            runqueue::set_runnable(PEER, true);
             runqueue::publish_local_wake(PEER, 0, 100);
             assert!(runqueue::claim_dispatch(PEER, 0, 100));
             let before = runqueue::owner(PEER);
@@ -294,7 +292,6 @@ pub(in crate::multitask::scheduler) fn actual_running_target_keeps_current_custo
 #[test]
 pub(in crate::multitask::scheduler) fn block_during_owned_thread_queue_effect_is_not_an_affinity_wake() {
     fixture(UserAbi::Linux, |h| {
-        runqueue::set_runnable(PEER, true);
         runqueue::publish_local_wake(PEER, 0, 100);
         capture(h, ID + 1, UserAbi::Linux)
             .finish_with(4, 7, |slot, id, cohort| {
@@ -321,7 +318,6 @@ pub(in crate::multitask::scheduler) fn terminal_overlap_remains_retired_and_pinn
         use scheduler::retirement_cleanup::producer::{
             publish_process_turn_fixture, reset_process_turn_fixture,
         };
-        runqueue::set_runnable(PEER, true);
         runqueue::publish_local_wake(PEER, 0, 100);
         capture(h, ID + 1, UserAbi::Linux)
             .finish_with(4, 7, |slot, id, cohort| {

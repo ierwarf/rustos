@@ -102,7 +102,8 @@ fn first_turn(turn: &crate::multitask::cpu_local::dispatch_turn::CpuDispatchTurn
             }
             return Decision::Empty;
         };
-        let mut decision = if current_identity::read_dispatch(slot).is_some_and(|p| p.task_id != Some(task_id) || !p.lifecycle_dispatchable()) {
+        let mut decision = if current_identity::read_dispatch(slot).is_some_and(|p| p.task_id != Some(task_id) || !p.lifecycle_dispatchable())
+            || first_turn_record_is_stale(slot, cpu) {
             Decision::Empty
         } else {
             local_candidate(slot, cpu, if atomic { Urgency::Atomic } else { Urgency::Spawn })
@@ -143,6 +144,17 @@ fn first_turn(turn: &crate::multitask::cpu_local::dispatch_turn::CpuDispatchTurn
         if matches!(decision, Decision::Claimed(_)) { return decision; }
     }
     Decision::Incomplete
+}
+
+/// A first-turn record is ordering metadata, published AFTER its wake, so it
+/// can name a task that has since run, been pulled to another CPU, blocked or
+/// begun retiring. Only a runnable owner this CPU will dispatch (Local here) or
+/// is about to receive (RemoteQueued / Migrating here: a mailbox record the
+/// drain could not adopt this turn) keeps its place. Any other record used to
+/// stay at the FIFO front as `Incomplete` on every later turn, so the CPU fell
+/// back to idle and starved everything queued behind it; it is consumed here.
+fn first_turn_record_is_stale(slot: usize, cpu: usize) -> bool {
+    !runqueue::queued_on(slot, cpu)
 }
 
 fn materialize(record: sync_handoff::SyncHandoffRecord, cpu: usize) {
@@ -234,11 +246,11 @@ fn hint(cpu: usize, current: usize) -> Decision {
         slot, current, cpu, selection_now(cpu))) { return Decision::Empty; }
     local_candidate(slot, cpu, Urgency::Hint)
 }
-fn fair(cpu: usize, current: usize, voluntary: bool, runtime: u64) -> Result<Option<Candidate>, local_dispatch::LocalFallbackReason> {
+fn fair(cpu: usize, current: usize, voluntary: bool, runtime: u64, unresolved: &mut local_dispatch::UnresolvedCandidates) -> Result<Option<Candidate>, local_dispatch::LocalFallbackReason> {
     let mut selected = None;
     let result = local_dispatch::choose_local_next_with(cpu, current, voluntary, runtime,
         selection_now(cpu), runqueue::local_runnable_sequence(cpu),
-        donation_ledger::class_publication_sequence(), false, false, |slot, cpu, _now| {
+        donation_ledger::class_publication_sequence(), false, false, unresolved, |slot, cpu, _now| {
             match admitted_local_candidate(slot, cpu, Urgency::Fair) {
                 Decision::Selected(candidate) => {
                     let generation = candidate.generation;
@@ -261,7 +273,10 @@ fn fair(cpu: usize, current: usize, voluntary: bool, runtime: u64) -> Result<Opt
                 match selected_candidate(slot, cpu, id, generation,
                     if slot == current { FrameCustody::Current } else { FrameCustody::Local }, Urgency::Fair) {
                     Decision::Selected(candidate) => Ok(Some(candidate)),
-                    _ => Err(local_dispatch::LocalFallbackReason::FrameUnavailable),
+                    _ => {
+                        unresolved.record(slot, local_dispatch::LocalFallbackReason::FrameUnavailable);
+                        Err(local_dispatch::LocalFallbackReason::FrameUnavailable)
+                    }
                 }
             }
         }
@@ -271,7 +286,7 @@ fn fair(cpu: usize, current: usize, voluntary: bool, runtime: u64) -> Result<Opt
 }
 
 fn retry_fair(cpu: usize, current: usize, voluntary: bool, runtime: u64) -> Result<Option<Candidate>, local_dispatch::LocalFallbackReason> {
-    local_dispatch::retry_incomplete_policy(|| fair(cpu, current, voluntary, runtime))
+    local_dispatch::retry_incomplete_policy(|unresolved| fair(cpu, current, voluntary, runtime, unresolved))
 }
 
 /// Drives the actual priority chain without converting its observation into
@@ -336,9 +351,9 @@ fn choose(turn: &crate::multitask::cpu_local::dispatch_turn::CpuDispatchTurn<'st
     }
     match synchronous(cpu) { Decision::Empty => {}, result => return result }
     maintenance::service(turn, cpu, current, voluntary);
-    let overdue = local_dispatch::retry_incomplete_policy(|| local_dispatch::choose_overdue_system(
+    let overdue = local_dispatch::retry_incomplete_policy(|unresolved| local_dispatch::choose_overdue_system(
         cpu, current, ticks, selection_now(cpu),
-        runqueue::local_runnable_sequence(cpu), donation_ledger::class_publication_sequence()));
+        runqueue::local_runnable_sequence(cpu), donation_ledger::class_publication_sequence(), unresolved));
     match overdue {
         Ok(Some((slot, generation))) => {
             let Some(id) = current_identity::read_dispatch(slot).and_then(|p| p.task_id) else { return Decision::Incomplete; };

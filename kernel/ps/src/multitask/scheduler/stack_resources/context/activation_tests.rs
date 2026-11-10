@@ -87,9 +87,12 @@ fn architecture_only_capture_blocks_mm_close_without_a_fresh_runqueue_claim() {
     super::super::cpu_leases::with_test_bank(3, pin, false, || {
         cpu_local::with_test_activation_return(3, SLOT, SLOT, |phase| {
             if phase == 0 {
-                let lease = lease_for_architecture(SLOT, 0x2000, 3).unwrap();
-                assert_eq!(lease.root(), 0x2000);
-                drop(lease);
+                // The production capture the claim path runs, then the CPU
+                // retention the claimed turn performs with it.
+                let credential = test_capture_activation(SLOT, 3).flatten().unwrap();
+                assert_eq!(credential.root_for(SLOT, PID), Some(0x2000));
+                assert!(cpu_local::can_retain_mm_activation(3, &credential));
+                cpu_local::retain_mm_activation(3, credential);
                 assert!(attempt(reservation).is_none());
             }
             if phase == 1 {

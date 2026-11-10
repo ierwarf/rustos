@@ -187,6 +187,14 @@ fn commit_with_notify<G>(
         if let Some(cpu) = wake_cpu.filter(|&cpu| cpu != turn.cpu()) {
             notify_cpus |= 1u64 << cpu;
         }
+        // The first-turn record is ordering metadata for the queue THIS wake
+        // published into. An already-owned task was placed by another waker
+        // (possibly on another CPU), so it gets no record: a record on a CPU
+        // that does not queue the task can only be discarded there.
+        let runqueue::RemoteWakeOutcome::Published { cpu: queued, .. } = wake else {
+            continue;
+        };
+        debug_assert_eq!(queued, target, "activation wake published to a foreign CPU");
         let record = handoff_queue::FirstTurnHandoff { slot, task_id: id };
         let prioritized = if prioritize {
             // This original producer waits OUTSIDE all leaves, retaining its

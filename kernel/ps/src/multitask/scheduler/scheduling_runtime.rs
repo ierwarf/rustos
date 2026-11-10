@@ -129,6 +129,17 @@ pub(super) fn release(slot: usize, identity: ObjectIdentity) {
     }
 }
 
+/// The CPUs a slot's budgeted scheduling context may be funded on, or `None`
+/// for an unbudgeted task. Placement (affinity) must stay inside this mask:
+/// admission refuses a funded dispatch on any other CPU as an unresolved
+/// observation, so a task placed there never runs. The policy is immutable for
+/// the context's life; the caller's binding pin names the live context.
+pub(super) fn context_cpu_mask(slot: usize) -> Option<u64> {
+    let runtime = cell(slot)?.lock();
+    runtime.live_identity?;
+    runtime.policy.map(|policy| policy.cpu_mask)
+}
+
 #[cfg(test)]
 fn budget_for(
     slot: usize,

@@ -15,13 +15,14 @@ claim are two-step actions (observe, then exact CAS) so a writer can land
 between them.
 
 Concrete owners:
-  * runqueue.rs      transitions, edit_in_place (set_runnable, set_wait_armed,
-                     set_wait_reason, clear_wait_arm, publish_wait_arm,
-                     commit_wait, wake_wait_locked), retire_slot,
-                     release_retired
-  * runqueue/ipc_handoff.rs   claim_blocked_handoff, publish_remote_wake,
+  * runqueue/ownership.rs  transition (TRANSITIONS table), edit_in_place
+                     (set_runnable, set_wait_armed, set_wait_reason,
+                     clear_wait_arm, publish_wait_arm, commit_wait,
+                     wake_wait_locked)
+  * runqueue.rs      retire_slot, release_retired
+  * runqueue/ipc_handoff.rs   claim_blocked_handoff_duty, publish_remote_wake,
                      drain_remote_wakes (mailbox adoption), publish_migrating_record
-  * runqueue/lane.rs lane_cas
+  * runqueue/lane.rs lane_claim
   * runqueue/claim.rs claim_dispatch_inner,
     runqueue/return_publication.rs publish_return
 

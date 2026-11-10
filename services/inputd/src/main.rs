@@ -1081,6 +1081,9 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
     let result = thread::Builder::new()
         .name(String::from("inputd-dvm-ingress"))
         .spawn(move || {
+            // Separates "the worker thread never ran" from "it never reached the
+            // wait broker that admits the policy consumer".
+            debug_line("inputd: DVM ingress worker running");
             let mut ingest_scratch = vec![InputDvmRecordWire::default(); INPUTD_INGEST_MAX_EVENTS];
             let mut pending_events = Vec::with_capacity(INPUTD_INGEST_MAX_EVENTS);
             let mut decoder = dvm_protocol::DvmDecoder::default();

@@ -53,6 +53,7 @@ pub(in crate::multitask) struct ReturnArchitecture<'a> {
     changed: bool,
 }
 impl<'a> ReturnArchitecture<'a> {
+    #[cfg(test)]
     pub(in crate::multitask) fn capture(
         turn: &'a CpuDispatchTurn<'static>,
         dispatch: SchedulerDispatch,

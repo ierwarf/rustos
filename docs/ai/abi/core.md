@@ -289,9 +289,15 @@ a failed child cannot hide behind an indefinite rootd IPC wait. `READINESS_SIGNA
 values that do not match the kernel-stamped sender PID/TID. The sender-stamped
 receive path first re-authorizes the exact endpoint owner and is not a generic
 app IPC ABI; kernel-stamped sender identity does not grant policy capability.
-Rootd's supervisor loop must yield
-between nonblocking receive turns rather than sleep-polling, because service
-endpoint registration synchronously depends on rootd capability replies.
+Rootd's supervisor loop must never wait without receiving, because service
+endpoint registration synchronously depends on rootd capability replies and
+every core service's heartbeat is a 250 ms bounded call to rootd. Between
+nonblocking drain turns it either yields (the drain hit its budget) or blocks in
+one bounded receive (`SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED`,
+`ROOTD_SUPERVISOR_IDLE_POLL_MS`) that the next control message ends at once.
+This holds for the pre-init core-readiness loop as well as post-init: readiness
+is re-checked after every such boundary, and the readiness budget is charged by
+monotonic time (`supervise_core_readiness`), never by sleeping out a window.
 No service may hold a local policy/state lock across service discovery or a
 synchronous cross-service call. Early-boot maintenance paths additionally
 skip discovery when their drained work set is empty. A new bootstrap

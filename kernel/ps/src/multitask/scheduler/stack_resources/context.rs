@@ -315,93 +315,18 @@ pub(in crate::multitask::scheduler) fn replace_exec_mm(
     });
     drop(old); // release after the leaf; no HAL/heap work in pin Drop
 }
-/// Non-Copy physical MM credential retained outside leaves during hardware work.
-/// The CPU turn separately owns IRQ/preemption. This pin linearizes fresh
-/// acquisition against MM close, but does not replace cold exec/quiescence
-/// arbitration for the complete claim/activation/CPU-publication transaction.
+/// Host seam onto the production MM activation capture
+/// (`activation::capture`) exactly as the claim path performs it in
+/// `frame_readers::with_claim_activation`, under this slot's resource leaf.
+/// Hosts have no claimed CPU turn to retain the credential in, so a test that
+/// needs the retention calls `cpu_local::retain_mm_activation` itself.
+/// `None` is a refusal; `Some(None)` is a kernel context without MM.
 #[cfg(test)]
-pub(in crate::multitask::scheduler) struct ExecutionRootLease {
-    root: u64,
-    _pin: Option<crate::multitask::process_table::MmExecutionPin>,
-    _cpu_affinity: core::marker::PhantomData<*mut ()>,
-}
-#[cfg(test)]
-impl ExecutionRootLease {
-    pub(in crate::multitask::scheduler) fn root(&self) -> u64 {
-        self.root
-    }
-}
-#[cfg(test)]
-pub(in crate::multitask::scheduler) fn lease_execution_root(
+pub(in crate::multitask::scheduler) fn test_capture_activation(
     slot: usize,
-    root: u64,
     cpu: usize,
-) -> Option<ExecutionRootLease> {
-    lease_root_inner(slot, root, cpu, false)
-}
-#[cfg(test)]
-pub(in crate::multitask::scheduler) fn lease_for_architecture(
-    slot: usize,
-    root: u64,
-    cpu: usize,
-) -> Option<ExecutionRootLease> {
-    lease_root_inner(slot, root, cpu, true)
-}
-#[cfg(test)]
-fn lease_root_inner(
-    slot: usize,
-    root: u64,
-    cpu: usize,
-    activate: bool,
-) -> Option<ExecutionRootLease> {
-    if !(super::cpu_leases::owns_current(cpu, slot) || super::cpu_leases::owns_prepared(cpu, slot))
-    {
-        return None;
-    }
-    #[cfg(not(test))]
-    if activate && !crate::multitask::current_identity::execution::banks::owns_execution(cpu, slot)
-    {
-        return None;
-    }
-    let (pin, activation) = RESOURCES.get(slot)?.with(|resources| {
-        let context = resources.context?;
-        let pin = match context.process_handle {
-            Some(handle) => {
-                let pin = resources.mm_pin.as_ref()?;
-                if !pin.matches(handle, root) {
-                    return None;
-                }
-                Some(Some(pin.try_clone()?))
-            }
-            None => (!context.user_mode && resources.mm_pin.is_none()).then_some(None),
-        }?;
-        let activation = if activate {
-            super::activation::capture(resources, slot, cpu)?
-        } else {
-            None
-        };
-        Some((pin, activation))
-    })?;
-    if let Some(activation) = activation {
-        if !crate::multitask::cpu_local::can_retain_mm_activation(cpu, &activation) {
-            return None;
-        }
-        crate::multitask::cpu_local::retain_mm_activation(cpu, activation);
-    }
-    Some(ExecutionRootLease {
-        root,
-        _pin: pin,
-        _cpu_affinity: core::marker::PhantomData,
-    })
-}
-
-#[cfg(test)]
-pub(in crate::multitask::scheduler) fn execution_root_is_current(
-    slot: usize,
-    root: u64,
-    cpu: usize,
-) -> bool {
-    lease_execution_root(slot, root, cpu).is_some()
+) -> Option<Option<super::activation::ActivationCredential>> {
+    RESOURCES.get(slot)?.with(|resources| super::activation::capture(resources, slot, cpu))
 }
 
 pub(in crate::multitask::scheduler) fn clear(slot: usize) {

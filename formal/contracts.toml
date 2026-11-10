@@ -384,7 +384,7 @@ reason = "Original producer closes fresh identity/Cohort/execution admission bef
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/terminal_publication.rs"
-models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement", "process-lifecycle-transaction/ProcessLifecycleTransaction", "scheduler-wakeup/SchedulerWakeup", "exception-retirement-lifecycle/ExceptionRetirementLifecycle"]
+models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement", "process-lifecycle-transaction/ProcessLifecycleTransaction", "scheduler-wakeup/SchedulerWakeup", "exception-retirement-lifecycle/ExceptionRetirementLifecycle", "scheduler-terminal-producer/SchedulerTerminalProducer"]
 
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/scheduler/terminal_publication/tests.rs"
@@ -2175,6 +2175,10 @@ models = [
 ]
 
 [[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/ownership.rs"
+models = ["scheduler-owner-word/SchedulerOwnerWord", "scheduler-resident-cell/SchedulerResidentCell"]
+
+[[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/resident.rs"
 models = ["scheduler-resident-cell/SchedulerResidentCell"]
 
@@ -3484,7 +3488,7 @@ flows = ["cross-cpu-task-retirement"]
 reason = "Actual root-born resources, queue, lifecycle, deferred claims and physical Current bank witness refusal, stop ordering and retained funding/MM/context. Native external completion is injected and is not hardware retirement or joint refinement."
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/terminal_quarantine.rs"
-models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement", "scheduler-terminal-producer/SchedulerTerminalProducer"]
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/terminal_quarantine/tests.rs"
 models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
@@ -3501,7 +3505,7 @@ flows = ["cross-cpu-task-retirement"]
 reason = "Real row/producer/consumer/reset methods and independent predicate injections witness stale loans, duplicate consumption, poison and checked epochs, not complete lifecycle or physical retirement."
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/producer.rs"
-models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement", "scheduler-terminal-producer/SchedulerTerminalProducer"]
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/producer/tests.rs"
 models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]

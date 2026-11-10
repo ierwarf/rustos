@@ -95,9 +95,11 @@ fn call_before_arm_observing(
             if runqueue::is_handoff_dispatchable_owner(owner) {
                 if let Some(target) = owner.cpu {
                     let _publication = dispatch_priority::Publication::begin(scope, target);
+                    // Ordering hint only: the typed wake above already
+                    // published fair custody, so this commit owes no duty.
                     hinted = sync_handoff::publish_original(target,
                         sync_handoff::SyncHandoffRecord::new(binding.slot(), binding.id()),
-                        || Some(runqueue::owner(binding.slot()))).is_some();
+                        || Some((runqueue::owner(binding.slot()), None))).is_some();
                 }
             }
             // All original sender/donor/root/receiver and typed loans survive
@@ -217,54 +219,70 @@ pub(super) fn publish_switching(
     // Current/Transition pair before this FIFO may become visible. A fused
     // switch makes nothing visible to any dispatcher but this CPU's own.
     let publication = (!fused).then(|| dispatch_priority::Publication::begin(scope, target));
-    let original = current_identity::with_ipc_handoff_binding(slot, binding.id(), || {
+    // The claim is the owner-table row `Blocked --HandoffDirect/HandoffRemote-->`
+    // and yields its enqueue duty (I1): `HandoffFifo` for a local receiver
+    // (discharged by `publish_original` under the FIFO leaf, or carried by the
+    // fused `DirectSwitch`), `Mailbox` for a remote one (discharged below, after
+    // every leaf has ended). No path from here drops it.
+    let (original, duty) = current_identity::with_ipc_handoff_binding(slot, binding.id(), || {
         runqueue::affinity_payload::with_placement_admission(slot, Some(binding.id()), target, || {
             if fused {
                 return typed.publish_and_clear(|| {
-                    runqueue::claim_blocked_handoff(slot, expected, target, local)
-                });
+                    runqueue::claim_blocked_handoff_duty(slot, expected, target, local)
+                }).map(|(original, duty)| (original, Some(duty)));
             }
             sync_handoff::publish_original(target,
                 sync_handoff::SyncHandoffRecord::new(slot, binding.id()), || {
                     typed.publish_and_clear(|| {
-                        runqueue::claim_blocked_handoff(slot, expected, target, local)
-                    })
+                        runqueue::claim_blocked_handoff_duty(slot, expected, target, local)
+                    }).map(|(original, duty)| (original, Some(duty)))
                 })
         }).and_then(|(result, _grant)| result)
     }).flatten().ok_or(Outcome::DirectCustodyUnavailable)?;
     // All leaves have ended. The SAME reader remains alive until the exact
     // generation and remote record are visible; no dispatcher can claim early.
     frame_publication::bind_local_owner_generation(slot, original.generation);
-    let notify = !local && runqueue::publish_handoff_mailbox(slot, original,
-        runqueue::weight::value(slot));
+    let (notify, fused_duty) = match duty {
+        Some(duty) if duty.kind() == runqueue::DutyKind::Mailbox => {
+            (duty.publish_mailbox(runqueue::weight::value(slot)), None)
+        }
+        duty => (false, duty),
+    };
     runqueue::wait::set_ready_since_ticks(slot, crate::arch::rtc::ticks().max(1));
     runqueue::wait::set_blocked_since_ticks(slot, 0);
     last_effect();
     drop(publication);
-    match switch.filter(|_| fused) {
-        Some(out) => {
-            // SAFETY: this reader was acquired for this receiver on this masked
-            // CPU, never released, and validated just above at the same RSP.
-            let adopted = match frame_publication::direct_handoff_frame_token(slot, cpu) {
-                Some(now) => unsafe {
-                    dispatch_claim::FrameSelection::from_held(cpu, binding.id(), now,
-                        token.saved_rsp, return_to_user, reader)
-                },
-                None => Err(reader),
-            };
-            match adopted {
-                Ok(selection) => *out = Some(dispatch_claim::DirectSwitch::new(selection)),
-                Err(reader) => {
-                    // Ordinary FIFO custody for the committed owner; the dispatcher
-                    // re-captures this frame exactly as for any other handoff.
-                    let _publication = dispatch_priority::Publication::begin(scope, target);
-                    let _ = sync_handoff::enqueue(target,
-                        sync_handoff::SyncHandoffRecord::new(slot, binding.id()));
-                    drop(reader);
-                }
+    // Only a fused claim still owes its HandoffFifo duty here.
+    if let Some(duty) = fused_duty {
+        let out = switch.expect("a fused handoff claim has no switch to carry it");
+        // SAFETY: this reader was acquired for this receiver on this masked
+        // CPU, never released, and validated just above at the same RSP.
+        let adopted = match frame_publication::direct_handoff_frame_token(slot, cpu) {
+            Some(now) => unsafe {
+                dispatch_claim::FrameSelection::from_held(cpu, binding.id(), now,
+                    token.saved_rsp, return_to_user, reader)
+            },
+            None => Err(reader),
+        };
+        match adopted {
+            Ok(selection) => {
+                // The switch carries the duty: taken by `fast_switch`, or its
+                // Drop materializes the receiver into fair custody.
+                *out = Some(dispatch_claim::DirectSwitch::new(selection));
+                duty.handoff_recorded();
+            }
+            Err(reader) => {
+                // Ordinary FIFO custody for the committed owner; the dispatcher
+                // re-captures this frame exactly as for any other handoff.
+                let _publication = dispatch_priority::Publication::begin(scope, target);
+                assert!(sync_handoff::enqueue(target,
+                    sync_handoff::SyncHandoffRecord::new(slot, binding.id())));
+                duty.handoff_recorded();
+                drop(reader);
             }
         }
-        None => drop(reader),
+    } else {
+        drop(reader);
     }
     #[cfg(not(test))]
     if notify { crate::multitask::irq::request_target_reschedule(target); }
@@ -401,14 +419,18 @@ pub(super) fn reply_published(
     if !exact && live { return None; }
     Some(if wake_publication::reply_switching(scope, reply, caller, eligible_cpus, switch) {
         FastIpcReplyHandoffOutcome::LocalFallback
-    } else {
+    } else if wake_retry::record_in(scope, caller,
+        Some((runqueue::wait::REASON_ENDPOINT_REPLY, reply)))
+    {
         // The response is already published and the server may now sleep.
         // A transient frame/Current-return refusal must not discard its only
         // wake. Retain an observation of the exact reply wait for a later IRQ;
         // this grants no fresh wake/frame custody and cannot clear a newer epoch.
-        let _ = wake_retry::record_in(scope, caller,
-            Some((runqueue::wait::REASON_ENDPOINT_REPLY, reply)));
         FastIpcReplyHandoffOutcome::Rejected
+    } else {
+        // `record_in` found no wait instance naming this reply (or a wake already
+        // owns its pending phase): a legitimate protocol outcome, not a lost wake.
+        FastIpcReplyHandoffOutcome::NotWaiting
     })
 }
 

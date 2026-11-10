@@ -202,14 +202,14 @@ fn affinity_change_refuses_real_local_claim_without_directory_and_preserves_queu
         ));
         assert_eq!(runqueue::owner(SLOT), before);
         assert_eq!(identity::execution::count(SLOT), 0);
-        assert!(runqueue::published_local_member_for_test(CPU, SLOT));
+        assert!(runqueue::published_local_membership(SLOT, CPU));
         runqueue::affinity_payload::set_affinity(SLOT, 1 << CPU, 1 << CPU, true);
         assert!(
             runqueue::claim_dispatch_with_owner_generation(SLOT, CPU, 100, Some(before.generation)),
             "migration intent is not a veto of an included destination CPU"
         );
         assert_eq!(identity::execution::count(SLOT), 1);
-        assert!(!runqueue::published_local_member_for_test(CPU, SLOT));
+        assert!(!runqueue::published_local_membership(SLOT, CPU));
     });
 }
 #[test]
@@ -276,7 +276,7 @@ fn owned_cohort_gate_refuses_real_local_and_direct_cas_until_commit_preserving_e
             assert!(!runqueue::claim_dispatch(SLOT, CPU, 100));
             assert_eq!(runqueue::owner(SLOT), before);
             if !direct {
-                assert!(runqueue::published_local_member_for_test(CPU, SLOT));
+                assert!(runqueue::published_local_membership(SLOT, CPU));
             }
             cohort.complete();
             assert!(runqueue::claim_dispatch(SLOT, CPU, 100));
@@ -307,7 +307,7 @@ fn reserved_slot_refuses_real_local_and_direct_cas_in_every_phase_without_spendi
                 assert_eq!(runqueue::owner(SLOT), before);
                 assert_eq!(identity::execution::count(SLOT), 0);
                 if !direct {
-                    assert!(runqueue::published_local_member_for_test(CPU, SLOT));
+                    assert!(runqueue::published_local_membership(SLOT, CPU));
                 }
             }
             admission::set_phase_for_test(SLOT, ID, None); // model release, not production ACK

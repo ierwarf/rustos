@@ -70,6 +70,7 @@ required_models = [
     "scheduler-owner-word/SchedulerOwnerWord",
     "scheduler-resident-cell/SchedulerResidentCell",
     "scheduler-terminal-claim/SchedulerTerminalClaim",
+    "scheduler-terminal-producer/SchedulerTerminalProducer",
     "scheduler-thread-demotion/SchedulerThreadDemotion",
     "scheduler-wakeup/SchedulerWakeup",
     "sigchld-notification/SigchldNotification",
@@ -4164,6 +4165,56 @@ replace = '''    /\ stop' = StopWithdrawn
 '''
 occurrence = 1
 invariant = "NoRetireUnderClaim"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "scheduler-terminal-producer-drain-assertion-forgets-parked-stop"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-terminal-producer/SchedulerTerminalProducer"
+flow = "scheduler-terminal-producer"
+find = '''    /\ crash' = IF h = "hk" /\ (lifecycle # (producer = "deferred"))'''
+replace = '''    /\ crash' = IF h = "hk" /\ ~(lifecycle \/ producer = "waiting")'''
+occurrence = 1
+invariant = "NoPanic"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "scheduler-terminal-producer-park-drops-the-stop-request"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-terminal-producer/SchedulerTerminalProducer"
+flow = "scheduler-terminal-producer"
+find = '''               /\ producer' = "parked" /\ holder' = "none" /\ from' = "none"'''
+replace = '''               /\ producer' = "vacant" /\ holder' = "none" /\ from' = "none"'''
+occurrence = 1
+invariant = "StopRequestKept"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "scheduler-terminal-producer-rollback-restores-another-origin"
+kind = "transition-effect"
+severity = "high"
+model = "scheduler-terminal-producer/SchedulerTerminalProducer"
+flow = "scheduler-terminal-producer"
+find = '''    /\ producer' = from /\ holder' = "none" /\ from' = "none"'''
+replace = '''    /\ producer' = "deferred" /\ holder' = "none" /\ from' = "none"'''
+occurrence = 1
+invariant = "DeferredMeansWithdrawn"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "scheduler-terminal-producer-withdraw-ignores-in-flight-claim"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-terminal-producer/SchedulerTerminalProducer"
+flow = "scheduler-terminal-producer"
+find = '''       ELSE IF InFlight
+          THEN \* park_unwithdrawn'''
+replace = '''       ELSE IF FALSE
+          THEN \* park_unwithdrawn'''
+occurrence = 1
+invariant = "NoPanic"
 min_counterexample_states = 4
 
 [[mutation]]

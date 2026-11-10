@@ -181,7 +181,6 @@ pub(in crate::multitask::scheduler) fn actual_group_capture_owns_every_live_bind
 #[test]
 pub(in crate::multitask::scheduler) fn queued_rehome_keeps_old_process_mask_and_closed_admission_until_actual_owner_effect_returns() {
     fixture(UserAbi::Windows, |h| {
-        runqueue::set_runnable(PEER, true);
         assert!(matches!(
             runqueue::publish_local_wake(PEER, 0, 100),
             runqueue::RemoteWakeOutcome::Published { .. }
@@ -233,7 +232,6 @@ pub(in crate::multitask::scheduler) fn running_affinity_never_steals_current_cus
             }
             let (_, current) = identity::execution::with_claim(ROOT, |_| ()).unwrap();
             identity::execution::banks::initialize(0, current.unwrap());
-            runqueue::set_runnable(PEER, true);
             runqueue::publish_local_wake(PEER, 0, 100);
             assert!(runqueue::claim_dispatch(PEER, 0, 100));
             let before = runqueue::owner(PEER);
@@ -369,7 +367,6 @@ pub(in crate::multitask::scheduler) fn terminal_stop_during_queue_effect_cannot_
         use scheduler::retirement_cleanup::producer::{
             publish_process_turn_fixture, reset_process_turn_fixture,
         };
-        runqueue::set_runnable(PEER, true);
         runqueue::publish_local_wake(PEER, 0, 100);
         let result = capture(h, 4).finish_with(|slot, id, mask, cohort| {
             let mut turn = placement::terminal::Turn::begin(h, (slot, id)).unwrap();
@@ -402,7 +399,6 @@ pub(in crate::multitask::scheduler) fn terminal_stop_during_queue_effect_cannot_
 #[test]
 pub(in crate::multitask::scheduler) fn peer_block_between_affinity_masks_and_queue_effect_never_spends_affinity_as_a_wake() {
     fixture(UserAbi::Windows, |h| {
-        runqueue::set_runnable(PEER, true);
         runqueue::publish_local_wake(PEER, 0, 100);
         let result = capture(h, 4).finish_with(|slot, id, mask, cohort| {
             runqueue::publish_blocked(slot, 0, 100);

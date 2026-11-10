@@ -356,10 +356,10 @@ source = "kernel/ps/src/multitask/scheduler/local_dispatch/fair_retry.rs"
 source_symbol = "retry_incomplete_policy"
 source_anchors = [
   "for _ in 0..MAX_LOCAL_FAIR_OBSERVATIONS {",
-  "Ok(choice) => return Ok(choice),",
+  "return Ok(choice);",
   "Err(LocalFallbackReason::CustodyUnavailable) // unresolved earlier class",
 ]
-invariant = "a torn strict-System/User reservation publication cannot become proof of no eligible peer: a stable epoch can claim its exact System owner, while exhaustion remains guarded and never grants later-class work"
+invariant = "a torn strict-System/User reservation publication cannot become proof of no eligible peer: a stable epoch can claim its exact System owner, while exhaustion remains guarded and never grants later-class work; only a candidate slot unresolved in every earlier observation of the turn is omitted by the final one (UnresolvedCandidates), so one stuck candidate cannot idle the CPU, and an epoch tear is never slot-attributed"
 loom_test = "incomplete_early_policy_never_authorizes_a_later_class"
 shuttle_test = "incomplete_early_policy_never_authorizes_a_later_class_pct"
 herd_not_applicable = "bounded queue/class epoch sampling, policy priority and owner CAS cross independent objects and cannot be reduced to a single publication litmus"
@@ -370,11 +370,11 @@ severity = "critical"
 flow = "scheduler-dispatch"
 model = "scheduler-local-authority/SchedulerLocalAuthority"
 source = "kernel/ps/src/multitask/scheduler/local_dispatch/fair_retry.rs"
-source_symbol = "retry_incomplete_fair"
+source_symbol = "retry_incomplete_policy"
 source_anchors = [
   "for _ in 0..MAX_LOCAL_FAIR_OBSERVATIONS {",
-  "Ok(choice) => return choice,",
-  "Err(LocalFallbackReason::NoLocalCandidate) => return None,",
+  "unresolved.begin_observation();",
+  "Err(LocalFallbackReason::NoLocalCandidate) => return Ok(None),",
   "Err(_) => continue,",
 ]
 invariant = "a torn ordinary fair observation can retry but grants no partial catalog authority; only a stable Local generation can be claimed, and a republish before its owner CAS loses the stale claim"
@@ -444,13 +444,12 @@ id = "scheduler-owner-word-metadata-vs-retire"
 severity = "critical"
 flow = "scheduler-owner-word"
 model = "scheduler-owner-word/SchedulerOwnerWord"
-source = "kernel/ps/src/multitask/scheduler/runqueue.rs"
+source = "kernel/ps/src/multitask/scheduler/runqueue/ownership.rs"
 source_symbol = "edit_in_place"
 source_anchors = [
   "if !observed.state.is_editable() {",
   "return InPlace::Settled;",
-  "self.compare_exchange_raw(observed, next)",
-  "scheduler retire completion raced observed={observed:?}",
+  "self.cas(observed, next)",
 ]
 invariant = "a lock-free run-intent or wait-arm writer edits only a live owner word and refuses Retiring, Retired and Dormant words, so the exact Retiring-to-Retired completion CAS never loses to a late publish_frame write and a terminal word never carries metadata"
 loom_test = "owner_word_terminal_beats_late_metadata_writers"
@@ -528,7 +527,7 @@ source_anchors = [
   "owner.state == RunOwnerState::Running",
   "crate::multitask::cpu_local::task_execution_owner(slot).is_some()",
   "return RetireOutcome::ClaimInFlight;",
-  "OWNER_WORDS[slot].compare_exchange(owner, retiring)",
+  "transition(slot, owner, OwnerEvent::Withdraw, None)",
 ]
 invariant = "a remote stop retires the owner word in one CAS loop with its in-flight check, so the CPU that claimed a task never installs it under a retired owner, and a stop parked behind the claim retires once the task is published"
 loom_test = "terminal_withdraw_never_retires_an_in_flight_claim"

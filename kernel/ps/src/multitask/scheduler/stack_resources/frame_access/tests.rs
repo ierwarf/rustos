@@ -93,6 +93,9 @@ fn closing_defers_reap_until_the_exclusive_writer_releases() {
     quiesce(true);
     super::super::super::retirement_cleanup::take_reap_pending();
     with_exec(SLOT, ID, |_| {
+        // The production reclaim gate (the reaper's `reuse::begin_retired`
+        // shares `begin_qualified`) refuses while the byte writer is active.
+        assert!(super::super::reuse::begin(SLOT, Some(ID)).is_none());
         assert!(!close_for_reclaim(SLOT));
         assert!(pin_view(SLOT, ID, view).is_none());
         assert!(catch_unwind(AssertUnwindSafe(|| take_storage(SLOT))).is_err());
