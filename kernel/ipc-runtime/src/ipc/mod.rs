@@ -922,11 +922,10 @@ struct FastCallFrame {
     terminal_error: Option<IpcError>,
     request: [u8; IPC_FAST_INLINE_BYTES],
     response: [u8; IPC_FAST_INLINE_BYTES],
-    /// Request and response bytes that do not fit the inline images. Present only
-    /// for a message larger than `IPC_FAST_INLINE_BYTES`; the common frame pays one
-    /// null check at retirement.
-    // Keep the two fallibly allocated byte vectors, but not a second
-    // infallibly allocated Box metadata object on the kernel IPC path.
+    /// Metadata for bytes outside the 256-byte images. The two Vec headers
+    /// live in the fixed reply frame even when the spill is absent: this costs
+    /// some slot memory but avoids a separate infallible Box allocation on the
+    /// OOM-sensitive kernel IPC path. Spill byte allocations remain fallible.
     spill: Option<FastSpill>,
 }
 
