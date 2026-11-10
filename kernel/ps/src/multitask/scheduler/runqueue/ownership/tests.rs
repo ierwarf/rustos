@@ -256,6 +256,38 @@ fn queued_run_intent_may_be_withdrawn_in_place_and_keeps_its_membership() {
 }
 
 #[test]
+fn rehome_preserves_withdrawn_local_run_intent_through_mailbox_adoption() {
+    // A Local member may be temporarily non-runnable. Rehome is a change
+    // of queue custody, not a wake: resetting the runnable bit to the
+    // Migrating/RemoteQueued/Local default would execute a blocked task.
+    const SLOT: usize = 109;
+    const SOURCE: usize = 1;
+    const TARGET: usize = 2;
+    let _serial = test_serial_guard();
+    reset_before_publication();
+    admit_blocked(SLOT);
+    runqueue::publish_local(SLOT, SOURCE, 100);
+    set_runnable(SLOT, false);
+    assert!(!owner(SLOT).runnable);
+    assert!(matches!(
+        runqueue::rehome_queued(SLOT, TARGET, 100),
+        RemoteWakeOutcome::Published { cpu: TARGET, .. }
+    ));
+    assert_eq!(owner(SLOT).state, RunOwnerState::RemoteQueued);
+    assert!(!owner(SLOT).runnable, "migration must not act as a wake");
+    assert_eq!(drain_remote_wakes(TARGET), 1);
+    assert_eq!(owner(SLOT).state, RunOwnerState::Local);
+    assert!(!owner(SLOT).runnable, "mailbox adoption must preserve block intent");
+    assert!(!is_local_dispatchable(SLOT, TARGET));
+    runqueue::wait::set_blocked(SLOT, false);
+    assert!(is_local_dispatchable(SLOT, TARGET),
+        "a subsequent real wake still grants runnable intent");
+    retire(SLOT, 100);
+    release_retired(SLOT);
+    reset_before_publication();
+}
+
+#[test]
 fn the_flight_ring_holds_the_last_transitions_newest_first() {
     const SLOT: usize = 108;
     let _serial = test_serial_guard();

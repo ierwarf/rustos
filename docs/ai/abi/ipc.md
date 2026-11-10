@@ -121,8 +121,11 @@ runs at a scheduler entry, and every arm is refused meanwhile. The request is
 already enqueued, so the waiter yields and re-samples the deadline instead of
 cancelling; the fast-call path rolls back and falls through to this bounded
 retry (`FallbackDeadlineArm`). Only after `MAX_TRANSIENT_ARM_REFUSALS` (256)
-yielded retries is the refusal treated as permanent (no Current bank, terminal
-owner), cancelled as `InvalidArm` and reported as `EINVAL`. A fast call whose
+**consecutive** yielded refusals is the refusal treated as permanent (no
+Current bank, terminal owner), cancelled as `InvalidArm` and reported as
+`EINVAL`. A successful scheduler arm resets the refusal streak; otherwise
+several unrelated arm/commit turns in one long call can accumulate to a false
+permanent failure. The original absolute reply deadline always bounds retries. A fast call whose
 receiver already owns the request still cancels exactly as the slow path does.
 
 The typed `ipc::{call,recv_with_sender,reply,reply_recv_with_sender}` helpers
@@ -154,7 +157,10 @@ identity/owner checks only, never user-memory access. Exec/exit/stale-slot
 refusals remain mandatory; diagnostic PID/TID publications are not authority.
 
 A rendezvous frame carries up to one maximum IPC message (64 KiB) each way: the
-inline 256-byte images plus an owned spill for the rest. A caller's declared reply
+inline 256-byte images plus an owned spill for the rest. Spill metadata is
+stored inline in the reply frame; only the byte vectors require fallible
+allocations, rather than a second infallible `Box::new` on an OOM-sensitive
+Ring0 path. A caller's declared reply
 capacity above that is clamped. An unfused `REPLY` holds its caller's wake until
 the same task's next blocking receive (or its next syscall or scheduler entry).
 

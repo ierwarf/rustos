@@ -631,6 +631,13 @@ Invariants:
   for the first one's exact completion instead of re-withdrawing the word.
 - **I3.** Every row advances the generation by exactly one; nothing else changes
   it.
+- **Run intent across migration.** `Rehome`, `PublishMigration` and `Adopt`
+  move a pre-existing execution/queue claim; they do not mint a wake. Preserve
+  the *current* owner word's runnable bit across each row, including a
+  non-runnable `Local` member awaiting a real wake. CAS retries use the
+  winner's word rather than an earlier migration snapshot. Resetting runnable
+  to the destination state's default silently runs a continuation whose
+  previous owner had already withdrawn its intent.
 
 Effects run in a fixed order after the CAS: resident-cell settle, flight-recorder
 store, the duty, the caller's frame-generation bind and published-load update

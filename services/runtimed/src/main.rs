@@ -243,6 +243,9 @@ fn main() {
     let listener = match socket::bind_listener(DEFAULT_RUNTIME_SOCKET_PATH) {
         Ok(listener) => listener,
         Err(err) => {
+            // This failure exits the process before session endpoint publication.
+            // Initd only sees ESRCH; keep the actual cause on unconditional debugcon.
+            spawn::debug_line(&format!("runtimed: fatal runtime socket bind failed errno={err}"));
             observability_client::error!(
                 "runtimed",
                 service,
@@ -269,7 +272,7 @@ fn main() {
     let mut runtime_connections = match socket::RuntimeConnections::with_acceptor(listener) {
         Ok(connections) => connections,
         Err(errno) => {
-            spawn::debug_line("runtimed: fatal control acceptor thread failed");
+            spawn::debug_line(&format!("runtimed: fatal control acceptor thread failed errno={errno}"));
             boot_line(&format!("runtimed: fatal control acceptor thread failed errno={errno}"));
             return;
         }
@@ -600,7 +603,8 @@ fn require_post_ui_user_class() {
         spawn::debug_line("runtimed: post-ui scheduling class=user");
         return;
     }
-    spawn::debug_line("runtimed: fatal post-ui scheduling demotion failed");
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EPERM);
+    spawn::debug_line(&format!("runtimed: fatal post-ui scheduling demotion failed errno={errno}"));
     std::process::exit(134);
 }
 
