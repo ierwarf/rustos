@@ -4,6 +4,37 @@ Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
 
+## Ring0 static audit (2026-11-10, GitHub audit branch)
+
+Starting tree was `75203b1d` (the predecessor `b82b50eb` was replaced by a
+concurrent scheduler refactor during the audit). The earlier deferred terminal
+panic is already addressed in this starting tree by explicit
+`Producer::Origin` (Withdrawn/ExecutorWait/Parked); do not revert that fix.
+
+Changes in this audit: preserve already-withdrawn Local run intent through
+`Rehome -> Migrating -> PublishMigration -> RemoteQueued -> Adopt -> Local`;
+add a real runqueue regression test; reset consecutive reply-arm refusals after
+a successful arm; remove the second infallible allocation of `FastSpill`
+metadata from Ring0 by keeping that metadata inline. Contract text was updated.
+
+New external boot evidence reported by the user: lane 0 failed 25/25
+50-second 4-vCPU parallel smoke runs, common cause
+`initd endpoint admission failed: exec=services/runtimed/runtimed.elf
+pid=122 errno=3 cause=service-exited waited_ms=5058 slices=2`;
+DVM display/relay/input ready but `rustos-runtime=false`, no wayclick frame.
+This is an observed exited service, **not** proof that a particular Ring0
+scheduler or IPC race caused the exit. The reporter's local
+`/tmp/rk/lane-0/kvm/` debugcon and QEMU logs were unavailable to this GitHub
+audit environment. Runtimed's early socket/acceptor/demotion failures now
+report an unconditional debugcon errno; inspect the original debugcon to
+locate the first runtimed fatal or user fault before attempting a startup fix.
+
+**Not verified in this audit:** checkout compilation, native tests, formal PR
+gate, mutation, KVM and DVM. A GitHub source comparison only is not evidence
+that the 25/25 failure is resolved. Run the focused kernel-ps,
+kernel-ipc-runtime and kernel-compat test crates, then formal PR gate and
+4/8/16-vCPU KVM with per-lane debugcon before claiming qualification.
+
 ## Hardening pass (2026-11-09, uncommitted)
 
 Whole-tree hardening by area-owning agents (kernel/ps, compat, mm, hal,
