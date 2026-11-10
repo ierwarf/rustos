@@ -213,7 +213,14 @@ impl RunOwnerSnapshot {
             CpuRule::Keep => self.cpu,
             CpuRule::Target => cpu,
         };
-        let next = Self::new(row.to, cpu, generation);
+        let mut next = Self::new(row.to, cpu, generation);
+        // Rehome moves existing queue custody, not a fresh wake. A Local
+        // continuation may retain membership while no longer runnable; its
+        // run intent must survive Migrating -> RemoteQueued -> Local. Likewise
+        // a wake racing migration can only raise the *current* word's intent.
+        if matches!(row.event, OwnerEvent::Rehome | OwnerEvent::PublishMigration | OwnerEvent::Adopt) {
+            next.runnable = self.runnable;
+        }
         match row.wait {
             WaitRule::Clear => next,
             WaitRule::Keep => next.with_wait(self.wait_armed, self.wait_reason_kind),
