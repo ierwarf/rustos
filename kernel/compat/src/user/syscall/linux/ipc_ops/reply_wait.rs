@@ -108,6 +108,10 @@ pub(super) fn wait_for_reply_with_deadline(
             cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::InvalidArm);
             return Err(LINUX_EINVAL);
         }
+        // Count *consecutive* refused arms. A successful scheduler arm
+        // ends the previous publication race, even if the timer arm or the
+        // subsequent commit must retry within the original deadline.
+        arm_refusals = 0;
         if !arm_reply_deadline_waiter(caller_task_id, deadline_tick) {
             let _ = multitask::cancel_block_current_task();
             multitask::yield_now();
@@ -264,6 +268,11 @@ mod tests {
             "the turn polls before it arms: an already completed reply must not \
              pay the arm and disarm pair"
         );
+
+        let reset = body.find("arm_refusals = 0;").expect("successful arm resets retry streak");
+        let timer_arm = body.find("if !arm_reply_deadline_waiter(").expect("deadline arm");
+        assert!(arm < reset && reset < timer_arm,
+            "successful reply block arm must clear previous transient refusals");
 
         let ceiling = body
             .find("polls, POLLS_PER_WAIT_TURN,")
