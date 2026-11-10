@@ -906,12 +906,12 @@ int rustos_gpu_runtime_render_bootstrap(struct rustos_gpu_runtime *runtime,
         errno = EPROTO;
         return -1;
     }
-    atlas_bytes = (size_t)runtime->atlas_stride_bytes * runtime->atlas_height;
-    if (runtime->atlas_height != 0U &&
-        atlas_bytes / runtime->atlas_height != runtime->atlas_stride_bytes) {
-        errno = EOVERFLOW;
-        return -1;
-    }
+    const uint32_t boot_width =
+        runtime->output_width < 64U ? runtime->output_width : 64U;
+    const uint32_t boot_height =
+        runtime->output_height < 64U ? runtime->output_height : 64U;
+    const size_t boot_stride = (size_t)boot_width * 4U;
+    atlas_bytes = boot_stride * boot_height;
     pixels = calloc(1U, atlas_bytes);
     if (pixels == NULL)
         return -1;
@@ -921,21 +921,21 @@ int rustos_gpu_runtime_render_bootstrap(struct rustos_gpu_runtime *runtime,
      * distinguish a progressing boot from a dead scanout, while never
      * sampling RustOS-owned DMA-BUF pixels before the first validated release.
      */
-    for (y = 0U; y < runtime->output_height; y++) {
-        uint8_t *row = pixels + (size_t)y * runtime->atlas_stride_bytes;
+    for (y = 0U; y < boot_height; y++) {
+        uint8_t *row = pixels + (size_t)y * boot_stride;
         uint32_t x;
         const uint8_t shade =
-            (uint8_t)(((uint64_t)y * 24U) / runtime->output_height);
-        for (x = 0U; x < runtime->output_width; x++) {
+            (uint8_t)(((uint64_t)y * 24U) / boot_height);
+        for (x = 0U; x < boot_width; x++) {
             uint8_t *pixel = row + (size_t)x * 4U;
             pixel[0] = (uint8_t)(38U + shade);
             pixel[1] = (uint8_t)(24U + shade / 2U);
             pixel[2] = (uint8_t)(12U + shade / 3U);
             pixel[3] = UINT8_MAX;
-            if (x >= runtime->output_width * 3U / 8U &&
-                x < runtime->output_width * 5U / 8U &&
-                y >= runtime->output_height * 31U / 64U &&
-                y < runtime->output_height * 33U / 64U) {
+            if (x >= boot_width * 3U / 8U &&
+                x < boot_width * 5U / 8U &&
+                y >= boot_height * 31U / 64U &&
+                y < boot_height * 33U / 64U) {
                 pixel[0] = 245U;
                 pixel[1] = 176U;
                 pixel[2] = 56U;
@@ -955,12 +955,10 @@ int rustos_gpu_runtime_render_bootstrap(struct rustos_gpu_runtime *runtime,
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, runtime->source_texture);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH,
-                  (GLint)(runtime->atlas_stride_bytes / 4U));
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)runtime->atlas_width,
-                    (GLsizei)runtime->atlas_height, GL_BGRA_EXT,
-                    GL_UNSIGNED_BYTE, pixels);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)boot_width,
+                    (GLsizei)boot_height, GL_BGRA_EXT,
+                    GL_UNSIGNED_BYTE, pixels);
     free(pixels);
     pixels = NULL;
     runtime->stage = "gpu-prime-textured-draw";
@@ -974,8 +972,8 @@ int rustos_gpu_runtime_render_bootstrap(struct rustos_gpu_runtime *runtime,
     glUniform4f(runtime->transform_uniform, 0.0F, 0.0F, 0.0F, 0.0F);
     glUniform1f(runtime->perspective_uniform, 0.0F);
     glUniform4f(runtime->uv_rect_uniform, 0.0F, 0.0F,
-                (GLfloat)runtime->output_width / (GLfloat)runtime->atlas_width,
-                (GLfloat)runtime->output_height / (GLfloat)runtime->atlas_height);
+                (GLfloat)boot_width / (GLfloat)runtime->atlas_width,
+                (GLfloat)boot_height / (GLfloat)runtime->atlas_height);
     glUniform1i(runtime->use_texture_uniform, 1);
     glDisable(GL_BLEND);
     glClearColor(0.0F, 0.0F, 0.0F, 1.0F);
@@ -1079,7 +1077,8 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
         header.budget_us < RUSTOS_GPU_COLD_RENDER_BUDGET_US)
         header.budget_us = RUSTOS_GPU_COLD_RENDER_BUDGET_US;
     frame->budget_us = header.budget_us;
-    if (gpu_deadline_after(operation_started_ns, (uint64_t)header.budget_us * 1000ULL,
+    if (gpu_deadline_after(operation_started_ns,
+                           (uint64_t)RUSTOS_GPU_COLD_RENDER_BUDGET_US * 1000ULL,
                            &frame->render_deadline_ns) != 0 ||
         gpu_deadline_after(frame->render_deadline_ns, 100000000ULL,
                            &frame->operation_deadline_ns) != 0 ||
@@ -1109,13 +1108,27 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
         glPixelStorei(GL_UNPACK_ROW_LENGTH,
                       (GLint)(runtime->atlas_stride_bytes / 4U));
         for (index = 0U; index < damage_count; index++) {
-            const uint8_t *pixels = atlas_pixels +
-                (size_t)damage[index].y * runtime->atlas_stride_bytes +
-                (size_t)damage[index].x * 4U;
-            glTexSubImage2D(GL_TEXTURE_2D, 0, (GLint)damage[index].x,
-                            (GLint)damage[index].y, (GLsizei)damage[index].width,
-                            (GLsizei)damage[index].height, GL_BGRA_EXT,
-                            GL_UNSIGNED_BYTE, pixels);
+            uint32_t row_offset = 0U;
+            while (row_offset < damage[index].height) {
+                uint32_t strip_height = damage[index].height - row_offset;
+                const uint8_t *pixels;
+                if (strip_height > 256U)
+                    strip_height = 256U;
+                pixels = atlas_pixels +
+                    (size_t)(damage[index].y + row_offset) * runtime->atlas_stride_bytes +
+                    (size_t)damage[index].x * 4U;
+                glTexSubImage2D(GL_TEXTURE_2D, 0, (GLint)damage[index].x,
+                                (GLint)(damage[index].y + row_offset),
+                                (GLsizei)damage[index].width,
+                                (GLsizei)strip_height, GL_BGRA_EXT,
+                                GL_UNSIGNED_BYTE, pixels);
+                row_offset += strip_height;
+                if (row_offset < damage[index].height) {
+                    const struct timespec rttime_yield = {.tv_sec = 0, .tv_nsec = 1000};
+                    glFlush();
+                    (void)nanosleep(&rttime_yield, NULL);
+                }
+            }
         }
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     }
@@ -1145,9 +1158,20 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
     runtime->last_content_epoch = source.content_epoch;
     runtime->stage = "gpu-batch-render-clock";
     if (monotonic_ns(&frame->render_started_ns) != 0 ||
+        gpu_deadline_after(frame->render_started_ns, (uint64_t)header.budget_us * 1000ULL,
+                           &frame->render_deadline_ns) != 0 ||
+        gpu_deadline_after(frame->render_deadline_ns, 100000000ULL,
+                           &frame->operation_deadline_ns) != 0 ||
         gpu_deadline_remaining(frame->render_started_ns, frame->render_deadline_ns,
                                &remaining_ns) != 0)
         return -1;
+    {
+        uint64_t armed = atomic_load_explicit(watchdog_deadline_ns, memory_order_acquire);
+        while (armed != 0U && frame->operation_deadline_ns < armed &&
+               !atomic_compare_exchange_weak(watchdog_deadline_ns, &armed,
+                                             frame->operation_deadline_ns))
+            ;
+    }
     runtime->stage = "gpu-batch-command-draw";
     glUseProgram(runtime->program);
     glBindVertexArray(runtime->vertex_array);

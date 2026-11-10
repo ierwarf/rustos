@@ -32,6 +32,7 @@
 #include <unistd.h>
 
 #include <drm_fourcc.h>
+#include <linux/sync_file.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
@@ -804,7 +805,14 @@ static int open_uio_interrupt(struct shared_display *shared) {
     return -1;
 }
 
+static const uint8_t *gpu_pixel_pointer(const struct shared_display *shared,
+                                        uint64_t absolute_offset, uint64_t bytes);
+
 static int map_gpu_pixel_pool(struct shared_display *shared) {
+    const volatile uint8_t *cursor;
+    uint64_t command_bytes;
+    uint64_t atlas_bytes;
+    uint64_t offset;
     if (shared == NULL || shared->uio_fd < 0 || shared->pixel_bytes == 0U) {
         errno = EINVAL;
         return -1;
@@ -814,6 +822,20 @@ static int map_gpu_pixel_pool(struct shared_display *shared) {
     if (shared->pixels == MAP_FAILED) {
         shared->pixels = NULL;
         return -1;
+    }
+    /* Populate host EPT and backing pages for all command and atlas slots
+     * before entering SCHED_RR/RLIMIT_RTTIME or arming per-frame deadlines. */
+    command_bytes = (uint64_t)GPU_ATLAS_SLOT_COUNT * GPU_ATLAS_COMMAND_SLOT_BYTES;
+    cursor = gpu_pixel_pointer(shared, shared->atlas.command_offset, command_bytes);
+    if (cursor != NULL) {
+        for (offset = 0U; offset < command_bytes; offset += 4096U)
+            (void)cursor[offset];
+    }
+    atlas_bytes = (uint64_t)GPU_ATLAS_SLOT_COUNT * shared->atlas.atlas_slot_bytes;
+    cursor = gpu_pixel_pointer(shared, shared->atlas.atlas_offset, atlas_bytes);
+    if (cursor != NULL) {
+        for (offset = 0U; offset < atlas_bytes; offset += 4096U)
+            (void)cursor[offset];
     }
     return 0;
 }
@@ -1741,6 +1763,35 @@ static int atomic_gpu_initial_modeset(struct kms_display *display,
     return 0;
 }
 
+static int read_sync_fence_completed_ns(int fence_fd, uint64_t started_ns,
+                                        uint64_t *completed_ns) {
+    struct sync_fence_info fence_info[4];
+    struct sync_file_info file_info;
+    uint64_t now_ns = 0U;
+    if (monotonic_time_ns(&now_ns) != 0)
+        return -1;
+    memset(&fence_info, 0, sizeof(fence_info));
+    memset(&file_info, 0, sizeof(file_info));
+    file_info.num_fences = 4U;
+    file_info.sync_fence_info = (uint64_t)(uintptr_t)&fence_info[0];
+    if (ioctl(fence_fd, SYNC_IOC_FILE_INFO, &file_info) == 0 &&
+        file_info.status == 1 && file_info.num_fences > 0U &&
+        file_info.num_fences <= 4U) {
+        uint64_t max_ts = 0U;
+        uint32_t i;
+        for (i = 0U; i < file_info.num_fences; i++) {
+            if (fence_info[i].status == 1 && fence_info[i].timestamp_ns > max_ts)
+                max_ts = fence_info[i].timestamp_ns;
+        }
+        if (max_ts > 0U && max_ts <= now_ns) {
+            *completed_ns = max_ts > started_ns ? max_ts : started_ns + 1U;
+            return 0;
+        }
+    }
+    *completed_ns = now_ns;
+    return 0;
+}
+
 static int atomic_gpu_page_flip(struct kms_display *display,
                                 struct rustos_gpu_runtime *runtime,
                                 struct rustos_gpu_frame *frame,
@@ -1813,25 +1864,22 @@ static int atomic_gpu_page_flip(struct kms_display *display,
     display->setup_stage = "gpu-frame-present-fences";
     while (!wait.page_flip_complete || !out_complete || !render_complete) {
         uint64_t now_ns;
-        uint64_t remaining_ns;
+        uint64_t active_deadline_ns;
         int timeout_ms;
         if (monotonic_time_ns(&now_ns) != 0) {
             result = -1;
             goto fail_fences;
         }
-        if (now_ns >= deadline_ns) {
-            result = 0;
-            goto fail_fences;
+        active_deadline_ns = render_complete ? deadline_ns :
+            gpu_deadline_min(deadline_ns, frame->render_deadline_ns);
+        if (now_ns >= active_deadline_ns) {
+            timeout_ms = 0;
+        } else {
+            uint64_t remaining_ns = active_deadline_ns - now_ns;
+            timeout_ms = (int)((remaining_ns + 999999ULL) / 1000000ULL);
+            if (timeout_ms <= 0)
+                timeout_ms = 1;
         }
-        if (!render_complete && now_ns >= frame->render_deadline_ns) {
-            result = 0;
-            goto fail_fences;
-        }
-        remaining_ns = (render_complete ? deadline_ns :
-            gpu_deadline_min(deadline_ns, frame->render_deadline_ns)) - now_ns;
-        timeout_ms = (int)((remaining_ns + 999999ULL) / 1000000ULL);
-        if (timeout_ms <= 0)
-            timeout_ms = 1;
         pollfds[0].fd = display->fd;
         pollfds[0].events = wait.page_flip_complete ? 0 : POLLIN;
         pollfds[0].revents = 0;
@@ -1852,15 +1900,6 @@ static int atomic_gpu_page_flip(struct kms_display *display,
                 errno = EIO;
             goto fail_fences;
         }
-        if (monotonic_time_ns(&now_ns) != 0) {
-            result = -1;
-            goto fail_fences;
-        }
-        if (now_ns >= deadline_ns ||
-            (!render_complete && now_ns >= frame->render_deadline_ns)) {
-            result = 0;
-            goto fail_fences;
-        }
         if ((pollfds[0].revents & POLLIN) != 0 && drmHandleEvent(display->fd, &event) != 0) {
             result = -1;
             goto fail_fences;
@@ -1868,7 +1907,9 @@ static int atomic_gpu_page_flip(struct kms_display *display,
         if ((pollfds[1].revents & POLLIN) != 0)
             out_complete = 1;
         if ((pollfds[2].revents & POLLIN) != 0) {
-            if (monotonic_time_ns(&render_completed_ns) != 0) {
+            if (read_sync_fence_completed_ns(frame->in_fence_fd,
+                                             frame->render_started_ns,
+                                             &render_completed_ns) != 0) {
                 result = -1;
                 goto fail_fences;
             }

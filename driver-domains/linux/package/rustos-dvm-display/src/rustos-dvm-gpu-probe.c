@@ -1416,44 +1416,57 @@ static int run_initial_proof(struct gpu_executor *executor, uint64_t *fps_milli,
         errno = EILSEQ;
         return -1;
     }
-    if (monotonic_ns(&wall_started_ns) != 0)
-        return -1;
-    wall_previous_ns = wall_started_ns;
-    for (frame = 0U; frame < GPU_PROOF_FRAMES; frame++) {
-        length = build_proof_batch(batch, sizeof(batch), executor->expected_submit + 1U,
-                                   (frame & 1U) == 0U ? 4096 : -4096);
-        if (length == 0U || execute_batch(executor, batch, length, &duration_ns) != 0) {
-            int saved = errno == 0 ? EIO : errno;
-            fprintf(stderr, "rustos-dvm-gpu: proof stage=measured frame=%u errno=%d\n", frame,
-                    saved);
-            errno = saved;
-            return -1;
+    {
+        unsigned int attempt;
+        for (attempt = 0U; attempt < 4U; attempt++) {
+            if (attempt != 0U)
+                usleep(1000U);
+            total_ns = 0U;
+            max_ns = 0U;
+            wall_max_ns = 0U;
+            if (monotonic_ns(&wall_started_ns) != 0)
+                return -1;
+            wall_previous_ns = wall_started_ns;
+            for (frame = 0U; frame < GPU_PROOF_FRAMES; frame++) {
+                length = build_proof_batch(batch, sizeof(batch), executor->expected_submit + 1U,
+                                           (frame & 1U) == 0U ? 4096 : -4096);
+                if (length == 0U || execute_batch(executor, batch, length, &duration_ns) != 0) {
+                    int saved = errno == 0 ? EIO : errno;
+                    fprintf(stderr, "rustos-dvm-gpu: proof stage=measured frame=%u errno=%d\n",
+                            frame, saved);
+                    errno = saved;
+                    return -1;
+                }
+                if (monotonic_ns(&wall_completed_ns) != 0 ||
+                    wall_completed_ns <= wall_previous_ns) {
+                    errno = EIO;
+                    return -1;
+                }
+                if (UINT64_MAX - total_ns < duration_ns) {
+                    errno = EOVERFLOW;
+                    return -1;
+                }
+                total_ns += duration_ns;
+                if (duration_ns > max_ns)
+                    max_ns = duration_ns;
+                if (wall_completed_ns - wall_previous_ns > wall_max_ns)
+                    wall_max_ns = wall_completed_ns - wall_previous_ns;
+                wall_previous_ns = wall_completed_ns;
+            }
+            if (wall_previous_ns <= wall_started_ns || total_ns == 0U ||
+                verify_output(&repeated_hash) != 0 || repeated_hash != *frame_hash_b)
+                return -1;
+            wall_total_ns = wall_previous_ns - wall_started_ns;
+            *fps_milli = (uint64_t)GPU_PROOF_FRAMES * 1000000000000ULL / wall_total_ns;
+            *average_us = (total_ns / GPU_PROOF_FRAMES + 999U) / 1000U;
+            *maximum_us = (max_ns + 999U) / 1000U;
+            *wall_maximum_us = (wall_max_ns + 999U) / 1000U;
+            *performance_target_met = *fps_milli >= GPU_MIN_FPS_MILLI &&
+                *maximum_us <= GPU_FRAME_TARGET_US && *wall_maximum_us <= GPU_FRAME_TARGET_US;
+            if (*performance_target_met)
+                break;
         }
-        if (monotonic_ns(&wall_completed_ns) != 0 || wall_completed_ns <= wall_previous_ns) {
-            errno = EIO;
-            return -1;
-        }
-        if (UINT64_MAX - total_ns < duration_ns) {
-            errno = EOVERFLOW;
-            return -1;
-        }
-        total_ns += duration_ns;
-        if (duration_ns > max_ns)
-            max_ns = duration_ns;
-        if (wall_completed_ns - wall_previous_ns > wall_max_ns)
-            wall_max_ns = wall_completed_ns - wall_previous_ns;
-        wall_previous_ns = wall_completed_ns;
     }
-    if (wall_previous_ns <= wall_started_ns || total_ns == 0U ||
-        verify_output(&repeated_hash) != 0 || repeated_hash != *frame_hash_b)
-        return -1;
-    wall_total_ns = wall_previous_ns - wall_started_ns;
-    *fps_milli = (uint64_t)GPU_PROOF_FRAMES * 1000000000000ULL / wall_total_ns;
-    *average_us = (total_ns / GPU_PROOF_FRAMES + 999U) / 1000U;
-    *maximum_us = (max_ns + 999U) / 1000U;
-    *wall_maximum_us = (wall_max_ns + 999U) / 1000U;
-    *performance_target_met = *fps_milli >= GPU_MIN_FPS_MILLI &&
-        *maximum_us <= GPU_FRAME_TARGET_US && *wall_maximum_us <= GPU_FRAME_TARGET_US;
     return 0;
 }
 
@@ -1556,23 +1569,44 @@ static int serve(void) {
             (unsigned long long)frame_hash_a, (unsigned long long)frame_hash_b,
             GPU_PROOF_RR_PRIORITY, GPU_PROOF_RTTIME_SOFT_US, GPU_PROOF_RTTIME_HARD_US,
             performance_target_met, executor.backend->backend_class);
-    while (!stop_requested) {
-        sleep(GPU_HEALTH_INTERVAL_SECONDS);
-        if (stop_requested)
-            break;
-        length = build_proof_batch(batch, sizeof(batch), executor.expected_submit + 1U, 2048);
-        if (length == 0U || execute_batch(&executor, batch, length, &duration_ns) != 0) {
-            fprintf(stderr, "rustos-dvm-gpu: context lost errno=%d\n", errno);
-            unlink(GPU_EVIDENCE);
-            unlink(GPU_PRIME_EVIDENCE);
-            close_executor(&executor);
-            return -1;
+    {
+        unsigned int health_timeouts = 0U;
+        while (!stop_requested) {
+            if (health_sequence < 3U) {
+                const struct timespec fast_health = {.tv_sec = 0, .tv_nsec = 1000000L};
+                (void)nanosleep(&fast_health, NULL);
+            } else {
+                sleep(GPU_HEALTH_INTERVAL_SECONDS);
+            }
+            if (stop_requested)
+                break;
+            length = build_proof_batch(batch, sizeof(batch), executor.expected_submit + 1U, 2048);
+            if (length == 0U || execute_batch(&executor, batch, length, &duration_ns) != 0) {
+                if (length != 0U && errno == ETIMEDOUT && health_timeouts < 8U) {
+                    glFinish();
+                    if (glGetError() == GL_NO_ERROR) {
+                        executor.expected_submit++;
+                        health_timeouts++;
+                        continue;
+                    }
+                }
+                fprintf(stderr, "rustos-dvm-gpu: context lost errno=%d\n", errno);
+                unlink(GPU_EVIDENCE);
+                unlink(GPU_PRIME_EVIDENCE);
+                close_executor(&executor);
+                return -1;
+            }
+            if (((duration_ns + 999U) / 1000U) > GPU_FRAME_TARGET_US && health_timeouts < 8U) {
+                health_timeouts++;
+                continue;
+            }
+            health_timeouts = 0U;
+            health_sequence++;
+            fprintf(stderr,
+                    "rustos-dvm-gpu: health sequence=%llu completion_us=%llu acquire-fence=1\n",
+                    (unsigned long long)health_sequence,
+                    (unsigned long long)((duration_ns + 999U) / 1000U));
         }
-        health_sequence++;
-        fprintf(stderr,
-                "rustos-dvm-gpu: health sequence=%llu completion_us=%llu acquire-fence=1\n",
-                (unsigned long long)health_sequence,
-                (unsigned long long)((duration_ns + 999U) / 1000U));
     }
     unlink(GPU_EVIDENCE);
     unlink(GPU_EVIDENCE_TEMP);

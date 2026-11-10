@@ -196,6 +196,13 @@ static void relay_log(const char *format, ...)
             bytes = sizeof(message) - 1U;
         while (write(STDERR_FILENO, message, bytes) < 0 && errno == EINTR)
             ;
+        if (strncmp(message, "rustos-dvm-block: ready ", 24U) == 0) {
+            int kmsg_fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+            if (kmsg_fd >= 0) {
+                (void)write(kmsg_fd, message, bytes);
+                close(kmsg_fd);
+            }
+        }
     }
     errno = saved_errno;
 }
@@ -1549,24 +1556,39 @@ static int serve(void)
     close(events[0]);
     watchdog_worker = true;
     state.watchdog_fd = events[1];
-    for (;;) {
-        uint32_t event_count;
-        ssize_t count;
+    {
+        bool ready_confirmed = false;
+        for (;;) {
+            uint32_t event_count;
+            ssize_t count;
 
-        if (stop_requested)
-            break;
-        if (drain_requests(&state) != 0)
-            goto out;
-        do {
-            count = read(state.transport.uio_fd, &event_count,
-                         sizeof(event_count));
-        } while (count < 0 && errno == EINTR && !stop_requested);
-        if (stop_requested)
-            break;
-        if (count != (ssize_t)sizeof(event_count) || event_count == 0U) {
-            if (count >= 0)
-                errno = EIO;
-            goto out;
+            if (stop_requested)
+                break;
+            if (drain_requests(&state) != 0)
+                goto out;
+            if (!ready_confirmed && state.last_request_id != 0U) {
+                ready_confirmed = true;
+                relay_log(
+                    "rustos-dvm-block: ready abi=2 generation=%" PRIu64
+                    " controller=%s device=%s sectors=%" PRIu64
+                    " logical=%u physical=%u features=0x%" PRIx64
+                    " event=ivshmem-msix-uio\n",
+                    state.header.generation, state.device.controller_driver,
+                    state.device.name, state.device.capacity_sectors,
+                    state.device.logical_block_size,
+                    state.device.physical_block_size, state.header.features);
+            }
+            do {
+                count = read(state.transport.uio_fd, &event_count,
+                             sizeof(event_count));
+            } while (count < 0 && errno == EINTR && !stop_requested);
+            if (stop_requested)
+                break;
+            if (count != (ssize_t)sizeof(event_count) || event_count == 0U) {
+                if (count >= 0)
+                    errno = EIO;
+                goto out;
+            }
         }
     }
     result = 0;

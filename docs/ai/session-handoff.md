@@ -4,6 +4,39 @@ Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
 
+## 4-way parallel 4-vCPU 100-run KVM normalization (2026-11-11, local; verified)
+
+Starting `d9993b6f`:
+
+- **DVM GPU bootstrap & staged-copy deadline/RTTIME handling (`driver-domains/linux/package/rustos-dvm-display/src/{rustos-dvm-gpu-runtime.c,rustos-dvm-display.c,rustos-dvm-gpu-probe.c}`):**
+  - Sized the private bootstrap lifecycle texture upload in
+    `rustos_gpu_runtime_render_bootstrap` to `64 x 64` stretched with
+    `GL_NEAREST`, reducing 4-way parallel `prime_us` from `~500 ms` to
+    `~30..90 ms`.
+  - Pre-faulted all 3 command and 3 atlas slots in `map_gpu_pixel_pool` before
+    entering `SCHED_RR`/`RLIMIT_RTTIME`, and chunked large staged
+    `glTexSubImage2D` uploads into 256-row strips with `glFlush()` + 1 us
+    blocking `nanosleep` so full-atlas uploads under 4-way parallel KVM load
+    never exceed the 50 ms `RLIMIT_RTTIME` soft limit (`SIGXCPU`).
+  - Separated pre-render staged upload deadline (`RUSTOS_GPU_COLD_RENDER_BUDGET_US`)
+    from the post-acquire render deadline (`frame->render_started_ns +
+    header.budget_us * 1000ULL`), harvested ready `pollfds` in
+    `atomic_gpu_page_flip` before checking deadline expiration, and read the
+    kernel's `SYNC_IOC_FILE_INFO` fence completion timestamp when available.
+  - Completed the initial 3 `rustos-dvm-gpu` health checks immediately after
+    the 120-frame proof and added bounded retry on `SCHED_OTHER` preemption
+    timeouts in the background health loop and initial proof.
+- **DVM block readiness marker serialization (`driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c`):**
+  Mirrored `rustos-dvm-block: ready abi=2 generation=...` to `/dev/kmsg` and
+  re-confirmed on the first served request so concurrent kernel `printk` output
+  on `ttyS0` cannot split the readiness marker mid-line.
+- **Verified:** `bash formal/run-dvm-timeout-tests.sh`,
+  `make -C driver-domains/linux build`, `cargo xtask verify-dvm`,
+  `python3 formal/check-rust-source-contracts.py`,
+  `python3 formal/check-dispatch-source-contracts.py`, `cargo xtask check`,
+  `cargo test -p xtask` (298 passed), and 100 runs of 4-vCPU `kvm-smoke`
+  executed 4 in parallel (`4 lanes x --repeat 25` -> `100/100 passed`).
+
 ## KVM runtime & DVM normalization (2026-11-11, local; verified)
 
 Starting `7cbe0711`:
