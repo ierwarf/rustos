@@ -955,7 +955,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        handle_ready, launch_may_precede_ui_ready, launch_retry_backoff, read_request_progress,
+        bind_listener, dispatch_request, handle_ready, launch_may_precede_ui_ready,
+        launch_retry_backoff, read_request_progress,
         runtime_request_role_authorized, PendingRuntimeClient, RequestReadProgress,
         AcceptedClient, RuntimeConnections, RuntimePeerCredentials, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH,
         OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS, OP_WATCH_RUNNING_PROGRAMS,

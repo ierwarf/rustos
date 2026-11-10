@@ -11,6 +11,8 @@
 //! - **Failure:** Malformed dequeued requests receive `EINVAL`; a pre-commit
 //!   failure retries only the still-live reply through the standalone path,
 //!   while a tagged post-commit failure enters a fresh receive with bounded logs.
+//!   Failed receives back off instead of spinning; invalid endpoint/syscall
+//!   errors terminate the incarnation so its supervisor can restart it.
 //! - **Forbidden:** No identity-blind receive, abandoned caller, handle-bearing
 //!   fused path, queue lock across IPC, or retry of a completed reply.
 //! - **Evidence:** `ipc-reply-recv-transaction/IpcReplyRecvTransaction`, the
@@ -63,6 +65,15 @@ pub(super) fn serve(endpoint: u64) {
     );
     loop {
         if received < 0 {
+            let errno = received.checked_neg().unwrap_or(i64::MAX);
+            REPLY_FAILURE_DIAGNOSTICS.record("inputd", "ipc-recv", errno);
+            if receive_failure_is_terminal(errno) {
+                debug_line(&format!("inputd: fatal receive endpoint errno={errno}"));
+                std::process::exit(134);
+            }
+            // An unexpected transient refusal (e.g. EAGAIN/EINTR) must not
+            // busy-loop at input priority and starve netd or the DVM worker.
+            thread::sleep(Duration::from_millis(10));
             received = recv_input_request(
                 endpoint,
                 &mut request_buf,
@@ -230,6 +241,13 @@ pub(super) fn serve(endpoint: u64) {
     }
 }
 
+/// These failures cannot be repaired by retrying the same live endpoint.
+fn receive_failure_is_terminal(errno: i64) -> bool {
+    matches!(errno, e if e == i64::from(libc::EBADF)
+        || e == i64::from(libc::EINVAL)
+        || e == i64::from(libc::ENOSYS))
+}
+
 fn malformed_input_response() -> InputdIpcResponse {
     InputdIpcResponse {
         version: INPUTD_IPC_ABI_VERSION,
@@ -359,6 +377,15 @@ fn commercial_response(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_receive_endpoint_is_terminal_but_transient_refusal_is_not() {
+        assert!(super::receive_failure_is_terminal(i64::from(libc::EBADF)));
+        assert!(super::receive_failure_is_terminal(i64::from(libc::EINVAL)));
+        assert!(super::receive_failure_is_terminal(i64::from(libc::ENOSYS)));
+        assert!(!super::receive_failure_is_terminal(i64::from(libc::EAGAIN)));
+        assert!(!super::receive_failure_is_terminal(i64::from(libc::EINTR)));
+    }
+
     use super::*;
 
     #[test]

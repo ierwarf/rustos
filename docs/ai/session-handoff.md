@@ -4,6 +4,28 @@ Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
 
+## Bounded source hardening pass (2026-11-10, post-7b817e9e)
+
+This pass intentionally stops after one small batch; it reviewed the Ring0
+scheduler custody and IPC terminal paths alongside Ring3 input/net/runtime
+service loops, without claiming to exhaust the entire codebase.
+
+- Ring0 Linux-compat IPC service-endpoint wait: when an endpoint is visible but
+  the process grant repeatedly loses an epoch race (`EAGAIN`), the old
+  unconditional `continue` skipped the only timeout and exit checks. Those
+  checks now guard every loop iteration, and grant races yield instead of
+  spinning indefinitely. A source-level regression pins their ordering.
+- Ring3 inputd: a failed ordinary receive previously immediately retried
+  with no delay. Transient failures now back off and report bounded diagnostics;
+  invalid endpoint/syscall failures fail closed so the supervisor can restart
+  the service instead of accepting health while making no IPC progress.
+- Ring3 runtimed: restore missing test-module imports for
+  `bind_listener` and `dispatch_request`, introduced by prior regression
+  tests. These were an independent native-test compilation blocker.
+
+Not run: Rust compilation, native tests, formal profile, mutation or KVM.
+Do not treat this source-only change as proof of 4-vCPU smoke stability.
+
 ## Follow-up static hardening (2026-11-10, GitHub source only)
 
 Starting GitHub master: `b823ebcd`. This pass crosses Ring0 scheduler/IPC,

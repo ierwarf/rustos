@@ -1190,6 +1190,20 @@ pub(super) fn syscall_linux_rustos_ipc_wait_service_endpoint(args_ptr: u64) -> u
     let deadline_tick = crate::arch::rtc::ticks().saturating_add(timeout_ticks);
 
     loop {
+        // This deadline must enclose the successful-registry / failed-grant
+        // retry as well as the ordinary wait path. A live endpoint whose grant
+        // repeatedly races revocation otherwise loops forever on EAGAIN,
+        // without reaching the timeout check further below.
+        if multitask::is_user_process_exiting(args.expected_pid) {
+            remove_service_endpoint_waiter(task_id);
+            crate::arch::rtc::disarm_sleep_waiter(task_id);
+            return linux_errno(LINUX_ESRCH);
+        }
+        if crate::arch::rtc::ticks() >= deadline_tick {
+            remove_service_endpoint_waiter(task_id);
+            crate::arch::rtc::disarm_sleep_waiter(task_id);
+            return linux_errno(LINUX_ETIMEDOUT);
+        }
         match service_endpoint_for_expected_process(args.service_id, args.expected_pid) {
             Ok(Some(endpoint)) => {
                 let endpoint = match grant_current_process_service_call(
@@ -1198,7 +1212,12 @@ pub(super) fn syscall_linux_rustos_ipc_wait_service_endpoint(args_ptr: u64) -> u
                     Some(args.expected_pid),
                 ) {
                     Ok(endpoint) => endpoint,
-                    Err(LINUX_EAGAIN) => continue,
+                    Err(LINUX_EAGAIN) => {
+                        // A generation change is not a busy-loop exemption:
+                        // let the publishing CPU finish its registry transaction.
+                        multitask::yield_now();
+                        continue;
+                    },
                     Err(errno) => return linux_errno(errno),
                 };
                 remove_service_endpoint_waiter(task_id);

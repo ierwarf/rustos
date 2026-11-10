@@ -194,6 +194,36 @@ fn cached_service_call_grant_is_exact_process_and_epoch() {
 }
 
 #[test]
+fn service_endpoint_wait_budget_encloses_grant_race_retries() {
+    // Source-level guard against a control-flow regression: the wait syscall
+    // must check the absolute deadline *before* a successful endpoint lookup
+    // can repeatedly fail its process-grant publication with EAGAIN.
+    let source = include_str!("../ipc_ops.rs");
+    let wait = source
+        .split_once("pub(super) fn syscall_linux_rustos_ipc_wait_service_endpoint(")
+        .expect("service endpoint waiter")
+        .1
+        .split_once("\nfn service_endpoint_for_expected_process(")
+        .expect("waiter boundary")
+        .0;
+    let loop_body = wait.split_once("    loop {").expect("wait retry loop").1;
+    let deadline = loop_body
+        .find("if crate::arch::rtc::ticks() >= deadline_tick")
+        .expect("deadline on each retry");
+    let grant = loop_body
+        .find("grant_current_process_service_call(")
+        .expect("raced endpoint grant");
+    let retry_yield = loop_body
+        .find("Err(LINUX_EAGAIN) => {")
+        .expect("bounded grant retry");
+    assert!(deadline < grant && grant < retry_yield);
+    assert!(
+        loop_body[retry_yield..].contains("multitask::yield_now();"),
+        "the grant race must yield, not spin with a live endpoint"
+    );
+}
+
+#[test]
 fn inputd_owner_exit_withdraws_the_separate_ring_policy_lease() {
     assert!(service_exit_requires_input_policy_withdrawal(
         linux_abi::IPC_SERVICE_INPUTD
