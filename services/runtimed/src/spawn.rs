@@ -199,13 +199,50 @@ pub(super) fn begin_tracked_launch(state: &mut BrokerState, entry: LaunchEntry) 
 /// blocks after creating the suspended child and does not activate it until
 /// this function has answered. Running the launch off the loop changed where
 /// the blocking calls happen, not that ordering.
+const LAUNCH_WORKER_RETRY_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Workers are an optimization of the blocking boundary, not an ephemeral
+/// startup resource. A transient EAGAIN at boot must not permanently disable
+/// every desktop launch; a disconnected result channel must not strand the
+/// recorded suspended child and the sole launch-in-flight slot.
 pub(super) fn service_launch_worker(state: &mut BrokerState) -> bool {
     let mut applied = false;
+    if state.launch_worker.is_none() {
+        if state.launch_worker_retry_at.is_none_or(|due| Instant::now() >= due) {
+            state.launch_worker_retry_at = Some(Instant::now() + LAUNCH_WORKER_RETRY_BACKOFF);
+            state.launch_worker = crate::launch_worker::start(launch_calls());
+            if state.launch_worker.is_some() {
+                debug_line("runtimed: launch worker recovered");
+                applied = true;
+            }
+        }
+        if state.launch_worker.is_none() {
+            return applied;
+        }
+    }
     loop {
         let Some(worker) = state.launch_worker.as_ref() else {
             return applied;
         };
         let Some(progress) = worker.poll() else {
+            if worker.disconnected() {
+                // All queued progress records are drained before try_recv can
+                // report Disconnected. A recorded child that has no terminal
+                // outcome must be retired before its session charge is refunded
+                // and its launch slot is made available for a new attempt.
+                let recorded = state.launch_in_flight.as_ref().and_then(|flight| flight.recorded_pid);
+                state.launch_worker = None;
+                state.launch_worker_retry_at =
+                    Some(Instant::now() + LAUNCH_WORKER_RETRY_BACKOFF);
+                debug_line("runtimed: launch worker disconnected; retiring in-flight launch");
+                if let Some(pid) = recorded {
+                    retire_failed_spawn_or_abort(pid, "launch-worker-disconnected");
+                }
+                if state.launch_in_flight.is_some() {
+                    finish_tracked_launch(state, recorded, Err(libc::EPIPE));
+                }
+                return true;
+            }
             return applied;
         };
         applied = true;
@@ -794,9 +831,23 @@ pub(super) fn reap_children(state: &mut BrokerState) -> bool {
     let exited = match state.child_reaper.as_ref() {
         Some(reaper) => {
             let answer = reaper.poll();
-            let due = state.reap_due.is_none_or(|due| Instant::now() >= due);
-            if due && !reaper.busy() && !state.running.is_empty() && reaper.request() {
-                state.reap_due = Some(Instant::now() + REAP_INTERVAL);
+            if reaper.disconnected() {
+                // The old result channel is permanently closed. Treating
+                // Disconnected like an empty poll used to leave outstanding
+                // stuck and skip every future wait4, leaking exited clients
+                // and the Job/session charges bound to their PIDs. Start a
+                // fresh reaper; a failed thread start takes the existing
+                // synchronous fallback on the next pass.
+                debug_line("runtimed: child reaper worker disconnected; recreating");
+                state.child_reaper = super::offload::Offload::start(
+                    "runtimed-reap",
+                    collect_exited_children,
+                );
+            } else {
+                let due = state.reap_due.is_none_or(|due| Instant::now() >= due);
+                if due && !reaper.busy() && !state.running.is_empty() && reaper.request() {
+                    state.reap_due = Some(Instant::now() + REAP_INTERVAL);
+                }
             }
             answer.unwrap_or_default()
         }

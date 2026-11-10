@@ -155,9 +155,11 @@ pub(crate) struct BrokerState {
     /// The thread that performs a launch's blocking service calls, and the one
     /// launch it currently has in flight.
     ///
-    /// Absent only when the thread could not be created, in which case launches
-    /// run inline again - slowly, but not never.
+    /// Absent after thread-creation failure or a terminal worker exit.
+    /// The supervisor retries creation on a bounded backoff; it never performs
+    /// worker-owned blocking launches inline on the console receiver.
     pub(crate) launch_worker: Option<launch_worker::LaunchWorker>,
+    pub(crate) launch_worker_retry_at: Option<Instant>,
     pub(crate) launch_in_flight: Option<spawn::InFlightLaunch>,
     /// The private qualification contract read, which reaches DVM-volume
     /// storage and took 104 ms on the loop.
@@ -205,6 +207,7 @@ impl Default for BrokerState {
             qualification_catalog_last_error: None,
             qualification_catalog_failures: 0,
             launch_worker: launch_worker::start(spawn::launch_calls()),
+            launch_worker_retry_at: None,
             launch_in_flight: None,
             launch_catalog_load: offload::Offload::start(
                 "runtimed-launch-catalog",

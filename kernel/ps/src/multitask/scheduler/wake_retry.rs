@@ -52,13 +52,34 @@ impl Queue {
         Self { tokens: [None; MAX_TASK], len: 0 }
     }
 
-    /// One token per task: a newer refusal replaces the older observation.
-    fn insert(&mut self, token: Token) -> bool {
+    /// One token per task, but ordering is by the *wait epoch*, not by the
+    /// time a producer finally acquired this CPU's retry queue. A producer
+    /// can capture an old epoch, lose a race to a new refused wake, and only
+    /// then enqueue its stale observation. Never replace the newer token.
+    ///
+    /// Repeated refusals of the same epoch also retain the original expiry
+    /// (including the u64::MAX "already reported" sentinel), so an active
+    /// producer cannot indefinitely postpone or repeat the prolonged-wait
+    /// diagnostic by refreshing the timer on every retry.
+    fn insert(&mut self, mut token: Token) -> bool {
         if let Some(existing) = self.tokens[..self.len]
             .iter_mut()
             .flatten()
             .find(|existing| existing.task_id == token.task_id)
         {
+            if existing.slot == token.slot {
+                if existing.serial > token.serial {
+                    return true;
+                }
+                if existing.serial == token.serial {
+                    if (existing.kind, existing.id) != (token.kind, token.id) {
+                        // One wait serial has one exact typed identity. A
+                        // stale or torn observation must not replace it.
+                        return true;
+                    }
+                    token.expires_tick = existing.expires_tick;
+                }
+            }
             *existing = token;
             return true;
         }

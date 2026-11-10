@@ -4,6 +4,44 @@ Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
 
+## Continued wake and Ring3 worker-lifecycle audit (2026-11-10)
+
+Starting GitHub master: `7b817e9e`. This is a static GitHub-source
+review, not native execution evidence. The preceding terminal-reply fix is
+preserved.
+
+- Scheduler `wake_retry::Queue::insert`: a refused wake producer can observe
+  an older wait serial and enqueue only after another producer already
+  recorded a newer serial of the same task. Last-writer-wins previously
+  overwrote the newer wake token with the stale one, losing the only retry of
+  the new wait. Retain the highest serial per task/slot. Repeated refusals
+  for one serial preserve its original diagnostic expiry, including the
+  prolonged-report sentinel. Native queue witnesses model both orders.
+- `runtimed::offload`: the worker-result receive path used to conflate
+  `TryRecvError::Disconnected` with `Empty`, leaving `outstanding=true`
+  permanently after a worker exits. Distinguish terminal channel close,
+  clear the busy flag, and prevent further requests to that dead worker.
+  The launch catalog and SMP qualification loaders fall back to their
+  existing synchronous path if their worker is gone; the child reaper
+  recreates its worker (or takes the existing inline fallback on failure).
+  Channel-disconnect witnesses do not depend on thread timing.
+- `runtimed::launch_worker`: a startup thread-creation failure previously
+  meant ordinary catalog launches received `EAGAIN` for the entire service
+  lifetime, because `launch_worker` was constructed once and never retried.
+  The broker now retries creation on a 500 ms backoff. A launch worker whose
+  progress channel closes is no longer treated as merely idle: the broker
+  retires a recorded child, completes its failed transaction/refund, and
+  schedules worker recreation. An unknown child spawned but not yet reported
+  before a worker crash cannot be identified solely through the existing
+  launch channel: independent process-lifecycle evidence is still required
+  to guarantee cleanup of that exceptional interval.
+
+The changes do **not** establish success on the 4-vCPU parallel boot tests.
+No local source checkout, compilation, cargo tests, formal verification,
+mutation tests, DVM builds or KVM runs were available for this audit.
+Prioritize `kernel-ps` and `runtimed` tests and 4/8/16-vCPU repeated KVM
+boot/teardown after this commit.
+
 ## Bounded source hardening pass (2026-11-10, post-7b817e9e)
 
 This pass intentionally stops after one small batch; it reviewed the Ring0

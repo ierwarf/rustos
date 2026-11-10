@@ -25,7 +25,8 @@
 //! head-of-line blocking is to give long work its own worker rather than to
 //! make short work wait behind it. This module is that worker.
 
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::cell::Cell;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 use std::time::Duration;
 
@@ -94,6 +95,9 @@ pub(crate) struct LaunchCalls {
 pub(crate) struct LaunchWorker {
     jobs: SyncSender<LaunchJob>,
     progress: Receiver<LaunchProgress>,
+    /// If the worker exits, its progress channel closes. The supervisor
+    /// must not confuse that terminal edge with a still-running job.
+    disconnected: Cell<bool>,
 }
 
 impl LaunchWorker {
@@ -103,13 +107,28 @@ impl LaunchWorker {
         match self.jobs.try_send(job) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err(libc::EBUSY),
-            Err(TrySendError::Disconnected(_)) => Err(libc::EPIPE),
+            Err(TrySendError::Disconnected(_)) => {
+                self.disconnected.set(true);
+                Err(libc::EPIPE)
+            }
         }
     }
 
-    /// Take whatever the worker has said, without waiting.
+    /// Take whatever the worker has said, without waiting. A closed result
+    /// channel is a terminal worker failure, not an empty progress queue.
     pub(crate) fn poll(&self) -> Option<LaunchProgress> {
-        self.progress.try_recv().ok()
+        match self.progress.try_recv() {
+            Ok(progress) => Some(progress),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.disconnected.set(true);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn disconnected(&self) -> bool {
+        self.disconnected.get()
     }
 }
 
@@ -130,6 +149,7 @@ pub(crate) fn start(calls: LaunchCalls) -> Option<LaunchWorker> {
     Some(LaunchWorker {
         jobs: job_sender,
         progress: progress_receiver,
+        disconnected: Cell::new(false),
     })
 }
 
@@ -449,6 +469,30 @@ mod tests {
         assert_eq!(pid, Some(42));
         assert_eq!(result, Ok(()));
         assert_eq!(ACTIVATED.load(Ordering::SeqCst), 42);
+    }
+
+    #[test]
+    fn disconnected_launch_worker_is_not_mistaken_for_idle_progress() {
+        let (jobs, job_rx) = std::sync::mpsc::sync_channel::<LaunchJob>(1);
+        drop(job_rx);
+        let (progress_tx, progress) = std::sync::mpsc::sync_channel::<LaunchProgress>(1);
+        drop(progress_tx);
+        let worker = LaunchWorker {
+            jobs,
+            progress,
+            disconnected: Cell::new(false),
+        };
+        assert!(worker.poll().is_none());
+        assert!(worker.disconnected());
+        assert_eq!(
+            worker.submit(LaunchJob {
+                entry: entry(),
+                qualification_contract: None,
+                session_handle: None,
+                is_ui_server: false,
+            }),
+            Err(libc::EPIPE),
+        );
     }
 
     fn wait_for_progress(worker: &LaunchWorker) -> LaunchProgress {

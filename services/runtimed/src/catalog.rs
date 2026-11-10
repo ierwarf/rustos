@@ -103,9 +103,20 @@ fn request_launch_catalog(state: &mut BrokerState) -> Option<LaunchCatalogLoad> 
     if let Some(loaded) = load.poll() {
         return Some(loaded);
     }
+    // A panicked/stopped storage worker closes its response channel. Prior
+    // code collapsed Disconnected into Empty and kept its outstanding bit
+    // forever, leaving this signed launch catalog unresolved for the boot.
+    if load.disconnected() {
+        state.launch_catalog_load = None;
+        announce_launch_catalog_load_begin();
+        return Some(load_launch_catalog());
+    }
     if !load.busy() {
         announce_launch_catalog_load_begin();
-        load.request();
+        if !load.request() && load.disconnected() {
+            state.launch_catalog_load = None;
+            return Some(load_launch_catalog());
+        }
     }
     None
 }
@@ -236,8 +247,13 @@ fn request_qualification_contract(
     if let Some(loaded) = load.poll() {
         return Some(loaded);
     }
-    if !load.busy() {
-        load.request();
+    if load.disconnected() {
+        state.qualification_load = None;
+        return Some(super::kvm_smp_qualification::load_kvm_smp_qualification_contract());
+    }
+    if !load.busy() && !load.request() && load.disconnected() {
+        state.qualification_load = None;
+        return Some(super::kvm_smp_qualification::load_kvm_smp_qualification_contract());
     }
     None
 }
