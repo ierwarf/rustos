@@ -7,6 +7,6 @@ publish = false
 [dependencies]
 libc = "0.2"
 wayland-client = "0.31.14"
-wayland-protocols = { version = "0.32.12", features = ["client"] }
+wayland-protocols = { version = "0.32.12", features = ["client", "unstable"] }
 rustos-app-dmabuf = { path = "../../libs/rustos-app-dmabuf" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi", default-features = false }

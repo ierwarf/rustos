@@ -17,6 +17,9 @@ use wayland_client::{
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
 };
+use wayland_protocols::xdg::decoration::zv1::client::{
+    zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
+};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 const WIDTH: u32 = 800;
@@ -238,6 +241,7 @@ fn main() {
     let mut event_queue = conn.new_event_queue();
     let qh = event_queue.handle();
     conn.display().get_registry(&qh, ());
+    conn.display().sync(&qh, CallbackKind::RegistrySync);
     raw_stderr_line("wayclick: registry requested");
     // The initial registry request has no incoming event to wake a client that
     // enters its first blocking dispatch before the buffered write reaches
@@ -409,17 +413,26 @@ fn send_forged_dmabuf(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CallbackKind {
+    RegistrySync,
+    Frame,
+}
+
 struct GameState {
     running: bool,
     dmabuf: bool,
     probe: AppDmabufProbe,
     auto_exit_after_first_frame: bool,
     first_frame_presented: bool,
+    registry_synced: bool,
     configured: bool,
     surface: Option<wl_surface::WlSurface>,
     xdg_surface: Option<xdg_surface::XdgSurface>,
     toplevel: Option<xdg_toplevel::XdgToplevel>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
+    decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
+    decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     buffers: Vec<ShmBuffer>,
     buffer_available: Vec<bool>,
     frame_callback: Option<wl_callback::WlCallback>,
@@ -448,11 +461,14 @@ impl GameState {
             probe: AppDmabufProbe::new(),
             auto_exit_after_first_frame: auto_exit_after_first_frame(),
             first_frame_presented: false,
+            registry_synced: false,
             configured: false,
             surface: None,
             xdg_surface: None,
             toplevel: None,
             wm_base: None,
+            decoration_manager: None,
+            decoration: None,
             buffers: Vec::new(),
             buffer_available: Vec::new(),
             frame_callback: None,
@@ -477,7 +493,7 @@ impl GameState {
     }
 
     fn init_shell(&mut self, qh: &QueueHandle<Self>) {
-        if self.xdg_surface.is_some() {
+        if !self.registry_synced || self.xdg_surface.is_some() {
             return;
         }
         let Some(wm_base) = self.wm_base.as_ref() else {
@@ -489,6 +505,11 @@ impl GameState {
 
         let xdg_surface = wm_base.get_xdg_surface(surface, qh, ());
         let toplevel = xdg_surface.get_toplevel(qh, ());
+        if let Some(decoration_manager) = self.decoration_manager.as_ref() {
+            let decoration = decoration_manager.get_toplevel_decoration(&toplevel, qh, ());
+            decoration.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+            self.decoration = Some(decoration);
+        }
         self.update_title(&toplevel);
         surface.commit();
         self.xdg_surface = Some(xdg_surface);
@@ -589,7 +610,7 @@ impl GameState {
         };
         self.buffer_available[buffer_index] = false;
         self.redraw_pending = false;
-        self.frame_callback = Some(surface.frame(qh, ()));
+        self.frame_callback = Some(surface.frame(qh, CallbackKind::Frame));
         surface.attach(Some(&wl_buffer), 0, 0);
         if let Some((x, y, width, height)) = self.pending_damage.take() {
             surface.damage(x, y, width, height);
@@ -982,6 +1003,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for GameState {
                         Some(registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 1, qh, ()));
                     state.init_shell(qh);
                 }
+                "zxdg_decoration_manager_v1" => {
+                    state.decoration_manager = Some(registry.bind::<
+                        zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+                        _,
+                        _,
+                    >(name, 1, qh, ()));
+                }
                 _ => {}
             }
         }
@@ -992,6 +1020,8 @@ delegate_noop!(GameState: ignore wl_compositor::WlCompositor);
 delegate_noop!(GameState: ignore wl_surface::WlSurface);
 delegate_noop!(GameState: ignore wl_shm::WlShm);
 delegate_noop!(GameState: ignore wl_shm_pool::WlShmPool);
+delegate_noop!(GameState: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
+delegate_noop!(GameState: ignore zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1);
 // Format/modifier advertisements are not consulted: only linear ARGB8888 is
 // ever allocated, and the compositor refuses anything else at create_immed.
 delegate_noop!(GameState: ignore zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1);
@@ -1137,16 +1167,21 @@ impl Dispatch<wl_pointer::WlPointer, ()> for GameState {
     }
 }
 
-impl Dispatch<wl_callback::WlCallback, ()> for GameState {
+impl Dispatch<wl_callback::WlCallback, CallbackKind> for GameState {
     fn event(
         state: &mut Self,
         callback: &wl_callback::WlCallback,
         event: wl_callback::Event,
-        _: &(),
+        kind: &CallbackKind,
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
         if let wl_callback::Event::Done { .. } = event {
+            if *kind == CallbackKind::RegistrySync {
+                state.registry_synced = true;
+                state.init_shell(qh);
+                return;
+            }
             let in_flight = state
                 .frame_callback
                 .as_ref()
@@ -1355,14 +1390,96 @@ impl ShmBuffer {
     }
 
     fn fill_circle(&mut self, cx: i32, cy: i32, radius: i32, color: u32) {
-        let r2 = radius * radius;
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
-                if dx * dx + dy * dy <= r2 {
-                    self.fill_rect(cx + dx, cy + dy, 1, 1, color);
-                }
+        if radius < 0 {
+            return;
+        }
+        let width = self.width as usize;
+        let height = self.height as usize;
+        fill_circle_in_slice(
+            self.pixels_mut(),
+            width,
+            height,
+            cx,
+            cy,
+            radius,
+            color,
+        );
+    }
+}
+
+/// Alpha-blend a straight-ARGB source color over a premultiplied/opaque
+/// destination pixel so translucent glows keep the window surface opaque.
+fn blend_argb(dst: u32, src: u32) -> u32 {
+    let a = (src >> 24) & 0xff;
+    if a == 0 {
+        return dst;
+    }
+    if a == 0xff {
+        return src;
+    }
+    let inv = 255 - a;
+    let dst_a = (dst >> 24) & 0xff;
+    let out_a = (a * 255 + dst_a * inv + 127) / 255;
+    let blend_chan = |shift: u32| {
+        let s = (src >> shift) & 0xff;
+        let d = (dst >> shift) & 0xff;
+        (s * a + d * inv + 127) / 255
+    };
+    (out_a << 24) | (blend_chan(16) << 16) | (blend_chan(8) << 8) | blend_chan(0)
+}
+
+fn fill_circle_in_slice(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    cx: i32,
+    cy: i32,
+    radius: i32,
+    color: u32,
+) {
+    if radius < 0 || width == 0 || height == 0 {
+        return;
+    }
+    let a = (color >> 24) & 0xff;
+    if a == 0 {
+        return;
+    }
+    let r2 = i64::from(radius) * i64::from(radius);
+    let start_y = cy.saturating_sub(radius).max(0);
+    let end_y = cy.saturating_add(radius).min(height as i32 - 1);
+    for y in start_y..=end_y {
+        let dy = i64::from(y - cy);
+        let rem = (r2 - dy * dy).max(0) as u64;
+        let half = rem.isqrt() as i32;
+        let start_x = cx.saturating_sub(half).max(0);
+        let end_x = cx.saturating_add(half).min(width as i32 - 1);
+        if start_x > end_x {
+            continue;
+        }
+        let row_offset = y as usize * width;
+        let span = &mut pixels[row_offset + start_x as usize..=row_offset + end_x as usize];
+        if a == 0xff {
+            span.fill(color);
+        } else {
+            for pixel in span {
+                *pixel = blend_argb(*pixel, color);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod circle_blend_tests {
+    use super::*;
+
+    #[test]
+    fn translucent_target_halo_blends_over_opaque_canvas_without_leaking_alpha() {
+        let mut pixels = vec![0xFF08_1F38_u32; 32 * 32];
+        fill_circle_in_slice(&mut pixels, 32, 32, 16, 16, 8, 0x332E_82B4);
+        let center = pixels[16 * 32 + 16];
+        assert_eq!(center >> 24, 0xff);
+        assert_ne!(center, 0xFF08_1F38);
+        assert_eq!(pixels[0], 0xFF08_1F38);
     }
 }
 
