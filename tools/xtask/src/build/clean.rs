@@ -1,7 +1,6 @@
 //! Reclaiming build and formal scratch from the tree.
 //!
-//! Split out of `build/mod.rs` to keep that module within its registered
-//! `formal/rust-large-files.tsv` budget. Nothing here participates in a build;
+//! Split out of `build/mod.rs`. Nothing here participates in a build;
 //! it only deletes working state that a lane rebuilds on demand.
 
 use fs_err as fs;

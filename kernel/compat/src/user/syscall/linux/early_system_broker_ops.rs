@@ -15,7 +15,7 @@ pub(super) fn syscall_linux_rustos_early_system_broker(args_ptr: u64) -> u64 {
     }
     let args = match usermem::read_current_user_struct::<EarlySystemBrokerArgs>(args_ptr) {
         Ok(args) => args,
-        Err(error) => return linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
     };
     let path_len = usize::try_from(args.path_len).unwrap_or(usize::MAX);
     if args.abi_version != EARLY_SYSTEM_BROKER_ABI_VERSION
@@ -51,7 +51,7 @@ fn broker_info(args: &EarlySystemBrokerArgs, path: &str) -> u64 {
     };
     match usermem::write_current_user_bytes(args.out_file_len_ptr, &len.to_ne_bytes()) {
         Ok(()) => 0,
-        Err(error) => linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
     }
 }
 
@@ -68,7 +68,7 @@ fn broker_read(args: &EarlySystemBrokerArgs, path: &str) -> u64 {
         Err(_) => return linux_errno(LINUX_EINVAL),
     };
     if let Err(error) = usermem::validate_current_user_write_buffer(args.buffer_ptr, len) {
-        return linux_errno(address_space_error_to_linux_errno(error));
+        return linux_errno(user_pointer_error_to_linux_errno(error));
     }
     let mut bytes = Vec::new();
     if bytes.try_reserve_exact(len).is_err() {
@@ -82,7 +82,7 @@ fn broker_read(args: &EarlySystemBrokerArgs, path: &str) -> u64 {
     };
     match usermem::write_current_user_bytes(args.buffer_ptr, &bytes[..read]) {
         Ok(()) => read as u64,
-        Err(error) => linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
     }
 }
 

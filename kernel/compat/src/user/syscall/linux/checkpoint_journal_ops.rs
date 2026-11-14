@@ -113,7 +113,7 @@ pub(super) fn syscall_linux_rustos_checkpoint_journal(ptr: u64) -> u64 {
     }
     let mut args = match usermem::read_current_user_struct::<RustosCheckpointJournalArgs>(ptr) {
         Ok(args) => args,
-        Err(error) => return linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
     };
     if !valid_request(&args) {
         return linux_errno(LINUX_EINVAL);
@@ -123,7 +123,7 @@ pub(super) fn syscall_linux_rustos_checkpoint_journal(ptr: u64) -> u64 {
     if let Err(error) = usermem::validate_current_user_write_buffer(
         ptr, size_of::<RustosCheckpointJournalArgs>(),
     ) {
-        return linux_errno(address_space_error_to_linux_errno(error));
+        return linux_errno(user_pointer_error_to_linux_errno(error));
     }
     let outcome = {
         let mut journal = JOURNAL.lock();
@@ -161,7 +161,7 @@ pub(super) fn syscall_linux_rustos_checkpoint_journal(ptr: u64) -> u64 {
     }
     match usermem::write_current_user_struct(ptr, &args) {
         Ok(()) => 0,
-        Err(error) => linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
     }
 }
 

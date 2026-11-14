@@ -143,8 +143,15 @@ fn runtime_sync_worker(runtime: RuntimeClient, shared: Arc<Mutex<SharedRuntimeSt
         observed_digest = digest;
 
         let mut running_programs = [RuntimeRunningProgram::default(); MAX_RUNNING_PROGRAMS];
-        let running_count = snapshot.len().min(MAX_RUNNING_PROGRAMS);
-        running_programs[..running_count].copy_from_slice(&snapshot[..running_count]);
+        let mut running_count = 0;
+        for program in snapshot
+            .into_iter()
+            .filter(|program| program.session_handle != 0 && !runtime_program_is_hidden(program))
+            .take(MAX_RUNNING_PROGRAMS)
+        {
+            running_programs[running_count] = program;
+            running_count += 1;
+        }
 
         let mut shared = shared.lock().unwrap_or_else(PoisonError::into_inner);
         // The digest covers runtimed's whole set; this window covers only the

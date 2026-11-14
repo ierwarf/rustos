@@ -31,6 +31,13 @@ struct SmokeOptions {
     dvm_block_shmem: bool,
     rustos_vcpus: u8,
     smp_iteration: bool,
+    /// Keep both guests up this many seconds after readiness was accepted
+    /// (`--hold-seconds`, `guest.rs::hold_after_readiness`). The run passes only
+    /// if acceptance held and nothing exited or failed during the window.
+    hold_seconds: Option<u64>,
+    /// Desktop id runtimed launches once the UI is ready (`--launch-desktop`,
+    /// `launch_desktop.rs`), through a private KVM-only contract file.
+    launch_desktop: Option<String>,
     /// Percent of the host cores the run may use that are kept busy for the
     /// whole run (`--host-cpu-pressure`, see `kvm/host_pressure.rs`). `None`
     /// is the idle-host profile; `Some` is a distinct timing profile.
@@ -64,6 +71,8 @@ struct SmokeOptions {
     proc_stress: bool,
     /// Arm `apps/localfdprobe` (pipe/eventfd semantics; `local_fd_probe.rs`).
     local_fd_probe: bool,
+    /// Arm `apps/faultprobe` (process-group fault semantics; `fault_probe.rs`).
+    fault_probe: bool,
     /// Arm `apps/libmapprobe` and require its runtime proof markers.
     library_map_probe: bool,
     /// Arm the `apps/wayclick` app DMA-BUF probe (`app_dmabuf_probe.rs`).
@@ -130,6 +139,8 @@ where
         dvm_block_shmem: false,
         rustos_vcpus: DEFAULT_RUSTOS_VCPUS,
         smp_iteration: false,
+        hold_seconds: None,
+        launch_desktop: None,
         host_cpu_pressure: None,
         smp_formal_profile_override: None,
         smp_ring3_qualification: false,
@@ -145,6 +156,7 @@ where
         job_policy_probe: false,
         proc_stress: false,
         local_fd_probe: false,
+        fault_probe: false,
         library_map_probe: false,
         app_dmabuf_probe: false,
         mmap_cost_probe: false,
@@ -176,7 +188,7 @@ where
                 let value = next_value(&mut args, "--repeat")?;
                 let runs = value
                     .parse::<usize>()
-                    .with_context(|| format!("invalid --repeat value: {value}"))?;
+                    .with_context(|| format!("invalid --repeat value: {value} (expected an integer in 1..=64)"))?;
                 if !(1..=64).contains(&runs) {
                     bail!("--repeat must be in 1..=64, got {runs}");
                 }
@@ -194,6 +206,27 @@ where
                 options.rustos_vcpus = parse_rustos_vcpus(next_value(&mut args, "--rustos-vcpus")?)?
             }
             "--smp-iteration" => options.smp_iteration = true,
+            "--hold-seconds" => {
+                if options.hold_seconds.is_some() {
+                    bail!("--hold-seconds was supplied more than once");
+                }
+                let value = next_value(&mut args, "--hold-seconds")?;
+                let seconds = value.parse::<u64>().with_context(|| {
+                    format!("invalid --hold-seconds value: {value} (expected an integer in 1..={MAX_SMOKE_HOLD_SECONDS})")
+                })?;
+                if !(1..=MAX_SMOKE_HOLD_SECONDS).contains(&seconds) {
+                    bail!("--hold-seconds must be in 1..={MAX_SMOKE_HOLD_SECONDS}, got {seconds}");
+                }
+                options.hold_seconds = Some(seconds);
+            }
+            "--launch-desktop" => {
+                if options.launch_desktop.is_some() {
+                    bail!("--launch-desktop was supplied more than once");
+                }
+                let id = next_value(&mut args, "--launch-desktop")?;
+                validate_launch_desktop_id(&id)?;
+                options.launch_desktop = Some(id);
+            }
             "--host-cpu-pressure" => {
                 if options.host_cpu_pressure.is_some() {
                     bail!("--host-cpu-pressure was supplied more than once");
@@ -236,6 +269,7 @@ where
             }
             "--proc-stress" => options.proc_stress = true,
             "--local-fd-probe" => options.local_fd_probe = true,
+            "--fault-probe" => options.fault_probe = true,
             "--library-map-probe" => options.library_map_probe = true,
             "--app-dmabuf-probe" => options.app_dmabuf_probe = true,
             "--mmap-cost-probe" => options.mmap_cost_probe = true,
@@ -271,7 +305,7 @@ where
                 let value = next_value(&mut args, "--min-ui-fps")?;
                 let fps = value
                     .parse::<u32>()
-                    .with_context(|| format!("invalid --min-ui-fps value: {value}"))?;
+                    .with_context(|| format!("invalid --min-ui-fps value: {value} (expected an integer in 1..=240)"))?;
                 if !(1..=240).contains(&fps) {
                     bail!("--min-ui-fps must be in 1..=240, got {fps}");
                 }
@@ -306,7 +340,7 @@ where
                 let value = next_value(&mut args, "--timeout")?;
                 let seconds = value
                     .parse::<u64>()
-                    .with_context(|| format!("invalid --timeout value: {value}"))?;
+                    .with_context(|| format!("invalid --timeout value: {value} (expected an integer in 1..={MAX_SMOKE_TIMEOUT})"))?;
                 if !(1..=MAX_SMOKE_TIMEOUT).contains(&seconds) {
                     bail!("--timeout must be in 1..={MAX_SMOKE_TIMEOUT}, got {seconds}");
                 }
@@ -330,6 +364,47 @@ where
         }
     }
 
+    if options.hold_seconds.is_some() {
+        // The hold is an observation window over the positive product topology.
+        // Each of these either ends the run itself, restarts a guest, or is a
+        // bounded acceptance run with its own evidence window.
+        let contradiction = if options.storage_only || options.expect_block_flush_fault {
+            Some("--storage-dvm-only")
+        } else if options.recovery_probe != RecoveryProbe::None {
+            Some("--recovery-probe")
+        } else if options.min_ui_fps.is_some() {
+            Some("--min-ui-fps")
+        } else if options.smp_iteration {
+            Some("--smp-iteration")
+        } else {
+            None
+        };
+        if let Some(other) = contradiction {
+            bail!("--hold-seconds observes the positive product topology and cannot combine with {other}");
+        }
+        // uiserver's required display dependency expires 30 s after it starts;
+        // a window longer than that can only be held with a display provider.
+        options.gui_dvm_surfaces = true;
+    }
+    if options.launch_desktop.is_some() {
+        let contradiction = if options.storage_only || options.expect_block_flush_fault {
+            Some("--storage-dvm-only")
+        } else if options.smp_iteration {
+            Some("--smp-iteration")
+        } else {
+            None
+        };
+        if let Some(other) = contradiction {
+            bail!("--launch-desktop needs the graphical session and cannot combine with {other}");
+        }
+        // runtimed launches it once the UI is ready, from the DVM-backed volume.
+        options.gui_dvm_surfaces = true;
+        if let Some(id) = options.launch_desktop.as_deref() {
+            options
+                .expected_markers
+                .push(launch_desktop_launched_marker(id));
+        }
+    }
     if options.job_policy_probe {
         if options.oom_hog || options.proc_stress {
             bail!("--job-policy-probe cannot combine with memory or process stress proofs");
@@ -406,6 +481,11 @@ where
         // Session programs start only once the graphical session is up.
         options.gui_dvm_surfaces = true;
         options.expected_markers.extend(local_fd_probe_markers());
+    }
+    if options.fault_probe {
+        // Session programs start only once the graphical session is up.
+        options.gui_dvm_surfaces = true;
+        options.expected_markers.extend(fault_probe_markers());
     }
     if options.proc_stress {
         // Session programs start only once the graphical session is up.

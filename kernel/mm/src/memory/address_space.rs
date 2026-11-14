@@ -152,6 +152,9 @@ impl ProcessAddressSpace {
         let pml4_phys = phys::alloc_frame_user().ok_or(AddressSpaceError::OutOfFrames)?;
         phys::register_lazy_table_root(pml4_phys.as_u64());
         phys::register_data_leaf_root(pml4_phys.as_u64());
+        // SAFETY: `pml4_phys` is a frame just returned by `alloc_frame_user`: exclusively
+        // owned, 4 KiB aligned, direct-mapped, and not yet published in any root, so
+        // this `&mut` cannot alias another reference.
         let root = unsafe { kernel_vm::phys_to_table_mut(pml4_phys) };
         root.zero();
 
@@ -367,6 +370,10 @@ impl ProcessAddressSpace {
                 drop(mutation);
                 return Err(error);
             }
+            // SAFETY: `src_phys` is the parent's leaf, re-translated and ownership-checked
+            // above under the mutation stripe; `dst_phys` is a fresh exclusive frame from
+            // `alloc_frame_user`. Both are direct-mapped, 4 KiB, and distinct frames, so
+            // the two PAGE_4KIB ranges cannot overlap.
             unsafe {
                 ptr::copy_nonoverlapping(
                     higher_half_ptr(src_phys),
@@ -521,6 +528,9 @@ impl ProcessAddressSpace {
             let frame_phys = frame_buffer[frame_buffer_pos];
             frame_buffer_pos += 1;
 
+            // SAFETY: `frame_phys` was just taken from the batch allocator, so it is an
+            // exclusively owned, direct-mapped 4 KiB frame not yet claimed or mapped;
+            // zeroing it before `map_user_page` publishes it leaks nothing to userspace.
             unsafe {
                 ptr::write_bytes(higher_half_ptr(frame_phys), 0, PAGE_4KIB);
             }
@@ -847,18 +857,30 @@ impl ProcessAddressSpace {
             return None;
         }
 
+        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
+        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
+        // only at address-space retirement, which cannot overlap this `&self` borrow;
+        // a racing exception-time installer only CASes unused -> table, never frees.
         let pdpt = unsafe { kernel_vm::phys_to_table_ref(pml4_entry.addr()) };
         let pdpt_entry = &pdpt[p3_index(virt)];
         if pdpt_entry.is_unused() || pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return None;
         }
 
+        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
+        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
+        // only at address-space retirement, which cannot overlap this `&self` borrow;
+        // a racing exception-time installer only CASes unused -> table, never frees.
         let pd = unsafe { kernel_vm::phys_to_table_ref(pdpt_entry.addr()) };
         let pd_entry = &pd[p2_index(virt)];
         if pd_entry.is_unused() || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return None;
         }
 
+        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
+        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
+        // only at address-space retirement, which cannot overlap this `&self` borrow;
+        // a racing exception-time installer only CASes unused -> table, never frees.
         let pt = unsafe { kernel_vm::phys_to_table_ref(pd_entry.addr()) };
         let pt_entry = &pt[p1_index(virt)];
         if pt_entry.is_unused() {
@@ -873,6 +895,8 @@ impl ProcessAddressSpace {
     }
 
     fn root_table_ref(&self) -> &'static PageTable {
+        // SAFETY: `root_phys` is this address space's own PML4 frame, allocated in `new`
+        // and live until retirement, so the direct-map alias is a valid 4 KiB table.
         unsafe { kernel_vm::phys_to_table_ref(self.root_phys()) }
     }
 
@@ -896,6 +920,9 @@ impl ProcessAddressSpace {
         let pdpt_phys = ensure_next_table(root_phys, pml4_phys, p4_index(virt))?;
         let pd_phys = ensure_next_table(root_phys, pdpt_phys, p3_index(virt))?;
         let pt_phys = ensure_next_table(root_phys, pd_phys, p2_index(virt))?;
+        // SAFETY: `pt_phys` came from `ensure_next_table`, which returned the PT frame this
+        // walk already published (or found) under the mutation guard; `&mut self`
+        // excludes other normal-time writers, so the direct-map `&mut` is the sole one.
         let pt = unsafe { kernel_vm::phys_to_table_mut(pt_phys) };
 
         let entry = &mut pt[p1_index(virt)];
@@ -936,36 +963,63 @@ impl ProcessAddressSpace {
         if pml4_entry.is_unused() || pml4_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return None;
         }
+        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
+        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
+        // only at address-space retirement, which cannot overlap this `&self` borrow;
+        // a racing exception-time installer only CASes unused -> table, never frees.
         let pdpt = unsafe { kernel_vm::phys_to_table_ref(pml4_entry.addr()) };
         let pdpt_entry = &pdpt[p3_index(virt)];
         if pdpt_entry.is_unused() || pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return None;
         }
+        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
+        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
+        // only at address-space retirement, which cannot overlap this `&self` borrow;
+        // a racing exception-time installer only CASes unused -> table, never frees.
         let pd = unsafe { kernel_vm::phys_to_table_ref(pdpt_entry.addr()) };
         let pd_entry = &pd[p2_index(virt)];
         if pd_entry.is_unused() || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return None;
         }
+        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
+        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
+        // only at address-space retirement, which cannot overlap this `&self` borrow;
+        // a racing exception-time installer only CASes unused -> table, never frees.
         Some(unsafe { kernel_vm::phys_to_table_ref(pd_entry.addr()) })
     }
 
     fn leaf_pt_mut(&mut self, virt: VirtAddr) -> Result<&mut PageTable, AddressSpaceError> {
         validate_user_page_range(virt, 1)?;
+        // SAFETY: `root_phys` is this address space's own PML4 frame, allocated in `new`
+        // and live until retirement; `&mut self` plus the mutation guard exclude other
+        // normal-time writers (the exception-time installer only CASes empty entries).
         let root = unsafe { kernel_vm::phys_to_table_mut(self.root_phys()) };
         let pml4_entry = &mut root[p4_index(virt)];
         if pml4_entry.is_unused() || pml4_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return Err(AddressSpaceError::NotMapped);
         }
+        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
+        // kernel-allocated 4 KiB table frame in the direct map. `&mut self` plus the
+        // address-space mutation guard exclude other normal-time writers; the only
+        // concurrent writer is the exception-time installer's unused -> table CAS.
         let pdpt = unsafe { kernel_vm::phys_to_table_mut(pml4_entry.addr()) };
         let pdpt_entry = &mut pdpt[p3_index(virt)];
         if pdpt_entry.is_unused() || pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return Err(AddressSpaceError::NotMapped);
         }
+        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
+        // kernel-allocated 4 KiB table frame in the direct map. `&mut self` plus the
+        // address-space mutation guard exclude other normal-time writers; the only
+        // concurrent writer is the exception-time installer's unused -> table CAS.
         let pd = unsafe { kernel_vm::phys_to_table_mut(pdpt_entry.addr()) };
         let pd_entry = &mut pd[p2_index(virt)];
         if pd_entry.is_unused() || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return Err(AddressSpaceError::NotMapped);
         }
+        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
+        // kernel-allocated 4 KiB table frame in the direct map. `&mut self` plus the
+        // address-space mutation guard exclude other normal-time writers; the only
+        // concurrent writer is the exception-time installer's unused -> table CAS.
         Ok(unsafe { kernel_vm::phys_to_table_mut(pd_entry.addr()) })
     }
 
@@ -1017,24 +1071,39 @@ impl ProcessAddressSpace {
             return None;
         }
 
+        // SAFETY: `root_phys` is this address space's own PML4 frame, allocated in `new`
+        // and live until retirement; `&mut self` plus the mutation guard exclude other
+        // normal-time writers (the exception-time installer only CASes empty entries).
         let root = unsafe { kernel_vm::phys_to_table_mut(self.root_phys()) };
         let pml4_entry = &mut root[p4_index(virt)];
         if pml4_entry.is_unused() || pml4_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return None;
         }
 
+        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
+        // kernel-allocated 4 KiB table frame in the direct map. `&mut self` plus the
+        // address-space mutation guard exclude other normal-time writers; the only
+        // concurrent writer is the exception-time installer's unused -> table CAS.
         let pdpt = unsafe { kernel_vm::phys_to_table_mut(pml4_entry.addr()) };
         let pdpt_entry = &mut pdpt[p3_index(virt)];
         if pdpt_entry.is_unused() || pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return None;
         }
 
+        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
+        // kernel-allocated 4 KiB table frame in the direct map. `&mut self` plus the
+        // address-space mutation guard exclude other normal-time writers; the only
+        // concurrent writer is the exception-time installer's unused -> table CAS.
         let pd = unsafe { kernel_vm::phys_to_table_mut(pdpt_entry.addr()) };
         let pd_entry = &mut pd[p2_index(virt)];
         if pd_entry.is_unused() || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return None;
         }
 
+        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
+        // kernel-allocated 4 KiB table frame in the direct map. `&mut self` plus the
+        // address-space mutation guard exclude other normal-time writers; the only
+        // concurrent writer is the exception-time installer's unused -> table CAS.
         let pt = unsafe { kernel_vm::phys_to_table_mut(pd_entry.addr()) };
         let pt_entry = &mut pt[p1_index(virt)];
         if pt_entry.is_unused() {
@@ -1102,6 +1171,9 @@ fn ensure_next_table(
     let Some(table_phys) = phys::alloc_frame_user() else {
         return Err(AddressSpaceError::OutOfFrames);
     };
+    // SAFETY: `table_phys` is a fresh exclusive frame from `alloc_frame_user`, direct-
+    // mapped and not yet linked into any table, so zeroing it as a `PageTable`
+    // cannot alias another reference and precedes the publishing CAS below.
     unsafe {
         kernel_vm::phys_to_table_mut(table_phys).zero();
     }
@@ -1361,18 +1433,30 @@ impl ProcessAddressSpace {
             return UserPageLookup::MissingPml4;
         }
 
+        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
+        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
+        // only at address-space retirement, which cannot overlap this `&self` borrow;
+        // a racing exception-time installer only CASes unused -> table, never frees.
         let pdpt = unsafe { kernel_vm::phys_to_table_ref(pml4_entry.addr()) };
         let pdpt_entry = &pdpt[p3_index(virt)];
         if pdpt_entry.is_unused() || pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return UserPageLookup::MissingPdpt;
         }
 
+        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
+        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
+        // only at address-space retirement, which cannot overlap this `&self` borrow;
+        // a racing exception-time installer only CASes unused -> table, never frees.
         let pd = unsafe { kernel_vm::phys_to_table_ref(pdpt_entry.addr()) };
         let pd_entry = &pd[p2_index(virt)];
         if pd_entry.is_unused() || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return UserPageLookup::MissingPd;
         }
 
+        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
+        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
+        // only at address-space retirement, which cannot overlap this `&self` borrow;
+        // a racing exception-time installer only CASes unused -> table, never frees.
         let pt = unsafe { kernel_vm::phys_to_table_ref(pd_entry.addr()) };
         let pt_entry = &pt[p1_index(virt)];
         if pt_entry.is_unused() {
@@ -1446,6 +1530,9 @@ pub fn smoke_test() {
         .translate_user(region.start)
         .expect("process user translation must succeed");
     let mut probe = [0_u8; 14];
+    // SAFETY: boot smoke test: `phys` is the frame just translated for the mapped
+    // user page, direct-mapped and valid for `probe.len()` (14 <= 4096) bytes; the
+    // destination is a local array, so the ranges are disjoint.
     unsafe {
         ptr::copy_nonoverlapping(
             higher_half_ptr(phys) as *const u8,

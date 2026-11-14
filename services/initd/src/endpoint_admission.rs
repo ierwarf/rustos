@@ -89,6 +89,7 @@ pub(super) struct EndpointAdmission {
 }
 
 impl EndpointAdmission {
+    #[cfg(test)]
     pub(super) const fn new() -> Self {
         Self::with_limits(ENDPOINT_ADMISSION_BUDGET_MS, ENDPOINT_ADMISSION_SLICE_MS)
     }

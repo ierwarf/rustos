@@ -202,3 +202,53 @@ fn futex_wake_count_follows_linux_int_semantics() {
     // Upper register bits are ignored: val is a 32-bit int.
     assert_eq!(futex_wake_limit(0xdead_beef_0000_0003), 3);
 }
+
+#[test]
+fn futex_waiter_table_covers_every_scheduler_task_and_never_reports_ebusy() {
+    assert!(FUTEX_WAITERS_CAPACITY >= multitask::MAX_SCHEDULER_TASKS);
+    let key = FutexKey::Private {
+        mm_generation: 1,
+        address_space_root: 0x1000,
+        uaddr: 0x2000,
+    };
+    let waiter = |task_id| FutexWaiter {
+        key,
+        task_id,
+        bitset: linux_abi::FUTEX_BITSET_MATCH_ANY,
+    };
+    let mut waiters = [None; 4];
+    for id in 0..4 {
+        assert_eq!(register_futex_waiter_in(&mut waiters, waiter(id)), Ok(()));
+    }
+    assert_eq!(register_futex_waiter_in(&mut waiters, waiter(9)), Err(LINUX_ENOMEM));
+    // A stale entry for the running task is replaced, not duplicated or EBUSY.
+    assert_eq!(register_futex_waiter_in(&mut waiters, waiter(2)), Ok(()));
+    assert_eq!(waiters.iter().flatten().filter(|w| w.task_id == 2).count(), 1);
+}
+
+#[test]
+fn futex_requeue_counts_are_c_ints_from_the_timeout_register() {
+    assert_eq!(futex_int_count(0), Ok(0));
+    assert_eq!(futex_int_count(i32::MAX as u64), Ok(i32::MAX as usize));
+    assert_eq!(futex_int_count(0xdead_beef_0000_0005), Ok(5));
+    assert_eq!(futex_int_count(u64::from(u32::MAX)), Err(LINUX_EINVAL));
+    assert_eq!(futex_int_count(0x8000_0000), Err(LINUX_EINVAL));
+    // A set high bit in the 64-bit register is not a negative count.
+    assert_eq!(futex_int_count(0x1_0000_0001), Ok(1));
+}
+
+#[test]
+fn futex_op_validation_precedes_alignment_and_wake_op_is_unimplemented() {
+    assert_eq!(
+        validate_futex_policy_locally(linux_abi::FUTEX_WAKE_BITSET, 0),
+        Err(LINUX_EINVAL)
+    );
+    // FUTEX_WAKE_OP (5) is not implemented here and stays ENOSYS.
+    assert_eq!(validate_futex_policy_locally(5, 0), Err(LINUX_ENOSYS));
+    // FUTEX_CLOCK_REALTIME is valid only with WAIT_BITSET.
+    assert_eq!(
+        validate_futex_policy_locally(linux_abi::FUTEX_WAIT | linux_abi::FUTEX_CLOCK_REALTIME, 1),
+        Err(LINUX_ENOSYS)
+    );
+    assert_eq!(futex_impl(2, 5, 0, 0, 0, 0), linux_errno(LINUX_ENOSYS));
+}

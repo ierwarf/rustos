@@ -48,18 +48,22 @@
 #[cfg(rustos_boot_image)]
 use core::hint::spin_loop;
 #[cfg(rustos_boot_image)]
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize};
+#[cfg(any(rustos_boot_image, test))]
+use core::sync::atomic::Ordering;
 
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinGuard, TrackedSpinLock};
 use x86_64::PhysAddr;
 #[cfg(rustos_boot_image)]
 use x86_64::instructions::interrupts;
+#[cfg(rustos_boot_image)]
 use x86_64::instructions::tlb;
 
+#[cfg(rustos_boot_image)]
 use super::acpi::MAX_SUPPORTED_CPUS;
 
 const PAGE_SIZE: u64 = 4096;
+#[cfg(any(rustos_boot_image, test))]
 const GLOBAL_SCOPE: u64 = 0;
 #[cfg(rustos_boot_image)]
 /// A delayed virtual CPU may legitimately miss one host scheduling quantum.
@@ -77,6 +81,7 @@ const PROTOCOL_ACQUIRE_TIMEOUT_NS: u64 = ACK_LIVENESS_TIMEOUT_NS;
 /// more; it can never skip a flush.
 const STRIPES: usize = 64;
 /// Exclusive bit of the mutation gate; the low bits count shared holders.
+#[cfg(any(rustos_boot_image, test))]
 const GATE_EXCLUSIVE: u64 = 1 << 63;
 
 type ProtocolLock = TrackedSpinLock<(), { LockClass::TlbShootdown as u8 }>;
@@ -87,8 +92,10 @@ static GLOBAL_LOCK: ProtocolLock = TrackedSpinLock::new(());
 /// Serializes mutations of the spaces that hash to one stripe.
 static SPACE_LOCKS: [ProtocolLock; STRIPES] = [const { TrackedSpinLock::new(()) }; STRIPES];
 /// Per-space mutations hold this shared; a global mutation holds it exclusive.
+#[cfg(rustos_boot_image)]
 static GATE: AtomicU64 = AtomicU64::new(0);
 /// `tlb_gen` of each stripe: the number of mutations whose flush is owed.
+#[cfg(rustos_boot_image)]
 static SPACE_GEN: [AtomicU64; STRIPES] = [const { AtomicU64::new(0) }; STRIPES];
 /// Each sender's own monotonic request generation; only the sender writes it.
 #[cfg(rustos_boot_image)]
@@ -98,7 +105,9 @@ static SENDER_GEN: [AtomicU64; MAX_SUPPORTED_CPUS] =
 /// for target `t`.
 #[cfg(rustos_boot_image)]
 static PENDING: [AtomicU64; MAX_SUPPORTED_CPUS] = [const { AtomicU64::new(0) }; MAX_SUPPORTED_CPUS];
+#[cfg(rustos_boot_image)]
 type Mailbox = [[AtomicU64; MAX_SUPPORTED_CPUS]; MAX_SUPPORTED_CPUS];
+#[cfg(rustos_boot_image)]
 const fn mailbox() -> Mailbox {
     [const { [const { AtomicU64::new(0) }; MAX_SUPPORTED_CPUS] }; MAX_SUPPORTED_CPUS]
 }
@@ -162,8 +171,10 @@ const KVM_FEATURE_STEAL_TIME: u32 = 1 << 5;
 #[cfg(rustos_boot_image)]
 const KVM_FEATURE_PV_TLB_FLUSH: u32 = 1 << 9;
 /// The host sets this while the vCPU is scheduled out.
+#[cfg(any(rustos_boot_image, test))]
 const KVM_VCPU_PREEMPTED: u8 = 1 << 0;
 /// The guest sets this to ask the host to flush before the vCPU runs again.
+#[cfg(any(rustos_boot_image, test))]
 const KVM_VCPU_FLUSH_TLB: u8 = 1 << 1;
 
 /// `struct kvm_steal_time`: 64 bytes, 64-byte aligned, shared with the host,
@@ -1176,6 +1187,7 @@ fn acknowledgements_complete(targets: &[bool], acknowledgements: &[u64], generat
             .all(|(target, acknowledgement)| !*target || *acknowledgement == generation)
 }
 
+#[cfg(rustos_boot_image)]
 fn current_cpu_index() -> usize {
     let logical_index = nucleus_core::util::lockdep::current_cpu_index();
     assert!(

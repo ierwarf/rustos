@@ -79,7 +79,7 @@ for name in "${names[@]}"; do
     failed=$((failed + 1))
     printf 'FAIL  %-28s %3ss (exit %s)\n' "$name" "$seconds" "$status"
     # The first useful diagnostic and a tiny tail, not the whole log.
-    grep -v -e '^$' -e 'large-file debt' "$log_dir/$name.log" | head -4 | sed 's/^/        /'
+    grep -v -e '^$' "$log_dir/$name.log" | head -4 | sed 's/^/        /'
   fi
 done
 printf 'formal preflight: %d of %d checks failed in %ss\n' \

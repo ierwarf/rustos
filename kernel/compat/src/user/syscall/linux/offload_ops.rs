@@ -418,13 +418,13 @@ pub(super) fn drain_lifecycle_events(
     if out_count != 0 {
         if let Err(error) = usermem::write_current_user_slice(args.out_events_ptr, &snapshot) {
             restore_thread_loss(thread_loss_taken);
-            return Err(address_space_error_to_linux_errno(error));
+            return Err(user_pointer_error_to_linux_errno(error));
         }
     }
     if let Err(error) = usermem::write_current_user_bytes(args.out_count_ptr, &out_count.to_le_bytes())
     {
         restore_thread_loss(thread_loss_taken);
-        return Err(address_space_error_to_linux_errno(error));
+        return Err(user_pointer_error_to_linux_errno(error));
     }
     if thread_count != 0 {
         PROCD_THREAD_EXIT_EVENTS.lock().drain_prefix(thread_count);

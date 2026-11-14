@@ -22,6 +22,7 @@ use rustos_user_abi::syscall::{SYS_RUSTOS_SCHED_DEMOTE_SELF, TASK_WEIGHT_INTERAC
 mod catalog;
 mod heartbeat;
 mod image_probe;
+mod kvm_launch_desktop;
 mod kvm_smp_qualification;
 mod launch_worker;
 mod offload;
@@ -179,6 +180,9 @@ pub(crate) struct BrokerState {
     /// Earliest time the next reap request may be made, so an idle broker does
     /// not ask procd back to back.
     pub(crate) reap_due: Option<Instant>,
+    /// The private KVM-only `--launch-desktop` request; settles to `Done` at
+    /// once when its contract file is absent (every ordinary boot).
+    pub(crate) kvm_launch_desktop: kvm_launch_desktop::LaunchDesktopRequest,
 }
 
 impl Default for BrokerState {
@@ -220,6 +224,7 @@ impl Default for BrokerState {
             ),
             child_reaper: offload::Offload::start("runtimed-reap", spawn::collect_exited_children),
             reap_due: None,
+            kvm_launch_desktop: kvm_launch_desktop::LaunchDesktopRequest::default(),
         }
     }
 }
@@ -348,6 +353,7 @@ fn main() {
         // the first desktop launch after the catalog-ready transition.
         did_work |= socket::ensure_policy_launches(&mut state);
         pass.mark(LoopPhase::PolicyLaunches);
+        did_work |= kvm_launch_desktop::drive(&mut state);
         did_work |= socket::service_listener(&mut runtime_connections, &mut state);
         pass.mark(LoopPhase::Listener);
         if did_work {

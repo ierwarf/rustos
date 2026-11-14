@@ -706,8 +706,8 @@ fn broker_map_memfd_shared(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(),
     let len = checked_len(args.len)?;
     let start = checked_page_addr(args.addr)?;
     let mapping_end = checked_mapping_end(start, page_count(len)?)?;
-    let memfd = memfd_source(t, args.fd)?;
     let writable = args.prot & linux_abi::PROT_WRITE != 0;
+    let memfd = memfd_source(t, args.fd, writable)?;
     let (frames, hold) = memfd
         .acquire_mapping(
             usize::try_from(args.offset).map_err(|_| LINUX_EINVAL)?,
@@ -1215,11 +1215,16 @@ fn file_mapping_source(t: MmTarget, fd: u64) -> Result<FileMappingSource, i64> {
     source
 }
 
-fn memfd_source(t: MmTarget, fd: u64) -> Result<MemfdHandle, i64> {
+fn memfd_source(t: MmTarget, fd: u64, writable: bool) -> Result<MemfdHandle, i64> {
     let Some(source) = multitask::with_process_state_by_generation_mut(t.pid, t.process_generation, t.mm_generation, |process_state| {
         let entry = process_state.handles().get_entry(fd).ok_or(LINUX_EBADF)?;
         match entry.handle() {
-            KernelHandle::Memfd(memfd) => Ok(memfd.clone()),
+            KernelHandle::Memfd(memfd) => {
+                if !entry.rights().allows_read() || (writable && !entry.rights().allows_write()) {
+                    return Err(LINUX_EACCES);
+                }
+                Ok(memfd.clone())
+            }
             _ => Err(LINUX_EINVAL),
         }
     }) else {

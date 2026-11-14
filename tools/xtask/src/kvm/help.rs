@@ -46,6 +46,12 @@ options:
                        partial writes, blocking wakeups, dup/fork/exec, poll/epoll);
                        fails fast on `localfd: FAIL`, requires `localfd: PASS`
                        (implies --gui-dvm-surfaces)
+  --fault-probe        arm the `faultprobe` session program: process-group fault
+                       semantics (a fault in any thread kills the group once with
+                       SIGSEGV and every sibling is gone, a leader-retired group
+                       stays killable, fault vs exit_group reports one outcome);
+                       fails fast on `fault-probe: FAIL`, requires
+                       `fault-probe: all passed` (implies --gui-dvm-surfaces)
   --library-map-probe  arm the `libmapprobe` session program: two processes map a
                        pagerd-warmed library, share its physical frames, isolate a
                        private write, and release on exit; needs the storage-backed
@@ -99,6 +105,21 @@ options:
                        default is the idle-host profile. Not combinable with
                        --smp-iteration, whose sealed evidence does not record
                        the profile; ignored by --dry-run
+  --hold-seconds <seconds>
+                       observe mode: after readiness is accepted keep both guests
+                       up this many seconds (1..={MAX_SMOKE_HOLD_SECONDS}) on top of the --timeout readiness
+                       budget, then pass only if no guest exited and no startup,
+                       stall, crash or display failure appeared and every accepted
+                       marker still holds; logs stay in build/kvm. Implies
+                       --gui-dvm-surfaces; refused with --storage-dvm-only,
+                       --recovery-probe, --min-ui-fps and --smp-iteration
+  --launch-desktop <id.desktop>
+                       private KVM-only request: runtimed launches this registered
+                       desktop entry (e.g. chrome.desktop) once the UI is ready,
+                       through its normal launch path, and the run requires its
+                       `launched` record. Implies --gui-dvm-surfaces; an id that is
+                       malformed or absent from the staged registry is refused
+                       before boot. Refused with --storage-dvm-only/--smp-iteration
   --smp-iteration      require framed, checksummed per-CPU scheduler lifecycle
                        evidence; restricted to a bounded 30-second KVM smoke
   --smp-ring3-qualification

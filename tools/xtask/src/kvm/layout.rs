@@ -62,10 +62,16 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         || options.oom_hog
         || options.proc_stress
         || options.local_fd_probe
+        || options.fault_probe
         || options.library_map_probe
         || options.app_dmabuf_probe
         || options.mmap_cost_probe
-        || options.release_stage_probe;
+        || options.release_stage_probe
+        || options.launch_desktop.is_some();
+    if let Some(id) = options.launch_desktop.as_deref() {
+        // Refuse an unknown id before spending a boot on it.
+        validate_launch_desktop_registered(&config.image_dir.join("usr/share/applications"), id)?;
+    }
     let runtime_disk = if needs_private_contracts {
         let runtime_disk = run_dir.join("rustos-kvm.img");
         copy_sparse_file(&config.boot_disk_image, &runtime_disk).with_context(|| {
@@ -96,10 +102,12 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
             options.oom_hog,
             options.proc_stress,
             options.local_fd_probe,
+            options.fault_probe,
             options.library_map_probe.then(|| library_probe_contract(options.library_reclaim_probe)),
             options.release_stage_probe,
             options.app_dmabuf_probe,
             options.mmap_cost_probe.then_some(options.mmap_cost_sizes_mib.as_slice()),
+            options.launch_desktop.as_deref(),
         )?;
     }
     // Any physical VFIO device makes QEMU map every file-backed guest memory
@@ -645,10 +653,12 @@ fn write_private_kvm_contracts(
     oom_hog: bool,
     proc_stress: bool,
     local_fd_probe: bool,
+    fault_probe: bool,
     library_map_probe: Option<&[u8]>,
     release_stage_probe: bool,
     app_dmabuf_probe: bool,
     mmap_cost_sizes_mib: Option<&[u64]>,
+    launch_desktop: Option<&str>,
 ) -> Result<()> {
     let disk = std::fs::OpenOptions::new()
         .read(true)
@@ -707,6 +717,14 @@ fn write_private_kvm_contracts(
             FatWrite::write_all(&mut contract, LOCAL_FD_PROBE_CONTRACT_BODY)?;
             FatWrite::flush(&mut contract)?;
         }
+        if fault_probe {
+            let mut contract = root
+                .create_file(PRIVATE_FAULT_PROBE_CONTRACT_PATH)
+                .context("create private KVM fault probe contract file")?;
+            contract.truncate()?;
+            FatWrite::write_all(&mut contract, FAULT_PROBE_CONTRACT_BODY)?;
+            FatWrite::flush(&mut contract)?;
+        }
         if let Some(body) = library_map_probe {
             let mut contract = root
                 .create_file(PRIVATE_LIBRARY_MAP_PROBE_CONTRACT_PATH)
@@ -740,6 +758,14 @@ fn write_private_kvm_contracts(
             bundle.truncate()?;
             FatWrite::write_all(&mut bundle, &render_release_probe_bundle())?;
             FatWrite::flush(&mut bundle)?;
+        }
+        if let Some(id) = launch_desktop {
+            let mut contract = root
+                .create_file(PRIVATE_LAUNCH_DESKTOP_CONTRACT_PATH)
+                .context("create private KVM launch-desktop contract file")?;
+            contract.truncate()?;
+            FatWrite::write_all(&mut contract, render_launch_desktop_contract(id).as_bytes())?;
+            FatWrite::flush(&mut contract)?;
         }
         if oom_hog {
             let mut contract = root

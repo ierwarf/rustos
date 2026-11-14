@@ -324,6 +324,7 @@ pub(in crate::multitask::scheduler) fn lane_same_task(cpu: usize, slot: usize) {
 }
 /// Count one scheduler entry of `cause` on `cpu` (IRQs masked); folded with the
 /// next dispatch batch.
+#[cfg(not(test))]
 pub(in crate::multitask::scheduler) fn lane_entry_cause(cpu: usize, cause: SchedulerEntryCause) {
     let n = &mut lane_pending(cpu).entry_counts[cause as usize];
     *n = n.saturating_add(1);

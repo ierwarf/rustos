@@ -36,7 +36,7 @@ pub(super) fn syscall_linux_rustos_device_open_broker(args_ptr: u64) -> u64 {
 
     let args = match usermem::read_current_user_struct::<RustosDeviceOpenBrokerArgs>(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     if args.abi_version != rustos_user_abi::syscall::DEVMGRD_IPC_ABI_VERSION
         || args.reserved0 != 0
@@ -110,7 +110,7 @@ pub(super) fn syscall_linux_rustos_device_ioctl_broker(args_ptr: u64) -> u64 {
 
     let args = match usermem::read_current_user_struct::<RustosDeviceIoctlBrokerArgs>(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     if args.reserved0 != 0 || (args.process_id == 0 && !has_session_policy) {
         return linux_errno(LINUX_EINVAL);

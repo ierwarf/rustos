@@ -46,7 +46,7 @@ pub(super) fn control(args_ptr: u64) -> u64 {
     let args = match usermem::read_current_user_struct::<RustosLibraryObjectArgs>(args_ptr) {
         Ok(args) if args.is_canonical() => args,
         Ok(_) => return linux_errno(LINUX_EINVAL),
-        Err(error) => return linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
     };
     if args.op == LIBRARY_OBJECT_OP_PRESSURE {
         // Read-only counters for the pager's retention policy; no registry
@@ -59,7 +59,7 @@ pub(super) fn control(args_ptr: u64) -> u64 {
         };
         return match usermem::write_current_user_struct(args.payload_ptr, &wire) {
             Ok(()) => 0,
-            Err(error) => linux_errno(address_space_error_to_linux_errno(error)),
+            Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
         };
     }
     if args.op == LIBRARY_OBJECT_OP_SUPPLY_PAGE {
@@ -68,7 +68,7 @@ pub(super) fn control(args_ptr: u64) -> u64 {
         if let Err(error) =
             usermem::copy_from_current_user_exact(args.payload_ptr, &mut payload[..len])
         {
-            return linux_errno(address_space_error_to_linux_errno(error));
+            return linux_errno(user_pointer_error_to_linux_errno(error));
         }
         return control_op(pid, &args, &payload[..len]);
     }

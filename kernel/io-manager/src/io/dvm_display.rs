@@ -240,6 +240,10 @@ struct GpuSubmitGuard;
 impl GpuSubmitGuard {
     fn try_acquire() -> Option<Self> {
         GPU_SUBMIT_LOCK
+            // ORDERING: try-lock for the single GPU submitter. The AcqRel CAS acquires the
+            // previous holder's Release unlock below, so that holder's writes to the shared
+            // command slot and GPU_SLOT_* words are visible; the failure Acquire only
+            // reports Busy to the caller.
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
             .map(|_| Self)
@@ -248,6 +252,8 @@ impl GpuSubmitGuard {
 
 impl Drop for GpuSubmitGuard {
     fn drop(&mut self) {
+        // ORDERING: Release unlock publishes everything the submitter wrote (slot
+        // state, session counter, shared command bytes) to the next holder's AcqRel CAS.
         GPU_SUBMIT_LOCK.store(false, Ordering::Release);
     }
 }
@@ -256,19 +262,29 @@ impl Drop for GpuSubmitGuard {
 /// single-aperture V2 header is deliberately not recognized, so it cannot be
 /// selected as a fallback by PCI enumeration order or an incomplete launch.
 pub(crate) fn try_install() -> bool {
+    // ORDERING: Acquire loads pair with the Release stores that end installation
+    // (INSTALLED, after every aperture/geometry word is stored) and with the Release
+    // stores in revoke_transport/on_framebuffer_installed (TRANSPORT_REVOKED).
     if INSTALLED.load(Ordering::Acquire) {
         return !TRANSPORT_REVOKED.load(Ordering::Acquire);
     }
+    // ORDERING: sticky refusal bit set with Release in reject_install; Acquire only
+    // makes the refusal visible, no other data depends on it.
     if INSTALL_REJECTED.load(Ordering::Acquire) {
         return false;
     }
     if INSTALLING
+        // ORDERING: AcqRel CAS is the one-installer admission. Acquire sees the previous
+        // installer's Release store of INSTALLING=false (and so its INSTALL_REJECTED and
+        // static writes); the failure Acquire only makes this caller bail out.
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
         return false;
     }
     let installed = try_install_serialized();
+    // ORDERING: Release ends the exclusive install transaction and publishes every
+    // write try_install_serialized made to the next admitted installer.
     INSTALLING.store(false, Ordering::Release);
     installed
 }
@@ -276,8 +292,13 @@ pub(crate) fn try_install() -> bool {
 /// Early boot can precede PCI publication. Retry only the explicit V3 pool;
 /// absence remains unavailable and never selects an in-kernel or V2 provider.
 pub(crate) fn ensure_installed_before_present() {
+    // ORDERING: Acquire loads are a retry gate only; try_install re-checks both under
+    // the INSTALLING admission, which is the authority.
     if !INSTALLED.load(Ordering::Acquire) && !INSTALL_REJECTED.load(Ordering::Acquire) {
         let retry =
+            // ORDERING: bounded retry counter. No data is published through it; the AcqRel
+            // is stronger than needed and the INSTALLING CAS in try_install is what
+            // serializes installers.
             INSTALL_RETRY_BUDGET.fetch_update(Ordering::AcqRel, Ordering::Acquire, |budget| {
                 budget.checked_sub(1)
             });
@@ -297,18 +318,27 @@ pub(crate) fn gpu_atlas_info() -> Option<GpuAtlasInfo> {
 /// the per-process handle-table critical section never nests the sleepable
 /// MMIO registry.
 pub(crate) fn gpu_atlas_info_snapshot() -> Option<GpuAtlasInfo> {
+    // ORDERING: Acquire loads pair with the install-time Release stores of INSTALLED,
+    // the atlas geometry words and the prime fields (GPU_PRIME_DURATION_NS and
+    // GPU_SUBMIT_FLAGS stored before GUI_DVM_PEER_READY in drain_dvm_control). A
+    // provider replacement only zeroes words, which the checks below reject.
     if !INSTALLED.load(Ordering::Acquire)
+        // ORDERING: Acquire pairs with the Release stores of TRANSPORT_REVOKED (revoke_transport,
+        // on_framebuffer_installed) and of GUI_DVM_PEER_READY (drain_dvm_control).
         || TRANSPORT_REVOKED.load(Ordering::Acquire)
         || !GUI_DVM_PEER_READY.load(Ordering::Acquire)
     {
         return None;
     }
     let info = GpuAtlasInfo {
+        // ORDERING: Acquire pairs with the install-time Release stores of the atlas geometry;
+        // a provider replacement only zeroes these words and the != 0 checks below reject it.
         width: GPU_ATLAS_WIDTH.load(Ordering::Acquire),
         height: GPU_ATLAS_HEIGHT.load(Ordering::Acquire),
         stride_bytes: GPU_ATLAS_STRIDE_BYTES.load(Ordering::Acquire),
         slot_count: DVM_GPU_RENDER_MAX_IN_FLIGHT,
         context_id: GPU_CONTEXT_ID,
+        // ORDERING: epoch, prime duration and submit flags pair with the Release stores in service_gpu_epoch_reset and drain_dvm_control.
         context_epoch: GPU_CONTEXT_EPOCH.load(Ordering::Acquire),
         prime_fence_value: GPU_PRIME_FENCE_VALUE,
         prime_duration_ns: GPU_PRIME_DURATION_NS.load(Ordering::Acquire),
@@ -317,6 +347,8 @@ pub(crate) fn gpu_atlas_info_snapshot() -> Option<GpuAtlasInfo> {
     (info.width != 0
         && info.height != 0
         && info.stride_bytes >= info.width.saturating_mul(4)
+        // ORDERING: Acquire pairs with the install-time Release stores of the command/atlas offsets;
+        // zero (provider replaced) fails the contract check.
         && GPU_COMMAND_OFFSET.load(Ordering::Acquire) != 0
         && GPU_ATLAS_OFFSET.load(Ordering::Acquire) != 0
         && GPU_ATLAS_SLOT_BYTES.load(Ordering::Acquire) != 0
@@ -334,9 +366,13 @@ pub(crate) fn gpu_atlas_slot_mapping(slot: u32) -> Option<(u64, *mut u8, usize)>
     if slot >= info.slot_count {
         return None;
     }
+    // ORDERING: Acquire pairs with the install-time Release stores of the atlas slot
+    // size/offset (cleared to zero on provider replacement); the geometry is
+    // re-bounded against GUI_DVM_PIXEL_REGION_BYTES below.
     let slot_bytes = GPU_ATLAS_SLOT_BYTES.load(Ordering::Acquire);
     let slot_offset = slot_bytes
         .checked_mul(u64::from(slot))
+        // ORDERING: Acquire pairs with the install-time Release store of the atlas offset.
         .and_then(|offset| GPU_ATLAS_OFFSET.load(Ordering::Acquire).checked_add(offset))?;
     let phys_start = GUI_DVM_PIXEL_REGION_PHYS_ADDR.checked_add(slot_offset)?;
     let len = usize::try_from(slot_bytes).ok()?;
@@ -349,6 +385,8 @@ pub(crate) fn gpu_atlas_slot_mapping(slot: u32) -> Option<(u64, *mut u8, usize)>
     {
         return None;
     }
+    // ORDERING: Acquire pairs with the AcqRel publication CAS below, so a non-zero
+    // cached address implies the mmio mapper already registered that mapping.
     let cached = GPU_ATLAS_SLOT_MAP_ADDR[slot as usize].load(Ordering::Acquire);
     if cached != 0 {
         return Some((phys_start, cached as *mut u8, len));
@@ -360,6 +398,9 @@ pub(crate) fn gpu_atlas_slot_mapping(slot: u32) -> Option<(u64, *mut u8, usize)>
     match GPU_ATLAS_SLOT_MAP_ADDR[slot as usize].compare_exchange(
         0,
         mapping as usize,
+        // ORDERING: AcqRel publishes the new slot mapping; the failure Acquire observes
+        // the winner's mapping so this caller can unmap its duplicate and use the
+        // winner's address.
         Ordering::AcqRel,
         Ordering::Acquire,
     ) {
@@ -384,10 +425,14 @@ pub(crate) fn try_submit_gpu_atlas(
     batch: &[u8],
 ) -> DvmGpuSubmitOutcome {
     service_gpu_epoch_reset();
+    // ORDERING: Acquire gate loads pair with the Release stores of INSTALLED and
+    // TRANSPORT_REVOKED; the second TRANSPORT_REVOKED/PEER_READY checks below
+    // re-read after drain_dvm_control may have revoked or un-readied the peer.
     if !INSTALLED.load(Ordering::Acquire) || TRANSPORT_REVOKED.load(Ordering::Acquire) {
         return DvmGpuSubmitOutcome::Unavailable;
     }
     drain_dvm_control();
+    // ORDERING: Acquire re-reads revocation and peer readiness after drain_dvm_control; they pair with the Release stores in revoke_transport/drain_dvm_control.
     if TRANSPORT_REVOKED.load(Ordering::Acquire) {
         return DvmGpuSubmitOutcome::Unavailable;
     }
@@ -404,9 +449,15 @@ pub(crate) fn try_submit_gpu_atlas(
         return DvmGpuSubmitOutcome::Backpressured;
     };
     let slot = binding_slot as usize;
+    // ORDERING: Acquire loads of session counter and atlas geometry are read under
+    // the exclusive GpuSubmitGuard and pair with their install/Release stores; the
+    // counter is only mutated by the lock holder (and reset by drain after PEER_READY
+    // is cleared).
     let initial = GPU_SESSION_SUBMISSIONS.load(Ordering::Acquire) == 0;
     if slot >= GPU_SLOT_STATE.len()
         || surface_token == 0
+        // ORDERING: Acquire loads of the atlas geometry pair with the install-time Release stores;
+        // the submit must match the geometry the DVM was primed with.
         || width != GPU_ATLAS_WIDTH.load(Ordering::Acquire)
         || height != GPU_ATLAS_HEIGHT.load(Ordering::Acquire)
         || stride_bytes != GPU_ATLAS_STRIDE_BYTES.load(Ordering::Acquire)
@@ -420,7 +471,12 @@ pub(crate) fn try_submit_gpu_atlas(
         .compare_exchange(
             GPU_SLOT_FREE,
             GPU_SLOT_WRITING,
+            // ORDERING: the AcqRel CAS FREE -> WRITING claims the slot; Acquire pairs with the
+            // Release FREE stores (abandon paths and completion retirement), so the prior
+            // owner's clears happen-before this submitter's writes. Failure Acquire only
+            // reports Backpressured.
             Ordering::AcqRel,
+            // ORDERING: failure Acquire only reports Backpressured; the claim is not taken.
             Ordering::Acquire,
         )
         .is_err()
@@ -437,35 +493,50 @@ pub(crate) fn try_submit_gpu_atlas(
         stride_bytes,
     );
     let Some((header, source)) = parsed else {
+        // ORDERING: Release abandons the WRITING claim; nothing was published (state
+        // never reached SUBMITTED), and this orders this submitter's earlier writes
+        // before the next claimant's AcqRel CAS.
         GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
         return DvmGpuSubmitOutcome::Invalid;
     };
     if header.context_id != GPU_CONTEXT_ID
+        // ORDERING: Acquire pairs with the Release store of the context epoch in
+        // service_gpu_epoch_reset/install; a mismatch with the batch header is Invalid.
         || header.context_epoch != GPU_CONTEXT_EPOCH.load(Ordering::Acquire)
     {
+        // ORDERING: Release abandon of the WRITING claim; see the first abandon above.
         GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
         return DvmGpuSubmitOutcome::Invalid;
     }
     let Some(sequence) = next_gpu_sequence() else {
+        // ORDERING: Release abandons the claim. The Acquire load only reads the last
+        // acknowledged control sequence to echo into the revoke record.
         GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
         let control_sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
         revoke_transport("gpu-submit-sequence-exhausted", control_sequence);
         return DvmGpuSubmitOutcome::Unavailable;
     };
     let Some(next_session_submissions) = GPU_SESSION_SUBMISSIONS
+        // ORDERING: Acquire read of the session counter under the submit guard; the
+        // value is checked for overflow before it is stored back with Release.
         .load(Ordering::Acquire)
         .checked_add(1)
     else {
+        // ORDERING: Release abandons the claim; the Acquire load is the revoke-record echo
+        // of the acknowledged control sequence (Release-stored by drain/revoke).
         GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
         let control_sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
         revoke_transport("gpu-session-submit-counter-exhausted", control_sequence);
         return DvmGpuSubmitOutcome::Unavailable;
     };
+    // ORDERING: Acquire pairs with the Release store of the prime-proven submit flags
+    // (drain_dvm_control); they select the staged/direct path and are validated.
     let submit_flags = GPU_SUBMIT_FLAGS.load(Ordering::Acquire);
     if !matches!(
         submit_flags,
         DVM_GPU_ATLAS_SUBMIT_FLAG_STAGED_COPY | DVM_GPU_ATLAS_SUBMIT_FLAG_DIRECT_DMABUF
     ) {
+        // ORDERING: Release abandons the claim (unsupported submit flags).
         GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
         return DvmGpuSubmitOutcome::Unavailable;
     }
@@ -480,15 +551,26 @@ pub(crate) fn try_submit_gpu_atlas(
         damage_count: damage.len() as u32,
     };
     if !submit.matches_batch(header, source) || !publish_gpu_batch(slot, damage, batch, submit) {
+        // ORDERING: Release abandons the claim; the shared command bytes already written
+        // are never consumed because no invitation was written.
         GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
         return DvmGpuSubmitOutcome::Invalid;
     }
 
+    // ORDERING: these Release stores write the slot's capability words (generation,
+    // sequence, context id/epoch, submit value) while the state is still WRITING.
+    // They are consumed by query_gpu_atlas_completion only after it Acquire-loads
+    // SLOT_STATE==SUBMITTED, which the AcqRel CAS below publishes after them.
     GPU_SLOT_GENERATION[slot].store(source.generation, Ordering::Release);
+    // ORDERING: Release stores of the slot capability words while the state is still WRITING;
+    // they become visible to a completion query through the SUBMITTED publication CAS below.
     GPU_SLOT_SEQUENCE[slot].store(sequence, Ordering::Release);
     GPU_SLOT_CONTEXT_ID[slot].store(header.context_id, Ordering::Release);
     GPU_SLOT_CONTEXT_EPOCH[slot].store(header.context_epoch, Ordering::Release);
+    // ORDERING: last capability word; Release like the stores above, published by the SUBMITTED CAS.
     GPU_SLOT_SUBMIT_VALUE[slot].store(header.submit_value, Ordering::Release);
+    // ORDERING: the AcqRel CAS is the final slot publication and follows all
+    // payload/context Release stores under the still-live epoch claim.
     // ORDERING: the AcqRel CAS is the final slot publication and follows all
     // payload/context Release stores under the still-live epoch claim.
     if !lifecycle_claim.validate_current()
@@ -497,21 +579,32 @@ pub(crate) fn try_submit_gpu_atlas(
             .compare_exchange(
                 GPU_SLOT_WRITING,
                 GPU_SLOT_SUBMITTED,
+                // ORDERING: AcqRel publishes SUBMITTED after the Release stores above; failure Acquire
+                // observes a reset that already freed the slot.
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
             .is_err()
     {
+        // ORDERING: Release abandons the claim when the epoch moved or the publication
+        // CAS failed because a reset already freed the slot.
         GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
         return DvmGpuSubmitOutcome::Unavailable;
     }
     let Some(invitation_offset) = dvm_gpu_atlas_invitation_offset(binding_slot) else {
+        // ORDERING: Release abandons the claim after SUBMITTED was published but the
+        // invitation offset could not be formed (unreachable: slot < MAX_IN_FLIGHT).
         GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
         return DvmGpuSubmitOutcome::Invalid;
     };
     write_u64(invitation_offset, sequence);
     GPU_SLOT_PENDING_POLLS[slot].store(0, Ordering::Relaxed);
+    // ORDERING: Release store under the submit guard; the next guard holder reads
+    // it after its AcqRel CAS on the lock, so Release here is belt and braces.
     GPU_SESSION_SUBMISSIONS.store(next_session_submissions, Ordering::Release);
+    // ORDERING: SeqCst is a full barrier ordering the invitation and command-slot
+    // stores (volatile/plain shared-RAM writes, invisible to Release/Acquire pairs)
+    // ahead of the doorbell write in signal_gpu_dvm that makes the DVM read them.
     fence(Ordering::SeqCst);
     signal_gpu_dvm();
     DvmGpuSubmitOutcome::Submitted
@@ -522,10 +615,12 @@ pub(crate) fn query_gpu_atlas_completion(
     result: &mut [u8; driver_domain_protocol::DVM_GPU_ATLAS_COMPLETION_SLOT_BYTES],
 ) -> DvmGpuCompletionOutcome {
     service_gpu_epoch_reset();
+    // ORDERING: Acquire gate loads, as in try_submit_gpu_atlas.
     if !INSTALLED.load(Ordering::Acquire) || TRANSPORT_REVOKED.load(Ordering::Acquire) {
         return DvmGpuCompletionOutcome::Unavailable;
     }
     drain_dvm_control();
+    // ORDERING: Acquire re-reads revocation after drain_dvm_control; pairs with the Release store in revoke_transport.
     if TRANSPORT_REVOKED.load(Ordering::Acquire) {
         return DvmGpuCompletionOutcome::Unavailable;
     }
@@ -539,6 +634,8 @@ pub(crate) fn query_gpu_atlas_completion(
     if slot >= GPU_SLOT_STATE.len() {
         return DvmGpuCompletionOutcome::Invalid;
     }
+    // ORDERING: Acquire pairs with the AcqRel CAS that publishes SUBMITTED, so the
+    // slot's capability words stored before it are visible below.
     match GPU_SLOT_STATE[slot].load(Ordering::Acquire) {
         GPU_SLOT_SUBMITTED => {}
         // FREE here means the caller still holds a ticket for a submission
@@ -551,6 +648,7 @@ pub(crate) fn query_gpu_atlas_completion(
         GPU_SLOT_FREE => return DvmGpuCompletionOutcome::Unavailable,
         _ => return DvmGpuCompletionOutcome::Pending,
     }
+    // ORDERING: Acquire pairs with the Release store of the slot sequence at submit.
     let expected_sequence = GPU_SLOT_SEQUENCE[slot].load(Ordering::Acquire);
     let Some(sequence_offset) = dvm_gpu_atlas_completion_sequence_offset(binding_slot) else {
         return DvmGpuCompletionOutcome::Invalid;
@@ -564,6 +662,8 @@ pub(crate) fn query_gpu_atlas_completion(
         return DvmGpuCompletionOutcome::Pending;
     }
     if observed_sequence > expected_sequence {
+        // ORDERING: Acquire read of the acknowledged control sequence, used only to
+        // label the revoke record written to the host.
         let control_sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
         revoke_transport("gpu-completion-sequence-ahead", control_sequence);
         return DvmGpuCompletionOutcome::Unavailable;
@@ -575,20 +675,34 @@ pub(crate) fn query_gpu_atlas_completion(
     if read_bytes(completion_offset, &mut bytes).is_none() {
         return DvmGpuCompletionOutcome::Unavailable;
     }
+    // ORDERING: the DVM stores the completion body before its sequence word, which
+    // this path read first via read_u64. This Acquire fence follows the body read
+    // and keeps the validation loads and the ack below from moving above it; the
+    // sequence -> body ordering itself rests on x86 TSO (loads are not reordered
+    // with older loads) and on volatile reads not being reordered by the compiler.
+    // ORDERING: Acquire fence, see the note above: sequence -> body ordering relies on x86 TSO plus volatile program order.
     fence(Ordering::Acquire);
     let Some(completion) = DvmGpuAtlasCompletion::decode(&bytes) else {
         log_malformed_gpu_completion(binding_slot, expected_sequence, &bytes);
+        // ORDERING: Acquire echo of the acknowledged control sequence for the revoke
+        // record; the malformed completion itself was decoded from the local copy.
         let control_sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
         revoke_transport("gpu-completion-malformed", control_sequence);
         return DvmGpuCompletionOutcome::Unavailable;
     };
     if completion.slot != binding_slot
+        // ORDERING: these Acquire loads pair with the Release stores of the slot
+        // capability words at submit; the untrusted completion must match all of
+        // them, otherwise the transport is revoked (mismatch is never repaired).
         || completion.generation != GPU_SLOT_GENERATION[slot].load(Ordering::Acquire)
         || completion.sequence != expected_sequence
+        // ORDERING: Acquire loads pair with the Release stores of the slot capability words at submit;
+        // all must match the untrusted completion or the transport is revoked.
         || completion.render.context_id != GPU_SLOT_CONTEXT_ID[slot].load(Ordering::Acquire)
         || completion.render.context_epoch != GPU_SLOT_CONTEXT_EPOCH[slot].load(Ordering::Acquire)
         || completion.render.submit_value != GPU_SLOT_SUBMIT_VALUE[slot].load(Ordering::Acquire)
     {
+        // ORDERING: Acquire echo of the acknowledged control sequence for the revoke record.
         let control_sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
         revoke_transport("gpu-completion-capability-mismatch", control_sequence);
         return DvmGpuCompletionOutcome::Unavailable;
@@ -638,11 +752,19 @@ pub(crate) fn query_gpu_atlas_completion(
         return DvmGpuCompletionOutcome::Pending;
     }
     write_u64(ack_offset, expected_sequence);
+    // ORDERING: retirement is under the exclusive SUBMITTED -> WRITING claim. The
+    // capability words are cleared first and the Release FREE store last, so a
+    // later submitter's AcqRel CAS on FREE sees all of them cleared and cannot have
+    // its own freshly stored words wiped by a stale retirer.
     GPU_SLOT_GENERATION[slot].store(0, Ordering::Release);
+    // ORDERING: capability words are cleared while this retirer holds the WRITING claim, so no
+    // submitter can have stored new words; Release orders them before the FREE store below.
     GPU_SLOT_SEQUENCE[slot].store(0, Ordering::Release);
     GPU_SLOT_CONTEXT_ID[slot].store(0, Ordering::Release);
     GPU_SLOT_CONTEXT_EPOCH[slot].store(0, Ordering::Release);
+    // ORDERING: last cleared capability word; the Release FREE store follows.
     GPU_SLOT_SUBMIT_VALUE[slot].store(0, Ordering::Release);
+    // ORDERING: Release FREE is last; pairs with the next submitter's AcqRel claim CAS on FREE.
     GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
     *result = bytes;
     DvmGpuCompletionOutcome::Completed
@@ -718,12 +840,15 @@ fn parse_gpu_batch(
 }
 
 fn next_gpu_sequence() -> Option<u64> {
+    // ORDERING: monotonic sequence allocator; callers hold the GpuSubmitGuard, so the CAS only
+    // needs atomicity for uniqueness. Acquire/AcqRel are stronger than needed and publish no data.
     let mut current = GPU_NEXT_SEQUENCE.load(Ordering::Acquire);
     loop {
         let next = current.checked_add(1)?;
         match GPU_NEXT_SEQUENCE.compare_exchange_weak(
             current,
             next,
+            // ORDERING: AcqRel CAS (stronger than needed, see above); failure Acquire just reloads.
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
@@ -739,9 +864,12 @@ fn publish_gpu_batch(
     batch: &[u8],
     submit: DvmGpuAtlasSubmit,
 ) -> bool {
+    // ORDERING: Acquire loads pair with the install-time Release stores of the pool/atlas addresses and
+    // offsets. Zero (replaced provider) is rejected below and all offsets are bounded by the fixed region size.
     let pixels = SHARED_PIXEL_ADDR.load(Ordering::Acquire);
     let atlas_base = GPU_ATLAS_OFFSET.load(Ordering::Acquire);
     let atlas_slot_bytes = GPU_ATLAS_SLOT_BYTES.load(Ordering::Acquire);
+    // ORDERING: Acquire pairs with the install-time Release store of the command offset.
     let command_base = GPU_COMMAND_OFFSET.load(Ordering::Acquire);
     let Some(atlas_offset) = atlas_slot_bytes
         .checked_mul(slot as u64)
@@ -782,6 +910,11 @@ fn publish_gpu_batch(
     {
         return false;
     }
+    // `pixels` is the higher-half mapping of the reserved GUI_DVM_PIXEL_REGION_BYTES
+    // pixel region, never unmapped after install; every offset below uses checked
+    // arithmetic and batch_end <= command_end <= region bounds was verified above.
+    // SAFETY: the pointers stay inside that region; this submitter owns the slot's
+    // command area (state WRITING via its CAS) and the sources are distinct kernel buffers.
     unsafe {
         for (index, rect) in damage.iter().copied().enumerate() {
             let encoded = rect.encode();
@@ -804,17 +937,24 @@ fn publish_gpu_batch(
             encoded.len(),
         );
     }
+    // ORDERING: SeqCst fence orders the plain command/damage/batch copies ahead of the later SUBMITTED publication and invitation write.
     fence(Ordering::SeqCst);
     true
 }
 
 fn signal_gpu_dvm() {
+    // ORDERING: Acquire loads pair with the Release store of the doorbell address at install and the
+    // Release store of PEER_READY in drain_dvm_control; the doorbell is only rung for a ready peer.
     let doorbell = SHARED_DOORBELL_ADDR.load(Ordering::Acquire);
     if doorbell == 0 || !GUI_DVM_PEER_READY.load(Ordering::Acquire) {
         return;
     }
+    // ORDERING: SeqCst fence orders every earlier shared-memory store ahead of the doorbell MMIO write below.
     fence(Ordering::SeqCst);
     let value = (GUI_DVM_PEER_ID << 16).to_le();
+    // SAFETY: `doorbell` is the non-zero BAR0 register mapping published at install (never unmapped);
+    // find_ivshmem_gui_pool checked registers.size covers the 4-byte write at IVSHMEM_DOORBELL_OFFSET,
+    // and the mapping base is page aligned so the u32 access is aligned MMIO.
     unsafe {
         (doorbell as *mut u8)
             .add(IVSHMEM_DOORBELL_OFFSET)
@@ -866,15 +1006,20 @@ fn publish_frame(
     stride_bytes: usize,
     damage: DvmDisplayDamage,
 ) -> DvmPresentOutcome {
+    // ORDERING: Acquire pairs with the Release store of INSTALLED that ends installation.
     if !INSTALLED.load(Ordering::Acquire) {
         return DvmPresentOutcome::Unavailable;
     }
     drain_dvm_control();
+    // ORDERING: Acquire re-reads revocation after the control drain, then loads the single-writer
+    // generation published by the AcqRel CAS below and the acknowledged control sequence (echoed into revoke records).
     if TRANSPORT_REVOKED.load(Ordering::Acquire) {
         return DvmPresentOutcome::Unavailable;
     }
+    // ORDERING: Acquire; PUBLISHED_GENERATION has a single host writer (see the CAS below).
     let preferred_generation = PUBLISHED_GENERATION.load(Ordering::Acquire);
     let Some(generation) = preferred_generation.checked_add(2) else {
+        // ORDERING: Acquire pairs with the Release stores of the acknowledged sequence in drain_dvm_control/revoke_transport.
         let sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
         revoke_transport("host-generation-exhausted", sequence);
         return DvmPresentOutcome::Unavailable;
@@ -899,15 +1044,18 @@ fn publish_frame(
         preferred_generation,
     );
     if !copied {
+        // ORDERING: Release abandons the reserved slot (content generation cleared first); pairs with the AcqRel claim CAS in reserve_free_slot.
         SLOT_CONTENT_GENERATION[slot].store(0, Ordering::Release);
         SLOT_STATE[slot].store(GUI_SLOT_FREE, Ordering::Release);
         return DvmPresentOutcome::Unavailable;
     }
     let message = DvmGuiSurfaceMessage::present(slot as u32, generation, damage);
     if !message.is_valid_for_dimensions(
+        // ORDERING: Acquire loads pair with the install-time Release stores of the pool dimensions.
         POOL_WIDTH.load(Ordering::Acquire),
         POOL_HEIGHT.load(Ordering::Acquire),
     ) {
+        // ORDERING: Release abandons the reserved slot, as above.
         SLOT_CONTENT_GENERATION[slot].store(0, Ordering::Release);
         SLOT_STATE[slot].store(GUI_SLOT_FREE, Ordering::Release);
         warn_rejected("host-present-record-invalid");
@@ -917,6 +1065,8 @@ fn publish_frame(
         .compare_exchange(
             preferred_generation,
             generation,
+            // ORDERING: AcqRel CAS detects a second host writer: only the writer whose preferred generation
+            // is still current succeeds; failure Acquire observes the winner.
             Ordering::AcqRel,
             Ordering::Acquire,
         )
@@ -925,6 +1075,8 @@ fn publish_frame(
         // The display backend contract permits one host snapshot writer. If
         // that invariant is ever violated, this slot may have been patched
         // from a non-predecessor base and must never be published or reused.
+        // ORDERING: Release abandons a slot patched from a non-predecessor base; clearing the
+        // content generation first prevents reuse as an incremental base. Acquire reads the echo sequence.
         SLOT_CONTENT_GENERATION[slot].store(0, Ordering::Release);
         SLOT_STATE[slot].store(GUI_SLOT_FREE, Ordering::Release);
         let sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
@@ -932,9 +1084,12 @@ fn publish_frame(
         return DvmPresentOutcome::Unavailable;
     }
     write_host_record(slot, message);
+    // ORDERING: Release stores publish the slot, ending with READY. The DVM-visible host record was
+    // written (SeqCst fence in write_bytes) before them; drain_dvm_control Acquire-loads READY then the generation.
     SLOT_CONTENT_GENERATION[slot].store(generation, Ordering::Release);
     LAST_SOURCE_PTR.store(src_ptr as usize, Ordering::Release);
     SLOT_GENERATION[slot].store(generation, Ordering::Release);
+    // ORDERING: READY is the slot's final Release publication (see the group above).
     SLOT_STATE[slot].store(GUI_SLOT_READY, Ordering::Release);
     signal_gui_dvm(generation);
     DvmPresentOutcome::Presented
@@ -943,11 +1098,14 @@ fn publish_frame(
 fn reserve_free_slot(preferred_generation: u64) -> Option<usize> {
     if preferred_generation != 0 {
         for (slot, state) in SLOT_STATE.iter().enumerate() {
+            // ORDERING: Acquire reads the retained content generation; pairs with the Release store at publish.
             if SLOT_CONTENT_GENERATION[slot].load(Ordering::Acquire) == preferred_generation
                 && state
                     .compare_exchange(
                         GUI_SLOT_FREE,
                         GUI_SLOT_WRITING,
+                        // ORDERING: AcqRel claim FREE -> WRITING; Acquire pairs with the Release FREE store that freed the slot
+                        // (drain_dvm_control release or abandon), so earlier DVM-release bookkeeping is visible.
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     )
@@ -962,6 +1120,7 @@ fn reserve_free_slot(preferred_generation: u64) -> Option<usize> {
             .compare_exchange(
                 GUI_SLOT_FREE,
                 GUI_SLOT_WRITING,
+                // ORDERING: AcqRel claim of any free slot, same pairing as above.
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -1030,6 +1189,7 @@ fn copy_into_slot(
     previous_generation: u64,
 ) -> bool {
     if src_ptr.is_null()
+        // ORDERING: Acquire loads pair with the install-time Release stores of the pool geometry.
         || width != POOL_WIDTH.load(Ordering::Acquire) as usize
         || height != POOL_HEIGHT.load(Ordering::Acquire) as usize
         || stride_bytes != POOL_STRIDE_BYTES.load(Ordering::Acquire) as usize
@@ -1042,11 +1202,13 @@ fn copy_into_slot(
         warn_rejected("slot-offset-invalid");
         return false;
     };
+    // ORDERING: Acquire pairs with the Release store of LAST_SOURCE_PTR at publish; it only selects incremental vs full copy.
     let source_matches = LAST_SOURCE_PTR.load(Ordering::Acquire) == src_ptr as usize;
     let Some(plan) = snapshot_copy_plan(
         damage,
         width,
         height,
+        // ORDERING: Acquire pairs with the Release store of the slot content generation at publish or clear.
         SLOT_CONTENT_GENERATION[slot].load(Ordering::Acquire),
         previous_generation,
         source_matches,
@@ -1095,14 +1257,20 @@ fn copy_into_slot(
     else {
         return false;
     };
+    // ORDERING: Acquire pairs with the install-time Release store of the slot size.
     if copy_end > POOL_SLOT_BYTES.load(Ordering::Acquire) as usize {
         warn_rejected("copy-exceeds-slot");
         return false;
     }
+    // ORDERING: Acquire pairs with the install-time Release store of the pixel mapping address.
     let pixels = SHARED_PIXEL_ADDR.load(Ordering::Acquire);
     if pixels == 0 {
         return false;
     }
+    // SAFETY: `source` stays inside the caller's frame (KernelBgraFrame contract, geometry equal to the
+    // pool geometry checked above, extent bounded by `end`). The destination lies inside this slot:
+    // copy_end <= POOL_SLOT_BYTES and slot_offset() is bounded by header_fits_resource at install. The slot is
+    // exclusively WRITING-owned by this publisher, and the reserved pool is outside the allocator, so no overlap.
     unsafe {
         let source = src_ptr.add(row_offset);
         let destination = (pixels as *mut u8).add(slot_offset + row_offset);
@@ -1123,6 +1291,7 @@ fn copy_into_slot(
             }
         }
     }
+    // ORDERING: SeqCst fence orders the pixel copy ahead of the slot publication and invitation the DVM acts on.
     fence(Ordering::SeqCst);
     true
 }
@@ -1148,19 +1317,27 @@ fn damage_bounds(
 
 /// A replacement provider must not leave an installed GUI-DVM pool reachable.
 pub(crate) fn on_framebuffer_installed(framebuffer_addr: u64) {
+    // ORDERING: Acquire pairs with the install-time Release store of the pixel mapping address.
     let pixel_addr = SHARED_PIXEL_ADDR.load(Ordering::Acquire);
     let Some(first_slot) = slot_offset(0) else {
         return;
     };
     if pixel_addr != 0 && framebuffer_addr != pixel_addr as u64 + first_slot as u64 {
+        // ORDERING: teardown. Release stores zero the addresses and geometry before INSTALLED/REVOKED flip, so
+        // a reader that Acquires either flag sees zeros and bails. Mappings are never unmapped, so a pointer
+        // loaded earlier by a racing reader stays valid memory.
         SHARED_HEADER_ADDR.store(0, Ordering::Release);
         SHARED_PIXEL_ADDR.store(0, Ordering::Release);
+        // ORDERING: Release zeroing; see the teardown note above.
         SHARED_DOORBELL_ADDR.store(0, Ordering::Release);
+        // ORDERING: Release zeroing; see the teardown note above.
         GPU_COMMAND_OFFSET.store(0, Ordering::Release);
+        // ORDERING: continuation of the same teardown sequence, ordered after the zeroed addresses.
         GPU_ATLAS_OFFSET.store(0, Ordering::Release);
         GPU_ATLAS_SLOT_BYTES.store(0, Ordering::Release);
         GPU_ATLAS_WIDTH.store(0, Ordering::Release);
         GPU_ATLAS_HEIGHT.store(0, Ordering::Release);
+        // ORDERING: INSTALLED=false then TRANSPORT_REVOKED=true; Release makes the zeroed words visible first.
         GPU_ATLAS_STRIDE_BYTES.store(0, Ordering::Release);
         INSTALLED.store(false, Ordering::Release);
         TRANSPORT_REVOKED.store(true, Ordering::Release);
@@ -1178,10 +1355,12 @@ pub(crate) fn on_framebuffer_installed(framebuffer_addr: u64) {
 /// MSI-X leaf callbacks: allocation, logging, composition, and protocol
 /// parsing are forbidden here. The next normal present drains the fixed record.
 fn gui_dvm_control_interrupt(_vector: u8) {
+    // ORDERING: IRQ leaf: Release sets the pending bit; drain_dvm_control consumes it with an AcqRel swap in normal context.
     GUI_DVM_CONTROL_IRQ_PENDING.store(true, Ordering::Release);
 }
 
 fn gui_dvm_offline_interrupt(_vector: u8) {
+    // ORDERING: IRQ leaf: Release sets the offline pending bit; consumed by the AcqRel swap in drain_dvm_control.
     GUI_DVM_OFFLINE_IRQ_PENDING.store(true, Ordering::Release);
 }
 

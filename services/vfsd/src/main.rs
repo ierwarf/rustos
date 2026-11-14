@@ -199,8 +199,12 @@ fn linux_response_for_op(op: u16) -> LinuxSyscallOffloadResponse {
     let mut response = MaybeUninit::<LinuxSyscallOffloadResponse>::uninit();
     let ptr = response.as_mut_ptr().cast::<u8>();
     for offset in 0..size_of::<LinuxSyscallOffloadResponse>() {
+        // SAFETY: `ptr` addresses byte `offset < size_of::<LinuxSyscallOffloadResponse>()` of
+        // the local `MaybeUninit`, so the write is in bounds and aligned (u8).
         unsafe { core::ptr::write_volatile(ptr.add(offset), 0) };
     }
+    // SAFETY: every byte of `response` was zeroed above, and the response is an
+    // all-integer `repr(C)` wire struct for which the zero pattern is valid.
     let mut response = unsafe { response.assume_init() };
     response.version = SYSCALL_OFFLOAD_ABI_VERSION;
     response.op = op;
@@ -224,6 +228,10 @@ fn vfs_request_identity_admitted(request: &VfsIpcRequest, sender_pid: u64, sende
 fn reset_vfs_response_slot(op: u16) -> *mut VfsIpcResponse {
     let response = core::ptr::addr_of_mut!(VFS_RESPONSE_SLOT);
     let ptr = response.cast::<u8>();
+    // SAFETY: `VFS_RESPONSE_SLOT` is touched only here, from `serve`, which runs on
+    // the single receive-owner thread; the previous reply completed before the next
+    // request was received, so no other reference to the slot is live. The write
+    // stays inside the slot (size_of::<VfsIpcResponse>()).
     unsafe {
         core::ptr::write_bytes(ptr, 0, size_of::<VfsIpcResponse>());
         (*response).version = VFS_IPC_ABI_VERSION;
@@ -342,8 +350,9 @@ fn serve(endpoint: u64, mut state: VfsState) {
     let mut sender_tid = 0_u64;
     // Replies that are built locally live here so the fused reply-and-receive
     // can send them after the request buffer is reused for the next message.
-    let mut commercial_response = CommercialMaxProtocolResponse::default();
-    let mut linux_response = LinuxSyscallOffloadResponse::default();
+    // Each is assigned in the arm that serves it, before its address is taken.
+    let mut commercial_response: CommercialMaxProtocolResponse;
+    let mut linux_response: LinuxSyscallOffloadResponse;
     let mut received = receive_request(
         endpoint,
         &mut request,
@@ -367,10 +376,16 @@ fn serve(endpoint: u64, mut state: VfsState) {
 
         state.drain_lifecycle_events(&mut lifecycle_drain_failures);
         let served = {
+            // SAFETY: `received` is the length the kernel reported for this receive, bounded
+            // by VFS_RECV_BYTES, and those bytes were written by the kernel; the slice is
+            // read-only and dropped before the buffer is reused by the next receive.
             let request = unsafe {
                 core::slice::from_raw_parts(request.as_ptr() as *const u8, received as usize)
             };
             if received as usize == size_of::<VfsExecutableSnapshotRequest>() {
+                // SAFETY: `received` equals size_of VfsExecutableSnapshotRequest exactly; the
+                // buffer is the `align(8)` VfsRecvBuffer and the request is an all-integer
+                // `repr(C)` wire struct, so alignment and every bit pattern are valid.
                 let request = unsafe { &*request.as_ptr().cast::<VfsExecutableSnapshotRequest>() };
                 // The snapshot reply carries handles or is completed by the
                 // snapshot worker, so it never joins the fused turn.
@@ -393,15 +408,23 @@ fn serve(endpoint: u64, mut state: VfsState) {
                     },
                 )
             } else if received as usize == size_of::<VfsIpcRequest>() {
+                // SAFETY: `received` equals size_of VfsIpcRequest exactly; same 8-aligned
+                // receive buffer and all-integer `repr(C)` layout as above.
                 let request = unsafe { &*request.as_ptr().cast::<VfsIpcRequest>() };
                 let response = reset_vfs_response_slot(request.op);
                 if !vfs_request_identity_admitted(request, sender_pid, sender_tid) {
+                    // SAFETY: `response` is the exclusive static slot just reset by
+                    // reset_vfs_response_slot on this receive-owner thread.
                     unsafe { (*response).status = EACCES };
                 } else {
+                    // SAFETY: `response` is the exclusive static slot just reset on this receive-owner
+                    // thread; no other reference to it exists while the handler runs.
                     state.handle_vfs_request(request, unsafe { &mut *response });
                 }
                 Served::Reply(response.cast::<u8>(), size_of::<VfsIpcResponse>())
             } else if received as usize == size_of::<CommercialMaxProtocolRequest>() {
+                // SAFETY: `received` equals size_of CommercialMaxProtocolRequest exactly; same
+                // 8-aligned receive buffer and all-integer `repr(C)` layout as above.
                 let request = unsafe { &*request.as_ptr().cast::<CommercialMaxProtocolRequest>() };
                 commercial_response = if request.header.subject_pid != sender_pid
                     || request.header.subject_tid != sender_tid
@@ -419,6 +442,8 @@ fn serve(endpoint: u64, mut state: VfsState) {
                     size_of::<CommercialMaxProtocolResponse>(),
                 )
             } else if received as usize == size_of::<LinuxSyscallOffloadRequest>() {
+                // SAFETY: `received` equals size_of LinuxSyscallOffloadRequest exactly; same
+                // 8-aligned receive buffer and all-integer `repr(C)` layout as above.
                 let request = unsafe { &*request.as_ptr().cast::<LinuxSyscallOffloadRequest>() };
                 linux_response = if request.pid != sender_pid || request.tid != sender_tid {
                     LinuxSyscallOffloadResponse {
@@ -525,6 +550,10 @@ fn reply_executable_snapshot(
         reserved0: 0,
         reserved1: 0,
     };
+    // SAFETY: `args` and `response` are live locals for the synchronous call, and
+    // `send_fd` is a descriptor owned by `snapshot`, which is dropped only after
+    // the reply returns; the kernel copies the args by value and validates the
+    // embedded pointers and the one-shot `reply_cap`.
     let reply = unsafe {
         rustos_svc_runtime::syscall::syscall1(
             SYS_RUSTOS_IPC_REPLY_WITH_HANDLES,
@@ -547,16 +576,23 @@ fn reply_executable_snapshot(
 }
 
 fn demote_after_ui_bootstrap_snapshot_reply() {
+    // ORDERING: once-only latch for the one-way scheduling demotion; it guards no
+    // other data, so Acquire here pairs only with the Release store below.
     if SNAPSHOT_WORKER_DEMOTED.load(Ordering::Acquire) {
         return;
     }
+    // SAFETY: raw syscall with no pointer arguments; it demotes the calling thread.
     let status = unsafe { rustos_svc_runtime::syscall::syscall0(SYS_RUSTOS_SCHED_DEMOTE_SELF) };
     if status == 0 {
+        // ORDERING: Release publishes that the demotion succeeded to later Acquire
+        // readers of the latch; nothing else is ordered by it.
         SNAPSHOT_WORKER_DEMOTED.store(true, Ordering::Release);
         debug_line("vfsd: post-ui scheduling class=user");
         return;
     }
     debug_line("vfsd: fatal post-ui scheduling demotion failed");
+    // SAFETY: raw `exit` syscall with an integer status; it does not return, the loop
+    // below only satisfies the type if it somehow did.
     unsafe {
         rustos_svc_runtime::syscall::syscall1(linux_abi::SYS_EXIT, 134);
     }
@@ -665,6 +701,9 @@ include!("state_storage.rs");
 fn duplicate_snapshot_fd(fd: i32) -> Result<i32, i32> {
     // The caller holds storage ownership: eviction cannot close/reuse the
     // cache fd before this request acquires its independent descriptor.
+    // SAFETY: raw `fcntl(F_DUPFD_CLOEXEC)` takes only integers; `fd` is the cache
+    // descriptor the caller holds under storage ownership, so it cannot be closed
+    // or reused concurrently.
     let result = unsafe {
         rustos_svc_runtime::syscall::syscall3(
             linux_abi::SYS_FCNTL,
@@ -682,6 +721,8 @@ fn duplicate_snapshot_fd(fd: i32) -> Result<i32, i32> {
 
 fn close_fd(fd: i32) {
     if fd >= 0 {
+        // SAFETY: raw `close` takes only the integer `fd`; callers pass descriptors they
+        // own and no longer use, and a bad number yields EBADF.
         unsafe {
             let _ = rustos_svc_runtime::syscall::syscall1(linux_abi::SYS_CLOSE, fd as u64);
         }
@@ -697,7 +738,9 @@ fn call_rootd_checkpoint(
     if endpoint < 0 {
         return Err((-endpoint) as i32);
     }
+    // SAFETY: raw `getpid` syscall with no arguments and no memory access.
     let pid = unsafe { rustos_svc_runtime::syscall::syscall0(linux_abi::SYS_GETPID) };
+    // SAFETY: raw `gettid` syscall with no arguments and no memory access.
     let tid = unsafe { rustos_svc_runtime::syscall::syscall0(linux_abi::SYS_GETTID) };
     if pid <= 0 || tid <= 0 {
         return Err(EIO);
@@ -719,6 +762,9 @@ fn call_rootd_checkpoint(
         request.payload[..bytes.len()].copy_from_slice(&bytes);
     }
     let mut response = CommercialMaxProtocolResponse::default();
+    // SAFETY: `request` is readable for its exact size and `response` is writable for
+    // its exact size, both live locals across the synchronous call; the kernel keeps
+    // no pointer after it returns.
     let received = unsafe {
         ipc::call(
             endpoint as u64,
@@ -823,6 +869,9 @@ fn checkpoint_handle_record(
         last_start,
         last_result,
     };
+    // SAFETY: `wire` is a live local `repr(C)` OpenDescriptionCheckpointWire whose
+    // size is const-asserted to 64 bytes with no padding, so every byte is
+    // initialized; the view is read-only and copied immediately.
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&wire as *const OpenDescriptionCheckpointWire).cast::<u8>(),
@@ -925,6 +974,9 @@ fn epoll_interest_from_request(request: &VfsIpcRequest) -> Option<WaitSetInteres
     if request.payload_len as usize != wire_size {
         return None;
     }
+    // SAFETY: `payload_len` was checked equal to size_of WaitSetInterestWire (48),
+    // within the payload array; `read_unaligned` needs no alignment and the
+    // all-integer wire struct accepts any bit pattern.
     let wire = unsafe {
         core::ptr::read_unaligned(request.payload.as_ptr().cast::<WaitSetInterestWire>())
     };
@@ -1037,6 +1089,11 @@ impl DirEntry {
     }
 }
 
+pub(crate) const VFS_DEVICE_ACCESS_NULL: u16 =
+    rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT + 1;
+pub(crate) const VFS_DEVICE_ACCESS_URANDOM: u16 =
+    rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT + 2;
+
 fn is_input_device_node(path: &str) -> bool {
     matches!(path, "/dev/input0" | "/dev/input/event0")
 }
@@ -1046,6 +1103,8 @@ fn device_access_for_path(path: &str) -> u64 {
         "/dev/input0" => rustos_user_abi::syscall::INPUTD_ACCESS_NATIVE as u64,
         "/dev/input/event0" => rustos_user_abi::syscall::INPUTD_ACCESS_EVDEV as u64,
         "/dev/dri/card0" => rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT as u64,
+        "/dev/null" => VFS_DEVICE_ACCESS_NULL as u64,
+        "/dev/urandom" | "/dev/random" => VFS_DEVICE_ACCESS_URANDOM as u64,
         _ => 0,
     }
 }

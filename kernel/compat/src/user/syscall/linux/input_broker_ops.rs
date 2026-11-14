@@ -43,7 +43,7 @@ pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
 
     let args = match usermem::read_current_user_struct::<InputStatsBrokerArgs>(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     if !input_broker_abi_is_current(args.abi_version)
         || args.reserved0 != 0
@@ -70,7 +70,7 @@ pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
 
     match usermem::write_current_user_struct(args.out_stats_ptr, &stats) {
         Ok(()) => 0,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
     }
 }
 // RING3-MIGRATION-REFERENCE END: inputd-owned input broker policy.
@@ -82,7 +82,7 @@ pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
 
     let args = match usermem::read_current_user_struct::<InputIngestBrokerArgs>(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     if !input_broker_abi_is_current(args.abi_version)
         || args.reserved0 != 0
@@ -110,7 +110,7 @@ pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
         (args.out_records_ptr, records_byte_cap),
         (args.out_count_ptr, 4),
     ]) {
-        return linux_errno(address_space_error_to_linux_errno(err));
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     let mut records = alloc::vec![InputDvmRecordWire::default(); capacity];
     let count = kernel_io_manager::api::input::service_dvm_input_pending(&mut records);
@@ -123,12 +123,12 @@ pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
         // validation made ingress cost proportional to event count and could
         // not sustain the already-bounded DVM producer.
         if let Err(err) = usermem::write_current_user_slice(args.out_records_ptr, &records[..count]) {
-            return linux_errno(address_space_error_to_linux_errno(err));
+            return linux_errno(user_pointer_error_to_linux_errno(err));
         }
     }
     match usermem::write_current_user_u32(args.out_count_ptr, count as u32) {
         Ok(()) => count as u64,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
     }
 }
 

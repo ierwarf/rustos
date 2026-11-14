@@ -43,6 +43,7 @@ struct QueryAttempt {
 }
 
 impl LeaseQueryRecovery {
+    #[cfg(test)]
     fn begin(&self, service_id: u64, now: Instant) -> Result<QueryAttempt, i32> {
         self.begin_parent(service_id, now, None)
     }

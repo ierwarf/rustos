@@ -82,7 +82,7 @@ pub fn syscall_linux_rt_sigaction(
     if action_ptr != 0 {
         let action = match usermem::read_current_user_struct::<LinuxSigActionWire>(action_ptr) {
             Ok(action) => action,
-            Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+            Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
         };
         request.flags |= 0x1;
         request.payload_len = LINUX_SIGACTION_SIZE as u32;
@@ -92,7 +92,7 @@ pub fn syscall_linux_rt_sigaction(
         if let Err(err) =
             usermem::validate_current_user_write_buffer(old_action_ptr, LINUX_SIGACTION_SIZE)
         {
-            return linux_errno(address_space_error_to_linux_errno(err));
+            return linux_errno(user_pointer_error_to_linux_errno(err));
         }
         request.flags |= 0x2;
     }
@@ -112,7 +112,7 @@ pub fn syscall_linux_rt_sigaction(
             &response.payload[..LINUX_SIGACTION_SIZE],
         ) {
             Ok(()) => 0,
-            Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+            Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
         }
     } else {
         match ensure_empty_procd_response(&response) {
@@ -137,7 +137,7 @@ pub fn syscall_linux_rt_sigprocmask(
     if set_ptr != 0 {
         let mut set = [0_u8; 8];
         if let Err(err) = usermem::copy_from_current_user_exact(set_ptr, &mut set) {
-            return linux_errno(address_space_error_to_linux_errno(err));
+            return linux_errno(user_pointer_error_to_linux_errno(err));
         }
         requested_mask = u64::from_ne_bytes(set);
         request.flags |= 0x1;
@@ -146,7 +146,7 @@ pub fn syscall_linux_rt_sigprocmask(
     }
     if oldset_ptr != 0 {
         if let Err(err) = usermem::validate_current_user_write_buffer(oldset_ptr, 8) {
-            return linux_errno(address_space_error_to_linux_errno(err));
+            return linux_errno(user_pointer_error_to_linux_errno(err));
         }
         request.flags |= 0x2;
     }
@@ -166,7 +166,7 @@ pub fn syscall_linux_rt_sigprocmask(
         }
         match usermem::write_current_user_bytes(oldset_ptr, &response.payload[..8]) {
             Ok(()) => 0,
-            Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+            Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
         }
     } else {
         match ensure_empty_procd_response(&response) {
@@ -276,7 +276,7 @@ pub(super) fn validate_relative_sleep_timespec_locally(
 pub fn syscall_linux_nanosleep(request_ptr: u64, _remaining_ptr: u64) -> u64 {
     let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(request_ptr) {
         Ok(ts) => ts,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     if let Err(errno) = validate_time_hot_path_locally(TimeHotPath::Nanosleep, 0, 0, Some(ts)) {
         return linux_errno(errno);
@@ -288,7 +288,7 @@ pub fn syscall_linux_nanosleep(request_ptr: u64, _remaining_ptr: u64) -> u64 {
 pub fn syscall_linux_clock_gettime(clock_id: u64, timespec_ptr: u64) -> u64 {
     if let Err(err) = usermem::validate_current_user_write_buffer(timespec_ptr, LINUX_TIMESPEC_SIZE)
     {
-        return linux_errno(address_space_error_to_linux_errno(err));
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     if let Err(errno) = validate_time_hot_path_locally(TimeHotPath::ClockGettime, clock_id, 0, None)
     {
@@ -301,7 +301,7 @@ fn write_clock_timespec(clock_id: u64, timespec_ptr: u64) -> u64 {
     let ts = current_clock_timespec_substrate(clock_id);
     match usermem::write_current_user_bytes(timespec_ptr, as_bytes(&ts)) {
         Ok(()) => 0,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
     }
 }
 
@@ -498,7 +498,7 @@ pub fn syscall_linux_clock_nanosleep(
 ) -> u64 {
     let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(request_ptr) {
         Ok(ts) => ts,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     if let Err(errno) =
         validate_time_hot_path_locally(TimeHotPath::ClockNanosleep, clock_id, flags, Some(ts))
@@ -549,11 +549,15 @@ pub fn syscall_linux_clone3(frame: &SyscallFrame) -> u64 {
         _ => return linux_errno(LINUX_EINVAL),
     };
     let mut args = linux_abi::LinuxCloneArgs::default();
+    // SAFETY: `args` is a live, zero-initialized `#[repr(C)]` LinuxCloneArgs of u64
+    // fields (no padding, any byte pattern valid) and `provided_size` was checked
+    // above to be <= size_of it, so the exclusive byte view stays inside `args`.
+    // It is only used for the user copy below, before `args` is read.
     let args_bytes = unsafe {
         slice::from_raw_parts_mut(core::ptr::addr_of_mut!(args).cast::<u8>(), provided_size)
     };
     if let Err(err) = usermem::copy_from_current_user_exact(frame.rdi, args_bytes) {
-        return linux_errno(address_space_error_to_linux_errno(err));
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     if args.flags & linux_abi::CLONE_PIDFD != 0
         || args.set_tid != 0

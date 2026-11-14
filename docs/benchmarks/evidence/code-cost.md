@@ -27,10 +27,9 @@ moving with the sample count rather than with the code). What justifies the
 change is that the removed walk is redundant by construction, not a measured
 delta; no probe regressed, and `sched_yield` held at 5,000 across the extraction.
 
-This is also the first split boundary
-`formal/rust-large-files.tsv` named for `kernel/mm/src/memory/address_space.rs`:
-the proofs and their admission now live in `address_space/user_copy.rs`, which
-took the parent back under the 1,300-line threshold and retired its debt row.
+The proofs and their admission now live in
+`kernel/mm/src/memory/address_space/user_copy.rs`, split out of
+`kernel/mm/src/memory/address_space.rs`.
 
 ## The synchronous handoff's stale pending flag (landed)
 

@@ -26,7 +26,8 @@ use rustos_user_abi::syscall::{
     RustosMmBrokerArgs, RustosMmConflictBrokerResult, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
     RustosMmLibraryBindBrokerResult, RustosMmMapBrokerResult, LINUX_DEFAULT_STACK_RLIMIT_BYTES, LINUX_RLIMIT_SIZE,
     MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE, MM_BROKER_FD_KIND_DEVICE_BUFFER, MM_BROKER_FD_KIND_DISPLAY_SURFACE,
-    MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD, MM_BROKER_OP_BIND_LIBRARY, MM_BROKER_OP_DESCRIBE_FD,
+    MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD, MM_BROKER_FD_RIGHT_READ, MM_BROKER_FD_RIGHT_WRITE,
+    MM_BROKER_OP_BIND_LIBRARY, MM_BROKER_OP_DESCRIBE_FD,
     MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED, MM_BROKER_OP_MAP_FILE_PRIVATE,
     MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_QUERY_CONFLICT,
     MM_BROKER_OP_UNMAP, PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
@@ -36,7 +37,8 @@ use spin::Mutex;
 
 use crate::errno;
 use crate::mmap_policy::{
-    library_bind_candidate, parse_mmap_sharing, plan_mmap, MmapFdKind, MmapPlan, MmapPlanError, MAP_PRIVATE,
+    library_bind_candidate, parse_mmap_sharing, plan_mmap_with_write, MmapFdKind, MmapPlan,
+    MmapPlanError, MAP_PRIVATE, MAP_SHARED, MAP_TYPE,
 };
 use crate::vma_policy::{next_fit_with_wrap, AddressRange, VmaEntry, VmaMap};
 
@@ -113,7 +115,7 @@ struct Credentials {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum IdKind {
+pub enum IdKind {
     Uid,
     Gid,
     Euid,
@@ -226,18 +228,18 @@ impl Drop for MmLease {
     }
 }
 
-pub(crate) fn handle_uname(response: &mut LinuxSyscallOffloadResponse) {
+pub fn handle_uname(response: &mut LinuxSyscallOffloadResponse) {
     let mut uts = LinuxUtsName::default();
     write_uts_field(&mut uts.sysname, b"RustOS");
     write_uts_field(&mut uts.nodename, b"rustos");
-    write_uts_field(&mut uts.release, b"0.1");
+    write_uts_field(&mut uts.release, b"6.6.0-rustos");
     write_uts_field(&mut uts.version, b"RustOS 0.1");
     write_uts_field(&mut uts.machine, b"x86_64");
     write_uts_field(&mut uts.domainname, b"localdomain");
     copy_payload(response, &uts);
 }
 
-pub(crate) fn handle_prlimit64(
+pub fn handle_prlimit64(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -287,7 +289,7 @@ pub(crate) fn handle_prlimit64(
     }
 }
 
-pub(crate) fn handle_id(
+pub fn handle_id(
     request: &LinuxSyscallOffloadRequest,
     kind: IdKind,
     response: &mut LinuxSyscallOffloadResponse,
@@ -307,7 +309,7 @@ pub(crate) fn handle_id(
     response.payload[..size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
 }
 
-pub(crate) fn handle_setuid(
+pub fn handle_setuid(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -330,7 +332,7 @@ pub(crate) fn handle_setuid(
     response.payload_len = 0;
 }
 
-pub(crate) fn handle_setgid(
+pub fn handle_setgid(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -352,7 +354,7 @@ pub(crate) fn handle_setgid(
     response.payload_len = 0;
 }
 
-pub(crate) fn handle_memfd_create(
+pub fn handle_memfd_create(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -426,7 +428,7 @@ fn ensure_state_with_inheritance<'a>(
         .expect("syscalld policy state must be present after insert")
 }
 
-pub(crate) fn handle_getppid(
+pub fn handle_getppid(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -441,7 +443,7 @@ pub(crate) fn handle_getppid(
     response.payload[..size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
 }
 
-pub(crate) fn handle_getpgid(
+pub fn handle_getpgid(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -462,7 +464,7 @@ pub(crate) fn handle_getpgid(
     response.payload[..size_of::<u64>()].copy_from_slice(&pgid.to_le_bytes());
 }
 
-pub(crate) fn handle_setpgid(
+pub fn handle_setpgid(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -497,7 +499,7 @@ pub(crate) fn handle_setpgid(
     response.payload_len = 0;
 }
 
-pub(crate) fn handle_getsid(
+pub fn handle_getsid(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -519,7 +521,7 @@ pub(crate) fn handle_getsid(
     response.payload[..size_of::<u64>()].copy_from_slice(&sid.to_le_bytes());
 }
 
-pub(crate) fn handle_setsid(
+pub fn handle_setsid(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -540,7 +542,7 @@ pub(crate) fn handle_setsid(
     response.payload[..size_of::<u64>()].copy_from_slice(&pid.to_le_bytes());
 }
 
-pub(crate) fn handle_umask(
+pub fn handle_umask(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -554,7 +556,7 @@ pub(crate) fn handle_umask(
     response.payload[..size_of::<u32>()].copy_from_slice(&old.to_le_bytes());
 }
 
-pub(crate) fn handle_getrandom(
+pub fn handle_getrandom(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -575,6 +577,10 @@ pub(crate) fn handle_getrandom(
         return;
     }
     let len = requested_len.min(u64::from(GETRANDOM_MAX_BYTES)) as usize;
+    // SAFETY: the entropy broker writes at most `len` bytes at the given address; `len`
+    // is clamped to GETRANDOM_MAX_BYTES, which is within the response payload
+    // capacity, and `response.payload` is a live exclusively borrowed buffer. The
+    // kernel validates the destination through its own user-copy path.
     let result = unsafe {
         rustos_svc_runtime::syscall::syscall2(
             SYS_RUSTOS_ENTROPY_BROKER,
@@ -595,7 +601,7 @@ pub(crate) fn handle_getrandom(
     response.payload_len = len as u32;
 }
 
-pub(crate) fn handle_set_robust_list(
+pub fn handle_set_robust_list(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -612,7 +618,7 @@ pub(crate) fn handle_set_robust_list(
     response.payload_len = 0;
 }
 
-pub(crate) fn handle_get_robust_list(
+pub fn handle_get_robust_list(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -624,7 +630,7 @@ pub(crate) fn handle_get_robust_list(
     response.payload[8..16].copy_from_slice(&state.robust_len.to_le_bytes());
 }
 
-pub(crate) fn handle_rseq(
+pub fn handle_rseq(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -633,7 +639,7 @@ pub(crate) fn handle_rseq(
     response.payload_len = 0;
 }
 
-pub(crate) fn handle_arch_prctl_policy(
+pub fn handle_arch_prctl_policy(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -675,13 +681,16 @@ fn write_uts_field(dest: &mut [u8; 65], value: &[u8]) {
 fn copy_payload<T>(response: &mut LinuxSyscallOffloadResponse, value: &T) {
     let len = size_of::<T>();
     debug_assert!(len <= SYSCALL_OFFLOAD_PAYLOAD_CAPACITY);
+    // SAFETY: `value` is a live `&T` and the view covers exactly `size_of::<T>()`
+    // bytes of it, read-only for the copy below. Every caller passes a `repr(C)`
+    // wire value without padding (utsname, rlimit, u64 addresses).
     let bytes = unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), len) };
     response.status = 0;
     response.payload_len = len as u32;
     response.payload[..len].copy_from_slice(bytes);
 }
 
-pub(crate) fn handle_madvise(
+pub fn handle_madvise(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -734,7 +743,7 @@ pub(crate) fn handle_madvise(
     response.payload_len = 0;
 }
 
-pub(crate) fn handle_brk(
+pub fn handle_brk(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -797,7 +806,7 @@ pub(crate) fn handle_brk(
     copy_payload(response, &state.brk_current);
 }
 
-pub(crate) fn handle_mmap(
+pub fn handle_mmap(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -889,7 +898,7 @@ pub(crate) fn handle_mmap(
             return;
         }
     };
-    let fd_kind = if !anonymous {
+    let (fd_kind, fd_rights) = if !anonymous {
         let fd_info = match describe_fd(MmTarget::of(request), fd) {
             Ok(info) => info,
             Err(errno) => {
@@ -897,18 +906,27 @@ pub(crate) fn handle_mmap(
                 return;
             }
         };
-        Some(match fd_info.kind {
-            MM_BROKER_FD_KIND_FILE => MmapFdKind::File,
-            MM_BROKER_FD_KIND_MEMFD => MmapFdKind::Memfd,
-            MM_BROKER_FD_KIND_DISPLAY_SURFACE => MmapFdKind::DisplaySurface,
-            MM_BROKER_FD_KIND_DEVICE => MmapFdKind::Device,
-            MM_BROKER_FD_KIND_DEVICE_BUFFER => MmapFdKind::DeviceBuffer,
-            _ => MmapFdKind::Other,
-        })
+        (
+            Some(match fd_info.kind {
+                MM_BROKER_FD_KIND_FILE => MmapFdKind::File,
+                MM_BROKER_FD_KIND_MEMFD => MmapFdKind::Memfd,
+                MM_BROKER_FD_KIND_DISPLAY_SURFACE => MmapFdKind::DisplaySurface,
+                MM_BROKER_FD_KIND_DEVICE => MmapFdKind::Device,
+                MM_BROKER_FD_KIND_DEVICE_BUFFER => MmapFdKind::DeviceBuffer,
+                _ => MmapFdKind::Other,
+            }),
+            fd_info.rights,
+        )
     } else {
-        None
+        (None, 0)
     };
-    let plan = match plan_mmap(anonymous, sharing, prot == 0, fd_kind) {
+    let plan = match plan_mmap_with_write(
+        anonymous,
+        sharing,
+        prot == 0,
+        prot & PROT_WRITE != 0,
+        fd_kind,
+    ) {
         Ok(plan) => plan,
         Err(MmapPlanError::AccessDenied) => {
             response.status = errno::EACCES;
@@ -919,6 +937,15 @@ pub(crate) fn handle_mmap(
             return;
         }
     };
+    if matches!(plan, MmapPlan::FilePrivate | MmapPlan::MemfdShared)
+        && (fd_rights & MM_BROKER_FD_RIGHT_READ == 0
+            || (plan == MmapPlan::MemfdShared
+                && prot & PROT_WRITE != 0
+                && fd_rights & MM_BROKER_FD_RIGHT_WRITE == 0))
+    {
+        response.status = errno::EACCES;
+        return;
+    }
 
     if fixed {
         if let Err(errno) = replace_fixed_range_after_prevalidation(
@@ -984,7 +1011,7 @@ pub(crate) fn handle_mmap(
     }
 }
 
-pub(crate) fn handle_mprotect(
+pub fn handle_mprotect(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -1022,6 +1049,15 @@ pub(crate) fn handle_mprotect(
     };
     if state.vmas.len().saturating_add(VMA_SPLIT_HEADROOM) > MAX_VMA_RECORDS {
         response.status = errno::ENOMEM;
+        return;
+    }
+    if prot & PROT_WRITE != 0
+        && state
+            .vmas
+            .overlapping(start, end)
+            .any(|vma| vma.kind == MmVmaKind::FilePrivate && (vma.mmap_flags & MAP_TYPE) == MAP_SHARED)
+    {
+        response.status = errno::EACCES;
         return;
     }
     let reserved_segments = reserved_segments(&state, start, end);
@@ -1102,7 +1138,7 @@ pub(crate) fn handle_mprotect(
     response.payload_len = 0;
 }
 
-pub(crate) fn handle_munmap(
+pub fn handle_munmap(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
@@ -1313,7 +1349,7 @@ fn unmap_range_with(
 ) -> Result<(), i32> {
     // Even a policy-table hole is valid munmap and may contain legacy leaves.
     // Commit policy removal only after the whole kernel transaction succeeds.
-    syscalld::vma_policy::unmap_range_with(state, start, end, revoke, remove_vma_range)
+    crate::vma_policy::unmap_range_with(state, start, end, revoke, remove_vma_range)
 }
 
 fn replace_fixed_range_after_prevalidation(
@@ -1329,6 +1365,10 @@ fn replace_fixed_range_after_prevalidation(
 }
 
 fn mm_broker_call(args: &RustosMmBrokerArgs) -> Result<(), i32> {
+    // SAFETY: `args` is borrowed for the whole call, so the pointer stays valid and
+    // aligned; the kernel copies the struct by value (read_current_user_struct)
+    // and keeps no reference. Output pointers inside it are user addresses the
+    // kernel validates, so a bad one yields an errno, not a fault.
     let ret = unsafe {
         rustos_svc_runtime::syscall::syscall1(
             SYS_RUSTOS_MM_BROKER,
@@ -1338,17 +1378,17 @@ fn mm_broker_call(args: &RustosMmBrokerArgs) -> Result<(), i32> {
     if ret < 0 { Err((-ret) as i32) } else { Ok(()) }
 }
 
-pub(crate) fn handle_process_exec_pid(pid: u64) {
+pub fn handle_process_exec_pid(pid: u64) {
     // Credentials/umask survive exec; image-specific brk/VMA/guard state does not.
     MM_POLICY.lock().remove(&pid);
 }
 
-pub(crate) fn handle_process_exit_pid(dead_pid: u64) {
+pub fn handle_process_exit_pid(dead_pid: u64) {
     PROCESS_POLICY.lock().remove(&dead_pid);
     MM_POLICY.lock().remove(&dead_pid);
 }
 
-pub(crate) fn clear_process_policy() {
+pub fn clear_process_policy() {
     PROCESS_POLICY.lock().clear();
     MM_POLICY.lock().clear();
 }

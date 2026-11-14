@@ -818,8 +818,7 @@ fn drain_pending_vfs_mutations() -> usize {
     for _ in 0..HOUSEKEEPING_VFS_MAINTENANCE_ATTEMPTS {
         match replay_pending_vfs_mutation(None) {
             Some(true) => attempted += 1,
-            Some(false) => return attempted + 1,
-            None => return attempted,
+            Some(false) | None => return attempted,
         }
     }
     attempted

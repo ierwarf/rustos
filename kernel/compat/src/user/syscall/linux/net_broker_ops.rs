@@ -17,7 +17,7 @@ pub(super) fn syscall_linux_rustos_net_broker(args_ptr: u64) -> u64 {
 
     let args = match usermem::read_current_user_struct::<RustosNetBrokerArgs>(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     if args.process_id == 0 || args.reserved0 != 0 || args.reserved1 != 0 {
         return linux_errno(LINUX_EINVAL);
@@ -59,7 +59,7 @@ fn broker_prepare_socket_publication(args: &RustosNetBrokerArgs) -> Result<u64, 
     }
     let publication =
         usermem::read_current_user_struct::<NetBrokerPrepareSocketPublication>(args.arg0)
-            .map_err(address_space_error_to_linux_errno)?;
+            .map_err(user_pointer_error_to_linux_errno)?;
     if !net_broker_socket_publication_shape_valid(&publication)
         || publication.caller_pid != args.process_id
     {
@@ -141,7 +141,7 @@ fn broker_release_socket_control(args: &RustosNetBrokerArgs) -> Result<u64, i64>
     }
     let mut control = alloc::vec![0;len];
     usermem::copy_from_current_user_exact(args.arg0, &mut control)
-        .map_err(address_space_error_to_linux_errno)?;
+        .map_err(user_pointer_error_to_linux_errno)?;
     defer_socket_control_release(&control)?;
     Ok(0)
 }
@@ -215,7 +215,7 @@ fn broker_packet_tx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
     }
     let mut frame = alloc::vec![0_u8; len];
     usermem::copy_from_current_user_exact(args.arg0, frame.as_mut_slice())
-        .map_err(address_space_error_to_linux_errno)?;
+        .map_err(user_pointer_error_to_linux_errno)?;
     kernel_io_manager::api::network::transmit_frame(frame.as_slice(), packet_authority()?)
         .map(|count| count as u64)
         .map_err(packet_error_to_linux_errno)
@@ -228,13 +228,13 @@ fn broker_packet_rx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
     }
     // receive_frame dequeues; refuse a bad destination before the frame is lost.
     usermem::validate_current_user_write_buffer(args.arg0, cap)
-        .map_err(address_space_error_to_linux_errno)?;
+        .map_err(user_pointer_error_to_linux_errno)?;
     let mut frame = alloc::vec![0_u8; cap];
     let count = kernel_io_manager::api::network::receive_frame(frame.as_mut_slice(), packet_authority()?)
         .map_err(packet_error_to_linux_errno)?;
     let received = frame.get(..count).ok_or(LINUX_EIO)?;
     usermem::write_current_user_bytes(args.arg0, received)
-        .map_err(address_space_error_to_linux_errno)?;
+        .map_err(user_pointer_error_to_linux_errno)?;
     Ok(count as u64)
 }
 

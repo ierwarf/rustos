@@ -235,6 +235,9 @@ core::arch::global_asm!(
 #[cfg(not(test))]
 #[no_mangle]
 pub extern "C" fn __rustos_rootd_start() -> ! {
+    // SAFETY: runs once at process entry, before any allocation. `ROOTD_HEAP` is a
+    // private 4096-aligned static of exactly ROOTD_HEAP_BYTES that nothing else
+    // uses, and `addr_of_mut!` takes its address without creating a reference.
     unsafe {
         rustos_svc_runtime::allocator::init(rustos_svc_runtime::BootstrapHeap {
             base: core::ptr::addr_of_mut!(ROOTD_HEAP.0).cast::<u8>() as usize,
@@ -1758,6 +1761,9 @@ fn complete_loader_worker(
         .compare_exchange(
             LOADER_WORKER_RESULT_READY,
             LOADER_WORKER_COMPLETE,
+            // ORDERING: exact-state handoff RESULT_READY -> COMPLETE. Acquire pairs with
+            // complete_loader_supervision's Release store of RESULT_READY, so the result is
+            // visible; Release publishes COMPLETE to the worker loop's Acquire load.
             Ordering::AcqRel,
             Ordering::Acquire,
         )
@@ -2644,6 +2650,9 @@ fn write_manifest_payload(leases: &[Lease], dest: &mut [u8]) -> usize {
 }
 
 fn write_payload_struct<T>(value: &T, dest: &mut [u8]) -> u32 {
+    // SAFETY: `value` is a live `&T` and the view is exactly `size_of::<T>()` bytes,
+    // read-only and copied immediately. Callers pass padding-free `repr(C)` wire
+    // structs (CoreServiceLeaseWire, RustosSchedulingContextAuthority).
     let bytes = unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
     let count = bytes.len().min(dest.len());
     dest[..count].copy_from_slice(&bytes[..count]);
@@ -2865,14 +2874,22 @@ fn complete_loader_supervision(result: Result<u64, i64>) -> Result<u64, i64> {
         Ok(pid) => i64::try_from(pid).unwrap_or(-75),
         Err(errno) => errno.checked_neg().unwrap_or(-75),
     };
+    // ORDERING: the Release store of RESULT_READY below publishes this result; its
+    // acquirer is complete_loader_worker's AcqRel CAS (RESULT_READY -> COMPLETE).
     LOADER_WORKER_RESULT.store(encoded, Ordering::Relaxed);
     LOADER_WORKER_STATE.store(LOADER_WORKER_RESULT_READY, Ordering::Release);
     if signal_loader_worker_completion().is_err() {
         fail_closed(b"rootd: fatal loader supervisor completion rejected\n");
     }
+    // ORDERING: Acquire pairs with the worker's Release store of EXITED: after it
+    // the worker no longer touches the borrowed lease/checkpoint storage, so this
+    // thread may use it again.
     while LOADER_WORKER_STATE.load(Ordering::Acquire) != LOADER_WORKER_EXITED {
         yield_now();
     }
+    // ORDERING: read after the EXITED Acquire above; it is either the value stored
+    // at the top of this function or the worker's -22 start failure, which the
+    // worker's Release store of EXITED orders.
     let result = decode_loader_worker_result(LOADER_WORKER_RESULT.load(Ordering::Acquire));
     LOADER_WORKER_RESULT.store(0, Ordering::Relaxed);
     LOADER_WORKER_ENDPOINT.store(0, Ordering::Relaxed);
@@ -2881,6 +2898,8 @@ fn complete_loader_supervision(result: Result<u64, i64>) -> Result<u64, i64> {
     LOADER_WORKER_POST_INIT_PTR.store(0, Ordering::Relaxed);
     LOADER_WORKER_POST_INIT_LEN.store(0, Ordering::Relaxed);
     LOADER_WORKER_CHECKPOINTS_PTR.store(0, Ordering::Relaxed);
+    // ORDERING: Release returns the handoff slot to IDLE after the words above were
+    // cleared; pairs with the AcqRel CAS that starts the next transaction.
     LOADER_WORKER_STATE.store(LOADER_WORKER_IDLE, Ordering::Release);
     debug_line(b"rootd: loader supervisor worker completed\n");
     result
@@ -2896,21 +2915,32 @@ fn start_loader_supervisor_worker(
         .compare_exchange(
             LOADER_WORKER_IDLE,
             LOADER_WORKER_RUNNING,
+            // ORDERING: CAS IDLE -> RUNNING admits at most one worker. Acquire pairs with
+            // complete_loader_supervision's Release IDLE store, so the previous
+            // transaction's cleanup is visible before the handoff words are rewritten.
             Ordering::AcqRel,
             Ordering::Acquire,
         )
         .map_err(|_| 16_i64)?;
+    // ORDERING: Release stores publish the handoff words (endpoint, lease and
+    // post-init slices, checkpoint store) to the new worker, whose Acquire loads in
+    // loader_supervisor_worker_entry pair with them.
     LOADER_WORKER_ENDPOINT.store(endpoint, Ordering::Release);
     LOADER_WORKER_LEASES_PTR.store(leases.as_mut_ptr() as usize, Ordering::Release);
+    // ORDERING: lease-slice length handoff, same pairing as above.
     LOADER_WORKER_LEASES_LEN.store(leases.len(), Ordering::Release);
+    // ORDERING: post-init slice handoff, same pairing as above.
     LOADER_WORKER_POST_INIT_PTR.store(post_init_leases.as_mut_ptr() as usize, Ordering::Release);
     LOADER_WORKER_POST_INIT_LEN.store(post_init_leases.len(), Ordering::Release);
+    // ORDERING: checkpoint-store handoff, same pairing as above.
     LOADER_WORKER_CHECKPOINTS_PTR.store(
         service_checkpoints as *mut ServiceCheckpointStore as usize,
         Ordering::Release,
     );
     LOADER_WORKER_RESULT.store(0, Ordering::Relaxed);
     if let Err(errno) = spawn_loader_worker_thread() {
+        // ORDERING: Release rolls the slot back to IDLE; no worker was created, so no
+        // thread observes the handoff words stored above.
         LOADER_WORKER_STATE.store(LOADER_WORKER_IDLE, Ordering::Release);
         return Err(errno);
     }
@@ -2919,6 +2949,9 @@ fn start_loader_supervisor_worker(
 
 #[cfg(not(test))]
 fn spawn_loader_worker_thread() -> Result<(), i64> {
+    // SAFETY: `LOADER_WORKER_STACK` is a private 16-aligned static; the pointer is
+    // one-past-the-end of its array (in bounds for arithmetic) and no reference
+    // is formed. The IDLE -> RUNNING CAS above admits a single user of the stack.
     let stack_top = unsafe {
         core::ptr::addr_of_mut!(LOADER_WORKER_STACK.0)
             .cast::<u8>()
@@ -2926,6 +2959,9 @@ fn spawn_loader_worker_thread() -> Result<(), i64> {
     };
     let flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
     let result: i64;
+    // SAFETY: `clone` with CLONE_VM|CLONE_THREAD on the exclusive static stack; the
+    // child branch never returns (`call` into a `-> !` entry, then `ud2`) and only
+    // the parent reaches the code after the block. rcx/r11 are declared clobbered.
     unsafe {
         asm!(
             "syscall",
@@ -2959,21 +2995,35 @@ fn spawn_loader_worker_thread() -> Result<(), i64> {
 
 #[cfg(not(test))]
 extern "C" fn loader_supervisor_worker_entry() -> ! {
+    // ORDERING: Acquire pairs with start_loader_supervisor_worker's Release stores
+    // of the handoff words (clone itself also orders thread start).
     let endpoint = LOADER_WORKER_ENDPOINT.load(Ordering::Acquire);
     let leases_ptr = LOADER_WORKER_LEASES_PTR.load(Ordering::Acquire) as *mut Lease;
     let leases_len = LOADER_WORKER_LEASES_LEN.load(Ordering::Acquire);
+    // ORDERING: same Acquire pairing with the Release handoff stores.
     let post_init_ptr = LOADER_WORKER_POST_INIT_PTR.load(Ordering::Acquire) as *mut PostInitLease;
     let post_init_len = LOADER_WORKER_POST_INIT_LEN.load(Ordering::Acquire);
     let checkpoints_ptr =
         LOADER_WORKER_CHECKPOINTS_PTR.load(Ordering::Acquire) as *mut ServiceCheckpointStore;
     if endpoint == 0 || leases_ptr.is_null() || post_init_ptr.is_null() || checkpoints_ptr.is_null()
     {
+        // ORDERING: the Relaxed failure result is published by the Release EXITED store
+        // below, which complete_loader_supervision acquires before reading it.
         LOADER_WORKER_RESULT.store(-22, Ordering::Relaxed);
         LOADER_WORKER_STATE.store(LOADER_WORKER_EXITED, Ordering::Release);
     } else {
+        // SAFETY: the pointers and lengths were derived from the parent's exclusive
+        // slices in start_loader_supervisor_worker (checked non-null). The parent is
+        // blocked in the loader transaction, whose operation closure does not capture
+        // them, so these are the only live accesses until EXITED is stored.
         let leases = unsafe { slice::from_raw_parts_mut(leases_ptr, leases_len) };
+        // SAFETY: same handoff and exclusivity as `leases`, for the post-init slice.
         let post_init_leases = unsafe { slice::from_raw_parts_mut(post_init_ptr, post_init_len) };
+        // SAFETY: same handoff and exclusivity: the parent's ServiceCheckpointStore,
+        // non-null checked above, used by nothing else until EXITED.
         let service_checkpoints = unsafe { &mut *checkpoints_ptr };
+        // ORDERING: Acquire pairs with complete_loader_worker's AcqRel CAS
+        // (RESULT_READY -> COMPLETE), which this worker handles in serve_rootd_once.
         while LOADER_WORKER_STATE.load(Ordering::Acquire) != LOADER_WORKER_COMPLETE {
             drain_lifecycle_events(leases, post_init_leases, service_checkpoints);
             serve_rootd_once(
@@ -2985,6 +3035,9 @@ extern "C" fn loader_supervisor_worker_entry() -> ! {
                 None,
             );
         }
+        // ORDERING: Release publishes that the worker's use of the borrowed storage has
+        // ended; pairs with the Acquire wait in complete_loader_supervision. The
+        // worker still runs its exit syscall on LOADER_WORKER_STACK after this store.
         LOADER_WORKER_STATE.store(LOADER_WORKER_EXITED, Ordering::Release);
     }
     let _ = syscall1(SYS_EXIT, 0);
@@ -3058,6 +3111,9 @@ fn spawn_exec_via_loaderd_blocking(path: &'static [u8], weight_micros: u64, job_
     {
         return Err(22);
     }
+    // SAFETY: INITD_LOADER_REQUEST is used only by the rootd supervisor thread, one
+    // call at a time (spawn and activate are never nested or run by the worker),
+    // so this exclusive reference cannot alias another live one.
     let request = unsafe { &mut *INITD_LOADER_REQUEST.0.get() };
     *request = empty_loader_spawn_request();
     request.version = LOADER_REQUEST_ABI_VERSION;
@@ -3094,6 +3150,8 @@ fn spawn_exec_via_loaderd_blocking(path: &'static [u8], weight_micros: u64, job_
     copy_bytes(path, &mut request.argv_bytes);
     request.argv_bytes[path.len()] = 0;
 
+    // SAFETY: INITD_LOADER_RESPONSE is used only by the supervisor thread, one call
+    // at a time; the blocking call below returns before it is touched again.
     let response = unsafe { &mut *INITD_LOADER_RESPONSE.0.get() };
     *response = empty_loader_spawn_response();
     let result = jobs::call_loader(endpoint as u64, job_handle, request, response)?;
@@ -3122,6 +3180,8 @@ fn activate_exec_via_loaderd(pid: u64) -> Result<(), i64> {
     if endpoint <= 0 {
         return Err(if endpoint < 0 { -endpoint } else { 11 });
     }
+    // SAFETY: INITD_LOADER_REQUEST is used only by the rootd supervisor thread, one
+    // call at a time (activate never overlaps a spawn), so no aliasing reference.
     let request = unsafe { &mut *INITD_LOADER_REQUEST.0.get() };
     *request = empty_loader_spawn_request();
     request.version = LOADER_REQUEST_ABI_VERSION;
@@ -3133,6 +3193,8 @@ fn activate_exec_via_loaderd(pid: u64) -> Result<(), i64> {
     request.requester_pid = requester_pid as u64;
     request.target_pid = pid;
 
+    // SAFETY: INITD_LOADER_RESPONSE is used only by the supervisor thread, one call
+    // at a time; the IPC call below returns before it is read.
     let response = unsafe { &mut *INITD_LOADER_RESPONSE.0.get() };
     *response = empty_loader_spawn_response();
     let result = syscall5(
@@ -3180,6 +3242,9 @@ fn syscall0(number: u64) -> i64 {
         return result;
     }
     let result: i64;
+    // SAFETY: raw `syscall` per the x86-64 ABI: rax is in/out, rcx and r11 are declared\
+    // clobbered, and no memory is named, so the compiler assumes none changes; the\
+    // kernel validates every pointer argument (IPC buffers outlive the call).
     unsafe {
         asm!(
             "syscall",
@@ -3200,6 +3265,9 @@ fn syscall1(number: u64, arg0: u64) -> i64 {
         return result;
     }
     let result: i64;
+    // SAFETY: raw `syscall` per the x86-64 ABI: rax is in/out, rcx and r11 are declared\
+    // clobbered, and no memory is named, so the compiler assumes none changes; the\
+    // kernel validates every pointer argument (IPC buffers outlive the call).
     unsafe {
         asm!(
             "syscall",
@@ -3221,6 +3289,9 @@ fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
         return result;
     }
     let result: i64;
+    // SAFETY: raw `syscall` per the x86-64 ABI: rax is in/out, rcx and r11 are declared\
+    // clobbered, and no memory is named, so the compiler assumes none changes; the\
+    // kernel validates every pointer argument (IPC buffers outlive the call).
     unsafe {
         asm!(
             "syscall",
@@ -3243,6 +3314,9 @@ fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
         return result;
     }
     let result: i64;
+    // SAFETY: raw `syscall` per the x86-64 ABI: rax is in/out, rcx and r11 are declared\
+    // clobbered, and no memory is named, so the compiler assumes none changes; the\
+    // kernel validates every pointer argument (IPC buffers outlive the call).
     unsafe {
         asm!(
             "syscall",
@@ -3266,6 +3340,9 @@ fn syscall5(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
         return result;
     }
     let result: i64;
+    // SAFETY: raw `syscall` per the x86-64 ABI: rax is in/out, rcx and r11 are declared\
+    // clobbered, and no memory is named, so the compiler assumes none changes; the\
+    // kernel validates every pointer argument (IPC buffers outlive the call).
     unsafe {
         asm!(
             "syscall",
@@ -3291,6 +3368,9 @@ fn syscall6(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, 
         return result;
     }
     let result: i64;
+    // SAFETY: raw `syscall` per the x86-64 ABI: rax is in/out, rcx and r11 are declared\
+    // clobbered, and no memory is named, so the compiler assumes none changes; the\
+    // kernel validates every pointer argument (IPC buffers outlive the call).
     unsafe {
         asm!(
             "syscall",
@@ -3539,13 +3619,17 @@ mod tests {
         request.header.subject_tid = tid;
         let sender = IpcSenderIdentity { pid, tid };
 
+        // ORDERING: test-only setup of the exact RESULT_READY state; same pairing as
+        // the production Release store.
         LOADER_WORKER_STATE.store(LOADER_WORKER_RESULT_READY, Ordering::Release);
         assert_eq!(complete_loader_worker(&request, sender), Ok(()));
+        // ORDERING: test-only read of the state after complete_loader_worker's CAS.
         assert_eq!(
             LOADER_WORKER_STATE.load(Ordering::Acquire),
             LOADER_WORKER_COMPLETE
         );
         assert_eq!(complete_loader_worker(&request, sender), Err(16));
+        // ORDERING: test-only reset to IDLE between cases.
         LOADER_WORKER_STATE.store(LOADER_WORKER_IDLE, Ordering::Release);
 
         assert_eq!(

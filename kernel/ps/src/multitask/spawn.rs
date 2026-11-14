@@ -251,19 +251,30 @@ pub fn spawn_user_thread_suspended(bootstrap: UserTaskBootstrap) -> Result<u64, 
     // original MM and sleepable TEB effects through complete Slot/cancel ACK.
     let receipt = super::scheduler::thread_creation::work::submit(id, bootstrap, selectors)
         .ok_or(SpawnTaskError::NoFreeTaskSlot)?;
+    let mut yielded = false;
     loop {
         match super::scheduler::thread_creation::work::poll(receipt) {
             Some(true) => return Ok(id),
             Some(false) => return Err(SpawnTaskError::NoFreeTaskSlot),
             None => {
                 // Kernel callers can help under their own kill-safe Executor;
-                // user callers may only yield and observe, never claim work.
+                // user callers yield once for immediate handoff, then sleep so
+                // housekeeping gets the CPU on 1-vCPU under CPU-bound load.
                 if let Some(executor) =
                     super::scheduler::retirement_cleanup::executor::capture_current()
                 {
                     super::scheduler::thread_creation::work::service(&executor);
+                    super::irq::yield_now();
+                } else if !yielded {
+                    yielded = true;
+                    super::prioritize_housekeeping();
+                    super::irq::yield_now();
+                } else {
+                    super::prioritize_housekeeping();
+                    crate::arch::rtc::sleep_unless(1, || {
+                        super::scheduler::thread_creation::work::poll(receipt).is_some()
+                    });
                 }
-                super::irq::yield_now();
             }
         }
     }

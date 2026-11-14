@@ -22,7 +22,10 @@ use rustos_user_abi::syscall::{ServiceCapability,
 };
 use x86_64::VirtAddr;
 
-const FUTEX_WAITERS_CAPACITY: usize = 256;
+/// A task owns at most one futex wait, so one slot per scheduler task can
+/// never be exhausted; tying the size to the scheduler keeps that true if the
+/// task limit grows.
+const FUTEX_WAITERS_CAPACITY: usize = multitask::MAX_SCHEDULER_TASKS;
 const ROBUST_LIST_HEAD_SIZE: u64 = 24;
 const ROBUST_LIST_LIMIT: usize = 2_048;
 const ROBUST_CMPXCHG_RETRY_LIMIT: usize = 64;
@@ -67,11 +70,13 @@ const FUTEX_COW_RETRIES: u32 = 16;
 pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, val3: u64) -> u64 {
     // `op` is a C `int`; the register's upper half is not ABI.
     let op = op as u32 as u64;
-    if (uaddr & 0x3) != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
+    // Linux rejects an unknown op (ENOSYS) and a zero bitset (EINVAL) before
+    // it looks at the futex address, so alignment is checked last.
     if let Err(errno) = validate_futex_policy_locally(op, val3) {
         return linux_errno(errno);
+    }
+    if (uaddr & 0x3) != 0 {
+        return linux_errno(LINUX_EINVAL);
     }
     let cmd = op & linux_abi::FUTEX_CMD_MASK;
     let dispatch = || match cmd {
@@ -254,14 +259,14 @@ pub fn clone_linux_thread(
         if let Err(error) =
             usermem::validate_current_user_write_buffer(parent_tid_ptr, size_of::<u32>())
         {
-            return clone_stage_failed(2, address_space_error_to_linux_errno(error), parent_tid_ptr);
+            return clone_stage_failed(2, user_pointer_error_to_linux_errno(error), parent_tid_ptr);
         }
     }
     if flags & linux_abi::CLONE_CHILD_SETTID != 0 {
         if let Err(error) =
             usermem::validate_current_user_write_buffer(child_tid_ptr, size_of::<u32>())
         {
-            return clone_stage_failed(3, address_space_error_to_linux_errno(error), child_tid_ptr);
+            return clone_stage_failed(3, user_pointer_error_to_linux_errno(error), child_tid_ptr);
         }
     }
     let Some(console_session) = multitask::current_console_session() else {
@@ -360,7 +365,7 @@ pub fn clone_linux_thread(
         }
         if let Err(error) = result {
             let _ = multitask::terminate_user_task(child_tid);
-            return clone_stage_failed(4, address_space_error_to_linux_errno(error), parent_tid_ptr);
+            return clone_stage_failed(4, user_pointer_error_to_linux_errno(error), parent_tid_ptr);
         }
     }
     if !multitask::activate_suspended_user_task(child_tid) {
@@ -426,7 +431,7 @@ fn futex_wait(
         let actual = process_state
             .address_space()
             .atomic_load_user_u32(uaddr)
-            .map_err(address_space_error_to_linux_errno)?;
+            .map_err(user_pointer_error_to_linux_errno)?;
         if actual != expected {
             return Err(LINUX_EAGAIN);
         }
@@ -453,7 +458,9 @@ fn futex_wait(
     {
         clear_futex_waiter(task_id);
         let _ = multitask::cancel_block_current_task();
-        return Err(LINUX_EBUSY);
+        // The bounded deadline table is exhausted; Linux has no EBUSY here and
+        // ENOMEM is its errno for a failed kernel allocation.
+        return Err(LINUX_ENOMEM);
     }
     match multitask::commit_block_current_task_and_yield() {
         Some(true) => {}
@@ -473,10 +480,8 @@ fn futex_wait(
     let still_waiting = take_futex_waiter(task_id);
     let timed_out = still_waiting
         && deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline);
-    let interrupted = still_waiting
-        && multitask::current_linux_thread_state()
-            .is_some_and(|state| state.pending_signals & !state.signal_mask != 0);
     crate::arch::rtc::disarm_sleep_waiter(task_id);
+    let interrupted = !timed_out && still_waiting && current_wait_interrupted();
     if timed_out {
         Err(LINUX_ETIMEDOUT)
     } else if interrupted {
@@ -498,7 +503,7 @@ fn futex_wait_deadline_tick(op: u64, timeout_ptr: u64) -> Result<Option<u64>, i6
         return Ok(None);
     }
     let timeout = usermem::read_current_user_struct::<LinuxTimespecWire>(timeout_ptr)
-        .map_err(address_space_error_to_linux_errno)?;
+        .map_err(user_pointer_error_to_linux_errno)?;
     validate_futex_timespec(timeout)?;
 
     let now_tick = crate::arch::rtc::ticks();
@@ -781,17 +786,21 @@ fn register_futex_waiter_in(
     for slot in 0..waiters.len() {
         match waiters[slot] {
             Some(existing) if existing.task_id == waiter.task_id => {
-                // A task can own at most one scheduler wait. Treat a second
-                // registration as an invariant violation rather than hiding
-                // the older entry and consuming another bounded slot.
-                return Err(LINUX_EBUSY);
+                // A task executing FUTEX_WAIT is running, so an entry it still
+                // owns is stale (a wake/cleanup that lost its removal). Replace
+                // it rather than leak a slot or fail with an errno Linux never
+                // returns from futex wait.
+                waiters[slot] = Some(waiter);
+                return Ok(());
             }
             None if free_slot.is_none() => free_slot = Some(slot),
             _ => {}
         }
     }
+    // Unreachable while the table has a slot per scheduler task; ENOMEM is
+    // Linux's errno for a failed futex_q/kernel allocation.
     let Some(slot) = free_slot else {
-        return Err(LINUX_EBUSY);
+        return Err(LINUX_ENOMEM);
     };
     waiters[slot] = Some(waiter);
     Ok(())
@@ -1183,7 +1192,7 @@ pub fn syscall_linux_arch_prctl(_code: u64, _arg: u64) -> u64 {
             let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
             match usermem::write_current_user_bytes(_arg, &fs.to_le_bytes()) {
                 Ok(()) => 0,
-                Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+                Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
             }
         }
         _ => linux_errno(LINUX_EINVAL),
@@ -1231,7 +1240,8 @@ pub fn syscall_linux_kill(pid: u64, signal: u64) -> u64 {
     } else {
         pid_i64 as u64
     };
-    procd_tgkill(target_pid, target_pid, signal)
+    // tid 0: process-directed, so a retired leader cannot make kill() ESRCH.
+    procd_tgkill(target_pid, 0, signal)
 }
 
 pub fn syscall_linux_tkill(tid: u64, signal: u64) -> u64 {
@@ -1322,10 +1332,10 @@ pub fn syscall_linux_get_robust_list(pid: u64, head_ptr_ptr: u64, len_ptr: u64) 
     let head = snapshot.thread_state.robust_list_head.to_le_bytes();
     let len = snapshot.thread_state.robust_list_len.to_le_bytes();
     if let Err(err) = usermem::write_current_user_bytes(head_ptr_ptr, &head) {
-        return linux_errno(address_space_error_to_linux_errno(err));
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     if let Err(err) = usermem::write_current_user_bytes(len_ptr, &len) {
-        return linux_errno(address_space_error_to_linux_errno(err));
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     0
 }

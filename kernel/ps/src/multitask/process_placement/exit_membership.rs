@@ -5,6 +5,7 @@
 //! Concurrency: joins must drain before capture; no leaf spans identity/table callbacks or pin Drop.
 //! Failure: duplicate/foreign/exhausted admissions refuse without effects; stopped binding ACK is exact.
 //! Forbidden: copied slots, metadata absence or process PID alone never grant group withdrawal.
+//! Target: `target_by_pid` is the leader member, else the lowest live non-leader member of the exact handle.
 //! Evidence: native real ledger/identity/pin witnesses; bounded lifecycle models remain projections.
 use super::*;
 use process_table::pin_owner::ProcessObjectPin;
@@ -118,6 +119,16 @@ pub(in crate::multitask) fn publication_in_flight(handle: ProcessHandle) -> bool
     })
 }
 
+/// Resolves the exit target of process `pid`: its live leader member when the
+/// leader is still a member, otherwise the first live non-leader member (lowest
+/// membership index, deterministic). A leader that already retired (e.g.
+/// `pthread_exit`, a leader-thread fault) must not make a process with live
+/// siblings unterminatable. Absent only when no live member exists.
+///
+/// The fallback resolves pid -> exact handle under the process-table leaf with
+/// no cell leaf held, drops that reference, then reads the cell alone, so no new
+/// lock-order edge exists. The returned `(handle, member)` is revalidated
+/// against the cell generation and member list by `PendingExit::begin`.
 pub(in crate::multitask) fn target_by_pid(pid: u64) -> Option<(ProcessHandle, Member)> {
     for cell in CELLS.iter() {
         if let Some(target) = cell.with(|s| {
@@ -132,7 +143,26 @@ pub(in crate::multitask) fn target_by_pid(pid: u64) -> Option<(ProcessHandle, Me
             return Some(target);
         }
     }
-    None
+    let handle = process_table::retain_process_by_pid(pid)?.handle();
+    live_member_of(handle).map(|m| (handle, m))
+}
+
+/// First member of `handle`'s exact generation that is neither stopped nor
+/// detached (a detached row is a tombstone of a thread that already left).
+fn live_member_of(handle: ProcessHandle) -> Option<Member> {
+    cell(handle)?.with(|s| {
+        if s.handle != Some(handle) {
+            return None;
+        }
+        (0..MAX).find_map(|i| {
+            let m = s.members[i]?;
+            (!s.stopped[i]
+                && !s.exit_detached[i]
+                && !s.exec_detached[i]
+                && !s.terminal_detached[i])
+                .then_some(m)
+        })
+    })
 }
 
 pub(in crate::multitask) fn claim_next() -> Option<(ExitMembership, Reason)> {

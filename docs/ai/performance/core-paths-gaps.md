@@ -51,8 +51,6 @@ kernel-ps/compat/executive/hal/mm/nucleus-core/io-manager 경고 0. 호스트 �
 삭제로 필요 없어진 SMP 소스 핀, 변이 행(`run_authority` 구 비교 3행, 앵커 개수 조정)은 함께
 정리했다. 테스트 전용으로 남은 local-dispatch 정책 함수(`choose_local_next` 등)는
 독립 dispatch 소스 계약의 witness이며 운영 경로가 아니다.
-- `formal/rust-large-files.tsv`의 숫자는 실측 행수가 아니라 허용 부채 상한이다.
-  선행 변경에서 상한을 넘은 파일은 경고로 남으며, 검증을 조용하게 하려고 상한을 올리지 않는다.
 
 ## E. 현재 수집 상태 (2026-10-22 안정화 진행 중)
 

@@ -138,6 +138,9 @@ static WAYLAND_SLOW_TICK_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WAYLAND_READINESS_WAKE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 fn claim_wayland_rearm(needs_rearm: &AtomicBool) -> bool {
+    // ORDERING: the swap claims the edge exactly once: Acquire pairs with the
+    // worker's Release store of `needs_rearm`. The worker never reads the flag
+    // (it waits on the rearm channel), so the Release half is not load-bearing.
     needs_rearm.swap(false, Ordering::AcqRel)
 }
 
@@ -294,10 +297,15 @@ impl WaylandCompositor {
             ));
         }
         let poll_fd = self.display.backend().poll_fd().as_raw_fd();
+        // SAFETY: `poll_fd` is the live epoll descriptor borrowed from `self.display`;
+        // `F_DUPFD_CLOEXEC` only takes integers and returns a new descriptor (or -1).
         let duplicated = unsafe { libc::fcntl(poll_fd, libc::F_DUPFD_CLOEXEC, 3) };
         if duplicated < 0 {
             return Err(std::io::Error::last_os_error());
         }
+        // SAFETY: `duplicated` is a fresh descriptor returned by `fcntl` (checked
+        // non-negative above) that nothing else owns, so `OwnedFd` owns and closes it
+        // exactly once; it is independent of the display's own descriptor.
         let owned_fd = unsafe { OwnedFd::from_raw_fd(duplicated) };
         let (rearm_sender, rearm_receiver) = sync_channel::<()>(1);
         let needs_rearm = Arc::new(AtomicBool::new(false));
@@ -306,6 +314,9 @@ impl WaylandCompositor {
             let mut event = libc::epoll_event { events: 0, u64: 0 };
             let mut consecutive_transient_failures = 0_usize;
             loop {
+                // SAFETY: `owned_fd` is the epoll descriptor owned by this thread's closure, and
+                // `event` is a live local `epoll_event` with room for the single event
+                // requested (maxevents = 1).
                 let ready = unsafe { libc::epoll_wait(owned_fd.as_raw_fd(), &mut event, 1, -1) };
                 if ready < 0 {
                     let err = std::io::Error::last_os_error();
@@ -333,9 +344,14 @@ impl WaylandCompositor {
                 if ready == 0 {
                     continue;
                 }
+                // ORDERING: one-shot log latch; nothing depends on it, so the swap order is
+                // irrelevant to correctness and AcqRel is simply the conservative form.
                 if !WAYLAND_READINESS_WAKE_LOGGED.swap(true, Ordering::AcqRel) {
                     diag_line("uiserver: Wayland readiness wake observed");
                 }
+                // ORDERING: Release publishes the readiness edge before the UI wake below;
+                // pairs with the Acquire loads in has_pending_protocol_input and the AcqRel
+                // claim in claim_wayland_rearm.
                 worker_needs_rearm.store(true, Ordering::Release);
                 ui_wake_sender.signal();
                 if rearm_receiver.recv().is_err() {
@@ -373,6 +389,8 @@ impl WaylandCompositor {
             || self
                 .readiness
                 .as_ref()
+                // ORDERING: Acquire pairs with the readiness worker's Release store, so a
+                // UI turn that sees the edge is ordered after the worker's epoll wakeup.
                 .is_some_and(|readiness| readiness.needs_rearm.load(Ordering::Acquire))
     }
 
@@ -634,10 +652,13 @@ fn copy_wayland_bgra_row(src: &[u8], dst: &mut [u32], has_alpha: bool) -> bool {
 }
 
 fn set_fd_nonblocking(fd: i32) -> std::io::Result<()> {
+    // SAFETY: `F_GETFL` takes only the descriptor integer; a bad `fd` yields EBADF.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: `F_SETFL` takes integer arguments only; flags come from the F_GETFL
+    // above, so no other status flag is altered.
     if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -669,6 +690,9 @@ fn bind_wayland_listener(runtime_dir: &str, socket_path: &str) -> std::io::Resul
 }
 
 fn bind_nonblocking_unix_listener(socket_path: &str) -> std::io::Result<UnixListener> {
+    // SAFETY: `socket` takes only integer arguments; the result is checked for failure
+    // below and owned by this function until it is closed on error or moved into
+    // the UnixListener.
     let fd = unsafe {
         libc::socket(
             libc::AF_UNIX,
@@ -684,6 +708,8 @@ fn bind_nonblocking_unix_listener(socket_path: &str) -> std::io::Result<UnixList
         let path = CString::new(socket_path)
             .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
         let path_bytes = path.as_bytes_with_nul();
+        // SAFETY: `sockaddr_un` is a plain C struct of integers and a byte array, for
+        // which the all-zero bit pattern is valid.
         let mut addr = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
         addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
         if path_bytes.len() > addr.sun_path.len() {
@@ -693,6 +719,9 @@ fn bind_nonblocking_unix_listener(socket_path: &str) -> std::io::Result<UnixList
             addr.sun_path[index] = *byte as libc::c_char;
         }
 
+        // SAFETY: `addr` is a live, zero-initialized `sockaddr_un` with a path that was
+        // length-checked, and the length passed is exactly its size; `fd` is a valid
+        // socket owned by this function.
         let bind_rc = unsafe {
             libc::bind(
                 fd,
@@ -703,6 +732,7 @@ fn bind_nonblocking_unix_listener(socket_path: &str) -> std::io::Result<UnixList
         if bind_rc < 0 {
             return Err(std::io::Error::last_os_error());
         }
+        // SAFETY: `listen` takes the live socket `fd` and an integer backlog.
         if unsafe { libc::listen(fd, 16) } < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -710,9 +740,14 @@ fn bind_nonblocking_unix_listener(socket_path: &str) -> std::io::Result<UnixList
     })();
 
     if let Err(err) = result {
+        // SAFETY: `fd` is still exclusively owned here (it was only borrowed by the
+        // closure above); closing it once on the error path cannot double-close.
         let _ = unsafe { libc::close(fd) };
         return Err(err);
     }
+    // SAFETY: `fd` is a valid, bound, listening socket whose only owner is this
+    // function (the error path closed and returned), so the UnixListener takes
+    // sole ownership and closes it exactly once.
     Ok(unsafe { UnixListener::from_raw_fd(fd) })
 }
 

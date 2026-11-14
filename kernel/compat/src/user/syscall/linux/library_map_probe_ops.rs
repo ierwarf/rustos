@@ -18,7 +18,7 @@ const PAGE: u64 = 4096;
 pub(super) fn control(args_ptr: u64) -> u64 {
     let args = match usermem::read_current_user_struct::<RustosLibraryMapProbeArgs>(args_ptr) {
         Ok(args) => args,
-        Err(error) => return linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
     };
     match args.op {
         LIBRARY_MAP_PROBE_OP_FRAMES => frames(&args),
@@ -82,7 +82,7 @@ fn frames(args: &RustosLibraryMapProbeArgs) -> u64 {
         if let Err(error) =
             usermem::write_current_user_struct(args.out_ptr + index as u64 * 16, frame)
         {
-            return linux_errno(address_space_error_to_linux_errno(error));
+            return linux_errno(user_pointer_error_to_linux_errno(error));
         }
     }
     0
@@ -118,6 +118,6 @@ fn stats(args: &RustosLibraryMapProbeArgs) -> u64 {
     };
     match usermem::write_current_user_struct(args.out_ptr, &stats) {
         Ok(()) => 0,
-        Err(error) => linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
     }
 }

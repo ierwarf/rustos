@@ -64,6 +64,10 @@ pub fn handle_kernel_panic(info: &PanicInfo<'_>) -> ! {
     // for the verbose panic reporter. Otherwise a nested winner can halt the
     // only CPU whose site explains the original corruption.
     write_panic_site_marker(info);
+    // ORDERING: AcqRel swap on a one-shot election flag: exactly one CPU sees
+    // `false` and reports; the rest park. No data is published through the flag
+    // (the site marker goes straight to debugcon), so this is a conservative
+    // strength for a cold path, never weakened.
     if PANIC_IN_PROGRESS.swap(true, Ordering::AcqRel) {
         debug::println_emergency(format_args!("[NESTED PANIC]"));
         loop {

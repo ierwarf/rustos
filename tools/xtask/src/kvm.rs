@@ -213,6 +213,8 @@ const VHOST_VSOCK_DEVICE: &str = "/dev/vhost-vsock";
 // are absent; guest service waits retain their narrower class-specific bounds.
 const DEFAULT_SMOKE_TIMEOUT: u64 = 120;
 const MAX_SMOKE_TIMEOUT: u64 = 180;
+/// Upper bound of `--hold-seconds`; the hold is on top of the readiness budget.
+const MAX_SMOKE_HOLD_SECONDS: u64 = 180;
 const PHYSICAL_GPU_REQUIRED_MEMLOCK: u64 = 4 * 1024 * 1024 * 1024;
 const ACPI_VFCT_HEADER_BYTES: usize = 0x4c;
 const ACPI_VFCT_VBIOS_OFFSET: usize = 0x34;
@@ -772,6 +774,8 @@ include!("kvm/user_debug_records.rs");
 include!("kvm/oom_hog.rs");
 include!("kvm/app_dmabuf_probe.rs");
 include!("kvm/local_fd_probe.rs");
+include!("kvm/fault_probe.rs");
+include!("kvm/launch_desktop.rs");
 include!("kvm/mmap_cost_probe.rs");
 include!("kvm/application_limit.rs");
 include!("kvm/job_policy.rs");

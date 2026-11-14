@@ -750,7 +750,7 @@ mod tests {
 
         // A fixed claim over frames a magazine holds must succeed, and the
         // claimed frames must never come back out of a cache.
-        let first = alloc_one(pool, 0, false).unwrap();
+        let _first = alloc_one(pool, 0, false).unwrap();
         assert!(pool.cached_total() > 0);
         assert_eq!(
             pool.claim_fixed_range(PAGE_SIZE * 40, PAGE_SIZE * 2),
@@ -766,7 +766,6 @@ mod tests {
         }
         assert!(!rest.contains(&40) && !rest.contains(&41));
         assert_eq!(rest.len(), 64 - 2 - 1);
-        drop(first);
     }
 
     #[test]

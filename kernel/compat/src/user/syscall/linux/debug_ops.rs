@@ -40,7 +40,7 @@ pub(super) fn syscall_linux_rustos_debug_print(user_ptr: u64, user_len: u64) -> 
             return if written != 0 {
                 written as u64
             } else {
-                linux_errno(address_space_error_to_linux_errno(err))
+                linux_errno(user_pointer_error_to_linux_errno(err))
             };
         }
         // A Ring3 caller must never be able to inject a fresh debugcon line
@@ -146,7 +146,7 @@ pub(super) fn syscall_linux_rustos_product_executable_snapshot_evidence(args_ptr
     let evidence = match usermem::read_current_user_struct::<ProductSnapshotEvidenceWire>(args_ptr)
     {
         Ok(evidence) => evidence,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     if !product_executable_snapshot_evidence_shape_valid(&evidence) {
         return linux_errno(LINUX_EINVAL);

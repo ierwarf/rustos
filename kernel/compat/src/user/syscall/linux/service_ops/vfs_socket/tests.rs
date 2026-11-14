@@ -156,3 +156,56 @@ fn remote_vfs_registry_preserves_collision_chains_across_tombstones() {
     assert_eq!(register_remote_vfs_open_description(first), Ok(()));
     assert_eq!(release_remote_vfs_descriptor_ref(first), Ok(true));
 }
+
+#[test]
+fn proc_self_fd_target_matches_only_caller_fd_entries() {
+    assert_eq!(proc_self_fd_target("/proc/self/fd/0", 42), Some(0));
+    assert_eq!(proc_self_fd_target("/proc/self/fd/17", 42), Some(17));
+    assert_eq!(proc_self_fd_target("/proc/42/fd/17", 42), Some(17));
+    assert_eq!(proc_self_fd_target("/proc/43/fd/17", 42), None);
+    assert_eq!(proc_self_fd_target("/proc/self/fd/017", 42), None);
+    assert_eq!(proc_self_fd_target("/proc/self/fd/17/extra", 42), None);
+    assert_eq!(proc_self_fd_target("/proc/self/exe", 42), None);
+}
+
+#[test]
+fn memfd_reopen_flags_preserve_attenuated_rights_and_install_distinct_description() {
+    let mut table = multitask::HandleTable::new();
+    let memfd = multitask::MemfdHandle::new(alloc::string::String::from("shm"), true, None);
+    let rw_fd = table
+        .install_with_open_flags(multitask::KernelHandle::Memfd(memfd.clone()), linux_abi::O_RDWR)
+        .expect("rw memfd");
+    let rw_entry = table.get_entry(rw_fd).expect("rw entry").clone();
+    assert!(rw_entry.rights().allows_read() && rw_entry.rights().allows_write());
+
+    assert_eq!(
+        validate_memfd_reopen_flags(linux_abi::O_RDONLY | linux_abi::O_CLOEXEC, rw_entry.rights()),
+        Ok(false)
+    );
+    assert_eq!(
+        validate_memfd_reopen_flags(linux_abi::O_RDONLY | linux_abi::O_TRUNC, rw_entry.rights()),
+        Err(LINUX_EACCES)
+    );
+    assert_eq!(
+        validate_memfd_reopen_flags(linux_abi::O_RDONLY | linux_abi::O_DIRECTORY, rw_entry.rights()),
+        Err(LINUX_ENOTDIR)
+    );
+
+    let ro_fd = table
+        .install_with_open_flags(
+            multitask::KernelHandle::Memfd(memfd.reopen()),
+            linux_abi::O_RDONLY | linux_abi::O_CLOEXEC,
+        )
+        .expect("ro memfd");
+    let ro_entry = table.get_entry(ro_fd).expect("ro entry");
+    assert_ne!(ro_entry.token(), rw_entry.token());
+    assert_eq!(ro_entry.status_flags() & linux_abi::O_ACCMODE, linux_abi::O_RDONLY);
+    assert_eq!(ro_entry.fd_flags(), multitask::FD_CLOEXEC);
+    assert!(ro_entry.rights().allows_read());
+    assert!(!ro_entry.rights().allows_write());
+    assert_eq!(
+        validate_memfd_reopen_flags(linux_abi::O_RDWR, ro_entry.rights()),
+        Err(LINUX_EACCES),
+        "reopening a read-only memfd descriptor must not widen back to writable"
+    );
+}

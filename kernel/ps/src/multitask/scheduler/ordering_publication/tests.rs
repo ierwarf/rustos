@@ -221,3 +221,22 @@ pub(in crate::multitask::scheduler) fn actual_missing_current_cannot_supply_late
         drop(missing);
     });
 }
+#[test]
+fn actual_housekeeping_prioritizes_bloated_fair_worker_to_class_floor() {
+    family(|root, child, scope| {
+        runqueue::raise_vruntime_floor(root, 4 * IPC_DONATION_BONUS_NS);
+        runqueue::raise_vruntime_floor(child, 40 * IPC_DONATION_BONUS_NS);
+        let root_floor = runqueue::vruntime(root).saturating_sub(IPC_DONATION_BONUS_NS);
+        assert!(housekeeping_in(scope, CHILD));
+        assert!(
+            runqueue::vruntime(child) <= root_floor,
+            "bloated housekeeping worker stayed above active floor: {} > {}",
+            runqueue::vruntime(child),
+            root_floor
+        );
+        assert_eq!(
+            dispatch_policy::lock(0).next_pick_hint,
+            Some(dispatch_policy::LatencyPickHint { slot: child, task_id: CHILD })
+        );
+    });
+}

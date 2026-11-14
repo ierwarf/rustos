@@ -4,6 +4,84 @@ Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
 
+## Scheduler / Housekeeping 1-vCPU Starvation & `io-manager` Audit (2026-11-15)
+
+- **1-vCPU starvation & `--fault-probe` fix:**
+  - `drain_pending_vfs_mutations` (`kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs:818-825`) returned `attempted + 1` on `Some(false)` (failed replay parked for retry), causing `boot::housekeeping_once()` to stay `work > 0`, skip `housekeeping_idle_wait()`, and spin `yield_now()` up to ~83k Hz (`+17.7s/s` fake `vruntime` inflation on `slot 1` dragging waking services via `ready_floor` to `35s-40s`). Now returns `attempted`.
+  - `drain_pending_netd_refs` (`kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs:1430-1479`) incremented `attempted` before IPC (returning `1` on failed push-back) and only treated `LINUX_EBADF` as settled in the non-ack branch. Now treats `Err(LINUX_EBADF)` on `send_netd_ref_ack_with_timeout` as completed and only increments `attempted` on forward progress (`Ok` -> ack or `completed == true`).
+  - `kick_housekeeping` (`kernel/ps/src/multitask/housekeeping_kick.rs:27-39`) now wakes the registered housekeeping task without calling `prioritize_registered_housekeeping()` (`lower_vruntime_ceiling`) on every kick; explicit `prioritize_housekeeping()` remains bounded to `spawn_user_thread_suspended`.
+  - `complete_retirement_side_effects` (`kernel/ps/src/multitask/current.rs:1112-1126`) yields once for the executor, then waits via `rtc::sleep_unless(1, || ...)` instead of busy-looping `yield_now()` when `fence.complete()` stalls.
+  - Note: verified no `uiserver: auto-launching chrome.desktop for test` hook exists in `services/uiserver/`.
+  - Verified with `cargo test -p kernel-ps -- --test-threads=1` (1,178 passed), `cargo test -p kernel-compat` (352 passed), and `cargo xtask kvm-smoke --fault-probe` on 1, 2, and 4 vCPUs (all passed).
+
+- **Open `kernel/io-manager` concurrency issues (audited, not in this batch):**
+  1. `dvm_display.rs:680-684` / `dvm_display/peer.rs:344-377` / `app_buffer.rs:1449`: byte-by-byte volatile shared-memory access with `fence(Ordering::Acquire)` placed after body read instead of between sequence and body; tearable shared `u64` reads/writes.
+  2. `dvm_display/peer.rs:32-57`: offline IRQ cleanup resets `GUI_DVM_PEER_READY`, `GUI_DVM_EXPECTED_INVITATION`, `GPU_*` fields, shared `READY_CONFIRMATION`/`PRIME_COMPLETION`, and calls `service_gpu_epoch_reset()` outside `GUI_DVM_CONTROL_DRAIN` and `GpuSubmitGuard`.
+  3. `dvm_display/peer.rs:156-223`: `service_gpu_epoch_reset()` lacks a serialization mutex across concurrent callers, clearing `GPU_EPOCH_RESET_PENDING` (`line 200`) before `GPU_LIFECYCLE.activate(next_epoch)` (`line 207`), racing concurrent `finish_drain()` / `revoke_transport` host-ack writes.
+  4. `dvm_display.rs:1383-1408`: `on_framebuffer_installed` zeros `SHARED_*` / `GPU_*` offsets before flipping `INSTALLED = false` and `TRANSPORT_REVOKED = true` without draining `GPU_LIFECYCLE` or holding `GpuSubmitGuard`.
+  5. `dvm_display.rs:1020-1095` & `dvm_display/peer.rs:292-311`: lock-free slot claiming/publication (`reserve_free_slot`, `PUBLISHED_GENERATION` CAS after pixel writes) and `reinvite_newest_ready_slot` scan (`SLOT_STATE` then `SLOT_GENERATION`) race concurrent frame release/rebind without a single serializer.
+
+## Chrome run-through bug batch (2026-11-14; nothing committed)
+
+Method: temporary `startup`/autostart hacks were reverted; Chrome is launched by the
+pre-existing uiserver test hook (`uiserver: auto-launching chrome.desktop for test`,
+uncommitted, in `services/uiserver/src/app/runtime.rs`; remove before commit). Run:
+`cargo xtask kvm-smoke --rustos-vcpus 1 --gui-dvm-surfaces --dvm-block-shmem --timeout 180
+--no-auto-verify --expect chrome-never-marker` (the marker never matches on purpose so
+the VM lives the full window; read `build/kvm/rustos-debugcon.log`).
+
+Fixed and guest-observed:
+- **Int-arg ABI**: Chrome's syscall stub leaves garbage in the upper 32 bits of `int`
+  args (mmap fd arrived as 0x5_0000_0004 -> EBADF -> abort). `linux/int_args.rs` now
+  canonicalizes every 32-bit arg (table-driven, 10 host tests). First draft had a
+  match arm on an undefined `SYS_SYMLINKAT` (catch-all binding) that truncated `rsi`
+  for every syscall and broke DVM display (smoke control run proved it).
+- **Snapshot read**: storaged cache required a request inside one 32-block window
+  while vfsd sends 31-block requests, so every request missed (pipeline depth 1).
+  Cache now assembles across windows, read-ahead up to 16 windows. Chrome ELF
+  snapshot 49 s -> 26-29 s on 1 vCPU. Remaining per-IO latency is unprofiled; next
+  suspects: vfsd cooperative SCHED_YIELD every 256 KiB, 64 KiB IPC copies, DVM IO size.
+- **errno**: 184 user-pointer sites in `kernel/compat/.../linux/` switched to
+  `user_pointer_error_to_linux_errno` (EFAULT); 174 were classified mechanically by the
+  preceding usermem helper and not individually reviewed; ~120 sites elsewhere remain.
+- Chrome desktop entry now carries `HOME`/`XDG_RUNTIME_DIR=/run/user/1000` env
+  (example + local manifest).
+
+- **Group fault termination:** a fatal fault in one thread now seals the process
+  (`process_table::seal_fault_termination`), publishes the durable group exit and retires
+  siblings via `service_deferred_work`; status published once. 1-/4-vCPU boots pass; no
+  multi-thread fault probe exists yet. Risks listed by the author: new locks taken from
+  the IF-off fault context, a 100k-iteration bounded spin in `publish_for_fault`,
+  `target_by_pid` matching only the leader task (rootd terminate returns ESRCH once the
+  leader thread stopped; unfixed).
+- **futex:** waiter table sized to MAX_SCHEDULER_TASKS, table-full/timer-arm failures
+  ENOMEM (was EBUSY), op validation precedes alignment check. `FUTEX_WAKE_OP` unimplemented.
+- **errno contract:** native RustOS IPC syscalls keep EINVAL for kernel-range pointers
+  (`apps/ipcbench` uaccess selftest pins `[EFAULT,EFAULT,EFAULT,EINVAL,EINVAL]`); the EFAULT
+  sweep must not touch `ipc_ops*`, `ipc_reply_recv.rs`, `service_ops/ipc_helpers*`.
+- Verification this batch: `cargo xtask check` exit 0; kernel-compat 352 tests, kernel-ps
+  1173; 1-vCPU Chrome boot (all readiness flags true) and 4-vCPU `ipcbench: end` PASS.
+
+Open (evidence in `docs/ai/chrome-gap-fs-net.md`, `docs/ai/chrome-gap-mm-threads.md`):
+- Chrome now dies with `FATAL base/path_service.cc:264 Failed to get the path for 1001`
+  (chrome::DIR_LOGS -> user-data-dir creation). First ENOSYS seen: stat(4), gettimeofday(96),
+  statfs(137); no writable FS outside `/run/user/<uid>` (EROFS). Sandbox needs
+  unshare/setns/clone NEW*/seccomp/SIGSYS, all absent.
+- **runtimed exit status (root cause found, guest-observed):** `wait4(pid)` returns
+  ECHILD for loader-spawned apps (runtimed is not their wait parent), so the old sweep
+  fabricated status 0 and every app, including a crashed Chrome, logged `exit(0)`.
+  Now logged as `status unavailable (not a wait4 child)` (`WAIT_STATUS_UNAVAILABLE`).
+  Real status delivery to runtimed (kernel exit-status query keyed by launched pid) is
+  not implemented; the kernel itself records the correct signal (`linux-process-termination`).
+  `raise(SIGABRT)` default action not terminating remains unverified.
+- **Snapshot read remaining cost:** storaged `read()` averages ~3 ms busy per request and
+  nearly all of it is waiting on the DVM block IO (16 overlapped 64 KiB windows still
+  yield ~20 MB/s), so IPC gaps are not the limit. Next lever is the 64 KiB per-IO data
+  slot / DVM queue behavior (structural; not done).
+- A fault in one thread of a multi-threaded process retires only that thread (Linux
+  kills the group); fix needs care around `terminate_user_process_once`.
+- Not run: `formal/verify-all.sh`, multi-vCPU KVM, `cargo xtask check` for this batch.
+
 ## Chrome startup blockers 1-5 (2026-11-14; implemented and guest-verified, nothing committed)
 
 Five Chrome-startup blockers: `/proc/self/exe`, `prctl`, `eventfd2`, per-process
@@ -653,7 +731,7 @@ Starting `7cbe0711`:
   instead of returning a spurious `EINVAL` (`epoll-wait-failed` site=4).
 - **Source contracts & failure-snapshot completeness (`kernel/compat/src/user/syscall/linux.rs`, `tools/xtask/src/kvm/failure_snapshot.rs`, etc.):**
   Moved `LINUX_E*` constants into `linux/error_ops.rs` (`linux.rs` 630 -> 592
-  lines, within the 600-line budget), added missing `// SAFETY:` and
+  lines), added missing `// SAFETY:` and
   `// ORDERING:` comments in `libs/driver-domain-host/src/lib.rs`,
   `kernel/io-manager/src/io/dvm_network.rs`, and `services/storaged/src/block.rs`,
   and updated `failure_snapshot.rs` (`OWNER_WORDS` symbol path and `REPLIES`
@@ -1171,7 +1249,7 @@ re-audited by the Chrome desktop batch.
 
 - No full independent audit of the latest Ring0 transfer registry / v2 ABI;
   no fresh DVM window capture. `display-provider` exceeded its advisory 2.5 s
-  deadline (2.6–2.9 s); `linux.rs` exceeded its advisory 600-line budget.
+  deadline (2.6–2.9 s).
 - Wayland I/O remains on the UI loop; pointer hit tests ignore consoles.
   Cold DVM GPU budget behavior has limited parallel-load evidence. The DVM
   host ring/teardown audit and large `driver-domain-host` split are unfinished.

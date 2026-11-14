@@ -284,6 +284,8 @@ impl ReclaimingAllocator {
             if self.locked.load(Ordering::Relaxed) == UNLOCKED
                 && self
                     .locked
+                    // ORDERING: Acquire on success, as in `lock`: the previous holder's free-list
+                    // writes become visible; the Relaxed failure path publishes and reads nothing.
                     .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
             {
@@ -318,6 +320,9 @@ impl ReclaimingAllocator {
             || len == 0
             || self
                 .initialized
+                // ORDERING: one-shot admission latch. It guards no data itself (the free list is
+                // protected by `locked`); AcqRel on success and Acquire on failure also order
+                // it against the Release rollback store below from a failed first caller.
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
         {
@@ -328,6 +333,9 @@ impl ReclaimingAllocator {
         let installed = state.add_region(base, len);
         self.unlock();
         if !installed {
+            // ORDERING: Release rollback of the latch after `add_region` rejected the
+            // region, so a later `initialize` that wins the CAS observes the reset; no
+            // region was installed, so no other data is published by this store.
             self.initialized.store(false, Ordering::Release);
         }
         installed
@@ -440,6 +448,9 @@ mod tests {
     fn freed_large_allocation_is_reused_without_growth() {
         let mut heap = TestHeap([0; 32 * 1024]);
         let allocator = ReclaimingAllocator::new();
+        // SAFETY: the test region `heap` is a live, 4096-aligned array that outlives
+        // `allocator`; the allocator is unshared (single thread), so the state is
+        // exclusively accessed, and every allocation is freed with its own layout.
         unsafe {
             assert!((&mut *allocator.state.get())
                 .add_region(heap.0.as_mut_ptr() as usize, heap.0.len()));
@@ -457,6 +468,8 @@ mod tests {
     fn cumulative_transient_traffic_is_bounded_by_peak_live_memory() {
         let mut heap = TestHeap([0; 32 * 1024]);
         let allocator = ReclaimingAllocator::new();
+        // SAFETY: as in the previous test: private live `heap`, single thread, each
+        // allocation freed with the layout it was made with.
         unsafe {
             assert!((&mut *allocator.state.get())
                 .add_region(heap.0.as_mut_ptr() as usize, heap.0.len()));
@@ -479,6 +492,8 @@ mod tests {
     fn adjacent_frees_coalesce_for_a_larger_request() {
         let mut heap = TestHeap([0; 32 * 1024]);
         let allocator = ReclaimingAllocator::new();
+        // SAFETY: private live `heap`, single thread; both allocations are freed with
+        // their own layouts and the coalesced block is released before `heap` drops.
         unsafe {
             assert!((&mut *allocator.state.get())
                 .add_region(heap.0.as_mut_ptr() as usize, heap.0.len()));
@@ -500,6 +515,8 @@ mod tests {
     fn allocator_honors_large_alignment() {
         let mut heap = TestHeap([0; 32 * 1024]);
         let allocator = ReclaimingAllocator::new();
+        // SAFETY: private live `heap`, single thread; the allocation is freed with the
+        // layout it was made with, and `heap` outlives the allocator's use of it.
         unsafe {
             assert!((&mut *allocator.state.get())
                 .add_region(heap.0.as_mut_ptr() as usize, heap.0.len()));
@@ -527,16 +544,25 @@ mod tests {
         let allocator = ReclaimingAllocator::new();
         let layout = Layout::from_size_align(48 * 1024, 64).unwrap();
         let backing_layout = Layout::from_size_align(GROW_CHUNK_BYTES, 4096).unwrap();
+        // SAFETY: `backing_layout` has non-zero size and valid alignment; the null result
+        // is asserted right below and the block is freed with this same layout.
         let backing = unsafe { System.alloc(backing_layout) };
         assert!(!backing.is_null());
+        // SAFETY: single-threaded test; the grow closure returns `backing`, a live
+        // GROW_CHUNK_BYTES block, so `add_region` only touches memory this test owns.
         let allocation = unsafe {
             allocator.allocate_with_growth(layout, |chunk| {
+                // ORDERING: test-only check that the growth callback runs outside the allocator
+                // lock; Acquire pairs with the Release in `unlock`.
                 assert_eq!(allocator.locked.load(Ordering::Acquire), UNLOCKED);
                 assert!(chunk >= layout.size() + HEADER_BYTES);
                 Some(backing as usize)
             })
         };
         assert!(!allocation.is_null());
+        // SAFETY: the allocation came from `allocator` with this `layout` and is freed
+        // once; `backing` is freed once with the layout it was allocated with, after
+        // the allocator stops using it.
         unsafe {
             allocator.dealloc(allocation, layout);
             System.dealloc(backing, backing_layout);
@@ -584,6 +610,8 @@ mod tests {
             }
         });
         assert_eq!(failures.load(AtomicOrdering::Relaxed), 0);
+        // ORDERING: test-only check after all threads joined; Acquire pairs with the
+        // Release in `unlock`, so the lock is observed released.
         assert_eq!(allocator.locked.load(Ordering::Acquire), UNLOCKED);
     }
 
@@ -591,6 +619,9 @@ mod tests {
     fn duplicate_release_is_rejected_without_free_list_overlap() {
         let mut heap = TestHeap([0; 32 * 1024]);
         let allocator = ReclaimingAllocator::new();
+        // SAFETY: private live `heap`; `lock`/`unlock` are paired on this thread, the
+        // double `deallocate` is the validated rejection under test, and the later
+        // allocations are freed with their own layouts.
         unsafe {
             assert!((&mut *allocator.state.get())
                 .add_region(heap.0.as_mut_ptr() as usize, heap.0.len()));
@@ -616,6 +647,8 @@ mod tests {
     fn bootstrap_region_is_installed_once() {
         let mut heap = TestHeap([0; 32 * 1024]);
         let allocator = ReclaimingAllocator::new();
+        // SAFETY: private live `heap`; the second `initialize` is rejected by the latch
+        // and installs nothing, and both allocations are freed with their own layouts.
         unsafe {
             assert!(allocator.initialize(heap.0.as_mut_ptr() as usize, heap.0.len()));
             assert!(!allocator.initialize(heap.0.as_mut_ptr() as usize, heap.0.len()));

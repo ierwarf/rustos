@@ -282,13 +282,12 @@ Rust. Record required work as a failed contract/evidence row with an owner.
 `allow(dead_code)` is permitted only for a compiler-invisible ABI/assembly use,
 generated multi-context source, or a test-only item, with an adjacent reason.
 
-## Refactoring and file size
+## Refactoring
 
 - Prefer one state owner per module and one direction of dependency.
-- Split a Rust file above 1,300 lines when independent state owners, protocol
-  codecs, policy, tests, or evidence parsing can move behind private typed
-  interfaces. A cohesive exception must be named in the source-contract
-  inventory with a reason and a reduction plan.
+- Split a Rust file when independent state owners, protocol codecs, policy,
+  tests, or evidence parsing can move behind private typed interfaces; file
+  length alone is never a reason.
 - Do not split by `include!` merely to reduce line count. The new module must
   own a real concept and expose a smaller interface.
 - Cross-crate kernel calls go through `kernel_*::api`; service protocol types

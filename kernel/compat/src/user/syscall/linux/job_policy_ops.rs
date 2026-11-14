@@ -83,7 +83,7 @@ fn check_current_cache_if_enabled(args: &RustosJobPolicyArgs, caller: u64) -> Re
 pub(super) fn syscall_linux_rustos_job_policy(args_ptr: u64) -> u64 {
     let mut args = match usermem::read_current_user_struct::<RustosJobPolicyArgs>(args_ptr) {
         Ok(args) => args,
-        Err(error) => return linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
     };
     if !policy_args_are_valid(&args) {
         return linux_errno(LINUX_EINVAL);
@@ -94,7 +94,7 @@ pub(super) fn syscall_linux_rustos_job_policy(args_ptr: u64) -> u64 {
     if let Err(error) = usermem::validate_current_user_write_buffer(
         args_ptr, size_of::<RustosJobPolicyArgs>(),
     ) {
-        return linux_errno(address_space_error_to_linux_errno(error));
+        return linux_errno(user_pointer_error_to_linux_errno(error));
     }
     if let Err(errno) = run_policy_op(&mut args, caller) {
         return linux_errno(errno);
@@ -105,7 +105,7 @@ pub(super) fn syscall_linux_rustos_job_policy(args_ptr: u64) -> u64 {
     // SET commits scalar ceiling state, not new descriptor authority. A later
     // copyout fault is reported but does not roll back the completed mutation.
     if let Err(error) = usermem::write_current_user_struct(args_ptr, &args) {
-        return linux_errno(address_space_error_to_linux_errno(error));
+        return linux_errno(user_pointer_error_to_linux_errno(error));
     }
     0
 }

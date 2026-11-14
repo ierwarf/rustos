@@ -145,6 +145,10 @@ pub(super) unsafe fn guarded(mut owner: Producer, eligible_cpus: &dyn Fn(usize) 
                 TaskRetireReason::UserFault { vector, .. } => Some(vector),
                 _ => None,
             },
+            fault_status_sealed: matches!(owner.reason(), TaskRetireReason::UserFault { .. })
+                && context.process_handle.is_some_and(|handle| {
+                    crate::multitask::process_table::fault_termination_owner(handle, id).is_some()
+                }),
             clear_child_tid: linux.map(|state| state.clear_child_tid).unwrap_or(0),
             robust_list_head: linux.map(|state| state.robust_list_head).unwrap_or(0),
             robust_list_len: linux.map(|state| state.robust_list_len).unwrap_or(0),

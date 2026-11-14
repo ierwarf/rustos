@@ -60,6 +60,7 @@ fn own_basis(slot: usize, id: u64) -> FundingBasis {
 
 /// Reserve the donor's single edge without touching the ledger. `false` leaves
 /// the decision to `reserve_own`.
+#[cfg(any(rustos_boot_image, test))]
 pub(in super::super) fn reserve(slot: usize, id: u64) -> bool {
     let Some(edge) = EDGES.get(slot) else { return false };
     if edge.state.load(Ordering::Relaxed) != IDLE {

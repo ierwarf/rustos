@@ -13,6 +13,7 @@ pub struct RetiredTaskCleanup {
     pub(super) process_id: u64,
     pub(super) process_terminal: bool,
     pub(super) user_fault_vector: Option<u8>,
+    pub(super) fault_status_sealed: bool,
     pub(super) clear_child_tid: u64,
     pub(super) robust_list_head: u64,
     pub(super) robust_list_len: u64,
@@ -34,6 +35,12 @@ impl RetiredTaskCleanup {
     /// Original terminal producer's fault, not a later lookup of the task.
     pub const fn user_fault_vector(self) -> Option<u8> {
         self.user_fault_vector
+    }
+
+    /// True when this task's fault won the process's first-wins terminal seal
+    /// and therefore owns publishing the process wait status exactly once.
+    pub const fn fault_status_sealed(self) -> bool {
+        self.fault_status_sealed
     }
 
     pub const fn clear_child_tid(self) -> u64 {

@@ -127,6 +127,14 @@ impl MemfdHandle {
         }
     }
 
+    /// Creates a distinct open description backed by the same shared object.
+    pub fn reopen(&self) -> Self {
+        let object = self.object();
+        Self {
+            inner: Arc::new(Mutex::new(MemfdOpenState { object, cursor: 0 })),
+        }
+    }
+
     pub fn path(&self) -> String {
         let object = self.object();
         let state = object.state.lock();
@@ -812,5 +820,32 @@ mod tests {
         let free = MemfdHandle::new(String::from("free"), true, None);
         assert_eq!(free.truncate(2 * PAGE_SIZE), Ok(()));
         assert_eq!(charge::usage(53), 0);
+    }
+
+    #[test]
+    fn reopen_creates_distinct_open_description_sharing_backing_object() {
+        fake_reset(usize::MAX);
+        let mut primary = MemfdHandle::new(String::from("shared"), true, None);
+        assert_eq!(primary.truncate(PAGE_SIZE), Ok(()));
+        assert_eq!(
+            primary.seek(128, FileHandleSeekWhence::Start),
+            Ok(128)
+        );
+        let mut reopened = primary.reopen();
+        assert_ne!(primary.token_id(), reopened.token_id());
+        assert_eq!(primary.object().object_id, reopened.object().object_id);
+        assert_eq!(reopened.len(), PAGE_SIZE);
+        assert_eq!(
+            reopened.seek(0, FileHandleSeekWhence::Current),
+            Ok(0),
+            "reopened description starts at cursor 0"
+        );
+        assert_eq!(
+            primary.seek(0, FileHandleSeekWhence::Current),
+            Ok(128),
+            "reopening or seeking the new description leaves the primary cursor untouched"
+        );
+        assert_eq!(reopened.add_seals(linux_abi::F_SEAL_SHRINK as u32), Ok(()));
+        assert_eq!(primary.seals(), reopened.seals());
     }
 }

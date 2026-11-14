@@ -282,6 +282,7 @@ fn wayland_opaque_rect(window: &WaylandWindowSnapshot, client: Rect, pixels_opaq
     }
 }
 
+#[cfg(test)]
 fn opaque_wayland_interior(window: &WaylandWindowSnapshot) -> Rect {
     let client = wayland_window_client_rect_for(window, wayland_window_outer_rect(window));
     let width = window.width.min(client.width);

@@ -65,13 +65,17 @@ pub(crate) fn service_retired_task_runtime_cleanup(limit: usize) -> usize {
         let Some(cleanup) = multitask::next_retired_task_cleanup() else {
             break;
         };
-        // The exact producer elected the last process member and sealed its
-        // first fault. Do not infer this from a racy exception-time census or
-        // execute potentially blocking close/policy work with exception IF=0.
+        // The exact producer either won the process's first-wins fault seal
+        // (a fatal fault terminates the whole thread group, whichever thread
+        // took it) or elected the last process member after an unsealed fault.
+        // Never infer this from a racy exception-time census or execute
+        // potentially blocking close/policy work with exception IF=0.
         if let Some(vector) = retired_process_fault_vector(
-            cleanup.process_terminal(), cleanup.user_fault_vector(),
+            cleanup.process_terminal(), cleanup.user_fault_vector(), cleanup.fault_status_sealed(),
         ) {
-            super::record_linux_process_fault_termination(cleanup.process_id(), vector);
+            super::record_linux_process_fault_termination(
+                cleanup.process_id(), vector, cleanup.fault_status_sealed(),
+            );
         }
         work += cleanup_retired_task_runtime_state(
             cleanup.task_id(),
@@ -93,8 +97,12 @@ pub(crate) fn service_retired_task_runtime_cleanup(limit: usize) -> usize {
     work
 }
 
-fn retired_process_fault_vector(process_terminal: bool, user_fault_vector: Option<u8>) -> Option<u8> {
-    if process_terminal { user_fault_vector } else { None }
+fn retired_process_fault_vector(
+    process_terminal: bool,
+    user_fault_vector: Option<u8>,
+    fault_status_sealed: bool,
+) -> Option<u8> {
+    if process_terminal || fault_status_sealed { user_fault_vector } else { None }
 }
 
 fn rootd_terminate_args_are_valid(args: &RustosRootdTerminateBrokerArgs) -> bool {
@@ -124,7 +132,7 @@ pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 
     }
     let args = match usermem::read_current_user_struct::<LifecycleDrainBrokerArgs>(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     if !lifecycle_drain_args_are_valid(&args) {
         return linux_errno(LINUX_EINVAL);
@@ -153,7 +161,7 @@ pub(super) fn syscall_linux_rustos_rootd_terminate_broker(args_ptr: u64) -> u64 
     }
     let args = match usermem::read_current_user_struct::<RustosRootdTerminateBrokerArgs>(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     if !rootd_terminate_args_are_valid(&args) {
         return linux_errno(LINUX_EINVAL);
@@ -281,7 +289,7 @@ pub(super) fn syscall_linux_rustos_rootd_memory_broker(args_ptr: u64) -> u64 {
     }
     let args = match usermem::read_current_user_struct::<RustosRootdMemoryBrokerArgs>(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     if !rootd_memory_args_are_valid(&args) {
         return linux_errno(LINUX_EINVAL);
@@ -298,7 +306,7 @@ pub(super) fn syscall_linux_rustos_rootd_memory_broker(args_ptr: u64) -> u64 {
     let reply = build_memory_reply(&stats, &census[..count]);
     match usermem::write_current_user_struct(args_ptr, &reply) {
         Ok(()) => 0,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
     }
 }
 
@@ -318,12 +326,16 @@ mod tests {
     };
 
     #[test]
-    fn only_original_final_fault_token_commits_process_termination() {
-        assert_eq!(retired_process_fault_vector(false, None), None);
-        assert_eq!(retired_process_fault_vector(false, Some(14)), None);
-        assert_eq!(retired_process_fault_vector(true, None), None);
-        assert_eq!(retired_process_fault_vector(true, Some(14)), Some(14));
-        assert_eq!(retired_process_fault_vector(true, Some(13)), Some(13));
+    fn only_original_final_or_sealed_fault_token_commits_process_termination() {
+        assert_eq!(retired_process_fault_vector(false, None, false), None);
+        assert_eq!(retired_process_fault_vector(false, Some(14), false), None);
+        assert_eq!(retired_process_fault_vector(true, None, false), None);
+        assert_eq!(retired_process_fault_vector(true, Some(14), false), Some(14));
+        assert_eq!(retired_process_fault_vector(true, Some(13), false), Some(13));
+        // A non-final faulting thread that won the first-wins seal publishes the
+        // status for the whole group; one that lost it publishes nothing.
+        assert_eq!(retired_process_fault_vector(false, Some(14), true), Some(14));
+        assert_eq!(retired_process_fault_vector(false, None, true), None);
     }
 
     #[test]

@@ -1377,11 +1377,29 @@ pub(super) fn syscall_linux_rustos_proc_signal_queue_broker(args_ptr: u64) -> u6
         || args.reserved0 != 0
         || args.signal > crate::user::linux::MAX_SIGNAL_NUMBER as u32
         || args.target_pid == 0
-        || args.target_tid == 0
     {
         return linux_errno(LINUX_EINVAL);
     }
-    match multitask::queue_linux_signal(args.target_pid, args.target_tid, args.signal as u64) {
+    // `target_tid == 0` is process-directed (`kill`): any live member of the
+    // thread group, so a retired leader does not hide its siblings.
+    let queued = if args.target_tid == 0 {
+        multitask::queue_linux_process_signal(args.target_pid, args.signal as u64)
+    } else {
+        multitask::queue_linux_signal(args.target_pid, args.target_tid, args.signal as u64)
+    };
+    // SIGKILL cannot wait for a recipient syscall boundary: a thread spinning
+    // in user mode never reaches signal delivery. A process-directed SIGKILL
+    // from another process ends the whole group through the same terminal path
+    // rootd terminate uses, which also publishes the SIGKILL wait status.
+    if matches!(queued, Ok(true))
+        && args.target_tid == 0
+        && args.signal == linux_abi::SIGKILL as u32
+        && args.sender_pid != args.target_pid
+    {
+        terminate_process_once_and_finalize(args.target_pid);
+        return 0;
+    }
+    match queued {
         Ok(true) => 0,
         Ok(false) => linux_errno(LINUX_ESRCH),
         Err(()) => linux_errno(LINUX_EAGAIN),

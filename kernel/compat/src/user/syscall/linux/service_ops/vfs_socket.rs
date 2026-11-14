@@ -24,6 +24,9 @@ use nucleus_core::util::{
 };
 use rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT;
 
+const VFS_DEVICE_ACCESS_NULL: u16 = VFS_DEVICE_ACCESS_DRM_COMPAT + 1;
+const VFS_DEVICE_ACCESS_URANDOM: u16 = VFS_DEVICE_ACCESS_DRM_COMPAT + 2;
+
 const PENDING_NETD_REF_CAPACITY: usize = 4096;
 const PENDING_NETD_REF_STORAGE_CAPACITY: usize = PENDING_NETD_REF_CAPACITY + 1;
 const REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY: usize = 32 * 1024;
@@ -219,6 +222,12 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
+    if let Some(result) = try_reopen_proc_self_memfd(path.as_str(), flags) {
+        return match result {
+            Ok(fd) => fd,
+            Err(errno) => linux_errno(errno),
+        };
+    }
     if path.contains("startup-programs") || path.contains("runtime-env") {
         crate::debug::info!(
             compat,
@@ -279,7 +288,12 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
     // a device. Compat performs only the handle-transfer substrate after that
     // service decision; it must not classify caller path strings in ring0.
     if kind == multitask::RemoteVfsHandleKind::Device
-        && response.aux != u64::from(VFS_DEVICE_ACCESS_DRM_COMPAT)
+        && !matches!(
+            response.aux as u16,
+            VFS_DEVICE_ACCESS_DRM_COMPAT
+                | VFS_DEVICE_ACCESS_NULL
+                | VFS_DEVICE_ACCESS_URANDOM
+        )
     {
         let _ = call_vfs_remote_close_bounded(remote_id);
         return match open_device_via_devmgrd(handle_path.as_str(), flags) {
@@ -454,13 +468,18 @@ pub fn syscall_linux_vfs_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
             }
         }
         _ => {
-            if let Some(memfd) = current_memfd_handle(fd) {
+            if let Some((memfd, rights)) = current_memfd_handle_with_rights(fd) {
                 return match cmd {
                     linux_abi::F_GET_SEALS => memfd.seals() as u64,
-                    linux_abi::F_ADD_SEALS => match memfd.add_seals(arg as u32) {
-                        Ok(()) => 0,
-                        Err(err) => linux_errno(memfd_error_to_linux_errno(err)),
-                    },
+                    linux_abi::F_ADD_SEALS => {
+                        if !rights.allows_write() {
+                            return linux_errno(LINUX_EPERM);
+                        }
+                        match memfd.add_seals(arg as u32) {
+                            Ok(()) => 0,
+                            Err(err) => linux_errno(memfd_error_to_linux_errno(err)),
+                        }
+                    }
                     _ => linux_errno(LINUX_EINVAL),
                 };
             }
@@ -646,7 +665,10 @@ pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
             SYSCALL_OFFLOAD_OP_LINUX_RECVFROM, fd, user_ptr, user_len, 0, 0, 0,
         ));
     }
-    if let Some(mut memfd) = current_memfd_handle(fd) {
+    if let Some((mut memfd, rights)) = current_memfd_handle_with_rights(fd) {
+        if !rights.allows_read() {
+            return linux_errno(LINUX_EBADF);
+        }
         return super::local_memfd_io::read(&mut memfd, user_ptr, user_len);
     }
     if let Some((inputd_access, status_flags)) = current_input_device_access(fd) {
@@ -655,20 +677,38 @@ pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
-    if remote.kind() == multitask::RemoteVfsHandleKind::Device
-        && matches!(
-            remote.device_access(),
-            INPUTD_ACCESS_NATIVE | INPUTD_ACCESS_EVDEV
-        )
-    {
-        let access = remote.device_access();
-        let Some(status_flags) = current_fd_status_flags(fd) else {
-            // The remote device handle and its descriptor state must be
-            // observed atomically from the current process. Do not turn a
-            // missing descriptor into a blocking read with synthetic flags.
-            return linux_errno(LINUX_EBADF);
-        };
-        return read_input_device_via_inputd(fd, user_ptr, user_len, access, status_flags);
+    if remote.kind() == multitask::RemoteVfsHandleKind::Device {
+        match remote.device_access() {
+            INPUTD_ACCESS_NATIVE | INPUTD_ACCESS_EVDEV => {
+                let access = remote.device_access();
+                let Some(status_flags) = current_fd_status_flags(fd) else {
+                    // The remote device handle and its descriptor state must be
+                    // observed atomically from the current process. Do not turn a
+                    // missing descriptor into a blocking read with synthetic flags.
+                    return linux_errno(LINUX_EBADF);
+                };
+                return read_input_device_via_inputd(fd, user_ptr, user_len, access, status_flags);
+            }
+            VFS_DEVICE_ACCESS_NULL => {
+                let Ok(len) = usize::try_from(user_len) else {
+                    return linux_errno(LINUX_EINVAL);
+                };
+                if len > 0
+                    && let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, 1)
+                {
+                    return linux_errno(address_space_error_to_linux_errno(err));
+                }
+                return 0;
+            }
+            VFS_DEVICE_ACCESS_URANDOM => {
+                return super::super::syscalld_ops::syscall_linux_syscalld_getrandom(
+                    user_ptr,
+                    user_len,
+                    0,
+                );
+            }
+            _ => {}
+        }
     }
     read_remote_vfs(fd, remote.remote_id(), user_ptr, user_len, None)
 }
@@ -693,7 +733,10 @@ pub fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, offset: 
     if let Some(result) = super::local_fd::not_seekable(fd) {
         return result;
     }
-    if let Some(memfd) = current_memfd_handle(fd) {
+    if let Some((memfd, rights)) = current_memfd_handle_with_rights(fd) {
+        if !rights.allows_read() {
+            return linux_errno(LINUX_EBADF);
+        }
         let Ok(offset) = usize::try_from(offset) else {
             return linux_errno(LINUX_EINVAL);
         };
@@ -705,6 +748,29 @@ pub fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, offset: 
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
+    if remote.kind() == multitask::RemoteVfsHandleKind::Device {
+        match remote.device_access() {
+            VFS_DEVICE_ACCESS_NULL => {
+                let Ok(len) = usize::try_from(user_len) else {
+                    return linux_errno(LINUX_EINVAL);
+                };
+                if len > 0
+                    && let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, 1)
+                {
+                    return linux_errno(address_space_error_to_linux_errno(err));
+                }
+                return 0;
+            }
+            VFS_DEVICE_ACCESS_URANDOM => {
+                return super::super::syscalld_ops::syscall_linux_syscalld_getrandom(
+                    user_ptr,
+                    user_len,
+                    0,
+                );
+            }
+            _ => {}
+        }
+    }
     read_remote_vfs(fd, remote.remote_id(), user_ptr, user_len, Some(offset))
 }
 
@@ -753,12 +819,32 @@ pub fn syscall_linux_vfs_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
             0,
         );
     }
-    if let Some(mut memfd) = current_memfd_handle(fd) {
+    if let Some((mut memfd, rights)) = current_memfd_handle_with_rights(fd) {
+        if !rights.allows_write() {
+            return linux_errno(LINUX_EBADF);
+        }
         return super::local_memfd_io::write(&mut memfd, user_ptr, user_len);
     }
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
+    if remote.kind() == multitask::RemoteVfsHandleKind::Device
+        && matches!(
+            remote.device_access(),
+            VFS_DEVICE_ACCESS_NULL | VFS_DEVICE_ACCESS_URANDOM
+        )
+    {
+        let Ok(len) = usize::try_from(user_len) else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        let mut probe = [0u8; 1];
+        if len > 0
+            && let Err(err) = usermem::copy_from_current_user_exact(user_ptr, &mut probe)
+        {
+            return linux_errno(address_space_error_to_linux_errno(err));
+        }
+        return len as u64;
+    }
     write_remote_vfs(fd, remote.remote_id(), user_ptr, user_len)
 }
 
@@ -811,6 +897,100 @@ fn current_fd_exists(fd: u64) -> bool {
         process_state.handles().get_entry(fd).is_some()
     })
     .unwrap_or(false)
+}
+
+fn parse_strict_decimal_u64(component: &str) -> Option<u64> {
+    if component.is_empty() || (component.len() > 1 && component.starts_with('0')) {
+        return None;
+    }
+    if !component.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    component.parse().ok()
+}
+
+fn proc_self_fd_target(path: &str, caller_pid: u64) -> Option<u64> {
+    let rest = path.strip_prefix("/proc/")?;
+    let mut parts = rest.split('/');
+    let pid_part = parts.next()?;
+    let fd_dir = parts.next()?;
+    let fd_part = parts.next()?;
+    if parts.next().is_some() || fd_dir != "fd" {
+        return None;
+    }
+    if pid_part != "self" && parse_strict_decimal_u64(pid_part) != Some(caller_pid) {
+        return None;
+    }
+    parse_strict_decimal_u64(fd_part)
+}
+
+fn validate_memfd_reopen_flags(
+    flags: u64,
+    source_rights: kernel_object::api::handle::HandleRights,
+) -> Result<bool, i64> {
+    const LINUX_O_EXCL: u64 = 0o200;
+    if flags & linux_abi::O_DIRECTORY != 0 {
+        return Err(LINUX_ENOTDIR);
+    }
+    if flags & linux_abi::O_CREAT != 0 && flags & LINUX_O_EXCL != 0 {
+        return Err(LINUX_EEXIST);
+    }
+    let (wants_read, wants_write) = match flags & linux_abi::O_ACCMODE {
+        linux_abi::O_RDONLY => (true, false),
+        linux_abi::O_WRONLY => (false, true),
+        linux_abi::O_RDWR => (true, true),
+        _ => return Err(LINUX_EINVAL),
+    };
+    if (wants_read && !source_rights.allows_read())
+        || (wants_write && !source_rights.allows_write())
+    {
+        return Err(LINUX_EACCES);
+    }
+    let truncate = flags & linux_abi::O_TRUNC != 0;
+    if truncate && !wants_write {
+        return Err(LINUX_EACCES);
+    }
+    Ok(truncate)
+}
+
+fn try_reopen_proc_self_memfd(path: &str, flags: u64) -> Option<Result<u64, i64>> {
+    let caller_pid = multitask::current_user_process_id()?;
+    let target_fd = proc_self_fd_target(path, caller_pid)?;
+    let (memfd, source_rights, source_token) =
+        multitask::with_current_user_process_state(|_, _, process_state| {
+            let entry = process_state.handles().get_entry(target_fd)?;
+            match entry.handle() {
+                multitask::KernelHandle::Memfd(memfd) => {
+                    Some((memfd.clone(), entry.rights(), entry.token()))
+                }
+                _ => None,
+            }
+        })
+        .flatten()?;
+    let truncate = match validate_memfd_reopen_flags(flags, source_rights) {
+        Ok(truncate) => truncate,
+        Err(errno) => return Some(Err(errno)),
+    };
+    if truncate && let Err(err) = memfd.truncate(0) {
+        return Some(Err(memfd_error_to_linux_errno(err)));
+    }
+    let reopened = multitask::KernelHandle::Memfd(memfd.reopen());
+    let installed = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        if process_state
+            .handles()
+            .get_entry(target_fd)
+            .map(|entry| entry.token())
+            != Some(source_token)
+        {
+            return Err(LINUX_EBADF);
+        }
+        process_state
+            .handles_mut()
+            .install_with_open_flags(reopened, flags)
+            .ok_or(LINUX_EMFILE)
+    })
+    .unwrap_or(Err(LINUX_EBADF));
+    Some(installed)
 }
 
 fn call_vfs_remote_close(remote_id: u64) -> Result<(), i64> {
@@ -1085,22 +1265,6 @@ fn current_socket_fd(fd: u64) -> bool {
     .unwrap_or(false)
 }
 
-fn current_socket_token_and_flags(fd: u64) -> Option<(u64, u64)> {
-    multitask::with_current_user_process_state(|_, _, process_state| {
-        let entry = process_state.handles().get_entry(fd)?;
-        match entry.handle() {
-            multitask::KernelHandle::Socket(socket) => {
-                Some((socket.token_id(), entry.status_flags()))
-            }
-            multitask::KernelHandle::InetSocket(socket) => {
-                Some((socket.token_id(), entry.status_flags()))
-            }
-            _ => None,
-        }
-    })
-    .flatten()
-}
-
 fn new_netd_socket_request(op: u16, socket_token: u64, deadline_ns: u64) -> NetdIpcRequest {
     let mut operation = [0_u8; 16];
     nucleus_core::util::random::Random::new().fill_bytes(&mut operation);
@@ -1267,7 +1431,6 @@ fn drain_pending_netd_refs() -> usize {
         let Some(pending) = PENDING_NETD_REFS.lock().pop() else {
             return attempted;
         };
-        attempted += 1;
         let mut request = new_netd_socket_request(
             pending.op,
             pending.socket_token,
@@ -1279,11 +1442,14 @@ fn drain_pending_netd_refs() -> usize {
         request.operation_hi = pending.operation_hi;
         request.operation_lo = pending.operation_lo;
         let completed = if pending.acknowledge_only {
-            send_netd_ref_ack_with_timeout(
+            match send_netd_ref_ack_with_timeout(
                 &request,
                 rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
-            )
-            .is_ok()
+            ) {
+                Ok(()) => true,
+                Err(errno) if errno == LINUX_EBADF => true,
+                Err(_) => false,
+            }
         } else {
             match call_netd_ipc_request_with_timeout(
                 &request,
@@ -1300,7 +1466,7 @@ fn drain_pending_netd_refs() -> usize {
                         PENDING_NETD_REFS.lock().push_front(acknowledge),
                         "popped deferred netd reference must have retry capacity"
                     );
-                    return attempted;
+                    return attempted + 1;
                 }
                 Err(errno) if errno == LINUX_EBADF => true,
                 Err(_) => false,
@@ -1313,6 +1479,7 @@ fn drain_pending_netd_refs() -> usize {
             );
             return attempted;
         }
+        attempted += 1;
     }
     attempted
 }

@@ -108,17 +108,3 @@ pub(super) fn dequeue_message_with_limits(
         Ok(channel_object.recv_queue.pop_front())
     })
 }
-
-pub(super) fn channel_peer(channel: KernelChannelHandle) -> Option<KernelChannelHandle> {
-    with_ipc_objects_ref(|objects| {
-        let channel_object = objects.channels.get(&channel.raw())?;
-        channel_object.peer.map(KernelChannelHandle::from_raw)
-    })
-}
-
-pub(super) fn channel_queue_len(channel: KernelChannelHandle) -> Option<usize> {
-    with_ipc_objects_ref(|objects| {
-        let channel_object = objects.channels.get(&channel.raw())?;
-        Some(channel_object.recv_queue.len())
-    })
-}

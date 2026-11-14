@@ -412,6 +412,10 @@ pub fn for_each_pci_bus_region(mut visit: impl FnMut(u16, u8, u8) -> bool) {
 }
 
 fn boot_info_from_ptr(boot_info_ptr: *const BootInfo) -> Option<&'static BootInfo> {
+    // SAFETY: `boot_info_ptr` is the loader-handed `BootInfo` pointer, mapped and
+    // aligned for the whole boot; `from_ptr` rejects null/misaligned values and
+    // validates every encoded field, and `init` runs once on the BSP before APs or
+    // interrupts exist, so nothing mutates the structure while it is borrowed.
     unsafe { BootInfo::from_ptr(boot_info_ptr) }.ok()
 }
 
@@ -744,6 +748,10 @@ fn phys_bytes(addr: u64, len: usize) -> Option<&'static [u8]> {
         return None;
     }
 
+    // SAFETY: `addr..addr+len` was checked non-zero, overflow-free and below
+    // `IDENTITY_MAPPED_PHYS_LIMIT`, the physical window the kernel identity-maps,
+    // so the range is mapped. It is firmware table memory that the kernel never
+    // writes, so the shared `'static` slice cannot alias a mutation.
     Some(unsafe { core::slice::from_raw_parts(addr as *const u8, len as usize) })
 }
 

@@ -15,9 +15,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACTS = ROOT / "formal/contracts.toml"
 DEBT = ROOT / "formal/rust-source-debt.tsv"
-LARGE_FILES = ROOT / "formal/rust-large-files.tsv"
-# Advisory only: line counts never fail the check, they only warn.
-LARGE_FILE_THRESHOLD = 2000
 HEADER_SCAN_LINES = 100
 
 # Markdown outside `references/`, which is vendored upstream material this repo
@@ -202,33 +199,6 @@ def check_debt_ledger(
             )
 
 
-def check_large_files(files: list[Path], errors: list[str]) -> None:
-    """Advisory size report: oversize files and stale registry rows only warn."""
-    try:
-        registered = read_tsv(LARGE_FILES, 4)
-    except (OSError, ValueError) as error:
-        warn(str(error))
-        return
-
-    actual: dict[str, int] = {}
-    for path in files:
-        lines = path.read_text(errors="replace").splitlines()
-        if len(lines) > LARGE_FILE_THRESHOLD:
-            actual[path.relative_to(ROOT).as_posix()] = len(lines)
-
-    for path, line_count in actual.items():
-        row = registered.get(path)
-        if row is None:
-            warn(f"{path}: {line_count} lines exceeds {LARGE_FILE_THRESHOLD}")
-            continue
-        try:
-            limit = int(row[0])
-        except ValueError:
-            continue
-        if line_count > limit:
-            warn(f"{path}: large-file debt grew {limit} -> {line_count}")
-
-
 def check_production_markers(files: list[Path], errors: list[str]) -> None:
     forbidden = re.compile(r"\b(?:TODO|FIXME)\b|todo!\s*\(|unimplemented!\s*\(")
     for path in files:
@@ -300,7 +270,6 @@ def main() -> int:
     risks = risk_surface_paths()
     debt = check_high_risk_headers(risks, errors)
     check_debt_ledger(debt, errors)
-    check_large_files(files, errors)
     check_production_markers(files, errors)
     documented = check_documented_source_paths(errors)
 

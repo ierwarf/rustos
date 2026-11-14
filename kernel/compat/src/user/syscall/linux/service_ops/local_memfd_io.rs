@@ -98,7 +98,7 @@ pub(super) fn write(memfd: &mut multitask::MemfdHandle, user_ptr: u64, user_len:
             return completed_or_error(copied, LINUX_EFAULT);
         };
         if let Err(err) = usermem::copy_from_current_user_exact(src, &mut chunk[..chunk_len]) {
-            return completed_or_error(copied, address_space_error_to_linux_errno(err));
+            return completed_or_error(copied, user_pointer_error_to_linux_errno(err));
         }
         let written = match memfd.write_from(&chunk[..chunk_len]) {
             Ok(written) => written,
@@ -124,7 +124,7 @@ where
         return 0;
     }
     if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
-        return linux_errno(address_space_error_to_linux_errno(err));
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     let mut chunk = match bounded_buffer(user_len) {
         Ok(chunk) => chunk,
@@ -141,7 +141,7 @@ where
             return completed_or_error(copied, LINUX_EFAULT);
         };
         if let Err(err) = usermem::write_current_user_bytes(dest, &chunk[..read_len]) {
-            return completed_or_error(copied, address_space_error_to_linux_errno(err));
+            return completed_or_error(copied, user_pointer_error_to_linux_errno(err));
         }
         copied += read_len;
         multitask::cond_resched();

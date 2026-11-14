@@ -453,6 +453,17 @@ fn run_one_smoke_unarchived(
         if options.dvm_block_shmem {
             verify_dvm_block_ready(&layout)?;
         }
+        if let Some(seconds) = options.hold_seconds {
+            hold_after_readiness(
+                &mut rustos,
+                &mut dvm,
+                &layout,
+                &options,
+                Duration::from_secs(seconds),
+                &probe,
+                &control_relay,
+            )?;
+        }
         RecoveryHarness {
             qemu: &qemu,
             config,
@@ -590,6 +601,12 @@ fn run_one_smoke_unarchived(
         validate_local_fd_probe_log(&rustos_log)?;
         println!("xtask: local fd probe: every pipe/eventfd case passed in the guest");
     }
+    if options.fault_probe {
+        let rustos_log = read_log_lossy(&layout.debugcon_log)
+            .with_context(|| format!("read {}", layout.debugcon_log.display()))?;
+        validate_fault_probe_log(&rustos_log)?;
+        println!("xtask: fault probe: every process-group fault case passed in the guest");
+    }
     if options.app_dmabuf_probe {
         let rustos_log = read_log_lossy(&layout.debugcon_log)
             .with_context(|| format!("read {}", layout.debugcon_log.display()))?;
@@ -724,6 +741,8 @@ pub(crate) fn kvm_run_command(
         // Interactive SMP uses the same exact-tree bounded evidence profile as
         // the topology smoke run. It is observation, not a release/FPS claim.
         smp_iteration: rustos_vcpus > 1,
+        hold_seconds: None,
+        launch_desktop: None,
         host_cpu_pressure: None,
         smp_formal_profile_override: None,
         smp_ring3_qualification: false,
@@ -739,6 +758,7 @@ pub(crate) fn kvm_run_command(
         job_policy_probe: false,
         proc_stress: false,
         local_fd_probe: false,
+        fault_probe: false,
         library_map_probe: false,
         app_dmabuf_probe: false,
         mmap_cost_probe: false,

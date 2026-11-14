@@ -39,7 +39,7 @@ pub(super) fn syscall_linux_rustos_entropy_broker(out_ptr: u64, len: u64) -> u64
     nucleus_core::util::random::Random::new().fill_bytes(&mut bytes);
     match usermem::write_current_user_bytes(out_ptr, &bytes) {
         Ok(()) => len as u64,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
     }
 }
 // RING3-MIGRATION-REFERENCE END: bounded entropy substrate.

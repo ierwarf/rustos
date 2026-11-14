@@ -930,6 +930,10 @@ pub fn queue_linux_signal(process_id: u64, task_id: u64, signal: u64) -> Result<
     super::scheduler::linux_thread_state::signals::queue(process_id, task_id, signal)
 }
 
+pub fn queue_linux_process_signal(process_id: u64, signal: u64) -> Result<bool, ()> {
+    super::scheduler::linux_thread_state::signals::queue_process(process_id, signal)
+}
+
 pub fn queue_linux_process_sigchld(process_id: u64, events: u32) -> bool {
     super::scheduler::linux_thread_state::signals::process_sigchld(process_id, events)
 }
@@ -1106,12 +1110,20 @@ fn complete_retirement_side_effects() {
     // A retired user caller may never resume. It carries only observations,
     // while the independent kernel executor owns every external effect loan.
     let fence = interrupts::without_interrupts(executor::Fence::capture);
+    let mut yield_turn = true;
     while !interrupts::without_interrupts(|| fence.complete()) {
-        // A real yield: the executor is a task on this CPU, and a spin that only
-        // honours already-requested reschedules burns the whole quantum on a
-        // single-CPU system before the executor can run.
+        // Yield once so the executor can drain immediately on this CPU; if the
+        // executor itself is blocked waiting on another task, sleep instead of
+        // spinning the caller through repeated voluntary yields.
         super::kick_housekeeping();
-        super::yield_now();
+        if yield_turn {
+            yield_turn = false;
+            super::yield_now();
+        } else {
+            crate::arch::rtc::sleep_unless(1, || {
+                interrupts::without_interrupts(|| fence.complete())
+            });
+        }
     }
 }
 

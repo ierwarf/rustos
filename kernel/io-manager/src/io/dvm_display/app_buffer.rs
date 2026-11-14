@@ -46,6 +46,8 @@ const _: () = assert!(
 /// is not implemented, so a mismatched host layout is not detected beyond RAM
 /// aliasing and is unverified until a boot run.
 pub fn verify_aperture() -> bool {
+    // ORDERING: Acquire pairs with the Release store below; the verdict is a pure function of constants and the
+    // PCI topology, so the cache only skips repeating the probe.
     if APERTURE_VERIFIED.load(Ordering::Acquire) {
         return true;
     }
@@ -64,6 +66,7 @@ pub fn verify_aperture() -> bool {
         present
     });
     if present {
+        // ORDERING: Release publishes the successful verification; cached only on success, never refreshed from provider data.
         APERTURE_VERIFIED.store(true, Ordering::Release);
     }
     present
@@ -85,6 +88,9 @@ pub fn read_range(offset: u64, dst: &mut [u8]) -> bool {
         return false;
     };
     let src = crate::memory::higher_half_addr(phys) as *const u8;
+    // ORDERING: Acquire fence keeps the bulk reads below after the caller's earlier Acquire observation that the
+    // provider finished writing this range (the caller holds a mapping hold on the capability);
+    // the aperture itself is plain shared RAM, so no atomic covers these bytes.
     fence(Ordering::Acquire);
     // SAFETY: verified reserved WB aperture; `dst` is a distinct kernel buffer.
     unsafe { ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len()) };
@@ -107,6 +113,8 @@ pub fn scrub_range(offset: u64, len: u64) -> bool {
         unsafe { ptr::write_bytes(base.add(done as usize), 0, chunk) };
         done += chunk as u64;
     }
+    // ORDERING: SeqCst fence completes the zeroing stores before the caller's later custody transition that
+    // returns the range to the pool, so no reuse can observe pre-scrub bytes.
     fence(Ordering::SeqCst);
     true
 }
@@ -149,6 +157,8 @@ pub fn begin(
     if mailbox.pending.is_some() {
         return Err(AppBufferTransportError::Busy);
     }
+    // ORDERING: Acquire loads pair with the Release stores of INSTALLED, TRANSPORT_REVOKED and
+    // GUI_DVM_PEER_READY (install, revoke_transport, drain_dvm_control); a revoked or unready peer gets no request.
     if !INSTALLED.load(Ordering::Acquire)
         || TRANSPORT_REVOKED.load(Ordering::Acquire)
         || !GUI_DVM_PEER_READY.load(Ordering::Acquire)
@@ -192,6 +202,7 @@ pub fn begin(
     write_bytes(DVM_APP_BUFFER_REQUEST_RECORD_OFFSET, &bytes);
     write_u64(DVM_APP_BUFFER_REQUEST_KIND_OFFSET, kind);
     write_u64(DVM_APP_BUFFER_REQUEST_SEQUENCE_OFFSET, sequence);
+    // ORDERING: Acquire pairs with the Release store in signal_gui_dvm; the generation is re-validated there (non-zero, even).
     signal_gui_dvm(GUI_DVM_EXPECTED_INVITATION.load(Ordering::Acquire));
     // Proof markers for `kvm-smoke --app-dmabuf-probe`; the range is the
     // kernel's own record, never provider or client text.
@@ -217,12 +228,16 @@ pub fn take(sequence: u64) -> Result<Option<BufferCapability>, AppBufferTranspor
     if pending.sequence != sequence {
         return Err(AppBufferTransportError::Stale);
     }
+    // ORDERING: Acquire loads pair with the Release stores in revoke_transport/drain_dvm_control; a response from a
+    // revoked or unready peer is never accepted.
     if !GUI_DVM_PEER_READY.load(Ordering::Acquire) || TRANSPORT_REVOKED.load(Ordering::Acquire) {
         return Err(AppBufferTransportError::Unavailable);
     }
     if read_u64(DVM_APP_BUFFER_RESPONSE_SEQUENCE_OFFSET) != sequence {
         return Ok(None);
     }
+    // ORDERING: Acquire fence between the response sequence read and the status read; pairs with the provider
+    // publishing the status word before its sequence word, so status is read only for a completed response.
     fence(Ordering::Acquire);
     let status = read_u64(DVM_APP_BUFFER_RESPONSE_STATUS_OFFSET) as i64;
     let pending = mailbox.pending.take().expect("pending mailbox transaction");

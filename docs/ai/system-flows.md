@@ -75,8 +75,16 @@ contracts.
    final close publishes provider teardown and wait-set purge.
 7. **No Rust exception cleanup before ABI repair.** Every general exception
    crosses the explicit stack-alignment bridge before any nested ordinary Rust
-   call. A recoverable user fault preserves authority; fatal non-final and
-   final-thread paths have distinct cleanup.
+   call. A recoverable user fault preserves authority. A fatal user fault ends
+   the whole thread group: the faulting thread atomically seals the process
+   exiting plus its own `(task, vector)` in one process-table section (first
+   terminal event wins against other faults, `exit_group` and external
+   terminators), stops itself, and queues the durable group exit
+   (`Reason::Terminated`) without waiting (IF clear). Housekeeping's
+   `service_deferred_work` retires siblings; only the seal winner's cleanup row
+   (`fault_status_sealed`) records the signal wait status and service-handle
+   teardown, exactly once. Exec-in-progress or an exhausted lifecycle id leaves
+   the seal unavailable and falls back to last-thread-only status.
 8. **Failure is an observable terminal, not fabricated success.** Malformed
    envelopes, stale epochs, exhausted bounds, incomplete replay, and uncertain
    teardown return a direct error or withdraw authority.

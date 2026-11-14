@@ -121,6 +121,10 @@ impl TransportLease {
 unsafe impl Send for DvmNetworkState {}
 
 pub(crate) fn try_install() -> bool {
+    // ORDERING: Acquire pairs with the Release stores of INSTALLED (below and in
+    // the install path) that follow the `*state_guard = Some(..)` publication;
+    // seeing true means the mapped aperture state is complete. STATE is still
+    // taken under its lock for every real use, so this is a fast-path hint.
     if INSTALLED.load(Ordering::Acquire) {
         return true;
     }
@@ -130,6 +134,9 @@ pub(crate) fn try_install() -> bool {
     // second mapping or racing ring ownership.
     let mut state_guard = STATE.lock();
     if state_guard.is_some() {
+        // ORDERING: Release republishes INSTALLED for a racing installer that filled
+        // STATE first; the Some(state) written under this STATE lock happens-before
+        // any reader whose Acquire load of INSTALLED observes true.
         INSTALLED.store(true, Ordering::Release);
         return true;
     }
@@ -203,6 +210,9 @@ pub(crate) fn try_install() -> bool {
         true
     });
     let Some(state) = installed else {
+        // ORDERING: once-only log gate. No data is published or consumed through
+        // this flag; AcqRel is stronger than the diagnostic needs and orders
+        // nothing else. Failure to log twice is the only race it prevents.
         if !UNAVAILABLE_LOGGED.swap(true, Ordering::AcqRel) {
             crate::debug::println!(
                 "dvm-network: shared transport unavailable candidates={} last_rejection={}",
@@ -216,7 +226,12 @@ pub(crate) fn try_install() -> bool {
     let mtu = state.header.mtu;
     let region = state.header.region_bytes;
     *state_guard = Some(state);
+    // ORDERING: Release publishes the completed `*state_guard = Some(state)`
+    // (mapped base, validated header, seeded cursors) to the Acquire loads of
+    // INSTALLED in transport_status/grant_transport_lease/try_install.
     INSTALLED.store(true, Ordering::Release);
+    // ORDERING: re-arms the unavailable log after a successful install; pure
+    // diagnostic flag with no dependent data, Release is merely conservative.
     UNAVAILABLE_LOGGED.store(false, Ordering::Release);
     crate::debug::println!(
         "dvm-network: shared transport installed slots={} mtu={} region={}",
@@ -252,6 +267,9 @@ fn authorized_lease(
 }
 
 pub(crate) fn transport_status(authorize: impl FnOnce() -> bool) -> Result<PacketTransportStatus, PacketError> {
+    // ORDERING: Acquire pairs with the Release store of INSTALLED in
+    // try_install, so a true result implies STATE was populated; the
+    // STATE.lock() below remains the authority.
     if !INSTALLED.load(Ordering::Acquire) && !try_install() {
         return Ok(PacketTransportStatus::Unavailable);
     }
@@ -299,6 +317,10 @@ pub(crate) fn transmit(frame: &[u8], authorize: impl FnOnce() -> bool) -> Result
     // SAFETY: `slot` spans DVM_NET_SLOT_BYTES inside the admitted aperture and
     // `frame.len() <= mtu` was checked above.
     unsafe { copy_to_shared(slot.add(SLOT_LEN_BYTES), frame) };
+    // ORDERING: Release fence orders the volatile slot length and payload
+    // writes before the TX producer store below (itself a Release store); it
+    // pairs with the Linux relay's Acquire read of the TX producer, so the
+    // DVM never sees the new producer before the slot bytes.
     fence(Ordering::Release);
     state.tx_producer = state.tx_producer.wrapping_add(1);
     write_u32(state.base, TX_PRODUCER_OFFSET, state.tx_producer);
@@ -320,6 +342,10 @@ pub(crate) fn receive(out: &mut [u8], authorize: impl FnOnce() -> bool) -> Resul
     if available == 0 {
         return Err(PacketError::WouldBlock);
     }
+    // ORDERING: Acquire fence follows the Acquire producer load in read_u32
+    // and orders the slot length and payload reads after observing the
+    // producer; pairs with the DVM's Release store of the RX producer after
+    // it filled the slot.
     fence(Ordering::Acquire);
     let slot = rx_slot(state, state.rx_consumer).ok_or(PacketError::Invalid)?;
     let len = read_u32(slot, 0) as usize;
@@ -381,6 +407,10 @@ unsafe fn copy_from_shared(src: *const u8, dst: &mut [u8]) {
 }
 
 fn advance_rx_consumer(state: &mut DvmNetworkState) {
+    // ORDERING: Release fence orders every earlier volatile read of the RX slot
+    // before the consumer store below, so the DVM cannot reuse and overwrite
+    // the slot while the kernel is still copying it. Pairs with the DVM's
+    // Acquire read of the RX consumer.
     fence(Ordering::Release);
     state.rx_consumer = state.rx_consumer.wrapping_add(1);
     write_u32(state.base, RX_CONSUMER_OFFSET, state.rx_consumer);
@@ -394,6 +424,9 @@ pub(crate) fn grant_transport_lease(epoch: u32, authorize: impl FnOnce() -> bool
         return false;
     }
 
+    // ORDERING: Acquire pairs with the Release store of INSTALLED in
+    // try_install; it only selects whether to attempt an install, and STATE
+    // is re-examined under its lock before any ring access.
     let installed = INSTALLED.load(Ordering::Acquire) || try_install();
     let Ok(mut lease) = authorized_lease(&TRANSPORT_LEASE, authorize) else { return false; };
     if !installed {
@@ -474,6 +507,10 @@ fn slot_at(state: &DvmNetworkState, offset: u64, sequence: u32) -> Option<*mut u
         return None;
     }
     let start = usize::try_from(start).ok()?;
+    // SAFETY: pointer arithmetic only. `start + DVM_NET_SLOT_BYTES <=
+    // region_bytes` was checked above, and region_bytes equals the fixed
+    // DVM_NET_APERTURE_BYTES the BAR shape check proved was mapped at
+    // `base` for the kernel lifetime, so the result stays in the allocation.
     Some(unsafe { state.base.add(start) })
 }
 
@@ -501,11 +538,17 @@ fn read_u32(base: *const u8, offset: usize) -> u32 {
     // The runner owns an aligned page and all counter offsets are 4-byte
     // aligned. The aperture is ordinary shared RAM, not MMIO, so an atomic
     // load provides the producer/consumer acquire edge without torn bytes.
+    // SAFETY: the admitted aperture is page-aligned WB RAM mapped for the kernel
+    // lifetime; fixed 4-byte aligned in-aperture offsets make the AtomicU32 view valid.
+    // ORDERING: Acquire is the SPSC consumer edge, pairing with the DVM's Release store.
     unsafe { (&*base.add(offset).cast::<AtomicU32>()).load(Ordering::Acquire) }.to_le()
 }
 
 fn write_u32(base: *mut u8, offset: usize, value: u32) {
     // See `read_u32`: fixed aligned offsets are part of the transport ABI.
+    // SAFETY: same aligned, in-aperture AtomicU32 argument as `read_u32`.
+    // ORDERING: Release publishes all earlier slot writes (or slot reads for
+    // the consumer cursor) to the DVM's Acquire load of this word.
     unsafe {
         (&*base.add(offset).cast::<AtomicU32>()).store(u32::from_le(value), Ordering::Release)
     };

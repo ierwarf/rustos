@@ -70,7 +70,7 @@ broker transaction을 포함한다. native MM 80 / PS 977 / compat 184 / ipcbenc
 | 영구 상태세 | fork/exec/exit/signal/mmap/thread 이후 null+IPC 상시 회귀 | 기본 벤치에 추가 중; 전체 실제 실행 증거는 아직 없음 |
 | 검증 | 영역별 단위 테스트, dev-plan now, PR formal, SMP formal, 지정 8-vCPU GUI/input smoke | now95/native/SMP 실행; GUI 수정 후 재실행 및 PR/지정 smoke/전체 kernel tests 미완료 |
 | 안전/핀 | CR0.WP/user 범위/fault 재검증, uaccess selftest, 깨진 앵커·변이 갱신 및 --only | 기존 상태에 대한 새 검증 필요 |
-| 마무리 | dead code, docs/ai/**·formal/*.md·AGENTS 일치, large-file 목록 정리, ABAB 전후표 및 커밋 제안 | 미착수 |
+| 마무리 | dead code, docs/ai/**·formal/*.md·AGENTS 일치, ABAB 전후표 및 커밋 제안 | 미착수 |
 
 ## 변경 전 대조군
 

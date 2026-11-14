@@ -250,6 +250,9 @@ pub fn read_retained_user_struct<T: Copy + Default>(
     user_ptr: u64,
 ) -> Result<T, paging::AddressSpaceError> {
     let mut value = T::default();
+    // SAFETY: `value` is live and uniquely borrowed for exactly `size_of::<T>()`
+    // bytes; the exact-length copy below overwrites only that `T` allocation
+    // and fails without returning `value` if the user range is short.
     let bytes = unsafe {
         core::slice::from_raw_parts_mut(
             core::ptr::addr_of_mut!(value).cast::<u8>(),

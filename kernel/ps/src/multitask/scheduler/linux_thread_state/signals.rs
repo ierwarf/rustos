@@ -139,6 +139,27 @@ fn queue_in(scope: &DispatchPreemption<'_>, pid: u64, id: u64, signal: u64,
     let Some(target) = Recipient::resolve(pid, id) else { return Ok(false); };
     target.queue(scope, signal, 0, eligible_cpus)
 }
+/// Process-directed `kill(pid)`: the leader when it is live, otherwise the
+/// lowest-slot live member of the same process. A retired leader must not make
+/// the surviving thread group unreachable (`tgkill(pid, pid)` would ESRCH).
+pub(in crate::multitask) fn queue_process(pid: u64, signal: u64) -> Result<bool, ()> {
+    let mut scope = DispatchPreemption::enter(); scope.mask_irqs();
+    check_scope(&scope);
+    let mut candidates = [(usize::MAX, 0_u64); MAX_TASK];
+    let mut len = 0;
+    for slot in 0..MAX_TASK {
+        if let Some(start) = stack_resources::task_start::read(slot) {
+            candidates[len] = (slot, start.id); len += 1;
+        }
+    }
+    candidates[..len].sort_unstable_by_key(|&(slot, id)| (id != pid, slot));
+    for &(slot, id) in &candidates[..len] {
+        if let Some(target) = Recipient::capture(slot, id, pid) {
+            return target.queue(&scope, signal, 0, &runqueue_policy::online_affinity_mask);
+        }
+    }
+    Ok(false)
+}
 pub(in crate::multitask) fn process_sigchld(pid: u64, events: u32) -> bool {
     let mut scope = DispatchPreemption::enter(); scope.mask_irqs();
     process_sigchld_in(&scope, pid, events, &runqueue_policy::online_affinity_mask)

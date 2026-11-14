@@ -272,6 +272,7 @@ pub(super) fn scheduler_current_task_scratch() -> usize {
 /// The global owner CPU is diagnostic publication only; a foreign CPU can no
 /// longer derive scratch permission from whichever directory writer holds it.
 #[inline]
+#[cfg(any(rustos_boot_image, test))]
 pub(super) fn scheduler_turn_logical_index() -> usize {
     dispatch_turn::current_cpu()
 }

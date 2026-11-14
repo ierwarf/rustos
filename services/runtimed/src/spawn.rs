@@ -383,8 +383,19 @@ fn finish_tracked_launch(state: &mut BrokerState, pid: Option<i32>, result: Resu
         };
         state.runtime_transactions.finish(key, outcome);
     }
+    super::kvm_launch_desktop::report_completion(state, in_flight.desktop_file_id.as_str(), result);
     match result {
         Ok(()) => {
+            debug_line(
+                format!(
+                    "runtimed: launched desktop_id={} exec={} pid={:?} rpc={}",
+                    in_flight.desktop_file_id,
+                    in_flight.exec,
+                    pid,
+                    in_flight.rpc_transaction.is_some()
+                )
+                .as_str(),
+            );
             observability_client::info!(
                 "runtimed",
                 service,
@@ -421,6 +432,13 @@ fn finish_tracked_launch(state: &mut BrokerState, pid: Option<i32>, result: Resu
             }
             release_failed_session(state, in_flight.session_handle);
             if in_flight.rpc_transaction.is_some() {
+                debug_line(
+                    format!(
+                        "runtimed: RPC launch failed desktop_id={} exec={} errno={errno}",
+                        in_flight.desktop_file_id, in_flight.exec
+                    )
+                    .as_str(),
+                );
                 observability_client::error!(
                     "runtimed",
                     service,
@@ -879,6 +897,28 @@ fn retry_deferred_cleanup() {
 /// loop used to observe them at.
 const REAP_INTERVAL: Duration = Duration::from_millis(20);
 
+/// Snapshot of PIDs currently tracked in `BrokerState::running` for the reaper
+/// worker. Processes spawned via `loaderd` are independent roots (`parent == None`)
+/// so the kernel can reclaim their slots immediately on exit without blocking on
+/// `runtimed`; the reaper therefore checks tracked PIDs with a signal-0 liveness
+/// probe in addition to `wait4`.
+static TRACKED_RUNNING_PIDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+fn sync_tracked_running_pids(state: &BrokerState) {
+    let mut tracked = TRACKED_RUNNING_PIDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    tracked.clear();
+    tracked.extend(state.running.keys().copied());
+}
+
+fn snapshot_tracked_running_pids() -> Vec<i32> {
+    TRACKED_RUNNING_PIDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 /// Reap every child that has already exited and report `(pid, status)` for
 /// each. Runs on the reaper thread (or inline when none could be created); it
 /// is the only place the procd ownership round trip of `wait4` happens.
@@ -886,6 +926,9 @@ pub(super) fn collect_exited_children() -> Vec<(i32, i32)> {
     let mut exited = Vec::new();
     loop {
         let mut status = 0_i32;
+        // SAFETY: raw `wait4(-1, WNOHANG)`; `status` is a live local i32 the kernel may
+        // write, the rusage pointer is null (not requested), and WNOHANG keeps the
+        // call nonblocking. Only children of this process can be reaped.
         let pid = unsafe {
             libc::syscall(
                 libc::SYS_wait4 as libc::c_long,
@@ -899,7 +942,96 @@ pub(super) fn collect_exited_children() -> Vec<(i32, i32)> {
             exited.push((pid, status));
             continue;
         }
-        return exited;
+        break;
+    }
+    for pid in snapshot_tracked_running_pids() {
+        if pid <= 0 || exited.iter().any(|(existing, _)| *existing == pid) {
+            continue;
+        }
+        // SAFETY: `tgkill(pid, pid, 0)` sends no signal (existence probe) and takes only
+        // integers; `pid` is a tracked running child, and a stale value yields ESRCH.
+        let rc = unsafe { libc::syscall(libc::SYS_tgkill as libc::c_long, pid, pid, 0) as i32 };
+        if rc < 0 && last_errno() == libc::ESRCH {
+            // The thread is gone, but a faulting child's wait status is
+            // published by deferred kernel cleanup AFTER its task retires, so
+            // the sweep above may have missed it. Never invent status 0
+            // ("exited 0") for a child that still has a status coming.
+            let mut status = 0_i32;
+            // SAFETY: raw `wait4(pid, WNOHANG)`; `status` is a live local i32, the rusage
+            // pointer is null, and the call is nonblocking and limited to our own child.
+            let waited = unsafe {
+                libc::syscall(
+                    libc::SYS_wait4 as libc::c_long,
+                    pid,
+                    &mut status as *mut i32,
+                    libc::WNOHANG,
+                    std::ptr::null_mut::<libc::rusage>(),
+                ) as i32
+            };
+            let errno = if waited < 0 { last_errno() } else { 0 };
+            if let Some(entry) = vanished_pid_report(pid, waited, status, errno) {
+                exited.push(entry);
+            }
+        }
+    }
+    exited
+}
+
+/// Decide what to report for a tracked pid whose thread no longer exists after
+/// a targeted `wait4(pid, WNOHANG)`. `waited > 0` is the real status; `0` means
+/// the child's terminal status is not published yet (retry next pass, do not
+/// report); only `ECHILD` (not our child) falls back to an unknown status 0.
+/// `wait4` cannot report a process runtimed is not the parent of (loader-spawned
+/// apps are not wait children): the status exists but is not obtainable here.
+const WAIT_STATUS_UNAVAILABLE: i32 = i32::MIN;
+
+fn vanished_pid_report(pid: i32, waited: i32, status: i32, errno: i32) -> Option<(i32, i32)> {
+    if waited > 0 {
+        Some((waited, status))
+    } else if waited == 0 {
+        None
+    } else if errno == libc::ECHILD {
+        Some((pid, WAIT_STATUS_UNAVAILABLE))
+    } else {
+        None
+    }
+}
+
+/// Human-readable decoding of a Linux wait status for the reap log.
+fn wait_status_summary(status: i32) -> String {
+    if status == WAIT_STATUS_UNAVAILABLE {
+        return String::from("status unavailable (not a wait4 child)");
+    }
+    let signal = status & 0x7f;
+    if signal == 0 {
+        format!("exit({})", (status >> 8) & 0xff)
+    } else if signal == 0x7f {
+        format!("stopped({})", (status >> 8) & 0xff)
+    } else {
+        let core = if status & 0x80 != 0 { " core" } else { "" };
+        format!("signal({signal}{core})")
+    }
+}
+
+#[cfg(test)]
+mod wait_status_tests {
+    use super::{vanished_pid_report, wait_status_summary};
+
+    #[test]
+    fn signalled_status_is_not_reported_as_exit_zero() {
+        assert_eq!(wait_status_summary(0x0b), "signal(11)");
+        assert_eq!(wait_status_summary(0x8b), "signal(11 core)");
+        assert_eq!(wait_status_summary(0x2a00), "exit(42)");
+        assert_eq!(wait_status_summary(0), "exit(0)");
+        assert_eq!(wait_status_summary(super::WAIT_STATUS_UNAVAILABLE), "status unavailable (not a wait4 child)");
+    }
+
+    #[test]
+    fn vanished_pid_never_invents_a_clean_exit_while_status_is_pending() {
+        assert_eq!(vanished_pid_report(111, 111, 0x0b, 0), Some((111, 0x0b)));
+        assert_eq!(vanished_pid_report(111, 0, 0, 0), None);
+        assert_eq!(vanished_pid_report(111, -1, 0, libc::ECHILD), Some((111, super::WAIT_STATUS_UNAVAILABLE)));
+        assert_eq!(vanished_pid_report(111, -1, 0, libc::EINTR), None);
     }
 }
 
@@ -919,6 +1051,7 @@ pub(super) fn reap_children(state: &mut BrokerState) -> bool {
     {
         return false;
     }
+    sync_tracked_running_pids(state);
     // The wait itself never runs on this loop: collect what the reaper has
     // already found, and ask it again no more often than `REAP_INTERVAL`.
     let exited = match state.child_reaper.as_ref() {
@@ -945,9 +1078,16 @@ pub(super) fn reap_children(state: &mut BrokerState) -> bool {
         None => collect_exited_children(),
     };
     let mut reaped_any = false;
-    for (pid, _status) in exited {
+    for (pid, status) in exited {
         reaped_any = true;
         if let Some(process) = state.running.remove(&pid) {
+            debug_line(
+                format!(
+                    "runtimed: reaped child pid={pid} status={status:#x} ({}) desktop_id={} exec={}",
+                    wait_status_summary(status), process.desktop_file_id, process.exec
+                )
+                .as_str(),
+            );
             if process.session_handle != 0 {
                 release_failed_session(state, Some(process.session_handle));
             }
@@ -1186,6 +1326,9 @@ fn activate_spawned_process_with_deadline(pid: i32, deadline_ns: Option<u64>) ->
     let endpoint = lookup_loader_endpoint()?;
     let timeout_ms = bounded_timeout_ms(deadline_ns)?;
     let mut response = LoaderSpawnResponse::default();
+    // SAFETY: `request` is readable for its exact size and `response` is writable for
+    // its exact size, both live locals across the call; the bounded call keeps no
+    // pointer after it returns and ends within `timeout_ms`.
     let call = unsafe {
         rustos_svc_runtime::syscall::syscall6(
             SYS_RUSTOS_IPC_CALL_BOUNDED,
@@ -1227,6 +1370,8 @@ fn wait_for_service_endpoint(
         timeout_ms: bounded_timeout_ms(deadline_ns)?,
         ..RustosIpcWaitServiceEndpointArgs::default()
     };
+    // SAFETY: `args` is a fully initialized fixed ABI record that stays live for the
+    // synchronous call; the kernel copies it by value and bounds the wait itself.
     let result = unsafe {
         libc::syscall(
             SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT as libc::c_long,
@@ -1283,6 +1428,7 @@ fn admitted_task_weight_micros(exec_path: &str, weight_micros: u64) -> u64 {
 }
 
 pub(super) fn lookup_service_endpoint(service_id: u64) -> i64 {
+    // SAFETY: raw lookup syscall taking one integer service id and no pointers.
     libc_syscall_status(unsafe {
         libc::syscall(
             SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT as libc::c_long,
@@ -1317,6 +1463,8 @@ pub(super) fn debug_line(message: &str) {
 
 pub(super) fn terminate_pid(pid: i32) -> Result<(), i32> {
     let rc =
+        // SAFETY: `tgkill(pid, pid, SIGKILL)` takes only integers; a stale or foreign
+        // `pid` is refused by the kernel with an errno, which is returned below.
         unsafe { libc::syscall(libc::SYS_tgkill as libc::c_long, pid, pid, libc::SIGKILL) as i32 };
     if rc < 0 {
         return Err(last_errno());
@@ -1370,6 +1518,8 @@ pub(super) fn close_console_session(_console_fd: RawFd, session_handle: u64) -> 
 
 fn open_device(path: &str, flags: usize) -> Result<OwnedFd, i32> {
     let path = CString::new(path).map_err(|_| libc::EINVAL)?;
+    // SAFETY: `path` is a live NUL-terminated CString for the duration of the
+    // `openat` call and the remaining arguments are integers.
     let raw_fd = unsafe {
         libc::syscall(
             SYS_OPENAT as libc::c_long,
@@ -1382,6 +1532,8 @@ fn open_device(path: &str, flags: usize) -> Result<OwnedFd, i32> {
     if raw_fd < 0 {
         return Err(last_errno());
     }
+    // SAFETY: `raw_fd` is the descriptor `openat` just returned (checked non-negative
+    // above) and has no other owner, so `OwnedFd` takes unique ownership.
     Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
 }
 

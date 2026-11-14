@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn mid_stream_transient_read_error_retires_and_refuses() {
-        let mut fake = host_with(&[("/lib/a.so", pattern(9 * PAGE, 4))]);
+        let fake = host_with(&[("/lib/a.so", pattern(9 * PAGE, 4))]);
         struct TransientMidStream(Fake);
         impl WarmHost for TransientMidStream {
             fn read(&mut self, path: &str, offset: u64, out: &mut [u8]) -> Result<ReadChunk, i32> {

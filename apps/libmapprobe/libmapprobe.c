@@ -279,18 +279,6 @@ static int read_full(int fd, void *buf, size_t n) {
     return 0;
 }
 
-static int write_full(int fd, const void *buf, size_t n) {
-    const uint8_t *p = buf;
-    while (n) {
-        ssize_t put = write(fd, p, n);
-        if (put <= 0) {
-            return -1;
-        }
-        p += put; n -= (size_t)put;
-    }
-    return 0;
-}
-
 #define CHILD_SLEEP_MS 3000L
 #define PARENT_LOOK_MS 1500L
 

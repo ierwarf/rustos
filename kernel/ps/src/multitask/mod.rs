@@ -4,8 +4,8 @@ mod context;
 pub use self::child_wait::{register_child_waiter, unregister_child_waiter, wake_child_waiters};
 mod housekeeping_kick;
 pub use self::housekeeping_kick::{
-    housekeeping_kicked, kick_housekeeping, register_housekeeping_task, take_housekeeping_kick,
-    task_slot_available,
+    housekeeping_kicked, kick_housekeeping, prioritize_housekeeping, register_housekeeping_task,
+    take_housekeeping_kick, task_slot_available,
 };
 mod cpu_local;
 mod current;
@@ -75,7 +75,7 @@ pub use self::current::{
     mark_user_process_exiting, mark_user_process_exiting_once, next_retired_task_cleanup,
     note_process_exit_status, pager_vma_regions_for_process, parent_process_id_of,
     publish_current_pager_vma, publish_inherited_pager_vma_for_process,
-    publish_pager_vma_for_process, queue_linux_process_sigchld, queue_linux_signal,
+    publish_pager_vma_for_process, queue_linux_process_sigchld, queue_linux_process_signal, queue_linux_signal,
     release_ipc_priority, release_pager_fault_priority, reserve_ipc_call_donation,
     reserve_ipc_priority, retain_current_user_process_state, retire_current_user_task_due_to_fault,
     revoke_current_pager_vma, revoke_pager_vma_for_process, service_deferred_work,

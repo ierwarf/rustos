@@ -1,14 +1,10 @@
 #![no_std]
 
 extern crate alloc;
-#[cfg(test)]
-extern crate self as syscalld;
-#[cfg(test)]
-mod linux_policy;
-
 pub mod affinity_policy;
 pub mod errno;
 pub mod fast_offload;
+pub mod linux_policy;
 pub mod mmap_policy;
 pub mod vma_policy;
 

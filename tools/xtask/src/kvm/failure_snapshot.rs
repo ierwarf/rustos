@@ -18,7 +18,7 @@ const READ_BUDGET: Duration = Duration::from_secs(4);
 /// would run out on a large guest before the tables behind the registers.
 const READ_BUDGET_PER_CPU: Duration = Duration::from_millis(250);
 const MAX_TRANSCRIPT_BYTES: usize = 512 * 1024;
-const MAX_SYMBOL_BYTES: u64 = 16 * 1024;
+const MAX_SYMBOL_BYTES: u64 = 32 * 1024;
 // Diagnostic adapters for the current 64-bit, cache-aligned IPC slabs. Exact
 // linked symbol sizes must agree before any handle-derived row is read.
 const IPC_SLABS: &[(&str, u64, u64)] = &[
@@ -155,17 +155,17 @@ impl Monitor {
         Ok(words)
     }
 
-    /// The 128 owner words. Each lives alone on a cache line (`RunOwnerWord` is
-    /// 64-byte aligned), so the symbol dump holds eight words per slot with the
-    /// owner first; a dump of exactly 128 words is already dense.
+    /// The task-slot owner words. Each lives alone on a cache line (`RunOwnerWord`
+    /// is 64-byte aligned), so the symbol dump holds eight words per slot with the
+    /// owner first; a dump of one word per slot is already dense.
     fn owner_words(&self) -> Result<Vec<u64>> {
-        const SLOTS: usize = 128;
+        const SLOTS: usize = 256;
         const WORDS_PER_LINE: usize = 8;
         let words =
             self.words("kernel_ps::multitask::scheduler::runqueue::ownership::OWNER_WORDS")?;
         match words.len() {
-            SLOTS => Ok(words),
-            len if len == SLOTS * WORDS_PER_LINE => {
+            SLOTS | 128 => Ok(words),
+            len if len == SLOTS * WORDS_PER_LINE || len == 128 * WORDS_PER_LINE => {
                 Ok(words.into_iter().step_by(WORDS_PER_LINE).collect())
             }
             _ => Ok(words),
@@ -177,8 +177,10 @@ impl Monitor {
         let rsps = self.words("kernel_ps::multitask::scheduler::frame_publication::SAVED_RSP")?;
         let bases = self.words("kernel_ps::multitask::scheduler::runqueue::KERNEL_STACK_BASE")?;
         let tops = self.words("kernel_ps::multitask::scheduler::runqueue::KERNEL_STACK_TOP")?;
+        let slots = owners.len();
         ensure!(
-            [owners.len(), rsps.len(), bases.len(), tops.len()] == [128; 4],
+            (slots == 256 || slots == 128)
+                && [owners.len(), rsps.len(), bases.len(), tops.len()] == [slots; 4],
             "incomplete kernel-stack census"
         );
         // Only original published usable stack bounds, never a guessed user or
@@ -253,7 +255,7 @@ impl Monitor {
         let owners = self.owner_words()?;
         let reasons = self.words("kernel_ps::multitask::scheduler::runqueue::wait::REASON_ID")?;
         ensure!(
-            owners.len() == 128 && reasons.len() == owners.len(),
+            (owners.len() == 256 || owners.len() == 128) && reasons.len() == owners.len(),
             "incomplete wait census"
         );
         let mut seen = BTreeSet::new();

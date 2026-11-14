@@ -91,10 +91,16 @@ static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
 const _: () = assert!(LEASE_SLOTS == 256 && BUSY_SENTINEL == u64::MAX);
 
 fn claim_mask_set(index: usize) {
+    // ORDERING: SeqCst so the claim bit is in the single total order with the SeqCst
+    // pid store and the holders_of_pid scan (store-then-scan, Dekker style): of two
+    // same-pid openers at least one observes the other's claim.
     CLAIMED_MASK[index >> 6].fetch_or(1_u64 << (index & 63), Ordering::SeqCst);
 }
 
 fn claim_mask_clear(index: usize) {
+    // ORDERING: Release only needs to order this slot's earlier accesses before the
+    // bit drops; a stale-set bit is harmless because holders_of_pid also requires a
+    // non-FREE ticket, and the slot is freed only after this clear.
     CLAIMED_MASK[index >> 6].fetch_and(!(1_u64 << (index & 63)), Ordering::Release);
 }
 
@@ -150,6 +156,9 @@ impl RequestLease {
         for (index, slot) in SLOTS.iter().enumerate() {
             if slot
                 .ticket
+                // ORDERING: Acquire on the winning CAS pairs with the Release FREE store of the
+                // previous owner (drain_and_free), so its slot writes cannot overlap ours; a
+                // failed CAS reads nothing, hence Relaxed.
                 .compare_exchange(FREE, BUSY_SENTINEL, Ordering::Acquire, Ordering::Relaxed)
                 .is_err()
             {
@@ -170,6 +179,8 @@ impl RequestLease {
             slot.pid.store(target.pid, Ordering::SeqCst);
             if holders_of_pid(target.pid, index) >= MAX_LEASES_PER_PID {
                 claim_mask_clear(index);
+                // ORDERING: Release returns the slot to FREE after the claim bit was cleared;
+                // pairs with the Acquire CAS in try_open.
                 slot.ticket.store(FREE, Ordering::Release);
                 return Err(OpenRefusal::PerPidLimit);
             }
@@ -195,13 +206,19 @@ impl RequestLease {
 fn holders_of_pid(pid: u64, skip: usize) -> usize {
     let mut count = 0_usize;
     for (word_idx, word_atom) in CLAIMED_MASK.iter().enumerate() {
+        // ORDERING: SeqCst load of the claim mask completes the store-then-scan pattern
+        // documented in try_open: the opener's SeqCst bit/pid stores precede this scan.
         let mut bits = word_atom.load(Ordering::SeqCst);
         while bits != 0 {
             let bit = bits.trailing_zeros() as usize;
             bits &= bits - 1;
             let index = (word_idx << 6) | bit;
             if index != skip
+                // ORDERING: SeqCst pid load is the second half of the store-then-scan in
+                // try_open; it must be ordered after the claim-bit load above.
                 && SLOTS[index].pid.load(Ordering::SeqCst) == pid
+                // ORDERING: SeqCst so a slot whose claimant already announced its pid is seen
+                // as claimed in the same total order (see try_open).
                 && SLOTS[index].ticket.load(Ordering::SeqCst) != FREE
             {
                 count += 1;
@@ -211,6 +228,7 @@ fn holders_of_pid(pid: u64, skip: usize) -> usize {
     count
 }
 
+#[cfg(test)]
 impl RequestLease {
     /// Step one of close: no apply may begin after this returns. False when
     /// the lease was already reclaimed (its incarnation died first).
@@ -220,6 +238,8 @@ impl RequestLease {
 
     /// Appliers that validated before retirement and have not finished.
     fn active_appliers(&self) -> u32 {
+        // ORDERING: test-only observation of the applier count; SeqCst matches the
+        // protocol's own accesses to this counter.
         SLOTS[self.index].appliers.load(Ordering::SeqCst)
     }
 }
@@ -228,6 +248,10 @@ impl RequestLease {
 /// when the slot no longer holds that ticket (reclaimed or recycled).
 fn retire(slot: &Slot, ticket: u64) -> bool {
     slot.ticket
+        // ORDERING: SeqCst on both outcomes: the retirement store must be ordered
+        // before drain_and_free's SeqCst load of appliers, pairing with begin_apply's
+        // fetch_add then ticket re-read, so either the applier sees the sentinel or
+        // close sees the applier.
         .compare_exchange(ticket, BUSY_SENTINEL, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
 }
@@ -240,6 +264,8 @@ fn retire(slot: &Slot, ticket: u64) -> bool {
 /// applier may need either to finish. `yield_cpu` lets the applier's CPU make
 /// progress in normal syscall context instead of burning this one.
 fn drain_and_free(index: usize, slot: &Slot, yield_cpu: bool) {
+    // ORDERING: SeqCst load of appliers after retire's SeqCst CAS: it cannot miss an
+    // applier whose fetch_add preceded that applier's ticket re-read (Dekker).
     while slot.appliers.load(Ordering::SeqCst) != 0 {
         if yield_cpu {
             #[cfg(not(test))]
@@ -251,6 +277,8 @@ fn drain_and_free(index: usize, slot: &Slot, yield_cpu: bool) {
         }
     }
     claim_mask_clear(index);
+    // ORDERING: Release publishes the drained, unclaimed slot as FREE; pairs with
+    // the Acquire CAS in try_open, and orders the preceding claim_mask_clear.
     slot.ticket.store(FREE, Ordering::Release);
 }
 
@@ -277,12 +305,17 @@ impl Drop for RequestLease {
 /// Frees leases whose owner can no longer run (its incarnation is gone).
 fn reclaim_dead(is_live: &impl Fn(MmTarget) -> bool, pid_filter: Option<u64>) {
     for (word_idx, word_atom) in CLAIMED_MASK.iter().enumerate() {
+        // ORDERING: Acquire pairs with the SeqCst/Release claim-bit updates, so the slot's
+        // ticket we examine below is at least as new as the bit we observed.
         let mut bits = word_atom.load(Ordering::Acquire);
         while bits != 0 {
             let bit = bits.trailing_zeros() as usize;
             bits &= bits - 1;
             let index = (word_idx << 6) | bit;
             let slot = &SLOTS[index];
+            // ORDERING: Acquire pairs with the Release ticket store in try_open, making the
+            // slot's pid/generations (Relaxed reads below) visible. A slot recycled
+            // meanwhile has another ticket, so retire_and_drain's exact-ticket CAS fails.
             let ticket = slot.ticket.load(Ordering::Acquire);
             if ticket == FREE || ticket == BUSY_SENTINEL {
                 continue;
@@ -324,6 +357,8 @@ impl ApplyGuard {
 
 impl Drop for ApplyGuard {
     fn drop(&mut self) {
+        // ORDERING: SeqCst decrement pairs with drain_and_free's SeqCst load; it also
+        // releases the effect's memory writes to the closer that frees the slot.
         SLOTS[self.index].appliers.fetch_sub(1, Ordering::SeqCst);
     }
 }
@@ -344,13 +379,20 @@ pub(super) fn begin_apply(ticket: u64, target_pid: u64) -> Result<ApplyGuard, Le
     }
     let index = (ticket as usize) & (LEASE_SLOTS - 1);
     let slot = &SLOTS[index];
+    // ORDERING: Acquire pairs with try_open's Release ticket store, so pid and
+    // generations are visible; a retired or recycled ticket fails the compare.
     if slot.ticket.load(Ordering::Acquire) != ticket {
         return Err(LeaseRefusal::NoRequest);
     }
+    // ORDERING: SeqCst announcement of the applier before the ticket re-read below;
+    // pairs with retire's SeqCst CAS and drain_and_free's SeqCst load.
     slot.appliers.fetch_add(1, Ordering::SeqCst);
     // Re-read after announcing: close stores the sentinel before waiting on
     // `appliers`, so either this read sees the retirement or close sees us.
+    // ORDERING: SeqCst re-read: either it sees retire's sentinel or the closer's
+    // appliers load sees our increment (no applier escapes close).
     if slot.ticket.load(Ordering::SeqCst) != ticket {
+        // ORDERING: SeqCst undo of the announce on refusal; keeps the counter balanced.
         slot.appliers.fetch_sub(1, Ordering::SeqCst);
         return Err(LeaseRefusal::NoRequest);
     }
@@ -438,6 +480,8 @@ mod tests {
         drop(apply);
         assert_eq!(lease.active_appliers(), 0);
         // Finish the close by hand: `retire` already ran, so Drop must not.
+        // ORDERING: test-only manual completion of close (retire already ran); Release
+        // matches drain_and_free.
         SLOTS[lease.index].ticket.store(FREE, Ordering::Release);
         core::mem::forget(lease);
     }

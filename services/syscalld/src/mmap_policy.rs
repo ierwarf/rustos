@@ -69,10 +69,21 @@ pub fn plan_mmap(
     prot_none: bool,
     fd_kind: Option<MmapFdKind>,
 ) -> Result<MmapPlan, MmapPlanError> {
+    plan_mmap_with_write(anonymous, sharing, prot_none, true, fd_kind)
+}
+
+pub fn plan_mmap_with_write(
+    anonymous: bool,
+    sharing: MmapSharing,
+    prot_none: bool,
+    writable: bool,
+    fd_kind: Option<MmapFdKind>,
+) -> Result<MmapPlan, MmapPlanError> {
     match (anonymous, sharing, fd_kind) {
         (true, MmapSharing::Private, None) if prot_none => Ok(MmapPlan::Reserved),
         (true, MmapSharing::Private, None) => Ok(MmapPlan::Anonymous),
         (false, MmapSharing::Private, Some(MmapFdKind::File)) => Ok(MmapPlan::FilePrivate),
+        (false, MmapSharing::Shared, Some(MmapFdKind::File)) if !writable => Ok(MmapPlan::FilePrivate),
         (false, MmapSharing::Private, Some(_)) => Err(MmapPlanError::InvalidBacking),
         (false, MmapSharing::Shared, Some(MmapFdKind::Memfd)) => Ok(MmapPlan::MemfdShared),
         (false, MmapSharing::Shared, Some(MmapFdKind::DisplaySurface | MmapFdKind::Device | MmapFdKind::DeviceBuffer)) => {
@@ -147,6 +158,14 @@ mod tests {
         assert_eq!(
             plan_mmap(false, MmapSharing::Private, false, Some(MmapFdKind::File)),
             Ok(MmapPlan::FilePrivate)
+        );
+        assert_eq!(
+            plan_mmap_with_write(false, MmapSharing::Shared, false, false, Some(MmapFdKind::File)),
+            Ok(MmapPlan::FilePrivate)
+        );
+        assert_eq!(
+            plan_mmap_with_write(false, MmapSharing::Shared, false, true, Some(MmapFdKind::File)),
+            Err(MmapPlanError::AccessDenied)
         );
         assert_eq!(
             plan_mmap(false, MmapSharing::Shared, false, Some(MmapFdKind::Memfd)),

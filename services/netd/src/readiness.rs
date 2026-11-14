@@ -132,6 +132,9 @@ impl NetState {
         }
         // Publication order stays ascending by token across both tables.
         changed.sort_unstable();
+        // ORDERING: the counter is the only datum: the RMW hands out a unique, strictly
+        // increasing generation, and AcqRel/Acquire keeps it ordered with the
+        // readiness state published before the broker call that exposes it.
         let generation = READINESS_GENERATION
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
                 old.checked_add(1)

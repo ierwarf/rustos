@@ -63,7 +63,7 @@ pub(super) fn syscall_linux_sigaltstack(stack_ptr: u64, old_stack_ptr: u64) -> u
         }
         let mut buf = [0_u8; SIGALTSTACK_WIRE_SIZE];
         if let Err(err) = usermem::copy_from_current_user_exact(stack_ptr, &mut buf) {
-            return linux_errno(address_space_error_to_linux_errno(err));
+            return linux_errno(user_pointer_error_to_linux_errno(err));
         }
         let ss_sp = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let ss_flags = i32::from_le_bytes(buf[8..12].try_into().unwrap());
@@ -77,7 +77,7 @@ pub(super) fn syscall_linux_sigaltstack(stack_ptr: u64, old_stack_ptr: u64) -> u
         if let Err(err) =
             usermem::validate_current_user_write_buffer(old_stack_ptr, SIGALTSTACK_WIRE_SIZE)
         {
-            return linux_errno(address_space_error_to_linux_errno(err));
+            return linux_errno(user_pointer_error_to_linux_errno(err));
         }
         request.flags |= 0x1;
     }
@@ -139,7 +139,7 @@ pub(super) fn syscall_linux_sigaltstack(stack_ptr: u64, old_stack_ptr: u64) -> u
         out[8..12].copy_from_slice(&old_flags.to_le_bytes());
         out[16..24].copy_from_slice(&old_stack.size.to_le_bytes());
         if let Err(err) = usermem::write_current_user_bytes(old_stack_ptr, &out) {
-            return linux_errno(address_space_error_to_linux_errno(err));
+            return linux_errno(user_pointer_error_to_linux_errno(err));
         }
     } else if response.payload_len != 0 {
         return linux_errno(LINUX_EINVAL);

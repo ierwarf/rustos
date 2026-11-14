@@ -37,6 +37,23 @@ pub fn kick_housekeeping() {
     }
 }
 
+/// Ensures the registered housekeeping task is awake, brought to the active
+/// runqueue latency floor, and hinted for dispatch even if a prior kick flag
+/// was already set while housekeeping lagged behind CPU-bound tasks.
+pub fn prioritize_housekeeping() {
+    KICKED.store(true, Ordering::Release);
+    prioritize_registered_housekeeping();
+}
+
+fn prioritize_registered_housekeeping() {
+    // ORDERING: Acquire pairs with the registration store.
+    let id = HOUSEKEEPING_TASK.load(Ordering::Acquire);
+    if id != 0 {
+        let _ = super::wake_task(id);
+        let _ = super::scheduler::ordering_publication::housekeeping(id);
+    }
+}
+
 /// Whether the scheduler has a task slot a new process could be given right
 /// now. An exited task's slot is returned by the housekeeping pass, not by the
 /// parent's `wait`, so a loop of fork and wait can briefly find none; a caller

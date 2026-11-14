@@ -584,7 +584,10 @@ fn wait_for_parallel_boot(
         let dvm_log = read_log_lossy(&layout.dvm_serial_log)
             .with_context(|| format!("read {}", layout.dvm_serial_log.display()))?;
         if let Some(failure) = startup_failure_detail(&rustos_log) {
-            bail!("RustOS startup failed before readiness: {failure}");
+            bail!(
+                "RustOS startup failed before readiness: {}",
+                with_display_topology_hint(failure, options.gui_dvm_surfaces)
+            );
         }
         if options.expect_block_flush_fault && rustos_log.contains(RUSTOS_DVM_BLOCK_E2E_MARKER) {
             bail!(
@@ -646,7 +649,8 @@ fn wait_for_parallel_boot(
         // an FPS proof additionally requires that record to have settled.
         let ui_runtime_ready = !runtime_stall_or_crash_observed(&rustos_log)
             && (options.min_ui_fps.is_none() || ui_readiness_settled(&rustos_log));
-        let ui_startup_detail = runtime_failure_detail(&rustos_log);
+        let ui_startup_detail =
+            with_display_topology_hint(runtime_failure_detail(&rustos_log), options.gui_dvm_surfaces);
         let dvm_relay_fps_ready = options.min_ui_fps.is_none_or(|minimum| {
             !options.gui_dvm_surfaces
                 || dvm_display_relay_meets_fps(&dvm_log, minimum, options.ui_proof_windows)
@@ -705,8 +709,21 @@ fn wait_for_parallel_boot(
             })
             .or_else(|| {
                 options
+                    .fault_probe
+                    .then(|| fault_probe_failure(&rustos_log))
+                    .flatten()
+            })
+            .or_else(|| {
+                options
                     .app_dmabuf_probe
                     .then(|| app_dmabuf_probe_failure(&rustos_log))
+                    .flatten()
+            })
+            .or_else(|| {
+                options
+                    .launch_desktop
+                    .is_some()
+                    .then(|| launch_desktop_failure(&rustos_log))
                     .flatten()
             });
         if probe_failure.is_some() || Instant::now() >= deadline {
@@ -786,6 +803,99 @@ fn wait_for_parallel_boot(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Name the cause when uiserver's required display dependency failed in a
+/// topology that never attached a display provider. Without this the record
+/// reads `dependency=display errno=11` and says nothing about the run shape.
+fn with_display_topology_hint(detail: String, gui_dvm_surfaces: bool) -> String {
+    if gui_dvm_surfaces || !detail.contains("dependency=display") {
+        return detail;
+    }
+    format!(
+        "{detail}; this run has no display provider (no --gui-dvm-surfaces), and uiserver's required display dependency gives up 30 s after it starts: pass --gui-dvm-surfaces (implied by --hold-seconds, --launch-desktop and the session probes) for any run that must outlive that"
+    )
+}
+
+/// `--hold-seconds`: after readiness was accepted, keep both guests up for the
+/// whole window and fail on the first sign the accepted state did not hold - a
+/// guest exit, a typed startup failure, a stall/crash marker, a display relay
+/// failure, an input-relay error, a launch-desktop refusal, or an expected
+/// marker that is no longer present. The window is on top of the `--timeout`
+/// readiness budget; logs stay in `build/kvm`.
+fn hold_after_readiness(
+    rustos: &mut Child,
+    dvm: &mut Child,
+    layout: &KvmLayout,
+    options: &SmokeOptions,
+    hold: Duration,
+    probe: &ProbeResult,
+    control_relay: &Receiver<Result<ProbeResult>>,
+) -> Result<()> {
+    let mut control_ready = Some(probe.clone());
+    let held_from = Instant::now();
+    let until = held_from + hold;
+    println!(
+        "xtask: readiness accepted; holding both guests for {} s (--hold-seconds)",
+        hold.as_secs()
+    );
+    while Instant::now() < until {
+        let elapsed = held_from.elapsed().as_secs();
+        check_guest_running(rustos, "RustOS", &layout.rustos_stderr_log)
+            .with_context(|| format!("hold failed {elapsed} s into the window"))?;
+        check_guest_running(dvm, "Linux DVM", &layout.dvm_stderr_log)
+            .with_context(|| format!("hold failed {elapsed} s into the window"))?;
+        poll_input_relay(control_relay, &mut control_ready)
+            .with_context(|| format!("hold failed {elapsed} s into the window"))?;
+        let rustos_log = rejoin_user_debug_records(
+            &read_log_lossy(&layout.debugcon_log)
+                .with_context(|| format!("read {}", layout.debugcon_log.display()))?,
+        );
+        let dvm_log = read_log_lossy(&layout.dvm_serial_log)
+            .with_context(|| format!("read {}", layout.dvm_serial_log.display()))?;
+        if let Some(reason) = held_state_failure(&rustos_log, &dvm_log, options) {
+            bail!("hold failed {elapsed} s into the window: {reason}");
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    println!(
+        "xtask: held {} s with no guest exit or failure",
+        hold.as_secs()
+    );
+    Ok(())
+}
+
+/// What the log says is wrong with an accepted state, if anything.
+fn held_state_failure(rustos_log: &str, dvm_log: &str, options: &SmokeOptions) -> Option<String> {
+    if let Some(failure) = startup_failure_detail(rustos_log) {
+        return Some(failure);
+    }
+    if runtime_stall_or_crash_observed(rustos_log) {
+        return Some(runtime_failure_detail(rustos_log));
+    }
+    if runtime_stall_or_crash_observed(dvm_log) {
+        return Some(format!("Linux DVM: {}", runtime_failure_detail(dvm_log)));
+    }
+    if let Some(failure) = launch_desktop_failure(rustos_log) {
+        return Some(failure);
+    }
+    if options.gui_dvm_surfaces
+        && let Some(failure) = dvm_display_failure(dvm_log, options.physical_gpu_bdf.is_some())
+    {
+        return Some(format!("Linux DVM display relay failed: {failure}"));
+    }
+    let lost = options
+        .expected_markers
+        .iter()
+        .find(|marker| !rustos_marker_present(rustos_log, marker))
+        .map(|marker| format!("accepted RustOS marker disappeared: {marker}"));
+    lost.or_else(|| {
+        options
+            .expected_dvm_markers
+            .iter()
+            .find(|marker| !dvm_log.contains(marker.as_str()))
+            .map(|marker| format!("accepted Linux-DVM marker disappeared: {marker}"))
+    })
 }
 
 fn runtime_log_len(path: &Path) -> Result<usize> {

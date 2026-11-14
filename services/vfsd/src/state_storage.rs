@@ -182,7 +182,7 @@ impl VfsState {
         if flags & O_DIRECTORY != 0 && metadata.kind != RemoteKind::Directory {
             return Err(ENOTDIR);
         }
-        if flags & (O_CREAT | O_TRUNC) != 0 {
+        if flags & (O_CREAT | O_TRUNC) != 0 && metadata.kind != RemoteKind::Device {
             return Err(EROFS);
         }
         let handle = RemoteHandle {
@@ -234,6 +234,9 @@ impl VfsState {
             let handle = self.handles.get(&id).ok_or(EBADF)?;
             if handle.kind == RemoteKind::Device && is_input_device_node(handle.path.as_str()) {
                 return Err(EAGAIN);
+            }
+            if handle.kind == RemoteKind::Device && handle.path == "/dev/null" {
+                return Ok(0);
             }
             if handle.kind != RemoteKind::File {
                 return Err(EISDIR);

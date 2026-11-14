@@ -45,7 +45,7 @@ pub(super) fn control(args_ptr: u64) -> u64 {
     let args = match usermem::read_current_user_struct::<RustosFrameSourceArgs>(args_ptr) {
         Ok(args) if args.is_canonical() => args,
         Ok(_) => return linux_errno(LINUX_EINVAL),
-        Err(error) => return linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
     };
     if args.op == FRAME_SOURCE_OP_SUPPLY {
         let Some(group) = multitask::current_user_job_charge_group() else {
@@ -57,7 +57,7 @@ pub(super) fn control(args_ptr: u64) -> u64 {
             if let Err(error) =
                 usermem::copy_from_current_user_exact(args.payload_ptr, &mut payload[..len])
             {
-                return linux_errno(address_space_error_to_linux_errno(error));
+                return linux_errno(user_pointer_error_to_linux_errno(error));
             }
         }
         // Never reclaim under the registry lock: a concurrent PTE/COW change

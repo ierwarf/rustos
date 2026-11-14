@@ -256,6 +256,8 @@ pub fn physical_base() -> Option<u64> {
     if leaf1.edx & CPUID_FEATURE_APIC == 0 {
         return None;
     }
+    // SAFETY: CPUID.1:EDX.APIC was just checked, so IA32_APIC_BASE exists; a
+    // ring-0 RDMSR of it has no side effects and touches only this CPU's state.
     let apic_base = unsafe { Msr::new(IA32_APIC_BASE).read() };
     // The base field stays architecturally valid in x2APIC mode; the MMIO
     // mapping is then simply unused.
@@ -321,6 +323,8 @@ pub fn init() -> bool {
     }
 
     let mut apic_base_msr = Msr::new(IA32_APIC_BASE);
+    // SAFETY: CPUID.1:EDX.APIC was checked above, so IA32_APIC_BASE exists; the
+    // read is side-effect free and per-CPU, and `init` runs on the owning CPU.
     let mut apic_base = unsafe { apic_base_msr.read() };
     let physical_base = apic_base & APIC_BASE_ADDRESS_MASK;
     // ORDERING: Acquire observes the admitted physical/virtual mapping pair
@@ -337,6 +341,9 @@ pub fn init() -> bool {
     if apic_base & APIC_BASE_ENABLE == 0 {
         // xAPIC must be enabled first; disabled -> x2APIC is an invalid step.
         apic_base |= APIC_BASE_ENABLE;
+        // SAFETY: APIC support was checked and the base address matches the admitted
+        // page; the value is the MSR just read with only ENABLE added, so reserved bits
+        // and this CPU's own mode bits are preserved. Only this CPU runs its `init`.
         unsafe {
             apic_base_msr.write(apic_base);
         }
@@ -365,6 +372,8 @@ pub fn init() -> bool {
             u64::from((current & !0xff) | APIC_SPURIOUS_ENABLE | APIC_SPURIOUS_VECTOR),
         );
     } else {
+        // ORDERING: Acquire pairs with the Release store of LOCAL_APIC_BASE in
+        // `configure_mmio`, so the admitted uncacheable mapping is visible before use.
         let base = LOCAL_APIC_BASE.load(Ordering::Acquire);
         if base == 0 {
             return false;
@@ -438,6 +447,8 @@ fn quiesce_local_vectors(x2apic: bool) {
 pub(super) fn write_lvt_timer_for_current_cpu(value: u32) -> bool {
     let logical_index = nucleus_core::util::lockdep::current_cpu_index();
     if logical_index >= MAX_SUPPORTED_CPUS
+        // ORDERING: Acquire pairs with this CPU's Release store of READY in `init`, so
+        // the SVR programming is complete before LVT timer writes.
         || !LOCAL_APIC_READY[logical_index].load(Ordering::Acquire)
     {
         return false;
@@ -446,6 +457,8 @@ pub(super) fn write_lvt_timer_for_current_cpu(value: u32) -> bool {
         x2apic_write(X2APIC_MSR_LVT_TIMER, u64::from(value));
         return true;
     }
+    // ORDERING: Acquire pairs with the Release in `configure_mmio` publishing the
+    // mapped APIC page; READY above already implies it, this orders the base read.
     let base = LOCAL_APIC_BASE.load(Ordering::Acquire);
     if base == 0 {
         return false;
@@ -661,10 +674,15 @@ pub const fn vector_is_valid(vector: u8) -> bool {
 impl MsiVectorLease {
     /// Reserve one vector without publishing any registration authority.
     pub fn allocate() -> Option<Self> {
+        // ORDERING: AcqRel on the scan cursor is only a start-index spread hint; slot
+        // ownership is decided by the per-slot CAS below, so no data depends on it.
         let start = ALLOCATION_CURSOR.fetch_add(1, Ordering::AcqRel) % MSI_VECTOR_COUNT;
         for offset in 0..MSI_VECTOR_COUNT {
             let index = (start + offset) % MSI_VECTOR_COUNT;
             if ALLOCATED[index]
+                // ORDERING: AcqRel CAS claims the slot exclusively (one winner per vector);
+                // Acquire pairs with `release_vector_handler`'s Release store so the previous
+                // owner's revoked handler and drained dispatch are visible before reuse.
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
@@ -690,12 +708,16 @@ impl MsiVectorLease {
         let Some(index) = vector_index(self.vector) else {
             return false;
         };
+        // ORDERING: Acquire pairs with the AcqRel claim CAS in `allocate`; the lease
+        // may register only against a slot that is really reserved.
         if !vector_has_registration_authority(self.vector, ALLOCATED[index].load(Ordering::Acquire))
         {
             return false;
         }
         let raw = handler as usize;
         if HANDLERS[index]
+            // ORDERING: AcqRel CAS installs the handler word 0 -> raw exactly once; the
+            // SeqCst load in `dispatch` observes it, and a failed CAS means another owner.
             .compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
@@ -710,6 +732,8 @@ impl MsiVectorLease {
         let index = vector_index(self.vector)?;
         if self.handler == 0
             || !LOCAL_APIC_READY[nucleus_core::util::lockdep::current_cpu_index()]
+                // ORDERING: Acquire loads pair with the AcqRel handler CAS and the claim CAS,
+                // so the message is returned only for this lease's live handler and slot.
                 .load(Ordering::Acquire)
             || !ALLOCATED[index].load(Ordering::Acquire)
             || HANDLERS[index].load(Ordering::Acquire) != self.handler
@@ -953,6 +977,7 @@ mod tests {
 
         let mut lease = MsiVectorLease::allocate().expect("bounded test vector");
         let index = vector_index(lease.vector()).expect("allocated vector index");
+        // ORDERING: single-threaded test read; same Acquire as production `message`.
         assert!(ALLOCATED[index].load(Ordering::Acquire));
         assert!(lease.register_handler(handler));
         assert_eq!(
@@ -961,6 +986,8 @@ mod tests {
         );
 
         drop(lease);
+        // ORDERING: single-threaded test check that drop released handler and slot;
+        // Acquire matches the production observers of the Release in the release path.
         assert_eq!(HANDLERS[index].load(Ordering::Acquire), 0);
         assert!(!ALLOCATED[index].load(Ordering::Acquire));
     }
@@ -974,10 +1001,12 @@ mod tests {
         assert!(lease.register_handler(handler));
         let committed = lease.commit();
         assert_eq!(committed.vector(), MSI_VECTOR_FIRST + index as u8);
+        // ORDERING: single-threaded test read, same strength as production observers.
         assert!(ALLOCATED[index].load(Ordering::Acquire));
 
         drop(committed);
         assert_eq!(HANDLERS[index].load(Ordering::Acquire), 0);
+        // ORDERING: single-threaded test check that the slot was released after drop.
         assert!(!ALLOCATED[index].load(Ordering::Acquire));
     }
 

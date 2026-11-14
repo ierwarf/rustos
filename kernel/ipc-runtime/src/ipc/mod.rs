@@ -604,6 +604,10 @@ impl SharedRegionObject {
     }
 
     fn release(&self) -> bool {
+        // ORDERING: every retain/release runs inside `SHARED_REGIONS.with`, i.e. under
+        // the IpcRegion slab lock, and the last-reference teardown re-takes that lock in
+        // `remove`; the lock already orders all holders' accesses before the reclaim.
+        // Release is kept so the count stays correct if used outside the lock.
         let previous = self.references.fetch_sub(1, Ordering::Release);
         assert!(previous != 0, "shared-region reference underflow");
         previous == 1
@@ -1365,6 +1369,9 @@ fn reserve_shared_region_admission(
     byte_len: usize,
 ) -> Result<(), IpcError> {
     if SHARED_REGION_ADMITTED
+        // ORDERING: AcqRel CAS-loop reserves one object slot against the hard cap. The
+        // counter only bounds admission; the object itself is published later by the
+        // slab insert under its lock, so no other data rides on this ordering.
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
             if admitted >= MAX_SHARED_REGION_OBJECTS {
                 return None;
@@ -1376,6 +1383,8 @@ fn reserve_shared_region_admission(
         return Err(IpcError::NoMemory);
     }
     if SHARED_REGION_BYTES_ADMITTED
+        // ORDERING: AcqRel CAS-loop reserves the byte budget against the global cap;
+        // admission accounting only, paired with the AcqRel decrement in release.
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
             admitted
                 .checked_add(byte_len)
@@ -1383,12 +1392,16 @@ fn reserve_shared_region_admission(
         })
         .is_err()
     {
+        // ORDERING: AcqRel rollback of the object-slot reservation taken above when the
+        // byte budget is refused; undoes exactly this caller's increment.
         SHARED_REGION_ADMITTED.fetch_sub(1, Ordering::AcqRel);
         return Err(IpcError::NoMemory);
     }
     if let Some(process_id) = owner_process_id
         && let Err(error) = SHARED_REGION_QUOTAS.lock().reserve(process_id, byte_len)
     {
+        // ORDERING: AcqRel rollback of this caller's byte reservation when the
+        // per-process quota refuses; counters are admission-only accounting.
         SHARED_REGION_BYTES_ADMITTED.fetch_sub(byte_len, Ordering::AcqRel);
         SHARED_REGION_ADMITTED.fetch_sub(1, Ordering::AcqRel);
         return Err(error);
@@ -1400,11 +1413,15 @@ fn release_shared_region_admission(owner_process_id: Option<u64>, byte_len: usiz
     if let Some(process_id) = owner_process_id {
         SHARED_REGION_QUOTAS.lock().release(process_id, byte_len);
     }
+    // ORDERING: AcqRel decrement returns this region's byte budget; the previous
+    // value is only checked for underflow, and no data depends on it.
     let previous_bytes = SHARED_REGION_BYTES_ADMITTED.fetch_sub(byte_len, Ordering::AcqRel);
     assert!(
         previous_bytes >= byte_len,
         "shared-region admission byte count underflow"
     );
+    // ORDERING: AcqRel decrement returns the object slot; checked for underflow
+    // only, and the freed capacity carries no other published state.
     let previous = SHARED_REGION_ADMITTED.fetch_sub(1, Ordering::AcqRel);
     assert!(previous != 0, "shared-region admission count underflow");
 }
@@ -1449,6 +1466,9 @@ fn create_shared_region_with_owner(
         let Some(phys_start) = phys::alloc_contiguous(page_count) else {
             return Err(IpcError::NoMemory);
         };
+        // SAFETY: `phys_start..+alloc_len` was just returned by `alloc_contiguous` for
+        // `page_count` frames, so it is exclusively owned and no handle exists yet. The
+        // higher-half direct map covers all RAM; `u8` writes need no alignment.
         unsafe {
             ptr::write_bytes(
                 kernel_vm::higher_half_addr(phys_start.as_u64()) as *mut u8,

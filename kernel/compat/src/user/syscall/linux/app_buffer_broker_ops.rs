@@ -253,7 +253,7 @@ fn reap(owner: u64, epoch: u64) -> Result<u64, i64> {
 pub(super) fn syscall_linux_rustos_app_buffer_broker(ptr: u64) -> u64 {
     let args = match usermem::read_current_user_struct::<RustosAppBufferBrokerArgs>(ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     let (owner, epoch) = match live_owner() { Ok(subject) => subject, Err(e) => return linux_errno(e) };
     let result = match args.op {
@@ -276,7 +276,7 @@ pub(super) fn syscall_linux_rustos_app_buffer_alloc(ptr: u64) -> u64 {
     };
     let args = match usermem::read_current_user_struct::<RustosAppBufferAllocArgs>(ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     if args.reserved != [0; 2] { return linux_errno(LINUX_EINVAL); }
     // Early refusal only; the authoritative check runs atomically with the

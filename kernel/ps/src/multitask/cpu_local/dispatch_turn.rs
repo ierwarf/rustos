@@ -14,6 +14,7 @@ use super::super::scheduler::rsp_handoff::RspHandoff;
 use core::cell::UnsafeCell;
 use nucleus_core::util::lockdep::DispatchPreemption;
 #[cfg(not(test))]
+#[cfg(rustos_boot_image)]
 use nucleus_core::util::lockdep::LockClass;
 
 struct TurnCell {

@@ -149,6 +149,8 @@ struct DvmIngressLogState {
 
 impl DvmIngressLogState {
     fn claim(&self, keyboard: bool, pointer: bool) -> (bool, bool) {
+        // ORDERING: these flags only elect the first log line per stream; no data rides
+        // on them, and the AcqRel swap is atomic, so exactly one caller sees `false`.
         (
             keyboard && !self.keyboard.swap(true, Ordering::AcqRel),
             pointer && !self.pointer.swap(true, Ordering::AcqRel),
@@ -1534,6 +1536,10 @@ fn notify_netd_dvm_session(
         dvm_session_sync::monotonic_nanos(),
     )?;
     let mut response = NetdIpcResponse::default();
+    // SAFETY: `request` is readable for NETD_IPC_REQUEST_HEADER_SIZE bytes (the
+    // header is a prefix of `NetdIpcRequest`, whose size is header + payload) and
+    // `response` is writable for its full size; both outlive the call, which is
+    // finitely bounded by `timeout_ms` and keeps no pointer after it returns.
     let received = unsafe {
         rustos_svc_runtime::ipc::call_bounded(
             endpoint as u64,
@@ -1616,6 +1622,9 @@ fn fill_native_payload(
         let Some(event) = queue.pop_front() else {
             break;
         };
+        // SAFETY: `event` is a live local UiInputEvent (`repr(C)`, six 32-bit-or-smaller
+        // fields, 24 bytes, no padding), so its `event_size` bytes are initialized;
+        // the view is read-only and copied before `event` is dropped.
         let bytes = unsafe {
             slice::from_raw_parts(
                 (&event as *const input_evdev::InputEvent).cast::<u8>(),
@@ -1651,6 +1660,9 @@ fn fill_evdev_payload(
     let written_events = input_evdev::translate_input_events_to_evdev(&input, &mut output)
         .map_err(|_| libc::EINVAL)?;
     let bytes_len = written_events * event_size;
+    // SAFETY: `output[..written_events]` is initialized `repr(C)` LinuxInputEvent data
+    // (i64,i64,u16,u16,i32: no padding) and `bytes_len = written_events * size` is
+    // within `output`'s length, which the translator bounded by its capacity.
     let bytes = unsafe { slice::from_raw_parts(output.as_ptr().cast::<u8>(), bytes_len) };
     payload[..bytes_len].copy_from_slice(bytes);
     Ok(bytes_len)
@@ -1930,6 +1942,9 @@ fn copy_label(src: &[u8], dest: &mut [u8], len: &mut u16) {
 }
 
 fn write_payload_struct<T>(value: &T, dest: &mut [u8]) -> u32 {
+    // SAFETY: `value` is a live `&T` and the view is exactly `size_of::<T>()` bytes,
+    // read-only and copied immediately. Callers pass `repr(C)` integer wire structs
+    // without padding (InputStatsWire: eight u64, two u32, one u64).
     let bytes = unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
     let count = bytes.len().min(dest.len());
     dest[..count].copy_from_slice(&bytes[..count]);
@@ -1938,14 +1953,22 @@ fn write_payload_struct<T>(value: &T, dest: &mut [u8]) -> u32 {
 
 fn read_unaligned<T: Copy>(buffer: &[u8]) -> T {
     assert!(buffer.len() >= size_of::<T>());
+    // SAFETY: the assert guarantees `size_of::<T>()` readable bytes; `read_unaligned`
+    // needs no alignment, and `T: Copy` wire types are plain integers for which
+    // every bit pattern is valid.
     unsafe { core::ptr::read_unaligned(buffer.as_ptr().cast::<T>()) }
 }
 
 fn syscall0(number: u64) -> i64 {
+    // SAFETY: raw `syscall(2)` with no pointer arguments; the number is one of the
+    // RustOS broker numbers, which validate everything themselves.
     unsafe { libc::syscall(number as libc::c_long) as i64 }
 }
 
 fn syscall1(number: u64, arg0: u64) -> i64 {
+    // SAFETY: raw `syscall(2)` whose one argument is either an integer or the address
+    // of a broker args struct the caller keeps alive across the call; the kernel
+    // copies it by value and validates every embedded pointer.
     unsafe { libc::syscall(number as libc::c_long, arg0) as i64 }
 }
 

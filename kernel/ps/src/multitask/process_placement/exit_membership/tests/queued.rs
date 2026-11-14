@@ -324,3 +324,88 @@ fn unpublished_seal_is_in_flight_until_publication_or_rollback() {
         assert!(receipt.complete());
     });
 }
+
+#[test]
+fn target_resolution_finds_live_sibling_after_leader_retired_and_prefers_leader_when_alive() {
+    fixture(|h| {
+        let join = Join::begin(h, (SLOT, ID), UserAbi::Linux).unwrap();
+        join.register(PEER, ID + 1).unwrap();
+        identity::publish_metadata(PEER, Some(meta(h, ID + 1)));
+        drop(join);
+        // Leader alive: unchanged, the leader member is the target.
+        assert_eq!(target_by_pid(ID), Some((h, (SLOT, ID))));
+        // Leader retired (thread exit) while the sibling lives: the sibling is the target.
+        unregister(h, SLOT, ID);
+        assert_eq!(target_by_pid(ID), Some((h, (PEER, ID + 1))));
+        // Foreign pid still resolves to nothing, and the resolved target is admissible.
+        assert!(target_by_pid(ID + 5).is_none());
+        let receipt = PendingExit::begin(h, target_by_pid(ID).unwrap().1)
+            .unwrap()
+            .publish(ID, reason());
+        assert!(queued_for(h).is_some() && !receipt.complete());
+        assert!(PendingExit::begin(h, (PEER, ID + 1)).is_none());
+        let (census, _) = claim_next().unwrap();
+        finish(census);
+        assert!(receipt.complete());
+    });
+}
+
+#[test]
+fn target_resolution_is_absent_when_every_member_is_gone_or_stopped() {
+    fixture(|h| {
+        unregister(h, SLOT, ID);
+        assert!(target_by_pid(ID).is_none());
+    });
+    fixture(|h| {
+        let join = Join::begin(h, (SLOT, ID), UserAbi::Linux).unwrap();
+        join.register(PEER, ID + 1).unwrap();
+        identity::publish_metadata(PEER, Some(meta(h, ID + 1)));
+        drop(join);
+        cell(h).unwrap().with(|s| s.stopped = [true; MAX]);
+        assert!(target_by_pid(ID).is_none());
+        cell(h).unwrap().with(|s| s.stopped = [false; MAX]);
+    });
+}
+
+#[test]
+fn concurrent_terminators_and_fault_seal_elect_exactly_one_exit_owner() {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    fixture(|h| {
+        let join = Join::begin(h, (SLOT, ID), UserAbi::Linux).unwrap();
+        join.register(PEER, ID + 1).unwrap();
+        identity::publish_metadata(PEER, Some(meta(h, ID + 1)));
+        drop(join);
+        unregister(h, SLOT, ID);
+        let winners = AtomicUsize::new(0);
+        let first_seals = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let Some((handle, member)) = target_by_pid(ID) else { return };
+                    if let Some(pending) = PendingExit::begin(handle, member) {
+                        // ORDERING: SeqCst test counter; the scope join below publishes it to the asserts.
+                        winners.fetch_add(1, Ordering::SeqCst);
+                        let _ = pending.publish(ID, reason());
+                    }
+                });
+            }
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    if process_table::seal_fault_termination(h, ID, ID + 1, 13)
+                        == process_table::FaultSeal::First
+                    {
+                        // ORDERING: SeqCst test counter; the scope join below publishes it to the asserts.
+                        first_seals.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        // ORDERING: all spawned threads joined at scope end; SeqCst loads read the final counts.
+        assert_eq!(first_seals.load(Ordering::SeqCst), 1);
+        // ORDERING: all spawned threads joined at scope end; SeqCst loads read the final counts.
+        assert_eq!(winners.load(Ordering::SeqCst), 1);
+        let (census, _) = claim_next().unwrap();
+        assert!(claim_next().is_none());
+        finish(census);
+    });
+}

@@ -46,7 +46,7 @@ pub use crate::multitask::{
     mark_user_process_exiting_once, next_retired_task_cleanup, note_process_exit_status,
     first_user_mapping_conflict, pager_fault_snapshot, pager_vma_regions_for_process, protect_pager_vma_for_process,
     publish_current_pager_vma, publish_inherited_pager_vma_for_process,
-    publish_pager_vma_for_process, queue_linux_process_sigchld, queue_linux_signal,
+    publish_pager_vma_for_process, queue_linux_process_sigchld, queue_linux_process_signal, queue_linux_signal,
     register_pager_fault_waiter, release_ipc_priority, release_pager_fault_priority,
     reserve_ipc_call_donation, reserve_ipc_priority, reserve_pager_fault_with_dispatch_grant,
     reserve_process_spawn, reserve_process_spawn_in, revoke_current_pager_vma, revoke_pager_vma_for_process,

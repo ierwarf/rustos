@@ -209,3 +209,97 @@
         }
         assert!(parse_smoke_options(vec!["--repeat".into()].into_iter()).is_err());
     }
+
+    fn parse(args: &[&str]) -> anyhow::Result<super::SmokeOptions> {
+        parse_smoke_options(args.iter().map(|arg| (*arg).to_owned()))
+    }
+
+    #[test]
+    fn hold_seconds_is_bounded_and_implies_the_display_provider() {
+        let options = parse(&["--hold-seconds", "45"]).unwrap();
+        assert_eq!(options.hold_seconds, Some(45));
+        assert!(options.gui_dvm_surfaces && options.dvm_block_shmem);
+        assert_eq!(parse(&["--hold-seconds", "1"]).unwrap().hold_seconds, Some(1));
+        assert_eq!(
+            parse(&["--hold-seconds", "180"]).unwrap().hold_seconds,
+            Some(super::MAX_SMOKE_HOLD_SECONDS)
+        );
+        for bad in ["0", "181", "-1", "x", ""] {
+            assert!(parse(&["--hold-seconds", bad]).is_err(), "{bad:?}");
+        }
+        let range = parse(&["--hold-seconds", "181"]).unwrap_err().to_string();
+        assert!(range.contains("--hold-seconds") && range.contains("1..=180"), "{range}");
+        assert!(parse(&["--hold-seconds"]).is_err());
+        assert!(parse(&["--hold-seconds", "5", "--hold-seconds", "6"]).is_err());
+        assert!(parse(&[]).unwrap().hold_seconds.is_none());
+    }
+
+    #[test]
+    fn hold_seconds_refuses_what_it_contradicts() {
+        for other in [
+            vec!["--storage-dvm-only"],
+            vec!["--recovery-probe", "all"],
+            vec!["--min-ui-fps", "30"],
+            vec!["--smp-iteration", "--timeout", "30"],
+        ] {
+            let mut args = vec!["--hold-seconds", "10"];
+            args.extend(other.iter().copied());
+            let err = parse(&args).unwrap_err().to_string();
+            assert!(err.contains("--hold-seconds"), "{args:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn launch_desktop_is_strict_and_requires_its_marker() {
+        let options = parse(&["--launch-desktop", "chrome.desktop"]).unwrap();
+        assert_eq!(options.launch_desktop.as_deref(), Some("chrome.desktop"));
+        assert!(options.gui_dvm_surfaces && options.dvm_block_shmem);
+        assert!(options
+            .expected_markers
+            .contains(&super::launch_desktop_launched_marker("chrome.desktop")));
+        for bad in ["chrome", "../x.desktop", "a/b.desktop", ".desktop", "a b.desktop"] {
+            assert!(parse(&["--launch-desktop", bad]).is_err(), "{bad:?}");
+        }
+        assert!(parse(&["--launch-desktop"]).is_err());
+        assert!(parse(&["--launch-desktop", "a.desktop", "--launch-desktop", "b.desktop"]).is_err());
+        assert!(parse(&["--launch-desktop", "a.desktop", "--storage-dvm-only"]).is_err());
+        assert!(parse(&["--launch-desktop", "a.desktop", "--smp-iteration", "--timeout", "30"]).is_err());
+        assert!(parse(&[]).unwrap().launch_desktop.is_none());
+    }
+
+    #[test]
+    fn numeric_flag_errors_name_the_valid_range() {
+        for (flag, range) in [("--timeout", "1..=180"), ("--repeat", "1..=64"), ("--min-ui-fps", "1..=240")] {
+            let err = format!("{:#}", parse(&[flag, "abc"]).unwrap_err());
+            assert!(err.contains(flag) && err.contains(range), "{flag}: {err}");
+        }
+    }
+
+    #[test]
+    fn display_failure_without_a_display_provider_names_the_topology() {
+        let detail = String::from("uiserver readiness failed: dependency=display errno=11 gen=120 (display=failed#120)");
+        let hinted = super::with_display_topology_hint(detail.clone(), false);
+        assert!(hinted.starts_with(&detail) && hinted.contains("--gui-dvm-surfaces"), "{hinted}");
+        assert_eq!(super::with_display_topology_hint(detail.clone(), true), detail);
+        let other = String::from("uiserver readiness failed: dependency=input errno=5");
+        assert_eq!(super::with_display_topology_hint(other.clone(), false), other);
+    }
+
+    #[test]
+    fn held_state_fails_on_any_regression_and_passes_when_clean() {
+        let options = parse(&["--hold-seconds", "10"]).unwrap();
+        let mut rustos = options.expected_markers.join("\n");
+        rustos.push('\n');
+        let mut dvm = options.expected_dvm_markers.join("\n");
+        dvm.push('\n');
+        // Clean logs hold only when the display relay is also healthy; the
+        // DVM log here carries only the expected markers, which is not a
+        // display failure.
+        assert_eq!(super::held_state_failure(&rustos, &dvm, &options), None);
+        let lost = super::held_state_failure(&rustos.replace(RUSTOS_BOOT_MARKER, ""), &dvm, &options);
+        assert!(lost.is_some_and(|reason: String| reason.contains("disappeared")));
+        let refused = format!("{rustos}runtimed: kvm launch-desktop FAIL desktop_id=x.desktop errno=2\n");
+        assert!(super::held_state_failure(&refused, &dvm, &options).is_some_and(|r: String| r.contains("errno=2")));
+        let panicked = format!("{rustos}initd: fatal service endpoint not ready exec=a pid=1 errno=5\n");
+        assert!(super::held_state_failure(&panicked, &dvm, &options).is_some());
+    }

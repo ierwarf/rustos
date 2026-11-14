@@ -547,7 +547,7 @@ fn rdpid_supported() -> bool {
     __cpuid(0).eax >= 7 && __cpuid_count(7, 0).ecx & (1 << 22) != 0
 }
 
-#[cfg(not(test))]
+#[cfg(rustos_boot_image)]
 fn rdtscp_supported() -> bool {
     use core::arch::x86_64::__cpuid;
 

@@ -302,7 +302,7 @@ fn run_job_op(args: &mut RustosJobArgs, caller: u64) -> Result<Option<PendingJob
 pub(super) fn syscall_linux_rustos_job(args_ptr: u64) -> u64 {
     let mut args = match usermem::read_current_user_struct::<RustosJobArgs>(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     if !job_args_are_valid(&args) {
         return linux_errno(LINUX_EINVAL);
@@ -311,14 +311,14 @@ pub(super) fn syscall_linux_rustos_job(args_ptr: u64) -> u64 {
         return linux_errno(LINUX_ESRCH);
     };
     if let Err(err) = usermem::validate_current_user_write_buffer(args_ptr, size_of::<RustosJobArgs>()) {
-        return linux_errno(address_space_error_to_linux_errno(err));
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     let mut pending = match run_job_op(&mut args, caller) {
         Ok(pending) => pending,
         Err(errno) => return linux_errno(errno),
     };
     if let Err(err) = usermem::write_current_user_struct(args_ptr, &args) {
-        return linux_errno(address_space_error_to_linux_errno(err));
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     if let Some(pending) = pending.as_mut()
         && let Err(errno) = pending.commit()
@@ -430,7 +430,7 @@ pub(super) fn syscall_linux_rustos_job_session(args_ptr: u64) -> u64 {
     use rustos_user_abi::syscall::RustosJobSessionArgs;
     let mut args = match usermem::read_current_user_struct::<RustosJobSessionArgs>(args_ptr) {
         Ok(value) => value,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     if !job_session_args_valid(&args) {
         return linux_errno(LINUX_EINVAL);
@@ -439,7 +439,7 @@ pub(super) fn syscall_linux_rustos_job_session(args_ptr: u64) -> u64 {
         return linux_errno(LINUX_ESRCH);
     };
     if let Err(err) = usermem::validate_current_user_write_buffer(args_ptr, size_of::<RustosJobSessionArgs>()) {
-        return linux_errno(address_space_error_to_linux_errno(err));
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     if let Err(err) = execute_job_session(&mut args, caller) {
         return linux_errno(err);
@@ -447,7 +447,7 @@ pub(super) fn syscall_linux_rustos_job_session(args_ptr: u64) -> u64 {
     if let Err(err) = usermem::write_current_user_struct(args_ptr, &args) {
         // The kernel owns tokens and watermarks: repeating the same request
         // after ambiguous user copyout never doubles the charge or refund.
-        return linux_errno(address_space_error_to_linux_errno(err));
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     0
 }
@@ -478,7 +478,7 @@ pub(super) fn syscall_linux_rustos_job_kmem(ptr: u64) -> u64 {
     use rustos_user_abi::syscall::*;
     let mut args = match usermem::read_current_user_struct::<RustosJobKmemArgs>(ptr) {
         Ok(args) => args,
-        Err(error) => return linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
     };
     let class_op = matches!(args.op, JOB_KMEM_OP_INSPECT_CLASS | JOB_KMEM_OP_SET_CLASS_LIMIT);
     let flags_ok = if class_op {
@@ -503,7 +503,7 @@ pub(super) fn syscall_linux_rustos_job_kmem(ptr: u64) -> u64 {
     if let Err(error) =
         usermem::validate_current_user_write_buffer(ptr, size_of::<RustosJobKmemArgs>())
     {
-        return linux_errno(address_space_error_to_linux_errno(error));
+        return linux_errno(user_pointer_error_to_linux_errno(error));
     }
     let Some(caller) = multitask::current_user_process_id() else {
         return linux_errno(LINUX_ESRCH);
@@ -541,7 +541,7 @@ pub(super) fn syscall_linux_rustos_job_kmem(ptr: u64) -> u64 {
         args.usage_process_object_bytes = usage;
         return match usermem::write_current_user_struct(ptr, &args) {
             Ok(()) => 0,
-            Err(error) => linux_errno(address_space_error_to_linux_errno(error)),
+            Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
         };
     }
     let result = if args.op == JOB_KMEM_OP_INSPECT {
@@ -559,7 +559,7 @@ pub(super) fn syscall_linux_rustos_job_kmem(ptr: u64) -> u64 {
     args.object_size_bytes = info.process_object_size;
     match usermem::write_current_user_struct(ptr, &args) {
         Ok(()) => 0,
-        Err(error) => linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
     }
 }
 
@@ -589,7 +589,7 @@ pub(super) fn syscall_linux_rustos_job_memory_qos(ptr: u64) -> u64 {
     use rustos_user_abi::syscall::*;
     let mut args = match usermem::read_current_user_struct::<RustosJobMemoryQosArgs>(ptr) {
         Ok(value) => value,
-        Err(error) => return linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
     };
     if !job_memory_qos_args_valid(&args) {
         return linux_errno(LINUX_EINVAL);
@@ -600,7 +600,7 @@ pub(super) fn syscall_linux_rustos_job_memory_qos(ptr: u64) -> u64 {
     if let Err(error) =
         usermem::validate_current_user_write_buffer(ptr, size_of::<RustosJobMemoryQosArgs>())
     {
-        return linux_errno(address_space_error_to_linux_errno(error));
+        return linux_errno(user_pointer_error_to_linux_errno(error));
     }
     let right = if args.op == JOB_MEMORY_QOS_OP_INSPECT {
         JobHandleRights::INSPECT
@@ -633,7 +633,7 @@ pub(super) fn syscall_linux_rustos_job_memory_qos(ptr: u64) -> u64 {
     args.high_crossings = info.high_events;
     match usermem::write_current_user_struct(ptr, &args) {
         Ok(()) => 0,
-        Err(error) => linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
     }
 }
 

@@ -108,7 +108,9 @@ pub const THREAD_STACK_BYTES: usize = 16 * 1024;
 impl ThreadStack {
     pub const fn new() -> Self { Self([0; THREAD_STACK_BYTES]) }
 }
+#[cfg(all(target_arch = "x86_64", not(test)))]
 static THREAD_SERVICE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "x86_64", not(test)))]
 static THREAD_STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Start the independent heartbeat thread of a freestanding service whose

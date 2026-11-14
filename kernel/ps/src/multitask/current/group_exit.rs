@@ -32,6 +32,29 @@ pub(in crate::multitask) fn request_marked(
     Some((pending.publish(pid, Reason::Terminated { requested_by_pid }), true))
 }
 
+/// Fault-time publication of the thread-group exit. The faulting thread is a
+/// member and stays one; the caller stops it itself. IF-clear and non-waiting:
+/// the durable row is serviced by `service_deferred`. A concurrent admission
+/// holding the unpublished seal is non-yielding on its CPU, so a short bounded
+/// spin waits it out. Returns whether a group exit is queued for the process.
+pub(in crate::multitask) fn publish_for_fault(
+    handle: crate::multitask::process_table::ProcessHandle,
+    slot: usize,
+    task_id: u64,
+    process_id: u64,
+) -> bool {
+    for _ in 0..100_000 {
+        if exit_membership::queued_for(handle).is_some() { return true; }
+        if let Some(pending) = PendingExit::begin(handle, (slot, task_id)) {
+            let _ = pending.publish(process_id, Reason::Terminated { requested_by_pid: None });
+            return true;
+        }
+        if !exit_membership::publication_in_flight(handle) { return false; }
+        core::hint::spin_loop();
+    }
+    false
+}
+
 pub(super) fn terminate(pid: u64) -> bool {
     terminate_marked(pid).is_some()
 }

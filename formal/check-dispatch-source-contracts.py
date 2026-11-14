@@ -852,7 +852,8 @@ lifecycle_cleanup = body(Path('kernel/compat/src/user/syscall/linux/lifecycle_br
     'service_retired_task_runtime_cleanup')
 ordered(lifecycle_cleanup, ['multitask::next_retired_task_cleanup()',
     'retired_process_fault_vector(', 'cleanup.process_terminal(), cleanup.user_fault_vector()',
-    'super::record_linux_process_fault_termination(cleanup.process_id(), vector)',
+    'super::record_linux_process_fault_termination(',
+    'cleanup.process_id(), vector, cleanup.fault_status_sealed(),',
     'cleanup_retired_task_runtime_state(', 'multitask::complete_retired_task_cleanup(cleanup)'],
     'interruptible runtime consumer records exact original final fault before cleanup ACK')
 original = current_terminal[current_terminal.index("impl<'scope, 'irq> OriginalCurrent"):current_terminal.index('pub(in crate::multitask) fn fault')]

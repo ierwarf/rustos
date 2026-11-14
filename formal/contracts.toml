@@ -2724,6 +2724,41 @@ models = [
 ]
 
 [[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/checkpoint_journal_ops.rs"
+models = [
+    "post-init-supervisor-recovery/PostInitSupervisorRecovery",
+    "service-call-authority/ServiceCallAuthority",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/early_system_broker_ops.rs"
+models = [
+    "service-call-authority/ServiceCallAuthority",
+    "vfs-open-description-recovery/VfsOpenDescriptionRecovery",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/library_map_probe_ops.rs"
+models = [
+    "commercial-service-envelope/CommercialServiceEnvelope",
+    "page-table-lifecycle/PageTableLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/prctl_ops.rs"
+models = [
+    "lifecycle-execution-claim/LifecycleExecutionClaim",
+    "process-lifecycle-transaction/ProcessLifecycleTransaction",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/service_policy_ops.rs"
+models = [
+    "post-init-bootstrap-barrier/PostInitBootstrapBarrier",
+    "service-call-authority/ServiceCallAuthority",
+]
+
+[[source_mappings]]
 path = "kernel/ps/src/user/memfd.rs"
 models = [
     "page-table-lifecycle/PageTableLifecycle",

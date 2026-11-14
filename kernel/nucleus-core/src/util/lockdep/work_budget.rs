@@ -61,8 +61,10 @@ static ACTIVE_BUDGET_DEPTHS: [[AtomicU32; MAX_LOCK_CLASSES]; MAX_TRACKED_CPUS] =
 
 /// Shipping budget registration. Adding a new `declare` class requires adding
 /// it here; `declare` fails closed if the call site and this mask diverge.
+#[cfg(any(rustos_boot_image, test))]
 const SHIPPING_BUDGET_CLASS_MASK: u64 = 1_u64 << (LockClass::ProcessState as u8);
 
+#[cfg(any(rustos_boot_image, test))]
 #[inline]
 const fn is_shipping_budget_class(class: u8) -> bool {
     SHIPPING_BUDGET_CLASS_MASK & (1_u64 << class) != 0
@@ -106,7 +108,7 @@ pub(crate) fn charge_acquire(cpu: usize, class_index: usize) {
 /// classes that have no shipping cost budget. Diagnostic builds still census
 /// every class.
 #[inline]
-#[cfg(not(test))]
+#[cfg(rustos_boot_image)]
 pub(crate) fn charge_acquire_for_class<const CLASS: u8>(cpu: usize) {
     #[cfg(rustos_lock_phase_profile)]
     charge_acquire(cpu, usize::from(CLASS));
@@ -179,7 +181,7 @@ pub fn select_site_census_class(class_index: usize) {
 /// Charges one acquisition of `class_index` to `caller` when that class is the
 /// selected one. A direct-mapped bucket keeps the common case one line.
 #[inline]
-#[cfg(not(test))]
+#[cfg(rustos_boot_image)]
 pub(crate) fn charge_site(class_index: usize, caller: &'static Location<'static>) {
     if !cfg!(rustos_lock_phase_profile) {
         return;

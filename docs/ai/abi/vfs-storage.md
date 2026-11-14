@@ -600,20 +600,21 @@ claims made by the read-only accelerator.
   but does not print a per-input-pulse line while a pointer moves. Input state
   remains in the service-owned queue and its readiness generation; eliminating
   that debug-console work cannot alter delivery, wake, or compositor policy.
-- Storaged may satisfy repeated FAT metadata and executable reads from at most
-  eight validated 64-KiB read-ahead windows (512 KiB total), but it first
+- Storaged may satisfy repeated FAT metadata and executable reads from at
+  most forty validated 64-KiB read-ahead windows (2.5 MiB total), but it first
   revalidates live DVM geometry and the exact caller generation on every
-  request. A hit must be wholly contained in one exact-generation window. A
-  first or noncontiguous miss submits one forward window. Only a later miss at
-  that exact window boundary may submit up to two contiguous forward windows,
-  each no larger than one fixed DVM slot, before waiting for the first
-  completion. The batch leaves headroom in the eight-window cache for
-  interleaved FAT metadata and limits each completion batch to 128 KiB.
-  This uses the transport's bounded queue for proven sequential demand without
-  turning random FAT metadata probes into full-cache speculative reads. No
-  window is published to the cache until the complete batch succeeds; submit
-  failure cancels every issued ticket and completion failure cancels the
-  remaining tickets and clears the cache epoch.
+  request. A hit is assembled from one or more contiguous exact-generation
+  windows (bulk requests are 63488 B and never align to a 64-KiB window). A
+  partial hit reads only the uncovered tail. A first or noncontiguous miss
+  submits one forward window. A miss whose first uncovered block equals the
+  exact preceding read-ahead end may submit up to sixteen contiguous forward
+  windows (1 MiB), each no larger than one fixed DVM slot, before waiting for
+  the first completion; the 64-entry transport queue overlaps device latency
+  for proven sequential demand. A refused speculative submit is dropped once
+  the demanded range is covered; a refused demanded submit cancels every
+  issued ticket. No window is published to the cache until the complete batch
+  succeeds; completion failure cancels the remaining tickets and clears the
+  cache epoch.
   overlapping replacements cannot coexist, a different generation atomically
   replaces the complete cache epoch, and every write clears all windows before
   submission. Transport-info failure also clears them. Cached bytes therefore

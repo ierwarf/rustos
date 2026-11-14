@@ -67,7 +67,7 @@ pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
                 return 0;
             }
             Err(LINUX_ETIMEDOUT) => {
-                if current_wait_was_interrupted() {
+                if current_wait_interrupted() {
                     return linux_errno(LINUX_EINTR);
                 }
                 multitask::cond_resched();
@@ -83,7 +83,7 @@ pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
         {
             return 0;
         }
-        if current_wait_was_interrupted() {
+        if current_wait_interrupted() {
             return linux_errno(LINUX_EINTR);
         }
         let Some(task_id) = multitask::current_task_id() else {
@@ -113,7 +113,7 @@ pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
             }
             Err(LINUX_ETIMEDOUT) => {
                 super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
-                if current_wait_was_interrupted() {
+                if current_wait_interrupted() {
                     return linux_errno(LINUX_EINTR);
                 }
                 multitask::cond_resched();
@@ -151,10 +151,13 @@ pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
             let _ = multitask::cancel_block_current_task();
             continue;
         }
-        if current_wait_was_interrupted() {
+        if has_unmasked_pending_signal() {
             super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
             let _ = multitask::cancel_block_current_task();
-            return linux_errno(LINUX_EINTR);
+            if current_wait_interrupted() {
+                return linux_errno(LINUX_EINTR);
+            }
+            continue;
         }
         if let Some(deadline) = deadline_tick
             && !crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline)
@@ -174,7 +177,7 @@ pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
         }
         super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
         crate::arch::rtc::disarm_sleep_waiter(task_id);
-        if current_wait_was_interrupted() {
+        if current_wait_interrupted() {
             return linux_errno(LINUX_EINTR);
         }
     }
@@ -228,7 +231,7 @@ fn collect_poll_readiness(
             .ok_or(LINUX_EFAULT)?;
         let mut raw = [0_u8; POLLFD_SIZE];
         usermem::copy_from_current_user_exact(entry_ptr, &mut raw)
-            .map_err(address_space_error_to_linux_errno)?;
+            .map_err(user_pointer_error_to_linux_errno)?;
         let (fd, events) = decode_pollfd(&raw)?;
         let route = if fd < 0 {
             PollRoute::Done(0)
@@ -274,7 +277,7 @@ fn collect_poll_readiness(
         let revents_bytes = (entry.revents as i16).to_le_bytes();
         if entry.raw[6..8] != revents_bytes {
             usermem::write_current_user_bytes(entry.ptr + 6, &revents_bytes)
-                .map_err(address_space_error_to_linux_errno)?;
+                .map_err(user_pointer_error_to_linux_errno)?;
         }
     }
     if state.observations.len()
@@ -613,7 +616,7 @@ fn waitset_input_object_id(access: u16) -> u64 {
     }
 }
 
-fn current_wait_was_interrupted() -> bool {
+fn has_unmasked_pending_signal() -> bool {
     multitask::current_linux_thread_state()
         .is_some_and(|state| state.pending_signals & !state.signal_mask != 0)
 }
@@ -699,7 +702,7 @@ pub fn syscall_linux_ppoll(
     } else {
         let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(timeout_ptr) {
             Ok(ts) => ts,
-            Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+            Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
         };
         if let Err(errno) = process_time::validate_relative_sleep_timespec_locally(ts) {
             return linux_errno(errno);
@@ -739,7 +742,7 @@ fn with_temporary_wait_signal_mask(
     }
     let requested = match usermem::read_current_user_struct::<u64>(sigmask_ptr) {
         Ok(mask) => sanitize_wait_signal_mask(mask),
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     let previous = multitask::with_current_user_process_and_linux_thread_state_mut(
         |_, _, _, _, thread_state| {
@@ -873,7 +876,7 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
             }
             let (events, data) = match read_linux_epoll_event(event_ptr) {
                 Ok(event) => event,
-                Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+                Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
             };
             // Linux: EPOLLEXCLUSIVE is ADD-only and combines only with the
             // bits that make a wake-one hint meaningful. An interest added
@@ -894,6 +897,10 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
     }
 
     request.payload_len = WAITSET_INTEREST_SIZE as u32;
+    // SAFETY: `wire` is a live local `#[repr(C)]` WaitSetInterestWire made only of
+    // integers with no padding (u16,u16,u32 then u64/u32 fields, 48 bytes), so all
+    // WAITSET_INTEREST_SIZE bytes are initialized; the byte view is read-only and
+    // dies before `wire` is touched again.
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&wire as *const WaitSetInterestWire).cast::<u8>(),
@@ -964,7 +971,7 @@ pub fn syscall_linux_epoll_wait(
     if let Err(err) =
         usermem::validate_current_user_write_buffer(events_ptr, maxevents * EPOLL_EVENT_SIZE)
     {
-        return linux_errno(address_space_error_to_linux_errno(err));
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     let epoll = match epoll_handle_or_errno(epfd) {
         Ok(epoll) => epoll,
@@ -988,7 +995,7 @@ pub fn syscall_linux_epoll_wait(
                 return 0;
             }
             Err(LINUX_ETIMEDOUT) => {
-                if current_wait_was_interrupted() {
+                if current_wait_interrupted() {
                     return linux_errno(LINUX_EINTR);
                 }
                 multitask::cond_resched();
@@ -1008,7 +1015,7 @@ pub fn syscall_linux_epoll_wait(
         {
             return 0;
         }
-        if current_wait_was_interrupted() {
+        if current_wait_interrupted() {
             return linux_errno(LINUX_EINTR);
         }
 
@@ -1036,7 +1043,7 @@ pub fn syscall_linux_epoll_wait(
             }
             Err(LINUX_ETIMEDOUT) => {
                 super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
-                if current_wait_was_interrupted() {
+                if current_wait_interrupted() {
                     return linux_errno(LINUX_EINTR);
                 }
                 multitask::cond_resched();
@@ -1082,10 +1089,13 @@ pub fn syscall_linux_epoll_wait(
             let _ = multitask::cancel_block_current_task();
             continue;
         }
-        if current_wait_was_interrupted() {
+        if has_unmasked_pending_signal() {
             super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
             let _ = multitask::cancel_block_current_task();
-            return linux_errno(LINUX_EINTR);
+            if current_wait_interrupted() {
+                return linux_errno(LINUX_EINTR);
+            }
+            continue;
         }
         if let Some(deadline) = deadline_tick
             && !crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline)
@@ -1103,7 +1113,7 @@ pub fn syscall_linux_epoll_wait(
             }
         }
         acknowledge_epoll_wait_block(task_id);
-        if current_wait_was_interrupted() {
+        if current_wait_interrupted() {
             return linux_errno(LINUX_EINTR);
         }
     }
@@ -1620,7 +1630,7 @@ fn write_epoll_ready_events(events_ptr: u64, ready: &[(u32, u64)]) -> u64 {
             return linux_errno(LINUX_EFAULT);
         };
         if let Err(err) = write_linux_epoll_event(entry_ptr, events, data) {
-            return linux_errno(address_space_error_to_linux_errno(err));
+            return linux_errno(user_pointer_error_to_linux_errno(err));
         }
     }
     ready.len() as u64

@@ -1,0 +1,25 @@
+id = "faultprobe"
+kind = "app"
+execution_domain = "user"
+startup = "session"
+
+[build]
+builder = "c-demo"
+source = "fault_probe.c"
+extra_args = ["-pthread"]
+
+[install]
+path = "apps/faultprobe/faultprobe.elf"
+
+# In-guest checker for process-group fault semantics: a fault in any thread
+# kills the whole group exactly once, leader-retired groups stay killable, and
+# fault vs exit_group never double-reports. Session program: runs only when
+# `cargo xtask kvm-smoke --fault-probe` wrote the private contract file.
+# Reports `fault-probe: <case> ok` and `fault-probe: all passed` /
+# `fault-probe: FAIL <case>` on the kernel debug channel.
+[[desktop.entries]]
+display_name = "Fault probe"
+weight_micros = 100
+logical_admin = false
+console_hosted = false
+no_display = true

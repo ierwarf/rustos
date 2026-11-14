@@ -463,6 +463,8 @@ const NANOS_TO_TICKS_MULT: u64 = {
 pub fn ticks() -> u64 {
     let nanos = crate::arch::clock::monotonic_nanos_coarse();
     if nanos == 0 && crate::arch::clock::current_source().is_none() {
+        // ORDERING: Acquire pairs with the AcqRel `fetch_add` in `on_interrupt`; this is
+        // only the pre-clocksource fallback, and the count itself is the whole payload.
         return RTC_TICKS.load(Ordering::Acquire);
     }
     crate::arch::clock::scale_by_nanos_mult(nanos, NANOS_TO_TICKS_MULT)
@@ -497,6 +499,8 @@ pub const fn ticks_per_second() -> u64 {
 }
 
 pub fn is_initialized() -> bool {
+    // ORDERING: Acquire pairs with the Release store in `init` (below): a caller
+    // that sees `true` also sees the CMOS register programming that preceded it.
     RTC_INITIALIZED.load(Ordering::Acquire)
 }
 
@@ -519,11 +523,16 @@ pub fn init() {
         enable_nmi();
     });
 
+    // ORDERING: Release publishes the completed CMOS setup (done under `CMOS_LOCK`
+    // with interrupts off) to `is_initialized` Acquire loads; it is set once.
     RTC_INITIALIZED.store(true, Ordering::Release);
 }
 
 pub fn on_interrupt() {
     let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
+    // ORDERING: AcqRel on the edge counter, whose only writer is this IRQ leaf; it
+    // pairs with Acquire loads in `ticks` and the uptime path. The count is the
+    // whole payload, so the strength is conservative on a cold diagnostic path.
     let interrupt_count = RTC_TICKS.fetch_add(1, Ordering::AcqRel).saturating_add(1);
     // A timer may interrupt the narrow acquisition/release window of any raw
     // lock. Preserve hardware accounting and acknowledgement, but defer
@@ -537,15 +546,21 @@ pub fn on_interrupt() {
     // (re-entrance or a missed completion). In the steady state delta is
     // always 1 — logging that every few ticks dominates the debugcon stream
     // (≈90% of boot output) without adding signal.
+    // ORDERING: Acquire pairs with the AcqRel `fetch_add` that ends the previous
+    // handler below, so `inflight` reflects only handlers truly still running.
     let completed = RTC_TICKS_COMPLETED.load(Ordering::Acquire);
     let inflight = interrupt_count.saturating_sub(completed);
     if inflight > 1 {
+        // ORDERING: Acquire reads the last printed tick, written by the AcqRel CAS
+        // below on whichever CPU printed last; it only rate-limits a diagnostic line.
         let last_diag_tick = RTC_LAST_DIAG_PRINT_TICK.load(Ordering::Acquire);
         if interrupt_count.saturating_sub(last_diag_tick) >= 4
             && RTC_LAST_DIAG_PRINT_TICK
                 .compare_exchange(
                     last_diag_tick,
                     interrupt_count,
+                    // ORDERING: CAS elects exactly one printer per 4-tick window; AcqRel on success,
+                    // Acquire on failure to re-read the winner's tick. No data rides on the CAS.
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
@@ -570,6 +585,8 @@ pub fn on_interrupt() {
         let _cmos = CMOS_LOCK.lock();
         let _ = cmos_read(RTC_REG_C);
     }
+    // ORDERING: AcqRel marks this edge fully handled (CMOS register C acked); it
+    // pairs with the Acquire load in the next edge's in-flight check above.
     RTC_TICKS_COMPLETED.fetch_add(1, Ordering::AcqRel);
 }
 
@@ -588,8 +605,12 @@ pub fn service_clock_event() {
     let now_ticks = ticks();
     wake_ready_sleepers(now_ticks);
     let current_second = crate::arch::clock::monotonic_nanos() / 1_000_000_000;
+    // ORDERING: Acquire pairs with the AcqRel CAS in `drain_pending_heartbeat`,
+    // the only writer, so a drained second is never re-marked as pending.
     let last_reported_second = RTC_LAST_ALIVE_SECOND.load(Ordering::Acquire);
     if current_second != last_reported_second {
+        // ORDERING: Release publishes the pending second to the Acquire load in
+        // `drain_pending_heartbeat`; the value is the only payload (no pointers).
         HEARTBEAT_PENDING_SECOND.store(current_second, Ordering::Release);
     }
 }
@@ -598,15 +619,21 @@ pub fn service_clock_event() {
 /// be called outside IRQ context — the housekeeping task is the intended
 /// caller. Returns the number of seconds drained.
 pub fn drain_pending_heartbeat() -> usize {
+    // ORDERING: Acquire pairs with the Release store in `service_clock_event`
+    // that marked this second pending.
     let pending = HEARTBEAT_PENDING_SECOND.load(Ordering::Acquire);
     if pending == u64::MAX {
         return 0;
     }
+    // ORDERING: Acquire reads the last reported second; its writer is the CAS
+    // below, so concurrent drainers agree on one reported value.
     let last_reported = RTC_LAST_ALIVE_SECOND.load(Ordering::Acquire);
     if pending == last_reported {
         return 0;
     }
     if RTC_LAST_ALIVE_SECOND
+        // ORDERING: AcqRel CAS elects a single drainer per second (losers return 0);
+        // failure Acquire re-reads the winner's value. Only the second number moves.
         .compare_exchange(last_reported, pending, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
@@ -628,15 +655,21 @@ fn emit_heartbeat_log(current_second: u64) {
     let linux_input_lock_last_seq = snapshot.linux_input_lock_last_seq;
     let input_packet_delta = input_snapshot.pointer_packet_submits.saturating_sub(
         RTC_LAST_INPUT_PACKET_SUBMIT_COUNT
+            // ORDERING: AcqRel swap takes the previous packet-count sample atomically for
+            // the delta; only the heartbeat drain winner (CAS above) calls this, and the
+            // counter is a diagnostic with no dependent data.
             .swap(input_snapshot.pointer_packet_submits, Ordering::AcqRel),
     );
     let input_read_call_delta = input_snapshot.read_calls.saturating_sub(
+        // ORDERING: same single-consumer diagnostic swap, for the read-call count.
         RTC_LAST_INPUT_READ_CALL_COUNT.swap(input_snapshot.read_calls, Ordering::AcqRel),
     );
     let input_read_event_delta = input_snapshot.read_events.saturating_sub(
+        // ORDERING: same single-consumer diagnostic swap, for the read-event count.
         RTC_LAST_INPUT_READ_EVENT_COUNT.swap(input_snapshot.read_events, Ordering::AcqRel),
     );
     let linux_irq_depth_delta = (linux_irq_total_depth as u64).saturating_sub(
+        // ORDERING: same single-consumer diagnostic swap, for the Linux IRQ lock depth.
         RTC_LAST_LINUX_IRQ_LOCK_DEPTH.swap(linux_irq_total_depth as u64, Ordering::AcqRel),
     );
     crate::debug::info!(

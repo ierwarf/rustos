@@ -168,27 +168,36 @@ impl DvmBlockState {
         if self.revoked {
             return Err(DvmBlockError::Revoked);
         }
+        // ORDERING: Acquire loads of the shared header words, which the DVM writes. FLAGS carries DVM_READY, which the DVM
+        // publishes with release semantics (wire contract) after finishing its setup, so observing it also observes that setup. The immutable words
+        // are re-checked against the signed geometry on every admission.
         let flags = load_u32(self.base, FLAGS_OFFSET, Ordering::Acquire);
         let expected_fixed_flags = self.geometry.flags & !DVM_BLOCK_FLAG_DVM_READY;
+        // ORDERING: Acquire load of the immutable magic word; same pairing as the flags load above.
         let immutable_header_matches = load_u64(self.base, 0, Ordering::Acquire)
             == u64::from_le_bytes(DVM_BLOCK_MAGIC)
+            // ORDERING: Acquire loads of immutable header words, same pairing as the flags load above; any change revokes.
             && load_u32(self.base, 8, Ordering::Acquire) == DVM_BLOCK_VERSION
             && load_u32(self.base, 12, Ordering::Acquire) == DVM_BLOCK_HEADER_BYTES
             && load_u64(self.base, REGION_BYTES_OFFSET, Ordering::Acquire)
                 == self.geometry.region_bytes
+            // ORDERING: Acquire loads of immutable geometry words (queue depth, data slot size), same pairing.
             && load_u32(self.base, QUEUE_DEPTH_OFFSET, Ordering::Acquire)
                 == self.geometry.queue_depth
             && load_u32(self.base, DATA_SLOT_BYTES_OFFSET, Ordering::Acquire)
                 == self.geometry.data_slot_bytes
+            // ORDERING: Acquire loads of immutable features, generation and capacity words, same pairing.
             && load_u64(self.base, FEATURES_OFFSET, Ordering::Acquire) == self.geometry.features
             && load_u64(self.base, GENERATION_OFFSET, Ordering::Acquire)
                 == self.geometry.generation
             && load_u64(self.base, CAPACITY_SECTORS_OFFSET, Ordering::Acquire)
                 == self.geometry.capacity_sectors
+            // ORDERING: Acquire loads of immutable block-size words, same pairing.
             && load_u32(self.base, LOGICAL_BLOCK_SIZE_OFFSET, Ordering::Acquire)
                 == self.geometry.logical_block_size
             && load_u32(self.base, PHYSICAL_BLOCK_SIZE_OFFSET, Ordering::Acquire)
                 == self.geometry.physical_block_size
+            // ORDERING: Acquire load of the reserved word, which must stay zero.
             && load_u32(self.base, RESERVED_OFFSET, Ordering::Acquire) == 0;
         if !immutable_header_matches {
             self.revoke(DvmBlockRevokeReason::HeaderImmutableMismatch);
@@ -257,6 +266,8 @@ impl DvmBlockState {
             return Err(DvmBlockError::Revoked);
         }
         let inject_device_fault = inject_fault(operation);
+        // ORDERING: Acquire pairs with the DVM's Release store of the request consumer cursor, issued after it finished
+        // reading that ring record and data slot, so the slot may be overwritten once the cursor passed it.
         let consumer = load_u64(self.base, REQUEST_CONSUMER_OFFSET, Ordering::Acquire);
         if self.request_producer < consumer
             || self.request_producer.saturating_sub(consumer) >= u64::from(DVM_BLOCK_QUEUE_DEPTH)
@@ -318,6 +329,9 @@ impl DvmBlockState {
         self.next_request_id = next_request_id;
         self.next_operation_id = next_operation_id;
         if let Some(destination) = data_destination {
+            // SAFETY: `destination` came from data_slot(), which bounds the slot (data_slot_bytes) inside the 8 MiB aperture, and
+            // request.is_valid_for(header) bounded data_len by it. STATE is held, the slot is free (pending[slot] was None and the
+            // ring has room), and the DVM only reads it after the producer cursor is published; `data` is a distinct kernel slice.
             unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), destination, data.len()) };
         }
         self.pending[slot] = Some(PendingRequest {
@@ -333,6 +347,8 @@ impl DvmBlockState {
             self.base,
             REQUEST_PRODUCER_OFFSET,
             self.request_producer,
+            // ORDERING: Release publishes the data slot bytes and request record written above to the DVM's Acquire load of
+            // the request producer cursor; the single producer (this STATE holder) writes it.
             Ordering::Release,
         );
         self.signal_request();
@@ -345,9 +361,12 @@ impl DvmBlockState {
 
     fn signal_request(&self) {
         debug_assert!(!self.doorbell.is_null());
+        // ORDERING: SeqCst fence orders the producer-cursor store ahead of the doorbell MMIO write that wakes the DVM.
         core::sync::atomic::fence(Ordering::SeqCst);
         let value =
             ivshmem_doorbell_value(BLOCK_DVM_PEER_ID, BLOCK_DVM_REQUEST_VECTOR_INDEX).to_le();
+        // SAFETY: `doorbell` is the uncached BAR0 register mapping admitted at install (registers.size covers the 4-byte
+        // write at IVSHMEM_DOORBELL_OFFSET), kept for the kernel lifetime and aligned by the page-aligned mapping; volatile MMIO.
         unsafe {
             self.doorbell
                 .add(IVSHMEM_DOORBELL_OFFSET)
@@ -357,8 +376,12 @@ impl DvmBlockState {
     }
 
     fn drain_completions(&mut self) -> Result<(), DvmBlockError> {
+        // ORDERING: AcqRel swap consumes the interrupt hint before the completion cursor is read, so an edge arriving after
+        // the swap leaves the hint set for the next drain; Release partner is block_ring_interrupt.
         let irq_was_pending = IRQ_PENDING.swap(false, Ordering::AcqRel);
         let _ = self.current_header()?;
+        // ORDERING: Acquire pairs with the DVM's Release store of the completion producer cursor, issued after it wrote the
+        // completion record and any read data into its data slot.
         let producer = load_u64(self.base, COMPLETION_PRODUCER_OFFSET, Ordering::Acquire);
         if producer < self.completion_consumer
             || producer.saturating_sub(self.completion_consumer) > u64::from(DVM_BLOCK_QUEUE_DEPTH)
@@ -368,6 +391,7 @@ impl DvmBlockState {
         }
         if producer > self.completion_consumer
             && FIRST_COMPLETION_REPORTED
+                // ORDERING: once-only diagnostic latch. No data is published through it; AcqRel is stronger than needed.
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
@@ -418,6 +442,8 @@ impl DvmBlockState {
                 self.base,
                 COMPLETION_CONSUMER_OFFSET,
                 self.completion_consumer,
+                // ORDERING: Release publishes that the completion record was consumed, so the DVM may reuse the ring slot; the data
+                // slot is not freed by this cursor (it stays reserved by `pending` until finish).
                 Ordering::Release,
             );
             if cancelled {
@@ -441,6 +467,7 @@ impl DvmBlockState {
         match self.current_header() {
             Ok(_) if !readiness_was_observed => true,
             Ok(_) => {
+                // ORDERING: Acquire pairs with the DVM's Release store of the completion producer cursor.
                 let producer = load_u64(self.base, COMPLETION_PRODUCER_OFFSET, Ordering::Acquire);
                 producer != self.completion_consumer
             }
@@ -483,6 +510,9 @@ impl DvmBlockState {
                         return Err(DvmBlockError::Invalid);
                     }
                     let source = data_slot(self, slot).ok_or(DvmBlockError::Protocol)?;
+                    // SAFETY: `source` came from data_slot() (bounded inside the aperture), len == request.data_len <= data_slot_bytes and
+                    // out.len() == len was checked. The completion for this ticket was accepted after an Acquire of the producer cursor, so the
+                    // DVM finished writing the slot, and `pending[slot]` keeps it reserved until finish; `out` is a distinct kernel buffer.
                     unsafe { core::ptr::copy_nonoverlapping(source, out.as_mut_ptr(), len) };
                     Ok(DvmBlockPoll::Completed(len))
                 } else if out.is_empty() {
@@ -563,11 +593,14 @@ fn report_peer_ready_observation(generation: u64) {
         nucleus_core::debug::LogCategory::Storage,
         "dvm-block-peer-ready",
         generation,
+        // ORDERING: diagnostic-only Acquire loads of the interrupt statistics; they pair with the stores in install and
+        // block_ring_interrupt but no decision depends on them.
         IRQ_COUNT.load(Ordering::Acquire),
     );
     nucleus_core::debug::write_debugcon_only_line(
         alloc::format!(
             "dvm-block: peer ready observed irq_count={} irq_pending={} vector={:#x}",
+            // ORDERING: diagnostic-only Acquire loads of the interrupt statistics.
             IRQ_COUNT.load(Ordering::Acquire),
             IRQ_PENDING.load(Ordering::Acquire),
             IRQ_VECTOR.load(Ordering::Acquire),
@@ -597,6 +630,7 @@ fn report_first_completion_observation(
             "dvm-block: first completion observed producer={} consumer={} irq_count={} irq_was_pending={}",
             producer,
             consumer,
+            // ORDERING: diagnostic-only Acquire load of the interrupt count.
             IRQ_COUNT.load(Ordering::Acquire),
             irq_was_pending,
         )
@@ -614,6 +648,7 @@ fn report_first_completion_observation(
 }
 
 pub(crate) fn try_install() -> bool {
+    // ORDERING: Acquire pairs with the Release store of INSTALLED; STATE is taken under its lock for any use.
     if INSTALLED.load(Ordering::Acquire) {
         let mut guard = STATE.lock();
         return guard.as_mut().is_some_and(|state| {
@@ -624,11 +659,13 @@ pub(crate) fn try_install() -> bool {
             }
         });
     }
+    // ORDERING: Acquire pairs with the Release store of the sticky TOPOLOGY_ABSENT verdict.
     if TOPOLOGY_ABSENT.load(Ordering::Acquire) {
         return false;
     }
     let mut guard = STATE.lock();
     if guard.is_some() {
+        // ORDERING: Release republishes INSTALLED for a racing installer that populated STATE first.
         INSTALLED.store(true, Ordering::Release);
         return true;
     }
@@ -737,6 +774,7 @@ pub(crate) fn try_install() -> bool {
         let topology_absent =
             fixed_pci_topology_lacks_block_aperture(candidate_count, matching_shape_count);
         if topology_absent {
+            // ORDERING: Release publishes the sticky topology verdict; no data depends on it.
             TOPOLOGY_ABSENT.store(true, Ordering::Release);
         }
         let diagnostic = if let Some((start, size, is_io, prefetchable, is_64bit)) =
@@ -811,6 +849,7 @@ pub(crate) fn try_install() -> bool {
         state.geometry.capacity_sectors,
     );
     *guard = Some(state);
+    // ORDERING: Release publishes INSTALLED after STATE was populated (the guard is released after this store).
     INSTALLED.store(true, Ordering::Release);
     interrupt_install.retain_permanent();
     true
@@ -855,6 +894,7 @@ fn try_rebind_signed_epoch_with_key(state: &mut DvmBlockState, key_bytes: [u8; 3
     }
     let mut replacement = DvmBlockState::new(base, doorbell, header);
     replacement.geometry.flags |= DVM_BLOCK_FLAG_RUSTOS_READY;
+    // ORDERING: Release clears the stale interrupt hint of the previous epoch before the new epoch is signalled.
     IRQ_PENDING.store(false, Ordering::Release);
     replacement.signal_request();
     #[cfg(not(test))]
@@ -895,6 +935,8 @@ fn verify_epoch_signature_with_key(header: DvmBlockHeader, key_bytes: [u8; 32]) 
 
 fn epoch_signature_matches(base: *mut u8, expected: &[u8; 64]) -> bool {
     expected.iter().enumerate().all(|(offset, expected)| {
+        // SAFETY: `offset < 64` lies inside the header (EPOCH_SIGNATURE_OFFSET + 64 <= header size) of the admitted aperture;
+        // the bytes are DVM-writable, so the read is volatile and compared, never trusted.
         (unsafe { core::ptr::read_volatile(base.add(EPOCH_SIGNATURE_OFFSET + offset)) })
             == *expected
     })
@@ -990,6 +1032,8 @@ pub(crate) fn finish(ticket: DvmBlockTicket) -> Result<(), DvmBlockError> {
 }
 
 pub(crate) fn completion_or_fault_pending() -> bool {
+    // ORDERING: Acquire pairs with the Release store in block_ring_interrupt. The interrupt carries no data; completion
+    // data is read through the Acquire cursor loads under STATE.
     if IRQ_PENDING.load(Ordering::Acquire) {
         return true;
     }
@@ -1005,15 +1049,20 @@ pub(crate) fn arm_waiter(task_id: u64) -> bool {
         return false;
     }
     for slot in &WAITERS {
+        // ORDERING: Acquire/AcqRel on waiter slots. A slot holds only a task id; arm_waiter's CAS precedes the caller's
+        // recheck of the ring, and block_ring_interrupt stores IRQ_PENDING (Release) before swapping the slots. The no-lost-wakeup
+        // argument for that store->load pattern rests on x86 locked RMWs being full barriers (x86_64-only transport).
         let existing = slot.load(Ordering::Acquire);
         if existing == task_id {
             return true;
         }
         if existing != 0 && !crate::multitask::is_user_task_alive(existing) {
+            // ORDERING: AcqRel CAS frees a slot whose task died; only this slot's task id changes, the id publishes no other data.
             let _ = slot.compare_exchange(existing, 0, Ordering::AcqRel, Ordering::Acquire);
         }
     }
     WAITERS.iter().any(|slot| {
+        // ORDERING: AcqRel CAS claims a free waiter slot so the interrupt's swap sees this task; the registration precedes the caller's ring recheck.
         slot.compare_exchange(0, task_id, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     })
@@ -1023,6 +1072,7 @@ pub(crate) fn disarm_waiter(task_id: u64) -> bool {
     let mut removed = false;
     for slot in &WAITERS {
         removed |= slot
+            // ORDERING: AcqRel CAS removes exactly this task's registration; no other data depends on it.
             .compare_exchange(task_id, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
     }
@@ -1031,6 +1081,7 @@ pub(crate) fn disarm_waiter(task_id: u64) -> bool {
 
 fn wake_waiters() {
     for slot in &WAITERS {
+        // ORDERING: AcqRel swap takes each waiter registration once, so one wake is delivered per registration.
         let task_id = slot.swap(0, Ordering::AcqRel);
         if task_id != 0 {
             let _ = crate::multitask::wake_task(task_id);
@@ -1040,6 +1091,7 @@ fn wake_waiters() {
 
 fn block_ring_interrupt(_vector: u8) {
     IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+    // ORDERING: Release sets the interrupt hint; see arm_waiter for the check-arm-recheck pairing.
     IRQ_PENDING.store(true, Ordering::Release);
     wake_waiters();
 }
@@ -1059,6 +1111,7 @@ fn ring_record(state: &DvmBlockState, offset: u64, sequence: u64) -> Option<*mut
     if end > state.geometry.region_bytes {
         return None;
     }
+    // SAFETY: pointer arithmetic only; `end <= region_bytes` (== the 8 MiB mapping size, enforced by header decode) was checked.
     Some(unsafe { state.base.add(start as usize) })
 }
 
@@ -1072,12 +1125,14 @@ fn data_slot(state: &DvmBlockState, slot: usize) -> Option<*mut u8> {
     if end > state.geometry.region_bytes {
         return None;
     }
+    // SAFETY: pointer arithmetic only; `end <= region_bytes` (== the 8 MiB mapping size) was checked.
     Some(unsafe { state.base.add(start as usize) })
 }
 
 fn read_header(base: *mut u8) -> Option<DvmBlockHeader> {
     let mut bytes = [0_u8; DVM_BLOCK_HEADER_RECORD_BYTES];
     for (offset, byte) in bytes.iter_mut().enumerate() {
+        // SAFETY: `offset < DVM_BLOCK_HEADER_RECORD_BYTES`, inside the admitted aperture header; volatile because the DVM may write it.
         *byte = unsafe { core::ptr::read_volatile(base.add(offset)) };
     }
     // Both rings are single-producer/single-consumer. Reading the consumer
@@ -1085,13 +1140,17 @@ fn read_header(base: *mut u8) -> Option<DvmBlockHeader> {
     // advancing its own cursor. All four fields are naturally aligned and
     // single-copy atomic by the wire contract.
     bytes[REQUEST_CONSUMER_OFFSET..REQUEST_CONSUMER_OFFSET + 8]
+        // ORDERING: Acquire loads of the cursors, consumer first then producer, so the snapshot satisfies the monotonic
+        // bounds; they pair with the DVM's and our Release cursor stores.
         .copy_from_slice(&load_u64(base, REQUEST_CONSUMER_OFFSET, Ordering::Acquire).to_le_bytes());
     bytes[COMPLETION_CONSUMER_OFFSET..COMPLETION_CONSUMER_OFFSET + 8].copy_from_slice(
         &load_u64(base, COMPLETION_CONSUMER_OFFSET, Ordering::Acquire).to_le_bytes(),
     );
     bytes[REQUEST_PRODUCER_OFFSET..REQUEST_PRODUCER_OFFSET + 8]
+        // ORDERING: Acquire loads of the request-side cursors; they pair with the Release cursor stores of both sides.
         .copy_from_slice(&load_u64(base, REQUEST_PRODUCER_OFFSET, Ordering::Acquire).to_le_bytes());
     bytes[COMPLETION_PRODUCER_OFFSET..COMPLETION_PRODUCER_OFFSET + 8].copy_from_slice(
+        // ORDERING: Acquire loads of the completion-side cursors; they pair with the DVM's and our Release cursor stores.
         &load_u64(base, COMPLETION_PRODUCER_OFFSET, Ordering::Acquire).to_le_bytes(),
     );
     DvmBlockHeader::decode(&bytes)
@@ -1100,6 +1159,8 @@ fn read_header(base: *mut u8) -> Option<DvmBlockHeader> {
 fn read_record(base: *mut u8) -> [u8; DVM_BLOCK_RECORD_BYTES] {
     let mut bytes = [0_u8; DVM_BLOCK_RECORD_BYTES];
     for (offset, byte) in bytes.iter_mut().enumerate() {
+        // SAFETY: `base` is a ring_record() pointer and `offset < DVM_BLOCK_RECORD_BYTES`, so the read stays inside the 64-byte
+        // record within the aperture; volatile because the DVM writes completion records.
         *byte = unsafe { core::ptr::read_volatile(base.add(offset)) };
     }
     bytes
@@ -1107,6 +1168,8 @@ fn read_record(base: *mut u8) -> [u8; DVM_BLOCK_RECORD_BYTES] {
 
 fn write_record(base: *mut u8, bytes: &[u8; DVM_BLOCK_RECORD_BYTES]) {
     for (offset, byte) in bytes.iter().copied().enumerate() {
+        // SAFETY: `base` is a ring_record() pointer and `offset < DVM_BLOCK_RECORD_BYTES`; the record slot is free (ring has room)
+        // and only this STATE holder writes request records, before the Release producer publication.
         unsafe { core::ptr::write_volatile(base.add(offset), byte) };
     }
 }
@@ -1152,14 +1215,18 @@ fn arm_block_ring_interrupt(device: crate::arch::pci::PciDevice) -> Option<Block
     if table.is_null() {
         return None;
     }
+    // SAFETY: `table` maps `table_len` bytes of uncached MSI-X table and table_offset + MSIX_ENTRY_BYTES <= table_len was
+    // checked above; the entry offsets are 4-byte aligned, volatile MMIO, and the mapping outlives the block.
     unsafe {
         program_msix_entry(table.add(table_offset), message);
+        // ORDERING: SeqCst fence completes programming the entry before it is unmasked.
         core::sync::atomic::fence(Ordering::SeqCst);
         table
             .add(table_offset + MSIX_ENTRY_VECTOR_CONTROL_OFFSET)
             .cast::<u32>()
             .write_volatile(0);
     }
+    // ORDERING: SeqCst fence completes the unmask before MSI-X is enabled in PCI config space.
     core::sync::atomic::fence(Ordering::SeqCst);
     capability.set_enabled(&attach, true);
     capability.set_function_masked(&attach, false);
@@ -1172,6 +1239,7 @@ fn arm_block_ring_interrupt(device: crate::arch::pci::PciDevice) -> Option<Block
 }
 
 fn load_u32(base: *mut u8, offset: usize, ordering: Ordering) -> u32 {
+    // SAFETY: pointer arithmetic only; every caller passes a fixed header-word offset inside the admitted aperture.
     let address = unsafe { base.add(offset) };
     debug_assert_eq!(address.align_offset(core::mem::align_of::<AtomicU32>()), 0);
     // SAFETY: The ABI fixes every u32 field at a naturally aligned offset in a
@@ -1181,6 +1249,7 @@ fn load_u32(base: *mut u8, offset: usize, ordering: Ordering) -> u32 {
 }
 
 fn fetch_and_u32(base: *mut u8, offset: usize, value: u32, ordering: Ordering) -> u32 {
+    // SAFETY: pointer arithmetic only; callers pass a fixed header-word offset inside the admitted aperture.
     let address = unsafe { base.add(offset) };
     debug_assert_eq!(address.align_offset(core::mem::align_of::<AtomicU32>()), 0);
     // SAFETY: See load_u32. Readiness has one RustOS writer and the peer may
@@ -1189,6 +1258,7 @@ fn fetch_and_u32(base: *mut u8, offset: usize, value: u32, ordering: Ordering) -
 }
 
 fn publish_rustos_ready(base: *mut u8, expected_flags: u32) -> bool {
+    // SAFETY: pointer arithmetic only; FLAGS_OFFSET (64) is a fixed header offset inside the admitted aperture.
     let address = unsafe { base.add(FLAGS_OFFSET) };
     debug_assert_eq!(address.align_offset(core::mem::align_of::<AtomicU32>()), 0);
     // SAFETY: The shared header contract naturally aligns the flags field and
@@ -1200,6 +1270,8 @@ fn publish_rustos_ready(base: *mut u8, expected_flags: u32) -> bool {
             .compare_exchange(
                 expected_flags,
                 expected_flags | DVM_BLOCK_FLAG_RUSTOS_READY,
+                // ORDERING: AcqRel CAS linearizes RustOS-ready against the peer's flag updates: Acquire sees its latest flags (a change
+                // fails the CAS and aborts install), Release makes our verification visible before the DVM can observe RUSTOS_READY.
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -1208,6 +1280,7 @@ fn publish_rustos_ready(base: *mut u8, expected_flags: u32) -> bool {
 }
 
 fn load_u64(base: *mut u8, offset: usize, ordering: Ordering) -> u64 {
+    // SAFETY: pointer arithmetic only; every caller passes a fixed 8-byte aligned header cursor offset inside the aperture.
     let address = unsafe { base.add(offset) };
     debug_assert_eq!(address.align_offset(core::mem::align_of::<AtomicU64>()), 0);
     // SAFETY: See load_u32. RustOS supports this transport only on little-
@@ -1216,6 +1289,7 @@ fn load_u64(base: *mut u8, offset: usize, ordering: Ordering) -> u64 {
 }
 
 fn store_u64(base: *mut u8, offset: usize, value: u64, ordering: Ordering) {
+    // SAFETY: pointer arithmetic only; callers pass the fixed request-producer or completion-consumer offset inside the aperture.
     let address = unsafe { base.add(offset) };
     debug_assert_eq!(address.align_offset(core::mem::align_of::<AtomicU64>()), 0);
     // SAFETY: See load_u64. Each cursor has exactly one writer.

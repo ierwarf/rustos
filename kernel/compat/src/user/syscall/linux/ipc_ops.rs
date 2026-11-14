@@ -383,6 +383,9 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &mut SyscallFrame) -> u64
 // capability lease checks. Ring0 keeps direct table queries only for current
 // broker authorization and service-call routing.
 pub(super) fn linux_syscall_endpoint() -> Option<KernelEndpointHandle> {
+    // ORDERING: Acquire pairs with the Release stores of LINUX_SYSCALL_ENDPOINT in
+    // registration and revoke; the raw handle is the whole payload, and every
+    // call still passes the per-call IPC authorization.
     let raw = service_endpoint_raw(linux_abi::IPC_SERVICE_LINUX_SYSCALLD)
         .unwrap_or_else(|| LINUX_SYSCALL_ENDPOINT.load(Ordering::Acquire));
     (raw != 0).then_some(KernelEndpointHandle::from_raw(raw))
@@ -424,17 +427,24 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
         clear_service_call_grants(grants.as_mut_slice(), process_id);
     }
     forget_cached_service_grants(process_id);
+    // ORDERING: the registry mutation lock serializes writers; Acquire pairs with
+    // the Release owner store made at registration.
     if SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .load(Ordering::Acquire)
         == process_id
     {
+        // ORDERING: Release pairs with the Acquire fallback load in
+        // linux_syscall_endpoint; the cleared handle is the only payload.
         LINUX_SYSCALL_ENDPOINT.store(0, Ordering::Release);
     }
     for i in 0..MAX_SERVICE_ENDPOINTS {
+        // ORDERING: Acquire pairs with the Release owner store of the registration
+        // that made this process the owner (lock held, so no concurrent writer).
         if SERVICE_ENDPOINT_OWNERS[i].load(Ordering::Acquire) == process_id {
             // Endpoint zero is the reader-visible revoke commit point. Clear
             // it before the tuple fields and advance the public epoch last,
             // matching the explicit revoke path below.
+            // ORDERING: epoch read first, then Release clears endpoint -> owner -> caps.
             let retired_epoch = SERVICE_ENDPOINT_EPOCHS[i].load(Ordering::Acquire);
             SERVICE_ENDPOINTS[i].store(0, Ordering::Release);
             SERVICE_ENDPOINT_OWNERS[i].store(0, Ordering::Release);
@@ -479,9 +489,12 @@ pub(super) fn current_process_service_capability_snapshot() -> Option<(u64, u64)
         .iter()
         .zip(SERVICE_ENDPOINT_OWNERS.iter())
         .zip(SERVICE_ENDPOINT_CAPS.iter())
+        // ORDERING: registry lock held; Acquire pairs with the Release publication
+        // stores, so an observed endpoint implies its final owner and caps.
         .filter(|((endpoint, owner), _)| {
             endpoint.load(Ordering::Acquire) != 0 && owner.load(Ordering::Acquire) == process_id
         })
+        // ORDERING: caps word read under the same lock; Acquire pairs with its Release store.
         .fold(0_u64, |caps, (_, entry_caps)| {
             caps | entry_caps.load(Ordering::Acquire)
         });
@@ -520,6 +533,8 @@ pub(crate) fn with_owned_service_lease<T>(
 ) -> Option<T> {
     let index = service_index(service_id)?;
     let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    // ORDERING: lock held, so no publish/revoke interleaves; Acquire pairs with
+    // the Release publication stores (epoch, caps, owner, endpoint last).
     let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
     let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
     let epoch = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
@@ -550,6 +565,8 @@ fn withdraw_frame_source_owner(service_id: u64, epoch: u64) {
 pub(crate) fn service_endpoint_epoch(service_id: u64) -> Option<u64> {
     let index = service_index(service_id)?;
     let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    // ORDERING: lock held, so no publish/revoke interleaves; Acquire pairs with
+    // the Release publication stores (epoch, caps, owner, endpoint last).
     let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
     let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
     let epoch = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
@@ -577,6 +594,7 @@ pub(crate) fn published_service_endpoint_owner_and_epoch(service_id: u64) -> Opt
     // snapshot never authenticates fields from different publications.
     let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
     let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
+    // ORDERING: Acquire pairs with the epoch Release in advance_service_endpoint_epoch.
     let epoch = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
     (endpoint != 0 && owner != 0 && epoch != 0).then_some((owner, epoch))
 }
@@ -660,12 +678,16 @@ fn service_authorization_is_current(authorization: ServiceCapabilityAuthorizatio
         return true;
     };
     let index = linux_abi::IPC_SERVICE_ROOTD as usize;
+    // ORDERING: caller holds the registry lock; Acquire pairs with the Release
+    // publication stores (owner before endpoint) for a coherent pair.
     let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
     let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
     rootd_authorization_epoch_matches(
         expected_epoch,
         endpoint,
         owner,
+        // ORDERING: Acquire pairs with advance_service_endpoint_epoch's Release store;
+        // the value is compared with the epoch rootd's authorization captured.
         SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire),
         multitask::is_user_process_exiting(owner),
     )
@@ -691,6 +713,8 @@ fn grant_current_process_service_call(
         return Err(LINUX_EINVAL);
     };
     let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    // ORDERING: lock held, so no publish/revoke interleaves; Acquire pairs with
+    // the Release publication stores (epoch, caps, owner, endpoint last).
     let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
     let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
     let epoch = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
@@ -831,6 +855,9 @@ fn cache_service_grant(index: usize, process_id: u64, endpoint_epoch: u64) {
 fn forget_cached_service_grants(process_id: u64) {
     for row in &SERVICE_GRANT_CACHE {
         for way in row.iter() {
+            // ORDERING: runs under the registry lock on process exit. A cache word is a
+            // self-contained packed (epoch, pid) tuple with no dependent data; Release
+            // clearing makes later Acquire hits in service_grant_cached miss.
             if way.load(Ordering::Acquire) & u64::from(u32::MAX) == process_id {
                 way.store(0, Ordering::Release);
             }
@@ -842,6 +869,9 @@ fn forget_cached_service_grants(process_id: u64) {
 fn advance_service_endpoint_epoch(index: usize) -> Result<u64, i64> {
     let current = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Relaxed);
     let next = next_service_endpoint_epoch(current).ok_or(LINUX_EOVERFLOW)?;
+    // ORDERING: Release pairs with the Acquire epoch loads of the lock-free
+    // stable_published_service_endpoint readers; the Relaxed read above is
+    // safe because the registry lock serializes every writer of this slot.
     SERVICE_ENDPOINT_EPOCHS[index].store(next, Ordering::Release);
     if current != 0 {
         multitask::drop_ipc_transfers_for_service_epoch(index as u64, current);
@@ -963,6 +993,8 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
     // Same single-owner rule as the generic registration: a live published
     // endpoint is revoked (explicitly or by its owner's exit) before another
     // registrant may replace it.
+    // ORDERING: lock held; Acquire pairs with the Release endpoint publication,
+    // so a published endpoint is observed as busy.
     if SERVICE_ENDPOINTS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize].load(Ordering::Acquire)
         != 0
     {
@@ -979,22 +1011,31 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
         drop(registry_mutation);
         return linux_errno(LINUX_EAGAIN);
     }
+    // ORDERING: publication order under the registry lock is caps, owner, epoch,
+    // then the endpoint last; each is a Release store.
     SERVICE_ENDPOINT_CAPS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .store(authorization.capability.to_wire(), Ordering::Release);
+    // ORDERING: owner Release store, as above.
     SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .store(process_id, Ordering::Release);
     if let Err(errno) =
         advance_service_endpoint_epoch(linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize)
     {
+        // ORDERING: epoch exhaustion rollback; the endpoint is still 0, so these
+        // clears only restore the unpublished tuple before the lock drops.
         SERVICE_ENDPOINT_CAPS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
             .store(0, Ordering::Release);
+        // ORDERING: owner cleared the same way.
         SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
             .store(0, Ordering::Release);
         drop(registry_mutation);
         return linux_errno(errno);
     }
+    // ORDERING: endpoint is the commit point: Release makes the caps, owner and
+    // epoch stores above visible to any Acquire reader that observes it.
     SERVICE_ENDPOINTS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .store(endpoint, Ordering::Release);
+    // ORDERING: Release mirror pairs with the Acquire fallback in linux_syscall_endpoint.
     LINUX_SYSCALL_ENDPOINT.store(endpoint, Ordering::Release);
     drop(registry_mutation);
     ipc_trace!(
@@ -1032,6 +1073,7 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
     );
     if endpoint == 0 {
         let registry_mutation = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+        // ORDERING: lock held; Acquire pairs with the Release publication stores.
         let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
         let registered_endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
         if owner == 0 && registered_endpoint == 0 {
@@ -1051,6 +1093,7 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
             );
             return linux_errno(LINUX_EPERM);
         }
+        // ORDERING: epoch read first, then Release clears endpoint -> owner -> caps.
         let retired_epoch = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
         SERVICE_ENDPOINTS[index].store(0, Ordering::Release);
         SERVICE_ENDPOINT_OWNERS[index].store(0, Ordering::Release);
@@ -1095,6 +1138,7 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         );
         return linux_errno(LINUX_ESRCH);
     }
+    // ORDERING: lock held; Acquire pairs with the Release endpoint publication.
     if SERVICE_ENDPOINTS[index].load(Ordering::Acquire) != 0 {
         drop(registry_mutation);
         record_service_endpoint_milestone(
@@ -1109,6 +1153,8 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         drop(registry_mutation);
         return linux_errno(LINUX_EAGAIN);
     }
+    // ORDERING: lock held; Acquire pairs with the Release seal store below, whose
+    // only writer is this serialized path.
     let sealed_rootd_owner = ROOTD_BOOTSTRAP_OWNER.load(Ordering::Acquire);
     if service_id == linux_abi::IPC_SERVICE_ROOTD
         && !rootd_bootstrap_owner_allows(sealed_rootd_owner, process_id)
@@ -1121,11 +1167,13 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         return linux_errno(errno);
     }
     if service_id == linux_abi::IPC_SERVICE_ROOTD && sealed_rootd_owner == 0 {
+        // ORDERING: Release seals the rootd identity; later Acquire loads see it.
         ROOTD_BOOTSTRAP_OWNER.store(process_id, Ordering::Release);
     }
     if let Some(publication) = network_publication.as_mut() {
         publication.reset_predecessor();
     }
+    // ORDERING: caps then owner Release stores precede the endpoint commit below.
     SERVICE_ENDPOINT_CAPS[index].store(authorization.capability.to_wire(), Ordering::Release);
     SERVICE_ENDPOINT_OWNERS[index].store(process_id, Ordering::Release);
     if authorization.capability.contains(ServiceCapability::PagerPolicy) {
@@ -1136,6 +1184,7 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
     }
     // Publish the endpoint last. Acquire readers that observe it also observe
     // the rootd-authorized owner and capability written above.
+    // ORDERING: Release endpoint store is the commit point for the writes above.
     SERVICE_ENDPOINTS[index].store(endpoint, Ordering::Release);
     drop(registry_mutation);
     // No packet operation can use the new owner with the predecessor lease.
@@ -1354,10 +1403,13 @@ fn service_endpoint_for_expected_process(
 ) -> Result<Option<u64>, i64> {
     let index = service_index(service_id).ok_or(LINUX_EINVAL)?;
     let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    // ORDERING: lock held; Acquire pairs with the Release endpoint publication.
     let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
     if endpoint == 0 {
         return Ok(None);
     }
+    // ORDERING: lock held, so no re-registration interleaves; Acquire pairs with
+    // the Release owner store.
     let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
     if owner != expected_pid {
         return Err(LINUX_EBUSY);
@@ -3552,6 +3604,9 @@ fn enqueue_call_and_wake_with_handles_for_task(
             // caller would spend its whole reply deadline. The rendezvous wait
             // re-checks this flag after arming, which closes that window the
             // same way the fault re-check closes the fault one.
+            // ORDERING: Release pairs with the AcqRel swap in
+            // take_pending_pager_control_request; set before the wake so the
+            // re-check after arming cannot miss it.
             PAGER_CONTROL_REQUEST_PENDING.store(true, Ordering::Release);
             true
         }
@@ -4182,48 +4237,6 @@ pub(super) fn prepare_transfer_entries_for_current_process(
         service_refs,
         committed: false,
     })
-}
-
-pub(super) fn install_transfer_entries_for_current_process(
-    entries: Vec<multitask::TransferredHandleEntry>,
-) -> Result<Vec<i32>, i64> {
-    let service_refs = service_transfer_refs(&entries);
-    let Some(fds) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        if !process_state
-            .handles()
-            .can_install_additional(entries.len())
-        {
-            return Err(LINUX_EMFILE);
-        }
-        let mut fds: Vec<i32> = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let Some(fd) = process_state.handles_mut().install_transferred(entry) else {
-                for installed in fds.iter().copied() {
-                    let _ = process_state.handles_mut().close(installed as u64);
-                }
-                return Err(LINUX_EMFILE);
-            };
-            let Ok(fd) = i32::try_from(fd) else {
-                let _ = process_state.handles_mut().close(fd);
-                for installed in fds.iter().copied() {
-                    let _ = process_state.handles_mut().close(installed as u64);
-                }
-                return Err(LINUX_EOVERFLOW);
-            };
-            fds.push(fd);
-        }
-        Ok(fds)
-    }) else {
-        super::service_ops::release_service_handle_refs_bounded(&service_refs);
-        return Err(LINUX_EINVAL);
-    };
-    match fds {
-        Ok(fds) => Ok(fds),
-        Err(errno) => {
-            super::service_ops::release_service_handle_refs_bounded(&service_refs);
-            Err(errno)
-        }
-    }
 }
 
 pub(super) fn drop_transfer_tickets(tickets: &[KernelTransferTicket]) {

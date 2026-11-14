@@ -30,10 +30,13 @@ use rustos_user_abi::syscall::{
 
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(15);
 const WAIT_SLICE_MILLIS: u64 = 1_000;
-const READ_CACHE_WINDOW_LIMIT: usize = 8;
-// A full-cache speculative batch evicts interleaved FAT metadata and delays
-// the demanded read until every unused window settles. Leave cache headroom.
-const READ_AHEAD_IN_FLIGHT_LIMIT: usize = 2;
+// Sequential streams (a miss that starts exactly at the previous read-ahead
+// frontier) keep up to READ_AHEAD_IN_FLIGHT_LIMIT 64 KiB windows outstanding in
+// the DVM virtio-blk queue (depth 64) so one completion latency is shared by the
+// whole batch. Random misses stay one window. The cache keeps headroom above a
+// full batch so interleaved metadata windows are not evicted by speculation.
+const READ_CACHE_WINDOW_LIMIT: usize = 40;
+const READ_AHEAD_IN_FLIGHT_LIMIT: usize = 16;
 const _: () = assert!(READ_AHEAD_IN_FLIGHT_LIMIT < READ_CACHE_WINDOW_LIMIT);
 static READ_CACHE: Mutex<ReadCacheSet> = Mutex::new(ReadCacheSet::new());
 // A timeout does not cancel Linux I/O. Never re-admit this process after an
@@ -146,6 +149,15 @@ impl ReadCache {
     }
 }
 
+enum Coverage {
+    Hit(Vec<u8>),
+    Partial {
+        prefix: Vec<u8>,
+        start: u64,
+        continues_read_ahead: bool,
+    },
+}
+
 #[derive(Debug, Default)]
 struct ReadCacheSet {
     entries: Vec<ReadCache>,
@@ -160,6 +172,7 @@ impl ReadCacheSet {
         }
     }
 
+    #[cfg(test)]
     fn slice(
         &mut self,
         generation: u64,
@@ -182,6 +195,62 @@ impl ReadCacheSet {
         let entry = self.entries.remove(index);
         self.entries.push(entry);
         Ok(Some(bytes))
+    }
+
+    /// Assemble a request from one or more contiguous cached windows. A full
+    /// cover is a hit; otherwise the cached prefix and the first uncovered
+    /// block are returned so only the missing tail is read from the device.
+    fn cover(
+        &mut self,
+        generation: u64,
+        lba: u64,
+        block_count: u64,
+        block_size: usize,
+    ) -> Result<Coverage, i32> {
+        let end = lba.checked_add(block_count).ok_or(libc::EINVAL)?;
+        let mut cursor = lba;
+        let mut out = Vec::new();
+        let mut used: Vec<usize> = Vec::new();
+        while cursor < end {
+            let Some(index) = self.entries.iter().position(|entry| {
+                entry.generation == generation
+                    && entry.lba <= cursor
+                    && cursor < entry.lba.saturating_add(entry.block_count)
+            }) else {
+                break;
+            };
+            let entry = &self.entries[index];
+            if entry.block_size != block_size {
+                return Err(libc::EIO);
+            }
+            let take = (entry.lba + entry.block_count).min(end) - cursor;
+            let take_bytes = usize::try_from(take)
+                .ok()
+                .and_then(|blocks| blocks.checked_mul(block_size))
+                .ok_or(libc::EIO)?;
+            let bytes = entry
+                .slice(generation, cursor, take, take_bytes)?
+                .ok_or(libc::EIO)?;
+            out.extend_from_slice(&bytes);
+            used.push(index);
+            cursor += take;
+        }
+        used.sort_unstable();
+        used.dedup();
+        let mut touched = Vec::with_capacity(used.len());
+        for index in used.into_iter().rev() {
+            touched.push(self.entries.remove(index));
+        }
+        self.entries.extend(touched.into_iter().rev());
+        if cursor == end {
+            Ok(Coverage::Hit(out))
+        } else {
+            Ok(Coverage::Partial {
+                prefix: out,
+                start: cursor,
+                continues_read_ahead: self.miss_continues_read_ahead(generation, cursor),
+            })
+        }
     }
 
     fn insert(&mut self, cache: ReadCache) -> Result<(), i32> {
@@ -302,6 +371,10 @@ fn bounded_wait_timeout_ms(remaining: Duration) -> Option<u64> {
 }
 
 pub(super) fn read(expected_generation: u64, lba: u64, block_count: u64) -> Result<Vec<u8>, i32> {
+    read_inner(expected_generation, lba, block_count)
+}
+
+fn read_inner(expected_generation: u64, lba: u64, block_count: u64) -> Result<Vec<u8>, i32> {
     let info = info().inspect_err(|errno| {
         clear_read_cache();
         eprintln!("storaged: dvm read rejected stage=info errno={errno}");
@@ -319,19 +392,31 @@ pub(super) fn read(expected_generation: u64, lba: u64, block_count: u64) -> Resu
             info.logical_block_size, info.capacity_sectors
         );
     })?;
-    let (cached, continues_read_ahead) =
-        read_cache_lookup(info.generation, lba, block_count, byte_len)?;
-    if let Some(bytes) = cached {
-        require_unquarantined(&PROVIDER_QUARANTINED)?;
-        return Ok(bytes);
-    }
+    let (prefix, start, continues_read_ahead) =
+        match read_cache_lookup(info, lba, block_count)? {
+            Coverage::Hit(bytes) => {
+                require_unquarantined(&PROVIDER_QUARANTINED)?;
+                return Ok(bytes);
+            }
+            Coverage::Partial {
+                prefix,
+                start,
+                continues_read_ahead,
+            } => (prefix, start, continues_read_ahead),
+        };
     let window_limit = if continues_read_ahead {
         READ_AHEAD_IN_FLIGHT_LIMIT
     } else {
         1
     };
-    let windows = read_ahead_plan(info, lba, block_count, window_limit)?;
+    let missing_blocks = lba
+        .checked_add(block_count)
+        .and_then(|end| end.checked_sub(start))
+        .ok_or(libc::EIO)?;
+    let missing_bytes = byte_len.checked_sub(prefix.len()).ok_or(libc::EIO)?;
+    let windows = read_ahead_plan(info, start, missing_blocks, window_limit)?;
     let mut in_flight = Vec::with_capacity(windows.len());
+    let mut submitted_bytes = 0_usize;
     for window in windows {
         match submit(
             expected_generation,
@@ -342,7 +427,13 @@ pub(super) fn read(expected_generation: u64, lba: u64, block_count: u64) -> Resu
             std::ptr::null(),
             window.byte_len,
         ) {
-            Ok(ticket) => in_flight.push((window, ticket, vec![0_u8; window.byte_len])),
+            Ok(ticket) => {
+                submitted_bytes += window.byte_len;
+                in_flight.push((window, ticket, vec![0_u8; window.byte_len]));
+            }
+            // Speculative windows beyond the demanded range may be refused
+            // (queue full); the demanded range itself must be admitted.
+            Err(_) if submitted_bytes >= missing_bytes => break,
             Err(errno) => {
                 for (_, ticket, _) in in_flight {
                     cancel_best_effort(ticket);
@@ -373,11 +464,18 @@ pub(super) fn read(expected_generation: u64, lba: u64, block_count: u64) -> Resu
             return Err(errno);
         }
     }
-    let requested = in_flight
-        .first()
-        .and_then(|(_, _, bytes)| bytes.get(..byte_len))
-        .ok_or(libc::EIO)?
-        .to_vec();
+    let mut requested = prefix;
+    requested.reserve(missing_bytes);
+    for (_, _, bytes) in &in_flight {
+        let want = byte_len - requested.len();
+        if want == 0 {
+            break;
+        }
+        requested.extend_from_slice(&bytes[..want.min(bytes.len())]);
+    }
+    if requested.len() != byte_len {
+        return Err(libc::EIO);
+    }
     let read_ahead_end = in_flight
         .last()
         .and_then(|(window, _, _)| window.lba.checked_add(window.block_count))
@@ -487,16 +585,13 @@ fn validate_write_extent(
     Ok(())
 }
 
-fn read_cache_lookup(
-    generation: u64,
-    lba: u64,
-    block_count: u64,
-    byte_len: usize,
-) -> Result<(Option<Vec<u8>>, bool), i32> {
-    let mut cache = READ_CACHE.lock().map_err(|_| libc::EIO)?;
-    let bytes = cache.slice(generation, lba, block_count, byte_len)?;
-    let continues = bytes.is_none() && cache.miss_continues_read_ahead(generation, lba);
-    Ok((bytes, continues))
+fn read_cache_lookup(info: BlockInfo, lba: u64, block_count: u64) -> Result<Coverage, i32> {
+    READ_CACHE.lock().map_err(|_| libc::EIO)?.cover(
+        info.generation,
+        lba,
+        block_count,
+        info.logical_block_size as usize,
+    )
 }
 
 fn replace_read_cache(cache: ReadCache) -> Result<(), i32> {
@@ -694,6 +789,10 @@ fn syscall_block(args: &RustosBlockBrokerArgs) -> Result<u64, i32> {
         size_of::<RustosBlockBrokerArgs>(),
         std::mem::size_of_val(args)
     );
+    // SAFETY: `args` is borrowed for the whole call, so the pointer stays valid and
+    // aligned; the kernel copies the struct by value and never retains the
+    // pointer. Buffer/info pointers inside it are user addresses checked by the
+    // kernel's user-copy path, so a bad one yields an errno, not a fault.
     let status = unsafe {
         rustos_svc_runtime::syscall::syscall1(
             SYS_RUSTOS_BLOCK_BROKER,
@@ -903,7 +1002,7 @@ mod tests {
         let metadata = READ_CACHE_WINDOW_LIMIT as u64 - 1;
         assert!(caches.slice(geometry.generation, metadata, 1, 4_096).unwrap().is_some());
         let windows = read_ahead_plan(geometry, 100, 2, READ_AHEAD_IN_FLIGHT_LIMIT).unwrap();
-        assert_eq!(windows.len(), 2, "speculation must leave cache headroom");
+        assert_eq!(windows.len(), READ_AHEAD_IN_FLIGHT_LIMIT, "speculation must leave cache headroom");
         for window in windows {
             caches.insert(ReadCache {
                 generation: geometry.generation, lba: window.lba,
@@ -936,6 +1035,45 @@ mod tests {
             Err(libc::EINVAL)
         );
         assert_eq!(read_ahead_plan(info(), 100, 1, 0), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn unaligned_sequential_requests_assemble_across_windows() {
+        let mut caches = ReadCacheSet::new();
+        for (lba, byte) in [(0_u64, 1_u8), (4, 2)] {
+            caches
+                .insert(ReadCache {
+                    generation: 7,
+                    lba,
+                    block_count: 4,
+                    block_size: 2,
+                    bytes: vec![byte; 8],
+                })
+                .unwrap();
+        }
+        // blocks 3..7 straddle both windows.
+        match caches.cover(7, 3, 4, 2).unwrap() {
+            Coverage::Hit(bytes) => assert_eq!(bytes, [1, 1, 2, 2, 2, 2, 2, 2]),
+            Coverage::Partial { .. } => panic!("expected hit"),
+        }
+        // blocks 6..10: cached prefix of 2 blocks, first uncovered block 8.
+        caches.record_read_ahead_end(7, 8);
+        match caches.cover(7, 6, 4, 2).unwrap() {
+            Coverage::Partial { prefix, start, continues_read_ahead } => {
+                assert_eq!(prefix, [2, 2, 2, 2]);
+                assert_eq!(start, 8);
+                assert!(continues_read_ahead);
+            }
+            Coverage::Hit(_) => panic!("expected partial"),
+        }
+        match caches.cover(8, 6, 1, 2).unwrap() {
+            Coverage::Partial { prefix, start, .. } => {
+                assert!(prefix.is_empty());
+                assert_eq!(start, 6);
+            }
+            Coverage::Hit(_) => panic!("generation must not alias"),
+        }
+        assert_eq!(caches.cover(7, 0, 1, 4).err(), Some(libc::EIO));
     }
 
     #[test]

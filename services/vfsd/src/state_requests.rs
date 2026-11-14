@@ -160,7 +160,17 @@ impl VfsState {
             VFS_IPC_OP_READ => self.vfs_read(request, response, None),
             VFS_IPC_OP_PREAD64 => self.vfs_read(request, response, Some(request.arg0)),
             VFS_IPC_OP_WRITE => {
-                response.status = persistent_mutation_status(request.op).unwrap_or(EINVAL)
+                if self.handles.get(&request.remote_id).is_some_and(|handle| {
+                    handle.kind == RemoteKind::Device
+                        && matches!(
+                            handle.path.as_str(),
+                            "/dev/null" | "/dev/urandom" | "/dev/random"
+                        )
+                }) {
+                    response.value = u64::from(request.payload_len);
+                } else {
+                    response.status = persistent_mutation_status(request.op).unwrap_or(EINVAL);
+                }
             }
             VFS_IPC_OP_LSEEK => self.vfs_lseek(request, response),
             VFS_IPC_OP_FSTAT => self.vfs_fstat(request, response),

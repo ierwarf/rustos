@@ -251,3 +251,75 @@ fn actual_target_terminal_leaves_original_sibling_alive_until_separate_group_req
         Some(sibling)
     });
 }
+
+#[test]
+fn actual_single_thread_fault_seals_status_and_publishes_no_group_exit() {
+    root(true, |slot, handle| {
+        with_current(slot, |slot, scope| {
+            assert!(matches!(fault_in(scope, 14, Some(6), 0xdead, 0xbeef), UserFaultDisposition::Retired));
+            assert_eq!(process_table::is_process_exiting(ID), Some(true));
+            assert_eq!(process_table::fault_termination_owner(handle, ID), Some(14));
+            assert!(process_exit_queued(handle).is_none(), "no sibling, no group row");
+            let cleanup = retirement_cleanup::test_cleanup_payload(slot).expect("cleanup payload");
+            assert!(cleanup.fault_status_sealed() && cleanup.user_fault_vector() == Some(14));
+            // A repeated fault of the stopped thread neither reseals nor republishes.
+            assert!(matches!(fault_in(scope, 13, None, 0, 0), UserFaultDisposition::Retired));
+            assert_eq!(process_table::fault_termination_owner(handle, ID), Some(14));
+        });
+    });
+}
+
+fn process_exit_queued(handle: process_table::ProcessHandle) -> Option<()> {
+    crate::multitask::process_placement::exit_membership::queued_for(handle).map(|_| ())
+}
+
+#[test]
+fn actual_fault_with_sibling_terminates_whole_group_once() {
+    family(true, |slot, handle| {
+        let sibling = sibling(slot);
+        with_current(slot, |slot, scope| {
+            assert!(matches!(fault_in(scope, 6, None, 0, 0xbeef), UserFaultDisposition::Retired));
+            // The fault is the first terminal event: process sealed exiting,
+            // status owned by the faulting task, group exit queued, sibling alive.
+            assert_eq!(process_table::is_process_exiting(ID), Some(true));
+            assert_eq!(process_table::fault_termination_owner(handle, ID), Some(6));
+            let receipt = process_exit_queued(handle);
+            assert!(receipt.is_some(), "group exit must be queued for siblings");
+            assert!(!identity::lifecycle(sibling).retired);
+            // A concurrent fault in the sibling loses the seal: status is
+            // published once, by the first faulter only.
+            assert_eq!(
+                process_table::seal_fault_termination(handle, ID, ID + 1, 13),
+                process_table::FaultSeal::Lost
+            );
+            assert_eq!(process_table::fault_termination_owner(handle, ID + 1), None);
+            assert!(super::super::group_exit::service(scope));
+            assert!(identity::lifecycle(sibling).retired, "sibling retired by group exit");
+            assert!(process_exit_queued(handle).is_none());
+            let cleanup = retirement_cleanup::test_cleanup_payload(slot).expect("cleanup payload");
+            assert!(cleanup.fault_status_sealed());
+        });
+        Some(sibling)
+    });
+}
+
+#[test]
+fn actual_fault_after_exit_group_loses_status_seal_and_publishes_nothing() {
+    family(true, |slot, handle| {
+        let sibling = sibling(slot);
+        with_current(slot, |slot, scope| {
+            // exit_group's election: the exit request marks the process exiting.
+            let (_, fresh) =
+                crate::multitask::current::group_exit::request_marked(scope, ID, None).unwrap();
+            assert!(fresh);
+            assert!(matches!(fault_in(scope, 14, None, 0, 0), UserFaultDisposition::Retired));
+            assert_eq!(process_table::fault_termination_owner(handle, ID), None);
+            let cleanup = retirement_cleanup::test_cleanup_payload(slot).expect("cleanup payload");
+            assert!(!cleanup.fault_status_sealed(), "exit_group won; fault publishes no status");
+            assert_eq!(cleanup.user_fault_vector(), Some(14));
+            assert!(super::super::group_exit::service(scope));
+            assert!(identity::lifecycle(sibling).retired);
+        });
+        Some(sibling)
+    });
+}

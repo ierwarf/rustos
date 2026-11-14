@@ -81,7 +81,10 @@ pub fn syscall_linux_vfs_fstat(fd: u64, stat_ptr: u64) -> u64 {
 }
 
 pub fn syscall_linux_vfs_ftruncate(fd: u64, len: u64) -> u64 {
-    if let Some(memfd) = current_memfd_handle(fd) {
+    if let Some((memfd, rights)) = current_memfd_handle_with_rights(fd) {
+        if !rights.allows_write() {
+            return linux_errno(LINUX_EINVAL);
+        }
         let Ok(len) = usize::try_from(len) else {
             return linux_errno(LINUX_EINVAL);
         };
@@ -188,6 +191,16 @@ pub fn syscall_linux_vfs_statx(
     if let Some(result) = super::local_fd::statx_at_empty_path(dirfd, &path, flags, statx_ptr) {
         return result;
     }
+    if path.is_empty()
+        && flags & linux_abi::AT_EMPTY_PATH != 0
+        && let Some(memfd) = current_memfd_handle(dirfd)
+    {
+        return write_bootstrap_statx(
+            statx_ptr,
+            crate::vfs_core::path_inode(memfd.path().as_bytes()),
+            memfd.len() as u64,
+        );
+    }
     if let Err(err) = usermem::validate_current_user_write_buffer(statx_ptr, LINUX_STATX_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
@@ -230,6 +243,19 @@ pub fn syscall_linux_vfs_newfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, fl
     }
     if let Some(result) = super::local_fd::fstat_at_empty_path(dirfd, &path, flags, stat_ptr) {
         return result;
+    }
+    if path.is_empty()
+        && flags & linux_abi::AT_EMPTY_PATH != 0
+        && matches!(
+            current_kernel_handle(dirfd),
+            Some(
+                multitask::KernelHandle::Console(_)
+                    | multitask::KernelHandle::Memfd(_)
+                    | multitask::KernelHandle::DeviceBuffer(_)
+            )
+        )
+    {
+        return syscall_linux_vfs_fstat(dirfd, stat_ptr);
     }
     if let Err(err) = usermem::validate_current_user_write_buffer(stat_ptr, LINUX_STAT_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
@@ -315,9 +341,19 @@ pub fn syscall_linux_vfs_access(dirfd: u64, path_ptr: u64, mode: u64, flags: u64
 }
 
 pub fn current_memfd_handle(fd: u64) -> Option<multitask::MemfdHandle> {
+    current_memfd_handle_with_rights(fd).map(|(memfd, _)| memfd)
+}
+
+pub fn current_memfd_handle_with_rights(
+    fd: u64,
+) -> Option<(
+    multitask::MemfdHandle,
+    kernel_object::api::handle::HandleRights,
+)> {
     multitask::with_current_user_process_state(|_, _, process_state| {
-        match process_state.handles().get(fd) {
-            Some(multitask::KernelHandle::Memfd(memfd)) => Some(memfd.clone()),
+        let entry = process_state.handles().get_entry(fd)?;
+        match entry.handle() {
+            multitask::KernelHandle::Memfd(memfd) => Some((memfd.clone(), entry.rights())),
             _ => None,
         }
     })
@@ -411,6 +447,25 @@ fn write_bootstrap_stat(user_ptr: u64, inode: u64, len: u64) -> u64 {
     out[48..56].copy_from_slice(&(len as i64).to_ne_bytes());
     out[56..64].copy_from_slice(&4096_i64.to_ne_bytes());
     out[64..72].copy_from_slice(&(len.div_ceil(512) as i64).to_ne_bytes());
+    match usermem::write_current_user_bytes(user_ptr, &out) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+    }
+}
+
+fn write_bootstrap_statx(user_ptr: u64, inode: u64, len: u64) -> u64 {
+    const STATX_FILLED: u32 = 0x1 | 0x2 | 0x4 | 0x100 | 0x200 | 0x400;
+    if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, LINUX_STATX_SIZE) {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    let mut out = [0_u8; LINUX_STATX_SIZE];
+    out[0..4].copy_from_slice(&STATX_FILLED.to_ne_bytes());
+    out[4..8].copy_from_slice(&4096_u32.to_ne_bytes());
+    out[16..20].copy_from_slice(&1_u32.to_ne_bytes());
+    out[28..30].copy_from_slice(&(0o100000_u16 | 0o555).to_ne_bytes());
+    out[32..40].copy_from_slice(&inode.max(1).to_ne_bytes());
+    out[40..48].copy_from_slice(&len.to_ne_bytes());
+    out[48..56].copy_from_slice(&len.div_ceil(512).to_ne_bytes());
     match usermem::write_current_user_bytes(user_ptr, &out) {
         Ok(()) => 0,
         Err(err) => linux_errno(address_space_error_to_linux_errno(err)),

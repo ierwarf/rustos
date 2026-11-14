@@ -87,10 +87,15 @@ const fn input_ring_atomic_control_layout_is_valid() -> bool {
 const _: () = assert!(input_ring_atomic_control_layout_is_valid());
 
 const fn shared_control_load_order() -> Ordering {
+    // ORDERING: the single named load order for shared input-ring control words:
+    // Acquire pairs with the Release stores RustOS makes to flags, consumer cursor
+    // and wake generation, so data published before them is visible after the load.
     Ordering::Acquire
 }
 
 const fn shared_control_publish_order() -> Ordering {
+    // ORDERING: the single named publish order for the producer cursor: Release makes
+    // the volatile slot bytes written before it visible to RustOS's Acquire load.
     Ordering::Release
 }
 // Every live hostd process allocates a relay epoch once. The fixed input ring
@@ -170,6 +175,7 @@ impl ControlSecret {
             .metadata()
             .with_context(|| format!("read DVM control secret metadata {}", path.display()))?;
         if !metadata.is_file()
+            // SAFETY: `geteuid` is an argument-free POSIX query with no memory hazards.
             || metadata.uid() != unsafe { libc::geteuid() }
             || metadata.mode() & 0o077 != 0
         {
@@ -2828,6 +2834,10 @@ impl InputRingSink {
         if mapped_len != DVM_INPUT_RING_APERTURE_BYTES as usize {
             bail!("input-ring backing has unexpected length {mapped_len}");
         }
+        // SAFETY: `file` is an open read/write descriptor whose length was just checked to
+        // equal the fixed aperture; the null hint with offset 0 asks the kernel to pick
+        // a fresh mapping of exactly that length. The kernel keeps its own reference,
+        // so the mapping outlives `file`; failure is checked right below.
         let mapped = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -2843,17 +2853,23 @@ impl InputRingSink {
             return Err(std::io::Error::last_os_error()).context("map input-ring backing");
         }
         if !shared_control_words_are_aligned(mapped) {
+            // SAFETY: `mapped`/`mapped_len` are exactly the mapping created above and no
+            // reference into it exists yet; it is unmapped once on this error path.
             unsafe { libc::munmap(mapped.cast::<libc::c_void>(), mapped_len) };
             bail!("input-ring backing does not align atomic control words");
         }
         let header = read_input_ring_header(mapped)?;
         if header.region_bytes != DVM_INPUT_RING_APERTURE_BYTES {
+            // SAFETY: `mapped`/`mapped_len` are exactly the mapping created above; the header
+            // view taken from it was a by-value copy, so nothing borrows the mapping.
             unsafe { libc::munmap(mapped.cast::<libc::c_void>(), mapped_len) };
             bail!("input-ring backing did not contain the required fixed header");
         }
         let producer = match IvshmemInputProducer::connect(doorbell, timeout) {
             Ok(producer) => producer,
             Err(error) => {
+                // SAFETY: exact mapping created above, unmapped once on the producer connect
+                // error path; no sink exists yet whose Drop would unmap it again.
                 unsafe { libc::munmap(mapped.cast::<libc::c_void>(), mapped_len) };
                 return Err(error);
             }
@@ -2915,6 +2931,10 @@ impl InputRingSink {
             .filter(|end| *end <= self.mapped_len)
             .ok_or_else(|| anyhow!("input-ring record is outside launch-owned aperture"))?;
         for (index, byte) in frame.as_bytes().iter().enumerate() {
+            // SAFETY: `offset + index < end <= mapped_len` was checked above, so the byte is inside
+            // the launch-owned mapping. This slot is below the credit limit, hence not yet
+            // visible to the consumer, and `&mut self` is the only producer; control words
+            // are never written through this non-atomic path.
             unsafe { self.mapped.add(offset + index).write_volatile(*byte) };
         }
         debug_assert_eq!(end - offset, RUSTOS_INPUT_FRAME_BYTES);
@@ -2958,6 +2978,8 @@ impl InputRingSink {
 impl Drop for InputRingSink {
     fn drop(&mut self) {
         if !self.mapped.is_null() {
+            // SAFETY: `mapped` is non-null and, with `mapped_len`, is the mapping created in
+            // `connect`; Drop runs once and no borrow of the mapping outlives `self`.
             unsafe { libc::munmap(self.mapped.cast::<libc::c_void>(), self.mapped_len) };
         }
     }
@@ -3252,12 +3274,18 @@ impl HostControlListener {
         // caller-selected public port here would let a future caller silently
         // undo the same-CID setup-slot isolation.
         let port = control_secret.control_port();
+        // SAFETY: `socket` takes only integer arguments; the returned descriptor is checked
+        // for failure right below.
         let fd = unsafe { libc::socket(AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error()).context("create host AF_VSOCK listener");
         }
+        // SAFETY: `fd` was just returned by `socket`, checked non-negative, and has no
+        // other owner, so `OwnedFd` takes unique ownership and closes it exactly once.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let address = SockaddrVm::new(VMADDR_CID_ANY, port);
+        // SAFETY: `address` is a live `repr(C)` SockaddrVm (no padding, all bytes
+        // initialized) and the length passed is its exact size; `fd` is a valid socket.
         let bind_result = unsafe {
             libc::bind(
                 fd.as_raw_fd(),
@@ -3268,6 +3296,7 @@ impl HostControlListener {
         if bind_result != 0 {
             return Err(std::io::Error::last_os_error()).context("bind host AF_VSOCK listener");
         }
+        // SAFETY: `listen` takes only the live socket descriptor `fd` and an integer backlog.
         if unsafe { libc::listen(fd.as_raw_fd(), 4) } != 0 {
             return Err(std::io::Error::last_os_error()).context("listen on host AF_VSOCK");
         }
@@ -3493,6 +3522,8 @@ impl HostControlListener {
                 events: libc::POLLIN,
                 revents: 0,
             };
+            // SAFETY: `pollfd` is a live local for the duration of the call and the count of 1
+            // matches the single entry passed.
             let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
             if ready == 0 {
                 bail!("timed out waiting for Linux DVM vsock control connection");
@@ -3506,6 +3537,9 @@ impl HostControlListener {
             }
             let mut peer = SockaddrVm::new(0, 0);
             let mut peer_len = size_of::<SockaddrVm>() as libc::socklen_t;
+            // SAFETY: `peer` and `peer_len` are live locals, `peer_len` holds the exact size of
+            // `peer`, so the kernel writes at most size_of::<SockaddrVm>() bytes into it;
+            // the listener descriptor is owned by `self` and open.
             let accepted = unsafe {
                 libc::accept4(
                     self.fd.as_raw_fd(),
@@ -3526,6 +3560,8 @@ impl HostControlListener {
                     _ => return Err(error).context("accept Linux DVM vsock connection"),
                 }
             }
+            // SAFETY: `accepted` was returned by `accept4` and checked non-negative above, so
+            // it is a fresh descriptor owned by nobody else; `File` closes it exactly once.
             let connection = unsafe { std::fs::File::from_raw_fd(accepted) };
             if peer.family != AF_VSOCK as libc::sa_family_t || peer.cid != self.expected_dvm_cid {
                 // Any local guest can connect to the listening port; a wrong
@@ -4153,6 +4189,8 @@ fn socket_timeval(timeout: Option<Duration>) -> libc::timeval {
 fn configure_socket_timeout(connection: &std::fs::File, timeout: Option<Duration>) -> Result<()> {
     let timeout = socket_timeval(timeout);
     for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+        // SAFETY: `timeout` is a live local timeval and the length is its exact size;
+        // the descriptor is borrowed from `connection`, which outlives the call.
         let result = unsafe {
             libc::setsockopt(
                 connection.as_raw_fd(),
@@ -4276,10 +4314,13 @@ fn hmac_sha256(
     key: &[u8; CONTROL_SECRET_BYTES],
     message: &[u8],
 ) -> Result<[u8; CONTROL_SECRET_BYTES]> {
+    // SAFETY: `socket` takes only integer arguments; failure is checked right below.
     let fd = unsafe { libc::socket(AF_ALG, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error()).context("create AF_ALG HMAC socket");
     }
+    // SAFETY: `fd` was just returned by `socket`, checked non-negative, and has no
+    // other owner, so `OwnedFd` owns and closes it exactly once.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let mut address = SockaddrAlg {
         family: AF_ALG as libc::sa_family_t,
@@ -4290,6 +4331,8 @@ fn hmac_sha256(
     };
     copy_c_string(&mut address.algorithm_type, b"hash")?;
     copy_c_string(&mut address.name, b"hmac(sha256)")?;
+    // SAFETY: `address` is a live `repr(C)` SockaddrAlg (no padding, fully
+    // initialized by the literal and copy_c_string) and the length is its exact size.
     if unsafe {
         libc::bind(
             fd.as_raw_fd(),
@@ -4300,6 +4343,8 @@ fn hmac_sha256(
     {
         return Err(std::io::Error::last_os_error()).context("bind AF_ALG HMAC socket");
     }
+    // SAFETY: `key` is a live slice; pointer and length describe exactly its bytes,
+    // which the kernel copies during the call.
     if unsafe {
         libc::setsockopt(
             fd.as_raw_fd(),
@@ -4312,6 +4357,8 @@ fn hmac_sha256(
     {
         return Err(std::io::Error::last_os_error()).context("set AF_ALG HMAC key");
     }
+    // SAFETY: null address/length pointers are the documented form of `accept4` when the
+    // peer address is not wanted; `fd` is the bound AF_ALG socket.
     let operation = unsafe {
         libc::accept4(
             fd.as_raw_fd(),
@@ -4323,6 +4370,8 @@ fn hmac_sha256(
     if operation < 0 {
         return Err(std::io::Error::last_os_error()).context("accept AF_ALG HMAC operation");
     }
+    // SAFETY: `operation` came from `accept4` and was checked non-negative above, so
+    // it is a fresh descriptor with no other owner; `File` closes it exactly once.
     let mut operation = unsafe { std::fs::File::from_raw_fd(operation) };
     operation
         .write_all(message)
@@ -4425,6 +4474,7 @@ fn setup_transfer(connection: &std::fs::File, bytes: &mut [u8], write: bool, dea
     while offset < bytes.len() {
         let timeout = remaining_setup(deadline)?.map(|left| left.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32).unwrap_or(-1);
         let mut fd = libc::pollfd { fd: connection.as_raw_fd(), events: if write { libc::POLLOUT } else { libc::POLLIN }, revents: 0 };
+        // SAFETY: `fd` is a live local pollfd and the count of 1 matches the single entry.
         let ready = unsafe { libc::poll(&mut fd, 1, timeout) };
         if ready == 0 { bail!("Linux DVM setup deadline expired"); }
         if ready < 0 {
@@ -4433,6 +4483,10 @@ fn setup_transfer(connection: &std::fs::File, bytes: &mut [u8], write: bool, dea
             return Err(error).context("poll Linux DVM setup socket");
         }
         remaining_setup(deadline)?;
+        // SAFETY: `bytes[offset..]` is a live slice borrowed for the call, and the length
+        // passed is exactly its remaining size, so send reads / recv writes only
+        // inside it; the descriptor is borrowed from `connection`. MSG_DONTWAIT
+        // keeps the call bounded by the deadline checked above.
         let n = unsafe {
             if write { libc::send(connection.as_raw_fd(), bytes[offset..].as_ptr().cast(), bytes.len() - offset, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) }
             else { libc::recv(connection.as_raw_fd(), bytes[offset..].as_mut_ptr().cast(), bytes.len() - offset, libc::MSG_DONTWAIT) }
@@ -4552,7 +4606,10 @@ mod tests {
     #[test]
     fn input_ring_control_words_are_atomic_and_ordered() {
         assert!(input_ring_atomic_control_layout_is_valid());
+        // ORDERING: test pins the named load order to Acquire so a weakening of the
+        // shared-control protocol fails here.
         assert_eq!(shared_control_load_order(), Ordering::Acquire);
+        // ORDERING: test pins the named publish order to Release (see above).
         assert_eq!(shared_control_publish_order(), Ordering::Release);
 
         let mut backing = [0_u64; 32];

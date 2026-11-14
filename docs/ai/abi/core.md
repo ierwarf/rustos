@@ -538,3 +538,5 @@ rather than untyped payload formats.
 Full status and Codex fault-injection handoff:
 [Ring3 eight-stage status](../../validation/ring3-8stage-status.md).
 - SYS_RUSTOS_SERVICE_POLICY (0x5255_005f): rootd-only (`RootSupervisor`) `INSTALL` of the typed routing policy (generation must increase; validated whole before it replaces the old table) and `BIND_PRINCIPAL` of a live pid to a service identity under the installed generation. Typed wire only (`ServiceRouteWire`, `ServiceCapabilityListWire`).
+
+**User-pointer errno:** Linux syscalls return `EFAULT` for any bad user pointer (`user_pointer_error_to_linux_errno`). RustOS-native non-IPC broker/job syscalls do the same. Native IPC syscalls keep `EINVAL` for kernel-range pointers (pinned by the `apps/ipcbench` uaccess selftest) and must not be moved to the Linux mapping.

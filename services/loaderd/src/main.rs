@@ -289,6 +289,9 @@ fn serve(endpoint: u64) {
         // reply commits, while the UI bootstrap reply also owns the immediate
         // demotion boundary. Neither may block inside a fused receive before
         // its post-reply action completes.
+        // SAFETY: `reply_cap` is the one-shot capability from the receive above and has
+        // not been consumed; `handled.reply` is a live value, so `as_ptr`/`len` name
+        // exactly its wire struct, which the kernel only reads during the call.
         let reply = unsafe {
             rustos_svc_runtime::ipc::reply(reply_cap, handled.reply.as_ptr(), handled.reply.len())
         };
@@ -475,6 +478,10 @@ fn handle_wire_request(
     }
     match classify_loader_wire_size(received) {
         LoaderWireKind::Commercial => {
+            // SAFETY: `received` (= `bytes.len()`) matched size_of the request exactly;
+            // `bytes` starts at the `align(8)` LoaderdRecvBuffer and the request is an
+            // all-integer `repr(C)` wire struct, so alignment and every bit pattern
+            // are valid. The borrow ends with this handler, before the buffer is reused.
             let request = unsafe { &*bytes.as_ptr().cast::<CommercialMaxProtocolRequest>() };
             HandledLoaderRequest {
                 reply: LoaderReply::Commercial(handle_commercial_request(
@@ -486,10 +493,14 @@ fn handle_wire_request(
             }
         }
         LoaderWireKind::ActivateBatch => {
+            // SAFETY: `received` matched size_of LoaderActivateBatchRequest exactly; same
+            // 8-aligned receive buffer and all-integer `repr(C)` layout as above.
             let request = unsafe { &*bytes.as_ptr().cast::<LoaderActivateBatchRequest>() };
             handle_activate_batch_request(request, sender_pid)
         }
         LoaderWireKind::Spawn => {
+            // SAFETY: `received` matched size_of LoaderSpawnRequest exactly; same 8-aligned
+            // receive buffer and all-integer `repr(C)` layout as above.
             let request = unsafe { &*bytes.as_ptr().cast::<LoaderSpawnRequest>() };
             handle_request(received, request, sender_pid, sender_tid, handles, applications, image_work)
         }
@@ -844,10 +855,14 @@ fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>, 
 }
 
 fn demote_after_ui_bootstrap_reply() {
+    // ORDERING: once-only latch for the one-way scheduling demotion; it guards no
+    // other data, so Acquire here pairs only with the Release store below.
     if POST_UI_DEMOTED.load(Ordering::Acquire) {
         return;
     }
     if syscall0(SYS_RUSTOS_SCHED_DEMOTE_SELF) == 0 {
+        // ORDERING: Release publishes that the demotion syscall succeeded to later
+        // Acquire readers of the latch; nothing else is ordered by it.
         POST_UI_DEMOTED.store(true, Ordering::Release);
         debug_line("loaderd: post-ui scheduling class=user");
         return;
@@ -1258,6 +1273,8 @@ fn align_down(value: u64, align: u64) -> u64 {
 }
 
 fn syscall1(number: u64, arg0: u64) -> i64 {
+    // SAFETY: raw syscall wrapper; callers pass integer arguments only, and the
+    // broker numbers used here validate every argument in the kernel.
     unsafe { rustos_svc_runtime::syscall::syscall1(number, arg0) }
 }
 
@@ -1273,10 +1290,14 @@ fn syscall_unit_result(status: i64) -> Result<(), i32> {
 }
 
 fn syscall0(number: u64) -> i64 {
+    // SAFETY: raw syscall wrapper with no arguments; see `syscall1`.
     unsafe { rustos_svc_runtime::syscall::syscall0(number) }
 }
 
 fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
+    // SAFETY: raw syscall wrapper; any pointer among the integers is the address of
+    // a broker args struct the caller keeps alive across the call (copied by
+    // value by the kernel, which validates every embedded pointer).
     unsafe { rustos_svc_runtime::syscall::syscall4(number, arg0, arg1, arg2, arg3) }
 }
 

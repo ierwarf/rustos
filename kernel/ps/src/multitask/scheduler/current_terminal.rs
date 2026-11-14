@@ -96,9 +96,33 @@ fn fault_in(scope: &DispatchPreemption<'_>, vector: u8, error_code: Option<u64>,
         };
     };
     if !current.context().user_mode { return UserFaultDisposition::Unhandled; }
+    if !current.stopped() { claim_group_fault(&current, vector); }
     if current.stopped() || current.stop(TaskRetireReason::UserFault { vector, error_code, cr2, rip }) {
         UserFaultDisposition::Retired
     } else { UserFaultDisposition::Unhandled }
+}
+
+/// A fatal user fault terminates the whole thread group, like Linux's default
+/// action for SIGSEGV/SIGILL/SIGBUS/SIGFPE. Exactly one terminal event per
+/// process wins the `PROCESS_TABLE` seal (fault vs fault vs exit_group vs
+/// external terminate); only the winner publishes the durable group exit that
+/// `service_deferred_work` drains. No wait: this runs IF-clear on the exception
+/// stack, and the faulting thread itself is stopped by the caller. The winner's
+/// retirement row carries the wait status to the runtime cleanup consumer.
+fn claim_group_fault(current: &OriginalCurrent<'_, '_>, vector: u8) {
+    let context = current.context();
+    let (Some(handle), Some(process_id)) = (context.process_handle, context.process_id) else {
+        return;
+    };
+    let (slot, id) = current.member();
+    if process_table::seal_fault_termination(handle, process_id, id, vector)
+        != process_table::FaultSeal::First { return; }
+    if process_table::thread_count_by_pid(process_id).is_some_and(|threads| threads > 1) {
+        // Only the seal winner reaches here, so a queued or in-flight
+        // publication can only be a racing external terminator that sealed
+        // nothing; either way siblings are then already being terminated.
+        let _ = crate::multitask::current::group_exit::publish_for_fault(handle, slot, id, process_id);
+    }
 }
 
 /// Whether this CPU's Current already has a terminal run owner, i.e. another CPU

@@ -21,7 +21,6 @@
 //! - **Forbidden:** no numeric capability mask crosses this ABI; capabilities
 //!   are typed discriminants validated against `ServiceCapability`.
 use super::*;
-use core::mem::size_of;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use rustos_user_abi::syscall::{
     RustosServicePolicyArgs, ServiceCapability, ServiceCapabilitySet, SERVICE_POLICY_ABI_VERSION,
@@ -194,7 +193,7 @@ pub(super) fn syscall_linux_rustos_service_policy(ptr: u64) -> u64 {
     }
     let args = match usermem::read_current_user_struct::<RustosServicePolicyArgs>(ptr) {
         Ok(args) => args,
-        Err(error) => return linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
     };
     if args.abi_version != SERVICE_POLICY_ABI_VERSION {
         return linux_errno(LINUX_EINVAL);

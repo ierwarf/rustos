@@ -126,6 +126,7 @@ fn locked() -> impl core::ops::DerefMut<Target = DonationLedger> + 'static {
 
 /// Reserve the donor's edge without taking the ledger leaf when it is an ordinary
 /// class, self-funded edge; otherwise exactly `reserve_own`.
+#[cfg(any(rustos_boot_image, test))]
 pub(super) fn reserve_own_lazy(slot: usize, id: u64, priority: bool) -> bool {
     if !priority && borrowed_context_charge_token(slot).is_none() && lazy::reserve(slot, id) {
         return true;
@@ -263,6 +264,7 @@ pub(super) fn reserve_owned(loans: &super::donation_publication::Loans,
 /// unborrowed one by construction, so it is not captured in a separate leaf
 /// acquisition. A charge token published since the caller's lock-free check
 /// refuses here exactly as `current_basis_live` refuses a moved basis.
+#[cfg(any(rustos_boot_image, test))]
 pub(super) fn reserve_own(slot: usize, id: u64, priority: bool) -> bool {
     let mut ledger = locked();
     if borrowed_context_charge_token(slot).is_some() { return false; }

@@ -146,6 +146,7 @@ mod thread_slots;
 use alloc::vec::Vec;
 use core::{mem, ptr};
 
+#[cfg(any(rustos_boot_image, test))]
 use x86_64::VirtAddr;
 
 use kernel_object::api::identity::ObjectIdentity;
@@ -549,15 +550,6 @@ pub(in crate::multitask) fn with_exec_census_fixture(
 }
 
 
-
-#[cfg(rustos_log_sched_debug)]
-fn saved_context_rip(saved_rsp: usize) -> Option<u64> {
-    if saved_rsp == 0 {
-        return None;
-    }
-    let context = saved_rsp as *const SavedContext;
-    Some(unsafe { (*context).rip })
-}
 
 #[cfg(test)]
 fn should_validate_published_ready_frame(

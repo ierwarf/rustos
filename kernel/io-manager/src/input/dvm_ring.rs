@@ -67,18 +67,24 @@ const fn input_ring_atomic_control_layout_is_valid() -> bool {
 const _: () = assert!(input_ring_atomic_control_layout_is_valid());
 
 const fn shared_control_load_order() -> Ordering {
+    // ORDERING: the one load order for shared control words (flags, producer, consumer, wake generation).
+    // Acquire pairs with L0's Release publication, so record bytes written before a producer commit are visible.
     Ordering::Acquire
 }
 
 const fn shared_control_publish_order() -> Ordering {
+    // ORDERING: the one store order for shared control words. Release makes this side's earlier record reads
+    // and cursor retirement complete before L0's Acquire load of the word can let it reuse a slot.
     Ordering::Release
 }
 
 const fn shared_control_update_order() -> Ordering {
+    // ORDERING: read-modify-write order for the flags word and wake generation: acquire L0's latest state and release ours.
     Ordering::AcqRel
 }
 
 const fn shared_control_update_failure_order() -> Ordering {
+    // ORDERING: failure order of those CAS loops; only reloads the current word for the retry, nothing was stored.
     Ordering::Acquire
 }
 
@@ -235,14 +241,20 @@ impl Drop for TransportMappingClaim<'_> {
 }
 
 fn claim_installed_mapping() -> Option<TransportMappingClaim<'static>> {
+    // ORDERING: Acquire pairs with the Release store of INSTALLED at the end of try_install_serialized (after
+    // SHARED_ADDR, GENERATION, CONSUMER and the lifecycle commit); GENERATION below pairs with its own Release store.
     if !INSTALLED.load(Ordering::Acquire) {
         return None;
     }
+    // ORDERING: Acquire pairs with the Release store of GENERATION at install; the lifecycle claim is attempted for exactly this generation.
     let generation = GENERATION.load(Ordering::Acquire);
     let lifecycle = INPUT_LIFECYCLE.try_claim(generation)?;
+    // ORDERING: Acquire loads of the mapping address and the post-claim recheck of INSTALLED/GENERATION pair with the
+    // install and revoke Release stores; the lifecycle claim then pins the mapping against unmap.
     let mapped = SHARED_ADDR.load(Ordering::Acquire) as *mut u8;
     if mapped.is_null()
         || !INSTALLED.load(Ordering::Acquire)
+        // ORDERING: Acquire recheck: a generation change after the claim means a drain/reinstall raced, so the claim is dropped.
         || GENERATION.load(Ordering::Acquire) != generation
         || !lifecycle.validate_current()
     {
@@ -260,6 +272,7 @@ pub(crate) fn init() {
 }
 
 fn try_install() -> bool {
+    // ORDERING: Acquire pairs with the Release store of INSTALLED (install) and INSTALL_REJECTED (reject_install).
     if INSTALLED.load(Ordering::Acquire) {
         return true;
     }
@@ -267,6 +280,8 @@ fn try_install() -> bool {
         report_install_rejection_once();
         return false;
     }
+    // ORDERING: AcqRel CAS admits exactly one installer; Acquire sees the previous installer's Release unlock below,
+    // failure Acquire only makes this caller report not-installed.
     if INSTALLING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -274,11 +289,13 @@ fn try_install() -> bool {
         return false;
     }
     let installed = try_install_serialized();
+    // ORDERING: Release ends the exclusive install transaction and publishes its writes to the next installer.
     INSTALLING.store(false, Ordering::Release);
     installed
 }
 
 fn try_install_serialized() -> bool {
+    // ORDERING: Acquire rechecks INSTALLED and INSTALL_REJECTED under the INSTALLING admission, same pairing as try_install.
     if INSTALLED.load(Ordering::Acquire) {
         return true;
     }
@@ -293,6 +310,7 @@ fn try_install_serialized() -> bool {
     let Some(ring) = find_input_ring() else {
         return false;
     };
+    // ORDERING: Acquire pairs with the Release stores of MSIX_ARMED and ARMED_RESOURCE_START below (written by a previous install under INSTALLING).
     if MSIX_ARMED.load(Ordering::Acquire) {
         if ARMED_RESOURCE_START.load(Ordering::Acquire) != ring.resource_start {
             release_mapping(ring.mapped);
@@ -305,6 +323,7 @@ fn try_install_serialized() -> bool {
             reject_install(rejection);
             return false;
         }
+        // ORDERING: Release publishes the armed aperture identity before MSIX_ARMED, so a re-install that Acquires MSIX_ARMED sees the start address.
         ARMED_RESOURCE_START.store(ring.resource_start, Ordering::Release);
         MSIX_ARMED.store(true, Ordering::Release);
     }
@@ -331,11 +350,15 @@ fn try_install_serialized() -> bool {
             u64::from(previous_flags),
         );
     }
+    // ORDERING: Release stores of the mapping address, generation, cursor and wake generation precede the final
+    // Release store of INSTALLED; consumers Acquire INSTALLED (or claim through the lifecycle) before using them.
     SHARED_ADDR.store(ring.mapped as usize, Ordering::Release);
     GENERATION.store(ring.header.generation, Ordering::Release);
     CONSUMER.store(ring.header.consumer, Ordering::Release);
+    // ORDERING: Release store of the wake generation, part of the install publication ahead of INSTALLED.
     CONSUMER_WAKE_GENERATION.store(ring.header.consumer_wake_generation, Ordering::Release);
     if !activation.commit() {
+        // ORDERING: failed activation rolls the words back with Release; INSTALLED was never published, so no reader acts on them.
         SHARED_ADDR.store(0, Ordering::Release);
         GENERATION.store(0, Ordering::Release);
         CONSUMER.store(0, Ordering::Release);
@@ -343,6 +366,7 @@ fn try_install_serialized() -> bool {
         release_mapping(ring.mapped);
         return false;
     }
+    // ORDERING: Release publishes INSTALLED after the lifecycle activation committed and every word above was stored.
     INSTALLED.store(true, Ordering::Release);
     crate::debug::info!(
         input,
@@ -358,6 +382,7 @@ fn try_install_serialized() -> bool {
 /// advance the cursor.
 pub(crate) fn mark_policy_consumer_ready() -> bool {
     finish_pending_lifecycle();
+    // ORDERING: Acquire pairs with the Release store of INSTALLED; the lifecycle claim below is the authority.
     if !INSTALLED.load(Ordering::Acquire) && !try_install() {
         return false;
     }
@@ -376,6 +401,9 @@ pub(crate) fn mark_policy_consumer_ready() -> bool {
             return false;
         }
     };
+    // ORDERING: Acquire load of the software consumer cursor, which only this broker path (under the drain claim or
+    // lifecycle admission) advances with Release (drain owner, policy-ready, withdrawal, install);
+    // it is compared against the header's consumer word.
     if header.generation != mapping.generation()
         || header.consumer != CONSUMER.load(Ordering::Acquire)
     {
@@ -403,6 +431,7 @@ pub(crate) fn mark_policy_consumer_ready() -> bool {
             header.producer,
             shared_control_publish_order(),
         );
+        // ORDERING: Release publishes the retired cursor and the generation-stamped reset barrier for inputd's next drain turn (AcqRel swap).
         CONSUMER.store(header.producer, Ordering::Release);
         RESET_PENDING_GENERATION.store(header.generation, Ordering::Release);
     }
@@ -435,6 +464,7 @@ pub(crate) fn mark_policy_consumer_ready() -> bool {
 /// owner. A replacement inputd receives a generation-stamped reset barrier
 /// before it may publish policy readiness again.
 pub(crate) fn withdraw_policy_consumer() {
+    // ORDERING: Acquire pairs with the Release store of INSTALLED.
     if !INSTALLED.load(Ordering::Acquire) {
         super::wait_queue::wake_input_waiters();
         return;
@@ -493,6 +523,8 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
         return 0;
     }
     let _drain_guard = DrainGuard;
+    // ORDERING: AcqRel swap takes the pending reset barrier exactly once, pairing with the Release stores that
+    // publish a retired generation (revoke, withdraw, install rollback).
     let reset_generation = RESET_PENDING_GENERATION.swap(0, Ordering::AcqRel);
     let mut written = 0;
     if reset_generation != 0 {
@@ -509,6 +541,7 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
             return written;
         }
     }
+    // ORDERING: Acquire pairs with the Release store of INSTALLED; try_install re-admits under INSTALLING.
     if !INSTALLED.load(Ordering::Acquire) && !try_install() {
         RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
         return written;
@@ -520,6 +553,7 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
     let mapped = mapping.mapped();
     let generation = mapping.generation();
     let reset_written = written;
+    // ORDERING: AcqRel swap clears the interrupt-pending hint before the header is read, so an edge arriving later re-arms it and is not lost.
     let _ = IRQ_PENDING.swap(false, Ordering::AcqRel);
     let header = match read_header(mapped) {
         Ok(header) => header,
@@ -534,6 +568,7 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
             return reset_written;
         }
     };
+    // ORDERING: Acquire of the software cursor, written with Release only by the sole drain owner (this turn) or the lifecycle finisher.
     let mut consumer = CONSUMER.load(Ordering::Acquire);
     // Four independent conditions used to answer with one reason code, and the
     // run said only "cursor-or-generation-invalid". That is the same dead end
@@ -571,6 +606,10 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
         };
         let mut record = [0_u8; DVM_INPUT_RING_RECORD_BYTES];
         for (index, byte) in record.iter_mut().enumerate() {
+            // SAFETY: `offset + DVM_INPUT_RING_RECORD_BYTES <= DVM_INPUT_RING_APERTURE_BYTES` was just checked and the admitted
+            // mapping is exactly that large (fixed BAR shape, header region match), pinned by `mapping`'s lifecycle claim until
+            // it drops. The slot lies in [consumer, producer), committed by L0 and not rewritten until we publish the new consumer;
+            // volatile reads keep the compiler from assuming bytes stay unchanged, and inputd validates the copy.
             *byte = unsafe { mapped.add(offset + index).read_volatile() };
         }
         dest[written] = InputDvmRecordWire {
@@ -598,6 +637,8 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
         consumer,
         shared_control_publish_order(),
     );
+    // ORDERING: Release publishes the advanced software cursor; paired with the Acquire loads of CONSUMER in
+    // the readiness and next-turn paths (the shared consumer word was stored above with the same Release).
     CONSUMER.store(consumer, Ordering::Release);
     RECORDS_COPIED.fetch_add(written as u64, Ordering::Relaxed);
     if header.producer > consumer {
@@ -628,6 +669,7 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
 /// once per generation. This gives batching under load without relying on a
 /// stale empty/nonempty snapshot or an interrupt for every record.
 pub(crate) fn arm_consumer_wake() -> bool {
+    // ORDERING: Acquire pairs with the Release store of INSTALLED.
     if !INSTALLED.load(Ordering::Acquire) {
         return false;
     }
@@ -700,12 +742,16 @@ fn raise_shared_u64(base: *mut u8, offset: usize, value: u64, ordering: Ordering
 /// queue; otherwise that edge is lost and a finite poll can sleep forever.
 pub(crate) fn has_pending_records() -> bool {
     READINESS_POLLS.fetch_add(1, Ordering::Relaxed);
+    // ORDERING: Acquire loads of the reset barrier and interrupt-pending flag pair with their Release stores
+    // (revoke/withdraw/drain and input_ring_interrupt); a pending barrier or edge forces a broker turn.
     if RESET_PENDING_GENERATION.load(Ordering::Acquire) != 0 {
         return true;
     }
+    // ORDERING: Acquire pairs with the Release store of the pending hint in input_ring_interrupt and the broker turns.
     if IRQ_PENDING.load(Ordering::Acquire) {
         return true;
     }
+    // ORDERING: Acquire pairs with the Release store of INSTALLED.
     if !INSTALLED.load(Ordering::Acquire) {
         return false;
     }
@@ -726,6 +772,7 @@ pub(crate) fn has_pending_records() -> bool {
         return true;
     };
     let generation = mapping.generation();
+    // ORDERING: Acquire of the software cursor, published with Release by the drain owner.
     let consumer = CONSUMER.load(Ordering::Acquire);
     header.generation != generation
         || header.consumer != consumer
@@ -772,6 +819,7 @@ fn report_mapping_claim_failure() {
         input,
         "dvm-input-ring: readiness claim refused failures={} generation={} lifecycle_epoch={} in_flight={} installed={} polls={} turns={} copied={}",
         failures,
+        // ORDERING: diagnostic-only snapshot; Acquire matches the Release stores of GENERATION and INSTALLED, and no decision depends on it.
         GENERATION.load(Ordering::Acquire),
         INPUT_LIFECYCLE.epoch(),
         INPUT_LIFECYCLE.in_flight(),
@@ -783,6 +831,7 @@ fn report_mapping_claim_failure() {
 }
 
 fn input_ring_interrupt(_vector: u8) {
+    // ORDERING: Release sets the interrupt-pending hint; readers Acquire it in has_pending_records and swap it in service_pending.
     IRQ_PENDING.store(true, Ordering::Release);
     // This is a wake-only leaf. It does not inspect shared bytes, consume a
     // record, allocate, or execute input policy in interrupt context.
@@ -865,6 +914,7 @@ fn revoke(reason: &str) {
     crate::debug::record_milestone(
         crate::debug::LogCategory::Input,
         "dvm-input-transport-revoked",
+        // ORDERING: Acquire pairs with the Release store of GENERATION at install; used only to label the revoke milestone.
         GENERATION.load(Ordering::Acquire),
         revoke_reason_code(reason),
     );
@@ -892,6 +942,7 @@ fn finish_pending_lifecycle() {
     let Some(retired_generation) = INPUT_LIFECYCLE.finish_drain() else {
         return;
     };
+    // ORDERING: AcqRel swap makes one finisher the withdrawal owner; Release partner is the pending-bit store in withdraw_policy_consumer.
     if WITHDRAW_PENDING.swap(false, Ordering::AcqRel) {
         // ORDERING: AcqRel owns the one withdrawal reset; Acquire then observes
         // the mapping and cursor state published by the final claim.
@@ -899,6 +950,7 @@ fn finish_pending_lifecycle() {
         let valid = if mapped.is_null() {
             false
         } else if let Ok(header) = read_header(mapped) {
+            // ORDERING: Acquire of the software cursor, whose Release writers are excluded after the zero-claim finish_drain.
             let consumer = CONSUMER.load(Ordering::Acquire);
             if header.generation == retired_generation
                 && header.consumer == consumer
@@ -913,6 +965,7 @@ fn finish_pending_lifecycle() {
                     header.producer,
                     shared_control_publish_order(),
                 );
+                // ORDERING: Release publishes the withdrawal cursor and clears the interrupt hint; the shared consumer word above was already published with Release.
                 CONSUMER.store(header.producer, Ordering::Release);
                 IRQ_PENDING.store(false, Ordering::Release);
                 true
@@ -933,6 +986,7 @@ fn finish_pending_lifecycle() {
     if !REVOKE_PENDING.swap(false, Ordering::AcqRel) {
         return;
     }
+    // ORDERING: Release clears INSTALLED first so new claims fail; the AcqRel swap then takes the mapping address exactly once for unmap.
     INSTALLED.store(false, Ordering::Release);
     let mapped = SHARED_ADDR.swap(0, Ordering::AcqRel) as *mut u8;
     if !mapped.is_null() {
@@ -948,6 +1002,7 @@ fn finish_pending_lifecycle() {
     }
     release_mapping(mapped);
     IRQ_PENDING.store(false, Ordering::Release);
+    // ORDERING: Release resets the wake generation after the mapping was released, before the reset barrier below is published.
     CONSUMER_WAKE_GENERATION.store(0, Ordering::Release);
     // The kernel does not decode or own input/network policy. Publish a
     // generation-stamped barrier so inputd can revoke its state and notify
@@ -1003,6 +1058,7 @@ pub(crate) fn debug_snapshot() -> InputTransportDebugSnapshot {
 }
 
 fn reject_install(reason: u8) {
+    // ORDERING: Release stores publish the rejection reason before the sticky rejected flag; readers Acquire the flag, then the reason.
     INSTALL_REJECTION.store(reason, Ordering::Release);
     INSTALL_REJECTED.store(true, Ordering::Release);
     crate::debug::warn!(
@@ -1013,15 +1069,18 @@ fn reject_install(reason: u8) {
 }
 
 fn report_install_rejection_once() {
+    // ORDERING: AcqRel swap reports the sticky rejection once; the Acquire loads below pair with the Release stores in reject_install and find_input_ring.
     if INSTALL_REJECTION_REPORTED.swap(true, Ordering::AcqRel) {
         return;
     }
     crate::debug::println_serialized(format_args!(
         "DVM input ring rejected: reason={} discovery={} ivshmem_candidates={} exact_apertures={} aperture_start={:#x}",
+        // ORDERING: these Acquire loads pair with Release stores of the rejection and discovery diagnostics; they are report-only.
         install_rejection_name(INSTALL_REJECTION.load(Ordering::Acquire)),
         discovery_rejection_name(DISCOVERY_REJECTION.load(Ordering::Acquire)),
         DISCOVERY_IVSHMEM_CANDIDATES.load(Ordering::Acquire),
         DISCOVERY_EXACT_APERTURES.load(Ordering::Acquire),
+        // ORDERING: Acquire pairs with the Release store of the exact-aperture start in find_input_ring; report-only.
         DISCOVERY_EXACT_APERTURE_START.load(Ordering::Acquire),
     ));
     crate::debug::warn!(
@@ -1065,6 +1124,7 @@ fn install_rejection_name(reason: u8) -> &'static str {
 }
 
 fn consume_attach_attempt() -> bool {
+    // ORDERING: AcqRel bounded attach-attempt budget; the counter publishes no data, atomicity of the budget decrement is what matters.
     ATTACH_ATTEMPTS
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |attempts| {
             if attempts >= MAX_ATTACH_ATTEMPTS_PER_BOOT {
@@ -1109,6 +1169,7 @@ fn find_input_ring() -> Option<MappedInputRing> {
             return false;
         }
         exact_aperture_candidates = exact_aperture_candidates.saturating_add(1);
+        // ORDERING: Release store of the aperture start for the diagnostic report and later recovery identity check.
         DISCOVERY_EXACT_APERTURE_START.store(resource.start, Ordering::Release);
         if registers.is_io || registers.size < size_of::<u32>() as u64 {
             last_rejection = DISCOVERY_REJECTION_REGISTER_GEOMETRY;
@@ -1162,6 +1223,7 @@ fn find_input_ring() -> Option<MappedInputRing> {
         } else {
             exact_aperture_rejection
         };
+        // ORDERING: Release stores of the discovery diagnostics, read with Acquire by report_install_rejection_once; report-only.
         DISCOVERY_REJECTION.store(rejection, Ordering::Release);
         DISCOVERY_IVSHMEM_CANDIDATES.store(ivshmem_candidates as usize, Ordering::Release);
         DISCOVERY_EXACT_APERTURES.store(exact_aperture_candidates as usize, Ordering::Release);
@@ -1344,14 +1406,18 @@ fn arm_input_ring_interrupt(device: crate::arch::pci::PciDevice) -> Result<(), u
     if table.is_null() {
         return Err(INSTALL_REJECTION_TABLE_MAPPING);
     }
+    // SAFETY: `table` maps `table_len` bytes of uncached MSI-X table and table_offset + MSIX_ENTRY_BYTES <= table_len was
+    // checked above; the entry offsets are 4-byte aligned, volatile MMIO, and the mapping outlives the block.
     unsafe {
         program_msix_entry(table.add(table_offset), message);
+        // ORDERING: SeqCst fence completes programming the entry before it is unmasked.
         fence(Ordering::SeqCst);
         table
             .add(table_offset + MSIX_ENTRY_VECTOR_CONTROL_OFFSET)
             .cast::<u32>()
             .write_volatile(0);
     }
+    // ORDERING: SeqCst fence completes the unmask before MSI-X is enabled in PCI config space.
     fence(Ordering::SeqCst);
     capability.set_enabled(&attach, true);
     capability.set_function_masked(&attach, false);
@@ -1362,6 +1428,7 @@ fn arm_input_ring_interrupt(device: crate::arch::pci::PciDevice) -> Result<(), u
 }
 
 unsafe fn program_msix_entry(entry: *mut u8, message: crate::arch::msi::MsiMessage) {
+    // SAFETY: `entry` is a 16-byte, 4-byte aligned MSI-X table entry in uncached MMIO (see the call site's bounds check).
     unsafe {
         entry
             .add(MSIX_ENTRY_VECTOR_CONTROL_OFFSET)
@@ -1515,6 +1582,7 @@ mod tests {
     #[test]
     fn input_ring_control_words_are_atomic_and_ordered() {
         assert!(input_ring_atomic_control_layout_is_valid());
+        // ORDERING: pins the documented orderings of the shared control words: Acquire load, Release publish, AcqRel update, Acquire failure.
         assert_eq!(shared_control_load_order(), Ordering::Acquire);
         assert_eq!(shared_control_publish_order(), Ordering::Release);
         assert_eq!(shared_control_update_order(), Ordering::AcqRel);

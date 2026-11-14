@@ -27,6 +27,8 @@ impl Drop for ControlDrainGuard {
 /// a host acknowledgement. Unsupported focus changes fail closed because the
 /// current single-domain input broker has no multi-domain focus authority.
 pub(super) fn drain_dvm_control() {
+    // ORDERING: AcqRel swap claims the offline pending bit exactly once; Release partner is the store in
+    // gui_dvm_offline_interrupt. The IRQ leaf carries no data: the DVM's own shared-memory writes are read via volatile accesses.
     if GUI_DVM_OFFLINE_IRQ_PENDING.swap(false, Ordering::AcqRel) {
         GPU_LIFECYCLE.request_drain();
         // ORDERING: drain closes new claims before Release publishes pending
@@ -39,6 +41,8 @@ pub(super) fn drain_dvm_control() {
         GUI_DVM_LOGGED_INVITATION.store(0, Ordering::Release);
         GPU_PRIME_DURATION_NS.store(0, Ordering::Release);
         GPU_SUBMIT_FLAGS.store(0, Ordering::Release);
+        // ORDERING: Release reset of the session counter for the replacement epoch; the next submitter reads it under
+        // GpuSubmitGuard after its AcqRel CAS. The offline IRQ has already cleared PEER_READY and requested the lifecycle drain.
         GPU_SESSION_SUBMISSIONS.store(0, Ordering::Release);
         // A future relay must not mistake an old confirmation for approval of
         // a reused generation after DVM restart.
@@ -51,6 +55,8 @@ pub(super) fn drain_dvm_control() {
             return;
         }
     }
+    // ORDERING: AcqRel swap claims the control pending bit; Release partner is gui_dvm_control_interrupt, so a record
+    // published by the DVM before its interrupt is processed by exactly one drainer.
     if !GUI_DVM_CONTROL_IRQ_PENDING.swap(false, Ordering::AcqRel) {
         return;
     }
@@ -69,6 +75,7 @@ pub(super) fn drain_dvm_control() {
         return;
     }
     let _control_drain = ControlDrainGuard;
+    // ORDERING: Acquire pairs with the Release store of the expected invitation in signal_gui_dvm and the Release clears here and in revoke_transport.
     let expected = GUI_DVM_EXPECTED_INVITATION.load(Ordering::Acquire);
     let ready_ack = read_u64(DVM_GUI_SURFACE_POOL_READY_ACK_OFFSET);
     if expected != 0 && expected == ready_ack {
@@ -76,6 +83,8 @@ pub(super) fn drain_dvm_control() {
             revoke_transport("gpu-prime-completion-invalid", ready_ack);
             return;
         };
+        // ORDERING: the prime proof fields are Release-stored before PEER_READY below; gpu_atlas_info_snapshot
+        // Acquire-loads PEER_READY first, so a ready peer always exposes the validated duration and submit flags.
         GPU_PRIME_DURATION_NS.store(prime.duration_ns, Ordering::Release);
         GPU_SUBMIT_FLAGS.store(prime.submit_flags, Ordering::Release);
         GUI_DVM_PEER_READY.store(true, Ordering::Release);
@@ -87,6 +96,7 @@ pub(super) fn drain_dvm_control() {
         // interrupts disabled, on the same transport the acceptance proof reads
         // its per-second windows from. The protocol path below is unchanged.
         let already_confirmed =
+            // ORDERING: once-per-invitation log gate. Nothing is published through it; AcqRel is stronger than the diagnostic needs.
             GUI_DVM_LOGGED_INVITATION.swap(expected, Ordering::AcqRel) == expected;
         if !already_confirmed {
             nucleus_core::debug::write_debugcon_only_line(
@@ -108,6 +118,7 @@ pub(super) fn drain_dvm_control() {
         signal_gui_dvm(expected);
     }
     let sequence = read_u64(DVM_GUI_SURFACE_POOL_DVM_SEQUENCE_OFFSET);
+    // ORDERING: Acquire read of the acknowledged sequence; stored (Release) only by the exclusive CONTROL_DRAIN owner, revoke_transport or install.
     let acknowledged = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
     if sequence == 0 || sequence <= acknowledged {
         return;
@@ -118,11 +129,14 @@ pub(super) fn drain_dvm_control() {
     };
     let valid_release = matches!(message.kind, DvmGuiSurfaceMessageKind::Release)
         && message.is_valid_for_dimensions(
+            // ORDERING: Acquire loads pair with the install-time Release stores of the pool dimensions.
             POOL_WIDTH.load(Ordering::Acquire),
             POOL_HEIGHT.load(Ordering::Acquire),
         )
         && usize::try_from(message.slot).ok().is_some_and(|slot| {
             slot < GUI_SLOT_COUNT
+                // ORDERING: Acquire of READY then the generation pairs with publish_frame's Release stores, which store the
+                // generation before READY; a slot the host never published, or that is WRITING/FREE, cannot be released by the DVM.
                 && SLOT_STATE[slot].load(Ordering::Acquire) == GUI_SLOT_READY
                 && SLOT_GENERATION[slot].load(Ordering::Acquire) == message.generation
         });
@@ -131,6 +145,8 @@ pub(super) fn drain_dvm_control() {
         return;
     }
     let slot = message.slot as usize;
+    // ORDERING: the DVM release is validated; generation is cleared, then Release FREE pairs with reserve_free_slot's
+    // AcqRel claim CAS, and the acknowledged sequence is Released last so the host ack below reflects the freed slot.
     SLOT_GENERATION[slot].store(0, Ordering::Release);
     SLOT_STATE[slot].store(GUI_SLOT_FREE, Ordering::Release);
     GUI_DVM_ACKED_CONTROL_SEQUENCE.store(sequence, Ordering::Release);
@@ -143,6 +159,8 @@ pub(super) fn revoke_transport(reason: &str, sequence: u64) {
     TRANSPORT_REVOKED.store(true, Ordering::Release);
     GPU_LIFECYCLE.request_drain();
     GPU_EPOCH_RESET_PENDING.store(true, Ordering::Release);
+    // ORDERING: revocation clears submit flags, peer readiness and the expected invitation with Release after the
+    // TRANSPORT_REVOKED store above, so no later consumer observes readiness for a revoked transport.
     GPU_SUBMIT_FLAGS.store(0, Ordering::Release);
     GUI_DVM_PEER_READY.store(false, Ordering::Release);
     GUI_DVM_EXPECTED_INVITATION.store(0, Ordering::Release);
@@ -211,11 +229,15 @@ pub(super) fn reset_gpu_slots() {
         "gui-dvm reset attempted with in-flight transport claims"
     );
     for slot in 0..GPU_SLOT_STATE.len() {
+        // ORDERING: runs only with no in-flight claim (asserted above). Capability words are cleared, then the Release FREE
+        // store at the end pairs with the next submitter's AcqRel claim CAS on FREE.
         GPU_SLOT_GENERATION[slot].store(0, Ordering::Release);
         GPU_SLOT_SEQUENCE[slot].store(0, Ordering::Release);
         GPU_SLOT_CONTEXT_ID[slot].store(0, Ordering::Release);
+        // ORDERING: remaining capability words cleared with Release; see the group above.
         GPU_SLOT_CONTEXT_EPOCH[slot].store(0, Ordering::Release);
         GPU_SLOT_SUBMIT_VALUE[slot].store(0, Ordering::Release);
+        // ORDERING: Release FREE last, pairs with the AcqRel claim CAS in try_submit_gpu_atlas.
         GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
         if let Some(offset) = dvm_gpu_atlas_invitation_offset(slot as u32) {
             write_u64(offset, 0);
@@ -234,6 +256,7 @@ pub(super) fn read_gpu_prime_completion() -> Option<DvmGpuPrimeCompletion> {
     read_bytes(DVM_GPU_ATLAS_PRIME_COMPLETION_OFFSET, &mut bytes)?;
     let completion = DvmGpuPrimeCompletion::decode(&bytes)?;
     (completion.context_id == GPU_CONTEXT_ID
+        // ORDERING: Acquire pairs with the Release store of the context epoch in service_gpu_epoch_reset/install; a prime proof for another epoch is rejected.
         && completion.context_epoch == GPU_CONTEXT_EPOCH.load(Ordering::Acquire)
         && completion.status == DvmGpuPrimeCompletionStatus::Ready
         && completion.fence_value == GPU_PRIME_FENCE_VALUE)
@@ -241,16 +264,23 @@ pub(super) fn read_gpu_prime_completion() -> Option<DvmGpuPrimeCompletion> {
 }
 
 pub(super) fn signal_gui_dvm(generation: u64) {
+    // ORDERING: Acquire loads pair with the install-time Release store of the doorbell address and the Release PEER_READY stores.
     let doorbell = SHARED_DOORBELL_ADDR.load(Ordering::Acquire);
     if doorbell == 0 || generation == 0 || generation & 1 != 0 {
         return;
     }
+    // ORDERING: Acquire PEER_READY; only an unready peer is told the invitation, written before EXPECTED_INVITATION is Released.
     if !GUI_DVM_PEER_READY.load(Ordering::Acquire) {
         write_u64(DVM_GUI_SURFACE_POOL_INVITATION_OFFSET, generation);
+        // ORDERING: Release publishes the expected invitation after the invitation word was written; drain_dvm_control Acquire-loads it before comparing the DVM's ready ack.
         GUI_DVM_EXPECTED_INVITATION.store(generation, Ordering::Release);
     }
+    // ORDERING: SeqCst fence orders the invitation and every earlier shared-memory store ahead of the doorbell MMIO write.
     fence(Ordering::SeqCst);
     let value = (GUI_DVM_PEER_ID << 16).to_le();
+    // SAFETY: `doorbell` is the non-zero BAR0 register mapping published at install and never unmapped;
+    // find_ivshmem_gui_pool checked registers.size covers the 4-byte write at IVSHMEM_DOORBELL_OFFSET, and the
+    // mapping is page aligned, so this is an aligned volatile MMIO store.
     unsafe {
         (doorbell as *mut u8)
             .add(IVSHMEM_DOORBELL_OFFSET)
@@ -260,11 +290,13 @@ pub(super) fn signal_gui_dvm(generation: u64) {
 }
 
 pub(super) fn reinvite_newest_ready_slot() {
+    // ORDERING: Acquire loads pair with the Release stores of PEER_READY and TRANSPORT_REVOKED; a ready or revoked transport is not re-invited.
     if GUI_DVM_PEER_READY.load(Ordering::Acquire) || TRANSPORT_REVOKED.load(Ordering::Acquire) {
         return;
     }
     let mut newest = 0_u64;
     for slot in 0..GUI_SLOT_COUNT {
+        // ORDERING: Acquire of READY then the generation pairs with publish_frame's Release stores (generation before READY).
         if SLOT_STATE[slot].load(Ordering::Acquire) == GUI_SLOT_READY {
             newest = newest.max(SLOT_GENERATION[slot].load(Ordering::Acquire));
         }
@@ -272,6 +304,7 @@ pub(super) fn reinvite_newest_ready_slot() {
     if newest == 0 || newest & 1 != 0 {
         return;
     }
+    // ORDERING: Acquire pairs with the Release store of the expected invitation in signal_gui_dvm.
     if GUI_DVM_EXPECTED_INVITATION.load(Ordering::Acquire) != newest {
         signal_gui_dvm(newest);
     }
@@ -309,10 +342,14 @@ pub(super) fn read_u64(offset: usize) -> u64 {
 }
 
 pub(super) fn write_bytes(offset: usize, bytes: &[u8]) {
+    // ORDERING: Acquire pairs with the install-time Release store of the control header address (zeroed on replacement).
     let header = SHARED_HEADER_ADDR.load(Ordering::Acquire);
     if header == 0 {
         return;
     }
+    // SAFETY: `header` is the uncached control mapping of DVM_GUI_SURFACE_POOL_HEADER_BYTES (4096), never unmapped
+    // after install, so a pointer loaded before a racing replacement stays valid. This function does not itself bound
+    // offset + len; every caller passes a fixed protocol offset plus a fixed or slot-bounded length, all < 4096 (audited).
     unsafe {
         for (index, byte) in bytes.iter().enumerate() {
             (header as *mut u8)
@@ -320,14 +357,17 @@ pub(super) fn write_bytes(offset: usize, bytes: &[u8]) {
                 .write_volatile(*byte);
         }
     }
+    // ORDERING: SeqCst fence orders these volatile control-header stores ahead of later stores, notably the doorbell write and slot publication.
     fence(Ordering::SeqCst);
 }
 
 pub(super) fn read_bytes(offset: usize, bytes: &mut [u8]) -> Option<()> {
+    // ORDERING: Acquire pairs with the install-time Release store of the control header address.
     let header = SHARED_HEADER_ADDR.load(Ordering::Acquire);
     if header == 0 {
         return None;
     }
+    // SAFETY: same control-header mapping and caller-bounded offsets as in write_bytes (all < 4096, never unmapped).
     unsafe {
         for (index, byte) in bytes.iter_mut().enumerate() {
             *byte = (header as *const u8).add(offset + index).read_volatile();
@@ -340,6 +380,7 @@ pub(super) fn slot_offset(slot: usize) -> Option<usize> {
     if slot >= GUI_SLOT_COUNT {
         return None;
     }
+    // ORDERING: Acquire pairs with the install-time Release store of the slot size.
     let slot_bytes = usize::try_from(POOL_SLOT_BYTES.load(Ordering::Acquire)).ok()?;
     (DVM_GUI_SURFACE_POOL_HEADER_BYTES as usize).checked_add(slot.checked_mul(slot_bytes)?)
 }

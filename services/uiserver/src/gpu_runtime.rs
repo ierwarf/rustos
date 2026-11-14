@@ -470,6 +470,10 @@ impl GpuCompositor {
                 ));
                 EINVAL
             })?;
+            // SAFETY: `surface.handle` is the descriptor DISPLAY_IOCTL_CREATE_SURFACE just
+            // created for this process; it was validated non-zero and fits i32, and nothing
+            // else closes it, so `OwnedFd` takes unique ownership (closed on any later
+            // error return or when the slot drops).
             let surface_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
             let mapping_len = usize::try_from(surface.mapping_len)
                 .ok()

@@ -408,7 +408,7 @@ fn terminalize_binding_after_endpoint_revalidation(binding_id: u64, target: Qual
 pub(super) fn syscall_linux_rustos_smp_qualification_bind(args_ptr: u64) -> u64 {
     let args = match usermem::read_current_user_struct::<RustosSmpQualificationBindArgs>(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     if !linux_abi::smp_qualification_bind_shape_valid(&args) {
         return linux_errno(LINUX_EINVAL);

@@ -26,6 +26,7 @@ pub(in crate::multitask::scheduler) fn retained_scheduling_context(
 
 /// [`retained_scheduling_context`] for the task a masked CPU is executing, whose
 /// own Current bank retains it in place of a binding permit.
+#[cfg(rustos_boot_image)]
 pub(in crate::multitask::scheduler) fn retained_scheduling_context_for(
     slot: usize, id: u64,
 ) -> Option<kernel_object::api::identity::ObjectIdentity> {

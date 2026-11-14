@@ -846,7 +846,7 @@ dvm_snapshot_file_open_line="$(grep -n -m1 -F 'std::fs::File::open(disk)' <<<"$d
 dvm_snapshot_first_sync_line="$(grep -n -m1 -F '.sync_all()' <<<"$dvm_snapshot_sync_body" | cut -d: -f1)"
 dvm_snapshot_directory_open_line="$(grep -n -m1 -F 'std::fs::File::open(directory)' <<<"$dvm_snapshot_sync_body" | cut -d: -f1)"
 dvm_snapshot_last_sync_line="$(grep -n -F '.sync_all()' <<<"$dvm_snapshot_sync_body" | tail -n 1 | cut -d: -f1)"
-dvm_snapshot_copy_line="$(rg -n -m1 -F 'fs::copy(&runtime_disk, &disk)' tools/xtask/src/kvm/layout.rs | cut -d: -f1)"
+dvm_snapshot_copy_line="$(rg -n -m1 -F 'copy_sparse_file(&runtime_disk, &disk)' tools/xtask/src/kvm/layout.rs | cut -d: -f1)"
 dvm_snapshot_permissions_line="$(rg -n -m1 -F 'fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600))?' tools/xtask/src/kvm/layout.rs | cut -d: -f1)"
 dvm_snapshot_sync_call_line="$(rg -n -m1 -F 'sync_private_dvm_block_snapshot(&disk, &run_dir)?' tools/xtask/src/kvm/layout.rs | cut -d: -f1)"
 dvm_snapshot_aperture_line="$(rg -n -m1 -F 'create_dvm_block_aperture(&aperture, &disk, &config.storage_epoch_signing_key)?' tools/xtask/src/kvm/layout.rs | cut -d: -f1)"
@@ -2208,7 +2208,7 @@ sigchld-notification/SigchldNotification|kernel-ps|multitask::scheduler::tests::
 sigchld-notification/SigchldNotification|rustos-user-abi|syscall::syscall_tests::nocldstop_suppresses_only_nonterminal_child_state_changes
 sigchld-notification/SigchldNotification|kernel-compat|user::syscall::linux::support::tests::sigchld_selection_cannot_clear_unselected_or_future_causes
 exception-retirement-lifecycle/ExceptionRetirementLifecycle|kernel-hal|arch::idt::handlers::tests::general_exception_bridge_aligns_every_rust_call_boundary
-exception-retirement-lifecycle/ExceptionRetirementLifecycle|kernel-compat|user::syscall::linux::broker_ops::lifecycle_broker_ops::tests::only_original_final_fault_token_commits_process_termination
+exception-retirement-lifecycle/ExceptionRetirementLifecycle|kernel-compat|user::syscall::linux::broker_ops::lifecycle_broker_ops::tests::only_original_final_or_sealed_fault_token_commits_process_termination
 exception-retirement-lifecycle/ExceptionRetirementLifecycle|kernel-ps|multitask::scheduler::tests::retirement_revokes_task_and_process_ipc_authority
 futex-waiter-lifecycle/FutexWaiterLifecycle|kernel-compat|user::syscall::linux::service_ops::futex_thread::tests::task_identity_cleanup_removes_a_requeued_waiter
 futex-waiter-lifecycle/FutexWaiterLifecycle|kernel-compat|user::syscall::linux::service_ops::futex_thread::tests::supported_futex_admission_is_local_and_complete
@@ -2309,7 +2309,7 @@ ipc-handle-transfer/IpcHandleTransfer|kernel-compat|user::syscall::linux::servic
 process-signal-delivery/ProcessSignalDelivery|kernel-compat|user::syscall::linux::support::tests::signal_selection_revalidates_pending_mask_and_uncatchable_policy
 process-signal-delivery/ProcessSignalDelivery|kernel-compat|user::syscall::linux::support::tests::restored_signal_mask_cannot_block_kill_or_stop
 process-signal-delivery/ProcessSignalDelivery|kernel-compat|user::syscall::linux::process_termination_tests::x86_user_faults_have_linux_wait_signal_status
-process-signal-delivery/ProcessSignalDelivery|kernel-compat|user::syscall::linux::broker_ops::lifecycle_broker_ops::tests::only_original_final_fault_token_commits_process_termination
+process-signal-delivery/ProcessSignalDelivery|kernel-compat|user::syscall::linux::broker_ops::lifecycle_broker_ops::tests::only_original_final_or_sealed_fault_token_commits_process_termination
 process-signal-delivery/ProcessSignalDelivery|kernel-executive|hal_hooks::tests::linux_fault_policy_is_not_applied_to_windows_abi
 memfd-seal-lifecycle/MemfdSealLifecycle|kernel-ps|user::memfd::tests::memfd_seals_reject_growth_and_mapping_counter_overflow
 dvm-gpu-compositor/DvmGpuCompositor|driver-domain-protocol|tests::gpu_render_contract_is_fixed_bounded_and_address_free

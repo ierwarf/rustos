@@ -400,7 +400,7 @@ pub(crate) fn revoke_waitset_provider(service_id: u64) {
 pub(super) fn syscall_linux_rustos_waitset_signal_broker(args_ptr: u64) -> u64 {
     let args = match usermem::read_current_user_struct::<WaitSetSignalBrokerArgs>(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
     };
     // Published readiness packs `generation << 1 | ready` into one word, so the
     // top generation bit would be silently dropped and could regress the

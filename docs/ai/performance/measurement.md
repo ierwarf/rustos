@@ -324,8 +324,8 @@ lock, and service restart invalidates it by advancing the epoch.
 
 - Storaged starts a first or random cache miss with one 64-KiB DVM block
   ticket. A later miss must equal the exact preceding window end before it can
-  expand into at most eight contiguous tickets. It publishes that complete
-  bounded batch before waiting, so the 32-entry transport queue overlaps
+  expand into at most sixteen contiguous tickets. It publishes that complete
+  bounded batch before waiting, so the 64-entry transport queue overlaps
   device latency for actual sequential reads while random FAT metadata does
   not amplify into 512-KiB traffic. Partial submission is cancelled; a
   completion failure cancels the remainder and clears cached generation

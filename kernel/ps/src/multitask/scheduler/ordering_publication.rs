@@ -152,5 +152,58 @@ fn process_in(scope: &DispatchPreemption<'_>, pid: u64) -> Option<u64> {
     Some(target.binding.id())
 }
 
+/// Brings a Fair-class housekeeping worker back to the active class/caller
+/// latency floor when urgent kernel work is queued so accumulated past
+/// housekeeping turns cannot strand it behind CPU-bound user threads.
+pub(in crate::multitask) fn housekeeping(id: u64) -> bool {
+    if nucleus_core::util::lockdep::preemption_disabled()
+        || nucleus_core::util::lockdep::held_spin_lock_depth() != 0
+    {
+        return false;
+    }
+    scoped(|scope| housekeeping_in(scope, id))
+}
+fn housekeeping_in(scope: &DispatchPreemption<'_>, id: u64) -> bool {
+    let Some(target) = Target::capture(id) else {
+        return false;
+    };
+    let current = current_terminal::OriginalCurrent::borrow(scope);
+    let _publication = dispatch_priority::Publication::begin(scope, target.cpu);
+    if !target.ready() {
+        return false;
+    }
+    let slot = target.binding.slot();
+    if let Ok(class) = local_dispatch::observed_class(slot) {
+        let band = kernel_creation::ready_floor(
+            target.cpu,
+            Some(class == local_dispatch::LocalClass::System),
+        )
+        .saturating_sub(IPC_DONATION_BONUS_NS);
+        let ceiling = match current.as_ref() {
+            Some(cur)
+                if cur.member().0 != slot
+                    && !runqueue::is_idle_slot(cur.member().0)
+                    && target.cpu == scope.cpu() =>
+            {
+                let caller = runqueue::vruntime(cur.member().0)
+                    .saturating_sub(IPC_DONATION_BONUS_NS);
+                caller.min(band)
+            }
+            _ => band,
+        };
+        runqueue::lower_vruntime_ceiling(slot, ceiling);
+        if let Some(cur) = current.as_ref() {
+            cur.check();
+        }
+    }
+    dispatch_policy::lock(target.cpu).next_pick_hint = Some(dispatch_policy::LatencyPickHint {
+        slot,
+        task_id: target.binding.id(),
+    });
+    #[cfg(not(test))]
+    crate::multitask::irq::request_target_reschedule(target.cpu);
+    true
+}
+
 #[cfg(test)]
 pub(super) mod tests;

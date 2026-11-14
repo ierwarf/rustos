@@ -43,7 +43,7 @@ pub use crate::__rustos_debug_trace as trace;
 pub use crate::__rustos_debug_warn as warn;
 pub use crate::__rustos_debug_warn_ratelimited as warn_ratelimited;
 
-#[cfg(all(rustos_debug_print_enabled, not(test)))]
+#[cfg(all(rustos_debug_print_enabled, rustos_boot_image, not(test)))]
 const DEBUGCON_PORT: u16 = 0x00e9;
 #[cfg(rustos_debug_print_enabled)]
 const TEXT_RING_CAPACITY: usize = RUSTOS_LOGGING_RING_BUFFER_BYTES;

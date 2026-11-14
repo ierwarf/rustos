@@ -31,7 +31,9 @@ use core::mem::size_of;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 
+#[cfg(not(test))]
 use pagerd::library_custody::{self, Custody, Pressure, ReclaimHost};
+#[cfg(not(test))]
 use pagerd::library_warm::{self, ReadChunk, WarmHost};
 use pagerd::{request_sender_is_authorized, PagerFaultError, PagerState};
 use rustos_svc_runtime::{ipc, pager as pager_rendezvous};
@@ -173,10 +175,14 @@ fn serve(endpoint: u64, pager: &mut PagerState) {
         // Retries until the kernel admits the heartbeat thread (procd may not
         // be up when pagerd starts); a single relaxed load once it is running.
         rustos_svc_runtime::heartbeat::ensure_thread(rustos_user_abi::syscall::IPC_SERVICE_PAGERD);
+        #[cfg(not(test))]
         warm_worker::ensure();
         let mut reply_cap = 0;
         let mut sender_pid = 0;
         let mut sender_tid = 0;
+        // SAFETY: `bytes` is writable for `bytes.len()` and `reply_cap`, `sender_pid`,
+        // `sender_tid` are live locals for the call; the kernel fills them only on
+        // success and validates the addresses itself.
         let received = unsafe {
             ipc::try_recv_with_sender(
                 endpoint,
@@ -189,6 +195,9 @@ fn serve(endpoint: u64, pager: &mut PagerState) {
         };
         if received >= 0 {
             let response = handle_request(pager, received as usize, &bytes, sender_pid, sender_tid);
+            // SAFETY: `reply_cap` is the one-shot capability returned by the receive above
+            // (`received >= 0`); `response` is live and readable for exactly its size, and
+            // the kernel only reads it.
             unsafe {
                 ipc::reply(
                     reply_cap,
@@ -353,6 +362,10 @@ fn decode_payload<T: Copy>(request: &CommercialMaxProtocolRequest) -> Result<T, 
 
 fn write_payload<T: Copy>(response: &mut CommercialMaxProtocolResponse, value: &T) {
     let len = size_of::<T>();
+    // SAFETY: `len = size_of::<T>()` bytes are read from `value`, and the callers
+    // only pass the pager reply wire struct, whose size is const-asserted <= 256,
+    // within the 4096-byte payload; `value` and `response.payload` are distinct
+    // borrows, so they cannot overlap.
     unsafe {
         core::ptr::copy_nonoverlapping(
             (value as *const T).cast::<u8>(),
@@ -365,6 +378,9 @@ fn write_payload<T: Copy>(response: &mut CommercialMaxProtocolResponse, value: &
 
 fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
     assert!(bytes.len() >= size_of::<T>());
+    // SAFETY: the assert above guarantees `size_of::<T>()` readable bytes;
+    // `read_unaligned` places no alignment requirement, and `T: Copy` wire structs
+    // are plain integers for which every bit pattern is valid.
     unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) }
 }
 
@@ -390,6 +406,8 @@ const fn errno(error: PagerFaultError) -> i32 {
 /// It never runs on the serve/fault thread: it waits for vfsd, which may
 /// itself need this pager to answer requests, and the cache is only a
 /// performance hint. Failure leaves every mapping on the eager-copy path.
+/// Absent from test builds: the host test binary has no worker thread.
+#[cfg(not(test))]
 mod warm_worker {
     use super::*;
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -434,7 +452,7 @@ mod warm_worker {
         if STARTED.load(Ordering::Relaxed) || ATTEMPTS.fetch_add(1, Ordering::Relaxed) % 32 != 0 {
             return;
         }
-        #[cfg(all(target_arch = "x86_64", not(test)))]
+        #[cfg(target_arch = "x86_64")]
         {
             // ORDERING: AcqRel claims the single spawn; the failure Release below
             // republishes "not started" only after the spawn attempt returned.
@@ -524,7 +542,9 @@ mod warm_worker {
         for _ in 0..MAX_ATTEMPTS {
             let endpoint = ipc::lookup_service_endpoint(IPC_SERVICE_VFSD);
             last_endpoint = endpoint as i64;
+            // SAFETY: `syscall0` of getpid takes no arguments and touches no memory.
             let pid = unsafe { rustos_svc_runtime::syscall::syscall0(SYS_GETPID) };
+            // SAFETY: `syscall0` of gettid takes no arguments and touches no memory.
             let tid = unsafe { rustos_svc_runtime::syscall::syscall0(SYS_GETTID) };
             let (pid, tid) = if pid > 0 && tid > 0 {
                 (pid as u64, tid as u64)

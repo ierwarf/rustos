@@ -271,7 +271,7 @@ fn read_rt_signal_frame(rsp: u64) -> Result<LinuxRtSigFrame, i64> {
     match usermem::read_current_user_struct::<LinuxRtSigFrame>(frame_addr) {
         Ok(saved) if validate_rt_signal_frame(&saved) => Ok(saved),
         Ok(_) => Err(LINUX_EINVAL),
-        Err(err) => Err(address_space_error_to_linux_errno(err)),
+        Err(err) => Err(user_pointer_error_to_linux_errno(err)),
     }
 }
 
@@ -363,7 +363,7 @@ fn install_rt_signal_frame(
         .checked_sub(size_of::<u64>() as u64)
         .ok_or(LINUX_EFAULT)?;
     usermem::write_current_user_bytes(new_rsp, as_bytes(&signal_frame))
-        .map_err(address_space_error_to_linux_errno)?;
+        .map_err(user_pointer_error_to_linux_errno)?;
     frame.user_rsp = new_rsp;
     frame.user_rip = action.handler;
     frame.rax = 0;

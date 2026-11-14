@@ -28,7 +28,7 @@ pub(crate) fn call_syscalld_raw(request: &[u8]) -> Result<Vec<u8>, i64> {
 
 pub(super) fn syscall_linux_syscalld_uname(buf_ptr: u64) -> u64 {
     if let Err(err) = usermem::validate_current_user_write_buffer(buf_ptr, LINUX_UTSNAME_SIZE) {
-        return linux_errno(address_space_error_to_linux_errno(err));
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     let response = match call_syscalld(new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_UNAME)) {
         Ok(response) => response,
@@ -39,7 +39,7 @@ pub(super) fn syscall_linux_syscalld_uname(buf_ptr: u64) -> u64 {
     }
     match usermem::write_current_user_bytes(buf_ptr, &response.payload[..LINUX_UTSNAME_SIZE]) {
         Ok(()) => 0,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
     }
 }
 
@@ -55,7 +55,7 @@ pub(super) fn syscall_linux_syscalld_prlimit64(
     if new_limit_ptr != 0 {
         let mut new_limit = [0_u8; LINUX_RLIMIT_SIZE];
         if let Err(err) = usermem::copy_from_current_user_exact(new_limit_ptr, &mut new_limit) {
-            return linux_errno(address_space_error_to_linux_errno(err));
+            return linux_errno(user_pointer_error_to_linux_errno(err));
         }
         request.mask |= 0x1;
         request.path_len = LINUX_RLIMIT_SIZE as u32;
@@ -65,7 +65,7 @@ pub(super) fn syscall_linux_syscalld_prlimit64(
         if let Err(err) =
             usermem::validate_current_user_write_buffer(old_limit_ptr, LINUX_RLIMIT_SIZE)
         {
-            return linux_errno(address_space_error_to_linux_errno(err));
+            return linux_errno(user_pointer_error_to_linux_errno(err));
         }
         request.mask |= 0x2;
     }
@@ -83,7 +83,7 @@ pub(super) fn syscall_linux_syscalld_prlimit64(
         if let Err(err) =
             usermem::write_current_user_bytes(old_limit_ptr, &response.payload[..LINUX_RLIMIT_SIZE])
         {
-            return linux_errno(address_space_error_to_linux_errno(err));
+            return linux_errno(user_pointer_error_to_linux_errno(err));
         }
     } else if response.payload_len != 0 {
         return linux_errno(LINUX_EINVAL);
@@ -103,7 +103,7 @@ pub(super) fn syscall_linux_syscalld_sched_getaffinity(
         return linux_errno(LINUX_EINVAL);
     }
     if let Err(err) = usermem::validate_current_user_write_buffer(mask_ptr, LINUX_CPUSET_BYTES) {
-        return linux_errno(address_space_error_to_linux_errno(err));
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     let online_mask = kernel_hal::api::cpu::admitted_online_mask();
     let task_mask = match multitask::linux_task_affinity(pid, online_mask) {
@@ -130,7 +130,7 @@ pub(super) fn syscall_linux_syscalld_sched_getaffinity(
     }
     match usermem::write_current_user_bytes(mask_ptr, &response.payload[..payload_len]) {
         Ok(()) => payload_len as u64,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
     }
 }
 
@@ -147,7 +147,7 @@ pub(super) fn syscall_linux_syscalld_sched_setaffinity(
     }
     let mut mask_bytes = [0_u8; LINUX_CPUSET_BYTES];
     if let Err(err) = usermem::copy_from_current_user_exact(mask_ptr, &mut mask_bytes) {
-        return linux_errno(address_space_error_to_linux_errno(err));
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     let online_mask = kernel_hal::api::cpu::admitted_online_mask();
     let requested_mask = u64::from_le_bytes(mask_bytes);
@@ -421,7 +421,7 @@ pub(super) fn syscall_linux_syscalld_getrandom(user_ptr: u64, user_len: u64, fla
         if let Err(err) =
             usermem::write_current_user_bytes(dest_ptr, &response.payload[..payload_len])
         {
-            return linux_errno(address_space_error_to_linux_errno(err));
+            return linux_errno(user_pointer_error_to_linux_errno(err));
         }
         copied += payload_len;
     }
@@ -432,7 +432,7 @@ pub(super) fn syscall_linux_wait4(pid: i64, status_ptr: u64, options: u64, rusag
     if status_ptr != 0
         && let Err(err) = usermem::validate_current_user_write_buffer(status_ptr, size_of::<i32>())
     {
-        return linux_errno(address_space_error_to_linux_errno(err));
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     if rusage_ptr != 0
         && let Err(err) = usermem::validate_current_user_write_buffer(
@@ -440,7 +440,7 @@ pub(super) fn syscall_linux_wait4(pid: i64, status_ptr: u64, options: u64, rusag
             size_of::<linux_abi::LinuxRusage>(),
         )
     {
-        return linux_errno(address_space_error_to_linux_errno(err));
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
 
     let mut request = new_procd_request(PROCD_OP_WAIT4);
@@ -478,7 +478,7 @@ pub(super) fn syscall_linux_wait4(pid: i64, status_ptr: u64, options: u64, rusag
                 if status_ptr != 0
                     && let Err(err) = usermem::write_current_user_struct(status_ptr, &status)
                 {
-                    return linux_errno(address_space_error_to_linux_errno(err));
+                    return linux_errno(user_pointer_error_to_linux_errno(err));
                 }
                 if rusage_ptr != 0
                     && let Err(err) = usermem::write_current_user_struct(
@@ -486,7 +486,7 @@ pub(super) fn syscall_linux_wait4(pid: i64, status_ptr: u64, options: u64, rusag
                         &linux_abi::LinuxRusage::default(),
                     )
                 {
-                    return linux_errno(address_space_error_to_linux_errno(err));
+                    return linux_errno(user_pointer_error_to_linux_errno(err));
                 }
                 // Blocking wait is the lifecycle consumer's backpressure
                 // point. Advance the same bounded cleanup owner as executive

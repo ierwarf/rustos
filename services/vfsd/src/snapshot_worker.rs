@@ -11,7 +11,7 @@ use rustos_svc_runtime::ipc;
 use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::syscall::{
     VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse,
-    VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN,
+    VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION,
     VFS_EXECUTABLE_SNAPSHOT_OP_POLL, VFS_EXECUTABLE_SNAPSHOT_OP_CANCEL,
     VFS_EXECUTABLE_SNAPSHOT_PENDING, VFS_EXECUTABLE_SNAPSHOT_MAX_LEASE_MS,
 };

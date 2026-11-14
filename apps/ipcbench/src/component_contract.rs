@@ -18,6 +18,9 @@ pub const PROBES: &[(&str, u64)] = &[
     ("ipc_rt_intra_process_reply_recv", 20_000),
 ];
 
+// TEST-HARNESS: shared source; xtask includes this file by path and calls `split_names`; the
+// ipcbench guest binary itself only exercises it in its tests.
+#[allow(dead_code)]
 pub fn split_names(probe: &str) -> &'static [&'static str] {
     match probe {
         "ipc_rt_intra_process" => &[

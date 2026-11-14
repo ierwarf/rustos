@@ -59,6 +59,6 @@ pub(super) fn syscall_sched_context_snapshot(out_ptr: u64) -> u64 {
     };
     match usermem::write_current_user_struct(out_ptr, &wire) {
         Ok(()) => 0,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
     }
 }

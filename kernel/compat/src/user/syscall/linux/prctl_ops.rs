@@ -17,19 +17,27 @@
 
 use super::*;
 
+#[cfg(test)]
 pub(crate) const PR_SET_PDEATHSIG: u64 = 1;
+#[cfg(test)]
 pub(crate) const PR_GET_PDEATHSIG: u64 = 2;
 pub(crate) const PR_GET_DUMPABLE: u64 = 3;
 pub(crate) const PR_SET_DUMPABLE: u64 = 4;
+#[cfg(test)]
 pub(crate) const PR_GET_SECCOMP: u64 = 21;
+#[cfg(test)]
 pub(crate) const PR_SET_SECCOMP: u64 = 22;
+#[cfg(test)]
 pub(crate) const PR_CAPBSET_READ: u64 = 23;
 pub(crate) const PR_SET_NAME: u64 = 15;
 pub(crate) const PR_GET_NAME: u64 = 16;
+#[cfg(test)]
 pub(crate) const PR_SET_TIMERSLACK: u64 = 29;
+#[cfg(test)]
 pub(crate) const PR_GET_TIMERSLACK: u64 = 30;
 pub(crate) const PR_SET_NO_NEW_PRIVS: u64 = 38;
 pub(crate) const PR_GET_NO_NEW_PRIVS: u64 = 39;
+#[cfg(test)]
 pub(crate) const PR_SET_VMA: u64 = 0x5356_4d41;
 
 const COMM_LEN: usize = rustos_user_abi::linux::LINUX_TASK_COMM_LEN;

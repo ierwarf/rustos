@@ -45,6 +45,8 @@ pub(crate) enum FontRole {
 }
 
 impl FontRole {
+    /// Every role: the bundle build and tests iterate it, and
+    /// `from_section_name` resolves names against it.
     pub(crate) const ALL: [FontRole; 4] = [
         FontRole::UiLarge,
         FontRole::UiMedium,
@@ -52,14 +54,17 @@ impl FontRole {
         FontRole::Terminal,
     ];
 
-    fn from_section_name(name: &str) -> Option<Self> {
-        match name {
-            "ui_large" => Some(FontRole::UiLarge),
-            "ui_medium" => Some(FontRole::UiMedium),
-            "clock" => Some(FontRole::Clock),
-            "terminal" => Some(FontRole::Terminal),
-            _ => None,
+    const fn section_name(self) -> &'static str {
+        match self {
+            FontRole::UiLarge => "ui_large",
+            FontRole::UiMedium => "ui_medium",
+            FontRole::Clock => "clock",
+            FontRole::Terminal => "terminal",
         }
+    }
+
+    fn from_section_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|role| role.section_name() == name)
     }
 }
 

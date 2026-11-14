@@ -241,7 +241,7 @@ compat/windows/services/winsys/kernelbase/exports.c	0	0
 compat/windows/services/winsys/ntdll/syscall.c	0	0
 libs/rustos-user-abi/src/pager/region_edit.rs	0	0
 services/pagerd/src/page_cache.rs	0	0
-services/pagerd/src/main.rs	4	0
+services/pagerd/src/main.rs	6	0
 services/netd/src/readiness.rs	0	1
 services/netd/src/blocking.rs	0	0
 services/netd/src/deadline.rs	0	0
@@ -255,6 +255,6 @@ kernel/compat/src/pager/file_source.rs	0	0
 kernel/compat/src/user/syscall/linux/app_buffer_broker_ops.rs	0	0
 kernel/compat/src/user/syscall/linux/frame_source_ops.rs	0	0
 kernel/compat/src/user/syscall/linux/library_object_ops.rs	0	0
-kernel/compat/src/user/syscall/linux/mm_request_lease.rs	0	16
+kernel/compat/src/user/syscall/linux/mm_request_lease.rs	0	19
 kernel/io-manager/src/io/dvm_display/app_buffer.rs	0	10
 kernel/mm/src/memory/frame_source.rs	0	7

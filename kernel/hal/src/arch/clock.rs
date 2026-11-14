@@ -510,6 +510,9 @@ pub fn monotonic_nanos() -> u64 {
 fn init_hpet() -> Option<(u64, u64, u64)> {
     let base = crate::arch::acpi::hpet_address()?;
     let capabilities =
+        // SAFETY: `base` is the HPET GAS address `parse_hpet_table` admitted: non-zero,
+        // 1 KiB aligned and entirely below the identity-mapped limit, so the 64-bit
+        // capability register at its fixed offset is a mapped, aligned MMIO read.
         unsafe { read_volatile((base as usize + HPET_CAPABILITIES_OFFSET) as *const u64) };
     let period_fs = capabilities >> 32;
     // The HPET specification requires a period no greater than 100 ns. A
@@ -520,7 +523,12 @@ fn init_hpet() -> Option<(u64, u64, u64)> {
         return None;
     }
     let configuration = (base as usize + HPET_CONFIGURATION_OFFSET) as *mut u64;
+    // SAFETY: same admitted HPET block as the capability read; the configuration
+    // register is 8-byte aligned inside the 1 KiB window and volatile access is
+    // what the device requires. `init` runs once during single-CPU boot.
     let current = unsafe { read_volatile(configuration) };
+    // SAFETY: read-modify-write sets only HPET_ENABLE on the admitted register; no
+    // other agent programs the HPET configuration, so the RMW cannot race.
     unsafe { write_volatile(configuration, current | HPET_ENABLE) };
     let first = read_hpet_counter(base);
     let mut advanced = false;
@@ -596,6 +604,9 @@ fn cpuid_tsc_frequency_hz() -> Option<u64> {
 }
 
 fn read_hpet_counter(base: u64) -> u64 {
+    // SAFETY: `base` was admitted as in `init_hpet` (aligned, identity-mapped); the
+    // main counter is a read-only 64-bit MMIO register, so a volatile read has no
+    // side effects and is valid from any CPU or context.
     unsafe { read_volatile((base as usize + HPET_MAIN_COUNTER_OFFSET) as *const u64) }
 }
 

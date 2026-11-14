@@ -46,11 +46,9 @@ use rustos_user_abi::syscall::{
 use rustos_user_abi::windows::ERROR_INVALID_PARAMETER;
 
 use syscalld::{
-    affinity_policy, classify_reply_recv_recovery, errno, fast_offload, ReplyRecvRecoveryAction,
+    affinity_policy, classify_reply_recv_recovery, errno, fast_offload, linux_policy,
+    ReplyRecvRecoveryAction,
 };
-mod linux_policy;
-mod mmap_policy;
-mod vma_policy;
 mod win32_policy;
 
 rustos_svc_runtime::entry!(service_main);

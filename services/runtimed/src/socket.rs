@@ -169,6 +169,9 @@ pub(super) fn bind_listener(path: &str) -> Result<UnixListener, i32> {
     // reject an embedded NUL; doing it after socket() leaked that descriptor
     // on the error path of an otherwise fallible bootstrap operation.
     let path = CString::new(path).map_err(|_| libc::EINVAL)?;
+    // SAFETY: `socket` takes only integer arguments; the result is checked for
+    // failure immediately below and, on success, is owned by this function until
+    // it is closed on an error path or moved into the UnixListener.
     let socket_fd = unsafe {
         libc::socket(
             libc::AF_UNIX,
@@ -181,10 +184,14 @@ pub(super) fn bind_listener(path: &str) -> Result<UnixListener, i32> {
     }
     bind_timing("socket", started_at);
 
+    // SAFETY: `path` is a live NUL-terminated CString (embedded NULs were rejected
+    // above), valid for the duration of the call.
     let unlink_rc = unsafe { libc::unlink(path.as_ptr()) };
     if unlink_rc < 0 {
         let err = last_errno();
         if err != libc::ENOENT {
+            // SAFETY: `socket_fd` is the descriptor created above and not yet moved into a
+            // listener; closing it once on this error path cannot double-close.
             let _ = unsafe { libc::close(socket_fd) };
             return Err(err);
         }
@@ -192,9 +199,12 @@ pub(super) fn bind_listener(path: &str) -> Result<UnixListener, i32> {
     bind_timing("unlink", started_at);
 
     let path_bytes = path.as_bytes_with_nul();
+    // SAFETY: `sockaddr_un` is a plain C struct of integers and a byte array, for
+    // which the all-zero bit pattern is valid.
     let mut addr = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
     if path_bytes.len() > addr.sun_path.len() {
+        // SAFETY: `socket_fd` is still exclusively owned here (see above); closed once.
         let _ = unsafe { libc::close(socket_fd) };
         return Err(libc::ENAMETOOLONG);
     }
@@ -202,6 +212,8 @@ pub(super) fn bind_listener(path: &str) -> Result<UnixListener, i32> {
         addr.sun_path[index] = *byte as libc::c_char;
     }
 
+    // SAFETY: `addr` is a live, zero-initialized `sockaddr_un` with a validated path,
+    // and the length passed is exactly its size; `socket_fd` is a valid socket.
     let bind_rc = unsafe {
         libc::bind(
             socket_fd,
@@ -211,18 +223,24 @@ pub(super) fn bind_listener(path: &str) -> Result<UnixListener, i32> {
     };
     if bind_rc < 0 {
         let err = last_errno();
+        // SAFETY: `socket_fd` is still exclusively owned here; closed once on error.
         let _ = unsafe { libc::close(socket_fd) };
         return Err(err);
     }
     bind_timing("bind", started_at);
 
+    // SAFETY: `listen` takes the live descriptor `socket_fd` and an integer backlog.
     if unsafe { libc::listen(socket_fd, 16) } < 0 {
         let err = last_errno();
+        // SAFETY: `socket_fd` is still exclusively owned here; closed once on error.
         let _ = unsafe { libc::close(socket_fd) };
         return Err(err);
     }
     bind_timing("listen", started_at);
 
+    // SAFETY: `socket_fd` is a valid, bound, listening socket owned only by this
+    // function (every error path above closed it and returned), so the
+    // UnixListener takes sole ownership and closes it exactly once.
     Ok(unsafe { UnixListener::from_raw_fd(socket_fd) })
 }
 
@@ -473,6 +491,9 @@ fn write_runtime_error(stream: &mut UnixStream, err: i32) {
 fn accept_runtime_client(
     listener: &UnixListener,
 ) -> std::io::Result<(UnixStream, RuntimePeerCredentials)> {
+    // SAFETY: null address pointers are the documented form of `accept4` when the peer
+    // address is not wanted; the listener fd is borrowed from `listener`, which
+    // outlives the call.
     let fd = unsafe {
         libc::accept4(
             listener.as_raw_fd(),
@@ -484,14 +505,20 @@ fn accept_runtime_client(
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: `fd` is a fresh descriptor returned by `accept4` (checked non-negative
+    // above) with no other owner, so `UnixStream` takes unique ownership.
     let stream = unsafe { UnixStream::from_raw_fd(fd) };
     let peer = runtime_peer_credentials(stream.as_raw_fd())?;
     Ok((stream, peer))
 }
 
 fn runtime_peer_credentials(fd: i32) -> std::io::Result<RuntimePeerCredentials> {
+    // SAFETY: `ucred` is a plain C struct of integers; all-zero is a valid value.
     let mut credentials = unsafe { std::mem::zeroed::<libc::ucred>() };
     let mut credentials_len = size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `credentials` and `credentials_len` are live locals; the length passed
+    // is exactly the size of `ucred`, so the kernel writes at most that many bytes
+    // and updates the length, which is verified afterwards.
     let status = unsafe {
         libc::getsockopt(
             fd,
@@ -626,6 +653,9 @@ fn write_running_programs(
     )?;
     if !programs.is_empty() {
         stream
+            // SAFETY: `programs` is a live slice of `repr(C)` RuntimeRunningProgram, whose
+            // size is const-asserted to 184 bytes with no padding, so all
+            // size_of_val bytes are initialized; the view is read-only for this write.
             .write_all(unsafe {
                 std::slice::from_raw_parts(
                     programs.as_ptr().cast::<u8>(),

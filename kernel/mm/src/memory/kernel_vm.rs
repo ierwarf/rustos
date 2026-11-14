@@ -357,6 +357,9 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
             return;
         }
 
+        // SAFETY: CR3 names this CPU's live root, so its frame cannot be retired while
+        // loaded. Callers hold KERNEL_PML4 with IRQs off; only the kernel-half MMIO
+        // window slot is rewritten, and only from the kernel PML4's own entry value.
         let current_root = unsafe { phys_to_table_mut(current_root.start_address()) };
         let current_entry = &mut current_root[MMIO_WINDOW_PML4_INDEX];
         if current_entry.addr() == kernel_entry.addr()
@@ -812,6 +815,9 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
     pub unsafe fn load(&self) {
         let pml4_phys = PhysAddr::new(kernel_virtual_to_physical(addr_of!(self.pml4) as u64));
         let pml4_frame = PhysFrame::containing_address(pml4_phys);
+        // SAFETY: contract of this `unsafe fn` (see `# Safety`): `self.pml4` is the
+        // kernel's static PML4, whose frame is derived from its own address, and the
+        // caller guarantees it is fully built and serializes the CR3 switch.
         unsafe {
             Cr3::write(pml4_frame, Cr3Flags::empty());
         }
@@ -823,6 +829,10 @@ pub fn init(boot_info_ptr: *const BootInfo) {
         capture_boot_cpu_cache_attributes(),
         "BSP could not seal its x86 MTRR/PAT/cache baseline"
     );
+    // SAFETY: BSP-only early boot with IRQs off (`without_interrupts`) before APs,
+    // user roots or other CPUs exist, so the EFER write and CR3 switch cannot
+    // race. `pml4.load()` installs the root `init` just built, which keeps the
+    // low identity alias of the running continuation and adds the higher half.
     unsafe {
         interrupts::without_interrupts(|| {
             Efer::write(Efer::read() | EferFlags::NO_EXECUTE_ENABLE);
@@ -1094,10 +1104,16 @@ pub fn unmap_mmio_range(virt_addr: u64, size: usize) -> bool {
 }
 
 pub(crate) unsafe fn phys_to_table_ref(phys: PhysAddr) -> &'static PageTable {
+    // SAFETY: contract of this `unsafe fn`: `phys` names a live, 4 KiB-aligned
+    // page-table frame in the direct map (`higher_half_addr`); `PageTable` is
+    // exactly that 4 KiB layout. Aliasing is the caller's, as for `_mut` below.
     unsafe { &*(higher_half_addr(phys.as_u64()) as *const PageTable) }
 }
 
 pub(crate) unsafe fn phys_to_table_mut(phys: PhysAddr) -> &'static mut PageTable {
+    // SAFETY: contract of this `unsafe fn`: `phys` names a live, 4 KiB-aligned
+    // page-table frame in the direct map; the caller guarantees no other reference
+    // to that table exists (mutation guard / fresh frame / KERNEL_PML4 lock).
     unsafe { &mut *(higher_half_addr(phys.as_u64()) as *mut PageTable) }
 }
 
@@ -1213,26 +1229,41 @@ fn find_loaded_kernel_image(
 }
 
 fn loaded_kernel_load_bias_from_boot_info(boot_info_ptr: *const BootInfo) -> Option<u64> {
+    // SAFETY: `boot_info_ptr` is the loader-handed BootInfo, identity-mapped and
+    // aligned; `from_ptr` rejects null/misaligned values and validates the fields.
+    // Early boot is single-CPU, so nothing mutates it while borrowed.
     let boot_info = unsafe { BootInfo::from_ptr(boot_info_ptr) }.ok()?;
     let image = boot_info.nucleus_image;
     image.is_present().then_some(image.load_bias)
 }
 
 fn read_raw_elf_header_at(phys_addr: u64) -> Result<RawElfHeader<LittleEndian>, &'static str> {
+    // SAFETY: `phys_addr` is a candidate kernel-image base inside the loader's low
+    // identity map (boot info bias, or a scan within the bounded KASLR window), so
+    // the 64-byte range is readable; it is only read as bytes, never as a reference
+    // to a typed value, and nothing writes the header concurrently.
     let bytes = unsafe { slice::from_raw_parts(phys_addr as *const u8, ELF64_HEADER_SIZE) };
     if bytes.len() < ELF64_HEADER_SIZE {
         return Err("kernel ELF header is truncated");
     }
+    // SAFETY: `bytes` holds exactly `ELF64_HEADER_SIZE` readable bytes and the ELF
+    // header is plain data valid for any bit pattern; `read_unaligned` makes no
+    // alignment assumption about the physical address.
     Ok(unsafe { (bytes.as_ptr() as *const RawElfHeader<LittleEndian>).read_unaligned() })
 }
 
 fn read_raw_program_header_at(
     phys_addr: u64,
 ) -> Result<RawProgramHeader<LittleEndian>, &'static str> {
+    // SAFETY: `phys_addr` is `load_bias + e_phoff + index * phentsize` inside the
+    // loader-placed kernel image (identity-mapped), so the range is readable; it is
+    // read as bytes only, and the image headers are never written afterwards.
     let bytes = unsafe { slice::from_raw_parts(phys_addr as *const u8, ELF64_PROGRAM_HEADER_SIZE) };
     if bytes.len() < ELF64_PROGRAM_HEADER_SIZE {
         return Err("kernel ELF program header is truncated");
     }
+    // SAFETY: `bytes` holds exactly `ELF64_PROGRAM_HEADER_SIZE` readable bytes and
+    // the program header is plain data valid for any bit pattern; unaligned read.
     Ok(unsafe { (bytes.as_ptr() as *const RawProgramHeader<LittleEndian>).read_unaligned() })
 }
 
@@ -1453,14 +1484,21 @@ fn add_signed_u64(base: u64, offset: i64) -> Option<u64> {
 }
 
 fn read_i64_from_memory(addr: u64) -> i64 {
+    // SAFETY: `addr` is a dynamic/rela entry address inside the loader-placed,
+    // trusted kernel image (checked arithmetic at callers), identity-mapped and
+    // readable in the BSP early-boot window; unaligned read of plain data.
     unsafe { (addr as *const i64).read_unaligned() }
 }
 
 fn read_u64_from_memory(addr: u64) -> u64 {
+    // SAFETY: same trusted-image dynamic/rela entry read as `read_i64_from_memory`.
     unsafe { (addr as *const u64).read_unaligned() }
 }
 
 fn write_u64_to_memory(addr: u64, value: u64) {
+    // SAFETY: `addr` is a relative-relocation target (`load_bias - 2 MiB + r_offset`)
+    // in the trusted kernel image's relocation-bearing data, which stays writable
+    // and identity-mapped until the NX seal; BSP-only before other CPUs exist.
     unsafe { (addr as *mut u64).write_unaligned(value) }
 }
 
@@ -1618,6 +1656,8 @@ mod tests {
     fn kernel_static_pie_program_headers_use_link_base_not_header_physical_base_as_elf_bias() {
         // The ELF is linked at 2 MiB, not zero: its actual ELF load bias is
         // header_physical - 2 MiB. BootInfo still names the physical header.
+        // SAFETY: unit test; `RawProgramHeader` is plain integer fields, so all-zero
+        // bytes are a valid value.
         let mut ph: RawProgramHeader<LittleEndian> = unsafe { core::mem::zeroed() };
         ph.p_vaddr.set(ELF_ENDIAN, KERNEL_LOAD_BIAS_MIN + 0x123000);
         assert_eq!(

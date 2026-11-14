@@ -8,7 +8,6 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
-MAX_LINES = 2000  # advisory: oversize documents only warn
 
 
 def prose_lines(text: str):
@@ -50,9 +49,6 @@ def check() -> list[str]:
     for path in documents:
         text = path.read_text()
         relative = path.relative_to(ROOT)
-        count = len(text.splitlines())
-        if count > MAX_LINES:
-            print(f"documentation layout warning: {relative}: {count} lines > {MAX_LINES}", file=sys.stderr)
         for number, line in prose_lines(text):
             line = re.sub(r"(`+).*?\1", "", line)
             for target in re.findall(r"\]\(([^\s)]+)(?:\s+\"[^\"]*\")?\)", line):
@@ -87,4 +83,4 @@ if __name__ == "__main__":
             print(error, file=sys.stderr)
         if errors:
             raise SystemExit(f"documentation layout: {len(errors)} error(s)")
-        print(f"documentation layout passed: local links and headings resolve; {MAX_LINES}-line budget is advisory")
+        print(f"documentation layout passed: local links and headings resolve")

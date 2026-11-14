@@ -1129,8 +1129,14 @@ fn copy_label(src: &[u8], dest: &mut [u8], len: &mut u16) {
 fn lookup_device_node(path: &str, response: &mut DevmgrdIpcResponse) -> i32 {
     response.kind = match path {
         "/dev" | "/dev/input" | "/dev/dri" => DEVMGRD_NODE_KIND_DIR,
-        "/dev/console0" | "/dev/display0" | "/dev/input0" | "/dev/input/event0"
-        | "/dev/dri/card0" => DEVMGRD_NODE_KIND_DEVICE,
+        "/dev/console0"
+        | "/dev/display0"
+        | "/dev/input0"
+        | "/dev/input/event0"
+        | "/dev/dri/card0"
+        | "/dev/null"
+        | "/dev/urandom"
+        | "/dev/random" => DEVMGRD_NODE_KIND_DEVICE,
         _ => return libc::ENOENT,
     };
     0
@@ -1142,6 +1148,9 @@ fn read_device_dir(path: &str, response: &mut DevmgrdIpcResponse) -> i32 {
             ("console0", DEVMGRD_NODE_KIND_DEVICE),
             ("display0", DEVMGRD_NODE_KIND_DEVICE),
             ("input0", DEVMGRD_NODE_KIND_DEVICE),
+            ("null", DEVMGRD_NODE_KIND_DEVICE),
+            ("urandom", DEVMGRD_NODE_KIND_DEVICE),
+            ("random", DEVMGRD_NODE_KIND_DEVICE),
             ("input", DEVMGRD_NODE_KIND_DIR),
             ("dri", DEVMGRD_NODE_KIND_DIR),
         ],

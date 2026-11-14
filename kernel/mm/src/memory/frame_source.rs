@@ -241,6 +241,9 @@ impl<const N: usize> Table<N> {
                 .compare_exchange(
                     old,
                     word(next, 0, PUBLISHING),
+                    // ORDERING: AcqRel on success makes this CPU the sole PUBLISHING owner and
+                    // orders after the previous owner's Release-to-FREE; Acquire on failure
+                    // re-reads the slot that a racing publisher or pin changed.
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
@@ -335,6 +338,8 @@ impl<const N: usize> Table<N> {
                 .compare_exchange_weak(
                     value,
                     (value & !STATE_MASK) | RETIRING,
+                    // ORDERING: AcqRel on success closes admission (LIVE -> RETIRING) after every
+                    // earlier pin's AcqRel increment; Acquire on failure re-reads a racing pin.
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
@@ -364,6 +369,9 @@ impl<const N: usize> Table<N> {
             match self.ready.compare_exchange_weak(
                 head,
                 index + 1,
+                // ORDERING: Release on success publishes the `next_ready` link written above
+                // before the head becomes visible to the `ready.swap(AcqRel)` consumer;
+                // Acquire on failure takes the new head so the link chains correctly.
                 Ordering::Release,
                 Ordering::Acquire,
             ) {
@@ -414,6 +422,8 @@ impl<const N: usize> Table<N> {
             reclaimed += 1;
         }
         self.backlog.store(next, Ordering::Relaxed);
+        // ORDERING: Release hands the reclaim lock back, publishing the backlog store
+        // and every slot's FREE transition to the next Acquire CAS winner above.
         self.reclaiming.store(false, Ordering::Release);
         reclaimed
     }

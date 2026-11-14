@@ -77,7 +77,7 @@ fn write_dispatch(
         // complete as a deny. Leaving the exact fault owner blocked would
         // turn a service-local memory error into an unbounded kernel wait.
         let _ = crate::pager::reject_rendezvous_dispatch(reservation, pager_task_id);
-        return linux_errno(address_space_error_to_linux_errno(error));
+        return linux_errno(user_pointer_error_to_linux_errno(error));
     }
 
     // The fixed fault slot is the admission proof. Once pagerd is executing in
@@ -154,7 +154,7 @@ pub(super) fn syscall_linux_rustos_pager_fault_wait(args_ptr: u64) -> u64 {
     }
     let args = match usermem::read_current_user_struct::<RustosPagerFaultWaitArgs>(args_ptr) {
         Ok(args) => args,
-        Err(error) => return linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
     };
     if args.abi_version != PAGER_FAULT_RENDEZVOUS_ABI_VERSION
         || args.flags != 0
@@ -181,7 +181,7 @@ pub(super) fn syscall_linux_rustos_pager_fault_reply(args_ptr: u64) -> u64 {
     }
     let args = match usermem::read_current_user_struct::<RustosPagerFaultReplyArgs>(args_ptr) {
         Ok(args) => args,
-        Err(error) => return linux_errno(address_space_error_to_linux_errno(error)),
+        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
     };
     if args.abi_version != PAGER_FAULT_RENDEZVOUS_ABI_VERSION
         || args.flags != 0

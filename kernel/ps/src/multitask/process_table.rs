@@ -195,6 +195,9 @@ struct ProcessObject {
     exec_state_staged: bool,
     exit_pending: bool,
     exiting: bool,
+    /// First fatal user fault of the thread group: `(task_id, vector)`. Sealed
+    /// in the same table critical section that first marks the process exiting.
+    fault_termination: Option<(u64, u8)>,
     queued_for_reap: bool,
     exit_status: Option<i32>,
     child_state_change: Option<ChildStateChange>,
@@ -249,6 +252,7 @@ impl ProcessObject {
             exec_state_staged: false,
             exit_pending: false,
             exiting: false,
+            fault_termination: None,
             queued_for_reap: false,
             exit_status: None,
             child_state_change: None,
@@ -535,7 +539,10 @@ fn reclaim_slot(table: &mut ProcessTable, index: usize) -> Option<Box<ProcessObj
         object.queued_for_reap = false;
         return None;
     }
-    if object.exit_status.is_some() && !object.waited {
+    // A child with a parent cannot be reclaimed before `wait_for_child` consumes
+    // it, even in the window after its last thread detaches and before the
+    // terminator publishes `exit_status`.
+    if !object.waited {
         object.queued_for_reap = false;
         return None;
     }
@@ -1238,6 +1245,63 @@ fn mark_process_exiting_inner(process_id: u64, expected: Option<ProcessHandle>) 
     Some(())
 }
 
+/// Result of [`seal_fault_termination`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::multitask) enum FaultSeal {
+    /// This fault is the first terminal event of the process: it published the
+    /// exiting mark and owns the wait status and the group termination.
+    First,
+    /// The process was already exiting (exit_group, rootd/watchdog terminate or
+    /// an earlier fault); the earlier terminal event owns status and group exit.
+    Lost,
+    /// Exec transition or exhausted lifecycle ids: no seal was taken.
+    Unavailable,
+}
+
+/// A fatal user fault's atomic first-wins claim on the process's terminal
+/// status. The exiting mark and the fault seal change under one `PROCESS_TABLE`
+/// critical section, so concurrent faults, `exit_group` and external
+/// terminators elect exactly one owner. Safe with IF clear: the table lock is
+/// an ordinary leaf and nothing else is acquired while it is held.
+pub(in crate::multitask) fn seal_fault_termination(
+    handle: ProcessHandle,
+    process_id: u64,
+    task_id: u64,
+    vector: u8,
+) -> FaultSeal {
+    let mut table = PROCESS_TABLE.lock();
+    let Some(object) = table.lookup_object_mut(handle) else {
+        return FaultSeal::Unavailable;
+    };
+    if object.process_id != process_id || object.exec_in_progress {
+        return FaultSeal::Unavailable;
+    }
+    if object.exiting {
+        return FaultSeal::Lost;
+    }
+    let Some(transaction_id) = allocate_lifecycle_transaction_id() else {
+        return FaultSeal::Unavailable;
+    };
+    object.lifecycle_transaction_id = transaction_id;
+    object.exiting = true;
+    object.fault_termination = Some((task_id, vector));
+    let marker = (object.mm_generation, transaction_id);
+    publish_slot_visibility(handle.index(), &table.slots[handle.index()]);
+    drop(table);
+    record_lifecycle_marker("lifecycle-exit-seal", handle, marker.0, marker.1);
+    FaultSeal::First
+}
+
+/// Whether `task_id` holds the process's fault-status seal.
+pub(in crate::multitask) fn fault_termination_owner(
+    handle: ProcessHandle,
+    task_id: u64,
+) -> Option<u8> {
+    let mut table = PROCESS_TABLE.lock();
+    let object = table.lookup_object_mut(handle)?;
+    object.fault_termination.filter(|&(owner, _)| owner == task_id).map(|(_, vector)| vector)
+}
+
 /// Atomically marks the process exiting and reports whether this call won the
 /// transition. Resource owners use the `true` result to perform exactly-once
 /// service-side open-description teardown under concurrent exit_group calls.
@@ -1856,6 +1920,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn child_is_not_reaped_before_exit_status_publication_and_parent_wait() {
+        let _isolation = isolate_process_table();
+        let parent = create_process(5_062, new_state()).expect("parent");
+        let child = create_process_with_parent(5_063, Some(5_062), new_state()).expect("child");
+        detach_task(child).expect("child detach");
+        // Terminator retirement drops thread_count to 0 before note_process_exit_status runs.
+        assert_eq!(reap_exited_processes(), 0);
+        assert!(matches!(
+            wait_for_child(5_062, 5_063, false, false),
+            WaitResult::Pending
+        ));
+        note_process_exit_status(5_063, 9).expect("child kill status");
+        assert!(matches!(
+            wait_for_child(5_062, 5_063, false, false),
+            WaitResult::Exited {
+                pid: 5_063,
+                status: 9
+            }
+        ));
+        assert_eq!(reap_exited_processes(), 1);
+        detach_task(parent).expect("parent detach");
+        assert_eq!(reap_exited_processes(), 1);
+    }
+
+    #[test]
     fn retained_ref_delays_reclaim_until_drop() {
         let _guard = lock_process_table_for_tests();
         let handle = create_process(42, new_state()).expect("process handle");
@@ -2230,6 +2319,26 @@ pub(crate) mod tests {
             ));
         }
         drop(pin);
+        assert_eq!(reap_exited_processes(), 1);
+        detach_task(parent).unwrap();
+        assert_eq!(reap_exited_processes(), 1);
+    }
+
+    #[test]
+    fn signal_kill_status_reaches_the_waiter_unmodified() {
+        let _guard = lock_process_table_for_tests();
+        let parent = create_process(5_090, new_state()).unwrap();
+        let child = create_process_with_parent(5_091, Some(5_090), new_state()).unwrap();
+        // SIGSEGV, no core: WIFSIGNALED with WTERMSIG 11, never exit(0).
+        note_process_exit_status(5_091, 11).unwrap();
+        detach_task(child).unwrap();
+        match wait_for_child(5_090, 5_091, false, false) {
+            WaitResult::Exited { pid: 5_091, status } => {
+                assert_eq!(status, 11);
+                assert_ne!(status & 0x7f, 0);
+            }
+            _ => panic!("signal-killed child must be reported as exited with its status"),
+        }
         assert_eq!(reap_exited_processes(), 1);
         detach_task(parent).unwrap();
         assert_eq!(reap_exited_processes(), 1);

@@ -78,7 +78,7 @@ struct Object {
     /// meter refunds on drop, and an object is dropped exactly once when it
     /// leaves its slot (retire or a replaced pager lease). Meter drop is
     /// lock-free, so it is legal under the registry lock.
-    meter: Meter,
+    _meter: Meter,
 }
 
 pub(crate) struct Registry {
@@ -214,7 +214,7 @@ impl Registry {
             tokens,
             supplied: 0,
             state: State::Building,
-            meter,
+            _meter: meter,
         });
         Ok(make_handle(slot, generation))
     }
@@ -545,7 +545,7 @@ mod tests {
         next: RefCell<u64>,
         fail_supply_after: RefCell<Option<u64>>,
     }
-    struct ModelPin(u64);
+    struct ModelPin;
     impl PageSources for Model {
         type Pin = ModelPin;
         fn supply(
@@ -577,7 +577,7 @@ mod tests {
                 None => Err(FrameSourceError::Stale),
                 Some((o, _, _)) if *o != owner => Err(FrameSourceError::Authority),
                 Some((_, k, _)) if *k != key => Err(FrameSourceError::Mismatch),
-                Some(_) => Ok(ModelPin(token)),
+                Some(_) => Ok(ModelPin),
             }
         }
         fn retire(&self, token: u64, owner: FrameSourceOwner) {

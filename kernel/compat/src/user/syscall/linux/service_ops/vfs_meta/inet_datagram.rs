@@ -11,14 +11,14 @@ fn address_from_user(ptr: u64, len: u64) -> Result<Vec<u8>, i64> {
     }
     let mut bytes = alloc::vec![0; netd_message::IPV4_ADDRESS_SIZE];
     usermem::copy_from_current_user_exact(ptr, &mut bytes)
-        .map_err(address_space_error_to_linux_errno)?;
+        .map_err(user_pointer_error_to_linux_errno)?;
     Ok(bytes)
 }
 
 pub(super) fn populate_send(request: &mut NetdIpcRequest) -> Result<(), i64> {
     let (bytes, address) = if request.op == SYSCALL_OFFLOAD_OP_LINUX_SENDMSG {
         let header = usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(request.arg1)
-            .map_err(address_space_error_to_linux_errno)?;
+            .map_err(user_pointer_error_to_linux_errno)?;
         if header.msg_controllen != 0 {
             return Err(LINUX_EOPNOTSUPP);
         }
@@ -43,7 +43,7 @@ pub(super) fn populate_send(request: &mut NetdIpcRequest) -> Result<(), i64> {
         let mut bytes = alloc::vec![0; len];
         if len != 0 {
             usermem::copy_from_current_user_exact(request.arg1, &mut bytes)
-                .map_err(address_space_error_to_linux_errno)?;
+                .map_err(user_pointer_error_to_linux_errno)?;
         }
         (bytes, address_from_user(request.arg4, request.arg5)?)
     };
@@ -93,7 +93,7 @@ pub(super) fn consume_receive(
     }
     if is_recvmsg {
         let mut header = usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(request.arg1)
-            .map_err(address_space_error_to_linux_errno)?;
+            .map_err(user_pointer_error_to_linux_errno)?;
         let iovecs = if header.msg_iovlen == 0 {
             Vec::new()
         } else {
@@ -104,7 +104,7 @@ pub(super) fn consume_receive(
             let len = (header.msg_namelen as usize).min(message.address.len());
             if len != 0 {
                 usermem::write_current_user_bytes(header.msg_name, &message.address[..len])
-                    .map_err(address_space_error_to_linux_errno)?;
+                    .map_err(user_pointer_error_to_linux_errno)?;
             }
             header.msg_namelen = message.address.len() as u32;
         } else {
@@ -120,7 +120,7 @@ pub(super) fn consume_receive(
                 let mut control = message.control[..written].to_vec();
                 control[..8].copy_from_slice(&(written as u64).to_ne_bytes());
                 usermem::write_current_user_bytes(header.msg_control, &control)
-                    .map_err(address_space_error_to_linux_errno)?;
+                    .map_err(user_pointer_error_to_linux_errno)?;
             }
             if written < message.control.len() {
                 header.msg_flags |= linux_abi::MSG_CTRUNC as u32;
@@ -128,11 +128,11 @@ pub(super) fn consume_receive(
         }
         header.msg_controllen = written as u64;
         usermem::write_current_user_struct(request.arg1, &header)
-            .map_err(address_space_error_to_linux_errno)
+            .map_err(user_pointer_error_to_linux_errno)
     } else {
         if !message.data.is_empty() {
             usermem::write_current_user_bytes(request.arg1, message.data)
-                .map_err(address_space_error_to_linux_errno)?;
+                .map_err(user_pointer_error_to_linux_errno)?;
         }
         if request.arg4 != 0 {
             write_current_sockaddr_payload(request.arg4, request.arg5, message.address)?;
