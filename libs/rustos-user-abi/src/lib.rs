@@ -6,9 +6,12 @@ extern crate alloc;
 #[cfg(feature = "linux-compat-state")]
 pub mod linux;
 
+pub mod abi_revision;
 pub mod console;
 pub mod deadline;
 pub mod device;
+pub mod handle_kind;
+pub mod retired;
 pub mod ioctl;
 pub mod pager;
 pub mod performance;
@@ -209,6 +212,7 @@ mod tests {
         assert_eq!(syscall::VFS_IPC_ABI_VERSION, 5);
         assert_eq!(syscall::VFS_IPC_OP_CURSOR_SETTLE, 24);
         assert_eq!(syscall::VFS_IPC_OP_CHECKPOINT_ACK, 25);
+        assert_eq!(syscall::VFS_IPC_OP_FILE_IDENTITY, 26);
         assert_eq!(
             syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
             12
@@ -220,7 +224,8 @@ mod tests {
         assert_eq!(syscall::SYS_RUSTOS_EARLY_SYSTEM_BROKER, 0x5255_0041);
         assert_eq!(syscall::SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER, 0x5255_0042);
         assert_eq!(syscall::WAITSET_PROVIDER_SESSIOND, 4);
-        assert_eq!(syscall::WAITSET_PROVIDER_MAX, 4);
+        assert_eq!(syscall::WAITSET_PROVIDER_KERNEL, 5);
+        assert_eq!(syscall::WAITSET_PROVIDER_MAX, 5);
         assert_eq!(size_of::<syscall::WaitSetSignalBrokerArgs>(), 32);
         assert_eq!(size_of::<syscall::WaitSetInterestWire>(), 48);
         assert_eq!(syscall::BLOCK_BROKER_ABI_VERSION, 4);
@@ -297,10 +302,46 @@ mod tests {
         );
     }
 
+    /// Two independently authored brokers once claimed 0x5255_0061 and the
+    /// later dispatch arm silently shadowed the earlier one. Every Ring0 syscall
+    /// number must be unique across the whole ABI crate.
+    #[test]
+    fn rustos_syscall_numbers_are_unique() {
+        extern crate std;
+        use std::collections::BTreeMap;
+        use std::string::String;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = std::vec![root.join("syscall.rs"), root.join("pager.rs")];
+        for entry in std::fs::read_dir(root.join("syscall")).unwrap() {
+            files.push(entry.unwrap().path());
+        }
+        let mut seen: BTreeMap<u64, String> = BTreeMap::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            for line in text.lines() {
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("pub const SYS_RUSTOS_") else { continue };
+                let Some((name, value)) = rest.split_once(": u64 = ") else { continue };
+                let Some(hex) = value.trim_end_matches(';').strip_prefix("0x") else { continue };
+                let number = u64::from_str_radix(&hex.replace('_', ""), 16).unwrap();
+                if let Some(previous) = seen.insert(number, String::from(name)) {
+                    panic!("syscall {number:#x} is claimed by both SYS_RUSTOS_{previous} and SYS_RUSTOS_{name}");
+                }
+            }
+        }
+        assert!(seen.len() > 50, "scanner found only {} syscall numbers", seen.len());
+        for retired in crate::retired::RETIRED_NATIVE_SYSCALLS {
+            assert!(
+                !seen.contains_key(retired),
+                "retired syscall number {retired:#x} was reused"
+            );
+        }
+    }
+
     #[test]
     fn mm_broker_abi_layout_is_stable() {
         assert_eq!(syscall::SYS_RUSTOS_MM_BROKER, 0x5255_001e);
-        assert_eq!(size_of::<syscall::RustosMmBrokerArgs>(), 80);
+        assert_eq!(size_of::<syscall::RustosMmBrokerArgs>(), 88);
         assert_eq!(size_of::<syscall::RustosMmLayoutBrokerResult>(), 48);
         assert_eq!(
             size_of::<syscall::RustosMmFdBrokerResult>(),

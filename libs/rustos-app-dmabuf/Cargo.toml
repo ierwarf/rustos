@@ -1,0 +1,12 @@
+[package]
+name = "rustos-app-dmabuf"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libc = "0.2"
+rustos-user-abi = { path = "../rustos-user-abi", default-features = false }
+
+[lib]
+path = "src/lib.rs"

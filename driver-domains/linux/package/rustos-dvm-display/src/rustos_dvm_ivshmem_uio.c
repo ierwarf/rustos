@@ -13,6 +13,7 @@
  */
 
 #include <linux/io.h>
+#include <linux/list.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-map-ops.h>
@@ -43,6 +44,16 @@
 #define RUSTOS_DVM_MSIX_VECTOR_COUNT 2
 #define RUSTOS_GUI_PIXEL_REGION_PHYS 0x100000000ULL
 #define RUSTOS_GUI_PIXEL_REGION_BYTES (512ULL * 1024ULL * 1024ULL)
+#define RUSTOS_APP_REGION_PHYS 0x120000000ULL
+#define RUSTOS_APP_REGION_BYTES (512ULL * 1024ULL * 1024ULL)
+#define RUSTOS_APP_REQUEST_SEQUENCE 2200
+#define RUSTOS_APP_REQUEST_KIND 2208
+#define RUSTOS_APP_REQUEST_RECORD 2216
+#define RUSTOS_APP_RESPONSE_STATUS 2280
+#define RUSTOS_APP_RESPONSE_SEQUENCE 2288
+#define RUSTOS_APP_EXPORT 1ULL
+#define RUSTOS_APP_REVOKE 2ULL
+#define RUSTOS_APP_RECORD_BYTES 64
 
 #define RUSTOS_GUI_POOL_HEADER_BYTES 4096
 #define RUSTOS_GUI_POOL_VERSION 2
@@ -95,6 +106,13 @@
 #define RUSTOS_DVM_DMABUF_NAME "rustos-dvm-display-dmabuf"
 #define RUSTOS_DVM_DMABUF_IOCTL_EXPORT _IOW('R', 0x41, struct rustos_dvm_dmabuf_request)
 #define RUSTOS_DVM_DMABUF_IOCTL_ACQUIRE _IOW('R', 0x42, struct rustos_dvm_acquire_request)
+#define RUSTOS_DVM_APP_IOCTL_TAKE _IOR('R', 0x43, struct rustos_dvm_app_event)
+
+struct rustos_dvm_app_event {
+	__u64 sequence;
+	__u64 kind;
+	__u8 record[RUSTOS_APP_RECORD_BYTES];
+};
 
 struct rustos_dvm_dmabuf_request {
 	__u32 slot;
@@ -121,6 +139,11 @@ struct rustos_dvm_ivshmem {
 	void __iomem *doorbell;
 	void __iomem *shared;
 	struct dev_pagemap pixel_pgmap;
+	struct dev_pagemap app_pgmap;
+	void *app_pixels;
+	struct mutex app_lock;
+	struct list_head app_exports;
+	u64 app_sequence;
 	void *pixels;
 	u64 slot_bytes;
 	u64 gpu_command_offset;
@@ -146,6 +169,8 @@ static const u8 rustos_gpu_completion_magic[] = "RSGPUC01";
 static const u8 rustos_gpu_render_completion_magic[] = "RSGPUD01";
 static const u8 rustos_gpu_present_completion_magic[] = "RSGPUF01";
 static const u8 rustos_gpu_prime_completion_magic[] = "RSGPUP01";
+
+static long rustos_dvm_app_take(struct rustos_dvm_ivshmem *state, unsigned long argument);
 
 static int rustos_dvm_gpu_acquire_sync_fd(struct rustos_dvm_ivshmem *state,
 					   unsigned long argument);
@@ -288,6 +313,8 @@ static long rustos_dvm_dmabuf_ioctl(struct file *file, unsigned int command,
 	phys_addr_t end_phys;
 	int fd;
 
+	if (command == RUSTOS_DVM_APP_IOCTL_TAKE)
+		return rustos_dvm_app_take(state, argument);
 	if (command == RUSTOS_DVM_DMABUF_IOCTL_ACQUIRE)
 		return rustos_dvm_gpu_acquire_sync_fd(state, argument);
 	if (command != RUSTOS_DVM_DMABUF_IOCTL_EXPORT ||
@@ -362,6 +389,287 @@ static u64 rustos_dvm_read_le64(const u8 *bytes)
 	for (index = 0; index < sizeof(value); index++)
 		value |= (u64)bytes[index] << (index * 8);
 	return value;
+}
+
+
+/* App exports are separate from the immutable atlas: only a host-published
+ * request selects a range. The ioctl argument is output only, never authority. */
+struct rustos_dvm_app_export {
+	struct list_head link;
+	struct rustos_dvm_ivshmem *state;
+	struct dev_pagemap *pgmap;
+	phys_addr_t phys;
+	u64 bytes;
+	u8 record[RUSTOS_APP_RECORD_BYTES];
+	bool revoked;
+	/* Host revoke request awaiting the final dma-buf reference; 0 if none. */
+	u64 revoke_sequence;
+};
+
+static bool rustos_dvm_app_valid(const u8 *record)
+{
+	u64 offset = rustos_dvm_read_le64(record + 32);
+	u64 length = rustos_dvm_read_le64(record + 40);
+	u64 end, image;
+	u32 width = rustos_dvm_read_le32(record + 48);
+	u32 height = rustos_dvm_read_le32(record + 52);
+	u32 stride = rustos_dvm_read_le32(record + 56);
+	u32 format = rustos_dvm_read_le32(record + 60);
+
+	return !memcmp(record, "RSAPPB01", 8) &&
+	       rustos_dvm_read_le32(record + 8) == 1 &&
+	       rustos_dvm_read_le32(record + 12) == RUSTOS_APP_RECORD_BYTES &&
+	       rustos_dvm_read_le64(record + 16) &&
+	       rustos_dvm_read_le64(record + 24) && length &&
+	       !(offset & ~PAGE_MASK) && !(length & ~PAGE_MASK) &&
+	       !check_add_overflow(offset, length, &end) &&
+	       end <= RUSTOS_APP_REGION_BYTES && width && width <= 8192 &&
+	       height && height <= 8192 && stride >= width * 4 && !(stride & 3) &&
+	       !check_mul_overflow((u64)stride, (u64)height, &image) && image <= length &&
+	       (format == 0x34325258 || format == 0x34325241);
+}
+
+static int rustos_dvm_app_attach(struct dma_buf *dmabuf,
+				 struct dma_buf_attachment *attachment)
+{
+	struct rustos_dvm_app_export *app = dmabuf->priv;
+
+	if (READ_ONCE(app->revoked))
+		return -ESTALE;
+	return dev_is_dma_coherent(attachment->dev) ? 0 : -EOPNOTSUPP;
+}
+
+static struct sg_table *rustos_dvm_app_map(struct dma_buf_attachment *attachment,
+					   enum dma_data_direction direction)
+{
+	struct rustos_dvm_app_export *app = attachment->dmabuf->priv;
+	struct sg_table *table;
+	struct scatterlist *entry;
+	unsigned int i, pages = app->bytes >> PAGE_SHIFT;
+
+	if (READ_ONCE(app->revoked))
+		return ERR_PTR(-ESTALE);
+	if (!dev_is_dma_coherent(attachment->dev) || direction == DMA_NONE)
+		return ERR_PTR(-EOPNOTSUPP);
+	table = kzalloc(sizeof(*table), GFP_KERNEL);
+	if (!table)
+		return ERR_PTR(-ENOMEM);
+	if (sg_alloc_table(table, pages, GFP_KERNEL)) {
+		kfree(table);
+		return ERR_PTR(-ENOMEM);
+	}
+	for_each_sg(table->sgl, entry, pages, i) {
+		unsigned long pfn = PHYS_PFN(app->phys) + i;
+		if (!rustos_dvm_pgmap_owns_pfn(app->pgmap, pfn)) {
+			sg_free_table(table);
+			kfree(table);
+			return ERR_PTR(-ENXIO);
+		}
+		sg_set_page(entry, pfn_to_page(pfn), PAGE_SIZE, 0);
+	}
+	if (dma_map_sgtable(attachment->dev, table, direction, 0)) {
+		sg_free_table(table);
+		kfree(table);
+		return ERR_PTR(-EIO);
+	}
+	return table;
+}
+
+static void rustos_dvm_app_unmap(struct dma_buf_attachment *attachment,
+				 struct sg_table *table,
+				 enum dma_data_direction direction)
+{
+	dma_unmap_sgtable(attachment->dev, table, direction, 0);
+	sg_free_table(table);
+	kfree(table);
+}
+
+static int rustos_dvm_app_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
+{
+	struct rustos_dvm_app_export *app = dmabuf->priv;
+	u64 offset = (u64)vma->vm_pgoff << PAGE_SHIFT;
+	u64 bytes = vma->vm_end - vma->vm_start;
+
+	if (READ_ONCE(app->revoked))
+		return -ESTALE;
+	if (vma->vm_pgoff > (app->bytes >> PAGE_SHIFT) ||
+	    offset > app->bytes || bytes > app->bytes - offset)
+		return -EINVAL;
+	return remap_pfn_range(vma, vma->vm_start, PHYS_PFN(app->phys + offset),
+			       bytes, vma->vm_page_prot);
+}
+
+static int rustos_dvm_app_begin_cpu(struct dma_buf *dmabuf,
+				    enum dma_data_direction direction)
+{
+	struct rustos_dvm_app_export *app = dmabuf->priv;
+	if (READ_ONCE(app->revoked))
+		return -ESTALE;
+	/* dma-buf core waits on the reservation after this callback. All admitted
+	 * attachments are coherent; barriers bracket shared-memory CPU access. */
+	mb();
+	return 0;
+}
+
+static int rustos_dvm_app_end_cpu(struct dma_buf *dmabuf,
+				  enum dma_data_direction direction)
+{
+	mb();
+	return 0;
+}
+
+static void rustos_dvm_app_reply(struct rustos_dvm_ivshmem *state, u64 sequence, int status)
+{
+	writeq((u64)(s64)status, state->shared + RUSTOS_APP_RESPONSE_STATUS);
+	wmb();
+	writeq(sequence, state->shared + RUSTOS_APP_RESPONSE_SEQUENCE);
+	wmb();
+	iowrite32(RUSTOS_DVM_HOST_CONTROL_VECTOR,
+		  state->doorbell + RUSTOS_IVSHMEM_DOORBELL_OFFSET);
+}
+
+static void rustos_dvm_app_release(struct dma_buf *dmabuf)
+{
+	struct rustos_dvm_app_export *app = dmabuf->priv;
+	struct rustos_dvm_ivshmem *state = app->state;
+
+	mutex_lock(&state->app_lock);
+	list_del(&app->link);
+	/* The revoke acknowledgement is the proof the host waits for: every
+	 * importer, mapping and device reference to this range is gone. */
+	if (app->revoke_sequence)
+		rustos_dvm_app_reply(state, app->revoke_sequence, 0);
+	mutex_unlock(&state->app_lock);
+	put_dev_pagemap(app->pgmap);
+	kfree(app);
+}
+
+static const struct dma_buf_ops rustos_dvm_app_ops = {
+	.attach = rustos_dvm_app_attach,
+	.map_dma_buf = rustos_dvm_app_map,
+	.unmap_dma_buf = rustos_dvm_app_unmap,
+	.mmap = rustos_dvm_app_mmap,
+	.begin_cpu_access = rustos_dvm_app_begin_cpu,
+	.end_cpu_access = rustos_dvm_app_end_cpu,
+	.release = rustos_dvm_app_release,
+};
+
+static long rustos_dvm_app_take(struct rustos_dvm_ivshmem *state, unsigned long argument)
+{
+	struct rustos_dvm_app_event event;
+	struct rustos_dvm_app_export *app, *other;
+	DEFINE_DMA_BUF_EXPORT_INFO(info);
+	struct dma_buf *dmabuf;
+	u64 offset, end;
+	int fd, err;
+
+	if (!state || !state->app_pixels || !atomic_read(&state->relay_ready))
+		return -ENODEV;
+	mutex_lock(&state->app_lock);
+	event.sequence = readq(state->shared + RUSTOS_APP_REQUEST_SEQUENCE);
+	if (!event.sequence || event.sequence <= state->app_sequence) {
+		err = -EAGAIN;
+		goto out;
+	}
+	rmb();
+	event.kind = readq(state->shared + RUSTOS_APP_REQUEST_KIND);
+	memcpy_fromio(event.record, state->shared + RUSTOS_APP_REQUEST_RECORD,
+		      sizeof(event.record));
+	if (readq(state->shared + RUSTOS_APP_REQUEST_SEQUENCE) != event.sequence) {
+		err = -EAGAIN;
+		goto out;
+	}
+	if (!rustos_dvm_app_valid(event.record) ||
+	    (event.kind != RUSTOS_APP_EXPORT && event.kind != RUSTOS_APP_REVOKE)) {
+		err = -EPROTO;
+		goto reply;
+	}
+	if (event.kind == RUSTOS_APP_REVOKE) {
+		list_for_each_entry(app, &state->app_exports, link) {
+			if (!memcmp(app->record, event.record, sizeof(event.record))) {
+				/* Relay closes its fd after receiving this event. No reply
+				 * is sent until the final dma-buf reference has gone. */
+				if (copy_to_user((void __user *)argument, &event, sizeof(event))) {
+					err = -EFAULT;
+					goto out;
+				}
+				WRITE_ONCE(app->revoked, true);
+				app->revoke_sequence = event.sequence;
+				state->app_sequence = event.sequence;
+				err = 0;
+				goto out;
+			}
+		}
+		err = 0;
+		goto reply;
+	}
+	offset = rustos_dvm_read_le64(event.record + 32);
+	end = offset + rustos_dvm_read_le64(event.record + 40);
+	list_for_each_entry(other, &state->app_exports, link) {
+		u64 other_offset = other->phys - RUSTOS_APP_REGION_PHYS;
+		if (offset < other_offset + other->bytes && other_offset < end) {
+			err = -EBUSY;
+			goto reply;
+		}
+	}
+	app = kzalloc(sizeof(*app), GFP_KERNEL);
+	if (!app) {
+		err = -ENOMEM;
+		goto reply;
+	}
+	app->state = state;
+	app->phys = RUSTOS_APP_REGION_PHYS + offset;
+	app->bytes = end - offset;
+	memcpy(app->record, event.record, sizeof(app->record));
+	app->pgmap = get_dev_pagemap(PHYS_PFN(app->phys), NULL);
+	if (app->pgmap != &state->app_pgmap ||
+	    !rustos_dvm_pgmap_owns_pfn(app->pgmap, PHYS_PFN(app->phys + app->bytes - 1))) {
+		put_dev_pagemap(app->pgmap);
+		kfree(app);
+		err = -ENXIO;
+		goto reply;
+	}
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0) {
+		put_dev_pagemap(app->pgmap);
+		kfree(app);
+		err = fd;
+		goto reply;
+	}
+	if (copy_to_user((void __user *)argument, &event, sizeof(event))) {
+		put_unused_fd(fd);
+		put_dev_pagemap(app->pgmap);
+		kfree(app);
+		err = -EFAULT;
+		goto out;
+	}
+	/* Host has reserved the range exclusively and has not exposed it yet. */
+	memset(state->app_pixels + offset, 0, app->bytes);
+	wmb();
+	info.ops = &rustos_dvm_app_ops;
+	info.size = app->bytes;
+	info.flags = O_RDWR;
+	info.priv = app;
+	dmabuf = dma_buf_export(&info);
+	if (IS_ERR(dmabuf)) {
+		put_unused_fd(fd);
+		put_dev_pagemap(app->pgmap);
+		kfree(app);
+		err = PTR_ERR(dmabuf);
+		goto reply;
+	}
+	list_add_tail(&app->link, &state->app_exports);
+	fd_install(fd, dmabuf->file);
+	state->app_sequence = event.sequence;
+	rustos_dvm_app_reply(state, event.sequence, 0);
+	mutex_unlock(&state->app_lock);
+	return fd;
+reply:
+	state->app_sequence = event.sequence;
+	rustos_dvm_app_reply(state, event.sequence, err);
+out:
+	mutex_unlock(&state->app_lock);
+	return err;
 }
 
 static bool rustos_dvm_copy_pixels(struct rustos_dvm_ivshmem *state,
@@ -1091,6 +1399,19 @@ static int rustos_dvm_ivshmem_probe(struct pci_dev *pdev,
 	state->pixels = devm_memremap_pages(&pdev->dev, &state->pixel_pgmap);
 	if (IS_ERR(state->pixels))
 		return PTR_ERR(state->pixels);
+	mutex_init(&state->app_lock);
+	INIT_LIST_HEAD(&state->app_exports);
+	if (devm_request_mem_region(&pdev->dev, RUSTOS_APP_REGION_PHYS,
+				    RUSTOS_APP_REGION_BYTES, "rustos-dvm-app-buffers")) {
+		state->app_pgmap.type = MEMORY_DEVICE_GENERIC;
+		state->app_pgmap.range.start = RUSTOS_APP_REGION_PHYS;
+		state->app_pgmap.range.end = RUSTOS_APP_REGION_PHYS + RUSTOS_APP_REGION_BYTES - 1;
+		state->app_pgmap.nr_range = 1;
+		state->app_pgmap.owner = state;
+		state->app_pixels = devm_memremap_pages(&pdev->dev, &state->app_pgmap);
+		if (IS_ERR(state->app_pixels))
+			state->app_pixels = NULL;
+	}
 	state->doorbell = pcim_iomap(pdev, RUSTOS_IVSHMEM_REGISTERS_BAR,
 				    RUSTOS_IVSHMEM_DOORBELL_OFFSET + sizeof(u32));
 	if (!state->doorbell)
@@ -1099,6 +1420,7 @@ static int rustos_dvm_ivshmem_probe(struct pci_dev *pdev,
 				  RUSTOS_GUI_POOL_HEADER_BYTES);
 	if (!state->shared)
 		return -ENOMEM;
+	state->app_sequence = readq(state->shared + RUSTOS_APP_RESPONSE_SEQUENCE);
 	state->slot_bytes = readq(state->shared + 48U);
 	if (!state->slot_bytes || state->slot_bytes & (PAGE_SIZE - 1) ||
 	    state->slot_bytes >

@@ -10,6 +10,7 @@
 //! dependency is satisfied. Nothing in this file waits on a client fd.
 
 use super::snapshot::{blit_damage, Completion, JobId, Refused};
+use super::viewport::{map_buffer, ViewportError};
 use super::*;
 
 /// The state a `wl_surface.commit` carries, captured at request time.
@@ -17,6 +18,10 @@ pub(super) struct PendingCommit {
     /// `Some(None)` is a null attach (unmap); `None` is "no attach request".
     pub(super) attach: Option<Option<BufferAttachment>>,
     pub(super) damage: Rect,
+    pub(super) viewport: ViewportState,
+    pub(super) mapping: BufferMapping,
+    pub(super) decoration_server: bool,
+    pub(super) offset: (i64, i64),
 }
 
 pub(super) struct InFlightCommit {
@@ -49,6 +54,10 @@ pub(super) fn merge_commits(
     new: PendingCommit,
 ) -> (PendingCommit, Option<wl_buffer::WlBuffer>) {
     let damage = old.damage.union(new.damage);
+    let offset = (
+        old.offset.0.saturating_add(new.offset.0),
+        old.offset.1.saturating_add(new.offset.1),
+    );
     match new.attach {
         Some(attach) => {
             let released = match old.attach {
@@ -59,6 +68,10 @@ pub(super) fn merge_commits(
                 PendingCommit {
                     attach: Some(attach),
                     damage,
+                    viewport: new.viewport,
+                    mapping: new.mapping,
+                    decoration_server: new.decoration_server,
+                    offset,
                 },
                 released,
             )
@@ -67,6 +80,10 @@ pub(super) fn merge_commits(
             PendingCommit {
                 attach: old.attach,
                 damage,
+                viewport: new.viewport,
+                mapping: new.mapping,
+                decoration_server: new.decoration_server,
+                offset,
             },
             None,
         ),
@@ -89,13 +106,22 @@ fn initial_configure_due(surface: &WaylandSurfaceState, mapped: bool) -> bool {
 
 impl WaylandState {
     pub(super) fn commit_surface(&mut self, resource: &wl_surface::WlSurface, data: &SurfaceData) {
-        let (pending_buffer, damage, alive) = {
+        let (pending_buffer, damage, viewport, mapping, decoration_server, offset, alive) = {
             let Ok(mut surface) = data.shared.lock() else {
                 return;
             };
             let damage = surface.pending_damage;
             surface.pending_damage = Rect::empty();
-            (surface.pending_buffer.take(), damage, surface.alive)
+            let offset = std::mem::take(&mut surface.pending_offset);
+            (
+                surface.pending_buffer.take(),
+                damage,
+                surface.pending_viewport,
+                surface.pending_buffer_mapping,
+                surface.decoration_ack_server,
+                (i64::from(offset.0), i64::from(offset.1)),
+                surface.alive,
+            )
         };
         if !alive {
             // A retired surface (its toplevel was destroyed or it was closed)
@@ -128,6 +154,10 @@ impl WaylandState {
         let commit = PendingCommit {
             attach: pending_buffer,
             damage,
+            viewport,
+            mapping,
+            decoration_server,
+            offset,
         };
         // Every commit queues behind an in-flight one, including commits that
         // need no pixels: a null attach processed ahead of an earlier read
@@ -162,10 +192,43 @@ impl WaylandState {
         shared: &Arc<Mutex<WaylandSurfaceState>>,
         commit: PendingCommit,
     ) {
-        let PendingCommit { attach, damage } = commit;
+        let PendingCommit {
+            attach,
+            damage,
+            viewport,
+            mapping,
+            decoration_server,
+            offset,
+        } = commit;
         let has_damage = !damage.is_empty();
+        // Promote the captured mapping. Mapping-only changes are derived from
+        // compositor-owned pixels rather than a buffer already released to its client.
+        let viewport_changed = shared.lock().is_ok_and(|mut surface| {
+            let changed = surface.viewport != viewport || surface.buffer_mapping != mapping;
+            surface.viewport = viewport;
+            surface.buffer_mapping = mapping;
+            changed
+        });
+        let icon_offset_changed = shared.lock().is_ok_and(|mut surface| {
+            if !surface.drag_icon_role || offset == (0, 0) {
+                return false;
+            }
+            surface.drag_icon_offset_x = surface.drag_icon_offset_x.saturating_add(offset.0);
+            surface.drag_icon_offset_y = surface.drag_icon_offset_y.saturating_add(offset.1);
+            surface.frame.x = (i64::from(self.pointer_x).saturating_add(surface.drag_icon_offset_x))
+                .max(0) as usize;
+            surface.frame.y = (i64::from(self.pointer_y).saturating_add(surface.drag_icon_offset_y))
+                .max(0) as usize;
+            surface.drag_icon_active
+        });
+        let decoration_changed = shared.lock().is_ok_and(|mut surface| {
+            let changed = surface.decoration_server != decoration_server;
+            surface.decoration_server = decoration_server;
+            changed
+        });
         let mut outcome = Outcome {
             has_damage,
+            dirty: decoration_changed || icon_offset_changed,
             ..Outcome::default()
         };
         let mut copy_source = None::<BufferData>;
@@ -182,6 +245,9 @@ impl WaylandState {
                 if let Ok(mut surface) = shared.lock() {
                     surface.current_buffer = None;
                     surface.pixels = Arc::default();
+                    surface.original_pixels = Arc::default();
+                    surface.original_width = 0;
+                    surface.original_height = 0;
                     surface.width = 0;
                     surface.height = 0;
                     surface.stride_pixels = 0;
@@ -189,10 +255,29 @@ impl WaylandState {
                     surface.content_version = next_content_version(surface.content_version);
                     surface.configured_serial = 0;
                     surface.acknowledged_serial = 0;
+                    surface.outstanding_configures.clear();
+                    surface.decoration_configures.clear();
                     surface.needs_initial_configure = surface.toplevel.is_some();
                     outcome.trigger_initial_configure =
                         surface.needs_initial_configure && surface.toplevel.is_some();
                     outcome.dirty = true;
+                }
+            }
+            None if viewport_changed && !has_damage => {
+                let retained = shared.lock().ok().and_then(|surface| {
+                    surface.current_buffer.as_ref().map(|_| {
+                        (
+                            surface.original_pixels.clone(),
+                            surface.original_width,
+                            surface.original_height,
+                        )
+                    })
+                });
+                if let Some((pixels, width, height)) = retained {
+                    if !self.present_original(resource, shared, pixels, width, height, &mut outcome)
+                    {
+                        return;
+                    }
                 }
             }
             None if has_damage => {
@@ -218,12 +303,13 @@ impl WaylandState {
             // snapshot and skip the read. The first buffer or a layout change
             // still needs a complete copy so no undefined pixels become visible.
             let retained = !has_damage
+                && !viewport_changed
                 && shared.lock().is_ok_and(|mut surface| {
                     let can_retain = can_retain_undamaged_buffer(
-                        !surface.pixels.is_empty(),
-                        surface.width,
-                        surface.height,
-                        surface.stride_pixels,
+                        !surface.original_pixels.is_empty(),
+                        surface.original_width,
+                        surface.original_height,
+                        surface.original_width,
                         source.shared.width,
                         source.shared.height,
                         source.shared.width,
@@ -236,8 +322,14 @@ impl WaylandState {
                     can_retain
                 });
             if !retained {
-                match self.plan_pixels(resource, shared, &source, damage, has_damage, &mut outcome)
-                {
+                match self.plan_pixels(
+                    resource,
+                    shared,
+                    &source,
+                    damage,
+                    has_damage && !viewport_changed,
+                    &mut outcome,
+                ) {
                     Planned::Done => {}
                     Planned::InFlight(spec) => {
                         self.submit_commit(resource, shared, source, spec, damage, outcome);
@@ -262,7 +354,12 @@ impl WaylandState {
         has_damage: bool,
         outcome: &mut Outcome,
     ) -> Planned {
-        if has_damage {
+        let viewport_active = shared.lock().is_ok_and(|surface| {
+            surface.viewport.is_active() || surface.buffer_mapping != BufferMapping::default()
+        });
+        // A damage patch is in buffer coordinates; under a viewport the
+        // presented pixels are resampled, so only a full read is correct.
+        if has_damage && !viewport_active {
             let (width, height, stride, len) = shared.lock().map_or((0, 0, 0, 0), |surface| {
                 (
                     surface.width,
@@ -374,6 +471,9 @@ impl WaylandState {
                     if !blit_damage(&mut surface.pixels, width, height, damage, &rows) {
                         return false;
                     }
+                    surface.original_pixels = surface.pixels.clone();
+                    surface.original_width = width;
+                    surface.original_height = height;
                     surface.current_buffer = Some(flight.source.clone());
                     surface.last_damage = flight.damage;
                     surface.content_version = next_content_version(surface.content_version);
@@ -395,6 +495,7 @@ impl WaylandState {
                     .width
                     .saturating_mul(flight.damage.height)
                     .saturating_mul(std::mem::size_of::<u32>());
+                super::dmabuf::note_snapshot(&flight.source, bytes);
                 self.record_buffer_copy(elapsed, bytes);
             }
             Ok(SnapshotPixels::Full {
@@ -402,49 +503,21 @@ impl WaylandState {
                 width,
                 height,
             }) => {
-                let (display_width, display_height) = (self.display_width, self.display_height);
                 let bytes = pixels.len().saturating_mul(std::mem::size_of::<u32>());
+                if !self.present_original(
+                    &flight.resource,
+                    &shared,
+                    Arc::new(pixels),
+                    width,
+                    height,
+                    &mut outcome,
+                ) {
+                    return;
+                }
                 if let Ok(mut surface) = shared.lock() {
                     surface.current_buffer = Some(flight.source.clone());
-                    surface.pixels = Arc::new(pixels);
-                    surface.width = width;
-                    surface.height = height;
-                    surface.stride_pixels = width;
-                    surface.content_version = next_content_version(surface.content_version);
-                    // Clamp the rendered chrome to the desktop region. The
-                    // client buffer may be bigger than this (wayclick hardcodes
-                    // 800x520 and ignores our configure); the buffer is cropped
-                    // to what the chrome can show.
-                    let (visible_w, visible_h) = wayland_client_size_for_buffer(
-                        width,
-                        height,
-                        display_width,
-                        display_height,
-                    );
-                    surface.frame = clamp_wayland_frame(
-                        Rect {
-                            x: surface.frame.x,
-                            y: surface.frame.y,
-                            width: visible_w,
-                            height: visible_h,
-                        },
-                        display_width,
-                        display_height,
-                    );
-                    surface.last_damage = if flight.has_damage {
-                        flight.damage
-                    } else {
-                        Rect {
-                            x: 0,
-                            y: 0,
-                            width,
-                            height,
-                        }
-                    };
-                    outcome.mapped = true;
-                    outcome.dirty = true;
-                    outcome.trigger_initial_configure = initial_configure_due(&surface, true);
                 }
+                super::dmabuf::note_snapshot(&flight.source, bytes);
                 self.record_buffer_copy(elapsed, bytes);
             }
             Err(_) => {
@@ -461,6 +534,107 @@ impl WaylandState {
         self.start_queued_commit(&flight.resource, &shared);
     }
 
+    fn present_original(
+        &mut self,
+        resource: &wl_surface::WlSurface,
+        shared: &Arc<Mutex<WaylandSurfaceState>>,
+        original: Arc<Vec<u32>>,
+        width: usize,
+        height: usize,
+        outcome: &mut Outcome,
+    ) -> bool {
+        let (viewport, mapping, viewport_resource) = match shared.lock() {
+            Ok(surface) => (
+                surface.viewport,
+                surface.buffer_mapping,
+                surface.viewport_resource.clone(),
+            ),
+            Err(_) => return false,
+        };
+        let (original_width, original_height) = (width, height);
+        let (pixels, width, height) = match map_buffer(&original, width, height, mapping, &viewport)
+        {
+            Ok(None) => (original.clone(), width, height),
+            Ok(Some((pixels, width, height))) => (Arc::new(pixels), width, height),
+            Err(ViewportError::BufferSize) => {
+                resource.post_error(
+                    wl_surface::Error::InvalidSize,
+                    "buffer dimensions must be a multiple of scale".to_string(),
+                );
+                return false;
+            }
+            Err(error) => {
+                if let Some(viewport) = viewport_resource {
+                    let code = match error {
+                        ViewportError::OutOfBuffer => wp_viewport::Error::OutOfBuffer,
+                        _ => wp_viewport::Error::BadSize,
+                    };
+                    viewport.post_error(code, "invalid viewport at commit".to_string());
+                } else {
+                    post_protocol_error(resource, "invalid viewport at commit".into());
+                }
+                return false;
+            }
+        };
+        let retained = original
+            .len()
+            .saturating_add(if Arc::ptr_eq(&original, &pixels) {
+                0
+            } else {
+                pixels.len()
+            });
+        if !surface_pixel_budget_allows(self.retained_surface_pixels_excluding(shared), retained) {
+            post_protocol_error(
+                resource,
+                "wl_surface.commit: compositor surface memory budget exceeded".into(),
+            );
+            return false;
+        }
+        if let Ok(mut surface) = shared.lock() {
+            surface.original_pixels = original;
+            surface.original_width = original_width;
+            surface.original_height = original_height;
+            surface.pixels = pixels;
+            surface.width = width;
+            surface.height = height;
+            surface.stride_pixels = width;
+            surface.content_version = next_content_version(surface.content_version);
+            let (visible_w, visible_h) = wayland_client_size_for_buffer(
+                width,
+                height,
+                self.display_width,
+                self.display_height,
+            );
+            if surface.drag_icon_role {
+                surface.frame.width = width;
+                surface.frame.height = height;
+            } else {
+                surface.frame = clamp_wayland_frame(
+                    Rect {
+                        x: surface.frame.x,
+                        y: surface.frame.y,
+                        width: visible_w,
+                        height: visible_h,
+                    },
+                    self.display_width,
+                    self.display_height,
+                );
+            }
+            surface.last_damage = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            outcome.mapped = true;
+            outcome.dirty = true;
+            outcome.trigger_initial_configure = initial_configure_due(&surface, true);
+            true
+        } else {
+            false
+        }
+    }
+
     /// The commit's visible effects, shared by the synchronous and the
     /// completed-snapshot paths.
     fn finish_commit(&mut self, shared: &Arc<Mutex<WaylandSurfaceState>>, mut outcome: Outcome) {
@@ -471,7 +645,7 @@ impl WaylandState {
                 buffer.release();
             }
         }
-        if outcome.has_damage && !outcome.dirty {
+        if !outcome.mapped {
             if let Ok(surface) = shared.lock() {
                 if !surface.pixels.is_empty() && surface.width != 0 && surface.height != 0 {
                     outcome.mapped = true;
@@ -593,15 +767,27 @@ mod tests {
         let old = PendingCommit {
             attach: None,
             damage: rect(0, 0, 10, 10),
+            viewport: ViewportState::default(),
+            mapping: BufferMapping::default(),
+            decoration_server: true,
+            offset: (0, 0),
         };
         let new = PendingCommit {
             attach: Some(None),
             damage: rect(20, 20, 5, 5),
+            viewport: ViewportState {
+                destination: Some((7, 8)),
+                ..Default::default()
+            },
+            mapping: BufferMapping::default(),
+            decoration_server: true,
+            offset: (0, 0),
         };
         let (merged, released) = merge_commits(old, new);
         assert!(released.is_none());
         assert!(matches!(merged.attach, Some(None)));
         assert_eq!(merged.damage, rect(0, 0, 25, 25));
+        assert_eq!(merged.viewport.destination, Some((7, 8)));
     }
 
     #[test]
@@ -609,10 +795,18 @@ mod tests {
         let old = PendingCommit {
             attach: Some(None),
             damage: Rect::empty(),
+            viewport: ViewportState::default(),
+            mapping: BufferMapping::default(),
+            decoration_server: true,
+            offset: (0, 0),
         };
         let new = PendingCommit {
             attach: None,
             damage: rect(1, 1, 2, 2),
+            viewport: ViewportState::default(),
+            mapping: BufferMapping::default(),
+            decoration_server: true,
+            offset: (0, 0),
         };
         let (merged, _) = merge_commits(old, new);
         assert!(

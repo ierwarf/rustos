@@ -3,6 +3,7 @@ pub mod kmem_charge;
 pub mod address_space;
 mod cache_attributes;
 pub mod frame_capability;
+pub mod frame_source;
 pub mod heap;
 pub mod kernel_vm;
 pub mod paging;

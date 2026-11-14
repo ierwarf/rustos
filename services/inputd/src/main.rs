@@ -1963,3 +1963,6 @@ fn debug_line(message: &str) {
     line[len] = b'\n';
     rustos_svc_runtime::ipc::debug_bytes(&line[..len + 1]);
 }
+
+// Native ABI revision stamp (hint, not authority); see docs/architecture/evolution-rules.md.
+rustos_user_abi::native_abi_note!();

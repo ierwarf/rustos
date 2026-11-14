@@ -21,6 +21,7 @@ impl Drop for ProcessAddressSpace {
     #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
     fn drop(&mut self) {
         // Last release enqueues only; no allocation, lock, CR3 or shootdown here.
+        self.immutable.clear();
         drop(self.execution.take());
     }
 }
@@ -59,6 +60,7 @@ pub(super) fn reclaim_root(root: u64) {
         pml4_frame_phys: root,
         next_user_addr: super::USER_SPACE_BASE,
         execution: None,
+        immutable: Vec::new(),
     });
     if address_space.pml4_frame_phys == 0 {
         return;

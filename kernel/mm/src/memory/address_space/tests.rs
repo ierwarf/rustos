@@ -40,6 +40,22 @@ fn user_page_flags_enforce_wx_and_reject_huge_pages() {
 }
 
 #[test]
+fn no_access_keeps_owned_bytes_but_denies_hardware_and_checked_user_access() {
+    let none = normalize_user_page_flags(USER_INACCESSIBLE_LEAF | PageTableFlags::NO_EXECUTE).unwrap();
+    assert!(none.contains(PageTableFlags::PRESENT | USER_INACCESSIBLE_LEAF));
+    assert!(!none.intersects(PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE));
+    assert_eq!(validate_user_page_access(none, UserBufferAccess::Read), Err(AddressSpaceError::ProtectionViolation));
+    assert_eq!(validate_user_page_access(none, UserBufferAccess::Write), Err(AddressSpaceError::ProtectionViolation));
+    assert!(normalize_user_page_flags(none | PageTableFlags::WRITABLE).is_err());
+    let hidden = preserve_4k_leaf_pat(none | ROOT_OWNED_USER_LEAF, none);
+    assert!(hidden.contains(ROOT_OWNED_USER_LEAF | USER_INACCESSIBLE_LEAF));
+    let read = normalize_user_page_flags(PageTableFlags::NO_EXECUTE).unwrap();
+    let restored = preserve_4k_leaf_pat(hidden, read);
+    assert!(restored.contains(ROOT_OWNED_USER_LEAF | PageTableFlags::USER_ACCESSIBLE));
+    assert!(!restored.contains(USER_INACCESSIBLE_LEAF));
+}
+
+#[test]
 fn mprotect_preserves_write_combine_pat_on_4k_leaf() {
     let existing = PageTableFlags::PRESENT
         | PageTableFlags::USER_ACCESSIBLE

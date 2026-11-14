@@ -35,8 +35,9 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rustos_image_admission::{
-    admit_elf64_image, admit_pe64_image_headers, apply_pe64_base_relocations,
-    validate_pe64_import_table, ByteAdmissionError,
+    admit_elf64_image, admit_native_abi_stamp, admit_pe64_image_headers,
+    apply_pe64_base_relocations, validate_pe64_import_table, ByteAdmissionError,
+    NativeAbiRefusal,
 };
 use rustos_user_abi::deadline::{AbsoluteDeadline, NANOS_PER_MILLI};
 use rustos_user_abi::performance::EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS;

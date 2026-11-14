@@ -3,6 +3,10 @@
 // broker entry substrate.
 use super::*;
 
+#[path = "app_buffer_broker_ops.rs"]
+mod app_buffer_broker_ops;
+use app_buffer_broker_ops::*;
+
 #[path = "device_broker_ops.rs"]
 mod device_broker_ops;
 #[path = "early_system_broker_ops.rs"]
@@ -47,7 +51,9 @@ pub(crate) use lifecycle_broker_ops::{
 pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
     matches!(
         syscall_number,
-        linux_abi::SYS_RUSTOS_NET_BROKER
+        linux_abi::SYS_RUSTOS_APP_BUFFER_BROKER
+            | linux_abi::SYS_RUSTOS_APP_BUFFER_ALLOC
+            | linux_abi::SYS_RUSTOS_NET_BROKER
             | linux_abi::SYS_RUSTOS_INPUT_STATS_BROKER
             | linux_abi::SYS_RUSTOS_INPUT_INGEST_BROKER
             | linux_abi::SYS_RUSTOS_INPUT_WAIT_BROKER
@@ -72,6 +78,8 @@ pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
 
 pub(super) fn dispatch_linux_rustos_broker_syscall(frame: &SyscallFrame) -> u64 {
     match frame.rax {
+        linux_abi::SYS_RUSTOS_APP_BUFFER_BROKER => syscall_linux_rustos_app_buffer_broker(frame.rdi),
+        linux_abi::SYS_RUSTOS_APP_BUFFER_ALLOC => syscall_linux_rustos_app_buffer_alloc(frame.rdi),
         linux_abi::SYS_RUSTOS_NET_BROKER => syscall_linux_rustos_net_broker(frame.rdi),
         linux_abi::SYS_RUSTOS_INPUT_STATS_BROKER => {
             syscall_linux_rustos_input_stats_broker(frame.rdi)

@@ -38,8 +38,15 @@ pub enum Class {
     /// A queued synchronous-call message and its request/handle storage,
     /// billed to the sending process's Job.
     IpcMessage = 5,
+    /// App DMA-BUF aperture bytes (`kernel-ps` device-buffer custody), billed
+    /// to the Job that installed the allocation until the range is reclaimed.
+    DeviceBuffer = 6,
+    /// Ring0 heap of the shared library-cache registry (per-object page-token
+    /// arrays), billed to the owning service Job that created the object
+    /// until the object is retired or dropped.
+    LibraryObject = 7,
 }
-pub const CLASSES: usize = 6;
+pub const CLASSES: usize = 8;
 const NO_PARENT: u32 = u32::MAX;
 const MAX_DEPTH: usize = 9;
 
@@ -159,6 +166,22 @@ pub fn would_admit(class: Class, index: usize, bytes: u64) -> bool {
     true
 }
 
+/// One owner's meter shared with the physical execution root. The root's
+/// clone keeps its accounting alive through delayed cold reclamation.
+#[derive(Clone, Debug)]
+pub struct SharedMeter(alloc::sync::Arc<spin::Mutex<Meter>>);
+impl SharedMeter {
+    pub fn new(class: Class) -> Self { Self(alloc::sync::Arc::new(spin::Mutex::new(Meter::new(class)))) }
+    pub fn charged(&self) -> u64 { self.0.lock().charged() }
+    pub fn bind(&self, group: usize, total: u64) -> bool { self.0.lock().bind(group, total) }
+    pub fn set_total(&self, total: u64) -> bool { self.0.lock().set_total(total) }
+    pub fn set_total_forced(&self, total: u64) { self.0.lock().set_total_forced(total) }
+    pub fn would_admit(&self, total: u64) -> bool { self.0.lock().would_admit(total) }
+    pub fn try_peer(&self, total: u64) -> Option<Self> {
+        self.0.lock().try_peer(total).map(|peer| Self(alloc::sync::Arc::new(spin::Mutex::new(peer))))
+    }
+}
+
 /// A kernel object owner's running charge in one class: the pattern every
 /// owner of variable-size kernel state follows. The meter is bound to a Job
 /// group once; `set_total`/`set_total_forced` keep the group's usage equal to
@@ -231,6 +254,18 @@ impl Meter {
             uncharge(self.class, group as usize, self.charged - total);
         }
         self.charged = total;
+    }
+
+    /// Independently reserves an owner in the same group; both meters retain
+    /// their charges until their own lifetimes end.
+    pub fn try_peer(&self, total: u64) -> Option<Meter> {
+        let mut peer = Meter::new(self.class);
+        if let Some(group) = self.group {
+            if !peer.bind(group as usize, total) {
+                return None;
+            }
+        }
+        Some(peer)
     }
 
     /// Takes over the binding and charge of `other`, leaving it unbound.
@@ -432,5 +467,42 @@ mod tests {
         assert_eq!(limit(C, 57), UNLIMITED);
         assert_eq!(usage(C, 57), 8);
         uncharge(C, 57, 8);
+    }
+}
+
+#[cfg(test)]
+mod mapping_reservation_tests {
+    extern crate std;
+    use super::*;
+    use std::{sync::{Arc, Barrier}, thread};
+
+    #[test]
+    fn concurrent_mapping_growth_reserves_ancestor_budget_and_refunds() {
+        init_group(33, None);
+        init_group(34, Some(33));
+        init_group(35, Some(33));
+        set_limit(Class::Vma, 33, 64);
+        let entered = Arc::new(Barrier::new(3));
+        let release = Arc::new(Barrier::new(3));
+        let mut tasks = std::vec::Vec::new();
+        for group in [34, 35] {
+            let entered = entered.clone();
+            let release = release.clone();
+            tasks.push(thread::spawn(move || {
+                let mut meter = Meter::new(Class::Vma);
+                assert!(meter.bind(group, 0));
+                let admitted = meter.set_total(64);
+                entered.wait();
+                release.wait();
+                // Cancellation or exact-total reconciliation returns the reservation.
+                assert!(meter.set_total(0));
+                admitted
+            }));
+        }
+        entered.wait();
+        assert_eq!(usage(Class::Vma, 33), 64);
+        release.wait();
+        assert_eq!(tasks.into_iter().map(|t| t.join().unwrap()).filter(|won| *won).count(), 1);
+        assert_eq!(usage(Class::Vma, 33), 0);
     }
 }

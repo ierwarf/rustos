@@ -89,6 +89,15 @@ pub struct ProcessSecurityContext {
     euid: u32,
     egid: u32,
     pending_admin_request: Option<PendingAdminRequest>,
+    /// `PR_SET_NO_NEW_PRIVS`: one-way per-process flag. Inherited by fork and
+    /// preserved across exec (`for_exec`); RustOS has no setuid/file-capability
+    /// exec path, so recording it is the whole truthful behavior today.
+    no_new_privs: bool,
+    /// `PR_SET_DUMPABLE` (0/1). Defaults to dumpable, inherited by fork and
+    /// reset to dumpable by exec (`for_exec`), as Linux does for a process whose
+    /// credentials did not change. RustOS produces no core dumps or ptrace
+    /// attach checks that consume it yet.
+    dumpable: bool,
 }
 
 impl ProcessSecurityContext {
@@ -110,6 +119,8 @@ impl ProcessSecurityContext {
             euid: uid,
             egid: gid,
             pending_admin_request: None,
+            no_new_privs: false,
+            dumpable: true,
         }
     }
 
@@ -127,7 +138,32 @@ impl ProcessSecurityContext {
             euid,
             egid,
             pending_admin_request: None,
+            no_new_privs: false,
+            dumpable: true,
         }
+    }
+
+    /// Security context of the same process after a successful exec:
+    /// credentials and `no_new_privs` carry over, everything image-specific
+    /// (pending admin request, dumpable) is reset.
+    pub const fn for_exec(self) -> Self {
+        let mut next = Self::new_with_credentials(
+            self.logical_admin,
+            self.uid,
+            self.gid,
+            self.euid,
+            self.egid,
+        );
+        next.no_new_privs = self.no_new_privs;
+        next
+    }
+
+    pub const fn no_new_privs(self) -> bool {
+        self.no_new_privs
+    }
+
+    pub const fn dumpable(self) -> bool {
+        self.dumpable
     }
 
     pub fn is_logical_admin(self) -> bool {
@@ -189,6 +225,9 @@ pub struct UserProcessState {
     mapping_cursor: u64,
     shared_memfd_mappings: Vec<SharedMemfdMapping>,
     shared_region_mappings: Vec<SharedRegionMapping>,
+    /// App DMA-BUF mappings. Not inherited by fork (the child has no PTEs for
+    /// them and holds no custody); the child must import its own capability.
+    device_buffer_mappings: Vec<DeviceBufferMapping>,
     /// Fixed physical windows (scanout/GPU surfaces) mapped into this process.
     /// They have no shared region to hold, and the surface handle's own record
     /// dies with the fd, so this list is the only thing that keeps the PTEs
@@ -196,7 +235,7 @@ pub struct UserProcessState {
     external_physical_mappings: Vec<(u64, u64)>,
     /// Bytes of the two mapping lists above, billed to the Job as
     /// `Class::Vma` once the process is published.
-    mapping_kmem: kernel_mm::api::kmem_charge::Meter,
+    mapping_kmem: kernel_mm::api::kmem_charge::SharedMeter,
     exec_path: [u8; PROCESS_EXEC_PATH_CAPACITY],
     exec_path_len: usize,
 }
@@ -291,6 +330,23 @@ pub struct SharedMemfdMapping {
     hold: MemfdMappingHold,
 }
 
+/// One admitted app DMA-BUF mapping. The `Arc` lets a partial munmap keep the
+/// remaining pieces' custody without a second admission; the capability's
+/// mapping count drops only when the last piece is gone (after PTE removal and
+/// TLB shootdown, or after retirement reclaim for teardown/exec).
+#[derive(Clone, Debug)]
+struct DeviceBufferMapping {
+    start: u64,
+    len: u64,
+    hold: alloc::sync::Arc<crate::user::handles::BufferMappingHold>,
+}
+
+impl DeviceBufferMapping {
+    fn end(&self) -> u64 {
+        self.start.saturating_add(self.len)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SharedRegionMapping {
     start: u64,
@@ -379,13 +435,15 @@ impl UserProcessState {
             mapping_cursor: default_cursor,
             shared_memfd_mappings: Vec::new(),
             shared_region_mappings: Vec::new(),
+            device_buffer_mappings: Vec::new(),
             external_physical_mappings: Vec::new(),
-            mapping_kmem: kernel_mm::api::kmem_charge::Meter::new(
+            mapping_kmem: kernel_mm::api::kmem_charge::SharedMeter::new(
                 kernel_mm::api::kmem_charge::Class::Vma,
             ),
             exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
             exec_path_len: 0,
         };
+        state.address_space.set_mapping_meter(state.mapping_kmem.clone());
         state.set_exec_path(exec_path);
         state.sync_linux_mapping_cursor();
         state
@@ -544,6 +602,67 @@ impl UserProcessState {
         self.sync_mapping_kmem();
     }
 
+    /// Records custody for a mapping whose PTEs were just installed. The hold
+    /// is released only by `release_device_buffer_mappings_in_range` after the
+    /// unmap's TLB shootdown, or by retirement of this whole state.
+    pub fn record_device_buffer_mapping(
+        &mut self,
+        start: u64,
+        len: u64,
+        hold: crate::user::handles::BufferMappingHold,
+    ) {
+        self.device_buffer_mappings.push(DeviceBufferMapping {
+            start,
+            len,
+            hold: alloc::sync::Arc::new(hold),
+        });
+        self.sync_mapping_kmem();
+    }
+
+    pub fn device_buffer_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        self.device_buffer_mappings
+            .iter()
+            .filter_map(|mapping| {
+                overlap_segment(mapping.start, mapping.end(), start, end)
+                    .map(|(seg_start, len)| (seg_start, seg_start.saturating_add(len)))
+            })
+            .collect()
+    }
+
+    pub fn release_device_buffer_mappings_in_range(&mut self, start: u64, end: u64) {
+        if !self
+            .device_buffer_mappings
+            .iter()
+            .any(|mapping| end > mapping.start && start < mapping.end())
+        {
+            return;
+        }
+        let mut updated = Vec::with_capacity(self.device_buffer_mappings.len() + 1);
+        for mapping in self.device_buffer_mappings.drain(..) {
+            let mapping_end = mapping.end();
+            if end <= mapping.start || start >= mapping_end {
+                updated.push(mapping);
+                continue;
+            }
+            if start > mapping.start {
+                updated.push(DeviceBufferMapping {
+                    start: mapping.start,
+                    len: start - mapping.start,
+                    hold: mapping.hold.clone(),
+                });
+            }
+            if end < mapping_end {
+                updated.push(DeviceBufferMapping {
+                    start: end,
+                    len: mapping_end - end,
+                    hold: mapping.hold.clone(),
+                });
+            }
+        }
+        self.device_buffer_mappings = updated;
+        self.sync_mapping_kmem();
+    }
+
     pub fn record_external_physical_mapping(&mut self, start: u64, len: u64) {
         self.external_physical_mappings.push((start, len));
         self.sync_mapping_kmem();
@@ -636,7 +755,9 @@ impl UserProcessState {
     fn mapping_kmem_total(&self) -> u64 {
         (self.shared_memfd_mappings.len() * core::mem::size_of::<SharedMemfdMapping>()
             + self.shared_region_mappings.len() * core::mem::size_of::<SharedRegionMapping>()
-            + self.external_physical_mappings.len() * core::mem::size_of::<(u64, u64)>())
+            + self.device_buffer_mappings.len() * core::mem::size_of::<DeviceBufferMapping>()
+            + self.external_physical_mappings.len() * core::mem::size_of::<(u64, u64)>()
+            + self.address_space.immutable_mapping_metadata_bytes())
             as u64
     }
 
@@ -644,9 +765,23 @@ impl UserProcessState {
     /// after the list changed, so it cannot refuse: the new record already
     /// exists (admission was `admit_mapping_records`) and a split by unmap
     /// must not fail. A shrink refunds.
-    fn sync_mapping_kmem(&mut self) {
+    pub fn sync_mapping_kmem(&mut self) {
         let total = self.mapping_kmem_total();
         self.mapping_kmem.set_total_forced(total);
+    }
+
+    /// Pre-admit immutable private-image metadata splits, independently of
+    /// shared mappings. The MM preflights its complete edit before PTE changes.
+    pub fn admit_immutable_mapping_edit(&mut self, start: u64, end: u64) -> bool {
+        let extra = self.address_space.immutable_edit_headroom_bytes(start, end) as u64;
+        self.mapping_kmem.set_total(self.mapping_kmem_total().saturating_add(extra))
+    }
+
+    /// Independently reserve the replacement while the old root retains its meter.
+    pub fn reserve_exec_mapping_kmem(&self, address_space: &ProcessAddressSpace)
+        -> Option<kernel_mm::api::kmem_charge::SharedMeter>
+    {
+        self.mapping_kmem.try_peer(address_space.immutable_mapping_metadata_bytes() as u64)
     }
 
     /// Bills the mapping lists to `group` (the Job's charge group); refused,
@@ -762,6 +897,15 @@ impl UserProcessState {
         self.security.set_uid(uid);
     }
 
+    /// One-way: there is deliberately no way to clear the flag.
+    pub fn set_no_new_privs(&mut self) {
+        self.security.no_new_privs = true;
+    }
+
+    pub fn set_dumpable(&mut self, dumpable: bool) {
+        self.security.dumpable = dumpable;
+    }
+
     pub fn set_gid(&mut self, gid: u32) {
         self.security.set_gid(gid);
     }
@@ -784,12 +928,14 @@ impl UserProcessState {
             mapping_cursor: self.mapping_cursor,
             shared_memfd_mappings: self.shared_memfd_mappings.clone(),
             shared_region_mappings: self.shared_region_mappings.clone(),
+            device_buffer_mappings: Vec::new(),
             external_physical_mappings: self.external_physical_mappings.clone(),
             // A fork child is billed when it is published, not when cloned.
-            mapping_kmem: self.mapping_kmem.clone(),
+            mapping_kmem: kernel_mm::api::kmem_charge::SharedMeter::new(kernel_mm::api::kmem_charge::Class::Vma),
             exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
             exec_path_len: 0,
         };
+        state.address_space.set_mapping_meter(state.mapping_kmem.clone());
         state.set_exec_path(exec_path_override.unwrap_or(self.exec_path()));
         state
     }
@@ -815,6 +961,7 @@ impl UserProcessState {
             mapping_cursor,
             shared_memfd_mappings,
             shared_region_mappings,
+            device_buffer_mappings,
             external_physical_mappings,
             mapping_kmem,
             exec_path,
@@ -832,6 +979,7 @@ impl UserProcessState {
             mapping_cursor,
             shared_memfd_mappings,
             shared_region_mappings,
+            device_buffer_mappings,
             external_physical_mappings,
             mapping_kmem,
             exec_path,
@@ -846,17 +994,12 @@ impl UserProcessState {
         linux_memory_map: LinuxMemoryMapState,
         linux_runtime_profile: LinuxRuntimeProfile,
         exec_path: &str,
+        replacement_mapping_kmem: kernel_mm::api::kmem_charge::SharedMeter,
     ) -> (Vec<KernelHandle>, Self) {
         let preserved_ignored = self
             .linux_sigactions
             .map(|action| action.handler == SIG_IGN);
-        let security = ProcessSecurityContext::new_with_credentials(
-            self.security.logical_admin,
-            self.security.uid,
-            self.security.gid,
-            self.security.euid,
-            self.security.egid,
-        );
+        let security = self.security.for_exec();
         let mut handles = core::mem::take(&mut self.handles);
         let closed = handles.close_cloexec();
 
@@ -870,10 +1013,9 @@ impl UserProcessState {
             exec_path,
         );
         fresh.handles = handles;
-        // The Job binding survives exec; exec leaves no shared mappings, so
-        // the new lists are empty and the old bytes are refunded now.
-        fresh.mapping_kmem.adopt(&mut self.mapping_kmem);
-        fresh.sync_mapping_kmem();
+        // The old meter remains in old_state until its root is reclaimed.
+        fresh.mapping_kmem = replacement_mapping_kmem;
+        fresh.address_space.set_mapping_meter(fresh.mapping_kmem.clone());
         fresh.security = security;
         for (signal, ignored) in preserved_ignored
             .iter()
@@ -998,6 +1140,42 @@ mod tests {
     };
 
     #[test]
+    fn device_buffer_mapping_custody_survives_split_and_releases_last() {
+        use crate::user::handles::{app_buffer_pool, BufferOwner, BufferRights};
+        use crate::user::process_state::UserProcessState;
+        use alloc::vec;
+        use kernel_mm::api::ProcessAddressSpace;
+        let owner = BufferOwner { service_id: 4, generation: 0x7d_0001 };
+        let cap = app_buffer_pool().allocate(owner, 2 * 4096, BufferRights::ALL).unwrap();
+        let id = cap.identity();
+        let mut state = UserProcessState::new(
+            ProcessAddressSpace::empty_for_tests(),
+            Some(crate::user::linux::LinuxProcessState::default()),
+            None, None, None, false, "/dmabuf",
+        );
+        let base = 0x4000_0000_u64;
+        state.record_device_buffer_mapping(base, 2 * 4096, cap.admit_mapping(0, 2 * 4096, true).unwrap());
+        assert_eq!(state.device_buffer_overlap_segments(base, base + 4096), vec![(base, base + 4096)]);
+        {
+            let mut pool = app_buffer_pool();
+            pool.revoke(id).unwrap();
+            pool.provider_retired(id).unwrap();
+        }
+        drop(cap);
+        assert_eq!(app_buffer_pool().next_reclaimable(), None, "mapped range must stay quarantined");
+        // Partial munmap keeps custody for the remaining page.
+        state.release_device_buffer_mappings_in_range(base, base + 4096);
+        assert_eq!(state.device_buffer_overlap_segments(base, base + 2 * 4096), vec![(base + 4096, base + 2 * 4096)]);
+        assert_eq!(app_buffer_pool().next_reclaimable(), None);
+        // Unrelated range changes nothing.
+        state.release_device_buffer_mappings_in_range(base + 8 * 4096, base + 9 * 4096);
+        assert_eq!(app_buffer_pool().next_reclaimable(), None);
+        state.release_device_buffer_mappings_in_range(base + 4096, base + 2 * 4096);
+        assert_eq!(app_buffer_pool().next_reclaimable(), Some(id));
+        app_buffer_pool().reclaim_after_scrub(id).unwrap();
+    }
+
+    #[test]
     fn overlap_segment_rejects_disjoint_ranges_without_unsigned_underflow() {
         assert_eq!(overlap_segment(0x1000, 0x2000, 0x3000, 0x4000), None);
         assert_eq!(overlap_segment(0x3000, 0x4000, 0x1000, 0x2000), None);
@@ -1034,5 +1212,32 @@ mod tests {
         assert_eq!(admin.gid(), 0);
         assert_eq!(admin.euid(), 0);
         assert_eq!(admin.egid(), 0);
+    }
+
+    #[test]
+    fn no_new_privs_is_one_way_and_survives_exec_dumpable_resets() {
+        use crate::user::process_state::UserProcessState;
+        use kernel_mm::api::ProcessAddressSpace;
+        let mut state = UserProcessState::new(
+            ProcessAddressSpace::empty_for_tests(),
+            Some(crate::user::linux::LinuxProcessState::default()),
+            None, None, None, false, "/p",
+        );
+        assert!(!state.security().no_new_privs());
+        assert!(state.security().dumpable());
+        state.set_dumpable(false);
+        state.set_no_new_privs();
+        state.set_no_new_privs();
+        assert!(state.security().no_new_privs());
+        assert!(!state.security().dumpable());
+        // Fork copies the context by value.
+        let forked = state.security();
+        assert!(forked.no_new_privs() && !forked.dumpable());
+        // Exec keeps credentials and no_new_privs, resets dumpable.
+        let exec = state.security().for_exec();
+        assert!(exec.no_new_privs());
+        assert!(exec.dumpable());
+        assert_eq!(exec.uid(), state.security().uid());
+        assert_eq!(exec.egid(), state.security().egid());
     }
 }

@@ -1,3 +1,4 @@
+mod abi_drift;
 mod bench;
 mod build;
 mod cli;
@@ -6,6 +7,7 @@ mod dev;
 mod formal_contracts;
 mod kvm;
 mod layering;
+mod native_abi;
 mod package_manifest;
 mod soak;
 mod stage;

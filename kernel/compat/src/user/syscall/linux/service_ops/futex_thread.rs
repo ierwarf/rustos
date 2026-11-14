@@ -342,6 +342,9 @@ pub fn clone_linux_thread(
         Err(multitask::SpawnTaskError::InvalidWeightMicros) => {
             return clone_stage_failed(10, LINUX_EINVAL, flags);
         }
+        Err(multitask::SpawnTaskError::MemoryQuota) => {
+            return clone_stage_failed(11, LINUX_ENOMEM, flags);
+        }
         Err(multitask::SpawnTaskError::NoFreeTaskSlot) => {
             return clone_stage_failed(11, LINUX_EAGAIN, flags);
         },

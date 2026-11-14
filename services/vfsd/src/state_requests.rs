@@ -146,7 +146,8 @@ impl VfsState {
             && matches!(request.op,
                 VFS_IPC_OP_READ | VFS_IPC_OP_PREAD64 | VFS_IPC_OP_WRITE |
                 VFS_IPC_OP_LSEEK | VFS_IPC_OP_FSTAT | VFS_IPC_OP_GETDENTS64 |
-                VFS_IPC_OP_FCNTL | VFS_IPC_OP_CURSOR_SETTLE | VFS_IPC_OP_FTRUNCATE)
+                VFS_IPC_OP_FCNTL | VFS_IPC_OP_CURSOR_SETTLE | VFS_IPC_OP_FTRUNCATE |
+                VFS_IPC_OP_FILE_IDENTITY)
             && !self.has_funded_open_description(request.remote_id,request.pid)
         {
             response.status=116; // ESTALE, forces reopen against new provider
@@ -163,6 +164,8 @@ impl VfsState {
             }
             VFS_IPC_OP_LSEEK => self.vfs_lseek(request, response),
             VFS_IPC_OP_FSTAT => self.vfs_fstat(request, response),
+            VFS_IPC_OP_FILE_IDENTITY => self.vfs_file_identity(request, response),
+            VFS_IPC_OP_LIBRARY_READ => self.vfs_library_read(request, response),
             VFS_IPC_OP_FTRUNCATE => {
                 response.status = persistent_mutation_status(request.op).unwrap_or(EINVAL)
             }
@@ -172,7 +175,7 @@ impl VfsState {
             VFS_IPC_OP_CHECKPOINT_ACK => self.vfs_checkpoint_ack(request, response),
             VFS_IPC_OP_STATX => self.vfs_path_statx(request, response),
             VFS_IPC_OP_NEWFSTATAT => self.vfs_path_stat(request, response),
-            VFS_IPC_OP_READLINKAT => response.status = ENOENT,
+            VFS_IPC_OP_READLINKAT => self.vfs_readlinkat(request, response),
             VFS_IPC_OP_ACCESS => self.vfs_access(request, response),
             VFS_IPC_OP_GETCWD => self.vfs_getcwd(request, response),
             VFS_IPC_OP_CHDIR => self.vfs_chdir(request, response),

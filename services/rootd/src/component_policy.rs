@@ -414,6 +414,9 @@ mod tests {
                 ),
                 IPC_SERVICE_VFSD => matches!(target, IPC_SERVICE_DEVMGRD | IPC_SERVICE_STORAGED),
                 IPC_SERVICE_PROCD => target == IPC_SERVICE_LOADERD,
+                // Added with the shared library cache: the pager warm worker
+                // reads its authenticated manifest's files through vfsd.
+                IPC_SERVICE_PAGERD => target == IPC_SERVICE_VFSD,
                 IPC_SERVICE_INPUTD => target == IPC_SERVICE_NETD,
                 IPC_SERVICE_SESSIOND => matches!(
                     target,

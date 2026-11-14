@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_WEIGHT_MICROS: u64 = 100;
 pub(crate) const RPC_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const LAUNCH_TRANSACTION_TIMEOUT: Duration =
+    Duration::from_nanos(protocol::MAX_TRANSACTION_LIFETIME_NS);
 
 mod config_snapshot;
 pub mod protocol;
@@ -207,47 +209,61 @@ impl RuntimeClient {
         Ok((programs, digest))
     }
 
-    fn transaction(&self, mut request: RuntimeRequest) -> Result<RuntimeTransaction, i32> {
+    fn transaction(
+        &self,
+        mut request: RuntimeRequest,
+        lifetime: Duration,
+    ) -> Result<RuntimeTransaction, i32> {
         let now = monotonic_nanos()?;
         let sequence = NEXT_TRANSACTION
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| libc::EOVERFLOW)?;
         request.transaction_id_hi = now;
         request.transaction_id_lo = sequence;
-        request.transaction_deadline_ns = now
-            .checked_add(RPC_IO_TIMEOUT.as_nanos() as u64)
-            .ok_or(libc::EOVERFLOW)?;
+        let lifetime_ns = u64::try_from(lifetime.as_nanos())
+            .map_err(|_| libc::EOVERFLOW)?
+            .min(protocol::MAX_TRANSACTION_LIFETIME_NS);
+        request.transaction_deadline_ns = now.checked_add(lifetime_ns).ok_or(libc::EOVERFLOW)?;
         Ok(RuntimeTransaction { request })
     }
 
     pub fn launch_transaction(&self, desktop_file_id: &str) -> Result<RuntimeTransaction, i32> {
-        self.transaction(request_with_path(
-            OP_REQUEST_LAUNCH_PATH,
-            LAUNCH_TARGET_NEW_SESSION,
-            0,
-            desktop_file_id,
-        )?)
+        self.transaction(
+            request_with_path(
+                OP_REQUEST_LAUNCH_PATH,
+                LAUNCH_TARGET_NEW_SESSION,
+                0,
+                desktop_file_id,
+            )?,
+            LAUNCH_TRANSACTION_TIMEOUT,
+        )
     }
 
     pub fn terminate_session_transaction(
         &self,
         session_handle: u64,
     ) -> Result<RuntimeTransaction, i32> {
-        self.transaction(RuntimeRequest {
-            op: OP_REQUEST_TERMINATE,
-            target_kind: TERMINATE_TARGET_SESSION,
-            target_value: session_handle,
-            ..RuntimeRequest::default()
-        })
+        self.transaction(
+            RuntimeRequest {
+                op: OP_REQUEST_TERMINATE,
+                target_kind: TERMINATE_TARGET_SESSION,
+                target_value: session_handle,
+                ..RuntimeRequest::default()
+            },
+            RPC_IO_TIMEOUT,
+        )
     }
 
     pub fn terminate_pid_transaction(&self, pid: u64) -> Result<RuntimeTransaction, i32> {
-        self.transaction(RuntimeRequest {
-            op: OP_REQUEST_TERMINATE,
-            target_kind: TERMINATE_TARGET_PID,
-            target_value: pid,
-            ..RuntimeRequest::default()
-        })
+        self.transaction(
+            RuntimeRequest {
+                op: OP_REQUEST_TERMINATE,
+                target_kind: TERMINATE_TARGET_PID,
+                target_value: pid,
+                ..RuntimeRequest::default()
+            },
+            RPC_IO_TIMEOUT,
+        )
     }
 
     /// Submit once. Every later attempt must query this same identity.
@@ -1662,6 +1678,16 @@ mod tests {
             assert_eq!(
                 requests[0].transaction_deadline_ns,
                 requests[1].transaction_deadline_ns
+            );
+            assert_eq!(
+                requests[0].transaction_deadline_ns - requests[0].transaction_id_hi,
+                super::super::protocol::MAX_TRANSACTION_LIFETIME_NS,
+                "launch transactions must carry the full application launch lease"
+            );
+            assert!(
+                requests[0].deadline_ns - requests[0].transaction_id_hi
+                    <= super::super::RPC_IO_TIMEOUT.as_nanos() as u64 + 1_000_000_000,
+                "single-attempt socket deadline must stay bounded by RPC_IO_TIMEOUT"
             );
             assert_eq!(requests[0].flags, 0);
             assert_eq!(

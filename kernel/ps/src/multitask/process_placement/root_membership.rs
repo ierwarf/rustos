@@ -110,11 +110,11 @@ impl RootJoin {
         &mut self,
         parent: Option<u64>,
         state: crate::user::process_state::UserProcessState,
-    ) -> Option<ProcessHandle> {
+    ) -> Result<ProcessHandle, crate::multitask::SpawnTaskError> {
         if !self.live || self.process.is_some() || self.key.registered {
-            return None;
+            return Err(crate::multitask::SpawnTaskError::NoFreeTaskSlot);
         }
-        let loan = self.spawn_key.as_mut()?;
+        let loan = self.spawn_key.as_mut().ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot)?;
         let process = process_table::spawn::publish_root_spawn(loan, parent, state)?;
         assert_eq!(
             process.handle(),
@@ -122,7 +122,7 @@ impl RootJoin {
             "root process changed original generation"
         );
         self.process = Some(process);
-        Some(self.handle)
+        Ok(self.handle)
     }
     pub(in crate::multitask) fn cancel(self) -> Option<process_table::SpawnReservation> {
         if self.process.is_some() || self.key.registered {

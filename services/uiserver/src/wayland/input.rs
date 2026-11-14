@@ -4,11 +4,20 @@ use super::*;
 
 impl WaylandState {
     pub(super) fn hit_test_pointer(&self, x: u32, y: u32) -> Option<PointerHit> {
+        self.hit_test_pointer_impl(x, y, false)
+    }
+
+    pub(super) fn hit_test_drag(&self, x: u32, y: u32) -> Option<PointerHit> {
+        self.hit_test_pointer_impl(x, y, true)
+    }
+
+    fn hit_test_pointer_impl(&self, x: u32, y: u32, dragging: bool) -> Option<PointerHit> {
         for surface in self.surfaces.iter().rev() {
             let Ok(surface) = surface.shared.lock() else {
                 continue;
             };
-            let grabbed = self.pointer_button_down
+            let grabbed = !dragging
+                && self.pointer_button_down
                 && self.pointer_focus.as_ref().is_some_and(|focus| {
                     surface
                         .resource
@@ -16,7 +25,8 @@ impl WaylandState {
                         .is_some_and(|resource| resource.id() == focus.surface.id())
                 });
             if (!grabbed
-                && (self.pointer_button_down || self.pointer_target != Some(surface.surface_id)))
+                && ((!dragging && self.pointer_button_down)
+                    || self.pointer_target != Some(surface.surface_id)))
                 || !surface.alive
                 || surface.minimized
                 || surface.width == 0
@@ -38,8 +48,18 @@ impl WaylandState {
             let visible_w = surface.width.min(surface.frame.width);
             let visible_h = surface.height.min(surface.frame.height);
             let client_rect = Rect {
-                x: surface.frame.x + WINDOW_BORDER,
-                y: surface.frame.y + WINDOW_TITLE_HEIGHT + WINDOW_BORDER,
+                x: surface.frame.x
+                    + if surface.decoration_server {
+                        WINDOW_BORDER
+                    } else {
+                        0
+                    },
+                y: surface.frame.y
+                    + if surface.decoration_server {
+                        WINDOW_TITLE_HEIGHT + WINDOW_BORDER
+                    } else {
+                        0
+                    },
                 width: visible_w,
                 height: visible_h,
             };
@@ -114,6 +134,16 @@ impl WaylandState {
             .map(|focus| focus.surface.id().clone());
         self.pointer_x = next_x;
         self.pointer_y = next_y;
+        if self.drag.is_some() {
+            self.drag_motion();
+            return;
+        }
+        if let Some((id, dx, dy)) = self.moving_surface {
+            let x = (i64::from(self.pointer_x) - dx).max(0) as usize;
+            let y = (i64::from(self.pointer_y) - dy).max(0) as usize;
+            self.move_surface(id, x, y);
+            return;
+        }
         let hit = self.hit_test_pointer(self.pointer_x, self.pointer_y);
         self.update_pointer_focus(hit.clone());
         let Some(focus) = self.pointer_focus.as_ref() else {
@@ -177,6 +207,16 @@ impl WaylandState {
             return;
         }
 
+        let old_client = self
+            .keyboard_focus
+            .as_ref()
+            .map(|focus| focus.client_id.clone());
+        let new_client = next.as_ref().map(|focus| focus.client_id.clone());
+        let client_changed = old_client != new_client;
+        if client_changed {
+            self.invalidate_selection_offers();
+            self.input_serials.clear();
+        }
         let leave_serial = self.next_configure_serial();
         if let Some(previous) = self.keyboard_focus.take() {
             for keyboard in self
@@ -189,7 +229,11 @@ impl WaylandState {
         }
 
         if let Some(next) = next {
+            if client_changed {
+                self.send_selection_to_client(&next.client_id);
+            }
             let enter_serial = self.next_configure_serial();
+            self.record_input_serial(enter_serial, next.client_id.clone());
             for keyboard in self
                 .keyboard_resources
                 .iter()
@@ -215,6 +259,7 @@ impl WaylandState {
         let client_id = focus.client_id.clone();
         let serial = self.next_configure_serial();
         let time = self.event_time_ms();
+        self.record_input_serial(serial, client_id.clone());
         let key_state = match event.action {
             INPUT_ACTION_PRESSED | INPUT_ACTION_REPEATED => wl_keyboard::KeyState::Pressed,
             INPUT_ACTION_RELEASED => wl_keyboard::KeyState::Released,

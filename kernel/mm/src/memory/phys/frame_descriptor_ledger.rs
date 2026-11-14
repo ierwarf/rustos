@@ -427,12 +427,12 @@ impl FrameDescriptorLedger {
         Some(current)
     }
 
-    fn claim_exclusive_data(&self, root_phys: u64, va: u64, frame_phys: u64) -> bool {
+    fn claim_exclusive_data(&self, root_phys: u64, va: u64, frame_phys: u64, reserve: bool) -> DataClaim {
         if !valid_mapping(root_phys, va, frame_phys) || self.verify_root(root_phys).is_none() {
-            return false;
+            return DataClaim::Invalid;
         }
         let Some(frame) = self.record(frame_phys) else {
-            return false;
+            return DataClaim::Invalid;
         };
         if frame
             .role
@@ -444,13 +444,17 @@ impl FrameDescriptorLedger {
             )
             .is_err()
         {
-            return false;
+            return DataClaim::Invalid;
+        }
+        if reserve && !self.try_charge_root(root_phys, 1) {
+            frame.role.store(ROLE_FREE, DESCRIPTOR_RELEASE);
+            return DataClaim::Quota;
         }
         frame
             .owner_or_table_head
             .store(root_phys, Ordering::Relaxed);
         frame.next_or_virtual_address.store(va, Ordering::Relaxed);
-        true
+        DataClaim::Claimed
     }
 
     fn publish_exclusive_data(&self, root_phys: u64, va: u64, frame_phys: u64) {
@@ -462,7 +466,6 @@ impl FrameDescriptorLedger {
         assert_eq!(frame.next_or_virtual_address.load(Ordering::Relaxed), va);
         root.data_leaf_count_or_map_head
             .fetch_add(1, DESCRIPTOR_ACQ_REL);
-        self.charge_root(root, 1);
         assert_eq!(
             frame.role.compare_exchange(
                 ROLE_EXCLUSIVE_DATA_CLAIMED,
@@ -475,7 +478,7 @@ impl FrameDescriptorLedger {
         );
     }
 
-    fn cancel_exclusive_data(&self, root_phys: u64, va: u64, frame_phys: u64) {
+    fn cancel_exclusive_data(&self, root_phys: u64, va: u64, frame_phys: u64, reserved: bool) {
         let frame = self
             .record(frame_phys)
             .expect("cancelled data leaf is outside frame descriptors");
@@ -492,6 +495,9 @@ impl FrameDescriptorLedger {
             ),
             Ok(ROLE_EXCLUSIVE_DATA_CLAIMED)
         );
+        if reserved {
+            self.uncharge_root(self.verify_root(root_phys).expect("missing data-leaf root"), 1);
+        }
     }
 
     fn prepare_shared_alias(
@@ -504,9 +510,10 @@ impl FrameDescriptorLedger {
         kind: CowFrameKind,
         backing_identity: u64,
     ) -> Option<SharedAliasTicket> {
-        if !valid_mapping(owner_root, owner_va, frame_phys)
+        let cache_owner = owner_root == 0 && owner_va == 0 && kind == CowFrameKind::PrivateFileSection;
+        if (!cache_owner && !valid_mapping(owner_root, owner_va, frame_phys))
             || !valid_mapping(new_root, new_va, frame_phys)
-            || self.verify_root(owner_root).is_none()
+            || (!cache_owner && self.verify_root(owner_root).is_none())
             || self.verify_root(new_root).is_none()
             || kind == CowFrameKind::PrivateFileSection && backing_identity == 0
             || kind == CowFrameKind::AnonymousFork && backing_identity != 0
@@ -518,7 +525,7 @@ impl FrameDescriptorLedger {
         let live_role = shared_live_role(kind);
         let locked_role = shared_locked_role(kind);
         let role = frame.role.load(DESCRIPTOR_ACQUIRE);
-        let converted_exclusive = if role == ROLE_EXCLUSIVE_DATA_LIVE
+        let converted_exclusive = if !cache_owner && role == ROLE_EXCLUSIVE_DATA_LIVE
             && frame.owner_or_table_head.load(Ordering::Relaxed) == owner_root
             && frame.next_or_virtual_address.load(Ordering::Relaxed) == owner_va
         {
@@ -584,14 +591,19 @@ impl FrameDescriptorLedger {
         frame
             .data_leaf_count_or_map_head
             .store(pack_shared(next_count, mapping_id), Ordering::Relaxed);
-        Some(SharedAliasTicket {
+        let ticket = SharedAliasTicket {
             frame_phys,
             root_phys: new_root,
             virtual_address: new_va,
             mapping_id,
             kind,
             converted_exclusive,
-        })
+        };
+        if !self.try_charge_root(new_root, 1) {
+            self.cancel_shared_alias_inner(ticket);
+            return None;
+        }
+        Some(ticket)
     }
 
     fn publish_shared_alias(&self, ticket: SharedAliasTicket) {
@@ -615,7 +627,6 @@ impl FrameDescriptorLedger {
         );
         root.data_leaf_count_or_map_head
             .fetch_add(1, DESCRIPTOR_ACQ_REL);
-        self.charge_root(root, 1);
         assert_eq!(
             frame
                 .role
@@ -625,6 +636,11 @@ impl FrameDescriptorLedger {
     }
 
     fn cancel_shared_alias(&self, ticket: SharedAliasTicket) {
+        self.uncharge_root(self.verify_root(ticket.root_phys).expect("missing alias root"), 1);
+        self.cancel_shared_alias_inner(ticket);
+    }
+
+    fn cancel_shared_alias_inner(&self, ticket: SharedAliasTicket) {
         let frame = self
             .record(ticket.frame_phys)
             .expect("cancelled shared alias frame disappeared");
@@ -723,21 +739,55 @@ impl FrameDescriptorLedger {
         true
     }
 
+    /// Cache custody is the inline shared owner `(0, 0)`, a key no real root
+    /// can have. It contributes to the shared count but not to a mapping quota.
+    /// The supplying capability separately pays for cache residency.
+    fn claim_private_file_cache(&self, frame_phys: u64, backing_identity: u64) -> bool {
+        if frame_phys == 0 || !frame_phys.is_multiple_of(PAGE_SIZE) || backing_identity == 0 {
+            return false;
+        }
+        let Some(frame) = self.record(frame_phys) else { return false; };
+        if frame.role.compare_exchange(ROLE_FREE, ROLE_SHARED_PRIVATE_FILE_LOCKED, DESCRIPTOR_ACQ_REL, DESCRIPTOR_ACQUIRE).is_err() {
+            return false;
+        }
+        frame.owner_or_table_head.store(0, Ordering::Relaxed);
+        frame.next_or_virtual_address.store(0, Ordering::Relaxed);
+        frame.data_leaf_count_or_map_head.store(pack_shared(1, 0), Ordering::Relaxed);
+        frame.shared_backing_identity.store(backing_identity, Ordering::Relaxed);
+        frame.role.store(ROLE_SHARED_PRIVATE_FILE_LIVE, DESCRIPTOR_RELEASE);
+        true
+    }
+
+    /// Remove source custody after withdrawing its capability and draining
+    /// in-flight installers. Mapped leaves retain the frame through TLB reclaim.
+    fn release_private_file_cache(&self, frame_phys: u64, backing_identity: u64) -> Option<DataLeafRelease> {
+        if backing_identity == 0 { return None; }
+        let frame = self.record(frame_phys)?;
+        if !self.lock_shared(frame, CowFrameKind::PrivateFileSection, true) { return None; }
+        if frame.shared_backing_identity.load(Ordering::Relaxed) != backing_identity
+            || frame.owner_or_table_head.load(Ordering::Relaxed) != 0
+            || frame.next_or_virtual_address.load(Ordering::Relaxed) != 0 {
+            frame.role.store(ROLE_SHARED_PRIVATE_FILE_LIVE, DESCRIPTOR_RELEASE);
+            return None;
+        }
+        Some(self.remove_shared_mapping_locked(frame, 0, 0, 0, CowFrameKind::PrivateFileSection, true))
+    }
+
     fn claim_private_file_data(
         &self,
         root_phys: u64,
         va: u64,
         frame_phys: u64,
         backing_identity: u64,
-    ) -> bool {
+    ) -> DataClaim {
         if backing_identity == 0
             || !valid_mapping(root_phys, va, frame_phys)
             || self.verify_root(root_phys).is_none()
         {
-            return false;
+            return DataClaim::Invalid;
         }
         let Some(frame) = self.record(frame_phys) else {
-            return false;
+            return DataClaim::Invalid;
         };
         if frame
             .role
@@ -749,7 +799,11 @@ impl FrameDescriptorLedger {
             )
             .is_err()
         {
-            return false;
+            return DataClaim::Invalid;
+        }
+        if !self.try_charge_root(root_phys, 1) {
+            frame.role.store(ROLE_FREE, DESCRIPTOR_RELEASE);
+            return DataClaim::Quota;
         }
         frame
             .owner_or_table_head
@@ -761,7 +815,7 @@ impl FrameDescriptorLedger {
         frame
             .shared_backing_identity
             .store(backing_identity, Ordering::Relaxed);
-        true
+        DataClaim::Claimed
     }
 
     fn publish_private_file_data(&self, root_phys: u64, va: u64, frame_phys: u64) {
@@ -776,7 +830,6 @@ impl FrameDescriptorLedger {
         assert_ne!(frame.shared_backing_identity.load(Ordering::Relaxed), 0);
         root.data_leaf_count_or_map_head
             .fetch_add(1, DESCRIPTOR_ACQ_REL);
-        self.charge_root(root, 1);
         assert_eq!(
             frame
                 .role
@@ -796,6 +849,7 @@ impl FrameDescriptorLedger {
         assert_eq!(frame.owner_or_table_head.load(Ordering::Relaxed), root_phys);
         assert_eq!(frame.next_or_virtual_address.load(Ordering::Relaxed), va);
         self.clear_shared_frame(frame);
+        self.uncharge_root(self.verify_root(root_phys).expect("missing private-file root"), 1);
     }
 
     fn data_is_owned(&self, root_phys: u64, va: u64, frame_phys: u64) -> bool {
@@ -952,7 +1006,9 @@ impl FrameDescriptorLedger {
             claim.kind,
             true,
         );
-        self.decrement_root_data_count(claim.root_phys);
+        let root = self.verify_root(claim.root_phys).expect("COW mapping root disappeared");
+        let previous = root.data_leaf_count_or_map_head.fetch_sub(1, DESCRIPTOR_ACQ_REL);
+        assert!(previous != 0, "data-leaf root count underflow");
         result
     }
 
@@ -1311,10 +1367,9 @@ impl FrameDescriptorLedger {
         word.checked_sub(1).map(|group| group as usize)
     }
 
-    fn charge_root(&self, root: &FrameDescriptorRecord, pages: u64) {
-        if let Some(group) = Self::root_group(root) {
-            charge::charge(group, pages);
-        }
+    fn try_charge_root(&self, root_phys: u64, pages: u64) -> bool {
+        self.verify_root(root_phys).and_then(Self::root_group)
+            .is_none_or(|group| charge::try_charge(group, pages))
     }
 
     fn uncharge_root(&self, root: &FrameDescriptorRecord, pages: u64) {
@@ -1332,16 +1387,17 @@ impl FrameDescriptorLedger {
         let Some(root) = self.verify_root(root_phys) else {
             return false;
         };
+        let held = root.data_leaf_count_or_map_head.load(DESCRIPTOR_ACQUIRE);
+        if !charge::try_charge(group, held) {
+            return false;
+        }
         if root
             .next_or_virtual_address
             .compare_exchange(0, group as u64 + 1, DESCRIPTOR_ACQ_REL, DESCRIPTOR_ACQUIRE)
             .is_err()
         {
+            charge::uncharge(group, held);
             return false;
-        }
-        let held = root.data_leaf_count_or_map_head.load(DESCRIPTOR_ACQUIRE);
-        if held != 0 {
-            charge::charge(group, held);
         }
         // The root frame and every table already published are existing state:
         // catch the group up without a limit check, as for data leaves.
@@ -1372,6 +1428,14 @@ impl FrameDescriptorLedger {
         assert!(previous != 0, "data-leaf root count underflow");
         self.uncharge_root(root, 1);
     }
+}
+
+/// Outcome of reserving a data-frame descriptor and its resident quota.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DataClaim {
+    Claimed,
+    Invalid,
+    Quota,
 }
 
 /// Outcome of claiming a frame as a lazily published page table.

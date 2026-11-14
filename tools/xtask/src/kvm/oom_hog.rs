@@ -352,3 +352,134 @@ mod oom_hog_tests {
         assert!(validate_oom_hog_watchdog_log(&log(&[START, W_KILL, W_BACK, survived])).is_err());
     }
 }
+
+/// Frame count named by the single success line of `apps/libmapprobe`, after
+/// refusing any failure record and requiring each intermediate proof line.
+fn validate_library_map_probe_log(log: &str, reclaim: bool) -> Result<u64> {
+    if log.contains(LIBRARY_MAP_PROBE_FAIL_MARKER) {
+        bail!("libmapprobe reported a failure; see the library-map-probe: FAIL line");
+    }
+    if reclaim {
+        if !log.contains(PAGERD_LIBRARY_RECLAIMED_MARKER) {
+            bail!("pagerd never logged `{PAGERD_LIBRARY_RECLAIMED_MARKER}`");
+        }
+        let survived: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains(LIBRARY_RECLAIM_SURVIVED_MARKER))
+            .collect();
+        let [line] = survived.as_slice() else {
+            bail!("expected exactly one reclaim-survived line, found {}", survived.len());
+        };
+        let fields = numbers_after(line, "checks=").unwrap_or_default();
+        let pages = numbers_after(line, "pages=")
+            .and_then(|f| f.first().copied())
+            .filter(|pages| (6..=64).contains(pages))
+            .ok_or_else(|| anyhow::anyhow!("reclaim-survived line has no plausible page count: {line}"))?;
+        if fields.first().copied().unwrap_or(0) < 2 {
+            bail!("reclaim-survived needs at least two verifications: {line}");
+        }
+        let (before, after) = (
+            numbers_after(line, "sealed=").and_then(|f| f.first().copied()),
+            numbers_after(line, "->").and_then(|f| f.first().copied()),
+        );
+        if !matches!((before, after), (Some(b), Some(a)) if a < b) {
+            bail!("reclaim-survived does not show a smaller registry: {line}");
+        }
+        return Ok(pages);
+    }
+    for required in [
+        "library-map-probe: mapped pages=",
+        "library-map-probe: cow-isolated parent-write",
+        "library-map-probe: eof-zero tail=",
+        "library-map-probe: fork-semantics split-grandchild ok post-write-fork ok",
+    ] {
+        if !log.contains(required) {
+            bail!("libmapprobe never logged `{required}`");
+        }
+    }
+    let done: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("library-map-probe: shared frames=") && line.contains(LIBRARY_MAP_PROBE_DONE_MARKER))
+        .collect();
+    let [line] = done.as_slice() else {
+        bail!("expected exactly one libmapprobe completion line, found {}", done.len());
+    };
+    let pages = numbers_after(line, "library-map-probe: shared frames=")
+        .and_then(|fields| fields.first().copied())
+        .filter(|pages| (6..=64).contains(pages))
+        .ok_or_else(|| anyhow::anyhow!("libmapprobe completion line has no plausible frame count: {line}"))?;
+    Ok(pages)
+}
+
+#[cfg(test)]
+mod library_probe_tests {
+    use super::*;
+
+    const REQUIRED: [&str; 4] = [
+        "library-map-probe: mapped pages=45 alias_maps=1 leaves+45 free-0",
+        "library-map-probe: cow-isolated parent-write child-frame-unchanged",
+        "library-map-probe: eof-zero tail=1296",
+        "library-map-probe: fork-semantics split-grandchild ok post-write-fork ok",
+    ];
+    const DONE: &str = "library-map-probe: shared frames=45 cow-isolated eof-zero exit-clean leaves=863 free-drift=5";
+
+    fn log(lines: &[&str]) -> String {
+        lines.iter().map(|l| format!("user-debug payload={l}\\n\n")).collect()
+    }
+
+    #[test]
+    fn mapping_proof_needs_every_stage_and_one_completion() {
+        let mut all: Vec<&str> = REQUIRED.to_vec();
+        all.push(DONE);
+        assert_eq!(validate_library_map_probe_log(&log(&all), false).unwrap(), 45);
+        for skip in 0..REQUIRED.len() {
+            let mut partial: Vec<&str> = REQUIRED.to_vec();
+            partial.remove(skip);
+            partial.push(DONE);
+            assert!(validate_library_map_probe_log(&log(&partial), false).is_err());
+        }
+        all.push(DONE);
+        assert!(validate_library_map_probe_log(&log(&all), false).is_err());
+        let failed = log(&["library-map-probe: FAIL fork 0 0 errno=1", DONE]);
+        assert!(validate_library_map_probe_log(&failed, false).is_err());
+    }
+
+    #[test]
+    fn reclaim_proof_needs_pagerd_retire_and_a_surviving_mapping() {
+        let pagerd = "pagerd: library cache reclaimed objects=2 pages=300 free=900 kept=4";
+        let ok = "library-map-probe: reclaim-survived sealed=6->4 checks=5 pages=45";
+        assert_eq!(validate_library_map_probe_log(&log(&[pagerd, ok]), true).unwrap(), 45);
+        assert!(validate_library_map_probe_log(&log(&[ok]), true).is_err());
+        assert!(validate_library_map_probe_log(&log(&[pagerd]), true).is_err());
+        let same = "library-map-probe: reclaim-survived sealed=6->6 checks=5 pages=45";
+        assert!(validate_library_map_probe_log(&log(&[pagerd, same]), true).is_err());
+        let once = "library-map-probe: reclaim-survived sealed=6->4 checks=1 pages=45";
+        assert!(validate_library_map_probe_log(&log(&[pagerd, once]), true).is_err());
+        let broken = "library-map-probe: FAIL mapping bytes changed under reclaim 3 0 errno=0";
+        assert!(validate_library_map_probe_log(&log(&[pagerd, ok, broken]), true).is_err());
+    }
+
+    #[test]
+    fn probe_failure_is_extracted_for_fail_fast() {
+        assert_eq!(library_map_probe_failure(&log(&[DONE])), None);
+        let text = log(&["x", "library-map-probe: FAIL child frames 0 0 errno=3"]);
+        assert_eq!(
+            library_map_probe_failure(&text).as_deref(),
+            Some("library-map-probe: FAIL child frames 0 0 errno=3")
+        );
+    }
+
+    #[test]
+    fn reclaim_probe_flag_requires_plain_oom_hog_and_swaps_markers() {
+        let parse = |args: &[&str]| {
+            parse_smoke_options(args.iter().map(|a| a.to_string()))
+        };
+        assert!(parse(&["--library-reclaim-probe"]).is_err());
+        assert!(parse(&["--library-reclaim-probe", "--oom-hog-watchdog"]).is_err());
+        let ok = parse(&["--library-reclaim-probe", "--oom-hog"]).unwrap();
+        assert!(ok.expected_markers.iter().any(|m| m == LIBRARY_RECLAIM_SURVIVED_MARKER));
+        assert!(ok.expected_markers.iter().any(|m| m == PAGERD_LIBRARY_RECLAIMED_MARKER));
+        assert!(!ok.expected_markers.iter().any(|m| m == LIBRARY_MAP_PROBE_DONE_MARKER));
+        assert_eq!(library_probe_contract(true), b"contract=rustos-libmapprobe-v1\nmode=reclaim\n");
+    }
+}

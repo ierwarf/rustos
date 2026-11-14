@@ -20,6 +20,8 @@ fn window(outer: Rect, alpha: u32) -> WaylandWindowSnapshot {
         title: "fragments".into(),
         frame: rect(outer.x, outer.y, width, height),
         minimized: false,
+        server_decoration: true,
+        drag_icon: false,
         content_version: 1,
         damage: Rect::empty(),
         pixels: Arc::new(vec![(alpha << 24) | 0x123456; width * height]),
@@ -450,7 +452,9 @@ fn over(source: u32, destination: u32) -> u32 {
 
 #[test]
 fn only_capacity_failures_degrade_to_the_cropped_scene() {
-    assert!(crate::render::degrades_to_cropped_scene(GpuSceneError::AtlasFull));
+    assert!(crate::render::degrades_to_cropped_scene(
+        GpuSceneError::AtlasFull
+    ));
     assert!(crate::render::degrades_to_cropped_scene(
         GpuSceneError::CommandLimit
     ));

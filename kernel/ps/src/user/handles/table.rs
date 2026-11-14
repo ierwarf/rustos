@@ -521,6 +521,55 @@ impl HandleTable {
         }
     }
 
+    /// Aperture bytes of the distinct app DMA-BUF allocations this table holds
+    /// (duplicates of one allocation count once; revoked capabilities still
+    /// count because their range stays unreusable until the descriptor closes).
+    pub fn device_buffer_held_bytes(&self) -> u64 {
+        let all = || self.standard.iter().chain(self.entries.iter()).flatten();
+        let mut total = 0_u64;
+        for (index, entry) in all().enumerate() {
+            let KernelHandle::DeviceBuffer(capability) = entry.handle() else { continue };
+            let repeated = all().take(index).any(|earlier| {
+                matches!(earlier.handle(), KernelHandle::DeviceBuffer(other)
+                    if other.identity() == capability.identity())
+            });
+            if !repeated {
+                total = total.saturating_add(capability.len());
+            }
+        }
+        total
+    }
+
+    /// Prepare capacity before taking a service-publication lock. The reserved
+    /// descriptor remains invisible until `commit_reserved_device_buffer`.
+    pub fn prepare_reserved_device_buffer(&mut self, reservation_id: u64, fd: u64) -> bool {
+        if self.reserved.get(&fd) != Some(&reservation_id) || self.get_entry(fd).is_some() {
+            return false;
+        }
+        dynamic_index(fd).is_none_or(|index| self.ensure_entry_capacity(index).is_some())
+    }
+
+    /// Publish only a previously prepared reservation; this performs no
+    /// allocation and must run under the exact live provider service lease.
+    pub fn commit_reserved_device_buffer(&mut self, reservation_id: u64, fd: u64,
+                                         capability: BufferCapability) -> bool {
+        if self.reserved.get(&fd) != Some(&reservation_id) || self.get_entry(fd).is_some() {
+            return false;
+        }
+        let entry = HandleEntry::new(KernelHandle::DeviceBuffer(capability), FD_CLOEXEC,
+                                     linux_abi::O_RDWR);
+        if let Some(index) = standard_index(fd) {
+            self.reserved.remove(&fd);
+            self.standard[index] = Some(entry);
+        } else if let Some(index) = dynamic_index(fd).filter(|index| *index < self.entries.len()) {
+            self.reserved.remove(&fd);
+            self.entries[index] = Some(entry);
+        } else {
+            return false;
+        }
+        true
+    }
+
     /// Publishes one newly minted Job descriptor after its result copyout.
     /// The exact reservation, not an fd guess, owns the invisible slot. No
     /// provider reference is acquired: a Job token does not pin a live job.

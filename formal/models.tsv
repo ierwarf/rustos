@@ -87,6 +87,7 @@ netd-deferred-reply/NetdDeferredReply	temporal	intentional-terminal	deferred req
 network-payload-session/NetworkPayloadSession	safety	intentional-terminal	payload decision is terminal	120	900	exhaustive	no	no	no
 page-cache-lifecycle/PageCacheLifecycle	safety	check	explicit terminal stutter preserves bounded load COW writeback and reclaim progress	30	120	exhaustive	no	no	no
 pager-frame-grant-lifecycle/PagerFrameGrantLifecycle	safety	check	explicit terminal stutter preserves generation-bound one-shot frame custody	30	120	exhaustive	no	no	no
+frame-source-lifecycle/FrameSourceLifecycle	safety	check	explicit stutter preserves bounded source lease pin cold retirement and independent mapped-frame custody	30	120	exhaustive	no	no	no
 pager-fault-slot-lifecycle/PagerFaultSlotLifecycle	safety	check	explicit terminal stutter preserves fixed allocation-free fault custody and one-shot reply authority	30	120	exhaustive	no	no	no
 pager-region-agreement/PagerRegionAgreement	safety	check	explicit refusal and retry states stutter while both replicas keep every faultable address backed	30	120	exhaustive	no	no	no
 pager-vma-publication/PagerVmaPublication	safety	check	explicit stable and exhausted terminals preserve bounded all-atomic publication checking	30	120	exhaustive	no	no	no
@@ -156,3 +157,5 @@ child-wait-publication/ChildWaitPublication	safety	check	explicit stutter covers
 scheduler-owner-word/SchedulerOwnerWord	safety	check	explicit stutter step is always enabled after the bounded generation range	30	120	exhaustive	no	no	no
 scheduler-resident-cell/SchedulerResidentCell	safety	check	explicit stutter step is always enabled after the bounded generation range	30	120	exhaustive	no	no	no
 scheduler-terminal-producer/SchedulerTerminalProducer	safety	check	explicit stutter step is always enabled	30	120	exhaustive	no	no	no
+mm-request-lease/MmRequestLease	safety	check	explicit stutter preserves bounded one-slot lease with two processes two incarnations and two appliers	30	120	exhaustive	no	no	no
+app-buffer-custody/AppBufferCustody	safety	check	explicit stutter preserves bounded one-range export custody with two provider epochs and process incarnations	30	120	exhaustive	no	no	no

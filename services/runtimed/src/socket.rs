@@ -662,20 +662,27 @@ fn service_mutation(client: &mut PendingRuntimeClient, state: &mut BrokerState, 
             if left == 0 {
                 return Err(libc::ETIMEDOUT);
             }
-            let deadline = client.deadline.min(anchor + Duration::from_nanos(left));
-            if Instant::now() >= deadline {
+            let transaction_deadline = anchor + Duration::from_nanos(left);
+            if Instant::now() >= client.deadline || Instant::now() >= transaction_deadline {
                 return Err(libc::ETIMEDOUT);
             }
             if request.op == OP_REQUEST_LAUNCH_PATH {
                 let remaining_ns = u64::try_from(
-                    deadline
+                    transaction_deadline
                         .saturating_duration_since(Instant::now())
                         .as_nanos(),
                 )
                 .map_err(|_| libc::EOVERFLOW)?;
                 let effective_ns = now.checked_add(remaining_ns).ok_or(libc::EOVERFLOW)?;
-                begin_rpc_launch(state, request, key, deadline, effective_ns)
+                begin_rpc_launch(
+                    state,
+                    request,
+                    key,
+                    transaction_deadline,
+                    effective_ns.min(request.transaction_deadline_ns),
+                )
             } else {
+                let deadline = client.deadline.min(transaction_deadline);
                 terminate_request(state, request, deadline)
             }
         });
@@ -744,9 +751,7 @@ fn begin_rpc_launch(
         },
         key,
         deadline,
-        deadline_ns
-            .min(request.deadline_ns)
-            .min(request.transaction_deadline_ns),
+        deadline_ns.min(request.transaction_deadline_ns),
     )
 }
 
@@ -1125,6 +1130,83 @@ mod tests {
             crate::runtime_transactions::Outcome::Finished(Err(libc::EINVAL))
         );
         assert!(!fresh);
+    }
+
+    #[test]
+    fn rpc_launch_preserves_transaction_deadline_past_short_socket_attempt_timeout() {
+        static OBSERVED_DEADLINE_NS: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        OBSERVED_DEADLINE_NS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut state = BrokerState {
+            launch_worker: crate::launch_worker::start(crate::launch_worker::LaunchCalls {
+                spawn: |_, _, deadline_ns| {
+                    OBSERVED_DEADLINE_NS.store(
+                        deadline_ns.unwrap_or(0),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    Err(libc::ENOENT)
+                },
+                report_lease: |_, _, _| Ok(()),
+                bind_and_activate: |_, _, _| Ok(()),
+                await_endpoint: |_, _| Ok(()),
+                retire: |_, _| {},
+            }),
+            ..BrokerState::default()
+        };
+        state.programs.insert(
+            String::from("chrome.desktop"),
+            crate::ProgramMetadata {
+                package_id: String::from("chrome"),
+                desktop_file_id: String::from("chrome.desktop"),
+                display_name: String::from("Google Chrome"),
+                exec: String::from("/apps/chrome/chrome"),
+                startup: runtime_control::StartupMode::None,
+                weight_micros: DEFAULT_USER_TASK_WEIGHT_MICROS,
+                logical_admin: false,
+                console_hosted: false,
+                args: vec![String::from("/apps/chrome/chrome")],
+                env: Vec::new(),
+                runtime_deps: Vec::new(),
+            },
+        );
+        let now = runtime_control::monotonic_nanos().unwrap();
+        let mut request = RuntimeRequest {
+            version: PROTOCOL_VERSION,
+            op: OP_REQUEST_LAUNCH_PATH,
+            target_kind: crate::LAUNCH_TARGET_NEW_SESSION,
+            transaction_id_hi: now,
+            transaction_id_lo: 1,
+            transaction_deadline_ns: now + super::MAX_TRANSACTION_LIFETIME_NS,
+            deadline_ns: now + 5_000_000_000,
+            ..RuntimeRequest::default()
+        };
+        let target = b"chrome.desktop";
+        request.text_len = target.len() as u32;
+        request.text[..target.len()].copy_from_slice(target);
+        let (peer, server) = UnixStream::pair().unwrap();
+        let mut client = PendingRuntimeClient {
+            stream: server,
+            peer: RuntimePeerCredentials { pid: 42 },
+            request,
+            bytes_read: 0,
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        super::service_mutation(&mut client, &mut state, now);
+        drop(client);
+        let mut reply = peer;
+        assert_eq!(read_ack(&mut reply).status, -libc::EINPROGRESS);
+
+        let wait_until = Instant::now() + Duration::from_secs(2);
+        while OBSERVED_DEADLINE_NS.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            assert!(Instant::now() < wait_until, "worker must run");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let observed = OBSERVED_DEADLINE_NS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            observed >= now + 120_000_000_000,
+            "background launch job must inherit the transaction budget rather than the 5s socket attempt deadline (observed delta={}ns)",
+            observed.saturating_sub(now),
+        );
     }
 
     #[test]

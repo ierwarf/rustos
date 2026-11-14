@@ -715,11 +715,39 @@ pub fn with_current_user_process_state<R>(
     process.with_visible_state(|_, process_state| f(thread_id, abi, process_state))
 }
 
+/// Exit-path access that survives `mark_user_process_exiting`; see
+/// `process_table::with_process_state_for_teardown_mut`.
+pub fn with_process_state_for_teardown_mut<R>(
+    process_id: u64,
+    f: impl FnOnce(&mut UserProcessState) -> R,
+) -> Option<R> {
+    process_table::with_process_state_for_teardown_mut(process_id, f)
+}
+
 pub fn with_process_state_by_pid_mut<R>(
     process_id: u64,
     f: impl FnOnce(&mut UserProcessState) -> R,
 ) -> Option<R> {
     process_table::with_process_state_by_pid_mut(process_id, f)
+}
+
+/// Commit asynchronous broker work only into the exact process/MM generations
+/// captured at admission. Scalar claims alone confer no authority: the retained
+/// process and state lock revalidate the live identity across exec/exit.
+pub fn with_process_state_by_generation_mut<R>(
+    process_id: u64,
+    expected_process_generation: u32,
+    expected_mm_generation: u32,
+    f: impl FnOnce(&mut UserProcessState) -> R,
+) -> Option<R> {
+    let process = process_table::retain_process_by_pid(process_id)?;
+    let identity = process.live_identity()?;
+    if identity.process_generation() != expected_process_generation
+        || identity.mm_generation() != expected_mm_generation
+    {
+        return None;
+    }
+    process.with_exact_visible_state_mut(identity, |_, state| f(state))
 }
 
 /// Serializes a Linux fork snapshot against both process-state page-table

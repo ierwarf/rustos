@@ -1274,7 +1274,7 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         ));
     }
     if let Err(refusal) = &exec_outcome {
-        // Names the refusing stage; every refusal still surfaces as ESRCH.
+        // Names the refusing stage without collapsing quota into a missing target.
         nucleus_core::debug::record_milestone(
             nucleus_core::debug::LogCategory::Compat,
             "proc-exec-refused",
@@ -1309,7 +1309,14 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         args.target_pid
     } else {
         EXEC_TRANSITIONS.lock().remove(&args.target_tid);
-        linux_errno(LINUX_ESRCH)
+        linux_errno(exec_refusal_errno(exec_outcome.unwrap_err()))
+    }
+}
+
+fn exec_refusal_errno(refusal: multitask::ExecRefusal) -> i64 {
+    match refusal {
+        multitask::ExecRefusal::MappingQuota => LINUX_ENOMEM,
+        _ => LINUX_ESRCH,
     }
 }
 
@@ -1583,6 +1590,8 @@ fn address_space_from_mappings(
 ) -> Result<crate::memory::paging::ProcessAddressSpace, i64> {
     let mut address_space = crate::memory::paging::ProcessAddressSpace::new()
         .map_err(address_space_error_to_linux_errno)?;
+    let mut shared_bytes = 0u64;
+    let mut copied_bytes = 0u64;
     for (index, mapping) in mappings.iter().enumerate() {
         match mapping.as_ref() {
             MappingEntry::Zeroed {
@@ -1642,7 +1651,29 @@ fn address_space_from_mappings(
                 mem_len,
                 flags,
             } => {
-                map_zeroed(&mut address_space, *target_addr, *mem_len, *flags).inspect_err(
+                // loaderd supplied ranges, not format policy. Share only full
+                // immutable pages; partial file pages and zero-fill remain
+                // private so no byte beyond the admitted range is exposed.
+                let shared = if executable_snapshot_is_immutable(backing) {
+                    immutable_file_prefix(*file_offset, *file_len, *flags, backing.len() as u64)?
+                } else { 0 };
+                if shared != 0 {
+                    let (frames, hold) = backing.acquire_mapping(
+                        usize::try_from(*file_offset).map_err(|_| LINUX_EOVERFLOW)?,
+                        usize::try_from(shared).map_err(|_| LINUX_EOVERFLOW)?, false,
+                    ).map_err(|err| match err {
+                        crate::user::memfd::MemfdError::NoMemory => LINUX_ENOMEM,
+                        _ => LINUX_EINVAL,
+                    })?;
+                    let backing = crate::memory::paging::ImmutableBacking::new(
+                        hold.object_id(), hold.resident_pages(), alloc::sync::Arc::new(hold),
+                    );
+                    address_space.map_immutable_user_pages_at(
+                        VirtAddr::new(*target_addr), &frames, page_flags(*flags)?, backing,
+                    ).map_err(address_space_error_to_linux_errno)?;
+                }
+                if *mem_len > shared {
+                    map_zeroed(&mut address_space, *target_addr + shared, *mem_len - shared, *flags).inspect_err(
                     |errno| {
                         nucleus_core::debug::write_debugcon_only_line(
                             alloc::format!(
@@ -1652,12 +1683,15 @@ fn address_space_from_mappings(
                         );
                     },
                 )?;
+                }
+                shared_bytes += shared;
+                copied_bytes += *file_len - shared;
                 copy_file_into_address_space(
                     &mut address_space,
                     backing,
-                    *target_addr,
-                    *file_offset,
-                    *file_len,
+                    *target_addr + shared,
+                    *file_offset + shared,
+                    *file_len - shared,
                 )
                 .inspect_err(|errno| {
                     nucleus_core::debug::write_debugcon_only_line(
@@ -1670,7 +1704,21 @@ fn address_space_from_mappings(
             }
         }
     }
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Memory,
+        "proc-image-bytes", shared_bytes, copied_bytes,
+    );
     Ok(address_space)
+}
+
+fn immutable_file_prefix(file_offset: u64, file_len: u64, flags: u64, backing_len: u64) -> Result<u64, i64> {
+    if file_offset.checked_add(file_len).is_none_or(|end| end > backing_len) {
+        return Err(LINUX_EIO);
+    }
+    if flags & PROC_BROKER_MAP_WRITE != 0 || !file_offset.is_multiple_of(PAGE_SIZE) {
+        return Ok(0);
+    }
+    Ok(file_len / PAGE_SIZE * PAGE_SIZE)
 }
 
 fn copy_file_into_address_space(
@@ -1681,7 +1729,11 @@ fn copy_file_into_address_space(
     file_len: u64,
 ) -> Result<(), i64> {
     let total = usize::try_from(file_len).map_err(|_| LINUX_EOVERFLOW)?;
-    let mut chunk = alloc::vec![0_u8; FILE_COPY_CHUNK.min(total.max(1))];
+    if total == 0 { return Ok(()); }
+    let mut chunk = Vec::new();
+    let chunk_len = FILE_COPY_CHUNK.min(total);
+    chunk.try_reserve_exact(chunk_len).map_err(|_| LINUX_ENOMEM)?;
+    chunk.resize(chunk_len, 0);
     let mut copied = 0usize;
     while copied < total {
         let count = (total - copied).min(chunk.len());
@@ -1949,6 +2001,7 @@ fn process_load_error_to_linux_errno(error: crate::user::process::ProcessLoadErr
         crate::user::process::ProcessLoadError::Spawn(err) => match err {
             multitask::SpawnTaskError::InvalidWeightMicros => LINUX_EINVAL,
             multitask::SpawnTaskError::NoFreeTaskSlot => LINUX_EAGAIN,
+            multitask::SpawnTaskError::MemoryQuota => LINUX_ENOMEM,
         },
         crate::user::process::ProcessLoadError::InterpreterLoad { .. } => LINUX_ENOEXEC,
         crate::user::process::ProcessLoadError::InvalidElf(_)
@@ -1961,6 +2014,7 @@ fn process_spawn_error_to_linux_errno(error: multitask::SpawnTaskError) -> i64 {
     match error {
         multitask::SpawnTaskError::InvalidWeightMicros => LINUX_EINVAL,
         multitask::SpawnTaskError::NoFreeTaskSlot => LINUX_EAGAIN,
+        multitask::SpawnTaskError::MemoryQuota => LINUX_ENOMEM,
     }
 }
 

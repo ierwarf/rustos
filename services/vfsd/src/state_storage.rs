@@ -347,8 +347,10 @@ impl VfsStorage {
         }
     }
 
-    fn read_mapped_file(&mut self, path: &str, len: u64, offset: u64, output: &mut [u8]) -> Result<usize, i32> {
-        use storage_core::file_io::ReadAt;
+    /// Plans and caches the on-volume read map of `path` (bounded; evicts the
+    /// whole set when full). The map is the storage layer's identity of the
+    /// file: its volume/object/generation never alias a different file.
+    fn ensure_read_map(&mut self, path: &str, len: u64) -> Result<String, i32> {
         let key = fat_cache_key(path);
         if !self.read_maps.contains_key(&key) {
             let map = self.volume()?.plan_read(path, vfsd::snapshot_budget::SNAPSHOT_MAP_BYTES)
@@ -362,6 +364,47 @@ impl VfsStorage {
             self.read_map_bytes += cost;
             self.read_maps.insert(key.clone(), map);
         }
+        Ok(key)
+    }
+
+    /// Attests the backing file of an open description for the shared library
+    /// cache. Two providers qualify, both because vfsd implements no mutation
+    /// of them: a regular file on the DVM-mounted volume, whose identity is the
+    /// storage layer's read map and names the mount generation and storage
+    /// epoch (a remount or provider restart ends its validity); and a file of
+    /// the authenticated early-system image, read-only for the whole boot, whose
+    /// identity is a reserved volume id plus a collision-resistant digest of its
+    /// image path. Volatile directories and devices are refused rather than
+    /// reported as eligible.
+    fn file_identity(&mut self, path: &str, len: u64) -> Result<VfsFileIdentityWire, i32> {
+        self.invalidate_caches_if_remounted();
+        if let Some(image_len) = early_system::file_len(path)? {
+            // The handle's length must be the image entry's; the image has no
+            // other writer, so a mismatch means the description is not it.
+            if image_len != len {
+                return Err(EIO);
+            }
+            return Ok(vfsd::early_system_identity(path, len));
+        }
+        let key = self.ensure_read_map(path, len)?;
+        let identity = self.read_maps.get(&key).ok_or(EIO)?.identity();
+        if self.dvm_storage_epoch == 0 {
+            return Err(EIO);
+        }
+        Ok(VfsFileIdentityWire {
+            volume: identity.volume,
+            object: identity.object,
+            generation: identity.generation,
+            storage_epoch: self.dvm_storage_epoch,
+            mount_generation: self.mount_generation,
+            len,
+            flags: VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME,
+        })
+    }
+
+    fn read_mapped_file(&mut self, path: &str, len: u64, offset: u64, output: &mut [u8]) -> Result<usize, i32> {
+        use storage_core::file_io::ReadAt;
+        let key = self.ensure_read_map(path, len)?;
         let map = self.read_maps.get(&key).ok_or(EIO)?;
         if map.len() != len { return Err(EIO); }
         let mut scratch = [0; 4096];

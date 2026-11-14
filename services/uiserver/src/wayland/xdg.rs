@@ -100,7 +100,7 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceData> for WaylandState {
                 state.mark_dirty();
             }
             xdg_surface::Request::AckConfigure { serial } => {
-                let ack_result = {
+                let ack_result: Result<(), String> = {
                     if let Ok(mut surface) = data.shared.lock() {
                         match surface
                             .outstanding_configures
@@ -109,11 +109,19 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceData> for WaylandState {
                         {
                             Some(index) if serial != 0 => {
                                 surface.acknowledged_serial = serial;
+                                if let Some(pos) = surface
+                                    .decoration_configures
+                                    .iter()
+                                    .position(|(sent, _)| *sent == serial)
+                                {
+                                    surface.decoration_ack_server =
+                                        surface.decoration_configures[pos].1;
+                                    surface.decoration_configures.drain(..=pos);
+                                }
                                 // Older configures are superseded by this ack.
                                 surface.outstanding_configures.drain(..=index);
                                 Ok(())
                             }
-                            _ if serial != 0 && serial == surface.acknowledged_serial => Ok(()),
                             _ => Err("xdg_surface.ack_configure: unknown configure serial".into()),
                         }
                     } else {
@@ -121,7 +129,7 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceData> for WaylandState {
                     }
                 };
                 if let Err(message) = ack_result {
-                    post_protocol_error(resource, message);
+                    resource.post_error(xdg_surface::Error::InvalidSerial, message);
                 }
             }
             xdg_surface::Request::Destroy => {
@@ -141,7 +149,7 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceData> for WaylandState {
 impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceData> for WaylandState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         _resource: &xdg_toplevel::XdgToplevel,
         request: xdg_toplevel::Request,
         data: &SurfaceData,
@@ -149,6 +157,29 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceData> for WaylandState {
         _data_init: &mut DataInit<'_, Self>,
     ) {
         match request {
+            xdg_toplevel::Request::Move { serial, .. } => {
+                let valid = state.pointer_button_down
+                    && state.pointer_grab_serial == Some(serial)
+                    && state.pointer_focus.as_ref().is_some_and(|focus| {
+                        focus.client_id == client.id()
+                            && data.shared.lock().is_ok_and(|surface| {
+                                surface
+                                    .resource
+                                    .as_ref()
+                                    .is_some_and(|resource| resource.id() == focus.surface.id())
+                            })
+                    });
+                if valid && state.drag.is_none() {
+                    if let Ok(surface) = data.shared.lock() {
+                        state.moving_surface = Some((
+                            surface.surface_id,
+                            i64::from(state.pointer_x) - surface.frame.x as i64,
+                            i64::from(state.pointer_y) - surface.frame.y as i64,
+                        ));
+                    }
+                    state.update_pointer_focus(None);
+                }
+            }
             xdg_toplevel::Request::SetTitle { title } => {
                 let mut title = title;
                 if title.len() > MAX_WAYLAND_TITLE_BYTES {
@@ -170,6 +201,18 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceData> for WaylandState {
                 state.send_toplevel_configure(&data.shared);
             }
             xdg_toplevel::Request::Destroy => {
+                if let Some(decoration) = data
+                    .shared
+                    .lock()
+                    .ok()
+                    .and_then(|surface| surface.decoration.clone())
+                {
+                    decoration.post_error(
+                        zxdg_toplevel_decoration_v1::Error::Orphaned,
+                        "decoration must be destroyed before toplevel".to_string(),
+                    );
+                    return;
+                }
                 if let Ok(mut surface) = data.shared.lock() {
                     surface.toplevel = None;
                 }
@@ -197,7 +240,7 @@ impl GlobalDispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for
 
 impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for WaylandState {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         client: &Client,
         resource: &zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
         request: zxdg_decoration_manager_v1::Request,
@@ -215,16 +258,13 @@ impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for Wayla
                 );
                 return;
             }
-            let Some(ticket) = client
-                .get_data::<WaylandClientState>()
-                .and_then(|counts| {
-                    LiveObjectTicket::admit(
-                        &counts.decorations,
-                        MAX_WAYLAND_DECORATIONS_PER_CLIENT,
-                        None,
-                    )
-                })
-            else {
+            let Some(ticket) = client.get_data::<WaylandClientState>().and_then(|counts| {
+                LiveObjectTicket::admit(
+                    &counts.decorations,
+                    MAX_WAYLAND_DECORATIONS_PER_CLIENT,
+                    None,
+                )
+            }) else {
                 post_protocol_error(
                     resource,
                     format!(
@@ -234,8 +274,37 @@ impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for Wayla
                 );
                 return;
             };
-            let decoration = data_init.init(id, DecorationData { _ticket: ticket });
-            decoration.configure(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+            let surface_data = toplevel.data::<SurfaceData>().unwrap().clone();
+            let decoration = data_init.init(
+                id,
+                DecorationData {
+                    surface: surface_data.clone(),
+                    _ticket: ticket,
+                },
+            );
+            let Ok(mut surface) = surface_data.shared.lock() else {
+                return;
+            };
+            if surface.decoration.is_some() {
+                decoration.post_error(
+                    zxdg_toplevel_decoration_v1::Error::AlreadyConstructed,
+                    "toplevel already has a decoration".to_string(),
+                );
+                return;
+            }
+            if surface.current_buffer.is_some()
+                || surface.commit.is_busy()
+                || matches!(surface.pending_buffer, Some(Some(_)))
+            {
+                decoration.post_error(
+                    zxdg_toplevel_decoration_v1::Error::UnconfiguredBuffer,
+                    "decoration created after buffer attachment".to_string(),
+                );
+                return;
+            }
+            surface.decoration = Some(decoration);
+            drop(surface);
+            state.send_toplevel_configure(&surface_data.shared);
         }
     }
 }
@@ -244,22 +313,69 @@ impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, DecorationD
     for WaylandState
 {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         _client: &Client,
         resource: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
         request: zxdg_toplevel_decoration_v1::Request,
-        _data: &DecorationData,
+        data: &DecorationData,
         _handle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        match request {
-            zxdg_toplevel_decoration_v1::Request::SetMode { .. }
-            | zxdg_toplevel_decoration_v1::Request::UnsetMode => {
-                resource.configure(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+        let preference = match request {
+            zxdg_toplevel_decoration_v1::Request::SetMode {
+                mode: WEnum::Value(zxdg_toplevel_decoration_v1::Mode::ClientSide),
+            } => Some(false),
+            zxdg_toplevel_decoration_v1::Request::SetMode {
+                mode: WEnum::Value(zxdg_toplevel_decoration_v1::Mode::ServerSide),
+            } => Some(true),
+            zxdg_toplevel_decoration_v1::Request::SetMode { .. } => {
+                resource.post_error(
+                    zxdg_toplevel_decoration_v1::Error::InvalidMode,
+                    "invalid decoration mode".to_string(),
+                );
+                return;
             }
-            zxdg_toplevel_decoration_v1::Request::Destroy => {}
-            _ => {}
+            zxdg_toplevel_decoration_v1::Request::UnsetMode => Some(true),
+            zxdg_toplevel_decoration_v1::Request::Destroy => {
+                if let Ok(mut surface) = data.surface.shared.lock() {
+                    if surface
+                        .decoration
+                        .as_ref()
+                        .is_some_and(|bound| bound.id() == resource.id())
+                    {
+                        surface.decoration = None;
+                        surface.decoration_ack_server = false;
+                        surface.decoration_configures.clear();
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(server) = preference {
+            if let Ok(mut surface) = data.surface.shared.lock() {
+                surface.decoration_requested_server = server;
+            }
+            state.send_toplevel_configure(&data.surface.shared);
+        }
+    }
+
+    fn destroyed(
+        _state: &mut Self,
+        _client: ClientId,
+        resource: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+        data: &DecorationData,
+    ) {
+        if let Ok(mut surface) = data.surface.shared.lock() {
+            if surface
+                .decoration
+                .as_ref()
+                .is_some_and(|bound| bound.id() == resource.id())
+            {
+                surface.decoration = None;
+                surface.decoration_ack_server = false;
+                surface.decoration_configures.clear();
+            }
         }
     }
 }
-

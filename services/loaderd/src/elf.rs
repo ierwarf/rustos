@@ -287,6 +287,7 @@ fn validate_executable_fd(fd: i32) -> Result<ExecutableAdmission, i32> {
     if header[..4] == *b"\x7fELF" {
         let phdrs = read_program_headers(fd, &header)?;
         let load_bias = validate_elf_fd(fd, &header, &phdrs, ELF_MAIN_DYN_LOAD_OFFSET)?;
+        admit_native_abi_stamp_fd(fd, &phdrs)?;
         return Ok(ExecutableAdmission::Elf64 {
             header,
             program_headers: phdrs,
@@ -298,6 +299,47 @@ fn validate_executable_fd(fd: i32) -> Result<ExecutableAdmission, i32> {
         return Ok(ExecutableAdmission::Pe64);
     }
     Err(ENOEXEC)
+}
+
+/// Native ABI revision gate for the main executable of a spawn.
+///
+/// A self-declared compatibility hint, not an authority claim: an unstamped
+/// image is an ordinary ELF and is admitted unchanged, a stamped image of a
+/// supported revision is admitted, and a stamp naming an unsupported revision
+/// (or a malformed or duplicated RustOS note) fails the spawn with `ENOEXEC`.
+/// The result never selects a personality and is not consulted by rootd or
+/// `personality_gate`. Only the bounded `PT_NOTE` bytes are read (one pread per
+/// note segment, see `admit_native_abi_stamp`); the interpreter and boot-spawned
+/// services are not checked here (xtask verifies staged native ELFs).
+fn admit_native_abi_stamp_fd(fd: i32, phdrs: &[u8]) -> Result<(), i32> {
+    let verdict = admit_native_abi_stamp(phdrs, |offset, buf| {
+        let read = syscall4(
+            SYS_PREAD64,
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            offset,
+        );
+        if read < 0 {
+            Err((-read) as i32)
+        } else {
+            Ok(read as usize)
+        }
+    })?;
+    match verdict {
+        Ok(_) => Ok(()),
+        Err(NativeAbiRefusal::UnsupportedRevision(revision)) => {
+            debug_line(&format!(
+                "loaderd: refused native abi revision {revision} (supported: current {})",
+                rustos_user_abi::abi_revision::NATIVE_ABI_REVISION_CURRENT
+            ));
+            Err(ENOEXEC)
+        }
+        Err(NativeAbiRefusal::MalformedNote) => {
+            debug_line("loaderd: refused malformed native abi note");
+            Err(ENOEXEC)
+        }
+    }
 }
 
 /// Reads the full program-header table in a single pread64. Loaderd used to

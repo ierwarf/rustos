@@ -1,0 +1,23 @@
+id = "localfdprobe"
+kind = "app"
+execution_domain = "user"
+startup = "session"
+
+[build]
+builder = "c-demo"
+source = "localfd_probe.c"
+extra_args = ["-pthread"]
+
+[install]
+path = "apps/localfdprobe/localfdprobe.elf"
+
+# In-guest checker for pipe/pipe2/eventfd/eventfd2 (docs/ai/abi/local-fd.md).
+# Session program: runs only when `cargo xtask kvm-smoke --local-fd-probe` wrote
+# the private contract file. Reports `localfd: <case> ok|FAIL` and the verdict
+# `localfd: PASS` / `localfd: FAIL <case>` on the kernel debug channel.
+[[desktop.entries]]
+display_name = "Local fd probe"
+weight_micros = 100
+logical_admin = false
+console_hosted = false
+no_display = true

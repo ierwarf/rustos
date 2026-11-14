@@ -192,6 +192,55 @@ pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> boo
 }
 // RING3-MIGRATION-REFERENCE END: procd-owned signal-frame substrate exception.
 
+/// Whether a blocking syscall must stop waiting with `EINTR`: some unmasked
+/// pending signal would actually be delivered. A pending signal whose
+/// disposition is ignore (SIGCHLD by default, an ignored SIGPIPE) is consumed
+/// here, as Linux never queues it, instead of interrupting the wait. procd
+/// owns the disposition; an unreachable or malformed answer is treated as an
+/// interruption so a signal is never silently starved.
+pub(super) fn current_wait_interrupted() -> bool {
+    for _ in 0..8 {
+        let Some(state) = multitask::current_linux_thread_state() else {
+            return false;
+        };
+        if state.pending_signals & !state.signal_mask == 0 {
+            return false;
+        }
+        let mut request = new_procd_request(PROCD_OP_SELECT_SIGNAL);
+        request.arg0 = state.pending_signals;
+        request.arg1 = u64::from(state.pending_sigchld_events);
+        let Ok(response) = call_procd(&request) else {
+            return true;
+        };
+        if response.version != rustos_user_abi::syscall::PROCD_IPC_ABI_VERSION
+            || response.status != 0
+        {
+            return true;
+        }
+        match response.action {
+            PROCD_SELECT_SIGNAL_NONE => return false,
+            PROCD_SELECT_SIGNAL_IGNORE => {
+                let signal = response.signal as u64;
+                let Some(current) = multitask::current_linux_thread_state() else {
+                    return false;
+                };
+                if signal_selection_is_current(
+                    current.pending_signals,
+                    current.signal_mask,
+                    current.pending_sigchld_events,
+                    signal,
+                    response.action,
+                    response.reserved0,
+                ) {
+                    clear_current_pending_signal(signal, response.reserved0);
+                }
+            }
+            _ => return true,
+        }
+    }
+    true
+}
+
 pub(super) fn syscall_linux_rt_sigreturn(frame: &mut SyscallFrame) -> u64 {
     let saved = match read_rt_signal_frame(frame.user_rsp) {
         Ok(saved) => saved,

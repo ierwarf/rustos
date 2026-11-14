@@ -131,3 +131,10 @@ fn concurrent_metadata_and_gate_writers_do_not_lose_each_others_fields() {
     assert!(!read_dispatch(slot).unwrap().lifecycle_dispatchable());
     clear(slot);
 }
+
+#[test]
+fn published_identity_tables_cover_the_whole_task_table() {
+    assert_eq!(IDENTITIES.len(), MAX_SCHEDULER_TASKS);
+    assert_eq!(SIGNAL_PENDING.len(), MAX_SCHEDULER_TASKS);
+    assert_eq!(execution::REFS.len(), MAX_SCHEDULER_TASKS);
+}

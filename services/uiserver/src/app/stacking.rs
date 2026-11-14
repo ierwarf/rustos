@@ -42,6 +42,11 @@ pub(crate) fn window_hit_test(
     y: u32,
 ) -> Option<(WindowId, crate::layout::WindowChromeHit)> {
     order.iter().rev().find_map(|id| {
+        if let WindowId::Wayland(id) = *id {
+            if wayland.iter().any(|w| w.surface_id == id && w.drag_icon) {
+                return None;
+            }
+        }
         let outer = match *id {
             WindowId::Console(id) => {
                 consoles
@@ -55,9 +60,23 @@ pub(crate) fn window_hit_test(
                     .find(|w| w.surface_id == id && !w.minimized)?,
             ),
         };
-        outer
-            .contains(x, y)
-            .then(|| (*id, crate::layout::window_chrome_hit(outer, x, y)))
+        outer.contains(x, y).then(|| {
+            let client_only = match *id {
+                WindowId::Wayland(id) => wayland
+                    .iter()
+                    .find(|w| w.surface_id == id)
+                    .is_some_and(|w| !w.server_decoration),
+                _ => false,
+            };
+            (
+                *id,
+                if client_only {
+                    crate::layout::WindowChromeHit::Client
+                } else {
+                    crate::layout::window_chrome_hit(outer, x, y)
+                },
+            )
+        })
     })
 }
 
@@ -134,6 +153,7 @@ impl AppState {
     pub(super) fn wayland_placement_frames(&self) -> Vec<crate::canvas::Rect> {
         self.wayland_windows
             .iter()
+            .filter(|w| !w.drag_icon)
             .map(|w| w.frame)
             .chain(
                 self.pending_wayland_placements
@@ -168,6 +188,9 @@ impl AppState {
         });
         let mut occupied = self.occupied_window_frames();
         for window in windows {
+            if window.drag_icon {
+                continue;
+            }
             if self
                 .wayland_windows
                 .iter()
@@ -248,6 +271,13 @@ impl AppState {
         {
             order.raise(WindowId::Console(self.focused_session_handle));
         }
+        for icon in self
+            .wayland_windows
+            .iter()
+            .filter(|window| window.drag_icon)
+        {
+            order.raise(WindowId::Wayland(icon.surface_id));
+        }
         order.0
     }
 
@@ -263,7 +293,7 @@ impl AppState {
                 WindowId::Wayland(id) => self
                     .wayland_windows
                     .iter()
-                    .any(|w| w.surface_id == *id && !w.minimized),
+                    .any(|w| w.surface_id == *id && !w.minimized && !w.drag_icon),
             })
     }
 }

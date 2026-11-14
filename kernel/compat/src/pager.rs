@@ -57,6 +57,9 @@ static REJECTED_COW_WRITES: AtomicU64 = AtomicU64::new(0);
 fn offered_run_pages(request: PagerFaultRequestWire) -> u32 {
     use rustos_user_abi::pager::PAGER_PAGE_BYTES;
 
+    if request.object.object_type != rustos_user_abi::pager::VM_OBJECT_ANONYMOUS {
+        return 1;
+    }
     let Ok(snapshot) = ps_api::validate_fault_request(request) else {
         return 1;
     };
@@ -93,6 +96,9 @@ fn frame_binding(
 }
 
 fn cancel_grant(reservation: ps_api::PagerFaultReservation) {
+    if reservation.zeroed_frame_capability == 0 {
+        return;
+    }
     let _ = mm_api::frame_capability::cancel_frame_grant(
         reservation.zeroed_frame_capability,
         frame_binding(reservation),
@@ -710,6 +716,10 @@ pub(crate) fn adopt_rendezvous_reply(
     pager_task_id: u64,
 ) -> Result<(), ps_api::PagerFaultSlotError> {
     let dispatch = dispatch_wire(reservation);
+    if reply.is_canonical_file_for(dispatch) {
+        let claimed = ps_api::claim_pager_fault_reply_from_pager(reservation.token, pager_task_id)?;
+        return complete_cached_file_reply(claimed, reply);
+    }
     if !reply.is_canonical_zeroed_for(dispatch) {
         let claimed = ps_api::claim_pager_fault_reply_from_pager(reservation.token, pager_task_id)?;
         finish_without_mapping(claimed);
@@ -731,6 +741,10 @@ pub(crate) fn reject_rendezvous_dispatch(
     finish_without_mapping(claimed);
     Ok(())
 }
+
+#[path = "pager/file_source.rs"]
+mod file_source;
+use file_source::complete_cached_file_reply;
 
 fn complete_claimed_reply(claimed: ps_api::PagerFaultReservation, reply: PagerFaultReplyWire) {
     let Ok(frame) = mm_api::frame_capability::take_frame_grant(
@@ -756,15 +770,16 @@ fn complete_claimed_reply(claimed: ps_api::PagerFaultReservation, reply: PagerFa
         let _ = wake_fault_owner(claimed.token, claimed.request.task_id);
         return;
     };
-    let mapped = ps_api::with_validated_fault_address_space(claimed.request, |_, extent, address_space| {
-        address_space.map_prepared_pager_fault_frame_at(
-            VirtAddr::new(claimed.request.virtual_address),
-            frame.as_u64(),
-            page_flags(reply.frame_rights),
-            extent,
-        )
-    })
-    .is_ok_and(|result| result.is_ok());
+    let mapped =
+        ps_api::with_validated_fault_address_space(claimed.request, |_, extent, address_space| {
+            address_space.map_prepared_pager_fault_frame_at(
+                VirtAddr::new(claimed.request.virtual_address),
+                frame.as_u64(),
+                page_flags(reply.frame_rights),
+                extent,
+            )
+        })
+        .is_ok_and(|result| result.is_ok());
     if !mapped {
         let rejected = REJECTED_ANONYMOUS_FAULT_MAPS.fetch_add(1, Ordering::Relaxed) + 1;
         if rejected == 1 || rejected.is_multiple_of(16) {
@@ -900,10 +915,11 @@ fn populate_run(request: PagerFaultRequestWire, rights: u32, run_pages: u64) {
 /// holds the only map of the range, so there is no dispatch to drive, no reply
 /// to adopt on a later turn, and no second replica to reconcile. Pager-backed
 /// objects drain their own fixed rendezvous from pagerd directly. The hook
-/// stays because it is the registered normal-time entry point the page cache
-/// will need; it reports the work it actually did, which is currently none.
+/// is also the normal-time reclamation boundary for withdrawn immutable source
+/// capabilities. Last-pin Drop only queues; this hook may wait for an MM leaf
+/// transition to finish before releasing descriptor custody and source charges.
 pub fn service_deferred_work() -> usize {
-    0
+    mm_api::frame_source::reclaim_frame_sources(64)
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@ read the sections you need, rather than paging from line 1 by habit.
 | User task | Read first | Then only if unresolved |
 | --- | --- | --- |
 | Resume prior work / prepare session handoff | `session-handoff.md` repository snapshot, never local authority | live goal + `git status --short` + `git log -1`, then one owner contract |
+| Linux `pipe`/`eventfd` semantics, local fd kinds, `WAITSET_PROVIDER_KERNEL` | `abi/local-fd.md` | `kernel/ps/src/user/{pipe,eventfd,local_wait}.rs`, `service_ops/local_fd.rs`; probe `kvm-smoke --local-fd-probe` |
 | Build/check issue | `.agents/skills/rustos-build/SKILL.md` or the failing diagnostic | search `commands.md` only if exact invocation remains unclear |
 | Development-speed/tooling change | relevant `token-policy.md` section + exact active hook/config | search `commands.md` only if a build invocation is part of the issue |
 | Run/KVM/debug issue | `.agents/skills/rustos-kvm/SKILL.md` | exact KVM owner; bounded `build/kvm/` evidence after symptom is known |
@@ -36,6 +37,7 @@ read the sections you need, rather than paging from line 1 by habit.
 | Performance optimization/profiling | `.agents/skills/rustos-performance-optimization/SKILL.md` | search `performance-hardening.md`, then measured owner and exact hot symbol |
 | IPC/syscall/scheduler cost | performance skill + exact benchmark symptom | search the synchronous-IPC section of `performance-hardening.md` and matching `docs/benchmarks/README.md` range |
 | Hardening/security review | relevant section of `core-engineering-contract.md`, then highest-risk owner contract | add ABI/API/system-flow ranges only for crossed boundaries |
+| Add or change an ABI/syscall/handle/protocol identifier, or kernel scope question | `../architecture/evolution-rules.md` | owning `abi/*.md` section and `libs/rustos-user-abi` constants |
 | Ring0/ring3 ownership | search the owning heading in `contracts-abi.md` | exact broker/service/API owner |
 | Add service/app/driver | `workflows.md` | closest manifest/source and target files |
 | Docs update | target doc | `docs/SUMMARY.md` only when navigation changes |

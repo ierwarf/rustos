@@ -243,6 +243,16 @@ pub(super) fn call_syscalld_fast_mem(
     offset: u64,
 ) -> Result<LinuxSyscallOffloadFastResponse, i64> {
     let snapshot = multitask::current_user_snapshot().ok_or(LINUX_EINVAL)?;
+    // Bind this request to the caller's exact process/MM incarnation. The MM
+    // broker honours only operations that echo this ticket, and only until
+    // this function returns - for a reply, a timeout, or an interruption alike.
+    let (_, identity) = multitask::current_user_ipc_identity().ok_or(LINUX_EINVAL)?;
+    let lease = super::mm_request_lease::RequestLease::open(super::mm_request_lease::MmTarget {
+        pid: snapshot.process_id(),
+        process_generation: identity.process_generation(),
+        mm_generation: identity.mm_generation(),
+    })
+    .ok_or(LINUX_EAGAIN)?;
     let request = LinuxSyscallOffloadFastMemRequest {
         version: SYSCALL_OFFLOAD_ABI_VERSION,
         op,
@@ -254,6 +264,7 @@ pub(super) fn call_syscalld_fast_mem(
         flags,
         fd,
         offset,
+        ticket: lease.ticket(),
     };
     let (received, bytes) = ipc_ops::call_linux_syscall_fast_endpoint(
         as_bytes(&request),
@@ -491,10 +502,7 @@ pub(super) fn syscall_linux_wait4(pid: i64, status_ptr: u64, options: u64, rusag
                 if matches!(parking, ChildParking::Unavailable) {
                     multitask::yield_now();
                 }
-                match child_wait_after_parking(parking, || {
-                    multitask::current_linux_thread_state()
-                        .is_some_and(|state| state.pending_signals & !state.signal_mask != 0)
-                }) {
+                match child_wait_after_parking(parking, current_wait_interrupted) {
                     Ok(settled) => carried = settled,
                     Err(errno) => return linux_errno(errno),
                 }
@@ -595,6 +603,9 @@ pub(super) fn syscall_linux_memfd_create(name_ptr: u64, flags: u64) -> u64 {
     let handle = multitask::KernelHandle::Memfd(multitask::MemfdHandle::new(
         name,
         flags & linux_abi::MFD_ALLOW_SEALING != 0,
+        // Backing frames bill the creating Job's resident-page group; no
+        // published Job (kernel-internal caller) means unaccounted.
+        multitask::current_user_job_charge_group(),
     ));
     match multitask::with_current_user_process_state_mut(|_, _, process_state| {
         process_state

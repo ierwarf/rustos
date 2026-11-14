@@ -141,6 +141,8 @@ pub enum ExecRefusal {
     Image(u8),
     /// The old address space still has an activation grant in flight.
     SealBusy,
+    /// The replacement exceeded the target Job's memory quota.
+    MappingQuota,
     /// Staging refused for another reason (pin, process gone, transfer).
     Stage,
 }
@@ -159,7 +161,26 @@ impl ExecRefusal {
             Self::Image(detail) => 8 | (u64::from(detail) << 8),
             Self::SealBusy => 9,
             Self::Stage => 10,
+            Self::MappingQuota => 11,
         }
+    }
+}
+
+fn stage_refusal_to_exec(refusal: super::super::process_table::StageRefusal) -> ExecRefusal {
+    match refusal {
+        super::super::process_table::StageRefusal::SealBusy => ExecRefusal::SealBusy,
+        super::super::process_table::StageRefusal::MappingQuota => ExecRefusal::MappingQuota,
+        _ => ExecRefusal::Stage,
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+    #[test]
+    fn staging_quota_refusal_survives_the_exec_boundary() {
+        assert_eq!(stage_refusal_to_exec(super::super::super::process_table::StageRefusal::MappingQuota), ExecRefusal::MappingQuota);
+        assert_eq!(stage_refusal_to_exec(super::super::super::process_table::StageRefusal::Transfer), ExecRefusal::Stage);
     }
 }
 
@@ -294,8 +315,7 @@ pub fn exec_user_process_by_pid_checked(
         drop(census);
         cancel_intent(intent);
         return Err(match stage_refusal {
-            Some(super::super::process_table::StageRefusal::SealBusy) => ExecRefusal::SealBusy,
-            Some(_) => ExecRefusal::Stage,
+            Some(refusal) => stage_refusal_to_exec(refusal),
             None => ExecRefusal::Image(exec_transaction::take_image_refusal()),
         });
     };

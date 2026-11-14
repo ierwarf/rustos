@@ -607,7 +607,7 @@ fn actual_windows_materialization_error_cancels_all_unpublished_process_and_slot
                 |_| 1,
                 |_, _| panic!("failed materialization reached ACK")
             )
-            .is_none()
+            .is_err()
         );
         assert_eq!(process_table::live_process_identity_by_pid(ID), None);
         assert!(!stack_resources::allocated(1));
@@ -630,7 +630,7 @@ fn newly_visible_root_abandonment_retains_actual_process_pin_and_poisoned_join_w
         )
         .unwrap();
         assert!(join.register().is_none());
-        assert_eq!(join.publish(None, state()), Some(handle));
+        assert_eq!(join.publish(None, state()), Ok(handle));
         drop(join);
         assert!(crate::multitask::process_placement::root_membership::pending(handle));
         assert!(
@@ -790,7 +790,7 @@ fn actual_orphan_runtime_refusal_does_not_publish_pid_or_release_foreign_funding
                 |_| 1,
                 |_, _| panic!("foreign runtime reached PID ACK")
             )
-            .is_none()
+            .is_err()
         );
         assert_eq!(process_table::live_process_identity_by_pid(ID), None);
         assert!(foreign.runtime_snapshot().is_some());
@@ -813,4 +813,61 @@ pub(in crate::multitask::scheduler) fn unbudgeted_refused() {
 #[test]
 fn actual_kernel_actor_does_not_grant_unbudgeted_or_missing_parent_admission() {
     unbudgeted_refused();
+}
+
+#[test]
+fn fork_publication_quota_refusals_preserve_parent_and_rollback_root_custody() {
+    use kernel_mm::api::{charge, kmem_charge::{self, Class}};
+    kernel(|actor, turn| {
+        let job = process_table::jobs::job_create_child(process_table::jobs::ROOT_JOB).unwrap();
+        let parent_reservation = process_table::reserve_spawn_in(Some(job)).unwrap();
+        let parent = process_table::publish_spawn(parent_reservation, ID, None, state()).unwrap();
+        let admission = Admission::capture(actor, None, Some(policy())).unwrap();
+        let group = job.charge_group();
+        let thread_before = kmem_charge::usage(Class::Thread, group);
+        let vma_before = kmem_charge::usage(Class::Vma, group);
+        let resident_before = charge::usage(group);
+        for mapping in [true, false] {
+            let mut space = ProcessAddressSpace::empty_for_tests();
+            space.add_immutable_metadata_for_tests();
+            if mapping {
+                process_table::jobs::job_set_kmem_class_limit(job, Class::Vma, vma_before).unwrap();
+            } else {
+                process_table::jobs::job_set_kmem_class_limit(job, Class::Vma, u64::MAX).unwrap();
+                charge::set_limit(group, resident_before);
+            }
+            let child = UserProcessState::new(space, None, None, None, None, false, "/child");
+            let reservation = process_table::reserve_spawn().unwrap();
+            let handle = reservation.process_handle();
+            let result = construct(ID + 1, Input::State(child), bootstrap(UserAbi::Linux), Some(ID),
+                119, 0x23, 0x1b, 0x202, true, reservation, actor, &admission, turn,
+                |_| 1, |_, _| panic!("refused child reached publication"));
+            assert_eq!(result, Err(crate::multitask::SpawnTaskError::MemoryQuota));
+            assert_eq!(process_table::live_process_identity_by_pid(ID + 1), None);
+            assert!(process_table::retain_process(handle).is_none());
+            assert!(!process_table::cancel_spawn(reservation));
+            assert!(!stack_resources::allocated(1));
+            assert!(!stack_resources::admission::is_reserved(1));
+            assert!(process_table::retain_process(parent).is_some());
+            assert_eq!(process_table::jobs::process_job(ID), Some(job));
+            assert_eq!(kmem_charge::usage(Class::Thread, group), thread_before);
+            kernel_mm::api::address_space::drain_retired_address_spaces(128);
+            assert_eq!(kmem_charge::usage(Class::Vma, group), vma_before);
+            assert_eq!(charge::usage(group), resident_before);
+        }
+        charge::set_limit(group, u64::MAX);
+        use process_table::jobs::{job_set_limits, JobLimits, LimitMask};
+        job_set_limits(job, LimitMask::PROCESSES, JobLimits { processes: 1, ..JobLimits::UNSET }).unwrap();
+        let reservation = process_table::reserve_spawn().unwrap();
+        let result = construct(ID + 2, Input::State(state()), bootstrap(UserAbi::Linux), Some(ID),
+            119, 0x23, 0x1b, 0x202, true, reservation, actor, &admission, turn,
+            |_| 1, |_, _| panic!("process quota refusal reached publication"));
+        assert_eq!(result, Err(crate::multitask::SpawnTaskError::NoFreeTaskSlot));
+        assert!(!process_table::cancel_spawn(reservation));
+        assert!(!stack_resources::allocated(1));
+        assert!(process_table::retain_process(parent).is_some());
+        assert!(process_table::mark_process_exiting(ID).is_some());
+        process_table::detach_task(parent).unwrap();
+        assert_eq!(process_table::reap_exited_processes(), 1);
+    });
 }

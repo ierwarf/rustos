@@ -219,3 +219,65 @@ fn a_live_process_exit_query_never_enters_the_table_and_exiting_still_reaches_au
     detach_task(handle).expect("last thread detach");
     assert_eq!(reap_exited_processes(), 1);
 }
+
+/// The app-buffer broker (and every other deferred effect) re-enters a process
+/// by `(pid, process generation, mm generation)`. A recycled PID, a new image
+/// after exec, or a mismatched generation must never reach the new owner's
+/// state.
+#[test]
+fn generation_bound_state_access_refuses_reused_pid_and_stale_generations() {
+    use crate::multitask::current::with_process_state_by_generation_mut as enter;
+    let _isolation = isolate_process_table();
+    let first = create_process(80_106, new_state()).expect("first incarnation");
+    let (_, identity) = crate::multitask::current::ipc_identity_for_binding(1, first)
+        .expect("live identity");
+    let (generation, mm) = (identity.process_generation(), identity.mm_generation());
+
+    assert_eq!(enter(80_106, generation, mm, |_| 7), Some(7));
+    assert_eq!(enter(80_106, generation.wrapping_add(1), mm, |_| 7), None);
+    assert_eq!(enter(80_106, generation, mm.wrapping_add(1), |_| 7), None);
+    assert_eq!(enter(80_107, generation, mm, |_| 7), None);
+
+    // Exec hides the process: the pre-exec reservation may not act on the image
+    // that is being replaced, and a cancelled exec restores exactly the old one.
+    let reservation = begin_exec(first).expect("exec reservation");
+    assert_eq!(enter(80_106, generation, mm, |_| 7), None);
+    assert!(cancel_exec(reservation));
+    assert_eq!(enter(80_106, generation, mm, |_| 7), Some(7));
+
+    // PID reuse: same number, different incarnation.
+    assert_eq!(mark_process_exiting(80_106), Some(()));
+    assert_eq!(enter(80_106, generation, mm, |_| 7), None);
+    detach_task(first).expect("retire first incarnation");
+    assert_eq!(reap_exited_processes(), 1);
+    let second = create_process(80_106, new_state()).expect("reused pid");
+    let (_, reused) = crate::multitask::current::ipc_identity_for_binding(1, second)
+        .expect("reused identity");
+    assert_eq!(enter(80_106, generation, mm, |_| 7), None, "stale bearer reached the reused PID");
+    assert_eq!(
+        enter(80_106, reused.process_generation(), reused.mm_generation(), |_| 7),
+        Some(7)
+    );
+    detach_task(second).expect("retire second incarnation");
+    assert_eq!(reap_exited_processes(), 1);
+}
+
+/// Exit seals visibility so nothing new is published, yet the exit path must
+/// still drain the handle table: pipes, eventfds and service-side descriptions
+/// are only released by that drain. Losing it leaks the peer's EOF/EPIPE.
+#[test]
+fn exiting_process_hides_from_visible_access_but_stays_reachable_for_teardown() {
+    use super::super::{with_process_state_by_pid_mut, with_process_state_for_teardown_mut};
+    let _isolation = isolate_process_table();
+    let handle = create_process(80_108, new_state()).expect("process");
+    assert_eq!(with_process_state_by_pid_mut(80_108, |_| 1), Some(1));
+    assert_eq!(with_process_state_for_teardown_mut(80_108, |_| 2), Some(2));
+
+    assert_eq!(mark_process_exiting(80_108), Some(()));
+    assert_eq!(with_process_state_by_pid_mut(80_108, |_| 1), None);
+    assert_eq!(with_process_state_for_teardown_mut(80_108, |_| 2), Some(2));
+    assert_eq!(with_process_state_for_teardown_mut(80_109, |_| 2), None);
+
+    detach_task(handle).expect("last thread detach");
+    assert_eq!(reap_exited_processes(), 1);
+}

@@ -15,6 +15,7 @@ into another crate's private modules when `api.rs` exposes a wrapper.
 | Endpoints, replies, transferred handles, shared regions | `kernel_ipc_runtime::api as ipc_api` | `kernel/ipc-runtime/src/api.rs` |
 | Scheduler/process/user state | `kernel_ps::api as ps_api` | `kernel/ps/src/api.rs` |
 | VFS/devices/console/drivers/input/USB | `kernel_io_manager::api as io_api` | `kernel/io-manager/src/api.rs` |
+| Local fd objects (pipe, eventfd readiness registry) | `kernel_ps::api` (`PipeHandle`, `EventFdHandle`, `local_fd_readiness_of`) | `kernel/ps/src/user/{pipe,eventfd,local_wait}.rs`, `docs/ai/abi/local-fd.md` |
 | Linux/Windows compat/syscalls | `kernel_compat::api as compat_api` | `kernel/compat/src/api.rs` |
 | Boot orchestration/hooks | `kernel_executive::boot` | `kernel/executive/src/boot.rs`, `kernel/executive/src/lib.rs` |
 | Logging/panic/boot trace | `nucleus_core::debug` | `kernel/nucleus-core/src/debug/mod.rs` |

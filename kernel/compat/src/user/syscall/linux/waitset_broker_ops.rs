@@ -17,11 +17,12 @@
 // own readiness state and generations; every wake is followed by a provider
 // recheck before Linux-visible readiness is returned.
 use super::*;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use rustos_user_abi::syscall::{
-    WAITSET_MAX_INTERESTS, WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_MAX, WAITSET_PROVIDER_NETD,
+    WAITSET_MAX_INTERESTS, WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_KERNEL,
+    WAITSET_PROVIDER_MAX, WAITSET_PROVIDER_NETD,
     WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD, WAITSET_SIGNAL_FLAG_READY,
     WaitSetSignalBrokerArgs, waitset_signal_shape_valid,
 };
@@ -29,7 +30,11 @@ use rustos_user_abi::syscall::{
 // the remaining capacity admits ordinary multi-provider waits concurrently.
 // Exhaustion is explicit EBUSY and never collapses identities or allocates in
 // the raw registry critical section.
-const WAITSET_OBSERVATIONS_PER_TASK_BUDGET: usize = 16;
+// 8 per task over the 256-slot task table keeps the slab at the 2,048 entries it
+// had at 16 per task over 128 slots: the table is built by value before it is
+// published (`lazy_static`), so doubling it to ~196 KiB overflowed a 2 MiB
+// thread stack in unoptimized builds, and no task arms more than a few providers.
+const WAITSET_OBSERVATIONS_PER_TASK_BUDGET: usize = 8;
 const WAITSET_WAITER_CAPACITY: usize =
     multitask::MAX_SCHEDULER_TASKS * WAITSET_OBSERVATIONS_PER_TASK_BUDGET;
 pub(crate) const WAITSET_MAX_OBSERVATIONS: usize = WAITSET_MAX_INTERESTS + 1;
@@ -55,6 +60,27 @@ struct InputOpenDescription {
     token: u64,
     access: u16,
     refs: u64,
+}
+
+/// Observations of `WAITSET_PROVIDER_KERNEL` currently installed in
+/// `WAITSET_WAITERS`. Maintained only under that lock; read lock-free by
+/// `wake_local_fd_object` so a pipe write with nobody waiting never scans the
+/// waiter slab.
+static KERNEL_OBSERVERS: AtomicUsize = AtomicUsize::new(0);
+
+fn clear_waiter_slot(slot: &mut Option<WaitSetWaiter>) {
+    if let Some(waiter) = slot.take()
+        && waiter.observation.provider == WAITSET_PROVIDER_KERNEL
+    {
+        KERNEL_OBSERVERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn install_waiter_slot(slot: &mut Option<WaitSetWaiter>, waiter: WaitSetWaiter) {
+    if waiter.observation.provider == WAITSET_PROVIDER_KERNEL {
+        KERNEL_OBSERVERS.fetch_add(1, Ordering::Relaxed);
+    }
+    *slot = Some(waiter);
 }
 
 lazy_static! {
@@ -291,7 +317,7 @@ fn register_waitset_waiters_faultable(
             .as_ref()
             .is_some_and(|waiter| waiter.task_id == task_id)
         {
-            *slot = None;
+            clear_waiter_slot(slot);
         }
     }
     for observation in observations.iter().copied() {
@@ -299,12 +325,20 @@ fn register_waitset_waiters_faultable(
             .iter_mut()
             .find(|slot| slot.is_none())
             .expect("waitset capacity preflight diverged");
-        *slot = Some(WaitSetWaiter {
-            task_id,
-            process_id,
-            observation,
-        });
+        install_waiter_slot(
+            slot,
+            WaitSetWaiter {
+                task_id,
+                process_id,
+                observation,
+            },
+        );
     }
+    drop(waiters);
+    // Pairs with the fence in `wake_local_fd_object`: either its counter load
+    // sees this registration, or the caller's post-registration recheck of the
+    // object sees the state change that load would otherwise have missed.
+    fence(Ordering::SeqCst);
     Ok(())
 }
 
@@ -316,7 +350,7 @@ pub(crate) fn remove_waitset_waiters(task_id: u64) -> usize {
             .as_ref()
             .is_some_and(|waiter| waiter.task_id == task_id)
         {
-            *slot = None;
+            clear_waiter_slot(slot);
             removed += 1;
         }
     }
@@ -351,7 +385,7 @@ pub(crate) fn remove_waitset_waiters_for_process(process_id: u64) {
             .as_ref()
             .is_some_and(|waiter| waiter.process_id == process_id)
         {
-            *slot = None;
+            clear_waiter_slot(slot);
         }
     }
 }
@@ -393,6 +427,63 @@ pub(super) fn syscall_linux_rustos_waitset_signal_broker(args_ptr: u64) -> u64 {
     0
 }
 
+/// Wakes every waiter armed on kernel-local fd object `token` at a generation
+/// older than `generation`. The caller publishes this after releasing the
+/// object's own lock. Waiters are removed before they are woken (the same
+/// contract as provider signals); a woken task re-registers if it still has to
+/// wait.
+pub(crate) fn wake_local_fd_object(token: u64, generation: u64) {
+    const BATCH: usize = 8;
+    // Pairs with the fence closing `register_waitset_waiters`.
+    fence(Ordering::SeqCst);
+    if KERNEL_OBSERVERS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    loop {
+        let mut task_ids = [0_u64; BATCH];
+        let (count, more) = take_local_waiters(token, generation, &mut task_ids);
+        for task_id in task_ids.into_iter().take(count) {
+            let _ = multitask::wake_task(task_id);
+        }
+        if !more {
+            return;
+        }
+    }
+}
+
+/// Removes up to `task_ids.len()` distinct tasks with a matching kernel-local
+/// observation; `more` reports that another distinct task still matches.
+fn take_local_waiters(token: u64, generation: u64, task_ids: &mut [u64]) -> (usize, bool) {
+    let mut count = 0_usize;
+    let mut more = false;
+    let mut waiters = WAITSET_WAITERS.lock();
+    for waiter in waiters.iter().flatten() {
+        let observation = waiter.observation;
+        if observation.provider != WAITSET_PROVIDER_KERNEL
+            || observation.object_id != token
+            || !generation_advances(observation.generation, generation)
+            || task_ids[..count].contains(&waiter.task_id)
+        {
+            continue;
+        }
+        if count == task_ids.len() {
+            more = true;
+            break;
+        }
+        task_ids[count] = waiter.task_id;
+        count += 1;
+    }
+    for slot in waiters.iter_mut() {
+        if slot
+            .as_ref()
+            .is_some_and(|waiter| task_ids[..count].contains(&waiter.task_id))
+        {
+            clear_waiter_slot(slot);
+        }
+    }
+    (count, more)
+}
+
 fn wake_matching(provider: u16, object_id: Option<u64>, generation: Option<u64>) {
     let mut task_ids = [0_u64; WAITSET_WAITER_CAPACITY];
     let count = take_matching_waiters(provider, object_id, generation, &mut task_ids);
@@ -431,7 +522,7 @@ fn take_matching_waiters(
                 .as_ref()
                 .is_some_and(|waiter| task_ids[..count].contains(&waiter.task_id))
             {
-                *slot = None;
+                clear_waiter_slot(slot);
             }
         }
     }
@@ -469,10 +560,10 @@ mod tests {
         generation_advances, input_open_description_access, provider_for_service,
         register_input_open_description, register_waitset_waiters,
         register_waitset_waiters_faultable, release_input_open_description, remove_waitset_waiters,
-        service_for_provider, take_matching_waiters, waitset_waiters_match,
+        service_for_provider, take_local_waiters, take_matching_waiters, waitset_waiters_match,
     };
     use rustos_user_abi::syscall::{
-        INPUTD_ACCESS_EVDEV, IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, IPC_SERVICE_SESSIOND,
+        WAITSET_PROVIDER_KERNEL, INPUTD_ACCESS_EVDEV, IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, IPC_SERVICE_SESSIOND,
         IPC_SERVICE_VFSD, WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_NETD,
         WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD,
     };
@@ -761,5 +852,91 @@ mod tests {
         assert!(!waitset_waiters_match(first_task, process_id, &first));
         assert!(waitset_waiters_match(second_task, process_id, &second));
         remove_waitset_waiters(second_task);
+    }
+
+    #[test]
+    fn kernel_local_waiters_are_counted_matched_and_removed_exactly() {
+        use core::sync::atomic::Ordering;
+        let _guard = WAITSET_TEST_GUARD.lock();
+        let (task_a, task_b, task_c, process) =
+            (u64::MAX - 61, u64::MAX - 62, u64::MAX - 63, u64::MAX - 64);
+        let token = u64::MAX - 65;
+        let before = super::KERNEL_OBSERVERS.load(Ordering::Relaxed);
+        let at = |generation| {
+            [ProviderObservation {
+                provider: WAITSET_PROVIDER_KERNEL,
+                object_id: token,
+                generation,
+            }]
+        };
+        register_waitset_waiters(task_a, process, &at(4)).unwrap();
+        register_waitset_waiters(task_b, process, &at(9)).unwrap();
+        // A foreign-provider observation with the same object id never matches.
+        register_waitset_waiters(
+            task_c,
+            process,
+            &[ProviderObservation {
+                provider: WAITSET_PROVIDER_NETD,
+                object_id: token,
+                generation: 1,
+            }],
+        )
+        .unwrap();
+        assert_eq!(super::KERNEL_OBSERVERS.load(Ordering::Relaxed), before + 2);
+
+        let mut woken = [0_u64; 8];
+        // Generation 9 advances task A (observed 4) but not task B (observed 9).
+        let (count, more) = take_local_waiters(token, 9, &mut woken);
+        assert_eq!((count, more, woken[0]), (1, false, task_a));
+        assert_eq!(super::KERNEL_OBSERVERS.load(Ordering::Relaxed), before + 1);
+        assert!(!waitset_waiters_match(task_a, process, &at(4)), "woken waiters are removed");
+        assert!(waitset_waiters_match(task_b, process, &at(9)), "an equal generation is not a wake");
+        assert!(waitset_waiters_match(task_c, process, &[ProviderObservation {
+            provider: WAITSET_PROVIDER_NETD,
+            object_id: token,
+            generation: 1,
+        }]));
+
+        // Re-registering the same task replaces its observation without
+        // double-counting.
+        register_waitset_waiters(task_b, process, &at(9)).unwrap();
+        assert_eq!(super::KERNEL_OBSERVERS.load(Ordering::Relaxed), before + 1);
+        remove_waitset_waiters(task_b);
+        remove_waitset_waiters(task_c);
+        assert_eq!(super::KERNEL_OBSERVERS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn kernel_local_wake_batches_report_when_more_waiters_remain() {
+        let _guard = WAITSET_TEST_GUARD.lock();
+        let process = u64::MAX - 70;
+        let token = u64::MAX - 71;
+        let tasks = [u64::MAX - 72, u64::MAX - 73, u64::MAX - 74];
+        for task in tasks {
+            register_waitset_waiters(
+                task,
+                process,
+                &[ProviderObservation {
+                    provider: WAITSET_PROVIDER_KERNEL,
+                    object_id: token,
+                    generation: 1,
+                }],
+            )
+            .unwrap();
+        }
+        let mut first = [0_u64; 2];
+        let (count, more) = take_local_waiters(token, 2, &mut first);
+        assert_eq!((count, more), (2, true));
+        let mut second = [0_u64; 2];
+        let (count, more) = take_local_waiters(token, 2, &mut second);
+        assert_eq!((count, more), (1, false));
+        for task in tasks {
+            remove_waitset_waiters(task);
+        }
+    }
+
+    #[test]
+    fn userspace_cannot_signal_the_kernel_provider() {
+        assert_eq!(service_for_provider(WAITSET_PROVIDER_KERNEL), None);
     }
 }

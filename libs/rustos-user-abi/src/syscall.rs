@@ -8,6 +8,8 @@ mod ipc_handle_receive;
 mod ipc_registers;
 mod ipc_fast_buffer;
 mod pager_fault;
+mod frame_source;
+mod library_object;
 mod scheduling_context;
 pub mod smp_qualification;
 mod vfs_executable_snapshot;
@@ -21,6 +23,8 @@ pub use ipc_handle_receive::*;
 pub use ipc_registers::*;
 pub use ipc_fast_buffer::*;
 pub use pager_fault::*;
+pub use frame_source::*;
+pub use library_object::*;
 pub use scheduling_context::*;
 pub use smp_qualification::*;
 pub use vfs_executable_snapshot::*;
@@ -113,6 +117,74 @@ pub const SYS_RUSTOS_SERVICE_POLICY: u64 = 0x5255_005f;
 /// (0..=IPC_MAX_TRANSFER_HANDLES). Owners declare their receive shape before
 /// publication, so incompatible requests cannot block a service queue.
 pub const SYS_RUSTOS_IPC_ENDPOINT_CREATE_WITH_LIMITS: u64 = 0x5255_0060;
+/// Device-policy-only app-buffer custody and DVM export control.
+pub const SYS_RUSTOS_APP_BUFFER_BROKER: u64 = 0x5255_0061;
+pub const APP_BUFFER_BROKER_BEGIN: u32 = 1;
+pub const APP_BUFFER_BROKER_TAKE: u32 = 2;
+pub const APP_BUFFER_BROKER_CANCEL: u32 = 3;
+pub const APP_BUFFER_BROKER_REAP: u32 = 4;
+/// `st_rdev` of a genuine app DMA-BUF handle (major 0x5250, minor 0x44).
+pub const APP_BUFFER_STAT_RDEV: u64 = (0x5250 << 8) | 0x44;
+pub const APP_BUFFER_IPC_VERSION: u32 = 1;
+pub const APP_BUFFER_IPC_ALLOCATE: u32 = 1;
+
+/// Broker never accepts an offset or an allocation identity from userspace.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RustosAppBufferBrokerArgs {
+    pub op: u32,
+    pub timeout_ms: u32,
+    pub sequence: u64,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: u32,
+}
+
+/// Kernel-stamped client allocation request to devmgrd. `pid`/`tid` are
+/// written by the kernel from the calling thread, never from user memory, and
+/// devmgrd must still match them with the IPC sender before acting.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DevmgrdAppBufferRequest {
+    pub version: u32,
+    pub op: u32,
+    pub pid: u64,
+    pub tid: u64,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: u32,
+    pub reserved: [u64; 2],
+}
+
+/// Reply carries exactly one transferred `DeviceBuffer` handle on success and
+/// none on failure. `status` is a positive Linux errno or zero.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DevmgrdAppBufferResponse {
+    pub version: u32,
+    pub status: i32,
+}
+
+/// Linux-ABI client syscall: allocate one app DMA-BUF. The fd is the return
+/// value; no address, offset or allocation identity crosses this interface.
+pub const SYS_RUSTOS_APP_BUFFER_ALLOC: u64 = 0x5255_0062;
+/// Largest single allocation devmgrd policy admits.
+pub const APP_BUFFER_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Most app DMA-BUF aperture bytes one process may hold across its descriptor
+/// table (distinct allocations); the kernel refuses the allocation beyond it.
+pub const APP_BUFFER_CLIENT_QUOTA_BYTES: u64 = 128 * 1024 * 1024;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RustosAppBufferAllocArgs {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: u32,
+    pub reserved: [u64; 2],
+}
+
 /// Capability-gated, event-driven wait for the DVM input transport. Only
 /// inputd may use this to wait for an MSI-X-published ingress batch; input
 /// policy and translation remain in the service.
@@ -607,7 +679,7 @@ pub const SYSCALL_OFFLOAD_OP_WIN32_QUERY_VIRTUAL_MEMORY: u16 = 90;
 pub const SYSCALL_OFFLOAD_PATH_CAPACITY: usize = 256;
 pub const SYSCALL_OFFLOAD_PAYLOAD_CAPACITY: usize = 0x200;
 pub const SYSCALL_OFFLOAD_FAST_PAYLOAD_CAPACITY: usize = 32;
-pub const MM_BROKER_ABI_VERSION: u16 = 1;
+pub const MM_BROKER_ABI_VERSION: u16 = 2;
 pub const MM_BROKER_OP_QUERY_LAYOUT: u16 = 1;
 pub const MM_BROKER_OP_DESCRIBE_FD: u16 = 2;
 pub const MM_BROKER_OP_MAP_ANON: u16 = 3;
@@ -616,6 +688,12 @@ pub const MM_BROKER_OP_MAP_MEMFD_SHARED: u16 = 5;
 pub const MM_BROKER_OP_MAP_DEVICE_SHARED: u16 = 6;
 pub const MM_BROKER_OP_PROTECT: u16 = 7;
 pub const MM_BROKER_OP_UNMAP: u16 = 8;
+/// Advisory occupied geometry; address selection remains Ring3 policy.
+pub const MM_BROKER_OP_QUERY_CONFLICT: u16 = 10;
+/// Bind a file descriptor's open description to a sealed shared library object
+/// after vfsd attests its backing file identity. A later `MAP_FILE_PRIVATE` of
+/// that descriptor aliases the object's immutable frames copy-on-write.
+pub const MM_BROKER_OP_BIND_LIBRARY: u16 = 11;
 pub const MM_BROKER_FLAG_NONE: u32 = 0;
 pub const MM_BROKER_MAP_READ: u64 = 1 << 0;
 pub const MM_BROKER_MAP_WRITE: u64 = 1 << 1;
@@ -628,6 +706,7 @@ pub const MM_BROKER_FD_KIND_FILE: u16 = 1;
 pub const MM_BROKER_FD_KIND_MEMFD: u16 = 2;
 pub const MM_BROKER_FD_KIND_DEVICE: u16 = 3;
 pub const MM_BROKER_FD_KIND_DISPLAY_SURFACE: u16 = 4;
+pub const MM_BROKER_FD_KIND_DEVICE_BUFFER: u16 = 5;
 pub const MM_BROKER_FD_RIGHT_READ: u64 = 1 << 0;
 pub const MM_BROKER_FD_RIGHT_WRITE: u64 = 1 << 1;
 pub const MM_BROKER_FD_RIGHT_MAP: u64 = 1 << 2;
@@ -661,6 +740,16 @@ pub const VFS_IPC_OP_CURSOR_SETTLE: u16 = 24;
 /// Acknowledge visibility of a successful tombstoning mutation so vfsd may
 /// reclaim its durable replay record without breaking response-loss retries.
 pub const VFS_IPC_OP_CHECKPOINT_ACK: u16 = 25;
+/// Report the backing file identity of an open file description as one
+/// `VfsFileIdentityWire` payload. Read-only metadata; changes no vfsd state.
+pub const VFS_IPC_OP_FILE_IDENTITY: u16 = 26;
+/// Pager-service-only whole-file read for the shared library cache. `path` names
+/// an absolute file; `arg0` is a page-aligned offset and `arg1` the byte count
+/// (at most `VFS_LIBRARY_READ_MAX_BYTES`). The reply payload is one
+/// `VfsFileIdentityWire` (all zero when the file is not on the immutable volume,
+/// `aux == 0`) followed by the bytes read; `value` is the file length.
+pub const VFS_IPC_OP_LIBRARY_READ: u16 = 27;
+pub const VFS_LIBRARY_READ_MAX_BYTES: usize = 8 * 4096;
 pub const VFS_CURSOR_SETTLE_COMMIT: u64 = 1;
 pub const VFS_CURSOR_SETTLE_CANCEL: u64 = 2;
 /// Batched fd readiness: `payload_len` is `n * size_of::<LinuxPollFd>()` for
@@ -692,7 +781,11 @@ pub const WAITSET_PROVIDER_VFSD: u16 = 1;
 pub const WAITSET_PROVIDER_NETD: u16 = 2;
 pub const WAITSET_PROVIDER_INPUTD: u16 = 3;
 pub const WAITSET_PROVIDER_SESSIOND: u16 = 4;
-pub const WAITSET_PROVIDER_MAX: u16 = WAITSET_PROVIDER_SESSIOND;
+/// Kernel-local fd objects (pipe ends, eventfd): ring0 is the provider, so no
+/// service owns this id and `SYS_RUSTOS_WAITSET_SIGNAL_BROKER` refuses to
+/// signal it. The kernel itself advances these generations and wakes waiters.
+pub const WAITSET_PROVIDER_KERNEL: u16 = 5;
+pub const WAITSET_PROVIDER_MAX: u16 = WAITSET_PROVIDER_KERNEL;
 /// inputd exposes two shared readiness objects. Every open description of one
 /// access ABI observes the same underlying bounded queue, so these stable IDs
 /// are the exact wait keys rather than per-fd aliases.
@@ -1260,6 +1353,10 @@ pub const JOB_KMEM_CLASS_THREAD: u32 = 4;
 pub const JOB_KMEM_CLASS_VMA: u32 = 5;
 /// Queued synchronous-call messages, billed to the sending Job.
 pub const JOB_KMEM_CLASS_IPC_MESSAGE: u32 = 6;
+/// App DMA-BUF aperture bytes, billed to the installing Job until reclaim.
+pub const JOB_KMEM_CLASS_DEVICE_BUFFER: u32 = 7;
+/// Library-cache registry heap, billed to the owning (pager) service Job.
+pub const JOB_KMEM_CLASS_LIBRARY_OBJECT: u32 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3392,6 +3489,11 @@ pub struct RustosMmBrokerArgs {
     pub offset: u64,
     pub out_ptr: u64,
     pub out_len: u64,
+    /// Kernel-issued request ticket, echoed from the compact address-space
+    /// request `syscalld` is serving. Every operation except the pager's own
+    /// anonymous-policy publication is refused unless it names a live request
+    /// of `target_pid`; a ticket never outlives the caller's call.
+    pub ticket: u64,
 }
 
 #[repr(C)]
@@ -3403,6 +3505,15 @@ pub struct RustosMmLayoutBrokerResult {
     pub mmap_next: u64,
     pub user_range_start: u64,
     pub user_range_end: u64,
+}
+
+/// An occupied extent intersecting the query; both zero means no conflict.
+/// This snapshot neither reserves an address nor authorizes later mutation.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RustosMmConflictBrokerResult {
+    pub start: u64,
+    pub end: u64,
 }
 
 #[repr(C)]
@@ -3704,6 +3815,10 @@ pub struct LinuxSyscallOffloadFastMemRequest {
     pub flags: u64,
     pub fd: u64,
     pub offset: u64,
+    /// Kernel-issued lease ticket binding this request to the caller's exact
+    /// process/MM generations. `syscalld` must echo it on every broker call it
+    /// makes while serving the request.
+    pub ticket: u64,
 }
 
 impl Default for LinuxSyscallOffloadRequest {
@@ -3862,4 +3977,5 @@ crate::user_wire!(RootdMemoryCensusEntry { process_id: u64, parent_process_id: u
 crate::user_wire!(RustosMmLayoutBrokerResult { brk_start: u64, brk_current: u64, brk_mapped_end: u64, mmap_next: u64, user_range_start: u64, user_range_end: u64 });
 crate::user_wire!(RustosMmFdBrokerResult { kind: u16, reserved0: u16, path_len: u32, rights: u64, len: u64, path: [u8; MM_BROKER_PATH_CAPACITY] });
 crate::user_wire!(RustosMmMapBrokerResult { addr: u64, len: u64 });
+crate::user_wire!(RustosMmConflictBrokerResult { start: u64, end: u64 });
 crate::user_wire!(InputDvmRecordWire { transport_generation: u64, flags: u32, len: u16, reserved0: u16, bytes: [u8; INPUTD_DVM_RECORD_BYTES] });

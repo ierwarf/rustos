@@ -221,7 +221,20 @@ impl ProcessAddressSpace {
         start: VirtAddr,
         data: &[u8],
     ) -> Result<(), AddressSpaceError> {
-        // Loader-time initialization has no admission to carry, so it walks.
+        // Loader initialization may bypass PTE write permission, but it must
+        // never bypass the immutable external backing contract.
+        let end = start
+            .as_u64()
+            .checked_add(data.len() as u64)
+            .ok_or(AddressSpaceError::AddressOverflow)?;
+        if !data.is_empty()
+            && self
+                .immutable
+                .iter()
+                .any(|m| start.as_u64() < m.end && end > m.start)
+        {
+            return Err(AddressSpaceError::ProtectionViolation);
+        }
         self.write_user_bytes_from(start, data, None)
     }
 

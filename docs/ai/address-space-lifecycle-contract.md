@@ -398,6 +398,35 @@ the decision with no round trip on the fault.  This is Zircon's split -
 userspace sets the policy, the kernel enforces it - and not seL4's, which
 RustOS could not adopt anyway because it has an in-kernel frame allocator.
 
+### Request lease: who may mutate which MM
+
+`syscalld` owns mapping *policy* (placement, protection, `MAP_FIXED` sequencing);
+it does not own the authority to touch a process. A broker call that selected its
+target by `target_pid` alone could land after the caller timed out, or in the
+image `exec` installed under the same PID, while the original caller would only
+validate the policy reply after those effects.
+
+Owner: `kernel/compat/src/user/syscall/linux/mm_request_lease.rs`. Before the
+IPC call the caller opens a lease `(ticket, pid, process_generation,
+mm_generation)` in a bounded lock-free table (256 slots; exhaustion returns
+`EAGAIN`, never an unbound ticket). The ticket travels in the compact request;
+`syscalld` echoes it in `RustosMmBrokerArgs::ticket`. For each broker operation
+the kernel (1) validates the ticket names a live lease of `target_pid`, (2) holds
+an apply guard for the duration of the effect, (3) performs every effect through
+generation-exact primitives (`with_process_state_by_generation_mut`, and the
+`ExpectedMm` argument of the pager-VMA publish/protect/unmap/conflict functions,
+which re-check under the process-state lock). Closing the lease first retires the
+ticket (no new apply can start) and then waits for appliers that already began,
+so the caller never observes the end of its call mid-effect and nothing lands
+afterward.
+
+Residual, deliberately not hidden: effects applied before a caller times out are
+not rolled back (a timed-out IPC has an unknown outcome, as everywhere else), and
+the policy reply is still validated by the caller after its effects. The
+file-private copy path still performs VFS reads while holding the guard; it is
+the eager contract that pager-backed file mappings replace, and a timed-out
+caller's close waits for that bounded read.
+
 `PagerAnonymousPolicyWire` carries what has moved: the fault-around run
 length, the per-process demand-paging ceiling, the demand-paging toggle, and
 the list of services kept wired.  `pagerd` publishes it through

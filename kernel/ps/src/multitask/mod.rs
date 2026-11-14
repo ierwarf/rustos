@@ -91,7 +91,7 @@ pub use self::current::{
     with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_current_user_process_state_mut, with_fork_parent_state, with_process_state_by_pid,
-    with_process_state_by_pid_mut, ExecRefusal, PagerChargeSnapshot,
+    with_process_state_by_pid_mut, with_process_state_for_teardown_mut, with_process_state_by_generation_mut, ExecRefusal, PagerChargeSnapshot,
 };
 pub use self::pager_fault::{
     cancel_pager_fault, claim_pager_fault_reply_from_pager, consume_pager_fault_reply,
@@ -101,11 +101,12 @@ pub use self::pager_fault::{
     unregister_pager_fault_waiter, PagerFaultReservation, PagerFaultSlotError, PagerFaultState,
 };
 pub use self::pager_vma::{
+    first_mapping_conflict as first_user_mapping_conflict,
     protect_for_process as protect_pager_vma_for_process,
     set_commit_state_for_process as set_pager_vma_commit_state_for_process,
     unmap_for_process as unmap_pager_vma_for_process,
     unmap_for_process_with as unmap_pager_vma_for_process_with, validate_fault_request,
-    with_validated_fault_address_space, PagerFaultInstallPermit, PagerVmaError, PagerVmaSnapshot,
+    with_validated_fault_address_space, ExpectedMm, PagerFaultInstallPermit, PagerVmaError, PagerVmaSnapshot,
 };
 pub use self::process_table::{
     cancel_spawn as cancel_process_spawn, reserve_spawn as reserve_process_spawn,
@@ -186,6 +187,7 @@ pub fn mark_root_idle() {
 pub enum SpawnTaskError {
     InvalidWeightMicros,
     NoFreeTaskSlot,
+    MemoryQuota,
 }
 
 pub use retirement::RetiredTaskCleanup;
@@ -286,6 +288,7 @@ impl SpawnTaskError {
         match self {
             Self::InvalidWeightMicros => "thread weight is outside the supported range",
             Self::NoFreeTaskSlot => "scheduler task table is full",
+            Self::MemoryQuota => "process memory or kernel memory quota exceeded",
         }
     }
 }

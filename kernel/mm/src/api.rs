@@ -73,6 +73,7 @@ pub mod boot {
 }
 
 pub mod paging {
+    pub use crate::memory::address_space::USER_INACCESSIBLE_LEAF;
     pub use crate::memory::paging::*;
 }
 
@@ -85,6 +86,16 @@ pub mod frame_capability {
         preallocate_pager_fault_frames, replenish_pager_fault_frames,
         reserve_preallocated_zeroed_frame_grant, return_pager_fault_frame,
         service_pager_fault_frame_refill, take_frame_grant, take_pager_fault_frame,
+    };
+}
+
+/// Immutable externally supplied page custody; caller authenticates the exact
+/// provider owner and object identity. No I/O or replacement policy lives here.
+pub mod frame_source {
+    pub use crate::memory::frame_source::{
+        FrameSourceError, FrameSourceKey, FrameSourceOwner, FrameSourcePin,
+        MAX_FRAME_SOURCES, pin_frame_source, reclaim_frame_sources, retire_frame_source,
+        retire_frame_sources_for_owner, supply_frame_source,
     };
 }
 

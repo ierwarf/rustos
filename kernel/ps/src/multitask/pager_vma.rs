@@ -46,6 +46,33 @@ use rewrite_epoch::{RangeRewrite, read_rewrite_epoch};
 const MAX_PAGER_VMAS_PER_PROCESS: usize = PAGER_MAX_VMAS_PER_PROCESS;
 const MAX_PUBLICATION_SEQUENCE: u64 = u64::MAX - 3;
 
+/// The exact process and MM incarnation a caller captured before it asked
+/// for a range edit. Scalar PIDs identify nothing across `exec`; an edit that
+/// names an expectation is refused as `Stale` rather than landing in whatever
+/// image now owns the PID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpectedMm {
+    pub process_generation: u32,
+    pub mm_generation: u32,
+}
+
+impl ExpectedMm {
+    pub(super) fn check(
+        expected: Option<Self>,
+        identity: ProcessIdentity,
+    ) -> Result<(), PagerVmaError> {
+        match expected {
+            Some(expected)
+                if expected.process_generation != identity.process_generation()
+                    || expected.mm_generation != identity.mm_generation() =>
+            {
+                Err(PagerVmaError::Stale)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PagerVmaError {
     Malformed,
@@ -1144,6 +1171,7 @@ where
 /// [`unmap_for_process`] returns it.
 pub fn protect_for_process(
     process_id: u64,
+    expected: Option<ExpectedMm>,
     start: u64,
     end: u64,
     prot: u32,
@@ -1152,6 +1180,7 @@ pub fn protect_for_process(
     let retained =
         super::process_table::retain_process_by_pid(process_id).ok_or(PagerVmaError::Stale)?;
     let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
+    ExpectedMm::check(expected, identity)?;
     let page_count = end
         .checked_sub(start)
         .and_then(|bytes| usize::try_from(bytes / PAGER_PAGE_BYTES).ok())
@@ -1179,6 +1208,7 @@ pub fn protect_for_process(
 /// Cleans up pager-owned leaves after a failed mapping publication.
 pub fn unmap_for_process(
     process_id: u64,
+    expected: Option<ExpectedMm>,
     start: u64,
     end: u64,
 ) -> Result<Option<(u64, u64)>, PagerVmaError> {
@@ -1188,6 +1218,7 @@ pub fn unmap_for_process(
         .ok_or(PagerVmaError::Malformed)?;
     unmap_for_process_inner(
         process_id,
+        expected,
         start,
         end,
         false,
@@ -1210,16 +1241,18 @@ pub fn unmap_for_process(
 /// The returned identity names pager publication work, not whether PTE work ran.
 pub fn unmap_for_process_with(
     process_id: u64,
+    expected: Option<ExpectedMm>,
     start: u64,
     end: u64,
     mutate: impl FnOnce(&mut super::UserProcessState) -> Result<(), PagerVmaError>,
     release: impl FnOnce(&mut super::UserProcessState),
 ) -> Result<Option<(u64, u64)>, PagerVmaError> {
-    unmap_for_process_inner(process_id, start, end, true, mutate, release)
+    unmap_for_process_inner(process_id, expected, start, end, true, mutate, release)
 }
 
 fn unmap_for_process_inner(
     process_id: u64,
+    expected: Option<ExpectedMm>,
     start: u64,
     end: u64,
     mutate_without_publication: bool,
@@ -1229,6 +1262,7 @@ fn unmap_for_process_inner(
     let retained =
         super::process_table::retain_process_by_pid(process_id).ok_or(PagerVmaError::Stale)?;
     let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
+    ExpectedMm::check(expected, identity)?;
     let process = retained
         .handle()
         .object_identity()
@@ -1307,6 +1341,64 @@ pub fn set_commit_state_for_process(
         )
     })?;
     Ok(rewritten.then(|| (process.slot(), process.generation())))
+}
+
+/// Reports the first occupied extent intersecting a page-aligned query.
+/// This is advisory geometry, not placement or mapping authority. Ring3 picks
+/// addresses; a later installer must revalidate overlap under its own custody.
+/// Includes demand/PROT_NONE reservations even when they have no leaf PTEs.
+pub fn first_mapping_conflict(
+    process_id: u64,
+    expected: Option<ExpectedMm>,
+    start: u64,
+    end: u64,
+) -> Result<Option<(u64, u64)>, PagerVmaError> {
+    use crate::memory::paging::{USER_SPACE_BASE, USER_SPACE_END_EXCLUSIVE};
+    if start < USER_SPACE_BASE || start >= end || end > USER_SPACE_END_EXCLUSIVE
+        || !start.is_multiple_of(PAGER_PAGE_BYTES) || !end.is_multiple_of(PAGER_PAGE_BYTES)
+    {
+        return Err(PagerVmaError::Malformed);
+    }
+    let retained = super::process_table::retain_process_by_pid(process_id)
+        .ok_or(PagerVmaError::Stale)?;
+    let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
+    ExpectedMm::check(expected, identity)?;
+    let handle = retained.handle();
+    let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
+    retained.with_exact_visible_state_mut(identity, |_, state| {
+        let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
+        let mut first: Option<(u64, u64)> = None;
+        for slot in process_slots(handle).ok_or(PagerVmaError::Stale)? {
+            let Some(region) = slot.snapshot()? else { continue; };
+            if region.start < end && start < region.end
+                && region_matches_identity(region, process.slot(), identity)
+                && first.is_none_or(|old| region.start < old.0)
+            {
+                first = Some((region.start, region.end));
+            }
+        }
+        if first.is_some_and(|range| range.0 <= start) {
+            return Ok(first);
+        }
+        // Process custody excludes destructive PTE edits. Demand faults may
+        // only add leaves within the reservations already checked above.
+        let scan_end = first.map_or(end, |range| range.0.min(end));
+        let count = usize::try_from((scan_end - start) / PAGER_PAGE_BYTES)
+            .map_err(|_| PagerVmaError::Malformed)?;
+        let space = state.address_space();
+        let mapped = space.first_mapped_user_page(x86_64::VirtAddr::new(start), count)
+            .map_err(|_| PagerVmaError::Stale)?;
+        if let Some(mapped) = mapped {
+            // Skip a dense image/data extent in one sparse walk, rather than
+            // forcing a service to issue one native query per occupied page.
+            let count = usize::try_from((USER_SPACE_END_EXCLUSIVE - mapped.as_u64()) / PAGER_PAGE_BYTES)
+                .map_err(|_| PagerVmaError::Malformed)?;
+            let gap = space.first_unmapped_user_page(mapped, count)
+                .map_err(|_| PagerVmaError::Stale)?;
+            return Ok(Some((mapped.as_u64(), gap.map_or(USER_SPACE_END_EXCLUSIVE, |v| v.as_u64()))));
+        }
+        Ok(first)
+    }).ok_or(PagerVmaError::Stale)?
 }
 
 /// Returns every region this process has published as one stable reading.

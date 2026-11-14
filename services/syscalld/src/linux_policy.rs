@@ -23,12 +23,12 @@ use core::mem::size_of;
 
 use rustos_user_abi::syscall::{
     LinuxRlimit, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxUtsName,
-    RustosMmBrokerArgs, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
-    RustosMmMapBrokerResult, LINUX_DEFAULT_STACK_RLIMIT_BYTES, LINUX_RLIMIT_SIZE,
-    MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE, MM_BROKER_FD_KIND_DISPLAY_SURFACE,
-    MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD, MM_BROKER_OP_DESCRIBE_FD,
+    RustosMmBrokerArgs, RustosMmConflictBrokerResult, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
+    RustosMmLibraryBindBrokerResult, RustosMmMapBrokerResult, LINUX_DEFAULT_STACK_RLIMIT_BYTES, LINUX_RLIMIT_SIZE,
+    MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE, MM_BROKER_FD_KIND_DEVICE_BUFFER, MM_BROKER_FD_KIND_DISPLAY_SURFACE,
+    MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD, MM_BROKER_OP_BIND_LIBRARY, MM_BROKER_OP_DESCRIBE_FD,
     MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED, MM_BROKER_OP_MAP_FILE_PRIVATE,
-    MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT,
+    MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_QUERY_CONFLICT,
     MM_BROKER_OP_UNMAP, PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
     SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, SYS_RUSTOS_ENTROPY_BROKER, SYS_RUSTOS_MM_BROKER,
 };
@@ -36,7 +36,7 @@ use spin::Mutex;
 
 use crate::errno;
 use crate::mmap_policy::{
-    parse_mmap_sharing, plan_mmap, MmapFdKind, MmapPlan, MmapPlanError, MAP_PRIVATE,
+    library_bind_candidate, parse_mmap_sharing, plan_mmap, MmapFdKind, MmapPlan, MmapPlanError, MAP_PRIVATE,
 };
 use crate::vma_policy::{next_fit_with_wrap, AddressRange, VmaEntry, VmaMap};
 
@@ -181,6 +181,24 @@ impl VmaEntry for MmVma {
 /// state is always consistent with the live address space. The receive loop is
 /// single threaded; a second concurrent lease for the same pid would rebuild
 /// from the kernel layout, which is why no handler yields while holding one.
+/// The process a request mutates plus the kernel-issued ticket proving that
+/// request is still live. Every MM broker call echoes the ticket; the kernel
+/// refuses operations whose ticket is absent, stale, or another process's.
+#[derive(Clone, Copy)]
+struct MmTarget {
+    pid: u64,
+    ticket: u64,
+}
+
+impl MmTarget {
+    /// Address-space requests carry the ticket in `arg3` (see
+    /// `expand_mem_request`); a full-form request has none and is refused by
+    /// the kernel rather than served unbound.
+    fn of(request: &LinuxSyscallOffloadRequest) -> Self {
+        Self { pid: request.pid, ticket: request.arg3 }
+    }
+}
+
 struct MmLease {
     pid: u64,
     state: Option<MmPolicyState>,
@@ -720,7 +738,7 @@ pub(crate) fn handle_brk(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
-    let mut state = match mm_state_for(request.pid) {
+    let mut state = match mm_state_for(MmTarget::of(request)) {
         Ok(state) => state,
         Err(errno) => {
             response.status = errno;
@@ -748,7 +766,7 @@ pub(crate) fn handle_brk(
     if requested_end > state.brk_mapped_end {
         let delta = requested_end - state.brk_mapped_end;
         if broker_simple(
-            request.pid,
+            MmTarget::of(request),
             MM_BROKER_OP_MAP_ANON,
             state.brk_mapped_end,
             delta,
@@ -784,7 +802,7 @@ pub(crate) fn handle_mmap(
         return;
     }
 
-    let mut state = match mm_state_for(request.pid) {
+    let mut state = match mm_state_for(MmTarget::of(request)) {
         Ok(state) => state,
         Err(errno) => {
             response.status = errno;
@@ -828,7 +846,7 @@ pub(crate) fn handle_mmap(
         }
         requested_addr
     } else {
-        match find_free_region(&state, requested_addr, map_len) {
+        match find_current_free_region(MmTarget::of(request), &state, requested_addr, map_len) {
             Ok(addr) => addr,
             Err(errno) => {
                 response.status = errno;
@@ -850,7 +868,7 @@ pub(crate) fn handle_mmap(
         }
     };
     let fd_kind = if !anonymous {
-        let fd_info = match describe_fd(request.pid, fd) {
+        let fd_info = match describe_fd(MmTarget::of(request), fd) {
             Ok(info) => info,
             Err(errno) => {
                 response.status = errno;
@@ -862,6 +880,7 @@ pub(crate) fn handle_mmap(
             MM_BROKER_FD_KIND_MEMFD => MmapFdKind::Memfd,
             MM_BROKER_FD_KIND_DISPLAY_SURFACE => MmapFdKind::DisplaySurface,
             MM_BROKER_FD_KIND_DEVICE => MmapFdKind::Device,
+            MM_BROKER_FD_KIND_DEVICE_BUFFER => MmapFdKind::DeviceBuffer,
             _ => MmapFdKind::Other,
         })
     } else {
@@ -881,7 +900,7 @@ pub(crate) fn handle_mmap(
 
     if fixed {
         if let Err(errno) = replace_fixed_range_after_prevalidation(
-            request.pid,
+            MmTarget::of(request),
             &mut state,
             addr,
             addr + map_len,
@@ -914,7 +933,15 @@ pub(crate) fn handle_mmap(
         MmapPlan::DeviceShared => (MM_BROKER_OP_MAP_DEVICE_SHARED, MmVmaKind::DeviceShared),
     };
 
-    match broker_map(request.pid, op, addr, map_len, prot, flags, fd, offset) {
+    if library_bind_candidate(plan, prot, offset) {
+        // Advisory: the kernel binds this description to a sealed shared
+        // library object only after vfsd attests its backing file, and the map
+        // below aliases that object's frames. Any refusal or failure here is
+        // "not eligible", never an mmap error; the eager copy path is exact.
+        let _ = broker_bind_library(MmTarget::of(request), fd);
+    }
+
+    match broker_map(MmTarget::of(request), op, addr, map_len, prot, flags, fd, offset) {
         Ok(mapped_addr) => {
             insert_vma(
                 &mut state,
@@ -957,7 +984,7 @@ pub(crate) fn handle_mprotect(
         response.status = errno;
         return;
     }
-    let mut state = match mm_state_for(request.pid) {
+    let mut state = match mm_state_for(MmTarget::of(request)) {
         Ok(state) => state,
         Err(errno) => {
             response.status = errno;
@@ -981,7 +1008,7 @@ pub(crate) fn handle_mprotect(
         // which works on the live page tables; if the range isn't mapped the
         // kernel will return an error and we propagate it.
         if let Err(errno) = broker_simple(
-            request.pid,
+            MmTarget::of(request),
             MM_BROKER_OP_PROTECT,
             start,
             map_len,
@@ -999,7 +1026,7 @@ pub(crate) fn handle_mprotect(
     for (seg_start, seg_end) in &reserved_segments {
         if prot != 0 {
             if let Err(errno) = broker_simple(
-                request.pid,
+                MmTarget::of(request),
                 MM_BROKER_OP_MAP_ANON,
                 *seg_start,
                 seg_end - seg_start,
@@ -1015,7 +1042,7 @@ pub(crate) fn handle_mprotect(
     }
     if prot != 0 {
         if let Err(errno) = broker_simple(
-            request.pid,
+            MmTarget::of(request),
             MM_BROKER_OP_PROTECT,
             start,
             map_len,
@@ -1030,7 +1057,7 @@ pub(crate) fn handle_mprotect(
     } else {
         for (seg_start, seg_end) in nonreserved_segments(&state, start, end) {
             if let Err(errno) = broker_simple(
-                request.pid,
+                MmTarget::of(request),
                 MM_BROKER_OP_PROTECT,
                 seg_start,
                 seg_end - seg_start,
@@ -1066,7 +1093,7 @@ pub(crate) fn handle_munmap(
             return;
         }
     };
-    let mut state = match mm_state_for(request.pid) {
+    let mut state = match mm_state_for(MmTarget::of(request)) {
         Ok(state) => state,
         Err(errno) => {
             response.status = errno;
@@ -1080,7 +1107,7 @@ pub(crate) fn handle_munmap(
             return;
         }
     };
-    match unmap_populated_range(request.pid, &mut state, start, end) {
+    match unmap_populated_range(MmTarget::of(request), &mut state, start, end) {
         Ok(()) => {
             response.status = 0;
             response.payload_len = 0;
@@ -1089,7 +1116,8 @@ pub(crate) fn handle_munmap(
     }
 }
 
-fn mm_state_for(pid: u64) -> Result<MmLease, i32> {
+fn mm_state_for(target: MmTarget) -> Result<MmLease, i32> {
+    let pid = target.pid;
     let stored = mm_db().lock().remove(&pid);
     if let Some(state) = stored {
         return Ok(MmLease { pid, state: Some(state) });
@@ -1099,6 +1127,7 @@ fn mm_state_for(pid: u64) -> Result<MmLease, i32> {
         abi_version: MM_BROKER_ABI_VERSION,
         op: MM_BROKER_OP_QUERY_LAYOUT,
         target_pid: pid,
+        ticket: target.ticket,
         out_ptr: (&mut layout as *mut RustosMmLayoutBrokerResult) as u64,
         out_len: size_of::<RustosMmLayoutBrokerResult>() as u64,
         ..RustosMmBrokerArgs::default()
@@ -1138,12 +1167,29 @@ fn save_mm_state(pid: u64, state: MmPolicyState) {
     mm_db().lock().insert(pid, state);
 }
 
-fn describe_fd(pid: u64, fd: u64) -> Result<RustosMmFdBrokerResult, i32> {
+fn broker_bind_library(target: MmTarget, fd: u64) -> Result<bool, i32> {
+    let mut result = RustosMmLibraryBindBrokerResult::default();
+    let args = RustosMmBrokerArgs {
+        abi_version: MM_BROKER_ABI_VERSION,
+        op: MM_BROKER_OP_BIND_LIBRARY,
+        target_pid: target.pid,
+        ticket: target.ticket,
+        fd,
+        out_ptr: (&mut result as *mut RustosMmLibraryBindBrokerResult) as u64,
+        out_len: size_of::<RustosMmLibraryBindBrokerResult>() as u64,
+        ..RustosMmBrokerArgs::default()
+    };
+    mm_broker_call(&args)?;
+    Ok(result.bound != 0)
+}
+
+fn describe_fd(target: MmTarget, fd: u64) -> Result<RustosMmFdBrokerResult, i32> {
     let mut info = RustosMmFdBrokerResult::default();
     let args = RustosMmBrokerArgs {
         abi_version: MM_BROKER_ABI_VERSION,
         op: MM_BROKER_OP_DESCRIBE_FD,
-        target_pid: pid,
+        target_pid: target.pid,
+        ticket: target.ticket,
         fd,
         out_ptr: (&mut info as *mut RustosMmFdBrokerResult) as u64,
         out_len: size_of::<RustosMmFdBrokerResult>() as u64,
@@ -1155,7 +1201,7 @@ fn describe_fd(pid: u64, fd: u64) -> Result<RustosMmFdBrokerResult, i32> {
 
 #[allow(clippy::too_many_arguments)]
 fn broker_simple(
-    pid: u64,
+    target: MmTarget,
     op: u16,
     addr: u64,
     len: u64,
@@ -1167,7 +1213,8 @@ fn broker_simple(
     let args = RustosMmBrokerArgs {
         abi_version: MM_BROKER_ABI_VERSION,
         op,
-        target_pid: pid,
+        target_pid: target.pid,
+        ticket: target.ticket,
         addr,
         len,
         prot,
@@ -1181,7 +1228,7 @@ fn broker_simple(
 
 #[allow(clippy::too_many_arguments)]
 fn broker_map(
-    pid: u64,
+    target: MmTarget,
     op: u16,
     addr: u64,
     len: u64,
@@ -1194,7 +1241,8 @@ fn broker_map(
     let args = RustosMmBrokerArgs {
         abi_version: MM_BROKER_ABI_VERSION,
         op,
-        target_pid: pid,
+        target_pid: target.pid,
+        ticket: target.ticket,
         addr,
         len,
         prot,
@@ -1210,7 +1258,7 @@ fn broker_map(
 }
 
 fn unmap_populated_range(
-    pid: u64,
+    target: MmTarget,
     state: &mut MmPolicyState,
     start: u64,
     end: u64,
@@ -1219,7 +1267,7 @@ fn unmap_populated_range(
         // One complete sparse/mixed interval, not one mutation per VMA.
         // Ring0 preflights every present leaf before removing any prefix.
         broker_simple(
-            pid,
+            target,
             MM_BROKER_OP_UNMAP,
             start,
             end - start,
@@ -1243,7 +1291,7 @@ fn unmap_range_with(
 }
 
 fn replace_fixed_range_after_prevalidation(
-    pid: u64,
+    target: MmTarget,
     state: &mut MmPolicyState,
     start: u64,
     end: u64,
@@ -1251,7 +1299,7 @@ fn replace_fixed_range_after_prevalidation(
 ) -> Result<(), i32> {
     // `state` is the request's lease: a completed unmap that is followed by a
     // refused replacement mapping is stored as a hole when the lease drops.
-    unmap_populated_range(pid, state, start, end)
+    unmap_populated_range(target, state, start, end)
 }
 
 fn mm_broker_call(args: &RustosMmBrokerArgs) -> Result<(), i32> {
@@ -1308,6 +1356,53 @@ fn align_up(value: u64) -> Option<u64> {
     value
         .checked_add(PAGE_SIZE - 1)
         .map(|value| value & !(PAGE_SIZE - 1))
+}
+
+fn find_current_free_region(target: MmTarget, state: &MmPolicyState, requested: u64, len: u64) -> Result<u64, i32> {
+    choose_free_region_with_conflicts(state, requested, len, |address| {
+        let mut result = RustosMmConflictBrokerResult::default();
+        let args = RustosMmBrokerArgs {
+            abi_version: MM_BROKER_ABI_VERSION,
+            op: MM_BROKER_OP_QUERY_CONFLICT,
+            target_pid: target.pid,
+            ticket: target.ticket,
+            addr: address,
+            len,
+            out_ptr: (&mut result as *mut RustosMmConflictBrokerResult) as u64,
+            out_len: size_of::<RustosMmConflictBrokerResult>() as u64,
+            ..RustosMmBrokerArgs::default()
+        };
+        mm_broker_call(&args)?;
+        if result.start == 0 && result.end == 0 { Ok(None) }
+        else { Ok(Some((result.start, result.end))) }
+    })
+}
+
+/// Policy remains here. Native queries report geometry only; they do not
+/// reserve this selection or replace the installer's final overlap check.
+fn choose_free_region_with_conflicts(
+    state: &MmPolicyState,
+    requested: u64,
+    len: u64,
+    mut query: impl FnMut(u64) -> Result<Option<(u64, u64)>, i32>,
+) -> Result<u64, i32> {
+    let first = find_free_region(state, requested, len)?;
+    let mut candidate = first;
+    let mut wrapped = false;
+    loop {
+        let Some((start, end)) = query(candidate)? else { return Ok(candidate); };
+        let limit = candidate.checked_add(len).ok_or(errno::ENOMEM)?;
+        if start >= end || end <= candidate || start >= limit
+            || !start.is_multiple_of(PAGE_SIZE) || !end.is_multiple_of(PAGE_SIZE)
+        { return Err(errno::EIO); }
+        let next = find_free_region(state, end, len)?;
+        if next <= candidate {
+            if wrapped { return Err(errno::ENOMEM); }
+            wrapped = true;
+        }
+        if wrapped && next >= first { return Err(errno::ENOMEM); }
+        candidate = next;
+    }
 }
 
 fn find_free_region(state: &MmPolicyState, requested: u64, len: u64) -> Result<u64, i32> {
@@ -1642,14 +1737,14 @@ mod tests {
         );
         save_mm_state(pid, seed);
         {
-            let mut lease = mm_state_for(pid).unwrap();
+            let mut lease = mm_state_for(MmTarget { pid, ticket: 1 }).unwrap();
             assert!(mm_db().lock().get(&pid).is_none(), "state moves, not copies");
             // A fixed unmap completed, then the replacement map was refused.
             let result: Result<(), i32> =
                 unmap_range_with(&mut lease, 0x4000, 0x6000, |_, _| Ok(()));
             assert_eq!(result, Ok(()));
         }
-        let lease = mm_state_for(pid).unwrap();
+        let lease = mm_state_for(MmTarget { pid, ticket: 1 }).unwrap();
         assert!(lease.vmas.is_empty(), "the hole was persisted by the lease");
         drop(lease);
         handle_process_exit_pid(pid);

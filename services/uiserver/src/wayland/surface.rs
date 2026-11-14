@@ -39,7 +39,14 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
         data_init: &mut DataInit<'_, Self>,
     ) {
         match request {
-            wl_surface::Request::Attach { buffer, .. } => {
+            wl_surface::Request::Attach { buffer, x, y } => {
+                if resource.version() >= 5 && (x != 0 || y != 0) {
+                    resource.post_error(
+                        wl_surface::Error::InvalidOffset,
+                        "attach offset requires wl_surface.offset".to_string(),
+                    );
+                    return;
+                }
                 let pending = buffer.and_then(|buffer| {
                     let data = buffer.data::<BufferData>().cloned()?;
                     Some(BufferAttachment {
@@ -49,6 +56,9 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                 });
                 if let Ok(mut surface) = data.shared.lock() {
                     surface.pending_buffer = Some(pending);
+                    if resource.version() < 5 {
+                        surface.pending_offset = (x, y);
+                    }
                 }
             }
             wl_surface::Request::Frame { callback } => {
@@ -121,6 +131,32 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                     }
                 }
             }
+            wl_surface::Request::Offset { x, y } => {
+                if let Ok(mut surface) = data.shared.lock() {
+                    surface.pending_offset = (x, y);
+                }
+            }
+            wl_surface::Request::SetBufferScale { scale } => {
+                if scale <= 0 {
+                    resource.post_error(
+                        wl_surface::Error::InvalidScale,
+                        "buffer scale must be positive".to_string(),
+                    );
+                } else if let Ok(mut surface) = data.shared.lock() {
+                    surface.pending_buffer_mapping.scale = scale as usize;
+                }
+            }
+            wl_surface::Request::SetBufferTransform { transform } => match transform {
+                WEnum::Value(value) => {
+                    if let Ok(mut surface) = data.shared.lock() {
+                        surface.pending_buffer_mapping.transform = value as u32;
+                    }
+                }
+                WEnum::Unknown(_) => resource.post_error(
+                    wl_surface::Error::InvalidTransform,
+                    "invalid buffer transform".to_string(),
+                ),
+            },
             wl_surface::Request::Commit => state.commit_surface(resource, data),
             _ => {}
         }

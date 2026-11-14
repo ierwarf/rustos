@@ -13,13 +13,18 @@ use rustos_user_abi::pager::{PagerEndpointCapabilityWire, VM_PROT_READ};
 use rustos_user_abi::syscall::{ServiceCapability,
     IPC_SERVICE_PAGERD, PAGER_FAULT_RENDEZVOUS_ABI_VERSION,
     RustosPagerFaultReplyArgs, RustosPagerFaultWaitArgs, SYS_RUSTOS_PAGER_FAULT_REPLY,
-    SYS_RUSTOS_PAGER_FAULT_WAIT,
+    SYS_RUSTOS_PAGER_FAULT_WAIT, SYS_RUSTOS_FRAME_SOURCE, SYS_RUSTOS_LIBRARY_OBJECT,
+    SYS_RUSTOS_LIBRARY_MAP_PROBE,
 };
 
 pub(super) const fn is_pager_fault_syscall(number: u64) -> bool {
     matches!(
         number,
-        SYS_RUSTOS_PAGER_FAULT_WAIT | SYS_RUSTOS_PAGER_FAULT_REPLY
+        SYS_RUSTOS_PAGER_FAULT_WAIT
+            | SYS_RUSTOS_PAGER_FAULT_REPLY
+            | SYS_RUSTOS_FRAME_SOURCE
+            | SYS_RUSTOS_LIBRARY_OBJECT
+            | SYS_RUSTOS_LIBRARY_MAP_PROBE
     )
 }
 
@@ -27,6 +32,9 @@ pub(super) fn dispatch_pager_fault_syscall(number: u64, args: u64) -> u64 {
     match number {
         SYS_RUSTOS_PAGER_FAULT_WAIT => syscall_linux_rustos_pager_fault_wait(args),
         SYS_RUSTOS_PAGER_FAULT_REPLY => syscall_linux_rustos_pager_fault_reply(args),
+        SYS_RUSTOS_FRAME_SOURCE => super::frame_source_ops::control(args),
+        SYS_RUSTOS_LIBRARY_OBJECT => super::library_object_ops::control(args),
+        SYS_RUSTOS_LIBRARY_MAP_PROBE => super::library_map_probe_ops::control(args),
         _ => linux_errno(LINUX_ENOSYS),
     }
 }

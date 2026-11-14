@@ -87,11 +87,28 @@ pub(crate) fn clamp_console_window_rect(width: u32, height: u32, rect: Rect) -> 
 pub(crate) fn wayland_window_outer_rect(window: &WaylandWindowSnapshot) -> Rect {
     let client_w = window.width.min(window.frame.width);
     let client_h = window.height.min(window.frame.height);
-    layout_wayland_outer_rect(window.frame.x, window.frame.y, client_w, client_h)
+    if window.server_decoration {
+        layout_wayland_outer_rect(window.frame.x, window.frame.y, client_w, client_h)
+    } else {
+        Rect {
+            x: window.frame.x,
+            y: window.frame.y,
+            width: client_w,
+            height: client_h,
+        }
+    }
 }
 
 pub(crate) fn wayland_window_client_rect(outer: Rect) -> Rect {
     layout_wayland_client_rect(outer)
+}
+
+pub(crate) fn wayland_window_client_rect_for(window: &WaylandWindowSnapshot, outer: Rect) -> Rect {
+    if window.server_decoration {
+        wayland_window_client_rect(outer)
+    } else {
+        outer
+    }
 }
 
 pub(crate) fn wayland_window_damage_rect(window: &WaylandWindowSnapshot, damage: Rect) -> Rect {
@@ -99,7 +116,7 @@ pub(crate) fn wayland_window_damage_rect(window: &WaylandWindowSnapshot, damage:
         return Rect::empty();
     }
 
-    let client = wayland_window_client_rect(wayland_window_outer_rect(window));
+    let client = wayland_window_client_rect_for(window, wayland_window_outer_rect(window));
     Rect {
         x: client.x.saturating_add(damage.x),
         y: client.y.saturating_add(damage.y),
@@ -314,12 +331,20 @@ fn build_full_gpu_atlas_scene(
     for (plan_index, planned) in plan.iter().enumerate().rev() {
         let mut scratch = Vec::with_capacity(1);
         let source_rect = match *planned {
-            PlannedWindow::Wayland { index, focused } => {
-                push_wayland_gpu_layer(&mut packer, &mut scratch, atlas, &state.wayland_windows[index], focused)?
-            }
-            PlannedWindow::Console { index, focused } => {
-                push_console_gpu_layer(&mut packer, &mut scratch, atlas, &mut state.console_windows[index], focused)?
-            }
+            PlannedWindow::Wayland { index, focused } => push_wayland_gpu_layer(
+                &mut packer,
+                &mut scratch,
+                atlas,
+                &state.wayland_windows[index],
+                focused,
+            )?,
+            PlannedWindow::Console { index, focused } => push_console_gpu_layer(
+                &mut packer,
+                &mut scratch,
+                atlas,
+                &mut state.console_windows[index],
+                focused,
+            )?,
         };
         if let (Some(source_rect), Some(layer)) = (source_rect, scratch.pop()) {
             placed[plan_index] = Some(PlacedWindowLayer { layer, source_rect });
@@ -449,6 +474,7 @@ pub(crate) fn gpu_scene_reuse_signature(state: &AppState) -> u64 {
         mix(window.frame.width as u64);
         mix(window.frame.height as u64);
         mix(window.minimized as u64);
+        mix(window.server_decoration as u64);
         for byte in window.title.as_bytes() {
             mix(u64::from(*byte));
         }
@@ -617,13 +643,26 @@ pub(crate) fn update_wayland_gpu_textures(
             let pixels = render_wayland_gpu_texture(window, binding.focused)?;
             let mut packer =
                 GpuAtlasPacker::new(atlas_pixels, atlas_width, atlas_height, atlas_stride_pixels)?;
-            packer.write_xrgb_at(
-                binding.source_rect,
-                pixels.as_slice(),
-                binding.source_rect.width,
-            )?;
-            let (atlas_pixels, stride) = packer.pixels_mut();
-            apply_atlas_window_alpha(atlas_pixels, stride, binding.source_rect, binding.focused)?;
+            if window.server_decoration {
+                packer.write_xrgb_at(
+                    binding.source_rect,
+                    pixels.as_slice(),
+                    binding.source_rect.width,
+                )?;
+                let (atlas_pixels, stride) = packer.pixels_mut();
+                apply_atlas_window_alpha(
+                    atlas_pixels,
+                    stride,
+                    binding.source_rect,
+                    binding.focused,
+                )?;
+            } else {
+                packer.write_bgra_at(
+                    binding.source_rect,
+                    pixels.as_slice(),
+                    binding.source_rect.width,
+                )?;
+            }
             damage.push(padded_atlas_rect(
                 binding.source_rect,
                 atlas_width,
@@ -746,7 +785,7 @@ fn copy_opaque_wayland_damage_to_atlas(
         width: source_rect.width,
         height: source_rect.height,
     };
-    let local_client = wayland_window_client_rect(local_outer);
+    let local_client = wayland_window_client_rect_for(window, local_outer);
     let visible = Rect {
         x: 0,
         y: 0,
@@ -1005,7 +1044,12 @@ fn render_dock_gpu_texture(state: &AppState) -> Result<(Rect, Vec<u32>), GpuScen
                 window.minimized,
             );
         }
-        for (index, window) in state.wayland_windows.iter().enumerate() {
+        for (index, window) in state
+            .wayland_windows
+            .iter()
+            .filter(|window| !window.drag_icon)
+            .enumerate()
+        {
             let rect = taskbar_slot_rect(
                 state.surface.width,
                 state.surface.height,
@@ -1134,9 +1178,13 @@ fn push_wayland_gpu_layer(
     }
     let source_rect = packer.reserve(outer.width, outer.height)?;
     let pixels = render_wayland_gpu_texture(window, focused)?;
-    packer.write_xrgb_at(source_rect, &pixels, outer.width)?;
-    let (atlas_pixels, stride) = packer.pixels_mut();
-    apply_atlas_window_alpha(atlas_pixels, stride, source_rect, focused)?;
+    if window.server_decoration {
+        packer.write_xrgb_at(source_rect, &pixels, outer.width)?;
+        let (atlas_pixels, stride) = packer.pixels_mut();
+        apply_atlas_window_alpha(atlas_pixels, stride, source_rect, focused)?;
+    } else {
+        packer.write_bgra_at(source_rect, &pixels, outer.width)?;
+    }
     layers.push(GpuSceneLayer {
         destination: outer,
         opacity: u8::MAX,
@@ -1159,13 +1207,28 @@ fn render_wayland_gpu_texture(
     if outer.is_empty() {
         return Err(GpuSceneError::InvalidLayer);
     }
+    if !window.server_decoration {
+        let mut pixels = Vec::with_capacity(outer.width.saturating_mul(outer.height));
+        for y in 0..outer.height {
+            let start = y
+                .checked_mul(window.stride_pixels)
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            pixels.extend_from_slice(
+                window
+                    .pixels
+                    .get(start..start + outer.width)
+                    .ok_or(GpuSceneError::InvalidLayer)?,
+            );
+        }
+        return Ok(pixels);
+    }
     let local_outer = Rect {
         x: 0,
         y: 0,
         width: outer.width,
         height: outer.height,
     };
-    let local_client = wayland_window_client_rect(local_outer);
+    let local_client = wayland_window_client_rect_for(window, local_outer);
     let pixel_count = outer
         .width
         .checked_mul(outer.height)
@@ -1364,7 +1427,11 @@ fn render_scene(
             );
         }
     }
-    for (index, window) in wayland_windows.iter().enumerate() {
+    for (index, window) in wayland_windows
+        .iter()
+        .filter(|window| !window.drag_icon)
+        .enumerate()
+    {
         let rect = taskbar_slot_rect(width, height, console_windows.len().saturating_add(index));
         if rect_intersects_clip(clip_rect, shadow_bounds(rect, 2)) {
             let title = if window.title.is_empty() {

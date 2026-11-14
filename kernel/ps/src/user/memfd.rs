@@ -12,8 +12,18 @@
 //!   object state and frame ownership intact.
 //! - **Forbidden:** No policy fallback, W+X widening, seal rollback, cursor
 //!   sharing across distinct open descriptions, or frame reuse before release.
+//! - **Accounting:** each backing frame is one page of the resident-page
+//!   charge group of the Job that created the memfd (`charge_group`, recorded
+//!   once at creation; none means unaccounted). A page is reserved before its
+//!   frame is allocated and refunded on allocation failure, staged-grow
+//!   rollback, shrink and exactly once in the object's `Drop`. The reservation
+//!   itself keeps the group slot from being reused while frames exist (the Job
+//!   layer waits for usage to drain). Shared mappings of a memfd map external
+//!   leaves, which the root's data-leaf ledger does not count, so this
+//!   object-level charge is the only one for them; immutable executable
+//!   backing leases additionally bill the retaining root (separate custody).
 //! - **Evidence:** `memory-map`, `physical-frame-lifecycle`,
-//!   `vfs-open-description`.
+//!   `vfs-open-description`, `memory-charge-conservation`.
 // RING3-MIGRATION-REFERENCE START: memfd-kernel-substrate exception:
 // syscalld validates memfd_create policy and pagerd/mm broker owns mapping
 // admission. Ring0 keeps fd-local cursor, seal enforcement, physical frame
@@ -21,13 +31,19 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+#[cfg(not(test))]
 use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Mutex;
+#[cfg(not(test))]
 use x86_64::PhysAddr;
 
-use crate::memory::{kernel_vm, phys};
+use kernel_mm::api::charge;
+
+use crate::memory::kernel_vm;
+#[cfg(not(test))]
+use crate::memory::phys;
 use crate::user::handles::{FileHandleSeekError, FileHandleSeekWhence};
 use crate::user::linux as linux_abi;
 
@@ -55,6 +71,8 @@ struct MemfdState {
 #[derive(Debug)]
 struct MemfdObject {
     object_id: u64,
+    /// Resident-page charge group of the creating Job; immutable for life.
+    charge_group: Option<usize>,
     state: Mutex<MemfdState>,
 }
 
@@ -81,7 +99,9 @@ pub struct MemfdMappingHold {
 }
 
 impl MemfdHandle {
-    pub fn new(name: String, allow_sealing: bool) -> Self {
+    /// Creates an empty memfd whose backing frames are charged to
+    /// `charge_group` (the creating Job's resident-page group), if any.
+    pub fn new(name: String, allow_sealing: bool, charge_group: Option<usize>) -> Self {
         let initial_seals = if allow_sealing {
             0
         } else {
@@ -89,6 +109,7 @@ impl MemfdHandle {
         };
         let object = Arc::new(MemfdObject {
             object_id: allocate_memfd_object_id(),
+            charge_group,
             state: Mutex::new(MemfdState {
                 name,
                 len: 0,
@@ -195,9 +216,11 @@ impl MemfdHandle {
             }
             let keep_pages = len.div_ceil(PAGE_SIZE);
             let released = state.frames.split_off(keep_pages);
+            let released_pages = released.len();
             for frame_phys in released {
-                phys::free_frame(PhysAddr::new(frame_phys));
+                free_backing_frame(frame_phys);
             }
+            refund_pages(object.charge_group, released_pages);
             // The last kept page still holds the old bytes past the new end.
             // A later grow (or a write after a seek beyond EOF) must observe
             // zeros there, as ftruncate(2) specifies, not the stale contents.
@@ -205,16 +228,7 @@ impl MemfdHandle {
             if tail != 0
                 && let Some(&last_frame) = state.frames.last()
             {
-                // SAFETY: the frame is owned by this object and retained under
-                // the object-state lock; the direct map covers the whole page
-                // and `tail..PAGE_SIZE` stays inside it.
-                unsafe {
-                    ptr::write_bytes(
-                        (kernel_vm::higher_half_addr(last_frame) as *mut u8).add(tail),
-                        0,
-                        PAGE_SIZE - tail,
-                    );
-                }
+                zero_frame_tail(last_frame, tail);
             }
             state.len = len;
             return Ok(());
@@ -282,7 +296,10 @@ impl MemfdHandle {
 
         let start_page = offset / PAGE_SIZE;
         let end_page = end.div_ceil(PAGE_SIZE);
-        let frames = state.frames[start_page..end_page].to_vec();
+        let mut frames = Vec::new();
+        frames.try_reserve_exact(end_page - start_page)
+            .map_err(|_| MemfdError::NoMemory)?;
+        frames.extend_from_slice(&state.frames[start_page..end_page]);
         let (mapping_count, writable_mapping_count) =
             next_mapping_counts(state.mapping_count, state.writable_mapping_count, writable)?;
         state.mapping_count = mapping_count;
@@ -307,6 +324,11 @@ impl MemfdMappingHold {
     /// never recycled, so an unmap/remap cannot alias a sleeping futex key.
     pub fn object_id(&self) -> u64 {
         self.token.object.object_id
+    }
+
+    /// Number of frames pinned by the complete object behind this hold.
+    pub fn resident_pages(&self) -> u64 {
+        self.token.object.state.lock().frames.len() as u64
     }
 
     /// Whether this mapping was admitted writable. A mapping admitted
@@ -345,9 +367,11 @@ impl Drop for MemfdMappingToken {
 impl Drop for MemfdObject {
     fn drop(&mut self) {
         let state = self.state.get_mut();
+        let pages = state.frames.len();
         for frame_phys in state.frames.drain(..) {
-            phys::free_frame(PhysAddr::new(frame_phys));
+            free_backing_frame(frame_phys);
         }
+        refund_pages(self.charge_group, pages);
     }
 }
 
@@ -379,29 +403,39 @@ fn next_mapping_counts(
 
 /// Zero-filled frames allocated outside the object lock. Dropping them frees
 /// any frame that was not installed, so every early return releases its pages.
-struct StagedFrames(Vec<u64>);
+struct StagedFrames {
+    frames: Vec<u64>,
+    /// Group each staged frame is charged to; refunded when a frame is freed
+    /// here. Frames moved into the object take their charge with them.
+    group: Option<usize>,
+}
 
 impl StagedFrames {
     /// Allocates and zeroes `count` frames without holding any lock, so a large
     /// grow never stalls readers, mappers or sealers of the same object.
-    fn zeroed(count: usize) -> Result<Self, MemfdError> {
-        let mut staged = Self(Vec::new());
-        staged.0.try_reserve_exact(count).map_err(|_| MemfdError::NoMemory)?;
+    fn zeroed(count: usize, group: Option<usize>) -> Result<Self, MemfdError> {
+        let mut staged = Self {
+            frames: Vec::new(),
+            group,
+        };
+        staged
+            .frames
+            .try_reserve_exact(count)
+            .map_err(|_| MemfdError::NoMemory)?;
         for _ in 0..count {
-            let frame_phys = phys::alloc_frame_user().ok_or(MemfdError::NoMemory)?;
-            // The frame is recorded before it is touched so a failure below
-            // cannot leak it.
-            staged.0.push(frame_phys.as_u64());
-            // SAFETY: the freshly allocated frame is exclusively owned by this
-            // staging buffer, the higher-half direct map covers one complete
-            // page, and nothing publishes the frame until it is installed.
-            unsafe {
-                ptr::write_bytes(
-                    kernel_vm::higher_half_addr(frame_phys.as_u64()) as *mut u8,
-                    0,
-                    PAGE_SIZE,
-                );
+            // Reserve the page before allocating so a Job at its limit never
+            // takes a frame; a failed allocation returns the reservation.
+            if !try_charge_page(group) {
+                return Err(MemfdError::NoMemory);
             }
+            let Some(frame_phys) = alloc_backing_frame() else {
+                refund_pages(group, 1);
+                return Err(MemfdError::NoMemory);
+            };
+            // The frame is recorded (and its charge now owned by `staged`)
+            // before it is touched so a failure below cannot leak either.
+            staged.frames.push(frame_phys);
+            zero_frame(frame_phys);
         }
         Ok(staged)
     }
@@ -409,11 +443,97 @@ impl StagedFrames {
 
 impl Drop for StagedFrames {
     fn drop(&mut self) {
-        for frame_phys in self.0.drain(..) {
-            phys::free_frame(PhysAddr::new(frame_phys));
+        let pages = self.frames.len();
+        for frame_phys in self.frames.drain(..) {
+            free_backing_frame(frame_phys);
         }
+        refund_pages(self.group, pages);
     }
 }
+
+fn try_charge_page(group: Option<usize>) -> bool {
+    group.is_none_or(|group| charge::try_charge(group, 1))
+}
+
+fn refund_pages(group: Option<usize>, pages: usize) {
+    if let Some(group) = group
+        && pages != 0
+    {
+        charge::uncharge(group, pages as u64);
+    }
+}
+
+#[cfg(not(test))]
+fn alloc_backing_frame() -> Option<u64> {
+    phys::alloc_frame_user().map(PhysAddr::as_u64)
+}
+
+#[cfg(not(test))]
+fn free_backing_frame(frame_phys: u64) {
+    phys::free_frame(PhysAddr::new(frame_phys));
+}
+
+#[cfg(not(test))]
+fn zero_frame(frame_phys: u64) {
+    // SAFETY: the freshly allocated frame is exclusively owned by the caller's
+    // staging buffer, the higher-half direct map covers one complete page, and
+    // nothing publishes the frame until it is installed.
+    unsafe {
+        ptr::write_bytes(
+            kernel_vm::higher_half_addr(frame_phys) as *mut u8,
+            0,
+            PAGE_SIZE,
+        );
+    }
+}
+
+#[cfg(not(test))]
+fn zero_frame_tail(frame_phys: u64, tail: usize) {
+    // SAFETY: the frame is owned by the object and retained under the
+    // object-state lock; the direct map covers the whole page and
+    // `tail..PAGE_SIZE` stays inside it.
+    unsafe {
+        ptr::write_bytes(
+            (kernel_vm::higher_half_addr(frame_phys) as *mut u8).add(tail),
+            0,
+            PAGE_SIZE - tail,
+        );
+    }
+}
+
+// Host tests have no physical allocator or direct map: a counting fake stands
+// in so charge conservation is checkable without touching memory.
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+std::thread_local! {
+    static FAKE_FRAMES_LEFT: core::cell::Cell<usize> = const { core::cell::Cell::new(usize::MAX) };
+    static FAKE_FRAMES_LIVE: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn alloc_backing_frame() -> Option<u64> {
+    FAKE_FRAMES_LEFT.with(|left| {
+        if left.get() == 0 {
+            return None;
+        }
+        left.set(left.get() - 1);
+        FAKE_FRAMES_LIVE.with(|live| live.set(live.get() + 1));
+        Some(0x1000)
+    })
+}
+
+#[cfg(test)]
+fn free_backing_frame(_frame_phys: u64) {
+    FAKE_FRAMES_LIVE.with(|live| live.set(live.get() - 1));
+}
+
+#[cfg(test)]
+fn zero_frame(_frame_phys: u64) {}
+
+#[cfg(test)]
+fn zero_frame_tail(_frame_phys: u64, _tail: usize) {}
 
 /// Bounded retries when concurrent grow/shrink keep invalidating a staged plan.
 const GROW_ATTEMPTS: usize = 8;
@@ -445,17 +565,17 @@ fn grow_then<R>(
             }
             required_pages - state.frames.len()
         };
-        let mut staged = StagedFrames::zeroed(missing)?;
+        let mut staged = StagedFrames::zeroed(missing, object.charge_group)?;
         let mut state = object.state.lock();
         check(&state)?;
         let still_missing = required_pages.saturating_sub(state.frames.len());
-        let take = still_missing.min(staged.0.len());
+        let take = still_missing.min(staged.frames.len());
         state
             .frames
             .try_reserve(take)
             .map_err(|_| MemfdError::NoMemory)?;
-        let keep = staged.0.len() - take;
-        state.frames.extend(staged.0.drain(keep..));
+        let keep = staged.frames.len() - take;
+        state.frames.extend(staged.frames.drain(keep..));
         // Surplus frames (a concurrent grower won part of the range) are freed
         // by `staged`'s Drop after the lock is released below.
         drop(state);
@@ -528,6 +648,7 @@ mod tests {
     fn empty_object(seals: u32) -> MemfdObject {
         MemfdObject {
             object_id: 1,
+            charge_group: None,
             state: Mutex::new(MemfdState {
                 name: String::from("test"),
                 len: 0,
@@ -587,11 +708,93 @@ mod tests {
 
     #[test]
     fn memfd_objects_receive_nonzero_never_reused_futex_identities() {
-        let first = MemfdHandle::new(String::from("first"), true);
-        let second = MemfdHandle::new(String::from("second"), true);
+        let first = MemfdHandle::new(String::from("first"), true, None);
+        let second = MemfdHandle::new(String::from("second"), true, None);
         let first_id = first.object().object_id;
         let second_id = second.object().object_id;
         assert_ne!(first_id, 0);
         assert_ne!(first_id, second_id);
+    }
+
+    // Charge-group slots are process-wide statics shared with other kernel-ps
+    // tests: these use 50..=53 (kmem tests use a different counter family).
+    fn fake_reset(frames_left: usize) {
+        FAKE_FRAMES_LEFT.with(|left| left.set(frames_left));
+        FAKE_FRAMES_LIVE.with(|live| live.set(0));
+    }
+
+    fn fake_live() -> usize {
+        FAKE_FRAMES_LIVE.with(|live| live.get())
+    }
+
+    fn grown(group: usize, pages: usize) -> Result<MemfdHandle, MemfdError> {
+        let handle = MemfdHandle::new(String::from("charged"), true, Some(group));
+        handle.truncate(pages * PAGE_SIZE).map(|()| handle)
+    }
+
+    #[test]
+    fn charge_refusal_leaves_no_partial_frames_and_no_leaked_charge() {
+        charge::init_group(50, None);
+        charge::set_limit(50, 3);
+        fake_reset(usize::MAX);
+        let handle = MemfdHandle::new(String::from("limited"), true, Some(50));
+        assert_eq!(handle.truncate(5 * PAGE_SIZE), Err(MemfdError::NoMemory));
+        assert_eq!(charge::usage(50), 0, "the staged charge is refunded");
+        assert_eq!(fake_live(), 0, "the staged frames are freed");
+        assert_eq!(handle.len(), 0);
+        assert_eq!(handle.truncate(3 * PAGE_SIZE), Ok(()));
+        assert_eq!(charge::usage(50), 3);
+        assert_eq!(handle.truncate(4 * PAGE_SIZE), Err(MemfdError::NoMemory));
+        assert_eq!(charge::usage(50), 3, "a refused grow keeps the old charge");
+        assert_eq!(handle.len(), 3 * PAGE_SIZE);
+        drop(handle);
+        assert_eq!(charge::usage(50), 0);
+        assert_eq!(fake_live(), 0);
+    }
+
+    #[test]
+    fn allocation_failure_refunds_the_reservation_and_staged_pages() {
+        charge::init_group(51, None);
+        fake_reset(2);
+        let handle = MemfdHandle::new(String::from("oom"), true, Some(51));
+        assert_eq!(handle.truncate(4 * PAGE_SIZE), Err(MemfdError::NoMemory));
+        assert_eq!(charge::usage(51), 0);
+        assert_eq!(fake_live(), 0);
+        fake_reset(usize::MAX);
+    }
+
+    #[test]
+    fn shrink_refunds_released_pages_and_drop_refunds_exactly_once() {
+        charge::init_group(52, None);
+        fake_reset(usize::MAX);
+        let handle = grown(52, 6).unwrap();
+        assert_eq!(charge::usage(52), 6);
+        assert_eq!(handle.truncate(2 * PAGE_SIZE + 1), Ok(()));
+        assert_eq!(charge::usage(52), 3, "keeps ceil(len / page) pages");
+        assert_eq!(fake_live(), 3);
+        assert_eq!(handle.truncate(0), Ok(()));
+        assert_eq!(charge::usage(52), 0);
+        assert_eq!(handle.truncate(2 * PAGE_SIZE), Ok(()));
+        let clone = handle.clone();
+        assert_eq!(charge::usage(52), 2);
+        drop(handle);
+        assert_eq!(charge::usage(52), 2, "a duplicated description keeps the object");
+        drop(clone);
+        assert_eq!(charge::usage(52), 0, "the last drop refunds once");
+        assert_eq!(fake_live(), 0);
+    }
+
+    #[test]
+    fn an_unaccounted_memfd_never_touches_a_group() {
+        charge::init_group(53, None);
+        fake_reset(usize::MAX);
+        let handle = MemfdHandle::new(String::from("w"), true, Some(53));
+        assert_eq!(handle.truncate(PAGE_SIZE), Ok(()));
+        assert_eq!(charge::usage(53), 1);
+        drop(handle);
+        assert_eq!(charge::usage(53), 0);
+        let free = MemfdHandle::new(String::from("free"), true, None);
+        assert_eq!(free.truncate(2 * PAGE_SIZE), Ok(()));
+        assert_eq!(charge::usage(53), 0);
     }
 }

@@ -1,6 +1,8 @@
 #![no_std]
 
 mod page_cache;
+pub mod library_custody;
+pub mod library_warm;
 
 pub use page_cache::{
     CacheAdmission, CacheError, CachePage, PageCache, PageCacheKey, PAGER_MAX_CACHE_ENTRIES,
@@ -1016,7 +1018,11 @@ mod tests {
     #[test]
     fn a_protect_that_widens_rights_is_refused_without_touching_the_table() {
         let mut pager = PagerState::new(2);
+        // Delegated objects stay attenuation-only. (A ring0-owned private
+        // anonymous object has no delegated ceiling and may be reprotected.)
         let mut region = region(2);
+        region.object.object_type = rustos_user_abi::pager::VM_OBJECT_FILE_PRIVATE;
+        region.object.backing_service = 2;
         region.prot = VM_PROT_READ;
         region.object.rights = VM_PROT_READ;
         pager.admit_region(region).unwrap();

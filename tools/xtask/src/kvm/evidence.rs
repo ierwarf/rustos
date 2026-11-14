@@ -1152,6 +1152,15 @@ fn uiserver_profile_input_pipeline_healthy(
     false
 }
 
+/// The probe's own `FAIL` record, trimmed of the debugcon framing, if present.
+fn library_map_probe_failure(log: &str) -> Option<String> {
+    let line = log
+        .lines()
+        .find(|line| line.contains(LIBRARY_MAP_PROBE_FAIL_MARKER))?;
+    let at = line.find(LIBRARY_MAP_PROBE_FAIL_MARKER)?;
+    Some(line[at..].trim().trim_end_matches("\\n").to_owned())
+}
+
 fn runtime_stall_or_crash_observed(log: &str) -> bool {
     const FAILURES: &[&str] = &[
         "!PANIC-SITE:",
@@ -1170,6 +1179,8 @@ fn runtime_stall_or_crash_observed(log: &str) -> bool {
         "memory allocation of ",
         "fatal service endpoint not ready",
         "BUG:",
+        LIBRARY_MAP_PROBE_FAIL_MARKER,
+        APP_DMABUF_PROBE_FAIL_MARKER,
     ];
     log.lines()
         .any(|line| FAILURES.iter().any(|failure| line.contains(failure)))

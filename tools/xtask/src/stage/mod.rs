@@ -24,11 +24,17 @@ use crate::util::{
     remove_dir_if_exists, remove_file_if_exists, run_command,
 };
 
+mod library_cache;
+mod runtime_libs;
+
 const APPLICATIONS_DIR: &str = "usr/share/applications";
 const EARLY_SYSTEM_IMAGE_PATH: &str = "system/boot/early-system.img";
 const EARLY_SYSTEM_IMAGE_SIGNATURE_PATH: &str = "system/boot/early-system.img.sig";
 const EARLY_SYSTEM_BOOTSTRAP_PATHS: &[&str] = &[
     "etc/ld.so.cache",
+    // Boot cache policy and expected payload hashes must be authenticated,
+    // not replaced by the storage provider supplying the library bytes.
+    "etc/pagerd/library-cache.conf",
     "lib/x86_64-linux-gnu/libc.so.6",
     "lib/x86_64-linux-gnu/libgcc_s.so.1",
     "lib64/ld-linux-x86-64.so.2",
@@ -128,11 +134,16 @@ pub(crate) fn stage(config: &Config) -> Result<()> {
     cleanup_stale_build_paths(config)?;
 
     stage_image_asset_overlay(&config.image_asset_overlay_dir, &config.image_dir)?;
+    let runtime_baseline = runtime_libs::RuntimeBaseline::capture(&config.image_dir)?;
     apply_configured_autostart_policy(config)?;
 
     for manifest in &manifests {
         stage_manifest(config, manifest)?;
     }
+    // The kernel bootstrap allowlist spawns rootd and its five boot services
+    // without loaderd, so their stamps are proven here instead of at spawn.
+    crate::native_abi::verify_staged_native_elfs(config, &manifests)?;
+    let prebuilt_elfs = runtime_libs::stage_prebuilt_app_runtime_libraries(config, &manifests)?;
     stage_boot_manager(config)?;
     stage_nucleus_signature(config)?;
 
@@ -151,6 +162,10 @@ pub(crate) fn stage(config: &Config) -> Result<()> {
     write_linux_runtime_access_registry(config)?;
     write_runtime_env_registry(config)?;
     generate_dynamic_linker_cache(&config.image_dir)?;
+    materialize_image_file_aliases(&config.image_dir)?;
+    runtime_baseline.verify(&config.image_dir)?;
+    let library_uses = runtime_libs::verify_relocations(&config.image_dir, &prebuilt_elfs)?;
+    library_cache::stage_plan(&config.image_dir, &library_uses)?;
     write_early_system_image(config)?;
     write_boot_disk_image(config)?;
     Ok(())
@@ -448,31 +463,21 @@ struct ImageFile {
 }
 
 fn collect_image_files(image_dir: &Path) -> Result<Vec<ImageFile>> {
-    let mut files = WalkDir::new(image_dir)
-        .into_iter()
-        .filter_map(|entry| match entry {
-            Ok(entry) if entry.file_type().is_file() => Some(Ok(entry)),
-            Ok(_) => None,
-            Err(err) => Some(Err(err)),
-        })
-        .map(|entry| {
-            let path = entry?.into_path();
-            let relative = path
-                .strip_prefix(image_dir)?
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
-            let len = fs::metadata(&path)
-                .map_err(|err| anyhow!("failed to stat image file {}: {err}", path.display()))?
-                .len();
-            Ok(ImageFile {
-                source: path,
-                relative,
-                len,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut files = Vec::new();
+    for entry in WalkDir::new(image_dir) {
+        let entry = entry?;
+        if entry.file_type().is_symlink() {
+            bail!("unmaterialized image alias would be lost on FAT: {}", entry.path().display());
+        }
+        if !entry.file_type().is_file() { continue; }
+        let path = entry.into_path();
+        let relative = path.strip_prefix(image_dir)?.components()
+            .map(|component| component.as_os_str().to_str().context("non-UTF8 image file name"))
+            .collect::<Result<Vec<_>>>()?.join("/");
+        let len = fs::metadata(&path)
+            .map_err(|err| anyhow!("failed to stat image file {}: {err}", path.display()))?.len();
+        files.push(ImageFile { source: path, relative, len });
+    }
     files.sort_by(|lhs, rhs| lhs.relative.cmp(&rhs.relative));
     Ok(files)
 }
@@ -1218,13 +1223,15 @@ include!("finalization.rs");
 mod tests {
     use super::{
         EARLY_SYSTEM_BOOTSTRAP_PATHS, ImageFile, build_early_system_image, ensure_fat_parent_dirs,
-        registry_deps, verify_boot_disk_image_contract,
+        registry_deps, verify_boot_disk_image_contract, collect_image_files,
+        materialize_image_file_aliases, write_boot_disk_image, copy_tree_files, Config,
     };
     use boot_protocol::{
         EARLY_SYSTEM_ENTRY_BYTES, EARLY_SYSTEM_HEADER_BYTES, EarlySystemEntry, EarlySystemHeader,
     };
     use fatfs::{Seek as _, Write as _};
-    use std::fs::OpenOptions;
+    use std::fs::{self, OpenOptions};
+    use std::path::Path;
 
     #[test]
     fn imported_chrome_is_visible_without_any_boot_launch_entry() {
@@ -1341,6 +1348,49 @@ mod tests {
         let deps = vec!["runtimed,sessiond".to_string()];
 
         assert!(registry_deps(&deps).is_err());
+    }
+
+    #[test]
+    fn image_aliases_are_materialized_and_survive_fat_serialization() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let image = temp.path().join("image");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("libfoo.so.1.0"), b"library payload").unwrap();
+        symlink("libfoo.so.1.0", source.join("libfoo.so.1")).unwrap();
+        copy_tree_files(&source, &image).unwrap();
+        assert!(fs::symlink_metadata(source.join("libfoo.so.1")).unwrap().is_symlink());
+        assert!(!fs::symlink_metadata(image.join("libfoo.so.1")).unwrap().is_symlink());
+        // Model the additional alias introduced after copying by ldconfig.
+        symlink("libfoo.so.1.0", image.join("libfoo.so")).unwrap();
+        assert!(collect_image_files(&image).is_err(), "never silently omit a verified alias");
+        materialize_image_file_aliases(&image).unwrap();
+        let files = collect_image_files(&image).unwrap();
+        assert_eq!(files.iter().map(|file| file.relative.as_str()).collect::<Vec<_>>(),
+            ["libfoo.so", "libfoo.so.1", "libfoo.so.1.0"]);
+        let mut config = Config::from_env().unwrap();
+        config.image_dir = image;
+        config.boot_disk_image = temp.path().join("alias-fat.img");
+        // This reopens the actual FAT volume and compares every alias payload.
+        write_boot_disk_image(&config).unwrap();
+    }
+
+    #[test]
+    fn source_and_final_image_reject_escaping_dangling_and_directory_aliases() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("directory")).unwrap();
+        let outside = temp.path().join("outside");
+        fs::write(&outside, b"not an image file").unwrap();
+        let alias = source.join("alias");
+        for target in [outside.as_path(), Path::new("missing"), Path::new("directory")] {
+            symlink(target, &alias).unwrap();
+            assert!(copy_tree_files(&source, &temp.path().join("dest")).is_err());
+            assert!(materialize_image_file_aliases(&source).is_err());
+            fs::remove_file(&alias).unwrap();
+        }
     }
 
     #[test]

@@ -192,3 +192,32 @@ fn callback_failure_before_effects_can_abort_but_partial_effects_quarantine_bind
         BATCHES[A].fetch_and(!3, Ordering::Release);
     });
 }
+
+/// The cookie keeps `root + 1` in its low bits. At the widest table the highest
+/// slot must name itself (value 256) without spilling into the epoch, and the
+/// epoch must survive the round trip through the member word.
+#[test]
+fn the_highest_slot_is_a_distinct_cohort_root_and_does_not_alias_its_epoch() {
+    let _serial = crate::multitask::scheduler::execution_test_serial_guard();
+    let top = MAX - 1;
+    let (id_top, id_low) = (255_001_u64, 255_002_u64);
+    identity::clear(top);
+    identity::clear(A);
+    identity::publish_metadata(top, Some(metadata(id_top)));
+    identity::publish_metadata(A, Some(metadata(id_low)));
+    assert!(MAX as u64 <= COOKIE_ROOT_MASK);
+    for _ in 0..3 {
+        let mut owner = Cohort::begin(&[(top, id_top), (A, id_low)]).unwrap();
+        assert_eq!(owner.root, top);
+        assert_eq!(owner.cookie & COOKIE_ROOT_MASK, top as u64 + 1);
+        assert_eq!(owner.cookie >> COOKIE_ROOT_BITS, owner.epoch);
+        assert_eq!(MEMBERS[A].load(Ordering::Acquire), owner.cookie);
+        assert!(!admission_ready(A) && !admission_ready(top));
+        owner.begin_effects();
+        owner.complete();
+        assert!(admission_ready(A) && admission_ready(top));
+        assert!(!busy(A) && !busy(top));
+    }
+    identity::clear(top);
+    identity::clear(A);
+}

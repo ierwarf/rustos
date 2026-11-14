@@ -198,3 +198,28 @@ pub(crate) fn process_owns_published_service_endpoint(process_id: u64, service_i
     // owner after it.
     SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire) == process_id
 }
+
+/// Serialize an exact devmgrd publication with its revoke/republish operation.
+/// The closure may only perform bounded kernel publication; never user-copy,
+/// wait for IPC, scrub, or perform service policy under this lock.
+pub(crate) fn with_devmgrd_publication<T>(
+    process_id: u64,
+    epoch: u64,
+    publish: impl FnOnce() -> T,
+) -> Option<T> {
+    let index = service_index(linux_abi::IPC_SERVICE_DEVMGRD)?;
+    if process_id == 0 || epoch == 0 {
+        return None;
+    }
+    let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    let caps = ServiceCapabilitySet::from_wire(SERVICE_ENDPOINT_CAPS[index].load(Ordering::Acquire))?;
+    if SERVICE_ENDPOINTS[index].load(Ordering::Acquire) == 0
+        || SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire) != process_id
+        || SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire) != epoch
+        || !caps.contains(ServiceCapability::DevicePolicy)
+        || multitask::is_user_process_exiting(process_id)
+    {
+        return None;
+    }
+    Some(publish())
+}

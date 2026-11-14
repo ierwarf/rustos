@@ -207,15 +207,15 @@ pub(in crate::multitask) fn allocate(
     suspended: bool,
     supplied: Option<super::super::SchedulingContextAdmission>,
     reservation: process_table::SpawnReservation,
-) -> Option<(bool, usize)> {
+) -> Result<(bool, usize), crate::multitask::SpawnTaskError> {
     assert!(
         crate::multitask::cpu_local::scheduler_initialized(),
         "root creation preceded complete image"
     );
     let mut turn = nucleus_core::util::lockdep::DispatchPreemption::enter();
     turn.mask_irqs();
-    let actor = Actor::capture(turn.cpu()).or_else(|| refused(1))?;
-    let admission = Admission::capture(&actor, parent, supplied).or_else(|| refused(2))?;
+    let actor = Actor::capture(turn.cpu()).or_else(|| refused(1)).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot)?;
+    let admission = Admission::capture(&actor, parent, supplied).or_else(|| refused(2)).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot)?;
     let result = construct(
         id,
         input,
@@ -238,7 +238,7 @@ pub(in crate::multitask) fn allocate(
 }
 
 /// Names which refusal ended a root creation. Every one of them reaches the
-/// caller as the same `NoFreeTaskSlot`, which a `fork` reports as `EAGAIN`, so
+/// caller as `NoFreeTaskSlot` except typed process-publication errors, so
 /// without a site code a transient busy cohort, an exhausted slot table and a
 /// full scheduling domain cannot be told apart. Bounded, so a storm stays cheap.
 /// 1 creator actor, 2 parent admission, 3 no reservable slot, 4 process join,
@@ -275,7 +275,7 @@ fn construct(
     turn: &nucleus_core::util::lockdep::DispatchPreemption,
     eligible_cpus: impl FnOnce(usize) -> u64,
     before_wake: impl FnOnce(usize, u64),
-) -> Option<(bool, usize)> {
+) -> Result<(bool, usize), crate::multitask::SpawnTaskError> {
     match actor {
         Actor::Kernel(executor) => executor.assert_current_in(turn),
         Actor::User { slot, id, .. } => {
@@ -293,18 +293,18 @@ fn construct(
     let vruntime = kernel_creation::creation_floor(turn.cpu());
     let ticket = (FIRST_DYNAMIC_TASK_SLOT..MAX_TASK)
         .find_map(|slot| root_slots::reserve(slot, id))
-        .or_else(|| refused(3))?;
+        .or_else(|| refused(3)).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot)?;
     let mut root =
         match root_slots::RootPublication::prepare(reservation, ticket, admission.process_mask) {
             Ok(root) => root,
             Err(ticket) => {
                 root_slots::cancel_unpublished(ticket);
-                return refused(4);
+                return refused(4).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot);
             }
         };
     let Some(state) = input.materialize(&mut bootstrap, id) else {
         root.cancel();
-        return refused(5);
+        return refused(5).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot);
     };
     let phys = state.address_space_root();
     let slot = root.ticket().slot();
@@ -316,13 +316,17 @@ fn construct(
     ) {
         drop(state);
         root.cancel();
-        return refused(6);
+        return refused(6).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot);
     }
     let rsp = execution_image::reserved_user_entry(root.ticket(), &bootstrap, cs, ss, flags);
-    let Some(handle) = root.publish_process(parent, state) else {
-        scheduling_runtime::release(slot, scheduling.identity());
-        root.cancel();
-        return refused(7);
+    let handle = match root.publish_process(parent, state) {
+        Ok(handle) => handle,
+        Err(error) => {
+            scheduling_runtime::release(slot, scheduling.identity());
+            root.cancel();
+            let _: Option<()> = refused(7);
+            return Err(error);
+        }
     };
     let slot = publish(
         root,
@@ -341,7 +345,7 @@ fn construct(
     if let Actor::Kernel(executor) = actor {
         executor.assert_current_in(turn);
     }
-    Some((actor.is_user(), slot))
+    Ok((actor.is_user(), slot))
 }
 
 #[allow(clippy::too_many_arguments)]

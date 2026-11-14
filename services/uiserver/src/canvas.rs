@@ -538,6 +538,53 @@ impl<'a> SurfaceCanvas<'a> {
         }
     }
 
+    /// Composite premultiplied Wayland ARGB pixels onto the opaque canvas.
+    pub(crate) fn draw_surface_premultiplied(
+        &mut self,
+        src: &[u32],
+        width: usize,
+        height: usize,
+        stride: usize,
+        x: usize,
+        y: usize,
+    ) {
+        if width == 0 || height == 0 || stride < width {
+            return;
+        }
+        let Some(required) = stride
+            .checked_mul(height - 1)
+            .and_then(|v| v.checked_add(width))
+        else {
+            return;
+        };
+        if src.len() < required {
+            return;
+        }
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+        .intersect(self.clip_rect);
+        for row in 0..rect.height {
+            let source = (rect.y - y + row) * stride + rect.x - x;
+            let dest = (rect.y + row) * self.stride_pixels + rect.x;
+            let Some(dst) = self.pixels.get_mut(dest..dest + rect.width) else {
+                return;
+            };
+            for (dst, pixel) in dst.iter_mut().zip(&src[source..source + rect.width]) {
+                let a = pixel >> 24;
+                let inv = 255 - a;
+                let blend = |shift: u32| {
+                    (((pixel >> shift) & 255) + (((*dst >> shift) & 255) * inv + 127) / 255)
+                        .min(255)
+                };
+                *dst = (blend(16) << 16) | (blend(8) << 8) | blend(0);
+            }
+        }
+    }
+
     pub(crate) fn blit_alpha_mask(
         &mut self,
         alpha: &[u8],

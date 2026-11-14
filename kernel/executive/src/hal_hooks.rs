@@ -231,15 +231,27 @@ fn try_handle_current_user_page_fault(
         request,
         vma.region.fault_endpoint,
         |token, request| {
+            // Current VMA protection, not the object's maximum envelope, is
+            // the dispatch authority. A narrowed VMA must not regain write.
+            let rights = vma.region.prot;
+            if matches!(
+                request.object.object_type,
+                rustos_user_abi::pager::VM_OBJECT_FILE_PRIVATE
+                    | rustos_user_abi::pager::VM_OBJECT_IMAGE_SECTION
+            ) {
+                // File cache pages have independent source custody. Do not
+                // consume an exception-time zero frame merely to return it.
+                return Ok((0, rights));
+            }
             let binding = mm_api::frame_capability::FrameGrantBinding {
                 fault_token: token,
                 ..binding_template
             };
             mm_api::frame_capability::reserve_preallocated_zeroed_frame_grant(
                 binding,
-                u64::from(request.object.rights),
+                u64::from(rights),
             )
-            .map(|capability| (capability, request.object.rights))
+            .map(|capability| (capability, rights))
             .map_err(|_| ps_api::PagerFaultSlotError::Pressure)
         },
     ) else {

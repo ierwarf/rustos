@@ -157,6 +157,9 @@ pub enum LockClass {
     TaskWaitEpoch = 58, // per-slot payload/arm arbitration; no frame/queue/hardware work
     /// Per-CPU physical-frame magazine: one slot at a time, before `PhysicalAllocator`.
     PhysicalFrameCache = 59,
+    /// Kernel-local fd object state (pipe, eventfd) and the readiness registry:
+    /// bounded, allocation-free leaves; never nested, no user copy or wake.
+    LocalFdObject = 60,
 }
 #[cfg(rustos_boot_image)]
 #[derive(Clone, Copy)]

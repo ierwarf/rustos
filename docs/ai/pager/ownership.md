@@ -73,6 +73,46 @@ reserve alone was tried and reverted: the reserve is emptiest when the fault
 rate is highest, so the run went dead precisely when it was worth most. The run
 must degrade with supply, not switch off.
 
+### Immutable supplied-frame custody (not yet a live file pager)
+
+`kernel-mm::frame_source` owns opaque, non-reused generation tokens for supplied
+immutable pages. The supplying service's resident group pays one page while
+source custody exists; each published target leaf pays its normal mapping
+charge. Keys bind namespace, object identity/generation, content generation and
+page offset, and exact logical-service ID/publication-epoch ownership authorizes
+withdrawal. Reusing the same endpoint object after unregister/register does not
+reuse a source owner generation. No path or file/cache policy is interpreted
+by this mechanism.
+
+A source reference is the private-file descriptor's impossible process owner
+`(root=0, address=0)`. An installer pins the source token before touching the
+source frame and keeps it pinned until independent target descriptor custody is
+published or the attempt fails. Withdrawal closes new pins first and returns
+without waiting; the last already-admitted installer only links its slot into
+an allocation-free retirement queue. The bounded normal-time pager housekeeping
+hook releases descriptor custody and its charge outside registry/process/
+scheduler locks. Drop and provider-exit cleanup never wait for a TLB transition.
+Active mappings survive source
+withdrawal and free the physical frame only after their own last TLB-safe
+release. The packed generation/reference word never wraps a token or reference
+count. Slot reuse follows descriptor and charge cleanup, never precedes it.
+
+Authenticated native supply and service-exit withdrawal are connected through
+`SYS_RUSTOS_FRAME_SOURCE`. Fixed private-file/section replies accept a reusable
+source token only after exact worker/fault claim, source owner/key/content/page
+pin and current process/MM/VMA validation. File dispatch consumes no anonymous
+zero-frame reserve and offers exactly one source page. Its rights come from
+current VMA protection, not the object's wider envelope. Shared replies cannot
+write; private-write replies install read-only/COW leaves. Source permissions
+are READ with optional EXECUTE, never WRITE, even for writable private views.
+Shared-library file-backed VMAs are now admitted at mmap time from sealed pager-warmed objects (`SYS_RUSTOS_LIBRARY_OBJECT`; native-tested only, KVM-unverified); general file-backed fault I/O through pagerd remains disconnected. Native descriptor/source-table tests and a successful
+control selfcheck are not proof of a working file pager. The bounded
+`formal/frame-source-lifecycle/FrameSourceLifecycle.tla` projects two source
+and service generations, independent mapped-leaf/TLB custody, serialized
+publication/revoke, and cold-only source release. It does not prove x86 PTE
+publication, the intrusive queue weak-memory algorithm, allocator progress or
+file I/O. See [library-cache policy](library-cache.md).
+
 ### 2.3 Frame grant — pager-backed only
 
 | | |

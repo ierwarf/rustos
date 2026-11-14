@@ -1,11 +1,11 @@
 //! Physical root ownership, distinct from process-state box ownership.
 //! Last release only enqueues preallocated storage. Reclamation (including HAL
 //! inactive-root/shootdown) runs in an explicit cold drain, never a pin Drop.
-use alloc::boxed::Box;
+use alloc::{boxed::Box, vec::Vec};
 use core::{
     cell::UnsafeCell,
     ptr::{self, NonNull},
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering},
 };
 const CLOSED: usize = 1usize << (usize::BITS - 1);
 const COUNT: usize = CLOSED - 1;
@@ -17,6 +17,29 @@ struct Root {
     queue: &'static Queue,
     reclaim: bool,
     payload: UnsafeCell<Option<Box<dyn Send>>>,
+    // Installed by the unique mutable MM owner before external PTE publication.
+    // Pins never access this list; the cold consumer drops it after reclaim.
+    backings: UnsafeCell<Backings>,
+    // Lock-free census mirror; observers never access the mutable lease list.
+    retained_pages: AtomicU64,
+    mapping_meter: UnsafeCell<Option<crate::memory::kmem_charge::SharedMeter>>,
+}
+struct Backings {
+    leases: Vec<super::ImmutableBacking>,
+    group: Option<usize>,
+    charged: u64,
+}
+impl Drop for Root {
+    fn drop(&mut self) {
+        // Release any retired process payload before returning backing charges.
+        drop(self.payload.get_mut().take());
+        let backings = self.backings.get_mut();
+        // Backing pages remain billed until all root custody is dropped.
+        backings.leases.clear();
+        if let Some(group) = backings.group {
+            crate::memory::charge::uncharge(group, backings.charged);
+        }
+    }
 }
 struct Queue {
     head: AtomicPtr<Root>,
@@ -176,8 +199,76 @@ impl Owner {
                 queue,
                 reclaim,
                 payload: UnsafeCell::new(None),
+                backings: UnsafeCell::new(Backings { leases: Vec::new(), group: None, charged: 0 }),
+                retained_pages: AtomicU64::new(0),
+                mapping_meter: UnsafeCell::new(None),
             }))),
         }
+    }
+    pub(super) fn set_mapping_meter(&mut self, meter: crate::memory::kmem_charge::SharedMeter) {
+        unsafe { *self.root.as_ref().mapping_meter.get() = Some(meter); }
+    }
+    pub(super) fn retain_backing(
+        &mut self,
+        backing: super::ImmutableBacking,
+    ) -> Result<bool, super::AddressSpaceError> {
+        // Only the unique mutable owner touches this list; pins do not access it.
+        let backings = unsafe { &mut *self.root.as_ref().backings.get() };
+        if let Some(existing) = backings.leases.iter().find(|old| old.same_identity(&backing)) {
+            if existing.pages != backing.pages {
+                return Err(super::AddressSpaceError::InvalidFrameOwnership);
+            }
+            return Ok(false);
+        }
+        backings.leases.try_reserve(1).map_err(|_| super::AddressSpaceError::OutOfFrames)?;
+        let Some(total) = backings.charged.checked_add(backing.pages) else {
+            return Err(super::AddressSpaceError::OutOfFrames);
+        };
+        if backings.group.is_some_and(|group| !crate::memory::charge::try_charge(group, backing.pages)) {
+            return Err(super::AddressSpaceError::OutOfFrames);
+        }
+        backings.charged = total;
+        backings.leases.push(backing);
+        // SAFETY: the unique owner retains this root allocation across the store.
+        // ORDERING: Relaxed; this is standalone census data, not publication.
+        unsafe { self.root.as_ref() }.retained_pages.store(total, Ordering::Relaxed);
+        Ok(true)
+    }
+    pub(super) fn cancel_backing(&mut self, backing: super::ImmutableBacking) {
+        let backings = unsafe { &mut *self.root.as_ref().backings.get() };
+        let index = backings.leases.iter().position(|old| old.same_identity(&backing)).expect("missing staged backing");
+        let lease = backings.leases.swap_remove(index);
+        let pages = lease.pages;
+        drop(lease);
+        drop(backing);
+        backings.charged -= pages;
+        // SAFETY: the unique owner retains this root allocation across the store.
+        // ORDERING: Relaxed; census uses the scalar only, never lease contents.
+        unsafe { self.root.as_ref() }.retained_pages.store(backings.charged, Ordering::Relaxed);
+        if let Some(group) = backings.group {
+            crate::memory::charge::uncharge(group, pages);
+        }
+    }
+    pub(super) fn backings_bound(&self) -> bool {
+        unsafe { (&*self.root.as_ref().backings.get()).group.is_some() }
+    }
+    pub(super) fn bind_backings(&mut self, group: usize) -> bool {
+        let backings = unsafe { &mut *self.root.as_ref().backings.get() };
+        if backings.group.is_some() || !crate::memory::charge::try_charge(group, backings.charged) {
+            return false;
+        }
+        backings.group = Some(group);
+        true
+    }
+    pub(super) fn unbind_backings(&mut self) {
+        let backings = unsafe { &mut *self.root.as_ref().backings.get() };
+        if let Some(group) = backings.group.take() {
+            crate::memory::charge::uncharge(group, backings.charged);
+        }
+    }
+    pub(super) fn backing_metadata_bytes(&self) -> usize {
+        (unsafe { (&*self.root.as_ref().backings.get()).leases.capacity() })
+            * core::mem::size_of::<super::ImmutableBacking>()
     }
     pub(super) fn pin(&self) -> Option<ExecutionPin> {
         acquire(self.root)
@@ -214,6 +305,13 @@ impl Owner {
     }
 }
 impl ExecutionPin {
+    /// Whole immutable backing pages retained by this root, counted once per
+    /// backing identity, including pages retained after partial/full unmap.
+    pub fn retained_backing_pages(&self) -> u64 {
+        // SAFETY: this pin retains the root until the method returns.
+        // ORDERING: Relaxed; no pointer or mapping authority is derived here.
+        unsafe { self.root.as_ref() }.retained_pages.load(Ordering::Relaxed)
+    }
     pub fn root_phys(&self) -> u64 {
         unsafe { self.root.as_ref().root }
     }

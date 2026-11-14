@@ -49,6 +49,13 @@ use driver_domain_protocol::{
     dvm_gpu_atlas_invitation_offset,
 };
 
+mod app_buffer;
+pub use app_buffer::AppBufferTransportError;
+pub(crate) use app_buffer::{
+    aperture_phys as app_buffer_aperture_phys, begin as begin_app_buffer,
+    read_range as app_buffer_read_range,
+    scrub_range as app_buffer_scrub_range, take as take_app_buffer,
+};
 mod installation;
 mod peer;
 

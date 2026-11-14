@@ -2,7 +2,7 @@
 //! samples exactly one independently rasterized layer, in original draw order.
 use super::{
     chrome, gpu_window_draw_plan, render_dock_gpu_texture, render_wayland_gpu_texture,
-    taskbar_dirty_rect, wayland_window_client_rect, wayland_window_outer_rect, GpuAtlasScene,
+    taskbar_dirty_rect, wayland_window_client_rect_for, wayland_window_outer_rect, GpuAtlasScene,
     PlannedWindow,
 };
 use crate::app::AppState;
@@ -242,7 +242,7 @@ fn opaque_window_interior(outer: Rect) -> Rect {
 }
 
 fn opaque_wayland_interior(window: &WaylandWindowSnapshot) -> Rect {
-    let client = wayland_window_client_rect(wayland_window_outer_rect(window));
+    let client = wayland_window_client_rect_for(window, wayland_window_outer_rect(window));
     let width = window.width.min(client.width);
     let height = window.height.min(client.height);
     if width == 0 || height == 0 || window.stride_pixels < width {
@@ -261,7 +261,11 @@ fn opaque_wayland_interior(window: &WaylandWindowSnapshot) -> Rect {
             return Rect::empty();
         }
     }
-    client.intersect(opaque_window_interior(wayland_window_outer_rect(window)))
+    if window.server_decoration {
+        client.intersect(opaque_window_interior(wayland_window_outer_rect(window)))
+    } else {
+        client
+    }
 }
 
 pub(super) fn build_cropped_gpu_atlas_scene(
@@ -349,7 +353,7 @@ pub(super) fn build_cropped_gpu_atlas_scene(
         {
             continue;
         }
-        let (mut pixels, width, height, focused) = match *planned {
+        let (mut pixels, width, height, focused, server_decoration) = match *planned {
             PlannedWindow::Wayland { index, focused } => {
                 let window = &state.wayland_windows[index];
                 let outer = wayland_window_outer_rect(window);
@@ -358,6 +362,7 @@ pub(super) fn build_cropped_gpu_atlas_scene(
                     outer.width,
                     outer.height,
                     focused,
+                    window.server_decoration,
                 )
             }
             PlannedWindow::Console { index, focused } => {
@@ -371,13 +376,16 @@ pub(super) fn build_cropped_gpu_atlas_scene(
                     window.surface_cache.width,
                     window.surface_cache.height,
                     focused,
+                    true,
                 )
             }
         };
-        for pixel in &mut pixels {
-            *pixel |= 0xff00_0000;
+        if server_decoration {
+            for pixel in &mut pixels {
+                *pixel |= 0xff00_0000;
+            }
+            chrome::apply_window_texture_alpha(&mut pixels, width, width, height, focused);
         }
-        chrome::apply_window_texture_alpha(&mut pixels, width, width, height, focused);
         write_fragment_layer(
             &mut packer,
             &fragments,

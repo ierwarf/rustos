@@ -217,6 +217,9 @@ struct PostInitLease {
 rustos_svc_runtime::relocation_trampoline!();
 
 #[cfg(not(test))]
+rustos_user_abi::native_abi_note!();
+
+#[cfg(not(test))]
 core::arch::global_asm!(
     ".global _start",
     ".type _start, @function",
@@ -3622,6 +3625,23 @@ mod tests {
             IPC_SERVICE_VFSD,
             IPC_SERVICE_NETD
         ));
+    }
+
+    #[test]
+    fn pagerd_lookup_authority_is_only_the_vfs_library_source() {
+        assert!(component_policy::route_allowed(
+            IPC_SERVICE_PAGERD,
+            IPC_SERVICE_VFSD
+        ));
+        // pagerd starts before vfsd: the edge is post-init, not a bootstrap
+        // dependency, so it can never order pagerd behind the filesystem.
+        assert!(!component_policy::bootstrap_route_allowed(
+            IPC_SERVICE_PAGERD,
+            IPC_SERVICE_VFSD
+        ));
+        for target in [IPC_SERVICE_STORAGED, IPC_SERVICE_DEVMGRD, IPC_SERVICE_LOADERD] {
+            assert!(!component_policy::route_allowed(IPC_SERVICE_PAGERD, target));
+        }
     }
 
     #[test]

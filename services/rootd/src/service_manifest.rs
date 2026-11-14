@@ -196,7 +196,7 @@ pub(super) struct ServiceRouteSpec {
 /// One source of truth for named post-init and cross-service lookup routes.
 /// These offers are checked during bootstrap and evaluated without allocation
 /// at lookup time. Bootstrap dependency offers remain in dependency_mask.
-pub(super) const SERVICE_ROUTING_MANIFEST: [ServiceRouteSpec; 15] = [
+pub(super) const SERVICE_ROUTING_MANIFEST: [ServiceRouteSpec; 16] = [
     ServiceRouteSpec {
         subject: INITD_LEASE_ID,
         target: IPC_SERVICE_NETD,
@@ -224,6 +224,13 @@ pub(super) const SERVICE_ROUTING_MANIFEST: [ServiceRouteSpec; 15] = [
     ServiceRouteSpec {
         subject: IPC_SERVICE_VFSD,
         target: IPC_SERVICE_STORAGED,
+    },
+    // The pager's shared-library warm worker reads the immutable library files
+    // listed in its authenticated manifest. pagerd starts before vfsd, so this
+    // is a post-init route, never a bootstrap dependency.
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_PAGERD,
+        target: IPC_SERVICE_VFSD,
     },
     ServiceRouteSpec {
         subject: IPC_SERVICE_PROCD,

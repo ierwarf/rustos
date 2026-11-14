@@ -1,8 +1,11 @@
 pub mod abi;
 pub mod epoll;
+pub mod eventfd;
 pub mod handles;
 pub mod linux;
+pub mod local_wait;
 pub mod memfd;
+pub mod pipe;
 pub mod process;
 pub mod process_state;
 pub mod socket;

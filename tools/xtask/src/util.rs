@@ -83,18 +83,36 @@ pub(crate) fn copy_tree_files(src_root: &Path, dst_root: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let mut files = WalkDir::new(src_root)
+    let source_root = fs::canonicalize(src_root)?;
+    let mut files = WalkDir::new(&source_root)
         .into_iter()
         .collect::<std::result::Result<Vec<_>, _>>()?;
     files.sort_by_key(|entry| entry.path().to_owned());
     for entry in files {
-        if entry.file_type().is_file() {
-            let relative = entry.path().strip_prefix(src_root)?;
-            copy_with_parent(entry.path(), &dst_root.join(relative))?;
+        if entry.file_type().is_file() || entry.file_type().is_symlink() {
+            let relative = entry.path().strip_prefix(&source_root)?;
+            let source = if entry.file_type().is_symlink() {
+                contained_regular_file(&source_root, entry.path())?
+            } else {
+                entry.path().to_owned()
+            };
+            copy_with_parent(&source, &dst_root.join(relative))?;
         }
     }
 
     Ok(())
+}
+
+/// FAT has no symlink representation. Copy contained file targets under each
+/// alias name, and fail rather than silently omitting dangling/escaping or
+/// directory links. Always open the admitted target, not the unchecked alias.
+pub(crate) fn contained_regular_file(root: &Path, path: &Path) -> Result<PathBuf> {
+    let root = fs::canonicalize(root)?;
+    let target = fs::canonicalize(path)
+        .with_context(|| format!("unresolvable image alias {}", path.display()))?;
+    anyhow::ensure!(target.starts_with(&root), "image alias escapes source root: {}", path.display());
+    anyhow::ensure!(target.is_file(), "image alias is not a regular file: {}", path.display());
+    Ok(target)
 }
 
 /// Make `dst_root` hold exactly the files of `src_root`. Only files whose

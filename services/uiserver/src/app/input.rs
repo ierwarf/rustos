@@ -196,6 +196,7 @@ impl AppState {
 
         self.wayland_windows
             .iter()
+            .filter(|window| !window.drag_icon)
             .enumerate()
             .find(|(index, _)| {
                 taskbar_slot_rect(

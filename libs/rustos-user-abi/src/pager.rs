@@ -467,8 +467,15 @@ pub struct PagerFaultDispatchWire {
 impl PagerFaultDispatchWire {
     pub const fn is_canonical(self) -> bool {
         self.request.is_canonical()
-            && self.request.object.object_type == VM_OBJECT_ANONYMOUS
-            && self.zeroed_frame_capability != 0
+            && match self.request.object.object_type {
+                VM_OBJECT_ANONYMOUS => self.zeroed_frame_capability != 0,
+                VM_OBJECT_FILE_PRIVATE | VM_OBJECT_IMAGE_SECTION => {
+                    self.zeroed_frame_capability == 0
+                        && self.map_run_pages_offered == 1
+                        && self.request.fault_flags == 0
+                }
+                _ => false,
+            }
             && self.granted_frame_rights != 0
             && self.granted_frame_rights & !VM_PROT_KNOWN == 0
             && !(self.granted_frame_rights & VM_PROT_WRITE != 0
@@ -565,6 +572,29 @@ impl PagerFaultReplyWire {
             }
             _ => false,
         }
+    }
+
+    /// Validates one immutable-source reply for a private file/section view.
+    /// Source tokens name independently retained cache custody, not the
+    /// anonymous one-shot reserve. No file run may fabricate adjacent pages.
+    pub const fn is_canonical_file_for(self, dispatch: PagerFaultDispatchWire) -> bool {
+        dispatch.is_canonical()
+            && matches!(
+                dispatch.request.object.object_type,
+                VM_OBJECT_FILE_PRIVATE | VM_OBJECT_IMAGE_SECTION
+            )
+            && self.map_run_pages == 1
+            && self.frame_rights != 0
+            && self.frame_rights & !dispatch.granted_frame_rights == 0
+            && self.frame_rights & dispatch.request.access as u32 == dispatch.request.access as u32
+            && match self.action {
+                PAGER_ACTION_MAP_SHARED => self.frame_rights & VM_PROT_WRITE == 0,
+                PAGER_ACTION_MAP_COW => {
+                    self.source_generation == dispatch.request.object.backing_generation
+                }
+                _ => false,
+            }
+            && self.is_canonical_for(dispatch.request)
     }
 
     /// Validates the stricter Phase-7 anonymous first-touch reply.
@@ -742,9 +772,165 @@ mod tests {
             .is_canonical_for(request)
         );
     }
+    #[test]
+    fn file_dispatch_uses_source_custody_not_zero_reserve_or_adjacent_pages() {
+        let request = PagerFaultRequestWire {
+            object: PagerObjectIdentityWire {
+                object_type: VM_OBJECT_FILE_PRIVATE,
+                backing_service: 2,
+                ..request().object
+            },
+            ..request()
+        };
+        let dispatch = PagerFaultDispatchWire {
+            request,
+            zeroed_frame_capability: 0,
+            granted_frame_rights: VM_PROT_READ | VM_PROT_WRITE,
+            map_run_pages_offered: 1,
+            ..PagerFaultDispatchWire::default()
+        };
+        assert!(dispatch.is_canonical());
+        assert!(
+            !PagerFaultDispatchWire {
+                zeroed_frame_capability: 61,
+                ..dispatch
+            }
+            .is_canonical()
+        );
+        assert!(
+            !PagerFaultDispatchWire {
+                map_run_pages_offered: 2,
+                ..dispatch
+            }
+            .is_canonical()
+        );
+        let reply = PagerFaultReplyWire {
+            version: PAGER_FAULT_ABI_VERSION,
+            action: PAGER_ACTION_MAP_COW,
+            frame_rights: VM_PROT_READ | VM_PROT_WRITE,
+            fault_token: request.fault_token,
+            process_generation: request.process_generation,
+            task_generation: request.task_generation,
+            mm_generation: request.mm_generation,
+            vma_generation: request.vma_generation,
+            pager_epoch: request.object.pager_epoch,
+            frame_capability: 0x10001,
+            source_generation: request.object.backing_generation,
+            map_run_pages: 1,
+            ..PagerFaultReplyWire::default()
+        };
+        assert!(reply.is_canonical_file_for(dispatch));
+        for bad in [
+            PagerFaultReplyWire {
+                source_generation: reply.source_generation + 1,
+                ..reply
+            },
+            PagerFaultReplyWire {
+                mm_generation: reply.mm_generation + 1,
+                ..reply
+            },
+            PagerFaultReplyWire {
+                vma_generation: reply.vma_generation + 1,
+                ..reply
+            },
+            PagerFaultReplyWire {
+                pager_epoch: reply.pager_epoch + 1,
+                ..reply
+            },
+            PagerFaultReplyWire {
+                frame_capability: 0,
+                ..reply
+            },
+            PagerFaultReplyWire {
+                frame_rights: VM_PROT_READ,
+                ..reply
+            },
+            PagerFaultReplyWire {
+                map_run_pages: 2,
+                ..reply
+            },
+            PagerFaultReplyWire {
+                action: PAGER_ACTION_MAP_ZEROED,
+                ..reply
+            },
+        ] {
+            assert!(!bad.is_canonical_file_for(dispatch));
+        }
+        let read_dispatch = PagerFaultDispatchWire {
+            request: PagerFaultRequestWire {
+                access: VM_ACCESS_READ,
+                ..request
+            },
+            granted_frame_rights: VM_PROT_READ,
+            ..dispatch
+        };
+        // An object's wider envelope cannot undo a current VMA narrowing.
+        assert!(!reply.is_canonical_file_for(read_dispatch));
+        let shared = PagerFaultReplyWire {
+            action: PAGER_ACTION_MAP_SHARED,
+            frame_rights: VM_PROT_READ,
+            cache_generation: 71,
+            source_generation: 0,
+            ..reply
+        };
+        assert!(shared.is_canonical_file_for(read_dispatch));
+        assert!(
+            !PagerFaultReplyWire {
+                frame_rights: VM_PROT_READ | VM_PROT_WRITE,
+                ..shared
+            }
+            .is_canonical_file_for(dispatch)
+        );
+        let shared_file = PagerFaultDispatchWire {
+            request: PagerFaultRequestWire {
+                object: PagerObjectIdentityWire {
+                    object_type: VM_OBJECT_FILE_SHARED,
+                    ..request.object
+                },
+                ..request
+            },
+            ..dispatch
+        };
+        assert!(!shared_file.is_canonical());
+        assert!(!reply.is_canonical_file_for(shared_file));
+    }
 }
 
 // Copy-out safety: no padding bytes (see `wire`).
-crate::user_wire!(PagerFaultDispatchWire { request: PagerFaultRequestWire, zeroed_frame_capability: u64, granted_frame_rights: u32, map_run_pages_offered: u32, reserved1: [u64; 2] });
-crate::user_wire!(PagerFaultRequestWire { version: u16, access: u16, fault_flags: u16, reserved0: u16, fault_token: u64, process_handle: u64, process_generation: u64, task_id: u64, task_generation: u64, mm_generation: u64, vma_generation: u64, virtual_address: u64, object_offset: u64, deadline_ns: u64, scheduling_domain: u64, charge_token: u64, object: PagerObjectIdentityWire, reserved1: [u64; 2] });
-crate::user_wire!(PagerObjectIdentityWire { object_type: u16, reserved0: u16, rights: u32, backing_service: u64, slot: u64, generation: u64, pager_epoch: u64, backing_generation: u64 });
+crate::user_wire!(PagerFaultDispatchWire {
+    request: PagerFaultRequestWire,
+    zeroed_frame_capability: u64,
+    granted_frame_rights: u32,
+    map_run_pages_offered: u32,
+    reserved1: [u64; 2]
+});
+crate::user_wire!(PagerFaultRequestWire {
+    version: u16,
+    access: u16,
+    fault_flags: u16,
+    reserved0: u16,
+    fault_token: u64,
+    process_handle: u64,
+    process_generation: u64,
+    task_id: u64,
+    task_generation: u64,
+    mm_generation: u64,
+    vma_generation: u64,
+    virtual_address: u64,
+    object_offset: u64,
+    deadline_ns: u64,
+    scheduling_domain: u64,
+    charge_token: u64,
+    object: PagerObjectIdentityWire,
+    reserved1: [u64; 2]
+});
+crate::user_wire!(PagerObjectIdentityWire {
+    object_type: u16,
+    reserved0: u16,
+    rights: u32,
+    backing_service: u64,
+    slot: u64,
+    generation: u64,
+    pager_epoch: u64,
+    backing_generation: u64
+});

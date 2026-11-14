@@ -24,7 +24,7 @@ After the worker joins, configuration rechecks the loader incarnation and lease.
 the loader's service job. Partial/denied retirement retains custody.
 
 Every spawn from the live SESSIOND owner (`runtimed`) receives a new child in
-that realm, with limits of 8 processes, 64 threads and 524288 resident data
+that realm, with limits of 32 processes, 128 threads and 524288 resident data
 pages (2 GiB), before prepare. A runtime-supplied placement descriptor is
 refused. An unconfigured replacement returns `EAGAIN`, not a permanent launch
 denial. `services/loaderd/src/application_jobs.rs` retains child authority
@@ -144,6 +144,8 @@ committing a zero-filled file tail. The TLA+ models, source-level tests, and
 
 **ELF:** loaderd emits `PT_LOAD` mappings for main image + `PT_INTERP` via `MAP_FILE_BROKER`. Each ET_DYN admission independently samples an aligned placement in a 64-GiB band (main starts near the process base; interpreter starts at +128 GiB). Load biases preserve every PT_LOAD alignment (supported up to 1 GiB), and admission remains bounded by the process window and non-overlap gate. Legacy ET_EXEC images retain their required fixed virtual addresses; they cannot gain image ASLR without being rebuilt as PIE. Foundation services, including rootd, are genuine zero-link-base static PIEs; the runtime performs GOT-free RELATIVE/RELA self-relocation before entering Rust. Pre-loaderd bootstrap loading applies the same kind of randomization with boot-random. Must use `SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER` for minimal launch metadata (entry, phdr, phnum, phent, brk_start, interpreter_base) — **not** raw blob streaming via `SET_IMAGE_BLOB_BROKER`. Kernel derives launch state from this metadata and the pre-built address space.
 
+**Native ABI stamp:** after ELF admission of the main executable, loaderd checks the `.note.rustos.abi` stamp through `admit_native_abi_stamp` (bounded `PT_NOTE` reads). Unstamped images are unchanged; an unsupported revision or malformed/duplicate note fails the spawn with `ENOEXEC`. The stamp is a compatibility hint only: it never selects a personality or feeds rootd policy. Format and lifecycle: `docs/ai/abi/core.md` ("Native ABI revision stamp").
+
 The main ELF's admitted header, complete bounded program-header table, and
 derived load bias form one immutable loaderd admission snapshot for that open
 description. Segment mapping reuses it; it must not repeat the header/table
@@ -195,7 +197,27 @@ validates the actual sealed object (including bounded full-content readback),
 returns format/length with PID -1, and NEVER prepares/maps/commits/activates a
 process. The opt-in `RUSTOS_RUNTIME_IMAGE_PROBE` uses this production work
 protocol from a background runtimed thread after WayClick activation; ordinary
-images add neither the probe thread nor browser autostart.
+images add neither the probe thread nor browser autostart. The separate
+`RUSTOS_RUNTIME_MAPPING_PROBE=/absolute/image` build opt-in instead exercises
+the production scheduling-authority and deferred-spawn path on that background
+thread, then terminates the still-suspended child without activation. It emits
+`image-mapping-probe committed-and-terminated ... activated=0` only after both
+operations succeed; failed termination retains the child in runtimed's existing
+cleanup-retry custody. This proves image construction, not dynamic-loader or
+application execution, physical reclamation, or end-to-end application launch.
+Never leave either diagnostic option enabled in the final ordinary image.
+
+The 2026-11-12 1-vCPU mapping-probe acceptance for Chrome snapshot SHA-256
+`fa67e06a5bcd0525739996fb8e3ecff449039e6165c15ea7968d3935e59e829e`
+matched the host bundle's 306,789,704 bytes. Chrome plus interpreter mappings
+aliased 293,171,200 file bytes and copied 13,841,838 (95.491% less file-byte
+copying than the original all-copy path). This is not a matched startup-timing
+benchmark: the initial VFS snapshot still took 58.5 seconds, repeated `.so` IPC
+is not solved by image sharing, and browser code was never activated. Evidence
+is `build/goal-401795-evidence/mapping-probe-{debugcon.log,summary.json}`. The
+ordinary signed image was subsequently rebuilt with both probe variables unset
+and passed 4-vCPU smoke with 50% host CPU pressure and live input ingress;
+that unsealed smoke is not formal PR-gate evidence.
 
 After staging, image reads and nested policy IPC remain ordinary preemption/
 block points, but loaderd must not insert voluntary scheduler yields between mapping,
@@ -332,8 +354,26 @@ sealed-image cache has its separate 64-MiB ceiling. The reservation follows the
 owned result through reply/discard. It is not a pre-funded rootd Job grant:
 physical/Job allocation can still return ENOMEM. The process broker continues
 to reject live VFS handles and partially sealed memfds. Commit may allocate and copy page-table backing, but it must not issue
-nested vfsd/storage IPC or re-read a mutable path after validation. This closes
-the validation/commit content race, removes redundant storage reads, and keeps
+nested vfsd/storage IPC or re-read a mutable path after validation. Full pages
+of a page-aligned, terminally sealed backing may instead be aliased read-only;
+writable segments, unaligned file offsets, partial file pages and zero-fill
+remain owned private pages. This is a format-neutral MM mechanism used for both
+ELF and PE ranges, not kernel image parsing. The execution root retains each
+backing lease **before** PTE publication, through failed prepare/spawn, fork,
+exec replacement and final inactive-root reclamation. Custody is conservatively
+held until root retirement even after partial unmap; only the bounded initial
+image construction and its forks admit such leases. Private aliases never
+become shared-futex identities. A write protection upgrade stages private
+copies and exact owned-frame descriptors for the complete affected range before
+any PTE replacement; allocation failure leaves old bytes/rights intact. Fork
+reproduces external aliases with independent custody; unmap splits the live
+range ledger only after its TLB barrier. Mapping metadata is charged to the
+target Job, including split headroom and retained root custody. The
+`proc-image-bytes` milestone reports aliased file bytes in arg0 and copied file
+bytes in arg1 (neither is storage throughput). The existing MM boot smoke
+exercises real alias/fork/private-upgrade/mixed-unmap behavior; host tests cover
+boundary planning and pin-delayed backing destruction. This closes the
+validation/commit content race, removes redundant storage reads, and keeps
 service-owned storage policy out of ring0.
 
 Every syscall captures the entering user's complete SIMD/FPU image in a

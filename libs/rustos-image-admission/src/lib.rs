@@ -22,6 +22,7 @@ pub const ELF64_PT_LOAD: u32 = 1;
 pub const ELF64_PT_INTERP: u32 = 3;
 pub const ELF64_PT_SHLIB: u32 = 5;
 pub const ELF64_PT_PHDR: u32 = 6;
+pub const ELF64_PT_NOTE: u32 = 4;
 pub const ELF64_ET_EXEC: u16 = 2;
 pub const ELF64_ET_DYN: u16 = 3;
 pub const ELF64_EM_X86_64: u16 = 62;
@@ -374,6 +375,84 @@ fn align_to(value: u64, alignment: u64) -> Result<u64, ByteAdmissionError> {
         .checked_add(alignment - 1)
         .map(|aligned| aligned & !(alignment - 1))
         .ok_or(ByteAdmissionError::AddressOverflow)
+}
+
+/// Most `PT_NOTE` segments examined for a native ABI stamp. Linkers emit one or
+/// two; further note segments are ignored.
+pub const NATIVE_ABI_MAX_NOTE_SEGMENTS: usize = 8;
+/// Bytes read from the start of any one `PT_NOTE` segment. A longer segment is
+/// read only up to this bound, so a hostile `p_filesz` costs one fixed read.
+/// A stamp beyond the bound is simply not seen (the image counts as
+/// unstamped); the stamp is a hint, so this cannot widen anything.
+pub const NATIVE_ABI_NOTE_READ_MAX: usize = 4096;
+
+/// Why `loaderd` refuses an image on its native ABI stamp.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeAbiRefusal {
+    /// The stamp names a revision outside `NATIVE_ABI_SUPPORTED_REVISIONS`.
+    UnsupportedRevision(u32),
+    /// A RustOS ABI note is structurally wrong or appears more than once.
+    MalformedNote,
+}
+
+/// Inspects the image's `PT_NOTE` segments for the native ABI stamp.
+///
+/// `phdrs` is the full program-header table already accepted by
+/// [`admit_elf64_image`]. `read(offset, buf)` is a `pread`: it returns the
+/// number of bytes read, which may be short at end of file. Returns
+/// `Ok(None)` for an image with no stamp (an ordinary ELF, behaviour
+/// unchanged), `Ok(Some(rev))` for a stamped image of a supported revision,
+/// and `Err(refusal)` otherwise. Errors from `read` are returned as `Err`
+/// in the outer result.
+///
+/// The stamp is a self-declared compatibility hint and carries no authority:
+/// callers must not derive a personality, capability or policy decision from a
+/// present stamp.
+pub fn admit_native_abi_stamp<E>(
+    phdrs: &[u8],
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<usize, E>,
+) -> Result<Result<Option<u32>, NativeAbiRefusal>, E> {
+    use rustos_user_abi::abi_revision::{
+        is_supported_native_abi_revision, parse_native_abi_note_aligned, NoteOutcome,
+    };
+    let mut buf = [0_u8; NATIVE_ABI_NOTE_READ_MAX];
+    let mut examined = 0_usize;
+    let mut found: Option<u32> = None;
+    for ph in phdrs.chunks_exact(ELF64_PROGRAM_HEADER_SIZE) {
+        if read_u32(ph, 0).ok() != Some(ELF64_PT_NOTE) {
+            continue;
+        }
+        examined += 1;
+        if examined > NATIVE_ABI_MAX_NOTE_SEGMENTS {
+            break;
+        }
+        let (Ok(offset), Ok(filesz), Ok(align)) =
+            (read_u64(ph, 8), read_u64(ph, 32), read_u64(ph, 48))
+        else {
+            continue;
+        };
+        let len = filesz.min(NATIVE_ABI_NOTE_READ_MAX as u64) as usize;
+        if len == 0 || offset.checked_add(len as u64).is_none_or(|end| end > i64::MAX as u64) {
+            continue;
+        }
+        let got = read(offset, &mut buf[..len])?.min(len);
+        match parse_native_abi_note_aligned(&buf[..got], if align == 8 { 8 } else { 4 }) {
+            NoteOutcome::Absent => {}
+            NoteOutcome::Malformed => return Ok(Err(NativeAbiRefusal::MalformedNote)),
+            NoteOutcome::Valid(revision) => {
+                if found.is_some() {
+                    return Ok(Err(NativeAbiRefusal::MalformedNote));
+                }
+                found = Some(revision);
+            }
+        }
+    }
+    Ok(match found {
+        Some(revision) if !is_supported_native_abi_revision(revision) => {
+            Err(NativeAbiRefusal::UnsupportedRevision(revision))
+        }
+        other => Ok(other),
+    })
 }
 
 /// Validate the complete ELF64 header and program-header byte table used by
@@ -1554,5 +1633,211 @@ mod tests {
             validate_pe64_import_table(&ordinal, 0x20, 40, 8),
             Err(ByteAdmissionError::InvalidValue)
         );
+    }
+}
+
+#[cfg(test)]
+mod native_abi_stamp_tests {
+    use super::*;
+    use rustos_user_abi::abi_revision::{
+        encode_native_abi_note, NATIVE_ABI_REVISION_CURRENT,
+    };
+    use std::vec::Vec;
+
+    fn note_phdr(offset: u64, filesz: u64, align: u64) -> [u8; ELF64_PROGRAM_HEADER_SIZE] {
+        let mut ph = [0_u8; ELF64_PROGRAM_HEADER_SIZE];
+        ph[0..4].copy_from_slice(&ELF64_PT_NOTE.to_le_bytes());
+        ph[4..8].copy_from_slice(&4_u32.to_le_bytes());
+        ph[8..16].copy_from_slice(&offset.to_le_bytes());
+        ph[32..40].copy_from_slice(&filesz.to_le_bytes());
+        ph[48..56].copy_from_slice(&align.to_le_bytes());
+        ph
+    }
+
+    fn load_phdr() -> [u8; ELF64_PROGRAM_HEADER_SIZE] {
+        let mut ph = [0_u8; ELF64_PROGRAM_HEADER_SIZE];
+        ph[0..4].copy_from_slice(&ELF64_PT_LOAD.to_le_bytes());
+        ph
+    }
+
+    /// File image `file`, program headers: one PT_LOAD then each `(off, len)`
+    /// as a 4-aligned PT_NOTE.
+    fn run(
+        file: &[u8],
+        notes: &[(u64, u64)],
+    ) -> Result<Result<Option<u32>, NativeAbiRefusal>, ()> {
+        let mut phdrs = Vec::new();
+        phdrs.extend_from_slice(&load_phdr());
+        for (off, len) in notes {
+            phdrs.extend_from_slice(&note_phdr(*off, *len, 4));
+        }
+        admit_native_abi_stamp(&phdrs, |off, buf| {
+            let off = off as usize;
+            if off >= file.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(file.len() - off);
+            buf[..n].copy_from_slice(&file[off..off + n]);
+            Ok(n)
+        })
+    }
+
+    #[test]
+    fn valid_current_revision_is_admitted() {
+        let n = encode_native_abi_note(NATIVE_ABI_REVISION_CURRENT);
+        assert_eq!(run(&n, &[(0, 24)]), Ok(Ok(Some(NATIVE_ABI_REVISION_CURRENT))));
+    }
+
+    #[test]
+    fn unsupported_revision_is_refused() {
+        let n = encode_native_abi_note(NATIVE_ABI_REVISION_CURRENT + 1);
+        assert_eq!(
+            run(&n, &[(0, 24)]),
+            Ok(Err(NativeAbiRefusal::UnsupportedRevision(
+                NATIVE_ABI_REVISION_CURRENT + 1
+            )))
+        );
+        let n = encode_native_abi_note(0);
+        assert_eq!(
+            run(&n, &[(0, 24)]),
+            Ok(Err(NativeAbiRefusal::UnsupportedRevision(0)))
+        );
+    }
+
+    #[test]
+    fn malformed_note_is_refused() {
+        let mut n = encode_native_abi_note(1).to_vec();
+        n[4..8].copy_from_slice(&8_u32.to_le_bytes()); // descsz != 4
+        assert_eq!(run(&n, &[(0, 24)]), Ok(Err(NativeAbiRefusal::MalformedNote)));
+        // p_filesz cuts the note short.
+        let n = encode_native_abi_note(1);
+        assert_eq!(run(&n, &[(0, 22)]), Ok(Err(NativeAbiRefusal::MalformedNote)));
+        // File ends inside the note.
+        assert_eq!(run(&n[..22], &[(0, 24)]), Ok(Err(NativeAbiRefusal::MalformedNote)));
+    }
+
+    #[test]
+    fn absent_stamp_leaves_behaviour_unchanged() {
+        // No PT_NOTE at all.
+        assert_eq!(run(&[], &[]), Ok(Ok(None)));
+        // PT_NOTE with only a foreign note.
+        let mut gnu = std::vec![4, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0];
+        gnu.extend_from_slice(b"GNU\0\x01\x02\x03\x04");
+        assert_eq!(run(&gnu, &[(0, gnu.len() as u64)]), Ok(Ok(None)));
+        // Empty, out-of-file and overflowing PT_NOTE segments are ignored.
+        assert_eq!(run(&gnu, &[(0, 0), (1 << 40, 24), (u64::MAX - 4, 100)]), Ok(Ok(None)));
+    }
+
+    #[test]
+    fn multiple_notes_across_segments_are_refused() {
+        let mut f = encode_native_abi_note(1).to_vec();
+        f.extend_from_slice(&encode_native_abi_note(1));
+        assert_eq!(
+            run(&f, &[(0, 24), (24, 24)]),
+            Ok(Err(NativeAbiRefusal::MalformedNote))
+        );
+        // Same segment, two notes.
+        assert_eq!(run(&f, &[(0, 48)]), Ok(Err(NativeAbiRefusal::MalformedNote)));
+    }
+
+    #[test]
+    fn oversized_segment_is_read_once_and_bounded() {
+        let mut f = encode_native_abi_note(1).to_vec();
+        f.resize(1 << 20, 0);
+        let mut phdrs = Vec::new();
+        phdrs.extend_from_slice(&note_phdr(0, u64::MAX / 2, 4));
+        let mut reads = 0;
+        let mut largest = 0;
+        let out = admit_native_abi_stamp(&phdrs, |off, buf| {
+            reads += 1;
+            largest = largest.max(buf.len());
+            let n = buf.len().min(f.len() - off as usize);
+            buf[..n].copy_from_slice(&f[off as usize..off as usize + n]);
+            Ok::<_, ()>(n)
+        });
+        assert_eq!(out, Ok(Ok(Some(1))));
+        assert_eq!(reads, 1);
+        assert_eq!(largest, NATIVE_ABI_NOTE_READ_MAX);
+        // Padding after the stamp is zeros: zero namesz/descsz notes walk to
+        // the end without a stamp, so a stamp past the bound reads as absent.
+        let mut g = std::vec![0_u8; NATIVE_ABI_NOTE_READ_MAX];
+        g.extend_from_slice(&encode_native_abi_note(1));
+        assert_eq!(
+            run(&g, &[(0, g.len() as u64)]),
+            Ok(Ok(None))
+        );
+    }
+
+    #[test]
+    fn note_segments_beyond_the_examined_cap_are_ignored() {
+        let n = encode_native_abi_note(1);
+        let notes: Vec<(u64, u64)> = (0..NATIVE_ABI_MAX_NOTE_SEGMENTS)
+            .map(|_| (24_u64, 0_u64))
+            .chain([(0, 24)])
+            .collect();
+        assert_eq!(run(&n, &notes), Ok(Ok(None)));
+    }
+
+    fn ph(kind: u32, flags: u32, off: u64, vaddr: u64, filesz: u64, memsz: u64, align: u64) -> [u8; ELF64_PROGRAM_HEADER_SIZE] {
+        let mut p = [0_u8; ELF64_PROGRAM_HEADER_SIZE];
+        p[0..4].copy_from_slice(&kind.to_le_bytes());
+        p[4..8].copy_from_slice(&flags.to_le_bytes());
+        p[8..16].copy_from_slice(&off.to_le_bytes());
+        p[16..24].copy_from_slice(&vaddr.to_le_bytes());
+        p[24..32].copy_from_slice(&vaddr.to_le_bytes());
+        p[32..40].copy_from_slice(&filesz.to_le_bytes());
+        p[40..48].copy_from_slice(&memsz.to_le_bytes());
+        p[48..56].copy_from_slice(&align.to_le_bytes());
+        p
+    }
+
+    /// A dynamic ET_DYN image (PT_INTERP + PT_LOAD + PT_NOTE holding a foreign
+    /// build-id note and the stamp) passes ELF admission and the stamp gate.
+    #[test]
+    fn dynamic_elf_with_interp_and_note_is_admitted() {
+        let interp = b"/lib64/ld-linux-x86-64.so.2\0";
+        let mut file = std::vec![0_u8; 64 + 3 * 56];
+        let note_off = file.len();
+        let mut notes = std::vec![4, 0, 0, 0, 20, 0, 0, 0, 3, 0, 0, 0];
+        notes.extend_from_slice(b"GNU\0");
+        notes.extend_from_slice(&[0xab; 20]);
+        notes.extend_from_slice(&encode_native_abi_note(NATIVE_ABI_REVISION_CURRENT));
+        file.extend_from_slice(&notes);
+        let interp_off = file.len();
+        file.extend_from_slice(interp);
+        file.resize(0x2000, 0);
+        let mut phdrs = Vec::new();
+        phdrs.extend_from_slice(&ph(ELF64_PT_INTERP, 4, interp_off as u64, interp_off as u64, interp.len() as u64, interp.len() as u64, 1));
+        phdrs.extend_from_slice(&ph(ELF64_PT_LOAD, ELF64_PF_R | ELF64_PF_X, 0, 0, 0x2000, 0x2000, 0x1000));
+        phdrs.extend_from_slice(&ph(ELF64_PT_NOTE, 4, note_off as u64, note_off as u64, notes.len() as u64, notes.len() as u64, 4));
+        file[..4].copy_from_slice(b"\x7fELF");
+        file[4] = 2;
+        file[5] = 1;
+        file[6] = 1;
+        file[16..18].copy_from_slice(&3_u16.to_le_bytes());
+        file[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        file[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        file[24..32].copy_from_slice(&0x100_u64.to_le_bytes());
+        file[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        file[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        file[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        file[56..58].copy_from_slice(&3_u16.to_le_bytes());
+        file[64..64 + 168].copy_from_slice(&phdrs);
+        let header: [u8; ELF64_HEADER_SIZE] = file[..64].try_into().unwrap();
+        let summary = admit_elf64_image(&header, &phdrs, 0x10_0000, 0x1000, 1 << 40).unwrap();
+        assert!(summary.has_interpreter);
+        let verdict = admit_native_abi_stamp(&phdrs, |off, buf| {
+            let off = off as usize;
+            buf.copy_from_slice(&file[off..off + buf.len()]);
+            Ok::<_, ()>(buf.len())
+        });
+        assert_eq!(verdict, Ok(Ok(Some(NATIVE_ABI_REVISION_CURRENT))));
+    }
+
+    #[test]
+    fn read_errors_propagate() {
+        let mut phdrs = Vec::new();
+        phdrs.extend_from_slice(&note_phdr(0, 24, 4));
+        assert_eq!(admit_native_abi_stamp(&phdrs, |_, _| Err::<usize, _>(5)), Err(5));
     }
 }

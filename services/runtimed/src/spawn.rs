@@ -1024,6 +1024,24 @@ pub(super) fn spawn_exec(
     )
 }
 
+/// Developer-only caller lives behind RUSTOS_RUNTIME_MAPPING_PROBE. Exercise
+/// the production authority/loader path, but never activate the admitted image.
+pub(super) fn probe_suspended_image(exec_path: &str) -> Result<(), i32> {
+    let deadline = runtime_control::monotonic_nanos()?
+        .checked_add(rustos_user_abi::syscall::LOADER_APPLICATION_WORK_MAX_LEASE_MS * 1_000_000)
+        .ok_or(libc::EOVERFLOW)?;
+    let pid = spawn_exec_with_deadline(
+        exec_path, &[exec_path.to_owned()], &[], false,
+        DEFAULT_USER_TASK_WEIGHT_MICROS, 0, true, Some(deadline),
+    )?;
+    if let Err(errno) = cleanup_failed_spawn(pid, terminate_pid) {
+        // Never abandon an admitted suspended child on a refused cleanup.
+        unretired_pids().insert(pid);
+        return Err(errno);
+    }
+    Ok(())
+}
+
 fn spawn_exec_with_deadline(
     exec_path: &str,
     argv: &[String],

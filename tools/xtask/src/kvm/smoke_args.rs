@@ -62,6 +62,19 @@ struct SmokeOptions {
     /// Arm `apps/procstress` (fork, COW, mmap/mprotect/munmap churn) and wait
     /// for its completion marker; panics are caught by the ordinary checks.
     proc_stress: bool,
+    /// Arm `apps/localfdprobe` (pipe/eventfd semantics; `local_fd_probe.rs`).
+    local_fd_probe: bool,
+    /// Arm `apps/libmapprobe` and require its runtime proof markers.
+    library_map_probe: bool,
+    /// Arm the `apps/wayclick` app DMA-BUF probe (`app_dmabuf_probe.rs`).
+    app_dmabuf_probe: bool,
+    /// Arm the `mode=mmapcost` branch of `apps/libmapprobe` (`mmap_cost_probe.rs`).
+    mmap_cost_probe: bool,
+    /// File sizes (MiB) the mmap-cost probe measures.
+    mmap_cost_sizes_mib: Vec<u64>,
+    /// With `oom_hog` and `library_map_probe`: hold a live alias mapping while
+    /// pagerd reclaims library objects under pressure.
+    library_reclaim_probe: bool,
     /// Drop a signed release bundle on the volume and require loaderd to
     /// verify it with the test key and rootd to stage it.
     release_stage_probe: bool,
@@ -131,6 +144,12 @@ where
         oom_hog_job_limit: false,
         job_policy_probe: false,
         proc_stress: false,
+        local_fd_probe: false,
+        library_map_probe: false,
+        app_dmabuf_probe: false,
+        mmap_cost_probe: false,
+        mmap_cost_sizes_mib: MMAP_COST_DEFAULT_SIZES_MIB.to_vec(),
+        library_reclaim_probe: false,
         release_stage_probe: false,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
@@ -216,6 +235,17 @@ where
                 options.oom_hog_job_limit = true;
             }
             "--proc-stress" => options.proc_stress = true,
+            "--local-fd-probe" => options.local_fd_probe = true,
+            "--library-map-probe" => options.library_map_probe = true,
+            "--app-dmabuf-probe" => options.app_dmabuf_probe = true,
+            "--mmap-cost-probe" => options.mmap_cost_probe = true,
+            "--mmap-cost-sizes-mib" => {
+                options.mmap_cost_sizes_mib = parse_mmap_cost_sizes(&next_value(&mut args, &arg)?)?;
+            }
+            "--library-reclaim-probe" => {
+                options.library_map_probe = true;
+                options.library_reclaim_probe = true;
+            }
             "--release-stage-probe" => options.release_stage_probe = true,
             "--oom-hog-watchdog" => {
                 options.oom_hog = true;
@@ -334,6 +364,48 @@ where
         options
             .expected_markers
             .push(RELEASE_PROBE_STAGED_MARKER.to_owned());
+    }
+    if options.library_map_probe {
+        // Session programs start only once the graphical session is up, and the
+        // warmed libraries live on the DVM-backed volume.
+        options.gui_dvm_surfaces = true;
+        if options.library_reclaim_probe {
+            if !options.oom_hog || options.oom_hog_watchdog || options.oom_hog_job_limit {
+                bail!("--library-reclaim-probe needs plain --oom-hog (rootd-governed pressure)");
+            }
+            options
+                .expected_markers
+                .push(LIBRARY_RECLAIM_SURVIVED_MARKER.to_owned());
+            options
+                .expected_markers
+                .push(PAGERD_LIBRARY_RECLAIMED_MARKER.to_owned());
+        } else {
+            options
+                .expected_markers
+                .push(LIBRARY_MAP_PROBE_DONE_MARKER.to_owned());
+        }
+    }
+    if options.mmap_cost_probe {
+        if options.library_map_probe {
+            bail!("--mmap-cost-probe and --library-map-probe share one probe program; run them separately");
+        }
+        // Session programs start only once the graphical session is up, and the
+        // measured files live on the DVM-backed volume.
+        options.gui_dvm_surfaces = true;
+        options
+            .expected_markers
+            .push(format!("{MMAP_COST_DONE_MARKER}{}", options.mmap_cost_sizes_mib.len()));
+    }
+    if options.app_dmabuf_probe {
+        // wayclick starts with the graphical session from the DVM-backed volume,
+        // and the app aperture exists only in the GUI-DVM topology.
+        options.gui_dvm_surfaces = true;
+        options.expected_markers.extend(app_dmabuf_probe_markers().into_iter().map(str::to_owned));
+    }
+    if options.local_fd_probe {
+        // Session programs start only once the graphical session is up.
+        options.gui_dvm_surfaces = true;
+        options.expected_markers.extend(local_fd_probe_markers());
     }
     if options.proc_stress {
         // Session programs start only once the graphical session is up.

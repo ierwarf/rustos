@@ -212,6 +212,7 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for WaylandState {
                             height,
                             stride,
                             has_alpha,
+                            app_dmabuf: false,
                             _ticket: ticket,
                         }),
                     },

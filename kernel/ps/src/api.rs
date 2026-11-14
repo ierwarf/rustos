@@ -44,7 +44,7 @@ pub use crate::multitask::{
     linux_thread_snapshot_by_ids, live_user_process_identity_by_pid,
     live_user_process_identity_with_exact_exec_path, mark_user_process_exiting,
     mark_user_process_exiting_once, next_retired_task_cleanup, note_process_exit_status,
-    pager_fault_snapshot, pager_vma_regions_for_process, protect_pager_vma_for_process,
+    first_user_mapping_conflict, pager_fault_snapshot, pager_vma_regions_for_process, protect_pager_vma_for_process,
     publish_current_pager_vma, publish_inherited_pager_vma_for_process,
     publish_pager_vma_for_process, queue_linux_process_sigchld, queue_linux_signal,
     register_pager_fault_waiter, release_ipc_priority, release_pager_fault_priority,
@@ -68,12 +68,14 @@ pub use crate::multitask::{
     with_current_process_state, with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_fork_parent_state, with_process_state_by_pid, with_process_state_by_pid_mut,
+    with_process_state_for_teardown_mut,
+    with_process_state_by_generation_mut,
     with_validated_fault_address_space, ExecRefusal,
 };
 pub use crate::multitask::{
     AffinityCommit, AffinityError, CurrentUserSnapshot, FastIpcCallHandoffOutcome,
     PagerChargeSnapshot, PagerFaultReservation, PagerFaultSlotError, PagerFaultState,
-    PagerVmaError, PagerVmaSnapshot, ProcessAffinitySnapshot, RetainedCurrentUserAddressSpace,
+    ExpectedMm, PagerVmaError, PagerVmaSnapshot, ProcessAffinitySnapshot, RetainedCurrentUserAddressSpace,
     RetainedCurrentUserProcessState, RetiredTaskCleanup, SchedulingContextAdmission,
     SpawnTaskError, Thread, UserFaultDisposition, UserStackState, UserTaskBootstrap,
     UserTaskRegisters, WaitChildResult, DEFAULT_USER_TASK_WEIGHT_MICROS, MAX_SCHEDULER_TASKS,
@@ -101,7 +103,15 @@ pub use crate::user::linux::{
     LinuxRuntimeProfile, LinuxSigAction, LinuxSignalStack, LinuxTermios, LinuxThreadState,
     LinuxVma, LinuxVmaFlags, LinuxVmaName,
 };
+pub use crate::user::eventfd::{EventFdError, EventFdHandle, EVENTFD_MAX_COUNTER};
+pub use crate::user::local_wait::{
+    readiness_of as local_fd_readiness_of, LocalReadiness, LocalRelease, LocalWake,
+};
 pub use crate::user::memfd::{MemfdError, MemfdHandle, MemfdMappingHold};
+pub use crate::user::pipe::{
+    PipeCapacityError, PipeError, PipeHandle, PipeReadError, PipeProgress, PipeRole, PIPE_BUF,
+    PIPE_MAX_CAPACITY,
+};
 pub use crate::user::process_state::{
     ProcessSecurityContext, SharedFutexBackingKey, UserProcessState,
 };

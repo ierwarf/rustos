@@ -32,7 +32,7 @@ and owners must not be confused with that historical design input:
 | Resource | Current shape | Source |
 | --- | --- | --- |
 | Process slots | Default admission 32; chunked storage up to 4,096 slots (internal ceiling), with a runtime/root-job policy limit | [process_table.rs](../../kernel/ps/src/multitask/process_table.rs), [slot_dir.rs](../../kernel/ps/src/multitask/slot_dir.rs) |
-| Threads | Job-level counted limit; per-process structural ceiling still 32 | [process_table.rs](../../kernel/ps/src/multitask/process_table.rs) |
+| Threads | Job-level counted limit; per-process structural ceiling 128 (`MAX_THREADS_PER_PROCESS`), global task table 256 (`MAX_TASK`) | [process_table.rs](../../kernel/ps/src/multitask/process_table.rs) |
 | Jobs | Generation-bound tree, 64 internal slots | [jobs.rs](../../kernel/ps/src/multitask/process_table/jobs.rs) |
 | Resident user memory | Per-job hierarchical page charging and admission | [Phase 2b-ii](#phase-2b-ii-memory-limit-as-built) |
 | Service identity | Static numeric IDs and legacy capability bits remain | [Ring3 process model](ring3-process-model.md) |
@@ -95,11 +95,13 @@ cannot alias a stale handle**)**. Its capacity is a limit of the root job
 
 **Process → job.** `ProcessObject` gains a `job: JobRef`, set when the process
 is reserved (`reserve_spawn`) from a job handle that holds `CREATE_PROCESS`.
-The frame-descriptor ledger's root record also carries the `JobId` so a data-leaf
-claim can find its charge target without taking the process table lock
-**(proposed)**. Today the root record keeps a per-root data-leaf count that the
-memory census already reads **(verified**, `data_leaf_count`**)**; the job simply
-makes that count hierarchical.
+The frame-descriptor ledger's root record carries its charge-group binding so a
+data-leaf claim finds its hierarchical charge target without taking the process
+table lock. The memory census combines the root's owned data-leaf count with an
+atomic, execution-pin-retained count of whole immutable backing pages. The
+latter stays visible after unmap while the root still retains those objects;
+these are resident admission costs, not Linux's mapped-only RSS. Census readers
+never inspect a mutable backing list or acquire a process-state lock.
 
 **Moniker.** The kernel stores no path. `rootd` keeps `moniker → JobId`.
 
@@ -140,9 +142,14 @@ of the creating process, and propagates to every ancestor.
 | `memory.high_pages` | same | same | event only in v1 (no throttling) | no equivalent |
 | `memory.min_pages` | a guarantee, not a charge | admission when set: `Σ children.min ≤ parent.effective.min` | refuse `SET_LIMITS` | the watchdog's service-endpoint heuristic |
 | `kmem.max_bytes` | kernel objects made for the job (process objects, VMA tables, handle tables) | the allocation site | `ENOMEM` | unbounded ring0 `Vec`s |
-| `jobs.max`, `processes.max`, `threads.max` | live objects | create | `EAGAIN` | 32, 32 |
+| `jobs.max`, `processes.max`, `threads.max` | live objects | create | `EAGAIN` | 64, 32 |
 | `handles.max`, `endpoints.max`, `ipc_objects.max` | live objects | create | `EMFILE` / `ENOSPC` | 32/8, 16, 1 024 |
 | `sched.domain` | a reference to an existing scheduling domain | admission | inherit the parent's | `MAX_SCHEDULING_DOMAINS` call sites |
+
+Process publication preserves this distinction through the root constructor:
+resident or kernel-memory charge refusal reports `ENOMEM`, while process/task
+admission and a lost reservation report `EAGAIN`. An unpublished refusal rolls
+back its root loan and scheduler slot.
 
 CPU stays in the existing scheduling-domain admission, which already enforces a
 utilization quota **(verified**, `domain_admission.rs`**)**. A job names a domain;
@@ -235,7 +242,7 @@ as `rootd` policy over ring0 measurement here.
 
 The former `MAX_PROCESS_OBJECTS`-sized arrays are now chunked, non-moving
 directories; see [Phase 2a as built](#phase-2a-as-built). The admitted limit
-defaults to 32, but the storage ceiling is 4,096. Per-process VMA capacity
+defaults to 64, but the storage ceiling is 4,096. Per-process VMA capacity
 remains bounded, with its tables and writer locks in chunked directories.
 
 Do not treat the earlier two-level directory proposal as unimplemented.
@@ -435,12 +442,12 @@ full, grows the same way (128-entry chunks).
 Decisions and limits, so they are not read as the final form:
 
 - **The limit is a runtime variable, not yet job policy.** `process_limit()`
-  defaults to 32 (`DEFAULT_PROCESS_LIMIT`), `set_process_limit` clamps to the
+  defaults to 64 (`DEFAULT_PROCESS_LIMIT`; it was 32 until a multi-process browser needed more than the dozen slots left beside ~20 services), `set_process_limit` clamps to the
   directory ceiling of 4096 slots, and lowering it never evicts a live process.
   Nothing sets it yet: wiring it to the root job's `processes.max` needs
   `SET_LIMITS`, which is phase 2b. Boot behaviour is therefore unchanged.
-- **Other constants remain.** Threads per process (32, which also sizes each
-  placement cell), the job slab (64 jobs, depth 8), service endpoints (16), and
+- **Other constants remain.** Threads per process (128, which also sizes each
+  placement cell, about 8 KiB per process; the global task table is 256 slots, one 2 MiB heap-backed kernel stack per live thread, so the kernel heap of about RAM/8 bounds live threads on a small VM before the table does), the job slab (64 jobs, depth 8), service endpoints (16), and
   the other fixed tables listed in section 1 are untouched.
 - **Chunks are leaked on purpose.** A process slot index is stable for the life
   of the system; memory is only ever added.
@@ -501,10 +508,10 @@ value, reachable through a handle that holds `SET_LIMITS`.
   table lock, which is right for process and thread admission (rare events). The
   stock-and-batch design of section 6 is for the page-fault path and arrives
   with memory.
-- **Policy.** `rootd` sets no limit at boot; the defaults (root processes 32,
+- **Policy.** `rootd` sets no limit at boot; the defaults (root processes 64,
   everything else unset) keep boot behaviour unchanged. The boot self-check
   exercises set, read-back, clamp reporting and the missing-right refusal.
-- **`handles.max`, `endpoints.max`, `ipc_objects.max`** and the 32-threads-per-
+- **`handles.max`, `endpoints.max`, `ipc_objects.max`** and the 128-threads-per-
   process structural cap are untouched.
 - A scan of the process slots per admission is O(slots x depth); fine at tens
   of processes, to be indexed when the table is large.
@@ -527,30 +534,77 @@ commit), job ABI v4 (`JOB_LIMIT_MEMORY_PAGES`) and `rootd`. Model:
 `memory-charge-conservation`.
 
 How it works: each job owns a **charge group** of the same index (64, asserted
-equal to the job slab). A process's address-space root is bound to its job's
-group once, in the root's otherwise unused `next_or_virtual_address` word. The
-ledger charges the group exactly where it raises the root's data-leaf count (the
-exclusive, shared-alias and private-file publish sites) and uncharges where it
-lowers it (`decrement_root_data_count_with`), and the charge propagates to every
-ancestor, so a group's usage equals the pages held at or below it by
-construction. Binding a root that already holds pages (a new image, a forked
-child, an exec's new image) charges what it holds, forcibly. `memory_pages` is the
-group's own limit; the effective limit is the tightest on the chain.
+equal to the job slab). A process root binds once to its job's group; each
+charge also traverses the inherited ancestor chain, so either a job's limit or
+an ancestor's limit can refuse growth. Exclusive data and private-file claims
+reserve a page before publishing a descriptor; shared-alias preparation reserves
+one for the new root. A cancelled claim returns its reservation, publication
+converts it into a live leaf without billing twice, and leaf release refunds it.
+Thus usage includes staged claims as well as live leaves. COW replacement
+transfers the old mapping's charge to its replacement, so replacing a page at
+the limit needs no extra page budget.
 
-**Enforcement.** Before a root claims a page the caller asks `root_admits`, and a
-refusal is `AddressSpaceError::OutOfFrames`, the same error a watermark denial
-returns: the first-touch gate returns its unpublished frame and reports a
-refused fault, and fault-around stops at the limit. The faulting thread then
-takes an unhandled page fault; there is no policy kill from the limit.
-Admission is advisory (checked before the claim, charged at publication), so a
-limit can be exceeded by pages in flight on other CPUs and by the forced charge
-at binding; usage never drifts from the ledger counts. The model carries that
-as an explicit slack that grows only by concurrent admissions and binding.
+Immutable external image aliases do not charge each PTE. Their execution root
+retains a typed backing lease and charges the entire resident page cost of each
+unique backing once per root, including unmapped pages retained by the same
+object. The backing supplier supplies an immutable identity and complete cost;
+for sealed memfds this is the stable object ID and the full frame count. Multiple
+aliases of one backing in a root do not double-charge. Fork binds the child's
+own backing custody to its job; separate roots each pay for their retained
+custody. Unmap or privatization does not refund the backing, because the root
+continues retaining the complete lease. Private replacement frames are charged
+separately. The backing charge is returned only after the last execution pin
+and cold root reclaim release that lease. Process memory-census ranking includes
+these retained pages as well as owned data leaves, using a lock-free counter
+on the execution root. Duplicate backing identities count once; a cancelled
+pre-publication mapping removes its provisional census cost.
 
-**Not done:**
+**memfd backing frames.** A memfd's frames belong to the object, not to any
+page-table root, so the data-leaf ledger never sees them. Each frame is therefore
+charged as one page to the resident-page group of the Job that created the memfd
+(recorded once at `memfd_create`; a creator with no published Job is
+unaccounted). The page is reserved before the frame is allocated, and refunded
+on allocation failure, on rollback of a staged grow, on `ftruncate` shrink, and
+exactly once when the last open description and mapping drop the object. A
+refused reservation fails the write or `ftruncate` with `ENOMEM` and leaves the
+old frames and charge intact. Shared mappings of a memfd install external
+leaves, which are not data leaves, so they add no second charge; only the
+immutable executable backing lease above bills the retaining root again, as
+separate custody. Frames outliving their creating Job keep billing it (its
+slot is not reused while usage is nonzero). A memfd created empty whose Job
+exits before its first grow is not pinned and would bill the slot's next tenant.
 
-- **Page-table frames and kernel objects are not charged**, so `memory.max`
-  bounds resident user data pages only. `kmem.max_bytes` is not implemented.
+**Enforcement.** `root_admits` is only an early advisory filter. The claim's
+atomic hierarchical reservation is authoritative: racing claims to the same
+job or shared ancestor cannot both consume the same available page. A losing
+claim reports `AddressSpaceError::OutOfFrames`; an invalid descriptor reports
+`InvalidFrameOwnership`. Multi-page immutable privatization stages all copies
+before changing any PTE; an allocation, claim, or quota failure cancels every
+staged claim and refunds the whole batch. Spawn and exec admit the already-built
+root's data leaves before publication, instead of forcibly charging them. Exec
+independently reserves the new image's immutable mapping metadata against the
+inherited `Vma` budget before sealing the old root or transferring handles and
+image state; a failure leaves the old image unchanged and reports `ENOMEM`. The
+old mapping meter remains held by its execution root until cold reclamation,
+even if its process state or an old mapping has already been released. During
+the transfer the old and new roots can both be charged until old-root
+retirement, so admission can
+conservatively refuse an exec whose final steady-state usage would fit.
+
+Immutable mapping edits reserve split headroom using the mapping meter's atomic
+hierarchical `set_total`, then reconcile to the actual metadata size after
+success or failure. This covers the affected immutable edit path; unrelated
+shared-mapping list operations and mandatory shared-unmap splits still use
+their existing advisory/forced accounting and can exceed the Vma limit. Limits
+may also be lowered below current usage without eviction. The existing
+`memory-charge-conservation` model predates claim-time reservation and does not
+by itself prove these new concurrent admission and rollback paths.
+
+**Historical phase limitations** (subsequent sections describe later work):
+
+- `memory.max` bounds resident user data pages only. Page-table frames and
+  selected kernel objects are now separately charged as described below;
+  a single aggregate `kmem.max_bytes` remains incomplete.
 - **`memory.high` and `memory.min`**, and the job-level OOM policy that would use
   `memory.min` as protection, are not implemented.
 - **Application jobs do not exist yet**, so no application has run into a job
@@ -598,7 +652,7 @@ loader's service job, including incomplete bounded retirement.
 spawn in a child of that realm, not in initd's protected service job. The
 loader retains supervisor custody in
 `services/loaderd/src/application_jobs.rs`, sets all three limits before
-prepare (8 processes, 64 threads, 524288 resident user-data pages), verifies
+prepare (32 processes, 128 threads, 524288 resident user-data pages), verifies
 membership before a successful reply, and retires the whole job on an error
 or failed terminal reply. Runtime-supplied placement handles are refused.
 Normal collection happens on the next loader request, not a new periodic boot
@@ -968,14 +1022,24 @@ budget for each):
 | `IpcEndpoint` | reserved endpoint queues | endpoint creation | endpoint teardown |
 | `PageTable` | root and every lazily published table frame (4 KiB) | `claim_table` (refused as `OutOfFrames`), root bind catch-up (forced) | `cancel_table`, `pop_table`, `unregister_root` |
 | `Thread` | the 2 MiB kernel stack of each user thread | process publication (first), `attach_task` | `detach_task`, `ProcessObject::drop` |
-| `Vma` | shared memfd / shared-region mapping records | before the mapping is installed (`admit_mapping_records`); list sync after | `Meter` drop, list shrink |
+| `Vma` | shared mapping and immutable-alias metadata | immutable split/exec growth reserved before mutation; shared records use advisory admission and forced list sync | list shrink, reservation reconciliation, or cold execution-root meter release |
 | `IpcMessage` | a queued synchronous call (object, request copy, handle vector) | sender's group, before any allocation | `EndpointMessageObject::drop` |
 
+| `DeviceBuffer` | app DMA-BUF aperture bytes (page-aligned allocation length) | installing process's group, with the per-table quota check and `install_transferred`; refunded if install fails | `BufferPool::reclaim_after_scrub` (a revoked but unreclaimed range keeps counting; duplicates share the one charge) |
+| `LibraryObject` (ABI id 8) | ring0 heap of a library-cache registry object (one 8-byte token word per page); the shared cache is a service resource, so the owning (pager) service Job pays | `Registry::create`, from the caller's `current_user_job_charge_group`, before allocating (refused as `ENOMEM`, nothing published) | object drop (retire, or a replaced pager lease) via `Meter` drop, exactly once |
+
 The allocation-free fast-call rendezvous allocates nothing and is not billed.
-Known limits: a thread's stack is allocated before `attach_task` bills it
-(overshoot bounded by one stack per CPU); splitting a shared mapping by unmap
-is charged without a limit check because unmap must not fail; pager VMA slots
-are a preallocated fixed table and are not a per-Job allocation. A boot-time
+Known limits: a thread's stack is allocated (`reserve_with` ->
+`prepare_storage`) before `attach_task` bills it, and a refused bill frees it
+at once, so the overshoot is transient and bounded by one stack per CPU that is
+reserving concurrently; splitting a shared mapping by unmap
+is charged without a limit check because unmap must not fail; pager VMA
+publication slots are not billed to a Job as a per-VMA allocation: each process
+slot owns a `ProcessVmaTable([PublishedPagerVma; 256])` (cap
+`PAGER_MAX_VMAS_PER_PROCESS`), built in 32-slot chunks when the process table
+grows (`grow_slots`) and never freed, so its total is bounded by the process
+table size, which the Job process-object quota in turn bounds; the leaf page
+tables behind those mappings are billed as `Class::PageTable`. A boot-time
 smoke (`kmem page-table limit smoke passed`) drives the real allocator into the
 page-table limit on every boot. Full cgroup-style `kmem.max_bytes` aggregation
 across classes is still per-class, not one shared total. The signed service upgrade

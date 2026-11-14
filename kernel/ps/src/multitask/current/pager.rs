@@ -126,7 +126,7 @@ pub fn publish_current_pager_vma(
 ) -> Result<rustos_user_abi::pager::PagerVmRegionWire, crate::multitask::pager_vma::PagerVmaError> {
     let process_id =
         current_user_process_id().ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
-    publish_pager_vma_for_process(process_id, template, ceiling)
+    publish_pager_vma_for_process(process_id, None, template, ceiling)
 }
 
 /// Admit a range and publish a VMA for one retained process.
@@ -137,6 +137,7 @@ pub fn publish_current_pager_vma(
 /// needs, and this admission only has to prove the range is free.
 pub fn publish_pager_vma_for_process(
     process_id: u64,
+    expected: Option<crate::multitask::pager_vma::ExpectedMm>,
     template: rustos_user_abi::pager::PagerVmRegionWire,
     ceiling: usize,
 ) -> Result<rustos_user_abi::pager::PagerVmRegionWire, crate::multitask::pager_vma::PagerVmaError> {
@@ -162,6 +163,7 @@ pub fn publish_pager_vma_for_process(
         let identity = retained
             .live_identity()
             .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
+        crate::multitask::pager_vma::ExpectedMm::check(expected, identity)?;
         let published =
             crate::multitask::pager_vma::publish(retained.handle(), identity, template, ceiling)?;
         record_reservation(page_count as u64);

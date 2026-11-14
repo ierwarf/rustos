@@ -54,7 +54,7 @@ cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 `cargo xtask kvm-smoke --help` is the authoritative option list. Beyond the
 proof-selection flags above it carries opt-in lanes: `--exercise-input`,
 `--exercise-network`, `--exercise-google-ping`, `--oom-hog*`,
-`--job-policy-probe`, `--proc-stress`, `--release-stage-probe`,
+`--job-policy-probe`, `--proc-stress`, `--local-fd-probe`, `--release-stage-probe`,
 `--ipcbench-probe <name>` (restrict the `ipcbench` harness to one probe),
 `--expect-dvm <marker>` (extra Linux-DVM serial marker), `--min-ui-fps`,
 `--recovery-probe`, `--smp-iteration`, `--storage-dvm-only` and `--repeat <n>`
@@ -173,7 +173,7 @@ cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 
 `cargo xtask kvm-smoke --help`가 옵션의 기준 목록입니다. 위의 proof 선택 flag 외에
 선택적 lane으로 `--exercise-input`, `--exercise-network`,
-`--exercise-google-ping`, `--oom-hog*`, `--job-policy-probe`, `--proc-stress`,
+`--exercise-google-ping`, `--oom-hog*`, `--job-policy-probe`, `--proc-stress`, `--local-fd-probe`,
 `--release-stage-probe`, `--ipcbench-probe <name>`(`ipcbench` harness를 한 probe로
 제한), `--expect-dvm <marker>`(추가 Linux-DVM serial marker), `--min-ui-fps`,
 `--recovery-probe`, `--smp-iteration`, `--storage-dvm-only`,

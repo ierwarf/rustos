@@ -123,6 +123,71 @@ struct rustos_dvm_acquire_request {
 #define RUSTOS_DVM_DMABUF_IOCTL_ACQUIRE \
     _IOW('R', 0x42, struct rustos_dvm_acquire_request)
 
+struct rustos_dvm_app_event {
+    uint64_t sequence;
+    uint64_t kind;
+    uint8_t record[64];
+};
+#define RUSTOS_DVM_APP_IOCTL_TAKE _IOR('R', 0x43, struct rustos_dvm_app_event)
+#define RUSTOS_DVM_APP_EXPORT 1U
+#define RUSTOS_DVM_APP_REVOKE 2U
+
+struct app_export {
+    struct app_export *next;
+    uint8_t record[64];
+    int fd;
+};
+
+/* The kernel selects the record from the host-only mailbox. Userspace never
+ * supplies an aperture offset. Keep each real dma-buf fd until exact revoke. */
+static void service_app_export(int exporter, struct app_export **exports)
+{
+    struct rustos_dvm_app_event event = {0};
+    struct app_export *entry = malloc(sizeof(*entry));
+    struct app_export **cursor;
+    int fd;
+
+    if (exporter < 0 || entry == NULL) {
+        free(entry);
+        return;
+    }
+    fd = ioctl(exporter, RUSTOS_DVM_APP_IOCTL_TAKE, &event);
+    if (fd < 0) {
+        free(entry);
+        return;
+    }
+    if (event.kind == RUSTOS_DVM_APP_EXPORT) {
+        entry->fd = fd;
+        memcpy(entry->record, event.record, sizeof(entry->record));
+        entry->next = *exports;
+        *exports = entry;
+        return;
+    }
+    free(entry);
+    if (event.kind != RUSTOS_DVM_APP_REVOKE)
+        return;
+    for (cursor = exports; *cursor != NULL; cursor = &(*cursor)->next) {
+        if (memcmp((*cursor)->record, event.record, sizeof(event.record)) == 0) {
+            entry = *cursor;
+            *cursor = entry->next;
+            close(entry->fd);
+            free(entry);
+            break;
+        }
+    }
+}
+
+static void close_app_exports(struct app_export *exports)
+{
+    while (exports != NULL) {
+        struct app_export *next = exports->next;
+        close(exports->fd);
+        free(exports);
+        exports = next;
+    }
+}
+
+
 /*
  * Multiple DVM services share the serial tty. stdio may split one formatted
  * line into several writes, allowing another process to splice bytes into a
@@ -2522,6 +2587,8 @@ static int serve_gpu_display(struct shared_display *shared) {
     uint64_t diag_last_ns = 0U;
     uint64_t diag_last_slow_ns = 0U;
     uint64_t startup_now, startup_deadline;
+    struct app_export *app_exports = NULL;
+    int app_exporter = -1;
     struct gpu_watchdog watchdog = {.shared = shared};
     int thread_error = pthread_create(&watchdog.thread, NULL, gpu_watchdog_main, &watchdog);
     if (thread_error != 0) {
@@ -2546,10 +2613,15 @@ static int serve_gpu_display(struct shared_display *shared) {
     }
     gpu_watchdog_arm(startup_deadline);
     const int dmabuf_sources = rustos_gpu_runtime_uses_dmabuf_sources(runtime);
+    /* The app exporter is optional until the host publishes an app request;
+     * its absence must not change the existing atlas composition path. */
+    app_exporter = open(RUSTOS_DVM_DMABUF_DEVICE, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     shared->uio_fd = open_uio_interrupt(shared);
     if (shared->uio_fd < 0 || map_gpu_pixel_pool(shared) != 0) {
         relay_log("rustos-dvm-display: GPU read-only pixel mapping unavailable errno=%d\n",
                   errno);
+        if (app_exporter >= 0)
+            close(app_exporter);
         close_gpu_kms_display(&display, runtime);
         gpu_watchdog_stop(&watchdog);
         return -1;
@@ -2634,6 +2706,8 @@ static int serve_gpu_display(struct shared_display *shared) {
                 DISPLAY_RELAY_RR_PRIORITY, DISPLAY_RELAY_RTTIME_SOFT_US,
                 DISPLAY_RELAY_RTTIME_HARD_US);
         }
+        if (peer_ready_confirmed)
+            service_app_export(app_exporter, &app_exports);
         for (;;) {
             struct gpu_submission submission;
             struct rustos_gpu_frame frame;
@@ -2813,6 +2887,9 @@ fail:
         for (;;)
             pause();
     }
+    close_app_exports(app_exports);
+    if (app_exporter >= 0)
+        close(app_exporter);
     close_gpu_kms_display(&display, runtime);
     return scheduler.fatal ? DISPLAY_SERVE_FATAL : DISPLAY_SERVE_RETRY;
 }

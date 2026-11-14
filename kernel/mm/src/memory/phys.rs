@@ -70,7 +70,9 @@ pub(crate) const fn min_free_for(free_frames: usize) -> usize {
 
 mod frame_descriptor_ledger;
 pub use frame_descriptor_ledger::{
-    CowFrameKind, CowMappingClaim, DataLeafRelease, SharedAliasTicket, bind_root_charge,
+    CowFrameKind, CowMappingClaim, DataClaim, DataLeafRelease, SharedAliasTicket, bind_root_charge,
+    claim_cow_replacement, cancel_cow_replacement,
+    claim_private_file_cache_frame, release_private_file_cache_frame,
     root_admits, cancel_cow_mapping,
     cancel_data_leaf, cancel_lazy_table_record, cancel_private_file_data_leaf, cancel_shared_alias,
     TableClaim, claim_data_leaf, claim_lazy_table_record, claim_private_file_data_leaf, commit_cow_mapping,
@@ -964,6 +966,34 @@ pub fn claim_fixed_range(phys_start: u64, byte_len: u64) -> Result<(), FixedRang
     irq_safe(|| PHYS_POOL.claim_fixed_range(phys_start, byte_len))
 }
 
+/// True when any frame of the page-aligned range is boot-usable RAM that the
+/// allocator may hand out. Device apertures mapped to user space must answer
+/// false, otherwise a user mapping could alias allocator-owned frames.
+pub fn range_overlaps_boot_usable(phys_start: u64, byte_len: u64) -> bool {
+    irq_safe(|| {
+        let state = PHYS_POOL.state.lock();
+        range_overlaps_boot_usable_locked(&state, phys_start, byte_len)
+    })
+}
+
+fn range_overlaps_boot_usable_locked(state: &PhysAllocatorState, phys_start: u64, byte_len: u64) -> bool {
+    // Fail closed: an uninitialised allocator or malformed range claims overlap.
+    if !state.initialized
+        || byte_len == 0
+        || !phys_start.is_multiple_of(PAGE_SIZE)
+        || !byte_len.is_multiple_of(PAGE_SIZE)
+    {
+        return true;
+    }
+    let Some(end) = phys_start.checked_add(byte_len) else {
+        return true;
+    };
+    let first = phys_start / PAGE_SIZE;
+    let last = end / PAGE_SIZE;
+    let limit = (state.geo.frame_count as u64).min(last);
+    (first..limit).any(|frame| frame_is_boot_usable(state, frame as usize))
+}
+
 /// The cache slot of the calling CPU. Any slot is correct - slots are locked -
 /// so a stale or shared index costs only contention.
 #[inline]
@@ -1297,6 +1327,22 @@ mod tests {
         };
         state.mark_range_free(0, page_count);
         state
+    }
+
+    #[test]
+    fn device_aperture_overlap_check_is_fail_closed() {
+        let mut words = [0_u64; 4];
+        let state = test_state(&mut words, 256, 0);
+        let page = PAGE_SIZE;
+        assert!(range_overlaps_boot_usable_locked(&state, 0, page));
+        assert!(range_overlaps_boot_usable_locked(&state, 255 * page, 4 * page));
+        assert!(!range_overlaps_boot_usable_locked(&state, 256 * page, 4 * page));
+        assert!(range_overlaps_boot_usable_locked(&state, 3, page));
+        assert!(range_overlaps_boot_usable_locked(&state, 0, 0));
+        assert!(range_overlaps_boot_usable_locked(&state, u64::MAX - page + 1, 2 * page));
+        let mut uninit = test_state(&mut words, 256, 0);
+        uninit.initialized = false;
+        assert!(range_overlaps_boot_usable_locked(&uninit, 512 * page, page));
     }
 
     #[test]

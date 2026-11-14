@@ -4,6 +4,10 @@
 
 ## Kernel/Userspace ABI Surface
 
+Linux `pipe`/`pipe2`/`eventfd`/`eventfd2` are kernel-local descriptor kinds
+(`KernelHandle::{Pipe, EventFd}`, waitset provider `WAITSET_PROVIDER_KERNEL`);
+the contract is [Kernel-local pipe and eventfd](local-fd.md).
+
 `SYS_DEBUG_PRINT` is a bounded-admission byte stream: success counts only the
 accepted input prefix; zero admission returns `EAGAIN`. A later copy fault
 returns an already accepted prefix rather than inviting duplicate replay.
@@ -27,6 +31,30 @@ dropped record until its owner abandons it. Admission is not durable delivery.
   broker call paths, and owning service contracts.
 - `RING3-MIGRATION-REFERENCE` / `RING3-MIGRATION-COMMENTED-OUT` blocks are references for migration, not dormant code to revive. Do not fix breakage by uncommenting them unless the exact lines are the remaining ring0 substrate.
 - For each slice, move policy/state/lifecycle behavior into the owning service, leave only narrow ring0 fd-table/user-copy/page-table/privileged-device substrate, then delete or bypass the reference block.
+
+## Native ABI revision stamp
+
+- Source: `libs/rustos-user-abi/src/abi_revision.rs`
+  (`NATIVE_ABI_REVISION_CURRENT = 1`, `NATIVE_ABI_SUPPORTED_REVISIONS`, parser
+  `parse_native_abi_note`). Rules for when to bump: `docs/architecture/evolution-rules.md` section 7.
+- Format: ELF note in section `.note.rustos.abi` (4-aligned, becomes a
+  `PT_NOTE`): `namesz=7`, `descsz=4`, `type=1`, name `"RustOS\0"` (padded to
+  4), desc one little-endian `u32` revision; 24 bytes. Emitted by
+  `rustos_user_abi::native_abi_note!` (also expanded by `rustos_svc_runtime::entry!`); a second expansion in one
+  image is a link error (hidden symbol `__rustos_native_abi_note`).
+- Scope: every packaged executable whose crate depends directly on `rustos-user-abi` or `rustos-svc-runtime` (static-PIE and dynamic Rust-std alike; one expansion per executable root). C demos, apps/shell, sessiond and prebuilt apps are unstamped. xtask `native_abi.rs` derives the set from `Cargo.toml` dependencies; exceptions live in its `NOT_STAMPED` list.
+- `loaderd` (`admit_native_abi_stamp`, `libs/rustos-image-admission`) reads at
+  most `NATIVE_ABI_MAX_NOTE_SEGMENTS` (8) `PT_NOTE` segments, the first
+  `NATIVE_ABI_NOTE_READ_MAX` (4096) bytes of each, for the main executable of
+  a spawn. Absent: admitted unchanged. Supported revision: admitted.
+  Unsupported revision, malformed RustOS note, or more than one: spawn fails
+  with `ENOEXEC` and `loaderd` prints one diagnostic line. Foreign notes are
+  skipped; a foreign note with broken framing ends the walk as absent.
+- The stamp is a self-declared hint, not authority: never mapped to a
+  personality, not consulted by `personality_gate` or `rootd`, grants nothing.
+- Kernel-bootstrap-spawned services bypass `loaderd`; the kernel does not read
+  notes. `cargo xtask build`/`stage` fails if any staged native ELF lacks the
+  current revision; `cargo xtask check` checks the sources and fresh artifacts.
 
 ## Boot Initial Task
 
@@ -347,6 +375,22 @@ Service IDs 5 and 13, their former capability bits, and raw syscall numbers
 `0x52550020..=0x52550022` plus `0x52550037` are permanently retired. They are
 not extension points and must continue to return `ENOSYS`.
 
+### Linux `prctl` (syscall 157)
+
+Implemented in `kernel/compat/.../linux/prctl_ops.rs` (option table is pure and
+unit-tested). Supported: `PR_SET_NAME`/`PR_GET_NAME` (per-thread 15+NUL bytes in
+`LinuxThreadState::comm`; copied to clone/fork children, reset by exec; unset
+reads as the exec-path basename), `PR_SET_NO_NEW_PRIVS`/`PR_GET_NO_NEW_PRIVS`
+(`ProcessSecurityContext::no_new_privs`: one-way, fork-inherited,
+exec-preserved; arg2 must be 1 to set, stray args are `EINVAL`), and
+`PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` (0/1 only; fork-inherited, exec-reset to 1;
+nothing consumes it yet). Everything else returns `EINVAL`, never success:
+`PR_SET/GET_PDEATHSIG` (no parent-exit signal hook), `PR_SET/GET_SECCOMP` (no
+filter engine: run Chrome with `--no-sandbox`), `PR_SET_VMA`,
+`PR_SET/GET_TIMERSLACK`, `PR_CAPBSET_READ` (no capability bounding set) and
+unknown options. User pointers go through `usermem`; the name read never
+crosses a page boundary beyond the string's NUL.
+
 Broker authorization checks the caller's registered service capability — **not** its executable path.
 `SYS_RUSTOS_ENTROPY_BROKER` is limited to the Linux-syscall, network-policy,
 and process-loader capabilities and returns at most one inline-IPC payload of bytes from the
@@ -383,6 +427,49 @@ evidence; vfsd/storaged I/O, kernel fault dispatch, runtime pressure/restart,
 and Linux/Windows differential cutover are still required before Phase 8 is
 complete.
 
+### Library object control
+
+`SYS_RUSTOS_LIBRARY_OBJECT` (`0x5255_0064`, ABI v1) takes `RustosLibraryObjectArgs`
+with ops CREATE(1)/SUPPLY_PAGE(2)/SEAL(3)/RETIRE(4)/PRESSURE(5; returns
+`LibraryPressureWire` free/min-free/denials/reserved pages). The caller must hold
+PagerPolicy and the live pager lease. CREATE takes a `LibraryIdentityWire`
+(immutable `VfsFileIdentityWire` plus a 32-byte content hash, at most 1024
+pages); SUPPLY_PAGE copies the exact remaining bytes (kernel zero-fills the
+tail) into frame-source pages; an object is invisible to guests until SEAL.
+Limits: 128 objects, 12288 reserved pages. Related wire: vfsd ops
+`VFS_IPC_OP_FILE_IDENTITY`=26, `VFS_IPC_OP_LIBRARY_READ`=27 (pager only, chunks
+up to `VFS_LIBRARY_READ_MAX_BYTES`), and `MM_BROKER_OP_BIND_LIBRARY`=11.
+`SYS_RUSTOS_LIBRARY_MAP_PROBE` (`0x5255_0065`) is a diagnostic for the opt-in
+probe only (frames/stats; caller exec path must be `libmapprobe.elf`).
+Design and status: `docs/ai/pager/library-cache.md`.
+
+### Immutable frame-source control
+
+`SYS_RUSTOS_FRAME_SOURCE` (`0x5255_0063`, ABI v1; formerly collided with the app-buffer broker at `0x5255_0061`) takes the exact 88-byte
+`RustosFrameSourceArgs`. `SUPPLY` copies at most one page, zeroes its tail,
+charges the pager's actual resident group, and returns a reusable source token.
+`RETIRE` closes that token; `OWNER_EPOCH` returns the currently published service
+lease epoch. Owner IDs and charge groups are never caller-controlled fields.
+The caller must both hold PagerPolicy and own the live pager service lease.
+Source publication is serialized with lease withdrawal; user copies and cold
+reclamation never run under the registry lock. Source ownership binds logical
+service ID plus publication epoch, not endpoint-object identity: unregistering
+and registering the same endpoint cannot revive previous source tokens.
+
+Keys bind backing namespace, object identity/generation, content generation and
+page offset. Source rights require READ and permit optional EXECUTE, never
+WRITE; private writable views obtain their own COW frame. All reserved fields
+are checked before admission. A source pin protects installation; installed leaves acquire independent MM
+custody. Withdrawal/exit and last-pin Drop only queue reclamation. The normal
+pager housekeeping hook drains a bounded64 sources outside locks, after which
+unused physical frames and their source charges may return. Existing mapped
+leaves survive source retirement and still obey their TLB-safe final release.
+Private file/section dispatch carries no zero-frame reserve. Its fixed reply
+adoption pins the exact source through current MM/VMA validation and independent
+COW leaf publication; source pages are never anonymously populated as a run.
+This is not yet live file paging: VFS identity/VMA admission, pagerd I/O/cache
+reuse and boot prewarming still need connection.
+
 ### syscalld offload envelopes
 
 The kernel offloads Linux policy syscalls to `syscalld` over one endpoint and
@@ -391,8 +478,19 @@ tells the envelopes apart by **frame size**; there is no tag field to forge.
 | Frame | Used for | IPC lane |
 | --- | --- | --- |
 | `LinuxSyscallOffloadFastRequest` (40 B) | `getuid`, `getgid`, `geteuid`, `getegid` | fast lane |
-| `LinuxSyscallOffloadFastMemRequest` (64 B) | `mmap`, `munmap`, `mprotect`, `brk` | fast lane |
+| `LinuxSyscallOffloadFastMemRequest` (72 B) | `mmap`, `munmap`, `mprotect`, `brk` | fast lane |
 | `LinuxSyscallOffloadRequest` (full, path-bearing) | everything else | blocking transaction |
+
+The compact address-space frame carries a kernel-issued `ticket` (expanded into
+`arg3` of the full request that `syscalld` handlers see). `syscalld` must echo it
+in `RustosMmBrokerArgs::ticket` (broker ABI **v2**, 88 B) on every MM broker call
+it makes while serving the request. The kernel opens a request lease, capturing
+the caller's process and MM generations, before the IPC call and closes it when
+the call returns for any reason; a broker operation is refused (`ESRCH` for an
+absent/retired ticket, `EPERM` for another process's ticket) unless it names a
+live lease for `target_pid`, and then acts only on the captured generations. The
+only exception is `MM_BROKER_OP_SET_ANON_POLICY`, authorized by owning the pager
+endpoint. See `address-space-lifecycle-contract.md` (request lease).
 
 Both compact requests answer with `LinuxSyscallOffloadFastResponse` (48 B, 32 B
 payload). The IPC fast lane admits only frames up to `IPC_FAST_INLINE_BYTES`

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use driver_domain_protocol::{
-    DVM_BLOCK_APERTURE_BYTES, DVM_BLOCK_FEATURE_FLUSH, DVM_BLOCK_FLAG_DVM_READY,
+    DVM_APP_BUFFER_APERTURE_BYTES, DVM_APP_BUFFER_PHYS_ADDR, DVM_BLOCK_APERTURE_BYTES, DVM_BLOCK_FEATURE_FLUSH, DVM_BLOCK_FLAG_DVM_READY,
     DVM_BLOCK_FLAG_READ_ONLY, DVM_BLOCK_FLAG_RUSTOS_READY, DVM_BLOCK_HEADER_RECORD_BYTES,
     DVM_GPU_ATLAS_POOL_HEADER_OFFSET, DVM_GUI_SURFACE_POOL_HOST_RECORD_OFFSET,
     DVM_GUI_SURFACE_SLOT_COUNT, DVM_INPUT_RING_APERTURE_BYTES, DVM_NET_APERTURE_BYTES,
@@ -113,6 +113,8 @@ const MAX_DVM_GPU_RENDER_US: u64 = 16_667;
 const DVM_DISPLAY_WIDTH: u32 = 2560;
 const DVM_DISPLAY_HEIGHT: u32 = 1440;
 const DVM_DISPLAY_REGION_BYTES: u64 = 512 * 1024 * 1024;
+// Separate writable app-buffer backing; never alias the read-only atlas.
+const DVM_APP_BUFFER_REGION_BYTES: u64 = DVM_APP_BUFFER_APERTURE_BYTES;
 const DVM_GPU_ATLAS_WIDTH: u32 = 2688;
 const DVM_GPU_ATLAS_HEIGHT: u32 = 2560;
 // Keep the KVM proof topology identical to the supervised physical-display
@@ -170,6 +172,22 @@ const PRIVATE_IPCBENCH_PROBE_CONTRACT_PATH: &str = "system/registry/system/ipcbe
 // Arms `apps/oomhog`, a session-startup program that exits at once without this
 // file. It is written only for `kvm-smoke --oom-hog`.
 const PRIVATE_OOM_HOG_CONTRACT_PATH: &str = "system/registry/system/oomhog-v1.env";
+// Arms `apps/libmapprobe`, which exits at once without this file. Written only
+// for `kvm-smoke --library-map-probe`.
+const PRIVATE_LIBRARY_MAP_PROBE_CONTRACT_PATH: &str = "system/registry/system/libmapprobe-v1.env";
+const LIBRARY_MAP_PROBE_DONE_MARKER: &str = "cow-isolated eof-zero exit-clean";
+const LIBRARY_RECLAIM_SURVIVED_MARKER: &str = "library-map-probe: reclaim-survived";
+const PAGERD_LIBRARY_RECLAIMED_MARKER: &str = "pagerd: library cache reclaimed";
+/// Private contract body for the probe: the mapping proof, or the same plus the
+/// reclaim-mode line (the app accepts exactly these two bodies).
+fn library_probe_contract(reclaim: bool) -> &'static [u8] {
+    if reclaim {
+        b"contract=rustos-libmapprobe-v1\nmode=reclaim\n"
+    } else {
+        b"contract=rustos-libmapprobe-v1\n"
+    }
+}
+const LIBRARY_MAP_PROBE_FAIL_MARKER: &str = "library-map-probe: FAIL";
 // Arms `apps/procstress`, which exits at once without this file. Written only
 // for `kvm-smoke --proc-stress`.
 const PRIVATE_PROC_STRESS_CONTRACT_PATH: &str = "system/registry/system/procstress-v1.env";
@@ -752,6 +770,9 @@ include!("kvm/guest.rs");
 include!("kvm/evidence.rs");
 include!("kvm/user_debug_records.rs");
 include!("kvm/oom_hog.rs");
+include!("kvm/app_dmabuf_probe.rs");
+include!("kvm/local_fd_probe.rs");
+include!("kvm/mmap_cost_probe.rs");
 include!("kvm/application_limit.rs");
 include!("kvm/job_policy.rs");
 include!("kvm/tests.rs");

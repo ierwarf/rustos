@@ -396,6 +396,16 @@ fn route_one_poll_fd(
                 events & linux_abi::POLLIN as u32
             }))
         }
+        multitask::KernelHandle::Pipe(_) | multitask::KernelHandle::EventFd(_) => {
+            // Kernel-local object: readiness is read directly, with no
+            // provider round trip, and its generation arms the waiter.
+            let token = super::local_fd::waitset_object(&handle).ok_or(LINUX_EBADF)?;
+            let Some(readiness) = kernel_ps::api::local_fd_readiness_of(token) else {
+                return Ok(PollRoute::Done(linux_abi::POLLNVAL as u32));
+            };
+            note_poll_observation(state, WAITSET_PROVIDER_KERNEL, token, readiness.generation);
+            Ok(PollRoute::Done(epoll_report_events(readiness.events, events)))
+        }
         multitask::KernelHandle::Device(_) => {
             let Some((token, access, _)) = current_input_device_description(fd) else {
                 return Ok(PollRoute::Vfs);
@@ -906,7 +916,12 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
         release_epoll_target_guard(guard);
     }
     match result {
-        Ok(()) => 0,
+        Ok(()) => {
+            if op != linux_abi::EPOLL_CTL_DEL {
+                super::local_fd::note_epoll_registered(&target.handle);
+            }
+            0
+        }
         Err(errno) => linux_errno(errno),
     }
 }
@@ -1146,6 +1161,10 @@ fn epoll_interest_target(fd: u64) -> Result<EpollInterestTarget, i64> {
         multitask::KernelHandle::Console(console) if !current_console_session_is_system() => {
             (WAITSET_PROVIDER_SESSIOND, console.token_id())
         }
+        multitask::KernelHandle::Pipe(_) | multitask::KernelHandle::EventFd(_) => (
+            WAITSET_PROVIDER_KERNEL,
+            super::local_fd::waitset_object(&handle).ok_or(LINUX_EBADF)?,
+        ),
         _ => return Err(LINUX_EPERM),
     };
     Ok(EpollInterestTarget {
@@ -1188,6 +1207,9 @@ fn waitset_provider_epoch(provider: u16) -> Result<u64, i64> {
         WAITSET_PROVIDER_NETD => IPC_SERVICE_NETD,
         WAITSET_PROVIDER_INPUTD => IPC_SERVICE_INPUTD,
         WAITSET_PROVIDER_SESSIOND => IPC_SERVICE_SESSIOND,
+        // Ring0 is its own provider: there is no service endpoint to restart,
+        // so the epoch is constant.
+        WAITSET_PROVIDER_KERNEL => return Ok(1),
         _ => return Err(LINUX_EINVAL),
     };
     ipc_ops::service_endpoint_epoch(service_id).ok_or(LINUX_ENOSYS)
@@ -1390,6 +1412,25 @@ fn collect_epoll_readiness(
                         generation,
                     )
                 }
+                WAITSET_PROVIDER_KERNEL => match kernel_ps::api::local_fd_readiness_of(
+                    interest.object_id,
+                ) {
+                    Some(readiness) => {
+                        merge_provider_observation(
+                            &mut observations,
+                            super::super::broker_ops::waitset_broker_ops::ProviderObservation {
+                                provider: WAITSET_PROVIDER_KERNEL,
+                                object_id: interest.object_id,
+                                generation: readiness.generation,
+                            },
+                        );
+                        (readiness.events, readiness.edge_generation(provider_events))
+                    }
+                    // The object closed while an interest survived (a purge
+                    // that has not landed yet): report it like a revoked
+                    // provider so the waiter can drop the descriptor.
+                    None => (revoke_events, 1),
+                },
                 _ => return Err(LINUX_EIO),
             })
         })();

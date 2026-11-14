@@ -11,7 +11,7 @@
 
 | # | 영역 | 정적 증거 | 설계 방향 |
 |---|------|-----------|-----------|
-| A1 | Linux syscall 커버리지 | `linux.rs` 디스패치에 `pipe/pipe2, eventfd2, timerfd, signalfd, inotify, readv, pwrite64, pwritev, rename*, link/symlink, chmod/chown, utimensat, fsync, truncate, fallocate, getrusage, gettimeofday/time/clock_getres, sysinfo, mremap, msync, flock, select/pselect6, prctl, sched_set*/getparam, getpriority, getgroups, sendmmsg, sendfile, fstatfs, times, getrlimit, waitid` 항목이 없어 기본 `ENOSYS` | ring0는 fd 종류(핸들)와 대기 기전만, 정책·버퍼는 ring-3 서비스. pipe/eventfd는 공유 메모리 ring + waitset 알림 |
+| A1 | Linux syscall 커버리지 | `linux.rs` 디스패치에 `timerfd, signalfd, inotify, readv, pwrite64, pwritev, rename*, link/symlink, chmod/chown, utimensat, fsync, truncate, fallocate, getrusage, gettimeofday/time/clock_getres, sysinfo, mremap, msync, flock, select/pselect6, prctl, sched_set*/getparam, getpriority, getgroups, sendmmsg, sendfile, fstatfs, times, getrlimit, waitid` 항목이 없어 기본 `ENOSYS` | ring0는 fd 종류(핸들)와 대기 기전만, 정책·버퍼는 ring-3 서비스. pipe/eventfd는 공유 메모리 ring + waitset 알림. (pipe/pipe2, eventfd/eventfd2는 구현됨: 커널-로컬 객체, 설계 편차와 근거는 `docs/ai/abi/local-fd.md`) |
 | A2 | 쓰기 가능한 파일시스템 | `vfsd/src/lib.rs` `persistent_mutation_status`=EROFS, `mkdir_policy`는 `/run`만, `unlink_policy` EROFS. 주석: journal/recovery 프로토콜 부재 | 메모리 기반 쓰기 계층(tmpfs류)을 vfsd 소유로 먼저, 영속 쓰기는 journal 설계 후 |
 | A3 | blocking 소켓 | `netd` `handle_accept`: `None if nonblocking => EAGAIN, None => EAGAIN` (두 분기 동일). `recv_connected_bytes`는 빈 큐에서 항상 `EAGAIN`; blocking 플래그를 읽는 경로 없음 | netd가 요청(reply cap)을 보관했다가 데이터/EOF 도착 시 응답하는 parked-request 방식, 또는 호출측 waitset 대기 후 재시도. 데드라인·취소 포함 |
 | A4 | exec 실패 | **해결**: (1) resident lane에 주차된 대기 task가 stack pin을 쥐고 있어 이미지 writer가 거부 → `exec_transaction::evict_parked_target`(owner 전이와 같은 방식으로 cell 해제). (2) exec 뒤 새 이미지가 같은 주소를 다시 mmap하면, 이전 incarnation의 pager VMA 잔재가 범위 재작성에 끼어들어 `Stale`(EFAULT) → `pager_vma::rewrite_range`가 다른 incarnation의 영역을 무시하고 `publish`와 같이 회수. 회귀 witness `rewrite_reclaims_previous_exec_incarnation_instead_of_mutating_its_range`. 거부 단계는 `ExecRefusal`+`proc-exec-refused`, `pager-vma-unmap-refused`, `mm-broker-refused` 마일스톤으로 남김 | 완료 |
@@ -79,7 +79,7 @@ kernel-ps/compat/executive/hal/mm/nucleus-core/io-manager 경고 0. 호스트 �
   두 개와 전용 obsolete test를 삭제하고, 혼합 witness/소스 핀은 실제 사용하는
   exact-generation materializer로 옮겼다. 살아 있는 reply-wake/claim 경로의
   `sync_handoff`/`locality` 의존성을 경고 수만 보고 통째로 지우지 않는다.
-- pipe/pipe2, eventfd, 쓰기 가능 FS, SEQPACKET, `/proc`, blocking 소켓은 사용자 지시로 제외.
+- 쓰기 가능 FS, SEQPACKET, `/proc`, blocking 소켓은 사용자 지시로 제외.
 
 ## 참고한 외부 계약
 

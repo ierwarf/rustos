@@ -12,6 +12,7 @@ schema = "rustos-tla-mutation-corpus-v1"
 required_models = [
     "acceptance-profile-publication/AcceptanceProfilePublication",
     "affinity-claim-admission/AffinityClaimAdmission",
+    "app-buffer-custody/AppBufferCustody",
     "application-job-custody/ApplicationJobCustody",
     "application-limit-refusal/ApplicationLimitRefusal",
     "atomic-process-activation-batch/AtomicProcessActivationBatch",
@@ -32,6 +33,7 @@ required_models = [
     "exception-retirement-lifecycle/ExceptionRetirementLifecycle",
     "exec-address-space-transaction/ExecAddressSpaceTransaction",
     "frame-reader-claim/FrameReaderClaim",
+    "frame-source-lifecycle/FrameSourceLifecycle",
     "gpu-submit-transaction/GpuSubmitTransaction",
     "input-ingestion-worker/InputIngestionWorker",
     "ipc-fast-handoff/IpcFastHandoff",
@@ -49,6 +51,7 @@ required_models = [
     "lifecycle-execution-claim/LifecycleExecutionClaim",
     "memory-charge-conservation/MemoryChargeConservation",
     "mm-activation-close/MmActivationClose",
+    "mm-request-lease/MmRequestLease",
     "msi-vector-lifecycle/MsiVectorLifecycle",
     "netd-deferred-reply/NetdDeferredReply",
     "oom-termination-owner/OomTerminationOwner",
@@ -198,6 +201,100 @@ replace = '''Eligible == TRUE /\ processAllows /\ binding = uid'''
 occurrence = 1
 invariant = "ClaimHasCurrentAffinity"
 min_counterexample_states = 4
+
+[[mutation]]
+id = "app-buffer-abandon-exported-range"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "app-buffer-custody/AppBufferCustody"
+flow = "app-buffer-custody"
+find = '''    /\ st[r] = "allocated"
+    /\ ~exported[r]'''
+replace = '''    /\ st[r] \in {"allocated", "published"}
+    /\ TRUE'''
+occurrence = 1
+invariant = "RetiredNeedsAck"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "app-buffer-commit-after-deadline"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "app-buffer-custody/AppBufferCustody"
+flow = "app-buffer-custody"
+find = '''    /\ ~expired[r]
+    /\ epoch = allocEpoch[r]
+    /\ procInc = allocInc[r]'''
+replace = '''    /\ TRUE
+    /\ epoch = allocEpoch[r]
+    /\ procInc = allocInc[r]'''
+occurrence = 1
+invariant = "NoLateOrStaleCommit"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "app-buffer-commit-into-new-incarnation"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "app-buffer-custody/AppBufferCustody"
+flow = "app-buffer-custody"
+find = '''    /\ procInc = allocInc[r]
+    /\ st' = [st EXCEPT ![r] = "active"]'''
+replace = '''    /\ TRUE
+    /\ st' = [st EXCEPT ![r] = "active"]'''
+occurrence = 1
+invariant = "NoLateOrStaleCommit"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "app-buffer-free-on-descriptor-close"
+kind = "transition-effect"
+severity = "critical"
+model = "app-buffer-custody/AppBufferCustody"
+flow = "app-buffer-custody"
+find = '''    /\ fd' = [fd EXCEPT ![r] = FALSE]
+    /\ UNCHANGED <<st, exported,'''
+replace = '''    /\ fd' = [fd EXCEPT ![r] = FALSE] /\ st' = [st EXCEPT ![r] = "free"]
+    /\ UNCHANGED <<exported,'''
+occurrence = 1
+invariant = "NoReuseWhileDirty"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "app-buffer-realloc-without-scrub"
+kind = "transition-effect"
+severity = "critical"
+model = "app-buffer-custody/AppBufferCustody"
+flow = "app-buffer-custody"
+find = '''    /\ dirty' = [dirty EXCEPT ![r] = FALSE]'''
+replace = '''    /\ dirty' = dirty'''
+occurrence = 1
+invariant = "NoReuseWhileDirty"
+min_counterexample_states = 8
+
+[[mutation]]
+id = "app-buffer-retire-without-provider-ack"
+kind = "transition-effect"
+severity = "critical"
+model = "app-buffer-custody/AppBufferCustody"
+flow = "app-buffer-custody"
+find = '''    /\ exported' = [exported EXCEPT ![r] = FALSE]'''
+replace = '''    /\ exported' = exported'''
+occurrence = 1
+invariant = "RetiredNeedsAck"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "app-buffer-second-pending-request"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "app-buffer-custody/AppBufferCustody"
+flow = "app-buffer-custody"
+find = '''    /\ st[r] = "allocated" /\ epoch = allocEpoch[r] /\ NoPending'''
+replace = '''    /\ st[r] = "allocated" /\ epoch = allocEpoch[r]'''
+occurrence = 1
+invariant = "SinglePendingRequest"
+min_counterexample_states = 5
 
 [[mutation]]
 id = "application-job-ack-foreign-placement"
@@ -1257,6 +1354,74 @@ invariant = "NoRunningDuringNonexecutingRead"
 min_counterexample_states = 5
 
 [[mutation]]
+id = "frame-source-drop-runs-reclaimer"
+kind = "transition-effect"
+severity = "critical"
+model = "frame-source-lifecycle/FrameSourceLifecycle"
+flow = "frame-source-lifecycle"
+find = '''    /\ droppedPhysically' = FALSE'''
+replace = '''    /\ droppedPhysically' = TRUE'''
+occurrence = 1
+invariant = "DropNeverReclaims"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "frame-source-object-binding-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "frame-source-lifecycle/FrameSourceLifecycle"
+flow = "frame-source-lifecycle"
+find = '''    /\ key = binding[gen]
+    /\ ownerEpoch = epoch'''
+replace = '''    /\ TRUE
+    /\ ownerEpoch = epoch'''
+occurrence = 1
+invariant = "ExactTokenAndObject"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "frame-source-physical-free-with-live-leaves"
+kind = "transition-effect"
+severity = "critical"
+model = "frame-source-lifecycle/FrameSourceLifecycle"
+flow = "frame-source-lifecycle"
+find = '''    /\ freed' = [freed EXCEPT ![gen] = valid[gen] = {} /\ pending[gen] = {}]'''
+replace = '''    /\ freed' = [freed EXCEPT ![gen] = TRUE]'''
+occurrence = 1
+invariant = "NoEarlyPhysicalReuse"
+min_counterexample_states = 8
+
+[[mutation]]
+id = "frame-source-revoke-races-publication"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "frame-source-lifecycle/FrameSourceLifecycle"
+flow = "frame-source-lifecycle"
+find = '''RevokeService ==
+    /\ registered /\ ~registryBusy'''
+replace = '''RevokeService ==
+    /\ registered /\ TRUE'''
+occurrence = 1
+invariant = "PublisherSerializedWithRevoke"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "frame-source-token-generation-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "frame-source-lifecycle/FrameSourceLifecycle"
+flow = "frame-source-lifecycle"
+find = '''    /\ token = gen
+    /\ key = binding[gen]
+'''
+replace = '''    /\ TRUE
+    /\ key = binding[gen]
+'''
+occurrence = 1
+invariant = "ExactTokenAndObject"
+min_counterexample_states = 4
+
+[[mutation]]
 id = "futex-kernel-wake-forced-private"
 kind = "transition-effect"
 severity = "critical"
@@ -2229,6 +2394,90 @@ replace = '''    /\ phase = "Architecture" /\ TRUE /\ ~closed'''
 occurrence = 1
 invariant = "PublicationHasExactCurrency"
 min_counterexample_states = 4
+
+[[mutation]]
+id = "mm-request-lease-begin-after-retire"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "mm-request-lease/MmRequestLease"
+flow = "memory-map"
+find = '''    /\ slot = "live"
+    /\ t = ticket'''
+replace = '''    /\ slot \in {"live", "retired"}
+    /\ t = ticket'''
+occurrence = 1
+invariant = "NoBeginAfterRetire"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "mm-request-lease-close-skips-drain"
+kind = "transition-order"
+severity = "critical"
+model = "mm-request-lease/MmRequestLease"
+flow = "memory-map"
+find = '''    /\ NoGuards
+    /\ slot' = "free" /\ retiredBy' = 0'''
+replace = '''    /\ TRUE
+    /\ slot' = "free" /\ retiredBy' = 0'''
+occurrence = 1
+invariant = "CloseDrainsBeforeFree"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "mm-request-lease-cross-process-ticket"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "mm-request-lease/MmRequestLease"
+flow = "memory-map"
+find = '''    /\ pid = boundPid
+    /\ guardInc''''
+replace = '''    /\ TRUE
+    /\ guardInc''''
+occurrence = 1
+invariant = "NoCrossProcessTicket"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "mm-request-lease-effect-in-new-incarnation"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "mm-request-lease/MmRequestLease"
+flow = "memory-map"
+find = '''    /\ guardInc[a] = incOf[guardPid[a]]
+    /\ landedStale''''
+replace = '''    /\ TRUE
+    /\ landedStale''''
+occurrence = 1
+invariant = "NoCrossIncarnationEffect"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "mm-request-lease-stale-owner-close-frees-slot"
+kind = "transition-effect"
+severity = "critical"
+model = "mm-request-lease/MmRequestLease"
+flow = "memory-map"
+find = '''    /\ holders' = holders \ {t}
+    /\ UNCHANGED <<slot, ticket, retiredBy, boundPid, boundInc, next, reclaimed,'''
+replace = '''    /\ holders' = holders \ {t} /\ slot' = IF NoGuards THEN "free" ELSE slot
+    /\ UNCHANGED <<ticket, retiredBy, boundPid, boundInc, next, reclaimed,'''
+occurrence = 1
+invariant = "OwnerLeaseIntact"
+min_counterexample_states = 6
+
+[[mutation]]
+id = "mm-request-lease-stale-ticket-accepted"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "mm-request-lease/MmRequestLease"
+flow = "memory-map"
+find = '''    /\ t = ticket
+    /\ pid = boundPid'''
+replace = '''    /\ TRUE
+    /\ pid = boundPid'''
+occurrence = 1
+invariant = "NoStaleTicketAccepted"
+min_counterexample_states = 3
 
 [[mutation]]
 id = "msi-committed-rollback-handler-retained"

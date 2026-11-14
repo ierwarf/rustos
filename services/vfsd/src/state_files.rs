@@ -21,9 +21,12 @@ impl VfsState {
             Ok((id, handle)) => {
                 response.remote_id = id;
                 response.handle_kind = handle_kind_u16(handle.kind);
-                response.value = handle.len;
                 response.aux = device_access_for_path(handle.path.as_str());
                 write_vfs_payload_bytes(response, handle.path.as_bytes());
+                // After the payload write: it sets `value` to the payload
+                // length, which used to leave every open description's length
+                // equal to its path length.
+                response.value = handle.len;
             }
             Err(errno) => response.status = errno,
         }
@@ -144,6 +147,107 @@ impl VfsState {
         }
         response.value = candidate.cursor;
         self.handles.insert(request.remote_id, candidate);
+    }
+
+    /// Serves one bounded chunk of a file to the pager service for the shared
+    /// library cache, together with the vfsd identity of that file. Only the
+    /// current pager service owner may ask, so a path alone never grants read
+    /// access to anyone else; vfsd, not the pager, decides which files are on
+    /// the immutable volume (`aux == 1`).
+    fn vfs_library_read(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        if rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_PAGERD, request.pid) < 0 {
+            response.status = EACCES;
+            return;
+        }
+        let wanted = request.arg1 as usize;
+        let offset = request.arg0;
+        if wanted > VFS_LIBRARY_READ_MAX_BYTES || offset % 4096 != 0 {
+            response.status = EINVAL;
+            return;
+        }
+        let Some(raw_path) = vfs_request_path(request) else {
+            response.status = EINVAL;
+            return;
+        };
+        if !raw_path.starts_with('/') {
+            response.status = EINVAL;
+            return;
+        }
+        let path = match normalize_absolute_path("/", raw_path) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        let mut storage = lock_vfs_storage();
+        let metadata = match storage.metadata(path.as_str()) {
+            Ok(metadata) if metadata.kind == RemoteKind::File => metadata,
+            Ok(_) => {
+                response.status = EISDIR;
+                return;
+            }
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        const IDENTITY: usize = VfsFileIdentityWire::WIRE_BYTES;
+        // Identity first: refusal for a non-volume file is data, not an error,
+        // because the pager also reads its own (bootstrap-image) manifest here.
+        let (identity, attested) = match storage.file_identity(path.as_str(), metadata.len) {
+            Ok(identity) => (identity, 1),
+            Err(EOPNOTSUPP | ENOENT | EIO | EINVAL) => (VfsFileIdentityWire::default(), 0),
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        let available = metadata.len.saturating_sub(offset);
+        let count = wanted.min(usize::try_from(available).unwrap_or(usize::MAX));
+        let read = if count == 0 {
+            0
+        } else {
+            match storage.read_file_slice_into(
+                path.as_str(),
+                metadata.len,
+                offset,
+                &mut response.payload[IDENTITY..IDENTITY + count],
+            ) {
+                Ok(read) => read,
+                Err(errno) => {
+                    response.status = errno;
+                    return;
+                }
+            }
+        };
+        response.payload[..IDENTITY].copy_from_slice(&identity.to_bytes());
+        response.payload_len = (IDENTITY + read) as u32;
+        response.value = metadata.len;
+        response.aux = attested;
+    }
+
+    /// Reports which immutable-volume file this open description names. Pure
+    /// metadata: no cursor, checkpoint or charge state changes, so a lost or
+    /// repeated request is harmless.
+    fn vfs_file_identity(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(handle) = self.handles.get(&request.remote_id) else {
+            response.status = EBADF;
+            return;
+        };
+        if handle.kind != RemoteKind::File {
+            response.status = EINVAL;
+            return;
+        }
+        let (path, len) = (handle.path.clone(), handle.len);
+        match lock_vfs_storage().file_identity(path.as_str(), len) {
+            Ok(identity) => {
+                let bytes = identity.to_bytes();
+                response.payload[..bytes.len()].copy_from_slice(&bytes);
+                response.payload_len = bytes.len() as u32;
+            }
+            Err(errno) => response.status = errno,
+        }
     }
 
     fn vfs_fstat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
@@ -406,6 +510,9 @@ impl VfsState {
                 return;
             }
         };
+        if self.proc_path_stat(request, path.as_str(), true, response) {
+            return;
+        }
         match lock_vfs_storage().metadata(path.as_str()) {
             Ok(metadata) => {
                 let statx = build_linux_statx(metadata);
@@ -428,6 +535,9 @@ impl VfsState {
                 return;
             }
         };
+        if self.proc_path_stat(request, path.as_str(), false, response) {
+            return;
+        }
         match lock_vfs_storage().metadata(path.as_str()) {
             Ok(metadata) => {
                 let stat = build_linux_stat(metadata);
@@ -444,9 +554,130 @@ impl VfsState {
             return;
         };
         response.status = match self.resolve_path(request, request.pid, request.dirfd, path) {
-            Ok(path) => lock_vfs_storage().metadata(path.as_str()).err().unwrap_or(0),
+            Ok(path) => match vfsd::proc_fs::lookup(path.as_str(), request.pid) {
+                Some(Ok(_)) => 0,
+                Some(Err(errno)) => errno,
+                None => lock_vfs_storage().metadata(path.as_str()).err().unwrap_or(0),
+            },
             Err(errno) => errno,
         };
+    }
+
+    /// Serves `/proc` nodes for `newfstatat`/`statx`. Returns true when the
+    /// path belongs to procfs and `response` is filled (success or errno).
+    fn proc_path_stat(
+        &mut self,
+        request: &VfsIpcRequest,
+        path: &str,
+        statx: bool,
+        response: &mut VfsIpcResponse,
+    ) -> bool {
+        use vfsd::proc_fs::{self, ProcNode};
+        const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+        let node = match proc_fs::lookup(path, request.pid) {
+            None => return false,
+            Some(Err(errno)) => {
+                response.status = errno;
+                return true;
+            }
+            Some(Ok(node)) => node,
+        };
+        let exec = proc_fs::attached_exec_path(&request.payload, request.payload_len as usize);
+        let follow = request.flags & AT_SYMLINK_NOFOLLOW == 0;
+        if follow && node == ProcNode::ExeLink {
+            // Stat the target as an ordinary path; its own metadata is real.
+            let target = match proc_fs::link_target(node, request.pid, exec)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .map(|target| normalize_absolute_path("/", target.as_str()))
+            {
+                Some(Ok(target)) => target,
+                Some(Err(errno)) => {
+                    response.status = errno;
+                    return true;
+                }
+                None => {
+                    response.status = ENOENT;
+                    return true;
+                }
+            };
+            match lock_vfs_storage().metadata(target.as_str()) {
+                Ok(metadata) if statx => {
+                    response.payload_len = LINUX_STATX_SIZE as u32;
+                    response.payload[..LINUX_STATX_SIZE]
+                        .copy_from_slice(&build_linux_statx(metadata));
+                }
+                Ok(metadata) => {
+                    response.payload_len = LINUX_STAT_SIZE as u32;
+                    response.payload[..LINUX_STAT_SIZE]
+                        .copy_from_slice(&build_linux_stat(metadata));
+                }
+                Err(errno) => response.status = errno,
+            }
+            return true;
+        }
+        let (shown, size) = match node {
+            // `/proc/self` followed is the caller's pid directory.
+            ProcNode::SelfLink if follow => (ProcNode::PidDir, 0),
+            ProcNode::PidDir => (ProcNode::PidDir, 0),
+            link => match proc_fs::link_target(link, request.pid, exec) {
+                Ok(target) => (link, target.len() as u64),
+                Err(errno) => {
+                    response.status = errno;
+                    return true;
+                }
+            },
+        };
+        if statx {
+            response.payload_len = LINUX_STATX_SIZE as u32;
+            response.payload[..LINUX_STATX_SIZE]
+                .copy_from_slice(&proc_fs::node_statx(shown, request.pid, size));
+        } else {
+            response.payload_len = LINUX_STAT_SIZE as u32;
+            response.payload[..LINUX_STAT_SIZE]
+                .copy_from_slice(&proc_fs::node_stat(shown, request.pid, size));
+        }
+        true
+    }
+
+    /// `readlinkat` on `/proc` nodes; every other path is not a symlink.
+    fn vfs_readlinkat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(path) = vfs_request_path(request) else {
+            response.status = EINVAL;
+            return;
+        };
+        let path = match self.resolve_path(request, request.pid, request.dirfd, path) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        let node = match vfsd::proc_fs::lookup(path.as_str(), request.pid) {
+            Some(Ok(node)) => node,
+            Some(Err(errno)) => {
+                response.status = errno;
+                return;
+            }
+            // Not a procfs node: existing paths are not symlinks (EINVAL),
+            // missing ones are ENOENT.
+            None => {
+                response.status = match lock_vfs_storage().metadata(path.as_str()) {
+                    Ok(_) => EINVAL,
+                    Err(errno) => errno,
+                };
+                return;
+            }
+        };
+        let exec = vfsd::proc_fs::attached_exec_path(&request.payload, request.payload_len as usize);
+        match vfsd::proc_fs::link_target(node, request.pid, exec) {
+            Ok(target) => {
+                // readlink(2) truncates silently to the caller's buffer; the
+                // kernel front-end applies the user length bound.
+                write_vfs_payload_bytes(response, &target);
+            }
+            Err(errno) => response.status = errno,
+        }
     }
 
     fn vfs_getcwd(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {

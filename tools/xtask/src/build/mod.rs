@@ -39,6 +39,10 @@ pub(crate) fn build(config: &Config, show_timings: bool) -> Result<()> {
     let mut timings = StepTimings::new(show_timings);
     validate_workspace_layering(&config.root_dir)?;
     timings.mark("layering");
+    crate::abi_drift::check_abi_drift(&config.root_dir)?;
+    timings.mark("abi-drift");
+    crate::native_abi::check_native_abi_stamps(config)?;
+    timings.mark("native-abi-stamps");
     let manifests = load_manifests(&config.root_dir)?;
     timings.mark("manifests");
     validate_dvm_gpu_contract(config)?;
@@ -375,6 +379,8 @@ pub(crate) fn check(config: &Config, show_timings: bool) -> Result<()> {
     timings.mark("layering");
     let manifests = load_manifests(&config.root_dir)?;
     timings.mark("manifests");
+    crate::native_abi::check_native_abi_stamps(config)?;
+    timings.mark("native-abi-stamps");
     validate_dvm_gpu_contract(config)?;
     timings.mark("dvm-gpu-contract");
     ensure_targets(config)?;

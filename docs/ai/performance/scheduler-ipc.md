@@ -13,7 +13,7 @@
   and commercial acceptance remain separate. The Linux DVM's topology is
   independent; choose both topologies with host scheduling capacity in mind.
 
-- The scheduler keeps a fixed 128-slot task table, but ordinary fair dispatch is
+- The scheduler keeps a fixed 256-slot task table, but ordinary fair dispatch is
   selected from the current CPU's published runnable bitmap. The local picker
   records System/User global and same-CPU candidates in one pass, validates the
   complete publication epoch, and becomes authoritative only for that coherent

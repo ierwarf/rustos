@@ -2,6 +2,9 @@ use super::*;
 
 mod inet_datagram;
 pub fn syscall_linux_vfs_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
+    if let Some(result) = super::local_fd::not_seekable(fd) {
+        return result;
+    }
     if let Some(mut memfd) = current_memfd_handle(fd) {
         let whence = match whence {
             value if value == linux_abi::SEEK_SET => multitask::FileHandleSeekWhence::Start,
@@ -36,6 +39,9 @@ pub fn syscall_linux_vfs_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
 }
 
 pub fn syscall_linux_vfs_fstat(fd: u64, stat_ptr: u64) -> u64 {
+    if let Some(result) = super::local_fd::fstat(fd, stat_ptr) {
+        return result;
+    }
     if let Some(multitask::KernelHandle::Console(console)) = current_kernel_handle(fd) {
         return write_bootstrap_stat(stat_ptr, console.token_id(), 0);
     }
@@ -45,6 +51,9 @@ pub fn syscall_linux_vfs_fstat(fd: u64, stat_ptr: u64) -> u64 {
             crate::vfs_core::path_inode(memfd.path().as_bytes()),
             memfd.len() as u64,
         );
+    }
+    if let Some(multitask::KernelHandle::DeviceBuffer(buffer)) = current_kernel_handle(fd) {
+        return write_device_buffer_stat(stat_ptr, &buffer);
     }
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
@@ -176,10 +185,14 @@ pub fn syscall_linux_vfs_statx(
             path
         );
     }
+    if let Some(result) = super::local_fd::statx_at_empty_path(dirfd, &path, flags, statx_ptr) {
+        return result;
+    }
     if let Err(err) = usermem::validate_current_user_write_buffer(statx_ptr, LINUX_STATX_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
     let mut request = new_vfs_request(VFS_IPC_OP_STATX);
+    proc_identity::attach_caller_exec_path(&mut request);
     request.flags = flags as u32;
     request.arg1 = mask;
     if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
@@ -215,10 +228,14 @@ pub fn syscall_linux_vfs_newfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, fl
             path
         );
     }
+    if let Some(result) = super::local_fd::fstat_at_empty_path(dirfd, &path, flags, stat_ptr) {
+        return result;
+    }
     if let Err(err) = usermem::validate_current_user_write_buffer(stat_ptr, LINUX_STAT_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
     let mut request = new_vfs_request(VFS_IPC_OP_NEWFSTATAT);
+    proc_identity::attach_caller_exec_path(&mut request);
     request.flags = flags as u32;
     if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
         return linux_errno(errno);
@@ -260,6 +277,7 @@ pub fn syscall_linux_vfs_readlinkat(
         return linux_errno(address_space_error_to_linux_errno(err));
     }
     let mut request = new_vfs_request(VFS_IPC_OP_READLINKAT);
+    proc_identity::attach_caller_exec_path(&mut request);
     request.arg0 = user_len as u64;
     if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
         return linux_errno(errno);
@@ -359,6 +377,29 @@ pub fn memfd_error_to_linux_errno(err: multitask::MemfdError) -> i64 {
 // RING3-MIGRATION-REFERENCE START: vfsd owns remote-file stat materialization.
 // Ring0 materializes stat only for kernel-owned console and memfd handle kinds;
 // this is their primary substrate, not a weaker VFS fallback.
+/// App DMA-BUF identity for clients that must authenticate a received fd:
+/// character device `rdev` = `APP_BUFFER_STAT_RDEV`, `st_dev` = provider
+/// generation, `st_ino` = allocation id, `st_size` = capability length. These
+/// are kernel-synthesised from the held capability, never from a descriptor.
+fn write_device_buffer_stat(user_ptr: u64, buffer: &kernel_ps::api::handles::BufferCapability) -> u64 {
+    if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, LINUX_STAT_SIZE) {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    let id = buffer.identity();
+    let mut out = [0_u8; LINUX_STAT_SIZE];
+    out[0..8].copy_from_slice(&id.owner.generation.to_ne_bytes());
+    out[8..16].copy_from_slice(&id.allocation.to_ne_bytes());
+    out[16..24].copy_from_slice(&1_u64.to_ne_bytes());
+    out[24..28].copy_from_slice(&(0o020000_u32 | 0o600).to_ne_bytes());
+    out[40..48].copy_from_slice(&rustos_user_abi::syscall::APP_BUFFER_STAT_RDEV.to_ne_bytes());
+    out[48..56].copy_from_slice(&(buffer.len() as i64).to_ne_bytes());
+    out[56..64].copy_from_slice(&4096_i64.to_ne_bytes());
+    match usermem::write_current_user_bytes(user_ptr, &out) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+    }
+}
+
 fn write_bootstrap_stat(user_ptr: u64, inode: u64, len: u64) -> u64 {
     if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, LINUX_STAT_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
@@ -516,6 +557,10 @@ pub fn syscall_linux_vfs_umount2(target_ptr: u64, flags: u64) -> u64 {
 }
 
 pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
+    // Pipes and eventfds are kernel-local: devmgrd has nothing to route.
+    if let Some(local) = super::local_fd::current_local_fd(fd) {
+        return super::local_fd::ioctl(&local, request_number, arg);
+    }
     // A console-graph wait is answered by the console broker holding the reply
     // until the graph moves. Asking devmgrd to authorize and forward it would
     // park devmgrd's single serving loop for the whole wait, stalling every
@@ -603,16 +648,19 @@ fn is_console_device_handle(handle: &multitask::KernelHandle) -> bool {
 /// a handle nobody had yet established the kind of.
 fn kernel_handle_kind_code(handle: &multitask::KernelHandle) -> u64 {
     match handle {
-        multitask::KernelHandle::Console(_) => 1,
-        multitask::KernelHandle::Device(_) => 2,
-        multitask::KernelHandle::Epoll(_) => 3,
-        multitask::KernelHandle::InetSocket(_) => 4,
-        multitask::KernelHandle::Memfd(_) => 5,
-        multitask::KernelHandle::RemoteVfs(_) => 6,
-        multitask::KernelHandle::Socket(_) => 7,
-        multitask::KernelHandle::VfsDirectory(_) => 8,
-        multitask::KernelHandle::DisplaySurface(_) => 9,
-        multitask::KernelHandle::Job(_) => 10,
+        multitask::KernelHandle::Console(_) => rustos_user_abi::handle_kind::HANDLE_KIND_CONSOLE,
+        multitask::KernelHandle::Device(_) => rustos_user_abi::handle_kind::HANDLE_KIND_DEVICE,
+        multitask::KernelHandle::Epoll(_) => rustos_user_abi::handle_kind::HANDLE_KIND_EPOLL,
+        multitask::KernelHandle::InetSocket(_) => rustos_user_abi::handle_kind::HANDLE_KIND_INET_SOCKET,
+        multitask::KernelHandle::Memfd(_) => rustos_user_abi::handle_kind::HANDLE_KIND_MEMFD,
+        multitask::KernelHandle::RemoteVfs(_) => rustos_user_abi::handle_kind::HANDLE_KIND_REMOTE_VFS,
+        multitask::KernelHandle::Socket(_) => rustos_user_abi::handle_kind::HANDLE_KIND_SOCKET,
+        multitask::KernelHandle::VfsDirectory(_) => rustos_user_abi::handle_kind::HANDLE_KIND_VFS_DIRECTORY,
+        multitask::KernelHandle::DisplaySurface(_) => rustos_user_abi::handle_kind::HANDLE_KIND_DISPLAY_SURFACE,
+        multitask::KernelHandle::DeviceBuffer(_) => rustos_user_abi::handle_kind::HANDLE_KIND_DEVICE_BUFFER,
+        multitask::KernelHandle::Pipe(_) => rustos_user_abi::handle_kind::HANDLE_KIND_PIPE,
+        multitask::KernelHandle::EventFd(_) => rustos_user_abi::handle_kind::HANDLE_KIND_EVENTFD,
+        multitask::KernelHandle::Job(_) => rustos_user_abi::handle_kind::HANDLE_KIND_JOB,
     }
 }
 

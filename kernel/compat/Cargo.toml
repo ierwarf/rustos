@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+driver-domain-protocol = { path = "../../libs/driver-domain-protocol" }
 kernel-hal = { path = "../hal" }
 kernel-io-manager = { path = "../io-manager" }
 kernel-mm = { path = "../mm" }

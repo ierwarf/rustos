@@ -905,6 +905,50 @@ flows = ["memory-map"]
 reason = "Untrusted mapping requests cross into the ring0 page-table substrate."
 
 [[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/mm_request_lease.rs"
+severity = "critical"
+flows = ["memory-map"]
+reason = "A guessed, stale or cross-process ticket must not authorize a mapping effect, and no effect may land after the caller's call ended or in another MM generation."
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/mm_request_lease.rs"
+models = ["mm-request-lease/MmRequestLease"]
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/app_buffer_broker_ops.rs"
+severity = "critical"
+flows = ["app-buffer-custody"]
+reason = "A devmgrd-only broker allocates a DMA-BUF aperture range, publishes the export, and commits a descriptor only after a timely response under the exact service epoch and process/MM incarnation; failure, timeout and provider restart keep the range quarantined until provider revoke acknowledgement and scrub. The broker pending-state machine has no native unit test; only the pool custody half is witnessed."
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/app_buffer_broker_ops.rs"
+models = ["app-buffer-custody/AppBufferCustody"]
+
+[[risk_surfaces]]
+path = "kernel/io-manager/src/io/dvm_display/app_buffer.rs"
+severity = "critical"
+flows = ["app-buffer-custody"]
+reason = "The host-authorized app-buffer mailbox derives identity and range from the retained kernel capability, never the payload, and verifies the fixed aperture is not RAM before any physical address reaches a user page table. Aperture identity is not covered by the custody model."
+
+[[source_mappings]]
+path = "kernel/io-manager/src/io/dvm_display/app_buffer.rs"
+models = ["app-buffer-custody/AppBufferCustody"]
+
+[[source_mappings]]
+path = "kernel/ps/src/user/handles/device_buffer.rs"
+models = ["app-buffer-custody/AppBufferCustody"]
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/library_object_ops.rs"
+severity = "critical"
+flows = ["frame-source-lifecycle"]
+reason = "Pager-only create/supply/seal/retire requests are admitted into the sealed library-object registry, whose pages are published as frame sources; payload is copied before any lock and every refusal publishes nothing. Registry budgets and sealing order are covered by native tests, not by the frame-source model."
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/library_object_ops.rs"
+models = ["frame-source-lifecycle/FrameSourceLifecycle"]
+
+[[risk_surfaces]]
 path = "kernel/compat/src/user/syscall/linux/memory_ops.rs"
 severity = "critical"
 flows = ["memory-map"]
@@ -2333,6 +2377,7 @@ models = [
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/ipc_ops.rs"
 models = [
+    "frame-source-lifecycle/FrameSourceLifecycle",
     "input-ingestion-worker/InputIngestionWorker",
     "ipc-fast-handoff/IpcFastHandoff",
     "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
@@ -2892,7 +2937,7 @@ reason = "pagerd's service entry must accept only a canonical dispatched anonymo
 
 [[source_mappings]]
 path = "services/pagerd/src/main.rs"
-models = ["pager-fault-slot-lifecycle/PagerFaultSlotLifecycle", "pager-frame-grant-lifecycle/PagerFrameGrantLifecycle"]
+models = ["pager-fault-slot-lifecycle/PagerFaultSlotLifecycle", "pager-frame-grant-lifecycle/PagerFrameGrantLifecycle", "frame-source-lifecycle/FrameSourceLifecycle"]
 
 [[risk_surfaces]]
 path = "kernel/mm/src/memory/frame_capability.rs"
@@ -2913,6 +2958,40 @@ reason = "Page-fault entry must reserve only fixed one-shot token custody, publi
 [[source_mappings]]
 path = "kernel/ps/src/multitask/pager_fault.rs"
 models = ["pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/mm/src/memory/frame_source.rs"
+severity = "critical"
+flows = ["frame-source-lifecycle"]
+reason = "Reusable immutable source capabilities bind exact service lease epochs, object/content generations and rights; source pins close before cold descriptor/charge retirement, independent of surviving target leaves. Queue weak-memory and hardware scope are not inferred from the bounded lifecycle model."
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/frame_source.rs"
+models = ["frame-source-lifecycle/FrameSourceLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/compat/src/pager/file_source.rs"
+severity = "critical"
+flows = ["frame-source-lifecycle", "pager-fault-slot-lifecycle", "pager-vma-publication"]
+reason = "A worker-bound file reply borrows the exact source owner/key/content/page through current process-MM-VMA validation and independent COW leaf publication. Source writes and anonymous run population are forbidden. The lifecycle model does not prove hardware PTE behavior, file I/O, or queue weak-memory refinement."
+
+[[source_mappings]]
+path = "kernel/compat/src/pager/file_source.rs"
+models = ["frame-source-lifecycle/FrameSourceLifecycle", "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle", "pager-vma-publication/PagerVmaPublication", "cow-frame-lifecycle/CowFrameLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/frame_source_ops.rs"
+severity = "critical"
+flows = ["frame-source-lifecycle"]
+reason = "Native source supply authenticates PagerPolicy and an exact live service owner, copies user payload before the registry lock, serializes publication with revoke, and derives resident charge rather than accepting it from the caller."
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/frame_source_ops.rs"
+models = ["frame-source-lifecycle/FrameSourceLifecycle"]
+
+[[source_mappings]]
+path = "libs/rustos-user-abi/src/syscall/frame_source.rs"
+models = ["frame-source-lifecycle/FrameSourceLifecycle"]
 
 [[risk_surfaces]]
 path = "kernel/compat/src/user/syscall/linux/pager_fault_ops.rs"
@@ -2940,7 +3019,7 @@ models = ["pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"]
 
 [[source_mappings]]
 path = "libs/rustos-svc-runtime/src/pager.rs"
-models = ["pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"]
+models = ["pager-fault-slot-lifecycle/PagerFaultSlotLifecycle", "frame-source-lifecycle/FrameSourceLifecycle"]
 
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/pager_vma.rs"

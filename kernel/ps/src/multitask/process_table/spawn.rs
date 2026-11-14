@@ -111,7 +111,7 @@ pub fn publish_spawn(
     parent_process_id: Option<u64>,
     state: UserProcessState,
 ) -> Option<ProcessHandle> {
-    publish_inner(reservation, process_id, parent_process_id, state, None).map(|v| v.0)
+    publish_inner(reservation, process_id, parent_process_id, state, None).ok().map(|v| v.0)
 }
 
 /// Process-table half of an actual non-Copy root constructor. This snapshot
@@ -198,26 +198,20 @@ pub(in crate::multitask) fn publish_root_spawn(
     loan: &mut RootSpawnLoan,
     parent: Option<u64>,
     state: UserProcessState,
-) -> Option<pin_owner::ProcessObjectPin> {
+) -> Result<pin_owner::ProcessObjectPin, super::super::SpawnTaskError> {
     if !loan.live {
-        return None;
+        return Err(super::super::SpawnTaskError::NoFreeTaskSlot);
     }
     let key = loan.key;
     let (_, pin) = publish_inner(key.reservation, key.member.1, parent, state, Some(key))?;
     loan.live = false;
-    Some(pin.expect("root process publication lost pre-visibility pin"))
+    Ok(pin.expect("root process publication lost pre-visibility pin"))
 }
 
-/// Names which check refused a process publication. Every one of them reaches a
-/// `fork` as `EAGAIN` through `NoFreeTaskSlot`, so without a code a Job whose
-/// exited children have not been freed yet, a full kmem budget and a lost
-/// reservation are indistinguishable. 1 Job unavailable, 2 Job process/object
-/// limit (detail: objects in the subtree, of which already reaped), 3 handle-table
-/// budget, 4 mapping-record budget, 5 reservation lost, 6 thread-stack budget.
-/// Bounded, so a refusal storm stays cheap.
-fn publish_refused<T>(site: u64, a: u64, b: u64) -> Option<T> {
+/// Record a bounded refusal diagnostic while preserving its typed cause.
+fn publish_refused<T>(site: u64, a: u64, b: u64, error: super::super::SpawnTaskError) -> Result<T, super::super::SpawnTaskError> {
     static RECORDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    // ORDERING: Relaxed; a counter bounding telemetry volume.
+    // ORDERING: Relaxed; this counter only bounds diagnostic volume.
     if RECORDED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32 {
         crate::debug::record_milestone(
             crate::debug::LogCategory::Sched,
@@ -226,7 +220,7 @@ fn publish_refused<T>(site: u64, a: u64, b: u64) -> Option<T> {
             0,
         );
     }
-    None
+    Err(error)
 }
 
 fn publish_inner(
@@ -235,7 +229,7 @@ fn publish_inner(
     parent_process_id: Option<u64>,
     state: UserProcessState,
     root: Option<RootSpawnKey>,
-) -> Option<(ProcessHandle, Option<pin_owner::ProcessObjectPin>)> {
+) -> Result<(ProcessHandle, Option<pin_owner::ProcessObjectPin>), super::super::SpawnTaskError> {
     // Heap construction and failed-state destruction stay outside the table
     // leaf. The table guard drops before this earlier-declared object on refusal.
     // The job is only known under the lock, so the object is built with the
@@ -253,13 +247,13 @@ fn publish_inner(
     // cancel exactly as for any other publication refusal.
     object.job = match table.resolve_new_member_job(reservation.job, parent_process_id) {
         Ok(job) => job,
-        Err(_) => return publish_refused(1, 0, 0),
+        Err(_) => return publish_refused(1, 0, 0, super::super::SpawnTaskError::NoFreeTaskSlot),
     };
     // The authoritative admission check: reservation could not know the job a
     // fork inherits, and counts may have moved since an explicit job was checked.
     if !table.admits_process(object.job) {
         let (all, pending_free) = table.refusal_census(object.job.index());
-        return publish_refused(2, all, pending_free);
+        return publish_refused(2, all, pending_free, super::super::SpawnTaskError::NoFreeTaskSlot);
     }
     // Bill the new process's descriptor slots to its job. The object is still
     // private, so no state lock is taken, and the charge is lock-free: a
@@ -270,7 +264,7 @@ fn publish_inner(
         .handles_mut()
         .bind_kmem_group(object.job.index() as usize)
     {
-        return publish_refused(3, 0, 0);
+        return publish_refused(3, 0, 0, super::super::SpawnTaskError::MemoryQuota);
     }
     // The shared-mapping bookkeeping (fork-cloned records included) is billed
     // the same way, so a Job's Vma budget refuses the publication.
@@ -279,33 +273,35 @@ fn publish_inner(
         .get_mut()
         .bind_mapping_kmem(object.job.index() as usize)
     {
-        return publish_refused(4, 0, 0);
+        return publish_refused(4, 0, 0, super::super::SpawnTaskError::MemoryQuota);
     }
     let Some(slot) = table.lookup_slot_mut(reservation.handle) else {
-        return publish_refused(5, 0, 0);
+        return publish_refused(5, 0, 0, super::super::SpawnTaskError::NoFreeTaskSlot);
     };
     if slot.object.is_some()
         || slot.spawn_transaction_id != Some(reservation.transaction_id)
         || slot.root_spawn != root
     {
-        return publish_refused(5, 1, 0);
+        return publish_refused(5, 1, 0, super::super::SpawnTaskError::NoFreeTaskSlot);
     }
-    // The first thread's stack is billed with the process; nothing after this
-    // point can refuse the publication, so a charge never needs unwinding.
+    // Bill the first thread's stack to the private process object. If the
+    // subsequent root admission refuses, object destruction refunds this
+    // charge outside the table leaf; no unpublished owner is abandoned.
     if !kernel_mm::api::kmem_charge::try_charge(
         kernel_mm::api::kmem_charge::Class::Thread,
         object.job.index() as usize,
         super::THREAD_KMEM_BYTES,
     ) {
-        return publish_refused(6, 0, 0);
+        return publish_refused(6, 0, 0, super::super::SpawnTaskError::MemoryQuota);
     }
     object.thread_kmem = super::THREAD_KMEM_BYTES;
     // The root is quiescent until the process is visible, so binding it now
     // charges the image pages already mapped to the job exactly once.
-    let root_phys = object.mm_execution.root_phys();
     let job_index = object.job.index() as usize;
+    if !bind_process_root_charge(object.state.get_mut().address_space_mut(), job_index) {
+        return publish_refused(7, 0, 0, super::super::SpawnTaskError::MemoryQuota);
+    }
     slot.object = Some(object);
-    let _ = kernel_mm::api::phys::bind_root_charge(root_phys, job_index);
     slot.spawn_transaction_id = None;
     // Acquire actual backing BEFORE the release that admits live PID lookup;
     // no capture-after-publication gap and no Class55 leaf spans this Class54.
@@ -328,7 +324,7 @@ fn publish_inner(
         1,
         reservation.transaction_id,
     );
-    Some((reservation.handle, pin))
+    Ok((reservation.handle, pin))
 }
 
 /// Abort an unpublished spawn transaction. Nothing can observe the reserved

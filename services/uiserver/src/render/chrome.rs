@@ -12,8 +12,8 @@ use crate::clock::ClockReading;
 use crate::font::{self, TextStyle};
 use crate::layout::{
     window_button_cluster_width, window_client_rect, window_close_button_rect,
-    window_maximize_button_rect, window_minimize_button_rect, window_title_bar_rect, HomeCell, HomeClock,
-    WINDOW_RADIUS, WINDOW_SHADOW_STEPS,
+    window_maximize_button_rect, window_minimize_button_rect, window_title_bar_rect, HomeCell,
+    HomeClock, WINDOW_RADIUS, WINDOW_SHADOW_STEPS,
 };
 use crate::wayland::WaylandWindowSnapshot;
 
@@ -28,7 +28,7 @@ use super::glass::{
     WindowAlpha,
 };
 use super::icons::{draw_app_icon, stroke_line};
-use super::{wayland_window_client_rect, wayland_window_outer_rect};
+use super::{wayland_window_client_rect_for, wayland_window_outer_rect};
 
 const RAIL_RADIUS: usize = 18;
 
@@ -133,7 +133,14 @@ pub(super) fn draw_home_clock(
         let mut x = start_x;
         for ch in time.chars() {
             let cell = cell_width(ch);
-            font::draw_glyph_centered(canvas, x + dx, time_y + dy, cell, ch, TextStyle::clock(color));
+            font::draw_glyph_centered(
+                canvas,
+                x + dx,
+                time_y + dy,
+                cell,
+                ch,
+                TextStyle::clock(color),
+            );
             x += cell;
         }
     }
@@ -244,15 +251,17 @@ pub(super) fn draw_wayland_window(
     }
 
     let outer = wayland_window_outer_rect(window);
-    let client_rect = wayland_window_client_rect(outer);
+    let client_rect = wayland_window_client_rect_for(window, outer);
     let title = if window.title.is_empty() {
         "Wayland App"
     } else {
         window.title.as_str()
     };
 
-    draw_window_shadow(canvas, outer);
-    paint_window_chrome(canvas, outer, client_rect, title, focused);
+    if window.server_decoration {
+        draw_window_shadow(canvas, outer);
+        paint_window_chrome(canvas, outer, client_rect, title, focused);
+    }
 
     // The client may have committed a buffer larger than what the desktop
     // can hold (e.g. wayclick hardcodes 800×520 and ignores our configure).
@@ -263,7 +272,7 @@ pub(super) fn draw_wayland_window(
     if blit_w == 0 || blit_h == 0 {
         return;
     }
-    canvas.draw_surface(
+    canvas.draw_surface_premultiplied(
         window.pixels.as_slice(),
         blit_w,
         blit_h,

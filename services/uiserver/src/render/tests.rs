@@ -10,13 +10,23 @@ use super::{
 #[test]
 fn shell_echo_updates_retained_atlas_without_dragging_the_window() {
     use crate::app::{ConsoleWindow, VisualUpdate};
-    let frame = Rect { x: 40, y: 60, width: 320, height: 180 };
+    let frame = Rect {
+        x: 40,
+        y: 60,
+        width: 320,
+        height: 180,
+    };
     let mut window = ConsoleWindow::new(7, String::from("Shell"), frame, 1);
     window.output_cache.extend_from_slice(b"prompt> ");
     super::chrome::rebuild_console_window_surface(&mut window, true);
     let mut atlas = window.surface_cache.pixels.clone();
     let before = atlas.clone();
-    let source_rect = Rect { x: 0, y: 0, width: frame.width, height: frame.height };
+    let source_rect = Rect {
+        x: 0,
+        y: 0,
+        width: frame.width,
+        height: frame.height,
+    };
     let mut bindings = [super::ConsoleAtlasBinding {
         session_handle: 7,
         content_version: window.surface_cache.content_version,
@@ -33,9 +43,15 @@ fn shell_echo_updates_retained_atlas_without_dragging_the_window() {
     let mut damage = Vec::new();
     if update.scene_dirty() {
         assert!(super::update_console_gpu_texture(
-            &mut window, true, &mut atlas, frame.width,
-            &mut bindings, &mut 0, &mut damage,
-        ).unwrap());
+            &mut window,
+            true,
+            &mut atlas,
+            frame.width,
+            &mut bindings,
+            &mut 0,
+            &mut damage,
+        )
+        .unwrap());
     }
     assert_eq!(window.frame, frame, "echo must not depend on window motion");
     assert_eq!(damage, vec![source_rect]);
@@ -53,6 +69,8 @@ fn snapshot(pixels: Vec<u32>, damage: Rect) -> WaylandWindowSnapshot {
             height: 3,
         },
         minimized: false,
+        server_decoration: true,
+        drag_icon: false,
         content_version: 2,
         damage,
         pixels: Arc::new(pixels),
@@ -693,4 +711,29 @@ fn console_font_asset_revision_rebuilds_unchanged_title_and_terminal_raster() {
         window.surface_cache.content_version, current_version,
         "same font revision reuses the raster"
     );
+}
+
+#[test]
+fn client_decorated_wayland_window_has_no_compositor_chrome() {
+    let mut window = snapshot(vec![0xff12_3456; 4], Rect::empty());
+    window.width = 2;
+    window.height = 2;
+    window.stride_pixels = 2;
+    window.frame.width = 2;
+    window.frame.height = 2;
+    window.server_decoration = false;
+    assert_eq!(wayland_window_outer_rect(&window), window.frame);
+    let pixels = super::render_wayland_gpu_texture(&window, true).unwrap();
+    assert_eq!(pixels, vec![0xff12_3456; 4]);
+    let hit = crate::app::window_hit_test(
+        &[crate::app::WindowId::Wayland(window.surface_id)],
+        &[],
+        &[window.clone()],
+        window.frame.x as u32,
+        window.frame.y as u32,
+    );
+    assert!(matches!(
+        hit,
+        Some((_, crate::layout::WindowChromeHit::Client))
+    ));
 }

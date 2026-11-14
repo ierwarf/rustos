@@ -416,6 +416,7 @@ fn record_service_endpoint_milestone(
 /// 소모할 때까지 실패가 지연되므로 반드시 프로세스 종료 경로에서 호출해야 한다.
 pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
     let mut revoked_services = [0_u64; MAX_SERVICE_ENDPOINTS];
+    let mut revoked_epochs = [0_u64; MAX_SERVICE_ENDPOINTS];
     let mut revoked_count = 0usize;
     let registry_mutation = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
     {
@@ -434,6 +435,7 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
             // Endpoint zero is the reader-visible revoke commit point. Clear
             // it before the tuple fields and advance the public epoch last,
             // matching the explicit revoke path below.
+            let retired_epoch = SERVICE_ENDPOINT_EPOCHS[i].load(Ordering::Acquire);
             SERVICE_ENDPOINTS[i].store(0, Ordering::Release);
             SERVICE_ENDPOINT_OWNERS[i].store(0, Ordering::Release);
             SERVICE_ENDPOINT_CAPS[i].store(0, Ordering::Release);
@@ -446,11 +448,13 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
                 process_id
             );
             revoked_services[revoked_count] = i as u64;
+            revoked_epochs[revoked_count] = retired_epoch;
             revoked_count += 1;
         }
     }
     drop(registry_mutation);
-    for service_id in revoked_services.into_iter().take(revoked_count) {
+    for (service_id, epoch) in revoked_services.into_iter().zip(revoked_epochs).take(revoked_count) {
+        withdraw_frame_source_owner(service_id, epoch);
         super::broker_ops::waitset_broker_ops::revoke_waitset_provider(service_id);
         if service_exit_requires_input_policy_withdrawal(service_id) {
             // The fixed DVM ring publishes a separate policy-consumer lease.
@@ -503,6 +507,39 @@ fn syscall_linux_rustos_ipc_validate_service_owner(args_ptr: u64) -> u64 {
         return linux_errno(LINUX_EPERM);
     }
     0
+}
+
+/// Executes a bounded, nonblocking source-publication step under the exact
+/// service lease. Copy user buffers beforehand; the closure must not perform
+/// IPC, acquire a process-state/MM mutation lock, or reclaim an old source.
+/// This closes publish-vs-revoke without a racy liveness-check-only protocol.
+pub(crate) fn with_owned_service_lease<T>(
+    process_id: u64,
+    service_id: u64,
+    publish: impl FnOnce(u64, u64) -> T,
+) -> Option<T> {
+    let index = service_index(service_id)?;
+    let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    let endpoint = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
+    let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
+    let epoch = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
+    if endpoint == 0 || owner != process_id || epoch == 0
+        || multitask::is_user_process_exiting(process_id) { return None; }
+    Some(publish(service_id, epoch))
+}
+
+fn withdraw_frame_source_owner(service_id: u64, epoch: u64) {
+    if service_id == linux_abi::IPC_SERVICE_PAGERD && epoch != 0 {
+        // Atomic withdrawal only. Last-pin Drop queues descriptor/physical
+        // cleanup for the normal-time pager hook, never under a registry lock
+        // or on the exception/exit path. A replacement lease has another epoch
+        // even when it registers the same underlying endpoint object again.
+        kernel_mm::api::frame_source::retire_frame_sources_for_owner(
+            kernel_mm::api::frame_source::FrameSourceOwner {
+                service_slot: service_id, service_generation: epoch,
+            },
+        );
+    }
 }
 
 pub(crate) fn service_endpoint_epoch(service_id: u64) -> Option<u64> {
@@ -1009,12 +1046,14 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
             );
             return linux_errno(LINUX_EPERM);
         }
+        let retired_epoch = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
         SERVICE_ENDPOINTS[index].store(0, Ordering::Release);
         SERVICE_ENDPOINT_OWNERS[index].store(0, Ordering::Release);
         SERVICE_ENDPOINT_CAPS[index].store(0, Ordering::Release);
         withdraw_pager_policy_owner(owner);
         advance_service_endpoint_epoch(index).expect("service endpoint epoch exhausted");
         drop(registry_mutation);
+        withdraw_frame_source_owner(service_id, retired_epoch);
         super::broker_ops::waitset_broker_ops::revoke_waitset_provider(service_id);
         record_service_endpoint_milestone("ipc-service-revoke", service_id, process_id, 0);
         ipc_trace!("ipc service revoked: service={}", service_id);

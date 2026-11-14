@@ -216,6 +216,11 @@ fn spawn_rustos_guest(
                 .context("GUI-DVM control exists without a pixel backend")?,
             false,
         );
+        append_dvm_app_buffer_aperture(
+            &mut rustos_command,
+            layout.gui_dvm_app_buffers.as_deref().context("GUI-DVM app-buffer backend missing")?,
+            true,
+        );
     } else {
         rustos_command
             .arg("-device")
@@ -350,6 +355,11 @@ fn spawn_dvm_guest(
                 .context("GUI-DVM control exists without a pixel backend")?,
             true,
         );
+        append_dvm_app_buffer_aperture(
+            &mut dvm_command,
+            layout.gui_dvm_app_buffers.as_deref().context("GUI-DVM app-buffer backend missing")?,
+            false,
+        );
     }
     if let Some(shared_network) = layout.dvm_network_shmem.as_deref() {
         append_dvm_network_ivshmem(&mut dvm_command, shared_network);
@@ -442,6 +452,18 @@ fn append_dvm_display_pixels(command: &mut Command, path: &Path, read_only: bool
         .arg(format!(
             "virtio-pmem-pci,id=dvm-display-pmem,memdev=dvm-display-pixels,memaddr={DVM_DISPLAY_PIXEL_PHYS_ADDR}"
         ));
+}
+
+/// Both guests need write access; only the first QEMU preallocates the backing.
+fn append_dvm_app_buffer_aperture(command: &mut Command, path: &Path, prealloc: bool) {
+    let mut backend = format!(
+        "memory-backend-file,id=dvm-app-buffers,mem-path={},size={},share=on",
+        path.display(), DVM_APP_BUFFER_REGION_BYTES
+    );
+    if prealloc { backend.push_str(",prealloc=on"); }
+    command.arg("-object").arg(backend).arg("-device").arg(format!(
+        "virtio-pmem-pci,id=dvm-app-buffer-pmem,memdev=dvm-app-buffers,memaddr={DVM_APP_BUFFER_PHYS_ADDR}"
+    ));
 }
 
 /// Add an already-bound device from the sealed physical-GPU profile registry.
@@ -670,7 +692,24 @@ fn wait_for_parallel_boot(
         {
             return Ok(control_ready);
         }
-        if Instant::now() >= deadline {
+        // A probe that has already reported its own failure cannot recover;
+        // end the wait now instead of spending the rest of the timeout.
+        let probe_failure = (options.library_map_probe || options.mmap_cost_probe)
+            .then(|| library_map_probe_failure(&rustos_log))
+            .flatten()
+            .or_else(|| {
+                options
+                    .local_fd_probe
+                    .then(|| local_fd_probe_failure(&rustos_log))
+                    .flatten()
+            })
+            .or_else(|| {
+                options
+                    .app_dmabuf_probe
+                    .then(|| app_dmabuf_probe_failure(&rustos_log))
+                    .flatten()
+            });
+        if probe_failure.is_some() || Instant::now() >= deadline {
             let input = dvm_input_counters(&layout.dvm_input_ring)?;
             let wayclick_observed = wayclick_profile_observation(&rustos_log);
             let mut missing_rustos = options
@@ -695,10 +734,13 @@ fn wait_for_parallel_boot(
                 .filter(|marker| !dvm_log.contains(marker.as_str()))
                 .cloned()
                 .collect::<Vec<_>>();
-            let reason = format!(
-                "KVM parallel boot did not reach readiness within {:?}",
-                options.timeout
-            );
+            let reason = match probe_failure {
+                Some(line) => format!("probe failed early: {line}"),
+                None => format!(
+                    "KVM parallel boot did not reach readiness within {:?}",
+                    options.timeout
+                ),
+            };
             let evidence = write_kvm_failure_summary(
                 layout,
                 &reason,
@@ -836,6 +878,9 @@ impl RecoveryHarness<'_> {
             }
             if let Some(path) = self.layout.gui_dvm_pixels.as_deref() {
                 create_gui_dvm_surfaces(path).context("reset GUI-DVM pixel region")?;
+            }
+            if let Some(path) = self.layout.gui_dvm_app_buffers.as_deref() {
+                create_dvm_app_buffer_aperture(path).context("reset DVM app-buffer aperture")?;
             }
             if let Some(path) = self.layout.dvm_network_shmem.as_deref() {
                 create_dvm_network_shmem(path).context("reset DVM network region")?;

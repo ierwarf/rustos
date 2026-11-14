@@ -2,24 +2,25 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `70064fffde6d778e765683fba32ea701ccaafb074b11eec1bdc88037fc40d50a`
-- Models: `157`
-- Whole flows: `82`
-- Transitions: `1011`
+- Registry SHA-256: `62f52948560bb19c3ef1214c47bc800efac57e3861c210e34ee76199204be274`
+- Models: `160`
+- Whole flows: `84`
+- Transitions: `1028`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `1528`
+- Exact source witnesses: `1571`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
 - Intentional-terminal exceptions: `87` (ceiling `87`)
-- Cyclic strongly connected components: `57`
-- Supporting model bindings: `135`
-- Explicit critical/high risk surfaces: `252`
-- Additional source mappings: `389`
+- Cyclic strongly connected components: `59`
+- Supporting model bindings: `138`
+- Explicit critical/high risk surfaces: `259`
+- Additional source mappings: `398`
 
 | Flow | Severity | Owners | Models | Requirements | Hazards | Sinks |
 | --- | --- | --- | --- | ---: | ---: | --- |
 | `acpi-firmware-admission` | `critical` | kernel-hal | validator:acpi-table-admission | 6 | 6 | legacy-ready, ready, ready-without-hpet |
+| `app-buffer-custody` | `critical` | kernel-ps | app-buffer-custody/AppBufferCustody | 6 | 6 | free, rejected |
 | `application-job-custody` | `critical` | loaderd, rootd, rustos-user-abi, xtask | application-job-custody/ApplicationJobCustody | 16 | 16 | closed, denied |
 | `application-limit-refusal` | `critical` | kernel-compat, loaderd, rootd, xtask | application-limit-refusal/ApplicationLimitRefusal | 13 | 13 | closed, denied |
 | `atomic-process-activation-batch` | `critical` | initd, kernel-compat, kernel-ps, loaderd | atomic-process-activation-batch/AtomicProcessActivationBatch | 13 | 13 | handed-off, rejected, retired |
@@ -50,6 +51,7 @@
 | `entropy-boundary` | `critical` | kernel-compat, kernel-executive | entropy-broker-boundary/EntropyBrokerBoundary | 5 | 5 | boot-rejected, denied, served |
 | `exception-retirement` | `critical` | kernel-compat, kernel-executive, kernel-hal, kernel-ps, nucleus-core | exception-diagnostic-custody/ExceptionDiagnosticCustody, exception-retirement-lifecycle/ExceptionRetirementLifecycle, user-stack-growth/UserStackGrowth | 14 | 14 | growth-committed, kernel-panicked, nmi-returned, process-retired, resumed, thread-retired |
 | `executable-image-admission` | `critical` | image-admission | validator:image-admission | 4 | 4 | admitted, rejected |
+| `frame-source-lifecycle` | `critical` | kernel-compat, kernel-mm | frame-source-lifecycle/FrameSourceLifecycle | 8 | 8 | denied, free |
 | `futex-wait-lifecycle` | `critical` | kernel-compat, kernel-executive, kernel-ps | futex-waiter-lifecycle/FutexWaiterLifecycle | 9 | 9 | cancelled, owner-died, timed-out, woken |
 | `gpu-frame-lifecycle` | `critical` | kernel-io-manager, linux-dvm, uiserver | dvm-display-readiness/DvmDisplayReadiness, dvm-gpu-admission/DvmGpuAdmission, dvm-gpu-compositor/DvmGpuCompositor, gpu-submit-transaction/GpuSubmitTransaction | 14 | 14 | displayed, rejected, revoked |
 | `input-delivery-lifecycle` | `critical` | inputd, kernel-compat, kernel-io-manager, uiserver | dvm-input-ring/DvmInputRing, input-ingestion-worker/InputIngestionWorker, scheduler-wakeup/SchedulerWakeup, userspace-wait-set/UserspaceWaitSet | 19 | 19 | delivered, rejected, timed-out |
@@ -59,7 +61,7 @@
 | `kernel-memory-protection` | `critical` | kernel-mm | page-table-lifecycle/PageTableLifecycle | 5 | 5 | rejected |
 | `kernel-resource-lifecycle` | `critical` | kernel-ipc-runtime, kernel-ps | kernel-resource-accounting/KernelResourceAccounting | 9 | 9 | quota-returned, rejected |
 | `loader-request-authority` | `critical` | initd, kernel-compat, loaderd, rootd, rustos-user-abi | job-spawn-placement/JobSpawnPlacement, loader-request-authority/LoaderRequestAuthority | 20 | 20 | committed, denied |
-| `memory-map` | `critical` | kernel-compat, kernel-mm, syscalld | page-table-lifecycle/PageTableLifecycle, page-table-map-transaction/PageTableMapTransaction | 9 | 9 | rejected, unmapped |
+| `memory-map` | `critical` | kernel-compat, kernel-mm, syscalld | mm-request-lease/MmRequestLease, page-table-lifecycle/PageTableLifecycle, page-table-map-transaction/PageTableMapTransaction | 12 | 12 | rejected, unmapped |
 | `monotonic-deadline-lifecycle` | `critical` | kernel-compat, kernel-hal, kernel-ps | clocksource-deadline/ClocksourceDeadline | 13 | 13 | cancelled, reported, retired, source-rejected, timed-out |
 | `msi-vector-ingress` | `critical` | kernel-hal, kernel-io-manager | msi-vector-lifecycle/MsiVectorLifecycle | 8 | 8 | free, permanent, rejected |
 | `netd-deferred-reply-lifecycle` | `critical` | netd | netd-deferred-reply/NetdDeferredReply | 10 | 10 | discarded, provider-not-started, rejected, replied, timed-out |

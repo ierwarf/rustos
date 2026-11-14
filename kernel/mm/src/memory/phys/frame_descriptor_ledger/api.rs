@@ -42,8 +42,8 @@ pub fn pop_lazy_table_record(root_phys: u64) -> Option<u64> {
     FRAME_DESCRIPTORS.pop_table(root_phys)
 }
 
-pub fn claim_data_leaf(root_phys: u64, virtual_address: u64, frame_phys: u64) -> bool {
-    FRAME_DESCRIPTORS.claim_exclusive_data(root_phys, virtual_address, frame_phys)
+pub fn claim_data_leaf(root_phys: u64, virtual_address: u64, frame_phys: u64) -> DataClaim {
+    FRAME_DESCRIPTORS.claim_exclusive_data(root_phys, virtual_address, frame_phys, true)
 }
 
 pub fn publish_data_leaf(root_phys: u64, virtual_address: u64, frame_phys: u64) {
@@ -51,7 +51,16 @@ pub fn publish_data_leaf(root_phys: u64, virtual_address: u64, frame_phys: u64) 
 }
 
 pub fn cancel_data_leaf(root_phys: u64, virtual_address: u64, frame_phys: u64) {
-    FRAME_DESCRIPTORS.cancel_exclusive_data(root_phys, virtual_address, frame_phys);
+    FRAME_DESCRIPTORS.cancel_exclusive_data(root_phys, virtual_address, frame_phys, true);
+}
+
+/// Claim a replacement backed by the locked COW mapping's existing charge.
+pub fn claim_cow_replacement(claim: &CowMappingClaim, frame_phys: u64) -> DataClaim {
+    FRAME_DESCRIPTORS.claim_exclusive_data(claim.root_phys, claim.virtual_address, frame_phys, false)
+}
+
+pub fn cancel_cow_replacement(claim: &CowMappingClaim, frame_phys: u64) {
+    FRAME_DESCRIPTORS.cancel_exclusive_data(claim.root_phys, claim.virtual_address, frame_phys, false);
 }
 
 pub fn prepare_shared_alias(
@@ -86,12 +95,24 @@ pub fn rollback_shared_alias(ticket: SharedAliasTicket) -> bool {
     FRAME_DESCRIPTORS.rollback_shared_alias(ticket)
 }
 
+/// Claims independent cache custody; caller owns the allocated frame and pays
+/// its source-residency charge before publication.
+pub fn claim_private_file_cache_frame(frame_phys: u64, backing_identity: u64) -> bool {
+    FRAME_DESCRIPTORS.claim_private_file_cache(frame_phys, backing_identity)
+}
+
+/// Withdraw capability and drain installers before releasing this custody.
+/// Existing mapped leaves retain the frame through their own TLB-safe release.
+pub fn release_private_file_cache_frame(frame_phys: u64, backing_identity: u64) -> Option<DataLeafRelease> {
+    FRAME_DESCRIPTORS.release_private_file_cache(frame_phys, backing_identity)
+}
+
 pub fn claim_private_file_data_leaf(
     root_phys: u64,
     virtual_address: u64,
     frame_phys: u64,
     backing_identity: u64,
-) -> bool {
+) -> DataClaim {
     FRAME_DESCRIPTORS.claim_private_file_data(
         root_phys,
         virtual_address,

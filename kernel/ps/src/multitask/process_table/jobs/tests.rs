@@ -259,6 +259,32 @@ fn a_thread_limit_refuses_the_next_thread_across_the_subtree() {
 }
 
 #[test]
+fn a_thread_limit_above_the_per_process_ceiling_is_still_charged_and_enforced() {
+    use crate::multitask::process_table::MAX_THREADS_PER_PROCESS as CEILING;
+    let _isolation = isolate_process_table();
+    let job = job_create_child(ROOT_JOB).unwrap();
+    // Two processes may together exceed one process's ceiling, up to the job limit.
+    let limit = (CEILING + 4) as u64;
+    job_set_limits(job, LimitMask::THREADS, limits(LIMIT_UNSET, limit)).unwrap();
+    let a = spawn_in(140, None, Some(job)).unwrap();
+    let b = spawn_in(141, None, Some(job)).unwrap();
+    for _ in 1..CEILING {
+        attach_task(a).expect("within the process ceiling and the job limit");
+    }
+    assert!(attach_task(a).is_none(), "the per-process ceiling still binds");
+    assert_eq!(job_info(job).unwrap().usage_threads, (CEILING + 1) as u64);
+    for _ in 0..3 {
+        attach_task(b).expect("within the job limit");
+    }
+    assert_eq!(job_info(job).unwrap().usage_threads, limit);
+    assert!(attach_task(b).is_none(), "the job threads.max binds before b's ceiling");
+    detach_task(a).unwrap();
+    assert_eq!(job_info(job).unwrap().usage_threads, limit - 1);
+    attach_task(b).expect("an exit refunds the job charge");
+    assert!(attach_task(b).is_none());
+}
+
+#[test]
 fn a_recycled_job_slot_does_not_inherit_the_previous_jobs_limits() {
     let _isolation = isolate_process_table();
     let first = job_create_child(ROOT_JOB).unwrap();
@@ -415,18 +441,19 @@ fn killing_job_cannot_recycle_until_session_refunded() {
 
 #[test]
 fn roots_are_bound_to_their_job_at_publication_and_at_exec_commit() {
-    // The host ledger is not installed, so the binding itself is a source
-    // witness: it must follow the object becoming visible, and exec must bind
-    // the new image's root rather than leave it unbound.
+    // The host ledger is not installed. Verify admission precedes publication
+    // and exec closes neither the old root nor handles before it succeeds.
     let spawn = include_str!("../spawn.rs");
     let publish = spawn.split_once("fn publish_inner(").unwrap().1;
+    let bind = publish.find("bind_process_root_charge(object.state.get_mut().address_space_mut(), job_index)").unwrap();
     let object = publish.find("slot.object = Some(object);").unwrap();
-    let bind = publish.find("kernel_mm::api::phys::bind_root_charge(root_phys, job_index)").unwrap();
-    let root = publish.find("let root_phys = object.mm_execution.root_phys();").unwrap();
-    assert!(root < object && object < bind, "read the root before the move, bind once published");
+    assert!(bind < object);
     let table = include_str!("../../process_table.rs");
-    let exec = table.split_once("object.mm_execution = new_mm.pin_for_publication();").unwrap().1;
-    assert!(exec[..600].contains("bind_root_charge(new_root, object.job.index() as usize)"));
+    let exec = table.split_once("pub fn stage_exec_state_checked(").unwrap().1;
+    assert!(exec.find("bind_process_root_charge(&mut address_space, job_index)").unwrap()
+        < exec.find("seal_execution()").unwrap());
+    assert!(exec.find("reserve_exec_mapping_kmem(&address_space)").unwrap()
+        < exec.find("seal_execution()").unwrap());
 }
 
 /// Exhaustive kill/reap interleavings.

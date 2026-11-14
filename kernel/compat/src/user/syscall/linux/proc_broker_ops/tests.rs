@@ -15,6 +15,34 @@ fn file_mapping_len_must_fit_inside_memory_mapping() {
 }
 
 #[test]
+fn immutable_file_sharing_never_exposes_partial_or_out_of_file_bytes() {
+    assert_eq!(
+        immutable_file_prefix(0x1000, 0x2345, PROC_BROKER_MAP_READ, 0x4000),
+        Ok(0x2000)
+    );
+    assert_eq!(
+        immutable_file_prefix(0x1001, 0x2000, PROC_BROKER_MAP_READ, 0x4000),
+        Ok(0)
+    );
+    assert_eq!(
+        immutable_file_prefix(0, 0xfff, PROC_BROKER_MAP_EXEC, 0xfff),
+        Ok(0)
+    );
+    assert_eq!(
+        immutable_file_prefix(0, 0x2000, PROC_BROKER_MAP_WRITE, 0x2000),
+        Ok(0)
+    );
+    assert_eq!(
+        immutable_file_prefix(0, 0x2001, PROC_BROKER_MAP_READ, 0x2000),
+        Err(LINUX_EIO)
+    );
+    assert_eq!(
+        immutable_file_prefix(u64::MAX - 4095, 4096, 0, u64::MAX),
+        Err(LINUX_EIO)
+    );
+}
+
+#[test]
 fn truncated_file_mapping_never_commits_zero_filled_tail() {
     assert_eq!(validate_complete_file_copy(4096, 4096), Ok(()));
     assert_eq!(validate_complete_file_copy(4096, 4095), Err(LINUX_EIO));
@@ -176,7 +204,7 @@ fn exec_prepare_authority_is_exact_and_cannot_be_reused_as_spawn() {
 
 #[test]
 fn executable_file_backing_requires_a_terminally_sealed_snapshot() {
-    let snapshot = MemfdHandle::new(String::from("loader-test"), true);
+    let snapshot = MemfdHandle::new(String::from("loader-test"), true, None);
     assert!(!executable_snapshot_is_immutable(&snapshot));
     snapshot
         .add_seals(
@@ -404,4 +432,17 @@ fn linux_runtime_addresses_must_stay_inside_the_user_window() {
     args.tls_template_size = 16;
     args.tls_tcb_base = 0xffff_8000_0000_0000;
     assert!(!linux_tls_fields_valid(&args), "non-canonical tcb would panic VirtAddr::new");
+}
+
+#[test]
+fn exec_mapping_quota_is_enomem_not_missing_process() {
+    assert_eq!(exec_refusal_errno(multitask::ExecRefusal::MappingQuota), LINUX_ENOMEM);
+    assert_eq!(exec_refusal_errno(multitask::ExecRefusal::Stage), LINUX_ESRCH);
+}
+
+#[test]
+fn spawn_quota_errors_keep_linux_errno_distinct() {
+    assert_eq!(process_spawn_error_to_linux_errno(multitask::SpawnTaskError::MemoryQuota), LINUX_ENOMEM);
+    assert_eq!(process_spawn_error_to_linux_errno(multitask::SpawnTaskError::NoFreeTaskSlot), LINUX_EAGAIN);
+    assert_eq!(process_load_error_to_linux_errno(crate::user::process::ProcessLoadError::Spawn(multitask::SpawnTaskError::MemoryQuota)), LINUX_ENOMEM);
 }

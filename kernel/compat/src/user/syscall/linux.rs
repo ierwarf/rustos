@@ -1,14 +1,20 @@
 mod block_broker_ops;
 mod broker_ops;
 mod debug_ops;
+mod dispatch_ext;
 mod error_ops;
 pub(crate) mod ipc_ops;
 mod ipc_profile;
 pub(crate) mod ipc_server_profile;
 mod memory_ops;
 mod mm_broker_ops;
+mod mm_request_lease;
 pub(crate) mod offload_ops;
 mod pager_fault_ops;
+mod prctl_ops;
+mod frame_source_ops;
+mod library_map_probe_ops;
+mod library_object_ops;
 mod proc_broker_ops;
 mod runtime_maintenance;
 mod scheduler_ops;
@@ -109,8 +115,8 @@ use rustos_user_abi::syscall::{
     VFS_POLL_QUERY_EPOLL_CREATE, VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT,
     VFS_POLL_QUERY_EPOLL_RETIRE, VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_POLL,
     WAITSET_ABI_VERSION, WAITSET_INPUT_EVDEV_OBJECT_ID, WAITSET_INPUT_NATIVE_OBJECT_ID,
-    WAITSET_MAX_INTERESTS, WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_NETD,
-    WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD, WAITSET_SNAPSHOT_STATE_DISABLED,
+    WAITSET_MAX_INTERESTS, WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_KERNEL,
+    WAITSET_PROVIDER_NETD, WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD, WAITSET_SNAPSHOT_STATE_DISABLED,
 };
 
 use super::SyscallFrame;
@@ -354,6 +360,9 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
             frame, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ),
         linux_abi::SYS_ARCH_PRCTL => syscall_linux_arch_prctl(frame.rdi, frame.rsi),
+        linux_abi::SYS_PRCTL => {
+            prctl_ops::syscall_linux_prctl(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+        }
         linux_abi::SYS_SET_TID_ADDRESS => syscall_linux_set_tid_address(frame.rdi),
         linux_abi::SYS_CLOCK_GETTIME => syscall_linux_clock_gettime(frame.rdi, frame.rsi),
         linux_abi::SYS_CLOCK_NANOSLEEP => {
@@ -492,29 +501,23 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_RSEQ => syscall_linux_rseq(frame.rdi, frame.rsi, frame.rdx, frame.r10),
         linux_abi::SYS_CLONE3 => syscall_linux_clone3(frame),
         linux_abi::SYS_MEMFD_CREATE => syscall_linux_memfd_create(frame.rdi, frame.rsi),
-        linux_abi::SYS_GETPPID => {
-            syscall_linux_syscalld_u64_getter(SYSCALL_OFFLOAD_OP_LINUX_GETPPID, 0)
-        }
-        linux_abi::SYS_GETPGID => {
-            syscall_linux_syscalld_u64_getter(SYSCALL_OFFLOAD_OP_LINUX_GETPGID, frame.rdi)
-        }
-        linux_abi::SYS_SETPGID => syscall_linux_syscalld_setpgid(frame.rdi, frame.rsi),
-        linux_abi::SYS_GETSID => {
-            syscall_linux_syscalld_u64_getter(SYSCALL_OFFLOAD_OP_LINUX_GETSID, frame.rdi)
-        }
-        linux_abi::SYS_SETSID => {
-            syscall_linux_syscalld_u64_getter(SYSCALL_OFFLOAD_OP_LINUX_SETSID, 0)
-        }
         linux_abi::SYS_EXIT => syscall_process_exit(frame.rdi, false),
         linux_abi::SYS_EXIT_GROUP => syscall_process_exit(frame.rdi, true),
-        _ => error_ops::unimplemented_linux_syscall(frame),
+        _ => dispatch_ext::dispatch(frame)
+            .unwrap_or_else(|| error_ops::unimplemented_linux_syscall(frame)),
     };
     if result == linux_errno(LINUX_EBUSY) && frame.rax < 512 {
         error_ops::record_busy_linux_syscall(frame);
     }
 
-    if frame.rax != linux_abi::SYS_RT_SIGRETURN && deliver_pending_signals_if_needed(frame) {
-        return frame.rax;
+    if frame.rax != linux_abi::SYS_RT_SIGRETURN {
+        // The signal frame saves `frame.rax`: it must hold this syscall's
+        // result, not its number, or sigreturn resumes with the wrong value.
+        let number = core::mem::replace(&mut frame.rax, result);
+        if deliver_pending_signals_if_needed(frame) {
+            return frame.rax;
+        }
+        frame.rax = number;
     }
     result
 }

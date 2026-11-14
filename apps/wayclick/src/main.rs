@@ -14,6 +14,9 @@ use wayland_client::protocol::{
 use wayland_client::{
     delegate_noop, ConnectError, Connection, Dispatch, DispatchError, Proxy, QueueHandle, WEnum,
 };
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
+};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 const WIDTH: u32 = 800;
@@ -22,9 +25,12 @@ const HUD_HEIGHT: u32 = 56;
 const TARGET_GOAL: u32 = 20;
 const BTN_LEFT: u32 = 0x110;
 const SHM_BUFFER_COUNT: usize = 2;
-const SYS_RUSTOS_DEBUG_PRINT: usize = 0x5255_0001;
-const SYS_RUSTOS_PRODUCT_MILESTONE: usize = 0x5255_0046;
-const PRODUCT_MILESTONE_FIRST_FRAME: usize = 5;
+// Numbers come from the ABI crate so they cannot drift from the kernel's.
+const SYS_RUSTOS_DEBUG_PRINT: usize = rustos_user_abi::syscall::SYS_RUSTOS_DEBUG_PRINT as usize;
+const SYS_RUSTOS_PRODUCT_MILESTONE: usize =
+    rustos_user_abi::syscall::SYS_RUSTOS_PRODUCT_MILESTONE as usize;
+const PRODUCT_MILESTONE_FIRST_FRAME: usize =
+    rustos_user_abi::syscall::PRODUCT_MILESTONE_FIRST_FRAME as usize;
 const FIRST_FRAME_PRESENTED_MARKER: &str = "wayclick: first frame presented";
 const DEFAULT_XDG_RUNTIME_DIR: &str = "/run/user/1000";
 const DEFAULT_WAYLAND_DISPLAY: &str = "wayland-0";
@@ -34,6 +40,28 @@ fn auto_exit_after_first_frame() -> bool {
         Ok(value) => !matches!(value.as_str(), "0" | "false" | "False" | "FALSE"),
         Err(_) => false,
     }
+}
+
+/// Opt in to presenting through `zwp_linux_dmabuf_v1` app DMA-BUFs
+/// (`docs/ai/abi/app-dmabuf.md`) instead of `wl_shm`.
+fn dmabuf_requested() -> bool {
+    matches!(
+        std::env::var("RUSTOS_WAYCLICK_DMABUF").as_deref(),
+        Ok(value) if !matches!(value, "" | "0" | "false" | "False" | "FALSE")
+    ) || app_dmabuf_probe_armed()
+}
+
+const APP_DMABUF_PROBE_CONTRACT_PATH: &str = "/system/registry/system/appdmabuf-probe-v1.env";
+const APP_DMABUF_PROBE_CONTRACT_BODY: &str = "contract=rustos-appdmabuf-probe-v1\n";
+const APP_DMABUF_PROBE_FAIL: &str = "app-dmabuf-probe: FAIL";
+
+/// `kvm-smoke --app-dmabuf-probe` publishes this exact private contract file;
+/// without it (the production image) the probe is inert. The probe presents
+/// through app DMA-BUFs, proves a forged descriptor is refused by the real
+/// compositor, and exits once a buffer has been presented and released.
+fn app_dmabuf_probe_armed() -> bool {
+    std::fs::read_to_string(APP_DMABUF_PROBE_CONTRACT_PATH)
+        .is_ok_and(|body| body == APP_DMABUF_PROBE_CONTRACT_BODY)
 }
 
 fn profile_enabled() -> bool {
@@ -255,6 +283,9 @@ fn main() {
             .profile
             .maybe_emit(state.frame_callback.is_some(), state.redraw_pending);
     }
+    if state.probe.armed && !state.probe.finished {
+        state.probe.fail("wayclick stopped before every proof step was observed");
+    }
     raw_stderr_line("wayclick: main exit");
 }
 
@@ -301,8 +332,87 @@ fn flush_connection(conn: &Connection) -> Result<(), WaylandError> {
     }
 }
 
+/// Progress of the armed app DMA-BUF probe (`app_dmabuf_probe_armed`).
+struct AppDmabufProbe {
+    armed: bool,
+    forged_refused: bool,
+    frame_presented: bool,
+    buffer_released: bool,
+    finished: bool,
+}
+
+impl AppDmabufProbe {
+    fn new() -> Self {
+        Self {
+            armed: app_dmabuf_probe_armed(),
+            forged_refused: false,
+            frame_presented: false,
+            buffer_released: false,
+            finished: false,
+        }
+    }
+
+    fn fail(&mut self, why: &str) {
+        if self.armed {
+            raw_stderr_line(&format!("{APP_DMABUF_PROBE_FAIL} {why}"));
+        }
+    }
+
+    /// True once every proof step has been observed (reported exactly once).
+    fn complete(&mut self) -> bool {
+        if self.armed
+            && !self.finished
+            && self.forged_refused
+            && self.frame_presented
+            && self.buffer_released
+        {
+            self.finished = true;
+            raw_stderr_line("wayclick: app-dmabuf probe passed");
+            return true;
+        }
+        false
+    }
+}
+
+/// Negative proof: a descriptor that is not an app DMA-BUF (a pipe) must be
+/// refused by the real compositor with `failed`, never imported.
+fn send_forged_dmabuf(
+    dmabuf: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+    qh: &QueueHandle<GameState>,
+) -> io::Result<()> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a valid two-element out array. A socketpair is any
+    // non-DeviceBuffer fd the compositor must refuse; this system has no pipe(2).
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both descriptors were just created and are owned here.
+    let (read_end, write_end) =
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    drop(write_end);
+    let params = dmabuf.create_params(qh, ());
+    params.add(
+        read_end.as_fd(),
+        0,
+        0,
+        WIDTH * 4,
+        (rustos_app_dmabuf::MODIFIER_LINEAR >> 32) as u32,
+        rustos_app_dmabuf::MODIFIER_LINEAR as u32,
+    );
+    params.create(
+        WIDTH as i32,
+        HEIGHT as i32,
+        rustos_app_dmabuf::Format::Argb8888.fourcc(),
+        zwp_linux_buffer_params_v1::Flags::empty(),
+    );
+    raw_stderr_line("wayclick: app-dmabuf probe forged fd sent");
+    Ok(())
+}
+
 struct GameState {
     running: bool,
+    dmabuf: bool,
+    probe: AppDmabufProbe,
     auto_exit_after_first_frame: bool,
     first_frame_presented: bool,
     configured: bool,
@@ -334,6 +444,8 @@ impl GameState {
     fn new() -> Self {
         let mut state = Self {
             running: true,
+            dmabuf: dmabuf_requested(),
+            probe: AppDmabufProbe::new(),
             auto_exit_after_first_frame: auto_exit_after_first_frame(),
             first_frame_presented: false,
             configured: false,
@@ -795,7 +907,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for GameState {
                     state.surface = Some(compositor.create_surface(qh, ()));
                     state.init_shell(qh);
                 }
-                "wl_shm" => {
+                "wl_shm" if !state.dmabuf => {
                     let shm = registry.bind::<wl_shm::WlShm, _, _>(name, 1, qh, ());
                     state.buffers.clear();
                     state.buffer_available.clear();
@@ -821,6 +933,47 @@ impl Dispatch<wl_registry::WlRegistry, ()> for GameState {
                         state.request_redraw(qh);
                     }
                 }
+                "zwp_linux_dmabuf_v1" if state.dmabuf => {
+                    // Version 3 is the first with the modifier event; create_immed
+                    // needs version 2. Buffers are linear, so version 3 is bound
+                    // only to match what the compositor advertises.
+                    let dmabuf = registry.bind::<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _, _>(
+                        name, 3, qh, (),
+                    );
+                    state.buffers.clear();
+                    state.buffer_available.clear();
+                    for index in 0..SHM_BUFFER_COUNT {
+                        match ShmBuffer::new_dmabuf(&dmabuf, WIDTH, HEIGHT, qh, index) {
+                            Ok(buffer) => {
+                                state.buffers.push(buffer);
+                                state.buffer_available.push(true);
+                            }
+                            Err(error) => {
+                                // Requested explicitly: do not silently present
+                                // through another transport.
+                                raw_stderr_line(&format!(
+                                    "wayclick: dmabuf buffer failed: {error}"
+                                ));
+                                state.probe.fail(&format!("allocation or import failed: {error}"));
+                                state.buffers.clear();
+                                state.buffer_available.clear();
+                                state.running = false;
+                                return;
+                            }
+                        }
+                    }
+                    if state.probe.armed {
+                        if let Err(error) = send_forged_dmabuf(&dmabuf, qh) {
+                            state.probe.fail(&format!("forged fd setup failed: {error}"));
+                            state.running = false;
+                            return;
+                        }
+                    }
+                    if state.configured {
+                        state.pending_damage.mark_full();
+                        state.request_redraw(qh);
+                    }
+                }
                 "wl_seat" => {
                     registry.bind::<wl_seat::WlSeat, _, _>(name, 1, qh, ());
                 }
@@ -839,6 +992,40 @@ delegate_noop!(GameState: ignore wl_compositor::WlCompositor);
 delegate_noop!(GameState: ignore wl_surface::WlSurface);
 delegate_noop!(GameState: ignore wl_shm::WlShm);
 delegate_noop!(GameState: ignore wl_shm_pool::WlShmPool);
+// Format/modifier advertisements are not consulted: only linear ARGB8888 is
+// ever allocated, and the compositor refuses anything else at create_immed.
+delegate_noop!(GameState: ignore zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1);
+// create_immed never produces created/failed (a failed immediate import is a
+// protocol error). Only the armed probe's non-immediate forged `create` yields
+// `failed`, which is the expected refusal.
+impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, ()> for GameState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        event: zwp_linux_buffer_params_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if !state.probe.armed {
+            return;
+        }
+        match event {
+            zwp_linux_buffer_params_v1::Event::Failed => {
+                state.probe.forged_refused = true;
+                raw_stderr_line("wayclick: app-dmabuf probe forged-fd refused");
+                if state.probe.complete() {
+                    state.running = false;
+                }
+            }
+            zwp_linux_buffer_params_v1::Event::Created { .. } => {
+                state.probe.fail("forged fd was imported by the compositor");
+                state.running = false;
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<xdg_wm_base::XdgWmBase, ()> for GameState {
     fn event(
@@ -978,13 +1165,20 @@ impl Dispatch<wl_callback::WlCallback, ()> for GameState {
                         )
                     };
                     raw_stderr_line(FIRST_FRAME_PRESENTED_MARKER);
-                    if state.auto_exit_after_first_frame {
+                    state.probe.frame_presented = true;
+                    if state.probe.armed {
+                        // A second commit attaches the other buffer, which is
+                        // what makes the compositor release the first.
+                        state.pending_damage.mark_full();
+                        state.redraw_pending = true;
+                    }
+                    if state.auto_exit_after_first_frame && !state.probe.armed {
                         raw_stderr_line("wayclick: auto-exit after first frame");
                         state.running = false;
                         return;
                     }
                 }
-                if state.profile.enabled {
+                if state.profile.enabled || state.probe.armed {
                     state.redraw_pending = true;
                 }
                 state.try_redraw(qh);
@@ -1004,6 +1198,13 @@ impl Dispatch<wl_buffer::WlBuffer, usize> for GameState {
     ) {
         if let wl_buffer::Event::Release = event {
             state.profile.buffer_releases = state.profile.buffer_releases.saturating_add(1);
+            if state.probe.armed && state.probe.frame_presented {
+                state.probe.buffer_released = true;
+                if state.probe.complete() {
+                    state.running = false;
+                    return;
+                }
+            }
             if let Some(available) = state.buffer_available.get_mut(*index) {
                 *available = true;
             }
@@ -1077,6 +1278,56 @@ impl ShmBuffer {
         })
     }
 
+    /// Allocates an app DMA-BUF, maps it and wraps it as a linear ARGB8888
+    /// `wl_buffer` through `zwp_linux_buffer_params_v1.create_immed`. The fd is
+    /// sent over SCM_RIGHTS by the Wayland backend and kept for the buffer's life.
+    fn new_dmabuf(
+        dmabuf: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+        width: u32,
+        height: u32,
+        qh: &QueueHandle<GameState>,
+        buffer_index: usize,
+    ) -> io::Result<Self> {
+        let buf = rustos_app_dmabuf::AppDmabuf::allocate(
+            &rustos_app_dmabuf::KernelSource,
+            width,
+            height,
+            rustos_app_dmabuf::Format::Argb8888,
+        )?;
+        raw_stderr_line(&format!(
+            "wayclick: app-dmabuf allocated index={buffer_index} width={width} height={height} stride={} bytes={}",
+            buf.stride(),
+            buf.len()
+        ));
+        let params = dmabuf.create_params(qh, ());
+        params.add(
+            buf.as_fd(),
+            0,
+            0,
+            buf.stride(),
+            (rustos_app_dmabuf::MODIFIER_LINEAR >> 32) as u32,
+            rustos_app_dmabuf::MODIFIER_LINEAR as u32,
+        );
+        let wl_buffer = params.create_immed(
+            width as i32,
+            height as i32,
+            buf.format().fourcc(),
+            zwp_linux_buffer_params_v1::Flags::empty(),
+            qh,
+            buffer_index,
+        );
+        params.destroy();
+        let (fd, ptr, len) = buf.into_raw_parts();
+        Ok(Self {
+            wl_buffer: Some(wl_buffer),
+            fd,
+            ptr,
+            len_pixels: len / 4,
+            width,
+            height,
+        })
+    }
+
     fn pixels_mut(&mut self) -> &mut [u32] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len_pixels) }
     }
@@ -1138,3 +1389,6 @@ fn create_memfd(name: &str) -> io::Result<OwnedFd> {
     }
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
+
+// Native ABI revision stamp (hint, not authority); see docs/architecture/evolution-rules.md.
+rustos_user_abi::native_abi_note!();

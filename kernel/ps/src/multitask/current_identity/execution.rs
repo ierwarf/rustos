@@ -5,7 +5,7 @@ use super::*;
 use crate::multitask::scheduler;
 use core::sync::atomic::AtomicU32;
 pub(in crate::multitask) mod kernel_executor;
-static REFS: [AtomicU32; MAX_SCHEDULER_TASKS] = [const { AtomicU32::new(0) }; MAX_SCHEDULER_TASKS];
+pub(super) static REFS: [AtomicU32; MAX_SCHEDULER_TASKS] = [const { AtomicU32::new(0) }; MAX_SCHEDULER_TASKS];
 #[derive(Debug)]
 pub(in crate::multitask) struct ExecutionPermit {
     slot: usize,

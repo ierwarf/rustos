@@ -88,7 +88,8 @@ const MAX_SHARED_REGION_OBJECTS: usize = 1024;
 const MAX_OWNED_ENDPOINT_OBJECTS: usize = MAX_ENDPOINT_OBJECTS - 64;
 const MAX_ENDPOINTS_PER_PROCESS: usize = 32;
 const MAX_ENDPOINTS_PER_TASK: usize = 8;
-pub const MAX_ENDPOINT_WAKE_TASKS: usize = 128;
+/// Must cover the scheduler task table (`kernel-ps` `MAX_TASK`, asserted there).
+pub const MAX_ENDPOINT_WAKE_TASKS: usize = 256;
 const MAX_SHARED_REGION_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SHARED_REGION_TOTAL_BYTES: usize = 512 * 1024 * 1024;
 const MAX_SHARED_REGIONS_PER_PROCESS: usize = 64;

@@ -177,7 +177,15 @@ use sync_handoff::ReplyWakeHandoff;
 // launch and turned a recoverable capacity error into uiserver thread-spawn
 // panic. Keep the scheduler allocation-free and explicitly bounded, but size
 // the product contract for service growth and application headroom.
-pub(super) const MAX_TASK: usize = 128;
+//
+// 256 slots = the 512 MiB kernel-heap ceiling (`kernel_mm` `MAX_HEAP_SIZE`) over
+// one 2 MiB kernel stack per task. The slot-indexed statics cost a few hundred
+// bytes per slot, so the table itself is cheap; what bounds live tasks on a
+// smaller machine is the heap (about RAM/8, clamped to 64..512 MiB), and a stack
+// allocation failure is refused as EAGAIN rather than panicking. 256 is also the
+// widest table the 8-bit slot encodings (`task_directory` hint word, the
+// shadow-dispatch diagnostic bytes, the cohort cookie) can name.
+pub(super) const MAX_TASK: usize = 256;
 
 /// Releases reply-owned scheduling urgency without acquiring the scheduler
 /// catalog. The donation ledger's exact reply identity is the terminal owner;
@@ -223,7 +231,7 @@ pub(in crate::multitask) fn cancel_reply_donation_reservation(donor_task_id: u64
 
 
 
-const _: () = assert!(MAX_TASK.is_power_of_two() && MAX_TASK < u8::MAX as usize);
+const _: () = assert!(MAX_TASK.is_power_of_two() && MAX_TASK <= u8::MAX as usize + 1);
 const _: () = assert!(kernel_ipc_runtime::api::MAX_ENDPOINT_WAKE_TASKS >= MAX_TASK);
 const ROOT_TASK_SLOT: usize = 0;
 const FIRST_DYNAMIC_TASK_SLOT: usize = 1;

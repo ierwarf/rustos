@@ -23,7 +23,7 @@ pub struct Limits {
 /// budget; it cannot grant authority or lower the UI/service launch budgets.
 pub fn runtime_limits(limit_probe: bool, exec_path: &[u8]) -> Limits {
     Limits {
-        processes: 8, threads: 64,
+        processes: APPLICATION_PROCESSES, threads: APPLICATION_THREADS,
         memory_pages: if limit_probe && exec_path == b"/apps/oomhog/oomhog.elf" {
             LOADER_APPLICATION_LIMIT_PROBE_PAGES
         } else { 524_288 },
@@ -53,7 +53,7 @@ impl Jobs for NativeJobs {
             // Runtime application Jobs receive a finite client-funded session
             // ceiling at the same preparation boundary as process and page
             // limits. This is the live enforcement path, not only a model.
-            let budget = args.limit_processes.saturating_mul(4).clamp(1, 64);
+            let budget = args.limit_processes.saturating_mul(4).clamp(1, 128);
             let mut sessions = RustosJobSessionArgs {
                 abi_version: JOB_SESSION_ABI_VERSION,
                 op: JOB_SESSION_OP_SET_LIMIT,
@@ -137,6 +137,7 @@ impl Jobs for NativeJobs {
                 (JOB_KMEM_CLASS_THREAD, APPLICATION_THREAD_BUDGET_BYTES),
                 (JOB_KMEM_CLASS_VMA, APPLICATION_VMA_BUDGET_BYTES),
                 (JOB_KMEM_CLASS_IPC_MESSAGE, APPLICATION_IPC_MESSAGE_BUDGET_BYTES),
+                (JOB_KMEM_CLASS_DEVICE_BUFFER, APPLICATION_DEVICE_BUFFER_BUDGET_BYTES),
             ] {
                 let mut class = RustosJobKmemArgs {
                     abi_version: JOB_KMEM_ABI_VERSION,
@@ -164,6 +165,19 @@ impl Jobs for NativeJobs {
     }
 }
 
+/// Processes one application Job may run. A multi-process application such as a
+/// browser keeps a browser, GPU, network, storage and utility process plus one
+/// renderer per site, so the earlier 8 throttled it before the kernel did. The
+/// root job still bounds the whole system (`DEFAULT_PROCESS_LIMIT`, 64).
+pub const APPLICATION_PROCESSES: u64 = 32;
+/// Threads one application Job may run across all its processes: half of the
+/// kernel task table (`MAX_TASK`, 256), so a runaway application can never
+/// starve the boot services of task slots. A browser's main process alone runs
+/// tens of threads.
+pub const APPLICATION_THREADS: u64 = 128;
+/// Bytes of kernel stack the kernel bills for one user thread.
+const KERNEL_STACK_BYTES: u64 = 2 * 1024 * 1024;
+
 /// Per-application-Job ceiling for descriptor-table slots.
 const APPLICATION_HANDLE_TABLE_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
 /// Per-application-Job ceiling for reserved IPC endpoint queue storage.
@@ -171,14 +185,17 @@ const APPLICATION_IPC_ENDPOINT_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
 /// Page-table frames: 64 MiB maps well over the 2 GiB resident ceiling even
 /// when sparse (one table covers 2 MiB).
 const APPLICATION_PAGE_TABLE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
-/// Kernel stacks: the Job's 64-thread limit times the 2 MiB stack, so the
+/// Kernel stacks: the Job's thread limit times the 2 MiB stack, so the
 /// thread count stays the binding limit for well-behaved applications and
 /// this class only stops a Job from pinning stacks beyond it.
-const APPLICATION_THREAD_BUDGET_BYTES: u64 = 64 * 2 * 1024 * 1024;
+const APPLICATION_THREAD_BUDGET_BYTES: u64 = APPLICATION_THREADS * KERNEL_STACK_BYTES;
 /// Shared-mapping bookkeeping records.
 const APPLICATION_VMA_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
 /// Queued synchronous-call messages sent by the application.
 const APPLICATION_IPC_MESSAGE_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
+/// App DMA-BUF aperture bytes one application Job may hold (the per-table
+/// cap is `APP_BUFFER_CLIENT_QUOTA_BYTES`; this bounds the whole Job).
+const APPLICATION_DEVICE_BUFFER_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct Authority {
@@ -340,12 +357,12 @@ mod tests {
     fn installed() -> ApplicationJobs {
         ApplicationJobs { realm: Some(Authority { handle: 7, id: 70 }), children: Vec::new() }
     }
-    const LIMITS: Limits = Limits { processes: 8, threads: 64, memory_pages: 32_768 };
+    const LIMITS: Limits = Limits { processes: 32, threads: 128, memory_pages: 32_768 };
 
     #[test]
     fn limit_proof_only_tightens_the_explicit_hog_and_is_off_by_default() {
         let hog = b"/apps/oomhog/oomhog.elf";
-        assert_eq!(runtime_limits(false, hog), Limits { processes: 8, threads: 64, memory_pages: 524_288 });
+        assert_eq!(runtime_limits(false, hog), Limits { processes: 32, threads: 128, memory_pages: 524_288 });
         assert_eq!(runtime_limits(true, hog), LIMITS);
         for path in [b"/services/uiserver/uiserver.elf".as_slice(), b"/apps/oomhog/oomhog.elf.extra", b""] {
             assert_eq!(runtime_limits(true, path), runtime_limits(false, hog));
@@ -448,7 +465,7 @@ mod tests {
         let set = &jobs.calls[1];
         assert_eq!(set.job_handle, 8);
         assert_eq!(set.limit_mask, JOB_LIMIT_PROCESSES | JOB_LIMIT_THREADS | JOB_LIMIT_MEMORY_PAGES);
-        assert_eq!((set.limit_processes, set.limit_threads, set.limit_memory_pages), (8, 64, 32_768));
+        assert_eq!((set.limit_processes, set.limit_threads, set.limit_memory_pages), (32, 128, 32_768));
         assert_eq!(state.published(8, 41, &mut jobs), Ok(80));
         assert_eq!(jobs.calls[2].pid, 41);
         assert_eq!(state.children[0].leader, Some(41));

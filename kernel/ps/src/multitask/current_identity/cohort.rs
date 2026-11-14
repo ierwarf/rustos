@@ -6,7 +6,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 const PENDING: u64 = 1;
 const COMPLETE: u64 = 2;
 const POISON: u64 = 3;
-const _: () = assert!(MAX <= 255);
+// The cookie keeps `root + 1` (1..=MAX) in its low 9 bits, so a 256-slot table
+// still leaves the epoch above bit 9 and root slot 255 cannot alias the epoch.
+const COOKIE_ROOT_BITS: u32 = 9;
+const COOKIE_ROOT_MASK: u64 = (1 << COOKIE_ROOT_BITS) - 1;
+const _: () = assert!(MAX as u64 <= COOKIE_ROOT_MASK);
 static BATCHES: [AtomicU64; MAX] = [const { AtomicU64::new(0) }; MAX];
 static MEMBERS: [AtomicU64; MAX] = [const { AtomicU64::new(0) }; MAX];
 
@@ -42,10 +46,10 @@ pub(super) fn admission_ready(slot: usize) -> bool {
     if cookie == 0 {
         return true;
     }
-    let root = ((cookie & 255) - 1) as usize;
+    let root = ((cookie & COOKIE_ROOT_MASK) - 1) as usize;
     BATCHES
         .get(root)
-        .is_some_and(|word| word.load(Ordering::Acquire) == ((cookie >> 8) << 2) | COMPLETE)
+        .is_some_and(|word| word.load(Ordering::Acquire) == ((cookie >> COOKIE_ROOT_BITS) << 2) | COMPLETE)
 }
 impl Cohort {
     pub(in crate::multitask) fn begin(members: &[(usize, u64)]) -> Option<Self> {
@@ -68,7 +72,7 @@ impl Cohort {
         }
         let epoch = (old >> 2)
             .checked_add(1)
-            .filter(|epoch| *epoch <= u64::MAX >> 8)?;
+            .filter(|epoch| *epoch <= u64::MAX >> COOKIE_ROOT_BITS)?;
         ledger
             .compare_exchange(
                 old,
@@ -77,7 +81,7 @@ impl Cohort {
                 Ordering::Acquire,
             )
             .ok()?;
-        let cookie = epoch << 8 | (root as u64 + 1);
+        let cookie = epoch << COOKIE_ROOT_BITS | (root as u64 + 1);
         let mut owner = Self {
             root,
             epoch,

@@ -583,7 +583,10 @@ impl AppState {
 
         let mut dirty = canvas::Rect::empty();
         for (previous, window) in previous_windows.iter().zip(windows.iter()) {
-            if previous.minimized != window.minimized || previous.frame != window.frame {
+            if previous.minimized != window.minimized
+                || previous.frame != window.frame
+                || previous.server_decoration != window.server_decoration
+            {
                 dirty = dirty.union(crate::render::wayland_window_dirty_rect(previous));
                 dirty = dirty.union(crate::render::wayland_window_dirty_rect(window));
                 continue;
@@ -599,7 +602,7 @@ impl AppState {
             if previous.content_version != window.content_version || !window.damage.is_empty() {
                 let outer = crate::render::wayland_window_outer_rect(window);
                 let rect = if window.damage.is_empty() {
-                    crate::render::wayland_window_client_rect(outer)
+                    crate::render::wayland_window_client_rect_for(window, outer)
                 } else {
                     crate::render::wayland_window_damage_rect(window, window.damage)
                 };
@@ -717,7 +720,12 @@ mod visual_update_tests {
     use super::{canvas::Rect, VisualUpdate};
 
     fn damage() -> Rect {
-        Rect { x: 40, y: 60, width: 80, height: 20 }
+        Rect {
+            x: 40,
+            y: 60,
+            width: 80,
+            height: 20,
+        }
     }
 
     #[test]
@@ -744,7 +752,10 @@ mod visual_update_tests {
         assert!(!update.scene_dirty());
         assert!(!update.is_empty());
         update.add_partial_rect(damage());
-        assert!(update.scene_dirty(), "content after cursor motion must not be lost");
+        assert!(
+            update.scene_dirty(),
+            "content after cursor motion must not be lost"
+        );
     }
 
     #[test]
@@ -778,11 +789,17 @@ mod clock_refresh_tests {
     fn a_new_minute_invalidates_the_chrome_once() {
         let start = Instant::now();
         let mut cache = shown_at(100);
-        assert!(!cache.refresh_clock(start, true, || reading(100)), "same minute");
+        assert!(
+            !cache.refresh_clock(start, true, || reading(100)),
+            "same minute"
+        );
         assert!(cache.chrome_valid);
 
         let later = start + CLOCK_POLL_INTERVAL;
-        assert!(cache.refresh_clock(later, true, || reading(101)), "next minute");
+        assert!(
+            cache.refresh_clock(later, true, || reading(101)),
+            "next minute"
+        );
         assert!(!cache.chrome_valid);
 
         // The rebuild has not happened yet, so a second poll must not ask for
@@ -824,7 +841,10 @@ mod clock_refresh_tests {
             chrome_valid: true,
             ..DesktopSurfaceCache::default()
         };
-        assert!(!cache.refresh_clock(start, true, || None), "no time, no clock");
+        assert!(
+            !cache.refresh_clock(start, true, || None),
+            "no time, no clock"
+        );
         let later = start + CLOCK_POLL_INTERVAL;
         assert!(cache.refresh_clock(later, true, || reading(7)));
     }

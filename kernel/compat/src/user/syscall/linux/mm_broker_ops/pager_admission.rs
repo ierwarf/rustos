@@ -29,6 +29,7 @@
 //!   mutations.
 
 use super::*;
+use crate::user::syscall::linux::mm_request_lease::MmTarget;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -304,7 +305,7 @@ fn region_template(
 /// With anonymous faults answered in ring0, the pager holds no state this range
 /// needs, so there is nothing to tell it and nothing to wait for.
 pub(super) fn admit_anonymous_region(
-    target_pid: u64,
+    target: MmTarget,
     start: u64,
     end: u64,
     prot: u64,
@@ -314,8 +315,128 @@ pub(super) fn admit_anonymous_region(
         // here, so this is unreachable rather than ordinary. Fail closed.
         return AnonymousAdmission::Failed(LINUX_EINVAL);
     };
-    admit_anonymous_rights(target_pid, start, end, rights)
+    admit_anonymous_rights(target, start, end, rights)
 }
+
+/// Why a library-object alias mapping could not publish its VMA.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LibraryAdmission {
+    /// This mapping cannot use the shared object (no pager transport, or the
+    /// range is not vacant). Nothing was published; the eager copy path is
+    /// still correct.
+    Unavailable,
+    /// A real refusal that must reach the caller.
+    Refused(i64),
+}
+
+/// Publishes the private-file VMA of a library-object alias mapping.
+///
+/// The VMA names the sealed object (never a path) and its exact generations, so
+/// a later COW fault, `mprotect`, `munmap`, fork inheritance and a pagerd miss
+/// reply all resolve against the same authority. The range must be vacant: the
+/// caller maps the aliases only after this succeeds and revokes the VMA if
+/// that fails.
+pub(super) fn admit_library_region(
+    target: MmTarget,
+    start: u64,
+    end: u64,
+    prot: u64,
+    view: &crate::library_cache::ObjectView,
+    file_offset: u64,
+) -> Result<(), LibraryAdmission> {
+    let Some(vma_prot) = pager_protection(prot) else {
+        return Err(LibraryAdmission::Refused(LINUX_EINVAL));
+    };
+    let Some(endpoint) = fault_endpoint() else {
+        record_admission_class(
+            &WIRED_TRANSPORT_ABSENT,
+            "pager-wired-transport-absent",
+            target.pid,
+        );
+        return Err(LibraryAdmission::Unavailable);
+    };
+    let template = library_region_template(start, end, vma_prot, view, file_offset, endpoint)
+        .ok_or(LibraryAdmission::Refused(LINUX_EINVAL))?;
+    let policy = crate::pager_policy::anonymous_policy();
+    match multitask::publish_pager_vma_for_process(
+        target.pid,
+        Some(target.expected()),
+        template,
+        policy.process_vma_ceiling as usize,
+    ) {
+        Ok(_) => Ok(()),
+        Err(multitask::PagerVmaError::Pressure) => {
+            record_admission_class(
+                &WIRED_PROCESS_VMA_CAPACITY,
+                "pager-vma-capacity-refused",
+                target.pid,
+            );
+            // The alias is only an optimization. A process at its pager-VMA
+            // ceiling must keep mapping libraries through the eager copy, not
+            // fail an mmap the unaliased path can serve.
+            Err(LibraryAdmission::Unavailable)
+        }
+        Err(multitask::PagerVmaError::Overlap) => {
+            record_admission_class(&WIRED_STALE_REGION_OVERLAP, "pager-vma-overlap", start);
+            Err(LibraryAdmission::Unavailable)
+        }
+        Err(multitask::PagerVmaError::Stale) => Err(LibraryAdmission::Refused(LINUX_ESRCH)),
+        Err(error) => {
+            record_publish_failure(start, error);
+            Err(LibraryAdmission::Refused(LINUX_ENOMEM))
+        }
+    }
+}
+
+/// Rights the VMA object may later be protected up to. Write and execute are
+/// never both granted, so a mapping admitted executable keeps R|X and every
+/// other mapping keeps R|W.
+fn library_object_rights(vma_prot: u32) -> u32 {
+    if vma_prot & VM_PROT_EXECUTE != 0 {
+        VM_PROT_READ | VM_PROT_EXECUTE
+    } else {
+        VM_PROT_READ | VM_PROT_WRITE
+    }
+}
+
+fn library_region_template(
+    start: u64,
+    end: u64,
+    vma_prot: u32,
+    view: &crate::library_cache::ObjectView,
+    file_offset: u64,
+    endpoint: PagerEndpointCapabilityWire,
+) -> Option<PagerVmRegionWire> {
+    let region = PagerVmRegionWire {
+        start,
+        end,
+        object: PagerObjectIdentityWire {
+            object_type: rustos_user_abi::pager::VM_OBJECT_FILE_PRIVATE,
+            reserved0: 0,
+            rights: library_object_rights(vma_prot),
+            backing_service: view.backing_service,
+            slot: view.slot,
+            generation: view.generation,
+            pager_epoch: view.owner_generation,
+            backing_generation: view.backing_generation,
+        },
+        object_offset: file_offset,
+        prot: vma_prot,
+        sharing: VM_SHARING_PRIVATE,
+        commit_state: rustos_user_abi::pager::VM_COMMIT_COMMITTED,
+        vma_generation: 0,
+        process_handle: 0,
+        process_generation: 0,
+        mm_generation: 0,
+        fault_endpoint: endpoint,
+        reserved1: [0; 2],
+    };
+    // Process and VMA generations are stamped by kernel-ps; only the fields
+    // this module owns are checked here.
+    (region.object.has_authority() && file_offset % PAGER_PAGE_BYTES_U64 == 0).then_some(region)
+}
+
+const PAGER_PAGE_BYTES_U64: u64 = rustos_user_abi::pager::PAGER_PAGE_BYTES;
 
 /// Produces the unbound child template for one canonical parent VMA.
 ///
@@ -384,7 +505,7 @@ pub(super) fn admit_inherited_region(
 }
 
 fn admit_anonymous_rights(
-    target_pid: u64,
+    target: MmTarget,
     start: u64,
     end: u64,
     rights: u32,
@@ -394,7 +515,7 @@ fn admit_anonymous_rights(
         record_admission_class(
             &WIRED_TRANSPORT_ABSENT,
             "pager-wired-transport-absent",
-            target_pid,
+            target.pid,
         );
         return AnonymousAdmission::Eager(EagerByContract::PagerTransportAbsent);
     };
@@ -405,7 +526,7 @@ fn admit_anonymous_rights(
             &WIRED_POLICY_DISABLED,
             "pager-wired-policy-disabled",
         ))
-    } else if in_pager_control_graph(target_pid, policy) {
+    } else if in_pager_control_graph(target.pid, policy) {
         Some((
             EagerByContract::PagerControlGraph,
             &WIRED_CONTROL_GRAPH,
@@ -420,13 +541,14 @@ fn admit_anonymous_rights(
         return AnonymousAdmission::Failed(LINUX_EINVAL);
     };
     match multitask::publish_pager_vma_for_process(
-        target_pid,
+        target.pid,
+        Some(target.expected()),
         template,
         policy.process_vma_ceiling as usize,
     ) {
         Ok(_) => {
             if let Some((reason, counter, milestone)) = eager_reason {
-                record_admission_class(counter, milestone, target_pid);
+                record_admission_class(counter, milestone, target.pid);
                 AnonymousAdmission::Eager(reason)
             } else {
                 AnonymousAdmission::Demand
@@ -439,7 +561,7 @@ fn admit_anonymous_rights(
             record_admission_class(
                 &WIRED_PROCESS_VMA_CAPACITY,
                 "pager-vma-capacity-refused",
-                target_pid,
+                target.pid,
             );
             AnonymousAdmission::Failed(LINUX_ENOMEM)
         }
@@ -448,6 +570,8 @@ fn admit_anonymous_rights(
             record_admission_class(&WIRED_STALE_REGION_OVERLAP, "pager-vma-overlap", start);
             AnonymousAdmission::Eager(EagerByContract::StaleRegionOverlap)
         }
+        // The request's process/MM incarnation is gone (exec, exit).
+        Err(multitask::PagerVmaError::Stale) => AnonymousAdmission::Failed(LINUX_ESRCH),
         Err(error) => {
             record_publish_failure(start, error);
             AnonymousAdmission::Failed(LINUX_ENOMEM)
@@ -543,6 +667,62 @@ mod tests {
         assert_eq!(child.process_handle, 0);
         assert_eq!(child.process_generation, 0);
         assert_eq!(child.mm_generation, 0);
+    }
+
+    #[test]
+    fn library_region_names_the_object_generations_and_never_a_path() {
+        let endpoint = PagerEndpointCapabilityWire { slot: 5, generation: 7, rights: 1 };
+        let view = crate::library_cache::ObjectView {
+            handle: 3,
+            len: 9000,
+            backing_service: rustos_user_abi::syscall::LIBRARY_OBJECT_BACKING_NAMESPACE,
+            slot: 2,
+            generation: 11,
+            backing_generation: 1,
+            owner_generation: 13,
+        };
+        let region = library_region_template(0x40_000, 0x43_000, VM_PROT_READ | VM_PROT_WRITE, &view, 0x1000, endpoint)
+            .expect("template");
+        assert_eq!(region.object.object_type, rustos_user_abi::pager::VM_OBJECT_FILE_PRIVATE);
+        assert_eq!(region.object.slot, 2);
+        assert_eq!(region.object.generation, 11);
+        assert_eq!(region.object.pager_epoch, 13, "the pager lease epoch owns the sources");
+        assert_eq!(region.object_offset, 0x1000);
+        assert_eq!(region.sharing, VM_SHARING_PRIVATE);
+        assert_eq!(region.object.rights, VM_PROT_READ | VM_PROT_WRITE);
+        // Executable mappings keep R|X: never a W+X envelope.
+        let exec = library_region_template(0x40_000, 0x43_000, VM_PROT_READ | VM_PROT_EXECUTE, &view, 0, endpoint).unwrap();
+        assert_eq!(exec.object.rights, VM_PROT_READ | VM_PROT_EXECUTE);
+        // A misaligned file offset or an unauthorized object is not a region.
+        assert!(library_region_template(0x40_000, 0x43_000, VM_PROT_READ, &view, 1, endpoint).is_none());
+        let bad = crate::library_cache::ObjectView { generation: 0, ..view };
+        assert!(library_region_template(0x40_000, 0x43_000, VM_PROT_READ, &bad, 0, endpoint).is_none());
+        let bad = crate::library_cache::ObjectView { backing_service: 0, ..view };
+        assert!(library_region_template(0x40_000, 0x43_000, VM_PROT_READ, &bad, 0, endpoint).is_none());
+    }
+
+    #[test]
+    fn library_alias_child_inherits_the_same_object_authority() {
+        // Fork copies the object identity verbatim: the child's leaves already
+        // hold their own frames, and any missing page resolves against the same
+        // sealed object or fails closed - the child never holds a source pin.
+        let endpoint = PagerEndpointCapabilityWire { slot: 5, generation: 7, rights: 1 };
+        let view = crate::library_cache::ObjectView {
+            handle: 3, len: 4096,
+            backing_service: rustos_user_abi::syscall::LIBRARY_OBJECT_BACKING_NAMESPACE,
+            slot: 2, generation: 11, backing_generation: 1, owner_generation: 13,
+        };
+        let mut parent = library_region_template(0x40_000, 0x41_000, VM_PROT_READ, &view, 0, endpoint).unwrap();
+        parent.vma_generation = 11;
+        parent.process_handle = 13;
+        parent.process_generation = 17;
+        parent.mm_generation = 19;
+        assert!(parent.is_canonical());
+        let child = inherited_region_template(parent, None).expect("child template");
+        assert_eq!(child.object, parent.object);
+        assert_eq!(child.object_offset, parent.object_offset);
+        assert_eq!(child.vma_generation, 0);
+        assert_eq!(child.process_handle, 0);
     }
 
     #[test]

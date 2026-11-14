@@ -5,7 +5,7 @@
 ## Handle Transfer
 
 - Bounded cap-transfer via `kernel_ipc_runtime::api::KernelTransferredHandle` + `*_with_handles` endpoint APIs.
-- `SYS_RUSTOS_IPC_ENDPOINT_CREATE_WITH_HANDLE_LIMIT` (`0x5255_0060`) takes the owner's immutable request-handle capacity in rdi (0..=16), retaining the existing process ownership, quotas and Job charge. Ring3 service owners declare zero for byte-only protocols; loaderd declares one matching both placement receive paths. Legacy generic endpoint creation still accepts the full transfer bound. The handle-call syscall checks shape before exporting descriptors, and runtime enqueue independently rejects an incompatible batch before message/reply publication, waiter consumption or scheduling-context transfer. Failure is EINVAL, not a silently dropped request. No named-service policy table is added in Ring0.
+- `SYS_RUSTOS_IPC_ENDPOINT_CREATE_WITH_LIMITS` (`0x5255_0060`) takes the owner's immutable request-handle capacity in rdi (0..=16), retaining the existing process ownership, quotas and Job charge. Ring3 service owners declare zero for byte-only protocols; loaderd declares one matching both placement receive paths. Legacy generic endpoint creation still accepts the full transfer bound. The handle-call syscall checks shape before exporting descriptors, and runtime enqueue independently rejects an incompatible batch before message/reply publication, waiter consumption or scheduling-context transfer. Failure is EINVAL, not a silently dropped request. No named-service policy table is added in Ring0.
 - Byte-only recv/take wrappers must fail with `BufferTooSmall` when a queued message contains transferred handles. Byte or handle capacity refusal preserves the exact queued request and caller-owned transfer custody, allowing a capable receiver to retry or the caller to cancel. Older paths must never silently drop capabilities.
 - Transferred handles require nonzero transfer ticket + `HandleRights::allows_transfer()` true.
 - The only Ring3 handle-transfer authority wire is exactly 24 little-endian
@@ -247,8 +247,8 @@ no cell/epoch state to refine.
   are at most 512 MiB, and one process owns at most 64 objects and 128 MiB.
   Handle close transfers the object to deferred backing reclaim without
   returning object or byte quota. Only completed physical reclaim returns that
-  charge. The process table separately caps one process at 32 attached tasks,
-  so a single subject cannot consume all 128 scheduler slots.
+  charge. The process table separately caps one process at 128 attached tasks,
+  so a single subject cannot consume more than half of the 256 scheduler slots.
 - Public `SYS_RUSTOS_IPC_CALL` and handle-transfer call syscalls keep blocking
   Send/Receive/Reply semantics. Do not add a public timeout ABI for generic
   Linux ELF or Windows PE callers.

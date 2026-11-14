@@ -10,6 +10,7 @@ pub mod provider_client;
 pub mod loader_client;
 pub mod checkpoint_idl;
 pub mod heartbeat;
+pub mod worker;
 pub mod syscall;
 
 use core::ptr;
@@ -92,6 +93,11 @@ macro_rules! relocation_trampoline {
     };
 }
 
+/// The native ABI revision stamp macro lives in `rustos-user-abi` (every
+/// binary using the native surface expands it); `entry!` expands it for
+/// static-PIE services.
+pub use rustos_user_abi::native_abi_note;
+
 /// Declare the entry point of a static-PIE RustOS service.
 ///
 /// Generates `_start` (raw assembly trampoline) plus the
@@ -104,6 +110,7 @@ macro_rules! relocation_trampoline {
 macro_rules! entry {
     ($main:path) => {
         $crate::relocation_trampoline!();
+        $crate::native_abi_note!();
         ::core::arch::global_asm!(
             ".global _start",
             ".type _start, @function",

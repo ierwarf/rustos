@@ -38,7 +38,7 @@ reporter admission now uses a manifest-declared exact parent edge.
 | Area | Snapshot observation | Owner |
 | --- | --- | --- |
 | Process directory | Default admission 32, non-moving chunked slots up to internal ceiling 4,096; no longer a 32-slot static array | [process table](../../kernel/ps/src/multitask/process_table.rs), [slot directory](../../kernel/ps/src/multitask/slot_dir.rs) |
-| Thread limits | Job-level counted quota; per-process structural maximum 32 | [process table](../../kernel/ps/src/multitask/process_table.rs) |
+| Thread limits | Job-level counted quota; per-process structural maximum 128 | [process table](../../kernel/ps/src/multitask/process_table.rs) |
 | Job and resident memory | Generation-bound Job tree, hierarchical counted limits, resident-page charge, partial kernel-memory classes and high/min mechanisms implemented; complete accounting and policy remain open | [Job model](job-model.md#phase-2b-ii-memory-limit-as-built) |
 | Application isolation | Loader application-job placement implemented; opt-in limit evidence is not general stability acceptance | [Job model](job-model.md#application-placement-step-0a-as-built-limit-proof-still-open) |
 | JobPolicy | 256-bit v1 ceiling and GET/SET operations exist, but service-capability cutover is incomplete | [job policy ABI](../../libs/rustos-user-abi/src/syscall/job_policy.rs) |

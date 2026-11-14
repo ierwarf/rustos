@@ -1,0 +1,940 @@
+{
+  "libasound2t64": [
+    "noble-updates",
+    "main",
+    "pool/main/a/alsa-lib/libasound2t64_1.2.11-1ubuntu0.3_amd64.deb",
+    "5d17bfb5683eb99f1be951fe48e1be5bf3c52391913b6b74a8aecf9b4f5e779f",
+    397772
+  ],
+  "libatk-bridge2.0-0t64": [
+    "noble",
+    "main",
+    "pool/main/a/at-spi2-core/libatk-bridge2.0-0t64_2.52.0-1build1_amd64.deb",
+    "22b7d47e3c0f7953a78d3cfd309d1b20771085de9220fbe610c0989b9e808c9b",
+    66020
+  ],
+  "libatk1.0-0t64": [
+    "noble",
+    "main",
+    "pool/main/a/at-spi2-core/libatk1.0-0t64_2.52.0-1build1_amd64.deb",
+    "42c5d4b00954f17c2c3c4b866844f691eb8b6d57bf08b59203e65f12dc84a4f9",
+    55282
+  ],
+  "libatspi2.0-0t64": [
+    "noble",
+    "main",
+    "pool/main/a/at-spi2-core/libatspi2.0-0t64_2.52.0-1build1_amd64.deb",
+    "d686ace4080eca9c2d6ce8de69392a5ac56c846701894c0858922d4ce341a1d7",
+    80548
+  ],
+  "libavahi-client3": [
+    "noble-updates",
+    "main",
+    "pool/main/a/avahi/libavahi-client3_0.8-13ubuntu6.2_amd64.deb",
+    "00609b52ea5a1a9e35fcee4bfba03b6ff743a8015649026cb9109c356762f4d9",
+    26810
+  ],
+  "libavahi-common3": [
+    "noble-updates",
+    "main",
+    "pool/main/a/avahi/libavahi-common3_0.8-13ubuntu6.2_amd64.deb",
+    "edd1f7a4a21e70504d0872c429600f2e13fdff7775c0952145f1afeacede1c82",
+    23444
+  ],
+  "libb2-1": [
+    "noble",
+    "universe",
+    "pool/universe/libb/libb2/libb2-1_0.98.1-1.1build1_amd64.deb",
+    "c23173e035b257118540266098bd4f1928c67d918ad981b1e13e6e0d9847d69c",
+    44960
+  ],
+  "libblkid1": [
+    "noble-updates",
+    "main",
+    "pool/main/u/util-linux/libblkid1_2.39.3-9ubuntu6.6_amd64.deb",
+    "3bcf169cd65e2539059b2287924090fc629f9bf90f595fc25465a7efe950ee82",
+    124124
+  ],
+  "libbrotli1": [
+    "noble-updates",
+    "main",
+    "pool/main/b/brotli/libbrotli1_1.1.0-2ubuntu0.1_amd64.deb",
+    "70b188a86d81f30d7510aab30e25d638ed5037dded6691af1533952b71ac61de",
+    330968
+  ],
+  "libbsd0": [
+    "noble-updates",
+    "main",
+    "pool/main/libb/libbsd/libbsd0_0.12.1-1build1.1_amd64.deb",
+    "f3857b0863ac5cfd4263e9bf6cfb1d4be88d5321e4070d5bc2b62b0949e6c86f",
+    41238
+  ],
+  "libbz2-1.0": [
+    "noble-updates",
+    "main",
+    "pool/main/b/bzip2/libbz2-1.0_1.0.8-5.1ubuntu0.1_amd64.deb",
+    "36ee08b00b1ee5018b2fce02881b7d2d73c9b4e32990bde3388400d86c48126a",
+    34562
+  ],
+  "libc6": [
+    "noble-updates",
+    "main",
+    "pool/main/g/glibc/libc6_2.39-0ubuntu8.9_amd64.deb",
+    "ff5557d99b51f761c4b7c92368b9cc45565eda17df9bf9eb4b134d09825008be",
+    3264314
+  ],
+  "libcairo2": [
+    "noble",
+    "main",
+    "pool/main/c/cairo/libcairo2_1.18.0-3build1_amd64.deb",
+    "96950b306889ff6e4248bb937b0a3b56e72dacf643fe732214ce375f0f6bbb36",
+    566292
+  ],
+  "libcap2": [
+    "noble-updates",
+    "main",
+    "pool/main/libc/libcap2/libcap2_2.66-5ubuntu2.4_amd64.deb",
+    "23c627c77c66552a658e62852f244f4946dc543898e0ec5428d5dc6bffde2d6a",
+    30500
+  ],
+  "libcom-err2": [
+    "noble-updates",
+    "main",
+    "pool/main/e/e2fsprogs/libcom-err2_1.47.0-2.4~exp1ubuntu4.1_amd64.deb",
+    "7ab24d3057dabf86db8f771ad6e43f073ed86b6b950d6e8ba22cb9fe6707bbc9",
+    22982
+  ],
+  "libcups2t64": [
+    "noble-updates",
+    "main",
+    "pool/main/c/cups/libcups2t64_2.4.7-1.2ubuntu7.14_amd64.deb",
+    "b815a3d936718614e403035bb4a545e1323305ea624709bff2e9d94c214f9cc4",
+    274470
+  ],
+  "libdatrie1": [
+    "noble",
+    "main",
+    "pool/main/libd/libdatrie/libdatrie1_0.2.13-3build1_amd64.deb",
+    "1ae164e40e413eac4fbd38ce1c6ef9591f7a03278ad9076d71fa29258727f447",
+    18992
+  ],
+  "libdbus-1-3": [
+    "noble-updates",
+    "main",
+    "pool/main/d/dbus/libdbus-1-3_1.14.10-4ubuntu4.1_amd64.deb",
+    "5d630480f04b4b442300ce847a3fa705ea4d14d80ba6de91f99b51a4e4953b08",
+    209734
+  ],
+  "libdouble-conversion3": [
+    "noble",
+    "universe",
+    "pool/universe/d/double-conversion/libdouble-conversion3_3.3.0-1build1_amd64.deb",
+    "856f534738da20fa9d8c271e17781fba3dc180bbbab116c22a0b569f6f506e25",
+    40294
+  ],
+  "libdrm-common": [
+    "noble-updates",
+    "main",
+    "pool/main/libd/libdrm/libdrm-common_2.4.125-1ubuntu0.1~24.04.2_all.deb",
+    "0b60996bc18fa1545e60a47bb0fe1a7f360ec06fe62ba35fb8d8ba2a54e62166",
+    9250
+  ],
+  "libdrm2": [
+    "noble-updates",
+    "main",
+    "pool/main/libd/libdrm/libdrm2_2.4.125-1ubuntu0.1~24.04.2_amd64.deb",
+    "4d3e858dd57be617c49d87c5ddcdb35df744a4f0a559981256ae2ba174718584",
+    41388
+  ],
+  "libegl-mesa0": [
+    "noble-updates",
+    "main",
+    "pool/main/m/mesa/libegl-mesa0_25.2.8-0ubuntu0.24.04.4_amd64.deb",
+    "2b8363cb29868603c827cb569a19373a45bebb29bdca5cd34de42dce2f3c9419",
+    117224
+  ],
+  "libegl1": [
+    "noble",
+    "main",
+    "pool/main/libg/libglvnd/libegl1_1.7.0-1build1_amd64.deb",
+    "e549f7776216f7bd3b1c216729fb40a97a562e2eb7c563cde632b4931f9a4e57",
+    28670
+  ],
+  "libevdev2": [
+    "noble",
+    "main",
+    "pool/main/libe/libevdev/libevdev2_1.13.1+dfsg-1build1_amd64.deb",
+    "a14b1ea7b3220a063458590734920879cec8431b4fc5160eb0f044dfb8d76515",
+    37756
+  ],
+  "libexpat1": [
+    "noble-updates",
+    "main",
+    "pool/main/e/expat/libexpat1_2.6.1-2ubuntu0.6_amd64.deb",
+    "494b8e672f722130c6bca6a7bc4cc31a43ca891a31d60d868bfdd699a3c20b13",
+    98940
+  ],
+  "libffi8": [
+    "noble",
+    "main",
+    "pool/main/libf/libffi/libffi8_3.4.6-1build1_amd64.deb",
+    "637e6a7744de08cd331a41f4efd0d24e6ea9064843dea9d1c6ca87bdb5f038a2",
+    24718
+  ],
+  "libfontconfig1": [
+    "noble",
+    "main",
+    "pool/main/f/fontconfig/libfontconfig1_2.15.0-1.1ubuntu2_amd64.deb",
+    "a2bc05cfef021fdb84285036f98eda5ebec3c4b7a378f5aa2bdba5c4d3d8d586",
+    138572
+  ],
+  "libfreetype6": [
+    "noble-updates",
+    "main",
+    "pool/main/f/freetype/libfreetype6_2.13.2+dfsg-1ubuntu0.2_amd64.deb",
+    "8c6d3bac5a6197fa2f48b2d56f04f3ffecaa7082eeab91b0939f97a40adc88a6",
+    402610
+  ],
+  "libfribidi0": [
+    "noble",
+    "main",
+    "pool/main/f/fribidi/libfribidi0_1.0.13-3build1_amd64.deb",
+    "6cd50259d39ce0dfafee2632c6268538e6a02590e77161a133e9683af346dd1d",
+    26150
+  ],
+  "libgbm1": [
+    "noble-updates",
+    "main",
+    "pool/main/m/mesa/libgbm1_25.2.8-0ubuntu0.24.04.4_amd64.deb",
+    "4bfe348b456db5b445a80e0a3ffb9e9a01b91499bb86e0e568ca3634b134da7e",
+    34172
+  ],
+  "libgcc-s1": [
+    "noble-updates",
+    "main",
+    "pool/main/g/gcc-14/libgcc-s1_14.2.0-4ubuntu2~24.04.1_amd64.deb",
+    "aa7fadbe33b78bcf99885318040601c550c208929565b179891d9a3cc2aa68cd",
+    78392
+  ],
+  "libgcrypt20": [
+    "noble-updates",
+    "main",
+    "pool/main/libg/libgcrypt20/libgcrypt20_1.10.3-2ubuntu0.2_amd64.deb",
+    "957b9eeaa83cf6f2d5d5d76dbb8aa31d3297e6781d8a02fa08dcc897ae650a0b",
+    536494
+  ],
+  "libgl1": [
+    "noble",
+    "main",
+    "pool/main/libg/libglvnd/libgl1_1.7.0-1build1_amd64.deb",
+    "e2b2fadeb883f073b566ad1d7874f6702397514d258473e96152a89d4d502a09",
+    101990
+  ],
+  "libgl1-mesa-dri": [
+    "noble-updates",
+    "main",
+    "pool/main/m/mesa/libgl1-mesa-dri_25.2.8-0ubuntu0.24.04.4_amd64.deb",
+    "2dabbe4292b201ca07b38c0672352f68dbfc55b5850f96f89ef54d3b4b6c8a59",
+    37950
+  ],
+  "libglib2.0-0t64": [
+    "noble-updates",
+    "main",
+    "pool/main/g/glib2.0/libglib2.0-0t64_2.80.0-6ubuntu3.10_amd64.deb",
+    "ff1b650f655b36dfe202fdbae6bb02b363c7257b6dd23e4f95ab61f716190df3",
+    1547558
+  ],
+  "libglvnd0": [
+    "noble",
+    "main",
+    "pool/main/libg/libglvnd/libglvnd0_1.7.0-1build1_amd64.deb",
+    "33f5e07c74f73c2bfb44086ae0f9e6da52acd6c104d30ffe8fd768d8253d5e82",
+    69594
+  ],
+  "libglx-mesa0": [
+    "noble-updates",
+    "main",
+    "pool/main/m/mesa/libglx-mesa0_25.2.8-0ubuntu0.24.04.4_amd64.deb",
+    "5aa6164059989d476b15caa8ade892b1dec37593934dc4f617ece7ea0d639bc0",
+    110128
+  ],
+  "libglx0": [
+    "noble",
+    "main",
+    "pool/main/libg/libglvnd/libglx0_1.7.0-1build1_amd64.deb",
+    "aa4953182f30abde90cb5b072e83d7286b557b325769b8686196a7bd396d8795",
+    38558
+  ],
+  "libgmp10": [
+    "noble-updates",
+    "main",
+    "pool/main/g/gmp/libgmp10_6.3.0+dfsg-2ubuntu6.1_amd64.deb",
+    "285f8a505dfa8e1b33f357a9d8d3477ad35bf18c0b34771a6df4c25923f3ae0d",
+    253460
+  ],
+  "libgnutls30t64": [
+    "noble-updates",
+    "main",
+    "pool/main/g/gnutls28/libgnutls30t64_3.8.3-1.1ubuntu3.6_amd64.deb",
+    "b8944756260c5ea6b7fac019745f931f905aa7a4df0763676b1b25c911b692e2",
+    1002902
+  ],
+  "libgomp1": [
+    "noble-updates",
+    "main",
+    "pool/main/g/gcc-14/libgomp1_14.2.0-4ubuntu2~24.04.1_amd64.deb",
+    "e8a95ec58125b4933597f30ff56c2ae10edf90f287262e366d4b6edea3019144",
+    148062
+  ],
+  "libgpg-error0": [
+    "noble-updates",
+    "main",
+    "pool/main/libg/libgpg-error/libgpg-error0_1.47-3build2.1_amd64.deb",
+    "93654ee8180a73a0363f25c51dc673d67cbabcbecd164187b8a2deb54d007aef",
+    70092
+  ],
+  "libgraphite2-3": [
+    "noble-updates",
+    "main",
+    "pool/main/g/graphite2/libgraphite2-3_1.3.14-2ubuntu0.24.04.1_amd64.deb",
+    "2413ea0f6670d6610ee7c2f550551d69fa341f4b9c78e20eb397f0d1bbe914cb",
+    73352
+  ],
+  "libgssapi-krb5-2": [
+    "noble-updates",
+    "main",
+    "pool/main/k/krb5/libgssapi-krb5-2_1.20.1-6ubuntu2.10_amd64.deb",
+    "0d4a0187bcdbbe3e6a10bfa574100087d12052d0d0ef28614fd6210021c587b2",
+    142830
+  ],
+  "libgudev-1.0-0": [
+    "noble",
+    "main",
+    "pool/main/libg/libgudev/libgudev-1.0-0_238-5ubuntu1_amd64.deb",
+    "8bdd42c584a8d18759df2311b126dc679d438e9780038743b792cf5315f248dc",
+    15906
+  ],
+  "libharfbuzz0b": [
+    "noble",
+    "main",
+    "pool/main/h/harfbuzz/libharfbuzz0b_8.3.0-2build2_amd64.deb",
+    "d6f7eea2244f98aa0463a056680d4629476bf624767ede301560e24add686b5c",
+    468874
+  ],
+  "libhogweed6t64": [
+    "noble-updates",
+    "main",
+    "pool/main/n/nettle/libhogweed6t64_3.9.1-2.2build1.1_amd64.deb",
+    "a9b5f7e9d49ba9060e1c933567046fbc6feab6096799cbf550b7214dc9b0f49b",
+    198548
+  ],
+  "libice6": [
+    "noble",
+    "main",
+    "pool/main/libi/libice/libice6_1.0.10-1build3_amd64.deb",
+    "ad1edb5303574fee154e487947177e5bd15363aa71b92f78f5a2a7145fdb81c5",
+    41398
+  ],
+  "libicu74": [
+    "noble-updates",
+    "main",
+    "pool/main/i/icu/libicu74_74.2-1ubuntu3.1_amd64.deb",
+    "c9a70989678660eed9a1e904c74fa043da8bec8e2036856fc16e31ced79b04f8",
+    10860078
+  ],
+  "libidn2-0": [
+    "noble-updates",
+    "main",
+    "pool/main/libi/libidn2/libidn2-0_2.3.7-2build1.1_amd64.deb",
+    "46bfd10df095a23b65f58115de47a547c9a2d14627749bd0423ae78c14be77d3",
+    66242
+  ],
+  "libinput-bin": [
+    "noble-updates",
+    "main",
+    "pool/main/libi/libinput/libinput-bin_1.25.0-1ubuntu3.7_amd64.deb",
+    "c5abfbe403051ab17721cf21369919a18bf83024c9594248ebb30375ca7d0d0b",
+    23570
+  ],
+  "libinput10": [
+    "noble-updates",
+    "main",
+    "pool/main/libi/libinput/libinput10_1.25.0-1ubuntu3.7_amd64.deb",
+    "dd76b865f149d0b072d21a532539effefdce7983feb232b25e2adf354207237b",
+    133474
+  ],
+  "libjpeg-turbo8": [
+    "noble",
+    "main",
+    "pool/main/libj/libjpeg-turbo/libjpeg-turbo8_2.1.5-2ubuntu2_amd64.deb",
+    "f68b5b23bc8a1688fb787d2aed7e2cdf895a73022f6a5025e183162dac4500b2",
+    149982
+  ],
+  "libjpeg8": [
+    "noble",
+    "main",
+    "pool/main/libj/libjpeg8-empty/libjpeg8_8c-2ubuntu11_amd64.deb",
+    "4d6ed682972bddf62af158a06d68a0dda497e421423b7ca92fb450b3d9ceaac9",
+    2148
+  ],
+  "libk5crypto3": [
+    "noble-updates",
+    "main",
+    "pool/main/k/krb5/libk5crypto3_1.20.1-6ubuntu2.10_amd64.deb",
+    "273f7cc95a68d927d7f71c3e78b7717a16a8d86e646a206bae7bf797150ae9db",
+    81944
+  ],
+  "libkeyutils1": [
+    "noble",
+    "main",
+    "pool/main/k/keyutils/libkeyutils1_1.6.3-3build1_amd64.deb",
+    "0679f198b0128179e46cdf956fb2022c23c758664c00bc8efa0382d509683a8a",
+    9490
+  ],
+  "libkrb5-3": [
+    "noble-updates",
+    "main",
+    "pool/main/k/krb5/libkrb5-3_1.20.1-6ubuntu2.10_amd64.deb",
+    "60b48c5a3233f1d8caba30d6573edc8e131911ab6d63adcd664f7cbe62708362",
+    347568
+  ],
+  "libkrb5support0": [
+    "noble-updates",
+    "main",
+    "pool/main/k/krb5/libkrb5support0_1.20.1-6ubuntu2.10_amd64.deb",
+    "9224ede3246a82a845ea97652ecfae57f88e8d8f520d8a186f9157167574fb34",
+    34942
+  ],
+  "liblz4-1": [
+    "noble-updates",
+    "main",
+    "pool/main/l/lz4/liblz4-1_1.9.4-1build1.1_amd64.deb",
+    "319331270d5cc52d5ebffe51c941d7b01b432bc402c2924b557209a64d4ecbad",
+    63062
+  ],
+  "liblzma5": [
+    "noble-updates",
+    "main",
+    "pool/main/x/xz-utils/liblzma5_5.6.1+really5.4.5-1ubuntu0.4_amd64.deb",
+    "5bcf5da2339331e21d3f42a831e82c61c54c6b2f29804010e8d59abd0ae52167",
+    127704
+  ],
+  "libmd0": [
+    "noble-updates",
+    "main",
+    "pool/main/libm/libmd/libmd0_1.1.0-2build1.1_amd64.deb",
+    "e5ba01d3c41f256aaf57ec59aa0554857162e3e7f97cdfbff1ed2c0e8d720ee7",
+    26976
+  ],
+  "libmd4c0": [
+    "noble",
+    "universe",
+    "pool/universe/m/md4c/libmd4c0_0.4.8-1build1_amd64.deb",
+    "34fd2e7a7aa62ada2597cffd4529f086cb5058a6d7ac0048695254bd9fd882d7",
+    42274
+  ],
+  "libmount1": [
+    "noble-updates",
+    "main",
+    "pool/main/u/util-linux/libmount1_2.39.3-9ubuntu6.6_amd64.deb",
+    "8f2c25589f187dacfdc5bb6be2af0aee6c2ba7b4d2edd1ca4b26753469f07aae",
+    134082
+  ],
+  "libmtdev1t64": [
+    "noble",
+    "main",
+    "pool/main/m/mtdev/libmtdev1t64_1.1.6-1.1build1_amd64.deb",
+    "fa86080d67defabc076ead97d86ccff14c906d21fe4cc1625ba73a8cf8022dfa",
+    14380
+  ],
+  "libnettle8t64": [
+    "noble-updates",
+    "main",
+    "pool/main/n/nettle/libnettle8t64_3.9.1-2.2build1.1_amd64.deb",
+    "6d97fbc1972633083f08f51ccab433606c97bbceb897c631c66495117ca3406f",
+    181636
+  ],
+  "libnspr4": [
+    "noble",
+    "main",
+    "pool/main/n/nspr/libnspr4_4.35-1.1build1_amd64.deb",
+    "e579e72d091f6c7a13f5a756c31065b15aae5b81840d61b069355aa2283c07b4",
+    117398
+  ],
+  "libnss3": [
+    "noble-updates",
+    "main",
+    "pool/main/n/nss/libnss3_3.98-1ubuntu0.3_amd64.deb",
+    "e11fdf8c09a068d0f0c3fd90ed971253dfed7227cc20d3d487fd615d4771f1bb",
+    1444912
+  ],
+  "libopengl0": [
+    "noble",
+    "main",
+    "pool/main/libg/libglvnd/libopengl0_1.7.0-1build1_amd64.deb",
+    "da36bd4d30c13b40b697fa8b72cc09d309ff36a5bd9750341ef78492bf3f3966",
+    32780
+  ],
+  "libp11-kit0": [
+    "noble-updates",
+    "main",
+    "pool/main/p/p11-kit/libp11-kit0_0.25.3-4ubuntu2.2_amd64.deb",
+    "e7c58aeac19d89f5f1492dfaa52b8623bcd56edc40983f5243ad56d94f477bf2",
+    297270
+  ],
+  "libpango-1.0-0": [
+    "noble",
+    "main",
+    "pool/main/p/pango1.0/libpango-1.0-0_1.52.1+ds-1build1_amd64.deb",
+    "09dfa5c881ab273ec6bc1830adcefdc407fcd619316e68fb26ca3a23d0fc9f54",
+    230606
+  ],
+  "libpcre2-16-0": [
+    "noble-updates",
+    "main",
+    "pool/main/p/pcre2/libpcre2-16-0_10.42-4ubuntu2.2_amd64.deb",
+    "a6365e17d88d5fb6223fe2b8cb4c8c65425aeac056e1a212a0151c95e83edf38",
+    211640
+  ],
+  "libpcre2-8-0": [
+    "noble-updates",
+    "main",
+    "pool/main/p/pcre2/libpcre2-8-0_10.42-4ubuntu2.2_amd64.deb",
+    "f41da7cb7e979d6b037ea92650c72ec8ec532ec3c93aa8d5b997207de56695ea",
+    228546
+  ],
+  "libpixman-1-0": [
+    "noble",
+    "main",
+    "pool/main/p/pixman/libpixman-1-0_0.42.2-1build1_amd64.deb",
+    "d9c2931c4c424615eeab9dd5ae08bfc608b84e803c1d3ccddf319270db213421",
+    279306
+  ],
+  "libpng16-16t64": [
+    "noble-updates",
+    "main",
+    "pool/main/libp/libpng1.6/libpng16-16t64_1.6.43-5ubuntu0.7_amd64.deb",
+    "863d6abb089b2820ceba98e6b18f06eaacc55f9b05827001e7b4021a9a7b246c",
+    188998
+  ],
+  "libqt5core5t64": [
+    "noble",
+    "universe",
+    "pool/universe/q/qtbase-opensource-src/libqt5core5t64_5.15.13+dfsg-1ubuntu1_amd64.deb",
+    "8fb5c6a51ae436fefc41e0c9ad7a363ba8ab6b35db727eff5a469de2ee9f52bc",
+    2010540
+  ],
+  "libqt5dbus5t64": [
+    "noble",
+    "universe",
+    "pool/universe/q/qtbase-opensource-src/libqt5dbus5t64_5.15.13+dfsg-1ubuntu1_amd64.deb",
+    "c40a1469d41339bb8888f35d7dc6327d4bdd634b69974eaaaabe1b03f8924344",
+    219892
+  ],
+  "libqt5gui5t64": [
+    "noble",
+    "universe",
+    "pool/universe/q/qtbase-opensource-src/libqt5gui5t64_5.15.13+dfsg-1ubuntu1_amd64.deb",
+    "e2c8a969c3566bdad2b692c611ec0e6bbeaeed88db55e71bbd4f61a414b89252",
+    3747576
+  ],
+  "libqt5network5t64": [
+    "noble",
+    "universe",
+    "pool/universe/q/qtbase-opensource-src/libqt5network5t64_5.15.13+dfsg-1ubuntu1_amd64.deb",
+    "1b331252a34b1eb66e6deb8012d45db993fe3eb27ac6ded4978c7886471659d6",
+    722778
+  ],
+  "libqt5widgets5t64": [
+    "noble",
+    "universe",
+    "pool/universe/q/qtbase-opensource-src/libqt5widgets5t64_5.15.13+dfsg-1ubuntu1_amd64.deb",
+    "bdcb4395194d5062fcbda9ba70ae6d4deef75671d70140543d58ef34728dff53",
+    2560968
+  ],
+  "libqt6core6t64": [
+    "noble",
+    "universe",
+    "pool/universe/q/qt6-base/libqt6core6t64_6.4.2+dfsg-21.1build5_amd64.deb",
+    "1f6e26589271c1d7aa549cb86d0156ff589b764d37edf356712fecebfe5f30f8",
+    1788570
+  ],
+  "libqt6dbus6t64": [
+    "noble",
+    "universe",
+    "pool/universe/q/qt6-base/libqt6dbus6t64_6.4.2+dfsg-21.1build5_amd64.deb",
+    "20891a752f6569b8b0772b0c81b7251eb3394fdef57bf52870f4825cb0e9c0de",
+    266870
+  ],
+  "libqt6gui6t64": [
+    "noble",
+    "universe",
+    "pool/universe/q/qt6-base/libqt6gui6t64_6.4.2+dfsg-21.1build5_amd64.deb",
+    "f8774151f151a932d389817a371a3241004b1c3031cf53afd91feed73c8dd68e",
+    3119104
+  ],
+  "libqt6widgets6t64": [
+    "noble",
+    "universe",
+    "pool/universe/q/qt6-base/libqt6widgets6t64_6.4.2+dfsg-21.1build5_amd64.deb",
+    "9d5aba1eeb471c1230a94eb1865a95df0595ed8311971acf50fff2652452562d",
+    2648360
+  ],
+  "libselinux1": [
+    "noble-updates",
+    "main",
+    "pool/main/libs/libselinux/libselinux1_3.5-2ubuntu2.1_amd64.deb",
+    "6abaa6c26f46ef17764c4a753e0e84de1cdadde5634fd2987621fdc617988d19",
+    79660
+  ],
+  "libsm6": [
+    "noble",
+    "main",
+    "pool/main/libs/libsm/libsm6_1.2.3-1build3_amd64.deb",
+    "1d27ebc381b499075a28c504be4d7d424c63b6866354736ac7f8d25813860cdf",
+    15684
+  ],
+  "libsqlite3-0": [
+    "noble-updates",
+    "main",
+    "pool/main/s/sqlite3/libsqlite3-0_3.45.1-1ubuntu2.9_amd64.deb",
+    "e04c9d3cf7d0fc4d63332bea2395280550a0b5daef35d19c3c079fc2e96a92e5",
+    701804
+  ],
+  "libssl3t64": [
+    "noble-updates",
+    "main",
+    "pool/main/o/openssl/libssl3t64_3.0.13-0ubuntu3.16_amd64.deb",
+    "219f43b1cd836a4da550938db5fda93160d269d39a4edcf1f1ce698a470db797",
+    1945300
+  ],
+  "libstdc++6": [
+    "noble-updates",
+    "main",
+    "pool/main/g/gcc-14/libstdc++6_14.2.0-4ubuntu2~24.04.1_amd64.deb",
+    "a51f8de7829211db961a31f02158058ad1a95f92ac6d0a5dff6350e2821c54c0",
+    792064
+  ],
+  "libsystemd0": [
+    "noble-updates",
+    "main",
+    "pool/main/s/systemd/libsystemd0_255.4-1ubuntu8.18_amd64.deb",
+    "2da3fa28302cf007075e89cdc3aabe6973916afcd62c3884b86f67b77c73a5b4",
+    436342
+  ],
+  "libtasn1-6": [
+    "noble-updates",
+    "main",
+    "pool/main/libt/libtasn1-6/libtasn1-6_4.19.0-3ubuntu0.24.04.2_amd64.deb",
+    "f82c9ad142f952ea523bda5bfca7bb0802af3a50b8c0f0dd9ec18cdfa104bde7",
+    44468
+  ],
+  "libthai0": [
+    "noble",
+    "main",
+    "pool/main/libt/libthai/libthai0_0.1.29-2build1_amd64.deb",
+    "5ada7045c5f84a4b774e6449151800aa6470e8d01dc9d6124ef4a44ae6af5508",
+    18914
+  ],
+  "libts0t64": [
+    "noble",
+    "universe",
+    "pool/universe/t/tslib/libts0t64_1.22-1.1build1_amd64.deb",
+    "892524fd6a070e9e6a6b084d3a4099b81d6fbbd82a1c7bd4b67a8e6e998ac5a3",
+    63828
+  ],
+  "libudev1": [
+    "noble-updates",
+    "main",
+    "pool/main/s/systemd/libudev1_255.4-1ubuntu8.18_amd64.deb",
+    "6de7321adcc37068f8702fe6826473662df73c36377e00f07f7acfeca2e40d4a",
+    177836
+  ],
+  "libunistring5": [
+    "noble-updates",
+    "main",
+    "pool/main/libu/libunistring/libunistring5_1.1-2build1.1_amd64.deb",
+    "203d7657b5f54633fba1a9c9b784d556ef83c9f6787b3185ba55a88e07b865a3",
+    535554
+  ],
+  "libuuid1": [
+    "noble-updates",
+    "main",
+    "pool/main/u/util-linux/libuuid1_2.39.3-9ubuntu6.6_amd64.deb",
+    "7e2992d3a79fc05514dc5966558ee9c66a7214a47edf2a36017b9e2777528665",
+    36596
+  ],
+  "libvulkan1": [
+    "noble",
+    "main",
+    "pool/main/v/vulkan-loader/libvulkan1_1.3.275.0-1build1_amd64.deb",
+    "ccf4fe8f4461442f27ea2494c7ae650b60bd396fec2688b0c44a27d66a222f74",
+    142010
+  ],
+  "libwacom-common": [
+    "noble",
+    "main",
+    "pool/main/libw/libwacom/libwacom-common_2.10.0-2_all.deb",
+    "416099ceae870ec8ce13f875dfdf71f81a884b3641e404a74eafd378c15a78b4",
+    63364
+  ],
+  "libwacom9": [
+    "noble",
+    "main",
+    "pool/main/libw/libwacom/libwacom9_2.10.0-2_amd64.deb",
+    "87c707e4e7cbef1080b7c6cfb14acb0e5b0a4b07b19ce5545923952fbcf82298",
+    23874
+  ],
+  "libwayland-client0": [
+    "noble",
+    "main",
+    "pool/main/w/wayland/libwayland-client0_1.22.0-2.1build1_amd64.deb",
+    "6af0aed41d75149bea22fa468f01eb058ffe3e35ef07ff2f13fb88a90387881d",
+    26406
+  ],
+  "libx11-6": [
+    "noble-updates",
+    "main",
+    "pool/main/libx/libx11/libx11-6_1.8.7-1ubuntu0.1_amd64.deb",
+    "9102f73477081a9a57994c80587ca9760341f644ed51bdfa46f2248083d418b3",
+    653072
+  ],
+  "libx11-data": [
+    "noble-updates",
+    "main",
+    "pool/main/libx/libx11/libx11-data_1.8.7-1ubuntu0.1_all.deb",
+    "5cb70f7a8e7178e0bae4fd49eee49feaed623d2d821caf6ea5862b66f9e9630b",
+    115970
+  ],
+  "libx11-xcb1": [
+    "noble-updates",
+    "main",
+    "pool/main/libx/libx11/libx11-xcb1_1.8.7-1ubuntu0.1_amd64.deb",
+    "5ce7093e58aaaf753ed0904351a4e07f209e0c282ee8ef4f5f7988d0b40dccc1",
+    7796
+  ],
+  "libxau6": [
+    "noble",
+    "main",
+    "pool/main/libx/libxau/libxau6_1.0.9-1build6_amd64.deb",
+    "e40d29f1d1a62393bacaedebe0da3d9006084152a9f7e5e029293f08ce1c5c80",
+    7160
+  ],
+  "libxcb-dri3-0": [
+    "noble",
+    "main",
+    "pool/main/libx/libxcb/libxcb-dri3-0_1.15-1ubuntu2_amd64.deb",
+    "3d3d0e95e56ae16010a84883196b8153cba62d6831f9aaee2a68c46f20c7c004",
+    7142
+  ],
+  "libxcb-glx0": [
+    "noble",
+    "main",
+    "pool/main/libx/libxcb/libxcb-glx0_1.15-1ubuntu2_amd64.deb",
+    "d07cde26c70fe92df7c327928371e495cc4570fed2d6518758a5db5715cb34c1",
+    24774
+  ],
+  "libxcb-icccm4": [
+    "noble",
+    "main",
+    "pool/main/x/xcb-util-wm/libxcb-icccm4_0.4.1-1.1build3_amd64.deb",
+    "9e0e349f3904cd5bc07fea45498c4d03527a5d1178edd78555e84fdbd3793708",
+    10788
+  ],
+  "libxcb-image0": [
+    "noble",
+    "main",
+    "pool/main/x/xcb-util-image/libxcb-image0_0.4.0-2build1_amd64.deb",
+    "6af300eeef5523aa0d8dbfab3a23c1fe7006ecc19f8abdc5c636d734d7bb5287",
+    10810
+  ],
+  "libxcb-keysyms1": [
+    "noble",
+    "main",
+    "pool/main/x/xcb-util-keysyms/libxcb-keysyms1_0.4.0-1build4_amd64.deb",
+    "6c261aae923175b88a032018c530873ffb40f2bf96b045fdda42bd8bc74cb1c3",
+    7956
+  ],
+  "libxcb-present0": [
+    "noble",
+    "main",
+    "pool/main/libx/libxcb/libxcb-present0_1.15-1ubuntu2_amd64.deb",
+    "2e36e6557e87dbfd64df3143cbf81a4f75c3447501a545b4730511d228b0dd17",
+    5676
+  ],
+  "libxcb-randr0": [
+    "noble",
+    "main",
+    "pool/main/libx/libxcb/libxcb-randr0_1.15-1ubuntu2_amd64.deb",
+    "b5cb519823a05a617b543dc9b6a9289b7648b20048244abe021caa706309835a",
+    17862
+  ],
+  "libxcb-render-util0": [
+    "noble",
+    "main",
+    "pool/main/x/xcb-util-renderutil/libxcb-render-util0_0.3.9-1build4_amd64.deb",
+    "95d895ceb921e38e4edd85555b407b1a0564d8ad097ec7566e261764ce27787b",
+    9608
+  ],
+  "libxcb-render0": [
+    "noble",
+    "main",
+    "pool/main/libx/libxcb/libxcb-render0_1.15-1ubuntu2_amd64.deb",
+    "7d83a0668b1a693b5ea2e496206e8371fb6beda4c54a2b4b3902005915c272c5",
+    16230
+  ],
+  "libxcb-shape0": [
+    "noble",
+    "main",
+    "pool/main/libx/libxcb/libxcb-shape0_1.15-1ubuntu2_amd64.deb",
+    "ad57fed687ec9c2a4808b8e30ab1753d57daeddc9ad7fb883bfa0701f6da57c8",
+    6100
+  ],
+  "libxcb-shm0": [
+    "noble",
+    "main",
+    "pool/main/libx/libxcb/libxcb-shm0_1.15-1ubuntu2_amd64.deb",
+    "229d1280d459f1ba44c22939d3f9b61d9d20932d9a646b3fe4ce50be4cdf2325",
+    5756
+  ],
+  "libxcb-sync1": [
+    "noble",
+    "main",
+    "pool/main/libx/libxcb/libxcb-sync1_1.15-1ubuntu2_amd64.deb",
+    "14286795a258593259923619073e50c15345673befae2733f7b0577b07359aa8",
+    9312
+  ],
+  "libxcb-util1": [
+    "noble",
+    "main",
+    "pool/main/x/xcb-util/libxcb-util1_0.4.0-1build3_amd64.deb",
+    "b6ff05729519514bddcbcd460f8be7e55c986daa5a97ecdc612b2815614194ab",
+    10678
+  ],
+  "libxcb-xfixes0": [
+    "noble",
+    "main",
+    "pool/main/libx/libxcb/libxcb-xfixes0_1.15-1ubuntu2_amd64.deb",
+    "0b2ab64af92a71e3d1a35e3c819880ee28d04bfac81360df68ae8d8e9663ebd2",
+    10190
+  ],
+  "libxcb-xinerama0": [
+    "noble",
+    "main",
+    "pool/main/libx/libxcb/libxcb-xinerama0_1.15-1ubuntu2_amd64.deb",
+    "9fea44960e39646a22139f4daca03c3d26190e0dcecf2300b665ed23ea316b54",
+    5410
+  ],
+  "libxcb-xinput0": [
+    "noble",
+    "main",
+    "pool/main/libx/libxcb/libxcb-xinput0_1.15-1ubuntu2_amd64.deb",
+    "8ed274ebfa657a079895a0b60b399394db29305f4ad3fc29dc10558bed14bd7a",
+    33240
+  ],
+  "libxcb-xkb1": [
+    "noble",
+    "main",
+    "pool/main/libx/libxcb/libxcb-xkb1_1.15-1ubuntu2_amd64.deb",
+    "53bc0a58834c981fa8ce5c3ab6195387e5c8a417039d82cc7a8b49724fa53228",
+    32302
+  ],
+  "libxcb1": [
+    "noble",
+    "main",
+    "pool/main/libx/libxcb/libxcb1_1.15-1ubuntu2_amd64.deb",
+    "e1c6611d11ad7398326f1bf028afc34c3b14c51d917a3426b966ed4b9687fa58",
+    47730
+  ],
+  "libxcomposite1": [
+    "noble",
+    "main",
+    "pool/main/libx/libxcomposite/libxcomposite1_0.4.5-1build3_amd64.deb",
+    "a12d5d9ae70b798cbbf284080eae32b87367561fc9c24492f641b8860ac0f308",
+    6320
+  ],
+  "libxdamage1": [
+    "noble",
+    "main",
+    "pool/main/libx/libxdamage/libxdamage1_1.1.6-1build1_amd64.deb",
+    "6891faf325e996ebd28ef53ebb9c043dc96f67327500490affc3e89d366d35ed",
+    6150
+  ],
+  "libxdmcp6": [
+    "noble",
+    "main",
+    "pool/main/libx/libxdmcp/libxdmcp6_1.1.3-0ubuntu6_amd64.deb",
+    "bcd336fce11ce2a45f34d0f95e6980af22529f22147e8f98c156e5cee8ee42bb",
+    10254
+  ],
+  "libxext6": [
+    "noble",
+    "main",
+    "pool/main/libx/libxext/libxext6_1.3.4-1build2_amd64.deb",
+    "45783969a9ece9d7b7b733b8c60981584c53c6bc5ee3b42d295d2f80d1285679",
+    30406
+  ],
+  "libxfixes3": [
+    "noble",
+    "main",
+    "pool/main/libx/libxfixes/libxfixes3_6.0.0-2build1_amd64.deb",
+    "0ee1015cccd063249e01c0cd0bf45f513c8ac9a1e5e485070c12e69192455e4a",
+    10764
+  ],
+  "libxi6": [
+    "noble",
+    "main",
+    "pool/main/libx/libxi/libxi6_1.8.1-1build1_amd64.deb",
+    "0ea7acb5e8a8ce4d6653b30e03a319bfe136db7bfb5ee7cad34c2aa1272ea8d9",
+    32404
+  ],
+  "libxkbcommon-x11-0": [
+    "noble",
+    "main",
+    "pool/main/libx/libxkbcommon/libxkbcommon-x11-0_1.6.0-1build1_amd64.deb",
+    "3befe840ce612ddfc0998d8610c6eed295726722a78e75cd08520bbd75065a23",
+    14536
+  ],
+  "libxkbcommon0": [
+    "noble",
+    "main",
+    "pool/main/libx/libxkbcommon/libxkbcommon0_1.6.0-1build1_amd64.deb",
+    "2b9caeb423efb540296a1cb20b872cc630c23908407ecb5c1c787a617622d664",
+    121944
+  ],
+  "libxrandr2": [
+    "noble",
+    "main",
+    "pool/main/libx/libxrandr/libxrandr2_1.5.2-2build1_amd64.deb",
+    "f2955a5e594f5724b58ad241d9231ea191cb36574a0d5e5ca6b661cd41d6256d",
+    19670
+  ],
+  "libxrender1": [
+    "noble",
+    "main",
+    "pool/main/libx/libxrender/libxrender1_0.9.10-1.1build1_amd64.deb",
+    "d70bd831aebe8d4834b5dd2ed98df26dd6bd27f1042c47543bd7f66df1ae22ea",
+    19016
+  ],
+  "libxxf86vm1": [
+    "noble",
+    "main",
+    "pool/main/libx/libxxf86vm/libxxf86vm1_1.1.4-1build4_amd64.deb",
+    "48b2799f52b86505d2bc91dcb1bfa6536545635b9849cb693d274d934116a8da",
+    9282
+  ],
+  "libzstd1": [
+    "noble-updates",
+    "main",
+    "pool/main/libz/libzstd/libzstd1_1.5.5+dfsg2-2build1.1_amd64.deb",
+    "dfcf25061e07aad7efd3f4f880ba5ad4d4d09ebe7fc8cc77ab6b8a161d6d4727",
+    299472
+  ],
+  "zlib1g": [
+    "noble-updates",
+    "main",
+    "pool/main/z/zlib/zlib1g_1.3.dfsg-3.1ubuntu2.3_amd64.deb",
+    "376249c8de139568221dbb242318cc8cb8f02299e3a62b7432948e1754fbddf9",
+    63158
+  ]
+}

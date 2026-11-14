@@ -1434,3 +1434,6 @@ mod tests {
         assert!(source.contains("SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT"));
     }
 }
+
+// Native ABI revision stamp (hint, not authority); see docs/architecture/evolution-rules.md.
+rustos_user_abi::native_abi_note!();

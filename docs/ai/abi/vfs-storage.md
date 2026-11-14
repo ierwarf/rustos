@@ -14,6 +14,27 @@
   capability possession, and token obscurity never substitutes for the rootd
   dependency graph.
 - Kernel fd tables mirror service-owned objects as `KernelHandle::RemoteVfs`.
+- `/proc` is a minimal vfsd-owned namespace (`services/vfsd/src/proc_fs.rs`).
+  Provided: `/proc` (empty directory listing), `/proc/self` (symlink to the
+  caller's decimal pid), `/proc/<own pid>` (directory) and
+  `/proc/<own pid>/exe` (symlink to the caller's executable path). Reachable
+  through `readlinkat`/`readlink`, `newfstatat` and `statx` (symlink mode
+  `S_IFLNK` unless the caller follows `exe`, in which case the target's stat is
+  returned) and `access`. Identity is the kernel-stamped `VfsIpcRequest.pid`;
+  any other pid, live or not, and every other name is `ENOENT`, so no other
+  process's path is disclosed. The executable path is a kernel fact
+  (`UserProcessState::exec_path`): Ring0 attaches it in
+  `VfsIpcRequest.payload` for `READLINKAT`/`NEWFSTATAT`/`STATX` only
+  (`service_ops/proc_identity.rs`; dropped, not truncated, when over capacity)
+  and vfsd never stores it. `readlinkat` on an existing non-`/proc` path is
+  `EINVAL` (nothing else is a symlink); a missing one is `ENOENT`.
+  Intentionally unsupported (no truthful backing source in vfsd, so no fake
+  nodes): `open`/`getdents64` of `/proc/self` or `/proc/<pid>`,
+  `/proc/<pid>/fd`, `cmdline`, `status`, `maps`, `meminfo`, `cpuinfo`.
+  `/proc/self/fd` needs the kernel fd table, which is not exposed to vfsd; a
+  future version should add a kernel-attested fd-number snapshot rather than
+  guess. Chrome's `base::CloseSuperfluousFds` falls back to closing up to the
+  rlimit when it is absent.
 - VFS device open responses use `VfsIpcResponse.aux` for service-owned route
   metadata such as `INPUTD_ACCESS_*` and `VFS_DEVICE_ACCESS_DRM_COMPAT`.
   Compat never classifies `/dev/*` path strings: vfsd resolves the namespace,

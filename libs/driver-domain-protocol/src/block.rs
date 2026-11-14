@@ -216,11 +216,11 @@ pub enum DvmBlockOperation {
 }
 
 impl DvmBlockOperation {
-    const fn wire(self) -> u32 {
+    pub(crate) const fn wire(self) -> u32 {
         self as u32
     }
 
-    fn decode(value: u32) -> Option<Self> {
+    pub(crate) fn decode(value: u32) -> Option<Self> {
         match value {
             0 => Some(Self::Read),
             1 => Some(Self::Write),

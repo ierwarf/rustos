@@ -29,14 +29,16 @@ use std::{
     path::{Component, Path},
 };
 
+use wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1;
+use wayland_protocols::wp::viewporter::server::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::decoration::zv1::server::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
 use wayland_protocols::xdg::shell::server::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use wayland_server::backend::{ClientData, ClientId, ObjectId};
 use wayland_server::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat,
-    wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_callback, wl_compositor, wl_data_device_manager, wl_keyboard, wl_output,
+    wl_pointer, wl_region, wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_server::{
     Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
@@ -57,6 +59,8 @@ use crate::wayland_accept::{start_wayland_acceptor, WaylandAcceptor};
 mod buffer;
 mod commit;
 mod compositor;
+mod data_device;
+mod dmabuf;
 mod input;
 mod output;
 mod seat;
@@ -66,12 +70,15 @@ mod state;
 mod surface;
 #[cfg(test)]
 mod tests;
+mod viewport;
 mod windows;
 mod xdg;
 
 use self::buffer::*;
 use self::commit::CommitSlot;
+use self::data_device::{DataDeviceResource, DragState, Selection};
 use self::snapshot::{SnapshotLayout, SnapshotPixels, SnapshotService, SnapshotSpec};
+use self::viewport::ViewportState;
 
 const WAYLAND_SOCKET_NAME: &str = "wayland-0";
 const LINUX_BTN_LEFT: u32 = 0x110;
@@ -98,6 +105,7 @@ const MAX_WAYLAND_SHM_POOLS_TOTAL: usize = 256;
 const MAX_WAYLAND_BUFFERS_PER_CLIENT: usize = 256;
 const MAX_WAYLAND_REGIONS_PER_CLIENT: usize = 64;
 const MAX_WAYLAND_DECORATIONS_PER_CLIENT: usize = 16;
+const MAX_WAYLAND_VIEWPORTS_PER_CLIENT: usize = 64;
 const MAX_WAYLAND_OUTSTANDING_CONFIGURES: usize = 16;
 const MAX_WAYLAND_TITLE_BYTES: usize = 256;
 /// Tracked output, pointer or keyboard objects one client may hold at once.
@@ -137,6 +145,25 @@ fn transient_wayland_readiness_error(kind: ErrorKind) -> bool {
     matches!(kind, ErrorKind::BrokenPipe | ErrorKind::TimedOut)
 }
 
+/// Every global this compositor advertises, in one place so tests exercise the
+/// same set a client sees.
+fn create_wayland_globals(handle: &DisplayHandle) {
+    handle.create_global::<WaylandState, wl_compositor::WlCompositor, _>(6, ());
+    handle.create_global::<WaylandState, wl_shm::WlShm, _>(1, ());
+    handle.create_global::<WaylandState, wl_output::WlOutput, _>(4, ());
+    handle.create_global::<WaylandState, wl_seat::WlSeat, _>(7, ());
+    handle.create_global::<WaylandState, xdg_wm_base::XdgWmBase, _>(6, ());
+    handle.create_global::<WaylandState, zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _>(
+        1,
+        (),
+    );
+    handle.create_global::<WaylandState, wp_viewporter::WpViewporter, _>(1, ());
+    handle.create_global::<WaylandState, wl_data_device_manager::WlDataDeviceManager, _>(3, ());
+    // Version 3: format/modifier events only, no feedback objects. No
+    // format is advertised because nothing is importable (dmabuf.rs).
+    handle.create_global::<WaylandState, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _>(3, ());
+}
+
 fn post_protocol_error<I: Resource>(resource: &I, message: String) {
     diag_line(format!("uiserver: wayland protocol error: {message}"));
     resource.post_error(0_u32, message);
@@ -154,6 +181,8 @@ pub(crate) struct WaylandWindowSnapshot {
     pub(crate) title: String,
     pub(crate) frame: Rect,
     pub(crate) minimized: bool,
+    pub(crate) server_decoration: bool,
+    pub(crate) drag_icon: bool,
     pub(crate) content_version: u64,
     pub(crate) damage: Rect,
     pub(crate) pixels: Arc<Vec<u32>>,
@@ -168,6 +197,8 @@ impl PartialEq for WaylandWindowSnapshot {
             && self.title == other.title
             && self.frame == other.frame
             && self.minimized == other.minimized
+            && self.server_decoration == other.server_decoration
+            && self.drag_icon == other.drag_icon
             && self.content_version == other.content_version
             && self.width == other.width
             && self.height == other.height
@@ -233,20 +264,10 @@ impl WaylandCompositor {
                 return None;
             }
         };
-        let state = WaylandState::new(display_width, display_height);
+        let mut state = WaylandState::new(display_width, display_height);
+        state.display_handle = Some(display.handle());
         state.snapshots.set_waker(snapshot_waker);
-        {
-            let handle = display.handle();
-            handle.create_global::<WaylandState, wl_compositor::WlCompositor, _>(6, ());
-            handle.create_global::<WaylandState, wl_shm::WlShm, _>(1, ());
-            handle.create_global::<WaylandState, wl_output::WlOutput, _>(4, ());
-            handle.create_global::<WaylandState, wl_seat::WlSeat, _>(7, ());
-            handle.create_global::<WaylandState, xdg_wm_base::XdgWmBase, _>(6, ());
-            handle.create_global::<WaylandState, zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _>(
-                1,
-                (),
-            );
-        }
+        create_wayland_globals(&display.handle());
         diag_line(format!(
             "uiserver: wayland compositor ready on {}/{}",
             runtime_dir, WAYLAND_SOCKET_NAME
@@ -837,6 +858,19 @@ impl WaylandState {
             self.update_pointer_focus(Some(hit));
             self.pointer_button_down = true;
             self.mark_dirty();
+        } else if self.moving_surface.take().is_some() {
+            self.pointer_button_down = false;
+            self.pointer_grab_serial = None;
+            let hit = self.hit_test_pointer(self.pointer_x, self.pointer_y);
+            self.update_pointer_focus(hit);
+            return true;
+        } else if self.drag.is_some() {
+            self.pointer_button_down = false;
+            self.pointer_grab_serial = None;
+            self.drop_drag();
+            let hit = self.hit_test_pointer(self.pointer_x, self.pointer_y);
+            self.update_pointer_focus(hit);
+            return true;
         } else if !self.pointer_button_down {
             return false;
         } else {
@@ -852,6 +886,8 @@ impl WaylandState {
         let client_id = focus.client_id.clone();
         let serial = self.next_configure_serial();
         let time = self.event_time_ms();
+        self.record_input_serial(serial, client_id.clone());
+        self.pointer_grab_serial = if pressed { Some(serial) } else { None };
         let state = if pressed {
             wl_pointer::ButtonState::Pressed
         } else {
@@ -881,6 +917,11 @@ struct WaylandClientState {
     buffers: Arc<AtomicUsize>,
     regions: Arc<AtomicUsize>,
     decorations: Arc<AtomicUsize>,
+    viewports: Arc<AtomicUsize>,
+    data_sources: Arc<AtomicUsize>,
+    data_devices: Arc<AtomicUsize>,
+    data_offers: Arc<AtomicUsize>,
+    dmabuf_params: Arc<AtomicUsize>,
 }
 
 impl ClientData for WaylandClientState {}
@@ -950,6 +991,16 @@ struct WaylandState {
     output_resources: Vec<OutputResource>,
     pointer_resources: Vec<PointerResource>,
     keyboard_resources: Vec<KeyboardResource>,
+    /// Handle used to create server-initiated objects (clipboard offers).
+    display_handle: Option<DisplayHandle>,
+    data_devices: Vec<DataDeviceResource>,
+    selection: Option<Selection>,
+    selection_epoch: u64,
+    selection_serial: Option<u32>,
+    input_serials: Vec<(u32, ClientId)>,
+    pointer_grab_serial: Option<u32>,
+    drag: Option<DragState>,
+    moving_surface: Option<(u32, i64, i64)>,
     pointer_focus: Option<PointerFocus>,
     pointer_target: Option<u32>,
     keyboard_focus: Option<KeyboardFocus>,
@@ -1042,6 +1093,11 @@ struct WaylandSurfaceState {
     client_id: Option<ClientId>,
     xdg_surface: Option<xdg_surface::XdgSurface>,
     toplevel: Option<xdg_toplevel::XdgToplevel>,
+    decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
+    decoration_requested_server: bool,
+    decoration_ack_server: bool,
+    decoration_server: bool,
+    decoration_configures: Vec<(u32, bool)>,
     pending_buffer: Option<Option<BufferAttachment>>,
     current_buffer: Option<BufferData>,
     pending_damage: Rect,
@@ -1052,11 +1108,21 @@ struct WaylandSurfaceState {
     /// behind it (`wayland/commit.rs`).
     commit: CommitSlot,
     pixels: Arc<Vec<u32>>,
+    original_pixels: Arc<Vec<u32>>,
+    original_width: usize,
+    original_height: usize,
+    pending_buffer_mapping: BufferMapping,
+    buffer_mapping: BufferMapping,
     width: usize,
     height: usize,
     stride_pixels: usize,
     content_version: u64,
     role_assigned: bool,
+    drag_icon_role: bool,
+    drag_icon_active: bool,
+    drag_icon_offset_x: i64,
+    drag_icon_offset_y: i64,
+    pending_offset: (i32, i32),
     needs_initial_configure: bool,
     configured_serial: u32,
     acknowledged_serial: u32,
@@ -1067,6 +1133,26 @@ struct WaylandSurfaceState {
     outstanding_configures: Vec<u32>,
     on_output: bool,
     alive: bool,
+    /// `wp_viewport` bound to this surface, at most one.
+    viewport_resource: Option<wp_viewport::WpViewport>,
+    /// Double-buffered viewport: requests write `pending`, commit promotes it.
+    pending_viewport: ViewportState,
+    viewport: ViewportState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BufferMapping {
+    transform: u32,
+    scale: usize,
+}
+
+impl Default for BufferMapping {
+    fn default() -> Self {
+        Self {
+            transform: 0,
+            scale: 1,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1087,6 +1173,8 @@ struct WaylandBufferState {
     height: usize,
     stride: usize,
     has_alpha: bool,
+    /// Imported from an app DMA-BUF capability (proof markers only).
+    app_dmabuf: bool,
     /// Released when the last reference to this buffer goes away.
     _ticket: LiveObjectTicket,
 }
@@ -1112,6 +1200,7 @@ struct RegionData {
 }
 
 struct DecorationData {
+    surface: SurfaceData,
     _ticket: LiveObjectTicket,
 }
 

@@ -15,6 +15,15 @@ impl WaylandState {
             output_resources: Vec::new(),
             pointer_resources: Vec::new(),
             keyboard_resources: Vec::new(),
+            display_handle: None,
+            data_devices: Vec::new(),
+            selection: None,
+            selection_epoch: 0,
+            selection_serial: None,
+            input_serials: Vec::new(),
+            pointer_grab_serial: None,
+            drag: None,
+            moving_surface: None,
             pointer_focus: None,
             pointer_target: None,
             keyboard_focus: None,
@@ -80,10 +89,12 @@ impl WaylandState {
         loop {
             let id = self.next_surface_id.max(1);
             self.next_surface_id = id.wrapping_add(1).max(1);
-            let in_use = self
-                .surfaces
-                .iter()
-                .any(|surface| surface.shared.lock().is_ok_and(|state| state.surface_id == id));
+            let in_use = self.surfaces.iter().any(|surface| {
+                surface
+                    .shared
+                    .lock()
+                    .is_ok_and(|state| state.surface_id == id)
+            });
             if !in_use {
                 return id;
             }
@@ -103,11 +114,24 @@ impl WaylandState {
     }
 
     /// Pixels retained by every surface except `except`.
-    pub(super) fn retained_surface_pixels_excluding(&self, except: &Arc<Mutex<WaylandSurfaceState>>) -> usize {
+    pub(super) fn retained_surface_pixels_excluding(
+        &self,
+        except: &Arc<Mutex<WaylandSurfaceState>>,
+    ) -> usize {
         self.surfaces
             .iter()
             .filter(|surface| !Arc::ptr_eq(&surface.shared, except))
-            .filter_map(|surface| surface.shared.lock().ok().map(|state| state.pixels.len()))
+            .filter_map(|surface| {
+                surface.shared.lock().ok().map(|state| {
+                    state.pixels.len().saturating_add(
+                        if Arc::ptr_eq(&state.pixels, &state.original_pixels) {
+                            0
+                        } else {
+                            state.original_pixels.len()
+                        },
+                    )
+                })
+            })
             .fold(0_usize, usize::saturating_add)
     }
 
@@ -126,6 +150,9 @@ impl WaylandState {
                 title: String::from("Wayland App"),
                 frame: self.allocate_window_frame(),
                 alive: true,
+                decoration_requested_server: true,
+                decoration_ack_server: false,
+                decoration_server: false,
                 ..WaylandSurfaceState::default()
             })),
         };
@@ -151,6 +178,7 @@ impl WaylandState {
                 continue;
             };
             if !surface.alive
+                || (surface.drag_icon_role && !surface.drag_icon_active)
                 || surface.pixels.is_empty()
                 || surface.width == 0
                 || surface.height == 0
@@ -168,17 +196,83 @@ impl WaylandState {
             if required_len > surface.pixels.len() {
                 continue;
             }
+            let (pixels, width, height, stride_pixels, frame, damage) = if surface.drag_icon_active
+            {
+                let x = i64::from(self.pointer_x).saturating_add(surface.drag_icon_offset_x);
+                let y = i64::from(self.pointer_y).saturating_add(surface.drag_icon_offset_y);
+                let crop_x = if x < 0 {
+                    usize::try_from(x.unsigned_abs()).unwrap_or(usize::MAX)
+                } else {
+                    0
+                };
+                let crop_y = if y < 0 {
+                    usize::try_from(y.unsigned_abs()).unwrap_or(usize::MAX)
+                } else {
+                    0
+                };
+                if crop_x >= surface.width || crop_y >= surface.height {
+                    continue;
+                }
+                let width = surface.width - crop_x;
+                let height = surface.height - crop_y;
+                let mut frame = surface.frame;
+                frame.width = width;
+                frame.height = height;
+                if crop_x == 0 && crop_y == 0 {
+                    (
+                        surface.pixels.clone(),
+                        width,
+                        height,
+                        surface.stride_pixels,
+                        frame,
+                        surface.last_damage,
+                    )
+                } else {
+                    let mut pixels = Vec::new();
+                    if pixels.try_reserve_exact(width * height).is_err() {
+                        continue;
+                    }
+                    for row in crop_y..surface.height {
+                        let start = row * surface.stride_pixels + crop_x;
+                        pixels.extend_from_slice(&surface.pixels[start..start + width]);
+                    }
+                    (
+                        Arc::new(pixels),
+                        width,
+                        height,
+                        width,
+                        frame,
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            width,
+                            height,
+                        },
+                    )
+                }
+            } else {
+                (
+                    surface.pixels.clone(),
+                    surface.width,
+                    surface.height,
+                    surface.stride_pixels,
+                    surface.frame,
+                    surface.last_damage,
+                )
+            };
             snapshots.push(WaylandWindowSnapshot {
                 surface_id: surface.surface_id,
                 title: surface.title.clone(),
-                frame: surface.frame,
+                frame,
                 minimized: surface.minimized,
+                server_decoration: surface.decoration_server,
+                drag_icon: surface.drag_icon_active,
                 content_version: surface.content_version,
-                damage: surface.last_damage,
-                pixels: surface.pixels.clone(),
-                width: surface.width,
-                height: surface.height,
-                stride_pixels: surface.stride_pixels,
+                damage,
+                pixels,
+                width,
+                height,
+                stride_pixels,
             });
         }
         snapshots
@@ -231,6 +325,7 @@ impl WaylandState {
             };
             for buffer in releases {
                 released = released.saturating_add(1);
+                super::dmabuf::note_release(&buffer);
                 buffer.release();
             }
         }
@@ -475,7 +570,11 @@ impl WaylandState {
         }
     }
 
-    pub(super) fn sync_surface_output(&mut self, surface: &Arc<Mutex<WaylandSurfaceState>>, mapped: bool) {
+    pub(super) fn sync_surface_output(
+        &mut self,
+        surface: &Arc<Mutex<WaylandSurfaceState>>,
+        mapped: bool,
+    ) {
         self.prune_output_resources();
 
         let (resource, client_id, on_output) = {
@@ -523,7 +622,7 @@ impl WaylandState {
     }
 
     pub(super) fn send_toplevel_configure(&mut self, surface: &Arc<Mutex<WaylandSurfaceState>>) {
-        let (xdg_surface, toplevel, width, height) = {
+        let (xdg_surface, toplevel, decoration, decoration_server, width, height) = {
             let Ok(state) = surface.lock() else {
                 return;
             };
@@ -536,18 +635,36 @@ impl WaylandState {
             (
                 xdg_surface,
                 toplevel,
+                state.decoration.clone(),
+                if state.decoration.is_some() {
+                    state.decoration_requested_server
+                } else {
+                    state.decoration_ack_server
+                },
                 i32::try_from(state.frame.width).unwrap_or(0),
                 i32::try_from(state.frame.height).unwrap_or(0),
             )
         };
 
         toplevel.configure(width, height, Vec::<u8>::new());
+        if let Some(decoration) = decoration {
+            decoration.configure(if decoration_server {
+                zxdg_toplevel_decoration_v1::Mode::ServerSide
+            } else {
+                zxdg_toplevel_decoration_v1::Mode::ClientSide
+            });
+        }
         let serial = self.next_configure_serial();
         xdg_surface.configure(serial);
 
         if let Ok(mut state) = surface.lock() {
+            state
+                .decoration_configures
+                .push((serial, decoration_server));
+            if state.decoration_configures.len() > MAX_WAYLAND_OUTSTANDING_CONFIGURES {
+                state.decoration_configures.remove(0);
+            }
             state.configured_serial = serial;
-            state.acknowledged_serial = 0;
             if state.outstanding_configures.len() >= MAX_WAYLAND_OUTSTANDING_CONFIGURES {
                 state.outstanding_configures.remove(0);
             }

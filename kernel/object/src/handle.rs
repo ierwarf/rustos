@@ -4,6 +4,7 @@ use crate::identity::{ObjectIdentity, ObjectKind, ObjectOwner};
 pub enum HandleOwner {
     /// Generational job tokens have a separate namespace from PS console ids.
     Job,
+    DeviceBuffer,
     Io,
     Compat,
     Ps,
@@ -52,7 +53,7 @@ impl HandleToken {
             HandleOwner::Io => ObjectOwner::Io,
             HandleOwner::Compat => ObjectOwner::ServiceProxy,
             HandleOwner::Ps => ObjectOwner::Ps,
-            HandleOwner::Job => return None,
+            HandleOwner::Job | HandleOwner::DeviceBuffer => return None,
         };
         let Some(identity) =
             ObjectIdentity::new(object_owner, ObjectKind::OpenDescription, object_id, 1)
@@ -260,6 +261,7 @@ pub enum HandleRights {
     Epoll,
     Memfd(FileHandleRights),
     DisplaySurface(SharedRegionRights),
+    DeviceBuffer(SharedRegionRights),
     Job(JobHandleRights),
 }
 
@@ -275,7 +277,8 @@ impl HandleRights {
             (Self::Device(parent), Self::Device(child)) => child.is_subset_of(parent),
             (Self::Socket(parent), Self::Socket(child)) => child.is_subset_of(parent),
             (Self::Job(parent), Self::Job(child)) => child.is_subset_of(parent),
-            (Self::DisplaySurface(parent), Self::DisplaySurface(child)) => {
+            (Self::DisplaySurface(parent), Self::DisplaySurface(child))
+            | (Self::DeviceBuffer(parent), Self::DeviceBuffer(child)) => {
                 child.is_subset_of(parent)
             }
             (Self::Console, Self::Console) | (Self::Epoll, Self::Epoll) => true,
@@ -288,7 +291,7 @@ impl HandleRights {
             Self::File(rights) | Self::Memfd(rights) => rights.contains(FileHandleRights::TRANSFER),
             Self::Socket(rights) => rights.contains(SocketHandleRights::TRANSFER),
             Self::Device(rights) => rights.contains(DeviceHandleRights::TRANSFER),
-            Self::DisplaySurface(rights) => rights.contains(SharedRegionRights::TRANSFER),
+            Self::DisplaySurface(rights) | Self::DeviceBuffer(rights) => rights.contains(SharedRegionRights::TRANSFER),
             Self::Job(rights) => rights.contains(JobHandleRights::TRANSFER),
             Self::Console | Self::Epoll => false,
         }
@@ -296,7 +299,7 @@ impl HandleRights {
 
     pub const fn allows_shared_map(self) -> bool {
         match self {
-            Self::DisplaySurface(rights) => rights.contains(SharedRegionRights::MAP),
+            Self::DisplaySurface(rights) | Self::DeviceBuffer(rights) => rights.contains(SharedRegionRights::MAP),
             Self::Device(rights) => rights.contains(DeviceHandleRights::MAP),
             _ => false,
         }
@@ -306,7 +309,7 @@ impl HandleRights {
         match self {
             Self::File(rights) | Self::Memfd(rights) => rights.contains(FileHandleRights::READ),
             Self::Device(rights) => rights.contains(DeviceHandleRights::READ),
-            Self::DisplaySurface(rights) => rights.contains(SharedRegionRights::READ),
+            Self::DisplaySurface(rights) | Self::DeviceBuffer(rights) => rights.contains(SharedRegionRights::READ),
             _ => false,
         }
     }
@@ -315,7 +318,7 @@ impl HandleRights {
         match self {
             Self::File(rights) | Self::Memfd(rights) => rights.contains(FileHandleRights::WRITE),
             Self::Device(rights) => rights.contains(DeviceHandleRights::WRITE),
-            Self::DisplaySurface(rights) => rights.contains(SharedRegionRights::WRITE),
+            Self::DisplaySurface(rights) | Self::DeviceBuffer(rights) => rights.contains(SharedRegionRights::WRITE),
             _ => false,
         }
     }

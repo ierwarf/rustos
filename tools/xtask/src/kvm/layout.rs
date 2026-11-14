@@ -61,6 +61,10 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         || options.ipcbench_probe.is_some()
         || options.oom_hog
         || options.proc_stress
+        || options.local_fd_probe
+        || options.library_map_probe
+        || options.app_dmabuf_probe
+        || options.mmap_cost_probe
         || options.release_stage_probe;
     let runtime_disk = if needs_private_contracts {
         let runtime_disk = run_dir.join("rustos-kvm.img");
@@ -91,7 +95,11 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
             options.ipcbench_probe.as_deref(),
             options.oom_hog,
             options.proc_stress,
+            options.local_fd_probe,
+            options.library_map_probe.then(|| library_probe_contract(options.library_reclaim_probe)),
             options.release_stage_probe,
+            options.app_dmabuf_probe,
+            options.mmap_cost_probe.then_some(options.mmap_cost_sizes_mib.as_slice()),
         )?;
     }
     // Any physical VFIO device makes QEMU map every file-backed guest memory
@@ -122,6 +130,16 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
     {
         let path = directory.path().join("dvm-display.pmem");
         create_gui_dvm_surfaces(&path)?;
+        Some(path)
+    } else {
+        None
+    };
+    let gui_dvm_app_buffers = if let Some(directory) = display_backing_dir
+        .as_ref()
+        .filter(|_| options.gui_dvm_surfaces)
+    {
+        let path = directory.path().join("dvm-app-buffers.pmem");
+        create_dvm_app_buffer_aperture(&path)?;
         Some(path)
     } else {
         None
@@ -212,6 +230,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         _display_backing_dir: display_backing_dir,
         gui_dvm_surfaces,
         gui_dvm_pixels,
+        gui_dvm_app_buffers,
         dvm_display_doorbell,
         dvm_network_shmem,
         dvm_block_aperture,
@@ -313,6 +332,20 @@ fn create_dvm_network_shmem(path: &Path) -> Result<()> {
 }
 
 include!("layout/block_transport.rs");
+
+/// Reset only after both guests have exited; truncation clears predecessor bytes.
+fn create_dvm_app_buffer_aperture(path: &Path) -> Result<()> {
+    if path.to_string_lossy().contains(',') {
+        bail!("KVM app-buffer path contains a QEMU option separator: {}", path.display());
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true).truncate(true).read(true).write(true).open(path)
+        .with_context(|| format!("create DVM app-buffer aperture {}", path.display()))?;
+    file.set_len(DVM_APP_BUFFER_REGION_BYTES)?;
+    file.sync_all()?;
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
 
 /// Allocate the production GUI-DVM three-surface pool for the KVM topology.
 /// The L0 runner creates every slot and control record before either guest
@@ -606,7 +639,11 @@ fn write_private_kvm_contracts(
     ipcbench_probe: Option<&str>,
     oom_hog: bool,
     proc_stress: bool,
+    local_fd_probe: bool,
+    library_map_probe: Option<&[u8]>,
     release_stage_probe: bool,
+    app_dmabuf_probe: bool,
+    mmap_cost_sizes_mib: Option<&[u64]>,
 ) -> Result<()> {
     let disk = std::fs::OpenOptions::new()
         .read(true)
@@ -655,6 +692,40 @@ fn write_private_kvm_contracts(
                 .context("create private KVM process-stress contract file")?;
             contract.truncate()?;
             FatWrite::write_all(&mut contract, b"contract=rustos-procstress-v1\n")?;
+            FatWrite::flush(&mut contract)?;
+        }
+        if local_fd_probe {
+            let mut contract = root
+                .create_file(PRIVATE_LOCAL_FD_PROBE_CONTRACT_PATH)
+                .context("create private KVM local fd probe contract file")?;
+            contract.truncate()?;
+            FatWrite::write_all(&mut contract, LOCAL_FD_PROBE_CONTRACT_BODY)?;
+            FatWrite::flush(&mut contract)?;
+        }
+        if let Some(body) = library_map_probe {
+            let mut contract = root
+                .create_file(PRIVATE_LIBRARY_MAP_PROBE_CONTRACT_PATH)
+                .context("create private KVM library map probe contract file")?;
+            contract.truncate()?;
+            FatWrite::write_all(&mut contract, body)?;
+            FatWrite::flush(&mut contract)?;
+        }
+        if let Some(sizes) = mmap_cost_sizes_mib {
+            // Data first, so a full volume fails here and not in the guest.
+            let body = write_mmap_cost_probe_files(&root, sizes)?;
+            let mut contract = root
+                .create_file(PRIVATE_LIBRARY_MAP_PROBE_CONTRACT_PATH)
+                .context("create private KVM mmap-cost probe contract file")?;
+            contract.truncate()?;
+            FatWrite::write_all(&mut contract, body.as_bytes())?;
+            FatWrite::flush(&mut contract)?;
+        }
+        if app_dmabuf_probe {
+            let mut contract = root
+                .create_file(PRIVATE_APP_DMABUF_PROBE_CONTRACT_PATH)
+                .context("create private KVM app DMA-BUF probe contract file")?;
+            contract.truncate()?;
+            FatWrite::write_all(&mut contract, APP_DMABUF_PROBE_CONTRACT_BODY)?;
             FatWrite::flush(&mut contract)?;
         }
         if release_stage_probe {

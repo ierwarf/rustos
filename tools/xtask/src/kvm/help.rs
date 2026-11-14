@@ -41,6 +41,32 @@ options:
   --proc-stress        arm the `procstress` session program (fork, copy-on-write,
                        mmap/mprotect/munmap churn from many threads) and wait for
                        it to finish; used to reproduce scheduler and TLB panics
+  --local-fd-probe     arm the `localfdprobe` session program: kernel-local pipe/pipe2
+                       and eventfd/eventfd2 semantics (EOF, EPIPE/SIGPIPE, atomic and
+                       partial writes, blocking wakeups, dup/fork/exec, poll/epoll);
+                       fails fast on `localfd: FAIL`, requires `localfd: PASS`
+                       (implies --gui-dvm-surfaces)
+  --library-map-probe  arm the `libmapprobe` session program: two processes map a
+                       pagerd-warmed library, share its physical frames, isolate a
+                       private write, and release on exit; needs the storage-backed
+                       graphical session (implies --gui-dvm-surfaces)
+  --library-reclaim-probe
+                       with plain --oom-hog: the probe holds a live alias mapping
+                       while pagerd reclaims library objects under pressure
+                       (`pagerd: library cache reclaimed`); the mapping must keep
+                       its bytes and frames (`library-map-probe: reclaim-survived`)
+  --mmap-cost-probe    measure (not change) the current cost of mapping a large
+                       non-warmed file MAP_PRIVATE: writes deterministic files
+                       (default 4,16,64,128 MiB, `--mmap-cost-sizes-mib A,B,..`)
+                       onto the per-run boot volume and arms `libmapprobe`
+                       `mode=mmapcost`; prints a table and `mmap-cost-probe:`
+                       lines (mmap/sparse/full touch, fork, free pages; implies
+                       --gui-dvm-surfaces)
+  --app-dmabuf-probe   boot with the app DMA-BUF aperture and arm `apps/wayclick` to
+                       allocate an app DMA-BUF through devmgrd and the DVM exporter,
+                       present it through zwp_linux_dmabuf_v1, prove a forged fd is
+                       refused, and require export/import/release/revoke/scrub
+                       markers in order (implies --gui-dvm-surfaces)
   --release-stage-probe
                        put a signed release bundle on the volume and require
                        initd -> loaderd -> rootd to verify and stage it; build

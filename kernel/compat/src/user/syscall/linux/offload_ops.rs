@@ -8,11 +8,74 @@ use rustos_user_abi::syscall::{
     LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, LIFECYCLE_EVENT_FORK,
     LIFECYCLE_EVENT_THREAD_EXIT, LIFECYCLE_EVENT_THREAD_EXIT_LOST, LifecycleDrainBrokerArgs,
     LifecycleEventWire,
-    VFS_IPC_OP_PREAD64, VFS_IPC_PAYLOAD_CAPACITY,
+    VFS_IPC_OP_FILE_IDENTITY, VFS_IPC_OP_PREAD64, VFS_IPC_PAYLOAD_CAPACITY, VfsFileIdentityWire,
 };
 
+/// Asks vfsd which backing file one open description names. The reply is the
+/// only identity authority for a library binding; it is decoded from exactly
+/// one `VfsFileIdentityWire` payload and rejected when malformed.
+/// Asks vfsd which file `remote_id` names, on behalf of its owning process.
+///
+/// The mapping broker runs in syscalld's context, so the ambient request
+/// identity (pid and tid, which vfsd checks against the IPC sender) is
+/// syscalld's, while vfsd attributes the open description to the client that
+/// opened it and answers ESTALE for any other pid. The thread identity stays
+/// the sender's; only the pid names the client. vfsd accepts this split only for
+/// this read-only operation and only from the live syscalld owner.
+pub(crate) fn call_remote_vfs_file_identity(
+    remote_id: u64,
+    client_pid: u64,
+) -> Result<VfsFileIdentityWire, i64> {
+    let mut request = new_vfs_request(VFS_IPC_OP_FILE_IDENTITY);
+    request.remote_id = remote_id;
+    request.pid = client_pid;
+    let response = call_vfs_ipc_request(&request)?;
+    ensure_vfs_status(&response)?;
+    decode_file_identity(&response.payload[..], response.payload_len as usize)
+}
+
+fn decode_file_identity(payload: &[u8], len: usize) -> Result<VfsFileIdentityWire, i64> {
+    let bytes = payload.get(..len).ok_or(LINUX_EINVAL)?;
+    let wire = VfsFileIdentityWire::from_bytes(bytes).ok_or(LINUX_EINVAL)?;
+    if !wire.is_canonical() {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(wire)
+}
+
+#[cfg(test)]
+mod file_identity_tests {
+    use super::*;
+
+    fn bytes(wire: VfsFileIdentityWire) -> [u8; 56] {
+        wire.to_bytes()
+    }
+    fn good() -> VfsFileIdentityWire {
+        VfsFileIdentityWire { volume: 1, object: 2, generation: 3, storage_epoch: 4, mount_generation: 5, len: 6, flags: 1 }
+    }
+
+    #[test]
+    fn identity_reply_must_be_exactly_one_canonical_wire() {
+        let payload = bytes(good());
+        assert_eq!(decode_file_identity(&payload, 56), Ok(good()));
+        assert_eq!(decode_file_identity(&payload, 55), Err(LINUX_EINVAL));
+        assert_eq!(decode_file_identity(&payload, 57), Err(LINUX_EINVAL));
+        assert_eq!(decode_file_identity(&payload[..40], 56), Err(LINUX_EINVAL));
+        let zero_len = bytes(VfsFileIdentityWire { len: 0, ..good() });
+        assert_eq!(decode_file_identity(&zero_len, 56), Err(LINUX_EINVAL));
+        let unknown_flag = bytes(VfsFileIdentityWire { flags: 1 << 9, ..good() });
+        assert_eq!(decode_file_identity(&unknown_flag, 56), Err(LINUX_EINVAL));
+    }
+}
+
+/// Reads `len` bytes of `remote_id` at `offset` on behalf of `client_pid`, the
+/// process that owns the open description. The mapping broker runs in
+/// syscalld's context, so without naming the client vfsd answers ESTALE (the
+/// description is funded to the client, not to syscalld); see
+/// `call_remote_vfs_file_identity` for the identity split.
 pub(crate) fn call_remote_vfs_read_bytes(
     remote_id: u64,
+    client_pid: u64,
     offset: u64,
     len: usize,
 ) -> Result<Vec<u8>, i64> {
@@ -21,6 +84,7 @@ pub(crate) fn call_remote_vfs_read_bytes(
         let chunk_len = (len - bytes.len()).min(VFS_IPC_PAYLOAD_CAPACITY);
         let mut request = new_vfs_request(VFS_IPC_OP_PREAD64);
         request.remote_id = remote_id;
+        request.pid = client_pid;
         request.arg0 = offset.saturating_add(bytes.len() as u64);
         request.arg1 = chunk_len as u64;
         let response = call_vfs_ipc_request(&request).inspect_err(|errno| {

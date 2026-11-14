@@ -118,3 +118,8 @@ fn closing_cannot_be_undone_by_metadata_republication() {
     assert!(pin_view(slot, 92006, view).is_none());
     drop(take_storage(slot));
 }
+
+#[test]
+fn per_slot_resource_cells_cover_the_whole_task_table() {
+    assert_eq!(RESOURCES.len(), super::MAX_TASK);
+}

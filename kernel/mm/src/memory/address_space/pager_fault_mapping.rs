@@ -195,9 +195,11 @@ pub fn map_current_prepared_pager_fault_frame_at(
     if !phys::root_admits(root_phys, 1) {
         return Err(AddressSpaceError::OutOfFrames);
     }
-    if !phys::claim_data_leaf(root_phys, virtual_address, frame_phys) {
-        return Err(AddressSpaceError::InvalidFrameOwnership);
-    }
+    data_claim_result(phys::claim_data_leaf(
+        root_phys,
+        virtual_address,
+        frame_phys,
+    ))?;
     let desired = frame_phys | page_flags.bits();
     // ORDERING: success releases descriptor-admitted frame contents before the
     // present leaf; failure acquires any leaf published by a competing fault.
@@ -337,10 +339,10 @@ fn resolve_cow_write_under_mutation(
         return Ok(CowWriteResult::PromotedInPlace);
     }
 
-    if !phys::claim_data_leaf(root_phys, virtual_address, new_frame_phys) {
+    if let Err(error) = data_claim_result(phys::claim_cow_replacement(&claim, new_frame_phys)) {
         phys::cancel_cow_mapping(claim);
         drop(mutation);
-        return Err(AddressSpaceError::InvalidFrameOwnership);
+        return Err(error);
     }
     // SAFETY: both identities name descriptor-admitted, direct-mapped 4 KiB
     // frames. The destination is unpublished and the shared source is locked
@@ -382,14 +384,14 @@ fn resolve_cow_write_under_mutation(
         Ok(replaced) => replaced,
         Err(err) => {
             phys::cancel_cow_mapping(claim);
-            phys::cancel_data_leaf(root_phys, virtual_address, new_frame_phys);
+            phys::cancel_cow_replacement(&claim, new_frame_phys);
             drop(mutation);
             return Err(err);
         }
     };
     if !replaced {
         phys::cancel_cow_mapping(claim);
-        phys::cancel_data_leaf(root_phys, virtual_address, new_frame_phys);
+        phys::cancel_cow_replacement(&claim, new_frame_phys);
         drop(mutation);
         return Ok(CowWriteResult::Retry);
     }
@@ -571,14 +573,12 @@ impl ProcessAddressSpace {
         if !phys::root_admits(root_phys, 1) {
             return Err(AddressSpaceError::OutOfFrames);
         }
-        if !phys::claim_private_file_data_leaf(
+        data_claim_result(phys::claim_private_file_data_leaf(
             root_phys,
             virtual_address,
             frame_phys,
             backing_identity,
-        ) {
-            return Err(AddressSpaceError::InvalidFrameOwnership);
-        }
+        ))?;
         let mutation = begin_address_space_mutation(root);
         let installed = (|| {
             let pdpt_phys = ensure_next_table(root_phys, root, p4_index(start))?;
@@ -600,6 +600,35 @@ impl ProcessAddressSpace {
         phys::publish_private_file_data_leaf(root_phys, virtual_address, frame_phys);
         drop(mutation);
         Ok(())
+    }
+
+    /// The typed source borrow retains descriptor custody through publication;
+    /// afterwards the exact leaf independently retains its frame.
+    pub fn map_cached_private_file_cow_at(
+        &mut self,
+        start: VirtAddr,
+        flags: PageTableFlags,
+        source: &crate::memory::frame_source::FrameSourcePin,
+    ) -> Result<(), AddressSpaceError> {
+        use crate::memory::frame_capability::{FRAME_RIGHT_EXECUTE, FRAME_RIGHT_READ};
+        let flags = normalize_user_page_flags(flags)?;
+        // Private write permission never authorizes writing the source. The
+        // initial PTE stays read-only/COW; a later write allocates an owned page.
+        let mut needed = FRAME_RIGHT_READ;
+        if !flags.contains(PageTableFlags::NO_EXECUTE) {
+            needed |= FRAME_RIGHT_EXECUTE;
+        }
+        if !source.permits(needed) {
+            return Err(AddressSpaceError::ProtectionViolation);
+        }
+        self.map_private_file_cow_alias_at(
+            start,
+            0,
+            0,
+            source.frame_phys(),
+            flags,
+            source.backing_identity(),
+        )
     }
 
     /// Adds another exact private-file/section mapping of a shared cache frame.
@@ -765,9 +794,11 @@ impl ProcessAddressSpace {
         if !phys::root_admits(root_phys, 1) {
             return Err(AddressSpaceError::OutOfFrames);
         }
-        if !phys::claim_data_leaf(root_phys, virtual_address, frame_phys) {
-            return Err(AddressSpaceError::InvalidFrameOwnership);
-        }
+        data_claim_result(phys::claim_data_leaf(
+            root_phys,
+            virtual_address,
+            frame_phys,
+        ))?;
 
         let mutation = begin_address_space_mutation(root);
         let tables = (|| {
@@ -941,6 +972,9 @@ impl ProcessAddressSpace {
     ) -> Result<usize, AddressSpaceError> {
         validate_user_page_range(start, page_count)?;
         let range_end = pager_fault_range_end(start, page_count)?;
+        let (external_segments, remaining_immutable) =
+            self.immutable_unmap_plan(start.as_u64(), range_end, external_segments)?;
+        let external_segments = external_segments.as_slice();
         validate_external_user_segments(external_segments)?;
         let leaves = scan_present_user_leaves_in_range(
             self.root_phys(),
@@ -962,7 +996,9 @@ impl ProcessAddressSpace {
                 )
             },
         )?;
-        self.unmap_preflighted_user_leaves(leaves, external_segments)
+        let unmapped = self.unmap_preflighted_user_leaves(leaves, external_segments)?;
+        self.immutable = remaining_immutable;
+        Ok(unmapped)
     }
 
     fn unmap_preflighted_user_leaves(
@@ -1160,7 +1196,13 @@ fn validate_user_unmap_leaf(
 ) -> Result<(), AddressSpaceError> {
     if leaf.physical_address == 0
         || !leaf.physical_address.is_multiple_of(PAGE_4KIB_U64)
-        || !flags.contains(PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE)
+        || !flags.contains(PageTableFlags::PRESENT)
+        || if flags.contains(USER_INACCESSIBLE_LEAF) {
+            flags.intersects(PageTableFlags::USER_ACCESSIBLE | PageTableFlags::WRITABLE)
+                || !flags.contains(PageTableFlags::NO_EXECUTE)
+        } else {
+            !flags.contains(PageTableFlags::USER_ACCESSIBLE)
+        }
     {
         return Err(AddressSpaceError::InvalidFrameOwnership);
     }
@@ -1315,7 +1357,7 @@ fn with_prepared_user_leaf_atomic<R>(
 }
 
 /// Calls `f` with an existing 4 KiB user leaf entry.
-fn with_prepared_user_leaf_mut<R>(
+pub(super) fn with_prepared_user_leaf_mut<R>(
     pml4_phys: PhysAddr,
     virt: VirtAddr,
     f: impl FnOnce(&mut PageTableEntry) -> Result<R, AddressSpaceError>,

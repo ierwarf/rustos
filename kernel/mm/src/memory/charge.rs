@@ -9,13 +9,11 @@
 //! - **Lifecycle:** groups are created with the job that owns them and stay
 //!   valid after it dies until their usage drains to zero, which the job layer
 //!   waits for before reusing the slot.
-//! - **Concurrency:** lock-free. Usage and limits are relaxed atomics: admission
-//!   is advisory, charging is exact. A page is charged at publication, so
-//!   admission may overshoot a limit by the pages in flight at that instant,
-//!   at most one per CPU; it never lets usage drift from the ledger counts.
+//! - **Concurrency:** lock-free. Claims reserve usage before publication and
+//!   cancellation refunds it. The hierarchy is charged speculatively with
+//!   rollback on refusal; usage includes in-flight claims.
 //! - **Failure:** admission false refuses the allocation like a watermark
-//!   denial. Charging a published page never refuses it; counter overflow is
-//!   a fatal invariant rather than a wrapped, unaccounted charge.
+//!   denial. Overflow refuses speculative charges.
 //! - **Forbidden:** allocating, taking a lock, or sleeping; charging a root that
 //!   is not bound; unbinding a root that still owns data leaves.
 //! - **Evidence:** `memory-charge-conservation`, ledger unit tests.
@@ -157,6 +155,45 @@ pub fn would_admit(index: usize, pages: u64) -> bool {
     })
 }
 
+/// Atomically reserve pages on the whole hierarchy, rolling back on refusal.
+pub fn try_charge(index: usize, pages: u64) -> bool {
+    if pages == 0 {
+        return true;
+    }
+    let mut visited: [Option<&'static Group>; MAX_DEPTH] = [None; MAX_DEPTH];
+    let mut count = 0;
+    let mut cursor = index;
+    for _ in 0..MAX_DEPTH {
+        let Some(cell) = group(cursor) else {
+            return true;
+        };
+        let charged = cell
+            .usage
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |usage| {
+                let total = usage.checked_add(pages)?;
+                (total <= cell.limit.load(Ordering::Relaxed)).then_some(total)
+            });
+        let Ok(old) = charged else {
+            for cell in visited[..count].iter().flatten() {
+                cell.usage.fetch_sub(pages, Ordering::Relaxed);
+            }
+            return false;
+        };
+        let high = cell.high.load(Ordering::Relaxed);
+        if high != UNLIMITED && old <= high && old.saturating_add(pages) > high {
+            cell.high_events.fetch_add(1, Ordering::Relaxed);
+        }
+        visited[count] = Some(cell);
+        count += 1;
+        let parent = cell.parent.load(Ordering::Relaxed);
+        if parent == NO_PARENT {
+            return true;
+        }
+        cursor = parent as usize;
+    }
+    true
+}
+
 /// Charges `pages` to the group and every ancestor.
 pub fn charge(index: usize, pages: u64) {
     walk(index, |cell| {
@@ -180,9 +217,11 @@ pub fn uncharge(index: usize, pages: u64) {
         // Checked update: an over-return leaves the counter untouched rather
         // than wrapped, so a caller that survives the panic (host tests, a
         // contained fault) never sees a huge usage that blocks admission.
-        let updated = cell.usage.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |usage| {
-            usage.checked_sub(pages)
-        });
+        let updated = cell
+            .usage
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |usage| {
+                usage.checked_sub(pages)
+            });
         assert!(updated.is_ok(), "charge group usage underflow");
         true
     });
@@ -247,7 +286,11 @@ mod tests {
         charge(46, 3);
         init_group(46, None);
         assert_eq!(limit(46), UNLIMITED);
-        assert_eq!(usage(46), 3, "pages of the previous tenant still count until freed");
+        assert_eq!(
+            usage(46),
+            3,
+            "pages of the previous tenant still count until freed"
+        );
         uncharge(46, 3);
     }
 
@@ -285,37 +328,69 @@ mod admission_wiring_tests {
     #[test]
     fn every_root_claiming_site_asks_admission_before_it_claims_or_allocates() {
         let mapping = include_str!("address_space/pager_fault_mapping.rs");
+        // Formatting is not admission authority. Preserve exact arguments but
+        // ignore line wrapping and an optional trailing call comma.
+        let compact: alloc::string::String =
+            mapping.chars().filter(|c| !c.is_whitespace()).collect();
+        let mapping = compact.replace(",)", ")");
         for (claim, what) in [
-            ("phys::claim_data_leaf(root_phys, virtual_address, frame_phys) {\n        return Err(AddressSpaceError::InvalidFrameOwnership);\n    }\n    let desired", "current-root first touch"),
+            (
+                "phys::claim_data_leaf(root_phys,virtual_address,frame_phys)",
+                "current-root first touch",
+            ),
             ("phys::claim_private_file_data_leaf(", "private file"),
         ] {
-            let at = mapping.find(claim).unwrap_or_else(|| panic!("{what} claim moved"));
-            let admit = mapping[..at].rfind("phys::root_admits(root_phys, 1)")
+            let at = mapping
+                .find(claim)
+                .unwrap_or_else(|| panic!("{what} claim moved"));
+            let admit = mapping[..at]
+                .rfind("phys::root_admits(root_phys,1)")
                 .unwrap_or_else(|| panic!("{what} has no admission before its claim"));
-            assert!(at - admit < 400, "{what}: admission must sit right before the claim");
+            assert!(
+                at - admit < 400,
+                "{what}: admission must sit right before the claim"
+            );
         }
-        let other = mapping.split_once("pub fn map_prepared_pager_fault_frame_at(").unwrap().1;
+        let other = mapping
+            .split_once("pubfnmap_prepared_pager_fault_frame_at(")
+            .unwrap()
+            .1;
         // The VMA extent is checked before anything is admitted or claimed, so
         // an out-of-extent request can neither charge nor leak a frame claim.
         assert!(
             other.find("extent.end().as_u64()").unwrap()
-                < other.find("phys::root_admits(root_phys, 1)").unwrap()
+                < other.find("phys::root_admits(root_phys,1)").unwrap()
         );
         assert!(
-            other.find("phys::root_admits(root_phys, 1)").unwrap()
-                < other.find("phys::claim_data_leaf(root_phys, virtual_address, frame_phys)").unwrap()
+            other.find("phys::root_admits(root_phys,1)").unwrap()
+                < other
+                    .find("phys::claim_data_leaf(root_phys,virtual_address,frame_phys)")
+                    .unwrap()
         );
         let eager = include_str!("address_space.rs");
-        let batch = eager.find("phys::alloc_frames_batch_user(&mut frame_buffer[..want])").unwrap();
-        let admit = eager[..batch].rfind("phys::root_admits(self.pml4_frame_phys, want as u64)").unwrap();
-        assert!(batch - admit < 400, "the batch is admitted before frames are drawn");
+        let batch = eager
+            .find("phys::alloc_frames_batch_user(&mut frame_buffer[..want])")
+            .unwrap();
+        let admit = eager[..batch]
+            .rfind("phys::root_admits(self.pml4_frame_phys, want as u64)")
+            .unwrap();
+        assert!(
+            batch - admit < 400,
+            "the batch is admitted before frames are drawn"
+        );
     }
 
     #[test]
     fn a_refusal_is_an_out_of_frames_error_so_callers_unwind_like_a_watermark_denial() {
         let mapping = include_str!("address_space/pager_fault_mapping.rs");
-        let sites: alloc::vec::Vec<_> = mapping.match_indices("if !phys::root_admits(root_phys, 1) {").collect();
-        assert_eq!(sites.len(), 3, "first touch, prepared frame and private file");
+        let sites: alloc::vec::Vec<_> = mapping
+            .match_indices("if !phys::root_admits(root_phys, 1) {")
+            .collect();
+        assert_eq!(
+            sites.len(),
+            3,
+            "first touch, prepared frame and private file"
+        );
         for (at, _) in sites {
             let body = &mapping[at..at + 140];
             assert!(
@@ -324,7 +399,59 @@ mod admission_wiring_tests {
             );
         }
         let eager = include_str!("address_space.rs");
-        let at = eager.find("phys::root_admits(self.pml4_frame_phys, want as u64)").unwrap();
+        let at = eager
+            .find("phys::root_admits(self.pml4_frame_phys, want as u64)")
+            .unwrap();
         assert!(eager[at..at + 200].contains("return Err(AddressSpaceError::OutOfFrames);"));
+    }
+}
+
+#[cfg(test)]
+mod reservation_concurrency_tests {
+    extern crate std;
+    use super::*;
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+
+    #[test]
+    fn concurrent_reservations_obey_shared_and_ancestor_limits_and_refund() {
+        for (parent, first, second) in [(25, 26, 27), (28, 29, 29)] {
+            init_group(parent, None);
+            init_group(first, Some(parent));
+            if second != first {
+                init_group(second, Some(parent));
+            }
+            set_limit(parent, 1);
+            let entered = Arc::new(Barrier::new(3));
+            let release = Arc::new(Barrier::new(3));
+            let mut tasks = std::vec::Vec::new();
+            for index in [first, second] {
+                let entered = entered.clone();
+                let release = release.clone();
+                tasks.push(thread::spawn(move || {
+                    let admitted = try_charge(index, 1);
+                    entered.wait();
+                    release.wait();
+                    if admitted {
+                        uncharge(index, 1);
+                    }
+                    admitted
+                }));
+            }
+            entered.wait();
+            assert_eq!(usage(parent), 1);
+            release.wait();
+            let winners = tasks
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .filter(|won| *won)
+                .count();
+            assert_eq!(winners, 1);
+            assert_eq!(usage(parent), 0);
+            assert_eq!(usage(first), 0);
+            assert_eq!(usage(second), 0);
+        }
     }
 }

@@ -110,7 +110,7 @@ impl RootPublication {
         &mut self,
         parent: Option<u64>,
         state: crate::user::process_state::UserProcessState,
-    ) -> Option<crate::multitask::process_table::ProcessHandle> {
+    ) -> Result<crate::multitask::process_table::ProcessHandle, crate::multitask::SpawnTaskError> {
         self.join.publish(parent, state)
     }
     pub(super) fn cancel(self) {

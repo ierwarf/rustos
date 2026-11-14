@@ -6,6 +6,7 @@ pub mod checkpoint_wire;
 pub mod lifecycle;
 pub mod linux_types;
 pub mod path;
+pub mod proc_fs;
 pub mod run_dirs;
 pub mod snapshot_budget;
 pub mod snapshot_sessions;
@@ -1597,5 +1598,86 @@ mod tests {
                 ),
             )
             .unwrap();
+    }
+}
+
+/// Library-cache identity of an early-system image file.
+///
+/// The image is authenticated before vfsd runs and never changes during a
+/// boot, so its epoch and mount generation are constants; the object is the
+/// first 8 bytes of SHA-256 over the exact image-relative path (never zero),
+/// which keeps two paths from aliasing. Content is still bound separately: the
+/// pager hashes every byte against its authenticated manifest before sealing.
+pub fn early_system_identity(
+    path: &str,
+    len: u64,
+) -> rustos_user_abi::syscall::VfsFileIdentityWire {
+    use sha2::{Digest, Sha256};
+    let relative = path.strip_prefix('/').unwrap_or(path);
+    let digest = Sha256::digest(relative.as_bytes());
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&digest[..8]);
+    rustos_user_abi::syscall::VfsFileIdentityWire {
+        volume: rustos_user_abi::syscall::VFS_EARLY_SYSTEM_VOLUME_ID,
+        object: u64::from_le_bytes(prefix).max(1),
+        generation: 1,
+        storage_epoch: 1,
+        mount_generation: 1,
+        len,
+        flags: rustos_user_abi::syscall::VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME,
+    }
+}
+
+#[cfg(test)]
+mod early_system_identity_tests {
+    use super::early_system_identity;
+
+    #[test]
+    fn identity_is_canonical_immutable_and_path_exact() {
+        let libc = early_system_identity("/lib/x86_64-linux-gnu/libc.so.6", 2_125_328);
+        assert!(libc.is_canonical() && libc.is_immutable());
+        assert_eq!(libc, early_system_identity("lib/x86_64-linux-gnu/libc.so.6", 2_125_328));
+        let other = early_system_identity("/lib/x86_64-linux-gnu/libm.so.6", 2_125_328);
+        assert_ne!(libc.object, other.object, "two paths never alias");
+        assert_ne!(libc, early_system_identity("/lib/x86_64-linux-gnu/libc.so.6", 2_125_329));
+        assert_eq!(libc.volume, rustos_user_abi::syscall::VFS_EARLY_SYSTEM_VOLUME_ID);
+    }
+}
+
+/// Shape check for a request the mapping broker sends on behalf of the client
+/// that owns the description: the operation is one of the two read-only ops
+/// the broker needs (`FILE_IDENTITY` attestation and the `PREAD64` of the eager
+/// file-mapping copy), the thread is the IPC sender's, and the named pid is some
+/// other (client) process. The sender's service identity is checked by the
+/// caller.
+pub fn client_proxy_shape(
+    op: u16,
+    request_pid: u64,
+    request_tid: u64,
+    sender_pid: u64,
+    sender_tid: u64,
+) -> bool {
+    matches!(
+        op,
+        rustos_user_abi::syscall::VFS_IPC_OP_FILE_IDENTITY
+            | rustos_user_abi::syscall::VFS_IPC_OP_PREAD64
+    ) && request_tid == sender_tid
+        && request_pid != 0
+        && request_pid != sender_pid
+}
+
+#[cfg(test)]
+mod file_identity_proxy_tests {
+    use super::client_proxy_shape as file_identity_proxy_shape;
+    use rustos_user_abi::syscall::{VFS_IPC_OP_FILE_IDENTITY, VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ};
+
+    #[test]
+    fn only_identity_and_pread_may_name_another_pid_and_never_another_thread() {
+        assert!(file_identity_proxy_shape(VFS_IPC_OP_FILE_IDENTITY, 80, 7, 5, 7));
+        assert!(file_identity_proxy_shape(VFS_IPC_OP_PREAD64, 80, 7, 5, 7));
+        assert!(!file_identity_proxy_shape(VFS_IPC_OP_READ, 80, 7, 5, 7));
+        assert!(!file_identity_proxy_shape(VFS_IPC_OP_FILE_IDENTITY, 80, 8, 5, 7));
+        assert!(!file_identity_proxy_shape(VFS_IPC_OP_FILE_IDENTITY, 0, 7, 5, 7));
+        assert!(!file_identity_proxy_shape(VFS_IPC_OP_FILE_IDENTITY, 5, 7, 5, 7), "equal pid is the ordinary path");
     }
 }

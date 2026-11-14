@@ -35,7 +35,8 @@ use kernel_object::api::identity::ObjectIdentity;
 const WAYS: usize = 4;
 const SETS: usize = MAX_TASK;
 const _: () = assert!(SETS.is_power_of_two());
-const _: () = assert!(MAX_TASK <= u8::MAX as usize);
+// A slot is stored in the low byte, so the highest slot index must be 255.
+const _: () = assert!(MAX_TASK <= u8::MAX as usize + 1);
 
 static HINTS: [AtomicU64; SETS * WAYS] = [const { AtomicU64::new(0) }; SETS * WAYS];
 
@@ -287,6 +288,19 @@ mod tests {
         assert_eq!(hint(task_id), Some(9));
         forget(task_id);
         assert_eq!(hint(task_id), None);
+    }
+
+    /// Every slot, including the last of the widest table, fits the hint word's
+    /// low byte, and the slot-indexed tables are sized from the same constant.
+    #[test]
+    fn the_highest_slot_round_trips_and_per_slot_tables_match_the_task_table() {
+        let _serial = serialized();
+        let task_id = 8_191;
+        forget(task_id);
+        record(task_id, MAX_TASK - 1);
+        assert_eq!(hint(task_id), Some(MAX_TASK - 1));
+        forget(task_id);
+        assert_eq!(HINTS.len(), MAX_TASK * WAYS);
     }
 
     /// The unlocked readers accept a hint only when the slot it names still

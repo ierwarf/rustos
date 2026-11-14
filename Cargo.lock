@@ -664,6 +664,7 @@ name = "kernel-compat"
 version = "0.1.0"
 dependencies = [
  "boot-random",
+ "driver-domain-protocol",
  "heapless",
  "kernel-hal",
  "kernel-io-manager",
@@ -789,6 +790,7 @@ name = "kernel-ps"
 version = "0.1.0"
 dependencies = [
  "boot-random",
+ "driver-domain-protocol",
  "kernel-hal",
  "kernel-ipc-runtime",
  "kernel-lowlevel",
@@ -982,8 +984,10 @@ checksum = "2f3fbf80edff265ba1c0b425b83d880b130196ab88a8642e650aa1b963266fcf"
 name = "pagerd"
 version = "0.1.0"
 dependencies = [
+ "rustos-library-cache-policy",
  "rustos-svc-runtime",
  "rustos-user-abi",
+ "sha2",
 ]
 
 [[package]]
@@ -1183,6 +1187,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustos-app-dmabuf"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustos-user-abi",
+]
+
+[[package]]
 name = "rustos-component-model"
 version = "0.1.0"
 
@@ -1220,6 +1232,16 @@ dependencies = [
 [[package]]
 name = "rustos-image-admission"
 version = "0.1.0"
+dependencies = [
+ "rustos-user-abi",
+]
+
+[[package]]
+name = "rustos-library-cache-policy"
+version = "0.1.0"
+dependencies = [
+ "rustos-user-abi",
+]
 
 [[package]]
 name = "rustos-observability"
@@ -1755,6 +1777,8 @@ name = "wayclick"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustos-app-dmabuf",
+ "rustos-user-abi",
  "wayland-client",
  "wayland-protocols",
 ]
@@ -2007,6 +2031,7 @@ dependencies = [
  "rustos-driver-domain-host",
  "rustos-fault-injection",
  "rustos-image-admission",
+ "rustos-library-cache-policy",
  "rustos-release-verifier",
  "rustos-user-abi",
  "serde",

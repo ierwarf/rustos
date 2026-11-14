@@ -28,6 +28,20 @@ VMA check, reached pagerd, matched nothing, and killed the thread. That defect
 is what the shared rule exists to prevent; for anonymous ranges the split now
 removes its *precondition* as well.
 
+### 3.0 Protection widening
+
+A range edit is attenuation-only for every *delegated* object: file, memfd,
+image-section and device regions can never regain rights their source did not
+delegate. A ring0-owned **private anonymous** object has no source, provider or
+delegated ceiling, so its protection is the process's own choice: `RW -> RX` for
+JIT code, `RX -> RW` for patching, and `PROT_NONE -> RW` for a reopened guard.
+A narrowing edit leaves its object identity alone; a widening edit moves `object.rights` to the new protection so the fragment stays canonical (W+X cannot be one rights value). W+X remains
+`Malformed` in the shared rule and `Denied` in ring0's rewrite, so no span is
+ever writable and executable. Fork-shared (COW-tagged) leaves keep their write bit
+cleared regardless, so widening cannot write a shared frame
+(`preserve_4k_leaf_pat`). Previously `RW -> R -> RW` and any `-> RX` on a
+demand-paged anonymous range failed with `EACCES`.
+
 ### 3.1 The one permitted asymmetry
 
 `mprotect(PROT_NONE)` is the only case where two replicas install different
@@ -284,6 +298,7 @@ diagnosis the machine's dominant cost.
 | replicas therefore agree | both of the above against one rule, plus `PagerRegionAgreement` |
 | split refuses instead of losing a region | `a_split_that_cannot_fit_refuses_and_keeps_the_region_whole`, `a_split_with_no_free_vma_slot_refuses_and_keeps_every_region` |
 | protect narrows only the edited span | `an_interior_protect_narrows_only_the_edited_span` |
+| owned anonymous RW<->RX/none reopen, never W+X; delegated objects stay attenuation-only | `an_owned_anonymous_protect_may_change_rights_but_never_to_write_execute`, `owned_anonymous_jit_may_flip_rw_to_rx_and_back_but_never_to_write_execute`, `a_delegated_file_object_stays_attenuation_only` |
 | sustained faults never drain the reserve | `a_reserve_replenished_at_each_completion_never_runs_dry` |
 | exhaustion is counted, not silent | `an_unreplenished_reserve_drains_after_exactly_its_size_and_says_so` |
 | a ring0 fault that cannot map returns its wired frame | `a_frame_taken_for_a_ring0_fault_and_not_mapped_returns_to_the_reserve` |

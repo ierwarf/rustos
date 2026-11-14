@@ -30,6 +30,7 @@ pub(super) const LINUX_ENOTSOCK: i64 = 88;
 pub(super) const LINUX_EMSGSIZE: i64 = 90;
 pub(super) const LINUX_EOPNOTSUPP: i64 = 95;
 pub(super) const LINUX_ETIMEDOUT: i64 = 110;
+pub(super) const LINUX_ECANCELED: i64 = 125;
 pub(super) const LINUX_ESTALE: i64 = 116;
 
 /// Diagnose each unsupported standard Linux syscall once, without copying user
@@ -70,6 +71,19 @@ pub(super) fn record_busy_linux_syscall(frame: &SyscallFrame) {
     }
 }
 
+/// Errno for a failed user-pointer validation or copy.
+///
+/// Linux reports every unusable user address as `EFAULT`, including a null or
+/// out-of-range pointer; `address_space_error_to_linux_errno` maps those to
+/// `EINVAL`, which is right for mapping requests (mmap/munmap) but not for a
+/// buffer argument. Use this for buffer pointers only.
+pub(super) fn user_pointer_error_to_linux_errno(err: paging::AddressSpaceError) -> i64 {
+    match err {
+        paging::AddressSpaceError::OutOfFrames => LINUX_ENOMEM,
+        _ => LINUX_EFAULT,
+    }
+}
+
 pub(super) fn address_space_error_to_linux_errno(err: paging::AddressSpaceError) -> i64 {
     match err {
         paging::AddressSpaceError::ProtectionViolation
@@ -82,5 +96,30 @@ pub(super) fn address_space_error_to_linux_errno(err: paging::AddressSpaceError)
         | paging::AddressSpaceError::AddressNotPageAligned
         | paging::AddressSpaceError::AlreadyMapped => LINUX_EINVAL,
         paging::AddressSpaceError::OutOfFrames => LINUX_ENOMEM,
+    }
+}
+
+#[cfg(test)]
+mod user_pointer_errno_tests {
+    use super::*;
+
+    #[test]
+    fn unusable_buffer_addresses_are_efault_but_mapping_requests_keep_einval() {
+        for err in [
+            paging::AddressSpaceError::AddressOutOfRange,
+            paging::AddressSpaceError::AddressOverflow,
+            paging::AddressSpaceError::NotMapped,
+            paging::AddressSpaceError::ProtectionViolation,
+        ] {
+            assert_eq!(user_pointer_error_to_linux_errno(err), LINUX_EFAULT);
+        }
+        assert_eq!(
+            user_pointer_error_to_linux_errno(paging::AddressSpaceError::OutOfFrames),
+            LINUX_ENOMEM
+        );
+        assert_eq!(
+            address_space_error_to_linux_errno(paging::AddressSpaceError::AddressOutOfRange),
+            LINUX_EINVAL
+        );
     }
 }

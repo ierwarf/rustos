@@ -258,10 +258,16 @@ pub const fn apply_region_edit(region: PagerVmRegionWire, edit: PagerRangeEdit) 
     if !edit.overlaps(region) {
         return PagerRegionEdit::Untouched(region);
     }
-    // Attenuation only. A replica may narrow the rights of a span it already
-    // owns; it may never hand back more than the region carried.
+    // Attenuation only for every delegated object. A replica may narrow the
+    // rights of a span it already owns; it may never hand back more than the
+    // region carried. The one exception is a ring0-owned private anonymous
+    // object: it has no source, provider or delegated rights to exceed, so its
+    // protection is the process's own choice (`RW -> RX` for JIT code, a guard
+    // reopened after `PROT_NONE`). W^X and unknown bits are still refused by
+    // the callers' canonical check, so this never admits a writable+executable
+    // span.
     if let Some(prot) = edit.replacement_prot {
-        if prot & !region.prot != 0 {
+        if prot & !region.prot != 0 && !is_owned_private_anonymous(region) {
             return PagerRegionEdit::Denied;
         }
     }
@@ -383,7 +389,21 @@ const fn reprotected(fragment: Option<PagerVmRegionWire>, prot: u32) -> Option<P
         return None;
     };
     fragment.prot = prot;
+    // A ring0-owned anonymous object carries no delegated ceiling. A narrowing
+    // edit leaves its object identity untouched; only a widening edit moves
+    // `object.rights` to the new protection (canonical regions require `prot`
+    // to stay within `object.rights`, and W+X cannot be one rights value).
+    if prot & !fragment.object.rights != 0 && is_owned_private_anonymous(fragment) {
+        fragment.object.rights = prot;
+    }
     Some(fragment)
+}
+
+/// True for a private anonymous object: ring0 owns it end to end and no
+/// provider rights bound what the process may later choose.
+const fn is_owned_private_anonymous(region: PagerVmRegionWire) -> bool {
+    region.object.object_type == super::VM_OBJECT_ANONYMOUS
+        && region.sharing == super::VM_SHARING_PRIVATE
 }
 
 /// Slots one `munmap` edit can add to a replica's table.
@@ -638,8 +658,10 @@ mod tests {
     }
 
     #[test]
-    fn a_protect_that_widens_rights_is_denied_before_any_fragment_exists() {
+    fn a_protect_that_widens_a_delegated_object_is_denied_before_any_fragment_exists() {
         let mut region = region(0x10_000, 0x18_000);
+        region.object.object_type = crate::pager::VM_OBJECT_FILE_PRIVATE;
+        region.object.backing_service = 2;
         region.prot = VM_PROT_READ;
         region.object.rights = VM_PROT_READ;
         assert_eq!(
@@ -649,6 +671,51 @@ mod tests {
             ),
             PagerRegionEdit::Denied
         );
+    }
+
+    /// JIT needs `RW -> RX`, and a guard reopened after `PROT_NONE` needs
+    /// `none -> RW`. Both are the process's own choice over memory ring0 owns;
+    /// the object rights follow so the fragment stays canonical, and W+X is
+    /// still malformed.
+    #[test]
+    fn an_owned_anonymous_protect_may_change_rights_but_never_to_write_execute() {
+        let region = region(0x10_000, 0x18_000);
+        let PagerRegionEdit::Replaced(code) = apply_region_edit(
+            region,
+            PagerRangeEdit::protect(0x10_000, 0x18_000, VM_PROT_READ | VM_PROT_EXECUTE),
+        ) else {
+            panic!("owned anonymous RW -> RX must be permitted");
+        };
+        assert_eq!(code.prot, VM_PROT_READ | VM_PROT_EXECUTE);
+        assert_eq!(code.object.rights, VM_PROT_READ | VM_PROT_EXECUTE);
+        assert!(code.is_canonical());
+        let PagerRegionEdit::Replaced(back) = apply_region_edit(
+            code,
+            PagerRangeEdit::protect(0x10_000, 0x18_000, VM_PROT_READ | VM_PROT_WRITE),
+        ) else {
+            panic!("owned anonymous RX -> RW must be permitted");
+        };
+        assert!(back.is_canonical());
+        assert_eq!(
+            apply_region_edit(
+                region,
+                PagerRangeEdit::protect(0x10_000, 0x18_000, VM_PROT_WRITE | VM_PROT_EXECUTE)
+            ),
+            PagerRegionEdit::Malformed
+        );
+        // A deny-all span keeps its identity and reopens to any single class.
+        let PagerRegionEdit::Replaced(none) =
+            apply_region_edit(region, PagerRangeEdit::protect(0x10_000, 0x18_000, 0))
+        else {
+            panic!("owned anonymous protect to none");
+        };
+        let PagerRegionEdit::Replaced(reopened) = apply_region_edit(
+            none,
+            PagerRangeEdit::protect(0x10_000, 0x18_000, VM_PROT_READ | VM_PROT_EXECUTE),
+        ) else {
+            panic!("owned anonymous none -> RX");
+        };
+        assert!(reopened.is_canonical());
     }
 
     #[test]

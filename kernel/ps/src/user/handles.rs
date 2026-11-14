@@ -1,7 +1,9 @@
 use crate::io::device::DeviceHandle;
 use crate::user::epoll::EpollHandle;
+use crate::user::eventfd::EventFdHandle;
 use crate::user::linux as linux_abi;
 use crate::user::memfd::MemfdHandle;
+use crate::user::pipe::PipeHandle;
 use crate::user::socket::SocketHandle;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -22,6 +24,8 @@ use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 mod console_registry;
 #[path = "handles/display_surface.rs"]
 mod display_surface;
+#[path = "handles/device_buffer.rs"]
+mod device_buffer;
 #[path = "handles/table.rs"]
 mod table;
 mod transfer_registry;
@@ -31,6 +35,7 @@ mod vfs;
 pub use transfer_registry::*;
 
 pub use display_surface::DisplaySurfaceHandle;
+pub use device_buffer::{app_buffer_pool, BufferCapability, BufferError, BufferIdentity, BufferMappingHold, BufferOwner, BufferPool, BufferRights};
 pub use table::{HandleEntry, HandleTable, TransferredHandleEntry};
 pub use vfs::{
     FileHandleSeekError, FileHandleSeekWhence, VfsDirectoryEntry, VfsDirectoryEntryKind,
@@ -179,12 +184,15 @@ pub enum KernelHandle {
     Console(ConsoleHandle),
     Device(DeviceHandle),
     Epoll(EpollHandle),
+    EventFd(EventFdHandle),
     InetSocket(InetSocketHandle),
     Memfd(MemfdHandle),
+    Pipe(PipeHandle),
     RemoteVfs(RemoteVfsHandle),
     Socket(SocketHandle),
     VfsDirectory(VfsDirectoryHandle),
     DisplaySurface(DisplaySurfaceHandle),
+    DeviceBuffer(BufferCapability),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -203,6 +211,24 @@ pub struct RemoteVfsHandle {
     path: String,
     len: u64,
     device_access: u16,
+    library: LibraryBinding,
+}
+
+/// Whether this open file description is known to be a sealed shared library
+/// object. The record lives in the description's handle, so it follows
+/// dup/fork and dies with the last close, exec-cloexec or process exit; no
+/// separate revocation list exists to go stale. It is only ever written by the
+/// MM broker after vfsd attested the file identity, and every use revalidates
+/// the object generation against the registry.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LibraryBinding {
+    /// Not yet attested.
+    Unknown,
+    /// Attested equal to the sealed library object `object` (registry handle).
+    Bound { object: u64 },
+    /// No sealed object matched at registry epoch `registry_epoch`. Valid only
+    /// until the registry changes.
+    Ineligible { registry_epoch: u64 },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -228,11 +254,20 @@ impl RemoteVfsHandle {
             path,
             len,
             device_access,
+            library: LibraryBinding::Unknown,
         })
     }
 
     pub const fn token_id(&self) -> u64 {
         self.token
+    }
+
+    pub const fn library_binding(&self) -> LibraryBinding {
+        self.library
+    }
+
+    pub fn set_library_binding(&mut self, binding: LibraryBinding) {
+        self.library = binding;
     }
 
     pub const fn remote_id(&self) -> u64 {
@@ -308,6 +343,16 @@ impl KernelHandle {
             }
             Self::Device(device) => HandleToken::new(HandleOwner::Io, device.token_id()),
             Self::Epoll(epoll) => HandleToken::new(HandleOwner::Compat, epoll.token_id()),
+            Self::EventFd(eventfd) => HandleToken::from_nonreusable_open_description(
+                HandleOwner::Ps,
+                eventfd.token_id(),
+            )
+            .expect("eventfd open-description token is nonzero and nonreusable"),
+            Self::Pipe(pipe) => HandleToken::from_nonreusable_open_description(
+                HandleOwner::Ps,
+                pipe.token_id(),
+            )
+            .expect("pipe open-description token is nonzero and nonreusable"),
             Self::InetSocket(socket) => HandleToken::from_nonreusable_open_description(
                 HandleOwner::Compat,
                 socket.token_id(),
@@ -325,6 +370,7 @@ impl KernelHandle {
             Self::DisplaySurface(surface) => {
                 HandleToken::new(HandleOwner::Io, surface.generation())
             }
+            Self::DeviceBuffer(buffer) => HandleToken::new(HandleOwner::DeviceBuffer, buffer.identity().allocation),
         }
     }
 
@@ -334,12 +380,15 @@ impl KernelHandle {
             Self::Console(_) => "console",
             Self::Device(_) => "device",
             Self::Epoll(_) => "epoll",
+            Self::EventFd(_) => "eventfd",
+            Self::Pipe(_) => "pipe",
             Self::InetSocket(_) => "inet-socket",
             Self::Memfd(_) => "memfd",
             Self::RemoteVfs(_) => "remote-vfs",
             Self::Socket(_) => "socket",
             Self::VfsDirectory(_) => "vfs-dir",
             Self::DisplaySurface(_) => "display-surface",
+            Self::DeviceBuffer(_) => "device-buffer",
         }
     }
 
@@ -385,6 +434,15 @@ impl KernelHandle {
                 HandleRights::Device(rights)
             }
             Self::Epoll(_) => HandleRights::Epoll,
+            // Anonymous kernel-local objects are not transferable (no
+            // SCM_RIGHTS) and carry only the access their description allows.
+            Self::EventFd(_) => HandleRights::File(
+                FileHandleRights::READ.union(FileHandleRights::WRITE),
+            ),
+            Self::Pipe(pipe) => HandleRights::File(match pipe.role() {
+                crate::user::pipe::PipeRole::Read => FileHandleRights::READ,
+                crate::user::pipe::PipeRole::Write => FileHandleRights::WRITE,
+            }),
             Self::InetSocket(_) => HandleRights::Socket(
                 SocketHandleRights::SEND
                     .union(SocketHandleRights::RECV)
@@ -413,6 +471,19 @@ impl KernelHandle {
             Self::VfsDirectory(_) => {
                 HandleRights::File(FileHandleRights::READ.union(FileHandleRights::TRANSFER))
             }
+            Self::DeviceBuffer(buffer) => {
+                let mut rights = SharedRegionRights::empty();
+                if buffer.rights().contains(BufferRights::READ) {
+                    rights = rights.union(SharedRegionRights::READ).union(SharedRegionRights::MAP);
+                }
+                if buffer.rights().contains(BufferRights::WRITE) {
+                    rights = rights.union(SharedRegionRights::WRITE);
+                }
+                if buffer.rights().contains(BufferRights::TRANSFER) {
+                    rights = rights.union(SharedRegionRights::TRANSFER);
+                }
+                HandleRights::DeviceBuffer(rights)
+            },
             Self::DisplaySurface(_) => HandleRights::DisplaySurface(
                 SharedRegionRights::READ
                     .union(SharedRegionRights::WRITE)
@@ -430,6 +501,7 @@ impl KernelHandle {
                 | Self::VfsDirectory(_)
                 | Self::Device(_)
                 | Self::RemoteVfs(_)
+                | Self::DeviceBuffer(_)
         ) && rights.allows_transfer()
     }
 
@@ -446,6 +518,8 @@ impl KernelHandle {
             Self::Console(_) => alloc::string::String::from("/dev/tty"),
             Self::Device(device) => alloc::string::String::from(device.device_id().path()),
             Self::Epoll(epoll) => alloc::string::String::from(epoll.path()),
+            Self::EventFd(eventfd) => eventfd.path(),
+            Self::Pipe(pipe) => pipe.path(),
             Self::InetSocket(socket) => {
                 alloc::format!("socket:[rustos-inet:{}]", socket.token_id())
             }
@@ -458,6 +532,7 @@ impl KernelHandle {
             Self::DisplaySurface(_) => {
                 alloc::format!("anon_inode:[rustos-display-surface:{}]", token.object_id())
             }
+            Self::DeviceBuffer(_) => alloc::format!("anon_inode:[rustos-device-buffer:{}]", token.object_id()),
         }
     }
 }

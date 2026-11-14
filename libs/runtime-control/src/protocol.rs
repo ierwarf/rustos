@@ -33,7 +33,9 @@ pub const PROTOCOL_VERSION: u16 = 3;
 pub const REQUEST_FLAG_QUERY: u32 = 1;
 /// A transaction deadline may be at most this far after identity creation.
 /// Admission and replay cannot renew the identity's age.
-pub const MAX_TRANSACTION_LIFETIME_NS: u64 = 30_000_000_000;
+/// Matches the 180s application launch lease so large staged executables
+/// (such as `/apps/chrome/chrome`) do not expire before `loaderd`/`vfsd` finish.
+pub const MAX_TRANSACTION_LIFETIME_NS: u64 = 180_000_000_000;
 /// Replay metadata expires this long after the immutable admission horizon.
 pub const TRANSACTION_REPLAY_RETENTION_NS: u64 = 60_000_000_000;
 

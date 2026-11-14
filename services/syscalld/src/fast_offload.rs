@@ -73,6 +73,9 @@ pub fn expand_mem_request(
         flags: request.flags,
         mask: request.prot,
         dirfd: request.fd,
+        // Address-space operations carry the kernel lease ticket in `arg3`
+        // (unused by these operations); handlers echo it to the MM broker.
+        arg3: request.ticket,
         ..LinuxSyscallOffloadRequest::default()
     };
     // `mmap` carries its file offset in the first path bytes, exactly as the
@@ -129,12 +132,14 @@ mod tests {
             flags: 0x22,
             fd: u64::MAX,
             offset: 0x4000,
+            ticket: 0x1234_5678,
         };
         let full = expand_mem_request(&request, 77, 78).expect("exact sender");
         assert_eq!(
             (full.op, full.pid, full.arg0, full.arg1, full.flags, full.mask, full.dirfd),
             (request.op, 77, 0x7000_0000, 8192, 0x22, 3, u64::MAX)
         );
+        assert_eq!(full.arg3, 0x1234_5678);
         assert_eq!(&full.path[0..8], &0x4000_u64.to_le_bytes());
         assert_eq!(full.path_len, 8);
         // Another process's identity in the frame is refused, not honoured.

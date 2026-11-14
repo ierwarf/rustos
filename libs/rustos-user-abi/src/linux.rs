@@ -2,6 +2,8 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use linux_raw_sys::{auxvec as linux_auxvec, general as linux, ioctl as linux_ioctl, net as linux_net};
 
+mod local_fd;
+pub use local_fd::*;
 mod task;
 pub use task::*;
 
@@ -86,6 +88,7 @@ raw_u64! {
     SYS_SETGID = linux::__NR_setgid;
     SYS_SIGALTSTACK = linux::__NR_sigaltstack;
     SYS_ARCH_PRCTL = linux::__NR_arch_prctl;
+    SYS_PRCTL = linux::__NR_prctl;
     SYS_CLOCK_GETTIME = linux::__NR_clock_gettime;
     SYS_CLOCK_NANOSLEEP = linux::__NR_clock_nanosleep;
     SYS_EXIT = linux::__NR_exit;
@@ -1103,6 +1106,7 @@ impl LinuxProcessImageInfo {
             signal_mask: 0,
             pending_signals: 0,
             pending_sigchld_events: 0,
+            comm: [0; LINUX_TASK_COMM_LEN],
             signal_stack: LinuxSignalStack {
                 sp: 0,
                 flags: SS_DISABLE,
@@ -1368,8 +1372,16 @@ pub struct LinuxThreadState {
     /// pending SIGCHLD bit. These bits let procd apply SA_NOCLDSTOP without
     /// suppressing an exit notification that coalesced with stop/continue.
     pub pending_sigchld_events: u32,
+    /// `PR_SET_NAME` thread name (NUL-padded, at most 15 bytes plus NUL). All
+    /// zero means "never set": readers derive the exec-path basename, like
+    /// Linux's comm after exec. Copied to clone/fork children with the rest
+    /// of the thread state; a fresh exec starts from zero.
+    pub comm: [u8; LINUX_TASK_COMM_LEN],
     pub signal_stack: LinuxSignalStack,
 }
+
+/// `TASK_COMM_LEN`: the thread name buffer including its terminating NUL.
+pub const LINUX_TASK_COMM_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LinuxProcessLaunch<'a> {
@@ -1584,3 +1596,6 @@ mod tests {
 crate::user_wire!(LinuxMsghdr { msg_name: u64, msg_namelen: u32, __pad0: u32, msg_iov: u64, msg_iovlen: u64, msg_control: u64, msg_controllen: u64, msg_flags: u32, __pad1: u32 });
 crate::user_wire!(LinuxRusage { ru_utime: LinuxTimeval, ru_stime: LinuxTimeval, ru_maxrss: i64, ru_ixrss: i64, ru_idrss: i64, ru_isrss: i64, ru_minflt: i64, ru_majflt: i64, ru_nswap: i64, ru_inblock: i64, ru_oublock: i64, ru_msgsnd: i64, ru_msgrcv: i64, ru_nsignals: i64, ru_nvcsw: i64, ru_nivcsw: i64 });
 crate::user_wire!(LinuxTimeval { tv_sec: i64, tv_usec: i64 });
+
+pub const SYS_RUSTOS_APP_BUFFER_BROKER: u64 = crate::syscall::SYS_RUSTOS_APP_BUFFER_BROKER;
+pub const SYS_RUSTOS_APP_BUFFER_ALLOC: u64 = crate::syscall::SYS_RUSTOS_APP_BUFFER_ALLOC;

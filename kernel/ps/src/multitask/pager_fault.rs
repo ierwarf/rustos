@@ -372,9 +372,17 @@ impl PagerFaultTable {
                 return Err(error);
             }
         };
-        if require_dispatch_grant && (zeroed_frame_capability == 0 || granted_frame_rights == 0) {
-            // ORDERING: a dispatch reservation without a real grant is void;
-            // Release frees the slot before a dispatcher could observe it.
+        let dispatch = rustos_user_abi::pager::PagerFaultDispatchWire {
+            request,
+            zeroed_frame_capability,
+            granted_frame_rights,
+            map_run_pages_offered: 1,
+            reserved1: [0; 2],
+        };
+        if require_dispatch_grant && !dispatch.is_canonical() {
+            // ORDERING: anonymous requests need their exact zeroed grant;
+            // private files need no reserve frame and must carry none.
+            // Release frees malformed authority before a dispatcher sees it.
             slot.state.store(SLOT_FREE, Ordering::Release);
             return Err(PagerFaultSlotError::Malformed);
         }
@@ -903,6 +911,44 @@ mod tests {
             generation: 61,
             rights: 1,
         }
+    }
+
+    #[test]
+    fn private_file_dispatch_does_not_reserve_an_anonymous_frame() {
+        let table = PagerFaultTable::new();
+        let mut template = request();
+        template.object.object_type = rustos_user_abi::pager::VM_OBJECT_FILE_PRIVATE;
+        template.object.backing_service = 2;
+        let reservation = table
+            .reserve_with_dispatch_grant(template, endpoint(), true, |_, request| {
+                Ok((0, request.object.rights))
+            })
+            .unwrap();
+        assert_eq!(reservation.zeroed_frame_capability, 0);
+        assert_ne!(reservation.granted_frame_rights, 0);
+        table.mark_blocked(reservation.token).unwrap();
+        let dispatched = table
+            .take_next_dispatchable_for_pager(101, endpoint())
+            .unwrap();
+        assert_eq!(dispatched.token, reservation.token);
+        assert!(
+            table
+                .claim_reply_from_pager(reservation.token, 103)
+                .is_err()
+        );
+        assert!(table.claim_reply_from_pager(reservation.token, 101).is_ok());
+        table
+            .release(reservation.token, PagerFaultState::ReplyClaimed)
+            .unwrap();
+        assert!(table.snapshot(reservation.token).is_err());
+        assert!(
+            table
+                .reserve_with_dispatch_grant(template, endpoint(), true, |_, request| Ok((
+                    123,
+                    request.object.rights
+                )))
+                .is_err()
+        );
     }
 
     #[test]

@@ -31,6 +31,8 @@ use core::mem::size_of;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 
+use pagerd::library_custody::{self, Custody, Pressure, ReclaimHost};
+use pagerd::library_warm::{self, ReadChunk, WarmHost};
 use pagerd::{request_sender_is_authorized, PagerFaultError, PagerState};
 use rustos_svc_runtime::{ipc, pager as pager_rendezvous};
 use rustos_user_abi::pager::{
@@ -71,8 +73,23 @@ fn service_main() {
         let _ = errno;
         ipc::debug_line("pagerd: heartbeat thread unavailable");
     }
+    // An endpoint object may be unregistered and reused. Its publication lease
+    // epoch, not a per-process constant or endpoint handle, binds cache/fault
+    // authority across service restart.
+    let epoch = match pager_rendezvous::source_owner_epoch() {
+        Ok(epoch) => epoch,
+        Err(_) => {
+            ipc::debug_line("pagerd: frame-source lease query failed");
+            return;
+        }
+    };
+    if !source_control_selfcheck(epoch) {
+        ipc::debug_line("pagerd: frame-source-control selfcheck failed");
+        return;
+    }
+    ipc::debug_line("pagerd: frame-source-control selfcheck passed");
     publish_anonymous_policy();
-    let mut pager = PagerState::new(1);
+    let mut pager = PagerState::new(epoch);
     serve(endpoint as u64, &mut pager);
 }
 
@@ -91,6 +108,21 @@ fn service_main() {
 /// its own default until this lands, so a failure here leaves the system on
 /// that default rather than half-configured. Later pressure-policy updates use
 /// the same sequence publication instead of mutating fields in place.
+/// Prove the live native supply/withdrawal route before accepting source-backed
+/// work. This is a one-page capability/lifetime check, not file-pager readiness.
+fn source_control_selfcheck(epoch: u64) -> bool {
+    let key = rustos_user_abi::syscall::FrameSourceKeyWire {
+        namespace: u64::MAX, object: 1, object_generation: epoch,
+        content_generation: 1, page_offset: 0,
+    };
+    let token = match pager_rendezvous::source_supply(key, u64::from(rustos_user_abi::pager::VM_PROT_READ), b"source-control-check") {
+        Ok(token) => token,
+        Err(_) => return false,
+    };
+    pager_rendezvous::source_retire(token).is_ok()
+        && pager_rendezvous::source_owner_epoch() == Ok(epoch)
+}
+
 fn publish_anonymous_policy() {
     let mut wired_services = [0_u64; PAGER_MAX_WIRED_SERVICES];
     // The services the whole system starts through. Ring0 answers anonymous
@@ -141,6 +173,7 @@ fn serve(endpoint: u64, pager: &mut PagerState) {
         // Retries until the kernel admits the heartbeat thread (procd may not
         // be up when pagerd starts); a single relaxed load once it is running.
         rustos_svc_runtime::heartbeat::ensure_thread(rustos_user_abi::syscall::IPC_SERVICE_PAGERD);
+        warm_worker::ensure();
         let mut reply_cap = 0;
         let mut sender_pid = 0;
         let mut sender_tid = 0;
@@ -349,5 +382,375 @@ const fn errno(error: PagerFaultError) -> i32 {
         PagerFaultError::NotManaged => 95,
         PagerFaultError::Pressure(_) => 11,
         PagerFaultError::EpochExhausted => 75,
+    }
+}
+
+/// Boot-time shared-library cache warm-up on its own thread.
+///
+/// It never runs on the serve/fault thread: it waits for vfsd, which may
+/// itself need this pager to answer requests, and the cache is only a
+/// performance hint. Failure leaves every mapping on the eager-copy path.
+mod warm_worker {
+    use super::*;
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use rustos_user_abi::syscall::{
+        LibraryIdentityWire, VfsFileIdentityWire, VfsIpcRequest, VfsIpcResponse,
+        VFS_IPC_OP_LIBRARY_READ, VFS_LIBRARY_READ_MAX_BYTES,
+    };
+
+    const SYS_GETPID: u64 = 39;
+    const SYS_GETTID: u64 = 186;
+    const STACK_BYTES: usize = 32 * 1024;
+    const CALL_LIMIT_MS: u64 = 5_000;
+    const RETRY_MS: u64 = 250;
+    const MAX_ATTEMPTS: u32 = 240;
+    const RECLAIM_POLL_MS: u64 = 100;
+
+    #[repr(align(16))]
+    struct Stack(#[allow(dead_code)] [u8; STACK_BYTES]);
+    struct Buffers {
+        request: VfsIpcRequest,
+        response: VfsIpcResponse,
+        manifest: [u8; rustos_library_cache_policy::MAX_MANIFEST_BYTES],
+        chunk: [u8; VFS_LIBRARY_READ_MAX_BYTES],
+    }
+    // Owned exclusively by the single warm thread once it is started.
+    static mut STACK: Stack = Stack([0; STACK_BYTES]);
+    static mut BUFFERS: Buffers = Buffers {
+        request: unsafe { core::mem::zeroed() },
+        response: unsafe { core::mem::zeroed() },
+        manifest: [0; rustos_library_cache_policy::MAX_MANIFEST_BYTES],
+        chunk: [0; VFS_LIBRARY_READ_MAX_BYTES],
+    };
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    static ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+
+    /// Retried from the serve loop: `clone` answers ENOSYS until procd plans
+    /// thread creation. One attempt per 32 calls, one relaxed load afterwards.
+    pub fn ensure() {
+        if STARTED.load(Ordering::Relaxed) || ATTEMPTS.fetch_add(1, Ordering::Relaxed) % 32 != 0 {
+            return;
+        }
+        #[cfg(all(target_arch = "x86_64", not(test)))]
+        {
+            // SAFETY: the stack is a private static handed to exactly one thread
+            // (guarded by the compare_exchange below) and never reused.
+            if STARTED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                return;
+            }
+            let top = unsafe { (core::ptr::addr_of_mut!(STACK) as *mut u8).add(STACK_BYTES) } as u64;
+            let spawned = unsafe { rustos_svc_runtime::worker::spawn(top, entry) };
+            if spawned.is_ok() {
+                ipc::debug_line("pagerd: library warm thread spawned");
+            }
+            if let Err(errno) = spawned {
+                STARTED.store(false, Ordering::Release);
+                // Name the first refusal; retries stay one per 32 receive-loop turns.
+                static REPORTED: AtomicBool = AtomicBool::new(false);
+                if !REPORTED.swap(true, Ordering::Relaxed) {
+                    let digits = decimal(errno);
+                    let mut line = [0_u8; 64];
+                    let prefix = b"pagerd: library warm spawn refused errno=";
+                    line[..prefix.len()].copy_from_slice(prefix);
+                    line[prefix.len()..prefix.len() + digits.len()].copy_from_slice(&digits);
+                    if let Ok(text) = core::str::from_utf8(&line[..prefix.len() + digits.len()]) {
+                        ipc::debug_line(text);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fixed-capacity signed decimal for the give-up diagnostic (no allocator).
+    fn decimal(value: i64) -> heapless_decimal::Decimal {
+        heapless_decimal::Decimal::new(value)
+    }
+
+    mod heapless_decimal {
+        pub struct Decimal {
+            bytes: [u8; 21],
+            start: usize,
+        }
+        impl Decimal {
+            pub fn new(value: i64) -> Self {
+                let mut bytes = [0_u8; 21];
+                let mut at = bytes.len();
+                let negative = value < 0;
+                let mut magnitude = value.unsigned_abs();
+                loop {
+                    at -= 1;
+                    bytes[at] = b'0' + (magnitude % 10) as u8;
+                    magnitude /= 10;
+                    if magnitude == 0 {
+                        break;
+                    }
+                }
+                if negative {
+                    at -= 1;
+                    bytes[at] = b'-';
+                }
+                Self { bytes, start: at }
+            }
+        }
+        impl core::ops::Deref for Decimal {
+            type Target = [u8];
+            fn deref(&self) -> &[u8] {
+                &self.bytes[self.start..]
+            }
+        }
+    }
+
+    extern "C" fn entry() -> ! {
+        // SAFETY: only this thread touches BUFFERS after the guarded spawn.
+        let buffers = unsafe { &mut *core::ptr::addr_of_mut!(BUFFERS) };
+        // No allocation on the very first line: it proves the thread runs.
+        ipc::debug_bytes(b"pagerd: library warm thread started\n");
+        let mut last_endpoint = 0_i64;
+        let mut last_host_error = 0_i32;
+        let mut settled = false;
+        // Custody outlives retried runs: an object sealed by an earlier,
+        // interrupted run stays tracked (a later run sees it as already present).
+        let mut custody = Custody::new();
+        for _ in 0..MAX_ATTEMPTS {
+            let endpoint = ipc::lookup_service_endpoint(IPC_SERVICE_VFSD);
+            last_endpoint = endpoint as i64;
+            if endpoint > 0 {
+                let mut host = VfsHost { endpoint: endpoint as u64, request: &mut buffers.request, response: &mut buffers.response, serial: 0, custody: &mut custody };
+                match library_warm::warm(&mut host, &mut buffers.manifest, &mut buffers.chunk) {
+                    Ok(report) => {
+                        settled = true;
+                        if report.sealed > 0 || report.present > 0 {
+                            ipc::debug_line("pagerd: library cache warmed");
+                            if report.refused > 0 {
+                                // Rows are skipped one by one; name how many and
+                                // the first cause so a partial cache is visible.
+                                let (stage, code) = report
+                                    .first_refusal
+                                    .map_or((-1, 0), |skip| (skip.stage as i64, skip.code));
+                                let mut line = [0_u8; 112];
+                                let mut at = 0;
+                                for part in [
+                                    &b"pagerd: library cache warm partial sealed="[..],
+                                    &decimal(i64::from(report.sealed))[..],
+                                    &b" refused="[..],
+                                    &decimal(i64::from(report.refused))[..],
+                                    &b" stage="[..],
+                                    &decimal(stage)[..],
+                                    &b" code="[..],
+                                    &decimal(code)[..],
+                                ] {
+                                    let take = part.len().min(line.len() - at);
+                                    line[at..at + take].copy_from_slice(&part[..take]);
+                                    at += take;
+                                }
+                                if let Ok(text) = core::str::from_utf8(&line[..at]) {
+                                    ipc::debug_line(text);
+                                }
+                            }
+                        } else {
+                            // Name the first refused row once: stage is the
+                            // `library_warm::Stage` ordinal, code its errno.
+                            let (stage, code) = report
+                                .first_refusal
+                                .map_or((-1, 0), |skip| (skip.stage as i64, skip.code));
+                            let mut line = [0_u8; 96];
+                            let mut at = 0;
+                            for part in [
+                                &b"pagerd: library cache warm sealed nothing stage="[..],
+                                &decimal(stage)[..],
+                                &b" code="[..],
+                                &decimal(code)[..],
+                                &b" refused="[..],
+                                &decimal(i64::from(report.refused))[..],
+                            ] {
+                                let take = part.len().min(line.len() - at);
+                                line[at..at + take].copy_from_slice(&part[..take]);
+                                at += take;
+                            }
+                            if let Ok(text) = core::str::from_utf8(&line[..at]) {
+                                ipc::debug_line(text);
+                            }
+                        }
+                        break;
+                    }
+                    Err(library_warm::WarmError::Manifest) => {
+                        settled = true;
+                        ipc::debug_line("pagerd: library cache manifest refused");
+                        break;
+                    }
+                    Err(library_warm::WarmError::Host(errno)) => last_host_error = errno,
+                }
+            }
+            rustos_svc_runtime::syscall::sleep_millis(RETRY_MS);
+        }
+        if !settled {
+            // Exhausted retries: never fail silently, name the last cause.
+            let mut line = [0_u8; 96];
+            let mut at = 0;
+            for part in [
+                &b"pagerd: library warm gave up vfsd-endpoint="[..],
+                &decimal(last_endpoint)[..],
+                &b" host-error="[..],
+                &decimal(last_host_error as i64)[..],
+            ] {
+                let take = part.len().min(line.len() - at);
+                line[at..at + take].copy_from_slice(&part[..take]);
+                at += take;
+            }
+            if let Ok(text) = core::str::from_utf8(&line[..at]) {
+                ipc::debug_line(text);
+            }
+        }
+        // The process lives for the service. From here this thread is the
+        // cache custodian: it gives warmed objects back, coldest first, when
+        // the kernel reports memory pressure. Retirement is policy (here);
+        // ring0 frees only frames no mapping or pin still holds.
+        let mut lowest_free = u64::MAX;
+        let mut announced = false;
+        loop {
+            rustos_svc_runtime::syscall::sleep_millis(RECLAIM_POLL_MS);
+            // Bounded diagnostics: once at start, then whenever free memory
+            // halves relative to the lowest sample seen.
+            if let Ok(sample) = (KernelReclaim).pressure() {
+                if !announced || sample.free_pages < lowest_free / 2 {
+                    announced = true;
+                    lowest_free = lowest_free.min(sample.free_pages);
+                    let mut line = [0_u8; 128];
+                    let mut at = 0;
+                    for part in [
+                        &b"pagerd: library custodian sample free="[..],
+                        &decimal(sample.free_pages as i64)[..],
+                        &b" min="[..],
+                        &decimal(sample.min_free_pages as i64)[..],
+                        &b" kept="[..],
+                        &decimal(custody.objects() as i64)[..],
+                    ] {
+                        let take = part.len().min(line.len() - at);
+                        line[at..at + take].copy_from_slice(&part[..take]);
+                        at += take;
+                    }
+                    if let Ok(text) = core::str::from_utf8(&line[..at]) {
+                        ipc::debug_line(text);
+                    }
+                }
+            }
+            if let Some(done) = library_custody::reclaim_step(&mut custody, &mut KernelReclaim) {
+                let mut line = [0_u8; 112];
+                let mut at = 0;
+                for part in [
+                    &b"pagerd: library cache reclaimed objects="[..],
+                    &decimal(i64::from(done.objects))[..],
+                    &b" pages="[..],
+                    &decimal(done.pages as i64)[..],
+                    &b" free="[..],
+                    &decimal(done.free_pages as i64)[..],
+                    &b" kept="[..],
+                    &decimal(custody.objects() as i64)[..],
+                ] {
+                    let take = part.len().min(line.len() - at);
+                    line[at..at + take].copy_from_slice(&part[..take]);
+                    at += take;
+                }
+                if let Ok(text) = core::str::from_utf8(&line[..at]) {
+                    ipc::debug_line(text);
+                }
+            }
+        }
+    }
+
+    /// The kernel half of the retention pass: read-only counters and retire.
+    struct KernelReclaim;
+    impl ReclaimHost for KernelReclaim {
+        fn pressure(&mut self) -> Result<Pressure, i64> {
+            pager_rendezvous::library_pressure().map(|wire| Pressure {
+                free_pages: wire.free_pages,
+                min_free_pages: wire.min_free_pages,
+                watermark_denials: wire.watermark_denials,
+            })
+        }
+        fn retire(&mut self, object: u64) -> Result<(), i64> {
+            pager_rendezvous::library_retire(object).map(|_| ())
+        }
+    }
+
+    struct VfsHost<'a> {
+        endpoint: u64,
+        request: &'a mut VfsIpcRequest,
+        response: &'a mut VfsIpcResponse,
+        serial: u64,
+        custody: &'a mut Custody,
+    }
+
+    impl WarmHost for VfsHost<'_> {
+        fn read(&mut self, path: &str, offset: u64, out: &mut [u8]) -> Result<ReadChunk, i32> {
+            const IDENTITY: usize = VfsFileIdentityWire::WIRE_BYTES;
+            if path.len() > self.request.path.len() || out.len() > VFS_LIBRARY_READ_MAX_BYTES {
+                return Err(22);
+            }
+            let pid = unsafe { rustos_svc_runtime::syscall::syscall0(SYS_GETPID) };
+            let tid = unsafe { rustos_svc_runtime::syscall::syscall0(SYS_GETTID) };
+            if pid <= 0 || tid <= 0 {
+                return Err(22);
+            }
+            self.serial += 1;
+            *self.request = VfsIpcRequest::default();
+            self.request.op = VFS_IPC_OP_LIBRARY_READ;
+            self.request.pid = pid as u64;
+            self.request.tid = tid as u64;
+            self.request.arg0 = offset;
+            self.request.arg1 = out.len() as u64;
+            self.request.operation_hi = pid as u64;
+            self.request.operation_lo = self.serial;
+            self.request.path_len = path.len() as u32;
+            self.request.path[..path.len()].copy_from_slice(path.as_bytes());
+            *self.response = VfsIpcResponse::default();
+            // SAFETY: both buffers are exclusive, fixed-size and outlive the call.
+            let got = unsafe {
+                ipc::call_bounded(
+                    self.endpoint,
+                    (self.request as *const VfsIpcRequest).cast::<u8>(),
+                    size_of::<VfsIpcRequest>(),
+                    (self.response as *mut VfsIpcResponse).cast::<u8>(),
+                    size_of::<VfsIpcResponse>(),
+                    CALL_LIMIT_MS,
+                )
+            };
+            if got < 0 {
+                return Err((-got) as i32);
+            }
+            let response = &*self.response;
+            if got as usize != size_of::<VfsIpcResponse>() {
+                return Err(71);
+            }
+            if response.status != 0 {
+                return Err(response.status.unsigned_abs() as i32);
+            }
+            let payload = response.payload_len as usize;
+            if payload < IDENTITY || payload - IDENTITY > out.len() || payload > response.payload.len() {
+                return Err(71);
+            }
+            let identity = VfsFileIdentityWire::from_bytes(&response.payload[..IDENTITY]).ok_or(71)?;
+            let len = payload - IDENTITY;
+            out[..len].copy_from_slice(&response.payload[IDENTITY..payload]);
+            Ok(ReadChunk { len, file_len: response.value, attested: response.aux == 1, identity })
+        }
+
+        fn create(&mut self, identity: LibraryIdentityWire) -> Result<u64, i64> {
+            pager_rendezvous::library_create(identity)
+        }
+        fn supply(&mut self, object: u64, page: u64, bytes: &[u8]) -> Result<(), i64> {
+            pager_rendezvous::library_supply_page(object, page, bytes)
+        }
+        fn seal(&mut self, object: u64) -> Result<(), i64> {
+            pager_rendezvous::library_seal(object)
+        }
+        fn retire(&mut self, object: u64) {
+            let _ = pager_rendezvous::library_retire(object);
+        }
+        fn published(&mut self, rank: u16, object: u64, pages: u64) {
+            // A full table leaves the object published but unreclaimable until
+            // the lease ends; the manifest bound (128) equals the table size.
+            let _ = self.custody.record(object, pages, rank);
+        }
     }
 }

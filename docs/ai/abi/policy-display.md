@@ -437,7 +437,7 @@ do not admit a service, a module-loading path, or a future ABI reuse.
   Authenticated User-only event handoffs use a deduplicated 16-entry FIFO and
   are capped at eight consecutive picks. These are the explicit recovery and
   application CPU reservations under DVM/UI load.
-- Normal and voluntary-yield task selection each scan the fixed 128-slot table
+- Normal and voluntary-yield task selection each scan the fixed 256-slot table
   once and retain one minimum-vruntime candidate per class. Do not restore a
   separate full-table pass for each empty higher class: effective class
   resolution also walks live reply donations, so repeated scans multiply the

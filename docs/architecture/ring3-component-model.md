@@ -21,7 +21,7 @@ library as replacing the existing rootd/Job/IPC authorities.
   duplicate service identities, invalid paths, malformed scheduling contexts
   and non-forward bootstrap dependency edges. It performs no kernel syscall.
 - `rootd::component_policy::route_allowed` consumes the immutable
-  `SERVICE_ROUTING_MANIFEST` of 15 directed lookup offers alongside
+  `SERVICE_ROUTING_MANIFEST` of 16 directed lookup offers alongside
   bootstrap-dependency grants. Bootstrap preflight rejects unknown service
   identities, self-edges, duplicate offers and redundant bootstrap grants.
   An exhaustive old-versus-new authority-matrix test covers the current

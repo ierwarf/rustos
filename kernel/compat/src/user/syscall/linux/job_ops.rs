@@ -464,6 +464,8 @@ fn kmem_class_from_abi(id: u32) -> Option<kernel_mm::api::kmem_charge::Class> {
         JOB_KMEM_CLASS_THREAD => Class::Thread,
         JOB_KMEM_CLASS_VMA => Class::Vma,
         JOB_KMEM_CLASS_IPC_MESSAGE => Class::IpcMessage,
+        JOB_KMEM_CLASS_DEVICE_BUFFER => Class::DeviceBuffer,
+        JOB_KMEM_CLASS_LIBRARY_OBJECT => Class::LibraryObject,
         _ => return None,
     })
 }

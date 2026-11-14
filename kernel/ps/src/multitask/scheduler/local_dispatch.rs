@@ -55,7 +55,7 @@ static SHADOW_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 #[cfg(rustos_scheduler_phase_profile)]
 static SHADOW_AUTHORITATIVE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 // [flags:8 | cpu:8 | current:8 | catalog-pick:8 | local-policy:8 |
-// catalog-pick:8]. Slots are bounded by MAX_TASK=128. The final byte is
+// catalog-pick:8]. Slots are bounded by MAX_TASK=256 (one byte each). The final byte is
 // intentionally repeated for compatibility with the existing diagnostic
 // decoder while divergence becomes policy evidence rather than a safety gate.
 #[cfg(rustos_scheduler_phase_profile)]

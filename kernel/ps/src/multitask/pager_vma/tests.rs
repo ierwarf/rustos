@@ -750,8 +750,10 @@ fn old_image_mapping_plan_cannot_publish_over_replacement_stack_guard() {
         retained.with_state_mut(|_, state| state.mapping_below_stack_guard(plan.start, plan.end))
     );
     retained.with_state_mut(|_, state| {
+        let replacement = ProcessAddressSpace::empty_for_tests();
+        let meter = state.reserve_exec_mapping_kmem(&replacement).unwrap();
         let _retired = state.replace_for_exec(
-            ProcessAddressSpace::empty_for_tests(),
+            replacement,
             LinuxProcessState {
                 mapping_limit: new_guard,
                 ..LinuxProcessState::default()
@@ -759,12 +761,13 @@ fn old_image_mapping_plan_cannot_publish_over_replacement_stack_guard() {
             LinuxMemoryMapState::default(),
             LinuxRuntimeProfile::default(),
             "/replacement.elf",
+            meter,
         );
     });
     // Resume the old plan against actual VMA admission. It must refuse before
     // even inspecting the replacement page tables, let alone publishing.
     assert_eq!(
-        super::super::publish_pager_vma_for_process(pid, plan, MAX_PAGER_VMAS_PER_PROCESS),
+        super::super::publish_pager_vma_for_process(pid, None, plan, MAX_PAGER_VMAS_PER_PROCESS),
         Err(PagerVmaError::Denied),
     );
     assert!(
@@ -1094,4 +1097,107 @@ fn rewrite_reclaims_previous_exec_incarnation_instead_of_mutating_its_range() {
     .unwrap();
     assert_ne!(fresh.mm_generation, stale.mm_generation);
     revoke(handle, after_exec, fresh.start, fresh.vma_generation).unwrap();
+}
+
+#[test]
+fn an_expected_incarnation_refuses_every_other_process_or_mm_generation() {
+    let live = identity(61, 67);
+    assert_eq!(ExpectedMm::check(None, live), Ok(()));
+    let exact = ExpectedMm {
+        process_generation: 61,
+        mm_generation: 67,
+    };
+    assert_eq!(ExpectedMm::check(Some(exact), live), Ok(()));
+    for stale in [
+        ExpectedMm {
+            mm_generation: 68,
+            ..exact
+        },
+        ExpectedMm {
+            process_generation: 62,
+            ..exact
+        },
+    ] {
+        assert_eq!(
+            ExpectedMm::check(Some(stale), live),
+            Err(PagerVmaError::Stale),
+            "an exec'd or reused process must not inherit a captured request"
+        );
+    }
+}
+
+#[test]
+fn owned_anonymous_jit_may_flip_rw_to_rx_and_back_but_never_to_write_execute() {
+    let _guard = guard();
+    let handle = ProcessHandle::new(27, 71);
+    let identity = identity(71, 73);
+    let published = publish(
+        handle,
+        identity,
+        template(0x60_000),
+        MAX_PAGER_VMAS_PER_PROCESS,
+    )
+    .unwrap();
+    let whole = (published.start, published.end);
+    let rx = VM_PROT_READ | VM_PROT_EXECUTE;
+    assert_eq!(
+        rewrite_attenuated_range(handle, identity, whole.0, whole.1, Some(rx), || Ok(())),
+        Ok(true)
+    );
+    assert!(lookup(handle, identity, whole.0, VM_ACCESS_EXECUTE).is_ok());
+    assert_eq!(
+        lookup(handle, identity, whole.0, VM_ACCESS_WRITE),
+        Err(PagerVmaError::Denied),
+        "the code span must not stay writable"
+    );
+    assert_eq!(
+        rewrite_attenuated_range(
+            handle,
+            identity,
+            whole.0,
+            whole.1,
+            Some(VM_PROT_WRITE | VM_PROT_EXECUTE),
+            || Ok(())
+        ),
+        Err(PagerVmaError::Denied)
+    );
+    assert_eq!(
+        rewrite_attenuated_range(
+            handle,
+            identity,
+            whole.0,
+            whole.1,
+            Some(VM_PROT_READ | VM_PROT_WRITE),
+            || Ok(())
+        ),
+        Ok(true)
+    );
+    assert!(lookup(handle, identity, whole.0, VM_ACCESS_WRITE).is_ok());
+    revoke(handle, identity, whole.0, lookup(handle, identity, whole.0, VM_ACCESS_READ).unwrap().vma_generation).unwrap();
+}
+
+#[test]
+fn a_delegated_file_object_stays_attenuation_only() {
+    let _guard = guard();
+    let handle = ProcessHandle::new(27, 75);
+    let identity = identity(75, 77);
+    let mut file = template(0x70_000);
+    file.object.object_type = rustos_user_abi::pager::VM_OBJECT_FILE_PRIVATE;
+    file.object.backing_service = 2;
+    file.object.rights = VM_PROT_READ;
+    file.prot = VM_PROT_READ;
+    let published = publish(handle, identity, file, MAX_PAGER_VMAS_PER_PROCESS).unwrap();
+    assert_eq!(
+        rewrite_attenuated_range(
+            handle,
+            identity,
+            published.start,
+            published.end,
+            Some(VM_PROT_READ | VM_PROT_WRITE),
+            || Ok(())
+        ),
+        Err(PagerVmaError::Denied),
+        "delegated source rights must never be widened by the process"
+    );
+    revoke(handle, identity, published.start, published.vma_generation).unwrap();
 }

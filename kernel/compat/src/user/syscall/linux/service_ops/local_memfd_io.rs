@@ -42,6 +42,44 @@ pub(super) fn read_at(
     })
 }
 
+/// pread from an app DMA-BUF capability. Rights, range and liveness come from
+/// the held capability; an admission hold over the whole (page-multiple)
+/// allocation excludes provider retirement, scrub and reuse for the duration.
+/// Revoked or stale capabilities fail with ESTALE and never read bytes.
+pub(super) fn read_device_buffer_at(
+    buffer: &kernel_ps::api::handles::BufferCapability,
+    user_ptr: u64,
+    user_len: u64,
+    offset: u64,
+) -> u64 {
+    use kernel_ps::api::handles::{BufferError, BufferRights};
+    if !buffer.rights().contains(BufferRights::READ) {
+        return linux_errno(LINUX_EACCES);
+    }
+    let _hold = match buffer.admit_mapping(0, buffer.len(), false) {
+        Ok(hold) => hold,
+        Err(BufferError::Stale) => return linux_errno(LINUX_ESTALE),
+        Err(_) => return linux_errno(LINUX_EINVAL),
+    };
+    let len = buffer.len();
+    if offset >= len {
+        return 0;
+    }
+    let available = len - offset;
+    let mut failed = false;
+    let result = read_with(user_ptr, user_len.min(available), |copied, chunk| {
+        let Some(position) = offset.checked_add(copied as u64) else { failed = true; return 0 };
+        let Some(aperture) = buffer.aperture_offset().checked_add(position) else { failed = true; return 0 };
+        if kernel_io_manager::api::app_buffer::read_range(aperture, chunk) {
+            chunk.len()
+        } else {
+            failed = true;
+            0
+        }
+    });
+    if failed && result == 0 { linux_errno(LINUX_ENODEV) } else { result }
+}
+
 pub(super) fn write(memfd: &mut multitask::MemfdHandle, user_ptr: u64, user_len: u64) -> u64 {
     let Ok(user_len) = usize::try_from(user_len) else {
         return linux_errno(LINUX_EINVAL);

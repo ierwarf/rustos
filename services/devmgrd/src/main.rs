@@ -13,6 +13,7 @@
 //! - **Forbidden:** No caller-selected route, silent direct fallback, rights
 //!   widening, guessed owner identity, or unbounded policy worker creation.
 //! - **Evidence:** `commercial-envelope`, `service-call-authority`.
+mod app_buffer;
 use std::io::Write;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -117,6 +118,13 @@ fn main() {
     };
     // Separates a stall in thread creation from one in endpoint registration.
     debug_line("devmgrd: ioctl workers started");
+    let app_buffers = match app_buffer::start() {
+        Ok(worker) => worker,
+        Err(errno) => {
+            debug_line(&format!("devmgrd: fatal app-buffer worker spawn failed errno={errno}"));
+            return;
+        }
+    };
     let register =
         rustos_svc_runtime::ipc::register_service_endpoint(IPC_SERVICE_DEVMGRD, endpoint as u64);
     if register < 0 {
@@ -133,7 +141,7 @@ fn main() {
         debug_line(&format!("devmgrd: heartbeat admission failed {error}"));
         return;
     }
-    serve(endpoint as u64, &sessiond_workers);
+    serve(endpoint as u64, &sessiond_workers, &app_buffers);
 }
 
 fn start_sessiond_ioctl_workers() -> Result<SessiondIoctlWorkers, i32> {
@@ -181,7 +189,7 @@ fn sessiond_ioctl_worker(receiver: Receiver<SessiondIoctlWork>) {
     }
 }
 
-fn serve(endpoint: u64, sessiond_workers: &SessiondIoctlWorkers) {
+fn serve(endpoint: u64, sessiond_workers: &SessiondIoctlWorkers, app_buffers: &app_buffer::Worker) {
     loop {
         let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
@@ -240,6 +248,19 @@ fn serve(endpoint: u64, sessiond_workers: &SessiondIoctlWorkers) {
                     reply_device_ioctl(reply_cap, &request)
                 }
             }
+            size if size == size_of::<rustos_user_abi::syscall::DevmgrdAppBufferRequest>() => {
+                let request =
+                    read_unaligned::<rustos_user_abi::syscall::DevmgrdAppBufferRequest>(&request);
+                // The kernel stamped pid/tid; they must be the IPC sender.
+                if !identity_is_exact_sender(request.pid, request.tid, sender_pid, sender_tid) {
+                    reply_app_buffer_status(reply_cap, libc::EACCES)
+                } else {
+                    match app_buffers.try_send(app_buffer::Work { reply_cap, request }) {
+                        Ok(()) => continue,
+                        Err(reply_cap) => reply_app_buffer_status(reply_cap, libc::EAGAIN),
+                    }
+                }
+            }
             size if size == size_of::<CommercialMaxProtocolRequest>() => {
                 let request = read_unaligned::<CommercialMaxProtocolRequest>(&request);
                 reply_commercial_request(reply_cap, &request, sender_pid, sender_tid)
@@ -261,6 +282,19 @@ fn serve(endpoint: u64, sessiond_workers: &SessiondIoctlWorkers) {
             REPLY_FAILURE_DIAGNOSTICS.record("devmgrd", "ipc", -reply);
         }
     }
+}
+
+fn reply_app_buffer_status(reply_cap: u64, status: i32) -> i64 {
+    let response = rustos_user_abi::syscall::DevmgrdAppBufferResponse {
+        version: rustos_user_abi::syscall::APP_BUFFER_IPC_VERSION,
+        status,
+    };
+    syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        (&response as *const rustos_user_abi::syscall::DevmgrdAppBufferResponse) as u64,
+        size_of::<rustos_user_abi::syscall::DevmgrdAppBufferResponse>() as u64,
+    )
 }
 
 fn reply_commercial_request(
@@ -1225,3 +1259,6 @@ fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
     // imposes no alignment precondition and `T: Copy` permits a bitwise value.
     unsafe { bytes.as_ptr().cast::<T>().read_unaligned() }
 }
+
+// Native ABI revision stamp (hint, not authority); see docs/architecture/evolution-rules.md.
+rustos_user_abi::native_abi_note!();

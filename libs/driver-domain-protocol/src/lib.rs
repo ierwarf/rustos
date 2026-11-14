@@ -9,6 +9,7 @@
 #[cfg(all(feature = "std", not(kani)))]
 extern crate std;
 
+mod app_buffer;
 mod display;
 mod gui;
 mod gpu;
@@ -16,6 +17,7 @@ mod block;
 mod input;
 mod net;
 
+pub use app_buffer::*;
 pub use display::*;
 pub use gui::*;
 pub use gpu::*;
@@ -23,6 +25,8 @@ pub use block::*;
 pub use input::*;
 pub use net::*;
 
+#[cfg(test)]
+mod abi_registry_tests;
 #[cfg(kani)]
 mod verification;
 #[cfg(test)]

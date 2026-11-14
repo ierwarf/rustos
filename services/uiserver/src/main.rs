@@ -1250,3 +1250,6 @@ fn main() {
     }
     std::process::exit(exit_code);
 }
+
+// Native ABI revision stamp (hint, not authority); see docs/architecture/evolution-rules.md.
+rustos_user_abi::native_abi_note!();

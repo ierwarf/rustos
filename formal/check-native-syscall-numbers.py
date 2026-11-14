@@ -10,7 +10,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCES = [ROOT / "libs/rustos-user-abi/src/syscall.rs"]
+SOURCES = [
+    ROOT / "libs/rustos-user-abi/src/syscall.rs",
+    ROOT / "libs/rustos-user-abi/src/pager.rs",
+]
 SOURCES.extend(sorted((ROOT / "libs/rustos-user-abi/src/syscall").glob("*.rs")))
 DECLARATION = re.compile(
     r"pub const\s+(SYS_RUSTOS_[A-Z0-9_]+)\s*:\s*u64\s*=\s*([^;]+);",

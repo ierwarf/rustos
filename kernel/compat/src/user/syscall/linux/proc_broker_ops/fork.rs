@@ -25,7 +25,7 @@ use super::*;
 /// Both resources are waited for: the process-table reservation (taken here)
 /// and a scheduler task slot (observed here, taken when the child is
 /// created). With only the first, a sequential fork/wait loop on a machine
-/// whose 128 task slots are nearly all in use occasionally found the table
+/// whose task slots are nearly all in use occasionally found the table
 /// free and the slot not yet retired, and the child was refused with EAGAIN
 /// after the address space had already been cloned.
 fn reserve_spawn_after_reclaim(parent_pid: u64) -> Option<multitask::SpawnReservation> {

@@ -78,6 +78,7 @@ struct KvmLayout {
     _display_backing_dir: Option<TempDir>,
     gui_dvm_surfaces: Option<PathBuf>,
     gui_dvm_pixels: Option<PathBuf>,
+    gui_dvm_app_buffers: Option<PathBuf>,
     dvm_display_doorbell: Option<PathBuf>,
     dvm_network_shmem: Option<PathBuf>,
     dvm_block_aperture: Option<PathBuf>,
@@ -583,6 +584,48 @@ fn run_one_smoke_unarchived(
             );
         }
     }
+    if options.local_fd_probe {
+        let rustos_log = read_log_lossy(&layout.debugcon_log)
+            .with_context(|| format!("read {}", layout.debugcon_log.display()))?;
+        validate_local_fd_probe_log(&rustos_log)?;
+        println!("xtask: local fd probe: every pipe/eventfd case passed in the guest");
+    }
+    if options.app_dmabuf_probe {
+        let rustos_log = read_log_lossy(&layout.debugcon_log)
+            .with_context(|| format!("read {}", layout.debugcon_log.display()))?;
+        let evidence = validate_app_dmabuf_probe_log(&rustos_log)?;
+        println!(
+            "xtask: app DMA-BUF probe: aperture range {:#x}+{:#x} was allocated through devmgrd, exported and acknowledged by the DVM, imported and presented by uiserver, a forged descriptor was refused, and the range was revoked, acknowledged and scrubbed",
+            evidence.offset, evidence.length
+        );
+    }
+    if options.mmap_cost_probe {
+        let rustos_log = read_log_lossy(&layout.debugcon_log)
+            .with_context(|| format!("read {}", layout.debugcon_log.display()))?;
+        let records = validate_mmap_cost_log(&rustos_log, &options.mmap_cost_sizes_mib)?;
+        println!(
+            "xtask: mmap cost probe ({} vCPU), per-size result of one boot (free pages are 4 KiB frames):\n{}",
+            options.rustos_vcpus,
+            render_mmap_cost_table(&records)
+        );
+        for line in rustos_log.lines().filter(|line| line.contains(MMAP_COST_SAMPLE_MARKER)) {
+            println!("{}", &line[line.find(MMAP_COST_SAMPLE_MARKER).unwrap_or(0)..]);
+        }
+    }
+    if options.library_map_probe {
+        let rustos_log = read_log_lossy(&layout.debugcon_log)
+            .with_context(|| format!("read {}", layout.debugcon_log.display()))?;
+        let pages = validate_library_map_probe_log(&rustos_log, options.library_reclaim_probe)?;
+        if options.library_reclaim_probe {
+            println!(
+                "xtask: library reclaim probe: pagerd retired library objects under pressure and a live {pages}-page alias mapping kept its bytes and frames"
+            );
+        } else {
+            println!(
+                "xtask: library map probe: two processes and a fork child shared {pages} warmed library frames, a private write stayed isolated, the EOF tail read zero, and unmap/exit released the leaves"
+            );
+        }
+    }
     phase("smoke-runtime-validated");
     let success_evidence = write_kvm_success_summary(
         config,
@@ -695,6 +738,12 @@ pub(crate) fn kvm_run_command(
         oom_hog_job_limit: false,
         job_policy_probe: false,
         proc_stress: false,
+        local_fd_probe: false,
+        library_map_probe: false,
+        app_dmabuf_probe: false,
+        mmap_cost_probe: false,
+        mmap_cost_sizes_mib: MMAP_COST_DEFAULT_SIZES_MIB.to_vec(),
+        library_reclaim_probe: false,
         release_stage_probe: false,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,

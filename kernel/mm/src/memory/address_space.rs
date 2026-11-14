@@ -28,6 +28,8 @@ use kernel_hal::api::arch::tlb::{AddressSpaceMutationGuard, begin_address_space_
 mod atomic_user;
 mod execution_lifetime;
 mod frame_release;
+mod immutable;
+pub use immutable::ImmutableBacking;
 mod pager_fault_mapping;
 mod range_query;
 mod retirement;
@@ -59,6 +61,11 @@ const PAGE_4KIB_U64: u64 = PAGE_4KIB as u64;
 const USER_PML4_INDEX: usize = 1;
 pub const USER_SPACE_BASE: u64 = (USER_PML4_INDEX as u64) << 39;
 pub const USER_SPACE_END_EXCLUSIVE: u64 = ((USER_PML4_INDEX + 1) as u64) << 39;
+/// A retained leaf whose bytes are inaccessible to userspace (PROT_NONE).
+/// Bit 10 is software-defined at leaf level; its directory-level meaning is
+/// independently ROOT_OWNED_USER_TABLE. Keep PRESENT for ownership/reclaim,
+/// but clear USER_ACCESSIBLE so hardware and checked user-copy both deny it.
+pub const USER_INACCESSIBLE_LEAF: PageTableFlags = PageTableFlags::BIT_10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PagerFaultLeaf {
     virtual_address: u64,
@@ -100,6 +107,14 @@ pub enum AddressSpaceError {
     InvalidFrameOwnership,
 }
 
+pub(crate) fn data_claim_result(claim: phys::DataClaim) -> Result<(), AddressSpaceError> {
+    match claim {
+        phys::DataClaim::Claimed => Ok(()),
+        phys::DataClaim::Quota => Err(AddressSpaceError::OutOfFrames),
+        phys::DataClaim::Invalid => Err(AddressSpaceError::InvalidFrameOwnership),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserRegion {
     pub start: VirtAddr,
@@ -128,6 +143,7 @@ pub struct ProcessAddressSpace {
     pml4_frame_phys: u64,
     next_user_addr: u64,
     execution: Option<execution_lifetime::Owner>,
+    immutable: Vec<immutable::ImmutableMapping>,
 }
 
 impl ProcessAddressSpace {
@@ -156,6 +172,7 @@ impl ProcessAddressSpace {
             pml4_frame_phys: pml4_phys.as_u64(),
             next_user_addr: USER_SPACE_BASE,
             execution: Some(execution_lifetime::Owner::new(pml4_phys.as_u64(), true)),
+            immutable: Vec::new(),
         })
     }
 
@@ -163,11 +180,34 @@ impl ProcessAddressSpace {
         PhysAddr::new(self.pml4_frame_phys)
     }
 
+    /// Keep mapping-accounting custody until this execution root is reclaimed.
+    pub fn set_mapping_meter(&mut self, meter: crate::memory::kmem_charge::SharedMeter) {
+        self.execution.as_mut().expect("live MM owner").set_mapping_meter(meter);
+    }
+
+    /// Bind both immutable backing custody and resident ledger atomically for
+    /// an unpublished, quiescent root. A refused bind retains no reservation.
+    pub fn bind_job_charge(&mut self, group: usize) -> bool {
+        let owner = self.execution.as_mut().expect("live MM owner");
+        if !owner.bind_backings(group) { return false; }
+        if !phys::bind_root_charge(self.pml4_frame_phys, group) {
+            owner.unbind_backings();
+            return false;
+        }
+        true
+    }
+
+    #[cfg(all(debug_assertions, not(rustos_boot_image)))]
+    pub fn bind_job_charge_for_tests(&mut self, group: usize) -> bool {
+        self.execution.as_mut().expect("test MM owner").bind_backings(group)
+    }
+
     /// Retains the complete owned root/PTE/frame ledger, not mutable mappings.
     pub fn pin_execution(&self) -> Option<ExecutionPin> {
         self.execution.as_ref()?.pin()
     }
     pub fn into_retirement_owner(mut self) -> RetirementOwner {
+        self.immutable.clear();
         RetirementOwner {
             owner: self
                 .execution
@@ -192,6 +232,7 @@ impl ProcessAddressSpace {
             pml4_frame_phys: root,
             next_user_addr: USER_SPACE_BASE,
             execution: Some(execution_lifetime::Owner::new(root, false)),
+            immutable: Vec::new(),
         }
     }
 
@@ -201,6 +242,7 @@ impl ProcessAddressSpace {
             pml4_frame_phys: 0,
             next_user_addr: USER_SPACE_BASE,
             execution: Some(execution_lifetime::Owner::new(0, false)),
+            immutable: Vec::new(),
         }
     }
 
@@ -231,6 +273,10 @@ impl ProcessAddressSpace {
         downgraded
             .try_reserve_exact(ownership.leaves.len())
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        // The child mapper acquires its own mutation stripe. Clone immutable
+        // aliases before taking the parent stripe to avoid nested class-38
+        // locks; the caller's fork hold still excludes parent VMA mutation.
+        self.clone_immutable_mappings_into(&mut cloned)?;
         let mutation = begin_address_space_mutation(self.root_phys());
 
         for leaf in ownership.leaves {
@@ -315,11 +361,11 @@ impl ProcessAddressSpace {
                 return Err(AddressSpaceError::OutOfFrames);
             };
             let child_root = cloned.pml4_frame_phys;
-            if !phys::claim_data_leaf(child_root, leaf.virtual_address, dst_phys.as_u64()) {
+            if let Err(error) = data_claim_result(phys::claim_data_leaf(child_root, leaf.virtual_address, dst_phys.as_u64())) {
                 phys::free_frame(dst_phys);
                 rollback_cloned_leaves(&mut cloned, &cloned_leaves);
                 drop(mutation);
-                return Err(AddressSpaceError::InvalidFrameOwnership);
+                return Err(error);
             }
             unsafe {
                 ptr::copy_nonoverlapping(
@@ -480,11 +526,11 @@ impl ProcessAddressSpace {
             }
 
             let virtual_address = virt.as_u64();
-            if !phys::claim_data_leaf(self.pml4_frame_phys, virtual_address, frame_phys.as_u64()) {
+            if let Err(error) = data_claim_result(phys::claim_data_leaf(self.pml4_frame_phys, virtual_address, frame_phys.as_u64())) {
                 phys::free_frame(frame_phys);
                 free_frame_buffer_tail(&frame_buffer[frame_buffer_pos..frame_buffer_len]);
                 rollback_user_pages(self, &mapped_pages, mutation);
-                return Err(AddressSpaceError::InvalidFrameOwnership);
+                return Err(error);
             }
             if let Err(err) = self.map_user_page(virt, frame_phys, page_flags) {
                 phys::cancel_data_leaf(self.pml4_frame_phys, virtual_address, frame_phys.as_u64());
@@ -681,6 +727,11 @@ impl ProcessAddressSpace {
             return Err(AddressSpaceError::NotMapped);
         }
 
+        // Private immutable aliases must become owned copies before a write
+        // upgrade. Complete-span validation above precedes all allocation/PTEs.
+        if page_flags.contains(PageTableFlags::WRITABLE) {
+            self.privatize_immutable_pages(start, page_count)?;
+        }
         let _mutation = begin_address_space_mutation(self.root_phys());
         for page_index in 0..page_count {
             let virt = page_addr(start, page_index)?;
@@ -1182,7 +1233,14 @@ fn normalize_user_page_flags(flags: PageTableFlags) -> Result<PageTableFlags, Ad
         return Err(AddressSpaceError::ProtectionViolation);
     }
 
-    Ok(flags | PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE)
+    if flags.contains(USER_INACCESSIBLE_LEAF) {
+        if flags.contains(PageTableFlags::WRITABLE) || !flags.contains(PageTableFlags::NO_EXECUTE) {
+            return Err(AddressSpaceError::ProtectionViolation);
+        }
+        Ok((flags | PageTableFlags::PRESENT).difference(PageTableFlags::USER_ACCESSIBLE))
+    } else {
+        Ok(flags | PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE)
+    }
 }
 
 fn preserve_4k_leaf_pat(existing: PageTableFlags, requested: PageTableFlags) -> PageTableFlags {
@@ -1339,6 +1397,7 @@ pub fn smoke_test() {
         phys.as_u64()
     );
     kmem_limit_smoke();
+    immutable::smoke_test();
 }
 
 #[cfg(test)]

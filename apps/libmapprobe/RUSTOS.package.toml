@@ -1,0 +1,19 @@
+id = "libmapprobe"
+kind = "app"
+execution_domain = "user"
+startup = "session"
+
+[build]
+builder = "c-demo"
+source = "libmapprobe.c"
+extra_args = []
+
+[install]
+path = "apps/libmapprobe/libmapprobe.elf"
+
+[[desktop.entries]]
+display_name = "Library map probe"
+weight_micros = 100
+logical_admin = false
+console_hosted = false
+no_display = true

@@ -53,10 +53,10 @@ const FRAME_BYTES: usize = 4096;
 const HANDLE_INDEX_BITS: u32 = 16;
 const HANDLE_INDEX_MASK: u64 = (1_u64 << HANDLE_INDEX_BITS) - 1;
 const HANDLE_MAX_GENERATION: u64 = u64::MAX >> HANDLE_INDEX_BITS;
-const FRAME_RIGHT_READ: u64 = 1 << 0;
-const FRAME_RIGHT_WRITE: u64 = 1 << 1;
-const FRAME_RIGHT_EXECUTE: u64 = 1 << 2;
-const FRAME_RIGHT_KNOWN: u64 = FRAME_RIGHT_READ | FRAME_RIGHT_WRITE | FRAME_RIGHT_EXECUTE;
+pub(super) const FRAME_RIGHT_READ: u64 = 1 << 0;
+pub(super) const FRAME_RIGHT_WRITE: u64 = 1 << 1;
+pub(super) const FRAME_RIGHT_EXECUTE: u64 = 1 << 2;
+pub(super) const FRAME_RIGHT_KNOWN: u64 = FRAME_RIGHT_READ | FRAME_RIGHT_WRITE | FRAME_RIGHT_EXECUTE;
 static FIRST_FAULT_FRAME_REPLENISHMENT: AtomicBool = AtomicBool::new(false);
 /// Set by the IRQ-off consumer once the wired reserve crosses its low-water
 /// mark.  The producer consumes this at an ordinary scheduled kernel-task

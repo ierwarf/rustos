@@ -29,6 +29,7 @@ pub enum MmapFdKind {
     Memfd,
     DisplaySurface,
     Device,
+    DeviceBuffer,
     Other,
 }
 
@@ -74,7 +75,7 @@ pub fn plan_mmap(
         (false, MmapSharing::Private, Some(MmapFdKind::File)) => Ok(MmapPlan::FilePrivate),
         (false, MmapSharing::Private, Some(_)) => Err(MmapPlanError::InvalidBacking),
         (false, MmapSharing::Shared, Some(MmapFdKind::Memfd)) => Ok(MmapPlan::MemfdShared),
-        (false, MmapSharing::Shared, Some(MmapFdKind::DisplaySurface | MmapFdKind::Device)) => {
+        (false, MmapSharing::Shared, Some(MmapFdKind::DisplaySurface | MmapFdKind::Device | MmapFdKind::DeviceBuffer)) => {
             Ok(MmapPlan::DeviceShared)
         }
         (false, MmapSharing::Shared, Some(_)) => Err(MmapPlanError::AccessDenied),
@@ -82,9 +83,44 @@ pub fn plan_mmap(
     }
 }
 
+/// Whether a planned private file mapping is worth asking the kernel to bind
+/// to a shared library object. This is only a hint that saves a vfsd round trip
+/// for mappings that can never be served: eligibility itself is vfsd's
+/// attestation plus the kernel's sealed-object registry, and a refusal leaves
+/// the eager copy path in force. Reserved (PROT_NONE), unreadable and
+/// misaligned mappings are never candidates.
+pub fn library_bind_candidate(plan: MmapPlan, prot: u64, offset: u64) -> bool {
+    const PROT_READ: u64 = 0x1;
+    plan == MmapPlan::FilePrivate && prot & PROT_READ != 0 && offset.is_multiple_of(4096)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_readable_aligned_private_file_mappings_are_bind_candidates() {
+        assert!(library_bind_candidate(MmapPlan::FilePrivate, 0x1, 0x2000));
+        assert!(library_bind_candidate(MmapPlan::FilePrivate, 0x1 | 0x4, 0));
+        assert!(!library_bind_candidate(MmapPlan::FilePrivate, 0, 0));
+        assert!(!library_bind_candidate(MmapPlan::FilePrivate, 0x2, 0));
+        assert!(!library_bind_candidate(MmapPlan::FilePrivate, 0x1, 0x2001));
+        for plan in [MmapPlan::Anonymous, MmapPlan::Reserved, MmapPlan::MemfdShared, MmapPlan::DeviceShared] {
+            assert!(!library_bind_candidate(plan, 0x1, 0));
+        }
+    }
+
+    #[test]
+    fn device_buffer_maps_shared_only() {
+        assert_eq!(
+            plan_mmap(false, MmapSharing::Shared, false, Some(MmapFdKind::DeviceBuffer)),
+            Ok(MmapPlan::DeviceShared)
+        );
+        assert_eq!(
+            plan_mmap(false, MmapSharing::Private, false, Some(MmapFdKind::DeviceBuffer)),
+            Err(MmapPlanError::InvalidBacking)
+        );
+    }
 
     #[test]
     fn invalid_backing_is_rejected_before_a_fixed_replace_plan_exists() {

@@ -51,7 +51,8 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR,
     COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN, COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR,
     COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY, COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH,
-    COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE, IPC_SERVICE_LOADERD, IPC_SERVICE_ROOTD, IPC_SERVICE_VFSD,
+    COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
+    IPC_SERVICE_ROOTD, IPC_SERVICE_VFSD,
     LINUX_STATX_SIZE, LINUX_STAT_SIZE, PRODUCT_MILESTONE_BOOTSTRAP_EXECUTABLE_SNAPSHOT_SEALED,
     SERVICE_CHECKPOINT_FLAG_TOMBSTONE, SERVICE_CHECKPOINT_VALUE_CAPACITY,
     SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ACCESS, SYSCALL_OFFLOAD_OP_LINUX_CHDIR,
@@ -65,7 +66,7 @@ use rustos_user_abi::syscall::{
     VFS_CURSOR_SETTLE_COMMIT, VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN,
     VFS_IPC_ABI_VERSION, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CHECKPOINT_ACK,
     VFS_IPC_OP_CLOSE, VFS_IPC_OP_CURSOR_SETTLE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT,
-    VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK,
+    VFS_IPC_OP_FILE_IDENTITY, VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK,
     VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT,
     VFS_IPC_OP_POLL_QUERY, VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT,
     VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE,
@@ -73,6 +74,8 @@ use rustos_user_abi::syscall::{
     VFS_EPOLL_CLAIM_MAX, VFS_POLL_BATCH_MAX, VFS_POLL_QUERY_EPOLL_CLAIM, VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT,
     VFS_POLL_QUERY_EPOLL_RETIRE, VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_POLL,
     WAITSET_ABI_VERSION, WAITSET_MAX_INTERESTS, WAITSET_SNAPSHOT_STATE_DISABLED,
+    VfsFileIdentityWire, VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME, VFS_IPC_OP_LIBRARY_READ,
+    VFS_LIBRARY_READ_MAX_BYTES, IPC_SERVICE_PAGERD,
 };
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
@@ -202,6 +205,20 @@ fn linux_response_for_op(op: u16) -> LinuxSyscallOffloadResponse {
     response.version = SYSCALL_OFFLOAD_ABI_VERSION;
     response.op = op;
     response
+}
+
+/// A VFS request must name its IPC sender. The exception is the read-only
+/// `FILE_IDENTITY` attestation and `PREAD64` (eager file-mapping copy) the
+/// mapping broker sends while running in syscalld's context on behalf of the
+/// client that owns the description: the
+/// sender thread must match, the sender must be the live syscalld owner, and
+/// vfsd still requires the named pid to own a funded description of that id.
+fn vfs_request_identity_admitted(request: &VfsIpcRequest, sender_pid: u64, sender_tid: u64) -> bool {
+    if request.pid == sender_pid && request.tid == sender_tid {
+        return true;
+    }
+    vfsd::client_proxy_shape(request.op, request.pid, request.tid, sender_pid, sender_tid)
+        && rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_LINUX_SYSCALLD, sender_pid) >= 0
 }
 
 fn reset_vfs_response_slot(op: u16) -> *mut VfsIpcResponse {
@@ -378,7 +395,7 @@ fn serve(endpoint: u64, mut state: VfsState) {
             } else if received as usize == size_of::<VfsIpcRequest>() {
                 let request = unsafe { &*request.as_ptr().cast::<VfsIpcRequest>() };
                 let response = reset_vfs_response_slot(request.op);
-                if request.pid != sender_pid || request.tid != sender_tid {
+                if !vfs_request_identity_admitted(request, sender_pid, sender_tid) {
                     unsafe { (*response).status = EACCES };
                 } else {
                     state.handle_vfs_request(request, unsafe { &mut *response });

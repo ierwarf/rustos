@@ -383,3 +383,14 @@ or incremental compile is build evidence only, never runtime or hardware
 evidence. Independent signed builds need not be byte-identical because the
 module-signing identity is per image; the certificate-bound verification and
 locked-input manifest are the release proof.
+
+### Application DMA-BUF aperture (not yet connected)
+
+The separate writable application aperture is not the atlas pixel pool. Its
+RustOS custody registry persists across provider publications, so an old
+unreclaimed allocation continues to exclude that range from a replacement
+provider. The registry currently has no authenticated production caller:
+service publication epochs, DVM request/reply, genuine app-buffer export,
+mapping, synchronization, and retirement are not integrated. A wire
+descriptor or a DVM-supplied offset is not allocation authority. The existing
+read-only atlas export and composition remain unchanged.

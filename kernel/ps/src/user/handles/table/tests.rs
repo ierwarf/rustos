@@ -791,3 +791,57 @@ fn fork_clone_leaves_a_stale_console_descriptor_closed_instead_of_panicking() {
     // already fully released above.
     core::mem::forget(table);
 }
+
+fn device_buffer(pool: &mut crate::user::handles::BufferPool, pages: u64) -> crate::user::handles::BufferCapability {
+    use crate::user::handles::{BufferOwner, BufferRights};
+    pool.allocate(BufferOwner { service_id: 4, generation: 9 }, pages * 4096, BufferRights::ALL)
+        .expect("aperture space")
+}
+
+#[test]
+fn a_device_buffer_publishes_only_through_its_exact_prepared_reservation() {
+    let mut pool = crate::user::handles::BufferPool::new(8 * 4096);
+    let cap = device_buffer(&mut pool, 1);
+    let mut table = HandleTable::new();
+    let (old, slots) = table.reserve_slots(1).unwrap();
+    let fd = slots[0];
+
+    assert!(!table.prepare_reserved_device_buffer(old + 1, fd), "foreign reservation id");
+    assert!(!table.prepare_reserved_device_buffer(old, fd + 1), "slot not owned by the reservation");
+    assert!(table.prepare_reserved_device_buffer(old, fd));
+    assert!(table.get_entry(fd).is_none(), "prepared slot stays invisible");
+    assert!(!table.commit_reserved_device_buffer(old + 1, fd, cap.clone()));
+    assert!(table.get_entry(fd).is_none());
+
+    // A cancelled reservation (timeout, lost lease, reused PID path) cannot
+    // publish, even after the same descriptor number is reserved again.
+    table.cancel_reservations(old, &slots);
+    assert!(!table.commit_reserved_device_buffer(old, fd, cap.clone()));
+    let (current, reused) = table.reserve_slots(1).unwrap();
+    assert_eq!(reused, slots);
+    assert_ne!(current, old);
+    assert!(!table.commit_reserved_device_buffer(old, fd, cap.clone()), "stale reservation id");
+    assert!(table.get_entry(fd).is_none());
+    assert!(table.prepare_reserved_device_buffer(current, fd));
+
+    assert!(table.commit_reserved_device_buffer(current, fd, cap.clone()));
+    assert!(matches!(table.get_entry(fd).unwrap().handle(), KernelHandle::DeviceBuffer(_)));
+    assert!(!table.commit_reserved_device_buffer(current, fd, cap.clone()), "commit is single-use");
+    assert!(table.reserved.is_empty());
+}
+
+#[test]
+fn held_device_buffer_bytes_count_distinct_allocations_once() {
+    let mut pool = crate::user::handles::BufferPool::new(8 * 4096);
+    let a = device_buffer(&mut pool, 2);
+    let b = device_buffer(&mut pool, 1);
+    let mut table = HandleTable::new();
+    assert_eq!(table.device_buffer_held_bytes(), 0);
+    let first = table.install(KernelHandle::DeviceBuffer(a.clone())).unwrap();
+    table.install(KernelHandle::DeviceBuffer(a.clone())).unwrap();
+    assert_eq!(table.device_buffer_held_bytes(), 2 * 4096, "duplicates of one allocation count once");
+    table.install(KernelHandle::DeviceBuffer(b)).unwrap();
+    assert_eq!(table.device_buffer_held_bytes(), 3 * 4096);
+    table.close(first);
+    assert_eq!(table.device_buffer_held_bytes(), 3 * 4096, "the duplicate keeps the allocation held");
+}

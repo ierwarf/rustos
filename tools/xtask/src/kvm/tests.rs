@@ -1057,6 +1057,23 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
     }
 
     #[test]
+    fn app_buffer_aperture_is_separate_writable_and_preallocated_once() {
+        assert_eq!(super::DVM_DISPLAY_PIXEL_PHYS_ADDR + super::DVM_DISPLAY_REGION_BYTES,
+                   super::DVM_APP_BUFFER_PHYS_ADDR);
+        let path = Path::new("/dev/shm/rustos-kvm-app-buffers");
+        for prealloc in [true, false] {
+            let mut command = Command::new("qemu-system-x86_64");
+            super::append_dvm_app_buffer_aperture(&mut command, path, prealloc);
+            let args = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
+            let backend = args.iter().find(|arg| arg.starts_with("memory-backend-file,id=dvm-app-buffers,")).unwrap();
+            assert!(backend.contains("share=on"));
+            assert!(!backend.contains("readonly=on"));
+            assert_eq!(backend.contains("prealloc=on"), prealloc);
+            assert!(args.iter().any(|arg| arg.contains(&format!("memaddr={}", super::DVM_APP_BUFFER_PHYS_ADDR))));
+        }
+    }
+
+    #[test]
     fn kvm_gpu_atlas_layout_fits_pixel_backing() {
         let pool = super::DvmGuiSurfacePoolHeader::new(
             DVM_DISPLAY_REGION_BYTES,

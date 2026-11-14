@@ -28,7 +28,10 @@ impl WaylandState {
         self.surfaces.push(surface);
     }
 
-    pub(super) fn find_surface_by_id(&self, surface_id: u32) -> Option<Arc<Mutex<WaylandSurfaceState>>> {
+    pub(super) fn find_surface_by_id(
+        &self,
+        surface_id: u32,
+    ) -> Option<Arc<Mutex<WaylandSurfaceState>>> {
         if surface_id == 0 {
             return None;
         }
@@ -70,7 +73,16 @@ impl WaylandState {
         diag_line(format!(
             "uiserver: retire_surface begin surface={surface_id}"
         ));
+        if self
+            .moving_surface
+            .is_some_and(|(id, _, _)| id == surface_id)
+        {
+            self.moving_surface = None;
+            self.pointer_button_down = false;
+            self.pointer_grab_serial = None;
+        }
         if let Some(object_id) = object_id.as_ref() {
+            self.drag_surface_destroyed(object_id);
             // Only the surface that owns the pointer grab ends it; retiring an
             // unrelated surface must not drop another client's drag.
             let owned_grab = self
@@ -102,6 +114,9 @@ impl WaylandState {
         state.alive = false;
         state.minimized = true;
         state.pixels = Arc::default();
+        state.original_pixels = Arc::default();
+        state.original_width = 0;
+        state.original_height = 0;
         state.width = 0;
         state.height = 0;
         state.stride_pixels = 0;
@@ -115,6 +130,7 @@ impl WaylandState {
         state.needs_initial_configure = false;
         drop(state);
         for buffer in pending_releases {
+            super::dmabuf::note_release(&buffer);
             buffer.release();
         }
         self.mark_dirty();

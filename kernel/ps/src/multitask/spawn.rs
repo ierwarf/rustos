@@ -100,8 +100,7 @@ fn spawn_user_process_inner(
         start_suspended,
         scheduling_context,
         spawn_reservation,
-    )
-    .ok_or(SpawnTaskError::NoFreeTaskSlot);
+    );
 
     let (spawned_from_user, slot) = match allocation {
         Ok(allocation) => allocation,
@@ -207,8 +206,7 @@ fn spawn_user_process_state_inner(
         start_suspended,
         None,
         spawn_reservation,
-    )
-    .ok_or(SpawnTaskError::NoFreeTaskSlot);
+    );
 
     let (spawned_from_user, slot) = match allocation {
         Ok(allocation) => allocation,

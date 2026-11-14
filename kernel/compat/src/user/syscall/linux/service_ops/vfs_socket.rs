@@ -376,6 +376,12 @@ pub fn syscall_linux_vfs_dup(oldfd: u64, newfd: u64, flags: u64, mode: VfsDupMod
 }
 
 pub fn syscall_linux_vfs_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
+    // Status flags and pipe sizing live on the kernel-local open description.
+    if let Some(local) = super::local_fd::current_local_fd(fd)
+        && let Some(result) = super::local_fd::fcntl(&local, cmd, arg)
+    {
+        return result;
+    }
     match cmd {
         linux_abi::F_DUPFD | linux_abi::F_DUPFD_CLOEXEC => {
             let Ok(min_fd) = i32::try_from(arg) else {
@@ -631,6 +637,9 @@ pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
             Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
         };
     }
+    if let Some(result) = super::local_fd::read(fd, user_ptr, user_len) {
+        return result;
+    }
     if current_socket_fd(fd) {
         // read(fd, ..., 0) is non-consuming even on a datagram socket.
         return socket_read_with_length(user_len, || super::vfs_meta::syscall_linux_net6(
@@ -681,11 +690,17 @@ pub fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, offset: 
     if offset > i64::MAX as u64 {
         return linux_errno(LINUX_EINVAL);
     }
+    if let Some(result) = super::local_fd::not_seekable(fd) {
+        return result;
+    }
     if let Some(memfd) = current_memfd_handle(fd) {
         let Ok(offset) = usize::try_from(offset) else {
             return linux_errno(LINUX_EINVAL);
         };
         return super::local_memfd_io::read_at(&memfd, user_ptr, user_len, offset);
+    }
+    if let Some(multitask::KernelHandle::DeviceBuffer(buffer)) = current_kernel_handle(fd) {
+        return super::local_memfd_io::read_device_buffer_at(&buffer, user_ptr, user_len, offset);
     }
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
@@ -717,6 +732,9 @@ pub fn syscall_linux_vfs_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
             Ok(written) => written as u64,
             Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
         };
+    }
+    if let Some(result) = super::local_fd::write(fd, user_ptr, user_len) {
+        return result;
     }
     if current_socket_fd(fd) {
         // A compositor writing events to a client whose receive buffer is full
@@ -1382,6 +1400,8 @@ pub enum ServiceHandleRef {
     RemoteVfs(u64),
     Epoll(multitask::EpollHandle),
     Input(u64),
+    Pipe(multitask::PipeHandle),
+    EventFd(multitask::EventFdHandle),
 }
 
 fn service_handle_refs_from_table(handles: &multitask::HandleTable) -> Vec<ServiceHandleRef> {
@@ -1419,7 +1439,11 @@ pub fn acquire_cloned_service_handle_refs(
 }
 
 pub fn release_all_service_handle_refs(process_id: u64) {
-    let closed = multitask::with_process_state_by_pid_mut(process_id, |state| {
+    // Callers have already sealed the process as exiting, which revokes its
+    // visibility; the teardown accessor is the one path that still reaches the
+    // handle table, so every open-description reference is released exactly
+    // once here instead of leaking with the process object.
+    let closed = multitask::with_process_state_for_teardown_mut(process_id, |state| {
         state.handles_mut().close_all()
     })
     .unwrap_or_default();
@@ -1485,6 +1509,8 @@ pub fn release_service_handle_refs(refs: &[ServiceHandleRef]) {
                     let _ = purge_vfs_epoll_object(WAITSET_PROVIDER_INPUTD, *token);
                 }
             }
+            ServiceHandleRef::Pipe(pipe) => super::local_fd::release_pipe(pipe, false),
+            ServiceHandleRef::EventFd(eventfd) => super::local_fd::release_eventfd(eventfd, false),
         }
     }
 }
@@ -1518,6 +1544,8 @@ pub fn release_service_handle_refs_bounded(refs: &[ServiceHandleRef]) {
                     let _ = purge_vfs_epoll_object_bounded(WAITSET_PROVIDER_INPUTD, *token);
                 }
             }
+            ServiceHandleRef::Pipe(pipe) => super::local_fd::release_pipe(pipe, true),
+            ServiceHandleRef::EventFd(eventfd) => super::local_fd::release_eventfd(eventfd, true),
         }
     }
 }
@@ -1534,6 +1562,10 @@ pub fn service_handle_ref_for_handle(handle: &multitask::KernelHandle) -> Option
             Some(ServiceHandleRef::RemoteVfs(remote.remote_id()))
         }
         multitask::KernelHandle::Epoll(epoll) => Some(ServiceHandleRef::Epoll(epoll.clone())),
+        multitask::KernelHandle::Pipe(pipe) => Some(ServiceHandleRef::Pipe(pipe.clone())),
+        multitask::KernelHandle::EventFd(eventfd) => {
+            Some(ServiceHandleRef::EventFd(eventfd.clone()))
+        }
         multitask::KernelHandle::Device(device)
             if device.device_id() == kernel_object::api::device::DeviceId::Input =>
         {
@@ -1556,6 +1588,14 @@ pub fn acquire_service_handle_ref(handle_ref: &ServiceHandleRef) -> Result<(), i
         ServiceHandleRef::Input(token) => {
             super::super::broker_ops::waitset_broker_ops::acquire_input_open_description(*token)
         }
+        ServiceHandleRef::Pipe(pipe) => pipe
+            .try_acquire_descriptor_reference()
+            .then_some(())
+            .ok_or(LINUX_EBADF),
+        ServiceHandleRef::EventFd(eventfd) => eventfd
+            .try_acquire_descriptor_reference()
+            .then_some(())
+            .ok_or(LINUX_EBADF),
     }
 }
 

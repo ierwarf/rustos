@@ -1415,3 +1415,6 @@ fn main() {
     }
     debug_line("ipcbench: end");
 }
+
+// Native ABI revision stamp (hint, not authority); see docs/architecture/evolution-rules.md.
+rustos_user_abi::native_abi_note!();

@@ -28,7 +28,11 @@ use crate::user::process_state::UserProcessState;
 /// Process slots the system admits until policy says otherwise. This is the
 /// boot default of the root job's `processes.max`, not a structural limit: the
 /// slot storage is chunked and grows on demand up to `slot_dir::SLOT_CEILING`.
-pub const DEFAULT_PROCESS_LIMIT: usize = 32;
+/// About twenty slots go to boot services; 64 leaves room for a multi-process
+/// application (a browser runs a dozen or more) plus helpers. Each process also
+/// owns a 2 MiB kernel stack per thread, so the kernel heap, not this number,
+/// bounds how many can be live on a small machine.
+pub const DEFAULT_PROCESS_LIMIT: usize = 64;
 static PROCESS_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_PROCESS_LIMIT);
 /// Deferred reap handles held before the reaper falls back to a full scan.
 const REAP_QUEUE_CAPACITY: usize = 64;
@@ -50,7 +54,12 @@ pub fn set_process_limit(limit: usize) -> usize {
     PROCESS_LIMIT.store(limit, Ordering::Relaxed);
     limit
 }
-pub const MAX_THREADS_PER_PROCESS: usize = 32;
+/// Per-process thread ceiling: covers a browser's main process (tens of threads
+/// plus worker pools) with headroom, and stays at most half of the task table so
+/// one process can never consume it (`MAX_TASK` is 256). It also sizes each
+/// process's placement cell (about 44 bytes per thread, about 5.6 KiB).
+pub const MAX_THREADS_PER_PROCESS: usize = 128;
+const _: () = assert!(MAX_THREADS_PER_PROCESS * 2 <= super::scheduler::MAX_TASK);
 type ProcessTableLock = TrackedSpinLock<ProcessTable, { LockClass::ProcessTable as u8 }>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -695,13 +704,14 @@ fn insert_largest(out: &mut [MemoryCensusEntry], len: usize, entry: MemoryCensus
     new_len
 }
 
-/// Fills `out` with the live, non-exiting processes that map the most memory,
-/// largest first, and returns how many entries were written.
+/// Fills `out` with live, non-exiting processes retaining the most resident
+/// memory, largest first, and returns how many entries were written.
 ///
 /// This allocates nothing and reads each resident count from the frame
-/// descriptor ledger without taking any process-state lock, so it may run
-/// while a process is faulting, exiting, or being retired. A root that has
-/// already been unregistered counts as zero pages.
+/// descriptor ledger and pinned-root backing counter without taking any
+/// process-state lock, so it may run while a process is faulting, exiting, or
+/// being retired. Counts include whole immutable objects still retained after
+/// unmap, matching resident admission rather than Linux's mapped-only RSS.
 pub fn memory_census(out: &mut [MemoryCensusEntry]) -> usize {
     let table = PROCESS_TABLE.lock();
     let mut len = 0;
@@ -712,8 +722,8 @@ pub fn memory_census(out: &mut [MemoryCensusEntry]) -> usize {
         if object.exiting || object.exit_pending {
             continue;
         }
-        let resident_pages =
-            kernel_mm::api::phys::data_leaf_count(object.mm_execution.root_phys()).unwrap_or(0);
+        let resident_pages = kernel_mm::api::phys::data_leaf_count(object.mm_execution.root_phys())
+            .unwrap_or(0).saturating_add(object.mm_execution.retained_backing_pages());
         len = insert_largest(
             out,
             len,
@@ -776,6 +786,18 @@ pub fn with_process_state_by_pid_mut<R>(
     process.with_visible_state_mut(|_, state| f(state))
 }
 
+/// State access for the process's own teardown. `mark_process_exiting`
+/// revokes visibility so nothing new is published, but the exit path still
+/// owns the handle table and must drain it; the counted reference keeps the
+/// state allocation alive and the lock serialises against late syscalls.
+pub fn with_process_state_for_teardown_mut<R>(
+    process_id: u64,
+    f: impl FnOnce(&mut UserProcessState) -> R,
+) -> Option<R> {
+    let process = retain_process_by_pid(process_id)?;
+    Some(process.with_state_mut(|_, state| f(state)))
+}
+
 pub fn with_process_state_by_pid<R>(
     process_id: u64,
     f: impl FnOnce(&UserProcessState) -> R,
@@ -797,6 +819,8 @@ pub enum StageRefusal {
     Transfer,
     /// The old address space refused to close admission (grant in flight).
     SealBusy,
+    /// The replacement mapping metadata exceeds the Job budget.
+    MappingQuota,
 }
 
 pub fn stage_exec_state(
@@ -818,9 +842,17 @@ pub fn stage_exec_state(
     .ok()
 }
 
+// Host process-table fixtures do not install the physical descriptor ledger.
+fn bind_process_root_charge(space: &mut ProcessAddressSpace, job_index: usize) -> bool {
+    #[cfg(not(test))]
+    { space.bind_job_charge(job_index) }
+    #[cfg(test)]
+    { space.bind_job_charge_for_tests(job_index) }
+}
+
 pub fn stage_exec_state_checked(
     reservation: ExecReservation,
-    address_space: ProcessAddressSpace,
+    mut address_space: ProcessAddressSpace,
     linux_process_state: crate::user::linux::LinuxProcessState,
     linux_memory_map: crate::user::linux::LinuxMemoryMapState,
     linux_runtime_profile: crate::user::linux::LinuxRuntimeProfile,
@@ -836,7 +868,7 @@ pub fn stage_exec_state_checked(
     );
     let process = retain_process(reservation.handle).ok_or(StageRefusal::ProcessGone)?;
     let staged = process.with_state_mut(|process_id, state| {
-        {
+        let job_index = {
             let mut table = PROCESS_TABLE.lock();
             let Some(object) = table.lookup_object_mut(reservation.handle) else {
                 return Err(StageRefusal::ProcessGone);
@@ -844,8 +876,17 @@ pub fn stage_exec_state_checked(
             if !exec_commit_may_transfer(object, reservation) {
                 return Err(StageRefusal::Transfer);
             }
-        }
+            object.job.index() as usize
+        };
 
+        let replacement_mapping_kmem = state.reserve_exec_mapping_kmem(&address_space)
+            .ok_or(StageRefusal::MappingQuota)?;
+        // A later root-bind or seal refusal can still leave execution pins on
+        // the staged root. Keep its meter until cold root reclamation too.
+        address_space.set_mapping_meter(replacement_mapping_kmem.clone());
+        if !bind_process_root_charge(&mut address_space, job_index) {
+            return Err(StageRefusal::MappingQuota);
+        }
         if !state.address_space().seal_execution() {
             return Err(StageRefusal::SealBusy);
         }
@@ -855,6 +896,7 @@ pub fn stage_exec_state_checked(
             linux_memory_map,
             linux_runtime_profile,
             exec_path,
+            replacement_mapping_kmem,
         );
 
         {
@@ -868,9 +910,6 @@ pub fn stage_exec_state_checked(
             );
             object.mm_execution = new_mm.pin_for_publication();
             object.mm_generation = reservation.next_mm_generation;
-            // The new image's root is quiescent until the exec is installed, so
-            // it can be bound and its already-mapped pages charged to the job.
-            let _ = kernel_mm::api::phys::bind_root_charge(new_root, object.job.index() as usize);
             object.exec_state_staged = true;
             let index = reservation.handle.index();
             let slot = &table.slots[index];
@@ -1587,6 +1626,24 @@ pub(crate) mod tests {
         }
 
         #[test]
+        fn census_includes_immutable_backing_not_present_in_owned_leaf_ledger() {
+            use super::super::{create_process, detach_task, mark_process_exiting, memory_census, reap_exited_processes};
+            use super::{isolate_process_table, new_state};
+            let _isolation = isolate_process_table();
+            let mut state = new_state();
+            state.address_space_mut().add_immutable_metadata_for_tests();
+            let handle = create_process(8_104, state).expect("immutable-backed process");
+            let mut out = [MemoryCensusEntry::default(); 1];
+            assert_eq!(memory_census(&mut out), 1);
+            assert_eq!(out[0].process_id, 8_104);
+            assert_eq!(out[0].resident_pages, 1);
+            mark_process_exiting(8_104).expect("mark immutable process exiting");
+            detach_task(handle).expect("detach modeled task");
+            assert_eq!(reap_exited_processes(), 1);
+            kernel_mm::api::address_space::drain_retired_address_spaces(128);
+        }
+
+        #[test]
         fn a_full_census_drops_an_entry_smaller_than_all_it_holds() {
             let mut out = [MemoryCensusEntry::default(); 2];
             let mut len = insert_largest(&mut out, 0, entry(1, 10));
@@ -1926,6 +1983,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn async_broker_generation_commit_rejects_exec_exit_and_process_substitution() {
+        let _isolation = isolate_process_table();
+        let handle = create_process(4_243, new_state()).expect("process handle");
+        let identity = live_process_identity(handle).unwrap();
+        let commit = |process_generation, mm_generation| {
+            crate::multitask::with_process_state_by_generation_mut(
+                4_243, process_generation, mm_generation, |state| state.exec_path().len(),
+            )
+        };
+        assert!(commit(identity.process_generation(), identity.mm_generation()).is_some());
+        assert!(commit(identity.process_generation() + 1, identity.mm_generation()).is_none());
+        assert!(commit(identity.process_generation(), identity.mm_generation() + 1).is_none());
+        {
+            let mut table = super::PROCESS_TABLE.lock();
+            table.lookup_object_mut(handle).unwrap().mm_generation += 1;
+            super::publish_slot_visibility(handle.index(), &table.slots[handle.index()]);
+        }
+        assert!(commit(identity.process_generation(), identity.mm_generation()).is_none());
+        let next = live_process_identity(handle).unwrap();
+        assert!(commit(next.process_generation(), next.mm_generation()).is_some());
+        mark_process_exiting(4_243).unwrap();
+        assert!(commit(next.process_generation(), next.mm_generation()).is_none());
+    }
+
+    #[test]
     fn retained_ref_rejects_address_space_generation_substitution() {
         let _isolation = isolate_process_table();
         let handle = create_process(4_242, new_state()).expect("process handle");
@@ -2099,11 +2181,30 @@ pub(crate) mod tests {
             Some(super::MAX_THREADS_PER_PROCESS)
         );
         assert_eq!(attach_task(handle), None);
+        // An exiting thread frees exactly one slot, and only one.
+        detach_task(handle).expect("a thread exits");
+        assert_eq!(
+            thread_count_by_pid(45),
+            Some(super::MAX_THREADS_PER_PROCESS - 1)
+        );
+        attach_task(handle).expect("the freed slot is reusable");
+        assert_eq!(attach_task(handle), None);
 
         for _ in 0..super::MAX_THREADS_PER_PROCESS {
             detach_task(handle).expect("detach admitted thread");
         }
         assert_eq!(reap_exited_processes(), 1);
+    }
+
+    #[test]
+    fn the_thread_ceiling_covers_a_browser_and_never_exceeds_half_the_task_table() {
+        // A multi-process browser's main process runs tens of threads plus worker
+        // pools; the ceiling must leave service and helper slots for the rest.
+        assert!(super::MAX_THREADS_PER_PROCESS >= 128);
+        assert!(super::MAX_THREADS_PER_PROCESS * 2 <= super::super::scheduler::MAX_TASK);
+        // The root job admits a browser's process tree beside the boot services.
+        assert!(DEFAULT_PROCESS_LIMIT >= 64);
+        assert!(DEFAULT_PROCESS_LIMIT <= super::super::scheduler::MAX_TASK);
     }
 
     #[test]

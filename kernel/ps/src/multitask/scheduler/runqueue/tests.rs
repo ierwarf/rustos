@@ -1216,3 +1216,18 @@ fn mailbox_adoption_survives_a_terminal_withdrawal_that_beats_its_owner_cas() {
     release_retired(slot);
     reset_before_publication();
 }
+
+/// Every slot-indexed table is sized from the one task-table constant, so no
+/// slot below `MAX_TASK` can index past a table that was left at the old size.
+#[test]
+fn slot_indexed_runqueue_tables_cover_the_whole_task_table() {
+    assert_eq!(VRUNTIME_NS.len(), MAX_TASK);
+    assert_eq!(EXEC_START_TICKS.len(), MAX_TASK);
+    assert_eq!(SAVED_RSP.len(), MAX_TASK);
+    assert_eq!(KERNEL_STACK_BASE.len(), MAX_TASK);
+    assert_eq!(KERNEL_STACK_TOP.len(), MAX_TASK);
+    assert_eq!(BITMAP_WORDS * 64, MAX_TASK);
+    assert_eq!(MAILBOX_CAPACITY, MAX_TASK);
+    assert_eq!(crate::multitask::MAX_SCHEDULER_TASKS, MAX_TASK);
+    assert!(kernel_ipc_runtime::api::MAX_ENDPOINT_WAKE_TASKS >= MAX_TASK);
+}

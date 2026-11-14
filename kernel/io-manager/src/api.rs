@@ -668,3 +668,30 @@ pub mod vfs {
         }
     }
 }
+
+/// Fixed GUI-DVM app-buffer transport. Callers must hold the authenticated
+/// service publication lease and retain the allocation capability.
+pub mod app_buffer {
+    pub use crate::io::dvm_display::AppBufferTransportError;
+    /// Verified physical address of `[offset, offset+len)` in the app aperture.
+    pub fn aperture_phys(offset: u64, len: u64) -> Option<u64> {
+        crate::io::dvm_display::app_buffer_aperture_phys(offset, len)
+    }
+    pub fn read_range(offset: u64, dst: &mut [u8]) -> bool {
+        crate::io::dvm_display::app_buffer_read_range(offset, dst)
+    }
+    pub fn scrub_range(offset: u64, len: u64) -> bool {
+        crate::io::dvm_display::app_buffer_scrub_range(offset, len)
+    }
+    pub fn begin(capability: &kernel_ps::api::handles::BufferCapability,
+                 record: driver_domain_protocol::DvmAppBuffer, revoke: bool)
+        -> Result<u64, AppBufferTransportError>
+    {
+        crate::io::dvm_display::begin_app_buffer(capability, record, revoke)
+    }
+    pub fn take(sequence: u64)
+        -> Result<Option<kernel_ps::api::handles::BufferCapability>, AppBufferTransportError>
+    {
+        crate::io::dvm_display::take_app_buffer(sequence)
+    }
+}
