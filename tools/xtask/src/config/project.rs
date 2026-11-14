@@ -359,10 +359,15 @@ pub(crate) fn load_project_config(root_dir: &Path) -> Result<ProjectConfig> {
 
 fn load_project_config_file(root_dir: &Path) -> Result<(ProjectConfig, ProjectConfigSource)> {
     let (canonical_path, overridden) = if let Some(path) = env_path(PROJECT_CONFIG_ENV) {
-        if !path.is_file() {
-            bail!("{PROJECT_CONFIG_ENV} is not a file: {}", path.display());
+        let resolved = if path.is_relative() && !path.is_file() {
+            root_dir.join(&path)
+        } else {
+            path
+        };
+        if !resolved.is_file() {
+            bail!("{PROJECT_CONFIG_ENV} is not a file: {}", resolved.display());
         }
-        (path, true)
+        (resolved, true)
     } else {
         (root_dir.join("config/rustos.toml"), false)
     };
