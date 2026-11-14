@@ -249,9 +249,13 @@ fn stream<H: WarmHost>(
         if offset == entry.bytes {
             break;
         }
-        got = host
-            .read(entry.path, offset, chunk)
-            .map_err(|errno| skip(Stage::StreamRead, i64::from(errno)))?;
+        got = host.read(entry.path, offset, chunk).map_err(|errno| {
+            if is_transient_not_ready(errno) {
+                Refusal::NotReady(errno)
+            } else {
+                skip(Stage::StreamRead, i64::from(errno))
+            }
+        })?;
         // The file must not change identity between chunks.
         if !got.attested || got.identity != first.identity || got.file_len != entry.bytes {
             return Err(skip(Stage::IdentityChanged, 0));
@@ -353,7 +357,7 @@ mod tests {
         text
     }
 
-    fn run(fake: &mut Fake) -> Result<WarmReport, WarmError> {
+    fn run(fake: &mut impl WarmHost) -> Result<WarmReport, WarmError> {
         let mut manifest = std::vec![0_u8; MAX_MANIFEST_BYTES];
         let mut chunk = std::vec![0_u8; 8 * PAGE];
         warm(fake, &mut manifest, &mut chunk)
@@ -475,5 +479,37 @@ mod tests {
         assert_eq!(run(&mut fake), Err(WarmError::Host(2)));
         fake.files.insert(MANIFEST_PATH.into(), (b"garbage\n".to_vec(), false));
         assert_eq!(run(&mut fake), Err(WarmError::Manifest));
+    }
+
+    #[test]
+    fn mid_stream_transient_read_error_retires_and_refuses() {
+        let mut fake = host_with(&[("/lib/a.so", pattern(9 * PAGE, 4))]);
+        struct TransientMidStream(Fake);
+        impl WarmHost for TransientMidStream {
+            fn read(&mut self, path: &str, offset: u64, out: &mut [u8]) -> Result<ReadChunk, i32> {
+                if path != MANIFEST_PATH && offset > 0 {
+                    return Err(11);
+                }
+                self.0.read(path, offset, out)
+            }
+            fn create(&mut self, id: LibraryIdentityWire) -> Result<u64, i64> {
+                self.0.create(id)
+            }
+            fn supply(&mut self, object: u64, page: u64, bytes: &[u8]) -> Result<(), i64> {
+                self.0.supply(object, page, bytes)
+            }
+            fn seal(&mut self, object: u64) -> Result<(), i64> {
+                self.0.seal(object)
+            }
+            fn retire(&mut self, object: u64) {
+                self.0.retire(object);
+            }
+            fn published(&mut self, rank: u16, object: u64, pages: u64) {
+                self.0.published(rank, object, pages);
+            }
+        }
+        let mut wrapped = TransientMidStream(fake);
+        assert_eq!(run(&mut wrapped), Err(WarmError::Host(11)));
+        assert!(wrapped.0.objects[&1].2 && !wrapped.0.objects[&1].1);
     }
 }

@@ -68,7 +68,8 @@ pub(super) fn milestone_output_class(name: &str) -> MilestoneOutputClass {
             || name == "kmem-page-table-limit-smoke"
             || name == "job-policy-current-cache-checked"
             || name.starts_with("ipc-donation-")
-            || name.starts_with("dvm-input-") =>
+            || name.starts_with("dvm-input-")
+            || name.starts_with("app-dmabuf-") =>
         {
             MilestoneOutputClass::Required
         }

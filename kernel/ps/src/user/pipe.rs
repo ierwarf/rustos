@@ -193,6 +193,26 @@ impl PipeState {
         self.len += src.len();
     }
 
+    /// Drops up to `max_bytes` already-peeked buffered bytes, burying drained pages.
+    fn discard(&mut self, max_bytes: usize, grave: &mut Graveyard) -> usize {
+        let mut discarded = 0;
+        while discarded < max_bytes {
+            let Some(front) = self.pages.front_mut() else {
+                break;
+            };
+            let take = (front.end - front.start).min(max_bytes - discarded);
+            front.start += take;
+            discarded += take;
+            if front.start == front.end {
+                let page = self.pages.pop_front().expect("front page exists");
+                grave.bury(page);
+            }
+        }
+        self.len -= discarded;
+        self.read_total = self.read_total.wrapping_add(discarded as u64);
+        discarded
+    }
+
     /// Moves up to `dest.len()` buffered bytes out, burying drained pages.
     fn consume(&mut self, dest: &mut [u8], grave: &mut Graveyard) -> usize {
         let mut copied = 0;
@@ -245,6 +265,17 @@ pub struct PipeShared {
     read_token: u64,
     write_token: u64,
     state: TrackedSpinLock<PipeState, { LockClass::LocalFdObject as u8 }>,
+}
+
+impl Drop for PipeShared {
+    fn drop(&mut self) {
+        // Free all PipePages (and refund their page charges) before releasing
+        // the job charge-group slot hold.
+        self.state.lock().pages.clear();
+        if let Some(group) = self.charge_group {
+            charge::release(group);
+        }
+    }
 }
 
 impl PipeShared {
@@ -374,7 +405,7 @@ impl PipeShared {
             }
             // Only readers remove bytes, so an unchanged `read_total` means the
             // peeked bytes are still the head of the buffer.
-            let taken = state.consume(&mut scratch[..peeked], &mut grave);
+            let taken = state.discard(peeked, &mut grave);
             debug_assert_eq!(taken, peeked);
             state.write_generation += 1;
             let wake = self.wake(PipeRole::Write, state.write_generation);
@@ -531,6 +562,9 @@ impl PipeHandle {
         pages
             .try_reserve_exact(MAX_PAGES)
             .map_err(|_| PipeError::NoMemory)?;
+        if let Some(group) = charge_group {
+            charge::retain(group);
+        }
         let shared = Arc::new(PipeShared {
             charge_group,
             read_token,

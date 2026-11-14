@@ -62,23 +62,27 @@ pub(super) fn control(args_ptr: u64) -> u64 {
             Err(error) => linux_errno(address_space_error_to_linux_errno(error)),
         };
     }
-    let mut payload = [0_u8; 4096];
-    let len = if args.op == LIBRARY_OBJECT_OP_SUPPLY_PAGE {
+    if args.op == LIBRARY_OBJECT_OP_SUPPLY_PAGE {
+        let mut payload = [0_u8; 4096];
         let len = args.payload_len as usize; // canonicality bounds it by one page
         if let Err(error) =
             usermem::copy_from_current_user_exact(args.payload_ptr, &mut payload[..len])
         {
             return linux_errno(address_space_error_to_linux_errno(error));
         }
-        len
-    } else {
-        0
-    };
+        return control_op(pid, &args, &payload[..len]);
+    }
+    control_op(pid, &args, &[])
+}
+
+fn control_op(pid: u64, args: &RustosLibraryObjectArgs, payload: &[u8]) -> u64 {
     let group = match args.op {
-        LIBRARY_OBJECT_OP_CREATE | LIBRARY_OBJECT_OP_SUPPLY_PAGE => match multitask::current_user_job_charge_group() {
-            Some(group) => group,
-            None => return linux_errno(LINUX_ESRCH),
-        },
+        LIBRARY_OBJECT_OP_CREATE | LIBRARY_OBJECT_OP_SUPPLY_PAGE => {
+            match multitask::current_user_job_charge_group() {
+                Some(group) => group,
+                None => return linux_errno(LINUX_ESRCH),
+            }
+        }
         _ => 0,
     };
     if args.op == LIBRARY_OBJECT_OP_SUPPLY_PAGE {
@@ -97,7 +101,7 @@ pub(super) fn control(args_ptr: u64) -> u64 {
                 owner,
                 args.page_index,
                 group,
-                &payload[..len],
+                payload,
             ),
             LIBRARY_OBJECT_OP_SEAL => registry.seal(args.object, owner).map(|()| 0),
             LIBRARY_OBJECT_OP_RETIRE => {
@@ -109,7 +113,7 @@ pub(super) fn control(args_ptr: u64) -> u64 {
     match outcome {
         Some(Ok(value)) => {
             if args.op == LIBRARY_OBJECT_OP_RETIRE {
-                frame_source::reclaim_frame_sources(16);
+                frame_source::reclaim_frame_sources(64);
             }
             value
         }

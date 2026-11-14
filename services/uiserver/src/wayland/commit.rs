@@ -468,6 +468,11 @@ impl WaylandState {
             Ok(SnapshotPixels::Damage { damage, rows }) => {
                 let applied = shared.lock().is_ok_and(|mut surface| {
                     let (width, height) = (surface.width, surface.height);
+                    // Drop any shared Arc clone on `original_pixels` before
+                    // `blit_damage` so `Arc::make_mut` updates `pixels` in place.
+                    if Arc::ptr_eq(&surface.pixels, &surface.original_pixels) {
+                        surface.original_pixels = Arc::default();
+                    }
                     if !blit_damage(&mut surface.pixels, width, height, damage, &rows) {
                         return false;
                     }

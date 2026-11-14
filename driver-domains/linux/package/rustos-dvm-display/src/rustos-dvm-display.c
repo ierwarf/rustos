@@ -142,37 +142,37 @@ struct app_export {
  * supplies an aperture offset. Keep each real dma-buf fd until exact revoke. */
 static void service_app_export(int exporter, struct app_export **exports)
 {
-    struct rustos_dvm_app_event event = {0};
-    struct app_export *entry = malloc(sizeof(*entry));
-    struct app_export **cursor;
-    int fd;
-
-    if (exporter < 0 || entry == NULL) {
-        free(entry);
+    if (exporter < 0)
         return;
-    }
-    fd = ioctl(exporter, RUSTOS_DVM_APP_IOCTL_TAKE, &event);
-    if (fd < 0) {
-        free(entry);
-        return;
-    }
-    if (event.kind == RUSTOS_DVM_APP_EXPORT) {
-        entry->fd = fd;
-        memcpy(entry->record, event.record, sizeof(entry->record));
-        entry->next = *exports;
-        *exports = entry;
-        return;
-    }
-    free(entry);
-    if (event.kind != RUSTOS_DVM_APP_REVOKE)
-        return;
-    for (cursor = exports; *cursor != NULL; cursor = &(*cursor)->next) {
-        if (memcmp((*cursor)->record, event.record, sizeof(event.record)) == 0) {
-            entry = *cursor;
-            *cursor = entry->next;
-            close(entry->fd);
-            free(entry);
-            break;
+    for (;;) {
+        struct rustos_dvm_app_event event = {0};
+        struct app_export *entry;
+        struct app_export **cursor;
+        int fd = ioctl(exporter, RUSTOS_DVM_APP_IOCTL_TAKE, &event);
+        if (fd < 0)
+            return;
+        if (event.kind == RUSTOS_DVM_APP_EXPORT) {
+            entry = malloc(sizeof(*entry));
+            if (entry == NULL) {
+                close(fd);
+                return;
+            }
+            entry->fd = fd;
+            memcpy(entry->record, event.record, sizeof(entry->record));
+            entry->next = *exports;
+            *exports = entry;
+            continue;
+        }
+        if (event.kind != RUSTOS_DVM_APP_REVOKE)
+            continue;
+        for (cursor = exports; *cursor != NULL; cursor = &(*cursor)->next) {
+            if (memcmp((*cursor)->record, event.record, sizeof(event.record)) == 0) {
+                entry = *cursor;
+                *cursor = entry->next;
+                close(entry->fd);
+                free(entry);
+                break;
+            }
         }
     }
 }

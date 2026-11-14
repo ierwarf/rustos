@@ -102,6 +102,9 @@ impl MemfdHandle {
     /// Creates an empty memfd whose backing frames are charged to
     /// `charge_group` (the creating Job's resident-page group), if any.
     pub fn new(name: String, allow_sealing: bool, charge_group: Option<usize>) -> Self {
+        if let Some(group) = charge_group {
+            kernel_mm::api::charge::retain(group);
+        }
         let initial_seals = if allow_sealing {
             0
         } else {
@@ -372,6 +375,9 @@ impl Drop for MemfdObject {
             free_backing_frame(frame_phys);
         }
         refund_pages(self.charge_group, pages);
+        if let Some(group) = self.charge_group {
+            kernel_mm::api::charge::release(group);
+        }
     }
 }
 
@@ -553,6 +559,7 @@ fn grow_then<R>(
     then: impl FnOnce(&mut MemfdState) -> R,
 ) -> Result<R, MemfdError> {
     let required_pages = len.div_ceil(PAGE_SIZE);
+    let mut then = Some(then);
     for _ in 0..GROW_ATTEMPTS {
         let missing = {
             let mut state = object.state.lock();
@@ -561,7 +568,7 @@ fn grow_then<R>(
                 // Only grows: a write ending inside the file must not shorten
                 // it (shrinking is `truncate`'s job).
                 state.len = state.len.max(len);
-                return Ok(then(&mut state));
+                return Ok((then.take().expect("grow_then closure"))(&mut state));
             }
             required_pages - state.frames.len()
         };
@@ -576,10 +583,19 @@ fn grow_then<R>(
             .map_err(|_| MemfdError::NoMemory)?;
         let keep = staged.frames.len() - take;
         state.frames.extend(staged.frames.drain(keep..));
+        let outcome = if state.frames.len() >= required_pages {
+            state.len = state.len.max(len);
+            Some((then.take().expect("grow_then closure"))(&mut state))
+        } else {
+            None
+        };
         // Surplus frames (a concurrent grower won part of the range) are freed
         // by `staged`'s Drop after the lock is released below.
         drop(state);
         drop(staged);
+        if let Some(result) = outcome {
+            return Ok(result);
+        }
     }
     Err(MemfdError::Busy)
 }

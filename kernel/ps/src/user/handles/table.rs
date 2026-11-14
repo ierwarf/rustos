@@ -525,17 +525,26 @@ impl HandleTable {
     /// (duplicates of one allocation count once; revoked capabilities still
     /// count because their range stays unreusable until the descriptor closes).
     pub fn device_buffer_held_bytes(&self) -> u64 {
-        let all = || self.standard.iter().chain(self.entries.iter()).flatten();
+        let all = self.standard.iter().chain(self.entries.iter()).flatten();
         let mut total = 0_u64;
-        for (index, entry) in all().enumerate() {
+        let mut seen_inline = [None; 16];
+        let mut seen_inline_len = 0_usize;
+        let mut seen_overflow = Vec::new();
+        for entry in all {
             let KernelHandle::DeviceBuffer(capability) = entry.handle() else { continue };
-            let repeated = all().take(index).any(|earlier| {
-                matches!(earlier.handle(), KernelHandle::DeviceBuffer(other)
-                    if other.identity() == capability.identity())
-            });
-            if !repeated {
-                total = total.saturating_add(capability.len());
+            let identity = capability.identity();
+            if seen_inline[..seen_inline_len].iter().any(|seen| *seen == Some(identity))
+                || seen_overflow.contains(&identity)
+            {
+                continue;
             }
+            if seen_inline_len < seen_inline.len() {
+                seen_inline[seen_inline_len] = Some(identity);
+                seen_inline_len += 1;
+            } else {
+                seen_overflow.push(identity);
+            }
+            total = total.saturating_add(capability.len());
         }
         total
     }

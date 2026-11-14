@@ -1214,14 +1214,26 @@ def run_shards(
             shard_checkout = Path(temp) / f"checkout-{index}"
             prepare_checkout(checkout, shard_checkout)
             shard_target = artifact_dir / f"target-{index}"
-        return run_bucket_mutations(
-            shard_checkout, shard_target, artifact_dir, bucket, originals
-        )
+        try:
+            return run_bucket_mutations(
+                shard_checkout, shard_target, artifact_dir, bucket, originals
+            )
+        finally:
+            # Incremental sessions are valuable inside one bucket's retries,
+            # but retaining them across shards turns a 6.5 GiB cache into 50+ GiB.
+            shutil.rmtree(shard_target / "debug" / "incremental", ignore_errors=True)
+            if index > 0 and os.environ.get("RUSTOS_KEEP_MUTATION_SHARDS") != "1":
+                shutil.rmtree(shard_target, ignore_errors=True)
 
     outcomes: list[dict[str, str | int]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=shards) as pool:
-        for bucket_outcomes in pool.map(run_bucket, range(shards)):
-            outcomes.extend(bucket_outcomes)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=shards) as pool:
+            for bucket_outcomes in pool.map(run_bucket, range(shards)):
+                outcomes.extend(bucket_outcomes)
+    finally:
+        for stale_shard in artifact_dir.glob("target-*"):
+            if stale_shard.is_dir():
+                shutil.rmtree(stale_shard, ignore_errors=True)
     return outcomes
 
 

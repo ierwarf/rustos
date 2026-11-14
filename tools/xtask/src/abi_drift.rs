@@ -133,9 +133,9 @@ fn check_docs(root: &Path, registry: &SyscallRegistry, errors: &mut Vec<String>)
     files.sort();
     for file in files {
         let text = fs::read_to_string(&file)?;
-        for (index, line) in text.lines().enumerate() {
+        let lines: Vec<&str> = text.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
             let at = format!("{}:{}", file.strip_prefix(root).unwrap_or(&file).display(), index + 1);
-            let lines: Vec<&str> = text.lines().collect();
             let near = lines[index.saturating_sub(1)..(index + 3).min(lines.len())].join(" ");
             let retired_context = near.to_ascii_lowercase().contains("retired");
             check_doc_line(line, &at, retired_context, registry, errors);

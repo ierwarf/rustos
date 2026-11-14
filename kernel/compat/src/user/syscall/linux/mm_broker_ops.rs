@@ -421,7 +421,7 @@ fn broker_map_file_private(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(),
 /// object. Verification happens here, under no lock but the registry's own and
 /// without any IPC; the binding itself was created by `broker_bind_library`.
 fn bound_library_object(t: MmTarget, fd: u64) -> Option<(u64, u64)> {
-    let (object, len) = multitask::with_process_state_by_generation_mut(
+    multitask::with_process_state_by_generation_mut(
         t.pid,
         t.process_generation,
         t.mm_generation,
@@ -440,11 +440,7 @@ fn bound_library_object(t: MmTarget, fd: u64) -> Option<(u64, u64)> {
                 _ => None,
             }
         },
-    )??;
-    let view = REGISTRY.lock().view(object).ok()?;
-    // The guest-visible length is vfsd's; a length that no longer agrees means
-    // this description is not the object's file.
-    (view.len == len).then_some((object, len))
+    )?
 }
 
 /// Binds a descriptor's open description to a sealed library object.
@@ -635,6 +631,9 @@ fn map_library_alias(
         let Ok(view) = registry.view(object) else {
             return Ok(None);
         };
+        if view.len != file_len {
+            return Ok(None);
+        }
         let pins = match registry.pin_range(&KernelSources, object, first_page, pages) {
             Ok(pins) => pins,
             Err(error) => {
@@ -669,16 +668,14 @@ fn map_library_alias(
             if !process_state.mapping_below_stack_guard(start, mapping_end) {
                 return Err(LINUX_ENOMEM);
             }
-            for (index, pin) in pins.iter().enumerate() {
-                process_state
-                    .address_space_mut()
-                    .map_cached_private_file_cow_at(
-                        VirtAddr::new(start + index as u64 * PAGE_SIZE),
-                        page_flags,
-                        pin,
-                    )
-                    .map_err(address_space_error_to_linux_errno)?;
-            }
+            process_state
+                .address_space_mut()
+                .map_cached_private_file_cow_batch_at(
+                    VirtAddr::new(start),
+                    page_flags,
+                    &pins,
+                )
+                .map_err(address_space_error_to_linux_errno)?;
             process_state.set_mapping_cursor(mapping_end);
             Ok(RustosMmMapBrokerResult { addr: start, len: args.len })
         },
@@ -692,8 +689,14 @@ fn map_library_alias(
             Ok(Some(result))
         }
         Err(errno) => {
-            // Withdraws the VMA and any leaf installed before the failure.
-            let _ = broker_unmap(args, t);
+            // Withdraw ONLY the newly installed VMA record; any preflighted
+            // failure leaves prior mappings untouched.
+            let _ = multitask::unmap_pager_vma_for_process(
+                t.pid,
+                Some(t.expected()),
+                start,
+                mapping_end,
+            );
             Err(errno)
         }
     }

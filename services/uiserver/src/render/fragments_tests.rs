@@ -465,3 +465,20 @@ fn only_capacity_failures_degrade_to_the_cropped_scene() {
         GpuSceneError::SceneNotReady
     ));
 }
+
+#[test]
+fn cached_opaque_wayland_interior_hits_and_invalidates_by_content_version() {
+    let outer = rect(10, 20, 200, 160);
+    let mut win = window(outer, 0xff);
+    let mut cache = Vec::new();
+    let expected = opaque_wayland_interior(&win);
+    assert!(!expected.is_empty());
+    assert_eq!(cached_opaque_wayland_interior(&mut cache, &win), expected);
+    assert_eq!(cache.len(), 1);
+    // Same content_version reuses cached opacity even if pixel alpha changes.
+    win.pixels = Arc::new(vec![0x00123456; win.width * win.height]);
+    assert_eq!(cached_opaque_wayland_interior(&mut cache, &win), expected);
+    // Bumping content_version invalidates the cache entry and recomputes.
+    win.content_version = 2;
+    assert!(cached_opaque_wayland_interior(&mut cache, &win).is_empty());
+}

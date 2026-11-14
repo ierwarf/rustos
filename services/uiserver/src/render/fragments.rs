@@ -241,12 +241,19 @@ fn opaque_window_interior(outer: Rect) -> Rect {
     }
 }
 
-fn opaque_wayland_interior(window: &WaylandWindowSnapshot) -> Rect {
-    let client = wayland_window_client_rect_for(window, wayland_window_outer_rect(window));
-    let width = window.width.min(client.width);
-    let height = window.height.min(client.height);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WaylandOpaqueCacheEntry {
+    surface_id: u32,
+    content_version: u64,
+    width: usize,
+    height: usize,
+    stride_pixels: usize,
+    pixels_opaque: bool,
+}
+
+fn wayland_pixels_are_opaque(window: &WaylandWindowSnapshot, width: usize, height: usize) -> bool {
     if width == 0 || height == 0 || window.stride_pixels < width {
-        return Rect::empty();
+        return false;
     }
     // SHM snapshots normalize XRGB to alpha=255; ARGB may prove opacity by
     // actual content, but format or an opaque-region request is not enough.
@@ -255,17 +262,67 @@ fn opaque_wayland_interior(window: &WaylandWindowSnapshot) -> Rect {
             .checked_mul(window.stride_pixels)
             .and_then(|start| window.pixels.get(start..start.checked_add(width)?))
         else {
-            return Rect::empty();
+            return false;
         };
         if pixels.iter().any(|pixel| pixel >> 24 != 255) {
-            return Rect::empty();
+            return false;
         }
+    }
+    true
+}
+
+fn wayland_opaque_rect(window: &WaylandWindowSnapshot, client: Rect, pixels_opaque: bool) -> Rect {
+    if !pixels_opaque {
+        return Rect::empty();
     }
     if window.server_decoration {
         client.intersect(opaque_window_interior(wayland_window_outer_rect(window)))
     } else {
         client
     }
+}
+
+fn opaque_wayland_interior(window: &WaylandWindowSnapshot) -> Rect {
+    let client = wayland_window_client_rect_for(window, wayland_window_outer_rect(window));
+    let width = window.width.min(client.width);
+    let height = window.height.min(client.height);
+    wayland_opaque_rect(window, client, wayland_pixels_are_opaque(window, width, height))
+}
+
+fn cached_opaque_wayland_interior(
+    cache: &mut Vec<WaylandOpaqueCacheEntry>,
+    window: &WaylandWindowSnapshot,
+) -> Rect {
+    let client = wayland_window_client_rect_for(window, wayland_window_outer_rect(window));
+    let width = window.width.min(client.width);
+    let height = window.height.min(client.height);
+    if width == 0 || height == 0 || window.stride_pixels < width {
+        return Rect::empty();
+    }
+    if let Some(entry) = cache.iter().find(|entry| {
+        entry.surface_id == window.surface_id
+            && entry.content_version == window.content_version
+            && entry.width == width
+            && entry.height == height
+            && entry.stride_pixels == window.stride_pixels
+    }) {
+        return wayland_opaque_rect(window, client, entry.pixels_opaque);
+    }
+    let pixels_opaque = wayland_pixels_are_opaque(window, width, height);
+    let new_entry = WaylandOpaqueCacheEntry {
+        surface_id: window.surface_id,
+        content_version: window.content_version,
+        width,
+        height,
+        stride_pixels: window.stride_pixels,
+        pixels_opaque,
+    };
+    if let Some(slot) = cache.iter_mut().find(|entry| entry.surface_id == window.surface_id) {
+        *slot = new_entry;
+    } else {
+        cache.push(new_entry);
+    }
+    wayland_opaque_rect(window, client, pixels_opaque)
 }
 
 pub(super) fn build_cropped_gpu_atlas_scene(
@@ -298,13 +355,21 @@ pub(super) fn build_cropped_gpu_atlas_scene(
         destination: output,
         opaque: output,
     }];
+    if state.wayland_opaque_cache.len() > state.wayland_windows.len() {
+        state.wayland_opaque_cache.retain(|entry| {
+            state
+                .wayland_windows
+                .iter()
+                .any(|window| window.surface_id == entry.surface_id)
+        });
+    }
     for planned in &plan {
         let (destination, opaque) = match *planned {
             PlannedWindow::Wayland { index, .. } => {
                 let window = &state.wayland_windows[index];
                 (
                     wayland_window_outer_rect(window),
-                    opaque_wayland_interior(window),
+                    cached_opaque_wayland_interior(&mut state.wayland_opaque_cache, window),
                 )
             }
             PlannedWindow::Console { index, .. } => {

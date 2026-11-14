@@ -765,6 +765,16 @@ pub(crate) fn handle_brk(
 
     if requested_end > state.brk_mapped_end {
         let delta = requested_end - state.brk_mapped_end;
+        let overlaps_kernel = match query_conflict(MmTarget::of(request), state.brk_mapped_end, delta) {
+            Ok(conflict) => conflict.is_some(),
+            Err(_) => true,
+        };
+        if state.vmas.overlapping(state.brk_mapped_end, requested_end).next().is_some()
+            || overlaps_kernel
+        {
+            copy_payload(response, &state.brk_current);
+            return;
+        }
         if broker_simple(
             MmTarget::of(request),
             MM_BROKER_OP_MAP_ANON,
@@ -836,12 +846,24 @@ pub(crate) fn handle_mmap(
             return;
         }
         if noreplace {
-            let overlaps = requested_addr
-                .checked_add(map_len)
-                .is_none_or(|end| state.vmas.overlapping(requested_addr, end).next().is_some());
-            if overlaps {
+            let Some(end) = requested_addr.checked_add(map_len) else {
                 response.status = errno::EEXIST;
                 return;
+            };
+            if state.vmas.overlapping(requested_addr, end).next().is_some() {
+                response.status = errno::EEXIST;
+                return;
+            }
+            match query_conflict(MmTarget::of(request), requested_addr, map_len) {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    response.status = errno::EEXIST;
+                    return;
+                }
+                Err(errno) => {
+                    response.status = errno;
+                    return;
+                }
             }
         }
         requested_addr
@@ -1002,26 +1024,6 @@ pub(crate) fn handle_mprotect(
         response.status = errno::ENOMEM;
         return;
     }
-    if !range_is_covered(&state, start, end) {
-        // The range may have been mapped directly by the kernel (e.g. the main
-        // ELF binary's PT_LOAD segments).  Fall through to MM_BROKER_OP_PROTECT
-        // which works on the live page tables; if the range isn't mapped the
-        // kernel will return an error and we propagate it.
-        if let Err(errno) = broker_simple(
-            MmTarget::of(request),
-            MM_BROKER_OP_PROTECT,
-            start,
-            map_len,
-            prot,
-            0,
-            u64::MAX,
-            0,
-        ) {
-            response.status = errno;
-        }
-        return;
-    }
-
     let reserved_segments = reserved_segments(&state, start, end);
     for (seg_start, seg_end) in &reserved_segments {
         if prot != 0 {
@@ -1040,6 +1042,30 @@ pub(crate) fn handle_mprotect(
             }
         }
     }
+    if !range_is_covered(&state, start, end) {
+        // The range may have been mapped directly by the kernel (e.g. the main
+        // ELF binary's PT_LOAD segments, possibly adjacent to tracked VMAs).
+        // Materialized any Reserved sub-segments above first; now protect the
+        // live page tables and synchronize any tracked VMA records on success.
+        if let Err(errno) = broker_simple(
+            MmTarget::of(request),
+            MM_BROKER_OP_PROTECT,
+            start,
+            map_len,
+            prot,
+            0,
+            u64::MAX,
+            0,
+        ) {
+            response.status = errno;
+            return;
+        }
+        set_vma_prot(&mut state, start, end, prot);
+        response.status = 0;
+        response.payload_len = 0;
+        return;
+    }
+
     if prot != 0 {
         if let Err(errno) = broker_simple(
             MmTarget::of(request),
@@ -1358,23 +1384,30 @@ fn align_up(value: u64) -> Option<u64> {
         .map(|value| value & !(PAGE_SIZE - 1))
 }
 
+fn query_conflict(target: MmTarget, address: u64, len: u64) -> Result<Option<(u64, u64)>, i32> {
+    let mut result = RustosMmConflictBrokerResult::default();
+    let args = RustosMmBrokerArgs {
+        abi_version: MM_BROKER_ABI_VERSION,
+        op: MM_BROKER_OP_QUERY_CONFLICT,
+        target_pid: target.pid,
+        ticket: target.ticket,
+        addr: address,
+        len,
+        out_ptr: (&mut result as *mut RustosMmConflictBrokerResult) as u64,
+        out_len: size_of::<RustosMmConflictBrokerResult>() as u64,
+        ..RustosMmBrokerArgs::default()
+    };
+    mm_broker_call(&args)?;
+    if result.start == 0 && result.end == 0 {
+        Ok(None)
+    } else {
+        Ok(Some((result.start, result.end)))
+    }
+}
+
 fn find_current_free_region(target: MmTarget, state: &MmPolicyState, requested: u64, len: u64) -> Result<u64, i32> {
     choose_free_region_with_conflicts(state, requested, len, |address| {
-        let mut result = RustosMmConflictBrokerResult::default();
-        let args = RustosMmBrokerArgs {
-            abi_version: MM_BROKER_ABI_VERSION,
-            op: MM_BROKER_OP_QUERY_CONFLICT,
-            target_pid: target.pid,
-            ticket: target.ticket,
-            addr: address,
-            len,
-            out_ptr: (&mut result as *mut RustosMmConflictBrokerResult) as u64,
-            out_len: size_of::<RustosMmConflictBrokerResult>() as u64,
-            ..RustosMmBrokerArgs::default()
-        };
-        mm_broker_call(&args)?;
-        if result.start == 0 && result.end == 0 { Ok(None) }
-        else { Ok(Some((result.start, result.end))) }
+        query_conflict(target, address, len)
     })
 }
 

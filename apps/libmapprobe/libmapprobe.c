@@ -62,12 +62,15 @@ static void debug_line(const char *message) {
 static void say(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 #include <stdarg.h>
 static void say(const char *fmt, ...) {
-    char line[200];
+    char line[512];
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
-    if (n > 0 && (size_t)n < sizeof(line)) {
+    if (n > 0) {
+        if ((size_t)n >= sizeof(line)) {
+            line[sizeof(line) - 2] = '~';
+        }
         debug_line(line);
     }
 }
@@ -592,6 +595,9 @@ static int mmap_cost_one(const char *path, uint64_t size, uint64_t seed, const c
             WEXITSTATUS(child_status) != 0) {
             child_ok = 0;
         }
+    }
+    if (child < 0) {
+        close(to_child[1]);
     }
     close(to_child[0]); close(from_child[0]); close(from_child[1]);
     if (child > 0 && !child_ok) {

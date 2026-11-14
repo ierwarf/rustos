@@ -164,6 +164,43 @@ impl EventFdHandle {
         self.object.description.epoll_registered()
     }
 
+    /// Peeks the value a `read` would return without consuming the counter.
+    pub fn peek_read(&self) -> Result<u64, EventFdError> {
+        let state = self.object.state.lock();
+        if state.counter == 0 {
+            return Err(EventFdError::WouldBlock {
+                generation: state.generation,
+            });
+        }
+        Ok(if self.object.semaphore { 1 } else { state.counter })
+    }
+
+    /// Commits a previously peeked read after copy-out succeeds, waking writers.
+    pub fn commit_read(&self, value: u64) -> Result<LocalWake, EventFdError> {
+        let mut state = self.object.state.lock();
+        let consumed = if self.object.semaphore {
+            if state.counter == 0 {
+                return Err(EventFdError::WouldBlock {
+                    generation: state.generation,
+                });
+            }
+            state.counter -= 1;
+            1
+        } else {
+            if state.counter < value {
+                return Err(EventFdError::WouldBlock {
+                    generation: state.generation,
+                });
+            }
+            state.counter -= value;
+            value
+        };
+        let _ = consumed;
+        state.generation += 1;
+        state.out_generation += 1;
+        Ok(self.object.wake(state.generation))
+    }
+
     /// `read`: returns the counter (or 1 in semaphore mode) and zeroes it (or
     /// decrements it). A zero counter is `WouldBlock`.
     pub fn try_read(&self) -> Result<(u64, LocalWake), EventFdError> {
@@ -336,5 +373,20 @@ mod tests {
         assert!(efd.release_descriptor_reference().last);
         assert!(local_wait::readiness_of(efd.token_id()).is_none());
         assert!(!efd.try_acquire_descriptor_reference());
+    }
+
+    #[test]
+    fn peek_read_does_not_consume_counter_until_commit_read() {
+        let efd = EventFdHandle::new(5, false, false).unwrap();
+        assert_eq!(efd.peek_read().unwrap(), 5);
+        assert_eq!(efd.counter(), 5);
+        assert!(efd.commit_read(5).is_ok());
+        assert_eq!(efd.counter(), 0);
+
+        let sem = EventFdHandle::new(2, true, false).unwrap();
+        assert_eq!(sem.peek_read().unwrap(), 1);
+        assert_eq!(sem.counter(), 2);
+        assert!(sem.commit_read(1).is_ok());
+        assert_eq!(sem.counter(), 1);
     }
 }

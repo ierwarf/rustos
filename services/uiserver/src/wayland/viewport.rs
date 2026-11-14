@@ -140,8 +140,8 @@ pub(super) fn map_buffer(
         Some(src)
             if src.x >= 0.0
                 && src.y >= 0.0
-                && src.x + src.width <= sw as f64
-                && src.y + src.height <= sh as f64 =>
+                && src.x + src.width <= sw as f64 + 1e-9
+                && src.y + src.height <= sh as f64 + 1e-9 =>
         {
             (src.x, src.y, src.width, src.height)
         }
@@ -158,9 +158,15 @@ pub(super) fn map_buffer(
     out.try_reserve_exact(count)
         .map_err(|_| ViewportError::BadSize)?;
     for y in 0..dh {
-        let ty = ((sy + (y as f64 + 0.5) * ch / dh as f64) * scale as f64).floor() as usize;
+        let ty = ((sy + (y as f64 + 0.5) * ch / dh as f64) * scale as f64)
+            .floor()
+            .max(0.0) as usize;
+        let ty = ty.min(th.saturating_sub(1));
         for x in 0..dw {
-            let tx = ((sx + (x as f64 + 0.5) * cw / dw as f64) * scale as f64).floor() as usize;
+            let tx = ((sx + (x as f64 + 0.5) * cw / dw as f64) * scale as f64)
+                .floor()
+                .max(0.0) as usize;
+            let tx = tx.min(tw.saturating_sub(1));
             let (bx, by) = match mapping.transform {
                 0 => (tx, ty),
                 1 => (ty, height - 1 - tx),

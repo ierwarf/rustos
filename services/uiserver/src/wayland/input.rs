@@ -16,6 +16,9 @@ impl WaylandState {
             let Ok(surface) = surface.shared.lock() else {
                 continue;
             };
+            if surface.drag_icon_role {
+                continue;
+            }
             let grabbed = !dragging
                 && self.pointer_button_down
                 && self.pointer_focus.as_ref().is_some_and(|focus| {
@@ -24,8 +27,9 @@ impl WaylandState {
                         .as_ref()
                         .is_some_and(|resource| resource.id() == focus.surface.id())
                 });
-            if (!grabbed
-                && ((!dragging && self.pointer_button_down)
+            if (!dragging
+                && !grabbed
+                && (self.pointer_button_down
                     || self.pointer_target != Some(surface.surface_id)))
                 || !surface.alive
                 || surface.minimized

@@ -173,7 +173,7 @@ fn progress(owner: u64, epoch: u64, requested: Option<u64>, cancel: bool) -> Res
         Ok(Some(cap)) if pending.cancelled => {
             match transport::begin(&cap, pending.active.record, true) {
                 Ok(seq) => { pending.sequence = seq; pending.retiring = true; state.pending = Some(pending); Err(LINUX_EAGAIN) }
-                Err(err) => { state.pending = Some(pending); Err(terr(err)) }
+                Err(err) => { pending.sequence = 0; state.pending = Some(pending); Err(terr(err)) }
             }
         }
         Ok(Some(cap)) => {
@@ -196,7 +196,7 @@ fn progress(owner: u64, epoch: u64, requested: Option<u64>, cancel: bool) -> Res
                 // Preserve custody even when publication lost its lease race.
                 match transport::begin(&pending.active.capability, pending.active.record, true) {
                     Ok(seq) => { pending.sequence = seq; pending.retiring = true; }
-                    Err(_) => {}
+                    Err(_) => { pending.sequence = 0; }
                 }
                 state.pending = Some(pending);
                 Err(LINUX_ETIMEDOUT)
@@ -228,10 +228,10 @@ fn reclaim_retired() -> Result<(), i64> {
 }
 fn reap(owner: u64, epoch: u64) -> Result<u64, i64> {
     if STATE.lock().pending.is_some() {
-        return match progress(owner, epoch, None, false) {
-            Err(LINUX_ECANCELED) => Ok(0),
-            other => other,
-        };
+        match progress(owner, epoch, None, false) {
+            Err(LINUX_ECANCELED) => {}
+            other => return other,
+        }
     }
     reclaim_retired()?;
     let mut state = STATE.lock();
@@ -243,7 +243,9 @@ fn reap(owner: u64, epoch: u64) -> Result<u64, i64> {
         Ok(sequence) => {
             state.pending = Some(Pending { active, owner, process_generation: 1, mm_generation: 1, epoch, sequence, deadline: u64::MAX,
                 reservation: 0, fd: 0, cancelled: true, retiring: true });
-            Ok(0)
+            // Report EAGAIN so callers keep polling until the retirement is
+            // acknowledged and scrubbed back into the free pool.
+            Err(LINUX_EAGAIN)
         }
         Err(err) => { state.active.push(active); Err(terr(err)) }
     }

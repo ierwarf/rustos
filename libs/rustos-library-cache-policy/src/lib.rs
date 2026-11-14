@@ -204,10 +204,14 @@ impl<'a> Plan<'a> {
         }
         let mut count: u16 = 0;
         let mut total: u64 = 0;
-        for (index, line) in rows.lines().enumerate() {
+        let mut seen_paths = [""; MAX_WARM_ENTRIES as usize];
+        for line in rows.lines() {
             let entry = parse_entry(line)?;
             if entry.bytes == 0 || entry.bytes > policy.max_file_bytes {
                 return Err(Error::Entry);
+            }
+            if seen_paths[..count as usize].contains(&entry.path) {
+                return Err(Error::Duplicate);
             }
             count = count.checked_add(1).ok_or(Error::Budget)?;
             if count > policy.max_entries {
@@ -219,11 +223,7 @@ impl<'a> Plan<'a> {
             if total > policy.budget_bytes {
                 return Err(Error::Budget);
             }
-            for earlier in rows.lines().take(index) {
-                if parse_entry(earlier)?.path == entry.path {
-                    return Err(Error::Duplicate);
-                }
-            }
+            seen_paths[(count - 1) as usize] = entry.path;
         }
         Ok(Self {
             policy,

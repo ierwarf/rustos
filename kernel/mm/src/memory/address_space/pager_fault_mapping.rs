@@ -631,6 +631,79 @@ impl ProcessAddressSpace {
         )
     }
 
+    pub fn map_cached_private_file_cow_batch_at(
+        &mut self,
+        start: VirtAddr,
+        flags: PageTableFlags,
+        sources: &[crate::memory::frame_source::FrameSourcePin],
+    ) -> Result<(), AddressSpaceError> {
+        use crate::memory::frame_capability::{FRAME_RIGHT_EXECUTE, FRAME_RIGHT_READ};
+        if sources.is_empty() {
+            return Err(AddressSpaceError::ZeroSizedAllocation);
+        }
+        let flags = normalize_user_page_flags(flags)?;
+        let mut needed = FRAME_RIGHT_READ;
+        if !flags.contains(PageTableFlags::NO_EXECUTE) {
+            needed |= FRAME_RIGHT_EXECUTE;
+        }
+        for source in sources {
+            if !source.permits(needed) {
+                return Err(AddressSpaceError::ProtectionViolation);
+            }
+        }
+        validate_user_page_range(start, sources.len())?;
+        if !self.user_range_is_unmapped(start, sources.len())? {
+            return Err(AddressSpaceError::AlreadyMapped);
+        }
+        let root = self.root_phys();
+        let root_phys = root.as_u64();
+        if !phys::root_admits(root_phys, sources.len() as u64) {
+            return Err(AddressSpaceError::OutOfFrames);
+        }
+        let mutation = begin_address_space_mutation(root);
+        let mut installed = 0_usize;
+        for (index, source) in sources.iter().enumerate() {
+            let va = page_addr(start, index)?;
+            let frame_phys = source.frame_phys();
+            let ticket = match phys::prepare_shared_alias(
+                0,
+                0,
+                root_phys,
+                va.as_u64(),
+                frame_phys,
+                phys::CowFrameKind::PrivateFileSection,
+                source.backing_identity(),
+            ) {
+                Some(ticket) => ticket,
+                None => {
+                    drop(mutation);
+                    if installed > 0 {
+                        let _ = self.unmap_present_user_pages_at(start, installed);
+                    }
+                    return Err(AddressSpaceError::InvalidFrameOwnership);
+                }
+            };
+            let mapped = (|| {
+                let pdpt_phys = ensure_next_table(root_phys, root, p4_index(va))?;
+                let pd_phys = ensure_next_table(root_phys, pdpt_phys, p3_index(va))?;
+                ensure_next_table(root_phys, pd_phys, p2_index(va))?;
+                self.map_shared_cow_leaf_without_mutation(va, frame_phys, flags)
+            })();
+            if let Err(error) = mapped {
+                phys::cancel_shared_alias(ticket);
+                drop(mutation);
+                if installed > 0 {
+                    let _ = self.unmap_present_user_pages_at(start, installed);
+                }
+                return Err(error);
+            }
+            phys::publish_shared_alias(ticket);
+            installed += 1;
+        }
+        drop(mutation);
+        Ok(())
+    }
+
     /// Adds another exact private-file/section mapping of a shared cache frame.
     pub fn map_private_file_cow_alias_at(
         &mut self,
@@ -645,6 +718,9 @@ impl ProcessAddressSpace {
         let root = self.root_phys();
         let root_phys = root.as_u64();
         let virtual_address = start.as_u64();
+        if !phys::root_admits(root_phys, 1) {
+            return Err(AddressSpaceError::OutOfFrames);
+        }
         let ticket = phys::prepare_shared_alias(
             owner_root,
             owner_va,

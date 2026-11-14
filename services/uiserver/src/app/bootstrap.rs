@@ -407,6 +407,7 @@ impl AppState {
             closing_console_sessions: Vec::new(),
             next_console_snapshot_index: 0,
             wayland_windows: Vec::new(),
+            wayland_opaque_cache: Vec::new(),
             dragging_window: None,
             drag_offset_x: 0,
             drag_offset_y: 0,

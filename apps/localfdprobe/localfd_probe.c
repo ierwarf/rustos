@@ -330,6 +330,7 @@ static void pipe_blocking_and_wakeups(void) {
     }
     say("localfd: step pipe-blocking reaped=%d status=%d errno=%d", (int)reaped, status, errno);
     CHECK(reaped == child && WIFEXITED(status) && WEXITSTATUS(status) == 0, name);
+    close(w2);
     case_done(name, before);
 }
 

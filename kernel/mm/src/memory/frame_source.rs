@@ -475,19 +475,10 @@ pub fn supply_frame_source(
         if !charge::try_charge(group, 1) {
             return Err(FrameSourceError::Quota);
         }
-        let Some(frame) = frame_capability::allocate_zeroed_frame() else {
+        let Some(frame) = frame_capability::allocate_filled_frame(bytes) else {
             charge::uncharge(group, 1);
             return Err(FrameSourceError::NoMemory);
         };
-        // SAFETY: freshly allocated, exclusively owned direct-mapped page;
-        // checked payload fits, and no PTE/capability has been published yet.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                crate::lowlevel::address::higher_half_addr(frame.as_u64()) as *mut u8,
-                bytes.len(),
-            );
-        }
         assert!(
             phys::claim_private_file_cache_frame(frame.as_u64(), token),
             "allocated source frame has a conflicting descriptor"

@@ -43,11 +43,20 @@ const EFD_ACCEPTED_FLAGS: u64 =
     linux_abi::EFD_SEMAPHORE | linux_abi::EFD_CLOEXEC | linux_abi::EFD_NONBLOCK;
 const FIONREAD_RESULT_BYTES: usize = 4;
 
-/// A kernel-local fd object as held by the calling process.
-#[derive(Clone, Debug)]
+/// A kernel-local fd object pinned by an active descriptor reference.
+#[derive(Debug)]
 pub(in crate::user::syscall::linux) enum LocalFd {
     Pipe(PipeHandle),
     EventFd(EventFdHandle),
+}
+
+impl Drop for LocalFd {
+    fn drop(&mut self) {
+        match self {
+            Self::Pipe(pipe) => release_pipe(pipe, true),
+            Self::EventFd(eventfd) => release_eventfd(eventfd, true),
+        }
+    }
 }
 
 impl LocalFd {
@@ -69,8 +78,14 @@ impl LocalFd {
 pub(in crate::user::syscall::linux) fn current_local_fd(fd: u64) -> Option<LocalFd> {
     multitask::with_current_user_process_state(|_, _, process_state| {
         match process_state.handles().get(fd) {
-            Some(multitask::KernelHandle::Pipe(pipe)) => Some(LocalFd::Pipe(pipe.clone())),
-            Some(multitask::KernelHandle::EventFd(eventfd)) => {
+            Some(multitask::KernelHandle::Pipe(pipe))
+                if pipe.try_acquire_descriptor_reference() =>
+            {
+                Some(LocalFd::Pipe(pipe.clone()))
+            }
+            Some(multitask::KernelHandle::EventFd(eventfd))
+                if eventfd.try_acquire_descriptor_reference() =>
+            {
                 Some(LocalFd::EventFd(eventfd.clone()))
             }
             _ => None,
@@ -373,6 +388,8 @@ pub(in crate::user::syscall::linux) fn write(fd: u64, user_ptr: u64, user_len: u
     })
 }
 
+const LOCAL_FD_STACK_SCRATCH_BYTES: usize = 4096;
+
 fn pipe_read(pipe: &PipeHandle, user_ptr: u64, user_len: u64) -> u64 {
     if pipe.role() != PipeRole::Read {
         return linux_errno(LINUX_EBADF);
@@ -383,19 +400,28 @@ fn pipe_read(pipe: &PipeHandle, user_ptr: u64, user_len: u64) -> u64 {
     if user_len == 0 {
         return 0;
     }
-    if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
+    let want = user_len.min(LOCAL_FD_IO_CHUNK_BYTES);
+    if let Err(err) =
+        usermem::validate_current_user_write_buffer(user_ptr, want.min(LOCAL_FD_STACK_SCRATCH_BYTES))
+    {
         return linux_errno(user_pointer_error_to_linux_errno(err));
     }
-    let mut buffer = Vec::new();
-    if buffer
-        .try_reserve_exact(user_len.min(LOCAL_FD_IO_CHUNK_BYTES))
-        .is_err()
-    {
-        return linux_errno(LINUX_ENOMEM);
-    }
-    buffer.resize(user_len.min(LOCAL_FD_IO_CHUNK_BYTES), 0);
+    let mut stack = [0_u8; LOCAL_FD_STACK_SCRATCH_BYTES];
+    let mut heap = Vec::new();
+    let scratch: &mut [u8] = if want <= LOCAL_FD_STACK_SCRATCH_BYTES {
+        &mut stack[..want]
+    } else {
+        if pipe.nonblocking() && pipe.shared().bytes_available() == 0 {
+            return linux_errno(LINUX_EAGAIN);
+        }
+        if heap.try_reserve_exact(want).is_err() {
+            return linux_errno(LINUX_ENOMEM);
+        }
+        heap.resize(want, 0);
+        &mut heap[..]
+    };
     loop {
-        let copied = pipe.shared().read_with(&mut buffer, |bytes| {
+        let copied = pipe.shared().read_with(scratch, |bytes| {
             usermem::write_current_user_bytes(user_ptr, bytes)
         });
         match copied {
@@ -403,8 +429,7 @@ fn pipe_read(pipe: &PipeHandle, user_ptr: u64, user_len: u64) -> u64 {
                 publish(progress.wake);
                 return progress.bytes as u64;
             }
-            // The user copy faulted (a sibling thread unmapped the range after
-            // validation); nothing was consumed from the pipe.
+            // The user copy faulted; nothing was consumed from the pipe.
             Err(PipeReadError::CopyOut(err)) => {
                 return linux_errno(user_pointer_error_to_linux_errno(err));
             }
@@ -435,28 +460,33 @@ fn pipe_write(pipe: &PipeHandle, user_ptr: u64, user_len: u64) -> u64 {
     if user_len == 0 {
         return 0;
     }
-    let mut buffer = Vec::new();
-    if buffer
-        .try_reserve_exact(user_len.min(LOCAL_FD_IO_CHUNK_BYTES))
-        .is_err()
+    let mut stack = [0_u8; LOCAL_FD_STACK_SCRATCH_BYTES];
+    let mut heap = Vec::new();
+    if user_len > LOCAL_FD_STACK_SCRATCH_BYTES
+        && heap.try_reserve_exact(user_len.min(LOCAL_FD_IO_CHUNK_BYTES)).is_err()
     {
         return linux_errno(LINUX_ENOMEM);
     }
     let mut total = 0_usize;
     while total < user_len {
         let chunk_len = (user_len - total).min(LOCAL_FD_IO_CHUNK_BYTES);
-        buffer.resize(chunk_len, 0);
+        let chunk: &mut [u8] = if chunk_len <= LOCAL_FD_STACK_SCRATCH_BYTES {
+            &mut stack[..chunk_len]
+        } else {
+            heap.resize(chunk_len, 0);
+            &mut heap[..chunk_len]
+        };
         let Some(source) = user_ptr.checked_add(total as u64) else {
             return completed_or(total, LINUX_EFAULT);
         };
-        if let Err(err) = usermem::copy_from_current_user_exact(source, &mut buffer[..chunk_len]) {
+        if let Err(err) = usermem::copy_from_current_user_exact(source, chunk) {
             return completed_or(total, user_pointer_error_to_linux_errno(err));
         }
         // A write of at most PIPE_BUF bytes is one atomic chunk; a larger
         // request stays a sequence of partial writes.
         let mut sent = 0_usize;
         while sent < chunk_len {
-            match pipe.shared().try_write(&buffer[sent..chunk_len]) {
+            match pipe.shared().try_write(&chunk[sent..chunk_len]) {
                 Ok(progress) => {
                     sent += progress.bytes;
                     publish(progress.wake);
@@ -492,26 +522,31 @@ fn eventfd_read(eventfd: &EventFdHandle, user_ptr: u64, user_len: u64) -> u64 {
         return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     loop {
-        match eventfd.try_read() {
-            Ok((value, wake)) => {
-                publish(Some(wake));
-                return match usermem::write_current_user_bytes(user_ptr, &value.to_ne_bytes()) {
-                    Ok(()) => size_of::<u64>() as u64,
-                    Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-                };
-            }
-            Err(EventFdError::WouldBlock { generation }) => {
-                if eventfd.nonblocking() {
-                    return linux_errno(LINUX_EAGAIN);
+        let generation = match eventfd.peek_read() {
+            Ok(value) => {
+                if let Err(err) = usermem::write_current_user_bytes(user_ptr, &value.to_ne_bytes()) {
+                    return linux_errno(user_pointer_error_to_linux_errno(err));
                 }
-                if current_wait_interrupted() {
-                    return linux_errno(LINUX_EINTR);
-                }
-                if let Err(errno) = wait_for_generation(eventfd.token_id(), generation) {
-                    return linux_errno(errno);
+                match eventfd.commit_read(value) {
+                    Ok(wake) => {
+                        publish(Some(wake));
+                        return size_of::<u64>() as u64;
+                    }
+                    Err(EventFdError::WouldBlock { .. }) => continue,
+                    Err(_) => return linux_errno(LINUX_EINVAL),
                 }
             }
+            Err(EventFdError::WouldBlock { generation }) => generation,
             Err(_) => return linux_errno(LINUX_EINVAL),
+        };
+        if eventfd.nonblocking() {
+            return linux_errno(LINUX_EAGAIN);
+        }
+        if current_wait_interrupted() {
+            return linux_errno(LINUX_EINTR);
+        }
+        if let Err(errno) = wait_for_generation(eventfd.token_id(), generation) {
+            return linux_errno(errno);
         }
     }
 }

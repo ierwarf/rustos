@@ -47,9 +47,12 @@ cheap_targets=(
     "build/formal/sanitizers/target-address-buildstd-v1"
     "build/formal/sanitizers/target-thread"
     "build/formal/sanitizers/target-thread-buildstd-v1"
-    "build/formal/implementation-mutations/target"
+    "build/formal/abi-differential/wine-prefix"
     "build/formal/abi-differential"
     "build/formal/shuttle"
+    "formal/loom-proof-kernel/target"
+    "formal/shuttle-proof-kernel/target"
+    "formal/fuzz/target"
     "build/perf"
     "target/miri"
     "target/kani"
@@ -96,10 +99,40 @@ printf 'reclaimable formal-lane caches:\n'
 for path in "${cheap_targets[@]}"; do
     remove "$path"
 done
+# Reclaim all implementation-mutation worker target shards (target and target-*).
+while IFS= read -r -d '' shard_target; do
+    remove "${shard_target#./}"
+done < <(find ./build/formal/implementation-mutations -maxdepth 1 -type d \( -name 'target' -o -name 'target-*' \) -print0 2>/dev/null)
+# Orphaned comparison temp trees and stale KVM diagnostics / bench copies.
+while IFS= read -r -d '' scratch_path; do
+    remove "${scratch_path#./}"
+done < <(find ./build -maxdepth 1 -name 'kv100.*' -print0 2>/dev/null)
+for path in \
+    "build/kvm/dvm-display.pmem" \
+    "build/kvm/dvm-display.ivshmem" \
+    "build/kvm/rustos-qemu-int.log" \
+    "build/kvm/rustos-guest.perf.data"
+do
+    remove "$path"
+done
+while IFS= read -r -d '' kvm_scratch; do
+    remove "${kvm_scratch#./}"
+done < <(find ./build/kvm -maxdepth 1 \( -name 'failure-snapshot-*.log' -o -name 'perf-*.data' -o -name 'physical-amdgpu-*' -o -name 'physical-gpu-launch-*' \) -print0 2>/dev/null)
 # Captured profiles are re-recorded by the run that wants them.
 while IFS= read -r -d '' capture; do
     remove "${capture#./}"
 done < <(find ./build -maxdepth 1 -name 'perf*.data' -print0 2>/dev/null)
+
+# Prune aged incremental compiler sessions (>1 day old) and old bench-core copies
+# without disturbing compiled dependency `.rlib`s or an active build.
+if ! pgrep -x cargo >/dev/null 2>&1 && ! pgrep -x rustc >/dev/null 2>&1; then
+    while IFS= read -r -d '' stale_inc; do
+        remove "${stale_inc#./}"
+    done < <(find ./target -maxdepth 4 -path '*/debug/incremental/*' -mindepth 4 -mtime +0 -print0 2>/dev/null)
+fi
+while IFS= read -r -d '' old_bench; do
+    remove "${old_bench#./}"
+done < <(find ./build/bench-core -maxdepth 1 -mindepth 1 -mtime +0 -print0 2>/dev/null)
 
 if [[ "$aggressive" -eq 1 ]]; then
     if pgrep -x cargo >/dev/null 2>&1 || pgrep -x rustc >/dev/null 2>&1; then

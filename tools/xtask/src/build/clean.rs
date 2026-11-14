@@ -108,6 +108,77 @@ fn artifact_dirs(root: &Path, found: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Auxiliary scratch directories pruned by `clean --stale` and `clean --scratch`.
+fn clean_build_scratch(
+    config: &Config,
+    cutoff: Option<Duration>,
+    include_bench: bool,
+    dry_run: bool,
+) -> Result<(u64, usize)> {
+    let mut reclaimed = 0_u64;
+    let mut entries = 0_usize;
+
+    let mut prune = |path: &Path| -> Result<()> {
+        if let Some(limit) = cutoff
+            && modified_age(path)? <= limit
+        {
+            return Ok(());
+        }
+        reclaimed += reclaim(path, dry_run)?;
+        entries += 1;
+        Ok(())
+    };
+
+    if include_bench {
+        let bench_dir = config.build_dir.join("bench-core");
+        if bench_dir.is_dir() {
+            for entry in fs::read_dir(&bench_dir)? {
+                prune(&entry?.path())?;
+            }
+        }
+    }
+
+    if config.build_dir.is_dir() {
+        for entry in fs::read_dir(&config.build_dir)? {
+            let path = entry?.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("kv100."))
+            {
+                prune(&path)?;
+            }
+        }
+    }
+
+    let kvm_dir = config.build_dir.join("kvm");
+    if kvm_dir.is_dir() {
+        for entry in fs::read_dir(&kvm_dir)? {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let is_ephemeral_kvm = name.starts_with("failure-snapshot-")
+                || name.starts_with("perf-")
+                || name.starts_with("physical-amdgpu-")
+                || name.starts_with("physical-gpu-launch-")
+                || (!include_bench && matches!(name, "rustos-kvm.img" | "dvm-block-disk.img"))
+                || matches!(
+                    name,
+                    "dvm-display.pmem"
+                        | "dvm-display.ivshmem"
+                        | "rustos-qemu-int.log"
+                        | "rustos-guest.perf.data"
+                );
+            if is_ephemeral_kvm {
+                prune(&path)?;
+            }
+        }
+    }
+
+    Ok((reclaimed, entries))
+}
+
 fn clean_stale(config: &Config, days: u32, dry_run: bool) -> Result<u64> {
     let cutoff = Duration::from_secs(u64::from(days) * 24 * 60 * 60);
     let mut dirs = Vec::new();
@@ -129,6 +200,10 @@ fn clean_stale(config: &Config, days: u32, dry_run: bool) -> Result<u64> {
             entries += 1;
         }
     }
+    let (scratch_bytes, scratch_entries) =
+        clean_build_scratch(config, Some(cutoff), true, dry_run)?;
+    reclaimed += scratch_bytes;
+    entries += scratch_entries;
     println!(
         "clean tier=stale days={days} entries={entries} reclaimed={} dry_run={dry_run}",
         human_bytes(reclaimed)
@@ -164,6 +239,11 @@ fn clean_scratch(config: &Config, dry_run: bool) -> Result<u64> {
             entries += 1;
         }
     }
+
+    let (build_scratch_bytes, build_scratch_entries) =
+        clean_build_scratch(config, None, false, dry_run)?;
+    reclaimed += build_scratch_bytes;
+    entries += build_scratch_entries;
 
     println!(
         "clean tier=scratch entries={entries} reclaimed={} dry_run={dry_run}",
@@ -232,4 +312,57 @@ pub(crate) fn clean(
         human_bytes(reclaimed)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+    use std::fs;
+    use std::time::Duration;
+
+    #[test]
+    fn build_scratch_prunes_ephemeral_artifacts_and_preserves_protected_images() {
+        let root = tempfile::tempdir().unwrap();
+        let build_dir = root.path();
+        let kvm_dir = build_dir.join("kvm");
+        fs::create_dir_all(&kvm_dir).unwrap();
+        fs::create_dir_all(build_dir.join("image")).unwrap();
+        fs::create_dir_all(build_dir.join("kv100.abc123")).unwrap();
+        fs::create_dir_all(build_dir.join("bench-core/old-run")).unwrap();
+        fs::create_dir_all(kvm_dir.join("physical-gpu-launch-1")).unwrap();
+        fs::write(build_dir.join("rustos-boot.img"), b"boot").unwrap();
+        fs::write(build_dir.join("image/kernel.elf"), b"kern").unwrap();
+        fs::write(build_dir.join("kv100.abc123/stale"), b"worktree").unwrap();
+        fs::write(build_dir.join("bench-core/old-run/bin"), b"bench").unwrap();
+        fs::write(kvm_dir.join("failure-snapshot-1.log"), b"snap").unwrap();
+        fs::write(kvm_dir.join("dvm-display.pmem"), b"pmem").unwrap();
+        fs::write(kvm_dir.join("perf-smp8.data"), b"perf").unwrap();
+        fs::write(kvm_dir.join("rustos-kvm.img"), b"kvmimg").unwrap();
+        fs::write(kvm_dir.join("failure-summary.json"), b"{}").unwrap();
+
+        let mut config = Config::from_env().unwrap();
+        config.build_dir = build_dir.to_path_buf();
+
+        // Zero-age cutoff treats the newly created bench-core entry as expired.
+        let (reclaimed, entries) =
+            clean_build_scratch(&config, Some(Duration::ZERO), true, false).unwrap();
+
+        assert!(reclaimed > 0);
+        assert!(entries >= 5);
+        assert!(!build_dir.join("kv100.abc123").exists());
+        assert!(!build_dir.join("bench-core/old-run").exists());
+        assert!(!kvm_dir.join("failure-snapshot-1.log").exists());
+        assert!(!kvm_dir.join("dvm-display.pmem").exists());
+        assert!(!kvm_dir.join("perf-smp8.data").exists());
+        assert!(!kvm_dir.join("physical-gpu-launch-1").exists());
+        assert!(build_dir.join("rustos-boot.img").exists());
+        assert!(build_dir.join("image/kernel.elf").exists());
+        assert!(kvm_dir.join("failure-summary.json").exists());
+        assert!(kvm_dir.join("rustos-kvm.img").exists());
+
+        // Non-stale scratch mode removes leftover runtime KVM images too.
+        clean_build_scratch(&config, None, false, false).unwrap();
+        assert!(!kvm_dir.join("rustos-kvm.img").exists());
+        assert!(build_dir.join("rustos-boot.img").exists());
+    }
 }

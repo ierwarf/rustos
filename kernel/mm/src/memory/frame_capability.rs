@@ -744,6 +744,27 @@ pub fn allocate_zeroed_frame() -> Option<PhysAddr> {
     Some(frame)
 }
 
+/// Allocates one frame, copies `bytes` into the prefix, and zeroes only the tail.
+pub fn allocate_filled_frame(bytes: &[u8]) -> Option<PhysAddr> {
+    if bytes.len() > FRAME_BYTES {
+        return None;
+    }
+    let frame = phys::alloc_frame_user()?;
+    let dest = kernel_vm::higher_half_addr(frame.as_u64()) as *mut u8;
+    // SAFETY: `alloc_frame_user` returns one exclusively owned page below the
+    // direct-map ceiling, and `bytes.len() <= FRAME_BYTES`.
+    unsafe {
+        if !bytes.is_empty() {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), dest, bytes.len());
+        }
+        let tail = FRAME_BYTES - bytes.len();
+        if tail > 0 {
+            ptr::write_bytes(dest.add(bytes.len()), 0, tail);
+        }
+    }
+    Some(frame)
+}
+
 pub fn allocate_zeroed_frame_grant(
     binding: FrameGrantBinding,
     rights: u64,

@@ -418,6 +418,9 @@ impl ProcessTable {
                     // out of a retiring address space; the slot is not reusable
                     // while any are charged to it.
                     && kernel_mm::api::charge::usage(index) == 0
+                    // Empty transferrable objects (memfd/pipe) may still outlive
+                    // the job and later grow against its slot.
+                    && kernel_mm::api::charge::retainers(index) == 0
                     // A reaped process's descriptor table may still be dropping.
                     && kernel_mm::api::kmem_charge::total_usage(index) == 0
                     && slot.subtree_sessions == 0

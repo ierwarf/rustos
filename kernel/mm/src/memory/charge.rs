@@ -29,6 +29,7 @@ const MAX_DEPTH: usize = 9;
 
 struct Group {
     usage: AtomicU64,
+    retainers: AtomicU64,
     limit: AtomicU64,
     high: AtomicU64,
     min: AtomicU64,
@@ -40,6 +41,7 @@ impl Group {
     const fn new() -> Self {
         Self {
             usage: AtomicU64::new(0),
+            retainers: AtomicU64::new(0),
             limit: AtomicU64::new(UNLIMITED),
             high: AtomicU64::new(UNLIMITED),
             min: AtomicU64::new(0),
@@ -47,6 +49,27 @@ impl Group {
             parent: AtomicU32::new(NO_PARENT),
         }
     }
+}
+
+/// Pins a charge group slot against reuse while an independent kernel object
+/// (such as a `MemfdObject` or `PipeShared`) may later charge or refund it.
+pub fn retain(index: usize) {
+    if let Some(cell) = group(index) {
+        cell.retainers.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Releases one object-level retain on a charge group slot. Must be called
+/// after all page charges owned by that object have already been uncharged.
+pub fn release(index: usize) {
+    let Some(cell) = group(index) else { return };
+    let previous = cell.retainers.fetch_sub(1, Ordering::AcqRel);
+    assert!(previous != 0, "charge group {index} retainer underflow");
+}
+
+/// Active object-level retains preventing slot reuse even when `usage == 0`.
+pub fn retainers(index: usize) -> u64 {
+    group(index).map_or(0, |cell| cell.retainers.load(Ordering::Acquire))
 }
 
 static GROUPS: [Group; CHARGE_GROUPS] = [const { Group::new() }; CHARGE_GROUPS];
@@ -318,6 +341,19 @@ mod tests {
         charge(CHARGE_GROUPS + 5, 1);
         assert_eq!(usage(CHARGE_GROUPS), 0);
     }
+
+    #[test]
+    fn retain_and_release_track_outstanding_retainers() {
+        init_group(49, None);
+        assert_eq!(retainers(49), 0);
+        retain(49);
+        retain(49);
+        assert_eq!(retainers(49), 2);
+        release(49);
+        assert_eq!(retainers(49), 1);
+        release(49);
+        assert_eq!(retainers(49), 0);
+    }
 }
 
 #[cfg(test)]
@@ -388,8 +424,8 @@ mod admission_wiring_tests {
             .collect();
         assert_eq!(
             sites.len(),
-            3,
-            "first touch, prepared frame and private file"
+            4,
+            "first touch, prepared frame, private file and shared alias"
         );
         for (at, _) in sites {
             let body = &mapping[at..at + 140];

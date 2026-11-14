@@ -8,11 +8,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustos_user_abi::syscall::{
-    APP_BUFFER_BROKER_BEGIN, APP_BUFFER_BROKER_REAP, APP_BUFFER_BROKER_TAKE,
-    APP_BUFFER_IPC_ALLOCATE, APP_BUFFER_IPC_VERSION, APP_BUFFER_MAX_BYTES,
-    DevmgrdAppBufferRequest, DevmgrdAppBufferResponse, IpcReplyWithHandlesArgs,
-    RustosAppBufferBrokerArgs, SYS_RUSTOS_APP_BUFFER_BROKER, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_IPC_REPLY_WITH_HANDLES,
+    APP_BUFFER_BROKER_BEGIN, APP_BUFFER_BROKER_CANCEL, APP_BUFFER_BROKER_REAP,
+    APP_BUFFER_BROKER_TAKE, APP_BUFFER_IPC_ALLOCATE, APP_BUFFER_IPC_VERSION,
+    APP_BUFFER_MAX_BYTES, DevmgrdAppBufferRequest, DevmgrdAppBufferResponse,
+    IpcReplyWithHandlesArgs, RustosAppBufferBrokerArgs, SYS_RUSTOS_APP_BUFFER_BROKER,
+    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_REPLY_WITH_HANDLES,
 };
 
 const FORMAT_XRGB8888: u32 = 0x3432_5258;
@@ -123,6 +123,14 @@ fn allocate(request: &DevmgrdAppBufferRequest) -> Result<u64, i32> {
             thread::sleep(Duration::from_millis(1));
             continue;
         }
+        if errno == libc::EAGAIN {
+            let mut cancel = RustosAppBufferBrokerArgs {
+                op: APP_BUFFER_BROKER_CANCEL,
+                sequence: sequence as u64,
+                ..RustosAppBufferBrokerArgs::default()
+            };
+            let _ = broker(&mut cancel);
+        }
         // ECANCELED: the broker finished retiring a timed-out allocation.
         return Err(match errno {
             libc::ECANCELED | libc::EAGAIN | libc::ETIMEDOUT => libc::ETIMEDOUT,
@@ -181,9 +189,13 @@ fn run(receiver: Receiver<Work>) {
     loop {
         match receiver.recv_timeout(IDLE_REAP) {
             Ok(work) => {
+                if let Err(errno) = validate(&work.request) {
+                    reply(&work, errno, None);
+                    continue;
+                }
                 // Settle earlier retirements first so exhaustion reflects reuse.
                 drain(Duration::from_millis(50));
-                match validate(&work.request).and_then(|()| allocate(&work.request)) {
+                match allocate(&work.request) {
                     Ok(fd) => reply(&work, 0, Some(fd)),
                     Err(errno) => {
                         reply(&work, errno, None);

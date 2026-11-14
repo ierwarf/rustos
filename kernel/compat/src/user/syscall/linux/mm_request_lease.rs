@@ -85,7 +85,23 @@ impl Slot {
 }
 
 static SLOTS: [Slot; LEASE_SLOTS] = [const { Slot::new() }; LEASE_SLOTS];
+static CLAIMED_MASK: [AtomicU64; LEASE_SLOTS / 64] = [const { AtomicU64::new(0) }; LEASE_SLOTS / 64];
 static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
+
+const _: () = assert!(LEASE_SLOTS == 256 && BUSY_SENTINEL == u64::MAX);
+
+fn claim_mask_set(index: usize) {
+    CLAIMED_MASK[index >> 6].fetch_or(1_u64 << (index & 63), Ordering::SeqCst);
+}
+
+fn claim_mask_clear(index: usize) {
+    CLAIMED_MASK[index >> 6].fetch_and(!(1_u64 << (index & 63)), Ordering::Release);
+}
+
+enum OpenRefusal {
+    PerPidLimit,
+    TableFull,
+}
 
 fn pack(process_generation: u32, mm_generation: u32) -> u64 {
     (u64::from(process_generation) << 32) | u64::from(mm_generation)
@@ -117,14 +133,20 @@ impl RequestLease {
     }
 
     fn open_with(target: MmTarget, is_live: impl Fn(MmTarget) -> bool) -> Option<Self> {
-        if let Some(lease) = Self::try_open(target) {
-            return Some(lease);
+        match Self::try_open(target) {
+            Ok(lease) => Some(lease),
+            Err(OpenRefusal::PerPidLimit) => {
+                reclaim_dead(&is_live, Some(target.pid));
+                Self::try_open(target).ok()
+            }
+            Err(OpenRefusal::TableFull) => {
+                reclaim_dead(&is_live, None);
+                Self::try_open(target).ok()
+            }
         }
-        reclaim_dead(&is_live);
-        Self::try_open(target)
     }
 
-    fn try_open(target: MmTarget) -> Option<Self> {
+    fn try_open(target: MmTarget) -> Result<Self, OpenRefusal> {
         for (index, slot) in SLOTS.iter().enumerate() {
             if slot
                 .ticket
@@ -134,21 +156,22 @@ impl RequestLease {
                 continue;
             }
             let ticket = loop {
-                // Never FREE or the sentinel; wrap skips both.
-                let candidate = NEXT_TICKET.fetch_add(1, Ordering::Relaxed);
+                // Encode `index` in the low 8 bits so `begin_apply` is O(1).
+                let seq = NEXT_TICKET.fetch_add(1, Ordering::Relaxed);
+                let candidate = (seq << 8) | (index as u64);
                 if candidate != FREE && candidate != BUSY_SENTINEL {
                     break candidate;
                 }
             };
-            // ORDERING: the pid is announced (SeqCst) while the slot is held by
-            // the sentinel, then the other slots are scanned. Two same-pid
-            // openers each store then scan, so at least one sees the other and
-            // the per-pid count cannot be overshot by a race. Stale pids on
-            // retiring slots only over-count (spurious refusal, never excess).
+            // ORDERING: mark bit and announce pid (SeqCst) while the slot is
+            // held by the sentinel, then scan claimed slots. Two same-pid
+            // openers each store then scan, so at least one sees the other.
+            claim_mask_set(index);
             slot.pid.store(target.pid, Ordering::SeqCst);
             if holders_of_pid(target.pid, index) >= MAX_LEASES_PER_PID {
+                claim_mask_clear(index);
                 slot.ticket.store(FREE, Ordering::Release);
-                return None;
+                return Err(OpenRefusal::PerPidLimit);
             }
             slot.generations.store(
                 pack(target.process_generation, target.mm_generation),
@@ -156,9 +179,9 @@ impl RequestLease {
             );
             // ORDERING: Release publishes pid/generations with the ticket.
             slot.ticket.store(ticket, Ordering::Release);
-            return Some(Self { index, ticket });
+            return Ok(Self { index, ticket });
         }
-        None
+        Err(OpenRefusal::TableFull)
     }
 
     pub(super) fn ticket(&self) -> u64 {
@@ -170,15 +193,22 @@ impl RequestLease {
 /// name `pid`. The pid is read before the ticket so a slot whose claimant has
 /// already announced `pid` is seen as claimed.
 fn holders_of_pid(pid: u64, skip: usize) -> usize {
-    SLOTS
-        .iter()
-        .enumerate()
-        .filter(|&(index, slot)| {
-            index != skip
-                && slot.pid.load(Ordering::SeqCst) == pid
-                && slot.ticket.load(Ordering::SeqCst) != FREE
-        })
-        .count()
+    let mut count = 0_usize;
+    for (word_idx, word_atom) in CLAIMED_MASK.iter().enumerate() {
+        let mut bits = word_atom.load(Ordering::SeqCst);
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let index = (word_idx << 6) | bit;
+            if index != skip
+                && SLOTS[index].pid.load(Ordering::SeqCst) == pid
+                && SLOTS[index].ticket.load(Ordering::SeqCst) != FREE
+            {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 impl RequestLease {
@@ -209,7 +239,7 @@ fn retire(slot: &Slot, ticket: u64) -> bool {
 /// the wait terminates. Callers must hold no IPC or process-state lock: an
 /// applier may need either to finish. `yield_cpu` lets the applier's CPU make
 /// progress in normal syscall context instead of burning this one.
-fn drain_and_free(slot: &Slot, yield_cpu: bool) {
+fn drain_and_free(index: usize, slot: &Slot, yield_cpu: bool) {
     while slot.appliers.load(Ordering::SeqCst) != 0 {
         if yield_cpu {
             #[cfg(not(test))]
@@ -220,16 +250,17 @@ fn drain_and_free(slot: &Slot, yield_cpu: bool) {
             core::hint::spin_loop();
         }
     }
+    claim_mask_clear(index);
     slot.ticket.store(FREE, Ordering::Release);
 }
 
 /// Retire `ticket` and, if this call won the retirement, drain and free the
 /// slot. Returns false (touching nothing) when the slot was not ours to retire.
-fn retire_and_drain(slot: &Slot, ticket: u64, yield_cpu: bool) -> bool {
+fn retire_and_drain(index: usize, slot: &Slot, ticket: u64, yield_cpu: bool) -> bool {
     if !retire(slot, ticket) {
         return false;
     }
-    drain_and_free(slot, yield_cpu);
+    drain_and_free(index, slot, yield_cpu);
     true
 }
 
@@ -239,29 +270,42 @@ impl Drop for RequestLease {
         // drain those that validated earlier. A false result means the lease
         // was reclaimed after this owner's incarnation died; the slot belongs
         // to someone else now and is not ours to retire or free.
-        retire_and_drain(&SLOTS[self.index], self.ticket, true);
+        retire_and_drain(self.index, &SLOTS[self.index], self.ticket, true);
     }
 }
 
 /// Frees leases whose owner can no longer run (its incarnation is gone).
-fn reclaim_dead(is_live: &impl Fn(MmTarget) -> bool) {
-    for slot in SLOTS.iter() {
-        let ticket = slot.ticket.load(Ordering::Acquire);
-        if ticket == FREE || ticket == BUSY_SENTINEL {
-            continue;
+fn reclaim_dead(is_live: &impl Fn(MmTarget) -> bool, pid_filter: Option<u64>) {
+    for (word_idx, word_atom) in CLAIMED_MASK.iter().enumerate() {
+        let mut bits = word_atom.load(Ordering::Acquire);
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let index = (word_idx << 6) | bit;
+            let slot = &SLOTS[index];
+            let ticket = slot.ticket.load(Ordering::Acquire);
+            if ticket == FREE || ticket == BUSY_SENTINEL {
+                continue;
+            }
+            let pid = slot.pid.load(Ordering::Relaxed);
+            if let Some(target_pid) = pid_filter
+                && pid != target_pid
+            {
+                continue;
+            }
+            let generations = slot.generations.load(Ordering::Relaxed);
+            let target = MmTarget {
+                pid,
+                process_generation: (generations >> 32) as u32,
+                mm_generation: generations as u32,
+            };
+            if is_live(target) {
+                continue;
+            }
+            // Retire only the lease observed above: a slot recycled meanwhile
+            // carries a different ticket and is left alone.
+            retire_and_drain(index, slot, ticket, false);
         }
-        let generations = slot.generations.load(Ordering::Relaxed);
-        let target = MmTarget {
-            pid: slot.pid.load(Ordering::Relaxed),
-            process_generation: (generations >> 32) as u32,
-            mm_generation: generations as u32,
-        };
-        if is_live(target) {
-            continue;
-        }
-        // Retire only the lease observed above: a slot recycled meanwhile
-        // carries a different ticket and is left alone.
-        retire_and_drain(slot, ticket, false);
     }
 }
 
@@ -298,31 +342,31 @@ pub(super) fn begin_apply(ticket: u64, target_pid: u64) -> Result<ApplyGuard, Le
     if ticket == FREE || ticket == BUSY_SENTINEL {
         return Err(LeaseRefusal::NoRequest);
     }
-    for (index, slot) in SLOTS.iter().enumerate() {
-        if slot.ticket.load(Ordering::Acquire) != ticket {
-            continue;
-        }
-        slot.appliers.fetch_add(1, Ordering::SeqCst);
-        // Re-read after announcing: close stores the sentinel before waiting on
-        // `appliers`, so either this read sees the retirement or close sees us.
-        if slot.ticket.load(Ordering::SeqCst) != ticket {
-            slot.appliers.fetch_sub(1, Ordering::SeqCst);
-            return Err(LeaseRefusal::NoRequest);
-        }
-        let guard = ApplyGuard {
-            index,
-            target: MmTarget {
-                pid: slot.pid.load(Ordering::Relaxed),
-                process_generation: (slot.generations.load(Ordering::Relaxed) >> 32) as u32,
-                mm_generation: slot.generations.load(Ordering::Relaxed) as u32,
-            },
-        };
-        if guard.target.pid != target_pid {
-            return Err(LeaseRefusal::WrongProcess);
-        }
-        return Ok(guard);
+    let index = (ticket as usize) & (LEASE_SLOTS - 1);
+    let slot = &SLOTS[index];
+    if slot.ticket.load(Ordering::Acquire) != ticket {
+        return Err(LeaseRefusal::NoRequest);
     }
-    Err(LeaseRefusal::NoRequest)
+    slot.appliers.fetch_add(1, Ordering::SeqCst);
+    // Re-read after announcing: close stores the sentinel before waiting on
+    // `appliers`, so either this read sees the retirement or close sees us.
+    if slot.ticket.load(Ordering::SeqCst) != ticket {
+        slot.appliers.fetch_sub(1, Ordering::SeqCst);
+        return Err(LeaseRefusal::NoRequest);
+    }
+    let generations = slot.generations.load(Ordering::Relaxed);
+    let guard = ApplyGuard {
+        index,
+        target: MmTarget {
+            pid: slot.pid.load(Ordering::Relaxed),
+            process_generation: (generations >> 32) as u32,
+            mm_generation: generations as u32,
+        },
+    };
+    if guard.target.pid != target_pid {
+        return Err(LeaseRefusal::WrongProcess);
+    }
+    Ok(guard)
 }
 
 #[cfg(test)]

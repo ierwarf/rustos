@@ -715,15 +715,11 @@ impl ProcessAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         validate_user_page_range(start, page_count)?;
         let page_flags = normalize_user_page_flags(flags)?;
+        if page_count == 0 {
+            return Ok(());
+        }
 
-        if !validate_protection_span(page_count, |page_index| {
-            page_addr(start, page_index).ok().is_some_and(|virt| {
-                matches!(
-                    self.lookup_user_page_state(virt),
-                    UserPageLookup::Present { .. }
-                )
-            })
-        }) {
+        if !self.all_user_pages_present(start, page_count) {
             return Err(AddressSpaceError::NotMapped);
         }
 
@@ -733,9 +729,27 @@ impl ProcessAddressSpace {
             self.privatize_immutable_pages(start, page_count)?;
         }
         let _mutation = begin_address_space_mutation(self.root_phys());
-        for page_index in 0..page_count {
-            let virt = page_addr(start, page_index)?;
-            self.protect_user_page(virt, page_flags)?;
+        let is_active = Cr3::read().0.start_address() == self.root_phys();
+        let mut done = 0_usize;
+        while done < page_count {
+            let chunk_start = page_addr(start, done)?;
+            let p1 = p1_index(chunk_start);
+            let chunk = (512 - p1).min(page_count - done);
+            let pt = self.leaf_pt_mut(chunk_start)?;
+            for offset in 0..chunk {
+                let entry = &mut pt[p1 + offset];
+                if entry.is_unused() {
+                    return Err(AddressSpaceError::NotMapped);
+                }
+                let updated = preserve_4k_leaf_pat(entry.flags(), page_flags);
+                entry.set_addr(entry.addr(), updated);
+                if is_active {
+                    tlb::flush(VirtAddr::new(
+                        chunk_start.as_u64() + (offset as u64) * PAGE_4KIB_U64,
+                    ));
+                }
+            }
+            done += chunk;
         }
 
         Ok(())
@@ -894,33 +908,48 @@ impl ProcessAddressSpace {
         Ok(())
     }
 
-    fn protect_user_page(
-        &mut self,
-        virt: VirtAddr,
-        flags: PageTableFlags,
-    ) -> Result<(), AddressSpaceError> {
-        // Bit 7 is PS in a directory entry, but PAT in a 4-KiB leaf PTE.
-        // Preserve it across mprotect so a write-combine external mapping
-        // cannot silently become write-back and create conflicting aliases.
-        // Software ownership and COW tags are likewise lifecycle evidence,
-        // not protection requested by mprotect, and may never be detached.
-        let existing = self.user_page_flags(virt)?;
-        self.set_user_page_flags_exact_without_flush(virt, preserve_4k_leaf_pat(existing, flags))?;
-        self.flush_if_active(virt);
-        Ok(())
+    fn all_user_pages_present(&self, start: VirtAddr, page_count: usize) -> bool {
+        let mut done = 0_usize;
+        while done < page_count {
+            let Ok(chunk_start) = page_addr(start, done) else {
+                return false;
+            };
+            let p1 = p1_index(chunk_start);
+            let chunk = (512 - p1).min(page_count - done);
+            let Some(pt) = self.leaf_pt_ref(chunk_start) else {
+                return false;
+            };
+            if (p1..p1 + chunk).any(|idx| pt[idx].is_unused()) {
+                return false;
+            }
+            done += chunk;
+        }
+        true
     }
 
-    fn user_page_flags(&self, virt: VirtAddr) -> Result<PageTableFlags, AddressSpaceError> {
-        self.translate_user_with_flags(virt)
-            .map(|(_, flags)| flags)
-            .ok_or(AddressSpaceError::NotMapped)
+    fn leaf_pt_ref(&self, virt: VirtAddr) -> Option<&PageTable> {
+        if !is_user_addr(virt.as_u64()) {
+            return None;
+        }
+        let root = self.root_table_ref();
+        let pml4_entry = &root[p4_index(virt)];
+        if pml4_entry.is_unused() || pml4_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return None;
+        }
+        let pdpt = unsafe { kernel_vm::phys_to_table_ref(pml4_entry.addr()) };
+        let pdpt_entry = &pdpt[p3_index(virt)];
+        if pdpt_entry.is_unused() || pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return None;
+        }
+        let pd = unsafe { kernel_vm::phys_to_table_ref(pdpt_entry.addr()) };
+        let pd_entry = &pd[p2_index(virt)];
+        if pd_entry.is_unused() || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return None;
+        }
+        Some(unsafe { kernel_vm::phys_to_table_ref(pd_entry.addr()) })
     }
 
-    fn set_user_page_flags_exact_without_flush(
-        &mut self,
-        virt: VirtAddr,
-        flags: PageTableFlags,
-    ) -> Result<(), AddressSpaceError> {
+    fn leaf_pt_mut(&mut self, virt: VirtAddr) -> Result<&mut PageTable, AddressSpaceError> {
         validate_user_page_range(virt, 1)?;
         let root = unsafe { kernel_vm::phys_to_table_mut(self.root_phys()) };
         let pml4_entry = &mut root[p4_index(virt)];
@@ -937,8 +966,45 @@ impl ProcessAddressSpace {
         if pd_entry.is_unused() || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return Err(AddressSpaceError::NotMapped);
         }
-        let pt = unsafe { kernel_vm::phys_to_table_mut(pd_entry.addr()) };
-        let pt_entry = &mut pt[p1_index(virt)];
+        Ok(unsafe { kernel_vm::phys_to_table_mut(pd_entry.addr()) })
+    }
+
+    fn protect_user_page(
+        &mut self,
+        virt: VirtAddr,
+        flags: PageTableFlags,
+    ) -> Result<(), AddressSpaceError> {
+        // Bit 7 is PS in a directory entry, but PAT in a 4-KiB leaf PTE.
+        // Preserve it across mprotect so a write-combine external mapping
+        // cannot silently become write-back and create conflicting aliases.
+        // Software ownership and COW tags are likewise lifecycle evidence,
+        // not protection requested by mprotect, and may never be detached.
+        let p1 = p1_index(virt);
+        let pt = self.leaf_pt_mut(virt)?;
+        let pt_entry = &mut pt[p1];
+        if pt_entry.is_unused() {
+            return Err(AddressSpaceError::NotMapped);
+        }
+        let updated = preserve_4k_leaf_pat(pt_entry.flags(), flags);
+        pt_entry.set_addr(pt_entry.addr(), updated);
+        self.flush_if_active(virt);
+        Ok(())
+    }
+
+    fn user_page_flags(&self, virt: VirtAddr) -> Result<PageTableFlags, AddressSpaceError> {
+        self.translate_user_with_flags(virt)
+            .map(|(_, flags)| flags)
+            .ok_or(AddressSpaceError::NotMapped)
+    }
+
+    fn set_user_page_flags_exact_without_flush(
+        &mut self,
+        virt: VirtAddr,
+        flags: PageTableFlags,
+    ) -> Result<(), AddressSpaceError> {
+        let p1 = p1_index(virt);
+        let pt = self.leaf_pt_mut(virt)?;
+        let pt_entry = &mut pt[p1];
         if pt_entry.is_unused() {
             return Err(AddressSpaceError::NotMapped);
         }
@@ -1107,6 +1173,7 @@ fn validate_user_page_range(start: VirtAddr, page_count: usize) -> Result<(), Ad
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_protection_span<F>(page_count: usize, mut page_is_present: F) -> bool
 where
     F: FnMut(usize) -> bool,

@@ -219,10 +219,18 @@ impl Registry {
         Ok(make_handle(slot, generation))
     }
 
+    pub(crate) fn retire_owner(&mut self, owner: FrameSourceOwner) {
+        self.drop_matching_owners(|object| object.owner == owner);
+    }
+
     fn drop_foreign_owner(&mut self, owner: FrameSourceOwner) {
+        self.drop_matching_owners(|object| object.owner != owner);
+    }
+
+    fn drop_matching_owners(&mut self, mut predicate: impl FnMut(&Object) -> bool) {
         let mut dropped = false;
         for slot in 0..LIBRARY_OBJECT_MAX_OBJECTS {
-            if self.slots[slot].as_ref().is_some_and(|object| object.owner != owner) {
+            if self.slots[slot].as_ref().is_some_and(&mut predicate) {
                 let object = self.slots[slot].take().expect("checked above");
                 self.reserved_pages -= object.tokens.len() as u64;
                 dropped = true;

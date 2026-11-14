@@ -524,8 +524,15 @@ mod warm_worker {
         for _ in 0..MAX_ATTEMPTS {
             let endpoint = ipc::lookup_service_endpoint(IPC_SERVICE_VFSD);
             last_endpoint = endpoint as i64;
-            if endpoint > 0 {
-                let mut host = VfsHost { endpoint: endpoint as u64, request: &mut buffers.request, response: &mut buffers.response, serial: 0, custody: &mut custody };
+            let pid = unsafe { rustos_svc_runtime::syscall::syscall0(SYS_GETPID) };
+            let tid = unsafe { rustos_svc_runtime::syscall::syscall0(SYS_GETTID) };
+            let (pid, tid) = if pid > 0 && tid > 0 {
+                (pid as u64, tid as u64)
+            } else {
+                (0, 0)
+            };
+            if endpoint > 0 && pid != 0 {
+                let mut host = VfsHost { endpoint: endpoint as u64, pid, tid, request: &mut buffers.request, response: &mut buffers.response, serial: 0, custody: &mut custody };
                 match library_warm::warm(&mut host, &mut buffers.manifest, &mut buffers.chunk) {
                     Ok(report) => {
                         settled = true;
@@ -618,10 +625,8 @@ mod warm_worker {
         let mut lowest_free = u64::MAX;
         let mut announced = false;
         loop {
-            rustos_svc_runtime::syscall::sleep_millis(RECLAIM_POLL_MS);
-            // Bounded diagnostics: once at start, then whenever free memory
-            // halves relative to the lowest sample seen.
-            if let Ok(sample) = (KernelReclaim).pressure() {
+            let sampled = (KernelReclaim).pressure();
+            if let Ok(sample) = sampled {
                 if !announced || sample.free_pages < lowest_free / 2 {
                     announced = true;
                     lowest_free = lowest_free.min(sample.free_pages);
@@ -643,28 +648,37 @@ mod warm_worker {
                         ipc::debug_line(text);
                     }
                 }
-            }
-            if let Some(done) = library_custody::reclaim_step(&mut custody, &mut KernelReclaim) {
-                let mut line = [0_u8; 112];
-                let mut at = 0;
-                for part in [
-                    &b"pagerd: library cache reclaimed objects="[..],
-                    &decimal(i64::from(done.objects))[..],
-                    &b" pages="[..],
-                    &decimal(done.pages as i64)[..],
-                    &b" free="[..],
-                    &decimal(done.free_pages as i64)[..],
-                    &b" kept="[..],
-                    &decimal(custody.objects() as i64)[..],
-                ] {
-                    let take = part.len().min(line.len() - at);
-                    line[at..at + take].copy_from_slice(&part[..take]);
-                    at += take;
+                if let Some(done) =
+                    library_custody::reclaim_with_pressure(&mut custody, &mut KernelReclaim, sample)
+                {
+                    let mut line = [0_u8; 112];
+                    let mut at = 0;
+                    for part in [
+                        &b"pagerd: library cache reclaimed objects="[..],
+                        &decimal(i64::from(done.objects))[..],
+                        &b" pages="[..],
+                        &decimal(done.pages as i64)[..],
+                        &b" free="[..],
+                        &decimal(done.free_pages as i64)[..],
+                        &b" kept="[..],
+                        &decimal(custody.objects() as i64)[..],
+                    ] {
+                        let take = part.len().min(line.len() - at);
+                        line[at..at + take].copy_from_slice(&part[..take]);
+                        at += take;
+                    }
+                    if let Ok(text) = core::str::from_utf8(&line[..at]) {
+                        ipc::debug_line(text);
+                    }
                 }
-                if let Ok(text) = core::str::from_utf8(&line[..at]) {
-                    ipc::debug_line(text);
+            }
+            if custody.objects() == 0 {
+                // Nothing held to reclaim; stop polling until service teardown.
+                loop {
+                    rustos_svc_runtime::syscall::sleep_millis(60_000);
                 }
             }
+            rustos_svc_runtime::syscall::sleep_millis(RECLAIM_POLL_MS);
         }
     }
 
@@ -685,6 +699,8 @@ mod warm_worker {
 
     struct VfsHost<'a> {
         endpoint: u64,
+        pid: u64,
+        tid: u64,
         request: &'a mut VfsIpcRequest,
         response: &'a mut VfsIpcResponse,
         serial: u64,
@@ -697,25 +713,29 @@ mod warm_worker {
             if path.len() > self.request.path.len() || out.len() > VFS_LIBRARY_READ_MAX_BYTES {
                 return Err(22);
             }
-            // SAFETY: getpid/gettid take no arguments and touch no memory.
-            let pid = unsafe { rustos_svc_runtime::syscall::syscall0(SYS_GETPID) };
-            // SAFETY: as above.
-            let tid = unsafe { rustos_svc_runtime::syscall::syscall0(SYS_GETTID) };
-            if pid <= 0 || tid <= 0 {
-                return Err(22);
-            }
             self.serial += 1;
-            *self.request = VfsIpcRequest::default();
+            self.request.version = 0;
             self.request.op = VFS_IPC_OP_LIBRARY_READ;
-            self.request.pid = pid as u64;
-            self.request.tid = tid as u64;
+            self.request.flags = 0;
+            self.request.pid = self.pid;
+            self.request.tid = self.tid;
+            self.request.session_handle = 0;
+            self.request.uid = 0;
+            self.request.gid = 0;
+            self.request.euid = 0;
+            self.request.egid = 0;
+            self.request.fd = 0;
+            self.request.dirfd = 0;
+            self.request.remote_id = 0;
             self.request.arg0 = offset;
             self.request.arg1 = out.len() as u64;
-            self.request.operation_hi = pid as u64;
+            self.request.arg2 = 0;
+            self.request.arg3 = 0;
+            self.request.operation_hi = self.pid;
             self.request.operation_lo = self.serial;
             self.request.path_len = path.len() as u32;
+            self.request.payload_len = 0;
             self.request.path[..path.len()].copy_from_slice(path.as_bytes());
-            *self.response = VfsIpcResponse::default();
             // SAFETY: both buffers are exclusive, fixed-size and outlive the call.
             let got = unsafe {
                 ipc::call_bounded(

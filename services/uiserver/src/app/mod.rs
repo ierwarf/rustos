@@ -493,6 +493,7 @@ pub(crate) struct AppState {
     closing_console_sessions: Vec<ConsoleSessionHandle>,
     pub(crate) next_console_snapshot_index: usize,
     pub(crate) wayland_windows: Vec<WaylandWindowSnapshot>,
+    pub(crate) wayland_opaque_cache: Vec<crate::render::WaylandOpaqueCacheEntry>,
     dragging_window: Option<DragTarget>,
     drag_offset_x: usize,
     drag_offset_y: usize,

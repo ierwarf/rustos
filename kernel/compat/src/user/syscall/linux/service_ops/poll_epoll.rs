@@ -912,16 +912,14 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
     };
     let result = call_vfs_ipc_request_with_timeout(&request, control::deadline_ms())
         .and_then(|response| ensure_vfs_status(&response));
+    if result.is_ok() && op != linux_abi::EPOLL_CTL_DEL {
+        super::local_fd::note_epoll_registered(&target.handle);
+    }
     if let Some(guard) = guard {
         release_epoll_target_guard(guard);
     }
     match result {
-        Ok(()) => {
-            if op != linux_abi::EPOLL_CTL_DEL {
-                super::local_fd::note_epoll_registered(&target.handle);
-            }
-            0
-        }
+        Ok(()) => 0,
         Err(errno) => linux_errno(errno),
     }
 }

@@ -525,15 +525,28 @@ impl FrameDescriptorLedger {
         let live_role = shared_live_role(kind);
         let locked_role = shared_locked_role(kind);
         let role = frame.role.load(DESCRIPTOR_ACQUIRE);
-        let converted_exclusive = if !cache_owner && role == ROLE_EXCLUSIVE_DATA_LIVE
+        let converted_exclusive = if !cache_owner
+            && matches!(role, ROLE_EXCLUSIVE_DATA_LIVE | ROLE_EXCLUSIVE_DATA_CLAIMED)
             && frame.owner_or_table_head.load(Ordering::Relaxed) == owner_root
             && frame.next_or_virtual_address.load(Ordering::Relaxed) == owner_va
         {
-            if frame
-                .role
-                .compare_exchange(role, locked_role, DESCRIPTOR_ACQ_REL, DESCRIPTOR_ACQUIRE)
-                .is_err()
-            {
+            let mut acquired = false;
+            for _ in 0..SHARED_LOCK_SPINS {
+                match frame.role.compare_exchange(
+                    ROLE_EXCLUSIVE_DATA_LIVE,
+                    locked_role,
+                    DESCRIPTOR_ACQ_REL,
+                    DESCRIPTOR_ACQUIRE,
+                ) {
+                    Ok(_) => {
+                        acquired = true;
+                        break;
+                    }
+                    Err(ROLE_EXCLUSIVE_DATA_CLAIMED) => spin_loop(),
+                    Err(_) => break,
+                }
+            }
+            if !acquired {
                 self.release_mapping_record(mapping_id);
                 return None;
             }
@@ -544,12 +557,8 @@ impl FrameDescriptorLedger {
                 .shared_backing_identity
                 .store(backing_identity, Ordering::Relaxed);
             true
-        } else if role == live_role {
-            if frame
-                .role
-                .compare_exchange(role, locked_role, DESCRIPTOR_ACQ_REL, DESCRIPTOR_ACQUIRE)
-                .is_err()
-            {
+        } else if matches!(role, r if r == live_role || r == locked_role) {
+            if !self.lock_shared(frame, kind, false) {
                 self.release_mapping_record(mapping_id);
                 return None;
             }
@@ -763,7 +772,7 @@ impl FrameDescriptorLedger {
     fn release_private_file_cache(&self, frame_phys: u64, backing_identity: u64) -> Option<DataLeafRelease> {
         if backing_identity == 0 { return None; }
         let frame = self.record(frame_phys)?;
-        if !self.lock_shared(frame, CowFrameKind::PrivateFileSection, true) { return None; }
+        if !self.lock_shared(frame, CowFrameKind::PrivateFileSection, false) { return None; }
         if frame.shared_backing_identity.load(Ordering::Relaxed) != backing_identity
             || frame.owner_or_table_head.load(Ordering::Relaxed) != 0
             || frame.next_or_virtual_address.load(Ordering::Relaxed) != 0 {
@@ -1414,6 +1423,7 @@ impl FrameDescriptorLedger {
             .is_none_or(|group| charge::would_admit(group, pages))
     }
 
+    #[cfg(test)]
     fn decrement_root_data_count(&self, root_phys: u64) {
         let root = self
             .verify_root(root_phys)

@@ -170,6 +170,18 @@ pub fn reclaim_step<H: ReclaimHost>(custody: &mut Custody, host: &mut H) -> Opti
         return None;
     }
     let pressure = host.pressure().ok()?;
+    reclaim_with_pressure(custody, host, pressure)
+}
+
+/// Same retention pass using an already-sampled pressure reading.
+pub fn reclaim_with_pressure<H: ReclaimHost>(
+    custody: &mut Custody,
+    host: &mut H,
+    pressure: Pressure,
+) -> Option<Reclaimed> {
+    if custody.objects() == 0 {
+        return None;
+    }
     let shortfall = pressure.shortfall();
     let mut victims = [0_u64; LIBRARY_OBJECT_MAX_OBJECTS];
     let (count, _) = custody.plan(shortfall, &mut victims);

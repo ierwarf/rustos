@@ -155,6 +155,7 @@ struct rustos_dvm_ivshmem {
 	atomic_t host_invited;
 	atomic_t relay_ready;
 	atomic_t gpu_prime_ready;
+	atomic_t torn_down;
 	atomic64_t invitation_generation;
 	atomic64_t control_sequence;
 	u64 acquired_values[RUSTOS_GPU_ATLAS_SLOT_COUNT];
@@ -518,8 +519,19 @@ static int rustos_dvm_app_end_cpu(struct dma_buf *dmabuf,
 	return 0;
 }
 
+static void rustos_dvm_ivshmem_mark_torndown(void *data)
+{
+	struct rustos_dvm_ivshmem *state = data;
+
+	mutex_lock(&state->app_lock);
+	atomic_set(&state->torn_down, 1);
+	mutex_unlock(&state->app_lock);
+}
+
 static void rustos_dvm_app_reply(struct rustos_dvm_ivshmem *state, u64 sequence, int status)
 {
+	if (atomic_read(&state->torn_down))
+		return;
 	writeq((u64)(s64)status, state->shared + RUSTOS_APP_RESPONSE_STATUS);
 	wmb();
 	writeq(sequence, state->shared + RUSTOS_APP_RESPONSE_SEQUENCE);
@@ -563,9 +575,14 @@ static long rustos_dvm_app_take(struct rustos_dvm_ivshmem *state, unsigned long 
 	u64 offset, end;
 	int fd, err;
 
-	if (!state || !state->app_pixels || !atomic_read(&state->relay_ready))
+	if (!state || !state->app_pixels || !atomic_read(&state->relay_ready) ||
+	    atomic_read(&state->torn_down))
 		return -ENODEV;
 	mutex_lock(&state->app_lock);
+	if (atomic_read(&state->torn_down)) {
+		err = -ENODEV;
+		goto out;
+	}
 	event.sequence = readq(state->shared + RUSTOS_APP_REQUEST_SEQUENCE);
 	if (!event.sequence || event.sequence <= state->app_sequence) {
 		err = -EAGAIN;
@@ -575,6 +592,7 @@ static long rustos_dvm_app_take(struct rustos_dvm_ivshmem *state, unsigned long 
 	event.kind = readq(state->shared + RUSTOS_APP_REQUEST_KIND);
 	memcpy_fromio(event.record, state->shared + RUSTOS_APP_REQUEST_RECORD,
 		      sizeof(event.record));
+	rmb();
 	if (readq(state->shared + RUSTOS_APP_REQUEST_SEQUENCE) != event.sequence) {
 		err = -EAGAIN;
 		goto out;
@@ -587,6 +605,12 @@ static long rustos_dvm_app_take(struct rustos_dvm_ivshmem *state, unsigned long 
 	if (event.kind == RUSTOS_APP_REVOKE) {
 		list_for_each_entry(app, &state->app_exports, link) {
 			if (!memcmp(app->record, event.record, sizeof(event.record))) {
+				/* Duplicate revoke while closing: acknowledge without
+				 * overwriting the prior revoke sequence. */
+				if (READ_ONCE(app->revoked)) {
+					err = 0;
+					goto reply;
+				}
 				/* Relay closes its fd after receiving this event. No reply
 				 * is sent until the final dma-buf reference has gone. */
 				if (copy_to_user((void __user *)argument, &event, sizeof(event))) {
@@ -624,7 +648,8 @@ static long rustos_dvm_app_take(struct rustos_dvm_ivshmem *state, unsigned long 
 	app->pgmap = get_dev_pagemap(PHYS_PFN(app->phys), NULL);
 	if (app->pgmap != &state->app_pgmap ||
 	    !rustos_dvm_pgmap_owns_pfn(app->pgmap, PHYS_PFN(app->phys + app->bytes - 1))) {
-		put_dev_pagemap(app->pgmap);
+		if (app->pgmap)
+			put_dev_pagemap(app->pgmap);
 		kfree(app);
 		err = -ENXIO;
 		goto reply;
@@ -1070,22 +1095,32 @@ static ssize_t rustos_dvm_display_ready_store(struct device *dev,
 {
 	struct rustos_dvm_ivshmem *state = dev_get_drvdata(dev);
 	u64 generation;
+	ssize_t result = count;
 
 	if (!state || count != 6 || memcmp(buf, "ready\n", 6))
 		return -EINVAL;
-	if (!atomic_read(&state->gpu_prime_ready))
-		return -EAGAIN;
-	if (atomic_cmpxchg(&state->host_invited, 1, 0) != 1)
-		return -EAGAIN;
+	mutex_lock(&state->control_lock);
+	if (!atomic_read(&state->gpu_prime_ready)) {
+		result = -EAGAIN;
+		goto out;
+	}
+	if (atomic_cmpxchg(&state->host_invited, 1, 0) != 1) {
+		result = -EAGAIN;
+		goto out;
+	}
 	generation = atomic64_read(&state->invitation_generation);
-	if (!generation || generation & 1)
-		return -EPROTO;
+	if (!generation || generation & 1) {
+		result = -EPROTO;
+		goto out;
+	}
 	writeq(generation, state->shared + RUSTOS_GUI_POOL_READY_ACK_OFFSET);
 	wmb();
 	atomic_set(&state->relay_ready, 1);
 	iowrite32(RUSTOS_DVM_HOST_CONTROL_VECTOR,
 		  state->doorbell + RUSTOS_IVSHMEM_DOORBELL_OFFSET);
-	return count;
+out:
+	mutex_unlock(&state->control_lock);
+	return result;
 }
 static DEVICE_ATTR_WO(rustos_dvm_display_ready);
 
@@ -1420,6 +1455,11 @@ static int rustos_dvm_ivshmem_probe(struct pci_dev *pdev,
 				  RUSTOS_GUI_POOL_HEADER_BYTES);
 	if (!state->shared)
 		return -ENOMEM;
+	result = devm_add_action_or_reset(&pdev->dev,
+					 rustos_dvm_ivshmem_mark_torndown,
+					 state);
+	if (result)
+		return result;
 	state->app_sequence = readq(state->shared + RUSTOS_APP_RESPONSE_SEQUENCE);
 	state->slot_bytes = readq(state->shared + 48U);
 	if (!state->slot_bytes || state->slot_bytes & (PAGE_SIZE - 1) ||

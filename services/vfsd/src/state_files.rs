@@ -548,6 +548,23 @@ impl VfsState {
         }
     }
 
+    fn resolve_proc_exe_target(
+        &self,
+        request: &VfsIpcRequest,
+        node: vfsd::proc_fs::ProcNode,
+    ) -> Result<String, i32> {
+        let exec = vfsd::proc_fs::attached_exec_path(&request.payload, request.payload_len as usize);
+        match vfsd::proc_fs::link_target(node, request.pid, exec)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|target| normalize_absolute_path("/", target.as_str()))
+        {
+            Some(Ok(target)) => Ok(target),
+            Some(Err(errno)) => Err(errno),
+            None => Err(ENOENT),
+        }
+    }
+
     fn vfs_access(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
         let Some(path) = vfs_request_path(request) else {
             response.status = EINVAL;
@@ -555,6 +572,12 @@ impl VfsState {
         };
         response.status = match self.resolve_path(request, request.pid, request.dirfd, path) {
             Ok(path) => match vfsd::proc_fs::lookup(path.as_str(), request.pid) {
+                Some(Ok(vfsd::proc_fs::ProcNode::ExeLink)) => {
+                    match self.resolve_proc_exe_target(request, vfsd::proc_fs::ProcNode::ExeLink) {
+                        Ok(target) => lock_vfs_storage().metadata(target.as_str()).err().unwrap_or(0),
+                        Err(errno) => errno,
+                    }
+                }
                 Some(Ok(_)) => 0,
                 Some(Err(errno)) => errno,
                 None => lock_vfs_storage().metadata(path.as_str()).err().unwrap_or(0),
@@ -586,18 +609,10 @@ impl VfsState {
         let follow = request.flags & AT_SYMLINK_NOFOLLOW == 0;
         if follow && node == ProcNode::ExeLink {
             // Stat the target as an ordinary path; its own metadata is real.
-            let target = match proc_fs::link_target(node, request.pid, exec)
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .map(|target| normalize_absolute_path("/", target.as_str()))
-            {
-                Some(Ok(target)) => target,
-                Some(Err(errno)) => {
+            let target = match self.resolve_proc_exe_target(request, node) {
+                Ok(target) => target,
+                Err(errno) => {
                     response.status = errno;
-                    return true;
-                }
-                None => {
-                    response.status = ENOENT;
                     return true;
                 }
             };

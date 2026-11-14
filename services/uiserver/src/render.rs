@@ -37,6 +37,7 @@ mod glass;
 mod icons;
 
 pub(crate) use background::{start_desktop_background_loader, DesktopBackground};
+pub(crate) use fragments::WaylandOpaqueCacheEntry;
 
 const SLOW_DESKTOP_REFRESH_THRESHOLD: Duration = Duration::from_millis(8);
 const MAX_DESKTOP_REFRESH_LOGS: usize = 6;

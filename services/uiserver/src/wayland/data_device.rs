@@ -1111,7 +1111,7 @@ impl Dispatch<wl_data_offer::WlDataOffer, DragOfferData> for WaylandState {
                     );
                     return;
                 }
-                if !offer.valid || (offer.dropped && offer.action != 4) {
+                if !offer.valid || (offer.dropped && !offer.dropped_ask) {
                     return;
                 }
                 let intersection = actions & offer.source_actions;
@@ -1124,7 +1124,7 @@ impl Dispatch<wl_data_offer::WlDataOffer, DragOfferData> for WaylandState {
                 let dropped = offer.dropped;
                 offer.action = action;
                 offer.action_sent = true;
-                if offer_changed && !dropped {
+                if offer_changed {
                     resource.action(dnd_action(action));
                 }
                 drop(offer);

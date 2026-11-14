@@ -68,7 +68,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         || options.release_stage_probe;
     let runtime_disk = if needs_private_contracts {
         let runtime_disk = run_dir.join("rustos-kvm.img");
-        fs::copy(&config.boot_disk_image, &runtime_disk).with_context(|| {
+        copy_sparse_file(&config.boot_disk_image, &runtime_disk).with_context(|| {
             format!(
                 "failed to create KVM runtime disk from {}",
                 config.boot_disk_image.display()
@@ -169,7 +169,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         // bootstrap disk and the post-handoff DVM path. Copying the pristine
         // build image here silently discarded profiling/network overrides and
         // made their acceptance gates observe a different filesystem view.
-        fs::copy(&runtime_disk, &disk).with_context(|| {
+        copy_sparse_file(&runtime_disk, &disk).with_context(|| {
             format!(
                 "create private storage-DVM disk from {}",
                 runtime_disk.display()
@@ -185,6 +185,11 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
             Some(disk),
         )
     } else {
+        for stale in [run_dir.join("dvm-block-disk.img"), shmem_dir.join("dvm-block.ivshmem")] {
+            if stale.exists() {
+                let _ = fs::remove_file(&stale);
+            }
+        }
         (None, None, None)
     };
 
@@ -746,6 +751,37 @@ fn write_private_kvm_contracts(
         }
     }
     fs.unmount()?;
+    Ok(())
+}
+
+/// Copies a raw disk image while preserving zero-filled regions as filesystem
+/// sparse holes so repeated 1+ GiB boot copies do not bloat on-disk blocks.
+fn copy_sparse_file(src_path: &Path, dst_path: &Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut src = std::fs::File::open(src_path)?;
+    let len = src.metadata()?.len();
+    let mut dst = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(dst_path)?;
+    dst.set_len(len)?;
+    let mut buf = vec![0_u8; 64 * 1024];
+    let mut offset = 0_u64;
+    while offset < len {
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &buf[..n];
+        if chunk.iter().any(|&b| b != 0) {
+            dst.seek(SeekFrom::Start(offset))?;
+            dst.write_all(chunk)?;
+        }
+        offset += n as u64;
+    }
+    dst.flush()?;
     Ok(())
 }
 
@@ -1608,5 +1644,35 @@ mod run_archive_tests {
         let serial = names.iter().find(|name| name.ends_with(".dvm.txt")).unwrap();
         assert_eq!(fs::read_to_string(history.join(serial)).unwrap(), "dvm");
         assert!(names.iter().any(|name| name.ends_with(".log")));
+    }
+
+    #[test]
+    fn copy_sparse_file_preserves_zero_holes() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src.img");
+        let dst = root.path().join("dst.img");
+
+        {
+            let mut file = fs::File::create(&src).unwrap();
+            file.write_all(b"header-block").unwrap();
+            file.seek(SeekFrom::Start(8 * 1024 * 1024)).unwrap();
+            file.write_all(b"tail-block").unwrap();
+            file.set_len(16 * 1024 * 1024).unwrap();
+        }
+
+        super::copy_sparse_file(&src, &dst).unwrap();
+
+        let src_meta = fs::metadata(&src).unwrap();
+        let dst_meta = fs::metadata(&dst).unwrap();
+        assert_eq!(dst_meta.len(), src_meta.len());
+        assert!(
+            dst_meta.blocks() * 512 < 1024 * 1024,
+            "expected sparse allocation under 1 MiB, got {} bytes",
+            dst_meta.blocks() * 512
+        );
+        assert_eq!(fs::read(&dst).unwrap(), fs::read(&src).unwrap());
     }
 }

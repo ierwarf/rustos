@@ -539,6 +539,11 @@ fn withdraw_frame_source_owner(service_id: u64, epoch: u64) {
                 service_slot: service_id, service_generation: epoch,
             },
         );
+        crate::library_cache::REGISTRY.lock().retire_owner(
+            kernel_mm::api::frame_source::FrameSourceOwner {
+                service_slot: service_id, service_generation: epoch,
+            },
+        );
     }
 }
 

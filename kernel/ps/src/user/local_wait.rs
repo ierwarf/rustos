@@ -172,7 +172,6 @@ const _: () = assert!(REGISTRY_CAPACITY.is_power_of_two());
 
 enum Slot {
     Empty,
-    Tombstone,
     Live {
         token: u64,
         object: Weak<dyn LocalWaitable>,
@@ -218,28 +217,43 @@ impl Registry {
     /// Installs `object`; on refusal hands it back so the caller drops it
     /// outside the guard.
     fn insert(&mut self, token: u64, object: Weak<dyn LocalWaitable>) -> Result<(), Weak<dyn LocalWaitable>> {
-        if self.live == REGISTRY_CAPACITY || self.find(token).is_some() {
+        if self.live == REGISTRY_CAPACITY {
             return Err(object);
         }
         let start = Self::probe_start(token);
         for offset in 0..REGISTRY_CAPACITY {
             let index = (start + offset) & (REGISTRY_CAPACITY - 1);
-            if matches!(self.slots[index], Slot::Empty | Slot::Tombstone) {
-                self.slots[index] = Slot::Live { token, object };
-                self.live += 1;
-                return Ok(());
+            match &self.slots[index] {
+                Slot::Empty => {
+                    self.slots[index] = Slot::Live { token, object };
+                    self.live += 1;
+                    return Ok(());
+                }
+                Slot::Live { token: held, .. } if *held == token => return Err(object),
+                Slot::Live { .. } => {}
             }
         }
         Err(object)
     }
 
     fn remove(&mut self, token: u64) -> Option<Weak<dyn LocalWaitable>> {
-        let index = self.find(token)?;
-        let Slot::Live { object, .. } = core::mem::replace(&mut self.slots[index], Slot::Tombstone)
+        let mut hole = self.find(token)?;
+        let Slot::Live { object, .. } = core::mem::replace(&mut self.slots[hole], Slot::Empty)
         else {
             return None;
         };
         self.live -= 1;
+        // Backward-shift subsequent cluster entries so no tombstones accumulate.
+        let mask = REGISTRY_CAPACITY - 1;
+        let mut cur = (hole + 1) & mask;
+        while let Slot::Live { token: cur_token, .. } = &self.slots[cur] {
+            let desired = Self::probe_start(*cur_token);
+            if hole.wrapping_sub(desired) & mask < cur.wrapping_sub(desired) & mask {
+                self.slots[hole] = core::mem::replace(&mut self.slots[cur], Slot::Empty);
+                hole = cur;
+            }
+            cur = (cur + 1) & mask;
+        }
         Some(object)
     }
 }
