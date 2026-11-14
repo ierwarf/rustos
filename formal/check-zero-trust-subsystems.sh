@@ -31,8 +31,16 @@ fi
 registered_socket_sources="$(
     awk -F '\t' '$2 == "local-socket" {print $4}' "$registry" | sort -u
 )"
+# Ingress means production code: a unit test may bind a throwaway listener to
+# exercise a client, so everything from the first `#[cfg(test)]` on is ignored.
 implemented_socket_sources="$(
-    rg -l 'accept4\(|UnixListener|libc::bind\(' services --glob '*.rs' | sort -u
+    rg -l 'accept4\(|UnixListener|libc::bind\(' services --glob '*.rs' | while read -r source; do
+        if awk '/^[[:space:]]*#\[cfg\(test\)\]/ {exit}
+                /accept4\(|UnixListener|libc::bind\(/ {found = 1; exit}
+                END {exit !found}' "$source"; then
+            printf '%s\n' "$source"
+        fi
+    done | sort -u
 )"
 if ! diff -u <(printf '%s\n' "$implemented_socket_sources") \
     <(printf '%s\n' "$registered_socket_sources"); then

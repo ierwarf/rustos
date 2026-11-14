@@ -1,7 +1,7 @@
 # Kernel-local pipe and eventfd (`pipe`/`pipe2`/`eventfd`/`eventfd2`)
 
 Linux syscalls 22, 293, 284, 290. Modules: `kernel/ps/src/user/{pipe,eventfd,local_wait}.rs`
-(objects), `kernel/compat/.../service_ops/local_fd.rs` (syscalls, blocking, user copy),
+(objects), `kernel/compat/src/user/syscall/linux/service_ops/local_fd.rs` (syscalls, blocking, user copy),
 ABI constants in `libs/rustos-user-abi/src/linux/local_fd.rs`.
 
 ## Owner decision

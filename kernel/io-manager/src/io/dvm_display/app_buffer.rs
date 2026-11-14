@@ -1,6 +1,22 @@
 //! Host-authorized app-buffer mailbox. The payload is never an authority: the
 //! retained kernel capability supplies identity and range. Publication leases,
 //! service policy and timeout cancellation belong to the caller.
+//!
+//! - **Owner:** io-manager owns the one-slot request/response mailbox shared
+//!   with the display provider; the broker in kernel-compat owns policy.
+//! - **Boundary:** responses come from a provider and are untrusted; a response
+//!   is matched to its request by the retained capability and exact epoch, and
+//!   a payload field never selects a range.
+//! - **Lifecycle:** a request is published once, answered at most once, and
+//!   retired by the caller on completion, timeout or provider restart.
+//! - **Concurrency:** the mailbox mutex is taken before the app-buffer pool and
+//!   is never held across a wait or a callback.
+//! - **Failure:** a stale, duplicate or mismatched response changes nothing and
+//!   leaves the request for the caller's timeout path.
+//! - **Forbidden:** treating payload bytes as identity, blocking while holding
+//!   the mailbox, and completing a request the caller already cancelled.
+//! - **Evidence:** `formal/app-buffer-custody`, host tests in this module, and
+//!   `kvm-smoke --app-dmabuf-probe`.
 use super::*;
 use driver_domain_protocol::{
     DVM_APP_BUFFER_APERTURE_BYTES, DVM_APP_BUFFER_PAGE_BYTES, DVM_APP_BUFFER_PHYS_ADDR,

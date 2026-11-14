@@ -82,6 +82,7 @@ lane_seconds() {
 wait_parallel_lanes() {
     local failed=0
     local index
+    local -a failed_lanes=()
     for index in "${!lane_pids[@]}"; do
         if wait "${lane_pids[$index]}"; then
             # The full lane log is retained under build/formal/ regardless; a
@@ -95,11 +96,26 @@ wait_parallel_lanes() {
                 "${lane_names[$index]}" "$(lane_seconds "${lane_names[$index]}")" >&2
             tail -n 80 "$lane_dir/${lane_names[$index]}.log" >&2
             failed=1
+            failed_lanes+=("${lane_names[$index]}")
         fi
     done
+    if [[ "$failed" -ne 0 ]]; then
+        # The per-lane tails above bury the cause under whatever the lane
+        # printed last; end with the verdict and where each full log lives.
+        printf 'formal gate FAILED: %d lane(s): %s\n' "${#failed_lanes[@]}" "${failed_lanes[*]}" >&2
+        local lane
+        for lane in "${failed_lanes[@]}"; do
+            printf '  %s: %s\n' "$lane" "$lane_dir/$lane.log" >&2
+        done
+    fi
     [[ "$failed" -eq 0 ]]
 }
 
+# Name the stage that stopped the gate. Sequential stages exit under `set -e`
+# without a word of their own, so a bare nonzero exit says nothing about which
+# one failed; `tools/agent/formal-preflight.sh` reports every cheap static
+# failure in one pass instead of one gate run per failure.
+trap 'status=$?; echo "formal gate FAILED (exit $status) at: $BASH_COMMAND" >&2; echo "run tools/agent/formal-preflight.sh to list every static failure at once" >&2' ERR
 bash formal/selftest.sh
 bash formal/run-proof-index.sh
 # The exhaustive TLC set is the only lane whose contract is a wall clock.

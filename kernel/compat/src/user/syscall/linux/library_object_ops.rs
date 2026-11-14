@@ -8,7 +8,11 @@
 //!   bounded and performs no IPC; cold frame reclamation runs after the lock.
 //! - **Failure:** every refusal publishes nothing; a partially built object is
 //!   invisible to guests until sealed.
+//! - **Concurrency:** one registry lock guards mutation and is never held across
+//!   a payload copy, IPC or frame reclamation; the service lease is taken first.
 //! - **Forbidden:** paths, policy, and guest-facing authority.
+//! - **Evidence:** `kvm-smoke --library-map-probe` and the registry tests in
+//!   `library_cache.rs`.
 use super::*;
 use crate::library_cache::{KernelSources, LibraryError, REGISTRY};
 use kernel_mm::api::frame_source::{self, FrameSourceOwner};

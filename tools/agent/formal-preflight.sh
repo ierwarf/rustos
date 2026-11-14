@@ -39,6 +39,8 @@ checks=(
   "performance-contracts|bash formal/check-performance-contracts.sh"
   "spec-mutation-registry|python3 formal/run-spec-mutations.py --check"
   "impl-mutation-registry|python3 formal/run-implementation-mutations.py --check"
+  "source-conformance-static|FORMAL_SOURCE_CONFORMANCE_STATIC_ONLY=1 bash formal/run-source-conformance.sh"
+  "selftest|bash formal/selftest.sh"
 )
 
 if [[ "${1:-}" == "--list" ]]; then

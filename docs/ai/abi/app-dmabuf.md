@@ -24,7 +24,7 @@ See "Not done / unverified" before relying on any part of this.
 
 512 MiB shared writable virtio-pmem at GPA `0x1_2000_0000`, adjacent to (and
 disjoint from) the read-only atlas pixel pool. `verify_aperture()`
-(`kernel/io-manager/.../dvm_display/app_buffer.rs`) requires the physical
+(`kernel/io-manager/src/io/dvm_display/app_buffer.rs`) requires the physical
 allocator to own no frame of the range (`phys::range_overlaps_boot_usable`) and
 a virtio-pmem PCI function (1af4:105b) to be present. It does not read the
 pmem function's start/size registers. No user PTE can be built before it

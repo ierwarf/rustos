@@ -407,6 +407,7 @@ mod warm_worker {
     const RECLAIM_POLL_MS: u64 = 100;
 
     #[repr(align(16))]
+    // LAYOUT: the field is only addressed, never read, as the worker's stack.
     struct Stack(#[allow(dead_code)] [u8; STACK_BYTES]);
     struct Buffers {
         request: VfsIpcRequest,
@@ -417,6 +418,8 @@ mod warm_worker {
     // Owned exclusively by the single warm thread once it is started.
     static mut STACK: Stack = Stack([0; STACK_BYTES]);
     static mut BUFFERS: Buffers = Buffers {
+        // SAFETY: the request and response wire structs are plain-old-data for
+        // which the all-zero bit pattern is a valid value.
         request: unsafe { core::mem::zeroed() },
         response: unsafe { core::mem::zeroed() },
         manifest: [0; rustos_library_cache_policy::MAX_MANIFEST_BYTES],
@@ -433,17 +436,24 @@ mod warm_worker {
         }
         #[cfg(all(target_arch = "x86_64", not(test)))]
         {
+            // ORDERING: AcqRel claims the single spawn; the failure Release below
+            // republishes "not started" only after the spawn attempt returned.
             // SAFETY: the stack is a private static handed to exactly one thread
             // (guarded by the compare_exchange below) and never reused.
             if STARTED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
                 return;
             }
+            // SAFETY: only the compare_exchange winner reaches this point, so the
+            // static stack is not aliased; the address stays in bounds.
             let top = unsafe { (core::ptr::addr_of_mut!(STACK) as *mut u8).add(STACK_BYTES) } as u64;
+            // SAFETY: `top` is the end of a private stack that lives for the
+            // program and `entry` never returns into this frame.
             let spawned = unsafe { rustos_svc_runtime::worker::spawn(top, entry) };
             if spawned.is_ok() {
                 ipc::debug_line("pagerd: library warm thread spawned");
             }
             if let Err(errno) = spawned {
+                // ORDERING: Release publishes the stack as unclaimed again.
                 STARTED.store(false, Ordering::Release);
                 // Name the first refusal; retries stay one per 32 receive-loop turns.
                 static REPORTED: AtomicBool = AtomicBool::new(false);
@@ -687,7 +697,9 @@ mod warm_worker {
             if path.len() > self.request.path.len() || out.len() > VFS_LIBRARY_READ_MAX_BYTES {
                 return Err(22);
             }
+            // SAFETY: getpid/gettid take no arguments and touch no memory.
             let pid = unsafe { rustos_svc_runtime::syscall::syscall0(SYS_GETPID) };
+            // SAFETY: as above.
             let tid = unsafe { rustos_svc_runtime::syscall::syscall0(SYS_GETTID) };
             if pid <= 0 || tid <= 0 {
                 return Err(22);

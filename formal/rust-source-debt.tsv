@@ -251,3 +251,10 @@ services/netd/src/dispatch.rs	0	0
 services/netd/src/inet_stack.rs	0	0
 services/netd/src/local_poll.rs	0	0
 services/netd/src/receive_turn.rs	0	0
+kernel/compat/src/pager/file_source.rs	0	0
+kernel/compat/src/user/syscall/linux/app_buffer_broker_ops.rs	0	0
+kernel/compat/src/user/syscall/linux/frame_source_ops.rs	0	0
+kernel/compat/src/user/syscall/linux/library_object_ops.rs	0	0
+kernel/compat/src/user/syscall/linux/mm_request_lease.rs	0	16
+kernel/io-manager/src/io/dvm_display/app_buffer.rs	0	10
+kernel/mm/src/memory/frame_source.rs	0	7

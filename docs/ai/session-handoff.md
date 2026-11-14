@@ -36,6 +36,19 @@ thread limit, `pipe`/`pipe2`.
   (builds, not wired); memfd frame charge has two known gaps (Job-group index not
   pinned across Job exit before first grow; possible double bill with an immutable
   backing lease); `formal/verify-all.sh` PR/nightly profiles not run.
+- **Formal PR gate repaired (2026-11-14):** the gate had been failing before this
+  batch (stale text anchors, unsorted/stale mutation rows, test-only listeners
+  counted as ingress, undocumented source contracts). Fixes are in
+  `formal/` (mutation rows, `check-zero-trust-subsystems.sh`,
+  `run-source-conformance.sh`, `smp-source-contracts.toml`, ledgers, model docs).
+  `scheduler-wait-arm-retired-clear` was an equivalent mutant (arm writes refuse
+  retired words) and became `scheduler-wait-payload-retired-clear`.
+  Hardening: static source-conformance checks now report every violation in one
+  run; `verify-all.sh` names the failing stage/lane and ends with a verdict;
+  `tools/agent/formal-preflight.sh` now also runs `source-conformance-static`
+  and `selftest`. Run the preflight (about 40 s) before `verify-all.sh`.
+  `formal/binding-exempt-paths.txt` no longer exempts `docs/architecture/job-model.md`
+  (xtask `abi_drift` reads it). PR gate sealed in 136 s with warm caches.
 - Validation this batch: `cargo xtask check`, 2533 tests (13 crates), rootd 156
   (`host-test`), `formal-contracts check`, 1-vCPU and 4-vCPU `--local-fd-probe`,
   1- and 4-vCPU `--exercise-input`, `--app-dmabuf-probe`, `--library-map-probe`.
@@ -85,7 +98,7 @@ warm log:**
 
 **Item 5 (app DMA-BUF) — server side merged, not exercised:** allocation
 handshake via devmgrd (`services/devmgrd/src/app_buffer.rs`), kernel aperture
-registry `kernel/ps/.../handles/device_buffer.rs` (DeviceBuffer handle kind is
+registry `kernel/ps/src/user/handles/device_buffer.rs` (DeviceBuffer handle kind is
 now 11; it collided with Job=10), `SYS_RUSTOS_APP_BUFFER_ALLOC`, syscalld device
 mmap, uiserver `wayland/dmabuf.rs` (linear ARGB/XRGB8888 only, forged/stale fd
 refused), owner contract `abi/app-dmabuf.md`, model `formal/app-buffer-custody`.

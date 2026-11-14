@@ -377,7 +377,7 @@ not extension points and must continue to return `ENOSYS`.
 
 ### Linux `prctl` (syscall 157)
 
-Implemented in `kernel/compat/.../linux/prctl_ops.rs` (option table is pure and
+Implemented in `kernel/compat/src/user/syscall/linux/prctl_ops.rs` (option table is pure and
 unit-tested). Supported: `PR_SET_NAME`/`PR_GET_NAME` (per-thread 15+NUL bytes in
 `LinuxThreadState::comm`; copied to clone/fork children, reset by exec; unset
 reads as the exec-path basename), `PR_SET_NO_NEW_PRIVS`/`PR_GET_NO_NEW_PRIVS`

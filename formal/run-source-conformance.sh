@@ -10,6 +10,10 @@ records="$(mktemp)"
 seen="$(mktemp)"
 trap 'rm -f "$records" "$seen"' EXIT
 
+# The static checks below report every violation in one run instead of stopping
+# at the first, so a registration mistake costs one pass, not one gate run each.
+static_failures=0
+
 # These native C witnesses exercise the actual relay bodies, not duplicated
 # models or source substrings. Keep them fail-closed in the PR witness lane.
 bash formal/run-dvm-timeout-tests.sh
@@ -22,7 +26,7 @@ if boot_cfg_misuse="$(rg -n 'target_os[[:space:]]*=[[:space:]]*"none"' kernel --
     && [[ -n "$boot_cfg_misuse" ]]; then
     printf '%s\n' "$boot_cfg_misuse" >&2
     echo 'kernel boot behavior must use cfg(rustos_boot_image), not target_os = "none"' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # `println_emergency` deliberately bypasses the shared debug-output lock so a
@@ -40,7 +44,7 @@ while IFS= read -r emergency_source; do
         *)
             printf '%s\n' "$emergency_source" >&2
             echo 'non-panic debug output must not bypass milestone serialization' >&2
-            exit 1
+            static_failures=$((static_failures + 1))
             ;;
     esac
 done < <(rg -l 'println_emergency' kernel --glob '*.rs' | sort)
@@ -52,7 +56,7 @@ if split_block_api="$(rg -n 'pub fn commit_block_current_task\(' kernel/ps/src -
     && [[ -n "$split_block_api" ]]; then
     printf '%s\n' "$split_block_api" >&2
     echo 'scheduler block commit must not be exported without its atomic reschedule' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # The syscall entry frame remains live across interruptible kernel work and can
@@ -80,7 +84,7 @@ if [[ -z "$tail_reschedule_line" || -z "$return_validation_line" \
     || "$return_validation_line" -le "$tail_reschedule_line" \
     || "$context_publication_line" -le "$return_validation_line" ]]; then
     echo 'scheduled syscall return must be validated after claim and before context publication' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # A deadline notification is recovery authority, not proof that the resumed
@@ -97,7 +101,7 @@ timer_ack_line="$(
 )"
 if [[ -z "$cleanup_line" || -z "$timer_ack_line" || "$cleanup_line" -ge "$timer_ack_line" ]]; then
     echo 'futex resume cleanup must precede deadline timer acknowledgement' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # Futex wait/wake is scheduler substrate. Supported opcode/flag admission must
@@ -110,11 +114,11 @@ futex_impl_body="$(
 )"
 if ! grep -Fq 'validate_futex_policy_locally(op, val3)' <<<"$futex_impl_body"; then
     echo 'futex entry must validate its supported ABI envelope locally' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if grep -Eq 'call_syscalld|SYSCALL_OFFLOAD_OP_LINUX_FUTEX_POLICY' <<<"$futex_impl_body"; then
     echo 'futex scheduler substrate must not synchronously depend on syscalld' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 futex_context_body="$(
     sed -n '/^fn current_futex_binding(/,/^fn register_futex_waiter_in(/p' \
@@ -122,21 +126,21 @@ futex_context_body="$(
 )"
 if ! grep -Fq 'multitask::current_user_wait_binding()' <<<"$futex_context_body"; then
     echo 'futex key admission must use the scheduler-local current task/MM binding' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if ! grep -Fq 'usermem::current_user_address_space()' <<<"$futex_context_body" \
     || ! grep -Fq 'shared_futex_backing_key(uaddr)' <<<"$futex_context_body"; then
     echo 'shared futex key admission must pin the exact process/VMA backing generation' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if grep -Eq 'with_current_user_process_state(_mut)?' <<<"$futex_context_body"; then
     echo 'futex admission must use its retained generation, not resnapshot current process state' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if ! grep -Fq 'Err(paging::AddressSpaceError::NotMapped) => Ok(private)' <<<"$futex_context_body" \
     || ! grep -Fq 'Some(shared) => [Some(shared), Some(private)]' <<<"$futex_context_body"; then
     echo 'futex keys must fall back for anonymous words and preserve shared cleanup candidates' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 stack_layout_body="$(
@@ -153,7 +157,7 @@ if ! grep -Fq 'USER_STACK_INITIAL_COMMIT_PAGES: usize = USER_STACK_RESERVE_PAGES
     || ! grep -Fq 'release_user_stack_state(reserve_start)' <<<"$stack_setup_body" \
     || ! grep -Fq 'USER_STACK_INITIAL_COMMIT_PAGES,' <<<"$stack_setup_body"; then
     echo 'release user stacks must eagerly map every usable page above one permanent guard' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 exec_scheduler_body="$(
@@ -168,11 +172,11 @@ if [[ -z "$exec_retire_line" || -z "$exec_root_line" || "$exec_retire_line" -ge 
     || ! grep -Fq 'retirement_cleanup::kernel_pending(slot)' <<<"$exec_scheduler_body" \
     || ! grep -Fq 'retirement_cleanup::reason(slot).is_some()' <<<"$exec_scheduler_body"; then
     echo 'exec must reject retirement before installing a new address-space root' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if grep -Eq 'retired\[[^]]+\][[:space:]]*=[[:space:]]*false|retirement_cleanup\[[^]]+\][[:space:]]*=[[:space:]]*None|deferred_retire_reasons\[[^]]+\][[:space:]]*=[[:space:]]*None' <<<"$exec_scheduler_body"; then
     echo 'exec must never erase a previously published retirement marker' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 exec_stage_body="$(
     sed -n '/^pub fn stage_exec_state(/,/^pub(super) fn finalize_exec_state(/p' \
@@ -181,7 +185,7 @@ exec_stage_body="$(
 if ! grep -Fq 'exec_commit_may_transfer(object, reservation)' <<<"$exec_stage_body" \
     || ! grep -Fq 'object.exec_state_staged = true;' <<<"$exec_stage_body"; then
     echo 'exec staging must retain exact reservation and hide the new process state' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 exec_transfer_body="$(
     sed -n '/^pub fn exec_current_user_process(/,/^pub fn exec_user_process_by_pid(/p' \
@@ -196,7 +200,7 @@ if [[ -z "$exec_image_line" || -z "$exec_state_line" || -z "$exec_publish_line" 
     || "$exec_image_line" -ge "$exec_state_line" || "$exec_state_line" -ge "$exec_publish_line" || "$exec_publish_line" -ge "$exec_retain_line" \
     || "$exec_retain_line" -ge "$exec_drop_line" ]]; then
     echo 'exec must acquire image custody before staging, publish root with receipt, finalize generation, then retire the old bundle' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # Exception-side table installation has no allocator lock or heap admission.
@@ -221,20 +225,20 @@ if [[ -z "$fault_claim_line" || -z "$fault_entry_line" || -z "$fault_publish_lin
     || -z "$retire_barrier_line" || -z "$retire_drain_line" || -z "$retire_free_line" \
     || "$retire_barrier_line" -ge "$retire_drain_line" || "$retire_drain_line" -ge "$retire_free_line" ]]; then
     echo 'lazy-table ledger must claim before CAS, resolve each loser, and drain after retirement' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 # Retirement runs when memory is scarce, so it must not allocate: no collection
 # that grows with the address space may appear in the finalizer.
 if grep -Eq 'Vec|try_reserve|to_vec|collect|Box|String' <<<"$retirement_body"; then
     echo 'address-space retirement must stream frames through the stack batch and not allocate' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if ! grep -Fq 'cancel_lazy_table_record' <<<"$fault_loser_body" \
     || ! grep -Fq 'release(frame);' <<<"$fault_loser_body" \
     || ! grep -Fq 'cancel_lazy_table_record' <<<"$fault_error_body" \
     || ! grep -Fq 'release(frame);' <<<"$fault_error_body"; then
     echo 'lazy-table ledger must claim before CAS, resolve each loser, and drain after retirement' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # Normal-time mapping must not retain intermediate table frames in the data
@@ -252,17 +256,18 @@ if [[ -z "$normal_claim_line" || -z "$normal_entry_line" || -z "$normal_publish_
     || ! "$normal_table_body" == *'cancel_lazy_table_record'* \
     || "$normal_table_body" == *'track_owned_frame'* ]]; then
     echo 'normal table installation must use the unified frame-descriptor claim/CAS protocol' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 reschedule_publish_body="$(
-    sed -n '/^fn set_local_deferred_reschedule(/,/^}/p' kernel/ps/src/multitask/irq.rs
+    sed -n '/^fn set_local_deferred_reschedule(/,/^}/p; /^pub(super) fn request_local_reschedule_on(/,/^}/p' \
+        kernel/ps/src/multitask/irq.rs
 )"
 if ! grep -Fq 'super::reschedule_observation::publish_request(' <<<"$reschedule_publish_body" \
     || grep -Eq 'send_reschedule_ipi|send_target_reschedule_ipi|fanout' <<<"$reschedule_publish_body" \
     || ! grep -Fq 'super::irq::flush_deferred_target_reschedules();' kernel/ps/src/multitask/cpu_local.rs; then
     echo 'local reschedule publication must stay local and exact target custody must flush after raw unlock' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # Busy/idle migration now retains an ORIGINAL physical reader through exact
@@ -278,7 +283,7 @@ input_drain_body="$(
 if ! grep -Fq 'if !try_claim_drain(&DRAIN_IN_PROGRESS)' <<<"$input_drain_body" \
     || ! grep -Fq 'let _drain_guard = DrainGuard;' <<<"$input_drain_body"; then
     echo 'DVM input cursor and reset authority require one exact drain owner' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 nmi_body="$(
@@ -288,12 +293,12 @@ nmi_body="$(
 if ! grep -Fq 'emergency_exception_marker(2);' <<<"$nmi_body" \
     || grep -Eq 'crate::debug::|hooks::|process_table::|\.lock\(|panic!|println!' <<<"$nmi_body"; then
     echo 'NMI must remain a dedicated-IST lock-free emergency leaf' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if grep -Eq 'stack_frame\.stack_pointer\.as_u64\(\)[[:space:]]+as[[:space:]]+\*const|slice::from_raw_parts' \
         kernel/hal/src/arch/idt/handlers.rs; then
     echo 'user exception diagnostics must never dereference the untrusted saved RSP' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 if ! grep -Fq 'IpcTransferTicketWire::decode(bytes)' \
@@ -301,13 +306,13 @@ if ! grep -Fq 'IpcTransferTicketWire::decode(bytes)' \
     || grep -Eq 'MaybeUninit|assume_init' \
         kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs; then
     echo 'SCM_RIGHTS service bytes must use the canonical integer-only ticket parser' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 if ! grep -Fq 'cpu_count == 1' kernel/hal/src/arch/clock.rs \
     || ! grep -Fq 'if let Some((base, period_fs, counter)) = hpet' kernel/hal/src/arch/clock.rs; then
     echo 'raw TSC must remain uniprocessor-only and SMP must fail over to validated HPET' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 gpu_present_body="$(
@@ -318,7 +323,7 @@ if ! grep -Fq 'let compiler_checkpoint = self.compiler.checkpoint();' <<<"$gpu_p
     || ! grep -Fq 'self.compiler.restore_rejected_submit(compiler_checkpoint);' <<<"$gpu_present_body" \
     || ! grep -Fq 'self.force_full_snapshot = true;' <<<"$gpu_present_body"; then
     echo 'GPU submit preparation must retain exact rollback and full-replay state' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # Wayland listener and client dispatch are readiness-driven. A nonblocking
@@ -334,25 +339,30 @@ if ! grep -Fq 'libc::epoll_wait(' <<<"$wayland_accept_body" \
     || ! grep -Fq 'ui_wake_sender.signal()' <<<"$wayland_accept_body" \
     || grep -Fq 'thread::sleep' <<<"$wayland_accept_body"; then
     echo 'Wayland accept must block on listener readiness and publish queue ownership before waking UI' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if ! grep -Fq 'wayland_service_required(protocol_input, input.input_events, callback_due)' \
         services/uiserver/src/main.rs; then
     echo 'Wayland client dispatch must require protocol input, server events, or a due callback' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # Every production uiserver thread must cross the role-typed spawn boundary.
 # The sole direct Builder call is the wrapper implementation itself; allowing
 # a second call would restore inherited scheduling authority implicitly.
+# Test modules (everything from the first `#[cfg(test)]`) may spawn plain
+# threads to drive a client; only production code is bound by the boundary.
 ui_direct_spawns="$(
-    rg -n 'thread::spawn|thread::Builder::new' services/uiserver/src --glob '*.rs' || true
+    for ui_source in $(rg -l 'thread::spawn|thread::Builder::new' services/uiserver/src --glob '*.rs' || true); do
+        awk '/^[[:space:]]*#\[cfg\(test\)\]/ {exit}
+             /thread::spawn|thread::Builder::new/ {print FILENAME ":" FNR ":" $0}' "$ui_source"
+    done
 )"
 if [[ "$(wc -l <<<"$ui_direct_spawns")" -ne 1 ]] \
     || ! grep -Fq 'services/uiserver/src/sys.rs:' <<<"$ui_direct_spawns" \
     || ! grep -Fq 'thread::Builder::new().name(name.into()).spawn' <<<"$ui_direct_spawns"; then
     echo 'uiserver production threads must use the single role-typed spawn boundary' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 acceptance_body="$(
@@ -365,7 +375,7 @@ if ! grep -Fq 'contract && ui_profile == Some(true) && network_exercise.is_some(
     || ! grep -Fq 'read_bounded_config_snapshot(CONTRACT_PATH, CONTRACT_MAX_BYTES)' <<<"$acceptance_body" \
     || grep -Fq 'read_to_string' <<<"$acceptance_body"; then
     echo 'late acceptance profiling must use an exact bounded positioned-read demoted watcher' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 runtimed_acceptance_body="$(
@@ -376,7 +386,7 @@ if ! grep -Fq 'read_bounded_config_snapshot(' <<<"$runtimed_acceptance_body" \
     || ! grep -Fq 'KVM_ACCEPTANCE_CONTRACT_MAX_BYTES' <<<"$runtimed_acceptance_body" \
     || grep -Fq 'read_to_string' <<<"$runtimed_acceptance_body"; then
     echo 'runtimed acceptance injection must use the bounded positioned-read snapshot path' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 vfs_receive_body="$(
@@ -397,7 +407,7 @@ if ! grep -Fq 'state.resolve_executable_snapshot_request(*request)' <<<"$vfs_rec
     || ! grep -Fq 'SnapshotWorkerAdmission' services/vfsd/src/snapshot_worker.rs \
     || grep -Eq 'sched_yield|SYS_SCHED_YIELD' services/vfsd/src/main.rs services/vfsd/src/snapshot_worker.rs; then
     echo 'vfsd must resolve namespace once and run bounded leased bulk work without retaining reply authority' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 loader_placed_body="$(sed -n '/^fn handle_placed_request(/,/^fn authorize_loader_operation(/p' services/loaderd/src/main.rs | sed '$d')"
@@ -408,7 +418,7 @@ if grep -Fq 'open_immutable_file_snapshot(' <<<"$loader_placed_body" \
     || ! grep -Fq 'authorize_loader_operation(pending.request.op, owner.0)' services/loaderd/src/image_staging.rs \
     || ! grep -Fq 'application_launch::spawn(&pending.request' services/loaderd/src/image_staging.rs; then
     echo 'loaderd must stage with owner-bound work, move attenuated receive custody, and construct from the same owned snapshot' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 proc_prepare_authority="kernel/compat/src/user/syscall/linux/proc_broker_ops/authority.rs"
@@ -422,7 +432,7 @@ if grep -Eq 'call_service_endpoint|IPC_SERVICE_PROCD|procd_process_prepare_polic
         <<<"$proc_prepare_body" \
     || ! grep -Fq 'let owner_pid = loader_pid;' <<<"$proc_prepare_body"; then
     echo 'loader prepare must consume PROCESS_LOADER authority without a procd reverse IPC cycle' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # VFS geometry admission is an authority equality check.  Treating the signed
@@ -435,7 +445,7 @@ vfs_geometry_body="$(
 if ! grep -Fq '|| info.flags != expected_flags' <<<"$vfs_geometry_body" \
     || grep -Fq 'info.flags & !expected_flags' <<<"$vfs_geometry_body"; then
     echo 'vfsd DVM geometry must require the exact expected READ_ONLY flag authority' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 time_hot_path_body="$(
@@ -444,11 +454,11 @@ time_hot_path_body="$(
 )"
 if ! grep -Fq 'validate_time_hot_path_locally' <<<"$time_hot_path_body"; then
     echo 'clock and sleep hot paths must validate their fixed ABI envelope locally' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if grep -Eq 'request_syscalld|with_current_user_process_state(_mut)?' <<<"$time_hot_path_body"; then
     echo 'clock and sleep hot paths must not depend on process-state or policy-service latency' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 # REQ-CLK-013. The tick domain numbers the deadline wheel; it is not the
 # resolution an instant is reported at. Deriving the reported timespec from
@@ -461,7 +471,7 @@ monotonic_report_body="$(
 if ! grep -Fq 'crate::arch::rtc::monotonic_nanos()' <<<"$monotonic_report_body" \
     || grep -Eq 'ticks\(\)|ticks_per_second' <<<"$monotonic_report_body"; then
     echo 'the reported monotonic instant must come from the clocksource, not the tick domain' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 # The calendar chip is read under `without_interrupts` and answers with
 # one-second resolution; under virtualization each of its port accesses is an
@@ -473,7 +483,7 @@ realtime_report_body="$(
 )"
 if grep -Fq 'crate::arch::rtc::now()' <<<"$realtime_report_body"; then
     echo 'CLOCK_REALTIME must not read the calendar chip on the query path' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 # Asking for the identity of the task already running on the asking CPU is a
 # per-CPU question. Answering it through the exclusive global scheduler lock
@@ -487,7 +497,7 @@ current_snapshot_body="$(
 if ! grep -Fq 'published_current_identity()' <<<"$current_snapshot_body" \
     || ! grep -Fq 'owned_current_user_binding()' <<<"$current_snapshot_body"; then
     echo 'current-task snapshot must retain published identity and exact owned Current fallback' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 python3 - <<'PY'
 from pathlib import Path
@@ -525,7 +535,7 @@ if ! grep -Fq 'Ok(Some(index as u64))' <<<"$ipc_authorize_body" \
     || rg -Fq 'service_reply_deadline_tick_for_endpoint' \
         kernel/compat/src/user/syscall/linux/ipc_ops.rs; then
     echo 'synchronous IPC must derive its reply deadline from the exact service identity captured by authorization without a second publication lookup' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 # A synchronous receiver is already blocked and the caller will block in the
 # same transaction. If all dispatch constraints admit the caller's CPU, moving
@@ -541,7 +551,7 @@ if ! grep -Fq 'let previous = receiver_owner.cpu.unwrap_or_else' <<<"$ipc_fast_h
     || ! grep -Fq 'duty.publish_mailbox(runqueue::weight::value(slot))' <<<"$ipc_fast_handoff_body" \
     || ! grep -Fq 'request_target_reschedule(target)' <<<"$ipc_fast_handoff_body"; then
     echo 'synchronous IPC must prefer an eligible caller CPU while retaining the admitted previous-CPU remote wake fallback' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 # A bounded receive can leave the block by timer instead of by sender. A sender
 # pops the receiver it wakes; a timer does not, so a task that resumes on its
@@ -558,7 +568,7 @@ bounded_recv_body="$(
 if ! grep -Fq 'arm_sleep_waiter_until_tick' <<<"$bounded_recv_body" \
     || ! grep -Fq 'remove_endpoint_waiter_for_task(endpoint, task_id)' <<<"$bounded_recv_body"; then
     echo 'the bounded endpoint receive must arm a deadline waiter and must withdraw its endpoint receiver waiter when it resumes' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 # The supervisor idle wait is the whole point of the bounded receive: a flat
 # sleep here puts the entire idle interval in front of every synchronous caller,
@@ -570,7 +580,7 @@ runtimed_idle_body="$(
 if ! grep -Fq 'service_session_endpoint(session_endpoint, &mut state, Some(idle_delay))' \
     <<<"$runtimed_idle_body"; then
     echo 'the runtimed idle wait must block on the session endpoint with a bounded deadline, not on a timer' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 # A parked console read is answered by the same loop that idles. If its deadline
 # is not folded into the idle budget, the broker can sleep straight through it
@@ -584,7 +594,7 @@ if ! grep -Fq 'earliest_console_read_deadline()' <<<"$runtimed_delay_body" \
     || ! grep -Fq 'earliest_watch_deadline' <<<"$runtimed_delay_body" \
     || ! grep -Fq '.min(parked_watch_delay)' <<<"$runtimed_delay_body"; then
     echo 'the runtimed idle budget must include every reply deadline it is holding' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 # devmgrd answers the ioctl routing question with a pure function of the request
 # number - no fd, pid, credentials, or session reach it - so re-asking per call
@@ -600,13 +610,13 @@ if ! grep -Fq 'memoized_ioctl_route(request_number, epoch)' <<<"$route_memo_body
     || ! grep -Fq 'ipc_ops::service_endpoint_epoch(linux_abi::IPC_SERVICE_DEVMGRD)' \
         <<<"$route_memo_body"; then
     echo 'the devmgrd ioctl route must be memoized against its registration epoch, not re-asked per call' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if rg -Fq 'memoized_ioctl_route' \
     <<<"$(sed -n '/^pub fn ioctl_device_via_devmgrd(/,/^}/p' \
         kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs)"; then
     echo 'ioctl authorization reads the caller and must never be served from the routing memo' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # The console has two observers with opposite interests: a shell waiting to read
@@ -620,13 +630,13 @@ graph_advance_body="$(
 )"
 if ! grep -Fq 'publish_console_graph_readiness(self.output_generation)' <<<"$graph_advance_body"; then
     echo 'the console graph token must publish its wait-set edge where the token moves' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 for mutation in create_session remove_session write_to_session handle_input_event; do
     body="$(sed -n "/^    \(pub(crate) \)\?fn ${mutation}(/,/^    }/p" services/runtimed/src/session.rs)"
     if ! grep -Fq 'advance_graph_generation()' <<<"$body"; then
         echo "console mutation ${mutation} must advance the graph token the compositor waits on" >&2
-        exit 1
+        static_failures=$((static_failures + 1))
     fi
 done
 # A parked graph wait is answered by the broker pass, so the pass has to visit
@@ -634,11 +644,11 @@ done
 # through a promise it made.
 if ! rg -Fq 'session::service_console_graph_waiters(&mut state)' services/runtimed/src/main.rs; then
     echo 'the runtimed loop must answer parked console-graph waits every pass' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if ! grep -Fq '.min(parked_graph_delay)' <<<"$runtimed_delay_body"; then
     echo 'the runtimed idle budget must include the soonest parked console-graph deadline' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 # The compositor must wait on that edge instead of a timer, and the wait must
 # not be routed through devmgrd: devmgrd serves from a single loop, so a held
@@ -649,12 +659,12 @@ console_refresh_body="$(
 if ! grep -Fq 'console_wait_graph(' <<<"$console_refresh_body" \
     || grep -Fq 'wait_for_edge' <<<"$console_refresh_body"; then
     echo 'the uiserver console refresh must block on the console graph edge, not on an interval' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if ! rg -Fq 'if request_number == rustos_user_abi::console::CONSOLE_IOCTL_WAIT_GRAPH {' \
     kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs; then
     echo 'the console graph wait must take the direct broker rail, never the devmgrd forward' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # A change token that changes when it is read tells every caller that everything
@@ -670,7 +680,7 @@ if ! grep -Fq 'let generation = state.session_runtime.output_generation();' \
     <<<"$session_graph_body" \
     || grep -Eq 'fetch_add|SESSION_GRAPH_GENERATION' <<<"$session_graph_body"; then
     echo 'reporting the console generation must not advance it; observing a change token may not be a change' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 # The runtimed control socket is deliberately non-blocking so a dead peer cannot
 # hang connect. That makes a short read/write spin unless it waits on the
@@ -681,10 +691,10 @@ runtime_rpc_body="$(
         libs/runtime-control/src/lib.rs
 )"
 if grep -Fq 'thread::yield_now()' <<<"$runtime_rpc_body" \
-    || ! grep -Fq 'wait_for_socket_ready(stream, deadline, libc::POLLOUT)' <<<"$runtime_rpc_body" \
-    || ! grep -Fq 'wait_for_socket_ready(stream, deadline, libc::POLLIN)' <<<"$runtime_rpc_body"; then
+    || ! grep -Fq 'wait_for_socket_ready(fd, deadline, libc::POLLOUT)' <<<"$runtime_rpc_body" \
+    || ! grep -Fq 'wait_for_socket_ready(fd, deadline, libc::POLLIN)' <<<"$runtime_rpc_body"; then
     echo 'the runtimed control RPC must wait on the socket for readiness, never spin yielding' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 # The control wire had two definitions - one per crate - and nothing checked
 # them against each other. A silent divergence in an opcode or a frame field is
@@ -694,11 +704,11 @@ if runtimed_protocol_copy="$(rg -n '^pub\(crate\) const (PROTOCOL_VERSION|OP_[A-
     && [[ -n "$runtimed_protocol_copy" ]]; then
     printf '%s\n' "$runtimed_protocol_copy" >&2
     echo 'the runtimed control protocol must have one definition, not a private server copy' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if ! rg -Fq 'pub(crate) use runtime_control::protocol::{' services/runtimed/src/main.rs; then
     echo 'runtimed must consume the shared runtime-control protocol module' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 # The change edge is defined by the bytes a reply would carry, not by a counter
 # the server bumps at each mutation site. A counter that misses one site parks a
@@ -712,7 +722,7 @@ if ! grep -Fq 'let programs = running_program_snapshot(state);' <<<"$watch_servi
     || ! grep -Fq 'let digest = running_programs_digest(&programs);' <<<"$watch_service_body" \
     || ! grep -Fq 'now < watcher.deadline' <<<"$watch_service_body"; then
     echo 'a parked watch must be judged by the digest of the reply itself and re-armed at its deadline' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 # Watchers are answered from the broker pass, so the pass has to visit them.
 # Without this call a held reply is owed forever and the callers that stopped
@@ -720,7 +730,7 @@ fi
 if ! rg -Fq 'socket::service_running_program_watchers(&mut runtime_connections, &state)' \
     services/runtimed/src/main.rs; then
     echo 'the runtimed loop must publish the running-set edge to parked watchers every pass' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 # uiserver and sessiond were the two permanent pollers of that set. Each paid a
 # full snapshot round trip per interval, forever, to be told nothing changed.
@@ -731,7 +741,7 @@ if ! grep -Fq 'runtime.watch_running_programs(observed_digest, RUNTIME_WATCH_WAI
     <<<"$uiserver_sync_body" \
     || grep -Fq 'snapshot_running_programs()' <<<"$uiserver_sync_body"; then
     echo 'the uiserver runtime sync must park on the running-set change edge, not poll a snapshot' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 sessiond_observe_body="$(
     sed -n '/^fn observe_running_programs(/,/^}/p' services/sessiond/src/main.rs
@@ -740,7 +750,7 @@ if ! grep -Fq 'runtime.watch_running_programs(*observed_digest, idle_watch_wait(
     <<<"$sessiond_observe_body" \
     || ! grep -Fq 'if launch_pending {' <<<"$sessiond_observe_body"; then
     echo 'an idle sessiond must park on the running-set change edge and keep the tight cadence only while a launch is pending' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 # Rootd has the same lifecycle/control split as runtimed: its bounded drain may
 # not block, but the post-init idle turn must wake on a control message or the
@@ -751,7 +761,7 @@ if ! grep -Fq 'SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED' <<<"$rootd_source" \
     || ! grep -Fq 'ROOTD_SUPERVISOR_IDLE_POLL_MS' <<<"$rootd_source" \
     || grep -Eq '^fn supervisor_idle\(\)' <<<"$rootd_source"; then
     echo 'rootd post-init supervision must use bounded message-or-timeout receive, not timer-only supervisor idle' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 join_line="$(rg -n 'pthread_join\(threads\[index\]' apps/smpqual/smpqual.c | head -n 1 | cut -d: -f1)"
@@ -880,7 +890,7 @@ if ! grep -Fq '!is_io && prefetchable && size == DVM_BLOCK_APERTURE_BYTES' <<<"$
     || ! grep -Fq 'libc::MAP_SHARED' libs/driver-domain-host/src/lib.rs \
     || rg -q -e 'fn[[:space:]]+map[[:space:]]*\(' kernel/io-manager/src/driver/mmio.rs; then
     echo 'DVM block/input/network shared RAM must be exact prefetchable WB, Linux BAR2 must clear PAT cache flags, raw network resource2 access must remain absent, host input must MAP_SHARED, and ambiguous mmio::map must remain absent' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if ! grep -Fq 'use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};' <<<"$network_ring_atomic_production" \
     || ! grep -Fq ').load(Ordering::Acquire)' <<<"$network_ring_atomic_production" \
@@ -893,7 +903,7 @@ if ! grep -Fq 'use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};
     || ! grep -Fq '__ATOMIC_RELEASE' driver-domains/linux/package/rustos-dvm-net/src/rustos-dvm-net.c \
     || ! grep -Fq '__ATOMIC_ACQ_REL' driver-domains/linux/package/rustos-dvm-net/src/rustos-dvm-net.c; then
     echo 'DVM network control words must use aligned Acquire/Release atomics and immutable-only byte snapshots on both sides' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if ! grep -Fq 'const fn shared_control_load_order() -> Ordering {' <<<"$input_ring_atomic_production" \
     || ! grep -Fq 'const fn shared_control_publish_order() -> Ordering {' <<<"$input_ring_atomic_production" \
@@ -922,7 +932,7 @@ if ! grep -Fq 'const fn shared_control_load_order() -> Ordering {' <<<"$input_ri
     || ! grep -Fq 'DVM_INPUT_RING_FLAGS_OFFSET + size_of::<u32>()..DVM_INPUT_RING_PRODUCER_OFFSET' <<<"$host_input_ring_snapshot_body" \
     || ! grep -Fq 'DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET + size_of::<u64>()..bytes.len()' <<<"$host_input_ring_snapshot_body"; then
     echo 'DVM input control words must use aligned acquire/release atomics, AcqRel flag updates, and immutable-only volatile header snapshots on both RustOS and L0' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if [[ -z "$mmio_straddle_guard_line" || -z "$mmio_conflict_line" || -z "$mmio_registry_reserve_line" || -z "$mmio_direct_map_line" || -z "$mmio_window_map_line" ]] \
     || (( mmio_straddle_guard_line >= mmio_conflict_line || mmio_conflict_line >= mmio_registry_reserve_line || mmio_registry_reserve_line >= mmio_direct_map_line || mmio_registry_reserve_line >= mmio_window_map_line )) \
@@ -933,7 +943,7 @@ if [[ -z "$mmio_straddle_guard_line" || -z "$mmio_conflict_line" || -z "$mmio_re
     || [[ -z "$mmio_override_reserve_line" || -z "$mmio_direct_map_update_line" || "$mmio_override_reserve_line" -ge "$mmio_direct_map_update_line" ]] \
     || ! grep -Fq 'new_pages.try_reserve(page_count).is_err()' <<<"$mmio_direct_override_body"; then
     echo 'global physical overlap, direct-map-boundary, and reserve-before-PTE-mutation guards must fail before an alias or partial mapping can publish' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if [[ "$raw_high_window_callers" != "kernel/mm/src/memory/kernel_vm.rs" ]] \
     || [[ "$raw_direct_map_update_callers" != $'kernel/io-manager/src/driver/mmio.rs\nkernel/mm/src/memory/kernel_vm.rs\nkernel/mm/src/memory/paging.rs' ]] \
@@ -952,7 +962,7 @@ if [[ "$raw_high_window_callers" != "kernel/mm/src/memory/kernel_vm.rs" ]] \
     || [[ -z "$apic_permanent_map_line" || -z "$apic_configure_line" || -z "$apic_pic_line" ]] \
     || (( apic_permanent_map_line >= apic_configure_line || apic_configure_line >= apic_pic_line )); then
     echo 'direct-map cache aliases must use only the whitelisted owners: permanent APIC UC retyping precedes APIC/PIC use, high-window maps reject direct-map physical addresses, and display WC routes through io-manager' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if ! grep -Fq 'compare_exchange(' <<<"$bsp_cache_capture_body" \
     || ! grep -Fq 'cpu_memory_type_features_are_admissible(features)' <<<"$bsp_cache_capture_body" \
@@ -982,7 +992,7 @@ if ! grep -Fq 'compare_exchange(' <<<"$bsp_cache_capture_body" \
     || [[ -z "$ap_no_fill_cr0_line" || -z "$ap_no_fill_wbinvd_line" ]] \
     || (( ap_no_fill_cr0_line >= ap_no_fill_wbinvd_line )); then
     echo 'the BSP must seal an exact MTRR/PAT baseline before SIPI; every AP must enter reset no-fill, restore and read back that baseline, then enable caches before OnlineParked or private readiness publication' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # DVM block revoke is a terminal evidence boundary.  Keep its closed production
@@ -1006,7 +1016,7 @@ if [[ "$dvm_revoke_reason_count" != 12 ]] \
     || ! grep -Fq 'DVM_BLOCK_DATA_SLOT_BYTES' <<<"$dvm_block_flush_read_body" \
     || ! grep -Fq 'assert!(!state.revoked);' <<<"$dvm_block_flush_read_body"; then
     echo 'DVM block revoke must retain 12 production reasons, one pre-clear snapshot, the reason/generation milestone ABI, and valid FLUSH-to-first-64KiB-READ liveness' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 if [[ -z "$dvm_revoke_guard_line" || -z "$dvm_revoke_observation_line" || -z "$dvm_revoke_terminal_line" \
     || -z "$dvm_revoke_observer_line" || -z "$dvm_revoke_pending_clear_line" || -z "$dvm_revoke_flags_clear_line" ]] \
@@ -1016,7 +1026,7 @@ if [[ -z "$dvm_revoke_guard_line" || -z "$dvm_revoke_observation_line" || -z "$d
         || dvm_revoke_observer_line >= dvm_revoke_pending_clear_line \
         || dvm_revoke_pending_clear_line >= dvm_revoke_flags_clear_line )); then
     echo 'DVM block revoke must reject a second report and snapshot before terminal clear' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # Only the six closed SMP/HECS names may use qualification-local loss
@@ -1040,7 +1050,7 @@ if [[ "$debug_qualification_class_failed" != 0 ]] \
     || ! rg -Fq 'event.milestones_dropped != 0' tools/xtask/src/kvm.rs \
     || ! rg -Fq '|| event.debug_bytes_discarded != 0' tools/xtask/src/kvm.rs; then
     echo 'qualification debug evidence must use its exact six SMP/HECS classes, local fail-closed loss counters, a one-attempt scheduler measurement, Required DVM revoke, and parser loss rejection' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 if [[ -z "$join_line" || -z "$complete_line" || "$complete_line" -le "$join_line" ]] \
@@ -1164,7 +1174,7 @@ if [[ -z "$join_line" || -z "$complete_line" || "$complete_line" -le "$join_line
     || ! rg -Fq 'let observed = capture_smpqual_early_system_executable(&runtime_disk)?;' tools/xtask/src/kvm/evidence/smp_qualification.rs \
     || ! rg -Fq 'fs::hard_link(&self.temporary_path, &self.final_path)' tools/xtask/src/kvm/evidence/smp_qualification.rs; then
     echo 'SMP Ring3 qualification source no longer preserves UI-independent private injection, the closed pre-UI exception, bind-before-activate cleanup, generation-bound kernel FSM admission, escaped user debug, join-before-complete, 3N+1 lifecycle plus 2N HECS records, v7 actual-execution and pre-spawn DVM/early-system executable attestations, durable snapshot-before-signing order, QEMU readonly ATAPI/header/Linux-relay agreement with built-in sr at exact 2048-byte FLUSH-only media geometry, exact media-barrier authority path, exact successor-generation recovery, publication-time drift rejection, or non-overwriting archive publication' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # The old catalog dispatch/fallback body is deleted. Qualify the ACTUAL
@@ -1188,7 +1198,7 @@ if ! grep -Fq 'let borrowed = token.map(|(owner_slot, _)| current_identity::read
     || ! grep -Fq 'policy.cpu_mask & cpu_bit != 0,' kernel/ps/src/multitask/scheduler/scheduling_runtime.rs \
     || ! grep -Fq '&& cpu_allowed' libs/rustos-scheduler-frame-gate/src/lib.rs; then
     echo 'borrowed local admission must validate donor charge and exact live reply token' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # Production per-CPU handoff and reservation queues must live outside the
@@ -1247,7 +1257,7 @@ if ! grep -Fq 'scheduler::wake_publication::reply(reply, task_id)' <<<"$reply_cu
     || grep -Eq 'release_ipc_priority|wake_task|set_next_synchronous_pick_hint' <<<"$handle_reply_body" \
     || grep -Eq 'release_ipc_priority|wake_task|set_next_synchronous_pick_hint' <<<"$reply_recv_body"; then
     echo 'Current terminal IPC replies must return exact scheduling-context custody and retain original binding through exact FIFO publication without legacy fallback' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # ReplyObject is the sole transport owner of caller scheduling-context custody.
@@ -1262,7 +1272,7 @@ if ! rg -Uq 'struct ReplyObject \{[^}]*scheduling_context: Option<ReplySchedulin
     || ! rg -Fq 'enqueue_endpoint_call_with_handles_priority_custody_in_group(' kernel/compat/src/user/syscall/linux/ipc_ops.rs \
     || ! rg -Fq 'settle_endpoint_scheduling_contexts(&wake_set);' kernel/ps/src/multitask/scheduler/reclaim.rs; then
     echo 'reply-owned scheduling-context custody no longer covers reply, cancel, owner failure, and retirement exactly once' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # Fork publishes a copied reservation over resident leaves, while ordinary
@@ -1287,7 +1297,7 @@ if ! grep -Fq '.user_range_is_unmapped(' <<<"$ordinary_vma_publish_body" \
     || ! rg -Uq '(?s)PagerVmaError::Malformed => 1,.*PagerVmaError::Overlap => 2,.*PagerVmaError::Pressure => 3,.*PagerVmaError::Stale => 4,.*PagerVmaError::Unstable => 5,.*PagerVmaError::Denied => 6,' "$pager_admission_source" \
     || ! grep -Fq 'count.saturating_mul(1 << 8) | pager_vma_error_class(error)' "$pager_admission_source"; then
     echo 'fork inheritance must preserve VMA authority, separate resident publication from ordinary mmap, private pre-publication copyout, reclaim stale generations, accept PROT_NONE, and retain exact failure classes' >&2
-    exit 1
+    static_failures=$((static_failures + 1))
 fi
 
 # Kernel copyout is a write in the VMA/COW model even though the byte mover
@@ -1313,7 +1323,19 @@ if ! rg -Uq 'fn with_current_write_address_space<R>\([^)]*UserCopyAddressSpace' 
     || ! rg -Uq 'libc::pread\(stamp\.fd, copyout_page\.cast\(\), 16, 0\)' "$cow_probe_source" \
     || [ "$(rg -c 'ptr::read_volatile\(copyout_page' "$cow_probe_source")" -lt 4 ]; then
     echo 'kernel copyout must resolve COW through exact VMA authority and retained root, retranslate, and retain the untouched-page KVM witness' >&2
+    static_failures=$((static_failures + 1))
+fi
+
+if [[ "$static_failures" -ne 0 ]]; then
+    echo "source conformance FAILED: $static_failures static check(s) failed; every one is listed above" >&2
     exit 1
+fi
+
+# The static checks above are all that a registration mistake can break; the
+# witness execution below needs Cargo. `formal-preflight.sh` stops here.
+if [[ "${FORMAL_SOURCE_CONFORMANCE_STATIC_ONLY:-0}" == 1 ]]; then
+    echo 'source conformance static checks passed'
+    exit 0
 fi
 
 checks=0

@@ -1,6 +1,25 @@
 //! Devmgrd-only allocation preparation and exact DVM export custody. No
 //! userspace field selects an aperture offset. Provider failure or abandoned
 //! requests quarantine ranges until the complete retirement proof exists.
+//!
+//! - **Owner:** devmgrd owns the aperture allocator; this file admits its
+//!   begin/commit/abort requests and holds the range custody between them.
+//! - **Boundary:** the caller must be the devmgrd service under its live lease;
+//!   request fields, sizes and handles are untrusted until validated against
+//!   the kernel capability, never taken as an offset or authority.
+//! - **Lifecycle:** begin quarantines a clean range, the provider export
+//!   publishes it, and commit installs a descriptor only for the exact service
+//!   epoch and process/MM incarnation; every other exit leaves the range
+//!   quarantined until the provider revoke acknowledgement and a scrub.
+//! - **Concurrency:** the broker state mutex is taken outside the service lease
+//!   and never held across IPC; the order is service registry mutation, then
+//!   mailbox, then the app-buffer pool.
+//! - **Failure:** a refusal, timeout or provider restart publishes no
+//!   descriptor and releases no range early.
+//! - **Forbidden:** guest-selected apertures, committing after a late or
+//!   wrong-epoch response, and reusing a range before the scrub.
+//! - **Evidence:** `formal/app-buffer-custody` and the DMA-BUF KVM probe
+//!   (`kvm-smoke --app-dmabuf-probe`).
 use super::*;
 use alloc::vec::Vec;
 use driver_domain_protocol::DvmAppBuffer;

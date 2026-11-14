@@ -4,6 +4,12 @@
 //! then consume the fault and wake only its exact waiter.
 //! Failure: a stale source or target publishes nothing; cache withdrawal never
 //! frees a surviving leaf. No file I/O, path selection or cache policy lives here.
+//! Concurrency: the pin is taken in normal context and the fault slot is
+//! consumed exactly once; no lock is held across the leaf publication.
+//! Forbidden: publishing without a live pin, waking a waiter other than the
+//! faulting one, and allocating or reclaiming from exception context.
+//! Evidence: `formal/frame-source-lifecycle`, `formal/pager-fault-slot-lifecycle`
+//! and the pager host tests.
 
 use super::*;
 use mm_api::frame_source::{FrameSourceKey, FrameSourceOwner};

@@ -60,7 +60,8 @@ pub(super) fn reclaim_root(root: u64) {
         pml4_frame_phys: root,
         next_user_addr: super::USER_SPACE_BASE,
         execution: None,
-        immutable: Vec::new(),
+        // The empty default performs no allocation.
+        immutable: Default::default(),
     });
     if address_space.pml4_frame_phys == 0 {
         return;

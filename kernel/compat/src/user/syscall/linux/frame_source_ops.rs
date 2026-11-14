@@ -2,6 +2,18 @@
 //! Source publication is serialized against service-lease withdrawal. Payload
 //! copies and cold reclamation occur outside the registry lock; the publishing
 //! closure only allocates a fresh page and publishes bounded source metadata.
+//!
+//! - **Owner:** the pager service supplies sources; kernel-mm owns the slots.
+//! - **Boundary:** the caller must hold PagerPolicy and the live pager lease;
+//!   key, length and payload are untrusted until validated.
+//! - **Lifecycle:** supply publishes a bounded source, withdrawal rejects new
+//!   pins, and cold reclamation runs after the last pin is released.
+//! - **Concurrency:** publication is serialized against lease withdrawal; the
+//!   registry lock is never held across a payload copy or reclamation.
+//! - **Failure:** every refusal publishes nothing and leaves no charged slot.
+//! - **Forbidden:** paths, cache replacement, and guest-facing authority.
+//! - **Evidence:** `formal/frame-source-lifecycle` and `kvm-smoke
+//!   --library-map-probe`.
 use super::*;
 use kernel_mm::api::frame_source::{self, FrameSourceError, FrameSourceKey, FrameSourceOwner};
 use rustos_user_abi::syscall::{

@@ -13,6 +13,21 @@
 //! including provider-exit cleanup from exception context. Keys are immutable between the
 //! release publication and final pin release. Per-field relaxed accesses below
 //! are protected by that publication and the packed generation/reference word.
+//!
+//! - **Owner:** kernel-mm owns source slots, pins and the resident charge; an
+//!   external pager owns what a source contains and when it is withdrawn.
+//! - **Boundary:** callers present a key and owner; neither is trusted beyond an
+//!   exact match, and a pin is the only way to read a source's frame.
+//! - **Lifecycle:** supply, pin, publish a leaf, unpin, withdraw, then cold
+//!   reclamation once the last pin drops; mapped leaves outlive withdrawal.
+//! - **Concurrency:** publication and revoke serialize on the packed
+//!   generation/reference word; withdrawal and pin Drop never allocate.
+//! - **Failure:** a stale key, owner or generation yields no pin; exhaustion
+//!   refuses supply and never evicts a pinned source.
+//! - **Forbidden:** file names, cache policy, I/O, and reclamation from
+//!   exception context.
+//! - **Evidence:** `formal/frame-source-lifecycle` and the native table and
+//!   descriptor tests below.
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::{charge, frame_capability, phys};

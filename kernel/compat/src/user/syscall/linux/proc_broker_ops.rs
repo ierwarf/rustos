@@ -1437,6 +1437,7 @@ pub(super) fn cleanup_proc_broker_state_for_process(process_id: u64) -> (usize, 
                 && authority.owner.process_id() != process_id
                 && authority.target.process_id() != process_id
         });
+        drop(activations);
         count
     };
     for target_pid in deferred_targets[..deferred_target_count].iter().copied() {

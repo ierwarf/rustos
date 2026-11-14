@@ -335,7 +335,7 @@ fn register_waitset_waiters_faultable(
         );
     }
     drop(waiters);
-    // Pairs with the fence in `wake_local_fd_object`: either its counter load
+    // ORDERING: pairs with the fence in `wake_local_fd_object`: either its counter load
     // sees this registration, or the caller's post-registration recheck of the
     // object sees the state change that load would otherwise have missed.
     fence(Ordering::SeqCst);
@@ -434,7 +434,7 @@ pub(super) fn syscall_linux_rustos_waitset_signal_broker(args_ptr: u64) -> u64 {
 /// wait.
 pub(crate) fn wake_local_fd_object(token: u64, generation: u64) {
     const BATCH: usize = 8;
-    // Pairs with the fence closing `register_waitset_waiters`.
+    // ORDERING: pairs with the fence closing `register_waitset_waiters`.
     fence(Ordering::SeqCst);
     if KERNEL_OBSERVERS.load(Ordering::Relaxed) == 0 {
         return;

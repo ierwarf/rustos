@@ -21,8 +21,8 @@ use crate::Result;
 
 const NATIVE_PREFIX: u64 = 0x5255_0000;
 
-/// Doc files whose syscall numbers are checked. `docs/ai/session-handoff.md`
-/// is a dated history log and is deliberately not scanned.
+/// Doc files whose syscall numbers are checked. Dated history logs are
+/// deliberately not scanned.
 const DOC_GLOBS: &[&str] = &["docs/ai/abi", "docs/architecture/job-model.md"];
 
 /// Marker constants whose value is not text printed by kernel or services.

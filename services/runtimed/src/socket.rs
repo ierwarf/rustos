@@ -861,9 +861,7 @@ fn handle_ready(
     // A client that already gave up (closed the stream) loses only the ack:
     // the edge is recorded, and its retry is a no-op.
     if let Err(errno) = super::util::write_response(stream, ready_ack()) {
-        boot_line(&format!(
-            "runtimed: ui ready ack not delivered errno={errno}"
-        ));
+        boot_line(&format!("runtimed: ui ready ack not delivered errno={errno}"));
     }
     Ok(())
 }
