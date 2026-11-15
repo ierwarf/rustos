@@ -258,6 +258,25 @@ impl WaylandState {
         true
     }
 
+    pub(super) fn resize_surface(&mut self, surface_id: u32, frame: Rect) -> bool {
+        let Some(shared) = self.find_surface_by_id(surface_id) else {
+            return false;
+        };
+        let clamped = clamp_wayland_frame(frame, self.display_width, self.display_height);
+        let Ok(mut state) = shared.lock() else {
+            return false;
+        };
+        if state.frame == clamped {
+            return false;
+        }
+        state.pre_maximize_frame = None;
+        state.frame = clamped;
+        drop(state);
+        self.send_toplevel_configure(&shared);
+        self.mark_dirty();
+        true
+    }
+
     pub(super) fn close_surface(&mut self, surface_id: u32) -> bool {
         diag_line(format!(
             "uiserver: close_surface begin surface={surface_id}"

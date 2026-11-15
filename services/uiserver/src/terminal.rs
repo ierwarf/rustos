@@ -8,7 +8,44 @@ const TERMINAL_PADDING_Y: usize = 14;
 const MAX_CONSOLE_COLS: usize = 240;
 const MAX_CONSOLE_ROWS: usize = 128;
 const MAX_CONSOLE_CELLS: usize = MAX_CONSOLE_COLS * MAX_CONSOLE_ROWS;
+const MAX_SCROLLBACK_LINES: usize = 256;
 const CURSOR_UNDERLINE_HEIGHT: usize = 2;
+
+/// Packed terminal cell storing ASCII character and 1-based ANSI 16-color
+/// indices (`0` = default theme foreground/background).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct TerminalCell {
+    ch: u8,
+    fg: u8,
+    bg: u8,
+}
+
+impl TerminalCell {
+    const BLANK: Self = Self {
+        ch: b' ',
+        fg: 0,
+        bg: 0,
+    };
+}
+
+const ANSI_PALETTE: [u32; 16] = [
+    0x001a_2233, // 0: black
+    0x00e0_5c73, // 1: red
+    0x006c_f0c2, // 2: green
+    0x00ff_d06c, // 3: yellow
+    0x006c_a6ff, // 4: blue
+    0x00c7_8cff, // 5: magenta
+    0x006c_e0ff, // 6: cyan
+    0x00e8_ecf2, // 7: white
+    0x005c_6b82, // 8: bright black
+    0x00ff_7a90, // 9: bright red
+    0x008f_ffda, // 10: bright green
+    0x00ff_e08c, // 11: bright yellow
+    0x008c_bfff, // 12: bright blue
+    0x00de_adff, // 13: bright magenta
+    0x0096_ebff, // 14: bright cyan
+    0x00ff_ffff, // 15: bright white
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct TerminalLayout {
@@ -85,7 +122,13 @@ pub(crate) struct TerminalState {
     layout: TerminalLayout,
     cursor_col: usize,
     cursor_row: usize,
-    cells: [u8; MAX_CONSOLE_CELLS],
+    cells: Vec<TerminalCell>,
+    scrollback: Vec<Vec<TerminalCell>>,
+    scroll_offset: usize,
+    current_fg: u8,
+    current_bg: u8,
+    bold: bool,
+    reverse: bool,
     parser: Parser,
     cursor_visible: bool,
     focused: bool,
@@ -105,7 +148,13 @@ impl TerminalState {
             layout: TerminalLayout::empty(),
             cursor_col: 0,
             cursor_row: 0,
-            cells: [b' '; MAX_CONSOLE_CELLS],
+            cells: vec![TerminalCell::BLANK; MAX_CONSOLE_CELLS],
+            scrollback: Vec::new(),
+            scroll_offset: 0,
+            current_fg: 0,
+            current_bg: 0,
+            bold: false,
+            reverse: false,
             parser: Parser::new(),
             cursor_visible: true,
             focused: false,
@@ -177,6 +226,25 @@ impl TerminalState {
         true
     }
 
+    pub(crate) fn scroll_by(&mut self, delta_lines: isize) -> bool {
+        if !self.initialized || self.scrollback.is_empty() || delta_lines == 0 {
+            return false;
+        }
+        let max_offset = self.scrollback.len();
+        let next = if delta_lines > 0 {
+            self.scroll_offset
+                .saturating_add(delta_lines as usize)
+                .min(max_offset)
+        } else {
+            self.scroll_offset.saturating_sub(delta_lines.unsigned_abs())
+        };
+        if next == self.scroll_offset {
+            return false;
+        }
+        self.scroll_offset = next;
+        true
+    }
+
     pub(crate) fn toggle_cursor(&mut self) -> bool {
         if !self.initialized || self.layout.cols == 0 || self.layout.rows == 0 {
             return false;
@@ -187,6 +255,7 @@ impl TerminalState {
 
     pub(crate) fn cursor_cell_rect(&self) -> Option<Rect> {
         if !self.initialized
+            || self.scroll_offset != 0
             || self.layout.cols == 0
             || self.layout.rows == 0
             || self.cursor_row >= self.layout.rows
@@ -198,7 +267,7 @@ impl TerminalState {
     }
 
     pub(crate) fn render_cursor_cell(&self, canvas: &mut SurfaceCanvas<'_>) {
-        if !self.initialized || self.layout.cols == 0 || self.layout.rows == 0 {
+        if !self.initialized || self.scroll_offset != 0 || self.layout.cols == 0 || self.layout.rows == 0 {
             return;
         }
         self.render_cell(canvas, self.cursor_row, self.cursor_col, true);
@@ -226,7 +295,13 @@ impl TerminalState {
         self.cursor_visible = true;
         self.focused = focused;
         self.initialized = true;
-        self.cells = [b' '; MAX_CONSOLE_CELLS];
+        self.cells.fill(TerminalCell::BLANK);
+        self.scrollback.clear();
+        self.scroll_offset = 0;
+        self.current_fg = 0;
+        self.current_bg = 0;
+        self.bold = false;
+        self.reverse = false;
         self.parsed_byte_count = 0;
     }
 
@@ -236,15 +311,36 @@ impl TerminalState {
         self.parser = parser;
     }
 
+    fn active_cell(&self, ch: u8) -> TerminalCell {
+        let mut fg = self.current_fg;
+        if self.bold && (1..=8).contains(&fg) {
+            fg += 8;
+        }
+        let bg = self.current_bg;
+        if self.reverse {
+            let rev_fg = if bg != 0 { bg } else { 1 };
+            let rev_bg = if fg != 0 { fg } else { 8 };
+            TerminalCell {
+                ch,
+                fg: rev_fg,
+                bg: rev_bg,
+            }
+        } else {
+            TerminalCell { ch, fg, bg }
+        }
+    }
+
     fn put_char(&mut self, byte: u8) {
         if self.layout.cols == 0 || self.layout.rows == 0 {
             return;
         }
+        self.scroll_offset = 0;
         if self.cursor_col >= self.layout.cols {
             self.new_line();
         }
 
-        self.set_cell(self.cursor_row, self.cursor_col, byte);
+        let cell = self.active_cell(byte);
+        self.set_cell(self.cursor_row, self.cursor_col, cell);
         self.cursor_col += 1;
         if self.cursor_col >= self.layout.cols {
             self.new_line();
@@ -295,11 +391,12 @@ impl TerminalState {
         }
 
         self.cursor_col -= 1;
-        self.set_cell(self.cursor_row, self.cursor_col, b' ');
+        self.set_cell(self.cursor_row, self.cursor_col, TerminalCell::BLANK);
     }
 
     fn new_line(&mut self) {
         self.cursor_col = 0;
+        self.scroll_offset = 0;
         if self.layout.rows == 0 {
             return;
         }
@@ -317,6 +414,13 @@ impl TerminalState {
         }
 
         let row_width = self.layout.cols;
+        if row_width > 0 {
+            let line = self.cells[..row_width].to_vec();
+            if self.scrollback.len() >= MAX_SCROLLBACK_LINES {
+                self.scrollback.remove(0);
+            }
+            self.scrollback.push(line);
+        }
         for row in 1..self.layout.rows {
             let src = row * row_width;
             let dst = (row - 1) * row_width;
@@ -325,8 +429,89 @@ impl TerminalState {
         }
 
         let last_row_start = (self.layout.rows - 1) * row_width;
-        for cell in &mut self.cells[last_row_start..last_row_start + row_width] {
-            *cell = b' ';
+        self.cells[last_row_start..last_row_start + row_width].fill(TerminalCell::BLANK);
+    }
+
+    fn scroll_down(&mut self) {
+        if self.layout.rows <= 1 || self.layout.cols == 0 {
+            return;
+        }
+        let row_width = self.layout.cols;
+        for row in (1..self.layout.rows).rev() {
+            let src = (row - 1) * row_width;
+            let dst = row * row_width;
+            self.cells.copy_within(src..src + row_width, dst);
+        }
+        self.cells[..row_width].fill(TerminalCell::BLANK);
+    }
+
+    fn erase_display(&mut self, mode: usize) {
+        let cols = self.layout.cols;
+        let rows = self.layout.rows;
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        let total = cols * rows;
+        let cursor_idx = (self.cursor_row * cols + self.cursor_col).min(total);
+        match mode {
+            0 => self.cells[cursor_idx..total].fill(TerminalCell::BLANK),
+            1 => self.cells[..cursor_idx.min(total)].fill(TerminalCell::BLANK),
+            2 | 3 => {
+                self.cells[..total].fill(TerminalCell::BLANK);
+                if mode == 3 {
+                    self.scrollback.clear();
+                    self.scroll_offset = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn erase_line(&mut self, mode: usize) {
+        let cols = self.layout.cols;
+        if cols == 0 || self.cursor_row >= self.layout.rows {
+            return;
+        }
+        let row_start = self.cursor_row * cols;
+        let cursor = row_start + self.cursor_col.min(cols);
+        let row_end = row_start + cols;
+        match mode {
+            0 => self.cells[cursor..row_end].fill(TerminalCell::BLANK),
+            1 => self.cells[row_start..cursor.min(row_end)].fill(TerminalCell::BLANK),
+            2 => self.cells[row_start..row_end].fill(TerminalCell::BLANK),
+            _ => {}
+        }
+    }
+
+    fn apply_sgr(&mut self, params: &Params) {
+        if params.is_empty() {
+            self.current_fg = 0;
+            self.current_bg = 0;
+            self.bold = false;
+            self.reverse = false;
+            return;
+        }
+        for param in params.iter() {
+            let code = param.first().copied().unwrap_or(0);
+            match code {
+                0 => {
+                    self.current_fg = 0;
+                    self.current_bg = 0;
+                    self.bold = false;
+                    self.reverse = false;
+                }
+                1 => self.bold = true,
+                7 => self.reverse = true,
+                22 => self.bold = false,
+                27 => self.reverse = false,
+                30..=37 => self.current_fg = (code - 30 + 1) as u8,
+                39 => self.current_fg = 0,
+                40..=47 => self.current_bg = (code - 40 + 1) as u8,
+                49 => self.current_bg = 0,
+                90..=97 => self.current_fg = (code - 90 + 9) as u8,
+                100..=107 => self.current_bg = (code - 100 + 9) as u8,
+                _ => {}
+            }
         }
     }
 
@@ -334,13 +519,31 @@ impl TerminalState {
         row * self.layout.cols + col
     }
 
-    fn cell(&self, row: usize, col: usize) -> u8 {
-        self.cells[self.cell_index(row, col)]
+    fn visible_cell(&self, row: usize, col: usize) -> TerminalCell {
+        if self.scroll_offset == 0 {
+            return self.cells[self.cell_index(row, col)];
+        }
+        let sb_len = self.scrollback.len();
+        let top_virtual_row = sb_len.saturating_sub(self.scroll_offset);
+        let virtual_row = top_virtual_row + row;
+        if virtual_row < sb_len {
+            self.scrollback[virtual_row]
+                .get(col)
+                .copied()
+                .unwrap_or(TerminalCell::BLANK)
+        } else {
+            let live_row = virtual_row - sb_len;
+            if live_row < self.layout.rows {
+                self.cells[self.cell_index(live_row, col)]
+            } else {
+                TerminalCell::BLANK
+            }
+        }
     }
 
-    fn set_cell(&mut self, row: usize, col: usize, byte: u8) {
+    fn set_cell(&mut self, row: usize, col: usize, cell: TerminalCell) {
         let index = self.cell_index(row, col);
-        self.cells[index] = byte;
+        self.cells[index] = cell;
     }
 
     fn render_cell(
@@ -351,25 +554,25 @@ impl TerminalState {
         paint_background: bool,
     ) {
         let cell_rect = self.layout.cell_rect(row, col);
-        // Bulk render fills the whole `layout.bounds` first, so per-cell
-        // background paints are only needed when the caller is repainting
-        // a single cell (e.g. cursor blink) on top of existing pixels.
-        if paint_background {
-            canvas.fill_rect(cell_rect, terminal_background_color());
+        let cell = self.visible_cell(row, col);
+        let bg = cell_color(cell.bg, terminal_background_color());
+        // Bulk render fills `layout.bounds` with `terminal_background_color()`,
+        // so non-default backgrounds always paint while default blanks skip in bulk.
+        if paint_background || cell.bg != 0 {
+            canvas.fill_rect(cell_rect, bg);
         }
 
-        let byte = self.cell(row, col);
-        if byte != b' ' {
-            font::draw_terminal_glyph(
-                canvas,
-                cell_rect.x,
-                cell_rect.y,
-                byte,
-                terminal_foreground(),
-            );
+        if cell.ch != b' ' {
+            let fg = cell_color(cell.fg, terminal_foreground());
+            font::draw_terminal_glyph(canvas, cell_rect.x, cell_rect.y, cell.ch, fg);
         }
 
-        if self.focused && self.cursor_visible && row == self.cursor_row && col == self.cursor_col {
+        if self.scroll_offset == 0
+            && self.focused
+            && self.cursor_visible
+            && row == self.cursor_row
+            && col == self.cursor_col
+        {
             let underline_height = CURSOR_UNDERLINE_HEIGHT.min(cell_rect.height);
             let underline_y = cell_rect.y + cell_rect.height - underline_height;
             canvas.fill_rect(
@@ -409,16 +612,67 @@ impl Perform for TerminalState {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
-        if ignore || !intermediates.is_empty() {
+        if ignore || !intermediates.is_empty() || self.layout.cols == 0 || self.layout.rows == 0 {
             return;
         }
 
-        let count = first_csi_param(params).max(1);
+        let first = first_csi_param(params);
+        let count = first.max(1);
         match action {
+            'A' => self.cursor_row = self.cursor_row.saturating_sub(count),
+            'B' => self.cursor_row = (self.cursor_row + count).min(self.layout.rows - 1),
             'C' => self.move_cursor_forward(count),
             'D' => self.move_cursor_backward(count),
+            'E' => {
+                self.cursor_col = 0;
+                self.cursor_row = (self.cursor_row + count).min(self.layout.rows - 1);
+            }
+            'F' => {
+                self.cursor_col = 0;
+                self.cursor_row = self.cursor_row.saturating_sub(count);
+            }
+            'G' => self.cursor_col = count.saturating_sub(1).min(self.layout.cols - 1),
+            'H' | 'f' => {
+                let row = nth_csi_param(params, 0).max(1).saturating_sub(1);
+                let col = nth_csi_param(params, 1).max(1).saturating_sub(1);
+                self.cursor_row = row.min(self.layout.rows - 1);
+                self.cursor_col = col.min(self.layout.cols - 1);
+            }
+            'J' => self.erase_display(first),
+            'K' => self.erase_line(first),
+            'S' => {
+                for _ in 0..count {
+                    self.scroll_up();
+                }
+            }
+            'T' => {
+                for _ in 0..count {
+                    self.scroll_down();
+                }
+            }
+            'm' => self.apply_sgr(params),
             _ => {}
         }
+    }
+}
+
+fn nth_csi_param(params: &Params, index: usize) -> usize {
+    params
+        .iter()
+        .nth(index)
+        .and_then(|param| param.first().copied())
+        .map(usize::from)
+        .unwrap_or(0)
+}
+
+fn cell_color(idx: u8, default: u32) -> u32 {
+    if idx == 0 {
+        default
+    } else {
+        ANSI_PALETTE
+            .get((idx - 1) as usize)
+            .copied()
+            .unwrap_or(default)
     }
 }
 
@@ -477,5 +731,32 @@ mod tests {
             (fresh.cursor_col, fresh.cursor_row)
         );
         assert_eq!(terminal.parsed_byte_count, bytes.len());
+    }
+
+    #[test]
+    fn ansi_csi_sequences_and_scrollback_work() {
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 160,
+            height: 80,
+        };
+        let mut terminal = TerminalState::new();
+        let layout = TerminalLayout::with_cell_metrics(bounds, 10, 20);
+        // 2 rows visible
+        let bytes = b"\x1b[32mline1\n\x1b[0mline2\nline3";
+        terminal.rebuild_with_layout(layout, true, bytes);
+        assert_eq!(terminal.visible_cell(0, 0).ch, b'l');
+        assert_eq!(terminal.visible_cell(0, 4).ch, b'2');
+        assert_eq!(terminal.visible_cell(1, 4).ch, b'3');
+        assert!(terminal.scroll_by(1));
+        assert_eq!(terminal.visible_cell(0, 4).ch, b'1');
+        assert_eq!(terminal.visible_cell(0, 0).fg, 3); // ANSI green index = 2 + 1
+
+        // CSI 2J clears screen
+        terminal.rebuild_with_layout(layout, true, b"hello\x1b[2J\x1b[1;1Hok");
+        assert_eq!(terminal.visible_cell(0, 0).ch, b'o');
+        assert_eq!(terminal.visible_cell(0, 1).ch, b'k');
+        assert_eq!(terminal.visible_cell(0, 2).ch, b' ');
     }
 }

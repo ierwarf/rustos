@@ -94,6 +94,22 @@ pub(in crate::multitask) fn alive(id: u64) -> bool {
 fn alive_in(id: u64) -> bool {
     task_directory::candidates(id).any(|slot| identity::observe_user_liveness(slot, id))
 }
+pub(in crate::multitask) fn user_target_abi_if_alive(
+    pid: u64,
+    id: u64,
+) -> Option<crate::user::abi::UserAbi> {
+    x86_64::instructions::interrupts::without_interrupts(|| user_target_abi_if_alive_in(pid, id))
+}
+fn user_target_abi_if_alive_in(pid: u64, id: u64) -> Option<crate::user::abi::UserAbi> {
+    if pid == 0 {
+        return None;
+    }
+    if id != 0 {
+        return task_directory::candidates(id)
+            .find_map(|slot| identity::observe_user_process_task_abi(slot, pid, id));
+    }
+    (0..super::MAX_TASK).find_map(|slot| identity::observe_user_process_task_abi(slot, pid, 0))
+}
 pub(in crate::multitask) fn log_ids(id: u64) -> Option<(u64, u64)> {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let target = Target::capture(id)?;

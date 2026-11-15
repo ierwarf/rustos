@@ -6,11 +6,6 @@ pub(super) const COLOR_BG_TOP: u32 = 0x0033_3a9e;
 pub(super) const COLOR_BG_MID: u32 = 0x0062_3aa8;
 pub(super) const COLOR_BG_DEEP: u32 = 0x0016_5f8f;
 
-pub(super) const COLOR_GLOW_CYAN: u32 = 0x004f_d1ff;
-pub(super) const COLOR_GLOW_PINK: u32 = 0x00ff_7ac6;
-pub(super) const COLOR_GLOW_MINT: u32 = 0x006c_f0c2;
-pub(super) const COLOR_GLOW_AMBER: u32 = 0x00ff_b86c;
-
 /// Window bodies stay dark so terminal and client content keeps its contrast.
 pub(super) const COLOR_GLASS_DARK: u32 = 0x000f_1430;
 pub(super) const COLOR_GLASS_DEEP: u32 = 0x0008_0c1f;

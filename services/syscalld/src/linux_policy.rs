@@ -97,8 +97,9 @@ const ARCH_GET_FS: u64 = 0x1003;
 #[derive(Clone, Copy, Debug)]
 struct LinuxPolicyState {
     credentials: Credentials,
-    stack_rlimit: LinuxRlimit,
+    rlimits: [LinuxRlimit; errno::RLIMIT_COUNT],
     umask: u32,
+    nice: i32,
     parent_pid: u64,
     pgid: u64,
     sid: u64,
@@ -112,6 +113,8 @@ struct Credentials {
     gid: u32,
     euid: u32,
     egid: u32,
+    suid: u32,
+    sgid: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -251,7 +254,11 @@ pub fn handle_prlimit64(
         response.status = errno::EACCES;
         return;
     }
-    if resource != errno::RLIMIT_STACK {
+    let Ok(resource_idx) = usize::try_from(resource) else {
+        response.status = errno::EINVAL;
+        return;
+    };
+    if resource_idx >= errno::RLIMIT_COUNT {
         response.status = errno::EINVAL;
         return;
     }
@@ -260,10 +267,8 @@ pub fn handle_prlimit64(
         return;
     }
     let mut policy = policy_db().lock();
-    let state = policy
-        .entry(request.pid)
-        .or_insert_with(|| initial_state(request));
-    let old_limit = state.stack_rlimit;
+    let state = ensure_state_with_inheritance(&mut policy, request);
+    let old_limit = state.rlimits[resource_idx];
     if has_new_limit {
         let new_limit = LinuxRlimit {
             rlim_cur: read_u64(&request.path[..LINUX_RLIMIT_SIZE], 0),
@@ -279,7 +284,7 @@ pub fn handle_prlimit64(
             response.status = errno::EPERM;
             return;
         }
-        state.stack_rlimit = new_limit;
+        state.rlimits[resource_idx] = new_limit;
     }
     if wants_old_limit {
         copy_payload(response, &old_limit);
@@ -287,6 +292,97 @@ pub fn handle_prlimit64(
         response.status = 0;
         response.payload_len = 0;
     }
+}
+
+pub fn handle_getres_id(
+    request: &LinuxSyscallOffloadRequest,
+    is_gid: bool,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    let mut policy = policy_db().lock();
+    let state = ensure_state_with_inheritance(&mut policy, request);
+    let ids = if is_gid {
+        [
+            state.credentials.gid,
+            state.credentials.egid,
+            state.credentials.sgid,
+        ]
+    } else {
+        [
+            state.credentials.uid,
+            state.credentials.euid,
+            state.credentials.suid,
+        ]
+    };
+    copy_payload(response, &ids);
+}
+
+pub fn handle_getgroups(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    let size = request.arg0 as i32;
+    if size < 0 {
+        response.status = errno::EINVAL;
+        return;
+    }
+    // Single primary-group model: zero supplementary groups.
+    let count: u32 = 0;
+    copy_payload(response, &count);
+}
+
+pub fn handle_getpriority(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    let which = request.flags;
+    let who = request.dirfd;
+    if which != errno::PRIO_PROCESS {
+        response.status = errno::EINVAL;
+        return;
+    }
+    let target_pid = if who == 0 { request.pid } else { who };
+    let mut policy = policy_db().lock();
+    let _ = ensure_state_with_inheritance(&mut policy, request);
+    let Some(state) = policy.get(&target_pid) else {
+        response.status = errno::ESRCH;
+        return;
+    };
+    let kernel_prio = (20 - state.nice) as u64;
+    copy_payload(response, &kernel_prio);
+}
+
+pub fn handle_setpriority(
+    request: &LinuxSyscallOffloadRequest,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    let which = request.flags;
+    let who = request.dirfd;
+    if which != errno::PRIO_PROCESS {
+        response.status = errno::EINVAL;
+        return;
+    }
+    let target_pid = if who == 0 { request.pid } else { who };
+    let requested = (request.arg0 as i32).clamp(-20, 19);
+    let mut policy = policy_db().lock();
+    let caller_euid = ensure_state_with_inheritance(&mut policy, request)
+        .credentials
+        .euid;
+    if target_pid != request.pid && caller_euid != 0 {
+        response.status = errno::EPERM;
+        return;
+    }
+    let Some(state) = policy.get_mut(&target_pid) else {
+        response.status = errno::ESRCH;
+        return;
+    };
+    if requested < state.nice && caller_euid != 0 {
+        response.status = errno::EACCES;
+        return;
+    }
+    state.nice = requested;
+    response.status = 0;
+    response.payload_len = 0;
 }
 
 pub fn handle_id(
@@ -321,6 +417,7 @@ pub fn handle_setuid(
     if state.credentials.euid == 0 {
         state.credentials.uid = requested;
         state.credentials.euid = requested;
+        state.credentials.suid = requested;
     } else if requested == state.credentials.uid || requested == state.credentials.euid {
         // An unprivileged setuid changes only the effective identity.
         state.credentials.euid = requested;
@@ -344,6 +441,7 @@ pub fn handle_setgid(
     if state.credentials.euid == 0 {
         state.credentials.gid = requested;
         state.credentials.egid = requested;
+        state.credentials.sgid = requested;
     } else if requested == state.credentials.gid || requested == state.credentials.egid {
         state.credentials.egid = requested;
     } else {
@@ -383,6 +481,35 @@ fn mm_db() -> &'static Mutex<BTreeMap<u64, MmPolicyState>> {
     &MM_POLICY
 }
 
+fn default_rlimits() -> [LinuxRlimit; errno::RLIMIT_COUNT] {
+    let unlimited = LinuxRlimit {
+        rlim_cur: errno::RLIM_INFINITY,
+        rlim_max: errno::RLIM_INFINITY,
+    };
+    let mut limits = [unlimited; errno::RLIMIT_COUNT];
+    limits[errno::RLIMIT_STACK as usize] = LinuxRlimit {
+        rlim_cur: LINUX_DEFAULT_STACK_RLIMIT_BYTES,
+        rlim_max: LINUX_DEFAULT_STACK_RLIMIT_BYTES,
+    };
+    limits[errno::RLIMIT_CORE as usize] = LinuxRlimit {
+        rlim_cur: 0,
+        rlim_max: errno::RLIM_INFINITY,
+    };
+    limits[errno::RLIMIT_NPROC as usize] = LinuxRlimit {
+        rlim_cur: 4096,
+        rlim_max: 4096,
+    };
+    limits[errno::RLIMIT_NOFILE as usize] = LinuxRlimit {
+        rlim_cur: 1024,
+        rlim_max: 4096,
+    };
+    limits[errno::RLIMIT_MEMLOCK as usize] = LinuxRlimit {
+        rlim_cur: LINUX_DEFAULT_STACK_RLIMIT_BYTES,
+        rlim_max: LINUX_DEFAULT_STACK_RLIMIT_BYTES,
+    };
+    limits
+}
+
 fn initial_state(request: &LinuxSyscallOffloadRequest) -> LinuxPolicyState {
     LinuxPolicyState {
         credentials: Credentials {
@@ -390,12 +517,12 @@ fn initial_state(request: &LinuxSyscallOffloadRequest) -> LinuxPolicyState {
             gid: request.gid,
             euid: request.euid,
             egid: request.egid,
+            suid: request.euid,
+            sgid: request.egid,
         },
-        stack_rlimit: LinuxRlimit {
-            rlim_cur: LINUX_DEFAULT_STACK_RLIMIT_BYTES,
-            rlim_max: LINUX_DEFAULT_STACK_RLIMIT_BYTES,
-        },
+        rlimits: default_rlimits(),
         umask: DEFAULT_UMASK,
+        nice: 0,
         parent_pid: request.parent_pid,
         pgid: request.pid,
         sid: request.pid,
@@ -419,6 +546,8 @@ fn ensure_state_with_inheritance<'a>(
         let mut state = initial_state(request);
         if let Some(parent) = parent {
             state.umask = parent.umask;
+            state.nice = parent.nice;
+            state.rlimits = parent.rlimits;
             state.pgid = parent.pgid;
             state.sid = parent.sid;
         }
@@ -1820,6 +1949,69 @@ mod tests {
         let lease = mm_state_for(MmTarget { pid, ticket: 1 }).unwrap();
         assert!(lease.vmas.is_empty(), "the hole was persisted by the lease");
         drop(lease);
+        handle_process_exit_pid(pid);
+    }
+
+    #[test]
+    fn prlimit_getres_and_priority_policies_enforce_bounds() {
+        let pid = u64::MAX - 29;
+        let base = LinuxSyscallOffloadRequest {
+            pid,
+            uid: 1000,
+            gid: 1000,
+            euid: 1000,
+            egid: 1000,
+            ..LinuxSyscallOffloadRequest::default()
+        };
+
+        let mut response = LinuxSyscallOffloadResponse::default();
+        handle_prlimit64(
+            &LinuxSyscallOffloadRequest {
+                flags: errno::RLIMIT_NOFILE,
+                mask: 0x2,
+                ..base
+            },
+            &mut response,
+        );
+        assert_eq!(response.status, 0);
+        assert_eq!(read_u64(&response.payload[..LINUX_RLIMIT_SIZE], 0), 1024);
+        assert_eq!(read_u64(&response.payload[..LINUX_RLIMIT_SIZE], 8), 4096);
+
+        let mut res_resp = LinuxSyscallOffloadResponse::default();
+        handle_getres_id(&base, false, &mut res_resp);
+        assert_eq!(res_resp.status, 0);
+        assert_eq!(res_resp.payload_len as usize, 12);
+
+        let mut prio_resp = LinuxSyscallOffloadResponse::default();
+        handle_setpriority(
+            &LinuxSyscallOffloadRequest {
+                flags: errno::PRIO_PROCESS,
+                arg0: (-5_i32) as u64,
+                ..base
+            },
+            &mut prio_resp,
+        );
+        assert_eq!(prio_resp.status, errno::EACCES);
+
+        handle_setpriority(
+            &LinuxSyscallOffloadRequest {
+                flags: errno::PRIO_PROCESS,
+                arg0: 4,
+                ..base
+            },
+            &mut prio_resp,
+        );
+        assert_eq!(prio_resp.status, 0);
+        handle_getpriority(
+            &LinuxSyscallOffloadRequest {
+                flags: errno::PRIO_PROCESS,
+                ..base
+            },
+            &mut prio_resp,
+        );
+        assert_eq!(prio_resp.status, 0);
+        assert_eq!(read_u64(&prio_resp.payload[..8], 0), 16);
+
         handle_process_exit_pid(pid);
     }
 }

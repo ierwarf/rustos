@@ -10,8 +10,7 @@ pub(super) fn handle_getsockname(request: &NetdIpcRequest, response: &mut NetdIp
     let Some(socket) = state.sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
-    sockaddr_payload(socket.local_path.as_deref().unwrap_or(""), response)
-        .unwrap_or_else(|errno| errno)
+    sockaddr_payload(socket.local_path.as_ref(), response).unwrap_or_else(|errno| errno)
 }
 
 pub(super) fn handle_getpeername(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
@@ -22,13 +21,34 @@ pub(super) fn handle_getpeername(request: &NetdIpcRequest, response: &mut NetdIp
     let Some(socket) = state.sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
-    let Some(path) = socket.peer_path.as_deref() else {
+    let Some(addr) = socket.peer_path.as_ref() else {
         return libc::ENOTCONN;
     };
-    sockaddr_payload(path, response).unwrap_or_else(|errno| errno)
+    sockaddr_payload(Some(addr), response).unwrap_or_else(|errno| errno)
 }
 
 pub(super) fn handle_getsockopt(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+    if request.arg1 == libc::IPPROTO_TCP as u64 && request.arg2 == libc::TCP_NODELAY as u64 {
+        let mut state = lock_net_state();
+        let Some(socket) = state.inet_sockets.get(&request.socket_token) else {
+            return if state.sockets.contains_key(&request.socket_token) {
+                libc::ENOPROTOOPT
+            } else {
+                libc::EBADF
+            };
+        };
+        let InetTransport::Tcp(tcp_handle) = socket.transport else {
+            return libc::ENOPROTOOPT;
+        };
+        let Some(stack) = state.inet.as_mut() else {
+            return libc::ENODEV;
+        };
+        let value = i32::from(!stack.sockets.get::<tcp::Socket>(tcp_handle).nagle_enabled());
+        response.payload[..size_of::<i32>()].copy_from_slice(&value.to_ne_bytes());
+        response.payload_len = size_of::<i32>() as u32;
+        response.value = 0;
+        return 0;
+    }
     if request.arg1 != linux_abi::SOL_SOCKET {
         return inet_datagram::get_ip_option(request, response);
     }
@@ -58,6 +78,15 @@ pub(super) fn handle_getsockopt(request: &NetdIpcRequest, response: &mut NetdIpc
             linux_abi::SO_SNDBUF => socket.options.send_buffer,
             linux_abi::SO_RCVBUF => socket.options.recv_buffer,
             linux_abi::SO_KEEPALIVE => socket.options.keepalive as i32,
+            linux_abi::SO_ACCEPTCONN => match socket.transport {
+                InetTransport::Tcp(tcp_handle) => i32::from(
+                    state
+                        .inet
+                        .as_ref()
+                        .is_some_and(|s| s.sockets.get::<tcp::Socket>(tcp_handle).is_listening()),
+                ),
+                _ => 0,
+            },
             _ => return libc::EOPNOTSUPP,
         };
         response.payload[..size_of::<i32>()].copy_from_slice(&value.to_ne_bytes());
@@ -96,6 +125,30 @@ pub(super) fn handle_getsockopt(request: &NetdIpcRequest, response: &mut NetdIpc
 }
 
 pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
+    if request.arg1 == libc::IPPROTO_TCP as u64 && request.arg2 == libc::TCP_NODELAY as u64 {
+        let Some(value) = request_i32_payload(request) else {
+            return libc::EINVAL;
+        };
+        let mut state = lock_net_state();
+        let Some(socket) = state.inet_sockets.get(&request.socket_token) else {
+            return if state.sockets.contains_key(&request.socket_token) {
+                libc::ENOPROTOOPT
+            } else {
+                libc::EBADF
+            };
+        };
+        let InetTransport::Tcp(tcp_handle) = socket.transport else {
+            return libc::ENOPROTOOPT;
+        };
+        let Some(stack) = state.inet.as_mut() else {
+            return libc::ENODEV;
+        };
+        stack
+            .sockets
+            .get_mut::<tcp::Socket>(tcp_handle)
+            .set_nagle_enabled(value == 0);
+        return 0;
+    }
     if request.arg1 != linux_abi::SOL_SOCKET {
         return inet_datagram::set_ip_option(request);
     }
@@ -192,7 +245,16 @@ pub(super) fn handle_shutdown(request: &NetdIpcRequest) -> i32 {
     0
 }
 
-pub(super) fn sockaddr_path_from_payload(request: &NetdIpcRequest) -> Result<String, i32> {
+pub(super) fn sockaddr_path_from_payload(request: &NetdIpcRequest) -> Result<UnixAddress, i32> {
+    sockaddr_bind_address_from_payload(request)?.ok_or(libc::EINVAL)
+}
+
+/// Parses an `AF_UNIX` `sockaddr_un` payload for `bind`: `Some(addr)` for
+/// filesystem or abstract names, or `None` when `addrlen == sizeof(sa_family_t)`
+/// (autobind request).
+pub(super) fn sockaddr_bind_address_from_payload(
+    request: &NetdIpcRequest,
+) -> Result<Option<UnixAddress>, i32> {
     let len = request.payload_len as usize;
     if len < size_of::<u16>() {
         return Err(libc::EINVAL);
@@ -202,8 +264,14 @@ pub(super) fn sockaddr_path_from_payload(request: &NetdIpcRequest) -> Result<Str
         return Err(libc::EAFNOSUPPORT);
     }
     let path_bytes = &request.payload[size_of::<u16>()..len];
+    if path_bytes.is_empty() {
+        return Ok(None);
+    }
     if path_bytes.first().copied() == Some(0) {
-        return Err(libc::EINVAL);
+        if path_bytes.len() > linux_abi::UNIX_PATH_MAX {
+            return Err(libc::EINVAL);
+        }
+        return Ok(Some(UnixAddress::Abstract(path_bytes.to_vec())));
     }
     let end = path_bytes
         .iter()
@@ -212,20 +280,47 @@ pub(super) fn sockaddr_path_from_payload(request: &NetdIpcRequest) -> Result<Str
     if end == 0 || end >= linux_abi::UNIX_PATH_MAX {
         return Err(libc::EINVAL);
     }
-    String::from_utf8(path_bytes[..end].to_vec()).map_err(|_| libc::EINVAL)
+    String::from_utf8(path_bytes[..end].to_vec())
+        .map(|path| Some(UnixAddress::Filesystem(path)))
+        .map_err(|_| libc::EINVAL)
 }
 
-pub(super) fn sockaddr_payload(path: &str, response: &mut NetdIpcResponse) -> Result<i32, i32> {
-    let needed = size_of::<u16>()
-        .checked_add(path.len())
-        .and_then(|value| value.checked_add(1))
-        .ok_or(libc::EINVAL)?;
-    if needed > response.payload.len() || path.len() >= linux_abi::UNIX_PATH_MAX {
-        return Err(libc::EINVAL);
-    }
+pub(super) fn sockaddr_payload(
+    address: Option<&UnixAddress>,
+    response: &mut NetdIpcResponse,
+) -> Result<i32, i32> {
     response.payload[..2].copy_from_slice(&(linux_abi::AF_UNIX as u16).to_ne_bytes());
-    response.payload[2..2 + path.len()].copy_from_slice(path.as_bytes());
-    response.payload[2 + path.len()] = 0;
+    let needed = match address {
+        None => {
+            response.payload[2] = 0;
+            size_of::<u16>() + 1
+        }
+        Some(UnixAddress::Filesystem(path)) => {
+            let needed = size_of::<u16>()
+                .checked_add(path.len())
+                .and_then(|value| value.checked_add(1))
+                .ok_or(libc::EINVAL)?;
+            if needed > response.payload.len() || path.len() >= linux_abi::UNIX_PATH_MAX {
+                return Err(libc::EINVAL);
+            }
+            response.payload[2..2 + path.len()].copy_from_slice(path.as_bytes());
+            response.payload[2 + path.len()] = 0;
+            needed
+        }
+        Some(UnixAddress::Abstract(bytes)) => {
+            if bytes.is_empty() || bytes.len() > linux_abi::UNIX_PATH_MAX {
+                return Err(libc::EINVAL);
+            }
+            let needed = size_of::<u16>()
+                .checked_add(bytes.len())
+                .ok_or(libc::EINVAL)?;
+            if needed > response.payload.len() {
+                return Err(libc::EINVAL);
+            }
+            response.payload[2..2 + bytes.len()].copy_from_slice(bytes);
+            needed
+        }
+    };
     response.payload_len = needed as u32;
     response.value = 0;
     Ok(0)

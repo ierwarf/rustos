@@ -399,26 +399,44 @@ pub(super) fn handle_bind(request: &NetdIpcRequest) -> i32 {
     if inet_socket_exists(request.socket_token) {
         return inet_datagram::bind(request);
     }
-    let path = match sockaddr_path_from_payload(request) {
-        Ok(path) => path,
+    let requested_address = match sockaddr_bind_address_from_payload(request) {
+        Ok(address) => address,
         Err(errno) => return errno,
     };
-    if is_wayland_path(path.as_str()) {
-        debug_line("netd: wayland bind");
-    }
     let mut state = lock_net_state();
-    if state.bindings.contains_key(&path) {
-        return libc::EADDRINUSE;
-    }
-    let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
+    let Some(socket) = state.sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
     if socket.bound_path.is_some() || !matches!(socket.state, UnixSocketState::Idle) {
         return libc::EINVAL;
     }
-    socket.bound_path = Some(path.clone());
-    socket.local_path = Some(path.clone());
-    state.bindings.insert(path, request.socket_token);
+    let address = match requested_address {
+        Some(address) => {
+            if state.bindings.contains_key(&address) {
+                return libc::EADDRINUSE;
+            }
+            address
+        }
+        None => loop {
+            let candidate_id = state.next_autobind_id;
+            state.next_autobind_id = candidate_id.wrapping_add(1).max(1);
+            let candidate =
+                UnixAddress::Abstract(format!("\0{:05x}", candidate_id & 0xfffff).into_bytes());
+            if !state.bindings.contains_key(&candidate) {
+                break candidate;
+            }
+        },
+    };
+    if address.as_filesystem_str().is_some_and(is_wayland_path) {
+        debug_line("netd: wayland bind");
+    }
+    let socket = state
+        .sockets
+        .get_mut(&request.socket_token)
+        .expect("validated unix socket disappeared under net state lock");
+    socket.bound_path = Some(address.clone());
+    socket.local_path = Some(address.clone());
+    state.bindings.insert(address, request.socket_token);
     0
 }
 
@@ -427,7 +445,11 @@ pub(super) fn handle_listen(request: &NetdIpcRequest) -> i32 {
     let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
         return libc::EBADF;
     };
-    let is_wayland = socket.bound_path.as_deref().is_some_and(is_wayland_path);
+    let is_wayland = socket
+        .bound_path
+        .as_ref()
+        .and_then(UnixAddress::as_filesystem_str)
+        .is_some_and(is_wayland_path);
     if socket.bound_path.is_none() || !matches!(socket.state, UnixSocketState::Idle) {
         return libc::EINVAL;
     }
@@ -490,7 +512,7 @@ pub(super) fn handle_connect(request: &NetdIpcRequest) -> i32 {
         Ok(channel_id) => channel_id,
         Err(errno) => return errno,
     };
-    let is_wayland = is_wayland_path(path.as_str());
+    let is_wayland = path.as_filesystem_str().is_some_and(is_wayland_path);
     let client = state
         .sockets
         .get_mut(&request.socket_token)
@@ -596,7 +618,11 @@ pub(super) fn handle_accept(
         let Some(listener) = state.sockets.get_mut(&request.socket_token) else {
             return libc::EBADF;
         };
-        let is_wayland = listener.local_path.as_deref().is_some_and(is_wayland_path);
+        let is_wayland = listener
+            .local_path
+            .as_ref()
+            .and_then(UnixAddress::as_filesystem_str)
+            .is_some_and(is_wayland_path);
         match &mut listener.state {
             UnixSocketState::Listening { pending, .. } => match pending.pop_front() {
                 Some(token) => {
@@ -629,9 +655,7 @@ pub(super) fn handle_accept(
         if request.arg1 != 0 && request.arg2 != 0 {
             let state = lock_net_state();
             if let Some(socket) = state.sockets.get(&accepted) {
-                if let Err(errno) =
-                    sockaddr_payload(socket.peer_path.as_deref().unwrap_or(""), response)
-                {
+                if let Err(errno) = sockaddr_payload(socket.peer_path.as_ref(), response) {
                     return errno;
                 }
             }

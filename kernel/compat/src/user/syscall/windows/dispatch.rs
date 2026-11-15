@@ -48,10 +48,17 @@ use rustos_user_abi::windows::{
 };
 
 use super::super::SyscallFrame;
+use super::api::WineNtApi;
 use super::Api;
 use crate::user::sysops::usermem;
 
 pub(crate) fn dispatch_syscall(frame: &mut SyscallFrame) -> u64 {
+    if let Some(nt_api) = WineNtApi::from_syscall_number(frame.rax) {
+        if !super::super::syscall_frame_security_check(frame) {
+            super::super::validate_syscall_entry_or_terminate(frame);
+        }
+        return super::nt_dispatch::dispatch_wine_nt_syscall(frame, nt_api);
+    }
     let api = match syscall_check(frame) {
         Ok(api) => api,
         Err(error) => return error,
@@ -116,7 +123,7 @@ pub(crate) fn dispatch_syscall(frame: &mut SyscallFrame) -> u64 {
     }
 }
 
-fn policy_status_to_ntstatus(status: u32) -> u64 {
+pub(super) fn policy_status_to_ntstatus(status: u32) -> u64 {
     match status {
         WIN32_ERROR_INVALID_FUNCTION => STATUS_INVALID_SYSTEM_SERVICE,
         WIN32_ERROR_INSUFFICIENT_BUFFER => STATUS_INFO_LENGTH_MISMATCH,
@@ -150,7 +157,7 @@ fn win32_offload_op(api: Api) -> u16 {
     }
 }
 
-fn stamp_windows_topology(request: &mut Win32SyscallOffloadRequest, online_mask: u64) {
+pub(super) fn stamp_windows_topology(request: &mut Win32SyscallOffloadRequest, online_mask: u64) {
     assert!(
         online_mask != 0
             && online_mask
@@ -197,7 +204,7 @@ fn apply_win32_mechanism(
     }
 }
 
-fn current_processor_number(online_mask: u64, logical_index: usize) -> u64 {
+pub(super) fn current_processor_number(online_mask: u64, logical_index: usize) -> u64 {
     let bit = 1_u64
         .checked_shl(u32::try_from(logical_index).expect("logical CPU index overflow"))
         .expect("logical CPU index exceeds affinity mask");
@@ -250,7 +257,7 @@ fn apply_query_process_affinity(request: &Win32SyscallOffloadRequest) -> u64 {
     1
 }
 
-fn affinity_error_to_ntstatus(error: crate::multitask::AffinityError) -> u64 {
+pub(super) fn affinity_error_to_ntstatus(error: crate::multitask::AffinityError) -> u64 {
     match error {
         crate::multitask::AffinityError::InvalidMask => STATUS_INVALID_PARAMETER,
         crate::multitask::AffinityError::MissingTask

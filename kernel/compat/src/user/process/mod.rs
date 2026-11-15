@@ -323,13 +323,20 @@ fn prepare_bootstrap_linux_process_with_launch(
 pub fn prepare_windows_process_with_address_space(
     metadata: WindowsProcessLoaderRuntime,
     address_space: ProcessAddressSpace,
-    launch: ProcessLaunchOptions<'_>,
+    mut launch: ProcessLaunchOptions<'_>,
     stack_top: u64,
 ) -> Result<PreparedProcessImage, ProcessLoadError> {
+    let entry = if metadata.runtime.bootstrap_entry_point != 0 {
+        launch.registers.rcx = 0;
+        launch.registers.rdx = metadata.entry_point;
+        metadata.runtime.bootstrap_entry_point
+    } else {
+        metadata.entry_point
+    };
     let loaded = LoadedProcessImage {
         abi: UserAbi::Windows,
         address_space,
-        entry: VirtAddr::new(metadata.entry_point),
+        entry: VirtAddr::new(entry),
         runtime: LoadedProcessRuntime::Windows(WindowsProcessImageInfo {
             runtime: metadata.runtime,
         }),

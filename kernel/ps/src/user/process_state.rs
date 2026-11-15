@@ -220,6 +220,7 @@ pub struct UserProcessState {
     linux_runtime_profile: Option<LinuxRuntimeProfile>,
     linux_sigactions: [LinuxSigAction; MAX_SIGNAL_NUMBER + 1],
     windows_runtime: Option<WindowsProcessRuntimeState>,
+    win32_objects: Win32ProcessObjects,
     handles: HandleTable,
     security: ProcessSecurityContext,
     mapping_cursor: u64,
@@ -281,6 +282,8 @@ pub struct WindowsProcessRuntimeState {
     pub loader_module_count: u32,
     pub loader_reserved: u32,
     pub main_module_entry_address: u64,
+    pub bootstrap_entry_point: u64,
+    pub kuser_shared_data_address: u64,
     pub command_line_w_ptr: u64,
     pub command_line_a_ptr: u64,
     pub environment_w_ptr: u64,
@@ -313,6 +316,41 @@ pub struct WindowsProcessRuntimeState {
     pub strerror_eio_ptr: u64,
     pub strerror_erange_ptr: u64,
     pub strerror_unknown_ptr: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Win32SectionObject {
+    pub handle: u64,
+    pub fd: Option<u64>,
+    pub size: u64,
+    pub protect: u64,
+    pub is_image: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Win32EventObject {
+    pub handle: u64,
+    pub signaled: bool,
+    pub manual_reset: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Win32MappedView {
+    pub base: u64,
+    pub size: u64,
+    pub allocation_base: u64,
+    pub state: u32,
+    pub protect: u32,
+    pub mem_type: u32,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Win32ProcessObjects {
+    pub next_section_seq: u64,
+    pub next_event_seq: u64,
+    pub sections: Vec<Win32SectionObject>,
+    pub events: Vec<Win32EventObject>,
+    pub vmas: Vec<Win32MappedView>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -430,6 +468,7 @@ impl UserProcessState {
             linux_runtime_profile,
             linux_sigactions: [LinuxSigAction::default(); MAX_SIGNAL_NUMBER + 1],
             windows_runtime,
+            win32_objects: Win32ProcessObjects::default(),
             handles: HandleTable::new(),
             security: ProcessSecurityContext::new(logical_admin),
             mapping_cursor: default_cursor,
@@ -869,6 +908,14 @@ impl UserProcessState {
         self.windows_runtime.as_mut()
     }
 
+    pub fn win32_objects(&self) -> &Win32ProcessObjects {
+        &self.win32_objects
+    }
+
+    pub fn win32_objects_mut(&mut self) -> &mut Win32ProcessObjects {
+        &mut self.win32_objects
+    }
+
     pub fn set_linux_signal_action(&mut self, signal: u64, action: LinuxSigAction) -> Option<()> {
         let index = usize::try_from(signal).ok()?;
         *self.linux_sigactions.get_mut(index)? = action;
@@ -923,6 +970,7 @@ impl UserProcessState {
             linux_runtime_profile: self.linux_runtime_profile.clone(),
             linux_sigactions: self.linux_sigactions,
             windows_runtime: self.windows_runtime,
+            win32_objects: self.win32_objects.clone(),
             handles: self.handles.clone(),
             security: self.security,
             mapping_cursor: self.mapping_cursor,
@@ -956,6 +1004,7 @@ impl UserProcessState {
             linux_runtime_profile,
             linux_sigactions,
             windows_runtime,
+            win32_objects,
             handles,
             security,
             mapping_cursor,
@@ -974,6 +1023,7 @@ impl UserProcessState {
             linux_runtime_profile,
             linux_sigactions,
             windows_runtime,
+            win32_objects,
             handles,
             security,
             mapping_cursor,

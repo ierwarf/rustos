@@ -37,6 +37,7 @@ pub(crate) const PR_SET_TIMERSLACK: u64 = 29;
 pub(crate) const PR_GET_TIMERSLACK: u64 = 30;
 pub(crate) const PR_SET_NO_NEW_PRIVS: u64 = 38;
 pub(crate) const PR_GET_NO_NEW_PRIVS: u64 = 39;
+pub(crate) const PR_GET_TID_ADDRESS: u64 = 40;
 #[cfg(test)]
 pub(crate) const PR_SET_VMA: u64 = 0x5356_4d41;
 
@@ -51,6 +52,7 @@ pub(crate) enum PrctlAction {
     GetName(u64),
     SetNoNewPrivs,
     GetNoNewPrivs,
+    GetTidAddress(u64),
     SetDumpable(bool),
     GetDumpable,
     Invalid,
@@ -68,6 +70,7 @@ pub(crate) fn decide(option: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> PrctlAc
         PR_GET_NO_NEW_PRIVS if a2 == 0 && a3 == 0 && a4 == 0 && a5 == 0 => {
             PrctlAction::GetNoNewPrivs
         }
+        PR_GET_TID_ADDRESS if a3 == 0 && a4 == 0 && a5 == 0 => PrctlAction::GetTidAddress(a2),
         // Only SUID_DUMP_DISABLE (0) and SUID_DUMP_USER (1) are valid.
         PR_SET_DUMPABLE if a2 <= 1 => PrctlAction::SetDumpable(a2 == 1),
         PR_GET_DUMPABLE => PrctlAction::GetDumpable,
@@ -184,6 +187,17 @@ pub(super) fn syscall_linux_prctl(option: u64, a2: u64, a3: u64, a4: u64, a5: u6
             u64::from(security.no_new_privs())
         })
         .unwrap_or_else(|| linux_errno(LINUX_EINVAL)),
+        PrctlAction::GetTidAddress(ptr) => {
+            let tid_addr = multitask::with_current_user_linux_state_mut(
+                |_, _, _, _, _, thread_state| thread_state.as_ref().map(|s| s.clear_child_tid),
+            )
+            .flatten()
+            .unwrap_or(0);
+            match usermem::write_current_user_struct(ptr, &tid_addr) {
+                Ok(()) => 0,
+                Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
+            }
+        }
         PrctlAction::SetDumpable(dumpable) => {
             match multitask::with_current_user_process_state_mut(|_, _, state| {
                 state.set_dumpable(dumpable)

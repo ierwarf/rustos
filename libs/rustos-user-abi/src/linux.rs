@@ -49,6 +49,9 @@ raw_u64! {
     SYS_FSTAT = linux::__NR_fstat;
     SYS_POLL = linux::__NR_poll;
     SYS_PPOLL = linux::__NR_ppoll;
+    SYS_SELECT = linux::__NR_select;
+    SYS_PSELECT6 = linux::__NR_pselect6;
+    SYS_TIME = linux::__NR_time;
     SYS_EPOLL_WAIT = linux::__NR_epoll_wait;
     SYS_EPOLL_PWAIT = linux::__NR_epoll_pwait;
     SYS_EPOLL_CTL = linux::__NR_epoll_ctl;
@@ -63,6 +66,7 @@ raw_u64! {
     SYS_RT_SIGRETURN = linux::__NR_rt_sigreturn;
     SYS_IOCTL = linux::__NR_ioctl;
     SYS_PREAD64 = linux::__NR_pread64;
+    SYS_READV = linux::__NR_readv;
     SYS_WRITEV = linux::__NR_writev;
     SYS_ACCESS = linux::__NR_access;
     SYS_SCHED_YIELD = linux::__NR_sched_yield;
@@ -90,7 +94,22 @@ raw_u64! {
     SYS_ARCH_PRCTL = linux::__NR_arch_prctl;
     SYS_PRCTL = linux::__NR_prctl;
     SYS_CLOCK_GETTIME = linux::__NR_clock_gettime;
+    SYS_CLOCK_GETRES = linux::__NR_clock_getres;
     SYS_CLOCK_NANOSLEEP = linux::__NR_clock_nanosleep;
+    SYS_GETTIMEOFDAY = linux::__NR_gettimeofday;
+    SYS_GETRUSAGE = linux::__NR_getrusage;
+    SYS_SYSINFO = linux::__NR_sysinfo;
+    SYS_TIMES = linux::__NR_times;
+    SYS_GETGROUPS = linux::__NR_getgroups;
+    SYS_GETRESUID = linux::__NR_getresuid;
+    SYS_GETRESGID = linux::__NR_getresgid;
+    SYS_GETPRIORITY = linux::__NR_getpriority;
+    SYS_SETPRIORITY = linux::__NR_setpriority;
+    SYS_SCHED_GETPARAM = linux::__NR_sched_getparam;
+    SYS_SCHED_GETSCHEDULER = linux::__NR_sched_getscheduler;
+    SYS_SCHED_GET_PRIORITY_MAX = linux::__NR_sched_get_priority_max;
+    SYS_SCHED_GET_PRIORITY_MIN = linux::__NR_sched_get_priority_min;
+    SYS_GETCPU = linux::__NR_getcpu;
     SYS_EXIT = linux::__NR_exit;
     SYS_EXIT_GROUP = linux::__NR_exit_group;
     SYS_TGKILL = linux::__NR_tgkill;
@@ -196,6 +215,7 @@ raw_u64! {
     F_SEAL_SHRINK = linux::F_SEAL_SHRINK;
     F_SEAL_GROW = linux::F_SEAL_GROW;
     F_SEAL_WRITE = linux::F_SEAL_WRITE;
+    F_SEAL_FUTURE_WRITE = linux::F_SEAL_FUTURE_WRITE;
     ARCH_SET_FS = linux::ARCH_SET_FS;
     F_OK = linux::F_OK;
     X_OK = linux::X_OK;
@@ -245,9 +265,19 @@ raw_u64! {
     CLOCK_REALTIME = linux::CLOCK_REALTIME;
     CLOCK_MONOTONIC = linux::CLOCK_MONOTONIC;
     TIMER_ABSTIME = linux::TIMER_ABSTIME;
+    RLIMIT_CPU = linux::RLIMIT_CPU;
+    RLIMIT_FSIZE = linux::RLIMIT_FSIZE;
+    RLIMIT_DATA = linux::RLIMIT_DATA;
     RLIMIT_STACK = linux::RLIMIT_STACK;
+    RLIMIT_CORE = linux::RLIMIT_CORE;
+    RLIMIT_RSS = linux::RLIMIT_RSS;
+    RLIMIT_NPROC = linux::RLIMIT_NPROC;
+    RLIMIT_NOFILE = linux::RLIMIT_NOFILE;
+    RLIMIT_MEMLOCK = linux::RLIMIT_MEMLOCK;
+    RLIMIT_AS = linux::RLIMIT_AS;
     FUTEX_WAIT = linux::FUTEX_WAIT;
     FUTEX_WAKE = linux::FUTEX_WAKE;
+    FUTEX_WAKE_OP = linux::FUTEX_WAKE_OP;
     FUTEX_WAIT_BITSET = linux::FUTEX_WAIT_BITSET;
     FUTEX_WAKE_BITSET = linux::FUTEX_WAKE_BITSET;
     FUTEX_REQUEUE = linux::FUTEX_REQUEUE;
@@ -689,6 +719,41 @@ pub struct LinuxRusage {
     pub ru_nsignals: i64,
     pub ru_nvcsw: i64,
     pub ru_nivcsw: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxSysinfo {
+    pub uptime: i64,
+    pub loads: [u64; 3],
+    pub totalram: u64,
+    pub freeram: u64,
+    pub sharedram: u64,
+    pub bufferram: u64,
+    pub totalswap: u64,
+    pub freeswap: u64,
+    pub procs: u16,
+    pub pad: u16,
+    pub _pad2: u32,
+    pub totalhigh: u64,
+    pub freehigh: u64,
+    pub mem_unit: u32,
+    pub _pad3: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxTms {
+    pub tms_utime: i64,
+    pub tms_stime: i64,
+    pub tms_cutime: i64,
+    pub tms_cstime: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LinuxSchedParam {
+    pub sched_priority: i32,
 }
 
 #[repr(C)]
@@ -1596,6 +1661,9 @@ mod tests {
 crate::user_wire!(LinuxMsghdr { msg_name: u64, msg_namelen: u32, __pad0: u32, msg_iov: u64, msg_iovlen: u64, msg_control: u64, msg_controllen: u64, msg_flags: u32, __pad1: u32 });
 crate::user_wire!(LinuxRusage { ru_utime: LinuxTimeval, ru_stime: LinuxTimeval, ru_maxrss: i64, ru_ixrss: i64, ru_idrss: i64, ru_isrss: i64, ru_minflt: i64, ru_majflt: i64, ru_nswap: i64, ru_inblock: i64, ru_oublock: i64, ru_msgsnd: i64, ru_msgrcv: i64, ru_nsignals: i64, ru_nvcsw: i64, ru_nivcsw: i64 });
 crate::user_wire!(LinuxTimeval { tv_sec: i64, tv_usec: i64 });
+crate::user_wire!(LinuxSysinfo { uptime: i64, loads: [u64; 3], totalram: u64, freeram: u64, sharedram: u64, bufferram: u64, totalswap: u64, freeswap: u64, procs: u16, pad: u16, _pad2: u32, totalhigh: u64, freehigh: u64, mem_unit: u32, _pad3: u32 });
+crate::user_wire!(LinuxTms { tms_utime: i64, tms_stime: i64, tms_cutime: i64, tms_cstime: i64 });
+crate::user_wire!(LinuxSchedParam { sched_priority: i32 });
 
 pub const SYS_RUSTOS_APP_BUFFER_BROKER: u64 = crate::syscall::SYS_RUSTOS_APP_BUFFER_BROKER;
 pub const SYS_RUSTOS_APP_BUFFER_ALLOC: u64 = crate::syscall::SYS_RUSTOS_APP_BUFFER_ALLOC;

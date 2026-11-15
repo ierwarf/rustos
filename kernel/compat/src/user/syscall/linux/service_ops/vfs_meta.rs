@@ -38,6 +38,41 @@ pub fn syscall_linux_vfs_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
     }
 }
 
+pub fn kernel_vfs_fstat(fd: u64) -> Result<linux_abi::LinuxStat, i64> {
+    if let Some(memfd) = current_memfd_handle(fd) {
+        let mut st = linux_abi::LinuxStat::default();
+        st.st_ino = crate::vfs_core::path_inode(memfd.path().as_bytes());
+        st.st_mode = 0o100_644;
+        st.st_nlink = 1;
+        st.st_size = memfd.len() as i64;
+        st.st_blksize = 4096;
+        return Ok(st);
+    }
+    let remote = current_remote_vfs_handle(fd).ok_or(LINUX_EBADF)?;
+    let mut request = new_vfs_request(VFS_IPC_OP_FSTAT);
+    request.fd = fd;
+    request.remote_id = remote.remote_id();
+    let response = call_pinned_remote_vfs_request(&request)?;
+    ensure_vfs_status(&response)?;
+    if response.payload_len as usize != LINUX_STAT_SIZE {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(read_unaligned::<linux_abi::LinuxStat>(&response.payload[..LINUX_STAT_SIZE]))
+}
+
+pub fn kernel_vfs_statx_path(path: &str) -> Result<linux_abi::LinuxStatx, i64> {
+    let mut request = new_vfs_request(VFS_IPC_OP_STATX);
+    proc_identity::attach_caller_exec_path(&mut request);
+    request.arg1 = 0x7ff;
+    populate_vfs_path_base(&mut request, linux_abi::AT_FDCWD as u64, path)?;
+    let response = call_pinned_remote_vfs_request(&request)?;
+    ensure_vfs_status(&response)?;
+    if response.payload_len as usize != LINUX_STATX_SIZE {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(read_unaligned::<linux_abi::LinuxStatx>(&response.payload[..LINUX_STATX_SIZE]))
+}
+
 pub fn syscall_linux_vfs_fstat(fd: u64, stat_ptr: u64) -> u64 {
     if let Some(result) = super::local_fd::fstat(fd, stat_ptr) {
         return result;

@@ -172,15 +172,68 @@ impl VfsState {
             };
         }
 
-        let metadata = lock_vfs_storage().metadata(path).inspect_err(|&errno| {
-            if !open_metadata_errno_is_routine(errno) {
-                debug_line(&format!(
-                    "vfsd: open failed stage=metadata errno={errno} path={path}"
-                ));
+        let metadata = match vfsd::proc_fs::lookup(path, request.pid) {
+            Some(Ok(node)) => {
+                const LINUX_O_NOFOLLOW: u64 = 0o400_000;
+                const ELOOP: i32 = 40;
+                match node {
+                    vfsd::proc_fs::ProcNode::SelfLink => {
+                        if flags & LINUX_O_NOFOLLOW != 0 {
+                            return Err(ELOOP);
+                        }
+                        Metadata {
+                            kind: RemoteKind::Directory,
+                            len: 0,
+                            inode: path_inode(path.as_bytes()),
+                        }
+                    }
+                    vfsd::proc_fs::ProcNode::PidDir => Metadata {
+                        kind: RemoteKind::Directory,
+                        len: 0,
+                        inode: path_inode(path.as_bytes()),
+                    },
+                    vfsd::proc_fs::ProcNode::ExeLink => {
+                        return Err(if flags & LINUX_O_NOFOLLOW != 0 {
+                            ELOOP
+                        } else {
+                            ENOENT
+                        });
+                    }
+                    file => {
+                        if flags & O_DIRECTORY != 0 {
+                            return Err(ENOTDIR);
+                        }
+                        if flags & (O_CREAT | O_TRUNC) != 0 {
+                            return Err(EROFS);
+                        }
+                        if flags & linux_abi::O_ACCMODE != linux_abi::O_RDONLY {
+                            return Err(EACCES);
+                        }
+                        let len = lock_vfs_storage().proc_virtual_file_bytes(file)?.len() as u64;
+                        Metadata {
+                            kind: RemoteKind::File,
+                            len,
+                            inode: path_inode(path.as_bytes()),
+                        }
+                    }
+                }
             }
-        })?;
+            Some(Err(errno)) => return Err(errno),
+            None => lock_vfs_storage().metadata(path).inspect_err(|&errno| {
+                if !open_metadata_errno_is_routine(errno) {
+                    debug_line(&format!(
+                        "vfsd: open failed stage=metadata errno={errno} path={path}"
+                    ));
+                }
+            })?,
+        };
         if flags & O_DIRECTORY != 0 && metadata.kind != RemoteKind::Directory {
             return Err(ENOTDIR);
+        }
+        if metadata.kind == RemoteKind::Directory
+            && flags & linux_abi::O_ACCMODE != linux_abi::O_RDONLY
+        {
+            return Err(EISDIR);
         }
         if flags & (O_CREAT | O_TRUNC) != 0 && metadata.kind != RemoteKind::Device {
             return Err(EROFS);
@@ -238,6 +291,13 @@ impl VfsState {
             if handle.kind == RemoteKind::Device && handle.path == "/dev/null" {
                 return Ok(0);
             }
+            if handle.kind == RemoteKind::Device
+                && matches!(handle.path.as_str(), "/dev/zero" | "/dev/full")
+            {
+                let count = len.min(dest.len());
+                dest[..count].fill(0);
+                return Ok(count);
+            }
             if handle.kind != RemoteKind::File {
                 return Err(EISDIR);
             }
@@ -265,8 +325,9 @@ impl VfsState {
                 return Ok(0);
             }
             let replay_len = replay_len as usize;
-            let read = lock_vfs_storage().read_file_slice_into(
+            let read = Self::read_slice_by_path(
                 path.as_str(),
+                request.pid,
                 file_len,
                 handle.last_start,
                 &mut dest[..replay_len],
@@ -282,7 +343,7 @@ impl VfsState {
         let read = if len == 0 {
             0
         } else {
-            lock_vfs_storage().read_file_slice_into(path.as_str(), file_len, start, &mut dest[..len])?
+            Self::read_slice_by_path(path.as_str(), request.pid, file_len, start, &mut dest[..len])?
         };
         if offset.is_none() {
             let mut candidate = self.handles.get(&id).cloned().ok_or(EBADF)?;
@@ -303,9 +364,64 @@ impl VfsState {
         }
         Ok(read)
     }
+
+    fn read_slice_by_path(
+        path: &str,
+        pid: u64,
+        file_len: u64,
+        start: u64,
+        dest: &mut [u8],
+    ) -> Result<usize, i32> {
+        let mut storage = lock_vfs_storage();
+        if let Some(Ok(node)) = vfsd::proc_fs::lookup(path, pid) {
+            if vfsd::proc_fs::is_virtual_file(node) {
+                return storage.read_proc_file_into(node, start, dest);
+            }
+        }
+        storage.read_file_slice_into(path, file_len, start, dest)
+    }
 }
 
 impl VfsStorage {
+    fn proc_virtual_file_bytes(&self, node: vfsd::proc_fs::ProcNode) -> Result<Vec<u8>, i32> {
+        use vfsd::proc_fs::{self, MemInfoSnapshot, ProcNode};
+        match node {
+            ProcNode::MeminfoFile => {
+                let mut info = linux_abi::LinuxSysinfo::default();
+                let status = unsafe {
+                    rustos_svc_runtime::syscall::syscall1(
+                        linux_abi::SYS_SYSINFO,
+                        (&mut info as *mut linux_abi::LinuxSysinfo) as u64,
+                    )
+                };
+                if status != 0 {
+                    return Err(EIO);
+                }
+                let unit = u64::from(info.mem_unit.max(1));
+                Ok(proc_fs::format_meminfo(&MemInfoSnapshot {
+                    mem_total_bytes: info.totalram.saturating_mul(unit),
+                    mem_free_bytes: info.freeram.saturating_mul(unit),
+                    buffers_bytes: info.bufferram.saturating_mul(unit),
+                    swap_total_bytes: info.totalswap.saturating_mul(unit),
+                    swap_free_bytes: info.freeswap.saturating_mul(unit),
+                }))
+            }
+            ProcNode::FilesystemsFile => Ok(proc_fs::format_filesystems().to_vec()),
+            ProcNode::MountsFile => Ok(proc_fs::format_mounts(self.volume.is_some())),
+            ProcNode::SelfLink | ProcNode::PidDir | ProcNode::ExeLink => Err(EINVAL),
+        }
+    }
+
+    fn read_proc_file_into(
+        &self,
+        node: vfsd::proc_fs::ProcNode,
+        start: u64,
+        dest: &mut [u8],
+    ) -> Result<usize, i32> {
+        let bytes = self.proc_virtual_file_bytes(node)?;
+        Ok(copy_file_cache_range(&bytes, start, dest))
+    }
+
     fn read_file_slice_into(
         &mut self,
         path: &str,
@@ -632,6 +748,7 @@ impl VfsState {
     fn render_getdents_payload(
         &mut self,
         id: u64,
+        caller_pid: u64,
         cursor: usize,
         user_len: usize,
         payload: &mut [u8],
@@ -648,7 +765,14 @@ impl VfsState {
             }
             handle.path.clone()
         };
-        let entries = lock_vfs_storage().dir_entries(path.as_str())?;
+        let entries = if let Some(Ok(
+            vfsd::proc_fs::ProcNode::PidDir | vfsd::proc_fs::ProcNode::SelfLink,
+        )) = vfsd::proc_fs::lookup(path.as_str(), caller_pid)
+        {
+            alloc::vec![DirEntry::new("mounts", RemoteKind::File)]
+        } else {
+            lock_vfs_storage().dir_entries(path.as_str())?
+        };
         let mut written = 0usize;
         let mut consumed = 0usize;
         for (index, entry) in entries.iter().enumerate().skip(cursor) {
@@ -675,6 +799,16 @@ impl VfsStorage {
                 len: 0,
                 inode: path_inode(path.as_bytes()),
             });
+        }
+        if path == "/sys" || path.starts_with("/sys/") {
+            if vfsd::proc_fs::sys_dir_children(path).is_some() {
+                return Ok(Metadata {
+                    kind: RemoteKind::Directory,
+                    len: 0,
+                    inode: path_inode(path.as_bytes()),
+                });
+            }
+            return Err(ENOENT);
         }
         if path.starts_with("/run/") {
             // `/run` is vfsd's volatile namespace, not a FAT directory: a path
@@ -743,6 +877,7 @@ impl VfsStorage {
             entries.push(DirEntry::new("dev", RemoteKind::Directory));
             entries.push(DirEntry::new("proc", RemoteKind::Directory));
             entries.push(DirEntry::new("run", RemoteKind::Directory));
+            entries.push(DirEntry::new("sys", RemoteKind::Directory));
         }
         if path == "/dev" || path == "/dev/input" || path == "/dev/dri" {
             match devmgrd_dir_entries(path) {
@@ -751,7 +886,22 @@ impl VfsStorage {
             }
         }
         if path == "/proc" {
+            entries.push(DirEntry::new("filesystems", RemoteKind::File));
+            entries.push(DirEntry::new("meminfo", RemoteKind::File));
+            entries.push(DirEntry::new("mounts", RemoteKind::File));
+            entries.push(DirEntry::new("self", RemoteKind::Directory));
             return Ok(entries);
+        }
+        if let Some(children) = vfsd::proc_fs::sys_dir_children(path) {
+            entries.extend(
+                children
+                    .iter()
+                    .map(|name| DirEntry::new(name, RemoteKind::Directory)),
+            );
+            return Ok(entries);
+        }
+        if path.starts_with("/sys/") {
+            return Err(ENOENT);
         }
         if self.run_dirs.contains(path) {
             entries.extend(

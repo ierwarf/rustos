@@ -82,6 +82,11 @@ use self::viewport::ViewportState;
 
 const WAYLAND_SOCKET_NAME: &str = "wayland-0";
 const LINUX_BTN_LEFT: u32 = 0x110;
+const LINUX_BTN_RIGHT: u32 = 0x111;
+const LINUX_BTN_MIDDLE: u32 = 0x112;
+const LINUX_BTN_SIDE: u32 = 0x113;
+const LINUX_BTN_EXTRA: u32 = 0x114;
+const WAYLAND_AXIS_PIXELS_PER_STEP: f64 = 15.0;
 const MAX_WAYLAND_SHM_POOL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WAYLAND_BUFFER_DIMENSION: usize = 8192;
 const MAX_WAYLAND_BUFFER_PIXELS: usize = MAX_WAYLAND_SHM_POOL_BYTES / 4;
@@ -572,6 +577,10 @@ impl WaylandCompositor {
         self.state.pointer_button(button, pressed)
     }
 
+    pub(crate) fn pointer_scroll(&mut self, vertical: i32, horizontal: i32) -> bool {
+        self.state.pointer_scroll(vertical, horizontal)
+    }
+
     pub(crate) fn set_keyboard_target(&mut self, surface_id: Option<u32>) {
         let focus = surface_id.and_then(|id| {
             let shared = self.state.find_surface_by_id(id)?;
@@ -597,6 +606,10 @@ impl WaylandCompositor {
 
     pub(crate) fn move_surface(&mut self, surface_id: u32, x: usize, y: usize) -> bool {
         self.state.move_surface(surface_id, x, y)
+    }
+
+    pub(crate) fn resize_surface(&mut self, surface_id: u32, frame: Rect) -> bool {
+        self.state.resize_surface(surface_id, frame)
     }
 
     pub(crate) fn set_surface_minimized(&mut self, surface_id: u32, minimized: bool) -> bool {
@@ -875,11 +888,23 @@ fn surface_damage_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> 
     })
 }
 
+fn linux_pointer_button_code(button: u32) -> Option<u32> {
+    Some(match button {
+        crate::sys::POINTER_BUTTON_LEFT => LINUX_BTN_LEFT,
+        crate::sys::POINTER_BUTTON_RIGHT => LINUX_BTN_RIGHT,
+        crate::sys::POINTER_BUTTON_MIDDLE => LINUX_BTN_MIDDLE,
+        crate::sys::POINTER_BUTTON_X1 => LINUX_BTN_SIDE,
+        crate::sys::POINTER_BUTTON_X2 => LINUX_BTN_EXTRA,
+        _ => return None,
+    })
+}
+
 impl WaylandState {
     fn pointer_button(&mut self, button: u32, pressed: bool) -> bool {
-        if button != 1 {
+        let Some(linux_button) = linux_pointer_button_code(button) else {
             return false;
-        }
+        };
+        let is_left = button == crate::sys::POINTER_BUTTON_LEFT;
 
         if pressed {
             let Some(hit) = self.hit_test_pointer(self.pointer_x, self.pointer_y) else {
@@ -891,24 +916,27 @@ impl WaylandState {
                 client_id: hit.client_id.clone(),
             }));
             self.update_pointer_focus(Some(hit));
-            self.pointer_button_down = true;
+            if is_left {
+                self.pointer_button_down = true;
+            }
             self.mark_dirty();
-        } else if self.moving_surface.take().is_some() {
+        } else if is_left && self.moving_surface.take().is_some() {
             self.pointer_button_down = false;
             self.pointer_grab_serial = None;
             let hit = self.hit_test_pointer(self.pointer_x, self.pointer_y);
             self.update_pointer_focus(hit);
             return true;
-        } else if self.drag.is_some() {
+        } else if is_left && self.drag.is_some() {
             self.pointer_button_down = false;
             self.pointer_grab_serial = None;
             self.drop_drag();
             let hit = self.hit_test_pointer(self.pointer_x, self.pointer_y);
             self.update_pointer_focus(hit);
             return true;
-        } else if !self.pointer_button_down {
-            return false;
-        } else {
+        } else if is_left {
+            if !self.pointer_button_down {
+                return false;
+            }
             self.pointer_button_down = false;
         }
         // Preserve Wayland input ordering: the latest coalesced coordinates
@@ -922,7 +950,9 @@ impl WaylandState {
         let serial = self.next_configure_serial();
         let time = self.event_time_ms();
         self.record_input_serial(serial, client_id.clone());
-        self.pointer_grab_serial = if pressed { Some(serial) } else { None };
+        if is_left {
+            self.pointer_grab_serial = if pressed { Some(serial) } else { None };
+        }
         let state = if pressed {
             wl_pointer::ButtonState::Pressed
         } else {
@@ -933,12 +963,63 @@ impl WaylandState {
             .iter()
             .filter(|pointer| pointer.client_id == client_id)
         {
-            pointer.resource.button(serial, time, LINUX_BTN_LEFT, state);
+            pointer.resource.button(serial, time, linux_button, state);
             if pointer.resource.version() >= 5 {
                 pointer.resource.frame();
             }
         }
         true
+    }
+
+    fn pointer_scroll(&mut self, vertical: i32, horizontal: i32) -> bool {
+        if vertical == 0 && horizontal == 0 {
+            return false;
+        }
+        self.flush_pointer_motion(true);
+        let Some(focus) = self.pointer_focus.as_ref() else {
+            return false;
+        };
+        let client_id = focus.client_id.clone();
+        let time = self.event_time_ms();
+        let mut emitted = false;
+        for pointer in self
+            .pointer_resources
+            .iter()
+            .filter(|pointer| pointer.client_id == client_id)
+        {
+            emitted = true;
+            if pointer.resource.version() >= 5 {
+                pointer.resource.axis_source(wl_pointer::AxisSource::Wheel);
+            }
+            if vertical != 0 {
+                // Linux evdev REL_WHEEL > 0 means scrolling up; Wayland vertical axis
+                // follows surface coordinates where negative values scroll up.
+                let value = -f64::from(vertical) * WAYLAND_AXIS_PIXELS_PER_STEP;
+                if pointer.resource.version() >= 5 {
+                    pointer
+                        .resource
+                        .axis_discrete(wl_pointer::Axis::VerticalScroll, -vertical);
+                }
+                pointer
+                    .resource
+                    .axis(time, wl_pointer::Axis::VerticalScroll, value);
+            }
+            if horizontal != 0 {
+                let value = f64::from(horizontal) * WAYLAND_AXIS_PIXELS_PER_STEP;
+                if pointer.resource.version() >= 5 {
+                    pointer
+                        .resource
+                        .axis_discrete(wl_pointer::Axis::HorizontalScroll, horizontal);
+                }
+                pointer
+                    .resource
+                    .axis(time, wl_pointer::Axis::HorizontalScroll, value);
+            }
+            if pointer.resource.version() >= 5 {
+                pointer.resource.frame();
+            }
+        }
+        emitted
     }
 }
 

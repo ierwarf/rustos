@@ -1,22 +1,22 @@
 use super::*;
 
-pub(super) const LINUX_EPERM: i64 = 1;
-pub(super) const LINUX_ENOENT: i64 = 2;
+pub(in crate::user::syscall) const LINUX_EPERM: i64 = 1;
+pub(in crate::user::syscall) const LINUX_ENOENT: i64 = 2;
 pub(super) const LINUX_ESRCH: i64 = 3;
 pub(super) const LINUX_EINTR: i64 = 4;
 pub(super) const LINUX_EIO: i64 = 5;
 pub(super) const LINUX_E2BIG: i64 = 7;
 pub(super) const LINUX_ENOEXEC: i64 = 8;
-pub(super) const LINUX_EBADF: i64 = 9;
+pub(in crate::user::syscall) const LINUX_EBADF: i64 = 9;
 pub(super) const LINUX_ECHILD: i64 = 10;
 pub(super) const LINUX_EAGAIN: i64 = 11;
-pub(super) const LINUX_ENOMEM: i64 = 12;
-pub(super) const LINUX_EACCES: i64 = 13;
+pub(in crate::user::syscall) const LINUX_ENOMEM: i64 = 12;
+pub(in crate::user::syscall) const LINUX_EACCES: i64 = 13;
 pub(super) const LINUX_EFAULT: i64 = 14;
 pub(super) const LINUX_EBUSY: i64 = 16;
 pub(super) const LINUX_EEXIST: i64 = 17;
 pub(super) const LINUX_ENODEV: i64 = 19;
-pub(super) const LINUX_ENOTDIR: i64 = 20;
+pub(in crate::user::syscall) const LINUX_ENOTDIR: i64 = 20;
 pub(super) const LINUX_EINVAL: i64 = 22;
 pub(super) const LINUX_EMFILE: i64 = 24;
 pub(super) const LINUX_ENOTTY: i64 = 25;

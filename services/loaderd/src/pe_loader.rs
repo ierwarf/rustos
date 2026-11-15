@@ -20,10 +20,15 @@ fn map_pe_segments_fd(
         4096,
     )
     .map_err(|err| pe_step_err(exec_path, "align-next-base", err))?;
-    preload_system_dlls(&registry, &mut modules, &mut next_base, deadline)
-        .map_err(|err| pe_step_err(exec_path, "preload-dlls", err))?;
-    resolve_import_closure(&mut main, &mut modules, &registry, &mut next_base, deadline)
-        .map_err(|err| pe_step_err(exec_path, "resolve-imports", err))?;
+    let wine_bootstrap_entry =
+        try_load_wine_ntdll(&registry, &mut modules, &mut next_base, deadline)
+            .map_err(|err| pe_step_err(exec_path, "load-wine-ntdll", err))?;
+    if wine_bootstrap_entry.is_none() {
+        preload_system_dlls(&registry, &mut modules, &mut next_base, deadline)
+            .map_err(|err| pe_step_err(exec_path, "preload-dlls", err))?;
+        resolve_import_closure(&mut main, &mut modules, &registry, &mut next_base, deadline)
+            .map_err(|err| pe_step_err(exec_path, "resolve-imports", err))?;
+    }
     let runtime = build_windows_runtime_blob(
         prepare_handle,
         &main,
@@ -32,12 +37,15 @@ fn map_pe_segments_fd(
         argv,
         env,
         next_base,
+        wine_bootstrap_entry,
     )
     .map_err(|err| pe_step_err(exec_path, "build-runtime-blob", err))?;
-    patch_crt_runtime_exports(&mut modules, &runtime)
-        .map_err(|err| pe_step_err(exec_path, "patch-crt-modules", err))?;
-    patch_crt_runtime_exports_for_main(&mut main, &runtime)
-        .map_err(|err| pe_step_err(exec_path, "patch-crt-main", err))?;
+    if wine_bootstrap_entry.is_none() {
+        patch_crt_runtime_exports(&mut modules, &runtime)
+            .map_err(|err| pe_step_err(exec_path, "patch-crt-modules", err))?;
+        patch_crt_runtime_exports_for_main(&mut main, &runtime)
+            .map_err(|err| pe_step_err(exec_path, "patch-crt-main", err))?;
+    }
     map_loaded_pe_module(prepare_handle, &main)
         .map_err(|err| pe_step_err(exec_path, "map-main-pages", err))?;
     for module in &modules {
@@ -50,6 +58,45 @@ fn map_pe_segments_fd(
         })?;
     }
     Ok(runtime)
+}
+
+fn try_load_wine_ntdll(
+    registry: &[SystemDllEntry],
+    modules: &mut Vec<LoadedPeModule>,
+    next_base: &mut u64,
+    deadline: AbsoluteDeadline,
+) -> Result<Option<u64>, i32> {
+    let Some(entry) = registry
+        .iter()
+        .find(|entry| dll_name_eq(entry.base_name.as_bytes(), b"ntdll.dll"))
+    else {
+        return Ok(None);
+    };
+    let fd = open_readonly(entry.path.as_str(), deadline)?;
+    let loaded = load_pe_image_fd(fd, entry.path.as_str(), *next_base, true);
+    let close_status = syscall1(SYS_CLOSE, fd as u64);
+    if close_status < 0 {
+        return Err((-close_status) as i32);
+    }
+    let module = loaded?;
+    let bootstrap_rva = module
+        .exports
+        .as_ref()
+        .and_then(|cache| lookup_export_by_name(cache, b"LdrInitializeThunk"))
+        .and_then(|target| match target {
+            ExportTarget::Address(rva) => Some(*rva as u64),
+            ExportTarget::Forwarder { .. } => None,
+        });
+    *next_base = align_up(
+        module
+            .load_base
+            .checked_add(module.image_size)
+            .ok_or(EOVERFLOW)?,
+        4096,
+    )?;
+    let entry_va = bootstrap_rva.map(|rva| module.load_base + rva);
+    modules.push(module);
+    Ok(entry_va)
 }
 
 fn pe_step_err(exec_path: &str, step: &str, errno: i32) -> i32 {
@@ -208,6 +255,10 @@ fn load_pe_image_fd(
         characteristics,
     )
     .map_err(byte_admission_errno)?;
+    if load_base != preferred_base {
+        let image_base_off = usize::try_from(optional_header_offset + 24).map_err(|_| EOVERFLOW)?;
+        image[image_base_off..image_base_off + 8].copy_from_slice(&load_base.to_le_bytes());
+    }
 
     let exports = build_export_cache(&image, directories[PE_DIRECTORY_EXPORT])?;
     Ok(LoadedPeModule {

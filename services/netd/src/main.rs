@@ -340,14 +340,35 @@ struct UnixStreamSegment {
     control: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum UnixAddress {
+    Filesystem(String),
+    Abstract(Vec<u8>),
+}
+
+impl UnixAddress {
+    fn as_filesystem_str(&self) -> Option<&str> {
+        match self {
+            Self::Filesystem(path) => Some(path.as_str()),
+            Self::Abstract(_) => None,
+        }
+    }
+}
+
+impl From<&str> for UnixAddress {
+    fn from(path: &str) -> Self {
+        Self::Filesystem(path.to_string())
+    }
+}
+
 #[derive(Debug)]
 struct UnixSocket {
     owner: Credentials,
     refs: usize,
     options: SocketOptions,
-    bound_path: Option<String>,
-    local_path: Option<String>,
-    peer_path: Option<String>,
+    bound_path: Option<UnixAddress>,
+    local_path: Option<UnixAddress>,
+    peer_path: Option<UnixAddress>,
     state: UnixSocketState,
 }
 
@@ -421,7 +442,8 @@ impl Default for SocketOptions {
 struct NetState {
     sockets: SocketTable<UnixSocket>,
     inet_sockets: SocketTable<InetSocket>,
-    bindings: BTreeMap<String, u64>,
+    bindings: BTreeMap<UnixAddress, u64>,
+    next_autobind_id: u64,
     unix_queued_bytes: usize,
     inet: Option<InetStack>,
     /// Per-socket readiness generation: the newest value published for that
@@ -438,6 +460,7 @@ impl NetState {
             sockets: SocketTable::new(),
             inet_sockets: SocketTable::new(),
             bindings: BTreeMap::new(),
+            next_autobind_id: 1,
             unix_queued_bytes: 0,
             inet: None,
             readiness_generations: BTreeMap::new(),

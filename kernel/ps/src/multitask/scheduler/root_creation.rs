@@ -176,13 +176,23 @@ impl Input {
                     }
                 }
                 if let Some(thread) = bootstrap.windows_thread_state
-                    && process::initialize_windows_thread_identifiers(
+                    && (process::initialize_windows_thread_identifiers(
                         state.address_space_mut(),
                         thread.teb_address,
                         id,
                         id,
                     )
                     .is_err()
+                        || process::initialize_windows_thread_stack(
+                            state.address_space_mut(),
+                            thread.teb_address,
+                            bootstrap.stack_pointer.as_u64(),
+                            bootstrap
+                                .user_stack
+                                .map(|stack| stack.committed_start)
+                                .unwrap_or(bootstrap.stack_pointer.as_u64().saturating_sub(0x1000)),
+                        )
+                        .is_err())
                 {
                     return None;
                 }

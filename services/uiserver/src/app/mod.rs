@@ -434,7 +434,37 @@ impl ConsoleWindow {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DragTarget {
     Console(ConsoleSessionHandle),
+    ConsoleResize {
+        session_handle: ConsoleSessionHandle,
+        edge: crate::layout::ResizeEdge,
+        start_x: u32,
+        start_y: u32,
+        start_frame: canvas::Rect,
+    },
     Wayland(u32),
+    WaylandResize {
+        surface_id: u32,
+        edge: crate::layout::ResizeEdge,
+        start_x: u32,
+        start_y: u32,
+        start_outer: canvas::Rect,
+    },
+}
+
+impl DragTarget {
+    pub(crate) fn console_session(self) -> Option<ConsoleSessionHandle> {
+        match self {
+            Self::Console(id) | Self::ConsoleResize { session_handle: id, .. } => Some(id),
+            Self::Wayland(_) | Self::WaylandResize { .. } => None,
+        }
+    }
+
+    pub(crate) fn wayland_surface(self) -> Option<u32> {
+        match self {
+            Self::Wayland(id) | Self::WaylandResize { surface_id: id, .. } => Some(id),
+            Self::Console(_) | Self::ConsoleResize { .. } => None,
+        }
+    }
 }
 
 impl AppState {
@@ -547,7 +577,7 @@ impl AppState {
                 .iter()
                 .zip(windows.iter())
                 .all(|(previous, next)| previous.surface_id == next.surface_id);
-        if let Some(DragTarget::Wayland(surface_id)) = self.dragging_window {
+        if let Some(surface_id) = self.dragging_window.and_then(DragTarget::wayland_surface) {
             if windows
                 .iter()
                 .all(|window| window.surface_id != surface_id || window.minimized)

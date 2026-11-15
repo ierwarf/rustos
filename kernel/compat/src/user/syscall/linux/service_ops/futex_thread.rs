@@ -102,6 +102,9 @@ pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, 
         c if c == linux_abi::FUTEX_CMP_REQUEUE => {
             futex_cmp_requeue(uaddr, val, timeout_ptr, uaddr2, val3, op)
         }
+        c if c == linux_abi::FUTEX_WAKE_OP => {
+            futex_wake_op(uaddr, val, timeout_ptr, uaddr2, val3, op)
+        }
         _ => Err(LINUX_ENOSYS),
     };
     let mut result = dispatch();
@@ -119,7 +122,9 @@ pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, 
         let word = size_of::<u32>();
         let second_word = matches!(
             cmd,
-            c if c == linux_abi::FUTEX_REQUEUE || c == linux_abi::FUTEX_CMP_REQUEUE
+            c if c == linux_abi::FUTEX_REQUEUE
+                || c == linux_abi::FUTEX_CMP_REQUEUE
+                || c == linux_abi::FUTEX_WAKE_OP
         );
         if usermem::validate_current_user_write_buffer(uaddr, word).is_err()
             || (second_word && usermem::validate_current_user_write_buffer(uaddr2, word).is_err())
@@ -161,8 +166,41 @@ fn validate_futex_policy_locally(op: u64, val3: u64) -> Result<(), i64> {
         c if c == linux_abi::FUTEX_WAIT_BITSET || c == linux_abi::FUTEX_WAKE_BITSET => {
             if val3 as u32 == 0 { Err(LINUX_EINVAL) } else { Ok(()) }
         }
+        c if c == linux_abi::FUTEX_WAKE_OP => decode_wake_op(val3 as u32).map(|_| ()),
         _ => Err(LINUX_ENOSYS),
     }
+}
+
+#[derive(Clone, Copy)]
+struct FutexWakeOp {
+    op: u8,
+    cmp: u8,
+    oparg: i32,
+    cmparg: i32,
+}
+
+fn sign_extend_12(bits: u32) -> i32 {
+    (((bits & 0xfff) as i32) << 20) >> 20
+}
+
+fn decode_wake_op(encoded: u32) -> Result<FutexWakeOp, i64> {
+    let raw_op = ((encoded >> 28) & 0xf) as u8;
+    let op = raw_op & 0x7;
+    let cmp = ((encoded >> 24) & 0xf) as u8;
+    if op > 4 || cmp > 5 {
+        return Err(LINUX_ENOSYS);
+    }
+    let mut oparg = sign_extend_12(encoded >> 12);
+    if raw_op & 0x8 != 0 {
+        oparg = 1_u32.wrapping_shl((oparg as u32) & 31) as i32;
+    }
+    let cmparg = sign_extend_12(encoded);
+    Ok(FutexWakeOp {
+        op,
+        cmp,
+        oparg,
+        cmparg,
+    })
 }
 
 fn current_process_is_syscalld_policy_owner() -> bool {
@@ -645,6 +683,87 @@ fn futex_cmp_requeue(
     })?;
     let woken = wake_selected_futex_tasks(&task_ids, wake_count);
     Ok((woken + requeued) as u64)
+}
+
+fn futex_wake_op(
+    uaddr: u64,
+    max_wake1: u64,
+    max_wake2: u64,
+    uaddr2: u64,
+    val3: u64,
+    op: u64,
+) -> Result<u64, i64> {
+    if (uaddr2 & 0x3) != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let decoded = decode_wake_op(val3 as u32)?;
+    let max_wake1 = futex_wake_limit(max_wake1);
+    let max_wake2 = futex_wake_limit(max_wake2);
+    let (_, address_space_root, retained) = current_futex_binding()?;
+    let mut task_ids1 = [0_u64; FUTEX_WAITERS_CAPACITY];
+    let mut task_ids2 = [0_u64; FUTEX_WAITERS_CAPACITY];
+    let (count1, count2) = retained.with_process_state(|process_state| {
+        let key1 = futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
+        let key2 = futex_key_for_process_state(process_state, address_space_root, uaddr2, op)?;
+        let mut waiters = FUTEX_WAITERS.lock();
+        let mut oldval = process_state
+            .address_space()
+            .atomic_load_user_u32(uaddr2)
+            .map_err(address_space_error_to_linux_errno)?;
+        loop {
+            let newval = match decoded.op {
+                0 => decoded.oparg as u32,
+                1 => oldval.wrapping_add(decoded.oparg as u32),
+                2 => oldval | (decoded.oparg as u32),
+                3 => oldval & !(decoded.oparg as u32),
+                _ => oldval ^ (decoded.oparg as u32),
+            };
+            match process_state
+                .address_space()
+                .atomic_compare_exchange_user_u32(uaddr2, oldval, newval)
+                .map_err(address_space_error_to_linux_errno)?
+            {
+                Ok(_) => break,
+                Err(observed) => oldval = observed,
+            }
+        }
+        let cond = match decoded.cmp {
+            0 => (oldval as i32) == decoded.cmparg,
+            1 => (oldval as i32) != decoded.cmparg,
+            2 => (oldval as i32) < decoded.cmparg,
+            3 => (oldval as i32) <= decoded.cmparg,
+            4 => (oldval as i32) > decoded.cmparg,
+            _ => (oldval as i32) >= decoded.cmparg,
+        };
+        let count1 = select_requeue_futex_waiters(
+            &mut waiters[..],
+            key1,
+            key1,
+            max_wake1,
+            0,
+            linux_abi::FUTEX_BITSET_MATCH_ANY,
+            &mut task_ids1,
+        )
+        .0;
+        let count2 = if cond {
+            select_requeue_futex_waiters(
+                &mut waiters[..],
+                key2,
+                key2,
+                max_wake2,
+                0,
+                linux_abi::FUTEX_BITSET_MATCH_ANY,
+                &mut task_ids2,
+            )
+            .0
+        } else {
+            0
+        };
+        Ok::<(usize, usize), i64>((count1, count2))
+    })?;
+    let woken1 = wake_selected_futex_tasks(&task_ids1, count1);
+    let woken2 = wake_selected_futex_tasks(&task_ids2, count2);
+    Ok((woken1 + woken2) as u64)
 }
 
 fn futex_requeue_inner(

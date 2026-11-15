@@ -890,6 +890,9 @@ fn write_windows_dll_registry(config: &Config, manifests: &[PackageManifest]) ->
                 .file_name()
                 .into_string()
                 .map_err(|_| anyhow!("non-utf8 DLL name in {}", artifact_dir.display()))?;
+            if !name.to_ascii_lowercase().ends_with(".dll") {
+                continue;
+            }
             lines.push(path_join_unix(&manifest.install.path, Path::new(&name))?);
         }
     }

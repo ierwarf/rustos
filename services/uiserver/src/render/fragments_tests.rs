@@ -322,7 +322,8 @@ fn fragmentation_budget_rejects_whole_candidate_and_recovers_without_poisoning_l
     );
     // Rejected scratch planning does not mutate a persistent allocator or
     // reserve commands from the next candidate.
-    let recovered = packed(&layers[..2], output, 2200, 256).unwrap();
+    // Reserved cursor texture (CURSOR_TEXTURE_SIZE=217) plus the 2048px output.
+    let recovered = packed(&layers[..2], output, 2300, 256).unwrap();
     assert_eq!(recovered.0.len(), 3);
 }
 

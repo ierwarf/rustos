@@ -1,9 +1,11 @@
 use super::{
     EpollCandidate, EpollScanMode, EpollTargetGuard, PollReadinessState, epoll_provider_events,
     epoll_report_events, select_epoll_events, acknowledge_epoll_wait_block, acquire_epoll_target_guard,
-    console_ready_events, epoll_ctl_requires_live_provider_epoch, linux_abi, multitask,
+    console_ready_events, decode_select_queries, encode_select_results,
+    epoll_ctl_requires_live_provider_epoch, linux_abi, multitask,
     note_poll_observation, provider_revoke_events, require_completed_provider_scan,
     sanitize_wait_signal_mask, waitset_provider_query_timeout_ms_from_ticks,
+    SELECT_POLLIN_EVENTS, SELECT_POLLOUT_EVENTS, SELECT_POLLEX_EVENTS,
 };
 use alloc::vec::Vec;
 use rustos_user_abi::linux::{SIGKILL, SIGSTOP};
@@ -260,4 +262,29 @@ fn epoll_exclusive_wire_constants_match_linux() {
     assert_eq!(linux_abi::EPOLLWAKEUP, 0x2000_0000);
     assert_eq!(linux_abi::EPOLLEXCLUSIVE, 0x1000_0000);
     assert_eq!(linux_abi::EPOLLRDHUP, 0x2000);
+}
+
+#[test]
+fn select_fd_sets_decode_and_encode_multiple_fds_and_clear_unready_bits() {
+    let read_words = [1_u64 << 0, 1_u64 << 1];
+    let write_words = [1_u64 << 0, 0];
+    let except_words = [0_u64, 1_u64 << 1];
+    let requests = decode_select_queries(70, &read_words, &write_words, &except_words);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].fd, 0);
+    assert_eq!(requests[0].events, SELECT_POLLIN_EVENTS | SELECT_POLLOUT_EVENTS);
+    assert_eq!(requests[1].fd, 65);
+    assert_eq!(requests[1].events, SELECT_POLLIN_EVENTS | SELECT_POLLEX_EVENTS);
+
+    // Notice fd=0 has both POLLIN and POLLOUT -> 2 ready bits, while fd=65 is unready.
+    let revents = [
+        (linux_abi::POLLIN as u32) | (linux_abi::POLLOUT as u32),
+        0,
+    ];
+    let (count, out_r, out_w, out_x) =
+        encode_select_results(&requests, &revents, 2, true, true, true);
+    assert_eq!(count, 2);
+    assert_eq!(out_r, alloc::vec![1_u64, 0_u64]);
+    assert_eq!(out_w, alloc::vec![1_u64, 0_u64]);
+    assert_eq!(out_x, alloc::vec![0_u64, 0_u64]);
 }

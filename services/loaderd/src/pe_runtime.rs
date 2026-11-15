@@ -213,6 +213,7 @@ fn build_windows_runtime_blob(
     argv: &[CString],
     env: &[CString],
     runtime_base_hint: u64,
+    wine_bootstrap_entry: Option<u64>,
 ) -> Result<RustosProcSetWindowsRuntimeBrokerArgs, i32> {
     let argv_strings = cstrings_to_strs(argv)?;
     let env_strings = cstrings_to_strs(env)?;
@@ -513,6 +514,76 @@ fn build_windows_runtime_blob(
         PROC_BROKER_MAP_PRIVATE | PROC_BROKER_MAP_READ | PROC_BROKER_MAP_WRITE,
     )?;
 
+    let (
+        final_runtime_size,
+        final_peb_address,
+        final_teb_address,
+        final_params_address,
+        final_teb_pid_ptr,
+        final_teb_tid_ptr,
+        bootstrap_entry_point,
+        kuser_shared_data_address,
+    ) = if let Some(bootstrap_entry) = wine_bootstrap_entry {
+        let mut cursor = runtime_base.checked_add(runtime_size).ok_or(EOVERFLOW)?;
+        let wine_peb_addr = cursor;
+        cursor = cursor.checked_add(4096).ok_or(EOVERFLOW)?;
+        let wine_teb_addr = cursor;
+        cursor = cursor.checked_add(4 * 4096).ok_or(EOVERFLOW)?;
+        let wine_kusd_addr = cursor;
+        // Keep one unmapped guard page before ProcessParameters so
+        // init_user_process_params -> NtFreeVirtualMemory(MEM_RELEASE)
+        // isolates and releases ProcessParameters safely.
+        cursor = cursor.checked_add(2 * 4096).ok_or(EOVERFLOW)?;
+        let wine_params_addr = cursor;
+
+        let wine_dos_exec_path = windows_dos_path_for_exec(exec_path);
+        let wine_dos_cmd = build_windows_command_line(
+            &argv_view
+                .iter()
+                .enumerate()
+                .map(|(i, s)| if i == 0 { wine_dos_exec_path.as_str() } else { *s })
+                .collect::<Vec<_>>(),
+        );
+        let params_size = build_and_map_wine_process_parameters(
+            prepare_handle,
+            wine_params_addr,
+            &wine_dos_exec_path,
+            &wine_dos_cmd,
+            environment_w.as_slice(),
+        )?;
+        let total_end = wine_params_addr.checked_add(params_size).ok_or(EOVERFLOW)?;
+        build_and_map_wine_peb_teb_kusd(
+            prepare_handle,
+            wine_peb_addr,
+            wine_teb_addr,
+            wine_kusd_addr,
+            wine_params_addr,
+            main.load_base,
+            public_runtime_address,
+        )?;
+        (
+            total_end - runtime_base,
+            wine_peb_addr,
+            wine_teb_addr,
+            wine_params_addr,
+            wine_teb_addr + 0x40,
+            wine_teb_addr + 0x48,
+            bootstrap_entry,
+            wine_kusd_addr,
+        )
+    } else {
+        (
+            runtime_size,
+            peb_address,
+            teb_address,
+            process_parameters_address,
+            teb_address + core::mem::offset_of!(TebLite, client_id_unique_process) as u64,
+            teb_address + core::mem::offset_of!(TebLite, client_id_unique_thread) as u64,
+            0,
+            0,
+        )
+    };
+
     Ok(RustosProcSetWindowsRuntimeBrokerArgs {
         abi_version: PROC_BROKER_ABI_VERSION,
         loader_module_count: loader_module_count as u32,
@@ -521,11 +592,11 @@ fn build_windows_runtime_blob(
         image_base: main.load_base,
         image_size: main.image_size,
         runtime_base,
-        runtime_size,
+        runtime_size: final_runtime_size,
         public_runtime_address,
-        peb_address,
-        teb_address,
-        process_parameters_address,
+        peb_address: final_peb_address,
+        teb_address: final_teb_address,
+        process_parameters_address: final_params_address,
         loader_data_address,
         loader_module_array_address,
         main_module_entry_address: main.entry_point,
@@ -561,12 +632,159 @@ fn build_windows_runtime_blob(
         strerror_eio_ptr,
         strerror_erange_ptr,
         strerror_unknown_ptr,
-        teb_process_id_ptr: teb_address
-            + core::mem::offset_of!(TebLite, client_id_unique_process) as u64,
-        teb_thread_id_ptr: teb_address
-            + core::mem::offset_of!(TebLite, client_id_unique_thread) as u64,
+        teb_process_id_ptr: final_teb_pid_ptr,
+        teb_thread_id_ptr: final_teb_tid_ptr,
+        bootstrap_entry_point,
+        kuser_shared_data_address,
         ..RustosProcSetWindowsRuntimeBrokerArgs::default()
     })
+}
+
+fn windows_dos_path_for_exec(exec_path: &str) -> String {
+    if let Some(rest) = exec_path.strip_prefix("/compat/windows/System32/") {
+        return format!("C:\\windows\\system32\\{}", rest.replace('/', "\\"));
+    }
+    if let Some(rest) = exec_path.strip_prefix("/compat/windows/") {
+        return format!("C:\\{}", rest.replace('/', "\\"));
+    }
+    format!("Z:{}", exec_path.replace('/', "\\"))
+}
+
+fn write_unicode_string(buf: &mut [u8], struct_off: usize, target_va: u64, text: &str, data_off: &mut usize) {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let byte_len = (units.len() * 2) as u16;
+    let max_len = byte_len.saturating_add(2);
+    *data_off = (*data_off + 1) & !1;
+    let str_va = target_va + *data_off as u64;
+    for u in units {
+        buf[*data_off..*data_off + 2].copy_from_slice(&u.to_le_bytes());
+        *data_off += 2;
+    }
+    buf[*data_off..*data_off + 2].copy_from_slice(&0_u16.to_le_bytes());
+    *data_off += 2;
+    buf[struct_off..struct_off + 2].copy_from_slice(&byte_len.to_le_bytes());
+    buf[struct_off + 2..struct_off + 4].copy_from_slice(&max_len.to_le_bytes());
+    buf[struct_off + 8..struct_off + 16].copy_from_slice(&str_va.to_le_bytes());
+}
+
+fn build_and_map_wine_process_parameters(
+    prepare_handle: u64,
+    params_addr: u64,
+    dos_image_path: &str,
+    dos_command_line: &str,
+    env_w_bytes: &[u8],
+) -> Result<u64, i32> {
+    let cur_dir = "C:\\windows\\system32\\";
+    let dll_path = "C:\\windows\\system32";
+    let needed = 1040
+        + (cur_dir.len() + dll_path.len() + dos_image_path.len() + dos_command_line.len() + 8) * 2
+        + env_w_bytes.len()
+        + 16;
+    let alloc_size = align_up(needed as u64, 4096)?;
+    let mut buf = vec![0_u8; alloc_size as usize];
+    let mut data_off = 1040_usize;
+
+    write_unicode_string(&mut buf, 56, params_addr, cur_dir, &mut data_off);
+    write_unicode_string(&mut buf, 80, params_addr, dll_path, &mut data_off);
+    write_unicode_string(&mut buf, 96, params_addr, dos_image_path, &mut data_off);
+    write_unicode_string(&mut buf, 112, params_addr, dos_command_line, &mut data_off);
+
+    data_off = (data_off + 7) & !7;
+    let env_va = params_addr + data_off as u64;
+    buf[data_off..data_off + env_w_bytes.len()].copy_from_slice(env_w_bytes);
+
+    buf[0..4].copy_from_slice(&(alloc_size as u32).to_le_bytes()); // AllocationSize
+    buf[4..8].copy_from_slice(&1040_u32.to_le_bytes()); // Size
+    buf[8..12].copy_from_slice(&1_u32.to_le_bytes()); // PROCESS_PARAMS_FLAG_NORMALIZED
+    buf[16..24].copy_from_slice(&0_u64.to_le_bytes()); // ConsoleHandle = 0 (skip conhost)
+    buf[32..40].copy_from_slice(&rustos_user_abi::windows::HANDLE_STDIN.to_le_bytes());
+    buf[40..48].copy_from_slice(&rustos_user_abi::windows::HANDLE_STDOUT.to_le_bytes());
+    buf[48..56].copy_from_slice(&rustos_user_abi::windows::HANDLE_STDERR.to_le_bytes());
+    buf[128..136].copy_from_slice(&env_va.to_le_bytes());
+    buf[1008..1016].copy_from_slice(&(env_w_bytes.len() as u64).to_le_bytes());
+
+    map_data_pages_from_image(
+        prepare_handle,
+        &buf,
+        0,
+        params_addr,
+        alloc_size,
+        PROC_BROKER_MAP_PRIVATE | PROC_BROKER_MAP_READ | PROC_BROKER_MAP_WRITE,
+    )?;
+    Ok(alloc_size)
+}
+
+fn build_and_map_wine_peb_teb_kusd(
+    prepare_handle: u64,
+    peb_addr: u64,
+    teb_addr: u64,
+    kusd_addr: u64,
+    params_addr: u64,
+    image_base: u64,
+    public_runtime_address: u64,
+) -> Result<(), i32> {
+    let mut peb = vec![0_u8; 4096];
+    peb[16..24].copy_from_slice(&image_base.to_le_bytes()); // ImageBaseAddress
+    // Leave LdrData = 0 so Wine's loader_init() sets peb->LdrData cleanly.
+    peb[32..40].copy_from_slice(&params_addr.to_le_bytes()); // ProcessParameters
+    peb[48..56].copy_from_slice(&HANDLE_PROCESS_HEAP.to_le_bytes()); // ProcessHeap
+    peb[144..152].copy_from_slice(&kusd_addr.to_le_bytes()); // SharedData
+    peb[184..188].copy_from_slice(&1_u32.to_le_bytes()); // NumberOfProcessors
+    peb[280..284].copy_from_slice(&10_u32.to_le_bytes()); // OSMajorVersion
+    peb[284..288].copy_from_slice(&0_u32.to_le_bytes()); // OSMinorVersion
+    peb[288..290].copy_from_slice(&19045_u16.to_le_bytes()); // OSBuildNumber
+    peb[292..296].copy_from_slice(&2_u32.to_le_bytes()); // OSPlatformId (VER_PLATFORM_WIN32_NT)
+    peb[296..300].copy_from_slice(&3_u32.to_le_bytes()); // ImageSubSystem (CUI)
+    map_data_pages_from_image(
+        prepare_handle,
+        &peb,
+        0,
+        peb_addr,
+        4096,
+        PROC_BROKER_MAP_PRIVATE | PROC_BROKER_MAP_READ | PROC_BROKER_MAP_WRITE,
+    )?;
+
+    let mut teb = vec![0_u8; 4 * 4096];
+    teb[0x28..0x30].copy_from_slice(&public_runtime_address.to_le_bytes()); // ArbitraryUserPointer
+    teb[0x30..0x38].copy_from_slice(&teb_addr.to_le_bytes()); // Tib.Self
+    teb[0x60..0x68].copy_from_slice(&peb_addr.to_le_bytes()); // Peb
+    teb[264..268].copy_from_slice(&0x0409_u32.to_le_bytes()); // CurrentLocale
+    map_data_pages_from_image(
+        prepare_handle,
+        &teb,
+        0,
+        teb_addr,
+        4 * 4096,
+        PROC_BROKER_MAP_PRIVATE | PROC_BROKER_MAP_READ | PROC_BROKER_MAP_WRITE,
+    )?;
+
+    let mut kusd = vec![0_u8; 4096];
+    kusd[0x004..0x008].copy_from_slice(&0x0100_0000_u32.to_le_bytes()); // TickCountMultiplier
+    let sysroot = "C:\\windows";
+    for (i, u) in sysroot.encode_utf16().enumerate() {
+        kusd[0x030 + i * 2..0x030 + i * 2 + 2].copy_from_slice(&u.to_le_bytes());
+    }
+    kusd[0x244..0x248].copy_from_slice(&0x0020_0000_u32.to_le_bytes()); // LargePageMinimum
+    kusd[0x260..0x264].copy_from_slice(&19045_u32.to_le_bytes()); // NtBuildNumber
+    kusd[0x264..0x268].copy_from_slice(&1_u32.to_le_bytes()); // NtProductType = WinNt
+    kusd[0x268] = 1; // ProductTypeIsValid
+    kusd[0x26a..0x26c].copy_from_slice(&9_u16.to_le_bytes()); // AMD64
+    kusd[0x26c..0x270].copy_from_slice(&10_u32.to_le_bytes()); // NtMajorVersion
+    kusd[0x270..0x274].copy_from_slice(&0_u32.to_le_bytes()); // NtMinorVersion
+    for feat in [2usize, 3, 6, 8, 9, 10, 12, 13, 14, 17, 23] {
+        kusd[0x274 + feat] = 1;
+    }
+    kusd[0x2d8..0x2dc].copy_from_slice(&1_u32.to_le_bytes()); // ActiveConsoleId
+    kusd[0x3c0..0x3c4].copy_from_slice(&1_u32.to_le_bytes()); // ActiveProcessorCount
+    map_data_pages_from_image(
+        prepare_handle,
+        &kusd,
+        0,
+        kusd_addr,
+        4096,
+        PROC_BROKER_MAP_PRIVATE | PROC_BROKER_MAP_READ,
+    )?;
+    Ok(())
 }
 
 #[derive(Clone)]

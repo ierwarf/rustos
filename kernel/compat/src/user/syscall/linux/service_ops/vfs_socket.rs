@@ -26,6 +26,8 @@ use rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT;
 
 const VFS_DEVICE_ACCESS_NULL: u16 = VFS_DEVICE_ACCESS_DRM_COMPAT + 1;
 const VFS_DEVICE_ACCESS_URANDOM: u16 = VFS_DEVICE_ACCESS_DRM_COMPAT + 2;
+const VFS_DEVICE_ACCESS_ZERO: u16 = VFS_DEVICE_ACCESS_DRM_COMPAT + 3;
+const VFS_DEVICE_ACCESS_FULL: u16 = VFS_DEVICE_ACCESS_DRM_COMPAT + 4;
 
 const PENDING_NETD_REF_CAPACITY: usize = 4096;
 const PENDING_NETD_REF_STORAGE_CAPACITY: usize = PENDING_NETD_REF_CAPACITY + 1;
@@ -222,11 +224,20 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
-    if let Some(result) = try_reopen_proc_self_memfd(path.as_str(), flags) {
-        return match result {
-            Ok(fd) => fd,
-            Err(errno) => linux_errno(errno),
-        };
+    match syscall_linux_vfs_openat_str(dirfd, path.as_str(), flags, mode) {
+        Ok(fd) => fd,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+pub fn syscall_linux_vfs_openat_str(
+    dirfd: u64,
+    path: &str,
+    flags: u64,
+    mode: u64,
+) -> Result<u64, i64> {
+    if let Some(result) = try_reopen_proc_self_memfd(path, flags) {
+        return result;
     }
     if path.contains("startup-programs") || path.contains("runtime-env") {
         crate::debug::info!(
@@ -243,24 +254,22 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
     // The proposed remote id is a boot-entropy-backed capability. vfsd owns
     // the object state, while dup/fork/transfer preserve this exact token.
     request.arg3 = mint_service_object_id();
-    if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
-        return linux_errno(errno);
-    }
+    populate_vfs_path_base(&mut request, dirfd, path)?;
     let response = match call_pinned_remote_vfs_request(&request) {
         Ok(response) => response,
         Err(errno) => {
             let _ = call_vfs_remote_close_bounded(request.arg3);
-            return linux_errno(errno);
+            return Err(errno);
         }
     };
     if let Err(errno) = ensure_vfs_status(&response) {
         let _ = call_vfs_remote_close_bounded(request.arg3);
-        return linux_errno(errno);
+        return Err(errno);
     }
     let remote_id = response.remote_id;
     if remote_id == 0 || remote_id != request.arg3 {
         let _ = call_vfs_remote_close_bounded(request.arg3);
-        return linux_errno(LINUX_EINVAL);
+        return Err(LINUX_EINVAL);
     }
     let kind = match response.handle_kind {
         VFS_IPC_HANDLE_KIND_FILE => multitask::RemoteVfsHandleKind::File,
@@ -268,7 +277,7 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
         VFS_IPC_HANDLE_KIND_DEVICE => multitask::RemoteVfsHandleKind::Device,
         _ => {
             let _ = call_vfs_remote_close_bounded(remote_id);
-            return linux_errno(LINUX_EINVAL);
+            return Err(LINUX_EINVAL);
         }
     };
     let handle_path = match response
@@ -281,7 +290,7 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
         }
         _ => {
             let _ = call_vfs_remote_close_bounded(remote_id);
-            return linux_errno(LINUX_EINVAL);
+            return Err(LINUX_EINVAL);
         }
     };
     // vfsd owns namespace resolution and declares whether the resolved node is
@@ -293,13 +302,12 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
             VFS_DEVICE_ACCESS_DRM_COMPAT
                 | VFS_DEVICE_ACCESS_NULL
                 | VFS_DEVICE_ACCESS_URANDOM
+                | VFS_DEVICE_ACCESS_ZERO
+                | VFS_DEVICE_ACCESS_FULL
         )
     {
         let _ = call_vfs_remote_close_bounded(remote_id);
-        return match open_device_via_devmgrd(handle_path.as_str(), flags) {
-            Ok(fd) => fd,
-            Err(errno) => linux_errno(errno),
-        };
+        return open_device_via_devmgrd(handle_path.as_str(), flags);
     }
     if let Err(errno) = register_remote_vfs_open_description(remote_id) {
         // EEXIST is a capability collision and must not close the already
@@ -308,7 +316,7 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
         if errno != LINUX_EEXIST {
             let _ = call_vfs_remote_close_bounded(remote_id);
         }
-        return linux_errno(errno);
+        return Err(errno);
     }
     let Some(remote_handle) = multitask::RemoteVfsHandle::new(
         remote_id,
@@ -318,7 +326,7 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
         response.aux as u16,
     ) else {
         release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
-        return linux_errno(LINUX_EOVERFLOW);
+        return Err(LINUX_EOVERFLOW);
     };
     let handle = multitask::KernelHandle::RemoteVfs(remote_handle);
     let installed = multitask::with_current_user_process_state_mut(|_, _, process_state| {
@@ -327,14 +335,14 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
             .install_with_open_flags(handle, flags)
     });
     match installed {
-        Some(Some(fd)) => fd,
+        Some(Some(fd)) => Ok(fd),
         Some(None) => {
             release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
-            linux_errno(LINUX_EMFILE)
+            Err(LINUX_EMFILE)
         }
         None => {
             release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
-            linux_errno(LINUX_EINVAL)
+            Err(LINUX_EINVAL)
         }
     }
 }
@@ -358,7 +366,7 @@ pub fn syscall_linux_vfs_close(fd: u64) -> u64 {
     0
 }
 
-pub fn syscall_linux_vfs_dup(oldfd: u64, newfd: u64, flags: u64, mode: VfsDupMode) -> u64 {
+pub(in crate::user::syscall::linux) fn syscall_linux_vfs_dup(oldfd: u64, newfd: u64, flags: u64, mode: VfsDupMode) -> u64 {
     if matches!(mode, VfsDupMode::Dup3) && (oldfd == newfd || flags & !linux_abi::O_CLOEXEC != 0) {
         return linux_errno(LINUX_EINVAL);
     }
@@ -689,28 +697,65 @@ pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
                 };
                 return read_input_device_via_inputd(fd, user_ptr, user_len, access, status_flags);
             }
-            VFS_DEVICE_ACCESS_NULL => {
-                let Ok(len) = usize::try_from(user_len) else {
-                    return linux_errno(LINUX_EINVAL);
-                };
-                if len > 0
-                    && let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, 1)
-                {
-                    return linux_errno(address_space_error_to_linux_errno(err));
+            access => {
+                if let Some(result) = try_read_virtual_device(access, user_ptr, user_len) {
+                    return result;
                 }
-                return 0;
             }
-            VFS_DEVICE_ACCESS_URANDOM => {
-                return super::super::syscalld_ops::syscall_linux_syscalld_getrandom(
-                    user_ptr,
-                    user_len,
-                    0,
-                );
-            }
-            _ => {}
         }
     }
     read_remote_vfs(fd, remote.remote_id(), user_ptr, user_len, None)
+}
+
+fn zero_fill_current_user(user_ptr: u64, user_len: u64) -> u64 {
+    const MAX_RW_COUNT: usize = 0x7fff_f000;
+    const ZEROS: [u8; 4096] = [0u8; 4096];
+    let Ok(len) = usize::try_from(user_len).map(|len| len.min(MAX_RW_COUNT)) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    let mut written = 0usize;
+    while written < len {
+        let chunk = (len - written).min(ZEROS.len());
+        let Some(dest_ptr) = user_ptr.checked_add(written as u64) else {
+            return if written > 0 {
+                written as u64
+            } else {
+                linux_errno(LINUX_EFAULT)
+            };
+        };
+        if let Err(err) = usermem::write_current_user_bytes(dest_ptr, &ZEROS[..chunk]) {
+            return if written > 0 {
+                written as u64
+            } else {
+                linux_errno(address_space_error_to_linux_errno(err))
+            };
+        }
+        written += chunk;
+    }
+    written as u64
+}
+
+fn try_read_virtual_device(access: u16, user_ptr: u64, user_len: u64) -> Option<u64> {
+    match access {
+        VFS_DEVICE_ACCESS_NULL => {
+            let Ok(len) = usize::try_from(user_len) else {
+                return Some(linux_errno(LINUX_EINVAL));
+            };
+            if len > 0
+                && let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, 1)
+            {
+                return Some(linux_errno(address_space_error_to_linux_errno(err)));
+            }
+            Some(0)
+        }
+        VFS_DEVICE_ACCESS_ZERO | VFS_DEVICE_ACCESS_FULL => {
+            Some(zero_fill_current_user(user_ptr, user_len))
+        }
+        VFS_DEVICE_ACCESS_URANDOM => Some(super::super::syscalld_ops::syscall_linux_syscalld_getrandom(
+            user_ptr, user_len, 0,
+        )),
+        _ => None,
+    }
 }
 
 fn current_console_handle_and_status_flags(fd: u64) -> Option<(multitask::ConsoleHandle, u64)> {
@@ -748,30 +793,105 @@ pub fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, offset: 
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
     };
-    if remote.kind() == multitask::RemoteVfsHandleKind::Device {
-        match remote.device_access() {
-            VFS_DEVICE_ACCESS_NULL => {
-                let Ok(len) = usize::try_from(user_len) else {
-                    return linux_errno(LINUX_EINVAL);
-                };
-                if len > 0
-                    && let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, 1)
-                {
-                    return linux_errno(address_space_error_to_linux_errno(err));
-                }
-                return 0;
-            }
-            VFS_DEVICE_ACCESS_URANDOM => {
-                return super::super::syscalld_ops::syscall_linux_syscalld_getrandom(
-                    user_ptr,
-                    user_len,
-                    0,
-                );
-            }
-            _ => {}
-        }
+    if remote.kind() == multitask::RemoteVfsHandleKind::Device
+        && let Some(result) = try_read_virtual_device(remote.device_access(), user_ptr, user_len)
+    {
+        return result;
     }
     read_remote_vfs(fd, remote.remote_id(), user_ptr, user_len, Some(offset))
+}
+
+pub fn kernel_vfs_result(raw: u64) -> Result<u64, i64> {
+    let signed = raw as i64;
+    if (-4095..=-1).contains(&signed) {
+        Err(-signed)
+    } else {
+        Ok(raw)
+    }
+}
+
+pub fn kernel_vfs_dup(oldfd: u64) -> Result<u64, i64> {
+    kernel_vfs_result(syscall_linux_vfs_dup(oldfd, 0, 0, VfsDupMode::Dup))
+}
+
+pub fn kernel_vfs_read_user(
+    fd: u64,
+    user_ptr: u64,
+    user_len: u64,
+    offset: Option<u64>,
+) -> Result<u64, i64> {
+    let raw = match offset {
+        Some(pos) => syscall_linux_vfs_pread64(fd, user_ptr, user_len, pos),
+        None => syscall_linux_vfs_read(fd, user_ptr, user_len),
+    };
+    kernel_vfs_result(raw)
+}
+
+pub fn kernel_vfs_write_user(fd: u64, user_ptr: u64, user_len: u64) -> Result<u64, i64> {
+    kernel_vfs_result(syscall_linux_vfs_write(fd, user_ptr, user_len))
+}
+
+pub fn kernel_vfs_pread_bytes(fd: u64, offset: u64, dest: &mut [u8]) -> Result<usize, i64> {
+    if dest.is_empty() {
+        return Ok(0);
+    }
+    if offset > i64::MAX as u64 {
+        return Err(LINUX_EINVAL);
+    }
+    if let Some((memfd, rights)) = current_memfd_handle_with_rights(fd) {
+        if !rights.allows_read() {
+            return Err(LINUX_EBADF);
+        }
+        let pos = usize::try_from(offset).map_err(|_| LINUX_EINVAL)?;
+        return Ok(memfd.read_at(pos, dest));
+    }
+    let remote = current_remote_vfs_handle(fd).ok_or(LINUX_EBADF)?;
+    let remote_id = remote.remote_id();
+    acquire_current_remote_vfs_ref(fd, remote_id)?;
+    let result = kernel_vfs_pread_bytes_pinned(fd, remote_id, offset, dest);
+    release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
+    result
+}
+
+fn kernel_vfs_pread_bytes_pinned(
+    fd: u64,
+    remote_id: u64,
+    offset: u64,
+    dest: &mut [u8],
+) -> Result<usize, i64> {
+    let mut copied = 0usize;
+    while copied < dest.len() {
+        let chunk_len = (dest.len() - copied).min(VFS_IPC_PAYLOAD_CAPACITY);
+        let chunk_offset = offset.checked_add(copied as u64).ok_or(LINUX_EOVERFLOW)?;
+        if chunk_offset > i64::MAX as u64 {
+            return if copied > 0 { Ok(copied) } else { Err(LINUX_EOVERFLOW) };
+        }
+        let mut request = new_vfs_request(VFS_IPC_OP_PREAD64);
+        request.fd = fd;
+        request.remote_id = remote_id;
+        request.arg0 = chunk_offset;
+        request.arg1 = chunk_len as u64;
+        let response = match call_vfs_ipc_request(&request) {
+            Ok(response) => response,
+            Err(errno) => return if copied > 0 { Ok(copied) } else { Err(errno) },
+        };
+        if let Err(errno) = ensure_vfs_status(&response) {
+            return if copied > 0 { Ok(copied) } else { Err(errno) };
+        }
+        let read = response.payload_len as usize;
+        if read > chunk_len || read > response.payload.len() {
+            return if copied > 0 { Ok(copied) } else { Err(LINUX_EINVAL) };
+        }
+        if read == 0 {
+            break;
+        }
+        dest[copied..copied + read].copy_from_slice(&response.payload[..read]);
+        copied += read;
+        if read < chunk_len {
+            break;
+        }
+    }
+    Ok(copied)
 }
 
 pub fn syscall_linux_vfs_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
@@ -831,7 +951,10 @@ pub fn syscall_linux_vfs_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
     if remote.kind() == multitask::RemoteVfsHandleKind::Device
         && matches!(
             remote.device_access(),
-            VFS_DEVICE_ACCESS_NULL | VFS_DEVICE_ACCESS_URANDOM
+            VFS_DEVICE_ACCESS_NULL
+                | VFS_DEVICE_ACCESS_URANDOM
+                | VFS_DEVICE_ACCESS_ZERO
+                | VFS_DEVICE_ACCESS_FULL
         )
     {
         let Ok(len) = usize::try_from(user_len) else {
@@ -843,9 +966,18 @@ pub fn syscall_linux_vfs_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
         {
             return linux_errno(address_space_error_to_linux_errno(err));
         }
+        if remote.device_access() == VFS_DEVICE_ACCESS_FULL && len > 0 {
+            return linux_errno(LINUX_ENOSPC);
+        }
         return len as u64;
     }
     write_remote_vfs(fd, remote.remote_id(), user_ptr, user_len)
+}
+
+pub fn syscall_linux_vfs_readv(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
+    vectored_io(fd, iov_ptr, iovcnt, |fd, ptr, len| {
+        syscall_linux_vfs_read(fd, ptr, len)
+    })
 }
 
 pub fn syscall_linux_vfs_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
@@ -1198,6 +1330,15 @@ fn write_remote_vfs(fd: u64, remote_id: u64, user_ptr: u64, user_len: u64) -> u6
 }
 
 fn writev_via_write(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
+    vectored_io(fd, iov_ptr, iovcnt, syscall_linux_vfs_write)
+}
+
+fn vectored_io(
+    fd: u64,
+    iov_ptr: u64,
+    iovcnt: u64,
+    mut step: impl FnMut(u64, u64, u64) -> u64,
+) -> u64 {
     const LINUX_UIO_MAXIOV: u64 = 1024;
     if iovcnt > LINUX_UIO_MAXIOV {
         return linux_errno(LINUX_EINVAL);
@@ -1221,9 +1362,9 @@ fn writev_via_write(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
                 };
             }
         };
-        let mut written_for_iov = 0_u64;
-        while written_for_iov < iov.iov_len {
-            let Some(chunk_ptr) = iov.iov_base.checked_add(written_for_iov) else {
+        let mut done_for_iov = 0_u64;
+        while done_for_iov < iov.iov_len {
+            let Some(chunk_ptr) = iov.iov_base.checked_add(done_for_iov) else {
                 return if total == 0 {
                     linux_errno(LINUX_EFAULT)
                 } else {
@@ -1231,8 +1372,8 @@ fn writev_via_write(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
                 };
             };
             let chunk_len =
-                (iov.iov_len - written_for_iov).min(VFS_IPC_REQUEST_PAYLOAD_CAPACITY as u64);
-            let result = syscall_linux_vfs_write(fd, chunk_ptr, chunk_len);
+                (iov.iov_len - done_for_iov).min(VFS_IPC_REQUEST_PAYLOAD_CAPACITY as u64);
+            let result = step(fd, chunk_ptr, chunk_len);
             if is_linux_error(result) {
                 return if total == 0 { result } else { total };
             }
@@ -1243,7 +1384,7 @@ fn writev_via_write(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
                 Some(value) => value,
                 None => return linux_errno(LINUX_EINVAL),
             };
-            written_for_iov = match written_for_iov.checked_add(result) {
+            done_for_iov = match done_for_iov.checked_add(result) {
                 Some(value) => value,
                 None => return linux_errno(LINUX_EINVAL),
             };

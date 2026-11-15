@@ -387,6 +387,83 @@ pub(super) fn syscall_linux_syscalld_setpgid(target_pid: u64, pgid: u64) -> u64 
     }
 }
 
+pub(super) fn syscall_linux_syscalld_getres_id(
+    op: u16,
+    ruid_ptr: u64,
+    euid_ptr: u64,
+    suid_ptr: u64,
+) -> u64 {
+    let response = match call_syscalld(new_syscalld_request(op)) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    if let Err(errno) = ensure_syscalld_payload(&response, 12) {
+        return linux_errno(errno);
+    }
+    let ids = [
+        u32::from_le_bytes(response.payload[0..4].try_into().unwrap()),
+        u32::from_le_bytes(response.payload[4..8].try_into().unwrap()),
+        u32::from_le_bytes(response.payload[8..12].try_into().unwrap()),
+    ];
+    for (ptr, val) in [(ruid_ptr, ids[0]), (euid_ptr, ids[1]), (suid_ptr, ids[2])] {
+        if ptr != 0 {
+            if let Err(err) = usermem::write_current_user_struct(ptr, &val) {
+                return linux_errno(user_pointer_error_to_linux_errno(err));
+            }
+        }
+    }
+    0
+}
+
+pub(super) fn syscall_linux_syscalld_getgroups(size: i64, list_ptr: u64) -> u64 {
+    if size < 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_GETGROUPS);
+    request.arg0 = size as u64;
+    if size > 0 {
+        if let Err(err) = usermem::validate_current_user_write_buffer(
+            list_ptr,
+            (size as usize).saturating_mul(size_of::<u32>()),
+        ) {
+            return linux_errno(user_pointer_error_to_linux_errno(err));
+        }
+    }
+    let response = match call_syscalld(request) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    if let Err(errno) = ensure_syscalld_payload(&response, size_of::<u32>()) {
+        return linux_errno(errno);
+    }
+    u32::from_le_bytes(response.payload[..4].try_into().unwrap()) as u64
+}
+
+pub(super) fn syscall_linux_syscalld_getpriority(which: u64, who: u64) -> u64 {
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_GETPRIORITY);
+    request.flags = which;
+    request.dirfd = who;
+    let response = match call_syscalld(request) {
+        Ok(response) => response,
+        Err(errno) => return linux_errno(errno),
+    };
+    if let Err(errno) = ensure_syscalld_payload(&response, size_of::<u64>()) {
+        return linux_errno(errno);
+    }
+    u64::from_le_bytes(response.payload[..8].try_into().unwrap())
+}
+
+pub(super) fn syscall_linux_syscalld_setpriority(which: u64, who: u64, prio: i64) -> u64 {
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_SETPRIORITY);
+    request.flags = which;
+    request.dirfd = who;
+    request.arg0 = prio as i32 as u64;
+    match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response)) {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
 pub(super) fn syscall_linux_syscalld_getrandom(user_ptr: u64, user_len: u64, flags: u64) -> u64 {
     // Linux clamps a single read-style request to MAX_RW_COUNT. Without the
     // clamp an attacker-sized length keeps this thread in a service round trip

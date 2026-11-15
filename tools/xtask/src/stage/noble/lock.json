@@ -580,6 +580,13 @@
     "9d5aba1eeb471c1230a94eb1865a95df0595ed8311971acf50fff2652452562d",
     2648360
   ],
+  "libreadline8t64": [
+    "noble",
+    "main",
+    "pool/main/r/readline/libreadline8t64_8.2-4build1_amd64.deb",
+    "563977a16df03b611f5239cc1e9a0426e86479fcc616b5c9e200ea32063119e5",
+    152856
+  ],
   "libselinux1": [
     "noble-updates",
     "main",
@@ -635,6 +642,13 @@
     "pool/main/libt/libthai/libthai0_0.1.29-2build1_amd64.deb",
     "5ada7045c5f84a4b774e6449151800aa6470e8d01dc9d6124ef4a44ae6af5508",
     18914
+  ],
+  "libtinfo6": [
+    "noble-updates",
+    "main",
+    "pool/main/n/ncurses/libtinfo6_6.4+20240113-1ubuntu2.2_amd64.deb",
+    "b67a6df2bdab61d273eabebd208bb6a3fb12618a390a067e1ee305a409ff03d9",
+    108086
   ],
   "libts0t64": [
     "noble",

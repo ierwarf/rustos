@@ -238,17 +238,18 @@ fn futex_requeue_counts_are_c_ints_from_the_timeout_register() {
 }
 
 #[test]
-fn futex_op_validation_precedes_alignment_and_wake_op_is_unimplemented() {
+fn futex_op_validation_precedes_alignment_and_wake_op_validates_encoding() {
     assert_eq!(
         validate_futex_policy_locally(linux_abi::FUTEX_WAKE_BITSET, 0),
         Err(LINUX_EINVAL)
     );
-    // FUTEX_WAKE_OP (5) is not implemented here and stays ENOSYS.
-    assert_eq!(validate_futex_policy_locally(5, 0), Err(LINUX_ENOSYS));
+    // FUTEX_WAKE_OP (5) accepts valid encoded op/cmp and rejects invalid sub-ops with ENOSYS.
+    assert_eq!(validate_futex_policy_locally(5, 0), Ok(()));
+    assert_eq!(validate_futex_policy_locally(5, 7 << 28), Err(LINUX_ENOSYS));
     // FUTEX_CLOCK_REALTIME is valid only with WAIT_BITSET.
     assert_eq!(
         validate_futex_policy_locally(linux_abi::FUTEX_WAIT | linux_abi::FUTEX_CLOCK_REALTIME, 1),
         Err(LINUX_ENOSYS)
     );
-    assert_eq!(futex_impl(2, 5, 0, 0, 0, 0), linux_errno(LINUX_ENOSYS));
+    assert_eq!(futex_impl(2, 5, 0, 0, 0, 0), linux_errno(LINUX_EINVAL));
 }

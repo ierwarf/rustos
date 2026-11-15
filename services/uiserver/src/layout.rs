@@ -34,11 +34,11 @@ pub(crate) const HOME_LABEL_HEIGHT: usize = 20;
 pub(crate) const HOME_CELL_BOTTOM_PADDING: usize = 24;
 // The clock sits at the top of the home screen and the app grid starts below
 // it, like a tablet. The time's height matches the clock face's line height.
-pub(crate) const HOME_CLOCK_TOP_PADDING: usize = 16;
+pub(crate) const HOME_CLOCK_TOP_PADDING: usize = 52;
 pub(crate) const HOME_CLOCK_TIME_HEIGHT: usize = 107;
 pub(crate) const HOME_CLOCK_DATE_GAP: usize = 2;
 pub(crate) const HOME_CLOCK_DATE_HEIGHT: usize = 22;
-pub(crate) const HOME_CLOCK_BOTTOM_GAP: usize = 30;
+pub(crate) const HOME_CLOCK_BOTTOM_GAP: usize = 68;
 pub(crate) const HOME_CLOCK_BLOCK_HEIGHT: usize = HOME_CLOCK_TOP_PADDING
     + HOME_CLOCK_TIME_HEIGHT
     + HOME_CLOCK_DATE_GAP
@@ -355,6 +355,91 @@ pub(crate) enum WindowChromeHit {
     Close,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResizeEdge {
+    pub(crate) left: bool,
+    pub(crate) right: bool,
+    pub(crate) bottom: bool,
+}
+
+const RESIZE_BORDER_PX: usize = 6;
+const RESIZE_CORNER_PX: usize = 12;
+
+/// Detect whether a pointer position inside `outer` lies on a resizable border
+/// or bottom corner. Excludes the title bar band so title dragging and caption
+/// buttons keep priority.
+pub(crate) fn window_resize_hit(outer: Rect, x: u32, y: u32) -> Option<ResizeEdge> {
+    if !outer.contains(x, y) {
+        return None;
+    }
+    let px = x as usize;
+    let py = y as usize;
+    let title_bottom = outer.y + WINDOW_BORDER + WINDOW_TITLE_HEIGHT;
+    if py < title_bottom {
+        return None;
+    }
+    let right_edge = outer.x + outer.width;
+    let bottom_edge = outer.y + outer.height;
+    let near_bottom = py >= bottom_edge.saturating_sub(RESIZE_BORDER_PX);
+    let corner_y = py >= bottom_edge.saturating_sub(RESIZE_CORNER_PX);
+    let left_margin = if corner_y { RESIZE_CORNER_PX } else { RESIZE_BORDER_PX };
+    let right_margin = if corner_y { RESIZE_CORNER_PX } else { RESIZE_BORDER_PX };
+    let left = px < outer.x + left_margin;
+    let right = !left && px >= right_edge.saturating_sub(right_margin);
+    let bottom = near_bottom || (corner_y && (left || right));
+    (left || right || bottom).then_some(ResizeEdge {
+        left,
+        right,
+        bottom,
+    })
+}
+
+/// Compute a new window rectangle when dragging `edge` by `(dx, dy)` relative
+/// to `start`, respecting `min_w`/`min_h` and desktop `bounds`.
+pub(crate) fn resized_window_rect(
+    start: Rect,
+    edge: ResizeEdge,
+    dx: i64,
+    dy: i64,
+    min_w: usize,
+    min_h: usize,
+    bounds: Rect,
+) -> Rect {
+    let start_left = start.x as i64;
+    let start_right = (start.x + start.width) as i64;
+    let start_top = start.y as i64;
+    let start_bottom = (start.y + start.height) as i64;
+    let bounds_left = bounds.x as i64;
+    let bounds_right = (bounds.x + bounds.width) as i64;
+    let bounds_bottom = (bounds.y + bounds.height) as i64;
+    let min_w = min_w.min(bounds.width) as i64;
+    let min_h = min_h.min(bounds.height) as i64;
+
+    let (x, width) = if edge.left {
+        let next_left = (start_left + dx).clamp(bounds_left, start_right - min_w);
+        (next_left as usize, (start_right - next_left) as usize)
+    } else if edge.right {
+        let next_right = (start_right + dx).clamp(start_left + min_w, bounds_right);
+        (start.x, (next_right - start_left) as usize)
+    } else {
+        (start.x, start.width)
+    };
+
+    let height = if edge.bottom {
+        let next_bottom = (start_bottom + dy).clamp(start_top + min_h, bounds_bottom);
+        (next_bottom - start_top) as usize
+    } else {
+        start.height
+    };
+
+    Rect {
+        x,
+        y: start.y,
+        width,
+        height,
+    }
+}
+
 /// Classify a pointer position that is inside `outer`. The caption buttons win
 /// over the title bar they sit in, so the rest of the title bar is the drag
 /// handle and a button is never mistaken for a drag.
@@ -608,10 +693,10 @@ mod tests {
     fn home_grid_is_centered_and_stays_between_the_rails() {
         let (width, height) = (1600_u32, 900_u32);
         let bounds = desktop_bounds(width, height);
-        let cells = home_cells(width, height, 36);
+        let cells = home_cells(width, height, 27);
         assert_eq!(
             cells.len(),
-            36,
+            27,
             "one full-size home page fits under the clock"
         );
         assert_eq!(
@@ -636,8 +721,8 @@ mod tests {
     #[test]
     fn a_long_launcher_list_shrinks_the_grid_instead_of_dropping_launchers() {
         let (width, height) = (1600_u32, 900_u32);
-        // A full-size page holds 36 launchers (9 columns, 4 rows) under the clock.
-        for count in [37_usize, 48, 90, 130] {
+        // A full-size page holds 27 launchers (9 columns, 3 rows) under the clock.
+        for count in [28_usize, 36, 48, 90, 130] {
             let cells = home_cells(width, height, count);
             assert_eq!(cells.len(), count, "all {count} launchers stay visible");
             assert!(cells[0].icon.width < HOME_ICON_SIZE, "the grid scaled down");
@@ -821,16 +906,21 @@ mod tests {
         let (width, height) = (1600_u32, 900_u32);
         let bounds = desktop_bounds(width, height);
         let clock = home_clock(width, height).expect("a 1600x900 display shows a clock");
+        assert_eq!(clock.time.y - bounds.y, HOME_CLOCK_TOP_PADDING);
         assert!(clock.time.y >= bounds.y && clock.date.y >= clock.time.y + clock.time.height);
         assert_eq!((clock.time.x, clock.time.width), (bounds.x, bounds.width));
 
         for count in [1_usize, 20, 36, 90] {
             let cells = home_cells(width, height, count);
             assert!(!cells.is_empty());
+            assert_eq!(
+                cells[0].cell.y - (clock.date.y + clock.date.height),
+                HOME_CLOCK_BOTTOM_GAP
+            );
             for home in &cells {
                 assert!(
-                    home.cell.y >= clock.date.y + clock.date.height,
-                    "apps start below the date"
+                    home.cell.y >= clock.date.y + clock.date.height + HOME_CLOCK_BOTTOM_GAP,
+                    "apps start below the clock block padding"
                 );
             }
         }
@@ -852,5 +942,51 @@ mod tests {
         );
         // Narrow.
         assert!(home_clock(200, 900).is_none());
+    }
+
+    #[test]
+    fn resize_hit_and_rect_respect_titlebar_corners_and_bounds() {
+        let outer = Rect {
+            x: 100,
+            y: 80,
+            width: 600,
+            height: 400,
+        };
+        assert_eq!(window_resize_hit(outer, 102, 84), None);
+        assert_eq!(
+            window_resize_hit(outer, 102, 200),
+            Some(ResizeEdge {
+                left: true,
+                right: false,
+                bottom: false,
+            })
+        );
+        assert_eq!(
+            window_resize_hit(outer, 695, 475),
+            Some(ResizeEdge {
+                left: false,
+                right: true,
+                bottom: true,
+            })
+        );
+        assert_eq!(window_resize_hit(outer, 300, 200), None);
+
+        let bounds = desktop_bounds(1920, 1080);
+        let shrunk = resized_window_rect(
+            outer,
+            ResizeEdge {
+                left: true,
+                right: false,
+                bottom: true,
+            },
+            500,
+            -300,
+            MIN_WINDOW_WIDTH,
+            MIN_WINDOW_HEIGHT,
+            bounds,
+        );
+        assert_eq!(shrunk.width, MIN_WINDOW_WIDTH);
+        assert_eq!(shrunk.height, MIN_WINDOW_HEIGHT);
+        assert_eq!(shrunk.x + shrunk.width, outer.x + outer.width);
     }
 }

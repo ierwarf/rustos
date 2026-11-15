@@ -549,6 +549,10 @@ pub(super) fn syscall_linux_rustos_proc_set_windows_runtime_broker(args_ptr: u64
         || args.image_base % PAGE_SIZE != 0
         || args.image_size % PAGE_SIZE != 0
         || !range_contains(args.image_base, args.image_size, args.entry_point, 1)
+        || (args.bootstrap_entry_point != 0
+            && !user_span_in_window(args.bootstrap_entry_point, 1))
+        || (args.kuser_shared_data_address != 0
+            && !range_contains(runtime_base, runtime_size, args.kuser_shared_data_address, 4096))
         || !range_contains(runtime_base, runtime_size, args.public_runtime_address, 1)
         || !range_contains(runtime_base, runtime_size, args.peb_address, 1)
         || !range_contains(runtime_base, runtime_size, args.teb_address, 1)
@@ -595,6 +599,8 @@ pub(super) fn syscall_linux_rustos_proc_set_windows_runtime_broker(args_ptr: u64
             loader_module_count: args.loader_module_count,
             loader_reserved: 0,
             main_module_entry_address: args.main_module_entry_address,
+            bootstrap_entry_point: args.bootstrap_entry_point,
+            kuser_shared_data_address: args.kuser_shared_data_address,
             command_line_w_ptr: args.command_line_w_ptr,
             command_line_a_ptr: args.command_line_a_ptr,
             environment_w_ptr: args.environment_w_ptr,
@@ -1401,7 +1407,23 @@ pub(super) fn syscall_linux_rustos_proc_signal_queue_broker(args_ptr: u64) -> u6
     }
     match queued {
         Ok(true) => 0,
-        Ok(false) => linux_errno(LINUX_ESRCH),
+        Ok(false) => {
+            if let Some(target_abi) =
+                multitask::user_target_abi_if_alive(args.target_pid, args.target_tid)
+            {
+                if args.signal == 0 {
+                    return 0;
+                }
+                if target_abi == multitask::UserAbi::Windows
+                    && args.sender_pid != args.target_pid
+                    && args.signal == linux_abi::SIGKILL as u32
+                {
+                    terminate_process_once_and_finalize(args.target_pid);
+                    return 0;
+                }
+            }
+            linux_errno(LINUX_ESRCH)
+        }
         Err(()) => linux_errno(LINUX_EAGAIN),
     }
 }

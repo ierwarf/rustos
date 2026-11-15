@@ -764,106 +764,198 @@ fn build_userspace_manifests(config: &Config, manifests: &[PackageManifest]) -> 
     })
 }
 
+const WINE_CORE_DLL_TARGETS: &[(&str, &str)] = &[
+    ("apisetschema.dll", "dlls/apisetschema/x86_64-windows/apisetschema.dll"),
+    ("ntdll.dll", "dlls/ntdll/x86_64-windows/ntdll.dll"),
+    ("kernelbase.dll", "dlls/kernelbase/x86_64-windows/kernelbase.dll"),
+    ("kernel32.dll", "dlls/kernel32/x86_64-windows/kernel32.dll"),
+    ("msvcrt.dll", "dlls/msvcrt/x86_64-windows/msvcrt.dll"),
+    ("ucrtbase.dll", "dlls/ucrtbase/x86_64-windows/ucrtbase.dll"),
+    ("vcruntime140.dll", "dlls/vcruntime140/x86_64-windows/vcruntime140.dll"),
+    ("vcruntime140_1.dll", "dlls/vcruntime140_1/x86_64-windows/vcruntime140_1.dll"),
+];
+
+const WINE_NLS_FILES: &[&str] = &[
+    "locale.nls",
+    "l_intl.nls",
+    "c_037.nls",
+    "c_437.nls",
+    "c_1252.nls",
+    "c_20127.nls",
+    "c_28591.nls",
+    "c_949.nls",
+    "normnfc.nls",
+    "normnfd.nls",
+    "normnfkc.nls",
+    "normnfkd.nls",
+    "normidna.nls",
+    "sortdefault.nls",
+];
+
+fn collect_wine_dll_inputs(
+    config: &Config,
+    manifest: &PackageManifest,
+    wine_source_dir: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut inputs = vec![
+        manifest.manifest_path.clone(),
+        config.root_dir.join("tools/xtask/src/build/mod.rs"),
+        wine_source_dir.join("RUSTOS-PATCHES.md"),
+        wine_source_dir.join("VERSION"),
+        wine_source_dir.join("configure"),
+        wine_source_dir.join("include/wine/asm.h"),
+        wine_source_dir.join("include/winternl.h"),
+    ];
+    for dll_dir in [
+        "apisetschema",
+        "ntdll",
+        "kernelbase",
+        "kernel32",
+        "msvcrt",
+        "ucrtbase",
+        "vcruntime140",
+        "vcruntime140_1",
+    ] {
+        let dir = wine_source_dir.join("dlls").join(dll_dir);
+        if dir.is_dir() {
+            for entry in fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.is_file()
+                    && matches!(
+                        path.extension().and_then(|ext| ext.to_str()),
+                        Some("c" | "h" | "spec" | "s" | "in")
+                    )
+                {
+                    inputs.push(path);
+                }
+            }
+        }
+    }
+    for nls in WINE_NLS_FILES {
+        inputs.push(wine_source_dir.join("nls").join(nls));
+    }
+    inputs.sort();
+    Ok(inputs)
+}
+
 fn build_windows_system_dlls(config: &Config, manifest: &PackageManifest) -> Result<()> {
+    let wine_source_dir = config.root_dir.join("vendor/wine");
+    if !wine_source_dir.join("configure").is_file() {
+        bail!(
+            "missing Wine 11.22 source tree at {}",
+            wine_source_dir.display()
+        );
+    }
+
     let artifact_dir = manifest.artifact_path(config);
-    let winsys_dir = &manifest.package_root;
+    let mut expected_outputs = Vec::new();
+    let mut expected_names = BTreeSet::new();
+    for (file_name, _) in WINE_CORE_DLL_TARGETS {
+        expected_outputs.push(artifact_dir.join(file_name));
+        expected_names.insert((*file_name).to_string());
+    }
+    for nls in WINE_NLS_FILES {
+        expected_outputs.push(artifact_dir.join(nls));
+        expected_names.insert((*nls).to_string());
+    }
 
+    let inputs = collect_wine_dll_inputs(config, manifest, &wine_source_dir)?;
+    let has_stale_entries = artifact_dir.is_dir()
+        && fs::read_dir(&artifact_dir)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .into_string()
+                    .map(|name| !expected_names.contains(&name))
+                    .unwrap_or(true)
+            });
+
+    if !has_stale_entries && outputs_are_fresh(&expected_outputs, &inputs)? {
+        return Ok(());
+    }
+
+    let wine_build_dir = config.build_dir.join("wine");
+    if !wine_build_dir.join("Makefile").is_file() {
+        fs::create_dir_all(&wine_build_dir)?;
+        let mut configure_cmd = Command::new(wine_source_dir.join("configure"));
+        configure_cmd
+            .current_dir(&wine_build_dir)
+            .arg("--enable-archs=x86_64")
+            .args([
+                "--without-x",
+                "--without-alsa",
+                "--without-cups",
+                "--without-dbus",
+                "--without-gphoto",
+                "--without-gssapi",
+                "--without-gstreamer",
+                "--without-krb5",
+                "--without-netapi",
+                "--without-opencl",
+                "--without-opengl",
+                "--without-osmesa",
+                "--without-oss",
+                "--without-pcap",
+                "--without-pulse",
+                "--without-sane",
+                "--without-sdl",
+                "--without-udev",
+                "--without-unwind",
+                "--without-usb",
+                "--without-v4l2",
+                "--without-vulkan",
+            ])
+            .arg("x86_64_CFLAGS=-D__RUSTOS__ -O2");
+        run_command(&mut configure_cmd)?;
+    }
+
+    let jobs = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let mut tooldeps_cmd = Command::new("make");
+    tooldeps_cmd
+        .current_dir(&wine_build_dir)
+        .arg(format!("-j{jobs}"))
+        .arg("__tooldeps__");
+    run_command(&mut tooldeps_cmd)?;
+
+    let mut dlls_cmd = Command::new("make");
+    dlls_cmd
+        .current_dir(&wine_build_dir)
+        .arg(format!("-j{jobs}"))
+        .arg("x86_64_CFLAGS=-D__RUSTOS__ -O2");
+    for (_, rel_target) in WINE_CORE_DLL_TARGETS {
+        dlls_cmd.arg(rel_target);
+    }
+    run_command(&mut dlls_cmd)?;
+
+    remove_dir_if_exists(&artifact_dir)?;
     fs::create_dir_all(&artifact_dir)?;
-    remove_dir_if_exists(&artifact_dir.join(".importlibs"))?;
-    let import_lib_dir = config.build_dir.join("intermediates/winsys-importlibs");
-    fs::create_dir_all(&import_lib_dir)?;
-
-    for (index, spec) in winsys_dll_specs().iter().enumerate() {
-        let mut sources = winsys_c_sources(&winsys_dir.join(spec.dir))?;
-        let exports = winsys_dir.join(spec.dir).join("exports.def");
-        let output = artifact_dir.join(spec.file_name);
-        let import_lib = import_lib_dir.join(format!("{}.a", spec.file_name));
-        for shared_source in spec.shared_sources {
-            sources.push(winsys_dir.join(shared_source));
+    let strip_bin = crate::util::env_os("MINGW_STRIP")
+        .unwrap_or_else(|| std::ffi::OsString::from("x86_64-w64-mingw32-strip"));
+    for (file_name, rel_target) in WINE_CORE_DLL_TARGETS {
+        let built = wine_build_dir.join(rel_target);
+        if !built.is_file() {
+            bail!("missing built Wine PE64 DLL {}", built.display());
         }
-        let mut inputs = sources.clone();
-        inputs.push(exports.clone());
-        inputs.push(manifest.manifest_path.clone());
-        inputs.push(config.root_dir.join("tools/xtask/src/build/mod.rs"));
-        inputs.extend(winsys_headers(&winsys_dir.join(spec.dir))?);
-        inputs.extend(winsys_headers(&winsys_dir.join("common"))?);
-        if winsys_dll_needs_ntdll(spec.file_name) {
-            inputs.push(import_lib_dir.join("ntdll.dll.a"));
-        }
-
-        if outputs_are_fresh(&[output.clone(), import_lib.clone()], &inputs)? {
-            continue;
-        }
-
-        remove_file_if_exists(&output)?;
-        remove_file_if_exists(&import_lib)?;
-
-        let image_base = 0x7000_0000_u64 + (index as u64) * 0x0010_0000_u64;
-        let mut command = Command::new(&config.mingw_cc);
-        command
-            .arg("-shared")
-            .arg("-nostdlib")
-            .arg("-ffreestanding")
-            .arg("-fcf-protection=branch")
-            .arg("-fno-jump-tables")
-            .arg("-fno-builtin")
-            .arg("-fno-stack-protector")
-            .arg("-I")
-            .arg(winsys_dir.join("common"))
-            .arg("-Wl,--entry,DllMain")
-            .arg(format!("-Wl,--image-base=0x{image_base:x}"))
-            .arg(format!("-Wl,--out-implib={}", import_lib.display()))
+        let staged = artifact_dir.join(file_name);
+        let mut strip_cmd = Command::new(&strip_bin);
+        strip_cmd
+            .arg("--strip-unneeded")
             .arg("-o")
-            .arg(&output);
-        for source in &sources {
-            command.arg(source);
-        }
-        command.arg(&exports);
-        if winsys_dll_needs_ntdll(spec.file_name) {
-            command.arg(import_lib_dir.join("ntdll.dll.a"));
-        }
-        run_command(&mut command)?;
+            .arg(&staged)
+            .arg(&built);
+        run_command(&mut strip_cmd)?;
+    }
+    for nls in WINE_NLS_FILES {
+        let src = wine_source_dir.join("nls").join(nls);
+        let dst = artifact_dir.join(nls);
+        fs::copy(&src, &dst)?;
     }
 
     Ok(())
-}
-
-fn winsys_headers(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("h") {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-    Ok(paths)
-}
-
-fn winsys_dll_needs_ntdll(file_name: &str) -> bool {
-    matches!(
-        file_name,
-        "kernelbase.dll"
-            | "msvcrt.dll"
-            | "ucrtbase.dll"
-            | "vcruntime140.dll"
-            | "vcruntime140_1.dll"
-    )
-}
-
-fn winsys_c_sources(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut sources = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("c") {
-            sources.push(path);
-        }
-    }
-    sources.sort();
-    if sources.is_empty() {
-        bail!("no C sources found in {}", dir.display());
-    }
-    Ok(sources)
 }
 
 fn build_manifests_matching(
@@ -1271,7 +1363,6 @@ fn parse_objdump_imports(text: &str) -> Vec<(String, String)> {
 struct WinsysDllSpec {
     dir: &'static str,
     file_name: &'static str,
-    shared_sources: &'static [&'static str],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1286,37 +1377,30 @@ const fn winsys_dll_specs() -> &'static [WinsysDllSpec] {
         WinsysDllSpec {
             dir: "ntdll",
             file_name: "ntdll.dll",
-            shared_sources: &[],
         },
         WinsysDllSpec {
             dir: "kernelbase",
             file_name: "kernelbase.dll",
-            shared_sources: &[],
         },
         WinsysDllSpec {
             dir: "kernel32",
             file_name: "kernel32.dll",
-            shared_sources: &[],
         },
         WinsysDllSpec {
             dir: "msvcrt",
             file_name: "msvcrt.dll",
-            shared_sources: &["common/msvcrt_impl.c"],
         },
         WinsysDllSpec {
             dir: "ucrtbase",
             file_name: "ucrtbase.dll",
-            shared_sources: &["common/msvcrt_impl.c", "common/ucrtbase_impl.c"],
         },
         WinsysDllSpec {
             dir: "vcruntime140",
             file_name: "vcruntime140.dll",
-            shared_sources: &["common/vcruntime_impl.c"],
         },
         WinsysDllSpec {
             dir: "vcruntime140_1",
             file_name: "vcruntime140_1.dll",
-            shared_sources: &["common/vcruntime_impl.c"],
         },
     ]
 }

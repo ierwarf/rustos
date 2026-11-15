@@ -297,6 +297,7 @@ impl VfsState {
         };
         let (written, consumed) = match self.render_getdents_payload(
             request.remote_id,
+            request.pid,
             start_index,
             requested,
             &mut response.payload,
@@ -635,6 +636,15 @@ impl VfsState {
             // `/proc/self` followed is the caller's pid directory.
             ProcNode::SelfLink if follow => (ProcNode::PidDir, 0),
             ProcNode::PidDir => (ProcNode::PidDir, 0),
+            file if proc_fs::is_virtual_file(file) => {
+                match lock_vfs_storage().proc_virtual_file_bytes(file) {
+                    Ok(bytes) => (file, bytes.len() as u64),
+                    Err(errno) => {
+                        response.status = errno;
+                        return true;
+                    }
+                }
+            }
             link => match proc_fs::link_target(link, request.pid, exec) {
                 Ok(target) => (link, target.len() as u64),
                 Err(errno) => {

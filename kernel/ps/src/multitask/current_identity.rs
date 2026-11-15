@@ -249,6 +249,30 @@ pub(in crate::multitask) fn observe_user_liveness(slot: usize, id: u64) -> bool 
     }).unwrap_or(false)
 }
 
+/// Scalar process/task ABI liveness at this writer-leaf linearization point,
+/// NOT a backing, execution, or wake grant. When `id == 0`, matches any
+/// non-retired user task belonging to `pid`.
+pub(in crate::multitask) fn observe_user_process_task_abi(
+    slot: usize,
+    pid: u64,
+    id: u64,
+) -> Option<UserAbi> {
+    with_writer(slot, |writer| {
+        if writer.lifecycle.retired {
+            return None;
+        }
+        let bound_id = writer.bound_task_id?;
+        if id != 0 && bound_id != id {
+            return None;
+        }
+        let entry = writer.identity?;
+        if entry.task_id != Some(bound_id) || !entry.user_mode || entry.process_id != Some(pid) {
+            return None;
+        }
+        entry.abi
+    })?
+}
+
 /// Original Identity51 custody for one scalar reply/object comparison only.
 /// No execution/funding grant, allocation or hardware callback may escape f.
 pub(in crate::multitask) fn with_reply_custody(

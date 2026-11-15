@@ -1,0 +1,22 @@
+id = "bc"
+kind = "app"
+execution_domain = "user"
+startup = "none"
+
+[build]
+builder = "prebuilt-app"
+source = "bundle"
+
+[install]
+path = "apps/bc"
+layout = "directory"
+
+[[desktop.entries]]
+display_name = "GNU bc"
+image = "apps/bc/bc"
+exec = "/apps/bc/bc"
+weight_micros = 500
+console_hosted = true
+launch = "new-session"
+args = ["/apps/bc/bc", "-l"]
+env = ["HOME=/run/user/1000", "TERM=vt100"]

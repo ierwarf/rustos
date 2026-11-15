@@ -814,7 +814,7 @@ impl AppState {
             update.add_partial_rect(taskbar_dirty_rect);
         }
 
-        if let Some(DragTarget::Console(session_handle)) = self.dragging_window {
+        if let Some(session_handle) = self.dragging_window.and_then(DragTarget::console_session) {
             if next
                 .iter()
                 .all(|window| window.session_handle != session_handle)
@@ -1001,7 +1001,7 @@ impl AppState {
             self.focused_session_handle = 0;
         }
 
-        if let Some(DragTarget::Console(session_handle)) = self.dragging_window {
+        if let Some(session_handle) = self.dragging_window.and_then(DragTarget::console_session) {
             if self
                 .console_windows
                 .iter()

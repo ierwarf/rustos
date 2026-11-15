@@ -37,8 +37,11 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
     use linux_abi::*;
     match nr {
         // unsigned int fd, size_t count
-        SYS_READ | SYS_WRITE | SYS_PREAD64 | SYS_WRITEV | SYS_CLOSE | SYS_FSTAT | SYS_DUP
-        | SYS_FTRUNCATE => [S, W, W, W, W, W],
+        SYS_READ | SYS_WRITE | SYS_PREAD64 | SYS_CLOSE | SYS_FSTAT | SYS_DUP | SYS_FTRUNCATE => {
+            [S, W, W, W, W, W]
+        }
+        // unsigned int fd, const struct iovec*, int iovcnt
+        SYS_READV | SYS_WRITEV => [S, W, S, W, W, W],
         // unsigned int fd, unsigned int count
         SYS_GETDENTS64 => [S, W, U, W, W, W],
         // fd, off_t, whence
@@ -53,6 +56,7 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
         // fds*, unsigned int nfds, int timeout
         SYS_POLL => [W, U, S, W, W, W],
         SYS_PPOLL => [W, U, W, W, W, W],
+        SYS_SELECT | SYS_PSELECT6 => [S, W, W, W, W, W],
         // epfd, events*, int maxevents, int timeout
         SYS_EPOLL_WAIT | SYS_EPOLL_PWAIT => [S, W, S, S, W, W],
         SYS_EPOLL_CTL => [S, U, S, W, W, W],
@@ -70,8 +74,16 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
         SYS_UMASK => [U, W, W, W, W, W],
         SYS_GETRANDOM => [W, W, U, W, W, W],
         // int clockid, int flags, ts*, ts*
-        SYS_CLOCK_GETTIME => [S, W, W, W, W, W],
+        SYS_CLOCK_GETTIME | SYS_CLOCK_GETRES => [S, W, W, W, W, W],
         SYS_CLOCK_NANOSLEEP => [S, U, W, W, W, W],
+        SYS_GETRUSAGE => [S, W, W, W, W, W],
+        SYS_GETGROUPS => [S, W, W, W, W, W],
+        SYS_GETPRIORITY => [S, U, W, W, W, W],
+        SYS_SETPRIORITY => [S, U, S, W, W, W],
+        SYS_SCHED_GETSCHEDULER
+        | SYS_SCHED_GETPARAM
+        | SYS_SCHED_GET_PRIORITY_MAX
+        | SYS_SCHED_GET_PRIORITY_MIN => [S, W, W, W, W, W],
         // uaddr, int op, u32 val, timeout*, uaddr2*, u32 val3
         SYS_FUTEX => [W, U, U, W, W, U],
         SYS_PRCTL | SYS_ARCH_PRCTL => [U, W, W, W, W, W],

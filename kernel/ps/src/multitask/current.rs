@@ -539,6 +539,13 @@ pub fn is_user_task_alive(task_id: u64) -> bool {
     super::scheduler::current_observation::alive(task_id)
 }
 
+pub fn user_target_abi_if_alive(
+    process_id: u64,
+    task_id: u64,
+) -> Option<UserAbi> {
+    super::scheduler::current_observation::user_target_abi_if_alive(process_id, task_id)
+}
+
 pub fn activate_suspended_user_task(task_id: u64) -> bool {
     activate_suspended_user_tasks(core::slice::from_ref(&task_id))
 }

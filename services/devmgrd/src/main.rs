@@ -1135,6 +1135,8 @@ fn lookup_device_node(path: &str, response: &mut DevmgrdIpcResponse) -> i32 {
         | "/dev/input/event0"
         | "/dev/dri/card0"
         | "/dev/null"
+        | "/dev/zero"
+        | "/dev/full"
         | "/dev/urandom"
         | "/dev/random" => DEVMGRD_NODE_KIND_DEVICE,
         _ => return libc::ENOENT,
@@ -1149,6 +1151,8 @@ fn read_device_dir(path: &str, response: &mut DevmgrdIpcResponse) -> i32 {
             ("display0", DEVMGRD_NODE_KIND_DEVICE),
             ("input0", DEVMGRD_NODE_KIND_DEVICE),
             ("null", DEVMGRD_NODE_KIND_DEVICE),
+            ("zero", DEVMGRD_NODE_KIND_DEVICE),
+            ("full", DEVMGRD_NODE_KIND_DEVICE),
             ("urandom", DEVMGRD_NODE_KIND_DEVICE),
             ("random", DEVMGRD_NODE_KIND_DEVICE),
             ("input", DEVMGRD_NODE_KIND_DIR),

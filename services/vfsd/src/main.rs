@@ -1093,6 +1093,10 @@ pub(crate) const VFS_DEVICE_ACCESS_NULL: u16 =
     rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT + 1;
 pub(crate) const VFS_DEVICE_ACCESS_URANDOM: u16 =
     rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT + 2;
+pub(crate) const VFS_DEVICE_ACCESS_ZERO: u16 =
+    rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT + 3;
+pub(crate) const VFS_DEVICE_ACCESS_FULL: u16 =
+    rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT + 4;
 
 fn is_input_device_node(path: &str) -> bool {
     matches!(path, "/dev/input0" | "/dev/input/event0")
@@ -1105,6 +1109,8 @@ fn device_access_for_path(path: &str) -> u64 {
         "/dev/dri/card0" => rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT as u64,
         "/dev/null" => VFS_DEVICE_ACCESS_NULL as u64,
         "/dev/urandom" | "/dev/random" => VFS_DEVICE_ACCESS_URANDOM as u64,
+        "/dev/zero" => VFS_DEVICE_ACCESS_ZERO as u64,
+        "/dev/full" => VFS_DEVICE_ACCESS_FULL as u64,
         _ => 0,
     }
 }

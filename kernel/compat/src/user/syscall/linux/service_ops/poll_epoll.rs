@@ -17,6 +17,7 @@
 mod control;
 
 use super::*;
+use alloc::vec;
 
 // Every provider-backed descriptor in one poll arm must fit in the exact
 // object observation set installed in ring0.  Reject larger scans instead of
@@ -49,79 +50,113 @@ fn decode_pollfd(bytes: &[u8]) -> Result<(i32, u32), i64> {
     ))
 }
 
+const SELECT_MAX_FDS: usize = 4096;
+const SELECT_POLLIN_EVENTS: u32 = (linux_abi::POLLIN as u32)
+    | linux_abi::EPOLLRDNORM
+    | linux_abi::EPOLLRDBAND
+    | (linux_abi::POLLHUP as u32)
+    | (linux_abi::POLLERR as u32);
+const SELECT_POLLOUT_EVENTS: u32 = (linux_abi::POLLOUT as u32)
+    | linux_abi::EPOLLWRNORM
+    | linux_abi::EPOLLWRBAND
+    | (linux_abi::POLLERR as u32);
+const SELECT_POLLEX_EVENTS: u32 = linux_abi::POLLPRI as u32;
+
 pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
+    let deadline_tick = (timeout_ms >= 0).then(|| deadline_tick_from_ms(timeout_ms as u64));
+    match wait_until_poll_ready(timeout_ms == 0, deadline_tick, || {
+        collect_poll_readiness(fds_ptr, nfds, deadline_tick)
+    }) {
+        Ok(ready) => ready,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+fn deadline_tick_from_ms(timeout_ms: u64) -> u64 {
     let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
-    let deadline_tick = (timeout_ms >= 0).then(|| {
-        let timeout_ticks = (timeout_ms as u64)
-            .saturating_mul(ticks_per_second)
-            .saturating_add(999)
-            / 1000;
-        crate::arch::rtc::ticks().saturating_add(timeout_ticks)
-    });
+    let timeout_ticks = timeout_ms
+        .saturating_mul(ticks_per_second)
+        .saturating_add(999)
+        / 1000;
+    crate::arch::rtc::ticks().saturating_add(timeout_ticks)
+}
+
+fn deadline_tick_from_nanos(nanos: u128) -> u64 {
+    let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1) as u128;
+    let timeout_ticks = nanos
+        .saturating_mul(ticks_per_second)
+        .saturating_add(999_999_999)
+        / 1_000_000_000;
+    let ticks = u64::try_from(timeout_ticks).unwrap_or(u64::MAX);
+    crate::arch::rtc::ticks().saturating_add(ticks.max(1))
+}
+
+fn wait_until_poll_ready(
+    immediate: bool,
+    deadline_tick: Option<u64>,
+    mut collect: impl FnMut() -> Result<PollReadinessState, i64>,
+) -> Result<u64, i64> {
     loop {
-        let first = match collect_poll_readiness(fds_ptr, nfds, deadline_tick) {
+        let first = match collect() {
             Ok(state) => state,
             Err(LINUX_ETIMEDOUT)
                 if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) =>
             {
-                return 0;
+                return Ok(0);
             }
             Err(LINUX_ETIMEDOUT) => {
                 if current_wait_interrupted() {
-                    return linux_errno(LINUX_EINTR);
+                    return Err(LINUX_EINTR);
                 }
                 multitask::cond_resched();
                 continue;
             }
-            Err(errno) => return linux_errno(errno),
+            Err(errno) => return Err(errno),
         };
         if first.ready != 0 {
-            return first.ready;
+            return Ok(first.ready);
         }
-        if timeout_ms == 0
+        if immediate
             || deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline)
         {
-            return 0;
+            return Ok(0);
         }
         if current_wait_interrupted() {
-            return linux_errno(LINUX_EINTR);
+            return Err(LINUX_EINTR);
         }
         let Some(task_id) = multitask::current_task_id() else {
-            return linux_errno(LINUX_EINVAL);
+            return Err(LINUX_EINVAL);
         };
         let Some(process_id) = multitask::current_user_process_id() else {
-            return linux_errno(LINUX_EINVAL);
+            return Err(LINUX_EINVAL);
         };
-        if !first.observations.is_empty()
-            && let Err(errno) =
-                super::super::broker_ops::waitset_broker_ops::register_waitset_waiters(
-                    task_id,
-                    process_id,
-                    &first.observations,
-                )
-        {
-            return linux_errno(errno);
+        if !first.observations.is_empty() {
+            super::super::broker_ops::waitset_broker_ops::register_waitset_waiters(
+                task_id,
+                process_id,
+                &first.observations,
+            )?;
         }
 
-        let second = match collect_poll_readiness(fds_ptr, nfds, deadline_tick) {
+        let second = match collect() {
             Ok(state) => state,
             Err(LINUX_ETIMEDOUT)
                 if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) =>
             {
                 super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
-                return 0;
+                return Ok(0);
             }
             Err(LINUX_ETIMEDOUT) => {
                 super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
                 if current_wait_interrupted() {
-                    return linux_errno(LINUX_EINTR);
+                    return Err(LINUX_EINTR);
                 }
                 multitask::cond_resched();
                 continue;
             }
             Err(errno) => {
                 super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
-                return linux_errno(errno);
+                return Err(errno);
             }
         };
         if second.ready != 0
@@ -130,14 +165,14 @@ pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
         {
             super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
             if second.ready != 0 {
-                return second.ready;
+                return Ok(second.ready);
             }
             continue;
         }
         if !multitask::arm_block_current_task() {
             super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
             if multitask::current_task_id() != Some(task_id) {
-                return linux_errno(LINUX_EINVAL);
+                return Err(LINUX_EINVAL);
             }
             multitask::cond_resched();
             continue;
@@ -155,7 +190,7 @@ pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
             super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
             let _ = multitask::cancel_block_current_task();
             if current_wait_interrupted() {
-                return linux_errno(LINUX_EINTR);
+                return Err(LINUX_EINTR);
             }
             continue;
         }
@@ -164,21 +199,20 @@ pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
         {
             super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
             let _ = multitask::cancel_block_current_task();
-            return linux_errno(LINUX_EBUSY);
+            return Err(LINUX_EBUSY);
         }
         match multitask::commit_block_current_task_and_yield() {
-            Some(true) => {}
-            Some(false) => {}
+            Some(true) | Some(false) => {}
             None => {
                 super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
                 crate::arch::rtc::disarm_sleep_waiter(task_id);
-                return linux_errno(LINUX_EINVAL);
+                return Err(LINUX_EINVAL);
             }
         }
         super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
         crate::arch::rtc::disarm_sleep_waiter(task_id);
         if current_wait_interrupted() {
-            return linux_errno(LINUX_EINTR);
+            return Err(LINUX_EINTR);
         }
     }
 }
@@ -233,40 +267,28 @@ fn collect_poll_readiness(
         usermem::copy_from_current_user_exact(entry_ptr, &mut raw)
             .map_err(user_pointer_error_to_linux_errno)?;
         let (fd, events) = decode_pollfd(&raw)?;
-        let route = if fd < 0 {
-            PollRoute::Done(0)
-        } else {
-            match route_one_poll_fd(fd as u64, events, deadline_tick, &mut state) {
-                Ok(route) => route,
-                Err(LINUX_ETIMEDOUT) => {
-                    state.provider_timed_out = true;
-                    PollRoute::Done(0)
-                }
-                Err(errno) => return Err(errno),
-            }
-        };
-        let revents = match route {
-            PollRoute::Done(revents) => revents,
-            PollRoute::Netd { token } => {
-                netd_slots.push(index);
-                netd_queries.push((token, events));
-                0
-            }
-            PollRoute::Vfs => {
-                vfs_slots.push(index);
-                0
-            }
-        };
-        entries.push(PollEntry {
-            ptr: entry_ptr,
+        let revents = push_poll_entry(
+            &mut entries,
+            &mut netd_slots,
+            &mut netd_queries,
+            &mut vfs_slots,
+            entry_ptr,
             raw,
             fd,
             events,
-            revents,
-        });
+            deadline_tick,
+            &mut state,
+        )?;
+        let _ = revents;
     }
-    resolve_poll_netd_batch(&mut entries, &netd_slots, &netd_queries, deadline_tick, &mut state)?;
-    resolve_poll_vfs_batch(&mut entries, &vfs_slots, deadline_tick, &mut state)?;
+    evaluate_poll_entries(
+        &mut entries,
+        &netd_slots,
+        &netd_queries,
+        &vfs_slots,
+        deadline_tick,
+        &mut state,
+    )?;
     for entry in &entries {
         if entry.revents != 0 {
             state.ready += 1;
@@ -280,13 +302,74 @@ fn collect_poll_readiness(
                 .map_err(user_pointer_error_to_linux_errno)?;
         }
     }
+    Ok(state)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_poll_entry(
+    entries: &mut Vec<PollEntry>,
+    netd_slots: &mut Vec<usize>,
+    netd_queries: &mut Vec<(u64, u32)>,
+    vfs_slots: &mut Vec<usize>,
+    ptr: u64,
+    raw: [u8; POLLFD_SIZE],
+    fd: i32,
+    events: u32,
+    deadline_tick: Option<u64>,
+    state: &mut PollReadinessState,
+) -> Result<u32, i64> {
+    let index = entries.len();
+    let route = if fd < 0 {
+        PollRoute::Done(0)
+    } else {
+        match route_one_poll_fd(fd as u64, events, deadline_tick, state) {
+            Ok(route) => route,
+            Err(LINUX_ETIMEDOUT) => {
+                state.provider_timed_out = true;
+                PollRoute::Done(0)
+            }
+            Err(errno) => return Err(errno),
+        }
+    };
+    let revents = match route {
+        PollRoute::Done(revents) => revents,
+        PollRoute::Netd { token } => {
+            netd_slots.push(index);
+            netd_queries.push((token, events));
+            0
+        }
+        PollRoute::Vfs => {
+            vfs_slots.push(index);
+            0
+        }
+    };
+    entries.push(PollEntry {
+        ptr,
+        raw,
+        fd,
+        events,
+        revents,
+    });
+    Ok(revents)
+}
+
+fn evaluate_poll_entries(
+    entries: &mut [PollEntry],
+    netd_slots: &[usize],
+    netd_queries: &[(u64, u32)],
+    vfs_slots: &[usize],
+    deadline_tick: Option<u64>,
+    state: &mut PollReadinessState,
+) -> Result<(), i64> {
+    resolve_poll_netd_batch(entries, netd_slots, netd_queries, deadline_tick, state)?;
+    resolve_poll_vfs_batch(entries, vfs_slots, deadline_tick, state)?;
     if state.observations.len()
         > super::super::broker_ops::waitset_broker_ops::WAITSET_MAX_OBSERVATIONS
     {
         return Err(LINUX_EINVAL);
     }
-    require_completed_provider_scan(state.provider_timed_out, state.ready != 0)?;
-    Ok(state)
+    let has_ready = entries.iter().any(|entry| entry.revents != 0);
+    require_completed_provider_scan(state.provider_timed_out, has_ready)
 }
 
 fn resolve_poll_netd_batch(
@@ -714,6 +797,352 @@ pub fn syscall_linux_ppoll(
     with_temporary_wait_signal_mask(sigmask_ptr, sigset_size, || {
         syscall_linux_poll(fds_ptr, nfds, timeout_ms)
     })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SelectRequestEntry {
+    fd: i32,
+    events: u32,
+    in_read: bool,
+    in_write: bool,
+    in_except: bool,
+}
+
+/// Linux `select(nfds, readfds, writefds, exceptfds, timeout)`.
+pub fn syscall_linux_select(
+    nfds: u64,
+    readfds_ptr: u64,
+    writefds_ptr: u64,
+    exceptfds_ptr: u64,
+    timeout_ptr: u64,
+) -> u64 {
+    let (immediate, deadline_tick) = if timeout_ptr == 0 {
+        (false, None)
+    } else {
+        let mut raw = [0_u8; 16];
+        if let Err(err) = usermem::copy_from_current_user_exact(timeout_ptr, &mut raw) {
+            return linux_errno(user_pointer_error_to_linux_errno(err));
+        }
+        let tv_sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
+        let tv_usec = i64::from_le_bytes(raw[8..16].try_into().unwrap());
+        if tv_sec < 0 || tv_usec < 0 {
+            return linux_errno(LINUX_EINVAL);
+        }
+        let total_nanos = (tv_sec as u128)
+            .saturating_mul(1_000_000_000)
+            .saturating_add((tv_usec as u128).saturating_mul(1_000));
+        if total_nanos == 0 {
+            (true, Some(crate::arch::rtc::ticks()))
+        } else {
+            (false, Some(deadline_tick_from_nanos(total_nanos)))
+        }
+    };
+
+    let result = execute_select(
+        nfds,
+        readfds_ptr,
+        writefds_ptr,
+        exceptfds_ptr,
+        immediate,
+        deadline_tick,
+    );
+    if timeout_ptr != 0
+        && !is_linux_errno_result(result)
+    {
+        let remaining_ticks = deadline_tick
+            .map(|deadline| deadline.saturating_sub(crate::arch::rtc::ticks()))
+            .unwrap_or(0);
+        let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1) as u128;
+        let remaining_usec = ((remaining_ticks as u128) * 1_000_000) / ticks_per_second;
+        let rem_sec = (remaining_usec / 1_000_000) as i64;
+        let rem_usec = (remaining_usec % 1_000_000) as i64;
+        let mut out = [0_u8; 16];
+        out[0..8].copy_from_slice(&rem_sec.to_le_bytes());
+        out[8..16].copy_from_slice(&rem_usec.to_le_bytes());
+        if let Err(err) = usermem::write_current_user_bytes(timeout_ptr, &out) {
+            return linux_errno(user_pointer_error_to_linux_errno(err));
+        }
+    }
+    result
+}
+
+/// Linux `pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask_arg)`.
+pub fn syscall_linux_pselect6(
+    nfds: u64,
+    readfds_ptr: u64,
+    writefds_ptr: u64,
+    exceptfds_ptr: u64,
+    timeout_ptr: u64,
+    sigmask_arg_ptr: u64,
+) -> u64 {
+    let (immediate, deadline_tick) = if timeout_ptr == 0 {
+        (false, None)
+    } else {
+        let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(timeout_ptr) {
+            Ok(ts) => ts,
+            Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
+        };
+        if let Err(errno) = process_time::validate_relative_sleep_timespec_locally(ts) {
+            return linux_errno(errno);
+        }
+        let total_nanos = (ts.tv_sec as u128)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u128);
+        if total_nanos == 0 {
+            (true, Some(crate::arch::rtc::ticks()))
+        } else {
+            (false, Some(deadline_tick_from_nanos(total_nanos)))
+        }
+    };
+
+    let (ss_ptr, ss_len) = if sigmask_arg_ptr == 0 {
+        (0, 0)
+    } else {
+        let mut raw = [0_u8; 16];
+        if let Err(err) = usermem::copy_from_current_user_exact(sigmask_arg_ptr, &mut raw) {
+            return linux_errno(user_pointer_error_to_linux_errno(err));
+        }
+        (
+            u64::from_le_bytes(raw[0..8].try_into().unwrap()),
+            u64::from_le_bytes(raw[8..16].try_into().unwrap()),
+        )
+    };
+
+    with_temporary_wait_signal_mask(ss_ptr, ss_len, || {
+        execute_select(
+            nfds,
+            readfds_ptr,
+            writefds_ptr,
+            exceptfds_ptr,
+            immediate,
+            deadline_tick,
+        )
+    })
+}
+
+fn is_linux_errno_result(value: u64) -> bool {
+    (value as i64) < 0 && (value as i64) >= -4095
+}
+
+fn execute_select(
+    nfds: u64,
+    readfds_ptr: u64,
+    writefds_ptr: u64,
+    exceptfds_ptr: u64,
+    immediate: bool,
+    deadline_tick: Option<u64>,
+) -> u64 {
+    let nfds_i64 = nfds as i64;
+    if nfds_i64 < 0 || nfds_i64 as usize > SELECT_MAX_FDS {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let nfds = nfds_i64 as usize;
+    let word_count = nfds.div_ceil(64);
+    let read_words = match read_select_fd_set(readfds_ptr, word_count) {
+        Ok(words) => words,
+        Err(errno) => return linux_errno(errno),
+    };
+    let write_words = match read_select_fd_set(writefds_ptr, word_count) {
+        Ok(words) => words,
+        Err(errno) => return linux_errno(errno),
+    };
+    let except_words = match read_select_fd_set(exceptfds_ptr, word_count) {
+        Ok(words) => words,
+        Err(errno) => return linux_errno(errno),
+    };
+
+    let requests = decode_select_queries(nfds, &read_words, &write_words, &except_words);
+    if requests.len() > MAX_POLL_FDS {
+        return linux_errno(LINUX_EINVAL);
+    }
+    for req in &requests {
+        if current_kernel_handle(req.fd as u64).is_none() {
+            return linux_errno(LINUX_EBADF);
+        }
+    }
+
+    let mut last_revents = vec![0_u32; requests.len()];
+    let wait_outcome = wait_until_poll_ready(immediate, deadline_tick, || {
+        collect_select_readiness(&requests, deadline_tick, &mut last_revents)
+    });
+    if let Err(errno) = wait_outcome {
+        return linux_errno(errno);
+    }
+
+    let (ready_bits, out_read, out_write, out_except) = encode_select_results(
+        &requests,
+        &last_revents,
+        word_count,
+        readfds_ptr != 0,
+        writefds_ptr != 0,
+        exceptfds_ptr != 0,
+    );
+    if let Err(errno) = write_select_fd_set(readfds_ptr, &out_read)
+        .and_then(|()| write_select_fd_set(writefds_ptr, &out_write))
+        .and_then(|()| write_select_fd_set(exceptfds_ptr, &out_except))
+    {
+        return linux_errno(errno);
+    }
+    ready_bits as u64
+}
+
+fn read_select_fd_set(ptr: u64, word_count: usize) -> Result<Vec<u64>, i64> {
+    if ptr == 0 || word_count == 0 {
+        return Ok(Vec::new());
+    }
+    let byte_len = word_count
+        .checked_mul(size_of::<u64>())
+        .ok_or(LINUX_EINVAL)?;
+    let mut raw = vec![0_u8; byte_len];
+    usermem::copy_from_current_user_exact(ptr, &mut raw)
+        .map_err(user_pointer_error_to_linux_errno)?;
+    Ok(raw
+        .chunks_exact(8)
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+        .collect())
+}
+
+fn write_select_fd_set(ptr: u64, words: &[u64]) -> Result<(), i64> {
+    if ptr == 0 || words.is_empty() {
+        return Ok(());
+    }
+    let mut raw = Vec::with_capacity(words.len() * 8);
+    for word in words {
+        raw.extend_from_slice(&word.to_le_bytes());
+    }
+    usermem::write_current_user_bytes(ptr, &raw).map_err(user_pointer_error_to_linux_errno)
+}
+
+fn decode_select_queries(
+    nfds: usize,
+    read_words: &[u64],
+    write_words: &[u64],
+    except_words: &[u64],
+) -> Vec<SelectRequestEntry> {
+    let mut requests = Vec::new();
+    for fd in 0..nfds {
+        let word_idx = fd / 64;
+        let bit = 1_u64 << (fd % 64);
+        let in_read = read_words.get(word_idx).is_some_and(|w| w & bit != 0);
+        let in_write = write_words.get(word_idx).is_some_and(|w| w & bit != 0);
+        let in_except = except_words.get(word_idx).is_some_and(|w| w & bit != 0);
+        if !in_read && !in_write && !in_except {
+            continue;
+        }
+        let mut events = 0_u32;
+        if in_read {
+            events |= SELECT_POLLIN_EVENTS;
+        }
+        if in_write {
+            events |= SELECT_POLLOUT_EVENTS;
+        }
+        if in_except {
+            events |= SELECT_POLLEX_EVENTS;
+        }
+        requests.push(SelectRequestEntry {
+            fd: fd as i32,
+            events,
+            in_read,
+            in_write,
+            in_except,
+        });
+    }
+    requests
+}
+
+fn select_matched_bit_count(req: SelectRequestEntry, revents: u32) -> usize {
+    let mut bits = 0usize;
+    if req.in_read && (revents & SELECT_POLLIN_EVENTS) != 0 {
+        bits += 1;
+    }
+    if req.in_write && (revents & SELECT_POLLOUT_EVENTS) != 0 {
+        bits += 1;
+    }
+    if req.in_except && (revents & SELECT_POLLEX_EVENTS) != 0 {
+        bits += 1;
+    }
+    bits
+}
+
+fn encode_select_results(
+    requests: &[SelectRequestEntry],
+    revents: &[u32],
+    word_count: usize,
+    has_read: bool,
+    has_write: bool,
+    has_except: bool,
+) -> (usize, Vec<u64>, Vec<u64>, Vec<u64>) {
+    let mut out_read = if has_read { vec![0_u64; word_count] } else { Vec::new() };
+    let mut out_write = if has_write { vec![0_u64; word_count] } else { Vec::new() };
+    let mut out_except = if has_except { vec![0_u64; word_count] } else { Vec::new() };
+    let mut ready_bits = 0usize;
+    for (req, &rev) in requests.iter().zip(revents.iter()) {
+        let fd = req.fd as usize;
+        let word_idx = fd / 64;
+        let bit = 1_u64 << (fd % 64);
+        if has_read && req.in_read && (rev & SELECT_POLLIN_EVENTS) != 0 {
+            out_read[word_idx] |= bit;
+            ready_bits += 1;
+        }
+        if has_write && req.in_write && (rev & SELECT_POLLOUT_EVENTS) != 0 {
+            out_write[word_idx] |= bit;
+            ready_bits += 1;
+        }
+        if has_except && req.in_except && (rev & SELECT_POLLEX_EVENTS) != 0 {
+            out_except[word_idx] |= bit;
+            ready_bits += 1;
+        }
+    }
+    (ready_bits, out_read, out_write, out_except)
+}
+
+fn collect_select_readiness(
+    requests: &[SelectRequestEntry],
+    deadline_tick: Option<u64>,
+    last_revents: &mut [u32],
+) -> Result<PollReadinessState, i64> {
+    let mut state = PollReadinessState {
+        ready: 0,
+        provider_timed_out: false,
+        observations: Vec::with_capacity(requests.len().min(WAITSET_MAX_INTERESTS)),
+    };
+    let mut entries = Vec::with_capacity(requests.len());
+    let mut netd_slots = Vec::new();
+    let mut netd_queries = Vec::new();
+    let mut vfs_slots = Vec::new();
+    for req in requests {
+        let rev = push_poll_entry(
+            &mut entries,
+            &mut netd_slots,
+            &mut netd_queries,
+            &mut vfs_slots,
+            0,
+            [0_u8; POLLFD_SIZE],
+            req.fd,
+            req.events,
+            deadline_tick,
+            &mut state,
+        )?;
+        if rev & (linux_abi::POLLNVAL as u32) != 0 {
+            return Err(LINUX_EBADF);
+        }
+    }
+    evaluate_poll_entries(
+        &mut entries,
+        &netd_slots,
+        &netd_queries,
+        &vfs_slots,
+        deadline_tick,
+        &mut state,
+    )?;
+    for ((req, entry), out_rev) in requests.iter().zip(entries.iter()).zip(last_revents.iter_mut()) {
+        if entry.revents & (linux_abi::POLLNVAL as u32) != 0 {
+            return Err(LINUX_EBADF);
+        }
+        *out_rev = entry.revents;
+        state.ready += select_matched_bit_count(*req, entry.revents) as u64;
+    }
+    Ok(state)
 }
 
 pub fn syscall_linux_epoll_pwait(

@@ -267,7 +267,8 @@ impl MemfdHandle {
         let allowed = (linux_abi::F_SEAL_SEAL
             | linux_abi::F_SEAL_SHRINK
             | linux_abi::F_SEAL_GROW
-            | linux_abi::F_SEAL_WRITE) as u32;
+            | linux_abi::F_SEAL_WRITE
+            | linux_abi::F_SEAL_FUTURE_WRITE) as u32;
         if seals & !allowed != 0 {
             return Err(MemfdError::InvalidArgument);
         }
@@ -277,6 +278,8 @@ impl MemfdHandle {
         if state.seals & linux_abi::F_SEAL_SEAL as u32 != 0 {
             return Err(MemfdError::PermissionDenied);
         }
+        // F_SEAL_FUTURE_WRITE blocks *new* writes and *new* writable mappings
+        // while allowing already-active writable mappings to keep writing.
         if seals & linux_abi::F_SEAL_WRITE as u32 != 0 && state.writable_mapping_count != 0 {
             return Err(MemfdError::Busy);
         }
@@ -301,7 +304,9 @@ impl MemfdHandle {
         if offset >= mapped_len || end > mapped_len {
             return Err(MemfdError::InvalidArgument);
         }
-        if writable && state.seals & linux_abi::F_SEAL_WRITE as u32 != 0 {
+        if writable
+            && state.seals & (linux_abi::F_SEAL_WRITE | linux_abi::F_SEAL_FUTURE_WRITE) as u32 != 0
+        {
             return Err(MemfdError::PermissionDenied);
         }
 
@@ -390,7 +395,7 @@ impl Drop for MemfdObject {
 }
 
 fn check_write_seals(state: &MemfdState, end: usize) -> Result<(), MemfdError> {
-    if state.seals & linux_abi::F_SEAL_WRITE as u32 != 0 {
+    if state.seals & (linux_abi::F_SEAL_WRITE | linux_abi::F_SEAL_FUTURE_WRITE) as u32 != 0 {
         return Err(MemfdError::PermissionDenied);
     }
     if end > state.len && state.seals & linux_abi::F_SEAL_GROW as u32 != 0 {
@@ -727,6 +732,14 @@ mod tests {
         assert_eq!(
             next_mapping_counts(1, usize::MAX, true),
             Err(MemfdError::Busy)
+        );
+        let future_sealed = MemfdState {
+            seals: linux_abi::F_SEAL_FUTURE_WRITE as u32,
+            ..state
+        };
+        assert_eq!(
+            check_write_seals(&future_sealed, PAGE_SIZE),
+            Err(MemfdError::PermissionDenied)
         );
     }
 

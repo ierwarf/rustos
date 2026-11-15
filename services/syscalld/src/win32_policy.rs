@@ -1,25 +1,38 @@
 use rustos_user_abi::syscall::{
     Win32SyscallOffloadRequest, Win32SyscallOffloadResponse,
     SYSCALL_OFFLOAD_OP_WIN32_ALLOC_VIRTUAL_MEMORY, SYSCALL_OFFLOAD_OP_WIN32_CLOSE,
-    SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION, SYSCALL_OFFLOAD_OP_WIN32_EXIT_PROCESS,
-    SYSCALL_OFFLOAD_OP_WIN32_FREE_VIRTUAL_MEMORY, SYSCALL_OFFLOAD_OP_WIN32_GET_CONSOLE_MODE,
+    SYSCALL_OFFLOAD_OP_WIN32_CONTINUE, SYSCALL_OFFLOAD_OP_WIN32_CREATE_EVENT,
+    SYSCALL_OFFLOAD_OP_WIN32_CREATE_SECTION, SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION,
+    SYSCALL_OFFLOAD_OP_WIN32_DEVICE_IOCTL, SYSCALL_OFFLOAD_OP_WIN32_DUPLICATE_OBJECT,
+    SYSCALL_OFFLOAD_OP_WIN32_EXIT_PROCESS, SYSCALL_OFFLOAD_OP_WIN32_FREE_VIRTUAL_MEMORY,
+    SYSCALL_OFFLOAD_OP_WIN32_GET_CONSOLE_MODE,
     SYSCALL_OFFLOAD_OP_WIN32_GET_CURRENT_PROCESSOR_NUMBER,
-    SYSCALL_OFFLOAD_OP_WIN32_PROTECT_VIRTUAL_MEMORY,
+    SYSCALL_OFFLOAD_OP_WIN32_GET_NLS_SECTION, SYSCALL_OFFLOAD_OP_WIN32_INIT_NLS,
+    SYSCALL_OFFLOAD_OP_WIN32_MAP_VIEW, SYSCALL_OFFLOAD_OP_WIN32_OPEN_FILE,
+    SYSCALL_OFFLOAD_OP_WIN32_OPEN_KEY, SYSCALL_OFFLOAD_OP_WIN32_PROTECT_VIRTUAL_MEMORY,
+    SYSCALL_OFFLOAD_OP_WIN32_QUERY_FILE, SYSCALL_OFFLOAD_OP_WIN32_QUERY_INFO_PROCESS,
+    SYSCALL_OFFLOAD_OP_WIN32_QUERY_INFO_THREAD, SYSCALL_OFFLOAD_OP_WIN32_QUERY_LOCALE,
     SYSCALL_OFFLOAD_OP_WIN32_QUERY_PROCESS_AFFINITY,
-    SYSCALL_OFFLOAD_OP_WIN32_QUERY_SYSTEM_INFORMATION,
+    SYSCALL_OFFLOAD_OP_WIN32_QUERY_SYSTEM_INFORMATION, SYSCALL_OFFLOAD_OP_WIN32_QUERY_TIME,
     SYSCALL_OFFLOAD_OP_WIN32_QUERY_VIRTUAL_MEMORY, SYSCALL_OFFLOAD_OP_WIN32_READ_FILE,
-    SYSCALL_OFFLOAD_OP_WIN32_SET_CONSOLE_MODE, SYSCALL_OFFLOAD_OP_WIN32_SET_PROCESS_AFFINITY,
-    SYSCALL_OFFLOAD_OP_WIN32_SET_THREAD_AFFINITY, SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE,
+    SYSCALL_OFFLOAD_OP_WIN32_SET_CONSOLE_MODE, SYSCALL_OFFLOAD_OP_WIN32_SET_FILE,
+    SYSCALL_OFFLOAD_OP_WIN32_SET_INFO_PROCESS, SYSCALL_OFFLOAD_OP_WIN32_SET_INFO_THREAD,
+    SYSCALL_OFFLOAD_OP_WIN32_SET_PROCESS_AFFINITY, SYSCALL_OFFLOAD_OP_WIN32_SET_THREAD_AFFINITY,
+    SYSCALL_OFFLOAD_OP_WIN32_TERMINATE_THREAD, SYSCALL_OFFLOAD_OP_WIN32_UNMAP_VIEW,
+    SYSCALL_OFFLOAD_OP_WIN32_WAIT_OBJECT, SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE,
+    SYSCALL_OFFLOAD_OP_WIN32_YIELD,
 };
 use rustos_user_abi::windows::{
     BOOL_FALSE, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION, ERROR_INVALID_HANDLE,
     ERROR_INVALID_LEVEL, ERROR_INVALID_PARAMETER, HANDLE_CURRENT_PROCESS, HANDLE_CURRENT_THREAD,
-    HANDLE_STDERR, HANDLE_STDIN, HANDLE_STDOUT, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
-    PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
-    PAGE_SIZE,
+    HANDLE_STDERR, HANDLE_STDIN, HANDLE_STDOUT, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE,
+    MEM_RESERVE, MEM_TOP_DOWN, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_EXECUTE_WRITECOPY, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_SIZE,
+    PAGE_WRITECOPY, WIN32_EVENT_HANDLE_BASE, WIN32_FD_HANDLE_BASE, WIN32_SECTION_HANDLE_BASE,
 };
 
-const MAX_CONSOLE_IO_BYTES: u64 = 1024 * 1024;
+const MAX_WIN32_IO_BYTES: u64 = 16 * 1024 * 1024;
+const WIN32_HANDLE_RANGE_END: u64 = WIN32_EVENT_HANDLE_BASE + 0x0010_0000;
 
 pub(crate) fn handle_request(
     request: &Win32SyscallOffloadRequest,
@@ -28,11 +41,13 @@ pub(crate) fn handle_request(
     let denied = match request.op {
         SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE => validate_write_file(request),
         SYSCALL_OFFLOAD_OP_WIN32_READ_FILE => validate_read_file(request),
-        SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION => Ok(()),
+        SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION | SYSCALL_OFFLOAD_OP_WIN32_YIELD => Ok(()),
         SYSCALL_OFFLOAD_OP_WIN32_CLOSE => validate_close(request),
         SYSCALL_OFFLOAD_OP_WIN32_GET_CONSOLE_MODE => validate_get_console_mode(request),
         SYSCALL_OFFLOAD_OP_WIN32_SET_CONSOLE_MODE => validate_set_console_mode(request),
-        SYSCALL_OFFLOAD_OP_WIN32_EXIT_PROCESS => Ok(()),
+        SYSCALL_OFFLOAD_OP_WIN32_EXIT_PROCESS | SYSCALL_OFFLOAD_OP_WIN32_TERMINATE_THREAD => {
+            Ok(())
+        }
         SYSCALL_OFFLOAD_OP_WIN32_ALLOC_VIRTUAL_MEMORY => validate_virtual_alloc(request),
         SYSCALL_OFFLOAD_OP_WIN32_FREE_VIRTUAL_MEMORY => validate_virtual_free(request),
         SYSCALL_OFFLOAD_OP_WIN32_PROTECT_VIRTUAL_MEMORY => validate_virtual_protect(request),
@@ -46,6 +61,26 @@ pub(crate) fn handle_request(
         SYSCALL_OFFLOAD_OP_WIN32_GET_CURRENT_PROCESSOR_NUMBER => {
             validate_get_current_processor_number(request)
         }
+        SYSCALL_OFFLOAD_OP_WIN32_OPEN_FILE
+        | SYSCALL_OFFLOAD_OP_WIN32_QUERY_FILE
+        | SYSCALL_OFFLOAD_OP_WIN32_SET_FILE
+        | SYSCALL_OFFLOAD_OP_WIN32_CREATE_SECTION
+        | SYSCALL_OFFLOAD_OP_WIN32_MAP_VIEW
+        | SYSCALL_OFFLOAD_OP_WIN32_UNMAP_VIEW
+        | SYSCALL_OFFLOAD_OP_WIN32_QUERY_INFO_PROCESS
+        | SYSCALL_OFFLOAD_OP_WIN32_SET_INFO_PROCESS
+        | SYSCALL_OFFLOAD_OP_WIN32_QUERY_INFO_THREAD
+        | SYSCALL_OFFLOAD_OP_WIN32_SET_INFO_THREAD
+        | SYSCALL_OFFLOAD_OP_WIN32_QUERY_TIME
+        | SYSCALL_OFFLOAD_OP_WIN32_QUERY_LOCALE
+        | SYSCALL_OFFLOAD_OP_WIN32_OPEN_KEY
+        | SYSCALL_OFFLOAD_OP_WIN32_CREATE_EVENT
+        | SYSCALL_OFFLOAD_OP_WIN32_WAIT_OBJECT
+        | SYSCALL_OFFLOAD_OP_WIN32_CONTINUE
+        | SYSCALL_OFFLOAD_OP_WIN32_INIT_NLS
+        | SYSCALL_OFFLOAD_OP_WIN32_GET_NLS_SECTION
+        | SYSCALL_OFFLOAD_OP_WIN32_DEVICE_IOCTL
+        | SYSCALL_OFFLOAD_OP_WIN32_DUPLICATE_OBJECT => Ok(()),
         _ => Err(ERROR_INVALID_FUNCTION),
     };
     if let Err(error) = denied {
@@ -93,22 +128,31 @@ fn validate_query_system_information(request: &Win32SyscallOffloadRequest) -> Re
         })
 }
 
+fn is_win32_fd_or_pseudo(handle: u64, std_handle: u64, raw32: u64, raw64: u64) -> bool {
+    handle == std_handle
+        || handle == raw32
+        || handle == raw64
+        || (WIN32_FD_HANDLE_BASE..WIN32_SECTION_HANDLE_BASE).contains(&handle)
+}
+
 fn validate_write_file(request: &Win32SyscallOffloadRequest) -> Result<(), u32> {
-    if !matches!(request.arg0, HANDLE_STDOUT | HANDLE_STDERR) {
+    if !is_win32_fd_or_pseudo(request.arg0, HANDLE_STDOUT, 0xffff_fff5, 0xffff_ffff_ffff_fff5)
+        && !is_win32_fd_or_pseudo(request.arg0, HANDLE_STDERR, 0xffff_fff4, 0xffff_ffff_ffff_fff4)
+    {
         return Err(ERROR_INVALID_HANDLE);
     }
     validate_console_io(request.arg1, request.arg2, request.arg4)
 }
 
 fn validate_read_file(request: &Win32SyscallOffloadRequest) -> Result<(), u32> {
-    if request.arg0 != HANDLE_STDIN {
+    if !is_win32_fd_or_pseudo(request.arg0, HANDLE_STDIN, 0xffff_fff6, 0xffff_ffff_ffff_fff6) {
         return Err(ERROR_INVALID_HANDLE);
     }
     validate_console_io(request.arg1, request.arg2, request.arg4)
 }
 
 fn validate_console_io(buffer: u64, len: u64, overlapped: u64) -> Result<(), u32> {
-    if overlapped != 0 || len > MAX_CONSOLE_IO_BYTES || len != 0 && buffer == 0 {
+    if overlapped != 0 || len > MAX_WIN32_IO_BYTES || (len != 0 && buffer == 0) {
         return Err(ERROR_INVALID_PARAMETER);
     }
     Ok(())
@@ -122,7 +166,14 @@ fn validate_close(request: &Win32SyscallOffloadRequest) -> Result<(), u32> {
             | HANDLE_STDERR
             | HANDLE_CURRENT_PROCESS
             | HANDLE_CURRENT_THREAD
-    ) {
+            | 0xffff_fff6
+            | 0xffff_fff5
+            | 0xffff_fff4
+            | 0xffff_ffff_ffff_fff6
+            | 0xffff_ffff_ffff_fff5
+            | 0xffff_ffff_ffff_fff4
+    ) || (WIN32_FD_HANDLE_BASE..WIN32_HANDLE_RANGE_END).contains(&request.arg0)
+    {
         Ok(())
     } else {
         Err(ERROR_INVALID_HANDLE)
@@ -151,7 +202,7 @@ fn validate_virtual_alloc(request: &Win32SyscallOffloadRequest) -> Result<(), u3
     let allocation_type = request.arg2;
     let protect = request.arg3;
     if request.arg1 == 0
-        || allocation_type & !(MEM_COMMIT | MEM_RESERVE) != 0
+        || allocation_type & !(MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN) != 0
         || allocation_type & (MEM_COMMIT | MEM_RESERVE) == 0
         || !valid_protect(protect)
         || request.arg0 != 0 && request.arg0 & (PAGE_SIZE - 1) != 0
@@ -162,10 +213,16 @@ fn validate_virtual_alloc(request: &Win32SyscallOffloadRequest) -> Result<(), u3
 }
 
 fn validate_virtual_free(request: &Win32SyscallOffloadRequest) -> Result<(), u32> {
-    if request.arg0 == 0 || request.arg1 != 0 || request.arg2 != MEM_RELEASE {
+    if request.arg0 == 0 {
         return Err(ERROR_INVALID_PARAMETER);
     }
-    Ok(())
+    if (request.arg2 == MEM_RELEASE && request.arg1 == 0)
+        || (request.arg2 == MEM_DECOMMIT && request.arg1 != 0)
+    {
+        Ok(())
+    } else {
+        Err(ERROR_INVALID_PARAMETER)
+    }
 }
 
 fn validate_virtual_protect(request: &Win32SyscallOffloadRequest) -> Result<(), u32> {
@@ -185,6 +242,13 @@ fn validate_virtual_query(request: &Win32SyscallOffloadRequest) -> Result<(), u3
 fn valid_protect(protect: u64) -> bool {
     matches!(
         protect,
-        PAGE_NOACCESS | PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE
+        PAGE_NOACCESS
+            | PAGE_READONLY
+            | PAGE_READWRITE
+            | PAGE_WRITECOPY
+            | PAGE_EXECUTE
+            | PAGE_EXECUTE_READ
+            | PAGE_EXECUTE_READWRITE
+            | PAGE_EXECUTE_WRITECOPY
     )
 }

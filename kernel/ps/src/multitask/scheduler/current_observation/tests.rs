@@ -94,3 +94,49 @@ fn actual_target_snapshot_retains_original_uid_and_refuses_foreign_pid_or_closed
         None
     });
 }
+
+#[test]
+fn user_target_abi_if_alive_tracks_windows_tasks_until_retired() {
+    let mut boot =
+        super::super::root_creation::tests::bootstrap(crate::user::abi::UserAbi::Windows);
+    boot.entry = x86_64::VirtAddr::new(crate::memory::paging::USER_SPACE_BASE + 0x400000);
+    boot.stack_pointer = x86_64::VirtAddr::new(crate::memory::paging::USER_SPACE_BASE + 0x700000);
+    super::super::root_creation::tests::exec_root_with_release(
+        ID,
+        false,
+        boot,
+        |slot, _handle| {
+            let scope = DispatchPreemption::enter_model(0);
+            assert_eq!(
+                user_target_abi_if_alive_in(ID, ID),
+                Some(crate::user::abi::UserAbi::Windows)
+            );
+            assert_eq!(
+                user_target_abi_if_alive_in(ID, 0),
+                Some(crate::user::abi::UserAbi::Windows)
+            );
+            assert_eq!(user_target_abi_if_alive_in(ID + 1, ID), None);
+            assert_eq!(user_target_abi_if_alive_in(ID, ID + 1), None);
+            assert_eq!(user_target_abi_if_alive_in(0, 0), None);
+            let producer =
+                terminal_quarantine::begin(slot, Some(ID), TaskRetireReason::Exited, false)
+                    .unwrap();
+            assert_eq!(
+                user_target_abi_if_alive_in(ID, ID),
+                Some(crate::user::abi::UserAbi::Windows),
+                "pending close is not committed retirement"
+            );
+            // SAFETY: modeled same masked CPU owns original Producer; no raw leaves
+            // span complete terminal publication or subsequent external fixture ACK.
+            unsafe {
+                terminal_publication::guarded(producer, &|_| 1);
+            }
+            assert_eq!(user_target_abi_if_alive_in(ID, ID), None);
+            assert_eq!(user_target_abi_if_alive_in(ID, 0), None);
+            drop(scope);
+        },
+        |slot, id, handle| {
+            terminal_publication::tests::release_published(slot, id, handle);
+        },
+    );
+}

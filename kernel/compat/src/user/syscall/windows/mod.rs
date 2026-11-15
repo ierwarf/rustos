@@ -2,6 +2,7 @@
 // syscall routing policy. Ring0 keeps module dispatch substrate.
 mod api;
 mod dispatch;
+mod nt_dispatch;
 
 pub use api::Api;
 pub(crate) use dispatch::dispatch_syscall;

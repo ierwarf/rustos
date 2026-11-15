@@ -71,6 +71,7 @@ pub use self::current::{
     exec_user_process_by_pid_checked, exit_current_user_process, exit_current_user_task,
     halt_current_retired_task, inherit_ipc_priority, inherit_pager_fault_priority,
     is_user_process_exiting, is_user_task_alive, linux_task_affinity, linux_thread_snapshot_by_ids,
+    user_target_abi_if_alive,
     live_user_process_identity_by_pid, live_user_process_identity_with_exact_exec_path,
     mark_user_process_exiting, mark_user_process_exiting_once, next_retired_task_cleanup,
     note_process_exit_status, pager_vma_regions_for_process, parent_process_id_of,

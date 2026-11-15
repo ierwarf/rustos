@@ -297,11 +297,179 @@ pub fn syscall_linux_clock_gettime(clock_id: u64, timespec_ptr: u64) -> u64 {
     write_clock_timespec(clock_id, timespec_ptr)
 }
 
+/// Linux `time(tloc)`: returns wall-clock seconds since the Unix epoch and
+/// stores them into `tloc` when non-null.
+pub fn syscall_linux_time(tloc_ptr: u64) -> u64 {
+    let sec = realtime_timespec().tv_sec;
+    if tloc_ptr != 0
+        && let Err(err) = usermem::write_current_user_bytes(tloc_ptr, &sec.to_le_bytes())
+    {
+        return linux_errno(user_pointer_error_to_linux_errno(err));
+    }
+    sec as u64
+}
+
 fn write_clock_timespec(clock_id: u64, timespec_ptr: u64) -> u64 {
     let ts = current_clock_timespec_substrate(clock_id);
     match usermem::write_current_user_bytes(timespec_ptr, as_bytes(&ts)) {
         Ok(()) => 0,
         Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
+    }
+}
+
+pub fn syscall_linux_clock_getres(clock_id: u64, res_ptr: u64) -> u64 {
+    if !is_supported_clock_id(clock_id) {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if res_ptr == 0 {
+        return 0;
+    }
+    let res = LinuxTimespecWire {
+        tv_sec: 0,
+        tv_nsec: 1,
+    };
+    match usermem::write_current_user_bytes(res_ptr, as_bytes(&res)) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
+    }
+}
+
+pub fn syscall_linux_gettimeofday(tv_ptr: u64, tz_ptr: u64) -> u64 {
+    if tv_ptr != 0 {
+        let now = realtime_timespec();
+        let tv = linux_abi::LinuxTimeval {
+            tv_sec: now.tv_sec,
+            tv_usec: now.tv_nsec / 1000,
+        };
+        if let Err(err) = usermem::write_current_user_struct(tv_ptr, &tv) {
+            return linux_errno(user_pointer_error_to_linux_errno(err));
+        }
+    }
+    if tz_ptr != 0 {
+        let tz = [0_u8; 8];
+        if let Err(err) = usermem::write_current_user_bytes(tz_ptr, &tz) {
+            return linux_errno(user_pointer_error_to_linux_errno(err));
+        }
+    }
+    0
+}
+
+pub fn syscall_linux_getrusage(who: i64, rusage_ptr: u64) -> u64 {
+    const RUSAGE_SELF: i64 = 0;
+    const RUSAGE_CHILDREN: i64 = -1;
+    const RUSAGE_THREAD: i64 = 1;
+    if !matches!(who, RUSAGE_SELF | RUSAGE_CHILDREN | RUSAGE_THREAD) {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mut usage = linux_abi::LinuxRusage::default();
+    if matches!(who, RUSAGE_SELF | RUSAGE_THREAD) {
+        if let Some(snapshot) = multitask::current_scheduling_context_runtime_snapshot() {
+            let consumed_us = snapshot.context_consumed_ns / 1000;
+            usage.ru_utime = linux_abi::LinuxTimeval {
+                tv_sec: (consumed_us / 1_000_000) as i64,
+                tv_usec: (consumed_us % 1_000_000) as i64,
+            };
+        }
+    }
+    match usermem::write_current_user_struct(rusage_ptr, &usage) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
+    }
+}
+
+pub fn syscall_linux_times(tms_ptr: u64) -> u64 {
+    const USER_HZ: u64 = 100;
+    const NS_PER_TICK: u64 = 1_000_000_000 / USER_HZ;
+    if tms_ptr != 0 {
+        let utime = multitask::current_scheduling_context_runtime_snapshot()
+            .map(|s| (s.context_consumed_ns / NS_PER_TICK) as i64)
+            .unwrap_or(0);
+        let tms = linux_abi::LinuxTms {
+            tms_utime: utime,
+            tms_stime: 0,
+            tms_cutime: 0,
+            tms_cstime: 0,
+        };
+        if let Err(err) = usermem::write_current_user_struct(tms_ptr, &tms) {
+            return linux_errno(user_pointer_error_to_linux_errno(err));
+        }
+    }
+    crate::arch::rtc::monotonic_nanos() / NS_PER_TICK
+}
+
+pub fn syscall_linux_sysinfo(info_ptr: u64) -> u64 {
+    let info = linux_abi::LinuxSysinfo {
+        uptime: monotonic_timespec().tv_sec,
+        loads: [0; 3],
+        totalram: crate::memory::usable_bytes(),
+        freeram: crate::memory::free_bytes(),
+        sharedram: 0,
+        bufferram: 0,
+        totalswap: 0,
+        freeswap: 0,
+        procs: 1,
+        pad: 0,
+        _pad2: 0,
+        totalhigh: 0,
+        freehigh: 0,
+        mem_unit: 1,
+        _pad3: 0,
+    };
+    match usermem::write_current_user_struct(info_ptr, &info) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
+    }
+}
+
+pub fn syscall_linux_getcpu(cpu_ptr: u64, node_ptr: u64) -> u64 {
+    if cpu_ptr != 0 {
+        let cpu = nucleus_core::util::lockdep::current_cpu_index() as u32;
+        if let Err(err) = usermem::write_current_user_struct(cpu_ptr, &cpu) {
+            return linux_errno(user_pointer_error_to_linux_errno(err));
+        }
+    }
+    if node_ptr != 0 {
+        let node = 0_u32;
+        if let Err(err) = usermem::write_current_user_struct(node_ptr, &node) {
+            return linux_errno(user_pointer_error_to_linux_errno(err));
+        }
+    }
+    0
+}
+
+pub fn syscall_linux_sched_getscheduler(pid: i64) -> u64 {
+    if pid < 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if pid != 0 && multitask::current_user_process_id() != Some(pid as u64)
+        && multitask::current_user_thread_id() != Some(pid as u64)
+    {
+        return linux_errno(LINUX_ESRCH);
+    }
+    0
+}
+
+pub fn syscall_linux_sched_getparam(pid: i64, param_ptr: u64) -> u64 {
+    if pid < 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if pid != 0 && multitask::current_user_process_id() != Some(pid as u64)
+        && multitask::current_user_thread_id() != Some(pid as u64)
+    {
+        return linux_errno(LINUX_ESRCH);
+    }
+    let param = linux_abi::LinuxSchedParam { sched_priority: 0 };
+    match usermem::write_current_user_struct(param_ptr, &param) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
+    }
+}
+
+pub fn syscall_linux_sched_get_priority_minmax(policy: i64) -> u64 {
+    if policy == 0 {
+        0
+    } else {
+        linux_errno(LINUX_EINVAL)
     }
 }
 

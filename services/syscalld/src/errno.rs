@@ -14,6 +14,16 @@ pub const ENOSYS: i32 = 38;
 
 /// Linux `RLIMIT_*` resource codes we care about.
 pub const RLIMIT_STACK: u64 = 3;
+pub const RLIMIT_CORE: u64 = 4;
+pub const RLIMIT_NPROC: u64 = 6;
+pub const RLIMIT_NOFILE: u64 = 7;
+pub const RLIMIT_MEMLOCK: u64 = 8;
+pub const RLIMIT_AS: u64 = 9;
+pub const RLIMIT_COUNT: usize = 10;
+pub const RLIM_INFINITY: u64 = u64::MAX;
+
+/// Linux `getpriority`/`setpriority` `which` constants.
+pub const PRIO_PROCESS: u64 = 0;
 
 // Linux x86_64 syscall number used for syscalld's own IPC receive backoff.
 // Offloaded guest time syscalls must not be proxied through syscalld and then

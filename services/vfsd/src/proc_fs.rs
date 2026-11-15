@@ -2,7 +2,10 @@
 //!
 //! vfsd serves exactly the nodes it can back with kernel-attested identity:
 //!
-//! * `/proc` - directory (empty listing, unchanged).
+//! * `/proc` - directory (`filesystems`, `meminfo`, `mounts`, `self`, `<caller pid>`).
+//! * `/proc/meminfo` - kernel physical memory / swap counters from `SYS_SYSINFO`.
+//! * `/proc/filesystems` - filesystems served by `vfsd`.
+//! * `/proc/mounts`, `/proc/self/mounts`, `/proc/<pid>/mounts` - active VFS mounts.
 //! * `/proc/self` - symlink whose target is the caller's decimal pid.
 //! * `/proc/<pid>` and `/proc/self/` as a path prefix - directory, but only
 //!   when `<pid>` is the caller's own pid.
@@ -12,15 +15,14 @@
 //!   learns another process's path.
 //!
 //! Every other name under `/proc`, including any other pid (live or not), is
-//! ENOENT. Directory iteration, `open` of these nodes, `/proc/<pid>/fd`,
-//! `cmdline`, `status`, `meminfo` and `cpuinfo` are intentionally unsupported:
-//! vfsd has no per-process fd table or counter source, and a fabricated value
-//! would be a fake success path.
+//! ENOENT. Unbacked nodes (`/proc/<pid>/fd`, `cmdline`, `status`, `cpuinfo`,
+//! `stat`) remain unsupported: a fabricated value would be a fake success path.
 //!
 //! Paths passed in must already be canonical (see
 //! `path::normalize_absolute_path`), so `..`, `.`, empty components and
 //! trailing slashes cannot reach the parser.
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -31,8 +33,10 @@ use crate::linux_types::{LinuxStat, LinuxStatx};
 use crate::path::path_inode;
 use crate::{EINVAL, ENOENT};
 
+pub const S_IFREG: u32 = 0o100_000;
 pub const S_IFLNK: u32 = 0o120_000;
 pub const S_IFDIR: u32 = 0o040_000;
+const REG_READONLY_MODE: u32 = S_IFREG | 0o444;
 const SYMLINK_MODE: u32 = S_IFLNK | 0o777;
 const PID_DIR_MODE: u32 = S_IFDIR | 0o555;
 const BLOCK_SIZE: u32 = 4096;
@@ -45,13 +49,28 @@ pub enum ProcNode {
     PidDir,
     /// `/proc/<caller pid>/exe`: symlink to the caller's executable path.
     ExeLink,
+    /// `/proc/meminfo`: kernel memory usage summary.
+    MeminfoFile,
+    /// `/proc/filesystems`: filesystem types implemented by `vfsd`.
+    FilesystemsFile,
+    /// `/proc/mounts` or `/proc/<caller pid>/mounts`: active mount table.
+    MountsFile,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MemInfoSnapshot {
+    pub mem_total_bytes: u64,
+    pub mem_free_bytes: u64,
+    pub buffers_bytes: u64,
+    pub swap_total_bytes: u64,
+    pub swap_free_bytes: u64,
 }
 
 /// Classifies a canonical absolute `path`.
 ///
 /// `None`: not a procfs node handled here (outside `/proc`, or `/proc`
-/// itself, which stays an ordinary empty directory). `Some(Err(ENOENT))`: the
-/// name is under `/proc` but is not a supported node of the caller.
+/// itself). `Some(Err(ENOENT))`: the name is under `/proc` but is not a
+/// supported node of the caller.
 pub fn lookup(path: &str, caller_pid: u64) -> Option<Result<ProcNode, i32>> {
     let rest = path.strip_prefix("/proc/")?;
     let mut parts = rest.split('/');
@@ -60,8 +79,14 @@ pub fn lookup(path: &str, caller_pid: u64) -> Option<Result<ProcNode, i32>> {
     if parts.next().is_some() {
         return Some(Err(ENOENT));
     }
-    if first == "self" && second.is_none() {
-        return Some(Ok(ProcNode::SelfLink));
+    if second.is_none() {
+        match first {
+            "self" => return Some(Ok(ProcNode::SelfLink)),
+            "meminfo" => return Some(Ok(ProcNode::MeminfoFile)),
+            "filesystems" => return Some(Ok(ProcNode::FilesystemsFile)),
+            "mounts" => return Some(Ok(ProcNode::MountsFile)),
+            _ => {}
+        }
     }
     if first != "self" && parse_pid(first) != Some(caller_pid) {
         return Some(Err(ENOENT));
@@ -69,7 +94,62 @@ pub fn lookup(path: &str, caller_pid: u64) -> Option<Result<ProcNode, i32>> {
     Some(match second {
         None => Ok(ProcNode::PidDir),
         Some("exe") => Ok(ProcNode::ExeLink),
+        Some("mounts") => Ok(ProcNode::MountsFile),
         Some(_) => Err(ENOENT),
+    })
+}
+
+pub fn is_virtual_file(node: ProcNode) -> bool {
+    matches!(
+        node,
+        ProcNode::MeminfoFile | ProcNode::FilesystemsFile | ProcNode::MountsFile
+    )
+}
+
+pub fn format_meminfo(snapshot: &MemInfoSnapshot) -> Vec<u8> {
+    let total_kb = snapshot.mem_total_bytes / 1024;
+    let free_kb = snapshot.mem_free_bytes / 1024;
+    let buffers_kb = snapshot.buffers_bytes / 1024;
+    let swap_total_kb = snapshot.swap_total_bytes / 1024;
+    let swap_free_kb = snapshot.swap_free_bytes / 1024;
+    // Fixed 8-digit right alignment keeps file byte length invariant across
+    // open/read/replay for systems under ~95 GiB.
+    format!(
+        "MemTotal:       {:>8} kB\n\
+         MemFree:        {:>8} kB\n\
+         MemAvailable:   {:>8} kB\n\
+         Buffers:        {:>8} kB\n\
+         Cached:         {:>8} kB\n\
+         SwapTotal:      {:>8} kB\n\
+         SwapFree:       {:>8} kB\n",
+        total_kb, free_kb, free_kb, buffers_kb, 0_u64, swap_total_kb, swap_free_kb
+    )
+    .into_bytes()
+}
+
+pub fn format_filesystems() -> &'static [u8] {
+    b"nodev\tsysfs\nnodev\tproc\nnodev\tdevtmpfs\nnodev\ttmpfs\n\tvfat\n"
+}
+
+pub fn format_mounts(has_boot_volume: bool) -> Vec<u8> {
+    let mut out = String::new();
+    if has_boot_volume {
+        out.push_str("boot / vfat ro 0 0\n");
+    }
+    out.push_str("devtmpfs /dev devtmpfs rw,nosuid 0 0\n");
+    out.push_str("proc /proc proc ro,nosuid,nodev,noexec 0 0\n");
+    out.push_str("sysfs /sys sysfs ro,nosuid,nodev,noexec 0 0\n");
+    out.push_str("tmpfs /run tmpfs rw,nosuid,nodev 0 0\n");
+    out.into_bytes()
+}
+
+/// Returns whether `path` is a read-only synthetic `/sys` directory and its
+/// static child directory names.
+pub fn sys_dir_children(path: &str) -> Option<&'static [&'static str]> {
+    Some(match path {
+        "/sys" => &["class", "devices", "fs", "kernel"],
+        "/sys/class" | "/sys/devices" | "/sys/fs" | "/sys/kernel" => &[],
+        _ => return None,
     })
 }
 
@@ -96,7 +176,10 @@ pub fn link_target(node: ProcNode, caller_pid: u64, exec_path: &[u8]) -> Result<
             }
             Ok(exec_path.to_vec())
         }
-        ProcNode::PidDir => Err(EINVAL),
+        ProcNode::PidDir
+        | ProcNode::MeminfoFile
+        | ProcNode::FilesystemsFile
+        | ProcNode::MountsFile => Err(EINVAL),
     }
 }
 
@@ -135,6 +218,9 @@ fn node_inode(node: ProcNode, caller_pid: u64) -> u64 {
             name.push_str(core::str::from_utf8(&pid).unwrap_or(""));
             name.push_str("/exe");
         }
+        ProcNode::MeminfoFile => name.push_str("meminfo"),
+        ProcNode::FilesystemsFile => name.push_str("filesystems"),
+        ProcNode::MountsFile => name.push_str("mounts"),
     }
     path_inode(name.as_bytes())
 }
@@ -143,6 +229,9 @@ fn node_mode(node: ProcNode) -> u32 {
     match node {
         ProcNode::PidDir => PID_DIR_MODE,
         ProcNode::SelfLink | ProcNode::ExeLink => SYMLINK_MODE,
+        ProcNode::MeminfoFile | ProcNode::FilesystemsFile | ProcNode::MountsFile => {
+            REG_READONLY_MODE
+        }
     }
 }
 
@@ -209,10 +298,60 @@ mod tests {
         assert_eq!(lookup("/proc/07/exe", 7), Some(Err(ENOENT)));
         assert_eq!(lookup("/proc/+7", 7), Some(Err(ENOENT)));
         assert_eq!(lookup("/proc/1/exe", 0), Some(Err(ENOENT)));
-        assert_eq!(lookup("/proc/meminfo", 7), Some(Err(ENOENT)));
+        assert_eq!(lookup("/proc/meminfo", 7), Some(Ok(ProcNode::MeminfoFile)));
+        assert_eq!(
+            lookup("/proc/filesystems", 7),
+            Some(Ok(ProcNode::FilesystemsFile))
+        );
+        assert_eq!(lookup("/proc/mounts", 7), Some(Ok(ProcNode::MountsFile)));
+        assert_eq!(
+            lookup("/proc/self/mounts", 7),
+            Some(Ok(ProcNode::MountsFile))
+        );
+        assert_eq!(lookup("/proc/7/mounts", 7), Some(Ok(ProcNode::MountsFile)));
+        assert_eq!(lookup("/proc/cpuinfo", 7), Some(Err(ENOENT)));
         assert_eq!(lookup("/proc/self/fd", 7), Some(Err(ENOENT)));
         assert_eq!(lookup("/proc/self/exe/x", 7), Some(Err(ENOENT)));
         assert_eq!(lookup("/proc/self/cmdline", 7), Some(Err(ENOENT)));
+    }
+
+    #[test]
+    fn meminfo_filesystems_mounts_and_sys_format() {
+        let mem = String::from_utf8(format_meminfo(&MemInfoSnapshot {
+            mem_total_bytes: 512 * 1024 * 1024,
+            mem_free_bytes: 256 * 1024 * 1024,
+            buffers_bytes: 0,
+            swap_total_bytes: 0,
+            swap_free_bytes: 0,
+        }))
+        .unwrap();
+        assert!(mem.contains("MemTotal:         524288 kB\n"));
+        assert!(mem.contains("MemFree:          262144 kB\n"));
+        assert!(mem.contains("MemAvailable:     262144 kB\n"));
+        assert!(mem.contains("SwapTotal:             0 kB\n"));
+
+        let fs = core::str::from_utf8(format_filesystems()).unwrap();
+        assert!(fs.contains("nodev\tsysfs\n"));
+        assert!(fs.contains("nodev\tproc\n"));
+        assert!(fs.contains("\tvfat\n"));
+
+        let mounts_no_boot = String::from_utf8(format_mounts(false)).unwrap();
+        assert!(!mounts_no_boot.contains("vfat"));
+        assert!(mounts_no_boot.contains("proc /proc proc"));
+        assert!(mounts_no_boot.contains("sysfs /sys sysfs"));
+        let mounts_boot = String::from_utf8(format_mounts(true)).unwrap();
+        assert!(mounts_boot.starts_with("boot / vfat ro 0 0\n"));
+
+        assert_eq!(
+            sys_dir_children("/sys"),
+            Some(&["class", "devices", "fs", "kernel"][..])
+        );
+        assert_eq!(sys_dir_children("/sys/kernel"), Some(&[][..]));
+        assert_eq!(sys_dir_children("/sys/nonexistent"), None);
+
+        let stat = node_stat(ProcNode::MeminfoFile, 7, mem.len() as u64);
+        let mode = u32::from_le_bytes(stat[24..28].try_into().unwrap());
+        assert_eq!(mode & 0o170_000, S_IFREG);
     }
 
     #[test]

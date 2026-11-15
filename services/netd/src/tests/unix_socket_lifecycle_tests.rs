@@ -435,3 +435,38 @@ fn listener_close_at_exact_aligned_custody_cap_emits_every_control() {
     assert_eq!(released, expected);
     assert!(response.payload_len as usize <= SOCKET_CONTROL_BUFFER_CAPACITY);
 }
+
+#[test]
+fn abstract_unix_addresses_roundtrip_and_stay_distinct_from_filesystem() {
+    let make_req = |sun_path: &[u8]| {
+        let mut req = NetdIpcRequest::default();
+        req.payload[..2].copy_from_slice(&(linux_abi::AF_UNIX as u16).to_ne_bytes());
+        req.payload[2..2 + sun_path.len()].copy_from_slice(sun_path);
+        req.payload_len = (2 + sun_path.len()) as u32;
+        req
+    };
+
+    let raw_abs = b"\0bus\0node";
+    let abs = sockaddr_path_from_payload(&make_req(raw_abs)).unwrap();
+    assert_eq!(abs, UnixAddress::Abstract(raw_abs.to_vec()));
+    assert_ne!(abs, UnixAddress::Filesystem("bus\0node".into()));
+
+    let mut resp = NetdIpcResponse::default();
+    assert_eq!(sockaddr_payload(Some(&abs), &mut resp), Ok(0));
+    assert_eq!(resp.payload_len as usize, 2 + raw_abs.len());
+    assert_eq!(&resp.payload[2..2 + raw_abs.len()], raw_abs);
+
+    // Exact UNIX_PATH_MAX abstract name succeeds without needing a trailing NUL.
+    let max_abs = vec![0u8; linux_abi::UNIX_PATH_MAX];
+    assert!(sockaddr_path_from_payload(&make_req(&max_abs)).is_ok());
+
+    // Overlong abstract name (> UNIX_PATH_MAX) is rejected.
+    let too_long = vec![0u8; linux_abi::UNIX_PATH_MAX + 1];
+    assert_eq!(sockaddr_path_from_payload(&make_req(&too_long)), Err(libc::EINVAL));
+
+    // Empty sockaddr_un (len == sizeof(sa_family_t)) requests autobind on bind,
+    // while connect refuses it with EINVAL.
+    let empty = make_req(&[]);
+    assert_eq!(sockaddr_bind_address_from_payload(&empty), Ok(None));
+    assert_eq!(sockaddr_path_from_payload(&empty), Err(libc::EINVAL));
+}

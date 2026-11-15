@@ -2,7 +2,7 @@ mod block_broker_ops;
 mod broker_ops;
 mod debug_ops;
 mod dispatch_ext;
-mod error_ops;
+pub(super) mod error_ops;
 mod int_args;
 mod process_termination;
 pub(crate) use process_termination::{record_linux_process_fault_termination, record_linux_process_termination};
@@ -24,7 +24,7 @@ mod library_object_ops;
 mod proc_broker_ops;
 mod runtime_maintenance;
 mod scheduler_ops;
-mod service_ops;
+pub(super) mod service_ops;
 mod smp_qualification_ops;
 mod support;
 mod syscalld_ops;
@@ -88,9 +88,11 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_ACCEPT, SYSCALL_OFFLOAD_OP_LINUX_BIND, SYSCALL_OFFLOAD_OP_LINUX_BRK,
     SYSCALL_OFFLOAD_OP_LINUX_CLOSE, SYSCALL_OFFLOAD_OP_LINUX_CONNECT, SYSCALL_OFFLOAD_OP_LINUX_DUP,
     SYSCALL_OFFLOAD_OP_LINUX_GETEGID, SYSCALL_OFFLOAD_OP_LINUX_GETEUID,
-    SYSCALL_OFFLOAD_OP_LINUX_GETGID, SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME,
-    SYSCALL_OFFLOAD_OP_LINUX_GETPGID, SYSCALL_OFFLOAD_OP_LINUX_GETPPID,
-    SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM, SYSCALL_OFFLOAD_OP_LINUX_GETSID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETGID, SYSCALL_OFFLOAD_OP_LINUX_GETGROUPS,
+    SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME, SYSCALL_OFFLOAD_OP_LINUX_GETPGID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETPPID, SYSCALL_OFFLOAD_OP_LINUX_GETPRIORITY,
+    SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM, SYSCALL_OFFLOAD_OP_LINUX_GETRESGID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETRESUID, SYSCALL_OFFLOAD_OP_LINUX_GETSID,
     SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME, SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT,
     SYSCALL_OFFLOAD_OP_LINUX_GETUID, SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST,
     SYSCALL_OFFLOAD_OP_LINUX_LISTEN, SYSCALL_OFFLOAD_OP_LINUX_MADVISE,
@@ -101,7 +103,8 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_RSEQ, SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY,
     SYSCALL_OFFLOAD_OP_LINUX_SCHED_SETAFFINITY, SYSCALL_OFFLOAD_OP_LINUX_SENDMSG,
     SYSCALL_OFFLOAD_OP_LINUX_SENDTO, SYSCALL_OFFLOAD_OP_LINUX_SETGID,
-    SYSCALL_OFFLOAD_OP_LINUX_SETPGID, SYSCALL_OFFLOAD_OP_LINUX_SETSID,
+    SYSCALL_OFFLOAD_OP_LINUX_SETPGID, SYSCALL_OFFLOAD_OP_LINUX_SETPRIORITY,
+    SYSCALL_OFFLOAD_OP_LINUX_SETSID,
     SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT, SYSCALL_OFFLOAD_OP_LINUX_SETUID,
     SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST, SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN,
     SYSCALL_OFFLOAD_OP_LINUX_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
@@ -275,6 +278,12 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_PPOLL => {
             syscall_linux_ppoll(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
         }
+        linux_abi::SYS_SELECT => {
+            syscall_linux_select(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+        }
+        linux_abi::SYS_PSELECT6 => syscall_linux_pselect6(
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+        ),
         linux_abi::SYS_EPOLL_WAIT => {
             syscall_linux_epoll_wait(frame.rdi, frame.rsi, frame.rdx, frame.r10 as i32 as i64)
         }
@@ -372,6 +381,7 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         }
         linux_abi::SYS_SET_TID_ADDRESS => syscall_linux_set_tid_address(frame.rdi),
         linux_abi::SYS_CLOCK_GETTIME => syscall_linux_clock_gettime(frame.rdi, frame.rsi),
+        linux_abi::SYS_TIME => syscall_linux_time(frame.rdi),
         linux_abi::SYS_CLOCK_NANOSLEEP => {
             syscall_linux_clock_nanosleep(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }
