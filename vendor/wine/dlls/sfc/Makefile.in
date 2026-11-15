@@ -1,0 +1,7 @@
+MODULE    = sfc.dll
+IMPORTLIB = sfc
+
+EXTRADLLFLAGS = -Wl,-noentry
+
+SOURCES = \
+	sfc.spec

@@ -1,0 +1,8 @@
+MODULE    = dllhost.exe
+IMPORTS   = ole32 uuid
+ENABLE_ARCHS = $(PE_ARCHS)
+
+EXTRADLLFLAGS = -mwindows -municode
+
+SOURCES = \
+	dllhost.c

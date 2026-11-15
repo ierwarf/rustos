@@ -1,0 +1,9 @@
+MODULE    = winevdm.exe
+IMPORTS   = user32 kernel
+ENABLE_ARCHS = $(WIN16_ARCH)
+
+EXTRADLLFLAGS = -mwindows
+
+SOURCES = \
+	winevdm.c \
+	winevdm.rc

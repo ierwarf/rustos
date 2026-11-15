@@ -1,0 +1,6 @@
+MODULE    = w32sys.dll16
+ENABLE_ARCHS = $(WIN16_ARCH)
+EXTRADLLFLAGS = -m16 -Wb,--main-module,w32skrnl.dll
+
+SOURCES = \
+	w32sys.c

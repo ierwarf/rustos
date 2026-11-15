@@ -1,0 +1,6 @@
+MODULE    = system.drv16
+ENABLE_ARCHS = $(WIN16_ARCH)
+EXTRADLLFLAGS = -m16
+
+SOURCES = \
+	system.c

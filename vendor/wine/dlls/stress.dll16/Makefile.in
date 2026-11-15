@@ -1,0 +1,6 @@
+MODULE    = stress.dll16
+ENABLE_ARCHS = $(WIN16_ARCH)
+EXTRADLLFLAGS = -m16
+
+SOURCES = \
+	stress.c

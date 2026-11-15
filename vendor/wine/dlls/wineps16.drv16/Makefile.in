@@ -1,0 +1,7 @@
+MODULE    = wineps16.drv16
+IMPORTS   = winspool
+ENABLE_ARCHS = $(WIN16_ARCH)
+EXTRADLLFLAGS = -m16
+
+SOURCES = \
+	driver.c

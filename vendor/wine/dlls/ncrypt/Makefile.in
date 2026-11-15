@@ -1,0 +1,6 @@
+IMPORTLIB = ncrypt
+MODULE    = ncrypt.dll
+IMPORTS   = bcrypt
+
+SOURCES = \
+	main.c

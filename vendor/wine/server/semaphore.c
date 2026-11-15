@@ -1,0 +1,259 @@
+/*
+ * Server-side semaphore management
+ *
+ * Copyright (C) 1998 Alexandre Julliard
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#include "config.h"
+
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <sys/types.h>
+
+#include "ntstatus.h"
+#include "windef.h"
+#include "winternl.h"
+
+#include "handle.h"
+#include "thread.h"
+#include "request.h"
+#include "security.h"
+
+static const WCHAR semaphore_name[] = {'S','e','m','a','p','h','o','r','e'};
+
+struct type_descr semaphore_type =
+{
+    { semaphore_name, sizeof(semaphore_name) },   /* name */
+    SEMAPHORE_ALL_ACCESS,                         /* valid_access */
+    {                                             /* mapping */
+        STANDARD_RIGHTS_READ | SEMAPHORE_QUERY_STATE,
+        STANDARD_RIGHTS_WRITE | SEMAPHORE_MODIFY_STATE,
+        STANDARD_RIGHTS_EXECUTE | SYNCHRONIZE,
+        SEMAPHORE_ALL_ACCESS
+    },
+};
+
+struct semaphore_sync
+{
+    struct object       obj;                /* object header */
+    unsigned int        count;              /* current count */
+    unsigned int        max;                /* maximum possible count */
+};
+
+static void semaphore_sync_dump( struct object *obj, int verbose );
+static int semaphore_sync_signaled( struct object *obj, struct wait_queue_entry *entry );
+static void semaphore_sync_satisfied( struct object *obj, struct wait_queue_entry *entry );
+
+static const struct object_ops semaphore_sync_ops =
+{
+    .size         = sizeof(struct semaphore_sync),
+    .type         = &no_type,
+    .dump         = semaphore_sync_dump,
+    .add_queue    = add_queue,
+    .remove_queue = remove_queue,
+    .signaled     = semaphore_sync_signaled,
+    .satisfied    = semaphore_sync_satisfied,
+};
+
+static int release_semaphore( struct semaphore_sync *sem, unsigned int count,
+                              unsigned int *prev )
+{
+    if (prev) *prev = sem->count;
+    if (sem->count + count < sem->count || sem->count + count > sem->max)
+    {
+        set_error( STATUS_SEMAPHORE_LIMIT_EXCEEDED );
+        return 0;
+    }
+    else if (sem->count)
+    {
+        /* there cannot be any thread to wake up if the count is != 0 */
+        sem->count += count;
+    }
+    else
+    {
+        sem->count = count;
+        wake_up( &sem->obj, count );
+    }
+    return 1;
+}
+
+static void semaphore_sync_dump( struct object *obj, int verbose )
+{
+    struct semaphore_sync *sem = (struct semaphore_sync *)obj;
+    assert( obj->ops == &semaphore_sync_ops );
+    fprintf( stderr, "Semaphore count=%d max=%d\n", sem->count, sem->max );
+}
+
+static int semaphore_sync_signaled( struct object *obj, struct wait_queue_entry *entry )
+{
+    struct semaphore_sync *sem = (struct semaphore_sync *)obj;
+    assert( obj->ops == &semaphore_sync_ops );
+    return (sem->count > 0);
+}
+
+static void semaphore_sync_satisfied( struct object *obj, struct wait_queue_entry *entry )
+{
+    struct semaphore_sync *sem = (struct semaphore_sync *)obj;
+    assert( obj->ops == &semaphore_sync_ops );
+    assert( sem->count );
+    sem->count--;
+}
+
+static struct object *create_semaphore_sync( unsigned int initial, unsigned int max )
+{
+    struct semaphore_sync *sem;
+
+    if (get_inproc_device_fd() >= 0) return (struct object *)create_inproc_semaphore_sync( initial, max );
+
+    if (!(sem = alloc_object( &semaphore_sync_ops ))) return NULL;
+    sem->count = initial;
+    sem->max   = max;
+    return &sem->obj;
+}
+
+struct semaphore
+{
+    struct object          obj;    /* object header */
+    struct object         *sync;   /* semaphore sync object */
+};
+
+struct semaphore_init_data
+{
+    unsigned int initial;
+    unsigned int max;
+};
+
+static void semaphore_dump( struct object *obj, int verbose );
+static bool semaphore_init( struct object *obj, const void *init_data );
+static struct object *semaphore_get_sync( struct object *obj );
+static int semaphore_signal( struct object *obj, unsigned int access, int signal );
+static void semaphore_destroy( struct object *obj );
+
+static const struct object_ops semaphore_ops =
+{
+    .size     = sizeof(struct semaphore),
+    .type     = &semaphore_type,
+    .dump     = semaphore_dump,
+    .init     = semaphore_init,
+    .signal   = semaphore_signal,
+    .get_sync = semaphore_get_sync,
+    .destroy  = semaphore_destroy,
+};
+
+static void semaphore_dump( struct object *obj, int verbose )
+{
+    struct semaphore *sem = (struct semaphore *)obj;
+    assert( obj->ops == &semaphore_ops );
+    sem->sync->ops->dump( sem->sync, verbose );
+}
+
+static bool semaphore_init( struct object *obj, const void *init_data )
+{
+    struct semaphore *sem = (struct semaphore *)obj;
+    const struct semaphore_init_data *data = init_data;
+
+    return !!(sem->sync = create_semaphore_sync( data->initial, data->max ));
+}
+
+static struct object *semaphore_get_sync( struct object *obj )
+{
+    struct semaphore *sem = (struct semaphore *)obj;
+    assert( obj->ops == &semaphore_ops );
+    return grab_object( sem->sync );
+}
+
+static int semaphore_signal( struct object *obj, unsigned int access, int signal )
+{
+    struct semaphore *sem = (struct semaphore *)obj;
+    assert( obj->ops == &semaphore_ops );
+
+    assert( sem->sync->ops == &semaphore_sync_ops ); /* never called with inproc syncs */
+    assert( signal == -1 ); /* always called from signal_object */
+
+    if (!(access & SEMAPHORE_MODIFY_STATE))
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return 0;
+    }
+    return release_semaphore( (struct semaphore_sync *)sem->sync, 1, NULL );
+}
+
+static void semaphore_destroy( struct object *obj )
+{
+    struct semaphore *sem = (struct semaphore *)obj;
+    assert( obj->ops == &semaphore_ops );
+    if (sem->sync) release_object( sem->sync );
+}
+
+/* create a semaphore */
+DECL_HANDLER(create_semaphore)
+{
+    struct semaphore_init_data data = { .initial = req->initial, .max = req->max };
+    struct object_params params = { .ops = &semaphore_ops, .access = req->access, .init_data = &data };
+
+    if (!req->max || (req->initial > req->max))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+
+    if (!get_req_object_attributes( &params )) return;
+    reply->handle = create_named_obj_handle( current->process, &params );
+    if (params.root) release_object( params.root );
+}
+
+/* open a handle to a semaphore */
+DECL_HANDLER(open_semaphore)
+{
+    reply->handle = open_object( current->process, req->rootdir, req->access,
+                                 &semaphore_ops, get_req_unicode_str(), req->attributes );
+}
+
+/* release a semaphore */
+DECL_HANDLER(release_semaphore)
+{
+    struct semaphore *sem;
+
+    if ((sem = (struct semaphore *)get_handle_obj( current->process, req->handle,
+                                                   SEMAPHORE_MODIFY_STATE, &semaphore_ops )))
+    {
+        struct semaphore_sync *sync = (struct semaphore_sync *)sem->sync;
+        assert( sem->sync->ops == &semaphore_sync_ops ); /* never called with inproc syncs */
+
+        release_semaphore( sync, req->count, &reply->prev_count );
+        release_object( sem );
+    }
+}
+
+/* query details about the semaphore */
+DECL_HANDLER(query_semaphore)
+{
+    struct semaphore *sem;
+
+    if ((sem = (struct semaphore *)get_handle_obj( current->process, req->handle,
+                                                   SEMAPHORE_QUERY_STATE, &semaphore_ops )))
+    {
+        struct semaphore_sync *sync = (struct semaphore_sync *)sem->sync;
+        assert( sem->sync->ops == &semaphore_sync_ops ); /* never called with inproc syncs */
+
+        reply->current = sync->count;
+        reply->max = sync->max;
+        release_object( sem );
+    }
+}

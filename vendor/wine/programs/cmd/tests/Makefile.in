@@ -1,0 +1,7 @@
+TESTDLL   = cmd.exe
+
+SOURCES = \
+	batch.c \
+	console.c \
+	directory.c \
+	rsrc.rc

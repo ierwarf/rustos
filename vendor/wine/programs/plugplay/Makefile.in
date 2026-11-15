@@ -1,0 +1,9 @@
+MODULE    = plugplay.exe
+IMPORTS   = advapi32 rpcrt4 user32
+ENABLE_ARCHS = $(HOST_ARCH)
+
+EXTRADLLFLAGS = -mconsole -municode
+
+SOURCES = \
+	main.c \
+	plugplay.idl

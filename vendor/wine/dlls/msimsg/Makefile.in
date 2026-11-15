@@ -1,0 +1,6 @@
+MODULE = msimsg.dll
+
+EXTRADLLFLAGS = -Wl,-noentry
+
+SOURCES = \
+	msimsg.rc

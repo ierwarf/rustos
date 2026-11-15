@@ -1,0 +1,8 @@
+MODULE    = kerberos.dll
+UNIXLIB   = kerberos.so
+UNIX_LIBS   = $(KRB5_LIBS) $(GSSAPI_LIBS)
+UNIX_CFLAGS = $(KRB5_CFLAGS) $(GSSAPI_CFLAGS)
+
+SOURCES = \
+	krb5_ap.c \
+	unixlib.c

@@ -1,0 +1,6 @@
+MODULE    = win87em.dll16
+ENABLE_ARCHS = $(WIN16_ARCH)
+EXTRADLLFLAGS = -m16
+
+SOURCES = \
+	win87em.c

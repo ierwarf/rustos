@@ -1,0 +1,9 @@
+MODULE    = dpnsvr.exe
+ENABLE_ARCHS = i386 x86_64 arm64ec
+
+EXTRADLLFLAGS = -mwindows -municode
+
+VER_PRODUCTVERSION = 5,3,0,900
+
+SOURCES = \
+	main.c

@@ -1,0 +1,7 @@
+MODULE    = rundll.exe16
+ENABLE_ARCHS = $(WIN16_ARCH)
+
+EXTRADLLFLAGS = -mconsole -m16
+
+SOURCES = \
+	rundll.c

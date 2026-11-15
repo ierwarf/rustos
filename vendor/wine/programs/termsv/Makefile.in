@@ -1,0 +1,8 @@
+MODULE    = termsv.exe
+IMPORTS   = advapi32
+ENABLE_ARCHS = $(HOST_ARCH)
+
+EXTRADLLFLAGS = -mconsole -municode
+
+SOURCES = \
+	main.c

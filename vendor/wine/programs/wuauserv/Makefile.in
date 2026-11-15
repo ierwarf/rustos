@@ -1,0 +1,8 @@
+MODULE    = wuauserv.exe
+IMPORTS   = advapi32
+ENABLE_ARCHS = $(HOST_ARCH)
+
+EXTRADLLFLAGS = -mconsole
+
+SOURCES = \
+	main.c

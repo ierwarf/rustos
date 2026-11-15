@@ -1,0 +1,6 @@
+MODULE    = mferror.dll
+
+EXTRADLLFLAGS = -Wl,-noentry
+
+SOURCES = \
+	mferror.mc

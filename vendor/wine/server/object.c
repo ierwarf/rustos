@@ -1,0 +1,860 @@
+/*
+ * Server-side objects
+ *
+ * Copyright (C) 1998 Alexandre Julliard
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+#include "config.h"
+
+#include <assert.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdarg.h>
+#include <sys/types.h>
+#ifdef HAVE_VALGRIND_MEMCHECK_H
+#include <valgrind/memcheck.h>
+#endif
+
+#include "ntstatus.h"
+#include "winternl.h"
+
+#include "file.h"
+#include "process.h"
+#include "thread.h"
+#include "unicode.h"
+#include "security.h"
+#include "handle.h"
+#include "request.h"
+
+
+struct namespace
+{
+    unsigned int        hash_size;       /* size of hash table */
+    struct list         names[1];        /* array of hash entry lists */
+};
+
+
+struct type_descr no_type =
+{
+    { NULL, 0 },                /* name */
+    STANDARD_RIGHTS_REQUIRED,   /* valid_access */
+    {                           /* mapping */
+        STANDARD_RIGHTS_READ,
+        STANDARD_RIGHTS_WRITE,
+        STANDARD_RIGHTS_EXECUTE,
+        STANDARD_RIGHTS_REQUIRED
+    },
+};
+
+struct reserve
+{
+    struct object obj;          /* object header */
+    int    type;                /* reserve object type. See MEMORY_RESERVE_OBJECT_TYPE */
+    struct object *bound_obj;   /* object using reserve object */
+    /* BYTE *memory */;         /* reserved memory */
+};
+
+static const WCHAR apc_reserve_type_name[] = {'U','s','e','r','A','p','c','R','e','s','e','r','v','e'};
+static const WCHAR completion_reserve_name[] = {'I','o','C','o','m','p','l','e','t','i','o','n','R','e','s','e','r','v','e'};
+
+struct type_descr apc_reserve_type =
+{
+    { apc_reserve_type_name, sizeof(apc_reserve_type_name) },       /* name */
+    STANDARD_RIGHTS_REQUIRED | 0x3,                                 /* valid_access */
+    {                                                               /* mapping */
+        STANDARD_RIGHTS_READ | 0x1,
+        STANDARD_RIGHTS_WRITE | 0x2,
+        STANDARD_RIGHTS_EXECUTE,
+        STANDARD_RIGHTS_REQUIRED | 0x3
+    },
+};
+
+struct type_descr completion_reserve_type =
+{
+    { completion_reserve_name, sizeof(completion_reserve_name) },   /* name */
+    STANDARD_RIGHTS_REQUIRED | 0x3,                                 /* valid_access */
+    {                                                               /* mapping */
+        STANDARD_RIGHTS_READ | 0x1,
+        STANDARD_RIGHTS_WRITE | 0x2,
+        STANDARD_RIGHTS_EXECUTE,
+        STANDARD_RIGHTS_REQUIRED | 0x3
+    },
+};
+
+struct reserve_init_data
+{
+    int type;
+};
+
+static void reserve_dump( struct object *obj, int verbose );
+static bool reserve_init( struct object *obj, const void *init_data );
+
+static const struct object_ops apc_reserve_ops =
+{
+    .size = sizeof(struct reserve),
+    .type = &apc_reserve_type,
+    .dump = reserve_dump,
+    .init = reserve_init,
+};
+
+static const struct object_ops completion_reserve_ops =
+{
+    .size = sizeof(struct reserve),
+    .type = &completion_reserve_type,
+    .dump = reserve_dump,
+    .init = reserve_init,
+};
+
+#ifdef DEBUG_OBJECTS
+static struct list object_list = LIST_INIT(object_list);
+
+void dump_objects(void)
+{
+    struct object *ptr;
+
+    LIST_FOR_EACH_ENTRY( ptr, &object_list, struct object, obj_list )
+    {
+        fprintf( stderr, "%p:%d: ", ptr, ptr->refcount );
+        dump_object_name( ptr );
+        ptr->ops->dump( ptr, 1 );
+    }
+}
+
+void close_objects(void)
+{
+    /* release the permanent objects */
+    for (;;)
+    {
+        struct object *obj;
+        int found = 0;
+
+        LIST_FOR_EACH_ENTRY( obj, &object_list, struct object, obj_list )
+        {
+            if (!(found = obj->is_permanent)) continue;
+            obj->is_permanent = 0;
+            release_object( obj );
+            break;
+        }
+        if (!found) break;
+    }
+
+    dump_objects();  /* dump any remaining objects */
+}
+
+#endif  /* DEBUG_OBJECTS */
+
+/*****************************************************************/
+
+/* mark a block of memory as not accessible for debugging purposes */
+void mark_block_noaccess( void *ptr, size_t size )
+{
+    memset( ptr, 0xfe, size );
+#if defined(VALGRIND_MAKE_MEM_NOACCESS)
+    VALGRIND_DISCARD( VALGRIND_MAKE_MEM_NOACCESS( ptr, size ) );
+#elif defined(VALGRIND_MAKE_NOACCESS)
+    VALGRIND_DISCARD( VALGRIND_MAKE_NOACCESS( ptr, size ) );
+#endif
+}
+
+/* mark a block of memory as uninitialized for debugging purposes */
+void mark_block_uninitialized( void *ptr, size_t size )
+{
+#if defined(VALGRIND_MAKE_MEM_UNDEFINED)
+    VALGRIND_DISCARD( VALGRIND_MAKE_MEM_UNDEFINED( ptr, size ));
+#elif defined(VALGRIND_MAKE_WRITABLE)
+    VALGRIND_DISCARD( VALGRIND_MAKE_WRITABLE( ptr, size ));
+#endif
+    memset( ptr, 0x55, size );
+#if defined(VALGRIND_MAKE_MEM_UNDEFINED)
+    VALGRIND_DISCARD( VALGRIND_MAKE_MEM_UNDEFINED( ptr, size ));
+#elif defined(VALGRIND_MAKE_WRITABLE)
+    VALGRIND_DISCARD( VALGRIND_MAKE_WRITABLE( ptr, size ));
+#endif
+}
+
+/* malloc replacement */
+void *mem_alloc( size_t size )
+{
+    void *ptr = malloc( size );
+    if (ptr) mark_block_uninitialized( ptr, size );
+    else set_error( STATUS_NO_MEMORY );
+    return ptr;
+}
+
+/* duplicate a block of memory */
+void *memdup( const void *data, size_t len )
+{
+    void *ptr = malloc( len );
+    if (ptr) memcpy( ptr, data, len );
+    else set_error( STATUS_NO_MEMORY );
+    return ptr;
+}
+
+
+/*****************************************************************/
+
+void namespace_add( struct namespace *namespace, struct object_name *ptr )
+{
+    unsigned int hash = hash_strW( ptr->name, ptr->len, namespace->hash_size );
+
+    list_add_head( &namespace->names[hash], &ptr->entry );
+}
+
+/* allocate a name for an object */
+static struct object_name *alloc_name( struct unicode_str name )
+{
+    struct object_name *ptr;
+
+    if ((ptr = mem_alloc( sizeof(*ptr) + name.len - sizeof(ptr->name) )))
+    {
+        ptr->len = name.len;
+        ptr->parent = NULL;
+        memcpy( ptr->name, name.str, name.len );
+    }
+    return ptr;
+}
+
+/* get the name of an existing object */
+const WCHAR *get_object_name( struct object *obj, data_size_t *len )
+{
+    struct object_name *ptr = obj->name;
+    if (!ptr) return NULL;
+    *len = ptr->len;
+    return ptr->name;
+}
+
+/* get the full path name of an existing object */
+WCHAR *default_get_full_name( struct object *obj, data_size_t max, data_size_t *ret_len )
+{
+    static const WCHAR backslash = '\\';
+    struct object *ptr = obj;
+    data_size_t len = 0;
+    char *ret;
+
+    while (ptr && ptr->name)
+    {
+        struct object_name *name = ptr->name;
+        len += name->len + sizeof(WCHAR);
+        ptr = name->parent;
+    }
+    if (!len) return NULL;
+    if (!(ret = malloc( len ))) return NULL;
+
+    *ret_len = len;
+    while (obj && obj->name)
+    {
+        struct object_name *name = obj->name;
+        memcpy( ret + len - name->len, name->name, name->len );
+        len -= name->len + sizeof(WCHAR);
+        memcpy( ret + len, &backslash, sizeof(WCHAR) );
+        obj = name->parent;
+    }
+    if (*ret_len > max) set_error( STATUS_INFO_LENGTH_MISMATCH );
+    return (WCHAR *)ret;
+}
+
+/* allocate and initialize an object */
+void *alloc_object( const struct object_ops *ops )
+{
+    struct object *obj = mem_alloc( ops->size );
+    if (obj)
+    {
+        obj->refcount     = 1;
+        obj->handle_count = 0;
+        obj->is_permanent = 0;
+        obj->ops          = ops;
+        obj->name         = NULL;
+        obj->sd           = NULL;
+        list_init( &obj->wait_queue );
+#ifdef DEBUG_OBJECTS
+        list_add_head( &object_list, &obj->obj_list );
+#endif
+        obj->ops->type->obj_count++;
+        obj->ops->type->obj_max = max( obj->ops->type->obj_max, obj->ops->type->obj_count );
+        return obj;
+    }
+    return NULL;
+}
+
+/* free an object once it has been destroyed */
+static void free_object( struct object *obj )
+{
+    free( obj->sd );
+    obj->ops->type->obj_count--;
+#ifdef DEBUG_OBJECTS
+    list_remove( &obj->obj_list );
+    memset( obj, 0xaa, obj->ops->size );
+#endif
+    free( obj );
+}
+
+/* find an object by name starting from the specified root */
+/* if it doesn't exist, its parent is returned, and name_left contains the remaining name */
+struct object *lookup_named_object( struct object *root, struct unicode_str name,
+                                    unsigned int attr, struct unicode_str *name_left )
+{
+    static int recursion_count;
+    struct object *parent;
+    struct unicode_str *ptr = &name;
+
+    if (root)
+    {
+        /* if root is specified path shouldn't start with backslash */
+        if (name.len && name.str[0] == '\\')
+        {
+            set_error( STATUS_OBJECT_PATH_SYNTAX_BAD );
+            return NULL;
+        }
+        parent = grab_object( root );
+    }
+    else
+    {
+        if (!name.len || name.str[0] != '\\')
+        {
+            set_error( STATUS_OBJECT_PATH_SYNTAX_BAD );
+            return NULL;
+        }
+        /* skip leading backslash */
+        name.str++;
+        name.len -= sizeof(WCHAR);
+        parent = root = get_root_directory();
+    }
+
+    if (!name.len) ptr = NULL;  /* special case for empty path */
+
+    if (recursion_count > 32)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        release_object( parent );
+        return NULL;
+    }
+    recursion_count++;
+    clear_error();
+
+    for (;;)
+    {
+        struct object *obj = NULL;
+
+        if (parent->ops->lookup_name) obj = parent->ops->lookup_name( parent, ptr, attr, root );
+        else if (!ptr) set_error( STATUS_OBJECT_TYPE_MISMATCH );
+
+        if (!obj) break;
+        /* move to the next element */
+        release_object ( parent );
+        parent = obj;
+    }
+
+    recursion_count--;
+    if (get_error())
+    {
+        release_object( parent );
+        return NULL;
+    }
+
+    if (name_left) *name_left = name;
+    return parent;
+}
+
+/* return length of first path element in name */
+data_size_t get_path_element( const WCHAR *name, data_size_t len )
+{
+    data_size_t i;
+
+    for (i = 0; i < len / sizeof(WCHAR); i++) if (name[i] == '\\') break;
+    return i * sizeof(WCHAR);
+}
+
+static struct object *create_object_without_name( const struct object_params *params )
+{
+    struct object *obj;
+
+    if (!(obj = alloc_object( params->ops ))) return NULL;
+
+    if (params->sd && !default_set_sd( obj, params->sd,
+                                       OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
+                                       DACL_SECURITY_INFORMATION | SACL_SECURITY_INFORMATION ))
+        goto failed;
+
+    if (!obj->ops->init || obj->ops->init( obj, params->init_data )) return obj;
+
+ failed:
+    free_object( obj );
+    return NULL;
+}
+
+static struct object *create_object_with_name( const struct object_params *params )
+{
+    struct object *obj = NULL, *parent;
+    struct object_name *name_ptr;
+    struct unicode_str new_name;
+
+    clear_error();
+
+    if (!params->name.len) return create_object_without_name( params );
+
+    if (!(parent = lookup_named_object( params->root, params->name, params->attr, &new_name )))
+        return NULL;
+
+    if (!new_name.len)
+    {
+        if (params->attr & OBJ_OPENIF && parent->ops == params->ops)
+        {
+            set_error( STATUS_OBJECT_NAME_EXISTS );
+            return parent;
+        }
+        release_object( parent );
+        if (params->attr & OBJ_OPENIF)
+            set_error( STATUS_OBJECT_TYPE_MISMATCH );
+        else
+            set_error( STATUS_OBJECT_NAME_COLLISION );
+        return NULL;
+    }
+
+    if (!(name_ptr = alloc_name( new_name ))) goto failed;
+    if (!(obj = alloc_object( params->ops ))) goto failed;
+
+    if (params->sd && !default_set_sd( obj, params->sd,
+                                       OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
+                                       DACL_SECURITY_INFORMATION | SACL_SECURITY_INFORMATION ))
+        goto failed;
+
+    if (!(obj->ops->link_name ? obj->ops->link_name( obj, name_ptr, parent ) :
+                                directory_link_name( obj, name_ptr, parent )))
+        goto failed;
+
+    name_ptr->obj = obj;
+    obj->name = name_ptr;
+    release_object( parent );
+
+    if (!obj->ops->init || obj->ops->init( obj, params->init_data )) return obj;
+
+    unlink_named_object( obj );
+    free_object( obj );
+    return NULL;
+
+ failed:
+    if (obj) free_object( obj );
+    free( name_ptr );
+    release_object( parent );
+    return NULL;
+}
+
+/* create an object as named child with the specified parameters */
+void *create_named_object( const struct object_params *params )
+{
+    struct object *obj = create_object_with_name( params );
+
+    if (obj && (params->attr & OBJ_PERMANENT))
+    {
+        make_object_permanent( obj );
+        grab_object( obj );
+    }
+    return obj;
+}
+
+/* create a handle as named child with the specified parameters */
+obj_handle_t create_named_obj_handle( struct process *process, const struct object_params *params )
+{
+    obj_handle_t handle;
+    struct object *obj = create_object_with_name( params );
+
+    if (!obj) return 0;
+
+    if (get_error() == STATUS_OBJECT_NAME_EXISTS)
+    {
+        handle = alloc_handle( process, obj, params->access, params->attr );
+        release_object( obj );
+    }
+    else
+    {
+        handle = alloc_handle_no_access_check( process, obj, params->access, params->attr );
+        if (handle && (params->attr & OBJ_PERMANENT)) make_object_permanent( obj );
+        else release_object( obj );
+    }
+    return handle;
+}
+
+/* open a object by name under the specified parent */
+void *open_named_object( const struct object_params *params )
+{
+    struct unicode_str name_left;
+    struct object *obj;
+
+    if (params->name.len >= 65534)
+    {
+        set_error( STATUS_OBJECT_NAME_INVALID );
+        return NULL;
+    }
+
+    if ((obj = lookup_named_object( params->root, params->name, params->attr, &name_left )))
+    {
+        if (name_left.len) /* not fully parsed */
+            set_error( STATUS_OBJECT_NAME_NOT_FOUND );
+        else if (params->ops && obj->ops != params->ops)
+            set_error( STATUS_OBJECT_TYPE_MISMATCH );
+        else
+            return obj;
+
+        release_object( obj );
+    }
+    return NULL;
+}
+
+/* recursive helper for dump_object_name */
+static void dump_name( struct object *obj )
+{
+    struct object_name *name = obj->name;
+
+    if (!name) return;
+    if (name->parent) dump_name( name->parent );
+    fputs( "\\\\", stderr );
+    dump_strW( name->name, name->len, stderr, "[]" );
+}
+
+/* dump the name of an object to stderr */
+void dump_object_name( struct object *obj )
+{
+    if (!obj->name) return;
+    fputc( '[', stderr );
+    dump_name( obj );
+    fputs( "] ", stderr );
+}
+
+/* unlink a named object from its namespace, without freeing the object itself */
+void unlink_named_object( struct object *obj )
+{
+    struct object_name *name_ptr = obj->name;
+
+    if (!name_ptr) return;
+    obj->name = NULL;
+    if (obj->ops->unlink_name) obj->ops->unlink_name( obj, name_ptr );
+    else unlink_name( name_ptr );
+    if (name_ptr->parent) release_object( name_ptr->parent );
+    free( name_ptr );
+}
+
+/* grab an object (i.e. increment its refcount) and return the object */
+struct object *grab_object( void *ptr )
+{
+    struct object *obj = (struct object *)ptr;
+    assert( obj->refcount < INT_MAX );
+    obj->refcount++;
+    return obj;
+}
+
+/* release an object (i.e. decrement its refcount) */
+void release_object( void *ptr )
+{
+    struct object *obj = (struct object *)ptr;
+    assert( obj->refcount );
+    if (!--obj->refcount)
+    {
+        assert( !obj->handle_count );
+        /* if the refcount is 0, nobody can be in the wait queue */
+        assert( list_empty( &obj->wait_queue ));
+        free_kernel_objects( obj );
+        unlink_named_object( obj );
+        if (obj->ops->destroy) obj->ops->destroy( obj );
+        free_object( obj );
+    }
+}
+
+/* find an object by its name; the refcount is incremented */
+struct object *find_object( const struct namespace *namespace, struct unicode_str name,
+                            unsigned int attributes )
+{
+    const struct list *list;
+    const struct object_name *ptr;
+
+    if (!name.len) return NULL;
+
+    list = &namespace->names[ hash_strW( name.str, name.len, namespace->hash_size ) ];
+    LIST_FOR_EACH_ENTRY( ptr, list, struct object_name, entry )
+    {
+        if (ptr->len != name.len) continue;
+        if (attributes & OBJ_CASE_INSENSITIVE)
+        {
+            if (!memicmp_strW( ptr->name, name.str, name.len ))
+                return grab_object( ptr->obj );
+        }
+        else
+        {
+            if (!memcmp( ptr->name, name.str, name.len ))
+                return grab_object( ptr->obj );
+        }
+    }
+    return NULL;
+}
+
+/* find an object by its index; the refcount is incremented */
+struct object *find_object_index( const struct namespace *namespace, unsigned int index )
+{
+    unsigned int i;
+
+    /* FIXME: not efficient at all */
+    for (i = 0; i < namespace->hash_size; i++)
+    {
+        const struct object_name *ptr;
+        LIST_FOR_EACH_ENTRY( ptr, &namespace->names[i], const struct object_name, entry )
+        {
+            if (!index--) return grab_object( ptr->obj );
+        }
+    }
+    return NULL;
+}
+
+/* allocate a namespace */
+struct namespace *create_namespace( unsigned int hash_size )
+{
+    struct namespace *namespace;
+    unsigned int i;
+
+    namespace = mem_alloc( sizeof(*namespace) + (hash_size - 1) * sizeof(namespace->names[0]) );
+    if (namespace)
+    {
+        namespace->hash_size      = hash_size;
+        for (i = 0; i < hash_size; i++) list_init( &namespace->names[i] );
+    }
+    return namespace;
+}
+
+/* retrieve the file descriptor associated to an object, if any */
+struct fd *get_obj_fd( struct object *obj )
+{
+    if (obj->ops->get_fd) return obj->ops->get_fd( obj );
+    set_error( STATUS_OBJECT_TYPE_MISMATCH );
+    return NULL;
+}
+
+/* retrieve the sync object associated to an object, or the object itself */
+struct object *get_obj_sync( struct object *obj )
+{
+    if (obj->ops->get_sync) return obj->ops->get_sync( obj );
+    return grab_object( obj );
+}
+
+/* functions for unimplemented/default object operations */
+
+int set_sd_defaults_from_token( struct object *obj, const struct security_descriptor *sd,
+                                unsigned int set_info, struct token *token )
+{
+    struct security_descriptor new_sd, *new_sd_ptr;
+    int present;
+    const struct sid *owner = NULL, *group = NULL;
+    const struct acl *sacl, *dacl;
+    struct acl *replaced_sacl = NULL;
+    char *ptr;
+
+    if (!set_info) return 1;
+
+    new_sd.control = sd->control & ~SE_SELF_RELATIVE;
+
+    if (set_info & OWNER_SECURITY_INFORMATION && sd->owner_len)
+    {
+        owner = sd_get_owner( sd );
+        new_sd.owner_len = sd->owner_len;
+    }
+    else if (obj->sd && obj->sd->owner_len)
+    {
+        owner = sd_get_owner( obj->sd );
+        new_sd.owner_len = obj->sd->owner_len;
+    }
+    else if (token)
+    {
+        owner = token_get_owner( token );
+        new_sd.owner_len = sid_len( owner );
+    }
+    else new_sd.owner_len = 0;
+
+    if (set_info & GROUP_SECURITY_INFORMATION && sd->group_len)
+    {
+        group = sd_get_group( sd );
+        new_sd.group_len = sd->group_len;
+    }
+    else if (obj->sd && obj->sd->group_len)
+    {
+        group = sd_get_group( obj->sd );
+        new_sd.group_len = obj->sd->group_len;
+    }
+    else if (token)
+    {
+        group = token_get_primary_group( token );
+        new_sd.group_len = sid_len( group );
+    }
+    else new_sd.group_len = 0;
+
+    sacl = sd_get_sacl( sd, &present );
+    if (set_info & SACL_SECURITY_INFORMATION && present)
+    {
+        new_sd.control |= SE_SACL_PRESENT;
+        new_sd.sacl_len = sd->sacl_len;
+    }
+    else if (set_info & LABEL_SECURITY_INFORMATION && present)
+    {
+        const struct acl *old_sacl = NULL;
+        if (obj->sd && obj->sd->control & SE_SACL_PRESENT) old_sacl = sd_get_sacl( obj->sd, &present );
+        if (!(replaced_sacl = replace_security_labels( old_sacl, sacl ))) return 0;
+        new_sd.control |= SE_SACL_PRESENT;
+        new_sd.sacl_len = replaced_sacl->size;
+        sacl = replaced_sacl;
+    }
+    else
+    {
+        if (obj->sd) sacl = sd_get_sacl( obj->sd, &present );
+
+        if (obj->sd && present)
+        {
+            new_sd.control |= SE_SACL_PRESENT;
+            new_sd.sacl_len = obj->sd->sacl_len;
+        }
+        else
+            new_sd.sacl_len = 0;
+    }
+
+    dacl = sd_get_dacl( sd, &present );
+    if (set_info & DACL_SECURITY_INFORMATION && present)
+    {
+        new_sd.control |= SE_DACL_PRESENT;
+        new_sd.dacl_len = sd->dacl_len;
+    }
+    else
+    {
+        if (obj->sd) dacl = sd_get_dacl( obj->sd, &present );
+
+        if (obj->sd && present)
+        {
+            new_sd.control |= SE_DACL_PRESENT;
+            new_sd.dacl_len = obj->sd->dacl_len;
+        }
+        else if (token)
+        {
+            dacl = token_get_default_dacl( token );
+            new_sd.control |= SE_DACL_PRESENT;
+            new_sd.dacl_len = dacl->size;
+        }
+        else new_sd.dacl_len = 0;
+    }
+
+    ptr = mem_alloc( sizeof(new_sd) + new_sd.owner_len + new_sd.group_len +
+                     new_sd.sacl_len + new_sd.dacl_len );
+    if (!ptr)
+    {
+        free( replaced_sacl );
+        return 0;
+    }
+    new_sd_ptr = (struct security_descriptor*)ptr;
+
+    ptr = mem_append( ptr, &new_sd, sizeof(new_sd) );
+    ptr = mem_append( ptr, owner, new_sd.owner_len );
+    ptr = mem_append( ptr, group, new_sd.group_len );
+    ptr = mem_append( ptr, sacl, new_sd.sacl_len );
+    mem_append( ptr, dacl, new_sd.dacl_len );
+
+    free( replaced_sacl );
+    free( obj->sd );
+    obj->sd = new_sd_ptr;
+    return 1;
+}
+
+/** Set the security descriptor using the current primary token for defaults. */
+int default_set_sd( struct object *obj, const struct security_descriptor *sd,
+                    unsigned int set_info )
+{
+    return set_sd_defaults_from_token( obj, sd, set_info, current->process->token );
+}
+
+static void reserve_dump( struct object *obj, int verbose )
+{
+    struct reserve *reserve = (struct reserve *) obj;
+
+    assert( obj->ops == &apc_reserve_ops || obj->ops == &completion_reserve_ops );
+    fprintf( stderr, "reserve type=%d\n", reserve->type);
+}
+
+static bool reserve_init( struct object *obj, const void *init_data )
+{
+    struct reserve *reserve = (struct reserve *)obj;
+    const struct reserve_init_data *data = init_data;
+
+    reserve->type = data->type;
+    reserve->bound_obj = NULL;
+    return true;
+}
+
+struct reserve *get_completion_reserve_obj( struct process *process, obj_handle_t handle, unsigned int access )
+{
+    return (struct reserve *)get_handle_obj( process, handle, access, &completion_reserve_ops );
+}
+
+struct reserve *reserve_obj_associate_apc( struct process *process, obj_handle_t handle, struct object *apc )
+{
+    struct reserve *reserve;
+
+    if (!(reserve = (struct reserve *)get_handle_obj( process, handle, 0, &apc_reserve_ops ))) return NULL;
+    if (reserve->bound_obj)
+    {
+        release_object( reserve );
+        set_error( STATUS_INVALID_PARAMETER_2 );
+        return NULL;
+    }
+    reserve->bound_obj = apc;
+    return reserve;
+}
+
+void reserve_obj_unbind( struct reserve *reserve )
+{
+    if (!reserve) return;
+    reserve->bound_obj = NULL;
+    release_object( reserve );
+}
+
+/* Allocate a reserve object for pre-allocating memory for object types */
+DECL_HANDLER(allocate_reserve_object)
+{
+    struct reserve *reserve;
+    struct reserve_init_data data = { .type = req->type };
+    struct object_params params = { .init_data = &data };
+
+    if (!get_req_object_attributes( &params )) return;
+    if (params.root) release_object( params.root ); /* unused */
+
+    if (params.name.len)
+    {
+        set_error( STATUS_OBJECT_NAME_INVALID );
+        return;
+    }
+
+    switch (data.type)
+    {
+    case MemoryReserveObjectTypeUserApc:      params.ops = &apc_reserve_ops; break;
+    case MemoryReserveObjectTypeIoCompletion: params.ops = &completion_reserve_ops; break;
+    default:
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+
+    if ((reserve = create_named_object( &params )))
+    {
+        reply->handle = alloc_handle_no_access_check( current->process, reserve,
+                                                      STANDARD_RIGHTS_REQUIRED | 0x3, params.attr );
+        release_object( reserve );
+    }
+
+}

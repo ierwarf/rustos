@@ -1,0 +1,6 @@
+MODULE    = olethk32.dll
+ENABLE_ARCHS = i386
+
+EXTRADLLFLAGS = -Wb,--prefer-native
+
+VER_PRODUCTVERSION = 5,1,2600,0

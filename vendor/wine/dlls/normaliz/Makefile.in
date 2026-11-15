@@ -1,0 +1,7 @@
+MODULE    = normaliz.dll
+IMPORTLIB = normaliz
+
+EXTRADLLFLAGS = -Wl,-noentry
+
+SOURCES = \
+	normaliz.spec

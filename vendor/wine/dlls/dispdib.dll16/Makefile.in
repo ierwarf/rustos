@@ -1,0 +1,6 @@
+MODULE    = dispdib.dll16
+ENABLE_ARCHS = $(WIN16_ARCH)
+EXTRADLLFLAGS = -m16
+
+SOURCES = \
+	dispdib.c

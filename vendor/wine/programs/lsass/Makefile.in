@@ -1,0 +1,11 @@
+MODULE    = lsass.exe
+IMPORTS   = advapi32 rpcrt4
+ENABLE_ARCHS = $(HOST_ARCH)
+
+EXTRADLLFLAGS = -mconsole -municode
+
+SOURCES = \
+	lsass.c \
+	lsass.idl \
+	main.c \
+	negotiate.c

@@ -1,0 +1,6 @@
+MODULE    = icmp.dll
+
+EXTRADLLFLAGS = -Wl,-noentry
+
+SOURCES = \
+	icmp.spec

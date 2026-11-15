@@ -1,0 +1,7 @@
+MODULE    = winoldap.mod16
+ENABLE_ARCHS = $(WIN16_ARCH)
+
+EXTRADLLFLAGS = -mconsole -m16
+
+SOURCES = \
+	winoldap.c

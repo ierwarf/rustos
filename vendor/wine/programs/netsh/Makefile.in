@@ -1,0 +1,7 @@
+MODULE    = netsh.exe
+ENABLE_ARCHS = $(PE_ARCHS)
+
+EXTRADLLFLAGS = -mconsole -municode
+
+SOURCES = \
+	netsh.c

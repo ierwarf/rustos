@@ -1,0 +1,6 @@
+MODULE = icuin.dll
+
+EXTRADLLFLAGS = -Wl,-noentry
+
+SOURCES = \
+	icuin.spec
