@@ -18,7 +18,6 @@
 //!   `entropy-readiness`, and `service-call-authority`.
 
 use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
 use core::mem::size_of;
 
 use rustos_user_abi::syscall::{
@@ -391,9 +390,7 @@ pub fn handle_id(
     response: &mut LinuxSyscallOffloadResponse,
 ) {
     let mut policy = policy_db().lock();
-    let state = policy
-        .entry(request.pid)
-        .or_insert_with(|| initial_state(request));
+    let state = ensure_state_with_inheritance(&mut policy, request);
     let value = match kind {
         IdKind::Uid => state.credentials.uid,
         IdKind::Gid => state.credentials.gid,
@@ -411,9 +408,7 @@ pub fn handle_setuid(
 ) {
     let requested = request.mask;
     let mut policy = policy_db().lock();
-    let state = policy
-        .entry(request.pid)
-        .or_insert_with(|| initial_state(request));
+    let state = ensure_state_with_inheritance(&mut policy, request);
     if state.credentials.euid == 0 {
         state.credentials.uid = requested;
         state.credentials.euid = requested;
@@ -435,9 +430,7 @@ pub fn handle_setgid(
 ) {
     let requested = request.mask;
     let mut policy = policy_db().lock();
-    let state = policy
-        .entry(request.pid)
-        .or_insert_with(|| initial_state(request));
+    let state = ensure_state_with_inheritance(&mut policy, request);
     if state.credentials.euid == 0 {
         state.credentials.gid = requested;
         state.credentials.egid = requested;
@@ -656,14 +649,22 @@ pub fn handle_setsid(
 ) {
     let pid = request.pid;
     let mut policy = policy_db().lock();
-    let already_leader = policy
-        .values()
-        .any(|s| s.pgid == pid && s.sid == pid && s.parent_pid != 0);
-    let state = ensure_state_with_inheritance(&mut policy, request);
-    if already_leader && state.sid == pid && state.pgid == pid {
+    let (is_group_leader, parent_pid) = {
+        let state = ensure_state_with_inheritance(&mut policy, request);
+        (state.sid == pid && state.pgid == pid, state.parent_pid)
+    };
+    if is_group_leader
+        && (parent_pid != 0
+            || policy
+                .values()
+                .any(|s| s.pgid == pid && s.sid == pid && s.parent_pid != 0))
+    {
         response.status = errno::EPERM;
         return;
     }
+    let state = policy
+        .get_mut(&pid)
+        .expect("syscalld policy state must be present after ensure_state_with_inheritance");
     state.sid = pid;
     state.pgid = pid;
     response.status = 0;
@@ -929,9 +930,11 @@ pub fn handle_brk(
             return;
         }
         state.brk_mapped_end = requested_end;
+        state.brk_current = requested;
+        upsert_heap_vma(&mut state);
+    } else {
+        state.brk_current = requested;
     }
-    state.brk_current = requested;
-    upsert_heap_vma(&mut state);
     copy_payload(response, &state.brk_current);
 }
 
@@ -1189,13 +1192,18 @@ pub fn handle_mprotect(
         response.status = errno::EACCES;
         return;
     }
-    let reserved_segments = reserved_segments(&state, start, end);
-    for (seg_start, seg_end) in &reserved_segments {
-        if prot != 0 {
+    if prot != 0 {
+        for vma in state
+            .vmas
+            .overlapping(start, end)
+            .filter(|vma| vma.kind == MmVmaKind::Reserved)
+        {
+            let seg_start = vma.start.max(start);
+            let seg_end = vma.end.min(end);
             if let Err(errno) = broker_simple(
                 MmTarget::of(request),
                 MM_BROKER_OP_MAP_ANON,
-                *seg_start,
+                seg_start,
                 seg_end - seg_start,
                 prot,
                 0,
@@ -1246,7 +1254,13 @@ pub fn handle_mprotect(
             return;
         }
     } else {
-        for (seg_start, seg_end) in nonreserved_segments(&state, start, end) {
+        for vma in state
+            .vmas
+            .overlapping(start, end)
+            .filter(|vma| vma.kind != MmVmaKind::Reserved)
+        {
+            let seg_start = vma.start.max(start);
+            let seg_end = vma.end.min(end);
             if let Err(errno) = broker_simple(
                 MmTarget::of(request),
                 MM_BROKER_OP_PROTECT,
@@ -1653,24 +1667,6 @@ fn range_is_covered(state: &MmPolicyState, start: u64, end: u64) -> bool {
     state.vmas.is_covered(start, end)
 }
 
-fn reserved_segments(state: &MmPolicyState, start: u64, end: u64) -> Vec<(u64, u64)> {
-    state
-        .vmas
-        .overlapping(start, end)
-        .filter(|vma| vma.kind == MmVmaKind::Reserved)
-        .map(|vma| (vma.start.max(start), vma.end.min(end)))
-        .collect()
-}
-
-fn nonreserved_segments(state: &MmPolicyState, start: u64, end: u64) -> Vec<(u64, u64)> {
-    state
-        .vmas
-        .overlapping(start, end)
-        .filter(|vma| vma.kind != MmVmaKind::Reserved)
-        .map(|vma| (vma.start.max(start), vma.end.min(end)))
-        .collect()
-}
-
 fn remove_vma_range(state: &mut MmPolicyState, start: u64, end: u64) {
     state.vmas.remove_range(start, end);
 }
@@ -1687,6 +1683,25 @@ fn set_vma_prot(state: &mut MmPolicyState, start: u64, end: u64, prot: u64) {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+    use alloc::vec::Vec;
+
+    fn reserved_segments(state: &MmPolicyState, start: u64, end: u64) -> Vec<(u64, u64)> {
+        state
+            .vmas
+            .overlapping(start, end)
+            .filter(|vma| vma.kind == MmVmaKind::Reserved)
+            .map(|vma| (vma.start.max(start), vma.end.min(end)))
+            .collect()
+    }
+
+    fn nonreserved_segments(state: &MmPolicyState, start: u64, end: u64) -> Vec<(u64, u64)> {
+        state
+            .vmas
+            .overlapping(start, end)
+            .filter(|vma| vma.kind != MmVmaKind::Reserved)
+            .map(|vma| (vma.start.max(start), vma.end.min(end)))
+            .collect()
+    }
 
     use super::*;
     use rustos_user_abi::syscall::LINUX_UTSNAME_SIZE;
@@ -2013,5 +2028,35 @@ mod tests {
         assert_eq!(read_u64(&prio_resp.payload[..8], 0), 16);
 
         handle_process_exit_pid(pid);
+    }
+
+    #[test]
+    fn handle_id_inherits_parent_umask_and_pgid() {
+        let parent_pid = 9901;
+        let child_pid = 9902;
+        let mut req = LinuxSyscallOffloadRequest::default();
+        req.pid = parent_pid;
+        req.mask = 0o077;
+        let mut resp = LinuxSyscallOffloadResponse::default();
+        handle_umask(&req, &mut resp);
+        assert_eq!(resp.status, 0);
+
+        let mut child_id_req = LinuxSyscallOffloadRequest::default();
+        child_id_req.pid = child_pid;
+        child_id_req.parent_pid = parent_pid;
+        child_id_req.uid = 1000;
+        handle_id(&child_id_req, IdKind::Uid, &mut resp);
+        assert_eq!(resp.status, 0);
+
+        let mut umask_req = LinuxSyscallOffloadRequest::default();
+        umask_req.pid = child_pid;
+        umask_req.parent_pid = parent_pid;
+        umask_req.mask = 0o022;
+        handle_umask(&umask_req, &mut resp);
+        assert_eq!(resp.status, 0);
+        assert_eq!(u32::from_le_bytes(resp.payload[..4].try_into().unwrap()), 0o077);
+
+        handle_process_exit_pid(child_pid);
+        handle_process_exit_pid(parent_pid);
     }
 }

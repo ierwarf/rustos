@@ -89,13 +89,13 @@ struct ReadAheadWindow {
 }
 
 impl ReadCache {
-    fn slice(
+    fn slice_bytes(
         &self,
         generation: u64,
         lba: u64,
         block_count: u64,
         byte_len: usize,
-    ) -> Result<Option<Vec<u8>>, i32> {
+    ) -> Result<Option<&[u8]>, i32> {
         if self.generation != generation || lba < self.lba {
             return Ok(None);
         }
@@ -119,7 +119,20 @@ impl ReadCache {
             .ok_or(libc::EIO)?;
         let end = offset.checked_add(byte_len).ok_or(libc::EIO)?;
         let bytes = self.bytes.get(offset..end).ok_or(libc::EIO)?;
-        Ok(Some(bytes.to_vec()))
+        Ok(Some(bytes))
+    }
+
+    #[cfg(test)]
+    fn slice(
+        &self,
+        generation: u64,
+        lba: u64,
+        block_count: u64,
+        byte_len: usize,
+    ) -> Result<Option<Vec<u8>>, i32> {
+        Ok(self
+            .slice_bytes(generation, lba, block_count, byte_len)?
+            .map(<[u8]>::to_vec))
     }
 
     fn validate(&self) -> Result<(), i32> {
@@ -149,10 +162,20 @@ impl ReadCache {
     }
 }
 
+#[cfg(test)]
 enum Coverage {
     Hit(Vec<u8>),
     Partial {
         prefix: Vec<u8>,
+        start: u64,
+        continues_read_ahead: bool,
+    },
+}
+
+enum CoverageInto {
+    Hit(usize),
+    Partial {
+        prefix_len: usize,
         start: u64,
         continues_read_ahead: bool,
     },
@@ -197,22 +220,31 @@ impl ReadCacheSet {
         Ok(Some(bytes))
     }
 
-    /// Assemble a request from one or more contiguous cached windows. A full
-    /// cover is a hit; otherwise the cached prefix and the first uncovered
-    /// block are returned so only the missing tail is read from the device.
-    fn cover(
+    /// Assemble a request from one or more contiguous cached windows directly
+    /// into `out`. A full cover is a hit; otherwise the cached prefix and the
+    /// first uncovered block are returned so only the missing tail is read.
+    fn cover_into(
         &mut self,
         generation: u64,
         lba: u64,
         block_count: u64,
         block_size: usize,
-    ) -> Result<Coverage, i32> {
+        out: &mut [u8],
+    ) -> Result<CoverageInto, i32> {
         let end = lba.checked_add(block_count).ok_or(libc::EINVAL)?;
+        let total_bytes = usize::try_from(block_count)
+            .ok()
+            .and_then(|blocks| blocks.checked_mul(block_size))
+            .ok_or(libc::EINVAL)?;
+        if total_bytes > out.len() {
+            return Err(libc::EOVERFLOW);
+        }
         let mut cursor = lba;
-        let mut out = Vec::new();
-        let mut used: Vec<usize> = Vec::new();
+        let mut written = 0_usize;
+        let mut first_used: Option<usize> = None;
+        let mut extra_used: Vec<usize> = Vec::new();
         while cursor < end {
-            let Some(index) = self.entries.iter().position(|entry| {
+            let Some(index) = self.entries.iter().rposition(|entry| {
                 entry.generation == generation
                     && entry.lba <= cursor
                     && cursor < entry.lba.saturating_add(entry.block_count)
@@ -229,27 +261,74 @@ impl ReadCacheSet {
                 .and_then(|blocks| blocks.checked_mul(block_size))
                 .ok_or(libc::EIO)?;
             let bytes = entry
-                .slice(generation, cursor, take, take_bytes)?
+                .slice_bytes(generation, cursor, take, take_bytes)?
                 .ok_or(libc::EIO)?;
-            out.extend_from_slice(&bytes);
-            used.push(index);
+            out[written..written + take_bytes].copy_from_slice(bytes);
+            written += take_bytes;
+            match first_used {
+                None => first_used = Some(index),
+                Some(_) => extra_used.push(index),
+            }
             cursor += take;
         }
-        used.sort_unstable();
-        used.dedup();
-        let mut touched = Vec::with_capacity(used.len());
-        for index in used.into_iter().rev() {
-            touched.push(self.entries.remove(index));
-        }
-        self.entries.extend(touched.into_iter().rev());
-        if cursor == end {
-            Ok(Coverage::Hit(out))
+        if extra_used.is_empty() {
+            if let Some(index) = first_used {
+                let entry = self.entries.remove(index);
+                self.entries.push(entry);
+            }
         } else {
-            Ok(Coverage::Partial {
-                prefix: out,
+            if let Some(first) = first_used {
+                extra_used.push(first);
+            }
+            extra_used.sort_unstable();
+            extra_used.dedup();
+            let mut touched = Vec::with_capacity(extra_used.len());
+            for index in extra_used.into_iter().rev() {
+                touched.push(self.entries.remove(index));
+            }
+            self.entries.extend(touched.into_iter().rev());
+        }
+        if cursor == end {
+            Ok(CoverageInto::Hit(written))
+        } else {
+            Ok(CoverageInto::Partial {
+                prefix_len: written,
                 start: cursor,
                 continues_read_ahead: self.miss_continues_read_ahead(generation, cursor),
             })
+        }
+    }
+
+    #[cfg(test)]
+    fn cover(
+        &mut self,
+        generation: u64,
+        lba: u64,
+        block_count: u64,
+        block_size: usize,
+    ) -> Result<Coverage, i32> {
+        let total_bytes = usize::try_from(block_count)
+            .ok()
+            .and_then(|blocks| blocks.checked_mul(block_size))
+            .ok_or(libc::EINVAL)?;
+        let mut out = vec![0_u8; total_bytes];
+        match self.cover_into(generation, lba, block_count, block_size, &mut out)? {
+            CoverageInto::Hit(len) => {
+                out.truncate(len);
+                Ok(Coverage::Hit(out))
+            }
+            CoverageInto::Partial {
+                prefix_len,
+                start,
+                continues_read_ahead,
+            } => {
+                out.truncate(prefix_len);
+                Ok(Coverage::Partial {
+                    prefix: out,
+                    start,
+                    continues_read_ahead,
+                })
+            }
         }
     }
 
@@ -268,6 +347,19 @@ impl ReadCacheSet {
         }
         self.entries.push(cache);
         debug_assert!(self.entries.len() <= READ_CACHE_WINDOW_LIMIT);
+        Ok(())
+    }
+
+    fn insert_batch(
+        &mut self,
+        caches: impl IntoIterator<Item = ReadCache>,
+        generation: u64,
+        read_ahead_end: u64,
+    ) -> Result<(), i32> {
+        for cache in caches {
+            self.insert(cache)?;
+        }
+        self.record_read_ahead_end(generation, read_ahead_end);
         Ok(())
     }
 
@@ -370,15 +462,23 @@ fn bounded_wait_timeout_ms(remaining: Duration) -> Option<u64> {
     )
 }
 
-pub(super) fn read(expected_generation: u64, lba: u64, block_count: u64) -> Result<Vec<u8>, i32> {
-    read_inner(expected_generation, lba, block_count)
+pub(super) fn read_into_with_info(
+    info: BlockInfo,
+    expected_generation: u64,
+    lba: u64,
+    block_count: u64,
+    out: &mut [u8],
+) -> Result<usize, i32> {
+    read_into_inner(info, expected_generation, lba, block_count, out)
 }
 
-fn read_inner(expected_generation: u64, lba: u64, block_count: u64) -> Result<Vec<u8>, i32> {
-    let info = info().inspect_err(|errno| {
-        clear_read_cache();
-        eprintln!("storaged: dvm read rejected stage=info errno={errno}");
-    })?;
+fn read_into_inner(
+    info: BlockInfo,
+    expected_generation: u64,
+    lba: u64,
+    block_count: u64,
+    out: &mut [u8],
+) -> Result<usize, i32> {
     require_generation(info, expected_generation).inspect_err(|errno| {
         clear_read_cache();
         eprintln!(
@@ -392,17 +492,20 @@ fn read_inner(expected_generation: u64, lba: u64, block_count: u64) -> Result<Ve
             info.logical_block_size, info.capacity_sectors
         );
     })?;
-    let (prefix, start, continues_read_ahead) =
-        match read_cache_lookup(info, lba, block_count)? {
-            Coverage::Hit(bytes) => {
+    if byte_len > out.len() {
+        return Err(libc::EOVERFLOW);
+    }
+    let (prefix_len, start, continues_read_ahead) =
+        match read_cache_lookup_into(info, lba, block_count, out)? {
+            CoverageInto::Hit(len) => {
                 require_unquarantined(&PROVIDER_QUARANTINED)?;
-                return Ok(bytes);
+                return Ok(len);
             }
-            Coverage::Partial {
-                prefix,
+            CoverageInto::Partial {
+                prefix_len,
                 start,
                 continues_read_ahead,
-            } => (prefix, start, continues_read_ahead),
+            } => (prefix_len, start, continues_read_ahead),
         };
     let window_limit = if continues_read_ahead {
         READ_AHEAD_IN_FLIGHT_LIMIT
@@ -413,7 +516,7 @@ fn read_inner(expected_generation: u64, lba: u64, block_count: u64) -> Result<Ve
         .checked_add(block_count)
         .and_then(|end| end.checked_sub(start))
         .ok_or(libc::EIO)?;
-    let missing_bytes = byte_len.checked_sub(prefix.len()).ok_or(libc::EIO)?;
+    let missing_bytes = byte_len.checked_sub(prefix_len).ok_or(libc::EIO)?;
     let windows = read_ahead_plan(info, start, missing_blocks, window_limit)?;
     let mut in_flight = Vec::with_capacity(windows.len());
     let mut submitted_bytes = 0_usize;
@@ -464,33 +567,37 @@ fn read_inner(expected_generation: u64, lba: u64, block_count: u64) -> Result<Ve
             return Err(errno);
         }
     }
-    let mut requested = prefix;
-    requested.reserve(missing_bytes);
+    let mut written = prefix_len;
     for (_, _, bytes) in &in_flight {
-        let want = byte_len - requested.len();
+        let want = byte_len - written;
         if want == 0 {
             break;
         }
-        requested.extend_from_slice(&bytes[..want.min(bytes.len())]);
+        let take = want.min(bytes.len());
+        out[written..written + take].copy_from_slice(&bytes[..take]);
+        written += take;
     }
-    if requested.len() != byte_len {
+    if written != byte_len {
         return Err(libc::EIO);
     }
     let read_ahead_end = in_flight
         .last()
         .and_then(|(window, _, _)| window.lba.checked_add(window.block_count))
         .ok_or(libc::EIO)?;
-    for (window, _, prefetched) in in_flight {
-        replace_read_cache(ReadCache {
-            generation: info.generation,
+    let block_size = info.logical_block_size as usize;
+    let generation = info.generation;
+    insert_read_ahead_batch(
+        in_flight.into_iter().map(|(window, _, prefetched)| ReadCache {
+            generation,
             lba: window.lba,
             block_count: window.block_count,
-            block_size: info.logical_block_size as usize,
+            block_size,
             bytes: prefetched,
-        })?;
-    }
-    record_read_ahead_end(info.generation, read_ahead_end)?;
-    Ok(requested)
+        }),
+        generation,
+        read_ahead_end,
+    )?;
+    Ok(written)
 }
 
 fn read_ahead_plan(
@@ -528,14 +635,15 @@ fn read_ahead_plan(
     Ok(windows)
 }
 
-pub(super) fn write(
+pub(super) fn write_with_info(
+    info: BlockInfo,
     expected_generation: u64,
     lba: u64,
     block_count: u64,
     bytes: &[u8],
     fua: bool,
 ) -> Result<(), i32> {
-    write_admitted_with(info()?, expected_generation, lba, block_count, bytes, || {
+    write_admitted_with(info, expected_generation, lba, block_count, bytes, || {
         clear_read_cache();
         let ticket = submit(
             expected_generation,
@@ -585,25 +693,30 @@ fn validate_write_extent(
     Ok(())
 }
 
-fn read_cache_lookup(info: BlockInfo, lba: u64, block_count: u64) -> Result<Coverage, i32> {
-    READ_CACHE.lock().map_err(|_| libc::EIO)?.cover(
+fn read_cache_lookup_into(
+    info: BlockInfo,
+    lba: u64,
+    block_count: u64,
+    out: &mut [u8],
+) -> Result<CoverageInto, i32> {
+    READ_CACHE.lock().map_err(|_| libc::EIO)?.cover_into(
         info.generation,
         lba,
         block_count,
         info.logical_block_size as usize,
+        out,
     )
 }
 
-fn replace_read_cache(cache: ReadCache) -> Result<(), i32> {
-    READ_CACHE.lock().map_err(|_| libc::EIO)?.insert(cache)
-}
-
-fn record_read_ahead_end(generation: u64, lba: u64) -> Result<(), i32> {
+fn insert_read_ahead_batch(
+    caches: impl IntoIterator<Item = ReadCache>,
+    generation: u64,
+    read_ahead_end: u64,
+) -> Result<(), i32> {
     READ_CACHE
         .lock()
         .map_err(|_| libc::EIO)?
-        .record_read_ahead_end(generation, lba);
-    Ok(())
+        .insert_batch(caches, generation, read_ahead_end)
 }
 
 fn clear_read_cache() {
@@ -612,12 +725,20 @@ fn clear_read_cache() {
     }
 }
 
-pub(super) fn flush(expected_generation: u64) -> Result<(), i32> {
-    flush_before(expected_generation, Instant::now() + COMPLETION_TIMEOUT)
+pub(super) fn flush_with_info(info: BlockInfo, expected_generation: u64) -> Result<(), i32> {
+    flush_with_info_before(info, expected_generation, Instant::now() + COMPLETION_TIMEOUT)
 }
 
 pub(super) fn flush_before(expected_generation: u64, deadline: Instant) -> Result<(), i32> {
-    require_generation(info()?, expected_generation)?;
+    flush_with_info_before(info()?, expected_generation, deadline)
+}
+
+fn flush_with_info_before(
+    info: BlockInfo,
+    expected_generation: u64,
+    deadline: Instant,
+) -> Result<(), i32> {
+    require_generation(info, expected_generation)?;
     let mut ticket = DvmBlockTicketWire::default();
     let args = RustosBlockBrokerArgs {
         abi_version: BLOCK_BROKER_ABI_VERSION,

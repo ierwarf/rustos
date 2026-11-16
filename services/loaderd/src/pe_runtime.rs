@@ -651,17 +651,18 @@ fn windows_dos_path_for_exec(exec_path: &str) -> String {
 }
 
 fn write_unicode_string(buf: &mut [u8], struct_off: usize, target_va: u64, text: &str, data_off: &mut usize) {
-    let units: Vec<u16> = text.encode_utf16().collect();
-    let byte_len = (units.len() * 2) as u16;
-    let max_len = byte_len.saturating_add(2);
     *data_off = (*data_off + 1) & !1;
     let str_va = target_va + *data_off as u64;
-    for u in units {
+    let mut unit_count = 0usize;
+    for u in text.encode_utf16() {
         buf[*data_off..*data_off + 2].copy_from_slice(&u.to_le_bytes());
         *data_off += 2;
+        unit_count += 1;
     }
     buf[*data_off..*data_off + 2].copy_from_slice(&0_u16.to_le_bytes());
     *data_off += 2;
+    let byte_len = (unit_count * 2) as u16;
+    let max_len = byte_len.saturating_add(2);
     buf[struct_off..struct_off + 2].copy_from_slice(&byte_len.to_le_bytes());
     buf[struct_off + 2..struct_off + 4].copy_from_slice(&max_len.to_le_bytes());
     buf[struct_off + 8..struct_off + 16].copy_from_slice(&str_va.to_le_bytes());
@@ -967,8 +968,8 @@ fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
 
 fn canonical_system_dll_name_bytes(name: &[u8]) -> Option<&'static str> {
     let trimmed = trim_dll_suffix(name);
-    for (_, target) in BUILTIN_SYSTEM_DLL_ALIASES {
-        if dll_name_eq(trimmed, trim_dll_suffix(target.as_bytes())) {
+    for (alias, target) in BUILTIN_SYSTEM_DLL_ALIASES {
+        if dll_name_eq(trimmed, alias.as_bytes()) {
             return Some(*target);
         }
     }

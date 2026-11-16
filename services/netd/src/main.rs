@@ -452,6 +452,8 @@ struct NetState {
     readiness_generations: BTreeMap<u64, u64>,
     readiness_observations: BTreeMap<u64, readiness::Readiness>,
     readiness_publications: Vec<(u64, u64)>,
+    readiness_changed_scratch: Vec<u64>,
+    unix_dirty_scratch: Vec<u64>,
 }
 
 impl NetState {
@@ -466,6 +468,8 @@ impl NetState {
             readiness_generations: BTreeMap::new(),
             readiness_observations: BTreeMap::new(),
             readiness_publications: Vec::new(),
+            readiness_changed_scratch: Vec::new(),
+            unix_dirty_scratch: Vec::new(),
         }
     }
 

@@ -5,7 +5,7 @@
 //! excessive body sizes and missing required fields all fail closed. Nothing
 //! here replaces production `repr(C)` RustOS ABIs until migration gates pass.
 
-use crate::wire::{Header, WireError, CURRENT_VERSION, MAX_BODY_BYTES};
+use crate::wire::{Header, WireError, CURRENT_VERSION, HEADER_SIZE, MAGIC, MAX_BODY_BYTES};
 use alloc::vec::Vec;
 
 pub const FIELD_HEADER_LEN: usize = 4;
@@ -139,11 +139,8 @@ impl<'a> Schema<'a> {
     }
 
     fn specification(self, tag: u16) -> Option<(usize, FieldSpec)> {
-        self.fields
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, f)| f.tag == tag)
+        let index = self.fields.binary_search_by_key(&tag, |f| f.tag).ok()?;
+        Some((index, self.fields[index]))
     }
 }
 
@@ -190,6 +187,7 @@ impl<'a> Message<'a> {
         let mut cursor = 0;
         let mut previous = 0u16;
         let mut found = 0u64;
+        let mut schema_idx = 0usize;
         while cursor < body.len() {
             if body.len() - cursor < FIELD_HEADER_LEN {
                 return Err(IdlError::Malformed);
@@ -211,9 +209,16 @@ impl<'a> Message<'a> {
             if end > body.len() {
                 return Err(IdlError::Malformed);
             }
-            let (index, spec) = schema.specification(tag).ok_or(IdlError::UnknownField)?;
+            while schema_idx < schema.fields.len() && schema.fields[schema_idx].tag < tag {
+                schema_idx += 1;
+            }
+            if schema_idx >= schema.fields.len() || schema.fields[schema_idx].tag != tag {
+                return Err(IdlError::UnknownField);
+            }
+            let spec = schema.fields[schema_idx];
             validate_field(spec, &body[cursor..end])?;
-            found |= 1u64 << index;
+            found |= 1u64 << schema_idx;
+            schema_idx += 1;
             previous = tag;
             cursor = end;
         }
@@ -265,9 +270,14 @@ pub struct Builder<'a> {
 
 impl<'a> Builder<'a> {
     pub fn new(schema: Schema<'a>) -> Result<Self, IdlError> {
+        let schema = schema.validate()?;
+        let mut body = Vec::new();
+        body.try_reserve(HEADER_SIZE)
+            .map_err(|_| IdlError::OutOfMemory)?;
+        body.resize(HEADER_SIZE, 0);
         Ok(Self {
-            schema: schema.validate()?,
-            body: Vec::new(),
+            schema,
+            body,
             last_tag: 0,
             present: 0,
         })
@@ -290,9 +300,8 @@ impl<'a> Builder<'a> {
         let added = FIELD_HEADER_LEN
             .checked_add(value.len())
             .ok_or(IdlError::TooLong)?;
-        let total = self
-            .body
-            .len()
+        let body_len = self.body.len() - HEADER_SIZE;
+        let total = body_len
             .checked_add(added)
             .ok_or(IdlError::TooLong)?;
         if total > MAX_BODY_BYTES {
@@ -309,19 +318,20 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    pub fn finish(self, request_id: u64) -> Result<Vec<u8>, IdlError> {
+    pub fn finish(mut self, request_id: u64) -> Result<Vec<u8>, IdlError> {
         for (index, spec) in self.schema.fields.iter().enumerate() {
             if spec.required && (self.present & (1u64 << index)) == 0 {
                 return Err(IdlError::Missing);
             }
         }
-        let header = Header {
-            version: CURRENT_VERSION,
-            opcode: self.schema.opcode,
-            body_len: self.body.len() as u32,
-            request_id,
-        };
-        header.encode(&self.body).map_err(IdlError::Wire)
+        let body_len = (self.body.len() - HEADER_SIZE) as u32;
+        self.body[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        self.body[4..6].copy_from_slice(&CURRENT_VERSION.to_le_bytes());
+        self.body[6..8].copy_from_slice(&self.schema.opcode.to_le_bytes());
+        self.body[8..12].copy_from_slice(&body_len.to_le_bytes());
+        // Bytes 12..16 (reserved) are already zeroed by `resize(HEADER_SIZE, 0)`.
+        self.body[16..24].copy_from_slice(&request_id.to_le_bytes());
+        Ok(self.body)
     }
 }
 

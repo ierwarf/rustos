@@ -93,11 +93,11 @@ impl VfsState {
         if path.is_empty() || path.len() > VFS_IPC_PATH_CAPACITY {
             return Err(EINVAL);
         }
-        let base = if path.starts_with('/') {
-            "/".to_string()
+        let base: &str = if path.starts_with('/') {
+            "/"
         } else if is_at_fdcwd(dirfd) {
             if let Some(cwd) = self.cwd.get(&pid) {
-                cwd.clone()
+                cwd.as_str()
             } else {
                 let mut clean_relative = !path.starts_with('/');
                 for component in path.split('/') {
@@ -131,9 +131,9 @@ impl VfsState {
             if handle.kind != RemoteKind::Directory {
                 return Err(ENOTDIR);
             }
-            handle.path.clone()
+            handle.path.as_str()
         };
-        normalize_absolute_path(base.as_str(), path)
+        normalize_absolute_path(base, path)
     }
 
     fn open_remote_checkpointed(
@@ -470,8 +470,8 @@ impl VfsStorage {
             Some(read) => Ok(read),
             None => {
                 self.invalidate_caches_if_remounted();
-                let key = fat_cache_key(path);
-                if let Some(bytes) = self.file_bytes_cache.get(&key) {
+                let key = fat_cache_key_cow(path);
+                if let Some(bytes) = self.file_bytes_cache.get(key.as_ref()) {
                     return Ok(copy_file_cache_range(bytes, start, dest));
                 }
 
@@ -494,7 +494,7 @@ impl VfsStorage {
                         self.file_bytes_cache_bytes = 0;
                     }
                     self.file_bytes_cache_bytes += bytes.len();
-                    self.file_bytes_cache.insert(key, bytes);
+                    self.file_bytes_cache.insert(key.into_owned(), bytes);
                     return Ok(read);
                 }
 
@@ -506,9 +506,9 @@ impl VfsStorage {
     /// Plans and caches the on-volume read map of `path` (bounded; evicts the
     /// whole set when full). The map is the storage layer's identity of the
     /// file: its volume/object/generation never alias a different file.
-    fn ensure_read_map(&mut self, path: &str, len: u64) -> Result<String, i32> {
-        let key = fat_cache_key(path);
-        if !self.read_maps.contains_key(&key) {
+    fn ensure_read_map(&mut self, path: &str, len: u64) -> Result<(), i32> {
+        let key = fat_cache_key_cow(path);
+        if !self.read_maps.contains_key(key.as_ref()) {
             let map = self.volume()?.plan_read(path, vfsd::snapshot_budget::SNAPSHOT_MAP_BYTES)
                 .map_err(map_range_error)?;
             if map.len() != len { return Err(EIO); }
@@ -518,9 +518,9 @@ impl VfsStorage {
                 self.read_map_bytes = 0;
             }
             self.read_map_bytes += cost;
-            self.read_maps.insert(key.clone(), map);
+            self.read_maps.insert(key.into_owned(), map);
         }
-        Ok(key)
+        Ok(())
     }
 
     /// Attests the backing file of an open description for the shared library
@@ -542,8 +542,9 @@ impl VfsStorage {
             }
             return Ok(vfsd::early_system_identity(path, len));
         }
-        let key = self.ensure_read_map(path, len)?;
-        let identity = self.read_maps.get(&key).ok_or(EIO)?.identity();
+        self.ensure_read_map(path, len)?;
+        let key = fat_cache_key_cow(path);
+        let identity = self.read_maps.get(key.as_ref()).ok_or(EIO)?.identity();
         if self.dvm_storage_epoch == 0 {
             return Err(EIO);
         }
@@ -560,8 +561,9 @@ impl VfsStorage {
 
     fn read_mapped_file(&mut self, path: &str, len: u64, offset: u64, output: &mut [u8]) -> Result<usize, i32> {
         use storage_core::file_io::ReadAt;
-        let key = self.ensure_read_map(path, len)?;
-        let map = self.read_maps.get(&key).ok_or(EIO)?;
+        self.ensure_read_map(path, len)?;
+        let key = fat_cache_key_cow(path);
+        let map = self.read_maps.get(key.as_ref()).ok_or(EIO)?;
         if map.len() != len { return Err(EIO); }
         let mut scratch = [0; 4096];
         self.volume.as_ref().ok_or(ENODEV)?.read_view(map, &mut scratch)
@@ -604,7 +606,11 @@ impl VfsStorage {
         let early_system_owned = early_system::file_len(path.as_str())?.is_some();
 
         self.invalidate_caches_if_remounted();
-        if let Some(snapshot) = self.executable_snapshot_cache.get(fat_cache_key(path.as_str()).as_str()).copied() {
+        if let Some(snapshot) = self
+            .executable_snapshot_cache
+            .get(fat_cache_key_cow(path.as_str()).as_ref())
+            .copied()
+        {
             return ExecutableSnapshotOpen::duplicate_cached(
                 snapshot.fd,
                 snapshot.file_bytes,
@@ -701,7 +707,11 @@ impl VfsStorage {
         // Another worker may have published the same path while this plan
         // read without storage ownership. Reuse that entry instead of leaking
         // its descriptor and counting the same image twice.
-        if let Some(snapshot) = self.executable_snapshot_cache.get(fat_cache_key(path.as_str()).as_str()).copied() {
+        if let Some(snapshot) = self
+            .executable_snapshot_cache
+            .get(fat_cache_key_cow(path.as_str()).as_ref())
+            .copied()
+        {
             return ExecutableSnapshotOpen::duplicate_cached(
                 snapshot.fd,
                 snapshot.file_bytes,
@@ -802,27 +812,31 @@ impl VfsState {
             }
             handle.path.clone()
         };
-        let entries = if let Some(Ok(
-            vfsd::proc_fs::ProcNode::PidDir | vfsd::proc_fs::ProcNode::SelfLink,
-        )) = vfsd::proc_fs::lookup(path.as_str(), caller_pid)
-        {
-            alloc::vec![DirEntry::new("mounts", RemoteKind::File)]
-        } else {
-            lock_vfs_storage().dir_entries(path.as_str())?
-        };
+        let limit = user_len.min(payload.len());
         let mut written = 0usize;
         let mut consumed = 0usize;
-        for (index, entry) in entries.iter().enumerate().skip(cursor) {
-            let record = encode_dirent(entry, index + 1);
-            if written + record.len() > user_len.min(payload.len()) {
+        let mut encode = |index: usize, entry: &DirEntry| -> Result<bool, i32> {
+            let Some(record_len) = encode_dirent_into(entry, index + 1, &mut payload[written..limit])
+            else {
                 if written == 0 {
                     return Err(EINVAL);
                 }
-                break;
-            }
-            payload[written..written + record.len()].copy_from_slice(record.as_slice());
-            written += record.len();
+                return Ok(false);
+            };
+            written += record_len;
             consumed += 1;
+            Ok(true)
+        };
+        if let Some(Ok(
+            vfsd::proc_fs::ProcNode::PidDir | vfsd::proc_fs::ProcNode::SelfLink,
+        )) = vfsd::proc_fs::lookup(path.as_str(), caller_pid)
+        {
+            if cursor == 0 {
+                let entry = DirEntry::new("mounts", RemoteKind::File);
+                let _ = encode(0, &entry)?;
+            }
+        } else {
+            lock_vfs_storage().for_each_dir_entry_from(path.as_str(), cursor, encode)?;
         }
         Ok((written, consumed))
     }
@@ -873,7 +887,7 @@ impl VfsStorage {
             }
         }
         self.invalidate_caches_if_remounted();
-        if let Some(entry) = self.metadata_cache.get(fat_cache_key(path).as_str()) {
+        if let Some(entry) = self.metadata_cache.get(fat_cache_key_cow(path).as_ref()) {
             return *entry;
         }
         if let Some(len) = early_system::file_len(path)? {
@@ -916,69 +930,101 @@ impl VfsStorage {
         self.metadata_cache.insert(fat_cache_key(path), result);
     }
 
-    fn dir_entries(&mut self, path: &str) -> Result<Vec<DirEntry>, i32> {
-        let mut entries = Vec::new();
-        if path == "/" {
-            entries.push(DirEntry::new("dev", RemoteKind::Directory));
-            entries.push(DirEntry::new("proc", RemoteKind::Directory));
-            entries.push(DirEntry::new("run", RemoteKind::Directory));
-            entries.push(DirEntry::new("sys", RemoteKind::Directory));
-        }
+    fn for_each_dir_entry_from(
+        &mut self,
+        path: &str,
+        cursor: usize,
+        mut visit: impl FnMut(usize, &DirEntry) -> Result<bool, i32>,
+    ) -> Result<(), i32> {
         if path == "/dev" || path == "/dev/input" || path == "/dev/dri" {
-            match devmgrd_dir_entries(path) {
-                Ok(entries) => return Ok(entries),
-                Err(errno) => return Err(errno),
+            let entries = devmgrd_dir_entries(path)?;
+            for (index, entry) in entries.iter().enumerate().skip(cursor) {
+                if !visit(index, entry)? {
+                    break;
+                }
             }
+            return Ok(());
         }
         if path == "/proc" {
-            entries.push(DirEntry::new("filesystems", RemoteKind::File));
-            entries.push(DirEntry::new("meminfo", RemoteKind::File));
-            entries.push(DirEntry::new("mounts", RemoteKind::File));
-            entries.push(DirEntry::new("self", RemoteKind::Directory));
-            entries.push(DirEntry::new("uptime", RemoteKind::File));
-            return Ok(entries);
+            let proc_entries = [
+                ("filesystems", RemoteKind::File),
+                ("meminfo", RemoteKind::File),
+                ("mounts", RemoteKind::File),
+                ("self", RemoteKind::Directory),
+                ("uptime", RemoteKind::File),
+            ];
+            for (index, (name, kind)) in proc_entries.iter().enumerate().skip(cursor) {
+                let entry = DirEntry::new(name, *kind);
+                if !visit(index, &entry)? {
+                    break;
+                }
+            }
+            return Ok(());
         }
         if let Some(children) = vfsd::proc_fs::sys_dir_children(path) {
-            entries.extend(children.iter().map(|name| {
+            for (index, name) in children.iter().enumerate().skip(cursor) {
                 let child_path = format!("{path}/{name}");
                 let kind = if vfsd::proc_fs::sys_virtual_file(child_path.as_str()).is_some() {
                     RemoteKind::File
                 } else {
                     RemoteKind::Directory
                 };
-                DirEntry::new(name, kind)
-            }));
-            return Ok(entries);
+                let entry = DirEntry::new(name, kind);
+                if !visit(index, &entry)? {
+                    break;
+                }
+            }
+            return Ok(());
         }
         if path.starts_with("/sys/") {
             return Err(ENOENT);
         }
         if self.run_dirs.contains(path) {
-            entries.extend(
-                self.run_dirs
-                    .children(path)
-                    .into_iter()
-                    .map(|name| DirEntry::new(name, RemoteKind::Directory)),
-            );
-            return Ok(entries);
+            for (index, name) in self.run_dirs.children(path).into_iter().enumerate().skip(cursor) {
+                let entry = DirEntry::new(name, RemoteKind::Directory);
+                if !visit(index, &entry)? {
+                    break;
+                }
+            }
+            return Ok(());
         }
         if path.starts_with("/run/") {
             return Err(ENOENT);
         }
+        let mut base_index = 0usize;
+        if path == "/" {
+            const ROOT_VIRTUAL: [(&str, RemoteKind); 4] = [
+                ("dev", RemoteKind::Directory),
+                ("proc", RemoteKind::Directory),
+                ("run", RemoteKind::Directory),
+                ("sys", RemoteKind::Directory),
+            ];
+            for (index, (name, kind)) in ROOT_VIRTUAL.iter().enumerate().skip(cursor) {
+                let entry = DirEntry::new(name, *kind);
+                if !visit(index, &entry)? {
+                    return Ok(());
+                }
+            }
+            base_index = ROOT_VIRTUAL.len();
+        }
         self.invalidate_caches_if_remounted();
-        if let Some(cached) = self.dir_entries_cache.get(fat_cache_key(path).as_str()) {
-            entries.extend_from_slice(cached);
-            return Ok(entries);
+        let key = fat_cache_key_cow(path);
+        if !self.dir_entries_cache.contains_key(key.as_ref()) {
+            let fat_entries = self.volume()?.read_dir(path).map_err(map_fat_error)?;
+            let resolved: Vec<DirEntry> = fat_entries.into_iter().map(DirEntry::from_fat).collect();
+            if self.dir_entries_cache.len() >= vfsd::DIR_ENTRIES_CACHE_MAX_ENTRIES {
+                self.dir_entries_cache.clear();
+            }
+            self.dir_entries_cache.insert(key.clone().into_owned(), resolved);
         }
-        let fat_entries = self.volume()?.read_dir(path).map_err(map_fat_error)?;
-        let resolved: Vec<DirEntry> = fat_entries.into_iter().map(DirEntry::from_fat).collect();
-        if self.dir_entries_cache.len() >= vfsd::DIR_ENTRIES_CACHE_MAX_ENTRIES {
-            self.dir_entries_cache.clear();
+        let cached = self.dir_entries_cache.get(key.as_ref()).ok_or(EIO)?;
+        let skip_fat = cursor.saturating_sub(base_index);
+        for (offset, entry) in cached.iter().enumerate().skip(skip_fat) {
+            if !visit(base_index + offset, entry)? {
+                break;
+            }
         }
-        self.dir_entries_cache
-            .insert(fat_cache_key(path), resolved.clone());
-        entries.extend(resolved);
-        Ok(entries)
+        Ok(())
     }
 
     fn volume(&mut self) -> Result<&FatVolume<BootBlockDevice>, i32> {

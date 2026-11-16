@@ -205,6 +205,12 @@ impl<K: Clone + Eq + Hash, T> FairQueue<K, T> {
             .collect()
     }
 
+    pub(super) fn has_expired(&self, now: Duration, budget: Duration) -> bool {
+        self.live
+            .values()
+            .any(|live| !live.cancelled && now.saturating_sub(live.submitted_at) >= budget)
+    }
+
     pub(super) fn has_queued(&self) -> bool {
         !self.queue.is_empty()
     }
@@ -452,7 +458,9 @@ impl SnapshotService {
     /// protocol turn is owed even with no socket edge.
     pub(super) fn expiry_due(&self) -> bool {
         let state = self.shared.lock();
-        !state.queue.expired(self.shared.now(), SNAPSHOT_JOB_BUDGET).is_empty()
+        state
+            .queue
+            .has_expired(self.shared.now(), SNAPSHOT_JOB_BUDGET)
     }
 }
 

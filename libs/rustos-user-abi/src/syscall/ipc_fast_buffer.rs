@@ -23,6 +23,7 @@ const _: [(); 8] = [(); core::mem::offset_of!(IpcRegisterBufferArgs, args)];
 
 /// Closed data-plane allowlist. In particular no Linux syscall, registration,
 /// service-owner validation or another fastcall can be tunneled through here.
+#[inline]
 pub const fn ipc_register_buffer_entry(operation: u64) -> Option<u64> {
     match operation {
         SYS_RUSTOS_IPC_CALL

@@ -120,7 +120,8 @@ impl NetState {
             .inet
             .as_mut()
             .is_some_and(|stack| std::mem::take(&mut stack.readiness_dirty));
-        let mut changed = Vec::new();
+        let mut changed = std::mem::take(&mut self.readiness_changed_scratch);
+        changed.clear();
         if self.sockets.has_dirty() {
             self.observe_unix(&mut changed);
         }
@@ -128,6 +129,7 @@ impl NetState {
             self.observe_inet(stack_advanced, &mut changed);
         }
         if changed.is_empty() {
+            self.readiness_changed_scratch = changed;
             return;
         }
         // Publication order stays ascending by token across both tables.
@@ -144,7 +146,7 @@ impl NetState {
                 std::process::exit(134);
             })
             + 1;
-        for token in changed {
+        for &token in &changed {
             if self.socket_exists(token) {
                 self.readiness_generations.insert(token, generation);
             } else {
@@ -153,6 +155,8 @@ impl NetState {
             // Include final close, even though its live generation is gone.
             self.readiness_publications.push((token, generation));
         }
+        changed.clear();
+        self.readiness_changed_scratch = changed;
     }
 
     /// Ordinary Unix traffic visits only dirty Unix identities, never the
@@ -164,8 +168,10 @@ impl NetState {
         }
         // Unix writability depends on the peer's receive capacity. Recheck
         // both the old and current peer, including a just-retired endpoint.
-        let touched: Vec<_> = dirty.iter().copied().collect();
-        for token in touched {
+        let mut touched = std::mem::take(&mut self.unix_dirty_scratch);
+        touched.clear();
+        touched.extend(dirty.iter().copied());
+        for &token in &touched {
             if let Some(UnixSocket {
                 state: UnixSocketState::Connected(connected),
                 ..
@@ -180,16 +186,18 @@ impl NetState {
                 dirty.insert(*peer);
             }
         }
+        touched.clear();
+        self.unix_dirty_scratch = touched;
         for token in dirty {
-            let after = if self.sockets.contains_key(&token) {
+            let after = if let Some(socket) = self.sockets.get(&token) {
                 const EVENTS: u32 =
                     (linux_abi::POLLIN | linux_abi::POLLOUT | linux_abi::POLLRDHUP) as u32;
-                let peer = match &self.sockets[&token].state {
+                let peer = match &socket.state {
                     UnixSocketState::Connected(connected) => Some(connected.peer),
                     _ => None,
                 };
                 Some(Readiness::Unix {
-                    events: unix_socket_revents(self, token, EVENTS).expect("live Unix socket"),
+                    events: unix_socket_revents_for(self, socket, EVENTS),
                     peer,
                 })
             } else {

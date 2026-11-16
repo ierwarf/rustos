@@ -131,7 +131,10 @@ fn read_manifest<H: WarmHost>(
             return Err(WarmError::Manifest);
         }
         let total = *total.get_or_insert(got.file_len);
-        if got.file_len != total || total > MAX_MANIFEST_BYTES as u64 || total as usize > manifest.len()
+        if got.file_len != total
+            || total > MAX_MANIFEST_BYTES as u64
+            || total as usize > manifest.len()
+            || offset.checked_add(got.len as u64).is_none_or(|end| end > total)
         {
             return Err(WarmError::Manifest);
         }
@@ -231,8 +234,12 @@ fn stream<H: WarmHost>(
     let mut got = first;
     loop {
         let len = got.len;
-        // A short non-final chunk would misalign the next page-aligned read.
-        if len == 0 || len > chunk.len() || (len % PAGE != 0 && offset + len as u64 != entry.bytes)
+        // A short non-final chunk would misalign the next page-aligned read,
+        // and a chunk extending past `entry.bytes` would overshoot EOF.
+        if len == 0
+            || len > chunk.len()
+            || offset.checked_add(len as u64).is_none_or(|end| end > entry.bytes)
+            || (len % PAGE != 0 && offset + len as u64 != entry.bytes)
         {
             return Err(skip(Stage::StreamShape, len as i64));
         }
@@ -511,5 +518,65 @@ mod tests {
         let mut wrapped = TransientMidStream(fake);
         assert_eq!(run(&mut wrapped), Err(WarmError::Host(11)));
         assert!(wrapped.0.objects[&1].2 && !wrapped.0.objects[&1].1);
+    }
+
+    #[test]
+    fn oversized_manifest_or_stream_chunk_is_refused_without_panicking() {
+        // Manifest read returning more bytes than file_len must fail closed.
+        struct OversizedManifest(Fake);
+        impl WarmHost for OversizedManifest {
+            fn read(&mut self, path: &str, offset: u64, out: &mut [u8]) -> Result<ReadChunk, i32> {
+                let mut got = self.0.read(path, offset, out)?;
+                if path == MANIFEST_PATH {
+                    got.file_len = 16;
+                    got.len = PAGE;
+                }
+                Ok(got)
+            }
+            fn create(&mut self, id: LibraryIdentityWire) -> Result<u64, i64> {
+                self.0.create(id)
+            }
+            fn supply(&mut self, object: u64, page: u64, bytes: &[u8]) -> Result<(), i64> {
+                self.0.supply(object, page, bytes)
+            }
+            fn seal(&mut self, object: u64) -> Result<(), i64> {
+                self.0.seal(object)
+            }
+            fn retire(&mut self, object: u64) {
+                self.0.retire(object);
+            }
+        }
+        let mut fake = OversizedManifest(host_with(&[("/lib/a.so", pattern(PAGE, 1))]));
+        assert_eq!(run(&mut fake), Err(WarmError::Manifest));
+
+        // Stream read returning a page-aligned chunk that overshoots entry.bytes must fail closed.
+        struct OversizedStream(Fake);
+        impl WarmHost for OversizedStream {
+            fn read(&mut self, path: &str, offset: u64, out: &mut [u8]) -> Result<ReadChunk, i32> {
+                let mut got = self.0.read(path, offset, out)?;
+                if path != MANIFEST_PATH {
+                    got.len = 2 * PAGE;
+                }
+                Ok(got)
+            }
+            fn create(&mut self, id: LibraryIdentityWire) -> Result<u64, i64> {
+                self.0.create(id)
+            }
+            fn supply(&mut self, object: u64, page: u64, bytes: &[u8]) -> Result<(), i64> {
+                self.0.supply(object, page, bytes)
+            }
+            fn seal(&mut self, object: u64) -> Result<(), i64> {
+                self.0.seal(object)
+            }
+            fn retire(&mut self, object: u64) {
+                self.0.retire(object);
+            }
+        }
+        let mut fake = OversizedStream(host_with(&[("/lib/a.so", pattern(PAGE + 1, 1))]));
+        let report = run(&mut fake).unwrap();
+        assert_eq!(report.sealed, 0);
+        assert_eq!(report.refused, 1);
+        assert_eq!(report.first_refusal.map(|s| s.stage), Some(Stage::StreamShape));
+        assert!(fake.0.objects[&1].2 && !fake.0.objects[&1].1);
     }
 }

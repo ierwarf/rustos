@@ -423,10 +423,15 @@ fn resolve_import_closure(
         if modules.len() > PE_MAX_IMPORT_MODULES {
             return Err(ENOEXEC);
         }
-        let mut module = modules.remove(cursor);
-        patch_module_imports(&mut module, modules, registry, next_base, deadline)?;
-        module.imports_patched = true;
-        modules.insert(cursor, module);
+        if !modules[cursor].imports_patched {
+            let groups = collect_imports(&modules[cursor])?;
+            let patches = resolve_import_groups(&groups, modules, registry, next_base, deadline)?;
+            let module = &mut modules[cursor];
+            for (rva, target) in patches {
+                write_u64_at_rva(&mut module.image, rva, target)?;
+            }
+            module.imports_patched = true;
+        }
         if modules.len() > PE_MAX_IMPORT_MODULES {
             return Err(ENOEXEC);
         }
@@ -445,25 +450,46 @@ fn patch_module_imports(
     if module.imports_patched {
         return Ok(());
     }
-    let imports = collect_imports(module)?;
-    for import in imports {
-        let dll_index =
-            ensure_system_dll_loaded(import.dll_name.as_slice(), modules, registry, next_base, deadline)?;
-        let target =
-            resolve_export_by_index(modules, dll_index, &import.lookup, 0)?.ok_or(ENOEXEC)?;
-        write_u64_at_rva(&mut module.image, import.first_thunk_rva, target)?;
+    let groups = collect_imports(module)?;
+    let patches = resolve_import_groups(&groups, modules, registry, next_base, deadline)?;
+    for (rva, target) in patches {
+        write_u64_at_rva(&mut module.image, rva, target)?;
     }
     module.imports_patched = true;
     Ok(())
 }
 
-struct ImportPatch {
-    dll_name: Vec<u8>,
-    lookup: ExportLookup,
-    first_thunk_rva: u32,
+fn resolve_import_groups(
+    groups: &[ImportDescriptorGroup],
+    modules: &mut Vec<LoadedPeModule>,
+    registry: &[SystemDllEntry],
+    next_base: &mut u64,
+    deadline: AbsoluteDeadline,
+) -> Result<Vec<(u32, u64)>, i32> {
+    let total_thunks: usize = groups.iter().map(|group| group.thunks.len()).sum();
+    let mut patches = Vec::with_capacity(total_thunks);
+    for group in groups {
+        let dll_index = ensure_system_dll_loaded(
+            group.dll_name.as_slice(),
+            modules,
+            registry,
+            next_base,
+            deadline,
+        )?;
+        for (lookup, first_thunk_rva) in &group.thunks {
+            let target = resolve_export_by_index(modules, dll_index, lookup, 0)?.ok_or(ENOEXEC)?;
+            patches.push((*first_thunk_rva, target));
+        }
+    }
+    Ok(patches)
 }
 
-fn collect_imports(module: &LoadedPeModule) -> Result<Vec<ImportPatch>, i32> {
+struct ImportDescriptorGroup {
+    dll_name: Vec<u8>,
+    thunks: Vec<(ExportLookup, u32)>,
+}
+
+fn collect_imports(module: &LoadedPeModule) -> Result<Vec<ImportDescriptorGroup>, i32> {
     let import_dir = module.directories[PE_DIRECTORY_IMPORT];
     validate_pe64_import_table(
         &module.image,
@@ -475,7 +501,7 @@ fn collect_imports(module: &LoadedPeModule) -> Result<Vec<ImportPatch>, i32> {
     if import_dir.rva == 0 || import_dir.size == 0 {
         return Ok(Vec::new());
     }
-    let mut imports = Vec::new();
+    let mut groups = Vec::new();
     let mut string_budget = PE_MAX_NAME_TABLE_BYTES;
     let mut descriptor = import_dir.rva as usize;
     let limit = descriptor
@@ -495,12 +521,14 @@ fn collect_imports(module: &LoadedPeModule) -> Result<Vec<ImportPatch>, i32> {
         if dll_name.len() > PE_MAX_DLL_NAME_BYTES {
             return Err(ENOEXEC);
         }
+        string_budget = string_budget.checked_sub(dll_name.len()).ok_or(ENOEXEC)?;
         let mut lookup_rva = if original_first_thunk != 0 {
             original_first_thunk
         } else {
             first_thunk
         };
         let mut write_rva = first_thunk;
+        let mut thunks = Vec::new();
         loop {
             let lookup_offset = lookup_rva as usize;
             if lookup_offset + 8 > module.image.len() {
@@ -520,20 +548,15 @@ fn collect_imports(module: &LoadedPeModule) -> Result<Vec<ImportPatch>, i32> {
                 ExportLookup::Name(name) => name.len(),
                 ExportLookup::Ordinal(_) => 0,
             };
-            string_budget = string_budget
-                .checked_sub(dll_name.len() + lookup_len)
-                .ok_or(ENOEXEC)?;
-            imports.push(ImportPatch {
-                dll_name: dll_name.clone(),
-                lookup,
-                first_thunk_rva: write_rva,
-            });
+            string_budget = string_budget.checked_sub(lookup_len).ok_or(ENOEXEC)?;
+            thunks.push((lookup, write_rva));
             lookup_rva = lookup_rva.checked_add(8).ok_or(EOVERFLOW)?;
             write_rva = write_rva.checked_add(8).ok_or(EOVERFLOW)?;
         }
+        groups.push(ImportDescriptorGroup { dll_name, thunks });
         descriptor += 20;
     }
-    Ok(imports)
+    Ok(groups)
 }
 
 fn byte_admission_errno(error: ByteAdmissionError) -> i32 {
@@ -733,6 +756,7 @@ fn build_export_cache(
         string_budget = string_budget.checked_sub(export_name.len()).ok_or(ENOEXEC)?;
         names.push((export_name, function_index));
     }
+    names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     Ok(Some(ExportCache {
         ordinal_base,
         functions,
@@ -770,11 +794,12 @@ fn classify_export_target(
 }
 
 fn lookup_export_by_name<'a>(cache: &'a ExportCache, name: &[u8]) -> Option<&'a ExportTarget> {
-    let (_, index) = cache
+    let pos = cache
         .names
-        .iter()
-        .find(|(candidate, _)| candidate == name)?;
-    cache.functions.get(*index as usize)
+        .binary_search_by(|(candidate, _)| candidate.as_slice().cmp(name))
+        .ok()?;
+    let (_, index) = cache.names[pos];
+    cache.functions.get(index as usize)
 }
 
 fn lookup_export_by_ordinal(cache: &ExportCache, ordinal: u32) -> Option<&ExportTarget> {

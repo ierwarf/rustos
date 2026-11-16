@@ -1,5 +1,3 @@
-use alloc::vec;
-use alloc::vec::Vec;
 use core::mem::size_of;
 
 use rustos_user_abi::syscall::{
@@ -13,7 +11,7 @@ use super::{
     DEVICE_FILE_MODE_BITS, DT_CHR, DT_DIR, DT_REG, EINVAL,
 };
 use storage_fat::FatError;
-pub(super) use vfsd::path::{fat_cache_key, normalize_absolute_path, path_inode};
+pub(super) use vfsd::path::{fat_cache_key, fat_cache_key_cow, normalize_absolute_path, path_inode};
 use vfsd::storage_io_error_to_linux_errno;
 
 pub(super) fn is_at_fdcwd(dirfd: u64) -> bool {
@@ -100,21 +98,28 @@ pub(super) fn write_vfs_payload_bytes(response: &mut VfsIpcResponse, bytes: &[u8
     response.value = len as u64;
 }
 
-pub(super) fn encode_dirent(entry: &DirEntry, next_offset: usize) -> Vec<u8> {
+pub(super) fn encode_dirent_into(
+    entry: &DirEntry,
+    next_offset: usize,
+    dest: &mut [u8],
+) -> Option<usize> {
     let base_len = 19 + entry.name.len() + 1;
     let record_len = (base_len + 7) & !7;
-    let mut bytes = vec![0_u8; record_len];
-    bytes[..8].copy_from_slice(&path_inode(entry.name.as_bytes()).to_le_bytes());
-    bytes[8..16].copy_from_slice(&(next_offset as i64).to_le_bytes());
-    bytes[16..18].copy_from_slice(&(record_len as u16).to_le_bytes());
-    bytes[18] = match entry.kind {
+    if record_len > dest.len() {
+        return None;
+    }
+    let out = &mut dest[..record_len];
+    out[..8].copy_from_slice(&path_inode(entry.name.as_bytes()).to_le_bytes());
+    out[8..16].copy_from_slice(&(next_offset as i64).to_le_bytes());
+    out[16..18].copy_from_slice(&(record_len as u16).to_le_bytes());
+    out[18] = match entry.kind {
         RemoteKind::File => DT_REG,
         RemoteKind::Directory => DT_DIR,
         RemoteKind::Device => DT_CHR,
     };
-    bytes[19..19 + entry.name.len()].copy_from_slice(entry.name.as_bytes());
-    bytes[19 + entry.name.len()] = 0;
-    bytes
+    out[19..19 + entry.name.len()].copy_from_slice(entry.name.as_bytes());
+    out[19 + entry.name.len()..record_len].fill(0);
+    Some(record_len)
 }
 
 pub(super) fn linux_request_path(

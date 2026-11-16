@@ -428,7 +428,7 @@ fn authorize_and_broker_ioctl(
                 (&args as *const RustosDeviceIoctlBrokerArgs) as u64,
             );
             if result < 0 {
-                last_errno()
+                (-result).try_into().unwrap_or(libc::EIO)
             } else {
                 response.value = result as u64;
                 0
@@ -488,7 +488,7 @@ fn reply_device_open(
                 (&args as *const RustosDeviceOpenBrokerArgs) as u64,
             );
             if result < 0 {
-                last_errno()
+                (-result).try_into().unwrap_or(libc::EIO)
             } else {
                 send_fd = result;
                 0
@@ -704,7 +704,11 @@ fn call_sessiond_ioctl(
     }
     let endpoint = syscall1(SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, IPC_SERVICE_SESSIOND);
     if endpoint <= 0 {
-        let errno = last_errno();
+        let errno = if endpoint < 0 {
+            (-endpoint).try_into().unwrap_or(libc::EIO)
+        } else {
+            libc::ENOENT
+        };
         if ioctl_request.request == rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS {
             debug_line(
                 format!("devmgrd: sessiond lookup failed endpoint={endpoint} errno={errno}")
@@ -908,13 +912,39 @@ fn authorize_uiserver_ioctl(op: u16, request_number: u64) -> Result<(), i32> {
 }
 
 fn stamp_current_subject(request: &mut CommercialMaxProtocolRequest) -> Result<(), i32> {
-    let pid = syscall0(SYS_GETPID);
-    let tid = syscall0(SYS_GETTID);
-    if pid <= 0 || tid <= 0 {
-        return Err(libc::EIO);
+    static CACHED_PID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    thread_local! {
+        static CACHED_TID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
-    request.header.subject_pid = pid as u64;
-    request.header.subject_tid = tid as u64;
+    let pid = match CACHED_PID.get().copied() {
+        Some(pid) => pid,
+        None => {
+            let pid = syscall0(SYS_GETPID);
+            if pid <= 0 {
+                return Err(libc::EIO);
+            }
+            let pid = pid as u64;
+            let _ = CACHED_PID.set(pid);
+            pid
+        }
+    };
+    let tid = CACHED_TID.with(|cell| {
+        let cached = cell.get();
+        if cached != 0 {
+            Ok(cached)
+        } else {
+            let tid = syscall0(SYS_GETTID);
+            if tid <= 0 {
+                Err(libc::EIO)
+            } else {
+                let tid = tid as u64;
+                cell.set(tid);
+                Ok(tid)
+            }
+        }
+    })?;
+    request.header.subject_pid = pid;
+    request.header.subject_tid = tid;
     Ok(())
 }
 
@@ -1191,70 +1221,32 @@ fn encode_node_entry(name: &str, kind: u16) -> Option<DevmgrdNodeEntry> {
 }
 
 fn syscall0(number: u64) -> i64 {
-    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
-    if let Some(result) = unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number, [0; 6]) } {
-        return result;
-    }
-    // SAFETY: This is the centralized zero-argument raw-syscall boundary; each
-    // caller supplies a RustOS ABI number whose result is decoded immediately.
-    unsafe { libc::syscall(number as libc::c_long) as i64 }
+    // SAFETY: Caller supplies a valid RustOS/Linux zero-argument syscall number.
+    unsafe { rustos_svc_runtime::syscall::syscall0(number) }
 }
 
 fn syscall1(number: u64, arg0: u64) -> i64 {
-    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
-    if let Some(result) =
-        unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, 0, 0, 0, 0, 0]) }
-    {
-        return result;
-    }
     // SAFETY: The caller constructs `arg0` according to the selected RustOS
     // syscall ABI and retains any referenced storage through the call.
-    unsafe { libc::syscall(number as libc::c_long, arg0) as i64 }
+    unsafe { rustos_svc_runtime::syscall::syscall1(number, arg0) }
 }
 
 fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
-    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
-    if let Some(result) =
-        unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, arg1, arg2, 0, 0, 0]) }
-    {
-        return result;
-    }
     // SAFETY: The caller owns the typed RustOS ABI envelope represented by
     // these three words and retains pointed-to storage until return.
-    unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2) as i64 }
+    unsafe { rustos_svc_runtime::syscall::syscall3(number, arg0, arg1, arg2) }
 }
 
 fn syscall5(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
-    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
-    if let Some(result) = unsafe {
-        rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, arg1, arg2, arg3, arg4, 0])
-    } {
-        return result;
-    }
     // SAFETY: The caller validates the five-word RustOS syscall contract and
     // keeps every referenced input/output object live for the synchronous call.
-    unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3, arg4) as i64 }
+    unsafe { rustos_svc_runtime::syscall::syscall5(number, arg0, arg1, arg2, arg3, arg4) }
 }
 
 fn syscall6(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
-    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
-    if let Some(result) = unsafe {
-        rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, arg1, arg2, arg3, arg4, arg5])
-    } {
-        return result;
-    }
     // SAFETY: The caller validates the six-word RustOS syscall contract and
     // keeps every referenced input/output object live for the synchronous call.
-    unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3, arg4, arg5) as i64 }
-}
-
-fn last_errno() -> i32 {
-    // A failed call that left errno at 0 must still be an error: a 0 status
-    // here would be replied to the caller as a granted open/ioctl.
-    std::io::Error::last_os_error()
-        .raw_os_error()
-        .filter(|errno| *errno > 0)
-        .unwrap_or(libc::EIO)
+    unsafe { rustos_svc_runtime::syscall::syscall6(number, arg0, arg1, arg2, arg3, arg4, arg5) }
 }
 
 fn debug_line(message: &str) {

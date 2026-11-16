@@ -535,20 +535,34 @@ pub fn dvm_gpu_render_batch_is_valid(
         aggregate_source_bytes = next_aggregate;
     }
 
-    commands
-        .iter()
-        .copied()
-        .enumerate()
-        .all(|(index, command)| {
-            (index == 0 || command.kind != DvmGpuRenderCommandKind::Clear)
-                && command.is_valid_for(output_width, output_height, header.source_count)
-        })
-        && sources.iter().enumerate().all(|(source_index, _)| {
+    let mut used_sources_mask = 0_u64;
+    for (index, command) in commands.iter().copied().enumerate() {
+        if (index != 0 && command.kind == DvmGpuRenderCommandKind::Clear)
+            || !command.is_valid_for(output_width, output_height, header.source_count)
+        {
+            return false;
+        }
+        if command.kind == DvmGpuRenderCommandKind::TexturedQuad
+            && (command.source_index as usize) < 64
+        {
+            used_sources_mask |= 1_u64 << command.source_index;
+        }
+    }
+    if sources.len() <= 64 {
+        let expected_mask = if sources.len() == 64 {
+            u64::MAX
+        } else {
+            (1_u64 << sources.len()) - 1
+        };
+        used_sources_mask == expected_mask
+    } else {
+        sources.iter().enumerate().all(|(source_index, _)| {
             commands.iter().any(|command| {
                 command.kind == DvmGpuRenderCommandKind::TexturedQuad
                     && command.source_index as usize == source_index
             })
         })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

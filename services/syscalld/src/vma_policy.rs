@@ -96,10 +96,6 @@ impl<V: VmaEntry> VmaMap<V> {
         self.map.retain(|_, vma| !drop_if(vma));
     }
 
-    fn overlapping_keys(&self, start: u64, end: u64) -> Vec<u64> {
-        self.overlapping(start, end).map(AddressRange::start).collect()
-    }
-
     /// Remove `[start, end)`, shrinking or splitting partially covered records.
     pub fn remove_range(&mut self, start: u64, end: u64) {
         self.update_range(start, end, None::<fn(&mut V)>);
@@ -112,14 +108,24 @@ impl<V: VmaEntry> VmaMap<V> {
     }
 
     fn update_range(&mut self, start: u64, end: u64, mut update: Option<impl FnMut(&mut V)>) {
-        for key in self.overlapping_keys(start, end) {
-            let Some(vma) = self.map.remove(&key) else { continue };
+        if start >= end {
+            return;
+        }
+        let mut cursor = start;
+        while cursor < end {
+            let Some(key) = self.overlapping(cursor, end).next().map(AddressRange::start) else {
+                break;
+            };
+            let Some(vma) = self.map.remove(&key) else {
+                break;
+            };
+            let vma_end = vma.end();
             if vma.start() < start {
                 let mut left = vma.clone();
                 left.set_end(start);
                 self.map.insert(left.start(), left);
             }
-            if vma.end() > end {
+            if vma_end > end {
                 let mut right = vma.clone();
                 right.set_start(end);
                 self.map.insert(right.start(), right);
@@ -135,6 +141,7 @@ impl<V: VmaEntry> VmaMap<V> {
                 update(&mut mid);
                 self.map.insert(mid.start(), mid);
             }
+            cursor = vma_end;
         }
     }
 

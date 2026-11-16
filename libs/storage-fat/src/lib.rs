@@ -4,6 +4,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+use alloc::borrow::Cow;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -407,15 +408,15 @@ impl<D: BlockDevice> FatVolume<D> {
     }
 
     pub fn open_file(&self, path: &str) -> Result<FatFile<'_, D>, FatError> {
-        let normalized = normalize_fat_path(path);
+        let normalized = normalize_fat_path_cow(path);
         self.fs
             .root_dir()
-            .open_file(normalized.as_str())
+            .open_file(normalized.as_ref())
             .map(FatFile)
     }
 
     pub fn open_file_with_len(&self, path: &str) -> Result<(FatFile<'_, D>, u64), FatError> {
-        let normalized = normalize_fat_path(path);
+        let normalized = normalize_fat_path_cow(path);
         let mut components = normalized
             .split('/')
             .filter(|component| !component.is_empty());
@@ -447,15 +448,15 @@ impl<D: BlockDevice> FatVolume<D> {
     }
 
     pub fn create_file(&self, path: &str) -> Result<FatFile<'_, D>, FatError> {
-        let normalized = normalize_fat_path(path);
+        let normalized = normalize_fat_path_cow(path);
         self.fs
             .root_dir()
-            .create_file(normalized.as_str())
+            .create_file(normalized.as_ref())
             .map(FatFile)
     }
 
     pub fn metadata(&self, path: &str) -> Result<FatMetadata, FatError> {
-        let normalized = normalize_fat_path(path);
+        let normalized = normalize_fat_path_cow(path);
         if normalized.is_empty() {
             return Ok(FatMetadata {
                 kind: FatNodeKind::Directory,
@@ -463,7 +464,7 @@ impl<D: BlockDevice> FatVolume<D> {
             });
         }
         let (parent, child) =
-            split_parent_child(normalized.as_str()).ok_or(fatfs::Error::InvalidInput)?;
+            split_parent_child(normalized.as_ref()).ok_or(fatfs::Error::InvalidInput)?;
         let dir = self.open_dir_by_path(parent)?;
         let limit = self.max_dir_entries();
         for (seen, entry_result) in dir.iter().enumerate() {
@@ -493,7 +494,7 @@ impl<D: BlockDevice> FatVolume<D> {
     /// and derive identities from it without the aliases splitting an object
     /// into several. The returned path has no leading separator.
     pub fn canonical_path(&self, path: &str) -> Result<String, FatError> {
-        let normalized = normalize_fat_path(path);
+        let normalized = normalize_fat_path_cow(path);
         let mut canonical = String::with_capacity(normalized.len());
         let mut dir = self.fs.root_dir();
         let mut components = normalized.split('/').filter(|c| !c.is_empty()).peekable();
@@ -514,8 +515,8 @@ impl<D: BlockDevice> FatVolume<D> {
     }
 
     pub fn read_dir(&self, path: &str) -> Result<Vec<FatDirEntry>, FatError> {
-        let normalized = normalize_fat_path(path);
-        let dir = self.open_dir_by_path(normalized.as_str())?;
+        let normalized = normalize_fat_path_cow(path);
+        let dir = self.open_dir_by_path(normalized.as_ref())?;
 
         let mut entries = Vec::new();
         let limit = self.max_dir_entries();
@@ -543,39 +544,39 @@ impl<D: BlockDevice> FatVolume<D> {
     }
 
     pub fn create_dir(&self, path: &str) -> Result<(), FatError> {
-        let normalized = normalize_fat_path(path);
-        self.fs.root_dir().create_dir(normalized.as_str())?;
+        let normalized = normalize_fat_path_cow(path);
+        self.fs.root_dir().create_dir(normalized.as_ref())?;
         Ok(())
     }
 
     pub fn remove_file(&self, path: &str) -> Result<(), FatError> {
-        let normalized = normalize_fat_path(path);
+        let normalized = normalize_fat_path_cow(path);
         let root = self.fs.root_dir();
-        let entry = root.open_file(normalized.as_str())?;
+        let entry = root.open_file(normalized.as_ref())?;
         drop(entry);
-        root.remove(normalized.as_str())
+        root.remove(normalized.as_ref())
     }
 
     pub fn remove_dir(&self, path: &str) -> Result<(), FatError> {
-        let normalized = normalize_fat_path(path);
+        let normalized = normalize_fat_path_cow(path);
         let root = self.fs.root_dir();
-        let dir = root.open_dir(normalized.as_str())?;
+        let dir = root.open_dir(normalized.as_ref())?;
         drop(dir);
-        root.remove(normalized.as_str())
+        root.remove(normalized.as_ref())
     }
 
     pub fn rename(&self, src: &str, dst: &str) -> Result<(), FatError> {
-        let src = normalize_fat_path(src);
-        let dst = normalize_fat_path(dst);
+        let src = normalize_fat_path_cow(src);
+        let dst = normalize_fat_path_cow(dst);
         let (dst_parent, dst_name) =
-            split_parent_child(dst.as_str()).ok_or(fatfs::Error::InvalidInput)?;
+            split_parent_child(dst.as_ref()).ok_or(fatfs::Error::InvalidInput)?;
         let root = self.fs.root_dir();
         let dst_dir = if dst_parent.is_empty() {
             root.clone()
         } else {
             root.open_dir(dst_parent)?
         };
-        root.rename(src.as_str(), &dst_dir, dst_name)
+        root.rename(src.as_ref(), &dst_dir, dst_name)
     }
 
     pub fn read_file_to_vec(&self, path: &str) -> Result<Vec<u8>, FatError> {
@@ -698,6 +699,22 @@ pub fn normalize_fat_path(path: &str) -> String {
     normalized
 }
 
+fn normalize_fat_path_cow(path: &str) -> Cow<'_, str> {
+    let trimmed = path.strip_prefix('/').unwrap_or(path);
+    if !trimmed.starts_with('/')
+        && !trimmed.ends_with('/')
+        && !trimmed.contains('\\')
+        && !trimmed.contains("//")
+        && trimmed != "."
+        && !trimmed.starts_with("./")
+        && !trimmed.ends_with("/.")
+        && !trimmed.contains("/./")
+    {
+        return Cow::Borrowed(trimmed);
+    }
+    Cow::Owned(normalize_fat_path(path))
+}
+
 /// A directory cannot hold more 32-byte records than fit on the device; a walk
 /// past that bound means a cyclic cluster chain in untrusted metadata.
 fn check_dir_walk(seen: usize, limit: u64) -> Result<(), FatError> {
@@ -739,6 +756,23 @@ fn entry_matches<D: BlockDevice>(
     entry: &fatfs::DirEntry<'_, FatDisk<D>, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
     name: &str,
 ) -> bool {
+    if name.is_ascii() {
+        let name_bytes = name.as_bytes();
+        if let Some(lfn) = entry.long_file_name_as_ucs2_units() {
+            if lfn.len() == name_bytes.len()
+                && lfn
+                    .iter()
+                    .zip(name_bytes.iter())
+                    .all(|(&u, &b)| u <= 0x7f && (u as u8).eq_ignore_ascii_case(&b))
+            {
+                return true;
+            }
+        }
+        let short = entry.short_file_name_as_bytes();
+        if short.is_ascii() {
+            return short.eq_ignore_ascii_case(name_bytes);
+        }
+    }
     entry.file_name().eq_ignore_ascii_case(name)
         || entry.short_file_name().eq_ignore_ascii_case(name)
 }
@@ -1264,5 +1298,28 @@ mod tests {
         }
 
         volume.unmount().expect("unmount");
+    }
+
+    #[test]
+    fn normalize_fat_path_cow_matches_owned_and_borrows_clean_paths() {
+        for clean in ["", "/", "/bin/ls", "bin/ls", "a", "/a", "a/../b", "/a/../b"] {
+            let cow = normalize_fat_path_cow(clean);
+            assert!(matches!(cow, Cow::Borrowed(_)), "expected borrow for {clean:?}");
+            assert_eq!(cow.as_ref(), normalize_fat_path(clean));
+        }
+        for dirty in [
+            "//bin/ls",
+            "/bin//ls",
+            "/bin/ls/",
+            "\\bin\\ls",
+            ".",
+            "./bin/ls",
+            "/./bin/ls",
+            "/bin/./ls",
+            "/bin/.",
+        ] {
+            let cow = normalize_fat_path_cow(dirty);
+            assert_eq!(cow.as_ref(), normalize_fat_path(dirty));
+        }
     }
 }

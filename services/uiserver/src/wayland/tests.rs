@@ -1874,5 +1874,81 @@ fn data_device_dropped_ask_rejects_preferred_action_outside_source_mask() {
     );
 }
 
+#[test]
+fn cleanup_disconnected_client_retires_surfaces_and_clears_focus_and_resources() {
+    use std::collections::HashMap;
+    use std::os::unix::net::UnixStream;
+
+    let mut display = test_display();
+    let mut state = super::WaylandState::new(800, 600);
+    state.display_handle = Some(display.handle());
+    super::create_wayland_globals(&display.handle());
+
+    let (server_end, mut sock) = UnixStream::pair().expect("socket pair");
+    sock.set_nonblocking(true).unwrap();
+    let client = display
+        .handle()
+        .insert_client(server_end, Arc::new(super::WaylandClientState::default()))
+        .expect("client");
+    let client_id = client.id();
+
+    wire::send(&mut sock, &wire::message(1, 1, &wire::u32s(&[2])));
+    pump(&mut display, &mut state);
+    let mut names = HashMap::new();
+    for (_, op, p) in wire::events(&mut sock) {
+        if op == 0 {
+            let name = u32::from_ne_bytes(p[0..4].try_into().unwrap());
+            let len = u32::from_ne_bytes(p[4..8].try_into().unwrap()) as usize;
+            names.insert(String::from_utf8(p[8..8 + len - 1].to_vec()).unwrap(), name);
+        }
+    }
+    for (iface, ver, id) in [("wl_seat", 7, 3), ("wl_output", 4, 4), ("wl_compositor", 6, 5)] {
+        let mut args = wire::u32s(&[names[iface]]);
+        args.extend(wire::string(iface));
+        args.extend(wire::u32s(&[ver, id]));
+        wire::send(&mut sock, &wire::message(2, 0, &args));
+    }
+    wire::send(&mut sock, &wire::message(3, 0, &wire::u32s(&[6])));
+    wire::send(&mut sock, &wire::message(3, 1, &wire::u32s(&[7])));
+    wire::send(&mut sock, &wire::message(5, 0, &wire::u32s(&[8])));
+    pump(&mut display, &mut state);
+
+    let surface_res = state
+        .surfaces
+        .last()
+        .unwrap()
+        .shared
+        .lock()
+        .unwrap()
+        .resource
+        .clone()
+        .unwrap();
+    state.pointer_focus = Some(super::PointerFocus {
+        surface: surface_res.clone(),
+        client_id: client_id.clone(),
+        surface_x: 1.0,
+        surface_y: 1.0,
+    });
+    state.keyboard_focus = Some(super::KeyboardFocus {
+        surface: surface_res,
+        client_id: client_id.clone(),
+    });
+    state.pointer_button_down = true;
+    state.pointer_grab_serial = Some(42);
+    state.record_input_serial(42, client_id.clone());
+
+    state.cleanup_disconnected_client(&client_id);
+
+    assert!(state.surfaces.is_empty());
+    assert!(state.pointer_resources.is_empty());
+    assert!(state.keyboard_resources.is_empty());
+    assert!(state.output_resources.is_empty());
+    assert!(state.input_serials.is_empty());
+    assert!(state.pointer_focus.is_none());
+    assert!(state.keyboard_focus.is_none());
+    assert!(!state.pointer_button_down);
+    assert!(state.pointer_grab_serial.is_none());
+}
+
 mod arbitration;
 mod dmabuf_import;

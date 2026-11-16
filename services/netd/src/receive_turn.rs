@@ -109,18 +109,27 @@ pub(super) fn dispatch_admitted_request(
             );
         }
         status
-    } else if is_deferred_local_poll_request(request) {
-        let status = handle_poll_socket(request, response);
-        if status == 0 && response.value == 0 {
-            match defer_local_poll_request(*request, reply_cap) {
+    } else if request.op == SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET
+        && request.arg2 == NETD_POLL_MODE_WAIT
+    {
+        if inet_socket_exists(request.socket_token) {
+            match enqueue_blocking_request(*request, reply_cap) {
                 Ok(()) => return None,
                 Err(errno) => errno,
             }
         } else {
-            if status == 0 {
-                response.reserved1 = NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;
+            let status = handle_poll_socket(request, response);
+            if status == 0 && response.value == 0 {
+                match defer_local_poll_request(*request, reply_cap) {
+                    Ok(()) => return None,
+                    Err(errno) => errno,
+                }
+            } else {
+                if status == 0 {
+                    response.reserved1 = NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;
+                }
+                status
             }
-            status
         }
     } else if is_accounting_request(request) {
         match enqueue_lifecycle_request(*request, reply_cap) {

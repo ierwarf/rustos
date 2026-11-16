@@ -518,6 +518,28 @@ impl WaylandState {
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
     }
 
+    pub(super) fn cleanup_data_client(&mut self, client_id: &ClientId) {
+        self.data_devices
+            .retain(|device| device.client_id != *client_id && device.resource.is_alive());
+        if self
+            .drag
+            .as_ref()
+            .is_some_and(|drag| drag.origin_client == *client_id)
+        {
+            self.cancel_drag();
+        }
+        if self.selection.as_ref().is_some_and(|selection| {
+            !selection.source.is_alive()
+                || selection
+                    .source
+                    .client()
+                    .is_some_and(|client| client.id() == *client_id)
+        }) {
+            self.selection = None;
+            self.invalidate_selection_offers();
+        }
+    }
+
     /// Offer the current selection (or its absence) on every data device the
     /// client owns. Called on keyboard enter and when the selection changes.
     pub(super) fn send_selection_to_client(&mut self, client_id: &ClientId) {

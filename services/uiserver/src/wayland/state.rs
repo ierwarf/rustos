@@ -318,10 +318,10 @@ impl WaylandState {
                 let Ok(mut surface) = surface.shared.lock() else {
                     continue;
                 };
-                surface
-                    .pending_buffer_releases
-                    .drain(..)
-                    .collect::<Vec<_>>()
+                if surface.pending_buffer_releases.is_empty() {
+                    continue;
+                }
+                core::mem::take(&mut surface.pending_buffer_releases)
             };
             for buffer in releases {
                 released = released.saturating_add(1);
@@ -360,10 +360,10 @@ impl WaylandState {
                 // Visibility is a legitimate reason to withhold a callback; the
                 // compositor's own buffer bookkeeping is not, and the audit's
                 // `V5-WAYLAND-HOL-013` is exactly this coupling.
-                if surface.alive && !surface.minimized {
-                    surface.pending_callbacks.drain(..).collect::<Vec<_>>()
+                if surface.alive && !surface.minimized && !surface.pending_callbacks.is_empty() {
+                    core::mem::take(&mut surface.pending_callbacks)
                 } else {
-                    Vec::new()
+                    continue;
                 }
             };
             for pending in callbacks {
@@ -437,6 +437,47 @@ impl WaylandState {
                 })
                 .unwrap_or(false)
         });
+    }
+
+    pub(super) fn cleanup_disconnected_client(&mut self, client_id: &ClientId) {
+        let client_surfaces: Vec<_> = self
+            .surfaces
+            .iter()
+            .filter_map(|surface| {
+                let state = surface.shared.lock().ok()?;
+                (state.alive && state.client_id.as_ref() == Some(client_id))
+                    .then(|| Arc::clone(&surface.shared))
+            })
+            .collect();
+        for shared in client_surfaces {
+            self.retire_surface(&shared);
+        }
+        self.prune_surfaces();
+        self.pointer_resources
+            .retain(|pointer| pointer.client_id != *client_id && pointer.resource.is_alive());
+        self.keyboard_resources
+            .retain(|keyboard| keyboard.client_id != *client_id && keyboard.resource.is_alive());
+        self.output_resources
+            .retain(|output| output.client_id != *client_id && output.resource.is_alive());
+        self.input_serials.retain(|(_, owner)| owner != client_id);
+        if self
+            .pointer_focus
+            .as_ref()
+            .is_some_and(|focus| focus.client_id == *client_id)
+        {
+            self.pointer_focus = None;
+            self.pointer_button_down = false;
+            self.pointer_grab_serial = None;
+            self.pointer_motion_pending = false;
+        }
+        if self
+            .keyboard_focus
+            .as_ref()
+            .is_some_and(|focus| focus.client_id == *client_id)
+        {
+            self.keyboard_focus = None;
+        }
+        self.cleanup_data_client(client_id);
     }
 
     pub(super) fn prune_surface_callbacks(surface: &mut WaylandSurfaceState) {

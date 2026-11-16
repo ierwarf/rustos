@@ -59,7 +59,10 @@ impl PagerFaultError {
 
 pub struct PagerState {
     epoch: u64,
+    /// Dense prefix `regions[..tracked]` kept sorted by `(process_handle, start)`
+    /// with non-overlapping ranges per process for O(log N) lookup and edits.
     regions: [Option<PagerVmRegionWire>; PAGER_MAX_REGIONS],
+    tracked: usize,
     /// Highest fault-token generation accepted for each ring0 slot. Index is
     /// the token's one-based slot minus one; zero means the slot is unused.
     accepted_generations: [u64; PAGER_MAX_CONSUMED_TOKENS],
@@ -70,6 +73,7 @@ impl PagerState {
         Self {
             epoch,
             regions: [None; PAGER_MAX_REGIONS],
+            tracked: 0,
             accepted_generations: [0; PAGER_MAX_CONSUMED_TOKENS],
         }
     }
@@ -82,30 +86,40 @@ impl PagerState {
         if !region.is_canonical() || region.object.pager_epoch != self.epoch {
             return Err(PagerFaultError::Malformed);
         }
-        if self.regions.iter().flatten().any(|current| {
-            current.process_handle == region.process_handle
-                && current.start < region.end
-                && region.start < current.end
-        }) {
-            return Err(PagerFaultError::Stale);
+        let active = &self.regions[..self.tracked];
+        let idx = active.partition_point(|slot| {
+            let current = slot.expect("dense tracked prefix");
+            (current.process_handle, current.start) < (region.process_handle, region.start)
+        });
+        if idx > 0 {
+            let prev = active[idx - 1].expect("dense tracked prefix");
+            if prev.process_handle == region.process_handle && prev.end > region.start {
+                return Err(PagerFaultError::Stale);
+            }
         }
-        let slot = self
-            .regions
-            .iter_mut()
-            .find(|slot| slot.is_none())
-            .ok_or(PagerFaultError::Pressure(PAGER_PRESSURE_REGION_TABLE_FULL))?;
-        *slot = Some(region);
+        if idx < self.tracked {
+            let next = active[idx].expect("dense tracked prefix");
+            if next.process_handle == region.process_handle && region.end > next.start {
+                return Err(PagerFaultError::Stale);
+            }
+        }
+        if self.tracked == PAGER_MAX_REGIONS {
+            return Err(PagerFaultError::Pressure(PAGER_PRESSURE_REGION_TABLE_FULL));
+        }
+        self.regions.copy_within(idx..self.tracked, idx + 1);
+        self.regions[idx] = Some(region);
+        self.tracked += 1;
         Ok(())
     }
 
     /// Regions this pager currently tracks, across every process.
-    pub fn tracked_regions(&self) -> usize {
-        self.regions.iter().flatten().count()
+    pub const fn tracked_regions(&self) -> usize {
+        self.tracked
     }
 
     /// Free region slots. A split needs one of these for its second fragment.
-    pub fn free_region_slots(&self) -> usize {
-        PAGER_MAX_REGIONS - self.tracked_regions()
+    pub const fn free_region_slots(&self) -> usize {
+        PAGER_MAX_REGIONS - self.tracked
     }
 
     /// Applies one ring0-stamped range edit to every region it overlaps,
@@ -137,22 +151,22 @@ impl PagerState {
         if !edit.is_canonical() || process_handle == 0 || process_generation == 0 {
             return Err(PagerFaultError::Malformed);
         }
-        // Only which slots the edit touches is carried between the two passes.
-        // Caching each `PagerRegionEdit` instead would put three whole region
-        // wires per slot on the stack - about 120 KiB for a full table - in a
-        // `no_std` service whose thread stack is nowhere near that. The rule is
-        // pure, so the second pass simply re-derives it.
-        let mut touched = [false; PAGER_MAX_REGIONS];
+        let active = &self.regions[..self.tracked];
+        let start_idx = active.partition_point(|slot| {
+            let region = slot.expect("dense tracked prefix");
+            region.process_handle < process_handle
+                || (region.process_handle == process_handle && region.end <= edit.start)
+        });
+        let mut end_idx = start_idx;
         let mut additional = 0_usize;
         let mut edited = 0_usize;
-        for (index, slot) in self.regions.iter().enumerate() {
-            let Some(region) = *slot else {
-                continue;
-            };
-            if region.process_handle != process_handle
-                || region.process_generation != process_generation
-                || !edit.overlaps(region)
-            {
+        while end_idx < self.tracked {
+            let region = active[end_idx].expect("dense tracked prefix");
+            if region.process_handle != process_handle || region.start >= edit.end {
+                break;
+            }
+            end_idx += 1;
+            if region.process_generation != process_generation {
                 continue;
             }
             let outcome = apply_region_edit(region, edit);
@@ -164,7 +178,6 @@ impl PagerState {
             }
             additional += outcome.additional_pager_slots();
             edited += 1;
-            touched[index] = true;
         }
         if edited == 0 {
             return Ok(0);
@@ -175,28 +188,35 @@ impl PagerState {
             ));
         }
 
-        for index in 0..PAGER_MAX_REGIONS {
-            if !touched[index] {
+        let mut i = start_idx;
+        let mut remaining = end_idx - start_idx;
+        while remaining > 0 {
+            remaining -= 1;
+            let region = self.regions[i].expect("dense tracked prefix");
+            if region.process_generation != process_generation {
+                i += 1;
                 continue;
             }
-            // Re-derived, not cached. A touched slot still holds the region the
-            // first pass measured: this pass only ever writes slot `index`
-            // after reading it, and any free slot it fills is untouched and so
-            // is skipped when the loop reaches it.
-            let Some(region) = self.regions[index] else {
-                return Err(PagerFaultError::Malformed);
-            };
             let (fragments, len) = apply_region_edit(region, edit).pager_fragments();
-            // The edited region's own slot takes the first fragment, so the
-            // common trim case needs no free slot at all.
-            self.regions[index] = (len > 0).then(|| fragments[0]);
-            for fragment in fragments.iter().copied().take(len).skip(1) {
-                let free = self
-                    .regions
-                    .iter_mut()
-                    .find(|slot| slot.is_none())
-                    .expect("split headroom was checked before any region was withdrawn");
-                *free = Some(fragment);
+            match len {
+                0 => {
+                    self.regions.copy_within(i + 1..self.tracked, i);
+                    self.tracked -= 1;
+                    self.regions[self.tracked] = None;
+                }
+                _ => {
+                    self.regions[i] = Some(fragments[0]);
+                    let extra = len - 1;
+                    if extra > 0 {
+                        self.regions
+                            .copy_within(i + 1..self.tracked, i + 1 + extra);
+                        self.tracked += extra;
+                        for (offset, fragment) in fragments[1..len].iter().copied().enumerate() {
+                            self.regions[i + 1 + offset] = Some(fragment);
+                        }
+                    }
+                    i += len;
+                }
             }
         }
         Ok(edited)
@@ -249,12 +269,20 @@ impl PagerState {
     }
 
     pub fn invalidate_process(&mut self, process_handle: u64) -> usize {
-        let mut removed = 0;
-        for slot in &mut self.regions {
-            if slot.is_some_and(|region| region.process_handle == process_handle) {
-                *slot = None;
-                removed += 1;
-            }
+        let active = &self.regions[..self.tracked];
+        let start = active.partition_point(|slot| {
+            slot.expect("dense tracked prefix").process_handle < process_handle
+        });
+        let end = start
+            + active[start..].partition_point(|slot| {
+                slot.expect("dense tracked prefix").process_handle == process_handle
+            });
+        let removed = end - start;
+        if removed > 0 {
+            self.regions.copy_within(end..self.tracked, start);
+            let new_tracked = self.tracked - removed;
+            self.regions[new_tracked..self.tracked].fill(None);
+            self.tracked = new_tracked;
         }
         removed
     }
@@ -265,7 +293,8 @@ impl PagerState {
             .checked_add(1)
             .filter(|epoch| *epoch != 0)
             .ok_or(PagerFaultError::EpochExhausted)?;
-        self.regions.fill(None);
+        self.regions[..self.tracked].fill(None);
+        self.tracked = 0;
         self.accepted_generations.fill(0);
         Ok(self.epoch)
     }
@@ -289,12 +318,16 @@ impl PagerState {
         if request.object.pager_epoch != self.epoch || !self.token_is_fresh(request.fault_token) {
             return Err(PagerFaultError::Stale);
         }
-        let region = self
-            .regions
-            .iter()
-            .flatten()
-            .find(|region| fault_matches_region(request, **region))
-            .copied()
+        let active = &self.regions[..self.tracked];
+        let idx = active.partition_point(|slot| {
+            let region = slot.expect("dense tracked prefix");
+            (region.process_handle, region.start)
+                <= (request.process_handle, request.virtual_address)
+        });
+        let region = idx
+            .checked_sub(1)
+            .and_then(|i| active[i])
+            .filter(|region| fault_matches_region(request, *region))
             .ok_or(PagerFaultError::NotManaged)?;
 
         let mut reply = reply_envelope(request);

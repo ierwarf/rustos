@@ -1087,6 +1087,7 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
             // wait broker that admits the policy consumer".
             debug_line("inputd: DVM ingress worker running");
             let mut ingest_scratch = vec![InputDvmRecordWire::default(); INPUTD_INGEST_MAX_EVENTS];
+            let mut outcomes = Vec::with_capacity(INPUTD_INGEST_MAX_EVENTS);
             let mut pending_events = Vec::with_capacity(INPUTD_INGEST_MAX_EVENTS);
             let mut decoder = dvm_protocol::DvmDecoder::default();
             let mut retry_without_wait = false;
@@ -1113,18 +1114,22 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                         std::process::exit(134);
                     }
                 };
+                if drained == 0 {
+                    retry_without_wait = false;
+                    continue;
+                }
                 let drain_done_ns = dvm_session_sync::monotonic_nanos();
-                let mut outcomes = ingest_scratch[..drained]
-                    .iter()
-                    .map(|record| decoder.consume(record))
-                    .collect::<Vec<_>>();
+                outcomes.clear();
+                outcomes.extend(
+                    ingest_scratch[..drained]
+                        .iter()
+                        .map(|record| decoder.consume(record)),
+                );
                 let decode_done_ns = dvm_session_sync::monotonic_nanos();
                 total_drained = total_drained.saturating_add(drained as u64);
-                if drained != 0 {
-                    nonempty_batches = nonempty_batches.saturating_add(1);
-                }
-                let report_progress = drained != 0
-                    && (nonempty_batches == 1 || total_drained >= next_progress_report); // First proof, then interval-bound to avoid debugcon boot serialization.
+                nonempty_batches = nonempty_batches.saturating_add(1);
+                let report_progress =
+                    nonempty_batches == 1 || total_drained >= next_progress_report; // First proof, then interval-bound to avoid debugcon boot serialization.
                 if report_progress {
                     debug_line(&format!(
                         "inputd: DVM transport progress records={total_drained} batch={drained} batch_seq={nonempty_batches} stage=decoded"
@@ -1347,6 +1352,9 @@ fn wait_for_dvm_ingress(armed_logged: &mut bool) -> Result<(), i32> {
 }
 
 fn log_dvm_ingress_observations(queue: &SharedInputQueue, state: &DvmIngressLogState) {
+    if state.keyboard.load(Ordering::Relaxed) && state.pointer.load(Ordering::Relaxed) {
+        return;
+    }
     let observations = lock_input_queue(queue).take_dvm_ingress_observations();
     log_dvm_ingress_observation_flags(state, observations);
 }
@@ -1642,30 +1650,42 @@ fn fill_evdev_payload(
     payload: &mut [u8; INPUTD_READ_PAYLOAD_CAPACITY],
     requested: usize,
 ) -> Result<usize, i32> {
+    thread_local! {
+        static EVDEV_SCRATCH: std::cell::RefCell<(
+            Vec<input_evdev::InputEvent>,
+            Vec<input_evdev::LinuxInputEvent>,
+        )> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    }
     let event_size = size_of::<input_evdev::LinuxInputEvent>();
     let output_capacity = requested / event_size;
     if output_capacity < input_evdev::MAX_EVDEV_EVENTS_PER_INPUT_EVENT || queue.is_empty() {
         return Ok(0);
     }
-    let mut input = Vec::new();
     let max_input = (output_capacity / input_evdev::MAX_EVDEV_EVENTS_PER_INPUT_EVENT)
         .min(queue.len())
         .min(input_evdev::MAX_INPUT_EVENTS_PER_READ);
-    for _ in 0..max_input {
-        if let Some(event) = queue.pop_front() {
+    EVDEV_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        let (input, output) = &mut *scratch;
+        input.clear();
+        input.reserve(max_input.saturating_sub(input.capacity()));
+        for _ in 0..max_input {
+            let Some(event) = queue.pop_front() else {
+                break;
+            };
             input.push(event);
         }
-    }
-    let mut output = vec![input_evdev::LinuxInputEvent::default(); output_capacity];
-    let written_events = input_evdev::translate_input_events_to_evdev(&input, &mut output)
-        .map_err(|_| libc::EINVAL)?;
-    let bytes_len = written_events * event_size;
-    // SAFETY: `output[..written_events]` is initialized `repr(C)` LinuxInputEvent data
-    // (i64,i64,u16,u16,i32: no padding) and `bytes_len = written_events * size` is
-    // within `output`'s length, which the translator bounded by its capacity.
-    let bytes = unsafe { slice::from_raw_parts(output.as_ptr().cast::<u8>(), bytes_len) };
-    payload[..bytes_len].copy_from_slice(bytes);
-    Ok(bytes_len)
+        output.resize(output_capacity, input_evdev::LinuxInputEvent::default());
+        let written_events = input_evdev::translate_input_events_to_evdev(input, output)
+            .map_err(|_| libc::EINVAL)?;
+        let bytes_len = written_events * event_size;
+        // SAFETY: `output[..written_events]` is initialized `repr(C)` LinuxInputEvent data
+        // (i64,i64,u16,u16,i32: no padding) and `bytes_len = written_events * size` is
+        // within `output`'s length, which the translator bounded by its capacity.
+        let bytes = unsafe { slice::from_raw_parts(output.as_ptr().cast::<u8>(), bytes_len) };
+        payload[..bytes_len].copy_from_slice(bytes);
+        Ok(bytes_len)
+    })
 }
 
 fn authorize_read_with_stats(

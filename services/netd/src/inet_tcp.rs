@@ -134,7 +134,8 @@ pub(super) fn poll_inet_connect(request: &NetdIpcRequest) -> i32 {
     inet_connect_status(&mut state, request.socket_token)
 }
 
-pub(super) fn handle_inet_send(
+pub(super) fn handle_inet_send_in_state(
+    state: &mut NetState,
     request: &NetdIpcRequest,
     bytes: &[u8],
     response: &mut NetdIpcResponse,
@@ -143,7 +144,6 @@ pub(super) fn handle_inet_send(
         response.value = 0;
         return 0;
     }
-    let mut state = lock_net_state();
     let Some(inet) = state.inet_sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
@@ -171,7 +171,11 @@ pub(super) fn handle_inet_send(
     }
 }
 
-pub(super) fn handle_inet_recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+pub(super) fn handle_inet_recv_in_state(
+    state: &mut NetState,
+    request: &NetdIpcRequest,
+    response: &mut NetdIpcResponse,
+) -> i32 {
     // RECVMSG carries its length in `payload_len` (arg2 holds the msg flags)
     // and expects the reply to start with the recvmsg envelope header.
     let recvmsg = request.op == SYSCALL_OFFLOAD_OP_LINUX_RECVMSG;
@@ -187,7 +191,6 @@ pub(super) fn handle_inet_recv(request: &NetdIpcRequest, response: &mut NetdIpcR
         response.payload[..data_start].fill(0);
         return 0;
     }
-    let mut state = lock_net_state();
     let Some(inet) = state.inet_sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };

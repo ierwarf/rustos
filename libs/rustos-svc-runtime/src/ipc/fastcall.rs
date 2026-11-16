@@ -6,16 +6,19 @@ use rustos_user_abi::syscall::*;
 
 const EOVERFLOW: i64 = 75;
 
+#[inline(always)]
 fn short_call_shape(request_len: usize, reply_capacity: usize) -> bool {
     request_len != 0 && request_len <= IPC_REGISTER_BYTES && reply_capacity == IPC_REGISTER_BYTES
 }
 
+#[inline(always)]
 fn short_receive_shape(capacity: usize) -> bool {
     // A smaller capacity must reject without consuming a too-large request;
     // a larger capacity promises to accept messages beyond the register image.
     capacity == IPC_REGISTER_BYTES
 }
 
+#[inline(always)]
 unsafe fn words(pointer: *const u8, length: usize) -> Option<[u64; 2]> {
     if length > IPC_REGISTER_BYTES || (length != 0 && pointer.is_null()) {
         return None;
@@ -28,6 +31,7 @@ unsafe fn words(pointer: *const u8, length: usize) -> Option<[u64; 2]> {
     ipc_register_pack(bytes)
 }
 
+#[inline(always)]
 unsafe fn copy_payload(result: &IpcRegisterResult, destination: *mut u8) -> i64 {
     if result.status < 0 {
         return result.status;
@@ -137,6 +141,7 @@ pub(super) unsafe fn reply_receive(
     Some(unsafe { receive_result(result, request, reply, pid, tid) })
 }
 
+#[inline(always)]
 unsafe fn receive_result(
     result: IpcRegisterResult,
     request: *mut u8,
@@ -146,13 +151,15 @@ unsafe fn receive_result(
 ) -> i64 {
     let status = unsafe { copy_payload(&result, request) };
     // Never manufacture authority on error, even for a malformed return image.
-    let metadata = if status >= 0 {
-        [result.reply, result.sender_pid, result.sender_tid]
+    let (r, p, t) = if status >= 0 {
+        (result.reply, result.sender_pid, result.sender_tid)
     } else {
-        [0; 3]
+        (0, 0, 0)
     };
-    for (pointer, value) in [reply, pid, tid].into_iter().zip(metadata) {
-        unsafe { pointer.write_unaligned(value) };
+    unsafe {
+        reply.write_unaligned(r);
+        pid.write_unaligned(p);
+        tid.write_unaligned(t);
     }
     status
 }

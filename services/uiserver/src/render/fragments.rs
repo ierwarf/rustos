@@ -38,28 +38,37 @@ pub(super) fn visible_fragments(
     layers: &[FragmentLayer],
     output: Rect,
 ) -> Result<Vec<AtlasFragment>, GpuSceneError> {
+    let covers: Vec<Rect> = layers
+        .iter()
+        .map(|layer| layer.opaque.intersect(layer.destination).intersect(output))
+        .collect();
     let mut fragments = Vec::new();
+    let mut visible = Vec::new();
+    let mut next = Vec::new();
     for (layer_index, layer) in layers.iter().enumerate() {
         let clipped = layer.destination.intersect(output);
         if clipped.is_empty() {
             continue;
         }
-        let mut visible = vec![clipped];
-        for upper in &layers[layer_index + 1..] {
-            let cover = upper.opaque.intersect(upper.destination).intersect(output);
+        visible.clear();
+        visible.push(clipped);
+        for &cover in &covers[layer_index + 1..] {
             if cover.is_empty() {
                 continue;
             }
-            let mut next = Vec::new();
-            for rect in visible {
+            next.clear();
+            for &rect in &visible {
                 subtract(rect, cover, &mut next);
                 if fragments.len() + next.len() > MAX_FRAGMENTS {
                     return Err(GpuSceneError::CommandLimit);
                 }
             }
-            visible = next;
+            core::mem::swap(&mut visible, &mut next);
+            if visible.is_empty() {
+                break;
+            }
         }
-        for destination in visible {
+        for &destination in &visible {
             if fragments.len() == MAX_FRAGMENTS {
                 return Err(GpuSceneError::CommandLimit);
             }
@@ -412,6 +421,8 @@ pub(super) fn build_cropped_gpu_atlas_scene(
         true,
     )?;
     // Only one full independent window raster is temporary at any time.
+    let mut console_scratch = Vec::new();
+    let mut wayland_scratch = Vec::new();
     for (index, planned) in plan.iter().enumerate() {
         if !fragments
             .iter()
@@ -419,16 +430,17 @@ pub(super) fn build_cropped_gpu_atlas_scene(
         {
             continue;
         }
-        let (mut pixels, width, height, focused, server_decoration) = match *planned {
+        let (width, height, focused, server_decoration, is_console) = match *planned {
             PlannedWindow::Wayland { index, focused } => {
                 let window = &state.wayland_windows[index];
                 let outer = wayland_window_outer_rect(window);
+                wayland_scratch = render_wayland_gpu_texture(window, focused)?;
                 (
-                    render_wayland_gpu_texture(window, focused)?,
                     outer.width,
                     outer.height,
                     focused,
                     window.server_decoration,
+                    false,
                 )
             }
             PlannedWindow::Console { index, focused } => {
@@ -437,27 +449,31 @@ pub(super) fn build_cropped_gpu_atlas_scene(
                 if !window.surface_cache.valid {
                     return Err(GpuSceneError::SceneNotReady);
                 }
+                console_scratch.clear();
+                console_scratch.extend_from_slice(&window.surface_cache.pixels);
                 (
-                    window.surface_cache.pixels.clone(),
                     window.surface_cache.width,
                     window.surface_cache.height,
                     focused,
                     true,
+                    true,
                 )
             }
         };
+        let pixels = if is_console {
+            &mut console_scratch
+        } else {
+            &mut wayland_scratch
+        };
         if server_decoration {
-            for pixel in &mut pixels {
-                *pixel |= 0xff00_0000;
-            }
-            chrome::apply_window_texture_alpha(&mut pixels, width, width, height, focused);
+            chrome::apply_window_texture_alpha(pixels, width, width, height, focused);
         }
         write_fragment_layer(
             &mut packer,
             &fragments,
             &regions,
             index + 1,
-            &pixels,
+            pixels,
             width,
             false,
         )?;

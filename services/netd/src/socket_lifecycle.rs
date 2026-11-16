@@ -647,18 +647,15 @@ pub(super) fn handle_accept(
             let UnixSocketState::Connected(connected) = &socket.state else {
                 return libc::ECONNABORTED;
             };
-            connected.channel_id
-        };
-        if channel_id == 0 {
-            return libc::EPROTO;
-        }
-        if request.arg1 != 0 && request.arg2 != 0 {
-            let state = lock_net_state();
-            if let Some(socket) = state.sockets.get(&accepted) {
+            if request.arg1 != 0 && request.arg2 != 0 {
                 if let Err(errno) = sockaddr_payload(socket.peer_path.as_ref(), response) {
                     return errno;
                 }
             }
+            connected.channel_id
+        };
+        if channel_id == 0 {
+            return libc::EPROTO;
         }
         // An accepted endpoint is not funded merely because it is queued.
         // Charge the client only at the public accept handoff boundary.

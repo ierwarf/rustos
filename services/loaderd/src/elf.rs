@@ -24,6 +24,7 @@ enum ExecutableAdmission {
         header: [u8; ELF_HEADER_SIZE],
         program_headers: Vec<u8>,
         load_bias: u64,
+        interpreter_path: Option<String>,
     },
     Pe64,
 }
@@ -51,18 +52,17 @@ fn map_executable_segments(
             header,
             program_headers,
             load_bias,
+            interpreter_path,
         } => {
-            trace_line(&format!(
-                "loaderd: elf map header reused handle={prepare_handle}"
-            ));
-            trace_line(&format!(
+            trace_log!("loaderd: elf map header reused handle={prepare_handle}");
+            trace_log!(
                 "loaderd: elf map phdrs reused handle={prepare_handle} bytes={}",
                 program_headers.len()
-            ));
+            );
             map_admitted_elf_segments_fd(
                 fd,
                 prepare_handle,
-                true,
+                interpreter_path.as_deref(),
                 header,
                 program_headers,
                 *load_bias,
@@ -286,12 +286,14 @@ fn validate_executable_fd(fd: i32) -> Result<ExecutableAdmission, i32> {
     read_exact_at(fd, 0, &mut header)?;
     if header[..4] == *b"\x7fELF" {
         let phdrs = read_program_headers(fd, &header)?;
-        let load_bias = validate_elf_fd(fd, &header, &phdrs, ELF_MAIN_DYN_LOAD_OFFSET)?;
+        let (load_bias, interpreter_path) =
+            validate_elf_fd(fd, &header, &phdrs, ELF_MAIN_DYN_LOAD_OFFSET, true)?;
         admit_native_abi_stamp_fd(fd, &phdrs)?;
         return Ok(ExecutableAdmission::Elf64 {
             header,
             program_headers: phdrs,
             load_bias,
+            interpreter_path,
         });
     }
     if &header[..2] == b"MZ" {
@@ -372,23 +374,13 @@ fn read_program_headers(fd: i32, header: &[u8; ELF_HEADER_SIZE]) -> Result<Vec<u
     Ok(buf)
 }
 
-fn program_header_at(phdrs: &[u8], index: u64) -> Result<&[u8], i32> {
-    let start = usize::try_from(index)
-        .map_err(|_| EOVERFLOW)?
-        .checked_mul(ELF_PROGRAM_HEADER_SIZE)
-        .ok_or(EOVERFLOW)?;
-    let end = start
-        .checked_add(ELF_PROGRAM_HEADER_SIZE)
-        .ok_or(EOVERFLOW)?;
-    phdrs.get(start..end).ok_or(ENOEXEC)
-}
-
 fn validate_elf_fd(
     fd: i32,
     header: &[u8; ELF_HEADER_SIZE],
     phdrs: &[u8],
     dyn_load_offset: u64,
-) -> Result<u64, i32> {
+    read_interpreter: bool,
+) -> Result<(u64, Option<String>), i32> {
     // ET_EXEC retains its ABI-required fixed mapping. Only ET_DYN is movable.
     // Keep the load bias a multiple of every PT_LOAD alignment, including
     // images whose minimum vaddr is not zero.
@@ -405,16 +397,20 @@ fn validate_elf_fd(
         PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
     )
     .map_err(byte_admission_errno)?;
-    let phnum = u64::from(summary.program_headers);
-    for index in 0..phnum {
-        let ph_slice = program_header_at(phdrs, index)?;
-        let mut ph = [0_u8; ELF_PROGRAM_HEADER_SIZE];
-        ph.copy_from_slice(ph_slice);
-        if read_u32(&ph, 0) == ELF_PT_INTERP {
-            validate_elf_interp(fd, &ph)?;
+    let mut interpreter_path = None;
+    if summary.has_interpreter {
+        for ph in phdrs.chunks_exact(ELF_PROGRAM_HEADER_SIZE) {
+            if read_u32(ph, 0) == ELF_PT_INTERP {
+                if read_interpreter {
+                    interpreter_path = Some(read_elf_interp_path(fd, ph)?);
+                } else {
+                    validate_elf_interp(fd, ph)?;
+                }
+                break;
+            }
         }
     }
-    Ok(summary.load_bias)
+    Ok((summary.load_bias, interpreter_path))
 }
 
 fn randomized_elf_offset(phdrs: &[u8], window_start: u64) -> Result<u64, i32> {
@@ -448,26 +444,21 @@ fn map_elf_segments_fd(
     deadline: AbsoluteDeadline,
 ) -> Result<ElfMapResult, i32> {
     let mut header = [0_u8; ELF_HEADER_SIZE];
-    trace_line(&format!(
-        "loaderd: elf map header begin handle={prepare_handle}"
-    ));
+    trace_log!("loaderd: elf map header begin handle={prepare_handle}");
     read_exact_at(fd, 0, &mut header)?;
-    trace_line(&format!(
-        "loaderd: elf map header done handle={prepare_handle}"
-    ));
+    trace_log!("loaderd: elf map header done handle={prepare_handle}");
     let phdrs = read_program_headers(fd, &header)?;
-    trace_line(&format!(
+    trace_log!(
         "loaderd: elf map phdrs done handle={prepare_handle} bytes={}",
         phdrs.len()
-    ));
-    let load_bias = validate_elf_fd(fd, &header, &phdrs, dyn_load_offset)?;
-    trace_line(&format!(
-        "loaderd: elf map validation done handle={prepare_handle}"
-    ));
+    );
+    let (load_bias, interpreter_path) =
+        validate_elf_fd(fd, &header, &phdrs, dyn_load_offset, map_interpreter)?;
+    trace_log!("loaderd: elf map validation done handle={prepare_handle}");
     map_admitted_elf_segments_fd(
         fd,
         prepare_handle,
-        map_interpreter,
+        interpreter_path.as_deref(),
         &header,
         &phdrs,
         load_bias,
@@ -478,7 +469,7 @@ fn map_elf_segments_fd(
 fn map_admitted_elf_segments_fd(
     fd: i32,
     prepare_handle: u64,
-    map_interpreter: bool,
+    admitted_interpreter_path: Option<&str>,
     header: &[u8; ELF_HEADER_SIZE],
     phdrs: &[u8],
     load_bias: u64,
@@ -493,43 +484,32 @@ fn map_admitted_elf_segments_fd(
 
     let mut max_loaded_end: u64 = load_bias;
     let mut min_loaded_start: u64 = u64::MAX;
-    let mut interpreter_path = None::<String>;
     let mut mappings = Vec::<ElfLoadMapping>::new();
 
-    for index in 0..phnum {
-        let ph_slice = program_header_at(phdrs, index)?;
-        let mut ph = [0_u8; ELF_PROGRAM_HEADER_SIZE];
-        ph.copy_from_slice(ph_slice);
-        match read_u32(&ph, 0) {
-            ELF_PT_LOAD => {
-                mappings.push(elf_load_segment_mapping(fd, &ph, load_bias)?);
-                let vaddr = read_u64(&ph, 16);
-                let memsz = read_u64(&ph, 40);
-                let end = vaddr
-                    .checked_add(memsz)
-                    .and_then(|e| e.checked_add(load_bias))
-                    .ok_or(EOVERFLOW)?;
-                max_loaded_end = max_loaded_end.max(end);
-                min_loaded_start =
-                    min_loaded_start.min(vaddr.checked_add(load_bias).ok_or(EOVERFLOW)?);
-            }
-            ELF_PT_INTERP if map_interpreter => {
-                interpreter_path = Some(read_elf_interp_path(fd, &ph)?);
-            }
-            _ => {}
+    for ph in phdrs.chunks_exact(ELF_PROGRAM_HEADER_SIZE) {
+        if read_u32(ph, 0) == ELF_PT_LOAD {
+            mappings.push(elf_load_segment_mapping(fd, ph, load_bias)?);
+            let vaddr = read_u64(ph, 16);
+            let memsz = read_u64(ph, 40);
+            let end = vaddr
+                .checked_add(memsz)
+                .and_then(|e| e.checked_add(load_bias))
+                .ok_or(EOVERFLOW)?;
+            max_loaded_end = max_loaded_end.max(end);
+            min_loaded_start =
+                min_loaded_start.min(vaddr.checked_add(load_bias).ok_or(EOVERFLOW)?);
         }
     }
 
     publish_elf_mappings(prepare_handle, &mappings)?;
-    trace_line(&format!(
-        "loaderd: elf main mappings done handle={prepare_handle}"
-    ));
+    trace_log!("loaderd: elf main mappings done handle={prepare_handle}");
 
     max_loaded_end = align_up(max_loaded_end, 4096)?;
+    let min_loaded_page = align_down(min_loaded_start, 4096);
     let mut backing_fds = Vec::new();
 
     let (interpreter_base, actual_entry, interp_path_out, interp_max_end) =
-        if let Some(path) = interpreter_path.as_deref() {
+        if let Some(path) = admitted_interpreter_path {
             let interp = match map_elf_interpreter(path, prepare_handle, deadline) {
                 Ok(interp) => interp,
                 Err(errno) => {
@@ -540,13 +520,13 @@ fn map_admitted_elf_segments_fd(
             // A fixed-address (ET_EXEC) image can be linked anywhere; the
             // interpreter lives at a fixed window, so refuse any overlap
             // here instead of relying on the commit-time mapping failure.
-            if min_loaded_start < interp.max_loaded_end && interp.load_bias < max_loaded_end {
+            if min_loaded_page < interp.max_loaded_end && interp.load_bias < max_loaded_end {
                 close_fds(&interp.backing_fds);
                 return Err(ENOEXEC);
             }
             let end = interp.max_loaded_end.max(max_loaded_end);
             backing_fds.extend(interp.backing_fds);
-            (interp.load_bias, interp.entry, interpreter_path, end)
+            (interp.load_bias, interp.entry, Some(String::from(path)), end)
         } else {
             (0, entry, None, max_loaded_end)
         };
@@ -589,29 +569,23 @@ fn program_header_table_addr_from_phdrs(
     let ph_size = phentsize.checked_mul(phnum).ok_or(EOVERFLOW)?;
     let ph_end = phoff.checked_add(ph_size).ok_or(EOVERFLOW)?;
 
-    for index in 0..phnum {
-        let ph_slice = program_header_at(phdrs, index)?;
-        let mut ph = [0_u8; ELF_PROGRAM_HEADER_SIZE];
-        ph.copy_from_slice(ph_slice);
-        if read_u32(&ph, 0) == ELF_PT_PHDR {
-            return read_u64(&ph, 16).checked_add(load_bias).ok_or(EOVERFLOW);
+    for ph in phdrs.chunks_exact(ELF_PROGRAM_HEADER_SIZE) {
+        if read_u32(ph, 0) == ELF_PT_PHDR {
+            return read_u64(ph, 16).checked_add(load_bias).ok_or(EOVERFLOW);
         }
     }
 
-    for index in 0..phnum {
-        let ph_slice = program_header_at(phdrs, index)?;
-        let mut ph = [0_u8; ELF_PROGRAM_HEADER_SIZE];
-        ph.copy_from_slice(ph_slice);
-        if read_u32(&ph, 0) != ELF_PT_LOAD || read_u64(&ph, 32) == 0 {
+    for ph in phdrs.chunks_exact(ELF_PROGRAM_HEADER_SIZE) {
+        if read_u32(ph, 0) != ELF_PT_LOAD || read_u64(ph, 32) == 0 {
             continue;
         }
-        let file_start = read_u64(&ph, 8);
-        let file_end = file_start.checked_add(read_u64(&ph, 32)).ok_or(EOVERFLOW)?;
+        let file_start = read_u64(ph, 8);
+        let file_end = file_start.checked_add(read_u64(ph, 32)).ok_or(EOVERFLOW)?;
         if phoff < file_start || ph_end > file_end {
             continue;
         }
         let table_delta = phoff - file_start;
-        return read_u64(&ph, 16)
+        return read_u64(ph, 16)
             .checked_add(table_delta)
             .and_then(|value| value.checked_add(load_bias))
             .ok_or(EOVERFLOW);
@@ -631,7 +605,7 @@ enum ElfLoadMapping {
 
 fn elf_load_segment_mapping(
     fd: i32,
-    ph: &[u8; ELF_PROGRAM_HEADER_SIZE],
+    ph: &[u8],
     load_bias: u64,
 ) -> Result<ElfLoadMapping, i32> {
     let segment_offset = read_u64(ph, 8);
@@ -689,10 +663,10 @@ fn flush_elf_file_map_batch(
     file_maps: &mut Vec<RustosProcMapFileBatchEntry>,
 ) -> Result<(), i32> {
     for chunk in file_maps.chunks(PROC_BROKER_BATCH_CAPACITY) {
-        trace_line(&format!(
+        trace_log!(
             "loaderd: elf file-map batch begin handle={prepare_handle} count={}",
             chunk.len()
-        ));
+        );
         let mut args = RustosProcMapFileBatchBrokerArgs {
             prepare_handle,
             count: chunk.len() as u32,
@@ -707,10 +681,10 @@ fn flush_elf_file_map_batch(
             file_maps.clear();
             return Err((-status) as i32);
         }
-        trace_line(&format!(
+        trace_log!(
             "loaderd: elf file-map batch done handle={prepare_handle} count={}",
             chunk.len()
-        ));
+        );
     }
     file_maps.clear();
     Ok(())
@@ -750,18 +724,18 @@ fn proc_map_flags(elf_flags: u32) -> u64 {
     flags
 }
 
-fn validate_elf_interp(fd: i32, ph: &[u8; ELF_PROGRAM_HEADER_SIZE]) -> Result<(), i32> {
-    read_elf_interp_path(fd, ph).map(|_| ())
-}
-
-fn read_elf_interp_path(fd: i32, ph: &[u8; ELF_PROGRAM_HEADER_SIZE]) -> Result<String, i32> {
+fn read_elf_interp_str<'a>(
+    fd: i32,
+    ph: &[u8],
+    buf: &'a mut [u8; LOADER_SPAWN_EXEC_PATH_CAPACITY],
+) -> Result<&'a str, i32> {
     let offset = read_u64(ph, 8);
     let file_size = read_u64(ph, 32);
     if file_size < 2 || file_size as usize > LOADER_SPAWN_EXEC_PATH_CAPACITY {
         return Err(ENOEXEC);
     }
-    let mut bytes = vec![0_u8; file_size as usize];
-    read_exact_at(fd, offset, &mut bytes)?;
+    let bytes = &mut buf[..file_size as usize];
+    read_exact_at(fd, offset, bytes)?;
     if bytes.last().copied() != Some(0) || bytes[..bytes.len() - 1].contains(&0) {
         return Err(ENOEXEC);
     }
@@ -769,5 +743,15 @@ fn read_elf_interp_path(fd: i32, ph: &[u8; ELF_PROGRAM_HEADER_SIZE]) -> Result<S
     if !path.starts_with('/') {
         return Err(ENOEXEC);
     }
-    Ok(path.to_string())
+    Ok(path)
+}
+
+fn validate_elf_interp(fd: i32, ph: &[u8]) -> Result<(), i32> {
+    let mut buf = [0_u8; LOADER_SPAWN_EXEC_PATH_CAPACITY];
+    read_elf_interp_str(fd, ph, &mut buf).map(|_| ())
+}
+
+fn read_elf_interp_path(fd: i32, ph: &[u8]) -> Result<String, i32> {
+    let mut buf = [0_u8; LOADER_SPAWN_EXEC_PATH_CAPACITY];
+    read_elf_interp_str(fd, ph, &mut buf).map(String::from)
 }

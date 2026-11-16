@@ -34,6 +34,7 @@ pub enum IpcReplyRecvResultKind {
 }
 
 /// Classify the complete native result space without ambiguous retry states.
+#[inline]
 pub const fn ipc_reply_recv_result_kind(result: i64) -> IpcReplyRecvResultKind {
     if result >= 0 {
         return IpcReplyRecvResultKind::Success;
@@ -80,6 +81,7 @@ pub struct IpcReplyRecvWithSenderArgs {
 /// Accept only the exact public reply-receive envelope before ring0 consumes
 /// reply authority. Pointer/range and endpoint-owner validation remains in the
 /// kernel because it depends on the live address space and capability graph.
+#[inline]
 pub const fn ipc_reply_recv_shape_valid(args: &IpcReplyRecvWithSenderArgs) -> bool {
     args.abi_version == IPC_ABI_VERSION
         && args.flags == 0

@@ -219,14 +219,27 @@ fn frame_is_well_formed(bytes: &[u8; INPUTD_DVM_RECORD_BYTES]) -> bool {
             == crc32(&bytes[..28])
 }
 
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0_u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            let mask = (crc & 1).wrapping_neg() & 0xedb8_8320;
+            crc = (crc >> 1) ^ mask;
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0_u32;
     for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg() & 0xedb8_8320;
-            crc = (crc >> 1) ^ mask;
-        }
+        crc = (crc >> 8) ^ CRC32_TABLE[((crc ^ u32::from(byte)) & 0xff) as usize];
     }
     !crc
 }

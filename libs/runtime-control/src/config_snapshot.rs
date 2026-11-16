@@ -39,7 +39,12 @@ fn read_config_snapshot_file(file: &File, max_bytes: usize) -> Result<String, Er
     // These files are immutable policy snapshots, not streams. Explicit-offset
     // I/O avoids publishing a durable VFS cursor transition for every chunk;
     // that checkpoint path is serialized with latency-sensitive VFS requests.
-    let mut bytes = Vec::new();
+    let initial_capacity = file
+        .metadata()
+        .ok()
+        .and_then(|meta| usize::try_from(meta.len()).ok())
+        .map_or(0, |len| len.min(max_bytes));
+    let mut bytes = Vec::with_capacity(initial_capacity);
     let mut chunk = [0_u8; CONFIG_SNAPSHOT_CHUNK_BYTES];
     loop {
         if bytes.len() == max_bytes {

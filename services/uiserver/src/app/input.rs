@@ -282,6 +282,11 @@ impl AppState {
     }
 
     pub(crate) fn sync_wayland_input_focus(&self, wayland: &mut WaylandCompositor) {
+        if self.wayland_windows.is_empty() {
+            wayland.set_keyboard_target(None);
+            wayland.set_pointer_target(None);
+            return;
+        }
         wayland.set_keyboard_target(self.focused_wayland_surface_id);
         self.sync_wayland_pointer_target(wayland);
     }

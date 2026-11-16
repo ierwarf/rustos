@@ -565,6 +565,82 @@ struct WaitSetObjectInterest {
 }
 
 impl WaitSetRegistry {
+    pub fn check_create(&self, token: u64) -> Result<(), WaitSetRegistryError> {
+        if token == 0 || self.epolls.contains_key(&token) {
+            return Err(WaitSetRegistryError::Exists);
+        }
+        if self.epolls.len() >= WAITSET_MAX_EPOLL_OBJECTS {
+            return Err(WaitSetRegistryError::Capacity);
+        }
+        Ok(())
+    }
+
+    pub fn check_retire(&self, token: u64) -> Result<(), WaitSetRegistryError> {
+        if self.epolls.contains_key(&token) {
+            Ok(())
+        } else {
+            Err(WaitSetRegistryError::NotFound)
+        }
+    }
+
+    pub fn check_add(
+        &self,
+        token: u64,
+        interest: WaitSetInterestRecord,
+    ) -> Result<(), WaitSetRegistryError> {
+        let epoll = self
+            .epolls
+            .get(&token)
+            .ok_or(WaitSetRegistryError::NotFound)?;
+        if !epoll_event_mask_valid(interest.events) {
+            return Err(WaitSetRegistryError::Invalid);
+        }
+        if epoll.interests.contains_key(&interest.key) {
+            return Err(WaitSetRegistryError::Exists);
+        }
+        if epoll.interests.len() >= WAITSET_MAX_INTERESTS {
+            return Err(WaitSetRegistryError::Capacity);
+        }
+        Ok(())
+    }
+
+    pub fn check_modify(
+        &self,
+        token: u64,
+        interest: WaitSetInterestRecord,
+    ) -> Result<(), WaitSetRegistryError> {
+        let epoll = self
+            .epolls
+            .get(&token)
+            .ok_or(WaitSetRegistryError::NotFound)?;
+        let Some(existing) = epoll.interests.get(&interest.key) else {
+            return Err(WaitSetRegistryError::NotFound);
+        };
+        if existing.events & linux_abi::EPOLLEXCLUSIVE != 0
+            || interest.events & linux_abi::EPOLLEXCLUSIVE != 0
+            || !epoll_event_mask_valid(interest.events)
+        {
+            return Err(WaitSetRegistryError::Invalid);
+        }
+        Ok(())
+    }
+
+    pub fn check_delete(
+        &self,
+        token: u64,
+        key: WaitSetInterestKey,
+    ) -> Result<(), WaitSetRegistryError> {
+        let epoll = self
+            .epolls
+            .get(&token)
+            .ok_or(WaitSetRegistryError::NotFound)?;
+        if epoll.interests.contains_key(&key) {
+            Ok(())
+        } else {
+            Err(WaitSetRegistryError::NotFound)
+        }
+    }
+
     pub fn create(&mut self, token: u64) -> Result<(), WaitSetRegistryError> {
         self.insert_epoll(token)
     }
@@ -830,33 +906,45 @@ impl WaitSetRegistry {
         Ok(true)
     }
 
-    pub fn snapshot_entries(
+    pub fn visit_snapshot_entries(
         &mut self,
         token: u64,
         max: usize,
-    ) -> Result<Vec<(WaitSetInterestRecord, WaitSetReportState)>, WaitSetRegistryError> {
+        mut visit: impl FnMut(usize, WaitSetInterestRecord, WaitSetReportState),
+    ) -> Result<usize, WaitSetRegistryError> {
         let epoll = self
             .epolls
             .get_mut(&token)
             .ok_or(WaitSetRegistryError::NotFound)?;
         let count = epoll.interests.len();
         let start = epoll.cursor.min(count.saturating_sub(1));
-        let snapshot = epoll
+        let mut written = 0usize;
+        for interest in epoll
             .interests
             .values()
             .skip(start)
             .chain(epoll.interests.values().take(start))
             .take(max)
-            .map(|interest| {
-                (
-                    *interest,
-                    epoll.report.get(&interest.key).copied().unwrap_or_default(),
-                )
-            })
-            .collect::<Vec<_>>();
+        {
+            let report = epoll.report.get(&interest.key).copied().unwrap_or_default();
+            visit(written, *interest, report);
+            written += 1;
+        }
         if count != 0 {
             epoll.cursor = (start + 1) % count;
         }
+        Ok(written)
+    }
+
+    pub fn snapshot_entries(
+        &mut self,
+        token: u64,
+        max: usize,
+    ) -> Result<Vec<(WaitSetInterestRecord, WaitSetReportState)>, WaitSetRegistryError> {
+        let mut snapshot = Vec::new();
+        self.visit_snapshot_entries(token, max, |_, interest, report| {
+            snapshot.push((interest, report));
+        })?;
         Ok(snapshot)
     }
 }
@@ -1679,5 +1767,46 @@ mod file_identity_proxy_tests {
         assert!(!file_identity_proxy_shape(VFS_IPC_OP_FILE_IDENTITY, 80, 8, 5, 7));
         assert!(!file_identity_proxy_shape(VFS_IPC_OP_FILE_IDENTITY, 0, 7, 5, 7));
         assert!(!file_identity_proxy_shape(VFS_IPC_OP_FILE_IDENTITY, 5, 7, 5, 7), "equal pid is the ordinary path");
+    }
+
+    #[test]
+    fn waitset_check_methods_match_mutations_without_cloning() {
+        let mut reg = super::WaitSetRegistry::default();
+        assert_eq!(reg.check_create(0), Err(super::WaitSetRegistryError::Exists));
+        assert_eq!(reg.check_retire(1), Err(super::WaitSetRegistryError::NotFound));
+        assert_eq!(reg.check_create(1), Ok(()));
+        reg.create(1).unwrap();
+        assert_eq!(reg.check_create(1), Err(super::WaitSetRegistryError::Exists));
+        assert_eq!(reg.check_retire(1), Ok(()));
+
+        let key = super::WaitSetInterestKey {
+            target_fd: 3,
+            provider: 1,
+            object_id: 9,
+        };
+        let interest = super::WaitSetInterestRecord {
+            key,
+            provider_epoch: 1,
+            events: 1,
+            data: 42,
+        };
+        assert_eq!(reg.check_add(1, interest), Ok(()));
+        assert_eq!(
+            reg.check_modify(1, interest),
+            Err(super::WaitSetRegistryError::NotFound)
+        );
+        assert_eq!(
+            reg.check_delete(1, key),
+            Err(super::WaitSetRegistryError::NotFound)
+        );
+        reg.add(1, interest).unwrap();
+        assert_eq!(
+            reg.check_add(1, interest),
+            Err(super::WaitSetRegistryError::Exists)
+        );
+        assert_eq!(reg.check_modify(1, interest), Ok(()));
+        assert_eq!(reg.check_delete(1, key), Ok(()));
+        reg.delete(1, key).unwrap();
+        reg.retire(1).unwrap();
     }
 }

@@ -928,12 +928,34 @@ fn parse_runtime_env_registry_entry(line: &str) -> Option<RuntimeEnvEntry> {
 }
 
 fn parse_startup_registry_entry(line: &str) -> Option<StartupEntry> {
-    let exec = registry_field(line, "exec")?.to_string();
-    let desktop_file_id = registry_field(line, "desktop_id")?.to_string();
-    let package_id = registry_field(line, "package_id")?.to_string();
-    let display_name = registry_field(line, "display_name")?.to_string();
-    let mode = parse_startup_mode(registry_field(line, "mode")?)?;
-    let runtime_deps = parse_registry_deps(registry_field(line, "deps")?);
+    let mut exec = None;
+    let mut desktop_file_id = None;
+    let mut package_id = None;
+    let mut display_name = None;
+    let mut mode = None;
+    let mut deps = None;
+
+    for token in line.split('\t') {
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        match key {
+            "exec" if exec.is_none() => exec = Some(value),
+            "desktop_id" if desktop_file_id.is_none() => desktop_file_id = Some(value),
+            "package_id" if package_id.is_none() => package_id = Some(value),
+            "display_name" if display_name.is_none() => display_name = Some(value),
+            "mode" if mode.is_none() => mode = Some(value),
+            "deps" if deps.is_none() => deps = Some(value),
+            _ => {}
+        }
+    }
+
+    let exec = exec?.to_string();
+    let desktop_file_id = desktop_file_id?.to_string();
+    let package_id = package_id?.to_string();
+    let display_name = display_name?.to_string();
+    let mode = parse_startup_mode(mode?)?;
+    let runtime_deps = parse_registry_deps(deps?);
     if desktop_file_id.is_empty()
         || package_id.is_empty()
         || display_name.is_empty()
@@ -953,21 +975,61 @@ fn parse_startup_registry_entry(line: &str) -> Option<StartupEntry> {
 }
 
 fn parse_desktop_registry_entry(line: &str) -> Option<DesktopProgramEntry> {
-    let desktop_file_id = registry_field(line, "desktop_id")?.to_string();
-    let package_id = registry_field(line, "package_id")?.to_string();
-    let display_name = registry_field(line, "display_name")?.to_string();
-    let exec = registry_field(line, "exec")?.to_string();
-    let startup = parse_startup_mode(registry_field(line, "startup")?)?;
-    let weight_micros = registry_field(line, "weight")?.parse().ok()?;
-    let logical_admin = parse_registry_bool(registry_field(line, "logical_admin")?)?;
-    let console_hosted = parse_registry_bool(registry_field(line, "console_hosted")?)?;
-    let terminal = parse_registry_bool(registry_field(line, "terminal")?)?;
-    let args = parse_registry_list(registry_field(line, "args")?);
-    let env = parse_registry_list(registry_field(line, "env")?);
-    let runtime_deps = parse_registry_deps(registry_field(line, "deps")?);
-    let autostart_enabled = parse_registry_bool(registry_field(line, "autostart_enabled")?)?;
-    let hidden = parse_registry_bool(registry_field(line, "hidden")?)?;
-    let no_display = parse_registry_bool(registry_field(line, "no_display")?)?;
+    let mut desktop_file_id = None;
+    let mut package_id = None;
+    let mut display_name = None;
+    let mut exec = None;
+    let mut startup = None;
+    let mut weight = None;
+    let mut logical_admin = None;
+    let mut console_hosted = None;
+    let mut terminal = None;
+    let mut args = None;
+    let mut env = None;
+    let mut deps = None;
+    let mut autostart_enabled = None;
+    let mut hidden = None;
+    let mut no_display = None;
+
+    for token in line.split('\t') {
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        match key {
+            "desktop_id" if desktop_file_id.is_none() => desktop_file_id = Some(value),
+            "package_id" if package_id.is_none() => package_id = Some(value),
+            "display_name" if display_name.is_none() => display_name = Some(value),
+            "exec" if exec.is_none() => exec = Some(value),
+            "startup" if startup.is_none() => startup = Some(value),
+            "weight" if weight.is_none() => weight = Some(value),
+            "logical_admin" if logical_admin.is_none() => logical_admin = Some(value),
+            "console_hosted" if console_hosted.is_none() => console_hosted = Some(value),
+            "terminal" if terminal.is_none() => terminal = Some(value),
+            "args" if args.is_none() => args = Some(value),
+            "env" if env.is_none() => env = Some(value),
+            "deps" if deps.is_none() => deps = Some(value),
+            "autostart_enabled" if autostart_enabled.is_none() => autostart_enabled = Some(value),
+            "hidden" if hidden.is_none() => hidden = Some(value),
+            "no_display" if no_display.is_none() => no_display = Some(value),
+            _ => {}
+        }
+    }
+
+    let desktop_file_id = desktop_file_id?.to_string();
+    let package_id = package_id?.to_string();
+    let display_name = display_name?.to_string();
+    let exec = exec?.to_string();
+    let startup = parse_startup_mode(startup?)?;
+    let weight_micros = weight?.parse().ok()?;
+    let logical_admin = parse_registry_bool(logical_admin?)?;
+    let console_hosted = parse_registry_bool(console_hosted?)?;
+    let terminal = parse_registry_bool(terminal?)?;
+    let args = parse_registry_list(args?);
+    let env = parse_registry_list(env?);
+    let runtime_deps = parse_registry_deps(deps?);
+    let autostart_enabled = parse_registry_bool(autostart_enabled?)?;
+    let hidden = parse_registry_bool(hidden?)?;
+    let no_display = parse_registry_bool(no_display?)?;
     if desktop_file_id.is_empty()
         || package_id.is_empty()
         || display_name.is_empty()

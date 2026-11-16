@@ -857,11 +857,19 @@ fn cleanup_failed_spawn(
 /// pid space and idempotent.
 static UNRETIRED_PIDS: std::sync::Mutex<std::collections::BTreeSet<i32>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
+static HAS_UNRETIRED_PIDS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn unretired_pids() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<i32>> {
     UNRETIRED_PIDS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn record_unretired_pid(pid: i32) {
+    unretired_pids().insert(pid);
+    // ORDERING: Release publishes non-empty unretired-pid state after mutex insertion.
+    HAS_UNRETIRED_PIDS.store(true, Ordering::Release);
 }
 
 fn retire_failed_spawn_or_abort(pid: i32, stage: &str) {
@@ -874,7 +882,7 @@ fn retire_failed_spawn_or_abort(pid: i32, stage: &str) {
             "failed-spawn cleanup deferred stage={stage} pid={pid} errno={errno}"
         );
         if pid > 0 {
-            unretired_pids().insert(pid);
+            record_unretired_pid(pid);
         }
     }
 }
@@ -882,10 +890,15 @@ fn retire_failed_spawn_or_abort(pid: i32, stage: &str) {
 /// Retry deferred child kills and Job-session refunds. Cheap when idle.
 fn retry_deferred_cleanup() {
     let pids: Vec<i32> = unretired_pids().iter().copied().collect();
-    for pid in pids {
-        if cleanup_failed_spawn(pid, terminate_pid).is_ok() {
-            unretired_pids().remove(&pid);
+    if !pids.is_empty() {
+        let mut guard = unretired_pids();
+        for pid in pids {
+            if cleanup_failed_spawn(pid, terminate_pid).is_ok() {
+                guard.remove(&pid);
+            }
         }
+        // ORDERING: Release pairs with Acquire in `reap_children` once remaining pids are updated.
+        HAS_UNRETIRED_PIDS.store(!guard.is_empty(), Ordering::Release);
     }
     if session_accounting::has_deferred() {
         session_accounting::retry_deferred();
@@ -1038,7 +1051,9 @@ mod wait_status_tests {
 pub(super) fn reap_children(state: &mut BrokerState) -> bool {
     // Deferred cleanup talks to rootd/procd, so it shares the reap cadence
     // instead of running on every idle pass.
-    let cleanup_pending = !unretired_pids().is_empty() || session_accounting::has_deferred();
+    // ORDERING: Acquire pairs with Release stores in `record_unretired_pid`/`retry_deferred_cleanup`.
+    let cleanup_pending =
+        HAS_UNRETIRED_PIDS.load(Ordering::Acquire) || session_accounting::has_deferred();
     if cleanup_pending && state.reap_due.is_none_or(|due| Instant::now() >= due) {
         retry_deferred_cleanup();
         state.reap_due = Some(Instant::now() + REAP_INTERVAL);
@@ -1051,7 +1066,6 @@ pub(super) fn reap_children(state: &mut BrokerState) -> bool {
     {
         return false;
     }
-    sync_tracked_running_pids(state);
     // The wait itself never runs on this loop: collect what the reaper has
     // already found, and ask it again no more often than `REAP_INTERVAL`.
     let exited = match state.child_reaper.as_ref() {
@@ -1069,13 +1083,19 @@ pub(super) fn reap_children(state: &mut BrokerState) -> bool {
                     super::offload::Offload::start("runtimed-reap", collect_exited_children);
             } else {
                 let due = state.reap_due.is_none_or(|due| Instant::now() >= due);
-                if due && !reaper.busy() && !state.running.is_empty() && reaper.request() {
-                    state.reap_due = Some(Instant::now() + REAP_INTERVAL);
+                if due && !reaper.busy() && !state.running.is_empty() {
+                    sync_tracked_running_pids(state);
+                    if reaper.request() {
+                        state.reap_due = Some(Instant::now() + REAP_INTERVAL);
+                    }
                 }
             }
             answer.unwrap_or_default()
         }
-        None => collect_exited_children(),
+        None => {
+            sync_tracked_running_pids(state);
+            collect_exited_children()
+        }
     };
     let mut reaped_any = false;
     for (pid, status) in exited {
@@ -1176,7 +1196,7 @@ pub(super) fn probe_suspended_image(exec_path: &str) -> Result<(), i32> {
     )?;
     if let Err(errno) = cleanup_failed_spawn(pid, terminate_pid) {
         // Never abandon an admitted suspended child on a refused cleanup.
-        unretired_pids().insert(pid);
+        record_unretired_pid(pid);
         return Err(errno);
     }
     Ok(())
@@ -1594,25 +1614,25 @@ fn build_exec_env_with_defaults(
     if extra_env.len() > MAX_EXEC_ENV_COUNT {
         return Err(libc::E2BIG);
     }
-    let mut env = Vec::with_capacity(extra_env.len().saturating_add(default_env.len()));
+    let mut env: Vec<&str> = Vec::with_capacity(extra_env.len().saturating_add(default_env.len()));
     for item in extra_env {
         if !valid_exec_text(item.as_str(), true) {
             return Err(libc::EINVAL);
         }
-        env.push(item.clone());
+        env.push(item.as_str());
     }
     for item in default_env {
-        if !valid_exec_text(item, true) {
+        if !valid_exec_text(item.as_str(), true) {
             return Err(libc::EINVAL);
         }
-        push_env_if_missing(&mut env, item)?;
+        push_env_if_missing(&mut env, item.as_str())?;
     }
     env.into_iter()
         .map(|item| CString::new(item).map_err(|_| libc::EINVAL))
         .collect()
 }
 
-fn push_env_if_missing(env: &mut Vec<String>, item: &str) -> Result<(), i32> {
+fn push_env_if_missing<'a>(env: &mut Vec<&'a str>, item: &'a str) -> Result<(), i32> {
     use super::MAX_EXEC_ENV_COUNT;
     let key = env_key(item);
     if env.iter().any(|candidate| env_key(candidate) == key) {
@@ -1621,7 +1641,7 @@ fn push_env_if_missing(env: &mut Vec<String>, item: &str) -> Result<(), i32> {
     if env.len() >= MAX_EXEC_ENV_COUNT {
         return Err(libc::E2BIG);
     }
-    env.push(item.to_string());
+    env.push(item);
     Ok(())
 }
 

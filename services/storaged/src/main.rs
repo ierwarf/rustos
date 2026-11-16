@@ -327,17 +327,16 @@ fn reply_commercial_request(reply_cap: u64, request: &CommercialMaxProtocolReque
 fn reply_bulk_read(reply_cap: u64, request: &CommercialMaxProtocolRequest) {
     let response = core::ptr::addr_of_mut!(STORAGED_BULK_RESPONSE_SLOT);
     unsafe {
-        core::ptr::write_bytes(
-            response.cast::<u8>(),
-            0,
-            size_of::<StoragedBulkReadResponse>(),
-        );
         (*response).header = request.header;
+        (*response).status = 0;
+        (*response).payload_len = 0;
         (*response).generation = request.arg0;
         (*response).lba = request.arg1;
         (*response).block_count = request.arg2;
+        (*response).reserved0 = 0;
     }
 
+    let mut written_len = 0_usize;
     let status = match validate_commercial_request(request) {
         Err(errno) => {
             let _ = writeln!(
@@ -349,21 +348,17 @@ fn reply_bulk_read(reply_cap: u64, request: &CommercialMaxProtocolRequest) {
         }
         Ok(()) => match dvm_e2e_ready_for_current_generation().and_then(|info| {
             require_request_generation(request, info)?;
-            block::read(request.arg0, request.arg1, request.arg2)
+            let payload = unsafe { &mut *core::ptr::addr_of_mut!((*response).payload) };
+            block::read_into_with_info(info, request.arg0, request.arg1, request.arg2, payload)
         }) {
-            Ok(bytes) if bytes.len() <= STORAGED_BULK_READ_PAYLOAD_CAPACITY => {
+            Ok(written) => {
+                written_len = written;
                 unsafe {
-                    (*response).payload_len = bytes.len() as u32;
-                    core::ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        core::ptr::addr_of_mut!((*response).payload).cast::<u8>(),
-                        bytes.len(),
-                    );
+                    (*response).payload_len = written as u32;
                 }
                 note_dvm_request_ready();
                 0
             }
-            Ok(_) => libc::EOVERFLOW,
             Err(errno) => {
                 log_dvm_request_rejection("dispatch", request.header.op, errno);
                 errno
@@ -372,6 +367,18 @@ fn reply_bulk_read(reply_cap: u64, request: &CommercialMaxProtocolRequest) {
     };
     unsafe {
         (*response).status = status;
+        let payload_ptr = core::ptr::addr_of_mut!((*response).payload).cast::<u8>();
+        if status == 0 {
+            if written_len < STORAGED_BULK_READ_PAYLOAD_CAPACITY {
+                core::ptr::write_bytes(
+                    payload_ptr.add(written_len),
+                    0,
+                    STORAGED_BULK_READ_PAYLOAD_CAPACITY - written_len,
+                );
+            }
+        } else {
+            core::ptr::write_bytes(payload_ptr, 0, STORAGED_BULK_READ_PAYLOAD_CAPACITY);
+        }
     }
     let reply = syscall3(
         SYS_RUSTOS_IPC_REPLY,
@@ -427,20 +434,23 @@ fn dispatch_commercial(
         }
         COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ => {
             require_request_generation(request, info)?;
-            let bytes = block::read(request.arg0, request.arg1, request.arg2)?;
-            if bytes.len() > response.payload.len() {
-                return Err(libc::EOVERFLOW);
-            }
+            let written = block::read_into_with_info(
+                info,
+                request.arg0,
+                request.arg1,
+                request.arg2,
+                &mut response.payload,
+            )?;
             response.value0 = request.arg0;
-            response.value1 = bytes.len() as u64;
-            response.payload_len = bytes.len() as u32;
-            response.payload[..bytes.len()].copy_from_slice(&bytes);
+            response.value1 = written as u64;
+            response.payload_len = written as u32;
             Ok(())
         }
         COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE => {
             require_request_generation(request, info)?;
             let fua = request.arg3 & COMMERCIAL_MAX_STORAGED_BLOCK_FLAG_FUA != 0;
-            block::write(
+            block::write_with_info(
+                info,
                 request.arg0,
                 request.arg1,
                 request.arg2,
@@ -453,7 +463,7 @@ fn dispatch_commercial(
         }
         COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_FLUSH => {
             require_request_generation(request, info)?;
-            block::flush(request.arg0)?;
+            block::flush_with_info(info, request.arg0)?;
             response.value0 = request.arg0;
             Ok(())
         }

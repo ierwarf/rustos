@@ -193,6 +193,27 @@ const BUILTIN_SYSTEM_DLL_ALIASES: &[(&str, &str)] = &[
     ("api-ms-win-crt-utility-l1-1-0", "ucrtbase.dll"),
 ];
 
+
+
+#[inline]
+fn boot_trace_enabled() -> bool {
+    option_env!("RUSTOS_LOGGING_BOOT_TRACE_ENABLED") == Some("true")
+}
+
+fn trace_line(message: &str) {
+    if boot_trace_enabled() {
+        debug_line(message);
+    }
+}
+
+macro_rules! trace_log {
+    ($($arg:tt)*) => {
+        if boot_trace_enabled() {
+            trace_line(&format!($($arg)*));
+        }
+    };
+}
+
 rustos_svc_runtime::entry!(service_main);
 
 fn service_main() {
@@ -664,7 +685,9 @@ fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>, 
             return spawn_response(response);
         }
     };
-    trace_line(&format!("loaderd: spawn begin exec={requested_exec_path}"));
+    if boot_trace_enabled() {
+        trace_line(&format!("loaderd: spawn begin exec={requested_exec_path}"));
+    }
     // Use the exact canonical sealed image from staging; never reopen a path
     // or restart its transfer deadline after admission.
     let Some(mut snapshot) = snapshot else {
@@ -681,8 +704,10 @@ fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>, 
             return spawn_response(response);
         }
     };
-    trace_line(&format!("loaderd: open done exec={exec_path}"));
-    trace_line(&format!("loaderd: validate begin exec={exec_path}"));
+    if boot_trace_enabled() {
+        trace_line(&format!("loaderd: open done exec={exec_path}"));
+        trace_line(&format!("loaderd: validate begin exec={exec_path}"));
+    }
     let executable_admission = match validate_executable_fd(fd) {
         Ok(admission) => admission,
         Err(errno) => {
@@ -694,7 +719,9 @@ fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>, 
     };
     let executable_format = executable_admission.format();
     response.image_format = executable_format;
-    trace_line(&format!("loaderd: validate done exec={exec_path}"));
+    if boot_trace_enabled() {
+        trace_line(&format!("loaderd: validate done exec={exec_path}"));
+    }
     if !operation.allows_format(executable_format) {
         let _ = syscall1(SYS_CLOSE, fd as u64);
         response.status = ENOEXEC;
@@ -761,7 +788,9 @@ fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>, 
         job_handle: job_handle.unwrap_or(0),
         stack_top,
     };
-    trace_line(&format!("loaderd: prepare begin exec={exec_path}"));
+    if boot_trace_enabled() {
+        trace_line(&format!("loaderd: prepare begin exec={exec_path}"));
+    }
     let prepare_handle = syscall1(
         SYS_RUSTOS_PROC_PREPARE_BROKER,
         (&prepare_args as *const RustosProcPrepareBrokerArgs) as u64,
@@ -772,7 +801,9 @@ fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>, 
         response.status = (-prepare_handle) as i32;
         return spawn_response(response);
     }
-    trace_line(&format!("loaderd: prepare done exec={exec_path}"));
+    if boot_trace_enabled() {
+        trace_line(&format!("loaderd: prepare done exec={exec_path}"));
+    }
     let prepared = match map_executable_segments(
         fd,
         exec_path,
@@ -793,7 +824,9 @@ fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>, 
             return spawn_response(response);
         }
     };
-    trace_line(&format!("loaderd: map done exec={exec_path}"));
+    if boot_trace_enabled() {
+        trace_line(&format!("loaderd: map done exec={exec_path}"));
+    }
     if let Some(ref result) = prepared.linux_runtime {
         if let Err(errno) = set_linux_runtime_broker(prepare_handle as u64, result) {
             debug_line("loaderd: linux runtime broker failed");
@@ -824,7 +857,9 @@ fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>, 
         response.status = ETIMEDOUT;
         return spawn_response(response);
     }
-    trace_line(&format!("loaderd: commit begin exec={exec_path}"));
+    if boot_trace_enabled() {
+        trace_line(&format!("loaderd: commit begin exec={exec_path}"));
+    }
     let pid = commit_prepared_executable(
         operation,
         request,
@@ -1324,9 +1359,4 @@ fn spawn_done_line_admitted() -> bool {
     n <= EARLY || n.is_power_of_two()
 }
 
-#[inline]
-fn trace_line(message: &str) {
-    if option_env!("RUSTOS_LOGGING_BOOT_TRACE_ENABLED") == Some("true") {
-        debug_line(message);
-    }
-}
+

@@ -92,6 +92,7 @@ impl WaylandState {
             self.clear_focus_for_surface(object_id);
             if owned_grab {
                 self.pointer_button_down = false;
+                self.pointer_grab_serial = None;
             }
         }
         self.sync_surface_output(shared, false);

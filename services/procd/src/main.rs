@@ -241,8 +241,14 @@ fn drain_lifecycle_events() {
         ipc::debug_line("procd: lifecycle evidence reset after drain failure");
         return;
     }
-    for event in &events[..count as usize] {
+    for event in &events[..(count as usize).min(LIFECYCLE_DRAIN_MAX_EVENTS)] {
         apply_lifecycle_event(event);
+    }
+}
+
+fn remove_process_threads(threads: &mut BTreeMap<(u64, u64), ThreadSignalPolicy>, pid: u64) {
+    while let Some((&key, _)) = threads.range((pid, 0)..=(pid, u64::MAX)).next() {
+        threads.remove(&key);
     }
 }
 
@@ -250,9 +256,8 @@ fn apply_lifecycle_event(event: &LifecycleEventWire) {
     match event.event {
         LIFECYCLE_EVENT_EXIT => {
             PROCESS_SIGNAL_POLICY.lock().remove(&event.pid);
-            THREAD_SIGNAL_POLICY
-                .lock()
-                .retain(|(pid, _), _| *pid != event.pid);
+            let mut threads = THREAD_SIGNAL_POLICY.lock();
+            remove_process_threads(&mut threads, event.pid);
         }
         LIFECYCLE_EVENT_THREAD_EXIT => {
             THREAD_SIGNAL_POLICY.lock().remove(&(event.pid, event.tid));
@@ -675,13 +680,17 @@ fn handle_wait4(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
 }
 
 fn handle_rt_sigaction(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
-    let signal = request.arg0 as usize;
     let has_action = request.flags & 0x1 != 0;
     let wants_old = request.flags & 0x2 != 0;
-    if signal == 0
-        || signal >= 65
+    if request.arg0 == 0
+        || request.arg0 >= 65
         || has_action && request.payload_len as usize != LINUX_SIGACTION_SIZE
     {
+        response.status = EINVAL;
+        return;
+    }
+    let signal = request.arg0 as usize;
+    if has_action && (signal == SIGKILL || signal == SIGSTOP) {
         response.status = EINVAL;
         return;
     }
@@ -689,10 +698,6 @@ fn handle_rt_sigaction(request: &ProcdIpcRequest, response: &mut ProcdIpcRespons
     let state = policy.entry(request.pid).or_default();
     let old = state.sigactions[signal];
     if has_action {
-        if signal == SIGKILL || signal == SIGSTOP {
-            response.status = EINVAL;
-            return;
-        }
         state.sigactions[signal] = read_sigaction(&request.payload[..LINUX_SIGACTION_SIZE]);
     }
     if wants_old {
@@ -704,7 +709,10 @@ fn handle_rt_sigaction(request: &ProcdIpcRequest, response: &mut ProcdIpcRespons
 fn handle_rt_sigprocmask(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
     let has_set = request.flags & 0x1 != 0;
     let wants_old = request.flags & 0x2 != 0;
-    if has_set && request.payload_len != 8 {
+    if has_set
+        && (request.payload_len != 8
+            || !matches!(request.arg0, SIG_BLOCK | SIG_UNBLOCK | SIG_SETMASK))
+    {
         response.status = EINVAL;
         return;
     }
@@ -724,10 +732,7 @@ fn handle_rt_sigprocmask(request: &ProcdIpcRequest, response: &mut ProcdIpcRespo
             SIG_BLOCK => state.signal_mask |= requested & !unblockable,
             SIG_UNBLOCK => state.signal_mask &= !requested,
             SIG_SETMASK => state.signal_mask = requested & !unblockable,
-            _ => {
-                response.status = EINVAL;
-                return;
-            }
+            _ => unreachable!(),
         }
     }
     if wants_old {
@@ -743,6 +748,16 @@ fn handle_sigaltstack(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse
         return;
     }
     let extra = read_unaligned::<SigaltstackRequest>(&request.payload);
+    if extra.has_new != 0 {
+        if extra.new_ss_flags & !SS_DISABLE != 0 {
+            response.status = EINVAL;
+            return;
+        }
+        if extra.new_ss_flags & SS_DISABLE == 0 && extra.new_ss_size < MINSIGSTKSZ {
+            response.status = ENOMEM;
+            return;
+        }
+    }
     let mut policy = THREAD_SIGNAL_POLICY.lock();
     let state = policy
         .entry((request.pid, request.tid))
@@ -759,17 +774,10 @@ fn handle_sigaltstack(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse
         ..SigaltstackResponse::default()
     };
     if extra.has_new != 0 {
-        if extra.new_ss_flags & !SS_DISABLE != 0 {
-            response.status = EINVAL;
-            return;
-        }
         if extra.new_ss_flags & SS_DISABLE != 0 {
             state.sigaltstack_sp = 0;
             state.sigaltstack_size = 0;
             state.sigaltstack_flags = SS_DISABLE;
-        } else if extra.new_ss_size < MINSIGSTKSZ {
-            response.status = ENOMEM;
-            return;
         } else {
             state.sigaltstack_sp = extra.new_ss_sp;
             state.sigaltstack_size = extra.new_ss_size;
@@ -809,6 +817,10 @@ fn handle_tgkill(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
 
 fn handle_select_signal(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
     let pending = request.arg0;
+    if pending == 0 {
+        response.action = PROCD_SELECT_SIGNAL_NONE;
+        return;
+    }
     let mask = {
         let mut threads = THREAD_SIGNAL_POLICY.lock();
         threads
@@ -950,7 +962,7 @@ fn inherit_signal_policy_after_fork(parent_pid: u64, parent_tid: u64, child_pid:
         }
     }
     let mut threads = THREAD_SIGNAL_POLICY.lock();
-    threads.retain(|(pid, _), _| *pid != child_pid);
+    remove_process_threads(&mut threads, child_pid);
     if let Some(parent_thread) = threads.get(&(parent_pid, parent_tid)).copied() {
         threads.insert((child_pid, child_pid), parent_thread);
     }
@@ -969,7 +981,7 @@ fn reset_signal_policy_after_exec(pid: u64, tid: u64) {
         .get(&(pid, tid))
         .map(|state| state.signal_mask)
         .unwrap_or(0);
-    threads.retain(|(entry_pid, _), _| *entry_pid != pid);
+    remove_process_threads(&mut threads, pid);
     threads.insert(
         (pid, pid),
         ThreadSignalPolicy {
@@ -1144,5 +1156,44 @@ mod tests {
         let mut response = ProcdIpcResponse::default();
         handle_select_signal(&request, &mut response);
         assert_eq!(response.status, EINVAL);
+    }
+
+    #[test]
+    fn select_signal_zero_pending_skips_thread_policy_allocation() {
+        let pid = u64::MAX - 30;
+        let mut request = ProcdIpcRequest::default();
+        request.pid = pid;
+        request.tid = pid;
+        request.arg0 = 0;
+        let mut response = ProcdIpcResponse::default();
+        handle_select_signal(&request, &mut response);
+        assert_eq!(response.action, PROCD_SELECT_SIGNAL_NONE);
+        assert!(!THREAD_SIGNAL_POLICY.lock().contains_key(&(pid, pid)));
+    }
+
+    #[test]
+    fn invalid_signal_ops_do_not_allocate_policy_entries() {
+        let pid = u64::MAX - 31;
+        let mut sigact_req = ProcdIpcRequest::default();
+        sigact_req.pid = pid;
+        sigact_req.tid = pid;
+        sigact_req.arg0 = SIGKILL as u64;
+        sigact_req.flags = 0x1;
+        sigact_req.payload_len = LINUX_SIGACTION_SIZE as u32;
+        let mut resp = ProcdIpcResponse::default();
+        handle_rt_sigaction(&sigact_req, &mut resp);
+        assert_eq!(resp.status, EINVAL);
+        assert!(!PROCESS_SIGNAL_POLICY.lock().contains_key(&pid));
+
+        let mut mask_req = ProcdIpcRequest::default();
+        mask_req.pid = pid;
+        mask_req.tid = pid;
+        mask_req.arg0 = 99;
+        mask_req.flags = 0x1;
+        mask_req.payload_len = 8;
+        let mut mask_resp = ProcdIpcResponse::default();
+        handle_rt_sigprocmask(&mask_req, &mut mask_resp);
+        assert_eq!(mask_resp.status, EINVAL);
+        assert!(!THREAD_SIGNAL_POLICY.lock().contains_key(&(pid, pid)));
     }
 }

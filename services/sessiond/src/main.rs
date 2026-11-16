@@ -125,6 +125,8 @@ fn main() {
     // crash-looping `restart` service is not relaunched every 200 ms.
     let mut early_exits = BTreeMap::<String, u32>::new();
     let mut observed_digest = RUNNING_PROGRAMS_DIGEST_UNKNOWN;
+    let mut running_desktop_ids = BTreeSet::<String>::new();
+    let mut running_packages = BTreeSet::<String>::new();
 
     loop {
         if let Some(mut pending) = pending_rpc.take() {
@@ -204,19 +206,19 @@ fn main() {
             }
         };
 
-        let running_desktop_ids = running
-            .iter()
-            .map(|program| decode_c_string(&program.desktop_file_id))
-            .collect::<BTreeSet<_>>();
-        let running_packages = running_desktop_ids
-            .iter()
-            .map(|desktop_id| {
-                package_by_desktop_id
-                    .get(desktop_id)
-                    .cloned()
-                    .unwrap_or_else(|| package_id_from_desktop_id(desktop_id))
-            })
-            .collect::<BTreeSet<_>>();
+        running_desktop_ids.clear();
+        running_desktop_ids.extend(
+            running
+                .iter()
+                .map(|program| decode_c_string(&program.desktop_file_id)),
+        );
+        running_packages.clear();
+        running_packages.extend(running_desktop_ids.iter().map(|desktop_id| {
+            package_by_desktop_id
+                .get(desktop_id)
+                .cloned()
+                .unwrap_or_else(|| package_id_from_desktop_id(desktop_id))
+        }));
 
         if let Some(pending) = pending_launch.as_mut() {
             if running_desktop_ids.contains(pending.desktop_file_id.as_str()) {
@@ -300,6 +302,8 @@ fn main() {
             pending_launch = None;
         }
 
+        let now = Instant::now();
+        retry_after.retain(|_, deadline| now < *deadline);
         for entry in &launch_entries {
             if !may_auto_launch(entry, &abandoned_packages) {
                 continue;
@@ -311,10 +315,7 @@ fn main() {
             ) {
                 continue;
             }
-            if retry_after
-                .get(entry.desktop_file_id.as_str())
-                .is_some_and(|deadline| Instant::now() < *deadline)
-            {
+            if retry_after.contains_key(entry.desktop_file_id.as_str()) {
                 continue;
             }
             if entry.restart {

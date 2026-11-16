@@ -3,6 +3,7 @@
 //! Kept in the library target so its tests execute: the `vfsd` binary has no
 //! test harness.
 
+use alloc::borrow::Cow;
 use alloc::string::String;
 
 use rustos_user_abi::syscall::VFS_IPC_PATH_CAPACITY;
@@ -18,6 +19,18 @@ pub fn normalize_absolute_path(base_path: &str, path: &str) -> Result<String, i3
     // names cannot contain it, so refusing it loses no valid path.
     if path.as_bytes().iter().any(|&b| b == 0 || b == b'\\') {
         return Err(EINVAL);
+    }
+    if path.starts_with('/') {
+        if path == "/" {
+            return Ok(String::from("/"));
+        }
+        if path.len() <= VFS_IPC_PATH_CAPACITY
+            && path[1..]
+                .split('/')
+                .all(|component| !component.is_empty() && component != "." && component != "..")
+        {
+            return Ok(String::from(path));
+        }
     }
     let capacity = base_path
         .len()
@@ -81,6 +94,16 @@ pub fn fat_cache_key(path: &str) -> String {
     path.to_ascii_lowercase()
 }
 
+/// Borrowing variant of `fat_cache_key` that avoids heap allocation when `path`
+/// already contains no ASCII uppercase letters.
+pub fn fat_cache_key_cow(path: &str) -> Cow<'_, str> {
+    if path.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(path.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +139,15 @@ mod tests {
     fn overlong_results_are_refused() {
         let long = "a/".repeat(VFS_IPC_PATH_CAPACITY);
         assert_eq!(normalize_absolute_path("/", &long), Err(EINVAL));
+    }
+
+    #[test]
+    fn fat_cache_key_cow_borrows_lowercase_and_lowercases_uppercase() {
+        assert!(matches!(fat_cache_key_cow("/bin/ls"), Cow::Borrowed("/bin/ls")));
+        assert!(matches!(fat_cache_key_cow("/BIN/Ls"), Cow::Owned(ref s) if s == "/bin/ls"));
+        assert_eq!(
+            normalize_absolute_path("/ignored", "/usr/lib/.hidden").unwrap(),
+            "/usr/lib/.hidden"
+        );
     }
 }

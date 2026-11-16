@@ -419,20 +419,36 @@ pub(super) fn socket_name(
     0
 }
 
-fn echo_request(bytes: &[u8], ident: u16) -> Result<Vec<u8>, i32> {
+fn validate_echo_request(bytes: &[u8]) -> Result<(), i32> {
     if bytes.len() < 8 || bytes[0] != 8 || bytes[1] != 0 {
         return Err(libc::EINVAL);
     }
     if bytes.len() > MAX_ICMP_PAYLOAD {
         return Err(libc::EMSGSIZE);
     }
-    let mut packet = bytes.to_vec();
-    packet[4..6].copy_from_slice(&ident.to_be_bytes());
-    Icmpv4Packet::new_unchecked(&mut packet).fill_checksum();
-    Ok(packet)
+    Ok(())
 }
 
-pub(super) fn send(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+fn fill_echo_request<'a>(buf: &'a mut [u8; MAX_ICMP_PAYLOAD], bytes: &[u8], ident: u16) -> Result<&'a [u8], i32> {
+    validate_echo_request(bytes)?;
+    let packet = &mut buf[..bytes.len()];
+    packet.copy_from_slice(bytes);
+    packet[4..6].copy_from_slice(&ident.to_be_bytes());
+    Icmpv4Packet::new_unchecked(packet).fill_checksum();
+    Ok(&buf[..bytes.len()])
+}
+
+#[cfg(test)]
+fn echo_request(bytes: &[u8], ident: u16) -> Result<Vec<u8>, i32> {
+    let mut buf = [0_u8; MAX_ICMP_PAYLOAD];
+    fill_echo_request(&mut buf, bytes, ident).map(|packet| packet.to_vec())
+}
+
+pub(super) fn send_in_state(
+    state: &mut NetState,
+    request: &NetdIpcRequest,
+    response: &mut NetdIpcResponse,
+) -> i32 {
     let flags = request_msg_flags(request);
     if flags & !((libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u64) != 0 {
         return libc::EOPNOTSUPP;
@@ -444,7 +460,6 @@ pub(super) fn send(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> 
     if !message.control.is_empty() || message.flags != 0 {
         return libc::EOPNOTSUPP;
     }
-    let mut state = lock_net_state();
     let Some(socket) = state.inet_sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
@@ -474,7 +489,7 @@ pub(super) fn send(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> 
     }
     // Reject malformed/non-echo ICMP before allocating a local identifier.
     if matches!(transport, InetTransport::Icmp(_)) {
-        if let Err(e) = echo_request(message.data, 0) {
+        if let Err(e) = validate_echo_request(message.data) {
             return e;
         }
     }
@@ -483,7 +498,7 @@ pub(super) fn send(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> 
     if pending_error != 0 {
         return pending_error;
     }
-    if let Err(e) = autobind(&mut state, request.socket_token) {
+    if let Err(e) = autobind(state, request.socket_token) {
         return e;
     }
     let local = state.inet_sockets[&request.socket_token].local.unwrap();
@@ -501,14 +516,15 @@ pub(super) fn send(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> 
                 udp::SendError::Unaddressable => libc::ENETUNREACH,
             }),
         InetTransport::Icmp(h) => {
-            let packet = match echo_request(message.data, local.port) {
+            let mut echo_buf = [0_u8; MAX_ICMP_PAYLOAD];
+            let packet = match fill_echo_request(&mut echo_buf, message.data, local.port) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
             stack
                 .sockets
                 .get_mut::<icmp::Socket>(h)
-                .send_slice(&packet, destination.addr)
+                .send_slice(packet, destination.addr)
                 .map_err(|e| match e {
                     icmp::SendError::BufferFull => libc::EAGAIN,
                     icmp::SendError::Unaddressable => libc::ENETUNREACH,
@@ -553,7 +569,11 @@ fn encode_received(
     0
 }
 
-pub(super) fn recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+pub(super) fn recv_in_state(
+    state: &mut NetState,
+    request: &NetdIpcRequest,
+    response: &mut NetdIpcResponse,
+) -> i32 {
     let flags = request_msg_flags(request);
     if flags
         & !((libc::MSG_DONTWAIT
@@ -573,23 +593,62 @@ pub(super) fn recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> 
     let limit = requested.min(
         NETD_IPC_PAYLOAD_CAPACITY - netd_message::HEADER_SIZE - netd_message::IPV4_ADDRESS_SIZE,
     );
-    let mut state = lock_net_state();
-    let Some(stack) = state.inet.as_mut() else {
+    let NetState {
+        inet, inet_sockets, ..
+    } = state;
+    let Some(stack) = inet.as_mut() else {
         return libc::ENODEV;
     };
     stack.poll_budget(8);
-    if let Err(e) = stage_one(&mut state, request.socket_token) {
-        return e;
-    }
-    let socket = state.inet_sockets.get_mut(&request.socket_token).unwrap();
+    error_queue::stage_all(stack, inet_sockets);
+    let Some(socket) = inet_sockets.get_mut(&request.socket_token) else {
+        return libc::EBADF;
+    };
     if flags & libc::MSG_ERRQUEUE as u64 != 0 {
+        stage_socket(stack, socket);
         return error_queue::receive(socket, response, limit, flags);
     }
     let pending_error = error_queue::take_pending(socket);
     if pending_error != 0 {
+        stage_socket(stack, socket);
         return pending_error;
     }
-    receive_staged(socket, response, limit, flags)
+    if let Some(packet) = socket.received.as_ref() {
+        if !eligible(socket, packet.source, &packet.bytes) {
+            socket.received = None;
+        }
+    }
+    if socket.received.is_some() || flags & libc::MSG_PEEK as u64 != 0 {
+        stage_socket(stack, socket);
+        return receive_staged(socket, response, limit, flags);
+    }
+    recv_direct(stack, socket, response, limit, flags)
+}
+
+fn recv_direct(
+    stack: &mut InetStack,
+    socket: &InetSocket,
+    response: &mut NetdIpcResponse,
+    limit: usize,
+    flags: u64,
+) -> i32 {
+    for _ in 0..PACKET_SLOTS {
+        let (bytes, source) = match socket.transport {
+            InetTransport::Udp(h) => match stack.sockets.get_mut::<udp::Socket>(h).recv() {
+                Ok((bytes, meta)) => (bytes, meta.endpoint),
+                Err(_) => return libc::EAGAIN,
+            },
+            InetTransport::Icmp(h) => match stack.sockets.get_mut::<icmp::Socket>(h).recv() {
+                Ok((bytes, addr)) => (bytes, IpEndpoint::new(addr, 0)),
+                Err(_) => return libc::EAGAIN,
+            },
+            InetTransport::Tcp(_) => return libc::EOPNOTSUPP,
+        };
+        if eligible(socket, source, bytes) {
+            return encode_received(response, bytes, source, limit, flags);
+        }
+    }
+    libc::EAGAIN
 }
 
 fn receive_staged(

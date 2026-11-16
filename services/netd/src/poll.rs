@@ -17,38 +17,34 @@ pub(super) fn handle_poll_batch(request: &NetdIpcRequest, response: &mut NetdIpc
     {
         return libc::EINVAL;
     }
-    let mut queries = Vec::with_capacity(count);
-    for index in 0..count {
-        let offset = index * QUERY;
-        let bytes = &request.payload[offset..offset + QUERY];
-        let query = NetdPollQueryWire {
-            socket_token: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
-            events: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            reserved0: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-        };
-        if query.socket_token == 0 || query.reserved0 != 0 {
+    let payload = &request.payload[..len];
+    for bytes in payload.chunks_exact(QUERY) {
+        let socket_token = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let reserved0 = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        if socket_token == 0 || reserved0 != 0 {
             return libc::EINVAL;
         }
-        queries.push(query);
     }
     let mut state = lock_net_state();
-    if queries
-        .iter()
-        .any(|query| state.inet_sockets.contains_key(&query.socket_token))
-    {
+    if payload.chunks_exact(QUERY).any(|bytes| {
+        let socket_token = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        state.inet_sockets.contains_key(&socket_token)
+    }) {
         if let Ok(stack) = state.inet_stack() {
             stack.poll_budget(8);
         }
     }
-    for (index, query) in queries.iter().enumerate() {
-        let outcome = if state.inet_sockets.contains_key(&query.socket_token) {
-            inet_socket_revents(&mut state, query.socket_token, query.events)
+    for (index, bytes) in payload.chunks_exact(QUERY).enumerate() {
+        let socket_token = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let events = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let outcome = if state.inet_sockets.contains_key(&socket_token) {
+            inet_socket_revents(&mut state, socket_token, events)
         } else {
-            unix_socket_revents(&state, query.socket_token, query.events)
+            unix_socket_revents(&state, socket_token, events)
         };
         let result = match outcome {
             Ok(revents) => NetdPollResultWire {
-                generation: state.socket_readiness_generation(query.socket_token),
+                generation: state.socket_readiness_generation(socket_token),
                 revents,
                 status: 0,
             },
@@ -93,6 +89,10 @@ pub(super) fn handle_poll_socket(request: &NetdIpcRequest, response: &mut NetdIp
 
 pub(super) fn unix_socket_revents(state: &NetState, token: u64, requested: u32) -> Result<u32, i32> {
     let socket = state.sockets.get(&token).ok_or(libc::EBADF)?;
+    Ok(unix_socket_revents_for(state, socket, requested))
+}
+
+pub(super) fn unix_socket_revents_for(state: &NetState, socket: &UnixSocket, requested: u32) -> u32 {
     let mut revents = 0_u32;
     match &socket.state {
         UnixSocketState::Listening { pending, .. } => {
@@ -146,7 +146,7 @@ pub(super) fn unix_socket_revents(state: &NetState, token: u64, requested: u32) 
             revents |= linux_abi::POLLERR as u32;
         }
     }
-    Ok(revents)
+    revents
 }
 
 pub(super) fn wait_for_socket_readiness(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {

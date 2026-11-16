@@ -112,6 +112,7 @@ impl AppDmabuf {
             .checked_mul(u64::from(height))
             .filter(|len| *len != 0 && *len <= APP_BUFFER_MAX_BYTES)
             .ok_or_else(einval)?;
+        let len = usize::try_from(len).map_err(|_| einval())?;
         let args = RustosAppBufferAllocArgs {
             width,
             height,
@@ -120,7 +121,7 @@ impl AppDmabuf {
             reserved: [0; 2],
         };
         let fd = source.alloc(&args)?;
-        Self::map(fd, width, height, stride, format, len as usize)
+        Self::map(fd, width, height, stride, format, len)
     }
 
     fn map(
@@ -213,6 +214,7 @@ fn check_identity(st: &libc::stat, needed: usize) -> io::Result<()> {
     let proto = || io::Error::from_raw_os_error(libc::EPROTO);
     if st.st_mode & libc::S_IFMT != libc::S_IFCHR
         || st.st_rdev as u64 != APP_BUFFER_STAT_RDEV
+        || st.st_size < 0
         || (st.st_size as u64) < needed as u64
     {
         return Err(proto());
@@ -294,6 +296,9 @@ mod tests {
         st.st_size = 256;
         assert!(check_identity(&st, 256).is_ok());
         assert!(check_identity(&st, 257).is_err());
+        st.st_size = -1;
+        assert!(check_identity(&st, 1).is_err());
+        st.st_size = 256;
         st.st_rdev = 0;
         assert!(check_identity(&st, 1).is_err());
         st.st_rdev = APP_BUFFER_STAT_RDEV as _;

@@ -3,10 +3,11 @@
 use super::*;
 
 pub(super) fn handle_send(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    if inet_datagram::is_datagram(request.socket_token) {
-        return inet_datagram::send(request, response);
-    }
-    if inet_socket_exists(request.socket_token) {
+    let mut state = lock_net_state();
+    if let Some(inet) = state.inet_sockets.get(&request.socket_token) {
+        if inet.transport.is_datagram() {
+            return inet_datagram::send_in_state(&mut state, request, response);
+        }
         if request.op == SYSCALL_OFFLOAD_OP_LINUX_SENDMSG {
             // The sendmsg envelope is a 16-byte header plus data and control
             // sections; only the data section is TCP stream payload. TCP has
@@ -18,17 +19,40 @@ pub(super) fn handle_send(request: &NetdIpcRequest, response: &mut NetdIpcRespon
             if !control.is_empty() {
                 return libc::EOPNOTSUPP;
             }
-            return handle_inet_send(request, &request.payload[data], response);
+            return handle_inet_send_in_state(
+                &mut state,
+                request,
+                &request.payload[data],
+                response,
+            );
         }
         let len = request.payload_len as usize;
-        return handle_inet_send(request, &request.payload[..len], response);
+        return handle_inet_send_in_state(&mut state, request, &request.payload[..len], response);
     }
     if request.op == SYSCALL_OFFLOAD_OP_LINUX_SENDMSG {
-        return handle_sendmsg(request, response);
+        let (data, control) = match split_sendmsg_payload(request) {
+            Ok(sections) => sections,
+            Err(errno) => return errno,
+        };
+        if let Err(errno) = validate_sendmsg_control(&request.payload[control.clone()]) {
+            return errno;
+        }
+        return match send_socket_message_in_state(
+            &mut state,
+            request,
+            &request.payload[data],
+            &request.payload[control],
+        ) {
+            Ok(sent) => {
+                response.value = sent as u64;
+                0
+            }
+            Err(errno) => errno,
+        };
     }
     let len = request.payload_len as usize;
     let bytes = &request.payload[..len];
-    match send_socket_bytes(request, bytes) {
+    match send_socket_message_in_state(&mut state, request, bytes, &[]) {
         Ok(sent) => {
             response.value = sent as u64;
             0
@@ -58,37 +82,20 @@ pub(super) fn split_sendmsg_payload(
     Ok((data_start..control_start, control_start..end))
 }
 
-pub(super) fn handle_sendmsg(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    let (data, control) = match split_sendmsg_payload(request) {
-        Ok(sections) => sections,
-        Err(errno) => return errno,
-    };
-    if let Err(errno) = validate_sendmsg_control(&request.payload[control.clone()]) {
-        return errno;
-    }
-    match send_socket_message(request, &request.payload[data], &request.payload[control]) {
-        Ok(sent) => {
-            response.value = sent as u64;
-            0
-        }
-        Err(errno) => errno,
-    }
-}
-
 pub(super) fn handle_recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    if inet_datagram::is_datagram(request.socket_token) {
-        return inet_datagram::recv(request, response);
-    }
-    if inet_socket_exists(request.socket_token) {
-        return handle_inet_recv(request, response);
+    let mut state = lock_net_state();
+    if let Some(inet) = state.inet_sockets.get(&request.socket_token) {
+        if inet.transport.is_datagram() {
+            return inet_datagram::recv_in_state(&mut state, request, response);
+        }
+        return handle_inet_recv_in_state(&mut state, request, response);
     }
     if request.op == SYSCALL_OFFLOAD_OP_LINUX_RECVMSG {
-        return handle_recvmsg(request, response);
+        return recvmsg_in_state(&mut state, request, response);
     }
     if request_msg_flags(request) & libc::MSG_PEEK as u64 != 0 {
         let requested = usize::try_from(request.arg2).unwrap_or(usize::MAX);
         let limit = requested.min(response.payload.len() - SOCKET_CONTROL_BUFFER_CAPACITY);
-        let state = lock_net_state();
         return match peek_connected_bytes(&state, request.socket_token, &mut response.payload[..limit]) {
             Ok((read, _)) => {
                 response.value = read as u64;
@@ -99,13 +106,18 @@ pub(super) fn handle_recv(request: &NetdIpcRequest, response: &mut NetdIpcRespon
             Err(errno) => errno,
         };
     }
-    let requested = if request.op == SYSCALL_OFFLOAD_OP_LINUX_RECVMSG {
-        request.payload_len as usize
-    } else {
-        usize::try_from(request.arg2).unwrap_or(usize::MAX)
-    };
+    let requested = usize::try_from(request.arg2).unwrap_or(usize::MAX);
     let limit = requested.min(response.payload.len() - SOCKET_CONTROL_BUFFER_CAPACITY);
-    match recv_socket_bytes(request, &mut response.payload[..limit], false) {
+    let outcome = if limit == 0 {
+        Ok(SocketReceive {
+            read: 0,
+            control: Vec::new(),
+            discarded: Vec::new(),
+        })
+    } else {
+        recv_socket_bytes_in_state(&mut state, request, &mut response.payload[..limit], false)
+    };
+    match outcome {
         Ok(received) => {
             let release_start = received.read;
             let release_end = release_start + received.discarded.len();
@@ -118,11 +130,6 @@ pub(super) fn handle_recv(request: &NetdIpcRequest, response: &mut NetdIpcRespon
         }
         Err(errno) => errno,
     }
-}
-
-pub(super) fn handle_recvmsg(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    let mut state = lock_net_state();
-    recvmsg_in_state(&mut state, request, response)
 }
 
 pub(super) fn recvmsg_in_state(
@@ -194,22 +201,6 @@ pub(super) fn recvmsg_in_state(
         }
         Err(errno) => errno,
     }
-}
-
-pub(super) fn send_socket_bytes(request: &NetdIpcRequest, bytes: &[u8]) -> Result<usize, i32> {
-    send_socket_message(request, bytes, &[])
-}
-
-pub(super) fn send_socket_message(
-    request: &NetdIpcRequest,
-    bytes: &[u8],
-    control: &[u8],
-) -> Result<usize, i32> {
-    if bytes.is_empty() {
-        return Ok(0);
-    }
-    let mut state = lock_net_state();
-    send_socket_message_in_state(&mut state, request, bytes, control)
 }
 
 pub(super) fn send_socket_message_in_state(
@@ -306,6 +297,7 @@ pub(super) fn send_socket_message_in_state(
     Ok(write_len)
 }
 
+#[cfg(test)]
 pub(super) fn recv_socket_bytes(
     request: &NetdIpcRequest,
     dest: &mut [u8],

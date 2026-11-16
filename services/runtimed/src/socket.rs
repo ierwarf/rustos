@@ -558,13 +558,22 @@ fn authorize_runtime_request(
     if peer.pid <= 0 {
         return Err(libc::EACCES);
     }
-    let peer_pid = peer.pid as u64;
-    let is_uiserver =
-        rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_UISERVER, peer_pid) >= 0;
     let is_logical_admin = state
         .running
         .get(&peer.pid)
         .is_some_and(|process| process.logical_admin);
+    // Avoid an IPC lookup to the service registry when the caller is already
+    // authenticated as logical_admin and the opcode does not require uiserver.
+    if request.op != OP_NOTIFY_READY && is_logical_admin {
+        return if runtime_request_role_authorized(request.op, false, true) {
+            Ok(())
+        } else {
+            Err(libc::EACCES)
+        };
+    }
+    let peer_pid = peer.pid as u64;
+    let is_uiserver =
+        rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_UISERVER, peer_pid) >= 0;
     if runtime_request_role_authorized(request.op, is_uiserver, is_logical_admin) {
         Ok(())
     } else {
@@ -617,21 +626,17 @@ fn dispatch_request(
 /// would carry it. Both the snapshot reply and the watch change edge read this,
 /// so a watcher's digest is taken over the same bytes the caller will hash.
 fn running_program_snapshot(state: &BrokerState) -> Vec<RuntimeRunningProgram> {
-    let mut programs = state
-        .running
-        .values()
-        .take(MAX_RUNTIME_PROGRAMS)
-        .map(|program| {
-            let mut snapshot = RuntimeRunningProgram::default();
-            snapshot.pid = program.pid as u64;
-            snapshot.program_id = 0;
-            snapshot.session_handle = program.session_handle;
-            super::util::copy_ascii_into(&mut snapshot.desktop_file_id, &program.desktop_file_id);
-            super::util::copy_ascii_into(&mut snapshot.display_name, &program.display_name);
-            super::util::copy_ascii_into(&mut snapshot.exec_path, &program.exec);
-            snapshot
-        })
-        .collect::<Vec<_>>();
+    let mut programs = Vec::with_capacity(state.running.len().min(MAX_RUNTIME_PROGRAMS));
+    for program in state.running.values().take(MAX_RUNTIME_PROGRAMS) {
+        let mut snapshot = RuntimeRunningProgram::default();
+        snapshot.pid = program.pid as u64;
+        snapshot.program_id = 0;
+        snapshot.session_handle = program.session_handle;
+        super::util::copy_ascii_into(&mut snapshot.desktop_file_id, &program.desktop_file_id);
+        super::util::copy_ascii_into(&mut snapshot.display_name, &program.display_name);
+        super::util::copy_ascii_into(&mut snapshot.exec_path, &program.exec);
+        programs.push(snapshot);
+    }
     programs.sort_by_key(|program| program.pid);
     programs
 }
@@ -755,12 +760,14 @@ fn begin_rpc_launch(
         return Err(libc::EOPNOTSUPP);
     }
     let target = super::util::request_path(&request)?;
-    let metadata = super::catalog::resolve_program_request(state, target.as_str())?;
-    if !super::catalog::runtime_deps_satisfied(
-        &metadata.runtime_deps,
-        &super::catalog::running_packages(state),
-        &state.launched_once,
-    ) {
+    let metadata = super::catalog::resolve_program_request(state, target)?;
+    if !metadata.runtime_deps.is_empty()
+        && !super::catalog::runtime_deps_satisfied(
+            &metadata.runtime_deps,
+            &super::catalog::running_packages(state),
+            &state.launched_once,
+        )
+    {
         return Err(libc::EAGAIN);
     }
     super::spawn::begin_rpc_launch(
@@ -911,92 +918,74 @@ pub(super) fn ensure_policy_launches(state: &mut BrokerState) -> bool {
     // loop still owns every decision about it - it records the pid and applies
     // the outcome - but starting a second would mean two children racing for
     // the same launch bookkeeping.
-    if state.launch_in_flight.is_some() {
+    if state.launch_in_flight.is_some() || state.launch_entries.is_empty() {
         return false;
     }
     let now = Instant::now();
-    let running_programs = state
-        .running
-        .values()
-        .map(|program| program.desktop_file_id.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    let running_packages = super::catalog::running_packages(state);
     let mut pending_service_launch = false;
     let mut pending_desktop_launch = false;
-    for entry in &state.launch_entries {
-        if state
-            .permanent_launch_failures
-            .contains_key(entry.desktop_file_id.as_str())
-        {
-            continue;
+    let mut candidates = Vec::new();
+    {
+        let running_programs = state
+            .running
+            .values()
+            .map(|program| program.desktop_file_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let running_packages = state
+            .running
+            .values()
+            .map(|program| program.package_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        for (idx, entry) in state.launch_entries.iter().enumerate() {
+            if state
+                .permanent_launch_failures
+                .contains_key(entry.desktop_file_id.as_str())
+            {
+                continue;
+            }
+            if state
+                .retry_after
+                .get(entry.desktop_file_id.as_str())
+                .is_some_and(|deadline| now < *deadline)
+            {
+                continue;
+            }
+            let already_satisfied = if entry.restart {
+                running_packages.contains(entry.package_id.as_str())
+            } else {
+                running_programs.contains(entry.desktop_file_id.as_str())
+                    || state.launched_once.contains(entry.package_id.as_str())
+            };
+            if already_satisfied {
+                continue;
+            }
+            let deps_satisfied = entry.runtime_deps.iter().all(|dep| {
+                running_packages.contains(dep.as_str())
+                    || state.launched_once.contains(dep.as_str())
+            });
+            if !deps_satisfied {
+                continue;
+            }
+            if entry.exec.starts_with("services/") {
+                pending_service_launch = true;
+            } else {
+                pending_desktop_launch = true;
+            }
+            candidates.push(idx);
         }
-        if state
-            .retry_after
-            .get(entry.desktop_file_id.as_str())
-            .is_some_and(|deadline| now < *deadline)
-        {
-            continue;
-        }
-        let already_satisfied = if entry.restart {
-            running_packages.contains(&entry.package_id)
-        } else {
-            running_programs.contains(&entry.desktop_file_id)
-                || state.launched_once.contains(entry.package_id.as_str())
-        };
-        if already_satisfied {
-            continue;
-        }
-        if !super::catalog::runtime_deps_satisfied(
-            &entry.runtime_deps,
-            &running_packages,
-            &state.launched_once,
-        ) {
-            continue;
-        }
-        if entry.exec.starts_with("services/") {
-            pending_service_launch = true;
-        } else {
-            pending_desktop_launch = true;
-        }
+    }
+    if candidates.is_empty() {
+        return false;
     }
 
     let mut attempts = 0usize;
     let mut launched_any = false;
-    for entry in state.launch_entries.clone() {
+    for idx in candidates {
         if attempts >= MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK {
             break;
         }
-        if state
-            .permanent_launch_failures
-            .contains_key(entry.desktop_file_id.as_str())
-        {
-            continue;
-        }
-        if state
-            .retry_after
-            .get(entry.desktop_file_id.as_str())
-            .is_some_and(|deadline| now < *deadline)
-        {
-            continue;
-        }
-        if entry.restart {
-            if running_packages.contains(&entry.package_id) {
-                continue;
-            }
-        } else if running_programs.contains(&entry.desktop_file_id)
-            || state.launched_once.contains(entry.package_id.as_str())
-        {
-            continue;
-        }
-        if !super::catalog::runtime_deps_satisfied(
-            &entry.runtime_deps,
-            &running_packages,
-            &state.launched_once,
-        ) {
-            continue;
-        }
-
-        let may_precede_ui_ready = launch_may_precede_ui_ready(&entry);
+        let entry = &state.launch_entries[idx];
+        let may_precede_ui_ready = launch_may_precede_ui_ready(entry);
         if pending_service_launch
             && !entry.exec.starts_with("services/")
             && !may_precede_ui_ready
@@ -1015,11 +1004,13 @@ pub(super) fn ensure_policy_launches(state: &mut BrokerState) -> bool {
             continue;
         }
         if !entry.exec.starts_with("services/") && !super::spawn::loader_endpoint_ready() {
-            schedule_launch_retry(state, entry.desktop_file_id.as_str(), libc::ENOSYS);
+            let desktop_file_id = entry.desktop_file_id.clone();
+            schedule_launch_retry(state, desktop_file_id.as_str(), libc::ENOSYS);
             continue;
         }
 
         attempts += 1;
+        let entry = entry.clone();
         // Hand the launch to its worker rather than running it here. Every
         // console caller the loop owns - a keystroke, a parked read, the
         // compositor's parked graph wait - waits for this pass to end, and a

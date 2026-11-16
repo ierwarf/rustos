@@ -106,83 +106,75 @@ fn initial_configure_due(surface: &WaylandSurfaceState, mapped: bool) -> bool {
 
 impl WaylandState {
     pub(super) fn commit_surface(&mut self, resource: &wl_surface::WlSurface, data: &SurfaceData) {
-        let (pending_buffer, damage, viewport, mapping, decoration_server, offset, alive) = {
+        enum CommitAction {
+            Run(PendingCommit),
+            ReleaseRetired(wl_buffer::WlBuffer),
+            Error(&'static str),
+            Done,
+        }
+        let action = {
             let Ok(mut surface) = data.shared.lock() else {
+                post_protocol_error(resource, "wl_surface.commit: surface unavailable".into());
                 return;
             };
             let damage = surface.pending_damage;
             surface.pending_damage = Rect::empty();
             let offset = std::mem::take(&mut surface.pending_offset);
-            (
-                surface.pending_buffer.take(),
-                damage,
-                surface.pending_viewport,
-                surface.pending_buffer_mapping,
-                surface.decoration_ack_server,
-                (i64::from(offset.0), i64::from(offset.1)),
-                surface.alive,
-            )
-        };
-        if !alive {
-            // A retired surface (its toplevel was destroyed or it was closed)
-            // is never shown again. Retaining a client buffer for it would pin
-            // up to 64 MiB until the next prune, so hand the attached buffer
-            // straight back.
-            if let Some(Some(attachment)) = pending_buffer {
-                attachment.resource.release();
-            }
-            return;
-        }
-        let commits_buffer = matches!(pending_buffer, Some(Some(_))) || !damage.is_empty();
-        if commits_buffer {
-            let commit_ready = match data.shared.lock() {
-                Ok(surface)
-                    if surface.toplevel.is_some()
-                        && surface.current_buffer.is_none()
-                        && surface.acknowledged_serial == 0 =>
-                {
-                    Err("wl_surface.commit: xdg surface buffer committed before configure ack")
+            let pending_buffer = surface.pending_buffer.take();
+            if !surface.alive {
+                // A retired surface (its toplevel was destroyed or it was closed)
+                // is never shown again. Retaining a client buffer for it would pin
+                // up to 64 MiB until the next prune, so hand the attached buffer
+                // straight back.
+                match pending_buffer {
+                    Some(Some(attachment)) => CommitAction::ReleaseRetired(attachment.resource),
+                    _ => CommitAction::Done,
                 }
-                Ok(_) => Ok(()),
-                Err(_) => Err("wl_surface.commit: surface unavailable"),
-            };
-            if let Err(message) = commit_ready {
-                post_protocol_error(resource, message.into());
-                return;
-            }
-        }
-        let commit = PendingCommit {
-            attach: pending_buffer,
-            damage,
-            viewport,
-            mapping,
-            decoration_server,
-            offset,
-        };
-        // Every commit queues behind an in-flight one, including commits that
-        // need no pixels: a null attach processed ahead of an earlier read
-        // would be resurrected when that read lands.
-        let commit = {
-            let Ok(mut surface) = data.shared.lock() else {
-                return;
-            };
-            if surface.commit.is_busy() {
-                let merged = match surface.commit.queued.take() {
-                    Some(old) => {
-                        let (merged, released) = merge_commits(old, commit);
-                        if let Some(buffer) = released {
-                            surface.pending_buffer_releases.push(buffer);
-                        }
-                        merged
+            } else {
+                let commits_buffer =
+                    matches!(pending_buffer, Some(Some(_))) || !damage.is_empty();
+                if commits_buffer
+                    && surface.toplevel.is_some()
+                    && surface.current_buffer.is_none()
+                    && surface.acknowledged_serial == 0
+                {
+                    CommitAction::Error(
+                        "wl_surface.commit: xdg surface buffer committed before configure ack",
+                    )
+                } else {
+                    let commit = PendingCommit {
+                        attach: pending_buffer,
+                        damage,
+                        viewport: surface.pending_viewport,
+                        mapping: surface.pending_buffer_mapping,
+                        decoration_server: surface.decoration_ack_server,
+                        offset: (i64::from(offset.0), i64::from(offset.1)),
+                    };
+                    if surface.commit.is_busy() {
+                        let merged = match surface.commit.queued.take() {
+                            Some(old) => {
+                                let (merged, released) = merge_commits(old, commit);
+                                if let Some(buffer) = released {
+                                    surface.pending_buffer_releases.push(buffer);
+                                }
+                                merged
+                            }
+                            None => commit,
+                        };
+                        surface.commit.queued = Some(merged);
+                        CommitAction::Done
+                    } else {
+                        CommitAction::Run(commit)
                     }
-                    None => commit,
-                };
-                surface.commit.queued = Some(merged);
-                return;
+                }
             }
-            commit
         };
-        self.run_commit(resource, &data.shared, commit);
+        match action {
+            CommitAction::Run(commit) => self.run_commit(resource, &data.shared, commit),
+            CommitAction::ReleaseRetired(buffer) => buffer.release(),
+            CommitAction::Error(message) => post_protocol_error(resource, message.into()),
+            CommitAction::Done => {}
+        }
     }
 
     /// Apply a commit now, or plan its read and leave it in flight.
@@ -201,31 +193,36 @@ impl WaylandState {
             offset,
         } = commit;
         let has_damage = !damage.is_empty();
-        // Promote the captured mapping. Mapping-only changes are derived from
-        // compositor-owned pixels rather than a buffer already released to its client.
-        let viewport_changed = shared.lock().is_ok_and(|mut surface| {
-            let changed = surface.viewport != viewport || surface.buffer_mapping != mapping;
-            surface.viewport = viewport;
-            surface.buffer_mapping = mapping;
-            changed
-        });
-        let icon_offset_changed = shared.lock().is_ok_and(|mut surface| {
-            if !surface.drag_icon_role || offset == (0, 0) {
-                return false;
-            }
-            surface.drag_icon_offset_x = surface.drag_icon_offset_x.saturating_add(offset.0);
-            surface.drag_icon_offset_y = surface.drag_icon_offset_y.saturating_add(offset.1);
-            surface.frame.x = (i64::from(self.pointer_x).saturating_add(surface.drag_icon_offset_x))
-                .max(0) as usize;
-            surface.frame.y = (i64::from(self.pointer_y).saturating_add(surface.drag_icon_offset_y))
-                .max(0) as usize;
-            surface.drag_icon_active
-        });
-        let decoration_changed = shared.lock().is_ok_and(|mut surface| {
-            let changed = surface.decoration_server != decoration_server;
-            surface.decoration_server = decoration_server;
-            changed
-        });
+        // Promote the captured mapping and surface metadata in one lock.
+        let (viewport_changed, icon_offset_changed, decoration_changed) = shared
+            .lock()
+            .map_or((false, false, false), |mut surface| {
+                let viewport_changed =
+                    surface.viewport != viewport || surface.buffer_mapping != mapping;
+                surface.viewport = viewport;
+                surface.buffer_mapping = mapping;
+
+                let icon_offset_changed = if surface.drag_icon_role && offset != (0, 0) {
+                    surface.drag_icon_offset_x =
+                        surface.drag_icon_offset_x.saturating_add(offset.0);
+                    surface.drag_icon_offset_y =
+                        surface.drag_icon_offset_y.saturating_add(offset.1);
+                    surface.frame.x = (i64::from(self.pointer_x)
+                        .saturating_add(surface.drag_icon_offset_x))
+                    .max(0) as usize;
+                    surface.frame.y = (i64::from(self.pointer_y)
+                        .saturating_add(surface.drag_icon_offset_y))
+                    .max(0) as usize;
+                    surface.drag_icon_active
+                } else {
+                    false
+                };
+
+                let decoration_changed = surface.decoration_server != decoration_server;
+                surface.decoration_server = decoration_server;
+
+                (viewport_changed, icon_offset_changed, decoration_changed)
+            });
         let mut outcome = Outcome {
             has_damage,
             dirty: decoration_changed || icon_offset_changed,
@@ -643,23 +640,24 @@ impl WaylandState {
     /// The commit's visible effects, shared by the synchronous and the
     /// completed-snapshot paths.
     fn finish_commit(&mut self, shared: &Arc<Mutex<WaylandSurfaceState>>, mut outcome: Outcome) {
-        if let Some(buffer) = outcome.release.take() {
+        let released_fallback = outcome.release.take();
+        if released_fallback.is_some() || !outcome.mapped || !outcome.dirty {
             if let Ok(mut surface) = shared.lock() {
-                surface.pending_buffer_releases.push(buffer);
-            } else {
-                buffer.release();
-            }
-        }
-        if !outcome.mapped {
-            if let Ok(surface) = shared.lock() {
-                if !surface.pixels.is_empty() && surface.width != 0 && surface.height != 0 {
+                if let Some(buffer) = released_fallback {
+                    surface.pending_buffer_releases.push(buffer);
+                }
+                if !outcome.mapped
+                    && !surface.pixels.is_empty()
+                    && surface.width != 0
+                    && surface.height != 0
+                {
                     outcome.mapped = true;
                 }
-            }
-        }
-        if !outcome.dirty {
-            if let Ok(mut surface) = shared.lock() {
-                surface.last_damage = Rect::empty();
+                if !outcome.dirty {
+                    surface.last_damage = Rect::empty();
+                }
+            } else if let Some(buffer) = released_fallback {
+                buffer.release();
             }
         }
         if outcome.dirty {

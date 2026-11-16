@@ -98,11 +98,14 @@ impl DvmInputRingHeader {
         DVM_INPUT_RING_HEADER_BYTES as u64
     }
 
+    #[inline]
     pub fn record_offset(sequence: u64) -> u64 {
         Self::records_offset()
-            + (sequence % DVM_INPUT_RING_SLOT_COUNT as u64) * DVM_INPUT_RING_RECORD_BYTES as u64
+            + (sequence & (DVM_INPUT_RING_SLOT_COUNT as u64 - 1))
+                * DVM_INPUT_RING_RECORD_BYTES as u64
     }
 
+    #[inline]
     pub const fn is_valid(self) -> bool {
         self.region_bytes >= DVM_INPUT_RING_MIN_REGION_BYTES
             && self.region_bytes <= DVM_INPUT_RING_APERTURE_BYTES
@@ -341,14 +344,28 @@ impl RustosInputFrame {
     }
 }
 
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0_u32; 256];
+    let mut index = 0;
+    while index < 256 {
+        let mut crc = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            let mask = (crc & 1).wrapping_neg() & 0xedb8_8320;
+            crc = (crc >> 1) ^ mask;
+            bit += 1;
+        }
+        table[index] = crc;
+        index += 1;
+    }
+    table
+};
+
+#[inline]
 pub(crate) fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0_u32;
     for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg() & 0xedb8_8320;
-            crc = (crc >> 1) ^ mask;
-        }
+        crc = (crc >> 8) ^ CRC32_TABLE[((crc ^ u32::from(byte)) & 0xff) as usize];
     }
     !crc
 }

@@ -1,4 +1,5 @@
 use core::convert::Infallible;
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 use embedded_graphics::draw_target::DrawTarget;
@@ -440,20 +441,51 @@ impl<'a> SurfaceCanvas<'a> {
             height,
         }
         .intersect(self.clip_rect);
+        if rect.is_empty() {
+            return;
+        }
+        let src_x = rect.x - x;
+        let src_y = rect.y - y;
         for row in 0..rect.height {
-            let source = (rect.y - y + row) * stride + rect.x - x;
-            let dest = (rect.y + row) * self.stride_pixels + rect.x;
-            let Some(dst) = self.pixels.get_mut(dest..dest + rect.width) else {
+            let Some(source) = (src_y + row)
+                .checked_mul(stride)
+                .and_then(|offset| offset.checked_add(src_x))
+            else {
                 return;
             };
-            for (dst, pixel) in dst.iter_mut().zip(&src[source..source + rect.width]) {
+            let Some(source_end) = source.checked_add(rect.width) else {
+                return;
+            };
+            let Some(src_row) = src.get(source..source_end) else {
+                return;
+            };
+            let Some(dest) = (rect.y + row)
+                .checked_mul(self.stride_pixels)
+                .and_then(|offset| offset.checked_add(rect.x))
+            else {
+                return;
+            };
+            let Some(dest_end) = dest.checked_add(rect.width) else {
+                return;
+            };
+            let Some(dst) = self.pixels.get_mut(dest..dest_end) else {
+                return;
+            };
+            for (dst, &pixel) in dst.iter_mut().zip(src_row) {
+                if pixel == 0 {
+                    continue;
+                }
                 let a = pixel >> 24;
+                if a == 255 {
+                    *dst = pixel & 0x00ff_ffff;
+                    continue;
+                }
                 let inv = 255 - a;
-                let blend = |shift: u32| {
-                    (((pixel >> shift) & 255) + (((*dst >> shift) & 255) * inv + 127) / 255)
-                        .min(255)
-                };
-                *dst = (blend(16) << 16) | (blend(8) << 8) | blend(0);
+                let dst_pixel = *dst;
+                let out_r = ((pixel >> 16) & 255) + div255_round(((dst_pixel >> 16) & 255) * inv);
+                let out_g = ((pixel >> 8) & 255) + div255_round(((dst_pixel >> 8) & 255) * inv);
+                let out_b = (pixel & 255) + div255_round((dst_pixel & 255) * inv);
+                *dst = (out_r.min(255) << 16) | (out_g.min(255) << 8) | out_b.min(255);
             }
         }
     }
@@ -492,6 +524,11 @@ impl<'a> SurfaceCanvas<'a> {
         let src_x = dst_rect.x.saturating_sub(dst_x);
         let src_y = dst_rect.y.saturating_sub(dst_y);
 
+        let src_r = (color >> 16) & 0xff;
+        let src_g = (color >> 8) & 0xff;
+        let src_b = color & 0xff;
+        let opaque_color = color;
+
         // Row-based access: take one slice per row so the inner loop only
         // sees plain index iteration without per-pixel bounds checks. With
         // ~470 k iterations per shadow blit this used to dominate the drag
@@ -520,7 +557,17 @@ impl<'a> SurfaceCanvas<'a> {
                 if alpha_value == 0 {
                     continue;
                 }
-                blend_pixel(dst_pixel, color, alpha_value);
+                if alpha_value == u8::MAX {
+                    *dst_pixel = opaque_color;
+                    continue;
+                }
+                let a = u32::from(alpha_value);
+                let inv = 255 - a;
+                let dst_v = *dst_pixel;
+                let out_r = div255_round(src_r * a + ((dst_v >> 16) & 0xff) * inv);
+                let out_g = div255_round(src_g * a + ((dst_v >> 8) & 0xff) * inv);
+                let out_b = div255_round(src_b * a + (dst_v & 0xff) * inv);
+                *dst_pixel = (out_r << 16) | (out_g << 8) | out_b;
             }
         }
     }
@@ -610,13 +657,13 @@ fn for_each_cursor_pixel(
     let divisor = CURSOR_ROTATION_FP.saturating_mul(CURSOR_SCALE_NUM);
     let factor = CURSOR_SCALE_DEN.saturating_mul(CURSOR_SUBPIXEL_FP);
     for local_y in -radius..=radius {
+        let mut rot_x = (-radius)
+            .saturating_mul(cos_fp)
+            .saturating_add(local_y.saturating_mul(sin_fp));
+        let mut rot_y = local_y
+            .saturating_mul(cos_fp)
+            .saturating_sub((-radius).saturating_mul(sin_fp));
         for local_x in -radius..=radius {
-            let rot_x = local_x
-                .saturating_mul(cos_fp)
-                .saturating_add(local_y.saturating_mul(sin_fp));
-            let rot_y = local_y
-                .saturating_mul(cos_fp)
-                .saturating_sub(local_x.saturating_mul(sin_fp));
             let sx_fp = div_round(rot_x.saturating_mul(factor), divisor).saturating_add(hotspot_fp);
             let sy_fp = div_round(rot_y.saturating_mul(factor), divisor).saturating_add(hotspot_fp);
             let (blue_alpha, white_alpha) =
@@ -624,6 +671,8 @@ fn for_each_cursor_pixel(
             if blue_alpha != 0 || white_alpha != 0 {
                 emit(local_x, local_y, blue_alpha, white_alpha);
             }
+            rot_x = rot_x.saturating_add(cos_fp);
+            rot_y = rot_y.saturating_sub(sin_fp);
         }
     }
     true
@@ -678,14 +727,15 @@ fn premultiplied_source_over(destination: &mut u32, color: u32, alpha: u8) {
     }
     let alpha = u32::from(alpha);
     let inverse = 255 - alpha;
-    let destination_alpha = *destination >> 24;
+    let dst = *destination;
+    let destination_alpha = dst >> 24;
     let source_r = ((color >> 16) & 0xff) * alpha / 255;
     let source_g = ((color >> 8) & 0xff) * alpha / 255;
     let source_b = (color & 0xff) * alpha / 255;
-    let out_r = source_r + (((*destination >> 16) & 0xff) * inverse + 127) / 255;
-    let out_g = source_g + (((*destination >> 8) & 0xff) * inverse + 127) / 255;
-    let out_b = source_b + ((*destination & 0xff) * inverse + 127) / 255;
-    let out_alpha = alpha + (destination_alpha * inverse + 127) / 255;
+    let out_r = source_r + div255_round(((dst >> 16) & 0xff) * inverse);
+    let out_g = source_g + div255_round(((dst >> 8) & 0xff) * inverse);
+    let out_b = source_b + div255_round((dst & 0xff) * inverse);
+    let out_alpha = alpha + div255_round(destination_alpha * inverse);
     *destination = (out_alpha.min(255) << 24)
         | (out_r.min(255) << 16)
         | (out_g.min(255) << 8)
@@ -730,15 +780,13 @@ struct CornerRow {
 
 static CORNER_CACHE: OnceLock<Vec<Vec<CornerRow>>> = OnceLock::new();
 
-fn corner_profile(radius: usize) -> &'static [CornerRow] {
+fn corner_profile(radius: usize) -> Cow<'static, [CornerRow]> {
     let cache =
         CORNER_CACHE.get_or_init(|| (0..=MAX_CACHED_RADIUS).map(build_corner_rows).collect());
     if let Some(profile) = cache.get(radius) {
-        profile.as_slice()
+        Cow::Borrowed(profile.as_slice())
     } else {
-        // Cold path for unusually large radii — rebuild on every call.
-        // No callers in the current renderer hit this branch.
-        Box::leak(build_corner_rows(radius).into_boxed_slice())
+        Cow::Owned(build_corner_rows(radius))
     }
 }
 
@@ -768,6 +816,13 @@ fn build_corner_rows(radius: usize) -> Vec<CornerRow> {
         .collect()
 }
 
+/// Exact `(value + 127) / 255` for `value in 0..=65025` without hardware division.
+#[inline]
+pub(crate) fn div255_round(value: u32) -> u32 {
+    let t = value + 128;
+    (t + (t >> 8)) >> 8
+}
+
 fn blend_pixel(dst: &mut u32, src: u32, alpha: u8) {
     if alpha == 0 {
         return;
@@ -777,17 +832,19 @@ fn blend_pixel(dst: &mut u32, src: u32, alpha: u8) {
         return;
     }
 
-    let inv = 255_u32.saturating_sub(alpha as u32);
+    let alpha = u32::from(alpha);
+    let inv = 255 - alpha;
     let src_r = (src >> 16) & 0xff;
     let src_g = (src >> 8) & 0xff;
     let src_b = src & 0xff;
-    let dst_r = (*dst >> 16) & 0xff;
-    let dst_g = (*dst >> 8) & 0xff;
-    let dst_b = *dst & 0xff;
+    let dst_v = *dst;
+    let dst_r = (dst_v >> 16) & 0xff;
+    let dst_g = (dst_v >> 8) & 0xff;
+    let dst_b = dst_v & 0xff;
 
-    let out_r = (src_r * alpha as u32 + dst_r * inv + 127) / 255;
-    let out_g = (src_g * alpha as u32 + dst_g * inv + 127) / 255;
-    let out_b = (src_b * alpha as u32 + dst_b * inv + 127) / 255;
+    let out_r = div255_round(src_r * alpha + dst_r * inv);
+    let out_g = div255_round(src_g * alpha + dst_g * inv);
+    let out_b = div255_round(src_b * alpha + dst_b * inv);
     *dst = (out_r << 16) | (out_g << 8) | out_b;
 }
 
@@ -910,5 +967,68 @@ mod tests {
         let unscaled_h = src_max_y - src_min_y + 1;
         assert!(max_x - min_x + 1 >= unscaled_w * 3 / 2);
         assert!(max_y - min_y + 1 >= unscaled_h * 3 / 2);
+    }
+
+    #[test]
+    fn div255_round_matches_exact_rounding_over_full_u8_product_range() {
+        for value in 0..=255_u32 * 255 {
+            assert_eq!(div255_round(value), (value + 127) / 255, "value={value}");
+        }
+    }
+
+    #[test]
+    fn draw_surface_premultiplied_handles_transparent_opaque_and_clipped_pixels() {
+        let mut dst = vec![0x0020_4060_u32; 4 * 4];
+        let src = [
+            0x0000_0000_u32,
+            0xff12_3456_u32,
+            0x8040_2010_u32,
+            0xffaa_bbcc_u32,
+        ];
+        {
+            let mut canvas = SurfaceCanvas::with_clip(
+                &mut dst,
+                4,
+                4,
+                4,
+                Rect {
+                    x: 1,
+                    y: 1,
+                    width: 2,
+                    height: 2,
+                },
+            );
+            canvas.draw_surface_premultiplied(&src, 2, 2, 2, 1, 1);
+            // Empty clip / zero-size rect is a safe no-op.
+            canvas.draw_surface_premultiplied(&src, 2, 2, 2, 10, 10);
+        }
+        assert_eq!(dst[5], 0x0020_4060);
+        assert_eq!(dst[6], 0x0012_3456);
+        assert_eq!(dst[2 * 4 + 2], 0x00aa_bbcc);
+        let blended = dst[9];
+        let inv = 255 - 0x80_u32;
+        let expected_r = (0x40 + (0x20 * inv + 127) / 255).min(255);
+        let expected_g = (0x20 + (0x40 * inv + 127) / 255).min(255);
+        let expected_b = (0x10 + (0x60 * inv + 127) / 255).min(255);
+        assert_eq!(blended, (expected_r << 16) | (expected_g << 8) | expected_b);
+    }
+
+    #[test]
+    fn large_radius_rounded_rect_uses_unleaked_profile() {
+        let mut pixels = vec![0_u32; 96 * 96];
+        let mut canvas = SurfaceCanvas::new(&mut pixels, 96, 96, 96);
+        canvas.fill_rounded_rect_alpha(
+            Rect {
+                x: 4,
+                y: 4,
+                width: 88,
+                height: 88,
+            },
+            0x00ff_ffff,
+            200,
+            40,
+        );
+        assert_eq!(pixels[4 * 96 + 4], 0);
+        assert_ne!(pixels[48 * 96 + 48], 0);
     }
 }

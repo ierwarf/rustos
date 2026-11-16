@@ -53,13 +53,13 @@ pub(super) fn write_response(
     stream.write_all(as_bytes(&response)).map_err(io_errno)
 }
 
-pub(super) fn request_path(request: &RuntimeRequest) -> Result<String, i32> {
+pub(super) fn request_path(request: &RuntimeRequest) -> Result<&str, i32> {
     let len = usize::try_from(request.text_len).map_err(|_| libc::EINVAL)?;
     if len > request.text.len() {
         return Err(libc::EINVAL);
     }
-    let path = String::from_utf8(request.text[..len].to_vec()).map_err(|_| libc::EINVAL)?;
-    if !valid_request_text(path.as_str()) {
+    let path = std::str::from_utf8(&request.text[..len]).map_err(|_| libc::EINVAL)?;
+    if !valid_request_text(path) {
         return Err(libc::EINVAL);
     }
     Ok(path)

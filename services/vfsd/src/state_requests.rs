@@ -49,14 +49,15 @@ impl VfsState {
         }
         match request.header.op {
             COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH => {
-                {
+                let (mount_generation, mounted) = {
                     let storage = lock_vfs_storage();
-                    response.value0 = storage.mount_generation;
-                    response.value1 = u64::from(storage.volume.is_some());
-                }
+                    (storage.mount_generation, u64::from(storage.volume.is_some()))
+                };
+                response.value0 = mount_generation;
+                response.value1 = mounted;
                 response.descriptor_count = 1;
                 response.descriptors[0] =
-                    vfs_descriptor("mount-graph", request.header.op, lock_vfs_storage().mount_generation, 0);
+                    vfs_descriptor("mount-graph", request.header.op, mount_generation, 0);
             }
             COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE => {
                 let path = commercial_request_path(request);
@@ -103,15 +104,6 @@ impl VfsState {
                 fill_handle_descriptors(self, &mut response, RemoteKind::File);
             }
             COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY => {
-                {
-                    let storage = lock_vfs_storage();
-                    response.value0 = storage.metadata_cache.len() as u64;
-                    response.value1 = storage.dir_entries_cache.len() as u64;
-                }
-                response.capability = vfs_capability("metadata-policy", request.header.op);
-                response.descriptor_count = 1;
-                // One acquisition: two live guards in one argument list would
-                // deadlock, because the storage owner is not re-entrant.
                 let (metadata_entries, dir_entries) = {
                     let storage = lock_vfs_storage();
                     (
@@ -119,6 +111,10 @@ impl VfsState {
                         storage.dir_entries_cache.len() as u64,
                     )
                 };
+                response.value0 = metadata_entries;
+                response.value1 = dir_entries;
+                response.capability = vfs_capability("metadata-policy", request.header.op);
+                response.descriptor_count = 1;
                 response.descriptors[0] = vfs_descriptor(
                     "metadata-policy",
                     request.header.op,
@@ -214,8 +210,7 @@ impl VfsState {
                 if self.checkpoint_operation_replayed(request, key) {
                     return;
                 }
-                let mut candidate = self.epolls.clone();
-                if let Err(err) = candidate.create(request.remote_id) {
+                if let Err(err) = self.epolls.check_create(request.remote_id) {
                     response.status = waitset_registry_status(err);
                     return;
                 }
@@ -224,7 +219,9 @@ impl VfsState {
                     response.status = errno;
                     return;
                 }
-                self.epolls = candidate;
+                self.epolls
+                    .create(request.remote_id)
+                    .expect("validated epoll create");
                 mutated = true;
                 mutated_epolls.push(request.remote_id);
             }
@@ -242,8 +239,7 @@ impl VfsState {
                 if self.checkpoint_operation_replayed(request, key) {
                     return;
                 }
-                let mut candidate = self.epolls.clone();
-                if let Err(err) = candidate.retire(request.remote_id) {
+                if let Err(err) = self.epolls.check_retire(request.remote_id) {
                     response.status = waitset_registry_status(err);
                     return;
                 }
@@ -252,7 +248,9 @@ impl VfsState {
                     response.status = errno;
                     return;
                 }
-                self.epolls = candidate;
+                self.epolls
+                    .retire(request.remote_id)
+                    .expect("validated epoll retire");
                 mutated = true;
                 mutated_epolls.push(request.remote_id);
             }
@@ -342,17 +340,16 @@ impl VfsState {
         if self.checkpoint_operation_replayed(request, checkpoint_key) {
             return;
         }
-        let mut candidate = self.epolls.clone();
-        let result = match request.arg1 {
-            linux_abi::EPOLL_CTL_ADD => candidate.add(request.remote_id, interest),
-            linux_abi::EPOLL_CTL_MOD => candidate.modify(request.remote_id, interest),
-            linux_abi::EPOLL_CTL_DEL => candidate.delete(request.remote_id, interest.key),
+        let check = match request.arg1 {
+            linux_abi::EPOLL_CTL_ADD => self.epolls.check_add(request.remote_id, interest),
+            linux_abi::EPOLL_CTL_MOD => self.epolls.check_modify(request.remote_id, interest),
+            linux_abi::EPOLL_CTL_DEL => self.epolls.check_delete(request.remote_id, interest.key),
             _ => {
                 response.status = EINVAL;
                 return;
             }
         };
-        if let Err(err) = result {
+        if let Err(err) = check {
             response.status = waitset_registry_status(err);
             return;
         }
@@ -360,59 +357,71 @@ impl VfsState {
             response.status = errno;
             return;
         }
-        self.epolls = candidate;
+        let result = match request.arg1 {
+            linux_abi::EPOLL_CTL_ADD => self.epolls.add(request.remote_id, interest),
+            linux_abi::EPOLL_CTL_MOD => self.epolls.modify(request.remote_id, interest),
+            linux_abi::EPOLL_CTL_DEL => self.epolls.delete(request.remote_id, interest.key),
+            _ => unreachable!(),
+        };
+        result.expect("validated epoll_ctl mutation");
     }
 
     fn vfs_epoll_snapshot(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let maxevents = request.arg1 as usize;
+        let Ok(maxevents) = usize::try_from(request.arg1) else {
+            response.status = EINVAL;
+            return;
+        };
         let wire_size = size_of::<WaitSetSnapshotWire>();
         let capacity = response.payload.len() / wire_size;
         if maxevents == 0 || maxevents > WAITSET_MAX_INTERESTS || maxevents > capacity {
             response.status = EINVAL;
             return;
         }
-        let interests = match self.epolls.snapshot_entries(request.remote_id, maxevents) {
-            Ok(interests) => interests,
+        let count = match self.epolls.visit_snapshot_entries(
+            request.remote_id,
+            maxevents,
+            |written, interest, report| {
+                let wire = WaitSetSnapshotWire {
+                    interest: WaitSetInterestWire {
+                        abi_version: WAITSET_ABI_VERSION,
+                        provider: interest.key.provider,
+                        flags: 0,
+                        target_fd: interest.key.target_fd,
+                        object_id: interest.key.object_id,
+                        provider_epoch: interest.provider_epoch,
+                        events: interest.events,
+                        reserved0: 0,
+                        data: interest.data,
+                    },
+                    edge_generation: report.edge_generation,
+                    state: if report.disabled {
+                        WAITSET_SNAPSHOT_STATE_DISABLED
+                    } else {
+                        0
+                    },
+                    reserved0: 0,
+                };
+                // SAFETY: `WaitSetSnapshotWire` is a `repr(C)` plain-data wire
+                // struct that outlives this view, which spans exactly its own bytes.
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        (&wire as *const WaitSetSnapshotWire).cast::<u8>(),
+                        wire_size,
+                    )
+                };
+                let offset = written * wire_size;
+                response.payload[offset..offset + wire_size].copy_from_slice(bytes);
+            },
+        ) {
+            Ok(count) => count,
             Err(err) => {
                 response.status = waitset_registry_status(err);
                 return;
             }
         };
-        for (written, (interest, report)) in interests.iter().enumerate() {
-            let wire = WaitSetSnapshotWire {
-                interest: WaitSetInterestWire {
-                    abi_version: WAITSET_ABI_VERSION,
-                    provider: interest.key.provider,
-                    flags: 0,
-                    target_fd: interest.key.target_fd,
-                    object_id: interest.key.object_id,
-                    provider_epoch: interest.provider_epoch,
-                    events: interest.events,
-                    reserved0: 0,
-                    data: interest.data,
-                },
-                edge_generation: report.edge_generation,
-                state: if report.disabled {
-                    WAITSET_SNAPSHOT_STATE_DISABLED
-                } else {
-                    0
-                },
-                reserved0: 0,
-            };
-            // SAFETY: `WaitSetSnapshotWire` is a `repr(C)` plain-data wire
-            // struct that outlives this view, which spans exactly its own bytes.
-            let bytes = unsafe {
-                core::slice::from_raw_parts(
-                    (&wire as *const WaitSetSnapshotWire).cast::<u8>(),
-                    wire_size,
-                )
-            };
-            let offset = written * wire_size;
-            response.payload[offset..offset + wire_size].copy_from_slice(bytes);
-        }
-        response.value = interests.len() as u64;
+        response.value = count as u64;
         response.aux = self.readiness_generation;
-        response.payload_len = (interests.len() * wire_size) as u32;
+        response.payload_len = (count * wire_size) as u32;
     }
 
     /// Atomically consume edge-triggered / one-shot reports. The reply is one
@@ -430,25 +439,20 @@ impl VfsState {
             response.status = EINVAL;
             return;
         }
-        let mut claims = Vec::with_capacity(count);
-        for index in 0..count {
-            // SAFETY: `index * CLAIM_SIZE + CLAIM_SIZE <= len <= payload.len()`
-            // and `read_unaligned` tolerates the byte array's alignment.
-            let wire = unsafe {
-                core::ptr::read_unaligned(
-                    request.payload[index * CLAIM_SIZE..]
-                        .as_ptr()
-                        .cast::<WaitSetClaimWire>(),
-                )
-            };
+        let raw_claims = &request.payload[..len];
+        for chunk in raw_claims.chunks_exact(CLAIM_SIZE) {
+            // SAFETY: `chunk.len() == CLAIM_SIZE` and `read_unaligned` tolerates
+            // the byte slice's alignment.
+            let wire = unsafe { core::ptr::read_unaligned(chunk.as_ptr().cast::<WaitSetClaimWire>()) };
             if !waitset_claim_shape_valid(&wire) {
                 response.status = EINVAL;
                 return;
             }
-            claims.push(wire);
         }
         let mut accepted = 0_u64;
-        for (index, wire) in claims.iter().enumerate() {
+        for (index, chunk) in raw_claims.chunks_exact(CLAIM_SIZE).enumerate() {
+            // SAFETY: validated above; `chunk.len() == CLAIM_SIZE`.
+            let wire = unsafe { core::ptr::read_unaligned(chunk.as_ptr().cast::<WaitSetClaimWire>()) };
             let key = WaitSetInterestKey {
                 target_fd: wire.target_fd,
                 provider: wire.provider,

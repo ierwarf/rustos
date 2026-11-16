@@ -14,6 +14,7 @@
 //!   matching release, periodic scan as readiness, or whole-compositor failure.
 //! - **Evidence:** `wayland-client-ingress`, `ui-main-loop-wakeup`, and
 //!   `gpu-frame-lifecycle`.
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io::ErrorKind;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -91,7 +92,7 @@ const MAX_WAYLAND_SHM_POOL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WAYLAND_BUFFER_DIMENSION: usize = 8192;
 const MAX_WAYLAND_BUFFER_PIXELS: usize = MAX_WAYLAND_SHM_POOL_BYTES / 4;
 const MAX_WAYLAND_CLIENT_ACCEPTS_PER_TICK: usize = 8;
-const MAX_WAYLAND_CLIENT_DISPATCHES_PER_TICK: usize = 1;
+const MAX_WAYLAND_CLIENT_DISPATCHES_PER_TICK: usize = 8;
 const MAX_WAYLAND_SURFACES: usize = 64;
 /// One client may not consume the whole compositor-wide surface table.
 const MAX_WAYLAND_SURFACES_PER_CLIENT: usize = 16;
@@ -219,7 +220,7 @@ impl Eq for WaylandWindowSnapshot {}
 pub(crate) struct WaylandCompositor {
     display: Display<WaylandState>,
     acceptor: WaylandAcceptor,
-    clients: Vec<ClientId>,
+    clients: VecDeque<ClientId>,
     state: WaylandState,
     readiness: Option<WaylandReadiness>,
 }
@@ -285,7 +286,7 @@ impl WaylandCompositor {
         Some(Self {
             display,
             acceptor,
-            clients: Vec::new(),
+            clients: VecDeque::new(),
             state,
             readiness: None,
         })
@@ -421,7 +422,7 @@ impl WaylandCompositor {
                         .insert_client(stream, Arc::new(WaylandClientState::default()))
                     {
                         Ok(client) => {
-                            self.clients.push(client.id());
+                            self.clients.push_back(client.id());
                             diag_line("uiserver: wayland client accepted");
                             crate::sys::debug_line("uiserver: wayland client accepted");
                             self.state.dirty = true;
@@ -442,20 +443,16 @@ impl WaylandCompositor {
 
         let dispatch_started = Instant::now();
         crate::note_wayland_step(crate::WAYLAND_STEP_DISPATCH);
-        let clients = core::mem::take(&mut self.clients);
-        let mut deferred_clients = Vec::new();
-        let mut dispatch_clients = Vec::new();
-        for client_id in clients {
-            if dispatch_clients.len() < MAX_WAYLAND_CLIENT_DISPATCHES_PER_TICK {
-                dispatch_clients.push(client_id);
-            } else {
-                deferred_clients.push(client_id);
-            }
-        }
-        self.clients = deferred_clients;
-
         let mut dispatched_requests = 0_usize;
-        for client_id in dispatch_clients {
+        let mut active_dispatches = 0_usize;
+        let client_count = self.clients.len();
+        for _ in 0..client_count {
+            if active_dispatches >= MAX_WAYLAND_CLIENT_DISPATCHES_PER_TICK {
+                break;
+            }
+            let Some(client_id) = self.clients.pop_front() else {
+                break;
+            };
             match self
                 .display
                 .backend()
@@ -463,7 +460,10 @@ impl WaylandCompositor {
             {
                 Ok(dispatched) => {
                     dispatched_requests = dispatched_requests.saturating_add(dispatched);
-                    self.clients.push(client_id);
+                    if dispatched > 0 {
+                        active_dispatches = active_dispatches.saturating_add(1);
+                    }
+                    self.clients.push_back(client_id);
                     if ui_profile_enabled()
                         && dispatched > 0
                         && WAYLAND_DISPATCH_LOG_COUNT.fetch_add(1, Ordering::Relaxed)
@@ -474,9 +474,10 @@ impl WaylandCompositor {
                     }
                 }
                 Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                    self.clients.push(client_id);
+                    self.clients.push_back(client_id);
                 }
                 Err(err) => {
+                    self.state.cleanup_disconnected_client(&client_id);
                     if WAYLAND_DISPATCH_LOG_COUNT.fetch_add(1, Ordering::Relaxed)
                         < MAX_WAYLAND_DISPATCH_LOGS
                     {
@@ -560,6 +561,12 @@ impl WaylandCompositor {
 
     /// UI policy resolves console occlusion and chrome before Wayland routing.
     pub(crate) fn set_pointer_target(&mut self, surface_id: Option<u32>) {
+        if surface_id.is_none()
+            && self.state.pointer_target.is_none()
+            && self.state.pointer_focus.is_none()
+        {
+            return;
+        }
         self.state.pointer_target = surface_id;
         if !self.state.pointer_button_down {
             let hit = self
@@ -582,6 +589,9 @@ impl WaylandCompositor {
     }
 
     pub(crate) fn set_keyboard_target(&mut self, surface_id: Option<u32>) {
+        if surface_id.is_none() && self.state.keyboard_focus.is_none() {
+            return;
+        }
         let focus = surface_id.and_then(|id| {
             let shared = self.state.find_surface_by_id(id)?;
             let surface = shared.lock().ok()?;
@@ -641,8 +651,11 @@ fn copy_wayland_bgra_row(src: &[u8], dst: &mut [u32], has_alpha: bool) -> bool {
         return false;
     }
     if has_alpha {
-        for (target, bytes) in dst.iter_mut().zip(src.chunks_exact(4)) {
-            *target = u32::from_le_bytes(bytes.try_into().expect("four-byte pixel"));
+        // SAFETY: `src.len() == dst.len() * 4` is checked above; `src` and `dst`
+        // are non-overlapping slices and every bit pattern of `u32` is valid on
+        // little-endian RustOS.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<u8>(), src.len());
         }
         return true;
     }

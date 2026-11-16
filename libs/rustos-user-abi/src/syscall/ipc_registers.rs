@@ -22,6 +22,7 @@ pub const SYS_RUSTOS_IPC_REGISTER_REPLY_RECV: u64 = 0x5255_0054;
 pub const SYS_RUSTOS_IPC_REGISTER_REPLY: u64 = 0x5255_0055;
 pub const IPC_REGISTER_BYTES: usize = 16;
 
+#[inline]
 pub const fn ipc_register_shape_valid(
     operation: u64,
     len: u64,
@@ -55,9 +56,16 @@ pub const fn ipc_register_shape_valid(
     }
 }
 
+#[inline]
 pub fn ipc_register_pack(bytes: &[u8]) -> Option<[u64; 2]> {
     if bytes.len() > IPC_REGISTER_BYTES {
         return None;
+    }
+    if bytes.len() == IPC_REGISTER_BYTES {
+        return Some([
+            u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        ]);
     }
     let mut padded = [0; IPC_REGISTER_BYTES];
     padded[..bytes.len()].copy_from_slice(bytes);
@@ -67,6 +75,7 @@ pub fn ipc_register_pack(bytes: &[u8]) -> Option<[u64; 2]> {
     ])
 }
 
+#[inline]
 pub fn ipc_register_unpack(words: [u64; 2]) -> [u8; IPC_REGISTER_BYTES] {
     let mut bytes = [0; IPC_REGISTER_BYTES];
     bytes[..8].copy_from_slice(&words[0].to_le_bytes());

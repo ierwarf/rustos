@@ -2930,12 +2930,18 @@ impl InputRingSink {
             .checked_add(DVM_INPUT_RING_RECORD_BYTES)
             .filter(|end| *end <= self.mapped_len)
             .ok_or_else(|| anyhow!("input-ring record is outside launch-owned aperture"))?;
-        for (index, byte) in frame.as_bytes().iter().enumerate() {
-            // SAFETY: `offset + index < end <= mapped_len` was checked above, so the byte is inside
-            // the launch-owned mapping. This slot is below the credit limit, hence not yet
-            // visible to the consumer, and `&mut self` is the only producer; control words
-            // are never written through this non-atomic path.
-            unsafe { self.mapped.add(offset + index).write_volatile(*byte) };
+        let frame_bytes = frame.as_bytes();
+        // `offset` is 32-byte aligned (4096 + slot * 32) and `connect` verified
+        // 8-byte alignment of `self.mapped`, so four aligned u64 volatile stores
+        // write the 32-byte frame without 32 byte-by-byte volatile accesses.
+        let slot_words = unsafe { self.mapped.add(offset).cast::<u64>() };
+        for (word_index, chunk) in frame_bytes.chunks_exact(8).enumerate() {
+            let word = u64::from_ne_bytes(chunk.try_into().expect("8-byte chunk"));
+            // SAFETY: `offset + word_index * 8 < end <= mapped_len` was checked above,
+            // `slot_words.add(word_index)` is 8-byte aligned, this slot is below the
+            // credit limit (not yet visible to the consumer), and `&mut self` is the
+            // only producer.
+            unsafe { slot_words.add(word_index).write_volatile(word) };
         }
         debug_assert_eq!(end - offset, RUSTOS_INPUT_FRAME_BYTES);
         let next = header

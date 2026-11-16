@@ -59,6 +59,8 @@ struct Held {
 
 pub struct Custody {
     held: [Option<Held>; LIBRARY_OBJECT_MAX_OBJECTS],
+    count: usize,
+    total_pages: u64,
 }
 
 impl Default for Custody {
@@ -69,7 +71,11 @@ impl Default for Custody {
 
 impl Custody {
     pub const fn new() -> Self {
-        Self { held: [None; LIBRARY_OBJECT_MAX_OBJECTS] }
+        Self {
+            held: [None; LIBRARY_OBJECT_MAX_OBJECTS],
+            count: 0,
+            total_pages: 0,
+        }
     }
 
     /// Starts tracking a sealed object. False when the table is full or the
@@ -82,6 +88,8 @@ impl Custody {
         match self.held.iter_mut().find(|slot| slot.is_none()) {
             Some(slot) => {
                 *slot = Some(Held { object, pages, rank });
+                self.count += 1;
+                self.total_pages += u64::from(pages);
                 true
             }
             None => false,
@@ -90,8 +98,13 @@ impl Custody {
 
     pub fn forget(&mut self, object: u64) {
         for slot in &mut self.held {
-            if slot.is_some_and(|held| held.object == object) {
-                *slot = None;
+            if let Some(held) = *slot {
+                if held.object == object {
+                    *slot = None;
+                    self.count -= 1;
+                    self.total_pages -= u64::from(held.pages);
+                    break;
+                }
             }
         }
     }
@@ -104,12 +117,12 @@ impl Custody {
             .map_or(0, |held| u64::from(held.pages))
     }
 
-    pub fn objects(&self) -> usize {
-        self.held.iter().flatten().count()
+    pub const fn objects(&self) -> usize {
+        self.count
     }
 
-    pub fn pages(&self) -> u64 {
-        self.held.iter().flatten().map(|held| u64::from(held.pages)).sum()
+    pub const fn pages(&self) -> u64 {
+        self.total_pages
     }
 
     /// Picks objects to retire for `shortfall` pages, coldest first (largest
@@ -119,29 +132,33 @@ impl Custody {
     /// reaches `shortfall`, but retires everything when the whole cache is
     /// smaller than the shortfall.
     pub fn plan(&self, shortfall: u64, out: &mut [u64]) -> (usize, u64) {
-        if shortfall == 0 {
+        if shortfall == 0 || out.is_empty() || self.count == 0 {
             return (0, 0);
         }
+        let mut active = [0_usize; LIBRARY_OBJECT_MAX_OBJECTS];
+        let mut n = 0;
+        for (index, slot) in self.held.iter().enumerate() {
+            if slot.is_some() {
+                active[n] = index;
+                n += 1;
+            }
+        }
+        active[..n].sort_unstable_by(|&ia, &ib| {
+            let a = self.held[ia].expect("active index");
+            let b = self.held[ib].expect("active index");
+            (b.rank, b.pages, core::cmp::Reverse(b.object))
+                .cmp(&(a.rank, a.pages, core::cmp::Reverse(a.object)))
+        });
         let mut chosen = 0;
         let mut covered = 0_u64;
-        let mut taken = [false; LIBRARY_OBJECT_MAX_OBJECTS];
-        while covered < shortfall && chosen < out.len() {
-            let next = self
-                .held
-                .iter()
-                .enumerate()
-                .filter(|(index, held)| held.is_some() && !taken[*index])
-                .max_by_key(|(_, held)| {
-                    let held = held.expect("filtered to Some");
-                    (held.rank, held.pages, core::cmp::Reverse(held.object))
-                })
-                .map(|(index, _)| index);
-            let Some(index) = next else { break };
-            taken[index] = true;
-            let held = self.held[index].expect("selected a held slot");
+        for &index in &active[..n] {
+            if covered >= shortfall || chosen >= out.len() {
+                break;
+            }
+            let held = self.held[index].expect("active index");
             out[chosen] = held.object;
             chosen += 1;
-            covered += u64::from(held.pages);
+            covered = covered.saturating_add(u64::from(held.pages));
         }
         (chosen, covered)
     }
@@ -183,6 +200,9 @@ pub fn reclaim_with_pressure<H: ReclaimHost>(
         return None;
     }
     let shortfall = pressure.shortfall();
+    if shortfall == 0 {
+        return None;
+    }
     let mut victims = [0_u64; LIBRARY_OBJECT_MAX_OBJECTS];
     let (count, _) = custody.plan(shortfall, &mut victims);
     let mut done = Reclaimed { free_pages: pressure.free_pages, ..Reclaimed::default() };

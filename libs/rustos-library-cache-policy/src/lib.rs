@@ -210,11 +210,11 @@ impl<'a> Plan<'a> {
             if entry.bytes == 0 || entry.bytes > policy.max_file_bytes {
                 return Err(Error::Entry);
             }
-            if seen_paths[..count as usize].contains(&entry.path) {
+            let Err(insert_at) = seen_paths[..count as usize].binary_search(&entry.path) else {
                 return Err(Error::Duplicate);
-            }
-            count = count.checked_add(1).ok_or(Error::Budget)?;
-            if count > policy.max_entries {
+            };
+            let next_count = count.checked_add(1).ok_or(Error::Budget)?;
+            if next_count > policy.max_entries {
                 return Err(Error::Budget);
             }
             total = total
@@ -223,7 +223,9 @@ impl<'a> Plan<'a> {
             if total > policy.budget_bytes {
                 return Err(Error::Budget);
             }
-            seen_paths[(count - 1) as usize] = entry.path;
+            seen_paths.copy_within(insert_at..count as usize, insert_at + 1);
+            seen_paths[insert_at] = entry.path;
+            count = next_count;
         }
         Ok(Self {
             policy,

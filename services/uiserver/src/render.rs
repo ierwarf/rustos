@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use crate::app::{AppState, ConsoleWindow, CursorMotion, DesktopSurfaceCache, WindowId};
 use crate::canvas::{
-    render_cursor_bgra, Rect, SurfaceCanvas, CURSOR_TEXTURE_SIZE, CURSOR_VISUAL_RADIUS,
+    div255_round, render_cursor_bgra, Rect, SurfaceCanvas, CURSOR_TEXTURE_SIZE,
+    CURSOR_VISUAL_RADIUS,
 };
 use crate::gpu_scene::{
     GpuAtlasPacker, GpuLayerKind, GpuLayerTransform, GpuSceneError, GpuSceneLayer,
@@ -329,8 +330,9 @@ fn build_full_gpu_atlas_scene(
     {
         return Err(GpuSceneError::CommandLimit);
     }
+    let mut scratch = Vec::with_capacity(1);
     for (plan_index, planned) in plan.iter().enumerate().rev() {
-        let mut scratch = Vec::with_capacity(1);
+        scratch.clear();
         let source_rect = match *planned {
             PlannedWindow::Wayland { index, focused } => push_wayland_gpu_layer(
                 &mut packer,
@@ -499,25 +501,12 @@ pub(crate) fn update_gpu_layer_destinations(
     console_bindings: &[ConsoleAtlasBinding],
 ) -> bool {
     let focused_wayland = state.focused_wayland_surface_id;
-    let mut wayland_windows = state
-        .wayland_windows
-        .iter()
-        .filter(|window| !window.minimized && Some(window.surface_id) != focused_wayland)
-        .collect::<Vec<_>>();
-    if let Some(surface_id) = focused_wayland {
-        if let Some(window) = state
-            .wayland_windows
-            .iter()
-            .find(|window| !window.minimized && window.surface_id == surface_id)
-        {
-            wayland_windows.push(window);
-        }
-    }
     // Bindings authenticate the exact retained uncropped texture commands.
     for binding in wayland_bindings {
-        let Some(window) = wayland_windows
+        let Some(window) = state
+            .wayland_windows
             .iter()
-            .find(|window| window.surface_id == binding.surface_id)
+            .find(|window| !window.minimized && window.surface_id == binding.surface_id)
         else {
             return false;
         };
@@ -593,24 +582,11 @@ pub(crate) fn update_wayland_gpu_textures(
     bindings: &mut [WaylandAtlasBinding],
 ) -> Result<Option<Vec<Rect>>, GpuSceneError> {
     let focused = state.focused_wayland_surface_id;
-    let mut windows = state
-        .wayland_windows
-        .iter()
-        .filter(|window| !window.minimized && Some(window.surface_id) != focused)
-        .collect::<Vec<_>>();
-    if let Some(surface_id) = focused {
-        if let Some(window) = state
+    if bindings.iter().any(|binding| {
+        state
             .wayland_windows
             .iter()
-            .find(|window| !window.minimized && window.surface_id == surface_id)
-        {
-            windows.push(window);
-        }
-    }
-    if bindings.iter().any(|binding| {
-        windows
-            .iter()
-            .find(|window| window.surface_id == binding.surface_id)
+            .find(|window| !window.minimized && window.surface_id == binding.surface_id)
             .is_none_or(|window| {
                 let outer = wayland_window_outer_rect(window);
                 (Some(window.surface_id) == focused) != binding.focused
@@ -623,9 +599,10 @@ pub(crate) fn update_wayland_gpu_textures(
 
     let mut damage = Vec::new();
     for binding in bindings.iter_mut() {
-        let Some(window) = windows
+        let Some(window) = state
+            .wayland_windows
             .iter()
-            .find(|window| window.surface_id == binding.surface_id)
+            .find(|window| !window.minimized && window.surface_id == binding.surface_id)
         else {
             return Ok(None);
         };
@@ -1285,31 +1262,23 @@ fn composite_wayland_client(
         let destination = destination
             .get_mut(destination_start..destination_end)
             .ok_or(GpuSceneError::InvalidLayer)?;
-        for (destination, source) in destination.iter_mut().zip(source) {
-            let alpha = *source >> 24;
+        for (destination, &source) in destination.iter_mut().zip(source) {
+            if source == 0 {
+                continue;
+            }
+            let alpha = source >> 24;
             if alpha == 0xff {
                 // Opaque client pixels (the common case) replace the chrome
                 // pre-fill; the blend below reduces to the colour channels.
-                *destination = *source & 0x00ff_ffff;
+                *destination = source & 0x00ff_ffff;
                 continue;
             }
-            let inverse = 255_u32.saturating_sub(alpha);
-            let source_b = *source & 0xff;
-            let source_g = (*source >> 8) & 0xff;
-            let source_r = (*source >> 16) & 0xff;
-            let destination_b = *destination & 0xff;
-            let destination_g = (*destination >> 8) & 0xff;
-            let destination_r = (*destination >> 16) & 0xff;
-            let out_b = source_b
-                .saturating_add((destination_b * inverse + 127) / 255)
-                .min(255);
-            let out_g = source_g
-                .saturating_add((destination_g * inverse + 127) / 255)
-                .min(255);
-            let out_r = source_r
-                .saturating_add((destination_r * inverse + 127) / 255)
-                .min(255);
-            *destination = (out_r << 16) | (out_g << 8) | out_b;
+            let inverse = 255 - alpha;
+            let dst = *destination;
+            let out_b = (source & 0xff) + div255_round((dst & 0xff) * inverse);
+            let out_g = ((source >> 8) & 0xff) + div255_round(((dst >> 8) & 0xff) * inverse);
+            let out_r = ((source >> 16) & 0xff) + div255_round(((dst >> 16) & 0xff) * inverse);
+            *destination = (out_r.min(255) << 16) | (out_g.min(255) << 8) | out_b.min(255);
         }
     }
     Ok(())

@@ -83,7 +83,7 @@ impl VfsState {
         response: &mut VfsIpcResponse,
         offset: Option<u64>,
     ) {
-        let len = (request.arg1 as usize).min(VFS_IPC_PAYLOAD_CAPACITY);
+        let len = request.arg1.min(VFS_IPC_PAYLOAD_CAPACITY as u64) as usize;
         match self.read_remote_into(request, offset, len, &mut response.payload) {
             Ok(read) => {
                 response.payload_len = read as u32;
@@ -159,7 +159,10 @@ impl VfsState {
             response.status = EACCES;
             return;
         }
-        let wanted = request.arg1 as usize;
+        let Ok(wanted) = usize::try_from(request.arg1) else {
+            response.status = EINVAL;
+            return;
+        };
         let offset = request.arg0;
         if wanted > VFS_LIBRARY_READ_MAX_BYTES || offset % 4096 != 0 {
             response.status = EINVAL;
@@ -269,7 +272,7 @@ impl VfsState {
             response.status = EBADF;
             return;
         };
-        let requested = (request.arg1 as usize).min(response.payload.len());
+        let requested = request.arg1.min(response.payload.len() as u64) as usize;
         let replayed =
             self.checkpoint_operation_replayed(request, checkpoint_handle_key(request.remote_id));
         if cursor_mutation_prepared(&handle) && !replayed {

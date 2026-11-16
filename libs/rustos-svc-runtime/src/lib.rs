@@ -14,7 +14,6 @@ pub mod worker;
 pub mod syscall;
 
 use core::ptr;
-use core::slice;
 
 use rustos_user_abi::syscall::{AT_RUSTOS_BOOTSTRAP_HEAP_BASE, AT_RUSTOS_BOOTSTRAP_HEAP_LEN};
 
@@ -234,15 +233,35 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, len: usize) -> *
 
 #[no_mangle]
 pub unsafe extern "C" fn memcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i32 {
-    if lhs.is_null() || rhs.is_null() || len == 0 {
+    if lhs == rhs || len == 0 || lhs.is_null() || rhs.is_null() {
         return 0;
     }
-    let lhs = slice::from_raw_parts(lhs, len);
-    let rhs = slice::from_raw_parts(rhs, len);
-    for (left, right) in lhs.iter().zip(rhs.iter()) {
-        if left != right {
-            return (*left as i32) - (*right as i32);
+    let mut offset = 0;
+    while len - offset >= 8 {
+        let a = ptr::read_unaligned(lhs.add(offset).cast::<u64>());
+        let b = ptr::read_unaligned(rhs.add(offset).cast::<u64>());
+        if a != b {
+            #[cfg(target_endian = "little")]
+            {
+                let byte_idx = ((a ^ b).trailing_zeros() >> 3) as usize;
+                let la = *lhs.add(offset + byte_idx);
+                let rb = *rhs.add(offset + byte_idx);
+                return (la as i32) - (rb as i32);
+            }
+            #[cfg(target_endian = "big")]
+            {
+                break;
+            }
         }
+        offset += 8;
+    }
+    while offset < len {
+        let left = *lhs.add(offset);
+        let right = *rhs.add(offset);
+        if left != right {
+            return (left as i32) - (right as i32);
+        }
+        offset += 1;
     }
     0
 }
@@ -291,4 +310,27 @@ unsafe fn parse_initial_stack(stack_ptr: *const u64) -> BootstrapHeap {
         cursor = cursor.add(2);
     }
     bootstrap
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn memcmp_handles_unaligned_and_multiword_differences() {
+        let a = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+        let mut b = a;
+        assert_eq!(unsafe { super::memcmp(a.as_ptr(), b.as_ptr(), a.len()) }, 0);
+        assert_eq!(unsafe { super::memcmp(a.as_ptr(), b.as_ptr(), 0) }, 0);
+        for diff_idx in [0, 3, 7, 8, 12, 15, 16] {
+            b[diff_idx] = a[diff_idx] + 5;
+            assert!(unsafe { super::memcmp(a.as_ptr(), b.as_ptr(), a.len()) } < 0);
+            assert!(unsafe { super::memcmp(b.as_ptr(), a.as_ptr(), a.len()) } > 0);
+            // Unaligned offset +1
+            if diff_idx >= 1 {
+                assert!(
+                    unsafe { super::memcmp(a[1..].as_ptr(), b[1..].as_ptr(), a.len() - 1) } < 0
+                );
+            }
+            b[diff_idx] = a[diff_idx];
+        }
+    }
 }

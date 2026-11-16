@@ -119,9 +119,9 @@ use snapshot_worker::{
     reply_snapshot_status, continue_executable_snapshot,
 };
 use util::{
-    build_linux_stat, build_linux_statx, encode_dirent, fat_cache_key, handle_kind_u16, is_at_fdcwd,
-    linux_request_path, map_fat_error, normalize_absolute_path, path_inode, vfs_request_path,
-    write_payload_bytes, write_vfs_payload_bytes,
+    build_linux_stat, build_linux_statx, encode_dirent_into, fat_cache_key, fat_cache_key_cow,
+    handle_kind_u16, is_at_fdcwd, linux_request_path, map_fat_error, normalize_absolute_path,
+    path_inode, vfs_request_path, write_payload_bytes, write_vfs_payload_bytes,
 };
 
 // Linux errno constants (x86_64)

@@ -228,7 +228,9 @@ impl VisualUpdate {
     }
 
     pub(crate) fn clear(&mut self) {
-        *self = Self::default();
+        self.needs_full_redraw = false;
+        self.partial_rects.clear();
+        self.scene_dirty = false;
     }
 
     fn merge_partial_rect(&mut self, rect: canvas::Rect) {

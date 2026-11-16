@@ -158,21 +158,15 @@ pub(super) fn fill_glossy_tile(
         );
     }
 
+    let span = rect.height as u32 * 2;
     for py in 0..rect.height {
-        for px in 0..rect.width {
-            let near_edge = px <= radius
-                || px + radius + 1 >= rect.width
-                || py <= radius
-                || py + radius + 1 >= rect.height;
-            if !near_edge {
-                continue;
-            }
+        let corner_row = py <= radius || py + radius + 1 >= rect.height;
+        let mut paint_edge_pixel = |px: usize| {
             let (outer, inner) = edge_coverage(px, py, rect.width, rect.height, radius);
             let ring = outer.saturating_sub(inner);
             if ring == 0 {
-                continue;
+                return;
             }
-            let span = rect.height as u32 * 2;
             let edge = 130 * span.saturating_sub(py as u32) / span * ring / 255;
             canvas.fill_rect_alpha(
                 Rect {
@@ -184,6 +178,20 @@ pub(super) fn fill_glossy_tile(
                 COLOR_PANEL_HIGHLIGHT,
                 scale(edge),
             );
+        };
+        if corner_row {
+            for px in 0..rect.width {
+                paint_edge_pixel(px);
+            }
+        } else {
+            let left_end = (radius + 1).min(rect.width);
+            for px in 0..left_end {
+                paint_edge_pixel(px);
+            }
+            let right_start = rect.width.saturating_sub(radius + 1).max(left_end);
+            for px in right_start..rect.width {
+                paint_edge_pixel(px);
+            }
         }
     }
 }
@@ -247,11 +255,24 @@ pub(super) fn apply_window_alpha(
             } else {
                 255
             };
+            if coverage == 0 {
+                *pixel = 0;
+                continue;
+            }
             let mut alpha = row_alpha;
             if y < title_height && spec.solid.iter().any(|rect| contains(rect, x, y)) {
                 alpha = alpha.max(u32::from(spec.solid_alpha));
             }
-            *pixel = premultiply(*pixel & 0x00ff_ffff, alpha * coverage / 255);
+            let final_alpha = if coverage == 255 {
+                alpha
+            } else {
+                div255_floor(alpha * coverage)
+            };
+            if final_alpha == 255 {
+                *pixel = 0xff00_0000 | (*pixel & 0x00ff_ffff);
+            } else {
+                *pixel = premultiply(*pixel & 0x00ff_ffff, final_alpha);
+            }
         }
     }
 }
@@ -272,12 +293,23 @@ fn title_row_alpha(spec: &WindowAlpha, y: usize, title_height: usize) -> u32 {
 }
 
 fn contains(rect: &Rect, x: usize, y: usize) -> bool {
-    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+    x >= rect.x
+        && x < rect.x.saturating_add(rect.width)
+        && y >= rect.y
+        && y < rect.y.saturating_add(rect.height)
+}
+
+/// Exact `value / 255` for `value in 0..=65025` without hardware division.
+#[inline]
+fn div255_floor(value: u32) -> u32 {
+    (value + 1 + (value >> 8)) >> 8
 }
 
 fn premultiply(rgb: u32, alpha: u32) -> u32 {
-    let channel = |shift: u32| (((rgb >> shift) & 0xff) * alpha / 255) << shift;
-    (alpha << 24) | channel(16) | channel(8) | channel(0)
+    let r = div255_floor(((rgb >> 16) & 0xff) * alpha) << 16;
+    let g = div255_floor(((rgb >> 8) & 0xff) * alpha) << 8;
+    let b = div255_floor((rgb & 0xff) * alpha);
+    (alpha << 24) | r | g | b
 }
 
 /// Horizontal inset of a rounded corner of `radius` at `row` rows below the
@@ -299,14 +331,8 @@ fn panel_surface(backdrop: Backdrop<'_>, rect: Rect, radius: usize, edge_alpha: 
     let mut surface = blurred_rect(backdrop, rect);
     let (width, height) = (rect.width, rect.height);
     for py in 0..height {
-        for px in 0..width {
-            let near_edge = px <= radius
-                || px + radius + 1 >= width
-                || py <= radius
-                || py + radius + 1 >= height;
-            if !near_edge {
-                continue;
-            }
+        let corner_row = py <= radius || py + radius + 1 >= height;
+        let mut paint_edge_pixel = |px: usize| {
             let (outer, inner) = edge_coverage(px, py, width, height, radius);
             let pixel = &mut surface[py * width + px];
             if outer < 255 {
@@ -320,6 +346,20 @@ fn panel_surface(backdrop: Backdrop<'_>, rect: Rect, radius: usize, edge_alpha: 
                 let falloff = (height as u32 * 2).saturating_sub(py as u32);
                 let alpha = edge_alpha as u32 * falloff / (height as u32 * 2) * ring / 255;
                 *pixel = mix(*pixel, 0x00ff_ffff, alpha);
+            }
+        };
+        if corner_row {
+            for px in 0..width {
+                paint_edge_pixel(px);
+            }
+        } else {
+            let left_end = (radius + 1).min(width);
+            for px in 0..left_end {
+                paint_edge_pixel(px);
+            }
+            let right_start = width.saturating_sub(radius + 1).max(left_end);
+            for px in right_start..width {
+                paint_edge_pixel(px);
             }
         }
     }

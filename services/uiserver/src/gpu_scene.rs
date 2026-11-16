@@ -309,23 +309,7 @@ impl<'a> GpuAtlasPacker<'a> {
         {
             return Err(GpuSceneError::InvalidLayer);
         }
-        let outer_x = destination.x - Self::PADDING;
-        let outer_y = destination.y - Self::PADDING;
-        let outer_width = destination.width + Self::PADDING * 2;
-        let outer_height = destination.height + Self::PADDING * 2;
-        for row in outer_y..outer_y + outer_height {
-            let start = row
-                .checked_mul(self.stride_pixels)
-                .and_then(|offset| offset.checked_add(outer_x))
-                .ok_or(GpuSceneError::InvalidLayer)?;
-            let end = start
-                .checked_add(outer_width)
-                .ok_or(GpuSceneError::InvalidLayer)?;
-            self.pixels
-                .get_mut(start..end)
-                .ok_or(GpuSceneError::InvalidLayer)?
-                .fill(0);
-        }
+        self.zero_padding_border(destination)?;
         for row in 0..destination.height {
             let source_start = row
                 .checked_mul(stride_pixels)
@@ -447,29 +431,75 @@ impl<'a> GpuAtlasPacker<'a> {
             .best_free_rect(outer_width, outer_height)
             .ok_or(GpuSceneError::AtlasFull)?;
         let (outer_x, outer_y) = (free.x, free.y);
-
-        for row in outer_y..outer_y + outer_height {
-            let start = row
-                .checked_mul(self.stride_pixels)
-                .and_then(|offset| offset.checked_add(outer_x))
-                .ok_or(GpuSceneError::AtlasFull)?;
-            let end = start
-                .checked_add(outer_width)
-                .ok_or(GpuSceneError::AtlasFull)?;
-            self.pixels
-                .get_mut(start..end)
-                .ok_or(GpuSceneError::InvalidLayer)?
-                .fill(0);
-        }
-
         let destination = Rect {
             x: outer_x + padding,
             y: outer_y + padding,
             width,
             height,
         };
+        self.zero_padding_border(destination)?;
         self.carve_free_rect(free_index, free, outer_width, outer_height);
         Ok(destination)
+    }
+
+    fn zero_padding_border(&mut self, destination: Rect) -> Result<(), GpuSceneError> {
+        let outer_x = destination
+            .x
+            .checked_sub(Self::PADDING)
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let outer_y = destination
+            .y
+            .checked_sub(Self::PADDING)
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let outer_width = destination
+            .width
+            .checked_add(Self::PADDING * 2)
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let outer_height = destination
+            .height
+            .checked_add(Self::PADDING * 2)
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let top_start = outer_y
+            .checked_mul(self.stride_pixels)
+            .and_then(|offset| offset.checked_add(outer_x))
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let top_end = top_start
+            .checked_add(outer_width)
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        self.pixels
+            .get_mut(top_start..top_end)
+            .ok_or(GpuSceneError::InvalidLayer)?
+            .fill(0);
+        let bottom_start = (outer_y + outer_height - 1)
+            .checked_mul(self.stride_pixels)
+            .and_then(|offset| offset.checked_add(outer_x))
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        let bottom_end = bottom_start
+            .checked_add(outer_width)
+            .ok_or(GpuSceneError::InvalidLayer)?;
+        self.pixels
+            .get_mut(bottom_start..bottom_end)
+            .ok_or(GpuSceneError::InvalidLayer)?
+            .fill(0);
+        let right_offset = outer_width - 1;
+        for row in destination.y..destination.y + destination.height {
+            let left_idx = row
+                .checked_mul(self.stride_pixels)
+                .and_then(|offset| offset.checked_add(outer_x))
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            let right_idx = left_idx
+                .checked_add(right_offset)
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            *self
+                .pixels
+                .get_mut(left_idx)
+                .ok_or(GpuSceneError::InvalidLayer)? = 0;
+            *self
+                .pixels
+                .get_mut(right_idx)
+                .ok_or(GpuSceneError::InvalidLayer)? = 0;
+        }
+        Ok(())
     }
 }
 
@@ -1330,5 +1360,27 @@ mod tests {
     fn boot_contract_exercises_3d_transform_and_epoch_reset() {
         assert!(validate_boot_contract(1600, 900));
         assert!(!validate_boot_contract(0, 900));
+    }
+
+    #[test]
+    fn atlas_packer_zeroes_only_one_pixel_padding_border() {
+        let mut pixels = vec![0xdead_beef_u32; 6 * 6];
+        let src = [0x1122_3344_u32; 2 * 2];
+        let mut packer = GpuAtlasPacker::new(&mut pixels, 6, 6, 6).unwrap();
+        let region = packer.reserve(2, 2).unwrap();
+        assert_eq!(region, Rect { x: 1, y: 1, width: 2, height: 2 });
+        packer.write_bgra_at(region, &src, 2).unwrap();
+        for y in 0..4 {
+            for x in 0..4 {
+                let px = pixels[y * 6 + x];
+                if (1..=2).contains(&x) && (1..=2).contains(&y) {
+                    assert_eq!(px, 0x1122_3344, "interior at ({x},{y})");
+                } else {
+                    assert_eq!(px, 0, "padding border at ({x},{y})");
+                }
+            }
+        }
+        // Outside the 4x4 padded outer rect remains untouched.
+        assert_eq!(pixels[5 * 6 + 5], 0xdead_beef);
     }
 }

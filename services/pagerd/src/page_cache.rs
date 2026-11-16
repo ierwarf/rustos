@@ -25,6 +25,8 @@ use rustos_user_abi::pager::{
 
 pub const PAGER_MAX_CACHE_ENTRIES: usize = 64;
 pub const PAGER_MAX_REVOKED_BACKINGS: usize = 16;
+const PAGER_CACHE_HASH_BUCKETS: usize = 128;
+const PAGER_CACHE_HASH_MASK: usize = PAGER_CACHE_HASH_BUCKETS - 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PageCacheKey {
@@ -136,6 +138,9 @@ struct CacheEntry {
 
 pub struct PageCache {
     entries: [Option<CacheEntry>; PAGER_MAX_CACHE_ENTRIES],
+    /// Open-addressed index into `entries`: `0` is empty, `1..=PAGER_MAX_CACHE_ENTRIES`
+    /// is `slot + 1`. Load factor is <= 0.5, so lookups and updates are O(1).
+    buckets: [u8; PAGER_CACHE_HASH_BUCKETS],
     revoked_backings: [Option<RevokedBacking>; PAGER_MAX_REVOKED_BACKINGS],
     next_generation: u64,
 }
@@ -144,6 +149,7 @@ impl PageCache {
     pub const fn new() -> Self {
         Self {
             entries: [None; PAGER_MAX_CACHE_ENTRIES],
+            buckets: [0; PAGER_CACHE_HASH_BUCKETS],
             revoked_backings: [None; PAGER_MAX_REVOKED_BACKINGS],
             next_generation: 1,
         }
@@ -176,15 +182,16 @@ impl PageCache {
                 }
             });
         }
-        let slot = self
+        let slot_idx = self
             .entries
-            .iter_mut()
-            .find(|entry| entry.is_none())
+            .iter()
+            .position(|entry| entry.is_none())
             .ok_or(CacheError::Pressure)?;
-        *slot = Some(CacheEntry {
+        self.entries[slot_idx] = Some(CacheEntry {
             key,
             state: CacheState::Loading { load_token },
         });
+        self.insert_bucket(key, slot_idx);
         Ok(CacheAdmission::LoadOwner { load_token })
     }
 
@@ -197,16 +204,19 @@ impl PageCache {
         if frame_capability == 0 {
             return Err(CacheError::Malformed);
         }
-        if self.entry(key).map(|entry| entry.state) != Some(CacheState::Loading { load_token }) {
+        let (slot_idx, _) = self.find_slot(key).ok_or(CacheError::Stale)?;
+        if self.entries[slot_idx].expect("occupied slot").state
+            != (CacheState::Loading { load_token })
+        {
             return Err(CacheError::Stale);
         }
         let generation = self.allocate_generation()?;
-        let entry = self.entry_mut(key).ok_or(CacheError::Stale)?;
         let page = CachePage {
             frame_capability,
             cache_generation: generation,
         };
-        entry.state = CacheState::Clean { page, mappings: 0 };
+        self.entries[slot_idx].as_mut().expect("occupied slot").state =
+            CacheState::Clean { page, mappings: 0 };
         Ok(page)
     }
 
@@ -382,17 +392,14 @@ impl PageCache {
         key: PageCacheKey,
         tlb_generation: u64,
     ) -> Result<CachePage, CacheError> {
-        let slot = self
-            .entries
-            .iter_mut()
-            .find(|slot| slot.is_some_and(|entry| entry.key == key))
-            .ok_or(CacheError::Stale)?;
-        match slot.expect("matched cache slot").state {
+        let (slot_idx, bucket_pos) = self.find_slot(key).ok_or(CacheError::Stale)?;
+        match self.entries[slot_idx].expect("matched cache slot").state {
             CacheState::Reclaiming {
                 page,
                 tlb_generation: expected,
             } if expected == tlb_generation => {
-                *slot = None;
+                self.entries[slot_idx] = None;
+                self.remove_bucket(bucket_pos);
                 Ok(page)
             }
             _ => Err(CacheError::Stale),
@@ -410,8 +417,8 @@ impl PageCache {
         }
         self.record_revoked_backing(backing_service, backing_generation, revoke_token)?;
         let mut revoked = 0;
-        for slot in &mut self.entries {
-            let Some(entry) = *slot else {
+        for slot_idx in 0..PAGER_MAX_CACHE_ENTRIES {
+            let Some(entry) = self.entries[slot_idx] else {
                 continue;
             };
             if entry.key.backing_service == backing_service
@@ -419,7 +426,10 @@ impl PageCache {
             {
                 let state = match entry.state {
                     CacheState::Loading { .. } => {
-                        *slot = None;
+                        self.entries[slot_idx] = None;
+                        if let Some((_, bucket_pos)) = self.find_slot(entry.key) {
+                            self.remove_bucket(bucket_pos);
+                        }
                         revoked += 1;
                         continue;
                     }
@@ -450,7 +460,7 @@ impl PageCache {
                     },
                     CacheState::Revoked { .. } => continue,
                 };
-                *slot = Some(CacheEntry {
+                self.entries[slot_idx] = Some(CacheEntry {
                     key: entry.key,
                     state,
                 });
@@ -495,12 +505,8 @@ impl PageCache {
         revoke_token: u64,
         tlb_generation: u64,
     ) -> Result<CachePage, CacheError> {
-        let slot = self
-            .entries
-            .iter_mut()
-            .find(|slot| slot.is_some_and(|entry| entry.key == key))
-            .ok_or(CacheError::Stale)?;
-        match slot.expect("matched cache slot").state {
+        let (slot_idx, bucket_pos) = self.find_slot(key).ok_or(CacheError::Stale)?;
+        match self.entries[slot_idx].expect("matched cache slot").state {
             CacheState::Revoked {
                 page,
                 mappings: 0,
@@ -511,7 +517,8 @@ impl PageCache {
                 && expected_tlb != 0
                 && expected_tlb == tlb_generation =>
             {
-                *slot = None;
+                self.entries[slot_idx] = None;
+                self.remove_bucket(bucket_pos);
                 Ok(page)
             }
             _ => Err(CacheError::Stale),
@@ -534,7 +541,8 @@ impl PageCache {
         {
             return Err(CacheError::Malformed);
         }
-        let entry = self.entry_mut(key).ok_or(CacheError::Stale)?;
+        let (slot_idx, bucket_pos) = self.find_slot(key).ok_or(CacheError::Stale)?;
+        let entry = self.entries[slot_idx].expect("matched cache slot");
         match entry.state {
             CacheState::Revoked {
                 page,
@@ -543,8 +551,12 @@ impl PageCache {
                 revoke_token: expected,
                 tlb_generation: 0,
             } if expected == revoke_token => {
-                entry.key = replacement;
-                entry.state = CacheState::Dirty { page, mappings };
+                self.remove_bucket(bucket_pos);
+                self.entries[slot_idx] = Some(CacheEntry {
+                    key: replacement,
+                    state: CacheState::Dirty { page, mappings },
+                });
+                self.insert_bucket(replacement, slot_idx);
                 Ok(page)
             }
             _ => Err(CacheError::Stale),
@@ -589,15 +601,58 @@ impl PageCache {
         Ok(())
     }
 
+    fn find_slot(&self, key: PageCacheKey) -> Option<(usize, usize)> {
+        let mut pos = hash_key(key) & PAGER_CACHE_HASH_MASK;
+        loop {
+            let raw = self.buckets[pos];
+            if raw == 0 {
+                return None;
+            }
+            let slot_idx = usize::from(raw - 1);
+            if self.entries[slot_idx].is_some_and(|entry| entry.key == key) {
+                return Some((slot_idx, pos));
+            }
+            pos = (pos + 1) & PAGER_CACHE_HASH_MASK;
+        }
+    }
+
+    fn insert_bucket(&mut self, key: PageCacheKey, slot_idx: usize) {
+        let mut pos = hash_key(key) & PAGER_CACHE_HASH_MASK;
+        while self.buckets[pos] != 0 {
+            pos = (pos + 1) & PAGER_CACHE_HASH_MASK;
+        }
+        self.buckets[pos] = (slot_idx + 1) as u8;
+    }
+
+    fn remove_bucket(&mut self, mut hole: usize) {
+        let mut cur = (hole + 1) & PAGER_CACHE_HASH_MASK;
+        loop {
+            let raw = self.buckets[cur];
+            if raw == 0 {
+                self.buckets[hole] = 0;
+                break;
+            }
+            let slot_idx = usize::from(raw - 1);
+            let home = hash_key(self.entries[slot_idx].expect("occupied bucket").key)
+                & PAGER_CACHE_HASH_MASK;
+            let dist_cur = cur.wrapping_sub(home) & PAGER_CACHE_HASH_MASK;
+            let dist_hole = hole.wrapping_sub(home) & PAGER_CACHE_HASH_MASK;
+            if dist_cur > dist_hole {
+                self.buckets[hole] = raw;
+                hole = cur;
+            }
+            cur = (cur + 1) & PAGER_CACHE_HASH_MASK;
+        }
+    }
+
     fn entry(&self, key: PageCacheKey) -> Option<&CacheEntry> {
-        self.entries.iter().flatten().find(|entry| entry.key == key)
+        let (slot_idx, _) = self.find_slot(key)?;
+        self.entries[slot_idx].as_ref()
     }
 
     fn entry_mut(&mut self, key: PageCacheKey) -> Option<&mut CacheEntry> {
-        self.entries
-            .iter_mut()
-            .flatten()
-            .find(|entry| entry.key == key)
+        let (slot_idx, _) = self.find_slot(key)?;
+        self.entries[slot_idx].as_mut()
     }
 
     fn allocate_generation(&mut self) -> Result<u64, CacheError> {
@@ -608,6 +663,18 @@ impl PageCache {
             .ok_or(CacheError::GenerationExhausted)?;
         Ok(generation)
     }
+}
+
+fn hash_key(key: PageCacheKey) -> usize {
+    let mut h = key.backing_service.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    h ^= key.object_slot.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= key.object_generation.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^= key.backing_generation.wrapping_mul(0xd6e8_feb8_6659_fd93);
+    h ^= key.page_offset.wrapping_mul(0xa076_1d64_78bd_642f);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h as usize
 }
 
 impl Default for PageCache {

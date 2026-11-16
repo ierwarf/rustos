@@ -453,10 +453,12 @@ impl TtySessionState {
     }
 
     fn on_noncanonical_key_event(&mut self, event: InputEvent) -> Result<(), i32> {
-        let bytes = noncanonical_input_bytes(self.termios, event)?;
-        self.push_input_bytes(&bytes);
+        let mut buf = [0_u8; 4];
+        let len = noncanonical_input_bytes(self.termios, event, &mut buf)?;
+        let bytes = &buf[..len];
+        self.push_input_bytes(bytes);
         if self.termios.echo_enabled() {
-            self.echo_noncanonical_input(&bytes);
+            self.echo_noncanonical_input(bytes);
         }
         Ok(())
     }
@@ -472,8 +474,10 @@ impl TtySessionState {
             if cursor + 1 == self.edit.len() {
                 self.push_output(byte);
             } else {
-                let tail: Vec<u8> = self.edit[cursor..].to_vec();
-                self.push_output_bytes(&tail);
+                for index in cursor..self.edit.len() {
+                    let tail_byte = self.edit[index];
+                    self.push_output(tail_byte);
+                }
                 self.move_visual_cursor_left(self.edit.len() - self.edit_cursor);
             }
         }
@@ -491,8 +495,10 @@ impl TtySessionState {
                 self.push_output_bytes(b"\x08 \x08");
             } else {
                 self.move_visual_cursor_left(1);
-                let tail: Vec<u8> = self.edit[delete_at..].to_vec();
-                self.push_output_bytes(&tail);
+                for index in delete_at..self.edit.len() {
+                    let tail_byte = self.edit[index];
+                    self.push_output(tail_byte);
+                }
                 self.push_output(b' ');
                 self.move_visual_cursor_left(self.edit.len() - delete_at + 1);
             }
@@ -584,9 +590,15 @@ impl TtySessionState {
         }
         self.push_output_bytes(b"\x1b[");
         if count != 1 {
-            for byte in count.to_string().bytes() {
-                self.push_output(byte);
+            let mut digits = [0_u8; 20];
+            let mut pos = digits.len();
+            let mut value = count;
+            while value > 0 {
+                pos -= 1;
+                digits[pos] = b'0' + (value % 10) as u8;
+                value /= 10;
             }
+            self.push_output_bytes(&digits[pos..]);
         }
         self.push_output(direction);
     }
@@ -624,9 +636,16 @@ fn input_event_text_byte(event: InputEvent) -> Result<u8, i32> {
     Ok(event.text as u8)
 }
 
-fn noncanonical_input_bytes(termios: LinuxTermios, event: InputEvent) -> Result<Vec<u8>, i32> {
+fn noncanonical_input_bytes(
+    termios: LinuxTermios,
+    event: InputEvent,
+    out: &mut [u8; 4],
+) -> Result<usize, i32> {
     let bytes: &[u8] = match KeyCode::from_u32(event.code) {
-        Some(KeyCode::Backspace) => return Ok(vec![termios.erase_byte()]),
+        Some(KeyCode::Backspace) => {
+            out[0] = termios.erase_byte();
+            return Ok(1);
+        }
         Some(KeyCode::Enter | KeyCode::NumpadEnter) => b"\n",
         Some(KeyCode::ArrowUp) => b"\x1b[A",
         Some(KeyCode::ArrowDown) => b"\x1b[B",
@@ -639,9 +658,13 @@ fn noncanonical_input_bytes(termios: LinuxTermios, event: InputEvent) -> Result<
         Some(KeyCode::PageUp) => b"\x1b[5~",
         Some(KeyCode::PageDown) => b"\x1b[6~",
         Some(KeyCode::Escape) => b"\x1b",
-        _ => return Ok(vec![input_event_text_byte(event)?]),
+        _ => {
+            out[0] = input_event_text_byte(event)?;
+            return Ok(1);
+        }
     };
-    Ok(bytes.to_vec())
+    out[..bytes.len()].copy_from_slice(bytes);
+    Ok(bytes.len())
 }
 
 pub(super) fn bootstrap_ui_server(state: &mut BrokerState) -> Result<(), i32> {
@@ -945,10 +968,18 @@ pub(super) fn service_console_graph_waiters(state: &mut BrokerState) -> bool {
     if state.session_runtime.console_graph_waiters.is_empty() {
         return false;
     }
-    let parked = std::mem::take(&mut state.session_runtime.console_graph_waiters);
     let generation = state.session_runtime.graph_generation();
-    let last_advance = state.session_runtime.last_advance;
     let now = Instant::now();
+    if !state
+        .session_runtime
+        .console_graph_waiters
+        .iter()
+        .any(|waiter| generation != waiter.known_generation || now >= waiter.deadline)
+    {
+        return false;
+    }
+    let parked = std::mem::take(&mut state.session_runtime.console_graph_waiters);
+    let last_advance = state.session_runtime.last_advance;
     let mut still_parked = VecDeque::new();
     let mut answered = false;
     for waiter in parked {
@@ -1101,8 +1132,18 @@ pub(super) fn service_console_read_waiters(state: &mut BrokerState) -> bool {
     if state.session_runtime.console_read_waiters.is_empty() {
         return false;
     }
-    let parked = state.session_runtime.take_console_read_waiters();
     let now = Instant::now();
+    let any_ready = state.session_runtime.console_read_waiters.iter().any(|waiter| {
+        now >= waiter.deadline
+            || state
+                .session_runtime
+                .pending_input_len(waiter.session)
+                .is_none_or(|pending| pending != 0)
+    });
+    if !any_ready {
+        return false;
+    }
+    let parked = state.session_runtime.take_console_read_waiters();
     let mut still_parked = VecDeque::new();
     let mut answered = false;
     for waiter in parked {
@@ -1406,22 +1447,18 @@ fn handle_console_route_request(
             let mut snapshot = super::util::read_unaligned::<ConsoleSnapshotSessionOutputRequest>(
                 &request.payload,
             );
-            let capacity = snapshot.capacity.min(response.payload.len() as u64) as usize;
-            let mut bytes = vec![0_u8; capacity];
-            let Some(count) = state
-                .session_runtime
-                .snapshot_output(snapshot.session_handle, &mut bytes)
-            else {
+            let header_len = size_of::<ConsoleSnapshotSessionOutputRequest>();
+            let max_output = response.payload.len().saturating_sub(header_len);
+            let capacity = snapshot.capacity.min(max_output as u64) as usize;
+            let Some(count) = state.session_runtime.snapshot_output(
+                snapshot.session_handle,
+                &mut response.payload[header_len..header_len + capacity],
+            ) else {
                 return libc::EINVAL;
             };
             snapshot.count = count as u64;
-            let header_len = size_of::<ConsoleSnapshotSessionOutputRequest>();
             let payload_len = header_len.saturating_add(count);
-            if payload_len > response.payload.len() {
-                return libc::EINVAL;
-            }
             response.payload[..header_len].copy_from_slice(super::util::as_bytes(&snapshot));
-            response.payload[header_len..payload_len].copy_from_slice(&bytes[..count]);
             response.payload_len = payload_len as u32;
             response.value0 = count as u64;
             0
@@ -2187,5 +2224,59 @@ mod tests {
         assert_eq!(reported.count, 1, "one session with a handle is reported");
         crate::util::read_unaligned::<ConsoleSessionInfo>(&response.payload[header_len..])
             .output_generation
+    }
+
+    #[test]
+    fn snapshot_session_output_clamps_capacity_to_remaining_response_payload() {
+        let mut state = BrokerState::default();
+        state.session_runtime.create_session(9).unwrap();
+        let output = vec![b'x'; OUTPUT_BUFFER_CAPACITY];
+        assert_eq!(
+            state.session_runtime.write_to_session(9, &output),
+            Some(output.len())
+        );
+
+        let mut request = CommercialMaxProtocolRequest {
+            arg0: console_abi::CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT,
+            ..CommercialMaxProtocolRequest::default()
+        };
+        let mut response = CommercialMaxProtocolResponse::default();
+        let header_len = size_of::<super::ConsoleSnapshotSessionOutputRequest>();
+        let snapshot_req = super::ConsoleSnapshotSessionOutputRequest {
+            session_handle: 9,
+            capacity: response.payload.len() as u64,
+            count: 0,
+            bytes_ptr: 0,
+        };
+        request.payload[..header_len].copy_from_slice(crate::util::as_bytes(&snapshot_req));
+        request.payload_len = header_len as u32;
+
+        assert_eq!(
+            super::handle_console_route_request(&request, &mut state, &mut response),
+            0
+        );
+        let expected_count = response.payload.len() - header_len;
+        let reported = crate::util::read_unaligned::<super::ConsoleSnapshotSessionOutputRequest>(
+            &response.payload,
+        );
+        assert_eq!(reported.count, expected_count as u64);
+        assert_eq!(response.value0, expected_count as u64);
+        assert_eq!(
+            response.payload_len as usize,
+            header_len + expected_count
+        );
+        assert!(response.payload[header_len..response.payload_len as usize]
+            .iter()
+            .all(|&b| b == b'x'));
+    }
+
+    #[test]
+    fn tty_cursor_move_sequence_formats_without_heap_allocation() {
+        let mut tty = super::TtySessionState::default();
+        tty.write_cursor_move_sequence(1, b'D');
+        tty.write_cursor_move_sequence(12, b'C');
+        let mut out = [0_u8; 16];
+        let count = tty.snapshot_output(&mut out);
+        assert_eq!(&out[..count], b"\x1b[D\x1b[12C");
     }
 }

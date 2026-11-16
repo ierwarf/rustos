@@ -253,6 +253,7 @@ impl ReclaimingAllocator {
     /// # Safety
     /// The caller must pair this with exactly one `unlock` and must not touch
     /// the returned state after it.
+    #[inline]
     unsafe fn lock(&self) -> *mut AllocatorState {
         // ORDERING: Acquire on success makes the previous holder's writes to
         // the free list visible; the failure path publishes nothing.
@@ -306,6 +307,7 @@ impl ReclaimingAllocator {
 
     /// # Safety
     /// The caller must hold the lock taken by `lock`.
+    #[inline]
     unsafe fn unlock(&self) {
         // ORDERING: Release publishes the critical section's free-list writes
         // to the next acquirer; CONTENDED means someone may be asleep.

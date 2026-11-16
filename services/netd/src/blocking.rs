@@ -80,6 +80,7 @@ pub(super) fn blocking_provider_started() {
     }
 }
 
+#[cfg(test)]
 pub(super) fn is_deferred_local_poll_request(request: &NetdIpcRequest) -> bool {
     request.op == SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET
         && request.arg2 == NETD_POLL_MODE_WAIT
@@ -102,17 +103,19 @@ pub(super) fn is_blocking_request(request: &NetdIpcRequest) -> bool {
     if request.op == SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET && request.arg2 == NETD_POLL_MODE_WAIT {
         return inet_socket_exists(request.socket_token);
     }
-    let inet_operation = match request.op {
+    if request.status_flags & linux_abi::O_NONBLOCK != 0
+        || request_msg_flags(request) & (linux_abi::MSG_DONTWAIT | libc::MSG_ERRQUEUE as u64) != 0
+    {
+        return false;
+    }
+    match request.op {
         SYSCALL_OFFLOAD_OP_LINUX_CONNECT => sockaddr_family(request) == Some(linux_abi::AF_INET),
         SYSCALL_OFFLOAD_OP_LINUX_SENDTO
         | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
         | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
         | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => inet_socket_exists(request.socket_token),
         _ => false,
-    };
-    inet_operation
-        && request.status_flags & linux_abi::O_NONBLOCK == 0
-        && request_msg_flags(request) & (linux_abi::MSG_DONTWAIT | libc::MSG_ERRQUEUE as u64) == 0
+    }
 }
 
 pub(super) fn local_socket_reply_requests_latency_handoff(
@@ -120,31 +123,33 @@ pub(super) fn local_socket_reply_requests_latency_handoff(
     response: &NetdIpcResponse,
     status: i32,
 ) -> bool {
-    let is_send_or_recv = matches!(
+    let is_recv = matches!(
         request.op,
-        SYSCALL_OFFLOAD_OP_LINUX_SENDTO
-            | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
-            | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
-            | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
+        SYSCALL_OFFLOAD_OP_LINUX_RECVFROM | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
     );
-    // Only byte-moving operations can ask for a handoff; skip the table probe
-    // for every other request.
-    if !is_send_or_recv || inet_socket_exists(request.socket_token) {
+    let is_send_or_recv = is_recv
+        || matches!(
+            request.op,
+            SYSCALL_OFFLOAD_OP_LINUX_SENDTO | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
+        );
+    // Only byte-moving operations with a nonzero transfer or a recv EAGAIN can
+    // ask for a handoff; skip the table probe for every other request/outcome.
+    if !is_send_or_recv {
         return false;
     }
-    if status == 0 && response.value != 0 && is_send_or_recv {
-        return true;
+    if status == 0 && response.value != 0 {
+        return !inet_socket_exists(request.socket_token);
     }
     status == libc::EAGAIN
-        && matches!(
-            request.op,
-            SYSCALL_OFFLOAD_OP_LINUX_RECVFROM | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
-        )
+        && is_recv
         && consume_local_recv_drain_handoff(request.socket_token)
 }
 
 pub(super) fn consume_local_recv_drain_handoff(socket_token: u64) -> bool {
     let mut state = lock_net_state();
+    if state.inet_sockets.contains_key(&socket_token) {
+        return false;
+    }
     let Some(socket) = state.sockets.get_mut(&socket_token) else {
         return false;
     };
