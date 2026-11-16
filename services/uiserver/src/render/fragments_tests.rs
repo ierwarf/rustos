@@ -483,3 +483,28 @@ fn cached_opaque_wayland_interior_hits_and_invalidates_by_content_version() {
     win.content_version = 2;
     assert!(cached_opaque_wayland_interior(&mut cache, &win).is_empty());
 }
+
+#[test]
+fn desktop_and_maximized_window_at_2880x1800_fit_3072x3072_atlas() {
+    let output = rect(0, 0, 2880, 1800);
+    let upper = window(rect(15, 25, 2850, 1750), 255);
+    let opaque = opaque_wayland_interior(&upper);
+    let layers = [
+        FragmentLayer {
+            destination: output,
+            opaque: output,
+        },
+        FragmentLayer {
+            destination: wayland_window_outer_rect(&upper),
+            opaque,
+        },
+        FragmentLayer {
+            destination: taskbar_dirty_rect(2880, 1800).intersect(output),
+            opaque: taskbar_dirty_rect(2880, 1800).intersect(output),
+        },
+    ];
+    let (fragments, regions) =
+        packed(&layers, output, 3072, 3072).expect("2880x1800 desktop + maximized client + dock");
+    assert_eq!(fragments.len(), regions.len());
+    assert!(fragments.iter().any(|f| f.layer_index == 1));
+}

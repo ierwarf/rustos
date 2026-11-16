@@ -16,8 +16,8 @@ pub const RUSTOS_INPUT_KIND_SESSION_END: u8 = 3;
 pub const RUSTOS_INPUT_KIND_POINTER_POSITION: u8 = 4;
 pub const LINUX_EVDEV_KEY_MAX: u16 = 0x02ff;
 pub const RUSTOS_POINTER_BUTTON_MASK: u8 = 0x1f;
-pub const RUSTOS_POINTER_POSITION_MAX_X: u16 = 2559;
-pub const RUSTOS_POINTER_POSITION_MAX_Y: u16 = 1439;
+pub const RUSTOS_POINTER_POSITION_MAX_X: u16 = 2879;
+pub const RUSTOS_POINTER_POSITION_MAX_Y: u16 = 1799;
 
 /// L0 is the only producer of this fixed input ring. The Linux DVM sends
 /// evdev records to L0 over its authenticated control channel; it never maps

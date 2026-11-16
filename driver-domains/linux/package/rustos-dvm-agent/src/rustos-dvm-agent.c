@@ -69,12 +69,12 @@
 // measured end-to-end consumer; button state is forwarded immediately.
 #define INPUT_POINTER_FLUSH_MS 5
 #define INPUT_POINTER_FLUSH_NS ((uint64_t)INPUT_POINTER_FLUSH_MS * 1000000ULL)
-// The interactive KVM topology has a fixed 2560x1440 DVM scanout. An absolute
+// The interactive KVM topology has a fixed 2880x1800 DVM scanout. An absolute
 // virtio tablet is normalized to that scanout and remains absolute through
 // the authenticated RDI3 frame, so hovering needs no manual grab and an
 // initial/duplicate tablet report cannot synthesize relative cursor motion.
-#define DVM_POINTER_WIDTH 2560
-#define DVM_POINTER_HEIGHT 1440
+#define DVM_POINTER_WIDTH 2880
+#define DVM_POINTER_HEIGHT 1800
 
 enum input_device_kind {
     INPUT_DEVICE_KEYBOARD,

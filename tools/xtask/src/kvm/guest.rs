@@ -224,7 +224,7 @@ fn spawn_rustos_guest(
     } else {
         rustos_command
             .arg("-device")
-            .arg("virtio-gpu-pci,id=rustos-virtio-gpu,xres=1280,yres=800");
+            .arg("virtio-gpu-pci,id=rustos-virtio-gpu,xres=2880,yres=1800");
     }
     if let Some(shared_network) = layout.dvm_network_shmem.as_deref() {
         append_dvm_network_ivshmem(&mut rustos_command, shared_network);

@@ -832,7 +832,7 @@ fn absolute_pointer_frame_is_bounded_and_keeps_position_semantics() {
     assert_eq!(bytes[5], RUSTOS_INPUT_KIND_POINTER_POSITION);
     assert_eq!(u16::from_be_bytes(bytes[16..18].try_into().unwrap()), 800);
     assert_eq!(u16::from_be_bytes(bytes[18..20].try_into().unwrap()), 450);
-    assert!(RustosInputFrame::linux_evdev_pointer_position(7, 2, 2560, 450, 0, 0, 0).is_err());
-    assert!(RustosInputFrame::linux_evdev_pointer_position(7, 2, 800, 1440, 0, 0, 0).is_err());
-    assert!(RustosInputFrame::linux_evdev_pointer_position(7, 3, 2559, 1439, 0, 0, 0).is_ok());
+    assert!(RustosInputFrame::linux_evdev_pointer_position(7, 2, 2880, 450, 0, 0, 0).is_err());
+    assert!(RustosInputFrame::linux_evdev_pointer_position(7, 2, 800, 1800, 0, 0, 0).is_err());
+    assert!(RustosInputFrame::linux_evdev_pointer_position(7, 3, 2879, 1799, 0, 0, 0).is_ok());
 }
