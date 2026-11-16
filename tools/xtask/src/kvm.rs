@@ -17,7 +17,8 @@ use anyhow::{Context, bail};
 use driver_domain_protocol::{
     DVM_APP_BUFFER_APERTURE_BYTES, DVM_APP_BUFFER_PHYS_ADDR, DVM_BLOCK_APERTURE_BYTES, DVM_BLOCK_FEATURE_FLUSH, DVM_BLOCK_FLAG_DVM_READY,
     DVM_BLOCK_FLAG_READ_ONLY, DVM_BLOCK_FLAG_RUSTOS_READY, DVM_BLOCK_HEADER_RECORD_BYTES,
-    DVM_GPU_ATLAS_POOL_HEADER_OFFSET, DVM_GUI_SURFACE_POOL_HOST_RECORD_OFFSET,
+    DVM_GPU_ATLAS_POOL_HEADER_OFFSET, DVM_GPU_RENDER_MAX_DIMENSION,
+    DVM_GUI_SURFACE_POOL_HOST_RECORD_OFFSET,
     DVM_GUI_SURFACE_SLOT_COUNT, DVM_INPUT_RING_APERTURE_BYTES, DVM_NET_APERTURE_BYTES,
     DvmBlockHeader, DvmGpuAtlasPoolHeader, DvmGuiSurfaceMessage, DvmGuiSurfacePoolHeader,
     DvmInputRingHeader, DvmNetHeader,
@@ -110,13 +111,118 @@ const MIN_UI_CURSOR_SPAN: u64 = 96;
 // inside a 16.67 ms 60 Hz frame.  The relay never copies pixel payloads.
 const MAX_DVM_DISPLAY_RELAY_US: u64 = 12_000;
 const MAX_DVM_GPU_RENDER_US: u64 = 16_667;
-const DVM_DISPLAY_WIDTH: u32 = 2880;
-const DVM_DISPLAY_HEIGHT: u32 = 1800;
+const DEFAULT_DVM_DISPLAY_WIDTH: u32 = 2560;
+const DEFAULT_DVM_DISPLAY_HEIGHT: u32 = 1440;
 const DVM_DISPLAY_REGION_BYTES: u64 = 512 * 1024 * 1024;
 // Separate writable app-buffer backing; never alias the read-only atlas.
 const DVM_APP_BUFFER_REGION_BYTES: u64 = DVM_APP_BUFFER_APERTURE_BYTES;
-const DVM_GPU_ATLAS_WIDTH: u32 = 3072;
-const DVM_GPU_ATLAS_HEIGHT: u32 = 3072;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DisplayGeometry {
+    width: u32,
+    height: u32,
+    atlas_width: u32,
+    atlas_height: u32,
+}
+
+impl Default for DisplayGeometry {
+    fn default() -> Self {
+        Self::from_dimensions(DEFAULT_DVM_DISPLAY_WIDTH, DEFAULT_DVM_DISPLAY_HEIGHT)
+    }
+}
+
+impl DisplayGeometry {
+    fn from_dimensions(mut width: u32, mut height: u32) -> Self {
+        const MIN_WIDTH: u32 = 640;
+        const MIN_HEIGHT: u32 = 480;
+        const MAX_SCANOUT_WIDTH: u32 = 3840;
+        const MAX_SCANOUT_HEIGHT: u32 = 2160;
+        if width < MIN_WIDTH || height < MIN_HEIGHT {
+            width = DEFAULT_DVM_DISPLAY_WIDTH;
+            height = DEFAULT_DVM_DISPLAY_HEIGHT;
+        }
+        while width > MAX_SCANOUT_WIDTH || height > MAX_SCANOUT_HEIGHT {
+            let half_w = width / 2;
+            let half_h = height / 2;
+            if half_w < MIN_WIDTH || half_h < MIN_HEIGHT {
+                width = width.min(MAX_SCANOUT_WIDTH);
+                height = height.min(MAX_SCANOUT_HEIGHT);
+                break;
+            }
+            width = half_w;
+            height = half_h;
+        }
+        width &= !1;
+        height &= !1;
+        let align64 = |v: u32| v.saturating_add(63) & !63;
+        let atlas_width = align64(width.saturating_add(128)).min(DVM_GPU_RENDER_MAX_DIMENSION);
+        let atlas_height = align64(height.saturating_add(1120)).min(DVM_GPU_RENDER_MAX_DIMENSION);
+        Self {
+            width,
+            height,
+            atlas_width,
+            atlas_height,
+        }
+    }
+
+    fn parse_drm_mode(contents: &str) -> Option<(u32, u32)> {
+        for line in contents.lines() {
+            let token = line.trim().split(|c: char| !c.is_ascii_digit() && c != 'x').next()?;
+            let Some((w, h)) = token.split_once('x') else {
+                continue;
+            };
+            let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) else {
+                continue;
+            };
+            if (640..=7680).contains(&w) && (480..=4320).contains(&h) {
+                return Some((w, h));
+            }
+        }
+        None
+    }
+
+    fn detect_host_in(drm_dir: &Path) -> Self {
+        let Ok(entries) = std::fs::read_dir(drm_dir) else {
+            return Self::default();
+        };
+        let mut candidates: Vec<(u8, String, PathBuf)> = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.contains('-') {
+                    return None;
+                }
+                let path = entry.path();
+                let status = std::fs::read_to_string(path.join("status")).ok()?;
+                if status.trim() != "connected" {
+                    return None;
+                }
+                let priority = if name.contains("-eDP-")
+                    || name.contains("-LVDS-")
+                    || name.contains("-DSI-")
+                {
+                    0
+                } else {
+                    1
+                };
+                Some((priority, name, path))
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, _, path) in candidates {
+            if let Ok(modes) = std::fs::read_to_string(path.join("modes"))
+                && let Some((w, h)) = Self::parse_drm_mode(&modes)
+            {
+                return Self::from_dimensions(w, h);
+            }
+        }
+        Self::default()
+    }
+
+    fn detect_host() -> Self {
+        Self::detect_host_in(Path::new("/sys/class/drm"))
+    }
+}
 // Keep the KVM proof topology identical to the supervised physical-display
 // DVM. Mesa virgl plus the AMD radeonsi/LLVM runtime, firmware, the compressed
 // initrd, XZ workspace, and unpacked ramfs coexist during early boot. Keep a

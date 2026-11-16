@@ -79,6 +79,7 @@ struct KvmLayout {
     gui_dvm_surfaces: Option<PathBuf>,
     gui_dvm_pixels: Option<PathBuf>,
     gui_dvm_app_buffers: Option<PathBuf>,
+    display_geometry: DisplayGeometry,
     dvm_display_doorbell: Option<PathBuf>,
     dvm_network_shmem: Option<PathBuf>,
     dvm_block_aperture: Option<PathBuf>,
@@ -515,7 +516,7 @@ fn run_one_smoke_unarchived(
         layout.gui_dvm_surfaces.as_deref(),
         layout.gui_dvm_pixels.as_deref(),
     ) {
-        verify_dvm_display_surface(shared_display, shared_pixels)?;
+        verify_dvm_display_surface(shared_display, shared_pixels, layout.display_geometry)?;
     }
     if options.exercise_network {
         let shared_network = layout
@@ -1077,12 +1078,11 @@ fn qemu_display_backend(
         //
         //
         // The default presents the guest at exactly 1:1, which is what the
-        // smoke and FPS proofs measure. That makes the window as large as the
-        // 2880x1800 guest, which exceeds the logical screen when the host runs
-        // a 2880x1800 panel with display scaling (e.g. 200% scale -> 1440x900).
-        // The interactive session therefore scales the guest to the window and
-        // hides the menu bar so the whole desktop stays on screen at any
-        // window size. Pointer input is absolute, so scaling stays exact.
+        // smoke and FPS proofs measure. That may exceed the logical screen when
+        // the host runs with display scaling (for example a 2880x1800 panel at
+        // 200% scale). The interactive session therefore scales the guest to the
+        // window and hides the menu bar so the whole desktop stays on screen at
+        // any window size. Pointer input is absolute, so scaling stays exact.
         GuestDisplay::DvmGtk if fit_host_window => Ok(
             "gtk,gl=on,show-tabs=off,show-menubar=off,zoom-to-fit=on,grab-on-hover=on,show-cursor=off"
                 .to_owned(),
@@ -1101,7 +1101,7 @@ fn dvm_machine() -> &'static str {
     "q35,accel=kvm,i8042=off"
 }
 
-fn dvm_gpu_device(display: GuestDisplay) -> Option<String> {
+fn dvm_gpu_device(display: GuestDisplay, geometry: DisplayGeometry) -> Option<String> {
     (display != GuestDisplay::Physical).then(|| {
         format!(
             // Virgl executes the same fixed GLES vocabulary intended for the AMD
@@ -1109,7 +1109,7 @@ fn dvm_gpu_device(display: GuestDisplay) -> Option<String> {
             // import and atomic-KMS path; this virtual device remains the explicit
             // staged-copy fallback and enables no CPU-composition success path.
             "virtio-gpu-gl-pci,id=dvm-virtio-gpu,xres={},yres={},edid=off,blob=on,hostmem=256M",
-            DVM_DISPLAY_WIDTH, DVM_DISPLAY_HEIGHT
+            geometry.width, geometry.height
         )
     })
 }
@@ -1125,7 +1125,7 @@ fn dvm_keyboard_device(display: GuestDisplay) -> &'static str {
 fn dvm_pointer_device(display: GuestDisplay) -> &'static str {
     // An absolute tablet keeps host pointer motion available while the GTK
     // window is merely hovered. The DVM agent normalizes the tablet range to
-    // the fixed 2880x1800 scanout before it emits the authenticated RDI3 frame.
+    // the active DVM scanout before it emits the authenticated RDI3 frame.
     if display == GuestDisplay::Physical {
         "virtio-tablet-pci,id=dvm-pointer"
     } else {
@@ -1133,8 +1133,12 @@ fn dvm_pointer_device(display: GuestDisplay) -> &'static str {
     }
 }
 
-fn append_dvm_virtual_gpu(command: &mut Command, display: GuestDisplay) -> bool {
-    let Some(gpu) = dvm_gpu_device(display) else {
+fn append_dvm_virtual_gpu(
+    command: &mut Command,
+    display: GuestDisplay,
+    geometry: DisplayGeometry,
+) -> bool {
+    let Some(gpu) = dvm_gpu_device(display, geometry) else {
         return false;
     };
     // QEMU resolves virtio-input's `display=` property while realizing the

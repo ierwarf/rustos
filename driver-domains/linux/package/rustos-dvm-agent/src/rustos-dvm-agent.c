@@ -69,12 +69,21 @@
 // measured end-to-end consumer; button state is forwarded immediately.
 #define INPUT_POINTER_FLUSH_MS 5
 #define INPUT_POINTER_FLUSH_NS ((uint64_t)INPUT_POINTER_FLUSH_MS * 1000000ULL)
-// The interactive KVM topology has a fixed 2880x1800 DVM scanout. An absolute
-// virtio tablet is normalized to that scanout and remains absolute through
-// the authenticated RDI3 frame, so hovering needs no manual grab and an
-// initial/duplicate tablet report cannot synthesize relative cursor motion.
-#define DVM_POINTER_WIDTH 2880
-#define DVM_POINTER_HEIGHT 1800
+// The interactive KVM topology sets the DVM scanout at boot via kernel cmdline
+// (`rustos.dvm.display-width=` / `rustos.dvm.display-height=`), defaulting to
+// 2560x1440. An absolute virtio tablet is normalized to that scanout and remains
+// absolute through the authenticated RDI3 frame, so hovering needs no manual
+// grab and an initial/duplicate tablet report cannot synthesize relative motion.
+#define DEFAULT_DVM_POINTER_WIDTH 2560U
+#define DEFAULT_DVM_POINTER_HEIGHT 1440U
+#define MIN_DVM_POINTER_DIM 640U
+#define MAX_DVM_POINTER_WIDTH 7680U
+#define MAX_DVM_POINTER_HEIGHT 4320U
+#define DISPLAY_WIDTH_CMDLINE_PREFIX "rustos.dvm.display-width="
+#define DISPLAY_HEIGHT_CMDLINE_PREFIX "rustos.dvm.display-height="
+
+static uint32_t dvm_pointer_width = DEFAULT_DVM_POINTER_WIDTH;
+static uint32_t dvm_pointer_height = DEFAULT_DVM_POINTER_HEIGHT;
 
 enum input_device_kind {
     INPUT_DEVICE_KEYBOARD,
@@ -269,14 +278,14 @@ static int input_scheduler_enter(struct input_scheduler_guard *guard) {
     return 0;
 }
 
-static int cmdline_has_option(const char *option) {
+static int cmdline_find_token(const char *token_or_prefix, int is_prefix, char *out, size_t out_size) {
     FILE *file = fopen("/proc/cmdline", "re");
     char buffer[4096];
-    size_t option_len = strlen(option);
+    size_t len = strlen(token_or_prefix);
     size_t bytes;
     char *cursor;
 
-    if (file == NULL || option_len == 0 || option_len >= sizeof(buffer)) {
+    if (file == NULL || len == 0 || len >= sizeof(buffer)) {
         if (file != NULL) {
             fclose(file);
         }
@@ -288,10 +297,21 @@ static int cmdline_has_option(const char *option) {
     cursor = buffer;
     while (*cursor != '\0') {
         char *end = cursor;
+        size_t token_len;
         while (*end != '\0' && *end != ' ' && *end != '\n' && *end != '\t') {
             end++;
         }
-        if ((size_t)(end - cursor) == option_len && memcmp(cursor, option, option_len) == 0) {
+        token_len = (size_t)(end - cursor);
+        if (is_prefix ? (token_len > len && memcmp(cursor, token_or_prefix, len) == 0)
+                      : (token_len == len && memcmp(cursor, token_or_prefix, len) == 0)) {
+            if (is_prefix && out != NULL && out_size > 0U) {
+                size_t val_len = token_len - len;
+                if (val_len >= out_size) {
+                    val_len = out_size - 1U;
+                }
+                memcpy(out, cursor + len, val_len);
+                out[val_len] = '\0';
+            }
             return 1;
         }
         cursor = end;
@@ -300,6 +320,33 @@ static int cmdline_has_option(const char *option) {
         }
     }
     return 0;
+}
+
+static int cmdline_has_option(const char *option) {
+    return cmdline_find_token(option, 0, NULL, 0U);
+}
+
+static uint32_t cmdline_u32_bounded(const char *prefix, uint32_t fallback, uint32_t min_val, uint32_t max_val) {
+    char value[32];
+    char *endptr = NULL;
+    unsigned long parsed;
+
+    if (!cmdline_find_token(prefix, 1, value, sizeof(value))) {
+        return fallback;
+    }
+    errno = 0;
+    parsed = strtoul(value, &endptr, 10);
+    if (errno != 0 || endptr == value || *endptr != '\0' || parsed < min_val || parsed > max_val) {
+        return fallback;
+    }
+    return (uint32_t)parsed;
+}
+
+static void init_pointer_geometry_from_cmdline(void) {
+    dvm_pointer_width = cmdline_u32_bounded(DISPLAY_WIDTH_CMDLINE_PREFIX, DEFAULT_DVM_POINTER_WIDTH,
+                                            MIN_DVM_POINTER_DIM, MAX_DVM_POINTER_WIDTH);
+    dvm_pointer_height = cmdline_u32_bounded(DISPLAY_HEIGHT_CMDLINE_PREFIX, DEFAULT_DVM_POINTER_HEIGHT,
+                                             MIN_DVM_POINTER_DIM, MAX_DVM_POINTER_HEIGHT);
 }
 
 static int write_input_event(int fd, uint16_t type, uint16_t code, int32_t value) {
@@ -357,21 +404,21 @@ static int input_selftest_start(struct input_selftest *selftest) {
     memset(&abs_setup, 0, sizeof(abs_setup));
     abs_setup.code = ABS_X;
     abs_setup.absinfo.minimum = 0;
-    abs_setup.absinfo.maximum = DVM_POINTER_WIDTH - 1;
+    abs_setup.absinfo.maximum = (int32_t)(dvm_pointer_width - 1U);
     if (ioctl(fd, UI_ABS_SETUP, &abs_setup) < 0) {
         close(fd);
         return -1;
     }
     abs_setup.code = ABS_Y;
-    abs_setup.absinfo.maximum = DVM_POINTER_HEIGHT - 1;
+    abs_setup.absinfo.maximum = (int32_t)(dvm_pointer_height - 1U);
     if (ioctl(fd, UI_ABS_SETUP, &abs_setup) < 0 || ioctl(fd, UI_DEV_CREATE) < 0) {
         close(fd);
         return -1;
     }
     (void)nanosleep(&settle, NULL);
     selftest->uinput_fd = fd;
-    selftest->pointer_x = DVM_POINTER_WIDTH / 2;
-    selftest->pointer_y = DVM_POINTER_HEIGHT / 2;
+    selftest->pointer_x = (int32_t)(dvm_pointer_width / 2U);
+    selftest->pointer_y = (int32_t)(dvm_pointer_height / 2U);
     selftest->enabled = 1;
     fprintf(stderr, "rustos-dvm-agent: input selftest evdev ready\n");
     fflush(stderr);
@@ -444,13 +491,13 @@ static int input_selftest_emit_cycle(struct input_selftest *selftest) {
     selftest->pointer_y += dy;
     if (selftest->pointer_x < 0) {
         selftest->pointer_x = 0;
-    } else if (selftest->pointer_x >= DVM_POINTER_WIDTH) {
-        selftest->pointer_x = DVM_POINTER_WIDTH - 1;
+    } else if (selftest->pointer_x >= (int32_t)dvm_pointer_width) {
+        selftest->pointer_x = (int32_t)(dvm_pointer_width - 1U);
     }
     if (selftest->pointer_y < 0) {
         selftest->pointer_y = 0;
-    } else if (selftest->pointer_y >= DVM_POINTER_HEIGHT) {
-        selftest->pointer_y = DVM_POINTER_HEIGHT - 1;
+    } else if (selftest->pointer_y >= (int32_t)dvm_pointer_height) {
+        selftest->pointer_y = (int32_t)(dvm_pointer_height - 1U);
     }
     if (write_input_event(fd, EV_ABS, ABS_X, selftest->pointer_x) != 0 ||
         write_input_event(fd, EV_ABS, ABS_Y, selftest->pointer_y) != 0 ||
@@ -1237,9 +1284,9 @@ static int pointer_state_configure(struct pointer_state *state, int pointer_fd) 
     state->absolute_min_y = abs_y.minimum;
     state->absolute_max_y = abs_y.maximum;
     state->absolute_x = scale_absolute_axis(abs_x.value, abs_x.minimum, abs_x.maximum,
-                                            DVM_POINTER_WIDTH);
+                                            (int32_t)dvm_pointer_width);
     state->absolute_y = scale_absolute_axis(abs_y.value, abs_y.minimum, abs_y.maximum,
-                                            DVM_POINTER_HEIGHT);
+                                            (int32_t)dvm_pointer_height);
     state->absolute_seen_x = 1;
     state->absolute_seen_y = 1;
     state->absolute_initialized = 1;
@@ -1618,7 +1665,7 @@ static int consume_pointer_event(struct pointer_state *state, const struct input
         int scaled;
         if (event->code == ABS_X) {
             scaled = scale_absolute_axis(event->value, state->absolute_min_x,
-                                         state->absolute_max_x, DVM_POINTER_WIDTH);
+                                         state->absolute_max_x, (int32_t)dvm_pointer_width);
             if (scaled < 0) {
                 errno = EINVAL;
                 return -1;
@@ -1627,7 +1674,7 @@ static int consume_pointer_event(struct pointer_state *state, const struct input
             state->absolute_seen_x = 1;
         } else if (event->code == ABS_Y) {
             scaled = scale_absolute_axis(event->value, state->absolute_min_y,
-                                         state->absolute_max_y, DVM_POINTER_HEIGHT);
+                                         state->absolute_max_y, (int32_t)dvm_pointer_height);
             if (scaled < 0) {
                 errno = EINVAL;
                 return -1;
@@ -2058,6 +2105,7 @@ static void serve(const struct control_contract *contract) {
 
 int main(int argc, char **argv) {
     struct control_contract contract;
+    init_pointer_geometry_from_cmdline();
     parse_contract(&contract);
     if (argc == 1 || strcmp(argv[1], "announce") == 0) {
         printf("rustos-dvm-agent: contract protocol=%s state=%s\n", contract.protocol,

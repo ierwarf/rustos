@@ -16,8 +16,8 @@ const KIND_SESSION_END: u8 = 3;
 const KIND_POINTER_POSITION: u8 = 4;
 const LINUX_EVDEV_KEY_MAX: u16 = 0x02ff;
 const POINTER_BUTTON_MASK: u8 = 0x1f;
-const POINTER_POSITION_MAX_X: u16 = 2879;
-const POINTER_POSITION_MAX_Y: u16 = 1799;
+const POINTER_POSITION_MAX_X: u16 = 7679;
+const POINTER_POSITION_MAX_Y: u16 = 4319;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DvmOutcome {

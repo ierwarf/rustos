@@ -119,6 +119,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         } else {
             None
         };
+    let display_geometry = DisplayGeometry::detect_host();
     let gui_dvm_surfaces = if let Some(directory) = display_backing_dir
         .as_ref()
         .filter(|_| options.gui_dvm_surfaces)
@@ -127,7 +128,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         // into its IOMMUFD IOAS. Keep the writable ivshmem BAR on tmpfs: a
         // regular build-directory file cannot be write-pinned by MAP_FILE.
         let path = directory.path().join("dvm-display.ivshmem");
-        create_gui_dvm_surfaces(&path)?;
+        create_gui_dvm_surfaces(&path, display_geometry)?;
         Some(path)
     } else {
         None
@@ -137,7 +138,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         .filter(|_| options.gui_dvm_surfaces)
     {
         let path = directory.path().join("dvm-display.pmem");
-        create_gui_dvm_surfaces(&path)?;
+        create_gui_dvm_surfaces(&path, display_geometry)?;
         Some(path)
     } else {
         None
@@ -244,6 +245,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         gui_dvm_surfaces,
         gui_dvm_pixels,
         gui_dvm_app_buffers,
+        display_geometry,
         dvm_display_doorbell,
         dvm_network_shmem,
         dvm_block_aperture,
@@ -363,7 +365,7 @@ fn create_dvm_app_buffer_aperture(path: &Path) -> Result<()> {
 /// Allocate the production GUI-DVM three-surface pool for the KVM topology.
 /// The L0 runner creates every slot and control record before either guest
 /// starts. Neither guest gets to select an address, slot count, or queue size.
-fn create_gui_dvm_surfaces(path: &Path) -> Result<()> {
+fn create_gui_dvm_surfaces(path: &Path, geometry: DisplayGeometry) -> Result<()> {
     if path.to_string_lossy().contains(',') {
         bail!(
             "KVM shared-display path contains an unsupported QEMU option separator: {}",
@@ -372,8 +374,8 @@ fn create_gui_dvm_surfaces(path: &Path) -> Result<()> {
     }
     let header = DvmGuiSurfacePoolHeader::new(
         DVM_DISPLAY_REGION_BYTES,
-        DVM_DISPLAY_WIDTH,
-        DVM_DISPLAY_HEIGHT,
+        geometry.width,
+        geometry.height,
     );
     if !header.is_valid() {
         bail!("refusing to create invalid GUI-DVM surface-pool header");
@@ -381,8 +383,8 @@ fn create_gui_dvm_surfaces(path: &Path) -> Result<()> {
     let atlas_header = DvmGpuAtlasPoolHeader::new(
         DVM_DISPLAY_REGION_BYTES,
         header,
-        DVM_GPU_ATLAS_WIDTH,
-        DVM_GPU_ATLAS_HEIGHT,
+        geometry.atlas_width,
+        geometry.atlas_height,
     )
     .ok_or_else(|| anyhow::anyhow!("refusing to create invalid GPU atlas-pool header"))?;
     let mut file = std::fs::OpenOptions::new()
@@ -410,7 +412,11 @@ fn create_gui_dvm_surfaces(path: &Path) -> Result<()> {
 /// A successful GUI-DVM smoke must prove a valid host `PRESENT` record and
 /// pixels in exactly the slot named by that record. This rejects a host-only
 /// pool, a stale record, and pixels written outside the fixed slot capability.
-fn verify_dvm_display_surface(control_path: &Path, pixel_path: &Path) -> Result<()> {
+fn verify_dvm_display_surface(
+    control_path: &Path,
+    pixel_path: &Path,
+    geometry: DisplayGeometry,
+) -> Result<()> {
     let mut file = std::fs::File::open(control_path)
         .with_context(|| format!("open DVM display control {}", control_path.display()))?;
     let mut encoded = [0_u8; DvmGuiSurfacePoolHeader::encoded_len()];
@@ -419,8 +425,8 @@ fn verify_dvm_display_surface(control_path: &Path, pixel_path: &Path) -> Result<
     let header = DvmGuiSurfacePoolHeader::decode(&encoded)
         .context("GUI-DVM surface-pool header changed or became invalid during smoke")?;
     if header.region_bytes != DVM_DISPLAY_REGION_BYTES
-        || header.width != DVM_DISPLAY_WIDTH
-        || header.height != DVM_DISPLAY_HEIGHT
+        || header.width != geometry.width
+        || header.height != geometry.height
     {
         bail!(
             "GUI-DVM surface-pool header differs from launch contract: region={} width={} height={}",

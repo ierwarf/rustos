@@ -4963,7 +4963,7 @@ mod tests {
                 .is_ok()
         );
         let invalid_position = parse_message(
-            "EVENT\nid=6\nop=input-stream\ntype=pointer-position\nx=2880\ny=450\nwheel-v=0\nwheel-h=0\nbuttons=0",
+            "EVENT\nid=6\nop=input-stream\ntype=pointer-position\nx=7680\ny=450\nwheel-v=0\nwheel-h=0\nbuttons=0",
         )
         .unwrap();
         assert!(
@@ -4993,7 +4993,7 @@ mod tests {
         assert!(RustosInputFrame::linux_evdev_key(7, 1, 0, 1).is_err());
         assert!(RustosInputFrame::linux_evdev_key(7, 1, 30, 3).is_err());
         assert!(RustosInputFrame::linux_evdev_pointer(7, 3, 0, 0, 0, 0, 0x20).is_err());
-        assert!(RustosInputFrame::linux_evdev_pointer_position(7, 4, 2880, 450, 0, 0, 0).is_err());
+        assert!(RustosInputFrame::linux_evdev_pointer_position(7, 4, 7680, 450, 0, 0, 0).is_err());
     }
 
     #[test]

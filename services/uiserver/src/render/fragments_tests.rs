@@ -485,7 +485,7 @@ fn cached_opaque_wayland_interior_hits_and_invalidates_by_content_version() {
 }
 
 #[test]
-fn desktop_and_maximized_window_at_2880x1800_fit_3072x3072_atlas() {
+fn desktop_and_maximized_window_at_2880x1800_fit_dynamic_atlas() {
     let output = rect(0, 0, 2880, 1800);
     let upper = window(rect(15, 25, 2850, 1750), 255);
     let opaque = opaque_wayland_interior(&upper);
@@ -504,7 +504,7 @@ fn desktop_and_maximized_window_at_2880x1800_fit_3072x3072_atlas() {
         },
     ];
     let (fragments, regions) =
-        packed(&layers, output, 3072, 3072).expect("2880x1800 desktop + maximized client + dock");
+        packed(&layers, output, 3008, 2944).expect("2880x1800 desktop + maximized client + dock");
     assert_eq!(fragments.len(), regions.len());
     assert!(fragments.iter().any(|f| f.layer_index == 1));
 }

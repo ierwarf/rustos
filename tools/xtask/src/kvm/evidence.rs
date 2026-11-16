@@ -266,7 +266,7 @@ mod display_recovery_tests {
     fn old_evidence_cannot_complete_a_new_attempt() {
         let log = "rustos-dvm-display: recovery v=1 generation=1 attempt=1 state=ready cause=none errno=0 frames=1 sequence=1\nrustos-dvm-display: active old\nrustos-dvm-display: recovery v=1 generation=2 attempt=1 state=starting cause=none errno=0\n";
         assert!(current_display_attempt_log(log).is_none());
-        assert!(!dvm_display_relay_ready(log, false));
+        assert!(!dvm_display_relay_ready(log, false, DisplayGeometry::default()));
         let ready = format!("{log}rustos-dvm-display: recovery v=1 generation=2 attempt=1 state=ready cause=none errno=0 frames=1 sequence=2\n");
         assert!(!current_display_attempt_log(&ready).unwrap().contains("active old"));
     }
@@ -410,19 +410,19 @@ fn dvm_physical_frames_ready(log: &str) -> bool {
 /// the bootstrap query may legitimately observe the provider before the atlas
 /// exists, so the durable display-ready milestone proves that promotion instead
 /// of requiring a time-dependent flag from the earlier snapshot.
-fn dvm_display_provider_ready(log: &str) -> bool {
+fn dvm_display_provider_ready(log: &str, geometry: DisplayGeometry) -> bool {
     let expected_stride = DvmGuiSurfacePoolHeader::new(
         DVM_DISPLAY_REGION_BYTES,
-        DVM_DISPLAY_WIDTH,
-        DVM_DISPLAY_HEIGHT,
+        geometry.width,
+        geometry.height,
     )
     .stride_bytes;
     let provider = log.lines().any(|line| {
         let Some((_, fields)) = line.split_once("uiserver: display_get_info ") else {
             return false;
         };
-        uiserver_display_field_is(fields, "width", DVM_DISPLAY_WIDTH)
-            && uiserver_display_field_is(fields, "height", DVM_DISPLAY_HEIGHT)
+        uiserver_display_field_is(fields, "width", geometry.width)
+            && uiserver_display_field_is(fields, "height", geometry.height)
             && uiserver_display_field_is(fields, "stride", expected_stride)
             && uiserver_display_field_is(fields, "bpp", 4)
             && uiserver_display_field_is(fields, "fmt", 1)
@@ -439,11 +439,11 @@ fn dvm_display_provider_ready(log: &str) -> bool {
     provider && log.contains("name=product-display-ready")
 }
 
-fn dvm_display_relay_ready(log: &str, physical_amdgpu: bool) -> bool {
+fn dvm_display_relay_ready(log: &str, physical_amdgpu: bool, geometry: DisplayGeometry) -> bool {
     let expected_stride = DvmGuiSurfacePoolHeader::new(
         DVM_DISPLAY_REGION_BYTES,
-        DVM_DISPLAY_WIDTH,
-        DVM_DISPLAY_HEIGHT,
+        geometry.width,
+        geometry.height,
     )
     .stride_bytes;
     let current = if latest_display_recovery(log).is_some() {
@@ -466,8 +466,8 @@ fn dvm_display_relay_ready(log: &str, physical_amdgpu: bool) -> bool {
                 && line.contains("staged-damage-copy=1")
         };
         line.contains("rustos-dvm-display: active")
-            && line.contains(&format!("width={DVM_DISPLAY_WIDTH}"))
-            && line.contains(&format!("height={DVM_DISPLAY_HEIGHT}"))
+            && line.contains(&format!("width={}", geometry.width))
+            && line.contains(&format!("height={}", geometry.height))
             && line.contains(&format!("stride={expected_stride}"))
             && line.contains("event=ivshmem-msix-uio")
             && has_interrupt
@@ -817,15 +817,17 @@ fn interactive_display_ready(layout: &KvmLayout, rustos_log: &str, dvm_log: &str
         layout.gui_dvm_surfaces.as_deref(),
         layout.gui_dvm_pixels.as_deref(),
     ) {
-        (Some(control), Some(pixels)) => verify_dvm_display_surface(control, pixels).is_ok(),
+        (Some(control), Some(pixels)) => {
+            verify_dvm_display_surface(control, pixels, layout.display_geometry).is_ok()
+        }
         _ => false,
     };
     let block_ready = rustos_log.contains(RUSTOS_DVM_BLOCK_MARKER)
         && rustos_log.contains(RUSTOS_DVM_BLOCK_E2E_MARKER)
         && dvm_log.contains(DVM_BLOCK_READY_MARKER)
         && verify_dvm_block_ready(layout).is_ok();
-    dvm_display_provider_ready(rustos_log)
-        && dvm_display_relay_ready(dvm_log, false)
+    dvm_display_provider_ready(rustos_log, layout.display_geometry)
+        && dvm_display_relay_ready(dvm_log, false, layout.display_geometry)
         && surface_ready
         && block_ready
         && rustos_log.contains(WAYCLICK_FIRST_FRAME_MARKER)
@@ -843,7 +845,9 @@ fn validate_interactive_session(layout: &KvmLayout, pointer_observed: bool) -> R
             layout.dvm_serial_log.display(),
         );
     }
-    if !dvm_display_provider_ready(&rustos_log) || !dvm_display_relay_ready(&dvm_log, false) {
+    if !dvm_display_provider_ready(&rustos_log, layout.display_geometry)
+        || !dvm_display_relay_ready(&dvm_log, false, layout.display_geometry)
+    {
         bail!(
             "interactive KVM DVM acceptance lacks the active atomic GUI-DVM display contract; inspect {} and {}",
             layout.debugcon_log.display(),
@@ -869,6 +873,7 @@ fn validate_interactive_session(layout: &KvmLayout, pointer_observed: bool) -> R
             .gui_dvm_pixels
             .as_deref()
             .context("interactive session lost GUI-DVM pixel backing")?,
+        layout.display_geometry,
     )?;
     if !uiserver_idle_ticks_healthy(&rustos_log, INTERACTIVE_IDLE_TICKS) {
         bail!(

@@ -222,9 +222,10 @@ fn spawn_rustos_guest(
             true,
         );
     } else {
-        rustos_command
-            .arg("-device")
-            .arg("virtio-gpu-pci,id=rustos-virtio-gpu,xres=2880,yres=1800");
+        rustos_command.arg("-device").arg(format!(
+            "virtio-gpu-pci,id=rustos-virtio-gpu,xres={},yres={}",
+            layout.display_geometry.width, layout.display_geometry.height
+        ));
     }
     if let Some(shared_network) = layout.dvm_network_shmem.as_deref() {
         append_dvm_network_ivshmem(&mut rustos_command, shared_network);
@@ -258,9 +259,15 @@ fn spawn_dvm_guest(
 ) -> Result<Child> {
     let mut dvm_command = Command::new(qemu);
     let dvm_append = if options.exercise_input {
-        "console=ttyS0 preempt=full rustos.dvm.input-selftest=1"
+        format!(
+            "console=ttyS0 preempt=full rustos.dvm.input-selftest=1 rustos.dvm.display-width={} rustos.dvm.display-height={}",
+            layout.display_geometry.width, layout.display_geometry.height
+        )
     } else {
-        "console=ttyS0 preempt=full"
+        format!(
+            "console=ttyS0 preempt=full rustos.dvm.display-width={} rustos.dvm.display-height={}",
+            layout.display_geometry.width, layout.display_geometry.height
+        )
     };
     let dvm_display = qemu_display_backend(guest_display, host_render_node, options.fit_host_window)?;
     if guest_display == GuestDisplay::DvmGtk {
@@ -292,7 +299,7 @@ fn spawn_dvm_guest(
         .arg(&artifacts.rootfs)
         .args([
             "-append",
-            dvm_append,
+            &dvm_append,
             "-display",
             &dvm_display,
             "-vga",
@@ -314,7 +321,7 @@ fn spawn_dvm_guest(
             layout.dvm_control_secret.display()
         ));
     append_dvm_network_device(&mut dvm_command, guest_display);
-    if !append_dvm_virtual_gpu(&mut dvm_command, guest_display) {
+    if !append_dvm_virtual_gpu(&mut dvm_command, guest_display, layout.display_geometry) {
         let bdf = options
             .physical_gpu_bdf
             .as_deref()
@@ -663,8 +670,12 @@ fn wait_for_parallel_boot(
             && dvm_relay_fps_ready
             && dvm_runtime_ready;
         let dvm_display_ready = !options.gui_dvm_surfaces
-            || (dvm_display_provider_ready(&rustos_log)
-                && dvm_display_relay_ready(&dvm_log, options.physical_gpu_bdf.is_some()));
+            || (dvm_display_provider_ready(&rustos_log, layout.display_geometry)
+                && dvm_display_relay_ready(
+                    &dvm_log,
+                    options.physical_gpu_bdf.is_some(),
+                    layout.display_geometry,
+                ));
         let physical_gpu_frames_ready = options
             .physical_gpu_bdf
             .as_ref()
@@ -984,10 +995,12 @@ impl RecoveryHarness<'_> {
             // has exited. Recreate the signed/headered initial state instead
             // of teaching either guest to accept a predecessor's active epoch.
             if let Some(path) = self.layout.gui_dvm_surfaces.as_deref() {
-                create_gui_dvm_surfaces(path).context("reset GUI-DVM control region")?;
+                create_gui_dvm_surfaces(path, self.layout.display_geometry)
+                    .context("reset GUI-DVM control region")?;
             }
             if let Some(path) = self.layout.gui_dvm_pixels.as_deref() {
-                create_gui_dvm_surfaces(path).context("reset GUI-DVM pixel region")?;
+                create_gui_dvm_surfaces(path, self.layout.display_geometry)
+                    .context("reset GUI-DVM pixel region")?;
             }
             if let Some(path) = self.layout.gui_dvm_app_buffers.as_deref() {
                 create_dvm_app_buffer_aperture(path).context("reset DVM app-buffer aperture")?;

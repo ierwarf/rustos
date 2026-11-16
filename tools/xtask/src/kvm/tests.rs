@@ -8,7 +8,8 @@ mod tests {
         DVM_BLOCK_MEDIA_FEATURES, DVM_BLOCK_READY_MARKER, DVM_BOOTSTRAP_FRAME_MARKER,
         DVM_CONTROL_AUTHENTICATION, DVM_CONTROL_CAPABILITIES, DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT,
         DVM_DISPLAY_REGION_BYTES, DVM_GPU_COMPOSITOR_MARKER, DVM_KEYBOARD_INGRESS_MARKER,
-        DVM_POINTER_INGRESS_MARKER, DvmNetworkCounters, GuestDisplay, MAX_SMOKE_TIMEOUT,
+        DVM_POINTER_INGRESS_MARKER, DisplayGeometry, DvmNetworkCounters, GuestDisplay,
+        MAX_SMOKE_TIMEOUT,
         PHYSICAL_GPU_PROFILES, RUSTOS_BOOT_MARKER, RUSTOS_DVM_BLOCK_E2E_MARKER,
         RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER, RUSTOS_DVM_BLOCK_FLUSH_FAULT_MARKER,
         RUSTOS_DVM_BLOCK_MARKER, RUSTOS_GPU_ACTIVE_MARKER, RUSTOS_GPU_SCENE_COMPILER_MARKER, RUSTOS_INIT_IDENTITY_MARKER,
@@ -263,16 +264,20 @@ mod tests {
                 .expected_dvm_markers
                 .contains(&DVM_BOOTSTRAP_FRAME_MARKER.to_owned())
         );
+        let geometry = DisplayGeometry::from_dimensions(2880, 1800);
         assert!(dvm_display_provider_ready(
             "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=2880 height=1800 stride=11776 bpp=4 fmt=1 flags=0x6 gen=1\n\
-             seq=9 msg=\"milestone name=product-display-ready arg0=0x1 arg1=0x1\""
+             seq=9 msg=\"milestone name=product-display-ready arg0=0x1 arg1=0x1\"",
+            geometry,
         ));
         assert!(!dvm_display_provider_ready(
-            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=2880 height=1800 stride=11776 bpp=4 fmt=1 flags=0x6 gen=1"
+            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=2880 height=1800 stride=11776 bpp=4 fmt=1 flags=0x6 gen=1",
+            geometry,
         ));
         assert!(!dvm_display_provider_ready(
             "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=2880 height=1800 stride=11776 bpp=4 fmt=1 flags=0x4 gen=1\n\
-             seq=9 msg=\"milestone name=product-display-ready arg0=0x1 arg1=0x1\""
+             seq=9 msg=\"milestone name=product-display-ready arg0=0x1 arg1=0x1\"",
+            geometry,
         ));
         assert!(dvm_display_relay_ready(
             "rustos-dvm-display: peer readiness sent event=ivshmem-msix-uio\n\
@@ -280,22 +285,26 @@ mod tests {
              rustos-dvm-display: scheduler admitted policy=rr priority=9 rttime_soft_us=50000 rttime_hard_us=100000 rttime_hard_action=terminate\n\
              rustos-dvm-display: active width=2880 height=1800 stride=11776 format=BGRA8888 event=ivshmem-msix-uio irq_count=1 source-path=staged-copy zero-copy=0 gpu-composition=1 explicit-fence=1 scanout_buffers=3 cpu-final-compose=0 staged-damage-copy=1",
             false,
+            geometry,
         ));
         assert!(!dvm_display_relay_ready(
             "rustos-dvm-display: active width=2880 height=1800 stride=11776 format=BGRA8888 dmabuf-direct-scanout",
             false,
+            geometry,
         ));
         assert!(!dvm_display_relay_ready(
             "rustos-dvm-display: peer readiness sent event=ivshmem-msix-uio\n\
              rustos-dvm-display: host confirmed peer readiness event=ivshmem-msix-uio\n\
              rustos-dvm-display: active width=2880 height=1800 stride=11776 format=BGRA8888 event=ivshmem-msix-uio irq_count=0 source-path=staged-copy zero-copy=0 gpu-composition=1 explicit-fence=1 scanout_buffers=3 cpu-final-compose=0 staged-damage-copy=1",
             false,
+            geometry,
         ));
         assert!(dvm_display_relay_ready(
             "rustos-dvm-display: host confirmed peer readiness event=ivshmem-msix-uio\n\
              rustos-dvm-display: scheduler admitted policy=rr priority=9 rttime_soft_us=50000 rttime_hard_us=100000 rttime_hard_action=terminate\n\
              rustos-dvm-display: active width=2880 height=1800 stride=11776 format=BGRA8888 event=ivshmem-msix-uio irq_count=1 source-path=dmabuf zero-copy=1 gpu-composition=1 explicit-fence=1 scanout_buffers=3 cpu-final-compose=0 staged-damage-copy=0",
             true,
+            geometry,
         ));
         assert_eq!(
             dvm_display_failure(
@@ -956,17 +965,18 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
             "none"
         );
         assert!(qemu_display_backend(GuestDisplay::Headless, None, true).is_err());
+        let geometry = DisplayGeometry::from_dimensions(2880, 1800);
         assert!(
-            dvm_gpu_device(GuestDisplay::DvmGtk)
+            dvm_gpu_device(GuestDisplay::DvmGtk, geometry)
                 .unwrap()
                 .starts_with("virtio-gpu-gl-pci,id=")
         );
         assert!(
-            dvm_gpu_device(GuestDisplay::Headless)
+            dvm_gpu_device(GuestDisplay::Headless, geometry)
                 .unwrap()
                 .contains("hostmem=256M")
         );
-        assert!(dvm_gpu_device(GuestDisplay::Physical).is_none());
+        assert!(dvm_gpu_device(GuestDisplay::Physical, geometry).is_none());
         assert_eq!(dvm_machine(), "q35,accel=kvm,i8042=off");
         assert_eq!(
             dvm_pointer_device(GuestDisplay::DvmGtk),
@@ -978,7 +988,7 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
         );
 
         let mut input = Command::new("qemu-system-x86_64");
-        assert!(append_dvm_virtual_gpu(&mut input, GuestDisplay::DvmGtk));
+        assert!(append_dvm_virtual_gpu(&mut input, GuestDisplay::DvmGtk, geometry));
         append_dvm_input_devices(&mut input, GuestDisplay::DvmGtk);
         let input_args = input
             .get_args()
@@ -1075,25 +1085,78 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
 
     #[test]
     fn kvm_gpu_atlas_layout_fits_pixel_backing() {
-        let pool = super::DvmGuiSurfacePoolHeader::new(
-            DVM_DISPLAY_REGION_BYTES,
-            super::DVM_DISPLAY_WIDTH,
-            super::DVM_DISPLAY_HEIGHT,
+        for (width, height) in [
+            (1920, 1080),
+            (2560, 1440),
+            (2880, 1800),
+            (3840, 2160),
+            (7680, 4320),
+        ] {
+            let geometry = DisplayGeometry::from_dimensions(width, height);
+            let pool = super::DvmGuiSurfacePoolHeader::new(
+                DVM_DISPLAY_REGION_BYTES,
+                geometry.width,
+                geometry.height,
+            );
+            assert!(pool.is_valid(), "{width}x{height} pool must be valid");
+            let atlas = super::DvmGpuAtlasPoolHeader::new(
+                DVM_DISPLAY_REGION_BYTES,
+                pool,
+                geometry.atlas_width,
+                geometry.atlas_height,
+            )
+            .expect("GPU atlas layout must fit the KVM pixel backing");
+            let last_slot = driver_domain_protocol::DVM_GPU_RENDER_MAX_IN_FLIGHT - 1;
+            let atlas_end = atlas
+                .atlas_slot_offset(last_slot)
+                .and_then(|offset| offset.checked_add(atlas.atlas_slot_bytes))
+                .expect("last GPU atlas slot must have a bounded end");
+            assert!(
+                atlas_end <= DVM_DISPLAY_REGION_BYTES,
+                "{width}x{height} atlas_end={atlas_end} exceeds backing {DVM_DISPLAY_REGION_BYTES}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_display_detection_picks_connected_edp_and_scales_above_4k() {
+        let base = std::env::temp_dir().join(format!(
+            "rustos-xtask-drm-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Headless/empty DRM directory falls back to 2560x1440.
+        assert_eq!(
+            DisplayGeometry::detect_host_in(&base),
+            DisplayGeometry::default()
         );
-        assert!(pool.is_valid());
-        let atlas = super::DvmGpuAtlasPoolHeader::new(
-            DVM_DISPLAY_REGION_BYTES,
-            pool,
-            super::DVM_GPU_ATLAS_WIDTH,
-            super::DVM_GPU_ATLAS_HEIGHT,
-        )
-        .expect("GPU atlas layout must fit the KVM pixel backing");
-        let last_slot = driver_domain_protocol::DVM_GPU_RENDER_MAX_IN_FLIGHT - 1;
-        let atlas_end = atlas
-            .atlas_slot_offset(last_slot)
-            .and_then(|offset| offset.checked_add(atlas.atlas_slot_bytes))
-            .expect("last GPU atlas slot must have a bounded end");
-        assert!(atlas_end <= DVM_DISPLAY_REGION_BYTES);
+
+        // Disconnected HDMI + connected eDP prefers connected eDP first mode.
+        let hdmi = base.join("card1-HDMI-A-1");
+        std::fs::create_dir_all(&hdmi).unwrap();
+        std::fs::write(hdmi.join("status"), "disconnected\n").unwrap();
+        std::fs::write(hdmi.join("modes"), "3840x2160\n").unwrap();
+
+        let edp = base.join("card1-eDP-1");
+        std::fs::create_dir_all(&edp).unwrap();
+        std::fs::write(edp.join("status"), "connected\n").unwrap();
+        std::fs::write(edp.join("modes"), "2880x1800\n1920x1200\n").unwrap();
+
+        let detected = DisplayGeometry::detect_host_in(&base);
+        assert_eq!(detected.width, 2880);
+        assert_eq!(detected.height, 1800);
+        assert_eq!(detected.atlas_width, 3008);
+        assert_eq!(detected.atlas_height, 2944);
+
+        // Connected >4K display halves dimensions while preserving aspect ratio.
+        std::fs::write(edp.join("modes"), "5120x2880\n").unwrap();
+        let scaled = DisplayGeometry::detect_host_in(&base);
+        assert_eq!(scaled.width, 2560);
+        assert_eq!(scaled.height, 1440);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
