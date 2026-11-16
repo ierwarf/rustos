@@ -81,6 +81,32 @@ pub(super) fn read_device_buffer_at(
 }
 
 pub(super) fn write(memfd: &mut multitask::MemfdHandle, user_ptr: u64, user_len: u64) -> u64 {
+    write_with(user_ptr, user_len, |_written_so_far, chunk| {
+        memfd.write_from(chunk)
+    })
+}
+
+pub(super) fn write_at(
+    memfd: &multitask::MemfdHandle,
+    user_ptr: u64,
+    user_len: u64,
+    offset: u64,
+) -> u64 {
+    let Ok(base) = usize::try_from(offset) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    write_with(user_ptr, user_len, |written_so_far, chunk| {
+        let pos = base
+            .checked_add(written_so_far)
+            .ok_or(multitask::MemfdError::InvalidArgument)?;
+        memfd.write_at(pos, chunk)
+    })
+}
+
+fn write_with<F>(user_ptr: u64, user_len: u64, mut write_chunk: F) -> u64
+where
+    F: FnMut(usize, &[u8]) -> Result<usize, multitask::MemfdError>,
+{
     let Ok(user_len) = usize::try_from(user_len) else {
         return linux_errno(LINUX_EINVAL);
     };
@@ -100,7 +126,7 @@ pub(super) fn write(memfd: &mut multitask::MemfdHandle, user_ptr: u64, user_len:
         if let Err(err) = usermem::copy_from_current_user_exact(src, &mut chunk[..chunk_len]) {
             return completed_or_error(copied, user_pointer_error_to_linux_errno(err));
         }
-        let written = match memfd.write_from(&chunk[..chunk_len]) {
+        let written = match write_chunk(copied, &chunk[..chunk_len]) {
             Ok(written) => written,
             Err(err) => return completed_or_error(copied, memfd_error_to_linux_errno(err)),
         };

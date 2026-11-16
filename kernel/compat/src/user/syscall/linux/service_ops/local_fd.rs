@@ -258,6 +258,21 @@ fn install_pair(
     }
 }
 
+pub(crate) fn kernel_create_pipe_pair(nonblocking: bool, cloexec: bool) -> Result<(u64, u64), i64> {
+    let (read, write) =
+        PipeHandle::new_pair(multitask::current_user_job_charge_group(), nonblocking)
+            .map_err(pipe_error_errno)?;
+    let fd_flags = if cloexec { multitask::FD_CLOEXEC } else { 0 };
+    match install_pair(read.clone(), write.clone(), fd_flags) {
+        Ok(fds) => Ok(fds),
+        Err(errno) => {
+            release_pipe(&read, true);
+            release_pipe(&write, true);
+            Err(errno)
+        }
+    }
+}
+
 pub fn syscall_linux_pipe2(pipefd_ptr: u64, flags: u64) -> u64 {
     // `flags` is a C `int`: the register's upper half is not ABI.
     let flags = u64::from(flags as u32);
@@ -274,24 +289,10 @@ pub fn syscall_linux_pipe2(pipefd_ptr: u64, flags: u64) -> u64 {
         return linux_errno(user_pointer_error_to_linux_errno(err));
     }
     let nonblocking = flags & linux_abi::O_NONBLOCK != 0;
-    let (read, write) =
-        match PipeHandle::new_pair(multitask::current_user_job_charge_group(), nonblocking) {
-            Ok(pair) => pair,
-            Err(err) => return linux_errno(pipe_error_errno(err)),
-        };
-    let fd_flags = if flags & linux_abi::O_CLOEXEC != 0 {
-        multitask::FD_CLOEXEC
-    } else {
-        0
-    };
-    let (read_fd, write_fd) = match install_pair(read.clone(), write.clone(), fd_flags) {
+    let cloexec = flags & linux_abi::O_CLOEXEC != 0;
+    let (read_fd, write_fd) = match kernel_create_pipe_pair(nonblocking, cloexec) {
         Ok(fds) => fds,
-        Err(errno) => {
-            // Neither end was published: settle each creation reference.
-            release_pipe(&read, true);
-            release_pipe(&write, true);
-            return linux_errno(errno);
-        }
+        Err(errno) => return linux_errno(errno),
     };
     let mut pair = [0_u8; 2 * size_of::<i32>()];
     pair[..4].copy_from_slice(&(read_fd as i32).to_ne_bytes());

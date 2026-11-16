@@ -122,6 +122,41 @@ pub fn syscall_linux_rt_sigaction(
     }
 }
 
+fn update_procd_signal_mask(
+    how: u64,
+    requested_mask: Option<u64>,
+    wants_old: bool,
+) -> Result<Option<u64>, i64> {
+    let mut request = new_procd_request(PROCD_OP_RT_SIGPROCMASK);
+    request.arg0 = how;
+    if let Some(mask) = requested_mask {
+        request.flags |= 0x1;
+        request.payload_len = 8;
+        request.payload[..8].copy_from_slice(&mask.to_ne_bytes());
+    }
+    if wants_old {
+        request.flags |= 0x2;
+    }
+    let response = call_procd(&request)?;
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
+    }
+    if let Some(mask) = requested_mask {
+        sync_current_linux_signal_mask(how, mask);
+    }
+    if wants_old {
+        if response.payload_len as usize != 8 {
+            return Err(LINUX_EINVAL);
+        }
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&response.payload[..8]);
+        Ok(Some(u64::from_ne_bytes(bytes)))
+    } else {
+        ensure_empty_procd_response(&response)?;
+        Ok(None)
+    }
+}
+
 pub fn syscall_linux_rt_sigprocmask(
     how: u64,
     set_ptr: u64,
@@ -131,48 +166,103 @@ pub fn syscall_linux_rt_sigprocmask(
     if sigset_size != size_of::<u64>() as u64 {
         return linux_errno(LINUX_EINVAL);
     }
-    let mut request = new_procd_request(PROCD_OP_RT_SIGPROCMASK);
-    request.arg0 = how;
-    let mut requested_mask = 0_u64;
-    if set_ptr != 0 {
+    let requested_mask = if set_ptr != 0 {
         let mut set = [0_u8; 8];
         if let Err(err) = usermem::copy_from_current_user_exact(set_ptr, &mut set) {
             return linux_errno(user_pointer_error_to_linux_errno(err));
         }
-        requested_mask = u64::from_ne_bytes(set);
-        request.flags |= 0x1;
-        request.payload_len = 8;
-        request.payload[..8].copy_from_slice(&set);
+        Some(u64::from_ne_bytes(set))
+    } else {
+        None
+    };
+    if oldset_ptr != 0
+        && let Err(err) = usermem::validate_current_user_write_buffer(oldset_ptr, 8)
+    {
+        return linux_errno(user_pointer_error_to_linux_errno(err));
     }
-    if oldset_ptr != 0 {
-        if let Err(err) = usermem::validate_current_user_write_buffer(oldset_ptr, 8) {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
-        }
-        request.flags |= 0x2;
-    }
-    let response = match call_procd(&request) {
-        Ok(response) => response,
+    let old = match update_procd_signal_mask(how, requested_mask, oldset_ptr != 0) {
+        Ok(old) => old,
         Err(errno) => return linux_errno(errno),
     };
-    if response.status != 0 {
-        return linux_errno(response.status.unsigned_abs() as i64);
-    }
-    if set_ptr != 0 {
-        sync_current_linux_signal_mask(how, requested_mask);
-    }
-    if oldset_ptr != 0 {
-        if response.payload_len as usize != 8 {
-            return linux_errno(LINUX_EINVAL);
-        }
-        match usermem::write_current_user_bytes(oldset_ptr, &response.payload[..8]) {
+    if let Some(old_mask) = old {
+        match usermem::write_current_user_bytes(oldset_ptr, &old_mask.to_ne_bytes()) {
             Ok(()) => 0,
             Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
         }
     } else {
-        match ensure_empty_procd_response(&response) {
-            Ok(()) => 0,
-            Err(errno) => linux_errno(errno),
+        0
+    }
+}
+
+pub fn syscall_linux_rt_sigpending(set_ptr: u64, sigset_size: u64) -> u64 {
+    if sigset_size != size_of::<u64>() as u64 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if let Err(err) = usermem::validate_current_user_write_buffer(set_ptr, 8) {
+        return linux_errno(user_pointer_error_to_linux_errno(err));
+    }
+    let pending = multitask::current_linux_thread_state()
+        .map(|state| state.pending_signals & state.signal_mask)
+        .unwrap_or(0);
+    match usermem::write_current_user_bytes(set_ptr, &pending.to_ne_bytes()) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
+    }
+}
+
+fn wait_for_interruptible_signal() -> Result<(), i64> {
+    loop {
+        if current_wait_interrupted() {
+            return Err(LINUX_EINTR);
         }
+        while !multitask::arm_block_current_task() {
+            multitask::cond_resched();
+            if current_wait_interrupted() {
+                return Err(LINUX_EINTR);
+            }
+        }
+        if multitask::current_linux_thread_state()
+            .is_some_and(|state| state.pending_signals & !state.signal_mask != 0)
+        {
+            let _ = multitask::cancel_block_current_task();
+            multitask::cond_resched();
+            continue;
+        }
+        if multitask::commit_block_current_task_and_yield().is_none() {
+            return Err(LINUX_EINVAL);
+        }
+    }
+}
+
+pub fn syscall_linux_pause() -> u64 {
+    linux_errno(wait_for_interruptible_signal().unwrap_err())
+}
+
+pub(in crate::user::syscall::linux) fn syscall_linux_rt_sigsuspend(frame: &mut SyscallFrame) -> u64 {
+    let mask_ptr = frame.rdi;
+    let sigset_size = frame.rsi;
+    if sigset_size != size_of::<u64>() as u64 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mut set = [0_u8; 8];
+    if let Err(err) = usermem::copy_from_current_user_exact(mask_ptr, &mut set) {
+        return linux_errno(user_pointer_error_to_linux_errno(err));
+    }
+    let temp_mask = u64::from_ne_bytes(set);
+    let old_mask = match update_procd_signal_mask(linux_abi::SIG_SETMASK, Some(temp_mask), true) {
+        Ok(Some(old)) => old,
+        Ok(None) => return linux_errno(LINUX_EINVAL),
+        Err(errno) => return linux_errno(errno),
+    };
+    let err = wait_for_interruptible_signal().unwrap_err();
+    frame.rax = linux_errno(err);
+    let delivered = deliver_pending_signals_if_needed_with_saved_mask(frame, Some(old_mask));
+    let _ = update_procd_signal_mask(linux_abi::SIG_SETMASK, Some(old_mask), false);
+    if delivered {
+        frame.rax
+    } else {
+        sync_current_linux_signal_mask(linux_abi::SIG_SETMASK, old_mask);
+        linux_errno(err)
     }
 }
 
@@ -470,6 +560,26 @@ pub fn syscall_linux_sched_get_priority_minmax(policy: i64) -> u64 {
         0
     } else {
         linux_errno(LINUX_EINVAL)
+    }
+}
+
+pub fn syscall_linux_sched_rr_get_interval(pid: i64, ts_ptr: u64) -> u64 {
+    if pid < 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if pid != 0
+        && multitask::current_user_process_id() != Some(pid as u64)
+        && multitask::current_user_thread_id() != Some(pid as u64)
+    {
+        return linux_errno(LINUX_ESRCH);
+    }
+    let ts = LinuxTimespecWire {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    match usermem::write_current_user_bytes(ts_ptr, as_bytes(&ts)) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
     }
 }
 

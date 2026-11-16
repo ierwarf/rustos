@@ -172,24 +172,17 @@ impl MemfdHandle {
     }
 
     pub fn write_from(&mut self, src: &[u8]) -> Result<usize, MemfdError> {
-        if src.is_empty() {
-            return Ok(0);
-        }
-
         let mut open = self.inner.lock();
-        let end = open
-            .cursor
-            .checked_add(src.len())
-            .ok_or(MemfdError::InvalidArgument)?;
         let cursor = open.cursor;
-        grow_then(
-            &open.object,
-            end,
-            |state| check_write_seals(state, end),
-            |state| write_at_locked(state.frames.as_slice(), cursor, src),
-        )?;
-        open.cursor = end;
-        Ok(src.len())
+        let written = write_at_object(&open.object, cursor, src)?;
+        open.cursor = cursor + written;
+        Ok(written)
+    }
+
+    /// Writes `src` at `offset` without modifying this open description's cursor.
+    pub fn write_at(&self, offset: usize, src: &[u8]) -> Result<usize, MemfdError> {
+        let object = self.object();
+        write_at_object(&object, offset, src)
     }
 
     pub fn seek(
@@ -650,6 +643,26 @@ fn read_at_locked(frames: &[u64], len: usize, offset: usize, dest: &mut [u8]) ->
     read_len
 }
 
+fn write_at_object(
+    object: &MemfdObject,
+    offset: usize,
+    src: &[u8],
+) -> Result<usize, MemfdError> {
+    if src.is_empty() {
+        return Ok(0);
+    }
+    let end = offset
+        .checked_add(src.len())
+        .ok_or(MemfdError::InvalidArgument)?;
+    grow_then(
+        object,
+        end,
+        |state| check_write_seals(state, end),
+        |state| write_at_locked(state.frames.as_slice(), offset, src),
+    )?;
+    Ok(src.len())
+}
+
 fn write_at_locked(frames: &[u64], offset: usize, src: &[u8]) {
     let mut copied = 0usize;
     while copied < src.len() {
@@ -860,5 +873,33 @@ mod tests {
         );
         assert_eq!(reopened.add_seals(linux_abi::F_SEAL_SHRINK as u32), Ok(()));
         assert_eq!(primary.seals(), reopened.seals());
+    }
+
+    #[test]
+    fn write_at_preserves_cursor_and_respects_seals() {
+        fake_reset(usize::MAX);
+        let mut handle = MemfdHandle::new(String::from("pwrite"), true, None);
+        assert_eq!(handle.truncate(PAGE_SIZE), Ok(()));
+        assert_eq!(handle.seek(128, FileHandleSeekWhence::Start), Ok(128));
+        assert_eq!(handle.write_at(8, b""), Ok(0));
+        assert_eq!(
+            handle.seek(0, FileHandleSeekWhence::Current),
+            Ok(128),
+            "write_at must not move the cursor"
+        );
+        assert_eq!(
+            handle.write_at(usize::MAX - 2, b"abcd"),
+            Err(MemfdError::InvalidArgument)
+        );
+        assert_eq!(handle.add_seals(linux_abi::F_SEAL_GROW as u32), Ok(()));
+        assert_eq!(
+            handle.write_at(PAGE_SIZE, b"x"),
+            Err(MemfdError::PermissionDenied)
+        );
+        assert_eq!(handle.add_seals(linux_abi::F_SEAL_WRITE as u32), Ok(()));
+        assert_eq!(
+            handle.write_at(0, b"X"),
+            Err(MemfdError::PermissionDenied)
+        );
     }
 }

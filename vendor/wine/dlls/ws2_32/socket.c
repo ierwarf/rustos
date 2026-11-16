@@ -728,7 +728,11 @@ BOOL WINAPI DllMain( HINSTANCE instance, DWORD reason, void *reserved )
     switch (reason)
     {
     case DLL_PROCESS_ATTACH:
+#ifdef __RUSTOS__
+        return TRUE;
+#else
         return !__wine_init_unix_call();
+#endif
 
     case DLL_THREAD_DETACH:
         free_per_thread_data();

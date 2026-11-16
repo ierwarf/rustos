@@ -93,6 +93,13 @@ struct LinuxRtSigFrame {
 // construction, current-thread pending-bit clearing, and final register
 // mutation substrate.
 pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> bool {
+    deliver_pending_signals_if_needed_with_saved_mask(frame, None)
+}
+
+pub(super) fn deliver_pending_signals_if_needed_with_saved_mask(
+    frame: &mut SyscallFrame,
+    saved_mask_override: Option<u64>,
+) -> bool {
     // Every syscall return reaches here and almost none of them have a signal
     // to deliver. The hint answers the common case without the scheduler lock;
     // only a raised hint pays for the authoritative snapshot.
@@ -179,7 +186,8 @@ pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> boo
             let Some(commit_thread_state) = commit_thread_state else {
                 return false;
             };
-            if install_rt_signal_frame(frame, signal, commit_thread_state.signal_mask, action)
+            let saved_mask = saved_mask_override.unwrap_or(commit_thread_state.signal_mask);
+            if install_rt_signal_frame(frame, signal, saved_mask, action)
                 .is_ok()
             {
                 clear_current_pending_signal(signal, response.reserved0);

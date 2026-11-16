@@ -37,11 +37,25 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
     use linux_abi::*;
     match nr {
         // unsigned int fd, size_t count
-        SYS_READ | SYS_WRITE | SYS_PREAD64 | SYS_CLOSE | SYS_FSTAT | SYS_DUP | SYS_FTRUNCATE => {
-            [S, W, W, W, W, W]
-        }
+        SYS_READ
+        | SYS_WRITE
+        | SYS_PREAD64
+        | SYS_PWRITE64
+        | SYS_CLOSE
+        | SYS_FSTAT
+        | SYS_DUP
+        | SYS_FTRUNCATE
+        | SYS_FSYNC
+        | SYS_FDATASYNC
+        | SYS_SYNCFS => [S, W, W, W, W, W],
         // unsigned int fd, const struct iovec*, int iovcnt
-        SYS_READV | SYS_WRITEV => [S, W, S, W, W, W],
+        SYS_READV | SYS_WRITEV | SYS_PREADV | SYS_PWRITEV => [S, W, S, W, W, W],
+        // unsigned int fd, const struct iovec*, int iovcnt, pos_l, pos_h, int flags
+        SYS_PREADV2 | SYS_PWRITEV2 => [S, W, S, W, W, U],
+        // int fd, loff_t offset, loff_t len, int advice
+        SYS_FADVISE64 => [S, W, W, U, W, W],
+        // unsigned int first, unsigned int last, unsigned int flags
+        SYS_CLOSE_RANGE => [U, U, U, W, W, W],
         // unsigned int fd, unsigned int count
         SYS_GETDENTS64 => [S, W, U, W, W, W],
         // fd, off_t, whence
@@ -83,7 +97,8 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
         SYS_SCHED_GETSCHEDULER
         | SYS_SCHED_GETPARAM
         | SYS_SCHED_GET_PRIORITY_MAX
-        | SYS_SCHED_GET_PRIORITY_MIN => [S, W, W, W, W, W],
+        | SYS_SCHED_GET_PRIORITY_MIN
+        | SYS_SCHED_RR_GET_INTERVAL => [S, W, W, W, W, W],
         // uaddr, int op, u32 val, timeout*, uaddr2*, u32 val3
         SYS_FUTEX => [W, U, U, W, W, U],
         SYS_PRCTL | SYS_ARCH_PRCTL => [U, W, W, W, W, W],
@@ -288,6 +303,32 @@ mod tests {
         assert_eq!(run(SYS_EXECVE, args), args);
         let out = run(SYS_SYMLINKAT, [0x10, 0xFFFF_FF9C, 0x20, 0, 0, 0]);
         assert_eq!(out[1], AT_FDCWD as u64);
+    }
+
+    #[test]
+    fn positional_vectored_close_range_and_fadvise_args() {
+        let out = run(SYS_PWRITE64, [GARBAGE | 3, 0x1000, 64, 128, 0, 0]);
+        assert_eq!(out, [3, 0x1000, 64, 128, 0, 0]);
+        let out = run(
+            SYS_PREADV2,
+            [GARBAGE | 4, 0x2000, 0xFFFF_FFFE, u64::MAX, 0, GARBAGE | 0x8],
+        );
+        assert_eq!(out[0], 4);
+        assert_eq!(out[2] as i64, -2);
+        assert_eq!(out[3], u64::MAX);
+        assert_eq!(out[5], 0x8);
+        let out = run(
+            SYS_FADVISE64,
+            [GARBAGE | 5, 0, 4096, GARBAGE | 3, 0, 0],
+        );
+        assert_eq!((out[0], out[2], out[3]), (5, 4096, 3));
+        let out = run(
+            SYS_CLOSE_RANGE,
+            [GARBAGE | 3, 0x5_FFFF_FFFF, GARBAGE | CLOSE_RANGE_CLOEXEC, 0, 0, 0],
+        );
+        assert_eq!(out[0], 3);
+        assert_eq!(out[1], u64::from(u32::MAX));
+        assert_eq!(out[2], CLOSE_RANGE_CLOEXEC);
     }
 }
 

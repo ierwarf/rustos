@@ -1,9 +1,7 @@
 EXTRADEFS = -D_WS2_32_
 MODULE    = ws2_32.dll
-UNIXLIB   = ws2_32.so
 IMPORTLIB = ws2_32
 DELAYIMPORTS = dnsapi advapi32 iphlpapi user32
-UNIX_LIBS    = $(PTHREAD_LIBS)
 
 VER_PRODUCTVERSION = 5,1,2600,5512
 
@@ -12,5 +10,4 @@ SOURCES = \
 	inaddr.c \
 	protocol.c \
 	rsrc.rc \
-	socket.c \
-	unixlib.c
+	socket.c

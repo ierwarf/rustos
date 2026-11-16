@@ -142,6 +142,45 @@ pub fn syscall_linux_vfs_ftruncate(fd: u64, len: u64) -> u64 {
     }
 }
 
+pub(crate) fn kernel_vfs_getdents_raw(fd: u64, dest: &mut [u8]) -> Result<usize, i64> {
+    let remote = current_remote_vfs_handle(fd).ok_or(LINUX_EBADF)?;
+    let remote_id = remote.remote_id();
+    acquire_current_remote_vfs_ref(fd, remote_id)?;
+    let result = (|| {
+        let _cursor = acquire_vfs_cursor_gate(remote_id)?;
+        let mut request = new_vfs_request(VFS_IPC_OP_GETDENTS64);
+        request.fd = fd;
+        request.remote_id = remote_id;
+        request.arg1 = dest.len() as u64;
+        let response = match call_vfs_ipc_request(&request) {
+            Ok(response) => response,
+            Err(errno) => {
+                let _ = settle_vfs_cursor_mutation(&request, false);
+                return Err(errno);
+            }
+        };
+        ensure_vfs_status(&response)?;
+        let len = response.payload_len as usize;
+        if len > dest.len() || len > response.payload.len() {
+            let _ = settle_vfs_cursor_mutation(&request, false);
+            return Err(LINUX_EINVAL);
+        }
+        dest[..len].copy_from_slice(&response.payload[..len]);
+        match settle_vfs_cursor_mutation(&request, true) {
+            Ok(()) => Ok(len),
+            Err(errno) => {
+                if len > 0 {
+                    Ok(len)
+                } else {
+                    Err(errno)
+                }
+            }
+        }
+    })();
+    release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
+    result
+}
+
 pub fn syscall_linux_vfs_getdents64(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
@@ -336,6 +375,21 @@ pub fn syscall_linux_vfs_readlinkat(
     }
     if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
         return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    if path.starts_with("/proc/")
+        && let Some(resolved) = super::vfs_socket::proc_fd_readlink_target(&path)
+    {
+        return match resolved {
+            Ok(target) => {
+                let bytes = target.as_bytes();
+                let len = bytes.len().min(user_len);
+                match usermem::write_current_user_bytes(user_ptr, &bytes[..len]) {
+                    Ok(()) => len as u64,
+                    Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+                }
+            }
+            Err(errno) => linux_errno(errno),
+        };
     }
     let mut request = new_vfs_request(VFS_IPC_OP_READLINKAT);
     proc_identity::attach_caller_exec_path(&mut request);
@@ -853,6 +907,67 @@ fn socket_op_honours_nonblock(op: u16) -> bool {
             | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
             | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
     )
+}
+
+pub(crate) fn kernel_netd_poll_fd(fd: u64, events: u32, timeout_ms: u64) -> Result<u32, i64> {
+    let snapshot = snapshot_socket(fd).ok_or(LINUX_ENOTSOCK)?;
+    let outcomes = super::vfs_socket::poll_netd_socket_batch(&[(snapshot.token(), events)], timeout_ms)?;
+    match outcomes.first() {
+        Some(Ok((revents, _))) => Ok(*revents),
+        Some(Err(errno)) => Err(*errno),
+        None => Ok(0),
+    }
+}
+
+pub(crate) fn kernel_netd_raw_socket_op(
+    op: u16,
+    fd: u64,
+    args: [u64; 5],
+    in_payload: &[u8],
+    timeout_ms: Option<u64>,
+) -> Result<(i64, Vec<u8>), i64> {
+    let mut request = NetdIpcRequest {
+        version: NETD_IPC_ABI_VERSION,
+        op,
+        arg0: fd,
+        arg1: args[0],
+        arg2: args[1],
+        arg3: args[2],
+        arg4: args[3],
+        arg5: args[4],
+        ..NetdIpcRequest::default()
+    };
+    if let Some(snapshot) = multitask::current_user_snapshot() {
+        request.pid = snapshot.process_id();
+        request.tid = snapshot.thread_id();
+    }
+    if let Some(security) = multitask::with_current_process_credentials(|security| security) {
+        request.uid = security.uid();
+        request.gid = security.gid();
+        request.euid = security.euid();
+        request.egid = security.egid();
+    }
+    let _socket = populate_netd_socket_token(&mut request).ok_or(LINUX_ENOTSOCK)?;
+    if in_payload.len() > NETD_IPC_PAYLOAD_CAPACITY {
+        return Err(LINUX_EINVAL);
+    }
+    if !in_payload.is_empty() {
+        request.payload[..in_payload.len()].copy_from_slice(in_payload);
+        request.payload_len = in_payload.len() as u32;
+    }
+    let deadline_class = timeout_ms.map_or(ipc_ops::ServiceIpcClass::BulkData, |_| {
+        super::ipc_helpers::deadline::netd_timeout_class(op)
+    });
+    request.deadline_ns = netd_deadline_after_class(deadline_class, timeout_ms);
+    let response = match timeout_ms {
+        Some(ms) => call_netd_ipc_request_with_timeout(&request, ms)?,
+        None => call_netd_ipc_request(&request)?,
+    };
+    let len = usize::try_from(response.payload_len).map_err(|_| LINUX_EINVAL)?;
+    if len > response.payload.len() {
+        return Err(LINUX_EINVAL);
+    }
+    Ok((response.value as i64, response.payload[..len].to_vec()))
 }
 
 pub fn syscall_linux_net4(op: u16, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {

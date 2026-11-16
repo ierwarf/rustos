@@ -527,7 +527,10 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         error_ops::record_busy_linux_syscall(frame);
     }
 
-    if frame.rax != linux_abi::SYS_RT_SIGRETURN {
+    if !matches!(
+        frame.rax,
+        linux_abi::SYS_RT_SIGRETURN | linux_abi::SYS_RT_SIGSUSPEND
+    ) {
         // The signal frame saves `frame.rax`: it must hold this syscall's
         // result, not its number, or sigreturn resumes with the wrong value.
         let number = core::mem::replace(&mut frame.rax, result);

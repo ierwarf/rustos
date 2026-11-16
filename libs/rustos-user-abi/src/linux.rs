@@ -45,6 +45,8 @@ raw_u64! {
     SYS_SOCKET = linux::__NR_socket;
     SYS_SENDTO = linux::__NR_sendto;
     SYS_ACCEPT = linux::__NR_accept;
+    SYS_FSYNC = linux::__NR_fsync;
+    SYS_FDATASYNC = linux::__NR_fdatasync;
     SYS_FTRUNCATE = linux::__NR_ftruncate;
     SYS_FSTAT = linux::__NR_fstat;
     SYS_POLL = linux::__NR_poll;
@@ -63,15 +65,19 @@ raw_u64! {
     SYS_BRK = linux::__NR_brk;
     SYS_RT_SIGACTION = linux::__NR_rt_sigaction;
     SYS_RT_SIGPROCMASK = linux::__NR_rt_sigprocmask;
+    SYS_RT_SIGPENDING = linux::__NR_rt_sigpending;
     SYS_RT_SIGRETURN = linux::__NR_rt_sigreturn;
+    SYS_RT_SIGSUSPEND = linux::__NR_rt_sigsuspend;
     SYS_IOCTL = linux::__NR_ioctl;
     SYS_PREAD64 = linux::__NR_pread64;
+    SYS_PWRITE64 = linux::__NR_pwrite64;
     SYS_READV = linux::__NR_readv;
     SYS_WRITEV = linux::__NR_writev;
     SYS_ACCESS = linux::__NR_access;
     SYS_SCHED_YIELD = linux::__NR_sched_yield;
     SYS_DUP = linux::__NR_dup;
     SYS_DUP2 = linux::__NR_dup2;
+    SYS_PAUSE = linux::__NR_pause;
     SYS_NANOSLEEP = linux::__NR_nanosleep;
     SYS_GETPID = linux::__NR_getpid;
     SYS_FORK = linux::__NR_fork;
@@ -110,6 +116,15 @@ raw_u64! {
     SYS_SCHED_GET_PRIORITY_MAX = linux::__NR_sched_get_priority_max;
     SYS_SCHED_GET_PRIORITY_MIN = linux::__NR_sched_get_priority_min;
     SYS_GETCPU = linux::__NR_getcpu;
+    SYS_SCHED_RR_GET_INTERVAL = linux::__NR_sched_rr_get_interval;
+    SYS_SYNC = linux::__NR_sync;
+    SYS_SYNCFS = linux::__NR_syncfs;
+    SYS_FADVISE64 = linux::__NR_fadvise64;
+    SYS_PREADV = linux::__NR_preadv;
+    SYS_PWRITEV = linux::__NR_pwritev;
+    SYS_PREADV2 = linux::__NR_preadv2;
+    SYS_PWRITEV2 = linux::__NR_pwritev2;
+    SYS_CLOSE_RANGE = linux::__NR_close_range;
     SYS_EXIT = linux::__NR_exit;
     SYS_EXIT_GROUP = linux::__NR_exit_group;
     SYS_TGKILL = linux::__NR_tgkill;
@@ -311,7 +326,21 @@ raw_u64! {
     DT_REG = linux::DT_REG;
     MFD_CLOEXEC = linux::MFD_CLOEXEC;
     MFD_ALLOW_SEALING = linux::MFD_ALLOW_SEALING;
+    POSIX_FADV_NORMAL = linux::POSIX_FADV_NORMAL;
+    POSIX_FADV_RANDOM = linux::POSIX_FADV_RANDOM;
+    POSIX_FADV_SEQUENTIAL = linux::POSIX_FADV_SEQUENTIAL;
+    POSIX_FADV_WILLNEED = linux::POSIX_FADV_WILLNEED;
+    POSIX_FADV_DONTNEED = linux::POSIX_FADV_DONTNEED;
+    RWF_HIPRI = linux::RWF_HIPRI;
+    RWF_DSYNC = linux::RWF_DSYNC;
+    RWF_SYNC = linux::RWF_SYNC;
+    RWF_NOWAIT = linux::RWF_NOWAIT;
 }
+
+pub const POSIX_FADV_NOREUSE: u64 = 5;
+pub const RWF_APPEND: u64 = 0x10;
+pub const CLOSE_RANGE_UNSHARE: u64 = 1 << 1;
+pub const CLOSE_RANGE_CLOEXEC: u64 = 1 << 2;
 
 pub const SCM_CREDENTIALS: u64 = 2;
 pub const MADV_NORMAL: u64 = 0;

@@ -1,3 +1,0 @@
-MODULE    = rasapi16.dll16
-ENABLE_ARCHS = $(WIN16_ARCH)
-EXTRADLLFLAGS = -m16 -Wb,--main-module,rasapi32.dll

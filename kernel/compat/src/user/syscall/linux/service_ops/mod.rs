@@ -2,7 +2,7 @@ pub(crate) use super::*;
 
 pub mod futex_thread;
 pub mod ipc_helpers;
-pub(in crate::user::syscall::linux) mod local_fd;
+pub(in crate::user::syscall) mod local_fd;
 mod local_memfd_io;
 pub mod poll_epoll;
 pub mod proc_identity;

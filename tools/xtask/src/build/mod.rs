@@ -773,6 +773,8 @@ const WINE_CORE_DLL_TARGETS: &[(&str, &str)] = &[
     ("ucrtbase.dll", "dlls/ucrtbase/x86_64-windows/ucrtbase.dll"),
     ("vcruntime140.dll", "dlls/vcruntime140/x86_64-windows/vcruntime140.dll"),
     ("vcruntime140_1.dll", "dlls/vcruntime140_1/x86_64-windows/vcruntime140_1.dll"),
+    ("nsi.dll", "dlls/nsi/x86_64-windows/nsi.dll"),
+    ("ws2_32.dll", "dlls/ws2_32/x86_64-windows/ws2_32.dll"),
 ];
 
 const WINE_NLS_FILES: &[&str] = &[
@@ -815,6 +817,8 @@ fn collect_wine_dll_inputs(
         "ucrtbase",
         "vcruntime140",
         "vcruntime140_1",
+        "nsi",
+        "ws2_32",
     ] {
         let dir = wine_source_dir.join("dlls").join(dll_dir);
         if dir.is_dir() {

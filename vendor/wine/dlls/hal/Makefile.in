@@ -1,8 +1,0 @@
-MODULE    = hal.dll
-IMPORTLIB = hal
-IMPORTS   = ntoskrnl
-
-VER_PRODUCTVERSION = 5,1,2600,5512
-
-SOURCES = \
-	hal.c

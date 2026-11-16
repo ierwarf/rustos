@@ -27,7 +27,362 @@
 WINE_DEFAULT_DEBUG_CHANNEL(winsock);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
 
+#ifdef __RUSTOS__
+
+static int rustos_parse_service_port( const char *service, WORD *port_net )
+{
+    unsigned long port = 0;
+
+    if (!service || !service[0])
+    {
+        *port_net = 0;
+        return 0;
+    }
+    if (!_stricmp( service, "http" )) port = 80;
+    else if (!_stricmp( service, "https" )) port = 443;
+    else if (!_stricmp( service, "domain" )) port = 53;
+    else if (!_stricmp( service, "ssh" )) port = 22;
+    else if (!_stricmp( service, "ftp" )) port = 21;
+    else if (!_stricmp( service, "smtp" )) port = 25;
+    else
+    {
+        char *end = NULL;
+        if (service[0] < '0' || service[0] > '9') return EAI_SERVICE;
+        port = strtoul( service, &end, 10 );
+        if (!end || *end || port > 65535) return EAI_SERVICE;
+    }
+    *port_net = htons( (WORD)port );
+    return 0;
+}
+
+static int rustos_dns_encode_name( const char *name, BYTE *out, int max_len )
+{
+    int pos = 0;
+    const char *p = name;
+
+    if (!name || !name[0]) return -1;
+    while (*p)
+    {
+        const char *dot = strchr( p, '.' );
+        int label_len = dot ? (int)(dot - p) : (int)strlen( p );
+        if (label_len <= 0 || label_len > 63 || pos + 1 + label_len + 1 > max_len)
+            return -1;
+        out[pos++] = (BYTE)label_len;
+        memcpy( out + pos, p, label_len );
+        pos += label_len;
+        p += label_len;
+        if (*p == '.') p++;
+    }
+    out[pos++] = 0;
+    return pos;
+}
+
+static int rustos_dns_skip_name( const BYTE *pkt, int pkt_len, int off )
+{
+    int jumped = 0, cur = off, end_off = -1, steps = 0;
+
+    while (cur < pkt_len && steps++ < 128)
+    {
+        BYTE c = pkt[cur];
+        if (c == 0) return jumped ? end_off : cur + 1;
+        if ((c & 0xc0) == 0xc0)
+        {
+            if (cur + 1 >= pkt_len) return -1;
+            if (!jumped) end_off = cur + 2;
+            jumped = 1;
+            cur = ((c & 0x3f) << 8) | pkt[cur + 1];
+        }
+        else
+        {
+            cur += 1 + c;
+        }
+    }
+    return -1;
+}
+
+static int rustos_dns_query_a( const char *host, DWORD *out_ips, int max_ips )
+{
+    BYTE req[512], resp[512];
+    int qname_len, req_len, rlen, qdcount, ancount, off, i, count = 0;
+    SOCKET s;
+    struct sockaddr_in dns;
+    fd_set rfds;
+    struct timeval tv;
+    WORD txid = (WORD)(GetTickCount() ^ 0x5255);
+
+    if (!host || !host[0] || strlen( host ) > 253) return 0;
+
+    memset( req, 0, sizeof(req) );
+    req[0] = (BYTE)(txid >> 8);
+    req[1] = (BYTE)(txid & 0xff);
+    req[2] = 0x01; /* RD */
+    req[5] = 0x01; /* QDCOUNT = 1 */
+    qname_len = rustos_dns_encode_name( host, req + 12, sizeof(req) - 16 );
+    if (qname_len < 0) return 0;
+    req_len = 12 + qname_len;
+    req[req_len++] = 0x00; req[req_len++] = 0x01; /* QTYPE = A */
+    req[req_len++] = 0x00; req[req_len++] = 0x01; /* QCLASS = IN */
+
+    s = WSASocketA( AF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, 0, 0 );
+    if (s == INVALID_SOCKET) return 0;
+
+    memset( &dns, 0, sizeof(dns) );
+    dns.sin_family = AF_INET;
+    dns.sin_port = htons( 53 );
+    dns.sin_addr.S_un.S_addr = htonl( 0x0a000203 ); /* QEMU SLIRP DNS 10.0.2.3 */
+
+    if (sendto( s, (const char *)req, req_len, 0, (const struct sockaddr *)&dns, sizeof(dns) ) != req_len)
+    {
+        closesocket( s );
+        return 0;
+    }
+
+    FD_ZERO( &rfds );
+    FD_SET( s, &rfds );
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    if (select( 0, &rfds, NULL, NULL, &tv ) <= 0)
+    {
+        closesocket( s );
+        return 0;
+    }
+
+    rlen = recvfrom( s, (char *)resp, sizeof(resp), 0, NULL, NULL );
+    closesocket( s );
+    if (rlen < 12 || resp[0] != req[0] || resp[1] != req[1] || (resp[3] & 0x0f) != 0)
+        return 0;
+
+    qdcount = (resp[4] << 8) | resp[5];
+    ancount = (resp[6] << 8) | resp[7];
+    off = 12;
+    for (i = 0; i < qdcount; i++)
+    {
+        off = rustos_dns_skip_name( resp, rlen, off );
+        if (off < 0 || off + 4 > rlen) return 0;
+        off += 4;
+    }
+    for (i = 0; i < ancount && count < max_ips; i++)
+    {
+        WORD rtype, rclass, rdlen;
+        off = rustos_dns_skip_name( resp, rlen, off );
+        if (off < 0 || off + 10 > rlen) break;
+        rtype = (resp[off] << 8) | resp[off + 1];
+        rclass = (resp[off + 2] << 8) | resp[off + 3];
+        rdlen = (resp[off + 8] << 8) | resp[off + 9];
+        off += 10;
+        if (off + rdlen > rlen) break;
+        if (rtype == 1 && rclass == 1 && rdlen == 4)
+            memcpy( &out_ips[count++], resp + off, 4 );
+        off += rdlen;
+    }
+    return count;
+}
+
+static int rustos_resolve_ipv4_list( const char *node, BOOL numeric_only, BOOL passive, DWORD *out_ips, int max_ips )
+{
+    IN_ADDR in4;
+    const char *term = NULL;
+
+    if (!node || !node[0])
+    {
+        out_ips[0] = passive ? 0 : htonl( INADDR_LOOPBACK );
+        return 1;
+    }
+    if (RtlIpv4StringToAddressA( node, TRUE, &term, &in4 ) == STATUS_SUCCESS && term && !*term)
+    {
+        out_ips[0] = in4.S_un.S_addr;
+        return 1;
+    }
+    if (numeric_only) return 0;
+    if (!_stricmp( node, "localhost" ) || !_stricmp( node, "rustos" ) || !_stricmp( node, "localhost.localdomain" ))
+    {
+        out_ips[0] = htonl( INADDR_LOOPBACK );
+        return 1;
+    }
+    return rustos_dns_query_a( node, out_ips, max_ips );
+}
+
+static int rustos_ws_getaddrinfo( struct getaddrinfo_params *params )
+{
+    const struct addrinfo *hints = params->hints;
+    int family = hints ? hints->ai_family : AF_UNSPEC;
+    int socktype = hints ? hints->ai_socktype : 0;
+    int protocol = hints ? hints->ai_protocol : 0;
+    int flags = hints ? hints->ai_flags : 0;
+    WORD port_net = 0;
+    DWORD ipv4[8];
+    IN6_ADDR ipv6;
+    const char *term = NULL;
+    int v4_count = 0, has_v6 = 0, total, i;
+    const char *canon = (flags & AI_CANONNAME) && params->node ? params->node : NULL;
+    unsigned int canon_len = canon ? (unsigned int)strlen( canon ) + 1 : 0;
+    unsigned int need;
+    char *cursor;
+    struct addrinfo *prev = NULL;
+    int ret;
+
+    if (family != AF_UNSPEC && family != AF_INET && family != AF_INET6)
+        return EAI_FAMILY;
+    if ((ret = rustos_parse_service_port( params->service, &port_net )))
+        return ret;
+
+    if (family == AF_UNSPEC || family == AF_INET)
+        v4_count = rustos_resolve_ipv4_list( params->node, (flags & AI_NUMERICHOST) != 0,
+                                             (flags & AI_PASSIVE) != 0, ipv4, 8 );
+    if (v4_count == 0 && (family == AF_UNSPEC || family == AF_INET6) && params->node)
+    {
+        if (RtlIpv6StringToAddressA( params->node, &term, &ipv6 ) == STATUS_SUCCESS && term && !*term)
+            has_v6 = 1;
+    }
+    else if (v4_count == 0 && family == AF_INET6 && (!params->node || !params->node[0]))
+    {
+        memset( &ipv6, 0, sizeof(ipv6) );
+        if (!(flags & AI_PASSIVE)) ipv6.u.Byte[15] = 1;
+        has_v6 = 1;
+    }
+
+    total = v4_count + has_v6;
+    if (total == 0) return WSAHOST_NOT_FOUND;
+
+    need = (unsigned int)total * (sizeof(struct addrinfo) + sizeof(SOCKADDR_STORAGE)) + canon_len;
+    if (*params->size < need)
+    {
+        *params->size = need;
+        return ERROR_INSUFFICIENT_BUFFER;
+    }
+
+    memset( params->info, 0, need );
+    cursor = (char *)params->info + (size_t)total * (sizeof(struct addrinfo) + sizeof(SOCKADDR_STORAGE));
+    if (canon) strcpy( cursor, canon );
+    canon = canon ? cursor : NULL;
+
+    for (i = 0; i < total; i++)
+    {
+        struct addrinfo *ai = (struct addrinfo *)((char *)params->info + (size_t)i * (sizeof(struct addrinfo) + sizeof(SOCKADDR_STORAGE)));
+        struct sockaddr *sa = (struct sockaddr *)(ai + 1);
+        ai->ai_socktype = socktype;
+        ai->ai_protocol = protocol;
+        ai->ai_canonname = (i == 0) ? (char *)canon : NULL;
+        ai->ai_addr = sa;
+        if (i < v4_count)
+        {
+            struct sockaddr_in *sin = (struct sockaddr_in *)sa;
+            ai->ai_family = AF_INET;
+            ai->ai_addrlen = sizeof(*sin);
+            sin->sin_family = AF_INET;
+            sin->sin_port = port_net;
+            sin->sin_addr.S_un.S_addr = ipv4[i];
+        }
+        else
+        {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
+            ai->ai_family = AF_INET6;
+            ai->ai_addrlen = sizeof(*sin6);
+            sin6->sin6_family = AF_INET6;
+            sin6->sin6_port = port_net;
+            memcpy( &sin6->sin6_addr, &ipv6, sizeof(ipv6) );
+        }
+        if (prev) prev->ai_next = ai;
+        prev = ai;
+    }
+    return 0;
+}
+
+static int rustos_fill_hostent( struct hostent *host, unsigned int *size, const char *name,
+                                const void *addr_bytes, int addr_count, int family )
+{
+    int addr_len = (family == AF_INET6) ? sizeof(IN6_ADDR) : sizeof(IN_ADDR);
+    unsigned int need = sizeof(struct hostent) + sizeof(char *) + (addr_count + 1) * sizeof(char *)
+                        + addr_count * addr_len + (unsigned int)strlen( name ) + 1;
+    char *p;
+    int i;
+
+    if (*size < need)
+    {
+        *size = need;
+        return ERROR_INSUFFICIENT_BUFFER;
+    }
+    memset( host, 0, need );
+    host->h_addrtype = (short)family;
+    host->h_length = (short)addr_len;
+    p = (char *)(host + 1);
+    host->h_aliases = (char **)p;
+    p += sizeof(char *);
+    host->h_addr_list = (char **)p;
+    p += (addr_count + 1) * sizeof(char *);
+    for (i = 0; i < addr_count; i++)
+    {
+        host->h_addr_list[i] = p;
+        memcpy( p, (const char *)addr_bytes + i * addr_len, addr_len );
+        p += addr_len;
+    }
+    host->h_name = p;
+    strcpy( p, name );
+    return 0;
+}
+
+static int rustos_ws_gethostbyaddr( struct gethostbyaddr_params *params )
+{
+    char buf[64];
+    if (!params->addr || params->family != AF_INET || params->len < 4)
+        return WSAHOST_NOT_FOUND;
+    RtlIpv4AddressToStringA( (const IN_ADDR *)params->addr, buf );
+    return rustos_fill_hostent( params->host, params->size, buf, params->addr, 1, AF_INET );
+}
+
+static int rustos_ws_gethostbyname( struct gethostbyname_params *params )
+{
+    DWORD ips[8];
+    int count;
+    const char *name = (params->name && params->name[0]) ? params->name : "rustos";
+
+    count = rustos_resolve_ipv4_list( name, FALSE, FALSE, ips, 8 );
+    if (count <= 0) return WSAHOST_NOT_FOUND;
+    return rustos_fill_hostent( params->host, params->size, name, ips, count, AF_INET );
+}
+
+static int rustos_ws_gethostname( struct gethostname_params *params )
+{
+    static const char host[] = "rustos";
+    if (!params->name || params->size < sizeof(host))
+        return WSAEFAULT;
+    strcpy( params->name, host );
+    return 0;
+}
+
+static int rustos_ws_getnameinfo( struct getnameinfo_params *params )
+{
+    if (!params->addr || params->addr_len < (int)sizeof(struct sockaddr_in))
+        return EAI_FAIL;
+    if (params->addr->sa_family == AF_INET)
+    {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)params->addr;
+        if (params->host && params->host_len)
+        {
+            char tmp[32];
+            if (!(params->flags & NI_NUMERICHOST) && sin->sin_addr.S_un.S_addr == htonl( INADDR_LOOPBACK ))
+                lstrcpynA( tmp, "localhost", sizeof(tmp) );
+            else
+                RtlIpv4AddressToStringA( &sin->sin_addr, tmp );
+            if (strlen( tmp ) >= params->host_len) return EAI_MEMORY;
+            strcpy( params->host, tmp );
+        }
+        if (params->serv && params->serv_len)
+        {
+            char pbuf[16];
+            snprintf( pbuf, sizeof(pbuf), "%u", ntohs( sin->sin_port ) );
+            if (strlen( pbuf ) >= params->serv_len) return EAI_MEMORY;
+            strcpy( params->serv, pbuf );
+        }
+        return 0;
+    }
+    return EAI_FAMILY;
+}
+
+#define WS_CALL(func, params) rustos_ws_ ## func(params)
+#else
 #define WS_CALL(func, params) WINE_UNIX_CALL( ws_unix_ ## func, params )
+#endif
 
 static char *get_fqdn(void)
 {
@@ -67,6 +422,7 @@ static int do_getaddrinfo( const char *node, const char *service,
     }
 }
 
+#ifndef __RUSTOS__
 static char *get_canonname( const char *name )
 {
     DNS_STATUS status;
@@ -183,6 +539,7 @@ static int dns_only_query( const char *node, const struct addrinfo *hints, struc
     DnsRecordListFree( (DNS_RECORD *)rec6, DnsFreeRecordList );
     return 0;
 }
+#endif
 
 /***********************************************************************
  *      getaddrinfo   (ws2_32.@)
@@ -210,6 +567,7 @@ int WINAPI getaddrinfo( const char *node, const char *service,
             if (!(fqdn = get_fqdn())) return WSA_NOT_ENOUGH_MEMORY;
             node = fqdn;
         }
+#ifndef __RUSTOS__
         else if (!service && hints &&
                  (hints->ai_flags == AI_DNS_ONLY || hints->ai_flags == (AI_ALL | AI_DNS_ONLY) ||
                   hints->ai_flags == (AI_CANONNAME | AI_DNS_ONLY)))
@@ -217,6 +575,7 @@ int WINAPI getaddrinfo( const char *node, const char *service,
             ret = dns_only_query( node, hints, info );
             goto done;
         }
+#endif
         else if (!hints || hints->ai_family == AF_UNSPEC || hints->ai_family == AF_INET6)
         {
             /* [ipv6] or [ipv6]:portnumber are supported by Windows */
@@ -260,7 +619,9 @@ int WINAPI getaddrinfo( const char *node, const char *service,
     free( fqdn );
     free( nodev6 );
 
+#ifndef __RUSTOS__
 done:
+#endif
     if (!ret && TRACE_ON(winsock))
     {
         struct addrinfo *ai;
@@ -810,6 +1171,7 @@ struct hostent * WINAPI gethostbyaddr( const char *addr, int len, int family )
 }
 
 
+#ifndef __RUSTOS__
 struct route
 {
     struct in_addr addr;
@@ -960,6 +1322,7 @@ cleanup:
     free( routes );
     return hostlist;
 }
+#endif
 
 
 /***********************************************************************
@@ -989,10 +1352,12 @@ struct hostent * WINAPI gethostbyname( const char *name )
     if (!name || !name[0])
         name = hostname;
 
+#ifndef __RUSTOS__
     /* If the hostname of the local machine is requested then return the
      * complete list of local IP addresses */
     if (!strcmp( name, hostname ))
         host = get_local_ips( hostname );
+#endif
 
     /* If any other hostname was requested (or the routing table lookup failed)
      * then return the IP found by the host OS */

@@ -235,6 +235,11 @@ impl VfsState {
         {
             return Err(EISDIR);
         }
+        if vfsd::proc_fs::sys_virtual_file(path).is_some()
+            && flags & linux_abi::O_ACCMODE != linux_abi::O_RDONLY
+        {
+            return Err(EACCES);
+        }
         if flags & (O_CREAT | O_TRUNC) != 0 && metadata.kind != RemoteKind::Device {
             return Err(EROFS);
         }
@@ -378,6 +383,9 @@ impl VfsState {
                 return storage.read_proc_file_into(node, start, dest);
             }
         }
+        if let Some(file) = vfsd::proc_fs::sys_virtual_file(path) {
+            return storage.read_sys_file_into(file, start, dest);
+        }
         storage.read_file_slice_into(path, file_len, start, dest)
     }
 }
@@ -408,8 +416,27 @@ impl VfsStorage {
             }
             ProcNode::FilesystemsFile => Ok(proc_fs::format_filesystems().to_vec()),
             ProcNode::MountsFile => Ok(proc_fs::format_mounts(self.volume.is_some())),
+            ProcNode::UptimeFile => {
+                Ok(proc_fs::format_uptime(rustos_svc_runtime::syscall::monotonic_nanos()))
+            }
             ProcNode::SelfLink | ProcNode::PidDir | ProcNode::ExeLink => Err(EINVAL),
         }
+    }
+
+    fn sys_virtual_file_bytes(&self, _file: vfsd::proc_fs::SysFile) -> Result<Vec<u8>, i32> {
+        let mut mask = 0_u64;
+        let status = unsafe {
+            rustos_svc_runtime::syscall::syscall3(
+                linux_abi::SYS_SCHED_GETAFFINITY,
+                0,
+                core::mem::size_of::<u64>() as u64,
+                (&mut mask as *mut u64) as u64,
+            )
+        };
+        if status < 0 || mask == 0 {
+            return Err(EIO);
+        }
+        Ok(vfsd::proc_fs::format_cpulist(mask))
     }
 
     fn read_proc_file_into(
@@ -419,6 +446,16 @@ impl VfsStorage {
         dest: &mut [u8],
     ) -> Result<usize, i32> {
         let bytes = self.proc_virtual_file_bytes(node)?;
+        Ok(copy_file_cache_range(&bytes, start, dest))
+    }
+
+    fn read_sys_file_into(
+        &self,
+        file: vfsd::proc_fs::SysFile,
+        start: u64,
+        dest: &mut [u8],
+    ) -> Result<usize, i32> {
+        let bytes = self.sys_virtual_file_bytes(file)?;
         Ok(copy_file_cache_range(&bytes, start, dest))
     }
 
@@ -801,6 +838,14 @@ impl VfsStorage {
             });
         }
         if path == "/sys" || path.starts_with("/sys/") {
+            if let Some(file) = vfsd::proc_fs::sys_virtual_file(path) {
+                let len = self.sys_virtual_file_bytes(file)?.len() as u64;
+                return Ok(Metadata {
+                    kind: RemoteKind::File,
+                    len,
+                    inode: path_inode(path.as_bytes()),
+                });
+            }
             if vfsd::proc_fs::sys_dir_children(path).is_some() {
                 return Ok(Metadata {
                     kind: RemoteKind::Directory,
@@ -890,14 +935,19 @@ impl VfsStorage {
             entries.push(DirEntry::new("meminfo", RemoteKind::File));
             entries.push(DirEntry::new("mounts", RemoteKind::File));
             entries.push(DirEntry::new("self", RemoteKind::Directory));
+            entries.push(DirEntry::new("uptime", RemoteKind::File));
             return Ok(entries);
         }
         if let Some(children) = vfsd::proc_fs::sys_dir_children(path) {
-            entries.extend(
-                children
-                    .iter()
-                    .map(|name| DirEntry::new(name, RemoteKind::Directory)),
-            );
+            entries.extend(children.iter().map(|name| {
+                let child_path = format!("{path}/{name}");
+                let kind = if vfsd::proc_fs::sys_virtual_file(child_path.as_str()).is_some() {
+                    RemoteKind::File
+                } else {
+                    RemoteKind::Directory
+                };
+                DirEntry::new(name, kind)
+            }));
             return Ok(entries);
         }
         if path.starts_with("/sys/") {

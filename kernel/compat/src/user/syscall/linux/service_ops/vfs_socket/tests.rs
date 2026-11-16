@@ -209,3 +209,30 @@ fn memfd_reopen_flags_preserve_attenuated_rights_and_install_distinct_descriptio
         "reopening a read-only memfd descriptor must not widen back to writable"
     );
 }
+
+#[test]
+fn preadv2_validation_handles_sentinel_negative_and_rwf_flags() {
+    assert_eq!(preadv2_validate_offset_and_flags(u64::MAX, 0), Ok(None));
+    assert_eq!(preadv2_validate_offset_and_flags(0, 0), Ok(Some(0)));
+    assert_eq!(
+        preadv2_validate_offset_and_flags(4096, linux_abi::RWF_NOWAIT | linux_abi::RWF_APPEND),
+        Ok(Some(4096))
+    );
+    assert_eq!(
+        preadv2_validate_offset_and_flags((-2_i64) as u64, 0),
+        Err(LINUX_EINVAL)
+    );
+    assert_eq!(
+        preadv2_validate_offset_and_flags(0, 1_u64 << 20),
+        Err(LINUX_EOPNOTSUPP)
+    );
+}
+
+#[test]
+fn proc_fd_path_parser_matches_self_and_caller_pid_only() {
+    assert_eq!(proc_self_fd_target("/proc/self/fd/3", 7), Some(3));
+    assert_eq!(proc_self_fd_target("/proc/7/fd/0", 7), Some(0));
+    assert_eq!(proc_self_fd_target("/proc/8/fd/3", 7), None);
+    assert_eq!(proc_self_fd_target("/proc/self/fd/03", 7), None);
+    assert_eq!(proc_self_fd_target("/proc/self/fd/3/extra", 7), None);
+}

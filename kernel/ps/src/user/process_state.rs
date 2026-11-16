@@ -325,6 +325,7 @@ pub struct Win32SectionObject {
     pub size: u64,
     pub protect: u64,
     pub is_image: bool,
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -332,6 +333,93 @@ pub struct Win32EventObject {
     pub handle: u64,
     pub signaled: bool,
     pub manual_reset: bool,
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Win32MutantObject {
+    pub handle: u64,
+    pub owner_tid: Option<u64>,
+    pub recursion_count: u32,
+    pub abandoned: bool,
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Win32SemaphoreObject {
+    pub handle: u64,
+    pub count: i32,
+    pub max_count: i32,
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Win32ThreadHandleObject {
+    pub handle: u64,
+    pub tid: u64,
+    pub teb_address: u64,
+    pub start_address: u64,
+    pub suspended: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Win32ProcessHandleObject {
+    pub handle: u64,
+    pub pid: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Win32KeyHandleObject {
+    pub handle: u64,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Win32ObjDirHandleObject {
+    pub handle: u64,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Win32SymlinkHandleObject {
+    pub handle: u64,
+    pub path: String,
+    pub target: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Win32DirEntrySnapshot {
+    pub name: String,
+    pub d_type: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Win32DirEnumCursor {
+    pub fd: u64,
+    pub dir_path: String,
+    pub pattern: String,
+    pub entries: Vec<Win32DirEntrySnapshot>,
+    pub cursor: usize,
+    pub exhausted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Win32AfdSocketObject {
+    pub handle: u64,
+    pub fd: Option<u64>,
+    pub family: i32,
+    pub sock_type: i32,
+    pub protocol: i32,
+    pub flags: u32,
+    pub nonblocking: bool,
+    pub event_handle: u64,
+    pub event_mask: u32,
+    pub connect_error: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Win32NsiHandleObject {
+    pub handle: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -348,8 +436,28 @@ pub struct Win32MappedView {
 pub struct Win32ProcessObjects {
     pub next_section_seq: u64,
     pub next_event_seq: u64,
+    pub next_mutant_seq: u64,
+    pub next_semaphore_seq: u64,
+    pub next_thread_seq: u64,
+    pub next_process_seq: u64,
+    pub next_key_seq: u64,
+    pub next_obj_dir_seq: u64,
+    pub next_symlink_seq: u64,
+    pub next_afd_seq: u64,
+    pub next_nsi_seq: u64,
     pub sections: Vec<Win32SectionObject>,
     pub events: Vec<Win32EventObject>,
+    pub mutants: Vec<Win32MutantObject>,
+    pub semaphores: Vec<Win32SemaphoreObject>,
+    pub threads: Vec<Win32ThreadHandleObject>,
+    pub processes: Vec<Win32ProcessHandleObject>,
+    pub keys: Vec<Win32KeyHandleObject>,
+    pub obj_dirs: Vec<Win32ObjDirHandleObject>,
+    pub symlinks: Vec<Win32SymlinkHandleObject>,
+    pub dir_cursors: Vec<Win32DirEnumCursor>,
+    pub dir_paths: Vec<(u64, String)>,
+    pub afd_sockets: Vec<Win32AfdSocketObject>,
+    pub nsi_handles: Vec<Win32NsiHandleObject>,
     pub vmas: Vec<Win32MappedView>,
 }
 

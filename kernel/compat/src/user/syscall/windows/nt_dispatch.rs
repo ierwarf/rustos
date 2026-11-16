@@ -43,8 +43,11 @@ use rustos_user_abi::windows::{
     STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS,
     STATUS_INVALID_PARAMETER, STATUS_INVALID_SYSTEM_SERVICE, STATUS_NOT_IMPLEMENTED,
     STATUS_NO_MEMORY, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
-    STATUS_SUCCESS, STATUS_TIMEOUT, STATUS_WAIT_0, WIN32_EVENT_HANDLE_BASE, WIN32_FD_HANDLE_BASE,
-    WIN32_SECTION_HANDLE_BASE, WindowsSystemBasicInformation,
+    STATUS_SUCCESS, WIN32_AFD_HANDLE_BASE, WIN32_EVENT_HANDLE_BASE,
+    WIN32_FD_HANDLE_BASE, WIN32_HANDLE_ALLOCATED_END, WIN32_KEY_HANDLE_BASE,
+    WIN32_MUTANT_HANDLE_BASE, WIN32_NSI_HANDLE_BASE, WIN32_OBJ_DIR_HANDLE_BASE,
+    WIN32_PROCESS_HANDLE_BASE, WIN32_SECTION_HANDLE_BASE, WIN32_SEMAPHORE_HANDLE_BASE,
+    WIN32_SYMLINK_HANDLE_BASE, WIN32_THREAD_HANDLE_BASE, WindowsSystemBasicInformation,
 };
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
@@ -61,9 +64,10 @@ use super::dispatch::{
     affinity_error_to_ntstatus, current_processor_number, policy_status_to_ntstatus,
     stamp_windows_topology,
 };
+use super::{fs_object, net_socket, process_thread, registry, sync};
 use crate::memory::paging;
 use crate::multitask;
-use crate::user::process_state::{Win32EventObject, Win32MappedView, Win32SectionObject};
+use crate::user::process_state::{Win32MappedView, Win32SectionObject};
 use crate::user::sysops::usermem;
 
 const WIN32_VA_FLOOR: u64 = 0x0000_0000_0010_0000;
@@ -83,24 +87,24 @@ const STDERR_32_PSEUDO: u64 = 0xffff_fff4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct UnicodeString64 {
-    length: u16,
-    maximum_length: u16,
+pub(super) struct UnicodeString64 {
+    pub(super) length: u16,
+    pub(super) maximum_length: u16,
     _pad: u32,
-    buffer: u64,
+    pub(super) buffer: u64,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct ObjectAttributes64 {
-    length: u32,
+pub(super) struct ObjectAttributes64 {
+    pub(super) length: u32,
     _pad0: u32,
-    root_directory: u64,
-    object_name: u64,
-    attributes: u32,
+    pub(super) root_directory: u64,
+    pub(super) object_name: u64,
+    pub(super) attributes: u32,
     _pad1: u32,
-    security_descriptor: u64,
-    security_qos: u64,
+    pub(super) security_descriptor: u64,
+    pub(super) security_qos: u64,
 }
 
 #[repr(C)]
@@ -205,15 +209,15 @@ struct FileNetworkOpenInformation64 {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct LdrDataTableEntryLite64 {
-    dll_base: u64,
-    entry_point: u64,
-    size_of_image: u32,
-    reserved: u32,
-    full_dll_name_w: u64,
-    base_dll_name_w: u64,
-    full_dll_name_a: u64,
-    base_dll_name_a: u64,
+pub(super) struct LdrDataTableEntryLite64 {
+    pub(super) dll_base: u64,
+    pub(super) entry_point: u64,
+    pub(super) size_of_image: u32,
+    pub(super) reserved: u32,
+    pub(super) full_dll_name_w: u64,
+    pub(super) base_dll_name_w: u64,
+    pub(super) full_dll_name_a: u64,
+    pub(super) base_dll_name_a: u64,
 }
 
 #[repr(C)]
@@ -443,16 +447,32 @@ pub(super) fn dispatch_wine_nt_syscall(frame: &mut SyscallFrame, api: WineNtApi)
             nt_query_attributes_file(arg0, arg1, api == WineNtApi::NtQueryFullAttributesFile)
         }
         WineNtApi::NtQueryDirectoryFile => {
-            let _ = admit_syscalld(&request);
-            STATUS_END_OF_FILE
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            fs_object::nt_query_directory_file(frame)
         }
         WineNtApi::NtFlushBuffersFile => {
             let _ = admit_syscalld(&request);
             STATUS_SUCCESS
         }
-        WineNtApi::NtDeviceIoControlFile | WineNtApi::NtFsControlFile => {
-            let _ = admit_syscalld(&request);
-            STATUS_NOT_IMPLEMENTED
+        WineNtApi::NtCreateNamedPipeFile => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            fs_object::nt_create_named_pipe_file(frame)
+        }
+        WineNtApi::NtDeviceIoControlFile => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            net_socket::nt_device_io_control_file(frame)
+        }
+        WineNtApi::NtFsControlFile => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            fs_object::nt_fs_control_file(frame)
         }
         WineNtApi::NtCreateSection | WineNtApi::NtCreateSectionEx => {
             if let Err(err) = admit_syscalld(&request) {
@@ -461,8 +481,10 @@ pub(super) fn dispatch_wine_nt_syscall(frame: &mut SyscallFrame, api: WineNtApi)
             nt_create_section(frame)
         }
         WineNtApi::NtOpenSection => {
-            let _ = admit_syscalld(&request);
-            STATUS_OBJECT_NAME_NOT_FOUND
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            fs_object::nt_open_section(frame)
         }
         WineNtApi::NtQuerySection => {
             if let Err(err) = admit_syscalld(&request) {
@@ -580,74 +602,300 @@ pub(super) fn dispatch_wine_nt_syscall(frame: &mut SyscallFrame, api: WineNtApi)
             if let Err(err) = admit_syscalld(&request) {
                 return err;
             }
-            nt_create_event(frame, api == WineNtApi::NtCreateEvent)
+            sync::nt_create_event(frame, api == WineNtApi::NtCreateEvent)
         }
         WineNtApi::NtSetEvent => {
             if let Err(err) = admit_syscalld(&request) {
                 return err;
             }
-            nt_modify_event(arg0, arg1, true, false)
+            sync::nt_modify_event(arg0, arg1, true, false)
         }
         WineNtApi::NtResetEvent | WineNtApi::NtClearEvent => {
             if let Err(err) = admit_syscalld(&request) {
                 return err;
             }
-            nt_modify_event(arg0, arg1, false, false)
+            sync::nt_modify_event(arg0, arg1, false, false)
         }
         WineNtApi::NtPulseEvent => {
             if let Err(err) = admit_syscalld(&request) {
                 return err;
             }
-            nt_modify_event(arg0, arg1, true, true)
+            sync::nt_modify_event(arg0, arg1, true, true)
         }
         WineNtApi::NtQueryEvent => {
             if let Err(err) = admit_syscalld(&request) {
                 return err;
             }
-            nt_query_event(arg0, arg1, arg2, arg3)
+            sync::nt_query_event(arg0, arg1, arg2, arg3)
+        }
+        WineNtApi::NtCreateMutant | WineNtApi::NtOpenMutant => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            sync::nt_create_or_open_mutant(frame, api == WineNtApi::NtCreateMutant)
+        }
+        WineNtApi::NtReleaseMutant => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            sync::nt_release_mutant(arg0, arg1)
+        }
+        WineNtApi::NtQueryMutant => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            sync::nt_query_mutant(frame)
+        }
+        WineNtApi::NtCreateSemaphore | WineNtApi::NtOpenSemaphore => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            sync::nt_create_or_open_semaphore(frame, api == WineNtApi::NtCreateSemaphore)
+        }
+        WineNtApi::NtReleaseSemaphore => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            sync::nt_release_semaphore(arg0, (arg1 as u32) as i32, arg2)
+        }
+        WineNtApi::NtQuerySemaphore => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            sync::nt_query_semaphore(frame)
         }
         WineNtApi::NtWaitForSingleObject => {
             if let Err(err) = admit_syscalld(&request) {
                 return err;
             }
-            nt_wait_for_single_object(arg0, arg2)
+            sync::nt_wait_for_single_object(arg0, arg2)
         }
-        WineNtApi::NtWaitForMultipleObjects
-        | WineNtApi::NtWaitForAlertByThreadId
-        | WineNtApi::NtAlertThreadByThreadId
-        | WineNtApi::NtWaitForKeyedEvent
-        | WineNtApi::NtReleaseKeyedEvent
-        | WineNtApi::NtTestAlert
-        | WineNtApi::NtOpenKeyedEvent => {
+        WineNtApi::NtWaitForMultipleObjects => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            let timeout_ptr = read_stack_arg(frame, 4).unwrap_or(0);
+            sync::nt_wait_for_multiple_objects(
+                (arg0 as u32) as u64,
+                arg1,
+                (arg2 as u32) as u64,
+                timeout_ptr,
+            )
+        }
+        WineNtApi::NtWaitForAlertByThreadId => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            sync::nt_wait_for_alert_by_thread_id(arg0, arg1)
+        }
+        WineNtApi::NtAlertThreadByThreadId => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            sync::nt_alert_thread_by_thread_id(arg0)
+        }
+        WineNtApi::NtTestAlert => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            sync::nt_test_alert()
+        }
+        WineNtApi::NtOpenKeyedEvent => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            sync::nt_open_keyed_event(arg0)
+        }
+        WineNtApi::NtWaitForKeyedEvent => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            sync::nt_keyed_event_op(arg1, arg3, false)
+        }
+        WineNtApi::NtReleaseKeyedEvent => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            sync::nt_keyed_event_op(arg1, arg3, true)
+        }
+        WineNtApi::NtCreateThreadEx => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            process_thread::nt_create_thread_ex(frame)
+        }
+        WineNtApi::NtCreateThread => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            process_thread::nt_create_thread(frame)
+        }
+        WineNtApi::NtResumeThread => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            process_thread::nt_resume_thread(arg0, arg1)
+        }
+        WineNtApi::NtSuspendThread => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            process_thread::nt_suspend_thread(arg0, arg1)
+        }
+        WineNtApi::NtOpenThread => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            process_thread::nt_open_thread(frame)
+        }
+        WineNtApi::NtOpenProcess => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            process_thread::nt_open_process(frame)
+        }
+        WineNtApi::NtReadVirtualMemory | WineNtApi::NtWriteVirtualMemory => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            process_thread::nt_read_or_write_virtual_memory(
+                frame,
+                api == WineNtApi::NtWriteVirtualMemory,
+            )
+        }
+        WineNtApi::NtGetContextThread => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            process_thread::nt_get_context_thread(frame, arg0, arg1)
+        }
+        WineNtApi::NtSetContextThread => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            process_thread::nt_set_context_thread(frame, arg0, arg1)
+        }
+        WineNtApi::NtRaiseException => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            process_thread::nt_raise_exception(frame, arg0, arg1, arg2)
+        }
+        WineNtApi::NtOpenKey | WineNtApi::NtOpenKeyEx | WineNtApi::NtCreateKey => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            registry::nt_open_or_create_key(frame, api == WineNtApi::NtCreateKey)
+        }
+        WineNtApi::NtSetValueKey => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            registry::nt_set_value_key(frame)
+        }
+        WineNtApi::NtQueryValueKey => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            registry::nt_query_value_key(frame)
+        }
+        WineNtApi::NtQueryKey => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            registry::nt_query_key(frame)
+        }
+        WineNtApi::NtEnumerateKey => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            registry::nt_enumerate_key(frame)
+        }
+        WineNtApi::NtEnumerateValueKey => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            registry::nt_enumerate_value_key(frame)
+        }
+        WineNtApi::NtDeleteKey => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            registry::nt_delete_key(arg0)
+        }
+        WineNtApi::NtDeleteValueKey => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            registry::nt_delete_value_key(arg0, arg1)
+        }
+        WineNtApi::NtFlushKey => {
             let _ = admit_syscalld(&request);
-            STATUS_NOT_IMPLEMENTED
+            STATUS_SUCCESS
         }
-        WineNtApi::NtOpenKey
-        | WineNtApi::NtOpenKeyEx
-        | WineNtApi::NtCreateKey
-        | WineNtApi::NtQueryValueKey
-        | WineNtApi::NtQueryKey
-        | WineNtApi::NtEnumerateKey
-        | WineNtApi::NtEnumerateValueKey
-        | WineNtApi::NtOpenDirectoryObject
-        | WineNtApi::NtQueryDirectoryObject
-        | WineNtApi::NtOpenSymbolicLinkObject
-        | WineNtApi::NtQuerySymbolicLinkObject
-        | WineNtApi::NtCreateDirectoryObject => {
+        WineNtApi::NtOpenDirectoryObject | WineNtApi::NtCreateDirectoryObject => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            registry::nt_open_or_create_directory_object(
+                frame,
+                api == WineNtApi::NtCreateDirectoryObject,
+            )
+        }
+        WineNtApi::NtQueryDirectoryObject => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            registry::nt_query_directory_object(frame)
+        }
+        WineNtApi::NtOpenSymbolicLinkObject => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            registry::nt_open_symbolic_link_object(frame)
+        }
+        WineNtApi::NtQuerySymbolicLinkObject => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            registry::nt_query_symbolic_link_object(arg0, arg1, arg2)
+        }
+        WineNtApi::NtQueryObject => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            fs_object::nt_query_object(frame)
+        }
+        WineNtApi::NtSetInformationObject => {
             let _ = admit_syscalld(&request);
-            STATUS_OBJECT_NAME_NOT_FOUND
+            STATUS_SUCCESS
         }
-        WineNtApi::NtQueryObject
-        | WineNtApi::NtSetInformationObject
-        | WineNtApi::NtAllocateLocallyUniqueId
-        | WineNtApi::NtOpenProcessToken
+        WineNtApi::NtAllocateLocallyUniqueId => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            process_thread::nt_allocate_locally_unique_id(arg0)
+        }
+        WineNtApi::NtOpenProcessToken
         | WineNtApi::NtOpenProcessTokenEx
         | WineNtApi::NtOpenThreadToken
-        | WineNtApi::NtOpenThreadTokenEx
-        | WineNtApi::NtQueryInformationToken
-        | WineNtApi::NtQuerySecurityObject => {
-            let _ = admit_syscalld(&request);
-            STATUS_NOT_IMPLEMENTED
+        | WineNtApi::NtOpenThreadTokenEx => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            process_thread::nt_open_token(frame)
+        }
+        WineNtApi::NtQueryInformationToken => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            process_thread::nt_query_information_token(frame)
+        }
+        WineNtApi::NtQuerySecurityObject => {
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            process_thread::nt_query_security_object(frame)
         }
     }
 }
@@ -660,10 +908,13 @@ fn offload_op_for(api: WineNtApi) -> u16 {
         WineNtApi::NtFreeVirtualMemory => SYSCALL_OFFLOAD_OP_WIN32_FREE_VIRTUAL_MEMORY,
         WineNtApi::NtProtectVirtualMemory => SYSCALL_OFFLOAD_OP_WIN32_PROTECT_VIRTUAL_MEMORY,
         WineNtApi::NtQueryVirtualMemory
+        | WineNtApi::NtReadVirtualMemory
+        | WineNtApi::NtWriteVirtualMemory
         | WineNtApi::NtFlushVirtualMemory
         | WineNtApi::NtFlushInstructionCache => SYSCALL_OFFLOAD_OP_WIN32_QUERY_VIRTUAL_MEMORY,
         WineNtApi::NtOpenFile
         | WineNtApi::NtCreateFile
+        | WineNtApi::NtCreateNamedPipeFile
         | WineNtApi::NtQueryAttributesFile
         | WineNtApi::NtQueryFullAttributesFile => SYSCALL_OFFLOAD_OP_WIN32_OPEN_FILE,
         WineNtApi::NtReadFile => SYSCALL_OFFLOAD_OP_WIN32_READ_FILE,
@@ -695,10 +946,19 @@ fn offload_op_for(api: WineNtApi) -> u16 {
         WineNtApi::NtGetCurrentProcessorNumber => {
             SYSCALL_OFFLOAD_OP_WIN32_GET_CURRENT_PROCESSOR_NUMBER
         }
-        WineNtApi::NtQueryInformationProcess => SYSCALL_OFFLOAD_OP_WIN32_QUERY_INFO_PROCESS,
+        WineNtApi::NtQueryInformationProcess | WineNtApi::NtOpenProcess => {
+            SYSCALL_OFFLOAD_OP_WIN32_QUERY_INFO_PROCESS
+        }
         WineNtApi::NtSetInformationProcess => SYSCALL_OFFLOAD_OP_WIN32_SET_INFO_PROCESS,
-        WineNtApi::NtQueryInformationThread => SYSCALL_OFFLOAD_OP_WIN32_QUERY_INFO_THREAD,
-        WineNtApi::NtSetInformationThread => SYSCALL_OFFLOAD_OP_WIN32_SET_INFO_THREAD,
+        WineNtApi::NtQueryInformationThread
+        | WineNtApi::NtOpenThread
+        | WineNtApi::NtGetContextThread => SYSCALL_OFFLOAD_OP_WIN32_QUERY_INFO_THREAD,
+        WineNtApi::NtSetInformationThread
+        | WineNtApi::NtCreateThread
+        | WineNtApi::NtCreateThreadEx
+        | WineNtApi::NtResumeThread
+        | WineNtApi::NtSuspendThread
+        | WineNtApi::NtSetContextThread => SYSCALL_OFFLOAD_OP_WIN32_SET_INFO_THREAD,
         WineNtApi::NtTerminateProcess => SYSCALL_OFFLOAD_OP_WIN32_EXIT_PROCESS,
         WineNtApi::NtTerminateThread => SYSCALL_OFFLOAD_OP_WIN32_TERMINATE_THREAD,
         WineNtApi::NtDelayExecution => SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION,
@@ -711,14 +971,24 @@ fn offload_op_for(api: WineNtApi) -> u16 {
         | WineNtApi::NtQueryInstallUILanguage
         | WineNtApi::NtSetDefaultLocale
         | WineNtApi::NtSetDefaultUILanguage => SYSCALL_OFFLOAD_OP_WIN32_QUERY_LOCALE,
-        WineNtApi::NtContinue | WineNtApi::NtContinueEx => SYSCALL_OFFLOAD_OP_WIN32_CONTINUE,
+        WineNtApi::NtContinue | WineNtApi::NtContinueEx | WineNtApi::NtRaiseException => {
+            SYSCALL_OFFLOAD_OP_WIN32_CONTINUE
+        }
         WineNtApi::NtCreateEvent
         | WineNtApi::NtOpenEvent
         | WineNtApi::NtSetEvent
         | WineNtApi::NtResetEvent
         | WineNtApi::NtClearEvent
         | WineNtApi::NtPulseEvent
-        | WineNtApi::NtQueryEvent => SYSCALL_OFFLOAD_OP_WIN32_CREATE_EVENT,
+        | WineNtApi::NtQueryEvent
+        | WineNtApi::NtCreateMutant
+        | WineNtApi::NtOpenMutant
+        | WineNtApi::NtReleaseMutant
+        | WineNtApi::NtQueryMutant
+        | WineNtApi::NtCreateSemaphore
+        | WineNtApi::NtOpenSemaphore
+        | WineNtApi::NtReleaseSemaphore
+        | WineNtApi::NtQuerySemaphore => SYSCALL_OFFLOAD_OP_WIN32_CREATE_EVENT,
         WineNtApi::NtWaitForSingleObject
         | WineNtApi::NtWaitForMultipleObjects
         | WineNtApi::NtWaitForAlertByThreadId
@@ -730,10 +1000,14 @@ fn offload_op_for(api: WineNtApi) -> u16 {
         WineNtApi::NtOpenKey
         | WineNtApi::NtOpenKeyEx
         | WineNtApi::NtCreateKey
+        | WineNtApi::NtSetValueKey
         | WineNtApi::NtQueryValueKey
         | WineNtApi::NtQueryKey
         | WineNtApi::NtEnumerateKey
         | WineNtApi::NtEnumerateValueKey
+        | WineNtApi::NtDeleteKey
+        | WineNtApi::NtDeleteValueKey
+        | WineNtApi::NtFlushKey
         | WineNtApi::NtOpenDirectoryObject
         | WineNtApi::NtQueryDirectoryObject
         | WineNtApi::NtOpenSymbolicLinkObject
@@ -771,7 +1045,7 @@ fn admit_syscalld(request: &Win32SyscallOffloadRequest) -> Result<u64, u64> {
     }
 }
 
-fn read_stack_arg(frame: &SyscallFrame, index: u64) -> Result<u64, u64> {
+pub(super) fn read_stack_arg(frame: &SyscallFrame, index: u64) -> Result<u64, u64> {
     // At `syscall` inside `call NtFoo`: `[rsp] = return RIP`, `[rsp+0x28] = arg4`, `[rsp+0x30] = arg5`.
     let offset = 8_u64
         .checked_add(index.checked_mul(8).ok_or(STATUS_INVALID_PARAMETER)?)
@@ -783,14 +1057,14 @@ fn read_stack_arg(frame: &SyscallFrame, index: u64) -> Result<u64, u64> {
     usermem::read_current_user_struct::<u64>(addr).map_err(|_| STATUS_INVALID_PARAMETER)
 }
 
-fn read_user_u64(ptr: u64) -> Result<u64, u64> {
+pub(super) fn read_user_u64(ptr: u64) -> Result<u64, u64> {
     if ptr == 0 {
         return Err(STATUS_INVALID_PARAMETER);
     }
     usermem::read_current_user_struct::<u64>(ptr).map_err(|_| STATUS_INVALID_PARAMETER)
 }
 
-fn write_user_u64(ptr: u64, val: u64) -> u64 {
+pub(super) fn write_user_u64(ptr: u64, val: u64) -> u64 {
     if ptr == 0 {
         return STATUS_INVALID_PARAMETER;
     }
@@ -800,7 +1074,7 @@ fn write_user_u64(ptr: u64, val: u64) -> u64 {
     }
 }
 
-fn write_user_i64(ptr: u64, val: i64) -> u64 {
+pub(super) fn write_user_i64(ptr: u64, val: i64) -> u64 {
     if ptr == 0 {
         return STATUS_INVALID_PARAMETER;
     }
@@ -810,7 +1084,7 @@ fn write_user_i64(ptr: u64, val: i64) -> u64 {
     }
 }
 
-fn write_user_u32_checked(ptr: u64, val: u32) -> u64 {
+pub(super) fn write_user_u32_checked(ptr: u64, val: u32) -> u64 {
     if ptr == 0 {
         return STATUS_INVALID_PARAMETER;
     }
@@ -820,7 +1094,7 @@ fn write_user_u32_checked(ptr: u64, val: u32) -> u64 {
     }
 }
 
-fn write_io_status(ptr: u64, status: u64, information: u64) {
+pub(super) fn write_io_status(ptr: u64, status: u64, information: u64) {
     if ptr != 0 {
         let iosb = IoStatusBlock64 {
             status,
@@ -923,6 +1197,142 @@ fn find_free_win32_va(
         }
         None
     }
+}
+
+pub(super) fn alloc_win32_zeroed_pages(
+    size: u64,
+    protect: u32,
+    page_flags: PageTableFlags,
+) -> Option<u64> {
+    let map_len = align_up_page(size.max(PAGE_SIZE))?;
+    let pages = usize::try_from(map_len / PAGE_SIZE).ok()?;
+    let flags = page_flags & (PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE);
+    multitask::with_current_user_process_state_mut(|_, _, st| {
+        let base = find_free_win32_va(
+            st.address_space(),
+            &st.win32_objects().vmas,
+            WIN32_DYNAMIC_VA_START,
+            WIN32_DYNAMIC_VA_END,
+            map_len,
+            false,
+        )?;
+        st.address_space_mut()
+            .map_zeroed_user_pages_at(VirtAddr::new(base), pages, flags)
+            .ok()?;
+        st.win32_objects_mut().vmas.push(Win32MappedView {
+            base,
+            size: map_len,
+            allocation_base: base,
+            state: MEM_COMMIT as u32,
+            protect,
+            mem_type: MEM_PRIVATE as u32,
+        });
+        Some(base)
+    })
+    .flatten()
+}
+
+pub(super) fn find_ntdll_export_address(
+    st: &crate::user::process_state::UserProcessState,
+    export_name: &str,
+) -> Option<u64> {
+    let rt = st.windows_runtime()?;
+    if rt.loader_module_array_address == 0 || rt.loader_module_count == 0 {
+        return None;
+    }
+    let count = rt.loader_module_count.min(32) as usize;
+    let aspace = st.address_space();
+    for idx in 0..count {
+        let entry_va =
+            rt.loader_module_array_address + (idx * size_of::<LdrDataTableEntryLite64>()) as u64;
+        let mut entry_bytes = [0_u8; size_of::<LdrDataTableEntryLite64>()];
+        if aspace
+            .copy_from_user(VirtAddr::new(entry_va), &mut entry_bytes)
+            .is_err()
+        {
+            continue;
+        }
+        let entry = read_unaligned::<LdrDataTableEntryLite64>(&entry_bytes);
+        if entry.dll_base == 0 || entry.base_dll_name_a == 0 {
+            continue;
+        }
+        let mut name_buf = [0_u8; 32];
+        if aspace
+            .copy_from_user(VirtAddr::new(entry.base_dll_name_a), &mut name_buf)
+            .is_err()
+        {
+            continue;
+        }
+        let name_len = name_buf.iter().position(|&b| b == 0).unwrap_or(name_buf.len());
+        let mod_name = core::str::from_utf8(&name_buf[..name_len]).ok()?;
+        if !mod_name.eq_ignore_ascii_case("ntdll.dll") && !mod_name.eq_ignore_ascii_case("ntdll") {
+            continue;
+        }
+
+        let mut dos = [0_u8; 0x40];
+        aspace
+            .copy_from_user(VirtAddr::new(entry.dll_base), &mut dos)
+            .ok()?;
+        if &dos[0..2] != b"MZ" {
+            return None;
+        }
+        let pe_off = u32::from_le_bytes(dos[0x3c..0x40].try_into().ok()?) as u64;
+        let mut export_dir_entry = [0_u8; 8];
+        aspace
+            .copy_from_user(VirtAddr::new(entry.dll_base + pe_off + 0x88), &mut export_dir_entry)
+            .ok()?;
+        let exp_rva = u32::from_le_bytes(export_dir_entry[0..4].try_into().ok()?) as u64;
+        if exp_rva == 0 {
+            return None;
+        }
+        let mut exp_hdr = [0_u8; 40];
+        aspace
+            .copy_from_user(VirtAddr::new(entry.dll_base + exp_rva), &mut exp_hdr)
+            .ok()?;
+        let num_names = u32::from_le_bytes(exp_hdr[24..28].try_into().ok()?) as usize;
+        let funcs_rva = u32::from_le_bytes(exp_hdr[28..32].try_into().ok()?) as u64;
+        let names_rva = u32::from_le_bytes(exp_hdr[32..36].try_into().ok()?) as u64;
+        let ords_rva = u32::from_le_bytes(exp_hdr[36..40].try_into().ok()?) as u64;
+        for i in 0..num_names.min(4096) {
+            let mut nrva_b = [0_u8; 4];
+            if aspace
+                .copy_from_user(VirtAddr::new(entry.dll_base + names_rva + (i as u64) * 4), &mut nrva_b)
+                .is_err()
+            {
+                break;
+            }
+            let nrva = u32::from_le_bytes(nrva_b) as u64;
+            let mut fn_buf = [0_u8; 64];
+            if aspace
+                .copy_from_user(VirtAddr::new(entry.dll_base + nrva), &mut fn_buf)
+                .is_err()
+            {
+                continue;
+            }
+            let flen = fn_buf.iter().position(|&b| b == 0).unwrap_or(fn_buf.len());
+            if core::str::from_utf8(&fn_buf[..flen]).ok() == Some(export_name) {
+                let mut ord_b = [0_u8; 2];
+                aspace
+                    .copy_from_user(
+                        VirtAddr::new(entry.dll_base + ords_rva + (i as u64) * 2),
+                        &mut ord_b,
+                    )
+                    .ok()?;
+                let ord = u16::from_le_bytes(ord_b) as u64;
+                let mut fn_rva_b = [0_u8; 4];
+                aspace
+                    .copy_from_user(
+                        VirtAddr::new(entry.dll_base + funcs_rva + ord * 4),
+                        &mut fn_rva_b,
+                    )
+                    .ok()?;
+                let fn_rva = u32::from_le_bytes(fn_rva_b) as u64;
+                return (fn_rva != 0).then_some(entry.dll_base + fn_rva);
+            }
+        }
+        return None;
+    }
+    None
 }
 
 fn nt_allocate_virtual_memory(
@@ -1514,6 +1924,15 @@ fn nt_open_or_create_file(frame: &SyscallFrame, is_create: bool) -> u64 {
     if file_handle_ptr == 0 || oa_ptr == 0 {
         return STATUS_INVALID_PARAMETER;
     }
+    if let Ok((_, raw_name)) = read_object_attributes_unicode(oa_ptr) {
+        let lower_raw = raw_name.to_ascii_lowercase();
+        if lower_raw.starts_with("\\device\\afd") {
+            return net_socket::open_afd_device(file_handle_ptr, io_status_ptr);
+        }
+        if lower_raw == "\\??\\nsi" || lower_raw == "\\device\\nsi" {
+            return net_socket::open_nsi_device(file_handle_ptr, io_status_ptr);
+        }
+    }
     let create_disposition = if is_create {
         (read_stack_arg(frame, 7).unwrap_or(1) as u32) as u64
     } else {
@@ -1542,9 +1961,21 @@ fn nt_open_or_create_file(frame: &SyscallFrame, is_create: bool) -> u64 {
 
     let opened = open_vfs_with_fallback(&primary, fallback.as_deref(), open_flags);
     match opened {
-        Ok(fd) => {
+        Ok((fd, used_path)) => {
+            if let Ok(stat) = vfs_meta::kernel_vfs_fstat(fd)
+                && (stat.st_mode & 0o170_000) == 0o040_000
+            {
+                let _ = multitask::with_current_user_process_state_mut(|_, _, st| {
+                    let paths = &mut st.win32_objects_mut().dir_paths;
+                    paths.retain(|(f, _)| *f != fd);
+                    paths.push((fd, used_path));
+                });
+            }
             let win_handle = WIN32_FD_HANDLE_BASE + fd;
             if write_user_u64(file_handle_ptr, win_handle) != STATUS_SUCCESS {
+                let _ = multitask::with_current_user_process_state_mut(|_, _, st| {
+                    st.win32_objects_mut().dir_paths.retain(|(f, _)| *f != fd);
+                });
                 let _ = vfs_socket::syscall_linux_vfs_close(fd);
                 return STATUS_INVALID_PARAMETER;
             }
@@ -1558,23 +1989,31 @@ fn nt_open_or_create_file(frame: &SyscallFrame, is_create: bool) -> u64 {
     }
 }
 
-fn open_vfs_with_fallback(primary: &str, fallback: Option<&str>, flags: u64) -> Result<u64, u64> {
+fn open_vfs_with_fallback(
+    primary: &str,
+    fallback: Option<&str>,
+    flags: u64,
+) -> Result<(u64, String), u64> {
     match vfs_socket::syscall_linux_vfs_openat_str(linux_abi::AT_FDCWD as u64, primary, flags, 0o644)
     {
-        Ok(fd) => Ok(fd),
+        Ok(fd) => Ok((fd, String::from(primary))),
         Err(errno) => {
             if let Some(alt) = fallback
-                && let Ok(fd) =
-                    vfs_socket::syscall_linux_vfs_openat_str(linux_abi::AT_FDCWD as u64, alt, flags, 0o644)
+                && let Ok(fd) = vfs_socket::syscall_linux_vfs_openat_str(
+                    linux_abi::AT_FDCWD as u64,
+                    alt,
+                    flags,
+                    0o644,
+                )
             {
-                return Ok(fd);
+                return Ok((fd, String::from(alt)));
             }
             Err(linux_errno_to_ntstatus(errno))
         }
     }
 }
 
-fn read_object_attributes_unicode(oa_ptr: u64) -> Result<(u64, String), u64> {
+pub(super) fn read_object_attributes_unicode(oa_ptr: u64) -> Result<(u64, String), u64> {
     let oa = usermem::read_current_user_struct::<ObjectAttributes64>(oa_ptr)
         .map_err(|_| STATUS_INVALID_PARAMETER)?;
     if oa.object_name == 0 {
@@ -1711,7 +2150,7 @@ fn translate_systemroot_subpath(tail: &str) -> (String, Option<String>) {
     )
 }
 
-fn map_win32_file_handle(handle: u64) -> Option<u64> {
+pub(super) fn map_win32_file_handle(handle: u64) -> Option<u64> {
     match handle {
         HANDLE_STDIN | STDIN_RAW_PSEUDO | STDIN_32_PSEUDO => Some(0),
         HANDLE_STDOUT | STDOUT_RAW_PSEUDO | STDOUT_32_PSEUDO => Some(1),
@@ -1749,17 +2188,8 @@ fn nt_read_or_write_file(frame: &SyscallFrame, is_write: bool) -> u64 {
     } else {
         vfs_socket::kernel_vfs_read_user(fd, buffer_ptr, length, offset)
     };
-    if event_handle >= WIN32_EVENT_HANDLE_BASE {
-        let _ = multitask::with_current_user_process_state_mut(|_, _, st| {
-            if let Some(ev) = st
-                .win32_objects_mut()
-                .events
-                .iter_mut()
-                .find(|e| e.handle == event_handle)
-            {
-                ev.signaled = true;
-            }
-        });
+    if event_handle >= WIN32_EVENT_HANDLE_BASE && event_handle < WIN32_MUTANT_HANDLE_BASE {
+        let _ = sync::nt_modify_event(event_handle, 0, true, false);
     }
     match io_res {
         Ok(0) if !is_write && length > 0 => {
@@ -1795,6 +2225,9 @@ fn nt_close(handle: u64) -> u64 {
     ) {
         return STATUS_SUCCESS;
     }
+    if net_socket::is_afd_handle(handle) || net_socket::is_nsi_handle(handle) {
+        return net_socket::close_afd_or_nsi_handle(handle);
+    }
     if handle >= WIN32_SECTION_HANDLE_BASE && handle < WIN32_EVENT_HANDLE_BASE {
         let removed_fd = multitask::with_current_user_process_state_mut(|_, _, st| {
             let secs = &mut st.win32_objects_mut().sections;
@@ -1811,11 +2244,36 @@ fn nt_close(handle: u64) -> u64 {
             None => STATUS_INVALID_HANDLE,
         };
     }
-    if handle >= WIN32_EVENT_HANDLE_BASE {
+    if handle >= WIN32_EVENT_HANDLE_BASE && handle < WIN32_HANDLE_ALLOCATED_END {
         let removed = multitask::with_current_user_process_state_mut(|_, _, st| {
-            let evs = &mut st.win32_objects_mut().events;
-            let idx = evs.iter().position(|e| e.handle == handle)?;
-            evs.remove(idx);
+            let objs = st.win32_objects_mut();
+            if handle < WIN32_MUTANT_HANDLE_BASE {
+                let idx = objs.events.iter().position(|e| e.handle == handle)?;
+                objs.events.remove(idx);
+            } else if handle < WIN32_SEMAPHORE_HANDLE_BASE {
+                let idx = objs.mutants.iter().position(|m| m.handle == handle)?;
+                objs.mutants.remove(idx);
+            } else if handle < WIN32_THREAD_HANDLE_BASE {
+                let idx = objs.semaphores.iter().position(|s| s.handle == handle)?;
+                objs.semaphores.remove(idx);
+            } else if handle < WIN32_PROCESS_HANDLE_BASE {
+                let idx = objs.threads.iter().position(|t| t.handle == handle)?;
+                objs.threads.remove(idx);
+            } else if handle < WIN32_KEY_HANDLE_BASE {
+                let idx = objs.processes.iter().position(|p| p.handle == handle)?;
+                objs.processes.remove(idx);
+            } else if handle < WIN32_OBJ_DIR_HANDLE_BASE {
+                let idx = objs.keys.iter().position(|k| k.handle == handle)?;
+                objs.keys.remove(idx);
+            } else if handle < WIN32_SYMLINK_HANDLE_BASE {
+                let idx = objs.obj_dirs.iter().position(|d| d.handle == handle)?;
+                objs.obj_dirs.remove(idx);
+            } else if handle < WIN32_AFD_HANDLE_BASE {
+                let idx = objs.symlinks.iter().position(|s| s.handle == handle)?;
+                objs.symlinks.remove(idx);
+            } else {
+                return None;
+            }
             Some(())
         })
         .flatten();
@@ -1826,6 +2284,11 @@ fn nt_close(handle: u64) -> u64 {
         };
     }
     if let Some(fd) = map_win32_file_handle(handle) {
+        let _ = multitask::with_current_user_process_state_mut(|_, _, st| {
+            let objs = st.win32_objects_mut();
+            objs.dir_cursors.retain(|c| c.fd != fd);
+            objs.dir_paths.retain(|(f, _)| *f != fd);
+        });
         return if vfs_socket::kernel_vfs_result(vfs_socket::syscall_linux_vfs_close(fd)).is_ok() {
             STATUS_SUCCESS
         } else {
@@ -1893,6 +2356,74 @@ fn nt_duplicate_object(frame: &SyscallFrame) -> u64 {
             None => STATUS_NO_MEMORY,
         };
     }
+    if src_handle >= WIN32_EVENT_HANDLE_BASE && src_handle < WIN32_AFD_HANDLE_BASE {
+        let new_h = multitask::with_current_user_process_state_mut(|_, _, st| {
+            let objs = st.win32_objects_mut();
+            if src_handle < WIN32_MUTANT_HANDLE_BASE {
+                let mut obj = objs.events.iter().find(|e| e.handle == src_handle)?.clone();
+                let h = WIN32_EVENT_HANDLE_BASE + objs.next_event_seq + 1;
+                objs.next_event_seq += 1;
+                obj.handle = h;
+                objs.events.push(obj);
+                Some(h)
+            } else if src_handle < WIN32_SEMAPHORE_HANDLE_BASE {
+                let mut obj = objs.mutants.iter().find(|m| m.handle == src_handle)?.clone();
+                let h = WIN32_MUTANT_HANDLE_BASE + objs.next_mutant_seq + 1;
+                objs.next_mutant_seq += 1;
+                obj.handle = h;
+                objs.mutants.push(obj);
+                Some(h)
+            } else if src_handle < WIN32_THREAD_HANDLE_BASE {
+                let mut obj = objs.semaphores.iter().find(|s| s.handle == src_handle)?.clone();
+                let h = WIN32_SEMAPHORE_HANDLE_BASE + objs.next_semaphore_seq + 1;
+                objs.next_semaphore_seq += 1;
+                obj.handle = h;
+                objs.semaphores.push(obj);
+                Some(h)
+            } else if src_handle < WIN32_PROCESS_HANDLE_BASE {
+                let mut obj = objs.threads.iter().find(|t| t.handle == src_handle)?.clone();
+                let h = WIN32_THREAD_HANDLE_BASE + objs.next_thread_seq + 1;
+                objs.next_thread_seq += 1;
+                obj.handle = h;
+                objs.threads.push(obj);
+                Some(h)
+            } else if src_handle < WIN32_KEY_HANDLE_BASE {
+                let mut obj = objs.processes.iter().find(|p| p.handle == src_handle)?.clone();
+                let h = WIN32_PROCESS_HANDLE_BASE + objs.next_process_seq + 1;
+                objs.next_process_seq += 1;
+                obj.handle = h;
+                objs.processes.push(obj);
+                Some(h)
+            } else if src_handle < WIN32_OBJ_DIR_HANDLE_BASE {
+                let mut obj = objs.keys.iter().find(|k| k.handle == src_handle)?.clone();
+                let h = WIN32_KEY_HANDLE_BASE + objs.next_key_seq + 1;
+                objs.next_key_seq += 1;
+                obj.handle = h;
+                objs.keys.push(obj);
+                Some(h)
+            } else if src_handle < WIN32_SYMLINK_HANDLE_BASE {
+                let mut obj = objs.obj_dirs.iter().find(|d| d.handle == src_handle)?.clone();
+                let h = WIN32_OBJ_DIR_HANDLE_BASE + objs.next_obj_dir_seq + 1;
+                objs.next_obj_dir_seq += 1;
+                obj.handle = h;
+                objs.obj_dirs.push(obj);
+                Some(h)
+            } else {
+                let mut obj = objs.symlinks.iter().find(|s| s.handle == src_handle)?.clone();
+                let h = WIN32_SYMLINK_HANDLE_BASE + objs.next_symlink_seq + 1;
+                objs.next_symlink_seq += 1;
+                obj.handle = h;
+                objs.symlinks.push(obj);
+                Some(h)
+            }
+        })
+        .flatten();
+        return match new_h {
+            Some(h) => write_user_u64(dst_handle_ptr, h),
+            None => STATUS_INVALID_HANDLE,
+        };
+    }
+    let _ = WIN32_NSI_HANDLE_BASE;
     STATUS_INVALID_HANDLE
 }
 
@@ -2122,7 +2653,7 @@ fn nt_query_attributes_file(oa_ptr: u64, info_ptr: u64, full: bool) -> u64 {
 }
 
 fn nt_create_section(frame: &SyscallFrame) -> u64 {
-    let (sec_handle_ptr, _access, _oa_ptr, max_size_ptr) =
+    let (sec_handle_ptr, _access, oa_ptr, max_size_ptr) =
         (frame.r10, frame.rdx, frame.r8, frame.r9);
     let page_protect = (read_stack_arg(frame, 4).unwrap_or(PAGE_READONLY) as u32) as u64;
     let alloc_attrs = (read_stack_arg(frame, 5).unwrap_or(0) as u32) as u64;
@@ -2131,7 +2662,59 @@ fn nt_create_section(frame: &SyscallFrame) -> u64 {
         return STATUS_INVALID_PARAMETER;
     }
 
+    let sec_name = if oa_ptr != 0 {
+        read_object_attributes_unicode(oa_ptr)
+            .ok()
+            .map(|(_, s)| s)
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
     let is_image = (alloc_attrs & SEC_IMAGE) != 0;
+    let mut size = if max_size_ptr != 0 {
+        usermem::read_current_user_struct::<u64>(max_size_ptr).unwrap_or(0)
+    } else {
+        0
+    };
+    if size == 0 && file_handle == 0 && sec_name.is_none() {
+        size = PAGE_SIZE;
+    }
+
+    if let Some(ref name) = sec_name && file_handle == 0 {
+        if size == 0 {
+            size = PAGE_SIZE;
+        }
+        let (fd, sec_size, sec_prot) =
+            match fs_object::register_or_open_named_section(name, size, page_protect, true) {
+                Ok(v) => v,
+                Err(status) => return status,
+            };
+        let handle = multitask::with_current_user_process_state_mut(|_, _, st| {
+            let objs = st.win32_objects_mut();
+            let h = WIN32_SECTION_HANDLE_BASE + objs.next_section_seq + 1;
+            objs.next_section_seq += 1;
+            objs.sections.push(Win32SectionObject {
+                handle: h,
+                fd: Some(fd),
+                size: sec_size,
+                protect: sec_prot,
+                is_image: false,
+                name: Some(name.clone()),
+            });
+            h
+        });
+        let Some(handle) = handle else {
+            let _ = vfs_socket::syscall_linux_vfs_close(fd);
+            return STATUS_NO_MEMORY;
+        };
+        if write_user_u64(sec_handle_ptr, handle) != STATUS_SUCCESS {
+            let _ = nt_close(handle);
+            return STATUS_INVALID_PARAMETER;
+        }
+        return STATUS_SUCCESS;
+    }
+
     let dup_fd = if file_handle != 0 {
         let Some(fd) = map_win32_file_handle(file_handle) else {
             return STATUS_INVALID_HANDLE;
@@ -2144,11 +2727,6 @@ fn nt_create_section(frame: &SyscallFrame) -> u64 {
         None
     };
 
-    let mut size = if max_size_ptr != 0 {
-        usermem::read_current_user_struct::<u64>(max_size_ptr).unwrap_or(0)
-    } else {
-        0
-    };
     if size == 0
         && let Some(fd) = dup_fd
         && let Ok(stat) = vfs_meta::kernel_vfs_fstat(fd)
@@ -2169,6 +2747,7 @@ fn nt_create_section(frame: &SyscallFrame) -> u64 {
             size,
             protect: page_protect,
             is_image,
+            name: sec_name.clone(),
         });
         h
     });
@@ -2907,10 +3486,40 @@ fn nt_query_information_process(frame: &SyscallFrame) -> u64 {
         (frame.r9 as u32) as u64,
     );
     let ret_len_ptr = read_stack_arg(frame, 4).unwrap_or(0);
-    if proc_handle != HANDLE_CURRENT_PROCESS {
+    let Some(target_pid) = process_thread::resolve_process_id(proc_handle) else {
         return STATUS_INVALID_HANDLE;
+    };
+    let cur_pid = multitask::current_user_process_id().unwrap_or(1);
+    if target_pid != cur_pid {
+        if info_class == 0 /* ProcessBasicInformation */ {
+            let need = size_of::<ProcessBasicInformation64>() as u64;
+            if ret_len_ptr != 0 {
+                let _ = write_user_u32_checked(ret_len_ptr, need as u32);
+            }
+            if length < need {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            let exit_status = if multitask::user_target_abi_if_alive(target_pid, 0).is_some() {
+                259
+            } else {
+                0
+            };
+            let pbi = ProcessBasicInformation64 {
+                exit_status,
+                affinity_mask: kernel_hal::api::cpu::admitted_online_mask(),
+                base_priority: 8,
+                unique_process_id: target_pid,
+                inherited_from_unique_process_id: 1,
+                ..ProcessBasicInformation64::default()
+            };
+            if usermem::write_current_user_struct(info_ptr, &pbi).is_err() {
+                return STATUS_INVALID_PARAMETER;
+            }
+            return STATUS_SUCCESS;
+        }
+        return STATUS_INVALID_INFO_CLASS;
     }
-    let pid = multitask::current_user_process_id().unwrap_or(1);
+    let pid = cur_pid;
     let rt = multitask::with_current_user_process_state_mut(|_, _, st| st.windows_runtime())
         .flatten();
     let Some(rt) = rt else {
@@ -3005,7 +3614,10 @@ fn nt_set_information_process(
 ) -> u64 {
     let info_class = (info_class as u32) as u64;
     let length = (length as u32) as u64;
-    if proc_handle != HANDLE_CURRENT_PROCESS {
+    let Some(target_pid) = process_thread::resolve_process_id(proc_handle) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    if target_pid != multitask::current_user_process_id().unwrap_or(1) {
         return STATUS_INVALID_HANDLE;
     }
     if info_class == 21 /* ProcessAffinityMask */ && length >= 8 {
@@ -3029,11 +3641,23 @@ fn nt_query_information_thread(frame: &SyscallFrame) -> u64 {
         (frame.r9 as u32) as u64,
     );
     let ret_len_ptr = read_stack_arg(frame, 4).unwrap_or(0);
-    if thread_handle != HANDLE_CURRENT_THREAD {
+    let Some(tid) = process_thread::resolve_thread_id(thread_handle) else {
         return STATUS_INVALID_HANDLE;
-    }
+    };
     let pid = multitask::current_user_process_id().unwrap_or(1);
-    let tid = multitask::current_user_thread_id().unwrap_or(1);
+    let cur_tid = multitask::current_user_thread_id().unwrap_or(1);
+    let teb_override = if tid != cur_tid {
+        multitask::with_current_user_process_state_mut(|_, _, st| {
+            st.win32_objects()
+                .threads
+                .iter()
+                .find(|t| t.tid == tid)
+                .map(|t| t.teb_address)
+        })
+        .flatten()
+    } else {
+        None
+    };
     match info_class {
         0 /* ThreadBasicInformation (48 bytes on x64) */ => {
             if ret_len_ptr != 0 {
@@ -3042,12 +3666,16 @@ fn nt_query_information_thread(frame: &SyscallFrame) -> u64 {
             if length < 48 {
                 return STATUS_INFO_LENGTH_MISMATCH;
             }
-            let teb = multitask::with_current_user_process_state_mut(|_, _, st| {
-                st.windows_runtime().map(|r| r.teb_address).unwrap_or(0)
-            })
-            .unwrap_or(0);
+            let teb = teb_override.unwrap_or_else(|| {
+                multitask::with_current_user_process_state_mut(|_, _, st| {
+                    st.windows_runtime().map(|r| r.teb_address).unwrap_or(0)
+                })
+                .unwrap_or(0)
+            });
+            let alive = tid == cur_tid || multitask::is_user_task_alive(tid);
+            let exit_status: u32 = if alive { 259 } else { 0 };
             let mut buf = [0_u8; 48];
-            buf[0..4].copy_from_slice(&259_u32.to_le_bytes()); // STILL_ACTIVE
+            buf[0..4].copy_from_slice(&exit_status.to_le_bytes()); // STILL_ACTIVE if alive
             buf[8..16].copy_from_slice(&teb.to_le_bytes());
             buf[16..24].copy_from_slice(&pid.to_le_bytes());
             buf[24..32].copy_from_slice(&tid.to_le_bytes());
@@ -3089,10 +3717,11 @@ fn nt_set_information_thread(
     info_ptr: u64,
     length: u64,
 ) -> u64 {
-    if thread_handle != HANDLE_CURRENT_THREAD {
+    let Some(target_tid) = process_thread::resolve_thread_id(thread_handle) else {
         return STATUS_INVALID_HANDLE;
-    }
-    if info_class == 4 /* ThreadAffinityMask */ && length >= 8 {
+    };
+    let cur_tid = multitask::current_user_thread_id().unwrap_or(1);
+    if target_tid == cur_tid && info_class == 4 /* ThreadAffinityMask */ && length >= 8 {
         let Ok(mask) = read_user_u64(info_ptr) else {
             return STATUS_INVALID_PARAMETER;
         };
@@ -3111,19 +3740,37 @@ fn nt_terminate_process(proc_handle: u64, exit_status: u64) -> u64 {
         // running LdrShutdownProcess(), then calls NtTerminateProcess(-1, status).
         return STATUS_SUCCESS;
     }
-    if proc_handle == HANDLE_CURRENT_PROCESS {
-        if let Some(pid) = multitask::current_user_process_id() {
+    if let Some(pid) = process_thread::resolve_process_id(proc_handle) {
+        let cur_pid = multitask::current_user_process_id().unwrap_or(0);
+        if pid == cur_pid {
+            let tid = multitask::current_user_thread_id().unwrap_or(0);
+            sync::notify_task_exited(pid, tid, true);
             let code = ((exit_status as u32) & 0xff) << 8;
             super::super::linux::record_linux_process_termination(pid, code as i32);
+            multitask::exit_current_user_process()
         }
-        multitask::exit_current_user_process()
     }
     STATUS_INVALID_HANDLE
 }
 
 fn nt_terminate_thread(thread_handle: u64, _exit_status: u64) -> u64 {
-    if thread_handle == 0 || thread_handle == HANDLE_CURRENT_THREAD {
+    if thread_handle == 0 {
+        if let (Some(pid), Some(tid)) = (
+            multitask::current_user_process_id(),
+            multitask::current_user_thread_id(),
+        ) {
+            sync::notify_task_exited(pid, tid, false);
+        }
         multitask::exit_current_user_task();
+    }
+    if let Some(tid) = process_thread::resolve_thread_id(thread_handle) {
+        let cur_tid = multitask::current_user_thread_id().unwrap_or(0);
+        if tid == cur_tid {
+            if let Some(pid) = multitask::current_user_process_id() {
+                sync::notify_task_exited(pid, tid, false);
+            }
+            multitask::exit_current_user_task();
+        }
     }
     STATUS_INVALID_HANDLE
 }
@@ -3151,7 +3798,7 @@ fn nt_delay_execution(_alertable: u64, interval_ptr: u64) -> u64 {
     STATUS_SUCCESS
 }
 
-fn current_filetime_100ns() -> i64 {
+pub(super) fn current_filetime_100ns() -> i64 {
     let ts = process_time::realtime_timespec();
     FILE_EPOCH_BIAS_100NS
         .saturating_add(ts.tv_sec.saturating_mul(10_000_000))
@@ -3176,7 +3823,7 @@ fn nt_query_performance_counter(counter_ptr: u64, freq_ptr: u64) -> u64 {
     STATUS_SUCCESS
 }
 
-fn nt_continue(frame: &mut SyscallFrame, context_ptr: u64) -> u64 {
+pub(super) fn nt_continue(frame: &mut SyscallFrame, context_ptr: u64) -> u64 {
     if context_ptr == 0 {
         return STATUS_INVALID_PARAMETER;
     }
@@ -3213,114 +3860,7 @@ fn nt_continue(frame: &mut SyscallFrame, context_ptr: u64) -> u64 {
     frame.rax
 }
 
-fn nt_create_event(frame: &SyscallFrame, is_create: bool) -> u64 {
-    let (handle_ptr, _access, _oa_ptr, event_type) = (frame.r10, frame.rdx, frame.r8, frame.r9);
-    if handle_ptr == 0 {
-        return STATUS_INVALID_PARAMETER;
-    }
-    let initial_state = if is_create {
-        read_stack_arg(frame, 4).unwrap_or(0) != 0
-    } else {
-        false
-    };
-    let manual_reset = event_type == 0; // NotificationEvent = 0, SynchronizationEvent = 1
-    let handle = multitask::with_current_user_process_state_mut(|_, _, st| {
-        let objs = st.win32_objects_mut();
-        let h = WIN32_EVENT_HANDLE_BASE + objs.next_event_seq + 1;
-        objs.next_event_seq += 1;
-        objs.events.push(Win32EventObject {
-            handle: h,
-            signaled: initial_state,
-            manual_reset,
-        });
-        h
-    });
-    match handle {
-        Some(h) => write_user_u64(handle_ptr, h),
-        None => STATUS_NO_MEMORY,
-    }
-}
-
-fn nt_modify_event(handle: u64, prev_ptr: u64, signaled: bool, pulse: bool) -> u64 {
-    let prev = multitask::with_current_user_process_state_mut(|_, _, st| {
-        let ev = st
-            .win32_objects_mut()
-            .events
-            .iter_mut()
-            .find(|e| e.handle == handle)?;
-        let old = ev.signaled as u32;
-        ev.signaled = if pulse { false } else { signaled };
-        Some(old)
-    })
-    .flatten();
-    let Some(old) = prev else {
-        return STATUS_INVALID_HANDLE;
-    };
-    if prev_ptr != 0 {
-        let _ = write_user_u32_checked(prev_ptr, old);
-    }
-    STATUS_SUCCESS
-}
-
-fn nt_query_event(handle: u64, _info_class: u64, buf_ptr: u64, len: u64) -> u64 {
-    if len < 8 || buf_ptr == 0 {
-        return STATUS_INFO_LENGTH_MISMATCH;
-    }
-    let state = multitask::with_current_user_process_state_mut(|_, _, st| {
-        st.win32_objects()
-            .events
-            .iter()
-            .find(|e| e.handle == handle)
-            .map(|e| (if e.manual_reset { 0_u32 } else { 1_u32 }, e.signaled as u32))
-    })
-    .flatten();
-    let Some((etype, sig)) = state else {
-        return STATUS_INVALID_HANDLE;
-    };
-    let mut bytes = [0_u8; 8];
-    bytes[0..4].copy_from_slice(&etype.to_le_bytes());
-    bytes[4..8].copy_from_slice(&sig.to_le_bytes());
-    if usermem::write_current_user_bytes(buf_ptr, &bytes).is_err() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    STATUS_SUCCESS
-}
-
-fn nt_wait_for_single_object(handle: u64, timeout_ptr: u64) -> u64 {
-    if handle >= WIN32_EVENT_HANDLE_BASE {
-        let signaled = multitask::with_current_user_process_state_mut(|_, _, st| {
-            let ev = st
-                .win32_objects_mut()
-                .events
-                .iter_mut()
-                .find(|e| e.handle == handle)?;
-            let was = ev.signaled;
-            if was && !ev.manual_reset {
-                ev.signaled = false;
-            }
-            Some(was)
-        })
-        .flatten();
-        match signaled {
-            Some(true) => return STATUS_WAIT_0,
-            Some(false) => {
-                if timeout_ptr != 0 {
-                    let _ = nt_delay_execution(0, timeout_ptr);
-                    return STATUS_TIMEOUT;
-                }
-                return STATUS_WAIT_0;
-            }
-            None => return STATUS_INVALID_HANDLE,
-        }
-    }
-    if timeout_ptr != 0 {
-        let _ = nt_delay_execution(0, timeout_ptr);
-        return STATUS_TIMEOUT;
-    }
-    STATUS_WAIT_0
-}
-
-fn linux_errno_to_ntstatus(errno: i64) -> u64 {
+pub(super) fn linux_errno_to_ntstatus(errno: i64) -> u64 {
     match errno {
         LINUX_ENOENT | LINUX_ENOTDIR => STATUS_OBJECT_NAME_NOT_FOUND,
         LINUX_EACCES | LINUX_EPERM => STATUS_ACCESS_DENIED,

@@ -55,6 +55,18 @@ pub enum ProcNode {
     FilesystemsFile,
     /// `/proc/mounts` or `/proc/<caller pid>/mounts`: active mount table.
     MountsFile,
+    /// `/proc/uptime`: monotonic uptime in seconds.
+    UptimeFile,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SysFile {
+    /// `/sys/devices/system/cpu/online`
+    CpuOnline,
+    /// `/sys/devices/system/cpu/possible`
+    CpuPossible,
+    /// `/sys/devices/system/cpu/present`
+    CpuPresent,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -85,6 +97,7 @@ pub fn lookup(path: &str, caller_pid: u64) -> Option<Result<ProcNode, i32>> {
             "meminfo" => return Some(Ok(ProcNode::MeminfoFile)),
             "filesystems" => return Some(Ok(ProcNode::FilesystemsFile)),
             "mounts" => return Some(Ok(ProcNode::MountsFile)),
+            "uptime" => return Some(Ok(ProcNode::UptimeFile)),
             _ => {}
         }
     }
@@ -102,7 +115,10 @@ pub fn lookup(path: &str, caller_pid: u64) -> Option<Result<ProcNode, i32>> {
 pub fn is_virtual_file(node: ProcNode) -> bool {
     matches!(
         node,
-        ProcNode::MeminfoFile | ProcNode::FilesystemsFile | ProcNode::MountsFile
+        ProcNode::MeminfoFile
+            | ProcNode::FilesystemsFile
+            | ProcNode::MountsFile
+            | ProcNode::UptimeFile
     )
 }
 
@@ -143,12 +159,58 @@ pub fn format_mounts(has_boot_volume: bool) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// Formats kernel monotonic uptime in `/proc/uptime` centisecond precision.
+pub fn format_uptime(monotonic_nanos: u64) -> Vec<u8> {
+    let cs = monotonic_nanos / 10_000_000;
+    format!("{}.{:02} 0.00\n", cs / 100, cs % 100).into_bytes()
+}
+
+/// Formats an online/possible CPU bitmask into Linux sysfs cpulist syntax.
+pub fn format_cpulist(cpu_mask: u64) -> Vec<u8> {
+    let mut out = String::new();
+    let mut bit = 0_u32;
+    while bit < 64 {
+        if (cpu_mask >> bit) & 1 == 0 {
+            bit += 1;
+            continue;
+        }
+        let start = bit;
+        while bit + 1 < 64 && (cpu_mask >> (bit + 1)) & 1 != 0 {
+            bit += 1;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        if start == bit {
+            out.push_str(&format!("{start}"));
+        } else {
+            out.push_str(&format!("{start}-{bit}"));
+        }
+        bit += 1;
+    }
+    out.push('\n');
+    out.into_bytes()
+}
+
+/// Classifies synthetic read-only `/sys` regular files.
+pub fn sys_virtual_file(path: &str) -> Option<SysFile> {
+    match path {
+        "/sys/devices/system/cpu/online" => Some(SysFile::CpuOnline),
+        "/sys/devices/system/cpu/possible" => Some(SysFile::CpuPossible),
+        "/sys/devices/system/cpu/present" => Some(SysFile::CpuPresent),
+        _ => None,
+    }
+}
+
 /// Returns whether `path` is a read-only synthetic `/sys` directory and its
-/// static child directory names.
+/// static child entry names.
 pub fn sys_dir_children(path: &str) -> Option<&'static [&'static str]> {
     Some(match path {
         "/sys" => &["class", "devices", "fs", "kernel"],
-        "/sys/class" | "/sys/devices" | "/sys/fs" | "/sys/kernel" => &[],
+        "/sys/devices" => &["system"],
+        "/sys/devices/system" => &["cpu"],
+        "/sys/devices/system/cpu" => &["online", "possible", "present"],
+        "/sys/class" | "/sys/fs" | "/sys/kernel" => &[],
         _ => return None,
     })
 }
@@ -179,7 +241,8 @@ pub fn link_target(node: ProcNode, caller_pid: u64, exec_path: &[u8]) -> Result<
         ProcNode::PidDir
         | ProcNode::MeminfoFile
         | ProcNode::FilesystemsFile
-        | ProcNode::MountsFile => Err(EINVAL),
+        | ProcNode::MountsFile
+        | ProcNode::UptimeFile => Err(EINVAL),
     }
 }
 
@@ -221,6 +284,7 @@ fn node_inode(node: ProcNode, caller_pid: u64) -> u64 {
         ProcNode::MeminfoFile => name.push_str("meminfo"),
         ProcNode::FilesystemsFile => name.push_str("filesystems"),
         ProcNode::MountsFile => name.push_str("mounts"),
+        ProcNode::UptimeFile => name.push_str("uptime"),
     }
     path_inode(name.as_bytes())
 }
@@ -229,9 +293,10 @@ fn node_mode(node: ProcNode) -> u32 {
     match node {
         ProcNode::PidDir => PID_DIR_MODE,
         ProcNode::SelfLink | ProcNode::ExeLink => SYMLINK_MODE,
-        ProcNode::MeminfoFile | ProcNode::FilesystemsFile | ProcNode::MountsFile => {
-            REG_READONLY_MODE
-        }
+        ProcNode::MeminfoFile
+        | ProcNode::FilesystemsFile
+        | ProcNode::MountsFile
+        | ProcNode::UptimeFile => REG_READONLY_MODE,
     }
 }
 
@@ -346,8 +411,23 @@ mod tests {
             sys_dir_children("/sys"),
             Some(&["class", "devices", "fs", "kernel"][..])
         );
+        assert_eq!(sys_dir_children("/sys/devices"), Some(&["system"][..]));
+        assert_eq!(
+            sys_dir_children("/sys/devices/system/cpu"),
+            Some(&["online", "possible", "present"][..])
+        );
         assert_eq!(sys_dir_children("/sys/kernel"), Some(&[][..]));
         assert_eq!(sys_dir_children("/sys/nonexistent"), None);
+        assert_eq!(
+            sys_virtual_file("/sys/devices/system/cpu/online"),
+            Some(SysFile::CpuOnline)
+        );
+        assert_eq!(sys_virtual_file("/sys/devices/system/cpu"), None);
+        assert_eq!(format_cpulist(0b1), b"0\n");
+        assert_eq!(format_cpulist(0b1111), b"0-3\n");
+        assert_eq!(format_cpulist(0b1101), b"0,2-3\n");
+        assert_eq!(lookup("/proc/uptime", 7), Some(Ok(ProcNode::UptimeFile)));
+        assert_eq!(format_uptime(12_340_000_000), b"12.34 0.00\n");
 
         let stat = node_stat(ProcNode::MeminfoFile, 7, mem.len() as u64);
         let mode = u32::from_le_bytes(stat[24..28].try_into().unwrap());
