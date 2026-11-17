@@ -229,6 +229,46 @@ fn preadv2_validation_handles_sentinel_negative_and_rwf_flags() {
 }
 
 #[test]
+fn remote_vfs_handle_table_enforces_write_rights_by_open_flags() {
+    let mut table = multitask::HandleTable::new();
+    let ro_remote = multitask::RemoteVfsHandle::new(
+        1,
+        multitask::RemoteVfsHandleKind::File,
+        alloc::string::String::from("/data/ro.txt"),
+        0,
+        0,
+    )
+    .expect("remote vfs handle");
+    let ro_fd = table
+        .install_with_open_flags(
+            multitask::KernelHandle::RemoteVfs(ro_remote),
+            linux_abi::O_RDONLY,
+        )
+        .expect("ro fd");
+    let ro_entry = table.get_entry(ro_fd).expect("ro entry");
+    assert!(ro_entry.rights().allows_read());
+    assert!(!ro_entry.rights().allows_write());
+
+    let rw_remote = multitask::RemoteVfsHandle::new(
+        2,
+        multitask::RemoteVfsHandleKind::File,
+        alloc::string::String::from("/data/rw.txt"),
+        0,
+        0,
+    )
+    .expect("remote vfs handle");
+    let rw_fd = table
+        .install_with_open_flags(
+            multitask::KernelHandle::RemoteVfs(rw_remote),
+            linux_abi::O_RDWR,
+        )
+        .expect("rw fd");
+    let rw_entry = table.get_entry(rw_fd).expect("rw entry");
+    assert!(rw_entry.rights().allows_read());
+    assert!(rw_entry.rights().allows_write());
+}
+
+#[test]
 fn proc_fd_path_parser_matches_self_and_caller_pid_only() {
     assert_eq!(proc_self_fd_target("/proc/self/fd/3", 7), Some(3));
     assert_eq!(proc_self_fd_target("/proc/7/fd/0", 7), Some(0));

@@ -22,10 +22,10 @@ use std::time::{Duration, Instant};
 
 use rustos_user_abi::syscall::{
     DvmBlockInfoWire, DvmBlockTicketWire, RustosBlockBrokerArgs, BLOCK_BROKER_ABI_VERSION,
-    BLOCK_BROKER_FLAG_FUA, BLOCK_BROKER_MAX_IO_BYTES, BLOCK_BROKER_OP_DVM_CANCEL,
-    BLOCK_BROKER_OP_DVM_COLLECT, BLOCK_BROKER_OP_DVM_INFO, BLOCK_BROKER_OP_DVM_SUBMIT_FLUSH,
-    BLOCK_BROKER_OP_DVM_SUBMIT_READ, BLOCK_BROKER_OP_DVM_SUBMIT_WRITE, BLOCK_BROKER_OP_DVM_WAIT,
-    SYS_RUSTOS_BLOCK_BROKER,
+    BLOCK_BROKER_FLAG_FUA, BLOCK_BROKER_INFO_FLAG_READ_ONLY, BLOCK_BROKER_MAX_IO_BYTES,
+    BLOCK_BROKER_OP_DVM_CANCEL, BLOCK_BROKER_OP_DVM_COLLECT, BLOCK_BROKER_OP_DVM_INFO,
+    BLOCK_BROKER_OP_DVM_SUBMIT_FLUSH, BLOCK_BROKER_OP_DVM_SUBMIT_READ,
+    BLOCK_BROKER_OP_DVM_SUBMIT_WRITE, BLOCK_BROKER_OP_DVM_WAIT, SYS_RUSTOS_BLOCK_BROKER,
 };
 
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(15);
@@ -172,6 +172,7 @@ enum Coverage {
     },
 }
 
+#[derive(Debug, Eq, PartialEq)]
 enum CoverageInto {
     Hit(usize),
     Partial {
@@ -644,7 +645,6 @@ pub(super) fn write_with_info(
     fua: bool,
 ) -> Result<(), i32> {
     write_admitted_with(info, expected_generation, lba, block_count, bytes, || {
-        clear_read_cache();
         let ticket = submit(
             expected_generation,
             BLOCK_BROKER_OP_DVM_SUBMIT_WRITE,
@@ -677,7 +677,11 @@ fn write_admitted_with(
     write: impl FnOnce() -> Result<(), i32>,
 ) -> Result<(), i32> {
     require_generation(info, expected_generation)?;
+    if info.flags & BLOCK_BROKER_INFO_FLAG_READ_ONLY != 0 {
+        return Err(libc::EROFS);
+    }
     validate_write_extent(info, lba, block_count, bytes.len())?;
+    clear_read_cache();
     write()
 }
 
@@ -1207,5 +1211,76 @@ mod tests {
         assert!(!caches.miss_continues_read_ahead(8, 116));
         caches.clear();
         assert!(!caches.miss_continues_read_ahead(7, 116));
+    }
+
+    #[test]
+    fn read_only_device_rejects_write_admission_with_erofs_and_preserves_cache() {
+        let ro_info = BlockInfo {
+            flags: BLOCK_BROKER_INFO_FLAG_READ_ONLY,
+            logical_block_size: 512,
+            ..info()
+        };
+        let bytes = [0_u8; 512];
+        let mut side_effects = 0;
+        assert_eq!(
+            write_admitted_with(ro_info, 7, 0, 1, &bytes, || {
+                side_effects += 1;
+                Ok(())
+            }),
+            Err(libc::EROFS)
+        );
+        assert_eq!(side_effects, 0);
+        assert_eq!(
+            write_with_info(ro_info, 7, 0, 1, &bytes, false),
+            Err(libc::EROFS)
+        );
+    }
+
+    #[test]
+    fn writable_device_permits_multi_block_write_and_invalidates_read_cache() {
+        let rw_info = BlockInfo {
+            flags: 0,
+            logical_block_size: 512,
+            ..info()
+        };
+        insert_read_ahead_batch(
+            [ReadCache {
+                generation: rw_info.generation,
+                lba: 0,
+                block_count: 2,
+                block_size: 512,
+                bytes: vec![0x5a; 1024],
+            }],
+            rw_info.generation,
+            2,
+        )
+        .expect("seed read cache");
+
+        let mut cached = [0_u8; 1024];
+        assert_eq!(
+            read_cache_lookup_into(rw_info, 0, 2, &mut cached),
+            Ok(CoverageInto::Hit(1024))
+        );
+
+        let bytes = [0xa5_u8; 1024];
+        let mut submitted = false;
+        assert_eq!(
+            write_admitted_with(rw_info, rw_info.generation, 0, 2, &bytes, || {
+                // Read cache must already be invalidated before submission.
+                let mut probe = [0_u8; 1024];
+                assert_eq!(
+                    read_cache_lookup_into(rw_info, 0, 2, &mut probe),
+                    Ok(CoverageInto::Partial {
+                        prefix_len: 0,
+                        start: 0,
+                        continues_read_ahead: false,
+                    })
+                );
+                submitted = true;
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert!(submitted);
     }
 }

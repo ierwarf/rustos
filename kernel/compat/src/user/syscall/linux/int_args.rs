@@ -27,9 +27,6 @@ const W: Kind = Kind::Wide;
 const S: Kind = Kind::Signed;
 const U: Kind = Kind::Unsigned;
 
-/// x86_64 `__NR_symlinkat`; the shared ABI crate does not export it.
-const SYS_SYMLINKAT: u64 = 266;
-
 /// 32-bit argument kinds for a Linux syscall number. Every name below must be
 /// a defined constant: an unknown identifier in a pattern is a catch-all
 /// binding, which would silently apply the arm to every other syscall.
@@ -47,7 +44,8 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
         | SYS_FTRUNCATE
         | SYS_FSYNC
         | SYS_FDATASYNC
-        | SYS_SYNCFS => [S, W, W, W, W, W],
+        | SYS_SYNCFS
+        | SYS_FSTATFS => [S, W, W, W, W, W],
         // unsigned int fd, const struct iovec*, int iovcnt
         SYS_READV | SYS_WRITEV | SYS_PREADV | SYS_PWRITEV => [S, W, S, W, W, W],
         // unsigned int fd, const struct iovec*, int iovcnt, pos_l, pos_h, int flags
@@ -135,6 +133,9 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
         SYS_FACCESSAT => [S, W, U, U, W, W],
         SYS_ACCESS => [W, U, W, W, W, W],
         SYS_MKDIR => [W, U, W, W, W, W],
+        SYS_MKDIRAT => [S, W, U, W, W, W],
+        SYS_RENAMEAT => [S, W, S, W, W, W],
+        SYS_RENAMEAT2 => [S, W, S, W, U, W],
         SYS_NEWFSTATAT => [S, W, W, U, W, W],
         // dirfd, path*, unsigned flags, unsigned mask, buf*
         SYS_STATX => [S, W, U, U, W, W],
@@ -329,6 +330,32 @@ mod tests {
         assert_eq!(out[0], 3);
         assert_eq!(out[1], u64::from(u32::MAX));
         assert_eq!(out[2], CLOSE_RANGE_CLOEXEC);
+    }
+
+    #[test]
+    fn writable_vfs_syscall_arg_widths() {
+        let out = run(SYS_MKDIRAT, [0xFFFF_FF9C, 0x1000, GARBAGE | 0o755, 0, 0, 0]);
+        assert_eq!(out[0], AT_FDCWD as u64);
+        assert_eq!(out[1], 0x1000);
+        assert_eq!(out[2], 0o755);
+
+        let out = run(
+            SYS_RENAMEAT2,
+            [0xFFFF_FF9C, 0x1000, GARBAGE | 7, 0x2000, GARBAGE | RENAME_NOREPLACE, 0],
+        );
+        assert_eq!(out[0], AT_FDCWD as u64);
+        assert_eq!(out[1], 0x1000);
+        assert_eq!(out[2], 7);
+        assert_eq!(out[3], 0x2000);
+        assert_eq!(out[4], RENAME_NOREPLACE);
+
+        let out = run(SYS_RENAMEAT, [GARBAGE | 3, 0x1000, 0xFFFF_FF9C, 0x2000, 0, 0]);
+        assert_eq!(out[0], 3);
+        assert_eq!(out[2], AT_FDCWD as u64);
+
+        let out = run(SYS_FSTATFS, [GARBAGE | 9, 0x3000, 0, 0, 0, 0]);
+        assert_eq!(out[0], 9);
+        assert_eq!(out[1], 0x3000);
     }
 }
 

@@ -42,6 +42,14 @@ raw_u64! {
     SYS_WRITE = linux::__NR_write;
     SYS_CLOSE = linux::__NR_close;
     SYS_UNLINK = linux::__NR_unlink;
+    SYS_TRUNCATE = linux::__NR_truncate;
+    SYS_RENAME = linux::__NR_rename;
+    SYS_RMDIR = linux::__NR_rmdir;
+    SYS_SYMLINK = linux::__NR_symlink;
+    SYS_CHMOD = linux::__NR_chmod;
+    SYS_FCHMOD = linux::__NR_fchmod;
+    SYS_STATFS = linux::__NR_statfs;
+    SYS_FSTATFS = linux::__NR_fstatfs;
     SYS_SOCKET = linux::__NR_socket;
     SYS_SENDTO = linux::__NR_sendto;
     SYS_ACCEPT = linux::__NR_accept;
@@ -129,6 +137,12 @@ raw_u64! {
     SYS_EXIT_GROUP = linux::__NR_exit_group;
     SYS_TGKILL = linux::__NR_tgkill;
     SYS_OPENAT = linux::__NR_openat;
+    SYS_MKDIRAT = linux::__NR_mkdirat;
+    SYS_RENAMEAT = linux::__NR_renameat;
+    SYS_RENAMEAT2 = linux::__NR_renameat2;
+    SYS_SYMLINKAT = linux::__NR_symlinkat;
+    SYS_FCHMODAT = linux::__NR_fchmodat;
+    SYS_UTIMENSAT = linux::__NR_utimensat;
     SYS_UNLINKAT = linux::__NR_unlinkat;
     SYS_SOCKETPAIR = linux::__NR_socketpair;
     SYS_BIND = linux::__NR_bind;
@@ -180,6 +194,7 @@ raw_u64! {
     O_RDWR = linux::O_RDWR;
     MS_RDONLY = linux::MS_RDONLY;
     O_CREAT = linux::O_CREAT;
+    O_EXCL = linux::O_EXCL;
     O_NOCTTY = linux::O_NOCTTY;
     O_TRUNC = linux::O_TRUNC;
     O_NONBLOCK = linux::O_NONBLOCK;
@@ -261,6 +276,13 @@ raw_u64! {
     AT_EMPTY_PATH = linux::AT_EMPTY_PATH;
     AT_EACCESS = linux::AT_EACCESS;
     AT_SYMLINK_NOFOLLOW = linux::AT_SYMLINK_NOFOLLOW;
+    AT_REMOVEDIR = linux::AT_REMOVEDIR;
+    RENAME_NOREPLACE = linux::RENAME_NOREPLACE;
+    RENAME_EXCHANGE = linux::RENAME_EXCHANGE;
+    UTIME_NOW = linux::UTIME_NOW;
+    UTIME_OMIT = linux::UTIME_OMIT;
+    ST_RDONLY = linux::MS_RDONLY;
+    ST_NOSUID = linux::MS_NOSUID;
     AT_NO_AUTOMOUNT = linux::AT_NO_AUTOMOUNT;
     AT_STATX_SYNC_TYPE = linux::AT_STATX_SYNC_TYPE;
     AT_STATX_SYNC_AS_STAT = linux::AT_STATX_SYNC_AS_STAT;
@@ -683,6 +705,24 @@ pub struct LinuxStat {
     pub st_mtim: LinuxTimespec,
     pub st_ctim: LinuxTimespec,
     pub __glibc_reserved: [i64; 3],
+}
+
+/// x86_64 Linux `struct statfs` (`120` bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinuxStatFs {
+    pub f_type: i64,
+    pub f_bsize: i64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: i64,
+    pub f_frsize: i64,
+    pub f_flags: i64,
+    pub f_spare: [i64; 4],
 }
 
 #[repr(C)]
@@ -1659,11 +1699,31 @@ mod tests {
     use alloc::string::String;
     use core::mem::size_of;
 
-    use super::{LinuxRuntimeProfile, LinuxStatx};
+    use super::{LinuxRuntimeProfile, LinuxStatFs, LinuxStatx};
 
     #[test]
     fn linux_statx_matches_uapi_size() {
         assert_eq!(size_of::<LinuxStatx>(), 0x100);
+    }
+
+    #[test]
+    fn linux_statfs_matches_uapi_layout() {
+        use core::mem::offset_of;
+        use linux_raw_sys::general::statfs;
+        assert_eq!(size_of::<LinuxStatFs>(), 120);
+        assert_eq!(size_of::<LinuxStatFs>(), size_of::<statfs>());
+        assert_eq!(offset_of!(LinuxStatFs, f_type), offset_of!(statfs, f_type));
+        assert_eq!(offset_of!(LinuxStatFs, f_bsize), offset_of!(statfs, f_bsize));
+        assert_eq!(offset_of!(LinuxStatFs, f_blocks), offset_of!(statfs, f_blocks));
+        assert_eq!(offset_of!(LinuxStatFs, f_bfree), offset_of!(statfs, f_bfree));
+        assert_eq!(offset_of!(LinuxStatFs, f_bavail), offset_of!(statfs, f_bavail));
+        assert_eq!(offset_of!(LinuxStatFs, f_files), offset_of!(statfs, f_files));
+        assert_eq!(offset_of!(LinuxStatFs, f_ffree), offset_of!(statfs, f_ffree));
+        assert_eq!(offset_of!(LinuxStatFs, f_fsid), offset_of!(statfs, f_fsid));
+        assert_eq!(offset_of!(LinuxStatFs, f_namelen), offset_of!(statfs, f_namelen));
+        assert_eq!(offset_of!(LinuxStatFs, f_frsize), offset_of!(statfs, f_frsize));
+        assert_eq!(offset_of!(LinuxStatFs, f_flags), offset_of!(statfs, f_flags));
+        assert_eq!(offset_of!(LinuxStatFs, f_spare), offset_of!(statfs, f_spare));
     }
 
     #[test]
@@ -1693,6 +1753,7 @@ crate::user_wire!(LinuxTimeval { tv_sec: i64, tv_usec: i64 });
 crate::user_wire!(LinuxSysinfo { uptime: i64, loads: [u64; 3], totalram: u64, freeram: u64, sharedram: u64, bufferram: u64, totalswap: u64, freeswap: u64, procs: u16, pad: u16, _pad2: u32, totalhigh: u64, freehigh: u64, mem_unit: u32, _pad3: u32 });
 crate::user_wire!(LinuxTms { tms_utime: i64, tms_stime: i64, tms_cutime: i64, tms_cstime: i64 });
 crate::user_wire!(LinuxSchedParam { sched_priority: i32 });
+crate::user_wire!(LinuxStatFs { f_type: i64, f_bsize: i64, f_blocks: u64, f_bfree: u64, f_bavail: u64, f_files: u64, f_ffree: u64, f_fsid: [i32; 2], f_namelen: i64, f_frsize: i64, f_flags: i64, f_spare: [i64; 4] });
 
 pub const SYS_RUSTOS_APP_BUFFER_BROKER: u64 = crate::syscall::SYS_RUSTOS_APP_BUFFER_BROKER;
 pub const SYS_RUSTOS_APP_BUFFER_ALLOC: u64 = crate::syscall::SYS_RUSTOS_APP_BUFFER_ALLOC;

@@ -610,3 +610,94 @@ fn prepared_unix_publication_requires_exact_operation_tokens_and_channel() {
         assert!(!net_broker_socket_publication_shape_valid(&malformed));
     }
 }
+
+#[test]
+fn vfs_writable_ipc_opcodes_are_distinct_and_version_unchanged() {
+    use super::{
+        VFS_IPC_ABI_VERSION, VFS_IPC_OP_FSYNC, VFS_IPC_OP_LIBRARY_READ, VFS_IPC_OP_PWRITE64,
+        VFS_IPC_OP_RENAMEAT2, VFS_IPC_OP_SET_ATTRS, VFS_IPC_OP_STATFS, VFS_IPC_OP_SYMLINKAT,
+    };
+    assert_eq!(VFS_IPC_ABI_VERSION, 5);
+    assert_eq!(VFS_IPC_OP_LIBRARY_READ, 27);
+    assert_eq!(VFS_IPC_OP_PWRITE64, 28);
+    assert_eq!(VFS_IPC_OP_FSYNC, 29);
+    assert_eq!(VFS_IPC_OP_RENAMEAT2, 30);
+    assert_eq!(VFS_IPC_OP_STATFS, 31);
+    assert_eq!(VFS_IPC_OP_SYMLINKAT, 32);
+    assert_eq!(VFS_IPC_OP_SET_ATTRS, 33);
+}
+
+#[test]
+fn vfs_statfs_wire_layout_and_round_trip() {
+    use super::VfsStatFsWire;
+    assert_eq!(size_of::<VfsStatFsWire>(), 120);
+    assert_eq!(VfsStatFsWire::WIRE_BYTES, 120);
+    assert!(VfsStatFsWire::WIRE_BYTES <= VFS_IPC_PAYLOAD_CAPACITY);
+
+    let wire = VfsStatFsWire {
+        f_type: 0x4d44,
+        f_bsize: 4096,
+        f_blocks: 1_000_000,
+        f_bfree: 500_000,
+        f_bavail: 450_000,
+        f_files: 65_536,
+        f_ffree: 60_000,
+        f_fsid: [0x1234_5678, -0x0102_0304],
+        f_namelen: 255,
+        f_frsize: 4096,
+        f_flags: 0,
+        f_spare: [1, 2, 3, 4],
+    };
+    let bytes = wire.to_bytes();
+    assert_eq!(VfsStatFsWire::from_bytes(&bytes), Some(wire));
+    assert_eq!(VfsStatFsWire::from_bytes(&bytes[..119]), None);
+    let mut long = [0_u8; 121];
+    long[..120].copy_from_slice(&bytes);
+    assert_eq!(VfsStatFsWire::from_bytes(&long), None);
+}
+
+#[test]
+fn vfs_two_path_payload_round_trip_and_bounds() {
+    use super::{
+        VFS_IPC_PATH_CAPACITY, VFS_IPC_REQUEST_PAYLOAD_CAPACITY, decode_two_path_payload,
+        encode_two_path_payload,
+    };
+    let mut buf = [0_u8; VFS_IPC_REQUEST_PAYLOAD_CAPACITY];
+    let len = encode_two_path_payload(b"/mnt/fat/old.txt", b"/mnt/fat/new.txt", &mut buf)
+        .expect("valid two-path payload");
+    assert_eq!(len, 4 + 16 + 16);
+    assert_eq!(
+        decode_two_path_payload(&buf[..len]),
+        Some((b"/mnt/fat/old.txt".as_slice(), b"/mnt/fat/new.txt".as_slice()))
+    );
+
+    // Exact capacity fit: 4 + 254 + 254 = 512 == VFS_IPC_REQUEST_PAYLOAD_CAPACITY
+    let max_half = [b'a'; 254];
+    let max_len = encode_two_path_payload(&max_half, &max_half, &mut buf)
+        .expect("exact capacity two-path payload");
+    assert_eq!(max_len, VFS_IPC_REQUEST_PAYLOAD_CAPACITY);
+    assert_eq!(
+        decode_two_path_payload(&buf[..max_len]),
+        Some((max_half.as_slice(), max_half.as_slice()))
+    );
+
+    // Overflowing combined payload is rejected.
+    let too_long = [b'b'; 255];
+    assert_eq!(encode_two_path_payload(&max_half, &too_long, &mut buf), None);
+
+    // Path exceeding VFS_IPC_PATH_CAPACITY is rejected even with larger slice.
+    let over_path = [b'c'; VFS_IPC_PATH_CAPACITY + 1];
+    let mut big_buf = [0_u8; VFS_IPC_PATH_CAPACITY + 16];
+    assert_eq!(encode_two_path_payload(&over_path, b"x", &mut big_buf), None);
+
+    // Short output buffer is rejected.
+    let mut small_buf = [0_u8; 8];
+    assert_eq!(encode_two_path_payload(b"abc", b"def", &mut small_buf), None);
+
+    // Malformed decode inputs: too short, length mismatch, trailing bytes.
+    assert_eq!(decode_two_path_payload(&buf[..3]), None);
+    assert_eq!(decode_two_path_payload(&buf[..len - 1]), None);
+    let mut trailing = [0_u8; 4 + 16 + 16 + 1];
+    let _ = encode_two_path_payload(b"/mnt/fat/old.txt", b"/mnt/fat/new.txt", &mut trailing);
+    assert_eq!(decode_two_path_payload(&trailing), None);
+}

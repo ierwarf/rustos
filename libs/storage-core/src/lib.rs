@@ -14,6 +14,12 @@ extern crate alloc;
 extern crate std;
 
 pub mod file_io;
+pub mod fs;
+
+pub use fs::{
+    dos_attrs, CasePolicy, FsCapabilities, FsDirEntry, FsError, FsMetadata, FsNodeKind,
+    FsOpenOptions, FsStatFs, FsTimestamp, FsVolume,
+};
 
 use alloc::boxed::Box;
 use alloc::vec;

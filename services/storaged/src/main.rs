@@ -448,13 +448,20 @@ fn dispatch_commercial(
         }
         COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE => {
             require_request_generation(request, info)?;
+            if info.flags & rustos_user_abi::syscall::BLOCK_BROKER_INFO_FLAG_READ_ONLY != 0 {
+                return Err(libc::EROFS);
+            }
+            let payload = request
+                .payload
+                .get(..request.payload_len as usize)
+                .ok_or(libc::EINVAL)?;
             let fua = request.arg3 & COMMERCIAL_MAX_STORAGED_BLOCK_FLAG_FUA != 0;
             block::write_with_info(
                 info,
                 request.arg0,
                 request.arg1,
                 request.arg2,
-                &request.payload[..request.payload_len as usize],
+                payload,
                 fua,
             )?;
             response.value0 = request.arg0;
@@ -773,6 +780,85 @@ mod tests {
             readiness_errno_witness(libc::ENODEV),
             readiness_errno_witness(libc::EIO)
         );
+    }
+
+    #[test]
+    fn read_only_device_rejects_write_dispatch_with_erofs_and_marks_descriptor_readonly() {
+        let ro_info = block::BlockInfo {
+            generation: 7,
+            capacity_sectors: 1024,
+            logical_block_size: 512,
+            physical_block_size: 512,
+            features: 0,
+            flags: rustos_user_abi::syscall::BLOCK_BROKER_INFO_FLAG_READ_ONLY,
+        };
+
+        let descriptors = list_descriptors(ro_info).expect("ro descriptors");
+        assert_eq!(descriptors.len(), 1);
+        assert_ne!(descriptors[0].flags & STORAGE_FLAG_READONLY, 0);
+
+        let root = selected_root_descriptor(ro_info).expect("ro root descriptor");
+        assert_ne!(root.flags & STORAGE_FLAG_READONLY, 0);
+
+        let mut inv_resp = CommercialMaxProtocolResponse::default();
+        dispatch_commercial(
+            &request(COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY),
+            &mut inv_resp,
+            ro_info,
+        )
+        .expect("inventory succeeds on ro device");
+        assert_eq!(inv_resp.descriptor_count, 1);
+        assert_ne!(inv_resp.descriptors[0].flags & STORAGE_FLAG_READONLY, 0);
+
+        let mut write_req = request(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE);
+        write_req.arg0 = ro_info.generation;
+        write_req.arg1 = 0;
+        write_req.arg2 = 1;
+        write_req.payload_len = 512;
+        assert_eq!(validate_commercial_request(&write_req), Ok(()));
+
+        let mut write_resp = CommercialMaxProtocolResponse::default();
+        assert_eq!(
+            dispatch_commercial(&write_req, &mut write_resp, ro_info),
+            Err(libc::EROFS)
+        );
+    }
+
+    #[test]
+    fn writable_device_omits_readonly_flag_and_permits_write_validation() {
+        let rw_info = block::BlockInfo {
+            generation: 7,
+            capacity_sectors: 1024,
+            logical_block_size: 512,
+            physical_block_size: 512,
+            features: 0,
+            flags: 0,
+        };
+
+        let descriptors = list_descriptors(rw_info).expect("rw descriptors");
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].flags & STORAGE_FLAG_READONLY, 0);
+
+        let root = selected_root_descriptor(rw_info).expect("rw root descriptor");
+        assert_eq!(root.flags & STORAGE_FLAG_READONLY, 0);
+
+        let mut root_resp = CommercialMaxProtocolResponse::default();
+        dispatch_commercial(
+            &request(COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT),
+            &mut root_resp,
+            rw_info,
+        )
+        .expect("root select succeeds on rw device");
+        assert_eq!(root_resp.descriptor_count, 1);
+        assert_eq!(root_resp.descriptors[0].flags & STORAGE_FLAG_READONLY, 0);
+
+        let mut write_req = request(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE);
+        write_req.arg0 = rw_info.generation;
+        write_req.arg1 = 0;
+        write_req.arg2 = 2;
+        write_req.arg3 = COMMERCIAL_MAX_STORAGED_BLOCK_FLAG_FUA;
+        write_req.payload_len = 1024;
+        assert_eq!(validate_commercial_request(&write_req), Ok(()));
     }
 }
 

@@ -66,7 +66,11 @@ impl VfsState {
         }
         match self.checkpoint_close_description(request, request.remote_id) {
             Ok(_) => {
-                self.handles.remove(&request.remote_id);
+                if let Some(closed) = self.handles.remove(&request.remote_id) {
+                    if closed.mount_id != 0 {
+                        lock_vfs_storage().note_close_node(closed.path.as_str());
+                    }
+                }
                 // A committed tombstone is a final reference, not just a
                 // request to close. The rootd receipt remains replayable.
                 if let Err(errno)=self.refund_open_description(request.remote_id){
@@ -113,9 +117,14 @@ impl VfsState {
             response.status = EBUSY;
             return;
         }
+        let file_len = if handle.kind == RemoteKind::File {
+            lock_vfs_storage().live_len_for_path(handle.path.as_str(), handle.len)
+        } else {
+            handle.len
+        };
         let next = match checked_seek_position(
             handle.cursor,
-            handle.len,
+            file_len,
             request.arg0 as i64,
             request.arg1,
         ) {
@@ -199,8 +208,10 @@ impl VfsState {
         // Identity first: refusal for a non-volume file is data, not an error,
         // because the pager also reads its own (bootstrap-image) manifest here.
         let (identity, attested) = match storage.file_identity(path.as_str(), metadata.len) {
-            Ok(identity) => (identity, 1),
-            Err(EOPNOTSUPP | ENOENT | EIO | EINVAL) => (VfsFileIdentityWire::default(), 0),
+            Ok(identity) if identity.flags & VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME != 0 => {
+                (identity, 1)
+            }
+            Ok(_) | Err(EOPNOTSUPP | ENOENT | EIO | EINVAL) => (VfsFileIdentityWire::default(), 0),
             Err(errno) => {
                 response.status = errno;
                 return;
@@ -258,10 +269,15 @@ impl VfsState {
             response.status = EBADF;
             return;
         };
+        let (len, inode) = if handle.kind == RemoteKind::File {
+            lock_vfs_storage().live_stat_for_path(handle.path.as_str(), handle.len)
+        } else {
+            (handle.len, path_inode(handle.path.as_bytes()))
+        };
         let stat = build_linux_stat(Metadata {
             kind: handle.kind,
-            len: handle.len,
-            inode: path_inode(handle.path.as_bytes()),
+            len,
+            inode,
         });
         response.payload_len = LINUX_STAT_SIZE as u32;
         response.payload[..LINUX_STAT_SIZE].copy_from_slice(&stat);
@@ -385,6 +401,7 @@ impl VfsState {
                 let mut candidate = handle;
                 candidate.status_flags = (candidate.status_flags & !F_SETFL_MUTABLE_MASK)
                     | (request.arg1 & F_SETFL_MUTABLE_MASK);
+                candidate.append = (candidate.status_flags & linux_abi::O_APPEND) != 0;
                 candidate.last_mutation = VFSD_OPEN_MUTATION_FCNTL;
                 candidate.last_start = request.arg0;
                 candidate.last_result = request.arg1;
@@ -740,7 +757,7 @@ impl VfsState {
                 return;
             }
         };
-        response.status = lock_vfs_storage().run_dirs.mkdir(path.as_str(), request.euid);
+        response.status = lock_vfs_storage().mkdir_path(path.as_str(), request.euid);
     }
 
     fn linux_mount_vfs(&mut self, response: &mut VfsIpcResponse) {
@@ -769,7 +786,295 @@ impl VfsState {
                 return;
             }
         };
-        response.status = unlink_policy(path.as_str());
+        let remove_dir = (request.flags & linux_abi::AT_REMOVEDIR as u32) != 0;
+        response.status = lock_vfs_storage().unlink_path(path.as_str(), remove_dir);
+    }
+
+    fn vfs_write(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(handle) = self.handles.get(&request.remote_id).cloned() else {
+            response.status = EBADF;
+            return;
+        };
+        if handle.kind == RemoteKind::Device {
+            match handle.path.as_str() {
+                "/dev/null" | "/dev/zero" | "/dev/urandom" | "/dev/random" => {
+                    response.value = u64::from(request.payload_len);
+                    return;
+                }
+                "/dev/full" => {
+                    response.status = if request.payload_len == 0 { 0 } else { ENOSPC };
+                    return;
+                }
+                _ => {
+                    response.status = EINVAL;
+                    return;
+                }
+            }
+        }
+        if !handle.writable {
+            response.status = EBADF;
+            return;
+        }
+        if handle.kind != RemoteKind::File {
+            response.status = EISDIR;
+            return;
+        }
+        if self.checkpoint_operation_replayed(request, checkpoint_handle_key(request.remote_id)) {
+            if handle.last_mutation != VFSD_OPEN_MUTATION_STABLE {
+                response.status = EIO;
+                return;
+            }
+            response.value = handle.last_result;
+            return;
+        }
+        if cursor_mutation_prepared(&handle) {
+            response.status = EBUSY;
+            return;
+        }
+        let len = (request.payload_len as usize).min(request.payload.len());
+        let data = &request.payload[..len];
+        let (start, written, new_len) = {
+            let mut storage = lock_vfs_storage();
+            let start = if handle.append {
+                storage.live_len_for_path(handle.path.as_str(), handle.len)
+            } else {
+                handle.cursor
+            };
+            match storage.write_at_path(handle.path.as_str(), start, data) {
+                Ok((written, new_len)) => (start, written, new_len),
+                Err(errno) => {
+                    response.status = errno;
+                    return;
+                }
+            }
+        };
+        let mut candidate = handle;
+        candidate.cursor = match start.checked_add(written as u64) {
+            Some(c) => c,
+            None => {
+                response.status = EOVERFLOW;
+                return;
+            }
+        };
+        candidate.len = new_len;
+        candidate.last_mutation = VFSD_OPEN_MUTATION_STABLE;
+        candidate.last_start = start;
+        candidate.last_result = written as u64;
+        if let Err(errno) = self.checkpoint_handle_state(
+            request,
+            request.remote_id,
+            &candidate,
+            VFSD_OPEN_MUTATION_STABLE,
+            start,
+            written as u64,
+        ) {
+            response.status = errno;
+            return;
+        }
+        self.handles.insert(request.remote_id, candidate);
+        response.value = written as u64;
+    }
+
+    fn vfs_pwrite64(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(handle) = self.handles.get(&request.remote_id).cloned() else {
+            response.status = EBADF;
+            return;
+        };
+        if handle.kind == RemoteKind::Device {
+            match handle.path.as_str() {
+                "/dev/null" | "/dev/zero" | "/dev/urandom" | "/dev/random" => {
+                    response.value = u64::from(request.payload_len);
+                    return;
+                }
+                "/dev/full" => {
+                    response.status = if request.payload_len == 0 { 0 } else { ENOSPC };
+                    return;
+                }
+                _ => {
+                    response.status = EINVAL;
+                    return;
+                }
+            }
+        }
+        if !handle.writable {
+            response.status = EBADF;
+            return;
+        }
+        if handle.kind != RemoteKind::File {
+            response.status = EISDIR;
+            return;
+        }
+        let len = (request.arg1 as usize)
+            .min(request.payload_len as usize)
+            .min(request.payload.len());
+        let data = &request.payload[..len];
+        match lock_vfs_storage().write_at_path(handle.path.as_str(), request.arg0, data) {
+            Ok((written, new_len)) => {
+                if let Some(entry) = self.handles.get_mut(&request.remote_id) {
+                    entry.len = new_len;
+                }
+                response.value = written as u64;
+            }
+            Err(errno) => response.status = errno,
+        }
+    }
+
+    fn vfs_ftruncate(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(handle) = self.handles.get(&request.remote_id).cloned() else {
+            response.status = EBADF;
+            return;
+        };
+        if !handle.writable || handle.kind != RemoteKind::File {
+            response.status = EINVAL;
+            return;
+        }
+        match lock_vfs_storage().truncate_path(handle.path.as_str(), request.arg0) {
+            Ok(actual_len) => {
+                if let Some(entry) = self.handles.get_mut(&request.remote_id) {
+                    entry.len = actual_len;
+                }
+                response.value = 0;
+            }
+            Err(errno) => response.status = errno,
+        }
+    }
+
+    fn vfs_fsync(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(handle) = self.handles.get(&request.remote_id) else {
+            response.status = EBADF;
+            return;
+        };
+        if handle.kind == RemoteKind::Device {
+            response.status = EINVAL;
+            return;
+        }
+        let path = handle.path.clone();
+        if let Err(errno) = lock_vfs_storage().flush_path(path.as_str()) {
+            response.status = errno;
+        }
+    }
+
+    fn vfs_renameat2(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let payload = &request.payload[..(request.payload_len as usize).min(request.payload.len())];
+        let Some((old_bytes, new_bytes)) = decode_two_path_payload(payload) else {
+            response.status = EINVAL;
+            return;
+        };
+        let (Ok(old_raw), Ok(new_raw)) = (str::from_utf8(old_bytes), str::from_utf8(new_bytes)) else {
+            response.status = EINVAL;
+            return;
+        };
+        let known_flags = linux_abi::RENAME_NOREPLACE as u64 | linux_abi::RENAME_EXCHANGE as u64;
+        if request.arg1 & !known_flags != 0 {
+            response.status = EINVAL;
+            return;
+        }
+        if request.arg1 & linux_abi::RENAME_EXCHANGE as u64 != 0 {
+            response.status = EOPNOTSUPP;
+            return;
+        }
+        let no_replace = (request.arg1 & linux_abi::RENAME_NOREPLACE as u64) != 0;
+        let old_path = match self.resolve_path_with_base(request.pid, request.dirfd, request.remote_id, old_raw) {
+            Ok(p) => p,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        let new_path = match self.resolve_path_with_base(request.pid, request.arg0, request.arg2, new_raw) {
+            Ok(p) => p,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        response.status = lock_vfs_storage().rename_paths(old_path.as_str(), new_path.as_str(), no_replace);
+    }
+
+    fn vfs_statfs(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let path = match request.arg0 {
+            0 => {
+                let Some(raw) = vfs_request_path(request) else {
+                    response.status = EINVAL;
+                    return;
+                };
+                match self.resolve_path(request, request.pid, request.dirfd, raw) {
+                    Ok(p) => p,
+                    Err(errno) => {
+                        response.status = errno;
+                        return;
+                    }
+                }
+            }
+            1 => {
+                let Some(handle) = self.handles.get(&request.remote_id) else {
+                    response.status = EBADF;
+                    return;
+                };
+                handle.path.clone()
+            }
+            _ => {
+                response.status = EINVAL;
+                return;
+            }
+        };
+        match lock_vfs_storage().statfs_path(path.as_str()) {
+            Ok(wire) => {
+                let bytes = wire.to_bytes();
+                response.payload[..bytes.len()].copy_from_slice(&bytes);
+                response.payload_len = bytes.len() as u32;
+            }
+            Err(errno) => response.status = errno,
+        }
+    }
+
+    fn vfs_symlinkat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let payload = &request.payload[..(request.payload_len as usize).min(request.payload.len())];
+        let Some((target_bytes, link_bytes)) = decode_two_path_payload(payload) else {
+            response.status = EINVAL;
+            return;
+        };
+        let (Ok(target), Ok(link_raw)) = (str::from_utf8(target_bytes), str::from_utf8(link_bytes)) else {
+            response.status = EINVAL;
+            return;
+        };
+        let link_path = match self.resolve_path(request, request.pid, request.dirfd, link_raw) {
+            Ok(p) => p,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        response.status = lock_vfs_storage().symlink_path(target, link_path.as_str());
+    }
+
+    fn vfs_set_attrs(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let path = if request.remote_id != 0 {
+            let Some(handle) = self.handles.get(&request.remote_id) else {
+                response.status = EBADF;
+                return;
+            };
+            handle.path.clone()
+        } else {
+            let Some(raw) = vfs_request_path(request) else {
+                response.status = EINVAL;
+                return;
+            };
+            match self.resolve_path(request, request.pid, request.dirfd, raw) {
+                Ok(p) => p,
+                Err(errno) => {
+                    response.status = errno;
+                    return;
+                }
+            }
+        };
+        response.status = lock_vfs_storage().set_attrs_path(
+            path.as_str(),
+            request.arg0,
+            request.arg1 as i64,
+            request.arg2 as i64,
+            request.arg3 as u32,
+        );
     }
 
 }

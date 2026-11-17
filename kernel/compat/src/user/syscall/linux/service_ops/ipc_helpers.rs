@@ -455,23 +455,31 @@ pub fn populate_vfs_path(request: &mut VfsIpcRequest, path: &str) -> Result<(), 
     Ok(())
 }
 
+pub(super) fn resolve_vfs_dirfd_remote_id(dirfd: u64, path: &str) -> Result<u64, i64> {
+    if !path.starts_with('/') && !is_linux_at_fdcwd_for_vfs(dirfd) {
+        let remote = current_remote_vfs_handle(dirfd).ok_or(LINUX_EBADF)?;
+        if remote.kind() != multitask::RemoteVfsHandleKind::Directory {
+            return Err(LINUX_ENOTDIR);
+        }
+        return Ok(remote.remote_id());
+    }
+    Ok(0)
+}
+
 pub fn populate_vfs_path_base(
     request: &mut VfsIpcRequest,
     dirfd: u64,
     path: &str,
 ) -> Result<(), i64> {
     request.dirfd = dirfd;
-    if !path.starts_with('/') && !is_linux_at_fdcwd_for_vfs(dirfd) {
-        let remote = current_remote_vfs_handle(dirfd).ok_or(LINUX_EBADF)?;
-        if remote.kind() != multitask::RemoteVfsHandleKind::Directory {
-            return Err(LINUX_ENOTDIR);
-        }
-        request.remote_id = remote.remote_id();
+    let remote_id = resolve_vfs_dirfd_remote_id(dirfd, path)?;
+    if remote_id != 0 {
+        request.remote_id = remote_id;
     }
     populate_vfs_path(request, path)
 }
 
-fn is_linux_at_fdcwd_for_vfs(dirfd: u64) -> bool {
+pub(super) fn is_linux_at_fdcwd_for_vfs(dirfd: u64) -> bool {
     const AT_FDCWD_I64: u64 = (-100_i64) as u64;
     const AT_FDCWD_I32: u64 = 0xffff_ff9c;
     dirfd == AT_FDCWD_I64 || dirfd == AT_FDCWD_I32 || dirfd == linux_abi::AT_FDCWD as u64
@@ -2136,9 +2144,18 @@ fn ticks_elapsed_ms(start_ticks: u64, end_ticks: u64) -> u64 {
 mod tests;
 
 pub fn current_remote_vfs_handle(fd: u64) -> Option<multitask::RemoteVfsHandle> {
+    current_remote_vfs_handle_with_rights(fd).map(|(remote, _)| remote)
+}
+
+pub fn current_remote_vfs_handle_with_rights(
+    fd: u64,
+) -> Option<(multitask::RemoteVfsHandle, kernel_object::api::HandleRights)> {
     multitask::with_current_user_process_state(|_, _, process_state| {
-        match process_state.handles().get(fd) {
-            Some(multitask::KernelHandle::RemoteVfs(remote)) => Some(remote.clone()),
+        let entry = process_state.handles().get_entry(fd)?;
+        match entry.handle() {
+            multitask::KernelHandle::RemoteVfs(remote) => {
+                Some((remote.clone(), entry.rights()))
+            }
             _ => None,
         }
     })

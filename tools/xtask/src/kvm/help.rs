@@ -146,6 +146,8 @@ options:
                        --dvm-block-shmem and require boot, both block peers,
                        first completion, and a read-only media barrier without
                        depending on UI, input, network, or GPU readiness markers
+  --writable-storage   attach a GPT image (partition 1 boot RO + partition 2
+                       writable FAT32) via AHCI ide-hd instead of read-only CD
   --storage-dvm-expect-flush-fault
                        with --storage-dvm-only and exactly block.flush=fail,
                        require a pre-publication DeviceFault and reject any

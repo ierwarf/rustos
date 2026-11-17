@@ -53,31 +53,31 @@ pub(crate) fn next_executable_snapshot_request_id() -> Result<u64, i32> {
 /// device existed at once. Storage is therefore a single shared owner, and a
 /// namespace-only request never has to wait behind a bulk read.
 pub(crate) struct VfsStorage {
-    pub(crate) volume: Option<FatVolume<BootBlockDevice>>,
+    pub(crate) mounts: MountTable,
     /// Positive + negative metadata cache. `Ok(_)` is a resolved entry;
     /// `Err(errno)` is a negative cache (e.g. ENOENT) so back-to-back stat()s
-    /// of common missing libc paths return without touching FAT. The whole map
-    /// is dropped whenever `mount_generation` changes.
-    pub(crate) metadata_cache: BTreeMap<String, Result<Metadata, i32>>,
-    /// Cached directory listings, keyed by absolute path. Linux startup
-    /// re-reads `/`, `/dev`, library directories, etc.; FAT traversal per call
-    /// is expensive enough to dominate boot time when libc walks PATH.
-    pub(crate) dir_entries_cache: BTreeMap<String, Vec<DirEntry>>,
-    /// Complete bytes for bounded read-only files on the current mount
-    /// generation. Persistent mutation is not implemented by vfsd, and every
-    /// remount invalidates this cache before the replacement volume is used.
-    pub(crate) file_bytes_cache: BTreeMap<String, Vec<u8>>,
+    /// of common missing libc paths return without touching the volume. The
+    /// whole map is dropped whenever `mount_generation` changes.
+    pub(crate) metadata_cache: BTreeMap<CacheKey, Result<Metadata, i32>>,
+    /// Cached directory listings, keyed by `(mount_id, canonical_rel_path)`.
+    pub(crate) dir_entries_cache: BTreeMap<CacheKey, Vec<DirEntry>>,
+    /// Complete bytes for bounded files on the current mount generation,
+    /// invalidated on any mutation or remount.
+    pub(crate) file_bytes_cache: BTreeMap<CacheKey, Vec<u8>>,
     pub(crate) file_bytes_cache_bytes: usize,
-    pub(crate) read_maps: BTreeMap<String, storage_core::file_io::FileReadMap>,
+    pub(crate) read_maps: BTreeMap<CacheKey, storage_core::file_io::FileReadMap>,
     pub(crate) read_map_bytes: usize,
     /// Terminally sealed executable images owned by the current mount
     /// generation. Handle transfer duplicates the descriptor into loaderd;
     /// keeping one vfsd reference lets common interpreters/DLLs be reused
     /// without re-reading the storage DVM on every process launch.
-    pub(crate) executable_snapshot_cache: BTreeMap<String, ExecutableSnapshot>,
+    pub(crate) executable_snapshot_cache: BTreeMap<CacheKey, ExecutableSnapshot>,
     pub(crate) executable_snapshot_cache_bytes: usize,
+    /// Per-canonical-node open reference count, live length, and deferred
+    /// unlink state for backends where `!supports_unlink_while_open`.
+    pub(crate) open_nodes: BTreeMap<CacheKey, OpenNodeState>,
     pub(crate) mount_generation: u64,
-    /// Exact storaged DVM block-provider generation that backs `volume`.
+    /// Exact storaged DVM block-provider generation that backs `mounts`.
     pub(crate) dvm_storage_epoch: u64,
     pub(crate) cache_generation: u64,
     /// Volatile `/run` directories; see `vfsd::run_dirs`.
@@ -87,7 +87,7 @@ pub(crate) struct VfsStorage {
 impl VfsStorage {
     pub(crate) const fn new() -> Self {
         Self {
-            volume: None,
+            mounts: MountTable::new(),
             metadata_cache: BTreeMap::new(),
             dir_entries_cache: BTreeMap::new(),
             file_bytes_cache: BTreeMap::new(),
@@ -96,6 +96,7 @@ impl VfsStorage {
             read_map_bytes: 0,
             executable_snapshot_cache: BTreeMap::new(),
             executable_snapshot_cache_bytes: 0,
+            open_nodes: BTreeMap::new(),
             mount_generation: 1,
             dvm_storage_epoch: 0,
             cache_generation: 1,
@@ -201,6 +202,8 @@ impl Drop for VfsStorageGuard {
 /// chunks that other requests can interleave with.
 pub(crate) struct ExecutableSnapshotPlan {
     pub(crate) path: String,
+    pub(crate) mount_id: u64,
+    pub(crate) cache_key: CacheKey,
     pub(crate) file_len: usize,
     pub(crate) read_map: Option<alloc::sync::Arc<storage_core::file_io::FileReadMap>>,
     pub(crate) metadata_len: u64,
@@ -232,7 +235,7 @@ pub(crate) enum ExecutableSnapshotAdmission {
 /// copy, hashing, memfd writes, sealing, or reply publication.
 struct SnapshotReader<'a> {
     plan: &'a ExecutableSnapshotPlan,
-    source: Option<storage_fat::FatReadSource<BootBlockDevice>>,
+    source: Option<alloc::boxed::Box<dyn ReadAt<Error = storage_core::file_io::RangeError> + Send>>,
     read_ns: u64,
 }
 impl ReadAt for SnapshotReader<'_> {
@@ -333,8 +336,12 @@ pub(crate) fn open_executable_snapshot(
     let file_len = plan.file_len;
     let mut writer = SnapshotWriter::new(plan.metadata_len)?;
     let source = match plan.read_map.as_ref() {
-        Some(map) => Some(lock_vfs_storage().volume.as_ref().ok_or(ENODEV)?
-            .read_source(map.clone()).map_err(map_range_error)?),
+        Some(map) => {
+            let storage = lock_vfs_storage();
+            let mount = storage.mounts.by_id(plan.mount_id).ok_or(ENODEV)?;
+            let read_map_source = mount.read_map_source.as_ref().ok_or(EOPNOTSUPP)?;
+            Some(read_map_source.read_source(map.clone()).map_err(map_range_error)?)
+        }
         None => None,
     };
     let mut reader = SnapshotReader { plan: &plan, source, read_ns: 0 };

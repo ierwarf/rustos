@@ -11,7 +11,7 @@ use super::{
     DEVICE_FILE_MODE_BITS, DT_CHR, DT_DIR, DT_REG, EINVAL,
 };
 use storage_fat::FatError;
-pub(super) use vfsd::path::{fat_cache_key, fat_cache_key_cow, normalize_absolute_path, path_inode};
+pub(super) use vfsd::path::{normalize_absolute_path, path_inode};
 use vfsd::storage_io_error_to_linux_errno;
 
 pub(super) fn is_at_fdcwd(dirfd: u64) -> bool {

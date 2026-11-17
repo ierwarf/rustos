@@ -5,6 +5,7 @@ extern crate alloc;
 pub mod checkpoint_wire;
 pub mod lifecycle;
 pub mod linux_types;
+pub mod mount_table;
 pub mod path;
 pub mod proc_fs;
 pub mod run_dirs;
@@ -266,9 +267,6 @@ pub fn admit_dvm_block_geometry(
         || !info
             .physical_block_size
             .is_multiple_of(info.logical_block_size)
-        // Geometry admission also fixes the transport authority. Accepting a
-        // writable signed epoch here would let the DVM volume silently exceed
-        // the read-only policy requested by BootBlockDevice.
         || info.flags != expected_flags
         || info.reserved0 != 0
     {
@@ -285,6 +283,48 @@ pub fn admit_dvm_block_geometry(
     Ok((block_size, block_count))
 }
 
+pub fn map_storage_error(err: StorageError) -> i32 {
+    match err {
+        StorageError::NotPresent => ENODEV,
+        StorageError::InvalidInput => EINVAL,
+        StorageError::Unsupported => EOPNOTSUPP,
+        StorageError::WouldBlock => EAGAIN,
+        StorageError::Interrupted => EINTR,
+        StorageError::Timeout => ETIMEDOUT,
+        StorageError::UnexpectedEof | StorageError::WriteZero | StorageError::DeviceFault => EIO,
+    }
+}
+
+pub fn map_fs_error(err: storage_core::fs::FsError) -> i32 {
+    use storage_core::fs::FsError;
+    const EACCES: i32 = 13;
+    const EBUSY: i32 = 16;
+    const EEXIST: i32 = 17;
+    const EISDIR: i32 = 21;
+    const EFBIG: i32 = 27;
+    const ENOSPC: i32 = 28;
+    const ENAMETOOLONG: i32 = 36;
+    const ENOTEMPTY: i32 = 39;
+    const EOPNOTSUPP: i32 = 95;
+    match err {
+        FsError::NotFound => ENOENT,
+        FsError::AlreadyExists => EEXIST,
+        FsError::NotADirectory => ENOTDIR,
+        FsError::IsADirectory => EISDIR,
+        FsError::DirectoryNotEmpty => ENOTEMPTY,
+        FsError::NoSpace => ENOSPC,
+        FsError::ReadOnly => EROFS,
+        FsError::InvalidInput => EINVAL,
+        FsError::PermissionDenied => EACCES,
+        FsError::SharingViolation | FsError::Busy => EBUSY,
+        FsError::Unsupported => EOPNOTSUPP,
+        FsError::TooBig => EFBIG,
+        FsError::NameTooLong => ENAMETOOLONG,
+        FsError::Io(e) => map_storage_error(e),
+    }
+}
+const EOPNOTSUPP: i32 = 95;
+
 pub fn storage_error_from_linux_status(status: i64) -> StorageError {
     let errno = status
         .checked_neg()
@@ -298,6 +338,39 @@ pub fn storage_error_from_linux_status(status: i64) -> StorageError {
         Some(ENOSYS) => StorageError::Unsupported,
         _ => StorageError::DeviceFault,
     }
+}
+
+pub fn admit_dvm_block_geometry_with_allowed_flags(
+    info: DvmBlockInfoWire,
+    response_generation: u64,
+    response_capacity_sectors: u64,
+    maximum_block_size: usize,
+    allowed_flags_mask: u32,
+) -> Result<(usize, u64), i32> {
+    let block_size = usize::try_from(info.logical_block_size).map_err(|_| EINVAL)?;
+    if info.generation != response_generation
+        || info.capacity_sectors != response_capacity_sectors
+        || info.generation == 0
+        || !matches!(block_size, 512 | 1024 | 2048 | 4096)
+        || block_size > maximum_block_size
+        || info.physical_block_size < info.logical_block_size
+        || !info
+            .physical_block_size
+            .is_multiple_of(info.logical_block_size)
+        || info.flags & !allowed_flags_mask != 0
+        || info.reserved0 != 0
+    {
+        return Err(EIO);
+    }
+    let sectors_per_block = (block_size / 512) as u64;
+    if !info.capacity_sectors.is_multiple_of(sectors_per_block) {
+        return Err(EIO);
+    }
+    let block_count = info.capacity_sectors / sectors_per_block;
+    if block_count == 0 || block_count.checked_mul(block_size as u64).is_none() {
+        return Err(EINVAL);
+    }
+    Ok((block_size, block_count))
 }
 
 /// Converts a service-directory lookup result into the VFS storage-backend

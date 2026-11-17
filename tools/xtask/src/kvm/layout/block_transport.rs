@@ -1,3 +1,83 @@
+pub(crate) fn dvm_writable_block_header(
+    generation: u64,
+    capacity_sectors: u64,
+    logical_block_size: u32,
+    physical_block_size: u32,
+    features: u64,
+) -> DvmBlockHeader {
+    let mut header = DvmBlockHeader::new(
+        generation,
+        capacity_sectors,
+        logical_block_size,
+        physical_block_size,
+        features | DVM_BLOCK_FEATURE_FLUSH | driver_domain_protocol::DVM_BLOCK_FEATURE_FUA,
+    );
+    header.flags = 0;
+    header
+}
+
+fn write_signed_dvm_block_aperture(
+    path: &Path,
+    disk: &Path,
+    signing_key_path: &Path,
+    unsigned_header: DvmBlockHeader,
+) -> Result<()> {
+    for candidate in [path, disk] {
+        if candidate.to_string_lossy().contains(',') {
+            bail!(
+                "KVM storage-DVM path contains an unsupported QEMU option separator: {}",
+                candidate.display()
+            );
+        }
+    }
+    let signing_key = crate::storage_epoch::load_signing_key(signing_key_path)?;
+    let header = crate::storage_epoch::sign_epoch(&signing_key, unsigned_header);
+    if !header.is_valid() {
+        bail!("refusing to create invalid fixed DVM block header");
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).read(true).write(true);
+    // Private from creation: set_permissions below would leave a umask-wide
+    // window for a newly created aperture.
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("create DVM block aperture {}", path.display()))?;
+    file.set_len(DVM_BLOCK_APERTURE_BYTES)
+        .with_context(|| format!("size DVM block aperture {}", path.display()))?;
+    file.write_all(&header.encode())
+        .with_context(|| format!("write DVM block header {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync DVM block aperture {}", path.display()))?;
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+pub(crate) fn create_writable_dvm_block_aperture(
+    path: &Path,
+    disk: &Path,
+    signing_key_path: &Path,
+) -> Result<()> {
+    let disk_bytes = fs::metadata(disk)
+        .with_context(|| format!("inspect private storage-DVM disk {}", disk.display()))?
+        .len();
+    if disk_bytes == 0 || !disk_bytes.is_multiple_of(512) {
+        bail!("private writable storage-DVM disk must be non-empty and 512-byte aligned");
+    }
+    write_signed_dvm_block_aperture(
+        path,
+        disk,
+        signing_key_path,
+        dvm_writable_block_header(
+            1,
+            disk_bytes / 512,
+            512,
+            512,
+            DVM_BLOCK_FEATURE_FLUSH | driver_domain_protocol::DVM_BLOCK_FEATURE_FUA,
+        ),
+    )
+}
+
 fn dvm_read_only_block_header(
     generation: u64,
     capacity_sectors: u64,
@@ -42,23 +122,16 @@ fn sync_private_dvm_block_snapshot(disk: &Path, directory: &Path) -> Result<()> 
 }
 
 fn create_dvm_block_aperture(path: &Path, disk: &Path, signing_key_path: &Path) -> Result<()> {
-    for candidate in [path, disk] {
-        if candidate.to_string_lossy().contains(',') {
-            bail!(
-                "KVM storage-DVM path contains an unsupported QEMU option separator: {}",
-                candidate.display()
-            );
-        }
-    }
     let disk_bytes = fs::metadata(disk)
         .with_context(|| format!("inspect private storage-DVM disk {}", disk.display()))?
         .len();
     if disk_bytes == 0 || !disk_bytes.is_multiple_of(u64::from(DVM_BLOCK_MEDIA_BLOCK_BYTES)) {
         bail!("private storage-DVM disk must be non-empty and CD-media-block aligned");
     }
-    let signing_key = crate::storage_epoch::load_signing_key(signing_key_path)?;
-    let header = crate::storage_epoch::sign_epoch(
-        &signing_key,
+    write_signed_dvm_block_aperture(
+        path,
+        disk,
+        signing_key_path,
         dvm_read_only_block_header(
             1,
             disk_bytes / 512,
@@ -66,26 +139,7 @@ fn create_dvm_block_aperture(path: &Path, disk: &Path, signing_key_path: &Path) 
             DVM_BLOCK_MEDIA_BLOCK_BYTES,
             DVM_BLOCK_MEDIA_FEATURES,
         ),
-    );
-    if !header.is_valid() {
-        bail!("refusing to create invalid fixed DVM block header");
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).truncate(true).read(true).write(true);
-    // Private from creation: set_permissions below would leave a umask-wide
-    // window for a newly created aperture.
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("create DVM block aperture {}", path.display()))?;
-    file.set_len(DVM_BLOCK_APERTURE_BYTES)
-        .with_context(|| format!("size DVM block aperture {}", path.display()))?;
-    file.write_all(&header.encode())
-        .with_context(|| format!("write DVM block header {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("sync DVM block aperture {}", path.display()))?;
-    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    )
 }
 
 /// Publish a new L0-authorized block transport epoch without replacing the

@@ -86,6 +86,24 @@ pub fn path_inode(bytes: &[u8]) -> u64 {
     hash.max(1)
 }
 
+/// Case-exact variant of `path_inode` for `CasePolicy::Exact` filesystems (e.g. ext4).
+pub fn path_inode_exact(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash.max(1)
+}
+
+pub fn path_inode_for_policy(bytes: &[u8], case_policy: storage_core::fs::CasePolicy) -> u64 {
+    match case_policy {
+        storage_core::fs::CasePolicy::Exact => path_inode_exact(bytes),
+        storage_core::fs::CasePolicy::AsciiInsensitive
+        | storage_core::fs::CasePolicy::UnicodePreservingInsensitive => path_inode(bytes),
+    }
+}
+
 /// Key under which path-addressed storage caches file their entries. The FAT
 /// engine matches names ASCII-case-insensitively, so every case spelling of one
 /// path must reach one entry instead of caching the same bytes, listing or
@@ -114,6 +132,19 @@ mod tests {
         assert_eq!(fat_cache_key("/BIN/Ls"), fat_cache_key("/bin/ls"));
         assert_ne!(path_inode(b"/bin/ls"), path_inode(b"/bin/lt"));
         assert_ne!(path_inode(b""), 0);
+    }
+
+    #[test]
+    fn path_inode_for_policy_separates_case_for_exact_mounts() {
+        use storage_core::fs::CasePolicy;
+        assert_eq!(
+            path_inode_for_policy(b"/data/Foo", CasePolicy::AsciiInsensitive),
+            path_inode_for_policy(b"/data/foo", CasePolicy::AsciiInsensitive),
+        );
+        assert_ne!(
+            path_inode_for_policy(b"/data/Foo", CasePolicy::Exact),
+            path_inode_for_policy(b"/data/foo", CasePolicy::Exact),
+        );
     }
 
     #[test]

@@ -180,6 +180,8 @@ impl VfsState {
                 return Err(EIO);
             }
             let kind = remote_kind_from_u16(wire.kind).ok_or(EIO)?;
+            let writable = (wire.status_flags & linux_abi::O_ACCMODE) != linux_abi::O_RDONLY;
+            let append = (wire.status_flags & linux_abi::O_APPEND) != 0;
             if self
                 .handles
                 .insert(
@@ -187,6 +189,9 @@ impl VfsState {
                     RemoteHandle {
                         checkpoint_version: wire.version,
                         kind,
+                        mount_id: 0,
+                        writable,
+                        append,
                         path,
                         cursor: wire.cursor,
                         len: wire.len,

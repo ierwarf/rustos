@@ -66,22 +66,29 @@ use rustos_user_abi::syscall::{
     VFS_CURSOR_SETTLE_COMMIT, VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN,
     VFS_IPC_ABI_VERSION, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CHECKPOINT_ACK,
     VFS_IPC_OP_CLOSE, VFS_IPC_OP_CURSOR_SETTLE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT,
-    VFS_IPC_OP_FILE_IDENTITY, VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK,
-    VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT,
-    VFS_IPC_OP_POLL_QUERY, VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT,
-    VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE,
+    VFS_IPC_OP_FILE_IDENTITY, VFS_IPC_OP_FSYNC, VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD,
+    VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK, VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT,
+    VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT, VFS_IPC_OP_POLL_QUERY, VFS_IPC_OP_PREAD64,
+    VFS_IPC_OP_PWRITE64, VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT, VFS_IPC_OP_RENAMEAT2,
+    VFS_IPC_OP_SET_ATTRS, VFS_IPC_OP_STATFS, VFS_IPC_OP_STATX, VFS_IPC_OP_SYMLINKAT,
+    VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE,
     VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY, VFS_POLL_QUERY_EPOLL_CREATE,
     VFS_EPOLL_CLAIM_MAX, VFS_POLL_BATCH_MAX, VFS_POLL_QUERY_EPOLL_CLAIM, VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT,
     VFS_POLL_QUERY_EPOLL_RETIRE, VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_POLL,
     WAITSET_ABI_VERSION, WAITSET_MAX_INTERESTS, WAITSET_SNAPSHOT_STATE_DISABLED,
-    VfsFileIdentityWire, VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME, VFS_IPC_OP_LIBRARY_READ,
-    VFS_LIBRARY_READ_MAX_BYTES, IPC_SERVICE_PAGERD,
+    VfsFileIdentityWire, VfsStatFsWire, decode_two_path_payload,
+    VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME, VFS_FILE_IDENTITY_FLAG_MUTABLE_VOLUME,
+    VFS_IPC_OP_LIBRARY_READ, VFS_LIBRARY_READ_MAX_BYTES, IPC_SERVICE_PAGERD,
 };
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
     WaitSetSignalBrokerArgs, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_PROVIDER_VFSD,
 };
-use storage_fat::{FatDirEntry, FatNodeKind, FatVolume};
+use storage_core::fs::{FsNodeKind, FsOpenOptions, FsTimestamp};
+use vfsd::mount_table::{
+    cache_key_for_mount, parent_rel_path, read_volume_file_to_vec, CacheKey, MountTable,
+    OpenNodeState, SharedBlockDevice,
+};
 use vfsd::checkpoint_wire::{
     checkpoint_epoll_record, checkpoint_interest_key, checkpoint_interest_record,
     copy_file_cache_range, waitset_interest_from_wire, CHECKPOINT_EPOLL_TAG,
@@ -89,7 +96,7 @@ use vfsd::checkpoint_wire::{
 use vfsd::{
     cacheable_metadata_errno, checked_next_generation, checked_seek_position, checkpoint_path_key,
     executable_snapshot_marker, executable_snapshot_resolution_base,
-    persistent_mutation_status, reply_failure_diagnostic_due, should_materialize_file_cache,
+    reply_failure_diagnostic_due, should_materialize_file_cache,
     ui_bootstrap_snapshot_reply_completed, unlink_policy, valid_checkpoint_record,
     ExecutableSnapshotBacking, OpenDescriptionCheckpointWire, SeekPositionError,
     WaitSetInterestKey, WaitSetInterestRecord, WaitSetRegistry, WaitSetRegistryError,
@@ -119,7 +126,7 @@ use snapshot_worker::{
     reply_snapshot_status, continue_executable_snapshot,
 };
 use util::{
-    build_linux_stat, build_linux_statx, encode_dirent_into, fat_cache_key, fat_cache_key_cow,
+    build_linux_stat, build_linux_statx, encode_dirent_into,
     handle_kind_u16, is_at_fdcwd, linux_request_path, map_fat_error, normalize_absolute_path,
     path_inode, vfs_request_path, write_payload_bytes, write_vfs_payload_bytes,
 };
@@ -135,6 +142,7 @@ pub(crate) const EBUSY: i32 = 16;
 pub(crate) const EACCES: i32 = 13;
 pub(crate) const EBADF: i32 = 9;
 pub(crate) const EEXIST: i32 = 17;
+pub(crate) const EXDEV: i32 = 18;
 pub(crate) const ENODEV: i32 = 19;
 pub(crate) const ENOTDIR: i32 = 20;
 pub(crate) const EISDIR: i32 = 21;
@@ -242,8 +250,6 @@ fn reset_vfs_response_slot(op: u16) -> *mut VfsIpcResponse {
 
 // Linux lseek whence constants
 // Linux open flags (x86_64)
-const O_CREAT: u64 = 0o100;
-const O_TRUNC: u64 = 0o1000;
 const O_DIRECTORY: u64 = 0o200000;
 type CheckpointRevisionKey = (u64, u64, u64, u64);
 
@@ -663,6 +669,9 @@ struct VfsState {
 struct RemoteHandle {
     checkpoint_version: u16,
     kind: RemoteKind,
+    mount_id: u64,
+    writable: bool,
+    append: bool,
     path: String,
     cursor: u64,
     len: u64,
@@ -1078,12 +1087,12 @@ impl DirEntry {
         }
     }
 
-    fn from_fat(entry: FatDirEntry) -> Self {
+    fn from_fs(entry: storage_core::fs::FsDirEntry) -> Self {
         Self {
             name: entry.name,
             kind: match entry.kind {
-                FatNodeKind::File => RemoteKind::File,
-                FatNodeKind::Directory => RemoteKind::Directory,
+                FsNodeKind::File | FsNodeKind::Symlink => RemoteKind::File,
+                FsNodeKind::Directory => RemoteKind::Directory,
             },
         }
     }

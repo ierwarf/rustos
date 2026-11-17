@@ -1,4 +1,7 @@
 use super::*;
+use rustos_user_abi::syscall::{
+    VFS_IPC_OP_RENAMEAT2, VFS_IPC_OP_STATFS, VFS_IPC_OP_SYMLINKAT,
+};
 
 mod inet_datagram;
 pub fn syscall_linux_vfs_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
@@ -128,9 +131,12 @@ pub fn syscall_linux_vfs_ftruncate(fd: u64, len: u64) -> u64 {
             Err(err) => linux_errno(memfd_error_to_linux_errno(err)),
         };
     }
-    let Some(remote) = current_remote_vfs_handle(fd) else {
+    let Some((remote, rights)) = current_remote_vfs_handle_with_rights(fd) else {
         return linux_errno(LINUX_EBADF);
     };
+    if !rights.allows_write() {
+        return linux_errno(LINUX_EINVAL);
+    }
     let mut request = new_vfs_request(VFS_IPC_OP_FTRUNCATE);
     request.fd = fd;
     request.remote_id = remote.remote_id();
@@ -640,6 +646,218 @@ pub fn syscall_linux_vfs_unlinkat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 
     {
         Ok(()) => 0,
         Err(errno) => linux_errno(errno),
+    }
+}
+
+pub(crate) fn kernel_vfs_unlink_path(path: &str, flags: u64) -> Result<(), i64> {
+    let mut request = new_vfs_request(VFS_IPC_OP_UNLINKAT);
+    request.flags = flags as u32;
+    populate_vfs_path_base(&mut request, linux_abi::AT_FDCWD as u64, path)?;
+    let response = call_pinned_remote_vfs_request(&request)?;
+    ensure_vfs_status(&response)
+}
+
+pub fn syscall_linux_vfs_truncate(path_ptr: u64, len: u64) -> u64 {
+    if len > i64::MAX as u64 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
+        Ok(path) => path,
+        Err(errno) => return linux_errno(errno),
+    };
+    let mut open_req = new_vfs_request(VFS_IPC_OP_OPENAT);
+    open_req.arg0 = linux_abi::O_WRONLY as u64;
+    open_req.arg1 = 0;
+    open_req.arg3 = mint_service_object_id();
+    if let Err(errno) = populate_vfs_path_base(&mut open_req, linux_abi::AT_FDCWD as u64, &path) {
+        return linux_errno(errno);
+    }
+    let open_resp = match call_vfs_ipc_request(&open_req) {
+        Ok(resp) => resp,
+        Err(errno) => {
+            let _ = call_vfs_remote_close_bounded(open_req.arg3);
+            return linux_errno(errno);
+        }
+    };
+    if let Err(errno) = ensure_vfs_status(&open_resp) {
+        let _ = call_vfs_remote_close_bounded(open_req.arg3);
+        return linux_errno(errno);
+    }
+    let remote_id = open_resp.remote_id;
+    if remote_id == 0 || remote_id != open_req.arg3 {
+        let _ = call_vfs_remote_close_bounded(open_req.arg3);
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mut trunc_req = new_vfs_request(VFS_IPC_OP_FTRUNCATE);
+    trunc_req.remote_id = remote_id;
+    trunc_req.arg0 = len;
+    let res = call_vfs_ipc_request(&trunc_req).and_then(|resp| ensure_vfs_status(&resp));
+    let _ = call_vfs_remote_close_bounded(remote_id);
+    match res {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+pub(crate) fn kernel_vfs_renameat2(
+    olddirfd: u64,
+    old_path: &str,
+    newdirfd: u64,
+    new_path: &str,
+    flags: u64,
+) -> Result<(), i64> {
+    let mut request = new_vfs_request(VFS_IPC_OP_RENAMEAT2);
+    request.dirfd = olddirfd;
+    request.remote_id = resolve_vfs_dirfd_remote_id(olddirfd, old_path)?;
+    request.arg0 = newdirfd;
+    request.arg1 = flags;
+    request.arg2 = resolve_vfs_dirfd_remote_id(newdirfd, new_path)?;
+    let encoded_len = rustos_user_abi::syscall::encode_two_path_payload(
+        old_path.as_bytes(),
+        new_path.as_bytes(),
+        &mut request.payload,
+    )
+    .ok_or(36_i64 /* ENAMETOOLONG */)?;
+    request.payload_len = encoded_len as u32;
+    let response = call_pinned_remote_vfs_request(&request)?;
+    ensure_vfs_status(&response)
+}
+
+pub(crate) fn kernel_vfs_rename_paths(
+    old_path: &str,
+    new_path: &str,
+    flags: u64,
+) -> Result<(), i64> {
+    kernel_vfs_renameat2(
+        linux_abi::AT_FDCWD as u64,
+        old_path,
+        linux_abi::AT_FDCWD as u64,
+        new_path,
+        flags,
+    )
+}
+
+pub fn syscall_linux_vfs_renameat2(
+    olddirfd: u64,
+    oldpath_ptr: u64,
+    newdirfd: u64,
+    newpath_ptr: u64,
+    flags: u64,
+) -> u64 {
+    let old_path = match copy_current_user_path(oldpath_ptr, VFS_IPC_PATH_CAPACITY) {
+        Ok(path) => path,
+        Err(errno) => return linux_errno(errno),
+    };
+    let new_path = match copy_current_user_path(newpath_ptr, VFS_IPC_PATH_CAPACITY) {
+        Ok(path) => path,
+        Err(errno) => return linux_errno(errno),
+    };
+    match kernel_vfs_renameat2(olddirfd, &old_path, newdirfd, &new_path, flags) {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+pub fn syscall_linux_vfs_symlinkat(
+    target_ptr: u64,
+    newdirfd: u64,
+    linkpath_ptr: u64,
+) -> u64 {
+    let target = match copy_current_user_path(target_ptr, VFS_IPC_PATH_CAPACITY) {
+        Ok(path) => path,
+        Err(errno) => return linux_errno(errno),
+    };
+    let linkpath = match copy_current_user_path(linkpath_ptr, VFS_IPC_PATH_CAPACITY) {
+        Ok(path) => path,
+        Err(errno) => return linux_errno(errno),
+    };
+    let mut request = new_vfs_request(VFS_IPC_OP_SYMLINKAT);
+    request.dirfd = newdirfd;
+    request.remote_id = match resolve_vfs_dirfd_remote_id(newdirfd, &linkpath) {
+        Ok(id) => id,
+        Err(errno) => return linux_errno(errno),
+    };
+    let Some(encoded_len) = rustos_user_abi::syscall::encode_two_path_payload(
+        target.as_bytes(),
+        linkpath.as_bytes(),
+        &mut request.payload,
+    ) else {
+        return linux_errno(36 /* ENAMETOOLONG */);
+    };
+    request.payload_len = encoded_len as u32;
+    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
+    {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+pub(crate) fn kernel_vfs_statfs_path(
+    path: &str,
+) -> Result<rustos_user_abi::syscall::VfsStatFsWire, i64> {
+    let mut request = new_vfs_request(VFS_IPC_OP_STATFS);
+    request.arg0 = 0;
+    populate_vfs_path_base(&mut request, linux_abi::AT_FDCWD as u64, path)?;
+    let response = call_pinned_remote_vfs_request(&request)?;
+    ensure_vfs_status(&response)?;
+    let bytes = response
+        .payload
+        .get(..response.payload_len as usize)
+        .ok_or(LINUX_EINVAL)?;
+    rustos_user_abi::syscall::VfsStatFsWire::from_bytes(bytes).ok_or(LINUX_EINVAL)
+}
+
+pub(crate) fn kernel_vfs_fstatfs(
+    fd: u64,
+) -> Result<rustos_user_abi::syscall::VfsStatFsWire, i64> {
+    if let Some(remote) = current_remote_vfs_handle(fd) {
+        let mut request = new_vfs_request(VFS_IPC_OP_STATFS);
+        request.arg0 = 1;
+        request.fd = fd;
+        request.remote_id = remote.remote_id();
+        let response = call_pinned_remote_vfs_request(&request)?;
+        ensure_vfs_status(&response)?;
+        let bytes = response
+            .payload
+            .get(..response.payload_len as usize)
+            .ok_or(LINUX_EINVAL)?;
+        return rustos_user_abi::syscall::VfsStatFsWire::from_bytes(bytes).ok_or(LINUX_EINVAL);
+    }
+    if current_fd_exists(fd) {
+        return Ok(rustos_user_abi::syscall::VfsStatFsWire {
+            f_type: 0x0102_1994,
+            f_bsize: 4096,
+            f_namelen: 255,
+            f_frsize: 4096,
+            ..Default::default()
+        });
+    }
+    Err(LINUX_EBADF)
+}
+
+pub fn syscall_linux_vfs_statfs(path_ptr: u64, buf_ptr: u64) -> u64 {
+    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
+        Ok(path) => path,
+        Err(errno) => return linux_errno(errno),
+    };
+    let wire = match kernel_vfs_statfs_path(&path) {
+        Ok(wire) => wire,
+        Err(errno) => return linux_errno(errno),
+    };
+    match usermem::write_current_user_bytes(buf_ptr, &wire.to_bytes()) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+    }
+}
+
+pub fn syscall_linux_vfs_fstatfs(fd: u64, buf_ptr: u64) -> u64 {
+    let wire = match kernel_vfs_fstatfs(fd) {
+        Ok(wire) => wire,
+        Err(errno) => return linux_errno(errno),
+    };
+    match usermem::write_current_user_bytes(buf_ptr, &wire.to_bytes()) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
     }
 }
 

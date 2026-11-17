@@ -172,27 +172,51 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
     };
     let (dvm_block_aperture, dvm_block_doorbell, dvm_block_disk) = if options.dvm_block_shmem {
         let disk = run_dir.join("dvm-block-disk.img");
-        // The storage DVM becomes the authoritative VFS backing store as soon
-        // as the block relay is admitted. Copy the already-private runtime
-        // image so KVM-only registry overrides are visible through both the
-        // bootstrap disk and the post-handoff DVM path. Copying the pristine
-        // build image here silently discarded profiling/network overrides and
-        // made their acceptance gates observe a different filesystem view.
-        copy_sparse_file(&runtime_disk, &disk).with_context(|| {
-            format!(
-                "create private storage-DVM disk from {}",
-                runtime_disk.display()
+        if !options.writable_storage {
+            // The storage DVM becomes the authoritative VFS backing store as soon
+            // as the block relay is admitted. Copy the already-private runtime
+            // image so KVM-only registry overrides are visible through both the
+            // bootstrap disk and the post-handoff DVM path. Copying the pristine
+            // build image here silently discarded profiling/network overrides and
+            // made their acceptance gates observe a different filesystem view.
+            copy_sparse_file(&runtime_disk, &disk).with_context(|| {
+                format!(
+                    "create private storage-DVM disk from {}",
+                    runtime_disk.display()
+                )
+            })?;
+            fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600))?;
+            sync_private_dvm_block_snapshot(&disk, &run_dir)?;
+            let aperture = shmem_dir.join("dvm-block.ivshmem");
+            create_dvm_block_aperture(&aperture, &disk, &config.storage_epoch_signing_key)?;
+            (
+                Some(aperture),
+                Some(run_dir.join("dvm-block-doorbell.sock")),
+                Some(disk),
             )
-        })?;
-        fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600))?;
-        sync_private_dvm_block_snapshot(&disk, &run_dir)?;
-        let aperture = shmem_dir.join("dvm-block.ivshmem");
-        create_dvm_block_aperture(&aperture, &disk, &config.storage_epoch_signing_key)?;
-        (
-            Some(aperture),
-            Some(run_dir.join("dvm-block-doorbell.sock")),
-            Some(disk),
-        )
+        } else {
+            const WRITABLE_DATA_PART_BYTES: u64 = 36 * 1024 * 1024;
+            crate::stage::write_gpt_boot_plus_writable_data_image(
+                &runtime_disk,
+                &disk,
+                WRITABLE_DATA_PART_BYTES,
+            )
+            .with_context(|| {
+                format!(
+                    "create writable GPT storage-DVM disk from {}",
+                    runtime_disk.display()
+                )
+            })?;
+            fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600))?;
+            sync_private_dvm_block_snapshot(&disk, &run_dir)?;
+            let aperture = shmem_dir.join("dvm-block.ivshmem");
+            create_writable_dvm_block_aperture(&aperture, &disk, &config.storage_epoch_signing_key)?;
+            (
+                Some(aperture),
+                Some(run_dir.join("dvm-block-doorbell.sock")),
+                Some(disk),
+            )
+        }
     } else {
         for stale in [run_dir.join("dvm-block-disk.img"), shmem_dir.join("dvm-block.ivshmem")] {
             if stale.exists() {
@@ -251,6 +275,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         dvm_block_aperture,
         dvm_block_doorbell,
         dvm_block_disk,
+        writable_storage: options.writable_storage,
     })
 }
 
@@ -604,6 +629,32 @@ fn verify_dvm_block_ready_generation(layout: &KvmLayout, expected_generation: u6
         .with_context(|| format!("read live DVM block header {}", aperture.display()))?;
     let header = DvmBlockHeader::decode(&bytes)
         .context("live DVM block aperture contains an invalid header")?;
+    if layout.writable_storage {
+        let ready = DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY;
+        if header.flags & ready != ready
+            || header.flags & DVM_BLOCK_FLAG_READ_ONLY != 0
+            || header.generation != expected_generation
+        {
+            bail!(
+                "DVM writable block peers did not publish expected dual readiness generation={} actual_generation={} flags={:#x}",
+                expected_generation,
+                header.generation,
+                header.flags,
+            );
+        }
+        let disk_bytes = fs::metadata(disk)
+            .with_context(|| format!("inspect live storage-DVM disk {}", disk.display()))?
+            .len();
+        if disk_bytes == 0
+            || !disk_bytes.is_multiple_of(512)
+            || header.capacity_sectors != disk_bytes / 512
+            || header.logical_block_size != 512
+            || header.physical_block_size != 512
+        {
+            bail!("live writable DVM block geometry diverged from the private backing disk");
+        }
+        return Ok(());
+    }
     if !dvm_block_header_matches_ready_generation(header, expected_generation) {
         bail!(
             "DVM block peers did not publish expected read-only dual readiness generation={} actual_generation={} flags={:#x}",

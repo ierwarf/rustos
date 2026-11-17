@@ -429,6 +429,288 @@ fn verify_boot_disk_image_contract(boot_disk_image: &Path, files: &[ImageFile]) 
     Ok(())
 }
 
+fn gpt_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0_u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
+        }
+    }
+    !crc
+}
+
+fn write_gpt_entry(
+    buf: &mut [u8],
+    type_guid: [u8; 16],
+    unique_guid: [u8; 16],
+    start_lba: u64,
+    end_lba: u64,
+    name: &str,
+) {
+    buf[0..16].copy_from_slice(&type_guid);
+    buf[16..32].copy_from_slice(&unique_guid);
+    buf[32..40].copy_from_slice(&start_lba.to_le_bytes());
+    buf[40..48].copy_from_slice(&end_lba.to_le_bytes());
+    buf[48..56].copy_from_slice(&0_u64.to_le_bytes());
+    for (idx, code_unit) in name.encode_utf16().take(36).enumerate() {
+        let off = 56 + idx * 2;
+        buf[off..off + 2].copy_from_slice(&code_unit.to_le_bytes());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_gpt_header(
+    my_lba: u64,
+    alternate_lba: u64,
+    first_usable_lba: u64,
+    last_usable_lba: u64,
+    disk_guid: [u8; 16],
+    entry_lba: u64,
+    entry_count: u32,
+    entry_size: u32,
+    entry_array_crc32: u32,
+) -> [u8; 512] {
+    let mut header = [0_u8; 512];
+    header[0..8].copy_from_slice(b"EFI PART");
+    header[8..12].copy_from_slice(&0x0001_0000_u32.to_le_bytes());
+    header[12..16].copy_from_slice(&92_u32.to_le_bytes());
+    header[20..24].copy_from_slice(&0_u32.to_le_bytes());
+    header[24..32].copy_from_slice(&my_lba.to_le_bytes());
+    header[32..40].copy_from_slice(&alternate_lba.to_le_bytes());
+    header[40..48].copy_from_slice(&first_usable_lba.to_le_bytes());
+    header[48..56].copy_from_slice(&last_usable_lba.to_le_bytes());
+    header[56..72].copy_from_slice(&disk_guid);
+    header[72..80].copy_from_slice(&entry_lba.to_le_bytes());
+    header[80..84].copy_from_slice(&entry_count.to_le_bytes());
+    header[84..88].copy_from_slice(&entry_size.to_le_bytes());
+    header[88..92].copy_from_slice(&entry_array_crc32.to_le_bytes());
+    let header_crc = gpt_crc32(&header[..92]);
+    header[16..20].copy_from_slice(&header_crc.to_le_bytes());
+    header
+}
+
+struct PartitionFileSlice<'a> {
+    file: &'a mut fs::File,
+    base_offset: u64,
+    len: u64,
+    pos: u64,
+}
+
+impl<'a> PartitionFileSlice<'a> {
+    fn new(file: &'a mut fs::File, base_offset: u64, len: u64) -> Self {
+        Self {
+            file,
+            base_offset,
+            len,
+            pos: 0,
+        }
+    }
+}
+
+impl std::io::Read for PartitionFileSlice<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::Seek;
+        if self.pos >= self.len {
+            return Ok(0);
+        }
+        let max_read = usize::try_from(self.len - self.pos).unwrap_or(usize::MAX);
+        let to_read = buf.len().min(max_read);
+        self.file.seek(std::io::SeekFrom::Start(self.base_offset + self.pos))?;
+        let n = self.file.read(&mut buf[..to_read])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl std::io::Write for PartitionFileSlice<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use std::io::Seek;
+        if self.pos >= self.len {
+            return Ok(0);
+        }
+        let max_write = usize::try_from(self.len - self.pos).unwrap_or(usize::MAX);
+        let to_write = buf.len().min(max_write);
+        self.file.seek(std::io::SeekFrom::Start(self.base_offset + self.pos))?;
+        let n = self.file.write(&buf[..to_write])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl std::io::Seek for PartitionFileSlice<'_> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let next = match pos {
+            std::io::SeekFrom::Start(offset) => i128::from(offset),
+            std::io::SeekFrom::End(offset) => i128::from(self.len) + i128::from(offset),
+            std::io::SeekFrom::Current(offset) => i128::from(self.pos) + i128::from(offset),
+        };
+        if next < 0 || next > i128::from(self.len) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek out of partition bounds",
+            ));
+        }
+        self.pos = next as u64;
+        Ok(self.pos)
+    }
+}
+
+pub(crate) fn write_gpt_boot_plus_writable_data_image(
+    boot_image: &Path,
+    output_gpt_image: &Path,
+    data_size_bytes: u64,
+) -> Result<()> {
+    use std::io::{Seek, Write};
+
+    const SECTOR_BYTES: u64 = 512;
+    const GPT_ENTRY_COUNT: u32 = 128;
+    const GPT_ENTRY_BYTES: u32 = 128;
+    const GPT_ARRAY_SECTORS: u64 = 32;
+    const FIRST_USABLE_LBA: u64 = 2 + GPT_ARRAY_SECTORS;
+    const EFI_SYSTEM_PART_GUID: [u8; 16] = [
+        0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9,
+        0x3B,
+    ];
+    const BASIC_DATA_PART_GUID: [u8; 16] = [
+        0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99,
+        0xC7,
+    ];
+
+    let boot_bytes = fs::metadata(boot_image)
+        .with_context(|| format!("inspect boot image {}", boot_image.display()))?
+        .len();
+    if boot_bytes == 0 || !boot_bytes.is_multiple_of(SECTOR_BYTES) {
+        bail!("boot image must be non-empty and 512-byte aligned");
+    }
+    if data_size_bytes == 0 || !data_size_bytes.is_multiple_of(SECTOR_BYTES) {
+        bail!("writable data partition size must be non-empty and 512-byte aligned");
+    }
+
+    let boot_blocks = boot_bytes / SECTOR_BYTES;
+    let data_blocks = data_size_bytes / SECTOR_BYTES;
+    let part1_start = FIRST_USABLE_LBA;
+    let part1_end = part1_start
+        .checked_add(boot_blocks)
+        .and_then(|end| end.checked_sub(1))
+        .context("boot partition LBA overflow")?;
+    let part2_start = part1_end
+        .checked_add(1)
+        .context("data partition start LBA overflow")?;
+    let part2_end = part2_start
+        .checked_add(data_blocks)
+        .and_then(|end| end.checked_sub(1))
+        .context("data partition end LBA overflow")?;
+    let last_usable_lba = part2_end;
+    let backup_array_lba = last_usable_lba + 1;
+    let backup_header_lba = backup_array_lba + GPT_ARRAY_SECTORS;
+    let total_blocks = backup_header_lba + 1;
+    let total_bytes = total_blocks
+        .checked_mul(SECTOR_BYTES)
+        .context("GPT disk byte length overflow")?;
+
+    if let Some(parent) = output_gpt_image.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut out = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(output_gpt_image)
+        .with_context(|| format!("create GPT image {}", output_gpt_image.display()))?;
+    out.set_len(total_bytes)?;
+
+    out.seek(std::io::SeekFrom::Start(part1_start * SECTOR_BYTES))?;
+    let mut boot_in = fs::File::open(boot_image)?;
+    let copied = std::io::copy(&mut boot_in, &mut out)?;
+    if copied != boot_bytes {
+        bail!("short copy from boot image {}", boot_image.display());
+    }
+
+    {
+        let slice = PartitionFileSlice::new(&mut out, part2_start * SECTOR_BYTES, data_size_bytes);
+        let mut fat_io = fatfs::StdIoWrapper::new(slice);
+        fatfs::format_volume(
+            &mut fat_io,
+            fatfs::FormatVolumeOptions::new()
+                .fat_type(fatfs::FatType::Fat32)
+                .bytes_per_sector(512)
+                .volume_label(*b"RUSTOSDATA ")
+                .volume_id(0x5255_5344),
+        )
+        .context("format writable FAT32 data partition")?;
+    }
+
+    let mut entries = vec![0_u8; (GPT_ENTRY_COUNT * GPT_ENTRY_BYTES) as usize];
+    write_gpt_entry(
+        &mut entries[0..128],
+        EFI_SYSTEM_PART_GUID,
+        [0x11; 16],
+        part1_start,
+        part1_end,
+        "RUSTOSBOOT",
+    );
+    write_gpt_entry(
+        &mut entries[128..256],
+        BASIC_DATA_PART_GUID,
+        [0x22; 16],
+        part2_start,
+        part2_end,
+        "RUSTOSDATA",
+    );
+    let entry_array_crc = gpt_crc32(&entries);
+
+    let mut mbr = [0_u8; 512];
+    mbr[446 + 1..446 + 4].copy_from_slice(&[0x00, 0x02, 0x00]);
+    mbr[446 + 4] = 0xEE;
+    mbr[446 + 5..446 + 8].copy_from_slice(&[0xFF, 0xFF, 0xFF]);
+    mbr[446 + 8..446 + 12].copy_from_slice(&1_u32.to_le_bytes());
+    let mbr_sectors = u32::try_from(total_blocks - 1).unwrap_or(u32::MAX);
+    mbr[446 + 12..446 + 16].copy_from_slice(&mbr_sectors.to_le_bytes());
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+
+    let disk_guid = [0x52; 16];
+    let primary_header = build_gpt_header(
+        1,
+        backup_header_lba,
+        FIRST_USABLE_LBA,
+        last_usable_lba,
+        disk_guid,
+        2,
+        GPT_ENTRY_COUNT,
+        GPT_ENTRY_BYTES,
+        entry_array_crc,
+    );
+    let backup_header = build_gpt_header(
+        backup_header_lba,
+        1,
+        FIRST_USABLE_LBA,
+        last_usable_lba,
+        disk_guid,
+        backup_array_lba,
+        GPT_ENTRY_COUNT,
+        GPT_ENTRY_BYTES,
+        entry_array_crc,
+    );
+
+    out.seek(std::io::SeekFrom::Start(0))?;
+    out.write_all(&mbr)?;
+    out.write_all(&primary_header)?;
+    out.write_all(&entries)?;
+
+    out.seek(std::io::SeekFrom::Start(backup_array_lba * SECTOR_BYTES))?;
+    out.write_all(&entries)?;
+    out.write_all(&backup_header)?;
+    out.sync_all()?;
+    Ok(())
+}
+
 fn sign_detached_for_grub(config: &Config, input: &Path, signature: &Path) -> Result<()> {
     remove_file_if_exists(signature)?;
     let gpg_home = config
@@ -1434,5 +1716,83 @@ mod tests {
             }],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn gpt_boot_plus_writable_data_image_exposes_boot_and_rw_fat32_partitions() {
+        use storage_core::FsVolume;
+
+        let temp = tempfile::tempdir().unwrap();
+        let boot_disk = temp.path().join("rustos-boot.img");
+        let payload = b"rootd bootstrap payload";
+        {
+            let image_file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(true)
+                .open(&boot_disk)
+                .unwrap();
+            image_file.set_len(2 * 1024 * 1024).unwrap();
+            let mut image = fatfs::StdIoWrapper::new(image_file);
+            fatfs::format_volume(&mut image, fatfs::FormatVolumeOptions::new()).unwrap();
+            image.seek(fatfs::SeekFrom::Start(0)).unwrap();
+            let fs = fatfs::FileSystem::new(image, fatfs::FsOptions::new()).unwrap();
+            {
+                let root = fs.root_dir();
+                ensure_fat_parent_dirs(&root, "services/rootd/rootd.elf").unwrap();
+                let mut staged = root.create_file("services/rootd/rootd.elf").unwrap();
+                staged.write_all(payload).unwrap();
+                staged.flush().unwrap();
+            }
+            fs.unmount().unwrap();
+        }
+
+        let gpt_disk = temp.path().join("rustos-gpt.img");
+        super::write_gpt_boot_plus_writable_data_image(&boot_disk, &gpt_disk, 36 * 1024 * 1024)
+            .unwrap();
+
+        let disk_bytes = std::fs::read(&gpt_disk).unwrap();
+        let mut dev = storage_core::MemBlockDevice::from_bytes(512, disk_bytes.clone()).unwrap();
+        let partitions = storage_core::detect_partitions(&mut dev).unwrap();
+        assert_eq!(partitions.len(), 2);
+        assert!(partitions[0].start_lba + partitions[0].block_count <= partitions[1].start_lba);
+
+        {
+            let boot_vol = storage_fat::FatVolume::from_partition(
+                dev,
+                partitions[0].start_lba,
+                partitions[0].block_count,
+            )
+            .unwrap();
+            let actual = boot_vol.read_file_to_vec("services/rootd/rootd.elf").unwrap();
+            assert_eq!(actual, payload);
+            boot_vol.unmount().unwrap();
+        }
+
+        {
+            let rw_dev = storage_core::MemBlockDevice::from_bytes(512, disk_bytes).unwrap();
+            let mut data_vol = storage_fat::FatVolume::from_partition(
+                rw_dev,
+                partitions[1].start_lba,
+                partitions[1].block_count,
+            )
+            .unwrap();
+            assert!(data_vol.read_dir("/").unwrap().is_empty());
+            {
+                let mut file = data_vol.create_file("/hello.txt").unwrap();
+                file.flush().unwrap();
+            }
+            let (written, new_len) =
+                FsVolume::write_at(&data_vol, "/hello.txt", 0, b"rustos rw").unwrap();
+            assert_eq!(written, 9);
+            assert_eq!(new_len, 9);
+            FsVolume::flush(&data_vol).unwrap();
+            assert_eq!(
+                data_vol.read_file_to_vec("/hello.txt").unwrap(),
+                b"rustos rw"
+            );
+            data_vol.unmount().unwrap();
+        }
     }
 }

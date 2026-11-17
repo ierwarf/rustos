@@ -51,7 +51,7 @@ impl VfsState {
             COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH => {
                 let (mount_generation, mounted) = {
                     let storage = lock_vfs_storage();
-                    (storage.mount_generation, u64::from(storage.volume.is_some()))
+                    (storage.mount_generation, u64::from(!storage.mounts.is_empty()))
                 };
                 response.value0 = mount_generation;
                 response.value1 = mounted;
@@ -141,6 +141,7 @@ impl VfsState {
         if self.handles.contains_key(&request.remote_id)
             && matches!(request.op,
                 VFS_IPC_OP_READ | VFS_IPC_OP_PREAD64 | VFS_IPC_OP_WRITE |
+                VFS_IPC_OP_PWRITE64 | VFS_IPC_OP_FSYNC |
                 VFS_IPC_OP_LSEEK | VFS_IPC_OP_FSTAT | VFS_IPC_OP_GETDENTS64 |
                 VFS_IPC_OP_FCNTL | VFS_IPC_OP_CURSOR_SETTLE | VFS_IPC_OP_FTRUNCATE |
                 VFS_IPC_OP_FILE_IDENTITY)
@@ -155,32 +156,14 @@ impl VfsState {
             VFS_IPC_OP_DUP => response.status = EOPNOTSUPP,
             VFS_IPC_OP_READ => self.vfs_read(request, response, None),
             VFS_IPC_OP_PREAD64 => self.vfs_read(request, response, Some(request.arg0)),
-            VFS_IPC_OP_WRITE => {
-                if let Some(handle) = self.handles.get(&request.remote_id) {
-                    if handle.kind == RemoteKind::Device {
-                        match handle.path.as_str() {
-                            "/dev/null" | "/dev/zero" | "/dev/urandom" | "/dev/random" => {
-                                response.value = u64::from(request.payload_len);
-                                return;
-                            }
-                            "/dev/full" => {
-                                response.status =
-                                    if request.payload_len == 0 { 0 } else { ENOSPC };
-                                return;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                response.status = persistent_mutation_status(request.op).unwrap_or(EINVAL);
-            }
+            VFS_IPC_OP_WRITE => self.vfs_write(request, response),
+            VFS_IPC_OP_PWRITE64 => self.vfs_pwrite64(request, response),
             VFS_IPC_OP_LSEEK => self.vfs_lseek(request, response),
             VFS_IPC_OP_FSTAT => self.vfs_fstat(request, response),
             VFS_IPC_OP_FILE_IDENTITY => self.vfs_file_identity(request, response),
             VFS_IPC_OP_LIBRARY_READ => self.vfs_library_read(request, response),
-            VFS_IPC_OP_FTRUNCATE => {
-                response.status = persistent_mutation_status(request.op).unwrap_or(EINVAL)
-            }
+            VFS_IPC_OP_FTRUNCATE => self.vfs_ftruncate(request, response),
+            VFS_IPC_OP_FSYNC => self.vfs_fsync(request, response),
             VFS_IPC_OP_GETDENTS64 => self.vfs_getdents64(request, response),
             VFS_IPC_OP_FCNTL => self.vfs_fcntl(request, response),
             VFS_IPC_OP_CURSOR_SETTLE => self.vfs_cursor_settle(request, response),
@@ -195,6 +178,10 @@ impl VfsState {
             VFS_IPC_OP_MOUNT => self.linux_mount_vfs(response),
             VFS_IPC_OP_UMOUNT2 => self.linux_umount_vfs(response),
             VFS_IPC_OP_UNLINKAT => self.vfs_unlinkat(request, response),
+            VFS_IPC_OP_RENAMEAT2 => self.vfs_renameat2(request, response),
+            VFS_IPC_OP_STATFS => self.vfs_statfs(request, response),
+            VFS_IPC_OP_SYMLINKAT => self.vfs_symlinkat(request, response),
+            VFS_IPC_OP_SET_ATTRS => self.vfs_set_attrs(request, response),
             VFS_IPC_OP_POLL_QUERY => self.vfs_poll_query(request, response),
             _ => response.status = EINVAL,
         }

@@ -90,6 +90,16 @@ impl VfsState {
         dirfd: u64,
         path: &str,
     ) -> Result<String, i32> {
+        self.resolve_path_with_base(pid, dirfd, request.remote_id, path)
+    }
+
+    fn resolve_path_with_base(
+        &mut self,
+        pid: u64,
+        dirfd: u64,
+        base_remote_id: u64,
+        path: &str,
+    ) -> Result<String, i32> {
         if path.is_empty() || path.len() > VFS_IPC_PATH_CAPACITY {
             return Err(EINVAL);
         }
@@ -122,8 +132,8 @@ impl VfsState {
                 return normalize_absolute_path("/", path);
             }
         } else {
-            let base_handle_id = if request.remote_id != 0 {
-                request.remote_id
+            let base_handle_id = if base_remote_id != 0 {
+                base_remote_id
             } else {
                 dirfd
             };
@@ -172,6 +182,21 @@ impl VfsState {
             };
         }
 
+        let accmode = flags & linux_abi::O_ACCMODE;
+        if !matches!(
+            accmode,
+            linux_abi::O_RDONLY | linux_abi::O_WRONLY | linux_abi::O_RDWR
+        ) {
+            return Err(EINVAL);
+        }
+        let writable = accmode != linux_abi::O_RDONLY;
+        let append = (flags & linux_abi::O_APPEND) != 0;
+        let create = (flags & linux_abi::O_CREAT) != 0;
+        let create_new = create && (flags & linux_abi::O_EXCL) != 0;
+        let truncate = (flags & linux_abi::O_TRUNC) != 0;
+
+        let mut mount_id = 0_u64;
+        let mut reset_live_len = false;
         let metadata = match vfsd::proc_fs::lookup(path, request.pid) {
             Some(Ok(node)) => {
                 const LINUX_O_NOFOLLOW: u64 = 0o400_000;
@@ -203,10 +228,10 @@ impl VfsState {
                         if flags & O_DIRECTORY != 0 {
                             return Err(ENOTDIR);
                         }
-                        if flags & (O_CREAT | O_TRUNC) != 0 {
+                        if create || truncate {
                             return Err(EROFS);
                         }
-                        if flags & linux_abi::O_ACCMODE != linux_abi::O_RDONLY {
+                        if writable {
                             return Err(EACCES);
                         }
                         let len = lock_vfs_storage().proc_virtual_file_bytes(file)?.len() as u64;
@@ -219,33 +244,78 @@ impl VfsState {
                 }
             }
             Some(Err(errno)) => return Err(errno),
-            None => lock_vfs_storage().metadata(path).inspect_err(|&errno| {
-                if !open_metadata_errno_is_routine(errno) {
-                    debug_line(&format!(
-                        "vfsd: open failed stage=metadata errno={errno} path={path}"
-                    ));
+            None => {
+                if vfsd::proc_fs::sys_virtual_file(path).is_some()
+                    || path == "/sys"
+                    || path.starts_with("/sys/")
+                {
+                    if writable {
+                        return Err(EACCES);
+                    }
+                    if create || truncate {
+                        return Err(EROFS);
+                    }
+                    lock_vfs_storage().metadata(path)?
+                } else if path == "/" || path == "/proc" || path == "/run" || path.starts_with("/run/")
+                    || path == "/dev" || path.starts_with("/dev/")
+                {
+                    let meta = lock_vfs_storage().metadata(path).inspect_err(|&errno| {
+                        if !open_metadata_errno_is_routine(errno) {
+                            debug_line(&format!(
+                                "vfsd: open failed stage=metadata errno={errno} path={path}"
+                            ));
+                        }
+                    })?;
+                    if (create || truncate) && meta.kind != RemoteKind::Device {
+                        return Err(EROFS);
+                    }
+                    meta
+                } else if let Some(image_len) = early_system::file_len(path)? {
+                    if writable || create || truncate {
+                        return Err(EROFS);
+                    }
+                    Metadata {
+                        kind: RemoteKind::File,
+                        len: image_len,
+                        inode: path_inode(path.as_bytes()),
+                    }
+                } else {
+                    let mut storage = lock_vfs_storage();
+                    let (mid, meta, should_reset) = storage.open_on_mount(
+                        path,
+                        FsOpenOptions {
+                            create,
+                            create_new,
+                            truncate,
+                            write: writable,
+                            append,
+                        },
+                        flags & O_DIRECTORY != 0,
+                    ).inspect_err(|&errno| {
+                        if !open_metadata_errno_is_routine(errno) {
+                            debug_line(&format!(
+                                "vfsd: open failed stage=metadata errno={errno} path={path}"
+                            ));
+                        }
+                    })?;
+                    mount_id = mid;
+                    reset_live_len = should_reset;
+                    meta
                 }
-            })?,
+            }
         };
         if flags & O_DIRECTORY != 0 && metadata.kind != RemoteKind::Directory {
             return Err(ENOTDIR);
         }
-        if metadata.kind == RemoteKind::Directory
-            && flags & linux_abi::O_ACCMODE != linux_abi::O_RDONLY
-        {
+        if metadata.kind == RemoteKind::Directory && writable {
             return Err(EISDIR);
-        }
-        if vfsd::proc_fs::sys_virtual_file(path).is_some()
-            && flags & linux_abi::O_ACCMODE != linux_abi::O_RDONLY
-        {
-            return Err(EACCES);
-        }
-        if flags & (O_CREAT | O_TRUNC) != 0 && metadata.kind != RemoteKind::Device {
-            return Err(EROFS);
         }
         let handle = RemoteHandle {
             checkpoint_version: VFSD_OPEN_CHECKPOINT_VERSION,
             kind: metadata.kind,
+            mount_id,
+            writable: writable && metadata.kind != RemoteKind::Directory,
+            append,
             path: path.to_string(),
             cursor: 0,
             len: metadata.len,
@@ -276,6 +346,9 @@ impl VfsState {
                 "vfsd: open failed stage=install errno={EIO} path={path}"
             ));
             return Err(EIO);
+        }
+        if mount_id != 0 {
+            lock_vfs_storage().note_open_node(path, metadata.len, reset_live_len);
         }
         Ok((id, handle))
     }
@@ -309,7 +382,7 @@ impl VfsState {
             (
                 handle.path.clone(),
                 offset.unwrap_or(handle.cursor),
-                handle.len,
+                lock_vfs_storage().live_len_for_path(handle.path.as_str(), handle.len),
             )
         };
         if offset.is_none()
@@ -415,7 +488,7 @@ impl VfsStorage {
                 }))
             }
             ProcNode::FilesystemsFile => Ok(proc_fs::format_filesystems().to_vec()),
-            ProcNode::MountsFile => Ok(proc_fs::format_mounts(self.volume.is_some())),
+            ProcNode::MountsFile => Ok(proc_fs::format_mounts(!self.mounts.is_empty())),
             ProcNode::UptimeFile => {
                 Ok(proc_fs::format_uptime(rustos_svc_runtime::syscall::monotonic_nanos()))
             }
@@ -470,20 +543,15 @@ impl VfsStorage {
             Some(read) => Ok(read),
             None => {
                 self.invalidate_caches_if_remounted();
-                let key = fat_cache_key_cow(path);
-                if let Some(bytes) = self.file_bytes_cache.get(key.as_ref()) {
+                let (mount_id, rel_path, key, _parent_key, _caps, _is_immutable, volume, read_map_source) =
+                    self.resolve_mount(path)?;
+                if let Some(bytes) = self.file_bytes_cache.get(&key) {
                     return Ok(copy_file_cache_range(bytes, start, dest));
                 }
 
                 let cacheable_len = should_materialize_file_cache(file_len, start, dest.len());
                 if let Some(expected_len) = cacheable_len {
-                    let bytes = self
-                        .volume()?
-                        .read_file_to_vec(path)
-                        .map_err(map_fat_error)?;
-                    if bytes.len() != expected_len {
-                        return Err(EIO);
-                    }
+                    let bytes = read_volume_file_to_vec(&*volume, &rel_path, expected_len)?;
                     let read = copy_file_cache_range(&bytes, start, dest);
                     if self
                         .file_bytes_cache_bytes
@@ -494,11 +562,16 @@ impl VfsStorage {
                         self.file_bytes_cache_bytes = 0;
                     }
                     self.file_bytes_cache_bytes += bytes.len();
-                    self.file_bytes_cache.insert(key.into_owned(), bytes);
+                    self.file_bytes_cache.insert(key, bytes);
                     return Ok(read);
                 }
 
-                self.read_mapped_file(path, file_len, start, dest)
+                if let Some(rms) = read_map_source {
+                    return self.read_mapped_file_on(mount_id, &rel_path, &key, &*rms, file_len, start, dest);
+                }
+                volume
+                    .read_at(&rel_path, start, dest)
+                    .map_err(vfsd::map_fs_error)
             }
         }
     }
@@ -506,48 +579,69 @@ impl VfsStorage {
     /// Plans and caches the on-volume read map of `path` (bounded; evicts the
     /// whole set when full). The map is the storage layer's identity of the
     /// file: its volume/object/generation never alias a different file.
-    fn ensure_read_map(&mut self, path: &str, len: u64) -> Result<(), i32> {
-        let key = fat_cache_key_cow(path);
-        if !self.read_maps.contains_key(key.as_ref()) {
-            let map = self.volume()?.plan_read(path, vfsd::snapshot_budget::SNAPSHOT_MAP_BYTES)
+    fn ensure_read_map(
+        &mut self,
+        rel_path: &str,
+        key: &CacheKey,
+        read_map_source: &dyn vfsd::mount_table::ReadMapSupport,
+        len: u64,
+    ) -> Result<(), i32> {
+        if !self.read_maps.contains_key(key) {
+            let map = read_map_source
+                .plan_read(rel_path, vfsd::snapshot_budget::SNAPSHOT_MAP_BYTES)
                 .map_err(map_range_error)?;
-            if map.len() != len { return Err(EIO); }
+            if map.len() != len {
+                return Err(EIO);
+            }
             let cost = map.metadata_bytes();
-            if self.read_maps.len() >= 128 || self.read_map_bytes.checked_add(cost).is_none_or(|n| n > 8 * 1024 * 1024) {
+            if self.read_maps.len() >= 128
+                || self
+                    .read_map_bytes
+                    .checked_add(cost)
+                    .is_none_or(|n| n > 8 * 1024 * 1024)
+            {
                 self.read_maps.clear();
                 self.read_map_bytes = 0;
             }
             self.read_map_bytes += cost;
-            self.read_maps.insert(key.into_owned(), map);
+            self.read_maps.insert(key.clone(), map);
         }
         Ok(())
     }
 
     /// Attests the backing file of an open description for the shared library
-    /// cache. Two providers qualify, both because vfsd implements no mutation
-    /// of them: a regular file on the DVM-mounted volume, whose identity is the
-    /// storage layer's read map and names the mount generation and storage
-    /// epoch (a remount or provider restart ends its validity); and a file of
-    /// the authenticated early-system image, read-only for the whole boot, whose
-    /// identity is a reserved volume id plus a collision-resistant digest of its
-    /// image path. Volatile directories and devices are refused rather than
-    /// reported as eligible.
+    /// cache.
     fn file_identity(&mut self, path: &str, len: u64) -> Result<VfsFileIdentityWire, i32> {
         self.invalidate_caches_if_remounted();
         if let Some(image_len) = early_system::file_len(path)? {
-            // The handle's length must be the image entry's; the image has no
-            // other writer, so a mismatch means the description is not it.
             if image_len != len {
                 return Err(EIO);
             }
             return Ok(vfsd::early_system_identity(path, len));
         }
-        self.ensure_read_map(path, len)?;
-        let key = fat_cache_key_cow(path);
-        let identity = self.read_maps.get(key.as_ref()).ok_or(EIO)?.identity();
+        let (mount_id, rel_path, key, _parent_key, _caps, is_immutable, volume, read_map_source) =
+            self.resolve_mount(path)?;
         if self.dvm_storage_epoch == 0 {
             return Err(EIO);
         }
+        if !is_immutable {
+            let node_id = volume
+                .metadata(&rel_path)
+                .map(|m| m.node_id)
+                .unwrap_or_else(|_| path_inode(path.as_bytes()));
+            return Ok(VfsFileIdentityWire {
+                volume: mount_id,
+                object: node_id,
+                generation: self.mount_generation,
+                storage_epoch: self.dvm_storage_epoch,
+                mount_generation: self.mount_generation,
+                len,
+                flags: VFS_FILE_IDENTITY_FLAG_MUTABLE_VOLUME,
+            });
+        }
+        let rms = read_map_source.ok_or(EOPNOTSUPP)?;
+        self.ensure_read_map(&rel_path, &key, &*rms, len)?;
+        let identity = self.read_maps.get(&key).ok_or(EIO)?.identity();
         Ok(VfsFileIdentityWire {
             volume: identity.volume,
             object: identity.object,
@@ -559,15 +653,24 @@ impl VfsStorage {
         })
     }
 
-    fn read_mapped_file(&mut self, path: &str, len: u64, offset: u64, output: &mut [u8]) -> Result<usize, i32> {
-        use storage_core::file_io::ReadAt;
-        self.ensure_read_map(path, len)?;
-        let key = fat_cache_key_cow(path);
-        let map = self.read_maps.get(key.as_ref()).ok_or(EIO)?;
-        if map.len() != len { return Err(EIO); }
-        let mut scratch = [0; 4096];
-        self.volume.as_ref().ok_or(ENODEV)?.read_view(map, &mut scratch)
-            .map_err(map_range_error)?.read_at(offset, output).map_err(map_range_error)
+    fn read_mapped_file_on(
+        &mut self,
+        _mount_id: u64,
+        rel_path: &str,
+        key: &CacheKey,
+        read_map_source: &dyn vfsd::mount_table::ReadMapSupport,
+        len: u64,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<usize, i32> {
+        self.ensure_read_map(rel_path, key, read_map_source, len)?;
+        let map = self.read_maps.get(key).ok_or(EIO)?;
+        if map.len() != len {
+            return Err(EIO);
+        }
+        read_map_source
+            .read_mapped_at(map, offset, output)
+            .map_err(map_range_error)
     }
 
     /// Resolves a snapshot request into either a warm cache hit or an
@@ -606,9 +709,15 @@ impl VfsStorage {
         let early_system_owned = early_system::file_len(path.as_str())?.is_some();
 
         self.invalidate_caches_if_remounted();
+        let (mount_id, rel_path, cache_key, read_map_source) = if early_system_owned {
+            (0_u64, String::new(), (0_u64, path.clone()), None)
+        } else {
+            let (mid, rel, key, _pk, _caps, _imm, _vol, rms) = self.resolve_mount(path.as_str())?;
+            (mid, rel, key, rms)
+        };
         if let Some(snapshot) = self
             .executable_snapshot_cache
-            .get(fat_cache_key_cow(path.as_str()).as_ref())
+            .get(&cache_key)
             .copied()
         {
             return ExecutableSnapshotOpen::duplicate_cached(
@@ -646,13 +755,17 @@ impl VfsStorage {
         };
         let request_id = next_executable_snapshot_request_id()?;
         let read_map = if backing == ExecutableSnapshotBacking::DvmVolume {
-            let map = self.volume()?.plan_read(path.as_str(), vfsd::snapshot_budget::SNAPSHOT_MAP_BYTES)
+            let rms = read_map_source.ok_or(EOPNOTSUPP)?;
+            let map = rms
+                .plan_read(rel_path.as_str(), vfsd::snapshot_budget::SNAPSHOT_MAP_BYTES)
                 .map_err(map_range_error)?;
             if map.len() != metadata.len { return Err(EIO); }
             Some(alloc::sync::Arc::new(map))
         } else { None };
         Ok(ExecutableSnapshotAdmission::Read(ExecutableSnapshotPlan {
             path,
+            mount_id,
+            cache_key,
             file_len,
             read_map,
             metadata_len: metadata.len,
@@ -698,7 +811,12 @@ impl VfsStorage {
             return Err(EAGAIN);
         }
         if let Some(map) = plan.read_map.as_ref() {
-            if !self.volume.as_ref().is_some_and(|volume| volume.read_map_is_current(map)) {
+            let is_current = self
+                .mounts
+                .by_id(plan.mount_id)
+                .and_then(|m| m.read_map_source.as_ref())
+                .is_some_and(|rms| rms.read_map_is_current(map));
+            if !is_current {
                 return Err(EAGAIN);
             }
         }
@@ -709,7 +827,7 @@ impl VfsStorage {
         // its descriptor and counting the same image twice.
         if let Some(snapshot) = self
             .executable_snapshot_cache
-            .get(fat_cache_key_cow(path.as_str()).as_ref())
+            .get(&plan.cache_key)
             .copied()
         {
             return ExecutableSnapshotOpen::duplicate_cached(
@@ -780,7 +898,7 @@ impl VfsStorage {
             self.executable_snapshot_cache_bytes = 0;
         }
         self.executable_snapshot_cache.insert(
-            fat_cache_key(path.as_str()),
+            plan.cache_key.clone(),
             ExecutableSnapshot {
                 fd: cache_fd,
                 file_bytes: plan.metadata_len,
@@ -843,6 +961,560 @@ impl VfsState {
 }
 
 impl VfsStorage {
+    fn ensure_mounted(&mut self) -> Result<(), i32> {
+        if self.mounts.is_empty() {
+            let device = BootBlockDevice::open().inspect_err(|&errno| {
+                if !block::is_transient_storage_not_ready(errno) {
+                    debug_line(&format!(
+                        "vfsd: volume unavailable stage=block-info errno={errno}"
+                    ));
+                }
+            })?;
+            let storage_epoch = device.generation;
+            let device_read_only = device.read_only;
+            let shared_dev = SharedBlockDevice::new(device);
+            let table = MountTable::mount_fat_disk(
+                shared_dev,
+                device_read_only,
+                storage_epoch,
+                || rustos_svc_runtime::syscall::sleep_millis(1),
+            )
+            .inspect_err(|&errno| {
+                debug_line(&format!(
+                    "vfsd: volume unavailable stage=fat-admission errno={errno}"
+                ));
+            })?;
+            self.dvm_storage_epoch = storage_epoch;
+            self.mounts = table;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn resolve_mount(
+        &mut self,
+        abs_path: &str,
+    ) -> Result<
+        (
+            u64,
+            String,
+            CacheKey,
+            Option<CacheKey>,
+            storage_core::fs::FsCapabilities,
+            bool,
+            alloc::sync::Arc<dyn storage_core::fs::FsVolume>,
+            Option<alloc::sync::Arc<dyn vfsd::mount_table::ReadMapSupport>>,
+        ),
+        i32,
+    > {
+        self.ensure_mounted()?;
+        let (entry, rel) = self.mounts.resolve(abs_path).ok_or(ENOENT)?;
+        let caps = entry.volume.capabilities();
+        let is_immutable = entry.volume.is_immutable();
+        let key = cache_key_for_mount(entry.id, caps.case_policy, rel);
+        let parent_key =
+            parent_rel_path(rel).map(|p| cache_key_for_mount(entry.id, caps.case_policy, p));
+        Ok((
+            entry.id,
+            rel.to_string(),
+            key,
+            parent_key,
+            caps,
+            is_immutable,
+            entry.volume.clone(),
+            entry.read_map_source.clone(),
+        ))
+    }
+
+    fn invalidate_path_caches(
+        &mut self,
+        key: &CacheKey,
+        parent_key: Option<&CacheKey>,
+    ) {
+        self.metadata_cache.remove(key);
+        self.dir_entries_cache.remove(key);
+        if let Some(bytes) = self.file_bytes_cache.remove(key) {
+            self.file_bytes_cache_bytes = self.file_bytes_cache_bytes.saturating_sub(bytes.len());
+        }
+        if let Some(map) = self.read_maps.remove(key) {
+            self.read_map_bytes = self.read_map_bytes.saturating_sub(map.metadata_bytes());
+        }
+        if let Some(snapshot) = self.executable_snapshot_cache.remove(key) {
+            close_fd(snapshot.fd);
+            self.executable_snapshot_cache_bytes = self
+                .executable_snapshot_cache_bytes
+                .saturating_sub(snapshot.file_bytes as usize);
+        }
+        if let Some(pk) = parent_key {
+            self.dir_entries_cache.remove(pk);
+            self.metadata_cache.remove(pk);
+        }
+    }
+
+    fn invalidate_subtree_caches(&mut self, key: &CacheKey) {
+        let prefix = if key.1.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", key.1)
+        };
+        let matches = |k: &CacheKey| -> bool {
+            k.0 == key.0 && (k.1 == key.1 || prefix.is_empty() || k.1.starts_with(prefix.as_str()))
+        };
+        self.metadata_cache.retain(|k, _| !matches(k));
+        self.dir_entries_cache.retain(|k, _| !matches(k));
+        let mut removed_file_bytes = 0usize;
+        self.file_bytes_cache.retain(|k, v| {
+            if matches(k) {
+                removed_file_bytes += v.len();
+                false
+            } else {
+                true
+            }
+        });
+        self.file_bytes_cache_bytes = self.file_bytes_cache_bytes.saturating_sub(removed_file_bytes);
+        let mut removed_map_bytes = 0usize;
+        self.read_maps.retain(|k, m| {
+            if matches(k) {
+                removed_map_bytes += m.metadata_bytes();
+                false
+            } else {
+                true
+            }
+        });
+        self.read_map_bytes = self.read_map_bytes.saturating_sub(removed_map_bytes);
+        let mut removed_snap_bytes = 0usize;
+        self.executable_snapshot_cache.retain(|k, snap| {
+            if matches(k) {
+                close_fd(snap.fd);
+                removed_snap_bytes += snap.file_bytes as usize;
+                false
+            } else {
+                true
+            }
+        });
+        self.executable_snapshot_cache_bytes = self
+            .executable_snapshot_cache_bytes
+            .saturating_sub(removed_snap_bytes);
+    }
+
+    fn open_on_mount(
+        &mut self,
+        abs_path: &str,
+        opts: FsOpenOptions,
+        dir_only: bool,
+    ) -> Result<(u64, Metadata, bool), i32> {
+        let (mount_id, rel_path, key, parent_key, caps, _imm, volume, _rms) =
+            self.resolve_mount(abs_path)?;
+        if self.open_nodes.get(&key).is_some_and(|n| n.pending_unlink) {
+            return Err(if opts.create { EBUSY } else { ENOENT });
+        }
+        if dir_only {
+            if opts.write || opts.create || opts.truncate {
+                return Err(EISDIR);
+            }
+            let meta = volume
+                .metadata(&rel_path)
+                .map_err(vfsd::map_fs_error)?;
+            if meta.kind != FsNodeKind::Directory {
+                return Err(ENOTDIR);
+            }
+            return Ok((
+                mount_id,
+                Metadata {
+                    kind: RemoteKind::Directory,
+                    len: 0,
+                    inode: path_inode(abs_path.as_bytes()),
+                },
+                false,
+            ));
+        }
+        if (opts.create || opts.truncate || opts.write) && caps.read_only {
+            if let Ok(meta) = volume.metadata(&rel_path) {
+                if meta.kind == FsNodeKind::Directory && opts.write {
+                    return Err(EISDIR);
+                }
+            }
+            return Err(EROFS);
+        }
+        let fs_meta = volume
+            .open_prepare(&rel_path, opts)
+            .map_err(vfsd::map_fs_error)?;
+        if opts.create || opts.truncate {
+            self.invalidate_path_caches(&key, parent_key.as_ref());
+        }
+        let kind = match fs_meta.kind {
+            FsNodeKind::File | FsNodeKind::Symlink => RemoteKind::File,
+            FsNodeKind::Directory => RemoteKind::Directory,
+        };
+        Ok((
+            mount_id,
+            Metadata {
+                kind,
+                len: fs_meta.len,
+                inode: vfsd::path::path_inode_for_policy(abs_path.as_bytes(), caps.case_policy),
+            },
+            opts.truncate,
+        ))
+    }
+
+    fn note_open_node(&mut self, abs_path: &str, len: u64, reset_len: bool) {
+        if let Ok((_mid, _rel, key, _pk, _caps, _imm, _vol, _rms)) = self.resolve_mount(abs_path) {
+            let entry = self.open_nodes.entry(key).or_insert(OpenNodeState {
+                refs: 0,
+                live_len: len,
+                pending_unlink: false,
+            });
+            entry.refs = entry.refs.saturating_add(1);
+            if reset_len || entry.refs == 1 {
+                entry.live_len = len;
+            }
+        }
+    }
+
+    fn note_close_node(&mut self, abs_path: &str) {
+        if let Ok((_mid, rel_path, key, parent_key, _caps, _imm, volume, _rms)) =
+            self.resolve_mount(abs_path)
+        {
+            let mut should_unlink = false;
+            if let Some(entry) = self.open_nodes.get_mut(&key) {
+                entry.refs = entry.refs.saturating_sub(1);
+                if entry.refs == 0 {
+                    should_unlink = entry.pending_unlink;
+                    self.open_nodes.remove(&key);
+                }
+            }
+            if should_unlink {
+                let _ = volume.unlink(&rel_path);
+                self.invalidate_path_caches(&key, parent_key.as_ref());
+            }
+        }
+    }
+
+    fn live_len_for_path(&mut self, abs_path: &str, fallback: u64) -> u64 {
+        if let Ok((_mid, _rel, key, _pk, _caps, _imm, _vol, _rms)) = self.resolve_mount(abs_path) {
+            if let Some(node) = self.open_nodes.get(&key) {
+                return node.live_len;
+            }
+        }
+        fallback
+    }
+
+    fn live_stat_for_path(&mut self, abs_path: &str, fallback_len: u64) -> (u64, u64) {
+        if let Ok((_mid, _rel, key, _pk, caps, _imm, _vol, _rms)) = self.resolve_mount(abs_path) {
+            let len = self
+                .open_nodes
+                .get(&key)
+                .map_or(fallback_len, |node| node.live_len);
+            let inode = vfsd::path::path_inode_for_policy(abs_path.as_bytes(), caps.case_policy);
+            return (len, inode);
+        }
+        (fallback_len, path_inode(abs_path.as_bytes()))
+    }
+
+    fn write_at_path(&mut self, abs_path: &str, offset: u64, data: &[u8]) -> Result<(usize, u64), i32> {
+        let (_mid, rel_path, key, parent_key, caps, _imm, volume, _rms) =
+            self.resolve_mount(abs_path)?;
+        if caps.read_only {
+            return Err(EROFS);
+        }
+        let (written, new_len) = volume
+            .write_at(&rel_path, offset, data)
+            .map_err(vfsd::map_fs_error)?;
+        if let Some(node) = self.open_nodes.get_mut(&key) {
+            node.live_len = new_len;
+        }
+        self.invalidate_path_caches(&key, parent_key.as_ref());
+        Ok((written, new_len))
+    }
+
+    fn truncate_path(&mut self, abs_path: &str, new_len: u64) -> Result<u64, i32> {
+        let (_mid, rel_path, key, parent_key, caps, _imm, volume, _rms) =
+            self.resolve_mount(abs_path)?;
+        if caps.read_only {
+            return Err(EROFS);
+        }
+        let actual_len = volume
+            .truncate(&rel_path, new_len)
+            .map_err(vfsd::map_fs_error)?;
+        if let Some(node) = self.open_nodes.get_mut(&key) {
+            node.live_len = actual_len;
+        }
+        self.invalidate_path_caches(&key, parent_key.as_ref());
+        Ok(actual_len)
+    }
+
+    fn flush_path(&mut self, abs_path: &str) -> Result<(), i32> {
+        if abs_path == "/proc"
+            || abs_path.starts_with("/proc/")
+            || abs_path == "/sys"
+            || abs_path.starts_with("/sys/")
+            || abs_path == "/dev"
+            || abs_path.starts_with("/dev/")
+            || abs_path == "/run"
+            || abs_path.starts_with("/run/")
+            || early_system::file_len(abs_path)?.is_some()
+        {
+            return Err(EINVAL);
+        }
+        let (_mid, _rel, _key, _pk, _caps, _imm, volume, _rms) = self.resolve_mount(abs_path)?;
+        volume.flush().map_err(vfsd::map_fs_error)
+    }
+
+    fn mkdir_path(&mut self, abs_path: &str, euid: u32) -> i32 {
+        if abs_path == "/run" || abs_path.starts_with("/run/") {
+            return self.run_dirs.mkdir(abs_path, euid);
+        }
+        if abs_path == "/"
+            || abs_path == "/dev"
+            || abs_path.starts_with("/dev/")
+            || abs_path == "/proc"
+            || abs_path.starts_with("/proc/")
+            || abs_path == "/sys"
+            || abs_path.starts_with("/sys/")
+        {
+            return EROFS;
+        }
+        if matches!(early_system::file_len(abs_path), Ok(Some(_))) {
+            return EEXIST;
+        }
+        let (_mid, rel_path, key, parent_key, caps, _imm, volume, _rms) =
+            match self.resolve_mount(abs_path) {
+                Ok(resolved) => resolved,
+                Err(errno) => return errno,
+            };
+        if caps.read_only {
+            return EROFS;
+        }
+        match volume.mkdir(&rel_path) {
+            Ok(()) => {
+                self.invalidate_path_caches(&key, parent_key.as_ref());
+                0
+            }
+            Err(err) => vfsd::map_fs_error(err),
+        }
+    }
+
+    fn unlink_path(&mut self, abs_path: &str, remove_dir: bool) -> i32 {
+        if abs_path.starts_with("/run/") {
+            return ENOENT;
+        }
+        if abs_path == "/"
+            || abs_path == "/run"
+            || abs_path == "/dev"
+            || abs_path.starts_with("/dev/")
+            || abs_path == "/proc"
+            || abs_path.starts_with("/proc/")
+            || abs_path == "/sys"
+            || abs_path.starts_with("/sys/")
+        {
+            return EROFS;
+        }
+        if matches!(early_system::file_len(abs_path), Ok(Some(_))) {
+            return EROFS;
+        }
+        let (_mid, rel_path, key, parent_key, caps, _imm, volume, _rms) =
+            match self.resolve_mount(abs_path) {
+                Ok(resolved) => resolved,
+                Err(errno) => return errno,
+            };
+        if caps.read_only {
+            return EROFS;
+        }
+        if remove_dir {
+            if rel_path.is_empty() {
+                return EBUSY;
+            }
+            return match volume.rmdir(&rel_path) {
+                Ok(()) => {
+                    self.invalidate_path_caches(&key, parent_key.as_ref());
+                    self.invalidate_subtree_caches(&key);
+                    0
+                }
+                Err(err) => vfsd::map_fs_error(err),
+            };
+        }
+        if !caps.supports_unlink_while_open {
+            if let Some(node) = self.open_nodes.get_mut(&key) {
+                if node.pending_unlink {
+                    return ENOENT;
+                }
+                if node.refs > 0 {
+                    node.pending_unlink = true;
+                    self.invalidate_path_caches(&key, parent_key.as_ref());
+                    return 0;
+                }
+            }
+        }
+        match volume.unlink(&rel_path) {
+            Ok(()) => {
+                self.invalidate_path_caches(&key, parent_key.as_ref());
+                0
+            }
+            Err(err) => vfsd::map_fs_error(err),
+        }
+    }
+
+    fn is_virtual_path(p: &str) -> bool {
+        p == "/"
+            || p == "/dev"
+            || p.starts_with("/dev/")
+            || p == "/proc"
+            || p.starts_with("/proc/")
+            || p == "/sys"
+            || p.starts_with("/sys/")
+            || p == "/run"
+            || p.starts_with("/run/")
+    }
+
+    fn rename_paths(&mut self, old_abs: &str, new_abs: &str, no_replace: bool) -> i32 {
+        if Self::is_virtual_path(old_abs) || Self::is_virtual_path(new_abs) {
+            return EROFS;
+        }
+        if matches!(early_system::file_len(old_abs), Ok(Some(_)))
+            || matches!(early_system::file_len(new_abs), Ok(Some(_)))
+        {
+            return EROFS;
+        }
+        let (old_mid, old_rel, old_key, old_pk, old_caps, _imm1, volume, _rms1) =
+            match self.resolve_mount(old_abs) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+        let (new_mid, new_rel, new_key, new_pk, _new_caps, _imm2, _vol2, _rms2) =
+            match self.resolve_mount(new_abs) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+        if old_mid != new_mid {
+            return EXDEV;
+        }
+        if old_caps.read_only {
+            return EROFS;
+        }
+        if self.open_nodes.get(&old_key).is_some_and(|n| n.pending_unlink) {
+            return ENOENT;
+        }
+        if !old_caps.supports_unlink_while_open
+            && (self.open_nodes.get(&old_key).is_some_and(|n| n.refs > 0)
+                || self.open_nodes.get(&new_key).is_some_and(|n| n.refs > 0))
+        {
+            return EBUSY;
+        }
+        match volume.rename(&old_rel, &new_rel, !no_replace, no_replace) {
+            Ok(()) => {
+                self.invalidate_path_caches(&old_key, old_pk.as_ref());
+                self.invalidate_subtree_caches(&old_key);
+                self.invalidate_path_caches(&new_key, new_pk.as_ref());
+                self.invalidate_subtree_caches(&new_key);
+                0
+            }
+            Err(err) => vfsd::map_fs_error(err),
+        }
+    }
+
+    fn statfs_path(&mut self, abs_path: &str) -> Result<VfsStatFsWire, i32> {
+        if abs_path == "/proc"
+            || abs_path.starts_with("/proc/")
+            || abs_path == "/sys"
+            || abs_path.starts_with("/sys/")
+            || abs_path == "/dev"
+            || abs_path.starts_with("/dev/")
+            || abs_path == "/run"
+            || abs_path.starts_with("/run/")
+        {
+            return Ok(VfsStatFsWire {
+                f_type: 0x0102_1994,
+                f_bsize: 4096,
+                f_namelen: 255,
+                f_frsize: 4096,
+                ..VfsStatFsWire::default()
+            });
+        }
+        let (_mid, _rel, _key, _pk, _caps, is_immutable, volume, _rms) =
+            self.resolve_mount(abs_path)?;
+        let st = volume.statfs().map_err(vfsd::map_fs_error)?;
+        Ok(VfsStatFsWire {
+            f_type: st.fs_type_magic as i64,
+            f_bsize: st.block_size as i64,
+            f_blocks: st.total_blocks,
+            f_bfree: st.free_blocks,
+            f_bavail: st.avail_blocks,
+            f_files: st.total_inodes,
+            f_ffree: st.free_inodes,
+            f_fsid: [0, 0],
+            f_namelen: i64::from(st.max_name_len),
+            f_frsize: st.block_size as i64,
+            f_flags: if is_immutable { 1 } else { 0 },
+            f_spare: [0; 4],
+        })
+    }
+
+    fn symlink_path(&mut self, target: &str, link_abs: &str) -> i32 {
+        if Self::is_virtual_path(link_abs) {
+            return EROFS;
+        }
+        let (_mid, rel_path, key, parent_key, caps, _imm, volume, _rms) =
+            match self.resolve_mount(link_abs) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+        if caps.read_only {
+            return EROFS;
+        }
+        match volume.symlink(target, &rel_path) {
+            Ok(()) => {
+                self.invalidate_path_caches(&key, parent_key.as_ref());
+                0
+            }
+            Err(err) => vfsd::map_fs_error(err),
+        }
+    }
+
+    fn set_attrs_path(
+        &mut self,
+        abs_path: &str,
+        mask: u64,
+        atime_secs: i64,
+        mtime_secs: i64,
+        dos_attrs: u32,
+    ) -> i32 {
+        if Self::is_virtual_path(abs_path) {
+            return EROFS;
+        }
+        let (_mid, rel_path, key, parent_key, caps, _imm, volume, _rms) =
+            match self.resolve_mount(abs_path) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+        if caps.read_only {
+            return EROFS;
+        }
+        if mask & 7 != 0 {
+            let atime = (mask & 1 != 0).then_some(FsTimestamp {
+                secs: atime_secs,
+                nanos: 0,
+            });
+            let mtime = (mask & 2 != 0).then_some(FsTimestamp {
+                secs: mtime_secs,
+                nanos: 0,
+            });
+            let crtime = (mask & 4 != 0).then_some(FsTimestamp {
+                secs: mtime_secs,
+                nanos: 0,
+            });
+            if let Err(err) = volume.set_times(&rel_path, atime, mtime, crtime) {
+                return vfsd::map_fs_error(err);
+            }
+        }
+        if mask & 8 != 0 {
+            if let Err(err) = volume.set_dos_attrs(&rel_path, dos_attrs) {
+                return vfsd::map_fs_error(err);
+            }
+        }
+        self.invalidate_path_caches(&key, parent_key.as_ref());
+        0
+    }
+
     fn metadata(&mut self, path: &str) -> Result<Metadata, i32> {
         if path == "/" || path == "/proc" || self.run_dirs.contains(path) {
             return Ok(Metadata {
@@ -887,47 +1559,52 @@ impl VfsStorage {
             }
         }
         self.invalidate_caches_if_remounted();
-        if let Some(entry) = self.metadata_cache.get(fat_cache_key_cow(path).as_ref()) {
-            return *entry;
-        }
         if let Some(len) = early_system::file_len(path)? {
+            let es_key = (0_u64, path.to_string());
             let metadata = Metadata {
                 kind: RemoteKind::File,
                 len,
                 inode: path_inode(path.as_bytes()),
             };
-            self.insert_metadata_cache(path, Ok(metadata));
+            self.insert_metadata_cache(es_key, Ok(metadata));
             return Ok(metadata);
         }
-        let result = match self.volume()?.metadata(path) {
+        let (_mid, rel_path, key, _pk, caps, _imm, volume, _rms) = self.resolve_mount(path)?;
+        if self.open_nodes.get(&key).is_some_and(|n| n.pending_unlink) {
+            return Err(ENOENT);
+        }
+        if let Some(entry) = self.metadata_cache.get(&key) {
+            return *entry;
+        }
+        let result = match volume.metadata(&rel_path) {
             Ok(meta) => Ok(Metadata {
                 kind: match meta.kind {
-                    FatNodeKind::File => RemoteKind::File,
-                    FatNodeKind::Directory => RemoteKind::Directory,
+                    FsNodeKind::File | FsNodeKind::Symlink => RemoteKind::File,
+                    FsNodeKind::Directory => RemoteKind::Directory,
                 },
                 len: meta.len,
-                inode: path_inode(path.as_bytes()),
+                inode: vfsd::path::path_inode_for_policy(path.as_bytes(), caps.case_policy),
             }),
-            Err(err) => Err(map_fat_error(err)),
+            Err(err) => Err(vfsd::map_fs_error(err)),
         };
         if result.is_ok()
             || result
                 .as_ref()
                 .is_err_and(|errno| cacheable_metadata_errno(*errno))
         {
-            self.insert_metadata_cache(path, result);
+            self.insert_metadata_cache(key, result);
         }
         result
     }
 
-    /// Negative and positive answers are keyed by client-chosen paths, so the
-    /// cache must have a hard entry bound or a path-probing client could
+    /// Negative and positive answers are keyed by `(mount_id, canonical_rel_path)`,
+    /// so the cache must have a hard entry bound or a path-probing client could
     /// exhaust the namespace service heap.
-    fn insert_metadata_cache(&mut self, path: &str, result: Result<Metadata, i32>) {
+    fn insert_metadata_cache(&mut self, key: CacheKey, result: Result<Metadata, i32>) {
         if self.metadata_cache.len() >= vfsd::METADATA_CACHE_MAX_ENTRIES {
             self.metadata_cache.clear();
         }
-        self.metadata_cache.insert(fat_cache_key(path), result);
+        self.metadata_cache.insert(key, result);
     }
 
     fn for_each_dir_entry_from(
@@ -991,14 +1668,16 @@ impl VfsStorage {
         if path.starts_with("/run/") {
             return Err(ENOENT);
         }
+        self.invalidate_caches_if_remounted();
+        let (mount_id, rel_path, key, _pk, caps, _imm, volume, _rms) = self.resolve_mount(path)?;
         let mut base_index = 0usize;
+        const ROOT_VIRTUAL: [(&str, RemoteKind); 4] = [
+            ("dev", RemoteKind::Directory),
+            ("proc", RemoteKind::Directory),
+            ("run", RemoteKind::Directory),
+            ("sys", RemoteKind::Directory),
+        ];
         if path == "/" {
-            const ROOT_VIRTUAL: [(&str, RemoteKind); 4] = [
-                ("dev", RemoteKind::Directory),
-                ("proc", RemoteKind::Directory),
-                ("run", RemoteKind::Directory),
-                ("sys", RemoteKind::Directory),
-            ];
             for (index, (name, kind)) in ROOT_VIRTUAL.iter().enumerate().skip(cursor) {
                 let entry = DirEntry::new(name, *kind);
                 if !visit(index, &entry)? {
@@ -1007,46 +1686,64 @@ impl VfsStorage {
             }
             base_index = ROOT_VIRTUAL.len();
         }
-        self.invalidate_caches_if_remounted();
-        let key = fat_cache_key_cow(path);
-        if !self.dir_entries_cache.contains_key(key.as_ref()) {
-            let fat_entries = self.volume()?.read_dir(path).map_err(map_fat_error)?;
-            let resolved: Vec<DirEntry> = fat_entries.into_iter().map(DirEntry::from_fat).collect();
+        let submounts: Vec<String> = self
+            .mounts
+            .submount_names_at(path)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        for (offset, name) in submounts.iter().enumerate() {
+            let idx = base_index + offset;
+            if idx < cursor {
+                continue;
+            }
+            let entry = DirEntry::new(name.as_str(), RemoteKind::Directory);
+            if !visit(idx, &entry)? {
+                return Ok(());
+            }
+        }
+        base_index += submounts.len();
+
+        if !self.dir_entries_cache.contains_key(&key) {
+            let fs_entries = volume.read_dir(&rel_path).map_err(vfsd::map_fs_error)?;
+            let resolved: Vec<DirEntry> = fs_entries.into_iter().map(DirEntry::from_fs).collect();
             if self.dir_entries_cache.len() >= vfsd::DIR_ENTRIES_CACHE_MAX_ENTRIES {
                 self.dir_entries_cache.clear();
             }
-            self.dir_entries_cache.insert(key.clone().into_owned(), resolved);
+            self.dir_entries_cache.insert(key.clone(), resolved);
         }
-        let cached = self.dir_entries_cache.get(key.as_ref()).ok_or(EIO)?;
-        let skip_fat = cursor.saturating_sub(base_index);
-        for (offset, entry) in cached.iter().enumerate().skip(skip_fat) {
+        let cached = self.dir_entries_cache.get(&key).ok_or(EIO)?;
+        let name_matches = |a: &str, b: &str| match caps.case_policy {
+            storage_core::fs::CasePolicy::Exact => a == b,
+            storage_core::fs::CasePolicy::AsciiInsensitive
+            | storage_core::fs::CasePolicy::UnicodePreservingInsensitive => {
+                a.eq_ignore_ascii_case(b)
+            }
+        };
+        let visible: Vec<&DirEntry> = cached
+            .iter()
+            .filter(|entry| {
+                if path == "/"
+                    && (ROOT_VIRTUAL.iter().any(|(v, _)| name_matches(&entry.name, v))
+                        || submounts.iter().any(|s| name_matches(&entry.name, s)))
+                {
+                    return false;
+                }
+                let child_rel = if rel_path.is_empty() {
+                    entry.name.clone()
+                } else {
+                    format!("{rel_path}/{}", entry.name)
+                };
+                let child_key = cache_key_for_mount(mount_id, caps.case_policy, &child_rel);
+                !self.open_nodes.get(&child_key).is_some_and(|n| n.pending_unlink)
+            })
+            .collect();
+        let skip_vol = cursor.saturating_sub(base_index);
+        for (offset, entry) in visible.into_iter().enumerate().skip(skip_vol) {
             if !visit(base_index + offset, entry)? {
                 break;
             }
         }
         Ok(())
-    }
-
-    fn volume(&mut self) -> Result<&FatVolume<BootBlockDevice>, i32> {
-        if self.volume.is_none() {
-            let device = BootBlockDevice::open().inspect_err(|&errno| {
-                if !block::is_transient_storage_not_ready(errno) {
-                    debug_line(&format!(
-                        "vfsd: volume unavailable stage=block-info errno={errno}"
-                    ));
-                }
-            })?;
-            let storage_epoch = device.generation;
-            let volume = FatVolume::new_with_wait(device, || rustos_svc_runtime::syscall::sleep_millis(1))
-                .map_err(map_fat_error)
-                .inspect_err(|&errno| {
-                    debug_line(&format!(
-                        "vfsd: volume unavailable stage=fat-admission errno={errno}"
-                    ));
-                })?;
-            self.dvm_storage_epoch = storage_epoch;
-            self.volume = Some(volume);
-        }
-        Ok(self.volume.as_ref().expect("volume initialized"))
     }
 }

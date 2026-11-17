@@ -39,13 +39,17 @@ pub const LIBRARY_OBJECT_OP_PRESSURE: u16 = 5;
 
 /// vfsd reports this for files that live on the read-only DVM volume mount.
 pub const VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME: u64 = 1 << 0;
+/// vfsd reports this for files that live on a mutable volume mount (or `0` when
+/// neither flag is set; mutable files are never cacheable).
+pub const VFS_FILE_IDENTITY_FLAG_MUTABLE_VOLUME: u64 = 1 << 1;
 /// `VfsFileIdentityWire::volume` of every file served by the authenticated
 /// early-system image. It is a reserved id, not a storage volume: the image is
 /// read-only for the whole boot, its `object` is the SHA-256 prefix of the
 /// image-relative path, and its epoch/mount generation are fixed at 1.
 pub const VFS_EARLY_SYSTEM_VOLUME_ID: u64 = 0x4553_5953_494d_4701;
 
-pub const VFS_FILE_IDENTITY_FLAGS_KNOWN: u64 = VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME;
+pub const VFS_FILE_IDENTITY_FLAGS_KNOWN: u64 =
+    VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME | VFS_FILE_IDENTITY_FLAG_MUTABLE_VOLUME;
 
 /// vfsd-attested identity of one open file description's backing file. The
 /// `volume`/`object`/`generation` triple is the storage layer's file identity;
@@ -64,16 +68,25 @@ pub struct VfsFileIdentityWire {
 }
 impl VfsFileIdentityWire {
     pub const fn is_canonical(self) -> bool {
+        let both_volume_flags = self.flags & VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME != 0
+            && self.flags & VFS_FILE_IDENTITY_FLAG_MUTABLE_VOLUME != 0;
         self.object != 0
             && self.generation != 0
             && self.storage_epoch != 0
             && self.mount_generation != 0
             && self.len != 0
             && self.flags & !VFS_FILE_IDENTITY_FLAGS_KNOWN == 0
+            && !both_volume_flags
     }
     /// Only files on the immutable volume are cacheable.
     pub const fn is_immutable(self) -> bool {
         self.flags & VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME != 0
+            && self.flags & VFS_FILE_IDENTITY_FLAG_MUTABLE_VOLUME == 0
+    }
+    /// Returns `true` when the file is on a mutable volume (explicit
+    /// `VFS_FILE_IDENTITY_FLAG_MUTABLE_VOLUME` or `0` / non-immutable).
+    pub const fn is_mutable(self) -> bool {
+        self.flags & VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME == 0
     }
     /// Fixed little-endian payload carried by `VFS_IPC_OP_FILE_IDENTITY`.
     pub const WIRE_BYTES: usize = 56;
@@ -376,6 +389,17 @@ mod tests {
         let mut bad = identity();
         bad.file.len = 0;
         assert!(!bad.is_canonical());
+        let mut bad = identity();
+        bad.file.flags = VFS_FILE_IDENTITY_FLAG_MUTABLE_VOLUME;
+        assert!(!bad.is_canonical(), "mutable mount files are never cacheable");
+        assert!(bad.file.is_canonical());
+        assert!(bad.file.is_mutable());
+        assert!(!bad.file.is_immutable());
+        let mut both = identity();
+        both.file.flags =
+            VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME | VFS_FILE_IDENTITY_FLAG_MUTABLE_VOLUME;
+        assert!(!both.file.is_canonical());
+        assert!(!both.is_canonical());
         let mut bad = identity();
         bad.file.flags |= 1 << 5;
         assert!(!bad.is_canonical());

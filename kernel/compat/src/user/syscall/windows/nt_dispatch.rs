@@ -453,8 +453,10 @@ pub(super) fn dispatch_wine_nt_syscall(frame: &mut SyscallFrame, api: WineNtApi)
             fs_object::nt_query_directory_file(frame)
         }
         WineNtApi::NtFlushBuffersFile => {
-            let _ = admit_syscalld(&request);
-            STATUS_SUCCESS
+            if let Err(err) = admit_syscalld(&request) {
+                return err;
+            }
+            nt_flush_buffers_file(frame)
         }
         WineNtApi::NtCreateNamedPipeFile => {
             if let Err(err) = admit_syscalld(&request) {
@@ -1918,6 +1920,12 @@ fn nt_query_virtual_memory(frame: &SyscallFrame) -> u64 {
     STATUS_SUCCESS
 }
 
+fn nt_desired_access_wants_write(desired_access: u32) -> bool {
+    // GENERIC_WRITE (0x4000_0000) | GENERIC_ALL (0x1000_0000) |
+    // DELETE (0x0001_0000) | FILE_WRITE_DATA (0x2) | FILE_APPEND_DATA (0x4)
+    desired_access & 0x5001_0006 != 0
+}
+
 fn nt_open_or_create_file(frame: &SyscallFrame, is_create: bool) -> u64 {
     let (file_handle_ptr, desired_access, oa_ptr, io_status_ptr) =
         (frame.r10, frame.rdx, frame.r8, frame.r9);
@@ -1943,7 +1951,7 @@ fn nt_open_or_create_file(frame: &SyscallFrame, is_create: bool) -> u64 {
         Err(status) => return status,
     };
 
-    let wants_write = (desired_access as u32) & 0x4001_0006 != 0;
+    let wants_write = nt_desired_access_wants_write(desired_access as u32);
     let mut open_flags = if wants_write {
         linux_abi::O_RDWR
     } else {
@@ -2037,6 +2045,10 @@ pub(super) fn read_object_attributes_unicode(oa_ptr: u64) -> Result<(u64, String
 
 fn resolve_object_attributes_posix_path(oa_ptr: u64) -> Result<(String, Option<String>), u64> {
     let (root_dir, raw_name) = read_object_attributes_unicode(oa_ptr)?;
+    Ok(resolve_nt_path_to_posix(root_dir, &raw_name))
+}
+
+fn resolve_nt_path_to_posix(root_dir: u64, raw_name: &str) -> (String, Option<String>) {
     let mut normalized = raw_name.replace('\\', "/");
     let lower = normalized.to_ascii_lowercase();
 
@@ -2045,11 +2057,11 @@ fn resolve_object_attributes_posix_path(oa_ptr: u64) -> Result<(String, Option<S
         .or_else(|| lower.strip_prefix("/dosdevices/"))
     {
         let tail = &normalized[normalized.len() - rest.len()..];
-        return Ok(translate_dos_path(tail));
+        return translate_dos_path(tail);
     }
     if lower.starts_with("/systemroot/") || lower == "/systemroot" {
         let tail = &normalized["/systemroot".len()..];
-        return Ok(translate_systemroot_subpath(tail));
+        return translate_systemroot_subpath(tail);
     }
     if root_dir >= WIN32_FD_HANDLE_BASE && root_dir < WIN32_SECTION_HANDLE_BASE {
         let dir_fd = root_dir - WIN32_FD_HANDLE_BASE;
@@ -2070,17 +2082,20 @@ fn resolve_object_attributes_posix_path(oa_ptr: u64) -> Result<(String, Option<S
                 base_dir.trim_end_matches('/'),
                 trimmed.to_ascii_lowercase()
             );
-            return Ok((
+            return (
                 combined.clone(),
                 (combined_lower != combined).then_some(combined_lower),
-            ));
+            );
         }
     }
     if !normalized.starts_with('/') {
         normalized.insert(0, '/');
     }
-    let alt = format!("/compat/windows/System32/{}", normalized.trim_start_matches('/').to_ascii_lowercase());
-    Ok((normalized, Some(alt)))
+    let alt = format!(
+        "/compat/windows/System32/{}",
+        normalized.trim_start_matches('/').to_ascii_lowercase()
+    );
+    (normalized, Some(alt))
 }
 
 fn translate_dos_path(dos_path: &str) -> (String, Option<String>) {
@@ -2184,7 +2199,7 @@ fn nt_read_or_write_file(frame: &SyscallFrame, is_write: bool) -> u64 {
     };
 
     let io_res = if is_write {
-        vfs_socket::kernel_vfs_write_user(fd, buffer_ptr, length)
+        vfs_socket::kernel_vfs_write_user(fd, buffer_ptr, length, offset)
     } else {
         vfs_socket::kernel_vfs_read_user(fd, buffer_ptr, length, offset)
     };
@@ -2284,12 +2299,21 @@ fn nt_close(handle: u64) -> u64 {
         };
     }
     if let Some(fd) = map_win32_file_handle(handle) {
+        let delete_target = take_delete_on_close_target(fd);
         let _ = multitask::with_current_user_process_state_mut(|_, _, st| {
             let objs = st.win32_objects_mut();
             objs.dir_cursors.retain(|c| c.fd != fd);
             objs.dir_paths.retain(|(f, _)| *f != fd);
         });
         return if vfs_socket::kernel_vfs_result(vfs_socket::syscall_linux_vfs_close(fd)).is_ok() {
+            if let Some((path, is_dir)) = delete_target {
+                let flags = if is_dir {
+                    linux_abi::AT_REMOVEDIR as u64
+                } else {
+                    0
+                };
+                let _ = vfs_meta::kernel_vfs_unlink_path(&path, flags);
+            }
             STATUS_SUCCESS
         } else {
             STATUS_INVALID_HANDLE
@@ -2530,8 +2554,114 @@ fn nt_query_information_file(frame: &SyscallFrame) -> u64 {
     }
 }
 
+static DELETE_ON_CLOSE_FDS: spin::Mutex<Vec<(u64, u64)>> = spin::Mutex::new(Vec::new());
+
+fn current_win32_pid() -> u64 {
+    multitask::current_user_snapshot()
+        .map(|s| s.process_id())
+        .unwrap_or(0)
+}
+
+fn set_delete_on_close_fd(fd: u64, delete: bool) {
+    let pid = current_win32_pid();
+    let mut guard = DELETE_ON_CLOSE_FDS.lock();
+    guard.retain(|&(p, f)| !(p == pid && f == fd));
+    if delete {
+        guard.push((pid, fd));
+    }
+}
+
+fn take_delete_on_close_target(fd: u64) -> Option<(String, bool)> {
+    let pid = current_win32_pid();
+    let marked = {
+        let mut guard = DELETE_ON_CLOSE_FDS.lock();
+        let pos = guard.iter().position(|&(p, f)| p == pid && f == fd);
+        if let Some(idx) = pos {
+            guard.remove(idx);
+            true
+        } else {
+            false
+        }
+    };
+    if !marked {
+        return None;
+    }
+    let remote = crate::user::syscall::linux::service_ops::current_remote_vfs_handle(fd)?;
+    let is_dir = remote.kind() == multitask::RemoteVfsHandleKind::Directory;
+    Some((String::from(remote.path()), is_dir))
+}
+
+fn nt_flush_buffers_file(frame: &SyscallFrame) -> u64 {
+    let (file_handle, io_status_ptr) = (frame.r10, frame.rdx);
+    if matches!(
+        file_handle,
+        HANDLE_STDIN
+            | HANDLE_STDOUT
+            | HANDLE_STDERR
+            | STDIN_RAW_PSEUDO
+            | STDOUT_RAW_PSEUDO
+            | STDERR_RAW_PSEUDO
+            | STDIN_32_PSEUDO
+            | STDOUT_32_PSEUDO
+            | STDERR_32_PSEUDO
+    ) {
+        write_io_status(io_status_ptr, STATUS_SUCCESS, 0);
+        return STATUS_SUCCESS;
+    }
+    let Some(fd) = map_win32_file_handle(file_handle) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    match vfs_socket::kernel_vfs_result(vfs_socket::syscall_linux_vfs_fsync(fd)) {
+        Ok(_) => {
+            write_io_status(io_status_ptr, STATUS_SUCCESS, 0);
+            STATUS_SUCCESS
+        }
+        Err(e) => linux_errno_to_ntstatus(e),
+    }
+}
+
+fn parse_file_rename_info(bytes: &[u8]) -> Option<(bool, u64, String)> {
+    if bytes.len() < 20 {
+        return None;
+    }
+    let replace_if_exists = bytes[0] != 0;
+    let root_dir = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+    let name_len = u32::from_le_bytes(bytes[16..20].try_into().ok()?) as usize;
+    if name_len == 0 || name_len % 2 != 0 || 20usize.checked_add(name_len)? > bytes.len() {
+        return None;
+    }
+    let mut u16s = Vec::with_capacity(name_len / 2);
+    for chunk in bytes[20..20 + name_len].chunks_exact(2) {
+        u16s.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    let name = String::from_utf16_lossy(&u16s);
+    Some((replace_if_exists, root_dir, name))
+}
+
+fn resolve_rename_target_posix(old_path: &str, root_dir: u64, raw_name: &str) -> String {
+    let trimmed = raw_name.trim_matches('\0');
+    let normalized = trimmed.replace('\\', "/");
+    let lower = normalized.to_ascii_lowercase();
+    if root_dir == 0
+        && !lower.starts_with("/??/")
+        && !lower.starts_with("/dosdevices/")
+        && !lower.starts_with("/systemroot")
+        && !normalized.starts_with('/')
+        && !(normalized.len() >= 2 && normalized.as_bytes()[1] == b':')
+    {
+        let parent = old_path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        if parent.is_empty() {
+            format!("/{normalized}")
+        } else {
+            format!("{parent}/{normalized}")
+        }
+    } else {
+        resolve_nt_path_to_posix(root_dir, trimmed).0
+    }
+}
+
 fn nt_set_information_file(frame: &SyscallFrame) -> u64 {
-    let (file_handle, io_status_ptr, info_ptr, _length) = (
+    let (file_handle, io_status_ptr, info_ptr, length) = (
         frame.r10,
         frame.rdx,
         frame.r8,
@@ -2542,7 +2672,53 @@ fn nt_set_information_file(frame: &SyscallFrame) -> u64 {
         return STATUS_INVALID_HANDLE;
     };
     match info_class {
+        10 /* FileRenameInformation */ => {
+            if info_ptr == 0 || length < 20 || length > 4096 {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            let mut buf = alloc::vec![0u8; length as usize];
+            if usermem::copy_from_current_user_exact(info_ptr, &mut buf).is_err() {
+                return STATUS_INVALID_PARAMETER;
+            }
+            let Some((replace_if_exists, root_dir, raw_name)) = parse_file_rename_info(&buf) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let Some(remote) = crate::user::syscall::linux::service_ops::current_remote_vfs_handle(fd) else {
+                return STATUS_INVALID_HANDLE;
+            };
+            let old_path = remote.path();
+            let new_path = resolve_rename_target_posix(&old_path, root_dir, &raw_name);
+            let flags = if replace_if_exists {
+                0
+            } else {
+                linux_abi::RENAME_NOREPLACE as u64
+            };
+            match vfs_meta::kernel_vfs_rename_paths(&old_path, &new_path, flags) {
+                Ok(()) => {
+                    write_io_status(io_status_ptr, STATUS_SUCCESS, 0);
+                    STATUS_SUCCESS
+                }
+                Err(e) => linux_errno_to_ntstatus(e),
+            }
+        }
+        13 /* FileDispositionInformation */ => {
+            if info_ptr == 0 || length < 1 {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            let Ok(delete_file) = usermem::read_current_user_struct::<u8>(info_ptr) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            if crate::user::syscall::linux::service_ops::current_remote_vfs_handle(fd).is_none() {
+                return STATUS_INVALID_HANDLE;
+            }
+            set_delete_on_close_fd(fd, delete_file != 0);
+            write_io_status(io_status_ptr, STATUS_SUCCESS, 0);
+            STATUS_SUCCESS
+        }
         14 /* FilePositionInformation */ => {
+            if length < 8 {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
             let Ok(pos) = usermem::read_current_user_struct::<i64>(info_ptr) else {
                 return STATUS_INVALID_PARAMETER;
             };
@@ -2561,11 +2737,95 @@ fn nt_set_information_file(frame: &SyscallFrame) -> u64 {
                 Err(e) => linux_errno_to_ntstatus(e),
             }
         }
+        19 /* FileEndOfFileInformation */ => {
+            if length < 8 {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            let Ok(eof) = usermem::read_current_user_struct::<i64>(info_ptr) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            if eof < 0 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            match vfs_socket::kernel_vfs_result(vfs_meta::syscall_linux_vfs_ftruncate(
+                fd,
+                eof as u64,
+            )) {
+                Ok(_) => {
+                    write_io_status(io_status_ptr, STATUS_SUCCESS, 0);
+                    STATUS_SUCCESS
+                }
+                Err(e) => linux_errno_to_ntstatus(e),
+            }
+        }
+        20 /* FileAllocationInformation */ => {
+            if length < 8 {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            let Ok(alloc_size) = usermem::read_current_user_struct::<i64>(info_ptr) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            if alloc_size < 0 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            write_io_status(io_status_ptr, STATUS_SUCCESS, 0);
+            STATUS_SUCCESS
+        }
         _ => {
             write_io_status(io_status_ptr, STATUS_SUCCESS, 0);
             STATUS_SUCCESS
         }
     }
+}
+
+fn encode_file_fs_size_info(statfs: &rustos_user_abi::syscall::VfsStatFsWire) -> [u8; 24] {
+    let bsize = statfs.f_bsize.max(512) as u64;
+    let bytes_per_sector = 512_u32;
+    let sectors_per_unit = (bsize / u64::from(bytes_per_sector)).max(1) as u32;
+    let mut out = [0_u8; 24];
+    out[0..8].copy_from_slice(&statfs.f_blocks.to_le_bytes());
+    out[8..16].copy_from_slice(&statfs.f_bavail.to_le_bytes());
+    out[16..20].copy_from_slice(&sectors_per_unit.to_le_bytes());
+    out[20..24].copy_from_slice(&bytes_per_sector.to_le_bytes());
+    out
+}
+
+fn encode_file_fs_attribute_info(
+    statfs: &rustos_user_abi::syscall::VfsStatFsWire,
+    max_len: usize,
+) -> Result<(Vec<u8>, bool), u64> {
+    if max_len < 12 {
+        return Err(STATUS_INFO_LENGTH_MISMATCH);
+    }
+    const MSDOS_SUPER_MAGIC: i64 = 0x4d44;
+    let (fs_name, attrs): (&str, u32) = if statfs.f_type == MSDOS_SUPER_MAGIC {
+        ("FAT32", 0x0000_0006) // FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK
+    } else {
+        ("VFS", 0x0000_0007) // FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK
+    };
+    let name_bytes_len = fs_name.len() * 2;
+    let max_comp = if statfs.f_namelen > 0 {
+        statfs.f_namelen.min(i32::MAX as i64) as i32
+    } else {
+        255
+    };
+    let total_needed = 12 + name_bytes_len;
+    let copy_len = total_needed.min(max_len);
+    let mut out = alloc::vec![0_u8; copy_len];
+    out[0..4].copy_from_slice(&attrs.to_le_bytes());
+    out[4..8].copy_from_slice(&max_comp.to_le_bytes());
+    out[8..12].copy_from_slice(&(name_bytes_len as u32).to_le_bytes());
+    let mut idx = 12;
+    for ch in fs_name.encode_utf16() {
+        let le = ch.to_le_bytes();
+        if idx + 2 <= copy_len {
+            out[idx..idx + 2].copy_from_slice(&le);
+            idx += 2;
+        } else {
+            break;
+        }
+    }
+    Ok((out, copy_len < total_needed))
 }
 
 fn nt_query_volume_information_file(frame: &SyscallFrame) -> u64 {
@@ -2598,6 +2858,43 @@ fn nt_query_volume_information_file(frame: &SyscallFrame) -> u64 {
             write_io_status(io_status_ptr, STATUS_SUCCESS, 8);
             return STATUS_SUCCESS;
         }
+        return STATUS_INVALID_PARAMETER;
+    }
+    if matches!(info_class, 3 /* FileFsSizeInformation */ | 5 /* FileFsAttributeInformation */) {
+        let statfs = match map_win32_file_handle(file_handle) {
+            Some(fd) => vfs_meta::kernel_vfs_fstatfs(fd),
+            None => return STATUS_INVALID_HANDLE,
+        };
+        let statfs = match statfs {
+            Ok(s) => s,
+            Err(e) => return linux_errno_to_ntstatus(e),
+        };
+        if info_class == 3 {
+            if length < 24 {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            let bytes = encode_file_fs_size_info(&statfs);
+            if usermem::write_current_user_bytes(info_ptr, &bytes).is_err() {
+                return STATUS_INVALID_PARAMETER;
+            }
+            write_io_status(io_status_ptr, STATUS_SUCCESS, 24);
+            return STATUS_SUCCESS;
+        }
+        let (bytes, overflow) = match encode_file_fs_attribute_info(&statfs, length as usize) {
+            Ok(res) => res,
+            Err(status) => return status,
+        };
+        let written = bytes.len() as u64;
+        if usermem::write_current_user_bytes(info_ptr, &bytes).is_err() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        let status = if overflow {
+            rustos_user_abi::windows::STATUS_BUFFER_OVERFLOW
+        } else {
+            STATUS_SUCCESS
+        };
+        write_io_status(io_status_ptr, status, written);
+        return status;
     }
     STATUS_INVALID_INFO_CLASS
 }
@@ -3877,4 +4174,83 @@ fn as_bytes<T>(value: &T) -> &[u8] {
 fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
     debug_assert!(bytes.len() >= size_of::<T>());
     unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustos_user_abi::syscall::{encode_two_path_payload, decode_two_path_payload, VfsStatFsWire};
+
+    #[test]
+    fn encode_two_path_payload_roundtrip_and_bounds() {
+        let mut buf = [0u8; 512];
+        let len = encode_two_path_payload(b"/tmp/old.txt", b"/tmp/new.txt", &mut buf)
+            .expect("should encode two short paths");
+        assert_eq!(len, 4 + 12 + 12);
+        let (first, second) = decode_two_path_payload(&buf[..len]).expect("should decode");
+        assert_eq!(first, b"/tmp/old.txt");
+        assert_eq!(second, b"/tmp/new.txt");
+
+        let mut small = [0u8; 10];
+        assert!(encode_two_path_payload(b"/tmp/a", b"/tmp/b", &mut small).is_none());
+    }
+
+    #[test]
+    fn parse_file_rename_info_and_resolve_target() {
+        let name: Vec<u16> = "renamed.txt".encode_utf16().collect();
+        let name_bytes_len = name.len() * 2;
+        let mut buf = vec![0u8; 20 + name_bytes_len];
+        buf[0] = 1; // ReplaceIfExists = TRUE
+        buf[8..16].copy_from_slice(&0u64.to_le_bytes());
+        buf[16..20].copy_from_slice(&(name_bytes_len as u32).to_le_bytes());
+        for (i, ch) in name.iter().enumerate() {
+            buf[20 + i * 2..22 + i * 2].copy_from_slice(&ch.to_le_bytes());
+        }
+        let (replace, root_dir, parsed) = parse_file_rename_info(&buf).expect("valid rename info");
+        assert!(replace);
+        assert_eq!(root_dir, 0);
+        assert_eq!(parsed, "renamed.txt");
+        assert_eq!(
+            resolve_rename_target_posix("/data/dir/old.txt", root_dir, &parsed),
+            "/data/dir/renamed.txt"
+        );
+    }
+
+    #[test]
+    fn encode_volume_size_and_attribute_info() {
+        let statfs = VfsStatFsWire {
+            f_type: 0x4d44, // MSDOS_SUPER_MAGIC
+            f_bsize: 4096,
+            f_blocks: 1024,
+            f_bfree: 512,
+            f_bavail: 500,
+            f_namelen: 255,
+            f_frsize: 4096,
+            ..Default::default()
+        };
+        let size_bytes = encode_file_fs_size_info(&statfs);
+        assert_eq!(u64::from_le_bytes(size_bytes[0..8].try_into().unwrap()), 1024);
+        assert_eq!(u64::from_le_bytes(size_bytes[8..16].try_into().unwrap()), 500);
+        assert_eq!(u32::from_le_bytes(size_bytes[16..20].try_into().unwrap()), 8);
+        assert_eq!(u32::from_le_bytes(size_bytes[20..24].try_into().unwrap()), 512);
+
+        let (attr_bytes, overflow) =
+            encode_file_fs_attribute_info(&statfs, 64).expect("attribute info");
+        assert!(!overflow);
+        assert_eq!(u32::from_le_bytes(attr_bytes[0..4].try_into().unwrap()), 6);
+        assert_eq!(i32::from_le_bytes(attr_bytes[4..8].try_into().unwrap()), 255);
+        assert_eq!(u32::from_le_bytes(attr_bytes[8..12].try_into().unwrap()), 10);
+        assert_eq!(attr_bytes.len(), 22);
+    }
+
+    #[test]
+    fn desired_access_wants_write_includes_generic_all() {
+        assert!(nt_desired_access_wants_write(0x1000_0000)); // GENERIC_ALL
+        assert!(nt_desired_access_wants_write(0x4000_0000)); // GENERIC_WRITE
+        assert!(nt_desired_access_wants_write(0x0000_0002)); // FILE_WRITE_DATA
+        assert!(nt_desired_access_wants_write(0x0000_0004)); // FILE_APPEND_DATA
+        assert!(nt_desired_access_wants_write(0x0001_0000)); // DELETE
+        assert!(!nt_desired_access_wants_write(0x8000_0000)); // GENERIC_READ
+        assert!(!nt_desired_access_wants_write(0x0000_0001)); // FILE_READ_DATA
+    }
 }

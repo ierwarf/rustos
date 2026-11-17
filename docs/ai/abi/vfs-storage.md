@@ -299,10 +299,44 @@ inode design deferred in the large-file plan; `content_identity` must stay a
 pure function of the path text until then so checkpoint replay stays valid.
 
 Executable publication uses the owner-bound asynchronous job and sealed memfd
-contract in [loader scheduling](loader-scheduling.md). VFS persistent writes and
-truncate remain EROFS. Writable object/checkpoint identity, durable mutation,
-shared buffered/mmap coherence and ext4/NTFS adapters are later phases, not
-claims made by the read-only accelerator.
+contract in [loader scheduling](loader-scheduling.md). Shared buffered/mmap
+coherence and ext4/NTFS adapters are later phases, not claims made by the
+read-only accelerator.
+
+### Filesystem-neutral volumes, `MountTable`, and writable FAT
+
+- `storage-core::fs` defines `FsVolume: Send + Sync` as the filesystem-neutral
+  `&self` volume trait, parameterized by `FsCapabilities` (`read_only`,
+  `case_policy: CasePolicy`, feature flags, `max_name_len`), `FsMetadata`,
+  `FsDirEntry`, `FsStatFs`, `FsOpenOptions`, and `FsError`. Optional operations
+  (`set_times`, `set_dos_attrs`, `symlink`, `readlink`) default to
+  `FsError::Unsupported`.
+- `VfsIpcRequest`/`VfsIpcResponse` adds `VFS_IPC_OP_PWRITE64` (28),
+  `VFS_IPC_OP_FSYNC` (29), `VFS_IPC_OP_RENAMEAT2` (30, two-path payload via
+  `encode_two_path_payload`), `VFS_IPC_OP_STATFS` (31, 120-byte little-endian
+  `VfsStatFsWire`), `VFS_IPC_OP_SYMLINKAT` (32, two-path payload), and
+  `VFS_IPC_OP_SET_ATTRS` (33).
+- `VfsFileIdentityWire` (`VFS_IPC_OP_FILE_IDENTITY`) distinguishes immutable
+  (`VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME`, bit 0) from mutable
+  (`VFS_FILE_IDENTITY_FLAG_MUTABLE_VOLUME`, bit 1) backing volumes; setting both
+  flags is non-canonical. Only `IMMUTABLE_VOLUME` files are cacheable in the
+  shared library cache; `MUTABLE_VOLUME` (or non-immutable) files report
+  `(mount_id, node_id, mount_generation, storage_epoch, mount_generation, len)`
+  and are never cached.
+- `vfsd::mount_table::MountTable` resolves absolute normalized paths by longest
+  mount-point prefix match and injects immediate submount names into directory
+  listings. `MountTable::mount_fat_disk` wraps the DVM block device in
+  `SharedBlockDevice` and inspects partitions via `detect_partitions`:
+  0 or 1 partition mounts `/` with `device_read_only`; 2+ partitions force
+  partition 0 read-only at `/` and mount partition 1 at `/data` with
+  `device_read_only` (so `/data` is writable when the DVM device is writable).
+- `vfsd` keys path caches (`metadata_cache`, `dir_entries_cache`,
+  `file_bytes_cache`, `read_maps`, `executable_snapshot_cache`) by
+  `CacheKey = (mount_id, case_normalized_rel_path)` (`CasePolicy` lowercases
+  ASCII/Unicode-insensitive mounts and preserves case for `Exact`). Every
+  filesystem mutation invalidates the target and parent `CacheKey` entries
+  (and matching subtree keys on directory/rename mutations); remounts clear all
+  caches via `invalidate_caches_if_remounted`.
 
 ## Storage Surface (`storaged`)
 
@@ -487,12 +521,18 @@ claims made by the read-only accelerator.
   Withdrawal after a successful observation is revoke, and timeout never
   selects early-system or a physical-controller fallback.
 - Vfsd treats the storaged block-info response and on-disk FAT image as
-  separate untrusted admissions. Response generation and capacity must bind
-  the exact envelope; logical sectors are one of 512, 1024, 2048, or 4096
-  bytes; physical alignment, flags, reserved fields, and total byte-length
-  multiplication are checked before allocation. `storage-fat` snapshots that
-  geometry and rejects a zero, unsupported, or overflowing device before
-  parsing its boot sector. A malformed image never publishes a mounted volume.
+  separate untrusted admissions. `admit_dvm_block_geometry_with_allowed_flags`
+  binds response generation and capacity to the exact envelope, admits only
+  `flags == 0` (RW) or `BLOCK_BROKER_INFO_FLAG_READ_ONLY` (RO) while rejecting
+  unknown flags and nonzero `reserved0`, requires logical sectors in
+  `{512, 1024, 2048, 4096}` (`<= max_block_size`), and checks physical
+  alignment and total byte-length multiplication before allocation.
+  `BootBlockDevice::write_blocks` rejects writes on a read-only device with
+  `StorageError::Unsupported`, and `flush` is a no-op on read-only devices
+  while issuing `COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_FLUSH` on writable ones.
+  `storage-fat` snapshots that geometry and rejects a zero, unsupported, or
+  overflowing device before parsing its boot sector. A malformed image never
+  publishes a mounted volume.
 - Common PCI resource discovery disables command decoding, probes and restores
   each standard BAR dword independently, and restores the low half of a 64-bit
   BAR before touching its high partner. Resource size is the least significant
@@ -642,7 +682,13 @@ claims made by the read-only accelerator.
 - A storaged write's declared logical-block count must checked-multiply to
   exactly the payload length and fit the admitted capacity before submission
   or read-cache invalidation. Payload length cannot silently redefine the
-  caller's requested write extent.
+  caller's requested write extent. On a read-only device
+  (`BLOCK_BROKER_INFO_FLAG_READ_ONLY`), `storaged` marks its descriptor
+  `STORAGE_FLAG_READONLY` and rejects `COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE`
+  (and `write_admitted_with`) with `EROFS` before invalidating `READ_CACHE` or
+  submitting a DVM ticket; on a writable device it clears `READ_CACHE` before
+  submission and supports `COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_FLUSH`
+  (`BLOCK_BROKER_OP_DVM_SUBMIT_FLUSH`).
 - Storaged invokes RustOS-private syscalls only through the raw
   `rustos-svc-runtime` entrypoints. A libc wrapper must not collapse raw
   negative results into `-1` plus TLS `errno`; transient `EAGAIN`, absence,

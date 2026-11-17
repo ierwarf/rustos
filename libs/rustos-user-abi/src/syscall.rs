@@ -776,6 +776,12 @@ pub const VFS_IPC_OP_FILE_IDENTITY: u16 = 26;
 /// `VfsFileIdentityWire` (all zero when the file is not on the immutable volume,
 /// `aux == 0`) followed by the bytes read; `value` is the file length.
 pub const VFS_IPC_OP_LIBRARY_READ: u16 = 27;
+pub const VFS_IPC_OP_PWRITE64: u16 = 28;
+pub const VFS_IPC_OP_FSYNC: u16 = 29;
+pub const VFS_IPC_OP_RENAMEAT2: u16 = 30;
+pub const VFS_IPC_OP_STATFS: u16 = 31;
+pub const VFS_IPC_OP_SYMLINKAT: u16 = 32;
+pub const VFS_IPC_OP_SET_ATTRS: u16 = 33;
 pub const VFS_LIBRARY_READ_MAX_BYTES: usize = 8 * 4096;
 pub const VFS_CURSOR_SETTLE_COMMIT: u64 = 1;
 pub const VFS_CURSOR_SETTLE_CANCEL: u64 = 2;
@@ -2456,6 +2462,131 @@ impl Default for VfsIpcResponse {
     }
 }
 
+/// Fixed-width little-endian `statfs` wire payload carried by `VFS_IPC_OP_STATFS`,
+/// matching x86_64 Linux `struct statfs` (`120` bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VfsStatFsWire {
+    pub f_type: i64,
+    pub f_bsize: i64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: i64,
+    pub f_frsize: i64,
+    pub f_flags: i64,
+    pub f_spare: [i64; 4],
+}
+
+impl VfsStatFsWire {
+    pub const WIRE_BYTES: usize = 120;
+
+    pub fn to_bytes(self) -> [u8; Self::WIRE_BYTES] {
+        let mut out = [0_u8; Self::WIRE_BYTES];
+        out[0..8].copy_from_slice(&self.f_type.to_le_bytes());
+        out[8..16].copy_from_slice(&self.f_bsize.to_le_bytes());
+        out[16..24].copy_from_slice(&self.f_blocks.to_le_bytes());
+        out[24..32].copy_from_slice(&self.f_bfree.to_le_bytes());
+        out[32..40].copy_from_slice(&self.f_bavail.to_le_bytes());
+        out[40..48].copy_from_slice(&self.f_files.to_le_bytes());
+        out[48..56].copy_from_slice(&self.f_ffree.to_le_bytes());
+        out[56..60].copy_from_slice(&self.f_fsid[0].to_le_bytes());
+        out[60..64].copy_from_slice(&self.f_fsid[1].to_le_bytes());
+        out[64..72].copy_from_slice(&self.f_namelen.to_le_bytes());
+        out[72..80].copy_from_slice(&self.f_frsize.to_le_bytes());
+        out[80..88].copy_from_slice(&self.f_flags.to_le_bytes());
+        for (i, spare) in self.f_spare.iter().enumerate() {
+            let start = 88 + i * 8;
+            out[start..start + 8].copy_from_slice(&spare.to_le_bytes());
+        }
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::WIRE_BYTES {
+            return None;
+        }
+        let i64_at = |offset: usize| -> i64 {
+            let mut buf = [0_u8; 8];
+            buf.copy_from_slice(&bytes[offset..offset + 8]);
+            i64::from_le_bytes(buf)
+        };
+        let u64_at = |offset: usize| -> u64 {
+            let mut buf = [0_u8; 8];
+            buf.copy_from_slice(&bytes[offset..offset + 8]);
+            u64::from_le_bytes(buf)
+        };
+        let i32_at = |offset: usize| -> i32 {
+            let mut buf = [0_u8; 4];
+            buf.copy_from_slice(&bytes[offset..offset + 4]);
+            i32::from_le_bytes(buf)
+        };
+        Some(Self {
+            f_type: i64_at(0),
+            f_bsize: i64_at(8),
+            f_blocks: u64_at(16),
+            f_bfree: u64_at(24),
+            f_bavail: u64_at(32),
+            f_files: u64_at(40),
+            f_ffree: u64_at(48),
+            f_fsid: [i32_at(56), i32_at(60)],
+            f_namelen: i64_at(64),
+            f_frsize: i64_at(72),
+            f_flags: i64_at(80),
+            f_spare: [i64_at(88), i64_at(96), i64_at(104), i64_at(112)],
+        })
+    }
+}
+
+/// Encodes two VFS paths (`u16 first_len` LE, `u16 second_len` LE, `first`, `second`)
+/// into a `VfsIpcRequest` payload buffer for two-path operations such as
+/// `VFS_IPC_OP_RENAMEAT2` and `VFS_IPC_OP_SYMLINKAT`.
+///
+/// Returns the encoded byte length (`<= VFS_IPC_REQUEST_PAYLOAD_CAPACITY`), or
+/// `None` if either path exceeds `VFS_IPC_PATH_CAPACITY` or the combined payload
+/// exceeds `VFS_IPC_REQUEST_PAYLOAD_CAPACITY` or `out.len()`.
+pub fn encode_two_path_payload(first: &[u8], second: &[u8], out: &mut [u8]) -> Option<usize> {
+    if first.len() > VFS_IPC_PATH_CAPACITY || second.len() > VFS_IPC_PATH_CAPACITY {
+        return None;
+    }
+    let first_len = u16::try_from(first.len()).ok()?;
+    let second_len = u16::try_from(second.len()).ok()?;
+    let total = 4usize.checked_add(first.len())?.checked_add(second.len())?;
+    if total > VFS_IPC_REQUEST_PAYLOAD_CAPACITY || total > out.len() {
+        return None;
+    }
+    out[0..2].copy_from_slice(&first_len.to_le_bytes());
+    out[2..4].copy_from_slice(&second_len.to_le_bytes());
+    let mid = 4 + first.len();
+    out[4..mid].copy_from_slice(first);
+    out[mid..total].copy_from_slice(second);
+    Some(total)
+}
+
+/// Decodes a two-path payload produced by [`encode_two_path_payload`].
+///
+/// Requires `payload.len() <= VFS_IPC_REQUEST_PAYLOAD_CAPACITY`, both lengths
+/// `<= VFS_IPC_PATH_CAPACITY`, and `4 + first_len + second_len == payload.len()`.
+pub fn decode_two_path_payload(payload: &[u8]) -> Option<(&[u8], &[u8])> {
+    if payload.len() < 4 || payload.len() > VFS_IPC_REQUEST_PAYLOAD_CAPACITY {
+        return None;
+    }
+    let first_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    let second_len = u16::from_le_bytes([payload[2], payload[3]]) as usize;
+    if first_len > VFS_IPC_PATH_CAPACITY || second_len > VFS_IPC_PATH_CAPACITY {
+        return None;
+    }
+    let total = 4usize.checked_add(first_len)?.checked_add(second_len)?;
+    if total != payload.len() {
+        return None;
+    }
+    let mid = 4 + first_len;
+    Some((&payload[4..mid], &payload[mid..]))
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RustosDeviceIoctlBrokerArgs {
@@ -4008,3 +4139,4 @@ crate::user_wire!(RustosMmFdBrokerResult { kind: u16, reserved0: u16, path_len: 
 crate::user_wire!(RustosMmMapBrokerResult { addr: u64, len: u64 });
 crate::user_wire!(RustosMmConflictBrokerResult { start: u64, end: u64 });
 crate::user_wire!(InputDvmRecordWire { transport_generation: u64, flags: u32, len: u16, reserved0: u16, bytes: [u8; INPUTD_DVM_RECORD_BYTES] });
+crate::user_wire!(VfsStatFsWire { f_type: i64, f_bsize: i64, f_blocks: u64, f_bfree: u64, f_bavail: u64, f_files: u64, f_ffree: u64, f_fsid: [i32; 2], f_namelen: i64, f_frsize: i64, f_flags: i64, f_spare: [i64; 4] });

@@ -10,6 +10,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
+mod fs_volume;
 mod read_map;
 pub use read_map::{FatReadView, FatReadSource};
 use alloc::vec;
@@ -367,10 +368,12 @@ type InnerDir<'a, D> =
     fatfs::Dir<'a, FatDisk<D>, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>;
 
 pub struct FatVolume<D: BlockDevice> {
-    fs: FatFs<D>,
+    fs: Mutex<FatFs<D>>,
     /// Size of the underlying device in bytes; no valid file can be larger.
     device_bytes: u64,
     device: Arc<DeviceCell<D>>,
+    wait: fn(),
+    read_only: bool,
 }
 
 pub struct FatFile<'a, D: BlockDevice>(InnerFile<'a, D>);
@@ -383,15 +386,61 @@ impl<D: BlockDevice> FatVolume<D> {
     /// `wait` must allow a blocked device holder to run and must not re-enter
     /// this filesystem. Blocking Ring3 devices should sleep/park, not spin.
     pub fn new_with_wait(device: D, wait: fn()) -> Result<Self, FatError> {
+        Self::new_with_wait_and_mode(device, wait, false)
+    }
+
+    pub fn new_with_wait_and_mode(
+        device: D,
+        wait: fn(),
+        read_only: bool,
+    ) -> Result<Self, FatError> {
         let disk = FatDisk::new_with_wait(device, wait).map_err(fatfs::Error::Io)?;
-        Self::from_disk(disk)
+        Self::from_disk(disk).map(|vol| vol.with_read_only(read_only))
     }
 
     pub fn from_disk(disk: FatDisk<D>) -> Result<Self, FatError> {
         let device_bytes = disk.bytes_len();
         let device = disk.dev.clone();
+        let wait = device.wait;
         let fs = fatfs::FileSystem::new(disk, fatfs::FsOptions::new())?;
-        Ok(Self { fs, device_bytes, device })
+        Ok(Self {
+            fs: Mutex::new(fs),
+            device_bytes,
+            device,
+            wait,
+            read_only: false,
+        })
+    }
+
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    fn lock_fs(&self) -> spin::MutexGuard<'_, FatFs<D>> {
+        loop {
+            if let Some(guard) = self.fs.try_lock() {
+                return guard;
+            }
+            (self.wait)();
+        }
+    }
+
+    fn bump_version(&self) -> Result<(), storage_core::FsError> {
+        let mut dev = self.device.lock();
+        dev.version = dev
+            .version
+            .checked_add(1)
+            .ok_or(storage_core::FsError::Io(StorageError::InvalidInput))?;
+        Ok(())
     }
 
     pub fn from_partition(
@@ -407,15 +456,25 @@ impl<D: BlockDevice> FatVolume<D> {
         self.device_bytes / 32 + 1
     }
 
-    pub fn open_file(&self, path: &str) -> Result<FatFile<'_, D>, FatError> {
+    pub fn open_file(&mut self, path: &str) -> Result<FatFile<'_, D>, FatError> {
         let normalized = normalize_fat_path_cow(path);
         self.fs
+            .get_mut()
             .root_dir()
             .open_file(normalized.as_ref())
             .map(FatFile)
     }
 
-    pub fn open_file_with_len(&self, path: &str) -> Result<(FatFile<'_, D>, u64), FatError> {
+    pub fn open_file_with_len(&mut self, path: &str) -> Result<(FatFile<'_, D>, u64), FatError> {
+        let limit = self.max_dir_entries();
+        Self::open_file_with_len_in(self.fs.get_mut(), limit, path)
+    }
+
+    pub(crate) fn open_file_with_len_in<'a>(
+        fs: &'a FatFs<D>,
+        limit: u64,
+        path: &str,
+    ) -> Result<(FatFile<'a, D>, u64), FatError> {
         let normalized = normalize_fat_path_cow(path);
         let mut components = normalized
             .split('/')
@@ -424,12 +483,12 @@ impl<D: BlockDevice> FatVolume<D> {
             return Err(fatfs::Error::InvalidInput);
         };
 
-        let mut dir = self.fs.root_dir();
+        let mut dir = fs.root_dir();
         let mut component = first;
         loop {
             let next = components.next();
             let want_dir = next.is_some();
-            let entry = find_entry_case_insensitive(&dir, component, self.max_dir_entries())?;
+            let entry = find_entry_case_insensitive(&dir, component, limit)?;
             if want_dir {
                 if !entry.is_dir() {
                     return Err(fatfs::Error::InvalidInput);
@@ -447,9 +506,10 @@ impl<D: BlockDevice> FatVolume<D> {
         }
     }
 
-    pub fn create_file(&self, path: &str) -> Result<FatFile<'_, D>, FatError> {
+    pub fn create_file(&mut self, path: &str) -> Result<FatFile<'_, D>, FatError> {
         let normalized = normalize_fat_path_cow(path);
         self.fs
+            .get_mut()
             .root_dir()
             .create_file(normalized.as_ref())
             .map(FatFile)
@@ -465,7 +525,8 @@ impl<D: BlockDevice> FatVolume<D> {
         }
         let (parent, child) =
             split_parent_child(normalized.as_ref()).ok_or(fatfs::Error::InvalidInput)?;
-        let dir = self.open_dir_by_path(parent)?;
+        let fs = self.lock_fs();
+        let dir = Self::open_dir_by_path_in(&fs, parent)?;
         let limit = self.max_dir_entries();
         for (seen, entry_result) in dir.iter().enumerate() {
             check_dir_walk(seen, limit)?;
@@ -496,7 +557,8 @@ impl<D: BlockDevice> FatVolume<D> {
     pub fn canonical_path(&self, path: &str) -> Result<String, FatError> {
         let normalized = normalize_fat_path_cow(path);
         let mut canonical = String::with_capacity(normalized.len());
-        let mut dir = self.fs.root_dir();
+        let fs = self.lock_fs();
+        let mut dir = fs.root_dir();
         let mut components = normalized.split('/').filter(|c| !c.is_empty()).peekable();
         while let Some(component) = components.next() {
             let entry = find_entry_case_insensitive(&dir, component, self.max_dir_entries())?;
@@ -516,7 +578,8 @@ impl<D: BlockDevice> FatVolume<D> {
 
     pub fn read_dir(&self, path: &str) -> Result<Vec<FatDirEntry>, FatError> {
         let normalized = normalize_fat_path_cow(path);
-        let dir = self.open_dir_by_path(normalized.as_ref())?;
+        let fs = self.lock_fs();
+        let dir = Self::open_dir_by_path_in(&fs, normalized.as_ref())?;
 
         let mut entries = Vec::new();
         let limit = self.max_dir_entries();
@@ -545,13 +608,14 @@ impl<D: BlockDevice> FatVolume<D> {
 
     pub fn create_dir(&self, path: &str) -> Result<(), FatError> {
         let normalized = normalize_fat_path_cow(path);
-        self.fs.root_dir().create_dir(normalized.as_ref())?;
+        self.lock_fs().root_dir().create_dir(normalized.as_ref())?;
         Ok(())
     }
 
     pub fn remove_file(&self, path: &str) -> Result<(), FatError> {
         let normalized = normalize_fat_path_cow(path);
-        let root = self.fs.root_dir();
+        let fs = self.lock_fs();
+        let root = fs.root_dir();
         let entry = root.open_file(normalized.as_ref())?;
         drop(entry);
         root.remove(normalized.as_ref())
@@ -559,7 +623,8 @@ impl<D: BlockDevice> FatVolume<D> {
 
     pub fn remove_dir(&self, path: &str) -> Result<(), FatError> {
         let normalized = normalize_fat_path_cow(path);
-        let root = self.fs.root_dir();
+        let fs = self.lock_fs();
+        let root = fs.root_dir();
         let dir = root.open_dir(normalized.as_ref())?;
         drop(dir);
         root.remove(normalized.as_ref())
@@ -570,7 +635,8 @@ impl<D: BlockDevice> FatVolume<D> {
         let dst = normalize_fat_path_cow(dst);
         let (dst_parent, dst_name) =
             split_parent_child(dst.as_ref()).ok_or(fatfs::Error::InvalidInput)?;
-        let root = self.fs.root_dir();
+        let fs = self.lock_fs();
+        let root = fs.root_dir();
         let dst_dir = if dst_parent.is_empty() {
             root.clone()
         } else {
@@ -580,7 +646,8 @@ impl<D: BlockDevice> FatVolume<D> {
     }
 
     pub fn read_file_to_vec(&self, path: &str) -> Result<Vec<u8>, FatError> {
-        let (mut file, len) = self.open_file_with_len(path)?;
+        let fs = self.lock_fs();
+        let (mut file, len) = Self::open_file_with_len_in(&fs, self.max_dir_entries(), path)?;
         // The directory-entry size is untrusted (up to 4 GiB); a file cannot
         // exceed the device, so refuse before allocating.
         if len > self.device_bytes {
@@ -607,7 +674,9 @@ impl<D: BlockDevice> FatVolume<D> {
     }
 
     pub fn read_file_into(&self, path: &str, dest: &mut [u8]) -> Result<usize, FatError> {
-        let mut file = self.open_file(path)?;
+        let normalized = normalize_fat_path_cow(path);
+        let fs = self.lock_fs();
+        let mut file = fs.root_dir().open_file(normalized.as_ref())?;
         let mut done = 0usize;
         while done < dest.len() {
             let chunk_len = (dest.len() - done).min(FILE_READ_CHUNK_CAP);
@@ -626,7 +695,9 @@ impl<D: BlockDevice> FatVolume<D> {
         offset: u64,
         dest: &mut [u8],
     ) -> Result<usize, FatError> {
-        let mut file = self.open_file(path)?;
+        let normalized = normalize_fat_path_cow(path);
+        let fs = self.lock_fs();
+        let mut file = fs.root_dir().open_file(normalized.as_ref())?;
         file.seek(SeekFrom::Start(offset))?;
         let mut done = 0usize;
         while done < dest.len() {
@@ -641,14 +712,17 @@ impl<D: BlockDevice> FatVolume<D> {
     }
 
     pub fn unmount(self) -> Result<(), FatError> {
-        self.fs.unmount()
+        self.fs.into_inner().unmount()
     }
 
-    fn open_dir_by_path(&self, normalized_path: &str) -> Result<InnerDir<'_, D>, FatError> {
+    fn open_dir_by_path_in<'a>(
+        fs: &'a FatFs<D>,
+        normalized_path: &str,
+    ) -> Result<InnerDir<'a, D>, FatError> {
         if normalized_path.is_empty() {
-            Ok(self.fs.root_dir())
+            Ok(fs.root_dir())
         } else {
-            self.fs.root_dir().open_dir(normalized_path)
+            fs.root_dir().open_dir(normalized_path)
         }
     }
 }
@@ -935,7 +1009,7 @@ mod tests {
     #[test]
     fn case_variants_and_short_aliases_resolve_to_one_canonical_path() {
         let disk = format_disk(512, 4096, 0x0A0B_0C0D);
-        let volume = FatVolume::new(disk).expect("open FAT volume");
+        let mut volume = FatVolume::new(disk).expect("open FAT volume");
         volume.create_dir("Program Files").expect("create dir");
         {
             let mut file = volume
@@ -986,7 +1060,7 @@ mod tests {
     #[test]
     fn write_truncate_append_persists_after_reopen() {
         let disk = format_disk(512, 4096, 0x1234_5678);
-        let volume = FatVolume::new(disk).expect("open FAT volume");
+        let mut volume = FatVolume::new(disk).expect("open FAT volume");
         volume.create_dir("logs").expect("create logs dir");
         {
             let mut file = volume
@@ -1011,7 +1085,7 @@ mod tests {
     #[test]
     fn create_dir_rename_remove_round_trip() {
         let disk = format_disk(512, 4096, 0x0102_0304);
-        let volume = FatVolume::new(disk).expect("open FAT volume");
+        let mut volume = FatVolume::new(disk).expect("open FAT volume");
         volume.create_dir("configs").expect("create configs dir");
         {
             let mut file = volume
@@ -1036,7 +1110,7 @@ mod tests {
     #[test]
     fn rename_between_directories_preserves_long_filenames() {
         let disk = format_disk(512, 4096, 0x0ace_feed);
-        let volume = FatVolume::new(disk).expect("open FAT volume");
+        let mut volume = FatVolume::new(disk).expect("open FAT volume");
         volume
             .create_dir("/configs")
             .expect("create configs directory");
@@ -1073,7 +1147,7 @@ mod tests {
     #[test]
     fn remove_dir_rejects_non_empty_directory() {
         let disk = format_disk(512, 4096, 0x4444_5555);
-        let volume = FatVolume::new(disk).expect("open FAT volume");
+        let mut volume = FatVolume::new(disk).expect("open FAT volume");
         volume.create_dir("logs").expect("create logs");
         {
             let mut file = volume.create_file("logs/boot.txt").expect("create file");
@@ -1092,7 +1166,7 @@ mod tests {
     #[test]
     fn supports_4k_block_devices() {
         let disk = format_disk(4096, 1024, 0x0bad_cafe);
-        let volume = FatVolume::new(disk).expect("open FAT volume");
+        let mut volume = FatVolume::new(disk).expect("open FAT volume");
         {
             let mut file = volume
                 .create_file("nucleus.elf")
@@ -1110,7 +1184,7 @@ mod tests {
     #[test]
     fn read_file_to_vec_reads_entire_large_file() {
         let disk = format_disk(512, 16384, 0xfeed_beef);
-        let volume = FatVolume::new(disk).expect("open FAT volume");
+        let mut volume = FatVolume::new(disk).expect("open FAT volume");
         let expected = vec![0x5a; 128 * 1024];
         {
             let mut file = volume.create_file("system.bin").expect("create file");
@@ -1134,7 +1208,7 @@ mod tests {
     #[test]
     fn read_file_into_reads_entire_large_file() {
         let disk = format_disk(512, 16384, 0xfeed_beee);
-        let volume = FatVolume::new(disk).expect("open FAT volume");
+        let mut volume = FatVolume::new(disk).expect("open FAT volume");
         let expected = vec![0xa5; 128 * 1024 + 17];
         {
             let mut file = volume.create_file("kernel.bin").expect("create file");
@@ -1160,7 +1234,7 @@ mod tests {
     #[test]
     fn read_file_range_into_reads_middle_window() {
         let disk = format_disk(512, 16384, 0xfeed_beee);
-        let volume = FatVolume::new(disk).expect("open FAT volume");
+        let mut volume = FatVolume::new(disk).expect("open FAT volume");
         let expected = (0..(192 * 1024))
             .map(|i| (i % 251) as u8)
             .collect::<Vec<_>>();
@@ -1187,7 +1261,7 @@ mod tests {
     #[test]
     fn metadata_reads_file_length_from_directory_entry() {
         let disk = format_disk(512, 4096, 0x1234_abcd);
-        let volume = FatVolume::new(disk).expect("open FAT volume");
+        let mut volume = FatVolume::new(disk).expect("open FAT volume");
         volume.create_dir("services").expect("create services dir");
         {
             let mut file = volume
@@ -1228,7 +1302,7 @@ mod tests {
     #[test]
     fn open_file_reads_nested_path_via_directory_entries() {
         let disk = format_disk(512, 4096, 0x1234_dcba);
-        let volume = FatVolume::new(disk).expect("open FAT volume");
+        let mut volume = FatVolume::new(disk).expect("open FAT volume");
         volume.create_dir("services").expect("create services dir");
         {
             let mut file = volume
@@ -1253,7 +1327,7 @@ mod tests {
     #[test]
     fn repeated_reopen_and_seek_on_nested_file_succeeds() {
         let disk = format_disk(512, 16384, 0x5566_7788);
-        let volume = FatVolume::new(disk).expect("open FAT volume");
+        let mut volume = FatVolume::new(disk).expect("open FAT volume");
         volume.create_dir("services").expect("create services dir");
         volume
             .create_dir("services/initd")

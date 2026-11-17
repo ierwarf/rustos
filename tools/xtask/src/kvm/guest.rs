@@ -373,13 +373,15 @@ fn spawn_dvm_guest(
     }
     if let Some(doorbell) = layout.dvm_block_doorbell.as_deref() {
         append_dvm_block_doorbell(&mut dvm_command, doorbell);
-        append_dvm_virtual_storage(
-            &mut dvm_command,
-            layout
-                .dvm_block_disk
-                .as_deref()
-                .context("DVM block aperture exists without a private backing disk")?,
-        );
+        let disk = layout
+            .dvm_block_disk
+            .as_deref()
+            .context("DVM block aperture exists without a private backing disk")?;
+        if layout.writable_storage {
+            append_dvm_writable_virtual_storage(&mut dvm_command, disk);
+        } else {
+            append_dvm_virtual_storage(&mut dvm_command, disk);
+        }
     }
     dvm_command
         .spawn()
@@ -459,6 +461,17 @@ fn append_dvm_display_pixels(command: &mut Command, path: &Path, read_only: bool
         .arg(format!(
             "virtio-pmem-pci,id=dvm-display-pmem,memdev=dvm-display-pixels,memaddr={DVM_DISPLAY_PIXEL_PHYS_ADDR}"
         ));
+}
+
+fn append_dvm_writable_virtual_storage(command: &mut Command, disk: &Path) {
+    command
+        .arg("-drive")
+        .arg(format!(
+            "file={},format=raw,if=none,id=dvm-storage-disk,cache=none,aio=threads",
+            disk.display()
+        ))
+        .arg("-device")
+        .arg("ide-hd,drive=dvm-storage-disk,bus=ide.0,unit=0,id=dvm-storage-disk-device");
 }
 
 /// Both guests need write access; only the first QEMU preallocates the backing.

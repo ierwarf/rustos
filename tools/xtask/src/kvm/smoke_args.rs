@@ -29,6 +29,7 @@ struct SmokeOptions {
     gui_dvm_surfaces: bool,
     dvm_network_shmem: bool,
     dvm_block_shmem: bool,
+    writable_storage: bool,
     rustos_vcpus: u8,
     smp_iteration: bool,
     /// Keep both guests up this many seconds after readiness was accepted
@@ -137,6 +138,7 @@ where
         gui_dvm_surfaces: false,
         dvm_network_shmem: false,
         dvm_block_shmem: false,
+        writable_storage: false,
         rustos_vcpus: DEFAULT_RUSTOS_VCPUS,
         smp_iteration: false,
         hold_seconds: None,
@@ -202,6 +204,7 @@ where
             "--gui-dvm-surfaces" => options.gui_dvm_surfaces = true,
             "--dvm-network-shmem" => options.dvm_network_shmem = true,
             "--dvm-block-shmem" => options.dvm_block_shmem = true,
+            "--writable-storage" => options.writable_storage = true,
             "--rustos-vcpus" => {
                 options.rustos_vcpus = parse_rustos_vcpus(next_value(&mut args, "--rustos-vcpus")?)?
             }
@@ -573,6 +576,14 @@ where
     }
     if options.expect_block_flush_fault && !options.storage_only {
         bail!("--storage-dvm-expect-flush-fault requires --storage-dvm-only");
+    }
+    if options.writable_storage {
+        if !options.dvm_block_shmem {
+            bail!("--writable-storage requires --dvm-block-shmem or --storage-dvm-only");
+        }
+        if options.smp_ring3_qualification || options.recovery_probe != RecoveryProbe::None || options.expect_block_flush_fault {
+            bail!("--writable-storage cannot be combined with qualification, recovery, or flush-fault modes");
+        }
     }
     if options.recovery_probe != RecoveryProbe::None
         && (options.storage_only || options.expect_block_flush_fault)

@@ -85,6 +85,7 @@ struct KvmLayout {
     dvm_block_aperture: Option<PathBuf>,
     dvm_block_doorbell: Option<PathBuf>,
     dvm_block_disk: Option<PathBuf>,
+    writable_storage: bool,
 }
 
 #[derive(Debug)]
@@ -738,6 +739,7 @@ pub(crate) fn kvm_run_command(
         gui_dvm_surfaces: true,
         dvm_network_shmem: true,
         dvm_block_shmem: true,
+        writable_storage: false,
         rustos_vcpus,
         // Interactive SMP uses the same exact-tree bounded evidence profile as
         // the topology smoke run. It is observation, not a release/FPS claim.

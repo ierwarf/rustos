@@ -23,9 +23,38 @@ pub(super) fn dispatch(frame: &mut SyscallFrame) -> Option<u64> {
         linux_abi::SYS_PWRITEV2 => syscall_linux_vfs_pwritev2(
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         ),
-        linux_abi::SYS_FSYNC | linux_abi::SYS_FDATASYNC => syscall_linux_vfs_fsync(frame.rdi),
+        linux_abi::SYS_FSYNC => syscall_linux_vfs_fsync_mode(frame.rdi, false),
+        linux_abi::SYS_FDATASYNC => syscall_linux_vfs_fsync_mode(frame.rdi, true),
         linux_abi::SYS_SYNC => syscall_linux_vfs_sync(),
         linux_abi::SYS_SYNCFS => syscall_linux_vfs_syncfs(frame.rdi),
+        linux_abi::SYS_TRUNCATE => syscall_linux_vfs_truncate(frame.rdi, frame.rsi),
+        linux_abi::SYS_MKDIRAT => syscall_linux_vfs_mkdir(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_RMDIR => syscall_linux_vfs_unlinkat(
+            linux_abi::AT_FDCWD as u64,
+            frame.rdi,
+            linux_abi::AT_REMOVEDIR as u64,
+        ),
+        linux_abi::SYS_RENAME => syscall_linux_vfs_renameat2(
+            linux_abi::AT_FDCWD as u64,
+            frame.rdi,
+            linux_abi::AT_FDCWD as u64,
+            frame.rsi,
+            0,
+        ),
+        linux_abi::SYS_RENAMEAT => {
+            syscall_linux_vfs_renameat2(frame.rdi, frame.rsi, frame.rdx, frame.r10, 0)
+        }
+        linux_abi::SYS_RENAMEAT2 => {
+            syscall_linux_vfs_renameat2(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+        }
+        linux_abi::SYS_SYMLINK => {
+            syscall_linux_vfs_symlinkat(frame.rdi, linux_abi::AT_FDCWD as u64, frame.rsi)
+        }
+        linux_abi::SYS_SYMLINKAT => {
+            syscall_linux_vfs_symlinkat(frame.rdi, frame.rsi, frame.rdx)
+        }
+        linux_abi::SYS_STATFS => syscall_linux_vfs_statfs(frame.rdi, frame.rsi),
+        linux_abi::SYS_FSTATFS => syscall_linux_vfs_fstatfs(frame.rdi, frame.rsi),
         linux_abi::SYS_FADVISE64 => {
             syscall_linux_vfs_fadvise64(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }

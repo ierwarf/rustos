@@ -103,3 +103,64 @@ pub(super) fn dvm_block_recovery_readiness_tracks_the_exact_successor_generation
     header.flags &= !DVM_BLOCK_FLAG_READ_ONLY;
     assert!(!dvm_block_header_matches_ready_generation(header, 2));
 }
+
+#[test]
+pub(super) fn dvm_writable_block_header_omits_read_only_and_sets_flush_fua() {
+    use driver_domain_protocol::DVM_BLOCK_FEATURE_FUA;
+
+    let header = super::super::dvm_writable_block_header(1, 8192, 512, 4096, 0);
+    assert_eq!(header.generation, 1);
+    assert_eq!(header.capacity_sectors, 8192);
+    assert_eq!(header.logical_block_size, 512);
+    assert_eq!(header.physical_block_size, 4096);
+    assert_eq!(header.flags & DVM_BLOCK_FLAG_READ_ONLY, 0);
+    assert_eq!(
+        header.flags & (DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY),
+        0
+    );
+    assert_eq!(
+        header.features & (DVM_BLOCK_FEATURE_FLUSH | DVM_BLOCK_FEATURE_FUA),
+        DVM_BLOCK_FEATURE_FLUSH | DVM_BLOCK_FEATURE_FUA
+    );
+    assert!(header.with_epoch_signature([1; 64]).is_valid());
+}
+
+#[test]
+pub(super) fn create_writable_dvm_block_aperture_signs_512_writable_header() {
+    use driver_domain_protocol::{
+        DVM_BLOCK_FEATURE_FUA, DVM_BLOCK_HEADER_RECORD_BYTES, DvmBlockHeader,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let key_path = temp.path().join("epoch.key");
+    crate::storage_epoch::load_or_create_signing_key(&key_path).unwrap();
+
+    let unaligned = temp.path().join("unaligned.img");
+    fs::write(&unaligned, [0_u8; 513]).unwrap();
+    let aperture = temp.path().join("aperture.bin");
+    assert!(super::super::create_writable_dvm_block_aperture(
+        &aperture,
+        &unaligned,
+        &key_path
+    )
+    .is_err());
+
+    let disk = temp.path().join("rw-disk.img");
+    fs::write(&disk, vec![0_u8; 4096]).unwrap();
+    super::super::create_writable_dvm_block_aperture(&aperture, &disk, &key_path).unwrap();
+
+    let bytes = fs::read(&aperture).unwrap();
+    let header_bytes: &[u8; DVM_BLOCK_HEADER_RECORD_BYTES] =
+        bytes[..DVM_BLOCK_HEADER_RECORD_BYTES].try_into().unwrap();
+    let header = DvmBlockHeader::decode(header_bytes).unwrap();
+    assert!(header.is_valid());
+    assert_eq!(header.generation, 1);
+    assert_eq!(header.capacity_sectors, 8);
+    assert_eq!(header.logical_block_size, 512);
+    assert_eq!(header.physical_block_size, 512);
+    assert_eq!(header.flags & DVM_BLOCK_FLAG_READ_ONLY, 0);
+    assert_eq!(
+        header.features & (DVM_BLOCK_FEATURE_FLUSH | DVM_BLOCK_FEATURE_FUA),
+        DVM_BLOCK_FEATURE_FLUSH | DVM_BLOCK_FEATURE_FUA
+    );
+}

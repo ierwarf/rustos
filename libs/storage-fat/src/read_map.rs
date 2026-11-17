@@ -45,7 +45,9 @@ impl<D: BlockDevice> FatVolume<D> {
             let dev = self.device.lock();
             (dev.identity, dev.version)
         };
-        let (mut file, len) = self.open_file_with_len(path).map_err(range_error)?;
+        let fs = self.lock_fs();
+        let (mut file, len) =
+            Self::open_file_with_len_in(&fs, self.max_dir_entries(), path).map_err(range_error)?;
         let object = file.0.directory_entry_offset().and_then(|offset| offset.checked_add(1))
             .ok_or(RangeError::Invalid)?;
         if len > self.device_bytes || len > self.read_capabilities().max_file_bytes {
@@ -145,7 +147,7 @@ mod tests {
     #[test]
     fn owned_map_reads_large_file_without_rewalking_fat_and_rejects_mutation() {
         let disk = format_disk(512, 32768, 41);
-        let volume = FatVolume::new(CountingBlockDevice { inner: disk, reads: 0 }).unwrap();
+        let mut volume = FatVolume::new(CountingBlockDevice { inner: disk, reads: 0 }).unwrap();
         let bytes = alloc::vec![0x43; 2 * 1024 * 1024 + 73];
         {
             let mut file = volume.create_file("large.bin").unwrap();
@@ -179,7 +181,7 @@ mod tests {
 
     #[test]
     fn detached_source_survives_namespace_drop_and_observes_write_revocation() {
-        let volume = FatVolume::new(format_disk(512, 32768, 15)).unwrap();
+        let mut volume = FatVolume::new(format_disk(512, 32768, 15)).unwrap();
         { let mut file = volume.create_file("a").unwrap(); file.write(b"abcd").unwrap(); file.flush().unwrap(); }
         let map = Arc::new(volume.plan_read("a", 4096).unwrap());
         let mut source = volume.read_source(map.clone()).unwrap();
@@ -204,7 +206,7 @@ mod tests {
 
     #[test]
     fn file_identity_is_stable_across_plans_and_case_aliases_but_not_mutation() {
-        let volume = FatVolume::new(format_disk(512, 32768, 51)).unwrap();
+        let mut volume = FatVolume::new(format_disk(512, 32768, 51)).unwrap();
         { let mut file = volume.create_file("a.bin").unwrap(); file.write(b"a").unwrap(); file.flush().unwrap(); }
         let a = volume.plan_read("a.bin", 4096).unwrap().identity();
         assert_eq!(a, volume.plan_read("A.BIN", 4096).unwrap().identity());
@@ -218,18 +220,24 @@ mod tests {
 
     #[test]
     fn fragmented_files_keep_range_reads_linear_and_map_memory_bounded() {
-        let volume = FatVolume::new(format_disk(512, 32768, 23)).unwrap();
-        let cluster = volume.fs.cluster_size() as usize;
-        let mut a = volume.create_file("a").unwrap();
-        let mut b = volume.create_file("b").unwrap();
+        let mut volume = FatVolume::new(format_disk(512, 32768, 23)).unwrap();
+        let cluster = volume.lock_fs().cluster_size() as usize;
+        volume.create_file("a").unwrap();
+        volume.create_file("b").unwrap();
         let data = alloc::vec![0x7b; cluster];
         for _ in 0..48 {
+            let mut a = volume.open_file("a").unwrap();
+            a.seek(SeekFrom::End(0)).unwrap();
             let mut done = 0;
             while done < data.len() { done += a.write(&data[done..]).unwrap(); }
+            a.flush().unwrap();
+            drop(a);
+            let mut b = volume.open_file("b").unwrap();
+            b.seek(SeekFrom::End(0)).unwrap();
             let mut done = 0;
             while done < data.len() { done += b.write(&data[done..]).unwrap(); }
+            b.flush().unwrap();
         }
-        a.flush().unwrap(); b.flush().unwrap(); drop(a); drop(b);
         assert!(matches!(volume.plan_read("a", 48), Err(RangeError::Budget)));
         let map = volume.plan_read("a", 8192).unwrap();
         assert!(map.range_count() > 1);
@@ -245,8 +253,8 @@ mod tests {
     }
 
     fn damaged_image(reserved_cluster: bool) -> storage_core::MemBlockDevice {
-        let volume = FatVolume::new(format_disk(512, 32768, 31)).unwrap();
-        let cluster_bytes = volume.fs.cluster_size() as usize;
+        let mut volume = FatVolume::new(format_disk(512, 32768, 31)).unwrap();
+        let cluster_bytes = volume.lock_fs().cluster_size() as usize;
         let mut file = volume.create_file("bad.bin").unwrap();
         let bytes = alloc::vec![0x18; cluster_bytes * 2];
         let mut done = 0;
@@ -295,7 +303,7 @@ mod tests {
 
     #[test]
     fn maps_are_bound_to_volume_and_metadata_admission() {
-        let a = FatVolume::new(format_disk(512, 16384, 1)).unwrap();
+        let mut a = FatVolume::new(format_disk(512, 16384, 1)).unwrap();
         let b = FatVolume::new(format_disk(512, 16384, 2)).unwrap();
         a.create_file("a").unwrap().write(b"content").unwrap();
         let map = a.plan_read("a", 4096).unwrap();

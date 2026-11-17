@@ -16,8 +16,8 @@ use storage_core::{BlockDevice, IoResult, StorageError};
 
 use super::{EAGAIN, EINVAL, EIO, ENODEV, ENOSYS, ENOMEM};
 use vfsd::{
-    admit_dvm_block_geometry, cooperative_bulk_yield_state, storage_error_from_linux_status,
-    storage_service_lookup_errno, validate_dvm_block_range,
+    admit_dvm_block_geometry_with_allowed_flags, cooperative_bulk_yield_state,
+    storage_error_from_linux_status, storage_service_lookup_errno, validate_dvm_block_range,
 };
 
 const IPC_BLOCK_PAYLOAD_BYTES: usize =
@@ -43,6 +43,7 @@ pub(super) struct BootBlockDevice {
     pub(super) generation: u64,
     pub(super) block_size: usize,
     pub(super) block_count: u64,
+    pub(super) read_only: bool,
     bulk_bytes_since_yield: usize,
     bulk_response: alloc::vec::Vec<u64>,
 }
@@ -62,13 +63,14 @@ impl BootBlockDevice {
             });
         }
         let info = read_block_info(&response.payload).ok_or(EIO)?;
-        let (block_size, block_count) = admit_dvm_block_geometry(
+        let (block_size, block_count) = admit_dvm_block_geometry_with_allowed_flags(
             info,
             response.value0,
             response.value1,
             IPC_BLOCK_PAYLOAD_BYTES,
             BLOCK_BROKER_INFO_FLAG_READ_ONLY,
         )?;
+        let read_only = info.flags & BLOCK_BROKER_INFO_FLAG_READ_ONLY != 0;
         let words = size_of::<StoragedBulkReadResponse>().div_ceil(size_of::<u64>());
         let mut bulk_response = alloc::vec::Vec::new();
         bulk_response.try_reserve_exact(words).map_err(|_| ENOMEM)?;
@@ -77,6 +79,7 @@ impl BootBlockDevice {
             generation: info.generation,
             block_size,
             block_count,
+            read_only,
             bulk_bytes_since_yield: 0,
             bulk_response,
         })
@@ -176,10 +179,16 @@ impl BlockDevice for BootBlockDevice {
     }
 
     fn write_blocks(&mut self, lba: u64, input: &[u8]) -> IoResult<()> {
+        if self.read_only {
+            return Err(StorageError::Unsupported);
+        }
         self.write_transfer(lba, input)
     }
 
     fn flush(&mut self) -> IoResult<()> {
+        if self.read_only {
+            return Ok(());
+        }
         let mut request = storage_request(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_FLUSH);
         request.arg0 = self.generation;
         let response = call_storaged(&request)
