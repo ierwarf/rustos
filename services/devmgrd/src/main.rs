@@ -340,9 +340,11 @@ fn reply_device_ioctl(reply_cap: u64, request: &DevmgrdDeviceIoctlRequest) -> i6
             match call_sessiond_ioctl(op, request) {
                 Ok(session_response) => {
                     response.value = session_response.value0;
-                    response.payload_len = session_response.payload_len;
                     let payload_len = session_response.payload_len as usize;
-                    if payload_len <= response.payload.len() {
+                    if payload_len <= response.payload.len()
+                        && payload_len <= session_response.payload.len()
+                    {
+                        response.payload_len = session_response.payload_len;
                         response.payload[..payload_len]
                             .copy_from_slice(&session_response.payload[..payload_len]);
                         0

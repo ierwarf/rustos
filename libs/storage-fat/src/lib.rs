@@ -807,7 +807,11 @@ impl<D: BlockDevice> FatVolume<D> {
     }
 
     pub fn unmount(self) -> Result<(), FatError> {
-        self.fs.into_inner().unmount()
+        let device = self.device.clone();
+        self.fs.into_inner().unmount()?;
+        // The disk runs without per-operation barriers, so unmount is the
+        // last point that can make the final metadata flush durable.
+        device.lock().device.flush().map_err(fatfs::Error::Io)
     }
 
     fn open_dir_by_path_in<'a>(

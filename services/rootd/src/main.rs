@@ -197,6 +197,10 @@ struct Lease {
     /// respawned. Deadline-driven so one crashing service never parks the
     /// whole supervisor (and its IPC service) for its backoff.
     restart_not_before_ns: u64,
+    /// Consecutive transient `EBUSY` job retirements (bounded kill not yet
+    /// empty) deferred without charging `restart_budget`; capped by
+    /// `RESTART_RETIRE_RETRY_MAX` so a stuck job still ends in a charged failure.
+    retire_retries: u32,
     state: u16,
     exit_status: i32,
     weight_micros: u64,
@@ -473,6 +477,7 @@ fn lease(spec: BootstrapServiceSpec) -> Lease {
         restart_budget: 3,
         backoff_ms: 250,
         restart_not_before_ns: 0,
+        retire_retries: 0,
         state: rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY,
         exit_status: 0,
         weight_micros: spec.weight_micros,
@@ -1539,6 +1544,7 @@ fn fill_commercial_max_response(
             let duplicate=service_checkpoints.health.is_duplicate(
                 pulse.service,sender.pid,pulse.sequence,
             );
+            let health_undo = service_checkpoints.health.snapshot(pulse.service);
             let deadline = service_checkpoints.health.report(
                 pulse.service, sender.pid, pulse.sequence, now_ns,
             )?;
@@ -1557,9 +1563,15 @@ fn fill_commercial_max_response(
                 // A copyout-lost ACK may repeat an already accepted pulse.
                 // Such a replay must never counterfeit 3 health witnesses
                 // and seal a candidate update without new progress.
-                service_checkpoints.updates.healthy(
+                // A failed update-journal write must not leave the report
+                // committed: the retry would be a "duplicate" that never
+                // advances the trial. Undo the report so it is re-evaluated.
+                if let Err(errno) = service_checkpoints.updates.healthy(
                     pulse.service, sender.pid, now_ns,
-                )?;
+                ) {
+                    service_checkpoints.health.restore(health_undo);
+                    return Err(errno);
+                }
             }
             response.payload[..ack.len()].copy_from_slice(&ack);
             response.payload_len = ack.len() as u32;
@@ -2704,6 +2716,10 @@ fn restart_failed_leases(
         {
             continue;
         }
+        if !restart_retire_gate(lease, job_lease::retire) {
+            lease.restart_not_before_ns = restart_deadline_ns(&mut now_ns, lease.backoff_ms);
+            continue;
+        }
         lease.restart_not_before_ns = 0;
         let result = restart_lease(
             index,
@@ -2720,6 +2736,7 @@ fn restart_failed_leases(
                 lease.pid = pid;
                 kernel_policy::bind(pid, lease.service_id);
                 lease.restart_budget -= 1;
+                lease.retire_retries = 0;
                 lease.state = ROOTD_LEASE_STATE_RUNNING;
                 lease.exit_status = 0;
                 lease.readiness_polls_remaining = CORE_READINESS_POLL_MAX;
@@ -2732,19 +2749,67 @@ fn restart_failed_leases(
                         restart_deadline_ns(&mut now_ns, lease.backoff_ms);
                 }
             }
-            Err(_) => {
-                lease.restart_budget -= 1;
-                if lease.restart_budget == 0 {
-                    lease.state = ROOTD_LEASE_STATE_FAILED;
-                    lease.exit_status = -11;
-                    debug_line(b"rootd: restart budget exhausted\n");
-                } else {
-                    lease.state = ROOTD_LEASE_STATE_RESTART_PENDING;
-                    lease.restart_not_before_ns =
-                        restart_deadline_ns(&mut now_ns, lease.backoff_ms);
-                }
+            Err(error) => {
+                account_restart_error(lease, error, |backoff_ms| {
+                    restart_deadline_ns(&mut now_ns, backoff_ms)
+                });
             }
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RestartError {
+    DependenciesNotReady,
+    Failed(i64),
+}
+
+impl From<i64> for RestartError {
+    fn from(errno: i64) -> Self {
+        Self::Failed(errno)
+    }
+}
+
+fn account_restart_error(
+    lease: &mut Lease,
+    error: RestartError,
+    deadline: impl FnOnce(u32) -> u64,
+) {
+    if let RestartError::Failed(_) = error {
+        lease.restart_budget -= 1;
+        if lease.restart_budget == 0 {
+            lease.state = ROOTD_LEASE_STATE_FAILED;
+            lease.exit_status = -11;
+            debug_line(b"rootd: restart budget exhausted\n");
+            return;
+        }
+    }
+    lease.state = ROOTD_LEASE_STATE_RESTART_PENDING;
+    lease.restart_not_before_ns = deadline(lease.backoff_ms);
+}
+
+/// Upper bound on budget-free deferrals of a lease whose job keeps answering
+/// `EBUSY` to retirement; past it the failure is charged like any other.
+const RESTART_RETIRE_RETRY_MAX: u32 = 64;
+
+/// Retire the lease's job before a respawn attempt. Returns `false` when the
+/// kill was only partial (`EBUSY`) and the attempt should be retried after the
+/// backoff without spending `restart_budget`. Other errors, and `EBUSY` beyond
+/// the retry cap, proceed so the restart path charges the budget as a failure.
+fn restart_retire_gate(
+    lease: &mut Lease,
+    retire: impl FnOnce(&mut Lease) -> Result<(), i64>,
+) -> bool {
+    match retire(lease) {
+        Err(11) if lease.retire_retries < RESTART_RETIRE_RETRY_MAX => {
+            lease.retire_retries += 1;
+            false
+        }
+        Ok(()) => {
+            lease.retire_retries = 0;
+            true
+        }
+        Err(_) => true,
     }
 }
 
@@ -2818,15 +2883,17 @@ fn restart_lease(
     leases: &mut [Lease],
     post_init_leases: &mut [PostInitLease],
     service_checkpoints: &mut ServiceCheckpointStore,
-) -> Result<(u64, bool), i64> {
+) -> Result<(u64, bool), RestartError> {
     job_lease::retire(&mut leases[index])?;
     let lease = leases[index];
     if BOOTSTRAP_MANIFEST[index].restart_direct {
         let job_handle = job_lease::ensure(&mut leases[index])?;
-        return spawn_exec(lease.exec_path, lease.weight_micros, job_handle, lease.service_id).map(|pid| (pid, false));
+        return spawn_exec(lease.exec_path, lease.weight_micros, job_handle, lease.service_id)
+            .map(|pid| (pid, false))
+            .map_err(RestartError::Failed);
     }
     if !service_dependencies_ready(index) || !service_ready(IPC_SERVICE_LOADERD) {
-        return Err(11);
+        return Err(RestartError::DependenciesNotReady);
     }
     let job_handle = job_lease::ensure(&mut leases[index])?;
     spawn_exec_via_loaderd_cooperative(
@@ -2839,6 +2906,7 @@ fn restart_lease(
         job_handle,
     )
     .map(|pid| (pid, true))
+    .map_err(RestartError::Failed)
 }
 
 fn spawn_exec_via_loaderd_cooperative(
@@ -3423,6 +3491,49 @@ mod tests {
     use rustos_user_abi::syscall::{
         IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER,
     };
+
+    #[test]
+    fn restart_dependency_deferrals_preserve_budget_but_real_eagain_is_charged() {
+        let mut lease = lease(BOOTSTRAP_MANIFEST[0]);
+        lease.state = ROOTD_LEASE_STATE_RESTART_PENDING;
+        let budget = lease.restart_budget;
+        for _ in 0..=RESTART_RETIRE_RETRY_MAX {
+            account_restart_error(&mut lease, RestartError::DependenciesNotReady, |_| 42);
+            assert_eq!(lease.restart_budget, budget);
+            assert_eq!(lease.state, ROOTD_LEASE_STATE_RESTART_PENDING);
+            assert_eq!(lease.restart_not_before_ns, 42);
+        }
+        for remaining in (0..budget).rev() {
+            account_restart_error(&mut lease, RestartError::from(11), |_| 43);
+            assert_eq!(lease.restart_budget, remaining);
+            if remaining > 0 {
+                assert_eq!(lease.state, ROOTD_LEASE_STATE_RESTART_PENDING);
+                assert_eq!(lease.restart_not_before_ns, 43);
+            } else {
+                assert_eq!(lease.state, ROOTD_LEASE_STATE_FAILED);
+                assert_eq!(lease.exit_status, -11);
+            }
+        }
+    }
+
+    #[test]
+    fn transient_ebusy_retire_defers_without_spending_restart_budget() {
+        let mut lease = lease(BOOTSTRAP_MANIFEST[0]);
+        let budget = lease.restart_budget;
+        for n in 1..=RESTART_RETIRE_RETRY_MAX {
+            assert!(!restart_retire_gate(&mut lease, |_| Err(11)));
+            assert_eq!(lease.retire_retries, n);
+            assert_eq!(lease.restart_budget, budget);
+        }
+        // Past the cap the failure proceeds and the caller charges the budget.
+        assert!(restart_retire_gate(&mut lease, |_| Err(11)));
+        // A completed retirement resets the counter.
+        assert!(restart_retire_gate(&mut lease, |_| Ok(())));
+        assert_eq!(lease.retire_retries, 0);
+        assert!(!restart_retire_gate(&mut lease, |_| Err(11)));
+        // Non-EBUSY errors are real failures and are charged.
+        assert!(restart_retire_gate(&mut lease, |_| Err(22)));
+    }
 
     // The kernel now decides lookups and registrations from the policy rootd
     // installs (`kernel_policy`) and the pid -> service bindings rootd makes

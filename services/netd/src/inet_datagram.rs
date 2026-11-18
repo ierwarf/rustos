@@ -232,21 +232,30 @@ fn bind_in_state(state: &mut NetState, token: u64, mut local: IpEndpoint) -> Res
     }
     let transport = socket.transport;
     let stack = state.inet.as_mut().ok_or(libc::ENODEV)?;
-    let occupied = |candidate: u16, state: &NetState| {
+    let protocol = transport.protocol();
+    let occupied_by_other = |candidate: u16, state: &NetState| {
         state.inet_sockets.iter().any(|(other, s)| {
             *other != token
-                && s.transport.protocol() == transport.protocol()
+                && s.transport.protocol() == protocol
                 && s.local.is_some_and(|ep| ep.port == candidate)
         })
     };
     if local.port == 0 {
         // TCP/UDP ports and ICMP identifiers have separate namespaces. Avoid
         // duplicate ping identifiers as well as UDP endpoints before binding.
+        // One table pass collects the busy ports; probing candidates against
+        // the set keeps a crowded range linear in sockets.
+        let used: std::collections::HashSet<u16> = state
+            .inet_sockets
+            .iter()
+            .filter(|(other, s)| **other != token && s.transport.protocol() == protocol)
+            .filter_map(|(_, s)| s.local.map(|ep| ep.port))
+            .collect();
         let mut next = stack.next_port;
-        local.port = select_ephemeral_port(&mut next, |port| occupied(port, state))
+        local.port = select_ephemeral_port(&mut next, |port| used.contains(&port))
             .ok_or(libc::EADDRINUSE)?;
         state.inet.as_mut().ok_or(libc::ENODEV)?.next_port = next;
-    } else if occupied(local.port, state) {
+    } else if occupied_by_other(local.port, state) {
         return Err(libc::EADDRINUSE);
     }
     let stack = state.inet.as_mut().ok_or(libc::ENODEV)?;
@@ -339,6 +348,10 @@ fn unicast_destination(addr: IpAddress) -> bool {
 
 pub(super) fn connect(request: &NetdIpcRequest) -> i32 {
     let mut state = lock_net_state();
+    connect_in_state(&mut state, request)
+}
+
+pub(super) fn connect_in_state(state: &mut NetState, request: &NetdIpcRequest) -> i32 {
     if sockaddr_family(request) == Some(libc::AF_UNSPEC as u64) {
         let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) else {
             return libc::EBADF;
@@ -358,10 +371,14 @@ pub(super) fn connect(request: &NetdIpcRequest) -> i32 {
     if matches!(socket.transport, InetTransport::Icmp(_)) {
         peer.port = 0;
     }
+    // Linux routes a connect to INADDR_ANY (0.0.0.0) to the loopback address.
+    if peer.addr == IpAddress::Ipv4(Ipv4Address::UNSPECIFIED) {
+        peer.addr = IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1));
+    }
     if !unicast_destination(peer.addr) {
         return libc::EOPNOTSUPP;
     }
-    if let Err(e) = autobind(&mut state, request.socket_token) {
+    if let Err(e) = autobind(state, request.socket_token) {
         return e;
     }
     state
@@ -789,5 +806,75 @@ mod tests {
             response.payload_len as usize,
             netd_message::HEADER_SIZE + 16
         );
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    fn request_to(addr: [u8; 4], port: u16) -> NetdIpcRequest {
+        let mut request = NetdIpcRequest::default();
+        request.socket_token = 7;
+        request.payload[..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+        request.payload[2..4].copy_from_slice(&port.to_be_bytes());
+        request.payload[4..8].copy_from_slice(&addr);
+        request.payload_len = 16;
+        request
+    }
+
+    fn state_with_udp() -> NetState {
+        let mut device = BrokerDevice {
+            rx: [0; NET_BROKER_PACKET_MTU],
+            errors: ErrorIngress::default(),
+        };
+        let config = SmolConfig::new(HardwareAddress::Ethernet(QEMU_USERNET_MAC));
+        let iface = Interface::new(config, &mut device, SmolInstant::from_millis(0));
+        let mut stack = InetStack {
+            iface,
+            device,
+            sockets: SocketSet::new(Vec::new()),
+            next_port: 49152,
+            closing: Vec::new(),
+            readiness_dirty: false,
+            last_timer_sweep: StdInstant::now(),
+        };
+        let transport = add_socket(&mut stack, linux_abi::SOCK_DGRAM, 17);
+        let mut state = NetState::new();
+        state.inet_sockets.insert(
+            7,
+            InetSocket {
+                refs: 1,
+                options: SocketOptions::default(),
+                transport,
+                local: None,
+                peer: None,
+                received: None,
+                errors: None,
+                connect_deadline: None,
+            },
+        );
+        state.inet = Some(stack);
+        state
+    }
+
+    #[test]
+    fn udp_connect_to_inaddr_any_targets_loopback() {
+        let mut state = state_with_udp();
+        assert_eq!(connect_in_state(&mut state, &request_to([0, 0, 0, 0], 5353)), 0);
+        let peer = state.inet_sockets[&7].peer.unwrap();
+        assert_eq!(peer.addr, IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)));
+        assert_eq!(peer.port, 5353);
+    }
+
+    #[test]
+    fn udp_connect_still_refuses_broadcast_and_multicast() {
+        let mut state = state_with_udp();
+        for addr in [[255, 255, 255, 255], [224, 0, 0, 1]] {
+            assert_eq!(
+                connect_in_state(&mut state, &request_to(addr, 53)),
+                libc::EOPNOTSUPP
+            );
+        }
     }
 }

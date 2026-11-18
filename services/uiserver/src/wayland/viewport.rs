@@ -92,20 +92,27 @@ pub(super) fn apply_viewport(
     if pixels.len() != width.saturating_mul(height) {
         return Err(ViewportError::OutOfBuffer);
     }
+    if width == 0 || height == 0 {
+        return Err(ViewportError::OutOfBuffer);
+    }
     let mut out = Vec::new();
     if out.try_reserve_exact(count).is_err() {
         return Err(ViewportError::BadSize);
     }
+    // The column mapping is the same for every row; compute it once instead
+    // of one f64 divide per output pixel.
+    let columns: Vec<usize> = (0..dw)
+        .map(|dx| {
+            let src_x = (sx + (dx as f64 + 0.5) * sw / dw as f64).floor();
+            (src_x.max(0.0) as usize).min(width - 1)
+        })
+        .collect();
     for dy in 0..dh {
         // Sample at the centre of each destination pixel.
         let src_y = (sy + (dy as f64 + 0.5) * sh / dh as f64).floor();
         let src_y = (src_y.max(0.0) as usize).min(height - 1);
         let row = &pixels[src_y * width..(src_y + 1) * width];
-        for dx in 0..dw {
-            let src_x = (sx + (dx as f64 + 0.5) * sw / dw as f64).floor();
-            let src_x = (src_x.max(0.0) as usize).min(width - 1);
-            out.push(row[src_x]);
-        }
+        out.extend(columns.iter().map(|&src_x| row[src_x]));
     }
     Ok(Some((out, dw, dh)))
 }

@@ -228,6 +228,12 @@ fn cached_early_system_payload(
     verify_payload_digest(payload, expected_digest)?;
     let mut verified = VERIFIED_PAYLOADS.lock();
     if !verified.contains(&key) {
+        // A full cache must not silently stop caching: every later chunked read
+        // of an uncached payload would otherwise re-hash the whole payload. Drop
+        // the oldest admission instead; a dropped entry only costs one re-verify.
+        if verified.is_full() {
+            verified.remove(0);
+        }
         let _ = verified.push(key);
     }
     Ok(Some(payload))

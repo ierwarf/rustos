@@ -1461,56 +1461,55 @@ impl VfsStorage {
                 .executable_snapshot_cache_bytes
                 .saturating_sub(snapshot.file_bytes as usize);
         }
+        // A node appearing or disappearing at `key` changes what a cached
+        // answer *below* it means (`key/x` flips between `ENOENT` and
+        // `ENOTDIR` when a file replaces a missing or removed directory), and
+        // negative answers are cached.
+        if !key.1.is_empty() {
+            for k in vfsd::mount_table::descendant_keys(&self.metadata_cache, key) {
+                self.metadata_cache.remove(&k);
+            }
+        }
         if let Some(pk) = parent_key {
             self.dir_entries_cache.remove(pk);
             self.metadata_cache.remove(pk);
         }
     }
 
+    /// `key` itself plus everything below it.
+    fn subtree_keys<V>(map: &BTreeMap<CacheKey, V>, key: &CacheKey) -> Vec<CacheKey> {
+        let mut keys = vfsd::mount_table::descendant_keys(map, key);
+        if map.contains_key(key) {
+            keys.push(key.clone());
+        }
+        keys
+    }
+
     fn invalidate_subtree_caches(&mut self, key: &CacheKey) {
-        let prefix = if key.1.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", key.1)
-        };
-        let matches = |k: &CacheKey| -> bool {
-            k.0 == key.0 && (k.1 == key.1 || prefix.is_empty() || k.1.starts_with(prefix.as_str()))
-        };
-        self.metadata_cache.retain(|k, _| !matches(k));
-        self.dir_entries_cache.retain(|k, _| !matches(k));
-        let mut removed_file_bytes = 0usize;
-        self.file_bytes_cache.retain(|k, v| {
-            if matches(k) {
-                removed_file_bytes += v.len();
-                false
-            } else {
-                true
+        for k in Self::subtree_keys(&self.metadata_cache, key) {
+            self.metadata_cache.remove(&k);
+        }
+        for k in Self::subtree_keys(&self.dir_entries_cache, key) {
+            self.dir_entries_cache.remove(&k);
+        }
+        for k in Self::subtree_keys(&self.file_bytes_cache, key) {
+            if let Some(bytes) = self.file_bytes_cache.remove(&k) {
+                self.file_bytes_cache_bytes = self.file_bytes_cache_bytes.saturating_sub(bytes.len());
             }
-        });
-        self.file_bytes_cache_bytes = self.file_bytes_cache_bytes.saturating_sub(removed_file_bytes);
-        let mut removed_map_bytes = 0usize;
-        self.read_maps.retain(|k, m| {
-            if matches(k) {
-                removed_map_bytes += m.metadata_bytes();
-                false
-            } else {
-                true
+        }
+        for k in Self::subtree_keys(&self.read_maps, key) {
+            if let Some(map) = self.read_maps.remove(&k) {
+                self.read_map_bytes = self.read_map_bytes.saturating_sub(map.metadata_bytes());
             }
-        });
-        self.read_map_bytes = self.read_map_bytes.saturating_sub(removed_map_bytes);
-        let mut removed_snap_bytes = 0usize;
-        self.executable_snapshot_cache.retain(|k, snap| {
-            if matches(k) {
-                close_fd(snap.fd);
-                removed_snap_bytes += snap.file_bytes as usize;
-                false
-            } else {
-                true
+        }
+        for k in Self::subtree_keys(&self.executable_snapshot_cache, key) {
+            if let Some(snapshot) = self.executable_snapshot_cache.remove(&k) {
+                close_fd(snapshot.fd);
+                self.executable_snapshot_cache_bytes = self
+                    .executable_snapshot_cache_bytes
+                    .saturating_sub(snapshot.file_bytes as usize);
             }
-        });
-        self.executable_snapshot_cache_bytes = self
-            .executable_snapshot_cache_bytes
-            .saturating_sub(removed_snap_bytes);
+        }
     }
 
     fn open_on_mount(
@@ -1725,7 +1724,7 @@ impl VfsStorage {
     }
 
     fn write_at_path(&mut self, abs_path: &str, offset: u64, data: &[u8]) -> Result<(usize, u64), i32> {
-        let (_mid, rel_path, key, parent_key, caps, _imm, volume, _rms) =
+        let (_mid, rel_path, key, _parent_key, caps, _imm, volume, _rms) =
             self.resolve_mount(abs_path)?;
         if caps.read_only {
             return Err(EROFS);
@@ -1744,12 +1743,14 @@ impl VfsStorage {
         if let Some(node) = self.open_nodes.get_mut(&key) {
             node.live_len = new_len;
         }
-        self.invalidate_path_caches(&key, parent_key.as_ref());
+        // A write changes this file's length and bytes, never the directory
+        // listing, so the parent's cached entries stay valid.
+        self.invalidate_path_caches(&key, None);
         Ok((written, new_len))
     }
 
     fn truncate_path(&mut self, abs_path: &str, new_len: u64) -> Result<u64, i32> {
-        let (_mid, rel_path, key, parent_key, caps, _imm, volume, _rms) =
+        let (_mid, rel_path, key, _parent_key, caps, _imm, volume, _rms) =
             self.resolve_mount(abs_path)?;
         if caps.read_only {
             return Err(EROFS);
@@ -1768,7 +1769,7 @@ impl VfsStorage {
         if let Some(node) = self.open_nodes.get_mut(&key) {
             node.live_len = actual_len;
         }
-        self.invalidate_path_caches(&key, parent_key.as_ref());
+        self.invalidate_path_caches(&key, None);
         Ok(actual_len)
     }
 
@@ -1920,6 +1921,16 @@ impl VfsStorage {
         if !old_caps.supports_unlink_while_open
             && (self.open_nodes.get(&old_key).is_some_and(|n| n.refs > 0)
                 || self.open_nodes.get(&new_key).is_some_and(|n| n.refs > 0))
+        {
+            return EBUSY;
+        }
+        // A path-addressed volume cannot rename a directory out from under
+        // descriptors that name their file by path.
+        if !old_caps.supports_unlink_while_open
+            && !old_key.1.is_empty()
+            && vfsd::mount_table::descendant_keys(&self.open_nodes, &old_key)
+                .iter()
+                .any(|k| self.open_nodes.get(k).is_some_and(|node| node.refs > 0))
         {
             return EBUSY;
         }
@@ -2351,7 +2362,7 @@ impl VfsStorage {
                 if self.is_virtual_path(abs_path) {
                     return EROFS;
                 }
-                let (_mid, rel_path, key, parent_key, caps, _imm, volume, _rms) =
+                let (_mid, rel_path, key, _parent_key, caps, _imm, volume, _rms) =
                     match self.resolve_mount(abs_path) {
                         Ok(r) => r,
                         Err(e) => return e,
@@ -2369,7 +2380,7 @@ impl VfsStorage {
                         return vfsd::map_fs_error(err);
                     }
                 }
-                self.invalidate_path_caches(&key, parent_key.as_ref());
+                self.invalidate_path_caches(&key, None);
                 0
             }
         }
@@ -2412,10 +2423,10 @@ impl VfsStorage {
         }
         self.invalidate_caches_if_remounted();
         if let Some(len) = early_system::file_len(path)? {
-            let es_key = (0_u64, path.to_string());
-            let metadata = Metadata::plain(RemoteKind::File, len, path_inode(path.as_bytes()));
-            self.insert_metadata_cache(es_key, Ok(metadata));
-            return Ok(metadata);
+            // Never cached: this answer is a table lookup, and a `(0, path)`
+            // entry has no reader, so inserting one only evicts useful entries
+            // when the bounded cache fills.
+            return Ok(Metadata::plain(RemoteKind::File, len, path_inode(path.as_bytes())));
         }
         let (_mid, rel_path, key, _pk, caps, _imm, volume, _rms) = self.resolve_mount(path)?;
         if self.open_nodes.get(&key).is_some_and(|n| n.pending_unlink) {

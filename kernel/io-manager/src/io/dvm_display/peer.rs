@@ -341,20 +341,68 @@ pub(super) fn read_u64(offset: usize) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
+/// Size of the uncached control mapping every shared-control access lives in.
+const CONTROL_HEADER_BYTES: usize = DVM_GUI_SURFACE_POOL_HEADER_BYTES as usize;
+
+/// Whether `[offset, offset + len)` lies inside the control-header mapping.
+fn control_range_in_bounds(offset: usize, len: usize) -> bool {
+    offset
+        .checked_add(len)
+        .is_some_and(|end| end <= CONTROL_HEADER_BYTES)
+}
+
+/// Width of the next volatile access for the byte at `address` with
+/// `remaining` bytes left: the widest naturally aligned power-of-two unit.
+///
+/// Sequence/ack words are written and read by the DVM as whole 64-bit words, so
+/// reading them one byte at a time can observe a torn value (for example a low
+/// byte from the old word and a high byte from the new one) and the control
+/// protocol would then acknowledge a sequence that was never published. Wide
+/// aligned accesses also make each uncached access cover 8 bytes rather than 1.
+fn control_access_width(address: usize, remaining: usize) -> usize {
+    if remaining >= 8 && address % 8 == 0 {
+        8
+    } else if remaining >= 4 && address % 4 == 0 {
+        4
+    } else {
+        1
+    }
+}
+
 pub(super) fn write_bytes(offset: usize, bytes: &[u8]) {
     // ORDERING: Acquire pairs with the install-time Release store of the control header address (zeroed on replacement).
     let header = SHARED_HEADER_ADDR.load(Ordering::Acquire);
     if header == 0 {
         return;
     }
+    if !control_range_in_bounds(offset, bytes.len()) {
+        // Every caller passes a fixed protocol offset; reaching this is a
+        // programming error and must never become an out-of-bounds MMIO write.
+        debug_assert!(false, "control write outside the 4096-byte header");
+        return;
+    }
     // SAFETY: `header` is the uncached control mapping of DVM_GUI_SURFACE_POOL_HEADER_BYTES (4096), never unmapped
-    // after install, so a pointer loaded before a racing replacement stays valid. This function does not itself bound
-    // offset + len; every caller passes a fixed protocol offset plus a fixed or slot-bounded length, all < 4096 (audited).
+    // after install, so a pointer loaded before a racing replacement stays valid. `offset + len` was bounds-checked
+    // above; each access is naturally aligned for its width (control_access_width), so it is a single volatile access.
     unsafe {
-        for (index, byte) in bytes.iter().enumerate() {
-            (header as *mut u8)
-                .add(offset + index)
-                .write_volatile(*byte);
+        let mut index = 0;
+        while index < bytes.len() {
+            let address = header + offset + index;
+            let width = control_access_width(address, bytes.len() - index);
+            match width {
+                8 => {
+                    let mut word = [0_u8; 8];
+                    word.copy_from_slice(&bytes[index..index + 8]);
+                    (address as *mut u64).write_volatile(u64::from_ne_bytes(word));
+                }
+                4 => {
+                    let mut word = [0_u8; 4];
+                    word.copy_from_slice(&bytes[index..index + 4]);
+                    (address as *mut u32).write_volatile(u32::from_ne_bytes(word));
+                }
+                _ => (address as *mut u8).write_volatile(bytes[index]),
+            }
+            index += width;
         }
     }
     // ORDERING: SeqCst fence orders these volatile control-header stores ahead of later stores, notably the doorbell write and slot publication.
@@ -364,13 +412,23 @@ pub(super) fn write_bytes(offset: usize, bytes: &[u8]) {
 pub(super) fn read_bytes(offset: usize, bytes: &mut [u8]) -> Option<()> {
     // ORDERING: Acquire pairs with the install-time Release store of the control header address.
     let header = SHARED_HEADER_ADDR.load(Ordering::Acquire);
-    if header == 0 {
+    if header == 0 || !control_range_in_bounds(offset, bytes.len()) {
         return None;
     }
-    // SAFETY: same control-header mapping and caller-bounded offsets as in write_bytes (all < 4096, never unmapped).
+    // SAFETY: same control-header mapping as write_bytes; the range was bounds-checked and each access is naturally aligned.
     unsafe {
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            *byte = (header as *const u8).add(offset + index).read_volatile();
+        let mut index = 0;
+        while index < bytes.len() {
+            let address = header + offset + index;
+            let width = control_access_width(address, bytes.len() - index);
+            match width {
+                8 => bytes[index..index + 8]
+                    .copy_from_slice(&(address as *const u64).read_volatile().to_ne_bytes()),
+                4 => bytes[index..index + 4]
+                    .copy_from_slice(&(address as *const u32).read_volatile().to_ne_bytes()),
+                _ => bytes[index] = (address as *const u8).read_volatile(),
+            }
+            index += width;
         }
     }
     Some(())
@@ -412,3 +470,29 @@ pub(crate) fn scanout_region_contains(addr: u64, size: u64) -> bool {
     addr >= region_start && end <= region_end
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_accesses_are_naturally_aligned_wide_units() {
+        // A 64-bit protocol word is one access, never eight byte reads that
+        // could straddle a concurrent DVM update.
+        assert_eq!(control_access_width(2208, 8), 8);
+        assert_eq!(control_access_width(2144, 4), 4);
+        assert_eq!(control_access_width(2148, 12), 4);
+        assert_eq!(control_access_width(2149, 8), 1);
+        assert_eq!(control_access_width(2208, 7), 4);
+        assert_eq!(control_access_width(2208, 3), 1);
+    }
+
+    #[test]
+    fn control_range_rejects_out_of_header_and_overflowing_spans() {
+        assert!(control_range_in_bounds(0, CONTROL_HEADER_BYTES));
+        assert!(control_range_in_bounds(CONTROL_HEADER_BYTES - 8, 8));
+        assert!(!control_range_in_bounds(CONTROL_HEADER_BYTES - 7, 8));
+        assert!(!control_range_in_bounds(usize::MAX, 2));
+        assert!(!control_range_in_bounds(0, CONTROL_HEADER_BYTES + 1));
+    }
+}

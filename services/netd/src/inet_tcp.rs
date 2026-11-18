@@ -26,22 +26,29 @@ pub(super) fn begin_inet_connect(request: &NetdIpcRequest) -> i32 {
         Err(errno) => return errno,
     };
     let mut state = lock_net_state();
-    let Some(inet) = state.inet_sockets.get(&request.socket_token) else {
+    begin_inet_connect_in_state(&mut state, request.socket_token, remote, port, connect_timeout, connect_timeout_ms)
+}
+
+fn begin_inet_connect_in_state(
+    state: &mut NetState, token: u64, remote: Ipv4Address, port: u16,
+    connect_timeout: Duration, connect_timeout_ms: u128,
+) -> i32 {
+    let Some(inet) = state.inet_sockets.get(&token) else {
         return libc::EBADF;
     };
     let InetTransport::Tcp(tcp_handle) = inet.transport else { return libc::EOPNOTSUPP; };
+    if inet.connect_deadline.is_some() {
+        return match inet_connect_status(state, token) {
+            libc::EINPROGRESS => libc::EALREADY,
+            status => status,
+        };
+    }
     let stack = match state.inet_stack() {
         Ok(stack) => stack,
         Err(errno) => return errno,
     };
-    {
-        let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
-        if socket.may_send() {
-            return 0;
-        }
-        if socket.is_open() {
-            return libc::EINPROGRESS;
-        }
+    if let Some(errno) = tcp_connect_state_errno(stack.sockets.get::<tcp::Socket>(tcp_handle).state()) {
+        return errno;
     }
     let Some(local_port) = stack.next_ephemeral_port() else {
         return libc::EADDRNOTAVAIL;
@@ -51,22 +58,149 @@ pub(super) fn begin_inet_connect(request: &NetdIpcRequest) -> i32 {
         socket.set_timeout(Some(smoltcp::time::Duration::from_millis(
             connect_timeout_ms.min(u128::from(u64::MAX)) as u64,
         )));
-        if socket
-            .connect(
-                stack.iface.context(),
-                (IpAddress::Ipv4(remote), port),
-                local_port,
-            )
-            .is_err()
-        {
-            return libc::EINVAL;
+        if let Err(error) = socket.connect(
+            stack.iface.context(),
+            (IpAddress::Ipv4(remote), port),
+            local_port,
+        ) {
+            return tcp_connect_error_errno(error);
         }
+        // A fresh active open starts a new connection; a reset recorded for
+        // the previous one must not be reported against it.
+        forget_tcp_termination(tcp_handle);
     }
     stack.poll_budget(8);
-    if let Some(inet) = state.inet_sockets.get_mut(&request.socket_token) {
+    if let Some(inet) = state.inet_sockets.get_mut(&token) {
         inet.connect_deadline = Some(StdInstant::now() + connect_timeout);
     }
-    inet_connect_status(&mut state, request.socket_token)
+    inet_connect_status(state, token)
+}
+
+/// Linux `connect` on a TCP socket that is not `TCP_CLOSE`: a connection still
+/// handshaking reports `EALREADY`; an established, closing or listening
+/// socket reports `EISCONN` (`__inet_stream_connect` returns it for any
+/// non-closed `SS_UNCONNECTED` state, listeners included).
+pub(super) fn tcp_connect_state_errno(state: tcp::State) -> Option<i32> {
+    match state {
+        tcp::State::Closed => None,
+        tcp::State::SynSent | tcp::State::SynReceived => Some(libc::EALREADY),
+        _ => Some(libc::EISCONN),
+    }
+}
+
+/// smoltcp rejects an active open only when no source address/route exists
+/// for the destination (the endpoint itself was validated by the decoder), or
+/// when the socket is open; the latter is screened by
+/// `tcp_connect_state_errno` first.
+pub(super) fn tcp_connect_error_errno(error: tcp::ConnectError) -> i32 {
+    match error {
+        tcp::ConnectError::Unaddressable => libc::ENETUNREACH,
+        tcp::ConnectError::InvalidState => libc::EISCONN,
+    }
+}
+
+/// Per-connection record of an abortive close. smoltcp reports an RST (and
+/// its own retransmission abort) only as `State::Closed`, which is
+/// indistinguishable from an orderly close afterwards, so the transition is
+/// recorded while the socket is polled. The table is a leaf lock under the
+/// `NetState` lock and is keyed by the stack's singleton socket handles.
+#[derive(Clone, Copy)]
+struct TcpTermination {
+    last: tcp::State,
+    reset: bool,
+}
+
+fn tcp_terminations() -> &'static Mutex<HashMap<SocketHandle, TcpTermination>> {
+    static TABLE: OnceLock<Mutex<HashMap<SocketHandle, TcpTermination>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_terminations() -> std::sync::MutexGuard<'static, HashMap<SocketHandle, TcpTermination>> {
+    tcp_terminations()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A synchronized connection that lands in `Closed` was aborted (RST or
+/// timeout); the graceful paths end in `LastAck`/`TimeWait`/`Closing` first,
+/// and `SynSent` failures are classified by `inet_connect_status`.
+fn abortive_close(previous: tcp::State, now: tcp::State) -> bool {
+    now == tcp::State::Closed
+        && matches!(
+            previous,
+            tcp::State::SynReceived
+                | tcp::State::Established
+                | tcp::State::FinWait1
+                | tcp::State::FinWait2
+                | tcp::State::CloseWait
+        )
+}
+
+fn note_tcp_state(table: &mut HashMap<SocketHandle, TcpTermination>, handle: SocketHandle, now: tcp::State) {
+    let entry = table.entry(handle).or_insert(TcpTermination {
+        last: tcp::State::Closed,
+        reset: false,
+    });
+    if abortive_close(entry.last, now) {
+        entry.reset = true;
+    }
+    entry.last = now;
+    if now == tcp::State::Closed && !entry.reset {
+        table.remove(&handle);
+    }
+}
+
+/// Records state transitions of every TCP socket; called after the stack made
+/// progress so a reset is seen before its socket is next touched.
+pub(super) fn observe_tcp_states(sockets: &SocketSet<'_>) {
+    let mut table = lock_terminations();
+    for (handle, socket) in sockets.iter() {
+        if let smoltcp::socket::Socket::Tcp(tcp) = socket {
+            note_tcp_state(&mut table, handle, tcp.state());
+        }
+    }
+}
+
+pub(super) fn forget_tcp_termination(handle: SocketHandle) {
+    lock_terminations().remove(&handle);
+}
+
+/// Reports (without consuming) that a reset is pending for this socket.
+fn tcp_reset_pending(socket: &tcp::Socket, handle: SocketHandle) -> bool {
+    let mut table = lock_terminations();
+    note_tcp_state(&mut table, handle, socket.state());
+    table.get(&handle).is_some_and(|entry| entry.reset)
+}
+
+/// Consumes the pending reset, like Linux clearing `sk_err` once reported.
+fn take_tcp_reset(socket: &tcp::Socket, handle: SocketHandle) -> bool {
+    let mut table = lock_terminations();
+    note_tcp_state(&mut table, handle, socket.state());
+    match table.get_mut(&handle) {
+        Some(entry) if entry.reset => {
+            entry.reset = false;
+            table.remove(&handle);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `SO_ERROR` for an established-then-reset TCP socket: `ECONNRESET` once.
+pub(super) fn take_tcp_socket_error(state: &mut NetState, token: u64) -> i32 {
+    let Some(InetTransport::Tcp(handle)) = state.inet_sockets.get(&token).map(|s| s.transport)
+    else {
+        return 0;
+    };
+    let Some(stack) = state.inet.as_mut() else {
+        return 0;
+    };
+    let socket = stack.sockets.get::<tcp::Socket>(handle);
+    if take_tcp_reset(socket, handle) {
+        libc::ECONNRESET
+    } else {
+        0
+    }
 }
 
 /// The 10 s connect budget is smoltcp's socket timeout, which keeps applying to
@@ -165,6 +299,10 @@ pub(super) fn handle_inet_send_in_state(
         }
     }
     if !socket.may_send() {
+        // A reset not yet reported surfaces as the socket error first.
+        if take_tcp_reset(socket, tcp_handle) {
+            return libc::ECONNRESET;
+        }
         libc::EPIPE
     } else {
         libc::EAGAIN
@@ -222,6 +360,9 @@ pub(super) fn handle_inet_recv_in_state(
         }
     }
     if !socket.may_recv() {
+        if take_tcp_reset(socket, tcp_handle) {
+            return libc::ECONNRESET;
+        }
         response.value = 0;
         response.payload_len = data_start as u32;
         response.payload[..data_start].fill(0);
@@ -260,6 +401,9 @@ pub(super) fn inet_socket_revents(state: &mut NetState, token: u64, requested: u
     }
     if requested & linux_abi::POLLRDHUP as u32 != 0 && rx_closed {
         revents |= linux_abi::POLLRDHUP as u32;
+    }
+    if tcp_reset_pending(socket, tcp_handle) {
+        revents |= linux_abi::POLLERR as u32;
     }
     if !socket.is_open() {
         revents |= linux_abi::POLLHUP as u32;
@@ -310,4 +454,212 @@ pub(super) fn sockaddr_in_from_payload(request: &NetdIpcRequest) -> Result<(Ipv4
         return Err(libc::EINVAL);
     }
     Ok((addr, port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smoltcp::iface::{Config, Interface};
+    use smoltcp::phy::{Loopback, Medium};
+    use smoltcp::wire::{HardwareAddress, IpCidr, IpListenEndpoint};
+
+    #[test]
+    fn connect_on_a_live_socket_reports_linux_errnos() {
+        assert_eq!(tcp_connect_state_errno(tcp::State::Closed), None);
+        assert_eq!(tcp_connect_state_errno(tcp::State::SynSent), Some(libc::EALREADY));
+        assert_eq!(tcp_connect_state_errno(tcp::State::SynReceived), Some(libc::EALREADY));
+        for state in [
+            tcp::State::Established,
+            tcp::State::Listen,
+            tcp::State::CloseWait,
+            tcp::State::FinWait1,
+            tcp::State::TimeWait,
+        ] {
+            assert_eq!(tcp_connect_state_errno(state), Some(libc::EISCONN), "{state}");
+        }
+    }
+
+    #[test]
+    fn smoltcp_connect_errors_map_to_route_errnos_not_einval() {
+        assert_eq!(
+            tcp_connect_error_errno(tcp::ConnectError::Unaddressable),
+            libc::ENETUNREACH
+        );
+        assert_eq!(
+            tcp_connect_error_errno(tcp::ConnectError::InvalidState),
+            libc::EISCONN
+        );
+    }
+
+    #[test]
+    fn abortive_close_excludes_graceful_and_connecting_states() {
+        assert!(abortive_close(tcp::State::Established, tcp::State::Closed));
+        assert!(abortive_close(tcp::State::CloseWait, tcp::State::Closed));
+        assert!(!abortive_close(tcp::State::LastAck, tcp::State::Closed));
+        assert!(!abortive_close(tcp::State::TimeWait, tcp::State::Closed));
+        assert!(!abortive_close(tcp::State::Closing, tcp::State::Closed));
+        assert!(!abortive_close(tcp::State::SynSent, tcp::State::Closed));
+        assert!(!abortive_close(tcp::State::Established, tcp::State::CloseWait));
+    }
+
+    fn poll_loopback(
+        iface: &mut Interface,
+        device: &mut Loopback,
+        sockets: &mut SocketSet<'static>,
+        clock: &mut i64,
+    ) {
+        for _ in 0..8 {
+            *clock += 10;
+            iface.poll(SmolInstant::from_millis(*clock), device, sockets);
+            observe_tcp_states(sockets);
+        }
+    }
+
+    fn new_tcp(sockets: &mut SocketSet<'static>) -> SocketHandle {
+        let rx = tcp::SocketBuffer::new(vec![0; 4096]);
+        let tx = tcp::SocketBuffer::new(vec![0; 4096]);
+        let handle = sockets.add(tcp::Socket::new(rx, tx));
+        forget_tcp_termination(handle);
+        handle
+    }
+
+    /// Establishes client<->server over smoltcp loopback and returns the
+    /// pieces so each test can end the connection its own way.
+    fn established() -> (Interface, Loopback, SocketSet<'static>, i64, SocketHandle, SocketHandle) {
+        let mut device = Loopback::new(Medium::Ethernet);
+        let mut iface = Interface::new(
+            Config::new(HardwareAddress::Ethernet(smoltcp::wire::EthernetAddress([2, 0, 0, 0, 0, 1]))),
+            &mut device,
+            SmolInstant::from_millis(0),
+        );
+        iface.update_ip_addrs(|addrs| {
+            addrs
+                .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
+                .unwrap();
+        });
+        let mut sockets = SocketSet::new(Vec::new());
+        let server = new_tcp(&mut sockets);
+        let client = new_tcp(&mut sockets);
+        sockets
+            .get_mut::<tcp::Socket>(server)
+            .listen(IpListenEndpoint { addr: None, port: 7000 })
+            .unwrap();
+        sockets
+            .get_mut::<tcp::Socket>(client)
+            .connect(
+                iface.context(),
+                (IpAddress::v4(127, 0, 0, 1), 7000),
+                50000,
+            )
+            .unwrap();
+        let mut clock = 0;
+        poll_loopback(&mut iface, &mut device, &mut sockets, &mut clock);
+        assert_eq!(sockets.get::<tcp::Socket>(client).state(), tcp::State::Established);
+        assert_eq!(sockets.get::<tcp::Socket>(server).state(), tcp::State::Established);
+        (iface, device, sockets, clock, client, server)
+    }
+
+    fn state_with_tcp(iface: Interface, sockets: SocketSet<'static>, handle: SocketHandle) -> NetState {
+        let mut state = NetState::new();
+        state.inet = Some(InetStack {
+            iface,
+            sockets,
+            device: BrokerDevice {
+                rx: [0; NET_BROKER_PACKET_MTU],
+                errors: inet_datagram::ErrorIngress::default(),
+            },
+            next_port: 49152,
+            closing: Vec::new(),
+            readiness_dirty: false,
+            last_timer_sweep: StdInstant::now(),
+        });
+        state.inet_sockets.insert(7, InetSocket {
+            refs: 1,
+            options: SocketOptions::default(),
+            transport: InetTransport::Tcp(handle),
+            local: None,
+            peer: None,
+            received: None,
+            errors: None,
+            connect_deadline: None,
+        });
+        state
+    }
+
+    #[test]
+    fn so_error_consumes_established_reset_and_clears_pollerr() {
+        let (mut iface, mut device, mut sockets, mut clock, client, server) = established();
+        sockets.get_mut::<tcp::Socket>(server).abort();
+        poll_loopback(&mut iface, &mut device, &mut sockets, &mut clock);
+        let mut state = state_with_tcp(iface, sockets, client);
+        assert_ne!(inet_socket_revents(&mut state, 7, 0).unwrap() & linux_abi::POLLERR as u32, 0);
+        assert_eq!(socket_info::take_inet_socket_error(&mut state, 7), libc::ECONNRESET);
+        assert_eq!(socket_info::take_inet_socket_error(&mut state, 7), 0);
+        assert_eq!(inet_socket_revents(&mut state, 7, 0).unwrap() & linux_abi::POLLERR as u32, 0);
+    }
+
+    #[test]
+    fn connect_retry_collects_completed_result_before_eisconn() {
+        let (iface, _device, sockets, _clock, client, _) = established();
+        let mut state = state_with_tcp(iface, sockets, client);
+        state.inet_sockets.get_mut(&7).unwrap().connect_deadline = Some(StdInstant::now() + Duration::from_secs(10));
+        let retry = |state: &mut NetState| begin_inet_connect_in_state(
+            state, 7, Ipv4Address::new(127, 0, 0, 1), 7000, Duration::from_secs(10), 10000,
+        );
+        assert_eq!(retry(&mut state), 0);
+        assert_eq!(retry(&mut state), libc::EISCONN);
+    }
+
+    #[test]
+    fn connect_retry_and_so_error_preserve_pending_and_failed_result() {
+        let (mut iface, _device, mut sockets, _clock, client, _) = established();
+        sockets.get_mut::<tcp::Socket>(client).abort();
+        sockets.get_mut::<tcp::Socket>(client).connect(
+            iface.context(), (IpAddress::v4(127, 0, 0, 1), 7001), 50001,
+        ).unwrap();
+        let mut state = state_with_tcp(iface, sockets, client);
+        state.inet_sockets.get_mut(&7).unwrap().connect_deadline = Some(StdInstant::now() + Duration::from_secs(10));
+        assert_eq!(socket_info::take_inet_socket_error(&mut state, 7), 0);
+        assert!(state.inet_sockets[&7].connect_deadline.is_some());
+        assert_eq!(begin_inet_connect_in_state(&mut state, 7, Ipv4Address::new(127, 0, 0, 1), 7001, Duration::from_secs(10), 10000), libc::EALREADY);
+        state.inet.as_mut().unwrap().sockets.get_mut::<tcp::Socket>(client).abort();
+        assert_eq!(begin_inet_connect_in_state(&mut state, 7, Ipv4Address::new(127, 0, 0, 1), 7001, Duration::from_secs(10), 10000), libc::ECONNREFUSED);
+        assert!(state.inet_sockets[&7].connect_deadline.is_none());
+    }
+
+    #[test]
+    fn peer_reset_is_reported_once_as_econnreset_not_eof() {
+        let (mut iface, mut device, mut sockets, mut clock, client, server) = established();
+        sockets.get_mut::<tcp::Socket>(server).abort();
+        poll_loopback(&mut iface, &mut device, &mut sockets, &mut clock);
+        let socket = sockets.get::<tcp::Socket>(client);
+        assert_eq!(socket.state(), tcp::State::Closed);
+        assert!(tcp_reset_pending(socket, client));
+        assert!(take_tcp_reset(socket, client));
+        assert!(!take_tcp_reset(socket, client), "reported exactly once");
+        assert!(!tcp_reset_pending(socket, client));
+        // A fresh connection on the recycled handle starts clean.
+        forget_tcp_termination(client);
+        assert!(!tcp_reset_pending(sockets.get::<tcp::Socket>(client), client));
+    }
+
+    #[test]
+    fn orderly_close_is_never_reported_as_a_reset() {
+        let (mut iface, mut device, mut sockets, mut clock, client, server) = established();
+        sockets.get_mut::<tcp::Socket>(server).close();
+        poll_loopback(&mut iface, &mut device, &mut sockets, &mut clock);
+        sockets.get_mut::<tcp::Socket>(client).close();
+        poll_loopback(&mut iface, &mut device, &mut sockets, &mut clock);
+        // Fast-forward past TIME-WAIT so both ends reach Closed gracefully.
+        for _ in 0..40 {
+            clock += 1000;
+            iface.poll(SmolInstant::from_millis(clock), &mut device, &mut sockets);
+            observe_tcp_states(&sockets);
+        }
+        for handle in [client, server] {
+            let socket = sockets.get::<tcp::Socket>(handle);
+            assert_eq!(socket.state(), tcp::State::Closed);
+            assert!(!take_tcp_reset(socket, handle));
+        }
+    }
 }

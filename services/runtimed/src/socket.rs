@@ -814,6 +814,11 @@ fn terminate_request(
     match request.target_kind {
         TERMINATE_TARGET_PID => {
             let pid = i32::try_from(request.target_value).map_err(|_| libc::EINVAL)?;
+            // Runtime policy owns only the programs it launched. A pid it does
+            // not track (service, reused pid) is never a kill target.
+            if !state.running.contains_key(&pid) {
+                return Err(libc::ESRCH);
+            }
             super::spawn::terminate_pid(pid).map_err(|_| libc::EOWNERDEAD)?;
             terminated = true;
         }

@@ -69,6 +69,9 @@ const FREE_ALIGN: usize = align_of::<FreeBlock>();
 const MIN_FREE_BYTES: usize = size_of::<FreeBlock>();
 #[cfg(feature = "global-allocator")]
 const HEADER_BYTES: usize = size_of::<AllocationHeader>();
+/// Smallest tail worth splitting off when an allocation shrinks in place.
+#[cfg(feature = "global-allocator")]
+const SHRINK_SPLIT_BYTES: usize = 256;
 
 #[cfg(feature = "global-allocator")]
 struct AllocatorState {
@@ -181,6 +184,73 @@ impl AllocatorState {
         }
         (*header).cookie = 0;
         self.insert_free_span(span_start, span_size);
+        true
+    }
+
+    /// Resize a live allocation without moving it. Returns false when the
+    /// allocation is invalid or cannot reach `new_size` without a move, in
+    /// which case nothing was changed and the caller falls back to
+    /// allocate-copy-free. Never fires for alignments above what the original
+    /// allocation guaranteed because `user` itself does not move.
+    unsafe fn resize_in_place(&mut self, allocation: *mut u8, new_size: usize) -> bool {
+        let user = allocation as usize;
+        let Some(header_start) = user.checked_sub(HEADER_BYTES) else {
+            return false;
+        };
+        let header = header_start as *mut AllocationHeader;
+        if (*header).cookie != ALLOCATION_COOKIE ^ user {
+            return false;
+        }
+        let span_start = (*header).span_start;
+        let span_size = (*header).span_size;
+        let Some(span_end) = span_start.checked_add(span_size) else {
+            return false;
+        };
+        if span_start > header_start || span_end < user {
+            return false;
+        }
+        let Some(wanted_end) = user
+            .checked_add(new_size.max(1))
+            .and_then(|end| align_up(end, FREE_ALIGN))
+        else {
+            return false;
+        };
+        if wanted_end <= span_end {
+            // Shrink (or growth inside existing slack). Give back a tail only
+            // when it is large enough to be worth a free-list node.
+            let tail = span_end - wanted_end;
+            if tail >= SHRINK_SPLIT_BYTES {
+                (*header).span_size = wanted_end - span_start;
+                self.insert_free_span(wanted_end, tail);
+            }
+            return true;
+        }
+        // Growth: absorb the free block that starts exactly at the span end.
+        let mut link: *mut *mut FreeBlock = &mut self.free_head;
+        while !(*link).is_null() && (*link as usize) < span_end {
+            link = &mut (**link).next;
+        }
+        let block = *link;
+        if block.is_null() || block as usize != span_end {
+            return false;
+        }
+        let block_size = (*block).size;
+        let Some(block_end) = span_end.checked_add(block_size) else {
+            return false;
+        };
+        if wanted_end > block_end {
+            return false;
+        }
+        let next = (*block).next;
+        *link = next;
+        let mut new_end = wanted_end;
+        if block_end - new_end < MIN_FREE_BYTES {
+            new_end = block_end;
+        }
+        (*header).span_size = new_end - span_start;
+        if block_end > new_end {
+            self.insert_free_span(new_end, block_end - new_end);
+        }
         true
     }
 
@@ -399,6 +469,24 @@ unsafe impl GlobalAlloc for ReclaimingAllocator {
         let _ = state.deallocate(allocation);
         self.unlock();
     }
+
+    unsafe fn realloc(&self, allocation: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY (caller contract): `new_size` is non-zero and, rounded up to
+        // `layout.align()`, does not overflow `isize`.
+        let state = &mut *self.lock();
+        let resized = state.resize_in_place(allocation, new_size);
+        self.unlock();
+        if resized {
+            return allocation;
+        }
+        let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
+        let moved = self.alloc(new_layout);
+        if !moved.is_null() {
+            ptr::copy_nonoverlapping(allocation, moved, layout.size().min(new_size));
+            self.dealloc(allocation, layout);
+        }
+        moved
+    }
 }
 
 #[cfg(feature = "global-allocator")]
@@ -510,6 +598,213 @@ mod tests {
             let combined = allocator.alloc(large);
             assert!(!combined.is_null());
             allocator.dealloc(combined, large);
+        }
+    }
+
+    #[test]
+    fn realloc_grows_and_shrinks_in_place_and_preserves_contents() {
+        let mut heap = TestHeap([0; 32 * 1024]);
+        let allocator = ReclaimingAllocator::new();
+        // SAFETY: private live `heap`, single thread; each allocation is freed with
+        // the layout it currently has.
+        unsafe {
+            assert!((&mut *allocator.state.get())
+                .add_region(heap.0.as_mut_ptr() as usize, heap.0.len()));
+            let small = Layout::from_size_align(64, 16).unwrap();
+            let block = allocator.alloc(small);
+            assert!(!block.is_null());
+            core::ptr::write_bytes(block, 0xab, 64);
+            let grown = allocator.realloc(block, small, 8 * 1024);
+            assert_eq!(grown, block, "free tail follows, so growth stays in place");
+            assert!((0..64).all(|i| *grown.add(i) == 0xab));
+            core::ptr::write_bytes(grown, 0xcd, 8 * 1024);
+            let big = Layout::from_size_align(8 * 1024, 16).unwrap();
+            let shrunk = allocator.realloc(grown, big, 128);
+            assert_eq!(shrunk, grown);
+            assert!((0..128).all(|i| *shrunk.add(i) == 0xcd));
+            // A neighbour blocks in-place growth: the block must move intact.
+            let neighbour = allocator.alloc(small);
+            assert!(!neighbour.is_null());
+            let small128 = Layout::from_size_align(128, 16).unwrap();
+            let moved = allocator.realloc(shrunk, small128, 4 * 1024);
+            assert!(!moved.is_null());
+            assert!((0..128).all(|i| *moved.add(i) == 0xcd));
+            let moved_layout = Layout::from_size_align(4 * 1024, 16).unwrap();
+            allocator.dealloc(moved, moved_layout);
+            allocator.dealloc(neighbour, small);
+            // Everything coalesced back: one allocation spanning most of the heap fits.
+            let whole = Layout::from_size_align(30 * 1024, 16).unwrap();
+            let all = allocator.alloc(whole);
+            assert!(!all.is_null());
+            allocator.dealloc(all, whole);
+        }
+    }
+
+    /// Walk the free list and the live headers and assert the heap invariants:
+    /// free blocks are address-ordered, aligned, large enough, non-adjacent
+    /// (fully coalesced) and disjoint from every live span; live spans are
+    /// disjoint, contain their header and user bytes, and the free plus live
+    /// bytes account for the whole region.
+    unsafe fn check_heap(
+        allocator: &ReclaimingAllocator,
+        base: usize,
+        len: usize,
+        live: &[(*mut u8, Layout, u8)],
+    ) {
+        let state = &*allocator.state.get();
+        let mut spans: std::vec::Vec<(usize, usize, bool)> = std::vec::Vec::new();
+        let mut block = state.free_head;
+        let mut previous_end = 0_usize;
+        while !block.is_null() {
+            let start = block as usize;
+            let size = (*block).size;
+            assert_eq!(start & (FREE_ALIGN - 1), 0);
+            assert!(size >= MIN_FREE_BYTES && size & (FREE_ALIGN - 1) == 0);
+            assert!(start >= previous_end, "free list unordered or overlapping");
+            assert!(start != previous_end || previous_end == 0, "uncoalesced");
+            previous_end = start + size;
+            spans.push((start, size, true));
+            block = (*block).next;
+        }
+        for &(allocation, layout, _) in live {
+            let user = allocation as usize;
+            assert_eq!(user % layout.align(), 0);
+            let header = (user - HEADER_BYTES) as *const AllocationHeader;
+            assert_eq!((*header).cookie, ALLOCATION_COOKIE ^ user);
+            let (start, size) = ((*header).span_start, (*header).span_size);
+            assert!(start <= user - HEADER_BYTES);
+            assert!(start + size >= user + layout.size());
+            assert_eq!(size & (FREE_ALIGN - 1), 0);
+            spans.push((start, size, false));
+        }
+        spans.sort();
+        let mut cursor = base;
+        let mut accounted = 0;
+        for &(start, size, _) in &spans {
+            assert!(start >= cursor, "overlapping spans");
+            assert!(start + size <= base + len);
+            cursor = start + size;
+            accounted += size;
+        }
+        // Only sub-FREE_ALIGN head/tail slack of the region may be unaccounted.
+        assert!(len - accounted < 2 * FREE_ALIGN);
+    }
+
+    #[test]
+    fn randomized_realloc_alloc_free_keeps_heap_invariants_and_contents() {
+        let mut heap = std::vec![0_u8; 8 * 1024 * 1024 + 64];
+        let allocator = ReclaimingAllocator::new();
+        let base = heap.as_mut_ptr() as usize;
+        let len = heap.len();
+        // SAFETY: private live `heap`, single thread; every pointer is released with
+        // the layout it currently has and tracked in `live`.
+        unsafe {
+            assert!((&mut *allocator.state.get()).add_region(base, len));
+            let (region_base, region_len) = {
+                let start = align_up(base, FREE_ALIGN).unwrap();
+                (start, (base + len) / FREE_ALIGN * FREE_ALIGN - start)
+            };
+            let mut live: std::vec::Vec<(*mut u8, Layout, u8)> = std::vec::Vec::new();
+            let mut rng = 0x9e37_79b9_7f4a_7c15_u64;
+            let mut next = move || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            let mut in_place = 0_u32;
+            for step in 0..20_000_u32 {
+                let roll = next() % 10;
+                let aligns = [8_usize, 16, 32, 64, 256];
+                let pick = (next() % 997) as usize;
+                if (roll < 4 || live.is_empty()) && live.len() < 200 {
+                    let align = aligns[(next() % 5) as usize];
+                    let size = 1 + (pick * 7) % 3000;
+                    let layout = Layout::from_size_align(size, align).unwrap();
+                    let allocation = allocator.alloc(layout);
+                    if !allocation.is_null() {
+                        let tag = (step & 0xff) as u8;
+                        ptr::write_bytes(allocation, tag, size);
+                        live.push((allocation, layout, tag));
+                    }
+                } else if roll < 7 {
+                    let index = pick % live.len();
+                    let (allocation, layout, tag) = live[index];
+                    let new_size = match next() % 4 {
+                        0 => 1,
+                        1 => layout.size() + 1 + pick % 16,
+                        2 => layout.size() / 2 + 1,
+                        _ => 1 + (pick * 13) % 6000,
+                    };
+                    let moved = allocator.realloc(allocation, layout, new_size);
+                    if moved.is_null() {
+                        continue;
+                    }
+                    if moved == allocation {
+                        in_place += 1;
+                    }
+                    let keep = layout.size().min(new_size);
+                    assert!((0..keep).all(|i| *moved.add(i) == tag), "contents lost");
+                    ptr::write_bytes(moved, tag, new_size);
+                    live[index] = (moved, Layout::from_size_align(new_size, layout.align()).unwrap(), tag);
+                } else {
+                    let index = pick % live.len();
+                    let (allocation, layout, tag) = live.swap_remove(index);
+                    assert!((0..layout.size()).all(|i| *allocation.add(i) == tag));
+                    allocator.dealloc(allocation, layout);
+                }
+                if step % 50 == 0 {
+                    check_heap(&allocator, region_base, region_len, &live);
+                }
+            }
+            check_heap(&allocator, region_base, region_len, &live);
+            assert!(in_place > 100, "in-place path barely exercised: {in_place}");
+            for (allocation, layout, tag) in live.drain(..) {
+                assert!((0..layout.size()).all(|i| *allocation.add(i) == tag));
+                allocator.dealloc(allocation, layout);
+            }
+            let state = &*allocator.state.get();
+            assert!(!state.free_head.is_null());
+            assert!((*state.free_head).next.is_null(), "fully coalesced");
+            assert_eq!((*state.free_head).size, region_len);
+        }
+    }
+
+    #[test]
+    fn realloc_handles_split_threshold_slack_and_overaligned_move() {
+        let mut heap = TestHeap([0; 32 * 1024]);
+        let allocator = ReclaimingAllocator::new();
+        // SAFETY: private live `heap`, single thread; layouts match each live allocation.
+        unsafe {
+            assert!((&mut *allocator.state.get())
+                .add_region(heap.0.as_mut_ptr() as usize, heap.0.len()));
+            // Over-aligned allocation keeps its address and alignment across resizes.
+            let aligned = Layout::from_size_align(512, 4096).unwrap();
+            let block = allocator.alloc(aligned);
+            assert_eq!(block as usize & 4095, 0);
+            ptr::write_bytes(block, 0x5a, 512);
+            let grown = allocator.realloc(block, aligned, 2048);
+            assert_eq!(grown, block);
+            let aligned_big = Layout::from_size_align(2048, 4096).unwrap();
+            // Shrink by less than the split threshold: nothing is returned, still valid.
+            let shrunk = allocator.realloc(grown, aligned_big, 2048 - 64);
+            assert_eq!(shrunk, block);
+            assert!((0..512).all(|i| *shrunk.add(i) == 0x5a));
+            // The pin cannot fit in the prefix left by the over-aligned
+            // allocation. It occupies the trailing span and forces a move.
+            let pin_layout = Layout::from_size_align(4096, FREE_ALIGN).unwrap();
+            let pin = allocator.alloc(pin_layout);
+            assert!(!pin.is_null() && pin.addr() > shrunk.addr());
+            let cur = Layout::from_size_align(2048 - 64, 4096).unwrap();
+            let moved = allocator.realloc(shrunk, cur, 8192);
+            assert!(!moved.is_null() && moved as usize & 4095 == 0);
+            assert_ne!(moved, shrunk);
+            assert!((0..512).all(|i| *moved.add(i) == 0x5a));
+            let moved_layout = Layout::from_size_align(8192, 4096).unwrap();
+            allocator.dealloc(moved, moved_layout);
+            allocator.dealloc(pin, pin_layout);
+            let state = &*allocator.state.get();
+            assert!((*state.free_head).next.is_null(), "fully coalesced");
         }
     }
 

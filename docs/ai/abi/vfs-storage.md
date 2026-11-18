@@ -421,8 +421,10 @@ the read-only accelerator; TmpFs has it (next section).
   file or backing memfd. Snapshot creation retries short positive frame writes
   and rejects premature source EOF or zero-progress copies before publication.
   Flush reports premature frame EOF as an I/O error, not a successful partial
-  writeback. Sequential zero-byte writes, including O_APPEND, leave the cursor
-  unchanged.
+  writeback. Rename moves shared backings for the renamed path and its
+  component-boundary descendants to their new mount-relative names, retaining
+  frame identity and replacing any backing at the destination. Sequential
+  zero-byte writes, including O_APPEND, leave the cursor unchanged.
 
 ### Filesystem-neutral volumes, `MountTable`, and writable FAT
 

@@ -243,7 +243,17 @@ impl UiAssets {
             if !faces.contains_key(&path) {
                 let bytes = ui_config::read_bounded(&path, MAX_FONT_FILE_BYTES)
                     .map_err(|err| read_error(&path, "font ", &err))?;
-                let face = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
+                // Only printable ASCII is ever rasterized, one `char` at a time
+                // (`build_atlas`), so GSUB-only glyphs (ligatures, stylistic
+                // alternates) are unreachable. fontdue outlines every cmap glyph
+                // and, by default, every GSUB glyph as well; skipping the latter
+                // shortens the boot-time parse without changing any rasterized
+                // pixel (`build_time_and_runtime_atlases_have_identical_geometry_and_pixels`).
+                let settings = fontdue::FontSettings {
+                    load_substitutions: false,
+                    ..fontdue::FontSettings::default()
+                };
+                let face = fontdue::Font::from_bytes(bytes, settings)
                     .map_err(|err| {
                         LoadError::Invalid(format!("cannot parse font {}: {err}", path.display()))
                     })?;

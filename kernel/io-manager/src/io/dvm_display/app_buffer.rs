@@ -179,15 +179,17 @@ pub fn begin(
         return Err(AppBufferTransportError::Invalid);
     }
     let bytes = record.encode().ok_or(AppBufferTransportError::Invalid)?;
+    // Every fallible step precedes the revoke so a failure never leaves the
+    // capability revoked with no request published to the provider.
+    let sequence = mailbox
+        .sequence
+        .checked_add(1)
+        .ok_or(AppBufferTransportError::Exhausted)?;
     if revoke {
         pool.revoke(id)
             .map_err(|_| AppBufferTransportError::Stale)?;
     }
     drop(pool);
-    let sequence = mailbox
-        .sequence
-        .checked_add(1)
-        .ok_or(AppBufferTransportError::Exhausted)?;
     let kind = if revoke {
         DVM_APP_BUFFER_REQUEST_REVOKE
     } else {

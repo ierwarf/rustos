@@ -60,7 +60,9 @@ impl InetStack {
     pub(super) fn add_tcp_socket(&mut self) -> SocketHandle {
         let rx = tcp::SocketBuffer::new(vec![0; INET_TCP_BUFFER_CAPACITY]);
         let tx = tcp::SocketBuffer::new(vec![0; INET_TCP_BUFFER_CAPACITY]);
-        self.sockets.add(tcp::Socket::new(rx, tx))
+        let handle = self.sockets.add(tcp::Socket::new(rx, tx));
+        inet_tcp::forget_tcp_termination(handle);
+        handle
     }
 
     pub(super) fn remove(&mut self, transport: InetTransport) {
@@ -90,6 +92,7 @@ impl InetStack {
             .poll_egress(smol_now(), &mut self.device, &mut self.sockets);
         for handle in handles {
             self.sockets.remove(*handle);
+            inet_tcp::forget_tcp_termination(*handle);
         }
     }
 
@@ -136,6 +139,7 @@ impl InetStack {
         let timer_sweep_due =
             self.last_timer_sweep.elapsed() >= INET_TIMER_SWEEP_INTERVAL;
         if changed || timer_sweep_due {
+            inet_tcp::observe_tcp_states(&self.sockets);
             self.readiness_dirty = true;
         }
         if timer_sweep_due {
@@ -162,17 +166,20 @@ impl InetStack {
 
     pub(super) fn next_ephemeral_port(&mut self) -> Option<u16> {
         // Include lingering closes: smoltcp does not reject duplicate local endpoints.
-        let sockets = &self.sockets;
-        select_ephemeral_port(&mut self.next_port, |candidate| {
-            sockets.iter().any(|(_, socket)| {
-                match socket {
-                    smoltcp::socket::Socket::Tcp(tcp) => tcp.is_open()
-                        && tcp.local_endpoint().is_some_and(|ep| ep.port == candidate),
-                    smoltcp::socket::Socket::Udp(udp) => udp.is_open() && udp.endpoint().port == candidate,
-                    _ => false,
+        // One pass over the socket set builds the in-use set, so a crowded
+        // range costs O(sockets + candidates) instead of O(sockets * candidates).
+        let used: std::collections::HashSet<u16> = self
+            .sockets
+            .iter()
+            .filter_map(|(_, socket)| match socket {
+                smoltcp::socket::Socket::Tcp(tcp) if tcp.is_open() => {
+                    tcp.local_endpoint().map(|ep| ep.port)
                 }
+                smoltcp::socket::Socket::Udp(udp) if udp.is_open() => Some(udp.endpoint().port),
+                _ => None,
             })
-        })
+            .collect();
+        select_ephemeral_port(&mut self.next_port, |candidate| used.contains(&candidate))
     }
 }
 

@@ -483,6 +483,38 @@ fn shm_pool_admission_refuses_fds_whose_read_can_block_the_compositor() {
 }
 
 #[test]
+fn revived_toplevel_resets_role_state_but_keeps_surface_identity() {
+    use wayland_server::protocol::wl_surface::WlSurface;
+    let display = test_display();
+    let mut handle = display.handle();
+    let (server, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let client = handle
+        .insert_client(server, Arc::new(super::WaylandClientState::default()))
+        .unwrap();
+    let mut state = super::WaylandState::new(1024, 768);
+    let surface = state.create_surface_data(&client.id()).unwrap();
+    let resource = client
+        .create_resource::<WlSurface, _, super::WaylandState>(&handle, 6, surface.clone())
+        .unwrap();
+    let id = {
+        let mut window = surface.shared.lock().unwrap();
+        window.resource = Some(resource);
+        window.title = String::from("Old title");
+        window.decoration_requested_server = false;
+        window.pre_maximize_frame = Some(window.frame);
+        window.surface_id
+    };
+    assert!(state.retire_surface(&surface.shared));
+    assert!(state.revive_retired_surface(&surface));
+    let window = surface.shared.lock().unwrap();
+    assert_eq!(window.surface_id, id);
+    assert_eq!(window.title, "Wayland App");
+    assert!(window.decoration_requested_server);
+    assert!(window.pre_maximize_frame.is_none());
+    assert!(window.needs_initial_configure);
+}
+
+#[test]
 fn pointer_routing_requires_exact_ui_target_and_keeps_button_grab_on_original_client() {
     use wayland_server::{protocol::wl_surface::WlSurface, Resource};
     let display = test_display();
@@ -1952,3 +1984,78 @@ fn cleanup_disconnected_client_retires_surfaces_and_clears_focus_and_resources()
 
 mod arbitration;
 mod dmabuf_import;
+
+#[test]
+fn a_destroyed_toplevel_surface_can_be_given_a_new_toplevel_and_shown() {
+    use std::os::fd::AsRawFd;
+    let mut display = test_display();
+    super::create_wayland_globals(&display.handle());
+    let mut state = super::WaylandState::new(1024, 768);
+    let (server, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server, Arc::new(super::WaylandClientState::default()))
+        .unwrap();
+    wire::send(&mut peer, &wire::message(1, 1, &wire::u32s(&[2])));
+    pump(&mut display, &mut state);
+    let mut names = std::collections::HashMap::new();
+    for (obj, op, p) in wire::events(&mut peer) {
+        if obj == 2 && op == 0 {
+            let len = u32::from_ne_bytes(p[4..8].try_into().unwrap()) as usize;
+            names.insert(
+                String::from_utf8(p[8..8 + len - 1].to_vec()).unwrap(),
+                u32::from_ne_bytes(p[..4].try_into().unwrap()),
+            );
+        }
+    }
+    for (iface, ver, id) in [
+        ("wl_compositor", 6, 3),
+        ("wl_shm", 1, 4),
+        ("xdg_wm_base", 6, 5),
+    ] {
+        let mut args = wire::u32s(&[names[iface]]);
+        args.extend(wire::string(iface));
+        args.extend(wire::u32s(&[ver, id]));
+        wire::send(&mut peer, &wire::message(2, 0, &args));
+    }
+    wire::send(&mut peer, &wire::message(3, 0, &wire::u32s(&[6])));
+    wire::send(&mut peer, &wire::message(5, 2, &wire::u32s(&[7, 6])));
+    wire::send(&mut peer, &wire::message(7, 1, &wire::u32s(&[8])));
+    pump(&mut display, &mut state);
+    wire::events(&mut peer);
+    // Unmap: destroy the toplevel, then its xdg_surface.
+    wire::send(&mut peer, &wire::message(8, 0, &[]));
+    wire::send(&mut peer, &wire::message(7, 0, &[]));
+    pump(&mut display, &mut state);
+    assert!(!state.surfaces[0].shared.lock().unwrap().alive);
+    // Map again with a new role object on the same wl_surface.
+    wire::send(&mut peer, &wire::message(5, 2, &wire::u32s(&[9, 6])));
+    wire::send(&mut peer, &wire::message(9, 1, &wire::u32s(&[10])));
+    pump(&mut display, &mut state);
+    let serial = wire::events(&mut peer)
+        .iter()
+        .find(|(obj, op, _)| *obj == 9 && *op == 0)
+        .map(|(_, _, p)| u32::from_ne_bytes(p[..4].try_into().unwrap()))
+        .expect("the new toplevel receives its initial configure");
+    assert_eq!(state.surfaces.len(), 1);
+    assert!(state.surfaces[0].shared.lock().unwrap().alive);
+    wire::send(&mut peer, &wire::message(9, 4, &wire::u32s(&[serial])));
+    let file = shm_file(&[0x33; 16]);
+    wire::send_fd(
+        &peer,
+        &wire::message(4, 0, &wire::u32s(&[11, 16])),
+        file.as_raw_fd(),
+    );
+    wire::send(
+        &mut peer,
+        &wire::message(11, 0, &wire::u32s(&[12, 0, 2, 2, 8, 1])),
+    );
+    wire::send(&mut peer, &wire::message(6, 1, &wire::u32s(&[12, 0, 0])));
+    wire::send(&mut peer, &wire::message(6, 6, &[]));
+    pump(&mut display, &mut state);
+    wait_for_snapshot(&mut state);
+    assert_eq!(state.window_snapshots().len(), 1);
+    assert!(!wire::events(&mut peer)
+        .iter()
+        .any(|(obj, op, _)| *obj == 1 && *op == 0));
+}

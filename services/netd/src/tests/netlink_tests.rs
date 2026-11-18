@@ -156,6 +156,29 @@ fn unsupported_types_and_non_dump_requests_get_eopnotsupp() {
 }
 
 #[test]
+fn control_records_and_non_requests_are_skipped_and_only_acked_on_request() {
+    let links = [loopback_link()];
+    // NLMSG_DONE / NLMSG_ERROR / NLMSG_NOOP sent to the kernel: no reply.
+    for ty in [1_u16, NLMSG_ERROR, NLMSG_DONE] {
+        assert!(process_request(&nlmsg(16, ty, 0x1, 1, 0), 5, &links, &[]).is_empty());
+    }
+    // A message without NLM_F_REQUEST is not a request, even of a known type.
+    assert!(process_request(&nlmsg(20, RTM_GETLINK, 0x300, 1, 0), 5, &links, &[]).is_empty());
+    // NLM_F_ACK turns the skip into a success acknowledgement.
+    let ack = nlmsg(16, NLMSG_DONE, 0x1 | NLM_F_ACK, 4, 0);
+    assert_eq!(
+        process_request(&ack, 5, &links, &[]),
+        build_error(0, &ack, 4, 5)
+    );
+    // The skipped record does not stop the next message from being answered.
+    let mut two = nlmsg(16, NLMSG_DONE, 0x1, 1, 0);
+    two.extend_from_slice(&dump_request(RTM_GETLINK, 0, 2));
+    let mut expected = build_link_message(&links[0], 2, 5);
+    expected.extend_from_slice(&build_done(2, 5));
+    assert_eq!(process_request(&two, 5, &links, &[]), expected);
+}
+
+#[test]
 fn several_messages_and_malformed_tails_are_handled_like_the_kernel() {
     let links = [loopback_link()];
     let mut two = dump_request(RTM_GETLINK, 0, 1);
@@ -379,6 +402,9 @@ fn bind_assigns_and_protects_port_ids() {
     assert_eq!(groups_of(a), 0x7);
     // Rebinding keeps the port id and updates groups.
     assert_eq!(bind(a, 0xabc0_1111, 0), 0);
+    assert_eq!(groups_of(a), 0);
+    // A bound socket cannot move to a different explicit port id.
+    assert_eq!(bind(a, 0xabc0_2222, 0), libc::EINVAL);
     assert_eq!(groups_of(a), 0);
     assert_eq!(bind(b, 0xabc0_1111, 0), libc::EADDRINUSE);
     // pid 0 assigns a free id: the process id first, then a generated one.

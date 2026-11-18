@@ -134,16 +134,20 @@ fn replay_entry(operation_lo: u64, complete: bool, admitted: StdInstant) -> RefR
 fn full_replay_log_reclaims_only_old_completed_results() {
     let base = StdInstant::now();
     let later = base + REF_REPLAY_MIN_RETENTION + Duration::from_secs(1);
-    let mut log = VecDeque::from([
+    let mut log: HashMap<(u64, u64), RefReplayEntry> = [
         // Old and acknowledged-by-nobody: reclaimable.
         replay_entry(1, true, base),
         // Old but still executing: its request owns the slot.
         replay_entry(2, false, base),
         // Recent completed result: a retry may still need it.
         replay_entry(3, true, later - Duration::from_secs(1)),
-    ]);
+    ]
+    .into_iter()
+    .map(|entry| ((entry.operation_hi, entry.operation_lo), entry))
+    .collect();
     reclaim_stale_ref_results(&mut log, later);
-    let kept: Vec<u64> = log.iter().map(|entry| entry.operation_lo).collect();
+    let mut kept: Vec<u64> = log.values().map(|entry| entry.operation_lo).collect();
+    kept.sort_unstable();
     assert_eq!(kept, [2, 3]);
 }
 

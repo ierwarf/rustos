@@ -149,15 +149,12 @@ impl VfsState {
             for chunk_index in 0..chunk_count {
                 let (key_hi, key_lo) =
                     checkpoint_path_key(record.key_hi, chunk_index).ok_or(EIO)?;
-                let child = records
-                    .iter()
-                    .find(|candidate| {
-                        candidate.parent_hi == record.key_hi
-                            && candidate.parent_lo == VFSD_CHECKPOINT_HANDLE_TAG
-                            && candidate.key_hi == key_hi
-                            && candidate.key_lo == key_lo
-                            && candidate.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
-                    })
+                // Records are unique per (parent, key), so a keyed lookup
+                // replaces a scan of every record for every path chunk.
+                let child = self
+                    .checkpoint_records
+                    .get(&(record.key_hi, VFSD_CHECKPOINT_HANDLE_TAG, key_hi, key_lo))
+                    .filter(|child| child.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0)
                     .ok_or(EIO)?;
                 let expected = (path_len - path_bytes.len()).min(SERVICE_CHECKPOINT_VALUE_CAPACITY);
                 if child.value_len as usize != expected {
@@ -165,13 +162,13 @@ impl VfsState {
                 }
                 path_bytes.extend_from_slice(&child.value[..expected]);
             }
-            let live_children = records
-                .iter()
-                .filter(|candidate| {
-                    candidate.parent_hi == record.key_hi
-                        && candidate.parent_lo == VFSD_CHECKPOINT_HANDLE_TAG
-                        && candidate.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
-                })
+            let live_children = self
+                .checkpoint_records
+                .range(
+                    (record.key_hi, VFSD_CHECKPOINT_HANDLE_TAG, 0, 0)
+                        ..=(record.key_hi, VFSD_CHECKPOINT_HANDLE_TAG, u64::MAX, u64::MAX),
+                )
+                .filter(|(_, child)| child.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0)
                 .count();
             if live_children != chunk_count || path_bytes.len() != path_len {
                 return Err(EIO);

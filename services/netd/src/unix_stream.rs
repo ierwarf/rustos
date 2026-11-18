@@ -37,6 +37,12 @@ pub(super) fn handle_send(request: &NetdIpcRequest, response: &mut NetdIpcRespon
         if let Err(errno) = validate_sendmsg_control(&request.payload[control.clone()]) {
             return errno;
         }
+        if let Err(errno) = validate_sendmsg_credentials(
+            &request.payload[control.clone()],
+            request_credentials(request),
+        ) {
+            return errno;
+        }
         return match send_socket_message_in_state(
             &mut state,
             request,
@@ -410,7 +416,8 @@ pub(super) fn recv_connected_bytes(
         return Ok(SocketReceive::default());
     }
     if connected.incoming_bytes == 0 {
-        if connected.peer_closed || connected.peer_write_closed {
+        // SHUT_RD makes receive report EOF once the queue is drained.
+        if connected.peer_closed || connected.peer_write_closed || connected.recv_closed {
             return Ok(SocketReceive::default());
         }
         return Err(libc::EAGAIN);
@@ -474,7 +481,8 @@ pub(super) fn peek_connected_bytes(
         return Err(libc::ENOTCONN);
     };
     if connected.incoming_bytes == 0 {
-        if connected.peer_closed || connected.peer_write_closed {
+        // SHUT_RD makes receive report EOF once the queue is drained.
+        if connected.peer_closed || connected.peer_write_closed || connected.recv_closed {
             return Ok((0, false));
         }
         return Err(libc::EAGAIN);
@@ -598,6 +606,36 @@ pub(super) fn validate_sendmsg_control(control: &[u8]) -> Result<(), i32> {
     }
     if offset != control.len() {
         return Err(libc::EINVAL);
+    }
+    Ok(())
+}
+
+/// An `SCM_CREDENTIALS` the sender supplies is queued verbatim for the peer, so
+/// it must name the sender's own identity (Linux requires CAP_SETUID/SYS_ADMIN
+/// for anything else; only euid 0 stands in for that here). `control` has
+/// already passed `validate_sendmsg_control`.
+pub(super) fn validate_sendmsg_credentials(
+    control: &[u8],
+    sender: Credentials,
+) -> Result<(), i32> {
+    const HEADER: usize = size_of::<linux_abi::LinuxCmsghdr>();
+    let mut offset = 0usize;
+    while offset + HEADER <= control.len() {
+        let header = read_cmsghdr(&control[offset..])?;
+        let cmsg_len = usize::try_from(header.cmsg_len).map_err(|_| libc::EINVAL)?;
+        if header.cmsg_type == linux_abi::SCM_CREDENTIALS as u32 && sender.uid != 0 {
+            let data = &control[offset + HEADER..offset + cmsg_len];
+            if data.len() != size_of::<linux_abi::LinuxUCred>() {
+                return Err(libc::EINVAL);
+            }
+            let pid = i32::from_ne_bytes(data[0..4].try_into().map_err(|_| libc::EINVAL)?);
+            let uid = u32::from_ne_bytes(data[4..8].try_into().map_err(|_| libc::EINVAL)?);
+            let gid = u32::from_ne_bytes(data[8..12].try_into().map_err(|_| libc::EINVAL)?);
+            if pid != sender.pid || uid != sender.uid || gid != sender.gid {
+                return Err(libc::EPERM);
+            }
+        }
+        offset += cmsg_align(cmsg_len);
     }
     Ok(())
 }

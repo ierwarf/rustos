@@ -535,3 +535,72 @@ fn filesystem_names_accept_a_full_unterminated_sun_path_and_report_it_back() {
     over.push(b'a');
     assert_eq!(sockaddr_path_from_payload(&make_req(&over)), Err(libc::EINVAL));
 }
+
+#[test]
+fn shutdown_read_makes_drained_receive_eof_and_poll_hup_requires_both_directions() {
+    let mut state = NetState::new();
+    state.sockets.insert(1, connected_socket(2, None));
+    state.sockets.insert(2, connected_socket(1, None));
+    let mut dest = [0_u8; 8];
+    assert_eq!(
+        recv_socket_bytes_in_state(&mut state, &request(1), &mut dest, false).err(),
+        Some(libc::EAGAIN)
+    );
+    connected_mut(&mut state, 1).recv_closed = true;
+    let received = recv_socket_bytes_in_state(&mut state, &request(1), &mut dest, false).unwrap();
+    assert_eq!(received.read, 0, "SHUT_RD drained receive must report EOF, not block");
+    let events = (linux_abi::POLLIN | linux_abi::POLLRDHUP | linux_abi::POLLOUT) as u32;
+    let revents = unix_socket_revents(&state, 1, events).unwrap();
+    assert_ne!(revents & linux_abi::POLLIN as u32, 0);
+    assert_ne!(revents & linux_abi::POLLRDHUP as u32, 0);
+    assert_eq!(revents & linux_abi::POLLHUP as u32, 0, "one direction is not a hangup");
+    connected_mut(&mut state, 1).send_closed = true;
+    let revents = unix_socket_revents(&state, 1, events).unwrap();
+    assert_ne!(revents & linux_abi::POLLHUP as u32, 0);
+    // The peer shut both directions: this end sees the same hangup.
+    let peer = connected_mut(&mut state, 2);
+    peer.peer_read_closed = true;
+    peer.peer_write_closed = true;
+    let revents = unix_socket_revents(&state, 2, events).unwrap();
+    assert_ne!(revents & linux_abi::POLLHUP as u32, 0);
+}
+
+#[test]
+fn sendmsg_credentials_must_name_the_sender() {
+    let own = Credentials { pid: 7, uid: 1000, gid: 100 };
+    let cred = |pid: i32, uid: u32, gid: u32| {
+        let hdr = size_of::<linux_abi::LinuxCmsghdr>();
+        let total = hdr + size_of::<linux_abi::LinuxUCred>();
+        let mut control = vec![0_u8; total];
+        write_plain_old_data(
+            &mut control[..hdr],
+            &linux_abi::LinuxCmsghdr {
+                cmsg_len: total as u64,
+                cmsg_level: linux_abi::SOL_SOCKET as u32,
+                cmsg_type: linux_abi::SCM_CREDENTIALS as u32,
+            },
+        );
+        write_plain_old_data(
+            &mut control[hdr..],
+            &linux_abi::LinuxUCred { pid, uid, gid },
+        );
+        control
+    };
+    let honest = cred(7, 1000, 100);
+    assert_eq!(validate_sendmsg_control(&honest), Ok(()));
+    assert_eq!(validate_sendmsg_credentials(&honest, own), Ok(()));
+    for forged in [cred(8, 1000, 100), cred(7, 0, 100), cred(7, 1000, 0)] {
+        assert_eq!(validate_sendmsg_credentials(&forged, own), Err(libc::EPERM));
+    }
+    let root = Credentials { pid: 1, uid: 0, gid: 0 };
+    assert_eq!(validate_sendmsg_credentials(&cred(8, 5, 5), root), Ok(()));
+    // Rights alone never trip the credential check.
+    assert_eq!(validate_sendmsg_credentials(&rights(1), own), Ok(()));
+}
+
+#[test]
+fn unnamed_socket_address_reports_only_the_family() {
+    let mut response = NetdIpcResponse::default();
+    assert_eq!(sockaddr_payload(None, &mut response), Ok(0));
+    assert_eq!(response.payload_len, 2);
+}

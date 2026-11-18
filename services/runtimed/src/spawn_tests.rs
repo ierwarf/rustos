@@ -9,6 +9,18 @@
     }
 
     #[test]
+    fn argument_overflow_is_rejected_before_requesting_a_rootd_grant() {
+        // On the host the grant lookup fails with a different errno, so E2BIG
+        // proves the oversized argv was rejected before any grant request.
+        let argv = [std::ffi::CString::new(vec![b'a'; 2048]).unwrap()];
+        let err = super::build_loader_spawn_request(
+            "/bin/app", &argv, &[], false, 0, 0, false, None,
+        )
+        .unwrap_err();
+        assert_eq!(err, libc::E2BIG);
+    }
+
+    #[test]
     fn syscall_status_preserves_timeout_and_nonerror_results() {
         // SAFETY: an invalid Linux syscall has no host effects or pointers.
         let status = unsafe { libc::syscall(-1 as libc::c_long) as i64 };

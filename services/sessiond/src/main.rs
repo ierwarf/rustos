@@ -58,6 +58,13 @@ enum RpcDecision {
     Unknown(i32),
 }
 
+/// Retry delay after the `rejections`-th consecutive refusal of one desktop
+/// id: doubles from `RETRY_BACKOFF` up to 64x so a permanently refused entry is
+/// not re-submitted and re-logged five times a second for the whole session.
+fn rejection_delay(rejections: u32) -> Duration {
+    RETRY_BACKOFF * (1_u32 << rejections.saturating_sub(1).min(6))
+}
+
 fn may_auto_launch(entry: &LaunchEntry, abandoned_packages: &BTreeSet<String>) -> bool {
     !abandoned_packages.contains(entry.package_id.as_str())
 }
@@ -124,6 +131,8 @@ fn main() {
     // Consecutive early exits per desktop id; widens the retry delay so a
     // crash-looping `restart` service is not relaunched every 200 ms.
     let mut early_exits = BTreeMap::<String, u32>::new();
+    // Consecutive refused or unpreparable launch submissions per desktop id.
+    let mut rejections = BTreeMap::<String, u32>::new();
     let mut observed_digest = RUNNING_PROGRAMS_DIGEST_UNKNOWN;
     let mut running_desktop_ids = BTreeSet::<String>::new();
     let mut running_packages = BTreeSet::<String>::new();
@@ -144,6 +153,7 @@ fn main() {
                             .or_insert(0) += 1;
                     }
                     retry_after.remove(pending.entry.desktop_file_id.as_str());
+                    rejections.remove(pending.entry.desktop_file_id.as_str());
                     pending_launch = Some(PendingLaunch {
                         desktop_file_id: pending.entry.desktop_file_id,
                         package_id: pending.entry.package_id,
@@ -159,9 +169,13 @@ fn main() {
                         "launch {} rejected: errno={err}",
                         pending.entry.desktop_file_id
                     );
+                    let count = rejections
+                        .entry(pending.entry.desktop_file_id.clone())
+                        .or_insert(0);
+                    *count = count.saturating_add(1);
                     retry_after.insert(
                         pending.entry.desktop_file_id,
-                        Instant::now() + RETRY_BACKOFF,
+                        Instant::now() + rejection_delay(*count),
                     );
                 }
                 RpcDecision::Query => {
@@ -350,9 +364,11 @@ fn main() {
                         "launch {} could not be prepared: errno={err}",
                         entry.desktop_file_id
                     );
+                    let count = rejections.entry(entry.desktop_file_id.clone()).or_insert(0);
+                    *count = count.saturating_add(1);
                     retry_after.insert(
                         entry.desktop_file_id.clone(),
-                        Instant::now() + RETRY_BACKOFF,
+                        Instant::now() + rejection_delay(*count),
                     );
                     continue;
                 }
@@ -363,6 +379,7 @@ fn main() {
                         *launch_attempts.entry(entry.package_id.clone()).or_insert(0) += 1;
                     }
                     retry_after.remove(entry.desktop_file_id.as_str());
+                    rejections.remove(entry.desktop_file_id.as_str());
                     observability_client::info!(
                         "sessiond",
                         service,
@@ -379,9 +396,11 @@ fn main() {
                     break;
                 }
                 RpcDecision::Rejected(err) => {
+                    let count = rejections.entry(entry.desktop_file_id.clone()).or_insert(0);
+                    *count = count.saturating_add(1);
                     retry_after.insert(
                         entry.desktop_file_id.clone(),
-                        Instant::now() + RETRY_BACKOFF,
+                        Instant::now() + rejection_delay(*count),
                     );
                     observability_client::error!(
                         "sessiond",
@@ -651,6 +670,16 @@ mod tests {
                 requests[0].transaction_deadline_ns
             );
         }
+    }
+
+    #[test]
+    fn rejection_backoff_doubles_and_saturates() {
+        use super::{rejection_delay, RETRY_BACKOFF};
+        assert_eq!(rejection_delay(0), RETRY_BACKOFF);
+        assert_eq!(rejection_delay(1), RETRY_BACKOFF);
+        assert_eq!(rejection_delay(2), RETRY_BACKOFF * 2);
+        assert_eq!(rejection_delay(7), RETRY_BACKOFF * 64);
+        assert_eq!(rejection_delay(u32::MAX), RETRY_BACKOFF * 64);
     }
 
     #[test]

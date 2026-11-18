@@ -28,10 +28,12 @@ pub(super) fn handle_getpeername(request: &NetdIpcRequest, response: &mut NetdIp
         // The only netlink peer is the kernel: nl_pid 0, no groups.
         return netlink::write_kernel_sockaddr(response);
     }
-    let Some(addr) = socket.peer_path.as_ref() else {
+    // A connected endpoint with an unnamed peer (socketpair, unbound client)
+    // still has a peer: it reports the unnamed address, not ENOTCONN.
+    if socket.peer_path.is_none() && !matches!(socket.state, UnixSocketState::Connected(_)) {
         return libc::ENOTCONN;
-    };
-    sockaddr_payload(Some(addr), response).unwrap_or_else(|errno| errno)
+    }
+    sockaddr_payload(socket.peer_path.as_ref(), response).unwrap_or_else(|errno| errno)
 }
 
 pub(super) fn handle_getsockopt(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
@@ -64,18 +66,8 @@ pub(super) fn handle_getsockopt(request: &NetdIpcRequest, response: &mut NetdIpc
     }
     let mut state = lock_net_state();
     if state.inet_sockets.contains_key(&request.socket_token) {
-        let pending = if request.arg2 == linux_abi::SO_ERROR && state.inet_sockets[&request.socket_token].transport.is_datagram() {
-            inet_datagram::take_socket_error(&mut state, request.socket_token)
-        } else if request.arg2 == linux_abi::SO_ERROR
-            && state.inet_sockets[&request.socket_token]
-                .connect_deadline
-                .is_some()
-        {
-            // Nonblocking connect outcome; reading SO_ERROR consumes it.
-            match inet_connect_status(&mut state, request.socket_token) {
-                libc::EINPROGRESS => 0,
-                errno => errno,
-            }
+        let pending = if request.arg2 == linux_abi::SO_ERROR {
+            take_inet_socket_error(&mut state, request.socket_token)
         } else {
             0
         };
@@ -138,6 +130,21 @@ pub(super) fn handle_getsockopt(request: &NetdIpcRequest, response: &mut NetdIpc
     response.payload_len = size_of::<i32>() as u32;
     response.value = 0;
     0
+}
+
+pub(super) fn take_inet_socket_error(state: &mut NetState, token: u64) -> i32 {
+    let socket = &state.inet_sockets[&token];
+    if socket.transport.is_datagram() {
+        inet_datagram::take_socket_error(state, token)
+    } else if socket.connect_deadline.is_some() {
+        // A pending active open takes precedence over established resets.
+        match inet_connect_status(state, token) {
+            libc::EINPROGRESS => 0,
+            errno => errno,
+        }
+    } else {
+        inet_tcp::take_tcp_socket_error(state, token)
+    }
 }
 
 pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
@@ -315,10 +322,9 @@ pub(super) fn sockaddr_payload(
 ) -> Result<i32, i32> {
     response.payload[..2].copy_from_slice(&(linux_abi::AF_UNIX as u16).to_ne_bytes());
     let needed = match address {
-        None => {
-            response.payload[2] = 0;
-            size_of::<u16>() + 1
-        }
+        // An unnamed socket reports only its family (addrlen 2), as Linux does;
+        // a trailing NUL byte would read as an empty abstract name.
+        None => size_of::<u16>(),
         Some(UnixAddress::Filesystem(path)) => {
             // A shorter path is reported with its NUL; a full 108-byte
             // `sun_path` has no room for one and is reported without it.

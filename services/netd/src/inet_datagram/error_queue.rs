@@ -320,8 +320,11 @@ pub(super) fn receive(
     } else {
         copied
     } as u64;
-    errors.queue.pop_front();
-    errors.pending = errors.queue.front().map(|e| e.errno);
+    // MSG_PEEK leaves the record (and SO_ERROR) untouched, as on Linux.
+    if flags & libc::MSG_PEEK as u64 == 0 {
+        errors.queue.pop_front();
+        errors.pending = errors.queue.front().map(|e| e.errno);
+    }
     0
 }
 
@@ -590,6 +593,26 @@ mod tests {
             0
         );
         assert_eq!(take_pending(&mut socket), libc::ENETUNREACH);
+    }
+
+    #[test]
+    fn error_queue_peek_does_not_consume_the_record() {
+        let mut socket = ingress(&quote(49152));
+        let mut response = NetdIpcResponse::default();
+        let peek = (libc::MSG_ERRQUEUE | libc::MSG_PEEK) as u64;
+        for _ in 0..2 {
+            assert_eq!(receive(&mut socket, &mut response, 32, peek), 0);
+            let message =
+                netd_message::decode(&response.payload[..response.payload_len as usize]).unwrap();
+            assert_eq!(message.data, b"dns?");
+        }
+        assert!(socket.errors.as_ref().unwrap().has_error());
+        assert_eq!(take_pending(&mut socket), libc::ECONNREFUSED);
+        assert_eq!(receive(&mut socket, &mut response, 32, libc::MSG_ERRQUEUE as u64), 0);
+        assert_eq!(
+            receive(&mut socket, &mut response, 32, libc::MSG_ERRQUEUE as u64),
+            libc::EAGAIN
+        );
     }
 
     #[test]

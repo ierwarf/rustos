@@ -122,6 +122,7 @@ pub(super) fn unix_socket_revents_for(state: &NetState, socket: &UnixSocket, req
                 && (connected.incoming_bytes != 0
                     || !connected.incoming.is_empty()
                     || connected.peer_write_closed
+                    || connected.recv_closed
                     || connected.peer_closed)
             {
                 revents |= linux_abi::POLLIN as u32;
@@ -143,11 +144,15 @@ pub(super) fn unix_socket_revents_for(state: &NetState, socket: &UnixSocket, req
                 }
             }
             if requested & linux_abi::POLLRDHUP as u32 != 0
-                && (connected.peer_write_closed || connected.peer_closed)
+                && (connected.peer_write_closed || connected.recv_closed || connected.peer_closed)
             {
                 revents |= linux_abi::POLLRDHUP as u32;
             }
-            if connected.peer_closed {
+            // Linux reports POLLHUP once both directions are shut down, whether
+            // by this end, by the peer, or by one of each.
+            let read_shut = connected.recv_closed || connected.peer_write_closed;
+            let write_shut = connected.send_closed || connected.peer_read_closed;
+            if connected.peer_closed || (read_shut && write_shut) {
                 revents |= linux_abi::POLLHUP as u32;
             }
             if peer_connected.is_none() {

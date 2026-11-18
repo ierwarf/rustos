@@ -403,8 +403,10 @@ fn read_gpt_copy<D: BlockDevice>(
         || (header_lba != 1 && (entry_lba <= last || end > header_lba))
     { return Err(invalid); }
     let mut data = zeroed_buffer(blocks.checked_mul(block_size).ok_or(invalid)?)?;
-    for (i, block) in data.chunks_exact_mut(block_size).enumerate() {
-        dev.read_blocks(entry_lba + i as u64, block)?;
+    // Batched transfers: one device request per 64 KiB rather than per block.
+    let chunk_blocks = (64 * 1024 / block_size).max(1);
+    for (i, chunk) in data.chunks_mut(chunk_blocks * block_size).enumerate() {
+        dev.read_blocks(entry_lba + (i * chunk_blocks) as u64, chunk)?;
     }
     if !crc32_update(!0, &data[..bytes]) != le_u32(&header, 88) { return Err(invalid); }
     let mut partitions = Vec::new();

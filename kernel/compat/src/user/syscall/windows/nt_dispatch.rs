@@ -70,6 +70,9 @@ use crate::multitask;
 use crate::user::process_state::{Win32MappedView, Win32SectionObject};
 use crate::user::sysops::usermem;
 
+const STATUS_NOT_MAPPED_VIEW: u64 = 0xc000_0019;
+const STATUS_FREE_VM_NOT_AT_BASE: u64 = 0xc000_009f;
+const STATUS_MEMORY_NOT_ALLOCATED: u64 = 0xc000_00a0;
 const WIN32_VA_FLOOR: u64 = 0x0000_0000_0010_0000;
 const WIN32_DYNAMIC_VA_START: u64 = 0x0000_0001_0000_0000;
 const WIN32_DYNAMIC_VA_END: u64 = 0x0000_7fff_0000_0000;
@@ -1140,6 +1143,12 @@ fn page_flags_to_protect(flags: PageTableFlags) -> u32 {
     }
 }
 
+/// End of a user-supplied decommit range, or `None` if it wraps or leaves user space.
+fn decommit_range_end(base: u64, size: u64) -> Option<u64> {
+    base.checked_add(size)
+        .filter(|end| *end <= paging::USER_SPACE_END_EXCLUSIVE)
+}
+
 fn vmas_overlap(vmas: &[Win32MappedView], start: u64, end: u64) -> bool {
     vmas.iter().any(|v| {
         let v_end = v.base.saturating_add(v.size);
@@ -1587,11 +1596,14 @@ fn nt_free_virtual_memory(
             if size != 0 {
                 return Err(STATUS_INVALID_PARAMETER);
             }
+            // Windows releases a whole allocation and only by its exact
+            // allocation base; a base inside an allocation is rejected rather
+            // than releasing a sub-view.
             let matching: Vec<Win32MappedView> = process_state
                 .win32_objects()
                 .vmas
                 .iter()
-                .filter(|v| v.allocation_base == aligned_base || v.base == aligned_base)
+                .filter(|v| v.allocation_base == aligned_base)
                 .cloned()
                 .collect();
             let release_size = if let Some(first) = matching.first() {
@@ -1608,14 +1620,29 @@ fn nt_free_virtual_memory(
                 process_state
                     .win32_objects_mut()
                     .vmas
-                    .retain(|v| v.allocation_base != aligned_base && v.base != aligned_base);
+                    .retain(|v| v.allocation_base != aligned_base);
                 total
+            } else if process_state
+                .win32_objects()
+                .vmas
+                .iter()
+                .any(|v| aligned_base >= v.base && aligned_base < v.base.saturating_add(v.size))
+            {
+                return Err(STATUS_FREE_VM_NOT_AT_BASE);
+            } else if process_state
+                .windows_runtime()
+                .is_none_or(|rt| rt.process_parameters_address != aligned_base)
+            {
+                // Pages outside every Win32 VMA belong to the loader (image,
+                // PEB/TEB, stacks); only the loader-mapped ProcessParameters
+                // block may be released without a VMA record.
+                return Err(STATUS_MEMORY_NOT_ALLOCATED);
             } else {
-                // Fallback for standalone pages like initial ProcessParameters.
                 let mut pages = 0usize;
-                while let Some(_) = process_state
+                while process_state
                     .address_space()
                     .translate_user(VirtAddr::new(aligned_base + (pages as u64) * PAGE_SIZE))
+                    .is_some()
                 {
                     pages += 1;
                     if pages >= 1024 {
@@ -1623,7 +1650,7 @@ fn nt_free_virtual_memory(
                     }
                 }
                 if pages == 0 {
-                    return Err(STATUS_INVALID_PARAMETER);
+                    return Err(STATUS_MEMORY_NOT_ALLOCATED);
                 }
                 let _ = process_state
                     .address_space_mut()
@@ -1634,11 +1661,15 @@ fn nt_free_virtual_memory(
         } else if free_type == MEM_DECOMMIT {
             let aligned_size = align_up_page(size.max(PAGE_SIZE)).ok_or(STATUS_INVALID_PARAMETER)?;
             let pages = usize::try_from(aligned_size / PAGE_SIZE).map_err(|_| STATUS_INVALID_PARAMETER)?;
+            // `base`/`size` are user supplied: an unchecked sum would wrap (or
+            // panic in debug builds) and decommit/relabel the wrong range.
+            let decommit_end =
+                decommit_range_end(aligned_base, aligned_size).ok_or(STATUS_INVALID_PARAMETER)?;
             let _ = process_state
                 .address_space_mut()
                 .unmap_present_user_pages_at(VirtAddr::new(aligned_base), pages);
             for v in &mut process_state.win32_objects_mut().vmas {
-                if v.base >= aligned_base && v.base + v.size <= aligned_base + aligned_size {
+                if v.base >= aligned_base && v.base.saturating_add(v.size) <= decommit_end {
                     v.state = MEM_RESERVE as u32;
                 }
             }
@@ -2474,8 +2505,12 @@ fn nt_query_information_file(frame: &SyscallFrame) -> u64 {
     };
     let is_dir = ((stat.st_mode & 0o170_000) == 0o040_000) as u8;
     let file_size = stat.st_size.max(0);
-    let alloc_size = (file_size + 4095) & !4095;
-    let mtime = (stat.st_mtim.tv_sec.saturating_mul(10_000_000)) + FILE_EPOCH_BIAS_100NS;
+    let alloc_size = file_size.min(i64::MAX - 4095).saturating_add(4095) & !4095;
+    let mtime = stat
+        .st_mtim
+        .tv_sec
+        .saturating_mul(10_000_000)
+        .saturating_add(FILE_EPOCH_BIAS_100NS);
 
     match info_class {
         4 /* FileBasicInformation */ => {
@@ -2917,7 +2952,11 @@ fn nt_query_attributes_file(oa_ptr: u64, info_ptr: u64, full: bool) -> u64 {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     };
     let is_dir = (st.stx_mode & 0o170_000) == 0o040_000;
-    let mtime = (st.stx_mtime.tv_sec.saturating_mul(10_000_000)) + FILE_EPOCH_BIAS_100NS;
+    let mtime = st
+        .stx_mtime
+        .tv_sec
+        .saturating_mul(10_000_000)
+        .saturating_add(FILE_EPOCH_BIAS_100NS);
     let attrs = if is_dir { 0x10 } else { 0x80 };
     if full {
         let info = FileNetworkOpenInformation64 {
@@ -2925,8 +2964,8 @@ fn nt_query_attributes_file(oa_ptr: u64, info_ptr: u64, full: bool) -> u64 {
             last_access_time: mtime,
             last_write_time: mtime,
             change_time: mtime,
-            allocation_size: ((st.stx_size as i64) + 4095) & !4095,
-            end_of_file: st.stx_size as i64,
+            allocation_size: (st.stx_size.min(i64::MAX as u64 - 4095) as i64 + 4095) & !4095,
+            end_of_file: st.stx_size.min(i64::MAX as u64) as i64,
             file_attributes: attrs,
             _pad: 0,
         };
@@ -3328,7 +3367,13 @@ fn nt_map_view_of_section(frame: &SyscallFrame, is_ex: bool) -> u64 {
     let mapped = multitask::with_current_user_process_state_mut(|_, _, st| {
         let base = if requested_base != 0 {
             let b = align_down_page(requested_base);
-            if vmas_overlap(&st.win32_objects().vmas, b, b + mapped_len)
+            let Some(b_end) = b.checked_add(mapped_len) else {
+                return Err(STATUS_INVALID_PARAMETER);
+            };
+            if b < paging::USER_SPACE_BASE || b_end >= paging::USER_SPACE_END_EXCLUSIVE {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            if vmas_overlap(&st.win32_objects().vmas, b, b_end)
                 || !st
                     .address_space()
                     .user_range_is_unmapped(VirtAddr::new(b), pages)
@@ -3545,31 +3590,28 @@ fn nt_unmap_view_of_section(proc_handle: u64, base_addr: u64) -> u64 {
     }
     let aligned = align_down_page(base_addr);
     let removed = multitask::with_current_user_process_state_mut(|_, _, st| {
-        let mut size = None;
-        st.win32_objects_mut().vmas.retain(|v| {
-            if v.allocation_base == aligned || v.base == aligned {
-                size = Some(v.size);
-                false
-            } else {
-                true
-            }
-        });
-        if let Some(sz) = size
-            && let Ok(pages) = usize::try_from(sz / PAGE_SIZE)
-            && pages > 0
-        {
+        // Only a mapped/image view may be unmapped here; private VirtualAlloc
+        // regions are released through NtFreeVirtualMemory.
+        let idx = st.win32_objects().vmas.iter().position(|v| {
+            v.base == aligned
+                && v.allocation_base == aligned
+                && v.mem_type != MEM_PRIVATE as u32
+        })?;
+        let view = st.win32_objects_mut().vmas.remove(idx);
+        let pages = usize::try_from(view.size / PAGE_SIZE).unwrap_or(0);
+        if pages > 0 {
             let _ = st
                 .address_space_mut()
                 .unmap_present_user_pages_at(VirtAddr::new(aligned), pages);
-            return true;
         }
-        false
+        Some(())
     })
-    .unwrap_or(false);
+    .flatten()
+    .is_some();
     if removed {
         STATUS_SUCCESS
     } else {
-        STATUS_INVALID_PARAMETER
+        STATUS_NOT_MAPPED_VIEW
     }
 }
 
@@ -4163,6 +4205,18 @@ pub(super) fn linux_errno_to_ntstatus(errno: i64) -> u64 {
         LINUX_EACCES | LINUX_EPERM => STATUS_ACCESS_DENIED,
         LINUX_ENOMEM => STATUS_NO_MEMORY,
         LINUX_EBADF => STATUS_INVALID_HANDLE,
+        // Linux x86-64 errno values; these have no shared constants here.
+        16 /* EBUSY */ => 0xc000_0043,          // STATUS_SHARING_VIOLATION
+        17 /* EEXIST */ => 0xc000_0035,         // STATUS_OBJECT_NAME_COLLISION
+        18 /* EXDEV */ => 0xc000_00d4,          // STATUS_NOT_SAME_DEVICE
+        21 /* EISDIR */ => 0xc000_00ba,         // STATUS_FILE_IS_A_DIRECTORY
+        22 /* EINVAL */ => STATUS_INVALID_PARAMETER,
+        23 | 24 /* ENFILE | EMFILE */ => 0xc000_011f, // STATUS_TOO_MANY_OPENED_FILES
+        28 /* ENOSPC */ => 0xc000_007f,         // STATUS_DISK_FULL
+        30 /* EROFS */ => 0xc000_00a2,          // STATUS_MEDIA_WRITE_PROTECTED
+        32 /* EPIPE */ => 0xc000_014b,          // STATUS_PIPE_BROKEN
+        36 /* ENAMETOOLONG */ => 0xc000_0033,   // STATUS_OBJECT_NAME_INVALID
+        39 /* ENOTEMPTY */ => 0xc000_0101,      // STATUS_DIRECTORY_NOT_EMPTY
         _ => STATUS_OBJECT_PATH_NOT_FOUND,
     }
 }

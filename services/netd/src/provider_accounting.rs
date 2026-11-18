@@ -14,7 +14,7 @@
 use rustos_component_model::provider_wire::Frame;
 use rustos_svc_runtime::provider_client::{self, Error, ProviderClient, Receipt, State};
 use rustos_user_abi::syscall::IPC_SERVICE_NETD;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -27,23 +27,35 @@ struct Accounting {
     client: ProviderClient,
     // Every charge reserves its eventual refund slot BEFORE the first IPC.
     // Live and in-flight tokens consume capacity too: close can never overflow.
-    custody: VecDeque<(u64, bool)>,
+    // Value: the token is marked for refund (and is queued in `refunds`).
+    custody: HashMap<u64, bool>,
+    // Tokens marked for refund, in service order; a failed refund rotates to
+    // the back so one stuck token cannot starve the others. Indexed so
+    // reserve/retire/settle never scan the (up to MAX_LOCAL_SESSIONS) book.
+    refunds: VecDeque<u64>,
 }
 impl Accounting {
+    fn new(client: ProviderClient) -> Self {
+        Self {
+            client,
+            custody: HashMap::new(),
+            refunds: VecDeque::new(),
+        }
+    }
     fn reserve(&mut self, token: u64) -> Result<(), i32> {
-        if self.custody.iter().any(|entry| entry.0 == token) {
+        if self.custody.contains_key(&token) {
             return Err(libc::EAGAIN);
         }
         if self.custody.len() >= provider_client::MAX_LOCAL_SESSIONS {
             return Err(libc::ENOSPC);
         }
-        self.custody.push_back((token, false));
+        self.custody.insert(token, false);
         Ok(())
     }
     fn prepare_charge(&mut self, token: u64, pid: u64) -> Result<Frame, i32> {
         self.reserve(token)?;
         if let Err(err) = self.client.begin_charge(token, pid) {
-            self.custody.retain(|entry| entry.0 != token);
+            self.custody.remove(&token);
             return Err(errno(err));
         }
         self.client.dispatch_charge(token).map_err(errno)
@@ -56,21 +68,26 @@ impl Accounting {
         result
     }
     fn retire(&mut self, token: u64) {
-        if let Some(entry) = self.custody.iter_mut().find(|entry| entry.0 == token) {
-            entry.1 = true;
+        if let Some(marked) = self.custody.get_mut(&token) {
+            if !*marked {
+                *marked = true;
+                self.refunds.push_back(token);
+            }
         }
     }
     fn settle(&mut self, token: u64, success: bool) {
-        let Some(index) = self
-            .custody
-            .iter()
-            .position(|entry| *entry == (token, true))
-        else {
+        if self.custody.get(&token) != Some(&true) {
+            return;
+        }
+        // The refund worker settles the front entry, so this is O(1) in practice.
+        let Some(index) = self.refunds.iter().position(|queued| *queued == token) else {
             return;
         };
-        let entry = self.custody.remove(index).expect("reserved refund custody");
-        if !success {
-            self.custody.push_back(entry)
+        self.refunds.remove(index);
+        if success {
+            self.custody.remove(&token);
+        } else {
+            self.refunds.push_back(token);
         }
     }
 }
@@ -87,10 +104,9 @@ fn refund_worker() {
         // In-flight refunds keep their reserved slot and block token reuse.
         let token = lock()
             .expect("netd accounting lock")
-            .custody
-            .iter()
-            .find(|entry| entry.1)
-            .map(|entry| entry.0);
+            .refunds
+            .front()
+            .copied();
         if let Some(token) = token {
             let success = release_if_funded(token).is_ok();
             lock().expect("netd accounting lock").settle(token, success);
@@ -120,10 +136,7 @@ fn ledger() -> Result<&'static Mutex<Accounting>, i32> {
         }
         ProviderClient::new(IPC_SERVICE_NETD, pid as u64, epoch)
             .map(|client| {
-                Mutex::new(Accounting {
-                    client,
-                    custody: VecDeque::new(),
-                })
+                Mutex::new(Accounting::new(client))
             })
             .map_err(|_| libc::EINVAL)
     }) {
@@ -272,10 +285,7 @@ mod tests {
     use super::*;
     #[test]
     fn refund_custody_is_reserved_before_charge_and_survives_failed_retry() {
-        let mut book = Accounting {
-            client: ProviderClient::new(3, 12, 7).unwrap(),
-            custody: VecDeque::new(),
-        };
+        let mut book = Accounting::new(ProviderClient::new(3, 12, 7).unwrap());
         for token in 1..=provider_client::MAX_LOCAL_SESSIONS as u64 {
             book.reserve(token).unwrap();
         }
@@ -285,12 +295,14 @@ mod tests {
         book.settle(1, false);
         assert_eq!(book.custody.len(), provider_client::MAX_LOCAL_SESSIONS);
         assert_eq!(book.reserve(1), Err(libc::EAGAIN));
-        assert_eq!(book.custody.back(), Some(&(1, true)));
+        assert_eq!(book.custody.get(&1), Some(&true));
+        assert_eq!(book.refunds.back(), Some(&1));
         book.settle(2, true); // Never settle live custody.
         assert_eq!(book.custody.len(), provider_client::MAX_LOCAL_SESSIONS);
         book.settle(1, true);
         book.reserve(1).unwrap();
-        assert_eq!(book.custody.back(), Some(&(1, false)));
+        assert_eq!(book.custody.get(&1), Some(&false));
+        assert!(book.refunds.is_empty());
         book.retire(0); // Unfunded internal endpoint is a no-op.
     }
     #[test]
@@ -298,10 +310,7 @@ mod tests {
         use crate::{retire_unix_socket, settle_socket_publication_at, NetState, NetdIpcRequest};
         use rustos_component_model::provider_wire::Phase;
         for (now, bind_error) in [(100, libc::EPIPE), (99, libc::EPIPE), (99, 0)] {
-            let mut book = Accounting {
-                client: ProviderClient::new(3, 12, 7).unwrap(),
-                custody: VecDeque::new(),
-            };
+            let mut book = Accounting::new(ProviderClient::new(3, 12, 7).unwrap());
             let token = 71;
             let charge = book.prepare_charge(token, 20).unwrap();
             // CHARGE commits, but returns only at/near the caller end.
@@ -382,16 +391,14 @@ mod tests {
     #[test]
     fn lost_charge_ack_is_cancelled_with_original_nonce_before_accept_token_reuse() {
         use rustos_component_model::provider_wire::{Operation, Phase};
-        let mut book = Accounting {
-            client: ProviderClient::new(3, 12, 7).unwrap(),
-            custody: VecDeque::new(),
-        };
+        let mut book = Accounting::new(ProviderClient::new(3, 12, 7).unwrap());
         let charge = book.prepare_charge(71, 20).unwrap();
         assert_eq!(
             book.finish_charge(71, Err(libc::ETIMEDOUT)),
             Err(libc::ETIMEDOUT)
         );
-        assert_eq!(book.custody.front(),Some(&(71,true)),"unknown outcome must autonomously enter cancellation");
+        assert_eq!(book.custody.get(&71), Some(&true), "unknown outcome must autonomously enter cancellation");
+        assert_eq!(book.refunds.front(), Some(&71));
         assert_eq!(book.prepare_charge(71, 21), Err(libc::EAGAIN));
         let cancel = book.client.begin_cancel(71).unwrap();
         assert_eq!(cancel.operation, Operation::Cancel);

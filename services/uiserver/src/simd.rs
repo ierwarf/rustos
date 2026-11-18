@@ -1,5 +1,7 @@
 use core::ptr;
 
+use crate::canvas::div255_round;
+
 #[cfg(target_arch = "x86_64")]
 use std::sync::OnceLock;
 
@@ -64,9 +66,9 @@ fn blend_solid_bgr_scalar(dst: &mut [u32], src_color: u32, alpha: u8) {
         let dst_g = (*pixel >> 8) & 0xff;
         let dst_r = (*pixel >> 16) & 0xff;
 
-        let out_b = (src_b * alpha + dst_b * inv_alpha) / 255;
-        let out_g = (src_g * alpha + dst_g * inv_alpha) / 255;
-        let out_r = (src_r * alpha + dst_r * inv_alpha) / 255;
+        let out_b = div255_round(src_b * alpha + dst_b * inv_alpha);
+        let out_g = div255_round(src_g * alpha + dst_g * inv_alpha);
+        let out_r = div255_round(src_r * alpha + dst_r * inv_alpha);
         *pixel = (out_r << 16) | (out_g << 8) | out_b;
     }
 }
@@ -145,5 +147,25 @@ unsafe fn blend_solid_bgr_avx2(dst: *mut u32, len: usize, src_color: u32, alpha:
             );
         }
         _mm256_zeroupper();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn solid_blend_rounds_identically_in_wide_and_scalar_paths() {
+        for alpha in [1_u8, 7, 64, 128, 200, 254] {
+            let src = 0x0037_c0a5;
+            let base: Vec<u32> = (0..67_u32)
+                .map(|i| (i * 3 & 0xff) << 16 | (i * 5 & 0xff) << 8 | (i * 11 & 0xff))
+                .collect();
+            let mut wide = base.clone();
+            blend_solid_bgr(&mut wide, src, alpha);
+            let mut scalar = base.clone();
+            blend_solid_bgr_scalar(&mut scalar, src, alpha);
+            assert_eq!(wide, scalar, "alpha={alpha}");
+        }
     }
 }

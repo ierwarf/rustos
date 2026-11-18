@@ -695,11 +695,19 @@ fn handle_rt_sigaction(request: &ProcdIpcRequest, response: &mut ProcdIpcRespons
         return;
     }
     let mut policy = PROCESS_SIGNAL_POLICY.lock();
-    let state = policy.entry(request.pid).or_default();
-    let old = state.sigactions[signal];
-    if has_action {
+    let old = if has_action {
+        // Only a mutation needs a per-process record; a pure query must not
+        // allocate a 2 KiB table for a process that never changed a handler.
+        let state = policy.entry(request.pid).or_default();
+        let old = state.sigactions[signal];
         state.sigactions[signal] = read_sigaction(&request.payload[..LINUX_SIGACTION_SIZE]);
-    }
+        old
+    } else {
+        policy
+            .get(&request.pid)
+            .map(|state| state.sigactions[signal])
+            .unwrap_or_default()
+    };
     if wants_old {
         response.payload[..LINUX_SIGACTION_SIZE].copy_from_slice(sigaction_bytes(&old));
         response.payload_len = LINUX_SIGACTION_SIZE as u32;
@@ -722,6 +730,20 @@ fn handle_rt_sigprocmask(request: &ProcdIpcRequest, response: &mut ProcdIpcRespo
         0
     };
     let mut policy = THREAD_SIGNAL_POLICY.lock();
+    if !has_set {
+        // A pure query reports the cached mask or the kernel-seeded one
+        // without creating a record.
+        let old = policy
+            .get(&(request.pid, request.tid))
+            .copied()
+            .unwrap_or_else(|| ThreadSignalPolicy::initial_from_request(request))
+            .signal_mask;
+        if wants_old {
+            response.payload[..8].copy_from_slice(&old.to_le_bytes());
+            response.payload_len = 8;
+        }
+        return;
+    }
     let state = policy
         .entry((request.pid, request.tid))
         .or_insert_with(|| ThreadSignalPolicy::initial_from_request(request));
@@ -1194,6 +1216,31 @@ mod tests {
         let mut mask_resp = ProcdIpcResponse::default();
         handle_rt_sigprocmask(&mask_req, &mut mask_resp);
         assert_eq!(mask_resp.status, EINVAL);
+        assert!(!THREAD_SIGNAL_POLICY.lock().contains_key(&(pid, pid)));
+    }
+    #[test]
+    fn pure_signal_queries_do_not_allocate_policy_entries() {
+        let pid = u64::MAX - 40;
+        let mut act = ProcdIpcRequest::default();
+        act.pid = pid;
+        act.tid = pid;
+        act.arg0 = 2;
+        act.flags = 0x2;
+        let mut resp = ProcdIpcResponse::default();
+        handle_rt_sigaction(&act, &mut resp);
+        assert_eq!(resp.status, 0);
+        assert_eq!(resp.payload_len as usize, LINUX_SIGACTION_SIZE);
+        assert!(!PROCESS_SIGNAL_POLICY.lock().contains_key(&pid));
+
+        let mut mask = ProcdIpcRequest::default();
+        mask.pid = pid;
+        mask.tid = pid;
+        mask.flags = 0x2;
+        mask.arg5 = 0b100;
+        let mut mresp = ProcdIpcResponse::default();
+        handle_rt_sigprocmask(&mask, &mut mresp);
+        assert_eq!(mresp.payload_len, 8);
+        assert_eq!(read_u64(&mresp.payload[..8], 0), 0b100);
         assert!(!THREAD_SIGNAL_POLICY.lock().contains_key(&(pid, pid)));
     }
 }

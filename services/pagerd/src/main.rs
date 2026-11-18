@@ -768,7 +768,7 @@ mod warm_worker {
                 )
             };
             if got < 0 {
-                return Err((-got) as i32);
+                return Err(got.unsigned_abs() as i32);
             }
             let response = &*self.response;
             if got as usize != size_of::<VfsIpcResponse>() {

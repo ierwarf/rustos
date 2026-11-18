@@ -335,7 +335,11 @@ impl LockTable {
                 }
                 Err(EAGAIN)
             }
-            Err(other) => Err(other),
+            Err(other) => {
+                // A refused attempt (`ENOLCK`, `EINVAL`) is no longer waiting.
+                self.cancel_wait(tid);
+                Err(other)
+            }
         }
     }
 
@@ -1126,6 +1130,17 @@ mod tests {
         t.release_description(1);
         t.release_process(200);
         assert_eq!(t.total_locks(), 0);
+    }
+
+    #[test]
+    fn a_refused_attempt_forgets_its_waiter() {
+        let mut t = LockTable::new();
+        t.set(F, A, W, 0, 0).unwrap();
+        assert_eq!(t.set_wait(F, B, 7, W, 0, 0, 0), Err(EAGAIN));
+        assert_eq!(t.wait_count(), 1);
+        // The same thread now asks for something invalid: it is not waiting.
+        assert_eq!(t.set_wait(F, B, 7, W, 9, 3, 1), Err(EINVAL));
+        assert_eq!(t.wait_count(), 0);
     }
 
     #[test]

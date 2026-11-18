@@ -89,11 +89,12 @@ impl ProviderBilling {
         // Never reuse an already-seen token even if its receipt has been
         // retained only as a settled tombstone. Clients must monotonically
         // advance the provider epoch/nonce pair.
-        if self.funded.iter().any(|x|{
-            x.provider==ticket.provider
-                && x.token.epoch==ticket.token.epoch
-                && x.token.nonce>=ticket.token.nonce
-        }) {return Err(ESTALE)}
+        // Every funded receipt was admitted through `admit_owner_nonce`, so the
+        // owner watermark bounds all funded nonces: this O(owners) check subsumes
+        // the former O(funded) scan (and also rejects other epochs' spent nonces).
+        if self.watermark(ticket.provider).is_some_and(|high|ticket.token.nonce<=high){
+            return Err(ESTALE)
+        }
         let mut evict=None;
         if self.funded.len()>=MAX_PROVIDER_TICKETS{
             // Receipt ACKs are best-effort compaction, so a provider that
@@ -288,6 +289,23 @@ impl ProviderBilling {
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]
+    fn lower_or_equal_nonce_is_stale_via_owner_watermark_alone() {
+        let owner=Owner{service:3,pid:8,lease:2};
+        let client=Client{pid:40,job:22,job_generation:9};
+        let mk=|epoch,nonce|Ticket{provider:owner,client,session:1,
+            kind:ProviderKind::Socket,token:Token{epoch,nonce}};
+        let mut book=ProviderBilling::new();
+        book.charge(mk(2,5),8,true,|_,_,_|Ok(9)).unwrap();
+        for t in [mk(2,5),mk(2,4),mk(3,4)] {
+            if t.token==mk(2,5).token{continue}
+            assert_eq!(book.charge(t,8,true,|_,_,_|panic!("stale")),Err(ESTALE));
+        }
+        assert_eq!(book.count(),1);
+        book.charge(mk(2,6),8,true,|_,_,_|Ok(10)).unwrap();
+        assert_eq!(book.count(),2);
+    }
+
     #[test]
     fn billing_records_exact_client_not_provider() {
         let owner=Owner{service:3,pid:8,lease:2};

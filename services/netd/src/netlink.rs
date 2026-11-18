@@ -70,7 +70,11 @@ pub(super) const RTPROT_KERNEL: u8 = 2;
 pub(super) const RTPROT_BOOT: u8 = 3;
 pub(super) const RTN_UNICAST: u8 = 1;
 pub(super) const RT_SCOPE_LINK: u8 = 253;
+pub(super) const NLM_F_REQUEST: u16 = 0x1;
 pub(super) const NLM_F_MULTI: u16 = 0x2;
+pub(super) const NLM_F_ACK: u16 = 0x4;
+/// First message type that is a real request (below it: control records).
+pub(super) const NLMSG_MIN_TYPE: u16 = 0x10;
 pub(super) const NLM_F_ROOT: u16 = 0x100;
 
 pub(super) const IFLA_ADDRESS: u16 = 1;
@@ -371,6 +375,20 @@ pub(super) fn process_request_snapshot(
         // glibc requests `NLM_F_ROOT` (+`NLM_F_MATCH`), libnl and Chromium the
         // full `NLM_F_DUMP`; both are dumps.
         let dump = flags & NLM_F_ROOT != 0;
+        // Like `netlink_rcv_skb`: only requests of a real message type reach a
+        // handler. Replies/control records (NLMSG_NOOP/ERROR/DONE) sent to the
+        // kernel are skipped; only an explicit NLM_F_ACK is answered, with a
+        // success acknowledgement.
+        if flags & NLM_F_REQUEST == 0 || msg_type < NLMSG_MIN_TYPE {
+            if flags & NLM_F_ACK != 0 {
+                reply.extend_from_slice(&build_error(0, &message[..NLMSG_HDRLEN], seq, portid));
+            }
+            offset += (len + 3) & !3;
+            if offset >= request.len() {
+                break;
+            }
+            continue;
+        }
         match msg_type {
             RTM_GETLINK if dump => {
                 for link in links {
@@ -540,6 +558,10 @@ pub(super) fn handle_bind(request: &NetdIpcRequest) -> i32 {
         return libc::EINVAL;
     };
     let current = netlink.portid;
+    if current != 0 && requested_pid != 0 && requested_pid != current {
+        // An already bound netlink socket cannot move to another port id.
+        return libc::EINVAL;
+    }
     if requested_pid != 0 && requested_pid != current && portid_in_use(&state, requested_pid) {
         return libc::EADDRINUSE;
     }

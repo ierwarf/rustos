@@ -1,6 +1,8 @@
 //! Multi-mount table and filesystem-neutral volume helpers for `vfsd`.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -476,11 +478,34 @@ pub fn cache_key_for_mount(mount_id: u64, case_policy: CasePolicy, rel_path: &st
     let normalized = rel_path.trim_matches('/');
     let key_str = match case_policy {
         CasePolicy::Exact => String::from(normalized),
-        CasePolicy::AsciiInsensitive | CasePolicy::UnicodePreservingInsensitive => {
-            normalized.to_ascii_lowercase()
-        }
+        CasePolicy::AsciiInsensitive => normalized.to_ascii_lowercase(),
+        // Two spellings that differ only by non-ASCII case name one file, so
+        // they must share one cache key or an invalidation through one
+        // spelling would leave the other's cached answer stale.
+        CasePolicy::UnicodePreservingInsensitive => normalized.to_lowercase(),
     };
     (mount_id, key_str)
+}
+
+/// Keys strictly below `key` in a path-keyed cache.
+///
+/// Keys order by `(mount_id, path)`, so every descendant `p/...` lies in the
+/// contiguous range `[p/, p0)` (`'0'` is the byte after `'/'`), and the mount
+/// root (empty path) owns every other key of its mount. This is an
+/// `O(log n + matches)` range walk where a `retain` over the whole map cost
+/// `O(n)` on every rename and rmdir.
+pub fn descendant_keys<V>(map: &BTreeMap<CacheKey, V>, key: &CacheKey) -> Vec<CacheKey> {
+    if key.1.is_empty() {
+        return map
+            .range((key.0, String::new())..)
+            .take_while(|(k, _)| k.0 == key.0)
+            .filter(|(k, _)| !k.1.is_empty())
+            .map(|(k, _)| k.clone())
+            .collect();
+    }
+    let low = (key.0, format!("{}/", key.1));
+    let high = (key.0, format!("{}0", key.1));
+    map.range(low..high).map(|(k, _)| k.clone()).collect()
 }
 
 pub fn parent_rel_path(rel_path: &str) -> Option<&str> {
@@ -726,6 +751,44 @@ mod tests {
         assert_eq!(parent_rel_path("foo.txt"), Some(""));
         assert_eq!(parent_rel_path("a/b/c"), Some("a/b"));
         assert_eq!(parent_rel_path(""), None);
+    }
+
+    #[test]
+    fn unicode_insensitive_keys_fold_non_ascii_case() {
+        assert_eq!(
+            cache_key_for_mount(2, CasePolicy::UnicodePreservingInsensitive, "Dir/\u{c9}t\u{e9}.TXT"),
+            cache_key_for_mount(2, CasePolicy::UnicodePreservingInsensitive, "dir/\u{e9}t\u{c9}.txt"),
+        );
+        assert_ne!(
+            cache_key_for_mount(2, CasePolicy::AsciiInsensitive, "\u{c9}"),
+            cache_key_for_mount(2, CasePolicy::AsciiInsensitive, "\u{e9}"),
+        );
+    }
+
+    #[test]
+    fn descendant_keys_cover_exactly_the_strict_subtree() {
+        let mut map: BTreeMap<CacheKey, u8> = BTreeMap::new();
+        for (mount, path) in [
+            (1, ""), (1, "a"), (1, "a-b"), (1, "a/b"), (1, "a/b/c"), (1, "a0"), (1, "a.txt"),
+            (1, "b"), (2, ""), (2, "a"), (2, "a/x"), (0, "a/z"),
+        ] {
+            map.insert((mount, String::from(path)), 0);
+        }
+        let below = |m: u64, p: &str| -> Vec<(u64, String)> {
+            descendant_keys(&map, &(m, String::from(p)))
+        };
+        let k = |m: u64, p: &str| (m, String::from(p));
+        assert_eq!(below(1, "a"), [k(1, "a/b"), k(1, "a/b/c")]);
+        assert_eq!(below(1, "a/b"), [k(1, "a/b/c")]);
+        assert!(below(1, "a/b/c").is_empty());
+        assert!(below(1, "missing").is_empty());
+        // The root owns every other key of its mount and nothing of another.
+        assert_eq!(
+            below(1, ""),
+            [k(1, "a"), k(1, "a-b"), k(1, "a.txt"), k(1, "a/b"), k(1, "a/b/c"), k(1, "a0"), k(1, "b")]
+        );
+        assert_eq!(below(2, ""), [k(2, "a"), k(2, "a/x")]);
+        assert_eq!(below(u64::MAX, ""), []);
     }
 
     fn zero_clock() -> FsTimestamp {

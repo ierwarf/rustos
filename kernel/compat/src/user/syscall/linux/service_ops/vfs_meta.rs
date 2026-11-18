@@ -116,6 +116,10 @@ fn ftruncate_unwritable_errno(rights: kernel_object::api::HandleRights) -> i64 {
 }
 
 pub fn syscall_linux_vfs_ftruncate(fd: u64, len: u64) -> u64 {
+    // Linux rejects a negative `off_t` before it looks at the descriptor.
+    if len > i64::MAX as u64 {
+        return linux_errno(LINUX_EINVAL);
+    }
     if let Some((memfd, rights)) = current_memfd_handle_with_rights(fd) {
         if !rights.allows_write() {
             return linux_errno(ftruncate_unwritable_errno(rights));
@@ -384,13 +388,14 @@ pub fn syscall_linux_vfs_readlinkat(
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
+    // `bufsiz` is a C `int` (sign-extended by `int_args`): zero or negative is
+    // EINVAL, not an empty success and not a huge buffer that faults.
+    if (user_len as i64) <= 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
     let Ok(user_len) = usize::try_from(user_len) else {
         return linux_errno(LINUX_EINVAL);
     };
-    // readlinkat(2): a zero bufsiz is EINVAL, not an empty success.
-    if user_len == 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
     if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
@@ -1108,7 +1113,9 @@ fn ioctl_is_display_policy_request(request_number: u64) -> bool {
     )
 }
 
-const NETD_MAX_IOVEC_COUNT: usize = 16;
+/// Linux `UIO_MAXIOV`. The payload copy below is bounded by the offload
+/// capacity, not by the vector count, so the count is only a parse limit.
+const NETD_MAX_IOVEC_COUNT: usize = 1024;
 
 /// Whether `O_NONBLOCK` on the descriptor forbids this operation from waiting.
 ///
@@ -2172,6 +2179,12 @@ fn consume_netd_response_payload(
             }
             if socket.is_some_and(SocketSnapshot::is_netlink) && request.arg4 != 0 {
                 write_current_sockaddr_payload(request.arg4, request.arg5, &netlink_kernel_address())?;
+            } else if request.arg4 != 0 && request.arg5 != 0 {
+                // No peer address is reported for this socket kind: say so
+                // (`addrlen = 0`, as Linux does for connected stream sockets)
+                // instead of leaving the caller's stale length in place. The
+                // bytes were already dequeued, so a bad pointer is not an error.
+                let _ = usermem::write_current_user_struct(request.arg5, &0_u32);
             }
             Ok(())
         }
@@ -2314,8 +2327,11 @@ pub(super) fn read_current_iovecs_payload(
 ) -> Result<Vec<linux_abi::LinuxIovec>, i64> {
     let iov_len = usize::try_from(iov_len).map_err(|_| LINUX_EINVAL)?;
     if iov_len == 0 { return Ok(Vec::new()); }
-    if iov_ptr == 0 || iov_len > NETD_MAX_IOVEC_COUNT {
+    if iov_len > NETD_MAX_IOVEC_COUNT {
         return Err(LINUX_EINVAL);
+    }
+    if iov_ptr == 0 {
+        return Err(LINUX_EFAULT);
     }
     let mut iovecs = Vec::with_capacity(iov_len);
     for index in 0..iov_len {
@@ -2788,9 +2804,16 @@ fn write_current_sockopt_payload(
     }
     let capacity = usermem::read_current_user_struct::<u32>(optlen_ptr)
         .map_err(address_space_error_to_linux_errno)? as usize;
-    if capacity < payload.len() {
+    // Linux truncates an int-valued option to the caller's `optlen`
+    // (`SO_ERROR` read through a 1-byte buffer); structured options with a
+    // short buffer stay `EINVAL`.
+    let payload = if capacity >= payload.len() {
+        payload
+    } else if payload.len() == size_of::<i32>() && capacity != 0 && capacity <= i32::MAX as usize {
+        &payload[..capacity]
+    } else {
         return Err(LINUX_EINVAL);
-    }
+    };
     usermem::write_current_user_bytes(optval_ptr, payload)
         .map_err(address_space_error_to_linux_errno)?;
     let len = payload.len() as u32;

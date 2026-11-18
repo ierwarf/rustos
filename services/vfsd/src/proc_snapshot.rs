@@ -76,8 +76,7 @@ impl ProcessFacts {
     pub fn vm_size_bytes(&self) -> u64 {
         self.regions
             .iter()
-            .map(|region| region.end.saturating_sub(region.start))
-            .sum()
+            .fold(0_u64, |total, region| total.saturating_add(region.end.saturating_sub(region.start)))
     }
 
     pub fn start_stack(&self) -> u64 {
@@ -211,7 +210,7 @@ pub fn format_smaps(regions: &[MapRegion]) -> Vec<u8> {
     let mut out = String::new();
     for region in regions {
         push_map_line(&mut out, region);
-        let _ = writeln!(out, "Size:           {:>8} kB", (region.end - region.start) / 1024);
+        let _ = writeln!(out, "Size:           {:>8} kB", region.end.saturating_sub(region.start) / 1024);
         out.push_str("KernelPageSize:        4 kB\n");
         out.push_str("MMUPageSize:           4 kB\n");
         out.push_str("VmFlags:");
@@ -272,7 +271,7 @@ pub fn format_status(process: &ProcessFacts, thread: &ThreadFacts) -> Vec<u8> {
     let _ = writeln!(out, "VmSize:\t{:>8} kB", process.vm_size_bytes() / 1024);
     let _ = writeln!(out, "VmLck:\t{:>8} kB", process.locked_bytes / 1024);
     if let Some(pages) = process.rss_pages {
-        let _ = writeln!(out, "VmRSS:\t{:>8} kB", pages * (PAGE_BYTES / 1024));
+        let _ = writeln!(out, "VmRSS:\t{:>8} kB", pages.saturating_mul(PAGE_BYTES / 1024));
     }
     let _ = writeln!(out, "Threads:\t{}", process.threads);
     let _ = writeln!(out, "SigPnd:\t{:016x}", thread.pending_signals);
@@ -320,14 +319,12 @@ pub fn format_statm(process: &ProcessFacts) -> Vec<u8> {
         .regions
         .iter()
         .filter(|region| region.exec)
-        .map(|region| region.end - region.start)
-        .sum();
+        .fold(0_u64, |total, region| total.saturating_add(region.end.saturating_sub(region.start)));
     let data: u64 = process
         .regions
         .iter()
         .filter(|region| region.write && !region.shared)
-        .map(|region| region.end - region.start)
-        .sum();
+        .fold(0_u64, |total, region| total.saturating_add(region.end.saturating_sub(region.start)));
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -468,5 +465,35 @@ mod tests {
 
         let n = encode_u64_list(&[0, 3, 9], &mut buf).unwrap();
         assert_eq!(decode_u64_list(&buf[..n]), Some(alloc::vec![0, 3, 9]));
+    }
+
+    #[test]
+    fn inverted_or_oversized_regions_saturate_instead_of_wrapping() {
+        let region = |start, end| MapRegion {
+            start,
+            end,
+            read: true,
+            write: true,
+            exec: true,
+            shared: false,
+            offset: 0,
+            name: None,
+        };
+        let regions = [region(0x2000, 0x1000), region(0, u64::MAX), region(0, u64::MAX)];
+        let smaps = String::from_utf8(format_smaps(&regions)).unwrap();
+        assert!(smaps.contains("Size:                  0 kB\n"));
+        let process = ProcessFacts {
+            pid: 1, ppid: 0, uid: 0, gid: 0, euid: 0, egid: 0, threads: 1, start_ticks: 0,
+            rss_pages: Some(u64::MAX), locked_bytes: 0, fd_slots: None, oom_score_adj: 0,
+            regions: regions.to_vec(), brk_start: 0, arg_start: 0, arg_end: 0, env_start: 0,
+            env_end: 0, sig_ignored: 0, sig_caught: 0, no_new_privs: false,
+        };
+        assert_eq!(process.vm_size_bytes(), u64::MAX);
+        assert!(!format_statm(&process).is_empty());
+        let thread = ThreadFacts {
+            tid: 1, comm: b"x".to_vec(), state: b'S', pending_signals: 0, blocked_signals: 0,
+            utime_ticks: None,
+        };
+        assert!(!format_status(&process, &thread).is_empty());
     }
 }

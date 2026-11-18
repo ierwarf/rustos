@@ -411,6 +411,7 @@ pub(super) fn find_ivshmem_gui_pool() -> Option<MappedGuiDvmPool> {
         };
         if pixel_atlas_header != atlas_header
             || !atlas_header_fits_resource(atlas_header, GUI_DVM_PIXEL_REGION_BYTES)
+            || !atlas_header_clears_gui_slots(atlas_header, header)
         {
             release_gui_mappings(control, doorbell);
             return false;
@@ -471,6 +472,18 @@ pub(super) fn atlas_header_fits_resource(header: DvmGpuAtlasPoolHeader, resource
             .is_some_and(|end| end <= header.region_bytes)
 }
 
+/// The atlas command/atlas regions must start after the last GUI snapshot slot.
+/// The two headers are validated independently, so an overlapping pair would
+/// let command-slot writes corrupt a published scanout snapshot (or the reverse).
+pub(super) fn atlas_header_clears_gui_slots(
+    atlas: DvmGpuAtlasPoolHeader,
+    gui: DvmGuiSurfacePoolHeader,
+) -> bool {
+    gui.slot_offset(DVM_GUI_SURFACE_SLOT_COUNT - 1)
+        .and_then(|offset| offset.checked_add(gui.slot_bytes))
+        .is_some_and(|gui_end| atlas.command_offset >= gui_end)
+}
+
 pub(super) fn warn_rejected(reason: &str) {
     crate::debug::warn!(
         display,
@@ -498,3 +511,23 @@ pub(super) fn release_gui_mappings(mapped: *mut u8, doorbell: *mut u8) {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atlas_regions_must_start_after_the_last_gui_slot() {
+        let gui = DvmGuiSurfacePoolHeader::new(GUI_DVM_PIXEL_REGION_BYTES, 1600, 900);
+        let atlas = DvmGpuAtlasPoolHeader::new(GUI_DVM_PIXEL_REGION_BYTES, gui, 1600, 900)
+            .expect("fixed geometry builds an atlas header");
+        assert!(atlas_header_clears_gui_slots(atlas, gui));
+
+        let gui_end = gui.slot_offset(DVM_GUI_SURFACE_SLOT_COUNT - 1).unwrap() + gui.slot_bytes;
+        let overlapping = DvmGpuAtlasPoolHeader {
+            command_offset: gui_end - u64::from(DVM_GUI_SURFACE_POOL_HEADER_BYTES),
+            ..atlas
+        };
+        assert!(!atlas_header_clears_gui_slots(overlapping, gui));
+    }
+}

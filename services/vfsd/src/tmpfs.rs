@@ -33,6 +33,7 @@
 //!   shrink-then-grow (the tail of the last chunk is zeroed on shrink).
 
 use alloc::boxed::Box;
+use alloc::collections::btree_map::Entry;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
@@ -119,6 +120,10 @@ struct Node {
     linkable: bool,
     /// Parent directory (directories only; the root is its own parent).
     parent: u64,
+    /// Name under `parent` (directories only; empty for the root). Kept in
+    /// step with the parent's entry so a directory's path is an O(depth) walk
+    /// up the `parent` chain instead of a scan of every parent's entries.
+    dir_name: String,
     body: Body,
     /// Regular files only: when set, the file's bytes live here and the
     /// chunk map is empty (see the module's shared-backing rules).
@@ -311,6 +316,7 @@ impl State {
                 opens: 0,
                 linkable: false,
                 parent: if is_dir { parent } else { 0 },
+                dir_name: if is_dir { String::from(name) } else { String::new() },
                 body,
                 shared: None,
             },
@@ -423,14 +429,16 @@ impl State {
             let idx = pos / CHUNK as u64;
             let within = (pos % CHUNK as u64) as usize;
             let n = (CHUNK - within).min(data.len() - done);
-            if !chunks.contains_key(&idx) {
-                if used_bytes.saturating_add(CHUNK as u64) > *quota_bytes {
-                    break;
+            let chunk = match chunks.entry(idx) {
+                Entry::Occupied(slot) => slot.into_mut(),
+                Entry::Vacant(slot) => {
+                    if used_bytes.saturating_add(CHUNK as u64) > *quota_bytes {
+                        break;
+                    }
+                    *used_bytes += CHUNK as u64;
+                    slot.insert(vec![0u8; CHUNK].into_boxed_slice())
                 }
-                *used_bytes += CHUNK as u64;
-                chunks.insert(idx, vec![0u8; CHUNK].into_boxed_slice());
-            }
-            let chunk = chunks.get_mut(&idx).ok_or(FsError::NotFound)?;
+            };
             chunk[within..within + n].copy_from_slice(&data[done..done + n]);
             done += n;
         }
@@ -470,11 +478,7 @@ impl State {
                 // chunk holding the new end is zeroed so a later growth reads
                 // zeros, not the truncated bytes.
                 let first_dead = new_len.div_ceil(CHUNK as u64);
-                let dead: Vec<u64> = chunks.range(first_dead..).map(|(idx, _)| *idx).collect();
-                for idx in dead {
-                    chunks.remove(&idx);
-                    freed += CHUNK as u64;
-                }
+                freed = chunks.split_off(&first_dead).len() as u64 * CHUNK as u64;
                 let tail = (new_len % CHUNK as u64) as usize;
                 if tail != 0 {
                     if let Some(chunk) = chunks.get_mut(&(new_len / CHUNK as u64)) {
@@ -675,6 +679,9 @@ impl State {
             d.nlink = d.nlink.saturating_add(1);
             self.nodes.get_mut(&sino).ok_or(FsError::NotFound)?.parent = dp;
         }
+        if src_is_dir && (sp != dp || sname != dname) {
+            self.nodes.get_mut(&sino).ok_or(FsError::NotFound)?.dir_name = String::from(dname);
+        }
         for dir in [sp, dp] {
             self.nodes.get_mut(&dir).ok_or(FsError::NotFound)?.touch_modify(now);
         }
@@ -704,6 +711,7 @@ impl TmpFs {
                 opens: 0,
                 linkable: false,
                 parent: ROOT_NODE,
+                dir_name: String::new(),
                 body: Body::Dir(BTreeMap::new()),
                 shared: None,
             },
@@ -799,17 +807,27 @@ impl FsVolume for TmpFs {
     fn directory_path_node(&self, mut node: u64) -> Result<String, FsError> {
         let st = self.state.lock();
         st.dir(node)?;
-        let mut parts = Vec::new();
+        // A removed directory (`rmdir` while pinned) has no path. Every
+        // ancestor of a live directory is live, so checking the start suffices.
+        if st.nodes.get(&node).ok_or(FsError::NotFound)?.nlink == 0 {
+            return Err(FsError::NotFound);
+        }
+        let mut parts: Vec<&str> = Vec::new();
+        let mut total = 0usize;
         while node != ROOT_NODE {
             let current = st.nodes.get(&node).ok_or(FsError::NotFound)?;
-            let parent = current.parent;
-            let name = st.dir(parent)?.iter().find_map(|(name, &child)|
-                (child == node).then(|| name.clone())).ok_or(FsError::NotFound)?;
-            parts.push(name);
-            node = parent;
+            total += current.dir_name.len() + 1;
+            parts.push(current.dir_name.as_str());
+            node = current.parent;
         }
-        parts.reverse();
-        Ok(parts.join("/"))
+        let mut out = String::with_capacity(total);
+        for part in parts.iter().rev() {
+            if !out.is_empty() {
+                out.push('/');
+            }
+            out.push_str(part);
+        }
+        Ok(out)
     }
 
     fn statfs(&self) -> Result<FsStatFs, FsError> {
@@ -867,7 +885,8 @@ impl FsVolume for TmpFs {
             if opts.create_new && comps.is_empty() {
                 return Err(FsError::AlreadyExists);
             }
-            if opts.write || opts.truncate {
+            // `open(dir, O_CREAT)` is EISDIR even read-only.
+            if opts.write || opts.truncate || opts.create {
                 return Err(FsError::IsADirectory);
             }
         } else if kind == FsNodeKind::File && opts.truncate && opts.write {
@@ -1095,6 +1114,7 @@ impl FsVolume for TmpFs {
                 opens: 1,
                 linkable: true,
                 parent: 0,
+                dir_name: String::new(),
                 body: Body::File {
                     len: 0,
                     chunks: BTreeMap::new(),
@@ -1216,13 +1236,27 @@ fn shared_write(
     if count == 0 {
         return Err(FsError::NoSpace);
     }
-    let new_len = (*len).max(offset + count);
-    if new_len > *len {
+    let old_len = *len;
+    let new_len = old_len.max(offset + count);
+    if new_len > old_len {
         frames.set_len(new_len)?;
+    }
+    let written = match frames.write_at(offset, &data[..count as usize]) {
+        Ok(written) => written,
+        Err(err) => {
+            if new_len > old_len {
+                // A failed write must not leave the file longer. Nothing maps
+                // the extension yet, so the shrink back cannot be refused; if
+                // it somehow is, the frames merely stay longer than the file.
+                let _ = frames.set_len(old_len);
+            }
+            return Err(err);
+        }
+    };
+    if new_len > old_len {
         *used_bytes += (pages(new_len) - cur_pages) * CHUNK as u64;
         *len = new_len;
     }
-    let written = frames.write_at(offset, &data[..count as usize])?;
     node.touch_modify(now);
     let Body::File { len, .. } = &node.body else {
         return Err(FsError::InvalidInput);
@@ -1483,7 +1517,13 @@ impl<K: Ord + Clone> SharedPathStore<K> {
         }
         let written = match entry.frames.write_at(offset, data) {
             Ok(n) => n,
-            Err(err) => return Some(Err(err)),
+            Err(err) => {
+                if end > entry.len {
+                    // Keep the frame length equal to the file length.
+                    let _ = entry.frames.set_len(entry.len);
+                }
+                return Some(Err(err));
+            }
         };
         entry.len = entry.len.max(offset + written as u64);
         Some(Ok((written, entry.len)))
@@ -1531,11 +1571,32 @@ impl<K: Ord + Clone> SharedPathStore<K> {
         self.entries.remove(key);
     }
 
-    pub fn rename(&mut self, old_key: &K, new_key: K, new_rel_path: String) {
+}
+
+impl SharedPathStore<(u64, String)> {
+    pub fn rename(&mut self, old_key: &(u64, String), new_key: (u64, String), new_rel_path: String) {
+        let mut sources = crate::mount_table::descendant_keys(&self.entries, old_key);
+        if self.entries.contains_key(old_key) {
+            sources.push(old_key.clone());
+        }
+        let mut moved = Vec::new();
+        let old_components = old_key.1.split('/').count();
+        for key in sources {
+            let mut entry = self.entries.remove(&key).unwrap();
+            let suffix = &key.1[old_key.1.len()..];
+            let destination = (new_key.0, alloc::format!("{}{}", new_key.1, suffix));
+            let relative_suffix = entry.rel_path.split('/').skip(old_components).collect::<Vec<_>>().join("/");
+            entry.rel_path = if relative_suffix.is_empty() {
+                new_rel_path.clone()
+            } else {
+                alloc::format!("{}/{}", new_rel_path, relative_suffix)
+            };
+            moved.push((destination, entry));
+        }
+        // A replaced file's old backing must not remain attached to its name.
         self.entries.remove(&new_key);
-        if let Some(mut entry) = self.entries.remove(old_key) {
-            entry.rel_path = new_rel_path;
-            self.entries.insert(new_key, entry);
+        for (key, entry) in moved {
+            self.entries.insert(key, entry);
         }
     }
 }
@@ -2287,7 +2348,6 @@ mod tests {
     type Fake = alloc::sync::Arc<Mutex<FakeInner>>;
     static FAKES: Mutex<Vec<(u64, Fake)>> = Mutex::new(Vec::new());
     static NEXT_OBJECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(100);
-    static FAIL_FACTORY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
     struct FakeFrames {
         object: u64,
@@ -2328,9 +2388,6 @@ mod tests {
         }
     }
     fn fake_factory(len: u64) -> Result<Box<dyn SharedFrames>, FsError> {
-        if FAIL_FACTORY.load(Ordering::Relaxed) {
-            return Err(FsError::NoSpace);
-        }
         let object = NEXT_OBJECT.fetch_add(1, Ordering::Relaxed);
         let inner: Fake = alloc::sync::Arc::new(Mutex::new(FakeInner {
             data: vec![0; len as usize],
@@ -2413,16 +2470,15 @@ mod tests {
 
     #[test]
     fn failed_upgrade_changes_nothing() {
-        let fs = shared_fs(64 * 4096);
+        fn fail_factory(_: u64) -> Result<Box<dyn SharedFrames>, FsError> { Err(FsError::NoSpace) }
+        let fs = fs_with(64 * 4096, 64).with_shared_frames(fail_factory);
         let node = put(&fs, "f", &[3u8; 9000]);
         let before = fs.used_bytes();
-        FAIL_FACTORY.store(true, Ordering::Relaxed);
         let failed = fs.shared_backing_node(node);
-        FAIL_FACTORY.store(false, Ordering::Relaxed);
         assert_eq!(failed, Err(FsError::NoSpace));
         assert_eq!(fs.used_bytes(), before);
         assert_eq!(read_all(&fs, "f"), vec![3u8; 9000]);
-        assert!(fs.shared_backing_node(node).is_ok(), "chunk path still upgradable");
+        assert_eq!(fs.shared_backing_node(node), Err(FsError::NoSpace));
     }
 
     #[test]
@@ -2640,5 +2696,156 @@ mod tests {
         // Generation bump invalidates stale entries.
         store.sync_generation(2);
         assert!(!store.contains(&new_key));
+    }
+
+    #[test]
+    fn shared_path_store_directory_rename_preserves_descendant_backing() {
+        let vol = alloc::sync::Arc::new(fs());
+        vol.mkdir("Old").unwrap();
+        vol.mkdir("Old/sub").unwrap();
+        vol.mkdir("Oldish").unwrap();
+        put(&vol, "Old/sub/file", b"original");
+        put(&vol, "Oldish/file", b"other");
+        let mut store = SharedPathStore::new();
+        let old = (1, String::from("old/sub/file"));
+        let other = (1, String::from("oldish/file"));
+        let backing = store.ensure_shared(old.clone(), "Old/sub/file", &*vol, fake_factory, true, 1).unwrap();
+        store.ensure_shared(other.clone(), "Oldish/file", &*vol, fake_factory, true, 1).unwrap();
+        store.write_at(&old, 0, b"changed!").unwrap().unwrap();
+        vol.rename("Old", "New", true, false).unwrap();
+        store.rename(&(1, String::from("old")), (1, String::from("new")), String::from("New"));
+        let new = (1, String::from("new/sub/file"));
+        assert!(!store.contains(&old));
+        assert!(store.contains(&other));
+        assert_eq!(store.ensure_shared(new.clone(), "New/sub/file", &*vol, fake_factory, true, 1).unwrap(), backing);
+        store.flush_by_object_id(backing.object, |_| Some(vol.clone())).unwrap();
+        assert_eq!(read_all(&vol, "New/sub/file"), b"changed!");
+        assert_eq!(read_all(&vol, "Oldish/file"), b"other");
+    }
+
+    #[test]
+    fn shared_path_store_rename_overwrites_destination_and_handles_same_key() {
+        let vol = fs();
+        put(&vol, "old", b"source");
+        put(&vol, "new", b"target");
+        let mut store = SharedPathStore::new();
+        let old = (1, String::from("old"));
+        let new = (1, String::from("new"));
+        let source = store.ensure_shared(old.clone(), "old", &vol, fake_factory, true, 1).unwrap();
+        store.ensure_shared(new.clone(), "new", &vol, fake_factory, true, 1).unwrap();
+        vol.rename("old", "new", true, false).unwrap();
+        store.rename(&old, new.clone(), String::from("new"));
+        assert_eq!(store.ensure_shared(new.clone(), "new", &vol, fake_factory, true, 1).unwrap(), source);
+        store.rename(&new, new.clone(), String::from("new"));
+        assert_eq!(store.ensure_shared(new, "new", &vol, fake_factory, true, 1).unwrap(), source);
+    }
+
+    #[test]
+    fn directory_path_follows_nested_renames_and_dies_with_rmdir() {
+        let fs = fs();
+        fs.mkdir("a").unwrap();
+        fs.mkdir("a/b").unwrap();
+        fs.mkdir("a/b/c").unwrap();
+        let c = fs.retain_node("a/b/c").unwrap();
+        let b = fs.retain_node("a/b").unwrap();
+        assert_eq!(fs.directory_path_node(c).unwrap(), "a/b/c");
+        assert_eq!(fs.directory_path_node(ROOT_NODE).unwrap(), "");
+        // Renaming an ancestor and the directory itself both show in the path.
+        fs.mkdir("t").unwrap();
+        fs.rename("a/b", "t/bb", true, false).unwrap();
+        assert_eq!(fs.directory_path_node(c).unwrap(), "t/bb/c");
+        fs.rename("t/bb/c", "t/cc", true, false).unwrap();
+        assert_eq!(fs.directory_path_node(c).unwrap(), "t/cc");
+        // A file node has no directory path.
+        let f = put(&fs, "t/f", b"x");
+        assert_eq!(fs.directory_path_node(f), Err(FsError::NotADirectory));
+        // A removed directory has none, even when its name is reused.
+        fs.rmdir("t/cc").unwrap();
+        fs.mkdir("t/cc").unwrap();
+        assert_eq!(fs.directory_path_node(c), Err(FsError::NotFound));
+        assert_eq!(fs.directory_path_node(b).unwrap(), "t/bb");
+        fs.release_node(c);
+        fs.release_node(b);
+    }
+
+    #[test]
+    fn create_flag_on_an_existing_directory_is_eisdir_even_read_only() {
+        let fs = fs();
+        fs.mkdir("d").unwrap();
+        let ro_create = FsOpenOptions { create: true, ..FsOpenOptions::default() };
+        assert_eq!(fs.open_prepare("d", ro_create), Err(FsError::IsADirectory));
+        assert_eq!(fs.open_prepare("", ro_create), Err(FsError::IsADirectory));
+        // Without O_CREAT a read-only directory open is still fine.
+        assert!(fs.open_prepare("d", FsOpenOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn truncate_to_chunk_boundary_frees_exactly_the_tail() {
+        let fs = fs();
+        put(&fs, "a", &[1u8; 3 * 4096]);
+        assert_eq!(fs.used_bytes(), 3 * 4096);
+        fs.truncate("a", 4096).unwrap();
+        assert_eq!(fs.used_bytes(), 4096);
+        fs.truncate("a", 4095).unwrap();
+        assert_eq!(fs.used_bytes(), 4096);
+        let data = read_all(&fs, "a");
+        assert!(data.iter().all(|b| *b == 1));
+        fs.truncate("a", 8192).unwrap();
+        let data = read_all(&fs, "a");
+        assert!(data[4095..].iter().all(|b| *b == 0), "regrowth reads zeros");
+    }
+
+    static FAIL_OBJECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static FLAKY_TEST_LOCK: Mutex<()> = Mutex::new(());
+    struct FlakyFrames(Box<dyn SharedFrames>);
+    impl SharedFrames for FlakyFrames {
+        fn identity(&self) -> (u64, u64) { self.0.identity() }
+        fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<usize, FsError> {
+            self.0.read_at(offset, out)
+        }
+        fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize, FsError> {
+            if self.0.identity().1 == FAIL_OBJECT.load(Ordering::Relaxed) {
+                return Err(FsError::Io(storage_core::StorageError::DeviceFault));
+            }
+            self.0.write_at(offset, data)
+        }
+        fn set_len(&mut self, len: u64) -> Result<(), FsError> { self.0.set_len(len) }
+    }
+    fn flaky_factory(len: u64) -> Result<Box<dyn SharedFrames>, FsError> {
+        Ok(Box::new(FlakyFrames(fake_factory(len)?)))
+    }
+
+    #[test]
+    fn failed_shared_write_does_not_grow_the_file_or_leak_quota() {
+        let _guard = FLAKY_TEST_LOCK.lock();
+        let fs = fs_with(64 * 4096, 64).with_shared_frames(flaky_factory);
+        let node = put(&fs, "f", b"abc");
+        let backing = fs.shared_backing_node(node).unwrap();
+        let frames = fake(backing.object);
+        let used = fs.used_bytes();
+        FAIL_OBJECT.store(backing.object, Ordering::Relaxed);
+        let failed = fs.write_node_at(node, 3 * 4096, b"zz");
+        FAIL_OBJECT.store(0, Ordering::Relaxed);
+        assert!(matches!(failed, Err(FsError::Io(_))));
+        assert_eq!(fs.metadata("f").unwrap().len, 3);
+        assert_eq!(fs.used_bytes(), used);
+        assert_eq!(frames.lock().data.len(), 3, "frame length tracks file length");
+        assert_eq!(fs.write_node_at(node, 3, b"d").unwrap(), (1, 4));
+    }
+
+    #[test]
+    fn failed_shared_path_write_keeps_frame_and_file_length_equal() {
+        let _guard = FLAKY_TEST_LOCK.lock();
+        let vol = alloc::sync::Arc::new(fs());
+        put(&vol, "file", b"hello");
+        let mut store: SharedPathStore<(u64, String)> = SharedPathStore::new();
+        let key = (1, String::from("file"));
+        let backing = store.ensure_shared(key.clone(), "file", &*vol, flaky_factory, true, 1).unwrap();
+        FAIL_OBJECT.store(backing.object, Ordering::Relaxed);
+        let failed = store.write_at(&key, 100, b"zz");
+        FAIL_OBJECT.store(0, Ordering::Relaxed);
+        assert!(matches!(failed, Some(Err(FsError::Io(_)))));
+        assert_eq!(store.len_of(&key), Some(5));
+        assert_eq!(fake(backing.object).lock().data.len(), 5);
     }
 }

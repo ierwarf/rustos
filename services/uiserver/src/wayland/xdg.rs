@@ -90,8 +90,21 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceData> for WaylandState {
                     post_protocol_error(resource, message);
                     return;
                 }
+                // A client may destroy a toplevel (unmapping the surface) and
+                // later give the same wl_surface a new toplevel, as GTK does on
+                // hide/show. The destroy retired the surface; without reviving it
+                // the new toplevel would never be shown and its frame callbacks
+                // would never complete.
+                let revived = state.revive_retired_surface(data);
                 let surface = data.clone();
                 let toplevel = data_init.init(id, surface);
+                if !revived {
+                    post_protocol_error(
+                        resource,
+                        "xdg_surface.get_toplevel: surface limit reached".into(),
+                    );
+                    return;
+                }
                 if let Ok(mut surface) = data.shared.lock() {
                     surface.toplevel = Some(toplevel);
                     surface.needs_initial_configure = true;

@@ -17,18 +17,22 @@ impl VfsState {
             SYSCALL_OFFLOAD_OP_LINUX_ACCESS => self.linux_access(request, &mut response),
             SYSCALL_OFFLOAD_OP_LINUX_GETCWD => self.linux_getcwd(request, &mut response),
             SYSCALL_OFFLOAD_OP_LINUX_CHDIR => self.linux_chdir(request, &mut response),
-            SYSCALL_OFFLOAD_OP_LINUX_MKDIR => self.linux_mkdir(request, &mut response),
             // Stateful fd operations require the versioned VFS IPC request's
             // operation identity. The retired generic offload envelope has no
             // such field and cannot provide crash-safe open descriptions.
-            SYSCALL_OFFLOAD_OP_LINUX_OPENAT
+            // Namespace mutations are refused for the same reason: the
+            // envelope carries caller-claimed credentials and has no parent
+            // search/write/sticky check, so `VFS_IPC_OP_MKDIR`/`UNLINKAT`
+            // (attested credentials, `check_parent`) are the only mutators.
+            SYSCALL_OFFLOAD_OP_LINUX_MKDIR
+            | SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT
+            | SYSCALL_OFFLOAD_OP_LINUX_OPENAT
             | SYSCALL_OFFLOAD_OP_LINUX_GETDENTS64
             | SYSCALL_OFFLOAD_OP_LINUX_CLOSE
             | SYSCALL_OFFLOAD_OP_LINUX_DUP
             | SYSCALL_OFFLOAD_OP_LINUX_FCNTL => response.status = EOPNOTSUPP,
             SYSCALL_OFFLOAD_OP_LINUX_MOUNT => self.linux_mount(&mut response),
             SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2 => self.linux_umount2(&mut response),
-            SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT => self.linux_unlinkat(request, &mut response),
             _ => response.status = EINVAL,
         }
         response
@@ -318,7 +322,11 @@ impl VfsState {
             let revents = if fd < 0 {
                 0
             } else {
-                let ready_bits = poll_ready_bits(events as u32) as i16;
+                // Regular files, directories and /dev nodes are always readable and
+                // writable; they never report PRI, ERR or HUP, and poll(2) must not
+                // echo those bits just because the caller asked for them.
+                let ready_bits = (poll_ready_bits(events as u32)
+                    & (linux_abi::EPOLLIN | linux_abi::EPOLLOUT)) as i16;
                 if ready_bits != 0 {
                     ready += 1;
                 }
@@ -628,48 +636,12 @@ impl VfsState {
         };
     }
 
-    fn linux_mkdir(
-        &mut self,
-        request: &LinuxSyscallOffloadRequest,
-        response: &mut LinuxSyscallOffloadResponse,
-    ) {
-        let Some(path) = linux_request_path(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        // Resolve against the caller's cwd like every other path operation: a
-        // relative path must not be judged as if it were already absolute.
-        response.status = match self.linux_resolved_path(request, path) {
-            Ok(path) => lock_vfs_storage().mkdir_path(
-                path.as_str(),
-                FsCreateAttrs::new(request.arg0 as u32, request.euid, request.egid),
-            ),
-            Err(errno) => errno,
-        };
-    }
-
     fn linux_mount(&mut self, response: &mut LinuxSyscallOffloadResponse) {
         response.status = EOPNOTSUPP;
     }
 
     fn linux_umount2(&mut self, response: &mut LinuxSyscallOffloadResponse) {
         response.status = EOPNOTSUPP;
-    }
-
-    fn linux_unlinkat(
-        &mut self,
-        request: &LinuxSyscallOffloadRequest,
-        response: &mut LinuxSyscallOffloadResponse,
-    ) {
-        let Some(path) = linux_request_path(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        response.status = match self.linux_resolved_path(request, path) {
-            Ok(path) => lock_vfs_storage()
-                .unlink_path(path.as_str(), request.flags & linux_abi::AT_REMOVEDIR as u64 != 0),
-            Err(errno) => errno,
-        };
     }
 
 }

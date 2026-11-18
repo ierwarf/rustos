@@ -426,10 +426,14 @@ impl PageCache {
             {
                 let state = match entry.state {
                     CacheState::Loading { .. } => {
+                        // The bucket must be located while the slot is still occupied:
+                        // `find_slot` matches on the slot's key, so clearing first
+                        // would leave a stale bucket that a later `remove_bucket`
+                        // trips over and that never frees its probe position.
+                        let (_, bucket_pos) =
+                            self.find_slot(entry.key).expect("indexed loading slot");
                         self.entries[slot_idx] = None;
-                        if let Some((_, bucket_pos)) = self.find_slot(entry.key) {
-                            self.remove_bucket(bucket_pos);
-                        }
+                        self.remove_bucket(bucket_pos);
                         revoked += 1;
                         continue;
                     }
@@ -877,6 +881,30 @@ mod tests {
         cache
             .begin_writeback(replacement, page.cache_generation, 113)
             .unwrap();
+    }
+
+    #[test]
+    fn revoking_loading_entries_leaves_no_stale_bucket_behind() {
+        let mut cache = PageCache::new();
+        // Many revoke/reload cycles would exhaust the 128-bucket index (and make
+        // `find_slot` spin) if each revoked Loading entry leaked its bucket.
+        for generation in 1..=400_u64 {
+            let loading = key(generation);
+            assert!(matches!(
+                cache.admit_load(loading, 5),
+                Ok(CacheAdmission::LoadOwner { .. })
+            ));
+            let page = clean(&mut cache, key(generation + 1000));
+            assert_eq!(cache.revoke_backing(12, generation, 9), Ok(1));
+            // Removing a neighbour must not meet a dangling bucket.
+            assert_eq!(
+                cache.begin_reclaim(key(generation + 1000), page.cache_generation, 3),
+                Ok(page)
+            );
+            assert_eq!(cache.complete_reclaim(key(generation + 1000), 3), Ok(page));
+            cache.revoked_backings = [None; PAGER_MAX_REVOKED_BACKINGS];
+        }
+        assert!(cache.buckets.iter().all(|bucket| *bucket == 0));
     }
 
     #[test]

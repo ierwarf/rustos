@@ -1155,13 +1155,16 @@ fn push_wayland_gpu_layer(
         return Ok(None);
     }
     let source_rect = packer.reserve(outer.width, outer.height)?;
-    let pixels = render_wayland_gpu_texture(window, focused)?;
     if window.server_decoration {
+        let pixels = render_wayland_gpu_texture(window, focused)?;
         packer.write_xrgb_at(source_rect, &pixels, outer.width)?;
         let (atlas_pixels, stride) = packer.pixels_mut();
         apply_atlas_window_alpha(atlas_pixels, stride, source_rect, focused)?;
     } else {
-        packer.write_bgra_at(source_rect, &pixels, outer.width)?;
+        // A client-decorated window is its own texture: copy the retained
+        // client rows straight into the atlas instead of staging a second
+        // full-window raster (`write_bgra_at` bounds-checks the source rows).
+        packer.write_bgra_at(source_rect, &window.pixels, window.stride_pixels)?;
     }
     layers.push(GpuSceneLayer {
         destination: outer,

@@ -623,18 +623,43 @@ fn cursor_motion_rotation(motion: CursorMotion) -> (i32, i32) {
     )
 }
 
+/// The most recent cursor raster. The texture is a pure function of the sprite
+/// index and the quantized rotation, and the cursor is stationary or moving in
+/// a steady direction for most frames, so repeating the 47k-sample bilinear
+/// pass every scene build is wasted work.
+type CursorRasterKey = (usize, i32, i32);
+static CURSOR_RASTER_CACHE: std::sync::Mutex<Option<(CursorRasterKey, Vec<u32>)>> =
+    std::sync::Mutex::new(None);
+
 pub(crate) fn render_cursor_bgra(pixels: &mut [u32], motion: CursorMotion) -> bool {
     if pixels.len() != CURSOR_TEXTURE_SIZE * CURSOR_TEXTURE_SIZE {
         return false;
     }
+    let sprite_index = (motion.sprite_index as usize).min(CURSOR_SPRITE_MAX_DISTANCE as usize);
+    let (cos_fp, sin_fp) = cursor_motion_rotation(motion);
+    let key = (sprite_index, cos_fp, sin_fp);
+    if let Ok(cache) = CURSOR_RASTER_CACHE.lock() {
+        if let Some((cached_key, cached)) = cache.as_ref() {
+            if *cached_key == key {
+                pixels.copy_from_slice(cached);
+                return true;
+            }
+        }
+    }
     pixels.fill(0);
     let radius = CURSOR_VISUAL_RADIUS as i32;
-    for_each_cursor_pixel(motion, |local_x, local_y, blue_alpha, white_alpha| {
+    let rendered = for_each_cursor_pixel(motion, |local_x, local_y, blue_alpha, white_alpha| {
         let index =
             (local_y + radius) as usize * CURSOR_TEXTURE_SIZE + (local_x + radius) as usize;
         premultiplied_source_over(&mut pixels[index], COLOR_CURSOR_BLUE, blue_alpha);
         premultiplied_source_over(&mut pixels[index], COLOR_CURSOR_WHITE, white_alpha);
-    })
+    });
+    if rendered {
+        if let Ok(mut cache) = CURSOR_RASTER_CACHE.lock() {
+            *cache = Some((key, pixels.to_vec()));
+        }
+    }
+    rendered
 }
 
 fn for_each_cursor_pixel(
@@ -967,6 +992,20 @@ mod tests {
         let unscaled_h = src_max_y - src_min_y + 1;
         assert!(max_x - min_x + 1 >= unscaled_w * 3 / 2);
         assert!(max_y - min_y + 1 >= unscaled_h * 3 / 2);
+    }
+
+    #[test]
+    fn cached_cursor_raster_equals_a_fresh_raster() {
+        let moving = CursorMotion { dx: 7, dy: -3, sprite_index: 2 };
+        let mut first = vec![0_u32; CURSOR_TEXTURE_SIZE * CURSOR_TEXTURE_SIZE];
+        let mut second = first.clone();
+        assert!(render_cursor_bgra(&mut first, moving));
+        assert!(render_cursor_bgra(&mut second, moving));
+        assert_eq!(first, second);
+        let mut other = vec![0_u32; first.len()];
+        assert!(render_cursor_bgra(&mut other, CursorMotion::stationary()));
+        assert!(render_cursor_bgra(&mut second, moving));
+        assert_eq!(first, second);
     }
 
     #[test]

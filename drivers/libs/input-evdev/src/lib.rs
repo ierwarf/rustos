@@ -246,8 +246,11 @@ pub fn translate_input_to_evdev(
     let mut count = 0usize;
     match event.kind {
         INPUT_KIND_KEYBOARD => {
-            let code =
-                rustos_key_code_to_linux(event.code).ok_or(EvdevTranslateError::InvalidArgument)?;
+            // An unmappable key has no evdev representation: it is a no-op, not
+            // an error, so one stray code cannot discard a whole read batch.
+            let Some(code) = rustos_key_code_to_linux(event.code) else {
+                return Ok(0);
+            };
             push_evdev(
                 dest,
                 &mut count,
@@ -272,8 +275,9 @@ pub fn translate_input_to_evdev(
             push_syn(dest, &mut count)?;
         }
         INPUT_KIND_POINTER_BUTTON => {
-            let code =
-                pointer_button_to_linux(event.code).ok_or(EvdevTranslateError::InvalidArgument)?;
+            let Some(code) = pointer_button_to_linux(event.code) else {
+                return Ok(0);
+            };
             push_evdev(
                 dest,
                 &mut count,
@@ -303,6 +307,8 @@ pub fn translate_input_events_to_evdev(
 ) -> Result<usize, EvdevTranslateError> {
     let mut written = 0usize;
     for event in input {
+        // Unmappable events translate to zero records; only a genuinely
+        // undersized destination is an error.
         written += translate_input_to_evdev(*event, &mut dest[written..])?;
     }
     Ok(written)
@@ -513,5 +519,59 @@ mod tests {
         let rs = linux_key_code_to_rustos(30).expect("A");
         assert_eq!(rs, KeyCode::A);
         assert_eq!(rustos_key_code_to_linux(KeyCode::A as u32), Some(30));
+    }
+
+    fn key(code: u32, action: u16) -> InputEvent {
+        InputEvent {
+            kind: INPUT_KIND_KEYBOARD,
+            action,
+            code,
+            value0: 0,
+            value1: 0,
+            modifiers: 0,
+            text: 0,
+        }
+    }
+
+    #[test]
+    fn unmapped_key_is_skipped_without_aborting_batch() {
+        let batch = [
+            key(KeyCode::A as u32, INPUT_ACTION_PRESSED),
+            key(0xFFFF_FFF0, INPUT_ACTION_PRESSED),
+            key(KeyCode::A as u32, INPUT_ACTION_RELEASED),
+        ];
+        let mut dest = [LinuxInputEvent::default(); 9];
+        let n = translate_input_events_to_evdev(&batch, &mut dest).expect("batch");
+        assert_eq!(n, 4);
+        assert_eq!((dest[0].kind, dest[0].value), (EV_KEY, 1));
+        assert_eq!((dest[2].kind, dest[2].value), (EV_KEY, 0));
+    }
+
+    #[test]
+    fn unmapped_button_is_skipped_without_aborting_batch() {
+        let bad = InputEvent {
+            kind: INPUT_KIND_POINTER_BUTTON,
+            code: 0x9999,
+            ..key(0, INPUT_ACTION_PRESSED)
+        };
+        let good = InputEvent {
+            kind: INPUT_KIND_POINTER_BUTTON,
+            code: POINTER_BUTTON_LEFT,
+            ..key(0, INPUT_ACTION_RELEASED)
+        };
+        let mut dest = [LinuxInputEvent::default(); 6];
+        assert_eq!(translate_input_to_evdev(bad, &mut dest), Ok(0));
+        let n = translate_input_events_to_evdev(&[bad, good, bad], &mut dest).expect("batch");
+        assert_eq!(n, 2);
+        assert_eq!(dest[0].code, BTN_LEFT);
+    }
+
+    #[test]
+    fn undersized_destination_is_still_an_error() {
+        let mut dest = [LinuxInputEvent::default(); 1];
+        assert_eq!(
+            translate_input_events_to_evdev(&[key(KeyCode::A as u32, INPUT_ACTION_PRESSED)], &mut dest),
+            Err(EvdevTranslateError::InvalidArgument)
+        );
     }
 }

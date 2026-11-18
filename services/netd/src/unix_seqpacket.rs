@@ -40,7 +40,7 @@ pub(super) fn recv_message(
     collect_control: bool,
 ) -> Result<SocketReceive, i32> {
     let Some(segment) = connected.incoming.pop_front() else {
-        if connected.peer_closed || connected.peer_write_closed {
+        if connected.peer_closed || connected.peer_write_closed || connected.recv_closed {
             return Ok(SocketReceive::default());
         }
         return Err(libc::EAGAIN);
@@ -86,7 +86,7 @@ pub(super) fn peek_message(
         return Err(libc::ENOTCONN);
     };
     let Some(segment) = connected.incoming.front() else {
-        if connected.peer_closed || connected.peer_write_closed {
+        if connected.peer_closed || connected.peer_write_closed || connected.recv_closed {
             return Ok((0, false, 0));
         }
         return Err(libc::EAGAIN);

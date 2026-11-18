@@ -229,13 +229,13 @@ struct reader_ctx {
     int fd;
     ssize_t result;
     int err;
-    char byte;
+    char bytes[32];
 };
 
 static void *blocking_reader(void *raw) {
     struct reader_ctx *ctx = raw;
     errno = 0;
-    ctx->result = read(ctx->fd, &ctx->byte, 1);
+    ctx->result = read(ctx->fd, ctx->bytes, sizeof(ctx->bytes));
     ctx->err = errno;
     return NULL;
 }
@@ -253,11 +253,13 @@ static void pipe_blocking_and_wakeups(void) {
     ctx.fd = fds[0];
     CHECK(pthread_create(&thread, NULL, blocking_reader, &ctx) == 0, name);
     msleep(100);
-    CHECK(write(fds[1], "q", 1) == 1, name);
+    static const char payload[] = "queued payload";
+    CHECK(write(fds[1], payload, sizeof(payload)) == (ssize_t)sizeof(payload), name);
     say("localfd: step pipe-blocking reader-written");
     pthread_join(thread, NULL);
     say("localfd: step pipe-blocking reader-joined");
-    CHECK(ctx.result == 1 && ctx.byte == 'q', name);
+    CHECK(ctx.result == (ssize_t)sizeof(payload) &&
+          memcmp(ctx.bytes, payload, sizeof(payload)) == 0, name);
     close(fds[0]);
     close(fds[1]);
 

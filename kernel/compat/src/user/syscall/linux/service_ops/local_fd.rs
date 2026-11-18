@@ -401,27 +401,32 @@ fn pipe_read(pipe: &PipeHandle, user_ptr: u64, user_len: u64) -> u64 {
     if user_len == 0 {
         return 0;
     }
-    let want = user_len.min(LOCAL_FD_IO_CHUNK_BYTES);
-    if let Err(err) =
-        usermem::validate_current_user_write_buffer(user_ptr, want.min(LOCAL_FD_STACK_SCRATCH_BYTES))
-    {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
     let mut stack = [0_u8; LOCAL_FD_STACK_SCRATCH_BYTES];
     let mut heap = Vec::new();
-    let scratch: &mut [u8] = if want <= LOCAL_FD_STACK_SCRATCH_BYTES {
-        &mut stack[..want]
-    } else {
-        if pipe.nonblocking() && pipe.shared().bytes_available() == 0 {
-            return linux_errno(LINUX_EAGAIN);
-        }
-        if heap.try_reserve_exact(want).is_err() {
-            return linux_errno(LINUX_ENOMEM);
-        }
-        heap.resize(want, 0);
-        &mut heap[..]
-    };
     loop {
+        // Size scratch by the queued bytes, sampling again after each wake.
+        // The one-byte minimum lets read_with distinguish EOF from an empty
+        // live pipe and return the wait generation under its own lock.
+        let want = user_len
+            .min(LOCAL_FD_IO_CHUNK_BYTES)
+            .min(pipe.shared().bytes_available().max(1));
+        if let Err(err) = usermem::validate_current_user_write_buffer(
+            user_ptr,
+            want.min(LOCAL_FD_STACK_SCRATCH_BYTES),
+        ) {
+            return linux_errno(user_pointer_error_to_linux_errno(err));
+        }
+        let scratch = if want <= LOCAL_FD_STACK_SCRATCH_BYTES {
+            &mut stack[..want]
+        } else {
+            if want > heap.len() {
+                if heap.try_reserve_exact(want - heap.len()).is_err() {
+                    return linux_errno(LINUX_ENOMEM);
+                }
+                heap.resize(want, 0);
+            }
+            &mut heap[..want]
+        };
         let copied = pipe.shared().read_with(scratch, |bytes| {
             usermem::write_current_user_bytes(user_ptr, bytes)
         });

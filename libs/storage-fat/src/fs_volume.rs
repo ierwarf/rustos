@@ -71,10 +71,22 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y + if m <= 2 { 1 } else { 0 }, m as u32, d as u32)
 }
 
+fn days_in_month(year: u16, month: u16) -> u16 {
+    match month {
+        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// `FsTimestamp::default()` (the epoch) stands for "unset or invalid": FAT's
+/// all-zero date and out-of-range calendar fields must not alias real days.
 fn date_to_timestamp(date: Date) -> FsTimestamp {
     if !(1980..=2107).contains(&date.year)
         || !(1..=12).contains(&date.month)
-        || !(1..=31).contains(&date.day)
+        || date.day == 0
+        || date.day > days_in_month(date.year, date.month)
     {
         return FsTimestamp::default();
     }
@@ -87,7 +99,9 @@ fn date_to_timestamp(date: Date) -> FsTimestamp {
 
 fn datetime_to_timestamp(dt: DateTime) -> FsTimestamp {
     let base = date_to_timestamp(dt.date);
-    if base.secs == 0 && dt.date.year < 1980 {
+    // A valid FAT date is never earlier than 1980, so zero means "invalid".
+    // Keeping only the time of day would fabricate a 1970 timestamp.
+    if base.secs == 0 {
         return FsTimestamp::default();
     }
     let hour = i64::from(dt.time.hour.min(23));
@@ -464,14 +478,30 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
             file.seek(SeekFrom::Start(offset)).map_err(map_fat_error)?;
         }
         let mut written = 0usize;
+        let mut failure = None;
         while written < data.len() {
-            let n = file.write(&data[written..]).map_err(map_fat_error)?;
-            if n == 0 {
-                return Err(FsError::Io(StorageError::WriteZero));
+            match file.write(&data[written..]) {
+                Ok(0) => {
+                    failure = Some(FsError::Io(StorageError::WriteZero));
+                    break;
+                }
+                Ok(n) => written += n,
+                Err(error) => {
+                    failure = Some(map_fat_error(error));
+                    break;
+                }
             }
-            written += n;
         }
-        file.flush().map_err(map_fat_error)?;
+        // fatfs writes one cluster at a time, so running out of space midway
+        // has already grown the file. Persist that prefix and report it as a
+        // short write instead of an error that hides the new length.
+        let flushed = file.flush().map_err(map_fat_error);
+        if let Some(error) = failure {
+            if written == 0 {
+                return Err(error);
+            }
+        }
+        flushed?;
         let new_len = current_len.max(offset + written as u64);
         Ok((written, new_len))
     }
@@ -609,6 +639,16 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
         drop(src_entry);
 
         let (dst_dir, dst_parent_canon) = self.open_dir_checked(&fs, dst_parent)?;
+        // Moving a directory below itself would detach the subtree into an
+        // unreachable cycle that fatfs does not detect.
+        if src_is_dir
+            && (dst_parent_canon == src_canon
+                || dst_parent_canon
+                    .strip_prefix(src_canon.as_str())
+                    .is_some_and(|rest| rest.starts_with('/')))
+        {
+            return Err(FsError::InvalidInput);
+        }
         match find_entry_case_insensitive(&dst_dir, dst_name, limit) {
             Ok(dst_entry) => {
                 let dst_canon = append_canonical(&dst_parent_canon, &dst_entry.file_name());
@@ -1084,5 +1124,108 @@ mod tests {
             .unwrap();
         assert_eq!(ro.write_at("missing.txt", 0, b"x"), Err(FsError::ReadOnly));
         assert_eq!(ro.truncate("missing.txt", 0), Err(FsError::ReadOnly));
+    }
+
+    #[test]
+    fn rename_directory_below_itself_is_rejected_and_tree_survives() {
+        let vol = FatVolume::new(format_disk(512, 4096, 0x0c0f_fee1)).unwrap();
+        vol.mkdir("a").unwrap();
+        vol.mkdir("a/b").unwrap();
+        let fs: &dyn FsVolume = &vol;
+        for dst in ["a/b/a", "a/a", "A/B/c"] {
+            assert_eq!(fs.rename("a", dst, false, false), Err(FsError::InvalidInput), "{dst}");
+        }
+        // A sibling whose name merely starts with the source name is legal.
+        vol.mkdir("ab").unwrap();
+        fs.rename("a", "ab/a", false, false).unwrap();
+        assert_eq!(fs.metadata("ab/a/b").unwrap().kind, FsNodeKind::Directory);
+        assert_eq!(fs.metadata("a"), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn write_at_reports_short_write_when_the_volume_fills_midway() {
+        let vol = FatVolume::new(format_disk(512, 4096, 0x0bad_f111)).unwrap();
+        let fs: &dyn FsVolume = &vol;
+        fs.open_prepare(
+            "big.bin",
+            FsOpenOptions { create: true, write: true, ..Default::default() },
+        )
+        .unwrap();
+        let free = fs.statfs().unwrap();
+        let capacity = (free.free_blocks * free.block_size) as usize;
+        let data = alloc::vec![0x5a_u8; capacity + 3 * free.block_size as usize];
+        let (written, new_len) = fs.write_at("big.bin", 0, &data).unwrap();
+        assert!(written > 0 && written < data.len(), "short write expected, got {written}");
+        assert_eq!(new_len, written as u64);
+        assert_eq!(fs.metadata("big.bin").unwrap().len, written as u64);
+        let mut back = alloc::vec![0_u8; written];
+        assert_eq!(fs.read_at("big.bin", 0, &mut back).unwrap(), written);
+        assert!(back.iter().all(|byte| *byte == 0x5a));
+        // With nothing left, the failure is reported rather than hidden.
+        assert_eq!(fs.write_at("big.bin", written as u64, &data[..1024]), Err(FsError::NoSpace));
+    }
+
+    #[test]
+    fn invalid_dos_dates_do_not_alias_real_timestamps() {
+        let invalid = [
+            Date::new(2023, 2, 30),
+            Date::new(2023, 2, 29),
+            Date::new(2023, 4, 31),
+            Date::new(2100, 2, 29),
+        ];
+        for date in invalid {
+            assert_eq!(date_to_timestamp(date), FsTimestamp::default(), "{date:?}");
+            let dt = DateTime::new(Date::new(1980, 1, 1), Time::new(1, 2, 3, 0));
+            assert_ne!(datetime_to_timestamp(dt), FsTimestamp::default());
+            let bad = DateTime::new(date, Time::new(1, 2, 3, 0));
+            assert_eq!(datetime_to_timestamp(bad), FsTimestamp::default(), "{date:?}");
+        }
+        assert_eq!(date_to_timestamp(Date::new(2024, 2, 29)).secs, 1_709_164_800);
+        assert_eq!(date_to_timestamp(Date::new(2100, 2, 28)).secs % 86_400, 0);
+    }
+
+    #[test]
+    fn unmount_makes_final_metadata_durable_with_a_barrier() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+        struct Barrier { inner: MemBlockDevice, flushes: StdArc<AtomicUsize> }
+        impl BlockDevice for Barrier {
+            fn logical_block_size(&self) -> usize { self.inner.logical_block_size() }
+            fn block_count(&self) -> u64 { self.inner.block_count() }
+            fn read_blocks(&mut self, lba: u64, out: &mut [u8]) -> storage_core::IoResult<()> {
+                self.inner.read_blocks(lba, out)
+            }
+            fn write_blocks(&mut self, lba: u64, data: &[u8]) -> storage_core::IoResult<()> {
+                self.inner.write_blocks(lba, data)
+            }
+            fn flush(&mut self) -> storage_core::IoResult<()> {
+                self.flushes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let flushes = StdArc::new(AtomicUsize::new(0));
+        let vol = FatVolume::new(Barrier { inner: format_disk(512, 4096, 0x1357_9bdf), flushes: flushes.clone() })
+            .unwrap();
+        vol.mkdir("d").unwrap();
+        assert_eq!(flushes.load(Ordering::SeqCst), 0, "per-operation flushes carry no barrier");
+        vol.unmount().unwrap();
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn plan_read_after_partial_failure_style_flush_keeps_epoch_current() {
+        let mut vol = FatVolume::new(format_disk(512, 8192, 0x2468_ace0)).unwrap();
+        {
+            let mut file = vol.create_file("m.bin").unwrap();
+            file.write_all(&[7_u8; 3000]).unwrap();
+            // Deliberately no flush: the bytes may still be staged in FatDisk.
+        }
+        let map = vol.plan_read("m.bin", 4096).unwrap();
+        assert!(vol.read_map_is_current(&map));
+        let mut scratch = [0_u8; 512];
+        let mut view = vol.read_view(&map, &mut scratch).unwrap();
+        let mut out = [0_u8; 3000];
+        assert_eq!(view.read_at(0, &mut out).unwrap(), 3000);
+        assert!(out.iter().all(|byte| *byte == 7));
     }
 }

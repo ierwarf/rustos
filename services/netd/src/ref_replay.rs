@@ -2,9 +2,9 @@
 
 use super::*;
 
-pub(super) fn ref_replay_log() -> &'static Mutex<VecDeque<RefReplayEntry>> {
-    static LOG: OnceLock<Mutex<VecDeque<RefReplayEntry>>> = OnceLock::new();
-    LOG.get_or_init(|| Mutex::new(VecDeque::with_capacity(REF_REPLAY_CAPACITY)))
+pub(super) fn ref_replay_log() -> &'static Mutex<HashMap<(u64, u64), RefReplayEntry>> {
+    static LOG: OnceLock<Mutex<HashMap<(u64, u64), RefReplayEntry>>> = OnceLock::new();
+    LOG.get_or_init(|| Mutex::new(HashMap::with_capacity(REF_REPLAY_CAPACITY)))
 }
 
 pub(super) fn begin_ref_result(
@@ -15,9 +15,7 @@ pub(super) fn begin_ref_result(
         return Err(libc::EINVAL);
     }
     let mut log = ref_replay_log().lock().map_err(|_| libc::EIO)?;
-    if let Some(entry) = log.iter().find(|entry| {
-        entry.operation_hi == request.operation_hi && entry.operation_lo == request.operation_lo
-    }) {
+    if let Some(entry) = log.get(&(request.operation_hi, request.operation_lo)) {
         if entry.op != request.op || entry.socket_token != request.socket_token {
             return Err(libc::EPROTO);
         }
@@ -36,24 +34,27 @@ pub(super) fn begin_ref_result(
             return Err(libc::ENOSPC);
         }
     }
-    log.push_back(RefReplayEntry {
-        operation_hi: request.operation_hi,
-        operation_lo: request.operation_lo,
-        op: request.op,
-        socket_token: request.socket_token,
-        status: libc::EINPROGRESS,
-        value: 0,
-        release: Vec::new(),
-        complete: false,
-        admitted: StdInstant::now(),
-    });
+    log.insert(
+        (request.operation_hi, request.operation_lo),
+        RefReplayEntry {
+            operation_hi: request.operation_hi,
+            operation_lo: request.operation_lo,
+            op: request.op,
+            socket_token: request.socket_token,
+            status: libc::EINPROGRESS,
+            value: 0,
+            release: Vec::new(),
+            complete: false,
+            admitted: StdInstant::now(),
+        },
+    );
     Ok(RefReplayAction::Execute)
 }
 
 /// Drops completed results older than `REF_REPLAY_MIN_RETENTION`. Incomplete
 /// entries belong to an executing request and are never reclaimed.
-pub(super) fn reclaim_stale_ref_results(log: &mut VecDeque<RefReplayEntry>, now: StdInstant) {
-    log.retain(|entry| {
+pub(super) fn reclaim_stale_ref_results(log: &mut HashMap<(u64, u64), RefReplayEntry>, now: StdInstant) {
+    log.retain(|_, entry| {
         !entry.complete
             || now
                 .checked_duration_since(entry.admitted)
@@ -66,9 +67,7 @@ pub(super) fn complete_ref_result(request: &NetdIpcRequest, response: &NetdIpcRe
         debug_line("netd: ref replay completion lock poisoned");
         std::process::exit(134);
     };
-    let Some(entry) = log.iter_mut().find(|entry| {
-        entry.operation_hi == request.operation_hi && entry.operation_lo == request.operation_lo
-    }) else {
+    let Some(entry) = log.get_mut(&(request.operation_hi, request.operation_lo)) else {
         debug_line("netd: ref replay reservation lost");
         std::process::exit(134);
     };
@@ -99,19 +98,17 @@ pub(super) fn acknowledge_ref_result(request: &NetdIpcRequest) -> i32 {
     let Ok(mut log) = ref_replay_log().lock() else {
         return libc::EIO;
     };
-    let Some(index) = log.iter().position(|entry| {
-        entry.operation_hi == request.operation_hi && entry.operation_lo == request.operation_lo
-    }) else {
+    let key = (request.operation_hi, request.operation_lo);
+    let Some(entry) = log.get(&key) else {
         return 0;
     };
-    let entry = &log[index];
     if Some(entry.op) != acked_op || entry.socket_token != request.socket_token {
         return libc::EPROTO;
     }
     if !entry.complete {
         return libc::EBUSY;
     }
-    log.remove(index);
+    log.remove(&key);
     0
 }
 

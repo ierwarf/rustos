@@ -86,6 +86,7 @@ impl SharedFrames for MemfdFrames {
     fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<usize, FsError> {
         let mut done = 0usize;
         while done < out.len() {
+            let position = offset.checked_add(done as u64).ok_or(FsError::TooBig)?;
             // SAFETY: `out[done..]` is a live writable range of the stated
             // length for the duration of the call.
             let status = unsafe {
@@ -94,7 +95,7 @@ impl SharedFrames for MemfdFrames {
                     self.fd as u64,
                     out[done..].as_mut_ptr() as u64,
                     (out.len() - done) as u64,
-                    offset + done as u64,
+                    position,
                 )
             };
             if status < 0 {
@@ -111,6 +112,7 @@ impl SharedFrames for MemfdFrames {
     fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize, FsError> {
         let mut done = 0usize;
         while done < data.len() {
+            let position = offset.checked_add(done as u64).ok_or(FsError::TooBig)?;
             // SAFETY: `data[done..]` is a live readable range of the stated
             // length for the duration of the call.
             let status = unsafe {
@@ -119,7 +121,7 @@ impl SharedFrames for MemfdFrames {
                     self.fd as u64,
                     data[done..].as_ptr() as u64,
                     (data.len() - done) as u64,
-                    offset + done as u64,
+                    position,
                 )
             };
             if status < 0 {

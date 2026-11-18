@@ -139,6 +139,67 @@ impl WaylandState {
         true
     }
 
+    /// Make a surface retired by `xdg_toplevel.destroy` usable for a new
+    /// toplevel. Returns false when the surface tables have no room for it.
+    /// A surface that is still alive needs nothing and returns true.
+    pub(super) fn revive_retired_surface(&mut self, data: &SurfaceData) -> bool {
+        let resource_alive = match data.shared.lock() {
+            Ok(state) if state.alive => return true,
+            Ok(state) => state
+                .resource
+                .as_ref()
+                .is_some_and(|resource| resource.is_alive()),
+            Err(_) => return false,
+        };
+        if !resource_alive {
+            return false;
+        }
+        // The retired entry itself is dropped by the prune; it is re-added below.
+        self.prune_surfaces();
+        let client_id = data
+            .shared
+            .lock()
+            .ok()
+            .and_then(|state| state.client_id.clone());
+        let Some(client_id) = client_id else {
+            return false;
+        };
+        if self.surfaces.len() >= MAX_WAYLAND_SURFACES
+            || self.client_surface_count(&client_id) >= MAX_WAYLAND_SURFACES_PER_CLIENT
+        {
+            return false;
+        }
+        let Ok(mut state) = data.shared.lock() else {
+            return false;
+        };
+        state.alive = true;
+        state.minimized = false;
+        // The wl_surface survives, but this is a new toplevel. Keep the
+        // placement, not the old role's saved maximize state or preferences.
+        state.pre_maximize_frame = None;
+        state.title.clear();
+        state.title.push_str("Wayland App");
+        state.decoration_requested_server = true;
+        state.pending_damage = Rect::empty();
+        state.needs_initial_configure = true;
+        state.configured_serial = 0;
+        state.acknowledged_serial = 0;
+        state.outstanding_configures.clear();
+        state.decoration_configures.clear();
+        state.decoration_ack_server = false;
+        state.decoration_server = false;
+        drop(state);
+        if !self
+            .surfaces
+            .iter()
+            .any(|surface| Arc::ptr_eq(&surface.shared, &data.shared))
+        {
+            self.surfaces.push(data.clone());
+        }
+        self.mark_dirty();
+        true
+    }
+
     pub(super) fn focus_surface(&mut self, surface_id: u32) -> bool {
         let Some(shared) = self.find_surface_by_id(surface_id) else {
             return false;

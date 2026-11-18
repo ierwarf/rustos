@@ -362,14 +362,19 @@ pub(super) fn fcntl(fd: u64, cmd: u64, arg: u64) -> Option<u64> {
     Some(match fcntl_lock(fd, kind, owner, arg) {
         Ok(value) => value,
         Err(errno) => {
-            nucleus_core::debug::println_serialized(format_args!(
-                "fcntl_lock failed pid={:?} fd={} cmd={} owner={} errno={}",
-                current_pid(),
-                fd,
-                cmd,
-                owner,
-                errno
-            ));
+            // Contention outcomes are ordinary results of F_SETLK/OFD polling
+            // (databases hit them constantly); only unexpected failures are
+            // worth a serial line, which is slow and unbounded otherwise.
+            if !matches!(errno, LINUX_EAGAIN | LINUX_EINTR | LINUX_EDEADLK) {
+                nucleus_core::debug::println_serialized(format_args!(
+                    "fcntl_lock failed pid={:?} fd={} cmd={} owner={} errno={}",
+                    current_pid(),
+                    fd,
+                    cmd,
+                    owner,
+                    errno
+                ));
+            }
             linux_errno(errno)
         }
     })

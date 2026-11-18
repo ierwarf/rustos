@@ -118,10 +118,24 @@ pub(super) fn dispatch_admitted_request(
                 Err(errno) => errno,
             }
         } else {
+            // ORDERING: a state commit bumps the generation under the state lock
+            // before its own waiter pass runs. Sampling before the evaluation
+            // lets us detect a commit whose pass found our (not yet queued)
+            // waiter missing.
+            let generation_before = READINESS_GENERATION.load(Ordering::Acquire);
             let status = handle_poll_socket(request, response);
             if status == 0 && response.value == 0 {
                 match defer_local_poll_request(*request, reply_cap) {
-                    Ok(()) => return None,
+                    Ok(()) => {
+                        // ORDERING: acquire pairs with the state commit's release.
+                        // Recheck only after transferring reply ownership to the queue.
+                        if READINESS_GENERATION.load(Ordering::Acquire) != generation_before {
+                            // Re-evaluate now: the waiter is queued and its
+                            // reply authority is owned by the queue.
+                            service_local_poll_waiters();
+                        }
+                        return None;
+                    }
                     Err(errno) => errno,
                 }
             } else {

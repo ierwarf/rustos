@@ -250,33 +250,92 @@ impl InputQueue {
         }
     }
 
+    /// Overflow policy for a full queue. Returns whether `event` may be queued.
+    ///
+    /// Events are shed in order of how little state they carry: pointer
+    /// motion/position samples, key repeats, scroll deltas, then key/button
+    /// *presses*. A release is never shed while it is the only record that a
+    /// key/button went up: losing it leaves the consumer with a stuck-down
+    /// key, whereas a lost press leaves at worst a release for an input the
+    /// consumer never saw go down, which every consumer treats as a no-op.
+    /// The only releases ever removed are an older duplicate of the same
+    /// (kind, code) when the queue holds nothing but releases; with no press in
+    /// the queue between them, the later release carries the same state.
+    ///
+    /// The common (not full) path is O(1) and allocation-free; the single scan
+    /// below runs only once the queue is full.
     fn make_room_for(&mut self, event: input_evdev::InputEvent) -> bool {
         if self.events.len() < INPUTD_QUEUE_MAX_EVENTS {
             return true;
         }
-        if self.drop_oldest_lossy_event() {
+        let incoming = overflow_class(event);
+        let mut victims: [Option<usize>; 5] = [None; 5];
+        for (index, queued) in self.events.iter().enumerate() {
+            let slot = &mut victims[overflow_class(*queued) as usize];
+            if slot.is_none() {
+                *slot = Some(index);
+            }
+        }
+        // Only evict something strictly cheaper than, or as cheap as, the
+        // incoming event (a press may evict an older press); otherwise the
+        // incoming event itself is the cheapest to lose.
+        for class in OverflowClass::EVICTION_ORDER {
+            if class > incoming.min(OverflowClass::Press) {
+                break;
+            }
+            if let Some(index) = victims[class as usize] {
+                let _ = self.events.remove(index);
+                self.count_dropped(class);
+                return true;
+            }
+        }
+        if incoming == OverflowClass::Release {
+            if let Some(index) = self.oldest_duplicate_release(event) {
+                let _ = self.events.remove(index);
+                self.count_dropped(OverflowClass::Release);
+                return true;
+            }
+            // Unreachable in practice: more queued releases than distinct
+            // (kind, code) pairs implies a duplicate. Keep the newest edge.
+            let _ = self.events.pop_front();
+            self.count_dropped(OverflowClass::Release);
             return true;
         }
-        if is_lossy_pointer_event(event) {
-            self.dropped_lossy = self.dropped_lossy.saturating_add(1);
-            return false;
-        }
-        let _ = self.events.pop_front();
-        self.dropped_discrete = self.dropped_discrete.saturating_add(1);
-        true
+        self.count_dropped(incoming);
+        false
     }
 
-    fn drop_oldest_lossy_event(&mut self) -> bool {
-        let Some(index) = self
-            .events
-            .iter()
-            .position(|event| is_lossy_pointer_event(*event))
-        else {
-            return false;
-        };
-        let _ = self.events.remove(index);
-        self.dropped_lossy = self.dropped_lossy.saturating_add(1);
-        true
+    fn count_dropped(&mut self, class: OverflowClass) {
+        match class {
+            OverflowClass::Press | OverflowClass::Release => {
+                self.dropped_discrete = self.dropped_discrete.saturating_add(1);
+            }
+            _ => self.dropped_lossy = self.dropped_lossy.saturating_add(1),
+        }
+    }
+
+    /// Index of the oldest release that a later release of the same
+    /// (kind, code) supersedes. Only called when the queue is full of releases.
+    fn oldest_duplicate_release(&self, incoming: input_evdev::InputEvent) -> Option<usize> {
+        let mut last: std::collections::HashMap<(u16, u32), usize> =
+            std::collections::HashMap::new();
+        // The incoming release supersedes any queued release of its own key.
+        if let Some(index) = self.events.iter().position(|queued| {
+            overflow_class(*queued) == OverflowClass::Release
+                && (queued.kind, queued.code) == (incoming.kind, incoming.code)
+        }) {
+            return Some(index);
+        }
+        let mut oldest: Option<usize> = None;
+        for (index, queued) in self.events.iter().enumerate() {
+            if overflow_class(*queued) != OverflowClass::Release {
+                continue;
+            }
+            if let Some(previous) = last.insert((queued.kind, queued.code), index) {
+                oldest = Some(oldest.map_or(previous, |best| best.min(previous)));
+            }
+        }
+        oldest
     }
 
     fn pop_front(&mut self) -> Option<input_evdev::InputEvent> {
@@ -497,11 +556,35 @@ fn can_coalesce(existing: input_evdev::InputEvent, next: input_evdev::InputEvent
         && existing.text == next.text
 }
 
-fn is_lossy_pointer_event(event: input_evdev::InputEvent) -> bool {
-    matches!(
-        event.kind,
-        input_evdev::INPUT_KIND_POINTER_MOTION | input_evdev::INPUT_KIND_POINTER_POSITION
-    )
+/// How expendable an event is when the queue overflows; lower is shed first.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum OverflowClass {
+    Position = 0,
+    Repeat = 1,
+    Scroll = 2,
+    Press = 3,
+    Release = 4,
+}
+
+impl OverflowClass {
+    const EVICTION_ORDER: [OverflowClass; 4] = [
+        OverflowClass::Position,
+        OverflowClass::Repeat,
+        OverflowClass::Scroll,
+        OverflowClass::Press,
+    ];
+}
+
+fn overflow_class(event: input_evdev::InputEvent) -> OverflowClass {
+    match (event.kind, event.action) {
+        (input_evdev::INPUT_KIND_POINTER_MOTION | input_evdev::INPUT_KIND_POINTER_POSITION, _) => {
+            OverflowClass::Position
+        }
+        (input_evdev::INPUT_KIND_POINTER_SCROLL, _) => OverflowClass::Scroll,
+        (_, input_evdev::INPUT_ACTION_REPEATED) => OverflowClass::Repeat,
+        (_, input_evdev::INPUT_ACTION_RELEASED) => OverflowClass::Release,
+        _ => OverflowClass::Press,
+    }
 }
 
 fn merge_coalesced_event(existing: &mut input_evdev::InputEvent, next: input_evdev::InputEvent) {
@@ -815,6 +898,100 @@ mod tests {
             event.kind == input_evdev::INPUT_KIND_POINTER_BUTTON
                 && event.action == input_evdev::INPUT_ACTION_PRESSED
         }));
+    }
+
+    #[test]
+    fn overflow_never_drops_release_while_press_or_lossy_exist() {
+        use input_evdev::*;
+        let key = |code: u32, action: u16| InputEvent {
+            kind: INPUT_KIND_KEYBOARD,
+            action,
+            code,
+            value0: 0,
+            value1: 0,
+            modifiers: 0,
+            text: 0,
+        };
+        let mut queue = InputQueue::default();
+        queue.events.push_back(key(5, INPUT_ACTION_PRESSED));
+        queue.events.push_back(key(5, INPUT_ACTION_RELEASED));
+        for code in 0..super::INPUTD_QUEUE_MAX_EVENTS as u32 - 2 {
+            queue.events.push_back(key(100 + code % 120, INPUT_ACTION_RELEASED));
+        }
+        // Full of releases plus one press: a new release evicts the old press.
+        queue.push(key(9, INPUT_ACTION_RELEASED));
+        assert_eq!(queue.len(), super::INPUTD_QUEUE_MAX_EVENTS);
+        assert!(queue.events.iter().all(|e| e.action == INPUT_ACTION_RELEASED));
+        assert!(queue.events.iter().any(|e| e.code == 9));
+        assert_eq!(queue.dropped_discrete, 1);
+        // Only releases left: a new press is shed, never a release.
+        queue.push(key(7, INPUT_ACTION_PRESSED));
+        assert!(queue.events.iter().all(|e| e.action == INPUT_ACTION_RELEASED));
+        assert_eq!(queue.dropped_discrete, 2);
+        // A new release replaces an older duplicate release only.
+        queue.push(key(9, INPUT_ACTION_RELEASED));
+        assert_eq!(queue.events.iter().filter(|e| e.code == 9).count(), 1);
+        assert_eq!(queue.dropped_discrete, 3);
+    }
+
+    #[test]
+    fn overflow_sheds_repeat_and_scroll_before_discrete() {
+        use input_evdev::*;
+        let mk = |kind, action, code| InputEvent {
+            kind,
+            action,
+            code,
+            value0: 1,
+            value1: 0,
+            modifiers: 0,
+            text: 0,
+        };
+        let mut queue = InputQueue::default();
+        queue.events.push_back(mk(INPUT_KIND_KEYBOARD, INPUT_ACTION_REPEATED, 4));
+        queue.events.push_back(mk(INPUT_KIND_POINTER_SCROLL, INPUT_ACTION_NONE, 0));
+        while queue.events.len() < super::INPUTD_QUEUE_MAX_EVENTS {
+            queue
+                .events
+                .push_back(mk(INPUT_KIND_KEYBOARD, INPUT_ACTION_RELEASED, 4));
+        }
+        queue.push(mk(INPUT_KIND_KEYBOARD, INPUT_ACTION_RELEASED, 6));
+        assert!(!queue.events.iter().any(|e| e.action == INPUT_ACTION_REPEATED));
+        assert_eq!(queue.dropped_lossy, 1);
+        queue.push(mk(INPUT_KIND_KEYBOARD, INPUT_ACTION_RELEASED, 7));
+        assert!(!queue.events.iter().any(|e| e.kind == INPUT_KIND_POINTER_SCROLL));
+        assert_eq!(queue.dropped_discrete, 0);
+        // A repeat or scroll arriving at an all-discrete full queue is shed itself.
+        queue.push(mk(INPUT_KIND_KEYBOARD, INPUT_ACTION_REPEATED, 4));
+        queue.push(mk(INPUT_KIND_POINTER_SCROLL, INPUT_ACTION_NONE, 0));
+        assert_eq!(queue.len(), super::INPUTD_QUEUE_MAX_EVENTS);
+        assert_eq!(queue.dropped_lossy, 4);
+    }
+
+    #[test]
+    fn evdev_read_skips_unmappable_events_instead_of_reporting_no_data() {
+        use input_evdev::*;
+        let mut queue = InputQueue::default();
+        let key = |code: u32, action: u16| InputEvent {
+            kind: INPUT_KIND_KEYBOARD,
+            action,
+            code,
+            value0: 0,
+            value1: 0,
+            modifiers: 0,
+            text: 0,
+        };
+        queue.push(key(0xFFFF_0000, INPUT_ACTION_PRESSED));
+        let mut payload = [0u8; super::INPUTD_READ_PAYLOAD_CAPACITY];
+        let want = 3 * std::mem::size_of::<LinuxInputEvent>();
+        // Only an unmappable event queued: consumed, nothing to report.
+        assert_eq!(super::fill_evdev_payload(&mut queue, &mut payload, want), Ok(0));
+        assert!(queue.is_empty());
+        // A leading unmappable event does not hide the mappable one behind it.
+        queue.push(key(0xFFFF_0000, INPUT_ACTION_PRESSED));
+        queue.push(key(KeyCode::A as u32, INPUT_ACTION_PRESSED));
+        let n = super::fill_evdev_payload(&mut queue, &mut payload, want).unwrap();
+        assert_eq!(n, 2 * std::mem::size_of::<LinuxInputEvent>());
+        assert!(queue.is_empty());
     }
 
     #[test]
@@ -1661,23 +1838,30 @@ fn fill_evdev_payload(
     if output_capacity < input_evdev::MAX_EVDEV_EVENTS_PER_INPUT_EVENT || queue.is_empty() {
         return Ok(0);
     }
-    let max_input = (output_capacity / input_evdev::MAX_EVDEV_EVENTS_PER_INPUT_EVENT)
-        .min(queue.len())
-        .min(input_evdev::MAX_INPUT_EVENTS_PER_READ);
     EVDEV_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
         let (input, output) = &mut *scratch;
-        input.clear();
-        input.reserve(max_input.saturating_sub(input.capacity()));
-        for _ in 0..max_input {
-            let Some(event) = queue.pop_front() else {
-                break;
-            };
-            input.push(event);
-        }
         output.resize(output_capacity, input_evdev::LinuxInputEvent::default());
-        let written_events = input_evdev::translate_input_events_to_evdev(input, output)
-            .map_err(|_| libc::EINVAL)?;
+        // Events with no evdev representation translate to nothing. An empty
+        // result for a non-empty queue must not look like "no data" (EOF or
+        // would-block) to the reader, so keep draining until something maps or
+        // the queue is empty.
+        let mut written_events = 0usize;
+        while written_events == 0 && !queue.is_empty() {
+            let max_input = (output_capacity / input_evdev::MAX_EVDEV_EVENTS_PER_INPUT_EVENT)
+                .min(queue.len())
+                .min(input_evdev::MAX_INPUT_EVENTS_PER_READ);
+            input.clear();
+            input.reserve(max_input.saturating_sub(input.capacity()));
+            for _ in 0..max_input {
+                let Some(event) = queue.pop_front() else {
+                    break;
+                };
+                input.push(event);
+            }
+            written_events = input_evdev::translate_input_events_to_evdev(input, output)
+                .map_err(|_| libc::EINVAL)?;
+        }
         let bytes_len = written_events * event_size;
         // SAFETY: `output[..written_events]` is initialized `repr(C)` LinuxInputEvent data
         // (i64,i64,u16,u16,i32: no padding) and `bytes_len = written_events * size` is

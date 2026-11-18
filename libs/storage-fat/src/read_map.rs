@@ -41,11 +41,15 @@ impl<D: BlockDevice> FatVolume<D> {
     /// admission, so a contiguous large file needs one range rather than a map
     /// entry per cluster. Temporary overlap-validation memory is also budgeted.
     pub fn plan_read(&self, path: &str, metadata_budget: usize) -> Result<FileReadMap, RangeError> {
+        let fs = self.lock_fs();
+        // Maps read the device directly, so staged FAT-layer blocks must have
+        // reached it before the map can be called current. The flush may itself
+        // write (and so revoke), hence the epoch is sampled after it.
+        fs.flush_disk().map_err(range_error)?;
         let (identity, version) = {
             let dev = self.device.lock();
             (dev.identity, dev.version)
         };
-        let fs = self.lock_fs();
         let (mut file, len) =
             Self::open_file_with_len_in(&fs, self.max_dir_entries(), path).map_err(range_error)?;
         let object = file.0.directory_entry_offset().and_then(|offset| offset.checked_add(1))

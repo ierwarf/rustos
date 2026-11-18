@@ -40,6 +40,12 @@ pub(crate) struct ServiceCheckpointStore {
     pub(crate) personality: super::personality_policy::PersonalityPolicy,
 }
 
+struct MutatePlan {
+    existing_index: Option<usize>,
+    descendants: Option<Vec<bool>>,
+    duplicate: bool,
+}
+
 impl ServiceCheckpointStore {
     pub(crate) fn new() -> Self {
         // The ABI bound is a *limit*, not a request to reserve tens of
@@ -56,23 +62,21 @@ impl ServiceCheckpointStore {
         }
     }
 
-    /// Evaluate one complex checkpoint mutation without publishing it.
+    /// Evaluate one checkpoint mutation without publishing it.
     /// Kernel journal append follows only a successful dry-run, so ENOSPC
-    /// cannot mutate the rootd DAG without a corresponding log entry.
-    fn snapshot_for_preflight(&self) -> Result<Self, i32> {
-        let mut scratch = Self::new();
-        scratch.records.try_reserve_exact(self.records.len())
-            .map_err(|_| ENOMEM)?;
-        scratch.records.extend_from_slice(&self.records);
-        Ok(scratch)
-    }
-
+    /// cannot mutate the rootd DAG without a corresponding log entry. The
+    /// dry-run is the exact planning half of `mutate` (no ledger copy), and
+    /// reserves the slot a new record needs so the commit cannot hit OOM.
     pub(crate) fn preflight_mutate(
-        &self,
+        &mut self,
         service_id: u64,
         record: ServiceCheckpointRecordWire,
     ) -> Result<(), i32> {
-        self.snapshot_for_preflight()?.mutate(service_id, record).map(|_| ())
+        let plan = self.plan_mutate(service_id, record)?;
+        if !plan.duplicate && plan.existing_index.is_none() {
+            self.records.try_reserve(1).map_err(|_| ENOMEM)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn preflight_compact(
@@ -80,7 +84,7 @@ impl ServiceCheckpointStore {
         service_id: u64,
         proof: ServiceCheckpointRecordWire,
     ) -> Result<(), i32> {
-        self.snapshot_for_preflight()?.compact(service_id, proof).map(|_| ())
+        self.plan_compact(service_id, proof).map(|_| ())
     }
 
     pub(crate) fn mutate(
@@ -88,6 +92,49 @@ impl ServiceCheckpointStore {
         service_id: u64,
         incoming: ServiceCheckpointRecordWire,
     ) -> Result<bool, i32> {
+        let plan = self.plan_mutate(service_id, incoming)?;
+        if plan.duplicate {
+            return Ok(true);
+        }
+        let MutatePlan { existing_index, descendants, .. } = plan;
+        match existing_index {
+            Some(index) => self.records[index].wire = incoming,
+            None => {
+                // Reserve before changing any state (including dependent
+                // tombstones); OOM must not partially publish a checkpoint.
+                self.records.try_reserve(1).map_err(|_| ENOMEM)?;
+                self.records.push(StoredRecord {
+                    service_id,
+                    wire: incoming,
+                });
+            }
+        }
+
+        if let Some(descendants) = descendants {
+            for (index, selected) in descendants.into_iter().enumerate() {
+                if selected
+                    && self.records[index].wire.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
+                {
+                    let child = &mut self.records[index].wire;
+                    child.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
+                    child.value_len = 0;
+                    child.value.fill(0);
+                    child.operation_hi = incoming.operation_hi;
+                    child.operation_lo = incoming.operation_lo;
+                    child.revision += 1;
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Read-only validation of one mutation. Everything that can refuse the
+    /// request happens here, before any state changes.
+    fn plan_mutate(
+        &self,
+        service_id: u64,
+        incoming: ServiceCheckpointRecordWire,
+    ) -> Result<MutatePlan, i32> {
         validate_wire(&incoming)?;
         let existing_index = self.find(
             service_id,
@@ -102,7 +149,7 @@ impl ServiceCheckpointStore {
                 && current.operation_lo == incoming.operation_lo
             {
                 return if current == incoming {
-                    Ok(true)
+                    Ok(MutatePlan { existing_index, descendants: None, duplicate: true })
                 } else {
                     Err(EPROTO)
                 };
@@ -166,36 +213,7 @@ impl ServiceCheckpointStore {
         } else {
             None
         };
-
-        match existing_index {
-            Some(index) => self.records[index].wire = incoming,
-            None => {
-                // Reserve before changing any state (including dependent
-                // tombstones); OOM must not partially publish a checkpoint.
-                self.records.try_reserve(1).map_err(|_| ENOMEM)?;
-                self.records.push(StoredRecord {
-                    service_id,
-                    wire: incoming,
-                });
-            }
-        }
-
-        if let Some(descendants) = descendants {
-            for (index, selected) in descendants.into_iter().enumerate() {
-                if selected
-                    && self.records[index].wire.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
-                {
-                    let child = &mut self.records[index].wire;
-                    child.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
-                    child.value_len = 0;
-                    child.value.fill(0);
-                    child.operation_hi = incoming.operation_hi;
-                    child.operation_lo = incoming.operation_lo;
-                    child.revision += 1;
-                }
-            }
-        }
-        Ok(false)
+        Ok(MutatePlan { existing_index, descendants, duplicate: false })
     }
 
     pub(crate) fn scan(
@@ -232,27 +250,9 @@ impl ServiceCheckpointStore {
         service_id: u64,
         proof: ServiceCheckpointRecordWire,
     ) -> Result<bool, i32> {
-        validate_wire(&proof)?;
-        if proof.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0 {
-            return Err(EINVAL);
-        }
-        let Some(index) = self.find_key(service_id, proof.key_hi, proof.key_lo) else {
+        let Some(remove) = self.plan_compact(service_id, proof)? else {
             return Ok(true);
         };
-        if self.records[index].wire != proof {
-            return Err(ESTALE);
-        }
-
-        // Collect the exact subtree as a stable per-record bitmap *before*
-        // mutating the ledger. The allocation can fail without consuming the
-        // proof or removing any other service's records.
-        let mut remove = self.descendant_mask(service_id, (proof.key_hi, proof.key_lo))?;
-        for (i, selected) in remove.iter_mut().enumerate() {
-            *selected |= i == index;
-            if *selected && self.records[i].wire.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0 {
-                return Err(ESTALE);
-            }
-        }
         let mut cursor = 0;
         self.records.retain(|_| {
             let keep = !remove[cursor];
@@ -260,6 +260,34 @@ impl ServiceCheckpointStore {
             keep
         });
         Ok(false)
+    }
+
+    /// Read-only validation of one compaction. `None` means the key is
+    /// already absent. The subtree is collected as a stable per-record bitmap
+    /// *before* any mutation, so an allocation failure consumes nothing.
+    fn plan_compact(
+        &self,
+        service_id: u64,
+        proof: ServiceCheckpointRecordWire,
+    ) -> Result<Option<Vec<bool>>, i32> {
+        validate_wire(&proof)?;
+        if proof.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0 {
+            return Err(EINVAL);
+        }
+        let Some(index) = self.find_key(service_id, proof.key_hi, proof.key_lo) else {
+            return Ok(None);
+        };
+        if self.records[index].wire != proof {
+            return Err(ESTALE);
+        }
+        let mut remove = self.descendant_mask(service_id, (proof.key_hi, proof.key_lo))?;
+        for (i, selected) in remove.iter_mut().enumerate() {
+            *selected |= i == index;
+            if *selected && self.records[i].wire.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0 {
+                return Err(ESTALE);
+            }
+        }
+        Ok(Some(remove))
     }
 
     /// Unique key lookup. Parent is deliberately *not* part of identity.
@@ -615,6 +643,40 @@ mod tests {
         assert_eq!(store.compact(3, tombstone), Err(ESTALE));
         assert_eq!(store.scan(3, 0, 8).unwrap().0, vec![second]);
         assert_eq!(store.compact(3, second), Ok(false));
+        assert!(store.scan(3, 0, 8).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn preflight_is_a_read_only_dry_run_that_agrees_with_the_commit() {
+        let mut store = ServiceCheckpointStore::new();
+        let root = record((1, 1), (0, 0), 1, 10);
+        let child = record((2, 2), (1, 1), 1, 11);
+        // Accepted dry-runs change nothing.
+        assert_eq!(store.preflight_mutate(3, root), Ok(()));
+        assert!(store.scan(3, 0, 8).unwrap().0.is_empty());
+        store.mutate(3, root).unwrap();
+        // A child of an absent parent is refused by both phases.
+        assert_eq!(store.preflight_mutate(3, child.clone()), Ok(()));
+        let orphan = record((9, 9), (8, 8), 1, 12);
+        assert_eq!(store.preflight_mutate(3, orphan), Err(ESTALE));
+        assert_eq!(store.mutate(3, orphan), Err(ESTALE));
+        store.mutate(3, child).unwrap();
+        // Exact replay is accepted (idempotent) by the dry-run too.
+        assert_eq!(store.preflight_mutate(3, child), Ok(()));
+        // Tombstone dry-run does not touch descendants.
+        let mut tomb = root;
+        tomb.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
+        tomb.value_len = 0;
+        tomb.value.fill(0);
+        tomb.operation_lo = 20;
+        tomb.revision = 2;
+        assert_eq!(store.preflight_mutate(3, tomb), Ok(()));
+        assert_eq!(store.scan(3, 0, 8).unwrap().0, vec![root, child]);
+        assert_eq!(store.preflight_compact(3, tomb), Err(ESTALE));
+        store.mutate(3, tomb).unwrap();
+        assert_eq!(store.preflight_compact(3, tomb), Ok(()));
+        assert_eq!(store.scan(3, 0, 8).unwrap().0.len(), 2);
+        assert_eq!(store.compact(3, tomb), Ok(false));
         assert!(store.scan(3, 0, 8).unwrap().0.is_empty());
     }
 }

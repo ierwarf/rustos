@@ -4,6 +4,20 @@ Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
 
+## Ring3 and non-core Ring0 batch (2026-11-18)
+
+- The broad service and compat/I/O batch received six independent reviews.
+  Follow-ups cover TCP `SO_ERROR` and connect retries, rootd dependency restart
+  accounting, Wayland toplevel revival, pipe wakeup reads, tmpfs test isolation,
+  realloc move coverage, and shared backing identity across directory rename.
+- Remaining VFS issues: `state_storage.rs::render_getdents_payload` derives
+  cookies from regenerated indexes (unlink before the cursor can skip an
+  entry); `path.rs` returns EINVAL for over-capacity normalized paths; the
+  node-backed root listing does not use `MountTable::inject_mount_children`
+  and a failed FAT data mount leaves `/data` unavailable. Stable cookies need
+  mutation and checkpoint-replay coverage; path errno and mount visibility
+  need end-to-end tests. No Linux DVM appliance source was changed in this batch.
+
 ## Chrome filesystem/network integration (2026-11-18)
 
 - Follow-up: loader broker now derives initial executable/interpreter map

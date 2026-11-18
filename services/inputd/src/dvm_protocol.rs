@@ -85,6 +85,10 @@ impl DvmDecoder {
                     && bytes[16..18] != [0, 0]
                     && bytes[19..28].iter().all(|&byte| byte == 0) =>
             {
+                // The frame is authentic and in sequence; a semantically invalid
+                // payload is dropped but still consumes its sequence number, or
+                // every later valid frame would be rejected as out of order.
+                self.sequence = sequence;
                 let code = u16::from_be_bytes(bytes[16..18].try_into().expect("key code"));
                 if code > LINUX_EVDEV_KEY_MAX {
                     return DvmOutcome::default();
@@ -95,7 +99,6 @@ impl DvmDecoder {
                     2 => INPUT_ACTION_REPEATED,
                     _ => return DvmOutcome::default(),
                 };
-                self.sequence = sequence;
                 DvmOutcome {
                     event: Some(InputIngressWire {
                         kind: INPUTD_INGRESS_KIND_DVM_LINUX_KEY,
@@ -150,12 +153,12 @@ impl DvmDecoder {
                     && bytes[25..28].iter().all(|&byte| byte == 0)
                     && bytes[24] & !POINTER_BUTTON_MASK == 0 =>
             {
+                self.sequence = sequence;
                 let x = u16::from_be_bytes(bytes[16..18].try_into().expect("pointer x"));
                 let y = u16::from_be_bytes(bytes[18..20].try_into().expect("pointer y"));
                 if x > POINTER_POSITION_MAX_X || y > POINTER_POSITION_MAX_Y {
                     return DvmOutcome::default();
                 }
-                self.sequence = sequence;
                 DvmOutcome {
                     event: Some(InputIngressWire {
                         kind: INPUTD_INGRESS_KIND_POINTER_POSITION,
@@ -312,6 +315,24 @@ mod tests {
         });
         assert_eq!(reset.revoke_epoch, Some(9));
         assert!(reset.reset_input);
+    }
+
+    #[test]
+    fn in_sequence_frame_with_invalid_payload_does_not_wedge_the_session() {
+        let mut decoder = DvmDecoder::default();
+        decoder.consume(&record(KIND_SESSION_START, 9, 0));
+        let mut bad = record(KIND_KEY, 9, 1);
+        bad.bytes[16..18].copy_from_slice(&30_u16.to_be_bytes());
+        bad.bytes[18] = 7; // unknown action
+        let checksum = crc32(&bad.bytes[..28]).to_be_bytes();
+        bad.bytes[28..32].copy_from_slice(&checksum);
+        assert_eq!(decoder.consume(&bad).event, None);
+        let mut good = record(KIND_KEY, 9, 2);
+        good.bytes[16..18].copy_from_slice(&30_u16.to_be_bytes());
+        good.bytes[18] = 1;
+        let checksum = crc32(&good.bytes[..28]).to_be_bytes();
+        good.bytes[28..32].copy_from_slice(&checksum);
+        assert!(decoder.consume(&good).event.is_some());
     }
 
     #[test]

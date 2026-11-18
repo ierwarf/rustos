@@ -328,8 +328,10 @@ pub(super) fn retire_unix_socket(
             continue;
         };
         state.readiness_generations.remove(&token);
-        state.inode_bindings.retain(|_, owner| *owner != token);
         if let Some(path) = &socket.bound_path {
+            // Only a bound socket can own an inode binding; skip the table
+            // scan for the common unbound socket.
+            state.inode_bindings.retain(|_, owner| *owner != token);
             if state.bindings.get(path).copied() == Some(token) {
                 state.bindings.remove(path);
             }
@@ -583,12 +585,17 @@ pub(super) fn handle_listen(request: &NetdIpcRequest) -> i32 {
     if socket.kind == UnixSocketKind::Netlink {
         return libc::EOPNOTSUPP;
     }
-    if socket.bound_path.is_none() || !matches!(socket.state, UnixSocketState::Idle) {
-        return libc::EINVAL;
-    }
     let backlog = usize::try_from(request.arg1)
         .unwrap_or(usize::MAX)
         .clamp(1, MAX_LISTEN_BACKLOG);
+    // listen(2) on a listening socket only updates the backlog.
+    if let UnixSocketState::Listening { backlog: current, .. } = &mut socket.state {
+        *current = backlog;
+        return 0;
+    }
+    if socket.bound_path.is_none() || !matches!(socket.state, UnixSocketState::Idle) {
+        return libc::EINVAL;
+    }
     socket.state = UnixSocketState::Listening {
         backlog,
         pending: VecDeque::new(),

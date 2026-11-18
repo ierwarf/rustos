@@ -1269,8 +1269,7 @@ fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result
 }
 
 fn commercial_request_path(request: &CommercialMaxProtocolRequest) -> Option<&str> {
-    let len = request.path_len as usize;
-    str::from_utf8(&request.path[..len]).ok()
+    str::from_utf8(request.path.get(..request.path_len as usize)?).ok()
 }
 
 fn fill_handle_descriptors(

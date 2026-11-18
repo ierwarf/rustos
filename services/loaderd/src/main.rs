@@ -1254,18 +1254,25 @@ fn validate_pe_fd(fd: i32, dos_header_prefix: &[u8]) -> Result<(), i32> {
 }
 
 fn read_exact_at(fd: i32, offset: u64, dest: &mut [u8]) -> Result<(), i32> {
-    let read = syscall4(
-        SYS_PREAD64,
-        fd as u64,
-        dest.as_mut_ptr() as u64,
-        dest.len() as u64,
-        offset,
-    );
-    if read < 0 {
-        return Err((-read) as i32);
-    }
-    if read as usize != dest.len() {
-        return Err(ENOEXEC);
+    // A pread may legitimately return fewer bytes than asked (a large request
+    // split by the file service); only a zero-length read is a real EOF.
+    let mut done = 0_usize;
+    while done < dest.len() {
+        let position = offset.checked_add(done as u64).ok_or(EOVERFLOW)?;
+        let read = syscall4(
+            SYS_PREAD64,
+            fd as u64,
+            dest[done..].as_mut_ptr() as u64,
+            (dest.len() - done) as u64,
+            position,
+        );
+        if read < 0 {
+            return Err((-read) as i32);
+        }
+        if read == 0 || read as usize > dest.len() - done {
+            return Err(ENOEXEC);
+        }
+        done += read as usize;
     }
     Ok(())
 }

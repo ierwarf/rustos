@@ -358,6 +358,15 @@ fn try_install_serialized() -> bool {
     // ORDERING: Release store of the wake generation, part of the install publication ahead of INSTALLED.
     CONSUMER_WAKE_GENERATION.store(ring.header.consumer_wake_generation, Ordering::Release);
     if !activation.commit() {
+        // The transport-ready bit was published above; no consumer will ever
+        // drain this mapping, so withdraw it before the aperture is released.
+        let _ = update_shared_flags(ring.mapped, |flags| {
+            Some(
+                flags
+                    & !(DVM_INPUT_RING_FLAG_RUSTOS_READY
+                        | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY),
+            )
+        });
         // ORDERING: failed activation rolls the words back with Release; INSTALLED was never published, so no reader acts on them.
         SHARED_ADDR.store(0, Ordering::Release);
         GENERATION.store(0, Ordering::Release);
@@ -604,14 +613,10 @@ pub(crate) fn service_pending(dest: &mut [InputDvmRecordWire]) -> usize {
             RECORDS_COPIED.fetch_add(reset_written as u64, Ordering::Relaxed);
             return reset_written;
         };
-        let mut record = [0_u8; DVM_INPUT_RING_RECORD_BYTES];
-        for (index, byte) in record.iter_mut().enumerate() {
-            // SAFETY: `offset + DVM_INPUT_RING_RECORD_BYTES <= DVM_INPUT_RING_APERTURE_BYTES` was just checked and the admitted
-            // mapping is exactly that large (fixed BAR shape, header region match), pinned by `mapping`'s lifecycle claim until
-            // it drops. The slot lies in [consumer, producer), committed by L0 and not rewritten until we publish the new consumer;
-            // volatile reads keep the compiler from assuming bytes stay unchanged, and inputd validates the copy.
-            *byte = unsafe { mapped.add(offset + index).read_volatile() };
-        }
+        // SAFETY: `offset + DVM_INPUT_RING_RECORD_BYTES <= DVM_INPUT_RING_APERTURE_BYTES` was just checked and the admitted
+        // mapping is exactly that large (fixed BAR shape, header region match), pinned by `mapping`'s lifecycle claim until
+        // it drops. The slot lies in [consumer, producer), committed by L0 and not rewritten until we publish the new consumer.
+        let record = unsafe { copy_record_volatile(mapped, offset) };
         dest[written] = InputDvmRecordWire {
             transport_generation: generation,
             flags: 0,
@@ -1553,6 +1558,38 @@ fn write_control_words_to_header_bytes(mapped: *const u8, bytes: &mut [u8]) {
     bytes[DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET
         ..DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET + size_of::<u64>()]
         .copy_from_slice(&wake_generation.to_le_bytes());
+}
+
+/// Copy one committed ring record out of shared memory exactly once.
+///
+/// Uses naturally aligned 8-byte volatile loads when the slot is 8-aligned
+/// (the fixed layout guarantees it for a page-aligned aperture) and falls back
+/// to byte loads otherwise. The copy is then the only view of the record; inputd
+/// validates it, so a concurrent L0 rewrite cannot be observed twice.
+///
+/// # Safety
+/// `base.add(offset)..+DVM_INPUT_RING_RECORD_BYTES` must lie inside a live
+/// mapping that stays valid for the call.
+unsafe fn copy_record_volatile(base: *const u8, offset: usize) -> [u8; DVM_INPUT_RING_RECORD_BYTES] {
+    let mut record = [0_u8; DVM_INPUT_RING_RECORD_BYTES];
+    let start = base as usize + offset;
+    if start % align_of::<u64>() == 0 && DVM_INPUT_RING_RECORD_BYTES % size_of::<u64>() == 0 {
+        for (index, chunk) in record.chunks_exact_mut(size_of::<u64>()).enumerate() {
+            // SAFETY: caller contract bounds the record; `start` is 8-aligned and each chunk advances by 8.
+            let word = unsafe {
+                base.add(offset + index * size_of::<u64>())
+                    .cast::<u64>()
+                    .read_volatile()
+            };
+            chunk.copy_from_slice(&word.to_ne_bytes());
+        }
+    } else {
+        for (index, byte) in record.iter_mut().enumerate() {
+            // SAFETY: caller contract bounds the record.
+            *byte = unsafe { base.add(offset + index).read_volatile() };
+        }
+    }
+    record
 }
 
 fn read_immutable_u64(base: *const u8, offset: usize) -> u64 {

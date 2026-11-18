@@ -1218,6 +1218,7 @@ fn spawn_exec_with_deadline(
     let argv_storage = build_exec_argv(exec_path, argv)?;
     let env_storage = build_exec_env(env)?;
     ensure_launch_home_dirs(&env_storage);
+    let endpoint = lookup_loader_endpoint()?;
     let mut request = build_loader_spawn_request(
         exec_path,
         &argv_storage,
@@ -1228,7 +1229,6 @@ fn spawn_exec_with_deadline(
         defer_start,
         deadline_ns,
     )?;
-    let endpoint = lookup_loader_endpoint()?;
     // UI bootstrap keeps its existing short budget. Ordinary catalog work
     // lives on the launch worker and may collect a large immutable image;
     // each OPEN/POLL IPC is still short and the control loop never waits here.
@@ -1309,16 +1309,16 @@ fn build_loader_spawn_request(
         argv_count: u16::try_from(argv.len()).map_err(|_| libc::E2BIG)?,
         env_count: u16::try_from(env.len()).map_err(|_| libc::E2BIG)?,
         requester_pid: u64::from(std::process::id()),
-        scheduling_context: request_scheduling_context_authority(
-            canonical_exec_path.as_str(),
-            deadline_ns,
-        )?,
         ..LoaderSpawnRequest::default()
     };
     request.exec_path[..exec_bytes.len()].copy_from_slice(exec_bytes);
     request.argv_bytes_len =
         copy_cstring_blob(argv, &mut request.argv_bytes, LOADER_SPAWN_ARG_BYTES)?;
     request.env_bytes_len = copy_cstring_blob(env, &mut request.env_bytes, LOADER_SPAWN_ENV_BYTES)?;
+    // Last fallible step: a rootd one-shot grant must not be orphaned by an
+    // argument-size rejection above.
+    request.scheduling_context =
+        request_scheduling_context_authority(canonical_exec_path.as_str(), deadline_ns)?;
     Ok(request)
 }
 

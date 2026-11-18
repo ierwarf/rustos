@@ -168,6 +168,63 @@ pub unsafe extern "C" fn memset(dest: *mut u8, value: i32, len: usize) -> *mut u
     dest
 }
 
+/// Unaligned 8-byte load/store as single `mov`s. `ptr::read_unaligned` is not
+/// usable here: in an unoptimised build it lowers to `copy_nonoverlapping`,
+/// i.e. a call to the very `memcpy` being implemented.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn load8(src: *const u8) -> u64 {
+    let value: u64;
+    core::arch::asm!(
+        "mov {value}, [{src}]",
+        value = out(reg) value,
+        src = in(reg) src,
+        options(nostack, readonly, preserves_flags),
+    );
+    value
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn store8(dest: *mut u8, value: u64) {
+    core::arch::asm!(
+        "mov [{dest}], {value}",
+        dest = in(reg) dest,
+        value = in(reg) value,
+        options(nostack, preserves_flags),
+    );
+}
+
+/// Copies `8 <= len < 32` bytes with every load issued before any store, so it
+/// is exact for overlapping ranges in either direction (memmove) as well as for
+/// disjoint ones (memcpy).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn copy_8_to_31(dest: *mut u8, src: *const u8, len: usize) {
+    debug_assert!((8..32).contains(&len));
+    if len <= 16 {
+        let head = load8(src);
+        let tail = load8(src.add(len - 8));
+        store8(dest, head);
+        store8(dest.add(len - 8), tail);
+    } else {
+        let a = load8(src);
+        let b = load8(src.add(8));
+        let c = load8(src.add(len - 16));
+        let d = load8(src.add(len - 8));
+        store8(dest, a);
+        store8(dest.add(8), b);
+        store8(dest.add(len - 16), c);
+        store8(dest.add(len - 8), d);
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn copy_8_to_31(_dest: *mut u8, _src: *const u8, _len: usize) {
+    unreachable!("only reached through the x86_64 small-copy paths")
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, len: usize) -> *mut u8 {
     if !dest.is_null() && !src.is_null() && len != 0 {
@@ -182,6 +239,10 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, len: usize) -> *m
                 inout("rcx") len => _,
                 options(nostack, preserves_flags),
             );
+            return dest;
+        }
+        if cfg!(target_arch = "x86_64") && (8..32).contains(&len) {
+            copy_8_to_31(dest, src, len);
             return dest;
         }
         let mut index = 0;
@@ -213,6 +274,10 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, len: usize) -> *
                 );
                 return dest;
             }
+            if cfg!(target_arch = "x86_64") && (8..32).contains(&len) {
+                copy_8_to_31(dest, src, len);
+                return dest;
+            }
             let mut index = 0;
             while index < len {
                 let byte = ptr::read_volatile(src.add(index));
@@ -220,6 +285,10 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, len: usize) -> *
                 index += 1;
             }
         } else {
+            if cfg!(target_arch = "x86_64") && (8..32).contains(&len) {
+                copy_8_to_31(dest, src, len);
+                return dest;
+            }
             let mut index = len;
             while index != 0 {
                 index -= 1;
@@ -314,6 +383,31 @@ unsafe fn parse_initial_stack(stack_ptr: *const u64) -> BootstrapHeap {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn small_copies_are_exact_for_disjoint_and_overlapping_ranges() {
+        for len in 0..40_usize {
+            for dst_off in 0..12_usize {
+                for src_off in 0..12_usize {
+                    // Overlapping move inside one buffer, both directions.
+                    let mut buf: [u8; 96] = core::array::from_fn(|i| i as u8 ^ 0x5a);
+                    let mut expected = buf;
+                    expected.copy_within(src_off..src_off + len, dst_off);
+                    let base = buf.as_mut_ptr();
+                    unsafe { super::memmove(base.add(dst_off), base.add(src_off), len) };
+                    assert_eq!(buf, expected, "memmove len={len} {src_off}->{dst_off}");
+
+                    // Disjoint copy: guard bytes around the destination survive.
+                    let src: [u8; 64] = core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(1));
+                    let mut dst = [0xee_u8; 64];
+                    unsafe { super::memcpy(dst.as_mut_ptr().add(dst_off), src.as_ptr().add(src_off), len) };
+                    let mut want = [0xee_u8; 64];
+                    want[dst_off..dst_off + len].copy_from_slice(&src[src_off..src_off + len]);
+                    assert_eq!(dst, want, "memcpy len={len} {src_off}->{dst_off}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn memcmp_handles_unaligned_and_multiword_differences() {
         let a = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];

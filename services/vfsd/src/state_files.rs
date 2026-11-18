@@ -1066,6 +1066,11 @@ impl VfsState {
             response.status = EBADF;
             return;
         };
+        // `write` on a read-only description is EBADF for devices too.
+        if !handle.writable {
+            response.status = EBADF;
+            return;
+        }
         if handle.kind == RemoteKind::Device {
             match handle.path.as_str() {
                 "/dev/null" | "/dev/zero" | "/dev/urandom" | "/dev/random" => {
@@ -1081,10 +1086,6 @@ impl VfsState {
                     return;
                 }
             }
-        }
-        if !handle.writable {
-            response.status = EBADF;
-            return;
         }
         if handle.kind != RemoteKind::File {
             response.status = EISDIR;
@@ -1162,6 +1163,11 @@ impl VfsState {
             response.status = EBADF;
             return;
         };
+        // `write` on a read-only description is EBADF for devices too.
+        if !handle.writable {
+            response.status = EBADF;
+            return;
+        }
         if handle.kind == RemoteKind::Device {
             match handle.path.as_str() {
                 "/dev/null" | "/dev/zero" | "/dev/urandom" | "/dev/random" => {
@@ -1178,12 +1184,13 @@ impl VfsState {
                 }
             }
         }
-        if !handle.writable {
-            response.status = EBADF;
-            return;
-        }
         if handle.kind != RemoteKind::File {
             response.status = EISDIR;
+            return;
+        }
+        // A negative off_t offset is EINVAL.
+        if request.arg0 > i64::MAX as u64 {
+            response.status = EINVAL;
             return;
         }
         let len = (request.arg1 as usize)
@@ -1214,6 +1221,11 @@ impl VfsState {
             return;
         };
         if !handle.writable || handle.kind != RemoteKind::File {
+            response.status = EINVAL;
+            return;
+        }
+        // A length with the sign bit set is a negative off_t: EINVAL, not EFBIG.
+        if request.arg0 > i64::MAX as u64 {
             response.status = EINVAL;
             return;
         }
@@ -1672,6 +1684,12 @@ impl VfsState {
         };
         if handle.node == 0 {
             response.status = EOPNOTSUPP;
+            return;
+        }
+        // Negative offset or length (sign bit set) is EINVAL; an in-range pair
+        // whose end overflows off_t stays EFBIG from the volume.
+        if request.arg1 > i64::MAX as u64 || request.arg2 > i64::MAX as u64 {
+            response.status = EINVAL;
             return;
         }
         let (mount_id, node) = (handle.mount_id, handle.node);

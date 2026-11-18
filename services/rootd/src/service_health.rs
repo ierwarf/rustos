@@ -15,7 +15,7 @@ const CAPACITY: usize = BOOTSTRAP_MANIFEST.len() + POST_INIT_MANIFEST.len();
 pub(crate) const DEFAULT_TIMEOUT_NS: u64 = 30_000_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Witness {
+pub(crate) struct Witness {
     service: u64,
     pid: u64,
     sequence: u64,
@@ -50,6 +50,20 @@ impl HealthBook {
             && self.entries.iter().any(|entry| entry.service == service
                 && entry.pid == pid && entry.sequence == sequence
                 && !entry.timed_out)
+    }
+
+    /// Slot `report` would write for `service`, with its current contents, so a
+    /// caller whose follow-up transition fails can `restore` the report.
+    pub(crate) fn snapshot(&self, service: u64) -> Option<(usize, Witness)> {
+        let index = self.entries.iter().position(|entry| entry.service == service)
+            .or_else(|| self.entries.iter().position(|entry| entry.service == 0))?;
+        Some((index, self.entries[index]))
+    }
+
+    pub(crate) fn restore(&mut self, snapshot: Option<(usize, Witness)>) {
+        if let Some((index, witness)) = snapshot {
+            self.entries[index] = witness;
+        }
     }
 
     pub(crate) fn report(
@@ -144,6 +158,25 @@ impl HealthBook {
 mod tests {
     use super::*;
     use rustos_user_abi::syscall::IPC_SERVICE_SESSIOND;
+
+    #[test]
+    fn restored_report_is_not_a_duplicate_and_can_be_retried() {
+        let mut h = HealthBook::new();
+        // Fresh slot: undo must empty it again.
+        let undo = h.snapshot(IPC_SERVICE_SESSIOND);
+        assert_eq!(h.report(IPC_SERVICE_SESSIOND, 7, 1, 10), Ok(10 + DEFAULT_TIMEOUT_NS));
+        assert!(h.is_duplicate(IPC_SERVICE_SESSIOND, 7, 1));
+        h.restore(undo);
+        assert!(!h.is_duplicate(IPC_SERVICE_SESSIOND, 7, 1));
+        assert_eq!(h.report(IPC_SERVICE_SESSIOND, 7, 1, 20), Ok(20 + DEFAULT_TIMEOUT_NS));
+        // Existing slot: undo restores the previous sequence and deadline.
+        let undo = h.snapshot(IPC_SERVICE_SESSIOND);
+        assert_eq!(h.report(IPC_SERVICE_SESSIOND, 7, 2, 30), Ok(30 + DEFAULT_TIMEOUT_NS));
+        h.restore(undo);
+        assert!(h.is_duplicate(IPC_SERVICE_SESSIOND, 7, 1));
+        assert!(!h.is_duplicate(IPC_SERVICE_SESSIOND, 7, 2));
+        assert_eq!(h.report(IPC_SERVICE_SESSIOND, 7, 2, 40), Ok(40 + DEFAULT_TIMEOUT_NS));
+    }
 
     #[test]
     fn only_exact_manifest_service_and_monotonic_incarnation_can_report() {

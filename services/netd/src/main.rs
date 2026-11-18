@@ -19,7 +19,7 @@
 // items intentionally continue below that test-only module.
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};

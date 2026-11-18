@@ -60,7 +60,9 @@ in a ring-3 service"; revisit only if pipes need names (FIFOs) or policy.
 copied to the user buffer with no lock held, and consumed only if the copy
 succeeds. A concurrent reader that consumed during the copy invalidates the
 peek and the read restarts, so a fault never loses data and data is never
-delivered twice.
+delivered twice. The compat path sizes scratch from queued bytes and samples
+again after blocking wakeups, so sleeping on an empty pipe does not cap the
+subsequent read to one byte.
 
 ## Known gaps
 
