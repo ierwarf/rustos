@@ -89,6 +89,43 @@ fn recv_request(token: u64) -> NetdIpcRequest {
 }
 
 #[test]
+fn empty_stream_send_checks_both_endpoints_before_returning_zero() {
+    let mut state = NetState::new();
+    assert_eq!(
+        send_socket_message_in_state(&mut state, &request(99), b"", &[]),
+        Err(libc::EBADF)
+    );
+
+    state.sockets.insert(1, connected_socket(2, None));
+    assert_eq!(
+        send_socket_message_in_state(&mut state, &request(1), b"", &[]),
+        Err(libc::EPIPE),
+        "missing peer cannot silently accept an empty send"
+    );
+
+    state.sockets.insert(2, connected_socket(1, None));
+    assert_eq!(
+        send_socket_message_in_state(&mut state, &request(1), b"", &[]),
+        Ok(0)
+    );
+    assert_eq!(state.unix_queued_bytes, 0);
+    assert!(connected(&state, 2).incoming.is_empty());
+
+    connected_mut(&mut state, 2).recv_closed = true;
+    assert_eq!(
+        send_socket_message_in_state(&mut state, &request(1), b"", &[]),
+        Err(libc::EPIPE)
+    );
+    connected_mut(&mut state, 2).recv_closed = false;
+    connected_mut(&mut state, 1).send_closed = true;
+    assert_eq!(
+        send_socket_message_in_state(&mut state, &request(1), b"", &[]),
+        Err(libc::EPIPE)
+    );
+    assert_eq!(state.unix_queued_bytes, 0);
+}
+
+#[test]
 fn recvmsg_passcred_toggle_cannot_split_sizing_dequeue_and_encoding() {
     use std::sync::{mpsc, Arc, TryLockError};
     for initial_passcred in [false, true] {

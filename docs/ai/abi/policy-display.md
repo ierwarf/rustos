@@ -24,6 +24,12 @@ Routed Linux ops after bootstrap: `socket`, `socketpair`, socket `dup`/`dup2`/`d
 
 netd invokes gated `SYS_RUSTOS_NET_BROKER` with target pid. Net broker arg struct carries six 64-bit syscall arg slots. Kernel performs handle install and target user-memory validation/copy; AF_UNIX socket lifecycle, binding/listen queues, byte queues, and socket option policy belong to netd. Version-8 `NetdIpcRequest`/`Response` frames copy an exact 136/32-byte header plus only the actual bounded payload, rather than a fixed maximum-size buffer. Request offset 112 carries a mandatory nonzero absolute `CLOCK_MONOTONIC` deadline; the frames also carry `socket_token`, fd `status_flags`, and a bounded inline payload for this service-owned socket path.
 
+For AF_UNIX stream sends, even a zero-byte send validates both socket
+identities and their connection/shutdown state before returning success.
+A missing sender returns EBADF and a closed peer is not silently accepted;
+a valid empty stream send queues no segment or ancillary custody.
+SOCK_SEQPACKET empty messages retain their message boundaries and are queued.
+
 Pathname AF_UNIX bind/connect delegates the kernel-attested effective uid/gid
 and caller pid to vfsd for traversal and cwd resolution. Bind creates a socket
 inode with the caller's umask; connect checks write permission against the

@@ -260,9 +260,6 @@ pub(super) fn send_socket_message_in_state(
         return netlink::send_message(state, request, bytes, control);
     }
     let seqpacket = kind.is_some_and(UnixSocketKind::preserves_message_boundaries);
-    if bytes.is_empty() && !seqpacket {
-        return Ok(0);
-    }
     if seqpacket {
         unix_seqpacket::validate_send(bytes, control)?;
     }
@@ -279,6 +276,15 @@ pub(super) fn send_socket_message_in_state(
         }
         connected.peer
     };
+    if bytes.is_empty() && !seqpacket {
+        // Do not return success until both the sending description and peer
+        // have passed the same lifecycle checks as a nonempty stream send.
+        let peer_socket = state.sockets.get(&peer).ok_or(libc::EPIPE)?;
+        let UnixSocketState::Connected(peer_connected) = &peer_socket.state else {
+            return Err(libc::ENOTCONN);
+        };
+        return if peer_connected.recv_closed { Err(libc::EPIPE) } else { Ok(0) };
+    }
     let control_charge = cmsg_align(control.len());
     if control_charge != 0 {
         if let Some(owner) = state
