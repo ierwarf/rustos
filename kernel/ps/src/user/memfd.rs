@@ -78,6 +78,8 @@ struct ProcSnapshotTag {
     link: String,
     directory: bool,
     ino: u64,
+    node: u8,
+    number: u64,
 }
 
 /// What a procfs snapshot memfd reports about itself.
@@ -88,6 +90,11 @@ pub struct ProcSnapshotInfo {
     pub directory: bool,
     /// Stable inode of the procfs node (the same value `statx(path)` reports).
     pub ino: u64,
+    /// `ProcKernelNode::code` of the node and its fd/tid number, so a write
+    /// to a writable node (`comm`, `oom_score_adj`) can be routed without
+    /// parsing `link`.
+    pub node: u8,
+    pub number: u64,
 }
 
 #[derive(Debug)]
@@ -96,6 +103,9 @@ struct MemfdObject {
     /// Resident-page charge group of the creating Job; immutable for life.
     charge_group: Option<usize>,
     proc_snapshot: Option<ProcSnapshotTag>,
+    /// Serializes `truncate` + PTE reconciliation against concurrent `mmap`
+    /// (`reconcile_lock` -> `ProcessStateLock` -> `state`).
+    reconcile_lock: Mutex<()>,
     state: Mutex<MemfdState>,
 }
 
@@ -137,6 +147,7 @@ impl MemfdHandle {
             object_id: allocate_memfd_object_id(),
             charge_group,
             proc_snapshot: None,
+            reconcile_lock: Mutex::new(()),
             state: Mutex::new(MemfdState {
                 name,
                 len: 0,
@@ -159,6 +170,8 @@ impl MemfdHandle {
         link: String,
         directory: bool,
         ino: u64,
+        node: u8,
+        number: u64,
         bytes: &[u8],
         charge_group: Option<usize>,
     ) -> Result<Self, MemfdError> {
@@ -168,7 +181,8 @@ impl MemfdHandle {
         let object = Arc::new(MemfdObject {
             object_id: allocate_memfd_object_id(),
             charge_group,
-            proc_snapshot: Some(ProcSnapshotTag { link, directory, ino }),
+            proc_snapshot: Some(ProcSnapshotTag { link, directory, ino, node, number }),
+            reconcile_lock: Mutex::new(()),
             state: Mutex::new(MemfdState {
                 name: String::from("proc"),
                 len: 0,
@@ -195,12 +209,41 @@ impl MemfdHandle {
             link: tag.link.clone(),
             directory: tag.directory,
             ino: tag.ino,
+            node: tag.node,
+            number: tag.number,
         })
     }
 
     /// Current read position of this open description.
     pub fn cursor(&self) -> usize {
         self.inner.lock().cursor
+    }
+
+    /// The cursor and up to `max` bytes at it, read under the description
+    /// lock so both belong to one instant. Pair with
+    /// [`Self::advance_cursor_if`]: a reader that consumes a prefix commits it
+    /// only if no other thread moved the shared cursor in between, which is
+    /// what keeps a record stream (`getdents64`) from duplicating or skipping
+    /// entries when two threads read one open description.
+    pub fn peek_at_cursor(&self, max: usize) -> (usize, Vec<u8>) {
+        let open = self.inner.lock();
+        let state = open.object.state.lock();
+        let available = state.len.saturating_sub(open.cursor).min(max);
+        let mut bytes = alloc::vec![0_u8; available];
+        let read = read_at_locked(state.frames.as_slice(), state.len, open.cursor, &mut bytes);
+        bytes.truncate(read);
+        (open.cursor, bytes)
+    }
+
+    /// Moves the cursor from `expected` to `expected + count` only if it is
+    /// still at `expected`. `false` means another reader consumed first.
+    pub fn advance_cursor_if(&self, expected: usize, count: usize) -> bool {
+        let mut open = self.inner.lock();
+        if open.cursor != expected {
+            return false;
+        }
+        open.cursor = expected.saturating_add(count);
+        true
     }
 
     /// Creates a distinct open description backed by the same shared object.
@@ -297,26 +340,15 @@ impl MemfdHandle {
 
     pub fn truncate(&self, len: usize) -> Result<(), MemfdError> {
         let object = self.object();
+        let _reconcile = object.reconcile_lock.lock();
         let mut state = object.state.lock();
         if len < state.len {
             if state.seals & linux_abi::F_SEAL_SHRINK as u32 != 0 {
                 return Err(MemfdError::PermissionDenied);
             }
             let keep_pages = len.div_ceil(PAGE_SIZE);
-            // A mapped frame can only be released once no page table names
-            // it, and ring0 cannot revoke other processes' leaves. A shrink
-            // that keeps every frame (it only moves EOF inside the last page
-            // and zeroes the tail below) leaves every mapping valid, as on
-            // Linux; one that would free a frame waits for the unmaps.
-            if state.mapping_count != 0 && keep_pages < state.frames.len() {
-                return Err(MemfdError::Busy);
-            }
             let released = state.frames.split_off(keep_pages);
             let released_pages = released.len();
-            for frame_phys in released {
-                free_backing_frame(frame_phys);
-            }
-            refund_pages(object.charge_group, released_pages);
             // The last kept page still holds the old bytes past the new end.
             // A later grow (or a write after a seek beyond EOF) must observe
             // zeros there, as ftruncate(2) specifies, not the stale contents.
@@ -327,9 +359,22 @@ impl MemfdHandle {
                 zero_frame_tail(last_frame, tail);
             }
             state.len = len;
+            let reconcile_frames = (state.mapping_count != 0 && released_pages != 0)
+                .then(|| state.frames.clone());
+            drop(state);
+            // Replace shrunk leaves with EOF guards and complete TLB shootdowns
+            // before freeing any physical frame.
+            if let Some(frames) = reconcile_frames {
+                reconcile_memfd_mappings(object.object_id, &frames);
+            }
+            for frame_phys in released {
+                free_backing_frame(frame_phys);
+            }
+            refund_pages(object.charge_group, released_pages);
             return Ok(());
         }
 
+        let old_pages = state.frames.len();
         drop(state);
         grow_then(
             &object,
@@ -341,7 +386,15 @@ impl MemfdHandle {
                 Ok(())
             },
             |_| (),
-        )
+        )?;
+        let state = object.state.lock();
+        let reconcile_frames = (state.mapping_count != 0 && state.frames.len() > old_pages)
+            .then(|| state.frames.clone());
+        drop(state);
+        if let Some(frames) = reconcile_frames {
+            reconcile_memfd_mappings(object.object_id, &frames);
+        }
+        Ok(())
     }
 
     pub fn seals(&self) -> u32 {
@@ -370,6 +423,57 @@ impl MemfdHandle {
         }
         state.seals |= seals;
         Ok(())
+    }
+
+    pub fn with_reconcile_lock<R>(&self, f: impl FnOnce() -> R) -> R {
+        let object = self.object();
+        let _reconcile = object.reconcile_lock.lock();
+        f()
+    }
+
+    pub fn acquire_mapping_with_eof_guard(
+        &self,
+        offset: usize,
+        len: usize,
+        writable: bool,
+    ) -> Result<(Vec<u64>, usize, MemfdMappingHold), MemfdError> {
+        if len == 0 || offset & (PAGE_SIZE - 1) != 0 {
+            return Err(MemfdError::InvalidArgument);
+        }
+
+        let object = self.object();
+        if object.proc_snapshot.is_some() {
+            return Err(MemfdError::InvalidArgument);
+        }
+        let page_count = len.div_ceil(PAGE_SIZE);
+        let start_page = offset / PAGE_SIZE;
+        let mut state = object.state.lock();
+        if writable
+            && state.seals & (linux_abi::F_SEAL_WRITE | linux_abi::F_SEAL_FUTURE_WRITE) as u32 != 0
+        {
+            return Err(MemfdError::PermissionDenied);
+        }
+        let available_end = state.frames.len().min(start_page.saturating_add(page_count));
+        let mut frames = Vec::new();
+        if start_page < available_end {
+            frames
+                .try_reserve_exact(available_end - start_page)
+                .map_err(|_| MemfdError::NoMemory)?;
+            frames.extend_from_slice(&state.frames[start_page..available_end]);
+        }
+        let (mapping_count, writable_mapping_count) =
+            next_mapping_counts(state.mapping_count, state.writable_mapping_count, writable)?;
+        state.mapping_count = mapping_count;
+        state.writable_mapping_count = writable_mapping_count;
+        drop(state);
+
+        Ok((
+            frames,
+            page_count,
+            MemfdMappingHold {
+                token: Arc::new(MemfdMappingToken { object, writable }),
+            },
+        ))
     }
 
     pub fn acquire_mapping(
@@ -447,6 +551,18 @@ impl MemfdMappingHold {
         let state = self.token.object.state.lock();
         alloc::format!("anon_inode:[memfd:{}]", state.name)
     }
+
+    pub fn with_reconcile_and_frames<R>(&self, f: impl FnOnce(u64, &[u64]) -> R) -> R {
+        let _reconcile = self.token.object.reconcile_lock.lock();
+        let frames = self.token.object.state.lock().frames.clone();
+        f(self.token.object.object_id, &frames)
+    }
+}
+
+fn reconcile_memfd_mappings(object_id: u64, frames: &[u64]) {
+    crate::multitask::for_each_visible_process_state_mut(|state| {
+        let _ = state.reconcile_shared_memfd_mappings(object_id, frames);
+    });
 }
 
 fn allocate_memfd_object_id() -> u64 {
@@ -788,6 +904,7 @@ mod tests {
             object_id: 1,
             charge_group: None,
             proc_snapshot: None,
+            reconcile_lock: Mutex::new(()),
             state: Mutex::new(MemfdState {
                 name: String::from("test"),
                 len: 0,
@@ -932,26 +1049,45 @@ mod tests {
     }
 
     #[test]
-    fn a_mapped_memfd_shrinks_inside_its_last_page_but_never_frees_a_mapped_frame() {
+    fn a_mapped_memfd_shrinks_and_releases_frames_after_reconcile() {
         fake_reset(usize::MAX);
         let handle = MemfdHandle::new(String::from("mapped"), true, None);
         handle.truncate(3 * PAGE_SIZE).unwrap();
         let (_frames, hold) = handle.acquire_mapping(0, 3 * PAGE_SIZE, true).unwrap();
-        // Frees page 3: refused while any mapping exists, nothing changes.
-        assert_eq!(handle.truncate(2 * PAGE_SIZE), Err(MemfdError::Busy));
-        assert_eq!(handle.len(), 3 * PAGE_SIZE);
-        assert_eq!(fake_live(), 3);
-        // Keeps all three frames: only EOF and the tail move.
-        assert_eq!(handle.truncate(2 * PAGE_SIZE + 1), Ok(()));
-        assert_eq!(handle.len(), 2 * PAGE_SIZE + 1);
-        assert_eq!(fake_live(), 3, "the shrink released no frame");
-        // Growing back inside the pinned frames is also fine.
+        // Shrinking past a page boundary reconciles mappings and releases page 3.
+        assert_eq!(handle.truncate(2 * PAGE_SIZE), Ok(()));
+        assert_eq!(handle.len(), 2 * PAGE_SIZE);
+        assert_eq!(fake_live(), 2);
+        // Keeping the last page: only EOF and the tail move.
+        assert_eq!(handle.truncate(PAGE_SIZE + 1), Ok(()));
+        assert_eq!(handle.len(), PAGE_SIZE + 1);
+        assert_eq!(fake_live(), 2);
+        // Growing back allocates the new frame.
         assert_eq!(handle.truncate(3 * PAGE_SIZE), Ok(()));
+        assert_eq!(fake_live(), 3);
         drop(hold);
         assert_eq!(handle.truncate(PAGE_SIZE), Ok(()));
         assert_eq!(fake_live(), 1);
         drop(handle);
         assert_eq!(fake_live(), 0);
+    }
+
+    #[test]
+    fn acquire_mapping_with_eof_guard_admits_ranges_past_eof() {
+        fake_reset(usize::MAX);
+        let handle = MemfdHandle::new(String::from("eof-guard"), true, None);
+        handle.truncate(PAGE_SIZE).unwrap();
+        let (frames, page_count, _hold) = handle
+            .acquire_mapping_with_eof_guard(0, 3 * PAGE_SIZE, true)
+            .unwrap();
+        assert_eq!(page_count, 3);
+        assert_eq!(frames.len(), 1);
+
+        let (tail_frames, tail_pages, _tail_hold) = handle
+            .acquire_mapping_with_eof_guard(2 * PAGE_SIZE, 2 * PAGE_SIZE, false)
+            .unwrap();
+        assert_eq!(tail_pages, 2);
+        assert!(tail_frames.is_empty());
     }
 
     #[test]
@@ -1002,7 +1138,7 @@ mod tests {
         // sealing, identity and mapping rules.
         fake_reset(usize::MAX);
         let handle =
-            MemfdHandle::new_proc_snapshot(String::from("/proc/7/maps"), false, 99, b"", None)
+            MemfdHandle::new_proc_snapshot(String::from("/proc/7/maps"), false, 99, 1, 0, b"", None)
                 .unwrap();
         assert_eq!(handle.path(), "/proc/7/maps");
         assert_eq!(
@@ -1011,6 +1147,8 @@ mod tests {
                 link: String::from("/proc/7/maps"),
                 directory: false,
                 ino: 99,
+                node: 1,
+                number: 0,
             })
         );
         assert_eq!(handle.len(), 0);
@@ -1031,13 +1169,34 @@ mod tests {
         );
         assert_eq!(again.object_id(), handle.object_id());
         assert_eq!(again.cursor(), 0);
-        let dir = MemfdHandle::new_proc_snapshot(String::from("/proc/7/fd"), true, 5, b"", None)
+        let dir = MemfdHandle::new_proc_snapshot(String::from("/proc/7/fd"), true, 5, 32, 0, b"", None)
             .unwrap();
         assert!(dir.proc_snapshot().unwrap().directory);
         assert_eq!(
             MemfdHandle::new(String::from("m"), true, None).proc_snapshot(),
             None
         );
+    }
+
+    #[test]
+    fn shared_cursor_advances_only_for_the_reader_that_saw_it() {
+        fake_reset(usize::MAX);
+        // Length 0: host tests cannot read content through fake frames, and
+        // the cursor protocol does not depend on it.
+        let mut a = MemfdHandle::new(String::from("shared-cursor"), true, None);
+        let b = a.clone();
+        // Both handles are one open description: one cursor.
+        assert_eq!(a.peek_at_cursor(16), (0, Vec::new()));
+        assert!(a.advance_cursor_if(0, 24));
+        // A second reader that peeked at 0 before the first one committed
+        // loses the race instead of re-consuming the same bytes.
+        assert!(!b.advance_cursor_if(0, 24));
+        assert_eq!(b.cursor(), 24);
+        assert!(b.advance_cursor_if(24, 8));
+        assert_eq!(a.seek(0, FileHandleSeekWhence::Current), Ok(32));
+        // Reaching the end peeks nothing.
+        assert!(a.advance_cursor_if(32, PAGE_SIZE));
+        assert_eq!(a.peek_at_cursor(16), (32 + PAGE_SIZE, Vec::new()));
     }
 
     #[test]

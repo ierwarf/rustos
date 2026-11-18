@@ -40,7 +40,7 @@ pub mod address_space {
         ActivationPin, ExecutionPin, RetirementOwner, UserTranslationMemo, ValidatedUserWrite,
         drain_retired_address_spaces,
     };
-    pub use crate::memory::paging::ProcessAddressSpace;
+    pub use crate::memory::paging::{ProcessAddressSpace, current_user_leaf_is_eof_guard};
     pub use x86_64::structures::paging::PageTableFlags;
 
     pub fn debug_direct_map_flags_for_addr(addr: u64) -> Option<PageTableFlags> {

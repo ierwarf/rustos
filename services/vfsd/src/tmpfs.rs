@@ -100,6 +100,7 @@ enum Body {
     },
     Symlink(String),
     Socket,
+    Fifo,
 }
 
 struct Node {
@@ -113,6 +114,9 @@ struct Node {
     crtime: FsTimestamp,
     /// Open-description pins (`retain_node` minus `release_node`).
     opens: u32,
+    /// `O_TMPFILE` inode that may still receive its first name (Linux
+    /// `I_LINKABLE`). An ordinary file unlinked while open is not linkable.
+    linkable: bool,
     /// Parent directory (directories only; the root is its own parent).
     parent: u64,
     body: Body,
@@ -141,6 +145,7 @@ impl Node {
             Body::File { .. } => FsNodeKind::File,
             Body::Symlink(_) => FsNodeKind::Symlink,
             Body::Socket => FsNodeKind::Socket,
+            Body::Fifo => FsNodeKind::Fifo,
         }
     }
 
@@ -240,7 +245,7 @@ impl State {
             Body::File { len, .. } if node.shared.is_some() => (*len, pages(*len) * CHUNK as u64),
             Body::File { len, chunks } => (*len, chunks.len() as u64 * CHUNK as u64),
             Body::Symlink(target) => (target.len() as u64, 0),
-            Body::Socket => (0, 0),
+            Body::Socket | Body::Fifo => (0, 0),
         };
         Ok(FsMetadata {
             node_id: ino,
@@ -304,6 +309,7 @@ impl State {
                 ctime: now,
                 crtime: now,
                 opens: 0,
+                linkable: false,
                 parent: if is_dir { parent } else { 0 },
                 body,
                 shared: None,
@@ -696,6 +702,7 @@ impl TmpFs {
                 ctime: now,
                 crtime: now,
                 opens: 0,
+                linkable: false,
                 parent: ROOT_NODE,
                 body: Body::Dir(BTreeMap::new()),
                 shared: None,
@@ -993,6 +1000,10 @@ impl FsVolume for TmpFs {
         self.create(path, attrs, Body::Socket).map(|_| ())
     }
 
+    fn mknod_fifo(&self, path: &str, attrs: FsCreateAttrs) -> Result<(), FsError> {
+        self.create(path, attrs, Body::Fifo).map(|_| ())
+    }
+
     fn chmod(&self, path: &str, mode: u32) -> Result<(), FsError> {
         let comps = split_path(path)?;
         let now = self.now();
@@ -1002,6 +1013,14 @@ impl FsVolume for TmpFs {
         node.mode = mode & 0o7777;
         node.ctime = now;
         Ok(())
+    }
+
+    fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
+        let comps = split_path(path)?;
+        let now = self.now();
+        let mut st = self.state.lock();
+        let ino = st.walk(&comps)?;
+        chown_locked(&mut st, ino, uid, gid, now)
     }
 
     fn link(&self, existing: &str, new_path: &str) -> Result<(), FsError> {
@@ -1074,6 +1093,7 @@ impl FsVolume for TmpFs {
                 ctime: now,
                 crtime: now,
                 opens: 1,
+                linkable: true,
                 parent: 0,
                 body: Body::File {
                     len: 0,
@@ -1128,6 +1148,12 @@ impl FsVolume for TmpFs {
         n.mode = mode & 0o7777;
         n.ctime = now;
         Ok(())
+    }
+
+    fn chown_node(&self, node: u64, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
+        let now = self.now();
+        let mut st = self.state.lock();
+        chown_locked(&mut st, node, uid, gid, now)
     }
 
     fn set_times_node(
@@ -1261,6 +1287,36 @@ fn shared_fallocate(
     shared_truncate(node, used_bytes, quota_bytes, end, now)
 }
 
+/// `chown(2)` on one inode. Like Linux, a successful change by anyone clears
+/// `S_ISUID` and, when the group-execute bit is set, `S_ISGID` on a
+/// non-directory (`setattr_should_drop_suidgid`).
+fn chown_locked(
+    st: &mut State,
+    ino: u64,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    now: FsTimestamp,
+) -> Result<(), FsError> {
+    let node = st.nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+    if uid.is_none() && gid.is_none() {
+        return Ok(());
+    }
+    if let Some(uid) = uid {
+        node.uid = uid;
+    }
+    if let Some(gid) = gid {
+        node.gid = gid;
+    }
+    if !matches!(node.body, Body::Dir(_)) {
+        node.mode &= !0o4000;
+        if node.mode & 0o010 != 0 {
+            node.mode &= !0o2000;
+        }
+    }
+    node.ctime = now;
+    Ok(())
+}
+
 fn link_node_locked(
     st: &mut State,
     ino: u64,
@@ -1277,11 +1333,234 @@ fn link_node_locked(
         return Err(FsError::AlreadyExists);
     }
     let node = st.nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+    // A nameless inode may only receive its first name when it is an
+    // `O_TMPFILE`; an ordinary file unlinked while open is gone (`ENOENT`).
+    if node.nlink == 0 && !node.linkable {
+        return Err(FsError::NotFound);
+    }
     node.nlink = node.nlink.checked_add(1).ok_or(FsError::TooBig)?;
+    node.linkable = false;
     node.ctime = now;
     st.dir_mut(parent)?.insert(String::from(name), ino);
     st.nodes.get_mut(&parent).ok_or(FsError::NotFound)?.touch_modify(now);
     Ok(())
+}
+
+/// Shared-frame backing table for path-addressed filesystems (e.g. FAT) that do
+/// not natively keep an in-memory inode per open file. While a file has an
+/// active entry here, `read`, `write`, `truncate`, `O_TRUNC`, `stat`, and
+/// `MAP_SHARED` all operate on the same [`SharedFrames`] object, and
+/// `flush_entry` / `flush_by_object_id` write the frames back to the volume.
+pub struct SharedPathEntry {
+    pub frames: Box<dyn SharedFrames>,
+    pub rel_path: String,
+    pub len: u64,
+}
+
+pub struct SharedPathStore<K: Ord + Clone> {
+    entries: BTreeMap<K, SharedPathEntry>,
+    mount_generation: u64,
+}
+
+impl<K: Ord + Clone> SharedPathStore<K> {
+    pub const fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            mount_generation: 0,
+        }
+    }
+
+    pub fn sync_generation(&mut self, mount_generation: u64) {
+        if self.mount_generation != mount_generation {
+            self.entries.clear();
+            self.mount_generation = mount_generation;
+        }
+    }
+
+    pub fn len_of(&self, key: &K) -> Option<u64> {
+        self.entries.get(key).map(|entry| entry.len)
+    }
+
+    pub fn contains(&self, key: &K) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    pub fn ensure_shared(
+        &mut self,
+        key: K,
+        rel_path: &str,
+        volume: &dyn FsVolume,
+        factory: SharedFramesFactory,
+        writable: bool,
+        mount_generation: u64,
+    ) -> Result<FsSharedBacking, FsError> {
+        self.sync_generation(mount_generation);
+        let caps = volume.capabilities();
+        if writable && caps.read_only {
+            return Err(FsError::ReadOnly);
+        }
+        let meta = volume.metadata(rel_path)?;
+        if meta.kind != FsNodeKind::File {
+            return Err(FsError::IsADirectory);
+        }
+        if writable && (meta.dos_attrs & storage_core::fs::dos_attrs::READONLY != 0) {
+            return Err(FsError::PermissionDenied);
+        }
+        if let Some(entry) = self.entries.get(&key) {
+            let (token, object) = entry.frames.identity();
+            return Ok(FsSharedBacking {
+                token,
+                object,
+                len: entry.len,
+            });
+        }
+
+        let mut frames = factory(meta.len)?;
+        let mut buf = [0u8; CHUNK];
+        let mut offset = 0u64;
+        while offset < meta.len {
+            let want = (meta.len - offset).min(CHUNK as u64) as usize;
+            let n = volume.read_at(rel_path, offset, &mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            frames.write_at(offset, &buf[..n])?;
+            offset += n as u64;
+        }
+        let (token, object) = frames.identity();
+        self.entries.insert(
+            key,
+            SharedPathEntry {
+                frames,
+                rel_path: String::from(rel_path),
+                len: meta.len,
+            },
+        );
+        Ok(FsSharedBacking {
+            token,
+            object,
+            len: meta.len,
+        })
+    }
+
+    pub fn read_at(&self, key: &K, offset: u64, out: &mut [u8]) -> Option<Result<usize, FsError>> {
+        let entry = self.entries.get(key)?;
+        if out.is_empty() || offset >= entry.len {
+            return Some(Ok(0));
+        }
+        let want = (entry.len - offset).min(out.len() as u64) as usize;
+        Some(entry.frames.read_at(offset, &mut out[..want]))
+    }
+
+    pub fn write_at(
+        &mut self,
+        key: &K,
+        offset: u64,
+        data: &[u8],
+    ) -> Option<Result<(usize, u64), FsError>> {
+        let entry = self.entries.get_mut(key)?;
+        let end = match offset.checked_add(data.len() as u64) {
+            Some(end) if end <= u64::from(u32::MAX) => end,
+            _ => return Some(Err(FsError::TooBig)),
+        };
+        if end > entry.len {
+            if let Err(err) = entry.frames.set_len(end) {
+                return Some(Err(err));
+            }
+        }
+        let written = match entry.frames.write_at(offset, data) {
+            Ok(n) => n,
+            Err(err) => return Some(Err(err)),
+        };
+        entry.len = entry.len.max(offset + written as u64);
+        Some(Ok((written, entry.len)))
+    }
+
+    pub fn truncate(&mut self, key: &K, new_len: u64) -> Option<Result<u64, FsError>> {
+        let entry = self.entries.get_mut(key)?;
+        if new_len > u64::from(u32::MAX) {
+            return Some(Err(FsError::TooBig));
+        }
+        if let Err(err) = entry.frames.set_len(new_len) {
+            return Some(Err(err));
+        }
+        entry.len = new_len;
+        Some(Ok(new_len))
+    }
+
+    pub fn flush_entry(&mut self, key: &K, volume: &dyn FsVolume) -> Result<(), FsError> {
+        let Some(entry) = self.entries.get(key) else {
+            return Ok(());
+        };
+        flush_shared_entry(entry, volume)
+    }
+
+    pub fn flush_by_object_id(
+        &mut self,
+        object_id: u64,
+        mut resolve_volume: impl FnMut(&K) -> Option<alloc::sync::Arc<dyn FsVolume>>,
+    ) -> Result<(), FsError> {
+        for (key, entry) in &self.entries {
+            if object_id != 0 && entry.frames.identity().1 != object_id {
+                continue;
+            }
+            if let Some(volume) = resolve_volume(key) {
+                flush_shared_entry(entry, &*volume)?;
+            }
+            if object_id != 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn remove(&mut self, key: &K) {
+        self.entries.remove(key);
+    }
+
+    pub fn rename(&mut self, old_key: &K, new_key: K, new_rel_path: String) {
+        self.entries.remove(&new_key);
+        if let Some(mut entry) = self.entries.remove(old_key) {
+            entry.rel_path = new_rel_path;
+            self.entries.insert(new_key, entry);
+        }
+    }
+}
+
+fn flush_shared_entry(entry: &SharedPathEntry, volume: &dyn FsVolume) -> Result<(), FsError> {
+    if volume.capabilities().read_only {
+        return Ok(());
+    }
+    let on_disk_len = volume.metadata(&entry.rel_path)?.len;
+    if entry.len == 0 {
+        if on_disk_len != 0 {
+            volume.truncate(&entry.rel_path, 0)?;
+        }
+        volume.flush()?;
+        return Ok(());
+    }
+    if on_disk_len > entry.len {
+        volume.truncate(&entry.rel_path, entry.len)?;
+    }
+    let mut buf = [0u8; CHUNK];
+    let mut offset = 0u64;
+    while offset < entry.len {
+        let want = (entry.len - offset).min(CHUNK as u64) as usize;
+        let n = entry.frames.read_at(offset, &mut buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        let mut written = 0usize;
+        while written < n {
+            let (w, _) = volume.write_at(&entry.rel_path, offset + written as u64, &buf[written..n])?;
+            if w == 0 {
+                return Err(FsError::Io(storage_core::StorageError::WriteZero));
+            }
+            written += w;
+        }
+        offset += n as u64;
+    }
+    volume.flush()
 }
 
 #[cfg(test)]
@@ -1871,6 +2150,21 @@ mod tests {
     }
 
     #[test]
+    fn fifo_nodes_exist_with_mode_and_block_data_io() {
+        let fs = fs();
+        fs.mknod_fifo("pipe", FsCreateAttrs::new(0o600, 1000, 1000)).unwrap();
+        let meta = fs.metadata("pipe").unwrap();
+        assert_eq!(meta.kind, FsNodeKind::Fifo);
+        assert_eq!((meta.mode, meta.uid, meta.len), (0o600, 1000, 0));
+        assert_eq!(fs.mknod_fifo("pipe", A), Err(FsError::AlreadyExists));
+        assert_eq!(fs.mknod_fifo("nodir/p", A), Err(FsError::NotFound));
+        assert_eq!(fs.write_at("pipe", 0, b"x"), Err(FsError::InvalidInput));
+        assert_eq!(fs.truncate("pipe", 0), Err(FsError::InvalidInput));
+        let open = fs.open_prepare("pipe", CREATE).unwrap();
+        assert_eq!(open.kind, FsNodeKind::Fifo);
+    }
+
+    #[test]
     fn chmod_and_set_times_update_ctime() {
         let fs = fs();
         put(&fs, "a", b"x");
@@ -2203,5 +2497,75 @@ mod tests {
         }
         assert_eq!(fs.used_bytes(), 0);
         assert_eq!(fs.node_count(), 1);
+    }
+
+    #[test]
+    fn shared_path_store_read_write_truncate_and_flush_are_coherent() {
+        let vol = alloc::sync::Arc::new(fs());
+        put(&vol, "fat_file", b"initial-data");
+        let mut store: SharedPathStore<(u64, String)> = SharedPathStore::new();
+        let key = (1u64, String::from("fat_file"));
+
+        let backing = store
+            .ensure_shared(key.clone(), "fat_file", &*vol, fake_factory, true, 1)
+            .unwrap();
+        assert_eq!(backing.len, 12);
+        // Idempotent second call returns the same backing identity.
+        assert_eq!(
+            store
+                .ensure_shared(key.clone(), "fat_file", &*vol, fake_factory, true, 1)
+                .unwrap(),
+            backing
+        );
+
+        let mut buf = [0u8; 32];
+        assert_eq!(store.read_at(&key, 0, &mut buf), Some(Ok(12)));
+        assert_eq!(&buf[..12], b"initial-data");
+
+        // Write extends the shared backing without touching the volume yet.
+        assert_eq!(store.write_at(&key, 8, b"BYTES!"), Some(Ok((6, 14))));
+        assert_eq!(store.len_of(&key), Some(14));
+        assert_eq!(read_all(&vol, "fat_file"), b"initial-data");
+
+        // Flush by object id (msync path) persists the shared bytes to the volume.
+        store
+            .flush_by_object_id(backing.object, |_| Some(vol.clone()))
+            .unwrap();
+        assert_eq!(read_all(&vol, "fat_file"), b"initial-BYTES!");
+
+        // Truncate shrink + flush_entry (fsync/close path) persists the shorter length.
+        assert_eq!(store.truncate(&key, 7), Some(Ok(7)));
+        store.flush_entry(&key, &*vol).unwrap();
+        assert_eq!(read_all(&vol, "fat_file"), b"initial");
+
+        // Truncate to zero + flush_entry.
+        assert_eq!(store.truncate(&key, 0), Some(Ok(0)));
+        store.flush_entry(&key, &*vol).unwrap();
+        assert_eq!(read_all(&vol, "fat_file"), b"");
+    }
+
+    #[test]
+    fn shared_path_store_tracks_rename_remove_and_generation() {
+        let vol = alloc::sync::Arc::new(fs());
+        put(&vol, "old", b"hello");
+        let mut store: SharedPathStore<(u64, String)> = SharedPathStore::new();
+        let old_key = (1u64, String::from("old"));
+        let new_key = (1u64, String::from("new"));
+
+        store
+            .ensure_shared(old_key.clone(), "old", &*vol, fake_factory, true, 1)
+            .unwrap();
+        vol.rename("old", "new", true, false).unwrap();
+        store.rename(&old_key, new_key.clone(), String::from("new"));
+        assert!(!store.contains(&old_key));
+        assert!(store.contains(&new_key));
+
+        store.write_at(&new_key, 5, b"-world").unwrap().unwrap();
+        store.flush_entry(&new_key, &*vol).unwrap();
+        assert_eq!(read_all(&vol, "new"), b"hello-world");
+
+        // Generation bump invalidates stale entries.
+        store.sync_generation(2);
+        assert!(!store.contains(&new_key));
     }
 }

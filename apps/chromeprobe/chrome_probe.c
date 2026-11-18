@@ -618,6 +618,36 @@ static void lock_autorelease(void) {
     case_end();
 }
 
+static void lock_exec_cloexec(const char *self_exe) {
+    case_begin("lock.exec-cloexec");
+    const char *path = "/tmp/chromeprobe.execlock";
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        CHECK(write_all(fd, "lock", 4) == 0);
+        pid_t child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            struct flock fl = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0 };
+            if (fcntl(fd, F_SETLK, &fl) != 0) {
+                _exit(2);
+            }
+            char *const argv_exec[] = { (char *)self_exe, "--exec-child", NULL };
+            execv("/proc/self/exe", argv_exec);
+            execv(self_exe, argv_exec);
+            _exit(127);
+        }
+        int status = 0;
+        CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        struct flock probe = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0 };
+        CHECK(fcntl(fd, F_GETLK, &probe) == 0 && probe.l_type == F_UNLCK);
+        CHECK(fcntl(fd, F_SETLK, &probe) == 0);
+        close(fd);
+    }
+    unlink(path);
+    case_end();
+}
+
 /* ---- sockets -------------------------------------------------------------- */
 
 static void sock_seqpacket(void) {
@@ -739,6 +769,47 @@ static void sock_unix_path(void) {
     }
     close(cli);
     close(srv);
+    case_end();
+}
+
+static void sock_unix_rel_umask(void) {
+    case_begin("sock.unix-rel-umask");
+    char saved_cwd[256] = {0};
+    CHECK(getcwd(saved_cwd, sizeof(saved_cwd)) != NULL);
+    CHECK(chdir("/tmp") == 0);
+    char rel_name[64];
+    snprintf(rel_name, sizeof(rel_name), "chromeprobe.rel.%d", (int)getpid());
+    unlink(rel_name);
+
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sun_family = AF_UNIX;
+    snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", rel_name);
+
+    mode_t prev_mask = umask(0077);
+    int srv = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int brc = srv >= 0 ? bind(srv, (struct sockaddr *)&sa, sizeof(sa)) : -1;
+    umask(prev_mask);
+    CHECK(srv >= 0 && brc == 0);
+
+    struct stat st;
+    CHECK(stat(rel_name, &st) == 0 && S_ISSOCK(st.st_mode) && (st.st_mode & 0777) == 0700);
+    CHECK(listen(srv, 4) == 0);
+    int cli = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(cli >= 0 && connect(cli, (struct sockaddr *)&sa, sizeof(sa)) == 0);
+    int acc = accept(srv, NULL, NULL);
+    CHECK(acc >= 0);
+    char buf[8] = {0};
+    CHECK(cli >= 0 && write(cli, "rel", 3) == 3);
+    CHECK(acc >= 0 && read(acc, buf, sizeof(buf)) == 3 && memcmp(buf, "rel", 3) == 0);
+
+    if (acc >= 0) close(acc);
+    if (cli >= 0) close(cli);
+    if (srv >= 0) close(srv);
+    unlink(rel_name);
+    if (saved_cwd[0]) {
+        CHECK(chdir(saved_cwd) == 0);
+    }
     case_end();
 }
 
@@ -941,6 +1012,97 @@ static void mem_mlock_msync(void) {
     case_end();
 }
 
+static void mem_vm_semantics(void) {
+    case_begin("mem.vm-semantics");
+    const size_t page = 4096;
+    /* madvise(MADV_DONTNEED) zeroes anonymous private pages. */
+    unsigned char *anon = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(anon != MAP_FAILED);
+    if (anon != MAP_FAILED) {
+        anon[0] = 0xAB;
+        anon[page - 1] = 0xCD;
+        CHECK(madvise(anon, page, MADV_DONTNEED) == 0);
+        CHECK(anon[0] == 0 && anon[page - 1] == 0);
+        munmap(anon, page);
+    }
+
+    /* fork child mremap of inherited PROT_NONE reservation succeeds. */
+    void *res = mmap(NULL, 2 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(res != MAP_FAILED);
+    if (res != MAP_FAILED) {
+        pid_t child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            void *grown = mremap(res, 2 * page, 4 * page, MREMAP_MAYMOVE);
+            _exit(grown != MAP_FAILED ? 0 : 1);
+        }
+        int status = 0;
+        CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        munmap(res, 2 * page);
+    }
+
+    /* Partial mlock over a range with an unmapped hole returns ENOMEM while locking mapped pages. */
+    unsigned char *pair = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(pair != MAP_FAILED);
+    if (pair != MAP_FAILED) {
+        CHECK(munmap(pair + page, page) == 0);
+        CHECK_ERRNO(mlock(pair, 3 * page), ENOMEM);
+        char status_buf[8192];
+        ssize_t sn = slurp("/proc/self/status", status_buf, sizeof(status_buf));
+        char *vmlck = sn > 0 ? strstr(status_buf, "VmLck:") : NULL;
+        CHECK(vmlck != NULL && atoi(vmlck + 6) > 0);
+        munlock(pair, page);
+        munmap(pair, page);
+        munmap(pair + 2 * page, page);
+    }
+    case_end();
+}
+
+static void mem_truncate_sigbus_fat(void) {
+    case_begin("mem.truncate-sigbus-fat");
+    const size_t page = 4096;
+    const char *tpath = "/tmp/chromeprobe.sigbus";
+    int fd = make_file(tpath, NULL);
+    CHECK(fd >= 0 && ftruncate(fd, (off_t)(2 * page)) == 0);
+    if (fd >= 0) {
+        volatile unsigned char *m = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        CHECK(m != MAP_FAILED);
+        if (m != MAP_FAILED) {
+            m[page] = 0x42;
+            CHECK(ftruncate(fd, (off_t)page) == 0);
+            pid_t child = fork();
+            CHECK(child >= 0);
+            if (child == 0) {
+                (void)m[page];
+                _exit(0);
+            }
+            int status = 0;
+            CHECK(waitpid(child, &status, 0) == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGBUS);
+            munmap((void *)m, 2 * page);
+        }
+        close(fd);
+    }
+    unlink(tpath);
+
+    const char *dpath = "/data/chromeprobe/mapshared.bin";
+    int dfd = make_file(dpath, NULL);
+    CHECK(dfd >= 0 && ftruncate(dfd, (off_t)page) == 0);
+    if (dfd >= 0) {
+        unsigned char *dm = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, dfd, 0);
+        CHECK(dm != MAP_FAILED);
+        if (dm != MAP_FAILED) {
+            memcpy(dm, "fat-map-shared", 14);
+            CHECK(msync(dm, page, MS_SYNC) == 0);
+            char rbuf[16] = {0};
+            CHECK(pread(dfd, rbuf, 14, 0) == 14 && memcmp(rbuf, "fat-map-shared", 14) == 0);
+            munmap(dm, page);
+        }
+        close(dfd);
+    }
+    unlink(dpath);
+    case_end();
+}
+
 static void mem_membarrier(void) {
     case_begin("mem.membarrier");
     errno = 0;
@@ -1052,6 +1214,28 @@ static void proc_status(void) {
     char *pid = n > 0 ? strstr(buf, "Pid:") : NULL;
     CHECK(pid != NULL && atoi(pid + 4) == (int)getpid());
     CHECK(n > 0 && strstr(buf, "Threads:") != NULL);
+    CHECK(n > 0 && strstr(buf, "FDSize:") != NULL);
+    case_end();
+}
+
+static void proc_oom_score_adj(void) {
+    case_begin("proc.oom-score-adj");
+    char orig[32] = {0};
+    ssize_t n = slurp("/proc/self/oom_score_adj", orig, sizeof(orig));
+    CHECK(n > 0);
+    int fd = open("/proc/self/oom_score_adj", O_WRONLY);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        CHECK(write(fd, "150", 3) == 3);
+        char now[32] = {0};
+        CHECK(slurp("/proc/self/oom_score_adj", now, sizeof(now)) > 0 && atoi(now) == 150);
+        CHECK_ERRNO(write(fd, "-1001", 5), EINVAL);
+        CHECK_ERRNO(write(fd, "1001", 4), EINVAL);
+        if (n > 0) {
+            CHECK(write(fd, orig, (size_t)n) == n);
+        }
+        close(fd);
+    }
     case_end();
 }
 
@@ -1282,6 +1466,73 @@ static void fdkind_sendfile_copy(void) {
     case_end();
 }
 
+static void fileops_extended(void) {
+    case_begin("fileops.extended");
+    const char *reg = "/tmp/chromeprobe.fops.reg";
+    const char *fifo = "/tmp/chromeprobe.fops.fifo";
+    const char *sockp = "/tmp/chromeprobe.fops.sock";
+    const char *hard1 = "/tmp/chromeprobe.fops.hard1";
+    const char *hard2 = "/tmp/chromeprobe.fops.hard2";
+    unlink(reg); unlink(fifo); unlink(sockp); unlink(hard1); unlink(hard2);
+
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    CHECK(mknod(reg, S_IFREG | 0600, 0) == 0);
+    CHECK(mknodat(AT_FDCWD, fifo, S_IFIFO | 0600, 0) == 0);
+    CHECK(mknodat(AT_FDCWD, sockp, S_IFSOCK | 0600, 0) == 0);
+
+    struct stat st;
+    CHECK(stat(reg, &st) == 0 && S_ISREG(st.st_mode));
+    CHECK(stat(fifo, &st) == 0 && S_ISFIFO(st.st_mode));
+    CHECK(stat(sockp, &st) == 0 && S_ISSOCK(st.st_mode));
+
+    CHECK(chown(reg, uid, gid) == 0);
+    CHECK(lchown(reg, uid, gid) == 0);
+    CHECK(fchownat(AT_FDCWD, reg, uid, gid, AT_SYMLINK_NOFOLLOW) == 0);
+
+    struct timespec ts[2] = {
+        { .tv_sec = 1700000000L, .tv_nsec = 123456789L },
+        { .tv_sec = 1700000001L, .tv_nsec = 987654321L },
+    };
+    CHECK(utimensat(AT_FDCWD, reg, ts, 0) == 0);
+    CHECK(stat(reg, &st) == 0 && st.st_atim.tv_sec == 1700000000L && st.st_atim.tv_nsec == 123456789L);
+    CHECK(st.st_mtim.tv_sec == 1700000001L && st.st_mtim.tv_nsec == 987654321L);
+
+    int rfd = open(reg, O_RDWR);
+    CHECK(rfd >= 0);
+    if (rfd >= 0) {
+        CHECK(fchown(rfd, uid, gid) == 0);
+        CHECK(write_all(rfd, "hello-sendfile", 14) == 0);
+
+        int pfd[2];
+        CHECK(pipe(pfd) == 0);
+        off_t off = 0;
+        char buf[16] = {0};
+        CHECK(sendfile(pfd[1], rfd, &off, 14) == 14 && off == 14);
+        CHECK(read(pfd[0], buf, 14) == 14 && memcmp(buf, "hello-sendfile", 14) == 0);
+        close(pfd[0]);
+        close(pfd[1]);
+
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        off = 0;
+        memset(buf, 0, sizeof(buf));
+        CHECK(sendfile(sv[0], rfd, &off, 14) == 14 && off == 14);
+        CHECK(read(sv[1], buf, 14) == 14 && memcmp(buf, "hello-sendfile", 14) == 0);
+        close(sv[0]);
+        close(sv[1]);
+        close(rfd);
+    }
+
+    CHECK(link(reg, hard1) == 0);
+    CHECK(linkat(AT_FDCWD, reg, AT_FDCWD, hard2, 0) == 0);
+    struct stat st1, st2;
+    CHECK(stat(hard1, &st1) == 0 && stat(hard2, &st2) == 0 && st1.st_ino == st2.st_ino && st1.st_nlink >= 3);
+
+    unlink(reg); unlink(fifo); unlink(sockp); unlink(hard1); unlink(hard2);
+    case_end();
+}
+
 /* ---- driver --------------------------------------------------------------------- */
 
 static void wait_for_data(void) {
@@ -1296,7 +1547,9 @@ static void wait_for_data(void) {
 }
 
 int main(int argc, char **argv) {
-    (void)argv;
+    if (argc >= 2 && strcmp(argv[1], "--exec-child") == 0) {
+        return 0;
+    }
     /* Session-startup programs run in every boot that reaches ui-ready, so the
      * probe runs only when `kvm-smoke --chrome-compat-probe` wrote the private
      * contract; without it the program exits at once, silently. Any argument
@@ -1323,15 +1576,19 @@ int main(int argc, char **argv) {
     lock_ofd();
     lock_flock();
     lock_autorelease();
+    lock_exec_cloexec(argv[0]);
     sock_seqpacket();
     sock_scm_rights();
     sock_unix_path();
+    sock_unix_rel_umask();
     sock_abstract();
     netlink_dump("sock.netlink-link", CP_RTM_GETLINK, CP_RTM_NEWLINK, CP_IFLA_IFNAME, sizeof(struct cp_ifinfomsg));
     netlink_dump("sock.netlink-addr", CP_RTM_GETADDR, CP_RTM_NEWADDR, CP_IFA_LABEL, sizeof(struct cp_ifaddrmsg));
     mem_mremap();
     mem_mincore();
     mem_mlock_msync();
+    mem_vm_semantics();
+    mem_truncate_sigbus_fat();
     mem_membarrier();
     mem_sigtimedwait();
     mem_rlimit_sched();
@@ -1341,6 +1598,7 @@ int main(int argc, char **argv) {
     proc_maps();
     proc_status();
     proc_stat();
+    proc_oom_score_adj();
     proc_cmdline_environ();
     proc_fd_dir();
     proc_fd_readlink();
@@ -1350,6 +1608,7 @@ int main(int argc, char **argv) {
     fdkind_memfd_ino();
     fdkind_opath_tmpfile();
     fdkind_sendfile_copy();
+    fileops_extended();
 
     if (failures == 0) {
         say("chromeprobe: PASS (%d checks, 0 failures)", checks);

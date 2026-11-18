@@ -53,9 +53,13 @@ temporary file, never a predictable truncating `.partial` sibling.
 
 ### Proc and fd identity (M3/M4/S9)
 
-`/proc/self` and `/proc/<own pid>` expose maps/smaps, status/stat/statm,
+`/proc/self` and `/proc/<own pid>` expose maps/smaps, status/stat/statm
+(including `FDSize:`), `oom_score_adj` (read/write `-1000..=1000`), `comm`,
 NUL-separated cmdline/environ, auxv, limits, task directories and fd directories.
-Generated regular files report `S_IFREG`, size 0 and are read to EOF. Fd links
+`vfsd` pulls raw kernel-attested facts via `SYS_RUSTOS_PROC_FACTS_BROKER`
+(`0x5255_0066`, `VfsPolicy`-only) and formats `/proc` ASCII nodes in Ring3;
+writable `/proc` nodes (`comm`, `task/<tid>/comm`, `oom_score_adj`) route
+through `proc_identity::write_snapshot`. Generated regular files report `S_IFREG`, size 0 and are read to EOF. Fd links
 are generated from live fd objects, including socket/pipe inode text, memfd
 names and remote paths. Directories enumerate actual fd/TID snapshots.
 Oversized snapshots fail explicitly rather than silently returning a partial
@@ -78,14 +82,13 @@ The ABI carries Linux POSIX/OFD record locks and flock separately. Vfsd keys
 locks by `(mount_id, node_id)`; POSIX owner is the process, OFD/flock owner the
 open description. Blocking calls must not block the single vfsd receiver.
 Conflicts return `EAGAIN`, GETLK describes the actual blocker, and POSIX wait
-cycles are checked. Any close releases the process's record locks on that file;
-final description retirement releases OFD/flock locks.
-
-**Integration warning:** the baseline bounded-IPC cleanup loses failed release
-notifications and misses CLOEXEC target-process cleanup. A transaction core
-alone does not repair that. Exact prepare/commit/cancel, authenticated deferred
-custody and lifecycle wiring are being integrated; do not claim reliable
-advisory-lock completion until the production path and fault tests pass.
+cycles are checked. Any close (including `exec`-time `CLOEXEC` closes via
+`note_exec_cloexec_closed` + `vfsd::lock_release_proxy_shape`) releases the
+process's record locks on that file; final description retirement releases
+OFD/flock locks. Against missed exit events or lifecycle queue overflow,
+`execute_verified` / `verify_all_owners` probes kernel process incarnations via
+`LIFECYCLE_BROKER_MODE_PROBE_PIDS` and drops dead or pid-reused owners. The
+lock table is intentionally not checkpointed (locks die on `vfsd` restart).
 
 ### Unix messages and route dumps (M5/M6/S3)
 
@@ -99,9 +102,12 @@ names; private path-string fallback is not a replacement namespace.
 
 Route dumps must include loopback plus a currently live provider interface,
 correct sequence/multipart termination and a kernel-port sockaddr_nl source.
-Unsupported multicast membership must fail honestly rather than claim a
-subscription that never delivers changes. Full dynamic route notification and
-AF_UNIX datagrams are not implied by minimal route-dump support.
+`SOL_NETLINK` membership options (`NETLINK_ADD_MEMBERSHIP`,
+`NETLINK_DROP_MEMBERSHIP`, `NETLINK_LIST_MEMBERSHIPS`) and lazy
+interface-change notifications are wired in `netd` (`poll.rs` / `netlink.rs`),
+`umask` is applied to filesystem socket nodes, and Wayland (`uiserver`) binds in
+the normal namespace (`$XDG_RUNTIME_DIR/wayland-0`). Full dynamic route
+notification and AF_UNIX datagrams are not implied.
 
 ### Linux calls and open semantics (M2/S8)
 
@@ -113,8 +119,16 @@ helper test is not proof of Linux behavior.
 
 Copied-page mremap was unsafe with sibling writes, so movement is now done by the
 MM owner (`MM_BROKER_OP_MOVE`: leaves, frame-ledger claims, memlock ledger and
-pager VMA generations move together, no copy; see `abi/core.md`). `mlock` is
-accounting-only because the kernel never reclaims resident user pages. KEEP_SIZE
+pager VMA generations move together, no copy; see `abi/core.md`), and `fork`
+clones the parent's `syscalld` `MM_POLICY` VMAs (including `PROT_NONE`
+reservations) via `LifecycleConsumer::LinuxSyscallPolicy`. `mlock`/`mlock2`
+pre-fault resident pages (unless `MLOCK_ONFAULT`), apply partial mapped
+prefixes before returning `ENOMEM` on holes, and account `RLIMIT_MEMLOCK`.
+`madvise` implements `MADV_POPULATE_READ`/`WRITE` and `MADV_DONTNEED`/`FREE`
+on anonymous private pages. Writable `MAP_SHARED` supports FAT (`msync`
+`VFS_SHARED_BACKING_FLAG_SYNC`) as well as TmpFs, and `truncate`/`ftruncate`
+shrink revokes past-EOF leaves with an EOF guard for `SIGBUS`. `chown`/`mknod`/
+`link`/`utimensat` (ns) and `sendfile` to pipes/sockets are wired. KEEP_SIZE
 allocation must not report guarantees it does not establish. Copy pins must be released only
 when acquired; overlap checks use inode identity and effective gated cursors.
 Open honors `O_NOFOLLOW`/`ELOOP`, attenuated `O_PATH`, and an explicit unsupported

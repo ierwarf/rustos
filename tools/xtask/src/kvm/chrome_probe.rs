@@ -31,7 +31,7 @@ const CHROME_PROBE_PERSIST_MARKERS: [&str; 2] = [
 ];
 /// One `chromeprobe: <case> ok` record per case, all required. Must match the
 /// case names in `apps/chromeprobe/chrome_probe.c`.
-const CHROME_PROBE_CASES: [&str; 37] = [
+const CHROME_PROBE_CASES: [&str; 43] = [
     "tmpfs.tmp",
     "tmpfs.devshm",
     "tmpfs.run",
@@ -42,15 +42,19 @@ const CHROME_PROBE_CASES: [&str; 37] = [
     "lock.ofd",
     "lock.flock",
     "lock.autorelease",
+    "lock.exec-cloexec",
     "sock.seqpacket",
     "sock.scm-rights",
     "sock.unix-path",
+    "sock.unix-rel-umask",
     "sock.abstract",
     "sock.netlink-link",
     "sock.netlink-addr",
     "mem.mremap",
     "mem.mincore",
     "mem.mlock-msync",
+    "mem.vm-semantics",
+    "mem.truncate-sigbus-fat",
     "mem.membarrier",
     "mem.sigtimedwait",
     "mem.rlimit-sched",
@@ -60,6 +64,7 @@ const CHROME_PROBE_CASES: [&str; 37] = [
     "proc.maps",
     "proc.status",
     "proc.stat",
+    "proc.oom-score-adj",
     "proc.cmdline-environ",
     "proc.fd-dir",
     "proc.fd-readlink",
@@ -69,6 +74,7 @@ const CHROME_PROBE_CASES: [&str; 37] = [
     "fdkind.memfd-ino",
     "fdkind.opath-tmpfile",
     "fdkind.sendfile-copyrange",
+    "fileops.extended",
 ];
 
 fn chrome_probe_markers() -> Vec<String> {

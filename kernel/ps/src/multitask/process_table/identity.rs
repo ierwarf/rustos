@@ -500,6 +500,32 @@ pub fn retain_process_by_pid(process_id: u64) -> Option<ProcessRef> {
     })
 }
 
+pub fn retain_all_visible_processes() -> alloc::vec::Vec<ProcessRef> {
+    let mut table = PROCESS_TABLE.lock();
+    let mut refs = alloc::vec::Vec::new();
+    for (index, slot) in table.slots.iter_mut().enumerate() {
+        let generation = slot.generation;
+        let Some(object) = slot.object.as_deref_mut() else {
+            continue;
+        };
+        if object.exiting {
+            continue;
+        }
+        let Some(next_refs) = object.ref_count.checked_add(1) else {
+            continue;
+        };
+        object.ref_count = next_refs;
+        let process_id = object.process_id;
+        let state_ptr = object.state_ptr();
+        refs.push(ProcessRef {
+            handle: ProcessHandle::new(index, generation),
+            process_id,
+            pin: ProcessRefPin::Counted(state_ptr),
+        });
+    }
+    refs
+}
+
 pub fn release_process_ref(handle: ProcessHandle) {
     let mut table = PROCESS_TABLE.lock();
     let should_queue = {

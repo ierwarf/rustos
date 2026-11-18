@@ -839,50 +839,65 @@ pub fn handle_madvise(
     let start = request.arg0;
     let user_len = request.arg1;
     let advice = request.flags;
-    if user_len == 0 {
-        response.status = 0;
-        response.payload_len = 0;
-        return;
-    }
     if start & (PAGE_SIZE - 1) != 0 {
         response.status = errno::EINVAL;
         return;
     }
-    if start.checked_add(user_len).is_none() {
+    let Some(aligned) = align_up(user_len) else {
+        response.status = errno::EINVAL;
+        return;
+    };
+    if user_len != 0 && aligned == 0 {
         response.status = errno::EINVAL;
         return;
     }
-    let supported = matches!(
-        advice,
+    let Some(end) = start.checked_add(aligned) else {
+        response.status = errno::EINVAL;
+        return;
+    };
+    match advice {
+        // Purely advisory paging/dump/THP hints: no semantic side effect on
+        // mapping contents or fork behavior, so returning 0 on a valid user
+        // range is honest.
         MADV_NORMAL
-            | MADV_RANDOM
-            | MADV_SEQUENTIAL
-            | MADV_WILLNEED
-            | MADV_DONTNEED
-            | MADV_FREE
-            | MADV_REMOVE
-            | MADV_DONTFORK
-            | MADV_DOFORK
-            | MADV_MERGEABLE
-            | MADV_UNMERGEABLE
-            | MADV_HUGEPAGE
-            | MADV_NOHUGEPAGE
-            | MADV_DONTDUMP
-            | MADV_DODUMP
-            | MADV_WIPEONFORK
-            | MADV_KEEPONFORK
-            | MADV_COLD
-            | MADV_PAGEOUT
-            | MADV_POPULATE_READ
-            | MADV_POPULATE_WRITE
-            | MADV_DONTNEED_LOCKED
-    );
-    if !supported {
-        response.status = errno::EINVAL;
-        return;
+        | MADV_RANDOM
+        | MADV_SEQUENTIAL
+        | MADV_WILLNEED
+        | MADV_HUGEPAGE
+        | MADV_NOHUGEPAGE
+        | MADV_DONTDUMP
+        | MADV_DODUMP
+        | MADV_COLD
+        | MADV_PAGEOUT => {
+            if end != start && end > LINUX_USER_SPACE_END {
+                response.status = errno::ENOMEM;
+                return;
+            }
+            response.status = 0;
+            response.payload_len = 0;
+        }
+        // Handled directly in caller context (kernel-compat `mm_query_ops`)
+        // because they mutate/fault caller page tables and check MemlockLedger.
+        MADV_DONTNEED
+        | MADV_DONTNEED_LOCKED
+        | MADV_FREE
+        | MADV_POPULATE_READ
+        | MADV_POPULATE_WRITE => {
+            response.status = errno::ENOSYS;
+        }
+        // Advices whose semantics cannot be silently faked (fork-inheritance
+        // exclusions/wiping, shared hole punching, KSM) or unknown values.
+        MADV_REMOVE
+        | MADV_DONTFORK
+        | MADV_DOFORK
+        | MADV_MERGEABLE
+        | MADV_UNMERGEABLE
+        | MADV_WIPEONFORK
+        | MADV_KEEPONFORK
+        | _ => {
+            response.status = errno::EINVAL;
+        }
     }
-    response.status = 0;
-    response.payload_len = 0;
 }
 
 pub fn handle_brk(
@@ -1534,6 +1549,31 @@ fn mm_broker_call(args: &RustosMmBrokerArgs) -> Result<(), i32> {
     if ret < 0 { Err((-ret) as i32) } else { Ok(()) }
 }
 
+pub fn handle_process_fork_pid(child_pid: u64, parent_pid: u64) {
+    if child_pid == 0 || parent_pid == 0 || child_pid == parent_pid {
+        return;
+    }
+    {
+        let mut policy = PROCESS_POLICY.lock();
+        if let Some(mut parent) = policy.get(&parent_pid).copied() {
+            parent.parent_pid = parent_pid;
+            parent.robust_head = 0;
+            parent.robust_len = 0;
+            policy.insert(child_pid, parent);
+        } else {
+            policy.remove(&child_pid);
+        }
+    }
+    {
+        let mut mm = MM_POLICY.lock();
+        if let Some(parent_mm) = mm.get(&parent_pid).cloned() {
+            mm.insert(child_pid, parent_mm);
+        } else {
+            mm.remove(&child_pid);
+        }
+    }
+}
+
 pub fn handle_process_exec_pid(pid: u64) {
     // Credentials/umask survive exec; image-specific brk/VMA/guard state does not.
     MM_POLICY.lock().remove(&pid);
@@ -2071,5 +2111,166 @@ mod tests {
 
         handle_process_exit_pid(child_pid);
         handle_process_exit_pid(parent_pid);
+    }
+
+    #[test]
+    fn madvise_policy_validates_arguments_and_distinguishes_advices() {
+        let mut resp = LinuxSyscallOffloadResponse::default();
+        let req = |arg0, arg1, flags| LinuxSyscallOffloadRequest {
+            arg0,
+            arg1,
+            flags,
+            ..LinuxSyscallOffloadRequest::default()
+        };
+
+        // Unaligned start is EINVAL even when length is 0.
+        handle_madvise(&req(0x1001, 0, MADV_NORMAL), &mut resp);
+        assert_eq!(resp.status, errno::EINVAL);
+        handle_madvise(&req(0x1001, PAGE_SIZE, MADV_NORMAL), &mut resp);
+        assert_eq!(resp.status, errno::EINVAL);
+
+        // Overflowing length or end is EINVAL.
+        handle_madvise(&req(0x2000, u64::MAX, MADV_NORMAL), &mut resp);
+        assert_eq!(resp.status, errno::EINVAL);
+        handle_madvise(&req(u64::MAX - PAGE_SIZE + 1, PAGE_SIZE, MADV_NORMAL), &mut resp);
+        assert_eq!(resp.status, errno::EINVAL);
+
+        // Valid advisory hints succeed on valid user ranges and ENOMEM past ceiling.
+        for advice in [
+            MADV_NORMAL,
+            MADV_RANDOM,
+            MADV_SEQUENTIAL,
+            MADV_WILLNEED,
+            MADV_HUGEPAGE,
+            MADV_NOHUGEPAGE,
+            MADV_DONTDUMP,
+            MADV_DODUMP,
+            MADV_COLD,
+            MADV_PAGEOUT,
+        ] {
+            handle_madvise(&req(LINUX_USER_SPACE_BASE, PAGE_SIZE, advice), &mut resp);
+            assert_eq!(resp.status, 0);
+            handle_madvise(&req(LINUX_USER_SPACE_END, PAGE_SIZE, advice), &mut resp);
+            assert_eq!(resp.status, errno::ENOMEM);
+            handle_madvise(&req(LINUX_USER_SPACE_END, 0, advice), &mut resp);
+            assert_eq!(resp.status, 0);
+        }
+
+        // Kernel-handled advices must never silently succeed in syscalld.
+        for advice in [
+            MADV_DONTNEED,
+            MADV_DONTNEED_LOCKED,
+            MADV_FREE,
+            MADV_POPULATE_READ,
+            MADV_POPULATE_WRITE,
+        ] {
+            handle_madvise(&req(LINUX_USER_SPACE_BASE, PAGE_SIZE, advice), &mut resp);
+            assert_eq!(resp.status, errno::ENOSYS);
+        }
+
+        // Unimplemented semantic advices and unknown values return EINVAL.
+        for advice in [
+            MADV_REMOVE,
+            MADV_DONTFORK,
+            MADV_DOFORK,
+            MADV_MERGEABLE,
+            MADV_UNMERGEABLE,
+            MADV_WIPEONFORK,
+            MADV_KEEPONFORK,
+            999,
+        ] {
+            handle_madvise(&req(LINUX_USER_SPACE_BASE, PAGE_SIZE, advice), &mut resp);
+            assert_eq!(resp.status, errno::EINVAL);
+        }
+    }
+
+    #[test]
+    fn fork_clones_parent_vmas_including_prot_none_and_backing_metadata() {
+        let parent_pid = u64::MAX - 51;
+        let child_pid = u64::MAX - 52;
+        handle_process_exit_pid(parent_pid);
+        handle_process_exit_pid(child_pid);
+
+        let mut parent_state = MmPolicyState {
+            brk_start: 0x20_0000,
+            brk_current: 0x20_2000,
+            brk_mapped_end: 0x20_2000,
+            mmap_next: 0x50_0000,
+            user_range_start: LINUX_USER_SPACE_BASE,
+            user_range_end: LINUX_USER_SPACE_END,
+            vmas: VmaMap::new(),
+        };
+        upsert_heap_vma(&mut parent_state);
+        insert_vma(
+            &mut parent_state,
+            MmVma {
+                start: 0x30_0000,
+                end: 0x30_4000,
+                prot: 0,
+                mmap_flags: MAP_PRIVATE | MAP_ANONYMOUS,
+                kind: MmVmaKind::Reserved,
+            },
+        );
+        insert_vma(
+            &mut parent_state,
+            MmVma {
+                start: 0x31_0000,
+                end: 0x31_2000,
+                prot: PROT_READ,
+                mmap_flags: MAP_PRIVATE,
+                kind: MmVmaKind::FilePrivate,
+            },
+        );
+        insert_vma(
+            &mut parent_state,
+            MmVma {
+                start: 0x32_0000,
+                end: 0x32_3000,
+                prot: PROT_READ | PROT_WRITE,
+                mmap_flags: MAP_SHARED,
+                kind: MmVmaKind::MemfdShared,
+            },
+        );
+        save_mm_state(parent_pid, parent_state);
+
+        handle_process_fork_pid(child_pid, parent_pid);
+
+        // Parent mutates and exits; child retains its exact fork snapshot.
+        {
+            let mut db = mm_db().lock();
+            let parent = db.get_mut(&parent_pid).unwrap();
+            remove_vma_range(parent, 0x30_0000, 0x30_4000);
+        }
+        handle_process_exit_pid(parent_pid);
+
+        let child_vmas: Vec<MmVma> = mm_db()
+            .lock()
+            .get(&child_pid)
+            .expect("child should inherit parent MM policy on fork")
+            .vmas
+            .iter()
+            .cloned()
+            .collect();
+        assert_eq!(child_vmas.len(), 4);
+        assert_eq!(child_vmas[0].kind, MmVmaKind::Heap);
+        assert_eq!(
+            child_vmas[1],
+            MmVma {
+                start: 0x30_0000,
+                end: 0x30_4000,
+                prot: 0,
+                mmap_flags: MAP_PRIVATE | MAP_ANONYMOUS,
+                kind: MmVmaKind::Reserved,
+            }
+        );
+        assert_eq!(child_vmas[2].kind, MmVmaKind::FilePrivate);
+        assert_eq!(child_vmas[3].kind, MmVmaKind::MemfdShared);
+
+        let main_source = include_str!("main.rs");
+        assert!(main_source.contains(
+            "LIFECYCLE_EVENT_FORK {\n            linux_policy::handle_process_fork_pid(event.pid, event.parent_pid)"
+        ));
+
+        handle_process_exit_pid(child_pid);
     }
 }

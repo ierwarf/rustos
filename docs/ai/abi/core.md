@@ -116,7 +116,13 @@ dropped record until its owner abandons it. Admission is not durable delivery.
   an exit-only event for the abandoned child. Overflow (`EOVERFLOW`) loses
   identity evidence, so vfsd forgets every cwd (default `/`) and resumes from the
   rebased empty queue; any other drain failure is logged and leaves the table
-  unchanged.
+  and `verify_all_owners` on `EOVERFLOW` when `LIFECYCLE_BROKER_MODE_PROBE_PIDS`
+  (`1`, `VfsPolicy`-only) probes kernel process incarnations (`0` if absent or
+  exiting) to retire dead or pid-reused POSIX lock holders.
+- `LifecycleConsumer::LinuxSyscallPolicy` also receives `LIFECYCLE_EVENT_FORK`
+  and `LIFECYCLE_EVENT_EXIT`, so `syscalld` clones the parent's `MM_POLICY` VMAs
+  (including `PROT_NONE` reservations and backing metadata) and `PROCESS_POLICY`
+  for `fork` children without `EFAULT` on subsequent `mremap`/`munmap`/`mprotect`.
 - `/run` is vfsd's volatile in-memory directory namespace (`vfsd::run_dirs`):
   `mkdir` of `/run/user` and `/run/user/<euid>` creates a real bounded entry that
   `stat`/`getdents` observe (`EEXIST` for existing, `ENOENT` for a missing
@@ -395,19 +401,41 @@ not extension points and must continue to return `ENOSYS`.
   every mapping kind. A per-process `MemlockLedger` (16384 islands) accounts
   `RLIMIT_MEMLOCK` (EPERM with limit 0 and no privilege, ENOMEM over limit or on a
   hole, EAGAIN if the ledger is full); `MCL_FUTURE` is recorded and applied after
-  each map; `MCL_ONFAULT` behaves as default; pages are not pre-faulted; `VmLck:`
-  appears in `/proc/self/status`. munmap, MAP_FIXED replacement and exit release.
+  each map; `MLOCK_ONFAULT` skips pre-faulting while default `mlock`/`mlock2`
+  pre-faults resident pages and applies partial mapped prefixes up to a hole
+  before returning `ENOMEM`; `VmLck:` appears in `/proc/self/status`. munmap,
+  MAP_FIXED replacement and exit release.
+- `madvise`: `MADV_POPULATE_READ`/`MADV_POPULATE_WRITE` populate anonymous
+  private pages (enforcing permissions -> `EFAULT`, `ENOMEM` on holes);
+  `MADV_DONTNEED`/`MADV_DONTNEED_LOCKED`/`MADV_FREE` discard present anonymous
+  private leaves (`unmap_present_user_pages_at` + `sync_mapping_kmem()`, leaving
+  shared/file-private mappings intact and rejecting `mlock`ed ranges for
+  `MADV_DONTNEED`/`MADV_FREE`); advisory hints are validated in `syscalld`.
 - `mincore` (real leaf residency, ENOMEM for unmapped), `msync` (flag/alignment
-  checks; shared TmpFs mappings share frames with vfsd so nothing to flush),
+  checks; `VFS_SHARED_BACKING_FLAG_SYNC` flushes writable FAT `MAP_SHARED`
+  frames back to FAT while TmpFs shares frames directly),
   `membarrier` (QUERY returns 0, other commands EINVAL), `rt_sigtimedwait`
   (1 ms polling of pending bits, siginfo has only `si_signo`), `getrlimit`/
   `setrlimit` (prlimit64 storage), `epoll_pwait2` (ms rounding), `sendmmsg`/
   `recvmmsg` (loops over sendmsg/recvmsg, vlen cap 1024), `sched_set*` (only
-  SCHED_OTHER/0; other classes EPERM), `fallocate`, `chmod`/`fchmod`/`fchmodat(2)`
-  (no umask, `AT_SYMLINK_NOFOLLOW` EOPNOTSUPP), `utimensat` (seconds only,
-  NOW/OMIT), `sendfile`/`copy_file_range` (64 KiB bounce buffer, sendfile to a
-  socket/pipe/tty destination is EINVAL), `flock` (73) and `fcntl` lock commands
-  (see `abi/vfs-storage.md`). `chown` still returns ENOSYS.
+  SCHED_OTHER/0; other classes EPERM), `fallocate`, `chown`/`fchown`/`lchown`/
+  `fchownat` (`VFS_IPC_OP_CHOWN`=40, `VFS_IPC_OP_FCHOWN`=41), `mknod`/`mknodat`
+  (`VFS_IPC_OP_MKNOD`), `link`/`linkat` (`VFS_IPC_OP_LINKAT`=42), `chmod`/
+  `fchmod`/`fchmodat(2)` (no umask, `AT_SYMLINK_NOFOLLOW` EOPNOTSUPP),
+  `utimensat` (nanosecond precision, NOW/OMIT) + `utime`/`utimes`/`futimesat`,
+  `sendfile`/`copy_file_range` (64 KiB bounce buffer; `sendfile` targets
+  regular files, memfds, pipes, and sockets), `flock` (73) and `fcntl` lock
+  commands (see `abi/vfs-storage.md`).
+- Truncate `SIGBUS` revocation: shrinking a mapped TmpFs/FAT/memfd file replaces
+  mappings past the new EOF with an EOF guard leaf
+  (`map_external_user_pages_with_eof_guard` / `current_user_leaf_is_eof_guard`),
+  delivering `SIGBUS` on user `#PF` past EOF; `mprotect` updates
+  `SharedMemfdMapping::page_flags` across split ranges.
+- `SYS_RUSTOS_PROC_FACTS_BROKER` (`0x5255_0066`, ABI v1, `VfsPolicy`-only):
+  bounded pull of kernel-attested raw `/proc/<pid>` facts (`PROC_FACTS_OP_*`
+  `PROCESS`=1, `THREAD`=2, `FD_LIST`=3, `TID_LIST`=4, `LIMITS`=5) so `vfsd`
+  formats `/proc/<pid>/*` ASCII nodes in Ring3; writable `/proc` nodes (`comm`,
+  `task/<tid>/comm`, `oom_score_adj`) route through `proc_identity::write_snapshot`.
 - Local fd identity: `fstat`/`statx` of pipes (`S_IFIFO|0600`, both ends one
   inode), sockets (`S_IFSOCK|0777`), memfd (`S_IFREG|0777`, live size), eventfd/
   epoll (`S_IFREG|0600`) report `st_ino` = object identity (dup shares it) and a
@@ -482,9 +510,9 @@ pages); SUPPLY_PAGE copies the exact remaining bytes (kernel zero-fills the
 tail) into frame-source pages; an object is invisible to guests until SEAL.
 Limits: 128 objects, 12288 reserved pages. Related wire: vfsd ops
 `VFS_IPC_OP_FILE_IDENTITY`=26, `VFS_IPC_OP_LIBRARY_READ`=27 (pager only, chunks
-up to `VFS_LIBRARY_READ_MAX_BYTES`), and `MM_BROKER_OP_BIND_LIBRARY`=11. `VFS_IPC_OP_SHARED_BACKING`=39 and
-`MM_BROKER_OP_MAP_FILE_SHARED`=20 serve writable TmpFs `MAP_SHARED`
-(`abi/vfs-storage.md`).
+up to `VFS_LIBRARY_READ_MAX_BYTES`), and `MM_BROKER_OP_BIND_LIBRARY`=11. `VFS_IPC_OP_SHARED_BACKING`=39 (with `VFS_SHARED_BACKING_FLAG_SYNC` for
+`msync(MS_SYNC)` flush) and `MM_BROKER_OP_MAP_FILE_SHARED`=20 serve writable
+TmpFs and FAT `MAP_SHARED` (`abi/vfs-storage.md`).
 `SYS_RUSTOS_LIBRARY_MAP_PROBE` (`0x5255_0065`) is a diagnostic for the opt-in
 probe only (frames/stats; caller exec path must be `libmapprobe.elf`).
 Design and status: `docs/ai/pager/library-cache.md`.

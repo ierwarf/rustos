@@ -40,6 +40,7 @@ pub(super) fn handle_poll_batch(request: &NetdIpcRequest, response: &mut NetdIpc
         let outcome = if state.inet_sockets.contains_key(&socket_token) {
             inet_socket_revents(&mut state, socket_token, events)
         } else {
+            netlink::refresh_for_member(&mut state, socket_token);
             unix_socket_revents(&state, socket_token, events)
         };
         let result = match outcome {
@@ -73,6 +74,7 @@ pub(super) fn handle_poll_socket(request: &NetdIpcRequest, response: &mut NetdIp
         }
         inet_socket_revents(&mut state, request.socket_token, request.arg1 as u32)
     } else {
+        netlink::refresh_for_member(&mut state, request.socket_token);
         unix_socket_revents(&state, request.socket_token, request.arg1 as u32)
     };
     match outcome {

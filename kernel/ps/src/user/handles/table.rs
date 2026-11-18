@@ -797,6 +797,23 @@ impl HandleTable {
         numbers
     }
 
+    /// Number of descriptor slots the table has allocated (the always-present
+    /// standard slots plus the dynamic slots grown so far). This is the real
+    /// counter behind `FDSize` in `/proc/<pid>/status`.
+    pub fn slot_capacity(&self) -> usize {
+        self.standard.len() + self.entries.len()
+    }
+
+    /// Open descriptors (not reservations) whose entry satisfies `matches`.
+    pub fn count_open_where(&self, mut matches: impl FnMut(&HandleEntry) -> bool) -> usize {
+        self.standard
+            .iter()
+            .chain(self.entries.iter())
+            .filter_map(Option::as_ref)
+            .filter(|entry| matches(entry))
+            .count()
+    }
+
     pub fn duplicate_min(&mut self, fd: u64, min_fd: u64, close_on_exec: bool) -> Option<u64> {
         if min_fd > MAX_DYNAMIC_FD {
             return None;

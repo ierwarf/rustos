@@ -1,4 +1,5 @@
-//! Minimal `AF_NETLINK`/`NETLINK_ROUTE`: link and address dumps.
+//! Minimal `AF_NETLINK`/`NETLINK_ROUTE`: link, address and route dumps plus
+//! change notifications for the groups netd can really observe.
 //!
 //! - **Owner:** `netd` owns the interface/address view; it reports the real
 //!   `smoltcp` interface of the active packet provider plus a synthetic `lo`.
@@ -11,8 +12,21 @@
 //!   `ENOBUFS` once, then resumes.
 //! - **Failure:** unsupported message types yield `NLMSG_ERROR` carrying
 //!   `-EOPNOTSUPP`; nothing is silently answered with an empty success.
-//! - **Forbidden:** inventing hardware, delivering multicast notifications that
-//!   are never generated, or per-socket state outside `NetlinkState`.
+//! - **Receive:** an empty queue is `EAGAIN` here; a blocking caller waits on
+//!   the syscall side (kernel `wait_and_retry_local_receive`), honouring
+//!   `O_NONBLOCK`, `MSG_DONTWAIT` and `SO_RCVTIMEO`.
+//! - **Groups:** `bind(nl_groups)` and `NETLINK_ADD/DROP_MEMBERSHIP` record the
+//!   memberships. A member receives `RTM_NEW/DELLINK` (`RTMGRP_LINK`),
+//!   `RTM_NEW/DELADDR` (`RTMGRP_IPV4_IFADDR`) and `RTM_NEW/DELROUTE`
+//!   (`RTMGRP_IPV4_ROUTE`) only when the interface view of the packet provider
+//!   differs from the last published one ([`publish_interface_changes`]); there
+//!   is no notification source for other groups, so those memberships stay
+//!   silent. Detection is lazy: it runs when a member polls or receives, and
+//!   at every (un)subscription so a new member never sees past history.
+//! - **Neighbours:** `RTM_GETNEIGH` answers an empty dump: smoltcp does not
+//!   expose its neighbour cache and none is invented.
+//! - **Forbidden:** inventing hardware, delivering notifications that are never
+//!   generated, or per-socket state outside `NetlinkState`.
 //!
 //! Everything that builds bytes is a pure function so it can be tested
 //! byte-exact.
@@ -25,9 +39,37 @@ pub(super) const NLMSG_HDRLEN: usize = 16;
 pub(super) const NLMSG_ERROR: u16 = 2;
 pub(super) const NLMSG_DONE: u16 = 3;
 pub(super) const RTM_NEWLINK: u16 = 16;
+pub(super) const RTM_DELLINK: u16 = 17;
 pub(super) const RTM_GETLINK: u16 = 18;
 pub(super) const RTM_NEWADDR: u16 = 20;
+pub(super) const RTM_DELADDR: u16 = 21;
 pub(super) const RTM_GETADDR: u16 = 22;
+pub(super) const RTM_NEWROUTE: u16 = 24;
+pub(super) const RTM_DELROUTE: u16 = 25;
+pub(super) const RTM_GETROUTE: u16 = 26;
+pub(super) const RTM_GETNEIGH: u16 = 30;
+
+/// `rtnetlink` multicast groups netd can generate events for (bit masks as
+/// used by `sockaddr_nl.nl_groups`; the group number is the bit index + 1).
+pub(super) const RTMGRP_LINK: u32 = 1 << 0;
+pub(super) const RTMGRP_IPV4_IFADDR: u32 = 1 << 4;
+pub(super) const RTMGRP_IPV4_ROUTE: u32 = 1 << 6;
+/// `RTNLGRP_MAX` is 31 on current kernels: group numbers 1..=31 are valid.
+const NETLINK_GROUP_NUMBER_MAX: u32 = 31;
+pub(super) const NETLINK_ADD_MEMBERSHIP: u64 = 1;
+pub(super) const NETLINK_DROP_MEMBERSHIP: u64 = 2;
+pub(super) const NETLINK_LIST_MEMBERSHIPS: u64 = 9;
+
+pub(super) const RTA_DST: u16 = 1;
+pub(super) const RTA_OIF: u16 = 4;
+pub(super) const RTA_GATEWAY: u16 = 5;
+pub(super) const RTA_PREFSRC: u16 = 7;
+pub(super) const RTA_TABLE: u16 = 15;
+pub(super) const RT_TABLE_MAIN: u8 = 254;
+pub(super) const RTPROT_KERNEL: u8 = 2;
+pub(super) const RTPROT_BOOT: u8 = 3;
+pub(super) const RTN_UNICAST: u8 = 1;
+pub(super) const RT_SCOPE_LINK: u8 = 253;
 pub(super) const NLM_F_MULTI: u16 = 0x2;
 pub(super) const NLM_F_ROOT: u16 = 0x100;
 
@@ -56,8 +98,8 @@ pub(super) const RT_SCOPE_UNIVERSE: u8 = 0;
 pub(super) const RT_SCOPE_HOST: u8 = 254;
 
 pub(super) const SOCKADDR_NL_LEN: usize = 12;
-/// `SOL_NETLINK`: options at this level are accepted and ignored (no
-/// multicast groups are ever delivered).
+/// `SOL_NETLINK`: membership options are implemented; every other option is
+/// `ENOPROTOOPT` rather than accepted without effect.
 pub(super) const SOL_NETLINK: u64 = 270;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,6 +123,26 @@ pub(super) struct AddrInfo {
     pub(super) local: [u8; 4],
     pub(super) broadcast: Option<[u8; 4]>,
     pub(super) label: String,
+}
+
+/// One IPv4 route of the main table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RouteInfo {
+    pub(super) oif: i32,
+    pub(super) dst: [u8; 4],
+    pub(super) dst_len: u8,
+    pub(super) gateway: Option<[u8; 4]>,
+    pub(super) prefsrc: Option<[u8; 4]>,
+    pub(super) scope: u8,
+    pub(super) protocol: u8,
+}
+
+/// Everything a dump or an event comparison needs, taken under one lock.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct InterfaceSnapshot {
+    pub(super) links: Vec<LinkInfo>,
+    pub(super) addrs: Vec<AddrInfo>,
+    pub(super) routes: Vec<RouteInfo>,
 }
 
 pub(super) fn loopback_link() -> LinkInfo {
@@ -172,6 +234,10 @@ fn finish_message(mut body: Vec<u8>, msg_type: u16, flags: u16, seq: u32, pid: u
 
 /// `RTM_NEWLINK` record: `ifinfomsg` + IFNAME, MTU, OPERSTATE, ADDRESS, BROADCAST.
 pub(super) fn build_link_message(link: &LinkInfo, seq: u32, pid: u32) -> Vec<u8> {
+    link_record(link, RTM_NEWLINK, NLM_F_MULTI, seq, pid)
+}
+
+fn link_record(link: &LinkInfo, msg_type: u16, flags: u16, seq: u32, pid: u32) -> Vec<u8> {
     let mut body = Vec::with_capacity(96);
     body.push(0); // ifi_family = AF_UNSPEC
     body.push(0);
@@ -186,11 +252,15 @@ pub(super) fn build_link_message(link: &LinkInfo, seq: u32, pid: u32) -> Vec<u8>
     push_attr(&mut body, IFLA_OPERSTATE, &[link.oper_state]);
     push_attr(&mut body, IFLA_ADDRESS, &link.mac);
     push_attr(&mut body, IFLA_BROADCAST, &link.broadcast);
-    finish_message(body, RTM_NEWLINK, NLM_F_MULTI, seq, pid)
+    finish_message(body, msg_type, flags, seq, pid)
 }
 
 /// `RTM_NEWADDR` record: `ifaddrmsg` + ADDRESS, LOCAL, [BROADCAST], LABEL.
 pub(super) fn build_addr_message(addr: &AddrInfo, seq: u32, pid: u32) -> Vec<u8> {
+    addr_record(addr, RTM_NEWADDR, NLM_F_MULTI, seq, pid)
+}
+
+fn addr_record(addr: &AddrInfo, msg_type: u16, flags: u16, seq: u32, pid: u32) -> Vec<u8> {
     let mut body = Vec::with_capacity(48);
     body.push(AF_INET_FAMILY);
     body.push(addr.prefix_len);
@@ -205,7 +275,37 @@ pub(super) fn build_addr_message(addr: &AddrInfo, seq: u32, pid: u32) -> Vec<u8>
     let mut label = addr.label.clone().into_bytes();
     label.push(0);
     push_attr(&mut body, IFA_LABEL, &label);
-    finish_message(body, RTM_NEWADDR, NLM_F_MULTI, seq, pid)
+    finish_message(body, msg_type, flags, seq, pid)
+}
+
+/// `RTM_NEWROUTE` record: `rtmsg` + TABLE, [DST], OIF, [GATEWAY], [PREFSRC].
+pub(super) fn build_route_message(route: &RouteInfo, seq: u32, pid: u32) -> Vec<u8> {
+    route_record(route, RTM_NEWROUTE, NLM_F_MULTI, seq, pid)
+}
+
+fn route_record(route: &RouteInfo, msg_type: u16, flags: u16, seq: u32, pid: u32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(56);
+    body.push(AF_INET_FAMILY);
+    body.push(route.dst_len);
+    body.push(0); // rtm_src_len
+    body.push(0); // rtm_tos
+    body.push(RT_TABLE_MAIN);
+    body.push(route.protocol);
+    body.push(route.scope);
+    body.push(RTN_UNICAST);
+    body.extend_from_slice(&0_u32.to_ne_bytes()); // rtm_flags
+    push_attr(&mut body, RTA_TABLE, &u32::from(RT_TABLE_MAIN).to_ne_bytes());
+    if route.dst_len != 0 {
+        push_attr(&mut body, RTA_DST, &route.dst);
+    }
+    push_attr(&mut body, RTA_OIF, &(route.oif as u32).to_ne_bytes());
+    if let Some(gateway) = route.gateway {
+        push_attr(&mut body, RTA_GATEWAY, &gateway);
+    }
+    if let Some(prefsrc) = route.prefsrc {
+        push_attr(&mut body, RTA_PREFSRC, &prefsrc);
+    }
+    finish_message(body, msg_type, flags, seq, pid)
 }
 
 pub(super) fn build_done(seq: u32, pid: u32) -> Vec<u8> {
@@ -242,6 +342,20 @@ pub(super) fn process_request(
     links: &[LinkInfo],
     addrs: &[AddrInfo],
 ) -> Vec<u8> {
+    let snapshot = InterfaceSnapshot {
+        links: links.to_vec(),
+        addrs: addrs.to_vec(),
+        routes: Vec::new(),
+    };
+    process_request_snapshot(request, portid, &snapshot)
+}
+
+pub(super) fn process_request_snapshot(
+    request: &[u8],
+    portid: u32,
+    snapshot: &InterfaceSnapshot,
+) -> Vec<u8> {
+    let (links, addrs) = (&snapshot.links, &snapshot.addrs);
     let mut reply = Vec::new();
     let mut offset = 0usize;
     while request.len() - offset >= NLMSG_HDRLEN {
@@ -276,6 +390,17 @@ pub(super) fn process_request(
                 // an empty dump, still terminated by NLMSG_DONE.
                 reply.extend_from_slice(&build_done(seq, portid));
             }
+            RTM_GETROUTE if dump => {
+                let family = message.get(NLMSG_HDRLEN).copied().unwrap_or(0);
+                if family == 0 || family == AF_INET_FAMILY {
+                    for route in &snapshot.routes {
+                        reply.extend_from_slice(&build_route_message(route, seq, portid));
+                    }
+                }
+                reply.extend_from_slice(&build_done(seq, portid));
+            }
+            // No neighbour cache is exposed by the stack: an honest empty dump.
+            RTM_GETNEIGH if dump => reply.extend_from_slice(&build_done(seq, portid)),
             _ => reply.extend_from_slice(&build_error(libc::EOPNOTSUPP, message, seq, portid)),
         }
         offset += (len + 3) & !3;
@@ -316,6 +441,10 @@ impl NetlinkState {
 
     pub(super) fn readable(&self) -> bool {
         !self.rx.is_empty() || self.overrun
+    }
+
+    pub(super) fn groups(&self) -> u32 {
+        self.groups
     }
 
     #[cfg(test)]
@@ -400,10 +529,10 @@ pub(super) fn handle_bind(request: &NetdIpcRequest) -> i32 {
     }
     let requested_pid = rd_u32(&request.payload, 4);
     let groups = rd_u32(&request.payload, 8);
-    if groups != 0 {
-        return libc::EOPNOTSUPP;
-    }
     let mut state = lock_net_state();
+    // Publish what changed before this socket joins: a new member sees only
+    // later changes, never history.
+    publish_interface_changes(&mut state);
     let Some(socket) = state.sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
@@ -434,20 +563,25 @@ pub(super) fn handle_bind(request: &NetdIpcRequest) -> i32 {
         netlink.portid = portid;
         netlink.groups = groups;
     }
+    // Re-baseline for the new member set (a first member records its baseline).
+    publish_interface_changes(&mut state);
     0
 }
 
-/// Current interfaces and IPv4 addresses: the synthetic loopback plus the real
-/// provider interface when the packet provider is active.
-pub(super) fn current_interfaces(state: &mut NetState) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
+/// Current interfaces, IPv4 addresses and routes: the synthetic loopback plus
+/// the real provider interface when the packet provider is active.
+pub(super) fn current_interfaces(state: &mut NetState) -> InterfaceSnapshot {
     #[cfg(not(test))]
     {
         // The stack exists only once the provider is active; creating it here
         // is what the first INET socket would do anyway.
         let _ = state.inet_stack();
     }
-    let mut links = vec![loopback_link()];
-    let mut addrs = vec![loopback_addr()];
+    let mut snapshot = InterfaceSnapshot {
+        links: vec![loopback_link()],
+        addrs: vec![loopback_addr()],
+        routes: Vec::new(),
+    };
     #[cfg(not(test))]
     let provider_active = packet_provider_state() == Ok(PacketProviderState::Active);
     #[cfg(test)]
@@ -457,17 +591,185 @@ pub(super) fn current_interfaces(state: &mut NetState) -> (Vec<LinkInfo>, Vec<Ad
         // Both enums are single-variant under this crate's smoltcp features
         // (ethernet medium, IPv4 only).
         let HardwareAddress::Ethernet(mac) = stack.iface.hardware_addr();
-        links.push(provider_link(INDEX, mac.0));
+        snapshot.links.push(provider_link(INDEX, mac.0));
         for cidr in stack.iface.ip_addrs() {
             let IpCidr::Ipv4(cidr) = cidr;
-            addrs.push(provider_addr(
-                INDEX,
-                cidr.address().octets(),
-                cidr.prefix_len(),
-            ));
+            let (address, prefix_len) = (cidr.address().octets(), cidr.prefix_len());
+            snapshot.addrs.push(provider_addr(INDEX, address, prefix_len));
+            snapshot.routes.push(connected_route(INDEX, address, prefix_len));
+        }
+        if let Some(route) = stack.iface.routes().get_default_ipv4_route() {
+            let IpAddress::Ipv4(gateway) = route.via_router;
+            snapshot.routes.push(RouteInfo {
+                oif: INDEX,
+                dst: [0; 4],
+                dst_len: 0,
+                gateway: Some(gateway.octets()),
+                prefsrc: None,
+                scope: RT_SCOPE_UNIVERSE,
+                protocol: RTPROT_BOOT,
+            });
         }
     }
-    (links, addrs)
+    snapshot
+}
+
+/// The on-link route the kernel installs for an interface address.
+pub(super) fn connected_route(index: i32, address: [u8; 4], prefix_len: u8) -> RouteInfo {
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix_len.min(32)))
+    };
+    RouteInfo {
+        oif: index,
+        dst: (u32::from_be_bytes(address) & mask).to_be_bytes(),
+        dst_len: prefix_len,
+        gateway: None,
+        prefsrc: Some(address),
+        scope: RT_SCOPE_LINK,
+        protocol: RTPROT_KERNEL,
+    }
+}
+
+/// Events that turn `old` into `new`, each tagged with its multicast group.
+/// Pure so it can be tested byte-exact; seq and portid are zero (kernel origin).
+pub(super) fn diff_events(old: &InterfaceSnapshot, new: &InterfaceSnapshot) -> Vec<(u32, Vec<u8>)> {
+    let mut events = Vec::new();
+    for link in &new.links {
+        if old.links.iter().find(|candidate| candidate.index == link.index) != Some(link) {
+            events.push((RTMGRP_LINK, link_record(link, RTM_NEWLINK, 0, 0, 0)));
+        }
+    }
+    for link in &old.links {
+        if !new.links.iter().any(|candidate| candidate.index == link.index) {
+            events.push((RTMGRP_LINK, link_record(link, RTM_DELLINK, 0, 0, 0)));
+        }
+    }
+    for addr in &new.addrs {
+        if !old.addrs.contains(addr) {
+            events.push((RTMGRP_IPV4_IFADDR, addr_record(addr, RTM_NEWADDR, 0, 0, 0)));
+        }
+    }
+    for addr in &old.addrs {
+        if !new.addrs.contains(addr) {
+            events.push((RTMGRP_IPV4_IFADDR, addr_record(addr, RTM_DELADDR, 0, 0, 0)));
+        }
+    }
+    for route in &new.routes {
+        if !old.routes.contains(route) {
+            events.push((RTMGRP_IPV4_ROUTE, route_record(route, RTM_NEWROUTE, 0, 0, 0)));
+        }
+    }
+    for route in &old.routes {
+        if !new.routes.contains(route) {
+            events.push((RTMGRP_IPV4_ROUTE, route_record(route, RTM_DELROUTE, 0, 0, 0)));
+        }
+    }
+    events
+}
+
+/// Whether any netlink socket is subscribed to a group netd generates.
+fn has_observed_members(state: &NetState) -> bool {
+    state.sockets.values().any(|socket| {
+        matches!(&socket.state, UnixSocketState::Netlink(netlink)
+            if netlink.groups & (RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE) != 0)
+    })
+}
+
+/// Compares the live interface view with the last published one and queues the
+/// difference on every subscribed socket. The first call only records the
+/// baseline. Without a subscriber the baseline is left alone, so the stack is
+/// not created or inspected for nobody.
+pub(super) fn publish_interface_changes(state: &mut NetState) {
+    if !has_observed_members(state) {
+        state.netlink_view = None;
+        return;
+    }
+    let current = current_interfaces(state);
+    apply_interface_snapshot(state, current);
+}
+
+pub(super) fn apply_interface_snapshot(state: &mut NetState, current: InterfaceSnapshot) {
+    let Some(previous) = state.netlink_view.replace(current.clone()) else {
+        return;
+    };
+    for (group, message) in diff_events(&previous, &current) {
+        let members: Vec<u64> = state
+            .sockets
+            .iter()
+            .filter_map(|(token, socket)| match &socket.state {
+                UnixSocketState::Netlink(netlink) if netlink.groups & group != 0 => Some(*token),
+                _ => None,
+            })
+            .collect();
+        for token in members {
+            if let Some(socket) = state.sockets.get_mut(&token) {
+                let capacity = socket.options.recv_buffer.max(4096) as usize;
+                if let UnixSocketState::Netlink(netlink) = &mut socket.state {
+                    netlink.enqueue(message.clone(), capacity);
+                }
+            }
+        }
+    }
+}
+
+/// Poll/receive hook: only a socket that is itself a group member can be
+/// waiting for an event, so only it pays for the comparison.
+pub(super) fn refresh_for_member(state: &mut NetState, token: u64) {
+    let member = matches!(
+        state.sockets.get(&token).map(|socket| &socket.state),
+        Some(UnixSocketState::Netlink(netlink)) if netlink.groups != 0
+    );
+    if member {
+        publish_interface_changes(state);
+    }
+}
+
+/// `setsockopt(SOL_NETLINK, ...)`: only the membership options exist.
+pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
+    let Some(group) = request_i32_payload(request) else {
+        return libc::EINVAL;
+    };
+    let mut state = lock_net_state();
+    if !state.sockets.get(&request.socket_token).is_some_and(|socket| matches!(socket.state, UnixSocketState::Netlink(_))) {
+        return if state.socket_exists(request.socket_token) { libc::ENOPROTOOPT } else { libc::EBADF };
+    }
+    let option = request.arg2;
+    if option != NETLINK_ADD_MEMBERSHIP && option != NETLINK_DROP_MEMBERSHIP {
+        return libc::ENOPROTOOPT;
+    }
+    let group = group as u32;
+    if group == 0 || group > NETLINK_GROUP_NUMBER_MAX {
+        return libc::EINVAL;
+    }
+    publish_interface_changes(&mut state);
+    let bit = 1_u32 << (group - 1);
+    if let Some(UnixSocket { state: UnixSocketState::Netlink(netlink), .. }) = state.sockets.get_mut(&request.socket_token) {
+        if option == NETLINK_ADD_MEMBERSHIP {
+            netlink.groups |= bit;
+        } else {
+            netlink.groups &= !bit;
+        }
+    }
+    // Re-baseline for the new member set (a first member records its baseline).
+    publish_interface_changes(&mut state);
+    0
+}
+
+/// `getsockopt(SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS)`: the group bit mask.
+pub(super) fn handle_getsockopt(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+    let state = lock_net_state();
+    let Some(UnixSocket { state: UnixSocketState::Netlink(netlink), .. }) = state.sockets.get(&request.socket_token) else {
+        return if state.socket_exists(request.socket_token) { libc::ENOPROTOOPT } else { libc::EBADF };
+    };
+    if request.arg2 != NETLINK_LIST_MEMBERSHIPS {
+        return libc::ENOPROTOOPT;
+    }
+    response.payload[..4].copy_from_slice(&netlink.groups.to_ne_bytes());
+    response.payload_len = 4;
+    response.value = 0;
+    0
 }
 
 /// `send`/`sendto`/`sendmsg` on a netlink socket: answer into its own queue.
@@ -483,7 +785,7 @@ pub(super) fn send_message(
     if bytes.len() > SOCKET_BUFFER_CAPACITY {
         return Err(libc::EMSGSIZE);
     }
-    let (links, addrs) = current_interfaces(state);
+    let snapshot = current_interfaces(state);
     let preferred = request.pid as u32;
     let needs_portid = match state.sockets.get(&request.socket_token) {
         Some(UnixSocket {
@@ -505,7 +807,7 @@ pub(super) fn send_message(
     if let Some(portid) = autobound {
         netlink.portid = portid;
     }
-    let reply = process_request(bytes, netlink.portid, &links, &addrs);
+    let reply = process_request_snapshot(bytes, netlink.portid, &snapshot);
     netlink.enqueue(reply, capacity);
     Ok(bytes.len())
 }
@@ -518,6 +820,7 @@ fn take_datagram(
     dest: &mut [u8],
     peek: bool,
 ) -> Result<(usize, usize), i32> {
+    refresh_for_member(state, token);
     let socket = state.sockets.get_mut(&token).ok_or(libc::EBADF)?;
     let UnixSocketState::Netlink(netlink) = &mut socket.state else {
         return Err(libc::EOPNOTSUPP);

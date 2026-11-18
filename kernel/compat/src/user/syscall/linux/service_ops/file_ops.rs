@@ -20,12 +20,15 @@
 use super::*;
 use alloc::vec;
 use rustos_user_abi::syscall::{
-    VFS_IPC_OP_CHMOD, VFS_IPC_OP_FALLOCATE, VFS_IPC_OP_FCHMOD, VFS_IPC_OP_PWRITE64,
-    VFS_IPC_OP_SET_ATTRS,
+    VFS_CHOWN_FLAG_NOFOLLOW, VFS_IPC_OP_CHMOD, VFS_IPC_OP_CHOWN, VFS_IPC_OP_FALLOCATE,
+    VFS_IPC_OP_FCHMOD, VFS_IPC_OP_FCHOWN, VFS_IPC_OP_LINKAT, VFS_IPC_OP_MKNOD,
+    VFS_IPC_OP_PWRITE64, VFS_IPC_OP_SET_ATTRS, VFS_LINKAT_FLAG_SOURCE_DESCRIPTION,
+    encode_two_path_payload,
 };
 
 const LINUX_EISDIR: i64 = 21;
 const LINUX_EFBIG: i64 = 27;
+const LINUX_ENAMETOOLONG: i64 = 36;
 
 /// Largest bounce buffer of one copy iteration (a page multiple).
 const COPY_CHUNK: usize = 16 * 4096;
@@ -176,7 +179,175 @@ pub fn syscall_linux_vfs_fchmodat(dirfd: u64, path_ptr: u64, mode: u64, flags: u
 }
 
 // ---------------------------------------------------------------------------
-// utimensat
+// chown / mknod / link families
+// ---------------------------------------------------------------------------
+
+pub fn syscall_linux_vfs_fchown(fd: u64, owner: u64, group: u64) -> u64 {
+    let Some((remote, rights)) = current_remote_vfs_handle_with_rights(fd) else {
+        return linux_errno(if current_kernel_handle(fd).is_some() {
+            LINUX_EOPNOTSUPP
+        } else {
+            LINUX_EBADF
+        });
+    };
+    if !rights.allows_read() && !rights.allows_write() {
+        return linux_errno(LINUX_EBADF);
+    }
+    let mut request = new_vfs_request(VFS_IPC_OP_FCHOWN);
+    request.fd = fd;
+    request.remote_id = remote.remote_id();
+    request.arg0 = owner;
+    request.arg1 = group;
+    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
+    {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+fn fchownat_flags(flags: u64) -> Result<(bool, u32), i64> {
+    let known = linux_abi::AT_SYMLINK_NOFOLLOW | linux_abi::AT_EMPTY_PATH;
+    if flags & !known != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let vfs_flags = if flags & linux_abi::AT_SYMLINK_NOFOLLOW != 0 {
+        VFS_CHOWN_FLAG_NOFOLLOW
+    } else {
+        0
+    };
+    Ok((flags & linux_abi::AT_EMPTY_PATH != 0, vfs_flags))
+}
+
+pub fn syscall_linux_vfs_fchownat(
+    dirfd: u64,
+    path_ptr: u64,
+    owner: u64,
+    group: u64,
+    flags: u64,
+) -> u64 {
+    let (empty_path_allowed, vfs_flags) = match fchownat_flags(flags) {
+        Ok(parsed) => parsed,
+        Err(errno) => return linux_errno(errno),
+    };
+    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
+        Ok(path) => path,
+        Err(errno) => return linux_errno(errno),
+    };
+    if path.is_empty() {
+        return if empty_path_allowed {
+            syscall_linux_vfs_fchown(dirfd, owner, group)
+        } else {
+            linux_errno(LINUX_ENOENT)
+        };
+    }
+    let mut request = new_vfs_request(VFS_IPC_OP_CHOWN);
+    request.arg0 = owner;
+    request.arg1 = group;
+    request.flags = vfs_flags;
+    if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
+        return linux_errno(errno);
+    }
+    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
+    {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+pub fn syscall_linux_vfs_mknodat(dirfd: u64, path_ptr: u64, mode: u64, dev: u64) -> u64 {
+    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
+        Ok(path) => path,
+        Err(errno) => return linux_errno(errno),
+    };
+    let mut request = new_vfs_request(VFS_IPC_OP_MKNOD);
+    request.arg0 = mode;
+    request.arg1 = dev;
+    if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
+        return linux_errno(errno);
+    }
+    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
+    {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+fn linkat_flags(flags: u64) -> Result<(bool, u64), i64> {
+    let known = linux_abi::AT_SYMLINK_FOLLOW | linux_abi::AT_EMPTY_PATH;
+    if flags & !known != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    Ok((
+        flags & linux_abi::AT_EMPTY_PATH != 0,
+        flags & linux_abi::AT_SYMLINK_FOLLOW,
+    ))
+}
+
+pub fn syscall_linux_vfs_linkat(
+    olddirfd: u64,
+    oldpath_ptr: u64,
+    newdirfd: u64,
+    newpath_ptr: u64,
+    flags: u64,
+) -> u64 {
+    let (empty_path_allowed, follow_flag) = match linkat_flags(flags) {
+        Ok(parsed) => parsed,
+        Err(errno) => return linux_errno(errno),
+    };
+    let old_path = match copy_current_user_path(oldpath_ptr, VFS_IPC_PATH_CAPACITY) {
+        Ok(path) => path,
+        Err(errno) => return linux_errno(errno),
+    };
+    let new_path = match copy_current_user_path(newpath_ptr, VFS_IPC_PATH_CAPACITY) {
+        Ok(path) => path,
+        Err(errno) => return linux_errno(errno),
+    };
+    if new_path.is_empty() {
+        return linux_errno(LINUX_ENOENT);
+    }
+    let mut request = new_vfs_request(VFS_IPC_OP_LINKAT);
+    if old_path.is_empty() {
+        if !empty_path_allowed {
+            return linux_errno(LINUX_ENOENT);
+        }
+        let Some((remote, _rights)) = current_remote_vfs_handle_with_rights(olddirfd) else {
+            return linux_errno(if current_kernel_handle(olddirfd).is_some() {
+                LINUX_EOPNOTSUPP
+            } else {
+                LINUX_EBADF
+            });
+        };
+        request.flags = VFS_LINKAT_FLAG_SOURCE_DESCRIPTION;
+        request.fd = olddirfd;
+        request.remote_id = remote.remote_id();
+    } else {
+        request.dirfd = olddirfd;
+        request.remote_id = match resolve_vfs_dirfd_remote_id(olddirfd, &old_path) {
+            Ok(id) => id,
+            Err(errno) => return linux_errno(errno),
+        };
+    }
+    request.arg0 = newdirfd;
+    request.arg1 = follow_flag;
+    request.arg2 = match resolve_vfs_dirfd_remote_id(newdirfd, &new_path) {
+        Ok(id) => id,
+        Err(errno) => return linux_errno(errno),
+    };
+    let Some(encoded_len) =
+        encode_two_path_payload(old_path.as_bytes(), new_path.as_bytes(), &mut request.payload)
+    else {
+        return linux_errno(LINUX_ENAMETOOLONG);
+    };
+    request.payload_len = encoded_len as u32;
+    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
+    {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// utimensat / utime / utimes / futimesat
 // ---------------------------------------------------------------------------
 
 /// One decoded `timespec` of `utimensat`.
@@ -211,6 +382,66 @@ fn utime_attrs(atime: TimeSpec, mtime: TimeSpec) -> (u64, i64, i64, u64) {
     (amask | mmask, asecs, msecs, u64::from(ananos) | (u64::from(mnanos) << 32))
 }
 
+fn decode_utime_timeval(tv_sec: i64, tv_usec: i64) -> Result<TimeSpec, i64> {
+    if (0..1_000_000).contains(&tv_usec) {
+        Ok(TimeSpec::Set(tv_sec, (tv_usec as u32) * 1000))
+    } else {
+        Err(LINUX_EINVAL)
+    }
+}
+
+fn set_vfs_times(
+    dirfd: u64,
+    path: Option<&str>,
+    flags: u64,
+    atime: TimeSpec,
+    mtime: TimeSpec,
+) -> u64 {
+    // Linux specifies that two OMITs succeed without checking the target.
+    if atime == TimeSpec::Omit && mtime == TimeSpec::Omit {
+        return 0;
+    }
+    let (mask, atime_secs, mtime_secs, nanos) = utime_attrs(atime, mtime);
+    let mut request = new_vfs_request(VFS_IPC_OP_SET_ATTRS);
+    request.arg0 = mask;
+    request.arg1 = atime_secs as u64;
+    request.arg2 = mtime_secs as u64;
+    request.arg3 = nanos;
+    request.flags = (flags & linux_abi::AT_SYMLINK_NOFOLLOW) as u32;
+    let by_descriptor = match path {
+        None => true,
+        Some(path) => path.is_empty() && flags & linux_abi::AT_EMPTY_PATH != 0,
+    };
+    if by_descriptor {
+        // `futimens`: vfsd addresses the open description's node, which still
+        // exists after the name was unlinked.
+        let Some((remote, rights)) = current_remote_vfs_handle_with_rights(dirfd) else {
+            return linux_errno(if current_kernel_handle(dirfd).is_some() {
+                LINUX_EOPNOTSUPP
+            } else {
+                LINUX_EBADF
+            });
+        };
+        if !rights.allows_read() && !rights.allows_write() {
+            return linux_errno(LINUX_EBADF);
+        }
+        request.fd = dirfd;
+        request.remote_id = remote.remote_id();
+    } else if let Some(path) = path {
+        if path.is_empty() {
+            return linux_errno(LINUX_ENOENT);
+        }
+        if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, path) {
+            return linux_errno(errno);
+        }
+    }
+    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
+    {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
 pub fn syscall_linux_vfs_utimensat(dirfd: u64, path_ptr: u64, times_ptr: u64, flags: u64) -> u64 {
     let known = linux_abi::AT_SYMLINK_NOFOLLOW | linux_abi::AT_EMPTY_PATH;
     if flags & !known != 0 {
@@ -232,18 +463,6 @@ pub fn syscall_linux_vfs_utimensat(dirfd: u64, path_ptr: u64, times_ptr: u64, fl
             Err(errno) => return linux_errno(errno),
         }
     };
-    // Linux specifies that two OMITs succeed without checking the target.
-    if atime == TimeSpec::Omit && mtime == TimeSpec::Omit {
-        return 0;
-    }
-    let (mask, atime_secs, mtime_secs, nanos) = utime_attrs(atime, mtime);
-
-    let mut request = new_vfs_request(VFS_IPC_OP_SET_ATTRS);
-    request.arg0 = mask;
-    request.arg1 = atime_secs as u64;
-    request.arg2 = mtime_secs as u64;
-    request.arg3 = nanos;
-    request.flags = (flags & linux_abi::AT_SYMLINK_NOFOLLOW) as u32;
     let path = if path_ptr == 0 {
         None
     } else {
@@ -252,48 +471,65 @@ pub fn syscall_linux_vfs_utimensat(dirfd: u64, path_ptr: u64, times_ptr: u64, fl
             Err(errno) => return linux_errno(errno),
         }
     };
-    let by_descriptor = match &path {
-        None => true,
-        Some(path) => path.is_empty() && flags & linux_abi::AT_EMPTY_PATH != 0,
+    set_vfs_times(dirfd, path.as_deref(), flags, atime, mtime)
+}
+
+pub fn syscall_linux_vfs_utime(path_ptr: u64, times_ptr: u64) -> u64 {
+    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
+        Ok(path) => path,
+        Err(errno) => return linux_errno(errno),
     };
-    if by_descriptor {
-        // `futimens`: vfsd addresses the open description's node, which still
-        // exists after the name was unlinked.
-        let Some((remote, rights)) = current_remote_vfs_handle_with_rights(dirfd) else {
-            return linux_errno(if current_kernel_handle(dirfd).is_some() {
-                LINUX_EOPNOTSUPP
-            } else {
-                LINUX_EBADF
-            });
+    let (atime, mtime) = if times_ptr == 0 {
+        (TimeSpec::Now, TimeSpec::Now)
+    } else {
+        let times = match usermem::read_current_user_struct::<[i64; 2]>(times_ptr) {
+            Ok(times) => times,
+            Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
         };
-        if !rights.allows_read() && !rights.allows_write() {
-            return linux_errno(LINUX_EBADF);
+        (TimeSpec::Set(times[0], 0), TimeSpec::Set(times[1], 0))
+    };
+    set_vfs_times(linux_abi::AT_FDCWD as u64, Some(&path), 0, atime, mtime)
+}
+
+pub fn syscall_linux_vfs_futimesat(dirfd: u64, path_ptr: u64, times_ptr: u64) -> u64 {
+    let path = if path_ptr == 0 {
+        None
+    } else {
+        match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
+            Ok(path) => Some(path),
+            Err(errno) => return linux_errno(errno),
         }
-        request.fd = dirfd;
-        request.remote_id = remote.remote_id();
-    } else if let Some(path) = &path {
-        if path.is_empty() {
-            return linux_errno(LINUX_ENOENT);
+    };
+    let (atime, mtime) = if times_ptr == 0 {
+        (TimeSpec::Now, TimeSpec::Now)
+    } else {
+        let times = match usermem::read_current_user_struct::<[linux_abi::LinuxTimeval; 2]>(
+            times_ptr,
+        ) {
+            Ok(times) => times,
+            Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        };
+        let decoded = decode_utime_timeval(times[0].tv_sec, times[0].tv_usec)
+            .and_then(|a| decode_utime_timeval(times[1].tv_sec, times[1].tv_usec).map(|m| (a, m)));
+        match decoded {
+            Ok(pair) => pair,
+            Err(errno) => return linux_errno(errno),
         }
-        if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, path) {
-            return linux_errno(errno);
-        }
-    }
-    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
-    {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    };
+    set_vfs_times(dirfd, path.as_deref(), 0, atime, mtime)
 }
 
 // ---------------------------------------------------------------------------
 // sendfile / copy_file_range
 // ---------------------------------------------------------------------------
 
-/// One end of a bulk copy: a regular VFS file or a memfd.
+/// One end of a bulk copy: a regular VFS file, memfd, or (for `sendfile`
+/// output) a pipe or socket.
 enum CopyEnd {
     Remote { fd: u64, remote_id: u64 },
     Memfd(multitask::MemfdHandle),
+    Pipe(u64),
+    Socket { fd: u64, snapshot: SocketSnapshot },
 }
 
 impl CopyEnd {
@@ -304,6 +540,8 @@ impl CopyEnd {
         match self {
             CopyEnd::Remote { remote_id, .. } => (0, *remote_id),
             CopyEnd::Memfd(memfd) => (1, memfd.object_id()),
+            CopyEnd::Pipe(fd) => (2, *fd),
+            CopyEnd::Socket { snapshot, .. } => (3, snapshot.token()),
         }
     }
 
@@ -312,6 +550,8 @@ impl CopyEnd {
         match self {
             CopyEnd::Remote { remote_id, .. } => (0, *remote_id),
             CopyEnd::Memfd(memfd) => (1, memfd.token_id()),
+            CopyEnd::Pipe(fd) => (2, *fd),
+            CopyEnd::Socket { snapshot, .. } => (3, snapshot.token()),
         }
     }
 
@@ -324,6 +564,7 @@ impl CopyEnd {
                 let offset = usize::try_from(offset).map_err(|_| LINUX_EINVAL)?;
                 Ok(memfd.read_at(offset, dest))
             }
+            CopyEnd::Pipe(_) | CopyEnd::Socket { .. } => Err(LINUX_EINVAL),
         }
     }
 
@@ -367,6 +608,7 @@ impl CopyEnd {
                 let offset = usize::try_from(offset).map_err(|_| LINUX_EINVAL)?;
                 memfd.write_at(offset, data).map_err(memfd_error_to_linux_errno)
             }
+            CopyEnd::Pipe(_) | CopyEnd::Socket { .. } => Err(LINUX_EINVAL),
         }
     }
 
@@ -394,6 +636,7 @@ impl CopyEnd {
                 };
                 memfd.seek(offset as i64, whence).map_err(|_| LINUX_EINVAL)
             }
+            CopyEnd::Pipe(_) | CopyEnd::Socket { .. } => Err(LINUX_ESPIPE),
         }
     }
 
@@ -415,6 +658,10 @@ impl CopyEnd {
                 Ok(response.value as usize)
             }
             CopyEnd::Memfd(memfd) => memfd.write_from(data).map_err(memfd_error_to_linux_errno),
+            CopyEnd::Pipe(fd) => {
+                super::local_fd::pipe_write_bytes(*fd, data).ok_or(LINUX_EBADF)?
+            }
+            CopyEnd::Socket { fd, snapshot } => netd_socket_write_bytes(snapshot, *fd, data),
         }
     }
 }
@@ -680,16 +927,34 @@ pub fn syscall_linux_vfs_copy_file_range(
     copied
 }
 
+fn resolve_sendfile_out_end(fd: u64) -> Result<CopyEnd, i64> {
+    match resolve_copy_end(fd, false) {
+        Ok((end, _)) => Ok(end),
+        Err(LINUX_EINVAL) => {
+            if let Some(pipe_check) = super::local_fd::check_pipe_write_fd(fd) {
+                pipe_check.map(|()| CopyEnd::Pipe(fd))
+            } else if let Some(snapshot) = snapshot_socket(fd) {
+                if current_fd_allows_write(fd) {
+                    Ok(CopyEnd::Socket { fd, snapshot })
+                } else {
+                    Err(LINUX_EBADF)
+                }
+            } else {
+                Err(LINUX_EINVAL)
+            }
+        }
+        Err(errno) => Err(errno),
+    }
+}
+
 pub fn syscall_linux_vfs_sendfile(out_fd: u64, in_fd: u64, offset_ptr: u64, count: u64) -> u64 {
-    // The source must be a seekable regular file; any non-file destination
-    // (socket, pipe, tty) is `EINVAL` here because the bounce buffer lives in
-    // the kernel and only VFS files and memfds have a kernel-buffer write.
-    // Callers (libc, coreutils) fall back to read/write on `EINVAL`.
+    // The source must be a seekable regular file; the destination may be a
+    // regular file, memfd, pipe write end, or socket.
     let (mut src, _) = match resolve_copy_end(in_fd, true) {
         Ok(end) => end,
         Err(errno) => return linux_errno(errno),
     };
-    let (mut dst, _) = match resolve_copy_end(out_fd, false) {
+    let mut dst = match resolve_sendfile_out_end(out_fd) {
         Ok(end) => end,
         Err(errno) => return linux_errno(errno),
     };
@@ -829,6 +1094,35 @@ mod tests {
         assert!(!remote_rights(Directory, linux_abi::O_PATH | linux_abi::O_DIRECTORY).allows_read());
         assert!(remote_rights(Directory, linux_abi::O_RDONLY | linux_abi::O_DIRECTORY).allows_read());
         assert!(remote_rights(Device, linux_abi::O_WRONLY).allows_read());
+    }
+
+    #[test]
+    fn fchownat_and_linkat_flags_gate_known_bits() {
+        assert_eq!(fchownat_flags(0), Ok((false, 0)));
+        assert_eq!(
+            fchownat_flags(linux_abi::AT_SYMLINK_NOFOLLOW | linux_abi::AT_EMPTY_PATH),
+            Ok((true, VFS_CHOWN_FLAG_NOFOLLOW))
+        );
+        assert_eq!(fchownat_flags(0x4000_0000), Err(LINUX_EINVAL));
+
+        assert_eq!(linkat_flags(0), Ok((false, 0)));
+        assert_eq!(
+            linkat_flags(linux_abi::AT_SYMLINK_FOLLOW | linux_abi::AT_EMPTY_PATH),
+            Ok((true, linux_abi::AT_SYMLINK_FOLLOW))
+        );
+        assert_eq!(linkat_flags(linux_abi::AT_SYMLINK_NOFOLLOW), Err(LINUX_EINVAL));
+        assert_eq!(linkat_flags(0x4000_0000), Err(LINUX_EINVAL));
+    }
+
+    #[test]
+    fn utime_timeval_converts_micros_and_rejects_out_of_range() {
+        assert_eq!(decode_utime_timeval(10, 0), Ok(TimeSpec::Set(10, 0)));
+        assert_eq!(
+            decode_utime_timeval(-3, 999_999),
+            Ok(TimeSpec::Set(-3, 999_999_000))
+        );
+        assert_eq!(decode_utime_timeval(0, -1), Err(LINUX_EINVAL));
+        assert_eq!(decode_utime_timeval(0, 1_000_000), Err(LINUX_EINVAL));
     }
 
     #[test]

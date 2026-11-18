@@ -18,6 +18,51 @@ pub fn owner(fs: FsMetadata, cred: Credentials) -> bool { cred.uid == 0 || cred.
 pub fn set_times_allowed(fs: FsMetadata, cred: Credentials, both_now: bool) -> bool {
     owner(fs, cred) || (both_now && permits(fs, cred, 2))
 }
+/// Caller identity that `chown(2)` and hard-link protection judge. The kernel
+/// keeps no supplementary groups, so group membership is the real or
+/// effective primary group.
+#[derive(Clone, Copy)]
+pub struct OwnerCredentials { pub euid: u32, pub egid: u32, pub gid: u32 }
+
+/// Linux `chown_ok`/`chgrp_ok`: root (`CAP_CHOWN`) may set any owner and
+/// group; the file's owner may only keep the owner and move the group to one
+/// it belongs to (or leave it). `None` is "unchanged".
+pub fn chown_allowed(
+    owner_uid: u32,
+    owner_gid: u32,
+    cred: OwnerCredentials,
+    new_uid: Option<u32>,
+    new_gid: Option<u32>,
+) -> bool {
+    if cred.euid == 0 {
+        return true;
+    }
+    if let Some(uid) = new_uid {
+        if !(cred.euid == owner_uid && uid == owner_uid) {
+            return false;
+        }
+    }
+    if let Some(gid) = new_gid {
+        let member = gid == cred.egid || gid == cred.gid || gid == owner_gid;
+        if !(cred.euid == owner_uid && member) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Linux `protected_hardlinks`: a caller that does not own the file may link
+/// only a plain regular file without set-id bits that it can read and write.
+pub fn hardlink_source_allowed(fs: FsMetadata, cred: Credentials) -> bool {
+    if cred.uid == 0 || cred.uid == fs.uid {
+        return true;
+    }
+    let plain = fs.kind == storage_core::FsNodeKind::File
+        && fs.mode & 0o4000 == 0
+        && !(fs.mode & 0o2000 != 0 && fs.mode & 0o010 != 0);
+    plain && permits(fs, cred, 6)
+}
+
 pub fn sticky_allows(dir: FsMetadata, victim: FsMetadata, cred: Credentials) -> bool {
     dir.mode & 0o1000 == 0 || owner(dir, cred) || cred.uid == victim.uid
 }
@@ -62,4 +107,37 @@ mod tests {
         assert!(!owner(socket, stranger));
     }
 
+
+    #[test]
+    fn chown_is_root_only_for_owner_and_owner_only_for_group() {
+        let user = OwnerCredentials { euid: 1000, egid: 100, gid: 100 };
+        let root = OwnerCredentials { euid: 0, egid: 0, gid: 0 };
+        assert!(chown_allowed(1000, 100, root, Some(5), Some(6)));
+        // The owner cannot give the file away, but may keep it.
+        assert!(!chown_allowed(1000, 100, user, Some(5), None));
+        assert!(chown_allowed(1000, 100, user, Some(1000), None));
+        // Group: own group yes, a foreign one no, the file's current one yes.
+        assert!(chown_allowed(1000, 100, user, None, Some(100)));
+        assert!(!chown_allowed(1000, 100, user, None, Some(7)));
+        assert!(chown_allowed(1000, 7, user, None, Some(7)));
+        // A non-owner may change nothing, not even toward its own group.
+        assert!(!chown_allowed(2000, 100, user, None, Some(100)));
+        assert!(!chown_allowed(2000, 100, user, Some(1000), None));
+        assert!(chown_allowed(2000, 100, user, None, None));
+        // Real gid counts as membership.
+        let real = OwnerCredentials { euid: 1000, egid: 100, gid: 200 };
+        assert!(chown_allowed(1000, 5, real, None, Some(200)));
+    }
+
+    #[test]
+    fn protected_hardlinks_demand_rw_on_plain_files_of_others() {
+        let user = Credentials { uid: 1000, gid: 1000 };
+        assert!(hardlink_source_allowed(meta(0o600, 1000, FsNodeKind::File), user));
+        assert!(hardlink_source_allowed(meta(0o000, 0, FsNodeKind::File), Credentials { uid: 0, gid: 0 }));
+        assert!(hardlink_source_allowed(meta(0o666, 0, FsNodeKind::File), user));
+        assert!(!hardlink_source_allowed(meta(0o644, 0, FsNodeKind::File), user));
+        assert!(!hardlink_source_allowed(meta(0o4777, 0, FsNodeKind::File), user));
+        assert!(!hardlink_source_allowed(meta(0o2777, 0, FsNodeKind::File), user));
+        assert!(!hardlink_source_allowed(meta(0o777, 0, FsNodeKind::Symlink), user));
+    }
 }

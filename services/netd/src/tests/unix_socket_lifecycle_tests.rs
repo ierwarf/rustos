@@ -471,3 +471,30 @@ fn abstract_unix_addresses_roundtrip_and_stay_distinct_from_filesystem() {
     assert_eq!(sockaddr_bind_address_from_payload(&empty), Ok(None));
     assert_eq!(sockaddr_path_from_payload(&empty), Err(libc::EINVAL));
 }
+
+#[test]
+fn filesystem_names_accept_a_full_unterminated_sun_path_and_report_it_back() {
+    let make_req = |sun_path: &[u8]| {
+        let mut req = NetdIpcRequest::default();
+        req.payload[..2].copy_from_slice(&(linux_abi::AF_UNIX as u16).to_ne_bytes());
+        req.payload[2..2 + sun_path.len()].copy_from_slice(sun_path);
+        req.payload_len = (2 + sun_path.len()) as u32;
+        req
+    };
+    let mut full = vec![b'/'];
+    full.extend(std::iter::repeat(b'a').take(linux_abi::UNIX_PATH_MAX - 1));
+    let address = sockaddr_path_from_payload(&make_req(&full)).unwrap();
+    assert_eq!(address, UnixAddress::Filesystem(String::from_utf8(full.clone()).unwrap()));
+    let mut response = NetdIpcResponse::default();
+    assert_eq!(sockaddr_payload(Some(&address), &mut response), Ok(0));
+    assert_eq!(response.payload_len as usize, 2 + linux_abi::UNIX_PATH_MAX);
+    assert_eq!(&response.payload[2..2 + full.len()], &full[..]);
+    // One byte shorter keeps its NUL; one byte longer is EINVAL.
+    let short = &full[..full.len() - 1];
+    let short_address = sockaddr_path_from_payload(&make_req(short)).unwrap();
+    assert_eq!(sockaddr_payload(Some(&short_address), &mut response), Ok(0));
+    assert_eq!(response.payload_len as usize, 2 + short.len() + 1);
+    let mut over = full.clone();
+    over.push(b'a');
+    assert_eq!(sockaddr_path_from_payload(&make_req(&over)), Err(libc::EINVAL));
+}

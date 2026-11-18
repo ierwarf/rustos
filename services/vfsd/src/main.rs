@@ -39,8 +39,10 @@ use rustos_svc_runtime::syscall::monotonic_nanos;
 use rustos_user_abi::deadline::AbsoluteDeadline;
 use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::syscall::{
-    LifecycleDrainBrokerArgs, LifecycleEventWire, LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
-    LIFECYCLE_DRAIN_MAX_EVENTS, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER, waitset_claim_shape_valid, CommercialMaxCapabilityLeaseWire,
+    LifecycleDrainBrokerArgs, LifecycleEventWire, LifecyclePidProbeWire, ProcFactsBrokerArgs,
+    LIFECYCLE_BROKER_MODE_PROBE_PIDS, LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
+    LIFECYCLE_DRAIN_MAX_EVENTS, PROC_FACTS_BROKER_ABI_VERSION, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+    SYS_RUSTOS_PROC_FACTS_BROKER, waitset_claim_shape_valid, CommercialMaxCapabilityLeaseWire,
     CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
     CommercialMaxProtocolResponse, IpcReplyWithHandlesArgs, ServiceCheckpointRecordWire,
     VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse, VfsIpcRequest, VfsIpcResponse,
@@ -73,6 +75,7 @@ use rustos_user_abi::syscall::{
     VFS_IPC_OP_SET_ATTRS, VFS_IPC_OP_STATFS, VFS_IPC_OP_STATX, VFS_IPC_OP_SYMLINKAT,
     VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE, VFS_IPC_OP_MKNOD, VFS_IPC_OP_CHMOD,
     VFS_IPC_OP_FCHMOD, VFS_IPC_OP_FALLOCATE, VFS_IPC_OP_FILE_LOCK, VFS_IPC_OP_SHARED_BACKING,
+    VFS_IPC_OP_CHOWN, VFS_IPC_OP_FCHOWN, VFS_IPC_OP_LINKAT,
     VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY, VFS_POLL_QUERY_EPOLL_CREATE,
     VFS_EPOLL_CLAIM_MAX, VFS_POLL_BATCH_MAX, VFS_POLL_QUERY_EPOLL_CLAIM, VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT,
     VFS_POLL_QUERY_EPOLL_RETIRE, VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_POLL,
@@ -248,6 +251,11 @@ fn linux_response_for_op(op: u16) -> LinuxSyscallOffloadResponse {
 fn vfs_request_identity_admitted(request: &VfsIpcRequest, sender_pid: u64, sender_tid: u64) -> bool {
     if request.pid == sender_pid && request.tid == sender_tid {
         return true;
+    }
+    // loaderd's exec broker releases the exec'ing process's POSIX locks when a
+    // CLOEXEC descriptor is closed; only the live loaderd owner may name a pid.
+    if vfsd::lock_release_proxy_shape(request, sender_pid, sender_tid) {
+        return rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_LOADERD, sender_pid) >= 0;
     }
     vfsd::client_proxy_shape(request.op, request.pid, request.tid, sender_pid, sender_tid)
         && rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_LINUX_SYSCALLD, sender_pid) >= 0
@@ -646,6 +654,156 @@ fn demote_after_ui_bootstrap_snapshot_reply() {
     }
 }
 
+pub(crate) fn pull_proc_facts(op: u16, pid: u64, tid: u64) -> Option<Vec<u8>> {
+    let mut out = alloc::vec![0_u8; rustos_user_abi::procfs::PROC_SNAPSHOT_MAX_BYTES];
+    let mut out_len = 0_u32;
+    let args = ProcFactsBrokerArgs {
+        abi_version: PROC_FACTS_BROKER_ABI_VERSION,
+        op,
+        flags: 0,
+        pid,
+        tid,
+        out_ptr: out.as_mut_ptr() as u64,
+        out_capacity: out.len() as u32,
+        reserved0: 0,
+        out_len_ptr: &mut out_len as *mut u32 as u64,
+    };
+    // SAFETY: `args`, `out`, and `out_len` are live and exclusively owned by
+    // this stack frame for the synchronous broker syscall.
+    let ret = unsafe {
+        rustos_svc_runtime::syscall::syscall1(
+            SYS_RUSTOS_PROC_FACTS_BROKER,
+            (&args as *const ProcFactsBrokerArgs) as u64,
+        )
+    };
+    if ret < 0 {
+        return None;
+    }
+    let len = (out_len as usize).min(out.len());
+    out.truncate(len);
+    Some(out)
+}
+
+static PROC_SNAPSHOTS: spin::Mutex<BTreeMap<u64, Vec<u8>>> = spin::Mutex::new(BTreeMap::new());
+
+pub(crate) fn insert_proc_snapshot(id: u64, bytes: Vec<u8>) {
+    PROC_SNAPSHOTS.lock().insert(id, bytes);
+}
+
+pub(crate) fn read_proc_snapshot_range(id: u64, start: u64, dest: &mut [u8]) -> Option<usize> {
+    let guard = PROC_SNAPSHOTS.lock();
+    let bytes = guard.get(&id)?;
+    Some(copy_file_cache_range(bytes, start, dest))
+}
+
+pub(crate) fn has_proc_snapshot(id: u64) -> bool {
+    PROC_SNAPSHOTS.lock().contains_key(&id)
+}
+
+pub(crate) fn remove_proc_snapshot(id: u64) {
+    PROC_SNAPSHOTS.lock().remove(&id);
+}
+
+pub(crate) fn format_kernel_proc_snapshot(
+    pid: u64,
+    tid: u64,
+    node: rustos_user_abi::procfs::ProcKernelNode,
+    number: u64,
+) -> Result<Vec<u8>, i32> {
+    use rustos_user_abi::procfs::{ProcKernelNode as Node, PROC_SNAPSHOT_MAX_BYTES};
+    use rustos_user_abi::syscall::{PROC_FACTS_OP_PROCESS, PROC_FACTS_OP_THREAD};
+    use vfsd::proc_snapshot as snap;
+
+    let need_process = matches!(
+        node,
+        Node::Maps
+            | Node::Smaps
+            | Node::Status
+            | Node::Stat
+            | Node::Statm
+            | Node::OomScoreAdj
+            | Node::TaskStat
+            | Node::TaskStatus
+    );
+    let need_thread = matches!(
+        node,
+        Node::Status
+            | Node::Stat
+            | Node::Comm
+            | Node::TaskStat
+            | Node::TaskComm
+            | Node::TaskStatus
+    );
+    let process = if need_process {
+        let raw = pull_proc_facts(PROC_FACTS_OP_PROCESS, pid, 0).ok_or(ENOENT)?;
+        Some(snap::decode_process_facts(&raw).ok_or(EIO)?)
+    } else {
+        None
+    };
+    let target_tid = match node {
+        Node::TaskStat | Node::TaskComm | Node::TaskStatus => number,
+        _ => tid,
+    };
+    let thread = if need_thread {
+        let raw = pull_proc_facts(PROC_FACTS_OP_THREAD, pid, target_tid).ok_or(ENOENT)?;
+        Some(snap::decode_thread_facts(&raw).ok_or(EIO)?)
+    } else {
+        None
+    };
+    let bytes = match node {
+        Node::Maps => snap::format_maps(&process.as_ref().ok_or(EIO)?.regions),
+        Node::Smaps => snap::format_smaps(&process.as_ref().ok_or(EIO)?.regions),
+        Node::Status | Node::TaskStatus => {
+            snap::format_status(process.as_ref().ok_or(EIO)?, thread.as_ref().ok_or(EIO)?)
+        }
+        Node::Stat | Node::TaskStat => {
+            snap::format_stat(process.as_ref().ok_or(EIO)?, thread.as_ref().ok_or(EIO)?)
+        }
+        Node::Statm => snap::format_statm(process.as_ref().ok_or(EIO)?),
+        Node::Comm | Node::TaskComm => snap::format_comm(thread.as_ref().ok_or(EIO)?),
+        Node::OomScoreAdj => snap::format_oom_score_adj(process.as_ref().ok_or(EIO)?),
+        _ => return Err(EINVAL),
+    };
+    if bytes.len() > PROC_SNAPSHOT_MAX_BYTES {
+        return Err(EOVERFLOW);
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn probe_lifecycle_pids(pids: &[u64]) -> Option<Vec<u64>> {
+    let mut incarnations = Vec::with_capacity(pids.len());
+    for chunk in pids.chunks(LIFECYCLE_DRAIN_MAX_EVENTS) {
+        let mut entries = [LifecyclePidProbeWire::default(); LIFECYCLE_DRAIN_MAX_EVENTS];
+        for (slot, &pid) in entries.iter_mut().zip(chunk.iter()) {
+            slot.pid = pid;
+        }
+        let mut count = 0_u32;
+        let args = LifecycleDrainBrokerArgs {
+            abi_version: LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
+            mode: LIFECYCLE_BROKER_MODE_PROBE_PIDS,
+            out_events_ptr: entries.as_mut_ptr() as u64,
+            out_capacity: chunk.len() as u32,
+            out_count_ptr: &mut count as *mut u32 as u64,
+            ..LifecycleDrainBrokerArgs::default()
+        };
+        // SAFETY: `args` and the buffers it names are live and exclusively
+        // owned by this frame for the whole synchronous call.
+        let ret = unsafe {
+            rustos_svc_runtime::syscall::syscall1(
+                SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+                (&args as *const LifecycleDrainBrokerArgs) as u64,
+            )
+        };
+        if ret < 0 {
+            return None;
+        }
+        for entry in &entries[..chunk.len()] {
+            incarnations.push(entry.incarnation);
+        }
+    }
+    Some(incarnations)
+}
+
 impl VfsState {
     /// Applies every queued exit/fork before the next request is interpreted,
     /// so cwd ownership follows process lifetime in kernel order (see
@@ -673,6 +831,8 @@ impl VfsState {
             // At least one exit/fork was lost, so no pid's cwd can be trusted
             // to belong to its current process: forget them all (default `/`).
             self.cwd.clear();
+            self.locks
+                .verify_all_owners(monotonic_nanos(), &mut probe_lifecycle_pids);
             ipc::debug_line("vfsd: lifecycle evidence overflow; cwd table reset");
             return;
         }
@@ -750,6 +910,8 @@ pub(crate) enum RemoteKind {
     Symlink,
     /// Memory-filesystem socket inode; only ever stat'ed/listed, never a handle.
     Socket,
+    /// Memory-filesystem FIFO inode (`S_IFIFO`); metadata/namespace only.
+    Fifo,
 }
 
 impl RemoteKind {
@@ -759,6 +921,7 @@ impl RemoteKind {
             FsNodeKind::Directory => RemoteKind::Directory,
             FsNodeKind::Symlink => RemoteKind::Symlink,
             FsNodeKind::Socket => RemoteKind::Socket,
+            FsNodeKind::Fifo => RemoteKind::Fifo,
         }
     }
 }

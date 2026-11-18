@@ -4,7 +4,9 @@
 use super::*;
 
 use rustos_user_abi::syscall::{ServiceCapability,
-    LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LifecycleDrainBrokerArgs,
+    LIFECYCLE_BROKER_MODE_DRAIN, LIFECYCLE_BROKER_MODE_PROBE_PIDS,
+    LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS, LifecycleDrainBrokerArgs,
+    LifecyclePidProbeWire,
     ROOTD_MEMORY_BROKER_ABI_VERSION, ROOTD_MEMORY_CENSUS_MAX_ENTRIES,
     ROOTD_TERMINATE_BROKER_ABI_VERSION, RootdMemoryCensusEntry, RustosRootdMemoryBrokerArgs,
     RustosRootdTerminateBrokerArgs,
@@ -114,10 +116,70 @@ fn rootd_terminate_args_are_valid(args: &RustosRootdTerminateBrokerArgs) -> bool
 
 fn lifecycle_drain_args_are_valid(args: &LifecycleDrainBrokerArgs) -> bool {
     args.abi_version == LIFECYCLE_DRAIN_BROKER_ABI_VERSION
-        && args.reserved0 == 0
+        && matches!(args.mode, LIFECYCLE_BROKER_MODE_DRAIN | LIFECYCLE_BROKER_MODE_PROBE_PIDS)
         && args.reserved1 == 0
         && args.reserved2 == 0
 }
+
+// BEGIN lifecycle-pid-probe
+/// Shape of a `LIFECYCLE_BROKER_MODE_PROBE_PIDS` request (mode and version are
+/// checked by [`lifecycle_drain_args_are_valid`]).
+fn lifecycle_probe_args_are_valid(args: &LifecycleDrainBrokerArgs) -> bool {
+    args.mode == LIFECYCLE_BROKER_MODE_PROBE_PIDS
+        && args.out_capacity != 0
+        && args.out_capacity as usize <= LIFECYCLE_DRAIN_MAX_EVENTS
+        && args.out_events_ptr != 0
+        && args.out_count_ptr != 0
+}
+
+/// Identity of the live process `pid`: its start time (kept across `exec`),
+/// forced non-zero; `0` for a pid that is absent or already exiting. The
+/// process-table accessor only sees a visible (not yet sealed for exit)
+/// process, which is exactly "its exit event has not been produced yet or is
+/// being produced right now".
+fn process_incarnation(pid: u64) -> u64 {
+    if pid == 0 {
+        return 0;
+    }
+    multitask::with_process_state_by_pid(pid, |state| state.start_ns().max(1)).unwrap_or(0)
+}
+
+/// Fills in every entry's incarnation; returns how many processes are live.
+fn fill_probe_incarnations(
+    entries: &mut [LifecyclePidProbeWire],
+    incarnation_of: impl Fn(u64) -> u64,
+) -> u32 {
+    let mut live = 0_u32;
+    for entry in entries.iter_mut() {
+        entry.incarnation = incarnation_of(entry.pid);
+        live += u32::from(entry.incarnation != 0);
+    }
+    live
+}
+
+fn probe_lifecycle_pids(args: &LifecycleDrainBrokerArgs) -> Result<u64, i64> {
+    if !lifecycle_probe_args_are_valid(args) {
+        return Err(LINUX_EINVAL);
+    }
+    let count = args.out_capacity as usize;
+    let stride = core::mem::size_of::<LifecyclePidProbeWire>() as u64;
+    let mut entries = [LifecyclePidProbeWire::default(); LIFECYCLE_DRAIN_MAX_EVENTS];
+    for (index, slot) in entries[..count].iter_mut().enumerate() {
+        let ptr = args
+            .out_events_ptr
+            .checked_add(index as u64 * stride)
+            .ok_or(LINUX_EINVAL)?;
+        *slot = usermem::read_current_user_struct::<LifecyclePidProbeWire>(ptr)
+            .map_err(user_pointer_error_to_linux_errno)?;
+    }
+    let live = fill_probe_incarnations(&mut entries[..count], process_incarnation);
+    usermem::write_current_user_slice(args.out_events_ptr, &entries[..count])
+        .map_err(user_pointer_error_to_linux_errno)?;
+    usermem::write_current_user_bytes(args.out_count_ptr, &live.to_le_bytes())
+        .map_err(user_pointer_error_to_linux_errno)?;
+    Ok(u64::from(live))
+}
+// END lifecycle-pid-probe
 
 pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 {
     let is_process_policy =
@@ -136,6 +198,17 @@ pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 
     };
     if !lifecycle_drain_args_are_valid(&args) {
         return linux_errno(LINUX_EINVAL);
+    }
+    if args.mode == LIFECYCLE_BROKER_MODE_PROBE_PIDS {
+        // Liveness is vfsd's lock-owner evidence; no other consumer has a use
+        // for it, so a capability held only for a drain gets nothing here.
+        if !is_vfs_policy {
+            return linux_errno(LINUX_EPERM);
+        }
+        return match probe_lifecycle_pids(&args) {
+            Ok(live) => live,
+            Err(errno) => linux_errno(errno),
+        };
     }
     let consumer = if is_root_supervisor {
         offload_ops::LifecycleConsumer::RootSupervisor
@@ -315,16 +388,18 @@ pub(super) fn syscall_linux_rustos_rootd_memory_broker(args_ptr: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MemoryPressureStats, build_memory_reply, lifecycle_drain_args_are_valid,
-        memory_census_fault_gate,
-        retired_process_fault_vector, rootd_memory_args_are_valid, rootd_terminate_args_are_valid,
+        MemoryPressureStats, build_memory_reply, fill_probe_incarnations,
+        lifecycle_drain_args_are_valid, lifecycle_probe_args_are_valid,
+        memory_census_fault_gate, process_incarnation, retired_process_fault_vector,
+        rootd_memory_args_are_valid, rootd_terminate_args_are_valid,
     };
     use crate::multitask;
     use rustos_user_abi::syscall::{
-        LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LifecycleDrainBrokerArgs,
-        ROOTD_MEMORY_BROKER_ABI_VERSION, ROOTD_MEMORY_CENSUS_MAX_ENTRIES,
-        ROOTD_TERMINATE_BROKER_ABI_VERSION, RustosRootdMemoryBrokerArgs,
-        RustosRootdTerminateBrokerArgs,
+        LIFECYCLE_BROKER_MODE_DRAIN, LIFECYCLE_BROKER_MODE_PROBE_PIDS,
+        LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS,
+        LifecycleDrainBrokerArgs, LifecyclePidProbeWire, ROOTD_MEMORY_BROKER_ABI_VERSION,
+        ROOTD_MEMORY_CENSUS_MAX_ENTRIES, ROOTD_TERMINATE_BROKER_ABI_VERSION,
+        RustosRootdMemoryBrokerArgs, RustosRootdTerminateBrokerArgs,
     };
 
     #[test]
@@ -355,6 +430,54 @@ mod tests {
             reserved2: 1,
             ..valid
         }));
+        assert!(!lifecycle_drain_args_are_valid(&LifecycleDrainBrokerArgs {
+            reserved1: 1,
+            ..valid
+        }));
+        assert!(!lifecycle_drain_args_are_valid(&LifecycleDrainBrokerArgs {
+            mode: 2,
+            ..valid
+        }));
+    }
+
+    #[test]
+    fn pid_probe_request_shape_is_bounded_and_needs_both_pointers() {
+        let valid = LifecycleDrainBrokerArgs {
+            abi_version: LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
+            mode: LIFECYCLE_BROKER_MODE_PROBE_PIDS,
+            out_events_ptr: 0x1000,
+            out_capacity: LIFECYCLE_DRAIN_MAX_EVENTS as u32,
+            out_count_ptr: 0x2000,
+            ..LifecycleDrainBrokerArgs::default()
+        };
+        assert!(lifecycle_drain_args_are_valid(&valid));
+        assert!(lifecycle_probe_args_are_valid(&valid));
+        for bad in [
+            LifecycleDrainBrokerArgs { out_capacity: 0, ..valid },
+            LifecycleDrainBrokerArgs { out_capacity: LIFECYCLE_DRAIN_MAX_EVENTS as u32 + 1, ..valid },
+            LifecycleDrainBrokerArgs { out_events_ptr: 0, ..valid },
+            LifecycleDrainBrokerArgs { out_count_ptr: 0, ..valid },
+            LifecycleDrainBrokerArgs { mode: LIFECYCLE_BROKER_MODE_DRAIN, ..valid },
+        ] {
+            assert!(!lifecycle_probe_args_are_valid(&bad));
+        }
+    }
+
+    #[test]
+    fn pid_probe_reports_live_incarnations_and_zero_for_dead_or_pid_zero() {
+        let mut entries = [
+            LifecyclePidProbeWire { pid: 7, incarnation: 99 },
+            LifecyclePidProbeWire { pid: 8, incarnation: 99 },
+            LifecyclePidProbeWire { pid: 0, incarnation: 99 },
+        ];
+        let live = fill_probe_incarnations(&mut entries, |pid| match pid {
+            7 => 1234,
+            _ => 0,
+        });
+        assert_eq!(live, 1);
+        // The input incarnation is never trusted or echoed.
+        assert_eq!(entries.map(|entry| entry.incarnation), [1234, 0, 0]);
+        assert_eq!(process_incarnation(0), 0);
     }
 
     #[test]

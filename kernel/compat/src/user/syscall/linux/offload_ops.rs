@@ -336,37 +336,52 @@ pub(crate) fn record_process_exec(pid: u64) {
     }
 }
 
-/// Publish a new child process to vfsd before the child can run. `pid` is the
-/// child and `parent_pid` the forking process, so vfsd can copy the parent's
-/// cwd into the child's entry before the child's first namespace request. The
-/// queue is FIFO and drained before each vfsd request, which orders this
-/// event after any earlier exit of a reused pid and before the child's first
-/// request; the parent's later `chdir` cannot overtake it.
+fn push_lifecycle_event(consumers: &[LifecycleConsumer], event: LifecycleEventWire) {
+    for consumer in consumers {
+        if !consumer.events().lock().push(event) {
+            consumer.overflowed().store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Publish a new child process to syscalld and vfsd before the child can run.
+/// `pid` is the child and `parent_pid` the forking process, so vfsd can copy
+/// the parent's cwd and syscalld can clone the parent's VMA/policy state before
+/// the child's first request. The queue is FIFO and drained before each
+/// request, which orders this event after any earlier exit of a reused pid and
+/// before the child's first request; the parent's later mutations cannot
+/// overtake it.
 pub(crate) fn record_process_fork(pid: u64, parent_pid: u64) {
-    let consumer = LifecycleConsumer::VfsPolicy;
     let event = LifecycleEventWire {
         event: LIFECYCLE_EVENT_FORK,
         pid,
         parent_pid,
         ..LifecycleEventWire::default()
     };
-    if !consumer.events().lock().push(event) {
-        consumer.overflowed().store(true, Ordering::Release);
-    }
+    push_lifecycle_event(
+        &[
+            LifecycleConsumer::LinuxSyscallPolicy,
+            LifecycleConsumer::VfsPolicy,
+        ],
+        event,
+    );
 }
 
-/// Withdraw a fork event whose child never became runnable, so vfsd drops the
-/// cwd it copied for a pid that no exit event will ever name.
+/// Withdraw a fork event whose child never became runnable, so syscalld and
+/// vfsd drop the state they cloned for a pid that no exit event will ever name.
 pub(crate) fn record_process_fork_abandoned(pid: u64) {
-    let consumer = LifecycleConsumer::VfsPolicy;
     let event = LifecycleEventWire {
         event: LIFECYCLE_EVENT_EXIT,
         pid,
         ..LifecycleEventWire::default()
     };
-    if !consumer.events().lock().push(event) {
-        consumer.overflowed().store(true, Ordering::Release);
-    }
+    push_lifecycle_event(
+        &[
+            LifecycleConsumer::LinuxSyscallPolicy,
+            LifecycleConsumer::VfsPolicy,
+        ],
+        event,
+    );
 }
 
 pub(super) fn drain_lifecycle_events(
@@ -644,5 +659,26 @@ mod tests {
     fn lifecycle_event_wire_layout_is_stable() {
         assert_eq!(core::mem::size_of::<LifecycleEventWire>(), 32);
         assert_eq!(core::mem::offset_of!(LifecycleEventWire, tid), 24);
+    }
+
+    #[test]
+    fn fork_and_abandoned_fork_reach_both_syscalld_and_vfsd() {
+        let _ = LifecycleConsumer::LinuxSyscallPolicy.events().lock().drain_prefix(64);
+        let _ = LifecycleConsumer::VfsPolicy.events().lock().drain_prefix(64);
+
+        record_process_fork(42, 7);
+        record_process_fork_abandoned(42);
+
+        for consumer in [LifecycleConsumer::LinuxSyscallPolicy, LifecycleConsumer::VfsPolicy] {
+            let mut events = consumer.events().lock();
+            assert_eq!(events.len(), 2);
+            let slice = events.prefix(2);
+            assert_eq!(slice[0].event, LIFECYCLE_EVENT_FORK);
+            assert_eq!(slice[0].pid, 42);
+            assert_eq!(slice[0].parent_pid, 7);
+            assert_eq!(slice[1].event, LIFECYCLE_EVENT_EXIT);
+            assert_eq!(slice[1].pid, 42);
+            events.drain_prefix(2);
+        }
     }
 }

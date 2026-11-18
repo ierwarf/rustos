@@ -88,6 +88,40 @@ impl Target {
     }
 }
 
+/// Whether thread `id` of process `pid` still wants to run (`R`) rather than
+/// being blocked or parked (`S`). `None` when no such live Linux user thread
+/// exists. One atomic owner-word read under the target pin.
+pub(in crate::multitask) fn thread_runnable(pid: u64, id: u64) -> Option<bool> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let target = Target::capture(id)?;
+        if target.context.process_id != Some(pid)
+            || target.context.user_abi != Some(crate::user::abi::UserAbi::Linux)
+        {
+            return None;
+        }
+        Some(runqueue::owner(target.pin.slot()).runnable)
+    })
+}
+
+/// Stores `comm` as the name of thread `id` of process `pid`.
+pub(in crate::multitask) fn set_thread_comm(
+    pid: u64,
+    id: u64,
+    comm: [u8; rustos_user_abi::linux::LINUX_TASK_COMM_LEN],
+) -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let Some(target) = Target::capture(id) else {
+            return false;
+        };
+        if target.context.process_id != Some(pid)
+            || target.context.user_abi != Some(crate::user::abi::UserAbi::Linux)
+        {
+            return false;
+        }
+        linux_thread_state::set_comm_exact(target.pin.slot(), id, comm)
+    })
+}
+
 pub(in crate::multitask) fn alive(id: u64) -> bool {
     x86_64::instructions::interrupts::without_interrupts(|| alive_in(id))
 }

@@ -1243,6 +1243,216 @@ pub fn syscall_linux_net6_with_timeout(
     arg5: u64,
     timeout_ms: Option<u64>,
 ) -> u64 {
+    let result = syscall_linux_net6_once(op, arg0, arg1, arg2, arg3, arg4, arg5, timeout_ms);
+    if result != linux_errno(LINUX_EAGAIN) || timeout_ms.is_some() {
+        return result;
+    }
+    let io_flags = match op {
+        SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => arg2,
+        SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => arg3,
+        _ => return result,
+    };
+    if io_flags & (linux_abi::MSG_DONTWAIT | libc_msg_errqueue()) != 0 {
+        return result;
+    }
+    // Only sockets whose queue netd owns locally wait here: INET receives
+    // block inside netd's worker pool, so their `EAGAIN` is already final.
+    let blocking_local = snapshot_socket(arg0).is_some_and(|snapshot| {
+        snapshot.status_flags & linux_abi::O_NONBLOCK == 0
+            && matches!(snapshot.handle, multitask::KernelHandle::Socket(_))
+    });
+    if !blocking_local {
+        return result;
+    }
+    wait_and_retry_local_receive(arg0, || {
+        syscall_linux_net6_once(op, arg0, arg1, arg2, arg3, arg4, arg5, None)
+    })
+}
+
+/// `MSG_ERRQUEUE` (0x2000) never waits either; it is not in `linux_abi`.
+const fn libc_msg_errqueue() -> u64 {
+    0x2000
+}
+
+/// `SO_RCVTIMEO` (`struct timeval`), the only socket option the wait loop
+/// reads from netd.
+const LINUX_SO_RCVTIMEO: u64 = 20;
+/// Longest single readiness wait: bounds how late a signal or a lapsed
+/// `SO_RCVTIMEO` is noticed.
+const LOCAL_RECEIVE_WAIT_SLICE_MS: u64 = 100;
+
+/// Receive timeout in milliseconds from netd (`None` = wait forever).
+fn local_receive_timeout_ms(fd: u64) -> Option<u64> {
+    let args = [linux_abi::SOL_SOCKET, LINUX_SO_RCVTIMEO, 0, 0, 0];
+    let (_, payload) = kernel_netd_raw_socket_op(SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT, fd, args, &[], Some(500)).ok()?;
+    let seconds = i64::from_ne_bytes(payload.get(0..8)?.try_into().ok()?);
+    let micros = i64::from_ne_bytes(payload.get(8..16)?.try_into().ok()?);
+    let total_us = seconds.checked_mul(1_000_000)?.checked_add(micros)?;
+    (total_us > 0).then(|| (total_us as u64).div_ceil(1000))
+}
+
+/// A blocking receive on a local (AF_UNIX / AF_NETLINK) socket that found its
+/// queue empty: netd answers `EAGAIN`, so the *caller side* of the syscall owns
+/// the wait. It parks on netd's deferred local-poll machinery (the same wait
+/// `poll`/`epoll` use) in bounded slices and retries the receive, returning
+/// `EINTR` on a deliverable signal and `EAGAIN` once `SO_RCVTIMEO` lapses.
+fn wait_and_retry_local_receive(fd: u64, mut receive: impl FnMut() -> u64) -> u64 {
+    let start = crate::arch::rtc::ticks();
+    let timeout_ms = local_receive_timeout_ms(fd);
+    loop {
+        if super::poll_epoll::has_unmasked_pending_signal() {
+            return linux_errno(LINUX_EINTR);
+        }
+        let elapsed = crate::arch::rtc::ticks()
+            .saturating_sub(start)
+            .saturating_mul(1000)
+            .saturating_div(crate::arch::rtc::ticks_per_second().max(1));
+        let slice = match timeout_ms {
+            Some(limit) if elapsed >= limit => return linux_errno(LINUX_EAGAIN),
+            Some(limit) => (limit - elapsed).min(LOCAL_RECEIVE_WAIT_SLICE_MS),
+            None => LOCAL_RECEIVE_WAIT_SLICE_MS,
+        };
+        match kernel_netd_poll_fd(fd, linux_abi::POLLIN as u32, slice.max(1)) {
+            // Readable, hung up, or the slice lapsed: either way the receive
+            // below is the authority.
+            Ok(_) => {}
+            Err(errno) if errno == LINUX_ETIMEDOUT => {}
+            Err(errno) => return linux_errno(errno),
+        }
+        let result = receive();
+        if result != linux_errno(LINUX_EAGAIN) {
+            return result;
+        }
+    }
+}
+
+pub(super) fn current_fd_allows_write(fd: u64) -> bool {
+    multitask::with_current_user_process_state(|_, _, process_state| {
+        process_state.handles().get_entry(fd).is_some_and(|entry| {
+            let rights = entry.rights();
+            match rights {
+                kernel_object::api::HandleRights::Socket(socket_rights) => {
+                    socket_rights.contains(kernel_object::api::SocketHandleRights::SEND)
+                }
+                _ => rights.allows_write(),
+            }
+        })
+    })
+    .unwrap_or(false)
+}
+
+pub(super) fn netd_socket_write_bytes(
+    snapshot: &SocketSnapshot,
+    fd: u64,
+    data: &[u8],
+) -> Result<usize, i64> {
+    if data.is_empty() {
+        return Ok(0);
+    }
+    let nonblocking = snapshot.status_flags & linux_abi::O_NONBLOCK != 0;
+    let timeout = nonblocking
+        .then_some(rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS);
+    let class = timeout.map_or(ipc_ops::ServiceIpcClass::BulkData, |_| {
+        super::ipc_helpers::deadline::netd_timeout_class(SYSCALL_OFFLOAD_OP_LINUX_SENDTO)
+    });
+    let mut operation = [0_u8; 16];
+    nucleus_core::util::random::Random::new().fill_bytes(&mut operation);
+    let mut request = NetdIpcRequest {
+        version: NETD_IPC_ABI_VERSION,
+        op: SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
+        socket_token: snapshot.token(),
+        deadline_ns: netd_deadline_after_class(class, timeout),
+        operation_hi: u64::from_le_bytes(operation[..8].try_into().unwrap()),
+        operation_lo: u64::from_le_bytes(operation[8..].try_into().unwrap()),
+        arg0: fd,
+        status_flags: snapshot.status_flags,
+        ..NetdIpcRequest::default()
+    };
+    if request.operation_hi == 0 && request.operation_lo == 0 {
+        request.operation_lo = 1;
+    }
+    if let Some(user) = multitask::current_user_snapshot() {
+        request.pid = user.process_id();
+        request.tid = user.thread_id();
+    }
+    if let Some(security) = multitask::with_current_process_credentials(|security| security) {
+        request.uid = security.uid();
+        request.gid = security.gid();
+        request.euid = security.euid();
+        request.egid = security.egid();
+    }
+    let chunk = if snapshot.is_datagram() {
+        let max_dgram = NETD_IPC_PAYLOAD_CAPACITY
+            .saturating_sub(rustos_user_abi::syscall::netd_message::HEADER_SIZE);
+        let chunk = &data[..data.len().min(max_dgram)];
+        request.payload_len = rustos_user_abi::syscall::netd_message::encode(
+            &mut request.payload,
+            chunk,
+            &[],
+            0,
+            &[],
+        )
+        .ok_or(LINUX_EMSGSIZE)? as u32;
+        chunk
+    } else {
+        let chunk = &data[..data.len().min(NETD_IPC_PAYLOAD_CAPACITY)];
+        request.payload[..chunk.len()].copy_from_slice(chunk);
+        request.payload_len = chunk.len() as u32;
+        chunk
+    };
+    let stream = match &snapshot.handle {
+        multitask::KernelHandle::Socket(socket) => loop {
+            if let Some(stream) = socket.begin_stream_send(chunk.len()) {
+                break Some(stream);
+            }
+            if nonblocking {
+                return Err(LINUX_EAGAIN);
+            }
+            if super::poll_epoll::has_unmasked_pending_signal() {
+                return Err(LINUX_EINTR);
+            }
+            match kernel_netd_poll_fd(fd, linux_abi::POLLOUT as u32, LOCAL_RECEIVE_WAIT_SLICE_MS) {
+                Ok(_) => {}
+                Err(errno) if errno == LINUX_ETIMEDOUT => {}
+                Err(errno) => return Err(errno),
+            }
+        },
+        _ => None,
+    };
+    let response = if nonblocking {
+        call_netd_ipc_request_with_timeout(
+            &request,
+            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
+        )
+        .map_err(|errno| if errno == LINUX_ETIMEDOUT { LINUX_EAGAIN } else { errno })?
+    } else {
+        call_netd_ipc_request(&request)?
+    };
+    if response.value > chunk.len() as u64 {
+        return Err(LINUX_EIO);
+    }
+    if let Some(stream) = stream
+        && !stream.commit_send(response.value as usize)
+    {
+        return Err(LINUX_ESTALE);
+    }
+    Ok(response.value as usize)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the six-argument Linux socket offload plus its completion bound"
+)]
+fn syscall_linux_net6_once(
+    op: u16,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    arg5: u64,
+    timeout_ms: Option<u64>,
+) -> u64 {
     let mut request = NetdIpcRequest {
         version: NETD_IPC_ABI_VERSION,
         op,

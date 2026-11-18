@@ -23,11 +23,18 @@
 //!   close, but only for processes that ever took a POSIX lock
 //!   ([`PosixLockPids`]), so ordinary closes cost no IPC. The notice precedes
 //!   the description reference drop, so vfsd still knows the description.
+//! - **`CLOEXEC` at `exec`:** the process-table commit closes the descriptors
+//!   while the loader (not the exec'ing process) runs the broker, so
+//!   [`note_exec_cloexec_closed`] sends the same `RELEASE_FILE` with the
+//!   exec'ing pid in `VfsIpcRequest::pid`. vfsd accepts a pid that is not the
+//!   IPC sender only from the live loaderd owner, only for a POSIX
+//!   `RELEASE_FILE` and only on the sender's own thread
+//!   (`vfsd::lock_release_proxy_shape`); an ordinary client cannot name
+//!   another pid. The notice is best effort like [`note_fd_closed`]: if vfsd is
+//!   unreachable the lock lasts until the process exits.
 //! - **Not covered:** descriptions that are not remote-VFS files (pipes,
 //!   sockets, memfd, eventfd, epoll, devices) are `EINVAL`, not silently
-//!   unlocked. `CLOEXEC` closes at `exec` run in the procd context, whose
-//!   identity vfsd must not accept for another process, so POSIX locks held
-//!   through such an fd last until the process exits.
+//!   unlocked.
 //! - **Failure:** a conflict is `EAGAIN` for `F_SETLK` (Linux may also use
 //!   `EACCES`; RustOS always reports `EAGAIN`). Table overflow is `ENOLCK`.
 
@@ -123,6 +130,35 @@ pub(super) fn note_fd_closed(handle: &multitask::KernelHandle) {
     }
     let wire = control_wire(VFS_FILE_LOCK_CMD_RELEASE_FILE, VFS_FILE_LOCK_OWNER_POSIX);
     let _ = send(0, remote.remote_id(), &wire);
+}
+
+/// Remote descriptions among `closed` (deduplicated, order kept).
+fn remote_ids_of(closed: &[multitask::KernelHandle]) -> alloc::vec::Vec<u64> {
+    let mut ids = alloc::vec::Vec::new();
+    for handle in closed {
+        if let multitask::KernelHandle::RemoteVfs(remote) = handle {
+            let id = remote.remote_id();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// `exec` of `target_pid` just closed its `CLOEXEC` descriptors `closed`. The
+/// caller is the loader, so this names the exec'ing pid explicitly (see the
+/// module docs); the descriptions are still referenced, so vfsd still knows
+/// them. The pid stays registered: the process lives on and may still hold
+/// POSIX locks through descriptors that survived the exec.
+pub(super) fn note_exec_cloexec_closed(target_pid: u64, closed: &[multitask::KernelHandle]) {
+    if target_pid == 0 || !POSIX_LOCK_PIDS.contains(target_pid) {
+        return;
+    }
+    let wire = control_wire(VFS_FILE_LOCK_CMD_RELEASE_FILE, VFS_FILE_LOCK_OWNER_POSIX);
+    for remote_id in remote_ids_of(closed) {
+        let _ = send_for(Some(target_pid), 0, remote_id, &wire);
+    }
 }
 
 // ---- wire construction (pure) --------------------------------------------
@@ -230,9 +266,27 @@ fn flock_operation(operation: u64) -> Result<(u16, bool), i64> {
 // ---- IPC ---------------------------------------------------------------------
 
 fn send(fd: u64, remote_id: u64, wire: &VfsFileLockWire) -> Result<VfsFileLockWire, i64> {
+    send_for(None, fd, remote_id, wire)
+}
+
+/// Names the process a request acts for when it is not the IPC sender. The
+/// thread stays the sender's: vfsd requires it to match.
+fn apply_proxy_pid(request: &mut VfsIpcRequest, on_behalf_pid: Option<u64>) {
+    if let Some(pid) = on_behalf_pid {
+        request.pid = pid;
+    }
+}
+
+fn send_for(
+    on_behalf_pid: Option<u64>,
+    fd: u64,
+    remote_id: u64,
+    wire: &VfsFileLockWire,
+) -> Result<VfsFileLockWire, i64> {
     // A fresh request (fresh operation id) per attempt: polling must never
     // look like a replay of an earlier one.
     let mut request = new_vfs_request(VFS_IPC_OP_FILE_LOCK);
+    apply_proxy_pid(&mut request, on_behalf_pid);
     request.fd = fd;
     request.remote_id = remote_id;
     let bytes = wire.to_bytes();
@@ -307,7 +361,17 @@ pub(super) fn fcntl(fd: u64, cmd: u64, arg: u64) -> Option<u64> {
     let (kind, owner) = classify_fcntl(cmd)?;
     Some(match fcntl_lock(fd, kind, owner, arg) {
         Ok(value) => value,
-        Err(errno) => linux_errno(errno),
+        Err(errno) => {
+            nucleus_core::debug::println_serialized(format_args!(
+                "fcntl_lock failed pid={:?} fd={} cmd={} owner={} errno={}",
+                current_pid(),
+                fd,
+                cmd,
+                owner,
+                errno
+            ));
+            linux_errno(errno)
+        }
     })
 }
 
@@ -505,6 +569,23 @@ mod tests {
         assert!(set.contains(42));
         set.remove(42);
         assert!(!set.contains(42));
+    }
+
+    #[test]
+    fn proxy_pid_replaces_only_the_pid_and_never_the_thread() {
+        let mut request = VfsIpcRequest { pid: 5, tid: 9, ..VfsIpcRequest::default() };
+        apply_proxy_pid(&mut request, None);
+        assert_eq!((request.pid, request.tid), (5, 9));
+        apply_proxy_pid(&mut request, Some(77));
+        assert_eq!((request.pid, request.tid), (77, 9));
+    }
+
+    #[test]
+    fn exec_close_of_a_process_without_posix_locks_sends_nothing() {
+        // The pid is not registered, so this must return before any IPC (the
+        // test would otherwise try to reach vfsd).
+        note_exec_cloexec_closed(0, &[]);
+        note_exec_cloexec_closed(0xdead_0001, &[]);
     }
 
     #[test]

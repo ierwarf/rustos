@@ -754,7 +754,7 @@ fn drain_lifecycle_events(
     let mut count = 0_u32;
     let args = LifecycleDrainBrokerArgs {
         abi_version: LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
-        reserved0: 0,
+        mode: 0,
         reserved1: 0,
         out_events_ptr: events.as_mut_ptr() as u64,
         out_capacity: events.len() as u32,

@@ -70,7 +70,7 @@ pub(super) fn identity_of(handle: &multitask::KernelHandle) -> Option<AnonStat> 
             size: 0,
         },
         multitask::KernelHandle::Memfd(memfd) if memfd.proc_snapshot().is_some() => {
-            return memfd.proc_snapshot().map(|info| proc_snapshot_stat(info.ino, info.directory));
+            return memfd.proc_snapshot().map(|info| proc_snapshot_stat(&info));
         }
         multitask::KernelHandle::Memfd(memfd) => AnonStat {
             dev: DEV_MEMFD,
@@ -82,17 +82,19 @@ pub(super) fn identity_of(handle: &multitask::KernelHandle) -> Option<AnonStat> 
     })
 }
 
-/// Generated procfs node: read-only, size 0 like every `/proc` file (the
-/// content length is only known by reading), ino stable per node path.
-fn proc_snapshot_stat(ino: u64, directory: bool) -> AnonStat {
+/// Generated procfs node: size 0 like every `/proc` file (the content length
+/// is only known by reading), ino and mode are the node's own, the same values
+/// vfsd reports for `stat(path)` (0644 for the writable nodes, else 0444).
+fn proc_snapshot_stat(info: &multitask::ProcSnapshotInfo) -> AnonStat {
+    let mode = match rustos_user_abi::procfs::ProcKernelNode::from_code(info.node) {
+        Some(node) => node.mode(),
+        None if info.directory => rustos_user_abi::procfs::S_IFDIR | 0o555,
+        None => rustos_user_abi::procfs::S_IFREG | 0o444,
+    };
     AnonStat {
         dev: DEV_PROCFS,
-        ino,
-        mode: if directory {
-            rustos_user_abi::procfs::S_IFDIR | 0o555
-        } else {
-            rustos_user_abi::procfs::S_IFREG | 0o444
-        },
+        ino: info.ino,
+        mode,
         size: 0,
     }
 }
@@ -172,7 +174,7 @@ pub(in crate::user::syscall::linux) fn statx(fd: u64, statx_ptr: u64) -> Option<
 pub(super) fn memfd_stat(memfd: &multitask::MemfdHandle) -> linux_abi::LinuxStat {
     let mut st = linux_abi::LinuxStat::default();
     if let Some(info) = memfd.proc_snapshot() {
-        let stat = proc_snapshot_stat(info.ino, info.directory);
+        let stat = proc_snapshot_stat(&info);
         st.st_dev = stat.dev;
         st.st_ino = stat.ino;
         st.st_mode = stat.mode;

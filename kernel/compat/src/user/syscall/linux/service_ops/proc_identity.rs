@@ -104,6 +104,7 @@ fn caller_thread(tid: u64) -> snap::ThreadFacts {
 }
 
 fn other_thread(pid: u64, tid: u64) -> Option<snap::ThreadFacts> {
+    let runnable = multitask::linux_thread_runnable_by_ids(pid, tid)?;
     let snapshot = multitask::linux_thread_snapshot_by_ids(pid, tid)?;
     let name = crate::user::syscall::linux::prctl_ops::effective_name(
         &snapshot.thread_state.comm,
@@ -112,9 +113,7 @@ fn other_thread(pid: u64, tid: u64) -> Option<snap::ThreadFacts> {
     Some(snap::ThreadFacts {
         tid,
         comm: trimmed_comm(name),
-        // The kernel does not expose another thread's run state or CPU time
-        // here, so it is reported as sleeping with none.
-        state: b'S',
+        state: if runnable { b'R' } else { b'S' },
         pending_signals: snapshot.thread_state.pending_signals,
         blocked_signals: snapshot.thread_state.signal_mask,
         utime_ticks: None,
@@ -186,6 +185,8 @@ fn gather_process(pid: u64) -> Result<snap::ProcessFacts, i64> {
             start_ticks: state.start_ns() / NS_PER_TICK,
             rss_pages: rss,
             locked_bytes: state.memlock().locked_bytes(),
+            fd_slots: Some(state.handles().slot_capacity() as u64),
+            oom_score_adj: security.oom_score_adj(),
             regions,
             brk_start,
             arg_start: startup.arg_start,
@@ -305,7 +306,7 @@ fn render(node: Node, number: u64, pid: u64) -> Result<Vec<u8>, i64> {
         Node::Stat => snap::format_stat(&gather_process(pid)?, &caller_thread(caller_tid)),
         Node::Statm => snap::format_statm(&gather_process(pid)?),
         Node::Comm => snap::format_comm(&caller_thread(caller_tid)),
-        Node::OomScoreAdj => snap::format_oom_score_adj(),
+        Node::OomScoreAdj => snap::format_oom_score_adj(&gather_process(pid)?),
         Node::Limits => snap::format_limits(&gather_limits()),
         Node::Cmdline => {
             let process = gather_process(pid)?;
@@ -358,32 +359,49 @@ fn render(node: Node, number: u64, pid: u64) -> Result<Vec<u8>, i64> {
 
 fn install_snapshot(
     link: String,
-    directory: bool,
+    node: Node,
+    number: u64,
     ino: u64,
     bytes: &[u8],
     flags: u64,
 ) -> Result<u64, i64> {
     let group = multitask::current_user_job_charge_group();
-    let memfd = multitask::MemfdHandle::new_proc_snapshot(link, directory, ino, bytes, group)
-        .map_err(memfd_error_to_linux_errno)?;
+    let memfd = multitask::MemfdHandle::new_proc_snapshot(
+        link,
+        node.is_directory(),
+        ino,
+        node.code(),
+        number,
+        bytes,
+        group,
+    )
+    .map_err(memfd_error_to_linux_errno)?;
     multitask::with_current_user_process_state_mut(|_, _, state| {
         state
             .handles_mut()
             .install_with_open_flags_and_rights(
                 multitask::KernelHandle::Memfd(memfd),
                 flags,
-                HandleRights::Memfd(snapshot_rights(flags)),
+                HandleRights::Memfd(snapshot_rights(node, flags)),
             )
             .ok_or(LINUX_EMFILE)
     })
     .unwrap_or(Err(LINUX_EBADF))
 }
 
-fn snapshot_rights(flags: u64) -> FileHandleRights {
+fn snapshot_rights(node: Node, flags: u64) -> FileHandleRights {
     if flags & linux_abi::O_PATH != 0 {
-        FileHandleRights::TRANSFER
-    } else {
-        FileHandleRights::READ.union(FileHandleRights::TRANSFER)
+        return FileHandleRights::TRANSFER;
+    }
+    if !node.is_writable() {
+        return FileHandleRights::READ.union(FileHandleRights::TRANSFER);
+    }
+    match flags & linux_abi::O_ACCMODE {
+        linux_abi::O_WRONLY => FileHandleRights::WRITE.union(FileHandleRights::TRANSFER),
+        linux_abi::O_RDWR => FileHandleRights::READ
+            .union(FileHandleRights::WRITE)
+            .union(FileHandleRights::TRANSFER),
+        _ => FileHandleRights::READ.union(FileHandleRights::TRANSFER),
     }
 }
 
@@ -400,7 +418,8 @@ pub(crate) fn complete_open(aux: u64, flags: u64) -> Option<Result<u64, i64>> {
         let bytes = render(node, number, pid)?;
         install_snapshot(
             node_link(pid, node, number),
-            node.is_directory(),
+            node,
+            number,
             abi_procfs::node_inode(pid, node, number),
             &bytes,
             flags,
@@ -482,8 +501,8 @@ fn access_node(node: Node, number: u64, mode: u64) -> Result<(), i64> {
     if node.is_link() {
         return Ok(());
     }
-    // Generated nodes are read-only; only directories are searchable.
-    if mode & W_OK != 0 || (mode & X_OK != 0 && !node.is_directory()) {
+    // Only `comm`, `task/<tid>/comm` and `oom_score_adj` are writable; only directories are searchable.
+    if (mode & W_OK != 0 && !node.is_writable()) || (mode & X_OK != 0 && !node.is_directory()) {
         return Err(LINUX_EACCES);
     }
     Ok(())
@@ -497,6 +516,364 @@ pub(crate) fn complete_readlink(aux: u64) -> Option<Result<String, i64>> {
     } else {
         Err(LINUX_EINVAL)
     })
+}
+
+const PROC_WRITE_MAX_BYTES: usize = 64;
+
+fn parse_proc_comm(bytes: &[u8]) -> [u8; linux_abi::LINUX_TASK_COMM_LEN] {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let mut trimmed = &bytes[..end];
+    while let Some(&last) = trimmed.last() {
+        if last == b'\n' || last == b'\r' {
+            trimmed = &trimmed[..trimmed.len() - 1];
+        } else {
+            break;
+        }
+    }
+    let len = trimmed.len().min(linux_abi::LINUX_TASK_COMM_LEN - 1);
+    let mut comm = [0_u8; linux_abi::LINUX_TASK_COMM_LEN];
+    comm[..len].copy_from_slice(&trimmed[..len]);
+    comm
+}
+
+fn parse_oom_score_adj(bytes: &[u8]) -> Result<i64, i64> {
+    let text = core::str::from_utf8(bytes).map_err(|_| LINUX_EINVAL)?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(LINUX_EINVAL);
+    }
+    let value: i64 = trimmed.parse().map_err(|_| LINUX_EINVAL)?;
+    if !(-1000..=1000).contains(&value) {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(value)
+}
+
+fn apply_proc_write(node: Node, number: u64, pid: u64, bytes: &[u8]) -> Result<usize, i64> {
+    match node {
+        Node::Comm | Node::TaskComm => {
+            let tid = if node == Node::Comm {
+                multitask::current_user_thread_id().ok_or(LINUX_ESRCH)?
+            } else {
+                number
+            };
+            let comm = parse_proc_comm(bytes);
+            if !multitask::set_linux_thread_comm_by_ids(pid, tid, comm) {
+                return Err(LINUX_ESRCH);
+            }
+            Ok(bytes.len())
+        }
+        Node::OomScoreAdj => {
+            let value = parse_oom_score_adj(bytes)?;
+            let updated = multitask::with_current_user_process_state_mut(|_, _, state| {
+                state.set_oom_score_adj(value)
+            })
+            .flatten();
+            if updated.is_none() {
+                return Err(LINUX_EINVAL);
+            }
+            Ok(bytes.len())
+        }
+        _ => Err(LINUX_EACCES),
+    }
+}
+
+fn validate_proc_write_len(user_len: u64) -> Result<usize, i64> {
+    let len = usize::try_from(user_len).map_err(|_| LINUX_EINVAL)?;
+    if len > PROC_WRITE_MAX_BYTES {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(len)
+}
+
+/// Completes `write`/`pwrite64` on a writable procfs snapshot memfd (`comm`,
+/// `task/<tid>/comm`, `oom_score_adj`). Returns `None` when `memfd` is not a
+/// procfs snapshot so ordinary memfds take their normal path.
+pub(crate) fn write_snapshot(
+    memfd: &multitask::MemfdHandle,
+    user_ptr: u64,
+    user_len: u64,
+) -> Option<u64> {
+    let info = memfd.proc_snapshot()?;
+    let Some(node) = abi_procfs::ProcKernelNode::from_code(info.node) else {
+        return Some(linux_errno(LINUX_EACCES));
+    };
+    if !node.is_writable() {
+        return Some(linux_errno(LINUX_EACCES));
+    }
+    if user_len == 0 {
+        return Some(0);
+    }
+    let len = match validate_proc_write_len(user_len) {
+        Ok(len) => len,
+        Err(errno) => return Some(linux_errno(errno)),
+    };
+    let mut buf = alloc::vec![0_u8; len];
+    if let Err(err) = usermem::copy_from_current_user_exact(user_ptr, &mut buf) {
+        return Some(linux_errno(user_pointer_error_to_linux_errno(err)));
+    }
+    let pid = match caller_pid() {
+        Ok(pid) => pid,
+        Err(errno) => return Some(linux_errno(errno)),
+    };
+    Some(match apply_proc_write(node, info.number, pid, &buf) {
+        Ok(written) => written as u64,
+        Err(errno) => linux_errno(errno),
+    })
+}
+
+// ---- Ring3 vfsd attested raw-facts pull broker --------------------------------------------
+
+fn encode_process_facts_wire(pid: u64) -> Result<Vec<u8>, i64> {
+    use rustos_user_abi::linux::LinuxVmaName;
+    use rustos_user_abi::pager::{VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, VM_SHARING_SHARED};
+
+    let pager = multitask::pager_vma_regions_for_process(pid).unwrap_or_default();
+    let ppid = multitask::parent_process_id_of(pid).unwrap_or(0);
+    let threads = multitask::live_user_thread_ids(pid).len().max(1) as u64;
+
+    let mut regions: Vec<snap::MapRegion> = Vec::new();
+    let mut header = multitask::with_process_state_by_pid(pid, |state| {
+        if let Some(map) = state.linux_memory_map() {
+            for area in map.areas() {
+                regions.push(snap::MapRegion {
+                    start: area.start,
+                    end: area.end,
+                    read: area.flags.read,
+                    write: area.flags.write,
+                    exec: area.flags.execute,
+                    shared: !area.flags.private,
+                    offset: area.offset,
+                    name: match &area.name {
+                        LinuxVmaName::None => None,
+                        LinuxVmaName::Path(path) => Some(path.clone()),
+                        LinuxVmaName::Label(label) => Some(String::from(*label)),
+                    },
+                });
+            }
+        }
+        let security = state.security();
+        let (brk_start, startup) = state
+            .linux_process_state()
+            .map(|linux| (linux.brk_start, linux.startup))
+            .unwrap_or_default();
+        let (mut ignored, mut caught) = (0_u64, 0_u64);
+        for signal in 1..=64_u64 {
+            if let Some(action) = state.linux_signal_action(signal) {
+                match action.handler {
+                    0 => {}
+                    1 => ignored |= 1 << (signal - 1),
+                    _ => caught |= 1 << (signal - 1),
+                }
+            }
+        }
+        let rss = crate::memory::phys::data_leaf_count(state.address_space().root_phys().as_u64());
+        abi_procfs::ProcProcessFactsWire {
+            pid,
+            ppid,
+            uid: security.uid(),
+            gid: security.gid(),
+            euid: security.euid(),
+            egid: security.egid(),
+            threads,
+            start_ticks: state.start_ns() / NS_PER_TICK,
+            rss_pages: rss,
+            locked_bytes: state.memlock().locked_bytes(),
+            fd_slots: Some(state.handles().slot_capacity() as u64),
+            oom_score_adj: security.oom_score_adj(),
+            brk_start,
+            arg_start: startup.arg_start,
+            arg_end: startup.arg_end,
+            env_start: startup.env_start,
+            env_end: startup.env_end,
+            sig_ignored: ignored,
+            sig_caught: caught,
+            no_new_privs: security.no_new_privs(),
+            region_count: 0,
+        }
+    })
+    .ok_or(LINUX_ESRCH)?;
+
+    for region in pager {
+        let overlaps = regions
+            .iter()
+            .any(|known| region.start < known.end && known.start < region.end);
+        if overlaps {
+            continue;
+        }
+        regions.push(snap::MapRegion {
+            start: region.start,
+            end: region.end,
+            read: region.prot & VM_PROT_READ != 0,
+            write: region.prot & VM_PROT_WRITE != 0,
+            exec: region.prot & VM_PROT_EXECUTE != 0,
+            shared: region.sharing == VM_SHARING_SHARED,
+            offset: region.object_offset,
+            name: None,
+        });
+    }
+    let regions = snap::merge_regions(regions);
+    header.region_count = u32::try_from(regions.len()).map_err(|_| LINUX_EOVERFLOW)?;
+
+    let mut total_len = abi_procfs::ProcProcessFactsWire::ENCODED_LEN;
+    for region in &regions {
+        let name_len = region.name.as_ref().map_or(0, |n| n.len());
+        total_len = total_len
+            .checked_add(abi_procfs::ProcMapRegionWire::HEADER_LEN + name_len)
+            .ok_or(LINUX_EOVERFLOW)?;
+    }
+    if total_len > abi_procfs::PROC_SNAPSHOT_MAX_BYTES {
+        return Err(LINUX_EOVERFLOW);
+    }
+
+    let mut out = alloc::vec![0_u8; total_len];
+    let mut at = header.encode(&mut out).ok_or(LINUX_EOVERFLOW)?;
+    for region in &regions {
+        let flags = (u8::from(region.read) * abi_procfs::PROC_REGION_READ)
+            | (u8::from(region.write) * abi_procfs::PROC_REGION_WRITE)
+            | (u8::from(region.exec) * abi_procfs::PROC_REGION_EXEC)
+            | (u8::from(region.shared) * abi_procfs::PROC_REGION_SHARED);
+        let wire = abi_procfs::ProcMapRegionWire {
+            start: region.start,
+            end: region.end,
+            offset: region.offset,
+            flags,
+            name: region.name.as_deref().map(str::as_bytes),
+        };
+        at += wire.encode(&mut out[at..]).ok_or(LINUX_EOVERFLOW)?;
+    }
+    out.truncate(at);
+    Ok(out)
+}
+
+fn encode_thread_facts_wire(pid: u64, tid: u64) -> Result<Vec<u8>, i64> {
+    if tid == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let runnable = multitask::linux_thread_runnable_by_ids(pid, tid).ok_or(LINUX_ENOENT)?;
+    let snapshot = multitask::linux_thread_snapshot_by_ids(pid, tid).ok_or(LINUX_ENOENT)?;
+    let exec = multitask::with_process_state_by_pid(pid, |s| String::from(s.exec_path()))
+        .ok_or(LINUX_ESRCH)?;
+    let name = crate::user::syscall::linux::prctl_ops::effective_name(
+        &snapshot.thread_state.comm,
+        &exec,
+    );
+    let trimmed_len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    let mut comm = [0_u8; 16];
+    let copy_len = trimmed_len.min(16);
+    comm[..copy_len].copy_from_slice(&name[..copy_len]);
+    let wire = abi_procfs::ProcThreadFactsWire {
+        tid,
+        state: if runnable { b'R' } else { b'S' },
+        comm_len: copy_len as u8,
+        comm,
+        pending_signals: snapshot.thread_state.pending_signals,
+        blocked_signals: snapshot.thread_state.signal_mask,
+        utime_ticks: None,
+    };
+    let mut out = alloc::vec![0_u8; abi_procfs::ProcThreadFactsWire::ENCODED_LEN];
+    let n = wire.encode(&mut out).ok_or(LINUX_EOVERFLOW)?;
+    out.truncate(n);
+    Ok(out)
+}
+
+fn encode_u64_list_wire(values: &[u64]) -> Result<Vec<u8>, i64> {
+    let total = 4usize
+        .checked_add(values.len().checked_mul(8).ok_or(LINUX_EOVERFLOW)?)
+        .ok_or(LINUX_EOVERFLOW)?;
+    if total > abi_procfs::PROC_SNAPSHOT_MAX_BYTES {
+        return Err(LINUX_EOVERFLOW);
+    }
+    let mut out = alloc::vec![0_u8; total];
+    let n = abi_procfs::encode_u64_list(values, &mut out).ok_or(LINUX_EOVERFLOW)?;
+    out.truncate(n);
+    Ok(out)
+}
+
+/// `SYS_RUSTOS_PROC_FACTS_BROKER`: `VfsPolicy`-gated bounded pull of attested
+/// raw `/proc/<pid>` facts so `vfsd` formats `/proc` nodes in Ring3.
+pub(in crate::user::syscall::linux) fn syscall_linux_rustos_proc_facts_broker(
+    args_ptr: u64,
+) -> u64 {
+    use rustos_user_abi::syscall::{
+        ProcFactsBrokerArgs, PROC_FACTS_BROKER_ABI_VERSION, PROC_FACTS_OP_FD_LIST,
+        PROC_FACTS_OP_LIMITS, PROC_FACTS_OP_PROCESS, PROC_FACTS_OP_THREAD,
+        PROC_FACTS_OP_TID_LIST,
+    };
+
+    if !crate::user::syscall::linux::ipc_ops::current_process_has_service_capability(
+        ServiceCapability::VfsPolicy,
+    ) {
+        return linux_errno(LINUX_EPERM);
+    }
+    let args = match usermem::read_current_user_struct::<ProcFactsBrokerArgs>(args_ptr) {
+        Ok(args) => args,
+        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
+    };
+    if args.abi_version != PROC_FACTS_BROKER_ABI_VERSION
+        || args.flags != 0
+        || args.reserved0 != 0
+        || args.pid == 0
+        || args.out_ptr == 0
+        || args.out_len_ptr == 0
+        || args.out_capacity == 0
+        || args.out_capacity as usize > abi_procfs::PROC_SNAPSHOT_MAX_BYTES
+    {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if let Err(err) =
+        usermem::validate_current_user_write_buffer(args.out_ptr, args.out_capacity as usize)
+    {
+        return linux_errno(user_pointer_error_to_linux_errno(err));
+    }
+    if let Err(err) = usermem::validate_current_user_write_buffer(args.out_len_ptr, 4) {
+        return linux_errno(user_pointer_error_to_linux_errno(err));
+    }
+
+    let encoded = match args.op {
+        PROC_FACTS_OP_PROCESS => encode_process_facts_wire(args.pid),
+        PROC_FACTS_OP_THREAD => encode_thread_facts_wire(args.pid, args.tid),
+        PROC_FACTS_OP_FD_LIST => {
+            let fds = multitask::with_process_state_by_pid(args.pid, |s| s.handles().fd_numbers())
+                .ok_or(LINUX_ESRCH);
+            fds.and_then(|list| encode_u64_list_wire(&list))
+        }
+        PROC_FACTS_OP_TID_LIST => {
+            encode_u64_list_wire(&multitask::live_user_thread_ids(args.pid))
+        }
+        PROC_FACTS_OP_LIMITS => {
+            if caller_pid().ok() != Some(args.pid) {
+                Err(LINUX_EOPNOTSUPP)
+            } else {
+                let wire = abi_procfs::ProcLimitsWire {
+                    limits: gather_limits(),
+                };
+                let mut out = alloc::vec![0_u8; abi_procfs::ProcLimitsWire::ENCODED_LEN];
+                wire.encode(&mut out)
+                    .map(|n| {
+                        out.truncate(n);
+                        out
+                    })
+                    .ok_or(LINUX_EOVERFLOW)
+            }
+        }
+        _ => Err(LINUX_EINVAL),
+    };
+    let bytes = match encoded {
+        Ok(bytes) => bytes,
+        Err(errno) => return linux_errno(errno),
+    };
+    if bytes.len() > args.out_capacity as usize {
+        return linux_errno(LINUX_EOVERFLOW);
+    }
+    if let Err(err) = usermem::write_current_user_bytes(args.out_ptr, &bytes) {
+        return linux_errno(user_pointer_error_to_linux_errno(err));
+    }
+    let len_bytes = (bytes.len() as u32).to_le_bytes();
+    if let Err(err) = usermem::write_current_user_bytes(args.out_len_ptr, &len_bytes) {
+        return linux_errno(user_pointer_error_to_linux_errno(err));
+    }
+    0
 }
 
 /// `getdents64` on a generated directory snapshot; `None` when `fd` is not one
@@ -516,25 +893,23 @@ pub(crate) fn getdents_snapshot(fd: u64, user_ptr: u64, user_len: u64) -> Option
     if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
         return Some(linux_errno(user_pointer_error_to_linux_errno(err)));
     }
-    let cursor = memfd.cursor();
-    let total = memfd.len();
-    if cursor >= total {
-        return Some(0);
+    loop {
+        let (cursor, buffer) = memfd.peek_at_cursor(user_len);
+        if buffer.is_empty() {
+            return Some(0);
+        }
+        let take = snap::whole_dirent_prefix(&buffer, user_len);
+        if take == 0 {
+            // The caller's buffer cannot hold even the next record.
+            return Some(linux_errno(LINUX_EINVAL));
+        }
+        if let Err(err) = usermem::write_current_user_bytes(user_ptr, &buffer[..take]) {
+            return Some(linux_errno(user_pointer_error_to_linux_errno(err)));
+        }
+        if memfd.advance_cursor_if(cursor, take) {
+            return Some(take as u64);
+        }
     }
-    let want = (total - cursor).min(user_len);
-    let mut buffer = alloc::vec![0_u8; want];
-    let got = memfd.read_at(cursor, &mut buffer);
-    let take = snap::whole_dirent_prefix(&buffer[..got], user_len);
-    if take == 0 {
-        // The caller's buffer cannot hold even the next record.
-        return Some(linux_errno(LINUX_EINVAL));
-    }
-    if let Err(err) = usermem::write_current_user_bytes(user_ptr, &buffer[..take]) {
-        return Some(linux_errno(user_pointer_error_to_linux_errno(err)));
-    }
-    let mut advance = memfd.clone();
-    let _ = advance.seek(take as i64, multitask::FileHandleSeekWhence::Current);
-    Some(take as u64)
 }
 
 // ---- `open("/proc/self/fd/N")` reopen -------------------------------------------------------
@@ -603,9 +978,9 @@ mod tests {
 
     #[test]
     fn snapshot_path_descriptors_have_no_read_right() {
-        assert!(!snapshot_rights(linux_abi::O_PATH).contains(FileHandleRights::READ));
-        assert!(snapshot_rights(0).contains(FileHandleRights::READ));
-        assert!(snapshot_rights(linux_abi::O_PATH).contains(FileHandleRights::TRANSFER));
+        assert!(!snapshot_rights(Node::Maps, linux_abi::O_PATH).contains(FileHandleRights::READ));
+        assert!(snapshot_rights(Node::Maps, 0).contains(FileHandleRights::READ));
+        assert!(snapshot_rights(Node::Maps, linux_abi::O_PATH).contains(FileHandleRights::TRANSFER));
     }
 
     #[test]
@@ -667,5 +1042,43 @@ mod tests {
         assert_eq!(copy_exec_path(&mut payload, "/too/long/path"), 0);
         assert_eq!(copy_exec_path(&mut payload, ""), 0);
         assert_eq!(copy_exec_path(&mut payload, "/a\0b"), 0);
+    }
+
+    #[test]
+    fn writable_proc_nodes_parse_comm_and_oom_score_adj() {
+        assert_eq!(&parse_proc_comm(b"worker\n")[..7], b"worker\0");
+        assert_eq!(
+            &parse_proc_comm(b"0123456789abcdef_extra\n")[..15],
+            b"0123456789abcde"
+        );
+        assert_eq!(parse_proc_comm(b"abc\0ignored"), [b'a', b'b', b'c', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(parse_oom_score_adj(b"0\n"), Ok(0));
+        assert_eq!(parse_oom_score_adj(b"-1000\n"), Ok(-1000));
+        assert_eq!(parse_oom_score_adj(b" 1000 \n"), Ok(1000));
+        assert_eq!(parse_oom_score_adj(b"1001\n"), Err(LINUX_EINVAL));
+        assert_eq!(parse_oom_score_adj(b"-1001\n"), Err(LINUX_EINVAL));
+        assert_eq!(parse_oom_score_adj(b"abc\n"), Err(LINUX_EINVAL));
+        assert_eq!(parse_oom_score_adj(b"   "), Err(LINUX_EINVAL));
+        assert_eq!(validate_proc_write_len(PROC_WRITE_MAX_BYTES as u64), Ok(PROC_WRITE_MAX_BYTES));
+        assert_eq!(validate_proc_write_len(PROC_WRITE_MAX_BYTES as u64 + 1), Err(LINUX_EINVAL));
+    }
+
+    #[test]
+    fn writable_proc_snapshot_rights_follow_open_mode() {
+        let ro = snapshot_rights(Node::Comm, linux_abi::O_RDONLY as u64);
+        assert!(ro.contains(FileHandleRights::READ));
+        assert!(!ro.contains(FileHandleRights::WRITE));
+
+        let wo = snapshot_rights(Node::Comm, linux_abi::O_WRONLY as u64);
+        assert!(!wo.contains(FileHandleRights::READ));
+        assert!(wo.contains(FileHandleRights::WRITE));
+
+        let rw = snapshot_rights(Node::OomScoreAdj, linux_abi::O_RDWR as u64);
+        assert!(rw.contains(FileHandleRights::READ));
+        assert!(rw.contains(FileHandleRights::WRITE));
+
+        let non_writable = snapshot_rights(Node::Status, linux_abi::O_RDWR as u64);
+        assert!(non_writable.contains(FileHandleRights::READ));
+        assert!(!non_writable.contains(FileHandleRights::WRITE));
     }
 }

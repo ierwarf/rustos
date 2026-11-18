@@ -75,6 +75,50 @@ pub(super) fn dispatch(frame: &mut SyscallFrame) -> Option<u64> {
         linux_abi::SYS_FCHMODAT2 => {
             syscall_linux_vfs_fchmodat(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }
+        linux_abi::SYS_CHOWN => syscall_linux_vfs_fchownat(
+            linux_abi::AT_FDCWD as u64,
+            frame.rdi,
+            frame.rsi,
+            frame.rdx,
+            0,
+        ),
+        linux_abi::SYS_LCHOWN => syscall_linux_vfs_fchownat(
+            linux_abi::AT_FDCWD as u64,
+            frame.rdi,
+            frame.rsi,
+            frame.rdx,
+            linux_abi::AT_SYMLINK_NOFOLLOW,
+        ),
+        linux_abi::SYS_FCHOWN => syscall_linux_vfs_fchown(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_FCHOWNAT => {
+            syscall_linux_vfs_fchownat(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+        }
+        linux_abi::SYS_MKNOD => syscall_linux_vfs_mknodat(
+            linux_abi::AT_FDCWD as u64,
+            frame.rdi,
+            frame.rsi,
+            frame.rdx,
+        ),
+        linux_abi::SYS_MKNODAT => {
+            syscall_linux_vfs_mknodat(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+        }
+        linux_abi::SYS_LINK => syscall_linux_vfs_linkat(
+            linux_abi::AT_FDCWD as u64,
+            frame.rdi,
+            linux_abi::AT_FDCWD as u64,
+            frame.rsi,
+            0,
+        ),
+        linux_abi::SYS_LINKAT => {
+            syscall_linux_vfs_linkat(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+        }
+        linux_abi::SYS_UTIME => syscall_linux_vfs_utime(frame.rdi, frame.rsi),
+        linux_abi::SYS_UTIMES => {
+            syscall_linux_vfs_futimesat(linux_abi::AT_FDCWD as u64, frame.rdi, frame.rsi)
+        }
+        linux_abi::SYS_FUTIMESAT => {
+            syscall_linux_vfs_futimesat(frame.rdi, frame.rsi, frame.rdx)
+        }
         linux_abi::SYS_UTIMENSAT => {
             syscall_linux_vfs_utimensat(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }

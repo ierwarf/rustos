@@ -486,6 +486,7 @@ struct NetState {
     next_autobind_id: u64,
     unix_queued_bytes: usize,
     inet: Option<InetStack>,
+    netlink_view: Option<netlink::InterfaceSnapshot>,
     /// Per-socket readiness generation: the newest value published for that
     /// socket. Entries exist only for live sockets, so the map is bounded by
     /// the socket tables; a missing entry reads as generation 1.
@@ -506,6 +507,7 @@ impl NetState {
             next_autobind_id: 1,
             unix_queued_bytes: 0,
             inet: None,
+            netlink_view: None,
             readiness_generations: BTreeMap::new(),
             readiness_observations: BTreeMap::new(),
             readiness_publications: Vec::new(),

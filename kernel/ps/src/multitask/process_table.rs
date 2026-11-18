@@ -440,7 +440,8 @@ pub(super) use identity::{published_live_process_identity, published_process_job
 #[cfg(test)]
 use identity::{clear_publication_for_test, process_state_is_visible};
 pub use identity::{
-    live_process_identity, live_process_identity_by_pid, retain_process, retain_process_by_pid,
+    live_process_identity, live_process_identity_by_pid, retain_all_visible_processes,
+    retain_process, retain_process_by_pid,
     ProcessHandle, ProcessIdentity, ProcessRef,
 };
 pub(super) use identity::{
@@ -811,6 +812,12 @@ pub fn with_process_state_by_pid<R>(
 ) -> Option<R> {
     let process = retain_process_by_pid(process_id)?;
     process.with_visible_state(|_, state| f(state))
+}
+
+pub fn for_each_visible_process_state_mut(mut f: impl FnMut(&mut UserProcessState)) {
+    for process in retain_all_visible_processes() {
+        process.with_visible_state_mut(|_, state| f(state));
+    }
 }
 
 /// Why staging a new exec image was refused. `SealBusy` is transient: the old

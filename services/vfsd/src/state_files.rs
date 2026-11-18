@@ -27,7 +27,7 @@ impl VfsState {
         // Kernel-fact `/proc/<pid>` nodes have no vfsd-side description: the
         // kernel builds a snapshot for the caller and holds it locally.
         if let Some(Ok(node)) = vfsd::proc_fs::lookup(path, request.pid) {
-            if let Some(aux) = vfsd::proc_fs::open_delegate(node) {
+            if let Some(aux) = vfsd::proc_fs::open_delegate_for_flags(node, request.arg0) {
                 match vfsd::proc_fs::delegated_open_errno(node, request.arg0) {
                     Some(errno) => response.status = errno,
                     None => response.aux = aux,
@@ -85,6 +85,7 @@ impl VfsState {
         match self.checkpoint_close_description(request, request.remote_id) {
             Ok(_) => {
                 if let Some(closed) = self.handles.remove(&request.remote_id) {
+                    remove_proc_snapshot(request.remote_id);
                     // Final close of the description: its OFD and flock locks.
                     self.locks.release_description(request.remote_id);
                     if closed.node != 0 {
@@ -316,26 +317,51 @@ impl VfsState {
     }
 
     /// `VFS_IPC_OP_SHARED_BACKING`: names the memfd that now holds a pinned
-    /// TmpFs file's bytes so the mapping broker can map it `MAP_SHARED`. The
-    /// description, not a path, selects the inode, so unlink/rename races
+    /// TmpFs or FAT file's bytes so the mapping broker can map it `MAP_SHARED`.
+    /// The description, not a path, selects the file, so unlink/rename races
     /// cannot redirect the mapping. A description that cannot write is refused
-    /// a writable backing here as well as in the kernel.
+    /// a writable backing here as well as in the kernel. When
+    /// `VFS_SHARED_BACKING_FLAG_SYNC` is set (`remote_id == 0`), flushes the
+    /// shared-backed FAT file identified by `arg1` (memfd object id) to disk.
     fn vfs_shared_backing(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        use rustos_user_abi::syscall::{
+            VFS_SHARED_BACKING_FLAG_SYNC, VFS_SHARED_BACKING_FLAG_WRITE,
+        };
+        if request.arg0 == VFS_SHARED_BACKING_FLAG_SYNC && request.remote_id == 0 {
+            if let Err(errno) = lock_vfs_storage().sync_shared_backing_by_object(request.arg1) {
+                response.status = errno;
+            }
+            return;
+        }
         let Some(handle) = self.handles.get(&request.remote_id) else {
             response.status = EBADF;
             return;
         };
-        if let Err(errno) = vfsd::shared_backing_admission(
-            handle.kind == RemoteKind::File,
-            request.arg0,
+        let (kind, writable, mount_id, node, path) = (
+            handle.kind,
             handle.writable,
-            handle.node != 0,
+            handle.mount_id,
+            handle.node,
+            handle.path.clone(),
+        );
+        let mut storage = lock_vfs_storage();
+        let supports_shared = node != 0 || storage.supports_shared_backing_path(path.as_str());
+        if let Err(errno) = vfsd::shared_backing_admission(
+            kind == RemoteKind::File,
+            request.arg0,
+            writable,
+            supports_shared,
         ) {
             response.status = errno;
             return;
         }
-        let (mount_id, node) = (handle.mount_id, handle.node);
-        match lock_vfs_storage().shared_backing_node(mount_id, node) {
+        let result = if node != 0 {
+            storage.shared_backing_node(mount_id, node)
+        } else {
+            let want_write = request.arg0 & VFS_SHARED_BACKING_FLAG_WRITE != 0;
+            storage.shared_backing_path(path.as_str(), want_write)
+        };
+        match result {
             Ok(backing) => {
                 response.value = backing.token;
                 response.aux = backing.object;
@@ -359,6 +385,14 @@ impl VfsState {
                 Err(errno) => response.status = errno,
             }
             return;
+        }
+        if has_proc_snapshot(request.remote_id) {
+            if let Some(Ok(node)) = vfsd::proc_fs::lookup(handle.path.as_str(), request.pid) {
+                let stat = vfsd::proc_fs::node_stat(node, request.pid, 0);
+                response.payload_len = LINUX_STAT_SIZE as u32;
+                response.payload[..LINUX_STAT_SIZE].copy_from_slice(&stat);
+                return;
+            }
         }
         let (len, inode) = if handle.kind == RemoteKind::File {
             lock_vfs_storage().live_stat_for_path(handle.path.as_str(), handle.len)
@@ -1465,6 +1499,152 @@ impl VfsState {
                 Ok(()) => storage.chmod_path(&path, request.arg0 as u32), Err(e) => e,
             };
         }
+    }
+
+    /// `(uid, gid)` of a `CHOWN`/`FCHOWN` request; `None` is "unchanged".
+    fn chown_ids(request: &VfsIpcRequest) -> Option<(Option<u32>, Option<u32>)> {
+        use rustos_user_abi::syscall::VFS_ID_UNCHANGED;
+        let id = |raw: u64| match raw {
+            VFS_ID_UNCHANGED => Some(None),
+            raw => u32::try_from(raw).ok().map(Some),
+        };
+        Some((id(request.arg0)?, id(request.arg1)?))
+    }
+
+    fn owner_credentials(request: &VfsIpcRequest) -> vfsd::permissions::OwnerCredentials {
+        vfsd::permissions::OwnerCredentials { euid: request.euid, egid: request.egid, gid: request.gid }
+    }
+
+    /// `VFS_IPC_OP_CHOWN`: owner and group of the node at a path.
+    fn vfs_chown(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some((uid, gid)) = Self::chown_ids(request) else {
+            response.status = EINVAL;
+            return;
+        };
+        if request.flags & !rustos_user_abi::syscall::VFS_CHOWN_FLAG_NOFOLLOW != 0 {
+            response.status = EINVAL;
+            return;
+        }
+        let Some(raw) = vfs_request_path(request) else {
+            response.status = EINVAL;
+            return;
+        };
+        let follow_last = request.flags & rustos_user_abi::syscall::VFS_CHOWN_FLAG_NOFOLLOW == 0;
+        let path = match self.resolve_path_follow(request, request.dirfd, raw, follow_last) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        response.status = lock_vfs_storage().chown_target(
+            AttrTarget::Path(path.as_str()),
+            Self::owner_credentials(request),
+            uid,
+            gid,
+        );
+    }
+
+    /// `VFS_IPC_OP_FCHOWN`: owner and group of an open description's node.
+    fn vfs_fchown(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some((uid, gid)) = Self::chown_ids(request) else {
+            response.status = EINVAL;
+            return;
+        };
+        let Some(handle) = self.handles.get(&request.remote_id) else {
+            response.status = EBADF;
+            return;
+        };
+        let cred = Self::owner_credentials(request);
+        if handle.node != 0 {
+            let (mount_id, node) = (handle.mount_id, handle.node);
+            response.status =
+                lock_vfs_storage().chown_target(AttrTarget::Node(mount_id, node), cred, uid, gid);
+        } else if handle.kind == RemoteKind::Device {
+            response.status = EINVAL;
+        } else {
+            let path = handle.path.clone();
+            response.status =
+                lock_vfs_storage().chown_target(AttrTarget::Path(path.as_str()), cred, uid, gid);
+        }
+    }
+
+    /// `VFS_IPC_OP_LINKAT`: a new hard link to a path or to an open description.
+    fn vfs_linkat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        use rustos_user_abi::syscall::VFS_LINKAT_FLAG_SOURCE_DESCRIPTION;
+        let payload = &request.payload[..(request.payload_len as usize).min(request.payload.len())];
+        let Some((old_bytes, new_bytes)) = decode_two_path_payload(payload) else {
+            response.status = EINVAL;
+            return;
+        };
+        let (Ok(old_raw), Ok(new_raw)) = (str::from_utf8(old_bytes), str::from_utf8(new_bytes)) else {
+            response.status = EINVAL;
+            return;
+        };
+        let by_description = request.flags & VFS_LINKAT_FLAG_SOURCE_DESCRIPTION != 0;
+        if request.flags & !VFS_LINKAT_FLAG_SOURCE_DESCRIPTION != 0
+            || request.arg1 & !(linux_abi::AT_SYMLINK_FOLLOW) != 0
+            || (by_description && !old_raw.is_empty())
+            || new_raw.is_empty()
+        {
+            response.status = EINVAL;
+            return;
+        }
+        let mut new_request = *request;
+        new_request.remote_id = request.arg2;
+        let new_path = match self.resolve_path_follow(&new_request, request.arg0, new_raw, false) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        let creds = credentials(request, false);
+        if by_description {
+            let Some(handle) = self.handles.get(&request.remote_id) else {
+                response.status = EBADF;
+                return;
+            };
+            if handle.node == 0 || handle.kind != RemoteKind::File {
+                // Only a pinned file node can gain a name; FAT, devices and
+                // directories cannot.
+                response.status = EPERM;
+                return;
+            }
+            let (mount_id, node) = (handle.mount_id, handle.node);
+            let mut storage = lock_vfs_storage();
+            response.status = match storage.node_metadata(mount_id, node) {
+                Ok(meta) if meta.fs.is_some_and(|fs| !vfsd::permissions::hardlink_source_allowed(fs, creds)) => EPERM,
+                Ok(_) => match check_parent(&mut storage, &new_path, request, false) {
+                    Ok(()) => storage.link_node_path(mount_id, node, &new_path),
+                    Err(errno) => errno,
+                },
+                Err(errno) => errno,
+            };
+            return;
+        }
+        if old_raw.is_empty() {
+            response.status = ENOENT;
+            return;
+        }
+        let follow_last = request.arg1 & linux_abi::AT_SYMLINK_FOLLOW != 0;
+        let old_path = match self.resolve_path_follow(request, request.dirfd, old_raw, follow_last) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        let mut storage = lock_vfs_storage();
+        response.status = match storage.metadata(old_path.as_str()) {
+            Ok(meta) if meta.kind == RemoteKind::Directory => EPERM,
+            Ok(meta) if meta.fs.is_some_and(|fs| !vfsd::permissions::hardlink_source_allowed(fs, creds)) => EPERM,
+            Ok(_) => match check_parent(&mut storage, &new_path, request, false) {
+                Ok(()) => storage.link_paths(&old_path, &new_path),
+                Err(errno) => errno,
+            },
+            Err(errno) => errno,
+        };
     }
 
     /// `VFS_IPC_OP_FALLOCATE`: mode 0 and `KEEP_SIZE` on a memory-filesystem

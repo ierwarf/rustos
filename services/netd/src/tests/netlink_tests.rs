@@ -135,14 +135,14 @@ fn getaddr_dump_filters_by_family() {
 #[test]
 fn unsupported_types_and_non_dump_requests_get_eopnotsupp() {
     let links = [loopback_link()];
-    let route = {
-        let mut bytes = nlmsg(20, 26, 0x1 | 0x300, 2, 0); // RTM_GETROUTE
+    let unsupported = {
+        let mut bytes = nlmsg(20, 99, 0x1 | 0x300, 2, 0); // unsupported type
         bytes.extend_from_slice(&[0; 4]);
         bytes
     };
     assert_eq!(
-        process_request(&route, 5, &links, &[]),
-        build_error(libc::EOPNOTSUPP, &route, 2, 5)
+        process_request(&unsupported, 5, &links, &[]),
+        build_error(libc::EOPNOTSUPP, &unsupported, 2, 5)
     );
     let single = {
         let mut bytes = nlmsg(20, RTM_GETLINK, 0x1, 8, 0); // no NLM_F_ROOT
@@ -371,8 +371,15 @@ fn bind_assigns_and_protects_port_ids() {
         req.payload_len = 12;
         netlink::handle_bind(&req)
     };
-    assert_eq!(bind(a, 0xabc0_1111, 0x7), libc::EOPNOTSUPP);
+    assert_eq!(bind(a, 0xabc0_1111, 0x7), 0);
+    let groups_of = |token: u64| match &lock_net_state().sockets[&token].state {
+        UnixSocketState::Netlink(netlink) => netlink.groups(),
+        _ => unreachable!(),
+    };
+    assert_eq!(groups_of(a), 0x7);
+    // Rebinding keeps the port id and updates groups.
     assert_eq!(bind(a, 0xabc0_1111, 0), 0);
+    assert_eq!(groups_of(a), 0);
     assert_eq!(bind(b, 0xabc0_1111, 0), libc::EADDRINUSE);
     // pid 0 assigns a free id: the process id first, then a generated one.
     assert_eq!(bind(b, 0, 0), 0);
@@ -411,7 +418,7 @@ fn netlink_shape_and_so_type() {
             ..NetdIpcRequest::default()
         };
         let mut response = NetdIpcResponse::default();
-        assert_eq!(handle_getsockopt(&req, &mut response), 0);
+        assert_eq!(super::handle_getsockopt(&req, &mut response), 0);
         i32::from_ne_bytes(response.payload[..4].try_into().unwrap())
     };
     assert_eq!(query(linux_abi::SO_TYPE), libc::SOCK_DGRAM);
@@ -426,7 +433,96 @@ fn netlink_shape_and_so_type() {
             ..NetdIpcRequest::default()
         };
         req.payload[..4].copy_from_slice(&(1_i32 << 20).to_ne_bytes());
-        assert_eq!(handle_setsockopt(&req), 0);
+        assert_eq!(super::handle_setsockopt(&req), 0);
     }
     lock_net_state().sockets.remove(&token);
+}
+
+#[test]
+fn sol_netlink_membership_options_and_change_notifications_work() {
+    let (a, b) = (0x9b0_0020_u64, 0x9b0_0021_u64);
+    {
+        let mut state = lock_net_state();
+        state.sockets.insert(a, netlink_socket(libc::SOCK_RAW as u64));
+        state.sockets.insert(b, netlink_socket(libc::SOCK_RAW as u64));
+    }
+
+    let set_membership = |token: u64, option: u64, group: i32| {
+        let mut req = NetdIpcRequest {
+            socket_token: token,
+            arg1: SOL_NETLINK,
+            arg2: option,
+            payload_len: 4,
+            ..NetdIpcRequest::default()
+        };
+        req.payload[..4].copy_from_slice(&group.to_ne_bytes());
+        super::handle_setsockopt(&req)
+    };
+    let get_memberships = |token: u64| {
+        let req = NetdIpcRequest {
+            socket_token: token,
+            arg1: SOL_NETLINK,
+            arg2: NETLINK_LIST_MEMBERSHIPS,
+            ..NetdIpcRequest::default()
+        };
+        let mut response = NetdIpcResponse::default();
+        assert_eq!(super::handle_getsockopt(&req, &mut response), 0);
+        assert_eq!(response.payload_len, 4);
+        u32::from_ne_bytes(response.payload[..4].try_into().unwrap())
+    };
+
+    // Group 0 and > 31 are rejected with EINVAL; unknown option is ENOPROTOOPT.
+    assert_eq!(set_membership(a, NETLINK_ADD_MEMBERSHIP, 0), libc::EINVAL);
+    assert_eq!(set_membership(a, NETLINK_ADD_MEMBERSHIP, 32), libc::EINVAL);
+    assert_eq!(set_membership(a, 99, 1), libc::ENOPROTOOPT);
+
+    // Subscribe `a` to RTMGRP_LINK (group 1) and RTMGRP_IPV4_IFADDR (group 5);
+    // `b` stays unsubscribed.
+    assert_eq!(set_membership(a, NETLINK_ADD_MEMBERSHIP, 1), 0);
+    assert_eq!(set_membership(a, NETLINK_ADD_MEMBERSHIP, 5), 0);
+    assert_eq!(get_memberships(a), RTMGRP_LINK | RTMGRP_IPV4_IFADDR);
+    assert_eq!(get_memberships(b), 0);
+
+    // First subscription recorded the baseline without queuing past history.
+    {
+        let state = lock_net_state();
+        let UnixSocketState::Netlink(na) = &state.sockets[&a].state else {
+            panic!();
+        };
+        assert_eq!(na.queued_messages(), 0);
+    }
+
+    // Apply a snapshot adding eth0 + address + route: `a` receives link & addr
+    // notifications (not route, since it did not join RTMGRP_IPV4_ROUTE); `b` gets 0.
+    let updated = InterfaceSnapshot {
+        links: vec![loopback_link(), provider_link(2, [0x52, 0x54, 0, 1, 2, 3])],
+        addrs: vec![loopback_addr(), provider_addr(2, [10, 0, 2, 15], 24)],
+        routes: vec![connected_route(2, [10, 0, 2, 15], 24)],
+    };
+    {
+        let mut state = lock_net_state();
+        apply_interface_snapshot(&mut state, updated.clone());
+        let UnixSocketState::Netlink(na) = &state.sockets[&a].state else {
+            panic!();
+        };
+        let UnixSocketState::Netlink(nb) = &state.sockets[&b].state else {
+            panic!();
+        };
+        assert_eq!(na.queued_messages(), 2);
+        assert_eq!(nb.queued_messages(), 0);
+    }
+
+    // Drop RTMGRP_LINK and verify remaining membership.
+    assert_eq!(set_membership(a, NETLINK_DROP_MEMBERSHIP, 1), 0);
+    assert_eq!(get_memberships(a), RTMGRP_IPV4_IFADDR);
+
+    // Verify RTM_GETROUTE dump returns the route + NLMSG_DONE.
+    let route_reply = process_request_snapshot(&dump_request(RTM_GETROUTE, 2, 77), 9, &updated);
+    let mut expected_route = build_route_message(&updated.routes[0], 77, 9);
+    expected_route.extend_from_slice(&build_done(77, 9));
+    assert_eq!(route_reply, expected_route);
+
+    let mut state = lock_net_state();
+    state.sockets.remove(&a);
+    state.sockets.remove(&b);
 }

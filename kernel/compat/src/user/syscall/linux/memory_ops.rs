@@ -37,6 +37,24 @@ struct SigaltstackRequestExtra {
 }
 
 pub(super) fn syscall_linux_madvise(start: u64, user_len: u64, advice: u64) -> u64 {
+    match advice {
+        linux_abi::MADV_POPULATE_READ => {
+            return mm_query_ops::syscall_linux_madvise_populate(start, user_len, false);
+        }
+        linux_abi::MADV_POPULATE_WRITE => {
+            return mm_query_ops::syscall_linux_madvise_populate(start, user_len, true);
+        }
+        linux_abi::MADV_DONTNEED => {
+            return mm_query_ops::syscall_linux_madvise_dontneed(start, user_len, false);
+        }
+        linux_abi::MADV_DONTNEED_LOCKED => {
+            return mm_query_ops::syscall_linux_madvise_dontneed(start, user_len, true);
+        }
+        linux_abi::MADV_FREE => {
+            return mm_query_ops::syscall_linux_madvise_free(start, user_len);
+        }
+        _ => {}
+    }
     let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_MADVISE);
     request.arg0 = start;
     request.arg1 = user_len;

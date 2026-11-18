@@ -699,7 +699,7 @@ fn waitset_input_object_id(access: u16) -> u64 {
     }
 }
 
-fn has_unmasked_pending_signal() -> bool {
+pub(super) fn has_unmasked_pending_signal() -> bool {
     multitask::current_linux_thread_state()
         .is_some_and(|state| state.pending_signals & !state.signal_mask != 0)
 }

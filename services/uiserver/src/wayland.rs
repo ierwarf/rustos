@@ -751,6 +751,15 @@ fn bind_nonblocking_unix_listener(socket_path: &str) -> std::io::Result<UnixList
         // SAFETY: `addr` is a live, zero-initialized `sockaddr_un` with a path that was
         // length-checked, and the length passed is exactly its size; `fd` is a valid
         // socket owned by this function.
+        //
+        // The compositor is a service principal (uid 0) while Wayland clients
+        // are desktop sessions (uid 1000), and `connect` needs write permission
+        // on the socket inode. `bind` creates it as `0777 & ~umask`, so a
+        // default `022` would leave it connectable only by its owner. The
+        // `0700` session directory is the access boundary; make the socket
+        // `0666` for the duration of the bind and restore the umask after.
+        // SAFETY: `umask` takes an integer and cannot fail.
+        let previous_umask = unsafe { libc::umask(0o111) };
         let bind_rc = unsafe {
             libc::bind(
                 fd,
@@ -758,6 +767,8 @@ fn bind_nonblocking_unix_listener(socket_path: &str) -> std::io::Result<UnixList
                 std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
             )
         };
+        // SAFETY: restores the value `umask` returned above.
+        unsafe { libc::umask(previous_umask) };
         if bind_rc < 0 {
             return Err(std::io::Error::last_os_error());
         }

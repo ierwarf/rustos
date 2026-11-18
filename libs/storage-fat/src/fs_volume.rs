@@ -1054,4 +1054,30 @@ mod tests {
             v.rmdir("sub").unwrap();
         });
     }
+
+    #[test]
+    fn write_truncate_and_flush_persist_across_reopen_and_readonly_refuses() {
+        let dev = format_disk(512, 4096, 0x3333_4444);
+        let vol = FatVolume::new(dev).unwrap();
+        vol.open_prepare(
+            "rw.txt",
+            FsOpenOptions {
+                create: true,
+                write: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(vol.write_at("rw.txt", 0, b"abcdef"), Ok((6, 6)));
+        assert_eq!(vol.truncate("rw.txt", 4), Ok(4));
+        vol.flush().unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(vol.read_at("rw.txt", 0, &mut buf), Ok(4));
+        assert_eq!(&buf[..4], b"abcd");
+
+        let ro = FatVolume::new_with_wait_and_mode(format_disk(512, 4096, 0x3333_4445), || {}, true)
+            .unwrap();
+        assert_eq!(ro.write_at("missing.txt", 0, b"x"), Err(FsError::ReadOnly));
+        assert_eq!(ro.truncate("missing.txt", 0), Err(FsError::ReadOnly));
+    }
 }

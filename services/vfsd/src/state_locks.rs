@@ -74,7 +74,7 @@ impl VfsState {
             file_len: if needs_len { self.lock_file_len(&handle) } else { 0 },
             now_ns: monotonic_nanos(),
         };
-        match vfsd::locks::execute(&mut self.locks, &ctx, &wire) {
+        match vfsd::locks::execute_verified(&mut self.locks, &ctx, &wire, &mut probe_lifecycle_pids) {
             Ok(Some(reply)) => write_lock_reply(response, &reply),
             Ok(None) => {}
             Err(errno) => response.status = errno,

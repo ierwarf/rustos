@@ -133,6 +133,27 @@ pub(super) fn exact_state(slot: usize, id: u64) -> Option<LinuxThreadState> {
     (cell.owner_tid == Some(id)).then_some(cell.state).flatten()
 }
 
+/// Replaces the `comm` of the exact thread `id` in `slot`; `false` when the
+/// cell is not that thread's live Linux state. Scalar write under the cell
+/// lock only (the caller holds a target pin), the same shape as
+/// `PR_SET_NAME` for the current thread.
+pub(super) fn set_comm_exact(slot: usize, id: u64, comm: [u8; rustos_user_abi::linux::LINUX_TASK_COMM_LEN]) -> bool {
+    let Some(lock) = LINUX_THREAD_STATES.get(slot) else {
+        return false;
+    };
+    let mut cell = lock.lock();
+    if cell.owner_tid != Some(id) {
+        return false;
+    }
+    match cell.state.as_mut() {
+        Some(state) => {
+            state.comm = comm;
+            true
+        }
+        None => false,
+    }
+}
+
 /// Exact original terminal source, whose seal excludes fresh wake borrowers.
 pub(super) fn terminal_snapshot(
     owner: &super::retirement_cleanup::producer::Producer,

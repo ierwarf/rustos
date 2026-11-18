@@ -54,6 +54,13 @@ pub struct MemlockLedger {
     ranges: Vec<(u64, u64)>,
     locked_bytes: u64,
     future: Option<FutureLock>,
+    /// Bytes admitted by [`Self::reserve`] for an operation (`mremap` growth of
+    /// a locked mapping) that has not yet learned where its pages will be. They
+    /// count against the limit exactly like locked bytes, so a concurrent locker
+    /// cannot spend the budget a growing mapping was already promised.
+    reserved_bytes: u64,
+    /// Islands set aside by the same reservations.
+    reserved_islands: usize,
 }
 
 impl MemlockLedger {
@@ -62,6 +69,8 @@ impl MemlockLedger {
             ranges: Vec::new(),
             locked_bytes: 0,
             future: None,
+            reserved_bytes: 0,
+            reserved_islands: 0,
         }
     }
 
@@ -123,18 +132,101 @@ impl MemlockLedger {
         if newly == 0 {
             return Ok(0);
         }
-        if self.locked_bytes.saturating_add(newly) > limit_bytes {
+        if self.committed_bytes().saturating_add(newly) > limit_bytes {
             return Err(LockRefusal::Limit);
         }
-        if self.ranges.len() + 2 > MAX_LOCKED_ISLANDS {
+        if self.ranges.len() + self.reserved_islands + 2 > MAX_LOCKED_ISLANDS {
             return Err(LockRefusal::NoMemory);
         }
         self.ranges
-            .try_reserve(2)
+            .try_reserve(2 + self.reserved_islands)
             .map_err(|_| LockRefusal::NoMemory)?;
         self.insert_merged(start, end);
         self.locked_bytes += newly;
         Ok(newly)
+    }
+
+    /// Locked bytes plus the bytes promised to in-flight reservations: what a
+    /// new admission is charged against.
+    pub fn committed_bytes(&self) -> u64 {
+        self.locked_bytes.saturating_add(self.reserved_bytes)
+    }
+
+    /// Locks every range of `ranges` (ascending, disjoint, page aligned) as one
+    /// admission: the cumulative newly locked total is checked against the limit
+    /// and the island storage is reserved before any range is recorded, so a
+    /// refusal changes nothing. This is `mlock` over a range with holes, where
+    /// Linux locks every mapped piece and reports the hole afterwards.
+    pub fn lock_all(
+        &mut self,
+        ranges: &[(u64, u64)],
+        limit_bytes: u64,
+    ) -> Result<u64, LockRefusal> {
+        let newly: u64 = ranges
+            .iter()
+            .map(|&(start, end)| self.unlocked_bytes_in(start, end))
+            .sum();
+        if newly == 0 {
+            return Ok(0);
+        }
+        if self.committed_bytes().saturating_add(newly) > limit_bytes {
+            return Err(LockRefusal::Limit);
+        }
+        let records = ranges.len().saturating_mul(2);
+        if self.ranges.len() + self.reserved_islands + records > MAX_LOCKED_ISLANDS {
+            return Err(LockRefusal::NoMemory);
+        }
+        self.ranges
+            .try_reserve(records + self.reserved_islands)
+            .map_err(|_| LockRefusal::NoMemory)?;
+        for &(start, end) in ranges {
+            self.insert_merged(start, end);
+        }
+        self.locked_bytes += newly;
+        Ok(newly)
+    }
+
+    /// Admits `bytes` of future locking against `limit_bytes` and sets aside the
+    /// island records it needs, atomically with respect to every other ledger
+    /// edit. Settle it with [`Self::commit_reservation`] or
+    /// [`Self::cancel_reservation`]; until then no other admission can spend it.
+    pub fn reserve(&mut self, bytes: u64, limit_bytes: u64) -> Result<(), LockRefusal> {
+        if self.committed_bytes().saturating_add(bytes) > limit_bytes {
+            return Err(LockRefusal::Limit);
+        }
+        if self.ranges.len() + self.reserved_islands + 2 > MAX_LOCKED_ISLANDS {
+            return Err(LockRefusal::NoMemory);
+        }
+        self.ranges
+            .try_reserve(self.reserved_islands + 2)
+            .map_err(|_| LockRefusal::NoMemory)?;
+        self.reserved_bytes += bytes;
+        self.reserved_islands += 2;
+        Ok(())
+    }
+
+    /// Gives back a reservation that will not be used.
+    pub fn cancel_reservation(&mut self, bytes: u64) {
+        self.reserved_bytes = self.reserved_bytes.saturating_sub(bytes);
+        self.reserved_islands = self.reserved_islands.saturating_sub(2);
+    }
+
+    /// Converts a reservation into a lock of `[start, end)`. The reserved bytes
+    /// were already admitted, so this cannot be refused for the limit; the
+    /// island records were set aside, so it cannot run out of storage either.
+    pub fn commit_reservation(&mut self, bytes: u64, start: u64, end: u64) {
+        self.cancel_reservation(bytes);
+        if start >= end {
+            return;
+        }
+        let newly = self.unlocked_bytes_in(start, end);
+        if newly == 0 {
+            return;
+        }
+        // `reserve` set aside capacity for one lock operation (two records) and
+        // every other edit leaves `reserved_islands` of headroom untouched.
+        self.insert_merged(start, end);
+        self.locked_bytes += newly;
     }
 
     /// Unlocks `[start, end)`; returns the bytes released. Never allocates more
@@ -148,7 +240,7 @@ impl MemlockLedger {
             return Err(LockRefusal::NoMemory);
         }
         self.ranges
-            .try_reserve(1)
+            .try_reserve(1 + self.reserved_islands)
             .map_err(|_| LockRefusal::NoMemory)?;
         self.remove_range(start, end);
         self.locked_bytes -= held;
@@ -163,7 +255,7 @@ impl MemlockLedger {
         if self.locked_bytes_in(start, end) == 0 {
             return;
         }
-        if self.ranges.try_reserve(1).is_err() {
+        if self.ranges.try_reserve(1 + self.reserved_islands).is_err() {
             // Cannot split: also drop the surviving remainder of any island that
             // straddles a boundary, over-releasing rather than leaving a lock
             // on memory that is gone. Never reached below the kernel heap limit.
@@ -197,7 +289,7 @@ impl MemlockLedger {
             return Err(LockRefusal::NoMemory);
         }
         self.ranges
-            .try_reserve(pieces + 2)
+            .try_reserve(pieces + 2 + self.reserved_islands)
             .map_err(|_| LockRefusal::NoMemory)
     }
 
@@ -225,7 +317,7 @@ impl MemlockLedger {
             return Err(LockRefusal::NoMemory);
         }
         self.ranges
-            .try_reserve(pieces.len() + 2)
+            .try_reserve(pieces.len() + 2 + self.reserved_islands)
             .map_err(|_| LockRefusal::NoMemory)?;
         self.remove_range(old_start, old_end);
         for (s, e) in pieces {
@@ -353,6 +445,46 @@ mod tests {
     }
 
     #[test]
+    fn lock_all_is_one_admission_over_a_range_with_holes() {
+        let mut ledger = MemlockLedger::new();
+        let pieces = [(0x10 * P, 0x12 * P), (0x14 * P, 0x15 * P)];
+        // Over the limit by one page: nothing is recorded.
+        assert_eq!(ledger.lock_all(&pieces, 2 * P), Err(LockRefusal::Limit));
+        assert_eq!(ledger.locked_bytes(), 0);
+        assert!(ledger.ranges().is_empty());
+        assert_eq!(ledger.lock_all(&pieces, 3 * P), Ok(3 * P));
+        assert_eq!(ledger.ranges(), pieces);
+        // Already-locked pieces are free.
+        assert_eq!(ledger.lock_all(&pieces, 3 * P), Ok(0));
+    }
+
+    #[test]
+    fn a_reservation_cannot_be_spent_by_another_locker() {
+        let mut ledger = MemlockLedger::new();
+        ledger.lock(0x10 * P, 0x12 * P, 4 * P).unwrap();
+        // A growing locked mapping is promised two pages of the four.
+        ledger.reserve(2 * P, 4 * P).unwrap();
+        assert_eq!(ledger.committed_bytes(), 4 * P);
+        // A concurrent locker finds the budget spent, even though nothing new
+        // is recorded yet.
+        assert_eq!(ledger.lock(0x40 * P, 0x41 * P, 4 * P), Err(LockRefusal::Limit));
+        assert_eq!(ledger.lock_all(&[(0x40 * P, 0x41 * P)], 4 * P), Err(LockRefusal::Limit));
+        assert_eq!(ledger.reserve(P, 4 * P), Err(LockRefusal::Limit));
+        // The extension lands somewhere else and converts the reservation.
+        ledger.commit_reservation(2 * P, 0x80 * P, 0x82 * P);
+        assert_eq!(ledger.locked_bytes(), 4 * P);
+        assert_eq!(ledger.committed_bytes(), 4 * P);
+        assert_eq!(ledger.ranges(), [(0x10 * P, 0x12 * P), (0x80 * P, 0x82 * P)]);
+        // A refused operation gives its promise back.
+        ledger.reserve(0, 4 * P).unwrap();
+        ledger.cancel_reservation(0);
+        let mut other = MemlockLedger::new();
+        other.reserve(3 * P, 4 * P).unwrap();
+        other.cancel_reservation(3 * P);
+        assert_eq!(other.lock(0x10 * P, 0x14 * P, 4 * P), Ok(4 * P));
+    }
+
+    #[test]
     fn island_count_is_bounded() {
         let mut ledger = MemlockLedger::new();
         let mut accepted = 0_u64;
@@ -382,5 +514,28 @@ mod tests {
         assert_eq!(ledger.future(), Some(future));
         ledger.set_future(None);
         assert_eq!(ledger.future(), None);
+    }
+
+    #[test]
+    fn partial_lock_all_and_hole_release_keep_accounting_exact() {
+        let mut ledger = MemlockLedger::new();
+        let pieces = [(0x10 * P, 0x13 * P), (0x20 * P, 0x22 * P)];
+        assert_eq!(ledger.lock_all(&pieces, 5 * P), Ok(5 * P));
+        assert_eq!(ledger.locked_bytes(), 5 * P);
+        assert_eq!(ledger.locked_bytes_in(0x11 * P, 0x21 * P), 3 * P);
+
+        // Concurrent unmap of [0x11*P, 0x12*P) splits the first island and drops 1 page.
+        ledger.release_mapping(0x11 * P, 0x12 * P);
+        assert_eq!(ledger.locked_bytes(), 4 * P);
+        assert_eq!(
+            ledger.ranges(),
+            [(0x10 * P, 0x11 * P), (0x12 * P, 0x13 * P), (0x20 * P, 0x22 * P)]
+        );
+
+        // Unlocking remaining pieces returns exact released bytes and zeroes total.
+        assert_eq!(ledger.unlock(0x10 * P, 0x13 * P), Ok(2 * P));
+        assert_eq!(ledger.unlock(0x20 * P, 0x22 * P), Ok(2 * P));
+        assert_eq!(ledger.locked_bytes(), 0);
+        assert!(ledger.ranges().is_empty());
     }
 }

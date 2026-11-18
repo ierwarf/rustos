@@ -29,6 +29,16 @@ const USER_RFLAGS_FORBIDDEN_MASK: u64 = RFlags::TRAP_FLAG.bits()
     | RFlags::VIRTUAL_INTERRUPT.bits()
     | RFlags::VIRTUAL_INTERRUPT_PENDING.bits();
 
+fn effective_linux_fault_vector(vector: u8, is_eof_guard: bool) -> u8 {
+    if vector == 14 && is_eof_guard {
+        // Map an EOF-guard page fault onto a SIGBUS-classified vector so
+        // `linux_fault_wait_status` reports SIGBUS (7) instead of SIGSEGV (11).
+        17
+    } else {
+        vector
+    }
+}
+
 pub(crate) fn retire_current_linux_task_due_to_fault(
     vector: u8,
     error_code: Option<u64>,
@@ -57,10 +67,14 @@ pub(crate) fn retire_current_linux_task_due_to_fault(
             );
         }
     }
+    let effective_vector = effective_linux_fault_vector(
+        vector,
+        vector == 14 && paging::current_user_leaf_is_eof_guard(cr2),
+    );
     // IF is still clear in the exception callback. The original terminal
     // producer carries the fault to the runtime cleanup consumer, which may
     // close service handles and notify policy only from interruptible context.
-    multitask::retire_current_user_task_due_to_fault(vector, error_code, cr2, rip, rsp)
+    multitask::retire_current_user_task_due_to_fault(effective_vector, error_code, cr2, rip, rsp)
 }
 
 #[repr(C)]
@@ -977,5 +991,12 @@ mod tests {
         assert!(stub.contains("wide_simd_section"));
         // The image rides the blocked continuation on the task's own stack.
         assert!(dispatch.contains("kernel stack"));
+    }
+
+    #[test]
+    fn eof_guard_page_fault_maps_to_sigbus_vector() {
+        assert_eq!(super::effective_linux_fault_vector(14, true), 17);
+        assert_eq!(super::effective_linux_fault_vector(14, false), 14);
+        assert_eq!(super::effective_linux_fault_vector(13, true), 13);
     }
 }

@@ -70,7 +70,7 @@ pub use self::current::{
     endpoint_receiver_still_waiting, exec_current_user_process, exec_user_process_by_pid,
     exec_user_process_by_pid_checked, exit_current_user_process, exit_current_user_task,
     halt_current_retired_task, inherit_ipc_priority, inherit_pager_fault_priority,
-    is_user_process_exiting, is_user_task_alive, linux_task_affinity, linux_thread_snapshot_by_ids,
+    is_user_process_exiting, is_user_task_alive, linux_task_affinity, linux_thread_runnable_by_ids, linux_thread_snapshot_by_ids, set_linux_thread_comm_by_ids,
     user_target_abi_if_alive,
     live_user_process_identity_by_pid, live_user_process_identity_with_exact_exec_path,
     mark_user_process_exiting, mark_user_process_exiting_once, next_retired_task_cleanup,
@@ -94,6 +94,7 @@ pub use self::current::{
     with_current_user_process_state_mut, with_fork_parent_state, with_process_state_by_pid,
     with_process_state_by_pid_mut, with_process_state_for_teardown_mut, with_process_state_by_generation_mut, ExecRefusal, PagerChargeSnapshot,
 };
+pub use self::process_table::for_each_visible_process_state_mut;
 pub use self::pager_fault::{
     cancel_pager_fault, claim_pager_fault_reply_from_pager, consume_pager_fault_reply,
     mark_pager_fault_blocked, pager_fault_snapshot, register_pager_fault_waiter,

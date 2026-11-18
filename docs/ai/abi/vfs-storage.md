@@ -341,12 +341,19 @@ the read-only accelerator; TmpFs has it (next section).
   POSIX owners) and the kernel polls with 1-32 ms sleeps, EINTR on a pending
   signal. A conflict is always EAGAIN. Release: final description close, any
   close of the file by a POSIX owner (kernel `note_fd_closed` -> RELEASE_FILE,
-  only for pids that ever took a POSIX lock), and process EXIT/FORK lifecycle
-  events. The kernel queues the lifecycle EXIT **before** publishing the zombie
-  to `wait4`, so a parent that returned from `wait4` never sees the dead child's
-  locks. Limits: the table is not checkpointed (locks vanish if vfsd restarts);
-  CLOEXEC closes at exec do not release POSIX locks; an EXIT lost to queue
-  overflow whose pid is never reused leaves a stale lock.
+  only for pids that ever took a POSIX lock), `exec`-time `CLOEXEC` closes
+  (`note_exec_cloexec_closed` via `vfsd::lock_release_proxy_shape`, admitted
+  only from the live `loaderd` owner on its own thread for POSIX
+  `RELEASE_FILE`), and process EXIT/FORK lifecycle events. The kernel queues the
+  lifecycle EXIT **before** publishing the zombie to `wait4`, so a parent that
+  returned from `wait4` never sees the dead child's locks. Against missed exit
+  events or lifecycle queue overflow, `execute_verified` / `verify_all_owners`
+  probes kernel process incarnations (`LIFECYCLE_BROKER_MODE_PROBE_PIDS`,
+  `VfsPolicy`-only, cached for `LIVENESS_RECHECK_NS`) on conflict/overflow and
+  drops dead or pid-reused owners. Checkpoint decision: the lock table is
+  intentionally not checkpointed (locks die with a `vfsd` restart just as the
+  kernel would drop them with the open descriptions, and clients re-take them
+  after reopening).
 - **procfs.** `/proc` serves the caller's own pid only (`/proc/self`,
   `/proc/<own pid>`). Kernel-fact nodes (maps, smaps, status, stat, statm,
   cmdline, environ, auxv, limits, comm, oom_score_adj, `task/`, `fd/`, `ns/*`) are

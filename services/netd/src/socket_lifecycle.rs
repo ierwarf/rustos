@@ -521,9 +521,6 @@ fn publish_unix_binding(
             }
         },
     };
-    if address.as_filesystem_str().is_some_and(is_wayland_path) {
-        debug_line("netd: wayland bind");
-    }
     let socket = state
         .sockets
         .get_mut(&request.socket_token)
@@ -586,11 +583,6 @@ pub(super) fn handle_listen(request: &NetdIpcRequest) -> i32 {
     if socket.kind == UnixSocketKind::Netlink {
         return libc::EOPNOTSUPP;
     }
-    let is_wayland = socket
-        .bound_path
-        .as_ref()
-        .and_then(UnixAddress::as_filesystem_str)
-        .is_some_and(is_wayland_path);
     if socket.bound_path.is_none() || !matches!(socket.state, UnixSocketState::Idle) {
         return libc::EINVAL;
     }
@@ -601,9 +593,6 @@ pub(super) fn handle_listen(request: &NetdIpcRequest) -> i32 {
         backlog,
         pending: VecDeque::new(),
     };
-    if is_wayland {
-        debug_line("netd: wayland listen");
-    }
     0
 }
 
@@ -690,7 +679,6 @@ pub(super) fn handle_connect_with(
         Ok(channel_id) => channel_id,
         Err(errno) => return errno,
     };
-    let is_wayland = path.as_filesystem_str().is_some_and(is_wayland_path);
     let client = state
         .sockets
         .get_mut(&request.socket_token)
@@ -720,9 +708,6 @@ pub(super) fn handle_connect_with(
             return libc::ECONNREFUSED;
         };
         pending.push_back(accepted);
-        if is_wayland {
-            debug_line("netd: wayland connect queued");
-        }
         listener.local_path.clone()
     };
     state.sockets.insert(
@@ -791,26 +776,14 @@ pub(super) fn handle_accept(
         return libc::EINVAL;
     }
     // accept4 flags control the NEW descriptor, not the listener's wait mode.
-    let nonblocking = request.status_flags & linux_abi::O_NONBLOCK != 0;
     let accepted = {
         let mut state = lock_net_state();
         let Some(listener) = state.sockets.get_mut(&request.socket_token) else {
             return libc::EBADF;
         };
-        let is_wayland = listener
-            .local_path
-            .as_ref()
-            .and_then(UnixAddress::as_filesystem_str)
-            .is_some_and(is_wayland_path);
         match &mut listener.state {
             UnixSocketState::Listening { pending, .. } => match pending.pop_front() {
-                Some(token) => {
-                    if is_wayland {
-                        debug_line("netd: wayland accept dequeued");
-                    }
-                    token
-                }
-                None if nonblocking => return libc::EAGAIN,
+                Some(token) => token,
                 None => return libc::EAGAIN,
             },
             _ => return libc::EINVAL,
@@ -940,10 +913,6 @@ pub(super) fn settle_unix_accept(
         }
     }
     retire_unix_socket(state, accepted)
-}
-
-pub(super) fn is_wayland_path(path: &str) -> bool {
-    path.ends_with("/wayland-0") || path == "wayland-0"
 }
 
 /// Linux accept does not inherit the listener's open-description flags, but the

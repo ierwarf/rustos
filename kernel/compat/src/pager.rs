@@ -160,6 +160,88 @@ pub fn serve_anonymous_first_touch(
     serve_anonymous_first_touch_enabled(request, prot)
 }
 
+/// What populating one page of the caller's own anonymous memory did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PopulateOutcome {
+    /// The page is resident (mapped now, or already was).
+    Resident,
+    /// A VMA writer held the publication or a frame/table was transiently
+    /// unavailable; the caller may try the same page again.
+    Retry,
+    /// No published anonymous region grants this access to the page, so there
+    /// is nothing ring0 could make resident (hole, `PROT_NONE`, read-only
+    /// target of a write, or a backing that is not anonymous).
+    NotPopulatable,
+    /// Memory is exhausted: no frame could be found for the page.
+    NoMemory,
+}
+
+/// Makes one page of the *calling task's own* anonymous mapping resident, by
+/// running exactly the fault path a first touch would, from syscall context.
+///
+/// This is what `mlock` and `MADV_POPULATE_*` need and nothing else can supply:
+/// the request is built from the caller's own published VMA snapshot, so the
+/// same process, MM and VMA generations authorize it as authorize a real fault,
+/// and `serve_anonymous_first_touch` re-validates them under its install permit.
+/// It runs with interrupts disabled so it executes in the environment that body
+/// was written for (the fault gate). A page another thread already mapped
+/// resolves as `Resident` (the leaf CAS loses and the frame is returned).
+/// Private-file and COW-shared leaves are never touched: they are resident by
+/// construction, and a missing one has no ring0 source of bytes.
+pub fn populate_current_anonymous_page(page: u64, write: bool) -> PopulateOutcome {
+    use rustos_user_abi::pager::{
+        PAGER_FAULT_ABI_VERSION, PAGER_PAGE_BYTES, VM_ACCESS_READ, VM_ACCESS_WRITE,
+        VM_OBJECT_ANONYMOUS,
+    };
+
+    let page = page & !(PAGER_PAGE_BYTES - 1);
+    let access = if write { VM_ACCESS_WRITE } else { VM_ACCESS_READ };
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let vma = match ps_api::current_pager_vma_snapshot(page, access) {
+            Ok(vma) => vma,
+            Err(ps_api::PagerVmaError::Unstable) => return PopulateOutcome::Retry,
+            Err(_) => return PopulateOutcome::NotPopulatable,
+        };
+        if vma.task_id == 0 || vma.region.object.object_type != VM_OBJECT_ANONYMOUS {
+            return PopulateOutcome::NotPopulatable;
+        }
+        let Some(task_generation) = vma.task_id.checked_add(1) else {
+            return PopulateOutcome::NotPopulatable;
+        };
+        let Some(object_offset) = page
+            .checked_sub(vma.region.start)
+            .and_then(|delta| vma.region.object_offset.checked_add(delta))
+        else {
+            return PopulateOutcome::NotPopulatable;
+        };
+        let request = PagerFaultRequestWire {
+            version: PAGER_FAULT_ABI_VERSION,
+            access,
+            fault_flags: 0,
+            reserved0: 0,
+            fault_token: 0,
+            process_handle: vma.region.process_handle,
+            process_generation: vma.region.process_generation,
+            task_id: vma.task_id,
+            task_generation,
+            mm_generation: vma.region.mm_generation,
+            vma_generation: vma.region.vma_generation,
+            virtual_address: page,
+            object_offset,
+            deadline_ns: 0,
+            scheduling_domain: 0,
+            charge_token: 0,
+            object: vma.region.object,
+            reserved1: [0; 2],
+        };
+        match serve_anonymous_first_touch_enabled(request, vma.region.prot) {
+            AnonymousFaultOutcome::Mapped => PopulateOutcome::Resident,
+            AnonymousFaultOutcome::Retry => PopulateOutcome::Retry,
+            AnonymousFaultOutcome::Refused => PopulateOutcome::NoMemory,
+        }
+    })
+}
+
 /// Resolves one exact private COW write without leaving exception context.
 ///
 /// The VMA permit prevents unmap/protect from invalidating the fault request.

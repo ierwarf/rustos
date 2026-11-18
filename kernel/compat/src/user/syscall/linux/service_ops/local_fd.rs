@@ -450,6 +450,77 @@ fn pipe_read(pipe: &PipeHandle, user_ptr: u64, user_len: u64) -> u64 {
     }
 }
 
+/// Pushes `chunk` into a pipe, blocking per the descriptor's mode. `done` is
+/// what the caller already delivered in this call. `Err` carries the final
+/// syscall result: the bytes moved so far when any, else the negative errno.
+fn pipe_push_chunk(pipe: &PipeHandle, chunk: &[u8], done: usize) -> Result<(), u64> {
+    // A write of at most PIPE_BUF bytes is one atomic chunk; a larger
+    // request stays a sequence of partial writes.
+    let mut sent = 0_usize;
+    while sent < chunk.len() {
+        match pipe.shared().try_write(&chunk[sent..]) {
+            Ok(progress) => {
+                sent += progress.bytes;
+                publish(progress.wake);
+            }
+            Err(PipeError::WouldBlock { generation }) => {
+                if pipe.nonblocking() {
+                    return Err(completed_or(done + sent, LINUX_EAGAIN));
+                }
+                if current_wait_interrupted() {
+                    return Err(completed_or(done + sent, LINUX_EINTR));
+                }
+                if let Err(errno) = wait_for_generation(pipe.token_id(), generation) {
+                    return Err(completed_or(done + sent, errno));
+                }
+            }
+            Err(PipeError::BrokenPipe) => {
+                raise_sigpipe();
+                return Err(completed_or(done + sent, LINUX_EPIPE));
+            }
+            Err(err) => return Err(completed_or(done + sent, pipe_error_errno(err))),
+        }
+    }
+    Ok(())
+}
+
+/// Checks whether `fd` is a pipe and whether it is writable (`EBADF` if read end).
+pub(in crate::user::syscall::linux) fn check_pipe_write_fd(fd: u64) -> Option<Result<(), i64>> {
+    let local = current_local_fd(fd)?;
+    let LocalFd::Pipe(pipe) = &local else {
+        return None;
+    };
+    Some(if pipe.role() == PipeRole::Write {
+        Ok(())
+    } else {
+        Err(LINUX_EBADF)
+    })
+}
+
+/// Kernel-buffer `write(2)` to a pipe write end, for `sendfile`. `None` when
+/// `fd` is not a pipe; otherwise the bytes delivered, or the errno when none
+/// were. A short count is real progress (nonblocking pipe full, signal).
+pub(in crate::user::syscall::linux) fn pipe_write_bytes(
+    fd: u64,
+    data: &[u8],
+) -> Option<Result<usize, i64>> {
+    let local = current_local_fd(fd)?;
+    let LocalFd::Pipe(pipe) = &local else {
+        return None;
+    };
+    if pipe.role() != PipeRole::Write {
+        return Some(Err(LINUX_EBADF));
+    }
+    if data.is_empty() {
+        return Some(Ok(0));
+    }
+    Some(match pipe_push_chunk(pipe, data, 0) {
+        Ok(()) => Ok(data.len()),
+        Err(raw) if is_linux_error(raw) => Err(-(raw as i64)),
+        Err(progress) => Ok(progress as usize),
+    })
+}
+
 fn pipe_write(pipe: &PipeHandle, user_ptr: u64, user_len: u64) -> u64 {
     if pipe.role() != PipeRole::Write {
         return linux_errno(LINUX_EBADF);
@@ -483,32 +554,8 @@ fn pipe_write(pipe: &PipeHandle, user_ptr: u64, user_len: u64) -> u64 {
         if let Err(err) = usermem::copy_from_current_user_exact(source, chunk) {
             return completed_or(total, user_pointer_error_to_linux_errno(err));
         }
-        // A write of at most PIPE_BUF bytes is one atomic chunk; a larger
-        // request stays a sequence of partial writes.
-        let mut sent = 0_usize;
-        while sent < chunk_len {
-            match pipe.shared().try_write(&chunk[sent..chunk_len]) {
-                Ok(progress) => {
-                    sent += progress.bytes;
-                    publish(progress.wake);
-                }
-                Err(PipeError::WouldBlock { generation }) => {
-                    if pipe.nonblocking() {
-                        return completed_or(total + sent, LINUX_EAGAIN);
-                    }
-                    if current_wait_interrupted() {
-                        return completed_or(total + sent, LINUX_EINTR);
-                    }
-                    if let Err(errno) = wait_for_generation(pipe.token_id(), generation) {
-                        return completed_or(total + sent, errno);
-                    }
-                }
-                Err(PipeError::BrokenPipe) => {
-                    raise_sigpipe();
-                    return completed_or(total + sent, LINUX_EPIPE);
-                }
-                Err(err) => return completed_or(total + sent, pipe_error_errno(err)),
-            }
+        if let Err(raw) = pipe_push_chunk(pipe, chunk, total) {
+            return raw;
         }
         total += chunk_len;
     }

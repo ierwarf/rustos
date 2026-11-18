@@ -52,6 +52,19 @@ raw_u64! {
     SYS_SYMLINK = linux::__NR_symlink;
     SYS_CHMOD = linux::__NR_chmod;
     SYS_FCHMOD = linux::__NR_fchmod;
+    // ---- BEGIN ownership / mknod / link / legacy utime syscall numbers ----
+    SYS_LINK = linux::__NR_link;
+    SYS_CHOWN = linux::__NR_chown;
+    SYS_FCHOWN = linux::__NR_fchown;
+    SYS_LCHOWN = linux::__NR_lchown;
+    SYS_UTIME = linux::__NR_utime;
+    SYS_MKNOD = linux::__NR_mknod;
+    SYS_UTIMES = linux::__NR_utimes;
+    SYS_MKNODAT = linux::__NR_mknodat;
+    SYS_FCHOWNAT = linux::__NR_fchownat;
+    SYS_FUTIMESAT = linux::__NR_futimesat;
+    SYS_LINKAT = linux::__NR_linkat;
+    // ---- END ownership / mknod / link / legacy utime syscall numbers ----
     SYS_STATFS = linux::__NR_statfs;
     SYS_FSTATFS = linux::__NR_fstatfs;
     SYS_SOCKET = linux::__NR_socket;
@@ -284,6 +297,7 @@ raw_u64! {
     AT_EMPTY_PATH = linux::AT_EMPTY_PATH;
     AT_EACCESS = linux::AT_EACCESS;
     AT_SYMLINK_NOFOLLOW = linux::AT_SYMLINK_NOFOLLOW;
+    AT_SYMLINK_FOLLOW = linux::AT_SYMLINK_FOLLOW;
     AT_REMOVEDIR = linux::AT_REMOVEDIR;
     RENAME_NOREPLACE = linux::RENAME_NOREPLACE;
     RENAME_EXCHANGE = linux::RENAME_EXCHANGE;

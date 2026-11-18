@@ -1297,6 +1297,10 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         // from an earlier fd snapshot that a sibling can close/reuse before
         // replacement. A provider restart independently revokes any call that
         // cannot complete this bounded cleanup.
+        // POSIX locks die with a close of any fd of the file, including this
+        // one; the descriptions are still referenced here, so vfsd still knows
+        // them. Runs in the loader's context, hence the explicit pid.
+        file_lock_ops::note_exec_cloexec_closed(args.target_pid, &closed_handles);
         let cloexec_service_refs: Vec<_> = closed_handles
             .iter()
             .filter_map(service_handle_ref_for_handle)

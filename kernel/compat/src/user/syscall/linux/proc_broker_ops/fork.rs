@@ -252,6 +252,10 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
         let _ = multitask::terminate_user_task(child_pid);
         return fork_stage_failed(2, errno, 0);
     }
+    if let Err(errno) = inherit_shared_memfd_mappings(child_pid) {
+        let _ = multitask::terminate_user_task(child_pid);
+        return fork_stage_failed(2, errno, 0);
+    }
     if args.clone_flags & linux_abi::CLONE_CHILD_SETTID != 0 {
         let child_tid = (child_pid as u32).to_le_bytes();
         let write_result = multitask::with_process_state_by_pid_mut(child_pid, |child| {
@@ -283,6 +287,24 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
     multitask::set_next_spawn_pick_hint(child_pid);
     multitask::request_deferred_reschedule();
     child_pid
+}
+
+fn inherit_shared_memfd_mappings(child_pid: u64) -> Result<(), i64> {
+    let holds = multitask::with_process_state_by_pid(child_pid, |child| child.shared_memfd_holds())
+        .ok_or(LINUX_ESRCH)?;
+    for hold in holds {
+        let res = hold.with_reconcile_and_frames(|object_id, frames| {
+            multitask::with_process_state_by_pid_mut(child_pid, |child| {
+                child.reconcile_shared_memfd_mappings(object_id, frames)
+            })
+        });
+        match res {
+            Some(Ok(())) => {}
+            Some(Err(err)) => return Err(address_space_error_to_linux_errno(err)),
+            None => return Err(LINUX_ESRCH),
+        }
+    }
+    Ok(())
 }
 
 fn writable_committed_regions_cover(

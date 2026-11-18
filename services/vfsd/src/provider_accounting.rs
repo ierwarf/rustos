@@ -124,11 +124,11 @@ impl OpenDescriptionBilling {
         self.flush_acks();
         Ok(())
     }
-    fn owns_funded(&self, remote_id: u64, client_pid: u64) -> bool {
+    fn is_funded(&self, remote_id: u64) -> bool {
         self.ledger
             .pending(remote_id)
             .ok()
-            .is_some_and(|(state, frame)| state == State::Funded && frame.client_pid == client_pid)
+            .is_some_and(|(state, _frame)| state == State::Funded)
     }
 }
 impl VfsState {
@@ -174,10 +174,13 @@ impl VfsState {
     }
     /// Snapshot may inform health reporting and resource management,
     /// but unverified counts do not bypass the kernel's Job quota.
-    pub(super) fn has_funded_open_description(&self, id: u64, pid: u64) -> bool {
+    /// Open descriptions are shared across `fork` and `SCM_RIGHTS` fd passing,
+    /// so any process holding a kernel-verified descriptor to a `Funded`
+    /// description in this `vfsd` incarnation may use it.
+    pub(super) fn has_funded_open_description(&self, id: u64) -> bool {
         self.billing
             .as_ref()
-            .is_some_and(|b| b.owns_funded(id, pid))
+            .is_some_and(|b| b.is_funded(id))
     }
 }
 #[cfg(test)]

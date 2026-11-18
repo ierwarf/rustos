@@ -94,6 +94,9 @@ pub(super) fn read_device_buffer_at(
 }
 
 pub(super) fn write(memfd: &mut multitask::MemfdHandle, user_ptr: u64, user_len: u64) -> u64 {
+    if let Some(result) = super::proc_identity::write_snapshot(memfd, user_ptr, user_len) {
+        return result;
+    }
     write_with(user_ptr, user_len, |_written_so_far, chunk| {
         memfd.write_from(chunk)
     })
@@ -105,6 +108,14 @@ pub(super) fn write_at(
     user_len: u64,
     offset: u64,
 ) -> u64 {
+    if memfd.proc_snapshot().is_some() {
+        if offset != 0 {
+            return linux_errno(LINUX_EINVAL);
+        }
+        if let Some(result) = super::proc_identity::write_snapshot(memfd, user_ptr, user_len) {
+            return result;
+        }
+    }
     let Ok(base) = usize::try_from(offset) else {
         return linux_errno(LINUX_EINVAL);
     };

@@ -78,6 +78,8 @@ pub enum FsNodeKind {
     Symlink,
     /// Filesystem socket inode (`S_IFSOCK`); never opened for data I/O.
     Socket,
+    /// Named pipe (`S_IFIFO`); metadata/namespace node.
+    Fifo,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -261,7 +263,19 @@ pub trait FsVolume: Send + Sync {
     fn mknod_socket(&self, _path: &str, _attrs: FsCreateAttrs) -> Result<(), FsError> {
         Err(FsError::Unsupported)
     }
+    /// Creates an `S_IFIFO` inode at `path`. Fails with `AlreadyExists` when
+    /// the name is taken.
+    fn mknod_fifo(&self, _path: &str, _attrs: FsCreateAttrs) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
     fn chmod(&self, _path: &str, _mode: u32) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+    /// `chown(2)`: `None` leaves that id alone. Credential policy belongs to
+    /// the caller; the volume only stores the ids and, like Linux, drops
+    /// `S_ISUID`/`S_ISGID` of a non-directory. Volumes that cannot store
+    /// owners keep the default `Unsupported`.
+    fn chown(&self, _path: &str, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), FsError> {
         Err(FsError::Unsupported)
     }
     /// Hard link `new_path` to the non-directory `existing`.
@@ -331,6 +345,9 @@ pub trait FsVolume: Send + Sync {
         Err(FsError::Unsupported)
     }
     fn chmod_node(&self, _node: u64, _mode: u32) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+    fn chown_node(&self, _node: u64, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), FsError> {
         Err(FsError::Unsupported)
     }
     fn set_times_node(

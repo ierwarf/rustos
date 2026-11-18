@@ -255,6 +255,29 @@ pub const SYS_RUSTOS_SCHEDULING_CONTEXT_GRANT_BROKER: u64 = 0x5255_004d;
 /// closed identifiers below. The kernel stamps the live process/thread
 /// identity and monotonic timestamp into the structured debug record.
 pub const SYS_RUSTOS_PRODUCT_MILESTONE: u64 = 0x5255_0046;
+/// VfsPolicy-only bounded pull of kernel-attested raw `/proc/<pid>` facts.
+pub const SYS_RUSTOS_PROC_FACTS_BROKER: u64 = 0x5255_0066;
+pub const PROC_FACTS_BROKER_ABI_VERSION: u16 = 1;
+pub const PROC_FACTS_OP_PROCESS: u16 = 1;
+pub const PROC_FACTS_OP_THREAD: u16 = 2;
+pub const PROC_FACTS_OP_FD_LIST: u16 = 3;
+pub const PROC_FACTS_OP_TID_LIST: u16 = 4;
+pub const PROC_FACTS_OP_LIMITS: u16 = 5;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProcFactsBrokerArgs {
+    pub abi_version: u16,
+    pub op: u16,
+    pub flags: u32,
+    pub pid: u64,
+    pub tid: u64,
+    pub out_ptr: u64,
+    pub out_capacity: u32,
+    pub reserved0: u32,
+    pub out_len_ptr: u64,
+}
+const _: () = assert!(core::mem::size_of::<ProcFactsBrokerArgs>() == 48);
 pub const PRODUCT_MILESTONE_ROOT_CORE_READY: u64 = 1;
 pub const PRODUCT_MILESTONE_DISPLAY_READY: u64 = 2;
 pub const PRODUCT_MILESTONE_STORAGE_READY: u64 = 3;
@@ -877,6 +900,37 @@ pub const fn vfs_fallocate_keep_size(mode: u64) -> Option<bool> {
     }
 }
 // ---- END vfsd memory-filesystem ops ----
+// ---- BEGIN vfsd ownership and hard-link ops (chown family, linkat) ----
+// Reuse the `VfsIpcRequest` header; the `arg*` meanings below are the contract.
+/// `fchownat(dirfd, path, uid, gid, flags)`: `dirfd`/`path` as `OPENAT`;
+/// `arg0` is the new owner and `arg1` the new group, each `VFS_ID_UNCHANGED`
+/// for "leave alone". `flags & VFS_CHOWN_FLAG_NOFOLLOW` changes the owner of a
+/// trailing symlink itself (`lchown`). vfsd applies the credential rules from
+/// the request's `euid`/`egid`: only `euid == 0` changes an owner; the owner
+/// may change the group to its own `egid` or `gid` (the kernel keeps no
+/// supplementary groups). A volume without POSIX ownership accepts only a
+/// request that matches what it reports (owner 0, group 0) and answers
+/// `EPERM` otherwise, as Linux vfat does.
+pub const VFS_IPC_OP_CHOWN: u16 = 40;
+/// `fchown(fd, uid, gid)`: `remote_id` names the open description, `arg0` and
+/// `arg1` as `VFS_IPC_OP_CHOWN`. Works on a file unlinked while open.
+pub const VFS_IPC_OP_FCHOWN: u16 = 41;
+/// `linkat(olddirfd, oldpath, newdirfd, newpath, flags)`: the two-path payload
+/// (`encode_two_path_payload(old, new)`) as `RENAMEAT2`; `dirfd`/`remote_id`
+/// base the old path, `arg0` is `newdirfd` and `arg2` its remote id, `arg1`
+/// the `AT_SYMLINK_FOLLOW` flag word. With `VFS_LINKAT_FLAG_SOURCE_DESCRIPTION`
+/// in `flags` the old path is empty and `remote_id` names the open description
+/// whose node gets the new name (`O_TMPFILE` and `/proc/self/fd/N` links).
+/// Hard links exist only on volumes with POSIX nodes (`EPERM` elsewhere, as
+/// Linux vfat); a link across mounts is `EXDEV`; a directory is `EPERM`.
+pub const VFS_IPC_OP_LINKAT: u16 = 42;
+/// "Leave this id unchanged" in `VFS_IPC_OP_CHOWN`/`FCHOWN` (`(uid_t)-1`).
+pub const VFS_ID_UNCHANGED: u64 = 0xFFFF_FFFF;
+/// `VfsIpcRequest::flags` bit of `VFS_IPC_OP_CHOWN`: do not follow a final symlink.
+pub const VFS_CHOWN_FLAG_NOFOLLOW: u32 = 1;
+/// `VfsIpcRequest::flags` bit of `VFS_IPC_OP_LINKAT`: link the open description.
+pub const VFS_LINKAT_FLAG_SOURCE_DESCRIPTION: u32 = 1;
+// ---- END vfsd ownership and hard-link ops ----
 pub const VFS_LIBRARY_READ_MAX_BYTES: usize = 8 * 4096;
 pub const VFS_CURSOR_SETTLE_COMMIT: u64 = 1;
 pub const VFS_CURSOR_SETTLE_CANCEL: u64 = 2;
@@ -1403,6 +1457,31 @@ pub const PROC_BROKER_PREPARE_FLAG_JOB_HANDLE: u32 = 1 << 1;
 /// version to process prepare/commit ABI revisions. Version 2 moved
 /// `exit_status` ahead of the pids and appended `tid` to `LifecycleEventWire`.
 pub const LIFECYCLE_DRAIN_BROKER_ABI_VERSION: u16 = 2;
+
+// ---- lifecycle broker pid-liveness probe (vfsd lock-owner verification) ----
+// BEGIN lifecycle-pid-probe
+/// `LifecycleDrainBrokerArgs::mode`: drain this consumer's event queue.
+pub const LIFECYCLE_BROKER_MODE_DRAIN: u16 = 0;
+/// `LifecycleDrainBrokerArgs::mode`: kernel-attested liveness probe.
+///
+/// `out_events_ptr` names `out_capacity` (at most `LIFECYCLE_DRAIN_MAX_EVENTS`)
+/// [`LifecyclePidProbeWire`] entries. The kernel reads each `pid` and writes
+/// back its `incarnation`: a non-zero value that identifies this exact process
+/// (stable across `exec`, never equal for two processes that ever shared a
+/// pid), or `0` when no such live process exists (never created, exiting or
+/// gone). `out_count_ptr` receives the number of live entries. No event queue
+/// is touched, so a probe never interferes with a drain. Only the
+/// `VfsPolicy` capability may probe: vfsd uses it to prove that the owner of a
+/// POSIX record lock still exists when an exit event may have been lost.
+pub const LIFECYCLE_BROKER_MODE_PROBE_PIDS: u16 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LifecyclePidProbeWire {
+    pub pid: u64,
+    pub incarnation: u64,
+}
+// END lifecycle-pid-probe
 /// Root-supervisor termination is versioned independently from every other
 /// process broker operation.
 pub const ROOTD_TERMINATE_BROKER_ABI_VERSION: u16 = 1;
@@ -2390,7 +2469,9 @@ const _: () = assert!(core::mem::size_of::<LifecycleEventWire>() == 32);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LifecycleDrainBrokerArgs {
     pub abi_version: u16,
-    pub reserved0: u16,
+    /// `LIFECYCLE_BROKER_MODE_*`. Zero (the value every earlier caller sent in
+    /// this then-reserved slot) is the drain.
+    pub mode: u16,
     pub reserved1: u32,
     pub out_events_ptr: u64,
     pub out_capacity: u32,
@@ -4254,8 +4335,10 @@ crate::user_wire!(RustosJobKmemArgs { abi_version: u16, op: u16, flags: u32, job
 crate::user_wire!(RustosJobMemoryQosArgs { abi_version: u16, op: u16, flags: u32, job_handle: u64, high_pages: u64, min_pages: u64, effective_high_pages: u64, usage_pages: u64, high_crossings: u64, reserved: u64 });
 crate::user_wire!(RustosCheckpointJournalArgs { abi_version: u16, op: u16, flags: u32, cursor: u64, next_cursor: u64, service_id: u64, record_kind: u16, done: u16, reserved: u32, record: ServiceCheckpointRecordWire });
 crate::user_wire!(RustosRootdMemoryBrokerArgs { abi_version: u16, reserved0: u16, flags: u32, usable_pages: u64, free_pages: u64, min_free_pages: u64, watermark_denials: u64, entry_count: u32, reserved1: u32, entries: [RootdMemoryCensusEntry; ROOTD_MEMORY_CENSUS_MAX_ENTRIES] });
+crate::user_wire!(LifecyclePidProbeWire { pid: u64, incarnation: u64 });
+crate::user_wire!(ProcFactsBrokerArgs { abi_version: u16, op: u16, flags: u32, pid: u64, tid: u64, out_ptr: u64, out_capacity: u32, reserved0: u32, out_len_ptr: u64 });
 crate::user_wire!(LifecycleEventWire { event: u16, reserved0: u16, exit_status: i32, pid: u64, parent_pid: u64, tid: u64 });
-crate::user_wire!(LifecycleDrainBrokerArgs { abi_version: u16, reserved0: u16, reserved1: u32, out_events_ptr: u64, out_capacity: u32, reserved2: u32, out_count_ptr: u64 });
+crate::user_wire!(LifecycleDrainBrokerArgs { abi_version: u16, mode: u16, reserved1: u32, out_events_ptr: u64, out_capacity: u32, reserved2: u32, out_count_ptr: u64 });
 crate::user_wire!(ServiceCheckpointRecordWire { version: u16, flags: u16, value_len: u32, key_hi: u64, key_lo: u64, parent_hi: u64, parent_lo: u64, operation_hi: u64, operation_lo: u64, revision: u64, value: [u8; SERVICE_CHECKPOINT_VALUE_CAPACITY] });
 crate::user_wire!(RootdMemoryCensusEntry { process_id: u64, parent_process_id: u64, resident_pages: u64, job: u64 });
 crate::user_wire!(RustosMmLayoutBrokerResult { brk_start: u64, brk_current: u64, brk_mapped_end: u64, mmap_next: u64, user_range_start: u64, user_range_end: u64 });

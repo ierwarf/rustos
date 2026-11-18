@@ -62,6 +62,21 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
         SYS_FCHMODAT | SYS_FCHMODAT2 => [S, W, U, U, W, W],
         // int dirfd, path*, timespec[2]*, int flags
         SYS_UTIMENSAT => [S, W, W, U, W, W],
+        // path*, uid_t owner, gid_t group (lchown shares the shape)
+        SYS_CHOWN | SYS_LCHOWN => [W, U, U, W, W, W],
+        // unsigned int fd, uid_t owner, gid_t group
+        SYS_FCHOWN => [S, U, U, W, W, W],
+        // int dirfd, path*, uid_t owner, gid_t group, int flag
+        SYS_FCHOWNAT => [S, W, U, U, U, W],
+        // path*, umode_t mode, unsigned dev
+        SYS_MKNOD => [W, U, U, W, W, W],
+        // int dirfd, path*, umode_t mode, unsigned dev
+        SYS_MKNODAT => [S, W, U, U, W, W],
+        // int olddirfd, oldpath*, int newdirfd, newpath*, int flags
+        SYS_LINKAT => [S, W, S, W, U, W],
+        // link/utimes/utime take only pointers: the default all-wide row
+        // int dirfd, path*, struct timeval[2]*
+        SYS_FUTIMESAT => [S, W, W, W, W, W],
         // int out_fd, int in_fd, off_t* offset, size_t count
         SYS_SENDFILE => [S, S, W, W, W, W],
         // int fd_in, loff_t*, int fd_out, loff_t*, size_t len, unsigned int flags
@@ -444,6 +459,34 @@ mod tests {
         let out = run(SYS_FSTATFS, [GARBAGE | 9, 0x3000, 0, 0, 0, 0]);
         assert_eq!(out[0], 9);
         assert_eq!(out[1], 0x3000);
+    }
+
+    #[test]
+    fn ownership_mknod_link_arg_widths() {
+        // (uid_t)-1 stays u32::MAX whatever the stub left in the upper half.
+        let out = run(SYS_CHOWN, [0x1000, GARBAGE | 0xFFFF_FFFF, GARBAGE | 7, 0, 0, 0]);
+        assert_eq!(out, [0x1000, 0xFFFF_FFFF, 7, 0, 0, 0]);
+        let out = run(SYS_LCHOWN, [0x1000, GARBAGE | 5, GARBAGE | 0xFFFF_FFFF, 0, 0, 0]);
+        assert_eq!(out, [0x1000, 5, 0xFFFF_FFFF, 0, 0, 0]);
+        let out = run(SYS_FCHOWN, [GARBAGE | 4, GARBAGE | 0xFFFF_FFFF, GARBAGE | 9, 0, 0, 0]);
+        assert_eq!(out, [4, 0xFFFF_FFFF, 9, 0, 0, 0]);
+        let out = run(
+            SYS_FCHOWNAT,
+            [0xFFFF_FF9C, 0x1000, GARBAGE | 1, GARBAGE | 2, GARBAGE | 0x100, 0],
+        );
+        assert_eq!(out, [0xFFFF_FFFF_FFFF_FF9C, 0x1000, 1, 2, 0x100, 0]);
+        let out = run(SYS_MKNOD, [0x1000, GARBAGE | 0o100644, GARBAGE | 0, 0, 0, 0]);
+        assert_eq!(out, [0x1000, 0o100644, 0, 0, 0, 0]);
+        let out = run(SYS_MKNODAT, [0xFFFF_FF9C, 0x1000, GARBAGE | 0o140600, GARBAGE | 3, 0, 0]);
+        assert_eq!(out, [0xFFFF_FFFF_FFFF_FF9C, 0x1000, 0o140600, 3, 0, 0]);
+        let out = run(SYS_LINKAT, [GARBAGE | 3, 0x1000, 0xFFFF_FF9C, 0x2000, GARBAGE | 0x400, 0]);
+        assert_eq!(out, [3, 0x1000, 0xFFFF_FFFF_FFFF_FF9C, 0x2000, 0x400, 0]);
+        let args = [0x1000, 0x2000, 0, 0, 0, 0];
+        assert_eq!(run(SYS_LINK, args), args);
+        assert_eq!(run(SYS_UTIMES, args), args);
+        assert_eq!(run(SYS_UTIME, args), args);
+        let out = run(SYS_FUTIMESAT, [0xFFFF_FF9C, 0x1000, 0x2000, 0, 0, 0]);
+        assert_eq!(out, [0xFFFF_FFFF_FFFF_FF9C, 0x1000, 0x2000, 0, 0, 0]);
     }
 
     #[test]

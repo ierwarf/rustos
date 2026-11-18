@@ -41,12 +41,14 @@ pub(super) struct ThreadFacts {
     pub tid: u64,
     /// At most 15 bytes, no NUL.
     pub comm: Vec<u8>,
-    /// `R` for the thread executing the read; `S` for any other thread: the
-    /// kernel does not expose another thread's run state here.
+    /// `R` when the thread is running or runnable, `S` when it is blocked
+    /// (the scheduler's run-intent bit; no finer Linux state is tracked).
     pub state: u8,
     pub pending_signals: u64,
     pub blocked_signals: u64,
-    /// Consumed CPU in clock ticks, only for the reading thread.
+    /// Consumed CPU in clock ticks. The scheduler keeps no per-thread CPU
+    /// counter, so this is `Some` only for the reading thread (its scheduling
+    /// context's consumed budget) and `None` (printed 0) for every other.
     pub utime_ticks: Option<u64>,
 }
 
@@ -64,6 +66,10 @@ pub(super) struct ProcessFacts {
     pub rss_pages: Option<u64>,
     /// Bytes `mlock`/`mlockall` hold in the process's lock ledger (`VmLck`).
     pub locked_bytes: u64,
+    /// Descriptor slots the fd table has allocated (`FDSize`).
+    pub fd_slots: Option<u64>,
+    /// `oom_score_adj` recorded for the process.
+    pub oom_score_adj: i16,
     pub regions: Vec<MapRegion>,
     pub brk_start: u64,
     pub arg_start: u64,
@@ -233,8 +239,10 @@ fn comm_str(comm: &[u8]) -> String {
     String::from_utf8_lossy(comm).into_owned()
 }
 
-/// `/proc/<pid>/status`. Keys with no real source are omitted (`FDSize`,
-/// `Groups`, `VmHWM`, `VmPeak`, `RssAnon`, context-switch counts, `Cpus_allowed`).
+/// `/proc/<pid>/status`. Keys with no real source are omitted (`Groups`:
+/// supplementary groups are syscalld policy state; `VmHWM`/`VmPeak`: nothing
+/// tracks a high-water mark; `RssAnon`, context-switch counts,
+/// `Cpus_allowed`). `FDSize` is the fd table's allocated slot count.
 /// `Uid`/`Gid` carry real and effective ids; the saved and filesystem columns
 /// repeat the effective id (there is no setuid exec and no `setfsuid`).
 pub(super) fn format_status(process: &ProcessFacts, thread: &ThreadFacts) -> Vec<u8> {
@@ -255,6 +263,9 @@ pub(super) fn format_status(process: &ProcessFacts, thread: &ThreadFacts) -> Vec
         "Gid:\t{}\t{}\t{}\t{}",
         process.gid, process.egid, process.egid, process.egid
     );
+    if let Some(slots) = process.fd_slots {
+        let _ = writeln!(out, "FDSize:\t{slots}");
+    }
     let _ = writeln!(out, "VmSize:\t{:>8} kB", process.vm_size_bytes() / 1024);
     let _ = writeln!(out, "VmLck:\t{:>8} kB", process.locked_bytes / 1024);
     if let Some(pages) = process.rss_pages {
@@ -345,10 +356,11 @@ pub(super) fn format_comm(thread: &ThreadFacts) -> Vec<u8> {
     out
 }
 
-/// `/proc/<pid>/oom_score_adj`. RustOS has no OOM-score adjustment, so the
-/// value is the constant default and writes are refused (the file is 0444).
-pub(super) fn format_oom_score_adj() -> Vec<u8> {
-    b"0\n".to_vec()
+/// `/proc/<pid>/oom_score_adj`: the value last written (default 0). It is
+/// recorded and inherited but ranks nothing: RustOS has no OOM victim
+/// selection for it to influence.
+pub(super) fn format_oom_score_adj(process: &ProcessFacts) -> Vec<u8> {
+    alloc::format!("{}\n", process.oom_score_adj).into_bytes()
 }
 
 // ---- limits ---------------------------------------------------------------------------
@@ -485,6 +497,8 @@ mod tests {
             start_ticks: 555,
             rss_pages: Some(10),
             locked_bytes: 12 * 1024,
+            fd_slots: Some(64),
+            oom_score_adj: -250,
             regions,
             brk_start: 0x4000_0000,
             arg_start: 0x7fff_f000,
@@ -618,7 +632,7 @@ mod tests {
         assert!(text.contains("SigIgn:\t0000000000000004\n"));
         assert!(text.contains("SigCgt:\t0000000000008000\n"));
         assert!(text.contains("NoNewPrivs:\t1\n"));
-        assert!(!text.contains("FDSize"));
+        assert!(text.contains("Gid:\t100\t101\t101\t101\nFDSize:\t64\nVmSize:"));
         assert!(!text.contains("VmHWM"));
         assert!(!text.contains("Groups"));
     }
@@ -627,10 +641,12 @@ mod tests {
     fn status_omits_rss_when_unavailable_and_marks_other_threads_sleeping() {
         let mut process = facts(vec![]);
         process.rss_pages = None;
+        process.fd_slots = None;
         let mut other = thread(44, "worker");
         other.state = b'S';
         let text = String::from_utf8(format_status(&process, &other)).unwrap();
         assert!(!text.contains("VmRSS"));
+        assert!(!text.contains("FDSize"));
         assert!(text.contains("State:\tS (sleeping)\n"));
     }
 
@@ -699,7 +715,7 @@ mod tests {
     #[test]
     fn comm_and_oom_score_adj() {
         assert_eq!(format_comm(&thread(1, "abc")), b"abc\n");
-        assert_eq!(format_oom_score_adj(), b"0\n");
+        assert_eq!(format_oom_score_adj(&facts(vec![])), b"-250\n");
     }
 
     #[test]

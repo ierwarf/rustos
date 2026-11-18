@@ -198,15 +198,51 @@ pub fn open_delegate(node: ProcNode) -> Option<u64> {
     }
 }
 
+/// Whether `kernel` is a `/proc/<pid>/*` node whose read-only text is formatted
+/// in Ring3 `vfsd` from raw facts pulled via `SYS_RUSTOS_PROC_FACTS_BROKER`.
+pub const fn is_ring3_formatted(kernel: ProcKernelNode) -> bool {
+    matches!(
+        kernel,
+        ProcKernelNode::Maps
+            | ProcKernelNode::Smaps
+            | ProcKernelNode::Status
+            | ProcKernelNode::Stat
+            | ProcKernelNode::Statm
+            | ProcKernelNode::Comm
+            | ProcKernelNode::OomScoreAdj
+            | ProcKernelNode::TaskStat
+            | ProcKernelNode::TaskComm
+            | ProcKernelNode::TaskStatus
+    )
+}
+
+/// `aux` for `open(flags)` when Ring0 must complete the open (`FdLink`,
+/// `Cmdline`/`Environ`/`Auxv`, `Limits`, directory snapshots, or writable opens
+/// of `comm`/`oom_score_adj`). Read-only opens of Ring3-formatted nodes return
+/// `None` so `vfsd` pulls raw facts and formats them in Ring3.
+pub fn open_delegate_for_flags(node: ProcNode, flags: u64) -> Option<u64> {
+    let ProcNode::Kernel(kernel, number) = node else {
+        return None;
+    };
+    if is_ring3_formatted(kernel) && (flags & O_ACCMODE == 0) {
+        return None;
+    }
+    Some(abi_procfs::encode_delegate(kernel, number))
+}
+
 /// Errno for an `open(flags)` of a delegated node that can never succeed, or
-/// `None` when the kernel should build the snapshot. Every generated node is
-/// read-only; a regular file is not a directory; a magic link is not followed
-/// under `O_NOFOLLOW`.
+/// `None` when the kernel should build the snapshot. Only `comm`,
+/// `task/<tid>/comm` and `oom_score_adj` may be opened for writing or with
+/// `O_TRUNC`; `O_CREAT` is always refused; a regular file is not a directory;
+/// a magic link is not followed under `O_NOFOLLOW`.
 pub fn delegated_open_errno(node: ProcNode, flags: u64) -> Option<i32> {
     let ProcNode::Kernel(kernel, _) = node else {
         return None;
     };
-    if flags & O_ACCMODE != 0 || flags & (O_CREAT | O_TRUNC) != 0 {
+    if flags & O_CREAT != 0 {
+        return Some(EACCES);
+    }
+    if !kernel.is_writable() && (flags & O_ACCMODE != 0 || flags & O_TRUNC != 0) {
         return Some(EACCES);
     }
     if kernel.is_link() && flags & O_NOFOLLOW != 0 {
@@ -660,6 +696,19 @@ mod tests {
         assert_eq!(delegated_open_errno(fd, O_NOFOLLOW), Some(ELOOP));
         assert_eq!(delegated_open_errno(fd, 0), None);
         assert_eq!(delegated_open_errno(ProcNode::PidDir, 1), None);
+
+        for writable in [
+            ProcNode::Kernel(ProcKernelNode::Comm, 0),
+            ProcNode::Kernel(ProcKernelNode::TaskComm, 7),
+            ProcNode::Kernel(ProcKernelNode::OomScoreAdj, 0),
+        ] {
+            assert_eq!(delegated_open_errno(writable, 0), None);
+            assert_eq!(delegated_open_errno(writable, 1), None);
+            assert_eq!(delegated_open_errno(writable, 2), None);
+            assert_eq!(delegated_open_errno(writable, 1 | O_TRUNC), None);
+            assert_eq!(delegated_open_errno(writable, 1 | O_CREAT), Some(EACCES));
+            assert_eq!(delegated_open_errno(writable, O_DIRECTORY), Some(ENOTDIR));
+        }
     }
 
     #[test]

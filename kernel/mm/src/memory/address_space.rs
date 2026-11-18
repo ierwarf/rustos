@@ -26,6 +26,8 @@ use x86_64::structures::paging::{PageTable, PageTableFlags};
 use kernel_hal::api::arch::tlb::{AddressSpaceMutationGuard, begin_address_space_mutation};
 
 mod atomic_user;
+mod eof_guard;
+pub use eof_guard::current_user_leaf_is_eof_guard;
 mod execution_lifetime;
 mod frame_release;
 mod immutable;
@@ -750,6 +752,11 @@ impl ProcessAddressSpace {
                 let entry = &mut pt[p1 + offset];
                 if entry.is_unused() {
                     return Err(AddressSpaceError::NotMapped);
+                }
+                // A page past the end of its file stays a guard: protection
+                // changes apply to the file's pages, never reopen the hole.
+                if eof_guard::is_guard_leaf(entry.addr().as_u64(), entry.flags()) {
+                    continue;
                 }
                 let updated = preserve_4k_leaf_pat(entry.flags(), page_flags);
                 entry.set_addr(entry.addr(), updated);

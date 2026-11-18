@@ -99,6 +99,11 @@ pub struct ProcessSecurityContext {
     /// credentials did not change. RustOS produces no core dumps or ptrace
     /// attach checks that consume it yet.
     dumpable: bool,
+    /// `/proc/<pid>/oom_score_adj` in `-1000..=1000`. Inherited by fork and
+    /// preserved across exec, as Linux does. RustOS ranks nothing by it: the
+    /// job-group memory limit has no victim selection, so the value is
+    /// recorded and read back but has no policy effect.
+    oom_score_adj: i16,
 }
 
 impl ProcessSecurityContext {
@@ -122,6 +127,7 @@ impl ProcessSecurityContext {
             pending_admin_request: None,
             no_new_privs: false,
             dumpable: true,
+            oom_score_adj: 0,
         }
     }
 
@@ -141,6 +147,7 @@ impl ProcessSecurityContext {
             pending_admin_request: None,
             no_new_privs: false,
             dumpable: true,
+            oom_score_adj: 0,
         }
     }
 
@@ -156,7 +163,12 @@ impl ProcessSecurityContext {
             self.egid,
         );
         next.no_new_privs = self.no_new_privs;
+        next.oom_score_adj = self.oom_score_adj;
         next
+    }
+
+    pub const fn oom_score_adj(self) -> i16 {
+        self.oom_score_adj
     }
 
     pub const fn no_new_privs(self) -> bool {
@@ -481,6 +493,7 @@ pub struct SharedMemfdMapping {
     start: u64,
     len: u64,
     backing_offset: u64,
+    page_flags: PageTableFlags,
     hold: MemfdMappingHold,
 }
 
@@ -666,15 +679,76 @@ impl UserProcessState {
         start: u64,
         len: u64,
         backing_offset: u64,
+        page_flags: PageTableFlags,
         hold: MemfdMappingHold,
     ) {
         self.shared_memfd_mappings.push(SharedMemfdMapping {
             start,
             len,
             backing_offset,
+            page_flags,
             hold,
         });
         self.sync_mapping_kmem();
+    }
+
+    pub fn shared_memfd_object_ids_in_range(&self, start: u64, end: u64) -> Vec<u64> {
+        let mut ids = Vec::new();
+        for mapping in &self.shared_memfd_mappings {
+            if end > mapping.start && start < mapping.end() {
+                let id = mapping.hold.object_id();
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
+
+    pub fn shared_memfd_holds(&self) -> Vec<MemfdMappingHold> {
+        let mut holds: Vec<MemfdMappingHold> = Vec::new();
+        for mapping in &self.shared_memfd_mappings {
+            let id = mapping.hold.object_id();
+            if !holds.iter().any(|h| h.object_id() == id) {
+                holds.push(mapping.hold.clone());
+            }
+        }
+        holds
+    }
+
+    pub fn reconcile_shared_memfd_mappings(
+        &mut self,
+        object_id: u64,
+        frames: &[u64],
+    ) -> Result<(), crate::memory::paging::AddressSpaceError> {
+        let mut ranges = Vec::new();
+        for mapping in &self.shared_memfd_mappings {
+            if mapping.hold.object_id() == object_id {
+                ranges.push((
+                    mapping.start,
+                    mapping.len,
+                    mapping.backing_offset,
+                    mapping.page_flags,
+                ));
+            }
+        }
+        for (start, len, backing_offset, page_flags) in ranges {
+            let page_count = (len as usize).div_ceil(4096);
+            let start_page = (backing_offset as usize) / 4096;
+            let available = if start_page < frames.len() {
+                let end_page = frames.len().min(start_page.saturating_add(page_count));
+                &frames[start_page..end_page]
+            } else {
+                &[]
+            };
+            self.address_space.reconcile_external_user_pages(
+                VirtAddr::new(start),
+                available,
+                page_count,
+                page_flags,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn shared_memfd_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, usize)> {
@@ -725,6 +799,7 @@ impl UserProcessState {
                     start: mapping.start,
                     len: start - mapping.start,
                     backing_offset: mapping.backing_offset,
+                    page_flags: mapping.page_flags,
                     hold: mapping.hold.clone(),
                 });
             }
@@ -736,12 +811,70 @@ impl UserProcessState {
                         .backing_offset
                         .checked_add(end - mapping.start)
                         .expect("shared memfd split offset overflow"),
+                    page_flags: mapping.page_flags,
                     hold: mapping.hold.clone(),
                 });
             }
         }
         self.shared_memfd_mappings = updated;
         self.sync_mapping_kmem();
+    }
+
+    pub fn update_shared_memfd_page_flags_in_range(
+        &mut self,
+        start: u64,
+        end: u64,
+        page_flags: PageTableFlags,
+    ) {
+        if !self
+            .shared_memfd_mappings
+            .iter()
+            .any(|mapping| end > mapping.start && start < mapping.end())
+        {
+            return;
+        }
+        let mut updated = Vec::with_capacity(self.shared_memfd_mappings.len() + 2);
+        for mapping in self.shared_memfd_mappings.drain(..) {
+            let mapping_end = mapping.end();
+            if end <= mapping.start || start >= mapping_end {
+                updated.push(mapping);
+                continue;
+            }
+            if start > mapping.start {
+                updated.push(SharedMemfdMapping {
+                    start: mapping.start,
+                    len: start - mapping.start,
+                    backing_offset: mapping.backing_offset,
+                    page_flags: mapping.page_flags,
+                    hold: mapping.hold.clone(),
+                });
+            }
+            let overlap_start = start.max(mapping.start);
+            let overlap_end = end.min(mapping_end);
+            updated.push(SharedMemfdMapping {
+                start: overlap_start,
+                len: overlap_end - overlap_start,
+                backing_offset: mapping
+                    .backing_offset
+                    .checked_add(overlap_start - mapping.start)
+                    .expect("shared memfd protect offset overflow"),
+                page_flags,
+                hold: mapping.hold.clone(),
+            });
+            if end < mapping_end {
+                updated.push(SharedMemfdMapping {
+                    start: end,
+                    len: mapping_end - end,
+                    backing_offset: mapping
+                        .backing_offset
+                        .checked_add(end - mapping.start)
+                        .expect("shared memfd protect offset overflow"),
+                    page_flags: mapping.page_flags,
+                    hold: mapping.hold.clone(),
+                });
+            }
+        }
+        self.shared_memfd_mappings = updated;
     }
 
     pub fn record_shared_region_mapping(
@@ -1107,6 +1240,12 @@ impl UserProcessState {
         self.security.dumpable = dumpable;
     }
 
+    /// Records `/proc/<pid>/oom_score_adj`; `None` when outside `-1000..=1000`.
+    pub fn set_oom_score_adj(&mut self, value: i64) -> Option<()> {
+        self.security.oom_score_adj = i16::try_from(value).ok().filter(|v| (-1000..=1000).contains(v))?;
+        Some(())
+    }
+
     pub fn set_gid(&mut self, gid: u32) {
         self.security.set_gid(gid);
     }
@@ -1450,5 +1589,110 @@ mod tests {
         assert!(exec.dumpable());
         assert_eq!(exec.uid(), state.security().uid());
         assert_eq!(exec.egid(), state.security().egid());
+    }
+
+    #[test]
+    fn oom_score_adj_is_range_checked_inherited_and_exec_preserved() {
+        use crate::user::process_state::UserProcessState;
+        use kernel_mm::api::ProcessAddressSpace;
+        let mut state = UserProcessState::new(
+            ProcessAddressSpace::empty_for_tests(),
+            Some(crate::user::linux::LinuxProcessState::default()),
+            None, None, None, false, "/p",
+        );
+        assert_eq!(state.security().oom_score_adj(), 0);
+        assert_eq!(state.set_oom_score_adj(1001), None);
+        assert_eq!(state.set_oom_score_adj(-1001), None);
+        assert_eq!(state.security().oom_score_adj(), 0);
+        assert_eq!(state.set_oom_score_adj(-1000), Some(()));
+        assert_eq!(state.security().oom_score_adj(), -1000);
+        assert_eq!(state.security().for_exec().oom_score_adj(), -1000);
+        assert_eq!(state.set_oom_score_adj(1000), Some(()));
+        assert_eq!(state.security().oom_score_adj(), 1000);
+    }
+
+    #[test]
+    fn shared_memfd_object_ids_in_range_deduplicates_and_filters_by_overlap() {
+        use crate::user::memfd::MemfdHandle;
+        use crate::user::process_state::UserProcessState;
+        use alloc::string::String;
+        use kernel_mm::api::{PageTableFlags, ProcessAddressSpace};
+
+        let mut state = UserProcessState::new(
+            ProcessAddressSpace::empty_for_tests(),
+            Some(crate::user::linux::LinuxProcessState::default()),
+            None, None, None, false, "/p",
+        );
+        let m1 = MemfdHandle::new(String::from("m1"), true, None);
+        m1.truncate(4096).unwrap();
+        let (_f1, _p1, h1) = m1.acquire_mapping_with_eof_guard(0, 4096, true).unwrap();
+        let id1 = h1.object_id();
+        let flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+
+        state.record_shared_memfd_mapping(0x10000, 4096, 0, flags, h1.clone());
+        state.record_shared_memfd_mapping(0x12000, 4096, 0, flags, h1);
+        assert_eq!(state.shared_memfd_object_ids_in_range(0x10000, 0x13000), alloc::vec![id1]);
+        assert!(state.shared_memfd_object_ids_in_range(0x11000, 0x12000).is_empty());
+    }
+
+    #[test]
+    fn mprotect_updates_shared_memfd_page_flags_across_split_ranges() {
+        use crate::user::memfd::MemfdHandle;
+        use crate::user::process_state::UserProcessState;
+        use alloc::string::String;
+        use kernel_mm::api::{PageTableFlags, ProcessAddressSpace};
+
+        let mut state = UserProcessState::new(
+            ProcessAddressSpace::empty_for_tests(),
+            Some(crate::user::linux::LinuxProcessState::default()),
+            None, None, None, false, "/p",
+        );
+        let memfd = MemfdHandle::new(String::from("mprotect-split"), true, None);
+        memfd.truncate(3 * 4096).unwrap();
+        let (_f, _p, hold) = memfd
+            .acquire_mapping_with_eof_guard(0, 3 * 4096, true)
+            .unwrap();
+        let rw = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE;
+        let ro = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE;
+
+        state.record_shared_memfd_mapping(0x20000, 3 * 4096, 0, rw, hold);
+        state.update_shared_memfd_page_flags_in_range(0x21000, 0x22000, ro);
+
+        assert_eq!(state.shared_memfd_mappings.len(), 3);
+        assert_eq!(
+            (
+                state.shared_memfd_mappings[0].start,
+                state.shared_memfd_mappings[0].len,
+                state.shared_memfd_mappings[0].backing_offset,
+                state.shared_memfd_mappings[0].page_flags,
+            ),
+            (0x20000, 4096, 0, rw)
+        );
+        assert_eq!(
+            (
+                state.shared_memfd_mappings[1].start,
+                state.shared_memfd_mappings[1].len,
+                state.shared_memfd_mappings[1].backing_offset,
+                state.shared_memfd_mappings[1].page_flags,
+            ),
+            (0x21000, 4096, 4096, ro)
+        );
+        assert_eq!(
+            (
+                state.shared_memfd_mappings[2].start,
+                state.shared_memfd_mappings[2].len,
+                state.shared_memfd_mappings[2].backing_offset,
+                state.shared_memfd_mappings[2].page_flags,
+            ),
+            (0x22000, 4096, 8192, rw)
+        );
+        let holds = state.shared_memfd_holds();
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].object_id(), state.shared_memfd_mappings[0].hold.object_id());
     }
 }

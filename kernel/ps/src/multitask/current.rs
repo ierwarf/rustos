@@ -677,6 +677,24 @@ pub fn linux_thread_snapshot_by_ids(
     super::scheduler::current_observation::linux(process_id, thread_id)
 }
 
+/// Run intent of another live Linux thread of `process_id`: `Some(true)` when
+/// it is runnable or running, `Some(false)` when blocked, `None` when it is
+/// not a live thread of that process. Behind the `State:` of
+/// `/proc/<pid>/task/<tid>/{stat,status}`.
+pub fn linux_thread_runnable_by_ids(process_id: u64, thread_id: u64) -> Option<bool> {
+    super::scheduler::current_observation::thread_runnable(process_id, thread_id)
+}
+
+/// Sets the `comm` of thread `thread_id` of `process_id` (`/proc/.../comm`
+/// writes); `false` when it is not a live Linux thread of that process.
+pub fn set_linux_thread_comm_by_ids(
+    process_id: u64,
+    thread_id: u64,
+    comm: [u8; rustos_user_abi::linux::LINUX_TASK_COMM_LEN],
+) -> bool {
+    super::scheduler::current_observation::set_thread_comm(process_id, thread_id, comm)
+}
+
 pub fn with_current_user_linux_state_mut<R>(
     f: impl FnOnce(
         u64,

@@ -10,6 +10,7 @@ pub mod mount_table;
 pub mod path;
 pub mod permissions;
 pub mod proc_fs;
+pub mod proc_snapshot;
 pub mod snapshot_budget;
 pub mod snapshot_sessions;
 pub mod tmpfs;
@@ -1811,6 +1812,84 @@ pub fn client_proxy_shape(
         && request_pid != 0
         && request_pid != sender_pid
 }
+
+// BEGIN lock-release-proxy
+/// Shape of the one request that acts for a process other than its IPC sender
+/// in the lock namespace: loaderd's `exec` broker telling vfsd that the
+/// exec'ing process (`request.pid`) just closed a `CLOEXEC` descriptor, which
+/// drops that process's POSIX locks on the file (`RELEASE_FILE`, POSIX owner,
+/// no range). It must run on the sender's own thread and name a different,
+/// non-zero pid. The sender's service identity (the live loaderd owner) is
+/// checked by the caller; no other lock command, owner or sender may name a
+/// pid, so a client can neither take nor release locks for another process.
+pub fn lock_release_proxy_shape(
+    request: &rustos_user_abi::syscall::VfsIpcRequest,
+    sender_pid: u64,
+    sender_tid: u64,
+) -> bool {
+    use rustos_user_abi::syscall::{
+        VfsFileLockWire, VFS_FILE_LOCK_CMD_RELEASE_FILE, VFS_FILE_LOCK_OWNER_POSIX,
+        VFS_IPC_OP_FILE_LOCK,
+    };
+    if request.op != VFS_IPC_OP_FILE_LOCK
+        || request.tid != sender_tid
+        || request.pid == 0
+        || request.pid == sender_pid
+    {
+        return false;
+    }
+    let payload = &request.payload[..(request.payload_len as usize).min(request.payload.len())];
+    VfsFileLockWire::from_bytes(payload).is_some_and(|wire| {
+        wire.is_well_formed()
+            && wire.cmd == VFS_FILE_LOCK_CMD_RELEASE_FILE
+            && wire.owner == VFS_FILE_LOCK_OWNER_POSIX
+    })
+}
+
+#[cfg(test)]
+mod lock_release_proxy_tests {
+    use super::lock_release_proxy_shape as shape;
+    use rustos_user_abi::syscall::*;
+
+    fn request(cmd: u16, owner: u16, pid: u64, tid: u64) -> VfsIpcRequest {
+        let wire = VfsFileLockWire {
+            version: VFS_FILE_LOCK_WIRE_VERSION,
+            cmd,
+            owner,
+            lock_type: VFS_FILE_LOCK_TYPE_UNLCK,
+            ..VfsFileLockWire::default()
+        };
+        let mut r = VfsIpcRequest { op: VFS_IPC_OP_FILE_LOCK, pid, tid, ..VfsIpcRequest::default() };
+        let bytes = wire.to_bytes();
+        r.payload[..bytes.len()].copy_from_slice(&bytes);
+        r.payload_len = bytes.len() as u32;
+        r
+    }
+
+    #[test]
+    fn only_a_posix_release_on_the_senders_thread_may_name_another_pid() {
+        let release = request(VFS_FILE_LOCK_CMD_RELEASE_FILE, VFS_FILE_LOCK_OWNER_POSIX, 80, 7);
+        assert!(shape(&release, 5, 7));
+        assert!(!shape(&release, 5, 8), "thread must be the sender's");
+        assert!(!shape(&release, 80, 7), "equal pid is the ordinary path");
+        assert!(!shape(&request(VFS_FILE_LOCK_CMD_RELEASE_FILE, VFS_FILE_LOCK_OWNER_POSIX, 0, 7), 5, 7));
+        for cmd in [VFS_FILE_LOCK_CMD_GETLK, VFS_FILE_LOCK_CMD_SETLK, VFS_FILE_LOCK_CMD_SETLKW, VFS_FILE_LOCK_CMD_CANCEL_WAIT] {
+            assert!(!shape(&request(cmd, VFS_FILE_LOCK_OWNER_POSIX, 80, 7), 5, 7), "cmd {cmd}");
+        }
+        for owner in [VFS_FILE_LOCK_OWNER_OFD, VFS_FILE_LOCK_OWNER_FLOCK] {
+            assert!(!shape(&request(VFS_FILE_LOCK_CMD_RELEASE_FILE, owner, 80, 7), 5, 7), "owner {owner}");
+        }
+        let mut other_op = release;
+        other_op.op = VFS_IPC_OP_READ;
+        assert!(!shape(&other_op, 5, 7));
+        let mut garbled = release;
+        garbled.payload_len = 3;
+        assert!(!shape(&garbled, 5, 7));
+        garbled.payload_len = 0;
+        assert!(!shape(&garbled, 5, 7));
+    }
+}
+// END lock-release-proxy
 
 /// Admission of `VFS_IPC_OP_SHARED_BACKING` against one open description:
 /// only regular-file descriptions, only known flags, a writable backing only

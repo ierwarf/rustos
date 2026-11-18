@@ -723,37 +723,51 @@ fn broker_map_memfd_shared(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(),
     let mapping_end = checked_mapping_end(start, page_count(len)?)?;
     let writable = args.prot & linux_abi::PROT_WRITE != 0;
     let memfd = memfd_source(t, args.fd, writable)?;
-    let (frames, hold) = memfd
-        .acquire_mapping(
-            usize::try_from(args.offset).map_err(|_| LINUX_EINVAL)?,
-            len,
-            writable,
-        )
-        .map_err(memfd_error_to_errno)?;
+    let offset = usize::try_from(args.offset).map_err(|_| LINUX_EINVAL)?;
     let page_flags = protection_to_page_flags(args.prot)?;
 
-    let Some(result) = multitask::with_process_state_by_generation_mut(t.pid, t.process_generation, t.mm_generation, |process_state| {
-        if !process_state.mapping_below_stack_guard(start, mapping_end) {
-            return Err(LINUX_ENOMEM);
-        }
-        // The Job's mapping-record budget refuses before any page is mapped.
-        if !process_state.admit_mapping_records(1) {
-            return Err(LINUX_ENOMEM);
-        }
-        process_state
-            .address_space_mut()
-            .map_existing_user_pages_at(VirtAddr::new(start), &frames, page_flags)
-            .map_err(address_space_error_to_linux_errno)?;
-        process_state.record_shared_memfd_mapping(start, args.len, args.offset, hold);
-        process_state.set_mapping_cursor(mapping_end);
-        Ok::<RustosMmMapBrokerResult, i64>(RustosMmMapBrokerResult {
-            addr: start,
-            len: args.len,
-        })
-    }) else {
-        return Err(LINUX_ESRCH);
-    };
-    publish_map_result(args, t, &result?)
+    let result = memfd.with_reconcile_lock(|| {
+        let (frames, page_count, hold) = memfd
+            .acquire_mapping_with_eof_guard(offset, len, writable)
+            .map_err(memfd_error_to_errno)?;
+        multitask::with_process_state_by_generation_mut(
+            t.pid,
+            t.process_generation,
+            t.mm_generation,
+            |process_state| {
+                if !process_state.mapping_below_stack_guard(start, mapping_end) {
+                    return Err(LINUX_ENOMEM);
+                }
+                // The Job's mapping-record budget refuses before any page is mapped.
+                if !process_state.admit_mapping_records(1) {
+                    return Err(LINUX_ENOMEM);
+                }
+                process_state
+                    .address_space_mut()
+                    .map_external_user_pages_with_eof_guard(
+                        VirtAddr::new(start),
+                        &frames,
+                        page_count,
+                        page_flags,
+                    )
+                    .map_err(address_space_error_to_linux_errno)?;
+                process_state.record_shared_memfd_mapping(
+                    start,
+                    args.len,
+                    args.offset,
+                    page_flags,
+                    hold,
+                );
+                process_state.set_mapping_cursor(mapping_end);
+                Ok::<RustosMmMapBrokerResult, i64>(RustosMmMapBrokerResult {
+                    addr: start,
+                    len: args.len,
+                })
+            },
+        )
+        .ok_or(LINUX_ESRCH)?
+    })?;
+    publish_map_result(args, t, &result)
 }
 
 /// Maps an authenticated app DMA-BUF capability. `args.offset` is the byte
@@ -1043,6 +1057,9 @@ fn broker_protect(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64> {
             .address_space_mut()
             .protect_user_bytes(VirtAddr::new(start), len, page_flags)
             .map_err(address_space_error_to_linux_errno);
+        if result.is_ok() {
+            process_state.update_shared_memfd_page_flags_in_range(start, end, page_flags);
+        }
         process_state.sync_mapping_kmem();
         result
     }) else {

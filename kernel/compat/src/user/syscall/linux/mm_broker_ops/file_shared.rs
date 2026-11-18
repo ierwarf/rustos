@@ -105,34 +105,47 @@ pub(super) fn broker_map_file_shared(args: &RustosMmBrokerArgs, t: MmTarget) -> 
         ipc_ops::live_service_endpoint_owner_and_epoch(rustos_user_abi::syscall::IPC_SERVICE_VFSD)
             .ok_or(LINUX_ESTALE)?;
     let memfd = service_memfd(service_pid, token, object).ok_or(LINUX_ESTALE)?;
-    let (frames, hold) = memfd
-        .acquire_mapping(offset, len, writable)
-        .map_err(memfd_error_to_errno)?;
+    let result = memfd.with_reconcile_lock(|| {
+        let (frames, page_count, hold) = memfd
+            .acquire_mapping_with_eof_guard(offset, len, writable)
+            .map_err(memfd_error_to_errno)?;
 
-    let result = multitask::with_process_state_by_generation_mut(
-        t.pid,
-        t.process_generation,
-        t.mm_generation,
-        |process_state| {
-            if !process_state.mapping_below_stack_guard(start, mapping_end) {
-                return Err(LINUX_ENOMEM);
-            }
-            if !process_state.admit_mapping_records(1) {
-                return Err(LINUX_ENOMEM);
-            }
-            process_state
-                .address_space_mut()
-                .map_existing_user_pages_at(VirtAddr::new(start), &frames, page_flags)
-                .map_err(address_space_error_to_linux_errno)?;
-            process_state.record_shared_memfd_mapping(start, args.len, args.offset, hold);
-            process_state.set_mapping_cursor(mapping_end);
-            Ok::<RustosMmMapBrokerResult, i64>(RustosMmMapBrokerResult {
-                addr: start,
-                len: args.len,
-            })
-        },
-    )
-    .ok_or(LINUX_ESRCH)??;
+        multitask::with_process_state_by_generation_mut(
+            t.pid,
+            t.process_generation,
+            t.mm_generation,
+            |process_state| {
+                if !process_state.mapping_below_stack_guard(start, mapping_end) {
+                    return Err(LINUX_ENOMEM);
+                }
+                if !process_state.admit_mapping_records(1) {
+                    return Err(LINUX_ENOMEM);
+                }
+                process_state
+                    .address_space_mut()
+                    .map_external_user_pages_with_eof_guard(
+                        VirtAddr::new(start),
+                        &frames,
+                        page_count,
+                        page_flags,
+                    )
+                    .map_err(address_space_error_to_linux_errno)?;
+                process_state.record_shared_memfd_mapping(
+                    start,
+                    args.len,
+                    args.offset,
+                    page_flags,
+                    hold,
+                );
+                process_state.set_mapping_cursor(mapping_end);
+                Ok::<RustosMmMapBrokerResult, i64>(RustosMmMapBrokerResult {
+                    addr: start,
+                    len: args.len,
+                })
+            },
+        )
+        .ok_or(LINUX_ESRCH)?
+    })?;
     publish_map_result(args, t, &result)
 }
 
@@ -159,7 +172,9 @@ mod tests {
         let source = include_str!("file_shared.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
         assert!(production.contains("record_shared_memfd_mapping"));
-        assert!(production.contains("acquire_mapping"));
+        assert!(production.contains("acquire_mapping_with_eof_guard"));
+        assert!(production.contains("map_external_user_pages_with_eof_guard"));
+        assert!(production.contains("with_reconcile_lock"));
         for forbidden in ["map_zeroed_user_bytes_at", "copy_file_mapping", "with_process_state_by_pid_mut"] {
             assert!(!production.contains(forbidden), "{forbidden} would make this a copy or a by-pid mutation");
         }

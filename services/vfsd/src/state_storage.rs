@@ -3,6 +3,9 @@
 use rustos_user_abi::syscall::{
     ProductExecutableSnapshotEvidence, VFS_EXECUTABLE_SNAPSHOT_DIRFD_ROOT,
 };
+
+static SHARED_PATH_FILES: spin::Mutex<vfsd::tmpfs::SharedPathStore<CacheKey>> =
+    spin::Mutex::new(vfsd::tmpfs::SharedPathStore::new());
 fn map_range_error(error: storage_core::file_io::RangeError) -> i32 {
     use storage_core::file_io::RangeError;
     match error {
@@ -314,6 +317,7 @@ impl VfsState {
                 }
             }
         }
+        let mut pending_proc_snapshot: Option<Vec<u8>> = None;
         let metadata = match vfsd::proc_fs::lookup(path, request.pid) {
             Some(Ok(node)) => {
                 const LINUX_O_NOFOLLOW: u64 = 0o400_000;
@@ -350,7 +354,30 @@ impl VfsState {
                     // Kernel-fact nodes are delegated by `vfs_openat` before
                     // an open description exists; reaching here means a
                     // caller bypassed that, which must not mint a handle.
-                    vfsd::proc_fs::ProcNode::Kernel(..) => return Err(EOPNOTSUPP),
+                    vfsd::proc_fs::ProcNode::Kernel(kernel, number) => {
+                        if !vfsd::proc_fs::is_ring3_formatted(kernel) || writable {
+                            return Err(EOPNOTSUPP);
+                        }
+                        if flags & O_DIRECTORY != 0 {
+                            return Err(ENOTDIR);
+                        }
+                        if create || truncate {
+                            return Err(EACCES);
+                        }
+                        let bytes = format_kernel_proc_snapshot(
+                            request.pid,
+                            request.tid,
+                            kernel,
+                            number,
+                        )?;
+                        let len = bytes.len() as u64;
+                        pending_proc_snapshot = Some(bytes);
+                        Metadata::plain(
+                            RemoteKind::File,
+                            len,
+                            rustos_user_abi::procfs::node_inode(request.pid, kernel, number),
+                        )
+                    }
                     file => {
                         if flags & O_DIRECTORY != 0 {
                             return Err(ENOTDIR);
@@ -447,6 +474,9 @@ impl VfsState {
         );
         if result.is_err() && node != 0 {
             lock_vfs_storage().unpin_node(mount_id, node);
+        }
+        if let (Ok(_), Some(bytes)) = (&result, pending_proc_snapshot) {
+            insert_proc_snapshot(id, bytes);
         }
         result
     }
@@ -576,14 +606,20 @@ impl VfsState {
                 return Ok(0);
             }
             let replay_len = replay_len as usize;
-            let read = Self::read_slice_for_handle(
-                node,
-                path.as_str(),
-                request.pid,
-                file_len,
-                handle.last_start,
-                &mut dest[..replay_len],
-            )?;
+            let read = if let Some(read) =
+                read_proc_snapshot_range(id, handle.last_start, &mut dest[..replay_len])
+            {
+                read
+            } else {
+                Self::read_slice_for_handle(
+                    node,
+                    path.as_str(),
+                    request.pid,
+                    file_len,
+                    handle.last_start,
+                    &mut dest[..replay_len],
+                )?
+            };
             return (read == replay_len).then_some(read).ok_or(EIO);
         }
         if offset.is_none() && self.handles.get(&id).is_some_and(cursor_mutation_prepared) {
@@ -594,6 +630,8 @@ impl VfsState {
         let len = len.min(usize::try_from(available).unwrap_or(usize::MAX)).min(dest.len());
         let read = if len == 0 {
             0
+        } else if let Some(read) = read_proc_snapshot_range(id, start, &mut dest[..len]) {
+            read
         } else {
             Self::read_slice_for_handle(
                 node,
@@ -751,6 +789,13 @@ impl VfsStorage {
                     return volume
                         .read_at(&rel_path, start, dest)
                         .map_err(vfsd::map_fs_error);
+                }
+                {
+                    let mut shared = SHARED_PATH_FILES.lock();
+                    shared.sync_generation(self.mount_generation);
+                    if let Some(res) = shared.read_at(&key, start, dest) {
+                        return res.map_err(vfsd::map_fs_error);
+                    }
                 }
                 if let Some(bytes) = self.file_bytes_cache.get(&key) {
                     return Ok(copy_file_cache_range(bytes, start, dest));
@@ -1512,15 +1557,29 @@ impl VfsStorage {
         if opts.create || opts.truncate {
             self.invalidate_path_caches(&key, parent_key.as_ref());
         }
+        let mut live_len = fs_meta.len;
+        {
+            let mut shared = SHARED_PATH_FILES.lock();
+            shared.sync_generation(self.mount_generation);
+            if opts.truncate {
+                if let Some(res) = shared.truncate(&key, 0) {
+                    live_len = res.map_err(vfsd::map_fs_error)?;
+                }
+            } else if let Some(len) = shared.len_of(&key) {
+                live_len = len;
+            }
+        }
         let kind = match fs_meta.kind {
-            FsNodeKind::File | FsNodeKind::Symlink | FsNodeKind::Socket => RemoteKind::File,
+            FsNodeKind::File | FsNodeKind::Symlink | FsNodeKind::Socket | FsNodeKind::Fifo => {
+                RemoteKind::File
+            }
             FsNodeKind::Directory => RemoteKind::Directory,
         };
         Ok((
             mount_id,
             Metadata::plain(
                 kind,
-                fs_meta.len,
+                live_len,
                 vfsd::path::path_inode_for_policy(abs_path.as_bytes(), caps.case_policy),
             ),
             opts.truncate,
@@ -1547,9 +1606,9 @@ impl VfsStorage {
             FsNodeKind::Directory => {}
             _ if dir_only => return Err(ENOTDIR),
             // Resolution already followed links; a symlink here means
-            // `O_NOFOLLOW`, and a socket inode cannot be opened for I/O.
+            // `O_NOFOLLOW`, and a socket/fifo inode cannot be opened for I/O.
             FsNodeKind::Symlink => return Err(ELOOP),
-            FsNodeKind::Socket => return Err(ENXIO),
+            FsNodeKind::Socket | FsNodeKind::Fifo => return Err(ENXIO),
             FsNodeKind::File => {}
         }
         // Pin by path in the same storage hold that resolved it, so the node
@@ -1605,11 +1664,22 @@ impl VfsStorage {
             self.resolve_mount(abs_path)
         {
             let mut should_unlink = false;
+            let mut last_ref_closed = false;
             if let Some(entry) = self.open_nodes.get_mut(&key) {
                 entry.refs = entry.refs.saturating_sub(1);
                 if entry.refs == 0 {
+                    last_ref_closed = true;
                     should_unlink = entry.pending_unlink;
                     self.open_nodes.remove(&key);
+                }
+            }
+            if last_ref_closed {
+                let mut shared = SHARED_PATH_FILES.lock();
+                shared.sync_generation(self.mount_generation);
+                if should_unlink {
+                    shared.remove(&key);
+                } else {
+                    let _ = shared.flush_entry(&key, &*volume);
                 }
             }
             if should_unlink {
@@ -1621,6 +1691,13 @@ impl VfsStorage {
 
     fn live_len_for_path(&mut self, abs_path: &str, fallback: u64) -> u64 {
         if let Ok((_mid, _rel, key, _pk, _caps, _imm, _vol, _rms)) = self.resolve_mount(abs_path) {
+            {
+                let mut shared = SHARED_PATH_FILES.lock();
+                shared.sync_generation(self.mount_generation);
+                if let Some(len) = shared.len_of(&key) {
+                    return len;
+                }
+            }
             if let Some(node) = self.open_nodes.get(&key) {
                 return node.live_len;
             }
@@ -1630,10 +1707,16 @@ impl VfsStorage {
 
     fn live_stat_for_path(&mut self, abs_path: &str, fallback_len: u64) -> (u64, u64) {
         if let Ok((_mid, _rel, key, _pk, caps, _imm, _vol, _rms)) = self.resolve_mount(abs_path) {
-            let len = self
-                .open_nodes
-                .get(&key)
-                .map_or(fallback_len, |node| node.live_len);
+            let len = {
+                let mut shared = SHARED_PATH_FILES.lock();
+                shared.sync_generation(self.mount_generation);
+                shared.len_of(&key)
+            }
+            .unwrap_or_else(|| {
+                self.open_nodes
+                    .get(&key)
+                    .map_or(fallback_len, |node| node.live_len)
+            });
             let inode = vfsd::path::path_inode_for_policy(abs_path.as_bytes(), caps.case_policy);
             return (len, inode);
         }
@@ -1646,9 +1729,17 @@ impl VfsStorage {
         if caps.read_only {
             return Err(EROFS);
         }
-        let (written, new_len) = volume
-            .write_at(&rel_path, offset, data)
-            .map_err(vfsd::map_fs_error)?;
+        let shared_res = {
+            let mut shared = SHARED_PATH_FILES.lock();
+            shared.sync_generation(self.mount_generation);
+            shared.write_at(&key, offset, data)
+        };
+        let (written, new_len) = match shared_res {
+            Some(res) => res.map_err(vfsd::map_fs_error)?,
+            None => volume
+                .write_at(&rel_path, offset, data)
+                .map_err(vfsd::map_fs_error)?,
+        };
         if let Some(node) = self.open_nodes.get_mut(&key) {
             node.live_len = new_len;
         }
@@ -1662,9 +1753,17 @@ impl VfsStorage {
         if caps.read_only {
             return Err(EROFS);
         }
-        let actual_len = volume
-            .truncate(&rel_path, new_len)
-            .map_err(vfsd::map_fs_error)?;
+        let shared_res = {
+            let mut shared = SHARED_PATH_FILES.lock();
+            shared.sync_generation(self.mount_generation);
+            shared.truncate(&key, new_len)
+        };
+        let actual_len = match shared_res {
+            Some(res) => res.map_err(vfsd::map_fs_error)?,
+            None => volume
+                .truncate(&rel_path, new_len)
+                .map_err(vfsd::map_fs_error)?,
+        };
         if let Some(node) = self.open_nodes.get_mut(&key) {
             node.live_len = actual_len;
         }
@@ -1685,7 +1784,14 @@ impl VfsStorage {
         {
             return Err(EINVAL);
         }
-        let (_mid, _rel, _key, _pk, _caps, _imm, volume, _rms) = self.resolve_mount(abs_path)?;
+        let (_mid, _rel, key, _pk, _caps, _imm, volume, _rms) = self.resolve_mount(abs_path)?;
+        {
+            let mut shared = SHARED_PATH_FILES.lock();
+            shared.sync_generation(self.mount_generation);
+            shared
+                .flush_entry(&key, &*volume)
+                .map_err(vfsd::map_fs_error)?;
+        }
         volume.flush().map_err(vfsd::map_fs_error)
     }
 
@@ -1769,6 +1875,11 @@ impl VfsStorage {
         }
         match volume.unlink(&rel_path) {
             Ok(()) => {
+                {
+                    let mut shared = SHARED_PATH_FILES.lock();
+                    shared.sync_generation(self.mount_generation);
+                    shared.remove(&key);
+                }
                 self.invalidate_path_caches(&key, parent_key.as_ref());
                 0
             }
@@ -1813,6 +1924,11 @@ impl VfsStorage {
         }
         match volume.rename(&old_rel, &new_rel, !no_replace, no_replace) {
             Ok(()) => {
+                {
+                    let mut shared = SHARED_PATH_FILES.lock();
+                    shared.sync_generation(self.mount_generation);
+                    shared.rename(&old_key, new_key.clone(), new_rel);
+                }
                 self.invalidate_path_caches(&old_key, old_pk.as_ref());
                 self.invalidate_subtree_caches(&old_key);
                 self.invalidate_path_caches(&new_key, new_pk.as_ref());
@@ -1891,9 +2007,8 @@ impl VfsStorage {
             return EINVAL;
         };
         match kind {
-            VfsMknodKind::Fifo => return EOPNOTSUPP,
             VfsMknodKind::Device => return EPERM,
-            VfsMknodKind::Regular | VfsMknodKind::Socket => {}
+            VfsMknodKind::Regular | VfsMknodKind::Socket | VfsMknodKind::Fifo => {}
         }
         if self.is_virtual_path(abs_path) {
             return EROFS;
@@ -1906,10 +2021,10 @@ impl VfsStorage {
         if caps.read_only {
             return EROFS;
         }
-        let result = if kind == VfsMknodKind::Socket {
-            volume.mknod_socket(&rel_path, attrs)
-        } else {
-            volume
+        let result = match kind {
+            VfsMknodKind::Socket => volume.mknod_socket(&rel_path, attrs),
+            VfsMknodKind::Fifo => volume.mknod_fifo(&rel_path, attrs),
+            VfsMknodKind::Regular => volume
                 .open_prepare_with(
                     &rel_path,
                     FsOpenOptions {
@@ -1919,7 +2034,8 @@ impl VfsStorage {
                     },
                     attrs,
                 )
-                .map(|_| ())
+                .map(|_| ()),
+            VfsMknodKind::Device => unreachable!(),
         };
         match result {
             Ok(()) => {
@@ -1961,6 +2077,155 @@ impl VfsStorage {
         }
     }
 
+    /// `chown(2)` of a resolved path or a pinned node. One storage hold judges
+    /// the credentials and applies the change.
+    ///
+    /// A volume that stores POSIX owners records the ids. One that cannot (FAT)
+    /// reports owner 0 / group 0 for every node, so the call succeeds as a
+    /// no-op when it asks for exactly that and is `EPERM` otherwise, which is
+    /// what Linux vfat does for a request that differs from the mount's own
+    /// owner. Read-only mounts and virtual trees are `EROFS`.
+    fn chown_target(
+        &mut self,
+        target: AttrTarget<'_>,
+        cred: vfsd::permissions::OwnerCredentials,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> i32 {
+        let (volume, posix, owner, key) = match target {
+            AttrTarget::Node(mount_id, node) => {
+                let volume = match self.node_volume(mount_id) {
+                    Ok(volume) => volume,
+                    Err(errno) => return errno,
+                };
+                let meta = match volume.metadata_node(node) {
+                    Ok(meta) => meta,
+                    Err(err) => return vfsd::map_fs_error(err),
+                };
+                (volume, true, (meta.uid, meta.gid), None)
+            }
+            AttrTarget::Path(abs_path) => {
+                if self.is_virtual_path(abs_path) {
+                    return EROFS;
+                }
+                let (_mid, rel_path, key, parent_key, caps, _imm, volume, _rms) =
+                    match self.resolve_mount(abs_path) {
+                        Ok(r) => r,
+                        Err(e) => return e,
+                    };
+                if caps.read_only {
+                    return EROFS;
+                }
+                let posix = caps.posix_nodes();
+                let owner = if posix {
+                    match volume.metadata(&rel_path) {
+                        Ok(meta) => (meta.uid, meta.gid),
+                        Err(err) => return vfsd::map_fs_error(err),
+                    }
+                } else {
+                    match volume.metadata(&rel_path) {
+                        Ok(_) => (0, 0),
+                        Err(err) => return vfsd::map_fs_error(err),
+                    }
+                };
+                (volume, posix, owner, Some((key, parent_key, rel_path)))
+            }
+        };
+        if !vfsd::permissions::chown_allowed(owner.0, owner.1, cred, uid, gid) {
+            return EPERM;
+        }
+        if !posix {
+            let unchanged = |id: Option<u32>| id.is_none_or(|id| id == 0);
+            return if unchanged(uid) && unchanged(gid) { 0 } else { EPERM };
+        }
+        let result = match (target, &key) {
+            (AttrTarget::Node(_, node), _) => volume.chown_node(node, uid, gid),
+            (AttrTarget::Path(_), Some((_, _, rel_path))) => volume.chown(rel_path, uid, gid),
+            (AttrTarget::Path(_), None) => return EINVAL,
+        };
+        match result {
+            Ok(()) => {
+                if let Some((key, parent_key, _)) = key {
+                    self.invalidate_path_caches(&key, parent_key.as_ref());
+                }
+                0
+            }
+            Err(err) => vfsd::map_fs_error(err),
+        }
+    }
+
+    /// `link(2)` of two resolved paths. Hard links exist on volumes with POSIX
+    /// nodes only (`EPERM` on FAT, as Linux vfat); two mounts are `EXDEV`.
+    fn link_paths(&mut self, old_abs: &str, new_abs: &str) -> i32 {
+        if self.is_virtual_path(old_abs) || self.is_virtual_path(new_abs) {
+            return EPERM;
+        }
+        let (old_mount, old_rel, _k, _pk, _caps, _imm, volume, _rms) =
+            match self.resolve_mount(old_abs) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+        let (new_mount, new_rel, key, parent_key, caps, _imm, _volume, _rms) =
+            match self.resolve_mount(new_abs) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+        if old_mount != new_mount {
+            return EXDEV;
+        }
+        if caps.read_only {
+            return EROFS;
+        }
+        if !caps.posix_nodes() {
+            return EPERM;
+        }
+        let status = Self::link_status(volume.link(&old_rel, &new_rel));
+        if status == 0 {
+            self.invalidate_path_caches(&key, parent_key.as_ref());
+        }
+        status
+    }
+
+    /// Gives the pinned node of an open description a new name
+    /// (`O_TMPFILE`, `linkat` through `/proc/self/fd`).
+    fn link_node_path(&mut self, mount_id: u64, node: u64, new_abs: &str) -> i32 {
+        if self.is_virtual_path(new_abs) {
+            return EPERM;
+        }
+        let (new_mount, new_rel, key, parent_key, caps, _imm, volume, _rms) =
+            match self.resolve_mount(new_abs) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+        if new_mount != mount_id {
+            return EXDEV;
+        }
+        if caps.read_only {
+            return EROFS;
+        }
+        if !caps.posix_nodes() {
+            return EPERM;
+        }
+        let status = Self::link_status(volume.link_node(node, &new_rel));
+        if status == 0 {
+            self.invalidate_path_caches(&key, parent_key.as_ref());
+        }
+        status
+    }
+
+    /// `link(2)` errno of a volume result: a directory source is `EPERM`
+    /// (the volume's `PermissionDenied`), a full link count `EMLINK`.
+    fn link_status(result: Result<(), storage_core::fs::FsError>) -> i32 {
+        use storage_core::fs::FsError;
+        const EMLINK: i32 = 31;
+        match result {
+            Ok(()) => 0,
+            Err(FsError::PermissionDenied) => EPERM,
+            Err(FsError::TooBig) => EMLINK,
+            Err(err) => vfsd::map_fs_error(err),
+        }
+    }
+
     fn fallocate_node(
         &mut self,
         mount_id: u64,
@@ -1976,7 +2241,7 @@ impl VfsStorage {
 
     /// Moves a pinned TmpFs node's bytes into shared frames (idempotent) and
     /// names them for the mapping broker. A volume without shared frames
-    /// (FAT, the early-system image) is `ENODEV`: the caller keeps its
+    /// (the early-system image) is `ENODEV`: the caller keeps its
     /// existing private-copy policy.
     fn shared_backing_node(
         &mut self,
@@ -1989,6 +2254,53 @@ impl VfsStorage {
                 storage_core::fs::FsError::Unsupported => ENODEV,
                 other => vfsd::map_fs_error(other),
             })
+    }
+
+    fn supports_shared_backing_path(&mut self, abs_path: &str) -> bool {
+        if self.is_virtual_path(abs_path)
+            || matches!(early_system::file_len(abs_path), Ok(Some(_)))
+        {
+            return false;
+        }
+        matches!(
+            self.resolve_mount(abs_path),
+            Ok((_, _, _, _, _, false, _, _))
+        )
+    }
+
+    fn shared_backing_path(
+        &mut self,
+        abs_path: &str,
+        writable: bool,
+    ) -> Result<storage_core::fs::FsSharedBacking, i32> {
+        if self.is_virtual_path(abs_path) || early_system::file_len(abs_path)?.is_some() {
+            return Err(ENODEV);
+        }
+        let (_mid, rel_path, key, _pk, _caps, is_immutable, volume, _rms) =
+            self.resolve_mount(abs_path)?;
+        if is_immutable {
+            return Err(ENODEV);
+        }
+        let mut shared = SHARED_PATH_FILES.lock();
+        shared
+            .ensure_shared(
+                key,
+                &rel_path,
+                &*volume,
+                shared_frames::create_memfd_frames,
+                writable,
+                self.mount_generation,
+            )
+            .map_err(vfsd::map_fs_error)
+    }
+
+    fn sync_shared_backing_by_object(&mut self, object_id: u64) -> Result<(), i32> {
+        let mut shared = SHARED_PATH_FILES.lock();
+        shared.sync_generation(self.mount_generation);
+        let mounts = &self.mounts;
+        shared
+            .flush_by_object_id(object_id, |key| mounts.by_id(key.0).map(|entry| entry.volume.clone()))
+            .map_err(vfsd::map_fs_error)
     }
 
     fn truncate_node(&mut self, mount_id: u64, node: u64, new_len: u64) -> Result<u64, i32> {
@@ -2104,16 +2416,30 @@ impl VfsStorage {
         if self.open_nodes.get(&key).is_some_and(|n| n.pending_unlink) {
             return Err(ENOENT);
         }
+        let shared_len = {
+            let mut shared = SHARED_PATH_FILES.lock();
+            shared.sync_generation(self.mount_generation);
+            shared.len_of(&key)
+        };
         if let Some(entry) = self.metadata_cache.get(&key) {
-            return *entry;
+            return match (*entry, shared_len) {
+                (Ok(mut meta), Some(len)) => {
+                    meta.len = len;
+                    Ok(meta)
+                }
+                (other, _) => other,
+            };
         }
         let result = match volume.metadata(&rel_path) {
             Ok(meta) => Ok(Metadata::plain(
                 match meta.kind {
-                    FsNodeKind::File | FsNodeKind::Symlink | FsNodeKind::Socket => RemoteKind::File,
+                    FsNodeKind::File
+                    | FsNodeKind::Symlink
+                    | FsNodeKind::Socket
+                    | FsNodeKind::Fifo => RemoteKind::File,
                     FsNodeKind::Directory => RemoteKind::Directory,
                 },
-                meta.len,
+                shared_len.unwrap_or(meta.len),
                 vfsd::path::path_inode_for_policy(path.as_bytes(), caps.case_policy),
             )),
             Err(err) => Err(vfsd::map_fs_error(err)),

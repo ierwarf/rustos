@@ -73,6 +73,7 @@ pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_WAITSET_SIGNAL_BROKER
             | linux_abi::SYS_RUSTOS_ENTROPY_BROKER
             | linux_abi::SYS_RUSTOS_EARLY_SYSTEM_BROKER
+            | rustos_user_abi::syscall::SYS_RUSTOS_PROC_FACTS_BROKER
     )
 }
 
@@ -122,6 +123,9 @@ pub(super) fn dispatch_linux_rustos_broker_syscall(frame: &SyscallFrame) -> u64 
         }
         linux_abi::SYS_RUSTOS_EARLY_SYSTEM_BROKER => {
             syscall_linux_rustos_early_system_broker(frame.rdi)
+        }
+        rustos_user_abi::syscall::SYS_RUSTOS_PROC_FACTS_BROKER => {
+            super::service_ops::proc_identity::syscall_linux_rustos_proc_facts_broker(frame.rdi)
         }
         _ => linux_errno(LINUX_ENOSYS),
     }

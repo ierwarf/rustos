@@ -56,6 +56,9 @@ pub(super) fn handle_getsockopt(request: &NetdIpcRequest, response: &mut NetdIpc
         response.value = 0;
         return 0;
     }
+    if request.arg1 == netlink::SOL_NETLINK {
+        return netlink::handle_getsockopt(request, response);
+    }
     if request.arg1 != linux_abi::SOL_SOCKET {
         return inet_datagram::get_ip_option(request, response);
     }
@@ -163,14 +166,7 @@ pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
         return 0;
     }
     if request.arg1 == netlink::SOL_NETLINK {
-        // No multicast notifications are implemented; do not claim subscription success.
-        let state = lock_net_state();
-        return match state.sockets.get(&request.socket_token) {
-            Some(socket) if socket.kind == UnixSocketKind::Netlink => libc::ENOPROTOOPT,
-            Some(_) => libc::ENOPROTOOPT,
-            None if state.inet_sockets.contains_key(&request.socket_token) => libc::ENOPROTOOPT,
-            None => libc::EBADF,
-        };
+        return netlink::handle_setsockopt(request);
     }
     if request.arg1 != linux_abi::SOL_SOCKET {
         return inet_datagram::set_ip_option(request);
@@ -296,11 +292,16 @@ pub(super) fn sockaddr_bind_address_from_payload(
         }
         return Ok(Some(UnixAddress::Abstract(path_bytes.to_vec())));
     }
+    // Linux accepts a full `sun_path` (108 bytes) without a terminating NUL;
+    // only a longer `addrlen` is invalid.
+    if path_bytes.len() > linux_abi::UNIX_PATH_MAX {
+        return Err(libc::EINVAL);
+    }
     let end = path_bytes
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(path_bytes.len());
-    if end == 0 || end >= linux_abi::UNIX_PATH_MAX {
+    if end == 0 {
         return Err(libc::EINVAL);
     }
     String::from_utf8(path_bytes[..end].to_vec())
@@ -319,15 +320,19 @@ pub(super) fn sockaddr_payload(
             size_of::<u16>() + 1
         }
         Some(UnixAddress::Filesystem(path)) => {
-            let needed = size_of::<u16>()
-                .checked_add(path.len())
-                .and_then(|value| value.checked_add(1))
-                .ok_or(libc::EINVAL)?;
-            if needed > response.payload.len() || path.len() >= linux_abi::UNIX_PATH_MAX {
+            // A shorter path is reported with its NUL; a full 108-byte
+            // `sun_path` has no room for one and is reported without it.
+            if path.len() > linux_abi::UNIX_PATH_MAX {
+                return Err(libc::EINVAL);
+            }
+            let needed = size_of::<u16>() + path.len() + usize::from(path.len() < linux_abi::UNIX_PATH_MAX);
+            if needed > response.payload.len() {
                 return Err(libc::EINVAL);
             }
             response.payload[2..2 + path.len()].copy_from_slice(path.as_bytes());
-            response.payload[2 + path.len()] = 0;
+            if path.len() < linux_abi::UNIX_PATH_MAX {
+                response.payload[2 + path.len()] = 0;
+            }
             needed
         }
         Some(UnixAddress::Abstract(bytes)) => {

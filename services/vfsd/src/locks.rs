@@ -24,6 +24,16 @@
 //! [`WAIT_TTL_NS`]: the compat layer re-attempts every few milliseconds, which
 //! refreshes it, and a waiter that stopped (signal, exit) simply ages out, so a
 //! stale entry can delay a deadlock verdict but cannot fabricate one for long.
+//!
+//! **Checkpointing & liveness:** The lock table is intentionally **not**
+//! checkpointed. On a `vfsd` restart, advisory locks vanish just as they would
+//! if the kernel dropped them with the open descriptions, and clients re-take
+//! them after reopening; persisting stale lock ranges across a `vfsd` restart
+//! without live kernel process/description ownership would risk phantom
+//! conflicts. While `vfsd` is live, [`execute_verified`] protects against
+//! missed `EXIT`/`FORK` lifecycle events (or queue overflow via
+//! [`LockTable::verify_all_owners`]) by probing the kernel for process
+//! incarnations (`LIFECYCLE_BROKER_MODE_PROBE_PIDS`).
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -98,42 +108,44 @@ struct Wait {
     at_ns: u64,
 }
 
-/// Exact identity of a kernel lock mutation. IDs are never reused for a poll.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct LockTransactionId {
-    pub pid: u64,
-    pub tid: u64,
-    pub operation_hi: u64,
-    pub operation_lo: u64,
-    /// Monotonic kernel issuance sequence, ordered with process close events.
-    pub sequence: u64,
-}
+/// How long a proof that a POSIX owner is alive is reused before the next
+/// conflict asks the kernel again. A holder that vanished without an exit event
+/// is therefore found by the first conflicting request after this interval, and
+/// a busy lock never turns every retry into a broker call.
+pub const LIVENESS_RECHECK_NS: u64 = 100_000_000;
+/// Most owners the table remembers an incarnation for (a process table is far
+/// smaller); beyond it an owner is simply verified by liveness alone.
+pub const MAX_OWNER_RECORDS: usize = 1024;
+/// Most pids verified for one conflict. Longer chains stay conservative (kept).
+pub const MAX_VERIFY_PIDS: usize = 64;
+/// Pids per kernel probe (the broker's per-call bound).
+pub const PROBE_BATCH: usize = rustos_user_abi::syscall::LIFECYCLE_DRAIN_MAX_EVENTS;
 
+/// What the kernel last attested about a POSIX owner pid. `incarnation == 0`
+/// means "not learned yet" (the probe was unavailable); the pid's liveness is
+/// still checked, only reuse of the number cannot be told apart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LockCandidate {
-    pub key: FileKey,
-    pub owner: Owner,
-    pub op: LockOp,
-    pub start: u64,
-    pub end: u64,
+struct OwnerRecord {
+    incarnation: u64,
+    checked_ns: u64,
 }
 
-#[derive(Clone, Debug)]
-enum LockTransaction {
-    Prepared { candidate: LockCandidate, updated: Vec<Lock>, growth: usize },
-    Finished { candidate: Option<LockCandidate>, result: Result<(), i32> },
-}
-
-/// Hard bound: admission fails rather than forgetting an unresolved result.
-pub const MAX_LOCK_TRANSACTIONS: usize = 8192;
+/// Kernel-attested process liveness (`LIFECYCLE_BROKER_MODE_PROBE_PIDS`): one
+/// incarnation per requested pid, `0` for a pid with no live process. `None`
+/// when the kernel cannot answer; the table then keeps every lock (dropping a
+/// live owner's lock would break mutual exclusion, keeping a dead one only
+/// delays a retry).
+pub type PidProbe<'a> = &'a mut dyn FnMut(&[u64]) -> Option<Vec<u64>>;
 
 #[derive(Default)]
 pub struct LockTable {
     files: BTreeMap<FileKey, Vec<Lock>>,
     total: usize,
     waits: Vec<Wait>,
-    transactions: BTreeMap<LockTransactionId, LockTransaction>,
-    close_watermarks: BTreeMap<(u64, FileKey), u64>,
+    owners: BTreeMap<u64, OwnerRecord>,
+    /// An exit/fork event may have been lost (queue overflow) and the owners
+    /// could not be re-verified yet: the next conflict verifies all of them.
+    unverified: bool,
 }
 
 /// Resolves a `struct flock` range to an inclusive `[start, end]`.
@@ -228,7 +240,7 @@ fn coalesce(locks: &mut Vec<Lock>) {
 
 impl LockTable {
     pub const fn new() -> Self {
-        Self { files: BTreeMap::new(), total: 0, waits: Vec::new(), transactions: BTreeMap::new(), close_watermarks: BTreeMap::new() }
+        Self { files: BTreeMap::new(), total: 0, waits: Vec::new(), owners: BTreeMap::new(), unverified: false }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -245,105 +257,6 @@ impl LockTable {
 
     pub fn wait_count(&self) -> usize {
         self.waits.len()
-    }
-
-    /// Reserve a file snapshot without publishing the requested conversion.
-    /// Replayed operations return their original outcome, including EAGAIN.
-    pub fn prepare_transaction(&mut self, id: LockTransactionId, candidate: LockCandidate) -> Result<(), i32> {
-        if let Some(entry) = self.transactions.get(&id) {
-            return match entry {
-                LockTransaction::Prepared { candidate: old, .. } if *old == candidate => Ok(()),
-                LockTransaction::Finished { candidate: Some(old), result } if *old == candidate => *result,
-                LockTransaction::Finished { candidate: None, result } => *result,
-                _ => Err(EINVAL),
-            };
-        }
-        if id.pid == 0 || id.tid == 0 || id.sequence == 0 || (id.operation_hi == 0 && id.operation_lo == 0) {
-            return Err(EINVAL);
-        }
-        if self.transactions.len() >= MAX_LOCK_TRANSACTIONS {
-            return Err(ENOLCK);
-        }
-        let result = if candidate.owner == Owner::Process(id.pid)
-            && self.close_watermarks.get(&(id.pid, candidate.key)).is_some_and(|&close| id.sequence <= close) {
-            Err(125)
-        } else if candidate.start > candidate.end {
-            Err(EINVAL)
-        } else if self.transactions.values().any(|entry| matches!(entry,
-            LockTransaction::Prepared { candidate: other, .. } if other.key == candidate.key)) {
-            Err(EAGAIN)
-        } else if matches!(candidate.op, LockOp::Set(kind) if self.test(candidate.key, candidate.owner, kind, candidate.start, candidate.end).is_some()) {
-            Err(EAGAIN)
-        } else {
-            Ok(())
-        };
-        if let Err(errno) = result {
-            self.transactions.insert(id, LockTransaction::Finished { candidate: Some(candidate), result });
-            return Err(errno);
-        }
-        let current = self.files.get(&candidate.key).map(Vec::as_slice).unwrap_or(&[]);
-        let updated = apply(current, candidate.owner, candidate.op, candidate.start, candidate.end);
-        let growth = updated.len().saturating_sub(current.len());
-        let reserved: usize = self.transactions.values().map(|entry| match entry {
-            LockTransaction::Prepared { growth, .. } => *growth,
-            _ => 0,
-        }).sum();
-        if updated.len() > MAX_LOCKS_PER_FILE || self.total.saturating_add(reserved).saturating_add(growth) > MAX_LOCKS_TOTAL {
-            self.transactions.insert(id, LockTransaction::Finished { candidate: Some(candidate), result: Err(ENOLCK) });
-            return Err(ENOLCK);
-        }
-        self.transactions.insert(id, LockTransaction::Prepared { candidate, updated, growth });
-        Ok(())
-    }
-
-    /// Commit once; repeated commit returns the exact recorded terminal result.
-    pub fn commit_transaction(&mut self, id: LockTransactionId) -> Result<(), i32> {
-        let entry = self.transactions.remove(&id).ok_or(EINVAL)?;
-        match entry {
-            LockTransaction::Prepared { candidate, updated, .. } => {
-                let before = self.files.get(&candidate.key).map_or(0, Vec::len);
-                self.total = self.total + updated.len() - before;
-                if updated.is_empty() { self.files.remove(&candidate.key); }
-                else { self.files.insert(candidate.key, updated); }
-                self.transactions.insert(id, LockTransaction::Finished { candidate: Some(candidate), result: Ok(()) });
-                Ok(())
-            }
-            terminal @ LockTransaction::Finished { .. } => {
-                let LockTransaction::Finished { result, .. } = terminal else { unreachable!() };
-                self.transactions.insert(id, terminal);
-                result
-            }
-        }
-    }
-
-    /// Fence a late prepare, or cancel a prepared candidate without undoing
-    /// existing locks. A committed transaction remains committed.
-    pub fn cancel_transaction(&mut self, id: LockTransactionId) -> Result<(), i32> {
-        if id.pid == 0 || id.tid == 0 || id.sequence == 0 || (id.operation_hi == 0 && id.operation_lo == 0) { return Err(EINVAL); }
-        if let Some(entry) = self.transactions.get_mut(&id) {
-            return match entry {
-                LockTransaction::Prepared { candidate, .. } => {
-                    let candidate = *candidate;
-                    *entry = LockTransaction::Finished { candidate: Some(candidate), result: Err(125) };
-                    Ok(())
-                }
-                LockTransaction::Finished { result: Ok(()), .. } => Err(EINVAL),
-                LockTransaction::Finished { .. } => Ok(()),
-            };
-        }
-        if self.transactions.len() >= MAX_LOCK_TRANSACTIONS { return Err(ENOLCK); }
-        self.transactions.insert(id, LockTransaction::Finished { candidate: None, result: Err(125) });
-        Ok(())
-    }
-
-    fn cancel_candidates(&mut self, mut affected: impl FnMut(&LockCandidate) -> bool) {
-        for entry in self.transactions.values_mut() {
-            if let LockTransaction::Prepared { candidate, .. } = entry {
-                if affected(candidate) {
-                    *entry = LockTransaction::Finished { candidate: Some(*candidate), result: Err(125) };
-                }
-            }
-        }
     }
 
     /// First lock (lowest start) that would block the described request.
@@ -365,10 +278,6 @@ impl LockTable {
         start: u64,
         end: u64,
     ) -> Result<(), i32> {
-        if self.transactions.values().any(|entry| matches!(entry,
-            LockTransaction::Prepared { candidate, .. } if candidate.key == key)) {
-            return Err(EAGAIN);
-        }
         if start > end {
             return Err(EINVAL);
         }
@@ -380,12 +289,8 @@ impl LockTable {
         let current = self.files.get(&key).map(Vec::as_slice).unwrap_or(&[]);
         let updated = apply(current, owner, op, start, end);
         let before = current.len();
-        let reserved: usize = self.transactions.values().map(|entry| match entry {
-            LockTransaction::Prepared { growth, .. } => *growth,
-            _ => 0,
-        }).sum();
         if updated.len() > MAX_LOCKS_PER_FILE
-            || self.total.saturating_add(reserved).saturating_add(updated.len().saturating_sub(before)) > MAX_LOCKS_TOTAL
+            || self.total.saturating_add(updated.len().saturating_sub(before)) > MAX_LOCKS_TOTAL
         {
             return Err(ENOLCK);
         }
@@ -422,7 +327,7 @@ impl LockTable {
             Err(EAGAIN) => {
                 let LockOp::Set(kind) = op else { return Err(EAGAIN) };
                 if let Owner::Process(pid) = owner {
-                    if self.would_deadlock(pid, key, kind, start, end, now_ns) {
+                    if self.deadlock_chain(pid, key, kind, start, end, now_ns).is_some() {
                         self.cancel_wait(tid);
                         return Err(EDEADLK);
                     }
@@ -453,12 +358,14 @@ impl LockTable {
     }
 
     /// Would `pid` waiting for `[start, end]` of `key` close a wait-for cycle?
-    fn would_deadlock(&self, pid: u64, key: FileKey, kind: LockKind, start: u64, end: u64, now_ns: u64) -> bool {
+    /// `Some(pids)` names every holder visited on the way (the evidence a
+    /// verdict rests on); `None` means no cycle.
+    fn deadlock_chain(&self, pid: u64, key: FileKey, kind: LockKind, start: u64, end: u64, now_ns: u64) -> Option<Vec<u64>> {
         let mut seen: Vec<u64> = Vec::new();
         let mut stack = self.posix_blockers(key, pid, kind, start, end);
         while let Some(holder) = stack.pop() {
             if holder == pid {
-                return true;
+                return Some(seen);
             }
             if seen.contains(&holder) {
                 continue;
@@ -468,7 +375,7 @@ impl LockTable {
                 stack.extend(self.posix_blockers(w.key, holder, w.kind, w.start, w.end));
             }
         }
-        false
+        None
     }
 
     /// Pids of POSIX locks that block `pid` on the range (OFD and `flock`
@@ -502,24 +409,9 @@ impl LockTable {
         }
     }
 
-    /// Record the close boundary before releasing; an older prepare arriving
-    /// after the close cannot recreate the process's locks on this inode.
-    pub fn release_process_file_through(&mut self, pid: u64, key: FileKey, sequence: u64) -> Result<(), i32> {
-        if pid == 0 || sequence == 0 { return Err(EINVAL); }
-        if !self.close_watermarks.contains_key(&(pid, key)) && self.close_watermarks.len() >= MAX_LOCK_TRANSACTIONS {
-            return Err(ENOLCK);
-        }
-        let watermark = self.close_watermarks.entry((pid, key)).or_insert(0);
-        if sequence <= *watermark { return Ok(()); }
-        *watermark = sequence;
-        self.release_process_file(pid, key);
-        Ok(())
-    }
-
     /// POSIX: the process closed some fd of `key`, so all of its record locks
     /// on that file go, whichever fd took them.
     pub fn release_process_file(&mut self, pid: u64, key: FileKey) {
-        self.cancel_candidates(|candidate| candidate.key == key);
         if let Some(locks) = self.files.get_mut(&key) {
             let before = locks.len();
             locks.retain(|l| l.owner != Owner::Process(pid));
@@ -532,7 +424,7 @@ impl LockTable {
 
     /// Process exit: every POSIX lock and every blocked attempt of `pid`.
     pub fn release_process(&mut self, pid: u64) {
-        self.cancel_candidates(|_| true);
+        self.owners.remove(&pid);
         self.waits.retain(|w| w.pid != pid);
         if self.total != 0 {
             self.retain_locks(|_, l| l.owner != Owner::Process(pid));
@@ -553,9 +445,125 @@ impl LockTable {
         }
     }
 
+    /// Distinct POSIX owners (pids) of the locks that would block this
+    /// request, nearest first, at most [`MAX_VERIFY_PIDS`]. OFD and `flock`
+    /// holders are bound to open descriptions, which the provider's own close
+    /// path retires, so they carry no pid to verify.
+    fn blocking_pids(&self, key: FileKey, owner: Owner, kind: LockKind, start: u64, end: u64) -> Vec<u64> {
+        let mut pids: Vec<u64> = Vec::new();
+        for l in self.files.get(&key).into_iter().flatten() {
+            if let Owner::Process(pid) = l.owner {
+                if conflicts(l, owner, kind, start, end) && !pids.contains(&pid) && pids.len() < MAX_VERIFY_PIDS {
+                    pids.push(pid);
+                }
+            }
+        }
+        pids
+    }
+
+    /// Every pid that owns a POSIX lock, ascending.
+    fn posix_owner_pids(&self) -> Vec<u64> {
+        let mut pids: Vec<u64> = Vec::new();
+        for l in self.files.values().flatten() {
+            if let Owner::Process(pid) = l.owner {
+                if let Err(at) = pids.binary_search(&pid) {
+                    pids.insert(at, pid);
+                }
+            }
+        }
+        pids
+    }
+
+    /// Asks the kernel about `pids` and drops the locks and waits of every one
+    /// that is gone or is a different process under a reused number. `force`
+    /// ignores the recheck interval. Returns how many owners were dropped. An
+    /// unavailable probe drops nothing (see [`PidProbe`]).
+    pub fn verify_owners(&mut self, pids: &[u64], now_ns: u64, force: bool, probe: PidProbe<'_>) -> usize {
+        let due: Vec<u64> = pids
+            .iter()
+            .copied()
+            .filter(|pid| {
+                force
+                    || self.owners.get(pid).is_none_or(|record| {
+                        record.incarnation == 0
+                            || now_ns.saturating_sub(record.checked_ns) >= LIVENESS_RECHECK_NS
+                    })
+            })
+            .collect();
+        let mut dropped = 0;
+        for chunk in due.chunks(PROBE_BATCH) {
+            let Some(incarnations) = probe(chunk).filter(|answer| answer.len() == chunk.len()) else {
+                return dropped;
+            };
+            for (&pid, &incarnation) in chunk.iter().zip(&incarnations) {
+                let known = self.owners.get(&pid).map_or(0, |record| record.incarnation);
+                if incarnation == 0 || (known != 0 && known != incarnation) {
+                    // Gone, or a new process wearing the old number: the
+                    // locks belong to a predecessor whose exit event was lost.
+                    self.release_process(pid);
+                    dropped += 1;
+                } else {
+                    self.note_owner(pid, incarnation, now_ns);
+                }
+            }
+        }
+        dropped
+    }
+
+    fn note_owner(&mut self, pid: u64, incarnation: u64, now_ns: u64) {
+        if self.owners.len() < MAX_OWNER_RECORDS || self.owners.contains_key(&pid) {
+            self.owners.insert(pid, OwnerRecord { incarnation, checked_ns: now_ns });
+        }
+    }
+
+    /// Records the kernel's identity of POSIX owner `pid` the first time it
+    /// takes a lock, while it is certainly the live sender. Later reuse of the
+    /// number is then recognizable even if both lifecycle events were lost.
+    fn learn_owner(&mut self, pid: u64, now_ns: u64, probe: PidProbe<'_>) {
+        if self.owners.contains_key(&pid) {
+            return;
+        }
+        let incarnation = probe(&[pid])
+            .filter(|answer| answer.len() == 1)
+            .map_or(0, |answer| answer[0]);
+        // A failed probe is remembered as "unknown" so the request path does
+        // not retry the broker on every later lock of this pid.
+        if self.owners.len() < MAX_OWNER_RECORDS {
+            self.owners.insert(pid, OwnerRecord { incarnation, checked_ns: now_ns });
+        }
+    }
+
+    /// Lifecycle evidence was lost: no pid can be trusted to still be the
+    /// process that took its locks. Verify every owner now; if the kernel
+    /// cannot answer, keep the locks and verify at the next conflict.
+    pub fn verify_all_owners(&mut self, now_ns: u64, probe: PidProbe<'_>) -> usize {
+        let pids = self.posix_owner_pids();
+        self.unverified = true;
+        let mut answered = true;
+        let dropped = {
+            let mut tracked = |chunk: &[u64]| {
+                let answer = probe(chunk);
+                answered &= answer.as_ref().is_some_and(|v| v.len() == chunk.len());
+                answer
+            };
+            self.verify_owners(&pids, now_ns, true, &mut tracked)
+        };
+        if answered {
+            self.unverified = false;
+            // Owners with nothing left to verify need no record.
+            let remaining = self.posix_owner_pids();
+            self.owners.retain(|pid, _| remaining.binary_search(pid).is_ok());
+        }
+        dropped
+    }
+
+    /// `true` while an overflow could not be fully verified.
+    pub fn owners_unverified(&self) -> bool {
+        self.unverified
+    }
+
     /// Final close of an open description: its OFD and `flock` locks.
     pub fn release_description(&mut self, remote_id: u64) {
-        self.cancel_candidates(|_| true);
         if self.total != 0 {
             self.retain_locks(|_, l| {
                 l.owner != Owner::Description(remote_id) && l.owner != Owner::Flock(remote_id)
@@ -579,26 +587,22 @@ pub struct LockContext {
     pub now_ns: u64,
 }
 
-/// Executes one decoded `VFS_IPC_OP_FILE_LOCK` wire. `Ok(Some(reply))` is a
-/// `GETLK` answer to send back; `Err(errno)` is the reply status (`EAGAIN`
-/// means "conflict, retry" for the blocking command).
-pub fn execute(
-    table: &mut LockTable,
-    ctx: &LockContext,
-    wire: &VfsFileLockWire,
-) -> Result<Option<VfsFileLockWire>, i32> {
+/// A decoded `FILE_LOCK` command with its range resolved.
+#[derive(Clone, Copy, Debug)]
+enum Command {
+    CancelWait,
+    ReleaseFile,
+    Get { owner: Owner, kind: LockKind, start: u64, end: u64 },
+    Set { owner: Owner, op: LockOp, start: u64, end: u64, wait: bool },
+}
+
+fn decode(ctx: &LockContext, wire: &VfsFileLockWire) -> Result<Command, i32> {
     if !wire.is_well_formed() || wire.pid != 0 || ctx.pid == 0 {
         return Err(EINVAL);
     }
     match wire.cmd {
-        VFS_FILE_LOCK_CMD_CANCEL_WAIT => {
-            table.cancel_wait(ctx.tid);
-            return Ok(None);
-        }
-        VFS_FILE_LOCK_CMD_RELEASE_FILE => {
-            table.release_process_file(ctx.pid, ctx.key);
-            return Ok(None);
-        }
+        VFS_FILE_LOCK_CMD_CANCEL_WAIT => return Ok(Command::CancelWait),
+        VFS_FILE_LOCK_CMD_RELEASE_FILE => return Ok(Command::ReleaseFile),
         _ => {}
     }
     let (owner, whole_file) = match wire.owner {
@@ -624,40 +628,137 @@ pub fn execute(
         _ => None,
     };
     if wire.cmd == VFS_FILE_LOCK_CMD_GETLK {
-        let kind = kind.ok_or(EINVAL)?;
-        let mut reply = *wire;
-        match table.test(ctx.key, owner, kind, start, end) {
-            Some(found) => {
-                reply.lock_type = match found.kind {
-                    LockKind::Read => VFS_FILE_LOCK_TYPE_RDLCK,
-                    LockKind::Write => VFS_FILE_LOCK_TYPE_WRLCK,
-                };
-                reply.whence = VFS_FILE_LOCK_WHENCE_SET;
-                reply.start = i64::try_from(found.start).unwrap_or(i64::MAX);
-                reply.len = report_len(found.start, found.end);
-                // An OFD/flock owner has no pid to report (Linux: -1).
-                reply.pid = match found.owner {
-                    Owner::Process(pid) => i64::try_from(pid).unwrap_or(-1),
-                    _ => -1,
-                };
-            }
-            None => reply.lock_type = VFS_FILE_LOCK_TYPE_UNLCK,
+        return Ok(Command::Get { owner, kind: kind.ok_or(EINVAL)?, start, end });
+    }
+    Ok(Command::Set {
+        owner,
+        op: kind.map_or(LockOp::Unlock, LockOp::Set),
+        start,
+        end,
+        wait: wire.cmd == VFS_FILE_LOCK_CMD_SETLKW,
+    })
+}
+
+fn run(
+    table: &mut LockTable,
+    ctx: &LockContext,
+    wire: &VfsFileLockWire,
+    command: Command,
+) -> Result<Option<VfsFileLockWire>, i32> {
+    match command {
+        Command::CancelWait => {
+            table.cancel_wait(ctx.tid);
+            Ok(None)
         }
-        return Ok(Some(reply));
+        Command::ReleaseFile => {
+            table.release_process_file(ctx.pid, ctx.key);
+            Ok(None)
+        }
+        Command::Get { owner, kind, start, end } => {
+            let mut reply = *wire;
+            match table.test(ctx.key, owner, kind, start, end) {
+                Some(found) => {
+                    reply.lock_type = match found.kind {
+                        LockKind::Read => VFS_FILE_LOCK_TYPE_RDLCK,
+                        LockKind::Write => VFS_FILE_LOCK_TYPE_WRLCK,
+                    };
+                    reply.whence = VFS_FILE_LOCK_WHENCE_SET;
+                    reply.start = i64::try_from(found.start).unwrap_or(i64::MAX);
+                    reply.len = report_len(found.start, found.end);
+                    // An OFD/flock owner has no pid to report (Linux: -1).
+                    reply.pid = match found.owner {
+                        Owner::Process(pid) => i64::try_from(pid).unwrap_or(-1),
+                        _ => -1,
+                    };
+                }
+                None => reply.lock_type = VFS_FILE_LOCK_TYPE_UNLCK,
+            }
+            Ok(Some(reply))
+        }
+        Command::Set { owner, op, start, end, wait } => if wait {
+            table.set_wait(ctx.key, owner, ctx.tid, op, start, end, ctx.now_ns)
+        } else {
+            table.set(ctx.key, owner, op, start, end)
+        }
+        .map(|()| None),
     }
-    let op = kind.map_or(LockOp::Unlock, LockOp::Set);
-    if wire.cmd == VFS_FILE_LOCK_CMD_SETLKW {
-        table.set_wait(ctx.key, owner, ctx.tid, op, start, end, ctx.now_ns)
-    } else {
-        table.set(ctx.key, owner, op, start, end)
+}
+
+/// Executes one decoded `VFS_IPC_OP_FILE_LOCK` wire. `Ok(Some(reply))` is a
+/// `GETLK` answer to send back; `Err(errno)` is the reply status (`EAGAIN`
+/// means "conflict, retry" for the blocking command). Trusts every owner pid in
+/// the table; [`execute_verified`] is the form vfsd serves requests with.
+pub fn execute(
+    table: &mut LockTable,
+    ctx: &LockContext,
+    wire: &VfsFileLockWire,
+) -> Result<Option<VfsFileLockWire>, i32> {
+    let command = decode(ctx, wire)?;
+    run(table, ctx, wire, command)
+}
+
+/// The pids whose liveness decides this command's conflict, if it had one.
+fn conflict_witnesses(table: &LockTable, ctx: &LockContext, command: &Command, outcome: &Result<Option<VfsFileLockWire>, i32>) -> Vec<u64> {
+    match (command, outcome) {
+        (Command::Get { owner, kind, start, end }, Ok(Some(reply))) if reply.lock_type != VFS_FILE_LOCK_TYPE_UNLCK => {
+            table.blocking_pids(ctx.key, *owner, *kind, *start, *end)
+        }
+        (Command::Set { owner, op: LockOp::Set(kind), start, end, .. }, Err(EAGAIN)) => {
+            table.blocking_pids(ctx.key, *owner, *kind, *start, *end)
+        }
+        (Command::Set { owner: Owner::Process(pid), op: LockOp::Set(kind), start, end, wait: true }, Err(EDEADLK)) => {
+            // The verdict rests on a chain of holders and their waits; any of
+            // them being a ghost voids it. The refused wait was not
+            // remembered, so recompute the chain from the table.
+            table
+                .deadlock_chain(*pid, ctx.key, *kind, *start, *end, ctx.now_ns)
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
     }
-    .map(|()| None)
+}
+
+/// [`execute`] that never lets a dead owner decide a conflict.
+///
+/// * A POSIX owner's incarnation is learned from the kernel the first time it
+///   takes a lock in this table.
+/// * When a request meets a conflict (`GETLK` answer, `SETLK`/`SETLKW`
+///   `EAGAIN`, or an `EDEADLK` verdict), the owners it rests on are checked
+///   with the kernel probe (at most once per [`LIVENESS_RECHECK_NS`] each) and
+///   the locks of those that are gone, or that are a different process under a
+///   reused pid, are dropped; the request is then evaluated once more.
+/// * After lost lifecycle evidence ([`LockTable::verify_all_owners`] could not
+///   complete) the first conflict verifies every owner.
+///
+/// The probe is a local kernel call: nothing here can block on another service.
+pub fn execute_verified(
+    table: &mut LockTable,
+    ctx: &LockContext,
+    wire: &VfsFileLockWire,
+    probe: PidProbe<'_>,
+) -> Result<Option<VfsFileLockWire>, i32> {
+    let command = decode(ctx, wire)?;
+    let mut outcome = run(table, ctx, wire, command);
+    let witnesses = conflict_witnesses(table, ctx, &command, &outcome);
+    if !witnesses.is_empty() {
+        let dropped = if table.owners_unverified() {
+            table.verify_all_owners(ctx.now_ns, probe)
+        } else {
+            table.verify_owners(&witnesses, ctx.now_ns, false, probe)
+        };
+        if dropped != 0 {
+            outcome = run(table, ctx, wire, command);
+        }
+    }
+    if let (Ok(_), Command::Set { owner: Owner::Process(pid), op: LockOp::Set(_), .. }) = (&outcome, &command) {
+        table.learn_owner(*pid, ctx.now_ns, probe);
+    }
+    outcome
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
 
     const F: FileKey = (1, 10);
     const G: FileKey = (1, 11);
@@ -673,67 +774,6 @@ mod tests {
             .filter(|l| l.owner == owner)
             .map(|l| (l.kind, l.start, l.end))
             .collect()
-    }
-
-    fn transaction_id(n: u64) -> LockTransactionId {
-        LockTransactionId { pid: 100, tid: 101, operation_hi: 1, operation_lo: n, sequence: n }
-    }
-
-    fn candidate(owner: Owner, op: LockOp) -> LockCandidate {
-        LockCandidate { key: F, owner, op, start: 0, end: 9 }
-    }
-
-    #[test]
-    fn transaction_replay_and_conversion_preserve_old_ranges_until_commit() {
-        let mut table = LockTable::new();
-        table.set(F, A, R, 0, 9).unwrap();
-        let id = transaction_id(1);
-        let requested = candidate(A, W);
-        assert_eq!(table.prepare_transaction(id, requested), Ok(()));
-        assert_eq!(table.prepare_transaction(id, requested), Ok(()));
-        assert_eq!(ranges(&table, F, A), vec![(LockKind::Read, 0, 9)]);
-        assert_eq!(table.set(F, B, R, 0, 9), Err(EAGAIN));
-        assert_eq!(table.commit_transaction(id), Ok(()));
-        assert_eq!(table.commit_transaction(id), Ok(()));
-        assert_eq!(ranges(&table, F, A), vec![(LockKind::Write, 0, 9)]);
-    }
-
-    #[test]
-    fn cancellation_fences_late_prepare_and_any_close_fences_commit() {
-        let mut table = LockTable::new();
-        let early = transaction_id(1);
-        assert_eq!(table.cancel_transaction(early), Ok(()));
-        assert_eq!(table.prepare_transaction(early, candidate(A, W)), Err(125));
-        table.set(F, A, R, 0, 9).unwrap();
-        let id = transaction_id(2);
-        assert_eq!(table.prepare_transaction(id, candidate(A, W)), Ok(()));
-        table.release_process_file(100, F);
-        assert_eq!(table.commit_transaction(id), Err(125));
-        assert!(table.locks_for(F).is_empty());
-    }
-
-    #[test]
-    fn close_watermark_rejects_an_unseen_older_prepare() {
-        let mut table = LockTable::new();
-        assert_eq!(table.release_process_file_through(100, F, 10), Ok(()));
-        assert_eq!(table.prepare_transaction(transaction_id(9), candidate(A, W)), Err(125));
-        assert_eq!(table.prepare_transaction(transaction_id(11), candidate(A, W)), Ok(()));
-        assert_eq!(table.commit_transaction(transaction_id(11)), Ok(()));
-        // Replaying an old close must not release a later lock.
-        assert_eq!(table.release_process_file_through(100, F, 10), Ok(()));
-        assert_eq!(ranges(&table, F, A), vec![(LockKind::Write, 0, 9)]);
-    }
-
-    #[test]
-    fn transaction_conflict_result_is_replayed_after_blocker_changes() {
-        let mut table = LockTable::new();
-        table.set(F, B, W, 0, 9).unwrap();
-        let id = transaction_id(1);
-        let requested = candidate(A, W);
-        assert_eq!(table.prepare_transaction(id, requested), Err(EAGAIN));
-        table.release_process_file(200, F);
-        assert_eq!(table.prepare_transaction(id, requested), Err(EAGAIN));
-        assert_eq!(table.prepare_transaction(transaction_id(2), requested), Ok(()));
     }
 
     #[test]
@@ -1201,6 +1241,130 @@ mod tests {
             let unlck_probe = wire(VFS_FILE_LOCK_CMD_GETLK, VFS_FILE_LOCK_OWNER_POSIX, VFS_FILE_LOCK_TYPE_UNLCK, VFS_FILE_LOCK_WHENCE_SET, 0, 1);
             assert_eq!(execute(&mut t, &ctx(7, 1), &unlck_probe), Err(EINVAL));
             assert!(t.is_empty());
+        }
+
+        #[test]
+        fn verified_execution_drops_dead_and_reused_holders_and_caches_liveness() {
+            let mut t = LockTable::new();
+            let wr = wire(VFS_FILE_LOCK_CMD_SETLK, VFS_FILE_LOCK_OWNER_POSIX, VFS_FILE_LOCK_TYPE_WRLCK, VFS_FILE_LOCK_WHENCE_SET, 0, 10);
+            let mut inc7 = 100_u64;
+            let inc8 = 200_u64;
+            let mut probe_calls = 0_usize;
+
+            // pid 7 takes the lock; its incarnation (100) is learned.
+            let mut c7 = ctx(7, 1);
+            c7.now_ns = 1_000;
+            execute_verified(&mut t, &c7, &wr, &mut |pids| {
+                probe_calls += 1;
+                Some(pids.iter().map(|&p| if p == 7 { inc7 } else { inc8 }).collect())
+            })
+            .unwrap();
+            assert_eq!(probe_calls, 1);
+
+            // Within LIVENESS_RECHECK_NS, a conflicting SETLK trusts the cached liveness.
+            let mut c8 = ctx(8, 2);
+            c8.now_ns = 1_000 + LIVENESS_RECHECK_NS - 1;
+            probe_calls = 0;
+            assert_eq!(
+                execute_verified(&mut t, &c8, &wr, &mut |pids| {
+                    probe_calls += 1;
+                    Some(pids.iter().map(|_| 0).collect())
+                }),
+                Err(EAGAIN)
+            );
+            assert_eq!(probe_calls, 0);
+
+            // Past LIVENESS_RECHECK_NS, pid 7 is dead (incarnation 0): its lock is dropped and pid 8 succeeds.
+            c8.now_ns = 1_000 + LIVENESS_RECHECK_NS;
+            inc7 = 0;
+            assert_eq!(
+                execute_verified(&mut t, &c8, &wr, &mut |pids| {
+                    probe_calls += 1;
+                    Some(pids.iter().map(|&p| if p == 7 { inc7 } else { inc8 }).collect())
+                }),
+                Ok(None)
+            );
+            assert!(probe_calls >= 1);
+            assert_eq!(t.locks_for(F).len(), 1);
+            assert_eq!(t.locks_for(F)[0].owner, Owner::Process(8));
+
+            // pid 8 is now replaced by a new process with the same pid (incarnation 201 != 200).
+            let mut c9 = ctx(9, 3);
+            c9.now_ns = c8.now_ns + LIVENESS_RECHECK_NS;
+            assert_eq!(
+                execute_verified(&mut t, &c9, &wr, &mut |pids| {
+                    Some(pids.iter().map(|&p| if p == 8 { 201 } else { 300 }).collect())
+                }),
+                Ok(None)
+            );
+            assert_eq!(t.locks_for(F)[0].owner, Owner::Process(9));
+        }
+
+        #[test]
+        fn verified_execution_clears_stale_deadlock_and_unavailable_probe_is_conservative() {
+            let mut t = LockTable::new();
+            let wr_f = wire(VFS_FILE_LOCK_CMD_SETLKW, VFS_FILE_LOCK_OWNER_POSIX, VFS_FILE_LOCK_TYPE_WRLCK, VFS_FILE_LOCK_WHENCE_SET, 0, 10);
+            let mut c7 = ctx(7, 1);
+            c7.key = F;
+            let mut c8 = ctx(8, 2);
+            c8.key = G;
+
+            execute_verified(&mut t, &c7, &wr_f, &mut |pids| Some(alloc::vec![100; pids.len()])).unwrap();
+            execute_verified(&mut t, &c8, &wr_f, &mut |pids| Some(alloc::vec![200; pids.len()])).unwrap();
+
+            // pid 7 waits on G (held by pid 8).
+            let mut c7_g = ctx(7, 1);
+            c7_g.key = G;
+            c7_g.now_ns = 10;
+            assert_eq!(
+                execute_verified(&mut t, &c7_g, &wr_f, &mut |pids| Some(alloc::vec![200; pids.len()])),
+                Err(EAGAIN)
+            );
+
+            // Unavailable probe keeps locks conservatively on conflict.
+            let mut c8_f = ctx(8, 2);
+            c8_f.key = F;
+            c8_f.now_ns = LIVENESS_RECHECK_NS + 20;
+            assert_eq!(
+                execute_verified(&mut t, &c8_f, &wr_f, &mut |_| None),
+                Err(EDEADLK)
+            );
+            assert_eq!(t.locks_for(F).len(), 1);
+
+            // Once the probe reports pid 7 is dead, the EDEADLK cycle dissolves and pid 8 gets F.
+            assert_eq!(
+                execute_verified(&mut t, &c8_f, &wr_f, &mut |pids| {
+                    Some(pids.iter().map(|&p| if p == 7 { 0 } else { 200 }).collect())
+                }),
+                Ok(None)
+            );
+            assert_eq!(t.locks_for(F)[0].owner, Owner::Process(8));
+        }
+
+        #[test]
+        fn overflow_marks_unverified_until_full_probe_succeeds() {
+            let mut t = LockTable::new();
+            t.set(F, Owner::Process(7), LockOp::Set(LockKind::Write), 0, 9).unwrap();
+            t.set(G, Owner::Process(8), LockOp::Set(LockKind::Write), 0, 9).unwrap();
+
+            // Wrong-length or None probe keeps `unverified` set and drops nothing.
+            assert_eq!(t.verify_all_owners(100, &mut |_| Some(Vec::new())), 0);
+            assert!(t.owners_unverified());
+            assert_eq!(t.total_locks(), 2);
+
+            // Next conflict triggers verify_all_owners: pid 8 is dead, pid 7 is alive.
+            let wr = wire(VFS_FILE_LOCK_CMD_SETLK, VFS_FILE_LOCK_OWNER_POSIX, VFS_FILE_LOCK_TYPE_WRLCK, VFS_FILE_LOCK_WHENCE_SET, 0, 10);
+            let mut c9 = ctx(9, 3);
+            c9.now_ns = 200;
+            assert_eq!(
+                execute_verified(&mut t, &c9, &wr, &mut |pids| {
+                    Some(pids.iter().map(|&p| if p == 7 { 100 } else { 0 }).collect())
+                }),
+                Err(EAGAIN)
+            );
+            assert!(!t.owners_unverified());
+            assert_eq!(t.locks_for(F).len(), 1);
+            assert!(t.locks_for(G).is_empty(), "unrelated dead owner 8 was also cleaned up");
         }
     }
 }

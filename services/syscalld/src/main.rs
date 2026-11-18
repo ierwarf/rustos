@@ -246,6 +246,8 @@ fn drain_lifecycle_events() {
             linux_policy::handle_process_exit_pid(event.pid);
         } else if event.event == rustos_user_abi::syscall::LIFECYCLE_EVENT_EXEC {
             linux_policy::handle_process_exec_pid(event.pid);
+        } else if event.event == rustos_user_abi::syscall::LIFECYCLE_EVENT_FORK {
+            linux_policy::handle_process_fork_pid(event.pid, event.parent_pid);
         }
     }
 }
