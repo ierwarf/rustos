@@ -5,6 +5,7 @@ pub mod handles;
 pub mod linux;
 pub mod local_wait;
 pub mod memfd;
+pub mod memlock;
 pub mod pipe;
 pub mod process;
 pub mod process_state;

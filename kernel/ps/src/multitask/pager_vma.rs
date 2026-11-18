@@ -1343,6 +1343,257 @@ pub fn set_commit_state_for_process(
     Ok(rewritten.then(|| (process.slot(), process.generation())))
 }
 
+/// Relocates `[old_start, old_end)` to `new_start`: the VMAs covering it, and
+/// (through `mutate`, run under the same locks) its page-table leaves and
+/// descriptor claims. Returns how many VMAs were moved.
+///
+/// **Invariant: concurrent threads see the old mapping or fault into the new
+/// one, never a copy.** Lock order is process state -> per-process VMA writer ->
+/// installer drain -> address-space mutation (TLB) -> frame descriptor. Within
+/// the writer, the whole VMA set is held at an odd rewrite epoch, so an
+/// exception-time lookup returns `Unstable` and restarts rather than reading a
+/// mixture. The overlapping publications are withdrawn (draining installers)
+/// *before* `mutate` runs, so no installer holds a prepared leaf of the old
+/// range while it moves; the new publications appear only after `mutate`
+/// finished its shootdown, so the first access through the new address finds
+/// both leaf and VMA. A store racing through a stale translation lands in the
+/// frame that is the new mapping, so no store is lost.
+///
+/// The destination must hold no VMA; the source may contain holes (reserved
+/// ranges that have no publication, image or legacy leaves are `mutate`'s
+/// business). Nothing changes on any `Err`.
+pub fn move_for_process(
+    process_id: u64,
+    expected: Option<ExpectedMm>,
+    old_start: u64,
+    old_end: u64,
+    new_start: u64,
+    mutate: impl FnOnce(&mut super::UserProcessState) -> Result<(), PagerVmaError>,
+) -> Result<usize, PagerVmaError> {
+    let retained =
+        super::process_table::retain_process_by_pid(process_id).ok_or(PagerVmaError::Stale)?;
+    let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
+    ExpectedMm::check(expected, identity)?;
+    retained.with_state_mut(|_, state| {
+        if super::process_table::published_live_process_identity(retained.handle())
+            != Some(identity)
+        {
+            return Err(PagerVmaError::Unstable);
+        }
+        let mut mutate = Some(mutate);
+        relocate_range(
+            retained.handle(),
+            identity,
+            old_start,
+            old_end,
+            new_start,
+            || mutate.take().expect("relocation mutation consumed once")(state),
+        )
+    })
+}
+
+/// The geometry half of a relocation: which publications survive where.
+///
+/// Pure so that the split/translate rule is testable without a process.
+/// Returns `(remainders, moved)`: the pieces left outside `[old_start,
+/// old_end)` at their old addresses (same publication generation), and the
+/// clipped pieces already translated to the destination (generation unstamped).
+fn plan_relocation(
+    overlapping: &[PagerVmRegionWire],
+    old_start: u64,
+    old_end: u64,
+    new_start: u64,
+) -> Result<(Vec<PagerVmRegionWire>, Vec<PagerVmRegionWire>), PagerVmaError> {
+    let mut remainders = Vec::new();
+    let mut moved = Vec::new();
+    remainders
+        .try_reserve_exact(overlapping.len().saturating_add(2))
+        .map_err(|_| PagerVmaError::Pressure)?;
+    moved
+        .try_reserve_exact(overlapping.len())
+        .map_err(|_| PagerVmaError::Pressure)?;
+    for region in overlapping.iter().copied() {
+        if !(old_start < region.end && region.start < old_end) {
+            return Err(PagerVmaError::Stale);
+        }
+        let edit = PagerRangeEdit {
+            start: old_start,
+            end: old_end,
+            replacement_prot: None,
+        };
+        match apply_region_edit(region, edit) {
+            PagerRegionEdit::Removed => {}
+            PagerRegionEdit::Replaced(only) => remainders.push(only),
+            PagerRegionEdit::Split { left, right } => {
+                remainders.push(left);
+                remainders.push(right);
+            }
+            PagerRegionEdit::Untouched(_)
+            | PagerRegionEdit::ProtectedSplit { .. }
+            | PagerRegionEdit::Denied => return Err(PagerVmaError::Stale),
+            PagerRegionEdit::Malformed => return Err(PagerVmaError::Malformed),
+        }
+        let clipped_start = region.start.max(old_start);
+        let clipped_end = region.end.min(old_end);
+        let mut piece = region;
+        piece.object_offset = region
+            .object_offset
+            .checked_add(clipped_start - region.start)
+            .ok_or(PagerVmaError::Malformed)?;
+        let (translated_start, translated_end) = if new_start >= old_start {
+            let delta = new_start - old_start;
+            (
+                clipped_start.checked_add(delta),
+                clipped_end.checked_add(delta),
+            )
+        } else {
+            let delta = old_start - new_start;
+            (
+                clipped_start.checked_sub(delta),
+                clipped_end.checked_sub(delta),
+            )
+        };
+        piece.start = translated_start.ok_or(PagerVmaError::Malformed)?;
+        piece.end = translated_end.ok_or(PagerVmaError::Malformed)?;
+        piece.vma_generation = 0;
+        piece.process_handle = 0;
+        piece.process_generation = 0;
+        piece.mm_generation = 0;
+        moved.push(piece);
+    }
+    Ok((remainders, moved))
+}
+
+fn relocate_range<F>(
+    handle: ProcessHandle,
+    identity: ProcessIdentity,
+    old_start: u64,
+    old_end: u64,
+    new_start: u64,
+    mutate: F,
+) -> Result<usize, PagerVmaError>
+where
+    F: FnOnce() -> Result<(), PagerVmaError>,
+{
+    let aligned = |value: u64| value.is_multiple_of(PAGER_PAGE_BYTES);
+    if old_start == 0
+        || new_start == 0
+        || old_start >= old_end
+        || !aligned(old_start)
+        || !aligned(old_end)
+        || !aligned(new_start)
+    {
+        return Err(PagerVmaError::Malformed);
+    }
+    let new_end = new_start
+        .checked_add(old_end - old_start)
+        .ok_or(PagerVmaError::Malformed)?;
+    if new_start < old_end && old_start < new_end {
+        return Err(PagerVmaError::Overlap);
+    }
+    if handle.generation() != identity.process_generation() {
+        return Err(PagerVmaError::Stale);
+    }
+
+    let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
+    let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
+    let live_process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
+    let mut overlapping: Vec<(usize, PagerVmRegionWire)> = Vec::new();
+    overlapping
+        .try_reserve_exact(slots.len())
+        .map_err(|_| PagerVmaError::Pressure)?;
+    let mut empty_slots: Vec<usize> = Vec::new();
+    empty_slots
+        .try_reserve_exact(slots.len())
+        .map_err(|_| PagerVmaError::Pressure)?;
+    for (slot_index, slot) in slots.iter().enumerate() {
+        match slot.snapshot()? {
+            // Residue of a previous process/MM incarnation: same reclamation as
+            // every other writer, under the same lock.
+            Some(region) if !region_matches_identity(region, live_process.slot(), identity) => {
+                if let Err(error) = slot.publish(None) {
+                    return Err(error);
+                }
+                empty_slots.push(slot_index);
+            }
+            Some(region) => {
+                if new_start < region.end && region.start < new_end {
+                    return Err(PagerVmaError::Overlap);
+                }
+                if old_start < region.end && region.start < old_end {
+                    overlapping.push((slot_index, region));
+                }
+            }
+            None => empty_slots.push(slot_index),
+        }
+    }
+    overlapping.sort_unstable_by_key(|(_, region)| region.start);
+    let regions: Vec<PagerVmRegionWire> = overlapping.iter().map(|(_, region)| *region).collect();
+    let (remainders, moved) = plan_relocation(&regions, old_start, old_end, new_start)?;
+    let publications = remainders.len() + moved.len();
+    if publications > overlapping.len() + empty_slots.len() {
+        return Err(PagerVmaError::Pressure);
+    }
+    let mut targets: Vec<usize> = Vec::new();
+    targets
+        .try_reserve_exact(publications)
+        .map_err(|_| PagerVmaError::Pressure)?;
+    for index in 0..publications {
+        let slot_index = if index < overlapping.len() {
+            overlapping[index].0
+        } else {
+            empty_slots[index - overlapping.len()]
+        };
+        let sequence = slots[slot_index].sequence.load(Ordering::Relaxed);
+        if sequence & 1 != 0 || sequence > MAX_PUBLICATION_SEQUENCE - 2 {
+            return Err(PagerVmaError::Pressure);
+        }
+        targets.push(slot_index);
+    }
+    // Stamp the moved pieces up front so a refusal cannot leave a half-built
+    // publication set; each takes the generation its own slot will commit.
+    let mut stamped_moved: Vec<PagerVmRegionWire> = Vec::new();
+    stamped_moved
+        .try_reserve_exact(moved.len())
+        .map_err(|_| PagerVmaError::Pressure)?;
+    for (offset, piece) in moved.iter().copied().enumerate() {
+        let slot = &slots[targets[remainders.len() + offset]];
+        let generation = slot
+            .sequence
+            .load(Ordering::Relaxed)
+            .checked_div(2)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(PagerVmaError::Pressure)?;
+        stamped_moved.push(stamped_region(handle, identity, piece, generation)?);
+    }
+
+    // Whole-set odd interval: fault-time misses are restartable until every
+    // publication below (or the rollback) is committed.
+    let _move_rewrite = RangeRewrite::begin(handle)?;
+    for (position, (slot_index, _)) in overlapping.iter().copied().enumerate() {
+        let Err(error) = slots[slot_index].publish(None) else {
+            continue;
+        };
+        for (restore_index, region) in overlapping[..position].iter().copied() {
+            let _ = slots[restore_index].publish(Some(region));
+        }
+        return Err(error);
+    }
+    if let Err(error) = mutate() {
+        for (slot_index, region) in overlapping.iter().copied() {
+            let _ = slots[slot_index].publish(Some(region));
+        }
+        return Err(error);
+    }
+    for (index, region) in remainders.iter().copied().enumerate() {
+        slots[targets[index]].publish(Some(region))?;
+    }
+    for (offset, region) in stamped_moved.iter().copied().enumerate() {
+        slots[targets[remainders.len() + offset]].publish(Some(region))?;
+    }
+    Ok(stamped_moved.len())
+}
+
 /// Reports the first occupied extent intersecting a page-aligned query.
 /// This is advisory geometry, not placement or mapping authority. Ring3 picks
 /// addresses; a later installer must revalidate overlap under its own custody.

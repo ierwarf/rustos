@@ -28,6 +28,7 @@ use rustos_user_abi::syscall::{
     MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD, MM_BROKER_FD_RIGHT_READ, MM_BROKER_FD_RIGHT_WRITE,
     MM_BROKER_OP_BIND_LIBRARY, MM_BROKER_OP_DESCRIBE_FD,
     MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED, MM_BROKER_OP_MAP_FILE_PRIVATE,
+    MM_BROKER_OP_MAP_FILE_SHARED,
     MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_QUERY_CONFLICT,
     MM_BROKER_OP_UNMAP, PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
     SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, SYS_RUSTOS_ENTROPY_BROKER, SYS_RUSTOS_MM_BROKER,
@@ -40,6 +41,10 @@ use crate::mmap_policy::{
     MmapPlanError, MAP_PRIVATE, MAP_SHARED, MAP_TYPE,
 };
 use crate::vma_policy::{next_fit_with_wrap, AddressRange, VmaEntry, VmaMap};
+
+#[path = "mremap_policy.rs"]
+mod mremap_policy;
+pub use mremap_policy::handle_mremap;
 
 const DEFAULT_UMASK: u32 = 0o022;
 const GETRANDOM_MAX_BYTES: u32 = (SYSCALL_OFFLOAD_PAYLOAD_CAPACITY as u32) & !3;
@@ -1076,9 +1081,9 @@ pub fn handle_mmap(
             return;
         }
     };
-    if matches!(plan, MmapPlan::FilePrivate | MmapPlan::MemfdShared)
+    if matches!(plan, MmapPlan::FilePrivate | MmapPlan::FileShared | MmapPlan::MemfdShared)
         && (fd_rights & MM_BROKER_FD_RIGHT_READ == 0
-            || (plan == MmapPlan::MemfdShared
+            || (matches!(plan, MmapPlan::FileShared | MmapPlan::MemfdShared)
                 && prot & PROT_WRITE != 0
                 && fd_rights & MM_BROKER_FD_RIGHT_WRITE == 0))
     {
@@ -1117,6 +1122,7 @@ pub fn handle_mmap(
         }
         MmapPlan::Anonymous => (MM_BROKER_OP_MAP_ANON, MmVmaKind::Anonymous),
         MmapPlan::FilePrivate => (MM_BROKER_OP_MAP_FILE_PRIVATE, MmVmaKind::FilePrivate),
+        MmapPlan::FileShared => (MM_BROKER_OP_MAP_FILE_SHARED, MmVmaKind::MemfdShared),
         MmapPlan::MemfdShared => (MM_BROKER_OP_MAP_MEMFD_SHARED, MmVmaKind::MemfdShared),
         MmapPlan::DeviceShared => (MM_BROKER_OP_MAP_DEVICE_SHARED, MmVmaKind::DeviceShared),
     };

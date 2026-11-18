@@ -559,6 +559,9 @@ fn vfs_request_is_replay_safe(request: &VfsIpcRequest) -> bool {
 fn vfs_request_service_class(request: &VfsIpcRequest) -> ipc_ops::ServiceIpcClass {
     if matches!(request.op, VFS_IPC_OP_CLOSE | VFS_IPC_OP_CURSOR_SETTLE | VFS_IPC_OP_CHECKPOINT_ACK)
         || request.op == rustos_user_abi::syscall::VFS_IPC_OP_FILE_LOCK
+        // Moves the inode's bytes into a vfsd-owned memfd once; the reply names
+        // that memfd, so a short interactive deadline would orphan the upgrade.
+        || request.op == rustos_user_abi::syscall::VFS_IPC_OP_SHARED_BACKING
         || request.op == VFS_IPC_OP_POLL_QUERY && matches!(request.arg0,
             VFS_POLL_QUERY_EPOLL_CREATE | VFS_POLL_QUERY_EPOLL_CTL |
             VFS_POLL_QUERY_EPOLL_RETIRE | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT)

@@ -15,6 +15,7 @@
 //! - **Evidence:** `memory-map`.
 use super::*;
 
+mod file_shared;
 mod pager_admission;
 
 use alloc::vec;
@@ -30,11 +31,12 @@ use rustos_user_abi::syscall::{ServiceCapability,
     MM_BROKER_FD_RIGHT_READ, MM_BROKER_FD_RIGHT_WRITE, MM_BROKER_OP_BIND_LIBRARY, MM_BROKER_OP_DESCRIBE_FD,
     MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED, MM_BROKER_OP_MAP_FILE_PRIVATE,
     MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_QUERY_CONFLICT,
-    MM_BROKER_OP_UNMAP, MM_BROKER_PATH_CAPACITY, VFS_DEVICE_ACCESS_DRM_COMPAT,
+    MM_BROKER_OP_MOVE, MM_BROKER_OP_UNMAP, MM_BROKER_PATH_CAPACITY, VFS_DEVICE_ACCESS_DRM_COMPAT,
     VFS_IPC_PAYLOAD_CAPACITY, RustosMmLibraryBindBrokerResult,
 };
 
 use rustos_user_abi::pager::MM_BROKER_OP_SET_ANON_POLICY;
+use rustos_user_abi::syscall::MM_BROKER_OP_MAP_FILE_SHARED;
 
 use crate::user::handles::{KernelHandle, LibraryBinding, RemoteVfsHandleKind};
 use crate::library_cache::{decide_bind, BindDecision, KernelSources, REGISTRY};
@@ -93,7 +95,7 @@ pub(super) fn syscall_linux_rustos_mm_broker(args_ptr: u64) -> u64 {
             Err(mm_request_lease::LeaseRefusal::WrongProcess) => Err(LINUX_EPERM),
             Ok(apply) => {
                 let t = apply.target();
-                match args.op {
+                let outcome = match args.op {
                     MM_BROKER_OP_QUERY_LAYOUT => broker_query_layout(&args, t),
                     MM_BROKER_OP_QUERY_CONFLICT => broker_query_conflict(&args, t),
                     MM_BROKER_OP_DESCRIBE_FD => broker_describe_fd(&args, t),
@@ -101,10 +103,23 @@ pub(super) fn syscall_linux_rustos_mm_broker(args_ptr: u64) -> u64 {
                     MM_BROKER_OP_MAP_ANON => broker_map_anon(&args, t),
                     MM_BROKER_OP_MAP_FILE_PRIVATE => broker_map_file_private(&args, t),
                     MM_BROKER_OP_MAP_MEMFD_SHARED => broker_map_memfd_shared(&args, t),
+                    MM_BROKER_OP_MAP_FILE_SHARED => file_shared::broker_map_file_shared(&args, t),
                     MM_BROKER_OP_MAP_DEVICE_SHARED => broker_map_device_shared(&args, t),
                     MM_BROKER_OP_PROTECT => broker_protect(&args, t),
                     MM_BROKER_OP_UNMAP => broker_unmap(&args, t),
+                    MM_BROKER_OP_MOVE => broker_move(&args, t),
                     _ => Err(LINUX_EINVAL),
+                };
+                match (outcome, args.op) {
+                    (
+                        Ok(()),
+                        MM_BROKER_OP_MAP_ANON
+                        | MM_BROKER_OP_MAP_FILE_PRIVATE
+                        | MM_BROKER_OP_MAP_FILE_SHARED
+                        | MM_BROKER_OP_MAP_MEMFD_SHARED
+                        | MM_BROKER_OP_MAP_DEVICE_SHARED,
+                    ) => lock_new_mapping_for_mlockall(&args, t),
+                    (outcome, _) => outcome,
                 }
             }
         }
@@ -1092,6 +1107,9 @@ fn broker_unmap(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64> {
                 })
             },
             |state| {
+                // A lock never outlives its mapping: dropped under the same
+                // process-state lock that removed the leaves.
+                state.memlock_mut().release_mapping(start, end);
                 state.release_shared_memfd_mappings_in_range(start, end);
                 state.release_shared_region_mappings_in_range(start, end);
                 state.release_device_buffer_mappings_in_range(start, end);
@@ -1140,6 +1158,147 @@ fn broker_unmap(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64> {
             Err(LINUX_EFAULT)
         }
     }
+}
+
+/// `MM_BROKER_OP_MOVE`: relocate `[addr, addr + len)` to `offset` with no copy.
+///
+/// `syscalld` chose the destination and already unmapped whatever
+/// `MREMAP_FIXED` replaces; ring0 proves the destination is still vacant and
+/// refuses, changing nothing, every kind of backing it cannot re-key.
+///
+/// Invariant (see `kernel_ps::pager_vma::move_for_process`): under the process
+/// state lock the source publications are withdrawn, the leaves, their frame
+/// claims and any `mlock` ranges move together, the TLB shootdown completes,
+/// and only then are the destination publications made. A concurrent thread
+/// therefore faults on the old range until the move starts, restarts during it,
+/// and finds the finished mapping afterwards; a store that raced through a stale
+/// translation hit the frame that is now the destination.
+fn broker_move(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64> {
+    let len = checked_len(args.len)?;
+    let old_start = checked_page_addr(args.addr)?;
+    let pages = page_count(len)?;
+    let old_end = checked_mapping_end(old_start, pages)?;
+    let new_start = checked_page_addr(args.offset)?;
+    let new_end = checked_mapping_end(new_start, pages)?;
+    let mut refusal = None;
+    let result = retry_transient_range_edit("mremap", || {
+        multitask::move_pager_vma_range_for_process(
+            t.pid,
+            Some(t.expected()),
+            old_start,
+            old_end,
+            new_start,
+            |state| {
+                move_process_range(state, old_start, old_end, new_start, new_end).map_err(
+                    |errno| {
+                        refusal = Some(errno);
+                        multitask::PagerVmaError::Stale
+                    },
+                )
+            },
+        )
+    });
+    if let Some(errno) = refusal {
+        nucleus_core::debug::record_milestone(
+            nucleus_core::debug::LogCategory::Compat,
+            "mm-move-refused",
+            old_start,
+            errno as u64,
+        );
+        return Err(errno);
+    }
+    match result {
+        Ok(_) => Ok(()),
+        Err(multitask::PagerVmaError::Overlap | multitask::PagerVmaError::Pressure) => {
+            Err(LINUX_ENOMEM)
+        }
+        Err(multitask::PagerVmaError::Malformed) => Err(LINUX_EINVAL),
+        Err(refusal) => {
+            nucleus_core::debug::record_milestone(
+                nucleus_core::debug::LogCategory::Compat,
+                "pager-vma-move-refused",
+                args.target_pid,
+                refusal as u64,
+            );
+            Err(LINUX_EFAULT)
+        }
+    }
+}
+
+/// The page-table half of [`broker_move`], run under the process-state lock
+/// with the source publications already withdrawn.
+fn move_process_range(
+    process_state: &mut multitask::UserProcessState,
+    old_start: u64,
+    old_end: u64,
+    new_start: u64,
+    new_end: u64,
+) -> Result<(), i64> {
+    if !process_state.mapping_below_stack_guard(new_start, new_end) {
+        return Err(LINUX_ENOMEM);
+    }
+    // Shared memfd/region, DMA-BUF, fixed physical and surface mappings are
+    // owned by records keyed on their address and released by their own owner;
+    // image/heap/stack areas are labelled by address in /proc maps. None of
+    // those has a claim this transaction can re-key, so they never move.
+    if process_state.has_external_backing_in(old_start, old_end)
+        || process_state.has_external_backing_in(new_start, new_end)
+        || process_state.overlaps_labelled_area(old_start, old_end)
+        || process_state.overlaps_labelled_area(new_start, new_end)
+    {
+        return Err(LINUX_ENOMEM);
+    }
+    // Reserve every record the lock ledger will need before any leaf moves, so
+    // the relocation below cannot fail after the page tables changed.
+    process_state
+        .memlock_mut()
+        .reserve_relocation(old_start, old_end)
+        .map_err(|_| LINUX_ENOMEM)?;
+    let pages = ((old_end - old_start) / PAGE_SIZE) as usize;
+    process_state
+        .address_space_mut()
+        .move_present_user_leaves_at(VirtAddr::new(old_start), VirtAddr::new(new_start), pages)
+        .map_err(|_| LINUX_ENOMEM)?;
+    process_state
+        .memlock_mut()
+        .relocate(old_start, old_end, new_start)
+        .expect("lock ledger capacity was reserved before the leaves moved");
+    process_state.sync_mapping_kmem();
+    Ok(())
+}
+
+/// `mlockall(MCL_FUTURE)`: lock a mapping the broker just created, charging
+/// the limit recorded by `mlockall`. A mapping that does not fit is retired and
+/// `mmap` fails with `ENOMEM`, exactly as Linux refuses it.
+fn lock_new_mapping_for_mlockall(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64> {
+    let start = args.addr;
+    let Some(end) = args
+        .len
+        .checked_add(PAGE_SIZE - 1)
+        .map(|len| start.saturating_add(len & !(PAGE_SIZE - 1)))
+    else {
+        return Ok(());
+    };
+    let Some(locked) = multitask::with_process_state_by_generation_mut(
+        t.pid,
+        t.process_generation,
+        t.mm_generation,
+        |state| match state.memlock().future() {
+            None => Ok(()),
+            Some(future) => state
+                .memlock_mut()
+                .lock(start, end, future.limit_bytes)
+                .map(|_| ()),
+        },
+    ) else {
+        return Err(LINUX_ESRCH);
+    };
+    if locked.is_ok() {
+        return Ok(());
+    }
+    // Nothing was recorded on refusal; retire the mapping that does not fit.
+    let _ = broker_unmap(args, t);
+    Err(LINUX_ENOMEM)
 }
 
 fn unmap_process_range(
@@ -1464,9 +1623,11 @@ mod tests {
             "MM_BROKER_OP_MAP_ANON",
             "MM_BROKER_OP_MAP_FILE_PRIVATE",
             "MM_BROKER_OP_MAP_MEMFD_SHARED",
+            "MM_BROKER_OP_MAP_FILE_SHARED",
             "MM_BROKER_OP_MAP_DEVICE_SHARED",
             "MM_BROKER_OP_PROTECT",
             "MM_BROKER_OP_UNMAP",
+            "MM_BROKER_OP_MOVE",
         ] {
             let at = dispatch.find(op).unwrap_or_else(|| panic!("{op} not dispatched"));
             assert!(

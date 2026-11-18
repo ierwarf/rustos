@@ -70,6 +70,28 @@ stable repository prefix; use [task router](task-router.md) for owner contracts.
   cumulative/populated memory lock support, end-to-end seqpacket rights;
   new `mlock` rejects unsupported guarantees instead of pretending to lock.
 
+## Chrome compatibility batch landed on master (2026-11-18)
+
+- Items 1-6 of the Chrome/Linux-GUI request are implemented and guest-verified
+  with the `--chrome-compat-probe` (386 checks, two-boot persistence). No sandbox
+  bypass exists anywhere; Chrome itself still cannot start (sandbox namespaces and
+  seccomp remain out of scope).
+- Still disconnected / found bugs (not fixed): `chown` family is ENOSYS;
+  `madvise` is an all-success no-op in syscalld, so `MADV_DONTNEED` does not zero
+  pages (PartitionAlloc decommit relies on it); writable `MAP_SHARED` of FAT files
+  stays EACCES; no SIGBUS on truncate of a mapped TmpFs file (shrink of a mapped
+  frame returns EBUSY); `utimensat` stores whole seconds; `mlock` does not
+  pre-fault and does not lock partially; vfsd lock table is not checkpointed and
+  CLOEXEC-at-exec does not release POSIX locks; bind with relative paths and the
+  Wayland socket stay private netd bindings; `/proc` formatting lives in Ring0
+  compat (a bounded pull channel from vfsd is the recommended design);
+  `sendfile` to a socket/pipe returns EINVAL; no `mknod` syscall; a fork child's
+  PROT_NONE reservation is missing from syscalld's table (mremap EFAULT).
+- Flake notes: first-time KVM rebuild runs failed readiness twice while cargo test
+  jobs shared the host; clean reruns passed. The netd test binary once exited
+  without a harness verdict in a parallel run (3 later parallel runs and the serial
+  run pass); use `--test-threads=1` for acceptance.
+
 ## Scheduler / Housekeeping 1-vCPU Starvation & `io-manager` Audit (2026-11-15)
 
 - **1-vCPU starvation & `--fault-probe` fix:**

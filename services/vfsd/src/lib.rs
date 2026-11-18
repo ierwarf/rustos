@@ -1790,9 +1790,9 @@ mod early_system_identity_tests {
 }
 
 /// Shape check for a request the mapping broker sends on behalf of the client
-/// that owns the description: the operation is one of the two read-only ops
-/// the broker needs (`FILE_IDENTITY` attestation and the `PREAD64` of the eager
-/// file-mapping copy), the thread is the IPC sender's, and the named pid is some
+/// that owns the description: the operation is one of the ops the broker
+/// needs (`FILE_IDENTITY` attestation, the `PREAD64` of the eager file-mapping
+/// copy, and `SHARED_BACKING` for writable TmpFs shared mappings), the thread is the IPC sender's, and the named pid is some
 /// other (client) process. The sender's service identity is checked by the
 /// caller.
 pub fn client_proxy_shape(
@@ -1806,9 +1806,50 @@ pub fn client_proxy_shape(
         op,
         rustos_user_abi::syscall::VFS_IPC_OP_FILE_IDENTITY
             | rustos_user_abi::syscall::VFS_IPC_OP_PREAD64
+            | rustos_user_abi::syscall::VFS_IPC_OP_SHARED_BACKING
     ) && request_tid == sender_tid
         && request_pid != 0
         && request_pid != sender_pid
+}
+
+/// Admission of `VFS_IPC_OP_SHARED_BACKING` against one open description:
+/// only regular-file descriptions, only known flags, a writable backing only
+/// for a description that may write, and only pinned (inode-addressed) TmpFs
+/// descriptions; a path-addressed one has no shared frames to name.
+pub fn shared_backing_admission(
+    is_file: bool,
+    flags: u64,
+    description_writable: bool,
+    inode_pinned: bool,
+) -> Result<(), i32> {
+    use rustos_user_abi::syscall::VFS_SHARED_BACKING_FLAG_WRITE;
+    const EACCES: i32 = 13;
+    const ENODEV: i32 = 19;
+    if !is_file || flags & !VFS_SHARED_BACKING_FLAG_WRITE != 0 {
+        return Err(EINVAL);
+    }
+    if flags & VFS_SHARED_BACKING_FLAG_WRITE != 0 && !description_writable {
+        return Err(EACCES);
+    }
+    if !inode_pinned {
+        return Err(ENODEV);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod shared_backing_admission_tests {
+    use super::shared_backing_admission as admit;
+
+    #[test]
+    fn writable_backing_needs_a_writable_pinned_regular_file() {
+        assert_eq!(admit(true, 1, true, true), Ok(()));
+        assert_eq!(admit(true, 0, false, true), Ok(()));
+        assert_eq!(admit(true, 1, false, true), Err(13));
+        assert_eq!(admit(true, 1, true, false), Err(19), "FAT/path-addressed: no shared frames");
+        assert_eq!(admit(false, 0, true, true), Err(22));
+        assert_eq!(admit(true, 2, true, true), Err(22), "unknown flag");
+    }
 }
 
 /// Compare a delegated socket rollback against the inode created by bind.
@@ -1942,6 +1983,12 @@ mod file_identity_proxy_tests {
     fn only_identity_and_pread_may_name_another_pid_and_never_another_thread() {
         assert!(file_identity_proxy_shape(VFS_IPC_OP_FILE_IDENTITY, 80, 7, 5, 7));
         assert!(file_identity_proxy_shape(VFS_IPC_OP_PREAD64, 80, 7, 5, 7));
+        assert!(file_identity_proxy_shape(
+            rustos_user_abi::syscall::VFS_IPC_OP_SHARED_BACKING, 80, 7, 5, 7));
+        assert!(!file_identity_proxy_shape(
+            rustos_user_abi::syscall::VFS_IPC_OP_SHARED_BACKING, 80, 8, 5, 7), "thread must match");
+        assert!(!file_identity_proxy_shape(
+            rustos_user_abi::syscall::VFS_IPC_OP_SHARED_BACKING, 5, 7, 5, 7), "equal pid is the ordinary path");
         assert!(!file_identity_proxy_shape(VFS_IPC_OP_READ, 80, 7, 5, 7));
         assert!(!file_identity_proxy_shape(VFS_IPC_OP_FILE_IDENTITY, 80, 8, 5, 7));
         assert!(!file_identity_proxy_shape(VFS_IPC_OP_FILE_IDENTITY, 0, 7, 5, 7));

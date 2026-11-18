@@ -315,6 +315,35 @@ impl VfsState {
         }
     }
 
+    /// `VFS_IPC_OP_SHARED_BACKING`: names the memfd that now holds a pinned
+    /// TmpFs file's bytes so the mapping broker can map it `MAP_SHARED`. The
+    /// description, not a path, selects the inode, so unlink/rename races
+    /// cannot redirect the mapping. A description that cannot write is refused
+    /// a writable backing here as well as in the kernel.
+    fn vfs_shared_backing(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(handle) = self.handles.get(&request.remote_id) else {
+            response.status = EBADF;
+            return;
+        };
+        if let Err(errno) = vfsd::shared_backing_admission(
+            handle.kind == RemoteKind::File,
+            request.arg0,
+            handle.writable,
+            handle.node != 0,
+        ) {
+            response.status = errno;
+            return;
+        }
+        let (mount_id, node) = (handle.mount_id, handle.node);
+        match lock_vfs_storage().shared_backing_node(mount_id, node) {
+            Ok(backing) => {
+                response.value = backing.token;
+                response.aux = backing.object;
+            }
+            Err(errno) => response.status = errno,
+        }
+    }
+
     fn vfs_fstat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
         let Some(handle) = self.handles.get(&request.remote_id) else {
             response.status = EBADF;

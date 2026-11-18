@@ -44,6 +44,10 @@ pub enum MmapPlan {
     Reserved,
     Anonymous,
     FilePrivate,
+    /// Writable `MAP_SHARED` of a file: only a filesystem whose bytes live in
+    /// shared frames (TmpFs) can honour it; vfsd refuses every other file and
+    /// the broker reports that as `EACCES`, never as a private copy.
+    FileShared,
     MemfdShared,
     DeviceShared,
 }
@@ -84,6 +88,7 @@ pub fn plan_mmap_with_write(
         (true, MmapSharing::Private, None) => Ok(MmapPlan::Anonymous),
         (false, MmapSharing::Private, Some(MmapFdKind::File)) => Ok(MmapPlan::FilePrivate),
         (false, MmapSharing::Shared, Some(MmapFdKind::File)) if !writable => Ok(MmapPlan::FilePrivate),
+        (false, MmapSharing::Shared, Some(MmapFdKind::File)) => Ok(MmapPlan::FileShared),
         (false, MmapSharing::Private, Some(_)) => Err(MmapPlanError::InvalidBacking),
         (false, MmapSharing::Shared, Some(MmapFdKind::Memfd)) => Ok(MmapPlan::MemfdShared),
         (false, MmapSharing::Shared, Some(MmapFdKind::DisplaySurface | MmapFdKind::Device | MmapFdKind::DeviceBuffer)) => {
@@ -116,7 +121,13 @@ mod tests {
         assert!(!library_bind_candidate(MmapPlan::FilePrivate, 0, 0));
         assert!(!library_bind_candidate(MmapPlan::FilePrivate, 0x2, 0));
         assert!(!library_bind_candidate(MmapPlan::FilePrivate, 0x1, 0x2001));
-        for plan in [MmapPlan::Anonymous, MmapPlan::Reserved, MmapPlan::MemfdShared, MmapPlan::DeviceShared] {
+        for plan in [
+            MmapPlan::Anonymous,
+            MmapPlan::Reserved,
+            MmapPlan::FileShared,
+            MmapPlan::MemfdShared,
+            MmapPlan::DeviceShared,
+        ] {
             assert!(!library_bind_candidate(plan, 0x1, 0));
         }
     }
@@ -140,7 +151,7 @@ mod tests {
             Err(MmapPlanError::InvalidBacking)
         );
         assert_eq!(
-            plan_mmap(false, MmapSharing::Shared, false, Some(MmapFdKind::File)),
+            plan_mmap(false, MmapSharing::Shared, false, Some(MmapFdKind::Other)),
             Err(MmapPlanError::AccessDenied)
         );
     }
@@ -165,7 +176,12 @@ mod tests {
         );
         assert_eq!(
             plan_mmap_with_write(false, MmapSharing::Shared, false, true, Some(MmapFdKind::File)),
-            Err(MmapPlanError::AccessDenied)
+            Ok(MmapPlan::FileShared)
+        );
+        // A read-only shared file mapping keeps the private-snapshot path.
+        assert_eq!(
+            plan_mmap_with_write(false, MmapSharing::Shared, true, false, Some(MmapFdKind::File)),
+            Ok(MmapPlan::FilePrivate)
         );
         assert_eq!(
             plan_mmap(false, MmapSharing::Shared, false, Some(MmapFdKind::Memfd)),

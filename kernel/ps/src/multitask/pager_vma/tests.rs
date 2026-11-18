@@ -1201,3 +1201,138 @@ fn a_delegated_file_object_stays_attenuation_only() {
     );
     revoke(handle, identity, published.start, published.vma_generation).unwrap();
 }
+
+#[test]
+fn relocation_plan_splits_edges_and_translates_clipped_pieces() {
+    let page = PAGER_PAGE_BYTES;
+    let base = 0x40_0000;
+    let handle = ProcessHandle::new(22, 103);
+    let region = stamped_region(
+        handle,
+        identity(103, 107),
+        PagerVmRegionWire {
+            object_offset: 4 * page,
+            ..wide_template(base, 8)
+        },
+        5,
+    )
+    .unwrap();
+    // Move the middle [2, 5) pages of one region to a lower, disjoint window.
+    let (remainders, moved) =
+        plan_relocation(&[region], base + 2 * page, base + 5 * page, base - 16 * page).unwrap();
+    let mut left_right: alloc::vec::Vec<(u64, u64, u64)> = remainders
+        .iter()
+        .map(|piece| (piece.start, piece.end, piece.object_offset))
+        .collect();
+    left_right.sort_unstable();
+    assert_eq!(
+        left_right,
+        [
+            (base, base + 2 * page, 4 * page),
+            (base + 5 * page, base + 8 * page, 9 * page),
+        ],
+        "the outside pieces keep their address and object offsets"
+    );
+    assert_eq!(moved.len(), 1);
+    assert_eq!((moved[0].start, moved[0].end), (base - 16 * page, base - 13 * page));
+    assert_eq!(moved[0].object_offset, 6 * page, "offset follows the clipped start");
+    assert_eq!(
+        (moved[0].vma_generation, moved[0].process_handle, moved[0].process_generation),
+        (0, 0, 0),
+        "a moved piece is an unstamped template; ring0 stamps it"
+    );
+    // A region wholly inside the range leaves no remainder; one spanning only
+    // the tail contributes just the clipped head.
+    let (remainders, moved) =
+        plan_relocation(&[region], base, base + 8 * page, base + 64 * page).unwrap();
+    assert!(remainders.is_empty());
+    assert_eq!((moved[0].start, moved[0].end), (base + 64 * page, base + 72 * page));
+    // A region that does not intersect the range is a caller bug.
+    assert_eq!(
+        plan_relocation(&[region], base + 8 * page, base + 9 * page, base + 64 * page),
+        Err(PagerVmaError::Stale)
+    );
+}
+
+#[test]
+fn relocation_moves_authority_atomically_and_refuses_an_occupied_destination() {
+    let _guard = guard();
+    let handle = ProcessHandle::new(21, 97);
+    let identity = identity(97, 101);
+    let page = PAGER_PAGE_BYTES;
+    let source = publish(handle, identity, wide_template(0x80_0000, 4), MAX_PAGER_VMAS_PER_PROCESS).unwrap();
+    let blocker = publish(handle, identity, wide_template(0xc0_0000, 2), MAX_PAGER_VMAS_PER_PROCESS).unwrap();
+
+    // Destination overlaps another VMA: nothing changes and `mutate` never runs.
+    let mut ran = false;
+    assert_eq!(
+        relocate_range(handle, identity, source.start, source.end, 0xc0_0000 - page, || {
+            ran = true;
+            Ok(())
+        }),
+        Err(PagerVmaError::Overlap)
+    );
+    assert!(!ran);
+    assert_eq!(lookup(handle, identity, source.start, VM_ACCESS_READ).unwrap().vma_generation, source.vma_generation);
+
+    // A refused `mutate` restores the very publication it withdrew.
+    assert_eq!(
+        relocate_range(handle, identity, source.start, source.end, 0x100_0000, || Err(PagerVmaError::Denied)),
+        Err(PagerVmaError::Denied)
+    );
+    assert_eq!(lookup(handle, identity, source.start, VM_ACCESS_READ), Ok(source));
+
+    // A successful move: the old window faults as unmapped, the new one maps the
+    // same object bytes at the translated address under a fresh generation, and
+    // `mutate` observed the old region already withdrawn.
+    let mut withdrawn_during_mutate = false;
+    assert_eq!(
+        relocate_range(handle, identity, source.start, source.end, 0x100_0000, || {
+            withdrawn_during_mutate = lookup(handle, identity, source.start, VM_ACCESS_READ).is_err();
+            Ok(())
+        }),
+        Ok(1)
+    );
+    assert!(withdrawn_during_mutate);
+    assert_eq!(lookup(handle, identity, source.start, VM_ACCESS_READ), Err(PagerVmaError::Stale));
+    let moved = lookup(handle, identity, 0x100_0000 + 3 * page, VM_ACCESS_WRITE).unwrap();
+    assert_eq!((moved.start, moved.end, moved.object_offset), (0x100_0000, 0x100_0000 + 4 * page, 0));
+    assert_eq!(moved.object, source.object);
+    assert_eq!(moved.prot, source.prot);
+    assert_ne!(moved.process_generation, 0);
+    assert_eq!(lookup(handle, identity, blocker.start, VM_ACCESS_READ), Ok(blocker));
+
+    // A partial move leaves both remainders published and costs exactly one
+    // extra slot; an interior page moves under the shared edit rule.
+    assert_eq!(
+        relocate_range(handle, identity, 0x100_0000 + page, 0x100_0000 + 2 * page, 0x200_0000, || Ok(())),
+        Ok(1)
+    );
+    let spans = published_spans(handle, identity);
+    for expected in [
+        (0x100_0000, 0x100_0000 + page, 0),
+        (0x100_0000 + 2 * page, 0x100_0000 + 4 * page, 2 * page),
+        (0x200_0000, 0x200_0000 + page, page),
+    ] {
+        assert!(spans.contains(&expected), "{expected:x?} missing from {spans:x?}");
+    }
+    // Moving a hole publishes nothing but still runs the leaf mutation.
+    let mut hole_ran = false;
+    assert_eq!(
+        relocate_range(handle, identity, 0x300_0000, 0x300_0000 + page, 0x400_0000, || {
+            hole_ran = true;
+            Ok(())
+        }),
+        Ok(0)
+    );
+    assert!(hole_ran);
+    // Overlapping source/destination and a stale identity refuse up front.
+    assert_eq!(
+        relocate_range(handle, identity, 0x100_0000, 0x100_0000 + 2 * page, 0x100_0000 + page, || Ok(())),
+        Err(PagerVmaError::Overlap)
+    );
+    assert_eq!(
+        relocate_range(handle, ProcessIdentity::from_parts(41, 96, 101), 0x100_0000, 0x100_0000 + page, 0x500_0000, || Ok(())),
+        Err(PagerVmaError::Stale)
+    );
+}

@@ -680,14 +680,27 @@ pub(super) fn syscall_linux_memfd_create(name_ptr: u64, flags: u64) -> u64 {
         Ok(_) => return linux_errno(LINUX_EINVAL),
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE);
-    request.flags = flags;
-    request.path_len = name.len() as u32;
-    request.path[..name.len()].copy_from_slice(name.as_bytes());
-    if let Err(errno) =
-        call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response))
-    {
-        return linux_errno(errno);
+    if ipc_ops::current_process_has_service_capability(ServiceCapability::VfsPolicy) {
+        // vfsd creates its shared-file backing memfds while syscalld is
+        // blocked inside the mapping-broker call that is waiting for vfsd's
+        // reply. Offloading this call to the single-receiver syscalld would
+        // wait on that same blocked service and only end at the IPC deadline.
+        // syscalld's memfd policy is stateless (flag mask; the name was
+        // validated by the reader above), so the service applies it locally.
+        const MFD_KNOWN: u64 = linux_abi::MFD_CLOEXEC | linux_abi::MFD_ALLOW_SEALING;
+        if flags & !MFD_KNOWN != 0 {
+            return linux_errno(LINUX_EINVAL);
+        }
+    } else {
+        let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE);
+        request.flags = flags;
+        request.path_len = name.len() as u32;
+        request.path[..name.len()].copy_from_slice(name.as_bytes());
+        if let Err(errno) =
+            call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response))
+        {
+            return linux_errno(errno);
+        }
     }
 
     let fd_flags = if flags & linux_abi::MFD_CLOEXEC != 0 {

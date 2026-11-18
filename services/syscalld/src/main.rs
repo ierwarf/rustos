@@ -32,8 +32,8 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_GETSID, SYSCALL_OFFLOAD_OP_LINUX_GETUID,
     SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST, SYSCALL_OFFLOAD_OP_LINUX_MADVISE,
     SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE, SYSCALL_OFFLOAD_OP_LINUX_MMAP,
-    SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_MUNMAP,
-    SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64, SYSCALL_OFFLOAD_OP_LINUX_RSEQ,
+    SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_MREMAP,
+    SYSCALL_OFFLOAD_OP_LINUX_MUNMAP, SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64, SYSCALL_OFFLOAD_OP_LINUX_RSEQ,
     SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY, SYSCALL_OFFLOAD_OP_LINUX_SCHED_SETAFFINITY,
     SYSCALL_OFFLOAD_OP_LINUX_SETGID, SYSCALL_OFFLOAD_OP_LINUX_SETPGID,
     SYSCALL_OFFLOAD_OP_LINUX_SETPRIORITY, SYSCALL_OFFLOAD_OP_LINUX_SETSID,
@@ -448,6 +448,7 @@ fn handle_commercial_request(
                     ("mmap", SYSCALL_OFFLOAD_OP_LINUX_MMAP),
                     ("mprotect", SYSCALL_OFFLOAD_OP_LINUX_MPROTECT),
                     ("munmap", SYSCALL_OFFLOAD_OP_LINUX_MUNMAP),
+                    ("mremap", SYSCALL_OFFLOAD_OP_LINUX_MREMAP),
                     ("madvise", SYSCALL_OFFLOAD_OP_LINUX_MADVISE),
                     ("memfd-create", SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE),
                 ],
@@ -582,6 +583,7 @@ fn handle_linux_request(
         SYSCALL_OFFLOAD_OP_LINUX_MMAP => linux_policy::handle_mmap(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_MPROTECT => linux_policy::handle_mprotect(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_MUNMAP => linux_policy::handle_munmap(request, response),
+        SYSCALL_OFFLOAD_OP_LINUX_MREMAP => linux_policy::handle_mremap(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE => {
             linux_policy::handle_memfd_create(request, response)
         }
@@ -652,6 +654,7 @@ fn validate_request(received: usize, request: &LinuxSyscallOffloadRequest) -> Re
         | SYSCALL_OFFLOAD_OP_LINUX_MMAP
         | SYSCALL_OFFLOAD_OP_LINUX_MPROTECT
         | SYSCALL_OFFLOAD_OP_LINUX_MUNMAP
+        | SYSCALL_OFFLOAD_OP_LINUX_MREMAP
         | SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE => Ok(()),
         _ => Err(errno::EINVAL),
     }

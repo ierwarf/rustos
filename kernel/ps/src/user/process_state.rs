@@ -28,6 +28,7 @@ use crate::user::linux::{
     SIG_IGN,
 };
 use crate::user::memfd::MemfdMappingHold;
+use crate::user::memlock::MemlockLedger;
 use kernel_ipc_runtime::api::KernelSharedRegionMappingHold;
 
 const PAGE_SIZE: u64 = 4096;
@@ -234,6 +235,9 @@ pub struct UserProcessState {
     /// dies with the fd, so this list is the only thing that keeps the PTEs
     /// visible to `unmap` as external backing after the fd is closed.
     external_physical_mappings: Vec<(u64, u64)>,
+    /// `mlock` ranges and the `mlockall(MCL_FUTURE)` request. Not inherited by
+    /// fork (Linux clears `VM_LOCKED` in the child) and replaced by exec.
+    memlock: MemlockLedger,
     /// Bytes of the two mapping lists above, billed to the Job as
     /// `Class::Vma` once the process is published.
     mapping_kmem: kernel_mm::api::kmem_charge::SharedMeter,
@@ -588,6 +592,7 @@ impl UserProcessState {
             shared_region_mappings: Vec::new(),
             device_buffer_mappings: Vec::new(),
             external_physical_mappings: Vec::new(),
+            memlock: MemlockLedger::new(),
             mapping_kmem: kernel_mm::api::kmem_charge::SharedMeter::new(
                 kernel_mm::api::kmem_charge::Class::Vma,
             ),
@@ -954,6 +959,37 @@ impl UserProcessState {
             .would_admit(self.mapping_kmem_total() + (extra * per_record) as u64)
     }
 
+    pub fn memlock(&self) -> &MemlockLedger {
+        &self.memlock
+    }
+
+    pub fn memlock_mut(&mut self) -> &mut MemlockLedger {
+        &mut self.memlock
+    }
+
+    /// Whether any part of `[start, end)` is mapped through a record this
+    /// process owns outside the page-table/frame ledger (shared memfd or
+    /// region, DMA-BUF, fixed physical window, display surface). Such backing
+    /// is released by its own owner and has no leaf claim a relocation could
+    /// re-key, so it must not be moved.
+    pub fn has_external_backing_in(&self, start: u64, end: u64) -> bool {
+        !self.shared_memfd_overlap_segments(start, end).is_empty()
+            || !self.shared_region_overlap_segments(start, end).is_empty()
+            || !self.device_buffer_overlap_segments(start, end).is_empty()
+            || !self.external_physical_overlap_segments(start, end).is_empty()
+            || !self.handles().surface_overlap_segments(start, end).is_empty()
+    }
+
+    /// Whether `[start, end)` touches the ELF image, heap or stack areas whose
+    /// labels `/proc/<pid>/maps` renders from `linux_memory_map`.
+    pub fn overlaps_labelled_area(&self, start: u64, end: u64) -> bool {
+        self.linux_memory_map.as_ref().is_some_and(|map| {
+            map.areas()
+                .iter()
+                .any(|area| start < area.end && area.start < end)
+        })
+    }
+
     pub fn mapping_kmem_charged(&self) -> u64 {
         self.mapping_kmem.charged()
     }
@@ -1096,6 +1132,7 @@ impl UserProcessState {
             shared_region_mappings: self.shared_region_mappings.clone(),
             device_buffer_mappings: Vec::new(),
             external_physical_mappings: self.external_physical_mappings.clone(),
+            memlock: MemlockLedger::new(),
             // A fork child is billed when it is published, not when cloned.
             mapping_kmem: kernel_mm::api::kmem_charge::SharedMeter::new(kernel_mm::api::kmem_charge::Class::Vma),
             exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
@@ -1131,6 +1168,7 @@ impl UserProcessState {
             shared_region_mappings,
             device_buffer_mappings,
             external_physical_mappings,
+            memlock,
             mapping_kmem,
             exec_path,
             exec_path_len,
@@ -1151,6 +1189,7 @@ impl UserProcessState {
             shared_region_mappings,
             device_buffer_mappings,
             external_physical_mappings,
+            memlock,
             mapping_kmem,
             exec_path,
             exec_path_len,

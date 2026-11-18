@@ -1077,6 +1077,155 @@ impl ProcessAddressSpace {
         Ok(unmapped)
     }
 
+    /// Atomically relocates every present leaf of `[old_start, old_start + n)`
+    /// to the same offsets from `new_start`, moving the frame, its protection
+    /// and its descriptor claim; no byte is copied.
+    ///
+    /// Callers serialize VMA/PTE writers for this root (process state lock and
+    /// the VMA writer withdrawal) exactly as for unmap. Preflight proves, before
+    /// any PTE changes, that the ranges are disjoint, the destination is vacant
+    /// and not immutable image metadata, and that **every** present source leaf
+    /// is address-space owned (PTE tag plus exact `(root, va, frame)` claim);
+    /// borrowed or external backing is refused, never moved. Destination tables
+    /// are built before the first leaf moves, so the per-leaf step cannot run
+    /// out of memory.
+    ///
+    /// Per leaf, under one address-space mutation: clear the old PTE, re-key the
+    /// descriptor, install the new PTE with the identical flags. A store racing
+    /// from another CPU through a not-yet-shot-down translation lands in the very
+    /// frame that is now the new mapping, so no store is lost; the shootdown
+    /// completes before this returns. A failure rolls the moved prefix back.
+    pub fn move_present_user_leaves_at(
+        &mut self,
+        old_start: VirtAddr,
+        new_start: VirtAddr,
+        page_count: usize,
+    ) -> Result<usize, AddressSpaceError> {
+        if page_count == 0 {
+            return Err(AddressSpaceError::ZeroSizedAllocation);
+        }
+        validate_user_page_range(old_start, page_count)?;
+        validate_user_page_range(new_start, page_count)?;
+        let old_end = pager_fault_range_end(old_start, page_count)?;
+        let new_end = pager_fault_range_end(new_start, page_count)?;
+        if old_start.as_u64() < new_end && new_start.as_u64() < old_end {
+            return Err(AddressSpaceError::AlreadyMapped);
+        }
+        if self.immutable_overlaps(old_start.as_u64(), old_end)
+            || self.immutable_overlaps(new_start.as_u64(), new_end)
+        {
+            return Err(AddressSpaceError::ProtectionViolation);
+        }
+        if !self.user_range_is_unmapped(new_start, page_count)? {
+            return Err(AddressSpaceError::AlreadyMapped);
+        }
+        let root_frame = self.pml4_frame_phys;
+        let mut leaf_flags: Vec<PageTableFlags> = Vec::new();
+        let leaves = scan_present_user_leaves_in_range(
+            self.root_phys(),
+            old_start.as_u64(),
+            old_end,
+            page_count,
+            read_user_table_entry,
+            read_user_leaf_entry,
+            |leaf, flags| {
+                validate_user_unmap_leaf(
+                    leaf,
+                    flags,
+                    &[],
+                    phys::data_leaf_is_owned(root_frame, leaf.virtual_address, leaf.physical_address),
+                )?;
+                leaf_flags
+                    .try_reserve(1)
+                    .map_err(|_| AddressSpaceError::OutOfFrames)?;
+                leaf_flags.push(flags);
+                Ok(())
+            },
+        )?;
+        if leaves.is_empty() {
+            return Ok(0);
+        }
+        let delta_up = new_start.as_u64() >= old_start.as_u64();
+        let delta = new_start.as_u64().abs_diff(old_start.as_u64());
+        let destination = |leaf: &PagerFaultLeaf| {
+            VirtAddr::new(if delta_up {
+                leaf.virtual_address + delta
+            } else {
+                leaf.virtual_address - delta
+            })
+        };
+
+        let mutation = begin_address_space_mutation(self.root_phys());
+        // Build every destination table first; a table left behind by a later
+        // refusal is root-owned and reclaimed with the address space.
+        let root_table = self.root_phys();
+        let mut prepared_block = u64::MAX;
+        for leaf in &leaves {
+            let virt = destination(leaf);
+            let block = virt.as_u64() >> PD_SHIFT;
+            if block == prepared_block {
+                continue;
+            }
+            let pdpt = ensure_next_table(root_frame, root_table, p4_index(virt))?;
+            let pd = ensure_next_table(root_frame, pdpt, p3_index(virt))?;
+            ensure_next_table(root_frame, pd, p2_index(virt))?;
+            prepared_block = block;
+        }
+
+        let mut moved = 0_usize;
+        let mut failure = None;
+        for (leaf, flags) in leaves.iter().zip(leaf_flags.iter().copied()) {
+            let old = VirtAddr::new(leaf.virtual_address);
+            let new = destination(leaf);
+            let frame = PhysAddr::new(leaf.physical_address);
+            if self.unmap_user_page(old) != Some(frame) {
+                failure = Some(AddressSpaceError::NotMapped);
+                break;
+            }
+            if !phys::rekey_data_leaf(root_frame, old.as_u64(), new.as_u64(), frame.as_u64()) {
+                self.map_user_page(old, frame, flags)
+                    .expect("relocation restored a leaf it just removed");
+                failure = Some(AddressSpaceError::InvalidFrameOwnership);
+                break;
+            }
+            if let Err(error) = self.map_user_page(new, frame, flags) {
+                assert!(
+                    phys::rekey_data_leaf(root_frame, new.as_u64(), old.as_u64(), frame.as_u64()),
+                    "relocation lost the claim it just re-keyed"
+                );
+                self.map_user_page(old, frame, flags)
+                    .expect("relocation restored a leaf it just removed");
+                failure = Some(error);
+                break;
+            }
+            moved += 1;
+        }
+        if let Some(error) = failure {
+            for (leaf, flags) in leaves[..moved].iter().zip(leaf_flags.iter().copied()).rev() {
+                let old = VirtAddr::new(leaf.virtual_address);
+                let new = destination(leaf);
+                let frame = PhysAddr::new(leaf.physical_address);
+                assert_eq!(
+                    self.unmap_user_page(new),
+                    Some(frame),
+                    "relocation rollback lost a moved leaf"
+                );
+                assert!(
+                    phys::rekey_data_leaf(root_frame, new.as_u64(), old.as_u64(), frame.as_u64()),
+                    "relocation rollback lost a moved claim"
+                );
+                self.map_user_page(old, frame, flags)
+                    .expect("relocation rollback could not restore a leaf");
+            }
+            let _flushed = mutation.flush_for_reclaim();
+            return Err(error);
+        }
+        // Complete the shootdown before the caller republishes the VMAs: after
+        // this no CPU can reach the frame through the old address.
+        let _flushed = mutation.flush_for_reclaim();
+        Ok(moved)
+    }
+
     fn unmap_preflighted_user_leaves(
         &mut self,
         leaves: Vec<PagerFaultLeaf>,

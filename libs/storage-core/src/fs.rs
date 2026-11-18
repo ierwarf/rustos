@@ -127,6 +127,18 @@ pub struct FsStatFs {
     pub case_preserved: bool,
 }
 
+/// Identity of the memfd a volume moved one inode's bytes into so that mappings
+/// and the volume's own read/write path share one set of frames.
+///
+/// `token` is the owning service's descriptor number and `object` the memfd's
+/// never-recycled object id; the kernel validates the pair before mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FsSharedBacking {
+    pub token: u64,
+    pub object: u64,
+    pub len: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FsOpenOptions {
     pub create: bool,
@@ -327,6 +339,13 @@ pub trait FsVolume: Send + Sync {
         _atime: Option<FsTimestamp>,
         _mtime: Option<FsTimestamp>,
     ) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Moves a regular file's bytes into a shared-frame backing (idempotent)
+    /// and names it. Volumes without one keep the default `Unsupported`, which
+    /// is what keeps writable shared mappings of FAT files refused.
+    fn shared_backing_node(&self, _node: u64) -> Result<FsSharedBacking, FsError> {
         Err(FsError::Unsupported)
     }
 

@@ -111,10 +111,11 @@ lock calls, timed signals/select, message batches, epoll timespec waits,
 rlimits and scheduler/priority operations. Having a dispatch arm or an argument
 helper test is not proof of Linux behavior.
 
-In particular, copied-page mremap is unsafe with sibling writes; real movement
-must be performed by the MM owner with page-table/frame ownership and pager
-VMA generations updated together. Memory locking and KEEP_SIZE allocation must
-not report guarantees they do not establish. Copy pins must be released only
+Copied-page mremap was unsafe with sibling writes, so movement is now done by the
+MM owner (`MM_BROKER_OP_MOVE`: leaves, frame-ledger claims, memlock ledger and
+pager VMA generations move together, no copy; see `abi/core.md`). `mlock` is
+accounting-only because the kernel never reclaims resident user pages. KEEP_SIZE
+allocation must not report guarantees it does not establish. Copy pins must be released only
 when acquired; overlap checks use inode identity and effective gated cursors.
 Open honors `O_NOFOLLOW`/`ELOOP`, attenuated `O_PATH`, and an explicit unsupported
 answer where anonymous `O_TMPFILE` is not implemented.
@@ -167,27 +168,25 @@ short trace does not waive their requested compatibility tests.
    rerun remains required. Two pre-existing tests are opt-in/ignored.
 2. Host trace/signature comparison above collected; not RustOS execution.
 3. `--chrome-compat-probe` is opt-in and requires every named case plus PASS.
-   Follow-up: the latest second-phase boot passed persistence, atomic rename,
-   lock autorelease, pipe SCM_RIGHTS and executable path labeling. Exactly 3 of
-   378 checks failed: moving mremap, mlock and writable file `MAP_SHARED`. The
-   previous failures below are retained as historical evidence.
-   Persistence must run on one disposable disk with explicit phases:
+   Final guest evidence (2026-11-18, default vCPUs, one disposable disk, explicit
+   phases): `chromeprobe: persist first-boot ok` then `persist second-boot ok`,
+   `chromeprobe: PASS (386 checks, 0 failures)` on both boots, `kvm-smoke` exit 0.
+   Reproduce with:
 
    ```sh
-   cargo xtask kvm-smoke --rustos-vcpus 1 --timeout 90 \
-     --chrome-compat-probe --chrome-probe-persist first --data-disk <path>
-   cargo xtask kvm-smoke --rustos-vcpus 1 --timeout 90 \
-     --chrome-compat-probe --chrome-probe-persist second --data-disk <same path>
+   cargo xtask kvm-smoke --chrome-compat-probe --chrome-probe-persist first --data-disk <path>
+   cargo xtask kvm-smoke --chrome-compat-probe --chrome-probe-persist second --data-disk <same path>
    ```
 
    A missing/corrupt second-boot marker is failure, not another first-boot pass.
-   The 1-vCPU boots on `build/kvm/chrome-final-1794974269.img` logged both
-   `persist first-boot ok` and `persist second-boot ok`. TmpFs, `/data`,
-   SEQPACKET data, pathname/abstract sockets, link/address dumps, proc fd
-   reopen, message batching and socket stat passed. Both aggregate runs
-   failed with 14 of 378 checks failing, in five cases: lock autorelease,
-   SCM_RIGHTS, mremap move, mlock/msync setup, and maps executable labeling.
-   Logs are `logs/chrome-integration/kvm-{first,second}-final-debugcon.log`.
+   Bugs found and fixed by the final runs: vfsd `memfd_create` offloaded to
+   syscalld while syscalld waited for vfsd inside the `MAP_FILE_SHARED` broker op
+   (self-deadlock, ETIMEDOUT; vfsd now applies the stateless memfd policy
+   locally); lifecycle EXIT was queued after the zombie became visible to `wait4`
+   (flaky `lock.posix-data` EAGAIN). Two readiness failures
+   (`uiserver: gpu-compositor active`, uiserver watchdog) occurred only while
+   other cargo jobs loaded the host; clean-host reruns passed, but the
+   historical few-percent KVM flake baseline still applies.
 4. The final serial package suite and `cargo xtask check` passed using an
    isolated Cargo target. `bash formal/verify-all.sh --profile pr` likewise
    passed and sealed 45 artifacts with that target. The shared-target run

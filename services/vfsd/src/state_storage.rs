@@ -1222,7 +1222,7 @@ impl VfsStorage {
         if self.tmpfs_ready {
             return;
         }
-        match self.mounts.mount_tmpfs_defaults(tmpfs_clock) {
+        match self.mounts.mount_tmpfs_defaults(tmpfs_clock, Some(shared_frames::create_memfd_frames)) {
             Ok(()) => self.tmpfs_ready = true,
             Err(err) => debug_line(&format!("vfsd: tmpfs mount failed err={err}")),
         }
@@ -1972,6 +1972,23 @@ impl VfsStorage {
         self.node_volume(mount_id)?
             .fallocate_node(node, offset, len, keep_size)
             .map_err(vfsd::map_fs_error)
+    }
+
+    /// Moves a pinned TmpFs node's bytes into shared frames (idempotent) and
+    /// names them for the mapping broker. A volume without shared frames
+    /// (FAT, the early-system image) is `ENODEV`: the caller keeps its
+    /// existing private-copy policy.
+    fn shared_backing_node(
+        &mut self,
+        mount_id: u64,
+        node: u64,
+    ) -> Result<storage_core::fs::FsSharedBacking, i32> {
+        self.node_volume(mount_id)?
+            .shared_backing_node(node)
+            .map_err(|err| match err {
+                storage_core::fs::FsError::Unsupported => ENODEV,
+                other => vfsd::map_fs_error(other),
+            })
     }
 
     fn truncate_node(&mut self, mount_id: u64, node: u64, new_len: u64) -> Result<u64, i32> {

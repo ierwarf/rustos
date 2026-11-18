@@ -169,6 +169,12 @@ pub fn release_data_leaf(
     FRAME_DESCRIPTORS.release_data(root_phys, virtual_address, frame_phys)
 }
 
+/// Moves one live data mapping's ledger key from `old_va` to `new_va` of the
+/// same root (see `FrameDescriptorLedger::rekey_data`). `false` changes nothing.
+pub fn rekey_data_leaf(root_phys: u64, old_va: u64, new_va: u64, frame_phys: u64) -> bool {
+    FRAME_DESCRIPTORS.rekey_data(root_phys, old_va, new_va, frame_phys)
+}
+
 pub fn data_leaf_count(root_phys: u64) -> Option<u64> {
     let root = FRAME_DESCRIPTORS.verify_root(root_phys)?;
     Some(root.data_leaf_count_or_map_head.load(DESCRIPTOR_ACQUIRE))

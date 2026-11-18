@@ -13,7 +13,8 @@ use storage_core::{detect_partitions, BlockDevice, BlockSlice, IoResult};
 use storage_fat::{FatError, FatVolume};
 
 use crate::tmpfs::{
-    TmpFs, TmpFsConfig, DEV_SHM_MAX_INODES, DEV_SHM_QUOTA_BYTES, RUN_MAX_INODES, RUN_QUOTA_BYTES,
+    SharedFramesFactory, TmpFs, TmpFsConfig, DEV_SHM_MAX_INODES, DEV_SHM_QUOTA_BYTES, RUN_MAX_INODES,
+    RUN_QUOTA_BYTES,
     TMP_MAX_INODES, TMP_QUOTA_BYTES,
 };
 use crate::{map_storage_error, EIO};
@@ -282,19 +283,27 @@ impl MountTable {
 
     /// Mounts the boot-time memory filesystems and creates their fixed
     /// directories. Idempotent: an already mounted point is left untouched.
-    pub fn mount_tmpfs_defaults(&mut self, clock: fn() -> FsTimestamp) -> Result<(), FsError> {
+    pub fn mount_tmpfs_defaults(
+        &mut self,
+        clock: fn() -> FsTimestamp,
+        shared_frames: Option<SharedFramesFactory>,
+    ) -> Result<(), FsError> {
         for spec in TMPFS_MOUNTS {
             if self.entries.iter().any(|e| e.mount_point == spec.mount_point) {
                 continue;
             }
-            let fs = Arc::new(TmpFs::new(TmpFsConfig {
+            let mut fs = TmpFs::new(TmpFsConfig {
                 quota_bytes: spec.quota_bytes,
                 max_inodes: spec.max_inodes,
                 root_mode: spec.root_mode,
                 root_uid: 0,
                 root_gid: 0,
                 clock,
-            }));
+            });
+            if let Some(factory) = shared_frames {
+                fs = fs.with_shared_frames(factory);
+            }
+            let fs = Arc::new(fs);
             if spec.mount_point == "/run" {
                 for (dir, mode, uid, gid) in RUN_BOOT_DIRECTORIES {
                     fs.mkdir_with(dir, FsCreateAttrs::new(mode, uid, gid))?;
@@ -725,7 +734,7 @@ mod tests {
 
     fn tmpfs_table() -> MountTable {
         let mut table = MountTable::new();
-        table.mount_tmpfs_defaults(zero_clock).unwrap();
+        table.mount_tmpfs_defaults(zero_clock, None).unwrap();
         table
     }
 
@@ -740,7 +749,7 @@ mod tests {
         let (entry, _) = table.resolve("/tmp/x").unwrap();
         entry.volume.mkdir("keep").unwrap();
         let mut again = table;
-        again.mount_tmpfs_defaults(zero_clock).unwrap();
+        again.mount_tmpfs_defaults(zero_clock, None).unwrap();
         let (entry, rel) = again.resolve("/tmp/keep").unwrap();
         assert_eq!(rel, "keep");
         assert!(entry.volume.metadata(rel).is_ok());

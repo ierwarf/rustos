@@ -2,9 +2,11 @@
 //! `membarrier` and `mremap`.
 //!
 //! - **Owner:** `kernel-compat` owns the argument envelope and the read-only
-//!   queries; `syscalld` stays the owner of mapping policy, so every mapping
-//!   supported in-place `mremap` mutations use `mmap`/`munmap` requests.
-//!   Movement requires an MM-owner transaction and is refused for now.
+//!   queries. `syscalld` owns mapping policy: it picks every `mremap` target
+//!   and edits its `VmaMap`, and ring0's `MM_BROKER_OP_MOVE` (see
+//!   `mm_broker_ops`) is the only thing that relocates page-table leaves. The
+//!   per-process lock ledger (`kernel-ps` `MemlockLedger`) is owned by the
+//!   process state and mutated here under its lock.
 //! - **Boundary:** Addresses, lengths and flags arrive from an untrusted guest
 //!   and are validated against Linux's order of checks before any query.
 //! - **Mapped-ness:** a page is mapped when a pager VMA covers it (ring0's
@@ -17,15 +19,26 @@
 //! - **Concurrency:** the region snapshot takes the pager-VMA writer lock and no
 //!   process-state lock; the leaf scans take the process-state read section for
 //!   one bounded chunk and never call out of it. Nothing here nests the two.
-//! - **Failure:** a refused sub-request returns its own errno; relocation
-//!   fails before modifying either address range.
+//! - **Failure:** a refused sub-request returns its own errno; a refused move
+//!   changes neither address range (the broker rolls back, `syscalld` retires
+//!   the extension it mapped for the move).
+//! - **mlock:** this kernel never evicts, swaps or reclaims a resident user
+//!   page (memory pressure only ever kills a whole process through the OOM
+//!   watchdog), so a lock is a truthful promise for every mapping kind and is
+//!   recorded, not enforced by pinning. Pages are not pre-faulted: a locked page
+//!   becomes resident at its first touch and stays resident. `MCL_ONFAULT` and
+//!   `MLOCK_ONFAULT` therefore behave exactly as the default and are accepted.
 //! - **Forbidden:** no guest-selected frame, no W+X, and no success for an
 //!   operation whose effect the kernel cannot honestly provide.
 
 use alloc::vec::Vec;
 
 use rustos_user_abi::pager::{
-    PagerVmRegionWire, PAGER_PAGE_BYTES, VM_OBJECT_ANONYMOUS, VM_PROT_READ, VM_SHARING_PRIVATE,
+    PagerVmRegionWire, PAGER_PAGE_BYTES, VM_OBJECT_ANONYMOUS, VM_SHARING_PRIVATE,
+};
+use kernel_ps::user::memlock::{FutureLock, LockRefusal};
+use rustos_user_abi::syscall::{
+    MREMAP_SOURCE_ANON_PRIVATE, MREMAP_SOURCE_HAS_HOLES, SYSCALL_OFFLOAD_OP_LINUX_MREMAP,
 };
 use x86_64::VirtAddr;
 
@@ -34,10 +47,6 @@ use super::*;
 const PAGE: u64 = PAGER_PAGE_BYTES;
 /// Pages inspected per process-state section and per `mincore` output write.
 const SCAN_CHUNK_PAGES: usize = 4096;
-/// `PROT_READ | PROT_WRITE`, the protection a move destination is built with.
-const PROT_RW: u32 = (linux_abi::PROT_READ | linux_abi::PROT_WRITE) as u32;
-const MAP_ANON_PRIVATE: u64 = linux_abi::MAP_PRIVATE | linux_abi::MAP_ANONYMOUS;
-const NO_FD: u64 = u64::MAX;
 
 /// One published mapping, reduced to what this module decides on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,30 +144,40 @@ fn resident_pages(start: u64, pages: usize) -> Option<Vec<bool>> {
     })
 }
 
-/// Whether every page of `[start, end)` is mapped: covered by a published
-/// region or resident. Stops at the first unmapped page.
-fn range_fully_mapped(start: u64, end: u64) -> Result<bool, i64> {
+/// Sub-ranges of `[start, end)` that are neither covered by a published region
+/// nor resident, ascending.
+fn unmapped_ranges(start: u64, end: u64) -> Result<Vec<(u64, u64)>, i64> {
     let spans = current_spans()?;
+    let mut holes: Vec<(u64, u64)> = Vec::new();
     for (gap_start, gap_end) in uncovered_ranges(&spans, start, end) {
         let mut cursor = gap_start;
         while cursor < gap_end {
             let pages = (((gap_end - cursor) / PAGE) as usize).min(SCAN_CHUNK_PAGES);
             let resident = resident_pages(cursor, pages).ok_or(LINUX_ESRCH)?;
-            if resident.iter().any(|present| !present) {
-                return Ok(false);
+            for (index, present) in resident.iter().copied().enumerate() {
+                if present {
+                    continue;
+                }
+                let page = cursor + index as u64 * PAGE;
+                match holes.last_mut() {
+                    Some(last) if last.1 == page => last.1 = page + PAGE,
+                    _ => holes.push((page, page + PAGE)),
+                }
             }
             cursor += pages as u64 * PAGE;
         }
     }
-    Ok(true)
+    Ok(holes)
+}
+
+/// Whether every page of `[start, end)` is mapped: covered by a published
+/// region or resident.
+fn range_fully_mapped(start: u64, end: u64) -> Result<bool, i64> {
+    Ok(unmapped_ranges(start, end)?.is_empty())
 }
 
 fn align_up(value: u64) -> Option<u64> {
     value.checked_add(PAGE - 1).map(|v| v & !(PAGE - 1))
-}
-
-fn is_errno_result(value: u64) -> bool {
-    (value as i64) < 0 && (value as i64) >= -4095
 }
 
 // ---- mincore ---------------------------------------------------------------
@@ -216,9 +235,13 @@ pub(super) fn syscall_linux_mincore(start: u64, len: u64, vec_ptr: u64) -> u64 {
 
 // ---- mlock family ----------------------------------------------------------
 //
-// Without a cumulative lock ledger and eager population, a nonempty
-// mlock cannot promise Linux's residency and RLIMIT_MEMLOCK semantics.
-// Do not grant a lock that the VM owner has not recorded.
+// Admission follows Linux: `EPERM` when the caller has neither privilege nor a
+// nonzero `RLIMIT_MEMLOCK`; `ENOMEM` when the cumulative locked total would
+// exceed the limit or part of the range is unmapped; `EAGAIN` when the ledger
+// cannot record the lock. Ledger edits and the mapped check are ordered lock,
+// then check, then repair: a concurrent `munmap` releases its locks under the
+// same process-state lock, so a lock recorded after the unmap is the only stale
+// one and the repair below removes exactly that.
 
 fn memlock_limit() -> Result<u64, i64> {
     let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64);
@@ -237,14 +260,23 @@ fn caller_is_privileged() -> bool {
 }
 
 /// Linux `can_do_mlock`: privileged, or a nonzero `RLIMIT_MEMLOCK`.
-fn lock_admission(limit: u64, privileged: bool, bytes: u64) -> Result<(), i64> {
+fn lock_admission(limit: u64, privileged: bool) -> Result<(), i64> {
     if !privileged && limit == 0 {
         return Err(LINUX_EPERM);
     }
-    if !privileged && bytes > limit {
-        return Err(LINUX_ENOMEM);
-    }
     Ok(())
+}
+
+/// The byte budget the ledger enforces: unlimited for a privileged caller.
+fn lock_budget(limit: u64, privileged: bool) -> u64 {
+    if privileged { u64::MAX } else { limit }
+}
+
+fn refusal_errno(refusal: LockRefusal) -> i64 {
+    match refusal {
+        LockRefusal::Limit => LINUX_ENOMEM,
+        LockRefusal::NoMemory => LINUX_EAGAIN,
+    }
 }
 
 /// `[start, start + len)` widened to whole pages, as `do_mlock` does.
@@ -253,6 +285,9 @@ pub(super) fn lock_range(start: u64, len: u64) -> Result<(u64, u64), i64> {
     let aligned = align_up(len.checked_add(offset).ok_or(LINUX_ENOMEM)?).ok_or(LINUX_ENOMEM)?;
     let base = start & !(PAGE - 1);
     let end = base.checked_add(aligned).ok_or(LINUX_ENOMEM)?;
+    if end > paging::USER_SPACE_END_EXCLUSIVE {
+        return Err(LINUX_ENOMEM);
+    }
     Ok((base, end))
 }
 
@@ -265,15 +300,39 @@ fn mlock_common(start: u64, len: u64) -> u64 {
         Ok(limit) => limit,
         Err(errno) => return linux_errno(errno),
     };
-    if let Err(errno) = lock_admission(limit, caller_is_privileged(), end - base) {
+    let privileged = caller_is_privileged();
+    if let Err(errno) = lock_admission(limit, privileged) {
         return linux_errno(errno);
     }
     if end == base {
         return 0;
     }
     match range_fully_mapped(base, end) {
-        Ok(true) => linux_errno(LINUX_EOPNOTSUPP),
-        Ok(false) => linux_errno(LINUX_ENOMEM),
+        Ok(true) => {}
+        Ok(false) => return linux_errno(LINUX_ENOMEM),
+        Err(errno) => return linux_errno(errno),
+    }
+    let budget = lock_budget(limit, privileged);
+    let locked = multitask::with_current_user_process_state_mut(|_, _, state| {
+        state.memlock_mut().lock(base, end, budget)
+    });
+    match locked {
+        None => return linux_errno(LINUX_ESRCH),
+        Some(Err(refusal)) => return linux_errno(refusal_errno(refusal)),
+        Some(Ok(_)) => {}
+    }
+    // A thread that unmapped part of the range between the check and the lock
+    // left a lock on nothing; drop exactly those holes.
+    match unmapped_ranges(base, end) {
+        Ok(holes) if holes.is_empty() => 0,
+        Ok(holes) => {
+            let _ = multitask::with_current_user_process_state_mut(|_, _, state| {
+                for (hole_start, hole_end) in holes {
+                    state.memlock_mut().release_mapping(hole_start, hole_end);
+                }
+            });
+            linux_errno(LINUX_ENOMEM)
+        }
         Err(errno) => linux_errno(errno),
     }
 }
@@ -298,9 +357,16 @@ pub(super) fn syscall_linux_munlock(start: u64, len: u64) -> u64 {
         return 0;
     }
     match range_fully_mapped(base, end) {
-        Ok(true) => 0,
-        Ok(false) => linux_errno(LINUX_ENOMEM),
-        Err(errno) => linux_errno(errno),
+        Ok(true) => {}
+        Ok(false) => return linux_errno(LINUX_ENOMEM),
+        Err(errno) => return linux_errno(errno),
+    }
+    match multitask::with_current_user_process_state_mut(|_, _, state| {
+        state.memlock_mut().unlock(base, end)
+    }) {
+        None => linux_errno(LINUX_ESRCH),
+        Some(Err(refusal)) => linux_errno(refusal_errno(refusal)),
+        Some(Ok(_)) => 0,
     }
 }
 
@@ -309,26 +375,105 @@ pub(super) fn mlockall_flags_valid(flags: u64) -> bool {
     flags != 0 && flags & !known == 0 && flags != linux_abi::MCL_ONFAULT
 }
 
+/// Disjoint ascending page ranges of every mapping the process has: published
+/// pager regions plus the labelled image/heap/stack areas.
+fn all_mapped_ranges() -> Result<Vec<(u64, u64)>, i64> {
+    let mut ranges: Vec<(u64, u64)> = current_spans()?
+        .iter()
+        .map(|span| (span.start, span.end))
+        .collect();
+    if let Some(areas) = multitask::with_current_user_process_state(|_, _, state| {
+        state
+            .linux_memory_map()
+            .map(|map| map.areas().iter().map(|a| (a.start, a.end)).collect::<Vec<_>>())
+            .unwrap_or_default()
+    }) {
+        ranges.extend(areas);
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if start >= end || end > paging::USER_SPACE_END_EXCLUSIVE {
+            continue;
+        }
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    Ok(merged)
+}
+
 pub(super) fn syscall_linux_mlockall(flags: u64) -> u64 {
     if !mlockall_flags_valid(flags) {
         return linux_errno(LINUX_EINVAL);
     }
-    match memlock_limit().and_then(|limit| lock_admission(limit, caller_is_privileged(), 0)) {
-        Ok(()) => linux_errno(LINUX_EOPNOTSUPP),
-        Err(errno) => linux_errno(errno),
+    let limit = match memlock_limit() {
+        Ok(limit) => limit,
+        Err(errno) => return linux_errno(errno),
+    };
+    let privileged = caller_is_privileged();
+    if let Err(errno) = lock_admission(limit, privileged) {
+        return linux_errno(errno);
+    }
+    let budget = lock_budget(limit, privileged);
+    let current = flags & linux_abi::MCL_CURRENT != 0;
+    let ranges = if current {
+        match all_mapped_ranges() {
+            Ok(ranges) => ranges,
+            Err(errno) => return linux_errno(errno),
+        }
+    } else {
+        Vec::new()
+    };
+    let result = multitask::with_current_user_process_state_mut(|_, _, state| {
+        let ledger = state.memlock_mut();
+        let newly: u64 = ranges
+            .iter()
+            .map(|&(start, end)| ledger.unlocked_bytes_in(start, end))
+            .sum();
+        if ledger.locked_bytes().saturating_add(newly) > budget {
+            return Err(LockRefusal::Limit);
+        }
+        for &(start, end) in &ranges {
+            ledger.lock(start, end, budget)?;
+        }
+        // `mlockall` replaces the future-mapping policy: without MCL_FUTURE it
+        // clears an earlier one, as Linux rewrites `def_flags`.
+        ledger.set_future((flags & linux_abi::MCL_FUTURE != 0).then_some(FutureLock {
+            on_fault: flags & linux_abi::MCL_ONFAULT != 0,
+            limit_bytes: budget,
+        }));
+        Ok(())
+    });
+    match result {
+        None => linux_errno(LINUX_ESRCH),
+        Some(Err(refusal)) => linux_errno(refusal_errno(refusal)),
+        Some(Ok(())) => 0,
     }
 }
 
 pub(super) fn syscall_linux_munlockall() -> u64 {
-    0
+    match multitask::with_current_user_process_state_mut(|_, _, state| {
+        let ledger = state.memlock_mut();
+        ledger.release_mapping(0, paging::USER_SPACE_END_EXCLUSIVE);
+        ledger.set_future(None);
+    }) {
+        Some(()) => 0,
+        None => linux_errno(LINUX_ESRCH),
+    }
 }
 
 // ---- msync -----------------------------------------------------------------
 //
 // No mapping kind that `mmap` can create has a backing store to write back:
 // private file mappings never write through, memfd and anonymous memory are
-// their own backing, and shared file mappings are not offered. A valid `msync`
-// therefore has nothing to flush and succeeds once the range is proven mapped.
+// their own backing, and a writable shared TmpFs mapping maps the very frames
+// vfsd serves `pread` from (`mm_broker_ops/file_shared.rs`), so a store is
+// visible to every reader the moment it retires. Writable shared mappings of
+// FAT files are refused (`EACCES`) rather than made to need write-back. A valid
+// `msync` therefore has nothing to flush and succeeds once the range is proven
+// mapped.
 
 /// Linux's `msync` argument checks. `Ok(None)` means an empty range.
 pub(super) fn msync_range(start: u64, len: u64, flags: u64) -> Result<Option<(u64, u64)>, i64> {
@@ -450,70 +595,32 @@ pub(super) fn validate_mremap(
     })
 }
 
-/// How a validated request is carried out, decided from the mapping layout.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum MremapPlan {
-    /// Nothing to do; the mapping stays where it is.
-    Keep,
-    /// Unmap the tail `[addr, addr + len)`; works for every mapping kind.
-    ShrinkTail { addr: u64, len: u64 },
-    /// Map a fresh anonymous extension at `addr`.
-    GrowInPlace { addr: u64, len: u64, prot: u32 },
-}
-
-/// `ENOMEM` is the answer for every request that needs a kind of move or
-/// growth only anonymous private memory supports.
-pub(super) fn plan_mremap(
-    request: &MremapRequest,
-    tiles: &[Span],
-    extension_is_free: bool,
-) -> Result<MremapPlan, i64> {
-    if request.fixed.is_none() && request.new_len <= request.old_len {
-        return Ok(if request.new_len == request.old_len {
-            MremapPlan::Keep
-        } else {
-            MremapPlan::ShrinkTail {
-                addr: request.old_addr + request.new_len,
-                len: request.old_len - request.new_len,
+/// What ring0 knows about the source that `syscalld` may not have recorded:
+/// the `MREMAP_SOURCE_*` bits plus the protection of the last source page.
+pub(super) fn source_hint(spans: &[Span], start: u64, end: u64) -> u32 {
+    let tiles = tile_range(spans, start, end);
+    let mut hint = 0_u32;
+    match &tiles {
+        None => hint |= MREMAP_SOURCE_HAS_HOLES,
+        Some(tiles) => {
+            if !tiles.is_empty() && tiles.iter().all(|span| span.anonymous_private) {
+                hint |= MREMAP_SOURCE_ANON_PRIVATE;
             }
-        });
+        }
     }
-    let movable = tiles
-        .iter()
-        .all(|span| span.anonymous_private && span.prot & VM_PROT_READ != 0);
-    if !movable {
-        return Err(LINUX_ENOMEM);
+    if let Some(last) = span_containing(spans, end - 1) {
+        hint |= last.prot & 7;
     }
-    let last_prot = tiles.last().map_or(PROT_RW, |span| span.prot);
-    if request.fixed.is_none() && extension_is_free {
-        return Ok(MremapPlan::GrowInPlace {
-            addr: request.old_addr + request.old_len,
-            len: request.new_len - request.old_len,
-            prot: last_prot,
-        });
-    }
-    // A byte copy loses stores from sibling threads and cannot safely replace
-    // a fixed target. Refuse until the MM owner can relocate leaf authority.
-    Err(LINUX_ENOMEM)
+    hint
 }
 
-fn extension_is_free(spans: &[Span], start: u64, end: u64) -> bool {
-    if end > paging::USER_SPACE_END_EXCLUSIVE || !uncovered_ranges(spans, start, end).eq(&[(start, end)]) {
-        return false;
-    }
-    multitask::with_current_user_process_state(|_, _, process_state| {
-        process_state
-            .address_space()
-            .user_range_is_unmapped(VirtAddr::new(start), ((end - start) / PAGE) as usize)
-            .unwrap_or(false)
-    })
-    .unwrap_or(false)
-}
-
-/// `mremap(2)` for anonymous private memory and for any shrink.
+/// `mremap(2)`. `syscalld` plans (target, `MREMAP_FIXED` replacement, shrink,
+/// extension) and calls `MM_BROKER_OP_MOVE` when the mapping has to move; the
+/// move relocates page-table leaves and frame claims atomically, never copies.
 ///
-/// Movement is refused before mutation until the MM owner supports a
-/// generation-safe page-table and frame-authority relocation transaction.
+/// A growing mapping whose last page is locked stays locked, as Linux extends
+/// the locked VMA: the extension is admitted against `RLIMIT_MEMLOCK` first and
+/// recorded in the ledger afterwards.
 pub(super) fn syscall_linux_mremap(
     old_addr: u64,
     old_size: u64,
@@ -525,66 +632,65 @@ pub(super) fn syscall_linux_mremap(
         Ok(request) => request,
         Err(errno) => return linux_errno(errno),
     };
-    let spans = match current_spans() {
-        Ok(spans) => spans,
-        Err(errno) => return linux_errno(errno),
-    };
     let old_end = request.old_addr + request.old_len;
-    // The source must lie inside mappings; Linux answers EFAULT for a hole.
-    let tiles = match tile_range(&spans, request.old_addr, old_end) {
-        Some(tiles) => tiles,
-        None => match range_fully_mapped(request.old_addr, old_end) {
-            // Resident but VMA-less memory (image, heap, stack) is mapped but
-            // is not anonymous-private as far as this kernel can prove.
-            Ok(true) => Vec::from([Span {
-                start: request.old_addr,
-                end: old_end,
-                prot: 0,
-                anonymous_private: false,
-            }]),
-            Ok(false) => return linux_errno(LINUX_EFAULT),
-            Err(errno) => return linux_errno(errno),
-        },
-    };
-    let free = request.fixed.is_none()
-        && request.new_len > request.old_len
-        && extension_is_free(&spans, old_end, request.old_addr + request.new_len);
-    let plan = match plan_mremap(&request, &tiles, free) {
-        Ok(plan) => plan,
+    let hint = match current_spans() {
+        Ok(spans) => source_hint(&spans, request.old_addr, old_end),
         Err(errno) => return linux_errno(errno),
     };
-    match plan {
-        MremapPlan::Keep => request.old_addr,
-        MremapPlan::ShrinkTail { addr, len } => {
-            let result = syscall_linux_munmap(addr, len);
-            if is_errno_result(result) {
-                result
-            } else {
-                request.old_addr
-            }
-        }
-        MremapPlan::GrowInPlace { addr, len, prot } => {
-            let result = syscall_linux_mmap(
-                addr,
-                len,
-                u64::from(prot),
-                MAP_ANON_PRIVATE | MAP_FIXED_NOREPLACE,
-                NO_FD,
-                0,
-            );
-            if !is_errno_result(result) && result == addr {
-                return request.old_addr;
-            }
-            if !is_errno_result(result) {
-                let _ = syscall_linux_munmap(result, len);
-            }
-            linux_errno(LINUX_ENOMEM)
+    let grows = request.new_len > request.old_len;
+    let extension_locked = grows
+        && multitask::with_current_user_process_state(|_, _, state| {
+            state.memlock().is_locked(old_end - 1)
+        })
+        .unwrap_or(false);
+    if extension_locked {
+        let extension = request.new_len - request.old_len;
+        let admitted = memlock_limit().map(|limit| lock_budget(limit, caller_is_privileged()));
+        let within = admitted.map(|budget| {
+            multitask::with_current_user_process_state(|_, _, state| {
+                state.memlock().locked_bytes().saturating_add(extension) <= budget
+            })
+            .unwrap_or(false)
+        });
+        match within {
+            Ok(true) => {}
+            Ok(false) => return linux_errno(LINUX_ENOMEM),
+            Err(errno) => return linux_errno(errno),
         }
     }
+    let response = match call_syscalld_fast_mem(
+        SYSCALL_OFFLOAD_OP_LINUX_MREMAP,
+        request.old_addr,
+        request.old_len,
+        hint,
+        flags,
+        request.fixed.unwrap_or(0),
+        request.new_len,
+    ) {
+        Ok(response) => response,
+        Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) => {
+            return linux_errno(LINUX_ENOSYS);
+        }
+        Err(errno) => return linux_errno(errno),
+    };
+    if response.payload_len as usize != size_of::<u64>() {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let result = u64::from_le_bytes(response.payload[..8].try_into().unwrap());
+    if extension_locked {
+        let start = result + request.old_len;
+        let end = result + request.new_len;
+        // Admitted above; a concurrent locker that used the budget since leaves
+        // the extension unlocked, which is the conservative outcome.
+        let budget = memlock_limit().map(|limit| lock_budget(limit, caller_is_privileged()));
+        if let Ok(budget) = budget {
+            let _ = multitask::with_current_user_process_state_mut(|_, _, state| {
+                let _ = state.memlock_mut().lock(start, end, budget);
+            });
+        }
+    }
+    result
 }
-
-/// `MAP_FIXED_NOREPLACE`: like `MAP_FIXED` but fails instead of replacing.
-const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 
 #[cfg(test)]
 mod tests {
@@ -634,10 +740,14 @@ mod tests {
         assert!(!mlockall_flags_valid(0));
         assert!(!mlockall_flags_valid(linux_abi::MCL_ONFAULT));
         assert!(!mlockall_flags_valid(8));
-        assert_eq!(lock_admission(0, false, PAGE), Err(LINUX_EPERM));
-        assert_eq!(lock_admission(PAGE, false, 2 * PAGE), Err(LINUX_ENOMEM));
-        assert_eq!(lock_admission(PAGE, false, PAGE), Ok(()));
-        assert_eq!(lock_admission(0, true, 1 << 40), Ok(()));
+        assert_eq!(lock_range(paging::USER_SPACE_END_EXCLUSIVE - PAGE, 2 * PAGE), Err(LINUX_ENOMEM));
+        assert_eq!(lock_admission(0, false), Err(LINUX_EPERM));
+        assert_eq!(lock_admission(PAGE, false), Ok(()));
+        assert_eq!(lock_admission(0, true), Ok(()));
+        assert_eq!(lock_budget(PAGE, false), PAGE);
+        assert_eq!(lock_budget(PAGE, true), u64::MAX);
+        assert_eq!(refusal_errno(LockRefusal::Limit), LINUX_ENOMEM);
+        assert_eq!(refusal_errno(LockRefusal::NoMemory), LINUX_EAGAIN);
     }
 
     #[test]
@@ -691,44 +801,28 @@ mod tests {
     }
 
     #[test]
-    fn mremap_plans() {
-        let req = |old, new, may_move, fixed| MremapRequest {
-            old_addr: A,
-            old_len: old,
-            new_len: new,
-            may_move,
-            fixed,
-        };
-        let anon = [span(A, A + 2 * PAGE, true, 3)];
-        let file = [span(A, A + 2 * PAGE, false, 1)];
-        assert_eq!(plan_mremap(&req(2 * PAGE, 2 * PAGE, false, None), &file, false), Ok(MremapPlan::Keep));
-        // Shrinking is legal for every mapping kind.
+    fn mremap_source_hint_reports_only_what_ring0_can_prove() {
+        let spans = [
+            span(A, A + 2 * PAGE, true, 3),
+            span(A + 2 * PAGE, A + 4 * PAGE, true, 1),
+            span(A + 8 * PAGE, A + 9 * PAGE, false, 1),
+        ];
+        // Fully covered, all anonymous private: ring0 vouches, last page is R.
         assert_eq!(
-            plan_mremap(&req(2 * PAGE, PAGE, false, None), &file, false),
-            Ok(MremapPlan::ShrinkTail { addr: A + PAGE, len: PAGE })
+            source_hint(&spans, A, A + 4 * PAGE),
+            MREMAP_SOURCE_ANON_PRIVATE | 1
+        );
+        assert_eq!(source_hint(&spans, A, A + 2 * PAGE), MREMAP_SOURCE_ANON_PRIVATE | 3);
+        // A file-backed page withdraws the vouch but not the evidence.
+        assert_eq!(source_hint(&spans, A + 8 * PAGE, A + 9 * PAGE), 1);
+        // A hole is reported, and nothing is vouched for.
+        assert_eq!(
+            source_hint(&spans, A + 4 * PAGE, A + 6 * PAGE),
+            MREMAP_SOURCE_HAS_HOLES
         );
         assert_eq!(
-            plan_mremap(&req(2 * PAGE, 3 * PAGE, false, None), &anon, true),
-            Ok(MremapPlan::GrowInPlace { addr: A + 2 * PAGE, len: PAGE, prot: 3 })
+            source_hint(&spans, A, A + 6 * PAGE),
+            MREMAP_SOURCE_HAS_HOLES
         );
-        assert_eq!(plan_mremap(&req(2 * PAGE, 3 * PAGE, false, None), &anon, false), Err(LINUX_ENOMEM));
-        assert_eq!(plan_mremap(&req(2 * PAGE, 3 * PAGE, true, None), &anon, false), Err(LINUX_ENOMEM));
-        // Growing or moving anything but anonymous private memory is refused.
-        assert_eq!(plan_mremap(&req(2 * PAGE, 3 * PAGE, true, None), &file, true), Err(LINUX_ENOMEM));
-        assert_eq!(
-            plan_mremap(&req(2 * PAGE, PAGE, true, Some(A + 9 * PAGE)), &file, false),
-            Err(LINUX_ENOMEM)
-        );
-        for new_len in [PAGE, 2 * PAGE, 3 * PAGE] {
-            // A fixed target, including an occupied one, must not be replaced
-            // before relocation is available, regardless of the new length.
-            assert_eq!(
-                plan_mremap(&req(2 * PAGE, new_len, true, Some(A + 9 * PAGE)), &anon, false),
-                Err(LINUX_ENOMEM)
-            );
-        }
-        // An unreadable source cannot currently be grown.
-        let none = [span(A, A + 2 * PAGE, true, 0)];
-        assert_eq!(plan_mremap(&req(2 * PAGE, 3 * PAGE, true, None), &none, false), Err(LINUX_ENOMEM));
     }
 }

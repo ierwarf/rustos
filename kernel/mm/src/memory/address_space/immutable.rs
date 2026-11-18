@@ -160,6 +160,13 @@ impl ProcessAddressSpace {
             * core::mem::size_of::<ImmutableMapping>()
     }
 
+    /// Whether any private-image alias record intersects `[start, end)`.
+    pub fn immutable_overlaps(&self, start: u64, end: u64) -> bool {
+        self.immutable
+            .iter()
+            .any(|m| start < m.end && end > m.start)
+    }
+
     #[cfg(test)]
     pub(super) fn immutable_contains(&self, addr: u64) -> bool {
         self.immutable

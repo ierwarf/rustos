@@ -151,7 +151,7 @@ impl VfsState {
                 VFS_IPC_OP_LSEEK | VFS_IPC_OP_FSTAT | VFS_IPC_OP_GETDENTS64 |
                 VFS_IPC_OP_FCNTL | VFS_IPC_OP_CURSOR_SETTLE | VFS_IPC_OP_FTRUNCATE |
                 VFS_IPC_OP_FILE_IDENTITY | VFS_IPC_OP_FCHMOD | VFS_IPC_OP_FALLOCATE |
-                VFS_IPC_OP_FILE_LOCK)
+                VFS_IPC_OP_FILE_LOCK | VFS_IPC_OP_SHARED_BACKING)
             && !self.has_funded_open_description(request.remote_id,request.pid)
         {
             response.status=116; // ESTALE, forces reopen against new provider
@@ -194,6 +194,7 @@ impl VfsState {
             VFS_IPC_OP_FCHMOD => self.vfs_fchmod(request, response),
             VFS_IPC_OP_FALLOCATE => self.vfs_fallocate(request, response),
             VFS_IPC_OP_FILE_LOCK => self.vfs_file_lock(request, response),
+            VFS_IPC_OP_SHARED_BACKING => self.vfs_shared_backing(request, response),
             VFS_IPC_OP_POLL_QUERY => self.vfs_poll_query(request, response),
             _ => response.status = EINVAL,
         }

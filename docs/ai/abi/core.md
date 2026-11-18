@@ -375,6 +375,50 @@ Service IDs 5 and 13, their former capability bits, and raw syscall numbers
 `0x52550020..=0x52550022` plus `0x52550037` are permanently retired. They are
 not extension points and must continue to return `ENOSYS`.
 
+### Linux memory and scheduling syscalls (Chrome batch)
+
+- `mremap`: syscalld plans (VmaMap, free target, `MREMAP_FIXED`, shrink tail) and
+  Ring0 relocates through `MM_BROKER_OP_MOVE`=12 under the process-state lock:
+  source pager VMAs are withdrawn under an odd-epoch `RangeRewrite`, each leaf is
+  unmapped, its frame-ledger claim re-keyed and mapped at the new VA (rollback of
+  the prefix on failure), the mlock ledger moves with it, one TLB flush follows,
+  then destination VMAs publish. No page is copied, so a store through a stale
+  TLB entry lands in the moved frame. Lock order: process state, VMA writer,
+  installer drain, address-space/TLB, frame descriptor. Anonymous and eager
+  private-file leaves move; shared memfd/region/DMA-BUF/surface/physical, ELF
+  image/heap/stack and immutable-library aliases return ENOMEM; shrink works for
+  every kind; `MREMAP_DONTUNMAP` is EINVAL (no VMA-clone primitive). Compact mem
+  frame op 75 carries old addr/len, new length in `offset`, flags, the FIXED
+  target in `fd`.
+- `mlock`/`mlock2`/`mlockall`/`munlock*`: the kernel never reclaims resident user
+  pages (only the OOM watchdog kills whole processes), so a lock is truthful for
+  every mapping kind. A per-process `MemlockLedger` (16384 islands) accounts
+  `RLIMIT_MEMLOCK` (EPERM with limit 0 and no privilege, ENOMEM over limit or on a
+  hole, EAGAIN if the ledger is full); `MCL_FUTURE` is recorded and applied after
+  each map; `MCL_ONFAULT` behaves as default; pages are not pre-faulted; `VmLck:`
+  appears in `/proc/self/status`. munmap, MAP_FIXED replacement and exit release.
+- `mincore` (real leaf residency, ENOMEM for unmapped), `msync` (flag/alignment
+  checks; shared TmpFs mappings share frames with vfsd so nothing to flush),
+  `membarrier` (QUERY returns 0, other commands EINVAL), `rt_sigtimedwait`
+  (1 ms polling of pending bits, siginfo has only `si_signo`), `getrlimit`/
+  `setrlimit` (prlimit64 storage), `epoll_pwait2` (ms rounding), `sendmmsg`/
+  `recvmmsg` (loops over sendmsg/recvmsg, vlen cap 1024), `sched_set*` (only
+  SCHED_OTHER/0; other classes EPERM), `fallocate`, `chmod`/`fchmod`/`fchmodat(2)`
+  (no umask, `AT_SYMLINK_NOFOLLOW` EOPNOTSUPP), `utimensat` (seconds only,
+  NOW/OMIT), `sendfile`/`copy_file_range` (64 KiB bounce buffer, sendfile to a
+  socket/pipe/tty destination is EINVAL), `flock` (73) and `fcntl` lock commands
+  (see `abi/vfs-storage.md`). `chown` still returns ENOSYS.
+- Local fd identity: `fstat`/`statx` of pipes (`S_IFIFO|0600`, both ends one
+  inode), sockets (`S_IFSOCK|0777`), memfd (`S_IFREG|0777`, live size), eventfd/
+  epoll (`S_IFREG|0600`) report `st_ino` = object identity (dup shares it) and a
+  per-kind `st_dev` (anon 0x10, pipefs 0x11, sockfs 0x12, memfd 0x13, inet 0x14).
+- `openat`: `O_PATH` is an immutable status flag that keeps only transfer rights
+  (read/write/mmap/ftruncate refused, `fstat` and `AT_EMPTY_PATH` allowed);
+  `O_TMPFILE` is validated and wired to TmpFs unnamed files; `O_NOFOLLOW` reaches
+  vfsd (`ELOOP`). Remote-VFS `read`/`pread`/`readv` check read rights.
+- Lifecycle: the process EXIT event is queued before `wait4` can observe the
+  zombie (policy services never see a waiter ahead of the exit).
+
 ### Linux `prctl` (syscall 157)
 
 Implemented in `kernel/compat/src/user/syscall/linux/prctl_ops.rs` (option table is pure and
@@ -438,7 +482,9 @@ pages); SUPPLY_PAGE copies the exact remaining bytes (kernel zero-fills the
 tail) into frame-source pages; an object is invisible to guests until SEAL.
 Limits: 128 objects, 12288 reserved pages. Related wire: vfsd ops
 `VFS_IPC_OP_FILE_IDENTITY`=26, `VFS_IPC_OP_LIBRARY_READ`=27 (pager only, chunks
-up to `VFS_LIBRARY_READ_MAX_BYTES`), and `MM_BROKER_OP_BIND_LIBRARY`=11.
+up to `VFS_LIBRARY_READ_MAX_BYTES`), and `MM_BROKER_OP_BIND_LIBRARY`=11. `VFS_IPC_OP_SHARED_BACKING`=39 and
+`MM_BROKER_OP_MAP_FILE_SHARED`=20 serve writable TmpFs `MAP_SHARED`
+(`abi/vfs-storage.md`).
 `SYS_RUSTOS_LIBRARY_MAP_PROBE` (`0x5255_0065`) is a diagnostic for the opt-in
 probe only (frames/stats; caller exec path must be `libmapprobe.elf`).
 Design and status: `docs/ai/pager/library-cache.md`.

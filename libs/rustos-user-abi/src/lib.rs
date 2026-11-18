@@ -351,4 +351,34 @@ mod tests {
         assert_eq!(size_of::<syscall::RustosMmMapBrokerResult>(), 16);
         assert!(size_of::<syscall::RustosMmFdBrokerResult>() <= syscall::IPC_MAX_INLINE_BYTES);
     }
+
+    #[test]
+    fn mremap_move_operation_numbers_are_additive_and_distinct() {
+        // `mremap` is policy in syscalld (offload op 75, compact address-space
+        // frame) and mechanism in ring0 (`MM_BROKER_OP_MOVE`); neither number
+        // may alias an existing operation of its namespace.
+        assert_eq!(syscall::SYSCALL_OFFLOAD_OP_LINUX_MREMAP, 75);
+        assert_eq!(syscall::MM_BROKER_OP_MOVE, 12);
+        let offload = [
+            syscall::SYSCALL_OFFLOAD_OP_LINUX_MMAP,
+            syscall::SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
+            syscall::SYSCALL_OFFLOAD_OP_LINUX_MUNMAP,
+            syscall::SYSCALL_OFFLOAD_OP_LINUX_GETPRIORITY,
+            syscall::SYSCALL_OFFLOAD_OP_LINUX_SETPRIORITY,
+        ];
+        assert!(!offload.contains(&syscall::SYSCALL_OFFLOAD_OP_LINUX_MREMAP));
+        let broker = [
+            syscall::MM_BROKER_OP_MAP_ANON,
+            syscall::MM_BROKER_OP_PROTECT,
+            syscall::MM_BROKER_OP_UNMAP,
+            syscall::MM_BROKER_OP_QUERY_LAYOUT,
+            syscall::MM_BROKER_OP_QUERY_CONFLICT,
+            syscall::MM_BROKER_OP_MAP_FILE_SHARED,
+        ];
+        assert!(!broker.contains(&syscall::MM_BROKER_OP_MOVE));
+        // The source-evidence bits sit above the three PROT bits they share a field with.
+        assert_eq!(syscall::MREMAP_SOURCE_ANON_PRIVATE & 7, 0);
+        assert_eq!(syscall::MREMAP_SOURCE_HAS_HOLES & 7, 0);
+        assert_ne!(syscall::MREMAP_SOURCE_ANON_PRIVATE, syscall::MREMAP_SOURCE_HAS_HOLES);
+    }
 }

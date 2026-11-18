@@ -7,6 +7,7 @@ pub const ESRCH: i32 = 3;
 pub const EIO: i32 = 5;
 pub const ENOMEM: i32 = 12;
 pub const EACCES: i32 = 13;
+pub const EFAULT: i32 = 14;
 pub const EEXIST: i32 = 17;
 pub const EINVAL: i32 = 22;
 pub const EOVERFLOW: i32 = 75;

@@ -103,6 +103,7 @@ pub use self::pager_fault::{
 };
 pub use self::pager_vma::{
     first_mapping_conflict as first_user_mapping_conflict,
+    move_for_process as move_pager_vma_range_for_process,
     protect_for_process as protect_pager_vma_for_process,
     set_commit_state_for_process as set_pager_vma_commit_state_for_process,
     unmap_for_process as unmap_pager_vma_for_process,

@@ -18,15 +18,19 @@ fn finish_linux_process_termination(process_id: u64, wait_status: i32) {
     release_all_service_handle_refs(process_id);
     ipc_ops::cleanup_service_endpoints_for_process(process_id);
     cleanup_proc_broker_state_for_process(process_id);
-    let _ = multitask::note_process_exit_status(process_id, wait_status);
     let parent = multitask::parent_process_id_of(process_id).unwrap_or(0);
+    // Queue the lifecycle EXIT before the zombie becomes visible to `wait4`:
+    // service policy (vfsd advisory locks) must observe the exit no later than
+    // any waiter, or a parent that returns from `wait4` can still see the dead
+    // child's locks.
+    offload_ops::record_process_exit(process_id, parent, wait_status);
+    let _ = multitask::note_process_exit_status(process_id, wait_status);
     if parent != 0 {
         multitask::queue_linux_process_sigchld(
             parent,
             rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_EXIT,
         );
     }
-    offload_ops::record_process_exit(process_id, parent, wait_status);
 }
 
 /// `sealed`: the faulting task already won the scheduler's first-wins terminal

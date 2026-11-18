@@ -200,8 +200,10 @@ fn finalize_terminated_process(process_id: u64, parent_pid: u64) {
     // exit codes while still giving waiters and lifecycle consumers a terminal
     // result they can reason about.
     let exit_status = linux_abi::SIGKILL as i32;
-    let _ = multitask::note_process_exit_status(process_id, exit_status);
+    // Lifecycle EXIT first: policy services must see the exit no later than a
+    // `wait4` caller (same ordering as `finish_linux_process_termination`).
     offload_ops::record_process_exit(process_id, parent_pid, exit_status);
+    let _ = multitask::note_process_exit_status(process_id, exit_status);
     if parent_pid != 0 {
         multitask::queue_linux_process_sigchld(
             parent_pid,

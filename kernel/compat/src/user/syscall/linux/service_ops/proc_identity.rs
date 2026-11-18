@@ -185,6 +185,7 @@ fn gather_process(pid: u64) -> Result<snap::ProcessFacts, i64> {
             threads,
             start_ticks: state.start_ns() / NS_PER_TICK,
             rss_pages: rss,
+            locked_bytes: state.memlock().locked_bytes(),
             regions,
             brk_start,
             arg_start: startup.arg_start,

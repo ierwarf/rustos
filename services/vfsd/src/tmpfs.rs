@@ -17,6 +17,17 @@
 //!   A separate inode limit bounds the node table and therefore vfsd's heap.
 //! - **Concurrency:** one spin lock serialises all state; no method calls out
 //!   while holding it.
+//! - **Shared backing:** a writable `MAP_SHARED` mapping must see the frames
+//!   `read`/`write`/`ftruncate` use, so `shared_backing_node` moves an inode's
+//!   bytes once into a [`SharedFrames`] object (a vfsd-owned memfd in the
+//!   service) and the inode is *shared-backed* for the rest of its life: its
+//!   chunk map is empty, every I/O goes to the frames, and the memfd length
+//!   always equals the file length. Frame ownership is the `Node`, so it dies
+//!   with the node; mappings keep the frames alive past that through their own
+//!   kernel hold. A shared-backed file is dense: quota is
+//!   `ceil(len / 4096)` pages (sparse growth is charged), and a shrink below
+//!   the mapped extent is `Busy` (the kernel cannot revoke other processes'
+//!   page-table entries), never a silent dangling page.
 //! - **Forbidden:** following symlinks (the caller resolves them), reusing a
 //!   node id, charging more than the quota, or reading stale bytes after a
 //!   shrink-then-grow (the tail of the last chunk is zeroed on shrink).
@@ -30,7 +41,7 @@ use spin::Mutex;
 
 use storage_core::fs::{
     CasePolicy, FsCapabilities, FsCreateAttrs, FsDirEntry, FsError, FsMetadata, FsNodeKind,
-    FsOpenOptions, FsStatFs, FsTimestamp, FsVolume,
+    FsOpenOptions, FsSharedBacking, FsStatFs, FsTimestamp, FsVolume,
 };
 
 /// `statfs.f_type` of tmpfs (`TMPFS_MAGIC`).
@@ -52,6 +63,23 @@ pub const RUN_QUOTA_BYTES: u64 = 16 * 1024 * 1024;
 pub const TMP_MAX_INODES: u64 = 16 * 1024;
 pub const DEV_SHM_MAX_INODES: u64 = 4 * 1024;
 pub const RUN_MAX_INODES: u64 = 4 * 1024;
+
+/// Frames that back one shared-backed regular file. The implementation owns
+/// the physical pages (a memfd); `TmpFs` owns the object and therefore the
+/// pages' lifetime from the filesystem's point of view.
+pub trait SharedFrames: Send {
+    /// `(token, object)` the kernel validates before mapping: the service's
+    /// descriptor number and the memfd's never-recycled object id.
+    fn identity(&self) -> (u64, u64);
+    fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<usize, FsError>;
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize, FsError>;
+    /// Sets the exact byte length. Growth zero-fills; shrinking below an
+    /// extent that is still mapped is `FsError::Busy`.
+    fn set_len(&mut self, len: u64) -> Result<(), FsError>;
+}
+
+/// Creates frames holding `len` zero bytes. Failure leaves nothing behind.
+pub type SharedFramesFactory = fn(len: u64) -> Result<Box<dyn SharedFrames>, FsError>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TmpFsConfig {
@@ -88,6 +116,9 @@ struct Node {
     /// Parent directory (directories only; the root is its own parent).
     parent: u64,
     body: Body,
+    /// Regular files only: when set, the file's bytes live here and the
+    /// chunk map is empty (see the module's shared-backing rules).
+    shared: Option<Box<dyn SharedFrames>>,
 }
 
 fn read_dir_locked(st: &State, ino: u64) -> Result<Vec<FsDirEntry>, FsError> {
@@ -116,6 +147,7 @@ impl Node {
     /// Bytes this node charges against the quota.
     fn charged_bytes(&self) -> u64 {
         match &self.body {
+            Body::File { len, .. } if self.shared.is_some() => pages(*len) * CHUNK as u64,
             Body::File { chunks, .. } => chunks.len() as u64 * CHUNK as u64,
             Body::Symlink(target) => target.len() as u64,
             _ => 0,
@@ -138,7 +170,12 @@ struct State {
 
 pub struct TmpFs {
     clock: fn() -> FsTimestamp,
+    shared_frames: Option<SharedFramesFactory>,
     state: Mutex<State>,
+}
+
+fn pages(len: u64) -> u64 {
+    len.div_ceil(CHUNK as u64)
 }
 
 fn split_path(path: &str) -> Result<Vec<&str>, FsError> {
@@ -200,6 +237,7 @@ impl State {
         let node = self.nodes.get(&ino).ok_or(FsError::NotFound)?;
         let (len, allocation) = match &node.body {
             Body::Dir(entries) => (entries.len() as u64 * BOGO_DIRENT_SIZE, 0),
+            Body::File { len, .. } if node.shared.is_some() => (*len, pages(*len) * CHUNK as u64),
             Body::File { len, chunks } => (*len, chunks.len() as u64 * CHUNK as u64),
             Body::Symlink(target) => (target.len() as u64, 0),
             Body::Socket => (0, 0),
@@ -268,6 +306,7 @@ impl State {
                 opens: 0,
                 parent: if is_dir { parent } else { 0 },
                 body,
+                shared: None,
             },
         );
         self.dir_mut(parent)?.insert(String::from(name), ino);
@@ -309,6 +348,16 @@ impl State {
 
     fn read(&self, ino: u64, offset: u64, out: &mut [u8]) -> Result<usize, FsError> {
         let node = self.nodes.get(&ino).ok_or(FsError::NotFound)?;
+        if let Some(shared) = node.shared.as_ref() {
+            let Body::File { len, .. } = &node.body else {
+                return Err(FsError::InvalidInput);
+            };
+            if offset >= *len {
+                return Ok(0);
+            }
+            let count = (*len - offset).min(out.len() as u64) as usize;
+            return shared.read_at(offset, &mut out[..count]);
+        }
         let (len, chunks) = match &node.body {
             Body::File { len, chunks } => (*len, chunks),
             Body::Dir(_) => return Err(FsError::IsADirectory),
@@ -347,6 +396,9 @@ impl State {
             ..
         } = self;
         let node = nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+        if node.shared.is_some() {
+            return shared_write(node, used_bytes, *quota_bytes, offset, data, now);
+        }
         let (len, chunks) = match &mut node.body {
             Body::File { len, chunks } => (len, chunks),
             Body::Dir(_) => return Err(FsError::IsADirectory),
@@ -395,6 +447,11 @@ impl State {
         let mut freed = 0u64;
         {
             let node = self.nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+            if node.shared.is_some() {
+                let State { nodes, used_bytes, quota_bytes, .. } = self;
+                let node = nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+                return shared_truncate(node, used_bytes, *quota_bytes, new_len, now);
+            }
             let (len, chunks) = match &mut node.body {
                 Body::File { len, chunks } => (len, chunks),
                 Body::Dir(_) => return Err(FsError::IsADirectory),
@@ -426,6 +483,49 @@ impl State {
         Ok(new_len)
     }
 
+    /// Moves a regular file's chunks into a fresh frame object (idempotent).
+    /// Nothing changes on failure: the factory result is dropped and the
+    /// chunk map and quota charge stay as they were.
+    fn make_shared(
+        &mut self,
+        ino: u64,
+        factory: SharedFramesFactory,
+    ) -> Result<FsSharedBacking, FsError> {
+        let State { nodes, used_bytes, quota_bytes, .. } = self;
+        let node = nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+        let Node { body, shared, .. } = node;
+        let (len, chunks) = match body {
+            Body::File { len, chunks } => (len, chunks),
+            Body::Dir(_) => return Err(FsError::IsADirectory),
+            _ => return Err(FsError::InvalidInput),
+        };
+        if let Some(frames) = shared.as_ref() {
+            let (token, object) = frames.identity();
+            return Ok(FsSharedBacking { token, object, len: *len });
+        }
+        let old_charge = chunks.len() as u64 * CHUNK as u64;
+        let new_charge = pages(*len) * CHUNK as u64;
+        if new_charge > old_charge && used_bytes.saturating_add(new_charge - old_charge) > *quota_bytes {
+            return Err(FsError::NoSpace);
+        }
+        let mut frames = factory(*len)?;
+        for (idx, chunk) in chunks.iter() {
+            let start = idx * CHUNK as u64;
+            if start >= *len {
+                continue;
+            }
+            let n = ((*len - start).min(CHUNK as u64)) as usize;
+            if frames.write_at(start, &chunk[..n])? != n {
+                return Err(FsError::Io(storage_core::StorageError::DeviceFault));
+            }
+        }
+        let (token, object) = frames.identity();
+        *used_bytes = used_bytes.saturating_sub(old_charge) + new_charge;
+        chunks.clear();
+        *shared = Some(frames);
+        Ok(FsSharedBacking { token, object, len: *len })
+    }
+
     fn fallocate(
         &mut self,
         ino: u64,
@@ -441,6 +541,11 @@ impl State {
             .checked_add(len)
             .filter(|end| *end <= TMPFS_MAX_FILE_SIZE)
             .ok_or(FsError::TooBig)?;
+        if self.nodes.get(&ino).is_some_and(|n| n.shared.is_some()) {
+            let State { nodes, used_bytes, quota_bytes, .. } = self;
+            let node = nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+            return shared_fallocate(node, used_bytes, *quota_bytes, end, keep_size, now);
+        }
         let first = offset / CHUNK as u64;
         let last = (end - 1) / CHUNK as u64;
         let missing = {
@@ -593,10 +698,12 @@ impl TmpFs {
                 opens: 0,
                 parent: ROOT_NODE,
                 body: Body::Dir(BTreeMap::new()),
+                shared: None,
             },
         );
         Self {
             clock: config.clock,
+            shared_frames: None,
             state: Mutex::new(State {
                 nodes,
                 next_node: ROOT_NODE + 1,
@@ -605,6 +712,12 @@ impl TmpFs {
                 max_inodes: config.max_inodes.max(1),
             }),
         }
+    }
+
+    /// Enables `shared_backing_node` with `factory` as the frame source.
+    pub fn with_shared_frames(mut self, factory: SharedFramesFactory) -> Self {
+        self.shared_frames = Some(factory);
+        self
     }
 
     fn now(&self) -> FsTimestamp {
@@ -966,6 +1079,7 @@ impl FsVolume for TmpFs {
                     len: 0,
                     chunks: BTreeMap::new(),
                 },
+                shared: None,
             },
         );
         Ok(ino)
@@ -1035,11 +1149,116 @@ impl FsVolume for TmpFs {
         Ok(())
     }
 
+    fn shared_backing_node(&self, node: u64) -> Result<FsSharedBacking, FsError> {
+        let factory = self.shared_frames.ok_or(FsError::Unsupported)?;
+        self.state.lock().make_shared(node, factory)
+    }
+
     fn flush(&self) -> Result<(), FsError> {
         // Memory-backed: every completed write is already as durable as the
         // filesystem gets.
         Ok(())
     }
+}
+
+/// Write into a shared-backed file. Quota is charged in whole pages for the
+/// growth the write causes; a write that only partly fits is short, one that
+/// cannot place a byte is `NoSpace` (the chunk path's contract).
+fn shared_write(
+    node: &mut Node,
+    used_bytes: &mut u64,
+    quota_bytes: u64,
+    offset: u64,
+    data: &[u8],
+    now: FsTimestamp,
+) -> Result<(usize, u64), FsError> {
+    let Node { body, shared, .. } = node;
+    let (Body::File { len, .. }, Some(frames)) = (body, shared.as_mut()) else {
+        return Err(FsError::InvalidInput);
+    };
+    if data.is_empty() {
+        return Ok((0, *len));
+    }
+    offset
+        .checked_add(data.len() as u64)
+        .filter(|end| *end <= TMPFS_MAX_FILE_SIZE)
+        .ok_or(FsError::TooBig)?;
+    let cur_pages = pages(*len);
+    let spare_pages = quota_bytes.saturating_sub(*used_bytes) / CHUNK as u64;
+    let max_end = cur_pages.saturating_add(spare_pages).saturating_mul(CHUNK as u64);
+    let count = max_end.saturating_sub(offset).min(data.len() as u64);
+    if count == 0 {
+        return Err(FsError::NoSpace);
+    }
+    let new_len = (*len).max(offset + count);
+    if new_len > *len {
+        frames.set_len(new_len)?;
+        *used_bytes += (pages(new_len) - cur_pages) * CHUNK as u64;
+        *len = new_len;
+    }
+    let written = frames.write_at(offset, &data[..count as usize])?;
+    node.touch_modify(now);
+    let Body::File { len, .. } = &node.body else {
+        return Err(FsError::InvalidInput);
+    };
+    Ok((written, *len))
+}
+
+/// `ftruncate` of a shared-backed file. The frames are resized first: a
+/// refused shrink (`Busy`: still mapped) changes neither length nor quota.
+fn shared_truncate(
+    node: &mut Node,
+    used_bytes: &mut u64,
+    quota_bytes: u64,
+    new_len: u64,
+    now: FsTimestamp,
+) -> Result<u64, FsError> {
+    if new_len > TMPFS_MAX_FILE_SIZE {
+        return Err(FsError::TooBig);
+    }
+    let Node { body, shared, .. } = node;
+    let (Body::File { len, .. }, Some(frames)) = (body, shared.as_mut()) else {
+        return Err(FsError::InvalidInput);
+    };
+    let (old_pages, new_pages) = (pages(*len), pages(new_len));
+    if new_pages > old_pages
+        && used_bytes.saturating_add((new_pages - old_pages) * CHUNK as u64) > quota_bytes
+    {
+        return Err(FsError::NoSpace);
+    }
+    frames.set_len(new_len)?;
+    if new_pages >= old_pages {
+        *used_bytes += (new_pages - old_pages) * CHUNK as u64;
+    } else {
+        *used_bytes = used_bytes.saturating_sub((old_pages - new_pages) * CHUNK as u64);
+    }
+    *len = new_len;
+    node.touch_modify(now);
+    Ok(new_len)
+}
+
+/// `fallocate` of a shared-backed file. Pages exist exactly up to EOF, so
+/// extending the size allocates; `KEEP_SIZE` past EOF would need allocation
+/// the frames cannot represent and is refused rather than faked.
+fn shared_fallocate(
+    node: &mut Node,
+    used_bytes: &mut u64,
+    quota_bytes: u64,
+    end: u64,
+    keep_size: bool,
+    now: FsTimestamp,
+) -> Result<u64, FsError> {
+    let cur = match &node.body {
+        Body::File { len, .. } => *len,
+        _ => return Err(FsError::InvalidInput),
+    };
+    if end <= cur {
+        return Ok(cur);
+    }
+    if keep_size {
+        return Err(FsError::Unsupported);
+    }
+    shared_truncate(node, used_bytes, quota_bytes, end, now)
 }
 
 fn link_node_locked(
@@ -1742,6 +1961,225 @@ mod tests {
         assert!(!fs.is_immutable());
         assert_eq!(fs.flush(), Ok(()));
     }
+
+    // ---- shared backing -------------------------------------------------
+
+    /// Stand-in for the memfd: `data` is the frame contents, `mapped_len` the
+    /// extent a kernel mapping pins (a shrink below it is refused like the
+    /// real memfd's), `closed` is set when the owning node drops it.
+    struct FakeInner {
+        data: Vec<u8>,
+        mapped_len: usize,
+        closed: bool,
+    }
+    type Fake = alloc::sync::Arc<Mutex<FakeInner>>;
+    static FAKES: Mutex<Vec<(u64, Fake)>> = Mutex::new(Vec::new());
+    static NEXT_OBJECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(100);
+    static FAIL_FACTORY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    struct FakeFrames {
+        object: u64,
+        inner: Fake,
+    }
+    impl SharedFrames for FakeFrames {
+        fn identity(&self) -> (u64, u64) {
+            (7, self.object)
+        }
+        fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<usize, FsError> {
+            let g = self.inner.lock();
+            let start = (offset as usize).min(g.data.len());
+            let n = out.len().min(g.data.len() - start);
+            out[..n].copy_from_slice(&g.data[start..start + n]);
+            Ok(n)
+        }
+        fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize, FsError> {
+            let mut g = self.inner.lock();
+            let end = offset as usize + data.len();
+            if end > g.data.len() {
+                g.data.resize(end, 0);
+            }
+            g.data[offset as usize..end].copy_from_slice(data);
+            Ok(data.len())
+        }
+        fn set_len(&mut self, len: u64) -> Result<(), FsError> {
+            let mut g = self.inner.lock();
+            if (len as usize) < g.mapped_len {
+                return Err(FsError::Busy);
+            }
+            g.data.resize(len as usize, 0);
+            Ok(())
+        }
+    }
+    impl Drop for FakeFrames {
+        fn drop(&mut self) {
+            self.inner.lock().closed = true;
+        }
+    }
+    fn fake_factory(len: u64) -> Result<Box<dyn SharedFrames>, FsError> {
+        if FAIL_FACTORY.load(Ordering::Relaxed) {
+            return Err(FsError::NoSpace);
+        }
+        let object = NEXT_OBJECT.fetch_add(1, Ordering::Relaxed);
+        let inner: Fake = alloc::sync::Arc::new(Mutex::new(FakeInner {
+            data: vec![0; len as usize],
+            mapped_len: 0,
+            closed: false,
+        }));
+        FAKES.lock().push((object, inner.clone()));
+        Ok(Box::new(FakeFrames { object, inner }))
+    }
+    fn fake(object: u64) -> Fake {
+        FAKES.lock().iter().find(|(id, _)| *id == object).unwrap().1.clone()
+    }
+    fn shared_fs(quota: u64) -> TmpFs {
+        fs_with(quota, 64).with_shared_frames(fake_factory)
+    }
+
+    #[test]
+    fn shared_backing_moves_chunks_and_keeps_every_byte_and_the_quota_exact() {
+        let fs = shared_fs(64 * 4096);
+        let node = put(&fs, "f", &[7u8; 5000]);
+        assert_eq!(fs.used_bytes(), 2 * 4096);
+        let backing = fs.shared_backing_node(node).unwrap();
+        assert_eq!((backing.token, backing.len), (7, 5000));
+        let frames = fake(backing.object);
+        assert_eq!(frames.lock().data, vec![7u8; 5000]);
+        assert_eq!(fs.used_bytes(), 2 * 4096, "dense charge equals the old chunk charge");
+        assert_eq!(fs.metadata("f").unwrap().allocation_size, 2 * 4096);
+        assert_eq!(fs.shared_backing_node(node).unwrap(), backing, "idempotent");
+        assert_eq!(read_all(&fs, "f"), vec![7u8; 5000]);
+    }
+
+    #[test]
+    fn shared_backing_is_coherent_in_both_directions() {
+        let fs = shared_fs(64 * 4096);
+        let node = put(&fs, "f", b"abcdef");
+        let backing = fs.shared_backing_node(node).unwrap();
+        let frames = fake(backing.object);
+        // A write through the filesystem lands in the frames a mapping reads.
+        fs.write_node_at(node, 2, b"ZZ").unwrap();
+        assert_eq!(&frames.lock().data[..], b"abZZef");
+        // A store through a mapping is what pread sees, with no syscall.
+        frames.lock().data[0] = b'M';
+        assert_eq!(read_all(&fs, "f"), b"MbZZef");
+        // Growth by write extends the frames and the file together.
+        let (n, len) = fs.write_node_at(node, 6000, b"tail").unwrap();
+        assert_eq!((n, len), (4, 6004));
+        assert_eq!(frames.lock().data.len(), 6004);
+        assert_eq!(fs.used_bytes(), 2 * 4096);
+        let mut gap = [1u8; 8];
+        assert_eq!(fs.read_node_at(node, 100, &mut gap).unwrap(), 8);
+        assert_eq!(gap, [0u8; 8], "the hole between EOF and the write reads zeros");
+    }
+
+    #[test]
+    fn shared_backing_requires_a_frame_source_and_a_regular_file() {
+        let plain = fs();
+        let node = put(&plain, "f", b"x");
+        assert_eq!(plain.shared_backing_node(node), Err(FsError::Unsupported));
+        let fs = shared_fs(64 * 4096);
+        fs.mkdir("d").unwrap();
+        let dir = fs.metadata("d").unwrap().node_id;
+        assert_eq!(fs.shared_backing_node(dir), Err(FsError::IsADirectory));
+        assert_eq!(fs.shared_backing_node(9999), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn failed_upgrade_changes_nothing() {
+        let fs = shared_fs(64 * 4096);
+        let node = put(&fs, "f", &[3u8; 9000]);
+        let before = fs.used_bytes();
+        FAIL_FACTORY.store(true, Ordering::Relaxed);
+        let failed = fs.shared_backing_node(node);
+        FAIL_FACTORY.store(false, Ordering::Relaxed);
+        assert_eq!(failed, Err(FsError::NoSpace));
+        assert_eq!(fs.used_bytes(), before);
+        assert_eq!(read_all(&fs, "f"), vec![3u8; 9000]);
+        assert!(fs.shared_backing_node(node).is_ok(), "chunk path still upgradable");
+    }
+
+    #[test]
+    fn shared_file_is_dense_and_quota_bound() {
+        let fs = shared_fs(4 * 4096);
+        let node = put(&fs, "f", b"x");
+        fs.shared_backing_node(node).unwrap();
+        assert_eq!(fs.used_bytes(), 4096);
+        // Sparse growth is charged page for page, up to the quota.
+        assert_eq!(fs.truncate_node(node, 4 * 4096).unwrap(), 4 * 4096);
+        assert_eq!(fs.used_bytes(), 4 * 4096);
+        assert_eq!(fs.truncate_node(node, 4 * 4096 + 1), Err(FsError::NoSpace));
+        assert_eq!(fs.metadata("f").unwrap().len, 4 * 4096, "refused growth changed nothing");
+        // A write that only partly fits is short; one that cannot place a byte is ENOSPC.
+        let (n, len) = fs.write_node_at(node, 4 * 4096 - 2, b"abcd").unwrap();
+        assert_eq!((n, len), (2, 4 * 4096));
+        assert_eq!(fs.write_node_at(node, 4 * 4096, b"z"), Err(FsError::NoSpace));
+    }
+
+    #[test]
+    fn shrinking_below_a_mapped_extent_is_busy_and_changes_nothing() {
+        let fs = shared_fs(64 * 4096);
+        let node = put(&fs, "f", &[9u8; 3 * 4096]);
+        let backing = fs.shared_backing_node(node).unwrap();
+        let frames = fake(backing.object);
+        frames.lock().mapped_len = 2 * 4096;
+        assert_eq!(fs.truncate_node(node, 4096), Err(FsError::Busy));
+        assert_eq!(fs.metadata("f").unwrap().len, 3 * 4096);
+        assert_eq!(fs.used_bytes(), 3 * 4096);
+        assert_eq!(frames.lock().data.len(), 3 * 4096);
+        // Shrinking to a size that keeps the mapped extent is allowed.
+        assert_eq!(fs.truncate_node(node, 2 * 4096).unwrap(), 2 * 4096);
+        assert_eq!(fs.used_bytes(), 2 * 4096);
+        // Once unmapped the shrink completes and regrowth reads zeros.
+        frames.lock().mapped_len = 0;
+        fs.truncate_node(node, 10).unwrap();
+        assert_eq!(fs.used_bytes(), 4096);
+        fs.truncate_node(node, 100).unwrap();
+        let mut out = [1u8; 100];
+        assert_eq!(fs.read_node_at(node, 0, &mut out).unwrap(), 100);
+        assert_eq!(&out[..10], &[9u8; 10]);
+        assert_eq!(&out[10..], &[0u8; 90][..], "bytes past the old EOF are zero");
+    }
+
+    #[test]
+    fn shared_frames_live_until_the_last_pin_and_name_are_gone() {
+        let fs = shared_fs(64 * 4096);
+        let node = put(&fs, "f", &[1u8; 100]);
+        fs.retain_node_id(node).unwrap();
+        let backing = fs.shared_backing_node(node).unwrap();
+        let frames = fake(backing.object);
+        fs.unlink("f").unwrap();
+        assert!(!frames.lock().closed, "an open description keeps the frames");
+        assert_eq!(fs.used_bytes(), 4096);
+        let mut out = [0u8; 100];
+        assert_eq!(fs.read_node_at(node, 0, &mut out).unwrap(), 100);
+        fs.release_node(node);
+        assert!(frames.lock().closed, "the last release drops the frames");
+        assert_eq!(fs.used_bytes(), 0);
+        assert_eq!(fs.node_count(), 1);
+    }
+
+    #[test]
+    fn shared_fallocate_extends_but_refuses_unrepresentable_keep_size() {
+        let fs = shared_fs(8 * 4096);
+        let node = put(&fs, "f", b"x");
+        fs.shared_backing_node(node).unwrap();
+        assert_eq!(fs.fallocate_node(node, 0, 1, true).unwrap(), 1, "inside EOF: already allocated");
+        assert_eq!(fs.fallocate_node(node, 0, 8192, true), Err(FsError::Unsupported));
+        assert_eq!(fs.fallocate_node(node, 0, 8192, false).unwrap(), 8192);
+        assert_eq!(fs.used_bytes(), 2 * 4096);
+        assert_eq!(fs.fallocate_node(node, 0, 9 * 4096, false), Err(FsError::NoSpace));
+    }
+
+    #[test]
+    fn o_trunc_of_a_shared_file_releases_pages_when_unmapped() {
+        let fs = shared_fs(64 * 4096);
+        let node = put(&fs, "f", &[5u8; 3 * 4096]);
+        fs.shared_backing_node(node).unwrap();
+        let opts = FsOpenOptions { truncate: true, ..CREATE };
+        assert_eq!(fs.open_prepare("f", opts).unwrap().len, 0);
+        assert_eq!(fs.used_bytes(), 0);
+    }
+
 
     #[test]
     fn mixed_stress_never_leaks_quota_or_nodes() {

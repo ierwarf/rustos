@@ -1106,6 +1106,88 @@ impl FrameDescriptorLedger {
         None
     }
 
+    /// Re-keys one live data mapping from `(root, old_va)` to `(root, new_va)`
+    /// without touching its charge, frame, role or sharing set.
+    ///
+    /// This is the descriptor half of an atomic `mremap` relocation: the page
+    /// table leaf moves and the claim that proves the leaf is exclusively owned
+    /// (or one member of a COW sharing set) must name the new address in the
+    /// same critical section as the PTE change, or a later unmap would find a
+    /// leaf whose ledger key does not exist. Returns `false`, changing nothing,
+    /// when no live mapping `(root, old_va)` of `frame_phys` exists, so a caller
+    /// that preflighted ownership treats `false` as a ledger-corruption signal.
+    fn rekey_data(&self, root_phys: u64, old_va: u64, new_va: u64, frame_phys: u64) -> bool {
+        if !valid_mapping(root_phys, new_va, frame_phys) || self.verify_root(root_phys).is_none() {
+            return false;
+        }
+        let Some(frame) = self.record(frame_phys) else {
+            return false;
+        };
+        for _ in 0..SHARED_LOCK_SPINS {
+            match frame.role.load(DESCRIPTOR_ACQUIRE) {
+                ROLE_EXCLUSIVE_DATA_LIVE => {
+                    if frame.owner_or_table_head.load(Ordering::Relaxed) != root_phys
+                        || frame.next_or_virtual_address.load(Ordering::Relaxed) != old_va
+                    {
+                        return false;
+                    }
+                    // LIVE -> CLAIMED excludes `data_is_owned` readers (they
+                    // answer `false` for a claimed frame) for the two stores.
+                    if frame
+                        .role
+                        .compare_exchange(
+                            ROLE_EXCLUSIVE_DATA_LIVE,
+                            ROLE_EXCLUSIVE_DATA_CLAIMED,
+                            DESCRIPTOR_ACQ_REL,
+                            DESCRIPTOR_ACQUIRE,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    frame
+                        .next_or_virtual_address
+                        .store(new_va, Ordering::Relaxed);
+                    frame
+                        .role
+                        .store(ROLE_EXCLUSIVE_DATA_LIVE, DESCRIPTOR_RELEASE);
+                    return true;
+                }
+                role @ (ROLE_SHARED_ANONYMOUS_LIVE | ROLE_SHARED_PRIVATE_FILE_LIVE) => {
+                    let kind = if role == ROLE_SHARED_ANONYMOUS_LIVE {
+                        CowFrameKind::AnonymousFork
+                    } else {
+                        CowFrameKind::PrivateFileSection
+                    };
+                    if !self.lock_shared(frame, kind, false) {
+                        continue;
+                    }
+                    let updated = match self.find_shared_mapping_locked(frame, root_phys, old_va) {
+                        Some(0) => {
+                            frame
+                                .next_or_virtual_address
+                                .store(new_va, Ordering::Relaxed);
+                            true
+                        }
+                        Some(id) => match self.mapping(id) {
+                            Some(mapping) => {
+                                mapping.virtual_address.store(new_va, Ordering::Relaxed);
+                                true
+                            }
+                            None => false,
+                        },
+                        None => false,
+                    };
+                    frame.role.store(role, DESCRIPTOR_RELEASE);
+                    return updated;
+                }
+                ROLE_SHARED_ANONYMOUS_LOCKED | ROLE_SHARED_PRIVATE_FILE_LOCKED => spin_loop(),
+                _ => return false,
+            }
+        }
+        false
+    }
+
     fn release_locked_shared(
         &self,
         root: &FrameDescriptorRecord,

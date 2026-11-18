@@ -307,8 +307,108 @@ pure function of the path text until then so checkpoint replay stays valid.
 
 Executable publication uses the owner-bound asynchronous job and sealed memfd
 contract in [loader scheduling](loader-scheduling.md). Shared buffered/mmap
-coherence and ext4/NTFS adapters are later phases, not claims made by the
-read-only accelerator.
+coherence for FAT and ext4/NTFS adapters are later phases, not claims made by
+the read-only accelerator; TmpFs has it (next section).
+
+### Chrome-compatibility surfaces (TmpFs, procfs, locks, sockets)
+
+- **TmpFs mounts.** vfsd mounts `TmpFs` (`FsVolume` with `posix_nodes()`) at
+  `/tmp` (64 MiB), `/dev/shm` (64 MiB) and `/run` (16 MiB) before the boot disk;
+  `/run/user/1000` is pre-created 0700 uid 1000, `/tmp` and `/dev/shm` are 1777.
+  `run_dirs.rs` and `mkdir_policy` are gone. Nodes are dir/file/symlink/socket
+  with per-mount unique node ids, mode/uid/gid/times/nlink, 4 KiB sparse chunks,
+  a byte quota (ENOSPC) and an inode limit. An open description pins its node
+  (`retain_node`/`release_node`), so data survives unlink or rename-over until
+  the last close. TmpFs paths bypass every path-keyed cache and are never
+  admitted as executable snapshots. Symlinks are followed by
+  `MountTable::follow_symlinks` (40 hops, then ELOOP); `O_NOFOLLOW` gives ELOOP
+  and a socket inode gives ENXIO on open. `/proc/mounts` is generated from the
+  live `MountTable` (vfat rows `ro`/`rw`, tmpfs rows `rw,nosuid,nodev`).
+- **New VFS ops** (`VFS_IPC_ABI_VERSION` stays 5): `MKNOD`=34 (dirfd+path,
+  `arg0`=st_mode; S_IFSOCK and regular files only, FIFO EOPNOTSUPP, devices EPERM; used by netd bind, no `mknod` syscall is wired), `CHMOD`=35,
+  `FCHMOD`=36, `FALLOCATE`=37 (mode 0 and KEEP_SIZE), `FILE_LOCK`=38,
+  `SHARED_BACKING`=39. vfsd applies no umask: the kernel passes umask-adjusted
+  modes. Timestamps are seconds only.
+- **Advisory locks (`FILE_LOCK`).** `VfsFileLockWire` (48 bytes LE:
+  `version u16 | cmd u16 | owner u16 | lock_type u16 | whence u16 | flags u16 |
+  reserved u32 | start i64 | len i64 | pid i64 | reserved u64`); cmd 1 GETLK,
+  2 SETLK, 3 SETLKW, 4 CANCEL_WAIT, 5 RELEASE_FILE; owner 1 POSIX (kernel-stamped
+  pid), 2 OFD, 3 flock (the description's `remote_id`). The table in
+  `services/vfsd/src/locks.rs` is keyed by `(mount_id, node_id)`; same owner never
+  conflicts, POSIX/OFD conflict with each other, flock is a separate namespace;
+  512 locks per file and 8192 total (ENOLCK). vfsd never waits: SETLKW is a
+  non-blocking attempt that records the waiter (wait-for cycle gives EDEADLK for
+  POSIX owners) and the kernel polls with 1-32 ms sleeps, EINTR on a pending
+  signal. A conflict is always EAGAIN. Release: final description close, any
+  close of the file by a POSIX owner (kernel `note_fd_closed` -> RELEASE_FILE,
+  only for pids that ever took a POSIX lock), and process EXIT/FORK lifecycle
+  events. The kernel queues the lifecycle EXIT **before** publishing the zombie
+  to `wait4`, so a parent that returned from `wait4` never sees the dead child's
+  locks. Limits: the table is not checkpointed (locks vanish if vfsd restarts);
+  CLOEXEC closes at exec do not release POSIX locks; an EXIT lost to queue
+  overflow whose pid is never reused leaves a stale lock.
+- **procfs.** `/proc` serves the caller's own pid only (`/proc/self`,
+  `/proc/<own pid>`). Kernel-fact nodes (maps, smaps, status, stat, statm,
+  cmdline, environ, auxv, limits, comm, oom_score_adj, `task/`, `fd/`, `ns/*`) are
+  delegated: vfsd answers with a `PROC_DELEGATE` aux word and the Ring0 compat
+  front-end freezes a bounded (256 KiB) unmappable memfd snapshot at `open()`.
+  Generated files are `S_IFREG` 0444 size 0, directories 0555. `fd/N` are magic
+  links (`socket:[ino]`, `pipe:[ino]`, `anon_inode:[...]`, `/memfd:name (deleted)`,
+  recorded path); `open("/proc/self/fd/N")` reopens memfd (seals apply),
+  path-backed files (recorded path) and proc snapshots, `ENXIO` for sockets, pipes
+  and anonymous inodes. Omitted fields are omitted, not invented (no Rss/Pss,
+  dev:inode printed `00:00 0`, other threads' utime 0). Recommended follow-up: a
+  bounded pull channel instead of Ring0 formatting.
+- **netd path sockets.** `bind(AF_UNIX, abs path)` creates an `S_IFSOCK` inode
+  through vfsd `MKNOD` carrying `VFS_REQUEST_FLAG_NETD_SOCKET_NODE`; vfsd
+  accepts the flag only from the netd service owner and only for `S_IFSOCK`
+  MKNOD, stat (`AT_SYMLINK_NOFOLLOW` only) and socket-only UNLINKAT. The inode is
+  visible to `stat`/`access`/`unlink` and is not freed on socket close; a second
+  bind gives EADDRINUSE until `unlink`, connect to a gone node gives ENOENT.
+  Relative paths, abstract names and the Wayland path stay private netd
+  bindings (the kernel does not absolutize against cwd; Wayland waits for
+  `/run/user/1000` ownership by the compositor uid). netd needs the rootd route
+  NETD -> VFSD (17 directed lookup offers).
+
+### TmpFs writable `MAP_SHARED` (shared-frame backing)
+
+- **Owner/model:** a TmpFs inode keeps 4 KiB chunks until a writable shared
+  mapping needs coherence. `VFS_IPC_OP_SHARED_BACKING` (39; additive,
+  `VFS_IPC_ABI_VERSION` unchanged) makes vfsd move the inode's bytes once into
+  a vfsd-owned memfd (`SharedFrames`, `services/vfsd/src/shared_frames.rs`);
+  the inode is then *shared-backed* for life: chunk map empty, every
+  read/write/pread/pwrite/ftruncate/fallocate goes to the memfd with
+  `pread64`/`pwrite64`/`ftruncate`, and memfd length == file length. Reply:
+  `value` = vfsd descriptor, `aux` = memfd object id (the `st_ino` the kernel
+  reports; never recycled).
+- **Mapping:** syscalld plans `MmapPlan::FileShared` for `MAP_SHARED` +
+  `PROT_WRITE` of a file and calls `MM_BROKER_OP_MAP_FILE_SHARED` (20). Ring0
+  (`mm_broker_ops/file_shared.rs`) checks the client's rights (read, and write
+  for `PROT_WRITE`), asks vfsd on the client's behalf (same proxy shape as
+  `FILE_IDENTITY`), finds the memfd in vfsd's descriptor table by
+  `(descriptor, object id)` and maps it exactly like a shared memfd
+  (`acquire_mapping` + `record_shared_memfd_mapping`), so fork, munmap,
+  mprotect and exit reuse the memfd paths. Frames are therefore shared by
+  every mapper and by vfsd I/O; `msync` has nothing to flush.
+- **Refusals unchanged:** FAT/early-system files answer `ENODEV` from vfsd,
+  reported as `EACCES` (as before); read-only `MAP_SHARED` and `MAP_PRIVATE`
+  keep the private-copy path; the immutable executable snapshot path is
+  untouched.
+- **Lifetime:** frames die with the TmpFs node (last name and open description)
+  *and* the last mapping hold. `unlink`/`rename` while mapped is therefore
+  ordinary. Quota is `ceil(len/4096)` pages of the mount (dense, sparse growth
+  of a shared-backed file is charged); the pages are also charged to vfsd's
+  Job like any memfd.
+- **Truncate while mapped:** ring0 cannot revoke other processes' page-table
+  entries, so `ftruncate` that would free a mapped frame returns `EBUSY`
+  (length and quota unchanged) instead of leaving a dangling or SIGBUS-less
+  page; a shrink inside the last mapped page succeeds and zeroes the tail.
+  Linux's SIGBUS-beyond-EOF behaviour is not implemented.
+- **Known gaps:** mapping extents beyond EOF (including an empty file) is
+  `EINVAL`; `O_APPEND` files are not refused; `/proc/<pid>/maps` names the
+  mapping `memfd:vfsd-tmpfs`; `mtime` is not advanced by stores through a
+  mapping; `fallocate(KEEP_SIZE)` past EOF is `EOPNOTSUPP` on a shared-backed
+  file.
 
 ### Filesystem-neutral volumes, `MountTable`, and writable FAT
 

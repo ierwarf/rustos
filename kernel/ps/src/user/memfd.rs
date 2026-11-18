@@ -302,10 +302,15 @@ impl MemfdHandle {
             if state.seals & linux_abi::F_SEAL_SHRINK as u32 != 0 {
                 return Err(MemfdError::PermissionDenied);
             }
-            if state.mapping_count != 0 {
+            let keep_pages = len.div_ceil(PAGE_SIZE);
+            // A mapped frame can only be released once no page table names
+            // it, and ring0 cannot revoke other processes' leaves. A shrink
+            // that keeps every frame (it only moves EOF inside the last page
+            // and zeroes the tail below) leaves every mapping valid, as on
+            // Linux; one that would free a frame waits for the unmaps.
+            if state.mapping_count != 0 && keep_pages < state.frames.len() {
                 return Err(MemfdError::Busy);
             }
-            let keep_pages = len.div_ceil(PAGE_SIZE);
             let released = state.frames.split_off(keep_pages);
             let released_pages = released.len();
             for frame_phys in released {
@@ -923,6 +928,29 @@ mod tests {
         assert_eq!(charge::usage(52), 2, "a duplicated description keeps the object");
         drop(clone);
         assert_eq!(charge::usage(52), 0, "the last drop refunds once");
+        assert_eq!(fake_live(), 0);
+    }
+
+    #[test]
+    fn a_mapped_memfd_shrinks_inside_its_last_page_but_never_frees_a_mapped_frame() {
+        fake_reset(usize::MAX);
+        let handle = MemfdHandle::new(String::from("mapped"), true, None);
+        handle.truncate(3 * PAGE_SIZE).unwrap();
+        let (_frames, hold) = handle.acquire_mapping(0, 3 * PAGE_SIZE, true).unwrap();
+        // Frees page 3: refused while any mapping exists, nothing changes.
+        assert_eq!(handle.truncate(2 * PAGE_SIZE), Err(MemfdError::Busy));
+        assert_eq!(handle.len(), 3 * PAGE_SIZE);
+        assert_eq!(fake_live(), 3);
+        // Keeps all three frames: only EOF and the tail move.
+        assert_eq!(handle.truncate(2 * PAGE_SIZE + 1), Ok(()));
+        assert_eq!(handle.len(), 2 * PAGE_SIZE + 1);
+        assert_eq!(fake_live(), 3, "the shrink released no frame");
+        // Growing back inside the pinned frames is also fine.
+        assert_eq!(handle.truncate(3 * PAGE_SIZE), Ok(()));
+        drop(hold);
+        assert_eq!(handle.truncate(PAGE_SIZE), Ok(()));
+        assert_eq!(fake_live(), 1);
+        drop(handle);
         assert_eq!(fake_live(), 0);
     }
 

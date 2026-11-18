@@ -28,7 +28,7 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use rustos_user_abi::syscall::{
-    VfsFileLockWire, VFS_FILE_LOCK_CMD_CANCEL_WAIT, VFS_FILE_LOCK_CMD_GETLK,
+    LifecycleEventWire, LIFECYCLE_EVENT_EXIT, LIFECYCLE_EVENT_FORK, VfsFileLockWire, VFS_FILE_LOCK_CMD_CANCEL_WAIT, VFS_FILE_LOCK_CMD_GETLK,
     VFS_FILE_LOCK_CMD_RELEASE_FILE, VFS_FILE_LOCK_CMD_SETLKW, VFS_FILE_LOCK_OWNER_FLOCK,
     VFS_FILE_LOCK_OWNER_OFD, VFS_FILE_LOCK_OWNER_POSIX, VFS_FILE_LOCK_TYPE_RDLCK,
     VFS_FILE_LOCK_TYPE_UNLCK, VFS_FILE_LOCK_TYPE_WRLCK, VFS_FILE_LOCK_WHENCE_CUR,
@@ -539,6 +539,20 @@ impl LockTable {
         }
     }
 
+    /// Applies one lifecycle event. An exit drops the pid's POSIX locks. A
+    /// fork names a *new* pid, so any POSIX lock still filed under it belongs
+    /// to a dead predecessor whose exit event was lost (queue overflow): drop
+    /// it, or the new process would silently inherit the lock as its own and
+    /// bypass every conflict. A child never inherits record locks anyway.
+    pub fn apply_lifecycle_event(&mut self, event: &LifecycleEventWire) {
+        if event.pid == 0 {
+            return;
+        }
+        if event.event == LIFECYCLE_EVENT_EXIT || event.event == LIFECYCLE_EVENT_FORK {
+            self.release_process(event.pid);
+        }
+    }
+
     /// Final close of an open description: its OFD and `flock` locks.
     pub fn release_description(&mut self, remote_id: u64) {
         self.cancel_candidates(|_| true);
@@ -866,6 +880,45 @@ mod tests {
         assert_eq!(ranges(&t, F, B).len(), 1, "other process untouched");
         assert_eq!(t.locks_for(F).len(), 2, "OFD lock untouched by a posix close");
         assert_eq!(t.total_locks(), 3);
+    }
+
+    fn lifecycle(kind: u16, pid: u64) -> LifecycleEventWire {
+        LifecycleEventWire { event: kind, pid, ..LifecycleEventWire::default() }
+    }
+
+    #[test]
+    fn exit_event_releases_the_holder_so_a_conflicting_request_then_succeeds() {
+        let mut t = LockTable::new();
+        t.set(F, A, W, 0, 9).unwrap();
+        assert_eq!(t.set(F, B, W, 0, 9), Err(EAGAIN));
+        t.apply_lifecycle_event(&lifecycle(LIFECYCLE_EVENT_EXIT, 100));
+        assert_eq!(t.set(F, B, W, 0, 9), Ok(()));
+        assert!(t.locks_for(F).iter().all(|l| l.owner == B));
+    }
+
+    #[test]
+    fn fork_of_a_reused_pid_retires_a_lost_exit_predecessors_locks() {
+        let mut t = LockTable::new();
+        t.set(F, A, W, 0, 9).unwrap();
+        t.set(G, A, R, 0, 9).unwrap();
+        t.set(F, Owner::Description(5), W, 100, 109).unwrap();
+        // The exit of pid 100 was lost to overflow; pid 100 is forked anew.
+        t.apply_lifecycle_event(&lifecycle(LIFECYCLE_EVENT_FORK, 100));
+        assert!(ranges(&t, F, A).is_empty() && ranges(&t, G, A).is_empty());
+        assert_eq!(t.total_locks(), 1, "OFD lock is not owned by the pid");
+        // The new process starts with no locks and conflicts like anyone else.
+        assert_eq!(t.set(F, A, W, 0, 9), Ok(()));
+    }
+
+    #[test]
+    fn lifecycle_events_for_pid_zero_or_other_kinds_change_nothing() {
+        let mut t = LockTable::new();
+        t.set(F, A, W, 0, 9).unwrap();
+        t.apply_lifecycle_event(&lifecycle(LIFECYCLE_EVENT_EXIT, 0));
+        t.apply_lifecycle_event(&lifecycle(LIFECYCLE_EVENT_FORK, 0));
+        t.apply_lifecycle_event(&lifecycle(LIFECYCLE_EVENT_FORK + 100, 100));
+        t.apply_lifecycle_event(&lifecycle(LIFECYCLE_EVENT_EXIT, 200));
+        assert_eq!(t.total_locks(), 1);
     }
 
     #[test]

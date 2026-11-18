@@ -62,6 +62,8 @@ pub(super) struct ProcessFacts {
     /// Ticks since boot at process creation.
     pub start_ticks: u64,
     pub rss_pages: Option<u64>,
+    /// Bytes `mlock`/`mlockall` hold in the process's lock ledger (`VmLck`).
+    pub locked_bytes: u64,
     pub regions: Vec<MapRegion>,
     pub brk_start: u64,
     pub arg_start: u64,
@@ -254,6 +256,7 @@ pub(super) fn format_status(process: &ProcessFacts, thread: &ThreadFacts) -> Vec
         process.gid, process.egid, process.egid, process.egid
     );
     let _ = writeln!(out, "VmSize:\t{:>8} kB", process.vm_size_bytes() / 1024);
+    let _ = writeln!(out, "VmLck:\t{:>8} kB", process.locked_bytes / 1024);
     if let Some(pages) = process.rss_pages {
         let _ = writeln!(out, "VmRSS:\t{:>8} kB", pages * (PAGE_BYTES / 1024));
     }
@@ -481,6 +484,7 @@ mod tests {
             threads: 3,
             start_ticks: 555,
             rss_pages: Some(10),
+            locked_bytes: 12 * 1024,
             regions,
             brk_start: 0x4000_0000,
             arg_start: 0x7fff_f000,
@@ -607,6 +611,7 @@ mod tests {
         assert!(text.contains("Gid:\t100\t101\t101\t101\n"));
         assert!(text.contains("VmSize:\t      16 kB\n"));
         assert!(text.contains("VmRSS:\t      40 kB\n"));
+        assert!(text.contains("VmLck:\t      12 kB\n"));
         assert!(text.contains("Threads:\t3\n"));
         assert!(text.contains("SigPnd:\t0000000000000002\n"));
         assert!(text.contains("SigBlk:\t0000000000001000\n"));

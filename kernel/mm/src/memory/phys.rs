@@ -80,7 +80,7 @@ pub use frame_descriptor_ledger::{
     lazy_table_record_is_owned, pop_lazy_table_record, prepare_shared_alias,
     promote_cow_mapping_in_place, publish_data_leaf, publish_lazy_table_record,
     publish_private_file_data_leaf, publish_shared_alias, register_data_leaf_root,
-    register_lazy_table_root, release_data_leaf, rollback_shared_alias, try_claim_cow_mapping,
+    register_lazy_table_root, rekey_data_leaf, release_data_leaf, rollback_shared_alias, try_claim_cow_mapping,
     unregister_data_leaf_root,
 };
 use frame_descriptor_ledger::{CowMappingRecord, FRAME_DESCRIPTORS, FrameDescriptorRecord};

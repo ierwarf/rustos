@@ -6,7 +6,7 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_BRK, SYSCALL_OFFLOAD_OP_LINUX_GETEGID,
     SYSCALL_OFFLOAD_OP_LINUX_GETEUID, SYSCALL_OFFLOAD_OP_LINUX_GETGID,
     SYSCALL_OFFLOAD_OP_LINUX_GETUID, SYSCALL_OFFLOAD_OP_LINUX_MMAP,
-    SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_MUNMAP,
+    SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_MREMAP, SYSCALL_OFFLOAD_OP_LINUX_MUNMAP,
 };
 
 use crate::errno;
@@ -59,6 +59,7 @@ pub fn expand_mem_request(
                 | SYSCALL_OFFLOAD_OP_LINUX_MUNMAP
                 | SYSCALL_OFFLOAD_OP_LINUX_MPROTECT
                 | SYSCALL_OFFLOAD_OP_LINUX_BRK
+                | SYSCALL_OFFLOAD_OP_LINUX_MREMAP
         )
     {
         return Err(errno::EINVAL);
@@ -153,6 +154,22 @@ mod tests {
         assert!(expand_mem_request(&id_op, 77, 78).is_err());
         let stale = LinuxSyscallOffloadFastMemRequest { version: 0, ..request };
         assert!(expand_mem_request(&stale, 77, 78).is_err());
+        // `mremap` rides the same frame: the destination travels in `fd`, the
+        // new length in the offset slot and ring0's source evidence in `prot`.
+        let remap = LinuxSyscallOffloadFastMemRequest {
+            op: SYSCALL_OFFLOAD_OP_LINUX_MREMAP,
+            prot: 0x103,
+            flags: 3,
+            fd: 0x5000_0000,
+            offset: 0x8000,
+            ..request
+        };
+        let full = expand_mem_request(&remap, 77, 78).expect("mremap is an address-space op");
+        assert_eq!(
+            (full.arg0, full.arg1, full.flags, full.mask, full.dirfd, full.arg3),
+            (0x7000_0000, 8192, 3, 0x103, 0x5000_0000, 0x1234_5678)
+        );
+        assert_eq!(&full.path[0..8], &0x8000_u64.to_le_bytes());
     }
 
     #[test]

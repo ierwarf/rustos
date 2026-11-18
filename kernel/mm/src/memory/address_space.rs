@@ -1545,6 +1545,35 @@ pub fn smoke_test() {
         panic!("process paging smoke test data mismatch");
     }
 
+    // Relocation moves the frame, its flags and its descriptor claim, copying
+    // nothing; the old range must stop translating and the bytes stay put.
+    let before_flags = space
+        .translate_user_with_flags(region.start)
+        .expect("relocation source leaf")
+        .1;
+    let relocated = VirtAddr::new(region.start.as_u64() + 0x1000_0000);
+    let moved = space
+        .move_present_user_leaves_at(region.start, relocated, region.page_count)
+        .expect("process leaf relocation must succeed");
+    assert_eq!(moved, region.page_count, "relocation moved every resident leaf");
+    assert!(
+        space.translate_user(region.start).is_none(),
+        "the old range must be vacant after relocation"
+    );
+    assert_eq!(
+        space.translate_user_with_flags(relocated),
+        Some((phys, before_flags)),
+        "same frame, same protection at the new address"
+    );
+    assert!(phys::data_leaf_is_owned(space.pml4_frame_phys, relocated.as_u64(), phys.as_u64()));
+    assert!(!phys::data_leaf_is_owned(space.pml4_frame_phys, region.start.as_u64(), phys.as_u64()));
+    assert_eq!(
+        space.move_present_user_leaves_at(relocated, region.start, region.page_count),
+        Ok(region.page_count),
+        "relocation back must restore the original mapping"
+    );
+    assert_eq!(space.translate_user(region.start), Some(phys));
+
     debug::println!(
         "Process paging smoke test passed: user_va={:#x}, phys={:#x}",
         region.start.as_u64(),

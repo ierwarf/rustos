@@ -72,7 +72,7 @@ use rustos_user_abi::syscall::{
     VFS_IPC_OP_PWRITE64, VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT, VFS_IPC_OP_RENAMEAT2,
     VFS_IPC_OP_SET_ATTRS, VFS_IPC_OP_STATFS, VFS_IPC_OP_STATX, VFS_IPC_OP_SYMLINKAT,
     VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE, VFS_IPC_OP_MKNOD, VFS_IPC_OP_CHMOD,
-    VFS_IPC_OP_FCHMOD, VFS_IPC_OP_FALLOCATE, VFS_IPC_OP_FILE_LOCK,
+    VFS_IPC_OP_FCHMOD, VFS_IPC_OP_FALLOCATE, VFS_IPC_OP_FILE_LOCK, VFS_IPC_OP_SHARED_BACKING,
     VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY, VFS_POLL_QUERY_EPOLL_CREATE,
     VFS_EPOLL_CLAIM_MAX, VFS_POLL_BATCH_MAX, VFS_POLL_QUERY_EPOLL_CLAIM, VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT,
     VFS_POLL_QUERY_EPOLL_RETIRE, VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_POLL,
@@ -113,6 +113,7 @@ mod devmgrd;
 mod early_system;
 mod snapshot_worker;
 mod snapshot_output;
+mod shared_frames;
 use snapshot_output::{ExecutableSnapshotOpen, SnapshotWriter};
 mod storage_owner;
 mod util;
@@ -685,11 +686,9 @@ impl VfsState {
         // The count is kernel-written; never let it index past the local buffer.
         for event in &events[..(count as usize).min(LIFECYCLE_DRAIN_MAX_EVENTS)] {
             vfsd::lifecycle::apply_lifecycle_event(&mut self.cwd, event);
-            // POSIX record locks die with the process (the exit is queued
-            // before its pid can be reused, so this never hits a successor).
-            if event.event == rustos_user_abi::syscall::LIFECYCLE_EVENT_EXIT && event.pid != 0 {
-                self.locks.release_process(event.pid);
-            }
+            // POSIX record locks die with the process; a fork of a pid also
+            // retires any lock a lost-exit predecessor left under it.
+            self.locks.apply_lifecycle_event(event);
         }
     }
 }

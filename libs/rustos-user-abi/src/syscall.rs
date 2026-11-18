@@ -14,6 +14,7 @@ mod library_object;
 mod scheduling_context;
 pub mod smp_qualification;
 mod vfs_executable_snapshot;
+mod vfs_shared_backing;
 pub use activation_batch::*;
 pub use affinity::*;
 pub use bootstrap_spawn::*;
@@ -30,6 +31,7 @@ pub use library_object::*;
 pub use scheduling_context::*;
 pub use smp_qualification::*;
 pub use vfs_executable_snapshot::*;
+pub use vfs_shared_backing::*;
 pub const SYS_RUSTOS_DEBUG_PRINT: u64 = 0x5255_0001;
 /// Rootd-only pre-loader launch using `RustosBootstrapSpawnArgs` ABI v1.
 pub const SYS_RUSTOS_SPAWN_EXEC: u64 = 0x5255_0002;
@@ -673,6 +675,18 @@ pub const SYSCALL_OFFLOAD_OP_LINUX_GETRESGID: u16 = 71;
 pub const SYSCALL_OFFLOAD_OP_LINUX_GETGROUPS: u16 = 72;
 pub const SYSCALL_OFFLOAD_OP_LINUX_GETPRIORITY: u16 = 73;
 pub const SYSCALL_OFFLOAD_OP_LINUX_SETPRIORITY: u16 = 74;
+/// `mremap(2)` mapping policy. Rides the compact address-space frame:
+/// `addr` = old address, `len` = old length, `offset` = new length,
+/// `flags` = `MREMAP_*`, `fd` = `MREMAP_FIXED` destination, `prot` = the
+/// protection of the source's last mapped page (ring0 evidence for a source
+/// that `syscalld` never recorded) | `MREMAP_SOURCE_*` bits.
+pub const SYSCALL_OFFLOAD_OP_LINUX_MREMAP: u16 = 75;
+/// `prot` bit: every byte of the source range is covered by ring0 pager VMAs
+/// and every one of them is anonymous private memory.
+pub const MREMAP_SOURCE_ANON_PRIVATE: u32 = 1 << 8;
+/// `prot` bit: part of the source range is covered by no ring0 pager VMA
+/// (reserved-only policy records, ELF image, heap or stack).
+pub const MREMAP_SOURCE_HAS_HOLES: u32 = 1 << 9;
 pub const WIN32_SYSCALL_OFFLOAD_ABI_VERSION: u16 = 1;
 pub const SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE: u16 = 80;
 pub const SYSCALL_OFFLOAD_OP_WIN32_READ_FILE: u16 = 81;
@@ -725,6 +739,9 @@ pub const MM_BROKER_OP_QUERY_CONFLICT: u16 = 10;
 /// after vfsd attests its backing file identity. A later `MAP_FILE_PRIVATE` of
 /// that descriptor aliases the object's immutable frames copy-on-write.
 pub const MM_BROKER_OP_BIND_LIBRARY: u16 = 11;
+/// Atomically relocate `[addr, addr + len)` to `offset` (page-table leaves,
+/// frame-ledger claims and pager VMAs move together; no byte is copied).
+pub const MM_BROKER_OP_MOVE: u16 = 12;
 pub const MM_BROKER_FLAG_NONE: u32 = 0;
 pub const MM_BROKER_MAP_READ: u64 = 1 << 0;
 pub const MM_BROKER_MAP_WRITE: u64 = 1 << 1;

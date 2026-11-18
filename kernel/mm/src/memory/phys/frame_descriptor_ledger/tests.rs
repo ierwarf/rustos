@@ -591,3 +591,62 @@ fn concurrent_claims_report_quota_as_out_of_frames_and_refund_exactly() {
     ledger.unregister_root(root_a);
     ledger.unregister_root(root_b);
 }
+
+#[test]
+fn rekey_moves_exclusive_ownership_without_touching_charge() {
+    let (ledger, _records, _mappings) = ledger();
+    let root = PAGE_SIZE;
+    let frame = PAGE_SIZE * 3;
+    let (old_va, new_va) = (0x8000_4000, 0x9000_8000);
+    ledger.register_root(root);
+    assert_eq!(ledger.claim_exclusive_data(root, old_va, frame, true), DataClaim::Claimed);
+    ledger.publish_exclusive_data(root, old_va, frame);
+    let leaves = ledger.verify_root(root).unwrap().data_leaf_count_or_map_head.load(Ordering::Relaxed);
+    assert!(ledger.rekey_data(root, old_va, new_va, frame));
+    assert!(!ledger.data_is_owned(root, old_va, frame), "the old key must be gone");
+    assert!(ledger.data_is_owned(root, new_va, frame));
+    assert_eq!(
+        ledger.verify_root(root).unwrap().data_leaf_count_or_map_head.load(Ordering::Relaxed),
+        leaves,
+        "a relocation neither adds nor removes a data leaf"
+    );
+    // A stale or foreign key never re-keys.
+    assert!(!ledger.rekey_data(root, old_va, new_va + PAGE_SIZE, frame));
+    assert!(!ledger.rekey_data(root + PAGE_SIZE, new_va, old_va, frame));
+    assert!(!ledger.rekey_data(root, new_va, old_va + 1, frame));
+    assert!(ledger.data_is_owned(root, new_va, frame));
+    assert_eq!(ledger.release_data(root, old_va, frame), None);
+    assert_eq!(ledger.release_data(root, new_va, frame), Some(DataLeafRelease::FrameReusable));
+    ledger.unregister_root(root);
+}
+
+#[test]
+fn rekey_moves_one_member_of_a_shared_cow_set() {
+    let (ledger, _records, _mappings) = ledger();
+    let (parent, child) = (PAGE_SIZE, PAGE_SIZE * 2);
+    let frame = PAGE_SIZE * 3;
+    let (old_va, new_va, child_va) = (0x8000_4000, 0x9000_8000, 0x8000_4000);
+    ledger.register_root(parent);
+    ledger.register_root(child);
+    assert_eq!(ledger.claim_exclusive_data(parent, old_va, frame, true), DataClaim::Claimed);
+    ledger.publish_exclusive_data(parent, old_va, frame);
+    let ticket = ledger
+        .prepare_shared_alias(parent, old_va, child, child_va, frame, CowFrameKind::AnonymousFork, 0)
+        .unwrap();
+    ledger.publish_shared_alias(ticket);
+    // The primary (inline) member moves.
+    assert!(ledger.rekey_data(parent, old_va, new_va, frame));
+    assert!(ledger.data_is_owned(parent, new_va, frame));
+    assert!(!ledger.data_is_owned(parent, old_va, frame));
+    assert!(ledger.data_is_owned(child, child_va, frame), "the sibling keeps its key");
+    // A list member moves too.
+    assert!(ledger.rekey_data(child, child_va, child_va + 0x10_0000, frame));
+    assert!(ledger.data_is_owned(child, child_va + 0x10_0000, frame));
+    assert!(!ledger.data_is_owned(child, child_va, frame));
+    assert!(ledger.data_is_owned(parent, new_va, frame));
+    // Both members are still individually releasable under their new keys.
+    assert_eq!(ledger.release_data(child, child_va + 0x10_0000, frame), Some(DataLeafRelease::FrameRetained));
+    assert_eq!(ledger.release_data(parent, new_va, frame), Some(DataLeafRelease::FrameReusable));
+    ledger.unregister_root(child);
+    ledger.unregister_root(parent);
+}
