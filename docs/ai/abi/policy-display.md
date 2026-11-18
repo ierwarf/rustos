@@ -243,6 +243,13 @@ procd owns Linux `execve`, `fork`/`clone`, `wait4`, `rt_sigaction`, `rt_sigprocm
 
 Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pending-signal wakeup, Linux x86_64 `rt_sigframe`/`rt_sigreturn`.
 
+- **Service process lifecycle:** runtimed's reap probe uses process-directed
+  `kill(pid, 0)`, not leader-thread-directed `tgkill(pid, pid, 0)`.
+  A retired leader with live sibling threads must not make an application
+  look exited or refund its Job/session early. Failed-launch cleanup in
+  runtimed and initd uses process-directed `kill(pid, SIGKILL)` with an
+  explicit positive-PID guard, so sibling threads cannot survive cleanup.
+
 ## Syscalld Residual Surface
 
 - Per-process credentials + `RLIMIT_STACK` policy DB: source of truth for Linux-visible `get*id`, `set*id`, `prlimit64`. Kernel process credentials = gated bootstrap/security primitive; **must not** be mutated by Linux `set*id`.

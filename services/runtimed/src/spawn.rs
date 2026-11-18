@@ -961,11 +961,13 @@ pub(super) fn collect_exited_children() -> Vec<(i32, i32)> {
         if pid <= 0 || exited.iter().any(|(existing, _)| *existing == pid) {
             continue;
         }
-        // SAFETY: `tgkill(pid, pid, 0)` sends no signal (existence probe) and takes only
-        // integers; `pid` is a tracked running child, and a stale value yields ESRCH.
-        let rc = unsafe { libc::syscall(libc::SYS_tgkill as libc::c_long, pid, pid, 0) as i32 };
+        // Probe the process, not the leader thread: other threads may still
+        // run after the leader exits. tgkill(pid, pid, 0) would falsely
+        // report ESRCH and release their session/Job accounting.
+        // SAFETY: kill(positive_pid, 0) performs only an existence check.
+        let rc = unsafe { libc::syscall(libc::SYS_kill as libc::c_long, pid, 0) as i32 };
         if rc < 0 && last_errno() == libc::ESRCH {
-            // The thread is gone, but a faulting child's wait status is
+            // The process is gone, but a faulting child's wait status is
             // published by deferred kernel cleanup AFTER its task retires, so
             // the sweep above may have missed it. Never invent status 0
             // ("exited 0") for a child that still has a status coming.
@@ -1483,10 +1485,12 @@ pub(super) fn debug_line(message: &str) {
 }
 
 pub(super) fn terminate_pid(pid: i32) -> Result<(), i32> {
-    let rc =
-        // SAFETY: `tgkill(pid, pid, SIGKILL)` takes only integers; a stale or foreign
-        // `pid` is refused by the kernel with an errno, which is returned below.
-        unsafe { libc::syscall(libc::SYS_tgkill as libc::c_long, pid, pid, libc::SIGKILL) as i32 };
+    if pid <= 0 {
+        return Err(libc::EINVAL);
+    }
+    // Send to the whole process even if its leader thread already exited.
+    // SAFETY: kill(positive_pid, SIGKILL) targets the named process, not its caller's process group.
+    let rc = unsafe { libc::syscall(libc::SYS_kill as libc::c_long, pid, libc::SIGKILL) as i32 };
     if rc < 0 {
         return Err(last_errno());
     }

@@ -1122,10 +1122,14 @@ fn cleanup_spawned_service(
 }
 
 fn terminate_spawned_service(pid: i32) -> Result<(), i32> {
-    // SAFETY: tgkill receives only the exact positive process/thread identity
-    // already checked by `cleanup_spawned_service` and a fixed signal.
+    if pid <= 0 {
+        return Err(libc::EINVAL);
+    }
+    // Kill all threads of the admitted process, including when the leader
+    // already exited. A thread-directed tgkill could falsely report ESRCH.
+    // SAFETY: kill(positive_pid, SIGKILL) targets exactly this process.
     let status =
-        unsafe { libc::syscall(libc::SYS_tgkill as libc::c_long, pid, pid, libc::SIGKILL) as i32 };
+        unsafe { libc::syscall(libc::SYS_kill as libc::c_long, pid, libc::SIGKILL) as i32 };
     if status < 0 {
         return Err(last_errno());
     }
