@@ -196,7 +196,7 @@ pub(super) struct ServiceRouteSpec {
 /// One source of truth for named post-init and cross-service lookup routes.
 /// These offers are checked during bootstrap and evaluated without allocation
 /// at lookup time. Bootstrap dependency offers remain in dependency_mask.
-pub(super) const SERVICE_ROUTING_MANIFEST: [ServiceRouteSpec; 16] = [
+pub(super) const SERVICE_ROUTING_MANIFEST: [ServiceRouteSpec; 17] = [
     ServiceRouteSpec {
         subject: INITD_LEASE_ID,
         target: IPC_SERVICE_NETD,
@@ -230,6 +230,13 @@ pub(super) const SERVICE_ROUTING_MANIFEST: [ServiceRouteSpec; 16] = [
     // is a post-init route, never a bootstrap dependency.
     ServiceRouteSpec {
         subject: IPC_SERVICE_PAGERD,
+        target: IPC_SERVICE_VFSD,
+    },
+    // netd creates, stats and (on rollback) unlinks the `S_IFSOCK` node of an
+    // AF_UNIX `bind(path)`. netd is post-init, so this is a lookup route, not a
+    // bootstrap dependency; vfsd still admits only the live netd owner.
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_NETD,
         target: IPC_SERVICE_VFSD,
     },
     ServiceRouteSpec {

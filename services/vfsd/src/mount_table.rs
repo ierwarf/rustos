@@ -8,11 +8,70 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 use storage_core::file_io::{FileReadMap, RangeError, ReadAt};
-use storage_core::fs::{CasePolicy, FsVolume};
+use storage_core::fs::{CasePolicy, FsCreateAttrs, FsError, FsNodeKind, FsTimestamp, FsVolume};
 use storage_core::{detect_partitions, BlockDevice, BlockSlice, IoResult};
 use storage_fat::{FatError, FatVolume};
 
+use crate::tmpfs::{
+    TmpFs, TmpFsConfig, DEV_SHM_MAX_INODES, DEV_SHM_QUOTA_BYTES, RUN_MAX_INODES, RUN_QUOTA_BYTES,
+    TMP_MAX_INODES, TMP_QUOTA_BYTES,
+};
 use crate::{map_storage_error, EIO};
+
+/// One boot-time memory filesystem mount.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TmpfsMountSpec {
+    pub mount_point: &'static str,
+    pub quota_bytes: u64,
+    pub max_inodes: u64,
+    pub root_mode: u32,
+}
+
+/// `/tmp` and `/dev/shm` are world-writable with the sticky bit; `/run` is
+/// root-owned and only populated by named services.
+pub const TMPFS_MOUNTS: [TmpfsMountSpec; 3] = [
+    TmpfsMountSpec {
+        mount_point: "/tmp",
+        quota_bytes: TMP_QUOTA_BYTES,
+        max_inodes: TMP_MAX_INODES,
+        root_mode: 0o1777,
+    },
+    TmpfsMountSpec {
+        mount_point: "/dev/shm",
+        quota_bytes: DEV_SHM_QUOTA_BYTES,
+        max_inodes: DEV_SHM_MAX_INODES,
+        root_mode: 0o1777,
+    },
+    TmpfsMountSpec {
+        mount_point: "/run",
+        quota_bytes: RUN_QUOTA_BYTES,
+        max_inodes: RUN_MAX_INODES,
+        root_mode: 0o755,
+    },
+];
+
+/// Whether a checkpointed path belongs to a filesystem lost on restart.
+pub fn is_volatile_mount_path(path: &str) -> bool {
+    TMPFS_MOUNTS.iter().any(|spec| {
+        path == spec.mount_point
+            || path.strip_prefix(spec.mount_point).is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+/// Directories created at boot inside `/run`: `(path relative to /run, mode,
+/// uid, gid)`. `/run/user/1000` is the default session's `XDG_RUNTIME_DIR`.
+pub const RUN_BOOT_DIRECTORIES: [(&str, u32, u32, u32); 2] = [
+    ("user", 0o755, 0, 0),
+    ("user/1000", 0o700, 1000, 1000),
+];
+
+/// One `/proc/mounts` row source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MountInfo<'a> {
+    pub mount_point: &'a str,
+    pub fs_type: &'static str,
+    pub read_only: bool,
+}
 
 pub type CacheKey = (u64, String);
 
@@ -143,6 +202,109 @@ impl MountTable {
         self.entries.is_empty()
     }
 
+    /// Whether the boot volume is mounted at `/`.
+    pub fn has_root(&self) -> bool {
+        self.entries.iter().any(|entry| entry.mount_point == "/")
+    }
+
+    /// Mounted filesystems for `/proc/mounts`, root first, then by mount point.
+    pub fn mount_infos(&self) -> Vec<MountInfo<'_>> {
+        let mut infos: Vec<MountInfo<'_>> = self
+            .entries
+            .iter()
+            .map(|entry| {
+                let caps = entry.volume.capabilities();
+                MountInfo {
+                    mount_point: entry.mount_point.as_str(),
+                    fs_type: if caps.posix_nodes() { "tmpfs" } else { "vfat" },
+                    read_only: caps.read_only,
+                }
+            })
+            .collect();
+        infos.sort_by(|a, b| {
+            (a.mount_point != "/", a.mount_point).cmp(&(b.mount_point != "/", b.mount_point))
+        });
+        infos
+    }
+
+    /// Walk components in order, expanding each symlink before interpreting
+    /// subsequent `..` components. Missing final names are left for create.
+    pub fn follow_symlinks(&self, abs_path: &str, follow_last: bool) -> Result<String, i32> {
+        use alloc::collections::VecDeque;
+        use rustos_user_abi::syscall::VFS_IPC_PATH_CAPACITY;
+        if !abs_path.starts_with('/') || abs_path.len() > VFS_IPC_PATH_CAPACITY
+            || abs_path.bytes().any(|b| b == 0 || b == b'\\')
+        {
+            return Err(crate::EINVAL);
+        }
+        let mut pending: VecDeque<String> = abs_path.split('/').filter(|c| !c.is_empty())
+            .map(String::from).collect();
+        let mut path = String::from("/");
+        let mut expansions = 0;
+        while let Some(component) = pending.pop_front() {
+            if component == "." { continue; }
+            if component == ".." {
+                let end = path.rfind('/').unwrap_or(0);
+                path.truncate(end.max(1));
+                continue;
+            }
+            if path.len() > 1 { path.push('/'); }
+            path.push_str(&component);
+            if path.len() > VFS_IPC_PATH_CAPACITY { return Err(crate::EINVAL); }
+            let Some((entry, rel)) = self.resolve(&path) else { continue; };
+            if !entry.volume.capabilities().supports_symlinks { continue; }
+            match entry.volume.metadata(rel) {
+                Ok(meta) if meta.kind == FsNodeKind::Symlink && (follow_last || !pending.is_empty()) => {
+                    expansions += 1;
+                    if expansions > crate::SYMLINK_FOLLOW_MAX { return Err(crate::ELOOP); }
+                    let target = entry.volume.readlink(rel).map_err(crate::map_fs_error)?;
+                    if target.is_empty() || target.bytes().any(|b| b == 0 || b == b'\\') {
+                        return Err(crate::EINVAL);
+                    }
+                    let end = path.rfind('/').unwrap_or(0);
+                    path.truncate(end.max(1));
+                    if target.starts_with('/') { path.truncate(1); }
+                    for part in target.split('/').filter(|c| !c.is_empty()).rev() {
+                        pending.push_front(String::from(part));
+                    }
+                }
+                Ok(meta) if !pending.is_empty() && meta.kind != FsNodeKind::Directory => {
+                    return Err(crate::ENOTDIR);
+                }
+                Ok(_) => {}
+                Err(FsError::NotFound) if pending.is_empty() => {}
+                Err(FsError::NotFound) => return Err(crate::ENOENT),
+                Err(err) => return Err(crate::map_fs_error(err)),
+            }
+        }
+        Ok(path)
+    }
+
+    /// Mounts the boot-time memory filesystems and creates their fixed
+    /// directories. Idempotent: an already mounted point is left untouched.
+    pub fn mount_tmpfs_defaults(&mut self, clock: fn() -> FsTimestamp) -> Result<(), FsError> {
+        for spec in TMPFS_MOUNTS {
+            if self.entries.iter().any(|e| e.mount_point == spec.mount_point) {
+                continue;
+            }
+            let fs = Arc::new(TmpFs::new(TmpFsConfig {
+                quota_bytes: spec.quota_bytes,
+                max_inodes: spec.max_inodes,
+                root_mode: spec.root_mode,
+                root_uid: 0,
+                root_gid: 0,
+                clock,
+            }));
+            if spec.mount_point == "/run" {
+                for (dir, mode, uid, gid) in RUN_BOOT_DIRECTORIES {
+                    fs.mkdir_with(dir, FsCreateAttrs::new(mode, uid, gid))?;
+                }
+            }
+            self.mount(spec.mount_point, fs, None, 0);
+        }
+        Ok(())
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
     }
@@ -223,14 +385,28 @@ impl MountTable {
     }
 
     pub fn mount_fat_disk<D: BlockDevice + Send + 'static>(
-        mut shared_dev: SharedBlockDevice<D>,
+        shared_dev: SharedBlockDevice<D>,
         device_read_only: bool,
         storage_epoch: u64,
         wait: fn(),
     ) -> Result<Self, i32> {
+        let mut table = Self::new();
+        table.mount_fat_disk_into(shared_dev, device_read_only, storage_epoch, wait)?;
+        Ok(table)
+    }
+
+    /// Mounts the FAT boot disk into this table, keeping every mount already
+    /// present (the memory filesystems exist before the disk does).
+    pub fn mount_fat_disk_into<D: BlockDevice + Send + 'static>(
+        &mut self,
+        mut shared_dev: SharedBlockDevice<D>,
+        device_read_only: bool,
+        storage_epoch: u64,
+        wait: fn(),
+    ) -> Result<(), i32> {
         let total_blocks = shared_dev.block_count();
         let partitions = detect_partitions(&mut shared_dev).unwrap_or_default();
-        let mut table = Self::new();
+        let table = self;
         if partitions.is_empty() {
             let slice =
                 BlockSlice::new(shared_dev, 0, total_blocks).map_err(map_storage_error)?;
@@ -269,7 +445,7 @@ impl MountTable {
                 }
             }
         }
-        Ok(table)
+        Ok(())
     }
 }
 
@@ -541,5 +717,155 @@ mod tests {
         assert_eq!(parent_rel_path("foo.txt"), Some(""));
         assert_eq!(parent_rel_path("a/b/c"), Some("a/b"));
         assert_eq!(parent_rel_path(""), None);
+    }
+
+    fn zero_clock() -> FsTimestamp {
+        FsTimestamp::default()
+    }
+
+    fn tmpfs_table() -> MountTable {
+        let mut table = MountTable::new();
+        table.mount_tmpfs_defaults(zero_clock).unwrap();
+        table
+    }
+
+    #[test]
+    fn boot_tmpfs_mounts_exist_without_a_disk() {
+        let table = tmpfs_table();
+        assert!(!table.has_root());
+        let points: Vec<&str> = table.mount_infos().iter().map(|i| i.mount_point).collect();
+        assert_eq!(points, ["/dev/shm", "/run", "/tmp"]);
+        assert!(table.mount_infos().iter().all(|i| i.fs_type == "tmpfs" && !i.read_only));
+        // Idempotent: a second call mounts nothing new and keeps contents.
+        let (entry, _) = table.resolve("/tmp/x").unwrap();
+        entry.volume.mkdir("keep").unwrap();
+        let mut again = table;
+        again.mount_tmpfs_defaults(zero_clock).unwrap();
+        let (entry, rel) = again.resolve("/tmp/keep").unwrap();
+        assert_eq!(rel, "keep");
+        assert!(entry.volume.metadata(rel).is_ok());
+    }
+
+    #[test]
+    fn tmpfs_roots_have_required_modes_and_run_user_is_precreated() {
+        let table = tmpfs_table();
+        for point in ["/tmp", "/dev/shm"] {
+            let (entry, rel) = table.resolve(point).unwrap();
+            let meta = entry.volume.metadata(rel).unwrap();
+            assert_eq!((meta.mode, meta.uid), (0o1777, 0), "{point}");
+        }
+        let (run, rel) = table.resolve("/run").unwrap();
+        assert_eq!(run.volume.metadata(rel).unwrap().mode, 0o755);
+        let (entry, rel) = table.resolve("/run/user/1000").unwrap();
+        let meta = entry.volume.metadata(rel).unwrap();
+        assert_eq!((meta.mode, meta.uid, meta.gid), (0o700, 1000, 1000));
+        let user = entry.volume.metadata("user").unwrap();
+        assert_eq!((user.mode, user.uid), (0o755, 0));
+        // /dev/shm is a submount of /dev; /tmp and /run are listed at the root.
+        assert_eq!(table.submount_names_at("/dev"), ["shm"]);
+        let mut root = table.submount_names_at("/");
+        root.sort();
+        assert_eq!(root, ["run", "tmp"]);
+    }
+
+    #[test]
+    fn tmpfs_quotas_are_per_mount_and_match_the_named_constants() {
+        let table = tmpfs_table();
+        let blocks = |path: &str| {
+            let (entry, _) = table.resolve(path).unwrap();
+            entry.volume.statfs().unwrap().total_blocks * 4096
+        };
+        assert_eq!(blocks("/tmp"), crate::tmpfs::TMP_QUOTA_BYTES);
+        assert_eq!(blocks("/dev/shm"), crate::tmpfs::DEV_SHM_QUOTA_BYTES);
+        assert_eq!(blocks("/run"), crate::tmpfs::RUN_QUOTA_BYTES);
+        // Filling /run does not touch /tmp.
+        let (run, _) = table.resolve("/run/f").unwrap();
+        run.volume
+            .open_prepare("f", FsOpenOptions { create: true, write: true, ..FsOpenOptions::default() })
+            .unwrap();
+        run.volume.fallocate("f", 0, crate::tmpfs::RUN_QUOTA_BYTES, false).unwrap();
+        assert_eq!(run.volume.fallocate("f", crate::tmpfs::RUN_QUOTA_BYTES, 1, false), Err(FsError::NoSpace));
+        let (tmp, _) = table.resolve("/tmp/g").unwrap();
+        assert_eq!(tmp.volume.statfs().unwrap().free_blocks * 4096, crate::tmpfs::TMP_QUOTA_BYTES);
+    }
+
+    #[test]
+    fn tmpfs_mounts_are_distinct_volumes_with_exdev_boundaries() {
+        let table = tmpfs_table();
+        let (tmp, _) = table.resolve("/tmp/a").unwrap();
+        let (shm, _) = table.resolve("/dev/shm/a").unwrap();
+        assert_ne!(tmp.id, shm.id);
+        // A path below /dev/shm belongs to the shm mount, not to any /dev tree.
+        assert_eq!(table.resolve("/dev/shm/x/y").unwrap().1, "x/y");
+        assert_eq!(table.resolve("/dev/null").map(|(e, _)| e.id), None);
+    }
+
+    #[test]
+    fn volatile_mount_path_requires_component_boundary() {
+        for path in ["/tmp", "/tmp/a", "/run/user/1000", "/dev/shm/a"] {
+            assert!(is_volatile_mount_path(path));
+        }
+        for path in ["/", "/tmpfile", "/runtime", "/dev/shmem"] {
+            assert!(!is_volatile_mount_path(path));
+        }
+    }
+
+    #[test]
+    fn follow_symlinks_resolves_components_and_bounds_loops() {
+        let table = tmpfs_table();
+        let (entry, _) = table.resolve("/tmp/x").unwrap();
+        let v = &entry.volume;
+        v.mkdir("real").unwrap();
+        v.open_prepare("real/file", FsOpenOptions { create: true, write: true, ..FsOpenOptions::default() }).unwrap();
+        v.symlink("real", "dirlink").unwrap();
+        v.symlink("file", "real/rel").unwrap();
+        v.symlink("/tmp/real/file", "abs").unwrap();
+        v.symlink("/dev/shm/there", "cross").unwrap();
+        v.symlink("../real", "real/up").unwrap();
+        v.symlink("loop2", "loop1").unwrap();
+        v.symlink("loop1", "loop2").unwrap();
+        v.symlink("nowhere", "dangling").unwrap();
+        let (shm, _) = table.resolve("/dev/shm").unwrap();
+        shm.volume.mkdir("nested").unwrap();
+        v.symlink("/dev/shm/nested", "crossdir").unwrap();
+        let follow = |p: &str, last| table.follow_symlinks(p, last);
+        assert_eq!(follow("/tmp/dirlink/file", true).unwrap(), "/tmp/real/file");
+        assert_eq!(follow("/tmp/dirlink", true).unwrap(), "/tmp/real");
+        // The last component stays a link when asked not to follow it.
+        assert_eq!(follow("/tmp/dirlink", false).unwrap(), "/tmp/dirlink");
+        assert_eq!(follow("/tmp/dirlink/file", false).unwrap(), "/tmp/real/file");
+        assert_eq!(follow("/tmp/real/rel", true).unwrap(), "/tmp/real/file");
+        assert_eq!(follow("/tmp/abs", true).unwrap(), "/tmp/real/file");
+        assert_eq!(follow("/tmp/real/up/file", true).unwrap(), "/tmp/real/file");
+        // Absolute targets may leave the mount; the new mount decides further.
+        assert_eq!(follow("/tmp/cross", true).unwrap(), "/dev/shm/there");
+        assert_eq!(follow("/tmp/loop1", true), Err(crate::ELOOP));
+        assert_eq!(follow("/tmp/loop1/x", false), Err(crate::ELOOP));
+        // A dangling link and a missing path are left for the operation.
+        assert_eq!(follow("/tmp/dangling", true).unwrap(), "/tmp/nowhere");
+        assert_eq!(follow("/tmp/missing/x", true), Err(crate::ENOENT));
+        assert_eq!(follow("/tmp/dirlink/../abs", true).unwrap(), "/tmp/real/file");
+        assert_eq!(follow("/tmp/dangling/../abs", true), Err(crate::ENOENT));
+        assert_eq!(follow("/tmp/crossdir/../file", true).unwrap(), "/dev/shm/file");
+        assert_eq!(follow("/tmp/real/file/../abs", true), Err(crate::ENOTDIR));
+        // A volume without symlink support is never walked.
+        assert_eq!(follow("/boot/anything", true).unwrap(), "/boot/anything");
+    }
+
+    #[test]
+    fn mount_infos_reports_fat_and_tmpfs_flags() {
+        let dev = format_fat_mem_disk(2048);
+        let mut table = tmpfs_table();
+        table
+            .mount_fat_disk_into(SharedBlockDevice::new(dev), true, 7, || {})
+            .unwrap();
+        assert!(table.has_root());
+        let infos = table.mount_infos();
+        assert_eq!(infos[0].mount_point, "/");
+        assert_eq!((infos[0].fs_type, infos[0].read_only), ("vfat", true));
+        assert_eq!(infos.len(), 4);
+        // Mount ids stay stable: tmpfs first, the disk after.
+        assert_eq!(table.resolve("/").unwrap().0.id, 4);
+        assert!(table.resolve("/tmp/x").unwrap().0.id < 4);
     }
 }

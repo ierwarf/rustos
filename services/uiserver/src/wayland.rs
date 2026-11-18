@@ -235,24 +235,20 @@ impl WaylandCompositor {
         display_width: u32,
         display_height: u32,
         ui_wake_sender: UiWakeSender,
-    ) -> Option<Self> {
+    ) -> std::io::Result<Self> {
         let runtime_dir = current_runtime_dir();
         let socket_path = format!("{runtime_dir}/{WAYLAND_SOCKET_NAME}");
         let display = match Display::new() {
             Ok(display) => display,
             Err(err) => {
-                diag_line(format!("uiserver: wayland display init failed: {err}"));
-                return None;
+                return Err(std::io::Error::other(format!("Wayland display: {err}")));
             }
         };
         let listener = match bind_wayland_listener(runtime_dir.as_str(), socket_path.as_str()) {
             Ok(listener) => listener,
             Err(err) => {
-                diag_line(format!(
-                    "uiserver: wayland socket bind failed path={} err={err}",
-                    socket_path
-                ));
-                return None;
+                crate::sys::debug_line(&format!("uiserver: wayland bind path={socket_path}: {err}"));
+                return Err(err);
             }
         };
         if let Err(err) = set_fd_nonblocking(listener.as_raw_fd()) {
@@ -260,7 +256,7 @@ impl WaylandCompositor {
                 "uiserver: wayland listener nonblocking failed path={} err={err}",
                 socket_path
             ));
-            return None;
+            return Err(err);
         }
         let snapshot_waker = ui_wake_sender.clone();
         let acceptor = match start_wayland_acceptor(listener, ui_wake_sender) {
@@ -270,7 +266,7 @@ impl WaylandCompositor {
                     "uiserver: wayland accept worker start failed path={} err={err}",
                     socket_path
                 ));
-                return None;
+                return Err(err);
             }
         };
         let mut state = WaylandState::new(display_width, display_height);
@@ -283,7 +279,7 @@ impl WaylandCompositor {
         ));
         crate::sys::debug_line("uiserver: wayland compositor ready");
 
-        Some(Self {
+        Ok(Self {
             display,
             acceptor,
             clients: VecDeque::new(),
@@ -700,7 +696,14 @@ fn current_runtime_dir() -> String {
 }
 
 fn bind_wayland_listener(runtime_dir: &str, socket_path: &str) -> std::io::Result<UnixListener> {
-    fs::create_dir_all(runtime_dir)?;
+    // The session directory is normally pre-created by vfsd. Do not ask to
+    // mutate its parent (which is intentionally not writable by the user).
+    match fs::metadata(runtime_dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR)),
+        Err(err) if err.kind() == ErrorKind::NotFound => fs::create_dir_all(runtime_dir)?,
+        Err(err) => return Err(err),
+    }
     match bind_nonblocking_unix_listener(socket_path) {
         Ok(listener) => Ok(listener),
         Err(err) if err.kind() == ErrorKind::AddrInUse => {

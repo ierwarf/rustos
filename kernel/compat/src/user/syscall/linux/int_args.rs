@@ -52,6 +52,20 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
         SYS_PREADV2 | SYS_PWRITEV2 => [S, W, S, W, W, U],
         // int fd, loff_t offset, loff_t len, int advice
         SYS_FADVISE64 => [S, W, W, U, W, W],
+        // int fd, int mode, loff_t offset, loff_t len
+        SYS_FALLOCATE => [S, S, W, W, W, W],
+        // unsigned int fd, umode_t mode
+        SYS_FCHMOD => [S, U, W, W, W, W],
+        // path*, umode_t mode
+        SYS_CHMOD => [W, U, W, W, W, W],
+        // int dirfd, path*, umode_t mode, int flags
+        SYS_FCHMODAT | SYS_FCHMODAT2 => [S, W, U, U, W, W],
+        // int dirfd, path*, timespec[2]*, int flags
+        SYS_UTIMENSAT => [S, W, W, U, W, W],
+        // int out_fd, int in_fd, off_t* offset, size_t count
+        SYS_SENDFILE => [S, S, W, W, W, W],
+        // int fd_in, loff_t*, int fd_out, loff_t*, size_t len, unsigned int flags
+        SYS_COPY_FILE_RANGE => [S, W, S, W, W, U],
         // unsigned int first, unsigned int last, unsigned int flags
         SYS_CLOSE_RANGE => [U, U, U, W, W, W],
         // unsigned int fd, unsigned int count
@@ -60,6 +74,8 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
         SYS_LSEEK => [S, W, U, W, W, W],
         // fd, unsigned int cmd, unsigned long arg
         SYS_IOCTL | SYS_FCNTL => [S, U, W, W, W, W],
+        // int fd, int operation
+        SYS_FLOCK => [S, U, W, W, W, W],
         SYS_DUP2 => [S, S, W, W, W, W],
         SYS_DUP3 => [S, S, U, W, W, W],
         // addr, len, int prot, int flags, fd, off_t
@@ -145,6 +161,24 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
         SYS_PIPE2 => [W, U, W, W, W, W],
         SYS_EVENTFD => [U, W, W, W, W, W],
         SYS_EVENTFD2 => [U, U, W, W, W, W],
+        // old*, size_t old_len, size_t new_len, int flags, new*
+        SYS_MREMAP => [W, W, W, U, W, W],
+        // int flags
+        SYS_MLOCKALL => [U, W, W, W, W, W],
+        // addr, size_t len, unsigned int flags
+        SYS_MLOCK2 | SYS_MSYNC => [W, W, U, W, W, W],
+        // int cmd, unsigned int flags, int cpu_id
+        SYS_MEMBARRIER => [U, U, S, W, W, W],
+        // int epfd, events*, int maxevents, timespec*, sigmask*, size_t
+        SYS_EPOLL_PWAIT2 => [S, W, S, W, W, W],
+        // unsigned int resource, rlimit*
+        SYS_GETRLIMIT | SYS_SETRLIMIT => [U, W, W, W, W, W],
+        // pid_t pid, int policy, sched_param*
+        SYS_SCHED_SETSCHEDULER => [S, S, W, W, W, W],
+        // pid_t pid, sched_param*
+        SYS_SCHED_SETPARAM => [S, W, W, W, W, W],
+        // int fd, mmsghdr*, unsigned int vlen, unsigned int flags, timespec*
+        SYS_SENDMMSG | SYS_RECVMMSG => [S, W, U, U, W, W],
         _ => [W; 6],
     }
 }
@@ -266,6 +300,18 @@ mod tests {
     }
 
     #[test]
+    fn flock_fd_is_signed_and_operation_is_unsigned_32_bit() {
+        let out = run(SYS_FLOCK, [GARBAGE | 6, GARBAGE | 6, 0x77, 0, 0, 0]);
+        assert_eq!((out[0], out[1]), (6, 6), "garbage upper halves are dropped");
+        // A negative fd stays negative so the handler reports EBADF.
+        let out = run(SYS_FLOCK, [0xFFFF_FFFF, 2, 0, 0, 0, 0]);
+        assert_eq!(out[0] as i64, -1);
+        // The unused third slot is wide and passes through untouched.
+        let out = run(SYS_FLOCK, [3, 1, 0x1_0000_0077, 0, 0, 0]);
+        assert_eq!(out[2], 0x1_0000_0077);
+    }
+
+    #[test]
     fn fcntl_cmd_and_kill_pid_sig() {
         let out = run(SYS_FCNTL, [GARBAGE | 4, GARBAGE | 1030, 0x1_0000_0001, 0, 0, 0]);
         assert_eq!((out[0], out[1], out[2]), (4, 1030, 0x1_0000_0001));
@@ -293,6 +339,48 @@ mod tests {
         assert_eq!(out[0], 1);
         let out = run(SYS_PRCTL, [GARBAGE | 15, 0x7000, 0, 0, 0, 0]);
         assert_eq!(out[0], 15);
+    }
+
+    #[test]
+    fn memory_signal_limit_and_message_syscall_widths() {
+        let out = run(SYS_MREMAP, [0x1000, 0x1_0000_0000, 0x2_0000_0000, GARBAGE | 3, 0x9000, 0]);
+        assert_eq!(out, [0x1000, 0x1_0000_0000, 0x2_0000_0000, 3, 0x9000, 0]);
+        let out = run(SYS_MLOCKALL, [GARBAGE | 3, 0, 0, 0, 0, 0]);
+        assert_eq!(out[0], 3);
+        for nr in [SYS_MLOCK2, SYS_MSYNC] {
+            let out = run(nr, [0x1000, 0x1_0000_0000, GARBAGE | 4, 0, 0, 0]);
+            assert_eq!((out[0], out[1], out[2]), (0x1000, 0x1_0000_0000, 4));
+        }
+        let out = run(SYS_MEMBARRIER, [GARBAGE | 8, GARBAGE | 1, 0xFFFF_FFFF, 0, 0, 0]);
+        assert_eq!((out[0], out[1], out[2] as i64), (8, 1, -1));
+        let out = run(SYS_EPOLL_PWAIT2, [GARBAGE | 5, 0x10, GARBAGE | 64, 0x20, 0x30, 8]);
+        assert_eq!(out, [5, 0x10, 64, 0x20, 0x30, 8]);
+        for nr in [SYS_GETRLIMIT, SYS_SETRLIMIT] {
+            let out = run(nr, [GARBAGE | 7, 0x4000, 0, 0, 0, 0]);
+            assert_eq!((out[0], out[1]), (7, 0x4000));
+        }
+        let out = run(SYS_SCHED_SETSCHEDULER, [0xFFFF_FFFF, GARBAGE | 2, 0x5000, 0, 0, 0]);
+        assert_eq!((out[0] as i64, out[1], out[2]), (-1, 2, 0x5000));
+        let out = run(SYS_SCHED_SETPARAM, [GARBAGE | 9, 0x5000, 0, 0, 0, 0]);
+        assert_eq!((out[0], out[1]), (9, 0x5000));
+        for nr in [SYS_SENDMMSG, SYS_RECVMMSG] {
+            let out = run(nr, [GARBAGE | 6, 0x6000, GARBAGE | 1024, GARBAGE | 0x10000, 0x7000, 0]);
+            assert_eq!(out, [6, 0x6000, 1024, 0x10000, 0x7000, 0]);
+        }
+    }
+
+    #[test]
+    fn wide_only_new_syscalls_pass_every_register_through() {
+        let args = [GARBAGE | 1, GARBAGE | 2, GARBAGE | 3, GARBAGE | 4, GARBAGE | 5, GARBAGE | 6];
+        for nr in [SYS_MINCORE, SYS_MLOCK, SYS_MUNLOCK, SYS_MUNLOCKALL, SYS_RT_SIGTIMEDWAIT] {
+            assert_eq!(run(nr, args), args);
+        }
+        // Existing arms are unchanged by the additions.
+        let out = run(SYS_EPOLL_PWAIT, [GARBAGE | 5, 0x10, GARBAGE | 64, GARBAGE | 7, 0x30, 8]);
+        assert_eq!(out, [5, 0x10, 64, 7, 0x30, 8]);
+        let out = run(SYS_PRLIMIT64, [GARBAGE | 1, GARBAGE | 7, 0x10, 0x20, 0, 0]);
+        assert_eq!(out, [1, 7, 0x10, 0x20, 0, 0]);
+        assert_eq!(run(SYS_MUNMAP, args), args);
     }
 
     #[test]
@@ -356,6 +444,27 @@ mod tests {
         let out = run(SYS_FSTATFS, [GARBAGE | 9, 0x3000, 0, 0, 0, 0]);
         assert_eq!(out[0], 9);
         assert_eq!(out[1], 0x3000);
+    }
+
+    #[test]
+    fn file_metadata_and_bulk_copy_arg_widths() {
+        let out = run(SYS_FALLOCATE, [GARBAGE | 3, GARBAGE | 1, 0x1_0000_0000, 0x2_0000_0000, 0, 0]);
+        assert_eq!(out, [3, 1, 0x1_0000_0000, 0x2_0000_0000, 0, 0]);
+        let out = run(SYS_FCHMODAT, [0xFFFF_FF9C, 0x1000, GARBAGE | 0o644, 0, 0, 0]);
+        assert_eq!(out, [0xFFFF_FFFF_FFFF_FF9C, 0x1000, 0o644, 0, 0, 0]);
+        let out = run(SYS_FCHMODAT2, [GARBAGE | 4, 0x1000, GARBAGE | 0o600, GARBAGE | 0x100, 0, 0]);
+        assert_eq!(out, [4, 0x1000, 0o600, 0x100, 0, 0]);
+        let out = run(SYS_FCHMOD, [GARBAGE | 5, GARBAGE | 0o700, 0, 0, 0, 0]);
+        assert_eq!(out, [5, 0o700, 0, 0, 0, 0]);
+        let out = run(SYS_UTIMENSAT, [0xFFFF_FF9C, 0x1000, 0x2000, GARBAGE | 0x100, 0, 0]);
+        assert_eq!(out, [0xFFFF_FFFF_FFFF_FF9C, 0x1000, 0x2000, 0x100, 0, 0]);
+        let out = run(SYS_SENDFILE, [GARBAGE | 6, GARBAGE | 7, 0x3000, 0x1_0000_0000, 0, 0]);
+        assert_eq!(out, [6, 7, 0x3000, 0x1_0000_0000, 0, 0]);
+        let out = run(
+            SYS_COPY_FILE_RANGE,
+            [GARBAGE | 3, 0x4000, GARBAGE | 4, 0x5000, 0x1_0000_0000, GARBAGE],
+        );
+        assert_eq!(out, [3, 0x4000, 4, 0x5000, 0x1_0000_0000, 0]);
     }
 }
 

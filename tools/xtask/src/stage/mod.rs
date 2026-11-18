@@ -24,6 +24,7 @@ use crate::util::{
     remove_dir_if_exists, remove_file_if_exists, run_command,
 };
 
+mod browser_runtime;
 mod library_cache;
 mod runtime_libs;
 
@@ -83,6 +84,9 @@ const DEFAULT_RUNTIME_ASSET_DIRS: &[&str] = &[
     "/usr/share/locale",
     "/usr/lib/gconv",
     "/usr/share/zoneinfo",
+    "/usr/share/fonts",
+    "/etc/fonts",
+    "/etc/ssl",
 ];
 const DEFAULT_RUNTIME_ASSET_FILES: &[&str] = &[
     "/etc/nsswitch.conf",
@@ -93,16 +97,26 @@ const DEFAULT_RUNTIME_ASSET_FILES: &[&str] = &[
     "/system/registry/system/startup-programs.tsv",
     "/system/registry/system/runtime-launch-programs.tsv",
 ];
+/// Environment for the init scope (services started by initd).
 const DEFAULT_INIT_ENV: &[(&str, &str)] = &[
     ("PATH", "/bin:/usr/bin:/usr/local/bin"),
     ("HOME", "/home/user"),
     ("XDG_RUNTIME_DIR", "/run/user/1000"),
     ("WAYLAND_DISPLAY", "wayland-0"),
 ];
+/// Single source of truth for the default environment of every
+/// runtimed-launched application. Staged into `runtime-env.tsv`; runtimed's
+/// spawn path merges it under per-catalog-entry `env` (entry wins). HOME and
+/// the XDG dirs live on the writable `/data` partition; `/tmp` and
+/// `/run/user/1000` are tmpfs-class paths owned by vfsd.
 const DEFAULT_RUNTIME_ENV: &[(&str, &str)] = &[
     ("PATH", "/bin:/usr/bin:/usr/local/bin"),
-    ("HOME", "/home/user"),
+    ("HOME", "/data/home"),
+    ("XDG_CONFIG_HOME", "/data/config"),
+    ("XDG_CACHE_HOME", "/data/cache"),
     ("XDG_RUNTIME_DIR", "/run/user/1000"),
+    ("TMPDIR", "/tmp"),
+    ("LANG", "C.UTF-8"),
     ("WAYLAND_DISPLAY", "wayland-0"),
     ("XDG_SESSION_TYPE", "wayland"),
     ("XDG_CURRENT_DESKTOP", "RustOS"),
@@ -161,6 +175,9 @@ pub(crate) fn stage(config: &Config) -> Result<()> {
     write_windows_dll_registry(config, &manifests)?;
     write_linux_runtime_access_registry(config)?;
     write_runtime_env_registry(config)?;
+    for note in browser_runtime::stage_browser_runtime_files(config)? {
+        eprintln!("stage: {note}");
+    }
     generate_dynamic_linker_cache(&config.image_dir)?;
     materialize_image_file_aliases(&config.image_dir)?;
     runtime_baseline.verify(&config.image_dir)?;
@@ -491,14 +508,14 @@ fn build_gpt_header(
 }
 
 struct PartitionFileSlice<'a> {
-    file: &'a mut fs::File,
+    file: &'a mut std::fs::File,
     base_offset: u64,
     len: u64,
     pos: u64,
 }
 
 impl<'a> PartitionFileSlice<'a> {
-    fn new(file: &'a mut fs::File, base_offset: u64, len: u64) -> Self {
+    fn new(file: &'a mut std::fs::File, base_offset: u64, len: u64) -> Self {
         Self {
             file,
             base_offset,
@@ -560,10 +577,104 @@ impl std::io::Seek for PartitionFileSlice<'_> {
     }
 }
 
-pub(crate) fn write_gpt_boot_plus_writable_data_image(
+/// Read partition 2 of a previously written boot+data GPT image. Refuses any
+/// image that is not exactly the layout this writer produces, so a wrong file
+/// is never reinterpreted as user data.
+fn read_previous_data_partition(previous: &Path, data_size_bytes: u64) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek};
+    const SECTOR: u64 = 512;
+    let mut file = fs::File::open(previous)
+        .with_context(|| format!("open existing data disk {}", previous.display()))?;
+    let mut header = [0_u8; 512];
+    file.seek(std::io::SeekFrom::Start(SECTOR))?;
+    file.read_exact(&mut header)
+        .context("existing data disk is too small to hold a GPT header")?;
+    if &header[0..8] != b"EFI PART" {
+        bail!("existing data disk {} has no GPT header", previous.display());
+    }
+    let header_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+    if !(92..=512).contains(&header_len) {
+        bail!("existing data disk has an invalid GPT header size");
+    }
+    let stored_crc = u32::from_le_bytes(header[16..20].try_into().unwrap());
+    let mut crc_input = header[..header_len].to_vec();
+    crc_input[16..20].fill(0);
+    if gpt_crc32(&crc_input) != stored_crc {
+        bail!("existing data disk has a corrupt GPT header CRC");
+    }
+    let entries_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
+    let entry_count = u32::from_le_bytes(header[80..84].try_into().unwrap());
+    let entry_bytes = u32::from_le_bytes(header[84..88].try_into().unwrap());
+    let entries_crc = u32::from_le_bytes(header[88..92].try_into().unwrap());
+    let array_len = u64::from(entry_count) * u64::from(entry_bytes);
+    if entry_bytes < 128 || entry_count < 2 || array_len > 1 << 20 {
+        bail!("existing data disk has an unsupported GPT entry array");
+    }
+    let mut entries = vec![0_u8; array_len as usize];
+    file.seek(std::io::SeekFrom::Start(entries_lba * SECTOR))?;
+    file.read_exact(&mut entries)?;
+    if gpt_crc32(&entries) != entries_crc {
+        bail!("existing data disk has a corrupt GPT entry array CRC");
+    }
+    let entry = &entries[entry_bytes as usize..entry_bytes as usize + 128];
+    let first = u64::from_le_bytes(entry[32..40].try_into().unwrap());
+    let last = u64::from_le_bytes(entry[40..48].try_into().unwrap());
+    let name: Vec<u16> = entry[56..128]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|&c| c != 0)
+        .collect();
+    if String::from_utf16_lossy(&name) != "RUSTOSDATA" {
+        bail!("existing data disk partition 2 is not RUSTOSDATA");
+    }
+    let bytes = last
+        .checked_sub(first)
+        .and_then(|blocks| blocks.checked_add(1))
+        .and_then(|blocks| blocks.checked_mul(SECTOR))
+        .context("existing data partition bounds overflow")?;
+    if bytes != data_size_bytes {
+        bail!(
+            "existing data partition is {bytes} bytes, expected {data_size_bytes}; refusing to resize user data"
+        );
+    }
+    let mut data = vec![0_u8; bytes as usize];
+    file.seek(std::io::SeekFrom::Start(first * SECTOR))?;
+    file.read_exact(&mut data)
+        .context("existing data disk is shorter than its partition table")?;
+    if data[510..512] != [0x55, 0xAA] {
+        bail!("existing data partition has no FAT boot signature");
+    }
+    Ok(data)
+}
+
+/// Like [`write_gpt_boot_plus_writable_data_image`], but a `previous` image's
+/// data partition is carried over byte-for-byte instead of being formatted.
+/// The boot partition is always rewritten from `boot_image`. The output is
+/// built at a sibling temp path and renamed into place, so a failure at any
+/// point leaves an existing `output_gpt_image` (and `previous`) untouched.
+pub(crate) fn write_gpt_boot_plus_data_image(
     boot_image: &Path,
     output_gpt_image: &Path,
     data_size_bytes: u64,
+    previous: Option<&Path>,
+) -> Result<()> {
+    let previous_data = previous
+        .map(|path| read_previous_data_partition(path, data_size_bytes))
+        .transpose()?;
+    let parent = output_gpt_image.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    write_gpt_image_impl(boot_image, temp.as_file_mut(), data_size_bytes, previous_data.as_deref())?;
+    temp.persist(output_gpt_image)
+        .with_context(|| format!("publish GPT image {}", output_gpt_image.display()))?;
+    Ok(())
+}
+
+fn write_gpt_image_impl(
+    boot_image: &Path,
+    mut out: &mut std::fs::File,
+    data_size_bytes: u64,
+    previous_data: Option<&[u8]>,
 ) -> Result<()> {
     use std::io::{Seek, Write};
 
@@ -613,16 +724,6 @@ pub(crate) fn write_gpt_boot_plus_writable_data_image(
         .checked_mul(SECTOR_BYTES)
         .context("GPT disk byte length overflow")?;
 
-    if let Some(parent) = output_gpt_image.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut out = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(true)
-        .open(output_gpt_image)
-        .with_context(|| format!("create GPT image {}", output_gpt_image.display()))?;
     out.set_len(total_bytes)?;
 
     out.seek(std::io::SeekFrom::Start(part1_start * SECTOR_BYTES))?;
@@ -632,7 +733,10 @@ pub(crate) fn write_gpt_boot_plus_writable_data_image(
         bail!("short copy from boot image {}", boot_image.display());
     }
 
-    {
+    if let Some(data) = previous_data {
+        out.seek(std::io::SeekFrom::Start(part2_start * SECTOR_BYTES))?;
+        out.write_all(data)?;
+    } else {
         let slice = PartitionFileSlice::new(&mut out, part2_start * SECTOR_BYTES, data_size_bytes);
         let mut fat_io = fatfs::StdIoWrapper::new(slice);
         fatfs::format_volume(
@@ -1718,6 +1822,27 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn data_disk_carry_over_preserves_partial_sibling_and_symlink_target() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let boot = temp.path().join("boot.img");
+        fs::write(&boot, vec![0u8; 512]).unwrap();
+        let output = temp.path().join("data.img");
+        let sibling = temp.path().join("data.img.partial");
+        let target = temp.path().join("target");
+        fs::write(&target, b"target").unwrap();
+        fs::write(&sibling, b"sibling").unwrap();
+        super::write_gpt_boot_plus_data_image(&boot, &output, 64 * 1024 * 1024, None).unwrap();
+        assert_eq!(fs::read(&sibling).unwrap(), b"sibling");
+        fs::remove_file(&sibling).unwrap();
+        symlink(&target, &sibling).unwrap();
+        super::write_gpt_boot_plus_data_image(&boot, &output, 64 * 1024 * 1024, Some(&output)).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"target");
+        assert!(fs::symlink_metadata(&sibling).unwrap().file_type().is_symlink());
+    }
+
     #[test]
     fn gpt_boot_plus_writable_data_image_exposes_boot_and_rw_fat32_partitions() {
         use storage_core::FsVolume;
@@ -1749,7 +1874,7 @@ mod tests {
         }
 
         let gpt_disk = temp.path().join("rustos-gpt.img");
-        super::write_gpt_boot_plus_writable_data_image(&boot_disk, &gpt_disk, 36 * 1024 * 1024)
+        super::write_gpt_boot_plus_data_image(&boot_disk, &gpt_disk, 36 * 1024 * 1024, None)
             .unwrap();
 
         let disk_bytes = std::fs::read(&gpt_disk).unwrap();
@@ -1794,5 +1919,43 @@ mod tests {
             );
             data_vol.unmount().unwrap();
         }
+    }
+
+    #[test]
+    fn data_disk_carry_over_keeps_partition_two_and_refreshes_boot() {
+        let temp = tempfile::tempdir().unwrap();
+        let boot_a = temp.path().join("boot-a.img");
+        let boot_b = temp.path().join("boot-b.img");
+        std::fs::write(&boot_a, vec![0xA1_u8; 2 * 1024 * 1024]).unwrap();
+        std::fs::write(&boot_b, vec![0xB2_u8; 4 * 1024 * 1024]).unwrap();
+        let disk = temp.path().join("data.img");
+        let data_bytes = 36 * 1024 * 1024;
+        super::write_gpt_boot_plus_data_image(&boot_a, &disk, data_bytes, None).unwrap();
+        // Partition 2 start LBA lives in GPT entry 1 (second 128-byte entry).
+        let part2 = |bytes: &[u8]| {
+            let at = 2 * 512 + 128 + 32;
+            u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) * 512
+        };
+        let mut image = std::fs::read(&disk).unwrap();
+        let start = part2(&image) as usize;
+        image[start + 8192..start + 8192 + 9].copy_from_slice(b"user-data");
+        std::fs::write(&disk, &image).unwrap();
+
+        // A larger boot image moves partition 2; the data must follow it.
+        super::write_gpt_boot_plus_data_image(&boot_b, &disk, data_bytes, Some(&disk)).unwrap();
+        let after = std::fs::read(&disk).unwrap();
+        let new_start = part2(&after) as usize;
+        assert!(new_start > start);
+        assert_eq!(&after[new_start + 8192..new_start + 8192 + 9], b"user-data");
+        assert_eq!(after[34 * 512], 0xB2, "boot partition is refreshed");
+        assert!(!temp.path().join("data.img.partial").exists());
+
+        // Wrong-sized or foreign files are refused and left untouched.
+        assert!(super::write_gpt_boot_plus_data_image(&boot_b, &disk, data_bytes + 512, Some(&disk)).is_err());
+        assert_eq!(std::fs::read(&disk).unwrap(), after);
+        let foreign = temp.path().join("foreign.img");
+        std::fs::write(&foreign, vec![7_u8; 64 * 1024]).unwrap();
+        assert!(super::write_gpt_boot_plus_data_image(&boot_b, &foreign, data_bytes, Some(&foreign)).is_err());
+        assert_eq!(std::fs::read(&foreign).unwrap(), vec![7_u8; 64 * 1024]);
     }
 }

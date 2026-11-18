@@ -71,7 +71,8 @@ use rustos_user_abi::syscall::{
     VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT, VFS_IPC_OP_POLL_QUERY, VFS_IPC_OP_PREAD64,
     VFS_IPC_OP_PWRITE64, VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT, VFS_IPC_OP_RENAMEAT2,
     VFS_IPC_OP_SET_ATTRS, VFS_IPC_OP_STATFS, VFS_IPC_OP_STATX, VFS_IPC_OP_SYMLINKAT,
-    VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE,
+    VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE, VFS_IPC_OP_MKNOD, VFS_IPC_OP_CHMOD,
+    VFS_IPC_OP_FCHMOD, VFS_IPC_OP_FALLOCATE, VFS_IPC_OP_FILE_LOCK,
     VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY, VFS_POLL_QUERY_EPOLL_CREATE,
     VFS_EPOLL_CLAIM_MAX, VFS_POLL_BATCH_MAX, VFS_POLL_QUERY_EPOLL_CLAIM, VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT,
     VFS_POLL_QUERY_EPOLL_RETIRE, VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_POLL,
@@ -79,12 +80,13 @@ use rustos_user_abi::syscall::{
     VfsFileIdentityWire, VfsStatFsWire, decode_two_path_payload,
     VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME, VFS_FILE_IDENTITY_FLAG_MUTABLE_VOLUME,
     VFS_IPC_OP_LIBRARY_READ, VFS_LIBRARY_READ_MAX_BYTES, IPC_SERVICE_PAGERD,
+    IPC_SERVICE_NETD, VFS_REQUEST_FLAG_NETD_SOCKET_NODE,
 };
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
     WaitSetSignalBrokerArgs, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_PROVIDER_VFSD,
 };
-use storage_core::fs::{FsNodeKind, FsOpenOptions, FsTimestamp};
+use storage_core::fs::{FsCreateAttrs, FsMetadata, FsNodeKind, FsOpenOptions, FsTimestamp};
 use vfsd::mount_table::{
     cache_key_for_mount, parent_rel_path, read_volume_file_to_vec, CacheKey, MountTable,
     OpenNodeState, SharedBlockDevice,
@@ -94,10 +96,10 @@ use vfsd::checkpoint_wire::{
     copy_file_cache_range, waitset_interest_from_wire, CHECKPOINT_EPOLL_TAG,
 };
 use vfsd::{
-    cacheable_metadata_errno, checked_next_generation, checked_seek_position, checkpoint_path_key,
+    cacheable_metadata_errno, checked_seek_position, checkpoint_path_key,
     executable_snapshot_marker, executable_snapshot_resolution_base,
     reply_failure_diagnostic_due, should_materialize_file_cache,
-    ui_bootstrap_snapshot_reply_completed, unlink_policy, valid_checkpoint_record,
+    ui_bootstrap_snapshot_reply_completed, valid_checkpoint_record,
     ExecutableSnapshotBacking, OpenDescriptionCheckpointWire, SeekPositionError,
     WaitSetInterestKey, WaitSetInterestRecord, WaitSetRegistry, WaitSetRegistryError,
     FILE_BYTES_CACHE_BUDGET_BYTES, VFSD_CHECKPOINT_HANDLE_TAG, VFSD_OPEN_CHECKPOINT_VERSION,
@@ -152,6 +154,23 @@ pub(crate) const EROFS: i32 = 30;
 pub(crate) const ENOSYS: i32 = 38;
 pub(crate) const EOVERFLOW: i32 = 75;
 pub(crate) const EOPNOTSUPP: i32 = 95;
+pub(crate) const EPERM: i32 = 1;
+pub(crate) const ENXIO: i32 = 6;
+pub(crate) const ELOOP: i32 = vfsd::ELOOP;
+pub(crate) const ESTALE: i32 = 116;
+
+/// Filesystem timestamps use the same realtime domain as CLOCK_REALTIME.
+fn tmpfs_clock() -> FsTimestamp {
+    use rustos_svc_runtime::syscall::{self, KTimespec, SYS_CLOCK_GETTIME};
+    let mut ts = KTimespec::default();
+    // CLOCK_REALTIME is zero in the Linux ABI. The kernel writes one timespec.
+    let status = unsafe { syscall::syscall2(SYS_CLOCK_GETTIME, 0, (&mut ts as *mut KTimespec) as u64) };
+    if status != 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+        rustos_svc_runtime::ipc::debug_bytes(b"vfsd: fatal realtime clock unavailable\n");
+        syscall::exit_group(125);
+    }
+    FsTimestamp { secs: ts.tv_sec, nanos: ts.tv_nsec as u32 }
+}
 
 const fn max_usize(a: usize, b: usize) -> usize {
     if a > b {
@@ -233,6 +252,18 @@ fn vfs_request_identity_admitted(request: &VfsIpcRequest, sender_pid: u64, sende
         && rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_LINUX_SYSCALLD, sender_pid) >= 0
 }
 
+/// netd acts for the AF_UNIX path namespace with the binding caller's identity
+/// (see `vfsd::netd_namespace_admission`). The sender-owner proof costs a
+/// syscall, so it runs only for the marked requests and for `MKNOD` (rare).
+fn netd_namespace_request_admitted(request: &VfsIpcRequest) -> bool {
+    if request.flags & VFS_REQUEST_FLAG_NETD_SOCKET_NODE == 0 && request.op != VFS_IPC_OP_MKNOD {
+        return true;
+    }
+    let sender_is_netd =
+        rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_NETD, request.pid) >= 0;
+    vfsd::netd_namespace_admission(request, sender_is_netd).is_ok()
+}
+
 fn reset_vfs_response_slot(op: u16) -> *mut VfsIpcResponse {
     let response = core::ptr::addr_of_mut!(VFS_RESPONSE_SLOT);
     let ptr = response.cast::<u8>();
@@ -262,9 +293,13 @@ pub(crate) const DEFAULT_BLOCK_SIZE: u64 = 4096;
 pub(crate) const DT_REG: u8 = 8;
 pub(crate) const DT_DIR: u8 = 4;
 pub(crate) const DT_CHR: u8 = 2;
+pub(crate) const DT_LNK: u8 = 10;
+pub(crate) const DT_SOCK: u8 = 12;
 const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFCHR: u32 = 0o020000;
+const S_IFLNK: u32 = 0o120000;
+const S_IFSOCK: u32 = 0o140000;
 pub(crate) const BOOT_FILE_MODE_BITS: u32 = S_IFREG | 0o444;
 pub(crate) const BOOT_DIRECTORY_MODE_BITS: u32 = S_IFDIR | 0o555;
 pub(crate) const DEVICE_FILE_MODE_BITS: u32 = S_IFCHR | 0o600;
@@ -286,6 +321,7 @@ fn service_main() {
         ipc::debug_line("vfsd: checkpoint replay failed");
         return;
     }
+    lock_vfs_storage().ensure_tmpfs_mounts();
     let endpoint = ipc::endpoint_create_with_limits(VFS_RECV_BYTES as u64, 0);
     if endpoint < 0 {
         ipc::debug_line("vfsd: endpoint create failed");
@@ -418,7 +454,9 @@ fn serve(endpoint: u64, mut state: VfsState) {
                 // receive buffer and all-integer `repr(C)` layout as above.
                 let request = unsafe { &*request.as_ptr().cast::<VfsIpcRequest>() };
                 let response = reset_vfs_response_slot(request.op);
-                if !vfs_request_identity_admitted(request, sender_pid, sender_tid) {
+                if !vfs_request_identity_admitted(request, sender_pid, sender_tid)
+                    || !netd_namespace_request_admitted(request)
+                {
                     // SAFETY: `response` is the exclusive static slot just reset by
                     // reset_vfs_response_slot on this receive-owner thread.
                     unsafe { (*response).status = EACCES };
@@ -647,6 +685,11 @@ impl VfsState {
         // The count is kernel-written; never let it index past the local buffer.
         for event in &events[..(count as usize).min(LIFECYCLE_DRAIN_MAX_EVENTS)] {
             vfsd::lifecycle::apply_lifecycle_event(&mut self.cwd, event);
+            // POSIX record locks die with the process (the exit is queued
+            // before its pid can be reused, so this never hits a successor).
+            if event.event == rustos_user_abi::syscall::LIFECYCLE_EVENT_EXIT && event.pid != 0 {
+                self.locks.release_process(event.pid);
+            }
         }
     }
 }
@@ -658,6 +701,10 @@ struct VfsState {
     cwd: BTreeMap<u64, String>,
     handles: BTreeMap<u64, RemoteHandle>,
     epolls: WaitSetRegistry,
+    /// Advisory file locks (`VFS_IPC_OP_FILE_LOCK`). Not checkpointed: locks
+    /// die with a vfsd restart exactly as the kernel would drop them with the
+    /// descriptions, and clients re-take them after reopening.
+    locks: vfsd::locks::LockTable,
     checkpoint_revisions: BTreeMap<CheckpointRevisionKey, u64>,
     checkpoint_operations: BTreeMap<CheckpointRevisionKey, (u64, u64)>,
     checkpoint_records: BTreeMap<CheckpointRevisionKey, ServiceCheckpointRecordWire>,
@@ -668,11 +715,16 @@ struct VfsState {
 #[derive(Clone)]
 struct RemoteHandle {
     checkpoint_version: u16,
+    /// Volatile inode identity was lost when the service restarted.
+    stale: bool,
     kind: RemoteKind,
     mount_id: u64,
     writable: bool,
     append: bool,
     path: String,
+    /// Pinned volume node id for memory-filesystem opens (`0` = path based).
+    /// Not checkpointed: a restarted vfsd has lost the memory filesystem.
+    node: u64,
     cursor: u64,
     len: u64,
     refs: u64,
@@ -682,11 +734,34 @@ struct RemoteHandle {
     last_result: u64,
 }
 
+/// What `VFS_IPC_OP_SET_ATTRS` addresses: a resolved path, or the pinned node
+/// of an open description (which still exists after unlink).
+#[derive(Clone, Copy)]
+enum AttrTarget<'a> {
+    Path(&'a str),
+    Node(u64, u64),
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum RemoteKind {
     File,
     Directory,
     Device,
+    /// Memory-filesystem symlink; only ever stat'ed/listed, never a handle.
+    Symlink,
+    /// Memory-filesystem socket inode; only ever stat'ed/listed, never a handle.
+    Socket,
+}
+
+impl RemoteKind {
+    pub(crate) fn from_fs(kind: FsNodeKind) -> Self {
+        match kind {
+            FsNodeKind::File => RemoteKind::File,
+            FsNodeKind::Directory => RemoteKind::Directory,
+            FsNodeKind::Symlink => RemoteKind::Symlink,
+            FsNodeKind::Socket => RemoteKind::Socket,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -694,6 +769,23 @@ pub(crate) struct Metadata {
     pub(crate) kind: RemoteKind,
     pub(crate) len: u64,
     pub(crate) inode: u64,
+    /// Volume-reported POSIX attributes (mode, owner, nlink, times) for a
+    /// memory-filesystem node; `None` keeps the boot-volume defaults.
+    pub(crate) fs: Option<FsMetadata>,
+    /// `st_dev` of the owning mount (`0` for virtual and boot-volume nodes).
+    pub(crate) dev: u64,
+}
+
+impl Metadata {
+    pub(crate) const fn plain(kind: RemoteKind, len: u64, inode: u64) -> Self {
+        Self {
+            kind,
+            len,
+            inode,
+            fs: None,
+            dev: 0,
+        }
+    }
 }
 
 use storage_owner::{
@@ -705,6 +797,7 @@ mod provider_accounting;
 include!("state_checkpoint.rs");
 include!("state_requests.rs");
 include!("state_files.rs");
+include!("state_locks.rs");
 include!("state_storage.rs");
 
 fn duplicate_snapshot_fd(fd: i32) -> Result<i32, i32> {
@@ -1090,10 +1183,7 @@ impl DirEntry {
     fn from_fs(entry: storage_core::fs::FsDirEntry) -> Self {
         Self {
             name: entry.name,
-            kind: match entry.kind {
-                FsNodeKind::File | FsNodeKind::Symlink => RemoteKind::File,
-                FsNodeKind::Directory => RemoteKind::Directory,
-            },
+            kind: RemoteKind::from_fs(entry.kind),
         }
     }
 }

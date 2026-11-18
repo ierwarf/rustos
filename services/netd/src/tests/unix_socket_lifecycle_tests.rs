@@ -2,6 +2,7 @@ use super::*;
 
 fn connected_socket(peer: u64, pending_listener: Option<u64>) -> UnixSocket {
     UnixSocket {
+        kind: UnixSocketKind::Stream,
         owner: Credentials::default(),
         refs: 1,
         options: SocketOptions::default(),

@@ -516,7 +516,7 @@ fn linux_rt_sigframe_info_offset() -> usize {
     core::mem::offset_of!(LinuxRtSigFrame, info)
 }
 
-fn clear_current_pending_signal(signal: u64, selected_sigchld_events: u32) {
+pub(super) fn clear_current_pending_signal(signal: u64, selected_sigchld_events: u32) {
     let Some(bit) = crate::user::sysops::linux::linux_signal_bit(signal) else {
         return;
     };

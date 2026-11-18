@@ -2,6 +2,7 @@ mod block_broker_ops;
 mod broker_ops;
 mod debug_ops;
 mod dispatch_ext;
+mod file_lock_ops;
 pub(super) mod error_ops;
 mod int_args;
 mod process_termination;
@@ -14,10 +15,13 @@ mod ipc_profile;
 pub(crate) mod ipc_server_profile;
 mod memory_ops;
 mod mm_broker_ops;
+mod mm_query_ops;
 mod mm_request_lease;
+mod openat_flags_ops;
 pub(crate) mod offload_ops;
 mod pager_fault_ops;
 mod prctl_ops;
+mod process_ext_ops;
 mod frame_source_ops;
 mod library_map_probe_ops;
 mod library_object_ops;
@@ -43,9 +47,12 @@ use debug_ops::*;
 use error_ops::*;
 use memory_ops::*;
 use mm_broker_ops::*;
+use mm_query_ops::*;
+use openat_flags_ops::syscall_linux_openat;
 use pager_fault_ops::*;
 use proc_broker_ops::syscall_linux_rustos_proc_activate_batch_broker as proc_activate_batch;
 use proc_broker_ops::*;
+use process_ext_ops::*;
 use scheduler_ops::*;
 use service_ops::*;
 use smp_qualification_ops::*;
@@ -389,9 +396,7 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_KILL => syscall_linux_kill(frame.rdi, frame.rsi),
         linux_abi::SYS_TKILL => syscall_linux_tkill(frame.rdi, frame.rsi),
         linux_abi::SYS_TGKILL => syscall_linux_tgkill(frame.rdi, frame.rsi, frame.rdx),
-        linux_abi::SYS_OPENAT => {
-            syscall_linux_vfs_openat(frame.rdi, frame.rsi, frame.rdx, frame.r10)
-        }
+        linux_abi::SYS_OPENAT => syscall_linux_openat(frame.rdi, frame.rsi, frame.rdx, frame.r10),
         linux_abi::SYS_UNLINKAT => syscall_linux_vfs_unlinkat(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_SOCKETPAIR => syscall_linux_net4(
             SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,

@@ -93,12 +93,28 @@ pub(super) fn handle_recv(request: &NetdIpcRequest, response: &mut NetdIpcRespon
     if request.op == SYSCALL_OFFLOAD_OP_LINUX_RECVMSG {
         return recvmsg_in_state(&mut state, request, response);
     }
-    if request_msg_flags(request) & libc::MSG_PEEK as u64 != 0 {
+    let kind = state.sockets.get(&request.socket_token).map(|socket| socket.kind);
+    if kind == Some(UnixSocketKind::Netlink) {
+        return netlink::handle_recv(&mut state, request, response);
+    }
+    let seqpacket = kind == Some(UnixSocketKind::SeqPacket);
+    let flags = request_msg_flags(request);
+    if flags & libc::MSG_PEEK as u64 != 0 {
         let requested = usize::try_from(request.arg2).unwrap_or(usize::MAX);
         let limit = requested.min(response.payload.len() - SOCKET_CONTROL_BUFFER_CAPACITY);
-        return match peek_connected_bytes(&state, request.socket_token, &mut response.payload[..limit]) {
-            Ok((read, _)) => {
-                response.value = read as u64;
+        let peeked = if seqpacket {
+            unix_seqpacket::peek_message(&state, request.socket_token, &mut response.payload[..limit])
+        } else {
+            peek_connected_bytes(&state, request.socket_token, &mut response.payload[..limit])
+                .map(|(read, control)| (read, control, read))
+        };
+        return match peeked {
+            Ok((read, _, total)) => {
+                response.value = if seqpacket && flags & libc::MSG_TRUNC as u64 != 0 {
+                    total as u64
+                } else {
+                    read as u64
+                };
                 response.payload_len = read as u32;
                 response.reserved0 = 0;
                 0
@@ -108,12 +124,8 @@ pub(super) fn handle_recv(request: &NetdIpcRequest, response: &mut NetdIpcRespon
     }
     let requested = usize::try_from(request.arg2).unwrap_or(usize::MAX);
     let limit = requested.min(response.payload.len() - SOCKET_CONTROL_BUFFER_CAPACITY);
-    let outcome = if limit == 0 {
-        Ok(SocketReceive {
-            read: 0,
-            control: Vec::new(),
-            discarded: Vec::new(),
-        })
+    let outcome = if limit == 0 && !seqpacket {
+        Ok(SocketReceive::default())
     } else {
         recv_socket_bytes_in_state(&mut state, request, &mut response.payload[..limit], false)
     };
@@ -124,7 +136,10 @@ pub(super) fn handle_recv(request: &NetdIpcRequest, response: &mut NetdIpcRespon
             response.payload[release_start..release_end]
                 .copy_from_slice(received.discarded.as_slice());
             response.reserved0 = received.discarded.len() as u32;
-            response.value = received.read as u64;
+            let (value, extra) = unix_seqpacket::receive_accounting(flags, &received);
+            response.value = value;
+            response.discarded_tail = extra;
+            if received.record_present { response.reserved1 |= NETD_IPC_RESPONSE_FLAG_RECORD_PRESENT; }
             response.payload_len = release_end as u32;
             0
         }
@@ -137,25 +152,50 @@ pub(super) fn recvmsg_in_state(
     request: &NetdIpcRequest,
     response: &mut NetdIpcResponse,
 ) -> i32 {
-    if request_msg_flags(request) & libc::MSG_PEEK as u64 != 0 {
+    let flags = request_msg_flags(request);
+    let Some(kind) = state.sockets.get(&request.socket_token).map(|socket| socket.kind) else {
+        return libc::EBADF;
+    };
+    if kind == UnixSocketKind::Netlink {
+        return netlink::handle_recvmsg(state, request, response);
+    }
+    let seqpacket = kind.preserves_message_boundaries();
+    if flags & libc::MSG_PEEK as u64 != 0 {
         let requested = request.payload_len as usize;
         let room = response.payload.len() - NETD_RECVMSG_PAYLOAD_HEADER_SIZE;
         let data_end = NETD_RECVMSG_PAYLOAD_HEADER_SIZE + requested.min(room);
-        return match peek_connected_bytes(
-            state,
-            request.socket_token,
-            &mut response.payload[NETD_RECVMSG_PAYLOAD_HEADER_SIZE..data_end],
-        ) {
-            Ok((read, control_present)) => {
+        let peeked = if seqpacket {
+            unix_seqpacket::peek_message(
+                state,
+                request.socket_token,
+                &mut response.payload[NETD_RECVMSG_PAYLOAD_HEADER_SIZE..data_end],
+            )
+        } else {
+            peek_connected_bytes(
+                state,
+                request.socket_token,
+                &mut response.payload[NETD_RECVMSG_PAYLOAD_HEADER_SIZE..data_end],
+            )
+            .map(|(read, control)| (read, control, read))
+        };
+        return match peeked {
+            Ok((read, control_present, total)) => {
                 // Ancillary custody (SCM_RIGHTS) cannot be duplicated by a
                 // peek; report it as truncated and leave it queued.
-                let flags = if control_present { libc::MSG_CTRUNC as u32 } else { 0 };
+                let mut msg_flags = if control_present { libc::MSG_CTRUNC as u32 } else { 0 };
+                if total > read {
+                    msg_flags |= libc::MSG_TRUNC as u32;
+                }
                 response.payload[0..4].copy_from_slice(&(read as u32).to_ne_bytes());
                 response.payload[4..8].copy_from_slice(&0_u32.to_ne_bytes());
-                response.payload[8..12].copy_from_slice(&flags.to_ne_bytes());
+                response.payload[8..12].copy_from_slice(&msg_flags.to_ne_bytes());
                 response.payload[12..16].copy_from_slice(&0_u32.to_ne_bytes());
                 response.payload_len = (NETD_RECVMSG_PAYLOAD_HEADER_SIZE + read) as u32;
-                response.value = read as u64;
+                response.value = if seqpacket && flags & libc::MSG_TRUNC as u64 != 0 {
+                    total as u64
+                } else {
+                    read as u64
+                };
                 0
             }
             Err(errno) => errno,
@@ -172,7 +212,8 @@ pub(super) fn recvmsg_in_state(
         .options
         .passcred
         .then_some(connected.peer_credentials);
-    let control_len = pending_recvmsg_control_len(connected, requested, credentials.is_some());
+    let control_len =
+        pending_recvmsg_control_len(connected, requested, credentials.is_some(), seqpacket);
     // Preflight the whole reply before moving bytes or ancillary custody. The
     // same state transaction owns options, queue selection, dequeue and encode.
     let Some(available) = response
@@ -187,16 +228,21 @@ pub(super) fn recvmsg_in_state(
     let data_end = data_start + requested.min(available);
     match recv_socket_bytes_in_state(state,request,&mut response.payload[data_start..data_end],true) {
         Ok(received) => {
+            let (value, extra) = unix_seqpacket::receive_accounting(flags, &received);
+            let truncated = received.truncated;
             let control = append_recvmsg_credentials(credentials, received.control);
             let control_start = data_start + received.read;
             let control_end = control_start + control.len();
             response.payload[control_start..control_end].copy_from_slice(&control);
             response.payload[0..4].copy_from_slice(&(received.read as u32).to_ne_bytes());
             response.payload[4..8].copy_from_slice(&(control.len() as u32).to_ne_bytes());
-            response.payload[8..12].copy_from_slice(&0_u32.to_ne_bytes());
+            let msg_flags = if truncated { libc::MSG_TRUNC as u32 } else { 0 };
+            response.payload[8..12].copy_from_slice(&msg_flags.to_ne_bytes());
             response.payload[12..16].copy_from_slice(&0_u32.to_ne_bytes());
             response.payload_len = control_end as u32;
-            response.value = received.read as u64;
+            response.value = value;
+            response.discarded_tail = extra;
+            if received.record_present { response.reserved1 |= NETD_IPC_RESPONSE_FLAG_RECORD_PRESENT; }
             0
         }
         Err(errno) => errno,
@@ -209,8 +255,16 @@ pub(super) fn send_socket_message_in_state(
     bytes: &[u8],
     control: &[u8],
 ) -> Result<usize, i32> {
-    if bytes.is_empty() {
+    let kind = state.sockets.get(&request.socket_token).map(|socket| socket.kind);
+    if kind == Some(UnixSocketKind::Netlink) {
+        return netlink::send_message(state, request, bytes, control);
+    }
+    let seqpacket = kind.is_some_and(UnixSocketKind::preserves_message_boundaries);
+    if bytes.is_empty() && !seqpacket {
         return Ok(0);
+    }
+    if seqpacket {
+        unix_seqpacket::validate_send(bytes, control)?;
     }
     let peer = {
         let socket = state
@@ -261,8 +315,14 @@ pub(super) fn send_socket_message_in_state(
     if peer_connected.recv_closed {
         return Err(libc::EPIPE);
     }
-    let room = SOCKET_BUFFER_CAPACITY.saturating_sub(peer_connected.incoming_bytes).min(global_room);
-    if room == 0 {
+    let limit = if seqpacket { (peer_socket.options.recv_buffer as usize).min(SOCKET_BUFFER_CAPACITY) } else { SOCKET_BUFFER_CAPACITY };
+    let room = limit.saturating_sub(peer_connected.incoming_bytes).min(global_room);
+    if seqpacket {
+        // A message is delivered whole or not at all.
+        if room < bytes.len() || peer_connected.incoming.len() >= SEQPACKET_MAX_QUEUED_MESSAGES {
+            return Err(libc::EAGAIN);
+        }
+    } else if room == 0 {
         return Err(libc::EAGAIN);
     }
     if !control.is_empty() && room < bytes.len() {
@@ -287,7 +347,7 @@ pub(super) fn send_socket_message_in_state(
     // extends the tail segment. Without this, one-byte sends would cost a
     // heap segment each (up to SOCKET_BUFFER_CAPACITY of them per socket).
     match peer_connected.incoming.back_mut() {
-        Some(tail) if control.is_empty() => tail.bytes.extend(&bytes[..write_len]),
+        Some(tail) if control.is_empty() && !seqpacket => tail.bytes.extend(&bytes[..write_len]),
         _ => peer_connected.incoming.push_back(UnixStreamSegment {
             bytes: bytes[..write_len].iter().copied().collect(),
             control: control.to_vec(),
@@ -304,11 +364,7 @@ pub(super) fn recv_socket_bytes(
     collect_control: bool,
 ) -> Result<SocketReceive, i32> {
     if dest.is_empty() {
-        return Ok(SocketReceive {
-            read: 0,
-            control: Vec::new(),
-            discarded: Vec::new(),
-        });
+        return Ok(SocketReceive::default());
     }
     let mut state = lock_net_state();
     recv_socket_bytes_in_state(&mut state,request,dest,collect_control)
@@ -324,11 +380,16 @@ pub(super) fn recv_socket_bytes_in_state(
         .sockets
         .get_mut(&request.socket_token)
         .ok_or(libc::EBADF)?;
+    let seqpacket = socket.kind.preserves_message_boundaries();
     let UnixSocketState::Connected(connected) = &mut socket.state else {
         return Err(libc::ENOTCONN);
     };
     let before = connected.incoming_bytes + connected.incoming_control_bytes;
-    let result = recv_connected_bytes(connected, dest, collect_control);
+    let result = if seqpacket {
+        unix_seqpacket::recv_message(connected, dest, collect_control)
+    } else {
+        recv_connected_bytes(connected, dest, collect_control)
+    };
     let consumed = before - (connected.incoming_bytes + connected.incoming_control_bytes);
     state.release_unix_queued_bytes(consumed);
     result
@@ -340,19 +401,11 @@ pub(super) fn recv_connected_bytes(
     collect_control: bool,
 ) -> Result<SocketReceive, i32> {
     if dest.is_empty() {
-        return Ok(SocketReceive {
-            read: 0,
-            control: Vec::new(),
-            discarded: Vec::new(),
-        });
+        return Ok(SocketReceive::default());
     }
     if connected.incoming_bytes == 0 {
         if connected.peer_closed || connected.peer_write_closed {
-            return Ok(SocketReceive {
-                read: 0,
-                control: Vec::new(),
-                discarded: Vec::new(),
-            });
+            return Ok(SocketReceive::default());
         }
         return Err(libc::EAGAIN);
     }
@@ -399,6 +452,7 @@ pub(super) fn recv_connected_bytes(
         read,
         control,
         discarded,
+        ..SocketReceive::default()
     })
 }
 
@@ -440,15 +494,21 @@ pub(super) fn pending_recvmsg_control_len(
     connected: &ConnectedState,
     requested: usize,
     passcred: bool,
+    seqpacket: bool,
 ) -> usize {
     let mut remaining = requested;
     let mut queued_len = 0usize;
     for segment in &connected.incoming {
-        if remaining == 0 {
+        // A message receive dequeues exactly the front message, even for a
+        // zero-length buffer.
+        if remaining == 0 && !seqpacket {
             break;
         }
         if !segment.control.is_empty() {
             queued_len = segment.control.len();
+            break;
+        }
+        if seqpacket {
             break;
         }
         remaining = remaining.saturating_sub(segment.bytes.len());

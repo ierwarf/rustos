@@ -68,11 +68,34 @@ struct MemfdState {
     writable_mapping_count: usize,
 }
 
+/// Marks a memfd that is really a generated `/proc/<pid>/...` snapshot. The
+/// object is created fully sealed and is never mappable, so the bytes are the
+/// frozen view taken at `open`. `link` is what `readlink(/proc/self/fd/N)`
+/// reports (the procfs path, not a memfd name) and `directory` selects
+/// `S_IFDIR` stat and `getdents64` service.
+#[derive(Debug)]
+struct ProcSnapshotTag {
+    link: String,
+    directory: bool,
+    ino: u64,
+}
+
+/// What a procfs snapshot memfd reports about itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcSnapshotInfo {
+    /// `readlink(/proc/self/fd/N)` result.
+    pub link: String,
+    pub directory: bool,
+    /// Stable inode of the procfs node (the same value `statx(path)` reports).
+    pub ino: u64,
+}
+
 #[derive(Debug)]
 struct MemfdObject {
     object_id: u64,
     /// Resident-page charge group of the creating Job; immutable for life.
     charge_group: Option<usize>,
+    proc_snapshot: Option<ProcSnapshotTag>,
     state: Mutex<MemfdState>,
 }
 
@@ -113,6 +136,7 @@ impl MemfdHandle {
         let object = Arc::new(MemfdObject {
             object_id: allocate_memfd_object_id(),
             charge_group,
+            proc_snapshot: None,
             state: Mutex::new(MemfdState {
                 name,
                 len: 0,
@@ -127,6 +151,58 @@ impl MemfdHandle {
         }
     }
 
+    /// Creates the frozen backing of a generated procfs file or directory.
+    /// `bytes` is written once, then every seal is applied, so the object can
+    /// never change or be mapped. Pages are charged to `charge_group` like any
+    /// memfd. Nothing is retained on failure.
+    pub fn new_proc_snapshot(
+        link: String,
+        directory: bool,
+        ino: u64,
+        bytes: &[u8],
+        charge_group: Option<usize>,
+    ) -> Result<Self, MemfdError> {
+        if let Some(group) = charge_group {
+            kernel_mm::api::charge::retain(group);
+        }
+        let object = Arc::new(MemfdObject {
+            object_id: allocate_memfd_object_id(),
+            charge_group,
+            proc_snapshot: Some(ProcSnapshotTag { link, directory, ino }),
+            state: Mutex::new(MemfdState {
+                name: String::from("proc"),
+                len: 0,
+                frames: Vec::new(),
+                seals: 0,
+                mapping_count: 0,
+                writable_mapping_count: 0,
+            }),
+        });
+        write_at_object(&object, 0, bytes)?;
+        object.state.lock().seals = (linux_abi::F_SEAL_SEAL
+            | linux_abi::F_SEAL_SHRINK
+            | linux_abi::F_SEAL_GROW
+            | linux_abi::F_SEAL_WRITE
+            | linux_abi::F_SEAL_FUTURE_WRITE) as u32;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(MemfdOpenState { object, cursor: 0 })),
+        })
+    }
+
+    /// Identity of a procfs snapshot, or `None` for an ordinary memfd.
+    pub fn proc_snapshot(&self) -> Option<ProcSnapshotInfo> {
+        self.object().proc_snapshot.as_ref().map(|tag| ProcSnapshotInfo {
+            link: tag.link.clone(),
+            directory: tag.directory,
+            ino: tag.ino,
+        })
+    }
+
+    /// Current read position of this open description.
+    pub fn cursor(&self) -> usize {
+        self.inner.lock().cursor
+    }
+
     /// Creates a distinct open description backed by the same shared object.
     pub fn reopen(&self) -> Self {
         let object = self.object();
@@ -137,6 +213,9 @@ impl MemfdHandle {
 
     pub fn path(&self) -> String {
         let object = self.object();
+        if let Some(tag) = object.proc_snapshot.as_ref() {
+            return tag.link.clone();
+        }
         let state = object.state.lock();
         alloc::format!("anon_inode:[memfd:{}]", state.name)
     }
@@ -151,6 +230,14 @@ impl MemfdHandle {
 
     pub fn token_id(&self) -> u64 {
         Arc::as_ptr(&self.inner) as usize as u64
+    }
+
+    /// Identity of the shared object behind this open description: the same
+    /// for every `dup`, `reopen` and mapping of one memfd, distinct between
+    /// memfds even when they share a name, and never recycled. This is the
+    /// `st_ino` of the file; `token_id` names only the open description.
+    pub fn object_id(&self) -> u64 {
+        self.object().object_id
     }
 
     pub fn read_into(&mut self, dest: &mut [u8]) -> usize {
@@ -291,6 +378,10 @@ impl MemfdHandle {
         }
 
         let object = self.object();
+        // procfs files are not mappable (Linux answers ENODEV).
+        if object.proc_snapshot.is_some() {
+            return Err(MemfdError::InvalidArgument);
+        }
         let mut state = object.state.lock();
         let end = offset.checked_add(len).ok_or(MemfdError::InvalidArgument)?;
         let mapped_len = align_up_len(state.len).ok_or(MemfdError::InvalidArgument)?;
@@ -691,6 +782,7 @@ mod tests {
         MemfdObject {
             object_id: 1,
             charge_group: None,
+            proc_snapshot: None,
             state: Mutex::new(MemfdState {
                 name: String::from("test"),
                 len: 0,
@@ -873,6 +965,51 @@ mod tests {
         );
         assert_eq!(reopened.add_seals(linux_abi::F_SEAL_SHRINK as u32), Ok(()));
         assert_eq!(primary.seals(), reopened.seals());
+    }
+
+    #[test]
+    fn proc_snapshot_is_frozen_unmappable_and_reports_its_link() {
+        // Host tests have no direct map behind fake frames, so content I/O is
+        // exercised in the kernel-compat formatter tests; this covers the
+        // sealing, identity and mapping rules.
+        fake_reset(usize::MAX);
+        let handle =
+            MemfdHandle::new_proc_snapshot(String::from("/proc/7/maps"), false, 99, b"", None)
+                .unwrap();
+        assert_eq!(handle.path(), "/proc/7/maps");
+        assert_eq!(
+            handle.proc_snapshot(),
+            Some(ProcSnapshotInfo {
+                link: String::from("/proc/7/maps"),
+                directory: false,
+                ino: 99,
+            })
+        );
+        assert_eq!(handle.len(), 0);
+        assert_eq!(handle.write_at(0, b"x"), Err(MemfdError::PermissionDenied));
+        assert_eq!(handle.truncate(PAGE_SIZE), Err(MemfdError::PermissionDenied));
+        assert_eq!(
+            handle.add_seals(linux_abi::F_SEAL_WRITE as u32),
+            Err(MemfdError::PermissionDenied)
+        );
+        assert_eq!(
+            handle.acquire_mapping(0, PAGE_SIZE, false).err(),
+            Some(MemfdError::InvalidArgument)
+        );
+        let again = handle.reopen();
+        assert_eq!(
+            again.proc_snapshot().map(|info| info.link),
+            Some(String::from("/proc/7/maps"))
+        );
+        assert_eq!(again.object_id(), handle.object_id());
+        assert_eq!(again.cursor(), 0);
+        let dir = MemfdHandle::new_proc_snapshot(String::from("/proc/7/fd"), true, 5, b"", None)
+            .unwrap();
+        assert!(dir.proc_snapshot().unwrap().directory);
+        assert_eq!(
+            MemfdHandle::new(String::from("m"), true, None).proc_snapshot(),
+            None
+        );
     }
 
     #[test]

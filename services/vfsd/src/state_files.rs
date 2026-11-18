@@ -9,14 +9,32 @@ impl VfsState {
         // Absolute paths are canonicalized too: the open-description path is
         // the key for device routing, caches and checkpoint replay, so a raw
         // `/dev/../x` or `//x` must never become a handle path.
-        let resolved_path = match self.resolve_path(request, request.pid, request.dirfd, path) {
-            Ok(path) => path,
-            Err(errno) => {
-                response.status = errno;
+        // `O_NOFOLLOW` and `O_CREAT|O_EXCL` keep a trailing symlink as the
+        // opened (or colliding) name instead of following it.
+        const O_NOFOLLOW: u64 = 0o400_000;
+        let follow_last = request.arg0 & O_NOFOLLOW == 0
+            && request.arg0 & (linux_abi::O_CREAT | linux_abi::O_EXCL)
+                != (linux_abi::O_CREAT | linux_abi::O_EXCL);
+        let resolved_path =
+            match self.resolve_path_follow(request, request.dirfd, path, follow_last) {
+                Ok(path) => path,
+                Err(errno) => {
+                    response.status = errno;
+                    return;
+                }
+            };
+        let path = resolved_path.as_str();
+        // Kernel-fact `/proc/<pid>` nodes have no vfsd-side description: the
+        // kernel builds a snapshot for the caller and holds it locally.
+        if let Some(Ok(node)) = vfsd::proc_fs::lookup(path, request.pid) {
+            if let Some(aux) = vfsd::proc_fs::open_delegate(node) {
+                match vfsd::proc_fs::delegated_open_errno(node, request.arg0) {
+                    Some(errno) => response.status = errno,
+                    None => response.aux = aux,
+                }
                 return;
             }
-        };
-        let path = resolved_path.as_str();
+        }
         match self.open_remote_checkpointed(request, path, request.arg0) {
             Ok((id, handle)) => {
                 response.remote_id = id;
@@ -67,7 +85,11 @@ impl VfsState {
         match self.checkpoint_close_description(request, request.remote_id) {
             Ok(_) => {
                 if let Some(closed) = self.handles.remove(&request.remote_id) {
-                    if closed.mount_id != 0 {
+                    // Final close of the description: its OFD and flock locks.
+                    self.locks.release_description(request.remote_id);
+                    if closed.node != 0 {
+                        lock_vfs_storage().unpin_node(closed.mount_id, closed.node);
+                    } else if closed.mount_id != 0 {
                         lock_vfs_storage().note_close_node(closed.path.as_str());
                     }
                 }
@@ -117,10 +139,18 @@ impl VfsState {
             response.status = EBUSY;
             return;
         }
-        let file_len = if handle.kind == RemoteKind::File {
-            lock_vfs_storage().live_len_for_path(handle.path.as_str(), handle.len)
-        } else {
+        let file_len = if handle.kind != RemoteKind::File {
             handle.len
+        } else if handle.node != 0 {
+            match lock_vfs_storage().node_len(handle.mount_id, handle.node) {
+                Some(len) => len,
+                None => {
+                    response.status = ESTALE;
+                    return;
+                }
+            }
+        } else {
+            lock_vfs_storage().live_len_for_path(handle.path.as_str(), handle.len)
         };
         let next = match checked_seek_position(
             handle.cursor,
@@ -254,6 +284,27 @@ impl VfsState {
             return;
         }
         let (path, len) = (handle.path.clone(), handle.len);
+        if handle.node != 0 {
+            let (mount_id, node) = (handle.mount_id, handle.node);
+            let storage = lock_vfs_storage();
+            let Some(len) = storage.node_len(mount_id, node) else {
+                response.status = ESTALE;
+                return;
+            };
+            let bytes = VfsFileIdentityWire {
+                volume: mount_id,
+                object: node,
+                generation: storage.mount_generation,
+                storage_epoch: 0,
+                mount_generation: storage.mount_generation,
+                len,
+                flags: VFS_FILE_IDENTITY_FLAG_MUTABLE_VOLUME,
+            }
+            .to_bytes();
+            response.payload[..bytes.len()].copy_from_slice(&bytes);
+            response.payload_len = bytes.len() as u32;
+            return;
+        }
         match lock_vfs_storage().file_identity(path.as_str(), len) {
             Ok(identity) => {
                 let bytes = identity.to_bytes();
@@ -269,16 +320,23 @@ impl VfsState {
             response.status = EBADF;
             return;
         };
+        if handle.node != 0 {
+            match lock_vfs_storage().node_metadata(handle.mount_id, handle.node) {
+                Ok(metadata) => {
+                    response.payload_len = LINUX_STAT_SIZE as u32;
+                    response.payload[..LINUX_STAT_SIZE]
+                        .copy_from_slice(&build_linux_stat(metadata));
+                }
+                Err(errno) => response.status = errno,
+            }
+            return;
+        }
         let (len, inode) = if handle.kind == RemoteKind::File {
             lock_vfs_storage().live_stat_for_path(handle.path.as_str(), handle.len)
         } else {
             (handle.len, path_inode(handle.path.as_bytes()))
         };
-        let stat = build_linux_stat(Metadata {
-            kind: handle.kind,
-            len,
-            inode,
-        });
+        let stat = build_linux_stat(Metadata::plain(handle.kind, len, inode));
         response.payload_len = LINUX_STAT_SIZE as u32;
         response.payload[..LINUX_STAT_SIZE].copy_from_slice(&stat);
     }
@@ -382,6 +440,9 @@ impl VfsState {
             return;
         }
         match request.arg0 {
+            // Private VFS operation, not a Linux fcntl command. The kernel
+            // supplies an existing funded description and a fresh remote id.
+            0x5255_0001 => self.vfs_reopen_description(request, response, &handle),
             linux_abi::F_GETFL => response.value = handle.status_flags,
             linux_abi::F_SETFL => {
                 if self.checkpoint_operation_replayed(
@@ -420,6 +481,85 @@ impl VfsState {
                 self.handles.insert(request.remote_id, candidate);
             }
             _ => response.status = EINVAL,
+        }
+    }
+
+    fn vfs_reopen_description(
+        &mut self,
+        request: &VfsIpcRequest,
+        response: &mut VfsIpcResponse,
+        source: &RemoteHandle,
+    ) {
+        let flags = request.arg1;
+        let id = request.arg2;
+        let allowed = linux_abi::O_ACCMODE | linux_abi::O_APPEND | linux_abi::O_NONBLOCK
+            | linux_abi::O_CLOEXEC | linux_abi::O_DIRECTORY | 0o100000;
+        if id == 0 || id == request.remote_id || request.arg3 != 0 || flags & !allowed != 0 {
+            response.status = EINVAL;
+            return;
+        }
+        let access = flags & linux_abi::O_ACCMODE;
+        let original = source.status_flags & linux_abi::O_ACCMODE;
+        if access > linux_abi::O_RDWR
+            || (access != linux_abi::O_WRONLY && original == linux_abi::O_WRONLY)
+            || (access != linux_abi::O_RDONLY && original == linux_abi::O_RDONLY)
+        {
+            response.status = EACCES;
+            return;
+        }
+        if source.node == 0 {
+            response.status = EOPNOTSUPP;
+            return;
+        }
+        let metadata = match lock_vfs_storage().node_metadata(source.mount_id, source.node) {
+            Ok(metadata) => metadata,
+            Err(errno) => { response.status = errno; return; }
+        };
+        let needed = (if access != linux_abi::O_WRONLY { 4 } else { 0 })
+            | (if access != linux_abi::O_RDONLY { 2 } else { 0 });
+        if let Err(errno) = check_metadata_permission(metadata, request, needed, false) {
+            response.status = errno; return;
+        }
+        // Checkpoint records encode OPEN's flags in arg0; retain the same
+        // suboperation token while using the requested flags for this record.
+        let mut open_request = *request;
+        open_request.arg0 = flags;
+        let result = if let Some(existing) = self.handles.get(&id).cloned() {
+            let chunks = existing.path.len().div_ceil(SERVICE_CHECKPOINT_VALUE_CAPACITY);
+            let operation = checkpoint_suboperation(&open_request, chunks as u64 + 1);
+            let record = self.checkpoint_records.get(&checkpoint_handle_key(id));
+            if existing.stale || existing.mount_id != source.mount_id || existing.node != source.node
+                || existing.status_flags != flags & !linux_abi::O_CLOEXEC
+                || record.is_none_or(|r| (r.operation_hi, r.operation_lo) != operation)
+            {
+                Err(EINVAL)
+            } else {
+                Ok((id, existing))
+            }
+        } else {
+            let retained = lock_vfs_storage().node_volume(source.mount_id)
+                .and_then(|volume| volume.retain_node_id(source.node).map_err(vfsd::map_fs_error));
+            match retained {
+                Err(errno) => Err(errno),
+                Ok(()) => {
+                    let opened = self.publish_open_handle(&open_request, id, &source.path, flags,
+                        metadata, (source.mount_id, source.node), false, false);
+                    if opened.is_err() {
+                        lock_vfs_storage().unpin_node(source.mount_id, source.node);
+                    }
+                    opened
+                }
+            }
+        };
+        match result {
+            Ok((id, handle)) => {
+                response.remote_id = id;
+                response.handle_kind = handle_kind_u16(handle.kind);
+                response.aux = device_access_for_path(&handle.path);
+                write_vfs_payload_bytes(response, handle.path.as_bytes());
+                response.value = handle.len;
+            }
+            Err(errno) => response.status = errno,
         }
     }
 
@@ -524,7 +664,7 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        let path = match self.resolve_path(request, request.pid, request.dirfd, path) {
+        let path = match self.resolve_path_follow(request, request.dirfd, path, request.flags & 0x100 == 0) {
             Ok(path) => path,
             Err(errno) => {
                 response.status = errno;
@@ -539,6 +679,12 @@ impl VfsState {
                 let statx = build_linux_statx(metadata);
                 response.payload_len = LINUX_STATX_SIZE as u32;
                 response.payload[..LINUX_STATX_SIZE].copy_from_slice(&statx);
+                if request.flags & rustos_user_abi::syscall::VFS_REQUEST_FLAG_NETD_SOCKET_NODE != 0 {
+                    if let Some(fs) = metadata.fs {
+                        response.value = metadata.dev;
+                        response.aux = fs.node_id;
+                    }
+                }
             }
             Err(errno) => response.status = errno,
         }
@@ -549,7 +695,7 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        let path = match self.resolve_path(request, request.pid, request.dirfd, path) {
+        let path = match self.resolve_path_follow(request, request.dirfd, path, request.flags & 0x100 == 0) {
             Ok(path) => path,
             Err(errno) => {
                 response.status = errno;
@@ -564,6 +710,12 @@ impl VfsState {
                 let stat = build_linux_stat(metadata);
                 response.payload_len = LINUX_STAT_SIZE as u32;
                 response.payload[..LINUX_STAT_SIZE].copy_from_slice(&stat);
+                if request.flags & rustos_user_abi::syscall::VFS_REQUEST_FLAG_NETD_SOCKET_NODE != 0 {
+                    if let Some(fs) = metadata.fs {
+                        response.value = metadata.dev;
+                        response.aux = fs.node_id;
+                    }
+                }
             }
             Err(errno) => response.status = errno,
         }
@@ -587,24 +739,26 @@ impl VfsState {
     }
 
     fn vfs_access(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(path) = vfs_request_path(request) else {
-            response.status = EINVAL;
-            return;
+        let Some(path) = vfs_request_path(request) else { response.status = EINVAL; return; };
+        if request.arg0 & !7 != 0 || request.flags & !(0x200 | 0x100) != 0 { response.status = EINVAL; return; }
+        let real = request.flags & 0x200 == 0;
+        let mut traversal_request = *request;
+        if real { traversal_request.euid = request.uid; traversal_request.egid = request.gid; }
+        let path = match self.resolve_path_follow(&traversal_request, request.dirfd, path, request.flags & 0x100 == 0) {
+            Ok(path) => path, Err(errno) => { response.status = errno; return; }
         };
-        response.status = match self.resolve_path(request, request.pid, request.dirfd, path) {
-            Ok(path) => match vfsd::proc_fs::lookup(path.as_str(), request.pid) {
-                Some(Ok(vfsd::proc_fs::ProcNode::ExeLink)) => {
-                    match self.resolve_proc_exe_target(request, vfsd::proc_fs::ProcNode::ExeLink) {
-                        Ok(target) => lock_vfs_storage().metadata(target.as_str()).err().unwrap_or(0),
-                        Err(errno) => errno,
-                    }
-                }
-                Some(Ok(_)) => 0,
-                Some(Err(errno)) => errno,
-                None => lock_vfs_storage().metadata(path.as_str()).err().unwrap_or(0),
-            },
-            Err(errno) => errno,
-        };
+        match vfsd::proc_fs::lookup(&path, request.pid) {
+            Some(Ok(vfsd::proc_fs::ProcNode::ExeLink)) => {
+                response.status = self.resolve_proc_exe_target(request, vfsd::proc_fs::ProcNode::ExeLink)
+                    .and_then(|target| lock_vfs_storage().metadata(&target))
+                    .and_then(|m| check_metadata_permission(m, request, request.arg0 as u32, real))
+                    .err().unwrap_or(0);
+            }
+            Some(Ok(node)) => { if let Some(aux) = vfsd::proc_fs::kernel_only_delegate(node) { response.aux = aux; } },
+            Some(Err(errno)) => response.status = errno,
+            None => response.status = lock_vfs_storage().metadata(&path)
+                .and_then(|m| check_metadata_permission(m, request, request.arg0 as u32, real)).err().unwrap_or(0),
+        }
     }
 
     /// Serves `/proc` nodes for `newfstatat`/`statx`. Returns true when the
@@ -626,8 +780,24 @@ impl VfsState {
             }
             Some(Ok(node)) => node,
         };
+        if let Some(aux) = proc_fs::kernel_only_delegate(node) {
+            response.aux = aux;
+            return true;
+        }
         let exec = proc_fs::attached_exec_path(&request.payload, request.payload_len as usize);
         let follow = request.flags & AT_SYMLINK_NOFOLLOW == 0;
+        if let (true, ProcNode::NsLink(index)) = (follow, node) {
+            if statx {
+                response.payload_len = LINUX_STATX_SIZE as u32;
+                response.payload[..LINUX_STATX_SIZE]
+                    .copy_from_slice(&proc_fs::ns_target_statx(index));
+            } else {
+                response.payload_len = LINUX_STAT_SIZE as u32;
+                response.payload[..LINUX_STAT_SIZE]
+                    .copy_from_slice(&proc_fs::ns_target_stat(index));
+            }
+            return true;
+        }
         if follow && node == ProcNode::ExeLink {
             // Stat the target as an ordinary path; its own metadata is real.
             let target = match self.resolve_proc_exe_target(request, node) {
@@ -656,6 +826,10 @@ impl VfsState {
             // `/proc/self` followed is the caller's pid directory.
             ProcNode::SelfLink if follow => (ProcNode::PidDir, 0),
             ProcNode::PidDir => (ProcNode::PidDir, 0),
+            ProcNode::NsDir => (ProcNode::NsDir, 0),
+            // Static kernel-fact files report size 0 like procfs; the
+            // kernel-only subtrees were delegated above.
+            kernel @ ProcNode::Kernel(..) => (kernel, 0),
             file if proc_fs::is_virtual_file(file) => {
                 match lock_vfs_storage().proc_virtual_file_bytes(file) {
                     Ok(bytes) => (file, bytes.len() as u64),
@@ -691,7 +865,7 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        let path = match self.resolve_path(request, request.pid, request.dirfd, path) {
+        let path = match self.resolve_path_follow(request, request.dirfd, path, false) {
             Ok(path) => path,
             Err(errno) => {
                 response.status = errno;
@@ -707,13 +881,27 @@ impl VfsState {
             // Not a procfs node: existing paths are not symlinks (EINVAL),
             // missing ones are ENOENT.
             None => {
-                response.status = match lock_vfs_storage().metadata(path.as_str()) {
+                // Memory-filesystem symlinks are read through the volume;
+                // anything else that exists is not a link (EINVAL).
+                let mut storage = lock_vfs_storage();
+                if storage.tmpfs_owns(path.as_str()) {
+                    match storage.readlink_path(path.as_str()) {
+                        Ok(target) => write_vfs_payload_bytes(response, target.as_bytes()),
+                        Err(errno) => response.status = errno,
+                    }
+                    return;
+                }
+                response.status = match storage.metadata(path.as_str()) {
                     Ok(_) => EINVAL,
                     Err(errno) => errno,
                 };
                 return;
             }
         };
+        if let Some(aux) = vfsd::proc_fs::kernel_only_delegate(node) {
+            response.aux = aux;
+            return;
+        }
         let exec = vfsd::proc_fs::attached_exec_path(&request.payload, request.payload_len as usize);
         match vfsd::proc_fs::link_target(node, request.pid, exec) {
             Ok(target) => {
@@ -735,13 +923,15 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        let path = match self.resolve_path(request, request.pid, request.dirfd, path) {
+        let path = match self.resolve_path_follow(request, request.dirfd, path, true) {
             Ok(path) => path,
             Err(errno) => {
                 response.status = errno;
                 return;
             }
         };
+        let result = lock_vfs_storage().metadata(&path).and_then(|m| check_metadata_permission(m, request, 1, false));
+        if let Err(errno) = result { response.status = errno; return; }
         response.status = self.chdir(request.pid, path.as_str());
     }
 
@@ -750,28 +940,24 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        let path = match self.resolve_path(request, request.pid, request.dirfd, path) {
+        let path = match self.resolve_path_follow(request, request.dirfd, path, false) {
             Ok(path) => path,
             Err(errno) => {
                 response.status = errno;
                 return;
             }
         };
-        response.status = lock_vfs_storage().mkdir_path(path.as_str(), request.euid);
+        let attrs = FsCreateAttrs::new(request.arg0 as u32, request.euid, request.egid);
+        let mut storage = lock_vfs_storage();
+        response.status = match check_parent(&mut storage, &path, request, false) { Ok(()) => storage.mkdir_path(&path, attrs), Err(e) => e };
     }
 
     fn linux_mount_vfs(&mut self, response: &mut VfsIpcResponse) {
-        response.status = match lock_vfs_storage().advance_mount_generation() {
-            Ok(()) => 0,
-            Err(errno) => errno,
-        };
+        response.status = EOPNOTSUPP;
     }
 
     fn linux_umount_vfs(&mut self, response: &mut VfsIpcResponse) {
-        response.status = match lock_vfs_storage().advance_mount_generation() {
-            Ok(()) => 0,
-            Err(errno) => errno,
-        };
+        response.status = EOPNOTSUPP;
     }
 
     fn vfs_unlinkat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
@@ -779,7 +965,7 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        let path = match self.resolve_path(request, request.pid, request.dirfd, path) {
+        let path = match self.resolve_path_follow(request, request.dirfd, path, false) {
             Ok(path) => path,
             Err(errno) => {
                 response.status = errno;
@@ -787,7 +973,25 @@ impl VfsState {
             }
         };
         let remove_dir = (request.flags & linux_abi::AT_REMOVEDIR as u32) != 0;
-        response.status = lock_vfs_storage().unlink_path(path.as_str(), remove_dir);
+        let mut storage = lock_vfs_storage();
+        if let Err(e) = check_parent(&mut storage, &path, request, true) { response.status = e; return; }
+        if request.flags & rustos_user_abi::syscall::VFS_REQUEST_FLAG_NETD_SOCKET_NODE != 0 {
+            // A delayed bind rollback may not unlink a replacement inode.
+            if request.arg1 == 0 || request.arg2 == 0 {
+                response.status = EINVAL;
+                return;
+            }
+            match storage.metadata(path.as_str()) {
+                Ok(metadata) if vfsd::socket_rollback_matches(
+                    (request.arg1, request.arg2),
+                    (metadata.dev, metadata.fs.map_or(0, |fs| fs.node_id)),
+                    metadata.kind == RemoteKind::Socket,
+                ) => {}
+                Ok(_) => { response.status = ESTALE; return; }
+                Err(errno) => { response.status = errno; return; }
+            }
+        }
+        response.status = storage.unlink_path(path.as_str(), remove_dir);
     }
 
     fn vfs_write(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
@@ -835,16 +1039,27 @@ impl VfsState {
         let data = &request.payload[..len];
         let (start, written, new_len) = {
             let mut storage = lock_vfs_storage();
-            let start = if handle.append {
-                storage.live_len_for_path(handle.path.as_str(), handle.len)
+            if handle.node != 0 {
+                let offset = if handle.append { None } else { Some(handle.cursor) };
+                match storage.write_node(handle.mount_id, handle.node, offset, data) {
+                    Ok(result) => result,
+                    Err(errno) => {
+                        response.status = errno;
+                        return;
+                    }
+                }
             } else {
-                handle.cursor
-            };
-            match storage.write_at_path(handle.path.as_str(), start, data) {
-                Ok((written, new_len)) => (start, written, new_len),
-                Err(errno) => {
-                    response.status = errno;
-                    return;
+                let start = if handle.append {
+                    storage.live_len_for_path(handle.path.as_str(), handle.len)
+                } else {
+                    handle.cursor
+                };
+                match storage.write_at_path(handle.path.as_str(), start, data) {
+                    Ok((written, new_len)) => (start, written, new_len),
+                    Err(errno) => {
+                        response.status = errno;
+                        return;
+                    }
                 }
             }
         };
@@ -908,7 +1123,14 @@ impl VfsState {
             .min(request.payload_len as usize)
             .min(request.payload.len());
         let data = &request.payload[..len];
-        match lock_vfs_storage().write_at_path(handle.path.as_str(), request.arg0, data) {
+        let result = if handle.node != 0 {
+            lock_vfs_storage()
+                .write_node(handle.mount_id, handle.node, Some(request.arg0), data)
+                .map(|(_, written, new_len)| (written, new_len))
+        } else {
+            lock_vfs_storage().write_at_path(handle.path.as_str(), request.arg0, data)
+        };
+        match result {
             Ok((written, new_len)) => {
                 if let Some(entry) = self.handles.get_mut(&request.remote_id) {
                     entry.len = new_len;
@@ -928,7 +1150,12 @@ impl VfsState {
             response.status = EINVAL;
             return;
         }
-        match lock_vfs_storage().truncate_path(handle.path.as_str(), request.arg0) {
+        let result = if handle.node != 0 {
+            lock_vfs_storage().truncate_node(handle.mount_id, handle.node, request.arg0)
+        } else {
+            lock_vfs_storage().truncate_path(handle.path.as_str(), request.arg0)
+        };
+        match result {
             Ok(actual_len) => {
                 if let Some(entry) = self.handles.get_mut(&request.remote_id) {
                     entry.len = actual_len;
@@ -946,6 +1173,11 @@ impl VfsState {
         };
         if handle.kind == RemoteKind::Device {
             response.status = EINVAL;
+            return;
+        }
+        if handle.node != 0 {
+            // Memory-backed: a completed write is already as durable as it
+            // gets, and the pinned node needs no path to flush.
             return;
         }
         let path = handle.path.clone();
@@ -974,21 +1206,24 @@ impl VfsState {
             return;
         }
         let no_replace = (request.arg1 & linux_abi::RENAME_NOREPLACE as u64) != 0;
-        let old_path = match self.resolve_path_with_base(request.pid, request.dirfd, request.remote_id, old_raw) {
-            Ok(p) => p,
-            Err(errno) => {
-                response.status = errno;
-                return;
-            }
+        let old_path = match self.resolve_path_follow(request, request.dirfd, old_raw, false) {
+            Ok(path) => path,
+            Err(errno) => { response.status = errno; return; }
         };
-        let new_path = match self.resolve_path_with_base(request.pid, request.arg0, request.arg2, new_raw) {
-            Ok(p) => p,
-            Err(errno) => {
-                response.status = errno;
-                return;
-            }
+        let mut new_request = *request;
+        new_request.remote_id = request.arg2;
+        let new_path = match self.resolve_path_follow(&new_request, request.arg0, new_raw, false) {
+            Ok(path) => path,
+            Err(errno) => { response.status = errno; return; }
         };
-        response.status = lock_vfs_storage().rename_paths(old_path.as_str(), new_path.as_str(), no_replace);
+        let mut storage = lock_vfs_storage();
+        let check = check_parent(&mut storage, &old_path, request, true)
+            .and_then(|()| check_parent(&mut storage, &new_path, request, false))
+            .and_then(|()| match storage.metadata(&new_path) {
+                Ok(_) => check_parent(&mut storage, &new_path, request, true),
+                Err(ENOENT) => Ok(()), Err(e) => Err(e),
+            });
+        response.status = match check { Ok(()) => storage.rename_paths(&old_path, &new_path, no_replace), Err(e) => e };
     }
 
     fn vfs_statfs(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
@@ -998,7 +1233,7 @@ impl VfsState {
                     response.status = EINVAL;
                     return;
                 };
-                match self.resolve_path(request, request.pid, request.dirfd, raw) {
+                match self.resolve_path_follow(request, request.dirfd, raw, true) {
                     Ok(p) => p,
                     Err(errno) => {
                         response.status = errno;
@@ -1038,43 +1273,204 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        let link_path = match self.resolve_path(request, request.pid, request.dirfd, link_raw) {
+        let link_path = match self.resolve_path_follow(request, request.dirfd, link_raw, false) {
             Ok(p) => p,
             Err(errno) => {
                 response.status = errno;
                 return;
             }
         };
-        response.status = lock_vfs_storage().symlink_path(target, link_path.as_str());
+        let attrs = FsCreateAttrs::new(0o777, request.euid, request.egid);
+        let mut storage = lock_vfs_storage();
+        response.status = match check_parent(&mut storage, &link_path, request, false) { Ok(()) => storage.symlink_path(target, &link_path, attrs), Err(e) => e };
     }
 
     fn vfs_set_attrs(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let path = if request.remote_id != 0 {
+        use rustos_user_abi::syscall::{VFS_ATTR_ATIME, VFS_ATTR_MTIME, VFS_ATTR_ATIME_NOW, VFS_ATTR_MTIME_NOW};
+        let mask = request.arg0;
+        if mask & !0x3f != 0
+            || (mask & VFS_ATTR_ATIME_NOW != 0 && mask & VFS_ATTR_ATIME == 0)
+            || (mask & VFS_ATTR_MTIME_NOW != 0 && mask & VFS_ATTR_MTIME == 0)
+            || (mask & 8 != 0 && mask & 3 != 0)
+            || (mask & VFS_ATTR_ATIME != 0 && mask & VFS_ATTR_ATIME_NOW == 0 && request.arg3 as u32 >= 1_000_000_000)
+            || (mask & VFS_ATTR_MTIME != 0 && mask & VFS_ATTR_MTIME_NOW == 0 && (request.arg3 >> 32) >= 1_000_000_000)
+        {
+            response.status = EINVAL;
+            return;
+        }
+        let path;
+        // A path request carries its directory base in `remote_id` too, so the
+        // open-description form (futimens) is the one with no path at all.
+        let target = if request.path_len == 0 && request.remote_id != 0 {
             let Some(handle) = self.handles.get(&request.remote_id) else {
                 response.status = EBADF;
                 return;
             };
-            handle.path.clone()
+            if handle.node != 0 {
+                AttrTarget::Node(handle.mount_id, handle.node)
+            } else {
+                path = handle.path.clone();
+                AttrTarget::Path(path.as_str())
+            }
         } else {
             let Some(raw) = vfs_request_path(request) else {
                 response.status = EINVAL;
                 return;
             };
-            match self.resolve_path(request, request.pid, request.dirfd, raw) {
+            // `utimensat(.., AT_SYMLINK_NOFOLLOW)` stamps the link itself.
+            let follow_last = request.flags & linux_abi::AT_SYMLINK_NOFOLLOW as u32 == 0;
+            path = match self.resolve_path_follow(request, request.dirfd, raw, follow_last) {
                 Ok(p) => p,
                 Err(errno) => {
                     response.status = errno;
                     return;
                 }
+            };
+            AttrTarget::Path(path.as_str())
+        };
+        let mut storage = lock_vfs_storage();
+        let metadata = match target {
+            AttrTarget::Node(mount, node) => storage.node_metadata(mount, node),
+            AttrTarget::Path(path) => storage.metadata(path),
+        };
+        match metadata {
+            Ok(metadata) if mask != 0 && {
+                let both_now = mask == VFS_ATTR_ATIME | VFS_ATTR_MTIME | VFS_ATTR_ATIME_NOW | VFS_ATTR_MTIME_NOW;
+                match metadata.fs {
+                    Some(fs) => !vfsd::permissions::set_times_allowed(fs, credentials(request, false), both_now),
+                    // Plain metadata is reported as uid/gid 0 with the mode
+                    // synthesized by stat; apply the same ownership policy.
+                    None => request.euid != 0 && !(both_now && util::mode_bits(metadata.kind) & if request.egid == 0 { 0o020 } else { 0o002 } != 0),
+                }
+            } => {
+                let both_now = mask == VFS_ATTR_ATIME | VFS_ATTR_MTIME | VFS_ATTR_ATIME_NOW | VFS_ATTR_MTIME_NOW;
+                response.status = if both_now { EACCES } else { EPERM };
+            }
+            Ok(_) => response.status = storage.set_attrs_path(
+                target,
+                request.arg0,
+                request.arg1 as i64,
+                request.arg2 as i64,
+                request.arg3,
+            ),
+            Err(errno) => response.status = errno,
+        }
+    }
+
+    /// `VFS_IPC_OP_MKNOD`: create a socket (or empty regular) inode at a path.
+    fn vfs_mknod(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(raw) = vfs_request_path(request) else {
+            response.status = EINVAL;
+            return;
+        };
+        let path = match self.resolve_path_follow(request, request.dirfd, raw, false) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
             }
         };
-        response.status = lock_vfs_storage().set_attrs_path(
-            path.as_str(),
-            request.arg0,
-            request.arg1 as i64,
-            request.arg2 as i64,
-            request.arg3 as u32,
-        );
+        let attrs = FsCreateAttrs::new(request.arg0 as u32, request.euid, request.egid);
+        let mut storage = lock_vfs_storage();
+        response.status = match check_parent(&mut storage, &path, request, false) { Ok(()) => storage.mknod_path(&path, request.arg0, attrs), Err(e) => e };
+        if response.status == 0
+            && request.flags & rustos_user_abi::syscall::VFS_REQUEST_FLAG_NETD_SOCKET_NODE != 0
+        {
+            match storage.metadata(path.as_str()) {
+                Ok(metadata) => {
+                    if let Some(fs) = metadata.fs {
+                        response.value = metadata.dev;
+                        response.aux = fs.node_id;
+                    } else {
+                        response.status = EIO;
+                    }
+                }
+                Err(errno) => response.status = errno,
+            }
+        }
+    }
+
+    /// `VFS_IPC_OP_CHMOD`: permission bits of the node at a path.
+    fn vfs_chmod(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(raw) = vfs_request_path(request) else {
+            response.status = EINVAL;
+            return;
+        };
+        let path = match self.resolve_path_follow(request, request.dirfd, raw, true) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        let mut storage = lock_vfs_storage();
+        match storage.metadata(path.as_str()) {
+            Ok(metadata) if check_owner(metadata, request).is_err() => {
+                response.status = EPERM;
+            }
+            Ok(_) => response.status = storage.chmod_path(path.as_str(), request.arg0 as u32),
+            Err(errno) => response.status = errno,
+        }
+    }
+
+    /// `VFS_IPC_OP_FCHMOD`: permission bits of an open description's node.
+    fn vfs_fchmod(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(handle) = self.handles.get(&request.remote_id) else {
+            response.status = EBADF;
+            return;
+        };
+        if handle.node != 0 {
+            let (mount_id, node) = (handle.mount_id, handle.node);
+            let mut storage = lock_vfs_storage();
+            match storage.node_metadata(mount_id, node) {
+                Ok(metadata) if check_owner(metadata, request).is_err() => response.status = EPERM,
+                Ok(_) => response.status = storage.chmod_node(mount_id, node, request.arg0 as u32),
+                Err(errno) => response.status = errno,
+            }
+        } else if handle.kind == RemoteKind::Device {
+            response.status = EINVAL;
+        } else {
+            let path = handle.path.clone();
+            let mut storage = lock_vfs_storage();
+            response.status = match storage.metadata(&path).and_then(|m| check_owner(m, request)) {
+                Ok(()) => storage.chmod_path(&path, request.arg0 as u32), Err(e) => e,
+            };
+        }
+    }
+
+    /// `VFS_IPC_OP_FALLOCATE`: mode 0 and `KEEP_SIZE` on a memory-filesystem
+    /// file; reply `value` is the resulting length.
+    fn vfs_fallocate(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(handle) = self.handles.get(&request.remote_id) else {
+            response.status = EBADF;
+            return;
+        };
+        if !handle.writable {
+            response.status = EBADF;
+            return;
+        }
+        if handle.kind != RemoteKind::File {
+            response.status = ENODEV;
+            return;
+        }
+        let Some(keep_size) = rustos_user_abi::syscall::vfs_fallocate_keep_size(request.arg0) else {
+            response.status = EOPNOTSUPP;
+            return;
+        };
+        if handle.node == 0 {
+            response.status = EOPNOTSUPP;
+            return;
+        }
+        let (mount_id, node) = (handle.mount_id, handle.node);
+        match lock_vfs_storage().fallocate_node(mount_id, node, keep_size, request.arg1, request.arg2) {
+            Ok(len) => {
+                if let Some(entry) = self.handles.get_mut(&request.remote_id) {
+                    entry.len = len;
+                }
+                response.value = len;
+            }
+            Err(errno) => response.status = errno,
+        }
     }
 
 }

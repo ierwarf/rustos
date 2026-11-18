@@ -19,4 +19,3 @@ weight_micros = 1000
 console_hosted = false
 launch = "new-session"
 args = ["/apps/chrome/chrome", "--ozone-platform=wayland"]
-env = ["HOME=/run/user/1000", "XDG_RUNTIME_DIR=/run/user/1000"]

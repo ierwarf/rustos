@@ -432,9 +432,12 @@ pub fn mint_service_object_id() -> u64 {
 }
 
 pub fn populate_vfs_identity(request: &mut VfsIpcRequest) {
+    // IPC receive stamps the sender from the task's log identity, which
+    // remains available after the process is sealed for exit. The visible
+    // process snapshot deliberately disappears at that point, but final
+    // CLOSE and its checkpoint ACK must still identify their actual sender.
+    set_vfs_sender_identity(request, multitask::current_user_log_ids());
     if let Some(snapshot) = multitask::current_user_snapshot() {
-        request.pid = snapshot.process_id();
-        request.tid = snapshot.thread_id();
         request.session_handle = snapshot.console_session().raw();
     }
     if let Some(security) = multitask::with_current_process_credentials(|security| security) {
@@ -443,6 +446,10 @@ pub fn populate_vfs_identity(request: &mut VfsIpcRequest) {
         request.euid = security.euid();
         request.egid = security.egid();
     }
+}
+
+fn set_vfs_sender_identity(request: &mut VfsIpcRequest, sender: Option<(u64, u64)>) {
+    (request.pid, request.tid) = sender.unwrap_or((0, 0));
 }
 
 pub fn populate_vfs_path(request: &mut VfsIpcRequest, path: &str) -> Result<(), i64> {
@@ -472,11 +479,42 @@ pub fn populate_vfs_path_base(
     path: &str,
 ) -> Result<(), i64> {
     request.dirfd = dirfd;
+    // A generated proc directory is a typed snapshot, not a remote VFS
+    // handle. Send its canonical proc path back to vfsd so that namespace
+    // lookup and the caller-only PID check still happen there.
+    if !path.is_empty() && !path.starts_with('/') && !is_linux_at_fdcwd_for_vfs(dirfd) {
+        if let Some(memfd) = current_memfd_handle(dirfd) {
+            if let Some(info) = memfd.proc_snapshot() {
+                if !info.directory {
+                    return Err(LINUX_ENOTDIR);
+                }
+                let combined = proc_directory_child_path(&info.link, path);
+                request.dirfd = linux_abi::AT_FDCWD as u64;
+                return populate_vfs_path(request, &combined);
+            }
+        }
+    }
     let remote_id = resolve_vfs_dirfd_remote_id(dirfd, path)?;
     if remote_id != 0 {
         request.remote_id = remote_id;
     }
     populate_vfs_path(request, path)
+}
+
+fn proc_directory_child_path(base: &str, path: &str) -> alloc::string::String {
+    // Keep components intact; vfsd owns normalization and caller checks.
+    alloc::format!("{}/{}", base, path)
+}
+
+#[cfg(test)]
+mod proc_directory_base_tests {
+    use super::proc_directory_child_path;
+
+    #[test]
+    fn relative_path_retains_components_for_vfs_namespace_resolution() {
+        assert_eq!(proc_directory_child_path("/proc/7/fd", "3"), "/proc/7/fd/3");
+        assert_eq!(proc_directory_child_path("/proc/7/task/7", "../7/stat"), "/proc/7/task/7/../7/stat");
+    }
 }
 
 pub(super) fn is_linux_at_fdcwd_for_vfs(dirfd: u64) -> bool {
@@ -520,6 +558,7 @@ fn vfs_request_is_replay_safe(request: &VfsIpcRequest) -> bool {
 
 fn vfs_request_service_class(request: &VfsIpcRequest) -> ipc_ops::ServiceIpcClass {
     if matches!(request.op, VFS_IPC_OP_CLOSE | VFS_IPC_OP_CURSOR_SETTLE | VFS_IPC_OP_CHECKPOINT_ACK)
+        || request.op == rustos_user_abi::syscall::VFS_IPC_OP_FILE_LOCK
         || request.op == VFS_IPC_OP_POLL_QUERY && matches!(request.arg0,
             VFS_POLL_QUERY_EPOLL_CREATE | VFS_POLL_QUERY_EPOLL_CTL |
             VFS_POLL_QUERY_EPOLL_RETIRE | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT)
@@ -2081,7 +2120,7 @@ fn finish_netd_ipc_response(
     }
     // The scheduling hint is consumed at the kernel IPC boundary and is not
     // part of the Linux socket result exposed to compatibility callers.
-    decoded.reserved1 = 0;
+    decoded.reserved1 &= !NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;
     Ok(decoded)
 }
 
@@ -2118,7 +2157,23 @@ fn decode_netd_ipc_response(
                 request.op,
                 SYSCALL_OFFLOAD_OP_LINUX_CLOSE | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
             ))
-        || decoded.reserved1 & !NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF != 0
+        || (decoded.discarded_tail != 0
+            && (decoded.status != 0
+                || decoded.discarded_tail as usize > NETD_IPC_PAYLOAD_CAPACITY
+                || match request.op {
+                    SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => request.arg3 & (linux_abi::MSG_PEEK | linux_abi::MSG_TRUNC) != 0,
+                    SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => request.arg2 & (linux_abi::MSG_PEEK | linux_abi::MSG_TRUNC) != 0,
+                    _ => true,
+                }))
+        || decoded.reserved1 & !(NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF | rustos_user_abi::syscall::NETD_IPC_RESPONSE_FLAG_RECORD_PRESENT) != 0
+        || (decoded.reserved1 & rustos_user_abi::syscall::NETD_IPC_RESPONSE_FLAG_RECORD_PRESENT != 0
+            && (decoded.status != 0 || match request.op {
+                SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => request.arg3 & linux_abi::MSG_PEEK != 0,
+                SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => request.arg2 & linux_abi::MSG_PEEK != 0,
+                _ => true,
+            }))
+        || (decoded.discarded_tail != 0
+            && decoded.reserved1 & rustos_user_abi::syscall::NETD_IPC_RESPONSE_FLAG_RECORD_PRESENT == 0)
     {
         return Err(LINUX_EINVAL);
     }

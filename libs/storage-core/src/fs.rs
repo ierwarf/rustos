@@ -30,6 +30,37 @@ pub struct FsCapabilities {
     pub max_name_len: u32,
 }
 
+impl FsCapabilities {
+    /// True for volumes with full POSIX node semantics: symlinks, sparse
+    /// files and unlink-while-open (through the node-handle methods of
+    /// [`FsVolume`]). Such volumes report rich `FsMetadata` (mode, owner,
+    /// link count, times) that vfsd must surface instead of boot-volume
+    /// defaults, and must not be fronted by path-keyed content caches.
+    pub const fn posix_nodes(&self) -> bool {
+        self.supports_symlinks && self.supports_sparse && self.supports_unlink_while_open
+    }
+}
+
+/// Creation attributes for `open_prepare_with`, `mkdir_with`, `symlink_with`
+/// and `mknod_socket`. `mode` holds permission bits only (`07777`); the caller
+/// applies any umask before the request reaches the volume.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FsCreateAttrs {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl FsCreateAttrs {
+    pub const fn new(mode: u32, uid: u32, gid: u32) -> Self {
+        Self {
+            mode: mode & 0o7777,
+            uid,
+            gid,
+        }
+    }
+}
+
 pub mod dos_attrs {
     pub const READONLY: u32 = 0x1;
     pub const HIDDEN: u32 = 0x2;
@@ -45,6 +76,8 @@ pub enum FsNodeKind {
     File,
     Directory,
     Symlink,
+    /// Filesystem socket inode (`S_IFSOCK`); never opened for data I/O.
+    Socket,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -189,6 +222,114 @@ pub trait FsVolume: Send + Sync {
     fn readlink(&self, _path: &str) -> Result<String, FsError> {
         Err(FsError::Unsupported)
     }
+
+    /// `open_prepare` with explicit creation attributes. Volumes that do not
+    /// store POSIX ownership ignore them.
+    fn open_prepare_with(
+        &self,
+        path: &str,
+        opts: FsOpenOptions,
+        _attrs: FsCreateAttrs,
+    ) -> Result<FsMetadata, FsError> {
+        self.open_prepare(path, opts)
+    }
+    fn mkdir_with(&self, path: &str, _attrs: FsCreateAttrs) -> Result<(), FsError> {
+        self.mkdir(path)
+    }
+    fn symlink_with(
+        &self,
+        target: &str,
+        linkpath: &str,
+        _attrs: FsCreateAttrs,
+    ) -> Result<(), FsError> {
+        self.symlink(target, linkpath)
+    }
+    /// Creates an `S_IFSOCK` inode at `path` (the `bind(2)` name of an
+    /// `AF_UNIX` socket). Fails with `AlreadyExists` when the name is taken.
+    fn mknod_socket(&self, _path: &str, _attrs: FsCreateAttrs) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+    fn chmod(&self, _path: &str, _mode: u32) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+    /// Hard link `new_path` to the non-directory `existing`.
+    fn link(&self, _existing: &str, _new_path: &str) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+    /// `fallocate(2)` modes 0 and `FALLOC_FL_KEEP_SIZE`: preallocates (and
+    /// charges) `[offset, offset + len)` and returns the resulting length.
+    fn fallocate(
+        &self,
+        _path: &str,
+        _offset: u64,
+        _len: u64,
+        _keep_size: bool,
+    ) -> Result<u64, FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    // Node handles. A path-based volume cannot keep an open description alive
+    // across unlink or rename. A volume with `FsCapabilities::posix_nodes()`
+    // instead pins a node: `retain_node` resolves `path` once and returns an
+    // opaque id (the `FsMetadata::node_id`), every later call addresses the
+    // node directly, and the node's storage lives until `release_node` drops
+    // the last pin of an unlinked node. All default to `Unsupported`.
+    fn retain_node(&self, _path: &str) -> Result<u64, FsError> {
+        Err(FsError::Unsupported)
+    }
+    /// Acquire a second pin without resolving a pathname.
+    fn retain_node_id(&self, _node: u64) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+    /// Current path of a linked directory, relative to this volume's root.
+    fn directory_path_node(&self, _node: u64) -> Result<String, FsError> {
+        Err(FsError::Unsupported)
+    }
+    fn read_dir_node(&self, _node: u64) -> Result<Vec<FsDirEntry>, FsError> {
+        Err(FsError::Unsupported)
+    }
+    fn release_node(&self, _node: u64) {}
+    /// Creates an unnamed regular file inside directory `dir` (`O_TMPFILE`),
+    /// already pinned once. It has no directory entry until `link_node`.
+    fn open_unnamed(&self, _dir: &str, _attrs: FsCreateAttrs) -> Result<u64, FsError> {
+        Err(FsError::Unsupported)
+    }
+    fn link_node(&self, _node: u64, _new_path: &str) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+    fn metadata_node(&self, _node: u64) -> Result<FsMetadata, FsError> {
+        Err(FsError::Unsupported)
+    }
+    fn read_node_at(&self, _node: u64, _offset: u64, _out: &mut [u8]) -> Result<usize, FsError> {
+        Err(FsError::Unsupported)
+    }
+    fn write_node_at(&self, _node: u64, _offset: u64, _data: &[u8]) -> Result<(usize, u64), FsError> {
+        Err(FsError::Unsupported)
+    }
+    fn truncate_node(&self, _node: u64, _new_len: u64) -> Result<u64, FsError> {
+        Err(FsError::Unsupported)
+    }
+    fn fallocate_node(
+        &self,
+        _node: u64,
+        _offset: u64,
+        _len: u64,
+        _keep_size: bool,
+    ) -> Result<u64, FsError> {
+        Err(FsError::Unsupported)
+    }
+    fn chmod_node(&self, _node: u64, _mode: u32) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+    fn set_times_node(
+        &self,
+        _node: u64,
+        _atime: Option<FsTimestamp>,
+        _mtime: Option<FsTimestamp>,
+    ) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
     fn flush(&self) -> Result<(), FsError>;
 }
 

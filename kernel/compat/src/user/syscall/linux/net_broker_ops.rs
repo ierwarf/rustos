@@ -66,7 +66,9 @@ fn broker_prepare_socket_publication(args: &RustosNetBrokerArgs) -> Result<u64, 
         return Err(LINUX_EINVAL);
     }
     let netd_process_id = multitask::current_user_process_id().ok_or(LINUX_EPERM)?;
-    let descriptors = if publication.domain == linux_abi::AF_INET {
+    let descriptors = if publication.domain == linux_abi::AF_INET
+        || publication.domain == rustos_user_abi::syscall::NET_BROKER_PUBLICATION_AF_NETLINK
+    {
         alloc::vec![
             multitask::register_new_inet_socket_transfer(
                 publication.socket_token,
@@ -267,7 +269,8 @@ fn initial_unix_publication_entries(
         let socket = multitask::SocketHandle::from_token(
             token,
             publication.domain,
-            linux_abi::SOCK_STREAM,
+            // The shape predicate admits only SOCK_STREAM and SOCK_SEQPACKET.
+            publication.socket_type & linux_abi::SOCK_TYPE_MASK,
             publication.protocol,
         );
         if channel != 0 && !socket.bind_channel(channel, side) {
@@ -371,6 +374,40 @@ mod tests {
                 multitask::take_ipc_transfer_entries(&descriptors).is_err(),
                 "failed bind must reclaim every invisible descriptor"
             );
+        }
+    }
+    #[test]
+    fn seqpacket_publication_entries_carry_the_published_socket_type() {
+        for (socket_type, expected) in [
+            (linux_abi::SOCK_STREAM, linux_abi::SOCK_STREAM),
+            (
+                rustos_user_abi::syscall::NET_BROKER_PUBLICATION_SOCK_SEQPACKET
+                    | linux_abi::SOCK_NONBLOCK,
+                rustos_user_abi::syscall::NET_BROKER_PUBLICATION_SOCK_SEQPACKET,
+            ),
+        ] {
+            let publication = NetBrokerPrepareSocketPublication {
+                version: rustos_user_abi::syscall::NET_BROKER_SOCKET_PUBLICATION_VERSION,
+                operation: SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR as u64,
+                reply_cap: 11,
+                caller_pid: 12,
+                socket_token: 71,
+                second_socket_token: 72,
+                domain: linux_abi::AF_UNIX,
+                socket_type,
+                ..NetBrokerPrepareSocketPublication::default()
+            };
+            assert!(net_broker_socket_publication_shape_valid(&publication));
+            let entries = initial_unix_publication_entries(&publication, 99).unwrap();
+            for entry in &entries {
+                let multitask::KernelHandle::Socket(socket) = entry.entry().handle() else {
+                    panic!("Unix socket")
+                };
+                assert_eq!(socket.type_(), expected);
+                assert_eq!(entry.entry().fd_flags(), 0);
+            }
+            let descriptors = multitask::register_ipc_transfer_entries(entries).unwrap();
+            multitask::reclaim_unbound_socket_transfers(&descriptors);
         }
     }
     #[test]

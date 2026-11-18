@@ -30,6 +30,8 @@ struct SmokeOptions {
     dvm_network_shmem: bool,
     dvm_block_shmem: bool,
     writable_storage: bool,
+    /// Persistent `/data` disk image reused across runs (kvm-run, kvm-smoke).
+    data_disk: Option<PathBuf>,
     rustos_vcpus: u8,
     smp_iteration: bool,
     /// Keep both guests up this many seconds after readiness was accepted
@@ -72,6 +74,9 @@ struct SmokeOptions {
     proc_stress: bool,
     /// Arm `apps/localfdprobe` (pipe/eventfd semantics; `local_fd_probe.rs`).
     local_fd_probe: bool,
+    /// Arm `apps/chromeprobe` (Chromium-class Linux surface; `chrome_probe.rs`).
+    chrome_compat_probe: bool,
+    chrome_probe_persist: Option<String>,
     /// Arm `apps/faultprobe` (process-group fault semantics; `fault_probe.rs`).
     fault_probe: bool,
     /// Arm `apps/libmapprobe` and require its runtime proof markers.
@@ -139,6 +144,7 @@ where
         dvm_network_shmem: false,
         dvm_block_shmem: false,
         writable_storage: false,
+        data_disk: None,
         rustos_vcpus: DEFAULT_RUSTOS_VCPUS,
         smp_iteration: false,
         hold_seconds: None,
@@ -158,6 +164,8 @@ where
         job_policy_probe: false,
         proc_stress: false,
         local_fd_probe: false,
+        chrome_compat_probe: false,
+        chrome_probe_persist: None,
         fault_probe: false,
         library_map_probe: false,
         app_dmabuf_probe: false,
@@ -205,6 +213,12 @@ where
             "--dvm-network-shmem" => options.dvm_network_shmem = true,
             "--dvm-block-shmem" => options.dvm_block_shmem = true,
             "--writable-storage" => options.writable_storage = true,
+            "--data-disk" => {
+                if options.data_disk.is_some() {
+                    bail!("--data-disk may be given once");
+                }
+                options.data_disk = Some(PathBuf::from(next_value(&mut args, "--data-disk")?));
+            }
             "--rustos-vcpus" => {
                 options.rustos_vcpus = parse_rustos_vcpus(next_value(&mut args, "--rustos-vcpus")?)?
             }
@@ -272,6 +286,12 @@ where
             }
             "--proc-stress" => options.proc_stress = true,
             "--local-fd-probe" => options.local_fd_probe = true,
+            "--chrome-compat-probe" => options.chrome_compat_probe = true,
+            "--chrome-probe-persist" => {
+                let phase = next_value(&mut args, &arg)?;
+                if phase != "first" && phase != "second" { bail!("--chrome-probe-persist requires first or second"); }
+                if options.chrome_probe_persist.replace(phase).is_some() { bail!("--chrome-probe-persist supplied more than once"); }
+            },
             "--fault-probe" => options.fault_probe = true,
             "--library-map-probe" => options.library_map_probe = true,
             "--app-dmabuf-probe" => options.app_dmabuf_probe = true,
@@ -485,6 +505,17 @@ where
         options.gui_dvm_surfaces = true;
         options.expected_markers.extend(local_fd_probe_markers());
     }
+    if options.chrome_probe_persist.is_some() && (!options.chrome_compat_probe || options.data_disk.is_none()) {
+        bail!("--chrome-probe-persist requires --chrome-compat-probe and --data-disk");
+    }
+    if options.chrome_compat_probe {
+        // Session programs start only once the graphical session is up, and the
+        // probe needs a writable /data partition (persistence, locks, fsync).
+        options.gui_dvm_surfaces = true;
+        options.dvm_block_shmem = true;
+        options.writable_storage = true;
+        options.expected_markers.extend(chrome_probe_markers());
+    }
     if options.fault_probe {
         // Session programs start only once the graphical session is up.
         options.gui_dvm_surfaces = true;
@@ -549,7 +580,7 @@ where
         // early-system closure and is visible to runtimed only through the
         // production DVM-backed FAT volume. The evidence executable itself is
         // separately pinned inside early-system against DVM substitution.
-        options.dvm_block_shmem = true;
+        options.dvm_block_shmem = true; // qualification requires its private DVM contract
     } else if options.smp_evidence_cohort.is_some() {
         bail!("--smp-evidence-cohort requires --smp-ring3-qualification");
     }
@@ -576,6 +607,11 @@ where
     }
     if options.expect_block_flush_fault && !options.storage_only {
         bail!("--storage-dvm-expect-flush-fault requires --storage-dvm-only");
+    }
+    if options.data_disk.is_some() {
+        // A persistent data disk only exists in the writable GPT topology.
+        options.writable_storage = true;
+        options.dvm_block_shmem = true;
     }
     if options.writable_storage {
         if !options.dvm_block_shmem {

@@ -14,27 +14,25 @@
   capability possession, and token obscurity never substitutes for the rootd
   dependency graph.
 - Kernel fd tables mirror service-owned objects as `KernelHandle::RemoteVfs`.
-- `/proc` is a minimal vfsd-owned namespace (`services/vfsd/src/proc_fs.rs`).
-  Provided: `/proc` (empty directory listing), `/proc/self` (symlink to the
-  caller's decimal pid), `/proc/<own pid>` (directory) and
-  `/proc/<own pid>/exe` (symlink to the caller's executable path). Reachable
-  through `readlinkat`/`readlink`, `newfstatat` and `statx` (symlink mode
-  `S_IFLNK` unless the caller follows `exe`, in which case the target's stat is
-  returned) and `access`. Identity is the kernel-stamped `VfsIpcRequest.pid`;
-  any other pid, live or not, and every other name is `ENOENT`, so no other
-  process's path is disclosed. The executable path is a kernel fact
-  (`UserProcessState::exec_path`): Ring0 attaches it in
-  `VfsIpcRequest.payload` for `READLINKAT`/`NEWFSTATAT`/`STATX` only
-  (`service_ops/proc_identity.rs`; dropped, not truncated, when over capacity)
-  and vfsd never stores it. `readlinkat` on an existing non-`/proc` path is
-  `EINVAL` (nothing else is a symlink); a missing one is `ENOENT`.
-  Intentionally unsupported (no truthful backing source in vfsd, so no fake
-  nodes): `open`/`getdents64` of `/proc/self` or `/proc/<pid>`,
-  `/proc/<pid>/fd`, `cmdline`, `status`, `maps`, `meminfo`, `cpuinfo`.
-  `/proc/self/fd` needs the kernel fd table, which is not exposed to vfsd; a
-  future version should add a kernel-attested fd-number snapshot rather than
-  guess. Chrome's `base::CloseSuperfluousFds` falls back to closing up to the
-  rlimit when it is absent.
+- `/proc` is a vfsd-owned caller-only namespace (`proc_fs.rs`). `self`
+  links to the kernel-stamped caller PID; another PID is always `ENOENT`.
+  Vfsd admits maps/smaps, status/stat/statm, cmdline/environ, auxv, limits,
+  fd and task directories, then returns a typed delegation code. Ring0
+  supplies only the caller's actual VMAs, credentials, threads, argv/env,
+  auxiliary vector or fd snapshot; vfsd does not guess or retain them.
+  Generated regular files have `S_IFREG`, stat size 0 and read-to-EOF
+  semantics; snapshots over the 256-KiB bound fail, not truncate silently.
+  Fd links use actual object inode/name facts (`socket:[ino]`, `pipe:[ino]`,
+  memfd or remote pathname); proc directory handles support relative
+  open/readlink/stat. `O_PATH` snapshots grant neither read nor getdents.
+  Memfd magic-link reopen creates an independent cursor on the same sealed
+  object and cannot escalate a readonly source. Remote reopen uses
+  `VFS_FCNTL_REOPEN` (FCNTL arg0 `0x5255_0001`, source `remote_id`, requested
+  flags arg1, fresh kernel-minted description arg2, arg3 zero; OPENAT reply
+  shape). TmpFs pins the inode including an unlinked node; a backend without
+  genuine object reopen support fails explicitly, never looks up a saved
+  pathname and accidentally opens a replacement. Global `/proc/mounts`
+  reflects the current MountTable rather than a fixed boot-time string.
 - VFS device open responses use `VfsIpcResponse.aux` for service-owned route
   metadata such as `INPUTD_ACCESS_*` and `VFS_DEVICE_ACCESS_DRM_COMPAT`.
   Compat never classifies `/dev/*` path strings: vfsd resolves the namespace,
@@ -59,9 +57,12 @@
   create/ADD/MOD/DEL/retire and matching purges follow the same control rail.
   Cursor COMMIT/CANCEL and checkpoint visibility ACK likewise mutate provider
   custody and use one full state-mutation lease attempt, not the 16 ms
-  readiness rail or the 100 ms interactive rail. Foreground final remote-VFS close keeps the 100 ms rail; if a
-  prepared cursor rejects it with EBUSY after local fd retirement, retain the
-  exact close in deferred reconciliation rather than orphan the provider.
+  readiness rail or the 100 ms interactive rail. Explicit final remote-VFS
+  `close` waits for the 5 s state-mutation lease and reports a provider error
+  after retiring the numeric fd; a successful close must not leave a
+  path-backed inode pinned against an immediate rename. Implicit cleanup
+  keeps the short rail. If a prepared cursor rejects either with `EBUSY`,
+  retain the exact close in deferred reconciliation.
   Deferred replay preserves all four operation arguments,
   flags, dirfd, mutation identity, and bounded payload; in particular an epoll
   checkpoint ACK retains its original suboperation in arg3. Unconfirmed work
@@ -96,13 +97,19 @@
   another.
   Exec cleanup is likewise derived only from the exact `KernelHandle` values
   removed by the atomic process-table CLOEXEC commit; a pre-commit CLOEXEC
-  snapshot is not cleanup authority.
+  snapshot is not cleanup authority. Exit seals process visibility before it
+  drains the exact removed handles; VFS requests use the scheduler's current
+  task sender identity even after that seal, matching IPC receive attribution
+  for final CLOSE and its checkpoint ACK. Session and credential facts still
+  require a visible process snapshot.
 - A devmgrd ioctl route is policy advice, not fd identity. Compat must resolve
   the live fd-table entry again before dispatch: sessiond TTY operations require
   an actual `KernelHandle::Console`, so a closed/reused ordinary file fd
   receives `ENOTTY` and cannot read or mutate the caller's console policy.
 - `LinuxSyscallOffloadRequest.arg0..arg3` carry 64-bit fd-control args (target fd, cmd, arg, flags). **Do not pack pointer/flag values into the 32-bit `mask` field.**
-- `mount`/`umount2` route to vfsd → gated `SYS_RUSTOS_VFS_*_BROKER` for kernel mount-table mutation. Do not reintroduce direct generic-app `linux_ops::mount`/`umount2` paths.
+- `mount`/`umount2` route to vfsd and currently return `EOPNOTSUPP` when
+  no actual dynamic mount operation is available. Do not return false success
+  by changing only cache epochs, or reintroduce generic-app ring0 mount policy.
 - `poll`/`ppoll`/`epoll_*` route generic fd readiness policy and epoll
   interest state through `VFS_IPC_OP_POLL_QUERY`; socket readiness is `netd`
   policy, input readiness is `inputd` policy plus the narrow native-input
@@ -660,6 +667,28 @@ read-only accelerator.
   submission. Transport-info failure also clears them. Cached bytes therefore
   cannot survive revoke, restart, or mutation, and the optimization adds no
   controller authority or hidden fallback to vfsd.
+- TmpFs mounts `/tmp`, `/dev/shm` and `/run` use `CasePolicy::Exact` and
+  independent allocation-byte quotas, sparse holes, inode-pinned descriptions,
+  symlinks/socket nodes, rename modes, metadata updates and orphan reclamation.
+  `/run/user/1000` is created with mode 0700 and uid/gid 1000; `/tmp` and
+  `/dev/shm` are 01777. Traversal/open/mutation checks use attested credentials,
+  including sticky-directory ownership and chmod ownership. Policy remains in
+  vfsd. Supplementary-group/capability delegation is not fabricated by the
+  current primary-credential envelope.
+- A volatile description restored after provider restart is stale, never
+  converted into a pathname handle. Pinned directory enumeration uses the
+  node; renamed-directory bases are recovered from the live inode, not the
+  old path. Symlinks are expanded before later `..` components.
+- Netd's live service owner alone may use `VFS_REQUEST_FLAG_NETD_SOCKET_NODE`
+  for socket-node create/query/guarded rollback. `arg3` attests the original
+  client whose vfsd cwd resolves a relative path; pid/tid still identify the
+  actual netd sender. Create/query return stable `(mount_id,node_id)` in
+  `value/aux`; rollback arg1/arg2 must match that exact socket inode before
+  unlink, so a replacement node cannot be removed. Netd never treats path text
+  alone as filesystem binding identity.
+- Generic mount/umount operations that cannot update the actual mount owner
+  return unsupported; incrementing a cache generation is not mount success.
+  Automatic root/data/TmpFs publication remains service-owned MountTable state.
 - Vfsd's separate immutable file-byte cache is an admission-controlled
   convenience cache, not a DVM-read substitute. It may materialize at most
   one 16-MiB file within a 32-MiB total budget only for a zero-offset request
@@ -734,3 +763,21 @@ read-only accelerator.
   resource
   (`https://github.com/torvalds/linux/blob/master/drivers/pci/probe.c`).
 
+
+`SET_ATTRS` time bits 0/1 select atime/mtime, bits 4/5 request
+server-resolved NOW for the respective selected time. `arg1`/`arg2` carry
+signed seconds, `arg3` packs atime nanoseconds in its low 32 bits and mtime
+nanoseconds in its high 32 bits. DOS attributes (bit 3) cannot be combined
+with these time fields. Both NOW may be set by an owner, privileged caller, or
+a caller with write permission; mixed or explicit times require ownership or
+privilege. Both OMIT is handled as Linux's target-independent no-op.
+
+TmpFs quota tracks allocated chunks and symlink bytes, not Job provider-byte
+charges. A same-size truncate releases KEEP_SIZE allocations beyond EOF,
+including for an unlinked inode that remains open. Connecting Job byte charges
+needs a receipt-bearing reservation transaction outside the storage lock,
+actual allocation delta and rollback/reconciliation
+for concurrent writes, truncate, unlink and pinned orphans, plus durable
+ownership across cross-Job access and provider restart. Existing vfsd provider
+billing only charges open descriptions, and cannot safely stand in for that
+byte lifecycle.

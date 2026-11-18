@@ -126,7 +126,7 @@ pub(super) fn dispatch_admitted_request(
                 }
             } else {
                 if status == 0 {
-                    response.reserved1 = NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;
+                    response.reserved1 |= NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;
                 }
                 status
             }
@@ -144,7 +144,7 @@ pub(super) fn dispatch_admitted_request(
     } else {
         let status = dispatch_request(request, response, reply_cap);
         if local_socket_reply_requests_latency_handoff(request, response, status) {
-            response.reserved1 = NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;
+            response.reserved1 |= NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;
         }
         status
     };

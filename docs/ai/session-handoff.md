@@ -4,6 +4,72 @@ Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
 
+## Chrome filesystem/network integration (2026-11-18)
+
+- Follow-up: loader broker now derives initial executable/interpreter map
+  metadata from admitted pinned backing objects, pipes retain their endpoint
+  rights through SCM_RIGHTS, and exit-time VFS close uses the scheduler's
+  original sender identity. TmpFs same-size truncate releases KEEP_SIZE
+  reservations past EOF. Explicit final remote close now waits on the
+  mutation rail; exit/failure cleanup stays bounded separately.
+- Follow-up KVM: first boot saved the persistence marker and passed flock
+  autorelease, SCM_RIGHTS and maps. On that image a path-backed close/rename
+  race returned EBUSY. After the close fix, the same disk passed second-boot
+  persistence and atomic rename; exactly 3 of 378 checks still fail (mremap
+  move, mlock, and writable filesystem MAP_SHARED). No sandbox bypass or
+  test expectation was weakened. See `logs/chrome-integration/finish-kvm-*.log`.
+- Remaining: implementing a real MM-owner relocation transaction, cumulative
+  page-lock accounting and coherent VFS shared mappings requires more than
+  local syscall shims. TmpFs Job byte receipts and exact advisory-lock
+  transaction settlement/CLOEXEC are also still disconnected.
+
+- Request covers TmpFs, own-process proc/fd, advisory locks, seqpacket/path
+  sockets/netlink, Linux syscall semantics, runtime assets and complete gates.
+  Existing dirty implementation was preserved; no commit/push authorized.
+- Baseline 8-package tests passed: kernel-compat 429, kernel-ps 1183,
+  netd 132 (1 ignored), runtimed 113, storage-core 19, storage-fat 30,
+  vfsd 151, xtask 372 (1 ignored). Baseline `cargo xtask check` passed.
+  These are NOT acceptance for the follow-up changes.
+- Host Chrome traced for 20 seconds WITHOUT sandbox bypass, using an isolated
+  `--user-data-dir` and `--ozone-platform=wayland`; timeout exit 124 is expected
+  bounded collection, not a Chrome startup success verdict. Evidence under
+  `logs/chrome-integration/`: syscall signature JSON, full strace, stderr,
+  signed Arch strace package verification (no system installation).
+  Confirmed memfd + readonly proc-fd reopen, SEQPACKET, pathname Singleton
+  sockets/symlinks, POSIX range locks, rtnetlink, mremap, fallocate and utimensat.
+  Also observed sandbox namespace/seccomp calls, which remain out of scope.
+- Fixed in main: exclusive same-directory temporary data image publication;
+  launch directory recreation rather than stale success cache; explicit
+  `--chrome-probe-persist first|second` and guest contract enforcement.
+- Resumed using `gpt-6.1-terra:high` in persistent isolated worktrees
+  `/home/hongii2/worktrees/rustos/chrome-continue-1794972608/`; old `/tmp`
+  lanes are gone. Integrated the namespace credentials, SET_ATTRS ns/NOW/OMIT,
+  safe rejection of copied-page mremap moves, and close/copy safety fixes.
+  No commits/push. Do not reapply already integrated worktree deltas.
+- `target/chrome-validation` serial host tests passed: compat 436, PS 1184,
+  netd 138, runtimed 114, user ABI 124, storage core 19, FAT 30, syscalld 35,
+  VFS 163, xtask 374. Three opt-in tests ignored including a doctest. A
+  parallel netd run exited without a complete harness verdict; serial was
+  used for acceptance. The shared target also showed vfsd linking against
+  a foreign `FsError::Provider` definition; separate target builds compiled.
+- KVM: after fixing Wayland pre-created runtime-dir admission and preserving
+  cross-UID runtimed socket connections under SO_PEERCRED policy, the probe
+  ran twice on `build/kvm/chrome-final-1794974269.img`. Both exact persistence
+  markers passed. Both overall runs failed with 14/378 checks in five cases:
+  flock autorelease, SCM_RIGHTS pipe transfer EACCES, mremap move, mlock/msync
+  setup, and proc maps executable label. The corrected batch-message and
+  socket-stat probes on SEQPACKET passed. Guest logs preserved in
+  `logs/chrome-integration/kvm-{first,second}-final-debugcon.log`.
+- `cargo xtask check` and formal PR passed on the separate
+  `target/chrome-validation` lane; PR sealed 45 artifacts in 244 seconds
+  (`logs/chrome-integration/formal-pr-isolated.log`). This supersedes the
+  shared-target `FsError::Provider` witness failure, not guest acceptance.
+- Still disconnected: reliable lock exact outcome/lifecycle/CLOEXEC path
+  (provider transaction core present but not wired), job-backed TmpFs byte
+  receipts, atomic page relocation with VMA/fault-epoch/frame authority,
+  cumulative/populated memory lock support, end-to-end seqpacket rights;
+  new `mlock` rejects unsupported guarantees instead of pretending to lock.
+
 ## Scheduler / Housekeeping 1-vCPU Starvation & `io-manager` Audit (2026-11-15)
 
 - **1-vCPU starvation & `--fault-probe` fix:**

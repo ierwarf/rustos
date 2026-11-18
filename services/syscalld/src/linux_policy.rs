@@ -676,11 +676,18 @@ pub fn handle_umask(
     request: &LinuxSyscallOffloadRequest,
     response: &mut LinuxSyscallOffloadResponse,
 ) {
+    let query = rustos_user_abi::syscall::SYSCALL_OFFLOAD_UMASK_QUERY;
+    if request.flags & !query != 0 || (request.flags == query && request.mask != 0) {
+        response.status = errno::EINVAL;
+        return;
+    }
     let requested = request.mask & 0o777;
     let mut policy = policy_db().lock();
     let state = ensure_state_with_inheritance(&mut policy, request);
     let old = state.umask;
-    state.umask = requested;
+    if request.flags == 0 {
+        state.umask = requested;
+    }
     response.status = 0;
     response.payload_len = size_of::<u32>() as u32;
     response.payload[..size_of::<u32>()].copy_from_slice(&old.to_le_bytes());

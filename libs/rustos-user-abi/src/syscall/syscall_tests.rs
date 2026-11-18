@@ -485,10 +485,13 @@ fn socket_poll_owns_a_unique_offload_operation() {
 }
 
 #[test]
-fn netd_v8_deadline_wire_keeps_the_fixed_header_layout() {
-    assert_eq!(NETD_IPC_ABI_VERSION, 8);
+fn netd_v9_deadline_wire_keeps_the_fixed_header_layout() {
+    assert_eq!(NETD_IPC_ABI_VERSION, 9);
     assert_eq!(NETD_IPC_REQUEST_HEADER_SIZE, 136);
     assert_eq!(NETD_IPC_RESPONSE_HEADER_SIZE, 32);
+    assert_eq!(core::mem::offset_of!(NetdIpcResponse, discarded_tail), 12);
+    assert_eq!(NetdIpcResponse::default().discarded_tail, 0);
+    assert_eq!(super::NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF & super::NETD_IPC_RESPONSE_FLAG_RECORD_PRESENT, 0);
     assert_eq!(core::mem::offset_of!(NetdIpcRequest, deadline_ns), 112);
     assert_eq!(NetdIpcRequest::default().deadline_ns, 0);
     assert_eq!(
@@ -612,6 +615,100 @@ fn prepared_unix_publication_requires_exact_operation_tokens_and_channel() {
 }
 
 #[test]
+fn unix_socket_shape_admits_only_stream_and_seqpacket() {
+    use super::{
+        NET_BROKER_PUBLICATION_SOCK_SEQPACKET, SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
+        SYSCALL_OFFLOAD_OP_LINUX_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
+        net_broker_unix_socket_shape_valid as unix,
+    };
+    let flags = NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS;
+    assert!(unix(1, NET_BROKER_PUBLICATION_SOCK_STREAM, 0));
+    assert!(unix(1, NET_BROKER_PUBLICATION_SOCK_SEQPACKET | flags, 0));
+    // DGRAM (2), RAW (3), RDM (4), DCCP (6), PACKET (10) are not published.
+    for ty in [0, 2, 3, 4, 6, 10, 15] {
+        assert!(!unix(1, ty, 0), "type {ty}");
+    }
+    assert!(!unix(1, NET_BROKER_PUBLICATION_SOCK_SEQPACKET, 1), "protocol must be 0");
+    assert!(!unix(1, NET_BROKER_PUBLICATION_SOCK_SEQPACKET | 1 << 30, 0), "unknown flag");
+    assert!(!unix(2, NET_BROKER_PUBLICATION_SOCK_SEQPACKET, 0), "wrong domain");
+    // A seqpacket socket, socketpair and accept all publish; the kernel reads
+    // the type from the publication, so it must survive every operation.
+    let base = NetBrokerPrepareSocketPublication {
+        version: NET_BROKER_SOCKET_PUBLICATION_VERSION,
+        reply_cap: 11,
+        caller_pid: 12,
+        socket_token: 13,
+        domain: 1,
+        socket_type: NET_BROKER_PUBLICATION_SOCK_SEQPACKET,
+        ..NetBrokerPrepareSocketPublication::default()
+    };
+    for publication in [
+        NetBrokerPrepareSocketPublication {
+            operation: SYSCALL_OFFLOAD_OP_LINUX_SOCKET as u64,
+            ..base
+        },
+        NetBrokerPrepareSocketPublication {
+            operation: SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR as u64,
+            second_socket_token: 14,
+            ..base
+        },
+        NetBrokerPrepareSocketPublication {
+            operation: SYSCALL_OFFLOAD_OP_LINUX_ACCEPT as u64,
+            channel_id: 15,
+            ..base
+        },
+    ] {
+        assert!(net_broker_socket_publication_shape_valid(&publication));
+        let mut dgram = publication;
+        dgram.socket_type = 2;
+        assert!(!net_broker_socket_publication_shape_valid(&dgram));
+    }
+}
+
+#[test]
+fn netlink_socket_shape_is_route_raw_or_dgram_and_socket_only() {
+    use super::{
+        NET_BROKER_PUBLICATION_AF_NETLINK, NET_BROKER_PUBLICATION_SOCK_RAW,
+        SYSCALL_OFFLOAD_OP_LINUX_ACCEPT, SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
+        SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR, net_broker_netlink_socket_shape_valid as netlink,
+    };
+    let flags = NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS;
+    let n = NET_BROKER_PUBLICATION_AF_NETLINK;
+    assert!(netlink(n, NET_BROKER_PUBLICATION_SOCK_RAW | flags, 0));
+    assert!(netlink(n, 2, 0));
+    for ty in [0, 1, 4, 5, 6] {
+        assert!(!netlink(n, ty, 0), "type {ty}");
+    }
+    assert!(!netlink(n, NET_BROKER_PUBLICATION_SOCK_RAW, 9), "only NETLINK_ROUTE");
+    assert!(!netlink(n, NET_BROKER_PUBLICATION_SOCK_RAW | 1 << 30, 0), "unknown flag");
+    assert!(!netlink(1, NET_BROKER_PUBLICATION_SOCK_RAW, 0), "AF_UNIX is not netlink");
+    let socket = NetBrokerPrepareSocketPublication {
+        version: NET_BROKER_SOCKET_PUBLICATION_VERSION,
+        operation: SYSCALL_OFFLOAD_OP_LINUX_SOCKET as u64,
+        reply_cap: 11,
+        caller_pid: 12,
+        socket_token: 13,
+        domain: n,
+        socket_type: NET_BROKER_PUBLICATION_SOCK_RAW,
+        ..NetBrokerPrepareSocketPublication::default()
+    };
+    assert!(net_broker_socket_publication_shape_valid(&socket));
+    // A netlink socket cannot be paired or accepted.
+    let pair = NetBrokerPrepareSocketPublication {
+        operation: SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR as u64,
+        second_socket_token: 14,
+        ..socket
+    };
+    let accept = NetBrokerPrepareSocketPublication {
+        operation: SYSCALL_OFFLOAD_OP_LINUX_ACCEPT as u64,
+        channel_id: 15,
+        ..socket
+    };
+    assert!(!net_broker_socket_publication_shape_valid(&pair));
+    assert!(!net_broker_socket_publication_shape_valid(&accept));
+}
+
+#[test]
 fn vfs_writable_ipc_opcodes_are_distinct_and_version_unchanged() {
     use super::{
         VFS_IPC_ABI_VERSION, VFS_IPC_OP_FSYNC, VFS_IPC_OP_LIBRARY_READ, VFS_IPC_OP_PWRITE64,
@@ -625,6 +722,39 @@ fn vfs_writable_ipc_opcodes_are_distinct_and_version_unchanged() {
     assert_eq!(VFS_IPC_OP_STATFS, 31);
     assert_eq!(VFS_IPC_OP_SYMLINKAT, 32);
     assert_eq!(VFS_IPC_OP_SET_ATTRS, 33);
+}
+
+#[test]
+fn vfs_memfs_ops_are_distinct_additive_and_decode_modes() {
+    use super::{
+        vfs_fallocate_keep_size, vfs_mknod_kind, VfsMknodKind, VFS_FALLOC_FL_KEEP_SIZE,
+        VFS_FALLOC_FL_PUNCH_HOLE, VFS_IPC_ABI_VERSION, VFS_IPC_OP_CHMOD, VFS_IPC_OP_FALLOCATE,
+        VFS_IPC_OP_FCHMOD, VFS_IPC_OP_MKNOD, VFS_IPC_OP_SET_ATTRS,
+    };
+    assert_eq!(VFS_IPC_ABI_VERSION, 5);
+    let ops = [
+        VFS_IPC_OP_SET_ATTRS,
+        VFS_IPC_OP_MKNOD,
+        VFS_IPC_OP_CHMOD,
+        VFS_IPC_OP_FCHMOD,
+        VFS_IPC_OP_FALLOCATE,
+    ];
+    assert_eq!(ops, [33, 34, 35, 36, 37]);
+    assert_eq!(vfs_mknod_kind(0o140755), Some(VfsMknodKind::Socket));
+    assert_eq!(vfs_mknod_kind(0o100644), Some(VfsMknodKind::Regular));
+    assert_eq!(vfs_mknod_kind(0o644), Some(VfsMknodKind::Regular));
+    assert_eq!(vfs_mknod_kind(0o010600), Some(VfsMknodKind::Fifo));
+    assert_eq!(vfs_mknod_kind(0o020600), Some(VfsMknodKind::Device));
+    assert_eq!(vfs_mknod_kind(0o060600), Some(VfsMknodKind::Device));
+    assert_eq!(vfs_mknod_kind(0o040755), None);
+    assert_eq!(vfs_mknod_kind(0o120777), None);
+    assert_eq!(vfs_fallocate_keep_size(0), Some(false));
+    assert_eq!(vfs_fallocate_keep_size(VFS_FALLOC_FL_KEEP_SIZE), Some(true));
+    assert_eq!(
+        vfs_fallocate_keep_size(VFS_FALLOC_FL_PUNCH_HOLE | VFS_FALLOC_FL_KEEP_SIZE),
+        None
+    );
+    assert_eq!(vfs_fallocate_keep_size(0x10), None);
 }
 
 #[test]

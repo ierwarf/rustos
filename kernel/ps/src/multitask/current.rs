@@ -28,6 +28,8 @@ use owner_bindings::{
 
 mod ipc;
 mod pager;
+mod proc_view;
+pub use proc_view::live_user_thread_ids;
 
 pub use ipc::{
     arm_block_current_task, arm_block_current_task_on_endpoint,

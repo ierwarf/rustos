@@ -10,6 +10,9 @@ pub(super) fn handle_getsockname(request: &NetdIpcRequest, response: &mut NetdIp
     let Some(socket) = state.sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
+    if let UnixSocketState::Netlink(netlink) = &socket.state {
+        return netlink.write_sockaddr(response);
+    }
     sockaddr_payload(socket.local_path.as_ref(), response).unwrap_or_else(|errno| errno)
 }
 
@@ -21,6 +24,10 @@ pub(super) fn handle_getpeername(request: &NetdIpcRequest, response: &mut NetdIp
     let Some(socket) = state.sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
+    if let UnixSocketState::Netlink(_) = &socket.state {
+        // The only netlink peer is the kernel: nl_pid 0, no groups.
+        return netlink::write_kernel_sockaddr(response);
+    }
     let Some(addr) = socket.peer_path.as_ref() else {
         return libc::ENOTCONN;
     };
@@ -99,8 +106,14 @@ pub(super) fn handle_getsockopt(request: &NetdIpcRequest, response: &mut NetdIpc
     };
     let value = match request.arg2 {
         linux_abi::SO_ERROR => 0_i32,
-        linux_abi::SO_TYPE => linux_abi::SOCK_STREAM as i32,
-        linux_abi::SO_DOMAIN => linux_abi::AF_UNIX as i32,
+        linux_abi::SO_TYPE => match &socket.state {
+            UnixSocketState::Netlink(netlink) => netlink.sock_type() as i32,
+            _ => socket.kind.unix_socket_type() as i32,
+        },
+        linux_abi::SO_DOMAIN => match socket.kind {
+            UnixSocketKind::Netlink => libc::AF_NETLINK,
+            _ => linux_abi::AF_UNIX as i32,
+        },
         linux_abi::SO_PROTOCOL => 0_i32,
         linux_abi::SO_ACCEPTCONN => {
             if matches!(socket.state, UnixSocketState::Listening { .. }) {
@@ -148,6 +161,16 @@ pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
             .get_mut::<tcp::Socket>(tcp_handle)
             .set_nagle_enabled(value == 0);
         return 0;
+    }
+    if request.arg1 == netlink::SOL_NETLINK {
+        // No multicast notifications are implemented; do not claim subscription success.
+        let state = lock_net_state();
+        return match state.sockets.get(&request.socket_token) {
+            Some(socket) if socket.kind == UnixSocketKind::Netlink => libc::ENOPROTOOPT,
+            Some(_) => libc::ENOPROTOOPT,
+            None if state.inet_sockets.contains_key(&request.socket_token) => libc::ENOPROTOOPT,
+            None => libc::EBADF,
+        };
     }
     if request.arg1 != linux_abi::SOL_SOCKET {
         return inet_datagram::set_ip_option(request);

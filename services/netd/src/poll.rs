@@ -109,8 +109,16 @@ pub(super) fn unix_socket_revents_for(state: &NetState, socket: &UnixSocket, req
                         UnixSocketState::Connected(peer_connected) => Some(peer_connected),
                         _ => None,
                     });
+            let peer_limit = state.sockets.get(&connected.peer).map_or(SOCKET_BUFFER_CAPACITY, |peer| {
+                if peer.kind.preserves_message_boundaries() { (peer.options.recv_buffer as usize).min(SOCKET_BUFFER_CAPACITY) } else { SOCKET_BUFFER_CAPACITY }
+            });
+            let peer_seqpacket = state
+                .sockets
+                .get(&connected.peer)
+                .is_some_and(|peer| peer.kind.preserves_message_boundaries());
             if requested & linux_abi::POLLIN as u32 != 0
                 && (connected.incoming_bytes != 0
+                    || !connected.incoming.is_empty()
                     || connected.peer_write_closed
                     || connected.peer_closed)
             {
@@ -123,7 +131,9 @@ pub(super) fn unix_socket_revents_for(state: &NetState, socket: &UnixSocket, req
                     && !connected.peer_closed
                     && peer_connected.is_some_and(|peer| {
                         !peer.recv_closed
-                            && peer.incoming_bytes < SOCKET_BUFFER_CAPACITY
+                            && peer.incoming_bytes < peer_limit
+                            && !(peer_seqpacket
+                                && peer.incoming.len() >= SEQPACKET_MAX_QUEUED_MESSAGES)
                             && peer.incoming_control_bytes < SOCKET_CONTROL_BUFFER_CAPACITY
                     });
                 if writable {
@@ -140,6 +150,14 @@ pub(super) fn unix_socket_revents_for(state: &NetState, socket: &UnixSocket, req
             }
             if peer_connected.is_none() {
                 revents |= linux_abi::POLLERR as u32;
+            }
+        }
+        UnixSocketState::Netlink(netlink) => {
+            if requested & linux_abi::POLLIN as u32 != 0 && netlink.readable() {
+                revents |= linux_abi::POLLIN as u32;
+            }
+            if requested & linux_abi::POLLOUT as u32 != 0 {
+                revents |= linux_abi::POLLOUT as u32;
             }
         }
         UnixSocketState::Idle => {

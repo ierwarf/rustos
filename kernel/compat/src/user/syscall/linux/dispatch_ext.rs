@@ -7,6 +7,7 @@ use super::*;
 /// Handles the syscalls owned by this table; `None` means "not mine".
 pub(super) fn dispatch(frame: &mut SyscallFrame) -> Option<u64> {
     Some(match frame.rax {
+        linux_abi::SYS_FLOCK => super::file_lock_ops::syscall_linux_flock(frame.rdi, frame.rsi),
         linux_abi::SYS_PWRITE64 => {
             syscall_linux_vfs_pwrite64(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }
@@ -58,6 +59,31 @@ pub(super) fn dispatch(frame: &mut SyscallFrame) -> Option<u64> {
         linux_abi::SYS_FADVISE64 => {
             syscall_linux_vfs_fadvise64(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }
+        linux_abi::SYS_FALLOCATE => {
+            syscall_linux_vfs_fallocate(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+        }
+        linux_abi::SYS_FCHMOD => syscall_linux_vfs_fchmod(frame.rdi, frame.rsi),
+        linux_abi::SYS_CHMOD => syscall_linux_vfs_fchmodat(
+            linux_abi::AT_FDCWD as u64,
+            frame.rdi,
+            frame.rsi,
+            0,
+        ),
+        linux_abi::SYS_FCHMODAT => {
+            syscall_linux_vfs_fchmodat(frame.rdi, frame.rsi, frame.rdx, 0)
+        }
+        linux_abi::SYS_FCHMODAT2 => {
+            syscall_linux_vfs_fchmodat(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+        }
+        linux_abi::SYS_UTIMENSAT => {
+            syscall_linux_vfs_utimensat(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+        }
+        linux_abi::SYS_SENDFILE => {
+            syscall_linux_vfs_sendfile(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+        }
+        linux_abi::SYS_COPY_FILE_RANGE => syscall_linux_vfs_copy_file_range(
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+        ),
         linux_abi::SYS_CLOSE_RANGE => {
             syscall_linux_vfs_close_range(frame.rdi, frame.rsi, frame.rdx)
         }
@@ -72,9 +98,41 @@ pub(super) fn dispatch(frame: &mut SyscallFrame) -> Option<u64> {
         linux_abi::SYS_GETCPU => syscall_linux_getcpu(frame.rdi, frame.rsi),
         linux_abi::SYS_SCHED_GETSCHEDULER => syscall_linux_sched_getscheduler(frame.rdi as i64),
         linux_abi::SYS_SCHED_GETPARAM => syscall_linux_sched_getparam(frame.rdi as i64, frame.rsi),
-        linux_abi::SYS_SCHED_GET_PRIORITY_MAX | linux_abi::SYS_SCHED_GET_PRIORITY_MIN => {
-            syscall_linux_sched_get_priority_minmax(frame.rdi as i64)
+        linux_abi::SYS_SCHED_GET_PRIORITY_MAX => {
+            syscall_linux_sched_get_priority(frame.rdi as i64, true)
         }
+        linux_abi::SYS_SCHED_GET_PRIORITY_MIN => {
+            syscall_linux_sched_get_priority(frame.rdi as i64, false)
+        }
+        linux_abi::SYS_SCHED_SETSCHEDULER => {
+            syscall_linux_sched_setscheduler(frame.rdi as i64, frame.rsi as i64, frame.rdx)
+        }
+        linux_abi::SYS_SCHED_SETPARAM => syscall_linux_sched_setparam(frame.rdi as i64, frame.rsi),
+        linux_abi::SYS_GETRLIMIT => syscall_linux_getrlimit(frame.rdi, frame.rsi),
+        linux_abi::SYS_SETRLIMIT => syscall_linux_setrlimit(frame.rdi, frame.rsi),
+        linux_abi::SYS_RT_SIGTIMEDWAIT => {
+            syscall_linux_rt_sigtimedwait(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+        }
+        linux_abi::SYS_EPOLL_PWAIT2 => syscall_linux_epoll_pwait2(
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+        ),
+        linux_abi::SYS_SENDMMSG => {
+            syscall_linux_sendmmsg(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+        }
+        linux_abi::SYS_RECVMMSG => {
+            syscall_linux_recvmmsg(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+        }
+        linux_abi::SYS_MREMAP => {
+            syscall_linux_mremap(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+        }
+        linux_abi::SYS_MINCORE => syscall_linux_mincore(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_MLOCK => syscall_linux_mlock(frame.rdi, frame.rsi),
+        linux_abi::SYS_MLOCK2 => syscall_linux_mlock2(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_MUNLOCK => syscall_linux_munlock(frame.rdi, frame.rsi),
+        linux_abi::SYS_MLOCKALL => syscall_linux_mlockall(frame.rdi),
+        linux_abi::SYS_MUNLOCKALL => syscall_linux_munlockall(),
+        linux_abi::SYS_MSYNC => syscall_linux_msync(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_MEMBARRIER => syscall_linux_membarrier(frame.rdi, frame.rsi),
         linux_abi::SYS_SCHED_RR_GET_INTERVAL => {
             syscall_linux_sched_rr_get_interval(frame.rdi as i64, frame.rsi)
         }

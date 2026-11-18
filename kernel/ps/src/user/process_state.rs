@@ -239,6 +239,10 @@ pub struct UserProcessState {
     mapping_kmem: kernel_mm::api::kmem_charge::SharedMeter,
     exec_path: [u8; PROCESS_EXEC_PATH_CAPACITY],
     exec_path_len: usize,
+    /// Monotonic nanoseconds when the process was created. A fork child starts
+    /// at its own creation; `exec` keeps the value (same process). Reported as
+    /// `starttime` by procfs.
+    start_ns: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -589,6 +593,7 @@ impl UserProcessState {
             ),
             exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
             exec_path_len: 0,
+            start_ns: crate::arch::clock::monotonic_nanos(),
         };
         state.address_space.set_mapping_meter(state.mapping_kmem.clone());
         state.set_exec_path(exec_path);
@@ -1034,6 +1039,11 @@ impl UserProcessState {
         self.security
     }
 
+    /// Monotonic creation time of the process in nanoseconds.
+    pub fn start_ns(&self) -> u64 {
+        self.start_ns
+    }
+
     pub fn exec_path(&self) -> &str {
         core::str::from_utf8(&self.exec_path[..self.exec_path_len]).unwrap_or("")
     }
@@ -1090,6 +1100,7 @@ impl UserProcessState {
             mapping_kmem: kernel_mm::api::kmem_charge::SharedMeter::new(kernel_mm::api::kmem_charge::Class::Vma),
             exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
             exec_path_len: 0,
+            start_ns: crate::arch::clock::monotonic_nanos(),
         };
         state.address_space.set_mapping_meter(state.mapping_kmem.clone());
         state.set_exec_path(exec_path_override.unwrap_or(self.exec_path()));
@@ -1123,6 +1134,7 @@ impl UserProcessState {
             mapping_kmem,
             exec_path,
             exec_path_len,
+            start_ns,
         } = self;
         address_space.into_retirement_owner().retire((
             futex_namespace_id,
@@ -1142,6 +1154,7 @@ impl UserProcessState {
             mapping_kmem,
             exec_path,
             exec_path_len,
+            start_ns,
         ));
     }
 
@@ -1171,6 +1184,7 @@ impl UserProcessState {
             exec_path,
         );
         fresh.handles = handles;
+        fresh.start_ns = self.start_ns;
         // The old meter remains in old_state until its root is reclaimed.
         fresh.mapping_kmem = replacement_mapping_kmem;
         fresh.address_space.set_mapping_meter(fresh.mapping_kmem.clone());

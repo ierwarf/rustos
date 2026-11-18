@@ -1,5 +1,10 @@
 # path	undocumented_unsafe_limit	undocumented_ordering_limit
 kernel/nucleus-core/src/debug/milestone_class.rs	0	0
+kernel/compat/src/user/syscall/linux/file_lock_ops.rs	0	0
+kernel/compat/src/user/syscall/linux/mm_query_ops.rs	0	0
+kernel/compat/src/user/syscall/linux/openat_flags_ops.rs	0	0
+kernel/compat/src/user/syscall/linux/process_ext_ops.rs	0	0
+kernel/compat/src/user/syscall/linux/service_ops/file_ops.rs	0	0
 kernel/compat/src/user/syscall/linux/job_policy_ops.rs	0	0
 kernel/ps/src/multitask/current/job_policy.rs	0	0
 kernel/ps/src/multitask/process_table/identity.rs	0	0

@@ -555,14 +555,6 @@ pub fn syscall_linux_sched_getparam(pid: i64, param_ptr: u64) -> u64 {
     }
 }
 
-pub fn syscall_linux_sched_get_priority_minmax(policy: i64) -> u64 {
-    if policy == 0 {
-        0
-    } else {
-        linux_errno(LINUX_EINVAL)
-    }
-}
-
 pub fn syscall_linux_sched_rr_get_interval(pid: i64, ts_ptr: u64) -> u64 {
     if pid < 0 {
         return linux_errno(LINUX_EINVAL);

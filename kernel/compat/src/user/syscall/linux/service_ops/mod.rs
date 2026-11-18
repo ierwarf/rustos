@@ -1,15 +1,19 @@
 pub(crate) use super::*;
 
+mod anon_stat;
+pub mod file_ops;
 pub mod futex_thread;
 pub mod ipc_helpers;
 pub(in crate::user::syscall) mod local_fd;
 mod local_memfd_io;
 pub mod poll_epoll;
 pub mod proc_identity;
+mod proc_snapshot;
 pub mod process_time;
 pub mod vfs_meta;
 pub mod vfs_socket;
 
+pub use file_ops::*;
 pub use futex_thread::*;
 pub use ipc_helpers::*;
 pub use local_fd::{

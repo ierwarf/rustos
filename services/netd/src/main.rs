@@ -44,7 +44,7 @@ use rustos_user_abi::syscall::{
     NET_BROKER_PACKET_STATUS_ACTIVE, NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL,
     NET_BROKER_PACKET_STATUS_UNAVAILABLE, NET_BROKER_SOCKET_PUBLICATION_VERSION,
     NETD_DVM_SESSION_GRANT, NETD_DVM_SESSION_REVOKE, NETD_IPC_ABI_VERSION, NETD_IPC_OP_DVM_SESSION,
-    NETD_IPC_OP_POLL_BATCH, NETD_IPC_OP_REF_ACK, NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF,
+    NETD_IPC_OP_POLL_BATCH, NETD_IPC_OP_REF_ACK, NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF, NETD_IPC_RESPONSE_FLAG_RECORD_PRESENT,
     NETD_IPC_RESPONSE_HEADER_SIZE, NETD_POLL_MODE_QUERY, NETD_POLL_MODE_WAIT,
     NETD_POLL_BATCH_MAX, NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE,
     NetBrokerPrepareSocketPublication, NetdIpcRequest, NetdIpcResponse, NetdPollQueryWire, NetdPollResultWire, RustosNetBrokerArgs,
@@ -105,6 +105,11 @@ mod sys;
 use sys::*;
 mod unix_stream;
 use unix_stream::*;
+mod netlink;
+mod path_namespace;
+use path_namespace::{NodeState, PathNamespace};
+mod unix_seqpacket;
+use unix_seqpacket::SEQPACKET_MAX_QUEUED_MESSAGES;
 use commercial_protocol::{dispatch_commercial_request, validate_commercial_request};
 
 const RECV_BACKOFF: Duration = Duration::from_millis(1);
@@ -310,6 +315,39 @@ enum UnixSocketState {
         pending: VecDeque<u64>,
     },
     Connected(ConnectedState),
+    /// `AF_NETLINK`/`NETLINK_ROUTE` socket: queued whole reply messages.
+    Netlink(netlink::NetlinkState),
+}
+
+/// AF_UNIX socket type owned by netd. `Netlink` is not an AF_UNIX socket; it
+/// shares the socket table, charge, reference and readiness machinery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnixSocketKind {
+    Stream,
+    SeqPacket,
+    Netlink,
+}
+
+impl UnixSocketKind {
+    /// Linux `SOCK_*` base type for AF_UNIX kinds (netlink reports its own).
+    fn unix_socket_type(self) -> u64 {
+        match self {
+            Self::SeqPacket => libc::SOCK_SEQPACKET as u64,
+            Self::Stream | Self::Netlink => linux_abi::SOCK_STREAM,
+        }
+    }
+
+    fn from_unix_base_type(base_type: u64) -> Option<Self> {
+        match base_type as i32 {
+            libc::SOCK_STREAM => Some(Self::Stream),
+            libc::SOCK_SEQPACKET => Some(Self::SeqPacket),
+            _ => None,
+        }
+    }
+
+    fn preserves_message_boundaries(self) -> bool {
+        matches!(self, Self::SeqPacket)
+    }
 }
 
 #[derive(Debug)]
@@ -363,6 +401,7 @@ impl From<&str> for UnixAddress {
 
 #[derive(Debug)]
 struct UnixSocket {
+    kind: UnixSocketKind,
     owner: Credentials,
     refs: usize,
     options: SocketOptions,
@@ -443,6 +482,7 @@ struct NetState {
     sockets: SocketTable<UnixSocket>,
     inet_sockets: SocketTable<InetSocket>,
     bindings: BTreeMap<UnixAddress, u64>,
+    inode_bindings: BTreeMap<(u64, u64), u64>,
     next_autobind_id: u64,
     unix_queued_bytes: usize,
     inet: Option<InetStack>,
@@ -462,6 +502,7 @@ impl NetState {
             sockets: SocketTable::new(),
             inet_sockets: SocketTable::new(),
             bindings: BTreeMap::new(),
+            inode_bindings: BTreeMap::new(),
             next_autobind_id: 1,
             unix_queued_bytes: 0,
             inet: None,
@@ -546,10 +587,18 @@ fn net_state() -> &'static Mutex<NetState> {
     STATE.get_or_init(|| Mutex::new(NetState::new()))
 }
 
+#[derive(Default)]
 struct SocketReceive {
+    record_present: bool,
     read: usize,
     control: Vec<u8>,
     discarded: Vec<u8>,
+    /// SEQPACKET only: message bytes dequeued beyond `read` (truncated tail).
+    /// Zero for streams. The kernel advances its stream position by
+    /// `read + extra`, matching what the sender's position advanced.
+    extra: usize,
+    /// SEQPACKET only: the message did not fit the receive buffer.
+    truncated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -574,6 +623,18 @@ mod hardening_tests;
 #[cfg(test)]
 #[path = "tests/unix_socket_lifecycle_tests.rs"]
 mod unix_socket_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "tests/seqpacket_tests.rs"]
+mod seqpacket_tests;
+
+#[cfg(test)]
+#[path = "tests/path_namespace_tests.rs"]
+mod path_namespace_tests;
+
+#[cfg(test)]
+#[path = "tests/netlink_tests.rs"]
+mod netlink_tests;
 
 #[cfg(test)]
 mod idle_cadence_tests {

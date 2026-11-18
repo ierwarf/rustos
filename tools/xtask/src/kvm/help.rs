@@ -46,6 +46,16 @@ options:
                        partial writes, blocking wakeups, dup/fork/exec, poll/epoll);
                        fails fast on `localfd: FAIL`, requires `localfd: PASS`
                        (implies --gui-dvm-surfaces)
+  --chrome-probe-persist first|second require that persistence phase (also requires
+                        --chrome-compat-probe and --data-disk)
+  --chrome-compat-probe arm the `chromeprobe` session program: Chromium-class Linux
+                       surface (tmpfs /tmp,/dev/shm,/run semantics, /data persistence,
+                       POSIX/OFD/flock locks, AF_UNIX seqpacket/SCM_RIGHTS/abstract
+                       sockets, rtnetlink dumps, mremap/mincore/mlock, /proc/self,
+                       fd identity, sendfile); per-case `chromeprobe: <case> ok|FAIL`,
+                       fails fast on `chromeprobe: FAIL`, requires `chromeprobe: PASS`
+                       (implies --gui-dvm-surfaces and --writable-storage; with
+                       --data-disk and explicit first/second phases prove persistence)
   --fault-probe        arm the `faultprobe` session program: process-group fault
                        semantics (a fault in any thread kills the group once with
                        SIGSEGV and every sibling is gone, a leader-retired group
@@ -148,6 +158,10 @@ options:
                        depending on UI, input, network, or GPU readiness markers
   --writable-storage   attach a GPT image (partition 1 boot RO + partition 2
                        writable FAT32) via AHCI ide-hd instead of read-only CD
+  --data-disk <path>   keep the writable /data partition in this image across
+                       boots (implies --writable-storage; a missing file is
+                       created, an existing image's data partition is carried
+                       over, anything else is refused)
   --storage-dvm-expect-flush-fault
                        with --storage-dvm-only and exactly block.flush=fail,
                        require a pre-publication DeviceFault and reject any

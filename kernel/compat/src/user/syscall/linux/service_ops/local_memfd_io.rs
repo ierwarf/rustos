@@ -24,7 +24,17 @@ use super::*;
 // one explicit fairness point between bounded chunks.
 const LOCAL_MEMFD_IO_CHUNK_BYTES: usize = 64 * 1024;
 
+/// `EISDIR`: a generated procfs directory snapshot is read only by `getdents64`.
+const LINUX_EISDIR_ERRNO: i64 = 21;
+
+fn is_directory_snapshot(memfd: &multitask::MemfdHandle) -> bool {
+    memfd.proc_snapshot().is_some_and(|info| info.directory)
+}
+
 pub(super) fn read(memfd: &mut multitask::MemfdHandle, user_ptr: u64, user_len: u64) -> u64 {
+    if is_directory_snapshot(memfd) {
+        return linux_errno(LINUX_EISDIR_ERRNO);
+    }
     read_with(user_ptr, user_len, |_, chunk| memfd.read_into(chunk))
 }
 
@@ -34,6 +44,9 @@ pub(super) fn read_at(
     user_len: u64,
     offset: usize,
 ) -> u64 {
+    if is_directory_snapshot(memfd) {
+        return linux_errno(LINUX_EISDIR_ERRNO);
+    }
     read_with(user_ptr, user_len, |copied, chunk| {
         offset
             .checked_add(copied)

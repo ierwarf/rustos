@@ -98,9 +98,11 @@ impl HandleEntry {
     }
 
     pub fn set_status_flags(&mut self, status_flags: u64) {
-        let access_mode = self.status_flags & linux_abi::O_ACCMODE;
-        let mutable = status_flags & !linux_abi::O_ACCMODE;
-        self.status_flags = access_mode | (mutable & STATUS_FLAG_MASK);
+        // The access mode and `O_PATH` are fixed when the description opens.
+        let fixed_bits = linux_abi::O_ACCMODE | linux_abi::O_PATH;
+        let fixed = self.status_flags & fixed_bits;
+        let mutable = status_flags & !fixed_bits;
+        self.status_flags = fixed | (mutable & STATUS_FLAG_MASK);
     }
 }
 
@@ -775,6 +777,24 @@ impl HandleTable {
             snapshot.push((fd as u64, entry.clone()));
         }
         snapshot
+    }
+
+    /// Descriptor numbers currently open, ascending. Reserved (in-flight
+    /// receive) slots are not open descriptors and are excluded. This is the
+    /// kernel-attested fd list behind `/proc/<pid>/fd`.
+    pub fn fd_numbers(&self) -> Vec<u64> {
+        let mut numbers = Vec::new();
+        for (fd, entry) in self.standard.iter().enumerate() {
+            if entry.is_some() {
+                numbers.push(fd as u64);
+            }
+        }
+        for (index, entry) in self.entries.iter().enumerate() {
+            if entry.is_some() {
+                numbers.push(FIRST_DYNAMIC_FD as u64 + index as u64);
+            }
+        }
+        numbers
     }
 
     pub fn duplicate_min(&mut self, fd: u64, min_fd: u64, close_on_exec: bool) -> Option<u64> {

@@ -418,6 +418,9 @@ mod tests {
                 // reads its authenticated manifest's files through vfsd.
                 IPC_SERVICE_PAGERD => target == IPC_SERVICE_VFSD,
                 IPC_SERVICE_INPUTD => target == IPC_SERVICE_NETD,
+                // Added with filesystem-visible AF_UNIX names: netd creates the
+                // socket inode through vfsd.
+                IPC_SERVICE_NETD => target == IPC_SERVICE_VFSD,
                 IPC_SERVICE_SESSIOND => matches!(
                     target,
                     IPC_SERVICE_LOADERD | IPC_SERVICE_DEVMGRD | IPC_SERVICE_UISERVER

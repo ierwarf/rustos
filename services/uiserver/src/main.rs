@@ -525,10 +525,11 @@ fn run() -> Result<(), i32> {
         state.display.height,
         input_events.wake_sender(),
     )
-    .ok_or_else(|| {
-        diag_line("uiserver: mandatory Wayland compositor initialization failed");
-        startup.fail(Dependency::Wayland, libc::EIO, false);
-        libc::EIO
+    .map_err(|err| {
+        let errno = err.raw_os_error().unwrap_or(libc::EIO);
+        sys::debug_line(&format!("uiserver: mandatory Wayland initialization failed: {err}"));
+        startup.fail(Dependency::Wayland, errno, false);
+        errno
     })?;
     wayland
         .attach_readiness_waker(input_events.wake_sender())

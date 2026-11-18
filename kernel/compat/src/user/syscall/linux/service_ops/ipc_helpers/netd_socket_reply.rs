@@ -12,6 +12,12 @@ pub(super) fn netd_reply_uses_prepared_socket(request: &NetdIpcRequest) -> bool 
                     request.arg1,
                     request.arg2,
                 ))
+                || (request.op == SYSCALL_OFFLOAD_OP_LINUX_SOCKET
+                    && rustos_user_abi::syscall::net_broker_netlink_socket_shape_valid(
+                        request.arg0,
+                        request.arg1,
+                        request.arg2,
+                    ))
                 || rustos_user_abi::syscall::net_broker_unix_socket_shape_valid(
                     request.arg0,
                     request.arg1,
@@ -149,6 +155,26 @@ pub(super) fn install_prepared_netd_socket_response(
     Ok(decoded)
 }
 
+/// Whether a published AF_UNIX handle carries the right `SOCK_*` type.
+/// `socket()`/`socketpair()` publish the requested type; an accepted socket has
+/// the type of the listener it was accepted from.
+fn unix_socket_type_matches(
+    entry_type: u64,
+    accept: bool,
+    requested_type: u64,
+    listener_type: u64,
+) -> bool {
+    let valid_unix_type = entry_type == linux_abi::SOCK_STREAM
+        || entry_type == rustos_user_abi::syscall::NET_BROKER_PUBLICATION_SOCK_SEQPACKET;
+    if !accept {
+        return entry_type == requested_type & linux_abi::SOCK_TYPE_MASK && valid_unix_type;
+    }
+    // The producer stamps the listener's type into `arg4` of an accept request
+    // (netd ignores it); zero means a stream listener.
+    let expected = if listener_type == 0 { linux_abi::SOCK_STREAM } else { listener_type };
+    entry_type == expected && valid_unix_type
+}
+
 pub(super) fn prepared_netd_socket_response_matches(
     request: &NetdIpcRequest,
     decoded: &NetdIpcResponse,
@@ -199,8 +225,11 @@ pub(super) fn prepared_netd_socket_response_matches(
         }
         let token = if index == 0 { decoded.value } else { second };
         let matches = match entry.entry().handle() {
+            // AF_NETLINK sockets are netd-owned token handles with no stream
+            // bookkeeping, exactly like internet sockets.
             multitask::KernelHandle::InetSocket(socket) => {
-                domain == linux_abi::AF_INET
+                (domain == linux_abi::AF_INET
+                    || domain == rustos_user_abi::syscall::NET_BROKER_PUBLICATION_AF_NETLINK)
                     && socket.token_id() == token
                     && socket.domain() == domain
                     && socket.type_() == (socket_type & linux_abi::SOCK_TYPE_MASK)
@@ -210,7 +239,12 @@ pub(super) fn prepared_netd_socket_response_matches(
                 domain == linux_abi::AF_UNIX
                     && socket.token_id() == token
                     && socket.domain() == domain
-                    && socket.type_() == linux_abi::SOCK_STREAM
+                    && unix_socket_type_matches(
+                        socket.type_(),
+                        accept,
+                        socket_type,
+                        request.arg4,
+                    )
                     && socket.protocol() == protocol
                     && if accept {
                         socket.channel_id() != 0 && socket.channel_side() == 2

@@ -15,6 +15,7 @@ pub mod retired;
 pub mod ioctl;
 pub mod pager;
 pub mod performance;
+pub mod procfs;
 pub mod syscall;
 pub mod ui;
 pub mod windows;
@@ -218,7 +219,7 @@ mod tests {
             12
         );
         assert_eq!(syscall::COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE, 13);
-        assert_eq!(syscall::NETD_IPC_ABI_VERSION, 8);
+        assert_eq!(syscall::NETD_IPC_ABI_VERSION, 9);
         assert_eq!(syscall::SYS_RUSTOS_WAITSET_SIGNAL_BROKER, 0x5255_003f);
         assert_eq!(syscall::SYS_RUSTOS_ENTROPY_BROKER, 0x5255_0040);
         assert_eq!(syscall::SYS_RUSTOS_EARLY_SYSTEM_BROKER, 0x5255_0041);

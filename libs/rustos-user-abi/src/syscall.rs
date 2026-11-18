@@ -9,6 +9,7 @@ mod ipc_registers;
 mod ipc_fast_buffer;
 mod pager_fault;
 mod frame_source;
+mod file_lock;
 mod library_object;
 mod scheduling_context;
 pub mod smp_qualification;
@@ -24,6 +25,7 @@ pub use ipc_registers::*;
 pub use ipc_fast_buffer::*;
 pub use pager_fault::*;
 pub use frame_source::*;
+pub use file_lock::*;
 pub use library_object::*;
 pub use scheduling_context::*;
 pub use smp_qualification::*;
@@ -619,6 +621,8 @@ pub const SYSCALL_OFFLOAD_OP_LINUX_MOUNT: u16 = 22;
 pub const SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2: u16 = 23;
 pub const SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT: u16 = 24;
 pub const SYSCALL_OFFLOAD_OP_LINUX_UMASK: u16 = 25;
+/// Read the current umask without changing it (UMASK requests only).
+pub const SYSCALL_OFFLOAD_UMASK_QUERY: u64 = 1;
 pub const SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM: u16 = 26;
 pub const SYSCALL_OFFLOAD_OP_LINUX_GETPPID: u16 = 27;
 pub const SYSCALL_OFFLOAD_OP_LINUX_GETPGID: u16 = 28;
@@ -750,6 +754,9 @@ pub const VFS_IPC_OP_FSTAT: u16 = 8;
 pub const VFS_IPC_OP_FTRUNCATE: u16 = 9;
 pub const VFS_IPC_OP_GETDENTS64: u16 = 10;
 pub const VFS_IPC_OP_FCNTL: u16 = 11;
+/// Internal inode-bound reopen: remote_id is the pinned source, arg1 the
+/// requested flags, arg2 a fresh kernel-minted description; OPENAT reply shape.
+pub const VFS_FCNTL_REOPEN: u64 = 0x5255_0001;
 pub const VFS_IPC_OP_STATX: u16 = 12;
 pub const VFS_IPC_OP_NEWFSTATAT: u16 = 13;
 pub const VFS_IPC_OP_READLINKAT: u16 = 14;
@@ -782,6 +789,77 @@ pub const VFS_IPC_OP_RENAMEAT2: u16 = 30;
 pub const VFS_IPC_OP_STATFS: u16 = 31;
 pub const VFS_IPC_OP_SYMLINKAT: u16 = 32;
 pub const VFS_IPC_OP_SET_ATTRS: u16 = 33;
+/// SET_ATTRS time selection bits. NOW is resolved by vfsd, not the caller.
+pub const VFS_ATTR_ATIME: u64 = 1;
+pub const VFS_ATTR_MTIME: u64 = 2;
+pub const VFS_ATTR_ATIME_NOW: u64 = 16;
+pub const VFS_ATTR_MTIME_NOW: u64 = 32;
+// ---- BEGIN vfsd memory-filesystem ops (mknod/chmod/fchmod/fallocate) ----
+// All reuse the `VfsIpcRequest` header (no new wire struct); the unprefixed
+// `arg*` meanings below are the contract. Ownership of a created node comes
+// from the request's `euid`/`egid`; `mode` is already umask-adjusted.
+/// `mknodat(dirfd, path, mode, dev)`: `dirfd`/`path` as `OPENAT`, `arg0` is the
+/// full `st_mode` (file-type bits + permissions), `arg1` is `dev` (ignored).
+/// Only `VFS_MKNOD_S_IFSOCK` (the `bind(2)` name of an `AF_UNIX` socket) and
+/// `VFS_MKNOD_S_IFREG` create a node; `S_IFIFO` is `EOPNOTSUPP`, `S_IFCHR` and
+/// `S_IFBLK` are `EPERM`. An existing name is `EEXIST`. No handle is returned.
+pub const VFS_IPC_OP_MKNOD: u16 = 34;
+/// `fchmodat(dirfd, path, mode)`: `dirfd`/`path` as `OPENAT`, `arg0` the new
+/// permission bits (only `07777` is kept). Follows a trailing symlink.
+pub const VFS_IPC_OP_CHMOD: u16 = 35;
+/// `fchmod(fd, mode)`: `remote_id` names the open description, `arg0` is the
+/// new permission bits. Works on a file that was unlinked while open.
+pub const VFS_IPC_OP_FCHMOD: u16 = 36;
+/// `fallocate(fd, mode, offset, len)`: `remote_id` names the open description,
+/// `arg0` is the mode (`0` or `VFS_FALLOC_FL_KEEP_SIZE`), `arg1` the offset
+/// and `arg2` the length. The reply `value` is the resulting file length.
+/// `PUNCH_HOLE` and every other mode are `EOPNOTSUPP`.
+pub const VFS_IPC_OP_FALLOCATE: u16 = 37;
+pub const VFS_FALLOC_FL_KEEP_SIZE: u64 = 0x01;
+pub const VFS_FALLOC_FL_PUNCH_HOLE: u64 = 0x02;
+/// `VfsIpcRequest::flags` marker of a request netd sends for the AF_UNIX path
+/// namespace (`MKNOD(S_IFSOCK)`, `NEWFSTATAT`/`STATX`, non-directory
+/// `UNLINKAT`) with the binding caller's `euid`/`egid`. vfsd honours it only
+/// from the live netd owner and only for those shapes; any other sender is
+/// `EACCES`. See `vfsd::netd_namespace_admission`.
+pub const VFS_REQUEST_FLAG_NETD_SOCKET_NODE: u32 = 0x8000_0000;
+pub const VFS_MKNOD_S_IFMT: u64 = 0o170000;
+pub const VFS_MKNOD_S_IFSOCK: u64 = 0o140000;
+pub const VFS_MKNOD_S_IFREG: u64 = 0o100000;
+pub const VFS_MKNOD_S_IFBLK: u64 = 0o060000;
+pub const VFS_MKNOD_S_IFCHR: u64 = 0o020000;
+pub const VFS_MKNOD_S_IFIFO: u64 = 0o010000;
+
+/// What a `VFS_IPC_OP_MKNOD` mode asks for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VfsMknodKind {
+    Regular,
+    Socket,
+    Fifo,
+    Device,
+}
+
+/// Classifies the file-type bits of a `mknod` mode (`0` means regular, as in
+/// Linux). Returns `None` for an invalid type.
+pub const fn vfs_mknod_kind(mode: u64) -> Option<VfsMknodKind> {
+    match mode & VFS_MKNOD_S_IFMT {
+        0 | VFS_MKNOD_S_IFREG => Some(VfsMknodKind::Regular),
+        VFS_MKNOD_S_IFSOCK => Some(VfsMknodKind::Socket),
+        VFS_MKNOD_S_IFIFO => Some(VfsMknodKind::Fifo),
+        VFS_MKNOD_S_IFCHR | VFS_MKNOD_S_IFBLK => Some(VfsMknodKind::Device),
+        _ => None,
+    }
+}
+
+/// Decoded `fallocate` mode: `Some(keep_size)` for the supported modes.
+pub const fn vfs_fallocate_keep_size(mode: u64) -> Option<bool> {
+    match mode {
+        0 => Some(false),
+        VFS_FALLOC_FL_KEEP_SIZE => Some(true),
+        _ => None,
+    }
+}
+// ---- END vfsd memory-filesystem ops ----
 pub const VFS_LIBRARY_READ_MAX_BYTES: usize = 8 * 4096;
 pub const VFS_CURSOR_SETTLE_COMMIT: u64 = 1;
 pub const VFS_CURSOR_SETTLE_CANCEL: u64 = 2;
@@ -1101,10 +1179,10 @@ pub const ROOTD_LEASE_STATE_RUNNING: u16 = 1;
 pub const ROOTD_LEASE_STATE_EXITED: u16 = 2;
 pub const ROOTD_LEASE_STATE_RESTART_PENDING: u16 = 3;
 pub const ROOTD_LEASE_STATE_FAILED: u16 = 4;
-pub const NETD_IPC_ABI_VERSION: u16 = 8;
+pub const NETD_IPC_ABI_VERSION: u16 = 9;
 pub mod netd_message;
 pub const NETD_IPC_PAYLOAD_CAPACITY: usize = 32 * 1024;
-/// Netd v8 retains the fixed deadline header and adds copied IPv4 addresses
+/// Netd v9 separates truncated-record accounting from the latency hint and retains copied IPv4 addresses
 /// to datagram message envelopes. Only the header plus `payload_len` is sent; the unused tail of
 /// the in-memory transport buffer is not copied through the kernel IPC path.
 pub const NETD_IPC_REQUEST_HEADER_SIZE: usize =
@@ -1115,6 +1193,8 @@ pub const NETD_IPC_RESPONSE_HEADER_SIZE: usize =
 /// wait or a successful local-socket data transfer. The kernel may grant the
 /// awakened caller one bounded cross-class turn to finish the causal chain.
 pub const NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF: u32 = 1 << 0;
+/// A seqpacket receive dequeued a record, including an empty one.
+pub const NETD_IPC_RESPONSE_FLAG_RECORD_PRESENT: u32 = 1 << 1;
 /// Query readiness without waiting. This is the compatible default for the
 /// previously reserved `NetdIpcRequest::arg2` field on socket-poll requests.
 pub const NETD_POLL_MODE_QUERY: u64 = 0;
@@ -2886,6 +2966,11 @@ const NET_BROKER_PUBLICATION_AF_UNIX: u64 = 1;
 const NET_BROKER_PUBLICATION_AF_INET: u64 = 2;
 const NET_BROKER_PUBLICATION_SOCK_STREAM: u64 = 1;
 const NET_BROKER_PUBLICATION_SOCK_DGRAM: u64 = 2;
+/// `AF_NETLINK`/`SOCK_RAW`/`SOCK_SEQPACKET`: published sockets that netd owns
+/// in Ring3 (rtnetlink dump stub and message-boundary AF_UNIX).
+pub const NET_BROKER_PUBLICATION_AF_NETLINK: u64 = 16;
+pub const NET_BROKER_PUBLICATION_SOCK_RAW: u64 = 3;
+pub const NET_BROKER_PUBLICATION_SOCK_SEQPACKET: u64 = 5;
 const NET_BROKER_PUBLICATION_SOCK_TYPE_MASK: u64 = 0xf;
 const NET_BROKER_PUBLICATION_SOCK_NONBLOCK: u64 = 0o4000;
 const NET_BROKER_PUBLICATION_SOCK_CLOEXEC: u64 = 0o2000000;
@@ -2915,11 +3000,27 @@ pub const fn net_broker_inet_socket_shape_valid(domain: u64, socket_type: u64, p
         }
 }
 
-/// AF_UNIX stream sockets have no selectable transport protocol.
+/// AF_UNIX stream and seqpacket sockets have no selectable transport protocol.
+/// `SOCK_DGRAM` and every other type are not published here (netd answers
+/// `ESOCKTNOSUPPORT` before publication).
 pub const fn net_broker_unix_socket_shape_valid(domain:u64, socket_type:u64, protocol:u64)->bool {
     domain == NET_BROKER_PUBLICATION_AF_UNIX && protocol == 0
-        && socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK == NET_BROKER_PUBLICATION_SOCK_STREAM
+        && match socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK {
+            NET_BROKER_PUBLICATION_SOCK_STREAM | NET_BROKER_PUBLICATION_SOCK_SEQPACKET => true,
+            _ => false,
+        }
         && socket_type & !(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK | NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS) == 0
+}
+
+/// `AF_NETLINK` `NETLINK_ROUTE` (protocol 0) over `SOCK_RAW` or `SOCK_DGRAM`.
+/// Other netlink families are refused with `EPROTONOSUPPORT` by netd.
+pub const fn net_broker_netlink_socket_shape_valid(domain:u64, socket_type:u64, protocol:u64)->bool {
+    domain == NET_BROKER_PUBLICATION_AF_NETLINK && protocol == 0
+        && match socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK {
+            NET_BROKER_PUBLICATION_SOCK_RAW | NET_BROKER_PUBLICATION_SOCK_DGRAM => true,
+            _ => false,
+        }
+        && socket_type & !NET_BROKER_PUBLICATION_SOCK_TYPE_MASK & !NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS == 0
 }
 
 /// Intrinsic shape of one reply-bound socket/socketpair/accept publication.
@@ -2939,7 +3040,8 @@ pub const fn net_broker_socket_publication_shape_valid(
             op if op == SYSCALL_OFFLOAD_OP_LINUX_SOCKET as u64 => {
                 publication.second_socket_token == 0 && publication.channel_id == 0
                     && (net_broker_inet_socket_shape_valid(publication.domain, publication.socket_type, publication.protocol)
-                        || net_broker_unix_socket_shape_valid(publication.domain, publication.socket_type, publication.protocol))
+                        || net_broker_unix_socket_shape_valid(publication.domain, publication.socket_type, publication.protocol)
+                        || net_broker_netlink_socket_shape_valid(publication.domain, publication.socket_type, publication.protocol))
             }
             op if op == SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR as u64 => {
                 publication.second_socket_token != 0
@@ -2977,7 +3079,8 @@ mod net_broker_socket_publication_verification {
             assert_eq!((p.reserved0,p.reserved1,p.reserved2,p.reserved3),(0,0,0,0));
             assert!(p.reply_cap!=0 && p.caller_pid!=0 && p.socket_token!=0);
             assert!(net_broker_inet_socket_shape_valid(p.domain,p.socket_type,p.protocol)
-                || net_broker_unix_socket_shape_valid(p.domain,p.socket_type,p.protocol));
+                || net_broker_unix_socket_shape_valid(p.domain,p.socket_type,p.protocol)
+                || net_broker_netlink_socket_shape_valid(p.domain,p.socket_type,p.protocol));
             if p.operation!=SYSCALL_OFFLOAD_OP_LINUX_SOCKET as u64 {
                 assert!(net_broker_unix_socket_shape_valid(p.domain,p.socket_type,p.protocol));
             }
@@ -2998,7 +3101,8 @@ mod net_broker_socket_publication_verification {
             || p.reserved0!=0 || p.reserved1!=0 || p.reserved2!=0 || p.reserved3!=0
             || p.reply_cap==0 || p.caller_pid==0 || p.socket_token==0
             || !(net_broker_inet_socket_shape_valid(p.domain,p.socket_type,p.protocol)
-                || net_broker_unix_socket_shape_valid(p.domain,p.socket_type,p.protocol))
+                || net_broker_unix_socket_shape_valid(p.domain,p.socket_type,p.protocol)
+                || net_broker_netlink_socket_shape_valid(p.domain,p.socket_type,p.protocol))
             || (p.operation!=SYSCALL_OFFLOAD_OP_LINUX_SOCKET as u64
                 && p.operation!=SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR as u64
                 && p.operation!=SYSCALL_OFFLOAD_OP_LINUX_ACCEPT as u64);
@@ -3076,6 +3180,8 @@ pub struct NetdIpcResponse {
     pub op: u16,
     pub status: i32,
     pub reserved0: u32,
+    /// Bytes discarded from a truncated receive, excluding the returned length.
+    pub discarded_tail: u32,
     pub value: u64,
     pub payload_len: u32,
     pub reserved1: u32,
@@ -3089,6 +3195,7 @@ impl Default for NetdIpcResponse {
             op: 0,
             status: 0,
             reserved0: 0,
+            discarded_tail: 0,
             value: 0,
             payload_len: 0,
             reserved1: 0,

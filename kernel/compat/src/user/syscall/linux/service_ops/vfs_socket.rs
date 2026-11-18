@@ -23,7 +23,8 @@ use nucleus_core::util::{
     ring::RingBuffer,
 };
 use rustos_user_abi::syscall::{
-    VFS_DEVICE_ACCESS_DRM_COMPAT, VFS_IPC_OP_FSYNC, VFS_IPC_OP_PWRITE64,
+    VFS_DEVICE_ACCESS_DRM_COMPAT, VFS_IPC_OP_CHMOD, VFS_IPC_OP_FSYNC, VFS_IPC_OP_MKNOD,
+    VFS_IPC_OP_PWRITE64,
 };
 
 const VFS_DEVICE_ACCESS_NULL: u16 = VFS_DEVICE_ACCESS_DRM_COMPAT + 1;
@@ -238,9 +239,6 @@ pub fn syscall_linux_vfs_openat_str(
     flags: u64,
     mode: u64,
 ) -> Result<u64, i64> {
-    if let Some(result) = try_reopen_proc_self_memfd(path, flags) {
-        return result;
-    }
     if path.contains("startup-programs") || path.contains("runtime-env") {
         crate::debug::info!(
             compat,
@@ -268,9 +266,23 @@ pub fn syscall_linux_vfs_openat_str(
         let _ = call_vfs_remote_close_bounded(request.arg3);
         return Err(errno);
     }
+    // vfsd creates no description for a kernel-fact `/proc/<pid>` node; the
+    // delegation in `aux` makes this front-end build the snapshot itself.
+    if let Some(result) = proc_identity::complete_open(response.aux, flags) {
+        return result;
+    }
+    install_remote_vfs_response(response, request.arg3, flags, true)
+}
+
+fn install_remote_vfs_response(
+    response: VfsIpcResponse,
+    expected_id: u64,
+    flags: u64,
+    allow_device_handoff: bool,
+) -> Result<u64, i64> {
     let remote_id = response.remote_id;
-    if remote_id == 0 || remote_id != request.arg3 {
-        let _ = call_vfs_remote_close_bounded(request.arg3);
+    if remote_id == 0 || remote_id != expected_id {
+        let _ = call_vfs_remote_close_bounded(expected_id);
         return Err(LINUX_EINVAL);
     }
     let kind = match response.handle_kind {
@@ -309,7 +321,11 @@ pub fn syscall_linux_vfs_openat_str(
         )
     {
         let _ = call_vfs_remote_close_bounded(remote_id);
-        return open_device_via_devmgrd(handle_path.as_str(), flags);
+        return if allow_device_handoff {
+            open_device_via_devmgrd(handle_path.as_str(), flags)
+        } else {
+            Err(LINUX_EOPNOTSUPP)
+        };
     }
     if let Err(errno) = register_remote_vfs_open_description(remote_id) {
         // EEXIST is a capability collision and must not close the already
@@ -349,6 +365,29 @@ pub fn syscall_linux_vfs_openat_str(
     }
 }
 
+/// Reopen a pinned provider object, never its recorded pathname.
+pub(super) fn reopen_remote_vfs(fd: u64, remote_id: u64, flags: u64) -> Result<u64, i64> {
+    let new_id = mint_service_object_id();
+    let mut request = new_vfs_request(VFS_IPC_OP_FCNTL);
+    request.fd = fd;
+    request.remote_id = remote_id;
+    request.arg0 = rustos_user_abi::syscall::VFS_FCNTL_REOPEN;
+    request.arg1 = flags;
+    request.arg2 = new_id;
+    let response = match call_pinned_remote_vfs_request(&request) {
+        Ok(response) => response,
+        Err(errno) => {
+            let _ = call_vfs_remote_close_bounded(new_id);
+            return Err(errno);
+        }
+    };
+    if let Err(errno) = ensure_vfs_status(&response) {
+        let _ = call_vfs_remote_close_bounded(new_id);
+        return Err(errno);
+    }
+    install_remote_vfs_response(response, new_id, flags, false)
+}
+
 pub fn syscall_linux_vfs_close(fd: u64) -> u64 {
     let closed_handle = multitask::with_current_user_process_state_mut(|_, _, process_state| {
         process_state.handles_mut().close(fd)
@@ -357,6 +396,26 @@ pub fn syscall_linux_vfs_close(fd: u64) -> u64 {
     let Some(closed_handle) = closed_handle else {
         return linux_errno(LINUX_EBADF);
     };
+    // POSIX record locks go with any close of the file, before the description
+    // reference (which may be the last) is dropped.
+    super::super::file_lock_ops::note_fd_closed(&closed_handle);
+    if let multitask::KernelHandle::RemoteVfs(remote) = &closed_handle {
+        let id = remote.remote_id();
+        return match release_remote_vfs_descriptor_ref(id) {
+            Ok(false) => 0,
+            Ok(true) => {
+                // Path-backed files can be renamed only after vfsd retires
+                // the old description. Unlike background exit cleanup, the
+                // explicit close must acknowledge that mutation to the caller.
+                let mut request = new_vfs_request(VFS_IPC_OP_CLOSE);
+                request.remote_id = id;
+                let result = call_vfs_ipc_request(&request).and_then(|r| ensure_vfs_status(&r));
+                let _ = purge_vfs_epoll_object_bounded(WAITSET_PROVIDER_VFSD, id);
+                result.map_or_else(linux_errno, |()| 0)
+            }
+            Err(errno) => linux_errno(errno),
+        };
+    }
     if let Some(handle_ref) = service_handle_ref_for_handle(&closed_handle) {
         release_service_handle_refs_bounded(&[handle_ref]);
     }
@@ -400,6 +459,10 @@ pub(in crate::user::syscall::linux) fn syscall_linux_vfs_dup(oldfd: u64, newfd: 
 }
 
 pub fn syscall_linux_vfs_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
+    // Advisory record locks (F_GETLK/F_SETLK[W], F_OFD_*): vfsd owns the policy.
+    if let Some(result) = super::super::file_lock_ops::fcntl(fd, cmd, arg) {
+        return result;
+    }
     // Status flags and pipe sizing live on the kernel-local open description.
     if let Some(local) = super::local_fd::current_local_fd(fd)
         && let Some(result) = super::local_fd::fcntl(&local, cmd, arg)
@@ -523,7 +586,9 @@ pub fn call_pinned_remote_vfs_request(request: &VfsIpcRequest) -> Result<VfsIpcR
         | VFS_IPC_OP_READLINKAT
         | VFS_IPC_OP_ACCESS
         | VFS_IPC_OP_MKDIR
-        | VFS_IPC_OP_UNLINKAT => request.dirfd,
+        | VFS_IPC_OP_UNLINKAT
+        | VFS_IPC_OP_MKNOD
+        | VFS_IPC_OP_CHMOD => request.dirfd,
         _ => request.fd,
     };
     acquire_current_remote_vfs_ref(fd, request.remote_id)?;
@@ -619,6 +684,7 @@ fn duplicate_fd_transaction(
     };
 
     if let Some(replaced) = replaced {
+        super::super::file_lock_ops::note_fd_closed(&replaced);
         if let Some(handle_ref) = service_handle_ref_for_handle(&replaced) {
             release_service_handle_refs_bounded(&[handle_ref]);
         }
@@ -684,9 +750,13 @@ pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
     if let Some((inputd_access, status_flags)) = current_input_device_access(fd) {
         return read_input_device_via_inputd(fd, user_ptr, user_len, inputd_access, status_flags);
     }
-    let Some(remote) = current_remote_vfs_handle(fd) else {
+    let Some((remote, rights)) = current_remote_vfs_handle_with_rights(fd) else {
         return linux_errno(LINUX_EBADF);
     };
+    if !rights.allows_read() {
+        // A write-only or O_PATH description cannot be read.
+        return linux_errno(LINUX_EBADF);
+    }
     if remote.kind() == multitask::RemoteVfsHandleKind::Device {
         match remote.device_access() {
             INPUTD_ACCESS_NATIVE | INPUTD_ACCESS_EVDEV => {
@@ -817,9 +887,12 @@ pub fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, offset: 
     if let Some(multitask::KernelHandle::DeviceBuffer(buffer)) = current_kernel_handle(fd) {
         return super::local_memfd_io::read_device_buffer_at(&buffer, user_ptr, user_len, offset);
     }
-    let Some(remote) = current_remote_vfs_handle(fd) else {
+    let Some((remote, rights)) = current_remote_vfs_handle_with_rights(fd) else {
         return linux_errno(LINUX_EBADF);
     };
+    if !rights.allows_read() {
+        return linux_errno(LINUX_EBADF);
+    }
     if remote.kind() == multitask::RemoteVfsHandleKind::Device
         && let Some(result) = try_read_virtual_device(remote.device_access(), user_ptr, user_len)
     {
@@ -889,7 +962,7 @@ pub fn kernel_vfs_pread_bytes(fd: u64, offset: u64, dest: &mut [u8]) -> Result<u
     result
 }
 
-fn kernel_vfs_pread_bytes_pinned(
+pub(super) fn kernel_vfs_pread_bytes_pinned(
     fd: u64,
     remote_id: u64,
     offset: u64,
@@ -1320,6 +1393,9 @@ pub fn syscall_linux_vfs_close_range(first: u64, last: u64, flags: u64) -> u64 {
     })
     .unwrap_or_default();
     if !closed.is_empty() {
+        for handle in &closed {
+            super::super::file_lock_ops::note_fd_closed(handle);
+        }
         let refs = service_handle_refs_from_handles(&closed);
         release_service_handle_refs_bounded(&refs);
         purge_closed_console_handles(
@@ -1415,7 +1491,12 @@ pub(super) fn proc_self_fd_target(path: &str, caller_pid: u64) -> Option<u64> {
 pub(super) fn proc_fd_readlink_target(path: &str) -> Option<Result<alloc::string::String, i64>> {
     let caller_pid = multitask::current_user_process_id()?;
     let target_fd = proc_self_fd_target(path, caller_pid)?;
-    let resolved = multitask::with_current_user_process_state(|_, _, process_state| {
+    Some(proc_fd_link_text(target_fd))
+}
+
+/// The `readlink` text of `/proc/<own pid>/fd/<target_fd>`.
+pub(super) fn proc_fd_link_text(target_fd: u64) -> Result<alloc::string::String, i64> {
+    multitask::with_current_user_process_state(|_, _, process_state| {
         let Some(entry) = process_state.handles().get_entry(target_fd) else {
             return Err(LINUX_ENOENT);
         };
@@ -1452,11 +1533,11 @@ pub(super) fn proc_fd_readlink_target(path: &str) -> Option<Result<alloc::string
             }
             _ => alloc::string::String::from("anon_inode:[handle]"),
         })
-    })?;
-    Some(resolved)
+    })
+    .unwrap_or(Err(LINUX_ENOENT))
 }
 
-fn validate_memfd_reopen_flags(
+pub(super) fn validate_memfd_reopen_flags(
     flags: u64,
     source_rights: kernel_object::api::handle::HandleRights,
 ) -> Result<bool, i64> {
@@ -1466,6 +1547,9 @@ fn validate_memfd_reopen_flags(
     }
     if flags & linux_abi::O_CREAT != 0 && flags & LINUX_O_EXCL != 0 {
         return Err(LINUX_EEXIST);
+    }
+    if flags & linux_abi::O_PATH != 0 {
+        return Ok(false);
     }
     let (wants_read, wants_write) = match flags & linux_abi::O_ACCMODE {
         linux_abi::O_RDONLY => (true, false),
@@ -1485,45 +1569,6 @@ fn validate_memfd_reopen_flags(
     Ok(truncate)
 }
 
-fn try_reopen_proc_self_memfd(path: &str, flags: u64) -> Option<Result<u64, i64>> {
-    let caller_pid = multitask::current_user_process_id()?;
-    let target_fd = proc_self_fd_target(path, caller_pid)?;
-    let (memfd, source_rights, source_token) =
-        multitask::with_current_user_process_state(|_, _, process_state| {
-            let entry = process_state.handles().get_entry(target_fd)?;
-            match entry.handle() {
-                multitask::KernelHandle::Memfd(memfd) => {
-                    Some((memfd.clone(), entry.rights(), entry.token()))
-                }
-                _ => None,
-            }
-        })
-        .flatten()?;
-    let truncate = match validate_memfd_reopen_flags(flags, source_rights) {
-        Ok(truncate) => truncate,
-        Err(errno) => return Some(Err(errno)),
-    };
-    if truncate && let Err(err) = memfd.truncate(0) {
-        return Some(Err(memfd_error_to_linux_errno(err)));
-    }
-    let reopened = multitask::KernelHandle::Memfd(memfd.reopen());
-    let installed = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        if process_state
-            .handles()
-            .get_entry(target_fd)
-            .map(|entry| entry.token())
-            != Some(source_token)
-        {
-            return Err(LINUX_EBADF);
-        }
-        process_state
-            .handles_mut()
-            .install_with_open_flags(reopened, flags)
-            .ok_or(LINUX_EMFILE)
-    })
-    .unwrap_or(Err(LINUX_EBADF));
-    Some(installed)
-}
 
 fn call_vfs_remote_close(remote_id: u64) -> Result<(), i64> {
     call_vfs_remote_close_bounded(remote_id)
@@ -1532,7 +1577,7 @@ fn call_vfs_remote_close(remote_id: u64) -> Result<(), i64> {
 pub(super) fn call_vfs_remote_close_bounded(remote_id: u64) -> Result<(), i64> {
     let mut request = new_vfs_request(VFS_IPC_OP_CLOSE);
     request.remote_id = remote_id;
-    // Foreground final close: the fd is already retired and nobody consumes the
+    // Implicit/failure cleanup: the fd is retired and nobody consumes the
     // result, so keep the short rail; a timeout is replayed by housekeeping
     // under the state-mutation lease.
     call_vfs_ipc_request_with_timeout(&request,
@@ -2165,6 +2210,9 @@ pub fn acquire_cloned_service_handle_refs(
 }
 
 pub fn release_all_service_handle_refs(process_id: u64) {
+    // vfsd drops this process's POSIX locks from the lifecycle exit event; only
+    // the kernel-side "may hold locks" mark must not outlive the pid.
+    super::super::file_lock_ops::forget_process(process_id);
     // Callers have already sealed the process as exiting, which revokes its
     // visibility; the teardown accessor is the one path that still reaches the
     // handle table, so every open-description reference is released exactly

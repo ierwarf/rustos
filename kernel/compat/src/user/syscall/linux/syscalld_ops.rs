@@ -91,6 +91,24 @@ pub(super) fn syscall_linux_syscalld_prlimit64(
     0
 }
 
+/// `(soft, hard)` of `resource` for the calling process, read from the
+/// authoritative store in syscalld (the same `prlimit64(0, resource, NULL, &old)`
+/// a guest issues). Used to render `/proc/<pid>/limits`.
+pub(super) fn current_rlimit(resource: u64) -> Result<(u64, u64), i64> {
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64);
+    request.dirfd = 0;
+    request.flags = resource;
+    request.mask |= 0x2;
+    let response = call_syscalld(request)?;
+    ensure_syscalld_status(&response)?;
+    if response.payload_len as usize != LINUX_RLIMIT_SIZE {
+        return Err(LINUX_EINVAL);
+    }
+    let soft = u64::from_ne_bytes(response.payload[0..8].try_into().map_err(|_| LINUX_EINVAL)?);
+    let hard = u64::from_ne_bytes(response.payload[8..16].try_into().map_err(|_| LINUX_EINVAL)?);
+    Ok((soft, hard))
+}
+
 pub(super) fn syscall_linux_syscalld_sched_getaffinity(
     pid: u64,
     user_len: u64,

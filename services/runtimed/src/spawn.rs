@@ -1215,6 +1215,7 @@ fn spawn_exec_with_deadline(
     boot_line(format!("runtimed: loader request begin exec={}", exec_path).as_str());
     let argv_storage = build_exec_argv(exec_path, argv)?;
     let env_storage = build_exec_env(env)?;
+    ensure_launch_home_dirs(&env_storage);
     let mut request = build_loader_spawn_request(
         exec_path,
         &argv_storage,
@@ -1604,6 +1605,57 @@ fn build_exec_env(extra_env: &[String]) -> Result<Vec<CString>, i32> {
         load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Runtime)
             .map_err(runtime_registry_errno)?;
     build_exec_env_with_defaults(extra_env, &default_env)
+}
+
+/// Environment keys whose absolute directory must exist before the app starts.
+const LAUNCH_DIR_ENV_KEYS: [&str; 3] = ["HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"];
+
+/// The directories the effective launch environment names (entry value wins,
+/// as in `build_exec_env_with_defaults`): absolute paths of `HOME`,
+/// `XDG_CONFIG_HOME` and `XDG_CACHE_HOME`, deduplicated.
+fn launch_home_dirs<'a>(env: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut dirs: Vec<&str> = Vec::new();
+    for item in env {
+        let Some((key, value)) = item.split_once('=') else {
+            continue;
+        };
+        if LAUNCH_DIR_ENV_KEYS.contains(&key) && value.starts_with('/') && !dirs.contains(&value) {
+            dirs.push(value);
+        }
+    }
+    dirs
+}
+
+/// `mkdir -p` for each launch directory through `create`. `Ok(())` from
+/// `create` means the directory exists afterwards; any error is returned with
+/// its path and the remaining directories are still attempted. Nothing here
+/// reports success for a directory that could not be created.
+fn ensure_dirs_with(
+    dirs: &[&str],
+    mut create: impl FnMut(&str) -> std::io::Result<()>,
+) -> Vec<(String, i32)> {
+    let mut failures = Vec::new();
+    for dir in dirs {
+        if let Err(error) = create(dir) {
+            failures.push(((*dir).to_owned(), error.raw_os_error().unwrap_or(libc::EIO)));
+        }
+    }
+    failures
+}
+
+/// Creates the app's `HOME`/`XDG_*` directories on every launch. Policy lives
+/// here in ring3; vfsd only provides `mkdir`. A launch is not refused when the
+/// writable `/data` volume is absent (the app may not need it), but the
+/// failure is reported with its errno so it is never mistaken for success.
+fn ensure_launch_home_dirs(env: &[CString]) {
+    let items = env.iter().filter_map(|item| item.to_str().ok());
+    let wanted = launch_home_dirs(items);
+    let failures = ensure_dirs_with(&wanted, |dir| std::fs::create_dir_all(dir));
+    for (dir, errno) in failures {
+        debug_line(&format!(
+            "runtimed: launch dir unavailable path={dir} errno={errno}"
+        ));
+    }
 }
 
 fn build_exec_env_with_defaults(

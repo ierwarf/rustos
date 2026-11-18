@@ -23,6 +23,7 @@ fn poisoned_deferred_queue_is_drained_for_fail_closed_replies() {
 
 pub(super) fn connected_socket(peer: u64) -> UnixSocket {
     UnixSocket {
+        kind: UnixSocketKind::Stream,
         owner: Credentials::default(),
         refs: 1,
         options: SocketOptions::default(),

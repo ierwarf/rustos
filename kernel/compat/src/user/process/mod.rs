@@ -521,14 +521,16 @@ fn build_process_bootstrap(
                 // Ordinary reservations are releasable; this ceiling is not.
                 process_state.mapping_limit = stack.reserve_start - PAGE_SIZE;
             }
+            let (stack_pointer, startup) = linux::initialize_linux_user_stack(
+                address_space,
+                stack_end,
+                &image,
+                launch.linux,
+                security,
+            )?;
+            process_state.startup = startup;
             (
-                linux::initialize_linux_user_stack(
-                    address_space,
-                    stack_end,
-                    &image,
-                    launch.linux,
-                    security,
-                )?,
+                stack_pointer,
                 Some(process_state),
                 Some(linux::build_initial_memory_map(
                     &image,

@@ -5,12 +5,14 @@ extern crate alloc;
 pub mod checkpoint_wire;
 pub mod lifecycle;
 pub mod linux_types;
+pub mod locks;
 pub mod mount_table;
 pub mod path;
+pub mod permissions;
 pub mod proc_fs;
-pub mod run_dirs;
 pub mod snapshot_budget;
 pub mod snapshot_sessions;
+pub mod tmpfs;
 mod snapshot_lease;
 pub use snapshot_lease::ExecutableSnapshotLease;
 
@@ -30,6 +32,9 @@ use storage_core::{IoResult, StorageError};
 pub const ENOENT: i32 = 2;
 pub const ENOTDIR: i32 = 20;
 pub const EROFS: i32 = 30;
+pub const ELOOP: i32 = 40;
+/// Linux `MAXSYMLINKS`: symlink expansions allowed in one path resolution.
+pub const SYMLINK_FOLLOW_MAX: usize = 40;
 
 /// Selects the namespace base for an executable snapshot without copying cwd
 /// into a kernel or broker-owned process record. The caller is vfsd's endpoint
@@ -1032,23 +1037,6 @@ pub const fn persistent_mutation_status(op: u16) -> Option<i32> {
     }
 }
 
-pub fn mkdir_policy(path: &str, euid: u32) -> i32 {
-    let run_user_path = format!("/run/user/{euid}");
-    if path == "/run" || path == "/run/user" || path == run_user_path.as_str() {
-        0
-    } else {
-        EROFS
-    }
-}
-
-pub fn unlink_policy(path: &str) -> i32 {
-    if path.starts_with("/run/") {
-        ENOENT
-    } else {
-        EROFS
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1413,10 +1401,6 @@ mod tests {
             Some(EROFS)
         );
         assert_eq!(persistent_mutation_status(0xffff), None);
-        assert_eq!(mkdir_policy("/var/lib/rustos", 0), EROFS);
-        assert_eq!(unlink_policy("/var/lib/rustos/state"), EROFS);
-        assert_eq!(mkdir_policy("/run/user/1000", 1000), 0);
-        assert_eq!(unlink_policy("/run/user/1000/socket"), ENOENT);
     }
 
     #[test]
@@ -1825,6 +1809,128 @@ pub fn client_proxy_shape(
     ) && request_tid == sender_tid
         && request_pid != 0
         && request_pid != sender_pid
+}
+
+/// Compare a delegated socket rollback against the inode created by bind.
+pub fn socket_rollback_matches(expected: (u64, u64), actual: (u64, u64), is_socket: bool) -> bool {
+    expected.0 != 0 && expected.1 != 0 && is_socket && expected == actual
+}
+
+/// Admission of a request that acts for netd's AF_UNIX path namespace
+/// (`bind(2)` creates an `S_IFSOCK` node; `stat`/rollback keep it consistent).
+///
+/// Such a request carries `VFS_REQUEST_FLAG_NETD_SOCKET_NODE` and names the
+/// *binding caller's* `euid`/`egid` for ownership, so it is a delegated
+/// identity: only the live netd service owner (`sender_is_netd`, proven by the
+/// caller with a kernel-stamped sender check) may act that way, and only inside
+/// this narrow shape: a path relative to the delegated caller's cwd (arg3),
+/// or an absolute path, and `mknod(S_IFSOCK)`, a `stat`, or a non-directory
+/// `unlink` (whose target must additionally be a
+/// socket node, checked where the node kind is known). Every `MKNOD`, flagged
+/// or not, from the netd owner is held to the same shape, so a service cannot
+/// forge ownership or create other node kinds. A flag from any other sender
+/// is refused rather than ignored.
+pub fn netd_namespace_admission(
+    request: &rustos_user_abi::syscall::VfsIpcRequest,
+    sender_is_netd: bool,
+) -> Result<(), i32> {
+    use rustos_user_abi::syscall::{
+        VFS_IPC_OP_MKNOD, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_STATX, VFS_IPC_OP_UNLINKAT,
+        VFS_MKNOD_S_IFMT, VFS_MKNOD_S_IFSOCK, VFS_REQUEST_FLAG_NETD_SOCKET_NODE,
+    };
+    const EACCES: i32 = 13;
+    let flagged = request.flags & VFS_REQUEST_FLAG_NETD_SOCKET_NODE != 0;
+    if !sender_is_netd {
+        return if flagged { Err(EACCES) } else { Ok(()) };
+    }
+    let flags = request.flags & !VFS_REQUEST_FLAG_NETD_SOCKET_NODE;
+    let path_valid = request.path_len != 0
+        && request.path_len as usize <= request.path.len()
+        && !request.path[..request.path_len as usize].contains(&0);
+    let delegated = flagged && request.arg3 != 0
+        && (request.dirfd as i64 == -100 || request.dirfd == (-100i32 as u32) as u64)
+        && request.remote_id == 0;
+    let shape = match request.op {
+        VFS_IPC_OP_MKNOD => {
+            flags == 0
+                && request.arg0 & VFS_MKNOD_S_IFMT == VFS_MKNOD_S_IFSOCK
+                && request.arg0 & !(VFS_MKNOD_S_IFMT | 0o7777) == 0
+        }
+        // `AT_SYMLINK_NOFOLLOW` is the only stat flag netd uses.
+        VFS_IPC_OP_NEWFSTATAT | VFS_IPC_OP_STATX => flagged && (flags & !0x100) == 0,
+        VFS_IPC_OP_UNLINKAT => flagged && flags == 0,
+        _ => false,
+    };
+    if path_valid && delegated && shape {
+        Ok(())
+    } else {
+        Err(EACCES)
+    }
+}
+
+#[cfg(test)]
+mod netd_namespace_admission_tests {
+    use super::netd_namespace_admission as admit;
+    use rustos_user_abi::syscall::*;
+
+    fn request(op: u16, flags: u32, arg0: u64, path: &str) -> VfsIpcRequest {
+        let mut r = VfsIpcRequest { op, flags, arg0, arg3: 80, dirfd: (-100i64) as u64, ..VfsIpcRequest::default() };
+        r.path[..path.len()].copy_from_slice(path.as_bytes());
+        r.path_len = path.len() as u32;
+        r
+    }
+    const F: u32 = VFS_REQUEST_FLAG_NETD_SOCKET_NODE;
+    const SOCK: u64 = VFS_MKNOD_S_IFSOCK | 0o755;
+
+    #[test]
+    fn socket_rollback_requires_exact_nonzero_socket_identity() {
+        assert!(super::socket_rollback_matches((3, 9), (3, 9), true));
+        assert!(!super::socket_rollback_matches((3, 9), (3, 10), true));
+        assert!(!super::socket_rollback_matches((3, 9), (4, 9), true));
+        assert!(!super::socket_rollback_matches((3, 9), (3, 9), false));
+        assert!(!super::socket_rollback_matches((0, 0), (0, 0), true));
+    }
+
+    #[test]
+    fn netd_may_mknod_only_sockets_with_attested_cwd_delegation() {
+        assert_eq!(admit(&request(VFS_IPC_OP_MKNOD, F, SOCK, "/run/a.sock"), true), Ok(()));
+        assert_eq!(admit(&request(VFS_IPC_OP_MKNOD, 0, SOCK, "/run/a.sock"), true), Err(13));
+        let mut missing_pid = request(VFS_IPC_OP_MKNOD, F, SOCK, "a.sock");
+        missing_pid.arg3 = 0;
+        assert_eq!(admit(&missing_pid, true), Err(13));
+        let mut guessed_dir = request(VFS_IPC_OP_MKNOD, F, SOCK, "a.sock");
+        guessed_dir.remote_id = 9;
+        assert_eq!(admit(&guessed_dir, true), Err(13));
+        for mode in [VFS_MKNOD_S_IFREG | 0o644, VFS_MKNOD_S_IFIFO | 0o644, VFS_MKNOD_S_IFCHR, 0o644] {
+            assert_eq!(admit(&request(VFS_IPC_OP_MKNOD, F, mode, "/run/a"), true), Err(13));
+        }
+        assert_eq!(admit(&request(VFS_IPC_OP_MKNOD, F, SOCK | 0o100000_0, "/run/a"), true), Err(13));
+        assert_eq!(admit(&request(VFS_IPC_OP_MKNOD, F, SOCK, "run/a.sock"), true), Ok(()));
+        assert_eq!(admit(&request(VFS_IPC_OP_MKNOD, F, SOCK, ""), true), Err(13));
+        assert_eq!(admit(&request(VFS_IPC_OP_MKNOD, F | 0x200, SOCK, "/a"), true), Err(13));
+    }
+
+    #[test]
+    fn netd_stat_and_unlink_need_the_marker_and_no_directory_removal() {
+        assert_eq!(admit(&request(VFS_IPC_OP_NEWFSTATAT, F, 0, "/a"), true), Ok(()));
+        assert_eq!(admit(&request(VFS_IPC_OP_NEWFSTATAT, F | 0x100, 0, "/a"), true), Ok(()));
+        assert_eq!(admit(&request(VFS_IPC_OP_UNLINKAT, F, 0, "/a"), true), Ok(()));
+        assert_eq!(admit(&request(VFS_IPC_OP_UNLINKAT, F | 0x200, 0, "/a"), true), Err(13));
+        // Unmarked non-MKNOD ops from netd are outside this shape.
+        assert_eq!(admit(&request(VFS_IPC_OP_UNLINKAT, 0, 0, "/a"), true), Err(13));
+        assert_eq!(admit(&request(VFS_IPC_OP_OPENAT, F, 0, "/a"), true), Err(13));
+        assert_eq!(admit(&request(VFS_IPC_OP_RENAMEAT2, F, 0, "/a"), true), Err(13));
+        assert_eq!(admit(&request(VFS_IPC_OP_SET_ATTRS, F, 0, "/a"), true), Err(13));
+    }
+
+    #[test]
+    fn other_senders_cannot_claim_the_marker() {
+        assert_eq!(admit(&request(VFS_IPC_OP_MKNOD, F, SOCK, "/a"), false), Err(13));
+        assert_eq!(admit(&request(VFS_IPC_OP_UNLINKAT, F, 0, "/a"), false), Err(13));
+        // Ordinary client requests are unaffected.
+        assert_eq!(admit(&request(VFS_IPC_OP_MKNOD, 0, VFS_MKNOD_S_IFREG, "a"), false), Ok(()));
+        assert_eq!(admit(&request(VFS_IPC_OP_UNLINKAT, 0x200, 0, "a"), false), Ok(()));
+    }
 }
 
 #[cfg(test)]

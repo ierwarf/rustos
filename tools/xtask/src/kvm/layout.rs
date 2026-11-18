@@ -62,6 +62,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         || options.oom_hog
         || options.proc_stress
         || options.local_fd_probe
+        || options.chrome_compat_probe
         || options.fault_probe
         || options.library_map_probe
         || options.app_dmabuf_probe
@@ -102,6 +103,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
             options.oom_hog,
             options.proc_stress,
             options.local_fd_probe,
+            options.chrome_compat_probe.then_some(options.chrome_probe_persist.as_deref()),
             options.fault_probe,
             options.library_map_probe.then(|| library_probe_contract(options.library_reclaim_probe)),
             options.release_stage_probe,
@@ -196,14 +198,24 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
             )
         } else {
             const WRITABLE_DATA_PART_BYTES: u64 = 36 * 1024 * 1024;
-            crate::stage::write_gpt_boot_plus_writable_data_image(
+            // A persistent data disk keeps partition 2 (user data) across
+            // runs; partition 1 is always rewritten from the fresh boot image.
+            // An existing file is only ever replaced by a validated carry-over
+            // built beside it, never reformatted.
+            let (disk, previous) = match options.data_disk.as_deref() {
+                Some(path) => (path.to_path_buf(), path.exists().then_some(path)),
+                None => (disk, None),
+            };
+            crate::stage::write_gpt_boot_plus_data_image(
                 &runtime_disk,
                 &disk,
                 WRITABLE_DATA_PART_BYTES,
+                previous,
             )
             .with_context(|| {
                 format!(
-                    "create writable GPT storage-DVM disk from {}",
+                    "create writable GPT storage-DVM disk {} from {}",
+                    disk.display(),
                     runtime_disk.display()
                 )
             })?;
@@ -710,6 +722,7 @@ fn write_private_kvm_contracts(
     oom_hog: bool,
     proc_stress: bool,
     local_fd_probe: bool,
+    chrome_compat_probe: Option<Option<&str>>,
     fault_probe: bool,
     library_map_probe: Option<&[u8]>,
     release_stage_probe: bool,
@@ -772,6 +785,14 @@ fn write_private_kvm_contracts(
                 .context("create private KVM local fd probe contract file")?;
             contract.truncate()?;
             FatWrite::write_all(&mut contract, LOCAL_FD_PROBE_CONTRACT_BODY)?;
+            FatWrite::flush(&mut contract)?;
+        }
+        if let Some(phase) = chrome_compat_probe {
+            let mut contract = root
+                .create_file(PRIVATE_CHROME_PROBE_CONTRACT_PATH)
+                .context("create private KVM chrome compat probe contract file")?;
+            contract.truncate()?;
+            FatWrite::write_all(&mut contract, &chrome_probe_contract(phase))?;
             FatWrite::flush(&mut contract)?;
         }
         if fault_probe {

@@ -1385,7 +1385,7 @@ pub(super) fn initialize_linux_user_stack(
     image: &LinuxProcessImageInfo,
     launch: LinuxProcessLaunch<'_>,
     security: ProcessSecurityContext,
-) -> Result<VirtAddr, ProcessLoadError> {
+) -> Result<(VirtAddr, linux_abi::LinuxStartupLayout), ProcessLoadError> {
     let aligned_top = align_down(stack_end.as_u64(), 16);
     let mut cursor = aligned_top;
     let mut random_bytes = [0_u8; LINUX_STACK_RANDOM_BYTES];
@@ -1416,12 +1416,17 @@ pub(super) fn initialize_linux_user_stack(
         )?
     };
 
+    // Strings are pushed downward, so memory ascends argv, envp, execfn: the
+    // cursor after each push is the start of that group and the end of the
+    // group below it.
+    let env_end = cursor;
     let env_ptrs = push_stack_c_string_list(
         address_space,
         &mut cursor,
         launch.env,
         "linux env string placement overflow",
     )?;
+    let env_start = cursor;
 
     let argv_ptrs = push_stack_c_string_list(
         address_space,
@@ -1429,6 +1434,7 @@ pub(super) fn initialize_linux_user_stack(
         launch.argv,
         "linux argv string placement overflow",
     )?;
+    let arg_start = cursor;
 
     let stack_words = build_linux_initial_stack_words(
         image,
@@ -1459,7 +1465,17 @@ pub(super) fn initialize_linux_user_stack(
     }
 
     address_space.initialize_user_bytes(VirtAddr::new(stack_start), &stack_bytes)?;
-    Ok(VirtAddr::new(stack_start))
+    // Words: argc, argv[..], NULL, envp[..], NULL, then the auxiliary vector.
+    let auxv_offset_words = 1 + argv_ptrs.len() + 1 + env_ptrs.len() + 1;
+    let startup = linux_abi::LinuxStartupLayout {
+        arg_start,
+        arg_end: env_start,
+        env_start,
+        env_end,
+        auxv_start: stack_start + (auxv_offset_words * core::mem::size_of::<u64>()) as u64,
+        auxv_end: stack_start + stack_bytes_len,
+    };
+    Ok((VirtAddr::new(stack_start), startup))
 }
 
 fn build_linux_initial_stack_words(

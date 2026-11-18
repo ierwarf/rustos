@@ -51,7 +51,7 @@ impl VfsState {
             COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH => {
                 let (mount_generation, mounted) = {
                     let storage = lock_vfs_storage();
-                    (storage.mount_generation, u64::from(!storage.mounts.is_empty()))
+                    (storage.mount_generation, u64::from(storage.mounts.has_root()))
                 };
                 response.value0 = mount_generation;
                 response.value1 = mounted;
@@ -132,6 +132,12 @@ impl VfsState {
             response.status = errno;
             return;
         }
+        if request.op != VFS_IPC_OP_CLOSE
+            && self.handles.get(&request.remote_id).is_some_and(|handle| handle.stale)
+        {
+            response.status = ESTALE;
+            return;
+        }
         // Restored checkpoint handles are structural descriptions, not a
         // live kernel-funded client session. After a vfsd restart the old
         // provider PID's charges have been drained by rootd. Reuse of the
@@ -144,7 +150,8 @@ impl VfsState {
                 VFS_IPC_OP_PWRITE64 | VFS_IPC_OP_FSYNC |
                 VFS_IPC_OP_LSEEK | VFS_IPC_OP_FSTAT | VFS_IPC_OP_GETDENTS64 |
                 VFS_IPC_OP_FCNTL | VFS_IPC_OP_CURSOR_SETTLE | VFS_IPC_OP_FTRUNCATE |
-                VFS_IPC_OP_FILE_IDENTITY)
+                VFS_IPC_OP_FILE_IDENTITY | VFS_IPC_OP_FCHMOD | VFS_IPC_OP_FALLOCATE |
+                VFS_IPC_OP_FILE_LOCK)
             && !self.has_funded_open_description(request.remote_id,request.pid)
         {
             response.status=116; // ESTALE, forces reopen against new provider
@@ -182,6 +189,11 @@ impl VfsState {
             VFS_IPC_OP_STATFS => self.vfs_statfs(request, response),
             VFS_IPC_OP_SYMLINKAT => self.vfs_symlinkat(request, response),
             VFS_IPC_OP_SET_ATTRS => self.vfs_set_attrs(request, response),
+            VFS_IPC_OP_MKNOD => self.vfs_mknod(request, response),
+            VFS_IPC_OP_CHMOD => self.vfs_chmod(request, response),
+            VFS_IPC_OP_FCHMOD => self.vfs_fchmod(request, response),
+            VFS_IPC_OP_FALLOCATE => self.vfs_fallocate(request, response),
+            VFS_IPC_OP_FILE_LOCK => self.vfs_file_lock(request, response),
             VFS_IPC_OP_POLL_QUERY => self.vfs_poll_query(request, response),
             _ => response.status = EINVAL,
         }
@@ -624,23 +636,20 @@ impl VfsState {
         // Resolve against the caller's cwd like every other path operation: a
         // relative path must not be judged as if it were already absolute.
         response.status = match self.linux_resolved_path(request, path) {
-            Ok(path) => lock_vfs_storage().run_dirs.mkdir(path.as_str(), request.euid),
+            Ok(path) => lock_vfs_storage().mkdir_path(
+                path.as_str(),
+                FsCreateAttrs::new(request.arg0 as u32, request.euid, request.egid),
+            ),
             Err(errno) => errno,
         };
     }
 
     fn linux_mount(&mut self, response: &mut LinuxSyscallOffloadResponse) {
-        response.status = match lock_vfs_storage().advance_mount_generation() {
-            Ok(()) => 0,
-            Err(errno) => errno,
-        };
+        response.status = EOPNOTSUPP;
     }
 
     fn linux_umount2(&mut self, response: &mut LinuxSyscallOffloadResponse) {
-        response.status = match lock_vfs_storage().advance_mount_generation() {
-            Ok(()) => 0,
-            Err(errno) => errno,
-        };
+        response.status = EOPNOTSUPP;
     }
 
     fn linux_unlinkat(
@@ -652,7 +661,11 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        response.status = unlink_policy(path);
+        response.status = match self.linux_resolved_path(request, path) {
+            Ok(path) => lock_vfs_storage()
+                .unlink_path(path.as_str(), request.flags & linux_abi::AT_REMOVEDIR as u64 != 0),
+            Err(errno) => errno,
+        };
     }
 
 }

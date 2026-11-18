@@ -1,0 +1,25 @@
+id = "chromeprobe"
+kind = "app"
+execution_domain = "user"
+startup = "session"
+
+[build]
+builder = "c-demo"
+source = "chrome_probe.c"
+extra_args = ["-pthread"]
+
+[install]
+path = "apps/chromeprobe/chromeprobe.elf"
+
+# In-guest checker for the Linux surface a Chromium-class browser needs (tmpfs,
+# /data persistence, locks, AF_UNIX/netlink, memory syscalls, /proc/self, fd
+# identity). Session program: runs only when `cargo xtask kvm-smoke
+# --chrome-compat-probe` wrote the private contract file. Reports
+# `chromeprobe: <case> ok|FAIL <detail>` and the verdict `chromeprobe: PASS` /
+# `chromeprobe: FAIL ...` on the kernel debug channel.
+[[desktop.entries]]
+display_name = "Chrome compat probe"
+weight_micros = 100
+logical_admin = false
+console_hosted = false
+no_display = true

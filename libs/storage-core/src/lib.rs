@@ -17,7 +17,7 @@ pub mod file_io;
 pub mod fs;
 
 pub use fs::{
-    dos_attrs, CasePolicy, FsCapabilities, FsDirEntry, FsError, FsMetadata, FsNodeKind,
+    dos_attrs, CasePolicy, FsCapabilities, FsCreateAttrs, FsDirEntry, FsError, FsMetadata, FsNodeKind,
     FsOpenOptions, FsStatFs, FsTimestamp, FsVolume,
 };
 

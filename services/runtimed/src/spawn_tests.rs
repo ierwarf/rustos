@@ -83,7 +83,7 @@
 
     use super::{
         admitted_task_weight_micros, bind_then_activate_spawned_process, build_exec_argv,
-        build_exec_env_with_defaults, cleanup_failed_spawn, parse_kvm_acceptance_contract,
+        build_exec_env_with_defaults, cleanup_failed_spawn, ensure_dirs_with, launch_home_dirs, parse_kvm_acceptance_contract,
         smp_qualification_bind_args, upsert_env,
     };
     use crate::{
@@ -251,7 +251,10 @@
     fn build_exec_env_preserves_explicit_values_and_adds_defaults() {
         let defaults = [
             String::from("PATH=/bin:/usr/bin:/usr/local/bin"),
-            String::from("HOME=/home/user"),
+            String::from("HOME=/data/home"),
+            String::from("XDG_CONFIG_HOME=/data/config"),
+            String::from("XDG_CACHE_HOME=/data/cache"),
+            String::from("TMPDIR=/tmp"),
             String::from("XDG_RUNTIME_DIR=/run/user/1000"),
             String::from("WAYLAND_DISPLAY=wayland-0"),
             String::from("XDG_SESSION_TYPE=wayland"),
@@ -273,7 +276,10 @@
         assert!(values
             .iter()
             .any(|item| item == "XDG_RUNTIME_DIR=/run/custom"));
-        assert!(values.iter().any(|item| item == "HOME=/home/user"));
+        assert!(values.iter().any(|item| item == "HOME=/data/home"));
+        assert!(values.iter().any(|item| item == "XDG_CONFIG_HOME=/data/config"));
+        assert!(values.iter().any(|item| item == "XDG_CACHE_HOME=/data/cache"));
+        assert!(values.iter().any(|item| item == "TMPDIR=/tmp"));
         assert!(values
             .iter()
             .any(|item| item == "WAYLAND_DISPLAY=wayland-0"));
@@ -287,6 +293,77 @@
         assert!(!values
             .iter()
             .any(|item| item == "XDG_RUNTIME_DIR=/run/user/1000"));
+    }
+
+    #[test]
+    fn app_launch_entry_env_wins_over_shared_defaults_and_empty_entry_gets_all() {
+        let defaults = [
+            String::from("HOME=/data/home"),
+            String::from("TMPDIR=/tmp"),
+        ];
+        let empty = build_exec_env_with_defaults(&[], &defaults).expect("defaults only");
+        assert_eq!(empty.len(), 2);
+        let overridden =
+            build_exec_env_with_defaults(&[String::from("HOME=/elsewhere")], &defaults)
+                .expect("entry override");
+        let values = overridden
+            .iter()
+            .map(|item| item.to_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["HOME=/elsewhere", "TMPDIR=/tmp"]);
+    }
+
+    #[test]
+    fn launch_home_dirs_come_from_the_effective_env_and_are_absolute() {
+        let env = [
+            "PATH=/bin",
+            "HOME=/data/home",
+            "XDG_CONFIG_HOME=/data/config",
+            "XDG_CACHE_HOME=/data/home",
+            "TMPDIR=/tmp",
+        ];
+        assert_eq!(
+            launch_home_dirs(env.iter().copied()),
+            ["/data/home", "/data/config"]
+        );
+        assert!(launch_home_dirs(["HOME=relative", "XDG_CACHE_HOME"].into_iter()).is_empty());
+    }
+
+    #[test]
+    fn launch_directory_is_recreated_after_removal() {
+        let root = std::env::temp_dir().join(format!("runtimed-launch-dir-{}", std::process::id()));
+        let dir = root.join("home");
+        let path = dir.to_str().unwrap();
+        assert!(ensure_dirs_with(&[path], |dir| std::fs::create_dir_all(dir)).is_empty());
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(ensure_dirs_with(&[path], |dir| std::fs::create_dir_all(dir)).is_empty());
+        assert!(dir.is_dir());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ensure_dirs_reports_each_failure_and_keeps_going() {
+        let mut seen = Vec::new();
+        let failures = ensure_dirs_with(&["/data/home", "/data/config", "/data/cache"], |dir: &str| {
+            seen.push(dir.to_owned());
+            if dir == "/data/config" {
+                Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(seen.len(), 3);
+        assert_eq!(failures, [(String::from("/data/config"), libc::ENOENT)]);
+    }
+
+    #[test]
+    fn chrome_launch_manifest_never_requests_sandbox_bypass() {
+        // The catalog is generated from this manifest; its args and env must
+        // not carry sandbox-bypass flags (apps/chrome/README.md principle).
+        let manifest = include_str!("../../../apps/chrome/RUSTOS.package.toml.example");
+        for forbidden in ["no-sandbox", "disable-setuid-sandbox"] {
+            assert!(!manifest.contains(forbidden), "{forbidden}");
+        }
     }
 
     #[test]

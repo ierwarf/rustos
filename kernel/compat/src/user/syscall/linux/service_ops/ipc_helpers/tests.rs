@@ -1,6 +1,19 @@
 use super::*;
 
 #[test]
+fn vfs_sender_identity_survives_process_visibility_revocation() {
+    // The scheduler's task identity still names the IPC sender after exit
+    // seals the process and its visible process snapshot is unavailable.
+    for op in [VFS_IPC_OP_CLOSE, VFS_IPC_OP_CHECKPOINT_ACK] {
+        let mut request = VfsIpcRequest { op, ..VfsIpcRequest::default() };
+        set_vfs_sender_identity(&mut request, Some((42, 43)));
+        assert_eq!((request.pid, request.tid), (42, 43));
+        set_vfs_sender_identity(&mut request, None);
+        assert_eq!((request.pid, request.tid), (0, 0));
+    }
+}
+
+#[test]
 fn netd_failed_mutation_settles_cleanup_before_returning_the_error() {
     let response = NetdIpcResponse {
         status: LINUX_EAGAIN as i32,
@@ -695,4 +708,85 @@ fn prepared_unix_socket_pair_and_accept_abandonment_never_install_unseen_fds() {
         assert_eq!(result.value,if count==2 {0} else {37});
         assert_eq!(result.payload_len,0);
     }
+}
+
+#[test]
+fn seqpacket_and_netlink_replies_are_prepared_and_typed_exactly() {
+    let unix_entry = |ty: u64, token: u64| {
+        multitask::TransferredHandleEntry::from_initial_entry(multitask::HandleEntry::new(
+            multitask::KernelHandle::Socket(multitask::SocketHandle::from_token(
+                token,
+                linux_abi::AF_UNIX,
+                ty,
+                0,
+            )),
+            0,
+            0,
+        ))
+        .unwrap()
+    };
+    let netlink_entry = |ty: u64, token: u64| {
+        multitask::TransferredHandleEntry::from_initial_entry(multitask::HandleEntry::new(
+            multitask::KernelHandle::InetSocket(multitask::InetSocketHandle::from_token(
+                token,
+                rustos_user_abi::syscall::NET_BROKER_PUBLICATION_AF_NETLINK,
+                ty,
+                0,
+            )),
+            0,
+            0,
+        ))
+        .unwrap()
+    };
+    let seqpacket = rustos_user_abi::syscall::NET_BROKER_PUBLICATION_SOCK_SEQPACKET;
+    let raw = rustos_user_abi::syscall::NET_BROKER_PUBLICATION_SOCK_RAW;
+    // socket(AF_UNIX, SOCK_SEQPACKET): the published handle carries the type.
+    let request = NetdIpcRequest {
+        version: NETD_IPC_ABI_VERSION,
+        op: SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
+        arg0: linux_abi::AF_UNIX,
+        arg1: seqpacket,
+        ..NetdIpcRequest::default()
+    };
+    let response = NetdIpcResponse {
+        op: SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
+        value: 61,
+        ..NetdIpcResponse::default()
+    };
+    assert!(netd_reply_uses_prepared_socket(&request));
+    assert!(prepared_netd_socket_response_matches(&request, &response, &[unix_entry(seqpacket, 61)]));
+    assert!(
+        !prepared_netd_socket_response_matches(
+            &request,
+            &response,
+            &[unix_entry(linux_abi::SOCK_STREAM, 61)]
+        ),
+        "a stream handle must not satisfy a seqpacket request"
+    );
+    // socket(AF_UNIX, SOCK_DGRAM) is refused by netd and never prepared.
+    let dgram = NetdIpcRequest { arg1: linux_abi::SOCK_DGRAM, ..request };
+    assert!(!netd_reply_uses_prepared_socket(&dgram));
+    // socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE): a token handle.
+    let netlink = NetdIpcRequest {
+        arg0: rustos_user_abi::syscall::NET_BROKER_PUBLICATION_AF_NETLINK,
+        arg1: raw | linux_abi::SOCK_CLOEXEC,
+        ..request
+    };
+    assert!(netd_reply_uses_prepared_socket(&netlink));
+    let cloexec = multitask::TransferredHandleEntry::from_initial_entry(multitask::HandleEntry::new(
+        multitask::KernelHandle::InetSocket(multitask::InetSocketHandle::from_token(
+            61,
+            rustos_user_abi::syscall::NET_BROKER_PUBLICATION_AF_NETLINK,
+            raw,
+            0,
+        )),
+        multitask::FD_CLOEXEC,
+        0,
+    ))
+    .unwrap();
+    assert!(prepared_netd_socket_response_matches(&netlink, &response, &[cloexec]));
+    assert!(!prepared_netd_socket_response_matches(&netlink, &response, &[netlink_entry(2, 61)]));
+    // Netlink is socket()-only: a netlink socketpair is not a prepared reply.
+    let pair = NetdIpcRequest { op: SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR, ..netlink };
+    assert!(!netd_reply_uses_prepared_socket(&pair));
 }

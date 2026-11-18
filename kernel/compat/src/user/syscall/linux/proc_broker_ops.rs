@@ -761,9 +761,10 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
             // loaderd always populates `linux_runtime` before issuing commit;
             // the bytes-image fallback that used to call into ring0 ELF parsing
             // was retired with the PE bytes path on 2026-05-20.
-            let Some((info, actual_entry)) = state.linux_runtime else {
+            let Some((mut info, actual_entry)) = state.linux_runtime else {
                 return linux_errno(LINUX_EINVAL);
             };
+            info.image_mappings = initial_elf_mappings(&state.mappings, &info, actual_entry);
             match crate::user::process::prepare_linux_process_with_metadata(
                 info,
                 actual_entry,
@@ -1227,9 +1228,10 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
     };
     // Same loaderd contract as prepare: linux_runtime must be populated; the
     // bytes-image fallback into ring0 ELF parsing was retired.
-    let Some((info, actual_entry)) = state.linux_runtime else {
+    let Some((mut info, actual_entry)) = state.linux_runtime else {
         return linux_errno(LINUX_EINVAL);
     };
+    info.image_mappings = initial_elf_mappings(&state.mappings, &info, actual_entry);
     let prepared = match crate::user::process::prepare_linux_process_with_metadata(
         info,
         actual_entry,
@@ -1624,6 +1626,65 @@ fn exec_transition_from_prepared(
             rflags: 0x202,
         },
     }
+}
+
+/// Describe only the mappings actually installed from the loader's admitted
+/// plan. Tie the ELF names to the pinned backing object of each entry point,
+/// not a VA heuristic (a fixed ET_EXEC can be linked above the interpreter).
+fn initial_elf_mappings(
+    mappings: &[Box<MappingEntry>],
+    info: &crate::user::linux::LinuxProcessImageInfo,
+    actual_entry: u64,
+) -> Vec<crate::user::linux::LinuxImageMapping> {
+    use crate::user::linux::{LinuxImageMapping, LinuxImageMappingPathKind as Kind, LinuxVmaFlags};
+
+    let file_at = |address| {
+        mappings.iter().find_map(|mapping| match mapping.as_ref() {
+            MappingEntry::File { backing, target_addr, file_len, .. }
+                if address >= *target_addr && address - *target_addr < *file_len =>
+            {
+                Some(backing.object_id())
+            }
+            _ => None,
+        })
+    };
+    let executable = file_at(info.entry).or_else(|| file_at(info.program_headers));
+    let interpreter = (info.interpreter_path.is_some() && info.interpreter_base != 0)
+        .then(|| file_at(actual_entry))
+        .flatten();
+    mappings.iter().flat_map(|mapping| {
+        let (start, len, flags, file) = match mapping.as_ref() {
+            MappingEntry::File { backing, file_offset, file_len, target_addr, mem_len, flags } => {
+                let id = Some(backing.object_id());
+                let kind = if id == executable {
+                    Kind::Executable
+                } else if id == interpreter {
+                    Kind::Interpreter
+                } else {
+                    Kind::None
+                };
+                let backed = (file_len.div_ceil(PAGE_SIZE) * PAGE_SIZE).min(*mem_len);
+                (*target_addr, *mem_len, *flags, Some((backed, *file_offset, kind)))
+            }
+            MappingEntry::Zeroed { target_addr, mem_len, flags }
+            | MappingEntry::Data { target_addr, mem_len, flags, .. } =>
+                (*target_addr, *mem_len, *flags, None),
+        };
+        let flags = LinuxVmaFlags::private_anon(
+            flags & PROC_BROKER_MAP_READ != 0,
+            flags & PROC_BROKER_MAP_WRITE != 0,
+            flags & PROC_BROKER_MAP_EXEC != 0,
+        );
+        let (backed, offset, path_kind) = file.unwrap_or((0, 0, Kind::None));
+        [
+            (backed != 0).then_some(LinuxImageMapping {
+                start, end: start + backed, offset, flags, path_kind,
+            }),
+            (backed < len).then_some(LinuxImageMapping {
+                start: start + backed, end: start + len, offset: 0, flags, path_kind: Kind::None,
+            }),
+        ].into_iter().flatten()
+    }).collect()
 }
 
 fn address_space_from_mappings(

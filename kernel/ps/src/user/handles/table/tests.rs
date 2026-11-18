@@ -302,6 +302,21 @@ fn lifecycle_snapshot_is_descriptor_exact_and_filters_cloexec() {
 }
 
 #[test]
+fn fd_numbers_list_open_descriptors_only_and_exclude_reservations() {
+    let mut table = HandleTable::new();
+    assert_eq!(table.fd_numbers(), vec![0, 1, 2]);
+    let dir = || KernelHandle::VfsDirectory(VfsDirectoryHandle::new("/d".into(), vec![]));
+    let a = table.install_entry(HandleEntry::new(dir(), 0, 0)).unwrap();
+    let b = table.install_entry(HandleEntry::new(dir(), 0, 0)).unwrap();
+    assert_eq!(table.fd_numbers(), vec![0, 1, 2, a, b]);
+    let _ = table.close(1).expect("close standard output");
+    let _ = table.close(a).expect("close first dynamic fd");
+    assert_eq!(table.fd_numbers(), vec![0, 2, b]);
+    let (_, slots) = table.reserve_slots(1).expect("reserve one slot");
+    assert!(!table.fd_numbers().contains(&slots[0]));
+}
+
+#[test]
 fn receive_reservations_are_invisible_and_publish_atomically() {
     let mut table = HandleTable::new();
     let _ = table.close(0).expect("free standard descriptor");
@@ -587,6 +602,29 @@ fn transfer_install_preserves_rights_and_flags() {
 }
 
 #[test]
+fn transferred_pipe_preserves_endpoint_and_access_mode() {
+    let (read, write) = crate::user::pipe::PipeHandle::new_pair(None, true).unwrap();
+    let mut source = HandleTable::new();
+    let fd = source.install_with_open_flags(KernelHandle::Pipe(read.clone()), linux_abi::O_NONBLOCK).unwrap();
+    let held = source.duplicate_for_transfer(fd).unwrap();
+    let descriptor = held.ipc_descriptor(9).unwrap();
+    assert!(descriptor.rights().allows_read());
+    assert!(!descriptor.rights().allows_write());
+    assert_eq!(descriptor.token().object_id(), read.token_id());
+
+    let mut target = HandleTable::new();
+    let received = target.install_transferred(held).unwrap();
+    let entry = target.get_entry(received).unwrap();
+    assert_eq!(entry.token(), descriptor.token());
+    assert_eq!(entry.rights(), descriptor.rights());
+    assert_ne!(entry.status_flags() & linux_abi::O_NONBLOCK, 0);
+    drop(target);
+    drop(source);
+    read.release_descriptor_reference();
+    write.release_descriptor_reference();
+}
+
+#[test]
 fn directory_fds_are_file_caps_for_vfs_transfer() {
     let mut table = HandleTable::new();
     let dir_fd = table.install(KernelHandle::VfsDirectory(VfsDirectoryHandle::new(
@@ -844,4 +882,67 @@ fn held_device_buffer_bytes_count_distinct_allocations_once() {
     assert_eq!(table.device_buffer_held_bytes(), 3 * 4096);
     table.close(first);
     assert_eq!(table.device_buffer_held_bytes(), 3 * 4096, "the duplicate keeps the allocation held");
+}
+
+#[test]
+fn o_path_descriptors_hold_only_transfer_and_keep_the_flag_through_fcntl_and_dup() {
+    use crate::user::handles::RemoteVfsHandleKind;
+    let remote = |kind| {
+        crate::user::handles::RemoteVfsHandle::new(7, kind, "/etc/hosts".into(), 0, 0).unwrap()
+    };
+    let mut table = HandleTable::new();
+    let path_fd = table
+        .install_with_open_flags(
+            KernelHandle::RemoteVfs(remote(RemoteVfsHandleKind::File)),
+            linux_abi::O_PATH | linux_abi::O_CLOEXEC,
+        )
+        .unwrap();
+    let entry = table.get_entry(path_fd).unwrap();
+    let HandleRights::File(rights) = entry.rights() else { panic!("file rights") };
+    assert!(!rights.contains(FileHandleRights::READ));
+    assert!(!rights.contains(FileHandleRights::WRITE));
+    assert!(rights.contains(FileHandleRights::TRANSFER));
+    assert_ne!(entry.status_flags() & linux_abi::O_PATH, 0);
+
+    // F_SETFL cannot clear O_PATH or change the access mode.
+    table.get_entry_mut(path_fd).unwrap().set_status_flags(linux_abi::O_NONBLOCK);
+    let status = table.get_entry(path_fd).unwrap().status_flags();
+    assert_ne!(status & linux_abi::O_PATH, 0);
+    assert_ne!(status & linux_abi::O_NONBLOCK, 0);
+
+    // dup keeps the restriction.
+    let dup = table.duplicate_min(path_fd, 0, false).unwrap();
+    let HandleRights::File(dup_rights) = table.get_entry(dup).unwrap().rights() else { panic!() };
+    assert!(!dup_rights.contains(FileHandleRights::READ));
+
+    // An O_PATH directory also loses READ, while a plain one keeps it.
+    let dir_path = table
+        .install_with_open_flags(
+            KernelHandle::RemoteVfs(remote(RemoteVfsHandleKind::Directory)),
+            linux_abi::O_PATH | linux_abi::O_DIRECTORY,
+        )
+        .unwrap();
+    let dir_plain = table
+        .install_with_open_flags(
+            KernelHandle::RemoteVfs(remote(RemoteVfsHandleKind::Directory)),
+            linux_abi::O_DIRECTORY,
+        )
+        .unwrap();
+    let HandleRights::File(r) = table.get_entry(dir_path).unwrap().rights() else { panic!() };
+    assert!(!r.contains(FileHandleRights::READ));
+    let HandleRights::File(r) = table.get_entry(dir_plain).unwrap().rights() else { panic!() };
+    assert!(r.contains(FileHandleRights::READ));
+}
+
+#[test]
+fn o_path_remote_device_has_no_io_authority() {
+    let remote = crate::user::handles::RemoteVfsHandle::new(
+        7, crate::user::handles::RemoteVfsHandleKind::Device, "/dev/null".into(), 0, 0,
+    ).unwrap();
+    let mut table = HandleTable::new();
+    let fd = table.install_with_open_flags(KernelHandle::RemoteVfs(remote), linux_abi::O_PATH).unwrap();
+    let rights = table.get_entry(fd).unwrap().rights();
+    assert!(!rights.allows_read());
+    assert!(!rights.allows_write());
+    assert!(rights.allows_transfer());
 }

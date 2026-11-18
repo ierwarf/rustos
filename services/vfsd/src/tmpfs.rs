@@ -1,0 +1,1769 @@
+//! Memory-backed `TmpFs`: the writable POSIX filesystem behind `/tmp`,
+//! `/dev/shm` and `/run`.
+//!
+//! - **Owner:** vfsd owns every `TmpFs` instance; each mount has its own inode
+//!   table, byte quota and inode limit. Nothing survives a vfsd restart.
+//! - **Model:** an inode table keyed by a per-mount unique, never reused
+//!   `node_id`. Directories map names to node ids, so rename moves an entry,
+//!   not data. File data is a sparse map of 4-KiB chunks.
+//! - **Open while unlinked:** the volume trait is path based, so an open
+//!   description pins its node (`retain_node`) and all later I/O addresses the
+//!   node id. `unlink`/`rmdir`/replacing `rename` only drop a directory entry
+//!   and decrement `nlink`; the node and its charged bytes are freed when
+//!   `nlink == 0` and the last pin is released.
+//! - **Quota:** `used_bytes` counts allocated data chunks plus symlink target
+//!   bytes. Sparse `ftruncate` growth allocates nothing. Exhaustion is
+//!   `FsError::NoSpace`; a write that can only partly fit is a short write.
+//!   A separate inode limit bounds the node table and therefore vfsd's heap.
+//! - **Concurrency:** one spin lock serialises all state; no method calls out
+//!   while holding it.
+//! - **Forbidden:** following symlinks (the caller resolves them), reusing a
+//!   node id, charging more than the quota, or reading stale bytes after a
+//!   shrink-then-grow (the tail of the last chunk is zeroed on shrink).
+
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use spin::Mutex;
+
+use storage_core::fs::{
+    CasePolicy, FsCapabilities, FsCreateAttrs, FsDirEntry, FsError, FsMetadata, FsNodeKind,
+    FsOpenOptions, FsStatFs, FsTimestamp, FsVolume,
+};
+
+/// `statfs.f_type` of tmpfs (`TMPFS_MAGIC`).
+pub const TMPFS_MAGIC: u64 = 0x0102_1994;
+pub const TMPFS_BLOCK_SIZE: u64 = 4096;
+pub const TMPFS_NAME_MAX: u32 = 255;
+/// Longest symlink target (`PATH_MAX - 1`).
+pub const TMPFS_SYMLINK_MAX: usize = 4095;
+/// Largest file offset/length (`i64::MAX`).
+pub const TMPFS_MAX_FILE_SIZE: u64 = i64::MAX as u64;
+/// Linux reports a directory's size as `entries * BOGO_DIRENT_SIZE`.
+const BOGO_DIRENT_SIZE: u64 = 20;
+const CHUNK: usize = TMPFS_BLOCK_SIZE as usize;
+const ROOT_NODE: u64 = 1;
+
+pub const TMP_QUOTA_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEV_SHM_QUOTA_BYTES: u64 = 64 * 1024 * 1024;
+pub const RUN_QUOTA_BYTES: u64 = 16 * 1024 * 1024;
+pub const TMP_MAX_INODES: u64 = 16 * 1024;
+pub const DEV_SHM_MAX_INODES: u64 = 4 * 1024;
+pub const RUN_MAX_INODES: u64 = 4 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub struct TmpFsConfig {
+    pub quota_bytes: u64,
+    pub max_inodes: u64,
+    pub root_mode: u32,
+    pub root_uid: u32,
+    pub root_gid: u32,
+    /// Wall/monotonic time source for `atime`/`mtime`/`ctime` stamps.
+    pub clock: fn() -> FsTimestamp,
+}
+
+enum Body {
+    Dir(BTreeMap<String, u64>),
+    File {
+        len: u64,
+        chunks: BTreeMap<u64, Box<[u8]>>,
+    },
+    Symlink(String),
+    Socket,
+}
+
+struct Node {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    nlink: u32,
+    atime: FsTimestamp,
+    mtime: FsTimestamp,
+    ctime: FsTimestamp,
+    crtime: FsTimestamp,
+    /// Open-description pins (`retain_node` minus `release_node`).
+    opens: u32,
+    /// Parent directory (directories only; the root is its own parent).
+    parent: u64,
+    body: Body,
+}
+
+fn read_dir_locked(st: &State, ino: u64) -> Result<Vec<FsDirEntry>, FsError> {
+    let mut out = Vec::new();
+    for (name, child) in st.dir(ino)? {
+        let meta = st.metadata_of(*child)?;
+        out.push(FsDirEntry {
+            name: name.clone(), node_id: *child, kind: meta.kind,
+            len: if meta.kind == FsNodeKind::Directory { 0 } else { meta.len },
+            dos_attrs: 0,
+        });
+    }
+    Ok(out)
+}
+
+impl Node {
+    fn kind(&self) -> FsNodeKind {
+        match self.body {
+            Body::Dir(_) => FsNodeKind::Directory,
+            Body::File { .. } => FsNodeKind::File,
+            Body::Symlink(_) => FsNodeKind::Symlink,
+            Body::Socket => FsNodeKind::Socket,
+        }
+    }
+
+    /// Bytes this node charges against the quota.
+    fn charged_bytes(&self) -> u64 {
+        match &self.body {
+            Body::File { chunks, .. } => chunks.len() as u64 * CHUNK as u64,
+            Body::Symlink(target) => target.len() as u64,
+            _ => 0,
+        }
+    }
+
+    fn touch_modify(&mut self, now: FsTimestamp) {
+        self.mtime = now;
+        self.ctime = now;
+    }
+}
+
+struct State {
+    nodes: BTreeMap<u64, Node>,
+    next_node: u64,
+    used_bytes: u64,
+    quota_bytes: u64,
+    max_inodes: u64,
+}
+
+pub struct TmpFs {
+    clock: fn() -> FsTimestamp,
+    state: Mutex<State>,
+}
+
+fn split_path(path: &str) -> Result<Vec<&str>, FsError> {
+    let mut out = Vec::new();
+    for part in path.split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        check_name(part)?;
+        out.push(part);
+    }
+    Ok(out)
+}
+
+fn check_name(name: &str) -> Result<(), FsError> {
+    if name == "." || name == ".." || name.contains('\0') {
+        return Err(FsError::InvalidInput);
+    }
+    if name.len() > TMPFS_NAME_MAX as usize {
+        return Err(FsError::NameTooLong);
+    }
+    Ok(())
+}
+
+impl State {
+    fn dir(&self, ino: u64) -> Result<&BTreeMap<String, u64>, FsError> {
+        match &self.nodes.get(&ino).ok_or(FsError::NotFound)?.body {
+            Body::Dir(entries) => Ok(entries),
+            _ => Err(FsError::NotADirectory),
+        }
+    }
+
+    fn dir_mut(&mut self, ino: u64) -> Result<&mut BTreeMap<String, u64>, FsError> {
+        match &mut self.nodes.get_mut(&ino).ok_or(FsError::NotFound)?.body {
+            Body::Dir(entries) => Ok(entries),
+            _ => Err(FsError::NotADirectory),
+        }
+    }
+
+    /// Resolves `comps` without following symlinks (a symlink in a non-final
+    /// position is `NotADirectory`; the caller resolves links beforehand).
+    fn walk(&self, comps: &[&str]) -> Result<u64, FsError> {
+        let mut cur = ROOT_NODE;
+        for name in comps {
+            cur = *self.dir(cur)?.get(*name).ok_or(FsError::NotFound)?;
+        }
+        Ok(cur)
+    }
+
+    /// Splits off the final component: `(parent_dir_node, name)`.
+    fn parent_of<'a>(&self, comps: &[&'a str]) -> Result<(u64, &'a str), FsError> {
+        let (name, dirs) = comps.split_last().ok_or(FsError::InvalidInput)?;
+        let parent = self.walk(dirs)?;
+        self.dir(parent)?;
+        Ok((parent, name))
+    }
+
+    fn metadata_of(&self, ino: u64) -> Result<FsMetadata, FsError> {
+        let node = self.nodes.get(&ino).ok_or(FsError::NotFound)?;
+        let (len, allocation) = match &node.body {
+            Body::Dir(entries) => (entries.len() as u64 * BOGO_DIRENT_SIZE, 0),
+            Body::File { len, chunks } => (*len, chunks.len() as u64 * CHUNK as u64),
+            Body::Symlink(target) => (target.len() as u64, 0),
+            Body::Socket => (0, 0),
+        };
+        Ok(FsMetadata {
+            node_id: ino,
+            kind: node.kind(),
+            len,
+            allocation_size: allocation,
+            nlink: node.nlink,
+            mode: node.mode,
+            uid: node.uid,
+            gid: node.gid,
+            dos_attrs: 0,
+            atime: node.atime,
+            mtime: node.mtime,
+            ctime: node.ctime,
+            crtime: node.crtime,
+        })
+    }
+
+    fn charge(&mut self, bytes: u64) -> Result<(), FsError> {
+        let total = self.used_bytes.checked_add(bytes).ok_or(FsError::NoSpace)?;
+        if total > self.quota_bytes {
+            return Err(FsError::NoSpace);
+        }
+        self.used_bytes = total;
+        Ok(())
+    }
+
+    fn credit(&mut self, bytes: u64) {
+        self.used_bytes = self.used_bytes.saturating_sub(bytes);
+    }
+
+    fn insert_node(
+        &mut self,
+        parent: u64,
+        name: &str,
+        attrs: FsCreateAttrs,
+        body: Body,
+        now: FsTimestamp,
+    ) -> Result<u64, FsError> {
+        if self.dir(parent)?.contains_key(name) {
+            return Err(FsError::AlreadyExists);
+        }
+        if self.nodes.len() as u64 >= self.max_inodes {
+            return Err(FsError::NoSpace);
+        }
+        let is_dir = matches!(body, Body::Dir(_));
+        if let Body::Symlink(target) = &body {
+            self.charge(target.len() as u64)?;
+        }
+        let ino = self.next_node;
+        self.next_node += 1;
+        self.nodes.insert(
+            ino,
+            Node {
+                mode: attrs.mode & 0o7777,
+                uid: attrs.uid,
+                gid: attrs.gid,
+                nlink: if is_dir { 2 } else { 1 },
+                atime: now,
+                mtime: now,
+                ctime: now,
+                crtime: now,
+                opens: 0,
+                parent: if is_dir { parent } else { 0 },
+                body,
+            },
+        );
+        self.dir_mut(parent)?.insert(String::from(name), ino);
+        let p = self.nodes.get_mut(&parent).ok_or(FsError::NotFound)?;
+        if is_dir {
+            p.nlink = p.nlink.saturating_add(1);
+        }
+        p.touch_modify(now);
+        Ok(ino)
+    }
+
+    /// Frees `ino` when it has no name and no open description.
+    fn free_if_orphan(&mut self, ino: u64) {
+        let orphan = self
+            .nodes
+            .get(&ino)
+            .is_some_and(|n| n.nlink == 0 && n.opens == 0);
+        if orphan {
+            if let Some(node) = self.nodes.remove(&ino) {
+                self.credit(node.charged_bytes());
+            }
+        }
+    }
+
+    fn is_descendant_or_self(&self, mut ino: u64, ancestor: u64) -> bool {
+        loop {
+            if ino == ancestor {
+                return true;
+            }
+            if ino == ROOT_NODE {
+                return false;
+            }
+            match self.nodes.get(&ino) {
+                Some(node) => ino = node.parent,
+                None => return false,
+            }
+        }
+    }
+
+    fn read(&self, ino: u64, offset: u64, out: &mut [u8]) -> Result<usize, FsError> {
+        let node = self.nodes.get(&ino).ok_or(FsError::NotFound)?;
+        let (len, chunks) = match &node.body {
+            Body::File { len, chunks } => (*len, chunks),
+            Body::Dir(_) => return Err(FsError::IsADirectory),
+            _ => return Err(FsError::InvalidInput),
+        };
+        if offset >= len {
+            return Ok(0);
+        }
+        let count = (len - offset).min(out.len() as u64) as usize;
+        let mut done = 0usize;
+        while done < count {
+            let pos = offset + done as u64;
+            let idx = pos / CHUNK as u64;
+            let within = (pos % CHUNK as u64) as usize;
+            let n = (CHUNK - within).min(count - done);
+            match chunks.get(&idx) {
+                Some(chunk) => out[done..done + n].copy_from_slice(&chunk[within..within + n]),
+                None => out[done..done + n].fill(0),
+            }
+            done += n;
+        }
+        Ok(count)
+    }
+
+    fn write(
+        &mut self,
+        ino: u64,
+        offset: u64,
+        data: &[u8],
+        now: FsTimestamp,
+    ) -> Result<(usize, u64), FsError> {
+        let State {
+            nodes,
+            used_bytes,
+            quota_bytes,
+            ..
+        } = self;
+        let node = nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+        let (len, chunks) = match &mut node.body {
+            Body::File { len, chunks } => (len, chunks),
+            Body::Dir(_) => return Err(FsError::IsADirectory),
+            _ => return Err(FsError::InvalidInput),
+        };
+        if data.is_empty() {
+            return Ok((0, *len));
+        }
+        let end = offset
+            .checked_add(data.len() as u64)
+            .filter(|end| *end <= TMPFS_MAX_FILE_SIZE)
+            .ok_or(FsError::TooBig)?;
+        let mut done = 0usize;
+        while done < data.len() {
+            let pos = offset + done as u64;
+            let idx = pos / CHUNK as u64;
+            let within = (pos % CHUNK as u64) as usize;
+            let n = (CHUNK - within).min(data.len() - done);
+            if !chunks.contains_key(&idx) {
+                if used_bytes.saturating_add(CHUNK as u64) > *quota_bytes {
+                    break;
+                }
+                *used_bytes += CHUNK as u64;
+                chunks.insert(idx, vec![0u8; CHUNK].into_boxed_slice());
+            }
+            let chunk = chunks.get_mut(&idx).ok_or(FsError::NotFound)?;
+            chunk[within..within + n].copy_from_slice(&data[done..done + n]);
+            done += n;
+        }
+        if done == 0 {
+            return Err(FsError::NoSpace);
+        }
+        let written_end = (offset + done as u64).min(end);
+        if written_end > *len {
+            *len = written_end;
+        }
+        let new_len = *len;
+        node.touch_modify(now);
+        Ok((done, new_len))
+    }
+
+    fn truncate(&mut self, ino: u64, new_len: u64, now: FsTimestamp) -> Result<u64, FsError> {
+        if new_len > TMPFS_MAX_FILE_SIZE {
+            return Err(FsError::TooBig);
+        }
+        let mut freed = 0u64;
+        {
+            let node = self.nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+            let (len, chunks) = match &mut node.body {
+                Body::File { len, chunks } => (len, chunks),
+                Body::Dir(_) => return Err(FsError::IsADirectory),
+                _ => return Err(FsError::InvalidInput),
+            };
+            if new_len <= *len {
+                // A same-size truncate also discards KEEP_SIZE allocations
+                // beyond EOF, even when the file has never contained data.
+                // Chunks wholly past the new end go away; the tail of the
+                // chunk holding the new end is zeroed so a later growth reads
+                // zeros, not the truncated bytes.
+                let first_dead = new_len.div_ceil(CHUNK as u64);
+                let dead: Vec<u64> = chunks.range(first_dead..).map(|(idx, _)| *idx).collect();
+                for idx in dead {
+                    chunks.remove(&idx);
+                    freed += CHUNK as u64;
+                }
+                let tail = (new_len % CHUNK as u64) as usize;
+                if tail != 0 {
+                    if let Some(chunk) = chunks.get_mut(&(new_len / CHUNK as u64)) {
+                        chunk[tail..].fill(0);
+                    }
+                }
+            }
+            *len = new_len;
+            node.touch_modify(now);
+        }
+        self.credit(freed);
+        Ok(new_len)
+    }
+
+    fn fallocate(
+        &mut self,
+        ino: u64,
+        offset: u64,
+        len: u64,
+        keep_size: bool,
+        now: FsTimestamp,
+    ) -> Result<u64, FsError> {
+        if len == 0 {
+            return Err(FsError::InvalidInput);
+        }
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= TMPFS_MAX_FILE_SIZE)
+            .ok_or(FsError::TooBig)?;
+        let first = offset / CHUNK as u64;
+        let last = (end - 1) / CHUNK as u64;
+        let missing = {
+            let node = self.nodes.get(&ino).ok_or(FsError::NotFound)?;
+            let chunks = match &node.body {
+                Body::File { chunks, .. } => chunks,
+                Body::Dir(_) => return Err(FsError::IsADirectory),
+                _ => return Err(FsError::InvalidInput),
+            };
+            (last - first + 1) - chunks.range(first..=last).count() as u64
+        };
+        let cost = missing.checked_mul(CHUNK as u64).ok_or(FsError::NoSpace)?;
+        self.charge(cost)?;
+        let node = self.nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+        let Body::File { len: flen, chunks } = &mut node.body else {
+            return Err(FsError::InvalidInput);
+        };
+        if missing != 0 {
+            for idx in first..=last {
+                chunks
+                    .entry(idx)
+                    .or_insert_with(|| vec![0u8; CHUNK].into_boxed_slice());
+            }
+        }
+        if !keep_size && end > *flen {
+            *flen = end;
+        }
+        let out = *flen;
+        node.touch_modify(now);
+        Ok(out)
+    }
+
+    fn remove_entry(&mut self, path: &[&str], want_dir: bool, now: FsTimestamp) -> Result<(), FsError> {
+        let (parent, name) = self.parent_of(path)?;
+        let child = *self.dir(parent)?.get(name).ok_or(FsError::NotFound)?;
+        let is_dir = matches!(self.nodes.get(&child).ok_or(FsError::NotFound)?.body, Body::Dir(_));
+        if want_dir {
+            if !is_dir {
+                return Err(FsError::NotADirectory);
+            }
+            if !self.dir(child)?.is_empty() {
+                return Err(FsError::DirectoryNotEmpty);
+            }
+        } else if is_dir {
+            return Err(FsError::IsADirectory);
+        }
+        self.dir_mut(parent)?.remove(name);
+        {
+            let p = self.nodes.get_mut(&parent).ok_or(FsError::NotFound)?;
+            if is_dir {
+                p.nlink = p.nlink.saturating_sub(1);
+            }
+            p.touch_modify(now);
+        }
+        let node = self.nodes.get_mut(&child).ok_or(FsError::NotFound)?;
+        node.nlink = if is_dir { 0 } else { node.nlink.saturating_sub(1) };
+        node.ctime = now;
+        self.free_if_orphan(child);
+        Ok(())
+    }
+
+    fn rename(
+        &mut self,
+        src: &[&str],
+        dst: &[&str],
+        replace_existing: bool,
+        no_replace: bool,
+        now: FsTimestamp,
+    ) -> Result<(), FsError> {
+        if src.is_empty() || dst.is_empty() {
+            return Err(FsError::Busy);
+        }
+        let (sp, sname) = self.parent_of(src)?;
+        let sino = *self.dir(sp)?.get(sname).ok_or(FsError::NotFound)?;
+        let (dp, dname) = self.parent_of(dst)?;
+        let src_is_dir = matches!(self.nodes.get(&sino).ok_or(FsError::NotFound)?.body, Body::Dir(_));
+        if src_is_dir && self.is_descendant_or_self(dp, sino) {
+            // Moving a directory below itself would detach it from the tree.
+            return Err(FsError::InvalidInput);
+        }
+        let existing = self.dir(dp)?.get(dname).copied();
+        if let Some(dino) = existing {
+            if dino == sino {
+                // Same node (same path, or two hard links): POSIX no-op.
+                return if no_replace { Err(FsError::AlreadyExists) } else { Ok(()) };
+            }
+            if no_replace || !replace_existing {
+                return Err(FsError::AlreadyExists);
+            }
+            let dst_is_dir = matches!(
+                self.nodes.get(&dino).ok_or(FsError::NotFound)?.body,
+                Body::Dir(_)
+            );
+            match (src_is_dir, dst_is_dir) {
+                (true, false) => return Err(FsError::NotADirectory),
+                (false, true) => return Err(FsError::IsADirectory),
+                (true, true) if !self.dir(dino)?.is_empty() => {
+                    return Err(FsError::DirectoryNotEmpty)
+                }
+                _ => {}
+            }
+        }
+        // All checks passed: the mutation below cannot fail.
+        if let Some(dino) = existing {
+            let dst_is_dir = matches!(self.nodes[&dino].body, Body::Dir(_));
+            self.dir_mut(dp)?.remove(dname);
+            if dst_is_dir {
+                let p = self.nodes.get_mut(&dp).ok_or(FsError::NotFound)?;
+                p.nlink = p.nlink.saturating_sub(1);
+            }
+            let node = self.nodes.get_mut(&dino).ok_or(FsError::NotFound)?;
+            node.nlink = if dst_is_dir { 0 } else { node.nlink.saturating_sub(1) };
+            node.ctime = now;
+        }
+        self.dir_mut(sp)?.remove(sname);
+        self.dir_mut(dp)?.insert(String::from(dname), sino);
+        if src_is_dir && sp != dp {
+            let s = self.nodes.get_mut(&sp).ok_or(FsError::NotFound)?;
+            s.nlink = s.nlink.saturating_sub(1);
+            let d = self.nodes.get_mut(&dp).ok_or(FsError::NotFound)?;
+            d.nlink = d.nlink.saturating_add(1);
+            self.nodes.get_mut(&sino).ok_or(FsError::NotFound)?.parent = dp;
+        }
+        for dir in [sp, dp] {
+            self.nodes.get_mut(&dir).ok_or(FsError::NotFound)?.touch_modify(now);
+        }
+        self.nodes.get_mut(&sino).ok_or(FsError::NotFound)?.ctime = now;
+        if let Some(dino) = existing {
+            self.free_if_orphan(dino);
+        }
+        Ok(())
+    }
+}
+
+impl TmpFs {
+    pub fn new(config: TmpFsConfig) -> Self {
+        let now = (config.clock)();
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            ROOT_NODE,
+            Node {
+                mode: config.root_mode & 0o7777,
+                uid: config.root_uid,
+                gid: config.root_gid,
+                nlink: 2,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                crtime: now,
+                opens: 0,
+                parent: ROOT_NODE,
+                body: Body::Dir(BTreeMap::new()),
+            },
+        );
+        Self {
+            clock: config.clock,
+            state: Mutex::new(State {
+                nodes,
+                next_node: ROOT_NODE + 1,
+                used_bytes: 0,
+                quota_bytes: config.quota_bytes,
+                max_inodes: config.max_inodes.max(1),
+            }),
+        }
+    }
+
+    fn now(&self) -> FsTimestamp {
+        (self.clock)()
+    }
+
+    /// Bytes currently charged against the quota.
+    pub fn used_bytes(&self) -> u64 {
+        self.state.lock().used_bytes
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.state.lock().nodes.len()
+    }
+
+    fn create(&self, path: &str, attrs: FsCreateAttrs, body: Body) -> Result<u64, FsError> {
+        let comps = split_path(path)?;
+        if comps.is_empty() {
+            // The mount root always exists.
+            return Err(FsError::AlreadyExists);
+        }
+        let now = self.now();
+        let mut st = self.state.lock();
+        let (parent, name) = st.parent_of(&comps)?;
+        st.insert_node(parent, name, attrs, body, now)
+    }
+}
+
+impl FsVolume for TmpFs {
+    fn capabilities(&self) -> FsCapabilities {
+        FsCapabilities {
+            read_only: false,
+            case_policy: CasePolicy::Exact,
+            supports_symlinks: true,
+            supports_hardlinks: true,
+            supports_unlink_while_open: true,
+            supports_sparse: true,
+            supports_nt_attrs: false,
+            supports_streams: false,
+            supports_share_modes: false,
+            max_name_len: TMPFS_NAME_MAX,
+        }
+    }
+
+    fn is_immutable(&self) -> bool {
+        false
+    }
+
+    fn canonical_key(&self, path: &str) -> Result<String, FsError> {
+        let comps = split_path(path)?;
+        Ok(comps.join("/"))
+    }
+
+    fn metadata(&self, path: &str) -> Result<FsMetadata, FsError> {
+        let comps = split_path(path)?;
+        let st = self.state.lock();
+        let ino = st.walk(&comps)?;
+        st.metadata_of(ino)
+    }
+
+    fn read_dir(&self, path: &str) -> Result<Vec<FsDirEntry>, FsError> {
+        let comps = split_path(path)?;
+        let st = self.state.lock();
+        let ino = st.walk(&comps)?;
+        read_dir_locked(&st, ino)
+    }
+
+    fn read_dir_node(&self, node: u64) -> Result<Vec<FsDirEntry>, FsError> {
+        read_dir_locked(&self.state.lock(), node)
+    }
+
+    fn directory_path_node(&self, mut node: u64) -> Result<String, FsError> {
+        let st = self.state.lock();
+        st.dir(node)?;
+        let mut parts = Vec::new();
+        while node != ROOT_NODE {
+            let current = st.nodes.get(&node).ok_or(FsError::NotFound)?;
+            let parent = current.parent;
+            let name = st.dir(parent)?.iter().find_map(|(name, &child)|
+                (child == node).then(|| name.clone())).ok_or(FsError::NotFound)?;
+            parts.push(name);
+            node = parent;
+        }
+        parts.reverse();
+        Ok(parts.join("/"))
+    }
+
+    fn statfs(&self) -> Result<FsStatFs, FsError> {
+        let st = self.state.lock();
+        let total = st.quota_bytes / TMPFS_BLOCK_SIZE;
+        let used = st.used_bytes.div_ceil(TMPFS_BLOCK_SIZE);
+        let free = total.saturating_sub(used);
+        Ok(FsStatFs {
+            fs_type_magic: TMPFS_MAGIC,
+            block_size: TMPFS_BLOCK_SIZE,
+            total_blocks: total,
+            free_blocks: free,
+            avail_blocks: free,
+            total_inodes: st.max_inodes,
+            free_inodes: st.max_inodes.saturating_sub(st.nodes.len() as u64),
+            max_name_len: TMPFS_NAME_MAX,
+            fs_name: "tmpfs",
+            case_sensitive: true,
+            case_preserved: true,
+        })
+    }
+
+    fn open_prepare(&self, path: &str, opts: FsOpenOptions) -> Result<FsMetadata, FsError> {
+        self.open_prepare_with(path, opts, FsCreateAttrs::new(0o644, 0, 0))
+    }
+
+    fn open_prepare_with(
+        &self,
+        path: &str,
+        opts: FsOpenOptions,
+        attrs: FsCreateAttrs,
+    ) -> Result<FsMetadata, FsError> {
+        let comps = split_path(path)?;
+        let now = self.now();
+        let mut st = self.state.lock();
+        let ino = if comps.is_empty() {
+            ROOT_NODE
+        } else {
+            let (parent, name) = st.parent_of(&comps)?;
+            match st.dir(parent)?.get(name).copied() {
+                Some(existing) => {
+                    if opts.create_new {
+                        return Err(FsError::AlreadyExists);
+                    }
+                    existing
+                }
+                None if opts.create => {
+                    st.insert_node(parent, name, attrs, Body::File { len: 0, chunks: BTreeMap::new() }, now)?
+                }
+                None => return Err(FsError::NotFound),
+            }
+        };
+        let kind = st.nodes.get(&ino).ok_or(FsError::NotFound)?.kind();
+        if kind == FsNodeKind::Directory {
+            if opts.create_new && comps.is_empty() {
+                return Err(FsError::AlreadyExists);
+            }
+            if opts.write || opts.truncate {
+                return Err(FsError::IsADirectory);
+            }
+        } else if kind == FsNodeKind::File && opts.truncate && opts.write {
+            st.truncate(ino, 0, now)?;
+        }
+        st.metadata_of(ino)
+    }
+
+    fn read_at(&self, path: &str, offset: u64, out: &mut [u8]) -> Result<usize, FsError> {
+        let comps = split_path(path)?;
+        let st = self.state.lock();
+        let ino = st.walk(&comps)?;
+        st.read(ino, offset, out)
+    }
+
+    fn write_at(&self, path: &str, offset: u64, data: &[u8]) -> Result<(usize, u64), FsError> {
+        let comps = split_path(path)?;
+        let now = self.now();
+        let mut st = self.state.lock();
+        let ino = st.walk(&comps)?;
+        st.write(ino, offset, data, now)
+    }
+
+    fn truncate(&self, path: &str, new_len: u64) -> Result<u64, FsError> {
+        let comps = split_path(path)?;
+        let now = self.now();
+        let mut st = self.state.lock();
+        let ino = st.walk(&comps)?;
+        st.truncate(ino, new_len, now)
+    }
+
+    fn mkdir(&self, path: &str) -> Result<(), FsError> {
+        self.mkdir_with(path, FsCreateAttrs::new(0o755, 0, 0))
+    }
+
+    fn mkdir_with(&self, path: &str, attrs: FsCreateAttrs) -> Result<(), FsError> {
+        self.create(path, attrs, Body::Dir(BTreeMap::new())).map(|_| ())
+    }
+
+    fn unlink(&self, path: &str) -> Result<(), FsError> {
+        let comps = split_path(path)?;
+        if comps.is_empty() {
+            return Err(FsError::IsADirectory);
+        }
+        let now = self.now();
+        self.state.lock().remove_entry(&comps, false, now)
+    }
+
+    fn rmdir(&self, path: &str) -> Result<(), FsError> {
+        let comps = split_path(path)?;
+        if comps.is_empty() {
+            return Err(FsError::Busy);
+        }
+        let now = self.now();
+        self.state.lock().remove_entry(&comps, true, now)
+    }
+
+    fn rename(
+        &self,
+        src: &str,
+        dst: &str,
+        replace_existing: bool,
+        no_replace: bool,
+    ) -> Result<(), FsError> {
+        let src = split_path(src)?;
+        let dst = split_path(dst)?;
+        let now = self.now();
+        self.state
+            .lock()
+            .rename(&src, &dst, replace_existing, no_replace, now)
+    }
+
+    fn set_times(
+        &self,
+        path: &str,
+        atime: Option<FsTimestamp>,
+        mtime: Option<FsTimestamp>,
+        crtime: Option<FsTimestamp>,
+    ) -> Result<(), FsError> {
+        let comps = split_path(path)?;
+        let now = self.now();
+        let mut st = self.state.lock();
+        let ino = st.walk(&comps)?;
+        let node = st.nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+        if let Some(t) = atime {
+            node.atime = t;
+        }
+        if let Some(t) = mtime {
+            node.mtime = t;
+        }
+        if let Some(t) = crtime {
+            node.crtime = t;
+        }
+        node.ctime = now;
+        Ok(())
+    }
+
+    fn symlink(&self, target: &str, linkpath: &str) -> Result<(), FsError> {
+        self.symlink_with(target, linkpath, FsCreateAttrs::new(0o777, 0, 0))
+    }
+
+    fn symlink_with(
+        &self,
+        target: &str,
+        linkpath: &str,
+        attrs: FsCreateAttrs,
+    ) -> Result<(), FsError> {
+        if target.is_empty() {
+            return Err(FsError::NotFound);
+        }
+        if target.len() > TMPFS_SYMLINK_MAX || target.contains('\0') {
+            return Err(FsError::NameTooLong);
+        }
+        let attrs = FsCreateAttrs::new(0o777, attrs.uid, attrs.gid);
+        self.create(linkpath, attrs, Body::Symlink(String::from(target)))
+            .map(|_| ())
+    }
+
+    fn readlink(&self, path: &str) -> Result<String, FsError> {
+        let comps = split_path(path)?;
+        let st = self.state.lock();
+        let ino = st.walk(&comps)?;
+        match &st.nodes.get(&ino).ok_or(FsError::NotFound)?.body {
+            Body::Symlink(target) => Ok(target.clone()),
+            _ => Err(FsError::InvalidInput),
+        }
+    }
+
+    fn mknod_socket(&self, path: &str, attrs: FsCreateAttrs) -> Result<(), FsError> {
+        self.create(path, attrs, Body::Socket).map(|_| ())
+    }
+
+    fn chmod(&self, path: &str, mode: u32) -> Result<(), FsError> {
+        let comps = split_path(path)?;
+        let now = self.now();
+        let mut st = self.state.lock();
+        let ino = st.walk(&comps)?;
+        let node = st.nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+        node.mode = mode & 0o7777;
+        node.ctime = now;
+        Ok(())
+    }
+
+    fn link(&self, existing: &str, new_path: &str) -> Result<(), FsError> {
+        let from = split_path(existing)?;
+        let to = split_path(new_path)?;
+        let now = self.now();
+        let mut st = self.state.lock();
+        let ino = st.walk(&from)?;
+        link_node_locked(&mut st, ino, &to, now)
+    }
+
+    fn fallocate(
+        &self,
+        path: &str,
+        offset: u64,
+        len: u64,
+        keep_size: bool,
+    ) -> Result<u64, FsError> {
+        let comps = split_path(path)?;
+        let now = self.now();
+        let mut st = self.state.lock();
+        let ino = st.walk(&comps)?;
+        st.fallocate(ino, offset, len, keep_size, now)
+    }
+
+    fn retain_node(&self, path: &str) -> Result<u64, FsError> {
+        let comps = split_path(path)?;
+        let mut st = self.state.lock();
+        let ino = st.walk(&comps)?;
+        let node = st.nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+        node.opens = node.opens.checked_add(1).ok_or(FsError::Busy)?;
+        Ok(ino)
+    }
+
+    fn retain_node_id(&self, node: u64) -> Result<(), FsError> {
+        let mut st = self.state.lock();
+        let node = st.nodes.get_mut(&node).ok_or(FsError::NotFound)?;
+        node.opens = node.opens.checked_add(1).ok_or(FsError::Busy)?;
+        Ok(())
+    }
+
+    fn release_node(&self, node: u64) {
+        let mut st = self.state.lock();
+        if let Some(n) = st.nodes.get_mut(&node) {
+            n.opens = n.opens.saturating_sub(1);
+        }
+        st.free_if_orphan(node);
+    }
+
+    fn open_unnamed(&self, dir: &str, attrs: FsCreateAttrs) -> Result<u64, FsError> {
+        let comps = split_path(dir)?;
+        let now = self.now();
+        let mut st = self.state.lock();
+        let parent = st.walk(&comps)?;
+        st.dir(parent)?;
+        if st.nodes.len() as u64 >= st.max_inodes {
+            return Err(FsError::NoSpace);
+        }
+        let ino = st.next_node;
+        st.next_node += 1;
+        st.nodes.insert(
+            ino,
+            Node {
+                mode: attrs.mode & 0o7777,
+                uid: attrs.uid,
+                gid: attrs.gid,
+                nlink: 0,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                crtime: now,
+                opens: 1,
+                parent: 0,
+                body: Body::File {
+                    len: 0,
+                    chunks: BTreeMap::new(),
+                },
+            },
+        );
+        Ok(ino)
+    }
+
+    fn link_node(&self, node: u64, new_path: &str) -> Result<(), FsError> {
+        let to = split_path(new_path)?;
+        let now = self.now();
+        let mut st = self.state.lock();
+        link_node_locked(&mut st, node, &to, now)
+    }
+
+    fn metadata_node(&self, node: u64) -> Result<FsMetadata, FsError> {
+        self.state.lock().metadata_of(node)
+    }
+
+    fn read_node_at(&self, node: u64, offset: u64, out: &mut [u8]) -> Result<usize, FsError> {
+        self.state.lock().read(node, offset, out)
+    }
+
+    fn write_node_at(&self, node: u64, offset: u64, data: &[u8]) -> Result<(usize, u64), FsError> {
+        let now = self.now();
+        self.state.lock().write(node, offset, data, now)
+    }
+
+    fn truncate_node(&self, node: u64, new_len: u64) -> Result<u64, FsError> {
+        let now = self.now();
+        self.state.lock().truncate(node, new_len, now)
+    }
+
+    fn fallocate_node(
+        &self,
+        node: u64,
+        offset: u64,
+        len: u64,
+        keep_size: bool,
+    ) -> Result<u64, FsError> {
+        let now = self.now();
+        self.state.lock().fallocate(node, offset, len, keep_size, now)
+    }
+
+    fn chmod_node(&self, node: u64, mode: u32) -> Result<(), FsError> {
+        let now = self.now();
+        let mut st = self.state.lock();
+        let n = st.nodes.get_mut(&node).ok_or(FsError::NotFound)?;
+        n.mode = mode & 0o7777;
+        n.ctime = now;
+        Ok(())
+    }
+
+    fn set_times_node(
+        &self,
+        node: u64,
+        atime: Option<FsTimestamp>,
+        mtime: Option<FsTimestamp>,
+    ) -> Result<(), FsError> {
+        let now = self.now();
+        let mut st = self.state.lock();
+        let n = st.nodes.get_mut(&node).ok_or(FsError::NotFound)?;
+        if let Some(t) = atime {
+            n.atime = t;
+        }
+        if let Some(t) = mtime {
+            n.mtime = t;
+        }
+        n.ctime = now;
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<(), FsError> {
+        // Memory-backed: every completed write is already as durable as the
+        // filesystem gets.
+        Ok(())
+    }
+}
+
+fn link_node_locked(
+    st: &mut State,
+    ino: u64,
+    to: &[&str],
+    now: FsTimestamp,
+) -> Result<(), FsError> {
+    let (parent, name) = st.parent_of(to)?;
+    match st.nodes.get(&ino).ok_or(FsError::NotFound)?.body {
+        // Hard links to directories are not allowed (EPERM).
+        Body::Dir(_) => return Err(FsError::PermissionDenied),
+        _ => {}
+    }
+    if st.dir(parent)?.contains_key(name) {
+        return Err(FsError::AlreadyExists);
+    }
+    let node = st.nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+    node.nlink = node.nlink.checked_add(1).ok_or(FsError::TooBig)?;
+    node.ctime = now;
+    st.dir_mut(parent)?.insert(String::from(name), ino);
+    st.nodes.get_mut(&parent).ok_or(FsError::NotFound)?.touch_modify(now);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicI64, Ordering};
+
+    static TICK: AtomicI64 = AtomicI64::new(1000);
+    fn clock() -> FsTimestamp {
+        FsTimestamp {
+            secs: TICK.fetch_add(1, Ordering::Relaxed),
+            nanos: 0,
+        }
+    }
+
+    fn fs_with(quota: u64, inodes: u64) -> TmpFs {
+        TmpFs::new(TmpFsConfig {
+            quota_bytes: quota,
+            max_inodes: inodes,
+            root_mode: 0o1777,
+            root_uid: 0,
+            root_gid: 0,
+            clock,
+        })
+    }
+
+    fn fs() -> TmpFs {
+        fs_with(1024 * 1024, 1024)
+    }
+
+    const A: FsCreateAttrs = FsCreateAttrs::new(0o600, 1000, 1000);
+    const CREATE: FsOpenOptions = FsOpenOptions {
+        create: true,
+        create_new: false,
+        truncate: false,
+        write: true,
+        append: false,
+    };
+
+    fn put(fs: &TmpFs, path: &str, bytes: &[u8]) -> u64 {
+        let meta = fs.open_prepare_with(path, CREATE, A).unwrap();
+        fs.write_at(path, 0, bytes).unwrap();
+        meta.node_id
+    }
+
+    fn read_all(fs: &TmpFs, path: &str) -> Vec<u8> {
+        let len = fs.metadata(path).unwrap().len as usize;
+        let mut out = vec![0u8; len];
+        assert_eq!(fs.read_at(path, 0, &mut out).unwrap(), len);
+        out
+    }
+
+    #[test]
+    fn root_metadata_and_capabilities() {
+        let fs = fs();
+        let root = fs.metadata("").unwrap();
+        assert_eq!(root.kind, FsNodeKind::Directory);
+        assert_eq!(root.mode, 0o1777);
+        assert_eq!(root.nlink, 2);
+        assert_eq!(fs.metadata("/").unwrap().node_id, root.node_id);
+        let caps = fs.capabilities();
+        assert_eq!(caps.case_policy, CasePolicy::Exact);
+        assert!(caps.posix_nodes());
+        assert!(!caps.read_only);
+    }
+
+    #[test]
+    fn create_write_read_metadata_roundtrip() {
+        let fs = fs();
+        let meta = fs.open_prepare_with("a", CREATE, A).unwrap();
+        assert_eq!(meta.kind, FsNodeKind::File);
+        assert_eq!((meta.mode, meta.uid, meta.gid, meta.nlink), (0o600, 1000, 1000, 1));
+        assert_eq!(fs.write_at("a", 0, b"hello").unwrap(), (5, 5));
+        assert_eq!(fs.write_at("a", 3, b"LO!!").unwrap(), (4, 7));
+        assert_eq!(read_all(&fs, "a"), b"helLO!!");
+        let m2 = fs.metadata("a").unwrap();
+        assert!(m2.mtime.secs > meta.mtime.secs);
+        assert_eq!(m2.node_id, meta.node_id);
+        let mut buf = [0u8; 4];
+        assert_eq!(fs.read_at("a", 5, &mut buf).unwrap(), 2);
+        assert_eq!(fs.read_at("a", 99, &mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn node_ids_are_unique_and_never_reused() {
+        let fs = fs();
+        let a = put(&fs, "a", b"1");
+        fs.unlink("a").unwrap();
+        let b = put(&fs, "b", b"2");
+        assert_ne!(a, b);
+        assert!(b > a);
+        fs.mkdir("d").unwrap();
+        let d = fs.metadata("d").unwrap().node_id;
+        assert!(d > b);
+    }
+
+    #[test]
+    fn open_flags_exclusive_and_missing() {
+        let fs = fs();
+        let no_create = FsOpenOptions { create: false, ..CREATE };
+        assert_eq!(fs.open_prepare("a", no_create), Err(FsError::NotFound));
+        fs.open_prepare("a", CREATE).unwrap();
+        let excl = FsOpenOptions { create_new: true, ..CREATE };
+        assert_eq!(fs.open_prepare("a", excl), Err(FsError::AlreadyExists));
+        assert_eq!(fs.open_prepare("x/y", CREATE), Err(FsError::NotFound));
+        fs.write_at("a", 0, b"abc").unwrap();
+        fs.mkdir("d").unwrap();
+        assert_eq!(fs.open_prepare("d", CREATE), Err(FsError::IsADirectory));
+        let trunc = FsOpenOptions { truncate: true, create: false, ..CREATE };
+        assert_eq!(fs.open_prepare("a", trunc).unwrap().len, 0);
+        assert_eq!(fs.open_prepare("a/b", CREATE), Err(FsError::NotADirectory));
+    }
+
+    #[test]
+    fn path_validation() {
+        let fs = fs();
+        assert_eq!(fs.metadata("a/../b"), Err(FsError::InvalidInput));
+        let long = "x".repeat(256);
+        assert_eq!(fs.mkdir(&long), Err(FsError::NameTooLong));
+        assert_eq!(fs.mkdir("nul\0"), Err(FsError::InvalidInput));
+        fs.mkdir(&"y".repeat(255)).unwrap();
+        assert_eq!(fs.mkdir(""), Err(FsError::AlreadyExists));
+        assert_eq!(fs.unlink(""), Err(FsError::IsADirectory));
+    }
+
+    #[test]
+    fn mkdir_rmdir_nlink_and_errors() {
+        let fs = fs();
+        fs.mkdir_with("d", FsCreateAttrs::new(0o700, 7, 8)).unwrap();
+        let d = fs.metadata("d").unwrap();
+        assert_eq!((d.mode, d.uid, d.gid, d.nlink), (0o700, 7, 8, 2));
+        assert_eq!(fs.mkdir("d"), Err(FsError::AlreadyExists));
+        assert_eq!(fs.mkdir("nope/x"), Err(FsError::NotFound));
+        assert_eq!(fs.metadata("").unwrap().nlink, 3);
+        put(&fs, "d/f", b"x");
+        assert_eq!(fs.rmdir("d"), Err(FsError::DirectoryNotEmpty));
+        assert_eq!(fs.rmdir("d/f"), Err(FsError::NotADirectory));
+        assert_eq!(fs.unlink("d"), Err(FsError::IsADirectory));
+        fs.unlink("d/f").unwrap();
+        fs.rmdir("d").unwrap();
+        assert_eq!(fs.metadata("d"), Err(FsError::NotFound));
+        assert_eq!(fs.metadata("").unwrap().nlink, 2);
+        assert_eq!(fs.rmdir(""), Err(FsError::Busy));
+        assert_eq!(fs.node_count(), 1);
+    }
+
+    #[test]
+    fn read_dir_lists_sorted_kinds() {
+        let fs = fs();
+        fs.mkdir("d").unwrap();
+        put(&fs, "b", b"12");
+        fs.symlink("b", "l").unwrap();
+        fs.mknod_socket("s", A).unwrap();
+        let entries = fs.read_dir("").unwrap();
+        let view: Vec<(&str, FsNodeKind)> = entries.iter().map(|e| (e.name.as_str(), e.kind)).collect();
+        assert_eq!(
+            view,
+            [
+                ("b", FsNodeKind::File),
+                ("d", FsNodeKind::Directory),
+                ("l", FsNodeKind::Symlink),
+                ("s", FsNodeKind::Socket)
+            ]
+        );
+        assert_eq!(fs.read_dir("b"), Err(FsError::NotADirectory));
+    }
+
+    #[test]
+    fn quota_charges_chunks_and_returns_nospace() {
+        let fs = fs_with(3 * 4096, 64);
+        put(&fs, "a", &[1u8; 4096]);
+        assert_eq!(fs.used_bytes(), 4096);
+        // Overwrite does not charge again.
+        fs.write_at("a", 0, &[2u8; 100]).unwrap();
+        assert_eq!(fs.used_bytes(), 4096);
+        // Two more chunks fit, a third does not.
+        assert_eq!(fs.write_at("a", 4096, &vec![3u8; 2 * 4096]).unwrap().0, 2 * 4096);
+        assert_eq!(fs.used_bytes(), 3 * 4096);
+        assert_eq!(fs.write_at("a", 3 * 4096, b"x"), Err(FsError::NoSpace));
+        // Short write: only the part that fits is accepted.
+        fs.truncate("a", 4096).unwrap();
+        assert_eq!(fs.used_bytes(), 4096);
+        let (n, len) = fs.write_at("a", 4096, &vec![9u8; 5 * 4096]).unwrap();
+        assert_eq!((n, len), (2 * 4096, 3 * 4096));
+        // Freed on unlink.
+        fs.unlink("a").unwrap();
+        assert_eq!(fs.used_bytes(), 0);
+    }
+
+    #[test]
+    fn quota_boundary_is_exact_and_statfs_tracks_it() {
+        let fs = fs_with(2 * 4096, 64);
+        let st = fs.statfs().unwrap();
+        assert_eq!(st.fs_type_magic, 0x0102_1994);
+        assert_eq!((st.total_blocks, st.free_blocks, st.fs_name), (2, 2, "tmpfs"));
+        assert!(st.case_sensitive && st.case_preserved);
+        put(&fs, "a", &[7u8; 4096]);
+        assert_eq!(fs.statfs().unwrap().free_blocks, 1);
+        // One byte into the second chunk takes the whole chunk.
+        fs.write_at("a", 4096, b"z").unwrap();
+        let st = fs.statfs().unwrap();
+        assert_eq!((st.free_blocks, st.avail_blocks), (0, 0));
+        assert_eq!(fs.write_at("a", 8192, b"z"), Err(FsError::NoSpace));
+        assert_eq!(st.total_inodes, 64);
+        assert_eq!(st.free_inodes, 62);
+    }
+
+    #[test]
+    fn sparse_truncate_growth_allocates_nothing_and_reads_zeros() {
+        let fs = fs_with(4096, 64);
+        put(&fs, "a", b"abc");
+        // Growth far beyond the quota is sparse and charges nothing extra.
+        assert_eq!(fs.truncate("a", 1 << 40).unwrap(), 1 << 40);
+        assert_eq!(fs.used_bytes(), 4096);
+        assert_eq!(fs.metadata("a").unwrap().len, 1 << 40);
+        assert_eq!(fs.metadata("a").unwrap().allocation_size, 4096);
+        let mut buf = [0xffu8; 8];
+        assert_eq!(fs.read_at("a", 1 << 30, &mut buf).unwrap(), 8);
+        assert_eq!(buf, [0u8; 8]);
+        // Writing in the hole needs a fresh chunk, which the quota refuses.
+        assert_eq!(fs.write_at("a", 1 << 30, b"x"), Err(FsError::NoSpace));
+        assert_eq!(fs.truncate("a", TMPFS_MAX_FILE_SIZE + 1), Err(FsError::TooBig));
+    }
+
+    #[test]
+    fn shrink_then_grow_reads_zeros_not_stale_bytes() {
+        let fs = fs();
+        put(&fs, "a", &[0xaau8; 6000]);
+        fs.truncate("a", 100).unwrap();
+        assert_eq!(fs.used_bytes(), 4096);
+        fs.truncate("a", 6000).unwrap();
+        let data = read_all(&fs, "a");
+        assert!(data[..100].iter().all(|b| *b == 0xaa));
+        assert!(data[100..].iter().all(|b| *b == 0));
+        fs.truncate("a", 0).unwrap();
+        assert_eq!(fs.used_bytes(), 0);
+    }
+
+    #[test]
+    fn write_past_eof_zero_fills_gap() {
+        let fs = fs();
+        put(&fs, "a", b"ab");
+        fs.write_at("a", 10_000, b"Z").unwrap();
+        let data = read_all(&fs, "a");
+        assert_eq!(data.len(), 10_001);
+        assert_eq!(&data[..2], b"ab");
+        assert!(data[2..10_000].iter().all(|b| *b == 0));
+        assert_eq!(data[10_000], b'Z');
+        assert_eq!(fs.write_at("a", TMPFS_MAX_FILE_SIZE, b"xy"), Err(FsError::TooBig));
+        assert_eq!(fs.write_at("a", 0, b"").unwrap(), (0, 10_001));
+    }
+
+    #[test]
+    fn same_size_truncate_releases_keep_size_quota_for_unlinked_open_file() {
+        let fs = fs_with(8192, 16);
+        fs.open_prepare("a", CREATE).unwrap();
+        let node = fs.retain_node("a").unwrap();
+        fs.fallocate_node(node, 4096, 4096, true).unwrap();
+        assert_eq!(fs.used_bytes(), 4096);
+        fs.unlink("a").unwrap();
+        assert_eq!(fs.used_bytes(), 4096);
+        fs.truncate_node(node, 0).unwrap();
+        assert_eq!(fs.used_bytes(), 0);
+        fs.release_node(node);
+        assert_eq!(fs.used_bytes(), 0);
+    }
+
+    #[test]
+    fn fallocate_charges_and_respects_keep_size() {
+        let fs = fs_with(4 * 4096, 64);
+        put(&fs, "a", b"x");
+        assert_eq!(fs.fallocate("a", 0, 8192, false).unwrap(), 8192);
+        assert_eq!(fs.used_bytes(), 2 * 4096);
+        assert_eq!(fs.metadata("a").unwrap().len, 8192);
+        // KEEP_SIZE allocates but leaves the length alone.
+        assert_eq!(fs.fallocate("a", 8192, 4096, true).unwrap(), 8192);
+        assert_eq!(fs.used_bytes(), 3 * 4096);
+        assert_eq!(fs.metadata("a").unwrap().len, 8192);
+        // Too big for the quota: nothing is allocated.
+        assert_eq!(fs.fallocate("a", 0, 1 << 30, false), Err(FsError::NoSpace));
+        assert_eq!(fs.used_bytes(), 3 * 4096);
+        assert_eq!(fs.metadata("a").unwrap().len, 8192);
+        assert_eq!(fs.fallocate("a", 0, 0, false), Err(FsError::InvalidInput));
+        assert_eq!(fs.fallocate("a", u64::MAX, 2, false), Err(FsError::TooBig));
+        fs.mkdir("d").unwrap();
+        assert_eq!(fs.fallocate("d", 0, 1, false), Err(FsError::IsADirectory));
+    }
+
+    #[test]
+    fn inode_limit_returns_nospace_and_recovers() {
+        let fs = fs_with(1 << 20, 3);
+        fs.mkdir("a").unwrap();
+        fs.mkdir("b").unwrap();
+        assert_eq!(fs.mkdir("c"), Err(FsError::NoSpace));
+        assert_eq!(fs.open_prepare("f", CREATE), Err(FsError::NoSpace));
+        assert_eq!(fs.symlink("t", "l"), Err(FsError::NoSpace));
+        fs.rmdir("b").unwrap();
+        fs.mkdir("c").unwrap();
+    }
+
+    #[test]
+    fn rename_basic_replace_and_noreplace() {
+        let fs = fs();
+        let a = put(&fs, "a", b"AAA");
+        put(&fs, "b", b"BBBBBB");
+        assert_eq!(fs.rename("a", "b", false, true), Err(FsError::AlreadyExists));
+        assert_eq!(fs.rename("a", "b", false, false), Err(FsError::AlreadyExists));
+        let used = fs.used_bytes();
+        fs.rename("a", "b", true, false).unwrap();
+        assert_eq!(fs.metadata("a"), Err(FsError::NotFound));
+        assert_eq!(fs.metadata("b").unwrap().node_id, a);
+        assert_eq!(read_all(&fs, "b"), b"AAA");
+        // The replaced file's chunk was credited.
+        assert_eq!(fs.used_bytes(), used - 4096);
+        fs.rename("b", "c", true, true).unwrap();
+        assert_eq!(fs.rename("zz", "q", true, false), Err(FsError::NotFound));
+        // Same path: no-op, but NOREPLACE still reports EEXIST like Linux.
+        assert_eq!(fs.rename("c", "c", true, false), Ok(()));
+        assert_eq!(fs.rename("c", "c", true, true), Err(FsError::AlreadyExists));
+        assert_eq!(fs.rename("", "x", true, false), Err(FsError::Busy));
+    }
+
+    #[test]
+    fn rename_type_mismatch_and_non_empty_dir() {
+        let fs = fs();
+        fs.mkdir("d").unwrap();
+        fs.mkdir("e").unwrap();
+        put(&fs, "e/x", b"1");
+        put(&fs, "f", b"1");
+        assert_eq!(fs.rename("d", "f", true, false), Err(FsError::NotADirectory));
+        assert_eq!(fs.rename("f", "d", true, false), Err(FsError::IsADirectory));
+        assert_eq!(fs.rename("d", "e", true, false), Err(FsError::DirectoryNotEmpty));
+        fs.unlink("e/x").unwrap();
+        fs.rename("d", "e", true, false).unwrap();
+        assert_eq!(fs.metadata("d"), Err(FsError::NotFound));
+        assert_eq!(fs.metadata("").unwrap().nlink, 3);
+    }
+
+    #[test]
+    fn rename_directory_cycle_protection_and_nlink() {
+        let fs = fs();
+        fs.mkdir("a").unwrap();
+        fs.mkdir("a/b").unwrap();
+        fs.mkdir("a/b/c").unwrap();
+        assert_eq!(fs.rename("a", "a/b/c/a2", true, false), Err(FsError::InvalidInput));
+        assert_eq!(fs.rename("a", "a/x", true, false), Err(FsError::InvalidInput));
+        assert_eq!(fs.rename("a/b", "a/b/c/b", true, false), Err(FsError::InvalidInput));
+        // The tree is intact.
+        assert!(fs.metadata("a/b/c").is_ok());
+        // Legal move updates link counts and the cycle guard follows the move.
+        fs.mkdir("t").unwrap();
+        assert_eq!(fs.metadata("a").unwrap().nlink, 3);
+        fs.rename("a/b", "t/b", true, false).unwrap();
+        assert_eq!(fs.metadata("a").unwrap().nlink, 2);
+        assert_eq!(fs.metadata("t").unwrap().nlink, 3);
+        assert!(fs.metadata("t/b/c").is_ok());
+        assert_eq!(fs.rename("t", "t/b/c/t", true, false), Err(FsError::InvalidInput));
+        fs.rename("a", "t/b/c/a", true, false).unwrap();
+        assert!(fs.metadata("t/b/c/a").is_ok());
+    }
+
+    #[test]
+    fn rename_hardlink_to_self_is_noop_and_keeps_both_names() {
+        let fs = fs();
+        put(&fs, "a", b"x");
+        fs.link("a", "b").unwrap();
+        assert_eq!(fs.metadata("a").unwrap().nlink, 2);
+        fs.rename("a", "b", true, false).unwrap();
+        assert!(fs.metadata("a").is_ok() && fs.metadata("b").is_ok());
+        assert_eq!(fs.rename("a", "b", true, true), Err(FsError::AlreadyExists));
+    }
+
+    #[test]
+    fn hardlink_shares_data_and_frees_with_last_name() {
+        let fs = fs();
+        let ino = put(&fs, "a", b"data");
+        fs.link("a", "b").unwrap();
+        assert_eq!(fs.metadata("b").unwrap().node_id, ino);
+        fs.write_at("b", 4, b"!").unwrap();
+        assert_eq!(read_all(&fs, "a"), b"data!");
+        fs.unlink("a").unwrap();
+        assert_eq!(fs.metadata("b").unwrap().nlink, 1);
+        assert_eq!(fs.used_bytes(), 4096);
+        fs.unlink("b").unwrap();
+        assert_eq!(fs.used_bytes(), 0);
+        assert_eq!(fs.node_count(), 1);
+        fs.mkdir("d").unwrap();
+        assert_eq!(fs.link("d", "d2"), Err(FsError::PermissionDenied));
+        put(&fs, "f", b"");
+        assert_eq!(fs.link("f", "d"), Err(FsError::AlreadyExists));
+        assert_eq!(fs.link("nope", "x"), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn unlink_while_open_keeps_data_until_last_release() {
+        let fs = fs();
+        put(&fs, "a", b"persist");
+        let node = fs.retain_node("a").unwrap();
+        let node2 = fs.retain_node("a").unwrap();
+        assert_eq!(node, node2);
+        fs.unlink("a").unwrap();
+        assert_eq!(fs.metadata("a"), Err(FsError::NotFound));
+        // The name can be reused immediately with an unrelated node.
+        let fresh = put(&fs, "a", b"new");
+        assert_ne!(fresh, node);
+        // The pinned node is still readable, writable and growable.
+        let mut buf = [0u8; 16];
+        assert_eq!(fs.read_node_at(node, 0, &mut buf).unwrap(), 7);
+        assert_eq!(&buf[..7], b"persist");
+        assert_eq!(fs.write_node_at(node, 7, b"ed").unwrap(), (2, 9));
+        assert_eq!(fs.truncate_node(node, 100).unwrap(), 100);
+        assert_eq!(fs.metadata_node(node).unwrap().nlink, 0);
+        assert_eq!(read_all(&fs, "a"), b"new");
+        let held = fs.used_bytes();
+        assert_eq!(held, 2 * 4096);
+        fs.release_node(node);
+        // One pin left: still alive.
+        assert!(fs.metadata_node(node).is_ok());
+        assert_eq!(fs.used_bytes(), held);
+        fs.release_node(node2);
+        assert_eq!(fs.metadata_node(node), Err(FsError::NotFound));
+        assert_eq!(fs.used_bytes(), 4096);
+    }
+
+    #[test]
+    fn rename_over_open_target_keeps_replaced_data_alive() {
+        let fs = fs();
+        put(&fs, "src", b"S");
+        put(&fs, "dst", b"DDD");
+        let old = fs.retain_node("dst").unwrap();
+        fs.rename("src", "dst", true, false).unwrap();
+        let mut buf = [0u8; 4];
+        assert_eq!(fs.read_node_at(old, 0, &mut buf).unwrap(), 3);
+        assert_eq!(&buf[..3], b"DDD");
+        assert_eq!(read_all(&fs, "dst"), b"S");
+        fs.release_node(old);
+        assert_eq!(fs.metadata_node(old), Err(FsError::NotFound));
+        assert_eq!(fs.used_bytes(), 4096);
+    }
+
+    #[test]
+    fn pinned_directory_tracks_rename_and_not_replacement() {
+        let fs = fs();
+        fs.mkdir("a").unwrap();
+        put(&fs, "a/original", b"x");
+        let node = fs.retain_node("a").unwrap();
+        fs.rename("a", "b", false, false).unwrap();
+        fs.mkdir("a").unwrap();
+        put(&fs, "a/replacement", b"y");
+        assert_eq!(fs.directory_path_node(node).unwrap(), "b");
+        assert_eq!(fs.read_dir_node(node).unwrap()[0].name, "original");
+        fs.release_node(node);
+    }
+
+    #[test]
+    fn retain_node_id_keeps_unlinked_inode_alive() {
+        let fs = fs();
+        fs.open_prepare("file", FsOpenOptions { create: true, write: true, ..FsOpenOptions::default() }).unwrap();
+        let node = fs.retain_node("file").unwrap();
+        fs.unlink("file").unwrap();
+        fs.retain_node_id(node).unwrap();
+        fs.release_node(node);
+        assert!(fs.metadata_node(node).is_ok());
+        fs.release_node(node);
+        assert_eq!(fs.retain_node_id(node), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn open_node_follows_rename_and_release_of_linked_node_keeps_it() {
+        let fs = fs();
+        put(&fs, "a", b"keep");
+        let node = fs.retain_node("a").unwrap();
+        fs.rename("a", "b", true, false).unwrap();
+        assert_eq!(fs.metadata("b").unwrap().node_id, node);
+        fs.release_node(node);
+        assert_eq!(read_all(&fs, "b"), b"keep");
+        // Spurious extra release never underflows or frees a linked node.
+        fs.release_node(node);
+        assert_eq!(read_all(&fs, "b"), b"keep");
+    }
+
+    #[test]
+    fn unlinked_node_counts_against_inode_limit_until_released() {
+        let fs = fs_with(1 << 20, 2);
+        put(&fs, "a", b"x");
+        let node = fs.retain_node("a").unwrap();
+        fs.unlink("a").unwrap();
+        assert_eq!(fs.open_prepare("b", CREATE), Err(FsError::NoSpace));
+        fs.release_node(node);
+        fs.open_prepare("b", CREATE).unwrap();
+    }
+
+    #[test]
+    fn open_unnamed_and_link_node() {
+        let fs = fs();
+        fs.mkdir("d").unwrap();
+        let node = fs.open_unnamed("d", A).unwrap();
+        let meta = fs.metadata_node(node).unwrap();
+        assert_eq!((meta.nlink, meta.mode, meta.uid, meta.kind), (0, 0o600, 1000, FsNodeKind::File));
+        assert!(fs.read_dir("d").unwrap().is_empty());
+        fs.write_node_at(node, 0, b"tmp").unwrap();
+        fs.link_node(node, "d/named").unwrap();
+        assert_eq!(fs.metadata("d/named").unwrap().nlink, 1);
+        assert_eq!(read_all(&fs, "d/named"), b"tmp");
+        fs.release_node(node);
+        assert_eq!(read_all(&fs, "d/named"), b"tmp");
+        // Never linked: freed on release.
+        let lone = fs.open_unnamed("d", A).unwrap();
+        fs.write_node_at(lone, 0, b"x").unwrap();
+        let before = fs.used_bytes();
+        fs.release_node(lone);
+        assert_eq!(fs.used_bytes(), before - 4096);
+        assert_eq!(fs.open_unnamed("d/named", A), Err(FsError::NotADirectory));
+    }
+
+    #[test]
+    fn symlink_readlink_metadata_and_quota() {
+        let fs = fs_with(1 << 20, 64);
+        fs.symlink_with("../target/file", "l", FsCreateAttrs::new(0o600, 5, 6)).unwrap();
+        assert_eq!(fs.readlink("l").unwrap(), "../target/file");
+        let meta = fs.metadata("l").unwrap();
+        assert_eq!(meta.kind, FsNodeKind::Symlink);
+        assert_eq!(meta.len, 14);
+        assert_eq!((meta.mode, meta.uid, meta.gid), (0o777, 5, 6));
+        assert_eq!(fs.used_bytes(), 14);
+        assert_eq!(fs.symlink("x", "l"), Err(FsError::AlreadyExists));
+        assert_eq!(fs.symlink("", "e"), Err(FsError::NotFound));
+        assert_eq!(fs.symlink(&"t".repeat(4096), "big"), Err(FsError::NameTooLong));
+        put(&fs, "f", b"");
+        assert_eq!(fs.readlink("f"), Err(FsError::InvalidInput));
+        assert_eq!(fs.readlink("missing"), Err(FsError::NotFound));
+        // A dangling link is a link; walking through it is not a directory walk.
+        assert_eq!(fs.metadata("l/x"), Err(FsError::NotADirectory));
+        fs.unlink("l").unwrap();
+        assert_eq!(fs.used_bytes(), 0);
+    }
+
+    /// `O_NOFOLLOW` resolution leaves the final link in place; the volume then
+    /// reports a symlink node, which vfsd's `open_posix_node` maps to `ELOOP`.
+    /// An open with `O_TRUNC` must not touch the link or what it names.
+    #[test]
+    fn open_of_a_symlink_reports_the_link_and_never_truncates_its_target() {
+        let fs = fs();
+        put(&fs, "target", b"keep");
+        fs.symlink("target", "l").unwrap();
+        let opts = FsOpenOptions { create: false, create_new: false, truncate: true, write: true, append: false };
+        let meta = fs.open_prepare_with("l", opts, A).unwrap();
+        assert_eq!(meta.kind, FsNodeKind::Symlink);
+        let mut buf = [0u8; 4];
+        assert_eq!(fs.read_at("target", 0, &mut buf), Ok(4));
+        assert_eq!(&buf, b"keep");
+        // O_CREAT|O_EXCL on the link name collides instead of following it.
+        let excl = FsOpenOptions { create: true, create_new: true, truncate: false, write: false, append: false };
+        assert_eq!(fs.open_prepare_with("l", excl, A), Err(FsError::AlreadyExists));
+    }
+
+    #[test]
+    fn symlink_loops_are_data_not_followed_by_volume() {
+        let fs = fs();
+        fs.symlink("b", "a").unwrap();
+        fs.symlink("a", "b").unwrap();
+        // The volume never chases links, so a cycle cannot hang it.
+        assert_eq!(fs.readlink("a").unwrap(), "b");
+        assert_eq!(fs.readlink("b").unwrap(), "a");
+        assert_eq!(fs.metadata("a").unwrap().kind, FsNodeKind::Symlink);
+        let mut buf = [0u8; 1];
+        assert_eq!(fs.read_at("a", 0, &mut buf), Err(FsError::InvalidInput));
+    }
+
+    #[test]
+    fn socket_nodes_exist_with_mode_and_block_data_io() {
+        let fs = fs();
+        fs.mknod_socket("sock", FsCreateAttrs::new(0o755, 1000, 1000)).unwrap();
+        let meta = fs.metadata("sock").unwrap();
+        assert_eq!(meta.kind, FsNodeKind::Socket);
+        assert_eq!((meta.mode, meta.uid, meta.len), (0o755, 1000, 0));
+        assert_eq!(fs.mknod_socket("sock", A), Err(FsError::AlreadyExists));
+        assert_eq!(fs.mknod_socket("nodir/s", A), Err(FsError::NotFound));
+        assert_eq!(fs.write_at("sock", 0, b"x"), Err(FsError::InvalidInput));
+        assert_eq!(fs.truncate("sock", 0), Err(FsError::InvalidInput));
+        // Re-binding requires unlink, exactly as AF_UNIX does.
+        fs.unlink("sock").unwrap();
+        fs.mknod_socket("sock", A).unwrap();
+        // Opening for write is not offered by the node kind.
+        let open = fs.open_prepare("sock", CREATE).unwrap();
+        assert_eq!(open.kind, FsNodeKind::Socket);
+    }
+
+    #[test]
+    fn chmod_and_set_times_update_ctime() {
+        let fs = fs();
+        put(&fs, "a", b"x");
+        let before = fs.metadata("a").unwrap();
+        fs.chmod("a", 0o4755).unwrap();
+        let after = fs.metadata("a").unwrap();
+        assert_eq!(after.mode, 0o4755);
+        assert!(after.ctime.secs > before.ctime.secs);
+        assert_eq!(after.mtime, before.mtime);
+        fs.chmod("a", 0o170000 | 0o644).unwrap();
+        assert_eq!(fs.metadata("a").unwrap().mode, 0o644);
+        let t = FsTimestamp { secs: 42, nanos: 7 };
+        fs.set_times("a", Some(t), None, None).unwrap();
+        let m = fs.metadata("a").unwrap();
+        assert_eq!(m.atime, t);
+        assert_eq!(m.mtime, before.mtime);
+        fs.set_times("a", None, Some(t), None).unwrap();
+        assert_eq!(fs.metadata("a").unwrap().mtime, t);
+        assert_eq!(fs.chmod("zz", 0o600), Err(FsError::NotFound));
+        // Node-addressed variants work on an unlinked file too.
+        let node = fs.retain_node("a").unwrap();
+        fs.unlink("a").unwrap();
+        fs.chmod_node(node, 0o600).unwrap();
+        fs.set_times_node(node, None, Some(FsTimestamp { secs: 9, nanos: 0 })).unwrap();
+        let m = fs.metadata_node(node).unwrap();
+        assert_eq!((m.mode, m.mtime.secs), (0o600, 9));
+        fs.release_node(node);
+    }
+
+    #[test]
+    fn timestamps_preserve_nanoseconds_for_path_and_unlinked_node() {
+        fn precise_clock() -> FsTimestamp {
+            FsTimestamp { secs: 1_700_000_000, nanos: 123_456_789 }
+        }
+        let fs = TmpFs::new(TmpFsConfig {
+            quota_bytes: 4096,
+            max_inodes: 16,
+            root_mode: 0o1777,
+            root_uid: 0,
+            root_gid: 0,
+            clock: precise_clock,
+        });
+        let created = fs.open_prepare_with("a", CREATE, A).unwrap();
+        assert_eq!(created.mtime, precise_clock());
+        let atime = FsTimestamp { secs: -1, nanos: 999_999_999 };
+        let mtime = FsTimestamp { secs: 42, nanos: 987_654_321 };
+        fs.set_times("a", Some(atime), Some(mtime), None).unwrap();
+        let meta = fs.metadata("a").unwrap();
+        assert_eq!((meta.atime, meta.mtime, meta.ctime), (atime, mtime, precise_clock()));
+        let node = fs.retain_node("a").unwrap();
+        fs.unlink("a").unwrap();
+        fs.set_times_node(node, Some(mtime), Some(atime)).unwrap();
+        let meta = fs.metadata_node(node).unwrap();
+        assert_eq!((meta.atime, meta.mtime, meta.ctime), (mtime, atime, precise_clock()));
+        fs.release_node(node);
+    }
+
+    #[test]
+    fn directory_times_change_on_entry_mutation() {
+        let fs = fs();
+        fs.mkdir("d").unwrap();
+        let t0 = fs.metadata("d").unwrap().mtime;
+        put(&fs, "d/f", b"");
+        let t1 = fs.metadata("d").unwrap().mtime;
+        assert!(t1.secs > t0.secs);
+        fs.unlink("d/f").unwrap();
+        assert!(fs.metadata("d").unwrap().mtime.secs > t1.secs);
+    }
+
+    #[test]
+    fn open_directory_rules() {
+        let fs = fs();
+        fs.mkdir("d").unwrap();
+        let ro = FsOpenOptions::default();
+        assert_eq!(fs.open_prepare("d", ro).unwrap().kind, FsNodeKind::Directory);
+        assert_eq!(fs.open_prepare("", ro).unwrap().kind, FsNodeKind::Directory);
+        let wr = FsOpenOptions { write: true, ..ro };
+        assert_eq!(fs.open_prepare("d", wr), Err(FsError::IsADirectory));
+        assert_eq!(fs.read_at("d", 0, &mut [0u8; 1]), Err(FsError::IsADirectory));
+        assert_eq!(fs.write_at("d", 0, b"x"), Err(FsError::IsADirectory));
+        assert_eq!(fs.truncate("d", 0), Err(FsError::IsADirectory));
+    }
+
+    #[test]
+    fn canonical_key_and_flush() {
+        let fs = fs();
+        assert_eq!(fs.canonical_key("/a//b/").unwrap(), "a/b");
+        assert!(!fs.is_immutable());
+        assert_eq!(fs.flush(), Ok(()));
+    }
+
+    #[test]
+    fn mixed_stress_never_leaks_quota_or_nodes() {
+        let fs = fs_with(64 * 4096, 256);
+        for round in 0..20u32 {
+            for i in 0..8u32 {
+                let name = alloc::format!("f{i}");
+                let (written, _) = {
+                    fs.open_prepare(&name, CREATE).unwrap();
+                    fs.write_at(&name, u64::from(i) * 100, &vec![round as u8; 5000]).unwrap()
+                };
+                assert_eq!(written, 5000);
+                if i % 2 == 0 {
+                    fs.rename(&name, &alloc::format!("g{i}"), true, false).unwrap();
+                }
+            }
+            for i in 0..8u32 {
+                let _ = fs.unlink(&alloc::format!("f{i}"));
+                let _ = fs.unlink(&alloc::format!("g{i}"));
+            }
+        }
+        assert_eq!(fs.used_bytes(), 0);
+        assert_eq!(fs.node_count(), 1);
+    }
+}

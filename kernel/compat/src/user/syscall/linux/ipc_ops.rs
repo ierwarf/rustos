@@ -4152,6 +4152,26 @@ impl PreparedTransferInstall {
             .collect()
     }
 
+    /// Sets close-on-exec on every claimed entry before it is committed.
+    /// `recvmsg` descriptors take only the receiver's `MSG_CMSG_CLOEXEC`.
+    pub(super) fn set_close_on_exec(&mut self, cloexec: bool) -> Result<(), i64> {
+        let entries = self.entries.take().ok_or(LINUX_ESTALE)?;
+        let fd_flags = if cloexec { multitask::FD_CLOEXEC } else { 0 };
+        let mut rebuilt = Vec::with_capacity(entries.len());
+        for transferred in entries {
+            let mut entry = transferred.into_entry();
+            entry.set_fd_flags(fd_flags);
+            // The entry already owns its provider reference; re-wrapping it
+            // acquires no second one (`from_initial_entry`).
+            rebuilt.push(
+                multitask::TransferredHandleEntry::from_initial_entry(entry)
+                    .ok_or(LINUX_ESTALE)?,
+            );
+        }
+        self.entries = Some(rebuilt);
+        Ok(())
+    }
+
     pub(super) fn commit(mut self) -> Result<(), i64> {
         let entries = self.entries.take().ok_or(LINUX_ESTALE)?;
         let committed = multitask::with_current_user_process_state_mut(|_, _, process_state| {

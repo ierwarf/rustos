@@ -2,8 +2,12 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use linux_raw_sys::{auxvec as linux_auxvec, general as linux, ioctl as linux_ioctl, net as linux_net};
 
+mod file_lock;
+pub use file_lock::*;
 mod local_fd;
 pub use local_fd::*;
+mod mm_sched;
+pub use mm_sched::*;
 mod task;
 pub use task::*;
 
@@ -143,6 +147,10 @@ raw_u64! {
     SYS_SYMLINKAT = linux::__NR_symlinkat;
     SYS_FCHMODAT = linux::__NR_fchmodat;
     SYS_UTIMENSAT = linux::__NR_utimensat;
+    SYS_FCHMODAT2 = linux::__NR_fchmodat2;
+    SYS_FALLOCATE = linux::__NR_fallocate;
+    SYS_SENDFILE = linux::__NR_sendfile;
+    SYS_COPY_FILE_RANGE = linux::__NR_copy_file_range;
     SYS_UNLINKAT = linux::__NR_unlinkat;
     SYS_SOCKETPAIR = linux::__NR_socketpair;
     SYS_BIND = linux::__NR_bind;
@@ -1225,6 +1233,7 @@ impl LinuxProcessImageInfo {
             mmap_next,
             mapping_limit: crate::syscall::PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
             reserved_mappings: [LinuxReservedMapping::EMPTY; MAX_RESERVED_MAPPINGS],
+            startup: LinuxStartupLayout::default(),
         }
     }
 
@@ -1283,6 +1292,24 @@ pub struct LinuxProcessState {
     /// This is kernel-owned placement authority, not a releasable mmap reserve.
     pub mapping_limit: u64,
     pub reserved_mappings: [LinuxReservedMapping; MAX_RESERVED_MAPPINGS],
+    /// Where exec placed argv/envp/auxv in the new image's user memory.
+    pub startup: LinuxStartupLayout,
+}
+
+/// User-memory ranges of the initial process stack written at exec time:
+/// `[arg_start, arg_end)` holds the NUL-separated argv strings,
+/// `[env_start, env_end)` the NUL-separated envp strings and
+/// `[auxv_start, auxv_end)` the auxiliary vector words. Ring0 retains only
+/// these addresses (never a copy) so `/proc/<pid>/{cmdline,environ,auxv}` read
+/// the live bytes the way Linux does. All zero means "not recorded".
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct LinuxStartupLayout {
+    pub arg_start: u64,
+    pub arg_end: u64,
+    pub env_start: u64,
+    pub env_end: u64,
+    pub auxv_start: u64,
+    pub auxv_end: u64,
 }
 
 impl Default for LinuxProcessState {
@@ -1294,6 +1321,7 @@ impl Default for LinuxProcessState {
             mmap_next: 0,
             mapping_limit: crate::syscall::PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
             reserved_mappings: [LinuxReservedMapping::EMPTY; MAX_RESERVED_MAPPINGS],
+            startup: LinuxStartupLayout::default(),
         }
     }
 }

@@ -48,8 +48,14 @@ pub const FIRST_DYNAMIC_FD: u32 = 3;
 pub const MAX_DYNAMIC_FD: u64 = 65_535;
 pub const FD_CLOEXEC: u32 = 0x1;
 const MAX_PENDING_IPC_TRANSFER_OBJECTS: usize = 1024;
-const STATUS_FLAG_MASK: u64 =
-    linux_abi::O_ACCMODE | linux_abi::O_APPEND | linux_abi::O_NONBLOCK | linux_abi::O_NOCTTY;
+/// `O_PATH` is a status flag fixed at open: it marks a descriptor that names a
+/// location only, and `file_rights_from_status_flags` strips every right but
+/// transfer from it.
+const STATUS_FLAG_MASK: u64 = linux_abi::O_ACCMODE
+    | linux_abi::O_APPEND
+    | linux_abi::O_NONBLOCK
+    | linux_abi::O_NOCTTY
+    | linux_abi::O_PATH;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConsoleStreamKind {
@@ -434,15 +440,16 @@ impl KernelHandle {
                 HandleRights::Device(rights)
             }
             Self::Epoll(_) => HandleRights::Epoll,
-            // Anonymous kernel-local objects are not transferable (no
-            // SCM_RIGHTS) and carry only the access their description allows.
             Self::EventFd(_) => HandleRights::File(
                 FileHandleRights::READ.union(FileHandleRights::WRITE),
             ),
-            Self::Pipe(pipe) => HandleRights::File(match pipe.role() {
-                crate::user::pipe::PipeRole::Read => FileHandleRights::READ,
-                crate::user::pipe::PipeRole::Write => FileHandleRights::WRITE,
-            }),
+            Self::Pipe(pipe) => {
+                let access = match pipe.role() {
+                    crate::user::pipe::PipeRole::Read => FileHandleRights::READ,
+                    crate::user::pipe::PipeRole::Write => FileHandleRights::WRITE,
+                };
+                HandleRights::File(access.union(FileHandleRights::TRANSFER))
+            },
             Self::InetSocket(_) => HandleRights::Socket(
                 SocketHandleRights::SEND
                     .union(SocketHandleRights::RECV)
@@ -453,8 +460,14 @@ impl KernelHandle {
                 RemoteVfsHandleKind::File => {
                     HandleRights::File(file_rights_from_status_flags(status_flags))
                 }
+                RemoteVfsHandleKind::Directory if status_flags & linux_abi::O_PATH != 0 => {
+                    HandleRights::File(FileHandleRights::TRANSFER)
+                }
                 RemoteVfsHandleKind::Directory => {
                     HandleRights::File(FileHandleRights::READ.union(FileHandleRights::TRANSFER))
+                }
+                RemoteVfsHandleKind::Device if status_flags & linux_abi::O_PATH != 0 => {
+                    HandleRights::File(FileHandleRights::TRANSFER)
                 }
                 RemoteVfsHandleKind::Device => HandleRights::File(
                     FileHandleRights::READ
@@ -498,6 +511,7 @@ impl KernelHandle {
             Self::Job(_)
                 | Self::Socket(_)
                 | Self::Memfd(_)
+                | Self::Pipe(_)
                 | Self::VfsDirectory(_)
                 | Self::Device(_)
                 | Self::RemoteVfs(_)
@@ -539,6 +553,9 @@ impl KernelHandle {
 
 fn file_rights_from_status_flags(status_flags: u64) -> FileHandleRights {
     let mut rights = FileHandleRights::TRANSFER;
+    if status_flags & linux_abi::O_PATH != 0 {
+        return rights;
+    }
     match status_flags & linux_abi::O_ACCMODE {
         linux_abi::O_WRONLY => rights = rights.union(FileHandleRights::WRITE),
         linux_abi::O_RDWR => {

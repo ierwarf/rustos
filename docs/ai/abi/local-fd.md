@@ -39,7 +39,9 @@ in a ring-3 service"; revisit only if pipes need names (FIFOs) or policy.
 ## Mechanism
 
 - Handle kinds `KernelHandle::{Pipe, EventFd}` (`HANDLE_KIND_PIPE=12`,
-  `HANDLE_KIND_EVENTFD=13`). Non-transferable: no `SCM_RIGHTS`.
+  `HANDLE_KIND_EVENTFD=13`). A pipe can be passed via `SCM_RIGHTS`: the
+  transfer retains the exact endpoint, its access mode, and an in-flight
+  descriptor reference. An eventfd remains non-transferable.
 - Descriptor references are explicit (`try_acquire`/`release`); the last release
   closes the end, wakes peers and unregisters from the `local_wait` registry
   (4096 slots, `LockClass::LocalFdObject`, leaf lock; raw sections are bounded,

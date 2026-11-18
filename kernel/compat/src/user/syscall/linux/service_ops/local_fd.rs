@@ -660,62 +660,10 @@ pub(in crate::user::syscall::linux) fn not_seekable(fd: u64) -> Option<u64> {
     current_local_fd(fd).map(|_| linux_errno(LINUX_ESPIPE))
 }
 
-fn stat_identity(local: &LocalFd) -> (u64, u32) {
-    match local {
-        LocalFd::Pipe(pipe) => (pipe.inode(), linux_abi::S_IFIFO | 0o600),
-        LocalFd::EventFd(eventfd) => (eventfd.token_id(), linux_abi::S_IFREG | 0o600),
-    }
-}
-
-fn owner_ids() -> (u32, u32) {
-    multitask::with_current_process_credentials(|security| (security.euid(), security.egid()))
-        .unwrap_or((0, 0))
-}
-
-fn write_stat(local: &LocalFd, stat_ptr: u64) -> u64 {
-    if let Err(err) = usermem::validate_current_user_write_buffer(stat_ptr, LINUX_STAT_SIZE) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    let (inode, mode) = stat_identity(local);
-    let (uid, gid) = owner_ids();
-    let mut out = [0_u8; LINUX_STAT_SIZE];
-    out[8..16].copy_from_slice(&inode.to_ne_bytes());
-    out[16..24].copy_from_slice(&1_u64.to_ne_bytes());
-    out[24..28].copy_from_slice(&mode.to_ne_bytes());
-    out[28..32].copy_from_slice(&uid.to_ne_bytes());
-    out[32..36].copy_from_slice(&gid.to_ne_bytes());
-    out[56..64].copy_from_slice(&4096_i64.to_ne_bytes());
-    match usermem::write_current_user_bytes(stat_ptr, &out) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    }
-}
-
-fn write_statx(local: &LocalFd, statx_ptr: u64) -> u64 {
-    // STATX_TYPE | MODE | NLINK | UID | GID | INO | SIZE | BLOCKS: the fields
-    // filled in below. No timestamps are claimed.
-    const STATX_FILLED: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x100 | 0x200 | 0x400;
-    if let Err(err) = usermem::validate_current_user_write_buffer(statx_ptr, LINUX_STATX_SIZE) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    let (inode, mode) = stat_identity(local);
-    let (uid, gid) = owner_ids();
-    let mut out = [0_u8; LINUX_STATX_SIZE];
-    out[0..4].copy_from_slice(&STATX_FILLED.to_ne_bytes());
-    out[4..8].copy_from_slice(&4096_u32.to_ne_bytes());
-    out[16..20].copy_from_slice(&1_u32.to_ne_bytes());
-    out[20..24].copy_from_slice(&uid.to_ne_bytes());
-    out[24..28].copy_from_slice(&gid.to_ne_bytes());
-    out[28..30].copy_from_slice(&(mode as u16).to_ne_bytes());
-    out[32..40].copy_from_slice(&inode.to_ne_bytes());
-    match usermem::write_current_user_bytes(statx_ptr, &out) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    }
-}
-
+/// `fstat` on a kernel-owned descriptor object (pipe, eventfd, epoll, socket,
+/// memfd); the identity rules live in `anon_stat`.
 pub(in crate::user::syscall::linux) fn fstat(fd: u64, stat_ptr: u64) -> Option<u64> {
-    current_local_fd(fd).map(|local| write_stat(&local, stat_ptr))
+    super::anon_stat::fstat(fd, stat_ptr)
 }
 
 /// `fstat` spelled as `newfstatat(fd, "", ..., AT_EMPTY_PATH)`, which current
@@ -741,7 +689,7 @@ pub(in crate::user::syscall::linux) fn statx_at_empty_path(
     if !path.is_empty() || flags & linux_abi::AT_EMPTY_PATH == 0 {
         return None;
     }
-    current_local_fd(dirfd).map(|local| write_statx(&local, statx_ptr))
+    super::anon_stat::statx(dirfd, statx_ptr)
 }
 
 // ---- poll / epoll integration ---------------------------------------------

@@ -229,6 +229,16 @@ pub(super) fn bind_listener(path: &str) -> Result<UnixListener, i32> {
     }
     bind_timing("bind", started_at);
 
+    // This broker serves cross-UID clients. VFS write permission admits a
+    // connection; authenticated SO_PEERCRED still gates broker operations.
+    // SAFETY: `path` is the live NUL-terminated path in the protected /run.
+    if unsafe { libc::chmod(path.as_ptr(), 0o666) } < 0 {
+        let err = last_errno();
+        // SAFETY: this function still owns both the new socket and its name.
+        unsafe { libc::close(socket_fd); libc::unlink(path.as_ptr()); }
+        return Err(err);
+    }
+
     // SAFETY: `listen` takes the live descriptor `socket_fd` and an integer backlog.
     if unsafe { libc::listen(socket_fd, 16) } < 0 {
         let err = last_errno();

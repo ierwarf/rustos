@@ -898,6 +898,58 @@ severity = "critical"
 flows = ["vfs-open-description"]
 reason = "Bounded memfd copyin/copyout must preserve exact cursor and seal errors while preventing sub-page lock and reschedule amplification."
 
+# Chrome compatibility entrypoints reuse the owner models below; these mappings
+# route validation and do not prove Linux syscall conformance.
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/file_lock_ops.rs"
+severity = "critical"
+flows = ["vfs-open-description"]
+reason = "Record-lock mutations and any-close release must retain exact file, process and operation custody across IPC timeout and exec."
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/file_lock_ops.rs"
+models = ["service-mutation-recovery/ServiceMutationRecovery", "vfs-open-description-recovery/VfsOpenDescriptionRecovery"]
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/mm_query_ops.rs"
+severity = "critical"
+flows = ["memory-map"]
+reason = "Untrusted memory ranges must not bypass mapping ownership, page lifetime, TLB invalidation or allocation accounting."
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/mm_query_ops.rs"
+models = ["mm-request-lease/MmRequestLease"]
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/openat_flags_ops.rs"
+severity = "critical"
+flows = ["vfs-open-description"]
+reason = "O_PATH and no-follow admission must attenuate descriptor authority without bypassing the namespace owner."
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/openat_flags_ops.rs"
+models = ["vfs-open-description-recovery/VfsOpenDescriptionRecovery"]
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/process_ext_ops.rs"
+severity = "critical"
+flows = ["process-signal-lifecycle", "waitset"]
+reason = "Batched socket calls, timed signal consumption and temporary masks must preserve deadline, partial-result and signal ownership."
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/process_ext_ops.rs"
+models = ["userspace-wait-set/UserspaceWaitSet", "sigchld-notification/SigchldNotification"]
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/file_ops.rs"
+severity = "critical"
+flows = ["vfs-open-description"]
+reason = "Bulk copies and metadata operations must pin exact descriptions, enforce access rights and preserve cursors on partial failure."
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/file_ops.rs"
+models = ["vfs-open-description-recovery/VfsOpenDescriptionRecovery", "service-mutation-recovery/ServiceMutationRecovery"]
+
 [[risk_surfaces]]
 path = "kernel/compat/src/user/syscall/linux/mm_broker_ops.rs"
 severity = "critical"

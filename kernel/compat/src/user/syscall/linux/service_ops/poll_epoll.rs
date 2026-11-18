@@ -1158,6 +1158,33 @@ pub fn syscall_linux_epoll_pwait(
     })
 }
 
+/// `epoll_pwait2`: `epoll_pwait` with a `timespec` timeout (`NULL` blocks).
+/// The timeout is rounded up to whole milliseconds, the resolution of the wait.
+pub fn syscall_linux_epoll_pwait2(
+    epfd: u64,
+    events_ptr: u64,
+    maxevents: u64,
+    timeout_ptr: u64,
+    sigmask_ptr: u64,
+    sigset_size: u64,
+) -> u64 {
+    let timeout_ms = if timeout_ptr == 0 {
+        -1
+    } else {
+        let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(timeout_ptr) {
+            Ok(ts) => ts,
+            Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
+        };
+        if let Err(errno) = process_time::validate_relative_sleep_timespec_locally(ts) {
+            return linux_errno(errno);
+        }
+        ts.tv_sec
+            .saturating_mul(1000)
+            .saturating_add((ts.tv_nsec + 999_999) / 1_000_000)
+    };
+    syscall_linux_epoll_pwait(epfd, events_ptr, maxevents, timeout_ms, sigmask_ptr, sigset_size)
+}
+
 fn with_temporary_wait_signal_mask(
     sigmask_ptr: u64,
     sigset_size: u64,

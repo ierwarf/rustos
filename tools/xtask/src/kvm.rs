@@ -880,6 +880,7 @@ include!("kvm/user_debug_records.rs");
 include!("kvm/oom_hog.rs");
 include!("kvm/app_dmabuf_probe.rs");
 include!("kvm/local_fd_probe.rs");
+include!("kvm/chrome_probe.rs");
 include!("kvm/fault_probe.rs");
 include!("kvm/launch_desktop.rs");
 include!("kvm/mmap_cost_probe.rs");

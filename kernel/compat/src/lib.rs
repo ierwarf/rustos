@@ -99,12 +99,6 @@ pub(crate) mod vfs {
     }
 }
 
-pub(crate) mod vfs_core {
-    pub fn path_inode(path: &[u8]) -> u64 {
-        kernel_io_manager::api::vfs::path_inode(path)
-    }
-}
-
 pub mod user;
 
 pub(crate) mod oom_watchdog;

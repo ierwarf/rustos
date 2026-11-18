@@ -603,6 +603,15 @@ fn run_one_smoke_unarchived(
         validate_local_fd_probe_log(&rustos_log)?;
         println!("xtask: local fd probe: every pipe/eventfd case passed in the guest");
     }
+    if options.chrome_compat_probe {
+        let rustos_log = read_log_lossy(&layout.debugcon_log)
+            .with_context(|| format!("read {}", layout.debugcon_log.display()))?;
+        validate_chrome_probe_log(&rustos_log, options.chrome_probe_persist.as_deref())?;
+        println!(
+            "xtask: chrome compat probe: every case passed in the guest ({})",
+            chrome_probe_persist_boot(&rustos_log).unwrap_or("no persist record")
+        );
+    }
     if options.fault_probe {
         let rustos_log = read_log_lossy(&layout.debugcon_log)
             .with_context(|| format!("read {}", layout.debugcon_log.display()))?;
@@ -719,7 +728,17 @@ pub(crate) fn kvm_run_command(
     auto_verify: bool,
     physical_usb_bdf: Option<String>,
     fit_host_window: bool,
+    writable_storage: bool,
+    data_disk: Option<PathBuf>,
 ) -> Result<()> {
+    if let Some(path) = data_disk.as_deref() {
+        if !writable_storage {
+            bail!("--data-disk requires --writable-storage");
+        }
+        if path.exists() && !path.is_file() {
+            bail!("--data-disk {} exists but is not a regular file", path.display());
+        }
+    }
     let _launch_lock = acquire_kvm_launch_lock(&config.build_dir.join("kvm"))?;
     if build_image {
         crate::build::build(config, false)?;
@@ -739,7 +758,8 @@ pub(crate) fn kvm_run_command(
         gui_dvm_surfaces: true,
         dvm_network_shmem: true,
         dvm_block_shmem: true,
-        writable_storage: false,
+        writable_storage,
+        data_disk,
         rustos_vcpus,
         // Interactive SMP uses the same exact-tree bounded evidence profile as
         // the topology smoke run. It is observation, not a release/FPS claim.
@@ -761,6 +781,8 @@ pub(crate) fn kvm_run_command(
         job_policy_probe: false,
         proc_stress: false,
         local_fd_probe: false,
+        chrome_compat_probe: false,
+        chrome_probe_persist: None,
         fault_probe: false,
         library_map_probe: false,
         app_dmabuf_probe: false,

@@ -733,6 +733,12 @@ fn wait_for_parallel_boot(
             })
             .or_else(|| {
                 options
+                    .chrome_compat_probe
+                    .then(|| chrome_probe_failure(&rustos_log))
+                    .flatten()
+            })
+            .or_else(|| {
+                options
                     .fault_probe
                     .then(|| fault_probe_failure(&rustos_log))
                     .flatten()

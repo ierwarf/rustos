@@ -89,6 +89,17 @@ enum XtaskCommand {
         /// a host screen smaller than the guest's display.
         #[arg(long = "actual-size")]
         actual_size: bool,
+        /// Attach the writable `/data` partition (GPT image: boot RO + FAT32
+        /// data). The disk is recreated every run unless --data-disk is used.
+        #[arg(long = "writable-storage")]
+        writable_storage: bool,
+        /// Keep the writable `/data` partition in this image across runs.
+        /// Implies --writable-storage. A missing file is created; an existing
+        /// file's data partition is carried over unchanged (the boot partition
+        /// is refreshed) and a file that is not such an image is refused,
+        /// never overwritten.
+        #[arg(long = "data-disk", value_name = "PATH")]
+        data_disk: Option<PathBuf>,
     },
     /// Measure ring3 syscall, scheduler, and IPC round-trip cost.
     ///
@@ -295,6 +306,8 @@ pub(crate) fn run() -> Result<()> {
             no_auto_verify,
             physical_usb,
             actual_size,
+            writable_storage,
+            data_disk,
         }) => kvm::kvm_run_command(
             &config,
             build_image,
@@ -302,6 +315,8 @@ pub(crate) fn run() -> Result<()> {
             !no_auto_verify,
             physical_usb,
             !actual_size,
+            writable_storage || data_disk.is_some(),
+            data_disk,
         ),
         Some(XtaskCommand::Bench {
             baseline,

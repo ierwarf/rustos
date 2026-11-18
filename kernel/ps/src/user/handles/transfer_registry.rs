@@ -219,7 +219,12 @@ pub fn register_new_inet_socket_transfer(
     let base_type = socket_type & linux_abi::SOCK_TYPE_MASK;
     let open_flags = socket_type & (linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC);
     if token == 0
-        || !rustos_user_abi::syscall::net_broker_inet_socket_shape_valid(domain, socket_type, protocol)
+        || !(rustos_user_abi::syscall::net_broker_inet_socket_shape_valid(domain, socket_type, protocol)
+            || rustos_user_abi::syscall::net_broker_netlink_socket_shape_valid(
+                domain,
+                socket_type,
+                protocol,
+            ))
     {
         return Err(IpcTransferRegistryError::InvalidDescriptor);
     }

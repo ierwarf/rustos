@@ -7,6 +7,7 @@ impl VfsState {
             cwd: BTreeMap::new(),
             handles: BTreeMap::new(),
             epolls: WaitSetRegistry::default(),
+            locks: vfsd::locks::LockTable::new(),
             checkpoint_revisions: BTreeMap::new(),
             checkpoint_operations: BTreeMap::new(),
             checkpoint_records: BTreeMap::new(),
@@ -188,11 +189,13 @@ impl VfsState {
                     record.key_hi,
                     RemoteHandle {
                         checkpoint_version: wire.version,
+                        stale: vfsd::mount_table::is_volatile_mount_path(&path),
                         kind,
                         mount_id: 0,
                         writable,
                         append,
                         path,
+                        node: 0,
                         cursor: wire.cursor,
                         len: wire.len,
                         refs: u64::from(wire.refs),
@@ -368,8 +371,4 @@ impl VfsStorage {
         }
     }
 
-    fn advance_mount_generation(&mut self) -> Result<(), i32> {
-        self.mount_generation = checked_next_generation(self.mount_generation).ok_or(EOVERFLOW)?;
-        Ok(())
-    }
 }
