@@ -1421,10 +1421,19 @@ impl<K: Ord + Clone> SharedPathStore<K> {
         while offset < meta.len {
             let want = (meta.len - offset).min(CHUNK as u64) as usize;
             let n = volume.read_at(rel_path, offset, &mut buf[..want])?;
-            if n == 0 {
-                break;
+            if n == 0 || n > want {
+                // Do not publish a partially initialized mapping as a
+                // complete snapshot of the metadata's declared file size.
+                return Err(FsError::Io(storage_core::StorageError::DeviceFault));
             }
-            frames.write_at(offset, &buf[..n])?;
+            let mut copied = 0usize;
+            while copied < n {
+                let count = frames.write_at(offset + copied as u64, &buf[copied..n])?;
+                if count == 0 || count > n - copied {
+                    return Err(FsError::Io(storage_core::StorageError::DeviceFault));
+                }
+                copied += count;
+            }
             offset += n as u64;
         }
         let (token, object) = frames.identity();
@@ -1459,6 +1468,10 @@ impl<K: Ord + Clone> SharedPathStore<K> {
         data: &[u8],
     ) -> Option<Result<(usize, u64), FsError>> {
         let entry = self.entries.get_mut(key)?;
+        // A zero-byte pwrite must not extend either the file or its memfd.
+        if data.is_empty() {
+            return Some(Ok((0, entry.len)));
+        }
         let end = match offset.checked_add(data.len() as u64) {
             Some(end) if end <= u64::from(u32::MAX) => end,
             _ => return Some(Err(FsError::TooBig)),
@@ -1547,14 +1560,19 @@ fn flush_shared_entry(entry: &SharedPathEntry, volume: &dyn FsVolume) -> Result<
     while offset < entry.len {
         let want = (entry.len - offset).min(CHUNK as u64) as usize;
         let n = entry.frames.read_at(offset, &mut buf[..want])?;
-        if n == 0 {
-            break;
+        if n == 0 || n > want {
+            // Unexpected EOF in a known-length frame object is not a
+            // successful flush of the requested file contents.
+            return Err(FsError::Io(storage_core::StorageError::DeviceFault));
         }
         let mut written = 0usize;
         while written < n {
             let (w, _) = volume.write_at(&entry.rel_path, offset + written as u64, &buf[written..n])?;
             if w == 0 {
                 return Err(FsError::Io(storage_core::StorageError::WriteZero));
+            }
+            if w > n - written {
+                return Err(FsError::Io(storage_core::StorageError::DeviceFault));
             }
             written += w;
         }
@@ -2322,6 +2340,21 @@ mod tests {
         FAKES.lock().push((object, inner.clone()));
         Ok(Box::new(FakeFrames { object, inner }))
     }
+    // Exercise the contract that a frame writer can make partial progress.
+    struct ShortWriteFrames(Box<dyn SharedFrames>);
+    impl SharedFrames for ShortWriteFrames {
+        fn identity(&self) -> (u64, u64) { self.0.identity() }
+        fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<usize, FsError> {
+            self.0.read_at(offset, out)
+        }
+        fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize, FsError> {
+            self.0.write_at(offset, &data[..data.len().min(2)])
+        }
+        fn set_len(&mut self, len: u64) -> Result<(), FsError> { self.0.set_len(len) }
+    }
+    fn short_frame_write_factory(len: u64) -> Result<Box<dyn SharedFrames>, FsError> {
+        Ok(Box::new(ShortWriteFrames(fake_factory(len)?)))
+    }
     fn fake(object: u64) -> Fake {
         FAKES.lock().iter().find(|(id, _)| *id == object).unwrap().1.clone()
     }
@@ -2542,6 +2575,46 @@ mod tests {
         assert_eq!(store.truncate(&key, 0), Some(Ok(0)));
         store.flush_entry(&key, &*vol).unwrap();
         assert_eq!(read_all(&vol, "fat_file"), b"");
+    }
+
+    #[test]
+    fn shared_path_store_empty_write_does_not_extend_file_or_frames() {
+        let vol = alloc::sync::Arc::new(fs());
+        put(&vol, "file", b"hello");
+        let mut store: SharedPathStore<(u64, String)> = SharedPathStore::new();
+        let key = (1, String::from("file"));
+        let backing = store.ensure_shared(key.clone(), "file", &*vol, fake_factory, true, 1).unwrap();
+        assert_eq!(store.write_at(&key, 8192, b""), Some(Ok((0, 5))));
+        assert_eq!(store.write_at(&key, u64::MAX, b""), Some(Ok((0, 5))));
+        assert_eq!(store.len_of(&key), Some(5));
+        assert_eq!(fake(backing.object).lock().data, b"hello".to_vec());
+        store.flush_entry(&key, &*vol).unwrap();
+        assert_eq!(read_all(&vol, "file"), b"hello");
+    }
+
+    #[test]
+    fn shared_path_store_retries_short_frame_writes_before_publication() {
+        let vol = alloc::sync::Arc::new(fs());
+        put(&vol, "file", b"0123456789abcdef");
+        let mut store: SharedPathStore<(u64, String)> = SharedPathStore::new();
+        let key = (1, String::from("file"));
+        let backing = store.ensure_shared(key, "file", &*vol, short_frame_write_factory, true, 1).unwrap();
+        assert_eq!(fake(backing.object).lock().data, b"0123456789abcdef".to_vec());
+    }
+
+    #[test]
+    fn shared_path_store_flush_rejects_premature_frame_eof() {
+        let vol = alloc::sync::Arc::new(fs());
+        put(&vol, "file", b"durable-data");
+        let mut store: SharedPathStore<(u64, String)> = SharedPathStore::new();
+        let key = (1, String::from("file"));
+        let backing = store.ensure_shared(key.clone(), "file", &*vol, fake_factory, true, 1).unwrap();
+        fake(backing.object).lock().data.clear();
+        assert!(matches!(
+            store.flush_entry(&key, &*vol),
+            Err(FsError::Io(storage_core::StorageError::DeviceFault))
+        ));
+        assert_eq!(read_all(&vol, "file"), b"durable-data");
     }
 
     #[test]

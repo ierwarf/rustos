@@ -59,6 +59,31 @@ pub fn executable_snapshot_resolution_base<'a>(
     Ok(cwd.unwrap_or("/"))
 }
 
+/// Cursor after a sequential write. Linux does not seek an open description
+/// for a zero-byte write, even if O_APPEND would choose a different start.
+pub fn cursor_after_write(previous: u64, start: u64, requested: usize, written: usize) -> Option<u64> {
+    if requested == 0 || written == 0 { return Some(previous); }
+    start.checked_add(u64::try_from(written).ok()?)
+}
+
+#[cfg(test)]
+mod write_cursor_tests {
+    use super::cursor_after_write;
+
+    #[test]
+    fn zero_byte_append_preserves_the_existing_cursor() {
+        assert_eq!(cursor_after_write(7, 4096, 0, 0), Some(7));
+        assert_eq!(cursor_after_write(7, u64::MAX, 0, 0), Some(7));
+        assert_eq!(cursor_after_write(7, 4096, 3, 0), Some(7));
+    }
+
+    #[test]
+    fn ordinary_writes_advance_and_detect_overflow() {
+        assert_eq!(cursor_after_write(7, 4096, 3, 3), Some(4099));
+        assert_eq!(cursor_after_write(7, u64::MAX, 1, 1), None);
+    }
+}
+
 const SNAPSHOT_ADMISSION_IDLE: u8 = 0;
 const SNAPSHOT_ADMISSION_WRITING: u8 = 1;
 const SNAPSHOT_ADMISSION_READY: u8 = 2;

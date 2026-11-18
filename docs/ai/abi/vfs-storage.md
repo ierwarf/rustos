@@ -417,6 +417,13 @@ the read-only accelerator; TmpFs has it (next section).
   mapping; `fallocate(KEEP_SIZE)` past EOF is `EOPNOTSUPP` on a shared-backed
   file.
 
+- **Shared path-backed volume I/O:** zero-length pwrite does not grow the
+  file or backing memfd. Snapshot creation retries short positive frame writes
+  and rejects premature source EOF or zero-progress copies before publication.
+  Flush reports premature frame EOF as an I/O error, not a successful partial
+  writeback. Sequential zero-byte writes, including O_APPEND, leave the cursor
+  unchanged.
+
 ### Filesystem-neutral volumes, `MountTable`, and writable FAT
 
 - `storage-core::fs` defines `FsVolume: Send + Sync` as the filesystem-neutral

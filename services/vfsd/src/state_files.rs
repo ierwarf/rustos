@@ -1131,7 +1131,7 @@ impl VfsState {
             }
         };
         let mut candidate = handle;
-        candidate.cursor = match start.checked_add(written as u64) {
+        candidate.cursor = match vfsd::cursor_after_write(candidate.cursor, start, len, written) {
             Some(c) => c,
             None => {
                 response.status = EOVERFLOW;
