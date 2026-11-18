@@ -280,7 +280,19 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
             0,
         ),
         linux_abi::SYS_FTRUNCATE => syscall_linux_vfs_ftruncate(frame.rdi, frame.rsi),
+        linux_abi::SYS_STAT => syscall_linux_vfs_newfstatat(
+            linux_abi::AT_FDCWD as u64,
+            frame.rdi,
+            frame.rsi,
+            0,
+        ),
         linux_abi::SYS_FSTAT => syscall_linux_vfs_fstat(frame.rdi, frame.rsi),
+        linux_abi::SYS_LSTAT => syscall_linux_vfs_newfstatat(
+            linux_abi::AT_FDCWD as u64,
+            frame.rdi,
+            frame.rsi,
+            linux_abi::AT_SYMLINK_NOFOLLOW,
+        ),
         linux_abi::SYS_POLL => syscall_linux_poll(frame.rdi, frame.rsi, frame.rdx as i32 as i64),
         linux_abi::SYS_PPOLL => {
             syscall_linux_ppoll(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
@@ -396,6 +408,15 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_KILL => syscall_linux_kill(frame.rdi, frame.rsi),
         linux_abi::SYS_TKILL => syscall_linux_tkill(frame.rdi, frame.rsi),
         linux_abi::SYS_TGKILL => syscall_linux_tgkill(frame.rdi, frame.rsi, frame.rdx),
+        linux_abi::SYS_OPEN => {
+            syscall_linux_openat(linux_abi::AT_FDCWD as u64, frame.rdi, frame.rsi, frame.rdx)
+        }
+        linux_abi::SYS_CREAT => syscall_linux_openat(
+            linux_abi::AT_FDCWD as u64,
+            frame.rdi,
+            linux_abi::O_CREAT | linux_abi::O_WRONLY | linux_abi::O_TRUNC,
+            frame.rsi,
+        ),
         linux_abi::SYS_OPENAT => syscall_linux_openat(frame.rdi, frame.rsi, frame.rdx, frame.r10),
         linux_abi::SYS_UNLINKAT => syscall_linux_vfs_unlinkat(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_SOCKETPAIR => syscall_linux_net4(

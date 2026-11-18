@@ -16,7 +16,7 @@ use crate::{
 
 const MSDOS_SUPER_MAGIC: u64 = 0x4d44;
 const FAT_MAX_NAME_LEN: u32 = 255;
-const ZERO_FILL_CHUNK: [u8; 4096] = [0; 4096];
+const ZERO_FILL_CHUNK: [u8; 64 * 1024] = [0; 64 * 1024];
 
 pub(crate) fn map_fat_error(err: FatError) -> FsError {
     match err {
@@ -530,6 +530,7 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
         }
         self.bump_version()?;
         dir.create_dir(child).map_err(map_fat_error)?;
+        fs.flush_disk().map_err(map_fat_error)?;
         Ok(())
     }
 
@@ -552,6 +553,7 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
         drop(entry);
         self.bump_version()?;
         dir.remove(child).map_err(map_fat_error)?;
+        fs.flush_disk().map_err(map_fat_error)?;
         Ok(())
     }
 
@@ -574,6 +576,7 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
         drop(entry);
         self.bump_version()?;
         dir.remove(child).map_err(map_fat_error)?;
+        fs.flush_disk().map_err(map_fat_error)?;
         Ok(())
     }
 
@@ -638,6 +641,7 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
         src_dir
             .rename(src_name, &dst_dir, dst_name)
             .map_err(map_fat_error)?;
+        fs.flush_disk().map_err(map_fat_error)?;
         Ok(())
     }
 
@@ -686,7 +690,8 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
     }
 
     fn flush(&self) -> Result<(), FsError> {
-        let _fs = self.lock_fs();
+        let fs = self.lock_fs();
+        fs.flush_disk().map_err(map_fat_error)?;
         self.device.lock().device.flush().map_err(FsError::Io)
     }
 }

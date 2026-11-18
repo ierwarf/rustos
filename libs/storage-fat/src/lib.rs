@@ -5,6 +5,7 @@ extern crate alloc;
 extern crate std;
 
 use alloc::borrow::Cow;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -102,14 +103,21 @@ impl<D> DeviceCell<D> {
 
 static NEXT_DEVICE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Bounded dirty-block coalescing buffer flushed in contiguous multi-block
+/// runs on `flush()` or capacity pressure. Turns thousands of small FAT1/FAT2
+/// updates into a handful of bulk block writes while preserving durability at
+/// every `FatVolume` operation boundary.
+const DIRTY_CACHE_BYTES: usize = 256 * 1024;
+
 pub struct FatDisk<D: BlockDevice> {
     dev: Arc<DeviceCell<D>>,
     pos: u64,
     block_size: usize,
     bytes_len: u64,
-    scratch: Vec<u8>,
     windows: [ReadWindow; 2],
     tick: u64,
+    dirty: BTreeMap<u64, Vec<u8>>,
+    writeback_no_barrier: bool,
 }
 
 impl<D: BlockDevice> FatDisk<D> {
@@ -126,7 +134,6 @@ impl<D: BlockDevice> FatDisk<D> {
         let bytes_len = block_count
             .checked_mul(block_size as u64)
             .ok_or(StorageError::InvalidInput)?;
-        let scratch = vec![0; block_size];
         let identity = NEXT_DEVICE_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
             |next| next.checked_add(1)).map_err(|_| StorageError::InvalidInput)?;
         Ok(Self {
@@ -134,9 +141,10 @@ impl<D: BlockDevice> FatDisk<D> {
             pos: 0,
             block_size,
             bytes_len,
-            scratch,
             windows: [ReadWindow::empty(), ReadWindow::empty()],
             tick: 0,
+            dirty: BTreeMap::new(),
+            writeback_no_barrier: false,
         })
     }
 
@@ -171,6 +179,10 @@ impl<D: BlockDevice> FatDisk<D> {
         window.blocks = 0;
         window.data.resize(span * block_size, 0);
         self.dev.lock().device.read_blocks(lba, &mut window.data)?;
+        for (&dirty_lba, dirty_block) in self.dirty.range(lba..(lba + span as u64)) {
+            let offset = (dirty_lba - lba) as usize * block_size;
+            window.data[offset..offset + block_size].copy_from_slice(dirty_block);
+        }
         self.tick += 1;
         window.start_lba = lba;
         window.blocks = span;
@@ -202,7 +214,8 @@ impl<D: BlockDevice> FatDisk<D> {
         }
     }
 
-    pub fn into_inner(self) -> D {
+    pub fn into_inner(mut self) -> D {
+        let _ = self.flush_dirty();
         // The only extra device reference belongs to a FatVolume, which never
         // exposes its internal FatDisk. A standalone disk is uniquely owned.
         Arc::try_unwrap(self.dev).ok().expect("standalone FAT disk").into_inner().device
@@ -242,20 +255,37 @@ impl<D: BlockDevice> Read for FatDisk<D> {
             let block_size = self.block_size;
             let lba = self.pos / block_size as u64;
             let off = (self.pos as usize) % block_size;
-            if let Some(index) = self.window_index(lba) {
-                self.tick += 1;
-                let window = &mut self.windows[index];
-                window.stamp = self.tick;
-                let start = (lba - window.start_lba) as usize * block_size + off;
-                let n = min(window.data.len() - start, max_read - done);
-                buf[done..done + n].copy_from_slice(&window.data[start..start + n]);
+            if let Some(dirty_block) = self.dirty.get(&lba) {
+                let n = min(block_size - off, max_read - done);
+                buf[done..done + n].copy_from_slice(&dirty_block[off..off + n]);
                 self.pos += n as u64;
                 done += n;
                 continue;
             }
             let remaining = max_read - done;
+            let clean_until_lba = self
+                .dirty
+                .range((lba + 1)..)
+                .next()
+                .map_or(u64::MAX, |(&dirty_lba, _)| dirty_lba);
+            let max_clean_bytes = usize::try_from(clean_until_lba.saturating_sub(lba))
+                .ok()
+                .and_then(|blocks| blocks.checked_mul(block_size))
+                .map_or(usize::MAX, |span| span.saturating_sub(off));
+            let clean_cap = remaining.min(max_clean_bytes);
+            if let Some(index) = self.window_index(lba) {
+                self.tick += 1;
+                let window = &mut self.windows[index];
+                window.stamp = self.tick;
+                let start = (lba - window.start_lba) as usize * block_size + off;
+                let n = min(window.data.len() - start, clean_cap);
+                buf[done..done + n].copy_from_slice(&window.data[start..start + n]);
+                self.pos += n as u64;
+                done += n;
+                continue;
+            }
             if off == 0 {
-                let direct_len = (remaining / block_size) * block_size;
+                let direct_len = (clean_cap / block_size) * block_size;
                 if direct_len >= READ_WINDOW_BYTES {
                     self.dev.lock().device
                         .read_blocks(lba, &mut buf[done..done + direct_len])?;
@@ -264,7 +294,7 @@ impl<D: BlockDevice> Read for FatDisk<D> {
                     continue;
                 }
             }
-            self.fill_window(lba, (off + remaining).div_ceil(block_size))?;
+            self.fill_window(lba, (off + clean_cap).div_ceil(block_size))?;
         }
 
         Ok(done)
@@ -287,54 +317,118 @@ impl<D: BlockDevice> Write for FatDisk<D> {
             let mut dev = self.dev.lock();
             dev.version = dev.version.checked_add(1).ok_or(StorageError::InvalidInput)?;
         }
+        let max_dirty_blocks = (DIRTY_CACHE_BYTES / self.block_size).max(1);
+        let direct_threshold = READ_WINDOW_BYTES.max(self.block_size);
         let max_write = min(buf.len() as u64, disk_len - self.pos) as usize;
         let mut done = 0usize;
         while done < max_write {
             let block_size = self.block_size;
             let lba = self.pos / block_size as u64;
             let off = (self.pos as usize) % block_size;
-            let n = if off == 0 && max_write - done >= block_size {
-                ((max_write - done) / block_size) * block_size
-            } else {
-                min(block_size - off, max_write - done)
-            };
-            let result = if off == 0 && n % block_size == 0 {
-                self.dev.lock().device.write_blocks(lba, &buf[done..done + n])
-            } else {
-                self.write_partial_block(lba, off, &buf[done..done + n])
-            };
-            if let Err(error) = result {
-                // The device state of this range is now unknown.
+            let remaining = max_write - done;
+            if off == 0 && remaining >= direct_threshold {
+                let n = (remaining / block_size) * block_size;
+                let end_lba = lba + (n / block_size) as u64;
+                let stale: Vec<u64> = self.dirty.range(lba..end_lba).map(|(&k, _)| k).collect();
+                for k in stale {
+                    self.dirty.remove(&k);
+                }
+                let write_res = self.dev.lock().device.write_blocks(lba, &buf[done..done + n]);
+                if let Err(error) = write_res {
+                    self.dirty.clear();
+                    self.drop_windows();
+                    return Err(error);
+                }
+                self.update_windows(self.pos, &buf[done..done + n]);
+                self.pos += n as u64;
+                done += n;
+                continue;
+            }
+            let n = min(block_size - off, remaining);
+            if let Err(error) = self.stage_dirty_write(lba, off, &buf[done..done + n]) {
+                self.dirty.clear();
                 self.drop_windows();
                 return Err(error);
             }
             self.update_windows(self.pos, &buf[done..done + n]);
             self.pos += n as u64;
             done += n;
+            if self.dirty.len() >= max_dirty_blocks {
+                self.flush_dirty()?;
+            }
         }
         Ok(done)
     }
 
     fn flush(&mut self) -> IoResult<()> {
-        self.dev.lock().device.flush()
+        self.flush_dirty()?;
+        if !self.writeback_no_barrier {
+            self.dev.lock().device.flush()?;
+        }
+        Ok(())
     }
 }
 
 impl<D: BlockDevice> FatDisk<D> {
-    /// Read-modify-write of one block, sourcing the old bytes from a cached
-    /// window when one holds the block.
-    fn write_partial_block(&mut self, lba: u64, off: usize, bytes: &[u8]) -> IoResult<()> {
+    /// Buffers a single-block update into the dirty cache, fetching the base
+    /// block bytes from a cached window or the device when only part of the
+    /// block is overwritten.
+    fn stage_dirty_write(&mut self, lba: u64, off: usize, bytes: &[u8]) -> IoResult<()> {
         let block_size = self.block_size;
-        if let Some(index) = self.window_index(lba) {
-            let window = &self.windows[index];
-            let start = (lba - window.start_lba) as usize * block_size;
-            self.scratch
-                .copy_from_slice(&window.data[start..start + block_size]);
-        } else {
-            self.dev.lock().device.read_blocks(lba, &mut self.scratch)?;
+        if let Some(existing) = self.dirty.get_mut(&lba) {
+            existing[off..off + bytes.len()].copy_from_slice(bytes);
+            return Ok(());
         }
-        self.scratch[off..off + bytes.len()].copy_from_slice(bytes);
-        self.dev.lock().device.write_blocks(lba, &self.scratch)
+        let mut block = vec![0_u8; block_size];
+        if off != 0 || bytes.len() < block_size {
+            if let Some(index) = self.window_index(lba) {
+                let window = &self.windows[index];
+                let start = (lba - window.start_lba) as usize * block_size;
+                block.copy_from_slice(&window.data[start..start + block_size]);
+            } else {
+                self.dev.lock().device.read_blocks(lba, &mut block)?;
+            }
+        }
+        block[off..off + bytes.len()].copy_from_slice(bytes);
+        self.dirty.insert(lba, block);
+        Ok(())
+    }
+
+    /// Writes all buffered dirty blocks to the underlying block device in
+    /// sorted, contiguous multi-block batches.
+    fn flush_dirty(&mut self) -> IoResult<()> {
+        if self.dirty.is_empty() {
+            return Ok(());
+        }
+        let block_size = self.block_size;
+        let max_run_blocks = (READ_WINDOW_BYTES / block_size).max(1);
+        let mut run_bytes = Vec::new();
+        while !self.dirty.is_empty() {
+            let mut run_start = 0_u64;
+            let mut run_blocks = 0_usize;
+            run_bytes.clear();
+            for (&lba, block) in &self.dirty {
+                if run_blocks == 0 {
+                    run_start = lba;
+                } else if lba != run_start + run_blocks as u64 || run_blocks >= max_run_blocks {
+                    break;
+                }
+                run_bytes.extend_from_slice(block);
+                run_blocks += 1;
+            }
+            if run_blocks == 0 {
+                break;
+            }
+            let write_res = self.dev.lock().device.write_blocks(run_start, &run_bytes);
+            if let Err(error) = write_res {
+                self.drop_windows();
+                return Err(error);
+            }
+            for idx in 0..run_blocks {
+                self.dirty.remove(&(run_start + idx as u64));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -398,7 +492,8 @@ impl<D: BlockDevice> FatVolume<D> {
         Self::from_disk(disk).map(|vol| vol.with_read_only(read_only))
     }
 
-    pub fn from_disk(disk: FatDisk<D>) -> Result<Self, FatError> {
+    pub fn from_disk(mut disk: FatDisk<D>) -> Result<Self, FatError> {
+        disk.writeback_no_barrier = true;
         let device_bytes = disk.bytes_len();
         let device = disk.dev.clone();
         let wait = device.wait;

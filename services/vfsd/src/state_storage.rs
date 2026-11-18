@@ -1292,6 +1292,7 @@ impl VfsStorage {
             inode: (mount_id << 40) | (meta.node_id & ((1 << 40) - 1)),
             fs: Some(meta),
             dev: mount_id,
+            rdev: None,
         }
     }
 
@@ -2400,7 +2401,11 @@ impl VfsStorage {
         if path == "/dev" || path.starts_with("/dev/") {
             match devmgrd_lookup(path) {
                 Ok(kind) => {
-                    return Ok(Metadata::plain(kind, 0, path_inode(path.as_bytes())));
+                    let mut metadata = Metadata::plain(kind, 0, path_inode(path.as_bytes()));
+                    if kind == RemoteKind::Device {
+                        metadata.rdev = device_rdev_for_path(path);
+                    }
+                    return Ok(metadata);
                 }
                 Err(errno) => return Err(errno),
             }

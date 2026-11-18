@@ -154,6 +154,9 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
         SYS_SENDTO => [S, W, W, U, W, U],
         SYS_RECVFROM => [S, W, W, U, W, W],
         SYS_SENDMSG | SYS_RECVMSG => [S, W, U, W, W, W],
+        // path*, int flags, umode_t mode / path*, umode_t mode
+        SYS_OPEN => [W, U, U, W, W, W],
+        SYS_CREAT => [W, U, W, W, W, W],
         // dirfd, path*, int flags, umode_t mode
         SYS_OPENAT => [S, W, U, U, W, W],
         SYS_UNLINKAT => [S, W, U, W, W, W],
@@ -275,6 +278,10 @@ mod tests {
         assert_eq!(out[1], 0xdead);
         assert_eq!(out[2], 0o2);
         assert_eq!(out[3], 0o644);
+        let open = run(SYS_OPEN, [0xdead, GARBAGE | 0o102, GARBAGE | 0o644, 0, 0, 0]);
+        assert_eq!(open[0..3], [0xdead, 0o102, 0o644]);
+        let creat = run(SYS_CREAT, [0xdead, GARBAGE | 0o666, 0, 0, 0, 0]);
+        assert_eq!(creat[0..2], [0xdead, 0o666]);
     }
 
     #[test]
@@ -482,6 +489,8 @@ mod tests {
         let out = run(SYS_LINKAT, [GARBAGE | 3, 0x1000, 0xFFFF_FF9C, 0x2000, GARBAGE | 0x400, 0]);
         assert_eq!(out, [3, 0x1000, 0xFFFF_FFFF_FFFF_FF9C, 0x2000, 0x400, 0]);
         let args = [0x1000, 0x2000, 0, 0, 0, 0];
+        assert_eq!(run(SYS_STAT, args), args);
+        assert_eq!(run(SYS_LSTAT, args), args);
         assert_eq!(run(SYS_LINK, args), args);
         assert_eq!(run(SYS_UTIMES, args), args);
         assert_eq!(run(SYS_UTIME, args), args);

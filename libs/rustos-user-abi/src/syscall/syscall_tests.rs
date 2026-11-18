@@ -17,11 +17,13 @@ use super::{
     PRODUCT_EXECUTABLE_SNAPSHOT_EVIDENCE_ABI_VERSION, ProductExecutableSnapshotEvidence,
     RustosIpcValidateServiceOwnerArgs, RustosPagerFaultReplyArgs, RustosPagerFaultWaitArgs,
     RustosSchedulingContextPolicy, STORAGED_BULK_READ_PAYLOAD_CAPACITY,
-    STORAGED_BULK_READ_RESPONSE_HEADER_BYTES, SYS_RUSTOS_PAGER_FAULT_REPLY,
+    STORAGED_BULK_READ_RESPONSE_HEADER_BYTES, STORAGED_BULK_WRITE_PAYLOAD_CAPACITY,
+    STORAGED_BULK_WRITE_REQUEST_HEADER_BYTES, SYS_RUSTOS_PAGER_FAULT_REPLY,
     SYS_RUSTOS_PAGER_FAULT_WAIT, SYSCALL_OFFLOAD_ABI_VERSION,
     SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
     SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_STATX,
     SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, StoragedBulkReadResponse,
+    StoragedBulkWriteRequest,
     VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_ABI_VERSION,
     VFS_IPC_OP_OPENAT, VFS_IPC_PAYLOAD_CAPACITY, VFS_IPC_RESPONSE_HEADER_BYTES,
     VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse, VfsIpcRequest, VfsIpcResponse,
@@ -411,6 +413,32 @@ fn storaged_bulk_read_response_binds_the_complete_request_header() {
     response.reserved0 = 0;
     response.payload_len = (response.payload.len() + 1) as u32;
     assert!(!response.is_valid_envelope_for(&request));
+}
+
+#[test]
+fn storaged_bulk_write_request_fills_one_exact_inline_message() {
+    assert_eq!(
+        core::mem::offset_of!(StoragedBulkWriteRequest, payload),
+        STORAGED_BULK_WRITE_REQUEST_HEADER_BYTES
+    );
+    assert_eq!(
+        STORAGED_BULK_WRITE_PAYLOAD_CAPACITY,
+        IPC_MAX_INLINE_BYTES - STORAGED_BULK_WRITE_REQUEST_HEADER_BYTES
+    );
+    assert_eq!(size_of::<StoragedBulkWriteRequest>(), IPC_MAX_INLINE_BYTES);
+
+    let mut req = StoragedBulkWriteRequest {
+        generation: 1,
+        block_count: 1,
+        payload_len: 512,
+        ..StoragedBulkWriteRequest::default()
+    };
+    assert!(req.has_valid_shape());
+    req.reserved0 = 1;
+    assert!(!req.has_valid_shape());
+    req.reserved0 = 0;
+    req.payload_len = (req.payload.len() + 1) as u32;
+    assert!(!req.has_valid_shape());
 }
 
 #[test]

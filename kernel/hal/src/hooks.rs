@@ -35,6 +35,17 @@ pub struct HeartbeatSnapshot {
 pub type RetireCurrentUserTaskDueToFaultHook =
     fn(u8, Option<u64>, u64, u64, u64) -> UserFaultDisposition;
 
+/// Result of attempting to populate one lazy anonymous page in syscall context.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnonymousPopulateStatus {
+    Resident,
+    Retry,
+    NotPopulatable,
+    NoMemory,
+}
+
+pub type PopulateCurrentAnonymousPageHook = fn(u64, bool) -> AnonymousPopulateStatus;
+
 /// Attempts the sole pageable user-fault admission path before generic fault
 /// retirement. The hook receives only the hardware page-fault record; it must
 /// fail closed with `Unhandled` when no exact, allocation-free pager custody
@@ -134,6 +145,7 @@ static TASK_HOOKS: TaskHookSlots = TaskHookSlots {
 };
 static DISPATCH_PIC_IRQ_HOOK: HookSlot<Option<fn(u8) -> bool>> = HookSlot::new();
 static HEARTBEAT_SNAPSHOT_HOOK: HookSlot<Option<fn() -> HeartbeatSnapshot>> = HookSlot::new();
+static POPULATE_ANON_PAGE_HOOK: HookSlot<Option<PopulateCurrentAnonymousPageHook>> = HookSlot::new();
 
 /// Registration is a boot-time operation; callers install each hook group once
 /// before the paths that read it can run, so per-slot publication is enough.
@@ -171,6 +183,17 @@ pub fn register_interrupt_hooks(hooks: InterruptHooks) {
 
 pub fn register_heartbeat_hooks(hooks: HeartbeatHooks) {
     HEARTBEAT_SNAPSHOT_HOOK.store(hooks.snapshot);
+}
+
+pub fn register_populate_anonymous_page_hook(hook: Option<PopulateCurrentAnonymousPageHook>) {
+    POPULATE_ANON_PAGE_HOOK.store(hook);
+}
+
+pub fn populate_current_anonymous_page(page: u64, write: bool) -> AnonymousPopulateStatus {
+    POPULATE_ANON_PAGE_HOOK
+        .load()
+        .map(|hook| hook(page, write))
+        .unwrap_or(AnonymousPopulateStatus::NotPopulatable)
 }
 
 /// Invokes the bounded, pageable user-fault admission hook.

@@ -12,6 +12,7 @@ use crate::memory::paging;
 use crate::multitask;
 use crate::user::handles::{DisplaySurfaceHandle, KernelHandle, RemoteVfsHandleKind};
 use crate::user::process_state::UserProcessState;
+use crate::user::sysops::usermem;
 use rustos_user_abi::device as device_abi;
 use rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT;
 
@@ -250,8 +251,12 @@ pub(crate) fn ioctl_current_process_fd(
     let Some(process_id) = multitask::current_user_process_id() else {
         return Err(DeviceSysopError::Unsupported);
     };
-    let Some((display_target, gpu_atlas_create_slot)) =
+    let Some((fd_check, display_target, gpu_atlas_create_slot)) =
         multitask::with_current_user_process_state_mut(|_, _, process_state| {
+            let Some(entry) = process_state.handles().get_entry(fd) else {
+                return (Err(DeviceSysopError::BadFileDescriptor), false, None);
+            };
+            let is_drm = is_drm_compat_entry(entry);
             let display_target = fd_targets_display(process_state, fd);
             let gpu_atlas_create_slot = display_target
                 .then(|| {
@@ -262,11 +267,15 @@ pub(crate) fn ioctl_current_process_fd(
                     )
                 })
                 .flatten();
-            (display_target, gpu_atlas_create_slot)
+            (Ok(is_drm), display_target, gpu_atlas_create_slot)
         })
     else {
         return Err(DeviceSysopError::Unsupported);
     };
+    let is_drm = fd_check?;
+    if is_drm && is_drm_ioctl(request) {
+        return ioctl_current_drm_device(process_id, fd, request, arg);
+    }
     if display_target {
         kernel_io_manager::api::device::prepare_display_ioctl(request, gpu_atlas_create_slot);
     }
@@ -276,6 +285,31 @@ pub(crate) fn ioctl_current_process_fd(
         return Err(DeviceSysopError::Unsupported);
     };
     result
+}
+
+fn is_drm_compat_entry(entry: &crate::user::handles::HandleEntry) -> bool {
+    matches!(
+        entry.handle(),
+        KernelHandle::RemoteVfs(remote)
+            if remote.kind() == RemoteVfsHandleKind::Device
+                && remote.device_access() == VFS_DEVICE_ACCESS_DRM_COMPAT
+    )
+}
+
+fn is_drm_ioctl(request: u64) -> bool {
+    matches!(
+        request,
+        DRM_IOCTL_VERSION
+            | DRM_IOCTL_GET_CAP
+            | DRM_IOCTL_MODE_GETRESOURCES
+            | DRM_IOCTL_MODE_GETCONNECTOR
+            | DRM_IOCTL_MODE_GETENCODER
+            | DRM_IOCTL_MODE_GETCRTC
+            | DRM_IOCTL_MODE_CREATE_DUMB
+            | DRM_IOCTL_MODE_MAP_DUMB
+            | DRM_IOCTL_MODE_DESTROY_DUMB
+            | DRM_IOCTL_MODE_ADDFB2
+    )
 }
 
 fn fd_targets_display(process_state: &UserProcessState, fd: u64) -> bool {
@@ -356,6 +390,308 @@ fn ioctl_display_device(
         DRM_IOCTL_MODE_ADDFB2 => drm_ioctl_addfb2(process_state, arg),
         _ => Err(DeviceSysopError::Unsupported),
     }
+}
+
+fn ioctl_current_drm_device(
+    process_id: u64,
+    fd: u64,
+    request: u64,
+    arg: u64,
+) -> Result<u64, DeviceSysopError> {
+    match request {
+        DRM_IOCTL_VERSION => {
+            let mut version = read_current_struct::<DrmVersion>(arg)?;
+            fill_drm_version_fields(&mut version);
+            copy_current_user_string(version.name, version.name_len, b"rustos-virtio-gpu")?;
+            copy_current_user_string(version.date, version.date_len, b"20260703")?;
+            copy_current_user_string(
+                version.desc,
+                version.desc_len,
+                b"RustOS virtio-gpu KMS compatibility",
+            )?;
+            set_drm_version_lengths(&mut version);
+            write_current_struct(arg, &version)?;
+            Ok(0)
+        }
+        DRM_IOCTL_GET_CAP => {
+            let mut cap = read_current_struct::<DrmGetCap>(arg)?;
+            cap.value = drm_cap_value(cap.capability);
+            write_current_struct(arg, &cap)?;
+            Ok(0)
+        }
+        DRM_IOCTL_MODE_GETRESOURCES => {
+            let display = current_display_info()?;
+            let mut res = read_current_struct::<DrmModeCardRes>(arg)?;
+            let crtcs = [DRM_PRIMARY_CRTC_ID];
+            let connectors = [DRM_PRIMARY_CONNECTOR_ID];
+            let encoders = [DRM_PRIMARY_ENCODER_ID];
+            copy_current_user_u32_array(res.crtc_id_ptr, res.count_crtcs, &crtcs)?;
+            copy_current_user_u32_array(res.connector_id_ptr, res.count_connectors, &connectors)?;
+            copy_current_user_u32_array(res.encoder_id_ptr, res.count_encoders, &encoders)?;
+            fill_drm_card_res(&mut res, display, crtcs.len(), connectors.len(), encoders.len());
+            write_current_struct(arg, &res)?;
+            Ok(0)
+        }
+        DRM_IOCTL_MODE_GETCONNECTOR => {
+            let display = current_display_info()?;
+            let mut connector = read_current_struct::<DrmModeGetConnector>(arg)?;
+            if connector.connector_id != 0 && connector.connector_id != DRM_PRIMARY_CONNECTOR_ID {
+                return Err(DeviceSysopError::NotFound);
+            }
+            let encoders = [DRM_PRIMARY_ENCODER_ID];
+            let mode = drm_mode_for_display(display);
+            copy_current_user_u32_array(
+                connector.encoders_ptr,
+                connector.count_encoders,
+                &encoders,
+            )?;
+            if connector.modes_ptr != 0 && connector.count_modes != 0 {
+                write_current_struct(connector.modes_ptr, &mode)?;
+            }
+            fill_drm_connector(&mut connector, display, encoders.len());
+            write_current_struct(arg, &connector)?;
+            Ok(0)
+        }
+        DRM_IOCTL_MODE_GETENCODER => {
+            let mut encoder = read_current_struct::<DrmModeGetEncoder>(arg)?;
+            if encoder.encoder_id != 0 && encoder.encoder_id != DRM_PRIMARY_ENCODER_ID {
+                return Err(DeviceSysopError::NotFound);
+            }
+            fill_drm_encoder(&mut encoder);
+            write_current_struct(arg, &encoder)?;
+            Ok(0)
+        }
+        DRM_IOCTL_MODE_GETCRTC => {
+            let display = current_display_info()?;
+            let mut crtc = read_current_struct::<DrmModeCrtc>(arg)?;
+            if crtc.crtc_id != 0 && crtc.crtc_id != DRM_PRIMARY_CRTC_ID {
+                return Err(DeviceSysopError::NotFound);
+            }
+            fill_drm_crtc(&mut crtc, display);
+            write_current_struct(arg, &crtc)?;
+            Ok(0)
+        }
+        DRM_IOCTL_MODE_CREATE_DUMB => {
+            let display = current_display_info()?;
+            let mut create = read_current_struct::<DrmModeCreateDumb>(arg)?;
+            validate_create_dumb(&create, display)?;
+            let Some(installed) =
+                multitask::with_current_user_process_state_mut(|_, _, process_state| {
+                    ensure_drm_fd(process_state, fd)?;
+                    let mut surface = DisplaySurfaceHandle::new(
+                        create.width,
+                        create.height,
+                        device_abi::PIXEL_FORMAT_BGRA8888,
+                        display.generation,
+                    )
+                    .ok_or(DeviceSysopError::InvalidArgument)?;
+                    let region = crate::ipc::create_shared_region_for_process(
+                        process_id,
+                        surface.mapping_len() as usize,
+                    )
+                    .map_err(|_| DeviceSysopError::InvalidArgument)?;
+                    surface.set_shared_region(region);
+                    let Some(handle) = process_state
+                        .handles_mut()
+                        .install(KernelHandle::DisplaySurface(surface))
+                    else {
+                        crate::ipc::release_shared_region_descriptor(region);
+                        return Err(DeviceSysopError::TryAgain);
+                    };
+                    let Ok(handle32) = u32::try_from(handle) else {
+                        let _ = process_state.handles_mut().close(handle);
+                        return Err(DeviceSysopError::InvalidArgument);
+                    };
+                    Ok((handle, handle32, surface.stride_bytes(), surface.mapping_len()))
+                })
+            else {
+                return Err(DeviceSysopError::Unsupported);
+            };
+            let (handle, handle32, pitch, size) = installed?;
+            create.handle = handle32;
+            create.pitch = pitch;
+            create.size = size;
+            if let Err(error) = write_current_struct(arg, &create) {
+                let _ = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+                    let _ = process_state.handles_mut().close(handle);
+                });
+                return Err(error);
+            }
+            Ok(0)
+        }
+        DRM_IOCTL_MODE_MAP_DUMB => {
+            let mut map = read_current_struct::<DrmModeMapDumb>(arg)?;
+            let Some(surface_res) =
+                multitask::with_current_user_process_state_mut(|_, _, process_state| {
+                    ensure_drm_fd(process_state, fd)?;
+                    let _ = process_surface(process_state, map.handle)?;
+                    Ok::<_, DeviceSysopError>(())
+                })
+            else {
+                return Err(DeviceSysopError::Unsupported);
+            };
+            surface_res?;
+            map.offset = u64::from(map.handle);
+            map.pad = 0;
+            write_current_struct(arg, &map)?;
+            Ok(0)
+        }
+        DRM_IOCTL_MODE_DESTROY_DUMB => {
+            let destroy = read_current_struct::<DrmModeDestroyDumb>(arg)?;
+            let Some(res) =
+                multitask::with_current_user_process_state_mut(|_, _, process_state| {
+                    ensure_drm_fd(process_state, fd)?;
+                    process_surface(process_state, destroy.handle)?;
+                    let _ = process_state.handles_mut().close(u64::from(destroy.handle));
+                    Ok::<_, DeviceSysopError>(())
+                })
+            else {
+                return Err(DeviceSysopError::Unsupported);
+            };
+            res?;
+            Ok(0)
+        }
+        DRM_IOCTL_MODE_ADDFB2 => {
+            let display = current_display_info()?;
+            let mut fb = read_current_struct::<DrmModeFbCmd2>(arg)?;
+            validate_addfb2_args(&fb, display)?;
+            let handle = fb.handles[0];
+            let Some(res) =
+                multitask::with_current_user_process_state_mut(|_, _, process_state| {
+                    ensure_drm_fd(process_state, fd)?;
+                    let surface = process_surface(process_state, handle)?;
+                    if surface.width() < fb.width || surface.height() < fb.height {
+                        return Err(DeviceSysopError::InvalidArgument);
+                    }
+                    Ok::<_, DeviceSysopError>(())
+                })
+            else {
+                return Err(DeviceSysopError::Unsupported);
+            };
+            res?;
+            fb.fb_id = handle;
+            write_current_struct(arg, &fb)?;
+            Ok(0)
+        }
+        _ => Err(DeviceSysopError::Unsupported),
+    }
+}
+
+fn ensure_drm_fd(
+    process_state: &UserProcessState,
+    fd: u64,
+) -> Result<(), DeviceSysopError> {
+    let Some(entry) = process_state.handles().get_entry(fd) else {
+        return Err(DeviceSysopError::BadFileDescriptor);
+    };
+    if is_drm_compat_entry(entry) {
+        Ok(())
+    } else {
+        Err(DeviceSysopError::Unsupported)
+    }
+}
+
+fn fill_drm_version_fields(version: &mut DrmVersion) {
+    version.version_major = 1;
+    version.version_minor = 6;
+    version.version_patchlevel = 0;
+}
+
+fn set_drm_version_lengths(version: &mut DrmVersion) {
+    version.name_len = b"rustos-virtio-gpu".len() as u64;
+    version.date_len = b"20260703".len() as u64;
+    version.desc_len = b"RustOS virtio-gpu KMS compatibility".len() as u64;
+}
+
+fn drm_cap_value(capability: u64) -> u64 {
+    match capability {
+        0x1 => 1,  // DRM_CAP_DUMB_BUFFER
+        0x2 => 0,  // DRM_CAP_VBLANK_HIGH_CRTC
+        0x3 => 0,  // DRM_CAP_DUMB_PREFERRED_DEPTH
+        0x4 => 0,  // DRM_CAP_DUMB_PREFER_SHADOW
+        0x10 => 1, // DRM_CAP_ADDFB2_MODIFIERS: linear-only accepted
+        _ => 0,
+    }
+}
+
+fn fill_drm_card_res(
+    res: &mut DrmModeCardRes,
+    display: device_abi::DisplayInfo,
+    crtcs_len: usize,
+    connectors_len: usize,
+    encoders_len: usize,
+) {
+    res.count_fbs = 0;
+    res.count_crtcs = crtcs_len as u32;
+    res.count_connectors = connectors_len as u32;
+    res.count_encoders = encoders_len as u32;
+    res.min_width = 1;
+    res.min_height = 1;
+    res.max_width = display.width;
+    res.max_height = display.height;
+}
+
+fn fill_drm_connector(
+    connector: &mut DrmModeGetConnector,
+    display: device_abi::DisplayInfo,
+    encoders_len: usize,
+) {
+    connector.count_modes = 1;
+    connector.count_props = 0;
+    connector.count_encoders = encoders_len as u32;
+    connector.encoder_id = DRM_PRIMARY_ENCODER_ID;
+    connector.connector_id = DRM_PRIMARY_CONNECTOR_ID;
+    connector.connector_type = DRM_MODE_CONNECTOR_VIRTUAL;
+    connector.connector_type_id = 1;
+    connector.connection = DRM_MODE_CONNECTED;
+    connector.mm_width = display.width / 4;
+    connector.mm_height = display.height / 4;
+    connector.subpixel = 0;
+    connector.pad = 0;
+}
+
+fn fill_drm_encoder(encoder: &mut DrmModeGetEncoder) {
+    encoder.encoder_id = DRM_PRIMARY_ENCODER_ID;
+    encoder.encoder_type = DRM_MODE_ENCODER_VIRTUAL;
+    encoder.crtc_id = DRM_PRIMARY_CRTC_ID;
+    encoder.possible_crtcs = 1;
+    encoder.possible_clones = 0;
+}
+
+fn fill_drm_crtc(crtc: &mut DrmModeCrtc, display: device_abi::DisplayInfo) {
+    crtc.crtc_id = DRM_PRIMARY_CRTC_ID;
+    crtc.fb_id = 0;
+    crtc.x = 0;
+    crtc.y = 0;
+    crtc.gamma_size = 0;
+    crtc.mode_valid = 1;
+    crtc.mode = drm_mode_for_display(display);
+}
+
+fn validate_create_dumb(
+    create: &DrmModeCreateDumb,
+    display: device_abi::DisplayInfo,
+) -> Result<(), DeviceSysopError> {
+    if create.width == 0 || create.height == 0 || create.bpp == 0 || create.bpp > 32 {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    if create.flags != 0 || create.width > display.width || create.height > display.height {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    Ok(())
+}
+
+fn validate_addfb2_args(
+    fb: &DrmModeFbCmd2,
+    display: device_abi::DisplayInfo,
+) -> Result<(), DeviceSysopError> {
+    if fb.width == 0 || fb.height == 0 || fb.width > display.width || fb.height > display.height {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    if !matches!(fb.pixel_format, DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888) {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    Ok(())
 }
 
 fn drm_ioctl_version(
@@ -671,19 +1007,40 @@ fn push_decimal(dst: &mut [u8], mut index: usize, mut value: u32) -> usize {
     index
 }
 
+fn bounded_user_string_len(
+    user_ptr: u64,
+    user_len: u64,
+    value_len: usize,
+) -> Result<usize, DeviceSysopError> {
+    if user_ptr == 0 || user_len == 0 {
+        return Ok(0);
+    }
+    usize::try_from(user_len)
+        .ok()
+        .map(|len| len.min(value_len))
+        .ok_or(DeviceSysopError::InvalidArgument)
+}
+
+fn copy_current_user_string(
+    user_ptr: u64,
+    user_len: u64,
+    value: &[u8],
+) -> Result<(), DeviceSysopError> {
+    let copy_len = bounded_user_string_len(user_ptr, user_len, value.len())?;
+    if copy_len == 0 {
+        return Ok(());
+    }
+    usermem::write_current_user_bytes(user_ptr, &value[..copy_len])?;
+    Ok(())
+}
+
 fn copy_user_string(
     process_state: &UserProcessState,
     user_ptr: u64,
     user_len: u64,
     value: &[u8],
 ) -> Result<(), DeviceSysopError> {
-    if user_ptr == 0 || user_len == 0 {
-        return Ok(());
-    }
-    let copy_len = usize::try_from(user_len)
-        .ok()
-        .map(|len| len.min(value.len()))
-        .ok_or(DeviceSysopError::InvalidArgument)?;
+    let copy_len = bounded_user_string_len(user_ptr, user_len, value.len())?;
     if copy_len == 0 {
         return Ok(());
     }
@@ -696,29 +1053,70 @@ fn copy_user_string(
     Ok(())
 }
 
+fn bounded_user_u32_bytes<'a>(
+    user_ptr: u64,
+    requested_count: u32,
+    values: &'a [u32],
+) -> Result<&'a [u8], DeviceSysopError> {
+    if user_ptr == 0 || requested_count == 0 {
+        return Ok(&[]);
+    }
+    let count = usize::try_from(requested_count)
+        .map_err(|_| DeviceSysopError::InvalidArgument)?
+        .min(values.len());
+    if count == 0 {
+        return Ok(&[]);
+    }
+    // SAFETY: `values` is a live `&[u32]` slice of at least `count` elements.
+    Ok(unsafe { slice::from_raw_parts(values.as_ptr().cast::<u8>(), count * size_of::<u32>()) })
+}
+
+fn copy_current_user_u32_array(
+    user_ptr: u64,
+    requested_count: u32,
+    values: &[u32],
+) -> Result<(), DeviceSysopError> {
+    let bytes = bounded_user_u32_bytes(user_ptr, requested_count, values)?;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    usermem::write_current_user_bytes(user_ptr, bytes)?;
+    Ok(())
+}
+
 fn copy_user_u32_array(
     process_state: &UserProcessState,
     user_ptr: u64,
     requested_count: u32,
     values: &[u32],
 ) -> Result<(), DeviceSysopError> {
-    if user_ptr == 0 || requested_count == 0 {
+    let bytes = bounded_user_u32_bytes(user_ptr, requested_count, values)?;
+    if bytes.is_empty() {
         return Ok(());
     }
-    let count = usize::try_from(requested_count)
-        .map_err(|_| DeviceSysopError::InvalidArgument)?
-        .min(values.len());
-    if count == 0 {
-        return Ok(());
-    }
-    let bytes =
-        unsafe { slice::from_raw_parts(values.as_ptr().cast::<u8>(), count * size_of::<u32>()) };
     process_state
         .address_space()
         .validate_user_write_buffer(VirtAddr::new(user_ptr), bytes.len())?;
     process_state
         .address_space()
         .copy_into_user(VirtAddr::new(user_ptr), bytes)?;
+    Ok(())
+}
+
+fn read_current_struct<T: Copy + Default>(ptr: u64) -> Result<T, DeviceSysopError> {
+    if ptr == 0 {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    Ok(usermem::read_current_user_struct::<T>(ptr)?)
+}
+
+fn write_current_struct<T: Copy>(ptr: u64, value: &T) -> Result<(), DeviceSysopError> {
+    if ptr == 0 {
+        return Err(DeviceSysopError::InvalidArgument);
+    }
+    // SAFETY: `value` is a live `Copy` value of `size_of::<T>()` bytes.
+    let bytes = unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
+    usermem::write_current_user_bytes(ptr, bytes)?;
     Ok(())
 }
 
@@ -779,6 +1177,42 @@ fn map_device_error(err: device_ns::DeviceError) -> DeviceSysopError {
         device_ns::DeviceError::StaleSurface => DeviceSysopError::StaleSurface,
         device_ns::DeviceError::TryAgain => DeviceSysopError::TryAgain,
         device_ns::DeviceError::Unsupported => DeviceSysopError::Unsupported,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_drm_ioctl_path_uses_fault_resolving_usermem_helpers() {
+        assert!(is_drm_ioctl(DRM_IOCTL_VERSION));
+        assert!(is_drm_ioctl(DRM_IOCTL_MODE_GETRESOURCES));
+        assert!(is_drm_ioctl(DRM_IOCTL_MODE_CREATE_DUMB));
+        assert!(!is_drm_ioctl(device_abi::DISPLAY_IOCTL_GET_INFO));
+
+        assert_eq!(bounded_user_string_len(0, 10, 17).unwrap(), 0);
+        assert_eq!(bounded_user_string_len(0x1000, 0, 17).unwrap(), 0);
+        assert_eq!(bounded_user_string_len(0x1000, 8, 17).unwrap(), 8);
+        assert_eq!(bounded_user_string_len(0x1000, 100, 17).unwrap(), 17);
+
+        let vals = [1_u32, 2, 3];
+        assert!(bounded_user_u32_bytes(0, 3, &vals).unwrap().is_empty());
+        assert!(bounded_user_u32_bytes(0x1000, 0, &vals).unwrap().is_empty());
+        assert_eq!(bounded_user_u32_bytes(0x1000, 2, &vals).unwrap().len(), 8);
+        assert_eq!(bounded_user_u32_bytes(0x1000, 10, &vals).unwrap().len(), 12);
+
+        // Structural guard: `ioctl_current_drm_device` must use `usermem`
+        // (fault-resolving) rather than `process_state.address_space()`.
+        let source = include_str!("device.rs");
+        let drm_fn = source
+            .split("fn ioctl_current_drm_device(")
+            .nth(1)
+            .and_then(|s| s.split("fn ensure_drm_fd(").next())
+            .expect("ioctl_current_drm_device");
+        assert!(!drm_fn.contains("address_space()"));
+        assert!(drm_fn.contains("read_current_struct"));
+        assert!(drm_fn.contains("write_current_struct"));
     }
 }
 // RING3-MIGRATION-REFERENCE END: devmgrd/sessiond-owned device sysop policy.

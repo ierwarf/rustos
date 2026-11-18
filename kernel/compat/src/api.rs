@@ -97,7 +97,12 @@ pub mod pager {
         crate::pager::service_deferred_work()
     }
 
-    pub use crate::pager::AnonymousFaultOutcome;
+    pub use crate::pager::{AnonymousFaultOutcome, PopulateOutcome};
+
+    /// Makes one page of the calling task's anonymous mapping resident from syscall context.
+    pub fn populate_current_anonymous_page(page: u64, write: bool) -> PopulateOutcome {
+        crate::pager::populate_current_anonymous_page(page, write)
+    }
 
     /// Publishes one census of the ring0 anonymous fault path. See
     /// `crate::pager::record_anonymous_fault_census`.

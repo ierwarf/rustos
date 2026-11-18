@@ -369,6 +369,20 @@ impl ReadCacheSet {
         self.next_read_ahead_lba = None;
     }
 
+    fn invalidate_range(&mut self, generation: u64, lba: u64, block_count: u64) {
+        let end = lba.saturating_add(block_count);
+        self.entries.retain(|entry| {
+            entry.generation != generation
+                || entry.lba >= end
+                || entry.lba.saturating_add(entry.block_count) <= lba
+        });
+        if let Some((gen, next_lba)) = self.next_read_ahead_lba {
+            if gen == generation && next_lba >= lba && next_lba < end {
+                self.next_read_ahead_lba = None;
+            }
+        }
+    }
+
     fn miss_continues_read_ahead(&self, generation: u64, lba: u64) -> bool {
         self.next_read_ahead_lba == Some((generation, lba))
     }
@@ -656,14 +670,17 @@ pub(super) fn write_with_info(
         )?;
         // A write that times out or fails may still land later, and a read
         // between the pre-write clear and that landing would repopulate the
-        // cache with old bytes. Drop the cache again once the write settles.
+        // cache with old bytes. Drop the cache on error; on success only the
+        // overwritten blocks need invalidation so FAT/dir reads stay cached.
         let result = wait_and_collect(ticket, None);
         if result.is_err() {
             // Neither a local timeout nor a transport error proves that the
             // submitted mutation did not reach the media. Do not replay it.
             quarantine_provider(ticket, "write-outcome-unknown");
+            clear_read_cache();
+        } else {
+            invalidate_read_cache_range(expected_generation, lba, block_count);
         }
-        clear_read_cache();
         result
     })
 }
@@ -681,7 +698,7 @@ fn write_admitted_with(
         return Err(libc::EROFS);
     }
     validate_write_extent(info, lba, block_count, bytes.len())?;
-    clear_read_cache();
+    invalidate_read_cache_range(info.generation, lba, block_count);
     write()
 }
 
@@ -726,6 +743,12 @@ fn insert_read_ahead_batch(
 fn clear_read_cache() {
     if let Ok(mut cache) = READ_CACHE.lock() {
         cache.clear();
+    }
+}
+
+fn invalidate_read_cache_range(generation: u64, lba: u64, block_count: u64) {
+    if let Ok(mut cache) = READ_CACHE.lock() {
+        cache.invalidate_range(generation, lba, block_count);
     }
 }
 

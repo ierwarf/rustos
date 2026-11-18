@@ -9,7 +9,9 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_STORAGED,
     COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_FLUSH, COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_INFO,
     COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK, COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE,
-    IPC_SERVICE_STORAGED, STORAGED_BULK_READ_PAYLOAD_CAPACITY, SYS_RUSTOS_IPC_CALL,
+    COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE_BULK,
+    IPC_SERVICE_STORAGED, STORAGED_BULK_READ_PAYLOAD_CAPACITY, STORAGED_BULK_WRITE_PAYLOAD_CAPACITY,
+    StoragedBulkWriteRequest, SYS_RUSTOS_IPC_CALL,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
 };
 use storage_core::{BlockDevice, IoResult, StorageError};
@@ -46,6 +48,7 @@ pub(super) struct BootBlockDevice {
     pub(super) read_only: bool,
     bulk_bytes_since_yield: usize,
     bulk_response: alloc::vec::Vec<u64>,
+    bulk_write_request: alloc::vec::Vec<u64>,
 }
 
 impl BootBlockDevice {
@@ -75,6 +78,10 @@ impl BootBlockDevice {
         let mut bulk_response = alloc::vec::Vec::new();
         bulk_response.try_reserve_exact(words).map_err(|_| ENOMEM)?;
         bulk_response.resize(words, 0);
+        let write_words = size_of::<StoragedBulkWriteRequest>().div_ceil(size_of::<u64>());
+        let mut bulk_write_request = alloc::vec::Vec::new();
+        bulk_write_request.try_reserve_exact(write_words).map_err(|_| ENOMEM)?;
+        bulk_write_request.resize(write_words, 0);
         Ok(Self {
             generation: info.generation,
             block_size,
@@ -82,6 +89,7 @@ impl BootBlockDevice {
             read_only,
             bulk_bytes_since_yield: 0,
             bulk_response,
+            bulk_write_request,
         })
     }
 
@@ -113,26 +121,44 @@ impl BootBlockDevice {
 
     fn write_transfer(&mut self, lba: u64, input: &[u8]) -> IoResult<()> {
         validate_dvm_block_range(self.block_size, self.block_count, lba, input.len())?;
-        let max_blocks = (IPC_BLOCK_PAYLOAD_BYTES / self.block_size) as u64;
-        if max_blocks == 0 {
+        let small_max_blocks = (IPC_BLOCK_PAYLOAD_BYTES / self.block_size) as u64;
+        let bulk_max_blocks = (STORAGED_BULK_WRITE_PAYLOAD_CAPACITY / self.block_size) as u64;
+        if small_max_blocks == 0 || bulk_max_blocks == 0 {
             return Err(StorageError::Unsupported);
         }
         let mut done = 0usize;
         while done < input.len() {
-            let remaining_blocks = ((input.len() - done) / self.block_size) as u64;
-            let block_count = remaining_blocks.min(max_blocks);
-            let byte_len = block_count as usize * self.block_size;
+            let remaining = input.len() - done;
+            let remaining_blocks = (remaining / self.block_size) as u64;
             let chunk_lba = lba
                 .checked_add((done / self.block_size) as u64)
                 .ok_or(StorageError::InvalidInput)?;
-            let mut request = storage_request(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE);
-            request.arg0 = self.generation;
-            request.arg1 = chunk_lba;
-            request.arg2 = block_count;
-            request.payload_len = byte_len as u32;
-            request.payload[..byte_len].copy_from_slice(&input[done..done + byte_len]);
-            let response = call_storaged(&request)
+            let (block_count, byte_len, response) = if remaining > IPC_BLOCK_PAYLOAD_BYTES {
+                let block_count = remaining_blocks.min(bulk_max_blocks);
+                let byte_len = block_count as usize * self.block_size;
+                let response = call_storaged_bulk_write(
+                    self.generation,
+                    chunk_lba,
+                    block_count,
+                    &input[done..done + byte_len],
+                    &mut self.bulk_write_request,
+                )
                 .map_err(|errno| storage_error_from_linux_status(-(errno as i64)))?;
+                (block_count, byte_len, response)
+            } else {
+                let block_count = remaining_blocks.min(small_max_blocks);
+                let byte_len = block_count as usize * self.block_size;
+                let mut request = storage_request(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE);
+                request.arg0 = self.generation;
+                request.arg1 = chunk_lba;
+                request.arg2 = block_count;
+                request.payload_len = byte_len as u32;
+                request.payload[..byte_len].copy_from_slice(&input[done..done + byte_len]);
+                let response = call_storaged(&request)
+                    .map_err(|errno| storage_error_from_linux_status(-(errno as i64)))?;
+                (block_count, byte_len, response)
+            };
+            let _ = block_count;
             if response.status != 0
                 || response.value0 != self.generation
                 || response.value1 != byte_len as u64
@@ -359,6 +385,89 @@ fn call_storaged_bulk(request: &CommercialMaxProtocolRequest, out: &mut [u8], re
     }
     out.copy_from_slice(&response_ref.payload[..out.len()]);
     Ok(())
+}
+
+fn call_storaged_bulk_write(
+    generation: u64,
+    lba: u64,
+    block_count: u64,
+    bytes: &[u8],
+    request_words: &mut [u64],
+) -> Result<CommercialMaxProtocolResponse, i32> {
+    if bytes.is_empty()
+        || bytes.len() > STORAGED_BULK_WRITE_PAYLOAD_CAPACITY
+        || request_words.len() < size_of::<StoragedBulkWriteRequest>().div_ceil(size_of::<u64>())
+    {
+        return Err(EINVAL);
+    }
+    let endpoint = unsafe {
+        rustos_svc_runtime::syscall::syscall1(
+            SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+            IPC_SERVICE_STORAGED,
+        )
+    };
+    if endpoint <= 0 {
+        let errno = storage_service_lookup_errno(endpoint);
+        if should_log_storage_failure(errno) {
+            super::debug_line(&format!(
+                "vfsd: storaged bulk write rejected stage=lookup errno={errno}"
+            ));
+        }
+        return Err(errno);
+    }
+    let base = storage_request(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE_BULK);
+    let req_ptr = request_words.as_mut_ptr().cast::<StoragedBulkWriteRequest>();
+    unsafe {
+        (*req_ptr).header = base.header;
+        (*req_ptr).flags = 0;
+        (*req_ptr).payload_len = bytes.len() as u32;
+        (*req_ptr).generation = generation;
+        (*req_ptr).lba = lba;
+        (*req_ptr).block_count = block_count;
+        (*req_ptr).reserved0 = 0;
+        core::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            core::ptr::addr_of_mut!((*req_ptr).payload).cast::<u8>(),
+            bytes.len(),
+        );
+    }
+    let mut response = CommercialMaxProtocolResponse::default();
+    let received = unsafe {
+        rustos_svc_runtime::syscall::syscall5(
+            SYS_RUSTOS_IPC_CALL,
+            endpoint as u64,
+            req_ptr as u64,
+            size_of::<StoragedBulkWriteRequest>() as u64,
+            (&mut response as *mut CommercialMaxProtocolResponse) as u64,
+            size_of::<CommercialMaxProtocolResponse>() as u64,
+        )
+    };
+    if received < 0 {
+        let errno = (-received) as i32;
+        if should_log_storage_failure(errno) {
+            super::debug_line(&format!(
+                "vfsd: storaged bulk write rejected stage=ipc-call errno={errno}"
+            ));
+        }
+        return Err(errno);
+    }
+    if received as usize != size_of::<CommercialMaxProtocolResponse>()
+        || response.header != base.header
+    {
+        super::debug_line("vfsd: storaged bulk write rejected stage=response-envelope errno=5");
+        return Err(EIO);
+    }
+    if response.status != 0 {
+        if should_log_storage_failure(response.status) {
+            super::debug_line(&format!(
+                "vfsd: storaged bulk write rejected stage=service-status errno={}",
+                response.status
+            ));
+        }
+    } else {
+        note_storage_ready();
+    }
+    Ok(response)
 }
 
 pub(super) fn is_transient_storage_not_ready(errno: i32) -> bool {

@@ -73,7 +73,9 @@ raw_u64! {
     SYS_FSYNC = linux::__NR_fsync;
     SYS_FDATASYNC = linux::__NR_fdatasync;
     SYS_FTRUNCATE = linux::__NR_ftruncate;
+    SYS_STAT = linux::__NR_stat;
     SYS_FSTAT = linux::__NR_fstat;
+    SYS_LSTAT = linux::__NR_lstat;
     SYS_POLL = linux::__NR_poll;
     SYS_PPOLL = linux::__NR_ppoll;
     SYS_SELECT = linux::__NR_select;
@@ -153,6 +155,8 @@ raw_u64! {
     SYS_EXIT = linux::__NR_exit;
     SYS_EXIT_GROUP = linux::__NR_exit_group;
     SYS_TGKILL = linux::__NR_tgkill;
+    SYS_OPEN = linux::__NR_open;
+    SYS_CREAT = linux::__NR_creat;
     SYS_OPENAT = linux::__NR_openat;
     SYS_MKDIRAT = linux::__NR_mkdirat;
     SYS_RENAMEAT = linux::__NR_renameat;

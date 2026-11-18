@@ -1789,12 +1789,18 @@ pub const COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ: u16 = 9;
 pub const COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE: u16 = 10;
 pub const COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_FLUSH: u16 = 11;
 pub const COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK: u16 = 12;
+pub const COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE_BULK: u16 = 13;
 pub const COMMERCIAL_MAX_STORAGED_BLOCK_FLAG_FUA: u64 = 1 << 0;
 /// Fixed bytes preceding `StoragedBulkReadResponse::payload`.
 pub const STORAGED_BULK_READ_RESPONSE_HEADER_BYTES: usize = 80;
 /// The largest block-aligned read reply that fits in one inline IPC message.
 pub const STORAGED_BULK_READ_PAYLOAD_CAPACITY: usize =
     IPC_MAX_INLINE_BYTES - STORAGED_BULK_READ_RESPONSE_HEADER_BYTES;
+/// Fixed bytes preceding `StoragedBulkWriteRequest::payload`.
+pub const STORAGED_BULK_WRITE_REQUEST_HEADER_BYTES: usize = 80;
+/// The largest block-aligned write request that fits in one inline IPC message.
+pub const STORAGED_BULK_WRITE_PAYLOAD_CAPACITY: usize =
+    IPC_MAX_INLINE_BYTES - STORAGED_BULK_WRITE_REQUEST_HEADER_BYTES;
 pub const COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE: u16 = 1;
 pub const COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS: u16 = 2;
 pub const COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND: u16 = 3;
@@ -2214,6 +2220,69 @@ impl Default for StoragedBulkReadResponse {
         let mut response = Self::zeroed();
         response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
         response
+    }
+}
+
+/// Full-inline-IPC write request for `COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE_BULK`.
+///
+/// Mirrors `StoragedBulkReadResponse` so multi-block writes (such as directory/file
+/// zero-fill and FAT updates) amortize DVM and IPC round-trips across up to
+/// `STORAGED_BULK_WRITE_PAYLOAD_CAPACITY` bytes per call.
+#[repr(C)]
+pub struct StoragedBulkWriteRequest {
+    pub header: CommercialMaxProtocolHeader,
+    pub flags: u32,
+    pub payload_len: u32,
+    pub generation: u64,
+    pub lba: u64,
+    pub block_count: u64,
+    pub reserved0: u64,
+    pub payload: [u8; STORAGED_BULK_WRITE_PAYLOAD_CAPACITY],
+}
+
+impl StoragedBulkWriteRequest {
+    pub const fn zeroed() -> Self {
+        Self {
+            header: CommercialMaxProtocolHeader {
+                version: 0,
+                protocol: 0,
+                op: 0,
+                flags: 0,
+                service_id: 0,
+                subject_pid: 0,
+                subject_tid: 0,
+                ticket: 0,
+            },
+            flags: 0,
+            payload_len: 0,
+            generation: 0,
+            lba: 0,
+            block_count: 0,
+            reserved0: 0,
+            payload: [0; STORAGED_BULK_WRITE_PAYLOAD_CAPACITY],
+        }
+    }
+
+    pub fn has_valid_shape(&self) -> bool {
+        self.header.version == COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
+            && self.header.protocol == COMMERCIAL_MAX_PROTOCOL_STORAGED
+            && self.header.op == COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE_BULK
+            && self.reserved0 == 0
+            && (self.flags as u64) & !COMMERCIAL_MAX_STORAGED_BLOCK_FLAG_FUA == 0
+            && self.generation != 0
+            && self.block_count != 0
+            && self.payload_len != 0
+            && (self.payload_len as usize) <= self.payload.len()
+    }
+}
+
+impl Default for StoragedBulkWriteRequest {
+    fn default() -> Self {
+        let mut request = Self::zeroed();
+        request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+        request.header.protocol = COMMERCIAL_MAX_PROTOCOL_STORAGED;
+        request.header.op = COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE_BULK;
+        request
     }
 }
 

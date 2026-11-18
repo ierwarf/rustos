@@ -17,11 +17,11 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN, COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT,
     COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA, CommercialMaxCapabilityLeaseWire,
     CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
-    CommercialMaxProtocolResponse, DvmBlockInfoWire, IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD,
-    PRODUCT_MILESTONE_STORAGE_READY, STORAGE_FLAG_READONLY, STORAGE_TRANSPORT_DVM_BLOCK,
-    STORAGED_BULK_READ_PAYLOAD_CAPACITY,
+    CommercialMaxProtocolResponse, DvmBlockInfoWire, IPC_MAX_INLINE_BYTES, IPC_SERVICE_STORAGED,
+    IPC_SERVICE_VFSD, PRODUCT_MILESTONE_STORAGE_READY, STORAGE_FLAG_READONLY,
+    STORAGE_TRANSPORT_DVM_BLOCK, STORAGED_BULK_READ_PAYLOAD_CAPACITY,
     SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY, StorageBlockDescriptorWire,
-    StoragedBulkReadResponse,
+    StoragedBulkReadResponse, StoragedBulkWriteRequest,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(50);
@@ -44,7 +44,7 @@ static DVM_READINESS_LAST_ERRNO: AtomicU64 = AtomicU64::new(0);
 fn main() {
     observability_client::info!("storaged", service, "service started");
     debug_line("storaged: endpoint create begin");
-    let endpoint = rustos_svc_runtime::ipc::endpoint_create_with_limits(size_of::<CommercialMaxProtocolRequest>() as u64, 0);
+    let endpoint = rustos_svc_runtime::ipc::endpoint_create_with_limits(size_of::<StoragedBulkWriteRequest>() as u64, 0);
     if endpoint < 0 {
         debug_line("storaged: endpoint create failed");
         let _ = writeln!(
@@ -203,22 +203,40 @@ fn dvm_block_e2e_marker(generation: u64) -> String {
 }
 
 fn serve(endpoint: u64) {
+    let mut recv_words = vec![0_u64; IPC_MAX_INLINE_BYTES.div_ceil(size_of::<u64>())];
     loop {
-        let mut request = CommercialMaxProtocolRequest::default();
         let mut reply_cap = 0_u64;
         let mut sender_pid = 0_u64;
         let mut sender_tid = 0_u64;
         let received = syscall6(
             SYS_RUSTOS_IPC_RECV_WITH_SENDER,
             endpoint,
-            (&mut request as *mut CommercialMaxProtocolRequest) as u64,
-            size_of::<CommercialMaxProtocolRequest>() as u64,
+            recv_words.as_mut_ptr() as u64,
+            IPC_MAX_INLINE_BYTES as u64,
             (&mut reply_cap as *mut u64) as u64,
             (&mut sender_pid as *mut u64) as u64,
             (&mut sender_tid as *mut u64) as u64,
         );
         if received < 0 {
             thread::sleep(RECV_BACKOFF);
+            continue;
+        }
+        if received as usize == size_of::<StoragedBulkWriteRequest>() {
+            // SAFETY: `recv_words` is 8-aligned and has at least `IPC_MAX_INLINE_BYTES`
+            // bytes (`== size_of::<StoragedBulkWriteRequest>()`).
+            let bulk_req = unsafe { &*(recv_words.as_ptr().cast::<StoragedBulkWriteRequest>()) };
+            let exact_sender = bulk_req.header.subject_pid == sender_pid
+                && bulk_req.header.subject_tid == sender_tid;
+            let owner_status = if exact_sender {
+                rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_VFSD, sender_pid)
+            } else {
+                -(libc::EACCES as i64)
+            };
+            if !exact_sender || owner_status < 0 {
+                reply_bulk_write_error(reply_cap, bulk_req.header, libc::EACCES);
+            } else {
+                reply_bulk_write_request(reply_cap, bulk_req);
+            }
             continue;
         }
         if received as usize != size_of::<CommercialMaxProtocolRequest>() {
@@ -229,9 +247,11 @@ fn serve(endpoint: u64) {
                 size_of::<CommercialMaxProtocolRequest>(),
                 reply_cap
             );
-            reply_commercial_error(reply_cap, &request, libc::EINVAL);
+            reply_commercial_error(reply_cap, &CommercialMaxProtocolRequest::default(), libc::EINVAL);
             continue;
         }
+        // SAFETY: `recv_words` is 8-aligned and `received == size_of::<CommercialMaxProtocolRequest>()`.
+        let request = unsafe { &*(recv_words.as_ptr().cast::<CommercialMaxProtocolRequest>()) };
         let exact_sender = request.subject_is_exact_sender(sender_pid, sender_tid);
         let owner_status = if exact_sender {
             rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_VFSD, sender_pid)
@@ -250,10 +270,83 @@ fn serve(endpoint: u64) {
                 owner_status.saturating_neg(),
                 reply_cap
             );
-            reply_commercial_error(reply_cap, &request, libc::EACCES);
+            reply_commercial_error(reply_cap, request, libc::EACCES);
             continue;
         }
-        reply_commercial_request(reply_cap, &request);
+        reply_commercial_request(reply_cap, request);
+    }
+}
+
+fn reply_bulk_write_error(
+    reply_cap: u64,
+    header: rustos_user_abi::syscall::CommercialMaxProtocolHeader,
+    status: i32,
+) {
+    let mut response = CommercialMaxProtocolResponse {
+        header,
+        status,
+        ..CommercialMaxProtocolResponse::default()
+    };
+    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    let reply = syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        (&response as *const CommercialMaxProtocolResponse) as u64,
+        size_of::<CommercialMaxProtocolResponse>() as u64,
+    );
+    if reply < 0 {
+        let _ = writeln!(std::io::stderr(), "storaged: bulk write reply failed errno={}", -reply);
+    }
+}
+
+fn reply_bulk_write_request(reply_cap: u64, request: &StoragedBulkWriteRequest) {
+    let mut response = CommercialMaxProtocolResponse {
+        header: request.header,
+        ..CommercialMaxProtocolResponse::default()
+    };
+    response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    response.status = if !request.has_valid_shape() {
+        libc::EINVAL
+    } else {
+        match dvm_e2e_ready_for_current_generation().and_then(|info| {
+            if request.generation != info.generation {
+                return Err(libc::EAGAIN);
+            }
+            let payload = request
+                .payload
+                .get(..request.payload_len as usize)
+                .ok_or(libc::EINVAL)?;
+            let fua = u64::from(request.flags) & COMMERCIAL_MAX_STORAGED_BLOCK_FLAG_FUA != 0;
+            block::write_with_info(
+                info,
+                request.generation,
+                request.lba,
+                request.block_count,
+                payload,
+                fua,
+            )?;
+            response.value0 = request.generation;
+            response.value1 = request.payload_len as u64;
+            Ok(())
+        }) {
+            Ok(()) => {
+                note_dvm_request_ready();
+                0
+            }
+            Err(errno) => {
+                log_dvm_request_rejection("dispatch", request.header.op, errno);
+                errno
+            }
+        }
+    };
+    let reply = syscall3(
+        SYS_RUSTOS_IPC_REPLY,
+        reply_cap,
+        (&response as *const CommercialMaxProtocolResponse) as u64,
+        size_of::<CommercialMaxProtocolResponse>() as u64,
+    );
+    if reply < 0 {
+        let _ = writeln!(std::io::stderr(), "storaged: bulk write reply failed errno={}", -reply);
     }
 }
 

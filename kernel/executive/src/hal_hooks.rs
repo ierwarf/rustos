@@ -361,6 +361,17 @@ fn trace_ticks_per_second() -> u64 {
     1_000_000_000
 }
 
+fn populate_current_anonymous_page_hook(page: u64, write: bool) -> hal_api::AnonymousPopulateStatus {
+    match compat_api::pager::populate_current_anonymous_page(page, write) {
+        compat_api::pager::PopulateOutcome::Resident => hal_api::AnonymousPopulateStatus::Resident,
+        compat_api::pager::PopulateOutcome::Retry => hal_api::AnonymousPopulateStatus::Retry,
+        compat_api::pager::PopulateOutcome::NotPopulatable => {
+            hal_api::AnonymousPopulateStatus::NotPopulatable
+        }
+        compat_api::pager::PopulateOutcome::NoMemory => hal_api::AnonymousPopulateStatus::NoMemory,
+    }
+}
+
 pub fn register() {
     nucleus_core::debug::register_runtime_hooks(nucleus_core::debug::DebugRuntimeHooks {
         #[cfg(not(rustos_lifecycle_trace))]
@@ -402,6 +413,7 @@ pub fn register() {
     hal_api::register_heartbeat_hooks(hal_api::HeartbeatHooks {
         snapshot: Some(heartbeat_snapshot),
     });
+    hal_api::register_populate_anonymous_page_hook(Some(populate_current_anonymous_page_hook));
 }
 
 #[cfg(test)]

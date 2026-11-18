@@ -576,6 +576,14 @@ impl<IO: Read + Write + Seek, TP, OCC> FileSystem<IO, TP, OCC> {
     /// # Errors
     ///
     /// `Error::Io` will be returned if the underlying storage object returned an I/O error.
+    /// Flushes dirty filesystem metadata and underlying disk buffers.
+    pub fn flush_disk(&self) -> Result<(), Error<IO::Error>> {
+        self.flush_fs_info()?;
+        let mut disk = self.disk.borrow_mut();
+        disk.flush()?;
+        Ok(())
+    }
+
     pub fn unmount(self) -> Result<(), Error<IO::Error>> {
         self.unmount_internal()
     }
@@ -921,7 +929,7 @@ impl OemCpConverter for LossyOemCpConverter {
 }
 
 pub(crate) fn write_zeros<IO: ReadWriteSeek>(disk: &mut IO, mut len: u64) -> Result<(), IO::Error> {
-    const ZEROS: [u8; 512] = [0_u8; 512];
+    const ZEROS: [u8; 32 * 1024] = [0_u8; 32 * 1024];
     while len > 0 {
         let write_size = len.min(ZEROS.len() as u64) as usize;
         disk.write_all(&ZEROS[..write_size])?;

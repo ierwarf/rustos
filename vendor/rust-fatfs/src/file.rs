@@ -22,6 +22,8 @@ pub struct File<'a, IO: ReadWriteSeek, TP, OCC> {
     entry: Option<DirEntryEditor>,
     // file-system reference
     fs: &'a FileSystem<IO, TP, OCC>,
+    // whether this handle dirtied directory metadata or file contents
+    dirty: bool,
 }
 
 /// An extent containing a file's data on disk.
@@ -54,6 +56,7 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
             fs,
             current_cluster: None, // cluster before first one
             offset: 0,
+            dirty: false,
         }
     }
 
@@ -68,6 +71,7 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
     /// Will panic if this is the root directory.
     pub fn truncate(&mut self) -> Result<(), Error<IO::Error>> {
         trace!("File::truncate");
+        self.dirty = true;
         if self.first_cluster.is_some_and(|cluster| !self.fs.valid_data_cluster(cluster))
             || self.current_cluster.is_some_and(|cluster| !self.fs.valid_data_cluster(cluster)) {
             return Err(Error::CorruptedFileSystem);
@@ -165,6 +169,7 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
     pub fn set_created(&mut self, date_time: DateTime) {
         if let Some(ref mut e) = self.entry {
             e.set_created(date_time);
+            self.dirty = true;
         }
     }
 
@@ -174,6 +179,7 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
     pub fn set_accessed(&mut self, date: Date) {
         if let Some(ref mut e) = self.entry {
             e.set_accessed(date);
+            self.dirty = true;
         }
     }
 
@@ -183,6 +189,7 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
     pub fn set_modified(&mut self, date_time: DateTime) {
         if let Some(ref mut e) = self.entry {
             e.set_modified(date_time);
+            self.dirty = true;
         }
     }
 
@@ -217,9 +224,13 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
     }
 
     fn flush(&mut self) -> Result<(), Error<IO::Error>> {
+        if !self.dirty {
+            return Ok(());
+        }
         self.flush_dir_entry()?;
         let mut disk = self.fs.disk.borrow_mut();
         disk.flush()?;
+        self.dirty = false;
         Ok(())
     }
 
@@ -243,8 +254,10 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
 
 impl<IO: ReadWriteSeek, TP, OCC> Drop for File<'_, IO, TP, OCC> {
     fn drop(&mut self) {
-        if let Err(err) = self.flush() {
-            error!("flush failed {:?}", err);
+        if self.dirty {
+            if let Err(err) = self.flush() {
+                error!("flush failed {:?}", err);
+            }
         }
     }
 }
@@ -258,6 +271,7 @@ impl<IO: ReadWriteSeek, TP, OCC> Clone for File<'_, IO, TP, OCC> {
             offset: self.offset,
             entry: self.entry.clone(),
             fs: self.fs,
+            dirty: self.dirty,
         }
     }
 }
@@ -316,6 +330,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
             if self.fs.options.update_accessed_date {
                 let now = self.fs.options.time_provider.get_current_date();
                 e.set_accessed(now);
+                self.dirty = true;
             }
         }
         Ok(read_bytes)
@@ -391,7 +406,8 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
         if written_bytes == 0 {
             return Ok(0);
         }
-        // some bytes were writter - update position and optionally size
+        // some bytes were written - update position and optionally size
+        self.dirty = true;
         self.offset += written_bytes as u32;
         self.current_cluster = Some(current_cluster);
         self.update_dir_entry_after_write();

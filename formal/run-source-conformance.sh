@@ -1076,7 +1076,7 @@ if [[ -z "$join_line" || -z "$complete_line" || "$complete_line" -le "$join_line
     || ! rg -Fq '.min(super::MAX_LAUNCH_RETRY_BACKOFF)' services/runtimed/src/catalog.rs \
     || ! rg -Fq 'if endpoint == 0 || endpoint == -(ENOENT as i64) {' services/vfsd/src/lib.rs \
     || ! rg -Fq '        EAGAIN' services/vfsd/src/lib.rs \
-    || [[ "$(rg -F -c 'let errno = storage_service_lookup_errno(endpoint);' services/vfsd/src/block.rs)" != 2 ]] \
+    || [[ "$(rg -F -c 'let errno = storage_service_lookup_errno(endpoint);' services/vfsd/src/block.rs)" != 3 ]] \
     || ! rg -Fq '    "apps/smpqual/smpqual.elf",' tools/xtask/src/stage/mod.rs \
     || ! rg -Fq 'entry.exec == UI_SERVER_EXEC_PATH' services/runtimed/src/socket.rs \
     || ! rg -Fq 'super::kvm_smp_qualification::qualification_contract_for_launch(entry)' services/runtimed/src/socket.rs \

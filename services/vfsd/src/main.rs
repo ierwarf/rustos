@@ -132,7 +132,7 @@ use snapshot_worker::{
     reply_snapshot_status, continue_executable_snapshot,
 };
 use util::{
-    build_linux_stat, build_linux_statx, encode_dirent_into,
+    build_linux_stat, build_linux_statx, device_rdev_for_path, encode_dirent_into,
     handle_kind_u16, is_at_fdcwd, linux_request_path, map_fat_error, normalize_absolute_path,
     path_inode, vfs_request_path, write_payload_bytes, write_vfs_payload_bytes,
 };
@@ -936,6 +936,8 @@ pub(crate) struct Metadata {
     pub(crate) fs: Option<FsMetadata>,
     /// `st_dev` of the owning mount (`0` for virtual and boot-volume nodes).
     pub(crate) dev: u64,
+    /// `(major, minor)` for character/block device nodes.
+    pub(crate) rdev: Option<(u32, u32)>,
 }
 
 impl Metadata {
@@ -946,6 +948,7 @@ impl Metadata {
             inode,
             fs: None,
             dev: 0,
+            rdev: None,
         }
     }
 }

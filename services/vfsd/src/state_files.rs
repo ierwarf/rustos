@@ -399,7 +399,11 @@ impl VfsState {
         } else {
             (handle.len, path_inode(handle.path.as_bytes()))
         };
-        let stat = build_linux_stat(Metadata::plain(handle.kind, len, inode));
+        let mut metadata = Metadata::plain(handle.kind, len, inode);
+        if handle.kind == RemoteKind::Device {
+            metadata.rdev = device_rdev_for_path(handle.path.as_str());
+        }
+        let stat = build_linux_stat(metadata);
         response.payload_len = LINUX_STAT_SIZE as u32;
         response.payload[..LINUX_STAT_SIZE].copy_from_slice(&stat);
     }

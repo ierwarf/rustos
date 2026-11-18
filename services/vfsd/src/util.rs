@@ -75,6 +75,27 @@ fn node_mode(metadata: &Metadata) -> u32 {
     }
 }
 
+pub(super) fn linux_makedev(major: u32, minor: u32) -> u64 {
+    let major = u64::from(major);
+    let minor = u64::from(minor);
+    ((major & 0x0000_0fff) << 8)
+        | ((major & 0xffff_f000) << 32)
+        | (minor & 0x0000_00ff)
+        | ((minor & 0xffff_ff00) << 12)
+}
+
+pub(super) fn device_rdev_for_path(path: &str) -> Option<(u32, u32)> {
+    match path {
+        "/dev/dri/card0" => Some((226, 0)),
+        "/dev/null" => Some((1, 3)),
+        "/dev/zero" => Some((1, 5)),
+        "/dev/full" => Some((1, 7)),
+        "/dev/random" => Some((1, 8)),
+        "/dev/urandom" => Some((1, 9)),
+        _ => None,
+    }
+}
+
 pub(super) fn build_linux_stat(metadata: Metadata) -> [u8; LINUX_STAT_SIZE] {
     let mut stat = LinuxStat {
         st_dev: metadata.dev,
@@ -85,6 +106,9 @@ pub(super) fn build_linux_stat(metadata: Metadata) -> [u8; LINUX_STAT_SIZE] {
             1
         },
         st_mode: node_mode(&metadata),
+        st_rdev: metadata
+            .rdev
+            .map_or(0, |(major, minor)| linux_makedev(major, minor)),
         st_size: metadata.len.min(i64::MAX as u64) as i64,
         st_blksize: DEFAULT_BLOCK_SIZE as i64,
         st_blocks: metadata.len.div_ceil(512).min(i64::MAX as u64) as i64,
@@ -118,6 +142,8 @@ pub(super) fn build_linux_statx(metadata: Metadata) -> [u8; LINUX_STATX_SIZE] {
         stx_size: metadata.len,
         stx_blocks: metadata.len.div_ceil(512),
         stx_dev_minor: metadata.dev as u32,
+        stx_rdev_major: metadata.rdev.map_or(0, |(major, _)| major),
+        stx_rdev_minor: metadata.rdev.map_or(0, |(_, minor)| minor),
         stx_mnt_id: metadata.dev,
         ..LinuxStatx::default()
     };
@@ -207,4 +233,34 @@ pub(super) fn vfs_request_path(request: &VfsIpcRequest) -> Option<&str> {
 
 pub(super) fn as_bytes<T>(value: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_rdev_and_stat_encoding_match_linux() {
+        assert_eq!(device_rdev_for_path("/dev/dri/card0"), Some((226, 0)));
+        assert_eq!(device_rdev_for_path("/dev/null"), Some((1, 3)));
+        assert_eq!(device_rdev_for_path("/dev/zero"), Some((1, 5)));
+        assert_eq!(device_rdev_for_path("/dev/full"), Some((1, 7)));
+        assert_eq!(device_rdev_for_path("/dev/random"), Some((1, 8)));
+        assert_eq!(device_rdev_for_path("/dev/urandom"), Some((1, 9)));
+        assert_eq!(device_rdev_for_path("/dev/unknown"), None);
+
+        let mut meta = Metadata::plain(RemoteKind::Device, 0, 42);
+        meta.rdev = device_rdev_for_path("/dev/dri/card0");
+
+        let stat_bytes = build_linux_stat(meta);
+        let stat: LinuxStat =
+            unsafe { core::ptr::read_unaligned(stat_bytes.as_ptr().cast::<LinuxStat>()) };
+        assert_eq!(stat.st_rdev, linux_makedev(226, 0));
+        assert_eq!(stat.st_rdev, 0xe200);
+
+        let statx_bytes = build_linux_statx(meta);
+        let statx: LinuxStatx =
+            unsafe { core::ptr::read_unaligned(statx_bytes.as_ptr().cast::<LinuxStatx>()) };
+        assert_eq!((statx.stx_rdev_major, statx.stx_rdev_minor), (226, 0));
+    }
 }
