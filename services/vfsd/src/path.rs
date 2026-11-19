@@ -47,10 +47,17 @@ pub fn normalize_absolute_path(base_path: &str, path: &str) -> Result<String, i3
     for component in path.split('/') {
         normalize_component(&mut normalized, component);
     }
-    if normalized.len() > VFS_IPC_PATH_CAPACITY {
-        return Err(EINVAL);
-    }
+    check_path_capacity(normalized.len())?;
     Ok(normalized)
+}
+
+/// VFS wire capacity counts UTF-8 bytes and excludes the terminator.
+pub fn check_path_capacity(len: usize) -> Result<(), i32> {
+    if len > VFS_IPC_PATH_CAPACITY {
+        Err(crate::ENAMETOOLONG)
+    } else {
+        Ok(())
+    }
 }
 
 fn normalize_component(normalized: &mut String, component: &str) {
@@ -169,7 +176,10 @@ mod tests {
     #[test]
     fn overlong_results_are_refused() {
         let long = "a/".repeat(VFS_IPC_PATH_CAPACITY);
-        assert_eq!(normalize_absolute_path("/", &long), Err(EINVAL));
+        assert_eq!(normalize_absolute_path("/", &long), Err(crate::ENAMETOOLONG));
+        let base = alloc::format!("/{}", "a".repeat(VFS_IPC_PATH_CAPACITY - 3));
+        assert_eq!(normalize_absolute_path(&base, "b").unwrap().len(), VFS_IPC_PATH_CAPACITY);
+        assert_eq!(normalize_absolute_path(&base, "bc"), Err(crate::ENAMETOOLONG));
     }
 
     #[test]

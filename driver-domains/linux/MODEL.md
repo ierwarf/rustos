@@ -143,7 +143,7 @@ grant RustOS host authority.
   name. It reports key records plus one coalesced pointer packet per
   `SYN_REPORT`. L0 accepts only bounded key code/action, signed motion/wheel,
   and five-button fields, assigns its own monotonic sequence, and forwards one
-  fixed RDI3 frame through an L0-owned fixed input ring and one RustOS-only
+  fixed RDI1 version-3 record through an L0-owned input ring and one RustOS-only
   MSI-X wake vector. The DVM never maps that ring, learns a RustOS address, or
   gains a generic RPC path.
 - RustOS accepts a nonzero relay epoch and contiguous sequence only, then

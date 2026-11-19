@@ -3,7 +3,9 @@
 Owner/status record for the current integration batch (2026-11-18). The former
 2026-11-14 static audit described an older tree; its blanket statements that
 writes, proc snapshots and SEQPACKET are absent no longer describe this tree.
-This document is not evidence that Chrome runs on RustOS.
+This document is not evidence that Chrome runs on RustOS. See the
+[`615b115c` batch record](../validation/ring3-reliability-batch.md) for later
+host, formal and KVM smoke evidence; that batch did not rerun Chrome.
 
 ## Privilege and launch boundary
 
@@ -28,8 +30,9 @@ This document is not evidence that Chrome runs on RustOS.
 `FsVolume`/`MountTable` select the longest matching mount. TmpFs is mounted at
 `/tmp`, `/dev/shm`, `/run`, with exact-case names, independent byte quotas,
 symlinks, socket inodes, sparse growth, unlink-open node retention, rename
-variants and mode/time attributes. `/data` is the mutable second FAT partition;
-`/` remains immutable. `/proc/mounts` is generated from the live mount table.
+variants and mode/time attributes. In the two-partition layout, `/` mounts
+read-only and `/data` is the second FAT partition when its mount succeeds.
+`/proc/mounts` is generated from the live mount table.
 The old special-purpose `run_dirs.rs` namespace is removed.
 
 Runtime defaults are staged in `runtime-env.tsv`, merged beneath explicit
@@ -178,11 +181,12 @@ short trace does not waive their requested compatibility tests.
 
 ## Acceptance (not yet complete)
 
-1. Eight requested host suites: initial baseline passed; final integrated
-   rerun remains required. Two pre-existing tests are opt-in/ignored.
+1. Historical host evidence includes the isolated integrated run in item 4.
+   The later `615b115c` host suite is recorded separately; a host pass does
+   not validate the Chrome guest workload.
 2. Host trace/signature comparison above collected; not RustOS execution.
 3. `--chrome-compat-probe` is opt-in and requires every named case plus PASS.
-   Final guest evidence (2026-11-18, default vCPUs, one disposable disk, explicit
+   One earlier guest profile passed (2026-11-18, default vCPUs, one disposable disk, explicit
    phases): `chromeprobe: persist first-boot ok` then `persist second-boot ok`,
    `chromeprobe: PASS (386 checks, 0 failures)` on both boots, `kvm-smoke` exit 0.
    Reproduce with:
@@ -193,6 +197,9 @@ short trace does not waive their requested compatibility tests.
    ```
 
    A missing/corrupt second-boot marker is failure, not another first-boot pass.
+   The separate [378-check integration follow-up](session-handoff.md#chrome-filesystemnetwork-integration-2026-11-18)
+   passed persistence and still reported three failing cases in its last recorded
+   configuration. Do not equate the two probe profiles.
    Bugs found and fixed by the final runs: vfsd `memfd_create` offloaded to
    syscalld while syscalld waited for vfsd inside the `MAP_FILE_SHARED` broker op
    (self-deadlock, ETIMEDOUT; vfsd now applies the stateless memfd policy

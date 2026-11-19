@@ -18,7 +18,7 @@ The ELF path supports static and dynamic 64-bit Linux ELF binaries.
 runtimed (or initd autostart)
   -> request_launch_path or spawn_exec
   -> loaderd (IPC_SERVICE_LOADERD)
-       open executable, validate ELF, read program headers in one pread64
+       open executable, validate ELF, read the bounded program headers with positioned I/O
        enforce the shared bounded/non-overlapping W^X + executable-entry gate
        SYS_RUSTOS_PROC_PREPARE_BROKER
        map main segments (+ interpreter if PT_INTERP)
@@ -36,8 +36,14 @@ Notes:
 - The canonical Linux ABI surface lives in `rustos-user-abi::linux`, re-exported
   through `kernel/ps::api` and then `kernel/compat::user`. Do not reintroduce
   shadow ABI files under `kernel/compat/src/user`.
-- Adding new Linux syscall routing should happen in `syscalld`, `vfsd`, or
-  the appropriate userspace service, not in `kernel/compat`.
+- Put new syscall policy in the owning service; keep trap routing and user
+  copy in `kernel/compat`.
+- Linux compatibility is partial. The local-fd guest probe covers pipe and
+  eventfd behavior, not browser startup. `/data` needs a valid second FAT
+  partition; a mount failure is reported separately from boot-volume access.
+  Directory cookies are opaque: use `d_off` only to resume enumeration, not
+  as an entry count. Overlong paths return `ENAMETOOLONG` at RustOS's 512-byte
+  wire limit, which is smaller than Linux's limit.
 
 ### Windows PE
 
@@ -48,7 +54,7 @@ GUI apps are limited until the compositor adds the Win32 GDI bridge.
 runtimed
   -> loaderd
        open executable, validate DOS+PE+OPTIONAL_HEADER
-       read the bounded section table in one pread64 and enforce the same image gate
+       read the bounded section table with positioned I/O and enforce the same image gate
        map PE main image at an admitted randomized base
        load_system_dll_registry (system/registry/compat/windows-system-dlls.txt)
        preload system DLLs (ntdll, kernel32, kernelbase, msvcrt, ucrtbase, ...)
@@ -116,7 +122,7 @@ ELF 경로는 static / dynamic 64-bit Linux ELF binary를 지원합니다.
 runtimed (또는 initd autostart)
   -> request_launch_path 또는 spawn_exec
   -> loaderd (IPC_SERVICE_LOADERD)
-       executable open, ELF 검증, program header를 pread64 한 번으로 읽기
+       executable open, ELF 검증, 범위가 제한된 program header를 위치 지정 읽기로 읽기
        공통 주소 범위/비중첩/W^X/실행 진입점 gate 적용
        SYS_RUSTOS_PROC_PREPARE_BROKER
        main segment map (필요하면 PT_INTERP interpreter 포함)
@@ -135,8 +141,14 @@ runtimed (또는 initd autostart)
   `kernel/ps::api`와 `kernel/compat::user`를 통해 re-export 됩니다.
   `kernel/compat/src/user` 아래 shadow ABI/handle/user-copy 파일은 다시
   만들지 않습니다.
-- 새 Linux syscall routing은 `syscalld`, `vfsd`, 또는 적절한 userspace
-  service에 추가하고 `kernel/compat`에 넣지 않습니다.
+- 새 syscall 정책은 담당 서비스에 두고, trap 라우팅과 사용자 메모리 복사는
+  `kernel/compat`에 둡니다.
+- Linux 호환성은 부분 지원입니다. local-fd 게스트 프로브는 파이프와 eventfd를
+  확인하지만 브라우저 실행을 확인하지는 않습니다. `/data`는 유효한 두 번째
+  FAT 파티션이 필요하며, 실패하면 부팅 볼륨 접근과 별개로 오류를 반환합니다.
+  디렉터리의 `d_off`는 항목 수가 아니라 열거를 재개하는 쿠키입니다. 경로가
+  RustOS의 512바이트 전송 한도를 넘으면 `ENAMETOOLONG`을 반환합니다. 이 한도는
+  Linux보다 작습니다.
 
 ### Windows PE
 
@@ -147,7 +159,7 @@ GUI app은 compositor에 Win32 GDI bridge가 들어오기 전까지 제한적입
 runtimed
   -> loaderd
        executable open, DOS+PE+OPTIONAL_HEADER 검증
-       bounded section table을 pread64 한 번으로 읽고 동일 image gate 적용
+       bounded section table을 위치 지정 읽기로 읽고 동일 image gate 적용
        PE main image를 검증된 randomized base에 load
        load_system_dll_registry (system/registry/compat/windows-system-dlls.txt)
        system DLL preload (ntdll, kernel32, kernelbase, msvcrt, ucrtbase, ...)

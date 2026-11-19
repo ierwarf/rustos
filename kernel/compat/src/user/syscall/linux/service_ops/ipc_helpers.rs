@@ -455,7 +455,7 @@ fn set_vfs_sender_identity(request: &mut VfsIpcRequest, sender: Option<(u64, u64
 pub fn populate_vfs_path(request: &mut VfsIpcRequest, path: &str) -> Result<(), i64> {
     let bytes = path.as_bytes();
     if bytes.len() > VFS_IPC_PATH_CAPACITY {
-        return Err(LINUX_EINVAL);
+        return Err(LINUX_ENAMETOOLONG);
     }
     request.path_len = bytes.len() as u32;
     request.path[..bytes.len()].copy_from_slice(bytes);
@@ -2220,13 +2220,19 @@ pub fn current_remote_vfs_handle_with_rights(
     .flatten()
 }
 
+const LINUX_ENAMETOOLONG: i64 = 36;
+
 pub fn copy_current_user_path(ptr: u64, capacity: usize) -> Result<String, i64> {
     if ptr == 0 {
         return Err(LINUX_EFAULT);
     }
-    let path = usermem::read_current_user_c_string(ptr, capacity)
-        .map_err(address_space_error_to_linux_errno)?;
-    if path.is_empty() || path.len() > capacity {
+    let path = usermem::read_current_user_c_string_bounded(ptr, capacity.saturating_add(1))
+        .map_err(user_pointer_error_to_linux_errno)?
+        .ok_or(LINUX_ENAMETOOLONG)?;
+    if path.len() > capacity {
+        return Err(LINUX_ENAMETOOLONG);
+    }
+    if path.is_empty() {
         return Err(LINUX_EINVAL);
     }
     Ok(path)

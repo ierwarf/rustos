@@ -18,7 +18,10 @@ offers are invalidated on selection replacement or keyboard focus changes.
 The selection event precedes keyboard enter for a newly focused client.
 Surfaces default to client-side decorations. Decoration mode changes are
 configured with the corresponding xdg-surface serial and take effect after
-acknowledgement and commit.
+acknowledgement and commit. Toplevel destruction retires the window, clears
+its focus, and abandons outstanding commits. A new toplevel on the surviving
+`wl_surface` keeps the compositor identity and placement but starts with a
+fresh title, decoration preference, maximize state and configure sequence.
 
 Drag-and-drop tracks pointer grabs, offers, actions, drop and finish in the UI
 service, including null-source drags and an icon surface. Every live recipient

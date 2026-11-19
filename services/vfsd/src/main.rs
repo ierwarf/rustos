@@ -1332,6 +1332,7 @@ fn copy_label(label: &str, target: &mut [u8], len: &mut u16) {
 
 #[derive(Clone)]
 pub(crate) struct DirEntry {
+    pub(crate) cookie: u64,
     pub(crate) name: String,
     pub(crate) kind: RemoteKind,
 }
@@ -1339,6 +1340,7 @@ pub(crate) struct DirEntry {
 impl DirEntry {
     pub(crate) fn new(name: &str, kind: RemoteKind) -> Self {
         Self {
+            cookie: 0,
             name: name.to_string(),
             kind,
         }
@@ -1346,6 +1348,7 @@ impl DirEntry {
 
     fn from_fs(entry: storage_core::fs::FsDirEntry) -> Self {
         Self {
+            cookie: entry.cookie,
             name: entry.name,
             kind: RemoteKind::from_fs(entry.kind),
         }

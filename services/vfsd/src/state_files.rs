@@ -421,9 +421,9 @@ impl VfsState {
             return;
         }
         let start = if replayed {
-            let (recorded_requested, _) = unpack_u32_pair(handle.last_result);
-            if handle.last_mutation != VFSD_OPEN_MUTATION_GETDENTS
-                || recorded_requested as usize != requested
+            if handle.checkpoint_version != VFSD_OPEN_CHECKPOINT_VERSION
+                || handle.last_mutation != VFSD_OPEN_MUTATION_GETDENTS
+                || vfsd::directory::checkpoint_request_size(handle.last_result) != requested
             {
                 response.status = EIO;
                 return;
@@ -432,50 +432,38 @@ impl VfsState {
         } else {
             handle.cursor
         };
-        let start_index = match usize::try_from(start) {
-            Ok(start) => start,
-            Err(_) => {
-                response.status = EOVERFLOW;
-                return;
-            }
-        };
-        let (written, consumed) = match self.render_getdents_payload(
+        let (written, end) = match self.render_getdents_payload(
             request.remote_id,
             request.pid,
-            start_index,
+            start,
             requested,
             &mut response.payload,
         ) {
             Ok(result) => result,
             Err(errno) => {
-                response.status = errno;
+                // The exact prepared reply is no longer reproducible. The
+                // compat caller cancels this operation and restores `start`.
+                response.status = if replayed { EIO } else { errno };
                 return;
             }
         };
+        let bytes = &response.payload[..written];
         if replayed {
-            let (_, recorded_consumed) = unpack_u32_pair(handle.last_result);
-            if consumed != recorded_consumed as usize {
+            if !vfsd::directory::replay_matches(handle.last_result, handle.cursor, requested, end, bytes) {
                 response.status = EIO;
                 return;
             }
         } else {
-            let mut candidate = handle;
-            candidate.cursor = match candidate.cursor.checked_add(consumed as u64) {
-                Some(cursor) => cursor,
-                None => {
-                    response.status = EOVERFLOW;
-                    return;
-                }
+            let Some(result) = vfsd::directory::checkpoint_reply(requested, bytes) else {
+                response.status = EOVERFLOW;
+                return;
             };
+            let mut candidate = handle;
+            candidate.cursor = end;
+            candidate.checkpoint_version = VFSD_OPEN_CHECKPOINT_VERSION;
             candidate.last_mutation = VFSD_OPEN_MUTATION_GETDENTS;
             candidate.last_start = start;
-            candidate.last_result = match pack_u32_pair(requested, consumed) {
-                Ok(result) => result,
-                Err(errno) => {
-                    response.status = errno;
-                    return;
-                }
-            };
+            candidate.last_result = result;
             if let Err(errno) = self.checkpoint_handle_state(
                 request,
                 request.remote_id,

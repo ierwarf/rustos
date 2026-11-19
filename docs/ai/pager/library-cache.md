@@ -8,12 +8,10 @@ COW leaf installation, generation checks, charging and TLB-safe lifetime.
 The same mechanisms are intended for Windows section/views; ELF, PE, Linux
 paths, and library popularity are not kernel policy.
 
-**Current integration is partial; see \"Live file mappings\".** The stage producer and parser exist;
-the native source supply/withdrawal control and service-exit closure exist.
-Fixed private-file/section replies now have a source-pin/COW adoption path,
-but file-backed VMA admission, actual pagerd file I/O, cache reuse and the
-boot-prewarm consumer still need connection. Native tests
-and a serialized hint file are not runtime cache or performance evidence.
+**Current integration:** Boot prewarming and mmap-time reuse of admitted
+immutable library pages are live and have bounded KVM evidence. General
+fault-driven file miss I/O is a separate path and is not established by that
+probe. See [live file mappings](#live-file-mappings-what-exists-and-what-does-not).
 
 ## Boot plan
 
@@ -21,14 +19,13 @@ and a serialized hint file are not runtime cache or performance evidence.
 actual isolated final-loader selections, after linker-cache generation and
 baseline libc/loader verification. It writes `/etc/pagerd/library-cache.conf`
 before signing the early-system closure and before FAT serialization. This
-file is in the early-system authenticated allowlist. The live consumer must
-explicitly read that authenticated provider representation, not accept a
-same-path product-volume shadow as trusted policy. This reader boundary remains
-to be connected; allowlist membership alone does not prove runtime selection.
+file is in the early-system authenticated allowlist. The warm worker reads
+this policy once VFS is available. Allowlist membership alone does not prove
+that a particular library was selected or its contents published.
 
 `libs/rustos-library-cache-policy` is a no_std host/Ring3 dependency, not a
 kernel dependency. Its versioned, bounded parser is shared by the stage producer
-and the planned pager consumer. Selection defaults are:
+and the pager consumer. Selection defaults are:
 
 - At most **32 MiB** of page-rounded boot cache residency, **4 MiB** per file,
   **128** entries and at most **16 pages** of lazy read-ahead. The accepted
@@ -43,7 +40,7 @@ and the planned pager consumer. Selection defaults are:
 - Common candidates, then larger consumer counts, then smaller files, then
   lexical paths define deterministic selection. Rejection spends no budget;
   a later small candidate can still fit. App-private, rare and large libraries
-  remain lazy, rather than copying them during boot.
+  are not prewarmed; this does not imply a lazy file-fault implementation.
 - This is deliberately an **initial static policy**, not measured runtime heat.
   Runtime hit/miss/read/supply/eviction counters must inform future tuning;
   do not claim a dependency count measures frequency of execution.
@@ -57,7 +54,7 @@ budget violations fail parsing. A plan is **not mapping authority**: the pager
 must independently obtain an immutable provider capability with exact backing
 identity/generations and verify each warm payload before cache publication.
 
-## Required live behavior
+## Ownership invariants and future lazy behavior
 
 Pager registration cannot wait for VFS: pagerd starts first in the bootstrap
 control graph. A bounded warm worker must wait for VFS readiness without blocking
@@ -178,7 +175,7 @@ fall to 32x the minimum (~490 MiB; a hog drains the 8x margin in under one
 second, measured) it retires the coldest objects (highest manifest rank,
 larger first) until the shortfall is covered, logging
 `pagerd: library cache reclaimed objects= pages= free= kept=`. Retirement is
-permanent for the lease (no re-warm). Native tests only; not KVM-exercised.
+permanent for the lease (no re-warm). See the bounded reclaim proof below.
 
 Not done:
 - Fault-driven serving of a post-mmap miss is not built (not needed under the

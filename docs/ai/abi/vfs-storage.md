@@ -325,10 +325,10 @@ the read-only accelerator; TmpFs has it (next section).
   and a socket inode gives ENXIO on open. `/proc/mounts` is generated from the
   live `MountTable` (vfat rows `ro`/`rw`, tmpfs rows `rw,nosuid,nodev`).
 - **New VFS ops** (`VFS_IPC_ABI_VERSION` stays 5): `MKNOD`=34 (dirfd+path,
-  `arg0`=st_mode; S_IFSOCK and regular files only, FIFO EOPNOTSUPP, devices EPERM; used by netd bind, no `mknod` syscall is wired), `CHMOD`=35,
+  `arg0`=st_mode; regular, socket and FIFO kinds are admitted where the volume supports them; device nodes are refused; used by Linux `mknod`/`mknodat` and netd bind), `CHMOD`=35,
   `FCHMOD`=36, `FALLOCATE`=37 (mode 0 and KEEP_SIZE), `FILE_LOCK`=38,
   `SHARED_BACKING`=39. vfsd applies no umask: the kernel passes umask-adjusted
-  modes. Timestamps are seconds only.
+  modes. Linux timestamp requests carry nanoseconds and NOW/OMIT; the actual precision also depends on the backing filesystem.
 - **Advisory locks (`FILE_LOCK`).** `VfsFileLockWire` (48 bytes LE:
   `version u16 | cmd u16 | owner u16 | lock_type u16 | whence u16 | flags u16 |
   reserved u32 | start i64 | len i64 | pid i64 | reserved u64`); cmd 1 GETLK,
@@ -357,15 +357,16 @@ the read-only accelerator; TmpFs has it (next section).
 - **procfs.** `/proc` serves the caller's own pid only (`/proc/self`,
   `/proc/<own pid>`). Kernel-fact nodes (maps, smaps, status, stat, statm,
   cmdline, environ, auxv, limits, comm, oom_score_adj, `task/`, `fd/`, `ns/*`) are
-  delegated: vfsd answers with a `PROC_DELEGATE` aux word and the Ring0 compat
-  front-end freezes a bounded (256 KiB) unmappable memfd snapshot at `open()`.
-  Generated files are `S_IFREG` 0444 size 0, directories 0555. `fd/N` are magic
+  exposed through vfsd. For kernel-fact files handled by the Ring3 snapshot
+  path, vfsd pulls attested binary facts through `SYS_RUSTOS_PROC_FACTS_BROKER`,
+  formats them and captures the bytes when opening the file. Some special
+  nodes still use the `PROC_DELEGATE` compat path. Generated read-only files
+  are `S_IFREG` 0444 size 0, directories 0555. `fd/N` are magic
   links (`socket:[ino]`, `pipe:[ino]`, `anon_inode:[...]`, `/memfd:name (deleted)`,
   recorded path); `open("/proc/self/fd/N")` reopens memfd (seals apply),
   path-backed files (recorded path) and proc snapshots, `ENXIO` for sockets, pipes
-  and anonymous inodes. Omitted fields are omitted, not invented (no Rss/Pss,
-  dev:inode printed `00:00 0`, other threads' utime 0). Recommended follow-up: a
-  bounded pull channel instead of Ring0 formatting.
+  and anonymous inodes. Unavailable Linux fields are omitted rather than
+  fabricated.
 - **netd path sockets.** `bind(AF_UNIX, abs path)` creates an `S_IFSOCK` inode
   through vfsd `MKNOD` carrying `VFS_REQUEST_FLAG_NETD_SOCKET_NODE`; vfsd
   accepts the flag only from the netd service owner and only for `S_IFSOCK`
@@ -393,26 +394,25 @@ the read-only accelerator; TmpFs has it (next section).
   (`mm_broker_ops/file_shared.rs`) checks the client's rights (read, and write
   for `PROT_WRITE`), asks vfsd on the client's behalf (same proxy shape as
   `FILE_IDENTITY`), finds the memfd in vfsd's descriptor table by
-  `(descriptor, object id)` and maps it exactly like a shared memfd
-  (`acquire_mapping` + `record_shared_memfd_mapping`), so fork, munmap,
+  `(descriptor, object id)` and maps it like a shared memfd
+  (`acquire_mapping_with_eof_guard` + `record_shared_memfd_mapping`), so fork, munmap,
   mprotect and exit reuse the memfd paths. Frames are therefore shared by
   every mapper and by vfsd I/O; `msync` has nothing to flush.
-- **Refusals unchanged:** FAT/early-system files answer `ENODEV` from vfsd,
-  reported as `EACCES` (as before); read-only `MAP_SHARED` and `MAP_PRIVATE`
-  keep the private-copy path; the immutable executable snapshot path is
-  untouched.
+- **Path-backed volumes:** mutable FAT files use the shared path store, not the
+  TmpFs inode upgrade. The store retains a memfd keyed by mount and normalized
+  path; `msync` requests writeback to the volume. Immutable and early-system
+  paths do not admit this shared backing. This does not establish full Linux
+  `MAP_SHARED` coherence, admission, or durability for every FAT file.
 - **Lifetime:** frames die with the TmpFs node (last name and open description)
   *and* the last mapping hold. `unlink`/`rename` while mapped is therefore
   ordinary. Quota is `ceil(len/4096)` pages of the mount (dense, sparse growth
   of a shared-backed file is charged); the pages are also charged to vfsd's
   Job like any memfd.
-- **Truncate while mapped:** ring0 cannot revoke other processes' page-table
-  entries, so `ftruncate` that would free a mapped frame returns `EBUSY`
-  (length and quota unchanged) instead of leaving a dangling or SIGBUS-less
-  page; a shrink inside the last mapped page succeeds and zeroes the tail.
-  Linux's SIGBUS-beyond-EOF behaviour is not implemented.
-- **Known gaps:** mapping extents beyond EOF (including an empty file) is
-  `EINVAL`; `O_APPEND` files are not refused; `/proc/<pid>/maps` names the
+- **Truncate while mapped:** shrinking the backing memfd replaces released
+  mapped pages with EOF guard leaves before frame release; a fault on a
+  guard delivers `SIGBUS`. A shrink inside the last page zeroes the tail.
+  Mapping ranges beyond EOF can include those guard leaves.
+- **Known gaps:** `O_APPEND` files are not refused; `/proc/<pid>/maps` names the
   mapping `memfd:vfsd-tmpfs`; `mtime` is not advanced by stores through a
   mapping; `fallocate(KEEP_SIZE)` past EOF is `EOPNOTSUPP` on a shared-backed
   file.
@@ -452,7 +452,12 @@ the read-only accelerator; TmpFs has it (next section).
   `SharedBlockDevice` and inspects partitions via `detect_partitions`:
   0 or 1 partition mounts `/` with `device_read_only`; 2+ partitions force
   partition 0 read-only at `/` and mount partition 1 at `/data` with
-  `device_read_only` (so `/data` is writable when the DVM device is writable).
+  `device_read_only` (so `/data` is writable when both the mount and DVM device
+  admit writes). If the second slice or FAT mount fails, `/` stays available,
+  but vfsd logs the distinct `/data` failure, omits that mount from listings,
+  and returns the saved error for `/data` and its descendants instead of
+  treating them as boot-volume paths. A disk without a second partition is
+  distinct from a second partition that failed admission.
 - `vfsd` keys path caches (`metadata_cache`, `dir_entries_cache`,
   `file_bytes_cache`, `read_maps`, `executable_snapshot_cache`) by
   `CacheKey = (mount_id, case_normalized_rel_path)` (`CasePolicy` lowercases
@@ -460,6 +465,23 @@ the read-only accelerator; TmpFs has it (next section).
   filesystem mutation invalidates the target and parent `CacheKey` entries
   (and matching subtree keys on directory/rename mutations); remounts clear all
   caches via `invalidate_caches_if_remounted`.
+- **Directory iteration:** vfsd merges immediate mount children with the
+  backing entries for node-, path- and virtual-backed directories. Namespace
+  entries shadow equivalent backing names. `getdents64` returns opaque `d_off`
+  cookies: fixed namespace slots/mount IDs, monotonic TmpFs name-entry IDs
+  (separate for hard links), or FAT directory-stream offsets. Removing earlier
+  entries does not renumber the survivors. Rewind with `lseek(fd, 0, SEEK_SET)`;
+  seek to a returned cookie to continue. This is not a directory snapshot:
+  inserts and renames may reorder or reuse slots on disk.
+- **Replay:** open-description checkpoint version 3 records the start/end
+  cookies and a fingerprint of the admitted buffer size and encoded bytes.
+  A changed page is refused and the exact transaction cancelled, not accepted
+  just because its record count matches. Old nonzero directory positions are
+  stale on restore; v1/v2 file-read checkpoints keep their original semantics.
+- **Path limits:** pathname admission and expansion past RustOS's 512-byte
+  VFS wire capacity report `ENAMETOOLONG`, as do filesystem name-length
+  failures. Invalid syntax and user-copy errors remain distinct. The wire
+  capacity is unchanged; Linux's larger pathname limit is not claimed.
 
 ## Storage Surface (`storaged`)
 

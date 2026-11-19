@@ -111,8 +111,9 @@ bounded close/dup/fork/exec cleanup are source/model covered. State mutations
 now use exact operation IDs with replay/reconciliation, vfsd restores its
 rootd-retained authenticated epoll checkpoint before endpoint publication, and
 service objects use boot-entropy capabilities plus sender/dependency checks.
-Runtime crash injection and the live KVM workload remain unclaimed; host
-admission rejects the available NVIDIA render node. Fuchsia's
+This does not replace focused runtime crash-injection evidence. The
+[batch validation](../validation/ring3-reliability-batch.md) records the
+separate KVM boot and input evidence and its timing limits. Fuchsia's
 peered IOBuffer remains a useful commercial-OS reference for the object shape,
 not an ABI to copy verbatim:
 <https://fuchsia.dev/fuchsia-src/reference/kernel_objects/io_buffer>.
@@ -131,10 +132,12 @@ not an ABI to copy verbatim:
   4x`MAX_WAYLAND_BUFFER_PIXELS` retained surface pixels in total. Exceeding a
   limit is a protocol error on the offending client only; one client cannot
   starve the others of surfaces, seat devices or heap.
-- **Known gap.** The shm pool is mapped for the size the client declares. A
-  client that truncates the backing file after `create_pool` can fault the
-  compositor on the next read; the fix needs either a kernel-side guarantee
-  (sealing / fault isolation) or a SIGBUS-safe copy path and is not done here.
+- **Shared-memory ownership.** The compositor does not map client SHM. It
+  uses positioned reads into owned pixels and rejects incomplete copies; see
+  [the SHM ownership contract](#mixed-window-and-hostile-shm-ownership-contract).
+- **Toplevel recreation.** Destroying a toplevel clears focus and abandons
+  outstanding commits. Recreating it on the same `wl_surface` preserves
+  identity and placement, but resets title, decoration and maximize state.
 - **GPU atlas capacity.** The desktop texture occupies 2560x1440 of the
   2688x2560 atlas, leaving a 2688x1118 strip for windows, so a maximized
   window cannot be placed. Windows are packed in reverse draw order (focused
@@ -321,9 +324,9 @@ lifetime, provider epoch revoke, interest별 `ERR|HUP`, bounded
 close/dup/fork/exec cleanup은 source/model 검증 범위입니다. 원격 상태변경은
 동일 operation ID replay/reconciliation을 사용하고, vfsd는 endpoint 공개 전
 rootd의 인증된 epoll checkpoint를 복구하며, service object는 boot entropy
-capability와 sender/dependency 검사를 함께 사용합니다. 남은 release gate는
-runtime crash injection과 NVIDIA host admission 때문에 실행하지 못한 live
-KVM workload이며, 이를 source/model 성공으로 대체해 기록하지 않습니다.
+capability와 sender/dependency 검사를 함께 사용합니다. 이 검사는 별도의 runtime crash injection을 대체하지 않습니다.
+[KVM 부팅과 입력 검증 기록](../validation/ring3-reliability-batch.md#korean)은
+확인한 범위와 시간 제한을 따로 설명합니다.
 
 ### Wayland 보강 계약
 
@@ -331,6 +334,10 @@ KVM workload이며, 이를 source/model 성공으로 대체해 기록하지 않�
   protocol id를 쓰지 않습니다. focus 비교는 `ObjectId`로 합니다.
 - 한도: 전체 surface 64, client 64, client당 surface 16과 output/pointer/keyboard
   8, 보존 surface pixel 총량 상한. 초과하면 해당 client만 protocol error입니다.
+- 클라이언트 SHM을 직접 매핑하지 않고 compositor 소유 메모리로 읽습니다.
+  완전히 읽지 못한 프레임은 게시하지 않습니다.
+- 같은 `wl_surface`에서 창을 다시 만들면 배치와 식별자는 유지하지만 제목,
+  장식 설정, 최대화 이력은 초기화합니다.
 - GPU atlas가 가득 차면 focused window를 먼저 packing하고 draw order는 유지하며,
   빠진 window는 bounded log로 남깁니다. 최대화 window는 아직 atlas에 들어가지
   않습니다(desktop texture 2560x1440 점유).

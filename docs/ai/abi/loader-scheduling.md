@@ -4,6 +4,11 @@
 
 ## Process Loader Surface (`loaderd` + `procd`)
 
+Exact positioned reads used by loader admission advance through short positive
+`pread64` results. A zero read before filling the destination is a truncated
+image (`ENOEXEC`); an overflowing file offset is rejected. Header and section
+validation still apply to the complete bounded input.
+
 Application placement uses the separate 16-byte `LoaderJobRealmRequest` v1
 (`LOADER_OP_CONFIGURE_JOB_REALM`, 5), defined in
 `libs/rustos-user-abi/src/syscall/loader_job_realm.rs`. It requires an exact

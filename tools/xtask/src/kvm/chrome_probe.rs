@@ -31,12 +31,16 @@ const CHROME_PROBE_PERSIST_MARKERS: [&str; 2] = [
 ];
 /// One `chromeprobe: <case> ok` record per case, all required. Must match the
 /// case names in `apps/chromeprobe/chrome_probe.c`.
-const CHROME_PROBE_CASES: [&str; 43] = [
+const CHROME_PROBE_CASES: [&str; 47] = [
     "tmpfs.tmp",
     "tmpfs.devshm",
     "tmpfs.run",
     "data.dirs",
     "data.atomic-write",
+    "dir.tmpfs-cookie",
+    "dir.fat-cookie",
+    "dir.mount-overlay",
+    "dir.name-too-long",
     "lock.posix-tmpfs",
     "lock.posix-data",
     "lock.ofd",

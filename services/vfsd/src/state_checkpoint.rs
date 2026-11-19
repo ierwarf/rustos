@@ -186,7 +186,10 @@ impl VfsState {
                     record.key_hi,
                     RemoteHandle {
                         checkpoint_version: wire.version,
-                        stale: vfsd::mount_table::is_volatile_mount_path(&path),
+                        stale: vfsd::mount_table::is_volatile_mount_path(&path)
+                            || (wire.version < VFSD_OPEN_CHECKPOINT_VERSION
+                                && kind == RemoteKind::Directory
+                                && (wire.cursor != 0 || wire.last_mutation == VFSD_OPEN_MUTATION_GETDENTS)),
                         kind,
                         mount_id: 0,
                         writable,

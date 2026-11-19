@@ -166,7 +166,7 @@ pub(crate) fn kernel_vfs_getdents_raw(fd: u64, dest: &mut [u8]) -> Result<usize,
                 return Err(errno);
             }
         };
-        ensure_vfs_status(&response)?;
+        vfs_getdents_status(&request, &response)?;
         let len = response.payload_len as usize;
         if len > dest.len() || len > response.payload.len() {
             let _ = settle_vfs_cursor_mutation(&request, false);
@@ -186,6 +186,16 @@ pub(crate) fn kernel_vfs_getdents_raw(fd: u64, dest: &mut [u8]) -> Result<usize,
     })();
     release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
     result
+}
+
+/// EIO may be a prepared replay whose directory page changed. Exact cancel
+/// is harmless for a fresh error and prevents wedging a prepared cursor.
+fn vfs_getdents_status(request: &VfsIpcRequest, response: &VfsIpcResponse) -> Result<(), i64> {
+    let status = ensure_vfs_status(response);
+    if status == Err(LINUX_EIO) {
+        let _ = settle_vfs_cursor_mutation(request, false);
+    }
+    status
 }
 
 pub fn syscall_linux_vfs_getdents64(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
@@ -221,7 +231,7 @@ pub fn syscall_linux_vfs_getdents64(fd: u64, user_ptr: u64, user_len: u64) -> u6
                 return linux_errno(errno);
             }
         };
-        if let Err(errno) = ensure_vfs_status(&response) {
+        if let Err(errno) = vfs_getdents_status(&request, &response) {
             return linux_errno(errno);
         }
         let len = response.payload_len as usize;

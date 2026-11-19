@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod checkpoint_wire;
+pub mod directory;
 pub mod lifecycle;
 pub mod linux_types;
 pub mod locks;
@@ -32,6 +33,7 @@ use storage_core::{IoResult, StorageError};
 
 pub const ENOENT: i32 = 2;
 pub const ENOTDIR: i32 = 20;
+pub const ENAMETOOLONG: i32 = 36;
 pub const EROFS: i32 = 30;
 pub const ELOOP: i32 = 40;
 /// Linux `MAXSYMLINKS`: symlink expansions allowed in one path resolution.
@@ -481,8 +483,10 @@ pub fn should_materialize_file_cache(
 pub const VFSD_CHECKPOINT_HANDLE_TAG: u64 = 0x4844_4c45_0000_0001;
 pub const VFSD_CHECKPOINT_PATH_TAG: u64 = 0x4850_4154_0000_0000;
 pub const VFSD_OPEN_CHECKPOINT_LEGACY_VERSION: u16 = 1;
-/// Version 2 records the caller's requested read size, rather than its EOF-clamped size.
-pub const VFSD_OPEN_CHECKPOINT_VERSION: u16 = 2;
+/// Version 2 records the requested read size, rather than its EOF-clamped size.
+pub const VFSD_OPEN_CHECKPOINT_READ_SIZE_VERSION: u16 = 2;
+/// Version 3 stores opaque directory cookies and fingerprints getdents replies.
+pub const VFSD_OPEN_CHECKPOINT_VERSION: u16 = 3;
 pub const VFSD_OPEN_MUTATION_STAGING: u16 = 0;
 pub const VFSD_OPEN_MUTATION_OPEN: u16 = 1;
 pub const VFSD_OPEN_MUTATION_READ: u16 = 2;
@@ -532,7 +536,7 @@ pub fn read_replay_is_valid(
     start: u64,
     file_len: u64,
 ) -> bool {
-    matches!(version, VFSD_OPEN_CHECKPOINT_LEGACY_VERSION | VFSD_OPEN_CHECKPOINT_VERSION)
+    matches!(version, VFSD_OPEN_CHECKPOINT_LEGACY_VERSION | VFSD_OPEN_CHECKPOINT_READ_SIZE_VERSION | VFSD_OPEN_CHECKPOINT_VERSION)
         && requested == recorded_requested
         && (version != VFSD_OPEN_CHECKPOINT_LEGACY_VERSION || start <= file_len)
         && replay_len <= requested
@@ -565,7 +569,7 @@ const _: () = assert!(core::mem::size_of::<OpenDescriptionCheckpointWire>() == 6
 
 impl OpenDescriptionCheckpointWire {
     pub fn valid(&self, path_capacity: usize) -> bool {
-        matches!(self.version, VFSD_OPEN_CHECKPOINT_LEGACY_VERSION | VFSD_OPEN_CHECKPOINT_VERSION)
+        matches!(self.version, VFSD_OPEN_CHECKPOINT_LEGACY_VERSION | VFSD_OPEN_CHECKPOINT_READ_SIZE_VERSION | VFSD_OPEN_CHECKPOINT_VERSION)
             && matches!(self.kind, 1..=3)
             && matches!(
                 self.last_mutation,
@@ -1469,7 +1473,8 @@ mod tests {
         };
         assert!(wire.valid(256));
         assert!(OpenDescriptionCheckpointWire { version: VFSD_OPEN_CHECKPOINT_LEGACY_VERSION, ..wire }.valid(256));
-        assert!(!OpenDescriptionCheckpointWire { version: 3, ..wire }.valid(256));
+        assert!(OpenDescriptionCheckpointWire { version: VFSD_OPEN_CHECKPOINT_READ_SIZE_VERSION, ..wire }.valid(256));
+        assert!(!OpenDescriptionCheckpointWire { version: 4, ..wire }.valid(256));
         assert!(!OpenDescriptionCheckpointWire { refs: 2, ..wire }.valid(256));
         assert!(!OpenDescriptionCheckpointWire {
             path_len: 257,
@@ -1481,8 +1486,9 @@ mod tests {
 
     #[test]
     fn read_replay_preserves_requested_length_and_allows_eof() {
-        let v2 = VFSD_OPEN_CHECKPOINT_VERSION;
+        let v2 = VFSD_OPEN_CHECKPOINT_READ_SIZE_VERSION;
         let v1 = VFSD_OPEN_CHECKPOINT_LEGACY_VERSION;
+        assert!(read_replay_is_valid(VFSD_OPEN_CHECKPOINT_VERSION, 100, 100, 3, 100, 7, 10));
         assert!(read_replay_is_valid(v2, 100, 100, 3, 100, 7, 10));
         assert!(read_replay_is_valid(v2, 100, 100, 0, 100, 20, 10));
         assert!(!read_replay_is_valid(v2, 99, 100, 3, 100, 7, 10));
@@ -1494,7 +1500,7 @@ mod tests {
         assert!(read_replay_is_valid(v1, 3, 3, 3, 100, 7, 10));
         assert!(!read_replay_is_valid(v1, 100, 3, 3, 100, 7, 10));
         assert!(!read_replay_is_valid(v1, 0, 0, 0, 100, 20, 10));
-        assert!(!read_replay_is_valid(3, 3, 3, 3, 100, 7, 10));
+        assert!(!read_replay_is_valid(4, 3, 3, 3, 100, 7, 10));
     }
 
     #[test]

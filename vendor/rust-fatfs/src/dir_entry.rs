@@ -543,6 +543,13 @@ pub struct DirEntry<'a, IO: ReadWriteSeek, TP, OCC> {
     pub(crate) fs: &'a FileSystem<IO, TP, OCC>,
 }
 
+impl<IO: ReadWriteSeek, TP, OCC> DirEntry<'_, IO, TP, OCC> {
+    /// Byte position immediately after this entry in its parent directory stream.
+    pub fn dir_stream_end(&self) -> u64 {
+        self.offset_range.1
+    }
+}
+
 #[allow(clippy::len_without_is_empty)]
 impl<'a, IO: ReadWriteSeek, TP, OCC: OemCpConverter> DirEntry<'a, IO, TP, OCC> {
     /// Returns short file name.

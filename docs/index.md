@@ -23,6 +23,7 @@ This book is split by audience:
   `RUSTOS.package.toml` manifest, and runtime control.
 - **Guides:** end-to-end recipes for adding services, apps, and drivers.
 - **Reference:** stable paths and environment variables.
+- **Validation:** [dated test results and remaining limits](validation/ring3-reliability-batch.md).
 - **AI Agent Reference:** compact machine-oriented context under
   `docs/ai/`.
 
@@ -62,6 +63,7 @@ IRQ/MMIO/DMA bridge, 그리고 소수의 gated broker — 만 남기고 나머�
   `RUSTOS.package.toml` manifest, runtime control.
 - **Guides:** service / app / driver를 추가하는 끝-끝 절차.
 - **Reference:** 안정적인 path와 environment variable.
+- **Validation:** [커밋별 검증 결과와 남은 한계](validation/ring3-reliability-batch.md#korean).
 - **AI Agent Reference:** `docs/ai/` 아래의 짧은 machine-oriented
   context.
 

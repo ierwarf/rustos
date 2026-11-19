@@ -23,6 +23,11 @@
   lets only initd and uiserver look up `IPC_SERVICE_INPUTD`. Widening that matrix
   hands the holder the ability to mint read grants for any pid, so such a change
   must also move the grant check into ring0.
+- When the userspace event queue is full, `inputd` sheds pointer samples,
+  repeats, scroll, then presses. An obsolete duplicate release can be
+  replaced, but a unique key/button release is retained rather than evicted
+  for a lower-priority event. An event without an evdev representation does
+  not hide a later readable event in the queue.
 - inputd owns a single System-class `inputd-dvm-ingress` worker. It waits in
   `SYS_RUSTOS_INPUT_WAIT_BROKER`, which arms before sleeping and rechecks raw
   producer/consumer cursors after registration; the MSI-X leaf only wakes that

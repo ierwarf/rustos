@@ -19,10 +19,10 @@ surfaces or sockets they expose.
 | `runtimed` | Service manager + launch broker. Bootstraps `uiserver` (synchronously with manifest env), then dispatches autostart and on-demand launches. | `/run/runtimed.sock` (`RuntimeClient`). |
 | `sessiond` | Session policy: focus, console session lifecycle, per-user resources. | Pairs with `runtimed`. |
 | `syscalld` | Linux MM/credential and selected signal policy via gated brokers; routine clocks use the local compat timer path. | `IPC_SERVICE_SYSCALLD`. |
-| `pagerd` | Backing-object and fault-policy service; anonymous faults are served in ring0, and file-backed fault dispatch is not yet live. | `IPC_SERVICE_PAGERD`. |
+| `pagerd` | Backing and fault policy, boot prewarm and immutable library sources. Ring0 installs leaves; warmed private file mappings alias cached pages at mmap time, not through a general lazy file-fault path. | `IPC_SERVICE_PAGERD`. |
 | `vfsd` | Linux VFS policy (mount table, openat resolution, FAT boot volume), plus leased, owner-bound executable snapshots streamed into a sealed memfd without a whole-file buffer. | `IPC_SERVICE_VFSD`. |
 | `loaderd` | Process spawn: ELF dynamic main+interpreter, PE32+ main + System32 imports, Windows runtime broker registration. Large images are staged asynchronously (loader ABI v4 begin/poll/cancel work, explicit launch lease) before the serial image build. | `IPC_SERVICE_LOADERD`. |
-| Linux DVM | Linux driver lifecycle, DRM/KMS, evdev, and virtio-net. | Fixed RDI3/ivshmem transports. |
+| Linux DVM | Linux driver lifecycle, DRM/KMS, evdev, and virtio-net. | Fixed ivshmem transports; input uses RDI1 version 3. |
 | `devmgrd` | RustOS device namespace and hotplug policy. | `IPC_SERVICE_DEVMGRD`. |
 | `inputd` | Authenticated DVM input routing into Wayland and console clients. | Wayland seat + console focus. |
 | `storaged` | Generation-bound block policy over the authenticated Linux-DVM transport. | DVM-backed block API. |
@@ -42,12 +42,15 @@ Remaining catalog-managed services and apps are launched from the catalog;
 rootd/initd-managed bootstrap services are not delayed until UI readiness. The catalog is
 materialized on runtimed's main loop after UI readiness. Desktop metadata and
 runtime-launch policy are cached separately so one registry can never be
-mistaken for the other.
+mistaken for the other. In rootd's recovery path, waiting for loaderd or
+another required service does not consume the dependent service's restart
+budget; actual failed restart attempts still count.
 
 ### Linux Driver Domain
 
 Linux modules execute only in the isolated DVM. RustOS receives keyboard and
-pointer records through authenticated RDI3 over an L0-owned MSI-X input ring;
+pointer events as authenticated RDI1 version-3 records over an L0-owned MSI-X
+input ring;
 display, network, and block traffic use separately validated fixed
 transports. `inputd`, `uiserver`, `netd`, and `storaged` own policy above
 those transports. A missing DVM transport disables its device;
@@ -70,10 +73,10 @@ ELF, 그리고 staged registry에 한 줄을 함께 가집니다. 아래 표는 
 | `runtimed` | service manager + launch broker. manifest env를 적용한 채 `uiserver`를 동기 부트스트랩한 뒤, autostart와 on-demand launch를 dispatch. | `/run/runtimed.sock` (`RuntimeClient`). |
 | `sessiond` | session policy: focus, console session lifecycle, per-user resource. | `runtimed`와 쌍. |
 | `syscalld` | Linux MM/credential 및 일부 signal 정책. 일반 clock 호출은 compat 내부 timer 경로. | `IPC_SERVICE_SYSCALLD`. |
-| `pagerd` | backing-object 및 fault 정책. anonymous fault는 ring0가 처리하며 file-backed dispatch는 아직 실사용 경로에 연결되지 않음. | `IPC_SERVICE_PAGERD`. |
+| `pagerd` | backing·fault 정책, 부팅 시 사전 로드, 불변 라이브러리 페이지 공급. Ring0가 매핑을 설치하며, 사전 로드된 파일은 일반 지연 폴트가 아니라 mmap 시 캐시 페이지를 공유합니다. | `IPC_SERVICE_PAGERD`. |
 | `vfsd` | Linux VFS policy (mount table, openat resolution, FAT boot volume)와 whole-file buffer 없이 sealed memfd로 스트리밍하는 lease·owner 결합 executable snapshot. | `IPC_SERVICE_VFSD`. |
 | `loaderd` | process spawn: ELF dynamic main+interpreter, PE32+ main + System32 import, Windows runtime broker 등록. 큰 image는 직렬 image build 전에 비동기로 staging합니다(loader ABI v4 begin/poll/cancel work, 명시적 launch lease). | `IPC_SERVICE_LOADERD`. |
-| Linux DVM | Linux driver lifecycle, DRM/KMS, evdev, virtio-net. | 고정 RDI3/ivshmem transport. |
+| Linux DVM | Linux driver lifecycle, DRM/KMS, evdev, virtio-net. | 고정 ivshmem 전송. 입력은 RDI1 버전 3. |
 | `devmgrd` | RustOS device namespace와 hotplug policy. | `IPC_SERVICE_DEVMGRD`. |
 | `inputd` | 인증된 DVM input을 Wayland와 console client로 route. | Wayland seat + console focus. |
 | `storaged` | 인증된 Linux DVM transport 위 generation-bound block policy. | DVM 기반 block API. |
@@ -92,12 +95,14 @@ transaction을 사용합니다.
 나머지 catalog-managed service와 app은 catalog에서 launch 됩니다.
 rootd/initd가 관리하는 bootstrap service는 UI readiness를 기다리지 않습니다. UI ready 뒤 runtimed의
 main loop가 catalog를 구성하며 desktop metadata와 runtime-launch policy는 별도
-cache를 사용하므로 서로 다른 registry가 뒤섞이지 않습니다.
+cache를 사용하므로 서로 다른 registry가 뒤섞이지 않습니다. rootd가 복구 중
+loaderd 등 의존 서비스의 준비를 기다릴 때는 재시작 예산을 차감하지 않고,
+실제 재시작 시도가 실패할 때만 차감합니다.
 
 ### Linux Driver Domain
 
 Linux module은 격리된 DVM에서만 실행합니다. RustOS는 keyboard/pointer를
-인증된 L0 소유 MSI-X input ring의 RDI3로 받고, display/network/block은 각각
+L0 소유 MSI-X 입력 링의 인증된 RDI1 버전 3 레코드로 받고, 화면·네트워크·블록은 각각
 검증된 고정 transport로 받습니다. 그 위의 정책은 `inputd`, `uiserver`, `netd`,
 `storaged`가 소유합니다. DVM transport가 없거나 검증에 실패하면 해당 장치는 사용할 수
 없으며, direct hardware·firmware display·RustOS module fallback은 없습니다.

@@ -67,7 +67,10 @@ markers from `inputd`. It does not inject input through QMP or the DVM virtio
 keyboard. Separate bounded DVM display, Ethernet, and read-only block relays
 are exercised by explicit KVM options (see [xtask API](api/xtask.md)). This
 virtual smoke is not proof of physical host-keyboard capture, hardware passthrough,
-production driver lifecycle, or data durability.
+production driver lifecycle, or data durability. To exercise pipes and eventfd
+inside the guest, run `cargo xtask kvm-smoke --timeout 75 --rustos-vcpus 1
+--local-fd-probe --dvm-block-shmem`. See the
+[dated validation record](validation/ring3-reliability-batch.md) for results and limits.
 
 <a id="korean"></a>
 
@@ -133,4 +136,7 @@ evdev relay로 소비하며 `inputd`의 keyboard 및 pointer ingress marker를 �
 QMP나 DVM virtio keyboard로 입력을 주입하지 않습니다. 화면·Ethernet·읽기 전용
 블록 relay는 별도 KVM 옵션으로 검증하며(참고: [xtask API](api/xtask.md)),
 이 가상 smoke가 물리 host keyboard capture, 하드웨어 passthrough, 상용
-드라이버 lifecycle 또는 데이터 내구성을 증명하지는 않습니다.
+드라이버 lifecycle 또는 데이터 내구성을 증명하지는 않습니다. 게스트의 파이프·eventfd는
+`cargo xtask kvm-smoke --timeout 75 --rustos-vcpus 1 --local-fd-probe --dvm-block-shmem`으로
+확인할 수 있습니다. 결과와 한계는 [검증 기록](validation/ring3-reliability-batch.md#korean)을
+참고하세요.

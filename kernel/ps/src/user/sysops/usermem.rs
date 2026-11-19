@@ -656,6 +656,15 @@ pub fn read_current_user_c_string(
     user_ptr: u64,
     max_len: usize,
 ) -> Result<alloc::string::String, paging::AddressSpaceError> {
+    read_current_user_c_string_bounded(user_ptr, max_len)?
+        .ok_or(paging::AddressSpaceError::AddressOverflow)
+}
+
+/// Returns `None` only if all admitted bytes were readable but none was NUL.
+pub fn read_current_user_c_string_bounded(
+    user_ptr: u64,
+    max_len: usize,
+) -> Result<Option<alloc::string::String>, paging::AddressSpaceError> {
     let max_pages = max_len.div_ceil(USER_PAGE_SIZE).saturating_add(1);
     for _ in 0..max_pages {
         let mut fault_ptr = None;
@@ -678,12 +687,12 @@ pub fn read_current_user_c_string(
                 }
                 if let Some(nul_index) = chunk[..chunk_len].iter().position(|byte| *byte == 0) {
                     bytes.extend_from_slice(&chunk[..nul_index]);
-                    return Ok(alloc::string::String::from_utf8_lossy(&bytes).into_owned());
+                    return Ok(Some(alloc::string::String::from_utf8_lossy(&bytes).into_owned()));
                 }
                 bytes.extend_from_slice(&chunk[..chunk_len]);
             }
 
-            Err(paging::AddressSpaceError::AddressOverflow)
+            Ok(None)
         });
         match result {
             Err(paging::AddressSpaceError::NotMapped) => {

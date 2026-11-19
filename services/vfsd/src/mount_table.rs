@@ -188,9 +188,17 @@ pub struct MountEntry {
     pub storage_epoch: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DataMountStatus {
+    NotConfigured,
+    Mounted,
+    Unavailable(i32),
+}
+
 pub struct MountTable {
     entries: Vec<MountEntry>,
     next_id: u64,
+    data_mount: DataMountStatus,
 }
 
 impl MountTable {
@@ -198,7 +206,18 @@ impl MountTable {
         Self {
             entries: Vec::new(),
             next_id: 1,
+            data_mount: DataMountStatus::NotConfigured,
         }
+    }
+
+    /// Preserve the optional mount's failure without denying access to `/`.
+    pub fn data_mount_error(&self, path: &str) -> Option<i32> {
+        if path == "/data" || path.starts_with("/data/") {
+            if let DataMountStatus::Unavailable(errno) = self.data_mount {
+                return Some(errno);
+            }
+        }
+        None
     }
 
     pub fn is_empty(&self) -> bool {
@@ -234,9 +253,9 @@ impl MountTable {
     /// subsequent `..` components. Missing final names are left for create.
     pub fn follow_symlinks(&self, abs_path: &str, follow_last: bool) -> Result<String, i32> {
         use alloc::collections::VecDeque;
-        use rustos_user_abi::syscall::VFS_IPC_PATH_CAPACITY;
-        if !abs_path.starts_with('/') || abs_path.len() > VFS_IPC_PATH_CAPACITY
-            || abs_path.bytes().any(|b| b == 0 || b == b'\\')
+        use crate::path::check_path_capacity;
+        check_path_capacity(abs_path.len())?;
+        if !abs_path.starts_with('/') || abs_path.bytes().any(|b| b == 0 || b == b'\\')
         {
             return Err(crate::EINVAL);
         }
@@ -253,7 +272,7 @@ impl MountTable {
             }
             if path.len() > 1 { path.push('/'); }
             path.push_str(&component);
-            if path.len() > VFS_IPC_PATH_CAPACITY { return Err(crate::EINVAL); }
+            check_path_capacity(path.len())?;
             let Some((entry, rel)) = self.resolve(&path) else { continue; };
             if !entry.volume.capabilities().supports_symlinks { continue; }
             match entry.volume.metadata(rel) {
@@ -371,8 +390,8 @@ impl MountTable {
         best
     }
 
-    /// Returns immediate child directory names of any submounts directly under `abs_dir`.
-    pub fn submount_names_at(&self, abs_dir: &str) -> Vec<&str> {
+    /// Returns immediate mount children, with identities stable over table edits.
+    pub fn submounts_at(&self, abs_dir: &str) -> Vec<(u64, &str)> {
         let mut names = Vec::new();
         for entry in &self.entries {
             if entry.mount_point == "/" {
@@ -388,11 +407,17 @@ impl MountTable {
             };
             if let Some(name) = child {
                 if !name.is_empty() && !name.contains('/') {
-                    names.push(name);
+                    names.push((entry.id, name));
                 }
             }
         }
+        names.sort_unstable_by_key(|(id, _)| *id);
         names
+    }
+
+    #[cfg(test)]
+    fn submount_names_at(&self, abs_dir: &str) -> Vec<&str> {
+        self.submounts_at(abs_dir).into_iter().map(|(_, name)| name).collect()
     }
 
     pub fn mount_fat_disk<D: BlockDevice + Send + 'static>(
@@ -414,10 +439,11 @@ impl MountTable {
         device_read_only: bool,
         storage_epoch: u64,
         wait: fn(),
-    ) -> Result<(), i32> {
+    ) -> Result<DataMountStatus, i32> {
         let total_blocks = shared_dev.block_count();
-        let partitions = detect_partitions(&mut shared_dev).unwrap_or_default();
+        let partitions = detect_partitions(&mut shared_dev).map_err(map_storage_error)?;
         let table = self;
+        let mut data = DataMountStatus::NotConfigured;
         if partitions.is_empty() {
             let slice =
                 BlockSlice::new(shared_dev, 0, total_blocks).map_err(map_storage_error)?;
@@ -447,16 +473,21 @@ impl MountTable {
             table.mount("/", vol0.clone(), Some(vol0), storage_epoch);
 
             let p1 = partitions[1];
-            if let Ok(slice1) = BlockSlice::new(shared_dev, p1.start_lba, p1.block_count) {
-                if let Ok(vol1) =
-                    FatVolume::new_with_wait_and_mode(slice1, wait, device_read_only)
-                {
-                    let vol1 = Arc::new(vol1);
-                    table.mount("/data", vol1.clone(), Some(vol1), storage_epoch);
+            let volume = BlockSlice::new(shared_dev, p1.start_lba, p1.block_count)
+                .map_err(map_storage_error)
+                .and_then(|slice| FatVolume::new_with_wait_and_mode(slice, wait, device_read_only)
+                    .map_err(map_fat_err_to_errno));
+            data = match volume {
+                Ok(volume) => {
+                    let volume = Arc::new(volume);
+                    table.mount("/data", volume.clone(), Some(volume), storage_epoch);
+                    DataMountStatus::Mounted
                 }
-            }
+                Err(errno) => DataMountStatus::Unavailable(errno),
+            };
         }
-        Ok(())
+        table.data_mount = data;
+        Ok(data)
     }
 }
 
@@ -661,6 +692,21 @@ mod tests {
 
         assert_eq!(table.submount_names_at("/"), alloc::vec!["data"]);
         assert!(table.submount_names_at("/data").is_empty());
+    }
+
+    #[test]
+    fn bad_secondary_fat_is_reported_without_losing_root_or_publishing_data() {
+        let mut disk = build_mbr_two_partition_disk(4096, 4096);
+        let data_boot_sector = (2048 + 4096) * 512;
+        disk.as_bytes_mut()[data_boot_sector..data_boot_sector + 512].fill(0);
+        let mut table = MountTable::new();
+        let status = table.mount_fat_disk_into(SharedBlockDevice::new(disk), false, 9, || {}).unwrap();
+        let DataMountStatus::Unavailable(errno) = status else { panic!("unexpected outcome: {status:?}"); };
+        assert!(table.has_root());
+        assert!(!table.submount_names_at("/").contains(&"data"));
+        assert_eq!(table.data_mount_error("/data"), Some(errno));
+        assert_eq!(table.data_mount_error("/data/home"), Some(errno));
+        assert_eq!(table.data_mount_error("/database"), None);
     }
 
     #[test]

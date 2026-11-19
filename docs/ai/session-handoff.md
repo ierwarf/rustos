@@ -1,8 +1,29 @@
-# Session Handoff — 2026-11-12
+# Session Handoff
 
 Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
+
+## VFS directory and mount follow-up
+
+- Replaced regenerated-list indexes with TmpFs directory-link cookies and FAT
+  stream positions. The same overlay merges namespace children for node,
+  path, and virtual directories. Checkpoint v3 rejects changed reply bytes on
+  replay and preserves cancellation; old nonzero directory cursors are stale.
+- VFS path admission/expansion distinguishes `ENAMETOOLONG` from syntax and
+  pointer errors; the 512-byte wire limit is unchanged. A configured but
+  failed `/data` mount reports its errno without hiding `/`.
+- Implementation references: Linux [`readdir(3)`](https://man7.org/linux/man-pages/man3/readdir.3.html),
+  [`path_resolution(7)`](https://man7.org/linux/man-pages/man7/path_resolution.7.html),
+  [tmpfs offsets](https://github.com/torvalds/linux/blob/v6.12/mm/shmem.c)
+  and [FAT directory offsets](https://github.com/torvalds/linux/blob/v6.12/fs/fat/dir.c).
+- Host tests: 2,289 passed, one ignored. The 1-vCPU compatibility probe
+  passed 494 checks on each of two boots with one persistent data disk,
+  including the new TmpFs/FAT deletion-and-resume, mount-overlay and path
+  errno cases. This is not evidence that Chromium ran. A corrupt secondary
+  volume is exercised in the host mount-table regression, not the guest
+  probe. The host tmpfs image placement was refused by QEMU's write alignment
+  check; a private image on the checkout filesystem passed both phases.
 
 ## Ring3 and non-core Ring0 batch (2026-11-18)
 
@@ -10,11 +31,17 @@ stable repository prefix; use [task router](task-router.md) for owner contracts.
   Follow-ups cover TCP `SO_ERROR` and connect retries, rootd dependency restart
   accounting, Wayland toplevel revival, pipe wakeup reads, tmpfs test isolation,
   realloc move coverage, and shared backing identity across directory rename.
-- Remaining VFS issues: `state_storage.rs::render_getdents_payload` derives
+- Landed as `615b115c` on `origin/master`. Workspace check, 1,862 host tests,
+  formal PR (45 artifacts), 1-vCPU local-fd smoke, and 8-vCPU GUI/input/network
+  smoke passed. Display readiness exceeded advisory deadlines. See the
+  [human-readable batch record](../validation/ring3-reliability-batch.md)
+  for exact scope and the host-only small-copy benchmark.
+- VFS issues at that revision (addressed in the follow-up above):
+  `state_storage.rs::render_getdents_payload` derives
   cookies from regenerated indexes (unlink before the cursor can skip an
   entry); `path.rs` returns EINVAL for over-capacity normalized paths; the
-  node-backed root listing does not use `MountTable::inject_mount_children`
-  and a failed FAT data mount leaves `/data` unavailable. Stable cookies need
+  node-backed listing bypassed mount-child merging, and a failed FAT data
+  mount left `/data` unavailable without a distinct admission result. Stable cookies need
   mutation and checkpoint-replay coverage; path errno and mount visibility
   need end-to-end tests. No Linux DVM appliance source was changed in this batch.
 

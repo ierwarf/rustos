@@ -1533,6 +1533,102 @@ static void fileops_extended(void) {
     case_end();
 }
 
+/* A 24-byte destination fits exactly one of our single-letter entries. */
+static int next_test_dirent(int fd, char *name, off_t *cookie) {
+    unsigned char bytes[24];
+    for (;;) {
+        long n = syscall(SYS_getdents64, fd, bytes, sizeof(bytes));
+        if (n <= 0) return (int)n;
+        uint16_t reclen;
+        int64_t offset;
+        if (n != sizeof(bytes)) return -1;
+        memcpy(&reclen, bytes + 16, sizeof(reclen));
+        memcpy(&offset, bytes + 8, sizeof(offset));
+        if (reclen != sizeof(bytes) || offset <= 0 || bytes[20] != 0) {
+            if (bytes[19] == '.' && bytes[20] == '.' && bytes[21] == 0) continue;
+            return -1;
+        }
+        if (bytes[19] == '.') continue;
+        *name = bytes[19];
+        *cookie = (off_t)offset;
+        return 1;
+    }
+}
+
+static void directory_cookie_mutation(const char *test, const char *path) {
+    case_begin(test);
+    CHECK(mkdir(path, 0700) == 0);
+    int fd = open(path, O_RDONLY | O_DIRECTORY);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        for (char name = 'a'; name <= 'd'; ++name) {
+            char entry[] = {name, 0};
+            int file = openat(fd, entry, O_WRONLY | O_CREAT | O_EXCL, 0600);
+            CHECK(file >= 0);
+            if (file >= 0) close(file);
+        }
+        char first = 0, second = 0, resumed = 0, replay = 0;
+        off_t first_cookie = 0, second_cookie = 0, after = 0;
+        CHECK(next_test_dirent(fd, &first, &first_cookie) == 1);
+        CHECK(next_test_dirent(fd, &second, &second_cookie) == 1);
+        CHECK(first != second && first != 0 && second != 0);
+        char removed[] = {first, 0};
+        CHECK(unlinkat(fd, removed, 0) == 0);
+        CHECK(next_test_dirent(fd, &resumed, &after) == 1);
+        CHECK(resumed != first && resumed != second && resumed != 0);
+        CHECK(lseek(fd, second_cookie, SEEK_SET) == second_cookie);
+        CHECK(next_test_dirent(fd, &replay, &after) == 1 && replay == resumed);
+        for (char name = 'a'; name <= 'd'; ++name) {
+            char entry[] = {name, 0};
+            if (name != first) CHECK(unlinkat(fd, entry, 0) == 0);
+        }
+        close(fd);
+    }
+    CHECK(rmdir(path) == 0);
+    case_end();
+}
+
+static bool dir_lists_once(const char *path, const char *name) {
+    DIR *d = opendir(path);
+    if (!d) return false;
+    int count = 0;
+    bool is_dir = false;
+    struct dirent *entry;
+    errno = 0;
+    while ((entry = readdir(d)) != NULL) {
+        if (strcmp(entry->d_name, name) == 0) {
+            ++count;
+            is_dir = entry->d_type == DT_DIR;
+        }
+    }
+    bool ok = errno == 0;
+    closedir(d);
+    return ok && count == 1 && is_dir;
+}
+
+static void directory_mount_overlay(void) {
+    case_begin("dir.mount-overlay");
+    CHECK(dir_lists_once("/", "data"));
+    CHECK(dir_lists_once("/", "tmp"));
+    CHECK(dir_lists_once("/dev", "shm"));
+    case_end();
+}
+
+static void overlong_path_errno(void) {
+    case_begin("dir.name-too-long");
+    char path[630];
+    memset(path, 'x', sizeof(path));
+    memcpy(path, "/tmp/", 5);
+    path[sizeof(path) - 1] = 0;
+    struct stat st;
+    errno = 0;
+    CHECK(stat(path, &st) == -1 && errno == ENAMETOOLONG);
+    path[5 + 256] = 0;
+    errno = 0;
+    CHECK(stat(path, &st) == -1 && errno == ENAMETOOLONG);
+    case_end();
+}
+
 /* ---- driver --------------------------------------------------------------------- */
 
 static void wait_for_data(void) {
@@ -1571,6 +1667,10 @@ int main(int argc, char **argv) {
     persist_check();
     data_dirs();
     data_atomic_write();
+    directory_cookie_mutation("dir.tmpfs-cookie", "/tmp/chromeprobe-cookies");
+    directory_cookie_mutation("dir.fat-cookie", "/data/chromeprobe/cookies");
+    directory_mount_overlay();
+    overlong_path_errno();
     posix_lock_suite("lock.posix-tmpfs", "/tmp/chromeprobe.plock");
     posix_lock_suite("lock.posix-data", "/data/chromeprobe/plock");
     lock_ofd();

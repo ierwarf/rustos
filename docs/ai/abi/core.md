@@ -362,7 +362,11 @@ only that same-process request may advance `RESULT_READY` to `COMPLETE`, and
 the original thread does not touch the borrowed supervisor state until the
 worker publishes `EXITED`. The worker receives no new capability and concurrent
 jobs fail closed; direct spawn and deferred checkpointing are not permitted
-substitutes.
+substitutes. A core restart deferred because a required service (including
+loaderd) is not ready reschedules with backoff without spending the dependent
+lease's restart budget. A real restart failure, including an EAGAIN returned
+by the restart operation, still spends a retry. A partially retired Job can
+also defer on EBUSY without charge, up to the 64-attempt retirement cap.
 
 | ID | Service | Capability (`ServiceCapability`) | Owns |
 |----|---------|----------------------------------|------|

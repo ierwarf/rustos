@@ -107,6 +107,9 @@ pub struct FsMetadata {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FsDirEntry {
+    /// Nonzero position in this directory's enumeration order. Removing an
+    /// earlier entry must not renumber the surviving entries.
+    pub cookie: u64,
     pub name: String,
     pub node_id: u64,
     pub kind: FsNodeKind,

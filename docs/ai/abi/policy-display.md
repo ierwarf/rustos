@@ -183,6 +183,16 @@ client commit can therefore wake the main loop before its runtime deadline.
 Runtime/QEMU evidence remains a release gate; source/model completion alone
 does not satisfy the 55 FPS gate.
 
+### TCP connect and pending errors
+
+An in-progress nonblocking TCP connect returns `EINPROGRESS`; a repeat while
+it is still pending returns `EALREADY`. The first repeat that collects a
+completed connect returns its result; a subsequent connect on an established
+socket returns `EISCONN`. `SO_ERROR` can collect the pending connect outcome;
+with no connect outcome pending it consumes an established TCP reset once,
+and the corresponding `POLLERR` clears. Network-transport KVM smoke is not an
+end-to-end test of these TCP edge cases; they have focused host regressions.
+
 ### IPv4 datagrams and external echo proof
 
 - `netd` owns IPv4 TCP, UDP (`SOCK_DGRAM`, protocol 0/17), and unprivileged

@@ -118,8 +118,8 @@ impl VfsState {
         path: &str,
         follow_last: bool,
     ) -> Result<String, i32> {
-        if path.is_empty() || path.len() > VFS_IPC_PATH_CAPACITY
-            || path.bytes().any(|b| b == 0 || b == b'\\')
+        vfsd::path::check_path_capacity(path.len())?;
+        if path.is_empty() || path.bytes().any(|b| b == 0 || b == b'\\')
         {
             return Err(EINVAL);
         }
@@ -154,7 +154,7 @@ impl VfsState {
             }
             if current.len() > 1 { current.push('/'); }
             current.push_str(&component);
-            if current.len() > VFS_IPC_PATH_CAPACITY { return Err(EINVAL); }
+            vfsd::path::check_path_capacity(current.len())?;
             let Some((entry, rel)) = storage.mounts.resolve(&current) else { continue; };
             if !entry.volume.capabilities().supports_symlinks { continue; }
             match entry.volume.metadata(rel) {
@@ -184,7 +184,8 @@ impl VfsState {
         base_remote_id: u64,
         path: &str,
     ) -> Result<String, i32> {
-        if path.is_empty() || path.len() > VFS_IPC_PATH_CAPACITY {
+        vfsd::path::check_path_capacity(path.len())?;
+        if path.is_empty() {
             return Err(EINVAL);
         }
         let base: &str = if path.starts_with('/') {
@@ -204,7 +205,8 @@ impl VfsState {
                     // The fast path must honour the same bound and NUL
                     // rejection as `normalize_absolute_path`; it skips the
                     // normalizer only because the path has no `.`/`..`.
-                    if path.len() + 1 > VFS_IPC_PATH_CAPACITY || path.as_bytes().iter().any(|&b| b == 0 || b == b'\\')
+                    vfsd::path::check_path_capacity(path.len() + 1)?;
+                    if path.as_bytes().iter().any(|&b| b == 0 || b == b'\\')
                     {
                         return Err(EINVAL);
                     }
@@ -1185,78 +1187,36 @@ impl VfsState {
         &mut self,
         id: u64,
         caller_pid: u64,
-        cursor: usize,
+        cursor: u64,
         user_len: usize,
         payload: &mut [u8],
-    ) -> Result<(usize, usize), i32> {
+    ) -> Result<(usize, u64), i32> {
         if user_len < 24 {
             return Err(EINVAL);
         }
-        let path = {
-            let Some(handle) = self.handles.get(&id) else {
-                return Err(EBADF);
-            };
-            if handle.kind != RemoteKind::Directory {
-                return Err(ENOTDIR);
-            }
-            if handle.node != 0 {
-                let entries = lock_vfs_storage().node_volume(handle.mount_id)?
-                    .read_dir_node(handle.node).map_err(vfsd::map_fs_error)?;
-                let limit = user_len.min(payload.len());
-                let mut written = 0usize;
-                let mut consumed = 0usize;
-                for (index, entry) in entries.into_iter().enumerate().skip(cursor) {
-                    let Some(len) = encode_dirent_into(&DirEntry::from_fs(entry), index + 1, &mut payload[written..limit]) else {
-                        if written == 0 { return Err(EINVAL); }
-                        break;
-                    };
-                    written += len;
-                    consumed += 1;
-                }
-                return Ok((written, consumed));
-            }
-            handle.path.clone()
+        let handle = self.handles.get(&id).ok_or(EBADF)?;
+        if handle.kind != RemoteKind::Directory {
+            return Err(ENOTDIR);
+        }
+        // Discover virtual inventory before entering the storage owner: the
+        // /dev inventory can make a synchronous call to devmgrd.
+        let virtual_entries = if handle.node == 0 {
+            virtual_dir_entries(&handle.path, caller_pid)?
+        } else {
+            None
         };
         let limit = user_len.min(payload.len());
-        let mut written = 0usize;
-        let mut consumed = 0usize;
-        let mut encode = |index: usize, entry: &DirEntry| -> Result<bool, i32> {
-            let Some(record_len) = encode_dirent_into(entry, index + 1, &mut payload[written..limit])
-            else {
-                if written == 0 {
-                    return Err(EINVAL);
-                }
-                return Ok(false);
+        let mut written = 0;
+        let mut next = cursor;
+        lock_vfs_storage().visit_directory(handle, virtual_entries, cursor, |cookie, entry| {
+            let Some(len) = encode_dirent_into(entry, cookie, &mut payload[written..limit]) else {
+                return if written == 0 { Err(EINVAL) } else { Ok(false) };
             };
-            written += record_len;
-            consumed += 1;
+            written += len;
+            next = cookie;
             Ok(true)
-        };
-        if let Some(Ok(
-            node @ (vfsd::proc_fs::ProcNode::PidDir
-            | vfsd::proc_fs::ProcNode::SelfLink
-            | vfsd::proc_fs::ProcNode::NsDir),
-        )) = vfsd::proc_fs::lookup(path.as_str(), caller_pid)
-        {
-            let entries = if node == vfsd::proc_fs::ProcNode::NsDir {
-                vfsd::proc_fs::ns_dir_entries()
-            } else {
-                vfsd::proc_fs::pid_dir_entries()
-            };
-            for (index, (name, d_type)) in entries.into_iter().enumerate().skip(cursor) {
-                let kind = match d_type {
-                    rustos_user_abi::procfs::DT_DIR => RemoteKind::Directory,
-                    rustos_user_abi::procfs::DT_LNK => RemoteKind::Symlink,
-                    _ => RemoteKind::File,
-                };
-                if !encode(index, &DirEntry::new(name, kind))? {
-                    break;
-                }
-            }
-        } else {
-            lock_vfs_storage().for_each_dir_entry_from(path.as_str(), cursor, encode)?;
-        }
-        Ok((written, consumed))
+        })?;
+        Ok((written, next))
     }
 }
 
@@ -1380,7 +1340,7 @@ impl VfsStorage {
             let storage_epoch = device.generation;
             let device_read_only = device.read_only;
             let shared_dev = SharedBlockDevice::new(device);
-            self.mounts
+            let data = self.mounts
                 .mount_fat_disk_into(
                     shared_dev,
                     device_read_only,
@@ -1392,6 +1352,9 @@ impl VfsStorage {
                         "vfsd: volume unavailable stage=fat-admission errno={errno}"
                     ));
                 })?;
+            if let vfsd::mount_table::DataMountStatus::Unavailable(errno) = data {
+                debug_line(&format!("vfsd: /data volume unavailable stage=fat-admission errno={errno}"));
+            }
             self.dvm_storage_epoch = storage_epoch;
         }
         Ok(())
@@ -1423,6 +1386,9 @@ impl VfsStorage {
         );
         if !on_tmpfs {
             self.ensure_mounted()?;
+        }
+        if let Some(errno) = self.mounts.data_mount_error(abs_path) {
+            return Err(errno);
         }
         let (entry, rel) = self.mounts.resolve(abs_path).ok_or(ENOENT)?;
         let caps = entry.volume.capabilities();
@@ -2480,150 +2446,143 @@ impl VfsStorage {
         self.metadata_cache.insert(key, result);
     }
 
-    fn for_each_dir_entry_from(
+    fn visit_directory(
         &mut self,
-        path: &str,
-        cursor: usize,
-        mut visit: impl FnMut(usize, &DirEntry) -> Result<bool, i32>,
+        handle: &RemoteHandle,
+        virtual_entries: Option<Vec<DirEntry>>,
+        cursor: u64,
+        visit: impl FnMut(u64, &DirEntry) -> Result<bool, i32>,
     ) -> Result<(), i32> {
+        use storage_core::fs::CasePolicy;
         self.ensure_tmpfs_mounts();
-        if path == "/dev" || path == "/dev/input" || path == "/dev/dri" {
-            let mut entries = devmgrd_dir_entries(path)?;
-            // Memory-filesystem mounts directly below this device directory
-            // (`/dev/shm`) are part of its listing.
-            for name in self.mounts.submount_names_at(path) {
-                if !entries.iter().any(|entry| entry.name == name) {
-                    entries.push(DirEntry::new(name, RemoteKind::Directory));
-                }
-            }
-            for (index, entry) in entries.iter().enumerate().skip(cursor) {
-                if !visit(index, entry)? {
-                    break;
-                }
-            }
-            return Ok(());
+        if let Some(entries) = virtual_entries {
+            return visit_directory_entries(
+                cursor, &self.directory_overlay(Some(&handle.path)), CasePolicy::Exact,
+                entries.iter().enumerate().map(|(i, entry)| (i as u64 + 1, entry)), visit,
+            );
         }
-        if path == "/proc" {
-            let proc_entries = [
-                ("filesystems", RemoteKind::File),
-                ("meminfo", RemoteKind::File),
-                ("mounts", RemoteKind::File),
-                ("self", RemoteKind::Symlink),
-                ("uptime", RemoteKind::File),
-            ];
-            for (index, (name, kind)) in proc_entries.iter().enumerate().skip(cursor) {
-                let entry = DirEntry::new(name, *kind);
-                if !visit(index, &entry)? {
-                    break;
-                }
-            }
-            return Ok(());
-        }
-        if let Some(children) = vfsd::proc_fs::sys_dir_children(path) {
-            for (index, name) in children.iter().enumerate().skip(cursor) {
-                let child_path = format!("{path}/{name}");
-                let kind = if vfsd::proc_fs::sys_virtual_file(child_path.as_str()).is_some() {
-                    RemoteKind::File
-                } else {
-                    RemoteKind::Directory
-                };
-                let entry = DirEntry::new(name, kind);
-                if !visit(index, &entry)? {
-                    break;
-                }
-            }
-            return Ok(());
-        }
-        if path.starts_with("/sys/") {
-            return Err(ENOENT);
+        if handle.node != 0 {
+            let mount = self.mounts.by_id(handle.mount_id).ok_or(ESTALE)?;
+            let path = match mount.volume.directory_path_node(handle.node) {
+                Ok(rel) if rel.is_empty() => Some(mount.mount_point.clone()),
+                Ok(rel) if mount.mount_point == "/" => Some(format!("/{rel}")),
+                Ok(rel) => Some(format!("{}/{rel}", mount.mount_point)),
+                // An open directory may be detached. Do not inject mounts
+                // using its former name (which can now refer to another node).
+                Err(storage_core::FsError::NotFound) => None,
+                Err(err) => return Err(vfsd::map_fs_error(err)),
+            };
+            let entries: Vec<_> = mount.volume.read_dir_node(handle.node)
+                .map_err(vfsd::map_fs_error)?.into_iter().map(DirEntry::from_fs).collect();
+            return visit_directory_entries(
+                cursor, &self.directory_overlay(path.as_deref()), mount.volume.capabilities().case_policy,
+                entries.iter().map(|entry| (entry.cookie, entry)), visit,
+            );
         }
         self.invalidate_caches_if_remounted();
-        let (mount_id, rel_path, key, _pk, caps, _imm, volume, _rms) = self.resolve_mount(path)?;
+        let (mount_id, rel_path, key, _pk, caps, _imm, volume, _rms) = self.resolve_mount(&handle.path)?;
+        let overlay = self.directory_overlay(Some(&handle.path));
         if caps.posix_nodes() {
-            // Memory filesystem: list live, uncached, sorted by name.
-            let entries = volume.read_dir(&rel_path).map_err(vfsd::map_fs_error)?;
-            for (index, entry) in entries.into_iter().enumerate().skip(cursor) {
-                if !visit(index, &DirEntry::from_fs(entry))? {
-                    break;
-                }
-            }
-            return Ok(());
+            let entries: Vec<_> = volume.read_dir(&rel_path).map_err(vfsd::map_fs_error)?
+                .into_iter().map(DirEntry::from_fs).collect();
+            return visit_directory_entries(
+                cursor, &overlay, caps.case_policy, entries.iter().map(|entry| (entry.cookie, entry)), visit,
+            );
         }
-        let mut base_index = 0usize;
-        // `run` and `tmp` are memory-filesystem submounts, listed below with
-        // the other mount points.
-        const ROOT_VIRTUAL: [(&str, RemoteKind); 3] = [
-            ("dev", RemoteKind::Directory),
-            ("proc", RemoteKind::Directory),
-            ("sys", RemoteKind::Directory),
-        ];
-        if path == "/" {
-            for (index, (name, kind)) in ROOT_VIRTUAL.iter().enumerate().skip(cursor) {
-                let entry = DirEntry::new(name, *kind);
-                if !visit(index, &entry)? {
-                    return Ok(());
-                }
-            }
-            base_index = ROOT_VIRTUAL.len();
-        }
-        let submounts: Vec<String> = self
-            .mounts
-            .submount_names_at(path)
-            .into_iter()
-            .map(String::from)
-            .collect();
-        for (offset, name) in submounts.iter().enumerate() {
-            let idx = base_index + offset;
-            if idx < cursor {
-                continue;
-            }
-            let entry = DirEntry::new(name.as_str(), RemoteKind::Directory);
-            if !visit(idx, &entry)? {
-                return Ok(());
-            }
-        }
-        base_index += submounts.len();
-
         if !self.dir_entries_cache.contains_key(&key) {
-            let fs_entries = volume.read_dir(&rel_path).map_err(vfsd::map_fs_error)?;
-            let resolved: Vec<DirEntry> = fs_entries.into_iter().map(DirEntry::from_fs).collect();
+            let resolved = volume.read_dir(&rel_path).map_err(vfsd::map_fs_error)?
+                .into_iter().map(DirEntry::from_fs).collect();
             if self.dir_entries_cache.len() >= vfsd::DIR_ENTRIES_CACHE_MAX_ENTRIES {
                 self.dir_entries_cache.clear();
             }
             self.dir_entries_cache.insert(key.clone(), resolved);
         }
         let cached = self.dir_entries_cache.get(&key).ok_or(EIO)?;
-        let name_matches = |a: &str, b: &str| match caps.case_policy {
-            storage_core::fs::CasePolicy::Exact => a == b,
-            storage_core::fs::CasePolicy::AsciiInsensitive
-            | storage_core::fs::CasePolicy::UnicodePreservingInsensitive => {
-                a.eq_ignore_ascii_case(b)
+        let hide_failed_data = handle.path == "/" && self.mounts.data_mount_error("/data").is_some();
+        let visible = cached.iter().filter(|entry| {
+            // A configured but failed data mount must not masquerade as a
+            // same-name placeholder on the read-only boot volume.
+            if hide_failed_data && entry.name.eq_ignore_ascii_case("data") {
+                return false;
             }
-        };
-        let visible: Vec<&DirEntry> = cached
-            .iter()
-            .filter(|entry| {
-                if path == "/"
-                    && (ROOT_VIRTUAL.iter().any(|(v, _)| name_matches(&entry.name, v))
-                        || submounts.iter().any(|s| name_matches(&entry.name, s)))
-                {
-                    return false;
-                }
-                let child_rel = if rel_path.is_empty() {
-                    entry.name.clone()
-                } else {
-                    format!("{rel_path}/{}", entry.name)
-                };
-                let child_key = cache_key_for_mount(mount_id, caps.case_policy, &child_rel);
-                !self.open_nodes.get(&child_key).is_some_and(|n| n.pending_unlink)
-            })
-            .collect();
-        let skip_vol = cursor.saturating_sub(base_index);
-        for (offset, entry) in visible.into_iter().enumerate().skip(skip_vol) {
-            if !visit(base_index + offset, entry)? {
-                break;
+            // Skip past cookies before constructing any path keys.
+            if vfsd::directory::backing_cookie(entry.cookie).is_none_or(|cookie| cookie <= cursor) {
+                return false;
             }
-        }
-        Ok(())
+            let child_rel = if rel_path.is_empty() { entry.name.clone() }
+                else { format!("{rel_path}/{}", entry.name) };
+            let child = cache_key_for_mount(mount_id, caps.case_policy, &child_rel);
+            !self.open_nodes.get(&child).is_some_and(|node| node.pending_unlink)
+        });
+        visit_directory_entries(cursor, &overlay, caps.case_policy,
+            visible.map(|entry| (entry.cookie, entry)), visit)
     }
+
+    fn directory_overlay(&self, path: Option<&str>) -> Vec<(u64, DirEntry)> {
+        let Some(path) = path else { return Vec::new() };
+        const ROOT_VIRTUAL: [&str; 3] = ["dev", "proc", "sys"];
+        let mut entries = Vec::new();
+        if path == "/" {
+            entries.extend(ROOT_VIRTUAL.iter().enumerate().map(|(i, name)|
+                (i as u64 + 1, DirEntry::new(name, RemoteKind::Directory))));
+        }
+        entries.extend(self.mounts.submounts_at(path).into_iter().filter_map(|(id, name)| {
+            if path == "/" && ROOT_VIRTUAL.contains(&name) { return None; }
+            let cookie = id.checked_add(ROOT_VIRTUAL.len() as u64)?;
+            (cookie < vfsd::directory::FILE_COOKIE_BASE)
+                .then(|| (cookie, DirEntry::new(name, RemoteKind::Directory)))
+        }));
+        entries
+    }
+}
+
+
+fn visit_directory_entries<'a>(
+    cursor: u64,
+    overlay: &'a [(u64, DirEntry)],
+    case_policy: storage_core::fs::CasePolicy,
+    entries: impl IntoIterator<Item = (u64, &'a DirEntry)>,
+    mut visit: impl FnMut(u64, &DirEntry) -> Result<bool, i32>,
+) -> Result<(), i32> {
+    let overlay: Vec<_> = overlay.iter().map(|(cookie, entry)| (*cookie, entry)).collect();
+    vfsd::directory::visit_merged(cursor, &overlay, entries, |a, b| match case_policy {
+        storage_core::fs::CasePolicy::Exact => a.name == b.name,
+        storage_core::fs::CasePolicy::AsciiInsensitive => a.name.eq_ignore_ascii_case(&b.name),
+        storage_core::fs::CasePolicy::UnicodePreservingInsensitive =>
+            a.name.eq_ignore_ascii_case(&b.name) || a.name.to_lowercase() == b.name.to_lowercase(),
+    }, |cookie, entry| visit(cookie, entry))
+}
+
+/// The virtual directories here and devmgrd's advertised device directory
+/// are fixed tables. Their slots are stable within a running image.
+fn virtual_dir_entries(path: &str, caller_pid: u64) -> Result<Option<Vec<DirEntry>>, i32> {
+    if matches!(path, "/dev" | "/dev/input" | "/dev/dri") {
+        return devmgrd_dir_entries(path).map(Some);
+    }
+    if path == "/proc" {
+        return Ok(Some(["filesystems", "meminfo", "mounts", "self", "uptime"].into_iter()
+            .map(|name| DirEntry::new(name, if name == "self" { RemoteKind::Symlink } else { RemoteKind::File }))
+            .collect()));
+    }
+    if let Some(Ok(node @ (vfsd::proc_fs::ProcNode::PidDir | vfsd::proc_fs::ProcNode::SelfLink
+        | vfsd::proc_fs::ProcNode::NsDir))) = vfsd::proc_fs::lookup(path, caller_pid)
+    {
+        let entries = if node == vfsd::proc_fs::ProcNode::NsDir { vfsd::proc_fs::ns_dir_entries() }
+            else { vfsd::proc_fs::pid_dir_entries() };
+        return Ok(Some(entries.into_iter().map(|(name, kind)| DirEntry::new(name, match kind {
+            rustos_user_abi::procfs::DT_DIR => RemoteKind::Directory,
+            rustos_user_abi::procfs::DT_LNK => RemoteKind::Symlink,
+            _ => RemoteKind::File,
+        })).collect()));
+    }
+    if let Some(children) = vfsd::proc_fs::sys_dir_children(path) {
+        return Ok(Some(children.iter().map(|name| {
+            let child = format!("{path}/{name}");
+            let kind = if vfsd::proc_fs::sys_virtual_file(&child).is_some() { RemoteKind::File }
+                else { RemoteKind::Directory };
+            DirEntry::new(name, kind)
+        }).collect()));
+    }
+    if path.starts_with("/sys/") { return Err(ENOENT); }
+    Ok(None)
 }

@@ -15,6 +15,16 @@ short; detailed design and API notes live in `docs/`.
 - Repository community files: license, contribution guide, security policy,
   code of conduct, issue templates, and pull request template.
 
+### Fixed
+
+- Directory enumeration uses stable TmpFs/FAT positions and merges mount
+  children consistently. Overlong VFS paths report `ENAMETOOLONG`; a failed
+  `/data` mount reports its own error without taking `/` offline.
+- Improved TCP connect and `SO_ERROR`, Unix socket shutdown, TmpFs shared-write
+  rollback and directory rename, service restart accounting, Wayland role
+  recreation, and blocking pipe reads. See the [batch changes, validation and
+  remaining limits](docs/validation/ring3-reliability-batch.md).
+
 ### Changed
 
 - Executable images larger than the old 128 MiB cap load through leased,
@@ -70,6 +80,16 @@ API 설명은 `docs/`에 둡니다.
   boot manager 생성
 - license, contribution guide, security policy, code of conduct, issue
   template, pull request template
+
+### 수정
+
+- TmpFs/FAT 디렉터리 열거는 항목이 삭제돼도 재개 위치가 밀리지 않고 마운트
+  항목을 일관되게 표시합니다. 긴 경로는 `ENAMETOOLONG`을 반환하며, `/data`
+  마운트 실패는 `/`를 유지하면서 별도 오류로 알립니다.
+- TCP 연결·`SO_ERROR`, Unix 소켓 종료, TmpFs 공유 쓰기 롤백과 디렉터리
+  이름 변경, 서비스 재시작 예산, Wayland 창 재생성, 블로킹 파이프 읽기를
+  수정했습니다. [변경 사항과 검증 범위](docs/validation/ring3-reliability-batch.md#korean)를
+  참고하세요.
 
 ### 변경
 

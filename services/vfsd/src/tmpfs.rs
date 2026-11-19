@@ -93,8 +93,14 @@ pub struct TmpFsConfig {
     pub clock: fn() -> FsTimestamp,
 }
 
+#[derive(Clone, Copy)]
+struct DirLink {
+    node: u64,
+    cookie: u64,
+}
+
 enum Body {
-    Dir(BTreeMap<String, u64>),
+    Dir(BTreeMap<String, DirLink>),
     File {
         len: u64,
         chunks: BTreeMap<u64, Box<[u8]>>,
@@ -132,14 +138,16 @@ struct Node {
 
 fn read_dir_locked(st: &State, ino: u64) -> Result<Vec<FsDirEntry>, FsError> {
     let mut out = Vec::new();
-    for (name, child) in st.dir(ino)? {
-        let meta = st.metadata_of(*child)?;
+    for (name, link) in st.dir(ino)? {
+        let meta = st.metadata_of(link.node)?;
         out.push(FsDirEntry {
-            name: name.clone(), node_id: *child, kind: meta.kind,
+            cookie: link.cookie,
+            name: name.clone(), node_id: link.node, kind: meta.kind,
             len: if meta.kind == FsNodeKind::Directory { 0 } else { meta.len },
             dos_attrs: 0,
         });
     }
+    out.sort_unstable_by_key(|entry| entry.cookie);
     Ok(out)
 }
 
@@ -173,6 +181,7 @@ impl Node {
 struct State {
     nodes: BTreeMap<u64, Node>,
     next_node: u64,
+    next_dir_cookie: u64,
     used_bytes: u64,
     quota_bytes: u64,
     max_inodes: u64,
@@ -211,14 +220,23 @@ fn check_name(name: &str) -> Result<(), FsError> {
 }
 
 impl State {
-    fn dir(&self, ino: u64) -> Result<&BTreeMap<String, u64>, FsError> {
+    fn next_dir_cookie(&mut self) -> Result<u64, FsError> {
+        let cookie = self.next_dir_cookie;
+        if cookie >= crate::directory::FILE_COOKIE_BASE {
+            return Err(FsError::NoSpace);
+        }
+        self.next_dir_cookie += 1;
+        Ok(cookie)
+    }
+
+    fn dir(&self, ino: u64) -> Result<&BTreeMap<String, DirLink>, FsError> {
         match &self.nodes.get(&ino).ok_or(FsError::NotFound)?.body {
             Body::Dir(entries) => Ok(entries),
             _ => Err(FsError::NotADirectory),
         }
     }
 
-    fn dir_mut(&mut self, ino: u64) -> Result<&mut BTreeMap<String, u64>, FsError> {
+    fn dir_mut(&mut self, ino: u64) -> Result<&mut BTreeMap<String, DirLink>, FsError> {
         match &mut self.nodes.get_mut(&ino).ok_or(FsError::NotFound)?.body {
             Body::Dir(entries) => Ok(entries),
             _ => Err(FsError::NotADirectory),
@@ -230,7 +248,7 @@ impl State {
     fn walk(&self, comps: &[&str]) -> Result<u64, FsError> {
         let mut cur = ROOT_NODE;
         for name in comps {
-            cur = *self.dir(cur)?.get(*name).ok_or(FsError::NotFound)?;
+            cur = self.dir(cur)?.get(*name).ok_or(FsError::NotFound)?.node;
         }
         Ok(cur)
     }
@@ -300,6 +318,7 @@ impl State {
         if let Body::Symlink(target) = &body {
             self.charge(target.len() as u64)?;
         }
+        let cookie = self.next_dir_cookie()?;
         let ino = self.next_node;
         self.next_node += 1;
         self.nodes.insert(
@@ -321,7 +340,7 @@ impl State {
                 shared: None,
             },
         );
-        self.dir_mut(parent)?.insert(String::from(name), ino);
+        self.dir_mut(parent)?.insert(String::from(name), DirLink { node: ino, cookie });
         let p = self.nodes.get_mut(&parent).ok_or(FsError::NotFound)?;
         if is_dir {
             p.nlink = p.nlink.saturating_add(1);
@@ -590,7 +609,7 @@ impl State {
 
     fn remove_entry(&mut self, path: &[&str], want_dir: bool, now: FsTimestamp) -> Result<(), FsError> {
         let (parent, name) = self.parent_of(path)?;
-        let child = *self.dir(parent)?.get(name).ok_or(FsError::NotFound)?;
+        let child = self.dir(parent)?.get(name).ok_or(FsError::NotFound)?.node;
         let is_dir = matches!(self.nodes.get(&child).ok_or(FsError::NotFound)?.body, Body::Dir(_));
         if want_dir {
             if !is_dir {
@@ -629,14 +648,15 @@ impl State {
             return Err(FsError::Busy);
         }
         let (sp, sname) = self.parent_of(src)?;
-        let sino = *self.dir(sp)?.get(sname).ok_or(FsError::NotFound)?;
+        let source = *self.dir(sp)?.get(sname).ok_or(FsError::NotFound)?;
+        let sino = source.node;
         let (dp, dname) = self.parent_of(dst)?;
         let src_is_dir = matches!(self.nodes.get(&sino).ok_or(FsError::NotFound)?.body, Body::Dir(_));
         if src_is_dir && self.is_descendant_or_self(dp, sino) {
             // Moving a directory below itself would detach it from the tree.
             return Err(FsError::InvalidInput);
         }
-        let existing = self.dir(dp)?.get(dname).copied();
+        let existing = self.dir(dp)?.get(dname).map(|link| link.node);
         if let Some(dino) = existing {
             if dino == sino {
                 // Same node (same path, or two hard links): POSIX no-op.
@@ -658,7 +678,9 @@ impl State {
                 _ => {}
             }
         }
-        // All checks passed: the mutation below cannot fail.
+        // Keep the position for same-directory renames. A cross-directory
+        // move is a new entry in the destination's enumeration order.
+        let cookie = if sp == dp { source.cookie } else { self.next_dir_cookie()? };
         if let Some(dino) = existing {
             let dst_is_dir = matches!(self.nodes[&dino].body, Body::Dir(_));
             self.dir_mut(dp)?.remove(dname);
@@ -671,7 +693,7 @@ impl State {
             node.ctime = now;
         }
         self.dir_mut(sp)?.remove(sname);
-        self.dir_mut(dp)?.insert(String::from(dname), sino);
+        self.dir_mut(dp)?.insert(String::from(dname), DirLink { node: sino, cookie });
         if src_is_dir && sp != dp {
             let s = self.nodes.get_mut(&sp).ok_or(FsError::NotFound)?;
             s.nlink = s.nlink.saturating_sub(1);
@@ -722,6 +744,7 @@ impl TmpFs {
             state: Mutex::new(State {
                 nodes,
                 next_node: ROOT_NODE + 1,
+                next_dir_cookie: 1,
                 used_bytes: 0,
                 quota_bytes: config.quota_bytes,
                 max_inodes: config.max_inodes.max(1),
@@ -867,7 +890,7 @@ impl FsVolume for TmpFs {
             ROOT_NODE
         } else {
             let (parent, name) = st.parent_of(&comps)?;
-            match st.dir(parent)?.get(name).copied() {
+            match st.dir(parent)?.get(name).map(|link| link.node) {
                 Some(existing) => {
                     if opts.create_new {
                         return Err(FsError::AlreadyExists);
@@ -1366,6 +1389,7 @@ fn link_node_locked(
     if st.dir(parent)?.contains_key(name) {
         return Err(FsError::AlreadyExists);
     }
+    let cookie = st.next_dir_cookie()?;
     let node = st.nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
     // A nameless inode may only receive its first name when it is an
     // `O_TMPFILE`; an ordinary file unlinked while open is gone (`ENOENT`).
@@ -1375,7 +1399,7 @@ fn link_node_locked(
     node.nlink = node.nlink.checked_add(1).ok_or(FsError::TooBig)?;
     node.linkable = false;
     node.ctime = now;
-    st.dir_mut(parent)?.insert(String::from(name), ino);
+    st.dir_mut(parent)?.insert(String::from(name), DirLink { node: ino, cookie });
     st.nodes.get_mut(&parent).ok_or(FsError::NotFound)?.touch_modify(now);
     Ok(())
 }
@@ -1787,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn read_dir_lists_sorted_kinds() {
+    fn read_dir_lists_kinds_in_cookie_order() {
         let fs = fs();
         fs.mkdir("d").unwrap();
         put(&fs, "b", b"12");
@@ -1798,8 +1822,8 @@ mod tests {
         assert_eq!(
             view,
             [
-                ("b", FsNodeKind::File),
                 ("d", FsNodeKind::Directory),
+                ("b", FsNodeKind::File),
                 ("l", FsNodeKind::Symlink),
                 ("s", FsNodeKind::Socket)
             ]
@@ -2738,6 +2762,27 @@ mod tests {
         assert_eq!(store.ensure_shared(new.clone(), "new", &vol, fake_factory, true, 1).unwrap(), source);
         store.rename(&new, new.clone(), String::from("new"));
         assert_eq!(store.ensure_shared(new, "new", &vol, fake_factory, true, 1).unwrap(), source);
+    }
+
+    #[test]
+    fn directory_cookies_follow_names_without_renumbering_survivors() {
+        let fs = fs();
+        fs.mkdir("dir").unwrap();
+        fs.mkdir("other").unwrap();
+        put(&fs, "dir/z", b"1");
+        let inode = put(&fs, "dir/a", b"2");
+        fs.link_node(inode, "dir/hardlink").unwrap();
+        let original = fs.read_dir("dir").unwrap();
+        assert_eq!(original.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["z", "a", "hardlink"]);
+        assert_ne!(original[1].cookie, original[2].cookie);
+        assert_eq!(original[1].node_id, original[2].node_id);
+        fs.unlink("dir/z").unwrap();
+        fs.rename("dir/a", "dir/b", false, false).unwrap();
+        fs.rename("dir/hardlink", "other/moved", false, false).unwrap();
+        let resumed = fs.read_dir("dir").unwrap();
+        assert_eq!(resumed[0].name, "b");
+        assert_eq!(resumed[0].cookie, original[1].cookie);
+        assert!(fs.read_dir("other").unwrap()[0].cookie > original[2].cookie);
     }
 
     #[test]

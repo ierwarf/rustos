@@ -62,7 +62,7 @@
   `health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream` handshake using a launch-assigned,
   process-scoped, non-reserved KVM vsock CID (derived by `guest_cid_for_process`).
   L0 then attaches as the fixed ivshmem peer 1 only after
-  RustOS has claimed peer 0, writes only fixed RDI3 session/key/pointer frames
+  RustOS has claimed peer 0, writes only fixed RDI1 version-3 session/key/pointer records
   into the host-owned 128 KiB input ring, and signals the one RustOS MSI-X
   eventfd at most once per inputd-published consumer wake generation; QMP is
   not launched and the DVM never maps that aperture. The DVM
@@ -106,7 +106,7 @@
   gap/age, exact logical/presented cursor agreement, and at least 96 pixels of
   travel on both axes. An absent or dropped sample fails the gate. No QMP
   socket, host-to-DVM input RPC, or production default path is added.
-- `agent-v1-control` remains DVM-to-L0 only. The RDI3 input ring is a bounded
+- `agent-v1-control` remains DVM-to-L0 only. The RDI1 version-3 input ring is a bounded
   L0-to-RustOS relay, not a general vsock endpoint or a NIC/block/GPU data
   plane. L0 limits event rate, emits held-key/button releases on disconnect,
   and sends a session end so reconnects cannot inherit input state. RustOS

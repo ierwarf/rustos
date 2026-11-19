@@ -311,6 +311,7 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
             let canon = append_canonical(&parent_canon, &name);
             let is_dir = entry.is_dir();
             entries.push(FsDirEntry {
+                cookie: entry.dir_stream_end(),
                 name,
                 node_id: node_id_for_canonical(&canon),
                 kind: if is_dir {

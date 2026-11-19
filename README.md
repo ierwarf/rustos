@@ -117,6 +117,9 @@ storage passthrough, host input capture, or commercial release readiness.
 
 ### Documentation
 
+See the [Ring 3 reliability batch](docs/validation/ring3-reliability-batch.md)
+for the changes, test results, and remaining compatibility limits at `615b115c`.
+
 A good reading order is:
 
 1. [Getting Started](docs/getting-started.md)
@@ -236,6 +239,9 @@ readiness를, 선택적 KVM 플래그는 각 relay 경로를 검증합니다. �
 | Public release artifacts | 예정 |
 
 ### 문서
+
+`615b115c`의 변경 사항, 검증 결과 및 남은 호환성 한계는
+[Ring 3 안정성 개선 기록](docs/validation/ring3-reliability-batch.md#korean)을 참고하세요.
 
 추천 읽기 순서:
 

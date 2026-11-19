@@ -38,6 +38,10 @@
 - [Paths](reference/paths.md)
 - [Environment Variables](reference/env.md)
 
+# Validation
+
+- [Ring 3 and non-core Ring 0 reliability batch](validation/ring3-reliability-batch.md)
+
 # AI Agent Reference
 
 - [AI Map](ai-map.md)

@@ -188,7 +188,7 @@ pub(super) fn write_vfs_payload_bytes(response: &mut VfsIpcResponse, bytes: &[u8
 
 pub(super) fn encode_dirent_into(
     entry: &DirEntry,
-    next_offset: usize,
+    next_offset: u64,
     dest: &mut [u8],
 ) -> Option<usize> {
     let base_len = 19 + entry.name.len() + 1;
