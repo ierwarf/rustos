@@ -66,6 +66,7 @@ pub(super) fn recv_message(
     }
     connected.recv_drain_handoff_armed = true;
     Ok(SocketReceive {
+        sender: Some(segment.sender),
         record_present: true,
         read,
         control,

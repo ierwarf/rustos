@@ -421,23 +421,34 @@ fn append_dvm_block_doorbell(command: &mut Command, socket_path: &Path) {
         .arg("ivshmem-doorbell,vectors=1,chardev=dvm-block-doorbell");
 }
 
+/// The storage DVM's virtual disk frontend: one paravirtual `virtio-blk-pci`
+/// function, which is the DVM's only admitted storage controller, presenting
+/// exactly the declared storage geometry (`DVM_STORAGE_*_BLOCK_BYTES`) that the
+/// signed transport header carries. virtio-blk keeps up to a queue's worth of
+/// commands in flight, unlike the former emulated ATAPI frontend that executed
+/// one command at a time. The Linux relay classifies the function from the
+/// guest kernel's own PCI/virtio identity and reads the geometry back from the
+/// kernel, so nothing in the relay or RustOS depends on this harness choice.
+fn dvm_storage_device_arg() -> String {
+    format!(
+        "virtio-blk-pci,drive=dvm-storage-disk,id=dvm-storage-disk-device,logical_block_size={DVM_STORAGE_LOGICAL_BLOCK_BYTES},physical_block_size={DVM_STORAGE_PHYSICAL_BLOCK_BYTES}"
+    )
+}
+
 fn append_dvm_virtual_storage(command: &mut Command, disk: &Path) {
     command
         .arg("-drive")
+        // `readonly=on` is the L0 end of read-only enforcement: QEMU opens the
+        // backing file read-only and virtio-blk advertises VIRTIO_BLK_F_RO, so
+        // Linux marks the disk read-only (`BLKROGET`). The signed header's
+        // READ_ONLY flag must agree, and the relay then never opens the device
+        // writable and refuses every mutation request.
         .arg(format!(
             "file={},format=raw,if=none,id=dvm-storage-disk,cache=none,aio=threads,readonly=on",
             disk.display()
         ))
         .arg("-device")
-        // q35 already owns exactly one ICH9 AHCI controller. Attach the
-        // private namespace to that controller instead of adding a second
-        // NVMe controller, which would correctly fail the storage DVM's
-        // exact-single-controller admission. QEMU's non-removable ide-hd
-        // frontend rejects a read-only block node; ide-cd is the AHCI
-        // frontend that advertises immutable media to Linux. ATAPI fixes the
-        // media block size at 2048 bytes; the signed header uses that same
-        // constant while capacity remains in protocol 512-byte sectors.
-        .arg("ide-cd,drive=dvm-storage-disk,bus=ide.0,unit=0,id=dvm-storage-disk-device");
+        .arg(dvm_storage_device_arg());
 }
 
 fn append_dvm_display_pixels(command: &mut Command, path: &Path, read_only: bool) {
@@ -471,7 +482,7 @@ fn append_dvm_writable_virtual_storage(command: &mut Command, disk: &Path) {
             disk.display()
         ))
         .arg("-device")
-        .arg("ide-hd,drive=dvm-storage-disk,bus=ide.0,unit=0,id=dvm-storage-disk-device");
+        .arg(dvm_storage_device_arg());
 }
 
 /// Both guests need write access; only the first QEMU preallocates the backing.

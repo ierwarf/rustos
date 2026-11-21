@@ -36,14 +36,20 @@ mod rewrite_epoch;
 pub(super) use fork_hold::with_fork_held_regions;
 use rewrite_epoch::{RangeRewrite, read_rewrite_epoch};
 
-/// Ring0's per-process pager VMA table, taken from the shared ABI.
+/// Hard per-process directory ceiling for pager VMAs, taken from the shared ABI.
 ///
-/// This used to be a private `64` with no declared relationship to pagerd's
-/// region table, so the two capacities could drift apart silently and nothing
-/// said what the safe relation between them was. `PAGER_MIN_FULLY_TRACKED_PROCESSES`
-/// in the ABI is that relation, and it is only meaningful if both replicas
-/// read the same constant.
+/// This used to size a fixed preallocated array per process (`64` -> `256`).
+/// Each process's VMA slots now grow lazily in `VMA_SLOT_CHUNK`-slot chunks up
+/// to this directory ceiling (narrowed by Ring3 policy `ceiling`), while
+/// `PAGER_MIN_FULLY_TRACKED_PROCESSES` in the ABI remains the cross-process
+/// relation with pagerd.
 const MAX_PAGER_VMAS_PER_PROCESS: usize = PAGER_MAX_VMAS_PER_PROCESS;
+const VMA_SLOT_CHUNK: usize = crate::multitask::slot_dir::SLOT_CHUNK;
+const VMA_SLOT_DIR: usize = crate::multitask::slot_dir::SLOT_DIR;
+const _: () = assert!(
+    VMA_SLOT_CHUNK * VMA_SLOT_DIR == MAX_PAGER_VMAS_PER_PROCESS,
+    "chunked per-process VMA directory must match the ABI per-process ceiling"
+);
 const MAX_PUBLICATION_SEQUENCE: u64 = u64::MAX - 3;
 
 /// The exact process and MM incarnation a caller captured before it asked
@@ -470,17 +476,86 @@ impl Drop for PagerFaultInstallPermit {
 
 #[expect(
     clippy::declare_interior_mutable_const,
-    reason = "array initializer for fixed all-atomic VMA publications"
+    reason = "initializer for lazily allocated all-atomic VMA slot chunks"
 )]
 const EMPTY_PAGER_VMA: PublishedPagerVma = PublishedPagerVma::empty();
 
-/// One process's publication slots. Boxed per chunk of processes, never freed.
-struct ProcessVmaTable([PublishedPagerVma; MAX_PAGER_VMAS_PER_PROCESS]);
+type VmaChunkBox = alloc::boxed::Box<[PublishedPagerVma]>;
+
+fn build_default_vma_chunk() -> Option<VmaChunkBox> {
+    AtomicDir::<PublishedPagerVma, VMA_SLOT_CHUNK, VMA_SLOT_DIR>::build_chunk(|| EMPTY_PAGER_VMA)
+}
+
+/// One process's chunked publication slots.
+///
+/// Starts with zero allocated slot chunks; normal-context writers append
+/// `VMA_SLOT_CHUNK`-slot chunks on demand up to the effective policy/directory
+/// ceiling, and chunks are never moved or freed so exception-time readers scan
+/// and borrow `&'static PublishedPagerVma` without allocating or locking.
+struct ProcessVmaTable {
+    slots: AtomicDir<PublishedPagerVma, VMA_SLOT_CHUNK, VMA_SLOT_DIR>,
+}
+
 impl ProcessVmaTable {
-    fn empty() -> Self {
-        Self([EMPTY_PAGER_VMA; MAX_PAGER_VMAS_PER_PROCESS])
+    const fn empty() -> Self {
+        Self {
+            slots: AtomicDir::new(),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.slots.contiguous_chunks() * VMA_SLOT_CHUNK
+    }
+
+    fn get(&self, index: usize) -> Option<&PublishedPagerVma> {
+        self.slots.get(index)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &PublishedPagerVma> + '_ {
+        self.slots.iter_contiguous()
+    }
+
+    /// Allocates and appends `count` slot chunks atomically with respect to
+    /// OOM and directory bounds. On failure, zero chunks are published.
+    fn append_chunks_with(
+        &self,
+        count: usize,
+        mut build: impl FnMut() -> Option<VmaChunkBox>,
+    ) -> Result<usize, PagerVmaError> {
+        if count == 0 {
+            return Ok(self.capacity());
+        }
+        let base_chunk = self.slots.contiguous_chunks();
+        let Some(end_chunk) = base_chunk.checked_add(count) else {
+            return Err(PagerVmaError::Pressure);
+        };
+        if end_chunk > VMA_SLOT_DIR {
+            return Err(PagerVmaError::Pressure);
+        }
+        let mut built = Vec::new();
+        built
+            .try_reserve_exact(count)
+            .map_err(|_| PagerVmaError::Pressure)?;
+        for _ in 0..count {
+            let chunk = build().ok_or(PagerVmaError::Pressure)?;
+            built.push(chunk);
+        }
+        for (offset, chunk) in built.into_iter().enumerate() {
+            if self.slots.publish_chunk(base_chunk + offset, chunk).is_err() {
+                return Err(PagerVmaError::Pressure);
+            }
+        }
+        Ok(base_chunk * VMA_SLOT_CHUNK)
     }
 }
+
+impl core::ops::Index<usize> for ProcessVmaTable {
+    type Output = PublishedPagerVma;
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.slots[index]
+    }
+}
+
 static PAGER_VMAS: AtomicDir<ProcessVmaTable> = AtomicDir::new();
 type PagerVmaWriterLock = TrackedSpinLock<(), { LockClass::PagerVmaPublication as u8 }>;
 /// One publication writer lock **per process**, not one for the system.
@@ -493,7 +568,7 @@ type PagerVmaWriterLock = TrackedSpinLock<(), { LockClass::PagerVmaPublication a
 /// installer would stall unrelated processes' `mmap`.
 ///
 /// Per-process is sound because the publication tables are already disjoint:
-/// `process_slots` hands each process its own slice, and the only shared state
+/// `process_slots` hands each process its own table, and the only shared state
 /// a writer touches is `NEXT_ANON_OBJECT_SLOT`, which is a standalone atomic.
 #[expect(
     clippy::declare_interior_mutable_const,
@@ -521,8 +596,8 @@ fn writer_lock(handle: ProcessHandle) -> Option<&'static PagerVmaWriterLock> {
     PAGER_VMA_WRITERS.get(handle.index())
 }
 
-fn process_slots(handle: ProcessHandle) -> Option<&'static [PublishedPagerVma]> {
-    PAGER_VMAS.get(handle.index()).map(|table| table.0.as_slice())
+fn process_slots(handle: ProcessHandle) -> Option<&'static ProcessVmaTable> {
+    PAGER_VMAS.get(handle.index())
 }
 
 fn template_is_canonical(region: PagerVmRegionWire) -> bool {
@@ -613,13 +688,25 @@ fn merge_adjacent_regions(regions: &mut Vec<PagerVmRegionWire>) {
 /// Publishes one region, refusing beyond `ceiling` live regions.
 ///
 /// `ceiling` is policy and arrives from the caller; this table only enforces
-/// it. It may narrow `MAX_PAGER_VMAS_PER_PROCESS`, which is the fixed array
-/// size, and is clamped to it here so a caller cannot widen a fixed table.
+/// it and clamps to `MAX_PAGER_VMAS_PER_PROCESS` (the directory ceiling).
+/// When all currently allocated chunks are full and `live < ceiling`, one
+/// additional chunk is allocated before publishing; on policy limit or OOM,
+/// existing mappings are left untouched.
 pub(super) fn publish(
     handle: ProcessHandle,
     identity: ProcessIdentity,
     template: PagerVmRegionWire,
     ceiling: usize,
+) -> Result<PagerVmRegionWire, PagerVmaError> {
+    publish_with_builder(handle, identity, template, ceiling, build_default_vma_chunk)
+}
+
+fn publish_with_builder(
+    handle: ProcessHandle,
+    identity: ProcessIdentity,
+    template: PagerVmRegionWire,
+    ceiling: usize,
+    build: fn() -> Option<VmaChunkBox>,
 ) -> Result<PagerVmRegionWire, PagerVmaError> {
     if handle.generation() != identity.process_generation() {
         return Err(PagerVmaError::Stale);
@@ -634,32 +721,43 @@ pub(super) fn publish(
     let process_generation = u64::from(identity.process_generation());
     let mm_generation = u64::from(identity.mm_generation());
     let mut live = 0_usize;
-    for slot in slots {
-        if let Some(existing) = slot.snapshot()? {
-            if existing.process_handle != process.slot()
-                || existing.process_generation != process_generation
-                || existing.mm_generation != mm_generation
-            {
-                // A reaped process slot or completed exec may leave an old
-                // generation in this fixed publication array. The writer lock
-                // and installer drain make reclamation exact before this slot
-                // can be reused by the new live identity.
-                slot.publish(None)?;
-                continue;
+    let mut free_slot: Option<&PublishedPagerVma> = None;
+    for slot in slots.iter() {
+        let Some(existing) = slot.snapshot()? else {
+            if free_slot.is_none() {
+                free_slot = Some(slot);
             }
-            if template.start < existing.end && existing.start < template.end {
-                return Err(PagerVmaError::Overlap);
+            continue;
+        };
+        if existing.process_handle != process.slot()
+            || existing.process_generation != process_generation
+            || existing.mm_generation != mm_generation
+        {
+            // A reaped process slot or completed exec may leave an old
+            // generation in this table. The writer lock and installer drain
+            // make reclamation exact before this slot can be reused by the new
+            // live identity.
+            slot.publish(None)?;
+            if free_slot.is_none() {
+                free_slot = Some(slot);
             }
-            live += 1;
+            continue;
         }
+        if template.start < existing.end && existing.start < template.end {
+            return Err(PagerVmaError::Overlap);
+        }
+        live += 1;
     }
     if live >= ceiling {
         return Err(PagerVmaError::Pressure);
     }
-    let slot = slots
-        .iter()
-        .find(|slot| matches!(slot.snapshot(), Ok(None)))
-        .ok_or(PagerVmaError::Pressure)?;
+    let slot = match free_slot {
+        Some(slot) => slot,
+        None => {
+            let first_new_slot = slots.append_chunks_with(1, build)?;
+            slots.get(first_new_slot).ok_or(PagerVmaError::Pressure)?
+        }
+    };
     let sequence = slot.sequence.load(Ordering::Relaxed);
     let generation = sequence
         .checked_div(2)
@@ -911,6 +1009,10 @@ pub fn with_validated_fault_address_space<R>(
 /// Rewrites one fully pager-managed range while preserving only attenuated
 /// authority. The original publications are withdrawn before `mutate` changes
 /// any PTE, so exception-time readers fail closed throughout the transaction.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal range-edit core parameterized by policy ceiling and chunk builder"
+)]
 fn rewrite_range<F>(
     handle: ProcessHandle,
     identity: ProcessIdentity,
@@ -918,6 +1020,8 @@ fn rewrite_range<F>(
     end: u64,
     replacement_prot: Option<u32>,
     replacement_commit_state: Option<u16>,
+    ceiling: usize,
+    build: fn() -> Option<VmaChunkBox>,
     mutate: F,
 ) -> Result<bool, PagerVmaError>
 where
@@ -944,17 +1048,10 @@ where
     if handle.generation() != identity.process_generation() {
         return Err(PagerVmaError::Stale);
     }
+    let ceiling = ceiling.min(MAX_PAGER_VMAS_PER_PROCESS);
 
-    // Sized exactly, on the heap, because these buffers scale with the VMA
-    // table and the syscall stack does not.
-    //
-    // They used to be `[PagerVmRegionWire; MAX_PAGER_VMAS_PER_PROCESS]`-shaped
-    // arrays: ~22 KiB of a 64 KiB syscall stack at 64 slots, and ~44 KiB at
-    // 128 - which is what made the per-process VMA table unable to grow, and
-    // that table filling is what turned an `mprotect(PROT_NONE)` guard page
-    // into `ENOMEM`. The cheap extent filter below sizes one exact allocation
-    // instead, so the common edit - one `mprotect` inside one region -
-    // reserves a single entry rather than the whole table.
+    // Sized to the process's currently allocated slot chunks on the heap,
+    // because these buffers scale with live chunks and the syscall stack does not.
     let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
     let candidates = slots
@@ -964,34 +1061,37 @@ where
     if candidates == 0 {
         return Ok(false);
     }
+    let allocated_slots = slots.capacity();
     let mut overlapping: Vec<(usize, PagerVmRegionWire)> = Vec::new();
     overlapping
         .try_reserve_exact(candidates)
         .map_err(|_| PagerVmaError::Pressure)?;
     let mut empty_slots: Vec<usize> = Vec::new();
     empty_slots
-        .try_reserve_exact(slots.len())
+        .try_reserve_exact(allocated_slots)
         .map_err(|_| PagerVmaError::Pressure)?;
     let live_process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
+    let mut live_total = 0_usize;
     for (slot_index, slot) in slots.iter().enumerate() {
         match slot.snapshot()? {
             // A completed exec or a reaped process slot leaves the previous
-            // incarnation's regions in this fixed array, and a new image maps
-            // the same addresses again. Such a region carries no authority for
-            // this identity, so it is not part of the range being rewritten;
-            // reclaim it exactly as `publish` does under the same writer lock.
+            // incarnation's regions in this table, and a new image maps the
+            // same addresses again. Such a region carries no authority for this
+            // identity, so it is not part of the range being rewritten; reclaim
+            // it exactly as `publish` does under the same writer lock.
             Some(region) if !region_matches_identity(region, live_process.slot(), identity) => {
                 slot.publish(None)?;
                 empty_slots.push(slot_index);
             }
-            Some(region)
+            Some(region) => {
+                live_total += 1;
                 if start < region.end && region.start < end
                     || region.end == start
-                    || region.start == end =>
-            {
-                overlapping.push((slot_index, region));
+                    || region.start == end
+                {
+                    overlapping.push((slot_index, region));
+                }
             }
-            Some(_) => {}
             None => empty_slots.push(slot_index),
         }
     }
@@ -1086,12 +1186,27 @@ where
         rewritten_len <= overlapping_len + maximum_growth,
         "one range edit may add at most one interior split's fragments"
     );
-    if (!removing && cursor < end) || rewritten_len > overlapping_len + empty_len {
-        return Err(if !removing && cursor < end {
-            PagerVmaError::Stale
-        } else {
-            PagerVmaError::Pressure
-        });
+    if !removing && cursor < end {
+        return Err(PagerVmaError::Stale);
+    }
+    let new_live = live_total
+        .checked_sub(overlapping_len)
+        .and_then(|rest| rest.checked_add(rewritten_len))
+        .ok_or(PagerVmaError::Pressure)?;
+    if rewritten_len > overlapping_len && new_live > ceiling {
+        return Err(PagerVmaError::Pressure);
+    }
+    let available = overlapping_len + empty_len;
+    if rewritten_len > available {
+        let needed_extra = rewritten_len - available;
+        let needed_chunks = needed_extra.div_ceil(VMA_SLOT_CHUNK);
+        empty_slots
+            .try_reserve_exact(needed_chunks * VMA_SLOT_CHUNK)
+            .map_err(|_| PagerVmaError::Pressure)?;
+        let first_new_slot = slots.append_chunks_with(needed_chunks, build)?;
+        for offset in 0..(needed_chunks * VMA_SLOT_CHUNK) {
+            empty_slots.push(first_new_slot + offset);
+        }
     }
 
     let mut targets: Vec<usize> = Vec::new();
@@ -1159,7 +1274,42 @@ pub(super) fn rewrite_attenuated_range<F>(
 where
     F: FnOnce() -> Result<(), PagerVmaError>,
 {
-    rewrite_range(handle, identity, start, end, replacement_prot, None, mutate)
+    rewrite_range(
+        handle,
+        identity,
+        start,
+        end,
+        replacement_prot,
+        None,
+        MAX_PAGER_VMAS_PER_PROCESS,
+        build_default_vma_chunk,
+        mutate,
+    )
+}
+
+pub(super) fn rewrite_attenuated_range_with_ceiling<F>(
+    handle: ProcessHandle,
+    identity: ProcessIdentity,
+    start: u64,
+    end: u64,
+    replacement_prot: Option<u32>,
+    ceiling: usize,
+    mutate: F,
+) -> Result<bool, PagerVmaError>
+where
+    F: FnOnce() -> Result<(), PagerVmaError>,
+{
+    rewrite_range(
+        handle,
+        identity,
+        start,
+        end,
+        replacement_prot,
+        None,
+        ceiling,
+        build_default_vma_chunk,
+        mutate,
+    )
 }
 
 /// Narrows protection over one exact range and reports the identity whose
@@ -1177,6 +1327,28 @@ pub fn protect_for_process(
     prot: u32,
     page_flags: x86_64::structures::paging::PageTableFlags,
 ) -> Result<Option<(u64, u64)>, PagerVmaError> {
+    protect_for_process_with_ceiling(
+        process_id,
+        expected,
+        start,
+        end,
+        prot,
+        page_flags,
+        MAX_PAGER_VMAS_PER_PROCESS,
+    )
+}
+
+/// Narrows protection over one exact range while enforcing `ceiling` on any
+/// resulting VMA split.
+pub fn protect_for_process_with_ceiling(
+    process_id: u64,
+    expected: Option<ExpectedMm>,
+    start: u64,
+    end: u64,
+    prot: u32,
+    page_flags: x86_64::structures::paging::PageTableFlags,
+    ceiling: usize,
+) -> Result<Option<(u64, u64)>, PagerVmaError> {
     let retained =
         super::process_table::retain_process_by_pid(process_id).ok_or(PagerVmaError::Stale)?;
     let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
@@ -1190,17 +1362,25 @@ pub fn protect_for_process(
         .object_identity()
         .ok_or(PagerVmaError::Stale)?;
     let rewritten = retained.with_state_mut(|_, state| {
-        rewrite_attenuated_range(retained.handle(), identity, start, end, Some(prot), || {
-            state
-                .address_space_mut()
-                .protect_present_prepared_pager_fault_pages_at(
-                    x86_64::VirtAddr::new(start),
-                    page_count,
-                    page_flags,
-                )
-                .map(|_| ())
-                .map_err(|_| PagerVmaError::Stale)
-        })
+        rewrite_attenuated_range_with_ceiling(
+            retained.handle(),
+            identity,
+            start,
+            end,
+            Some(prot),
+            ceiling,
+            || {
+                state
+                    .address_space_mut()
+                    .protect_present_prepared_pager_fault_pages_at(
+                        x86_64::VirtAddr::new(start),
+                        page_count,
+                        page_flags,
+                    )
+                    .map(|_| ())
+                    .map_err(|_| PagerVmaError::Stale)
+            },
+        )
     })?;
     Ok(rewritten.then(|| (process.slot(), process.generation())))
 }
@@ -1250,12 +1430,61 @@ pub fn unmap_for_process_with(
     unmap_for_process_inner(process_id, expected, start, end, true, mutate, release)
 }
 
+/// Unmaps pager publications and caller-owned PTEs while enforcing `ceiling` on
+/// any interior VMA split.
+pub fn unmap_for_process_with_ceiling(
+    process_id: u64,
+    expected: Option<ExpectedMm>,
+    start: u64,
+    end: u64,
+    ceiling: usize,
+    mutate: impl FnOnce(&mut super::UserProcessState) -> Result<(), PagerVmaError>,
+    release: impl FnOnce(&mut super::UserProcessState),
+) -> Result<Option<(u64, u64)>, PagerVmaError> {
+    unmap_for_process_inner_with_ceiling(
+        process_id,
+        expected,
+        start,
+        end,
+        true,
+        Some(ceiling),
+        mutate,
+        release,
+    )
+}
+
 fn unmap_for_process_inner(
     process_id: u64,
     expected: Option<ExpectedMm>,
     start: u64,
     end: u64,
     mutate_without_publication: bool,
+    mutate: impl FnOnce(&mut super::UserProcessState) -> Result<(), PagerVmaError>,
+    release: impl FnOnce(&mut super::UserProcessState),
+) -> Result<Option<(u64, u64)>, PagerVmaError> {
+    unmap_for_process_inner_with_ceiling(
+        process_id,
+        expected,
+        start,
+        end,
+        mutate_without_publication,
+        None,
+        mutate,
+        release,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shared unmap transaction core supporting both default and explicit policy ceiling"
+)]
+fn unmap_for_process_inner_with_ceiling(
+    process_id: u64,
+    expected: Option<ExpectedMm>,
+    start: u64,
+    end: u64,
+    mutate_without_publication: bool,
+    ceiling: Option<usize>,
     mutate: impl FnOnce(&mut super::UserProcessState) -> Result<(), PagerVmaError>,
     release: impl FnOnce(&mut super::UserProcessState),
 ) -> Result<Option<(u64, u64)>, PagerVmaError> {
@@ -1277,10 +1506,20 @@ fn unmap_for_process_inner(
             return Err(PagerVmaError::Unstable);
         }
         let mut mutate = Some(mutate);
-        let rewritten =
-            rewrite_attenuated_range(retained.handle(), identity, start, end, None, || {
+        let rewritten = match ceiling {
+            None => rewrite_attenuated_range(retained.handle(), identity, start, end, None, || {
                 mutate.take().expect("unmap mutation consumed once")(state)
-            })?;
+            })?,
+            Some(ceiling) => rewrite_attenuated_range_with_ceiling(
+                retained.handle(),
+                identity,
+                start,
+                end,
+                None,
+                ceiling,
+                || mutate.take().expect("unmap mutation consumed once")(state),
+            )?,
+        };
         // No intersecting pager VMA is still a valid sparse/legacy unmap.
         if mutate_without_publication {
             if let Some(mutate) = mutate {
@@ -1325,6 +1564,8 @@ pub fn set_commit_state_for_process(
             end,
             None,
             Some(commit_state),
+            MAX_PAGER_VMAS_PER_PROCESS,
+            build_default_vma_chunk,
             || {
                 if commit_state != VM_COMMIT_RESERVED {
                     return Ok(());
@@ -1370,6 +1611,28 @@ pub fn move_for_process(
     new_start: u64,
     mutate: impl FnOnce(&mut super::UserProcessState) -> Result<(), PagerVmaError>,
 ) -> Result<usize, PagerVmaError> {
+    move_for_process_with_ceiling(
+        process_id,
+        expected,
+        old_start,
+        old_end,
+        new_start,
+        MAX_PAGER_VMAS_PER_PROCESS,
+        mutate,
+    )
+}
+
+/// Relocates `[old_start, old_end)` to `new_start` while enforcing `ceiling`
+/// on any resulting VMA growth.
+pub fn move_for_process_with_ceiling(
+    process_id: u64,
+    expected: Option<ExpectedMm>,
+    old_start: u64,
+    old_end: u64,
+    new_start: u64,
+    ceiling: usize,
+    mutate: impl FnOnce(&mut super::UserProcessState) -> Result<(), PagerVmaError>,
+) -> Result<usize, PagerVmaError> {
     let retained =
         super::process_table::retain_process_by_pid(process_id).ok_or(PagerVmaError::Stale)?;
     let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
@@ -1381,12 +1644,14 @@ pub fn move_for_process(
             return Err(PagerVmaError::Unstable);
         }
         let mut mutate = Some(mutate);
-        relocate_range(
+        relocate_range_with(
             retained.handle(),
             identity,
             old_start,
             old_end,
             new_start,
+            ceiling,
+            build_default_vma_chunk,
             || mutate.take().expect("relocation mutation consumed once")(state),
         )
     })
@@ -1464,12 +1729,42 @@ fn plan_relocation(
     Ok((remainders, moved))
 }
 
+#[cfg(test)]
 fn relocate_range<F>(
     handle: ProcessHandle,
     identity: ProcessIdentity,
     old_start: u64,
     old_end: u64,
     new_start: u64,
+    mutate: F,
+) -> Result<usize, PagerVmaError>
+where
+    F: FnOnce() -> Result<(), PagerVmaError>,
+{
+    relocate_range_with(
+        handle,
+        identity,
+        old_start,
+        old_end,
+        new_start,
+        MAX_PAGER_VMAS_PER_PROCESS,
+        build_default_vma_chunk,
+        mutate,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal relocation core parameterized by policy ceiling and chunk builder"
+)]
+fn relocate_range_with<F>(
+    handle: ProcessHandle,
+    identity: ProcessIdentity,
+    old_start: u64,
+    old_end: u64,
+    new_start: u64,
+    ceiling: usize,
+    build: fn() -> Option<VmaChunkBox>,
     mutate: F,
 ) -> Result<usize, PagerVmaError>
 where
@@ -1494,18 +1789,21 @@ where
     if handle.generation() != identity.process_generation() {
         return Err(PagerVmaError::Stale);
     }
+    let ceiling = ceiling.min(MAX_PAGER_VMAS_PER_PROCESS);
 
     let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
+    let allocated_slots = slots.capacity();
     let live_process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
     let mut overlapping: Vec<(usize, PagerVmRegionWire)> = Vec::new();
     overlapping
-        .try_reserve_exact(slots.len())
+        .try_reserve_exact(allocated_slots)
         .map_err(|_| PagerVmaError::Pressure)?;
     let mut empty_slots: Vec<usize> = Vec::new();
     empty_slots
-        .try_reserve_exact(slots.len())
+        .try_reserve_exact(allocated_slots)
         .map_err(|_| PagerVmaError::Pressure)?;
+    let mut live_total = 0_usize;
     for (slot_index, slot) in slots.iter().enumerate() {
         match slot.snapshot()? {
             // Residue of a previous process/MM incarnation: same reclamation as
@@ -1517,6 +1815,7 @@ where
                 empty_slots.push(slot_index);
             }
             Some(region) => {
+                live_total += 1;
                 if new_start < region.end && region.start < new_end {
                     return Err(PagerVmaError::Overlap);
                 }
@@ -1528,11 +1827,33 @@ where
         }
     }
     overlapping.sort_unstable_by_key(|(_, region)| region.start);
-    let regions: Vec<PagerVmRegionWire> = overlapping.iter().map(|(_, region)| *region).collect();
+    let mut regions: Vec<PagerVmRegionWire> = Vec::new();
+    regions
+        .try_reserve_exact(overlapping.len())
+        .map_err(|_| PagerVmaError::Pressure)?;
+    for (_, region) in overlapping.iter() {
+        regions.push(*region);
+    }
     let (remainders, moved) = plan_relocation(&regions, old_start, old_end, new_start)?;
     let publications = remainders.len() + moved.len();
-    if publications > overlapping.len() + empty_slots.len() {
+    let new_live = live_total
+        .checked_sub(overlapping.len())
+        .and_then(|rest| rest.checked_add(publications))
+        .ok_or(PagerVmaError::Pressure)?;
+    if publications > overlapping.len() && new_live > ceiling {
         return Err(PagerVmaError::Pressure);
+    }
+    let available = overlapping.len() + empty_slots.len();
+    if publications > available {
+        let needed_extra = publications - available;
+        let needed_chunks = needed_extra.div_ceil(VMA_SLOT_CHUNK);
+        empty_slots
+            .try_reserve_exact(needed_chunks * VMA_SLOT_CHUNK)
+            .map_err(|_| PagerVmaError::Pressure)?;
+        let first_new_slot = slots.append_chunks_with(needed_chunks, build)?;
+        for offset in 0..(needed_chunks * VMA_SLOT_CHUNK) {
+            empty_slots.push(first_new_slot + offset);
+        }
     }
     let mut targets: Vec<usize> = Vec::new();
     targets
@@ -1619,7 +1940,7 @@ pub fn first_mapping_conflict(
     retained.with_exact_visible_state_mut(identity, |_, state| {
         let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
         let mut first: Option<(u64, u64)> = None;
-        for slot in process_slots(handle).ok_or(PagerVmaError::Stale)? {
+        for slot in process_slots(handle).ok_or(PagerVmaError::Stale)?.iter() {
             let Some(region) = slot.snapshot()? else { continue; };
             if region.start < end && start < region.end
                 && region_matches_identity(region, process.slot(), identity)
@@ -1665,9 +1986,9 @@ pub(super) fn snapshot_regions(
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
     let mut regions = Vec::new();
     regions
-        .try_reserve_exact(MAX_PAGER_VMAS_PER_PROCESS)
+        .try_reserve_exact(slots.capacity())
         .map_err(|_| PagerVmaError::Pressure)?;
-    for slot in slots {
+    for slot in slots.iter() {
         let Some(region) = slot.snapshot()? else {
             continue;
         };
@@ -1688,7 +2009,7 @@ pub(super) fn revoke(
     let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
     let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
-    for slot in slots {
+    for slot in slots.iter() {
         let Some(region) = slot.snapshot()? else {
             continue;
         };

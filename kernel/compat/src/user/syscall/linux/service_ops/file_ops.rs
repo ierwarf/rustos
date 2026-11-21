@@ -155,7 +155,7 @@ pub fn syscall_linux_vfs_fchmodat(dirfd: u64, path_ptr: u64, mode: u64, flags: u
         Ok(allowed) => allowed,
         Err(errno) => return linux_errno(errno),
     };
-    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
+    let path = match copy_current_user_path_allow_empty(path_ptr, VFS_IPC_PATH_CAPACITY) {
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
@@ -229,7 +229,7 @@ pub fn syscall_linux_vfs_fchownat(
         Ok(parsed) => parsed,
         Err(errno) => return linux_errno(errno),
     };
-    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
+    let path = match copy_current_user_path_allow_empty(path_ptr, VFS_IPC_PATH_CAPACITY) {
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
@@ -294,11 +294,11 @@ pub fn syscall_linux_vfs_linkat(
         Ok(parsed) => parsed,
         Err(errno) => return linux_errno(errno),
     };
-    let old_path = match copy_current_user_path(oldpath_ptr, VFS_IPC_PATH_CAPACITY) {
+    let old_path = match copy_current_user_path_allow_empty(oldpath_ptr, VFS_IPC_PATH_CAPACITY) {
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
-    let new_path = match copy_current_user_path(newpath_ptr, VFS_IPC_PATH_CAPACITY) {
+    let new_path = match copy_current_user_path_allow_empty(newpath_ptr, VFS_IPC_PATH_CAPACITY) {
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
@@ -466,7 +466,7 @@ pub fn syscall_linux_vfs_utimensat(dirfd: u64, path_ptr: u64, times_ptr: u64, fl
     let path = if path_ptr == 0 {
         None
     } else {
-        match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
+        match copy_current_user_path_allow_empty(path_ptr, VFS_IPC_PATH_CAPACITY) {
             Ok(path) => Some(path),
             Err(errno) => return linux_errno(errno),
         }

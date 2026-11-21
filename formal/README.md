@@ -92,9 +92,10 @@ individual proof or runs that model to completion. A PR pass is not a claim that
 unrelated nightly models were explored.
 The `tlc_max_wall_seconds` profile budget fails closed rather than accepting a
 partially explored model.
-An exact PR or SMP-iteration pass may be reused for at most 24 hours. These
-two profiles reciprocally share a completed TLC result only for a model selected
-by both, because their exhaustive worker/fingerprint/seed policy is identical;
+An exact PR pass may be reused for up to 168 hours (matching `evidence_max_age_hours`),
+and an SMP-iteration pass for 24 hours. These two profiles reciprocally share
+a completed TLC result only for a model selected by both (using the lower reuse
+window), because their exhaustive worker/fingerprint/seed policy is identical;
 the non-TLC PR lanes and release seal remain distinct. `tlc_cache.py` rejects it
 unless the TLA module, CFG, pinned TLC version and digest, deadlock policy,
 worker policy, fingerprint, seed, positive exploration metrics, and model name

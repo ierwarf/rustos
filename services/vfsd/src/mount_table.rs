@@ -3,7 +3,7 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -20,6 +20,9 @@ use crate::tmpfs::{
     TMP_MAX_INODES, TMP_QUOTA_BYTES,
 };
 use crate::{map_storage_error, EIO};
+use rustos_user_abi::desktop_session::{
+    RuntimeDir, DESKTOP_SESSION_GID, DESKTOP_SESSION_UID, TEMP_DIR,
+};
 
 /// One boot-time memory filesystem mount.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,7 +37,7 @@ pub struct TmpfsMountSpec {
 /// root-owned and only populated by named services.
 pub const TMPFS_MOUNTS: [TmpfsMountSpec; 3] = [
     TmpfsMountSpec {
-        mount_point: "/tmp",
+        mount_point: TEMP_DIR,
         quota_bytes: TMP_QUOTA_BYTES,
         max_inodes: TMP_MAX_INODES,
         root_mode: 0o1777,
@@ -62,11 +65,18 @@ pub fn is_volatile_mount_path(path: &str) -> bool {
 }
 
 /// Directories created at boot inside `/run`: `(path relative to /run, mode,
-/// uid, gid)`. `/run/user/1000` is the default session's `XDG_RUNTIME_DIR`.
-pub const RUN_BOOT_DIRECTORIES: [(&str, u32, u32, u32); 2] = [
-    ("user", 0o755, 0, 0),
-    ("user/1000", 0o700, 1000, 1000),
-];
+/// uid, gid)`. vfsd seeds the desktop session's `/run/user/<uid>` (the
+/// directory uiserver binds its compositor socket in) so it exists before any
+/// launch; runtimed ensures and verifies the directory of every other launch
+/// uid. The path comes from the shared `RuntimeDir` derivation.
+pub fn run_boot_directories() -> [(String, u32, u32, u32); 2] {
+    let session = RuntimeDir(DESKTOP_SESSION_UID).to_string();
+    let relative = String::from(session.strip_prefix("/run/").unwrap_or(&session));
+    [
+        (String::from("user"), 0o755, 0, 0),
+        (relative, 0o700, DESKTOP_SESSION_UID, DESKTOP_SESSION_GID),
+    ]
+}
 
 /// One `/proc/mounts` row source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -326,8 +336,8 @@ impl MountTable {
             }
             let fs = Arc::new(fs);
             if spec.mount_point == "/run" {
-                for (dir, mode, uid, gid) in RUN_BOOT_DIRECTORIES {
-                    fs.mkdir_with(dir, FsCreateAttrs::new(mode, uid, gid))?;
+                for (dir, mode, uid, gid) in run_boot_directories() {
+                    fs.mkdir_with(&dir, FsCreateAttrs::new(mode, uid, gid))?;
                 }
             }
             self.mount(spec.mount_point, fs, None, 0);
@@ -874,9 +884,13 @@ mod tests {
         }
         let (run, rel) = table.resolve("/run").unwrap();
         assert_eq!(run.volume.metadata(rel).unwrap().mode, 0o755);
-        let (entry, rel) = table.resolve("/run/user/1000").unwrap();
+        let runtime_dir = RuntimeDir(DESKTOP_SESSION_UID).to_string();
+        let (entry, rel) = table.resolve(&runtime_dir).unwrap();
         let meta = entry.volume.metadata(rel).unwrap();
-        assert_eq!((meta.mode, meta.uid, meta.gid), (0o700, 1000, 1000));
+        assert_eq!(
+            (meta.mode, meta.uid, meta.gid),
+            (0o700, DESKTOP_SESSION_UID, DESKTOP_SESSION_GID)
+        );
         let user = entry.volume.metadata("user").unwrap();
         assert_eq!((user.mode, user.uid), (0o755, 0));
         // /dev/shm is a submount of /dev; /tmp and /run are listed at the root.

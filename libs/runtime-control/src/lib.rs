@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+pub use rustos_user_abi::application_request::ApplicationRequest;
+
 const DEFAULT_WEIGHT_MICROS: u64 = 100;
 pub(crate) const RPC_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const LAUNCH_TRANSACTION_TIMEOUT: Duration =
@@ -78,6 +80,11 @@ pub struct DesktopProgramEntry {
     pub runtime_deps: Vec<String>,
     pub hidden: bool,
     pub no_display: bool,
+    /// What the package requested for its application Job; all zero means the
+    /// loader's derived defaults. Carried as written: the registry knows no
+    /// machine capacity, so only loaderd (which observes it at launch) can grant
+    /// or refuse the request.
+    pub application_request: ApplicationRequest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -739,6 +746,10 @@ pub fn load_runtime_launch_program_entries(
     Ok(entries)
 }
 
+/// Loads the default environment of `scope` as `KEY=VALUE` strings whose
+/// values are still templates for the `runtime` scope (see
+/// `validate_runtime_env_template`); the caller that owns the launch resolves
+/// them. `init` values are literal.
 pub fn load_runtime_default_env(
     path: &str,
     scope: RuntimeEnvScope,
@@ -906,11 +917,33 @@ fn load_runtime_env_registry_entries(path: &str) -> Result<Vec<RuntimeEnvEntry>,
                 ),
             )
         })?;
+        validate_runtime_env_template(&entry).map_err(|reason| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid runtime environment registry entry at line {}: {reason}",
+                    line_number + 1
+                ),
+            )
+        })?;
         entries.push(entry);
     }
 
     entries.sort();
     Ok(entries)
+}
+
+/// Registry values are templates (`session-profile` grammar), resolved per
+/// launch by runtimed. A value with an unknown placeholder or stray brace is a
+/// registry error, never passed through. The `init` scope is consumed by
+/// initd, which has no launch profile to resolve against, so it must be literal.
+fn validate_runtime_env_template(entry: &RuntimeEnvEntry) -> Result<(), String> {
+    let template = session_profile::Template::parse(&entry.value)
+        .map_err(|error| format!("key {}: {error}", entry.key))?;
+    if entry.scope == RuntimeEnvScope::Init.as_str() && !template.is_literal() {
+        return Err(format!("key {}: placeholders are not allowed in the init scope", entry.key));
+    }
+    Ok(())
 }
 
 fn parse_runtime_env_registry_entry(line: &str) -> Option<RuntimeEnvEntry> {
@@ -990,6 +1023,9 @@ fn parse_desktop_registry_entry(line: &str) -> Option<DesktopProgramEntry> {
     let mut autostart_enabled = None;
     let mut hidden = None;
     let mut no_display = None;
+    let mut request_processes = None;
+    let mut request_threads = None;
+    let mut request_memory_pages = None;
 
     for token in line.split('\t') {
         let Some((key, value)) = token.split_once('=') else {
@@ -1011,6 +1047,11 @@ fn parse_desktop_registry_entry(line: &str) -> Option<DesktopProgramEntry> {
             "autostart_enabled" if autostart_enabled.is_none() => autostart_enabled = Some(value),
             "hidden" if hidden.is_none() => hidden = Some(value),
             "no_display" if no_display.is_none() => no_display = Some(value),
+            "request_processes" if request_processes.is_none() => request_processes = Some(value),
+            "request_threads" if request_threads.is_none() => request_threads = Some(value),
+            "request_memory_pages" if request_memory_pages.is_none() => {
+                request_memory_pages = Some(value)
+            }
             _ => {}
         }
     }
@@ -1030,6 +1071,13 @@ fn parse_desktop_registry_entry(line: &str) -> Option<DesktopProgramEntry> {
     let autostart_enabled = parse_registry_bool(autostart_enabled?)?;
     let hidden = parse_registry_bool(hidden?)?;
     let no_display = parse_registry_bool(no_display?)?;
+    // The registry encodes "not requested" as `0`; the fields are mandatory like
+    // every other policy field so a truncated line cannot read as "defaults".
+    let application_request = ApplicationRequest {
+        processes: request_processes?.parse().ok()?,
+        threads: request_threads?.parse().ok()?,
+        memory_pages_per_process: request_memory_pages?.parse().ok()?,
+    };
     if desktop_file_id.is_empty()
         || package_id.is_empty()
         || display_name.is_empty()
@@ -1054,6 +1102,7 @@ fn parse_desktop_registry_entry(line: &str) -> Option<DesktopProgramEntry> {
         runtime_deps,
         hidden,
         no_display,
+        application_request,
     })
 }
 
@@ -1080,6 +1129,9 @@ fn parse_desktop_program_entry(
     let mut env = Vec::<String>::new();
     let mut package_id = None::<String>;
     let mut runtime_deps = Vec::<String>::new();
+    let mut request_processes = None::<u64>;
+    let mut request_threads = None::<u64>;
+    let mut request_memory_pages = None::<u64>;
 
     for raw_line in contents.lines() {
         let line = raw_line.trim();
@@ -1118,6 +1170,11 @@ fn parse_desktop_program_entry(
             "X-RustOS-Env" => env = parse_desktop_list(value),
             "X-RustOS-PackageId" => package_id = Some(value.to_string()),
             "X-RustOS-Deps" => runtime_deps = parse_desktop_deps(value),
+            "X-RustOS-RequestProcesses" => request_processes = Some(value.parse().ok()?),
+            "X-RustOS-RequestThreads" => request_threads = Some(value.parse().ok()?),
+            "X-RustOS-RequestMemoryPagesPerProcess" => {
+                request_memory_pages = Some(value.parse().ok()?)
+            }
             _ => {}
         }
     }
@@ -1128,6 +1185,11 @@ fn parse_desktop_program_entry(
     if !desktop_is_visible_to_rustos(only_show_in, not_show_in) {
         return None;
     }
+    // Syntax only, as at stage time: a key that is present asks for something,
+    // so zero is malformed (omit the key to take the derived default). The
+    // entry is dropped as invalid rather than admitted with a different request.
+    let application_request =
+        ApplicationRequest::new(request_processes, request_threads, request_memory_pages).ok()?;
     if mode == DesktopLoadMode::Autostart && (!enabled || hidden || no_display) {
         return None;
     }
@@ -1161,6 +1223,7 @@ fn parse_desktop_program_entry(
         runtime_deps,
         hidden,
         no_display,
+        application_request,
     })
 }
 
@@ -1364,6 +1427,7 @@ fn as_bytes_mut<T>(value: &mut T) -> &mut [u8] {
 mod tests {
     use super::{
         parse_desktop_program_entry, parse_desktop_registry_entry, parse_exec_tokens,
+        ApplicationRequest,
         parse_startup_registry_entry, response_payload_len, DesktopLoadMode, RuntimeRequest,
         RuntimeResponse, StartupMode, MAX_RUNTIME_PROGRAMS, OP_REQUEST_LAUNCH_PATH,
         OP_SNAPSHOT_RUNNING_PROGRAMS, PROTOCOL_VERSION,
@@ -1545,6 +1609,95 @@ mod tests {
             "desktop_id=runtimed.desktop\tmode=init\tdisplay_name=runtimed\texec=services/runtimed/runtimed.elf\tlaunch=none",
         );
         assert!(entry.is_none());
+    }
+
+    const REGISTRY_PREFIX: &str = "desktop_id=chrome.desktop\tpackage_id=chrome\tstartup=none\tdisplay_name=Google Chrome\timage=apps/chrome/chrome\texec=/apps/chrome/chrome\tweight=1000\tlogical_admin=0\tconsole_hosted=0\tterminal=0\thidden=0\tno_display=0\tautostart_enabled=0\tlaunch=new-session\tdeps=\targs=/apps/chrome/chrome\tenv=";
+
+    fn registry_line(request: &str) -> String {
+        format!("{REGISTRY_PREFIX}\t{request}")
+    }
+
+    #[test]
+    fn registry_entry_carries_the_application_request_as_written() {
+        let entry = parse_desktop_registry_entry(&registry_line(
+            "request_processes=24\trequest_threads=160\trequest_memory_pages=0",
+        ))
+        .expect("requested dimensions");
+        assert_eq!(
+            entry.application_request,
+            ApplicationRequest { processes: 24, threads: 160, memory_pages_per_process: 0 }
+        );
+        let none = parse_desktop_registry_entry(&registry_line(
+            "request_processes=0\trequest_threads=0\trequest_memory_pages=0",
+        ))
+        .expect("nothing requested");
+        assert!(!none.application_request.is_declared());
+    }
+
+    #[test]
+    fn registry_carries_a_request_larger_than_any_capacity_because_it_knows_none() {
+        let entry = parse_desktop_registry_entry(&registry_line(&format!(
+            "request_processes={0}\trequest_threads={0}\trequest_memory_pages={0}",
+            u64::MAX
+        )))
+        .expect("capacity is loaderd's judgement, not the registry's");
+        assert_eq!(entry.application_request.threads, u64::MAX);
+    }
+
+    #[test]
+    fn registry_entry_rejects_missing_or_malformed_request_fields() {
+        // The request fields are mandatory like every other policy field, so a
+        // truncated line cannot be read as "defaults".
+        assert!(parse_desktop_registry_entry(REGISTRY_PREFIX).is_none());
+        for request in [
+            "request_processes=x\trequest_threads=0\trequest_memory_pages=0",
+            "request_processes=-1\trequest_threads=0\trequest_memory_pages=0",
+            "request_processes=1.5\trequest_threads=0\trequest_memory_pages=0",
+            "request_processes=0\trequest_threads=0",
+        ] {
+            assert!(parse_desktop_registry_entry(&registry_line(request)).is_none(), "{request}");
+        }
+    }
+
+    #[test]
+    fn desktop_file_entry_carries_the_application_request() {
+        let text = |extra: &str| {
+            format!(
+                "[Desktop Entry]\nType=Application\nName=Chrome\nExec=/apps/chrome/chrome\nOnlyShowIn=RustOS;\n{extra}"
+            )
+        };
+        let path = Path::new("/usr/share/applications/chrome.desktop");
+        let parse = |extra: &str| {
+            parse_desktop_program_entry(&text(extra), path, DesktopLoadMode::Applications)
+        };
+        assert!(!parse("").unwrap().application_request.is_declared());
+        let entry = parse("X-RustOS-RequestProcesses=24\nX-RustOS-RequestThreads=160\n").unwrap();
+        assert_eq!(
+            entry.application_request,
+            ApplicationRequest { processes: 24, threads: 160, memory_pages_per_process: 0 }
+        );
+        let pages = parse("X-RustOS-RequestMemoryPagesPerProcess=4096\n").unwrap();
+        assert_eq!(pages.application_request.memory_pages_per_process, 4096);
+        // A present key asks for something: zero and non-numbers are malformed.
+        assert!(parse("X-RustOS-RequestThreads=0\n").is_none());
+        assert!(parse("X-RustOS-RequestProcesses=lots\n").is_none());
+    }
+
+    #[test]
+    fn the_stage_writer_and_both_readers_agree_on_the_request_spelling() {
+        // The xtask stage writer emits these keys (tools/xtask/src/stage/mod.rs);
+        // the registry reader and the desktop-file reader above parse them.
+        let source = include_str!("../../../tools/xtask/src/stage/mod.rs");
+        for key in [
+            "request_processes={}",
+            "request_threads={}",
+            "request_memory_pages={}",
+            "X-RustOS-RequestProcesses",
+            "X-RustOS-RequestThreads",
+            "X-RustOS-RequestMemoryPagesPerProcess",
+        ] {
+            assert!(source.contains(key), "{key}");
+        }
     }
 
     #[test]
@@ -1977,5 +2130,47 @@ mod verification {
         };
         kani::cover!(errno > 0);
         assert_eq!(response_payload_len(&request, &response), Err(errno));
+    }
+}
+
+#[cfg(test)]
+mod env_registry_tests {
+    use super::{load_runtime_default_env, RuntimeEnvScope};
+
+    fn load(name: &str, body: &str, scope: RuntimeEnvScope) -> Result<Vec<String>, std::io::Error> {
+        let path = std::env::temp_dir().join(format!("runtime-env-{name}-{}.tsv", std::process::id()));
+        std::fs::write(&path, body).unwrap();
+        let result = load_runtime_default_env(path.to_str().unwrap(), scope);
+        std::fs::remove_file(path).unwrap();
+        result
+    }
+
+    const TEMPLATED: &str = "scope=init\tkey=PATH\tvalue=/bin\n\
+        scope=runtime\tkey=HOME\tvalue={profile_root}/home\n\
+        scope=runtime\tkey=XDG_RUNTIME_DIR\tvalue={runtime_dir}\n";
+
+    #[test]
+    fn runtime_scope_returns_templates_unresolved() {
+        let env = load("runtime", TEMPLATED, RuntimeEnvScope::Runtime).unwrap();
+        assert_eq!(env, ["HOME={profile_root}/home", "XDG_RUNTIME_DIR={runtime_dir}"]);
+        assert_eq!(load("init", TEMPLATED, RuntimeEnvScope::Init).unwrap(), ["PATH=/bin"]);
+    }
+
+    #[test]
+    fn unknown_placeholders_and_stray_braces_are_registry_errors() {
+        for value in ["/run/user/{uid}", "{runtime_dir", "a}b", "x/{profile_root}"] {
+            let body = format!("scope=runtime\tkey=K\tvalue={value}\n");
+            let error = load("bad", &body, RuntimeEnvScope::Runtime).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{value}");
+            assert!(error.to_string().contains("line 1"), "{error}");
+        }
+    }
+
+    #[test]
+    fn init_scope_cannot_carry_placeholders() {
+        let body = "scope=init\tkey=XDG_RUNTIME_DIR\tvalue={runtime_dir}\n";
+        let error = load("init-bad", body, RuntimeEnvScope::Runtime).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("init scope"), "{error}");
     }
 }

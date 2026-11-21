@@ -45,6 +45,7 @@ pub(super) use return_publication::{publish_return, ReturnPublication};
 pub(super) use return_publication::{test_blocked_return, test_running_claim};
 mod execution_time;
 pub(super) use execution_time::set as set_exec_start_local_ns;
+pub(super) use execution_time::{charge as charge_cpu_time, consumed as consumed_cpu_time};
 mod idle;
 pub(super) use idle::{is_idle as is_idle_slot, set as set_idle_slot};
 mod ipc_handoff;

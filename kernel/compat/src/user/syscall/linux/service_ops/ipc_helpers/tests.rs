@@ -1,6 +1,34 @@
 use super::*;
 
 #[test]
+fn proc_exe_paths_resolve_to_caller_attested_executable() {
+    assert_eq!(
+        resolve_exec_path("/proc/self/exe", Some(116), Some("/apps/chrome/chrome")),
+        Ok(String::from("/apps/chrome/chrome"))
+    );
+    assert_eq!(
+        resolve_exec_path("/proc/thread-self/exe", Some(116), Some("/apps/chrome/chrome")),
+        Ok(String::from("/apps/chrome/chrome"))
+    );
+    assert_eq!(
+        resolve_exec_path("/proc//116/./exe", Some(116), Some("/apps/chrome/chrome")),
+        Ok(String::from("/apps/chrome/chrome"))
+    );
+    assert_eq!(
+        resolve_exec_path("/proc/117/exe", Some(116), Some("/apps/chrome/chrome")),
+        Err(LINUX_ENOENT)
+    );
+    assert_eq!(
+        resolve_exec_path("/proc/self/exe", Some(116), Some("")),
+        Err(LINUX_ENOENT)
+    );
+    assert_eq!(
+        resolve_exec_path("/bin/busybox", Some(116), Some("/apps/chrome/chrome")),
+        Ok(String::from("/bin/busybox"))
+    );
+}
+
+#[test]
 fn vfs_sender_identity_survives_process_visibility_revocation() {
     // The scheduler's task identity still names the IPC sender after exit
     // seals the process and its visible process snapshot is unavailable.

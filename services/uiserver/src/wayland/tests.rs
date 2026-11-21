@@ -2059,3 +2059,19 @@ fn a_destroyed_toplevel_surface_can_be_given_a_new_toplevel_and_shown() {
         .iter()
         .any(|(obj, op, _)| *obj == 1 && *op == 0));
 }
+
+#[test]
+fn compositor_and_clients_agree_on_the_runtime_dir_by_construction() {
+    use rustos_user_abi::desktop_session::{launch_credentials, RuntimeDir};
+    // Every graphical client runs as the same identity as the compositor, and
+    // both derive `/run/user/<uid>` through the one `RuntimeDir` function.
+    assert!(
+        include_str!("../../RUSTOS.package.toml").contains("logical_admin = false"),
+        "uiserver must run as the desktop identity so its clients share its runtime dir"
+    );
+    let (uid, _) = launch_credentials(false);
+    let advertised = RuntimeDir(uid).to_string();
+    assert_eq!(super::runtime_dir_from(None, uid), advertised);
+    assert_eq!(super::runtime_dir_from(Some(advertised.clone()), uid), advertised);
+    assert_eq!(super::runtime_dir_from(Some(String::from("relative")), uid), advertised);
+}

@@ -1,5 +1,9 @@
 #![no_std]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+
 mod page_cache;
 pub mod library_custody;
 pub mod library_warm;
@@ -20,8 +24,11 @@ use rustos_user_abi::pager::{
 };
 
 /// Live regions this pager tracks, sized by the shared ABI against ring0's
-/// per-process VMA capacity so one process cannot wedge the others.
+/// per-process VMA ceiling so one process cannot wedge the others.
 pub const PAGER_MAX_REGIONS: usize = PAGER_MAX_TRACKED_REGIONS;
+/// Region storage grows lazily in chunks of this many entries rather than
+/// preallocating `PAGER_MAX_REGIONS` upfront.
+pub const PAGER_REGION_CHUNK: usize = 64;
 /// Exact one-shot replay state, one entry per ring0 fault slot.
 ///
 /// This replaces an append-only list of consumed tokens. That list could only
@@ -59,10 +66,10 @@ impl PagerFaultError {
 
 pub struct PagerState {
     epoch: u64,
-    /// Dense prefix `regions[..tracked]` kept sorted by `(process_handle, start)`
-    /// with non-overlapping ranges per process for O(log N) lookup and edits.
-    regions: [Option<PagerVmRegionWire>; PAGER_MAX_REGIONS],
-    tracked: usize,
+    /// Sorted by `(process_handle, start)` with non-overlapping ranges per
+    /// process for O(log N) lookup and edits. Grown lazily in chunks up to
+    /// `PAGER_MAX_REGIONS`.
+    regions: Vec<PagerVmRegionWire>,
     /// Highest fault-token generation accepted for each ring0 slot. Index is
     /// the token's one-based slot minus one; zero means the slot is unused.
     accepted_generations: [u64; PAGER_MAX_CONSUMED_TOKENS],
@@ -72,8 +79,7 @@ impl PagerState {
     pub const fn new(epoch: u64) -> Self {
         Self {
             epoch,
-            regions: [None; PAGER_MAX_REGIONS],
-            tracked: 0,
+            regions: Vec::new(),
             accepted_generations: [0; PAGER_MAX_CONSUMED_TOKENS],
         }
     }
@@ -86,40 +92,49 @@ impl PagerState {
         if !region.is_canonical() || region.object.pager_epoch != self.epoch {
             return Err(PagerFaultError::Malformed);
         }
-        let active = &self.regions[..self.tracked];
-        let idx = active.partition_point(|slot| {
-            let current = slot.expect("dense tracked prefix");
+        let idx = self.regions.partition_point(|current| {
             (current.process_handle, current.start) < (region.process_handle, region.start)
         });
         if idx > 0 {
-            let prev = active[idx - 1].expect("dense tracked prefix");
+            let prev = self.regions[idx - 1];
             if prev.process_handle == region.process_handle && prev.end > region.start {
                 return Err(PagerFaultError::Stale);
             }
         }
-        if idx < self.tracked {
-            let next = active[idx].expect("dense tracked prefix");
+        if idx < self.regions.len() {
+            let next = self.regions[idx];
             if next.process_handle == region.process_handle && region.end > next.start {
                 return Err(PagerFaultError::Stale);
             }
         }
-        if self.tracked == PAGER_MAX_REGIONS {
+        if self.regions.len() >= PAGER_MAX_REGIONS {
             return Err(PagerFaultError::Pressure(PAGER_PRESSURE_REGION_TABLE_FULL));
         }
-        self.regions.copy_within(idx..self.tracked, idx + 1);
-        self.regions[idx] = Some(region);
-        self.tracked += 1;
+        if self.regions.len() == self.regions.capacity() {
+            let grow_by = PAGER_REGION_CHUNK.min(PAGER_MAX_REGIONS - self.regions.len());
+            if self.regions.try_reserve_exact(grow_by).is_err() {
+                self.regions
+                    .try_reserve_exact(1)
+                    .map_err(|_| PagerFaultError::Pressure(PAGER_PRESSURE_REGION_TABLE_FULL))?;
+            }
+        }
+        self.regions.insert(idx, region);
         Ok(())
     }
 
     /// Regions this pager currently tracks, across every process.
-    pub const fn tracked_regions(&self) -> usize {
-        self.tracked
+    pub fn tracked_regions(&self) -> usize {
+        self.regions.len()
     }
 
     /// Free region slots. A split needs one of these for its second fragment.
-    pub const fn free_region_slots(&self) -> usize {
-        PAGER_MAX_REGIONS - self.tracked
+    pub fn free_region_slots(&self) -> usize {
+        PAGER_MAX_REGIONS - self.regions.len()
+    }
+
+    /// Currently reserved region capacity (0 until first admission).
+    pub fn region_capacity(&self) -> usize {
+        self.regions.capacity()
     }
 
     /// Applies one ring0-stamped range edit to every region it overlaps,
@@ -151,17 +166,15 @@ impl PagerState {
         if !edit.is_canonical() || process_handle == 0 || process_generation == 0 {
             return Err(PagerFaultError::Malformed);
         }
-        let active = &self.regions[..self.tracked];
-        let start_idx = active.partition_point(|slot| {
-            let region = slot.expect("dense tracked prefix");
+        let start_idx = self.regions.partition_point(|region| {
             region.process_handle < process_handle
                 || (region.process_handle == process_handle && region.end <= edit.start)
         });
         let mut end_idx = start_idx;
         let mut additional = 0_usize;
         let mut edited = 0_usize;
-        while end_idx < self.tracked {
-            let region = active[end_idx].expect("dense tracked prefix");
+        while end_idx < self.regions.len() {
+            let region = self.regions[end_idx];
             if region.process_handle != process_handle || region.start >= edit.end {
                 break;
             }
@@ -187,12 +200,21 @@ impl PagerState {
                 PAGER_PRESSURE_REGION_SPLIT_NO_SLOT,
             ));
         }
+        if additional > 0 && self.regions.len() + additional > self.regions.capacity() {
+            let chunk = PAGER_REGION_CHUNK.min(self.free_region_slots());
+            let reserve = additional.max(chunk);
+            if self.regions.try_reserve_exact(reserve).is_err() {
+                self.regions
+                    .try_reserve_exact(additional)
+                    .map_err(|_| PagerFaultError::Pressure(PAGER_PRESSURE_REGION_SPLIT_NO_SLOT))?;
+            }
+        }
 
         let mut i = start_idx;
         let mut remaining = end_idx - start_idx;
         while remaining > 0 {
             remaining -= 1;
-            let region = self.regions[i].expect("dense tracked prefix");
+            let region = self.regions[i];
             if region.process_generation != process_generation {
                 i += 1;
                 continue;
@@ -200,20 +222,12 @@ impl PagerState {
             let (fragments, len) = apply_region_edit(region, edit).pager_fragments();
             match len {
                 0 => {
-                    self.regions.copy_within(i + 1..self.tracked, i);
-                    self.tracked -= 1;
-                    self.regions[self.tracked] = None;
+                    self.regions.remove(i);
                 }
                 _ => {
-                    self.regions[i] = Some(fragments[0]);
-                    let extra = len - 1;
-                    if extra > 0 {
-                        self.regions
-                            .copy_within(i + 1..self.tracked, i + 1 + extra);
-                        self.tracked += extra;
-                        for (offset, fragment) in fragments[1..len].iter().copied().enumerate() {
-                            self.regions[i + 1 + offset] = Some(fragment);
-                        }
+                    self.regions[i] = fragments[0];
+                    for (offset, fragment) in fragments[1..len].iter().copied().enumerate() {
+                        self.regions.insert(i + 1 + offset, fragment);
                     }
                     i += len;
                 }
@@ -269,20 +283,15 @@ impl PagerState {
     }
 
     pub fn invalidate_process(&mut self, process_handle: u64) -> usize {
-        let active = &self.regions[..self.tracked];
-        let start = active.partition_point(|slot| {
-            slot.expect("dense tracked prefix").process_handle < process_handle
-        });
+        let start = self
+            .regions
+            .partition_point(|region| region.process_handle < process_handle);
         let end = start
-            + active[start..].partition_point(|slot| {
-                slot.expect("dense tracked prefix").process_handle == process_handle
-            });
+            + self.regions[start..]
+                .partition_point(|region| region.process_handle == process_handle);
         let removed = end - start;
         if removed > 0 {
-            self.regions.copy_within(end..self.tracked, start);
-            let new_tracked = self.tracked - removed;
-            self.regions[new_tracked..self.tracked].fill(None);
-            self.tracked = new_tracked;
+            self.regions.drain(start..end);
         }
         removed
     }
@@ -293,8 +302,7 @@ impl PagerState {
             .checked_add(1)
             .filter(|epoch| *epoch != 0)
             .ok_or(PagerFaultError::EpochExhausted)?;
-        self.regions[..self.tracked].fill(None);
-        self.tracked = 0;
+        self.regions.clear();
         self.accepted_generations.fill(0);
         Ok(self.epoch)
     }
@@ -318,15 +326,13 @@ impl PagerState {
         if request.object.pager_epoch != self.epoch || !self.token_is_fresh(request.fault_token) {
             return Err(PagerFaultError::Stale);
         }
-        let active = &self.regions[..self.tracked];
-        let idx = active.partition_point(|slot| {
-            let region = slot.expect("dense tracked prefix");
+        let idx = self.regions.partition_point(|region| {
             (region.process_handle, region.start)
                 <= (request.process_handle, request.virtual_address)
         });
         let region = idx
             .checked_sub(1)
-            .and_then(|i| active[i])
+            .map(|i| self.regions[i])
             .filter(|region| fault_matches_region(request, *region))
             .ok_or(PagerFaultError::NotManaged)?;
 
@@ -841,7 +847,7 @@ mod tests {
     fn spans(pager: &PagerState) -> ([(u64, u64); 8], usize) {
         let mut spans = [(0_u64, 0_u64); 8];
         let mut len = 0;
-        for region in pager.regions.iter().flatten() {
+        for region in &pager.regions {
             assert!(len < spans.len(), "span set is larger than this fixture");
             spans[len] = (region.start, region.end);
             len += 1;
@@ -1005,6 +1011,27 @@ mod tests {
             pager.release_range(release_span(base, 0x12_000, 0x14_000)),
             Ok(1)
         );
+    }
+
+    #[test]
+    fn region_storage_grows_lazily_in_chunks_from_zero() {
+        let mut pager = PagerState::new(2);
+        assert_eq!(pager.region_capacity(), 0);
+        let base = region(2);
+        pager.admit_region(base).unwrap();
+        assert_eq!(pager.region_capacity(), PAGER_REGION_CHUNK);
+        for index in 1..=(PAGER_REGION_CHUNK as u64) {
+            let start = 0x10_000 + index * 0x8000;
+            pager
+                .admit_region(PagerVmRegionWire {
+                    start,
+                    end: start + 0x4000,
+                    ..base
+                })
+                .unwrap();
+        }
+        assert_eq!(pager.tracked_regions(), PAGER_REGION_CHUNK + 1);
+        assert_eq!(pager.region_capacity(), PAGER_REGION_CHUNK * 2);
     }
 
     /// `mprotect` on part of a region splits it on ring0's side. Without the

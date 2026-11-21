@@ -23,6 +23,14 @@ FINGERPRINT = 'F6ECB3762474EDA9D21B7022871920D1991BC93C'
 RELEASES = {'noble': 'cdb2f31d809f589719a53c6ad15f255b27569c4059542ada282aaa21b8e164b0',
             'noble-updates': '376987eebd4dea43d28af8ac80b79a3503f928aec90cc4129d5263e641bb7b78'}
 PREFIX = 'usr/lib/x86_64-linux-gnu/'
+XKB_PREFIX = 'usr/share/X11/xkb/'
+XKB_ALIASES = {'rules/xorg': 'rules/base', 'rules/xorg.lst': 'rules/base.lst', 'rules/xorg.xml': 'rules/base.xml'}
+QT_WAYLAND_PLUGINS = {}
+for line in (HERE / 'noble/qt-wayland-plugins.tsv').read_text().splitlines():
+    package, path = line.split('\t')
+    if not re.fullmatch(r'qt[56]/plugins/(platforms|wayland-shell-integration)/[a-z-]+\.so', path):
+        raise ValueError('invalid Qt Wayland plugin path: ' + path)
+    QT_WAYLAND_PLUGINS.setdefault(package, set()).add(path)
 PACKAGE_MIRRORS = ('https://archive.ubuntu.com/ubuntu/', 'https://security.ubuntu.com/ubuntu/')
 UNAVAILABLE_PACKAGE_MIRRORS = set()
 
@@ -110,7 +118,7 @@ def signed_indexes(cache, metadata=False):
     return indexes
 
 
-def libraries(deb):
+def deb_data(deb):
     require(deb[:8] == b'!<arch>\n', 'invalid deb archive')
     pos = 8
     data = None
@@ -124,16 +132,29 @@ def libraries(deb):
             data = deb[pos + 60:pos + 60 + size]
         pos += 60 + size + size % 2
     require(data is not None, 'missing data archive')
-    with tarfile.open(fileobj=io.BytesIO(data), mode='r:*') as tar:
-        members = {}
-        for member in tar.getmembers():
-            name = member.name.removeprefix('./')
-            require(name not in members, 'duplicate package member')
-            members[name] = member
+    return data
+
+
+def archive_members(tar):
+    members = {}
+    for member in tar.getmembers():
+        name = member.name.removeprefix('./')
+        require(name not in members, 'duplicate package member')
+        members[name] = member
+    return members
+
+
+def libraries(deb, plugins=()):
+    with tarfile.open(fileobj=io.BytesIO(deb_data(deb)), mode='r:*') as tar:
+        members = archive_members(tar)
+        selected = set()
         for name, member in members.items():
             if not name.startswith(PREFIX): continue
             basename = name[len(PREFIX):]
-            if not basename or '/' in basename or '.so' not in basename: continue
+            plugin = basename in plugins
+            if not plugin and (not basename or '/' in basename or '.so' not in basename): continue
+            if plugin:
+                require(member.isfile(), 'Qt Wayland plugin must be a regular archive member: ' + name)
             seen = set()
             while member.issym() or member.islnk():
                 require(member.name not in seen, 'package symlink cycle'); seen.add(member.name)
@@ -144,7 +165,30 @@ def libraries(deb):
             if member is None or not member.isfile(): continue
             require(member.size <= 128 * 1024 * 1024, 'oversized runtime library')
             content = tar.extractfile(member).read()
-            if content.startswith(b'\x7fELF'): yield basename, content
+            if content.startswith(b'\x7fELF'):
+                if plugin: selected.add(basename)
+                yield basename, content
+        require(selected == set(plugins), 'missing Qt Wayland plugins: ' + ', '.join(sorted(set(plugins) - selected)))
+
+
+def xkb_data(deb):
+    with tarfile.open(fileobj=io.BytesIO(deb_data(deb)), mode='r:*') as tar:
+        members = archive_members(tar)
+        required = {'rules/evdev', 'symbols/us', 'keycodes/evdev', 'types/complete', 'compat/complete'}
+        for name, member in members.items():
+            if not name.startswith(XKB_PREFIX) or member.isdir():
+                continue
+            path = name[len(XKB_PREFIX):]
+            require(all(re.fullmatch(r'[A-Za-z0-9_.+-]+', part) and part not in ('.', '..')
+                        for part in path.split('/')), 'invalid XKB data path: ' + name)
+            if path in XKB_ALIASES:
+                alias = XKB_ALIASES[path]
+                require(member.issym() and member.linkname == alias.split('/')[-1], 'invalid XKB alias: ' + name)
+                member = members[XKB_PREFIX + alias]
+            require(member.isfile() and 0 < member.size <= 4 * 1024 * 1024, 'invalid XKB data member: ' + name)
+            required.discard(path)
+            yield path, tar.extractfile(member).read()
+        require(not required, 'missing XKB data: ' + ', '.join(sorted(required)))
 
 
 def provision(build):
@@ -156,10 +200,19 @@ def provision(build):
         for name, record in sorted(LOCK.items()):
             suite, component, filename, digest, size = record
             require(indexes.get((suite, component, name)) == (filename, digest, size), 'lock differs from signed package index: ' + name)
-            for basename, content in libraries(fetch(cache, filename, digest, size)):
+            deb = fetch(cache, filename, digest, size)
+            if name == 'xkb-data':
+                for relative, content in xkb_data(deb):
+                    path = root / XKB_PREFIX / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(content)
+                continue
+            for basename, content in libraries(deb, QT_WAYLAND_PLUGINS.get(name, ())):
                 path = lib / basename
                 if path.exists(): require(path.read_bytes() == content, 'conflicting package libraries: ' + basename)
-                else: path.write_bytes(content)
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(content)
         dest = work / 'root'
         if dest.exists(): shutil.rmtree(dest)
         os.rename(root, dest)

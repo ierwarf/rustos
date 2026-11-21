@@ -545,6 +545,13 @@
     "1b331252a34b1eb66e6deb8012d45db993fe3eb27ac6ded4978c7886471659d6",
     722778
   ],
+  "libqt5waylandclient5": [
+    "noble",
+    "universe",
+    "pool/universe/q/qtwayland-opensource-src/libqt5waylandclient5_5.15.13-1_amd64.deb",
+    "399bc67fb5efaf46293ff2d0b85a37cf5a3f2a52a9480b8e217448db5046949c",
+    405284
+  ],
   "libqt5widgets5t64": [
     "noble",
     "universe",
@@ -572,6 +579,13 @@
     "pool/universe/q/qt6-base/libqt6gui6t64_6.4.2+dfsg-21.1build5_amd64.deb",
     "f8774151f151a932d389817a371a3241004b1c3031cf53afd91feed73c8dd68e",
     3119104
+  ],
+  "libqt6waylandclient6": [
+    "noble",
+    "universe",
+    "pool/universe/q/qt6-wayland/libqt6waylandclient6_6.4.2-5build3_amd64.deb",
+    "e6c669a21e019e67393dcecdbc22a396b66ebcee7cfc261f9ba673070af99946",
+    251254
   ],
   "libqt6widgets6t64": [
     "noble",
@@ -705,6 +719,13 @@
     "pool/main/w/wayland/libwayland-client0_1.22.0-2.1build1_amd64.deb",
     "6af0aed41d75149bea22fa468f01eb058ffe3e35ef07ff2f13fb88a90387881d",
     26406
+  ],
+  "libwayland-cursor0": [
+    "noble",
+    "main",
+    "pool/main/w/wayland/libwayland-cursor0_1.22.0-2.1build1_amd64.deb",
+    "29c20da27e8e37c984cf0518635c11cd0441f4cb6a2919a9f6eee1809171d327",
+    10406
   ],
   "libx11-6": [
     "noble-updates",
@@ -943,6 +964,27 @@
     "pool/main/libz/libzstd/libzstd1_1.5.5+dfsg2-2build1.1_amd64.deb",
     "dfcf25061e07aad7efd3f4f880ba5ad4d4d09ebe7fc8cc77ab6b8a161d6d4727",
     299472
+  ],
+  "qt6-wayland": [
+    "noble",
+    "universe",
+    "pool/universe/q/qt6-wayland/qt6-wayland_6.4.2-5build3_amd64.deb",
+    "61ea3237974e71188c699e3554f08b8b2dc29e6854d727ff60627ec0570de6cd",
+    126792
+  ],
+  "qtwayland5": [
+    "noble",
+    "universe",
+    "pool/universe/q/qtwayland-opensource-src/qtwayland5_5.15.13-1_amd64.deb",
+    "43b114f81630a14b9906b1843c627512be6e3be434fa205e06b6cf6d0d9d1ecc",
+    222744
+  ],
+  "xkb-data": [
+    "noble-updates",
+    "main",
+    "pool/main/x/xkeyboard-config/xkb-data_2.41-2ubuntu1.1_all.deb",
+    "e99f2a0b4c56cdf35dec489e56b6a8418826cab8ce6306ec6d0bd98e2cd0014a",
+    397328
   ],
   "zlib1g": [
     "noble-updates",

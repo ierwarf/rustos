@@ -596,6 +596,30 @@ rather than untyped payload formats.
 
 ### Job and supervisor management ABIs
 
+- SYS_RUSTOS_TASK_CAPACITY (0x5255_0067), version 1, 72-byte
+  `RustosTaskCapacityArgs`: read-only observation of the kernel's task capacity
+  for the Ring3 policy that grants Job limits (`ProcessLoader` or
+  `RootSupervisor` only, else `EPERM`; wrong version or a nonzero request field
+  is `EINVAL`). The caller sets `abi_version` and zeroes the rest. Reply:
+  `total_slots`, `kernel_reserved_slots` (`total / 4`),
+  `application_thread_budget` (`total - reserved`), `live_tasks`,
+  `reservable_slots`, `kernel_stack_bytes`, `process_thread_ceiling`
+  (`total / 2`) and `root_process_ceiling` (`total / 4`). The fixed values come
+  from the single `multitask::task_capacity` authority; `live_tasks` and
+  `reservable_slots` are an instantaneous per-slot observation, not a
+  reservation. Its Ring3 consumer is loaderd, which grants application Job
+  limits from it (`docs/architecture/job-model.md`, "Application Job request
+  and grant"); the kernel stack size is observed here, not restated. Linux
+  `clone(CLONE_THREAD)` refusals map from the typed
+  `SpawnTaskError`: kernel stack or Job thread-memory failure `ENOMEM`; task
+  table, per-process ceiling, Job `threads.max`/`processes.max`, exiting or
+  exec-in-progress process, and transient creator/publication refusals
+  `EAGAIN` (Linux `copy_process` also answers `EAGAIN` to `CLONE_THREAD` during
+  group exit). Each cause has its own `linux-thread-clone-stage` stage
+  (11 task table, 14 kernel stack, 15 per-process ceiling, 16 Job threads,
+  17 Job thread memory, 18 exiting, 19 exec, 20 creator, 21 publication,
+  22 materialization, 23 Job processes); the record's address word carries the
+  rejecting authority limit's value.
 - SYS_RUSTOS_JOB_KMEM (0x5255_005e): versioned INSPECT and SET_LIMIT for the
   exact boxed ProcessObject allocation byte dimension, plus INSPECT_CLASS and
   SET_CLASS_LIMIT for six separately accounted classes: handle-table slots,

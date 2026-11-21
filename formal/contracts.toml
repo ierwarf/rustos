@@ -2832,9 +2832,10 @@ evidence_max_age_hours = 168
 # the critical multi-owner models below; do not silently lower a model depth.
 # Broader model inventory remains a nightly qualification lane.
 tlc_max_wall_seconds = 120
-# Reuse only exact, recent pass evidence.  The validator binds the TLA/CFG,
-# pinned TLC binary, deadlock policy, workers, fingerprint, and seed.
-tlc_reuse_max_age_hours = 24
+# Reuse only exact, recent pass evidence matching `evidence_max_age_hours`.
+# The validator binds the TLA/CFG, pinned TLC binary, deadlock policy, workers,
+# fingerprint, and seed; nightly still re-runs everything with reuse off.
+tlc_reuse_max_age_hours = 168
 # PR and SMP-iteration invoke TLC with the same exhaustive execution policy.
 # Permit either profile's exact-input result to satisfy the other only because
 # this allow-list is reciprocal; release still runs every non-TLC PR lane.

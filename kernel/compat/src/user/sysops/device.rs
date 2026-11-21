@@ -16,6 +16,11 @@ use crate::user::sysops::usermem;
 use rustos_user_abi::device as device_abi;
 use rustos_user_abi::syscall::VFS_DEVICE_ACCESS_DRM_COMPAT;
 
+/// DRM_IOCTL_VERSION identity, reported identically by the current-process and
+/// process-state ioctl paths.
+const DRM_DRIVER_NAME: &[u8] = b"rustos-virtio-gpu";
+const DRM_DRIVER_DATE: &[u8] = b"20260703";
+const DRM_DRIVER_DESC: &[u8] = b"RustOS virtio-gpu KMS compatibility";
 const DRM_IOCTL_BASE: u8 = b'd';
 const DRM_MODE_CONNECTED: u32 = 1;
 const DRM_MODE_CONNECTOR_VIRTUAL: u32 = 15;
@@ -402,12 +407,12 @@ fn ioctl_current_drm_device(
         DRM_IOCTL_VERSION => {
             let mut version = read_current_struct::<DrmVersion>(arg)?;
             fill_drm_version_fields(&mut version);
-            copy_current_user_string(version.name, version.name_len, b"rustos-virtio-gpu")?;
-            copy_current_user_string(version.date, version.date_len, b"20260703")?;
+            copy_current_user_string(version.name, version.name_len, DRM_DRIVER_NAME)?;
+            copy_current_user_string(version.date, version.date_len, DRM_DRIVER_DATE)?;
             copy_current_user_string(
                 version.desc,
                 version.desc_len,
-                b"RustOS virtio-gpu KMS compatibility",
+                DRM_DRIVER_DESC,
             )?;
             set_drm_version_lengths(&mut version);
             write_current_struct(arg, &version)?;
@@ -598,9 +603,9 @@ fn fill_drm_version_fields(version: &mut DrmVersion) {
 }
 
 fn set_drm_version_lengths(version: &mut DrmVersion) {
-    version.name_len = b"rustos-virtio-gpu".len() as u64;
-    version.date_len = b"20260703".len() as u64;
-    version.desc_len = b"RustOS virtio-gpu KMS compatibility".len() as u64;
+    version.name_len = DRM_DRIVER_NAME.len() as u64;
+    version.date_len = DRM_DRIVER_DATE.len() as u64;
+    version.desc_len = DRM_DRIVER_DESC.len() as u64;
 }
 
 fn drm_cap_value(capability: u64) -> u64 {
@@ -706,18 +711,16 @@ fn drm_ioctl_version(
         process_state,
         version.name,
         version.name_len,
-        b"rustos-virtio-gpu",
+        DRM_DRIVER_NAME,
     )?;
-    copy_user_string(process_state, version.date, version.date_len, b"20260703")?;
+    copy_user_string(process_state, version.date, version.date_len, DRM_DRIVER_DATE)?;
     copy_user_string(
         process_state,
         version.desc,
         version.desc_len,
-        b"RustOS virtio-gpu KMS compatibility",
+        DRM_DRIVER_DESC,
     )?;
-    version.name_len = b"rustos-virtio-gpu".len() as u64;
-    version.date_len = b"20260703".len() as u64;
-    version.desc_len = b"RustOS virtio-gpu KMS compatibility".len() as u64;
+    set_drm_version_lengths(&mut version);
     write_process_struct(process_state, arg, &version)?;
     Ok(0)
 }

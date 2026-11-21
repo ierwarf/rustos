@@ -460,6 +460,7 @@ fn stat_node(node: Node, number: u64, flags: u64, out: StatOut) -> Result<u64, i
         dev: anon_stat::DEV_PROCFS,
         ino: abi_procfs::node_inode(pid, node, number),
         mode: node.mode(),
+        nlink: anon_stat::proc_node_nlink(Some(pid), node),
         size: 0,
     };
     let (uid, gid) = anon_stat::owner_ids();

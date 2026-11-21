@@ -17,6 +17,8 @@ mod entropy_broker_ops;
 mod input_broker_ops;
 #[path = "job_ops.rs"]
 mod job_ops;
+#[path = "task_capacity_ops.rs"]
+mod task_capacity_ops;
 #[path = "checkpoint_journal_ops.rs"]
 mod checkpoint_journal_ops;
 #[path = "service_policy_ops.rs"]
@@ -35,6 +37,7 @@ use early_system_broker_ops::*;
 use entropy_broker_ops::*;
 use input_broker_ops::*;
 use job_ops::*;
+use task_capacity_ops::*;
 use checkpoint_journal_ops::*;
 use service_policy_ops::*;
 use job_policy_ops::*;
@@ -67,6 +70,7 @@ pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_JOB_SESSION
             | linux_abi::SYS_RUSTOS_JOB_MEMORY_QOS
             | linux_abi::SYS_RUSTOS_JOB_KMEM
+            | linux_abi::SYS_RUSTOS_TASK_CAPACITY
             | linux_abi::SYS_RUSTOS_CHECKPOINT_JOURNAL
             | linux_abi::SYS_RUSTOS_SERVICE_POLICY
             | linux_abi::SYS_RUSTOS_SCHEDULING_CONTEXT_GRANT_BROKER
@@ -109,6 +113,7 @@ pub(super) fn dispatch_linux_rustos_broker_syscall(frame: &SyscallFrame) -> u64 
         linux_abi::SYS_RUSTOS_JOB_SESSION => syscall_linux_rustos_job_session(frame.rdi),
         linux_abi::SYS_RUSTOS_JOB_MEMORY_QOS => syscall_linux_rustos_job_memory_qos(frame.rdi),
         linux_abi::SYS_RUSTOS_JOB_KMEM => syscall_linux_rustos_job_kmem(frame.rdi),
+        linux_abi::SYS_RUSTOS_TASK_CAPACITY => syscall_linux_rustos_task_capacity(frame.rdi),
         linux_abi::SYS_RUSTOS_CHECKPOINT_JOURNAL =>
             syscall_linux_rustos_checkpoint_journal(frame.rdi),
         linux_abi::SYS_RUSTOS_SERVICE_POLICY => syscall_linux_rustos_service_policy(frame.rdi),

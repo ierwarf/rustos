@@ -1,3 +1,26 @@
+/// Capacity, in 512-byte protocol sectors, of a private storage-DVM disk.
+///
+/// The image must be non-empty and a whole number of the declared logical
+/// blocks (`DVM_STORAGE_LOGICAL_BLOCK_BYTES`): QEMU would otherwise round the
+/// capacity the guest sees, and the relay would reject the signed header.
+fn dvm_storage_capacity_sectors(disk_bytes: u64) -> Result<u64> {
+    if disk_bytes == 0 || !disk_bytes.is_multiple_of(u64::from(DVM_STORAGE_LOGICAL_BLOCK_BYTES)) {
+        bail!(
+            "private storage-DVM disk must be non-empty and a whole number of {DVM_STORAGE_LOGICAL_BLOCK_BYTES}-byte logical blocks"
+        );
+    }
+    Ok(disk_bytes / 512)
+}
+
+/// True when a live header describes exactly the declared storage geometry over
+/// a backing disk of `disk_bytes`.
+fn dvm_storage_header_geometry_matches(header: &DvmBlockHeader, disk_bytes: u64) -> bool {
+    dvm_storage_capacity_sectors(disk_bytes)
+        .is_ok_and(|sectors| header.capacity_sectors == sectors)
+        && header.logical_block_size == DVM_STORAGE_LOGICAL_BLOCK_BYTES
+        && header.physical_block_size == DVM_STORAGE_PHYSICAL_BLOCK_BYTES
+}
+
 pub(crate) fn dvm_writable_block_header(
     generation: u64,
     capacity_sectors: u64,
@@ -61,18 +84,17 @@ pub(crate) fn create_writable_dvm_block_aperture(
     let disk_bytes = fs::metadata(disk)
         .with_context(|| format!("inspect private storage-DVM disk {}", disk.display()))?
         .len();
-    if disk_bytes == 0 || !disk_bytes.is_multiple_of(512) {
-        bail!("private writable storage-DVM disk must be non-empty and 512-byte aligned");
-    }
+    let capacity_sectors = dvm_storage_capacity_sectors(disk_bytes)
+        .context("private writable storage-DVM disk geometry")?;
     write_signed_dvm_block_aperture(
         path,
         disk,
         signing_key_path,
         dvm_writable_block_header(
             1,
-            disk_bytes / 512,
-            512,
-            512,
+            capacity_sectors,
+            DVM_STORAGE_LOGICAL_BLOCK_BYTES,
+            DVM_STORAGE_PHYSICAL_BLOCK_BYTES,
             DVM_BLOCK_FEATURE_FLUSH | driver_domain_protocol::DVM_BLOCK_FEATURE_FUA,
         ),
     )
@@ -93,8 +115,11 @@ fn dvm_read_only_block_header(
         features,
     );
     // The signed transport contract must describe the actual QEMU block
-    // device mode. The Linux relay rejects a read-only device paired with a
-    // writable header before it publishes DVM readiness.
+    // device mode (`readonly=on` surfaces as the virtio-blk read-only feature
+    // and Linux `BLKROGET`). The Linux relay rejects a read-only device paired
+    // with a writable header, and a writable device paired with a read-only
+    // header, before it publishes DVM readiness; it never opens a read-only
+    // transport's device writable.
     header.flags = DVM_BLOCK_FLAG_READ_ONLY;
     header
 }
@@ -125,18 +150,17 @@ fn create_dvm_block_aperture(path: &Path, disk: &Path, signing_key_path: &Path) 
     let disk_bytes = fs::metadata(disk)
         .with_context(|| format!("inspect private storage-DVM disk {}", disk.display()))?
         .len();
-    if disk_bytes == 0 || !disk_bytes.is_multiple_of(u64::from(DVM_BLOCK_MEDIA_BLOCK_BYTES)) {
-        bail!("private storage-DVM disk must be non-empty and CD-media-block aligned");
-    }
+    let capacity_sectors = dvm_storage_capacity_sectors(disk_bytes)
+        .context("private storage-DVM disk geometry")?;
     write_signed_dvm_block_aperture(
         path,
         disk,
         signing_key_path,
         dvm_read_only_block_header(
             1,
-            disk_bytes / 512,
-            DVM_BLOCK_MEDIA_BLOCK_BYTES,
-            DVM_BLOCK_MEDIA_BLOCK_BYTES,
+            capacity_sectors,
+            DVM_STORAGE_LOGICAL_BLOCK_BYTES,
+            DVM_STORAGE_PHYSICAL_BLOCK_BYTES,
             DVM_BLOCK_MEDIA_FEATURES,
         ),
     )
@@ -154,9 +178,7 @@ fn rotate_dvm_block_epoch(path: &Path, disk: &Path, signing_key_path: &Path) -> 
     let disk_bytes = fs::metadata(disk)
         .with_context(|| format!("inspect private storage-DVM disk {}", disk.display()))?
         .len();
-    if disk_bytes == 0 || !disk_bytes.is_multiple_of(u64::from(DVM_BLOCK_MEDIA_BLOCK_BYTES)) {
-        bail!("private storage-DVM disk must remain non-empty and CD-media-block aligned");
-    }
+    dvm_storage_capacity_sectors(disk_bytes).context("private storage-DVM disk geometry")?;
     let signing_key = crate::storage_epoch::load_signing_key(signing_key_path)?;
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -177,7 +199,7 @@ fn rotate_dvm_block_epoch(path: &Path, disk: &Path, signing_key_path: &Path) -> 
     if predecessor.flags & DVM_BLOCK_FLAG_READ_ONLY == 0 {
         bail!("refusing to rotate a writable DVM block transport epoch");
     }
-    if predecessor.capacity_sectors != disk_bytes / 512 {
+    if !dvm_storage_header_geometry_matches(&predecessor, disk_bytes) {
         bail!("live DVM block epoch geometry diverged from its private backing disk");
     }
     let generation = predecessor

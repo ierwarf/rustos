@@ -794,6 +794,7 @@ fn begin_rpc_launch(
             console_hosted: metadata.console_hosted,
             args: metadata.args,
             env: metadata.env,
+            application_request: metadata.application_request,
             private_smp_qualification: None,
         },
         key,
@@ -1201,6 +1202,7 @@ mod tests {
                 args: vec![String::from("/apps/chrome/chrome")],
                 env: Vec::new(),
                 runtime_deps: Vec::new(),
+                application_request: runtime_control::ApplicationRequest::NONE,
             },
         );
         let now = runtime_control::monotonic_nanos().unwrap();
@@ -1310,6 +1312,7 @@ mod tests {
             console_hosted: false,
             args: Vec::new(),
             env: Vec::new(),
+            application_request: runtime_control::ApplicationRequest::NONE,
             private_smp_qualification: None,
         };
         assert!(!launch_may_precede_ui_ready(&ordinary));

@@ -72,7 +72,9 @@ require_enabled CONFIG_UIO
 require_disabled CONFIG_UIO_PCI_GENERIC
 require_enabled CONFIG_VIRTIO_PCI
 require_enabled CONFIG_VIRTIO_NET
-require_enabled CONFIG_VIRTIO_BLK
+# The KVM storage volume is virtio-blk and S12 loads no module for it.
+require_builtin CONFIG_VIRTIO_PCI
+require_builtin CONFIG_VIRTIO_BLK
 require_enabled CONFIG_VIRTIO_CONSOLE
 require_enabled CONFIG_VIRTIO_INPUT
 require_enabled CONFIG_MEMORY_HOTPLUG
@@ -112,7 +114,8 @@ require_module CONFIG_DRM_AMDGPU
 require_enabled CONFIG_DRM_AMD_DC
 require_enabled CONFIG_DRM_FBDEV_EMULATION
 require_module CONFIG_BLK_DEV_SD
-require_builtin CONFIG_BLK_DEV_SR
+# Optical/ATAPI media is never an admitted storage namespace.
+require_disabled CONFIG_BLK_DEV_SR
 require_module CONFIG_ATA
 require_module CONFIG_SATA_AHCI
 require_module CONFIG_BLK_DEV_NVME

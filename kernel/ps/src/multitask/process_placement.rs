@@ -5,7 +5,7 @@ use crate::user::abi::UserAbi;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use process_table::ProcessHandle;
 use crate::multitask::slot_dir::AtomicDir;
-const MAX: usize = process_table::MAX_THREADS_PER_PROCESS;
+const MAX: usize = super::task_capacity::CAPACITY.process_thread_ceiling();
 type Member = (usize, u64);
 struct State {
     handle: Option<ProcessHandle>,

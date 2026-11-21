@@ -18,6 +18,10 @@ pub const VFS_EXECUTABLE_SNAPSHOT_MAX_LEASE_MS: u64 = 120_000;
 /// Ring3 materialization policy, not a filesystem or Ring0 address limit.
 /// vfsd separately reserves final frames, metadata and scratch before reading.
 pub const VFS_EXECUTABLE_SNAPSHOT_MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+/// Bytes moved per bounded transfer of an immutable executable image: vfsd's
+/// snapshot write window, loaderd's ELF read/digest window and the early-system
+/// broker's per-call ceiling are all this one value.
+pub const EXECUTABLE_IMAGE_TRANSFER_WINDOW_BYTES: usize = 256 * 1024;
 /// Stage-root basis for trusted loaderd launches that do not replace a live
 /// process and therefore have no target PID cwd namespace.
 pub const VFS_EXECUTABLE_SNAPSHOT_DIRFD_ROOT: u64 = 0;

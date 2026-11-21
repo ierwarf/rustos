@@ -335,6 +335,9 @@ def run_cargo_command(
     env = os.environ.copy()
     env["CARGO_TARGET_DIR"] = str(target_dir)
     env["CARGO_INCREMENTAL"] = "1"
+    # Mutation witnesses only observe compile/test pass vs kill, so dropping DWARF
+    # inside the runner's isolated target tree avoids writing and linking debuginfo.
+    env.setdefault("CARGO_PROFILE_DEV_DEBUG", "0")
     started = time.monotonic()
     # Cargo launches libtest as a child. subprocess.run(timeout=...) kills
     # Cargo alone: a spinning mutant can then survive for hours, consuming a
@@ -1099,9 +1102,38 @@ def evaluate_mutation(
     }
 
 
-# A shard's own `CARGO_TARGET_DIR` measured ~1.4 GiB warm, plus its checkout.
-SHARD_DISK_BUDGET_BYTES = 3 * 1024 * 1024 * 1024
-SHARD_MEMORY_BUDGET_BYTES = 3 * 1024 * 1024 * 1024
+# A shard's own `CARGO_TARGET_DIR` measured ~1.5 GiB warm with line-tables (less
+# with debug=0), and one rustc+lld shard fits well under 2 GiB resident set.
+SHARD_DISK_BUDGET_BYTES = 2 * 1024 * 1024 * 1024
+SHARD_MEMORY_BUDGET_BYTES = 2 * 1024 * 1024 * 1024
+
+# Empirical per-mutant rebuild/link weights (ms) used for LPT shard balancing so
+# fast crates do not finish early and leave slow kernel-ps shards under-utilized.
+_PACKAGE_UNIT_WEIGHT_MS = {
+    "kernel-ps": 5_000,
+    "kernel-ipc-runtime": 3_900,
+    "kernel-compat": 2_800,
+}
+
+
+def partition_shard_buckets(
+    ordered: list[dict[str, str | int]], shards: int
+) -> list[list[dict[str, str | int]]]:
+    """Distribute whole-file mutation groups across shards by weighted LPT cost."""
+    buckets: list[list[dict[str, str | int]]] = [[] for _ in range(shards)]
+    by_source: dict[str, list[dict[str, str | int]]] = {}
+    for mutation in ordered:
+        by_source.setdefault(str(mutation["source"]), []).append(mutation)
+
+    def group_cost(group: list[dict[str, str | int]]) -> int:
+        return sum(_PACKAGE_UNIT_WEIGHT_MS.get(str(m["package"]), 1_000) for m in group)
+
+    loads = [0] * shards
+    for group in sorted(by_source.values(), key=lambda g: (group_cost(g), len(g)), reverse=True):
+        lightest = min(range(shards), key=lambda i: (loads[i], i))
+        buckets[lightest].extend(group)
+        loads[lightest] += group_cost(group)
+    return buckets
 
 
 def available_memory_bytes() -> int:
@@ -1189,20 +1221,7 @@ def run_shards(
             checkout, target_dir, artifact_dir, ordered, originals
         )
 
-    buckets: list[list[dict[str, str | int]]] = [[] for _ in range(shards)]
-    by_source: dict[str, list[dict[str, str | int]]] = {}
-    for mutation in ordered:
-        by_source.setdefault(str(mutation["source"]), []).append(mutation)
-    # Longest-processing-time-first onto the least loaded shard. Round-robin by
-    # file left the busiest shard with most of kernel-ps (over half of all
-    # mutants) while the others idled at a load average near 3, so the lane's
-    # wall time was one shard's. Whole files still stay together, which is what
-    # keeps cargo's incremental rebuild inside one crate per shard.
-    loads = [0] * shards
-    for group in sorted(by_source.values(), key=len, reverse=True):
-        lightest = min(range(shards), key=lambda i: (loads[i], i))
-        buckets[lightest].extend(group)
-        loads[lightest] += len(group)
+    buckets = partition_shard_buckets(ordered, shards)
 
     def run_bucket(index: int) -> list[dict[str, str | int]]:
         bucket = buckets[index]
@@ -1237,6 +1256,34 @@ def run_shards(
     return outcomes
 
 
+def changed_files(root: Path, base: str | None = None) -> set[str]:
+    """Repository-relative paths changed against ``base`` (default HEAD) plus untracked."""
+    changed = subprocess.check_output(
+        ["git", "diff", "--name-only", base or "HEAD", "--"], cwd=root, text=True
+    ).splitlines()
+    changed += subprocess.check_output(
+        ["git", "ls-files", "--others", "--exclude-standard"], cwd=root, text=True
+    ).splitlines()
+    return {path for path in changed if path}
+
+
+def changed_mutation_ids(root: Path, base: str | None = None) -> set[str]:
+    """Mutation IDs whose registry row was added or modified against ``base``."""
+    diff = subprocess.check_output(
+        ["git", "diff", "-U0", base or "HEAD", "--", "formal/implementation-mutations.tsv"],
+        cwd=root,
+        text=True,
+    )
+    ids: set[str] = set()
+    for line in diff.splitlines():
+        if not line.startswith("+") or line.startswith("+++") or line.startswith("+#"):
+            continue
+        identity = line[1:].split("\t", 1)[0].strip()
+        if identity:
+            ids.add(identity)
+    return ids
+
+
 def changed_packages(root: Path, base: str | None = None) -> set[str]:
     """Cargo packages owning a file changed against ``base`` (default HEAD).
 
@@ -1245,13 +1292,7 @@ def changed_packages(root: Path, base: str | None = None) -> set[str]:
     re-audits everything those could influence.
     """
     names: set[str] = set()
-    changed = subprocess.check_output(
-        ["git", "diff", "--name-only", base or "HEAD", "--"], cwd=root, text=True
-    ).splitlines()
-    changed += subprocess.check_output(
-        ["git", "ls-files", "--others", "--exclude-standard"], cwd=root, text=True
-    ).splitlines()
-    for relative in changed:
+    for relative in changed_files(root, base):
         current = (root / relative).parent
         while current != root and root in current.parents:
             manifest = current / "Cargo.toml"
@@ -1269,20 +1310,48 @@ def changed_packages(root: Path, base: str | None = None) -> set[str]:
     return names
 
 
+def _package_root_for(root: Path, raw_source: str) -> Path:
+    current = (root / raw_source).parent
+    while current != root and not (current / "Cargo.toml").is_file():
+        current = current.parent
+    return current
+
+
+def _mutation_matches_touched_files(
+    root: Path,
+    mutation: dict[str, str | int],
+    touched_files: set[str],
+    touched_ids: set[str],
+) -> bool:
+    if str(mutation["id"]) in touched_ids or str(mutation["source"]) in touched_files:
+        return True
+    package_root = _package_root_for(root, str(mutation["source"]))
+    if package_root == root:
+        return False
+    leaf = str(mutation["test"]).rsplit("::", 1)[-1]
+    for path_raw, _ in witness_context_index(str(package_root)).get(leaf, ()):
+        rel = Path(path_raw).relative_to(root).as_posix()
+        if rel in touched_files:
+            return True
+    return False
+
+
 def select_for_profile(
+    root: Path,
     mutations: list[dict[str, str | int]],
     profile: str,
-    changed: set[str],
+    touched_files: set[str],
+    touched_ids: set[str] = frozenset(),  # type: ignore[assignment]
 ) -> tuple[list[dict[str, str | int]], list[dict[str, str | int]]]:
-    """Return (rows to execute, advisory rows not executed by this profile)."""
+    """Return (rows to execute, rows deferred to nightly because inputs are untouched)."""
     if profile not in PROFILES:
         raise SystemExit(f"unknown mutation profile {profile!r}")
+    if profile == "nightly":
+        return list(mutations), []
     selected: list[dict[str, str | int]] = []
     skipped: list[dict[str, str | int]] = []
     for mutation in mutations:
-        if mutation["severity"] in BLOCKING_SEVERITIES or profile == "nightly":
-            selected.append(mutation)
-        elif str(mutation["package"]) in changed:
+        if _mutation_matches_touched_files(root, mutation, touched_files, set(touched_ids)):
             selected.append(mutation)
         else:
             skipped.append(mutation)
@@ -1327,8 +1396,8 @@ def main() -> int:
         default="nightly",
         help=(
             "nightly (default): execute every row, any survivor fails; pr: execute "
-            "critical/high always and medium/low only for changed packages, "
-            "reporting medium/low survivors as warnings"
+            "rows whose mutated source, witness file, or registry entry changed "
+            "(blocking critical/high, warning medium/low); nightly audits all rows"
         ),
     )
     parser.add_argument(
@@ -1361,8 +1430,14 @@ def main() -> int:
             for mutation in mutations
             if str(mutation["id"]) in focused_ids
         ]
-    changed = (
-        changed_packages(root, os.environ.get("RUSTOS_MUTATION_CHANGED_BASE"))
+    base_rev = os.environ.get("RUSTOS_MUTATION_CHANGED_BASE")
+    touched_files = (
+        changed_files(root, base_rev)
+        if args.profile == "pr" and not focused_ids
+        else set()
+    )
+    touched_ids = (
+        changed_mutation_ids(root, base_rev)
         if args.profile == "pr" and not focused_ids
         else set()
     )
@@ -1370,7 +1445,9 @@ def main() -> int:
         # A focused run executes exactly what was asked for, whatever its severity.
         skipped: list[dict[str, str | int]] = []
     else:
-        mutations, skipped = select_for_profile(mutations, args.profile, changed)
+        mutations, skipped = select_for_profile(
+            root, mutations, args.profile, touched_files, touched_ids
+        )
     artifact_dir = root / "build/formal/implementation-mutations"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     target_dir = artifact_dir / "target"
@@ -1422,8 +1499,8 @@ def main() -> int:
         )
     if skipped:
         print(
-            f"implementation mutations: {len(skipped)} medium/low rows not executed "
-            f"under profile={args.profile} (no changed package); nightly executes them",
+            f"implementation mutations: {len(skipped)} rows not executed "
+            f"under profile={args.profile} (untouched source/witness); nightly executes them",
             file=sys.stderr,
         )
     if failures:

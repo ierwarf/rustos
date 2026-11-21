@@ -237,7 +237,8 @@ not proof of immutable content against independent writers/provider changes.
 
 Success for B is storage/snapshot admission, not a browser window. Preserve and
 report the next actual loader/runtime error instead of suppressing it or adding
-`--no-sandbox`, fake syscall success or automatic Chrome startup.
+fake syscall success or automatic Chrome startup. (`--no-sandbox` is allowed as
+the user-approved interim launch argument, 2026-11-21; see `apps/chrome/README.md`.)
 
 ## 6. Filesystem-specific guardrails
 

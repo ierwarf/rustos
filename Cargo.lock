@@ -1149,6 +1149,8 @@ name = "runtime-control"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustos-user-abi",
+ "session-profile",
 ]
 
 [[package]]
@@ -1162,6 +1164,7 @@ dependencies = [
  "rustos-component-model",
  "rustos-svc-runtime",
  "rustos-user-abi",
+ "session-profile",
 ]
 
 [[package]]
@@ -1361,6 +1364,10 @@ checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "session-profile"
+version = "0.1.0"
 
 [[package]]
 name = "sessiond"
@@ -2028,6 +2035,7 @@ dependencies = [
  "fatfs",
  "fs-err",
  "libc",
+ "runtime-control",
  "rustos-driver-domain-host",
  "rustos-fault-injection",
  "rustos-image-admission",
@@ -2036,6 +2044,7 @@ dependencies = [
  "rustos-user-abi",
  "serde",
  "serde_json",
+ "session-profile",
  "sha2",
  "storage-core",
  "storage-fat",

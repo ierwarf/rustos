@@ -1517,7 +1517,8 @@ static int read_block_evidence(struct block_evidence_sample *sample)
         strlen(sample->device) != 4U ||
         strspn(sample->device, "0123456789abcdef") != 4U ||
         (strcmp(sample->driver, "nvme") != 0 &&
-         strcmp(sample->driver, "ahci") != 0) ||
+         strcmp(sample->driver, "ahci") != 0 &&
+         strcmp(sample->driver, "virtio_blk") != 0) ||
         !safe_evidence_token(sample->bdf, 15U, 1) ||
         !safe_evidence_token(sample->block_name, 64U, 0) ||
         (strcmp(sample->read_only, "yes") != 0 &&

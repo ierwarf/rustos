@@ -7,8 +7,9 @@ use runtime_control::{
 };
 
 use super::{
-    boot_line, debug_line, RETRY_BACKOFF, UI_SERVER_BOOTSTRAP_ENV, UI_SERVER_CATALOG_WEIGHT_MICROS,
-    UI_SERVER_DESKTOP_FILE_ID, UI_SERVER_EXEC_PATH,
+    boot_line, debug_line, RETRY_BACKOFF, UI_SERVER_APPLICATION_REQUEST,
+    UI_SERVER_BOOTSTRAP_ENV, UI_SERVER_CATALOG_WEIGHT_MICROS, UI_SERVER_DESKTOP_FILE_ID,
+    UI_SERVER_EXEC_PATH,
 };
 use super::{BrokerState, LaunchEntry, ProgramMetadata};
 
@@ -315,6 +316,7 @@ fn validate_ui_bootstrap_metadata(programs: &BTreeMap<String, ProgramMetadata>) 
         || metadata.console_hosted
         || !metadata.args.is_empty()
         || metadata.env != expected_env
+        || metadata.application_request != UI_SERVER_APPLICATION_REQUEST
     {
         return Err(libc::EINVAL);
     }
@@ -350,6 +352,7 @@ fn load_launch_entries(
             console_hosted: metadata.console_hosted,
             args: metadata.args.clone(),
             env: metadata.env.clone(),
+            application_request: metadata.application_request,
             private_smp_qualification: None,
         });
     }
@@ -374,6 +377,7 @@ fn load_launch_entries(
             console_hosted: metadata.console_hosted,
             args: metadata.args,
             env: metadata.env,
+            application_request: metadata.application_request,
             private_smp_qualification: None,
         });
     }
@@ -435,6 +439,7 @@ fn program_metadata_from_desktop_entry(entry: DesktopProgramEntry) -> ProgramMet
         console_hosted: entry.console_hosted,
         args: entry.args,
         env: entry.env,
+        application_request: entry.application_request,
     }
 }
 
@@ -485,8 +490,8 @@ mod tests {
     use super::{
         launch_entry_priority, qualification_catalog_candidate,
         qualification_catalog_retry_backoff, validate_ui_bootstrap_metadata, LaunchEntry,
-        ProgramMetadata, StartupMode, UI_SERVER_BOOTSTRAP_ENV, UI_SERVER_CATALOG_WEIGHT_MICROS,
-        UI_SERVER_DESKTOP_FILE_ID, UI_SERVER_EXEC_PATH,
+        ProgramMetadata, StartupMode, UI_SERVER_APPLICATION_REQUEST, UI_SERVER_BOOTSTRAP_ENV,
+        UI_SERVER_CATALOG_WEIGHT_MICROS, UI_SERVER_DESKTOP_FILE_ID, UI_SERVER_EXEC_PATH,
     };
     use crate::kvm_smp_qualification::KvmSmpQualificationContract;
     use std::collections::BTreeMap;
@@ -504,6 +509,7 @@ mod tests {
             console_hosted: false,
             args: Vec::new(),
             env: Vec::new(),
+            application_request: runtime_control::ApplicationRequest::NONE,
             private_smp_qualification: None,
         }
     }
@@ -526,6 +532,7 @@ mod tests {
             runtime_deps: Vec::new(),
             hidden: false,
             no_display: false,
+            application_request: runtime_control::ApplicationRequest::NONE,
         };
         let mut replacement = manual.clone();
         replacement.exec = "/wrong".into();
@@ -630,6 +637,7 @@ mod tests {
                 .iter()
                 .map(|value| String::from(*value))
                 .collect(),
+            application_request: UI_SERVER_APPLICATION_REQUEST,
         };
         let mut programs = BTreeMap::from([(String::from(UI_SERVER_DESKTOP_FILE_ID), metadata)]);
         assert_eq!(validate_ui_bootstrap_metadata(&programs), Ok(()));
@@ -638,6 +646,17 @@ mod tests {
             .expect("uiserver metadata")
             .env
             .push(String::from("UNSEALED=1"));
+        assert_eq!(validate_ui_bootstrap_metadata(&programs), Err(libc::EINVAL));
+        programs
+            .get_mut(UI_SERVER_DESKTOP_FILE_ID)
+            .expect("uiserver metadata")
+            .env
+            .pop();
+        programs
+            .get_mut(UI_SERVER_DESKTOP_FILE_ID)
+            .expect("uiserver metadata")
+            .application_request
+            .threads += 1;
         assert_eq!(validate_ui_bootstrap_metadata(&programs), Err(libc::EINVAL));
     }
 }

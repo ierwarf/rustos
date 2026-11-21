@@ -97,6 +97,17 @@ _Static_assert((DVM_BLOCK_APERTURE_BYTES &
 #define BLOCK_EVIDENCE_FILE "block-evidence-v1.env"
 #define BLOCK_EVIDENCE_NEXT ".block-evidence-v1.next"
 #define BLOCK_WATCHDOG_TIMEOUT_MS 10000
+/* Kernel readahead window for the whole-disk node. The default (128 KiB) keeps
+ * at most two guest I/Os in flight for a sequential stream of 64 KiB slots. A
+ * larger window lets the page cache issue several merged requests
+ * concurrently. It is advisory: it changes no ordering, durability, or
+ * addressing property of any request. It was introduced against the former
+ * emulated ATAPI media (one command at a time) where it measured no gain; it
+ * has NOT been re-measured on the queued virtio-blk harness disk, so it is
+ * kept only as a bounded, advisory hint until a run compares read-stats. */
+#define BLOCK_READAHEAD_BYTES (2U * 1024U * 1024U)
+/* One bounded diagnostic line per this many completed reads. */
+#define BLOCK_READ_STATS_INTERVAL 256U
 
 struct block_header {
     uint64_t region_bytes;
@@ -156,6 +167,23 @@ struct transport {
     char uio_name[32];
 };
 
+/* Contiguous byte range of queued reads that the device may start early. */
+struct prefetch_range {
+    uint64_t offset;
+    uint64_t bytes;
+};
+
+/* Worker-private read accounting; the supervisor never touches it. */
+struct read_stats {
+    uint64_t reads;
+    uint64_t bytes;
+    uint64_t pread_ns;
+    uint64_t pread_ns_max;
+    uint64_t prefetch_calls;
+    uint64_t prefetch_bytes;
+    uint64_t prefetch_ns;
+};
+
 struct relay_state {
     struct transport transport;
     struct block_device device;
@@ -166,6 +194,11 @@ struct relay_state {
     bool ready_published;
     int watchdog_fd;
     _Atomic bool *quarantined;
+    /* Request cursor below which queued reads were already offered to the
+     * device. Monotonic, never exceeds the request producer. */
+    uint64_t prefetched_through;
+    bool prefetch_disabled;
+    struct read_stats stats;
 };
 
 struct watchdog_event {
@@ -556,6 +589,105 @@ static bool path_is_descendant(const char *path, const char *ancestor)
            (path[length] == '\0' || path[length] == '/');
 }
 
+/* Storage controller classes the relay admits. The class is decided from the
+ * identity the guest kernel itself published (PCI class code, bound driver and,
+ * for virtio, the virtio device type), never from the harness that created the
+ * device, so physical AHCI/NVMe passthrough and the paravirtual KVM-harness
+ * disk go through one admission. Exactly one admitted controller may exist; the
+ * block-size, capacity and read-only facts are then read from its namespace. */
+#define PCI_CLASS_STORAGE_SCSI 0x0100U
+#define PCI_CLASS_STORAGE_SATA 0x0106U
+#define PCI_CLASS_STORAGE_NVM 0x0108U
+#define PCI_VENDOR_VIRTIO 0x1af4U
+#define VIRTIO_ID_BLOCK 2U
+
+struct controller_identity {
+    uint32_t pci_class;        /* 24-bit PCI class code */
+    uint32_t pci_vendor;
+    char pci_driver[32];       /* driver bound to the PCI function */
+    unsigned int virtio_children;
+    uint32_t virtio_device;    /* virtio device type of the sole child */
+    char virtio_driver[32];    /* driver bound to the sole virtio child */
+};
+
+/* Returns the admitted controller driver name, or NULL when the PCI function
+ * is not an admitted storage controller class. The returned string is static
+ * and is the Linux driver that owns the block namespace. */
+static const char *classify_storage_controller(
+    const struct controller_identity *identity)
+{
+    uint32_t class_code = identity->pci_class >> 8;
+
+    if (class_code == PCI_CLASS_STORAGE_SATA &&
+        strcmp(identity->pci_driver, "ahci") == 0)
+        return "ahci";
+    if (class_code == PCI_CLASS_STORAGE_NVM &&
+        strcmp(identity->pci_driver, "nvme") == 0)
+        return "nvme";
+    if (class_code == PCI_CLASS_STORAGE_SCSI &&
+        identity->pci_vendor == PCI_VENDOR_VIRTIO &&
+        strcmp(identity->pci_driver, "virtio-pci") == 0 &&
+        identity->virtio_children == 1U &&
+        identity->virtio_device == VIRTIO_ID_BLOCK &&
+        strcmp(identity->virtio_driver, "virtio_blk") == 0)
+        return "virtio_blk";
+    return NULL;
+}
+
+static int read_bound_driver(const char *device_path, char *driver,
+                             size_t capacity)
+{
+    char link[PATH_MAX];
+    char resolved[PATH_MAX];
+
+    if (snprintf(link, sizeof(link), "%s/driver", device_path) >=
+        (int)sizeof(link) ||
+        realpath(link, resolved) == NULL)
+        return -1;
+    if (snprintf(driver, capacity, "%s", path_basename(resolved)) >=
+        (int)capacity) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+/* Fill the virtio part of the identity from the `virtioN` children of a PCI
+ * function. More than one child, or an unreadable one, leaves the identity
+ * unclassifiable rather than guessing which child owns the namespace. */
+static void read_virtio_children(const char *pci_path,
+                                 struct controller_identity *identity)
+{
+    char pattern[PATH_MAX];
+    glob_t matches;
+    size_t index;
+
+    identity->virtio_children = 0U;
+    if (snprintf(pattern, sizeof(pattern), "%s/virtio*", pci_path) >=
+        (int)sizeof(pattern))
+        return;
+    memset(&matches, 0, sizeof(matches));
+    if (glob(pattern, 0, NULL, &matches) != 0)
+        return;
+    for (index = 0U; index < matches.gl_pathc; index++) {
+        char device_path[PATH_MAX];
+        uint64_t device_type;
+
+        if (snprintf(device_path, sizeof(device_path), "%s/device",
+                     matches.gl_pathv[index]) >= (int)sizeof(device_path) ||
+            read_u64_file(device_path, &device_type) != 0 ||
+            device_type > UINT32_MAX)
+            continue;
+        identity->virtio_children++;
+        identity->virtio_device = (uint32_t)device_type;
+        if (read_bound_driver(matches.gl_pathv[index],
+                              identity->virtio_driver,
+                              sizeof(identity->virtio_driver)) != 0)
+            identity->virtio_driver[0] = '\0';
+    }
+    globfree(&matches);
+}
+
 static int find_storage_controller(char *controller, size_t controller_capacity,
                                    char *driver, size_t driver_capacity)
 {
@@ -570,30 +702,31 @@ static int find_storage_controller(char *controller, size_t controller_capacity,
         return -1;
     }
     for (index = 0U; index < matches.gl_pathc; index++) {
-        char class_path[PATH_MAX];
-        char driver_path[PATH_MAX];
-        char class_name[32];
+        char attribute[PATH_MAX];
         char resolved_controller[PATH_MAX];
-        char resolved_driver[PATH_MAX];
-        const char *driver_name;
+        struct controller_identity identity;
+        uint64_t value;
+        const char *admitted;
 
-        if (snprintf(class_path, sizeof(class_path), "%s/class",
-                     matches.gl_pathv[index]) >= (int)sizeof(class_path) ||
-            snprintf(driver_path, sizeof(driver_path), "%s/driver",
-                     matches.gl_pathv[index]) >= (int)sizeof(driver_path) ||
-            read_text_file(class_path, class_name, sizeof(class_name)) != 0)
+        memset(&identity, 0, sizeof(identity));
+        if (snprintf(attribute, sizeof(attribute), "%s/class",
+                     matches.gl_pathv[index]) >= (int)sizeof(attribute) ||
+            read_u64_file(attribute, &value) != 0 || value > 0xffffffU)
             continue;
-        if (strncmp(class_name, "0x0106", 6U) != 0 &&
-            strncmp(class_name, "0x0108", 6U) != 0)
+        identity.pci_class = (uint32_t)value;
+        if (snprintf(attribute, sizeof(attribute), "%s/vendor",
+                     matches.gl_pathv[index]) >= (int)sizeof(attribute) ||
+            read_u64_file(attribute, &value) != 0 || value > 0xffffU)
             continue;
-        if (realpath(matches.gl_pathv[index], resolved_controller) == NULL ||
-            realpath(driver_path, resolved_driver) == NULL)
+        identity.pci_vendor = (uint32_t)value;
+        if (read_bound_driver(matches.gl_pathv[index], identity.pci_driver,
+                              sizeof(identity.pci_driver)) != 0 ||
+            realpath(matches.gl_pathv[index], resolved_controller) == NULL)
             continue;
-        driver_name = path_basename(resolved_driver);
-        if ((strncmp(class_name, "0x0106", 6U) == 0 &&
-             strcmp(driver_name, "ahci") != 0) ||
-            (strncmp(class_name, "0x0108", 6U) == 0 &&
-             strcmp(driver_name, "nvme") != 0))
+        if ((identity.pci_class >> 8) == PCI_CLASS_STORAGE_SCSI)
+            read_virtio_children(resolved_controller, &identity);
+        admitted = classify_storage_controller(&identity);
+        if (admitted == NULL)
             continue;
         found++;
         if (found != 1U) {
@@ -602,7 +735,7 @@ static int find_storage_controller(char *controller, size_t controller_capacity,
         }
         if (snprintf(controller, controller_capacity, "%s",
                      resolved_controller) >= (int)controller_capacity ||
-            snprintf(driver, driver_capacity, "%s", driver_name) >=
+            snprintf(driver, driver_capacity, "%s", admitted) >=
                 (int)driver_capacity) {
             errno = ENAMETOOLONG;
             goto out;
@@ -730,7 +863,8 @@ static int open_block_device(struct block_device *device,
     int logical;
     int physical;
     int read_only;
-    bool opened_write = true;
+    const bool header_read_only =
+        (header->flags & DVM_BLOCK_FLAG_READ_ONLY) != 0U;
 
     memset(device, 0, sizeof(*device));
     device->fd = -1;
@@ -768,11 +902,13 @@ static int open_block_device(struct block_device *device,
         return -1;
     }
 
-    device->fd = open(node, O_RDWR | O_CLOEXEC);
-    if (device->fd < 0) {
-        opened_write = false;
-        device->fd = open(node, O_RDONLY | O_CLOEXEC);
-    }
+    /* The signed header decides the access mode before the device is touched:
+     * a read-only transport never holds a writable descriptor, so no request
+     * handling bug can write to media the L0 declared immutable, and a
+     * writable transport requires a writable descriptor. The kernel then has
+     * to agree through BLKROGET below (QEMU `readonly=on` surfaces as the
+     * virtio-blk/NVMe/SCSI read-only bit, which sets the disk read-only). */
+    device->fd = open(node, (header_read_only ? O_RDONLY : O_RDWR) | O_CLOEXEC);
     if (device->fd < 0 ||
         ioctl(device->fd, BLKGETSIZE64, &capacity_bytes) != 0 ||
         ioctl(device->fd, BLKSSZGET, &logical) != 0 ||
@@ -780,9 +916,14 @@ static int open_block_device(struct block_device *device,
         ioctl(device->fd, BLKROGET, &read_only) != 0 ||
         capacity_bytes == 0U || capacity_bytes % 512U != 0U ||
         logical <= 0 || physical <= 0) {
+        int saved_errno = errno;
+
         if (device->fd >= 0)
             close(device->fd);
         device->fd = -1;
+        relay_log("rustos-dvm-block: block-device rejected stage=namespace-query device=%s errno=%d\n",
+                  device->name, saved_errno);
+        errno = saved_errno;
         return -1;
     }
     device->read_only = read_only != 0;
@@ -793,9 +934,7 @@ static int open_block_device(struct block_device *device,
     if (device->capacity_sectors != header->capacity_sectors ||
         device->logical_block_size != header->logical_block_size ||
         device->physical_block_size != header->physical_block_size ||
-        (!device->read_only && !opened_write) ||
-        device->read_only !=
-            ((header->flags & DVM_BLOCK_FLAG_READ_ONLY) != 0U) ||
+        device->read_only != header_read_only ||
         ((header->features & DVM_BLOCK_FEATURE_DISCARD) != 0U &&
          (queue_feature_bytes(device->name, "discard_max_bytes",
                               &discard_bytes) != 0 ||
@@ -804,11 +943,27 @@ static int open_block_device(struct block_device *device,
          (queue_feature_bytes(device->name, "write_zeroes_max_bytes",
                               &zero_bytes) != 0 ||
           zero_bytes == 0U))) {
+        /* The signed L0 header is the contract; the device the guest kernel
+         * discovered is the evidence. Name both sides so a harness/QEMU
+         * geometry or read-only disagreement is diagnosable from the log. */
+        relay_log("rustos-dvm-block: block-device rejected stage=geometry device=%s"
+                  " sectors=%" PRIu64 "/%" PRIu64
+                  " logical=%u/%u physical=%u/%u read_only=%d/%d"
+                  " (device/header)\n",
+                  device->name, device->capacity_sectors,
+                  header->capacity_sectors, device->logical_block_size,
+                  header->logical_block_size, device->physical_block_size,
+                  header->physical_block_size, device->read_only ? 1 : 0,
+                  header_read_only ? 1 : 0);
         close(device->fd);
         device->fd = -1;
         errno = EPROTO;
         return -1;
     }
+    if (ioctl(device->fd, BLKRASET,
+              (unsigned long)(BLOCK_READAHEAD_BYTES / 512U)) != 0)
+        relay_log("rustos-dvm-block: readahead window unchanged errno=%d\n",
+                  errno);
     return 0;
 }
 
@@ -964,6 +1119,18 @@ static int pwrite_full(int fd, const volatile uint8_t *buffer, size_t bytes,
     return 0;
 }
 
+static inline void wc_store_fence(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__("sfence" ::: "memory");
+#else
+    atomic_thread_fence(memory_order_release);
+#endif
+}
+
+static uint8_t read_bounce[DVM_BLOCK_DATA_SLOT_BYTES]
+    __attribute__((aligned(4096)));
+
 static int execute_request(struct relay_state *state,
                            const struct block_request *request,
                            struct block_completion *completion)
@@ -988,8 +1155,17 @@ static int execute_request(struct relay_state *state,
     if (result == 0) {
         switch (request->operation) {
         case DVM_BLOCK_OP_READ:
-            result = pread_full(state->device.fd, slot, request->data_len,
-                                offset);
+            if (request->data_len > sizeof(read_bounce)) {
+                errno = EINVAL;
+                result = -1;
+            } else {
+                result = pread_full(state->device.fd, read_bounce,
+                                    request->data_len, offset);
+                if (result == 0) {
+                    memcpy((void *)slot, read_bounce, request->data_len);
+                    wc_store_fence();
+                }
+            }
             break;
         case DVM_BLOCK_OP_WRITE:
             result = pwrite_full(state->device.fd, slot, request->data_len,
@@ -1116,9 +1292,137 @@ static int publish_watchdog_completion(struct relay_state *state,
     record = state->transport.base + DVM_BLOCK_COMPLETION_RING_OFFSET +
              (event->completion_producer % DVM_BLOCK_QUEUE_DEPTH) * DVM_BLOCK_RECORD_BYTES;
     write_record(record, event->completion);
+    wc_store_fence();
     store_cursor(state->transport.base, REQUEST_CONSUMER_OFFSET, event->request_consumer + 1U, __ATOMIC_RELEASE);
     store_cursor(state->transport.base, COMPLETION_PRODUCER_OFFSET, event->completion_producer + 1U, __ATOMIC_RELEASE);
     return 0;
+}
+
+static uint64_t monotonic_ns(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0U;
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
+/* Collect the contiguous byte ranges of the read requests published in
+ * [first, producer). Scanning stops at the first record that is not a
+ * well-formed read, so a write, flush or malformed record is never reordered
+ * around or interpreted here; request admission still happens, unchanged, when
+ * the drain loop reaches that record. Adjacent reads merge into one range.
+ * `*scanned_through` is the first cursor that was not examined. */
+static size_t plan_prefetch(const struct relay_state *state, uint64_t first,
+                            uint64_t producer,
+                            struct prefetch_range ranges[DVM_BLOCK_QUEUE_DEPTH],
+                            uint64_t *scanned_through)
+{
+    size_t count = 0U;
+    uint64_t cursor = first;
+
+    if (producer < first || producer - first > DVM_BLOCK_QUEUE_DEPTH) {
+        *scanned_through = first;
+        return 0U;
+    }
+    for (; cursor < producer; cursor++) {
+        const volatile uint8_t *record =
+            state->transport.base + DVM_BLOCK_REQUEST_RING_OFFSET +
+            (cursor % DVM_BLOCK_QUEUE_DEPTH) * DVM_BLOCK_RECORD_BYTES;
+        struct block_request request;
+        off_t offset;
+
+        if (decode_request(record, &request) != 0 ||
+            request.operation != DVM_BLOCK_OP_READ ||
+            request.generation != state->header.generation ||
+            !valid_data_range(&state->header, &request) ||
+            checked_offset(&request, &offset) != 0)
+            break;
+        if (count != 0U &&
+            ranges[count - 1U].offset + ranges[count - 1U].bytes ==
+                (uint64_t)offset) {
+            ranges[count - 1U].bytes += request.data_len;
+        } else {
+            ranges[count].offset = (uint64_t)offset;
+            ranges[count].bytes = request.data_len;
+            count++;
+        }
+    }
+    *scanned_through = cursor;
+    return count;
+}
+
+/* Offer every queued read to the kernel before executing the first one.
+ *
+ * The relay executes requests one at a time, and RustOS keeps up to sixteen
+ * sequential 64 KiB windows queued. Executing them with synchronous pread
+ * alone lets the page cache see only the request at hand, so the emulated
+ * controller pays its per-command latency once per window. readahead(2) only
+ * starts I/O into the page cache; the pread that follows still produces the
+ * bytes, in order, with the same error semantics. Failure is not an error: the
+ * pread path is complete without it. Runs after the watchdog "begin" event, so
+ * a stuck device is bounded by the same deadline as the request itself. */
+static void prefetch_pending_reads(struct relay_state *state,
+                                   uint64_t request_consumer)
+{
+    struct prefetch_range ranges[DVM_BLOCK_QUEUE_DEPTH];
+    uint64_t first = request_consumer;
+    uint64_t producer;
+    uint64_t scanned_through;
+    uint64_t started;
+    size_t count;
+    size_t index;
+
+    if (state->prefetch_disabled)
+        return;
+    /* Reload: RustOS keeps appending while earlier windows execute. Records
+     * below an Acquire-loaded producer are fully published. */
+    producer = load_cursor(state->transport.base, REQUEST_PRODUCER_OFFSET,
+                           __ATOMIC_ACQUIRE);
+    if (!valid_cursor_pair(producer, request_consumer))
+        return;
+    if (first < state->prefetched_through)
+        first = state->prefetched_through;
+    if (first >= producer)
+        return;
+    count = plan_prefetch(state, first, producer, ranges, &scanned_through);
+    if (scanned_through == first)
+        return;
+    started = monotonic_ns();
+    for (index = 0U; index < count; index++) {
+        if (readahead(state->device.fd, (off_t)ranges[index].offset,
+                      (size_t)ranges[index].bytes) != 0) {
+            relay_log("rustos-dvm-block: readahead disabled errno=%d\n", errno);
+            state->prefetch_disabled = true;
+            break;
+        }
+        state->stats.prefetch_calls++;
+        state->stats.prefetch_bytes += ranges[index].bytes;
+    }
+    state->stats.prefetch_ns += monotonic_ns() - started;
+    state->prefetched_through = scanned_through;
+}
+
+static void account_read(struct relay_state *state, uint32_t bytes,
+                         uint64_t elapsed_ns)
+{
+    struct read_stats *stats = &state->stats;
+
+    stats->reads++;
+    stats->bytes += bytes;
+    stats->pread_ns += elapsed_ns;
+    if (elapsed_ns > stats->pread_ns_max)
+        stats->pread_ns_max = elapsed_ns;
+    if (stats->reads % BLOCK_READ_STATS_INTERVAL != 0U)
+        return;
+    relay_log("rustos-dvm-block: read-stats reads=%" PRIu64 " bytes=%" PRIu64
+              " pread_us=%" PRIu64 " pread_max_us=%" PRIu64
+              " readahead_calls=%" PRIu64 " readahead_bytes=%" PRIu64
+              " readahead_us=%" PRIu64 "\n",
+              stats->reads, stats->bytes, stats->pread_ns / 1000U,
+              stats->pread_ns_max / 1000U, stats->prefetch_calls,
+              stats->prefetch_bytes, stats->prefetch_ns / 1000U);
+    stats->pread_ns_max = 0U;
 }
 
 static int drain_requests(struct relay_state *state)
@@ -1179,7 +1483,16 @@ static int drain_requests(struct relay_state *state)
             if (atomic_load_explicit(state->quarantined, memory_order_acquire) ||
                 watchdog_event_send(state->watchdog_fd, &event) != 0)
                 return -1;
-            (void)execute_request(state, &request, &completion);
+            if (request.operation == DVM_BLOCK_OP_READ) {
+                uint64_t started;
+
+                prefetch_pending_reads(state, request_consumer);
+                started = monotonic_ns();
+                (void)execute_request(state, &request, &completion);
+                account_read(state, request.data_len, monotonic_ns() - started);
+            } else {
+                (void)execute_request(state, &request, &completion);
+            }
             if (atomic_load_explicit(state->quarantined, memory_order_acquire)) {
                 errno = EIO;
                 return -1;
@@ -1605,6 +1918,90 @@ out:
     return result;
 }
 
+static void put_request(struct relay_state *state, uint64_t cursor,
+                        uint64_t generation, uint32_t operation,
+                        uint64_t sector, uint32_t length)
+{
+    uint8_t *record = (uint8_t *)state->transport.base +
+                      DVM_BLOCK_REQUEST_RING_OFFSET +
+                      (cursor % DVM_BLOCK_QUEUE_DEPTH) * DVM_BLOCK_RECORD_BYTES;
+
+    memset(record, 0, DVM_BLOCK_RECORD_BYTES);
+    write_le64(record, generation);
+    write_le64(record + 8U, cursor + 1U);
+    write_le32(record + 24U, operation);
+    write_le32(record + 32U, (uint32_t)(cursor % DVM_BLOCK_QUEUE_DEPTH));
+    write_le64(record + 40U, sector);
+    write_le32(record + 48U, length);
+}
+
+/* Read-ahead planning must merge only adjacent reads, stop at anything that is
+ * not a well-formed read of the current generation, and never invent a range
+ * the request ring did not publish. */
+static int selftest_prefetch_plan(struct relay_state *state)
+{
+    struct prefetch_range ranges[DVM_BLOCK_QUEUE_DEPTH];
+    uint64_t through = 0U;
+    size_t count;
+
+    put_request(state, 0U, 7U, DVM_BLOCK_OP_READ, 0U, 4096U);
+    put_request(state, 1U, 7U, DVM_BLOCK_OP_READ, 8U, 4096U);
+    put_request(state, 2U, 7U, DVM_BLOCK_OP_READ, 16U, 4096U);
+    put_request(state, 3U, 7U, DVM_BLOCK_OP_READ, 40U, 4096U);
+    put_request(state, 4U, 7U, DVM_BLOCK_OP_WRITE, 56U, 4096U);
+    put_request(state, 5U, 7U, DVM_BLOCK_OP_READ, 64U, 4096U);
+    count = plan_prefetch(state, 0U, 6U, ranges, &through);
+    if (count != 2U || through != 4U || ranges[0].offset != 0U ||
+        ranges[0].bytes != 3U * 4096U || ranges[1].offset != 40U * 512U ||
+        ranges[1].bytes != 4096U)
+        return -1;
+    /* A scan that starts after the merged head keeps the same tail ranges. */
+    count = plan_prefetch(state, 2U, 4U, ranges, &through);
+    if (count != 2U || through != 4U || ranges[0].offset != 16U * 512U ||
+        ranges[0].bytes != 4096U)
+        return -1;
+    /* A wrong-generation, oversized or out-of-capacity record ends the scan. */
+    put_request(state, 1U, 9U, DVM_BLOCK_OP_READ, 8U, 4096U);
+    count = plan_prefetch(state, 0U, 3U, ranges, &through);
+    if (count != 1U || through != 1U || ranges[0].bytes != 4096U)
+        return -1;
+    put_request(state, 1U, 7U, DVM_BLOCK_OP_READ, 8U,
+                DVM_BLOCK_DATA_SLOT_BYTES + 4096U);
+    if (plan_prefetch(state, 1U, 2U, ranges, &through) != 0U || through != 1U)
+        return -1;
+    put_request(state, 1U, 7U, DVM_BLOCK_OP_READ, 4096U, 4096U);
+    if (plan_prefetch(state, 1U, 2U, ranges, &through) != 0U || through != 1U)
+        return -1;
+    /* An implausible cursor span is refused instead of walked. */
+    if (plan_prefetch(state, 0U, DVM_BLOCK_QUEUE_DEPTH + 1U, ranges, &through) != 0U ||
+        through != 0U)
+        return -1;
+
+    /* Issue against a real descriptor: counters advance once per range and the
+     * cursor never revisits an examined record. */
+    put_request(state, 0U, 7U, DVM_BLOCK_OP_READ, 0U, 4096U);
+    put_request(state, 1U, 7U, DVM_BLOCK_OP_READ, 8U, 4096U);
+    put_request(state, 2U, 7U, DVM_BLOCK_OP_READ, 16U, 4096U);
+    store_cursor(state->transport.base, REQUEST_CONSUMER_OFFSET, 0U,
+                 __ATOMIC_RELEASE);
+    store_cursor(state->transport.base, REQUEST_PRODUCER_OFFSET, 3U,
+                 __ATOMIC_RELEASE);
+    state->prefetched_through = 0U;
+    prefetch_pending_reads(state, 0U);
+    if (state->stats.prefetch_calls != 1U ||
+        state->stats.prefetch_bytes != 3U * 4096U ||
+        state->prefetched_through != 3U)
+        return -1;
+    prefetch_pending_reads(state, 0U);
+    if (state->stats.prefetch_calls != 1U)
+        return -1;
+    store_cursor(state->transport.base, REQUEST_PRODUCER_OFFSET, 0U,
+                 __ATOMIC_RELEASE);
+    state->prefetched_through = 0U;
+    memset(&state->stats, 0, sizeof(state->stats));
+    return 0;
+}
+
 /* Pause a worker after its final quarantine check, then quarantine before
  * it sends the prepared completion. Only the supervisor owns the cursor. */
 static int selftest_quarantine_publication(void)
@@ -1657,6 +2054,169 @@ out:
     if (state.quarantined != NULL && state.quarantined != MAP_FAILED)
         munmap(state.quarantined, sizeof(*state.quarantined));
     return result;
+}
+
+static void selftest_identity(struct controller_identity *identity,
+                              uint32_t pci_class, uint32_t vendor,
+                              const char *pci_driver, unsigned int children,
+                              uint32_t virtio_device,
+                              const char *virtio_driver)
+{
+    memset(identity, 0, sizeof(*identity));
+    identity->pci_class = pci_class;
+    identity->pci_vendor = vendor;
+    snprintf(identity->pci_driver, sizeof(identity->pci_driver), "%s",
+             pci_driver);
+    identity->virtio_children = children;
+    identity->virtio_device = virtio_device;
+    snprintf(identity->virtio_driver, sizeof(identity->virtio_driver), "%s",
+             virtio_driver);
+}
+
+/* The admitted controller class set is closed: AHCI and NVMe by class code and
+ * bound driver, virtio-blk by virtio device type and bound driver. Anything
+ * else, including other virtio devices and ambiguous virtio functions, must not
+ * classify. */
+static int selftest_controller_classes(void)
+{
+    struct controller_identity identity;
+    const char *admitted;
+
+    selftest_identity(&identity, 0x010601U, 0x8086U, "ahci", 0U, 0U, "");
+    admitted = classify_storage_controller(&identity);
+    if (admitted == NULL || strcmp(admitted, "ahci") != 0)
+        return -1;
+    selftest_identity(&identity, 0x010802U, 0x144dU, "nvme", 0U, 0U, "");
+    admitted = classify_storage_controller(&identity);
+    if (admitted == NULL || strcmp(admitted, "nvme") != 0)
+        return -1;
+    selftest_identity(&identity, 0x010000U, 0x1af4U, "virtio-pci", 1U,
+                      VIRTIO_ID_BLOCK, "virtio_blk");
+    admitted = classify_storage_controller(&identity);
+    if (admitted == NULL || strcmp(admitted, "virtio_blk") != 0 ||
+        strlen(admitted) >= sizeof(((struct block_device *)0)->controller_driver))
+        return -1;
+
+    /* AHCI or NVMe class bound to a different driver is not that class. */
+    selftest_identity(&identity, 0x010601U, 0x8086U, "pata_acpi", 0U, 0U, "");
+    if (classify_storage_controller(&identity) != NULL)
+        return -1;
+    selftest_identity(&identity, 0x010802U, 0x144dU, "vfio-pci", 0U, 0U, "");
+    if (classify_storage_controller(&identity) != NULL)
+        return -1;
+    /* Another virtio device type, a non-virtio vendor, a foreign PCI driver,
+     * an unbound or foreign virtio driver, and ambiguous children all fail. */
+    selftest_identity(&identity, 0x010000U, 0x1af4U, "virtio-pci", 1U, 8U,
+                      "virtio_scsi");
+    if (classify_storage_controller(&identity) != NULL)
+        return -1;
+    selftest_identity(&identity, 0x010000U, 0x1234U, "virtio-pci", 1U,
+                      VIRTIO_ID_BLOCK, "virtio_blk");
+    if (classify_storage_controller(&identity) != NULL)
+        return -1;
+    selftest_identity(&identity, 0x010000U, 0x1af4U, "vfio-pci", 1U,
+                      VIRTIO_ID_BLOCK, "virtio_blk");
+    if (classify_storage_controller(&identity) != NULL)
+        return -1;
+    selftest_identity(&identity, 0x010000U, 0x1af4U, "virtio-pci", 1U,
+                      VIRTIO_ID_BLOCK, "");
+    if (classify_storage_controller(&identity) != NULL)
+        return -1;
+    selftest_identity(&identity, 0x010000U, 0x1af4U, "virtio-pci", 2U,
+                      VIRTIO_ID_BLOCK, "virtio_blk");
+    if (classify_storage_controller(&identity) != NULL)
+        return -1;
+    selftest_identity(&identity, 0x010000U, 0x1af4U, "virtio-pci", 0U, 0U, "");
+    if (classify_storage_controller(&identity) != NULL)
+        return -1;
+    /* Legacy IDE and unrelated classes are not admitted. */
+    selftest_identity(&identity, 0x010185U, 0x8086U, "ata_piix", 0U, 0U, "");
+    if (classify_storage_controller(&identity) != NULL)
+        return -1;
+    selftest_identity(&identity, 0x020000U, 0x1af4U, "virtio-pci", 1U, 1U,
+                      "virtio_net");
+    if (classify_storage_controller(&identity) != NULL)
+        return -1;
+    return 0;
+}
+
+/* Request validation is parameterised by the signed logical block size: every
+ * size the protocol admits works, none is special-cased, and read-only media
+ * admits only reads and the media barrier. */
+static int selftest_geometry_and_read_only(void)
+{
+    static const uint32_t block_sizes[] = {512U, 1024U, 2048U, 4096U};
+    size_t index;
+
+    for (index = 0U; index < sizeof(block_sizes) / sizeof(block_sizes[0]);
+         index++) {
+        struct relay_state state;
+        struct block_request request;
+        uint32_t block = block_sizes[index];
+        uint32_t sectors_per_block = block / 512U;
+
+        memset(&state, 0, sizeof(state));
+        state.header.queue_depth = DVM_BLOCK_QUEUE_DEPTH;
+        state.header.data_slot_bytes = DVM_BLOCK_DATA_SLOT_BYTES;
+        state.header.generation = 3U;
+        state.header.capacity_sectors = 4096U;
+        state.header.logical_block_size = block;
+        state.header.physical_block_size = block;
+        state.header.features = DVM_BLOCK_FEATURE_FLUSH;
+        state.header.flags = DVM_BLOCK_FLAG_READ_ONLY;
+        state.device.read_only = true;
+        request = (struct block_request){
+            .generation = 3U,
+            .request_id = 1U,
+            .operation = DVM_BLOCK_OP_READ,
+            .data_slot = 0U,
+            .sector = sectors_per_block,
+            .data_len = block,
+        };
+        if (!valid_request(&state, &request, 0U))
+            return -1;
+        /* Misaligned length or sector is invalid for this block size. */
+        request.data_len = block + (block > 512U ? 512U : 1U);
+        if (valid_request(&state, &request, 0U))
+            return -1;
+        request.data_len = block;
+        if (block > 512U) {
+            request.sector = 1U;
+            if (valid_request(&state, &request, 0U))
+                return -1;
+            request.sector = sectors_per_block;
+        }
+        /* Read-only media: the media barrier is admitted... */
+        request.operation = DVM_BLOCK_OP_FLUSH;
+        request.operation_id = 1U;
+        request.sector = 0U;
+        request.data_len = 0U;
+        if (!valid_request(&state, &request, 0U))
+            return -1;
+        /* ...but no mutation is, even with a writable-looking feature word. */
+        state.header.features |= DVM_BLOCK_FEATURE_FUA |
+                                 DVM_BLOCK_FEATURE_DISCARD |
+                                 DVM_BLOCK_FEATURE_WRITE_ZEROES;
+        request.operation = DVM_BLOCK_OP_WRITE;
+        request.flags = 0U;
+        request.sector = sectors_per_block;
+        request.data_len = block;
+        if (valid_request(&state, &request, 0U))
+            return -1;
+        request.operation = DVM_BLOCK_OP_DISCARD;
+        if (valid_request(&state, &request, 0U))
+            return -1;
+        request.operation = DVM_BLOCK_OP_WRITE_ZEROES;
+        if (valid_request(&state, &request, 0U))
+            return -1;
+        /* The same write is admitted once the device is writable. */
+        state.device.read_only = false;
+        state.header.flags = 0U;
+        request.operation = DVM_BLOCK_OP_WRITE;
+        if (!valid_request(&state, &request, 0U))
+            return -1;
+    }
+    return 0;
 }
 
 static int selftest(void)
@@ -1767,6 +2327,12 @@ static int selftest(void)
         completion.durable_through_operation_id != 2U)
         goto out;
 
+    if (selftest_controller_classes() != 0)
+        goto out;
+    if (selftest_geometry_and_read_only() != 0)
+        goto out;
+    if (selftest_prefetch_plan(&state) != 0)
+        goto out;
     if (selftest_quarantine_publication() != 0)
         goto out;
     result = 0;

@@ -2104,11 +2104,9 @@ fn process_load_error_to_linux_errno(error: crate::user::process::ProcessLoadErr
         crate::user::process::ProcessLoadError::AddressSpace(err) => {
             address_space_error_to_linux_errno(err)
         }
-        crate::user::process::ProcessLoadError::Spawn(err) => match err {
-            multitask::SpawnTaskError::InvalidWeightMicros => LINUX_EINVAL,
-            multitask::SpawnTaskError::NoFreeTaskSlot => LINUX_EAGAIN,
-            multitask::SpawnTaskError::MemoryQuota => LINUX_ENOMEM,
-        },
+        crate::user::process::ProcessLoadError::Spawn(err) => {
+            process_spawn_error_to_linux_errno(err)
+        }
         crate::user::process::ProcessLoadError::InterpreterLoad { .. } => LINUX_ENOEXEC,
         crate::user::process::ProcessLoadError::InvalidElf(_)
         | crate::user::process::ProcessLoadError::InvalidPe(_)
@@ -2116,11 +2114,30 @@ fn process_load_error_to_linux_errno(error: crate::user::process::ProcessLoadErr
     }
 }
 
-fn process_spawn_error_to_linux_errno(error: multitask::SpawnTaskError) -> i64 {
+/// The one `SpawnTaskError` -> Linux errno table, shared by fork/exec spawns
+/// and `clone(CLONE_THREAD)`.
+///
+/// Memory and kernel-stack/charge failures are `ENOMEM`. Count limits (task
+/// table, per-process ceiling, Job `threads.max`) are `EAGAIN`, the errno
+/// `clone`/`fork` document for RLIMIT_NPROC, the pids cgroup and the system
+/// thread limit. A process that is exiting or running exec is also `EAGAIN`:
+/// Linux `copy_process` refuses `CLONE_THREAD` with `-EAGAIN` once the signal
+/// group is exiting. A refused creator or publication is a transient race, so
+/// `EAGAIN` as well; none of these are programming errors of the caller.
+pub(super) fn process_spawn_error_to_linux_errno(error: multitask::SpawnTaskError) -> i64 {
+    use multitask::SpawnTaskError as E;
     match error {
-        multitask::SpawnTaskError::InvalidWeightMicros => LINUX_EINVAL,
-        multitask::SpawnTaskError::NoFreeTaskSlot => LINUX_EAGAIN,
-        multitask::SpawnTaskError::MemoryQuota => LINUX_ENOMEM,
+        E::InvalidWeightMicros => LINUX_EINVAL,
+        E::MemoryQuota | E::ThreadStackAllocation | E::JobThreadMemory => LINUX_ENOMEM,
+        E::NoFreeTaskSlot
+        | E::ProcessLimit
+        | E::ProcessThreadLimit
+        | E::JobThreadLimit
+        | E::ProcessExiting
+        | E::ProcessExecInProgress
+        | E::ThreadCreatorUnavailable
+        | E::ThreadPublicationRefused
+        | E::ThreadMaterializationFailed => LINUX_EAGAIN,
     }
 }
 

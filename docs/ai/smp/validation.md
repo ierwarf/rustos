@@ -66,11 +66,13 @@ revalidates those immutable bytes and writes a unique, non-overwriting vCPU/run
 archive under one explicit matrix cohort. An integer marker count alone is not
 publishable evidence. The forced private block provider copies and mode-seals
 its snapshot, file-syncs it, and containing-directory-syncs it before aperture
-creation/signing. It attaches as `readonly=on` `ide-cd` on existing q35 AHCI
-`ide.0`; exact built-in `CONFIG_BLK_DEV_SR=y` owns immutable ATAPI while modular
-`sd_mod` owns writable AHCI. Signed and host-verified media geometry is
-2048/2048 bytes with 512-byte protocol-sector capacity accounting and a
-FLUSH-only feature word, never FUA. A generation-bound read-only media-barrier
+creation/signing. It attaches as `readonly=on` behind a single `virtio-blk-pci`
+(q35 `sata=off`, so no implicit AHCI controller) with explicit block-size
+properties; built-in `CONFIG_VIRTIO_PCI`/`CONFIG_VIRTIO_BLK` own it and
+`CONFIG_BLK_DEV_SR` is forbidden. Signed and host-verified media geometry is the
+declared 512/512 bytes (`DVM_STORAGE_*_BLOCK_BYTES`, re-read by the relay with
+`BLKSSZGET`/`BLKPBSZGET`) with 512-byte protocol-sector capacity accounting and
+a FLUSH-only feature word, never FUA. A generation-bound read-only media-barrier
 completion proves VFS-to-Linux-DVM liveness and does not claim backing-image
 write durability. For multi-vCPU
 topologies the receive-side `smp-cpu-first-reschedule-ipi` event is required;

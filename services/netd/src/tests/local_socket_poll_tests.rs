@@ -90,6 +90,7 @@ fn unix_poll_readiness_tracks_data_space_and_peer_close() {
     connected.incoming.push_back(UnixStreamSegment {
         bytes: [1].into_iter().collect(),
         control: Vec::new(),
+        ..Default::default()
     });
     assert_eq!(
         unix_socket_revents(&state, 1, linux_abi::POLLIN as u32).unwrap(),
@@ -465,6 +466,7 @@ fn buffered_read_handles_wrapped_segments_and_partial_consumption() {
         vec![UnixStreamSegment {
             bytes,
             control: vec![9, 8, 7, 6],
+            ..Default::default()
         }],
     );
     let request = NetdIpcRequest {
@@ -497,10 +499,12 @@ fn recvmsg_ancillary_stays_with_its_stream_segment() {
             UnixStreamSegment {
                 bytes: [1, 2].into_iter().collect(),
                 control: Vec::new(),
+                ..Default::default()
             },
             UnixStreamSegment {
                 bytes: [3, 4].into_iter().collect(),
                 control: vec![9, 8, 7, 6],
+                ..Default::default()
             },
         ],
     );
@@ -528,6 +532,7 @@ fn ordinary_read_discards_ancillary_exactly_once() {
         vec![UnixStreamSegment {
             bytes: [5, 6].into_iter().collect(),
             control: vec![4, 3, 2, 1],
+            ..Default::default()
         }],
     );
     let request = NetdIpcRequest {

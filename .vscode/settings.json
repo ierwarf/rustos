@@ -1,5 +1,20 @@
 {
   "rust-analyzer.linkedProjects": [
     "Cargo.toml"
-  ]
+  ],
+  "search.followSymlinks": false,
+  "search.exclude": {
+    "**/target/**": true,
+    "**/build/**": true,
+    "**/driver-domains/linux/out/**": true,
+    "**/.tlacache/**": true,
+    "**/_apalache-out/**": true
+  },
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/build/**": true,
+    "**/driver-domains/linux/out/**": true,
+    "**/.tlacache/**": true,
+    "**/_apalache-out/**": true
+  }
 }

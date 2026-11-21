@@ -108,8 +108,9 @@ const EACCES: i32 = 13;
 const ENOEXEC: i32 = 8;
 const EOVERFLOW: i32 = 75;
 const ETIMEDOUT: i32 = 110;
-const ELF_READ_CHUNK_BYTES: usize = 256 * 1024;
-use rustos_user_abi::syscall::VFS_EXECUTABLE_SNAPSHOT_MAX_FILE_BYTES;
+use rustos_user_abi::syscall::{
+    EXECUTABLE_IMAGE_TRANSFER_WINDOW_BYTES, VFS_EXECUTABLE_SNAPSHOT_MAX_FILE_BYTES,
+};
 const ELF_HEADER_SIZE: usize = 64;
 const ELF_PROGRAM_HEADER_SIZE: usize = 56;
 const ELF_MAX_PROGRAM_HEADERS: u16 = 128;

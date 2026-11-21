@@ -12,7 +12,7 @@ test = false
 
 [dependencies]
 rustos-svc-runtime = { path = "../../libs/rustos-svc-runtime" }
-rustos-user-abi = { path = "../../libs/rustos-user-abi" }
+rustos-user-abi = { path = "../../libs/rustos-user-abi", features = ["linux-compat-state"] }
 rustos-image-admission = { path = "../../libs/rustos-image-admission" }
 
 rustos-release-verifier = { path = "../../libs/rustos-release-verifier" }

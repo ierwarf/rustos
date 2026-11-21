@@ -1122,7 +1122,13 @@ fn dvm_machine() -> &'static str {
     // The DVM receives only the explicit virtio input devices below. Leaving
     // q35's implicit i8042 enabled creates a second PS/2 keyboard/pointer pair,
     // so Linux may relay a different event device than the GUI frontend feeds.
-    "q35,accel=kvm,i8042=off"
+    //
+    // `sata=off` removes q35's implicit ICH9 AHCI controller (and with it the
+    // default emulated CD drive). The storage DVM admits exactly ONE storage
+    // controller; the only one it may see is the explicit virtio-blk disk
+    // attached by `dvm_storage_device_arg`. An always-present empty AHCI
+    // function would be counted as a second controller and fail admission.
+    "q35,accel=kvm,i8042=off,sata=off"
 }
 
 fn dvm_gpu_device(display: GuestDisplay, geometry: DisplayGeometry) -> Option<String> {

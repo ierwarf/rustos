@@ -29,7 +29,8 @@ struct Row {
     id: u64,
     phase: Phase,
     work: Option<Work>,
-    succeeded: bool,
+    /// Typed completion of the last materialization; meaningful in `Complete`.
+    outcome: Result<(), SpawnTaskError>,
 }
 impl Row {
     const fn new() -> Self {
@@ -38,7 +39,7 @@ impl Row {
             id: 0,
             phase: Phase::Vacant,
             work: None,
-            succeeded: false,
+            outcome: Err(SpawnTaskError::ThreadPublicationRefused),
         }
     }
 }
@@ -80,7 +81,7 @@ fn enqueue_into(row: &mut Row, work: Work) -> Result<Receipt, Work> {
     assert!(r.ticket().is_reserved_current());
     row.nonce = nonce;
     row.id = id;
-    row.succeeded = false;
+    row.outcome = Err(SpawnTaskError::ThreadPublicationRefused);
     row.work = Some(work);
     row.phase = Phase::Pending;
     // ORDERING: Release, under the row leaf, after the row became Pending; a
@@ -94,7 +95,7 @@ pub(in crate::multitask) fn submit(
     id: u64,
     bootstrap: UserTaskBootstrap,
     selectors: (u64, u64, u64),
-) -> Option<Receipt> {
+) -> Result<Receipt, SpawnTaskError> {
     let mut preemption = nucleus_core::util::lockdep::DispatchPreemption::enter();
     preemption.mask_irqs();
     #[cfg(not(test))]
@@ -103,10 +104,11 @@ pub(in crate::multitask) fn submit(
         "thread creation before scheduler bootstrap"
     );
     if !super::super::super::cpu_local::current_cpu_task_slot_admitted() {
-        return None;
+        return Err(SpawnTaskError::ThreadCreatorUnavailable);
     }
-    let slot = super::super::super::cpu_local::current_cpu_task_slot()?;
-    let creator = capture_creator(slot)?;
+    let slot = super::super::super::cpu_local::current_cpu_task_slot()
+        .ok_or(SpawnTaskError::ThreadCreatorUnavailable)?;
+    let creator = capture_creator(slot).ok_or(SpawnTaskError::ThreadCreatorUnavailable)?;
     let reservation = reserve_with(id, &creator)?;
     let work = Work {
         reservation: Some(reservation),
@@ -114,22 +116,24 @@ pub(in crate::multitask) fn submit(
         selectors,
     };
     match enqueue(work) {
-        Ok(receipt) => Some(receipt),
+        Ok(receipt) => Ok(receipt),
         Err(mut work) => {
+            // The reserved slot's previous producer row has not drained, so the
+            // slot is not yet usable for a new thread.
             cancel_owned(work.reservation.take().unwrap(), &preemption);
-            None
+            Err(SpawnTaskError::NoFreeTaskSlot)
         }
     }
 }
 /// Observation only: neither consumption nor caller death releases ownership.
-pub(in crate::multitask) fn poll(receipt: Receipt) -> Option<bool> {
+pub(in crate::multitask) fn poll(receipt: Receipt) -> Option<Result<(), SpawnTaskError>> {
     let row = ROWS[receipt.slot].lock();
     if row.nonce != receipt.nonce || row.id != receipt.id {
-        return Some(false);
+        return Some(Err(SpawnTaskError::ThreadPublicationRefused));
     }
     match row.phase {
-        Phase::Complete => Some(row.succeeded),
-        Phase::Poisoned | Phase::Vacant => Some(false),
+        Phase::Complete => Some(row.outcome),
+        Phase::Poisoned | Phase::Vacant => Some(Err(SpawnTaskError::ThreadPublicationRefused)),
         Phase::Pending | Phase::Executing => None,
     }
 }
@@ -221,17 +225,17 @@ impl Claim<'_> {
         };
         self.executor.assert_current();
         let r = work.reservation.take().unwrap();
-        let succeeded = if materialized {
+        let outcome = if materialized {
             commit(r,
                 work.bootstrap.clone(),
                 work.selectors.0,
                 work.selectors.1,
                 work.selectors.2,
             )
-            .is_some()
+            .map(|_| ())
         } else {
             cancel(r);
-            false
+            Err(SpawnTaskError::ThreadMaterializationFailed)
         };
         self.executor.assert_current();
         // No successful/failed receipt escapes before the real producer ACK.
@@ -242,7 +246,7 @@ impl Claim<'_> {
                 && row.phase == Phase::Executing
                 && row.work.is_none()
         );
-        row.succeeded = succeeded;
+        row.outcome = outcome;
         row.phase = Phase::Complete;
         self.live = false;
     }

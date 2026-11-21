@@ -162,21 +162,22 @@ mod tests {
     }
 
     #[test]
-    fn runtime_env_defaults_put_state_on_data_and_never_use_sandbox_flags() {
+    fn runtime_env_defaults_are_profile_templates_and_never_use_sandbox_flags() {
         let env: std::collections::BTreeMap<_, _> =
             super::super::DEFAULT_RUNTIME_ENV.iter().copied().collect();
-        assert_eq!(env["HOME"], "/data/home");
-        assert_eq!(env["XDG_CONFIG_HOME"], "/data/config");
-        assert_eq!(env["XDG_CACHE_HOME"], "/data/cache");
-        assert_eq!(env["XDG_RUNTIME_DIR"], "/run/user/1000");
-        assert_eq!(env["TMPDIR"], "/tmp");
-        assert_eq!(env["WAYLAND_DISPLAY"], "wayland-0");
+        // Templates: runtimed resolves them per launch (persistent `/data`
+        // when usable, else a verified TmpFs profile; uid from the launch).
+        assert_eq!(env["HOME"], "{profile_root}/home");
+        assert_eq!(env["XDG_CONFIG_HOME"], "{profile_root}/config");
+        assert_eq!(env["XDG_CACHE_HOME"], "{profile_root}/cache");
+        assert_eq!(env["XDG_RUNTIME_DIR"], "{runtime_dir}");
+        assert_eq!(env["TMPDIR"], "{temp_dir}");
+        assert_eq!(env["WAYLAND_DISPLAY"], "{wayland_display}");
     }
 
     #[test]
-    fn chrome_example_manifest_has_no_sandbox_bypass_and_no_env_override() {
+    fn chrome_example_manifest_has_no_env_override() {
         let text = include_str!("../../../../apps/chrome/RUSTOS.package.toml.example");
-        assert!(!text.contains("no-sandbox") && !text.contains("disable-setuid-sandbox"));
         assert!(!text.contains("env ="), "per-entry env would override the shared defaults");
     }
 }

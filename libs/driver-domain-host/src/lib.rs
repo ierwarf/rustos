@@ -3695,7 +3695,11 @@ fn parse_block_evidence(fields: &BTreeMap<String, String>) -> Result<Option<DvmB
                 .ok_or_else(|| anyhow!("Linux DVM block evidence omitted driver"))?
                 .to_owned();
             validate_driver_name(&driver, "Linux DVM block evidence")?;
-            if !matches!(driver.as_str(), "nvme" | "ahci") {
+            // Admitted storage controller classes of the DVM block relay. A
+            // physical-assignment policy still names only `nvme` or `ahci`
+            // (`PhysicalStoragePolicy`), so `virtio_blk` evidence from the
+            // paravirtual KVM-harness disk parses but can never satisfy it.
+            if !matches!(driver.as_str(), "nvme" | "ahci" | "virtio_blk") {
                 bail!("Linux DVM block evidence names an unsupported driver");
             }
             let guest_pci_bdf = fields
@@ -4874,6 +4878,24 @@ mod tests {
             .unwrap()
             .validate_evidence(&evidence, 9, "nvme0n1")
             .unwrap();
+        // The paravirtual harness disk reports the admitted `virtio_blk`
+        // controller class with its own device-reported geometry. It parses,
+        // but a physical NVMe/AHCI assignment policy never admits it.
+        let virtio = parse_message(
+            "RESPONSE\nid=5\nop=block-evidence-v1\nstatus=ok\ngeneration=9\ndriver=virtio_blk\npci-vendor=1af4\npci-device=1042\nguest-pci-bdf=0000:00:04.0\nblock-name=vda\ncapacity-sectors=2760704\nlogical-block-size=512\nphysical-block-size=512\nfeatures=0000000000000001\nread-only=yes",
+        )
+        .unwrap();
+        let virtio_evidence = parse_block_evidence(&virtio.fields).unwrap().unwrap();
+        assert_eq!(virtio_evidence.driver, "virtio_blk");
+        assert_eq!(virtio_evidence.logical_block_size, 512);
+        assert!(virtio_evidence.read_only);
+        assert!(
+            policy
+                .physical_storage()
+                .unwrap()
+                .validate_evidence(&virtio_evidence, 9, "vda")
+                .is_err()
+        );
         let mut read_only = evidence.clone();
         read_only.read_only = true;
         policy

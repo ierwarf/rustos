@@ -60,6 +60,56 @@ including materialized aliases. Run it with `RUSTOS_RUNTIME_FIXTURE_OVERLAY=asse
 `RUSTOS_RUNTIME_FIXTURE_CACHE=build/runtime-libs/noble/cache` using absolute paths:
 `cargo test -p xtask chrome_target_loader_relocates_without_host_fallbacks -- --ignored`.
 
+## Launch environment and session profile
+
+The default launch environment is not a build-time fact. `runtime-env.tsv`
+(`scope=init|runtime`, `key=`, `value=`) and a catalog entry's `env` carry
+**templates** in the `libs/session-profile` grammar: literal text plus
+`{profile_root}`, `{runtime_dir}`, `{temp_dir}` and `{wayland_display}`. There
+is no escape; an unknown placeholder, a stray `{`/`}` or a `{profile_root}` that
+is not the first segment is a hard error (xtask rejects it at stage time,
+`runtime-control` rejects the registry at load time, runtimed returns `EINVAL`),
+never passed through. The `init` scope is consumed by initd, which has no launch
+profile, so it must be literal. xtask stages
+`HOME={profile_root}/home`, `XDG_CONFIG_HOME={profile_root}/config`,
+`XDG_CACHE_HOME={profile_root}/cache`, `XDG_RUNTIME_DIR={runtime_dir}`,
+`TMPDIR={temp_dir}`, `WAYLAND_DISPLAY={wayland_display}` plus the literal
+`PATH`, `LANG`, `XDG_SESSION_TYPE`, `XDG_CURRENT_DESKTOP`; no uid, `/data`
+path or socket name is embedded in the image. Catalog values win over defaults
+by key (`push_env_if_missing`) and are templates too (`apps/bc` uses
+`HOME={runtime_dir}`).
+
+runtimed (`services/runtimed/src/launch_profile.rs`) resolves them per launch:
+
+- **Identity.** The uid/gid is `rustos_user_abi::desktop_session::launch_credentials(logical_admin)`:
+  the loader spawn request carries only the `logical_admin` bit and ring0 maps
+  it to 0 or the desktop identity (`kernel-ps` `DEFAULT_DESKTOP_UID/GID` must
+  stay equal to `DESKTOP_SESSION_UID/GID`). `{runtime_dir}` is
+  `RuntimeDir(uid)` = `/run/user/<uid>`; uiserver derives its compositor socket
+  directory with the same function (from `XDG_RUNTIME_DIR`, else its own uid),
+  and uiserver runs as the desktop identity, so every graphical client gets the
+  directory the compositor binds `{wayland_display}` (`WAYLAND_SOCKET_NAME`) in.
+  vfsd seeds `/run/user/<desktop uid>` at mount time; runtimed creates or
+  verifies the directory of any other launch uid (owner, no group/other write).
+- **Profile root.** Only when a surviving value uses `{profile_root}`. The
+  persistent root `/data` is chosen when every directory the values name under
+  it can be created and proven writable (probe file) - i.e. the second FAT
+  partition is mounted read-write. Otherwise the whole profile (never a split)
+  moves to `/tmp/rustos-profile-<uid>`, created 0700 and handed to the launch
+  uid; an existing entry is accepted only if it is a real directory owned by
+  that uid with no group/other write (`/tmp` is shared). The decision is logged
+  once: `runtimed: profile root=/data reason=persistent-volume-writable uid=..`
+  or `runtimed: profile root=/tmp/rustos-profile-.. reason=persistent-unusable(<dir>:errno=..,...) uid=..`.
+  The TmpFs profile lives for the boot only.
+- **Failure.** Every directory a resolved value names is created or verified
+  before the loader request is built. If neither root can be prepared (or the
+  runtime dir / `/tmp` is unusable) the launch fails with that real errno and
+  logs `runtimed: profile root unavailable ...`; nothing is launched with a
+  `HOME` that cannot exist (Chrome aborts on its user data dir otherwise).
+  An explicit literal `HOME`/`XDG_CONFIG_HOME`/`XDG_CACHE_HOME` from a catalog
+  entry is ensured the same way (`mkdir -p` plus writable probe) and fails the
+  launch if it cannot exist.
+
 ## Provenance and updates
 
 `tools/xtask/src/stage/noble/lock.json` pins package paths, sizes and SHA-256
@@ -75,13 +125,23 @@ Ubuntu's official archive/security mirrors with an explicit diagnostic, but
 only the identical size and SHA-256 authenticated by the pinned snapshot are
 accepted. Release/index authority never falls back to a mutable mirror; hash
 mismatch is fatal. Bounded retries and per-invocation failed-mirror suppression
-avoid repeating a dead transport for every package. It extracts only
-library files into a freshly reconstructed cache root and never invokes Debian
-package scripts. The cache is not a trust anchor. No host-installed package or
-library directory supplies runtime libraries. The lock covers all Chrome bundle ELFs, including Qt5/Qt6 shim dependencies,
-and their library-package dependencies; it is not the whole archive. Non-library
-package assets, services, driver plugins, and maintainer scripts are not
-installed by this provisioner. `noble_lock.py BUILD_DIR LIBRARY_PACKAGE...` can
+avoid repeating a dead transport for every package. The cache is not a trust
+anchor. No host-installed package or library directory supplies the runtime.
+The lock covers Chrome bundle ELFs, Qt5/Qt6 shim dependencies, and selected
+runtime files; it is not the whole archive. No maintainer scripts, services,
+or hardware driver plugins are installed by this provisioner.
+
+When Chrome is staged, `noble/qt-wayland-plugins.tsv` selects the generic
+software Wayland platform and xdg-shell integration plugins from the pinned
+Qt5/Qt6 packages. Preserve their distro plugin paths, and run each as an
+explicit ELF relocation root alongside Chrome bundle ELFs; Qt discovers them
+at runtime rather than via Chrome's `DT_NEEDED`. These roots are counted under
+Chrome, not as separate library-prewarm consumers. EGL, XComposite and
+compositor-side plugins are not included. Pinned `xkb-data` provides only
+`/usr/share/X11/xkb` data; three recognized rules aliases become ordinary
+files for FAT. The runtime can compile or load keyboard maps without borrowing
+host files. These checks prove dependency and asset admission, not a browser
+frame or successful input. `noble_lock.py BUILD_DIR LIBRARY_PACKAGE...` can
 extend the lock using only the authenticated pinned indexes. It preserves
 existing records, resolves versioned Provides (including Noble's t64 names),
 and checks Debian epoch/upstream/revision constraints without depending on a

@@ -372,10 +372,15 @@ struct ConnectedState {
     send_closed: bool,
 }
 
-#[derive(Debug)]
+/// One queued send. `sender` is the process identity at `sendmsg`/`write`
+/// time, which is what a receiver with `SO_PASSCRED` observes as
+/// `SCM_CREDENTIALS`; it is distinct from the connection-time identity that
+/// `SO_PEERCRED` reports (`ConnectedState::peer_credentials`).
+#[derive(Debug, Default)]
 struct UnixStreamSegment {
     bytes: VecDeque<u8>,
     control: Vec<u8>,
+    sender: Credentials,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -463,6 +468,9 @@ struct SocketOptions {
     send_buffer: i32,
     recv_buffer: i32,
     passcred: bool,
+    /// `SO_RCVTIMEO` as `(seconds, microseconds)`; zero waits forever. The
+    /// kernel's blocking local receive reads it back through `getsockopt`.
+    recv_timeout: (i64, i64),
 }
 
 impl Default for SocketOptions {
@@ -474,6 +482,7 @@ impl Default for SocketOptions {
             send_buffer: SOCKET_BUFFER_CAPACITY as i32,
             recv_buffer: SOCKET_BUFFER_CAPACITY as i32,
             passcred: false,
+            recv_timeout: (0, 0),
         }
     }
 }
@@ -591,6 +600,9 @@ fn net_state() -> &'static Mutex<NetState> {
 
 #[derive(Default)]
 struct SocketReceive {
+    /// Identity of the process whose send produced the first dequeued
+    /// segment. `None` when nothing was dequeued.
+    sender: Option<Credentials>,
     record_present: bool,
     read: usize,
     control: Vec<u8>,

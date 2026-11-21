@@ -1,7 +1,7 @@
 use alloc::format;
 use core::mem::size_of;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, DvmBlockInfoWire,
@@ -40,6 +40,41 @@ const _: () = assert!(core::mem::align_of::<StoragedBulkReadResponse>() <= core:
 // generation. Keep one diagnostic transition instead of turning every glibc
 // negative probe into debugcon I/O and scheduler pressure.
 static STORAGE_NOT_READY_DIAGNOSTIC_EMITTED: AtomicBool = AtomicBool::new(false);
+
+// Aggregate cost of the vfsd -> storaged bulk-read round trips. A large
+// executable snapshot is thousands of these calls; the per-snapshot report
+// uses the totals to separate "storaged's device read is slow" from "vfsd is
+// slow between calls" without a per-call debug line.
+static BULK_READ_CALLS: AtomicU64 = AtomicU64::new(0);
+static BULK_READ_NS: AtomicU64 = AtomicU64::new(0);
+static BULK_READ_MAX_NS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct BulkReadCounters {
+    pub(super) calls: u64,
+    pub(super) nanos: u64,
+}
+
+impl BulkReadCounters {
+    pub(super) fn since(self, earlier: Self) -> Self {
+        Self {
+            calls: self.calls.saturating_sub(earlier.calls),
+            nanos: self.nanos.saturating_sub(earlier.nanos),
+        }
+    }
+}
+
+pub(super) fn bulk_read_counters() -> BulkReadCounters {
+    BulkReadCounters {
+        calls: BULK_READ_CALLS.load(Ordering::Relaxed),
+        nanos: BULK_READ_NS.load(Ordering::Relaxed),
+    }
+}
+
+/// Longest single bulk call since the previous query.
+pub(super) fn take_bulk_read_max_nanos() -> u64 {
+    BULK_READ_MAX_NS.swap(0, Ordering::Relaxed)
+}
 
 pub(super) struct BootBlockDevice {
     pub(super) generation: u64,
@@ -338,6 +373,7 @@ fn call_storaged_bulk(request: &CommercialMaxProtocolRequest, out: &mut [u8], re
             size_of::<StoragedBulkReadResponse>(),
         );
     }
+    let call_started = rustos_svc_runtime::syscall::monotonic_nanos();
     let received = unsafe {
         rustos_svc_runtime::syscall::syscall6(
             rustos_user_abi::syscall::SYS_RUSTOS_IPC_CALL_BOUNDED,
@@ -349,6 +385,10 @@ fn call_storaged_bulk(request: &CommercialMaxProtocolRequest, out: &mut [u8], re
             rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS,
         )
     };
+    let call_ns = rustos_svc_runtime::syscall::monotonic_nanos().saturating_sub(call_started);
+    BULK_READ_CALLS.fetch_add(1, Ordering::Relaxed);
+    BULK_READ_NS.fetch_add(call_ns, Ordering::Relaxed);
+    BULK_READ_MAX_NS.fetch_max(call_ns, Ordering::Relaxed);
     if received < 0 {
         let errno = (-received) as i32;
         if should_log_storage_failure(errno) {

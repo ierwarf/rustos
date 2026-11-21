@@ -7,5 +7,5 @@ config BR2_PACKAGE_RUSTOS_DVM_BLOCK
 	  driver domain. A dedicated MSI-X UIO adapter binds only the exact
 	  RSDVMBL2 aperture, maps that bounded aperture write-back, and exposes
 	  only peer-0/vector-0 notification through UIO irqcontrol. The userspace
-	  relay owns no PCI controller MMIO; Linux nvme/ahci and the block layer
-	  remain the sole physical-device implementation.
+	  relay owns no PCI controller MMIO; Linux nvme/ahci/virtio_blk and the
+	  block layer remain the sole storage-device implementation.

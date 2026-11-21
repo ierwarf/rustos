@@ -577,10 +577,10 @@ severity = "critical"
 flow = "process-lifecycle-transaction"
 model = "slot-directory-growth/SlotDirectoryGrowth"
 source = "kernel/ps/src/multitask/slot_dir.rs"
-source_symbol = "ensure"
+source_symbol = "publish_chunk"
 source_anchors = [
   "match cell.compare_exchange(ptr::null_mut(), base, Ordering::AcqRel, Ordering::Acquire) {",
-  "drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(base, SLOT_CHUNK)) });",
+  "Err(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(base, C)) })",
 ]
 invariant = "a directory chunk is published once by a release CAS after its body is initialized; a losing grower frees only its own unpublished chunk and a lock-free reader sees either no chunk or a fully initialized one"
 loom_test = "slot_chunk_publication_race_publishes_once_and_readers_see_initialized_chunks"

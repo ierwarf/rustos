@@ -131,6 +131,7 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
         // uaddr, int op, u32 val, timeout*, uaddr2*, u32 val3
         SYS_FUTEX => [W, U, U, W, W, U],
         SYS_PRCTL | SYS_ARCH_PRCTL => [U, W, W, W, W, W],
+        SYS_CAPGET | SYS_CAPSET => [W, W, W, W, W, W],
         // pid, unsigned int resource, new*, old*
         SYS_PRLIMIT64 => [S, U, W, W, W, W],
         SYS_SCHED_GETAFFINITY | SYS_SCHED_SETAFFINITY => [S, U, W, W, W, W],

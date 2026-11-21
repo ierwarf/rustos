@@ -178,6 +178,7 @@ pub(super) fn inject_kvm_smp_qualification_launch(
             contract.deadline_ms.to_string(),
         ],
         env: Vec::new(),
+        application_request: runtime_control::ApplicationRequest::NONE,
         private_smp_qualification: Some(contract),
     });
     Ok(())
@@ -279,6 +280,7 @@ mod tests {
             console_hosted: false,
             args: Vec::new(),
             env: Vec::new(),
+            application_request: runtime_control::ApplicationRequest::NONE,
             private_smp_qualification: None,
         }
     }

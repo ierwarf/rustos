@@ -14,6 +14,7 @@ members = [
     "libs/rustos-scheduler-frame-gate",
     "libs/observability-client",
     "libs/runtime-control",
+    "libs/session-profile",
     "libs/rustos-user-abi",
     "libs/rustos-svc-runtime",
     "libs/rustos-component-model",

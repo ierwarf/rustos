@@ -249,13 +249,12 @@ pub fn spawn_user_thread_suspended(bootstrap: UserTaskBootstrap) -> Result<u64, 
     // Only a scalar receipt survives the first safe point on a killable user.
     // The durable row and then an actual kernel Executor own the real Ticket,
     // original MM and sleepable TEB effects through complete Slot/cancel ACK.
-    let receipt = super::scheduler::thread_creation::work::submit(id, bootstrap, selectors)
-        .ok_or(SpawnTaskError::NoFreeTaskSlot)?;
+    let receipt = super::scheduler::thread_creation::work::submit(id, bootstrap, selectors)?;
     let mut yielded = false;
     loop {
         match super::scheduler::thread_creation::work::poll(receipt) {
-            Some(true) => return Ok(id),
-            Some(false) => return Err(SpawnTaskError::NoFreeTaskSlot),
+            Some(Ok(())) => return Ok(id),
+            Some(Err(reason)) => return Err(reason),
             None => {
                 // Kernel callers can help under their own kill-safe Executor;
                 // user callers yield once for immediate handoff, then sleep so

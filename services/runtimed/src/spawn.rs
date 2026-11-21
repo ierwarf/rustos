@@ -117,6 +117,7 @@ pub(super) fn launch_calls() -> crate::launch_worker::LaunchCalls {
                 session_handle,
                 true,
                 deadline_ns,
+                entry.application_request,
             )
         },
         report_lease: |entry, pid, deadline| {
@@ -513,6 +514,7 @@ pub(super) fn spawn_tracked_process(
         entry.weight_micros,
         session_handle.unwrap_or(0),
         deferred_start,
+        entry.application_request,
     ) {
         Ok(pid) => pid,
         Err(err) => {
@@ -1173,6 +1175,7 @@ pub(super) fn spawn_exec(
     weight_micros: u64,
     session_handle: u64,
     defer_start: bool,
+    application_request: runtime_control::ApplicationRequest,
 ) -> Result<i32, i32> {
     spawn_exec_with_deadline(
         exec_path,
@@ -1183,6 +1186,7 @@ pub(super) fn spawn_exec(
         session_handle,
         defer_start,
         None,
+        application_request,
     )
 }
 
@@ -1195,6 +1199,7 @@ pub(super) fn probe_suspended_image(exec_path: &str) -> Result<(), i32> {
     let pid = spawn_exec_with_deadline(
         exec_path, &[exec_path.to_owned()], &[], false,
         DEFAULT_USER_TASK_WEIGHT_MICROS, 0, true, Some(deadline),
+        runtime_control::ApplicationRequest::NONE,
     )?;
     if let Err(errno) = cleanup_failed_spawn(pid, terminate_pid) {
         // Never abandon an admitted suspended child on a refused cleanup.
@@ -1213,11 +1218,11 @@ fn spawn_exec_with_deadline(
     session_handle: u64,
     defer_start: bool,
     deadline_ns: Option<u64>,
+    application_request: runtime_control::ApplicationRequest,
 ) -> Result<i32, i32> {
     boot_line(format!("runtimed: loader request begin exec={}", exec_path).as_str());
     let argv_storage = build_exec_argv(exec_path, argv)?;
-    let env_storage = build_exec_env(env)?;
-    ensure_launch_home_dirs(&env_storage);
+    let env_storage = build_exec_env(env, logical_admin)?;
     let endpoint = lookup_loader_endpoint()?;
     let mut request = build_loader_spawn_request(
         exec_path,
@@ -1228,6 +1233,7 @@ fn spawn_exec_with_deadline(
         session_handle,
         defer_start,
         deadline_ns,
+        application_request,
     )?;
     // UI bootstrap keeps its existing short budget. Ordinary catalog work
     // lives on the launch worker and may collect a large immutable image;
@@ -1281,6 +1287,7 @@ fn build_loader_spawn_request(
     session_handle: u64,
     defer_start: bool,
     deadline_ns: Option<u64>,
+    application_request: runtime_control::ApplicationRequest,
 ) -> Result<LoaderSpawnRequest, i32> {
     let canonical_exec_path = if exec_path.starts_with('/') {
         exec_path.to_owned()
@@ -1309,6 +1316,7 @@ fn build_loader_spawn_request(
         argv_count: u16::try_from(argv.len()).map_err(|_| libc::E2BIG)?,
         env_count: u16::try_from(env.len()).map_err(|_| libc::E2BIG)?,
         requester_pid: u64::from(std::process::id()),
+        application_request,
         ..LoaderSpawnRequest::default()
     };
     request.exec_path[..exec_bytes.len()].copy_from_slice(exec_bytes);
@@ -1601,70 +1609,27 @@ fn build_exec_argv(exec_path: &str, argv: &[String]) -> Result<Vec<CString>, i32
         .collect()
 }
 
-fn build_exec_env(extra_env: &[String]) -> Result<Vec<CString>, i32> {
+fn build_exec_env(extra_env: &[String], logical_admin: bool) -> Result<Vec<CString>, i32> {
     use runtime_control::{
         load_runtime_default_env, RuntimeEnvScope, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
     };
     let default_env =
         load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Runtime)
             .map_err(runtime_registry_errno)?;
-    build_exec_env_with_defaults(extra_env, &default_env)
+    build_exec_env_with_defaults(
+        extra_env,
+        &default_env,
+        &mut super::launch_profile::SystemLaunchHost::for_launch(logical_admin),
+    )
 }
 
-/// Environment keys whose absolute directory must exist before the app starts.
-const LAUNCH_DIR_ENV_KEYS: [&str; 3] = ["HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"];
-
-/// The directories the effective launch environment names (entry value wins,
-/// as in `build_exec_env_with_defaults`): absolute paths of `HOME`,
-/// `XDG_CONFIG_HOME` and `XDG_CACHE_HOME`, deduplicated.
-fn launch_home_dirs<'a>(env: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
-    let mut dirs: Vec<&str> = Vec::new();
-    for item in env {
-        let Some((key, value)) = item.split_once('=') else {
-            continue;
-        };
-        if LAUNCH_DIR_ENV_KEYS.contains(&key) && value.starts_with('/') && !dirs.contains(&value) {
-            dirs.push(value);
-        }
-    }
-    dirs
-}
-
-/// `mkdir -p` for each launch directory through `create`. `Ok(())` from
-/// `create` means the directory exists afterwards; any error is returned with
-/// its path and the remaining directories are still attempted. Nothing here
-/// reports success for a directory that could not be created.
-fn ensure_dirs_with(
-    dirs: &[&str],
-    mut create: impl FnMut(&str) -> std::io::Result<()>,
-) -> Vec<(String, i32)> {
-    let mut failures = Vec::new();
-    for dir in dirs {
-        if let Err(error) = create(dir) {
-            failures.push(((*dir).to_owned(), error.raw_os_error().unwrap_or(libc::EIO)));
-        }
-    }
-    failures
-}
-
-/// Creates the app's `HOME`/`XDG_*` directories on every launch. Policy lives
-/// here in ring3; vfsd only provides `mkdir`. A launch is not refused when the
-/// writable `/data` volume is absent (the app may not need it), but the
-/// failure is reported with its errno so it is never mistaken for success.
-fn ensure_launch_home_dirs(env: &[CString]) {
-    let items = env.iter().filter_map(|item| item.to_str().ok());
-    let wanted = launch_home_dirs(items);
-    let failures = ensure_dirs_with(&wanted, |dir| std::fs::create_dir_all(dir));
-    for (dir, errno) in failures {
-        debug_line(&format!(
-            "runtimed: launch dir unavailable path={dir} errno={errno}"
-        ));
-    }
-}
-
-fn build_exec_env_with_defaults(
+/// Merges the catalog entry's environment over the registry defaults (entry
+/// value wins, entry order first) and resolves the result against the launch's
+/// session profile; see `launch_profile`. Both inputs are templates.
+pub(super) fn build_exec_env_with_defaults(
     extra_env: &[String],
     default_env: &[String],
+    host: &mut impl super::launch_profile::LaunchHost,
 ) -> Result<Vec<CString>, i32> {
     use super::MAX_EXEC_ENV_COUNT;
     if extra_env.len() > MAX_EXEC_ENV_COUNT {
@@ -1683,9 +1648,7 @@ fn build_exec_env_with_defaults(
         }
         push_env_if_missing(&mut env, item.as_str())?;
     }
-    env.into_iter()
-        .map(|item| CString::new(item).map_err(|_| libc::EINVAL))
-        .collect()
+    super::launch_profile::resolve_launch_env(&env, extra_env.len(), host)
 }
 
 fn push_env_if_missing<'a>(env: &mut Vec<&'a str>, item: &'a str) -> Result<(), i32> {

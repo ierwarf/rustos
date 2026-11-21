@@ -28,7 +28,13 @@ wrapper, and selects Wayland. Import, build, and ordinary boot do not run Chrome
 
 This is installation/discovery, not proof that Chrome runs. Shared-library,
 Linux syscall, sandbox, writable-profile and Wayland compatibility still need
-separate tests. No `--no-sandbox` fallback is added. No package maintenance
+separate tests. The checked-in example launches Chrome with `--no-sandbox` as
+an interim measure: RustOS has no user namespaces or setuid sandbox yet, and
+without the flag Chrome aborts in `setuid_sandbox_host.cc`. The profile lives
+on TmpFs (`--user-data-dir=/tmp/chrome-profile`) because `/data` may be absent.
+Do not browse untrusted content until a real sandbox exists. Turning off
+background networking is not a network isolation guarantee.
+No package maintenance
 scripts, host installation, cron integration, or host setuid/setgid permissions
 are applied; privilege bits are stripped during extraction. The recorded digest
 is a local pin, not an independent verification of Google's package signature.
@@ -48,7 +54,9 @@ cargo xtask build
 가져오기는 고정 SHA-256을 확인한 뒤 Chrome 본체와 리소스만 로컬 `bundle/`에
 풀고 패키지 등록 파일을 마지막에 만듭니다. 이후 이미지의 `/apps/chrome`에
 포함됩니다. 가져오지 않은 checkout에는 Chrome 패키지가 없으며 기존 가져오기
-결과를 자동으로 덮어쓰지 않습니다.
+결과를 자동으로 덮어쓰지 않습니다. 무샌드박스 실험 설정은 Git에서 제외된
+로컬 매니페스트에만 두고, 이름에 표시하여 외부 네트워크가 차단된 테스트에서만
+사용하세요. 백그라운드 네트워크 옵션만으로는 네트워크가 차단되지 않습니다.
 
 uiserver 바탕화면에 `Google Chrome`이 표시되지만 **자동 실행하지 않습니다**.
 실행 아이콘은 실제 Chrome ELF와 Wayland 옵션에 연결됩니다. Chrome 실행 호환성은

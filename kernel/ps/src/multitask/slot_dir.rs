@@ -40,57 +40,74 @@ fn build_chunk<T, const C: usize>(mut make: impl FnMut() -> T) -> Option<Box<[T]
 }
 
 /// Lock-free, grow-only array of `T`, read with `get` from any context.
-pub(crate) struct AtomicDir<T> {
-    chunks: [AtomicPtr<T>; SLOT_DIR],
+pub(crate) struct AtomicDir<T, const C: usize = SLOT_CHUNK, const D: usize = SLOT_DIR> {
+    chunks: [AtomicPtr<T>; D],
 }
 
-impl<T> AtomicDir<T> {
+impl<T, const C: usize, const D: usize> AtomicDir<T, C, D> {
     pub(crate) const fn new() -> Self {
-        Self { chunks: [const { AtomicPtr::new(ptr::null_mut()) }; SLOT_DIR] }
+        Self { chunks: [const { AtomicPtr::new(ptr::null_mut()) }; D] }
+    }
+
+    /// Builds a single chunk without touching the directory.
+    pub(crate) fn build_chunk(make: impl FnMut() -> T) -> Option<Box<[T]>> {
+        build_chunk::<T, C>(make)
     }
 
     /// The element at `index`, or `None` while its chunk is not yet published.
     #[inline]
     pub(crate) fn get(&self, index: usize) -> Option<&T> {
-        let chunk = self.chunks.get(index / SLOT_CHUNK)?;
-        // ORDERING: Acquire pairs with the release CAS in `ensure`, so the
-        // chunk's initialized elements are visible before the pointer is.
+        let chunk = self.chunks.get(index / C)?;
+        // ORDERING: Acquire pairs with the release CAS in `ensure`/`publish_chunk`,
+        // so the chunk's initialized elements are visible before the pointer is.
         let base = chunk.load(Ordering::Acquire);
         if base.is_null() {
             return None;
         }
         // SAFETY: `base` is the first element of a leaked `Box<[T]>` of exactly
-        // `SLOT_CHUNK` elements that is never freed or moved, and
-        // `index % SLOT_CHUNK < SLOT_CHUNK`.
-        Some(unsafe { &*base.add(index % SLOT_CHUNK) })
+        // `C` elements that is never freed or moved, and `index % C < C`.
+        Some(unsafe { &*base.add(index % C) })
+    }
+
+    /// Publishes an already-built chunk at `chunk_index` if still empty.
+    pub(crate) fn publish_chunk(
+        &self,
+        chunk_index: usize,
+        chunk: Box<[T]>,
+    ) -> Result<(), Box<[T]>> {
+        debug_assert_eq!(chunk.len(), C);
+        let Some(cell) = self.chunks.get(chunk_index) else {
+            return Err(chunk);
+        };
+        let base = Box::into_raw(chunk).cast::<T>();
+        // ORDERING: AcqRel publishes the initialized chunk to every `get`.
+        match cell.compare_exchange(ptr::null_mut(), base, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                // SAFETY: `base` came from `Box::into_raw` of a boxed slice of
+                // `C` elements and lost the CAS, so nothing else can reference it.
+                Err(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(base, C)) })
+            }
+        }
     }
 
     /// Makes sure the chunk holding `index` exists, allocating it with `make`
     /// in normal context. False means the index is beyond the ceiling or the
     /// allocation failed; nothing changed.
     pub(crate) fn ensure(&self, index: usize, make: impl FnMut() -> T) -> bool {
-        let Some(cell) = self.chunks.get(index / SLOT_CHUNK) else {
+        let chunk_index = index / C;
+        let Some(cell) = self.chunks.get(chunk_index) else {
             return false;
         };
         // ORDERING: Acquire so an already published chunk is fully visible.
         if !cell.load(Ordering::Acquire).is_null() {
             return true;
         }
-        let Some(chunk) = build_chunk::<T, SLOT_CHUNK>(make) else {
+        let Some(chunk) = Self::build_chunk(make) else {
             return false;
         };
-        let base = Box::into_raw(chunk).cast::<T>();
-        // ORDERING: AcqRel publishes the initialized chunk to every `get`.
-        match cell.compare_exchange(ptr::null_mut(), base, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => true,
-            Err(_) => {
-                // SAFETY: `base` came from `Box::into_raw` of a boxed slice of
-                // `SLOT_CHUNK` elements a moment ago and lost the race, so it
-                // was never published and nothing else can reference it.
-                drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(base, SLOT_CHUNK)) });
-                true
-            }
-        }
+        let _ = self.publish_chunk(chunk_index, chunk);
+        true
     }
 
     /// Every element of every published chunk, in index order of the chunks.
@@ -98,26 +115,51 @@ impl<T> AtomicDir<T> {
         self.chunks.iter().flat_map(|cell| {
             // ORDERING: Acquire, as in `get`.
             let base = cell.load(Ordering::Acquire);
-            let count = if base.is_null() { 0 } else { SLOT_CHUNK };
+            let count = if base.is_null() { 0 } else { C };
             (0..count).map(move |offset| {
-                // SAFETY: as in `get`; `offset < SLOT_CHUNK`.
+                // SAFETY: as in `get`; `offset < C`.
                 unsafe { &*base.add(offset) }
             })
         })
     }
 
-    /// Slots covered by published chunks (a multiple of `SLOT_CHUNK`).
+    /// Every element of the contiguous prefix of published chunks, stopping at
+    /// the first unpublished chunk. Allocation-free.
+    pub(crate) fn iter_contiguous(&self) -> impl Iterator<Item = &T> + '_ {
+        self.chunks
+            .iter()
+            // ORDERING: Acquire, as in `get`.
+            .map(|cell| cell.load(Ordering::Acquire))
+            .take_while(|base| !base.is_null())
+            .flat_map(|base| {
+                (0..C).map(move |offset| {
+                    // SAFETY: as in `get`; `offset < C` and `base` is non-null.
+                    unsafe { &*base.add(offset) }
+                })
+            })
+    }
+
+    /// Count of contiguous chunks published from index 0.
+    pub(crate) fn contiguous_chunks(&self) -> usize {
+        self.chunks
+            .iter()
+            // ORDERING: Acquire, as in `get`.
+            .take_while(|cell| !cell.load(Ordering::Acquire).is_null())
+            .count()
+    }
+
+    /// Slots covered by published chunks (a multiple of `C`).
     pub(crate) fn capacity(&self) -> usize {
         self.chunks
             .iter()
             // ORDERING: Acquire, as in `get`.
             .filter(|cell| !cell.load(Ordering::Acquire).is_null())
             .count()
-            * SLOT_CHUNK
+            * C
     }
 }
 
-impl<T> Index<usize> for AtomicDir<T> {
+impl<T, const C: usize, const D: usize> Index<usize> for AtomicDir<T, C, D> {
     type Output = T;
     /// For writers that hold a slot index: its chunk was published before the
     /// slot became allocatable, so absence is a broken ordering, not a state.

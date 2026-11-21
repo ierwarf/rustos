@@ -37,8 +37,8 @@ const DEFAULT_MAPPING_GAP: u64 = 16 * 1024 * 1024;
 const ADMIN_REQUEST_PATH_CAPACITY: usize = 96;
 const PROCESS_EXEC_PATH_CAPACITY: usize = 192;
 pub const WINDOWS_TLS_SLOT_COUNT: usize = 64;
-pub const DEFAULT_DESKTOP_UID: u32 = 1000;
-pub const DEFAULT_DESKTOP_GID: u32 = 1000;
+pub const DEFAULT_DESKTOP_UID: u32 = rustos_user_abi::desktop_session::DESKTOP_SESSION_UID;
+pub const DEFAULT_DESKTOP_GID: u32 = rustos_user_abi::desktop_session::DESKTOP_SESSION_GID;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PendingAdminRequestKind {
@@ -82,6 +82,34 @@ impl PendingAdminRequest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinuxCapabilities {
+    pub effective: u64,
+    pub permitted: u64,
+    pub inheritable: u64,
+}
+
+impl LinuxCapabilities {
+    pub const EMPTY: Self = Self {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    };
+
+    /// Validate a Linux `capset` transition against the process's current sets:
+    /// permitted may only drop bits, effective must be a subset of permitted,
+    /// and inheritable cannot gain bits outside the existing inheritable | permitted.
+    pub const fn restrict_to(self, next: Self) -> Option<Self> {
+        if (next.permitted & !self.permitted) != 0
+            || (next.effective & !next.permitted) != 0
+            || (next.inheritable & !(self.inheritable | self.permitted)) != 0
+        {
+            return None;
+        }
+        Some(next)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessSecurityContext {
     logical_admin: bool,
@@ -104,6 +132,7 @@ pub struct ProcessSecurityContext {
     /// job-group memory limit has no victim selection, so the value is
     /// recorded and read back but has no policy effect.
     oom_score_adj: i16,
+    capabilities: LinuxCapabilities,
 }
 
 impl ProcessSecurityContext {
@@ -128,6 +157,7 @@ impl ProcessSecurityContext {
             no_new_privs: false,
             dumpable: true,
             oom_score_adj: 0,
+            capabilities: LinuxCapabilities::EMPTY,
         }
     }
 
@@ -148,6 +178,7 @@ impl ProcessSecurityContext {
             no_new_privs: false,
             dumpable: true,
             oom_score_adj: 0,
+            capabilities: LinuxCapabilities::EMPTY,
         }
     }
 
@@ -164,7 +195,12 @@ impl ProcessSecurityContext {
         );
         next.no_new_privs = self.no_new_privs;
         next.oom_score_adj = self.oom_score_adj;
+        next.capabilities = self.capabilities;
         next
+    }
+
+    pub const fn capabilities(self) -> LinuxCapabilities {
+        self.capabilities
     }
 
     pub const fn oom_score_adj(self) -> i16 {
@@ -235,6 +271,8 @@ pub struct UserProcessState {
     windows_runtime: Option<WindowsProcessRuntimeState>,
     win32_objects: Win32ProcessObjects,
     handles: HandleTable,
+    fork_handle_pins: usize,
+    deferred_fork_handle_drops: Vec<KernelHandle>,
     security: ProcessSecurityContext,
     mapping_cursor: u64,
     shared_memfd_mappings: Vec<SharedMemfdMapping>,
@@ -599,6 +637,8 @@ impl UserProcessState {
             windows_runtime,
             win32_objects: Win32ProcessObjects::default(),
             handles: HandleTable::new(),
+            fork_handle_pins: 0,
+            deferred_fork_handle_drops: Vec::new(),
             security: ProcessSecurityContext::new(logical_admin),
             mapping_cursor: default_cursor,
             shared_memfd_mappings: Vec::new(),
@@ -1240,6 +1280,15 @@ impl UserProcessState {
         self.security.dumpable = dumpable;
     }
 
+    /// Restrict per-process Linux capabilities without allowing escalation.
+    pub fn set_capabilities(&mut self, next: LinuxCapabilities) -> bool {
+        let Some(updated) = self.security.capabilities.restrict_to(next) else {
+            return false;
+        };
+        self.security.capabilities = updated;
+        true
+    }
+
     /// Records `/proc/<pid>/oom_score_adj`; `None` when outside `-1000..=1000`.
     pub fn set_oom_score_adj(&mut self, value: i64) -> Option<()> {
         self.security.oom_score_adj = i16::try_from(value).ok().filter(|v| (-1000..=1000).contains(v))?;
@@ -1248,6 +1297,42 @@ impl UserProcessState {
 
     pub fn set_gid(&mut self, gid: u32) {
         self.security.set_gid(gid);
+    }
+
+    /// Pin open-description reference drops while a concurrent `fork` acquires
+    /// inherited references for the snapshotted child handle table.
+    pub fn begin_fork_handle_pin(&mut self) {
+        self.fork_handle_pins = self
+            .fork_handle_pins
+            .checked_add(1)
+            .expect("fork handle pin count overflow");
+    }
+
+    pub fn end_fork_handle_pin(&mut self) -> Vec<KernelHandle> {
+        self.fork_handle_pins = self.fork_handle_pins.saturating_sub(1);
+        if self.fork_handle_pins == 0 {
+            core::mem::take(&mut self.deferred_fork_handle_drops)
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn defer_handle_drop_if_pinned(&mut self, handle: KernelHandle) -> (KernelHandle, bool) {
+        if self.fork_handle_pins > 0 {
+            self.deferred_fork_handle_drops.push(handle.clone());
+            (handle, false)
+        } else {
+            (handle, true)
+        }
+    }
+
+    pub fn close_handle_respecting_fork_pin(&mut self, fd: u64) -> Option<(KernelHandle, bool)> {
+        let handle = self.handles.close(fd)?;
+        Some(self.defer_handle_drop_if_pinned(handle))
+    }
+
+    pub fn take_deferred_fork_handle_drops(&mut self) -> Vec<KernelHandle> {
+        core::mem::take(&mut self.deferred_fork_handle_drops)
     }
 
     pub fn fork_clone(
@@ -1265,6 +1350,8 @@ impl UserProcessState {
             windows_runtime: self.windows_runtime,
             win32_objects: self.win32_objects.clone(),
             handles: self.handles.clone(),
+            fork_handle_pins: 0,
+            deferred_fork_handle_drops: Vec::new(),
             security: self.security,
             mapping_cursor: self.mapping_cursor,
             shared_memfd_mappings: self.shared_memfd_mappings.clone(),
@@ -1301,6 +1388,8 @@ impl UserProcessState {
             windows_runtime,
             win32_objects,
             handles,
+            fork_handle_pins,
+            deferred_fork_handle_drops,
             security,
             mapping_cursor,
             shared_memfd_mappings,
@@ -1322,6 +1411,8 @@ impl UserProcessState {
             windows_runtime,
             win32_objects,
             handles,
+            fork_handle_pins,
+            deferred_fork_handle_drops,
             security,
             mapping_cursor,
             shared_memfd_mappings,
@@ -1350,7 +1441,8 @@ impl UserProcessState {
             .map(|action| action.handler == SIG_IGN);
         let security = self.security.for_exec();
         let mut handles = core::mem::take(&mut self.handles);
-        let closed = handles.close_cloexec();
+        let mut closed = handles.close_cloexec();
+        closed.append(&mut self.deferred_fork_handle_drops);
 
         let mut fresh = Self::new(
             address_space,
@@ -1694,5 +1786,36 @@ mod tests {
         let holds = state.shared_memfd_holds();
         assert_eq!(holds.len(), 1);
         assert_eq!(holds[0].object_id(), state.shared_memfd_mappings[0].hold.object_id());
+    }
+
+    #[test]
+    fn fork_handle_pin_defers_closed_handle_drops_until_last_fork_unpins() {
+        use crate::user::epoll::EpollHandle;
+        use crate::user::process_state::{KernelHandle, UserProcessState};
+        use kernel_mm::api::ProcessAddressSpace;
+        let mut state = UserProcessState::new(
+            ProcessAddressSpace::empty_for_tests(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            "/bin/test",
+        );
+        let epoll = EpollHandle::from_token(77);
+        let fd = state
+            .handles_mut()
+            .install(KernelHandle::Epoll(epoll))
+            .unwrap();
+        state.begin_fork_handle_pin();
+        state.begin_fork_handle_pin();
+
+        let (_, release_now) = state.close_handle_respecting_fork_pin(fd).unwrap();
+        assert!(!release_now);
+        assert!(state.end_fork_handle_pin().is_empty());
+
+        let deferred = state.end_fork_handle_pin();
+        assert_eq!(deferred.len(), 1);
+        assert!(matches!(deferred[0], KernelHandle::Epoll(ref e) if e.token_id() == 77));
     }
 }

@@ -537,6 +537,14 @@ pub fn current_scheduling_context_runtime_snapshot()
     super::scheduler::current_observation::runtime()
 }
 
+/// CPU time the calling thread has consumed, for `CLOCK_THREAD_CPUTIME_ID`.
+pub fn current_thread_cpu_time_ns() -> Option<u64> {
+    if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
+        return None;
+    }
+    super::scheduler::current_observation::thread_cpu_time_ns()
+}
+
 pub fn is_user_task_alive(task_id: u64) -> bool {
     super::scheduler::current_observation::alive(task_id)
 }

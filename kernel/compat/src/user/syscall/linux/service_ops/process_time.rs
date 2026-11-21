@@ -305,7 +305,7 @@ fn validate_time_hot_path_locally(
 ) -> Result<(), i64> {
     match kind {
         TimeHotPath::ClockGettime => {
-            if flags != 0 || timespec.is_some() || !is_supported_clock_id(clock_id) {
+            if flags != 0 || timespec.is_some() || !is_readable_clock_id(clock_id) {
                 return Err(LINUX_EINVAL);
             }
         }
@@ -329,14 +329,24 @@ fn validate_time_hot_path_locally(
 // RAW/COARSE/BOOTTIME differ from MONOTONIC/REALTIME only in slewing,
 // resolution and suspend accounting, none of which exist here, and libc,
 // glib and runtimes read them routinely (a spurious EINVAL there panics
-// std-style `Instant::now` callers). CPU-time and TAI clocks stay unsupported.
+// std-style `Instant::now` callers). The process CPU-time and TAI clocks stay
+// unsupported; the calling thread's CPU time is readable (see
+// `is_readable_clock_id`) because the scheduler accounts it per thread.
 const CLOCK_MONOTONIC_RAW: u64 = 4;
 const CLOCK_REALTIME_COARSE: u64 = 5;
 const CLOCK_MONOTONIC_COARSE: u64 = 6;
 const CLOCK_BOOTTIME: u64 = 7;
+const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
 
 fn is_realtime_clock_id(clock_id: u64) -> bool {
     clock_id == linux_abi::CLOCK_REALTIME || clock_id == CLOCK_REALTIME_COARSE
+}
+
+/// Clocks `clock_gettime`/`clock_getres` serve. `CLOCK_THREAD_CPUTIME_ID` is
+/// readable but is no instant a sleep can wait on, so `clock_nanosleep` keeps
+/// using `is_supported_clock_id`, as Linux does.
+fn is_readable_clock_id(clock_id: u64) -> bool {
+    is_supported_clock_id(clock_id) || clock_id == CLOCK_THREAD_CPUTIME_ID
 }
 
 fn is_supported_clock_id(clock_id: u64) -> bool {
@@ -400,7 +410,14 @@ pub fn syscall_linux_time(tloc_ptr: u64) -> u64 {
 }
 
 fn write_clock_timespec(clock_id: u64, timespec_ptr: u64) -> u64 {
-    let ts = current_clock_timespec_substrate(clock_id);
+    let ts = if clock_id == CLOCK_THREAD_CPUTIME_ID {
+        match multitask::current_thread_cpu_time_ns() {
+            Some(nanos) => timespec_from_nanos(nanos),
+            None => return linux_errno(LINUX_EINVAL),
+        }
+    } else {
+        current_clock_timespec_substrate(clock_id)
+    };
     match usermem::write_current_user_bytes(timespec_ptr, as_bytes(&ts)) {
         Ok(()) => 0,
         Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
@@ -408,7 +425,7 @@ fn write_clock_timespec(clock_id: u64, timespec_ptr: u64) -> u64 {
 }
 
 pub fn syscall_linux_clock_getres(clock_id: u64, res_ptr: u64) -> u64 {
-    if !is_supported_clock_id(clock_id) {
+    if !is_readable_clock_id(clock_id) {
         return linux_errno(LINUX_EINVAL);
     }
     if res_ptr == 0 {
@@ -913,10 +930,13 @@ mod tests {
         }
         assert!(is_supported_clock_id(CLOCK_REALTIME_COARSE));
         assert!(is_realtime_clock_id(CLOCK_REALTIME_COARSE));
-        // CPU-time (2, 3) and TAI (11) clocks have no backing source here.
+        // Process CPU time (2) and TAI (11) have no backing source here, and
+        // the thread CPU clock is readable but never a sleep clock.
         for id in [2, 3, 8, 11, 12] {
             assert!(!is_supported_clock_id(id));
         }
+        assert!(is_readable_clock_id(CLOCK_THREAD_CPUTIME_ID));
+        assert!(!is_readable_clock_id(2));
     }
 
     #[test]

@@ -45,7 +45,7 @@ pub use crate::multitask::{
     linux_thread_runnable_by_ids, linux_thread_snapshot_by_ids, set_linux_thread_comm_by_ids, live_user_process_identity_by_pid,
     live_user_process_identity_with_exact_exec_path, mark_user_process_exiting,
     mark_user_process_exiting_once, next_retired_task_cleanup, note_process_exit_status,
-    first_user_mapping_conflict, move_pager_vma_range_for_process, pager_fault_snapshot, pager_vma_regions_for_process, protect_pager_vma_for_process,
+    first_user_mapping_conflict, move_pager_vma_range_for_process, move_pager_vma_range_for_process_with_ceiling, pager_fault_snapshot, pager_vma_regions_for_process, protect_pager_vma_for_process, protect_pager_vma_for_process_with_ceiling,
     publish_current_pager_vma, publish_inherited_pager_vma_for_process,
     publish_pager_vma_for_process, queue_linux_process_sigchld, queue_linux_process_signal, queue_linux_signal,
     register_pager_fault_waiter, release_ipc_priority, release_pager_fault_priority,
@@ -63,7 +63,7 @@ pub use crate::multitask::{
     spawn_user_thread_suspended, stop_current_linux_process, take_next_pager_fault_for_rendezvous,
     take_pager_fault_waiter_for, task_has_system_scheduling_class, terminate_user_process,
     terminate_user_process_once, TerminateOutcome,
-    terminate_user_task, unmap_pager_vma_for_process, unmap_pager_vma_for_process_with,
+    terminate_user_task, unmap_pager_vma_for_process, unmap_pager_vma_for_process_with, unmap_pager_vma_for_process_with_ceiling,
     unregister_pager_fault_waiter, validate_fault_request, wake_pager_service_waiter_for_process,
     wake_task, wake_user_task, windows_process_affinity, with_current_mm,
     with_current_process_state, with_current_process_state_mut, with_current_user_linux_state_mut,
@@ -114,7 +114,7 @@ pub use crate::user::pipe::{
     PIPE_MAX_CAPACITY,
 };
 pub use crate::user::process_state::{
-    ProcessSecurityContext, SharedFutexBackingKey, UserProcessState,
+    LinuxCapabilities, ProcessSecurityContext, SharedFutexBackingKey, UserProcessState,
 };
 pub use crate::user::socket::{
     PassedHandle, SocketCredentials, SocketError, SocketHandle, SocketStreamGuard,
@@ -139,6 +139,9 @@ pub use crate::multitask::{
 };
 pub use crate::multitask::{register_child_waiter, unregister_child_waiter, wake_child_waiters};
 pub use crate::multitask::{MemoryCensusEntry, memory_census};
+pub use crate::multitask::{
+    task_capacity_snapshot, CapacityLimit, TaskCapacity, TaskCapacitySnapshot, TASK_CAPACITY,
+};
 pub use crate::multitask::{
     job_admits_process, job_collect_members, job_create_child, job_info, job_is_within,
     job_kill_begin, job_set_limits, JobLimits, LimitMask, LIMIT_UNSET,
@@ -333,6 +336,10 @@ pub mod snapshot {
         crate::multitask::current_scheduling_context_runtime_snapshot()
     }
 
+    pub fn current_thread_cpu_time_ns() -> Option<u64> {
+        crate::multitask::current_thread_cpu_time_ns()
+    }
+
     pub fn current_user_ipc_identity() -> Option<(u64, crate::multitask::ProcessIdentity)> {
         crate::multitask::current_user_ipc_identity()
     }
@@ -463,7 +470,7 @@ pub use crate::user::sysops::{drain_user_copy_profile, force_drain_user_copy_pro
 pub use boot::{is_initialized, service_deferred_work, start, start_secondary_cpu};
 pub use fault::{halt_current_retired_task, retire_current_user_task_due_to_fault};
 pub use snapshot::{
-    current_scheduling_context_runtime_snapshot, current_task_id,
+    current_scheduling_context_runtime_snapshot, current_task_id, current_thread_cpu_time_ns,
     current_user_abi, current_user_id, current_user_log_ids, current_user_process_id,
     current_user_snapshot, parent_process_id_of, retain_current_user_process_state,
     user_log_ids_for_task, with_current_process_credentials, with_current_user_process_state_mut,

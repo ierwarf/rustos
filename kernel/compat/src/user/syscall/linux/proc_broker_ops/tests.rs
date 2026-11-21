@@ -446,3 +446,19 @@ fn spawn_quota_errors_keep_linux_errno_distinct() {
     assert_eq!(process_spawn_error_to_linux_errno(multitask::SpawnTaskError::NoFreeTaskSlot), LINUX_EAGAIN);
     assert_eq!(process_load_error_to_linux_errno(crate::user::process::ProcessLoadError::Spawn(multitask::SpawnTaskError::MemoryQuota)), LINUX_ENOMEM);
 }
+
+#[test]
+fn thread_spawn_memory_failures_are_enomem_and_limits_are_eagain() {
+    use multitask::SpawnTaskError as E;
+    for memory in [E::ThreadStackAllocation, E::JobThreadMemory] {
+        assert_eq!(process_spawn_error_to_linux_errno(memory), LINUX_ENOMEM, "{memory:?}");
+    }
+    for limit in [E::ProcessLimit, E::ProcessThreadLimit, E::JobThreadLimit, E::ProcessExiting, E::ProcessExecInProgress] {
+        assert_eq!(process_spawn_error_to_linux_errno(limit), LINUX_EAGAIN, "{limit:?}");
+        assert_eq!(
+            process_load_error_to_linux_errno(crate::user::process::ProcessLoadError::Spawn(limit)),
+            LINUX_EAGAIN,
+            "{limit:?}"
+        );
+    }
+}

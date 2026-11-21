@@ -355,6 +355,24 @@ fn loader_requester_identity_is_bound_to_the_kernel_sender() {
 }
 
 #[test]
+fn loader_spawn_request_carries_the_application_request_after_the_requester() {
+    use crate::application_request::ApplicationRequest;
+    use crate::syscall::LOADER_REQUEST_ABI_VERSION;
+    assert_eq!(LOADER_REQUEST_ABI_VERSION, 5);
+    assert_eq!(core::mem::size_of::<ApplicationRequest>(), 24);
+    assert_eq!(
+        core::mem::offset_of!(LoaderSpawnRequest, application_request),
+        core::mem::offset_of!(LoaderSpawnRequest, requester_pid) + 8
+    );
+    assert_eq!(
+        core::mem::offset_of!(LoaderSpawnRequest, scheduling_context),
+        core::mem::offset_of!(LoaderSpawnRequest, application_request) + 24
+    );
+    // Zero is the only default: a service request never carries a Job request.
+    assert!(!LoaderSpawnRequest::default().application_request.is_declared());
+}
+
+#[test]
 fn privileged_loader_operations_have_an_explicit_service_role_matrix() {
     for service_id in [IPC_SERVICE_ROOTD, IPC_SERVICE_INITD, IPC_SERVICE_SESSIOND] {
         assert!(loader_service_role_allows_operation(

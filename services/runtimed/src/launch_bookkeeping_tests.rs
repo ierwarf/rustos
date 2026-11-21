@@ -15,6 +15,7 @@ fn entry() -> LaunchEntry {
         console_hosted: false,
         args: Vec::new(),
         env: Vec::new(),
+        application_request: runtime_control::ApplicationRequest::NONE,
         private_smp_qualification: None,
     }
 }

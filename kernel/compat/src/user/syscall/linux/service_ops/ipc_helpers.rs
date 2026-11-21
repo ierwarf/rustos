@@ -215,6 +215,52 @@ pub fn copy_string_vector(
     Err(LINUX_E2BIG)
 }
 
+fn normalize_proc_components(raw_path: &str) -> Option<Vec<&str>> {
+    if !raw_path.starts_with('/') {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for segment in raw_path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(parts)
+}
+
+fn parse_decimal_pid(text: &str) -> Option<u64> {
+    if text.is_empty() || (text.len() > 1 && text.starts_with('0')) {
+        return None;
+    }
+    text.bytes().all(|b| b.is_ascii_digit()).then(|| text.parse().ok()).flatten()
+}
+
+pub(super) fn resolve_exec_path(
+    raw_path: &str,
+    caller_pid: Option<u64>,
+    caller_exec_path: Option<&str>,
+) -> Result<String, i64> {
+    if let Some(parts) = normalize_proc_components(raw_path)
+        && let ["proc", dir, "exe"] = parts.as_slice()
+    {
+        let matches_caller = *dir == "self"
+            || *dir == "thread-self"
+            || caller_pid.is_some_and(|pid| parse_decimal_pid(dir) == Some(pid));
+        if !matches_caller {
+            return Err(LINUX_ENOENT);
+        }
+        return caller_exec_path
+            .filter(|path| path.starts_with('/'))
+            .map(String::from)
+            .ok_or(LINUX_ENOENT);
+    }
+    Ok(String::from(raw_path))
+}
+
 pub fn procd_exec(
     frame: &mut SyscallFrame,
     op: u16,
@@ -231,14 +277,26 @@ pub fn procd_exec(
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
+    let caller_pid = multitask::current_user_process_id();
+    let caller_exec_path = multitask::with_current_user_process_state(|_, _, state| {
+        String::from(state.exec_path())
+    });
+    let exec_path = match resolve_exec_path(
+        raw_exec_path.as_str(),
+        caller_pid,
+        caller_exec_path.as_deref(),
+    ) {
+        Ok(path) => path,
+        Err(errno) => return linux_errno(errno),
+    };
     let mut request = new_procd_request(op);
     request.dirfd = (linux_abi::AT_FDCWD as i64) as u64;
     request.flags = flags as u32;
-    if raw_exec_path.len() > request.path.len() {
+    if exec_path.len() > request.path.len() {
         return linux_errno(LINUX_EINVAL);
     }
-    request.path_len = raw_exec_path.len() as u32;
-    request.path[..raw_exec_path.len()].copy_from_slice(raw_exec_path.as_bytes());
+    request.path_len = exec_path.len() as u32;
+    request.path[..exec_path.len()].copy_from_slice(exec_path.as_bytes());
     if let Err(errno) = copy_string_vector(
         argv_ptr,
         LOADER_SPAWN_MAX_ARG_COUNT,
@@ -2222,7 +2280,20 @@ pub fn current_remote_vfs_handle_with_rights(
 
 const LINUX_ENAMETOOLONG: i64 = 36;
 
+/// Copies a path argument that names something, as nearly every path syscall
+/// requires: Linux answers an empty name with `ENOENT`.
 pub fn copy_current_user_path(ptr: u64, capacity: usize) -> Result<String, i64> {
+    let path = copy_current_user_path_allow_empty(ptr, capacity)?;
+    if path.is_empty() {
+        return Err(LINUX_ENOENT);
+    }
+    Ok(path)
+}
+
+/// Copies a path argument whose empty string is meaningful (`AT_EMPTY_PATH`:
+/// the operation applies to the descriptor itself). The caller owns rejecting
+/// an empty path when that flag is absent.
+pub fn copy_current_user_path_allow_empty(ptr: u64, capacity: usize) -> Result<String, i64> {
     if ptr == 0 {
         return Err(LINUX_EFAULT);
     }
@@ -2231,9 +2302,6 @@ pub fn copy_current_user_path(ptr: u64, capacity: usize) -> Result<String, i64> 
         .ok_or(LINUX_ENAMETOOLONG)?;
     if path.len() > capacity {
         return Err(LINUX_ENAMETOOLONG);
-    }
-    if path.is_empty() {
-        return Err(LINUX_EINVAL);
     }
     Ok(path)
 }

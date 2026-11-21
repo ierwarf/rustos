@@ -251,10 +251,13 @@ static void tmpfs_suite(const char *name, const char *base) {
     case_begin(name);
     char dir[160], a[200], b[200], c[200], ln[200], lp1[200], lp2[200];
     snprintf(dir, sizeof(dir), "%s/chromeprobe.%d", base, (int)getpid());
-    /* The base itself must exist; /run/user/1000 may need creating. */
     if (strcmp(base, "/run/user/1000") == 0) {
-        mkdir("/run/user", 0755);
-        mkdir(base, 0700);
+        /* Qt probes this existing directory with mkdir before validating it.
+         * The user may search /run/user but may not create children there. */
+        CHECK_ERRNO(mkdir(base, 0700), EEXIST);
+        char missing[160];
+        snprintf(missing, sizeof(missing), "/run/user/chromeprobe.%d", (int)getpid());
+        CHECK_ERRNO(mkdir(missing, 0700), EACCES);
     }
     CHECK(mkdir(dir, 0700) == 0);
     CHECK(chmod(dir, 0700) == 0);
@@ -1040,6 +1043,26 @@ static void mem_vm_semantics(void) {
         CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
         munmap(res, 2 * page);
     }
+
+    /* A browser creates many guarded regions. Splitting the middle of 96
+     * reservations needs 288 fragments, above the former 256-entry limit. */
+    unsigned char *guards[96];
+    size_t created = 0;
+    int guarded_ok = 1;
+    while (created < sizeof(guards) / sizeof(guards[0])) {
+        unsigned char *span = mmap(NULL, 3 * page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (span == MAP_FAILED) { guarded_ok = 0; break; }
+        guards[created++] = span;
+        if (mprotect(span + page, page, PROT_READ | PROT_WRITE) != 0) { guarded_ok = 0; break; }
+        span[page] = (unsigned char)created;
+        if (span[page] != (unsigned char)created) { guarded_ok = 0; break; }
+    }
+    CHECK(guarded_ok && created == sizeof(guards) / sizeof(guards[0]));
+    int unmap_ok = 1;
+    for (size_t i = 0; i < created; ++i) {
+        if (munmap(guards[i], 3 * page) != 0) unmap_ok = 0;
+    }
+    CHECK(unmap_ok);
 
     /* Partial mlock over a range with an unmapped hole returns ENOMEM while locking mapped pages. */
     unsigned char *pair = mmap(NULL, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

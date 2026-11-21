@@ -19,8 +19,8 @@ fn errno(error: LeaseError) -> i32 {
 }
 fn digest_snapshot(snapshot: &ImmutableFileSnapshot, end_ns: u64) -> Result<String, i32> {
     let mut window = Vec::new();
-    window.try_reserve_exact(ELF_READ_CHUNK_BYTES).map_err(|_| 12)?;
-    window.resize(ELF_READ_CHUNK_BYTES, 0);
+    window.try_reserve_exact(EXECUTABLE_IMAGE_TRANSFER_WINDOW_BYTES).map_err(|_| 12)?;
+    window.resize(EXECUTABLE_IMAGE_TRANSFER_WINDOW_BYTES, 0);
     let mut digest = Sha256::new();
     let mut offset = 0;
     while offset < snapshot.file_bytes {

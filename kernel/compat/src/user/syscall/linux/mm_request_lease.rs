@@ -32,7 +32,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 /// table is reported to the caller as `EAGAIN` rather than served unbound.
 const LEASE_SLOTS: usize = 256;
 /// Most leases one pid may hold at once. A process has at most
-/// `MAX_THREADS_PER_PROCESS` (128) threads, each holding one lease for one
+/// per-process-thread-ceiling (`task_capacity`, 128 of 256 slots) threads, each holding one lease for one
 /// syscall, so without a cap a few processes with a slow `syscalld` could fill
 /// the whole table and turn every other process's request into `EAGAIN`. Over
 /// the cap, `open` refuses exactly like a full table; 32 lets a thread-heavy

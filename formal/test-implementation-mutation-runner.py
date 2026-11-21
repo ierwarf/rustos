@@ -449,18 +449,20 @@ def severity_gate_covers_critical_high_medium_and_low() -> None:
         else:
             raise AssertionError("unknown severity admitted")
 
-        # nightly executes everything; pr executes blocking rows plus advisory
-        # rows of changed packages only, and reports the rest as skipped.
-        selected, skipped = runner.select_for_profile(rows, "nightly", set())
+        # nightly executes everything; pr executes rows whose source file,
+        # witness file, or registry row changed, and skips untouched rows.
+        selected, skipped = runner.select_for_profile(root, rows, "nightly", set())
         assert [r["id"] for r in selected] == ["a", "b", "c", "d"] and not skipped
-        selected, skipped = runner.select_for_profile(rows, "pr", set())
-        assert [r["id"] for r in selected] == ["a", "b"]
-        assert [r["id"] for r in skipped] == ["c", "d"]
-        selected, skipped = runner.select_for_profile(rows, "pr", {"alpha"})
+        selected, skipped = runner.select_for_profile(root, rows, "pr", set())
+        assert not selected and [r["id"] for r in skipped] == ["a", "b", "c", "d"]
+        selected, skipped = runner.select_for_profile(root, rows, "pr", {"alpha/lib.rs"})
         assert [r["id"] for r in selected] == ["a", "b", "d"]
         assert [r["id"] for r in skipped] == ["c"]
+        selected, skipped = runner.select_for_profile(root, rows, "pr", set(), {"c"})
+        assert [r["id"] for r in selected] == ["c"]
+        assert [r["id"] for r in skipped] == ["a", "b", "d"]
         try:
-            runner.select_for_profile(rows, "weekly", set())
+            runner.select_for_profile(root, rows, "weekly", set())
         except SystemExit:
             pass
         else:
@@ -511,6 +513,22 @@ def severity_gate_covers_critical_high_medium_and_low() -> None:
         assert runner.changed_packages(root) == {"alpha", "beta"}, "untracked counts"
 
 
+def cost_weighted_lpt_separates_heavy_kernel_ps_groups() -> None:
+    def row(identity: str, package: str, source: str) -> dict[str, str | int]:
+        return {"id": identity, "package": package, "source": source}
+
+    ordered = [
+        *[row(f"ps-a-{i}", "kernel-ps", "a.rs") for i in range(4)],
+        *[row(f"ps-b-{i}", "kernel-ps", "b.rs") for i in range(4)],
+        *[row(f"mm-{i}", "kernel-mm", "mm.rs") for i in range(4)],
+    ]
+    buckets = runner.partition_shard_buckets(ordered, 2)
+    sources_per_bucket = [{str(m["source"]) for m in b} for b in buckets]
+    assert "a.rs" in sources_per_bucket[0] and "b.rs" in sources_per_bucket[1], (
+        f"heavy kernel-ps files must balance across shards: {sources_per_bucket}"
+    )
+
+
 def main() -> int:
     witness = "ipc::tests::exact_contract"
     started = sealed_output(witness, "running 1 test\n")
@@ -550,6 +568,7 @@ def main() -> int:
     cache_key_ignores_runner_edits_outside_kill_semantics()
     interrupted_lane_resumes_from_exact_key_checkpoint()
     severity_gate_covers_critical_high_medium_and_low()
+    cost_weighted_lpt_separates_heavy_kernel_ps_groups()
 
     print("implementation mutation runner selftest passed")
     return 0

@@ -16,7 +16,7 @@
 //! - **Evidence:** `dvm-block-startup`, `dvm-read-cache`,
 //!   `dvm-volume-io`, and `durable-block-mutation`.
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -39,9 +39,84 @@ const READ_CACHE_WINDOW_LIMIT: usize = 40;
 const READ_AHEAD_IN_FLIGHT_LIMIT: usize = 16;
 const _: () = assert!(READ_AHEAD_IN_FLIGHT_LIMIT < READ_CACHE_WINDOW_LIMIT);
 static READ_CACHE: Mutex<ReadCacheSet> = Mutex::new(ReadCacheSet::new());
+static READ_TELEMETRY: ReadTelemetry = ReadTelemetry::new();
 // A timeout does not cancel Linux I/O. Never re-admit this process after an
 // uncertain operation: only external quiescence/revocation can make reuse safe.
 static PROVIDER_QUARANTINED: AtomicBool = AtomicBool::new(false);
+
+/// Where a sequential DVM read stream spends its time, aggregated so a
+/// several-hundred-megabyte executable snapshot produces a handful of lines
+/// instead of one per request. Submit time is the broker round trips that queue
+/// a batch, first-completion time is the latency of the one demanded window
+/// (everything else in the batch overlaps behind it), and wait time is the
+/// whole batch from first submit to last collect. A hit never reaches the DVM.
+struct ReadTelemetry {
+    batches: AtomicU64,
+    windows: AtomicU64,
+    bytes: AtomicU64,
+    hits: AtomicU64,
+    submit_ns: AtomicU64,
+    first_ns: AtomicU64,
+    batch_ns: AtomicU64,
+    max_batch_ns: AtomicU64,
+}
+
+/// One summary per this many DVM batches (at most 16 windows each).
+const READ_TELEMETRY_INTERVAL_BATCHES: u64 = 32;
+
+impl ReadTelemetry {
+    const fn new() -> Self {
+        Self {
+            batches: AtomicU64::new(0),
+            windows: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            submit_ns: AtomicU64::new(0),
+            first_ns: AtomicU64::new(0),
+            batch_ns: AtomicU64::new(0),
+            max_batch_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn record_hit(&self) {
+        self.hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Accumulates one completed batch; yields the summary line on every
+    /// interval boundary so the caller (not this counter) owns the I/O.
+    fn record_batch(
+        &self,
+        windows: u64,
+        bytes: u64,
+        submit: Duration,
+        first: Duration,
+        batch: Duration,
+    ) -> Option<String> {
+        let nanos = |value: Duration| u64::try_from(value.as_nanos()).unwrap_or(u64::MAX);
+        let batch_ns = nanos(batch);
+        self.windows.fetch_add(windows, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.submit_ns.fetch_add(nanos(submit), Ordering::Relaxed);
+        self.first_ns.fetch_add(nanos(first), Ordering::Relaxed);
+        self.batch_ns.fetch_add(batch_ns, Ordering::Relaxed);
+        self.max_batch_ns.fetch_max(batch_ns, Ordering::Relaxed);
+        let batches = self.batches.fetch_add(1, Ordering::Relaxed) + 1;
+        if batches % READ_TELEMETRY_INTERVAL_BATCHES != 0 {
+            return None;
+        }
+        let micros = |counter: &AtomicU64| counter.load(Ordering::Relaxed) / 1_000;
+        let max_batch_us = self.max_batch_ns.swap(0, Ordering::Relaxed) / 1_000;
+        Some(format!(
+            "storaged: dvm read stream batches={batches} windows={} bytes={} hits={} submit_us={} first_us={} batch_us={} max_batch_us={max_batch_us}",
+            self.windows.load(Ordering::Relaxed),
+            self.bytes.load(Ordering::Relaxed),
+            self.hits.load(Ordering::Relaxed),
+            micros(&self.submit_ns),
+            micros(&self.first_ns),
+            micros(&self.batch_ns),
+        ))
+    }
+}
 
 fn require_unquarantined(quarantined: &AtomicBool) -> Result<(), i32> {
     // ORDERING: Acquire pairs with Release in `quarantine_provider`.
@@ -514,6 +589,7 @@ fn read_into_inner(
         match read_cache_lookup_into(info, lba, block_count, out)? {
             CoverageInto::Hit(len) => {
                 require_unquarantined(&PROVIDER_QUARANTINED)?;
+                READ_TELEMETRY.record_hit();
                 return Ok(len);
             }
             CoverageInto::Partial {
@@ -535,6 +611,7 @@ fn read_into_inner(
     let windows = read_ahead_plan(info, start, missing_blocks, window_limit)?;
     let mut in_flight = Vec::with_capacity(windows.len());
     let mut submitted_bytes = 0_usize;
+    let batch_started = Instant::now();
     for window in windows {
         match submit(
             expected_generation,
@@ -564,11 +641,16 @@ fn read_into_inner(
             }
         }
     }
+    let submitted_at = Instant::now();
+    let mut first_completion = Duration::ZERO;
     for index in 0..in_flight.len() {
         let completion = {
             let (_, ticket, prefetched) = &mut in_flight[index];
             wait_and_collect(*ticket, Some(prefetched.as_mut_slice()))
         };
+        if index == 0 {
+            first_completion = submitted_at.elapsed();
+        }
         if let Err(errno) = completion {
             let (window, ticket, _) = &in_flight[index];
             for (_, pending, _) in &in_flight[index + 1..] {
@@ -581,6 +663,15 @@ fn read_into_inner(
             );
             return Err(errno);
         }
+    }
+    if let Some(line) = READ_TELEMETRY.record_batch(
+        in_flight.len() as u64,
+        in_flight.iter().map(|(window, _, _)| window.byte_len as u64).sum(),
+        submitted_at.saturating_duration_since(batch_started),
+        first_completion,
+        batch_started.elapsed(),
+    ) {
+        eprintln!("{line}");
     }
     let mut written = prefix_len;
     for (_, _, bytes) in &in_flight {
@@ -1116,6 +1207,35 @@ mod tests {
             bounded_wait_timeout_ms(Duration::from_millis(WAIT_SLICE_MILLIS + 1)),
             Some(WAIT_SLICE_MILLIS)
         );
+    }
+
+    #[test]
+    fn read_telemetry_reports_one_bounded_summary_per_interval() {
+        let telemetry = ReadTelemetry::new();
+        telemetry.record_hit();
+        let ms = Duration::from_millis;
+        for batch in 1..READ_TELEMETRY_INTERVAL_BATCHES {
+            assert!(
+                telemetry.record_batch(16, 1 << 20, ms(1), ms(11), ms(170)).is_none(),
+                "batch {batch} must not log"
+            );
+        }
+        let line = telemetry
+            .record_batch(16, 1 << 20, ms(1), ms(11), ms(171))
+            .expect("interval boundary logs");
+        assert!(line.contains(&format!("batches={READ_TELEMETRY_INTERVAL_BATCHES} ")));
+        assert!(line.contains(&format!("windows={} ", 16 * READ_TELEMETRY_INTERVAL_BATCHES)));
+        assert!(line.contains(&format!("bytes={} ", READ_TELEMETRY_INTERVAL_BATCHES << 20)));
+        assert!(line.contains("hits=1 "));
+        assert!(line.contains("max_batch_us=171000"));
+        // The per-interval maximum restarts; totals keep accumulating.
+        for _ in 1..READ_TELEMETRY_INTERVAL_BATCHES {
+            assert!(telemetry.record_batch(1, 4096, ms(0), ms(1), ms(2)).is_none());
+        }
+        let next = telemetry
+            .record_batch(1, 4096, ms(0), ms(1), ms(2))
+            .expect("second interval logs");
+        assert!(next.contains("max_batch_us=2000"));
     }
 
     #[test]

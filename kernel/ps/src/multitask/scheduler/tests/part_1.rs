@@ -243,6 +243,11 @@ fn rejected_thread_attachment_releases_unpublished_stack() {
 }
 
 #[test]
+fn thread_reservation_refusals_carry_distinct_causes() {
+    super::thread_creation::tests::refusal_causes_are_distinct();
+}
+
+#[test]
 fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
     super::dispatcher::fifo_witnesses::synchronous_fifo();
     super::ordering_publication::tests::actual_original_ordering_preserves_spawn_fifo_and_current_floor_without_funding_transfer();

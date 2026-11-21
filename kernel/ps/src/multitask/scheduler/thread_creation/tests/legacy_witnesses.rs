@@ -60,7 +60,49 @@ pub(in crate::multitask::scheduler) fn rejected_attachment() {
         let before = process_table::thread_count_by_pid(ID).unwrap();
         let allocated: [bool; MAX_TASK] = core::array::from_fn(stack_resources::allocated);
         process_table::mark_process_exiting(ID).unwrap();
-        assert!(reserve_with(ID + 8, &creator).is_none());
+        assert_eq!(
+            reserve_with(ID + 8, &creator).err(),
+            Some(SpawnTaskError::ProcessExiting),
+            "an exiting process refuses the thread with its own reason"
+        );
+        for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
+            assert_eq!(stack_resources::allocated(slot), allocated[slot]);
+            assert!(!stack_resources::admission::is_reserved(slot));
+        }
+        assert_eq!(process_table::thread_count_by_pid(ID), Some(before));
+    });
+}
+
+/// Each refusal of a thread reservation carries its own typed cause, so a
+/// failed `clone` can name the limit it hit instead of reporting a full task
+/// table. The exiting-process cause is witnessed by `rejected_attachment`.
+pub(in crate::multitask::scheduler) fn refusal_causes_are_distinct() {
+    affinity_fixture(UserAbi::Linux, UserAbi::Linux, false, |handle| {
+        let creator = capture_creator(ROOT).unwrap();
+        let before = process_table::thread_count_by_pid(ID).unwrap();
+        let allocated: [bool; MAX_TASK] = core::array::from_fn(stack_resources::allocated);
+
+        let exec = process_table::begin_exec(handle).expect("exec reservation");
+        assert_eq!(
+            reserve_with(ID + 8, &creator).err(),
+            Some(SpawnTaskError::ProcessExecInProgress)
+        );
+        assert!(process_table::cancel_exec(exec));
+
+        let mut attached = 0;
+        while process_table::thread_count_by_pid(ID).unwrap() < crate::multitask::task_capacity::CAPACITY.process_thread_ceiling() {
+            process_table::attach_task(handle).expect("thread within the per-process ceiling");
+            attached += 1;
+        }
+        assert_eq!(
+            reserve_with(ID + 8, &creator).err(),
+            Some(SpawnTaskError::ProcessThreadLimit)
+        );
+        for _ in 0..attached {
+            process_table::detach_task(handle).expect("release filler thread");
+        }
+
+        // Refusals cancel the reserved slot and storage; none leaks.
         for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
             assert_eq!(stack_resources::allocated(slot), allocated[slot]);
             assert!(!stack_resources::admission::is_reserved(slot));

@@ -67,7 +67,7 @@ or launch policy.
 - Chrome uses `startup = "none"`, no autostart overlay, and a visible desktop
   entry pointing at the real ELF. It is installed/discoverable, not automatically
   started. Browser/syscall/sandbox/Wayland compatibility is not certified, and
-  the importer adds no sandbox bypass or host installation. Local external
+  the importer adds no host installation (the manifest template carries the interim `--no-sandbox`, see `apps/chrome/README.md`). Local external
   payloads are not checked-in formal source evidence.
 
 ### Driver-domain policy
@@ -107,7 +107,7 @@ or launch policy.
 - `system/registry/system/runtime-launch-programs.tsv`
 - `system/registry/system/startup-programs.tsv`
 - `system/registry/system/linux-runtime-access.tsv` — `kind=dir|file`, `path=/absolute/path`. Kernel VFS consumes this instead of hardcoded default runtime path allowlists.
-- `system/registry/system/runtime-env.tsv` — `scope=init|runtime`, `key=NAME`, `value=VALUE`. `initd` and `runtimed` consume this instead of hardcoded default `PATH`, `HOME`, `XDG_*`, display env values.
+- `system/registry/system/runtime-env.tsv` — `scope=init|runtime`, `key=NAME`, `value=VALUE`. `initd` and `runtimed` consume this instead of hardcoded default `PATH`, `HOME`, `XDG_*`, display env values. `runtime` values are templates (`{profile_root}`, `{runtime_dir}`, `{temp_dir}`, `{wayland_display}`) that runtimed resolves per launch; `init` values are literal; unknown placeholders are hard errors (see `abi/prebuilt-runtime.md`).
 - `system/registry/compat/windows-system-dlls.txt`
 
 ## Fuzzing

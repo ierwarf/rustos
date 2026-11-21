@@ -657,12 +657,7 @@ fn verify_dvm_block_ready_generation(layout: &KvmLayout, expected_generation: u6
         let disk_bytes = fs::metadata(disk)
             .with_context(|| format!("inspect live storage-DVM disk {}", disk.display()))?
             .len();
-        if disk_bytes == 0
-            || !disk_bytes.is_multiple_of(512)
-            || header.capacity_sectors != disk_bytes / 512
-            || header.logical_block_size != 512
-            || header.physical_block_size != 512
-        {
+        if !dvm_storage_header_geometry_matches(&header, disk_bytes) {
             bail!("live writable DVM block geometry diverged from the private backing disk");
         }
         return Ok(());
@@ -678,12 +673,7 @@ fn verify_dvm_block_ready_generation(layout: &KvmLayout, expected_generation: u6
     let disk_bytes = fs::metadata(disk)
         .with_context(|| format!("inspect live storage-DVM disk {}", disk.display()))?
         .len();
-    if disk_bytes == 0
-        || !disk_bytes.is_multiple_of(u64::from(DVM_BLOCK_MEDIA_BLOCK_BYTES))
-        || header.capacity_sectors != disk_bytes / 512
-        || header.logical_block_size != DVM_BLOCK_MEDIA_BLOCK_BYTES
-        || header.physical_block_size != DVM_BLOCK_MEDIA_BLOCK_BYTES
-    {
+    if !dvm_storage_header_geometry_matches(&header, disk_bytes) {
         bail!("live DVM block geometry diverged from the private backing disk");
     }
     Ok(())

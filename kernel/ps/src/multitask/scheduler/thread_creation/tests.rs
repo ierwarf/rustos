@@ -9,6 +9,7 @@ use super::*;
 use crate::multitask::scheduler::process_affinity::tests::affinity_fixture;
 pub(in crate::multitask::scheduler) mod legacy_witnesses;
 pub(in crate::multitask::scheduler) use legacy_witnesses::rejected_attachment;
+pub(in crate::multitask::scheduler) use legacy_witnesses::refusal_causes_are_distinct;
 const ROOT: usize = 124;
 const ID: u64 = 1245501;
 /// Actual same-process sibling birth plus actual activation for terminal tests.
@@ -199,12 +200,18 @@ pub(in crate::multitask::scheduler) fn final_retired_creator_or_wrong_abi_refusa
         let before = process_table::thread_count_by_pid(ID).unwrap();
         let r = reserve_actual();
         let slot = r.ticket().slot();
-        assert!(commit(r, bootstrap(UserAbi::Windows), 0x23, 0x1b, 0x202).is_none());
+        assert_eq!(
+            commit(r, bootstrap(UserAbi::Windows), 0x23, 0x1b, 0x202),
+            Err(SpawnTaskError::ThreadPublicationRefused)
+        );
         assert!(!stack_resources::allocated(slot));
         assert_eq!(process_table::thread_count_by_pid(ID), Some(before));
         let r = reserve_actual();
         identity::update_live_lifecycle(ROOT, ID, identity::LifecycleGate::Retired, true);
-        assert!(commit(r, bootstrap(UserAbi::Linux), 0x23, 0x1b, 0x202).is_none());
+        assert_eq!(
+            commit(r, bootstrap(UserAbi::Linux), 0x23, 0x1b, 0x202),
+            Err(SpawnTaskError::ThreadPublicationRefused)
+        );
         assert!(!stack_resources::allocated(slot));
         assert_eq!(process_table::thread_count_by_pid(ID), Some(before));
         assert!(!identity::cohort::busy(ROOT));

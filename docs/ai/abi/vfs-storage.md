@@ -314,13 +314,16 @@ the read-only accelerator; TmpFs has it (next section).
 
 - **TmpFs mounts.** vfsd mounts `TmpFs` (`FsVolume` with `posix_nodes()`) at
   `/tmp` (64 MiB), `/dev/shm` (64 MiB) and `/run` (16 MiB) before the boot disk;
-  `/run/user/1000` is pre-created 0700 uid 1000, `/tmp` and `/dev/shm` are 1777.
+  `/run/user/<desktop uid>` (`RuntimeDir(DESKTOP_SESSION_UID)`, 1000 today) is pre-created 0700 for that uid, `/tmp` and `/dev/shm` are 1777; runtimed ensures other launch uids' `/run/user/<uid>` and the profile directories (see `prebuilt-runtime.md` launch environment).
   `run_dirs.rs` and `mkdir_policy` are gone. Nodes are dir/file/symlink/socket
   with per-mount unique node ids, mode/uid/gid/times/nlink, 4 KiB sparse chunks,
   a byte quota (ENOSPC) and an inode limit. An open description pins its node
   (`retain_node`/`release_node`), so data survives unlink or rename-over until
   the last close. TmpFs paths bypass every path-keyed cache and are never
-  admitted as executable snapshots. Symlinks are followed by
+  admitted as executable snapshots. TmpFs `mkdir` requires parent search
+  permission and reports `EEXIST` for an existing target before checking
+  parent write permission. An absent target still requires write permission.
+  Symlinks are followed by
   `MountTable::follow_symlinks` (40 hops, then ELOOP); `O_NOFOLLOW` gives ELOOP
   and a socket inode gives ENXIO on open. `/proc/mounts` is generated from the
   live `MountTable` (vfat rows `ro`/`rw`, tmpfs rows `rw,nosuid,nodev`).
@@ -625,6 +628,47 @@ the read-only accelerator; TmpFs has it (next section).
   `nvme-core` are signed modules, never built-in controller authority; the
   `S12` storage bootstrap loads only the exact assigned PCI modalias closure.
   Missing class-driver, signature, or namespace publication fails closed.
+- **Admitted storage controller classes.** The relay and `S12` admit exactly
+  one controller from a closed class set, identified from the guest kernel's
+  own PCI/virtio identity and never from the harness that created it:
+  `ahci` (PCI class `0x0106`, bound to `ahci`), `nvme` (class `0x0108`, bound
+  to `nvme`), and `virtio_blk` (vendor `1af4`, PCI class `0x0100`, bound to
+  `virtio-pci`, with exactly one `virtioN` child of virtio device type 2 bound
+  to `virtio_blk`). Any other combination (another virtio device type, a
+  foreign driver, two virtio children, legacy IDE) does not classify, and a
+  second admitted controller is `EEXIST`. The evidence `DRIVER` token is the
+  admitted class's Linux driver name; the physical-assignment policy (schema 4)
+  still names only `nvme` or `ahci`, so `virtio_blk` evidence parses but can
+  never satisfy a physical VFIO assignment. `virtio-pci` and `virtio_blk` are
+  built in (no module closure); optical/ATAPI media is not an admitted
+  namespace (`CONFIG_BLK_DEV_SR` is forbidden), so a CD drive on an assigned
+  controller can never appear as a second namespace.
+- **Block-size source of truth.** The relay reads logical and physical block
+  sizes from the kernel (`BLKSSZGET`/`BLKPBSZGET`), capacity from
+  `BLKGETSIZE64`, and read-only state from `BLKROGET`, and refuses a device that
+  disagrees with the L0-signed header on any of them (logging both sides). The
+  relay publishes the device-reported geometry in its evidence, and the kernel,
+  storaged and vfsd use the header/info values, never a constant: any logical
+  size in `{512, 1024, 2048, 4096}` is admitted and capacity stays in 512-byte
+  protocol sectors. Only the KVM harness (L0) *declares* a geometry, because
+  the header is signed before the guest boots: `DVM_STORAGE_LOGICAL_BLOCK_BYTES`
+  and `DVM_STORAGE_PHYSICAL_BLOCK_BYTES` (512/512, matching the staged FAT
+  images) feed both the virtio-blk device properties and the signed header.
+- **Read-only enforcement is end to end.** QEMU opens the harness boot volume
+  `readonly=on` and virtio-blk advertises `VIRTIO_BLK_F_RO`; Linux marks the
+  disk read-only (`BLKROGET`); the signed header carries `READ_ONLY`; the relay
+  rejects a device/header disagreement in either direction, opens a read-only
+  transport's device `O_RDONLY` only (it never holds a writable descriptor),
+  and refuses WRITE/DISCARD/WRITE_ZEROES while admitting only reads and the
+  FLUSH media barrier; vfsd's `BootBlockDevice` rejects writes on RO media.
+- **KVM harness frontend.** Both the read-only boot volume and
+  `--writable-storage` attach one `virtio-blk-pci` (queued, unlike the former
+  emulated ATAPI frontend that executed one command at a time) on a q35 DVM
+  machine with `sata=off`, so the explicit disk is the DVM's only storage
+  controller. The relay's `BLKRASET` window and read-ahead prefetch predate
+  this frontend and have not been re-measured on it; treat them as advisory
+  until a run compares `rustos-dvm-block: read-stats` against a run with them
+  disabled.
 - Completion authority binds the exact generation, request ID, operation ID,
   and slot. Successful reads report no durability. Successful FUA writes and
   FLUSH report the exact durable-through operation ID; ordinary writeback
@@ -725,8 +769,9 @@ the read-only accelerator; TmpFs has it (next section).
 - The Linux-DVM block relay starts immediately after the guest's module
   admission turn (`S12` after Buildroot `S11modules`), before unrelated guest
   network, display, and control-agent scripts. It still discovers exactly one
-  assigned AHCI/NVMe controller and admits the complete AHCI `sd_mod` closure
-  before opening the relay. The DVM build rejects a stale late-start script,
+  assigned AHCI/NVMe/virtio-blk controller (the admitted class set above) and
+  admits the complete AHCI `sd_mod` closure when that class is AHCI before
+  opening the relay. The DVM build rejects a stale late-start script,
   so a rootfs overlay change cannot silently re-serialize storage behind DHCP
   or GPU startup.
 - A DVM image carrying GPU vendor modules, GPU firmware, Mesa/LLVM, and a
@@ -805,10 +850,30 @@ the read-only accelerator; TmpFs has it (next section).
   submission. Transport-info failure also clears them. Cached bytes therefore
   cannot survive revoke, restart, or mutation, and the optimization adds no
   controller authority or hidden fallback to vfsd.
+- The storage-DVM relay (`rustos-dvm-block.c`) executes ring requests strictly
+  one at a time, so a sequential stream is bounded by the guest block layer's
+  per-command latency unless the page cache can overlap commands (measured:
+  ~10.7 ms per 64-KiB window, ~6 MB/s, for a 306 MB Chrome snapshot; a lone
+  cold window costs ~12.8 ms). The relay therefore (1) raises the whole-disk
+  kernel readahead window to 2 MiB with `BLKRASET` and (2) before executing a
+  read, offers every read already published in the request ring to the kernel
+  with `readahead(2)`, merging adjacent requests into one range. Both are
+  advisory page-cache hints issued after the watchdog `begin` event: the `pread`
+  that follows still produces the bytes in ring order, the scan stops at the
+  first record that is not a well-formed read of the current generation, and
+  request admission, ordering, durability, FUA/flush and completion publication
+  are unchanged. Failure of either hint is reported once and ignored.
+- Sequential-read diagnostics (bounded, aggregate): the relay logs
+  `rustos-dvm-block: read-stats` every 256 reads (`pread_us`, `pread_max_us`,
+  `readahead_*`); storaged logs `storaged: dvm read stream` every 32 DVM
+  batches (`submit_us`, `first_us` = demanded-window latency, `batch_us`,
+  `hits`); vfsd's `snapshot transfer` line carries `storaged_calls`,
+  `storaged_us`, `storaged_max_us`. Together they split a slow snapshot into
+  DVM device time, broker/IPC time and vfsd time without per-request output.
 - TmpFs mounts `/tmp`, `/dev/shm` and `/run` use `CasePolicy::Exact` and
   independent allocation-byte quotas, sparse holes, inode-pinned descriptions,
   symlinks/socket nodes, rename modes, metadata updates and orphan reclamation.
-  `/run/user/1000` is created with mode 0700 and uid/gid 1000; `/tmp` and
+  the desktop session's `/run/user/<uid>` is created with mode 0700 and that uid/gid; `/tmp` and
   `/dev/shm` are 01777. Traversal/open/mutation checks use attested credentials,
   including sticky-directory ownership and chmod ownership. Policy remains in
   vfsd. Supplementary-group/capability delegation is not fabricated by the

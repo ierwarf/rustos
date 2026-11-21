@@ -32,7 +32,7 @@ and owners must not be confused with that historical design input:
 | Resource | Current shape | Source |
 | --- | --- | --- |
 | Process slots | Default admission 32; chunked storage up to 4,096 slots (internal ceiling), with a runtime/root-job policy limit | [process_table.rs](../../kernel/ps/src/multitask/process_table.rs), [slot_dir.rs](../../kernel/ps/src/multitask/slot_dir.rs) |
-| Threads | Job-level counted limit; per-process structural ceiling 128 (`MAX_THREADS_PER_PROCESS`), global task table 256 (`MAX_TASK`) | [process_table.rs](../../kernel/ps/src/multitask/process_table.rs) |
+| Threads | Job-level counted limit granted by loaderd from observed capacity ([request and grant](#application-job-request-and-grant)); per-process structural ceiling and the root-Job process default are derived from the task table by the `task_capacity` authority (ceiling `total/2`, root processes `total/4`, kernel headroom `total/4`; 128 / 64 / 64 of 256 slots today) and observable through `SYS_RUSTOS_TASK_CAPACITY` | [task_capacity.rs](../../kernel/ps/src/multitask/task_capacity.rs), [process_table.rs](../../kernel/ps/src/multitask/process_table.rs) |
 | Jobs | Generation-bound tree, 64 internal slots | [jobs.rs](../../kernel/ps/src/multitask/process_table/jobs.rs) |
 | Resident user memory | Per-job hierarchical page charging and admission | [Phase 2b-ii](#phase-2b-ii-memory-limit-as-built) |
 | Service identity | Static numeric IDs and legacy capability bits remain | [Ring3 process model](ring3-process-model.md) |
@@ -442,7 +442,7 @@ full, grows the same way (128-entry chunks).
 Decisions and limits, so they are not read as the final form:
 
 - **The limit is a runtime variable, not yet job policy.** `process_limit()`
-  defaults to 64 (`DEFAULT_PROCESS_LIMIT`; it was 32 until a multi-process browser needed more than the dozen slots left beside ~20 services), `set_process_limit` clamps to the
+  defaults to 64 (the `task_capacity` authority's `root_process_ceiling`; it was 32 until a multi-process browser needed more than the dozen slots left beside ~20 services), `set_process_limit` clamps to the
   directory ceiling of 4096 slots, and lowering it never evicts a live process.
   Nothing sets it yet: wiring it to the root job's `processes.max` needs
   `SET_LIMITS`, which is phase 2b. Boot behaviour is therefore unchanged.
@@ -1035,9 +1035,10 @@ at once, so the overshoot is transient and bounded by one stack per CPU that is
 reserving concurrently; splitting a shared mapping by unmap
 is charged without a limit check because unmap must not fail; pager VMA
 publication slots are not billed to a Job as a per-VMA allocation: each process
-slot owns a `ProcessVmaTable([PublishedPagerVma; 256])` (cap
-`PAGER_MAX_VMAS_PER_PROCESS`), built in 32-slot chunks when the process table
-grows (`grow_slots`) and never freed, so its total is bounded by the process
+slot owns a `ProcessVmaTable` directory (cap `PAGER_MAX_VMAS_PER_PROCESS` =
+4096), built in 32-slot `ProcessVmaTable` entries when the process table grows
+and growing its per-process VMA slot chunks lazily in 32-slot chunks on demand
+(never freed, bounded by policy ceiling and directory ceiling); the leaf page
 table size, which the Job process-object quota in turn bounds; the leaf page
 tables behind those mappings are billed as `Class::PageTable`. A boot-time
 smoke (`kmem page-table limit smoke passed`) drives the real allocator into the
@@ -1045,3 +1046,86 @@ page-table limit on every boot. Full cgroup-style `kmem.max_bytes` aggregation
 across classes is still per-class, not one shared total. The signed service upgrade
 and recovery state are likewise only partially wired. See
 [8-stage source ledger](../validation/ring3-8stage-status.md).
+
+### Application Job request and grant
+
+Application Job limits are **granted at launch from observed capacity**, never
+read from a constant that guesses the machine. Ownership:
+
+| Stage | Owner | What it knows |
+| --- | --- | --- |
+| Request | package manifest (`request_processes`, `request_threads`, `request_memory_pages_per_process` on a `[[desktop.entries]]`), carried by the launch registry (`request_*` fields) or `X-RustOS-Request*` desktop keys, `runtimed`, then `LoaderSpawnRequest::application_request` (loader request ABI v5) | the application's own need; **no machine capacity** |
+| Grant | `loaderd` (`services/loaderd/src/application_grant.rs`, `application_jobs.rs`) | `SYS_RUSTOS_TASK_CAPACITY`, physical memory (`sysinfo`), the grants of the Jobs it still holds |
+| Enforcement | kernel Job limits and `kmem` classes installed by loaderd | whatever Ring3 installed |
+
+Build-time validation (`tools/xtask/src/package_manifest.rs`) checks syntax only:
+a declared value is a non-zero integer. An absent dimension means "derived
+default"; `0` is the registry/wire encoding of absent and is rejected in a
+manifest or desktop file.
+
+**Semantics: exact.** A requested dimension is granted exactly or the launch is
+refused. It is not a minimum that is silently raised (that would take budget
+from other applications for nothing), and it is never clamped down. The kernel
+itself clamps a child limit to its ancestors' (`effective`); loaderd reads the
+`effective` limits back after `SET_LIMITS` and refuses the launch
+(`ancestor-job-limit`) if the hierarchy narrowed the grant.
+
+Observed inputs (`T` = `total_slots`, `B` = `application_thread_budget`,
+`C` = `process_thread_ceiling`, `R` = `root_process_ceiling`, `K` =
+`kernel_stack_bytes`, `S` = `reservable_slots`, `M` = physical pages):
+
+- process budget `P = R * B / T`: applications own the same fraction of the root
+  Job's process slots as of task slots; boot services own the rest.
+- derived defaults for an absent dimension: threads `max(1, B / 4)` (raised to
+  one thread per requested process), processes `max(1, P / 4)` (never more than
+  the granted threads), pages per process `max(1, M / 2)`. The divisors are the
+  named ratios `DEFAULT_THREAD_SHARE_DIVISOR`, `DEFAULT_PROCESS_SHARE_DIVISOR`,
+  `DEFAULT_PROCESS_MEMORY_DIVISOR`. At `T = 256`, 4 GiB: 12 processes, 48
+  threads, 2 GiB per process.
+- structural refusals (`EINVAL`, the request can never fit this kernel):
+  processes above `R` (`root-process-ceiling`) or `P`
+  (`application-process-budget`); threads above `B`
+  (`application-thread-budget`); more processes than threads
+  (`processes-exceed-threads`); threads above `processes * C`
+  (`process-thread-ceiling`); pages per process above `M`
+  (`physical-memory-pages`); a Job page total that overflows 64 bits
+  (`job-memory-pages-overflow`, `EOVERFLOW`).
+- transient refusals (`EAGAIN`, other applications hold the budget): threads
+  above `B - committed_threads` (`application-thread-budget`), above
+  `S - unused_threads` (`reservable-task-slots`), or processes above
+  `P - committed_processes` (`application-process-budget`).
+- every refusal creates no Job and logs
+  `loaderd: application job refused limit=<name> requested=<n> available=<n>
+  errno=<e>` with the request. runtimed's `is_permanent_launch_failure`
+  includes `EINVAL` and not `EAGAIN`.
+
+**Sum-of-grants invariant.** Each thread a Job may run occupies one scheduler
+slot, so the threads granted to all live application Jobs never exceed `B`:
+`ApplicationJobs` keeps `granted_processes` / `granted_threads` on every child
+Job it still holds and admits a new grant only if
+`committed + requested <= budget`. A Job counts until `collect` has proven it
+empty (kernel `kill` reports `remaining == 0`) and closed its descriptor, so a
+Job that is being retired is still counted; a Job that is unreadable counts in
+full; a Job the kernel reports gone (`ESRCH`) counts as zero. `unused_threads`
+is `granted - usage_threads` per Job (kernel-reported), the slots that are free
+now but already promised, so `reservable_slots` is judged net of them.
+Memory is deliberately not summed: page limits are ceilings over one shared
+physical pool enforced by the kernel frame ledger (over-commit is intended), so
+they are checked against physical memory only. A restart of loaderd forgets its
+children; the capacity observation (`S`) then still bounds new grants by the
+slots actually free.
+
+**Byte budgets** (`budget_plan`) are documented unit costs times the granted
+counts, so a budget cannot disagree with its grant: `Thread` = threads x the
+observed `kernel_stack_bytes`; `HandleTable` 256 KiB, `IpcEndpoint` 128 KiB,
+`Vma` 128 KiB, `IpcMessage` 512 KiB per granted process; `PageTable` = dense
+table frames (`min(job pages, M) / 512` x 4 KiB) times a sparsity factor of 8;
+`DeviceBuffer` = two `APP_BUFFER_CLIENT_QUOTA_BYTES`, a device aperture that is
+not per process; sessions = 4 per process; `memory.high` = 4/5 of the Job page
+limit. These unit costs are Ring3 policy (kernel accounting semantics are the
+table above); the kernel does not define a per-process maximum for these
+classes.
+
+Not measured: the true thread/process need of a browser; the Chrome package
+requests 24 processes and 144 threads as reasoned headroom (see
+`apps/chrome/RUSTOS.package.toml.example`) until a KVM run reports the peak.

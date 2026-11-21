@@ -25,6 +25,15 @@ fn runtime_in(scope: &DispatchPreemption<'_>) -> Option<crate::multitask::Schedu
     result
 }
 
+/// CPU time the calling thread has consumed, including the interval it is in.
+pub(in crate::multitask) fn thread_cpu_time_ns() -> Option<u64> {
+    scope(|scope| {
+        let current = OriginalCurrent::borrow(scope)?;
+        let (slot, _) = current.member();
+        Some(runqueue::consumed_cpu_time(slot, crate::arch::clock::scheduler_local_nanos()))
+    })
+}
+
 pub(in crate::multitask) fn set_tls(value: u64) {
     scope(|scope| { let _ = set_tls_in(scope, value); });
 }

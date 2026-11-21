@@ -81,7 +81,10 @@ fn descriptor_and_syscall_pins_delay_real_reap_and_notify_without_table_release(
     assert!(super::super::own_process_ref(handle, 0xa552).is_none());
     super::super::detach_task(handle).unwrap();
     assert_eq!(super::super::reap_exited_processes(), 0);
-    assert!(super::super::attach_task(handle).is_none());
+    assert_eq!(
+        super::super::attach_task(handle),
+        Err(crate::multitask::SpawnTaskError::ProcessExiting)
+    );
     assert!(super::super::own_process_ref(handle, 0xa551).is_none());
     drop(descriptor);
     assert_eq!(syscall.with_state(|pid, _| pid), 0xa551);

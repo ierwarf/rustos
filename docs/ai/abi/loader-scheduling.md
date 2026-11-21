@@ -16,8 +16,8 @@ kernel-stamped sender, the live rootd owner and exactly one transferred typed
 Job descriptor. Rootd retains the realm outside all service subtrees and lends
 only inspect/create-child/create-process/set-limits/kill/duplicate/transfer.
 Loaderd retains an exact-right duplicate; retries of the same realm are
-idempotent and a different live realm is refused. Spawn ABI v4 and process
-prepare v5 wire layouts are unchanged; an older loader refuses the new envelope
+idempotent and a different live realm is refused. The realm envelope changes neither the spawn request (see ABI v5 below) nor the process
+prepare v5 wire layout; an older loader refuses the new envelope
 rather than silently inheriting a service job.
 
 `services/rootd/src/loader_realm.rs` records realm custody before transfer,
@@ -69,6 +69,13 @@ production relaxed-atomic ordering. Normal-image restoration/smoke is pending.
   ELF/PE image admission; the broker owns only the bounded prepare-handle
   mechanism. The retired procd process-prepare query was a no-op format echo
   and could deadlock as `procd -> loaderd -> procd` when exec raced spawn.
+- Loader request ABI v5 adds `application_request` (`ApplicationRequest`: processes,
+  threads, pages per process; 24 bytes after `requester_pid`, all zero = derived
+  defaults). Only an application `SPAWN_EXEC` may carry a non-zero request;
+  service spawns and `EXEC_TARGET` with one are `EINVAL`. loaderd grants it
+  exactly against `SYS_RUSTOS_TASK_CAPACITY` or refuses (`EINVAL` structural,
+  `EAGAIN` transient, naming the limit in its debug line); see
+  [Application Job request and grant](../../architecture/job-model.md#application-job-request-and-grant).
 - Loader request ABI v4 requires `requester_pid` to equal the kernel-stamped
   IPC sender. Process broker ABI v3 carries that identity into deferred
   commit: ring0 binds the suspended target PID to the exact requester in a

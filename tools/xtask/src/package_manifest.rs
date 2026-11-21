@@ -3,6 +3,7 @@ use fs_err as fs;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
+use rustos_user_abi::application_request::{ApplicationRequest, ApplicationRequestError};
 use serde::Deserialize;
 use walkdir::{DirEntry, WalkDir};
 
@@ -134,6 +135,30 @@ pub(crate) struct DesktopEntrySpec {
     pub(crate) args: Vec<String>,
     #[serde(default)]
     pub(crate) env: Vec<String>,
+    /// What the application says its Job needs (see
+    /// `rustos_user_abi::application_request`). Each is optional; an absent
+    /// dimension takes the loader's default derived from the capacity observed at
+    /// launch. A request is granted exactly or the launch is refused. The build
+    /// only checks syntax (non-zero): it cannot know the machine's capacity.
+    #[serde(default)]
+    pub(crate) request_processes: Option<u64>,
+    #[serde(default)]
+    pub(crate) request_threads: Option<u64>,
+    #[serde(default)]
+    pub(crate) request_memory_pages_per_process: Option<u64>,
+}
+
+impl DesktopEntrySpec {
+    /// The entry's Job request in its wire form (absent dimension = `0`).
+    pub(crate) fn application_request(
+        &self,
+    ) -> std::result::Result<ApplicationRequest, ApplicationRequestError> {
+        ApplicationRequest::new(
+            self.request_processes,
+            self.request_threads,
+            self.request_memory_pages_per_process,
+        )
+    }
 }
 
 fn default_console_hosted() -> bool {
@@ -430,6 +455,15 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
 
         validate_manifest_location(manifest)?;
         validate_install_taxonomy(manifest)?;
+        for entry in &manifest.desktop.entries {
+            entry.application_request().map_err(|error| {
+                anyhow!(
+                    "package {} desktop entry {:?}: {error}",
+                    manifest.id,
+                    entry.display_name
+                )
+            })?;
+        }
 
         if matches!(
             manifest.startup,
@@ -750,6 +784,61 @@ mod tests {
             ),
         ] {
             assert!(validate_at(&invalid, "apps/chrome/RUSTOS.package.toml").is_err());
+        }
+    }
+
+    const REQUESTING_MANIFEST: &str = "id = \"example\"\nkind = \"app\"\nexecution_domain = \"user\"\nstartup = \"session\"\n[build]\nbuilder = \"cargo-kernel-binary\"\npackage = \"example\"\n[install]\npath = \"apps/example/example.elf\"\n[[desktop.entries]]\ndisplay_name = \"example\"\nweight_micros = 100\nno_display = true\n";
+
+    #[test]
+    fn a_job_request_is_optional_per_dimension_and_parsed_as_written() {
+        let none: PackageManifest = toml::from_str(REQUESTING_MANIFEST).unwrap();
+        assert_eq!(
+            none.desktop.entries[0].application_request(),
+            Ok(ApplicationRequest::NONE)
+        );
+        let text = format!("{REQUESTING_MANIFEST}request_threads = 96\nrequest_processes = 12\n");
+        let manifest: PackageManifest = toml::from_str(&text).unwrap();
+        assert_eq!(
+            manifest.desktop.entries[0].application_request(),
+            Ok(ApplicationRequest {
+                processes: 12,
+                threads: 96,
+                memory_pages_per_process: 0
+            })
+        );
+        validate_at(&text, "apps/example/RUSTOS.package.toml").unwrap();
+    }
+
+    #[test]
+    fn a_zero_request_is_a_stage_time_error_naming_the_key() {
+        for (key, line) in [
+            ("request_processes", "request_processes = 0\n"),
+            ("request_threads", "request_threads = 0\n"),
+            (
+                "request_memory_pages_per_process",
+                "request_memory_pages_per_process = 0\n",
+            ),
+        ] {
+            let text = format!("{REQUESTING_MANIFEST}{line}");
+            let err = validate_at(&text, "apps/example/RUSTOS.package.toml").unwrap_err();
+            assert!(err.contains(key) && err.contains("non-zero"), "{err}");
+        }
+    }
+
+    #[test]
+    fn stage_time_validation_embeds_no_machine_capacity() {
+        // A request far above any plausible task table is still syntactically
+        // valid here; only loaderd, which observes the running kernel, can
+        // refuse it.
+        let text = format!("{REQUESTING_MANIFEST}request_threads = 1000000\n");
+        validate_at(&text, "apps/example/RUSTOS.package.toml").unwrap();
+    }
+
+    #[test]
+    fn a_negative_or_non_numeric_request_is_rejected_by_the_parser() {
+        for line in ["request_threads = -1\n", "request_threads = \"many\"\n"] {
+            let text = format!("{REQUESTING_MANIFEST}{line}");
+            assert!(validate_at(&text, "apps/example/RUSTOS.package.toml").is_err(), "{line}");
         }
     }
 

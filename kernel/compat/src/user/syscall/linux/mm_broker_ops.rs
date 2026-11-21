@@ -998,14 +998,16 @@ fn broker_protect(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64> {
         }
     }
 
+    let vma_ceiling = crate::pager_policy::anonymous_policy().process_vma_ceiling as usize;
     match retry_transient_range_edit("mprotect", || {
-        multitask::protect_pager_vma_for_process(
+        multitask::protect_pager_vma_for_process_with_ceiling(
             t.pid,
             Some(t.expected()),
             start,
             end,
             pager_prot,
             page_flags,
+            vma_ceiling,
         )
     }) {
         // Ring0 holds the only map of an anonymous range and has already
@@ -1106,13 +1108,15 @@ fn broker_unmap(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64> {
     let len = checked_len(args.len)?;
     let start = checked_page_addr(args.addr)?;
     let end = checked_mapping_end(start, page_count(len)?)?;
+    let vma_ceiling = crate::pager_policy::anonymous_policy().process_vma_ceiling as usize;
     let mut mutation_errno = None;
     let result = retry_transient_range_edit("munmap", || {
-        multitask::unmap_pager_vma_for_process_with(
+        multitask::unmap_pager_vma_for_process_with_ceiling(
             t.pid,
             Some(t.expected()),
             start,
             end,
+            vma_ceiling,
             |state| {
                 unmap_process_range(state, start, end).map_err(|errno| {
                     mutation_errno = Some(errno);
@@ -1197,14 +1201,16 @@ fn broker_move(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64> {
     let old_end = checked_mapping_end(old_start, pages)?;
     let new_start = checked_page_addr(args.offset)?;
     let new_end = checked_mapping_end(new_start, pages)?;
+    let vma_ceiling = crate::pager_policy::anonymous_policy().process_vma_ceiling as usize;
     let mut refusal = None;
     let result = retry_transient_range_edit("mremap", || {
-        multitask::move_pager_vma_range_for_process(
+        multitask::move_pager_vma_range_for_process_with_ceiling(
             t.pid,
             Some(t.expected()),
             old_start,
             old_end,
             new_start,
+            vma_ceiling,
             |state| {
                 move_process_range(state, old_start, old_end, new_start, new_end).map_err(
                     |errno| {

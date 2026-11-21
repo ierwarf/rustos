@@ -363,7 +363,19 @@ The generalization, which applies well beyond this subsystem:
 > caller could succeed by trying again, the kernel is the thing that should try
 > again — it is the side that knows the wait is bounded.
 
-**Closed: `PAGER_MAX_VMAS_PER_PROCESS` is 256.**
+**`PAGER_MAX_VMAS_PER_PROCESS` is 4096 (directory ceiling) with lazy chunked
+allocation.** Chrome exhausted the former fixed 256-slot per-process array:
+`pager-vma-capacity-refused` immediately preceded two failed `mprotect`
+requests and a browser fault. Rather than merely raising a fixed per-process
+array (which preallocated slots for every process slot), each process's
+`ProcessVmaTable` now starts with zero slot chunks and allocates 32-slot
+`PublishedPagerVma` chunks on demand up to the effective policy
+`process_vma_ceiling` (clamped to `PAGER_MAX_VMAS_PER_PROCESS`). Exception-time
+readers (`lookup`, `acquire_fault_install`) never allocate; writers (`publish`,
+`rewrite_range`, `relocate_range`) fail cleanly with `Pressure` without touching
+existing mappings when a policy ceiling or actual OOM prevents expansion.
+`pagerd`'s `PagerState` likewise allocates tracked regions lazily in chunks up
+to `PAGER_MAX_TRACKED_REGIONS` rather than inline as a fixed array.
 It was 64, calibrated when pagerd refused most ranges so few were
 pager-tracked. Ring0 now tracks every anonymous range, and one
 `mprotect(PROT_NONE)` guard page splits a region into three, so a process with
@@ -377,7 +389,7 @@ edit (one `mprotect` inside one region) reserves one entry instead of the whole
 table and the stack no longer scales with it at all. Measured after: zero
 capacity refusals and zero `cannot map zero-fill pages` across a boot.
 
-The 256-entry **per-process** VMA table remains bounded, but the earlier
+The **per-process** VMA table remains bounded, but the earlier
 `MAX_PROCESS_OBJECTS * PAGER_MAX_VMAS_PER_PROCESS` boot-wide static array
 was removed in process-directory phase 2a. `PAGER_VMAS` and
 `PAGER_VMA_WRITERS` now use chunked `AtomicDir` storage, published before

@@ -89,6 +89,33 @@ class NobleRuntimeTests(unittest.TestCase):
         self.assertEqual(libs['libfoo.so.1'], b'\x7fELFfixture')
         self.assertNotIn('postinst', libs)
 
+    def test_extracts_only_selected_regular_qt_plugins(self):
+        paths = runtime.QT_WAYLAND_PLUGINS['qt6-wayland']
+        ignored = 'qt6/plugins/platforms/libqwayland-egl.so'
+        payload = b'\x7fELFfixture'
+        entries = [(runtime.PREFIX + path, payload, None) for path in paths]
+        deb = deb_with(entries + [(runtime.PREFIX + ignored, payload, None)])
+        self.assertEqual(set(dict(runtime.libraries(deb, paths))), paths)
+        self.assertEqual(dict(runtime.libraries(deb)), {})
+        with self.assertRaisesRegex(ValueError, 'missing Qt Wayland plugins'):
+            list(runtime.libraries(deb_with(entries[1:]), paths))
+        link = (entries[0][0], b'', 'other.so')
+        with self.assertRaisesRegex(ValueError, 'regular archive member'):
+            list(runtime.libraries(deb_with([link] + entries[1:]), paths))
+
+    def test_xkb_data_materializes_only_verified_aliases(self):
+        files = ['rules/evdev', 'rules/base', 'symbols/us', 'keycodes/evdev', 'types/complete', 'compat/complete']
+        prefix = runtime.XKB_PREFIX
+        entries = [(prefix + path, path.encode(), None) for path in files]
+        data = dict(runtime.xkb_data(deb_with(entries + [(prefix + 'rules/xorg', b'', 'base'),
+                                                        ('postinst', b'exit 99', None)])))
+        self.assertEqual(data['rules/xorg'], data['rules/base'])
+        self.assertNotIn('postinst', data)
+        with self.assertRaisesRegex(ValueError, 'invalid XKB alias'):
+            dict(runtime.xkb_data(deb_with(entries + [(prefix + 'rules/xorg', b'', '../outside')])))
+        with self.assertRaisesRegex(ValueError, 'missing XKB data'):
+            dict(runtime.xkb_data(deb_with(entries[1:])))
+
     def test_rejects_escaping_link_and_duplicate_members(self):
         prefix = runtime.PREFIX
         with self.assertRaises(ValueError):

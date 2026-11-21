@@ -26,6 +26,7 @@ mod run_authority;
 mod scheduler;
 mod scheduling_api;
 mod spawn;
+mod task_capacity;
 mod task_id;
 
 use core::{cell::Cell, mem, sync::atomic::AtomicU64};
@@ -62,7 +63,7 @@ pub use self::current::{
     complete_ipc_reply_wake_handoff_with_custody, complete_pager_fault_wake_handoff,
     complete_retired_task_cleanup, current_console_session, current_linux_thread_state,
     current_pager_charge_snapshot, current_pager_fault_install_permit, current_pager_vma_snapshot,
-    current_scheduling_context_runtime_snapshot, current_task_id, current_task_id_with_signal_hint,
+    current_scheduling_context_runtime_snapshot, current_thread_cpu_time_ns, current_task_id, current_task_id_with_signal_hint,
     current_thread_may_have_pending_signals, current_user_abi, current_user_address_space,
     current_user_id, current_user_ipc_entry, current_user_ipc_identity, current_user_job_charge_group, live_user_thread_ids, current_user_job_policy_allows, current_user_log_ids, current_user_process_id, current_user_process_identity,
     current_user_process_thread_count, current_user_snapshot, current_user_stack_state,
@@ -105,10 +106,14 @@ pub use self::pager_fault::{
 pub use self::pager_vma::{
     first_mapping_conflict as first_user_mapping_conflict,
     move_for_process as move_pager_vma_range_for_process,
+    move_for_process_with_ceiling as move_pager_vma_range_for_process_with_ceiling,
     protect_for_process as protect_pager_vma_for_process,
+    protect_for_process_with_ceiling as protect_pager_vma_for_process_with_ceiling,
     set_commit_state_for_process as set_pager_vma_commit_state_for_process,
     unmap_for_process as unmap_pager_vma_for_process,
-    unmap_for_process_with as unmap_pager_vma_for_process_with, validate_fault_request,
+    unmap_for_process_with as unmap_pager_vma_for_process_with,
+    unmap_for_process_with_ceiling as unmap_pager_vma_for_process_with_ceiling,
+    validate_fault_request,
     with_validated_fault_address_space, ExpectedMm, PagerFaultInstallPermit, PagerVmaError, PagerVmaSnapshot,
 };
 pub use self::process_table::{
@@ -138,7 +143,11 @@ pub use self::scheduler::{
 pub use self::scheduling_api::{SchedulingContextAdmission, SchedulingContextRuntimeSnapshot};
 
 /// Upper bound for schedulable task identities and cross-crate bounded registries.
-pub const MAX_SCHEDULER_TASKS: usize = scheduler::MAX_TASK;
+pub const MAX_SCHEDULER_TASKS: usize = task_capacity::CAPACITY.total_slots();
+pub use self::task_capacity::{
+    task_capacity_snapshot, CapacityLimit, TaskCapacity, TaskCapacitySnapshot,
+    CAPACITY as TASK_CAPACITY,
+};
 
 #[allow(unused_imports)]
 pub(crate) use self::irq::{
@@ -189,8 +198,38 @@ pub fn mark_root_idle() {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnTaskError {
     InvalidWeightMicros,
+    /// No dynamic task slot could be reserved (the scheduler task table is
+    /// exhausted, or the only free slot's producer row has not drained yet).
     NoFreeTaskSlot,
     MemoryQuota,
+    /// A new process would exceed the `processes.max` of its Job or of an
+    /// ancestor (the root Job's boot default is the capacity authority's
+    /// `root_process_ceiling`).
+    ProcessLimit,
+    /// The kernel stack backing for the new thread could not be allocated.
+    ThreadStackAllocation,
+    /// The process already holds the capacity authority's
+    /// `process_thread_ceiling` threads (structural per-process ceiling).
+    ProcessThreadLimit,
+    /// The process's Job, or an ancestor Job, is at its `threads.max` limit.
+    JobThreadLimit,
+    /// The process's Job is at its thread kernel-memory budget, so the new
+    /// thread's stack cannot be charged to it.
+    JobThreadMemory,
+    /// The process is exiting, already reaped, or its pin is closed.
+    ProcessExiting,
+    /// The process is replacing its image (exec) and admits no new thread.
+    ProcessExecInProgress,
+    /// The creating thread is not a live, admitted user task of the process
+    /// (its identity retired, or its address-space generation changed).
+    ThreadCreatorUnavailable,
+    /// The reserved thread was refused at suspended publication (the process
+    /// began exiting, scheduling-context admission, or no usable CPU
+    /// affinity), or its producer custody was abandoned.
+    ThreadPublicationRefused,
+    /// The thread's Windows TEB/thread identity could not be materialized in
+    /// the exact process address-space generation.
+    ThreadMaterializationFailed,
 }
 
 pub use retirement::RetiredTaskCleanup;
@@ -287,11 +326,43 @@ impl RetainedCurrentUserAddressSpace {
 }
 
 impl SpawnTaskError {
+    /// The capacity-authority limit that produced this refusal, if one did.
+    /// Job limits (`threads.max`, thread kernel-memory budget) are granted by
+    /// Ring3 policy and are not authority-derived, so they name none; the
+    /// caller reports the value through `TaskCapacity::limit_value`.
+    pub const fn rejecting_limit(self) -> Option<CapacityLimit> {
+        match self {
+            Self::NoFreeTaskSlot => Some(CapacityLimit::TaskTable),
+            Self::ProcessThreadLimit => Some(CapacityLimit::ProcessThreads),
+            Self::ProcessLimit => Some(CapacityLimit::RootProcesses),
+            Self::ThreadStackAllocation => Some(CapacityLimit::KernelStack),
+            Self::InvalidWeightMicros
+            | Self::MemoryQuota
+            | Self::JobThreadLimit
+            | Self::JobThreadMemory
+            | Self::ProcessExiting
+            | Self::ProcessExecInProgress
+            | Self::ThreadCreatorUnavailable
+            | Self::ThreadPublicationRefused
+            | Self::ThreadMaterializationFailed => None,
+        }
+    }
+
     pub fn summary(&self) -> &'static str {
         match self {
             Self::InvalidWeightMicros => "thread weight is outside the supported range",
             Self::NoFreeTaskSlot => "scheduler task table is full",
             Self::MemoryQuota => "process memory or kernel memory quota exceeded",
+            Self::ProcessLimit => "job process limit reached",
+            Self::ThreadStackAllocation => "kernel stack allocation for the thread failed",
+            Self::ProcessThreadLimit => "process thread ceiling reached",
+            Self::JobThreadLimit => "job threads limit reached",
+            Self::JobThreadMemory => "job thread kernel-memory budget exhausted",
+            Self::ProcessExiting => "process is exiting",
+            Self::ProcessExecInProgress => "process exec is in progress",
+            Self::ThreadCreatorUnavailable => "creating thread is not a live admitted user task",
+            Self::ThreadPublicationRefused => "thread publication was refused",
+            Self::ThreadMaterializationFailed => "thread identity could not be materialized",
         }
     }
 }

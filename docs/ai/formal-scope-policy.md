@@ -77,16 +77,16 @@ profile; a direct run defaults to `nightly`).
 
 | Severity | Role | `pr` profile | `nightly` profile |
 | --- | --- | --- | --- |
-| critical, high | blocking | every row executed; 100% must be killed by the exact witness, any survivor fails | same |
-| medium, low | advisory | executed only for packages with a changed file (working tree and untracked files against `HEAD`, or `RUSTOS_MUTATION_CHANGED_BASE`); a survivor is printed as `WARNING implementation mutation survivor (...)` and recorded in the summary (`advisory.survivors`), the gate still passes; rows not executed are counted and named in the summary (`advisory.not_executed`) | every row executed, cache off; any survivor fails the profile and is listed |
+| critical, high | blocking | executed for rows whose mutated source file, witness test file, or registry entry changed (working tree and untracked files against `HEAD`, or `RUSTOS_MUTATION_CHANGED_BASE`); 100% of executed rows must be killed by the exact witness, any survivor fails; untouched rows are listed under `advisory.not_executed` | every row executed, cache off; 100% must be killed, any survivor fails |
+| medium, low | advisory | same touched-file / registry-entry filter as above; a survivor is printed as `WARNING implementation mutation survivor (...)` and recorded in `advisory.survivors`, the gate still passes | every row executed, cache off; any survivor fails the profile and is listed |
 
 A witness that cannot be established (baseline failure, missing or ambiguous
 test) fails in every profile and for every severity: that is a registry defect,
 not a survivor. A `--only` run executes exactly the rows asked for. Path
-selection is a deliberate approximation (a change in a dependency does not
-select its dependents' advisory rows); the nightly profile is the audit that
-bounds it. The summary reports `kill_ratio` over executed rows and
-`blocking_kill_ratio` (must be 1.0).
+selection is a deliberate approximation (cross-file dependency changes rely on
+tests, Kani/Verus, source conformance, and the uncached nightly full corpus);
+the nightly profile is the audit that bounds it. The summary reports `kill_ratio`
+over executed rows and `blocking_kill_ratio` (must be 1.0).
 
 `formal/classify-mutation-severity.py` proposes grades by the rubric above
 (surface tier from the source path, safety tier from the mutation id; the

@@ -8,6 +8,7 @@
 use super::*;
 use crate::multitask::current_identity as identity;
 use crate::multitask::process_table::MmExecutionPin;
+use crate::multitask::SpawnTaskError;
 use stack_resources::admission::Ticket;
 
 pub(in crate::multitask) struct Reservation {
@@ -49,6 +50,15 @@ impl Drop for Reservation {
     }
 }
 
+/// Number of dynamic task slots a new thread could reserve right now. A
+/// non-binding observation (each slot is read under its own admission leaf, one
+/// at a time) for the capacity snapshot; `reserve` still decides.
+pub(in crate::multitask) fn reservable_slots() -> usize {
+    (FIRST_DYNAMIC_TASK_SLOT..MAX_TASK)
+        .filter(|slot| stack_resources::admission::reservable(*slot))
+        .count()
+}
+
 pub(in crate::multitask::scheduler) fn capture_creator(
     slot: usize,
 ) -> Option<identity::execution::BindingPin> {
@@ -60,16 +70,23 @@ pub(in crate::multitask::scheduler) fn capture_creator(
     identity::execution::pin_creation(slot, start.id, context.process_handle?, context.user_abi?)
 }
 
-fn reserve_with(id: u64, creator: &identity::execution::BindingPin) -> Option<Reservation> {
+fn reserve_with(
+    id: u64,
+    creator: &identity::execution::BindingPin,
+) -> Result<Reservation, SpawnTaskError> {
+    use SpawnTaskError as Refusal;
     let parent = (creator.slot(), creator.id());
-    let context = stack_resources::context::read(parent.0)?;
-    if stack_resources::task_start::read(parent.0)?.id != parent.1 || !context.user_mode {
-        return None;
+    let context = stack_resources::context::read(parent.0).ok_or(Refusal::ThreadCreatorUnavailable)?;
+    if stack_resources::task_start::read(parent.0).map(|start| start.id) != Some(parent.1)
+        || !context.user_mode
+    {
+        return Err(Refusal::ThreadCreatorUnavailable);
     }
-    let handle = context.process_handle?;
-    let pid = context.process_id?;
+    let handle = context.process_handle.ok_or(Refusal::ThreadCreatorUnavailable)?;
+    let pid = context.process_id.ok_or(Refusal::ThreadCreatorUnavailable)?;
     let root = runqueue::address_space::root(parent.0);
-    let mm = stack_resources::context::pin_thread_reservation_mm(parent.0, parent.1, handle, root)?;
+    let mm = stack_resources::context::pin_thread_reservation_mm(parent.0, parent.1, handle, root)
+        .ok_or(Refusal::ThreadCreatorUnavailable)?;
     for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
         let Some(ticket) = stack_resources::admission::reserve(slot, id) else {
             continue;
@@ -78,15 +95,15 @@ fn reserve_with(id: u64, creator: &identity::execution::BindingPin) -> Option<Re
             assert!(ticket.begin_cancel());
             drop(ticket.take_storage());
             ticket.finish_cancel();
-            return None;
+            return Err(Refusal::ThreadStackAllocation);
         }
-        if process_table::attach_task(handle).is_none() {
+        if let Err(refusal) = process_table::attach_task(handle) {
             assert!(ticket.begin_cancel());
             drop(ticket.take_storage());
             ticket.finish_cancel();
-            return None;
+            return Err(refusal);
         }
-        return Some(Reservation {
+        return Ok(Reservation {
             ticket: Some(ticket),
             mm: Some(mm),
             parent,
@@ -102,7 +119,8 @@ fn reserve_with(id: u64, creator: &identity::execution::BindingPin) -> Option<Re
             live: true,
         });
     }
-    None
+    // Only reached when no dynamic slot could be reserved at all.
+    Err(Refusal::NoFreeTaskSlot)
 }
 
 pub(in crate::multitask) fn cancel(reservation: Reservation) {
@@ -321,7 +339,7 @@ pub(in crate::multitask) fn commit(
     cs: u64,
     ss: u64,
     flags: u64,
-) -> Option<(usize, u32)> {
+) -> Result<(usize, u32), SpawnTaskError> {
     let result = {
         let mut preemption = nucleus_core::util::lockdep::DispatchPreemption::enter();
         preemption.mask_irqs();
@@ -335,10 +353,11 @@ pub(in crate::multitask) fn commit(
                 publication,
                 &preemption,
                 |_, _| {},
-            ),
+            )
+            .ok_or(SpawnTaskError::ThreadPublicationRefused),
             None => {
                 cancel_owned(reservation, &preemption);
-                None
+                Err(SpawnTaskError::ThreadPublicationRefused)
             }
         }
     };

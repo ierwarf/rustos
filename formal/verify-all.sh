@@ -149,7 +149,7 @@ if [[ "$profile" == nightly ]]; then
         RUSTOS_IMPLEMENTATION_MUTATION_CACHE=off \
         bash formal/run-implementation-mutations.sh --profile nightly
 else
-    # PR: critical/high always, medium/low only for changed packages (warnings).
+    # PR: rows whose mutated source, witness file, or TSV entry changed (critical/high block, medium/low warn).
     run_parallel_lane implementation-mutations \
         bash formal/run-implementation-mutations.sh --profile pr
 fi

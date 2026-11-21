@@ -4,8 +4,8 @@
 mod tests {
     use super::{
         DEFAULT_SMOKE_TIMEOUT, DEFAULT_UI_FPS_ACTIVE_WINDOWS, DVM_BLOCK_FEATURE_FLUSH, DVM_BLOCK_FLAG_DVM_READY,
-        DVM_BLOCK_FLAG_READ_ONLY, DVM_BLOCK_FLAG_RUSTOS_READY, DVM_BLOCK_MEDIA_BLOCK_BYTES,
-        DVM_BLOCK_MEDIA_FEATURES, DVM_BLOCK_READY_MARKER, DVM_BOOTSTRAP_FRAME_MARKER,
+        DVM_BLOCK_FLAG_READ_ONLY, DVM_BLOCK_FLAG_RUSTOS_READY, DVM_BLOCK_MEDIA_FEATURES,
+        DVM_STORAGE_LOGICAL_BLOCK_BYTES, DVM_STORAGE_PHYSICAL_BLOCK_BYTES, DVM_BLOCK_READY_MARKER, DVM_BOOTSTRAP_FRAME_MARKER,
         DVM_CONTROL_AUTHENTICATION, DVM_CONTROL_CAPABILITIES, DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT,
         DVM_DISPLAY_REGION_BYTES, DVM_GPU_COMPOSITOR_MARKER, DVM_KEYBOARD_INGRESS_MARKER,
         DVM_POINTER_INGRESS_MARKER, DisplayGeometry, DvmNetworkCounters, GuestDisplay,
@@ -18,6 +18,8 @@ mod tests {
         VIRTUAL_GPU_EVIDENCE, WAYCLICK_FIRST_FRAME_MARKER, WayclickProfileObservation,
         acquire_kvm_launch_lock, append_dvm_display_pixels, append_dvm_input_devices,
         append_dvm_network_device, append_dvm_virtual_gpu, append_dvm_virtual_storage,
+        append_dvm_writable_virtual_storage, dvm_storage_capacity_sectors,
+        dvm_storage_header_geometry_matches,
         append_physical_gpu, append_physical_usb, causal_tail, claim_physical_gpu_launch_in,
         dvm_shmem_backing_dir,
         dvm_block_header_matches_ready_generation, dvm_display_failure, dvm_display_provider_ready,
@@ -977,7 +979,7 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
                 .contains("hostmem=256M")
         );
         assert!(dvm_gpu_device(GuestDisplay::Physical, geometry).is_none());
-        assert_eq!(dvm_machine(), "q35,accel=kvm,i8042=off");
+        assert_eq!(dvm_machine(), "q35,accel=kvm,i8042=off,sata=off");
         assert_eq!(
             dvm_pointer_device(GuestDisplay::DvmGtk),
             "virtio-tablet-pci,id=dvm-pointer,display=dvm-virtio-gpu,head=0"
@@ -1170,8 +1172,23 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
     }
 
     #[test]
-    fn dvm_block_read_only_media_geometry_matches_atapi_capacity() {
-        dvm_block::dvm_block_read_only_media_geometry_matches_atapi_capacity();
+    fn dvm_block_read_only_media_geometry_is_the_declared_storage_geometry() {
+        dvm_block::dvm_block_read_only_media_geometry_is_the_declared_storage_geometry();
+    }
+
+    #[test]
+    fn dvm_writable_storage_uses_the_same_virtio_frontend() {
+        dvm_block::dvm_writable_storage_uses_the_same_virtio_frontend();
+    }
+
+    #[test]
+    fn dvm_machine_has_no_implicit_storage_controller() {
+        dvm_block::dvm_machine_has_no_implicit_storage_controller();
+    }
+
+    #[test]
+    fn create_read_only_dvm_block_aperture_signs_declared_geometry() {
+        dvm_block::create_read_only_dvm_block_aperture_signs_declared_geometry();
     }
 
     #[test]

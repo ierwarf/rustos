@@ -69,6 +69,12 @@ fn request(token: u64) -> NetdIpcRequest {
     }
 }
 
+const QUEUED_SENDER: Credentials = Credentials {
+    pid: 41,
+    uid: 42,
+    gid: 43,
+};
+
 fn enqueue(state: &mut NetState, token: u64, bytes: &[u8], control: &[u8]) {
     state.unix_queued_bytes+=bytes.len()+cmsg_align(control.len());
     let connected = connected_mut(state, token);
@@ -77,6 +83,7 @@ fn enqueue(state: &mut NetState, token: u64, bytes: &[u8], control: &[u8]) {
     connected.incoming.push_back(UnixStreamSegment {
         bytes: bytes.iter().copied().collect(),
         control: control.to_vec(),
+        sender: QUEUED_SENDER,
     });
 }
 
@@ -161,7 +168,7 @@ fn recvmsg_passcred_toggle_cannot_split_sizing_dequeue_and_encoding() {
             0
         );
         let expected_control = append_recvmsg_credentials(
-            initial_passcred.then_some(connected(&guard, 1).peer_credentials),
+            initial_passcred.then_some(QUEUED_SENDER),
             control,
         );
         let read = response.value as usize;
@@ -185,6 +192,95 @@ fn recvmsg_passcred_toggle_cannot_split_sizing_dequeue_and_encoding() {
         assert_eq!(read + tail.value as usize, bytes.len());
         assert_eq!(connected(&guard, 1).incoming_bytes, 0);
     }
+}
+
+fn passcred_credentials(response: &NetdIpcResponse) -> Option<linux_abi::LinuxUCred> {
+    let read = response.payload[0..4].try_into().map(u32::from_ne_bytes).unwrap() as usize;
+    let control_len = response.payload[4..8].try_into().map(u32::from_ne_bytes).unwrap() as usize;
+    let start = NETD_RECVMSG_PAYLOAD_HEADER_SIZE + read;
+    let control = &response.payload[start..start + control_len];
+    let header = read_cmsghdr(control).ok()?;
+    if header.cmsg_type != linux_abi::SCM_CREDENTIALS as u32 {
+        return None;
+    }
+    let data = &control[size_of::<linux_abi::LinuxCmsghdr>()..];
+    Some(linux_abi::LinuxUCred {
+        pid: i32::from_ne_bytes(data[0..4].try_into().unwrap()),
+        uid: u32::from_ne_bytes(data[4..8].try_into().unwrap()),
+        gid: u32::from_ne_bytes(data[8..12].try_into().unwrap()),
+    })
+}
+
+/// A socketpair's ends both carry the creator's identity (`SO_PEERCRED`), but
+/// `SCM_CREDENTIALS` must name whichever process performed the send. Chrome's
+/// zygote host learns a forked child's pid from the child's reply on a
+/// socketpair the browser created; reporting the creator made it see itself.
+#[test]
+fn scm_credentials_name_the_sender_not_the_connection_creator() {
+    let mut state = NetState::new();
+    state.sockets.insert(1, connected_socket(2, None));
+    state.sockets.insert(2, connected_socket(1, None));
+    state.sockets.get_mut(&1).unwrap().options.passcred = true;
+    let child = NetdIpcRequest {
+        pid: 55,
+        euid: 1000,
+        egid: 1001,
+        ..request(2)
+    };
+    assert_eq!(send_socket_message_in_state(&mut state, &child, b"x", &[]), Ok(1));
+    let mut response = NetdIpcResponse::default();
+    assert_eq!(recvmsg_in_state(&mut state, &recv_request(1), &mut response), 0);
+    let ucred = passcred_credentials(&response).expect("credentials cmsg");
+    assert_eq!((ucred.pid, ucred.uid, ucred.gid), (55, 1000, 1001));
+    assert_eq!(connected(&state, 1).peer_credentials.pid, 7, "SO_PEERCRED stays the creator");
+}
+
+#[test]
+fn stream_receive_never_merges_two_senders_credentials() {
+    let mut state = NetState::new();
+    state.sockets.insert(1, connected_socket(2, None));
+    state.sockets.insert(2, connected_socket(1, None));
+    state.sockets.get_mut(&1).unwrap().options.passcred = true;
+    for pid in [55, 56] {
+        let sender = NetdIpcRequest { pid, ..request(2) };
+        assert_eq!(send_socket_message_in_state(&mut state, &sender, b"x", &[]), Ok(1));
+    }
+    for expected in [55, 56] {
+        let mut response = NetdIpcResponse::default();
+        assert_eq!(recvmsg_in_state(&mut state, &recv_request(1), &mut response), 0);
+        assert_eq!(response.value, 1, "one sender per receive");
+        assert_eq!(passcred_credentials(&response).unwrap().pid, expected);
+    }
+}
+
+#[test]
+fn stream_receive_starts_exactly_at_the_segment_carrying_rights() {
+    // The kernel binds a rights ticket to the byte offset where its send began
+    // and checks it against the receive's start, so plain bytes queued ahead of
+    // a rights-bearing segment must come back as their own short read.
+    let mut state = NetState::new();
+    state.sockets.insert(1, connected_socket(2, None));
+    enqueue(&mut state, 1, b"plain", &[]);
+    let control = rights(0x72);
+    enqueue(&mut state, 1, b"fdmsg", &control);
+
+    let mut first = NetdIpcResponse::default();
+    assert_eq!(recvmsg_in_state(&mut state, &recv_request(1), &mut first), 0);
+    assert_eq!(first.value, 5, "plain prefix is a short read");
+    assert_eq!(connected(&state, 1).incoming.len(), 1);
+    assert!(!connected(&state, 1).incoming[0].control.is_empty());
+
+    let mut second = NetdIpcResponse::default();
+    assert_eq!(recvmsg_in_state(&mut state, &recv_request(1), &mut second), 0);
+    assert_eq!(second.value, 5);
+    assert_eq!(connected(&state, 1).incoming_control_bytes, 0);
+    let read = second.value as usize;
+    let at = NETD_RECVMSG_PAYLOAD_HEADER_SIZE + read;
+    assert_eq!(
+        &second.payload[at..at + control.len()],
+        control.as_slice(),
+        "rights arrive with the receive that starts at their segment"
+    );
 }
 
 #[test]

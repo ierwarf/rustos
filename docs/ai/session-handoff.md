@@ -4,6 +4,166 @@ Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
 
+## Chrome launch & virtio-blk KVM validation (2026-11-21)
+
+KVM validation and root-cause fixes completed on top of the uncommitted redesign batch (`apps/chrome/RUSTOS.package.toml` interim manifest with `--no-sandbox --disable-gpu --disable-background-networking --user-data-dir=/tmp/chrome-profile about:blank`).
+
+- **Bugs found & fixed during KVM + formal validation**:
+  1. **BAR2 effective UC under SeaBIOS (`driver-domains/linux/package/rustos-dvm-block/src/rustos_dvm_block_uio.c`, `driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c`)**: SeaBIOS places the 8 MiB `ivshmem-doorbell` BAR2 at `0xf0000000` inside its `UC` MTRR PCI hole, where clearing `_PAGE_CACHE_MASK` (`PAT=WB`) still downgraded to `UC` (~5.8 MB/s on `pread_full` into BAR2, causing `vfsd` 306 MB executable snapshot `read_us=58.98 s` no-`/data` and `43.98 s` writable, and `108.6 s` `pread_us` across 956 MB). Switched `rustos_dvm_block_uio.c` to `ioremap_wc` + `pgprot_writecombine` (`PAT=WC` overrides `MTRR=UC`) paired with an aligned RAM `read_bounce` buffer and explicit `wc_store_fence()` (`sfence`) in `rustos-dvm-block.c` before cursor publication; updated `formal/run-source-conformance.sh` and `tools/xtask/src/kvm/tests/dvm_block.rs`, rebuilt via `make -C driver-domains/linux rebuild-block` (`REBUILD_BLOCK_RC=0`) + `cargo xtask verify-dvm`.
+  2. **Desktop-resident Job budget starvation (`services/uiserver/RUSTOS.package.toml`, `apps/wayclick/RUSTOS.package.toml`, `apps/shell/RUSTOS.package.toml`, `services/runtimed/src/main.rs`, `services/runtimed/src/session.rs`, `services/runtimed/src/catalog.rs`)**: Without declared requests, `uiserver`, `wayclick`, and `shell` each took the default `12/48`, leaving only `12` of `48` process slots and refusing Chrome (`24/144`, `errno=11`). Declared `1/24` (`uiserver`), `1/4` (`wayclick`), `1/2` (`shell`) so steady desktop takes `3/30` and Chrome (`24/144`) launches cleanly.
+  3. **Leftover launch probe `EEXIST` hazard (`services/runtimed/src/launch_profile.rs`)**: `probe_writable` used `create_new(true)` despite allowing leftover markers; switched to `create(true).truncate(true)` with unit test coverage.
+  4. **Earlier static/preflight & ABI fixes**: `services/loaderd/src/application_grant.rs` `abi_version` mismatch (`TASK_CAPACITY_ABI_VERSION + 1`), `kernel/ps/src/user/process_state.rs` `DEFAULT_DESKTOP_UID/GID` constants from `desktop_session.rs`, `formal/concurrency-triangle.toml`, `formal/implementation-mutations.tsv` anchors/sort order, `formal/run-source-conformance.sh` DVM block assertions, and `docs/ai/formal-contracts.generated.md` regeneration.
+  5. **Surviving PR mutation `pager-vma-stale-process-slot-not-reclaimed` (`kernel/ps/src/multitask/pager_vma/tests.rs`)**: The `free_slot` cache optimization in `kernel/ps/src/multitask/pager_vma.rs` overwrote the single stale slot in `publication_reclaims_stale_process_generation_before_slot_reuse`, masking skipped `slot.publish(None)` reclamation; updated the test to publish two stale VMAs before retirement (`killed=1/1`, `kernel-ps` 1215 passed).
+- **KVM measurements (4 vCPUs, host load 12.8–15.0 with VS Code `rg` ~800–1154% CPU)**:
+  - **DVM block (`virtio-blk`)**: `controller=virtio_blk device=vda sectors=2760704 logical=512 physical=512`; no `ata1`/`sr0`.
+  - **306 MB Chrome snapshot copy**: before WC fix: `read_us=58982737` (no `/data`, load 18.7) / `43976262` (`--writable-storage`, load 15.2). After WC fix: `read_us=3742517` (no `/data`, load 15.0) / `4064733` (`--writable-storage`, load 12.8); cumulative DVM `pread_us` dropped from `108.6 s` (956 MB) to `1.41 s` (940 MB) / `1.76 s` (973 MB).
+  - **Without `/data` (after WC fix, `--hold-seconds 100`)**: `runtimed: profile root=/tmp/rustos-profile-1000 reason=persistent-unusable(...) uid=1000`; Chrome pid `116` granted `24/144/261336`; `wayland_windows=2` reached ~40.3 s after spawn (`ts=1795261053663` -> `1795261093959`) and stayed up until hold end (`rc=0`).
+  - **With `/data` (`--writable-storage --exercise-input --hold-seconds 180`, after WC fix)**: `runtimed: profile root=/data reason=persistent-volume-writable uid=1000`; `wayland_windows=2` at `ts=1795261281690` (~42.0 s after spawn) and `wayland_windows=3` (`KEY_F12` input delivered, `input_events=1356`) stayed up for ~140 s (`~189 s` boot uptime) with zero unexpected `linux-thread-clone-stage` rejections (`rc=0`).
+  - **16-vCPU smoke (`--gui-dvm-surfaces --expect "ipcbench: end"`)**: passed (`rc=0`).
+- **Remaining unverified / open items**:
+  - Chrome pixel content is unverified (no screenshot facility).
+  - Real browser sandbox (user namespaces/seccomp) remains open; crashpad `posix_spawn` EINVAL (pid `117`), `inotify_init` ENOSYS, empty `/etc/machine-id`, `dbus`, `drmGetDevices2`, and `/proc/<other-pid>/oom_score_adj` ENOENT remain non-fatal log noise.
+  - `launch_profile.rs` `ensure_persistent_dir` still probes/creates as uid `0` (works on non-POSIX FAT `/data`; would leave uid-0 dirs if an app put a literal `/tmp/...` path in `PROFILE_DIR_KEYS`).
+  - `kernel/compat/src/user/syscall/linux/mm_request_lease.rs` keeps `MAX_LEASES_PER_PID = 32` (`syscall_linux_brk` in `kernel/compat/src/user/syscall/linux/memory_ops.rs` still returns `0` on `Err`); not triggered in 180 s Chrome runs.
+  - Host-side verification before PR gate: `cargo test -p kernel-ps` (1215 passed), `cargo test -p loaderd` (62 passed), `cargo test -p runtimed` (126 passed), `cargo test -p xtask` (385 passed, 1 ignored), `cargo test -p uiserver` (270 passed), `cargo xtask check` rc=0, `formal-preflight.sh` 0/23 failed.
+
+## Redesign batch awaiting KVM validation (2026-11-21)
+
+Uncommitted, never booted baseline before the KVM validation above: kernel capacity authority + `SYS_RUSTOS_TASK_CAPACITY` + typed
+thread-creation failures; request/grant application Job limits (loaderd); template-based launch
+environment with runtime profile resolution (`libs/session-profile`, runtimed `launch_profile.rs`);
+DVM boot volume as read-only `virtio-blk-pci` instead of an ATAPI CD-ROM (log evidence:
+`ata1.00: ATAPI: QEMU DVD-ROM`, `sr0`, ~5-10 MB/s). Host-side only so far: `cargo xtask check` rc=0,
+crate tests green (kernel-ps 1215, kernel-compat 460, runtimed 126, loaderd 62, vfsd 205, storaged 26,
+netd 159, runtime-control 34, rustos-user-abi 125, session-profile 7, uiserver 270, driver-domain-host
+46, xtask 385), formal scripts pass except the known stale anchors
+(`check-concurrency-triangle` in `slot_dir.rs`, mutation runner `netd-seqpacket-coalesces-messages`).
+The takeover prompt for the KVM stage is `build/handoff-kvm-validation-prompt.md`.
+
+## Chrome launched from the desktop entry shows nothing (2026-11-21)
+
+Product manifest (`.example` args: `--ozone-platform=wayland` only), 4 vCPUs,
+`kvm-smoke --launch-desktop chrome.desktop`. Chrome never creates a window:
+
+- The 306 MB executable snapshot copy takes ~52 s (`vfsd: executable snapshot
+  phases ... read_us=52054362`) before pid 116 even spawns: no feedback in UI.
+- Without `--writable-storage` there is no `/data`; `HOME=/data/home` cannot be
+  created and Chrome dies in 2 s with `FATAL path_service.cc:264 Failed to get
+  the path for 1001` (DIR_LOGS -> user data dir).
+- With `--writable-storage` it passes that and then aborts at ~20 s with
+  `FATAL setuid_sandbox_host.cc:172 The SUID sandbox helper ... not configured
+  correctly` (no user namespaces, `chrome-sandbox` not setuid): the sandbox is
+  the blocker for any launch without `--no-sandbox`. Also crashpad
+  `posix_spawn` EINVAL in pid 117.
+- Resolution (user decision 2026-11-21): the checked-in manifest template now
+  launches `--no-sandbox --disable-gpu --disable-background-networking
+  --user-data-dir=/tmp/chrome-profile about:blank` as an interim; the
+  sandbox-bypass prohibitions (README, 3 tests, doc notes) were removed. Via
+  `--launch-desktop chrome.desktop` (4 vCPUs, no /data) pid 116 stays alive and
+  `wayland_windows=2` for the hold. Pixels still unverified. Real sandbox
+  (user namespaces + seccomp, `chrome-gap-mm-threads.md` M1-M3) remains open.
+- Performance (Chrome executable snapshot read, 306 MB): a subagent added
+  relay readahead (`rustos-dvm-block.c`, 2 MiB window + merged `readahead(2)`)
+  and read-latency telemetry (`rustos-dvm-block: read-stats`, `storaged: dvm
+  read stream`, `snapshot transfer ... storaged_us=`). Measured 4 vCPUs:
+  `read_us` 51.5 s -> 53.0 s with the new DVM while a VS Code `rg --files
+  --hidden` used ~10 host cores (host load ~17; `pread` ~8.9 ms/64 KiB, max
+  56 ms); 30.0 s with that `rg` SIGSTOPped (host load ~3; `pread_max` 8 ms).
+  So host CPU contention is at least half of the 52 s. NOT separated: how much
+  the readahead itself contributes (no A/B on the old DVM without contention).
+  Remaining ~30 s still is the eager 306 MB copy; the structural fix is a lazy
+  demand-paged sealed snapshot with per-chunk integrity hashes (not started).
+- The earlier "browser stays up" result used a private manifest with
+  `--no-sandbox --user-data-dir=/tmp/...`, which hides both failures.
+
+## Chrome non-sandbox launch: browser now stays up (2026-11-21)
+
+Private `--no-sandbox --disable-gpu --user-data-dir=/tmp/chrome-local-test
+about:blank` launches on 4 vCPUs, product manifest restored from `.example`.
+
+- Fixed (netd): AF_UNIX stream segments carry the sender's per-send
+  credentials; `SCM_CREDENTIALS` reports them (the zygote host had learned pid
+  116 from the connection creator, which broke OOM-score and
+  `!process.is_current()` checks). `SO_RCVTIMEO` is stored/reported for local
+  sockets. A rights-collecting receive no longer merges plain bytes queued
+  ahead of the rights segment; that merge made the kernel's ticket
+  `stream_start` differ from the receive start (EPERM, child crash).
+- Fixed (kernel): `CLOCK_THREAD_CPUTIME_ID` was EINVAL, so
+  `base::ThreadTicks::Now()` hit its int3 and killed the browser (the later
+  `clock_gettime` EFAULT/int3 in children 147/150 were teardown fallout:
+  published identity absent while the process was exiting). Scheduler now
+  accumulates per-slot CPU time (`execution_time::charge`).
+  Empty path names return ENOENT (was EINVAL); `AT_EMPTY_PATH` callers use
+  `copy_current_user_path_allow_empty` (statx/newfstatat/fchmodat/fchownat/
+  linkat/utimensat).
+- Evidence (run `build/kvm/debugcon-history/1795197*-*.log`, last of 11):
+  no `socket-stream-break`, no browser fault; zygotes 119/120, children 147
+  and 150 alive; `wayland_windows=2` for the whole hold; uiserver `frames=2-3`.
+  Pixel content is **not verified** (no screenshot facility); renderer/GPU/
+  network process roles were inferred from pids, not confirmed.
+- Remaining (not fixed): `/proc/<other-pid>/oom_score_adj` is ENOENT by the
+  vfsd contract (caller-only pids), so Chrome logs "Failed to adjust OOM score
+  of renderer" (needs kernel-attested cross-pid procfs delegation); crashpad
+  `posix_spawn` EINVAL (procd rejects vfork/CLONE_PARENT_SETTID plans);
+  `inotify_init` ENOSYS; empty `/etc/machine-id`; process CPU-time clock 2;
+  timed-out stream recv/send can still desynchronize kernel stream counters
+  from netd's queue (STREAM_BREAK_ABANDONED_IN_FLIGHT is only recorded; a
+  netd-authoritative stream offset would remove the class); eager private-file
+  mmap copy via vfsd times out under load (ETIMEDOUT reaches the app).
+
+## Chrome stage 1 follow-up: Qt Wayland, XKB, and first-frame blocker
+
+- Stage pins the generic software Qt5/Qt6 Wayland + xdg-shell plugins and
+  XKB data from the authenticated Noble snapshot. Target-loader validation
+  passed for all 15 ELF roots; the fixture also reopened 678 FAT files.
+- Fixed Linux TmpFs `mkdir` ordering for Qt's existing runtime directory:
+  require search, return EEXIST for an existing name, require write only for
+  creation. Final standalone 1-vCPU `chromeprobe` passed 496 checks. The
+  combined probe/browser run failed `lock.exec-cloexec` and hit a Chrome
+  executable snapshot timeout; the standalone probe passed separately.
+- Private signed browser runs used a new TmpFs profile, `--no-sandbox`,
+  `--disable-gpu`, a local HTML file, no RustOS network relay, and restricted
+  Linux DVM QEMU networking. The original launch manifest was restored.
+- Initial Qt plugin run reached `xkbcommon: failed to add default include
+  path`; adding XKB removed that message and exposed Qt's runtime-directory
+  `mkdir` EACCES. Final browser-only run no longer shows either message and
+  opens Wayland connections, but Chrome PID 113 terminates on x86 vector 13
+  (#GP) in threads 134/135 before any accepted browser-owned frame. The KVM
+  runner also reported a DVM GPU readiness timeout; that is not the kernel's
+  recorded Chrome termination cause. See
+  `build/kvm/debugcon-history/1795104012587-66560.log:4079-4088` and
+  `build/chrome-stage1.MUi0Mr/kvm-browser-only.log`. Next, bind the recorded
+  fault RIPs to Chrome's live executable/shared-library mappings before
+  changing CPU/MM behavior. First frame, tab and input are **not verified**.
+- Crashpad spawn remains a separate failure. No persistent-profile, vfork,
+  browser sandbox, or hardware-acceleration implementation was attempted.
+
+## Chrome 157 non-sandbox launch diagnosis (2026-11-19, `b554cdb5`)
+
+- Two 1-vCPU KVM diagnostics used privately signed images and no RustOS network
+  relay, `--no-sandbox --disable-background-networking about:blank`. The
+  product manifest was restored byte-for-byte; these flags are not product
+  defaults. KVM smoke tracks guest boot and PID publication, not Chrome UI.
+- Default FAT-backed profile: browser PID 113 exited 21 after
+  `/data/config/google-chrome/SingletonLock` creation returned `EOPNOTSUPP`.
+  Chromium expects a symlink; `storage-fat` has `supports_symlinks: false`.
+  Evidence: `build/kvm/debugcon-history/1795098833859-56091.log:3861,3897`.
+- A new TmpFs profile bypassed the profile filesystem limitation for diagnosis.
+  Browser PID 113 then exited 191 after Qt reported `Could not find the Qt
+  platform plugin "wayland"`. Staged Qt 5/6 libraries and Chrome Qt shims are
+  present, but no Qt Wayland platform plugin is staged. Evidence:
+  `build/kvm/debugcon-history/1795098981508-56886.log:3810,3817`.
+- Both runs: Crashpad child `posix_spawn` failed with EINVAL after rejected
+  `clone3` and legacy `clone`. The host trace shows glibc's shared-VM/vfork
+  spawn shape, which procd's process-fork plan does not admit. This killed
+  the helper, not the browser. Missing DRM render nodes, a missing system
+  D-Bus socket, and ENOSYS for inotify/other optional calls were observed;
+  they are not established as the immediate browser exit cause. Renderer,
+  tabs, GPU and network were not accepted by these tests.
+- Next work is outlined in the [software-rendering launch plan](chrome-software-launch-plan.md):
+  Qt Wayland and first frame first; POSIX profile storage and spawn semantics
+  are independent implementation tracks. Neither track is implemented here.
+
 ## VFS directory and mount follow-up
 
 - Replaced regenerated-list indexes with TmpFs directory-link cookies and FAT

@@ -81,10 +81,12 @@ CONFIG_BRIDGE=m
 CONFIG_VLAN_8021Q=m
 CONFIG_SCSI=y
 CONFIG_BLK_DEV_SD=m
-# The KVM qualification volume is immutable ATAPI media on the assigned AHCI
-# controller. Keep its sr namespace in the signed kernel image so early S12
-# storage admission never depends on an unverified cold-plug helper.
-CONFIG_BLK_DEV_SR=y
+# The KVM qualification volume is a read-only virtio-blk disk. virtio-pci and
+# virtio_blk are built in (above), so early S12 storage admission never depends
+# on a cold-plug helper. Optical/ATAPI media is not an admitted storage
+# namespace: without `sr`, a CD drive on an assigned physical controller cannot
+# appear as a second namespace and break the relay's one-namespace rule.
+# CONFIG_BLK_DEV_SR is not set
 # Physical storage controllers are assigned after the initramfs is live.
 # Keep their device-class drivers signed and modular so the storage bootstrap
 # admits only the exact PCI modalias closure selected by S12.

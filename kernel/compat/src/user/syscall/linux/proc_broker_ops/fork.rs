@@ -149,10 +149,9 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
             .try_reserve_exact(regions.len())
             .map_err(|_| crate::memory::paging::AddressSpaceError::OutOfFrames)?;
         inherited_regions.extend_from_slice(regions);
-        Ok::<_, crate::memory::paging::AddressSpaceError>((
-            parent.fork_clone(address_space, None),
-            inherited_regions,
-        ))
+        let child_state = parent.fork_clone(address_space, None);
+        parent.begin_fork_handle_pin();
+        Ok::<_, crate::memory::paging::AddressSpaceError>((child_state, inherited_regions))
     });
     let (child_state, inherited_regions) = match forked {
         Ok(Ok(result)) => result,
@@ -165,6 +164,7 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
             return fork_stage_failed(5 + error as i64 as u64, LINUX_ENOMEM, 0);
         }
     };
+    let fork_pin = ForkHandlePinGuard::new(args.source_pid);
     #[cfg(rustos_lifecycle_trace)]
     {
         // Emit only after the parent process/VMA guards have been released.
@@ -216,8 +216,12 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
     bootstrap.set_exec_path(child_state.exec_path());
 
     let inherited_service_refs = match acquire_cloned_service_handle_refs(&child_state) {
-        Ok(refs) => refs,
+        Ok(refs) => {
+            drop(fork_pin);
+            refs
+        }
         Err(errno) => {
+            drop(fork_pin);
             let _ = multitask::cancel_process_spawn(spawn_reservation);
             return fork_stage_failed(24, errno, args.source_pid);
         }
@@ -440,6 +444,33 @@ mod tests {
 /// child task (slot table, Job process/thread/kmem limit), 24 inherited
 /// service handles could not be acquired), so a
 /// bare errno under concurrent address-space churn is attributable. Bounded.
+struct ForkHandlePinGuard {
+    pid: u64,
+}
+
+impl ForkHandlePinGuard {
+    fn new(pid: u64) -> Self {
+        Self { pid }
+    }
+}
+
+impl Drop for ForkHandlePinGuard {
+    fn drop(&mut self) {
+        let deferred = multitask::with_process_state_by_pid_mut(self.pid, |state| {
+            state.end_fork_handle_pin()
+        })
+        .or_else(|| {
+            multitask::with_process_state_for_teardown_mut(self.pid, |state| {
+                state.end_fork_handle_pin()
+            })
+        })
+        .unwrap_or_default();
+        if !deferred.is_empty() {
+            super::service_ops::release_closed_handles(deferred);
+        }
+    }
+}
+
 fn fork_stage_failed(stage: u64, errno: i64, detail: u64) -> u64 {
     static RECORDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     // ORDERING: Relaxed; a counter bounding telemetry volume.

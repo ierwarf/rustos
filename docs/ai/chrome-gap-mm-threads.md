@@ -124,8 +124,10 @@ SET/GET_NAME, NO_NEW_PRIVS, DUMPABLE (`prctl_ops.rs:122`), rseq -> ENOSYS
   tracing, `ProcessMetrics::GetCumulativeCPUUsage` also reads `CLOCK_PROCESS_CPUTIME_ID` /
   `getrusage`); a failed call is `NOTREACHED` (fatal in recent Chrome, unverified). glibc
   `pthread_getcpuclockid` yields the dynamic clock ids `(tid<<3)|6`.
-- RustOS: only clock ids 0,1,4,5,6,7 are accepted (`process_time.rs:252-262`), so 2/3/dynamic
-  ids are EINVAL; `getrusage`, `times`, `clock_getres` are `not dispatched`.
+- RustOS: `CLOCK_THREAD_CPUTIME_ID` (3) is served from per-thread CPU time the scheduler
+  charges at every interval settlement (`runqueue/execution_time.rs`), readable by
+  `clock_gettime`/`clock_getres` only (never a sleep clock, as on Linux). Clock ids
+  0,1,4,5,6,7 are as before; 2 (process CPU time) and dynamic ids are still EINVAL; `getrusage`, `times`, `clock_getres` are `not dispatched`.
 - Sketch: scheduler already tracks per-task runtime ticks; export per-thread and per-process
   CPU nanoseconds from `kernel/ps`, serve ids 2/3 and `~tid` ids in
   `write_clock_timespec`; add `SYS_GETRUSAGE` (RUSAGE_SELF/THREAD/CHILDREN: utime/stime from
@@ -234,8 +236,8 @@ SET/GET_NAME, NO_NEW_PRIVS, DUMPABLE (`prctl_ops.rs:122`), rseq -> ENOSYS
 Without `--no-sandbox` Chrome will not start unless M1+M2 (and M3 for SIGSYS) exist, which
 is the largest cross-subsystem change in this audit. Recommendation: implement them
 (policy in `procd`/`syscalld`, no ring0 policy); do not fake `unshare`/`seccomp` success.
-Choosing `--no-sandbox --no-zygote` instead is a product/security decision that is the
-user's, and docs/ai/large-file-io-plan.md:240 currently forbids it as a workaround.
+The user chose `--no-sandbox` as an interim launch argument on 2026-11-21 (checked-in
+manifest template); the real sandbox (M1+M2+M3) remains open.
 
 ## 7. Not verified
 

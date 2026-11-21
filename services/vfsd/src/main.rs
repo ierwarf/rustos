@@ -216,7 +216,11 @@ static mut VFS_RESPONSE_SLOT: VfsIpcResponse = VfsIpcResponse {
 };
 
 use rustos_user_abi::syscall::VFS_EXECUTABLE_SNAPSHOT_MAX_FILE_BYTES;
-const EXECUTABLE_SNAPSHOT_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+// Size the sealed-image cache to at least the ABI's maximum admitted
+// executable snapshot so a large binary like Chrome stays cached across
+// child-process execs instead of re-reading hundreds of MiB from the DVM.
+const EXECUTABLE_SNAPSHOT_CACHE_BUDGET_BYTES: usize =
+    VFS_EXECUTABLE_SNAPSHOT_MAX_FILE_BYTES as usize;
 const UI_SERVER_EXEC_PATH: &[u8] = b"/services/uiserver/uiserver.elf";
 static SNAPSHOT_WORKER_DEMOTED: AtomicBool = AtomicBool::new(false);
 
@@ -224,6 +228,7 @@ static SNAPSHOT_WORKER_DEMOTED: AtomicBool = AtomicBool::new(false);
 struct ExecutableSnapshot {
     fd: i32,
     file_bytes: u64,
+    last_used_seq: u64,
 }
 
 fn linux_response_for_op(op: u16) -> LinuxSyscallOffloadResponse {

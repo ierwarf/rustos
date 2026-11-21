@@ -398,6 +398,8 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_PRCTL => {
             prctl_ops::syscall_linux_prctl(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
         }
+        linux_abi::SYS_CAPGET => prctl_ops::syscall_linux_capget(frame.rdi, frame.rsi),
+        linux_abi::SYS_CAPSET => prctl_ops::syscall_linux_capset(frame.rdi, frame.rsi),
         linux_abi::SYS_SET_TID_ADDRESS => syscall_linux_set_tid_address(frame.rdi),
         linux_abi::SYS_CLOCK_GETTIME => syscall_linux_clock_gettime(frame.rdi, frame.rsi),
         linux_abi::SYS_TIME => syscall_linux_time(frame.rdi),

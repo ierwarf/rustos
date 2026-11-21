@@ -1,0 +1,4 @@
+qtwayland5	qt5/plugins/platforms/libqwayland-generic.so
+qtwayland5	qt5/plugins/wayland-shell-integration/libxdg-shell.so
+qt6-wayland	qt6/plugins/platforms/libqwayland-generic.so
+qt6-wayland	qt6/plugins/wayland-shell-integration/libxdg-shell.so

@@ -38,6 +38,16 @@
   queue discard, peer exit, and service-epoch replacement release every queued
   batch. Destination FD numbers remain invisible reservations until data,
   control, and message-header copyout all succeed, then publish atomically.
+  A stream segment records the sending request's credentials (pid/uid/gid at
+  send time). One receive never spans two senders, merges plain sends only
+  when their sender matches, and reports the first segment's sender as
+  `SCM_CREDENTIALS` (never the connection creator's, which only `SO_PEERCRED`
+  reports). A receive that collects rights starts exactly at the segment
+  carrying them: plain bytes queued ahead are returned first as a short read,
+  because the kernel binds each rights ticket to the byte offset where its
+  send began and compares it with the receive's start offset.
+  `SO_RCVTIMEO` on a local socket is stored and reported by netd and is the
+  blocking-receive bound the kernel applies.
   Local `recvmsg` snapshots options/credentials, sizes the complete reply,
   dequeues and encodes under one netd state transaction; bounds rejection must
   precede byte/control movement. Ancillary admission charges aligned segment

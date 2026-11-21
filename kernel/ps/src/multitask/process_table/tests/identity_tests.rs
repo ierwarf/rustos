@@ -79,7 +79,10 @@ fn reaped_slot_reuse_changes_generation_and_rejects_every_stale_bearer() {
     assert_ne!(replacement.generation(), stale.generation());
     assert!(!process_state_is_visible(stale));
     assert!(retain_process(stale).is_none());
-    assert!(attach_task(stale).is_none());
+    assert_eq!(
+        attach_task(stale),
+        Err(crate::multitask::SpawnTaskError::ProcessExiting)
+    );
 
     detach_task(replacement).expect("retire replacement");
     assert_eq!(reap_exited_processes(), 1);

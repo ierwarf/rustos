@@ -10,6 +10,7 @@ use boot_protocol::{
 };
 use fatfs::Seek as FatSeek;
 use fatfs::Write as FatWrite;
+use rustos_user_abi::application_request::ApplicationRequest;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
@@ -97,27 +98,33 @@ const DEFAULT_RUNTIME_ASSET_FILES: &[&str] = &[
     "/system/registry/system/startup-programs.tsv",
     "/system/registry/system/runtime-launch-programs.tsv",
 ];
-/// Environment for the init scope (services started by initd).
-const DEFAULT_INIT_ENV: &[(&str, &str)] = &[
-    ("PATH", "/bin:/usr/bin:/usr/local/bin"),
-    ("HOME", "/home/user"),
-    ("XDG_RUNTIME_DIR", "/run/user/1000"),
-    ("WAYLAND_DISPLAY", "wayland-0"),
-];
+/// Environment for the init scope (services started by initd). initd has no
+/// launch profile to resolve against, so this scope is literal-only (the
+/// registry loader rejects placeholders here). Nothing in it names a user,
+/// profile or session directory: the only init-launched program that needs a
+/// session (uiserver) is launched by runtimed and receives the `runtime` scope.
+const DEFAULT_INIT_ENV: &[(&str, &str)] = &[("PATH", "/bin:/usr/bin:/usr/local/bin")];
 /// Single source of truth for the default environment of every
 /// runtimed-launched application. Staged into `runtime-env.tsv`; runtimed's
-/// spawn path merges it under per-catalog-entry `env` (entry wins). HOME and
-/// the XDG dirs live on the writable `/data` partition; `/tmp` and
-/// `/run/user/1000` are tmpfs-class paths owned by vfsd.
+/// spawn path merges it under per-catalog-entry `env` (entry wins).
+///
+/// Values are *templates* (`session-profile` grammar), never resolved facts:
+/// the image builder cannot know whether the target has a writable persistent
+/// volume or which uid a launch runs as. runtimed resolves `{profile_root}`
+/// (persistent `/data` when it works, else a verified per-uid TmpFs directory),
+/// `{runtime_dir}` (`/run/user/<launch uid>`), `{temp_dir}` and
+/// `{wayland_display}` per launch and creates every directory they name
+/// (`docs/ai/abi/prebuilt-runtime.md`). `PATH`, `LANG`, `XDG_SESSION_TYPE` and
+/// `XDG_CURRENT_DESKTOP` are platform identity strings with no runtime fact.
 const DEFAULT_RUNTIME_ENV: &[(&str, &str)] = &[
     ("PATH", "/bin:/usr/bin:/usr/local/bin"),
-    ("HOME", "/data/home"),
-    ("XDG_CONFIG_HOME", "/data/config"),
-    ("XDG_CACHE_HOME", "/data/cache"),
-    ("XDG_RUNTIME_DIR", "/run/user/1000"),
-    ("TMPDIR", "/tmp"),
+    ("HOME", "{profile_root}/home"),
+    ("XDG_CONFIG_HOME", "{profile_root}/config"),
+    ("XDG_CACHE_HOME", "{profile_root}/cache"),
+    ("XDG_RUNTIME_DIR", "{runtime_dir}"),
+    ("TMPDIR", "{temp_dir}"),
     ("LANG", "C.UTF-8"),
-    ("WAYLAND_DISPLAY", "wayland-0"),
+    ("WAYLAND_DISPLAY", "{wayland_display}"),
     ("XDG_SESSION_TYPE", "wayland"),
     ("XDG_CURRENT_DESKTOP", "RustOS"),
 ];
@@ -942,7 +949,7 @@ fn write_application_desktop_files(config: &Config, manifests: &[PackageManifest
                 entry.args.clone()
             };
             let content = format!(
-                "[Desktop Entry]\nType=Application\nName={name}\nExec={exec_line}\nTerminal={terminal}\nOnlyShowIn=RustOS;\nNoDisplay={no_display}\nX-RustOS-DesktopId={desktop_id}\nX-RustOS-PackageId={package_id}\nX-RustOS-Startup={startup}\nX-RustOS-Deps={deps}\nX-RustOS-WeightMicros={weight}\nX-RustOS-LogicalAdmin={logical_admin}\nX-RustOS-ConsoleHosted={console_hosted}\nX-RustOS-Argv={argv}\nX-RustOS-Env={env}\n",
+                "[Desktop Entry]\nType=Application\nName={name}\nExec={exec_line}\nTerminal={terminal}\nOnlyShowIn=RustOS;\nNoDisplay={no_display}\nX-RustOS-DesktopId={desktop_id}\nX-RustOS-PackageId={package_id}\nX-RustOS-Startup={startup}\nX-RustOS-Deps={deps}\nX-RustOS-WeightMicros={weight}\nX-RustOS-LogicalAdmin={logical_admin}\nX-RustOS-ConsoleHosted={console_hosted}\nX-RustOS-Argv={argv}\nX-RustOS-Env={env}\n{request}",
                 name = desktop_value(&entry.display_name)?,
                 exec_line = desktop_exec_line(&argv)?,
                 terminal = desktop_bool(entry.console_hosted),
@@ -959,12 +966,40 @@ fn write_application_desktop_files(config: &Config, manifests: &[PackageManifest
                 console_hosted = desktop_bool(entry.console_hosted),
                 argv = desktop_value(&join_registry_list(&entry.args)?)?,
                 env = desktop_value(&join_registry_list(&entry.env)?)?,
+                request = desktop_request_lines(&entry_application_request(manifest, entry)?),
             );
             fs::write(applications_dir.join(&desktop_file_id), content)?;
         }
     }
 
     Ok(())
+}
+
+/// The entry's Job request. Syntax was validated with the manifest; the request
+/// is carried as written and granted (or refused) by loaderd at launch.
+fn entry_application_request(
+    manifest: &PackageManifest,
+    entry: &crate::package_manifest::DesktopEntrySpec,
+) -> Result<ApplicationRequest> {
+    entry
+        .application_request()
+        .with_context(|| format!("package {} desktop entry {:?}", manifest.id, entry.display_name))
+}
+
+/// Desktop-file spelling of a request: a key only for a requested dimension, so
+/// an absent key means "derived default" and a zero is never written.
+fn desktop_request_lines(request: &ApplicationRequest) -> String {
+    let mut lines = String::new();
+    for (key, value) in [
+        ("X-RustOS-RequestProcesses", request.processes),
+        ("X-RustOS-RequestThreads", request.threads),
+        ("X-RustOS-RequestMemoryPagesPerProcess", request.memory_pages_per_process),
+    ] {
+        if value != 0 {
+            lines.push_str(&format!("{key}={value}\n"));
+        }
+    }
+    lines
 }
 
 fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
@@ -1009,8 +1044,9 @@ fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Res
                 manifest.kind == crate::package_manifest::PackageKind::Service || entry.no_display;
             let autostart_enabled = desktop_autostart_enabled(config, &desktop_id)?;
             let deps = registry_deps(&manifest.runtime_deps)?;
+            let request = entry_application_request(manifest, entry)?;
             lines.push(format!(
-                "desktop_id={}\tpackage_id={}\tstartup={}\tdisplay_name={}\timage={}\texec={}\tweight={}\tlogical_admin={}\tconsole_hosted={}\tterminal={}\thidden=0\tno_display={}\tautostart_enabled={}\tlaunch={}\tdeps={}\targs={}\tenv={}",
+                "desktop_id={}\tpackage_id={}\tstartup={}\tdisplay_name={}\timage={}\texec={}\tweight={}\tlogical_admin={}\tconsole_hosted={}\tterminal={}\thidden=0\tno_display={}\tautostart_enabled={}\tlaunch={}\tdeps={}\targs={}\tenv={}\trequest_processes={}\trequest_threads={}\trequest_memory_pages={}",
                 registry_value(&desktop_id)?,
                 registry_value(&manifest.id)?,
                 startup,
@@ -1027,6 +1063,9 @@ fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Res
                 deps,
                 args,
                 env,
+                request.processes,
+                request.threads,
+                request.memory_pages_per_process,
             ));
         }
     }
@@ -1079,8 +1118,9 @@ fn write_runtime_launch_registry(config: &Config, manifests: &[PackageManifest])
             let no_display =
                 manifest.kind == crate::package_manifest::PackageKind::Service || entry.no_display;
             let deps = registry_deps(&manifest.runtime_deps)?;
+            let request = entry_application_request(manifest, entry)?;
             lines.push(format!(
-                "desktop_id={}\tpackage_id={}\tstartup={}\tdisplay_name={}\timage={}\texec={}\tweight={}\tlogical_admin={}\tconsole_hosted={}\tterminal={}\thidden=0\tno_display={}\tautostart_enabled={}\tlaunch={}\tdeps={}\targs={}\tenv={}",
+                "desktop_id={}\tpackage_id={}\tstartup={}\tdisplay_name={}\timage={}\texec={}\tweight={}\tlogical_admin={}\tconsole_hosted={}\tterminal={}\thidden=0\tno_display={}\tautostart_enabled={}\tlaunch={}\tdeps={}\targs={}\tenv={}\trequest_processes={}\trequest_threads={}\trequest_memory_pages={}",
                 registry_value(&desktop_id)?,
                 registry_value(&manifest.id)?,
                 desktop_startup_mode(startup_mode),
@@ -1097,6 +1137,9 @@ fn write_runtime_launch_registry(config: &Config, manifests: &[PackageManifest])
                 deps,
                 args,
                 env,
+                request.processes,
+                request.threads,
+                request.memory_pages_per_process,
             ));
         }
     }
@@ -1335,6 +1378,13 @@ fn push_runtime_env_scope(
     entries: &[(&str, &str)],
 ) -> Result<()> {
     for (key, value) in entries {
+        // A malformed template would otherwise only surface as a failed launch
+        // on the target: reject it at build time with the same grammar.
+        let template = session_profile::Template::parse(value)
+            .map_err(|error| anyhow!("runtime env {scope}/{key}={value:?}: {error}"))?;
+        if scope == "init" && !template.is_literal() {
+            bail!("runtime env {scope}/{key}={value:?}: placeholders are not allowed in the init scope");
+        }
         lines.push(format!(
             "scope={}\tkey={}\tvalue={}",
             registry_value(scope)?,
@@ -1621,6 +1671,120 @@ mod tests {
     use fatfs::{Seek as _, Write as _};
     use std::fs::{self, OpenOptions};
     use std::path::Path;
+
+    #[test]
+    fn staged_runtime_env_registry_holds_templates_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::from_env().unwrap();
+        config.image_dir = temp.path().join("image");
+        super::write_runtime_env_registry(&config).unwrap();
+        let text = fs::read_to_string(config.image_dir.join(super::RUNTIME_ENV_REGISTRY_PATH)).unwrap();
+        let rows: Vec<(&str, &str, &str)> = text
+            .lines()
+            .map(|line| {
+                let mut fields = line.split('\t').map(|field| field.split_once('=').unwrap().1);
+                (fields.next().unwrap(), fields.next().unwrap(), fields.next().unwrap())
+            })
+            .collect();
+        // No resolved uid, profile path or volume assumption reaches the image.
+        for (scope, key, value) in &rows {
+            assert!(!value.contains("/data"), "{scope}/{key}={value}");
+            assert!(!value.contains("/run/user"), "{scope}/{key}={value}");
+            assert!(!value.contains("1000"), "{scope}/{key}={value}");
+            assert!(!value.contains("/tmp"), "{scope}/{key}={value}");
+            assert!(!value.contains("wayland-0"), "{scope}/{key}={value}");
+        }
+        let get = |scope: &str, key: &str| {
+            rows.iter().find(|row| row.0 == scope && row.1 == key).map(|row| row.2)
+        };
+        assert_eq!(get("runtime", "HOME"), Some("{profile_root}/home"));
+        assert_eq!(get("runtime", "XDG_CONFIG_HOME"), Some("{profile_root}/config"));
+        assert_eq!(get("runtime", "XDG_CACHE_HOME"), Some("{profile_root}/cache"));
+        assert_eq!(get("runtime", "XDG_RUNTIME_DIR"), Some("{runtime_dir}"));
+        assert_eq!(get("runtime", "TMPDIR"), Some("{temp_dir}"));
+        assert_eq!(get("runtime", "WAYLAND_DISPLAY"), Some("{wayland_display}"));
+        assert!(rows.iter().filter(|row| row.0 == "init").all(|row| !row.2.contains('{')));
+    }
+
+    #[test]
+    fn default_env_tables_use_only_known_placeholders() {
+        for (key, value) in super::DEFAULT_RUNTIME_ENV.iter().chain(super::DEFAULT_INIT_ENV) {
+            session_profile::Template::parse(value)
+                .unwrap_or_else(|error| panic!("{key}={value}: {error}"));
+        }
+        // The staging step refuses an unknown placeholder or an init-scope one.
+        let mut lines = Vec::new();
+        assert!(super::push_runtime_env_scope(&mut lines, "runtime", &[("K", "/run/user/{uid}")]).is_err());
+        assert!(super::push_runtime_env_scope(&mut lines, "runtime", &[("K", "{runtime_dir")]).is_err());
+        assert!(super::push_runtime_env_scope(&mut lines, "init", &[("K", "{runtime_dir}")]).is_err());
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn every_package_manifest_env_value_is_a_valid_template() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for manifest in crate::package_manifest::load_manifests(&root).unwrap() {
+            for entry in &manifest.desktop.entries {
+                for item in &entry.env {
+                    let (key, value) = item.split_once('=').unwrap_or((item, ""));
+                    session_profile::Template::parse(value)
+                        .unwrap_or_else(|error| panic!("{}: {key}: {error}", manifest.id));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_manifest_job_request_round_trips_through_both_registries_to_the_runtime_readers() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::from_env().unwrap();
+        config.image_dir = temp.path().join("image");
+        config.artifact_dir = temp.path().join("artifacts");
+        let mut manifest: crate::package_manifest::PackageManifest = toml::from_str(
+            include_str!("../../../../apps/chrome/RUSTOS.package.toml.example"),
+        ).unwrap();
+        // A session-startup entry is the one the runtime-launch registry keeps.
+        manifest.startup = super::StartupMode::Session;
+        let artifact = manifest.artifact_path(&config);
+        std::fs::create_dir_all(&artifact).unwrap();
+        std::fs::write(artifact.join("chrome"), b"browser fixture").unwrap();
+        let manifests = [manifest];
+        super::write_application_desktop_files(&config, &manifests).unwrap();
+        super::write_desktop_registry(&config, &manifests).unwrap();
+        super::write_runtime_launch_registry(&config, &manifests).unwrap();
+        let declared = runtime_control::ApplicationRequest {
+            processes: 24,
+            threads: 144,
+            memory_pages_per_process: 0,
+        };
+        let applications = config.image_dir.join(super::APPLICATIONS_DIR);
+        let from_desktop =
+            runtime_control::load_desktop_program_entries(applications.to_str().unwrap()).unwrap();
+        assert_eq!(from_desktop.len(), 1);
+        assert_eq!(from_desktop[0].application_request, declared);
+        let registry = config.image_dir.join(super::RUNTIME_LAUNCH_REGISTRY_PATH);
+        let from_registry =
+            runtime_control::load_runtime_launch_program_entries(registry.to_str().unwrap())
+                .unwrap();
+        assert_eq!(from_registry.len(), 1);
+        assert_eq!(from_registry[0].application_request, declared);
+        // A package that requests nothing is written as zeros / absent keys and
+        // reads back as "derived defaults".
+        let mut plain = manifests[0].clone();
+        plain.desktop.entries[0].request_processes = None;
+        plain.desktop.entries[0].request_threads = None;
+        let plain = [plain];
+        super::write_application_desktop_files(&config, &plain).unwrap();
+        super::write_runtime_launch_registry(&config, &plain).unwrap();
+        let text = std::fs::read_to_string(applications.join("chrome.desktop")).unwrap();
+        assert!(!text.contains("X-RustOS-Request"), "{text}");
+        let from_registry =
+            runtime_control::load_runtime_launch_program_entries(registry.to_str().unwrap())
+                .unwrap();
+        assert!(!from_registry[0].application_request.is_declared());
+        assert!(std::fs::read_to_string(&registry).unwrap()
+            .contains("request_processes=0\trequest_threads=0\trequest_memory_pages=0"));
+    }
 
     #[test]
     fn imported_chrome_is_visible_without_any_boot_launch_entry() {

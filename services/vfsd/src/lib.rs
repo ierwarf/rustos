@@ -1313,6 +1313,49 @@ mod tests {
     }
 
     #[test]
+    fn storage_geometry_uses_the_reported_block_size_with_512_byte_capacity_sectors() {
+        // The storage DVM reports the block size it read from the device
+        // (virtio-blk harness disk: 512; legacy optical media: 2048; native
+        // 4Kn disks: 4096). Admission derives the block count from that
+        // reported size, never from a constant, and capacity stays in
+        // 512-byte protocol sectors.
+        for (block_size, sectors_per_block) in [(512_u32, 1_u64), (2048, 4), (4096, 8)] {
+            let info = DvmBlockInfoWire {
+                generation: 3,
+                capacity_sectors: 8192,
+                logical_block_size: block_size,
+                physical_block_size: block_size,
+                flags: 1,
+                ..DvmBlockInfoWire::default()
+            };
+            assert_eq!(
+                admit_dvm_block_geometry(info, 3, 8192, 64 * 1024, 1),
+                Ok((block_size as usize, 8192 / sectors_per_block))
+            );
+            // A capacity that is not a whole number of the reported blocks is
+            // a fabricated geometry for that block size.
+            if block_size > 512 {
+                let ragged = DvmBlockInfoWire {
+                    capacity_sectors: 8193,
+                    ..info
+                };
+                assert!(admit_dvm_block_geometry(ragged, 3, 8193, 64 * 1024, 1).is_err());
+            }
+        }
+        // A physical block size smaller than or not a multiple of the logical
+        // one is rejected regardless of the logical size.
+        let info = DvmBlockInfoWire {
+            generation: 3,
+            capacity_sectors: 8192,
+            logical_block_size: 4096,
+            physical_block_size: 512,
+            flags: 1,
+            ..DvmBlockInfoWire::default()
+        };
+        assert!(admit_dvm_block_geometry(info, 3, 8192, 64 * 1024, 1).is_err());
+    }
+
+    #[test]
     fn broker_status_preserves_recoverable_storage_failures() {
         assert_eq!(
             storage_error_from_linux_status(-4),

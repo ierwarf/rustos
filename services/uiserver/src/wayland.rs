@@ -81,7 +81,7 @@ use self::data_device::{DataDeviceResource, DragState, Selection};
 use self::snapshot::{SnapshotLayout, SnapshotPixels, SnapshotService, SnapshotSpec};
 use self::viewport::ViewportState;
 
-const WAYLAND_SOCKET_NAME: &str = "wayland-0";
+use rustos_user_abi::desktop_session::{RuntimeDir, WAYLAND_SOCKET_NAME};
 const LINUX_BTN_LEFT: u32 = 0x110;
 const LINUX_BTN_RIGHT: u32 = 0x111;
 const LINUX_BTN_MIDDLE: u32 = 0x112;
@@ -687,12 +687,20 @@ fn set_fd_nonblocking(fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The session directory the compositor socket lives in. runtimed hands every
+/// launch an `XDG_RUNTIME_DIR` derived from the launch uid with the same
+/// `RuntimeDir`; when it is absent or unsafe this derives it from this
+/// process's own uid, so the clients (same uid, same derivation) still agree.
 fn current_runtime_dir() -> String {
-    const FALLBACK_RUNTIME_DIR: &str = "/run/user/1000";
-    std::env::var("XDG_RUNTIME_DIR")
-        .ok()
+    // SAFETY: `getuid` takes no arguments, touches no memory and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    runtime_dir_from(std::env::var("XDG_RUNTIME_DIR").ok(), uid)
+}
+
+fn runtime_dir_from(advertised: Option<String>, uid: u32) -> String {
+    advertised
         .filter(|value| safe_runtime_dir(value.as_str()))
-        .unwrap_or_else(|| String::from(FALLBACK_RUNTIME_DIR))
+        .unwrap_or_else(|| RuntimeDir(uid).to_string())
 }
 
 fn bind_wayland_listener(runtime_dir: &str, socket_path: &str) -> std::io::Result<UnixListener> {

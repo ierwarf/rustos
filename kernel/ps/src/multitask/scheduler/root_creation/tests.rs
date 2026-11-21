@@ -862,7 +862,7 @@ fn fork_publication_quota_refusals_preserve_parent_and_rollback_root_custody() {
         let result = construct(ID + 2, Input::State(state()), bootstrap(UserAbi::Linux), Some(ID),
             119, 0x23, 0x1b, 0x202, true, reservation, actor, &admission, turn,
             |_| 1, |_, _| panic!("process quota refusal reached publication"));
-        assert_eq!(result, Err(crate::multitask::SpawnTaskError::NoFreeTaskSlot));
+        assert_eq!(result, Err(crate::multitask::SpawnTaskError::ProcessLimit));
         assert!(!process_table::cancel_spawn(reservation));
         assert!(!stack_resources::allocated(1));
         assert!(process_table::retain_process(parent).is_some());

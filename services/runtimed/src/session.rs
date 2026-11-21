@@ -697,6 +697,7 @@ fn spawn_ui_server_once(state: &mut BrokerState) -> Result<(), i32> {
         console_hosted: false,
         args,
         env,
+        application_request: crate::UI_SERVER_APPLICATION_REQUEST,
         private_smp_qualification: None,
     };
     super::spawn::spawn_tracked_process(state, entry)

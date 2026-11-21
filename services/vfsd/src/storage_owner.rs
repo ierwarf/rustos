@@ -73,6 +73,7 @@ pub(crate) struct VfsStorage {
     /// without re-reading the storage DVM on every process launch.
     pub(crate) executable_snapshot_cache: BTreeMap<CacheKey, ExecutableSnapshot>,
     pub(crate) executable_snapshot_cache_bytes: usize,
+    pub(crate) executable_snapshot_cache_seq: u64,
     /// Per-canonical-node open reference count, live length, and deferred
     /// unlink state for backends where `!supports_unlink_while_open`.
     pub(crate) open_nodes: BTreeMap<CacheKey, OpenNodeState>,
@@ -96,6 +97,7 @@ impl VfsStorage {
             read_map_bytes: 0,
             executable_snapshot_cache: BTreeMap::new(),
             executable_snapshot_cache_bytes: 0,
+            executable_snapshot_cache_seq: 0,
             open_nodes: BTreeMap::new(),
             mount_generation: 1,
             dvm_storage_epoch: 0,
@@ -351,6 +353,8 @@ pub(crate) fn open_executable_snapshot(
     window.resize(window_bytes, 0);
     let mut digest = Sha256::new();
     let mut hash_ns = 0u64;
+    let bulk_before = crate::block::bulk_read_counters();
+    let _ = crate::block::take_bulk_read_max_nanos();
     let transfer = transfer_exact(&mut reader, &mut writer, &mut window,
         |bytes| {
             control.progress(bytes);
@@ -366,9 +370,12 @@ pub(crate) fn open_executable_snapshot(
     );
     if let Err(error) = &transfer { control.progress(error.completed_bytes); }
     if file_len > 128 * 1024 * 1024 {
-        ipc::debug_line(&format!("vfsd: snapshot transfer path={path} completed={} read_us={} write_us={} hash_us={} status={}",
+        let bulk = crate::block::bulk_read_counters().since(bulk_before);
+        ipc::debug_line(&format!("vfsd: snapshot transfer path={path} completed={} read_us={} write_us={} hash_us={} storaged_calls={} storaged_us={} storaged_max_us={} status={}",
             control.completed_bytes(), reader.read_ns / 1000, writer.write_ns() / 1000,
-            hash_ns / 1000, transfer.as_ref().err().map_or(0, transfer_errno)));
+            hash_ns / 1000, bulk.calls, bulk.nanos / 1000,
+            crate::block::take_bulk_read_max_nanos() / 1000,
+            transfer.as_ref().err().map_or(0, transfer_errno)));
     }
     transfer.map_err(|error| transfer_errno(&error))?;
     let snapshot = writer.seal(plan.mount_generation)?;

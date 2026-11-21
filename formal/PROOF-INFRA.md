@@ -70,7 +70,8 @@ not a bug. Keep it in `CONFORMANCE.md` until it is resolved.
   `contracts.toml` and has a hard 120-second aggregate wall budget; it preserves
   their model constants
   and fails rather than silently lowering the configured finite state space.
-  A PR or SMP-iteration pass is reusable for 24 hours only when the exact TLA/CFG hashes, pinned
+  A PR pass is reusable for up to 168 hours (24 hours for SMP-iteration or shared
+  cross-profile reuse) only when the exact TLA/CFG hashes, pinned
   tool, registry deadlock policy, and execution policy match; all misses run
   normally. Their reciprocal profile allow-list permits one exact completed
   result to satisfy the other for shared models, avoiding duplicate exhaustive

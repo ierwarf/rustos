@@ -214,6 +214,172 @@ pub(super) fn syscall_linux_prctl(option: u64, a2: u64, a3: u64, a4: u64, a5: u6
     }
 }
 
+const CAP_WORDS_V1: usize = 1;
+const CAP_WORDS_V3: usize = 2;
+
+fn cap_version_words(version: u32) -> Option<usize> {
+    match version {
+        linux_abi::LINUX_CAPABILITY_VERSION_1 => Some(CAP_WORDS_V1),
+        linux_abi::LINUX_CAPABILITY_VERSION_2 | linux_abi::LINUX_CAPABILITY_VERSION_3 => {
+            Some(CAP_WORDS_V3)
+        }
+        _ => None,
+    }
+}
+
+fn target_matches_caller(pid: i32) -> Result<bool, i64> {
+    if pid < 0 {
+        return Err(LINUX_EINVAL);
+    }
+    if pid == 0 {
+        return Ok(true);
+    }
+    let target = pid as u64;
+    Ok(multitask::current_user_process_id() == Some(target)
+        || multitask::current_user_thread_id() == Some(target))
+}
+
+fn encode_cap_data(caps: multitask::LinuxCapabilities, words: usize) -> [linux_abi::LinuxCapUserData; 2] {
+    let low = linux_abi::LinuxCapUserData {
+        effective: caps.effective as u32,
+        permitted: caps.permitted as u32,
+        inheritable: caps.inheritable as u32,
+    };
+    let high = if words == CAP_WORDS_V3 {
+        linux_abi::LinuxCapUserData {
+            effective: (caps.effective >> 32) as u32,
+            permitted: (caps.permitted >> 32) as u32,
+            inheritable: (caps.inheritable >> 32) as u32,
+        }
+    } else {
+        linux_abi::LinuxCapUserData::default()
+    };
+    [low, high]
+}
+
+fn decode_cap_data(data: &[linux_abi::LinuxCapUserData], words: usize) -> multitask::LinuxCapabilities {
+    let (eff_hi, perm_hi, inh_hi) = if words == CAP_WORDS_V3 {
+        (
+            u64::from(data[1].effective) << 32,
+            u64::from(data[1].permitted) << 32,
+            u64::from(data[1].inheritable) << 32,
+        )
+    } else {
+        (0, 0, 0)
+    };
+    multitask::LinuxCapabilities {
+        effective: u64::from(data[0].effective) | eff_hi,
+        permitted: u64::from(data[0].permitted) | perm_hi,
+        inheritable: u64::from(data[0].inheritable) | inh_hi,
+    }
+}
+
+fn read_cap_header(hdr_ptr: u64) -> Result<linux_abi::LinuxCapUserHeader, i64> {
+    if hdr_ptr == 0 {
+        return Err(LINUX_EFAULT);
+    }
+    usermem::read_current_user_struct::<linux_abi::LinuxCapUserHeader>(hdr_ptr)
+        .map_err(user_pointer_error_to_linux_errno)
+}
+
+fn write_preferred_cap_version(hdr_ptr: u64, mut hdr: linux_abi::LinuxCapUserHeader) -> Result<(), i64> {
+    hdr.version = linux_abi::LINUX_CAPABILITY_VERSION_3;
+    let mut bytes = [0_u8; 8];
+    bytes[0..4].copy_from_slice(&hdr.version.to_ne_bytes());
+    bytes[4..8].copy_from_slice(&hdr.pid.to_ne_bytes());
+    usermem::validate_current_user_write_buffer(hdr_ptr, bytes.len())
+        .map_err(user_pointer_error_to_linux_errno)?;
+    usermem::write_current_user_bytes(hdr_ptr, &bytes).map_err(user_pointer_error_to_linux_errno)
+}
+
+pub(super) fn syscall_linux_capget(hdr_ptr: u64, data_ptr: u64) -> u64 {
+    let hdr = match read_cap_header(hdr_ptr) {
+        Ok(hdr) => hdr,
+        Err(errno) => return linux_errno(errno),
+    };
+    let Some(words) = cap_version_words(hdr.version) else {
+        if let Err(errno) = write_preferred_cap_version(hdr_ptr, hdr) {
+            return linux_errno(errno);
+        }
+        return if data_ptr == 0 {
+            0
+        } else {
+            linux_errno(LINUX_EINVAL)
+        };
+    };
+    if data_ptr == 0 {
+        return 0;
+    }
+    let is_self = match target_matches_caller(hdr.pid) {
+        Ok(value) => value,
+        Err(errno) => return linux_errno(errno),
+    };
+    let caps = if is_self {
+        multitask::with_current_process_credentials(|security| security.capabilities())
+    } else {
+        multitask::with_process_state_by_pid(hdr.pid as u64, |state| state.security().capabilities())
+    };
+    let Some(caps) = caps else {
+        return linux_errno(LINUX_ESRCH);
+    };
+    let encoded = encode_cap_data(caps, words);
+    let mut raw = [0_u8; 24];
+    for (idx, word) in encoded[..words].iter().enumerate() {
+        let base = idx * 12;
+        raw[base..base + 4].copy_from_slice(&word.effective.to_ne_bytes());
+        raw[base + 4..base + 8].copy_from_slice(&word.permitted.to_ne_bytes());
+        raw[base + 8..base + 12].copy_from_slice(&word.inheritable.to_ne_bytes());
+    }
+    let byte_len = words * 12;
+    if let Err(err) = usermem::validate_current_user_write_buffer(data_ptr, byte_len) {
+        return linux_errno(user_pointer_error_to_linux_errno(err));
+    }
+    match usermem::write_current_user_bytes(data_ptr, &raw[..byte_len]) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
+    }
+}
+
+pub(super) fn syscall_linux_capset(hdr_ptr: u64, data_ptr: u64) -> u64 {
+    let hdr = match read_cap_header(hdr_ptr) {
+        Ok(hdr) => hdr,
+        Err(errno) => return linux_errno(errno),
+    };
+    let Some(words) = cap_version_words(hdr.version) else {
+        let _ = write_preferred_cap_version(hdr_ptr, hdr);
+        return linux_errno(LINUX_EINVAL);
+    };
+    if data_ptr == 0 {
+        return linux_errno(LINUX_EFAULT);
+    }
+    let mut raw = [linux_abi::LinuxCapUserData::default(); 2];
+    for (index, slot) in raw[..words].iter_mut().enumerate() {
+        let item_ptr = match data_ptr.checked_add((index * size_of::<linux_abi::LinuxCapUserData>()) as u64) {
+            Some(ptr) => ptr,
+            None => return linux_errno(LINUX_EFAULT),
+        };
+        *slot = match usermem::read_current_user_struct::<linux_abi::LinuxCapUserData>(item_ptr) {
+            Ok(data) => data,
+            Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
+        };
+    }
+    match target_matches_caller(hdr.pid) {
+        Ok(true) => {}
+        Ok(false) => return linux_errno(LINUX_EPERM),
+        Err(_) => return linux_errno(LINUX_EPERM),
+    }
+    let requested = decode_cap_data(&raw, words);
+    let updated = multitask::with_current_user_process_state_mut(|_, _, state| {
+        state.set_capabilities(requested)
+    })
+    .unwrap_or(false);
+    if updated {
+        0
+    } else {
+        linux_errno(LINUX_EPERM)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +469,52 @@ mod tests {
         assert_eq!(chunk_len(0x1000, 0), 15);
         assert_eq!(chunk_len(0x1000 - 20, 0), 15);
         assert_eq!(chunk_len(0x1000 - 20, 14), 1);
+    }
+
+    #[test]
+    fn cap_versions_and_subset_transitions_enforce_linux_abi() {
+        assert_eq!(cap_version_words(linux_abi::LINUX_CAPABILITY_VERSION_1), Some(1));
+        assert_eq!(cap_version_words(linux_abi::LINUX_CAPABILITY_VERSION_2), Some(2));
+        assert_eq!(cap_version_words(linux_abi::LINUX_CAPABILITY_VERSION_3), Some(2));
+        assert_eq!(cap_version_words(0), None);
+        assert_eq!(linux_abi::SYS_CAPGET, 125);
+        assert_eq!(linux_abi::SYS_CAPSET, 126);
+
+        let initial = multitask::LinuxCapabilities {
+            effective: 0x1_0000_0005,
+            permitted: 0x1_0000_0007,
+            inheritable: 0x0_0000_0008,
+        };
+        assert_eq!(
+            initial.restrict_to(multitask::LinuxCapabilities::EMPTY),
+            Some(multitask::LinuxCapabilities::EMPTY)
+        );
+        assert_eq!(
+            initial.restrict_to(multitask::LinuxCapabilities {
+                effective: 0x02,
+                permitted: 0x01,
+                inheritable: 0,
+            }),
+            None
+        );
+        assert_eq!(
+            initial.restrict_to(multitask::LinuxCapabilities {
+                effective: 0,
+                permitted: 0x10,
+                inheritable: 0,
+            }),
+            None
+        );
+
+        let encoded = encode_cap_data(initial, 2);
+        assert_eq!(decode_cap_data(&encoded, 2), initial);
+        assert_eq!(
+            decode_cap_data(&encoded, 1),
+            multitask::LinuxCapabilities {
+                effective: 0x5,
+                permitted: 0x7,
+                inheritable: 0x8,
+            }
+        );
     }
 }

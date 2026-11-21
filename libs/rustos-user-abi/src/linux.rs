@@ -126,6 +126,8 @@ raw_u64! {
     SYS_SIGALTSTACK = linux::__NR_sigaltstack;
     SYS_ARCH_PRCTL = linux::__NR_arch_prctl;
     SYS_PRCTL = linux::__NR_prctl;
+    SYS_CAPGET = linux::__NR_capget;
+    SYS_CAPSET = linux::__NR_capset;
     SYS_CLOCK_GETTIME = linux::__NR_clock_gettime;
     SYS_CLOCK_GETRES = linux::__NR_clock_getres;
     SYS_CLOCK_NANOSLEEP = linux::__NR_clock_nanosleep;
@@ -582,6 +584,27 @@ impl Default for LinuxSockaddrUn {
             sun_path: [0; UNIX_PATH_MAX],
         }
     }
+}
+
+raw_u32! {
+    LINUX_CAPABILITY_VERSION_1 = linux::_LINUX_CAPABILITY_VERSION_1;
+    LINUX_CAPABILITY_VERSION_2 = linux::_LINUX_CAPABILITY_VERSION_2;
+    LINUX_CAPABILITY_VERSION_3 = linux::_LINUX_CAPABILITY_VERSION_3;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinuxCapUserHeader {
+    pub version: u32,
+    pub pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinuxCapUserData {
+    pub effective: u32,
+    pub permitted: u32,
+    pub inheritable: u32,
 }
 
 #[repr(C)]
@@ -1715,6 +1738,7 @@ pub use crate::syscall::SYS_RUSTOS_JOB_POLICY;
 pub use crate::syscall::SYS_RUSTOS_JOB_SESSION;
 pub use crate::syscall::SYS_RUSTOS_JOB_MEMORY_QOS;
 pub use crate::syscall::SYS_RUSTOS_JOB_KMEM;
+pub use crate::syscall::SYS_RUSTOS_TASK_CAPACITY;
 pub use crate::syscall::SYS_RUSTOS_SERVICE_POLICY;
 pub use crate::syscall::SYS_RUSTOS_CHECKPOINT_JOURNAL;
 pub use crate::syscall::SYS_RUSTOS_ROOTD_MEMORY_BROKER;

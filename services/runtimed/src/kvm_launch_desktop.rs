@@ -260,6 +260,7 @@ fn start_launch(state: &mut BrokerState, id: String) -> bool {
         console_hosted: metadata.console_hosted,
         args: metadata.args,
         env: metadata.env,
+        application_request: metadata.application_request,
         private_smp_qualification: None,
     };
     match super::spawn::begin_tracked_launch(state, entry) {

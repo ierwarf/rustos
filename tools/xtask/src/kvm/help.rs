@@ -148,16 +148,18 @@ options:
                        standalone legacy surface or native-GPU path is accepted
   --dvm-network-shmem  attach the bounded RustOS↔DVM Ethernet ring; RustOS keeps
                        no native virtio-net device in this topology
-  --dvm-block-shmem    attach a private read-only ATAPI namespace to Linux DVM
-                       through its existing q35 AHCI controller and the fixed
-                       RustOS↔DVM block ring; RustOS receives no native storage
-                       controller
+  --dvm-block-shmem    attach a private read-only virtio-blk disk (512-byte
+                       blocks, queued, readonly=on) to Linux DVM as its only
+                       storage controller, and the fixed RustOS↔DVM block ring;
+                       the DVM machine carries no implicit AHCI controller and
+                       RustOS receives no native storage controller
   --storage-dvm-only   run the independent storage-DVM acceptance gate: enable
                        --dvm-block-shmem and require boot, both block peers,
                        first completion, and a read-only media barrier without
                        depending on UI, input, network, or GPU readiness markers
   --writable-storage   attach a GPT image (partition 1 boot RO + partition 2
-                       writable FAT32) via AHCI ide-hd instead of read-only CD
+                       writable FAT32) as the same virtio-blk device with a
+                       writable backing instead of the read-only disk
   --data-disk <path>   keep the writable /data partition in this image across
                        boots (implies --writable-storage; a missing file is
                        created, an existing image's data partition is carried

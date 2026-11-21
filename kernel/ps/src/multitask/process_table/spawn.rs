@@ -253,7 +253,7 @@ fn publish_inner(
     // fork inherits, and counts may have moved since an explicit job was checked.
     if !table.admits_process(object.job) {
         let (all, pending_free) = table.refusal_census(object.job.index());
-        return publish_refused(2, all, pending_free, super::super::SpawnTaskError::NoFreeTaskSlot);
+        return publish_refused(2, all, pending_free, super::super::SpawnTaskError::ProcessLimit);
     }
     // Bill the new process's descriptor slots to its job. The object is still
     // private, so no state lock is taken, and the charge is lock-free: a
@@ -368,6 +368,31 @@ mod tests {
             false,
             "/test.elf",
         )
+    }
+
+    #[test]
+    fn a_job_process_limit_refusal_is_typed_as_a_process_limit_not_a_full_task_table() {
+        use crate::multitask::process_table::jobs::{
+            job_create_child, job_set_limits, LimitMask, JobLimits, LIMIT_UNSET,
+        };
+        let _isolation = super::super::tests::isolate_process_table();
+        let job = job_create_child(jobs::ROOT_JOB).unwrap();
+        // The reservation is taken while the job still admits a process; the
+        // limit then drops to zero before publication, which is the race the
+        // authoritative publication check exists for.
+        let reservation = reserve_spawn_in(Some(job)).expect("job admits one process");
+        job_set_limits(
+            job,
+            LimitMask::PROCESSES,
+            JobLimits { processes: 0, threads: LIMIT_UNSET, memory_pages: LIMIT_UNSET },
+        )
+        .expect("lower the process limit");
+        let result = publish_inner(reservation, 5_099, None, new_state(), None);
+        assert_eq!(
+            result.err(),
+            Some(crate::multitask::SpawnTaskError::ProcessLimit)
+        );
+        assert!(cancel_spawn(reservation));
     }
 
     #[test]

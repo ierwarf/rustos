@@ -404,6 +404,8 @@ fn sparse_unmap_is_idempotent_and_protect_commit_still_require_coverage() {
             region.end,
             None,
             Some(VM_COMMIT_RESERVED),
+            MAX_PAGER_VMAS_PER_PROCESS,
+            build_default_vma_chunk,
             || panic!("commit state still requires complete coverage")
         ),
         Err(PagerVmaError::Stale)
@@ -498,6 +500,8 @@ fn reservation_commit_state_splits_and_gates_fault_access() {
             first_end,
             None,
             Some(VM_COMMIT_RESERVED),
+            MAX_PAGER_VMAS_PER_PROCESS,
+            build_default_vma_chunk,
             || Ok(()),
         ),
         Ok(true)
@@ -516,6 +520,8 @@ fn reservation_commit_state_splits_and_gates_fault_access() {
             first_end,
             None,
             Some(VM_COMMIT_COMMITTED),
+            MAX_PAGER_VMAS_PER_PROCESS,
+            build_default_vma_chunk,
             || Ok(()),
         ),
         Ok(true)
@@ -562,16 +568,21 @@ fn per_process_vma_bound_admits_product_envelope_and_rejects_the_next_region() {
     let _guard = guard();
     let handle = ProcessHandle::new(26, 71);
     let identity = identity(71, 73);
-    let mut published = [PagerVmRegionWire::default(); MAX_PAGER_VMAS_PER_PROCESS];
-    for (index, slot) in published.iter_mut().enumerate() {
-        let start = 0x40_000 + (index as u64) * PAGER_PAGE_BYTES * 2;
-        *slot = publish(
-            handle,
-            identity,
-            template(start),
-            MAX_PAGER_VMAS_PER_PROCESS,
-        )
+    let mut published = alloc::vec::Vec::new();
+    published
+        .try_reserve_exact(MAX_PAGER_VMAS_PER_PROCESS)
         .unwrap();
+    for index in 0..MAX_PAGER_VMAS_PER_PROCESS {
+        let start = 0x40_000 + (index as u64) * PAGER_PAGE_BYTES * 2;
+        published.push(
+            publish(
+                handle,
+                identity,
+                template(start),
+                MAX_PAGER_VMAS_PER_PROCESS,
+            )
+            .unwrap(),
+        );
     }
     assert_eq!(
         publish(
@@ -832,6 +843,13 @@ fn publication_reclaims_stale_process_generation_before_slot_reuse() {
         MAX_PAGER_VMAS_PER_PROCESS,
     )
     .expect("stale generation publication");
+    publish(
+        stale,
+        stale_identity,
+        template(0x4_0000),
+        MAX_PAGER_VMAS_PER_PROCESS,
+    )
+    .expect("second stale generation publication");
     super::super::process_table::detach_task(stale).expect("retire stale process");
     assert_eq!(super::super::process_table::reap_exited_processes(), 1);
 
@@ -1335,4 +1353,151 @@ fn relocation_moves_authority_atomically_and_refuses_an_occupied_destination() {
         relocate_range(handle, ProcessIdentity::from_parts(41, 96, 101), 0x100_0000, 0x100_0000 + page, 0x500_0000, || Ok(())),
         Err(PagerVmaError::Stale)
     );
+}
+
+#[test]
+fn vma_slots_grow_lazily_in_chunks_and_reuse_freed_slots() {
+    let _guard = guard();
+    let handle = ProcessHandle::new(30, 111);
+    let identity = identity(111, 113);
+    let slots = process_slots(handle).unwrap();
+    assert_eq!(slots.capacity(), 0, "new process must not preallocate VMA chunks");
+    assert_eq!(lookup(handle, identity, 0x40_000, VM_ACCESS_READ), Err(PagerVmaError::Stale));
+
+    let mut published = alloc::vec::Vec::new();
+    for index in 0..VMA_SLOT_CHUNK as u64 {
+        let start = 0x100_000 + index * PAGER_PAGE_BYTES * 2;
+        published.push(publish(handle, identity, template(start), MAX_PAGER_VMAS_PER_PROCESS).unwrap());
+    }
+    assert_eq!(slots.capacity(), VMA_SLOT_CHUNK);
+
+    // Revoke one slot and confirm a new publish reuses it without growing.
+    let reused_old = published.pop().unwrap();
+    revoke(handle, identity, reused_old.start, reused_old.vma_generation).unwrap();
+    let reused_new = publish(
+        handle,
+        identity,
+        template(0x100_000 + (VMA_SLOT_CHUNK as u64) * PAGER_PAGE_BYTES * 2),
+        MAX_PAGER_VMAS_PER_PROCESS,
+    )
+    .unwrap();
+    assert_eq!(slots.capacity(), VMA_SLOT_CHUNK);
+    published.push(reused_new);
+
+    // Next publish spills into chunk 2.
+    let spilled = publish(
+        handle,
+        identity,
+        template(0x100_000 + ((VMA_SLOT_CHUNK + 1) as u64) * PAGER_PAGE_BYTES * 2),
+        MAX_PAGER_VMAS_PER_PROCESS,
+    )
+    .unwrap();
+    assert_eq!(slots.capacity(), VMA_SLOT_CHUNK * 2);
+    published.push(spilled);
+
+    for region in published {
+        revoke(handle, identity, region.start, region.vma_generation).unwrap();
+    }
+}
+
+#[test]
+fn policy_ceiling_and_oom_fail_without_touching_existing_mappings() {
+    let _guard = guard();
+    let handle = ProcessHandle::new(31, 127);
+    let identity = identity(127, 131);
+    let slots = process_slots(handle).unwrap();
+    assert_eq!(slots.capacity(), 0);
+    let page = PAGER_PAGE_BYTES;
+
+    // Fill exactly one chunk (32 slots), each 3 pages wide so an interior split is valid.
+    let mut published = alloc::vec::Vec::new();
+    for index in 0..VMA_SLOT_CHUNK as u64 {
+        let start = 0x400_000 + index * page * 4;
+        published.push(
+            publish(handle, identity, wide_template(start, 3), VMA_SLOT_CHUNK).unwrap(),
+        );
+    }
+    assert_eq!(slots.capacity(), VMA_SLOT_CHUNK);
+    let before = published_spans(handle, identity);
+
+    // 1) Policy ceiling refuses both publish and interior split without growing or mutating.
+    let fail_build: fn() -> Option<VmaChunkBox> = || None;
+    assert_eq!(
+        publish(handle, identity, template(0x800_000), VMA_SLOT_CHUNK),
+        Err(PagerVmaError::Pressure)
+    );
+    let mut mutated = false;
+    assert_eq!(
+        rewrite_range(
+            handle,
+            identity,
+            published[0].start + page,
+            published[0].start + page * 2,
+            Some(VM_PROT_READ),
+            None,
+            VMA_SLOT_CHUNK,
+            build_default_vma_chunk,
+            || {
+                mutated = true;
+                Ok(())
+            },
+        ),
+        Err(PagerVmaError::Pressure)
+    );
+    assert!(!mutated);
+    assert_eq!(slots.capacity(), VMA_SLOT_CHUNK);
+    assert_eq!(published_spans(handle, identity), before);
+
+    // 2) Simulated OOM with a higher policy ceiling also refuses publish, split,
+    // and move growth without touching existing mappings or calling `mutate`.
+    assert_eq!(
+        publish_with_builder(
+            handle,
+            identity,
+            template(0x800_000),
+            MAX_PAGER_VMAS_PER_PROCESS,
+            fail_build,
+        ),
+        Err(PagerVmaError::Pressure)
+    );
+    assert_eq!(
+        rewrite_range(
+            handle,
+            identity,
+            published[0].start + page,
+            published[0].start + page * 2,
+            Some(VM_PROT_READ),
+            None,
+            MAX_PAGER_VMAS_PER_PROCESS,
+            fail_build,
+            || {
+                mutated = true;
+                Ok(())
+            },
+        ),
+        Err(PagerVmaError::Pressure)
+    );
+    assert_eq!(
+        relocate_range_with(
+            handle,
+            identity,
+            published[0].start + page,
+            published[0].start + page * 2,
+            0x900_000,
+            MAX_PAGER_VMAS_PER_PROCESS,
+            fail_build,
+            || {
+                mutated = true;
+                Ok(())
+            },
+        ),
+        Err(PagerVmaError::Pressure)
+    );
+    assert!(!mutated);
+    assert_eq!(slots.capacity(), VMA_SLOT_CHUNK);
+    assert_eq!(published_spans(handle, identity), before);
+    for region in published {
+        assert_eq!(lookup(handle, identity, region.start, VM_ACCESS_READ), Ok(region));
+        revoke(handle, identity, region.start, region.vma_generation).unwrap();
+    }
 }

@@ -17,6 +17,7 @@ rustos-image-admission = { path = "../../libs/rustos-image-admission" }
 rustos-library-cache-policy = { path = "../../libs/rustos-library-cache-policy" }
 rustos-release-verifier = { path = "../../libs/rustos-release-verifier" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }
+session-profile = { path = "../../libs/session-profile" }
 driver-domain-protocol = { path = "../../libs/driver-domain-protocol" }
 ed25519-dalek = "2"
 serde = { version = "1.0", features = ["derive"] }
@@ -27,3 +28,7 @@ storage-fat = { path = "../../libs/storage-fat" }
 tempfile = "3"
 toml = "0.8"
 walkdir = "2"
+
+[dev-dependencies]
+# Round-trip witness: what the stage writers emit is what runtime-control reads.
+runtime-control = { path = "../../libs/runtime-control" }

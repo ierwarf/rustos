@@ -214,12 +214,8 @@ pub(super) fn recvmsg_in_state(
         return libc::ENOTCONN;
     };
     let requested = request.payload_len as usize;
-    let credentials = socket
-        .options
-        .passcred
-        .then_some(connected.peer_credentials);
-    let control_len =
-        pending_recvmsg_control_len(connected, requested, credentials.is_some(), seqpacket);
+    let passcred = socket.options.passcred;
+    let control_len = pending_recvmsg_control_len(connected, requested, passcred, seqpacket);
     // Preflight the whole reply before moving bytes or ancillary custody. The
     // same state transaction owns options, queue selection, dequeue and encode.
     let Some(available) = response
@@ -236,6 +232,10 @@ pub(super) fn recvmsg_in_state(
         Ok(received) => {
             let (value, extra) = unix_seqpacket::receive_accounting(flags, &received);
             let truncated = received.truncated;
+            // SCM_CREDENTIALS names the process that performed the send, not
+            // the connection's creator: a zygote child answers on a socketpair
+            // its parent created, and the parent must see the child's pid.
+            let credentials = received.sender.filter(|_| passcred);
             let control = append_recvmsg_credentials(credentials, received.control);
             let control_start = data_start + received.read;
             let control_end = control_start + control.len();
@@ -291,6 +291,7 @@ pub(super) fn send_socket_message_in_state(
         };
         return if peer_connected.recv_closed { Err(libc::EPIPE) } else { Ok(0) };
     }
+    let sender = request_credentials(request);
     let control_charge = cmsg_align(control.len());
     if control_charge != 0 {
         if let Some(owner) = state
@@ -359,10 +360,14 @@ pub(super) fn send_socket_message_in_state(
     // extends the tail segment. Without this, one-byte sends would cost a
     // heap segment each (up to SOCKET_BUFFER_CAPACITY of them per socket).
     match peer_connected.incoming.back_mut() {
-        Some(tail) if control.is_empty() && !seqpacket => tail.bytes.extend(&bytes[..write_len]),
+        // Credentials are per send, so only one sender's bytes share a segment.
+        Some(tail) if control.is_empty() && !seqpacket && tail.sender == sender => {
+            tail.bytes.extend(&bytes[..write_len])
+        }
         _ => peer_connected.incoming.push_back(UnixStreamSegment {
             bytes: bytes[..write_len].iter().copied().collect(),
             control: control.to_vec(),
+            sender,
         }),
     }
     state.set_unix_queued_bytes(state.unix_queued_bytes + write_len + control_charge);
@@ -425,11 +430,21 @@ pub(super) fn recv_connected_bytes(
     let mut read = 0usize;
     let mut control = Vec::new();
     let mut discarded = Vec::new();
+    let mut sender = None;
     while read < dest.len() {
         let Some(segment) = connected.incoming.front_mut() else {
             break;
         };
-        if collect_control && !control.is_empty() && !segment.control.is_empty() {
+        // One receive reports one sender's credentials, as Linux does.
+        if sender.is_some_and(|first| first != segment.sender) {
+            break;
+        }
+        sender = Some(segment.sender);
+        // Ancillary data is bound to the byte offset where its send began (the
+        // kernel checks that offset against this receive's start), so a receive
+        // that wants control must begin exactly at the carrying segment. Plain
+        // bytes queued ahead of it are returned first, as a short read.
+        if collect_control && !segment.control.is_empty() && (read > 0 || !control.is_empty()) {
             break;
         }
         if !segment.control.is_empty() {
@@ -462,6 +477,7 @@ pub(super) fn recv_connected_bytes(
     }
     connected.recv_drain_handoff_armed = true;
     Ok(SocketReceive {
+        sender,
         read,
         control,
         discarded,
@@ -543,6 +559,10 @@ pub(super) fn append_recvmsg_credentials(credentials: Option<Credentials>, mut c
     let Some(peer_credentials) = credentials else {
         return control;
     };
+    if control_carries_credentials(&control) {
+        // The sender supplied an explicit ucred; Linux delivers exactly one.
+        return control;
+    }
     let cmsg_len = size_of::<linux_abi::LinuxCmsghdr>() + size_of::<linux_abi::LinuxUCred>();
     let start = cmsg_align(control.len());
     control.resize(start + cmsg_align(cmsg_len), 0);
@@ -566,6 +586,28 @@ pub(super) fn append_recvmsg_credentials(credentials: Option<Credentials>, mut c
     );
     control.truncate(start + cmsg_len);
     control
+}
+
+fn control_carries_credentials(control: &[u8]) -> bool {
+    let mut offset = 0usize;
+    while offset + size_of::<linux_abi::LinuxCmsghdr>() <= control.len() {
+        let Ok(header) = read_cmsghdr(&control[offset..]) else {
+            return false;
+        };
+        if header.cmsg_level == linux_abi::SOL_SOCKET as u32
+            && header.cmsg_type == linux_abi::SCM_CREDENTIALS as u32
+        {
+            return true;
+        }
+        let Ok(len) = usize::try_from(header.cmsg_len) else {
+            return false;
+        };
+        if len < size_of::<linux_abi::LinuxCmsghdr>() {
+            return false;
+        }
+        offset += cmsg_align(len);
+    }
+    false
 }
 
 pub(super) fn validate_sendmsg_control(control: &[u8]) -> Result<(), i32> {

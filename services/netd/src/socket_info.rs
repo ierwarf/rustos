@@ -124,6 +124,14 @@ pub(super) fn handle_getsockopt(request: &NetdIpcRequest, response: &mut NetdIpc
         linux_abi::SO_RCVBUF => socket.options.recv_buffer,
         linux_abi::SO_PASSCRED => socket.options.passcred as i32,
         linux_abi::SO_PEERCRED => return peercred_payload_from_socket(socket, response),
+        SO_RCVTIMEO => {
+            let (seconds, micros) = socket.options.recv_timeout;
+            response.payload[0..8].copy_from_slice(&seconds.to_ne_bytes());
+            response.payload[8..16].copy_from_slice(&micros.to_ne_bytes());
+            response.payload_len = TIMEVAL_SIZE as u32;
+            response.value = 0;
+            return 0;
+        }
         _ => return libc::EOPNOTSUPP,
     };
     response.payload[..size_of::<i32>()].copy_from_slice(&value.to_ne_bytes());
@@ -178,6 +186,9 @@ pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
     if request.arg1 != linux_abi::SOL_SOCKET {
         return inet_datagram::set_ip_option(request);
     }
+    if request.arg2 == SO_RCVTIMEO {
+        return set_local_receive_timeout(request);
+    }
     let Some(value) = request_i32_payload(request) else {
         return libc::EINVAL;
     };
@@ -213,6 +224,32 @@ pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
         linux_abi::SO_RCVBUF => socket.options.recv_buffer = clamp_socket_buffer(value),
         _ => return libc::EOPNOTSUPP,
     }
+    0
+}
+
+/// `SO_RCVTIMEO` of `SOL_SOCKET`. Only local sockets store it, because only
+/// their blocking receive honours it; inet sockets keep refusing the option.
+const SO_RCVTIMEO: u64 = 20;
+const TIMEVAL_SIZE: usize = 16;
+
+fn set_local_receive_timeout(request: &NetdIpcRequest) -> i32 {
+    if (request.payload_len as usize) < TIMEVAL_SIZE {
+        return libc::EINVAL;
+    }
+    let seconds = i64::from_ne_bytes(request.payload[0..8].try_into().unwrap_or_default());
+    let micros = i64::from_ne_bytes(request.payload[8..16].try_into().unwrap_or_default());
+    if !(0..1_000_000).contains(&micros) {
+        return libc::EDOM;
+    }
+    let mut state = lock_net_state();
+    if state.inet_sockets.contains_key(&request.socket_token) {
+        return libc::EOPNOTSUPP;
+    }
+    let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
+        return libc::EBADF;
+    };
+    // Linux treats a negative interval as zero (wait forever).
+    socket.options.recv_timeout = if seconds < 0 { (0, 0) } else { (seconds, micros) };
     0
 }
 

@@ -44,7 +44,19 @@ mod host_pressure;
 
 const DVM_KERNEL: &str = "rustos-linux-dvm-x86_64.bzImage";
 const DVM_ROOTFS: &str = "rustos-linux-dvm-x86_64.rootfs.cpio.zst";
-const DVM_BLOCK_MEDIA_BLOCK_BYTES: u32 = 2048;
+/// Block geometry the L0 harness declares for the storage-DVM virtual disk.
+///
+/// This is the single source for both halves of the admission contract: the
+/// `logical_block_size`/`physical_block_size` properties of the virtio-blk
+/// device QEMU presents (`dvm_storage_device_arg`) and the sizes in the signed
+/// transport header. The Linux relay reads the geometry back from the kernel
+/// (`BLKSSZGET`/`BLKPBSZGET`) and refuses a device that disagrees with the
+/// header, and RustOS consumers (kernel `dvm_block`, storaged, vfsd) use the
+/// header values, never a constant. Capacity stays in 512-byte protocol
+/// sectors whatever the logical block size. 512 matches the sector size of
+/// every staged volume image, so no read is widened to a larger media block.
+const DVM_STORAGE_LOGICAL_BLOCK_BYTES: u32 = 512;
+const DVM_STORAGE_PHYSICAL_BLOCK_BYTES: u32 = 512;
 const DVM_BLOCK_MEDIA_FEATURES: u64 = DVM_BLOCK_FEATURE_FLUSH;
 const DVM_CONFIG: &str = "rustos-linux-dvm-x86_64.config";
 const DVM_KERNEL_CONFIG: &str = "rustos-linux-dvm-x86_64.kernel.config";

@@ -19,4 +19,4 @@ weight_micros = 500
 console_hosted = true
 launch = "new-session"
 args = ["/apps/bc/bc", "-l"]
-env = ["HOME=/run/user/1000", "TERM=vt100"]
+env = ["HOME={runtime_dir}", "TERM=vt100"]

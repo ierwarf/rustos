@@ -269,7 +269,7 @@ pub fn syscall_linux_vfs_statx(
     mask: u64,
     statx_ptr: u64,
 ) -> u64 {
-    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
+    let path = match copy_current_user_path_allow_empty(path_ptr, VFS_IPC_PATH_CAPACITY) {
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
@@ -294,6 +294,9 @@ pub fn syscall_linux_vfs_statx_str(
     }
     if let Some(result) = super::local_fd::statx_at_empty_path(dirfd, &path, flags, statx_ptr) {
         return result;
+    }
+    if path.is_empty() && flags & linux_abi::AT_EMPTY_PATH == 0 {
+        return linux_errno(LINUX_ENOENT);
     }
     if let Err(err) = usermem::validate_current_user_write_buffer(statx_ptr, LINUX_STATX_SIZE) {
         return linux_errno(address_space_error_to_linux_errno(err));
@@ -329,7 +332,7 @@ pub fn syscall_linux_vfs_statx_str(
 }
 
 pub fn syscall_linux_vfs_newfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
-    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
+    let path = match copy_current_user_path_allow_empty(path_ptr, VFS_IPC_PATH_CAPACITY) {
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
@@ -344,6 +347,9 @@ pub fn syscall_linux_vfs_newfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, fl
     }
     if let Some(result) = super::local_fd::fstat_at_empty_path(dirfd, &path, flags, stat_ptr) {
         return result;
+    }
+    if path.is_empty() && flags & linux_abi::AT_EMPTY_PATH == 0 {
+        return linux_errno(LINUX_ENOENT);
     }
     if path.is_empty()
         && flags & linux_abi::AT_EMPTY_PATH != 0

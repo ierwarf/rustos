@@ -253,3 +253,47 @@ fn futex_op_validation_precedes_alignment_and_wake_op_validates_encoding() {
     );
     assert_eq!(futex_impl(2, 5, 0, 0, 0, 0), linux_errno(LINUX_EINVAL));
 }
+
+#[test]
+fn thread_spawn_refusals_have_distinct_stages_and_faithful_errnos() {
+    use multitask::SpawnTaskError as E;
+    // (reason, telemetry stage, Linux errno). Stage 11 names only the
+    // exhausted scheduler task table; every other cause has its own stage.
+    let table = [
+        (E::InvalidWeightMicros, 10, LINUX_EINVAL),
+        (E::NoFreeTaskSlot, 11, LINUX_EAGAIN),
+        (E::MemoryQuota, 13, LINUX_ENOMEM),
+        (E::ThreadStackAllocation, 14, LINUX_ENOMEM),
+        (E::ProcessThreadLimit, 15, LINUX_EAGAIN),
+        (E::JobThreadLimit, 16, LINUX_EAGAIN),
+        (E::JobThreadMemory, 17, LINUX_ENOMEM),
+        (E::ProcessExiting, 18, LINUX_EAGAIN),
+        (E::ProcessExecInProgress, 19, LINUX_EAGAIN),
+        (E::ThreadCreatorUnavailable, 20, LINUX_EAGAIN),
+        (E::ThreadPublicationRefused, 21, LINUX_EAGAIN),
+        (E::ThreadMaterializationFailed, 22, LINUX_EAGAIN),
+        (E::ProcessLimit, 23, LINUX_EAGAIN),
+    ];
+    for (index, (reason, stage, errno)) in table.iter().copied().enumerate() {
+        assert_eq!(clone_spawn_refusal_stage(reason), stage, "{reason:?}");
+        assert_eq!(process_spawn_error_to_linux_errno(reason), errno, "{reason:?}");
+        for (other, other_stage, _) in table.iter().copied().skip(index + 1) {
+            assert_ne!(stage, other_stage, "{reason:?} and {other:?} share a stage");
+        }
+        // The log's detail word names the authority limit that rejected.
+        match reason.rejecting_limit() {
+            Some(limit) => assert_eq!(
+                multitask::TASK_CAPACITY.limit_value(limit),
+                match limit {
+                    multitask::CapacityLimit::TaskTable => multitask::TASK_CAPACITY.total_slots() as u64,
+                    multitask::CapacityLimit::ProcessThreads => multitask::TASK_CAPACITY.process_thread_ceiling() as u64,
+                    multitask::CapacityLimit::RootProcesses => multitask::TASK_CAPACITY.root_process_ceiling() as u64,
+                    multitask::CapacityLimit::KernelStack => multitask::TASK_CAPACITY.kernel_stack_bytes() as u64,
+                }
+            ),
+            None => {}
+        }
+        // Stages already used by the earlier, non-spawn clone steps are reserved.
+        assert!(![1, 2, 3, 4, 5, 6, 7, 8, 9, 12].contains(&stage));
+    }
+}

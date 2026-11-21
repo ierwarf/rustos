@@ -7,8 +7,10 @@ extern crate alloc;
 pub mod linux;
 
 pub mod abi_revision;
+pub mod application_request;
 pub mod console;
 pub mod deadline;
+pub mod desktop_session;
 pub mod device;
 pub mod handle_kind;
 pub mod retired;

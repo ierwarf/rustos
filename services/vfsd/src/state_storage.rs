@@ -988,14 +988,15 @@ impl VfsStorage {
             }
             (mid, rel, key, rms)
         };
-        if let Some(snapshot) = self
-            .executable_snapshot_cache
-            .get(&cache_key)
-            .copied()
-        {
+        if let Some(snapshot) = self.executable_snapshot_cache.get_mut(&cache_key) {
+            self.executable_snapshot_cache_seq =
+                self.executable_snapshot_cache_seq.wrapping_add(1);
+            snapshot.last_used_seq = self.executable_snapshot_cache_seq;
+            let cached_fd = snapshot.fd;
+            let cached_bytes = snapshot.file_bytes;
             return ExecutableSnapshotOpen::duplicate_cached(
-                snapshot.fd,
-                snapshot.file_bytes,
+                cached_fd,
+                cached_bytes,
                 self.mount_generation,
                 request.max_bytes,
                 duplicate_snapshot_fd,
@@ -1159,22 +1160,33 @@ impl VfsStorage {
             Ok(fd) => fd,
             Err(_) => return Ok(None),
         };
-        if self
+        while self
             .executable_snapshot_cache_bytes
             .checked_add(file_len)
             .is_none_or(|total| total > EXECUTABLE_SNAPSHOT_CACHE_BUDGET_BYTES)
         {
-            for snapshot in self.executable_snapshot_cache.values() {
-                close_fd(snapshot.fd);
+            let Some(oldest_key) = self
+                .executable_snapshot_cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used_seq)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(evicted) = self.executable_snapshot_cache.remove(&oldest_key) {
+                close_fd(evicted.fd);
+                self.executable_snapshot_cache_bytes = self
+                    .executable_snapshot_cache_bytes
+                    .saturating_sub(evicted.file_bytes as usize);
             }
-            self.executable_snapshot_cache.clear();
-            self.executable_snapshot_cache_bytes = 0;
         }
+        self.executable_snapshot_cache_seq = self.executable_snapshot_cache_seq.wrapping_add(1);
         self.executable_snapshot_cache.insert(
             plan.cache_key.clone(),
             ExecutableSnapshot {
                 fd: cache_fd,
                 file_bytes: plan.metadata_len,
+                last_used_seq: self.executable_snapshot_cache_seq,
             },
         );
         self.executable_snapshot_cache_bytes += file_len;
@@ -1777,7 +1789,31 @@ impl VfsStorage {
                 || p.starts_with("/sys/"))
     }
 
-    fn mkdir_path(&mut self, abs_path: &str, attrs: FsCreateAttrs) -> i32 {
+    fn mkdir_path(&mut self, abs_path: &str, attrs: FsCreateAttrs, request: &VfsIpcRequest) -> i32 {
+        if self.tmpfs_owns(abs_path) {
+            let end = abs_path.rfind('/').unwrap_or(0);
+            let parent = if end == 0 { "/" } else { &abs_path[..end] };
+            let dir = match self.metadata(parent) {
+                Ok(dir) if dir.kind == RemoteKind::Directory => dir,
+                Ok(_) => return ENOTDIR,
+                Err(errno) => return errno,
+            };
+            // Linux name lookup reports an existing target before testing
+            // parent write permission, but still requires directory search.
+            if let Err(errno) = check_metadata_permission(dir, request, 1, false) {
+                return errno;
+            }
+            match self.metadata(abs_path) {
+                Ok(_) => return EEXIST,
+                Err(ENOENT) => {}
+                Err(errno) => return errno,
+            }
+            if let Err(errno) = check_metadata_permission(dir, request, 2, false) {
+                return errno;
+            }
+        } else if let Err(errno) = check_parent(self, abs_path, request, false) {
+            return errno;
+        }
         if self.is_virtual_path(abs_path) {
             return EROFS;
         }

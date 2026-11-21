@@ -9,27 +9,64 @@
 run_dir=/run/rustos-dvm
 pid_file="$run_dir/block.pid"
 
+# Admitted storage controller classes, identified from the guest kernel's own
+# PCI view so a physical AHCI/NVMe controller and the paravirtual KVM-harness
+# disk share one admission:
+#   0x0106*          AHCI, owned by the modular `ahci` driver
+#   0x0108*          NVMe, owned by the modular `nvme` driver
+#   0x0100* 1af4:    virtio-blk (PCI device 1001 transitional / 1042 modern),
+#                    owned by the built-in `virtio-pci` + `virtio_blk` drivers
+# The relay repeats the classification from the bound drivers and refuses any
+# other combination, so this script only decides how many functions to expect
+# and which drivers to admit.
+storage_controller_class() {
+    device=$1
+    [ -r "$device/class" ] || return 1
+    class=$(cat "$device/class")
+    case "$class" in
+        0x0106*) echo ahci ;;
+        0x0108*) echo nvme ;;
+        0x0100*)
+            [ -r "$device/vendor" ] && [ -r "$device/device" ] || return 1
+            [ "$(cat "$device/vendor")" = 0x1af4 ] || return 1
+            case "$(cat "$device/device")" in
+                0x1001|0x1042) echo virtio-blk ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 storage_controller_count() {
     count=0
     for device in /sys/bus/pci/devices/*; do
-        [ -r "$device/class" ] || continue
-        class=$(cat "$device/class")
-        case "$class" in
-            0x0106*|0x0108*) count=$((count + 1)) ;;
-        esac
+        storage_controller_class "$device" >/dev/null || continue
+        count=$((count + 1))
     done
     echo "$count"
+}
+
+# virtio_blk is built in, so a virtio-blk function has no module closure; its
+# single virtio child must nevertheless be bound by virtio_blk before the relay
+# looks for the namespace.
+virtio_blk_child_bound() {
+    bound=0
+    for child in "$1"/virtio*; do
+        [ -r "$child/device" ] || continue
+        [ "$(cat "$child/device")" = 0x0002 ] || continue
+        [ -L "$child/driver" ] || return 1
+        [ "$(basename "$(readlink -f "$child/driver")")" = virtio_blk ] || return 1
+        bound=$((bound + 1))
+    done
+    [ "$bound" -eq 1 ]
 }
 
 load_storage_controller() {
     found=0
     for device in /sys/bus/pci/devices/*; do
-        [ -r "$device/class" ] && [ -r "$device/modalias" ] || continue
-        class=$(cat "$device/class")
-        case "$class" in
-            0x0106*|0x0108*) ;;
-            *) continue ;;
-        esac
+        [ -r "$device/modalias" ] || continue
+        class=$(storage_controller_class "$device") || continue
         found=$((found + 1))
         [ "$found" -eq 1 ] || {
             echo "rustos-dvm-block: ambiguous assigned storage controllers" >&2
@@ -41,15 +78,24 @@ load_storage_controller() {
         [ -L "$device/driver" ] || return 1
         driver=$(basename "$(readlink -f "$device/driver")")
         case "$class:$driver" in
-            0x0106*:ahci)
-                # AHCI owns the controller. Signed sd_mod owns writable disk
-                # namespaces, while built-in sr owns the immutable ATAPI
-                # qualification namespace. Minimal DVM images have no general
-                # cold-plug daemon, so admit the complete driver closure
-                # explicitly before starting the relay.
+            ahci:ahci)
+                # AHCI owns the controller and signed sd_mod owns its
+                # whole-disk namespace. There is deliberately no `sr`:
+                # optical/ATAPI media is not an admitted namespace, so an
+                # optical drive on an assigned controller cannot appear as a
+                # second namespace and make the relay's one-namespace rule
+                # ambiguous. Minimal DVM images have no general cold-plug
+                # daemon, so admit the complete driver closure explicitly
+                # before starting the relay.
                 modprobe sd_mod || return 1
                 ;;
-            0x0108*:nvme) ;;
+            nvme:nvme) ;;
+            virtio-blk:virtio-pci)
+                virtio_blk_child_bound "$device" || {
+                    echo "rustos-dvm-block: virtio storage function is not bound to virtio_blk" >&2
+                    return 1
+                }
+                ;;
             *)
                 echo "rustos-dvm-block: controller driver mismatch class=$class driver=$driver" >&2
                 return 1

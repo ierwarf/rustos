@@ -1004,7 +1004,7 @@ impl VfsState {
         };
         let attrs = FsCreateAttrs::new(request.arg0 as u32, request.euid, request.egid);
         let mut storage = lock_vfs_storage();
-        response.status = match check_parent(&mut storage, &path, request, false) { Ok(()) => storage.mkdir_path(&path, attrs), Err(e) => e };
+        response.status = storage.mkdir_path(&path, attrs, request);
     }
 
     fn linux_mount_vfs(&mut self, response: &mut VfsIpcResponse) {

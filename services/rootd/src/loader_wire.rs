@@ -24,6 +24,7 @@ pub(super) const fn empty_loader_spawn_request() -> LoaderSpawnRequest {
         argv_bytes_len: 0,
         env_bytes_len: 0,
         requester_pid: 0,
+        application_request: rustos_user_abi::application_request::ApplicationRequest::NONE,
         scheduling_context: RustosSchedulingContextAuthority {
             token: 0,
             policy: RustosSchedulingContextPolicy {

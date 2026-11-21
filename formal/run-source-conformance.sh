@@ -779,6 +779,8 @@ dvm_snapshot_sync_body="$(sed -n '/^fn sync_private_dvm_block_snapshot(/,/^fn cr
 dvm_block_create_body="$(sed -n '/^fn create_dvm_block_aperture(/,/^fn rotate_dvm_block_epoch/p' tools/xtask/src/kvm/layout/block_transport.rs)"
 dvm_block_rotate_body="$(sed -n '/^fn rotate_dvm_block_epoch(/,$p' tools/xtask/src/kvm/layout/block_transport.rs)"
 dvm_virtual_storage_body="$(sed -n '/^fn append_dvm_virtual_storage(/,/^fn append_dvm_display_pixels/p' tools/xtask/src/kvm/guest.rs)"
+dvm_storage_device_body="$(sed -n '/^fn dvm_storage_device_arg(/,/^}/p' tools/xtask/src/kvm/guest.rs)"
+dvm_writable_storage_body="$(sed -n '/^fn append_dvm_writable_virtual_storage(/,/^}/p' tools/xtask/src/kvm/guest.rs)"
 dvm_recovery_harness_body="$(sed -n '/^impl RecoveryHarness/,/^fn wait_for_rustos_reboot_recovery/p' tools/xtask/src/kvm/guest.rs)"
 dvm_restart_recovery_body="$(sed -n '/^fn wait_for_dvm_restart_recovery(/,$p' tools/xtask/src/kvm/guest.rs)"
 dvm_ready_generation_body="$(sed -n '/^fn dvm_block_header_matches_ready_generation(/,/^fn verify_dvm_block_ready(/p' tools/xtask/src/kvm/layout.rs)"
@@ -875,9 +877,10 @@ if ! grep -Fq '!is_io && prefetchable && size == DVM_BLOCK_APERTURE_BYTES' <<<"$
     || ! grep -Fq 'crate::driver::mmio::map_shared_write_back(resource.start, resource_len).cast::<u8>();' <<<"$dvm_network_cache_source" \
     || ! grep -Fq 'PhysicalMappingCacheMode::WriteBack => PageTableFlags::empty(),' kernel/mm/src/memory/kernel_vm.rs \
     || ! grep -Fq '!(shared->flags & IORESOURCE_PREFETCH)' driver-domains/linux/package/rustos-dvm-block/src/rustos_dvm_block_uio.c \
-    || ! grep -Fq 'mapped = ioremap_cache(shared->start, sizeof(bytes));' driver-domains/linux/package/rustos-dvm-block/src/rustos_dvm_block_uio.c \
-    || ! grep -Fq '~_PAGE_CACHE_MASK' driver-domains/linux/package/rustos-dvm-block/src/rustos_dvm_block_uio.c \
+    || ! grep -Fq 'mapped = ioremap_wc(shared->start, sizeof(bytes));' driver-domains/linux/package/rustos-dvm-block/src/rustos_dvm_block_uio.c \
+    || ! grep -Fq 'pgprot_writecombine(vma->vm_page_prot)' driver-domains/linux/package/rustos-dvm-block/src/rustos_dvm_block_uio.c \
     || ! grep -Fq 'remap_pfn_range' driver-domains/linux/package/rustos-dvm-block/src/rustos_dvm_block_uio.c \
+    || ! grep -Fq 'wc_store_fence();' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
     || ! grep -Fq '!(shared->flags & IORESOURCE_PREFETCH)' driver-domains/linux/package/rustos-dvm-net/src/rustos_dvm_net_uio.c \
     || ! grep -Fq 'mapped = ioremap_cache(shared->start, sizeof(bytes));' driver-domains/linux/package/rustos-dvm-net/src/rustos_dvm_net_uio.c \
     || ! grep -Fq '~_PAGE_CACHE_MASK' driver-domains/linux/package/rustos-dvm-net/src/rustos_dvm_net_uio.c \
@@ -1124,17 +1127,33 @@ if [[ -z "$join_line" || -z "$complete_line" || "$complete_line" -le "$join_line
     || ! rg -Fq -- '--smp-ring3-qualification requires --smp-evidence-cohort' tools/xtask/src/kvm/smoke_args.rs \
     || ! grep -Fq 'options.dvm_block_shmem = true;' <<<"$smp_ring3_option_body" \
     || ! grep -Fq '"file={},format=raw,if=none,id=dvm-storage-disk,cache=none,aio=threads,readonly=on",' <<<"$dvm_virtual_storage_body" \
-    || ! grep -Fq 'ide-cd,drive=dvm-storage-disk,bus=ide.0,unit=0,id=dvm-storage-disk-device' <<<"$dvm_virtual_storage_body" \
-    || grep -Fq 'ide-hd,drive=dvm-storage-disk' <<<"$dvm_virtual_storage_body" \
-    || grep -Eq 'logical_block_size|physical_block_size' <<<"$dvm_virtual_storage_body" \
-    || ! rg -Fq 'const DVM_BLOCK_MEDIA_BLOCK_BYTES: u32 = 2048;' tools/xtask/src/kvm.rs \
+    || ! grep -Fq '.arg(dvm_storage_device_arg());' <<<"$dvm_virtual_storage_body" \
+    || grep -Eq 'ide-cd|ide-hd|bus=ide' <<<"$dvm_virtual_storage_body" \
+    || ! grep -Fq '.arg(dvm_storage_device_arg());' <<<"$dvm_writable_storage_body" \
+    || grep -Eq 'ide-cd|ide-hd|bus=ide|readonly=on' <<<"$dvm_writable_storage_body" \
+    || ! grep -Fq 'virtio-blk-pci,drive=dvm-storage-disk,id=dvm-storage-disk-device,logical_block_size={DVM_STORAGE_LOGICAL_BLOCK_BYTES},physical_block_size={DVM_STORAGE_PHYSICAL_BLOCK_BYTES}' <<<"$dvm_storage_device_body" \
+    || ! rg -Fq 'const DVM_STORAGE_LOGICAL_BLOCK_BYTES: u32 = 512;' tools/xtask/src/kvm.rs \
+    || ! rg -Fq 'const DVM_STORAGE_PHYSICAL_BLOCK_BYTES: u32 = 512;' tools/xtask/src/kvm.rs \
     || ! rg -Fq 'const DVM_BLOCK_MEDIA_FEATURES: u64 = DVM_BLOCK_FEATURE_FLUSH;' tools/xtask/src/kvm.rs \
-    || ! rg -Fxq 'CONFIG_BLK_DEV_SR=y' driver-domains/linux/board/linux.fragment \
+    || ! rg -Fq '"q35,accel=kvm,i8042=off,sata=off"' tools/xtask/src/kvm/options.rs \
+    || ! rg -Fxq 'CONFIG_VIRTIO_PCI=y' driver-domains/linux/board/linux.fragment \
+    || ! rg -Fxq 'CONFIG_VIRTIO_BLK=y' driver-domains/linux/board/linux.fragment \
+    || rg -Fxq 'CONFIG_BLK_DEV_SR=y' driver-domains/linux/board/linux.fragment \
+    || ! rg -Fxq '# CONFIG_BLK_DEV_SR is not set' driver-domains/linux/board/linux.fragment \
     || ! rg -Fq 'grep -qx "${1}=y" "$config"' driver-domains/linux/scripts/verify-kernel-config.sh \
-    || ! rg -Fxq 'require_builtin CONFIG_BLK_DEV_SR' driver-domains/linux/scripts/verify-kernel-config.sh \
-    || ! rg -Fq 'built-in sr owns the immutable ATAPI' driver-domains/linux/board/overlay/etc/init.d/S12rustos-dvm-block \
-    || ! rg -Fq 'Signed sd_mod owns writable disk' driver-domains/linux/board/overlay/etc/init.d/S12rustos-dvm-block \
+    || ! rg -Fxq 'require_builtin CONFIG_VIRTIO_PCI' driver-domains/linux/scripts/verify-kernel-config.sh \
+    || ! rg -Fxq 'require_builtin CONFIG_VIRTIO_BLK' driver-domains/linux/scripts/verify-kernel-config.sh \
+    || ! rg -Fxq 'require_disabled CONFIG_BLK_DEV_SR' driver-domains/linux/scripts/verify-kernel-config.sh \
+    || ! rg -Fq '0x1001|0x1042) echo virtio-blk ;;' driver-domains/linux/board/overlay/etc/init.d/S12rustos-dvm-block \
+    || ! rg -Fq 'virtio-blk:virtio-pci)' driver-domains/linux/board/overlay/etc/init.d/S12rustos-dvm-block \
+    || ! rg -Fq 'modprobe sd_mod || return 1' driver-domains/linux/board/overlay/etc/init.d/S12rustos-dvm-block \
     || rg -Fq 'modprobe sr_mod' driver-domains/linux/board/overlay/etc/init.d/S12rustos-dvm-block \
+    || ! rg -Fq 'if (class_code == PCI_CLASS_STORAGE_SCSI &&' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
+    || ! rg -Fq 'return "virtio_blk";' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
+    || ! rg -Fq 'ioctl(device->fd, BLKSSZGET, &logical) != 0 ||' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
+    || ! rg -Fq 'ioctl(device->fd, BLKROGET, &read_only) != 0 ||' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
+    || ! rg -Fq '(header_read_only ? O_RDONLY : O_RDWR)' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
+    || ! rg -Fq 'device->read_only != header_read_only ||' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
     || [[ -z "$dvm_snapshot_file_open_line" || -z "$dvm_snapshot_first_sync_line" || -z "$dvm_snapshot_directory_open_line" || -z "$dvm_snapshot_last_sync_line" ]] \
     || [[ "$dvm_snapshot_file_open_line" -ge "$dvm_snapshot_first_sync_line" || "$dvm_snapshot_first_sync_line" -ge "$dvm_snapshot_directory_open_line" || "$dvm_snapshot_directory_open_line" -ge "$dvm_snapshot_last_sync_line" ]] \
     || [[ "$(grep -F -c '.sync_all()' <<<"$dvm_snapshot_sync_body")" != 2 ]] \
@@ -1142,8 +1161,11 @@ if [[ -z "$join_line" || -z "$complete_line" || "$complete_line" -le "$join_line
     || [[ "$dvm_snapshot_copy_line" -ge "$dvm_snapshot_permissions_line" || "$dvm_snapshot_permissions_line" -ge "$dvm_snapshot_sync_call_line" || "$dvm_snapshot_sync_call_line" -ge "$dvm_snapshot_aperture_line" ]] \
     || ! grep -Fq 'header.flags = DVM_BLOCK_FLAG_READ_ONLY;' <<<"$dvm_read_only_header_body" \
     || ! grep -Fq 'dvm_read_only_block_header(' <<<"$dvm_block_create_body" \
-    || ! grep -Fq 'disk_bytes.is_multiple_of(u64::from(DVM_BLOCK_MEDIA_BLOCK_BYTES))' <<<"$dvm_block_create_body" \
-    || [[ "$(grep -F -c 'DVM_BLOCK_MEDIA_BLOCK_BYTES,' <<<"$dvm_block_create_body")" != 2 ]] \
+    || ! grep -Fq 'dvm_storage_capacity_sectors(disk_bytes)' <<<"$dvm_block_create_body" \
+    || [[ "$(grep -F -c 'DVM_STORAGE_LOGICAL_BLOCK_BYTES,' <<<"$dvm_block_create_body")" != 1 ]] \
+    || [[ "$(grep -F -c 'DVM_STORAGE_PHYSICAL_BLOCK_BYTES,' <<<"$dvm_block_create_body")" != 1 ]] \
+    || ! rg -Fq 'disk_bytes.is_multiple_of(u64::from(DVM_STORAGE_LOGICAL_BLOCK_BYTES))' tools/xtask/src/kvm/layout/block_transport.rs \
+    || ! grep -Fq 'dvm_storage_header_geometry_matches(&predecessor, disk_bytes)' <<<"$dvm_block_rotate_body" \
     || ! grep -Fq 'predecessor.flags & DVM_BLOCK_FLAG_READ_ONLY == 0' <<<"$dvm_block_rotate_body" \
     || ! grep -Fq 'dvm_read_only_block_header(' <<<"$dvm_block_rotate_body" \
     || ! rg -Fq 'let ready = DVM_BLOCK_FLAG_RUSTOS_READY | DVM_BLOCK_FLAG_DVM_READY | DVM_BLOCK_FLAG_READ_ONLY;' tools/xtask/src/kvm/layout.rs \
@@ -1154,12 +1176,10 @@ if [[ -z "$join_line" || -z "$complete_line" || "$complete_line" -le "$join_line
     || ! grep -Fq 'expected_block_generation: Option<u64>,' <<<"$dvm_restart_recovery_body" \
     || ! grep -Fq 'rustos_log.contains("dvm-block: signed transport epoch rebound generation=")' <<<"$dvm_restart_recovery_body" \
     || ! grep -Fq 'verify_dvm_block_ready_generation(layout, generation).is_ok()' <<<"$dvm_restart_recovery_body" \
-    || ! grep -Fq 'disk_bytes.is_multiple_of(u64::from(DVM_BLOCK_MEDIA_BLOCK_BYTES))' <<<"$dvm_block_ready_body" \
-    || ! grep -Fq 'header.logical_block_size != DVM_BLOCK_MEDIA_BLOCK_BYTES' <<<"$dvm_block_ready_body" \
-    || ! grep -Fq 'header.physical_block_size != DVM_BLOCK_MEDIA_BLOCK_BYTES' <<<"$dvm_block_ready_body" \
+    || [[ "$(grep -F -c 'dvm_storage_header_geometry_matches(&header, disk_bytes)' <<<"$dvm_block_ready_body")" != 2 ]] \
     || ! rg -Fq 'ioctl(device->fd, BLKROGET, &read_only) != 0' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
-    || ! rg -Fq 'device->read_only !=' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
-    || ! rg -Fq '((header->flags & DVM_BLOCK_FLAG_READ_ONLY) != 0U) ||' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
+    || ! rg -Fq '(header->flags & DVM_BLOCK_FLAG_READ_ONLY) != 0U;' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
+    || ! rg -Fq 'device->read_only != header_read_only ||' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
     || ! rg -Fq 'errno = EPROTO;' driver-domains/linux/package/rustos-dvm-block/src/rustos-dvm-block.c \
     || ! rg -Fq 'storaged: dvm-block e2e media barrier completed generation=' services/storaged/src/main.rs \
     || ! rg -Fq 'path=vfs-policy->block-broker->shared-ring->linux-dvm->media-barrier' services/storaged/src/main.rs \
@@ -1607,7 +1627,7 @@ dvm-block-transport/DvmBlockTransport|kernel-io-manager|io::dvm_block::tests::va
 dvm-block-transport/DvmBlockTransport|xtask|kvm::tests::dvm_block_recovery_readiness_tracks_the_exact_successor_generation
 dvm-block-transport/DvmBlockTransport|xtask|kvm::tests::dvm_attached_block_disk_requires_qemu_read_only_backing
 dvm-block-transport/DvmBlockTransport|xtask|kvm::tests::dvm_block_read_only_media_driver_closure_is_explicit
-dvm-block-transport/DvmBlockTransport|xtask|kvm::tests::dvm_block_read_only_media_geometry_matches_atapi_capacity
+dvm-block-transport/DvmBlockTransport|xtask|kvm::tests::dvm_block_read_only_media_geometry_is_the_declared_storage_geometry
 dvm-block-startup/DvmBlockStartup|kernel-io-manager|io::dvm_block::tests::startup_not_ready_is_sleepable_not_a_fault_event
 dvm-block-startup/DvmBlockStartup|kernel-io-manager|io::dvm_block::tests::fixed_nonblock_ivshmem_topology_is_negative_cached_only_after_enumeration
 dvm-block-startup/DvmBlockStartup|kernel-io-manager|io::dvm_block::tests::readiness_may_arrive_once_but_cannot_be_withdrawn
@@ -2883,7 +2903,7 @@ smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::smp_ring3_qualif
 smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::dvm_attached_block_disk_requires_qemu_read_only_backing
 smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::dvm_block_transport_header_matches_read_only_qemu_backing
 smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::dvm_block_read_only_media_driver_closure_is_explicit
-smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::dvm_block_read_only_media_geometry_matches_atapi_capacity
+smp-ring3-qualification/SmpRing3Qualification|xtask|kvm::tests::dvm_block_read_only_media_geometry_is_the_declared_storage_geometry
 smp-ring3-qualification/SmpRing3Qualification|xtask|stage::tests::early_system_allowlist_contains_the_minimal_dynamic_runtime_closure
 dvm-block-startup/DvmBlockStartup|kernel-io-manager|io::dvm_block::tests::block_shared_aperture_requires_prefetchable_write_back_atomic_memory
 dvm-input-ring/DvmInputRing|kernel-io-manager|input::dvm_ring::tests::input_shared_ring_requires_prefetchable_write_back_atomic_memory

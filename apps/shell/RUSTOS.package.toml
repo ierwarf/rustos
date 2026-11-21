@@ -13,3 +13,5 @@ path = "apps/shell/shell.elf"
 [[desktop.entries]]
 display_name = "shell"
 weight_micros = 100
+request_processes = 1
+request_threads = 2

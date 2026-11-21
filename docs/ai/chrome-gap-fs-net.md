@@ -19,8 +19,9 @@ host, formal and KVM smoke evidence; that batch did not rerun Chrome.
   facts. Other PIDs remain `ENOENT`; service proxy/replay authority must be
   separately authenticated, never inferred from a payload PID.
 - Chrome remains an opt-in desktop launch of
-  `/apps/chrome/chrome --ozone-platform=wayland`. No sandbox bypass, setuid
-  privilege import, automatic Chrome launch or claim of sandbox support is
+  `/apps/chrome/chrome --ozone-platform=wayland`. As of 2026-11-21 the manifest
+  also carries the user-approved interim `--no-sandbox` (see
+  `apps/chrome/README.md`); no setuid privilege import, automatic Chrome launch or claim of sandbox support is
   introduced. Namespace/setuid/seccomp sandbox completion is outside this batch.
 
 ## Implemented surface and integration seams
@@ -35,20 +36,22 @@ read-only and `/data` is the second FAT partition when its mount succeeds.
 `/proc/mounts` is generated from the live mount table.
 The old special-purpose `run_dirs.rs` namespace is removed.
 
-Runtime defaults are staged in `runtime-env.tsv`, merged beneath explicit
-catalog environment entries:
+Runtime defaults are staged in `runtime-env.tsv` as templates, merged beneath
+explicit catalog environment entries and resolved by runtimed per launch:
 
 ```text
-HOME=/data/home
-XDG_CONFIG_HOME=/data/config
-XDG_CACHE_HOME=/data/cache
-XDG_RUNTIME_DIR=/run/user/1000
-TMPDIR=/tmp
-WAYLAND_DISPLAY=wayland-0
+HOME={profile_root}/home                 -> /data/home, or /tmp/rustos-profile-<uid>/home
+XDG_CONFIG_HOME={profile_root}/config
+XDG_CACHE_HOME={profile_root}/cache
+XDG_RUNTIME_DIR={runtime_dir}            -> /run/user/<launch uid>
+TMPDIR={temp_dir}
+WAYLAND_DISPLAY={wayland_display}
 ```
 
-Launch directories are ensured on every launch; a successful previous mkdir is
-not cached across deletion or remount. Ordinary build/boot does not run Chrome.
+Launch directories are ensured on every launch (a successful previous mkdir is
+not cached across deletion or remount); without a writable `/data` the profile
+moves to a verified per-uid TmpFs directory, and with no usable root the launch
+fails with the real errno instead of starting Chrome with a dead `HOME`. Ordinary build/boot does not run Chrome.
 `kvm-run --writable-storage --data-disk <path>` and the corresponding smoke
 options preserve partition 2 while refreshing the boot partition. Existing
 images are layout/CRC validated; publication uses an exclusive same-directory

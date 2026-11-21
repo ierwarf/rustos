@@ -36,11 +36,14 @@ pub const PAGER_FAULT_RUN_PAGES_MAX: u32 = 16;
 /// Fixed number of ring0 fault slots a token may name.
 pub const PAGER_MAX_FAULT_SLOTS: usize = 128;
 
-/// Pager VMA slots ring0 keeps for one process.
+/// Hard directory ceiling on pager VMA slots ring0 keeps for one process.
 ///
-/// Published here because a pager sizes its own region table against it: one
-/// process must not be able to wedge the pager for every other process.
-pub const PAGER_MAX_VMAS_PER_PROCESS: usize = 256;
+/// Ring0 allocates per-process VMA slots lazily in chunks on demand rather than
+/// preallocating a fixed table of this size for every process. Published here
+/// because a pager sizes its own region ceiling against it and may narrow it
+/// via `PagerAnonymousPolicyWire::process_vma_ceiling`: one process must not
+/// be able to wedge the pager for every other process.
+pub const PAGER_MAX_VMAS_PER_PROCESS: usize = 4096;
 
 /// Regions a pager tracks across all processes.
 ///
@@ -107,7 +110,8 @@ pub struct PagerAnonymousPolicyWire {
     /// could put the tail of a run in a table this fault never prepared.
     pub fault_run_pages: u32,
     /// Demand-paged regions one process may hold. It may narrow, never widen,
-    /// `PAGER_MAX_VMAS_PER_PROCESS`, which sizes ring0's fixed table.
+    /// `PAGER_MAX_VMAS_PER_PROCESS`, which is ring0's hard per-process VMA
+    /// directory ceiling.
     pub process_vma_ceiling: u32,
     /// `0` admits nothing to demand paging: every anonymous range is wired,
     /// exactly as before demand paging existed.

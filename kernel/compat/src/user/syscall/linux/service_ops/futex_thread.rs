@@ -228,17 +228,68 @@ fn wait_for_task_slot() -> bool {
 // RING3-MIGRATION-REFERENCE START: scheduler-thread substrate exception: procd
 // owns Linux clone/thread admission policy. Ring0 keeps final
 // same-address-space thread spawn and register substrate.
+/// Bound on `linux-thread-clone-stage` records per boot.
+const CLONE_STAGE_RECORD_BUDGET: u32 = 32;
+
+/// Telemetry stage and Linux errno for a refused `spawn_user_thread_suspended`.
+/// Each cause owns a stage so the log names the limit that was hit; stage 11
+/// stays "scheduler task table exhausted" only. Errnos come from the shared
+/// spawn table in `proc_broker_ops`.
+const fn clone_spawn_refusal_stage(error: multitask::SpawnTaskError) -> u64 {
+    use multitask::SpawnTaskError as E;
+    match error {
+        E::InvalidWeightMicros => 10,
+        E::NoFreeTaskSlot => 11,
+        E::MemoryQuota => 13,
+        E::ThreadStackAllocation => 14,
+        E::ProcessThreadLimit => 15,
+        E::JobThreadLimit => 16,
+        E::JobThreadMemory => 17,
+        E::ProcessExiting => 18,
+        E::ProcessExecInProgress => 19,
+        E::ThreadCreatorUnavailable => 20,
+        E::ThreadPublicationRefused => 21,
+        E::ThreadMaterializationFailed => 22,
+        E::ProcessLimit => 23,
+    }
+}
+
+/// Records and returns the errno of a refused thread spawn. When the capacity
+/// authority's limit rejected it, the record's address field carries that
+/// limit's value (task-table slots, per-process thread ceiling, root process
+/// ceiling or kernel stack bytes) so the log names the limit that was hit; a
+/// Job limit or a transient refusal carries the clone flags as before.
+fn clone_spawn_refused(error: multitask::SpawnTaskError, flags: u64) -> u64 {
+    let detail = error
+        .rejecting_limit()
+        .map_or(flags, |limit| multitask::TASK_CAPACITY.limit_value(limit));
+    clone_stage_failed(
+        clone_spawn_refusal_stage(error),
+        process_spawn_error_to_linux_errno(error),
+        detail,
+    )
+}
+
 /// Names the step of a thread clone that failed. The bare errno of
 /// `linux-thread-clone-rejected` cannot tell a procd plan refusal from a user
 /// pointer that was not writable, which is the question that matters under
 /// concurrent address-space churn. Bounded so a failure storm stays cheap.
 fn clone_stage_failed(stage: u64, errno: i64, address: u64) -> u64 {
     static RECORDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    // ORDERING: Relaxed; a counter bounding telemetry volume.
+    // ORDERING: Relaxed; a counter bounding telemetry volume. It saturates at
+    // the budget, so a long failure storm can never wrap the counter and
+    // re-open the budget.
     // The policy service is not guaranteed to emit an unconditional debugcon
     // record. Stage 1 is the most useful discriminator for sporadic EINVAL
     // under concurrent boot, so include it in the same bounded budget.
-    if RECORDED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32 {
+    let within_budget = RECORDED
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |recorded| (recorded < CLONE_STAGE_RECORD_BUDGET).then_some(recorded + 1),
+        )
+        .is_ok();
+    if within_budget {
         nucleus_core::debug::record_milestone(
             nucleus_core::debug::LogCategory::Compat,
             "linux-thread-clone-stage",
@@ -382,15 +433,7 @@ pub fn clone_linux_thread(
     }
     let child_tid = match multitask::spawn_user_thread_suspended(bootstrap) {
         Ok(tid) => tid,
-        Err(multitask::SpawnTaskError::InvalidWeightMicros) => {
-            return clone_stage_failed(10, LINUX_EINVAL, flags);
-        }
-        Err(multitask::SpawnTaskError::MemoryQuota) => {
-            return clone_stage_failed(11, LINUX_ENOMEM, flags);
-        }
-        Err(multitask::SpawnTaskError::NoFreeTaskSlot) => {
-            return clone_stage_failed(11, LINUX_EAGAIN, flags);
-        },
+        Err(error) => return clone_spawn_refused(error, flags),
     };
     let child_tid_bytes = (child_tid as u32).to_le_bytes();
     if flags & (linux_abi::CLONE_PARENT_SETTID | linux_abi::CLONE_CHILD_SETTID) != 0 {

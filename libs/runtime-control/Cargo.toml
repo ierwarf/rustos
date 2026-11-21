@@ -6,6 +6,8 @@ publish = false
 
 [dependencies]
 libc = "0.2"
+rustos-user-abi = { path = "../rustos-user-abi" }
+session-profile = { path = "../session-profile" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

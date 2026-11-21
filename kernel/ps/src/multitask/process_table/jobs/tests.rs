@@ -1,4 +1,5 @@
 use super::*;
+use crate::multitask::SpawnTaskError;
 use crate::multitask::process_table::tests::{isolate_process_table, new_state};
 
 fn spawn_in(pid: u64, parent: Option<u64>, job: Option<JobId>) -> Option<ProcessHandle> {
@@ -250,17 +251,25 @@ fn a_thread_limit_refuses_the_next_thread_across_the_subtree() {
     let a = spawn_in(130, None, Some(parent)).unwrap();
     let b = spawn_in(131, None, Some(child)).unwrap();
     assert_eq!(job_info(parent).unwrap().usage_threads, 2);
-    assert!(attach_task(a).is_some());
-    assert!(attach_task(b).is_some());
+    assert!(attach_task(a).is_ok());
+    assert!(attach_task(b).is_ok());
     assert_eq!(job_info(parent).unwrap().usage_threads, 4);
-    assert!(attach_task(a).is_none(), "the parent's four threads are used");
-    assert!(attach_task(b).is_none(), "a descendant counts against its ancestor");
+    assert_eq!(
+        attach_task(a),
+        Err(SpawnTaskError::JobThreadLimit),
+        "the parent's four threads are used"
+    );
+    assert_eq!(
+        attach_task(b),
+        Err(SpawnTaskError::JobThreadLimit),
+        "a descendant counts against its ancestor"
+    );
     assert!(spawn_in(132, None, Some(parent)).is_none(), "a new process needs a thread too");
 }
 
 #[test]
 fn a_thread_limit_above_the_per_process_ceiling_is_still_charged_and_enforced() {
-    use crate::multitask::process_table::MAX_THREADS_PER_PROCESS as CEILING;
+    const CEILING: usize = crate::multitask::task_capacity::CAPACITY.process_thread_ceiling();
     let _isolation = isolate_process_table();
     let job = job_create_child(ROOT_JOB).unwrap();
     // Two processes may together exceed one process's ceiling, up to the job limit.
@@ -271,17 +280,25 @@ fn a_thread_limit_above_the_per_process_ceiling_is_still_charged_and_enforced() 
     for _ in 1..CEILING {
         attach_task(a).expect("within the process ceiling and the job limit");
     }
-    assert!(attach_task(a).is_none(), "the per-process ceiling still binds");
+    assert_eq!(
+        attach_task(a),
+        Err(SpawnTaskError::ProcessThreadLimit),
+        "the per-process ceiling still binds"
+    );
     assert_eq!(job_info(job).unwrap().usage_threads, (CEILING + 1) as u64);
     for _ in 0..3 {
         attach_task(b).expect("within the job limit");
     }
     assert_eq!(job_info(job).unwrap().usage_threads, limit);
-    assert!(attach_task(b).is_none(), "the job threads.max binds before b's ceiling");
+    assert_eq!(
+        attach_task(b),
+        Err(SpawnTaskError::JobThreadLimit),
+        "the job threads.max binds before b's ceiling"
+    );
     detach_task(a).unwrap();
     assert_eq!(job_info(job).unwrap().usage_threads, limit - 1);
     attach_task(b).expect("an exit refunds the job charge");
-    assert!(attach_task(b).is_none());
+    assert_eq!(attach_task(b), Err(SpawnTaskError::JobThreadLimit));
 }
 
 #[test]
@@ -309,7 +326,9 @@ fn the_root_jobs_process_limit_is_the_system_slot_limit() {
     assert!(spawn_in(155, None, None).is_none());
     job_set_limits(ROOT_JOB, LimitMask::PROCESSES, limits(LIMIT_UNSET, LIMIT_UNSET)).unwrap();
     assert_eq!(process_limit(), crate::multitask::slot_dir::SLOT_CEILING, "unset clamps to the ceiling");
-    super::super::set_process_limit(super::super::DEFAULT_PROCESS_LIMIT);
+    super::super::set_process_limit(
+        crate::multitask::task_capacity::CAPACITY.root_process_ceiling(),
+    );
 }
 
 #[test]

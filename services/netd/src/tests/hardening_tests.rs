@@ -428,10 +428,12 @@ fn unix_peek_leaves_queued_bytes_and_flags_ancillary_data() {
         connected.incoming.push_back(UnixStreamSegment {
             bytes: b"ab".iter().copied().collect(),
             control: Vec::new(),
+            ..Default::default()
         });
         connected.incoming.push_back(UnixStreamSegment {
             bytes: b"cd".iter().copied().collect(),
             control: vec![0; 8],
+            ..Default::default()
         });
         connected.incoming_bytes = 4;
     }

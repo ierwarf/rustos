@@ -350,9 +350,49 @@ pub(super) fn stage_prebuilt_app_runtime_libraries(
         .context("run verified Noble runtime provisioner")?;
     ensure!(status.success(), "Noble runtime provisioning failed");
     let source = config.build_dir.join("runtime-libs/noble/root");
+    if apps.iter().any(|app| app == Path::new("/apps/chrome/chrome")) {
+        // Qt loads these via its plugin directories, not Chrome's DT_NEEDED.
+        // Admit each as an explicit relocation root before final cache checks.
+        apps.extend(stage_qt_wayland_plugins(&config.image_dir, &source)?);
+        let xkb = Path::new("/usr/share/X11/xkb");
+        let from = image_path(&source, xkb)?;
+        let to = image_path(&config.image_dir, xkb)?;
+        ensure!(from.join("rules/evdev").is_file(), "missing authenticated XKB rules");
+        ensure!(!to.exists(), "refusing to overwrite staged XKB data");
+        super::copy_tree_files(&from, &to)?;
+    }
     resolve_closures(&config.image_dir, &source, &apps)?;
     Ok(apps)
 }
+
+fn qt_wayland_plugin_roots() -> Result<Vec<PathBuf>> {
+    include_str!("noble/qt-wayland-plugins.tsv")
+        .lines()
+        .map(|line| {
+            let (_, relative) = line.split_once('\t').context("invalid Qt Wayland plugin record")?;
+            safe_virtual(&Path::new("/usr/lib/x86_64-linux-gnu").join(relative))
+        })
+        .collect()
+}
+
+fn stage_qt_wayland_plugins(image: &Path, source: &Path) -> Result<Vec<PathBuf>> {
+    let roots = qt_wayland_plugin_roots()?;
+    let canonical_source = fs::canonicalize(source)?;
+    for virt in &roots {
+        let src = fs::canonicalize(image_path(source, virt)?)
+            .with_context(|| format!("missing pinned Qt Wayland plugin {}", virt.display()))?;
+        ensure!(src.starts_with(&canonical_source), "Qt Wayland plugin escapes provisioned root");
+        let info = inspect(&src)?;
+        ensure!(info.object_type == 3 && info.dynamic && info.interp.is_none(),
+            "Qt Wayland plugin is not an ELF shared library: {}", virt.display());
+        let dest = image_path(image, virt)?;
+        ensure!(!dest.exists(), "refusing to overwrite Qt Wayland plugin {}", dest.display());
+        fs::create_dir_all(dest.parent().context("Qt Wayland plugin has no parent")?)?;
+        fs::copy(src, dest)?;
+    }
+    Ok(roots)
+}
+
 fn resolve_closures(image: &Path, source: &Path, apps: &[PathBuf]) -> Result<()> {
     for app in apps {
         let mut queue = VecDeque::from([(app.clone(), Vec::<PathBuf>::new())]);
@@ -499,6 +539,7 @@ pub(super) fn verify_relocations(image: &Path, apps: &[PathBuf]) -> Result<Vec<s
     fs::copy(&loader, &copy).context("copy image loader for relocation check")?;
     fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755))?;
     let mut uses = Vec::new();
+    let qt_wayland = qt_wayland_plugin_roots()?;
     for app in apps {
         let info = inspect(&image_path(image, app)?)?;
         let interpreter = info.interp.as_deref().unwrap_or(LOADER);
@@ -541,9 +582,11 @@ pub(super) fn verify_relocations(image: &Path, apps: &[PathBuf]) -> Result<Vec<s
             stdout,
             stderr
         );
+        // A dlopen root is still part of Chrome, not an additional prewarm consumer.
+        let application = if qt_wayland.contains(app) { Path::new("/apps/chrome/chrome") } else { app };
         uses.extend(verify_baseline_resolution(image, &stdout, &baseline)?.into_iter()
             .map(|(requested, path)| super::library_cache::LibraryUse {
-                application: app.clone(), path, requested,
+                application: application.to_owned(), path, requested,
             }));
     }
     Ok(uses)
@@ -805,6 +848,12 @@ mod chrome_validation {
         let apps = stage_prebuilt_app_runtime_libraries(&config, &[manifest]).unwrap();
         assert!(apps.iter().any(|p| p.ends_with("chrome_crashpad_handler")));
         assert!(apps.iter().any(|p| p.ends_with("libvk_swiftshader.so")));
+        for major in ["qt5", "qt6"] {
+            let plugin_root = Path::new("/usr/lib/x86_64-linux-gnu").join(major).join("plugins");
+            assert!(apps.contains(&plugin_root.join("platforms/libqwayland-generic.so")));
+            assert!(apps.contains(&plugin_root.join("wayland-shell-integration/libxdg-shell.so")));
+            assert!(!image_path(&image, &plugin_root.join("platforms/libqwayland-egl.so")).unwrap().exists());
+        }
         super::super::generate_dynamic_linker_cache(&image).unwrap();
         super::super::materialize_image_file_aliases(&image).unwrap();
         baseline.verify(&image).unwrap();

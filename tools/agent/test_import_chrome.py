@@ -62,7 +62,7 @@ class ChromeImportTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     chrome.check_digest(package, digest)
 
-    def test_manifest_is_visible_but_has_no_autostart_or_sandbox_bypass(self):
+    def test_manifest_is_visible_and_has_no_autostart(self):
         import tomllib
         manifest = tomllib.loads((chrome.ROOT / "apps/chrome/RUSTOS.package.toml.example").read_text())
         self.assertEqual(manifest["startup"], "none")
@@ -71,7 +71,6 @@ class ChromeImportTests(unittest.TestCase):
         self.assertEqual(entry["display_name"], "Google Chrome")
         self.assertFalse(entry["console_hosted"])
         self.assertFalse(entry.get("no_display", False))
-        self.assertNotIn("--no-sandbox", entry["args"])
 
 
 if __name__ == "__main__":

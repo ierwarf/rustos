@@ -3,6 +3,7 @@ mod affinity;
 mod bootstrap_spawn;
 mod loader_job_realm;
 mod job_policy;
+mod task_capacity;
 mod ipc_reply_recv;
 mod ipc_handle_receive;
 mod ipc_registers;
@@ -20,6 +21,7 @@ pub use affinity::*;
 pub use bootstrap_spawn::*;
 pub use loader_job_realm::*;
 pub use job_policy::*;
+pub use task_capacity::*;
 pub use ipc_reply_recv::*;
 pub use ipc_handle_receive::*;
 pub use ipc_registers::*;
@@ -1368,7 +1370,7 @@ pub const EARLY_SYSTEM_BROKER_PATH_CAPACITY: usize = 96;
 /// thousands of scheduler/syscall turns and exhausted the caller's absolute
 /// launch deadline. Keep one transfer equal to vfsd's bounded snapshot write
 /// chunk while retaining explicit allocation and user-buffer limits in ring0.
-pub const EARLY_SYSTEM_BROKER_MAX_IO_BYTES: usize = 256 * 1024;
+pub const EARLY_SYSTEM_BROKER_MAX_IO_BYTES: usize = EXECUTABLE_IMAGE_TRANSFER_WINDOW_BYTES;
 pub const BLOCK_BROKER_WAIT_MAX_TIMEOUT_MS: u64 = 30_000;
 pub const LINUX_STAT_SIZE: usize = 0x90;
 pub const LINUX_STATX_SIZE: usize = 0x100;
@@ -1378,7 +1380,8 @@ pub const LINUX_CPUSET_BYTES: usize = 8;
 pub const LINUX_DEFAULT_STACK_RLIMIT_BYTES: u64 = 8 * 1024 * 1024;
 pub const LINUX_TIMESPEC_SIZE: usize = 16;
 pub const LINUX_SIGACTION_SIZE: usize = 32;
-pub const LOADER_REQUEST_ABI_VERSION: u16 = 4;
+/// v5 adds `LoaderSpawnRequest::application_request` (the application's Job request).
+pub const LOADER_REQUEST_ABI_VERSION: u16 = 5;
 pub const LOADER_OP_SPAWN_EXEC: u16 = 1;
 pub const LOADER_OP_EXEC_TARGET: u16 = 2;
 /// Nonblocking continuation of an authenticated image-staging transaction.
@@ -4007,6 +4010,11 @@ pub struct LoaderSpawnRequest {
     /// Immediate caller PID. Loaderd must compare this with the kernel-stamped
     /// IPC sender before acting on any target PID or exec ticket.
     pub requester_pid: u64,
+    /// What the application asked for its Job (processes, threads, pages per
+    /// process). All zero asks for the loader's derived defaults; only an
+    /// application `SPAWN_EXEC` may carry a non-zero request. loaderd grants it
+    /// against the capacity it observes at launch, exactly or by refusal.
+    pub application_request: crate::application_request::ApplicationRequest,
     pub scheduling_context: RustosSchedulingContextAuthority,
     pub exec_path: [u8; LOADER_SPAWN_EXEC_PATH_CAPACITY],
     pub argv_bytes: [u8; LOADER_SPAWN_ARG_BYTES],
@@ -4033,6 +4041,7 @@ impl Default for LoaderSpawnRequest {
             argv_bytes_len: 0,
             env_bytes_len: 0,
             requester_pid: 0,
+            application_request: crate::application_request::ApplicationRequest::NONE,
             scheduling_context: RustosSchedulingContextAuthority::default(),
             exec_path: [0; LOADER_SPAWN_EXEC_PATH_CAPACITY],
             argv_bytes: [0; LOADER_SPAWN_ARG_BYTES],

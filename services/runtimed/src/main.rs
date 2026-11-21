@@ -24,6 +24,7 @@ mod heartbeat;
 mod image_probe;
 mod kvm_launch_desktop;
 mod kvm_smp_qualification;
+mod launch_profile;
 mod launch_worker;
 mod offload;
 mod runtime_transactions;
@@ -81,6 +82,12 @@ pub(crate) const UI_SERVER_DISPLAY_NAME: &str = "UI Server";
 pub(crate) const UI_SERVER_EXEC_PATH: &str = "services/uiserver/uiserver.elf";
 pub(crate) const UI_SERVER_BOOTSTRAP_ENV: [&str; 2] =
     ["RUSTOS_UI_PROFILE=0", "RUSTOS_UI_BOOT_TRACE=0"];
+pub(crate) const UI_SERVER_APPLICATION_REQUEST: runtime_control::ApplicationRequest =
+    runtime_control::ApplicationRequest {
+        processes: 1,
+        threads: 24,
+        memory_pages_per_process: 0,
+    };
 pub(crate) static LOADER_ENDPOINT_CACHE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -96,6 +103,10 @@ pub(crate) struct LaunchEntry {
     pub(crate) console_hosted: bool,
     pub(crate) args: Vec<String>,
     pub(crate) env: Vec<String>,
+    /// What the package requested for its application Job (all zero = loader
+    /// derived defaults). Carried unchanged to loaderd on the spawn request;
+    /// loaderd grants it against the capacity it observes at launch.
+    pub(crate) application_request: runtime_control::ApplicationRequest,
     /// Set only by the private KVM contract injector. Signed catalog metadata
     /// cannot manufacture qualification authority by copying reserved names.
     pub(crate) private_smp_qualification:
@@ -127,6 +138,7 @@ pub(crate) struct ProgramMetadata {
     pub(crate) console_hosted: bool,
     pub(crate) args: Vec<String>,
     pub(crate) env: Vec<String>,
+    pub(crate) application_request: runtime_control::ApplicationRequest,
 }
 
 pub(crate) struct BrokerState {

@@ -154,7 +154,7 @@ fn abandoned_actual_kernel_claim_quarantines_capsule_without_reopen_or_implied_a
         kernel(|executor| {
             drop(claim_next(executor).unwrap());
             assert!(claim_next(executor).is_none());
-            assert_eq!(poll(receipt), Some(false));
+            assert_eq!(poll(receipt), Some(Err(SpawnTaskError::ThreadPublicationRefused)));
             let row = ROWS[receipt.slot].lock();
             assert_eq!(row.phase, Phase::Poisoned);
             assert!(
@@ -176,7 +176,7 @@ fn abandoned_actual_kernel_claim_quarantines_capsule_without_reopen_or_implied_a
         let mut row = ROWS[receipt.slot].lock();
         assert_eq!(row.nonce, receipt.nonce);
         row.phase = Phase::Complete;
-        row.succeeded = false;
+        row.outcome = Err(SpawnTaskError::ThreadPublicationRefused);
     });
 }
 #[test]
@@ -190,14 +190,14 @@ fn real_kernel_worker_publishes_slot_before_durable_ack_and_duplicate_claim_or_s
                 nonce: receipt.nonce + 1,
                 ..receipt
             }),
-            Some(false)
+            Some(Err(SpawnTaskError::ThreadPublicationRefused))
         );
         assert_eq!(
             poll(Receipt {
                 id: receipt.id + 1,
                 ..receipt
             }),
-            Some(false)
+            Some(Err(SpawnTaskError::ThreadPublicationRefused))
         );
         assert!(stack_resources::admission::is_reserved(receipt.slot));
         kernel(|executor| {
@@ -213,7 +213,7 @@ fn real_kernel_worker_publishes_slot_before_durable_ack_and_duplicate_claim_or_s
             assert_eq!(poll(receipt), None);
             assert!(stack_resources::admission::is_reserved(receipt.slot));
             claim.complete();
-            assert_eq!(poll(receipt), Some(true));
+            assert_eq!(poll(receipt), Some(Ok(())));
             assert!(!stack_resources::admission::is_reserved(receipt.slot));
             assert!(identity::lifecycle(receipt.slot).suspended);
             assert!(claim_next(executor).is_none());
@@ -239,7 +239,7 @@ fn same_uid_slot_reuse_spends_new_ticket_and_durable_nonce_and_old_receipt_canno
         kernel(|executor| {
             service(executor);
         });
-        assert_eq!(poll(old), Some(true));
+        assert_eq!(poll(old), Some(Ok(())));
         release_born(old.slot, old.id, handle);
         let next = pending();
         assert_eq!((next.slot, next.id), (old.slot, old.id));
@@ -257,13 +257,13 @@ fn same_uid_slot_reuse_spends_new_ticket_and_durable_nonce_and_old_receipt_canno
                 .generation()
                 > epoch
         );
-        assert_eq!(poll(old), Some(false));
+        assert_eq!(poll(old), Some(Err(SpawnTaskError::ThreadPublicationRefused)));
         assert_eq!(poll(next), None);
         kernel(|executor| {
             service(executor);
         });
-        assert_eq!(poll(old), Some(false));
-        assert_eq!(poll(next), Some(true));
+        assert_eq!(poll(old), Some(Err(SpawnTaskError::ThreadPublicationRefused)));
+        assert_eq!(poll(next), Some(Ok(())));
         release_born(next.slot, next.id, handle);
     });
 }
@@ -287,7 +287,7 @@ fn actual_windows_materialization_error_cancels_reserved_storage_and_attachment_
         kernel(|executor| {
             assert_eq!(service(executor), 1);
         });
-        assert_eq!(poll(receipt), Some(false));
+        assert_eq!(poll(receipt), Some(Err(SpawnTaskError::ThreadMaterializationFailed)));
         assert!(!stack_resources::allocated(receipt.slot));
         assert_eq!(process_table::thread_count_by_pid(ID), Some(count));
     });
@@ -305,7 +305,7 @@ fn dying_original_user_cannot_orphan_real_capsule_and_kernel_cancels_before_fail
         kernel(|executor| {
             assert_eq!(service(executor), 1);
         });
-        assert_eq!(poll(receipt), Some(false));
+        assert_eq!(poll(receipt), Some(Err(SpawnTaskError::ThreadPublicationRefused)));
         assert!(!stack_resources::allocated(receipt.slot));
         assert_eq!(process_table::thread_count_by_pid(ID), Some(count));
     });
@@ -322,7 +322,7 @@ fn submitted_thread_row_kicks_the_housekeeping_executor() {
         kernel(|executor| {
             assert_eq!(service(executor), 1);
         });
-        assert_eq!(poll(receipt), Some(true));
+        assert_eq!(poll(receipt), Some(Ok(())));
         release_born(receipt.slot, receipt.id, handle);
         let _ = crate::multitask::take_housekeeping_kick();
     });

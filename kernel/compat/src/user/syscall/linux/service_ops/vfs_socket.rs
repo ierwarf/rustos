@@ -389,16 +389,20 @@ pub(super) fn reopen_remote_vfs(fd: u64, remote_id: u64, flags: u64) -> Result<u
 }
 
 pub fn syscall_linux_vfs_close(fd: u64) -> u64 {
-    let closed_handle = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        process_state.handles_mut().close(fd)
-    })
-    .flatten();
-    let Some(closed_handle) = closed_handle else {
+    let Some((closed_handle, release_now)) =
+        multitask::with_current_user_process_state_mut(|_, _, process_state| {
+            process_state.close_handle_respecting_fork_pin(fd)
+        })
+        .flatten()
+    else {
         return linux_errno(LINUX_EBADF);
     };
     // POSIX record locks go with any close of the file, before the description
     // reference (which may be the last) is dropped.
     super::super::file_lock_ops::note_fd_closed(&closed_handle);
+    if !release_now {
+        return 0;
+    }
     if let multitask::KernelHandle::RemoteVfs(remote) = &closed_handle {
         let id = remote.remote_id();
         return match release_remote_vfs_descriptor_ref(id) {
@@ -416,14 +420,7 @@ pub fn syscall_linux_vfs_close(fd: u64) -> u64 {
             Err(errno) => linux_errno(errno),
         };
     }
-    if let Some(handle_ref) = service_handle_ref_for_handle(&closed_handle) {
-        release_service_handle_refs_bounded(&[handle_ref]);
-    }
-    if let multitask::KernelHandle::Console(console) = closed_handle
-        && console.is_last_reference()
-    {
-        let _ = purge_vfs_epoll_object_bounded(WAITSET_PROVIDER_SESSIOND, console.token_id());
-    }
+    release_closed_handles(core::iter::once(closed_handle));
     0
 }
 
@@ -667,6 +664,12 @@ fn duplicate_fd_transaction(
                 process_state
                     .handles_mut()
                     .duplicate_exact_with_replaced(oldfd, newfd, close_on_exec)
+                    .map(|(fd, replaced)| {
+                        (
+                            fd,
+                            replaced.map(|handle| process_state.defer_handle_drop_if_pinned(handle)),
+                        )
+                    })
                     .ok_or(install_errno)
             }
         }
@@ -683,15 +686,10 @@ fn duplicate_fd_transaction(
         }
     };
 
-    if let Some(replaced) = replaced {
+    if let Some((replaced, release_now)) = replaced {
         super::super::file_lock_ops::note_fd_closed(&replaced);
-        if let Some(handle_ref) = service_handle_ref_for_handle(&replaced) {
-            release_service_handle_refs_bounded(&[handle_ref]);
-        }
-        if let multitask::KernelHandle::Console(console) = replaced
-            && console.is_last_reference()
-        {
-            let _ = purge_vfs_epoll_object_bounded(WAITSET_PROVIDER_SESSIOND, console.token_id());
+        if release_now {
+            release_closed_handles(core::iter::once(replaced));
         }
     }
     Ok(fd)
@@ -1376,38 +1374,34 @@ pub fn syscall_linux_vfs_close_range(first: u64, last: u64, flags: u64) -> u64 {
         });
         return 0;
     }
-    let closed = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        let matching: Vec<u64> = process_state
-            .handles()
-            .entries_snapshot(false)
-            .into_iter()
-            .filter_map(|(fd, _)| (first..=last).contains(&fd).then_some(fd))
-            .collect();
-        let mut closed = Vec::with_capacity(matching.len());
-        for fd in matching {
-            if let Some(handle) = process_state.handles_mut().close(fd) {
-                closed.push(handle);
-            }
-        }
-        closed
-    })
-    .unwrap_or_default();
-    if !closed.is_empty() {
-        for handle in &closed {
-            super::super::file_lock_ops::note_fd_closed(handle);
-        }
-        let refs = service_handle_refs_from_handles(&closed);
-        release_service_handle_refs_bounded(&refs);
-        purge_closed_console_handles(
-            closed
+    let (closed_for_locks, release_now) =
+        multitask::with_current_user_process_state_mut(|_, _, process_state| {
+            let matching: Vec<u64> = process_state
+                .handles()
+                .entries_snapshot(false)
                 .into_iter()
-                .filter_map(|handle| match handle {
-                    multitask::KernelHandle::Console(console) => Some(console),
-                    _ => None,
-                })
-                .collect(),
-            true,
-        );
+                .filter_map(|(fd, _)| (first..=last).contains(&fd).then_some(fd))
+                .collect();
+            let mut lock_handles = Vec::with_capacity(matching.len());
+            let mut release_handles = Vec::with_capacity(matching.len());
+            for fd in matching {
+                if let Some((handle, release_now)) =
+                    process_state.close_handle_respecting_fork_pin(fd)
+                {
+                    if release_now {
+                        release_handles.push(handle.clone());
+                    }
+                    lock_handles.push(handle);
+                }
+            }
+            (lock_handles, release_handles)
+        })
+        .unwrap_or_default();
+    for handle in &closed_for_locks {
+        super::super::file_lock_ops::note_fd_closed(handle);
+    }
+    if !release_now.is_empty() {
+        release_closed_handles(release_now);
     }
     0
 }
@@ -2209,22 +2203,11 @@ pub fn acquire_cloned_service_handle_refs(
     Ok(acquired)
 }
 
-pub fn release_all_service_handle_refs(process_id: u64) {
-    // vfsd drops this process's POSIX locks from the lifecycle exit event; only
-    // the kernel-side "may hold locks" mark must not outlive the pid.
-    super::super::file_lock_ops::forget_process(process_id);
-    // Callers have already sealed the process as exiting, which revokes its
-    // visibility; the teardown accessor is the one path that still reaches the
-    // handle table, so every open-description reference is released exactly
-    // once here instead of leaking with the process object.
-    let closed = multitask::with_process_state_for_teardown_mut(process_id, |state| {
-        state.handles_mut().close_all()
-    })
-    .unwrap_or_default();
-    // Derive provider releases from the exact handles removed under the
-    // process-state mutation. A pre-close snapshot races dup/close/fd reuse
-    // and can release the wrong service object or leak the one actually
-    // removed during exit.
+pub fn release_closed_handles(handles: impl IntoIterator<Item = multitask::KernelHandle>) {
+    let closed: Vec<multitask::KernelHandle> = handles.into_iter().collect();
+    if closed.is_empty() {
+        return;
+    }
     let refs = service_handle_refs_from_handles(&closed);
     release_service_handle_refs_bounded(&refs);
     purge_closed_console_handles(
@@ -2237,6 +2220,27 @@ pub fn release_all_service_handle_refs(process_id: u64) {
             .collect(),
         true,
     );
+}
+
+pub fn release_all_service_handle_refs(process_id: u64) {
+    // vfsd drops this process's POSIX locks from the lifecycle exit event; only
+    // the kernel-side "may hold locks" mark must not outlive the pid.
+    super::super::file_lock_ops::forget_process(process_id);
+    // Callers have already sealed the process as exiting, which revokes its
+    // visibility; the teardown accessor is the one path that still reaches the
+    // handle table, so every open-description reference is released exactly
+    // once here instead of leaking with the process object.
+    let closed = multitask::with_process_state_for_teardown_mut(process_id, |state| {
+        let mut closed = state.handles_mut().close_all();
+        closed.append(&mut state.take_deferred_fork_handle_drops());
+        closed
+    })
+    .unwrap_or_default();
+    // Derive provider releases from the exact handles removed under the
+    // process-state mutation. A pre-close snapshot races dup/close/fd reuse
+    // and can release the wrong service object or leak the one actually
+    // removed during exit.
+    release_closed_handles(closed);
 }
 
 pub fn purge_closed_console_handles(handles: Vec<multitask::ConsoleHandle>, bounded: bool) {

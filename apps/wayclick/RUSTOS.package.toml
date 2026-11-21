@@ -16,4 +16,6 @@ display_name = "WayClick"
 # needs an explicit interactive fair-share weight under DVM input stress.
 weight_micros = 1000
 console_hosted = false
+request_processes = 1
+request_threads = 4
 env = ["RUSTOS_WAYCLICK_PROFILE=0"]

@@ -505,7 +505,10 @@ fn node_mode(node: ProcNode) -> u32 {
 
 fn node_nlink(node: ProcNode) -> u32 {
     match node {
-        ProcNode::PidDir | ProcNode::NsDir => 2,
+        // `/proc/<pid>` contains `.`, `..`, `fd`, `ns`, and `task`.
+        ProcNode::PidDir => 5,
+        ProcNode::NsDir => 2,
+        ProcNode::Kernel(ProcKernelNode::TaskDir, _) => 3,
         ProcNode::Kernel(kernel, _) if kernel.is_directory() => 2,
         _ => 1,
     }

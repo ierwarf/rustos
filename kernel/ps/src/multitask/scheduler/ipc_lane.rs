@@ -106,6 +106,7 @@ fn settle(cpu: usize, slot: usize, id: u64, clock: &crate::arch::rtc::ClockSampl
         }
     }
     let fair = elapsed.max(super::SCHED_MIN_GRANULARITY_NS);
+    runqueue::charge_cpu_time(slot, elapsed);
     runqueue::add_vruntime(
         slot,
         super::task_weight::weighted_vruntime_delta(fair, runqueue::weight::value(slot)),
@@ -422,6 +423,7 @@ fn finish(
         let hop = super::execution_interval::forward(
             cpu, (from.slot, from.id), (to.slot, to.id, running.generation), label.map_or(0, |(_, reply)| reply), clock);
         runtime_profile::owner::lane_account(cpu, from.slot, hop);
+        runqueue::charge_cpu_time(from.slot, hop);
         runqueue::add_vruntime(
             from.slot,
             super::task_weight::weighted_vruntime_delta(

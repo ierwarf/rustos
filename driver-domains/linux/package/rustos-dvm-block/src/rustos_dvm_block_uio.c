@@ -89,11 +89,12 @@ static int rustos_dvm_block_validate_aperture(struct pci_dev *pdev)
 	    resource_size(shared) != RUSTOS_DVM_BLOCK_APERTURE_BYTES)
 		return -ENODEV;
 	/*
-	 * BAR2 is shared RAM and every live participant maps it WB.  Do not use
-	 * pci_iomap() even for header discovery: on x86 that may create a
-	 * temporary UC alias while RustOS and the relay retain WB mappings.
+	 * SeaBIOS places the 32-bit PCI BAR2 inside the UC PCI MMIO MTRR hole,
+	 * where PAT WB would still downgrade to effective UC.  Use WC so PAT
+	 * overrides the UC MTRR for bulk 64-KiB read streaming; ioremap_wc keeps
+	 * the kernel probe's PAT attribute consistent with userspace.
 	 */
-	mapped = ioremap_cache(shared->start, sizeof(bytes));
+	mapped = ioremap_wc(shared->start, sizeof(bytes));
 	if (!mapped)
 		return -ENOMEM;
 	memcpy_fromio(bytes, mapped, sizeof(bytes));
@@ -170,12 +171,12 @@ static int rustos_dvm_block_mmap(struct uio_info *info,
 		return -EINVAL;
 	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
 	/*
-	 * BAR2 is QEMU shared RAM, not controller MMIO. RustOS maps the same
-	 * aperture cacheable; keep x86 PAT cache bits clear for coherent WB
-	 * atomics and bulk 64-KiB transfer slots.
+	 * BAR2 is QEMU shared RAM inside the SeaBIOS UC PCI MMIO MTRR range.
+	 * On x86, PAT=WC overrides MTRR=UC whereas PAT=WB would fall back to UC;
+	 * combine with sfence before cursor publication and wmb() before the
+	 * completion doorbell so WC 64-KiB slot stores are globally visible.
 	 */
-	vma->vm_page_prot = __pgprot(pgprot_val(vma->vm_page_prot) &
-				     ~_PAGE_CACHE_MASK);
+	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 	return remap_pfn_range(vma, vma->vm_start,
 			       state->shared_start >> PAGE_SHIFT, mapped_bytes,
 			       vma->vm_page_prot);
