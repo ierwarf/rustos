@@ -282,15 +282,19 @@ owned Data/Hole/Unwritten read maps. Extents are backend accelerators, never a
 kernel-visible FAT layout or a requirement for compressed/inline future files.
 FAT builds/coalesces its map once from the existing engine and checks geometry,
 overlap/cycles, full coverage, metadata admission and mutation epoch. Identity
-is the volume instance + short-directory-entry slot + nonwrapping media-write
+is the volume instance + short-directory-entry slot + a per-file registration
 generation: repeated/case-alias opens agree; reused slots cannot revive a stale
-read lease. This is not a persistent inode/checkpoint identity across mutation.
+read lease. A map records the byte spans it depends on (its data extents, the FAT
+entries of its chain in every FAT copy, and its directory entry) in a registry
+of at most 128 entries / 16 MiB; only a write that overlaps those spans revokes
+it, so unrelated writes never abort a snapshot, and an evicted registration just
+forces a replan. This is not a persistent inode/checkpoint identity across mutation.
 
 Ordinary read maps are bounded to 128 entries / 8 MiB; per-snapshot planning is
 bounded to 2 MiB. Detached readers hold only the checked map/device, not a FAT
 namespace borrow or a second filesystem/cache. Runtime-supplied sleeping device
 waits and per-device response storage preserve progress across blocking IPC and
-old/new mounts. Every write attempt revokes old map versions before media I/O.
+old/new mounts. A write that overlaps a map's spans revokes it before media I/O.
 
 FAT path identity: the volume matches names ASCII-case-insensitively (and the
 engine resolves a long name and its 8.3 alias to one entry), so `/BIN/Ls` and
@@ -864,28 +868,54 @@ the read-only accelerator; TmpFs has it (next section).
     cached. Cached bytes therefore cannot survive revoke, restart, or mutation,
     and the optimization adds no controller authority or hidden fallback to
     vfsd.
-- Vfsd reads a large range (at least 2 MiB; the executable snapshot transfer uses
-  its own 4-MiB window, `SNAPSHOT_WINDOW_BYTES`, so it qualifies, while loaderd
-  and the early-system broker keep the shared 256-KiB window)
-  through `services/vfsd/src/bulk_lanes.rs`: the calling snapshot worker and up
-  to three helper threads claim chunk indexes from one cursor and each issue
-  one bulk storaged call per chunk, so adjacent chunks are read concurrently.
-  A lane is never the VFS receive owner and uses only storaged IPC and
-  kernel-direct futexes, so it cannot wait on syscalld. One job runs at a time;
-  a second concurrent large read, a smaller read, or an unavailable pool reads
-  on its own thread. The caller does not return before every claimed chunk
-  completed (including after an error), the first error aborts unclaimed
-  chunks, and each chunk's echoed header, generation, LBA, block count and
-  length are validated exactly as for a single bulk call. When a read starts
-  where the previous one ended, the helpers then read the next range of the same
-  size into a private 4-MiB buffer while the caller hashes or writes what it
-  received; the next read adopts that job, helps finish it and copies the bytes
-  out. A different range or generation, a prefetch error, or any vfsd block
-  write (`invalidate_prefetch`, before and after the write) discards the
-  lookahead and reads normally, so it can change latency but never the bytes or
-  the error a caller sees. Measured over four interleaved boots per arm, the
-  306 MB Chrome snapshot's read+write+hash took 0.77 s with lookahead and 0.86 s
-  without.
+- Vfsd reads a large range (at least 2 MiB; the executable snapshot pipeline reads
+  4-MiB windows, while loaderd and the early-system broker keep the shared
+  256-KiB window) through `services/vfsd/src/bulk_lanes.rs`: the calling thread
+  and up to three helper threads claim chunk indexes from one cursor and each
+  issue one bulk storaged call per chunk, so adjacent chunks are read
+  concurrently. A lane is never the VFS receive owner and uses only storaged IPC
+  and kernel-direct futexes, so it cannot wait on syscalld. Four job slots allow
+  several large reads at once; a read falls back to its own thread only when
+  every slot is busy, the read is smaller than the threshold, or the pool is
+  unavailable. Helper threads live on static stacks for the process lifetime;
+  nothing is leaked or cached between calls. The caller does not return before
+  every claimed chunk completed (including after an error), the first error
+  aborts unclaimed chunks, and each chunk's echoed header, generation, LBA,
+  block count and length are validated exactly as for a single bulk call.
+- The executable snapshot is built by `services/vfsd/src/snapshot_pipeline.rs`,
+  a bounded three-stage pipeline over a ring of 2-3 windows of up to 4 MiB
+  (`SnapshotBudget` bills the whole ring, at most 12 MiB per snapshot). The
+  caller thread reads window N+1 straight into its ring slot through the lanes
+  while a writer helper writes window N into the sealed memfd and a hasher
+  helper hashes window N-1; with no helper available the caller drives the
+  other stages itself, serially. Window counters (`read_done`, `written`,
+  `hashed`) bound the reader to the slowest consumer, the first error aborts
+  every stage and joins them, and a partial memfd is never sealed. The SHA-256
+  digest is computed only for a verbose plan (product evidence for a DVM volume);
+  a plan that skipped it cannot publish product evidence. A write to the volume
+  during the transfer cannot publish stale bytes: each window read revalidates
+  its read-map source and `commit_executable_snapshot` re-checks the map.
+- Bulk reply and request wire shape: a `READ_BULK` reply is the 80-byte response
+  header plus exactly `payload_len` bytes, a `WRITE_BULK` request is the header
+  plus exactly `payload_len` bytes, and the receiver validates the exact length
+  (`StoragedBulkReadResponse::payload_of_reply`, `StoragedBulkWriteRequest::
+  payload_of_request`); no tail is zero-filled and no byte past the received
+  length is read. Vfsd caches the storaged endpoint and pid, drops the cache on
+  any IPC error or envelope failure and retries once only when the endpoint id
+  changed, so a restarted storaged is found without a per-call lookup.
+- Large IPC replies cost one validated copy into a reserved (unzeroed) buffer that
+  becomes the frame spill by move (`complete_fast_reply_moving`), and one copy
+  to the caller; the request direction uses the same direct copy. Storaged
+  validates its requester with the stable-publication ownership check
+  (`process_owns_stable_live_service_endpoint`), which fails closed while that
+  service is being republished, instead of the global registry mutation lock.
+- Memfd writes copy user bytes straight into private, unzeroed frames for the
+  pages a write adds (only uncovered head/tail/hole bytes are zeroed) and install
+  them under the lock after the copy succeeded, so a failed copy exposes nothing;
+  writes to existing pages stage in one per-syscall scratch buffer and copy under
+  the lock after the seals are re-checked. The write cursor is reserved first and
+  restored on a short write unless another writer moved it. Write chunks are
+  256 KiB.
 - The storage-DVM relay (`rustos-dvm-block.c`) executes ring requests strictly
   one at a time, so a sequential stream is bounded by the guest block layer's
   per-command latency unless the page cache can overlap commands (measured:
@@ -917,8 +947,10 @@ the read-only accelerator; TmpFs has it (next section).
   `readahead_*`); storaged logs `storaged: read engine` every 1024 reads
   (`waited` = reads that blocked on a window, `stall_us` = their total wait,
   `demand_windows`, `ahead_windows`, `in_flight_peak`, `streams`); vfsd's
-  `snapshot transfer` line carries `storaged_calls`, `storaged_us`,
-  `storaged_max_us`. Together they split a slow snapshot into DVM device time,
+  `snapshot transfer` line carries `total_us` (wall), per-stage busy times
+  `read_us`/`write_us`/`hash_us` that overlap, `windows`, `helper_stages`,
+  `*_stall_us` per stage, and `storaged_calls`, `storaged_us` (sampled 1 in 32
+  calls, scaled) and `storaged_max_us`. Together they split a slow snapshot into DVM device time,
   broker/IPC time and vfsd time without per-request output.
 - TmpFs mounts `/tmp`, `/dev/shm` and `/run` use `CasePolicy::Exact` and
   independent allocation-byte quotas, sparse holes, inode-pinned descriptions,

@@ -633,3 +633,84 @@ fn concurrent_spilled_replies_publish_and_return_custody_only_once() {
         assert!(bytes == [1; IPC_FAST_INLINE_BYTES + 1] || bytes == [2; IPC_FAST_INLINE_BYTES + 1]);
     });
 }
+
+#[test]
+fn moved_large_reply_becomes_the_spill_exactly_and_empties_the_callers_vec() {
+    use super::super::*;
+    with_isolated_ipc_test(|| {
+        let endpoint = create_endpoint().unwrap();
+        let len = IPC_FAST_MAX_BYTES;
+        add_endpoint_receiver_waiter(endpoint, 31).unwrap();
+        let (reply, _) = reserve_fast_endpoint_call_with_response_capacity(
+            endpoint, 70, 7, b"request", len, None,
+        ).unwrap();
+        take_fast_endpoint_request(endpoint, 31).unwrap().unwrap();
+        let mut response: std::vec::Vec<u8> = (0..len).map(|i| (i % 253) as u8).collect();
+        let expected = response.clone();
+        let ptr = response.as_ptr();
+        let completion = complete_fast_endpoint_reply_moving(reply, 31, &mut response).unwrap();
+        assert_eq!(completion.terminal_error, None);
+        assert!(response.is_empty(), "accepted response must be moved, not copied");
+        let FastEndpointResponseTake::Spilled(bytes) = take_fast_endpoint_response(reply, 7).unwrap() else {
+            panic!("missing spilled response");
+        };
+        assert_eq!(bytes.len(), len);
+        assert_eq!(bytes, expected);
+        assert_eq!(bytes.as_ptr(), ptr, "the caller's allocation is the spill");
+    });
+}
+
+#[test]
+fn rejected_moved_reply_returns_the_callers_bytes_untouched() {
+    use super::super::*;
+    with_isolated_ipc_test(|| {
+        let endpoint = create_endpoint().unwrap();
+        add_endpoint_receiver_waiter(endpoint, 31).unwrap();
+        let (reply, _) = reserve_fast_endpoint_call_with_response_capacity(
+            endpoint, 70, 7, b"request", IPC_FAST_INLINE_BYTES + 1, None,
+        ).unwrap();
+        take_fast_endpoint_request(endpoint, 31).unwrap().unwrap();
+        let mut response = std::vec![9_u8; IPC_FAST_INLINE_BYTES + 1];
+        // Wrong receiver: rejected under the lock after the vec was staged.
+        assert_eq!(complete_fast_endpoint_reply_moving(reply, 32, &mut response).unwrap_err(),
+                   IpcError::PermissionDenied);
+        assert_eq!(response, std::vec![9_u8; IPC_FAST_INLINE_BYTES + 1]);
+        // The same reply still completes afterwards.
+        complete_fast_endpoint_reply_moving(reply, 31, &mut response).unwrap();
+        assert!(response.is_empty());
+        // A consumed reply is rejected and the new bytes stay with the caller.
+        let mut late = std::vec![5_u8; IPC_FAST_INLINE_BYTES + 1];
+        assert!(complete_fast_endpoint_reply_moving(reply, 31, &mut late).is_err());
+        assert_eq!(late.len(), IPC_FAST_INLINE_BYTES + 1);
+    });
+}
+
+#[test]
+fn moved_reply_longer_than_capacity_is_terminal_and_short_reply_keeps_exact_length() {
+    use super::super::*;
+    with_isolated_ipc_test(|| {
+        let endpoint = create_endpoint().unwrap();
+        add_endpoint_receiver_waiter(endpoint, 31).unwrap();
+        let (reply, _) = reserve_fast_endpoint_call_with_response_capacity(
+            endpoint, 70, 7, b"request", IPC_FAST_INLINE_BYTES + 4, None,
+        ).unwrap();
+        take_fast_endpoint_request(endpoint, 31).unwrap().unwrap();
+        let mut too_big = std::vec![1_u8; IPC_FAST_INLINE_BYTES + 5];
+        let completion = complete_fast_endpoint_reply_moving(reply, 31, &mut too_big).unwrap();
+        assert_eq!(completion.terminal_error, Some(IpcError::BufferTooSmall));
+
+        add_endpoint_receiver_waiter(endpoint, 31).unwrap();
+        let (reply, _) = reserve_fast_endpoint_call_with_response_capacity(
+            endpoint, 70, 7, b"request", IPC_FAST_MAX_BYTES, None,
+        ).unwrap();
+        take_fast_endpoint_request(endpoint, 31).unwrap().unwrap();
+        // A reply much shorter than the caller's capacity reads back exactly.
+        let mut short = std::vec![3_u8; IPC_FAST_INLINE_BYTES + 1];
+        short.reserve_exact(4096);
+        complete_fast_endpoint_reply_moving(reply, 31, &mut short).unwrap();
+        let FastEndpointResponseTake::Spilled(bytes) = take_fast_endpoint_response(reply, 7).unwrap() else {
+            panic!("missing spilled response");
+        };
+        assert_eq!(bytes, std::vec![3_u8; IPC_FAST_INLINE_BYTES + 1]);
+    });
+}

@@ -2,13 +2,22 @@
 //!
 //! The volume remains the sole filesystem owner. Maps retain no File<'volume>
 //! borrow, pathname, second FatVolume, or raw-device capability. Bind a map back
-//! to its originating volume/version for each bounded read. Every write attempt
-//! revokes prior maps before it can modify media. Mutable VFS opens are not
-//! enabled by this read-only view; later backends can implement ReadAt directly.
-//! Malformed chains are bounded by the admitted length and reject overlapping
-//! cluster ranges, premature EOF, out-of-device extents and metadata pressure.
+//! to its originating volume for each bounded read.
+//!
+//! Validity is per file (see `map_registry`): a map depends on its data
+//! extents, the FAT entries of its cluster chain (every FAT copy) and its
+//! directory entry. A write overlapping any of those revokes the map before it
+//! can modify media; a write elsewhere on the volume does not. (FAT12 packs
+//! neighbouring 12-bit entries into shared bytes, so there a neighbour's chain
+//! update conservatively revokes too; that costs a replan, never correctness.)
+//! Mutable VFS
+//! opens are not enabled by this read-only view; later backends can implement
+//! ReadAt directly. Malformed chains are bounded by the admitted length and
+//! reject overlapping cluster ranges, premature EOF, out-of-device extents and
+//! metadata pressure.
 
 use super::*;
+use crate::map_registry::{normalize, Span};
 use storage_core::file_io::{FileCapabilities, FileIdentity, FileRange, FileReadMap, RangeError, RangeKind, ReadAt};
 
 pub struct FatReadView<'a, D: BlockDevice> {
@@ -25,6 +34,56 @@ pub struct FatReadSource<D: BlockDevice> {
     scratch: Vec<u8>,
 }
 
+fn map_is_current<D>(dev: &SharedDevice<D>, map: &FileReadMap) -> bool {
+    let id = map.identity();
+    id.volume == dev.identity && dev.maps.is_current(id.object, id.generation)
+}
+
+/// On-media layout needed to turn data extents into the FAT entries that link
+/// them. Parsed from the boot sector and cross-checked against fatfs.
+struct FatGeometry {
+    fat_type: fatfs::FatType,
+    cluster_bytes: u64,
+    data_start: u64,
+    fat_starts: Vec<u64>,
+    fat_bytes: u64,
+}
+
+impl FatGeometry {
+    /// Device byte span of the FAT entries for clusters `first..=last`.
+    fn entry_span(&self, fat_start: u64, first: u64, last: u64) -> Option<Span> {
+        let (start, end) = match self.fat_type {
+            fatfs::FatType::Fat12 => (first.checked_mul(3)? / 2, last.checked_mul(3)? / 2 + 2),
+            fatfs::FatType::Fat16 => (first.checked_mul(2)?, last.checked_mul(2)? + 2),
+            fatfs::FatType::Fat32 => (first.checked_mul(4)?, last.checked_mul(4)? + 4),
+        };
+        if end > self.fat_bytes { return None; }
+        Some((fat_start.checked_add(start)?, fat_start.checked_add(end)?))
+    }
+
+    /// Everything that determines the extents in `physical` (sorted, disjoint
+    /// data spans): the data itself, the chain's FAT entries in every FAT copy,
+    /// and the 32-byte directory entry at `entry_offset`.
+    fn dependencies(&self, physical: &[Span], entry_offset: u64) -> Result<Vec<Span>, RangeError> {
+        let mut deps = Vec::new();
+        let count = physical.len() * (1 + self.fat_starts.len()) + 1;
+        deps.try_reserve_exact(count).map_err(|_| RangeError::NoMemory)?;
+        for &(start, end) in physical {
+            deps.push((start, end));
+            let rel = start.checked_sub(self.data_start).ok_or(RangeError::Invalid)?;
+            if rel % self.cluster_bytes != 0 { return Err(RangeError::Invalid); }
+            let first = rel / self.cluster_bytes + 2;
+            let last = first + (end - start).div_ceil(self.cluster_bytes) - 1;
+            for &fat_start in &self.fat_starts {
+                deps.push(self.entry_span(fat_start, first, last).ok_or(RangeError::Invalid)?);
+            }
+        }
+        deps.push((entry_offset, entry_offset.checked_add(32).ok_or(RangeError::Invalid)?));
+        normalize(&mut deps);
+        Ok(deps)
+    }
+}
+
 fn range_error(error: FatError) -> RangeError {
     match error {
         fatfs::Error::Io(error) => RangeError::Io(error),
@@ -33,6 +92,40 @@ fn range_error(error: FatError) -> RangeError {
 }
 
 impl<D: BlockDevice> FatVolume<D> {
+    fn fat_geometry(&self, fs: &FatFs<D>) -> Result<FatGeometry, RangeError> {
+        let mut block = Vec::new();
+        {
+            let mut dev = self.device.lock();
+            let size = dev.device.logical_block_size();
+            block.try_reserve_exact(size).map_err(|_| RangeError::NoMemory)?;
+            block.resize(size, 0);
+            dev.device.read_blocks(0, &mut block).map_err(RangeError::Io)?;
+        }
+        let u16_at = |at: usize| u64::from(u16::from_le_bytes([block[at], block[at + 1]]));
+        let u32_at = |at: usize| u64::from(u32::from_le_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]]));
+        let sector = u16_at(11);
+        let per_cluster = u64::from(block[13]);
+        let reserved = u16_at(14);
+        let fats = u64::from(block[16]);
+        let root_entries = u16_at(17);
+        let fat_sectors = match u16_at(22) { 0 => u32_at(36), small => small };
+        let cluster_bytes = sector.checked_mul(per_cluster).ok_or(RangeError::Invalid)?;
+        if !(512..=4096).contains(&sector) || !sector.is_power_of_two() || per_cluster == 0
+            || fats == 0 || fat_sectors == 0 || cluster_bytes != u64::from(fs.cluster_size())
+        {
+            return Err(RangeError::Invalid);
+        }
+        let root_sectors = (root_entries * 32).div_ceil(sector);
+        let fat_bytes = fat_sectors.checked_mul(sector).ok_or(RangeError::Invalid)?;
+        let mut fat_starts = Vec::new();
+        fat_starts.try_reserve_exact(fats as usize).map_err(|_| RangeError::NoMemory)?;
+        for fat in 0..fats {
+            fat_starts.push((reserved + fat * fat_sectors) * sector);
+        }
+        let data_start = (reserved + fats * fat_sectors + root_sectors) * sector;
+        Ok(FatGeometry { fat_type: fs.fat_type(), cluster_bytes, data_start, fat_starts, fat_bytes })
+    }
+
     pub fn read_capabilities(&self) -> FileCapabilities {
         FileCapabilities { max_file_bytes: u32::MAX as u64, writable: false, sparse: false }
     }
@@ -43,24 +136,25 @@ impl<D: BlockDevice> FatVolume<D> {
     pub fn plan_read(&self, path: &str, metadata_budget: usize) -> Result<FileReadMap, RangeError> {
         let fs = self.lock_fs();
         // Maps read the device directly, so staged FAT-layer blocks must have
-        // reached it before the map can be called current. The flush may itself
-        // write (and so revoke), hence the epoch is sampled after it.
+        // reached it before the map can be called current. The namespace lock
+        // is held until registration, so no write can intervene afterwards.
         fs.flush_disk().map_err(range_error)?;
-        let (identity, version) = {
-            let dev = self.device.lock();
-            (dev.identity, dev.version)
-        };
+        let geometry = self.fat_geometry(&fs)?;
         let (mut file, len) =
             Self::open_file_with_len_in(&fs, self.max_dir_entries(), path).map_err(range_error)?;
-        let object = file.0.directory_entry_offset().and_then(|offset| offset.checked_add(1))
-            .ok_or(RangeError::Invalid)?;
+        let entry_offset = file.0.directory_entry_offset().ok_or(RangeError::Invalid)?;
+        let object = entry_offset.checked_add(1).ok_or(RangeError::Invalid)?;
         if len > self.device_bytes || len > self.read_capabilities().max_file_bytes {
             return Err(RangeError::Invalid);
         }
+        let (identity, generation) = {
+            let dev = self.device.lock();
+            (dev.identity, dev.maps.expected_generation(object))
+        };
         let per_range = core::mem::size_of::<FileRange>() + core::mem::size_of::<(u64, u64)>();
         let limit = metadata_budget / per_range;
         let mut map = FileReadMap::new(
-            FileIdentity { volume: identity, object, generation: version },
+            FileIdentity { volume: identity, object, generation },
             len, self.device_bytes, limit * core::mem::size_of::<FileRange>(),
         )?;
         let mut left = len;
@@ -87,21 +181,19 @@ impl<D: BlockDevice> FatVolume<D> {
         if physical.windows(2).any(|pair| pair[0].1 > pair[1].0) {
             return Err(RangeError::Invalid);
         }
-        if self.device.lock().version != version { return Err(RangeError::Stale); }
+        let deps = geometry.dependencies(&physical, entry_offset)?;
+        self.device.lock().maps.admit(object, generation, deps)?;
         Ok(map)
     }
 
     pub fn read_map_is_current(&self, map: &FileReadMap) -> bool {
-        let dev = self.device.lock();
-        let id = map.identity();
-        id.volume == dev.identity && id.generation == dev.version
+        map_is_current(&self.device.lock(), map)
     }
 
     pub fn read_source(&self, map: Arc<FileReadMap>) -> Result<FatReadSource<D>, RangeError> {
         let block_bytes = {
             let dev = self.device.lock();
-            let id = map.identity();
-            if id.volume != dev.identity || id.generation != dev.version { return Err(RangeError::Stale); }
+            if !map_is_current(&dev, &map) { return Err(RangeError::Stale); }
             dev.device.logical_block_size()
         };
         let mut scratch = Vec::new();
@@ -112,8 +204,7 @@ impl<D: BlockDevice> FatVolume<D> {
 
     pub fn read_view<'a>(&'a self, map: &'a FileReadMap, scratch: &'a mut [u8]) -> Result<FatReadView<'a, D>, RangeError> {
         let dev = self.device.lock();
-        let id = map.identity();
-        if id.volume != dev.identity || id.generation != dev.version { return Err(RangeError::Stale); }
+        if !map_is_current(&dev, map) { return Err(RangeError::Stale); }
         if scratch.len() < dev.device.logical_block_size() { return Err(RangeError::Budget); }
         Ok(FatReadView { volume: self, map, scratch })
     }
@@ -125,8 +216,7 @@ impl<D: BlockDevice> ReadAt for FatReadView<'_, D> {
     fn len(&self) -> u64 { self.map.len() }
     fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<usize, RangeError> {
         let mut dev = self.volume.device.lock();
-        let id = self.map.identity();
-        if id.volume != dev.identity || id.generation != dev.version { return Err(RangeError::Stale); }
+        if !map_is_current(&dev, &self.map) { return Err(RangeError::Stale); }
         self.map.read_at(&mut dev.device, offset, output, self.scratch)
     }
 }
@@ -137,8 +227,7 @@ impl<D: BlockDevice> ReadAt for FatReadSource<D> {
     fn len(&self) -> u64 { self.map.len() }
     fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<usize, RangeError> {
         let mut dev = self.device.lock();
-        let id = self.map.identity();
-        if id.volume != dev.identity || id.generation != dev.version { return Err(RangeError::Stale); }
+        if !map_is_current(&dev, &self.map) { return Err(RangeError::Stale); }
         self.map.read_at(&mut dev.device, offset, output, &mut self.scratch)
     }
 }
@@ -199,7 +288,7 @@ mod tests {
         // Namespace drop may flush volume status and revoke the epoch. The
         // independent device remains alive, never a borrowed/dangling FAT file.
         drop(volume);
-        let current = source.device.lock().version == source.identity().generation;
+        let current = map_is_current(&source.device.lock(), &source.map);
         if current {
             assert_eq!(source.read_at(0, &mut bytes), Ok(4));
             assert_eq!(&bytes, b"xycd");
@@ -209,17 +298,123 @@ mod tests {
     }
 
     #[test]
-    fn file_identity_is_stable_across_plans_and_case_aliases_but_not_mutation() {
+    fn file_identity_is_stable_across_plans_and_case_aliases_until_this_file_changes() {
         let mut volume = FatVolume::new(format_disk(512, 32768, 51)).unwrap();
         { let mut file = volume.create_file("a.bin").unwrap(); file.write(b"a").unwrap(); file.flush().unwrap(); }
         let a = volume.plan_read("a.bin", 4096).unwrap().identity();
         assert_eq!(a, volume.plan_read("A.BIN", 4096).unwrap().identity());
         { let mut file = volume.create_file("b.bin").unwrap(); file.write(b"b").unwrap(); file.flush().unwrap(); }
-        let new_a = volume.plan_read("a.bin", 4096).unwrap().identity();
+        let same_a = volume.plan_read("a.bin", 4096).unwrap().identity();
         let b = volume.plan_read("b.bin", 4096).unwrap().identity();
+        assert_eq!(a, same_a, "an unrelated create must not change a's identity");
+        assert_eq!(a.volume, b.volume);
+        assert_ne!(a.object, b.object);
+        assert_ne!(a.generation, b.generation);
+        { let mut file = volume.open_file("a.bin").unwrap(); file.write(b"z").unwrap(); file.flush().unwrap(); }
+        let new_a = volume.plan_read("a.bin", 4096).unwrap().identity();
         assert_eq!(a.object, new_a.object);
         assert_ne!(a.generation, new_a.generation);
-        assert_ne!(new_a.object, b.object);
+    }
+
+    fn fill(volume: &mut FatVolume<storage_core::MemBlockDevice>, name: &str, byte: u8, len: usize) {
+        let mut file = volume.create_file(name).unwrap();
+        let bytes = alloc::vec![byte; len];
+        let mut done = 0;
+        while done < bytes.len() { done += file.write(&bytes[done..]).unwrap(); }
+        file.flush().unwrap();
+    }
+
+    /// Plans `target`, runs `mutate`, and reports whether the map stayed valid.
+    fn survives(mutate: impl FnOnce(&mut FatVolume<storage_core::MemBlockDevice>)) -> bool {
+        let mut volume = FatVolume::new(format_disk(512, 32768, 77)).unwrap();
+        let cluster = volume.lock_fs().cluster_size() as usize;
+        fill(&mut volume, "target.bin", 0x11, cluster * 3 + 5);
+        fill(&mut volume, "other.bin", 0x22, cluster * 2);
+        let map = volume.plan_read("target.bin", 4096).unwrap();
+        assert!(volume.read_map_is_current(&map));
+        mutate(&mut volume);
+        let current = volume.read_map_is_current(&map);
+        let mut scratch = [0; 512];
+        assert_eq!(volume.read_view(&map, &mut scratch).is_ok(), current);
+        current
+    }
+
+    #[test]
+    fn unrelated_writes_keep_the_map_but_every_change_to_the_file_revokes_it() {
+        let cluster = {
+            let volume = FatVolume::new(format_disk(512, 32768, 77)).unwrap();
+            let size = volume.lock_fs().cluster_size() as usize;
+            size
+        };
+        // Unrelated: create/append/overwrite/truncate/delete other files and dirs.
+        assert!(survives(|v| fill(v, "new.bin", 0x33, cluster * 4)));
+        assert!(survives(|v| {
+            let mut other = v.open_file("other.bin").unwrap();
+            other.seek(SeekFrom::End(0)).unwrap();
+            other.write(&alloc::vec![9; cluster]).unwrap();
+            other.flush().unwrap();
+        }));
+        assert!(survives(|v| {
+            let mut other = v.open_file("other.bin").unwrap();
+            other.write(b"overwrite").unwrap();
+            other.flush().unwrap();
+        }));
+        assert!(survives(|v| {
+            let mut other = v.open_file("other.bin").unwrap();
+            other.truncate().unwrap();
+            other.flush().unwrap();
+        }));
+        // This file: append (size + chain), in-place overwrite (data only),
+        // truncate (size + chain).
+        assert!(!survives(|v| {
+            let mut file = v.open_file("target.bin").unwrap();
+            file.seek(SeekFrom::End(0)).unwrap();
+            file.write(b"tail").unwrap();
+            file.flush().unwrap();
+        }));
+        assert!(!survives(|v| {
+            let mut file = v.open_file("target.bin").unwrap();
+            file.seek(SeekFrom::Start(cluster as u64 + 7)).unwrap();
+            file.write(b"x").unwrap();
+            file.flush().unwrap();
+        }));
+        assert!(!survives(|v| {
+            let mut file = v.open_file("target.bin").unwrap();
+            file.seek(SeekFrom::Start(cluster as u64)).unwrap();
+            file.truncate().unwrap();
+            file.flush().unwrap();
+        }));
+    }
+
+    #[test]
+    fn namespace_changes_to_the_file_revoke_the_map() {
+        use storage_core::{FsOpenOptions, FsVolume};
+        let create = FsOpenOptions { create: true, write: true, ..Default::default() };
+        assert!(!survives(|v| { FsVolume::rename(v, "target.bin", "moved.bin", false, false).unwrap(); }));
+        assert!(!survives(|v| { v.unlink("target.bin").unwrap(); }));
+        // Delete and recreate under the same name: the directory slot and the
+        // first cluster are typically reused, yet the old map must not survive.
+        assert!(!survives(|v| {
+            v.unlink("target.bin").unwrap();
+            v.open_prepare("target.bin", create).unwrap();
+            v.write_at("target.bin", 0, b"fresh").unwrap();
+        }));
+        // Replacing the file by renaming another file over it.
+        assert!(!survives(|v| { FsVolume::rename(v, "other.bin", "target.bin", true, false).unwrap(); }));
+    }
+
+    #[test]
+    fn freed_clusters_reallocated_to_another_file_revoke_the_map() {
+        let mut volume = FatVolume::new(format_disk(512, 32768, 78)).unwrap();
+        let cluster = volume.lock_fs().cluster_size() as usize;
+        fill(&mut volume, "target.bin", 0x11, cluster * 2);
+        let map = volume.plan_read("target.bin", 4096).unwrap();
+        // Truncating through the volume interface changes only the FAT chain
+        // and the size, the data clusters stay on the media until reused.
+        storage_core::FsVolume::truncate(&volume, "target.bin", 0).unwrap();
+        assert!(!volume.read_map_is_current(&map));
+        let mut scratch = [0; 512];
+        assert!(matches!(volume.read_view(&map, &mut scratch), Err(RangeError::Stale)));
     }
 
     #[test]

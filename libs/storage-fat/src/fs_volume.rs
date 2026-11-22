@@ -387,7 +387,6 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
                 let canon = append_canonical(&parent_canon, &entry.file_name());
                 let mut meta = entry_to_metadata(&entry, &canon, cluster_size, self.read_only);
                 if opts.truncate {
-                    self.bump_version()?;
                     let mut file = entry.to_file();
                     file.truncate().map_err(map_fat_error)?;
                     file.flush().map_err(map_fat_error)?;
@@ -400,7 +399,6 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
                 if !(opts.create || opts.create_new) {
                     return Err(FsError::NotFound);
                 }
-                self.bump_version()?;
                 let mut file = dir.create_file(child).map_err(map_fat_error)?;
                 file.flush().map_err(map_fat_error)?;
                 drop(file);
@@ -470,7 +468,6 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
             return Err(FsError::PermissionDenied);
         }
         let current_len = entry.len();
-        self.bump_version()?;
         let mut file = entry.to_file();
         if offset > current_len {
             file.seek(SeekFrom::Start(current_len)).map_err(map_fat_error)?;
@@ -530,7 +527,6 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
             return Err(FsError::PermissionDenied);
         }
         let current_len = entry.len();
-        self.bump_version()?;
         let mut file = entry.to_file();
         if new_len < current_len {
             file.seek(SeekFrom::Start(new_len)).map_err(map_fat_error)?;
@@ -559,7 +555,6 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
             Err(fatfs::Error::NotFound) => {}
             Err(err) => return Err(map_fat_error(err)),
         }
-        self.bump_version()?;
         dir.create_dir(child).map_err(map_fat_error)?;
         fs.flush_disk().map_err(map_fat_error)?;
         Ok(())
@@ -582,7 +577,6 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
             return Err(FsError::IsADirectory);
         }
         drop(entry);
-        self.bump_version()?;
         dir.remove(child).map_err(map_fat_error)?;
         fs.flush_disk().map_err(map_fat_error)?;
         Ok(())
@@ -605,7 +599,6 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
             return Err(FsError::NotADirectory);
         }
         drop(entry);
-        self.bump_version()?;
         dir.remove(child).map_err(map_fat_error)?;
         fs.flush_disk().map_err(map_fat_error)?;
         Ok(())
@@ -670,11 +663,9 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
                 if !dst_is_dir && src_is_dir {
                     return Err(FsError::NotADirectory);
                 }
-                self.bump_version()?;
                 dst_dir.remove(dst_name).map_err(map_fat_error)?;
             }
             Err(fatfs::Error::NotFound) => {
-                self.bump_version()?;
             }
             Err(err) => return Err(map_fat_error(err)),
         }
@@ -708,7 +699,6 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
         if entry.is_dir() {
             return Err(FsError::Unsupported);
         }
-        self.bump_version()?;
         let mut file = entry.to_file();
         if let Some(ts) = atime {
             file.set_accessed(timestamp_to_date(ts));
@@ -1048,57 +1038,44 @@ mod tests {
     }
 
     #[test]
-    fn fs_volume_mutations_revoke_detached_read_sources() {
-        let vol = FatVolume::new(format_disk(512, 8192, 0xbbbb_cccc)).unwrap();
-        vol.open_prepare(
-            "a.txt",
-            FsOpenOptions {
-                create: true,
-                write: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    fn fs_volume_mutations_revoke_only_the_read_sources_they_affect() {
+        // FAT16 (FAT12 packs neighbouring entries into shared bytes, so a
+        // neighbour's chain update conservatively revokes there).
+        let vol = FatVolume::new(format_disk(512, 32768, 0xbbbb_cccc)).unwrap();
+        let create = FsOpenOptions { create: true, write: true, ..Default::default() };
+        vol.open_prepare("a.txt", create).unwrap();
         vol.write_at("a.txt", 0, b"hello").unwrap();
 
-        let assert_revoked = |op: &dyn Fn(&FatVolume<MemBlockDevice>)| {
+        let step = core::cell::Cell::new(0);
+        let check = |op: &dyn Fn(&FatVolume<MemBlockDevice>), revoked: bool| {
+            step.set(step.get() + 1);
             let map = Arc::new(vol.plan_read("a.txt", 4096).unwrap());
-            let mut source = vol.read_source(map).unwrap();
+            let mut source = vol.read_source(map.clone()).unwrap();
             let mut buf = [0u8; 5];
             assert_eq!(source.read_at(0, &mut buf).unwrap(), 5);
             op(&vol);
-            assert_eq!(source.read_at(0, &mut buf), Err(RangeError::Stale));
+            assert_eq!(vol.read_map_is_current(&map), !revoked, "step {}", step.get());
+            if revoked {
+                assert_eq!(source.read_at(0, &mut buf), Err(RangeError::Stale));
+            } else {
+                assert_eq!(source.read_at(0, &mut buf).unwrap(), 5);
+                assert_eq!(&buf, b"hello");
+            }
         };
 
-        assert_revoked(&|v| {
-            v.write_at("a.txt", 0, b"world").unwrap();
-        });
-        assert_revoked(&|v| {
-            v.truncate("a.txt", 10).unwrap();
-        });
-        assert_revoked(&|v| {
-            v.mkdir("sub").unwrap();
-        });
-        assert_revoked(&|v| {
-            v.open_prepare(
-                "b.txt",
-                FsOpenOptions {
-                    create: true,
-                    write: true,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        });
-        assert_revoked(&|v| {
-            FsVolume::rename(v, "b.txt", "c.txt", false, false).unwrap();
-        });
-        assert_revoked(&|v| {
-            v.unlink("c.txt").unwrap();
-        });
-        assert_revoked(&|v| {
-            v.rmdir("sub").unwrap();
-        });
+        // Changes elsewhere on the volume leave a.txt's map valid.
+        check(&|v| { v.mkdir("sub").unwrap(); }, false);
+        check(&|v| { v.open_prepare("b.txt", create).unwrap(); }, false);
+        check(&|v| { v.write_at("b.txt", 0, &[7; 3000]).unwrap(); }, false);
+        check(&|v| { v.truncate("b.txt", 10).unwrap(); }, false);
+        check(&|v| { FsVolume::rename(v, "b.txt", "c.txt", false, false).unwrap(); }, false);
+        check(&|v| { v.unlink("c.txt").unwrap(); }, false);
+        check(&|v| { v.rmdir("sub").unwrap(); }, false);
+        // Changes to a.txt revoke it (the last check also rewrites its data in
+        // place, which keeps its extents but changes the bytes behind them).
+        check(&|v| { v.truncate("a.txt", 10).unwrap(); }, true);
+        check(&|v| { v.write_at("a.txt", 0, b"world").unwrap(); }, true);
+        check(&|v| { v.write_at("a.txt", 3, b"x").unwrap(); }, true);
     }
 
     #[test]

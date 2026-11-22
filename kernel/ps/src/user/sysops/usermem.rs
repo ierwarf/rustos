@@ -119,6 +119,63 @@ pub fn copy_from_current_user_exact(
     }
 }
 
+/// Copies `len` bytes of the caller's memory into a freshly reserved `Vec`
+/// without zero-filling it first.
+///
+/// The length is the caller's to bound before this call. The reservation is
+/// the only allocation; the bytes are copied straight into it (the direct
+/// fault-recoverable copy first, the validated exact-MM copy when that faults or
+/// is disabled) and the `Vec` length covers them only after every byte was
+/// written, so no uninitialized byte is ever visible through the result.
+/// Reservation failure is `OutOfFrames`, before any user access.
+pub fn copy_from_current_user_to_vec(
+    user_ptr: u64,
+    len: usize,
+) -> Result<alloc::vec::Vec<u8>, paging::AddressSpaceError> {
+    let mut bytes = alloc::vec::Vec::new();
+    if len == 0 {
+        return Ok(bytes);
+    }
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| paging::AddressSpaceError::OutOfFrames)?;
+    copy_from_current_user_uninit(user_ptr, &mut bytes.spare_capacity_mut()[..len])?;
+    // SAFETY: the copy above returned `Ok`, so the first `len` bytes of the
+    // reserved storage are initialized; `len` is within the reservation.
+    unsafe { bytes.set_len(len) };
+    Ok(bytes)
+}
+
+/// On `Ok` every byte of `dest` is initialized; on `Err` none may be assumed.
+fn copy_from_current_user_uninit(
+    user_ptr: u64,
+    dest: &mut [core::mem::MaybeUninit<u8>],
+) -> Result<(), paging::AddressSpaceError> {
+    if user_access::enabled()
+        && let Ok(start) = user_virt_addr(user_ptr, dest.len())
+        && user_access::copy_from_user(dest, start.as_u64())
+    {
+        return Ok(());
+    }
+    let dest_len = dest.len();
+    let mut run = || {
+        with_current_address_space(|address_space| {
+            let start = user_virt_addr(user_ptr, dest.len())?;
+            address_space
+                .validate_user_read(start, dest.len())?
+                .copy_into_uninit(dest)
+        })
+    };
+    match run() {
+        Err(paging::AddressSpaceError::NotMapped)
+            if populate_anonymous_range(user_ptr, dest_len, false)? =>
+        {
+            run()
+        }
+        other => other,
+    }
+}
+
 /// Performs the fast-call request copy and reply-range admission under one
 /// exact MM-generation bind. No IPC state is visible yet, so both operations
 /// remain preflight; combining only removes a duplicate process/table lock.

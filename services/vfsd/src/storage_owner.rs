@@ -21,7 +21,8 @@
 use super::*;
 use core::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
-use storage_core::file_io::{FileIdentity, ReadAt, TransferControl, TransferError, TransferFailure, transfer_exact};
+use storage_core::file_io::{FileIdentity, ReadAt, TransferControl, TransferError, TransferFailure};
+use vfsd::snapshot_pipeline::{PipelineControl, WindowDigest};
 
 static NEXT_EXECUTABLE_SNAPSHOT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -52,57 +53,7 @@ pub(crate) fn next_executable_snapshot_request_id() -> Result<u64, i32> {
 /// could never hit a warm entry and two independent mutable views of one
 /// device existed at once. Storage is therefore a single shared owner, and a
 /// namespace-only request never has to wait behind a bulk read.
-pub(crate) struct LruIndex<K: Ord + Clone> {
-    stamps: BTreeMap<K, u64>,
-    queue: alloc::collections::VecDeque<(K, u64)>,
-    seq: u64,
-}
-
-impl<K: Ord + Clone> LruIndex<K> {
-    pub(crate) const fn new() -> Self {
-        Self {
-            stamps: BTreeMap::new(),
-            queue: alloc::collections::VecDeque::new(),
-            seq: 0,
-        }
-    }
-
-    pub(crate) fn touch(&mut self, key: &K) {
-        self.seq = self.seq.wrapping_add(1);
-        let stamp = self.seq;
-        self.stamps.insert(key.clone(), stamp);
-        self.queue.push_back((key.clone(), stamp));
-        if self.queue.len() > self.stamps.len().saturating_mul(4).max(256) {
-            let mut rebuilt = alloc::collections::VecDeque::with_capacity(self.stamps.len());
-            for (k, s) in &self.queue {
-                if self.stamps.get(k) == Some(s) {
-                    rebuilt.push_back((k.clone(), *s));
-                }
-            }
-            self.queue = rebuilt;
-        }
-    }
-
-    pub(crate) fn remove(&mut self, key: &K) {
-        self.stamps.remove(key);
-    }
-
-    pub(crate) fn pop_lru(&mut self) -> Option<K> {
-        while let Some((key, stamp)) = self.queue.pop_front() {
-            if self.stamps.get(&key) == Some(&stamp) {
-                self.stamps.remove(&key);
-                return Some(key);
-            }
-        }
-        None
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.stamps.clear();
-        self.queue.clear();
-        self.seq = 0;
-    }
-}
+pub(crate) use vfsd::lru::LruIndex;
 
 pub(crate) struct VfsStorage {
     pub(crate) mounts: MountTable,
@@ -323,6 +274,41 @@ impl ReadAt for SnapshotReader<'_> {
     }
 }
 
+/// Adapts the snapshot session and deadline to the pipeline's control hooks.
+struct SnapshotPipelineControl<'a> {
+    control: &'a vfsd::snapshot_sessions::SnapshotControl,
+    deadline: Option<AbsoluteDeadline>,
+}
+impl PipelineControl for SnapshotPipelineControl<'_> {
+    fn check(&self) -> Result<(), TransferControl> {
+        if self.control.cancelled() { Err(TransferControl::Cancelled) }
+        else if budget_expired(self.deadline, monotonic_nanos()) { Err(TransferControl::Expired) }
+        else { Ok(()) }
+    }
+    fn progress(&self, bytes: u64) { self.control.progress(bytes); }
+}
+
+/// SHA-256 of the image, with the time the hasher stage was busy.
+struct SnapshotDigest {
+    sha: Sha256,
+    ns: u64,
+}
+impl SnapshotDigest {
+    fn new() -> Self { Self { sha: Sha256::new(), ns: 0 } }
+    fn finalize(self) -> [u8; 32] {
+        let mut bytes = [0; 32];
+        bytes.copy_from_slice(&self.sha.finalize());
+        bytes
+    }
+}
+impl WindowDigest for SnapshotDigest {
+    fn update(&mut self, bytes: &[u8]) {
+        let started = monotonic_nanos();
+        self.sha.update(bytes);
+        self.ns = self.ns.saturating_add(monotonic_nanos().saturating_sub(started));
+    }
+}
+
 fn transfer_errno(error: &TransferFailure<i32, i32>) -> i32 {
     match &error.error {
         TransferError::Read(errno) | TransferError::Write(errno) => *errno,
@@ -406,43 +392,45 @@ pub(crate) fn open_executable_snapshot(
         None => None,
     };
     let mut reader = SnapshotReader { plan: &plan, source, read_ns: 0 };
-    let window_bytes = vfsd::snapshot_budget::SNAPSHOT_WINDOW_BYTES.min(plan.file_len);
-    let mut window = Vec::new();
-    window.try_reserve_exact(window_bytes).map_err(|_| ENOMEM)?;
-    window.resize(window_bytes, 0);
-    let mut digest = Sha256::new();
-    let mut hash_ns = 0u64;
+    // The ring is allocated once for this snapshot (billed by the writer's
+    // reservation, `snapshot_reservation_bytes`) and freed as soon as the
+    // transfer has stopped, before sealing and commit.
+    let geometry = vfsd::snapshot_budget::snapshot_ring_geometry(reader.len()).ok_or(EIO)?;
+    let mut ring = Vec::new();
+    ring.try_reserve_exact(geometry.buffer_bytes().ok_or(EOVERFLOW)?).map_err(|_| ENOMEM)?;
+    ring.resize(geometry.buffer_bytes().ok_or(EOVERFLOW)?, 0);
+    // The digest is product evidence only for a verbose plan
+    // (`commit_executable_snapshot`), so other plans do not pay for it.
+    let mut digest = plan.verbose.then(SnapshotDigest::new);
+    let hooks = SnapshotPipelineControl { control, deadline };
     let transfer_started = monotonic_nanos();
     let bulk_before = crate::block::bulk_read_counters();
     let _ = crate::block::take_bulk_read_max_nanos();
-    let transfer = transfer_exact(&mut reader, &mut writer, &mut window,
-        |bytes| {
-            control.progress(bytes);
-            if control.cancelled() { Err(TransferControl::Cancelled) }
-            else if budget_expired(deadline, monotonic_nanos()) { Err(TransferControl::Expired) }
-            else { Ok(()) }
-        },
-        |bytes| {
-            let started = monotonic_nanos();
-            digest.update(bytes);
-            hash_ns = hash_ns.saturating_add(monotonic_nanos().saturating_sub(started));
-        },
+    let transfer = vfsd::snapshot_pipeline::run(
+        &mut reader, &mut writer, digest.as_mut(), &mut ring, geometry, &hooks,
+        &crate::bulk_lanes::StageThreads,
     );
+    drop(ring);
     if let Err(error) = &transfer { control.progress(error.completed_bytes); }
     if file_len > 128 * 1024 * 1024 {
         let bulk = crate::block::bulk_read_counters().since(bulk_before);
-        ipc::debug_line(&format!("vfsd: snapshot transfer path={path} completed={} total_us={} read_us={} write_us={} hash_us={} storaged_calls={} storaged_us={} storaged_max_us={} status={}",
+        let stats = transfer.as_ref().copied().unwrap_or_default();
+        // `total_us` is wall time. `read_us`/`write_us`/`hash_us` are the busy
+        // time of each stage (they overlap, so they no longer sum to the
+        // wall); `*_stall_us` is how long a stage waited on another one.
+        ipc::debug_line(&format!("vfsd: snapshot transfer path={path} completed={} total_us={} read_us={} write_us={} hash_us={} storaged_calls={} storaged_us={} storaged_max_us={} windows={} helper_stages={} read_stall_us={} write_stall_us={} hash_stall_us={} status={}",
             control.completed_bytes(),
             monotonic_nanos().saturating_sub(transfer_started) / 1000, reader.read_ns / 1000, writer.write_ns() / 1000,
-            hash_ns / 1000, bulk.calls, bulk.nanos / 1000,
+            digest.as_ref().map_or(0, |digest| digest.ns) / 1000, bulk.calls, bulk.nanos / 1000,
             crate::block::take_bulk_read_max_nanos() / 1000,
+            stats.windows, stats.helper_stages, stats.reader_stall_ns / 1000,
+            stats.writer_stall_ns / 1000, stats.hasher_stall_ns / 1000,
             transfer.as_ref().err().map_or(0, transfer_errno)));
     }
     transfer.map_err(|error| transfer_errno(&error))?;
     let snapshot = writer.seal(plan.mount_generation)?;
     if budget_expired(deadline, monotonic_nanos()) { return Err(ETIMEDOUT); }
-    let mut digest_bytes = [0; 32];
-    digest_bytes.copy_from_slice(&digest.finalize());
+    let digest_bytes = digest.map(SnapshotDigest::finalize);
     let read_ns = monotonic_nanos();
     let publication = {
         let mut storage = lock_vfs_storage();

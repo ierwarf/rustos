@@ -1079,7 +1079,8 @@ if [[ -z "$join_line" || -z "$complete_line" || "$complete_line" -le "$join_line
     || ! rg -Fq '.min(super::MAX_LAUNCH_RETRY_BACKOFF)' services/runtimed/src/catalog.rs \
     || ! rg -Fq 'if endpoint == 0 || endpoint == -(ENOENT as i64) {' services/vfsd/src/lib.rs \
     || ! rg -Fq '        EAGAIN' services/vfsd/src/lib.rs \
-    || [[ "$(rg -F -c 'let errno = storage_service_lookup_errno(endpoint);' services/vfsd/src/block.rs)" != 3 ]] \
+    || [[ "$(rg -F -c 'return Err(storage_service_lookup_errno(endpoint));' services/vfsd/src/block.rs)" != 1 ]] \
+    || [[ "$(rg -F -c 'lookup_storaged_endpoint()' services/vfsd/src/block.rs)" -lt 3 ]] \
     || ! rg -Fq '    "apps/smpqual/smpqual.elf",' tools/xtask/src/stage/mod.rs \
     || ! rg -Fq 'entry.exec == UI_SERVER_EXEC_PATH' services/runtimed/src/socket.rs \
     || ! rg -Fq 'super::kvm_smp_qualification::qualification_contract_for_launch(entry)' services/runtimed/src/socket.rs \
@@ -2355,7 +2356,8 @@ validator:acpi-table-admission|kernel-hal|arch::acpi::tests::hpet_gas_requires_m
 validator:acpi-table-admission|kernel-hal|arch::acpi::admission_tests::root_sdt_admission_agrees_with_signature_width_and_entry_alignment
 validator:acpi-table-admission|kernel-hal|arch::acpi::admission_tests::mcfg_admission_agrees_with_the_ecam_predicate_and_is_atomic
 validator:acpi-table-admission|kernel-hal|arch::acpi::admission_tests::hpet_admission_agrees_with_the_exact_memory_gas_predicate
-persistent-mutation-admission/PersistentMutationAdmission|vfsd|tests::persistent_mutation_admission_remains_read_only
+persistent-mutation-admission/PersistentMutationAdmission|vfsd|mount_table::tests::multi_partition_disk_mounts_root_ro_and_data_rw
+persistent-mutation-admission/PersistentMutationAdmission|vfsd|mount_table::tests::mount_infos_reports_fat_and_tmpfs_flags
 deferred-start/DeferredStart|runtimed|spawn::tests::failed_spawn_cleanup_accepts_only_exact_retirement_or_esrch
 deferred-start/DeferredStart|initd|tests::failed_service_cleanup_accepts_only_exact_retirement_or_esrch
 ipc-endpoint-ownership/IpcEndpointOwnership|kernel-ps|user::handles::table::tests::dynamic_install_never_exceeds_descriptor_ceiling

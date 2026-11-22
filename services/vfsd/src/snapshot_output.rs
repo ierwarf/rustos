@@ -1,4 +1,7 @@
 //! Private streaming snapshot sink. No descriptor is published before sealing.
+//! The pipeline's writer stage owns it (on a stage thread, `Send`) for one
+//! transfer, writing each ring window with one sequential `SYS_WRITE` loop; it
+//! is back with the snapshot worker, joined, before `seal`.
 //! The byte reservation follows the owned descriptor through the terminal reply.
 use super::*;
 use storage_core::file_io::WriteAt;

@@ -2194,9 +2194,9 @@ pub struct StoragedBulkReadResponse {
 }
 
 impl StoragedBulkReadResponse {
-    /// A const zero value suitable for a single-owner service response slot.
-    /// The service overwrites the complete header and zeroes the slot before
-    /// every reply, preventing data from a prior caller from leaking.
+    /// A const zero value for a response slot. Only the first
+    /// `reply_len()` bytes of a slot are ever sent, so bytes past `payload_len`
+    /// (stale data of earlier replies) never reach a caller and need no clearing.
     pub const fn zeroed() -> Self {
         Self {
             header: CommercialMaxProtocolHeader {
@@ -2223,6 +2223,36 @@ impl StoragedBulkReadResponse {
         self.header == request.header
             && self.reserved0 == 0
             && self.payload_len as usize <= self.payload.len()
+    }
+
+    /// Wire length of a reply carrying `payload_len` payload bytes: the fixed
+    /// header plus exactly the payload. `None` when it exceeds the capacity.
+    pub const fn reply_len_for(payload_len: usize) -> Option<usize> {
+        if payload_len <= STORAGED_BULK_READ_PAYLOAD_CAPACITY {
+            Some(STORAGED_BULK_READ_RESPONSE_HEADER_BYTES + payload_len)
+        } else {
+            None
+        }
+    }
+
+    /// Bytes the service must send for this response (header + `payload_len`).
+    pub fn reply_len(&self) -> Option<usize> {
+        Self::reply_len_for(self.payload_len as usize)
+    }
+
+    /// The payload of a reply that arrived as `received` bytes, or `None` when
+    /// `received` is not exactly header + `payload_len`. Bytes of the receive
+    /// buffer past `received` are never exposed.
+    ///
+    /// The caller must still check `is_valid_envelope_for` (and the generation,
+    /// LBA and block-count binding) before trusting the payload.
+    pub fn payload_of_reply(&self, received: usize) -> Option<&[u8]> {
+        if received < STORAGED_BULK_READ_RESPONSE_HEADER_BYTES
+            || self.reply_len() != Some(received)
+        {
+            return None;
+        }
+        self.payload.get(..self.payload_len as usize)
     }
 }
 
@@ -2284,6 +2314,30 @@ impl StoragedBulkWriteRequest {
             && self.block_count != 0
             && self.payload_len != 0
             && (self.payload_len as usize) <= self.payload.len()
+    }
+}
+
+impl StoragedBulkWriteRequest {
+    /// Wire length of a request carrying `payload_len` payload bytes: the fixed
+    /// header plus exactly the payload. `None` when it exceeds the capacity.
+    pub const fn request_len_for(payload_len: usize) -> Option<usize> {
+        if payload_len <= STORAGED_BULK_WRITE_PAYLOAD_CAPACITY {
+            Some(STORAGED_BULK_WRITE_REQUEST_HEADER_BYTES + payload_len)
+        } else {
+            None
+        }
+    }
+
+    /// The payload of a request that arrived as `received` bytes, or `None`
+    /// when `received` is not exactly header + `payload_len`. Bytes of the
+    /// receive buffer past `received` are never exposed.
+    pub fn payload_of_request(&self, received: usize) -> Option<&[u8]> {
+        if received < STORAGED_BULK_WRITE_REQUEST_HEADER_BYTES
+            || Self::request_len_for(self.payload_len as usize) != Some(received)
+        {
+            return None;
+        }
+        self.payload.get(..self.payload_len as usize)
     }
 }
 

@@ -11,16 +11,18 @@ mod read_engine;
 use rustos_user_abi::performance::DVM_STORAGE_BOOT_READY_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
     CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, DvmBlockInfoWire,
+    CommercialMaxProtocolHeader, CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
+    DvmBlockInfoWire,
     StorageBlockDescriptorWire, StoragedBulkReadResponse, StoragedBulkWriteRequest,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
     COMMERCIAL_MAX_PROTOCOL_STORAGED, COMMERCIAL_MAX_STORAGED_BLOCK_FLAG_FUA,
     COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY, COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_FLUSH,
     COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_INFO, COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ,
     COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK, COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE,
+    COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE_BULK,
     COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN, COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT,
     COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA, IPC_MAX_INLINE_BYTES, IPC_SERVICE_STORAGED,
-    IPC_SERVICE_VFSD, PRODUCT_MILESTONE_STORAGE_READY, STORAGED_BULK_READ_PAYLOAD_CAPACITY,
+    IPC_SERVICE_VFSD, PRODUCT_MILESTONE_STORAGE_READY, STORAGED_BULK_READ_RESPONSE_HEADER_BYTES,
     STORAGE_FLAG_READONLY, STORAGE_TRANSPORT_DVM_BLOCK, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
     SYS_RUSTOS_IPC_REPLY,
 };
@@ -35,7 +37,10 @@ const RECEIVE_THREADS: usize = 4;
 // published after its own read-only media-barrier completion, and every request
 // rebinds that liveness proof to current DVM geometry before touching storage.
 static DVM_E2E_READY_GENERATION: AtomicU64 = AtomicU64::new(0);
-static PROVEN_BLOCK_INFO: std::sync::Mutex<Option<block::BlockInfo>> = std::sync::Mutex::new(None);
+// Read by every request, written only on a readiness transition: a reader lock
+// keeps the receive threads from serializing on it.
+static PROVEN_BLOCK_INFO: std::sync::RwLock<Option<block::BlockInfo>> =
+    std::sync::RwLock::new(None);
 // A readiness transition may cause many normal loader probes. Keep the first
 // one observable, but never let expected `EAGAIN` diagnostics become a DVM
 // boot-time work source themselves.
@@ -146,7 +151,7 @@ fn supervise_dvm_block_readiness() {
             Ok(info) => {
                 let generation = info.generation;
                 if generation != proven_generation {
-                    if let Ok(mut slot) = PROVEN_BLOCK_INFO.lock() {
+                    if let Ok(mut slot) = PROVEN_BLOCK_INFO.write() {
                         *slot = Some(info);
                     }
                     DVM_E2E_READY_GENERATION.store(generation, Ordering::Release);
@@ -175,7 +180,7 @@ fn supervise_dvm_block_readiness() {
 
 fn invalidate_dvm_readiness(published: &AtomicU64, proven_generation: &mut u64) {
     published.store(0, Ordering::Release);
-    if let Ok(mut slot) = PROVEN_BLOCK_INFO.lock() {
+    if let Ok(mut slot) = PROVEN_BLOCK_INFO.write() {
         *slot = None;
     }
     // Recovery of the same generation must run the barrier and republish it.
@@ -185,7 +190,7 @@ fn invalidate_dvm_readiness(published: &AtomicU64, proven_generation: &mut u64) 
 fn dvm_e2e_ready_for_current_generation() -> Result<block::BlockInfo, i32> {
     let proven = DVM_E2E_READY_GENERATION.load(Ordering::Acquire);
     if proven != 0 {
-        if let Ok(slot) = PROVEN_BLOCK_INFO.lock() {
+        if let Ok(slot) = PROVEN_BLOCK_INFO.read() {
             if let Some(info) = *slot {
                 if info.generation == proven {
                     return Ok(info);
@@ -198,7 +203,7 @@ fn dvm_e2e_ready_for_current_generation() -> Result<block::BlockInfo, i32> {
         DVM_E2E_READY_GENERATION.load(Ordering::Acquire),
         info.generation,
     ) {
-        if let Ok(mut slot) = PROVEN_BLOCK_INFO.lock() {
+        if let Ok(mut slot) = PROVEN_BLOCK_INFO.write() {
             *slot = Some(info);
         }
         Ok(info)
@@ -249,19 +254,17 @@ fn dvm_block_e2e_marker(generation: u64) -> String {
     )
 }
 
-/// One receive thread's bulk-read reply slot. The payload is kept zero beyond
-/// the last reply's length without clearing all of it on every reply.
+/// One receive thread's bulk-read reply slot. Only `reply_len()` bytes of it
+/// are ever sent, so bytes past `payload_len` (left by earlier replies) are
+/// never exposed and the slot is never cleared.
 struct BulkReplySlot {
     response: Box<StoragedBulkReadResponse>,
-    /// Bytes of `response.payload` that may be non-zero.
-    dirty: usize,
 }
 
 impl BulkReplySlot {
     fn new() -> Self {
         Self {
             response: Box::new(StoragedBulkReadResponse::zeroed()),
-            dirty: STORAGED_BULK_READ_PAYLOAD_CAPACITY,
         }
     }
 }
@@ -286,9 +289,18 @@ fn serve(endpoint: u64) {
             thread::sleep(RECV_BACKOFF);
             continue;
         }
-        if received as usize == size_of::<StoragedBulkWriteRequest>() {
-            // SAFETY: `recv_words` is 8-aligned and has at least `IPC_MAX_INLINE_BYTES`
-            // bytes (`== size_of::<StoragedBulkWriteRequest>()`).
+        let received = received as usize;
+        // Both request shapes begin with the protocol header, whose `op` selects
+        // the shape. A bulk write is header + exactly `payload_len` bytes.
+        if received >= size_of::<CommercialMaxProtocolHeader>()
+            // SAFETY: `recv_words` is 8-aligned, initialized, and at least
+            // `IPC_MAX_INLINE_BYTES` long; the header is its first field.
+            && unsafe { &*(recv_words.as_ptr().cast::<CommercialMaxProtocolHeader>()) }.op
+                == COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE_BULK
+        {
+            // SAFETY: as above; the buffer holds a whole
+            // `StoragedBulkWriteRequest`, and only `received` bytes of it are
+            // trusted (`payload_of_request`).
             let bulk_req = unsafe { &*(recv_words.as_ptr().cast::<StoragedBulkWriteRequest>()) };
             let exact_sender = bulk_req.header.subject_pid == sender_pid
                 && bulk_req.header.subject_tid == sender_tid;
@@ -300,11 +312,11 @@ fn serve(endpoint: u64) {
             if !exact_sender || owner_status < 0 {
                 reply_bulk_write_error(reply_cap, bulk_req.header, libc::EACCES);
             } else {
-                reply_bulk_write_request(reply_cap, bulk_req);
+                reply_bulk_write_request(reply_cap, bulk_req, received);
             }
             continue;
         }
-        if received as usize != size_of::<CommercialMaxProtocolRequest>() {
+        if received != size_of::<CommercialMaxProtocolRequest>() {
             let _ = writeln!(
                 std::io::stderr(),
                 "storaged: request rejected stage=request-size received={} expected={} reply_cap={}",
@@ -372,7 +384,7 @@ fn reply_bulk_write_error(
     }
 }
 
-fn reply_bulk_write_request(reply_cap: u64, request: &StoragedBulkWriteRequest) {
+fn reply_bulk_write_request(reply_cap: u64, request: &StoragedBulkWriteRequest, received: usize) {
     let mut response = CommercialMaxProtocolResponse {
         header: request.header,
         ..CommercialMaxProtocolResponse::default()
@@ -385,10 +397,7 @@ fn reply_bulk_write_request(reply_cap: u64, request: &StoragedBulkWriteRequest) 
             if request.generation != info.generation {
                 return Err(libc::EAGAIN);
             }
-            let payload = request
-                .payload
-                .get(..request.payload_len as usize)
-                .ok_or(libc::EINVAL)?;
+            let payload = request.payload_of_request(received).ok_or(libc::EINVAL)?;
             let fua = u64::from(request.flags) & COMMERCIAL_MAX_STORAGED_BLOCK_FLAG_FUA != 0;
             block::write_with_info(
                 info,
@@ -498,22 +507,6 @@ fn reply_commercial_request(
     }
 }
 
-/// Keeps the reused bulk-read slot zero beyond the reply's length without
-/// clearing all of it on every reply. After a success only the bytes a previous
-/// reply left past this length are cleared; after a failure the partially
-/// filled extent is unknown, so all of it is cleared.
-fn settle_bulk_payload_tail(payload: &mut [u8], dirty: &mut usize, ok: bool, written_len: usize) {
-    if ok {
-        let prev = core::mem::replace(dirty, written_len).min(payload.len());
-        if prev > written_len {
-            payload[written_len..prev].fill(0);
-        }
-    } else {
-        *dirty = 0;
-        payload.fill(0);
-    }
-}
-
 fn reply_bulk_read(
     reply_cap: u64,
     request: &CommercialMaxProtocolRequest,
@@ -528,7 +521,6 @@ fn reply_bulk_read(
     response.block_count = request.arg2;
     response.reserved0 = 0;
 
-    let mut written_len = 0_usize;
     let status = match validate_commercial_request(request) {
         Err(errno) => {
             let _ = writeln!(
@@ -549,7 +541,6 @@ fn reply_bulk_read(
             )
         }) {
             Ok(written) => {
-                written_len = written;
                 response.payload_len = written as u32;
                 note_dvm_request_ready();
                 0
@@ -561,17 +552,19 @@ fn reply_bulk_read(
         },
     };
     response.status = status;
-    settle_bulk_payload_tail(
-        &mut response.payload,
-        &mut slot.dirty,
-        status == 0,
-        written_len,
-    );
+    // Header plus exactly the bytes read; an error reply is the header alone.
+    // The slot's stale bytes past `payload_len` are never sent.
+    let reply_len = response.reply_len().unwrap_or_else(|| {
+        // Unreachable: the engine bounds `written` by the payload capacity.
+        response.payload_len = 0;
+        response.status = libc::EIO;
+        STORAGED_BULK_READ_RESPONSE_HEADER_BYTES
+    });
     let reply = syscall3(
         SYS_RUSTOS_IPC_REPLY,
         reply_cap,
         (response as *const StoragedBulkReadResponse) as u64,
-        size_of::<StoragedBulkReadResponse>() as u64,
+        reply_len as u64,
     );
     if reply < 0 {
         let _ = writeln!(
@@ -1046,22 +1039,6 @@ mod tests {
         write_req.arg3 = COMMERCIAL_MAX_STORAGED_BLOCK_FLAG_FUA;
         write_req.payload_len = 1024;
         assert_eq!(validate_commercial_request(&write_req), Ok(()));
-    }
-
-    #[test]
-    fn bulk_payload_tail_is_zero_after_shorter_and_failed_replies() {
-        let mut dirty = 8_usize;
-        let mut slot = [0xEE_u8; 8];
-        settle_bulk_payload_tail(&mut slot, &mut dirty, true, 3);
-        assert_eq!(slot, [0xEE, 0xEE, 0xEE, 0, 0, 0, 0, 0]);
-        slot[..6].fill(0xAA);
-        settle_bulk_payload_tail(&mut slot, &mut dirty, true, 6);
-        assert_eq!(slot[3..], [0xAA, 0xAA, 0xAA, 0, 0]);
-        // A failed read may leave bytes anywhere; the whole slot is cleared.
-        slot.fill(0x77);
-        settle_bulk_payload_tail(&mut slot, &mut dirty, false, 0);
-        assert_eq!(slot, [0; 8]);
-        assert_eq!(dirty, 0);
     }
 }
 

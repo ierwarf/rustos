@@ -41,6 +41,7 @@ use x86_64::PhysAddr;
 
 use kernel_mm::api::charge;
 
+#[cfg(not(test))]
 use crate::memory::kernel_vm;
 #[cfg(not(test))]
 use crate::memory::phys;
@@ -56,6 +57,25 @@ pub enum MemfdError {
     InvalidArgument,
     NoMemory,
     PermissionDenied,
+}
+
+/// Failure of a memfd write whose bytes come from a fallible source.
+#[derive(Debug, Eq, PartialEq)]
+pub enum MemfdWriteError<E> {
+    /// The memfd refused the write; nothing was committed.
+    Memfd(MemfdError),
+    /// The byte source failed; nothing was committed and no frame stayed
+    /// reachable through the object.
+    Source(E),
+}
+
+impl MemfdWriteError<core::convert::Infallible> {
+    fn into_memfd(self) -> MemfdError {
+        match self {
+            Self::Memfd(err) => err,
+            Self::Source(never) => match never {},
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -192,7 +212,12 @@ impl MemfdHandle {
                 writable_mapping_count: 0,
             }),
         });
-        write_at_object(&object, 0, bytes)?;
+        let mut scratch = Vec::new();
+        write_with_source(&object, 0, bytes.len(), &mut scratch, &mut |at, dst| {
+            dst.copy_from_slice(&bytes[at..at + dst.len()]);
+            Ok::<(), core::convert::Infallible>(())
+        })
+        .map_err(MemfdWriteError::into_memfd)?;
         object.state.lock().seals = (linux_abi::F_SEAL_SEAL
             | linux_abi::F_SEAL_SHRINK
             | linux_abi::F_SEAL_GROW
@@ -302,17 +327,70 @@ impl MemfdHandle {
     }
 
     pub fn write_from(&mut self, src: &[u8]) -> Result<usize, MemfdError> {
-        let mut open = self.inner.lock();
-        let cursor = open.cursor;
-        let written = write_at_object(&open.object, cursor, src)?;
-        open.cursor = cursor + written;
-        Ok(written)
+        let mut scratch = Vec::new();
+        self.write_from_with(src.len(), &mut scratch, &mut |at, dst| {
+            dst.copy_from_slice(&src[at..at + dst.len()]);
+            Ok::<(), core::convert::Infallible>(())
+        })
+        .map_err(MemfdWriteError::into_memfd)
     }
 
     /// Writes `src` at `offset` without modifying this open description's cursor.
     pub fn write_at(&self, offset: usize, src: &[u8]) -> Result<usize, MemfdError> {
+        let mut scratch = Vec::new();
+        self.write_at_with(offset, src.len(), &mut scratch, &mut |at, dst| {
+            dst.copy_from_slice(&src[at..at + dst.len()]);
+            Ok::<(), core::convert::Infallible>(())
+        })
+        .map_err(MemfdWriteError::into_memfd)
+    }
+
+    /// Writes `len` bytes at the cursor, taking the bytes from `fill` instead
+    /// of a kernel slice (see [`write_with_source`] for the `fill` and
+    /// `scratch` contract).
+    ///
+    /// The cursor range is reserved under the open-description lock and the
+    /// copy runs without it, because `fill` may fault in user memory. A failed
+    /// or short write returns the cursor to the start of the range unless
+    /// another writer or a seek has moved it meanwhile; in that case the
+    /// later cursor owner wins, as it would for any interleaved sequential
+    /// writers.
+    pub fn write_from_with<E>(
+        &mut self,
+        len: usize,
+        scratch: &mut Vec<u8>,
+        fill: &mut dyn FnMut(usize, &mut [u8]) -> Result<(), E>,
+    ) -> Result<usize, MemfdWriteError<E>> {
+        let (object, start) = {
+            let mut open = self.inner.lock();
+            let start = open.cursor;
+            let end = start
+                .checked_add(len)
+                .ok_or(MemfdWriteError::Memfd(MemfdError::InvalidArgument))?;
+            open.cursor = end;
+            (open.object.clone(), start)
+        };
+        let result = write_with_source(&object, start, len, scratch, fill);
+        let committed = *result.as_ref().unwrap_or(&0);
+        if committed != len {
+            let mut open = self.inner.lock();
+            if open.cursor == start + len {
+                open.cursor = start + committed;
+            }
+        }
+        result
+    }
+
+    /// [`Self::write_from_with`] at an explicit offset; the cursor is untouched.
+    pub fn write_at_with<E>(
+        &self,
+        offset: usize,
+        len: usize,
+        scratch: &mut Vec<u8>,
+        fill: &mut dyn FnMut(usize, &mut [u8]) -> Result<(), E>,
+    ) -> Result<usize, MemfdWriteError<E>> {
         let object = self.object();
-        write_at_object(&object, offset, src)
+        write_with_source(&object, offset, len, scratch, fill)
     }
 
     pub fn seek(
@@ -625,8 +703,9 @@ fn next_mapping_counts(
     Ok((mapping_count, writable_mapping_count))
 }
 
-/// Zero-filled frames allocated outside the object lock. Dropping them frees
-/// any frame that was not installed, so every early return releases its pages.
+/// Frames allocated outside the object lock and private to the allocating
+/// call until installed. Dropping them frees (and refunds) every frame that was
+/// not installed, so every early return releases its pages.
 struct StagedFrames {
     frames: Vec<u64>,
     /// Group each staged frame is charged to; refunded when a frame is freed
@@ -634,10 +713,16 @@ struct StagedFrames {
     group: Option<usize>,
 }
 
+/// Frames requested from the allocator (and charged) per round.
+const STAGE_BATCH_FRAMES: usize = 64;
+
 impl StagedFrames {
-    /// Allocates and zeroes `count` frames without holding any lock, so a large
-    /// grow never stalls readers, mappers or sealers of the same object.
-    fn zeroed(count: usize, group: Option<usize>) -> Result<Self, MemfdError> {
+    /// Allocates `count` frames without holding any lock, so a large grow never
+    /// stalls readers, mappers or sealers of the same object. Frames come from
+    /// the allocator in batches of [`STAGE_BATCH_FRAMES`]. They are zero-filled
+    /// only when `zero` is set; otherwise they hold arbitrary stale memory and
+    /// the caller must overwrite every byte before installing them.
+    fn allocate(count: usize, group: Option<usize>, zero: bool) -> Result<Self, MemfdError> {
         let mut staged = Self {
             frames: Vec::new(),
             group,
@@ -646,20 +731,29 @@ impl StagedFrames {
             .frames
             .try_reserve_exact(count)
             .map_err(|_| MemfdError::NoMemory)?;
-        for _ in 0..count {
-            // Reserve the page before allocating so a Job at its limit never
-            // takes a frame; a failed allocation returns the reservation.
-            if !try_charge_page(group) {
+        let mut remaining = count;
+        while remaining != 0 {
+            let want = remaining.min(STAGE_BATCH_FRAMES);
+            // Reserve the pages before allocating so a Job at its limit never
+            // takes a frame; unfilled reservations are returned below.
+            if !try_charge_pages(group, want) {
                 return Err(MemfdError::NoMemory);
             }
-            let Some(frame_phys) = alloc_backing_frame() else {
-                refund_pages(group, 1);
+            let mut batch = [0u64; STAGE_BATCH_FRAMES];
+            let got = alloc_backing_frames(&mut batch[..want]);
+            refund_pages(group, want - got);
+            // Recorded (and each charge now owned by `staged`) before the
+            // frames are touched so a failure below cannot leak either.
+            staged.frames.extend_from_slice(&batch[..got]);
+            if got < want {
                 return Err(MemfdError::NoMemory);
-            };
-            // The frame is recorded (and its charge now owned by `staged`)
-            // before it is touched so a failure below cannot leak either.
-            staged.frames.push(frame_phys);
-            zero_frame(frame_phys);
+            }
+            if zero {
+                for &frame_phys in &batch[..got] {
+                    zero_frame(frame_phys);
+                }
+            }
+            remaining -= got;
         }
         Ok(staged)
     }
@@ -675,8 +769,8 @@ impl Drop for StagedFrames {
     }
 }
 
-fn try_charge_page(group: Option<usize>) -> bool {
-    group.is_none_or(|group| charge::try_charge(group, 1))
+fn try_charge_pages(group: Option<usize>, pages: usize) -> bool {
+    group.is_none_or(|group| charge::try_charge(group, pages as u64))
 }
 
 fn refund_pages(group: Option<usize>, pages: usize) {
@@ -687,9 +781,23 @@ fn refund_pages(group: Option<usize>, pages: usize) {
     }
 }
 
+/// Fills `out` with user-class frames and returns how many were obtained; a
+/// short fill means pressure or exhaustion.
 #[cfg(not(test))]
-fn alloc_backing_frame() -> Option<u64> {
-    phys::alloc_frame_user().map(PhysAddr::as_u64)
+fn alloc_backing_frames(out: &mut [u64]) -> usize {
+    let mut frames = [PhysAddr::new(0); STAGE_BATCH_FRAMES];
+    let frames = &mut frames[..out.len()];
+    let got = phys::alloc_frames_batch_user(frames);
+    for (slot, frame) in out.iter_mut().zip(&frames[..got]) {
+        *slot = frame.as_u64();
+    }
+    got
+}
+
+/// Kernel (direct-map) pointer to the first byte of the frame at `frame_phys`.
+#[cfg(not(test))]
+fn frame_ptr(frame_phys: u64) -> *mut u8 {
+    kernel_vm::higher_half_addr(frame_phys) as *mut u8
 }
 
 #[cfg(not(test))]
@@ -703,25 +811,24 @@ fn zero_frame(frame_phys: u64) {
     // staging buffer, the higher-half direct map covers one complete page, and
     // nothing publishes the frame until it is installed.
     unsafe {
-        ptr::write_bytes(
-            kernel_vm::higher_half_addr(frame_phys) as *mut u8,
-            0,
-            PAGE_SIZE,
-        );
+        ptr::write_bytes(frame_ptr(frame_phys), 0, PAGE_SIZE);
     }
 }
 
 #[cfg(not(test))]
 fn zero_frame_tail(frame_phys: u64, tail: usize) {
-    // SAFETY: the frame is owned by the object and retained under the
-    // object-state lock; the direct map covers the whole page and
-    // `tail..PAGE_SIZE` stays inside it.
+    zero_frame_range(frame_phys, tail, PAGE_SIZE);
+}
+
+/// Zeroes bytes `from..to` of a frame.
+#[cfg(not(test))]
+fn zero_frame_range(frame_phys: u64, from: usize, to: usize) {
+    debug_assert!(from <= to && to <= PAGE_SIZE);
+    // SAFETY: the frame is owned by the caller (staged) or by the object and
+    // retained under the object-state lock; the direct map covers the whole
+    // page and `from..to` stays inside it.
     unsafe {
-        ptr::write_bytes(
-            (kernel_vm::higher_half_addr(frame_phys) as *mut u8).add(tail),
-            0,
-            PAGE_SIZE - tail,
-        );
+        ptr::write_bytes(frame_ptr(frame_phys).add(from), 0, to - from);
     }
 }
 
@@ -736,28 +843,66 @@ std::thread_local! {
     static FAKE_FRAMES_LIVE: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
+/// Host fakes: frames are real, 0xAA-poisoned heap pages addressed by their
+/// own pointer, so stale-content and copy behavior is observable.
 #[cfg(test)]
-fn alloc_backing_frame() -> Option<u64> {
-    FAKE_FRAMES_LEFT.with(|left| {
-        if left.get() == 0 {
-            return None;
+fn fake_page_layout() -> std::alloc::Layout {
+    std::alloc::Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).unwrap()
+}
+
+#[cfg(test)]
+fn alloc_backing_frames(out: &mut [u64]) -> usize {
+    let mut got = 0;
+    for slot in out.iter_mut() {
+        let allowed = FAKE_FRAMES_LEFT.with(|left| {
+            if left.get() == 0 {
+                return false;
+            }
+            left.set(left.get() - 1);
+            true
+        });
+        if !allowed {
+            break;
         }
-        left.set(left.get() - 1);
+        // SAFETY: non-zero-sized layout.
+        let page = unsafe { std::alloc::alloc(fake_page_layout()) };
+        assert!(!page.is_null());
+        // SAFETY: `page` is a fresh PAGE_SIZE allocation.
+        unsafe { core::ptr::write_bytes(page, 0xAA, PAGE_SIZE) };
         FAKE_FRAMES_LIVE.with(|live| live.set(live.get() + 1));
-        Some(0x1000)
-    })
+        *slot = page as u64;
+        got += 1;
+    }
+    got
 }
 
 #[cfg(test)]
-fn free_backing_frame(_frame_phys: u64) {
+fn free_backing_frame(frame_phys: u64) {
     FAKE_FRAMES_LIVE.with(|live| live.set(live.get() - 1));
+    // SAFETY: allocated by `alloc_backing_frames` with the same layout.
+    unsafe { std::alloc::dealloc(frame_phys as *mut u8, fake_page_layout()) };
 }
 
 #[cfg(test)]
-fn zero_frame(_frame_phys: u64) {}
+fn frame_ptr(frame_phys: u64) -> *mut u8 {
+    frame_phys as *mut u8
+}
 
 #[cfg(test)]
-fn zero_frame_tail(_frame_phys: u64, _tail: usize) {}
+fn zero_frame(frame_phys: u64) {
+    zero_frame_range(frame_phys, 0, PAGE_SIZE);
+}
+
+#[cfg(test)]
+fn zero_frame_tail(frame_phys: u64, tail: usize) {
+    zero_frame_range(frame_phys, tail, PAGE_SIZE);
+}
+
+#[cfg(test)]
+fn zero_frame_range(frame_phys: u64, from: usize, to: usize) {
+    // SAFETY: fake frames are live PAGE_SIZE heap pages.
+    unsafe { core::ptr::write_bytes(frame_ptr(frame_phys).add(from), 0, to - from) };
+}
 
 /// Bounded retries when concurrent grow/shrink keep invalidating a staged plan.
 const GROW_ATTEMPTS: usize = 8;
@@ -790,7 +935,7 @@ fn grow_then<R>(
             }
             required_pages - state.frames.len()
         };
-        let mut staged = StagedFrames::zeroed(missing, object.charge_group)?;
+        let mut staged = StagedFrames::allocate(missing, object.charge_group, true)?;
         let mut state = object.state.lock();
         check(&state)?;
         let still_missing = required_pages.saturating_sub(state.frames.len());
@@ -834,64 +979,233 @@ fn read_at_locked(frames: &[u64], len: usize, offset: usize, dest: &mut [u8]) ->
     if dest.is_empty() || offset >= len {
         return 0;
     }
-
     let read_len = dest.len().min(len - offset);
-    let mut copied = 0usize;
-    while copied < read_len {
-        let absolute = offset + copied;
-        let page_index = absolute / PAGE_SIZE;
-        let page_offset = absolute % PAGE_SIZE;
-        let chunk_len = (read_len - copied).min(PAGE_SIZE - page_offset);
-        let src =
-            (kernel_vm::higher_half_addr(frames[page_index] + page_offset as u64)) as *const u8;
-        // SAFETY: `frames[page_index]` is retained by the locked object
-        // snapshot, bounds above keep the source within that page, and `dest`
-        // owns at least `read_len` writable bytes.
-        unsafe {
-            crate::arch::simd::copy_fast(src, dest.as_mut_ptr().add(copied), chunk_len);
-        }
-        copied += chunk_len;
+    // SAFETY: `frames` are retained by the locked object snapshot and cover
+    // `offset..offset + read_len` (`read_len` is clamped to `len`); `dest` owns
+    // at least `read_len` writable bytes.
+    unsafe {
+        copy_frame_span(frames, offset, dest.as_mut_ptr(), read_len, SpanDirection::FromFrames);
     }
     read_len
 }
 
-fn write_at_object(
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SpanDirection {
+    ToFrames,
+    FromFrames,
+}
+
+/// Copies `len` bytes between the contiguous buffer `buf` and the page-backed
+/// byte range starting at `offset`, one page-bounded piece at a time. A span of
+/// at least one page takes ONE wide-SIMD section for all its pieces
+/// (`copy_fast` would save and restore the YMM upper halves for every 4 KiB
+/// piece); shorter spans use `copy_fast`'s own small-copy paths.
+///
+/// # Safety
+///
+/// `frames` must be retained and cover `offset..offset + len`; `buf` must be
+/// valid for `len` bytes in the copy direction and must not overlap the frames.
+unsafe fn copy_frame_span(
+    frames: &[u64],
+    offset: usize,
+    buf: *mut u8,
+    len: usize,
+    direction: SpanDirection,
+) {
+    let wide = len >= PAGE_SIZE && crate::arch::simd::avx_enabled();
+    let _section = wide.then(crate::arch::simd::wide_simd_section);
+    let mut copied = 0usize;
+    while copied < len {
+        let absolute = offset + copied;
+        let page_offset = absolute % PAGE_SIZE;
+        let piece = (len - copied).min(PAGE_SIZE - page_offset);
+        // SAFETY: bounds above keep the piece inside one retained page.
+        let frame = unsafe { frame_ptr(frames[absolute / PAGE_SIZE]).add(page_offset) };
+        let (src, dst) = match direction {
+            SpanDirection::ToFrames => (unsafe { buf.add(copied) } as *const u8, frame),
+            SpanDirection::FromFrames => (frame as *const u8, unsafe { buf.add(copied) }),
+        };
+        // SAFETY: both ranges are valid for `piece` bytes and disjoint.
+        unsafe {
+            if wide {
+                crate::arch::simd::copy_ymm(src, dst, piece);
+            } else {
+                crate::arch::simd::copy_fast(src, dst, piece);
+            }
+        }
+        copied += piece;
+    }
+}
+
+/// Writes `len` bytes at `offset`, taking them from `fill`, without ever
+/// calling `fill` under an object lock.
+///
+/// `fill(at, dst)` must copy bytes `at..at + dst.len()` of the write into
+/// `dst`. It is called for disjoint ranges that together cover `0..len`, may
+/// fault or block, and may be called again for the same range when a concurrent
+/// truncate invalidates the plan, so it must be idempotent. `dst` may be live
+/// frame memory that holds stale bytes; `fill` must only write it.
+///
+/// Pages the write extends the object into are allocated unzeroed and private:
+/// `fill` copies straight into them, bytes of a partially covered page outside
+/// the write (a hole before `offset`, the tail after the end) are zeroed, and
+/// only then are they installed under the lock. A failing `fill` therefore
+/// drops the private frames and the object, its readers and its mappers never
+/// see them. Bytes landing in pages that already existed are staged in
+/// `scratch` (grown on demand, reusable across calls, zeroed only when it
+/// grows) and copied under the lock after the seals are re-checked.
+fn write_with_source<E>(
     object: &MemfdObject,
     offset: usize,
-    src: &[u8],
-) -> Result<usize, MemfdError> {
-    if src.is_empty() {
+    len: usize,
+    scratch: &mut Vec<u8>,
+    fill: &mut dyn FnMut(usize, &mut [u8]) -> Result<(), E>,
+) -> Result<usize, MemfdWriteError<E>> {
+    if len == 0 {
         return Ok(0);
     }
     let end = offset
-        .checked_add(src.len())
-        .ok_or(MemfdError::InvalidArgument)?;
-    grow_then(
-        object,
-        end,
-        |state| check_write_seals(state, end),
-        |state| write_at_locked(state.frames.as_slice(), offset, src),
-    )?;
-    Ok(src.len())
+        .checked_add(len)
+        .ok_or(MemfdWriteError::Memfd(MemfdError::InvalidArgument))?;
+    let required_pages = end.div_ceil(PAGE_SIZE);
+    for _ in 0..GROW_ATTEMPTS {
+        let base_pages = {
+            let state = object.state.lock();
+            check_write_seals(&state, end).map_err(MemfdWriteError::Memfd)?;
+            state.frames.len()
+        };
+        let base_bytes = base_pages.saturating_mul(PAGE_SIZE);
+        let existing_len = if offset < base_bytes {
+            end.min(base_bytes) - offset
+        } else {
+            0
+        };
+        if existing_len != 0 {
+            if scratch.len() < existing_len {
+                scratch
+                    .try_reserve(existing_len - scratch.len())
+                    .map_err(|_| MemfdWriteError::Memfd(MemfdError::NoMemory))?;
+                scratch.resize(existing_len, 0);
+            }
+            fill(0, &mut scratch[..existing_len]).map_err(MemfdWriteError::Source)?;
+        }
+        let missing = required_pages.saturating_sub(base_pages);
+        let mut staged = StagedFrames::allocate(missing, object.charge_group, false)
+            .map_err(MemfdWriteError::Memfd)?;
+        fill_staged_pages(&staged.frames, base_pages, offset, end, fill)
+            .map_err(MemfdWriteError::Source)?;
+
+        let mut state = object.state.lock();
+        check_write_seals(&state, end).map_err(MemfdWriteError::Memfd)?;
+        if state.frames.len() < base_pages {
+            // A truncate removed pages the plan was written against.
+            continue;
+        }
+        // Concurrent growers may have installed the first staged pages.
+        let installed = (state.frames.len() - base_pages).min(staged.frames.len());
+        state
+            .frames
+            .try_reserve(staged.frames.len() - installed)
+            .map_err(|_| MemfdWriteError::Memfd(MemfdError::NoMemory))?;
+        if existing_len != 0 {
+            // SAFETY: the frames cover `base_pages` pages (re-checked above)
+            // and `offset..offset + existing_len` lies inside them; `scratch`
+            // holds `existing_len` bytes.
+            unsafe {
+                copy_frame_span(
+                    state.frames.as_slice(),
+                    offset,
+                    scratch.as_mut_ptr(),
+                    existing_len,
+                    SpanDirection::ToFrames,
+                );
+            }
+        }
+        for (index, &frame_phys) in staged.frames[..installed].iter().enumerate() {
+            let page_start = (base_pages + index) * PAGE_SIZE;
+            let (lo, hi) = (offset.max(page_start), end.min(page_start + PAGE_SIZE));
+            if lo < hi {
+                // SAFETY: the staged frame is private and fully initialized;
+                // the destination page exists in the locked object.
+                unsafe {
+                    copy_frame_span(
+                        state.frames.as_slice(),
+                        lo,
+                        frame_ptr(frame_phys).add(lo - page_start),
+                        hi - lo,
+                        SpanDirection::ToFrames,
+                    );
+                }
+            }
+        }
+        state.frames.extend(staged.frames.drain(installed..));
+        state.len = state.len.max(end);
+        // Staged frames a concurrent grower made redundant are freed after the
+        // lock is released.
+        drop(state);
+        drop(staged);
+        return Ok(len);
+    }
+    Err(MemfdWriteError::Memfd(MemfdError::Busy))
 }
 
-fn write_at_locked(frames: &[u64], offset: usize, src: &[u8]) {
-    let mut copied = 0usize;
-    while copied < src.len() {
-        let absolute = offset + copied;
-        let page_index = absolute / PAGE_SIZE;
-        let page_offset = absolute % PAGE_SIZE;
-        let chunk_len = (src.len() - copied).min(PAGE_SIZE - page_offset);
-        let dest =
-            (kernel_vm::higher_half_addr(frames[page_index] + page_offset as u64)) as *mut u8;
-        // SAFETY: The retained frame belongs to this memfd object, the
-        // page/chunk bounds stay within its direct-map page, and `src` owns the
-        // complete immutable input slice.
-        unsafe {
-            crate::arch::simd::copy_fast(src.as_ptr().add(copied), dest, chunk_len);
+/// Fills the private frames for pages `base_pages..` with the part of the write
+/// `[offset, end)` that falls on them and zeroes everything else on them. The
+/// source bytes are copied over the longest physically adjacent runs.
+fn fill_staged_pages<E>(
+    frames: &[u64],
+    base_pages: usize,
+    offset: usize,
+    end: usize,
+    fill: &mut dyn FnMut(usize, &mut [u8]) -> Result<(), E>,
+) -> Result<(), E> {
+    // Covered byte range of staged frame `index` inside its page.
+    let covered = |index: usize| {
+        let page_start = (base_pages + index) * PAGE_SIZE;
+        let lo = offset.max(page_start).saturating_sub(page_start);
+        let hi = end.min(page_start + PAGE_SIZE).saturating_sub(page_start);
+        if lo < hi { (lo, hi) } else { (0, 0) }
+    };
+    for (index, &frame_phys) in frames.iter().enumerate() {
+        let (lo, hi) = covered(index);
+        if lo == hi {
+            zero_frame_range(frame_phys, 0, PAGE_SIZE);
+        } else {
+            zero_frame_range(frame_phys, 0, lo);
+            zero_frame_range(frame_phys, hi, PAGE_SIZE);
         }
-        copied += chunk_len;
     }
+    let mut index = 0usize;
+    while index < frames.len() {
+        let (lo, hi) = covered(index);
+        if lo == hi {
+            index += 1;
+            continue;
+        }
+        let page_start = (base_pages + index) * PAGE_SIZE;
+        let at = page_start + lo - offset;
+        let mut run_len = hi - lo;
+        let mut last = index;
+        // A page extends the run only if the previous page is covered to its
+        // end, this one from its start, and the frames are adjacent.
+        while covered(last).1 == PAGE_SIZE
+            && last + 1 < frames.len()
+            && frames[last + 1] == frames[last] + PAGE_SIZE as u64
+        {
+            let (next_lo, next_hi) = covered(last + 1);
+            if next_lo != 0 || next_hi == 0 {
+                break;
+            }
+            run_len += next_hi;
+            last += 1;
+        }
+        // SAFETY: the frames are private, the run lies inside their pages and
+        // adjacent frames are adjacent in the direct map. `fill` only writes.
+        let dst = unsafe { core::slice::from_raw_parts_mut(frame_ptr(frames[index]).add(lo), run_len) };
+        fill(at, dst)?;
+        index = last + 1;
+    }
+    Ok(())
 }
 // RING3-MIGRATION-REFERENCE END: memfd kernel backing substrate exception.
 
@@ -1225,5 +1539,182 @@ mod tests {
             handle.write_at(0, b"X"),
             Err(MemfdError::PermissionDenied)
         );
+    }
+
+    fn pattern(len: usize, salt: u8) -> Vec<u8> {
+        (0..len).map(|i| (i as u8).wrapping_mul(7).wrapping_add(salt) | 1).collect()
+    }
+
+    fn slice_fill<'a>(
+        src: &'a [u8],
+    ) -> impl FnMut(usize, &mut [u8]) -> Result<(), ()> + 'a {
+        move |at, dst| {
+            dst.copy_from_slice(&src[at..at + dst.len()]);
+            Ok(())
+        }
+    }
+
+    fn read_all(handle: &MemfdHandle) -> Vec<u8> {
+        let mut out = alloc::vec![0u8; handle.len()];
+        assert_eq!(handle.read_at(0, &mut out), out.len());
+        out
+    }
+
+    /// Bytes of the backing frames past `len`, which must stay zero.
+    fn bytes_past_len(handle: &MemfdHandle) -> Vec<u8> {
+        let object = handle.object();
+        let state = object.state.lock();
+        let mut out = Vec::new();
+        for (page, &frame) in state.frames.iter().enumerate() {
+            for byte in 0..PAGE_SIZE {
+                if page * PAGE_SIZE + byte >= state.len {
+                    // SAFETY: fake frames are live heap pages.
+                    out.push(unsafe { *frame_ptr(frame).add(byte) });
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn unzeroed_growth_zeroes_holes_heads_and_tails_of_partial_pages() {
+        fake_reset(usize::MAX);
+        let handle = MemfdHandle::new(String::from("sparse"), true, None);
+        // Starts in page 1 (page 0 is a pure hole) and ends mid page 3.
+        let offset = PAGE_SIZE + 1000;
+        let data = pattern(2 * PAGE_SIZE + 500, 3);
+        let mut scratch = Vec::new();
+        assert_eq!(
+            handle.write_at_with(offset, data.len(), &mut scratch, &mut slice_fill(&data)),
+            Ok(data.len())
+        );
+        assert!(scratch.is_empty(), "pure growth needs no bounce buffer");
+        assert_eq!(handle.len(), offset + data.len());
+        let all = read_all(&handle);
+        assert!(all[..offset].iter().all(|&b| b == 0), "hole and head are zero, not 0xAA");
+        assert_eq!(&all[offset..], &data[..]);
+        assert!(
+            bytes_past_len(&handle).iter().all(|&b| b == 0),
+            "the unwritten tail of the last page is zero"
+        );
+        drop(handle);
+        assert_eq!(fake_live(), 0);
+    }
+
+    #[test]
+    fn a_write_spanning_more_than_one_allocation_batch_round_trips() {
+        fake_reset(usize::MAX);
+        let mut handle = MemfdHandle::new(String::from("big"), true, None);
+        let pages = STAGE_BATCH_FRAMES * 2 + 3;
+        let data = pattern(pages * PAGE_SIZE - 17, 9);
+        let mut scratch = Vec::new();
+        assert_eq!(
+            handle.write_from_with(data.len(), &mut scratch, &mut slice_fill(&data)),
+            Ok(data.len())
+        );
+        assert_eq!(handle.seek(0, FileHandleSeekWhence::Current), Ok(data.len() as u64));
+        assert_eq!(read_all(&handle), data);
+        assert_eq!(fake_live(), pages);
+        // A second append continues exactly where the cursor stopped.
+        let more = pattern(PAGE_SIZE + 5, 5);
+        assert_eq!(handle.write_from(&more), Ok(more.len()));
+        let all = read_all(&handle);
+        assert_eq!(&all[..data.len()], &data[..]);
+        assert_eq!(&all[data.len()..], &more[..]);
+        assert!(bytes_past_len(&handle).iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn a_source_failing_mid_copy_exposes_nothing_and_refunds_everything() {
+        charge::init_group(54, None);
+        fake_reset(usize::MAX);
+        let handle = MemfdHandle::new(String::from("fault"), true, Some(54));
+        let mut calls = 0;
+        let mut scratch = Vec::new();
+        // The first run copies half of its bytes (into stale 0xAA frames) and
+        // then faults.
+        let result = handle.write_at_with(0, 5 * PAGE_SIZE, &mut scratch, &mut |_, dst| {
+            calls += 1;
+            let half = dst.len() / 2;
+            dst[..half].fill(0x55);
+            Err("fault")
+        });
+        assert_eq!(result, Err(MemfdWriteError::Source("fault")));
+        assert_eq!(calls, 1);
+        assert_eq!(handle.len(), 0);
+        assert!(handle.object().state.lock().frames.is_empty());
+        assert_eq!(charge::usage(54), 0, "the staged charge is refunded");
+        assert_eq!(fake_live(), 0, "the private frames are freed");
+
+        // A fault in the part overwriting existing pages changes nothing.
+        let base = pattern(2 * PAGE_SIZE, 1);
+        assert_eq!(handle.write_at(0, &base), Ok(base.len()));
+        let live = fake_live();
+        let result = handle.write_at_with(PAGE_SIZE, 3 * PAGE_SIZE, &mut scratch, &mut |_, dst| {
+            dst.fill(0x66);
+            Err("fault")
+        });
+        assert_eq!(result, Err(MemfdWriteError::Source("fault")));
+        assert_eq!(read_all(&handle), base);
+        assert_eq!(fake_live(), live);
+        assert_eq!(charge::usage(54), 2);
+        drop(handle);
+        assert_eq!(charge::usage(54), 0);
+        assert_eq!(fake_live(), 0);
+    }
+
+    #[test]
+    fn overwrite_crossing_the_end_updates_existing_and_new_pages() {
+        fake_reset(usize::MAX);
+        let handle = MemfdHandle::new(String::from("cross"), true, None);
+        let base = pattern(PAGE_SIZE + 100, 1);
+        assert_eq!(handle.write_at(0, &base), Ok(base.len()));
+        let patch = pattern(2 * PAGE_SIZE, 77);
+        let offset = PAGE_SIZE - 300;
+        let mut scratch = Vec::new();
+        assert_eq!(
+            handle.write_at_with(offset, patch.len(), &mut scratch, &mut slice_fill(&patch)),
+            Ok(patch.len())
+        );
+        assert_eq!(scratch.len(), 2 * PAGE_SIZE - offset, "only the already-backed bytes bounce");
+        let mut expected = base.clone();
+        expected.resize(offset + patch.len(), 0);
+        expected[offset..].copy_from_slice(&patch);
+        assert_eq!(read_all(&handle), expected);
+        assert!(bytes_past_len(&handle).iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn writes_keep_seal_quota_and_size_limits() {
+        charge::init_group(55, None);
+        charge::set_limit(55, 2);
+        fake_reset(usize::MAX);
+        let handle = MemfdHandle::new(String::from("quota"), true, Some(55));
+        let data = pattern(3 * PAGE_SIZE, 2);
+        assert_eq!(handle.write_at(0, &data), Err(MemfdError::NoMemory));
+        assert_eq!(charge::usage(55), 0);
+        assert_eq!(fake_live(), 0);
+        assert_eq!(handle.write_at(0, &data[..2 * PAGE_SIZE]), Ok(2 * PAGE_SIZE));
+        assert_eq!(charge::usage(55), 2);
+        assert_eq!(handle.add_seals(linux_abi::F_SEAL_GROW as u32), Ok(()));
+        assert_eq!(handle.write_at(2 * PAGE_SIZE, b"x"), Err(MemfdError::PermissionDenied));
+        assert_eq!(handle.write_at(0, b"y"), Ok(1));
+        assert_eq!(
+            handle.write_at(usize::MAX - 1, b"zz"),
+            Err(MemfdError::InvalidArgument)
+        );
+        assert_eq!(fake_live(), 2);
+    }
+
+    #[test]
+    fn a_failed_cursor_write_returns_the_cursor() {
+        fake_reset(usize::MAX);
+        let mut handle = MemfdHandle::new(String::from("cursor"), true, None);
+        assert_eq!(handle.write_from(b"abcd"), Ok(4));
+        let mut scratch = Vec::new();
+        let result = handle.write_from_with(PAGE_SIZE, &mut scratch, &mut |_, _| Err(()));
+        assert_eq!(result, Err(MemfdWriteError::Source(())));
+        assert_eq!(handle.seek(0, FileHandleSeekWhence::Current), Ok(4));
+        assert_eq!(handle.len(), 4);
     }
 }

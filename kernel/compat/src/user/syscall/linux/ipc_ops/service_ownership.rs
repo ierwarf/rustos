@@ -168,6 +168,28 @@ pub(crate) fn process_owns_live_service_endpoint(process_id: u64, service_id: u6
         && !multitask::is_user_process_exiting(process_id)
 }
 
+/// Whether `process_id` owns the live endpoint of `service_id`, judged from one
+/// stable publication tuple instead of under the registry mutation lock.
+///
+/// `stable_published_service_endpoint` double-reads the epoch around the
+/// endpoint and owner, and reports a tuple only when no publish or revoke
+/// interleaved; it already hides an absent endpoint and an exiting owner. A
+/// concurrent mutation of this one service is therefore reported as `false`,
+/// which fails closed (the caller answers `EPERM`), never as a false grant.
+/// Request-rate callers (storaged validates its requester on every request)
+/// use this form so they do not bounce the global mutation-lock cache line
+/// shared by every service call.
+pub(crate) fn process_owns_stable_live_service_endpoint(process_id: u64, service_id: u64) -> bool {
+    if process_id == 0 {
+        return false;
+    }
+    let Some(index) = service_index(service_id) else {
+        return false;
+    };
+    stable_published_service_endpoint(index)
+        .is_some_and(|publication| publication.owner == process_id)
+}
+
 /// Whether `process_id` is the *published* owner of `service_id`, read without
 /// the registry lock.
 ///

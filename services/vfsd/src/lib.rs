@@ -9,12 +9,14 @@ pub mod inotify;
 pub mod lifecycle;
 pub mod linux_types;
 pub mod locks;
+pub mod lru;
 pub mod mount_table;
 pub mod path;
 pub mod permissions;
 pub mod proc_fs;
 pub mod proc_snapshot;
 pub mod snapshot_budget;
+pub mod snapshot_pipeline;
 pub mod snapshot_sessions;
 pub mod tmpfs;
 mod snapshot_lease;
@@ -28,8 +30,7 @@ use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::performance::{WAITSET_MAX_EPOLL_OBJECTS, WAITSET_MAX_GLOBAL_INTERESTS};
 use rustos_user_abi::syscall::{
     DvmBlockInfoWire, ServiceCheckpointRecordWire, EARLY_SYSTEM_BROKER_MAX_IO_BYTES,
-    SERVICE_CHECKPOINT_ABI_VERSION, SERVICE_CHECKPOINT_FLAG_TOMBSTONE, VFS_IPC_OP_FTRUNCATE,
-    VFS_IPC_OP_WRITE, WAITSET_MAX_INTERESTS,
+    SERVICE_CHECKPOINT_ABI_VERSION, SERVICE_CHECKPOINT_FLAG_TOMBSTONE, WAITSET_MAX_INTERESTS,
 };
 use storage_core::{IoResult, StorageError};
 
@@ -1059,16 +1060,6 @@ impl WaitSetRegistry {
     }
 }
 
-/// Persistent mutation remains unavailable until a journal/recovery protocol
-/// is implemented. Keeping this decision in the testable policy library makes
-/// the service dispatch and the formal admission model share one source gate.
-pub const fn persistent_mutation_status(op: u16) -> Option<i32> {
-    match op {
-        VFS_IPC_OP_WRITE | VFS_IPC_OP_FTRUNCATE => Some(EROFS),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1466,16 +1457,6 @@ mod tests {
         assert!(!cacheable_metadata_errno(5));
         assert!(!cacheable_metadata_errno(19));
         assert!(!cacheable_metadata_errno(110));
-    }
-
-    #[test]
-    fn persistent_mutation_admission_remains_read_only() {
-        assert_eq!(persistent_mutation_status(VFS_IPC_OP_WRITE), Some(EROFS));
-        assert_eq!(
-            persistent_mutation_status(VFS_IPC_OP_FTRUNCATE),
-            Some(EROFS)
-        );
-        assert_eq!(persistent_mutation_status(0xffff), None);
     }
 
     #[test]

@@ -20,6 +20,7 @@
 //! plan for the parent module.
 
 use core::cmp::min;
+use core::mem::MaybeUninit;
 use core::ptr;
 
 use x86_64::PhysAddr;
@@ -86,7 +87,35 @@ impl ValidatedUserRead<'_> {
             "validated user-read proof used with a different byte length"
         );
         self.address_space
+            .read_user_bytes_from(self.start, as_uninit_bytes(dest), self.first_phys)
+    }
+
+    /// [`Self::copy_into`] into storage that need not be initialized. On `Ok`
+    /// every byte of `dest` is initialized; on `Err` none of it may be assumed
+    /// initialized.
+    pub fn copy_into_uninit(
+        self,
+        dest: &mut [MaybeUninit<u8>],
+    ) -> Result<(), AddressSpaceError> {
+        assert_eq!(
+            dest.len(),
+            self.byte_len,
+            "validated user-read proof used with a different byte length"
+        );
+        self.address_space
             .read_user_bytes_from(self.start, dest, self.first_phys)
+    }
+}
+
+/// Views initialized bytes as possibly-uninitialized storage. Sound because the
+/// only writers in this module store initialized bytes.
+fn as_uninit_bytes(bytes: &mut [u8]) -> &mut [MaybeUninit<u8>] {
+    // SAFETY: `MaybeUninit<u8>` has the layout of `u8`; the borrow is unique.
+    unsafe {
+        core::slice::from_raw_parts_mut(
+            bytes.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+            bytes.len(),
+        )
     }
 }
 
@@ -285,7 +314,7 @@ impl ProcessAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         let first_phys =
             self.validate_user_buffer_access(start, dest.len(), UserBufferAccess::Read)?;
-        self.read_user_bytes_from(start, dest, first_phys)
+        self.read_user_bytes_from(start, as_uninit_bytes(dest), first_phys)
     }
 
     pub fn visit_user_read_spans(
@@ -343,7 +372,7 @@ impl ProcessAddressSpace {
     fn read_user_bytes_from(
         &self,
         start: VirtAddr,
-        dest: &mut [u8],
+        dest: &mut [MaybeUninit<u8>],
         first_phys: Option<PhysAddr>,
     ) -> Result<(), AddressSpaceError> {
         if dest.is_empty() {
@@ -368,7 +397,7 @@ impl ProcessAddressSpace {
             unsafe {
                 ptr::copy_nonoverlapping(
                     higher_half_ptr(phys) as *const u8,
-                    dest.as_mut_ptr().add(copied),
+                    dest.as_mut_ptr().add(copied).cast::<u8>(),
                     chunk,
                 );
             }

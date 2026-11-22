@@ -8,7 +8,12 @@
 //! and sink retain their capabilities until transfer completion/cancellation.
 //! Failure: overflow, allocation pressure, missing coverage and zero/overlong
 //! progress fail explicitly; an incomplete transfer is never a complete image.
-//! Evidence: native range, partial-I/O, cancellation and >4-GiB offset tests.
+//! Transfer driver: the positional-transfer vocabulary (`ReadAt`, `WriteAt`,
+//! `TransferError`, `TransferFailure`) lives here; the pipelined driver that
+//! uses it is vfsd's `snapshot_pipeline`, which owns the window ring and stage
+//! threads, so no serial copy loop remains in this crate.
+//! Evidence: native range-read tests here; partial-I/O, cancellation and
+//! >4-GiB offset tests in vfsd's `snapshot_pipeline`.
 
 use alloc::vec::Vec;
 use crate::{BlockDevice, StorageError};
@@ -195,47 +200,6 @@ pub struct TransferFailure<R, W> {
     pub completed_bytes: u64,
     pub error: TransferError<R, W>,
 }
-fn failure<R, W>(completed_bytes: u64, error: TransferError<R, W>) -> TransferFailure<R, W> {
-    TransferFailure { completed_bytes, error }
-}
-
-/// Transfer an exact immutable length, using only the caller's scratch window.
-/// `control` runs before every provider operation; `committed` sees only bytes
-/// actually accepted by the sink (suitable for an incremental content digest).
-pub fn transfer_exact<R: ReadAt, W: WriteAt>(
-    source: &mut R, sink: &mut W, window: &mut [u8],
-    mut control: impl FnMut(u64) -> Result<(), TransferControl>,
-    mut committed: impl FnMut(&[u8]),
-) -> Result<u64, TransferFailure<R::Error, W::Error>> {
-    if window.is_empty() { return Err(failure(0, TransferError::InvalidWindow)); }
-    let identity = source.identity();
-    let len = source.len();
-    let mut done = 0u64;
-    while done < len {
-        control(done).map_err(|error| failure(done, TransferError::Control(error)))?;
-        if source.identity() != identity || source.len() != len { return Err(failure(done, TransferError::SourceChanged)); }
-        let requested = window.len().min((len - done).min(usize::MAX as u64) as usize);
-        let read = source.read_at(done, &mut window[..requested]).map_err(|error| failure(done, TransferError::Read(error)))?;
-        if read == 0 { return Err(failure(done, TransferError::UnexpectedEof)); }
-        if read > requested { return Err(failure(done, TransferError::InvalidCount)); }
-        if source.identity() != identity || source.len() != len { return Err(failure(done, TransferError::SourceChanged)); }
-        let mut sent = 0;
-        while sent < read {
-            let offset = done + sent as u64;
-            control(offset).map_err(|error| failure(offset, TransferError::Control(error)))?;
-            let n = sink.write_at(offset, &window[sent..read]).map_err(|error| failure(offset, TransferError::Write(error)))?;
-            if n == 0 { return Err(failure(offset, TransferError::WriteZero)); }
-            if n > read - sent { return Err(failure(offset, TransferError::InvalidCount)); }
-            committed(&window[sent..sent + n]);
-            sent += n;
-        }
-        // `read <= requested <= len - done`, so this cannot wrap.
-        done += read as u64;
-    }
-    if source.identity() != identity || source.len() != len { return Err(failure(done, TransferError::SourceChanged)); }
-    control(done).map_err(|error| failure(done, TransferError::Control(error)))?;
-    Ok(done)
-}
 
 #[cfg(test)]
 mod tests {
@@ -277,92 +241,5 @@ mod tests {
         assert!(map.finish().is_err());
         let mut map = FileReadMap::new(ID, 1, u64::MAX, 4096).unwrap();
         assert_eq!(map.push(1, RangeKind::Data { device_offset: u64::MAX }), Err(RangeError::Invalid));
-    }
-
-    struct Source { len: u64, maximum: usize, eof: bool }
-    impl ReadAt for Source {
-        type Error = ();
-        fn identity(&self) -> FileIdentity { ID }
-        fn len(&self) -> u64 { self.len }
-        fn read_at(&mut self, offset: u64, bytes: &mut [u8]) -> Result<usize, ()> {
-            assert!(offset < self.len);
-            if self.eof { return Ok(0); }
-            Ok(bytes.len().min(self.maximum))
-        }
-    }
-    struct Sink { done: u64, maximum: usize }
-    impl WriteAt for Sink {
-        type Error = ();
-        fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<usize, ()> {
-            assert_eq!(offset, self.done);
-            let n = bytes.len().min(self.maximum);
-            self.done += n as u64;
-            Ok(n)
-        }
-    }
-
-    #[test]
-    fn transfer_handles_partial_progress_and_offsets_beyond_four_gib() {
-        let len = (1u64 << 32) + 71;
-        let mut source = Source { len, maximum: usize::MAX, eof: false };
-        let mut sink = Sink { done: 0, maximum: usize::MAX };
-        let mut window = alloc::vec![0; 1024 * 1024];
-        let mut counted = 0u64;
-        assert_eq!(transfer_exact(&mut source, &mut sink, &mut window, |_| Ok(()), |bytes| counted += bytes.len() as u64), Ok(len));
-        assert_eq!(counted, len);
-        let mut source = Source { len: 307, maximum: 17, eof: false };
-        let mut sink = Sink { done: 0, maximum: 3 };
-        assert_eq!(transfer_exact(&mut source, &mut sink, &mut window[..64], |_| Ok(()), |_| {}), Ok(307));
-    }
-
-    #[test]
-    fn failed_writes_preserve_confirmed_prefix_and_provider_outcome() {
-        struct FailingSink { done: u64 }
-        impl WriteAt for FailingSink {
-            type Error = &'static str;
-            fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<usize, Self::Error> {
-                assert_eq!(offset, self.done);
-                if self.done == 19 { return Err("provider outcome unknown"); }
-                let n = bytes.len().min(3).min((19 - self.done) as usize);
-                self.done += n as u64;
-                Ok(n)
-            }
-        }
-        let mut source = Source { len: 100, maximum: 64, eof: false };
-        let mut sink = FailingSink { done: 0 };
-        let mut digest_bytes = 0;
-        let result = transfer_exact(&mut source, &mut sink, &mut [0; 64], |_| Ok(()), |bytes| digest_bytes += bytes.len());
-        assert_eq!(result, Err(failure(19, TransferError::Write("provider outcome unknown"))));
-        assert_eq!(digest_bytes, 19);
-    }
-    #[test]
-    fn source_version_change_during_read_aborts_before_writing_that_window() {
-        struct ChangingSource { generation: u64 }
-        impl ReadAt for ChangingSource {
-            type Error = ();
-            fn identity(&self) -> FileIdentity { FileIdentity { generation: self.generation, ..ID } }
-            fn len(&self) -> u64 { 64 }
-            fn read_at(&mut self, _: u64, output: &mut [u8]) -> Result<usize, ()> { self.generation += 1; Ok(output.len()) }
-        }
-        let mut source = ChangingSource { generation: 1 };
-        let mut sink = Sink { done: 0, maximum: 64 };
-        assert_eq!(transfer_exact(&mut source, &mut sink, &mut [0; 64], |_| Ok(()), |_| {}),
-            Err(failure(0, TransferError::SourceChanged)));
-        assert_eq!(sink.done, 0);
-    }
-    #[test]
-    fn transfer_rejects_eof_zero_writes_and_cancellation() {
-        let mut source = Source { len: 1024, maximum: 64, eof: true };
-        let mut sink = Sink { done: 0, maximum: 1 };
-        let mut window = [0; 64];
-        assert_eq!(transfer_exact(&mut source, &mut sink, &mut window, |_| Ok(()), |_| {}), Err(failure(0, TransferError::UnexpectedEof)));
-        source.eof = false;
-        sink.maximum = 0;
-        assert_eq!(transfer_exact(&mut source, &mut sink, &mut window, |_| Ok(()), |_| {}), Err(failure(0, TransferError::WriteZero)));
-        sink.maximum = 64;
-        let error = transfer_exact(&mut source, &mut sink, &mut window,
-            |done| if done >= 64 { Err(TransferControl::Cancelled) } else { Ok(()) }, |_| {});
-        assert_eq!(error, Err(failure(64, TransferError::Control(TransferControl::Cancelled))));
-        assert_eq!(sink.done, 64);
     }
 }

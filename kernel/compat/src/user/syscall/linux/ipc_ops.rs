@@ -516,7 +516,7 @@ fn syscall_linux_rustos_ipc_validate_service_owner(args_ptr: u64) -> u64 {
     {
         return linux_errno(LINUX_EINVAL);
     }
-    if !process_owns_live_service_endpoint(args.process_id, args.service_id) {
+    if !process_owns_stable_live_service_endpoint(args.process_id, args.service_id) {
         return linux_errno(LINUX_EPERM);
     }
     0
@@ -2836,25 +2836,34 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
         && response_len <= kernel_ipc_runtime::api::IPC_FAST_MAX_BYTES
     {
         let mut inline = [0_u8; kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES];
-        let response: &[u8] = if response_len <= inline.len() {
+        let reply_handle = KernelReplyHandle::from_raw(reply);
+        let completed = if response_len <= inline.len() {
             if response_len != 0
                 && let Err(error) =
                     usermem::copy_from_current_user_exact(response_ptr, &mut inline[..response_len])
             {
                 return linux_errno(address_space_error_to_linux_errno(error));
             }
-            &inline[..response_len]
+            kernel_ipc_runtime::api::endpoint::complete_fast_reply_for_task(
+                reply_handle,
+                receiver_task_id,
+                &inline[..response_len],
+            )
         } else {
-            match copy_request_from_user(response_ptr, response_len as u64) {
-                Ok(bytes) => staged.insert(bytes).as_slice(),
+            let bytes = match copy_request_from_user(response_ptr, response_len as u64) {
+                Ok(bytes) => staged.insert(bytes),
                 Err(errno) => return linux_errno(errno),
-            }
+            };
+            // The large response moves into the frame spill: no second
+            // allocation or copy. On rejection it stays in `staged` for the
+            // queued path below.
+            kernel_ipc_runtime::api::endpoint::complete_fast_reply_moving(
+                reply_handle,
+                receiver_task_id,
+                bytes,
+            )
         };
-        match kernel_ipc_runtime::api::endpoint::complete_fast_reply_for_task(
-            KernelReplyHandle::from_raw(reply),
-            receiver_task_id,
-            response,
-        ) {
+        match completed {
             Ok(published) => {
                 note_fast_ipc(IpcFastCounter::ReplyPublished);
                 let wake_mark = charge_server_phase(IpcServerPhase::ReplyPublish, publish_mark);
@@ -4366,12 +4375,13 @@ fn copy_request_from_user(user_ptr: u64, user_len: u64) -> Result<Vec<u8>, i64> 
     if len == 0 || len > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
         return Err(LINUX_EINVAL);
     }
+    // One reservation, filled directly from user memory: no zeroing and no
+    // staging copy. The charge keeps its historical phase name (allocation).
     let alloc_mark = phase_mark();
-    let mut bytes = alloc::vec![0_u8; len];
+    let bytes = usermem::copy_from_current_user_to_vec(user_ptr, len)
+        .map_err(address_space_error_to_linux_errno);
     let _ = charge_phase(IpcCallPhase::CopyAlloc, alloc_mark);
-    usermem::copy_from_current_user_exact(user_ptr, &mut bytes)
-        .map_err(address_space_error_to_linux_errno)?;
-    Ok(bytes)
+    bytes
 }
 
 fn ipc_error_to_linux_errno(err: kernel_ipc_runtime::api::IpcError) -> i64 {

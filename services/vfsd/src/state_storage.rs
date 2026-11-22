@@ -835,11 +835,13 @@ impl VfsStorage {
                         return res.map_err(vfsd::map_fs_error);
                     }
                 }
-                if self.file_bytes_cache.contains_key(&key) {
+                let cached = self
+                    .file_bytes_cache
+                    .get(&key)
+                    .map(|bytes| copy_file_cache_range(bytes, start, dest));
+                if let Some(read) = cached {
                     self.file_bytes_cache_lru.touch(&key);
-                }
-                if let Some(bytes) = self.file_bytes_cache.get(&key) {
-                    return Ok(copy_file_cache_range(bytes, start, dest));
+                    return Ok(read);
                 }
 
                 let cacheable_len = should_materialize_file_cache(file_len, start, dest.len());
@@ -889,6 +891,18 @@ impl VfsStorage {
         read_map_source: &dyn vfsd::mount_table::ReadMapSupport,
         len: u64,
     ) -> Result<(), i32> {
+        // A revoked map (its file, FAT chain or directory entry was written)
+        // is dropped here and replanned, instead of failing every later read.
+        if self
+            .read_maps
+            .get(key)
+            .is_some_and(|map| !read_map_source.read_map_is_current(map))
+        {
+            self.read_maps_lru.remove(key);
+            if let Some(old) = self.read_maps.remove(key) {
+                self.read_map_bytes = self.read_map_bytes.saturating_sub(old.metadata_bytes());
+            }
+        }
         if !self.read_maps.contains_key(key) {
             let map = read_map_source
                 .plan_read(rel_path, vfsd::snapshot_budget::SNAPSHOT_MAP_BYTES)
@@ -1133,7 +1147,7 @@ impl VfsStorage {
         &mut self,
         plan: &ExecutableSnapshotPlan,
         snapshot: &ExecutableSnapshotOpen,
-        digest_bytes: [u8; 32],
+        digest_bytes: Option<[u8; 32]>,
     ) -> Result<Option<ExecutableSnapshotOpen>, i32> {
         self.invalidate_caches_if_remounted();
         if !vfsd::snapshot_plan_is_current(plan.mount_generation, self.mount_generation)
@@ -1194,12 +1208,17 @@ impl VfsStorage {
                     );
                 }
                 ExecutableSnapshotBacking::DvmVolume => {
+                    // Product evidence must carry a real digest; a plan that
+                    // skipped hashing cannot produce it.
+                    let Some(digest) = digest_bytes else {
+                        return Err(EIO);
+                    };
                     let evidence = ProductExecutableSnapshotEvidence {
                         storage_epoch: plan.storage_epoch,
                         mount_generation: plan.mount_generation,
                         request_id: plan.request_id,
                         file_bytes: file_len as u64,
-                        digest: digest_bytes,
+                        digest,
                         ..ProductExecutableSnapshotEvidence::default()
                     };
                     if ipc::product_executable_snapshot_evidence(&evidence) != 0 {
@@ -1770,6 +1789,10 @@ impl VfsStorage {
         (fallback_len, path_inode(abs_path.as_bytes()))
     }
 
+    /// Writes through the mount's volume (or the live shared mapping of the
+    /// path). Admission is per mount: a read-only mount is `EROFS`, a writable
+    /// FAT volume mutates in place. FAT has no journal, so durability is only
+    /// what `flush_path`/`fsync` (volume flush plus device barrier) establishes.
     fn write_at_path(&mut self, abs_path: &str, offset: u64, data: &[u8]) -> Result<(usize, u64), i32> {
         let (_mid, rel_path, key, _parent_key, caps, _imm, volume, _rms) =
             self.resolve_mount(abs_path)?;
@@ -2557,7 +2580,11 @@ impl VfsStorage {
     /// so the cache must have a hard entry bound or a path-probing client could
     /// exhaust the namespace service heap.
     fn insert_metadata_cache(&mut self, key: CacheKey, result: Result<Metadata, i32>) {
-        while self.metadata_cache.len() >= vfsd::METADATA_CACHE_MAX_ENTRIES {
+        // Replacing an existing answer does not grow the cache, so it must not
+        // evict an unrelated entry.
+        while !self.metadata_cache.contains_key(&key)
+            && self.metadata_cache.len() >= vfsd::METADATA_CACHE_MAX_ENTRIES
+        {
             let Some(evict_key) = self.metadata_cache_lru.pop_lru() else {
                 self.metadata_cache.clear();
                 break;

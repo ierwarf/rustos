@@ -195,20 +195,38 @@ const fn user_range_is_canonical(addr: u64, len: usize) -> bool {
     }
 }
 
+/// Element types a user read may fill: initialized bytes, or storage that is
+/// still uninitialized (a freshly reserved buffer that will be wholly
+/// overwritten). The copy only ever stores initialized bytes.
+pub trait UserReadByte: sealed::Sealed {}
+impl UserReadByte for u8 {}
+impl UserReadByte for core::mem::MaybeUninit<u8> {}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for u8 {}
+    impl Sealed for core::mem::MaybeUninit<u8> {}
+}
+
+/// Copies `dst.len()` bytes from user address `src`. On `true` every byte of
+/// `dst` is initialized. `false` means a fault or a disabled direct path; `dst`
+/// may be partly written, and for `MaybeUninit` storage none of it may be
+/// assumed initialized.
 #[cfg(rustos_boot_image)]
 #[inline]
-pub fn copy_from_user(dst: &mut [u8], src: u64) -> bool {
+pub fn copy_from_user<T: UserReadByte>(dst: &mut [T], src: u64) -> bool {
     if !user_range_is_canonical(src, dst.len()) {
         return false;
     }
-    // SAFETY: `dst` is a live kernel buffer; a fault in the read is recovered by
-    // the fixup table and reported as failure.
-    unsafe { rustos_user_copy_from(dst.as_mut_ptr(), src as *const u8, dst.len()) == 0 }
+    // SAFETY: `T` is `u8` or `MaybeUninit<u8>`, both one byte; `dst` is a live
+    // kernel buffer; a fault in the read is recovered by the fixup table and
+    // reported as failure. The routine only stores bytes.
+    unsafe { rustos_user_copy_from(dst.as_mut_ptr().cast::<u8>(), src as *const u8, dst.len()) == 0 }
 }
 
 #[cfg(not(rustos_boot_image))]
 #[inline]
-pub fn copy_from_user(_dst: &mut [u8], _src: u64) -> bool {
+pub fn copy_from_user<T: UserReadByte>(_dst: &mut [T], _src: u64) -> bool {
     false
 }
 

@@ -434,6 +434,60 @@ fn storaged_bulk_read_response_binds_the_complete_request_header() {
 }
 
 #[test]
+fn storaged_bulk_read_reply_length_is_header_plus_exact_payload() {
+    const HDR: usize = STORAGED_BULK_READ_RESPONSE_HEADER_BYTES;
+    assert_eq!(StoragedBulkReadResponse::reply_len_for(0), Some(HDR));
+    assert_eq!(
+        StoragedBulkReadResponse::reply_len_for(STORAGED_BULK_READ_PAYLOAD_CAPACITY),
+        Some(IPC_MAX_INLINE_BYTES)
+    );
+    assert_eq!(
+        StoragedBulkReadResponse::reply_len_for(STORAGED_BULK_READ_PAYLOAD_CAPACITY + 1),
+        None
+    );
+
+    let mut response = StoragedBulkReadResponse::default();
+    response.payload_len = 4096;
+    response.payload[..4096].fill(0xa5);
+    response.payload[4096] = 0xee;
+    assert_eq!(response.payload_of_reply(HDR + 4096).map(<[u8]>::len), Some(4096));
+    assert!(response.payload_of_reply(HDR + 4096).unwrap().iter().all(|b| *b == 0xa5));
+    // Short, long and header-truncated receives are all rejected.
+    assert!(response.payload_of_reply(HDR + 4095).is_none());
+    assert!(response.payload_of_reply(HDR + 4097).is_none());
+    assert!(response.payload_of_reply(HDR - 1).is_none());
+    assert!(response.payload_of_reply(0).is_none());
+    // An oversized claimed payload is rejected even at the full buffer size.
+    response.payload_len = (STORAGED_BULK_READ_PAYLOAD_CAPACITY + 1) as u32;
+    assert!(response.payload_of_reply(IPC_MAX_INLINE_BYTES).is_none());
+    // An error reply is header-only.
+    response.payload_len = 0;
+    assert_eq!(response.payload_of_reply(HDR), Some(&[][..]));
+}
+
+#[test]
+fn storaged_bulk_write_request_length_is_header_plus_exact_payload() {
+    const HDR: usize = STORAGED_BULK_WRITE_REQUEST_HEADER_BYTES;
+    assert_eq!(StoragedBulkWriteRequest::request_len_for(0), Some(HDR));
+    assert_eq!(
+        StoragedBulkWriteRequest::request_len_for(STORAGED_BULK_WRITE_PAYLOAD_CAPACITY),
+        Some(IPC_MAX_INLINE_BYTES)
+    );
+    assert_eq!(
+        StoragedBulkWriteRequest::request_len_for(STORAGED_BULK_WRITE_PAYLOAD_CAPACITY + 1),
+        None
+    );
+    let mut req = StoragedBulkWriteRequest::default();
+    req.payload_len = 512;
+    assert_eq!(req.payload_of_request(HDR + 512).map(<[u8]>::len), Some(512));
+    assert!(req.payload_of_request(HDR + 511).is_none());
+    assert!(req.payload_of_request(HDR + 513).is_none());
+    assert!(req.payload_of_request(HDR - 1).is_none());
+    req.payload_len = (STORAGED_BULK_WRITE_PAYLOAD_CAPACITY + 1) as u32;
+    assert!(req.payload_of_request(IPC_MAX_INLINE_BYTES).is_none());
+}
+
+#[test]
 fn storaged_bulk_write_request_fills_one_exact_inline_message() {
     assert_eq!(
         core::mem::offset_of!(StoragedBulkWriteRequest, payload),

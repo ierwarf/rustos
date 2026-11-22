@@ -2168,15 +2168,56 @@ pub fn take_fast_endpoint_request_inline<const N: usize>(
         .ok_or(IpcError::InvalidHandle)?
 }
 
+/// Where a fast reply's bytes come from. A response above the inline image is
+/// stored in the frame's spill; `Moving` hands the caller's own allocation over
+/// so the spill needs neither a second reservation nor a second copy.
+enum FastReplyBytes<'a> {
+    Borrowed(&'a [u8]),
+    Moving(&'a mut Vec<u8>),
+}
+
+impl FastReplyBytes<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Moving(bytes) => bytes.as_slice(),
+        }
+    }
+}
+
 pub fn complete_fast_endpoint_reply_for_task(
     reply: KernelReplyHandle,
     receiver_task_id: u64,
     response: &[u8],
 ) -> Result<FastReplyCompletion, IpcError> {
+    complete_fast_endpoint_reply(reply, receiver_task_id, FastReplyBytes::Borrowed(response))
+}
+
+/// [`complete_fast_endpoint_reply_for_task`] for a response the caller already
+/// owns in a `Vec` whose length is exactly the response length. When the
+/// response is larger than the inline image and is accepted, the allocation
+/// itself becomes the frame spill and `response` is left empty; on any error
+/// (including `InvalidHandle` for a non-fast reply) `response` is returned
+/// untouched so the caller can retry on another transport. A response that fits
+/// inline is copied and `response` is left as is.
+pub fn complete_fast_endpoint_reply_moving(
+    reply: KernelReplyHandle,
+    receiver_task_id: u64,
+    response: &mut Vec<u8>,
+) -> Result<FastReplyCompletion, IpcError> {
+    complete_fast_endpoint_reply(reply, receiver_task_id, FastReplyBytes::Moving(response))
+}
+
+fn complete_fast_endpoint_reply(
+    reply: KernelReplyHandle,
+    receiver_task_id: u64,
+    mut response: FastReplyBytes<'_>,
+) -> Result<FastReplyCompletion, IpcError> {
+    let response_len = response.as_slice().len();
     // Validate before preparing a potentially large buffer. This observation
     // grants no authority: cancellation, teardown or another reply may win
     // while allocation is in progress, so the commit repeats every check.
-    let capacity = if response.len() > IPC_FAST_INLINE_BYTES {
+    let capacity = if response_len > IPC_FAST_INLINE_BYTES {
         Some(
             REPLIES.with(reply.raw(), |object| {
                 if object.used || object.consumed {
@@ -2196,19 +2237,29 @@ pub fn complete_fast_endpoint_reply_for_task(
     };
 
     let mut terminal_error = capacity
-        .is_some_and(|capacity| response.len() > IPC_FAST_MAX_BYTES || response.len() > capacity)
+        .is_some_and(|capacity| response_len > IPC_FAST_MAX_BYTES || response_len > capacity)
         .then_some(IpcError::BufferTooSmall);
     let mut prepared_spill = None;
-    if terminal_error.is_none() && response.len() > IPC_FAST_INLINE_BYTES {
-        let mut bytes = Vec::new();
-        if bytes.try_reserve_exact(response.len()).is_err() {
-            terminal_error = Some(IpcError::NoMemory);
-        } else {
-            bytes.extend_from_slice(response);
-            prepared_spill = Some(FastSpill {
-                request: Vec::new(),
-                response: bytes,
-            });
+    if terminal_error.is_none() && response_len > IPC_FAST_INLINE_BYTES {
+        match &mut response {
+            FastReplyBytes::Moving(owned) => {
+                prepared_spill = Some(FastSpill {
+                    request: Vec::new(),
+                    response: core::mem::take(*owned),
+                });
+            }
+            FastReplyBytes::Borrowed(borrowed) => {
+                let mut bytes = Vec::new();
+                if bytes.try_reserve_exact(response_len).is_err() {
+                    terminal_error = Some(IpcError::NoMemory);
+                } else {
+                    bytes.extend_from_slice(borrowed);
+                    prepared_spill = Some(FastSpill {
+                        request: Vec::new(),
+                        response: bytes,
+                    });
+                }
+            }
         }
     }
     let mut replaced_spill = None;
@@ -2226,7 +2277,7 @@ pub fn complete_fast_endpoint_reply_for_task(
             if capacity.is_some_and(|capacity| frame.caller_response_capacity != capacity) {
                 return Err(IpcError::InvalidHandle);
             }
-            if response.len() > frame.caller_response_capacity {
+            if response_len > frame.caller_response_capacity {
                 terminal_error = Some(IpcError::BufferTooSmall);
             }
             if let Some(error) = terminal_error {
@@ -2237,9 +2288,9 @@ pub fn complete_fast_endpoint_reply_for_task(
                 if let Some(spill) = prepared_spill.take() {
                     replaced_spill = frame.spill.replace(spill);
                 } else {
-                    frame.response[..response.len()].copy_from_slice(response);
+                    frame.response[..response_len].copy_from_slice(response.as_slice());
                 }
-                frame.response_len = response.len();
+                frame.response_len = response_len;
                 frame.state = FastCallState::ResponseReady;
             }
             reply_object.used = true;
@@ -2252,6 +2303,14 @@ pub fn complete_fast_endpoint_reply_for_task(
             })
         })
         .ok_or(IpcError::InvalidHandle)?;
+    // A rejected moved response goes back to its owner; the owner's own bytes
+    // are never destroyed by a refusal. A response terminated by BufferTooSmall
+    // was consumed by the reply and is dropped below.
+    if result.is_err()
+        && let (Some(spill), FastReplyBytes::Moving(owned)) = (prepared_spill.take(), &mut response)
+    {
+        **owned = spill.response;
+    }
     // Neither replaced nor rejected storage may be destroyed under a slot lock.
     drop(replaced_spill);
     drop(prepared_spill);

@@ -220,6 +220,18 @@ pub mod endpoint {
         crate::ipc::complete_fast_endpoint_reply_for_task(reply, receiver_task_id, response)
     }
 
+    /// Like [`complete_fast_reply_for_task`] for a response the caller already
+    /// owns in a `Vec`: a response above the inline image moves into the frame
+    /// spill without a second allocation or copy, and is returned untouched in
+    /// `response` on any error so another transport can still carry it.
+    pub fn complete_fast_reply_moving(
+        reply: KernelReplyHandle,
+        receiver_task_id: u64,
+        response: &mut alloc::vec::Vec<u8>,
+    ) -> Result<FastReplyCompletion, IpcError> {
+        crate::ipc::complete_fast_endpoint_reply_moving(reply, receiver_task_id, response)
+    }
+
     pub fn reject_fast_reply_for_task(
         reply: KernelReplyHandle,
         receiver_task_id: u64,

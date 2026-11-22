@@ -4,8 +4,12 @@
 //!   cadence; `kernel-ps` owns memfd frame, seal, and cursor state.
 //! - **Boundary:** User pointers, lengths, offsets, and allocation failure are
 //!   untrusted and checked before use.
-//! - **Lifecycle:** Allocate one bounded bounce buffer, copy one chunk, commit
-//!   it to/from the exact open description, then expose a reschedule point.
+//! - **Lifecycle:** Reads allocate one bounded bounce buffer and copy one chunk
+//!   per round. Writes copy user bytes straight into the memfd's private,
+//!   unzeroed destination frames (`kernel-ps` installs them only after the
+//!   copy completed); a bounce buffer exists only for bytes landing on pages
+//!   that already existed, is allocated once per syscall and never re-zeroed.
+//!   Each chunk is then followed by a reschedule point.
 //! - **Concurrency:** No user copy or reschedule occurs while a memfd object
 //!   guard is live.
 //! - **Failure:** Invalid ranges, allocation failure, seals, and short I/O
@@ -16,13 +20,21 @@
 
 use alloc::vec::Vec;
 
+use kernel_ps::api::memfd::MemfdWriteError;
+
 use super::*;
 
 // The former 256-byte write loop acquired two memfd locks and called
 // `cond_resched` more than twelve thousand times for the uiserver snapshot.
-// 64 KiB matches the read path, spans only sixteen backing pages, and retains
-// one explicit fairness point between bounded chunks.
+// 64 KiB keeps the read bounce buffer small.
 const LOCAL_MEMFD_IO_CHUNK_BYTES: usize = 64 * 1024;
+
+// A write chunk is the unit of frame staging (one allocator/charge round per
+// 64 frames), of user-copy binding, of the object-lock install, and of
+// fault atomicity: a chunk is written entirely or not at all. 256 KiB spans
+// sixty-four pages, amortizes those fixed costs, and still leaves a fairness
+// point every few tens of microseconds of copying.
+const LOCAL_MEMFD_WRITE_CHUNK_BYTES: usize = 256 * 1024;
 
 /// `EISDIR`: a generated procfs directory snapshot is read only by `getdents64`.
 const LINUX_EISDIR_ERRNO: i64 = 21;
@@ -97,8 +109,8 @@ pub(super) fn write(memfd: &mut multitask::MemfdHandle, user_ptr: u64, user_len:
     if let Some(result) = super::proc_identity::write_snapshot(memfd, user_ptr, user_len) {
         return result;
     }
-    write_with(user_ptr, user_len, |_written_so_far, chunk| {
-        memfd.write_from(chunk)
+    write_with(user_ptr, user_len, |_written_so_far, len, scratch, fill| {
+        memfd.write_from_with(len, scratch, fill)
     })
 }
 
@@ -119,17 +131,30 @@ pub(super) fn write_at(
     let Ok(base) = usize::try_from(offset) else {
         return linux_errno(LINUX_EINVAL);
     };
-    write_with(user_ptr, user_len, |written_so_far, chunk| {
+    write_with(user_ptr, user_len, |written_so_far, len, scratch, fill| {
         let pos = base
             .checked_add(written_so_far)
-            .ok_or(multitask::MemfdError::InvalidArgument)?;
-        memfd.write_at(pos, chunk)
+            .ok_or(MemfdWriteError::Memfd(
+                multitask::MemfdError::InvalidArgument,
+            ))?;
+        memfd.write_at_with(pos, len, scratch, fill)
     })
 }
 
+type UserFill<'a> = &'a mut dyn FnMut(usize, &mut [u8]) -> Result<(), paging::AddressSpaceError>;
+
+/// Copies `user_len` bytes from user memory into a memfd in chunks.
+/// `write_chunk(done, len, scratch, fill)` commits the next `len` bytes, taking
+/// them from `fill` (see `MemfdHandle::write_at_with`); `scratch` is one
+/// buffer reused by every chunk of this syscall.
 fn write_with<F>(user_ptr: u64, user_len: u64, mut write_chunk: F) -> u64
 where
-    F: FnMut(usize, &[u8]) -> Result<usize, multitask::MemfdError>,
+    F: FnMut(
+        usize,
+        usize,
+        &mut Vec<u8>,
+        UserFill<'_>,
+    ) -> Result<usize, MemfdWriteError<paging::AddressSpaceError>>,
 {
     let Ok(user_len) = usize::try_from(user_len) else {
         return linux_errno(LINUX_EINVAL);
@@ -137,28 +162,28 @@ where
     if user_len == 0 {
         return 0;
     }
-    let mut chunk = match bounded_buffer(user_len) {
-        Ok(chunk) => chunk,
-        Err(errno) => return linux_errno(errno),
-    };
+    if user_ptr.checked_add(user_len as u64).is_none() {
+        return linux_errno(LINUX_EFAULT);
+    }
+    let mut scratch = Vec::new();
     let mut copied = 0usize;
     while copied < user_len {
-        let chunk_len = (user_len - copied).min(chunk.len());
-        let Some(src) = user_ptr.checked_add(copied as u64) else {
-            return completed_or_error(copied, LINUX_EFAULT);
+        let chunk_len = (user_len - copied).min(LOCAL_MEMFD_WRITE_CHUNK_BYTES);
+        // In range: `user_ptr + user_len` was checked above.
+        let chunk_ptr = user_ptr + copied as u64;
+        let mut fill = |at: usize, dst: &mut [u8]| {
+            usermem::copy_from_current_user_exact(chunk_ptr + at as u64, dst)
         };
-        if let Err(err) = usermem::copy_from_current_user_exact(src, &mut chunk[..chunk_len]) {
-            return completed_or_error(copied, user_pointer_error_to_linux_errno(err));
+        match write_chunk(copied, chunk_len, &mut scratch, &mut fill) {
+            Ok(written) => copied += written,
+            Err(MemfdWriteError::Memfd(err)) => {
+                return completed_or_error(copied, memfd_error_to_linux_errno(err));
+            }
+            Err(MemfdWriteError::Source(err)) => {
+                return completed_or_error(copied, user_pointer_error_to_linux_errno(err));
+            }
         }
-        let written = match write_chunk(copied, &chunk[..chunk_len]) {
-            Ok(written) => written,
-            Err(err) => return completed_or_error(copied, memfd_error_to_linux_errno(err)),
-        };
-        copied += written;
         multitask::cond_resched();
-        if written < chunk_len {
-            break;
-        }
     }
     copied as u64
 }
@@ -233,6 +258,12 @@ mod tests {
         assert_eq!(completed_or_error(0, LINUX_EFAULT), linux_errno(LINUX_EFAULT));
         assert_eq!(completed_or_error(LOCAL_MEMFD_IO_CHUNK_BYTES, LINUX_EFAULT), LOCAL_MEMFD_IO_CHUNK_BYTES as u64);
         assert_eq!(completed_or_error(1, LINUX_EINVAL), 1);
+    }
+
+    #[test]
+    fn local_memfd_write_chunk_is_page_multiple_and_bounded() {
+        assert_eq!(LOCAL_MEMFD_WRITE_CHUNK_BYTES % 4096, 0);
+        assert!(LOCAL_MEMFD_WRITE_CHUNK_BYTES >= LOCAL_MEMFD_IO_CHUNK_BYTES);
     }
 
     #[test]

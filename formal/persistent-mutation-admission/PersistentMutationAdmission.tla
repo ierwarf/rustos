@@ -2,66 +2,65 @@
 EXTENDS Naturals
 
 (***************************************************************************
-Owner: vfsd persistent-volume mutation admission.
-Linearization point: operation dispatch before any storage mutation. Current
-runtime persistent write/truncate/create/unlink is read-only. A future writable
-mode can become authoritative only after journal and recovery evidence are
-both installed; volatile /run policy does not grant persistent authority.
+Owner: vfsd per-mount mutation admission.
+Linearization point: operation dispatch before any storage mutation.
+
+Admission is a per-mount property decided when the mount is built: the root
+volume of a multi-partition disk is forced read-only, `/data` is writable only
+when the block device itself is writable, and a read-only mount answers EROFS
+for every write, truncate, create, unlink, rename and attribute change.
+Volatile `/run` (tmpfs) policy never mutates a persistent mount.
+
+NOT modeled and NOT claimed: crash consistency. FAT writes have no journal and
+no ordering between data, FAT copies and directory entries; a barrier is issued
+only by fsync/flush and unmount. Durability is an open gap, not a property of this model.
 ***************************************************************************)
 
-CONSTANTS Operations, VolatileOperations, MaxEpoch, WritableFeatureEnabled
-VARIABLES journalReady, recoveryReady, persistentEpoch, denied, admitted,
-          volatileObserved
-vars == <<journalReady, recoveryReady, persistentEpoch, denied, admitted,
-          volatileObserved>>
+CONSTANTS Mounts, Operations, VolatileOperations, MaxEpoch
+VARIABLES deviceReadOnly, persistentEpoch, denied, admitted, volatileObserved
+vars == <<deviceReadOnly, persistentEpoch, denied, admitted, volatileObserved>>
+
+\* The two-partition topology: partition 0 is "root", partition 1 is "data".
+MountReadOnly(m) == m = "root" \/ deviceReadOnly
 
 Init ==
-    /\ journalReady = FALSE /\ recoveryReady = FALSE
+    /\ deviceReadOnly \in BOOLEAN
     /\ persistentEpoch = 0 /\ denied = {} /\ admitted = {}
     /\ volatileObserved = {}
 
-InstallJournal ==
-    /\ ~journalReady /\ journalReady' = TRUE
-    /\ UNCHANGED <<recoveryReady, persistentEpoch, denied, admitted,
-                    volatileObserved>>
-
-InstallRecoveryEvidence ==
-    /\ ~recoveryReady /\ recoveryReady' = TRUE
-    /\ UNCHANGED <<journalReady, persistentEpoch, denied, admitted,
-                    volatileObserved>>
-
-Attempt(op) ==
-    /\ op \in Operations
+Attempt(m, op) ==
+    /\ m \in Mounts /\ op \in Operations
     /\ persistentEpoch < MaxEpoch
-    /\ IF WritableFeatureEnabled /\ journalReady /\ recoveryReady
+    /\ IF ~MountReadOnly(m)
           THEN /\ persistentEpoch' = persistentEpoch + 1
-               /\ admitted' = admitted \cup {op}
+               /\ admitted' = admitted \cup {<<m, op>>}
                /\ UNCHANGED denied
-          ELSE /\ denied' = denied \cup {op}
+          ELSE /\ denied' = denied \cup {<<m, op>>}
                /\ UNCHANGED <<persistentEpoch, admitted>>
-    /\ UNCHANGED <<journalReady, recoveryReady, volatileObserved>>
+    /\ UNCHANGED <<deviceReadOnly, volatileObserved>>
 
 AttemptVolatile(op) ==
     /\ op \in VolatileOperations
     /\ volatileObserved' = volatileObserved \cup {op}
-    /\ UNCHANGED <<journalReady, recoveryReady, persistentEpoch, denied, admitted>>
+    /\ UNCHANGED <<deviceReadOnly, persistentEpoch, denied, admitted>>
 
-Next == InstallJournal \/ InstallRecoveryEvidence
-        \/ (\E op \in Operations: Attempt(op))
+Next == (\E m \in Mounts, op \in Operations: Attempt(m, op))
         \/ (\E volatileOp \in VolatileOperations: AttemptVolatile(volatileOp))
 Spec == Init /\ [][Next]_vars
 
 TypeOK ==
-    /\ journalReady \in BOOLEAN /\ recoveryReady \in BOOLEAN
+    /\ deviceReadOnly \in BOOLEAN
     /\ persistentEpoch \in 0..MaxEpoch
-    /\ denied \in SUBSET Operations /\ admitted \in SUBSET Operations
+    /\ denied \in SUBSET (Mounts \X Operations)
+    /\ admitted \in SUBSET (Mounts \X Operations)
     /\ volatileObserved \in SUBSET VolatileOperations
-AdmissionRequiresCompleteRecoveryContract ==
-    admitted # {} => WritableFeatureEnabled /\ journalReady /\ recoveryReady
-NoPartialEvidenceMutation ==
-    ~(WritableFeatureEnabled /\ journalReady /\ recoveryReady) => persistentEpoch = 0
-DisabledWritableFeatureAdmitsNothing == ~WritableFeatureEnabled => admitted = {}
+AdmittedOnlyOnWritableMounts ==
+    \A entry \in admitted: ~MountReadOnly(entry[1])
+RootIsNeverMutated == \A entry \in admitted: entry[1] # "root"
+ReadOnlyDeviceAdmitsNothing == deviceReadOnly => admitted = {}
+EpochCountsOnlyAdmittedMutations ==
+    (admitted = {}) => persistentEpoch = 0
 VolatilePolicyNeverMutatesPersistentEpoch ==
-    volatileObserved # {} /\ ~WritableFeatureEnabled => persistentEpoch = 0
+    (volatileObserved # {} /\ deviceReadOnly) => persistentEpoch = 0
 
 =============================================================================

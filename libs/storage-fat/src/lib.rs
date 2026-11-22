@@ -12,6 +12,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
 mod fs_volume;
+mod map_registry;
 mod read_map;
 pub use read_map::{FatReadView, FatReadSource};
 use alloc::vec;
@@ -81,7 +82,9 @@ impl ReadWindow {
 struct SharedDevice<D> {
     device: D,
     identity: u64,
-    version: u64,
+    /// Registered read-map dependencies. A write revokes exactly the maps whose
+    /// extents, FAT entries or directory entry it overlaps.
+    maps: map_registry::MapRegistry,
 }
 
 /// The wait strategy belongs to the embedding runtime. A Ring3 filesystem
@@ -137,7 +140,7 @@ impl<D: BlockDevice> FatDisk<D> {
         let identity = NEXT_DEVICE_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
             |next| next.checked_add(1)).map_err(|_| StorageError::InvalidInput)?;
         Ok(Self {
-            dev: Arc::new(DeviceCell { inner: Mutex::new(SharedDevice { device: dev, identity, version: 1 }), wait }),
+            dev: Arc::new(DeviceCell { inner: Mutex::new(SharedDevice { device: dev, identity, maps: map_registry::MapRegistry::new() }), wait }),
             pos: 0,
             block_size,
             bytes_len,
@@ -312,14 +315,12 @@ impl<D: BlockDevice> Write for FatDisk<D> {
             return Ok(0);
         }
 
-        // Revoke detached maps before any potentially partial mutation.
-        {
-            let mut dev = self.dev.lock();
-            dev.version = dev.version.checked_add(1).ok_or(StorageError::InvalidInput)?;
-        }
+        // Revoke every read map that depends on the touched bytes before any
+        // potentially partial mutation reaches the media.
+        let max_write = min(buf.len() as u64, disk_len - self.pos) as usize;
+        self.dev.lock().maps.revoke(self.pos, self.pos + max_write as u64);
         let max_dirty_blocks = (DIRTY_CACHE_BYTES / self.block_size).max(1);
         let direct_threshold = READ_WINDOW_BYTES.max(self.block_size);
-        let max_write = min(buf.len() as u64, disk_len - self.pos) as usize;
         let mut done = 0usize;
         while done < max_write {
             let block_size = self.block_size;
@@ -527,15 +528,6 @@ impl<D: BlockDevice> FatVolume<D> {
             }
             (self.wait)();
         }
-    }
-
-    fn bump_version(&self) -> Result<(), storage_core::FsError> {
-        let mut dev = self.device.lock();
-        dev.version = dev
-            .version
-            .checked_add(1)
-            .ok_or(storage_core::FsError::Io(StorageError::InvalidInput))?;
-        Ok(())
     }
 
     pub fn from_partition(

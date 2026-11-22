@@ -23,6 +23,11 @@
 //!   submits only. It is never held across a completion wait or a blocking
 //!   transport call; the pump collects outside the lock with the buffer moved out
 //!   of the window.
+//!   A `Ready` window's bytes are shared (`Arc`): a reader pins the windows it
+//!   needs under the lock and copies them out after releasing it, so the large
+//!   memcpy never serializes other readers. Eviction or invalidation only drops
+//!   the cache's reference; a pinned buffer is recycled only after its last
+//!   reader lets go, so it cannot be overwritten under a copy.
 //! - **Invalidation:** a write marks overlapping `InFlight` windows stale. A
 //!   stale window is collected and dropped, never cached, so bytes read before a
 //!   write cannot repopulate the cache after it.
@@ -33,8 +38,8 @@
 //!   or stale completion, no unbounded read-ahead, no lock held across a wait.
 //! - **Evidence:** `dvm-read-cache` and `dvm-volume-io`.
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use rustos_user_abi::syscall::{DvmBlockTicketWire, BLOCK_BROKER_MAX_IO_BYTES};
@@ -125,8 +130,20 @@ enum State {
         buf: Option<Vec<u8>>,
         stale: bool,
     },
-    Ready(Vec<u8>),
+    /// Shared so a reader can pin the bytes and copy them out without the
+    /// engine lock; eviction or invalidation only drops the cache's reference.
+    Ready(Arc<Vec<u8>>),
     Failed(i32),
+}
+
+/// One run of a read served from one pinned window. `bytes` keeps the window's
+/// buffer alive (and un-recycled) while the reader copies after dropping the
+/// engine lock.
+struct Segment {
+    bytes: Arc<Vec<u8>>,
+    src: usize,
+    dst: usize,
+    len: usize,
 }
 
 struct Window {
@@ -176,6 +193,10 @@ pub(crate) struct Engine {
     ready: Condvar,
     /// A window went in flight: the parked pump has work.
     work: Condvar,
+    /// A stream's read-ahead lead may have run low, or the pump freed
+    /// in-flight capacity, since the last `top_up`. Lets `top_up` skip the
+    /// engine lock when nothing changed.
+    topup_hint: AtomicBool,
     stats: Stats,
 }
 
@@ -208,6 +229,15 @@ impl Inner {
         }
     }
 
+    /// Returns a cache-owned window buffer to the free list when no reader still
+    /// pins it. A pinned buffer is simply released: its last reader frees it,
+    /// so it can never be reused (and overwritten) under a reader's copy.
+    fn release(&mut self, bytes: Arc<Vec<u8>>) {
+        if let Ok(buf) = Arc::try_unwrap(bytes) {
+            self.recycle(buf);
+        }
+    }
+
     fn recycle(&mut self, mut buf: Vec<u8>) {
         if self.free_buffers.len() < FREE_BUFFER_LIMIT && buf.capacity() > 0 {
             buf.clear();
@@ -228,7 +258,7 @@ impl Inner {
                     };
                     self.windows.insert(index, window);
                 }
-                State::Ready(buf) => self.recycle(buf),
+                State::Ready(bytes) => self.release(bytes),
                 State::Failed(_) => {}
             }
         }
@@ -259,11 +289,11 @@ impl Inner {
         match victim {
             Some(index) => {
                 if let Some(Window {
-                    state: State::Ready(buf),
+                    state: State::Ready(bytes),
                     ..
                 }) = self.windows.remove(&index)
                 {
-                    self.recycle(buf);
+                    self.release(bytes);
                 }
                 true
             }
@@ -321,6 +351,7 @@ impl Engine {
             inner: Mutex::new(Inner::new()),
             ready: Condvar::new(),
             work: Condvar::new(),
+            topup_hint: AtomicBool::new(false),
             stats: Stats {
                 reads: AtomicU64::new(0),
                 waited: AtomicU64::new(0),
@@ -442,6 +473,7 @@ impl Engine {
         let last = (end - 1) / geometry.window_blocks;
         let deadline = Instant::now() + COMPLETION_TIMEOUT;
         let mut waited_since = None;
+        let segments;
         let mut inner = self.lock();
         inner.bind(geometry);
         let stream_id = inner.note_access(first, last);
@@ -468,7 +500,9 @@ impl Engine {
                 self.read_ahead(&mut inner, transport, stream_id, false);
             }
             if ready {
-                self.copy_out(&mut inner, geometry, stream_id, lba, end, first, last, out);
+                segments = self
+                    .pin_segments(&mut inner, geometry, stream_id, lba, end, first, last)
+                    .ok_or(libc::EIO)?;
                 break;
             }
             let now = Instant::now();
@@ -488,6 +522,15 @@ impl Engine {
             }
         }
         drop(inner);
+        // The copy runs without the engine lock: each segment pins its window's
+        // buffer, so eviction, invalidation or a write racing this read only
+        // drops the cache's reference. The read observes either side of such a
+        // write, as a read concurrent with it always could.
+        for segment in &segments {
+            out[segment.dst..segment.dst + segment.len]
+                .copy_from_slice(&segment.bytes[segment.src..segment.src + segment.len]);
+        }
+        drop(segments);
         self.stats.reads.fetch_add(1, Ordering::Relaxed);
         if let Some(since) = waited_since {
             self.stats.waited.fetch_add(1, Ordering::Relaxed);
@@ -500,8 +543,11 @@ impl Engine {
         Ok(total)
     }
 
+    /// Pins the `Ready` windows `first..=last` for the copy of `lba..end` and
+    /// updates their recency. The caller holds the engine lock and has just
+    /// seen every window `Ready`.
     #[allow(clippy::too_many_arguments)]
-    fn copy_out(
+    fn pin_segments(
         &self,
         inner: &mut Inner,
         geometry: Geometry,
@@ -510,19 +556,26 @@ impl Engine {
         end: u64,
         first: u64,
         last: u64,
-        out: &mut [u8],
-    ) {
+    ) -> Option<Vec<Segment>> {
         let streaming = inner
             .streams
             .iter()
             .any(|s| s.id == stream_id && s.depth > 0);
+        let low = inner.streams.iter().any(|s| {
+            s.id == stream_id
+                && s.depth > 0
+                && s.ahead_end.saturating_sub(s.last_window) < s.depth / 2
+        });
+        if low {
+            // ORDERING: Relaxed; `top_up` re-reads the state under the lock.
+            self.topup_hint.store(true, Ordering::Relaxed);
+        }
+        let expected = (last - first + 1) as usize;
+        let mut segments = Vec::with_capacity(expected);
         for index in first..=last {
             let (start, blocks) = geometry.window_extent(index);
             let from = lba.max(start);
             let to = end.min(start + blocks);
-            let src = (from - start) as usize * geometry.block_size;
-            let len = (to - from) as usize * geometry.block_size;
-            let dst = (from - lba) as usize * geometry.block_size;
             let consumed = to == start + blocks;
             let stamp = if streaming && consumed {
                 0
@@ -530,17 +583,29 @@ impl Engine {
                 inner.next_stamp()
             };
             if let Some(window) = inner.windows.get_mut(&index) {
-                if let State::Ready(buf) = &window.state {
-                    out[dst..dst + len].copy_from_slice(&buf[src..src + len]);
+                if let State::Ready(bytes) = &window.state {
+                    segments.push(Segment {
+                        bytes: Arc::clone(bytes),
+                        src: (from - start) as usize * geometry.block_size,
+                        dst: (from - lba) as usize * geometry.block_size,
+                        len: (to - from) as usize * geometry.block_size,
+                    });
                 }
                 window.stamp = stamp;
             }
         }
+        // Every window was `Ready` under this same lock hold, so a gap is an
+        // engine bug; never report success with bytes missing from `out`.
+        (segments.len() == expected).then_some(segments)
     }
 
     /// Runs after a reply has been sent: refills the read-ahead of streams whose
     /// lead has run low, so the submit syscalls overlap the requester's own work.
     pub(crate) fn top_up<T: Transport + ?Sized>(&self, transport: &T) {
+        // ORDERING: Relaxed; the stream state itself is read under the lock.
+        if !self.topup_hint.swap(false, Ordering::Relaxed) {
+            return;
+        }
         let mut inner = self.lock();
         let ids: Vec<u64> = inner.streams.iter().map(|s| s.id).collect();
         for id in ids {
@@ -569,11 +634,11 @@ impl Engine {
                 State::InFlight { stale, .. } => *stale = true,
                 State::Ready(_) | State::Failed(_) => {
                     if let Some(Window {
-                        state: State::Ready(buf),
+                        state: State::Ready(bytes),
                         ..
                     }) = inner.windows.remove(&index)
                     {
-                        inner.recycle(buf);
+                        inner.release(bytes);
                     }
                 }
             }
@@ -590,7 +655,7 @@ impl Engine {
         inner.windows.insert(
             index,
             Window {
-                state: State::Ready(bytes),
+                state: State::Ready(Arc::new(bytes)),
                 stamp,
                 submitted: Instant::now(),
             },
@@ -700,7 +765,7 @@ impl Engine {
                         inner.windows.remove(&index);
                         inner.recycle(buf);
                     } else if let Some(window) = inner.windows.get_mut(&index) {
-                        window.state = State::Ready(buf);
+                        window.state = State::Ready(Arc::new(buf));
                         window.stamp = stamp;
                     }
                 }
@@ -722,6 +787,8 @@ impl Engine {
         };
         drop(inner);
         if progressed != 0 {
+            // Freed in-flight capacity may let a starved stream read ahead.
+            self.topup_hint.store(true, Ordering::Relaxed);
             self.ready.notify_all();
         }
         status
@@ -748,7 +815,6 @@ impl Engine {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
-    use std::sync::atomic::AtomicBool;
 
     const BLOCK: usize = 4096;
     const WINDOW_BLOCKS: u64 = (WINDOW_BYTES / BLOCK) as u64;
@@ -1053,6 +1119,95 @@ mod tests {
             });
         });
         assert_eq!(fake.fetches_of(0), 2, "stale fetch dropped, then refetched");
+    }
+
+    #[test]
+    fn pinned_window_survives_invalidation_without_being_recycled() {
+        let engine = Engine::new();
+        let geo = geometry(4 * WINDOW_BLOCKS);
+        engine.seed_ready(geo, 0, vec![0x5a; WINDOW_BYTES]);
+        let segments = {
+            let mut inner = engine.lock();
+            engine
+                .pin_segments(&mut inner, geo, 0, 0, 2, 0, 0)
+                .expect("ready window pins")
+        };
+        engine.invalidate_range(geo.generation, 0, 1);
+        assert!(!engine.has_ready(0));
+        {
+            let mut inner = engine.lock();
+            assert!(
+                inner.free_buffers.is_empty(),
+                "a pinned buffer must not reach the free list"
+            );
+            // A new fetch taking a buffer must not be handed the pinned one.
+            let mut fresh = inner.take_buffer(WINDOW_BYTES);
+            fresh.fill(0xff);
+        }
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].bytes[..2 * BLOCK].iter().all(|b| *b == 0x5a));
+        // Once the last reader lets go the buffer is recyclable again.
+        drop(segments);
+        engine.seed_ready(geo, 1, vec![1; WINDOW_BYTES]);
+        engine.invalidate_range(geo.generation, WINDOW_BLOCKS, 1);
+        assert_eq!(engine.lock().free_buffers.len(), 1);
+    }
+
+    #[test]
+    fn pinned_window_survives_lru_eviction() {
+        let engine = Engine::new();
+        let geo = geometry((WINDOW_LIMIT as u64 + 2) * WINDOW_BLOCKS);
+        engine.seed_ready(geo, 0, vec![0x77; WINDOW_BYTES]);
+        let segments = {
+            let mut inner = engine.lock();
+            engine
+                .pin_segments(&mut inner, geo, 0, 0, 1, 0, 0)
+                .expect("ready window pins")
+        };
+        for index in 1..WINDOW_LIMIT as u64 {
+            engine.seed_ready(geo, index, vec![0; 1]);
+        }
+        {
+            let mut inner = engine.lock();
+            // The pinned window is the least recently used: it is the victim.
+            assert!(inner.make_room(true));
+            assert!(!inner.windows.contains_key(&0));
+            assert!(inner.free_buffers.is_empty());
+        }
+        assert!(segments[0].bytes.iter().all(|b| *b == 0x77));
+    }
+
+    #[test]
+    fn concurrent_readers_copy_while_windows_are_invalidated() {
+        let engine = Engine::new();
+        let fake = Fake::default();
+        let geo = geometry(64 * WINDOW_BLOCKS);
+        let stop = AtomicBool::new(false);
+        with_pump(&engine, &fake, || {
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        engine.invalidate_range(geo.generation, 0, 8 * WINDOW_BLOCKS);
+                        std::thread::sleep(Duration::from_micros(100));
+                    }
+                });
+                let mut handles = Vec::new();
+                for _ in 0..3 {
+                    handles.push(scope.spawn(|| {
+                        let mut out = vec![0_u8; 16 * BLOCK];
+                        for round in 0..64_u64 {
+                            let lba = (round % 8) * WINDOW_BLOCKS + 3;
+                            assert_eq!(engine.read(&fake, geo, lba, 16, &mut out), Ok(16 * BLOCK));
+                            expect_data(&out, lba, 16);
+                        }
+                    }));
+                }
+                for handle in handles {
+                    handle.join().unwrap();
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+        });
     }
 
     #[test]

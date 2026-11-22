@@ -10,7 +10,8 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_FLUSH, COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_INFO,
     COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK, COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE,
     COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE_BULK, IPC_SERVICE_STORAGED,
-    STORAGED_BULK_READ_PAYLOAD_CAPACITY, STORAGED_BULK_WRITE_PAYLOAD_CAPACITY, SYS_RUSTOS_IPC_CALL,
+    STORAGED_BULK_READ_PAYLOAD_CAPACITY, STORAGED_BULK_READ_RESPONSE_HEADER_BYTES,
+    STORAGED_BULK_WRITE_PAYLOAD_CAPACITY, SYS_RUSTOS_IPC_CALL,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
 };
 use storage_core::{BlockDevice, IoResult, StorageError};
@@ -44,10 +45,23 @@ static STORAGE_NOT_READY_DIAGNOSTIC_EMITTED: AtomicBool = AtomicBool::new(false)
 // Aggregate cost of the vfsd -> storaged bulk-read round trips. A large
 // executable snapshot is thousands of these calls; the per-snapshot report
 // uses the totals to separate "storaged's device read is slow" from "vfsd is
-// slow between calls" without a per-call debug line.
+// slow between calls" without a per-call debug line. Calls are counted exactly;
+// time is sampled (one call in `TIMING_SAMPLE_PERIOD` pays two clock syscalls)
+// and scaled by the period, so the sum is an estimate and the maximum is the
+// longest sampled call.
+const TIMING_SAMPLE_PERIOD: u64 = 32;
 static BULK_READ_CALLS: AtomicU64 = AtomicU64::new(0);
 static BULK_READ_NS: AtomicU64 = AtomicU64::new(0);
 static BULK_READ_MAX_NS: AtomicU64 = AtomicU64::new(0);
+
+// The process id never changes, so one `getpid` serves every request. The tid
+// is per thread and this `no_std` service has no thread-local storage, so each
+// request still asks the kernel for it.
+static CACHED_PID: AtomicU64 = AtomicU64::new(0);
+// Endpoint of the live storaged, cached across calls. Zero means "look it up".
+// It is dropped on any failed call and replaced by every control-path call, so
+// a restarted storaged is found again (see `storaged_endpoint`).
+static STORAGED_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct BulkReadCounters {
@@ -142,7 +156,6 @@ impl BootBlockDevice {
             self.generation,
             self.block_size,
             max_blocks,
-            self.block_count,
             lba,
             out,
             &mut self.bulk_response,
@@ -176,12 +189,7 @@ impl BootBlockDevice {
     }
 
     fn write_transfer(&mut self, lba: u64, input: &[u8]) -> IoResult<()> {
-        // Lookahead bytes read before this write must not outlive it, and one
-        // started while it ran may have read either side of it.
-        super::bulk_lanes::invalidate_prefetch();
-        let result = self.write_transfer_blocks(lba, input);
-        super::bulk_lanes::invalidate_prefetch();
-        result
+        self.write_transfer_blocks(lba, input)
     }
 
     fn write_transfer_blocks(&mut self, lba: u64, input: &[u8]) -> IoResult<()> {
@@ -306,18 +314,25 @@ pub(super) fn storage_request(operation: u16) -> CommercialMaxProtocolRequest {
     request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
     request.header.protocol = COMMERCIAL_MAX_PROTOCOL_STORAGED;
     request.header.op = operation;
-    let pid = unsafe { rustos_svc_runtime::syscall::syscall0(rustos_user_abi::linux::SYS_GETPID) };
+    let mut pid = CACHED_PID.load(Ordering::Relaxed);
+    if pid == 0 {
+        let raw =
+            unsafe { rustos_svc_runtime::syscall::syscall0(rustos_user_abi::linux::SYS_GETPID) };
+        if raw > 0 {
+            pid = raw as u64;
+            CACHED_PID.store(pid, Ordering::Relaxed);
+        }
+    }
     let tid = unsafe { rustos_svc_runtime::syscall::syscall0(rustos_user_abi::linux::SYS_GETTID) };
     if pid > 0 && tid > 0 {
-        request.header.subject_pid = pid as u64;
+        request.header.subject_pid = pid;
         request.header.subject_tid = tid as u64;
     }
     request
 }
 
-fn call_storaged(
-    request: &CommercialMaxProtocolRequest,
-) -> Result<CommercialMaxProtocolResponse, i32> {
+/// Looks the storaged endpoint up in the kernel registry and caches it.
+fn lookup_storaged_endpoint() -> Result<u64, i32> {
     let endpoint = unsafe {
         rustos_svc_runtime::syscall::syscall1(
             SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
@@ -325,19 +340,58 @@ fn call_storaged(
         )
     };
     if endpoint <= 0 {
-        let errno = storage_service_lookup_errno(endpoint);
-        if should_log_storage_failure(errno) {
-            super::debug_line(&format!(
-                "vfsd: storaged call rejected stage=lookup errno={errno}"
-            ));
-        }
-        return Err(errno);
+        STORAGED_ENDPOINT.store(0, Ordering::Relaxed);
+        return Err(storage_service_lookup_errno(endpoint));
     }
+    STORAGED_ENDPOINT.store(endpoint as u64, Ordering::Relaxed);
+    Ok(endpoint as u64)
+}
+
+/// The storaged endpoint for a bulk call: the cached one, or a fresh lookup.
+/// The bool is whether the endpoint came from the cache.
+///
+/// A cached endpoint can only go stale when storaged is replaced. Its calls
+/// then fail, and `retry_with_fresh_endpoint` drops the cache and repeats the
+/// call once against the registry's current endpoint. The control path
+/// (`call_storaged`, run at every mount open) always re-reads the registry.
+fn storaged_endpoint() -> Result<(u64, bool), i32> {
+    match STORAGED_ENDPOINT.load(Ordering::Relaxed) {
+        0 => lookup_storaged_endpoint().map(|endpoint| (endpoint, false)),
+        endpoint => Ok((endpoint, true)),
+    }
+}
+
+/// After a failed call on a cached endpoint: drops the cache and returns the
+/// registry's endpoint if it differs from the one that failed (storaged was
+/// replaced), so the caller retries exactly once. `None` means the same
+/// endpoint is still current and the failure is genuine.
+fn retry_with_fresh_endpoint(failed: u64) -> Option<u64> {
+    STORAGED_ENDPOINT.store(0, Ordering::Relaxed);
+    match lookup_storaged_endpoint() {
+        Ok(fresh) if fresh != failed => Some(fresh),
+        _ => None,
+    }
+}
+
+fn call_storaged(
+    request: &CommercialMaxProtocolRequest,
+) -> Result<CommercialMaxProtocolResponse, i32> {
+    let endpoint = match lookup_storaged_endpoint() {
+        Ok(endpoint) => endpoint,
+        Err(errno) => {
+            if should_log_storage_failure(errno) {
+                super::debug_line(&format!(
+                    "vfsd: storaged call rejected stage=lookup errno={errno}"
+                ));
+            }
+            return Err(errno);
+        }
+    };
     let mut response = CommercialMaxProtocolResponse::default();
     let received = unsafe {
         rustos_svc_runtime::syscall::syscall5(
             SYS_RUSTOS_IPC_CALL,
-            endpoint as u64,
+            endpoint,
             (request as *const CommercialMaxProtocolRequest) as u64,
             size_of::<CommercialMaxProtocolRequest>() as u64,
             (&mut response as *mut CommercialMaxProtocolResponse) as u64,
@@ -345,6 +399,7 @@ fn call_storaged(
         )
     };
     if received < 0 {
+        STORAGED_ENDPOINT.store(0, Ordering::Relaxed);
         let errno = (-received) as i32;
         if should_log_storage_failure(errno) {
             super::debug_line(&format!(
@@ -372,6 +427,93 @@ fn call_storaged(
     Ok(response)
 }
 
+/// One bulk-read round trip. Returns the kernel's reply length or `-errno`.
+/// A bounded call, so a wedged storaged cannot block this lane forever.
+///
+/// # Safety
+/// `response` must point to `size_of::<StoragedBulkReadResponse>()` writable
+/// bytes that no one else accesses for the duration of the call.
+unsafe fn bulk_read_round_trip(
+    endpoint: u64,
+    request: &CommercialMaxProtocolRequest,
+    response: *mut StoragedBulkReadResponse,
+) -> i64 {
+    // ORDERING: Relaxed; a statistics counter. The returned sequence number
+    // only picks which calls pay for a clock reading.
+    let sequence = BULK_READ_CALLS.fetch_add(1, Ordering::Relaxed);
+    let sampled = sequence % TIMING_SAMPLE_PERIOD == 0;
+    let started = if sampled {
+        rustos_svc_runtime::syscall::monotonic_nanos()
+    } else {
+        0
+    };
+    // The reply buffer is deliberately not cleared: the kernel writes exactly
+    // the reply, and `payload_of_reply` never exposes bytes past it.
+    let received = unsafe {
+        rustos_svc_runtime::syscall::syscall6(
+            rustos_user_abi::syscall::SYS_RUSTOS_IPC_CALL_BOUNDED,
+            endpoint,
+            (request as *const CommercialMaxProtocolRequest) as u64,
+            size_of::<CommercialMaxProtocolRequest>() as u64,
+            response as u64,
+            size_of::<StoragedBulkReadResponse>() as u64,
+            rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+        )
+    };
+    if sampled {
+        let call_ns = rustos_svc_runtime::syscall::monotonic_nanos().saturating_sub(started);
+        BULK_READ_NS.fetch_add(call_ns.saturating_mul(TIMING_SAMPLE_PERIOD), Ordering::Relaxed);
+        BULK_READ_MAX_NS.fetch_max(call_ns, Ordering::Relaxed);
+    }
+    received
+}
+
+/// Checks a reply of `received` bytes against `request` and returns the
+/// payload bytes it carries: the reply must be exactly header + `payload_len`,
+/// carry the request's envelope, report success and bind to the requested
+/// generation, LBA and block count. Nothing past `received` is read.
+fn validate_bulk_reply<'a>(
+    request: &CommercialMaxProtocolRequest,
+    response: &'a StoragedBulkReadResponse,
+    received: usize,
+    expected_len: usize,
+) -> Result<&'a [u8], i32> {
+    if received < STORAGED_BULK_READ_RESPONSE_HEADER_BYTES
+        || !response.is_valid_envelope_for(request)
+    {
+        // Not a storaged reply to this request: do not keep trusting the endpoint.
+        STORAGED_ENDPOINT.store(0, Ordering::Relaxed);
+        super::debug_line("vfsd: storaged bulk call rejected stage=response-envelope errno=5");
+        return Err(EIO);
+    }
+    if response.status != 0 {
+        if should_log_storage_failure(response.status) {
+            super::debug_line(&format!(
+                "vfsd: storaged bulk call rejected stage=service-status op={} errno={}",
+                request.header.op, response.status
+            ));
+        }
+        return Err(response.status);
+    }
+    let payload = response.payload_of_reply(received);
+    match payload {
+        Some(payload)
+            if payload.len() == expected_len
+                && response.generation == request.arg0
+                && response.lba == request.arg1
+                && response.block_count == request.arg2 =>
+        {
+            note_storage_ready();
+            Ok(payload)
+        }
+        _ => {
+            STORAGED_ENDPOINT.store(0, Ordering::Relaxed);
+            super::debug_line("vfsd: storaged bulk call rejected stage=response-binding errno=5");
+            Err(EIO)
+        }
+    }
+}
+
 pub(super) fn call_storaged_bulk(
     request: &CommercialMaxProtocolRequest,
     out: &mut [u8],
@@ -383,51 +525,33 @@ pub(super) fn call_storaged_bulk(
     {
         return Err(EINVAL);
     }
-    let endpoint = unsafe {
-        rustos_svc_runtime::syscall::syscall1(
-            SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
-            IPC_SERVICE_STORAGED,
-        )
-    };
-    if endpoint <= 0 {
-        let errno = storage_service_lookup_errno(endpoint);
-        if should_log_storage_failure(errno) {
+    let (mut endpoint, mut cached) = storaged_endpoint().inspect_err(|errno| {
+        if should_log_storage_failure(*errno) {
             super::debug_line(&format!(
                 "vfsd: storaged bulk call rejected stage=lookup errno={errno}"
             ));
         }
-        return Err(errno);
-    }
-
+    })?;
     // SAFETY: u64 storage has sufficient size/alignment (asserted above),
-    // is exclusively borrowed, and the all-integer wire type admits zero bits.
+    // is exclusively borrowed, and the all-integer wire type admits any bits.
     let response = response_words
         .as_mut_ptr()
         .cast::<StoragedBulkReadResponse>();
-    unsafe {
-        core::ptr::write_bytes(
-            response.cast::<u8>(),
-            0,
-            size_of::<StoragedBulkReadResponse>(),
-        );
-    }
-    let call_started = rustos_svc_runtime::syscall::monotonic_nanos();
-    let received = unsafe {
-        rustos_svc_runtime::syscall::syscall6(
-            rustos_user_abi::syscall::SYS_RUSTOS_IPC_CALL_BOUNDED,
-            endpoint as u64,
-            (request as *const CommercialMaxProtocolRequest) as u64,
-            size_of::<CommercialMaxProtocolRequest>() as u64,
-            response as u64,
-            size_of::<StoragedBulkReadResponse>() as u64,
-            rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS,
-        )
-    };
-    let call_ns = rustos_svc_runtime::syscall::monotonic_nanos().saturating_sub(call_started);
-    BULK_READ_CALLS.fetch_add(1, Ordering::Relaxed);
-    BULK_READ_NS.fetch_add(call_ns, Ordering::Relaxed);
-    BULK_READ_MAX_NS.fetch_max(call_ns, Ordering::Relaxed);
-    if received < 0 {
+    let received = loop {
+        // SAFETY: `response` is the exclusive, large-enough reply buffer.
+        let received = unsafe { bulk_read_round_trip(endpoint, request, response) };
+        if received >= 0 {
+            break received;
+        }
+        if cached {
+            if let Some(fresh) = retry_with_fresh_endpoint(endpoint) {
+                endpoint = fresh;
+                cached = false;
+                continue;
+            }
+        } else {
+            STORAGED_ENDPOINT.store(0, Ordering::Relaxed);
+        }
         let errno = (-received) as i32;
         if should_log_storage_failure(errno) {
             super::debug_line(&format!(
@@ -435,33 +559,13 @@ pub(super) fn call_storaged_bulk(
             ));
         }
         return Err(errno);
-    }
+    };
+    // SAFETY: the buffer is initialized u64 storage and outlives this borrow.
     let response_ref = unsafe { &*response };
-    if received as usize != size_of::<StoragedBulkReadResponse>()
-        || !response_ref.is_valid_envelope_for(request)
-    {
-        super::debug_line("vfsd: storaged bulk call rejected stage=response-envelope errno=5");
-        return Err(EIO);
-    }
-    if response_ref.status != 0 {
-        if should_log_storage_failure(response_ref.status) {
-            super::debug_line(&format!(
-                "vfsd: storaged bulk call rejected stage=service-status op={} errno={}",
-                request.header.op, response_ref.status
-            ));
-        }
-        return Err(response_ref.status);
-    }
-    note_storage_ready();
-    if response_ref.generation != request.arg0
-        || response_ref.lba != request.arg1
-        || response_ref.block_count != request.arg2
-        || response_ref.payload_len as usize != out.len()
-    {
-        super::debug_line("vfsd: storaged bulk call rejected stage=response-binding errno=5");
-        return Err(EIO);
-    }
-    out.copy_from_slice(&response_ref.payload[..out.len()]);
+    let payload = validate_bulk_reply(request, response_ref, received as usize, out.len())?;
+    // The one copy: the kernel reply is a single contiguous header + payload
+    // message, so the payload cannot land in `out` directly.
+    out.copy_from_slice(payload);
     Ok(())
 }
 
@@ -472,31 +576,28 @@ fn call_storaged_bulk_write(
     bytes: &[u8],
     request_words: &mut [u64],
 ) -> Result<CommercialMaxProtocolResponse, i32> {
+    let request_len = StoragedBulkWriteRequest::request_len_for(bytes.len()).ok_or(EINVAL)?;
     if bytes.is_empty()
-        || bytes.len() > STORAGED_BULK_WRITE_PAYLOAD_CAPACITY
         || request_words.len() < size_of::<StoragedBulkWriteRequest>().div_ceil(size_of::<u64>())
     {
         return Err(EINVAL);
     }
-    let endpoint = unsafe {
-        rustos_svc_runtime::syscall::syscall1(
-            SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
-            IPC_SERVICE_STORAGED,
-        )
-    };
-    if endpoint <= 0 {
-        let errno = storage_service_lookup_errno(endpoint);
-        if should_log_storage_failure(errno) {
+    let (mut endpoint, mut cached) = storaged_endpoint().inspect_err(|errno| {
+        if should_log_storage_failure(*errno) {
             super::debug_line(&format!(
                 "vfsd: storaged bulk write rejected stage=lookup errno={errno}"
             ));
         }
-        return Err(errno);
-    }
+    })?;
     let base = storage_request(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE_BULK);
     let req_ptr = request_words
         .as_mut_ptr()
         .cast::<StoragedBulkWriteRequest>();
+    // SAFETY: `request_words` is exclusively borrowed, 8-aligned and large
+    // enough for the whole struct (checked above). Only the header and exactly
+    // `bytes.len()` payload bytes are written, and only `request_len` bytes
+    // (those) are sent. The payload copy into the contiguous request message
+    // is required by the single-buffer IPC ABI.
     unsafe {
         (*req_ptr).header = base.header;
         (*req_ptr).flags = 0;
@@ -512,17 +613,31 @@ fn call_storaged_bulk_write(
         );
     }
     let mut response = CommercialMaxProtocolResponse::default();
-    let received = unsafe {
-        rustos_svc_runtime::syscall::syscall5(
-            SYS_RUSTOS_IPC_CALL,
-            endpoint as u64,
-            req_ptr as u64,
-            size_of::<StoragedBulkWriteRequest>() as u64,
-            (&mut response as *mut CommercialMaxProtocolResponse) as u64,
-            size_of::<CommercialMaxProtocolResponse>() as u64,
-        )
-    };
-    if received < 0 {
+    let received = loop {
+        let received = unsafe {
+            rustos_svc_runtime::syscall::syscall5(
+                SYS_RUSTOS_IPC_CALL,
+                endpoint,
+                req_ptr as u64,
+                request_len as u64,
+                (&mut response as *mut CommercialMaxProtocolResponse) as u64,
+                size_of::<CommercialMaxProtocolResponse>() as u64,
+            )
+        };
+        if received >= 0 {
+            break received;
+        }
+        // The retry is an idempotent rewrite of the same blocks at the same
+        // generation, and only happens when storaged was replaced.
+        if cached {
+            if let Some(fresh) = retry_with_fresh_endpoint(endpoint) {
+                endpoint = fresh;
+                cached = false;
+                continue;
+            }
+        } else {
+            STORAGED_ENDPOINT.store(0, Ordering::Relaxed);
+        }
         let errno = (-received) as i32;
         if should_log_storage_failure(errno) {
             super::debug_line(&format!(
@@ -530,10 +645,11 @@ fn call_storaged_bulk_write(
             ));
         }
         return Err(errno);
-    }
+    };
     if received as usize != size_of::<CommercialMaxProtocolResponse>()
         || response.header != base.header
     {
+        STORAGED_ENDPOINT.store(0, Ordering::Relaxed);
         super::debug_line("vfsd: storaged bulk write rejected stage=response-envelope errno=5");
         return Err(EIO);
     }
