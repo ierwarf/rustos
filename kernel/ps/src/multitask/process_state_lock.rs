@@ -128,6 +128,8 @@ impl<T> ProcessStateLock<T> {
 impl<T: ?Sized> ProcessStateLock<T> {
     /// Exclusive access without taking the lock: `&mut self` proves no other
     /// reference exists, as for an object that has not been published yet.
+    // TEST-HARNESS: used by unit tests that build unpublished state.
+    #[allow(dead_code)]
     pub(super) fn get_mut(&mut self) -> &mut T {
         self.value.get_mut()
     }

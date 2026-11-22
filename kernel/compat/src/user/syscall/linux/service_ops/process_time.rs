@@ -68,6 +68,17 @@ pub fn syscall_linux_fork(frame: &SyscallFrame) -> u64 {
     procd_fork(frame, 0, 0, 0, 0, 0)
 }
 
+pub fn syscall_linux_vfork(frame: &SyscallFrame) -> u64 {
+    procd_fork(
+        frame,
+        linux_abi::CLONE_VM | linux_abi::CLONE_VFORK | linux_abi::SIGCHLD,
+        0,
+        0,
+        0,
+        0,
+    )
+}
+
 pub fn syscall_linux_rt_sigaction(
     signal: u64,
     action_ptr: u64,
@@ -514,7 +525,7 @@ pub fn syscall_linux_sysinfo(info_ptr: u64) -> u64 {
         bufferram: 0,
         totalswap: 0,
         freeswap: 0,
-        procs: 1,
+        procs: (multitask::live_process_count().min(u16::MAX as usize) as u16).max(1),
         pad: 0,
         _pad2: 0,
         totalhigh: 0,
@@ -807,10 +818,21 @@ fn sleep_clock_nanosleep_substrate(clock_id: u64, flags: u64, ts: LinuxTimespecW
 // RING3-MIGRATION-REFERENCE START: scheduler-thread substrate exception:
 // procd owns clone/process admission policy. Ring0 keeps task creation plus
 // fixed futex/time ABI validation and scheduler wait/deadline substrate.
+const CLASSIC_CLONE_FLAGS_MASK: u64 = 0xffff_ffff;
+
 pub fn syscall_linux_clone(frame: &SyscallFrame) -> u64 {
+    // Linux `clone(2)` takes only the low 32 bits as flags; bit 32 and up
+    // (`CLONE_CLEAR_SIGHAND`, ...) exist for `clone3` alone and are ignored.
     record_clone_result(
         1,
-        clone_linux_thread(frame, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8),
+        clone_linux_thread(
+            frame,
+            frame.rdi & CLASSIC_CLONE_FLAGS_MASK,
+            frame.rsi,
+            frame.rdx,
+            frame.r10,
+            frame.r8,
+        ),
     )
 }
 
@@ -846,13 +868,8 @@ pub fn syscall_linux_clone3(frame: &SyscallFrame) -> u64 {
     if let Err(err) = usermem::copy_from_current_user_exact(frame.rdi, args_bytes) {
         return linux_errno(user_pointer_error_to_linux_errno(err));
     }
-    if args.flags & linux_abi::CLONE_PIDFD != 0
-        || args.set_tid != 0
-        || args.set_tid_size != 0
-        || args.flags & linux_abi::CLONE_INTO_CGROUP != 0
-        || args.exit_signal & !linux_abi::CSIGNAL != 0
-    {
-        return linux_errno(LINUX_ENOSYS);
+    if let Err(errno) = validate_clone3_args(&args) {
+        return linux_errno(errno);
     }
     let child_stack = if args.stack == 0 && args.stack_size == 0 {
         0
@@ -873,6 +890,20 @@ pub fn syscall_linux_clone3(frame: &SyscallFrame) -> u64 {
             args.tls,
         ),
     )
+}
+
+fn validate_clone3_args(args: &linux_abi::LinuxCloneArgs) -> Result<(), i64> {
+    if args.flags & linux_abi::CSIGNAL != 0 || args.exit_signal & !linux_abi::CSIGNAL != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    if args.flags & linux_abi::CLONE_PIDFD != 0
+        || args.set_tid != 0
+        || args.set_tid_size != 0
+        || args.flags & linux_abi::CLONE_INTO_CGROUP != 0
+    {
+        return Err(LINUX_ENOSYS);
+    }
+    Ok(())
 }
 
 fn record_clone_result(kind: u64, result: u64) -> u64 {
@@ -987,5 +1018,17 @@ mod tests {
             ),
             Err(LINUX_EINVAL)
         );
+    }
+
+    #[test]
+    fn clone3_rejects_csignal_bits_or_bad_exit_signal_with_einval() {
+        let mut args = linux_abi::LinuxCloneArgs::default();
+        args.flags = linux_abi::SIGCHLD;
+        assert_eq!(validate_clone3_args(&args), Err(LINUX_EINVAL));
+        args.flags = linux_abi::CLONE_VM | linux_abi::CLONE_VFORK | linux_abi::CLONE_CLEAR_SIGHAND;
+        args.exit_signal = u64::MAX;
+        assert_eq!(validate_clone3_args(&args), Err(LINUX_EINVAL));
+        args.exit_signal = linux_abi::SIGCHLD;
+        assert_eq!(validate_clone3_args(&args), Ok(()));
     }
 }

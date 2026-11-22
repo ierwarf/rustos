@@ -76,9 +76,12 @@ use rustos_user_abi::syscall::{
     VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE, VFS_IPC_OP_MKNOD, VFS_IPC_OP_CHMOD,
     VFS_IPC_OP_FCHMOD, VFS_IPC_OP_FALLOCATE, VFS_IPC_OP_FILE_LOCK, VFS_IPC_OP_SHARED_BACKING,
     VFS_IPC_OP_CHOWN, VFS_IPC_OP_FCHOWN, VFS_IPC_OP_LINKAT,
+    VFS_IPC_OP_INOTIFY_INIT, VFS_IPC_OP_INOTIFY_ADD_WATCH, VFS_IPC_OP_INOTIFY_RM_WATCH,
     VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY, VFS_POLL_QUERY_EPOLL_CREATE,
-    VFS_EPOLL_CLAIM_MAX, VFS_POLL_BATCH_MAX, VFS_POLL_QUERY_EPOLL_CLAIM, VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT,
+    VFS_EPOLL_CLAIM_MAX, VFS_POLL_BATCH_MAX, VFS_POLL_KEYED_BATCH_MAX,
+    VFS_POLL_QUERY_EPOLL_CLAIM, VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT,
     VFS_POLL_QUERY_EPOLL_RETIRE, VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_POLL,
+    VFS_POLL_QUERY_POLL_KEYED,
     WAITSET_ABI_VERSION, WAITSET_MAX_INTERESTS, WAITSET_SNAPSHOT_STATE_DISABLED,
     VfsFileIdentityWire, VfsStatFsWire, decode_two_path_payload,
     VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME, VFS_FILE_IDENTITY_FLAG_MUTABLE_VOLUME,
@@ -112,6 +115,7 @@ use vfsd::{
 };
 
 mod block;
+mod bulk_lanes;
 mod devmgrd;
 mod early_system;
 mod snapshot_worker;
@@ -155,6 +159,8 @@ pub(crate) const EISDIR: i32 = 21;
 pub(crate) const EINVAL: i32 = 22;
 pub(crate) const ENOSPC: i32 = 28;
 pub(crate) const EROFS: i32 = 30;
+pub(crate) const ESPIPE: i32 = 29;
+pub(crate) const EMFILE: i32 = 24;
 pub(crate) const ENOSYS: i32 = 38;
 pub(crate) const EOVERFLOW: i32 = 75;
 pub(crate) const EOPNOTSUPP: i32 = 95;
@@ -865,6 +871,7 @@ struct VfsState {
     cwd: BTreeMap<u64, String>,
     handles: BTreeMap<u64, RemoteHandle>,
     epolls: WaitSetRegistry,
+    inotify: vfsd::inotify::InotifyRegistry,
     /// Advisory file locks (`VFS_IPC_OP_FILE_LOCK`). Not checkpointed: locks
     /// die with a vfsd restart exactly as the kernel would drop them with the
     /// descriptions, and clients re-take them after reopening.
@@ -911,6 +918,7 @@ pub(crate) enum RemoteKind {
     File,
     Directory,
     Device,
+    Inotify,
     /// Memory-filesystem symlink; only ever stat'ed/listed, never a handle.
     Symlink,
     /// Memory-filesystem socket inode; only ever stat'ed/listed, never a handle.
@@ -1193,6 +1201,7 @@ fn remote_kind_from_u16(kind: u16) -> Option<RemoteKind> {
         rustos_user_abi::syscall::VFS_IPC_HANDLE_KIND_FILE => Some(RemoteKind::File),
         rustos_user_abi::syscall::VFS_IPC_HANDLE_KIND_DIR => Some(RemoteKind::Directory),
         rustos_user_abi::syscall::VFS_IPC_HANDLE_KIND_DEVICE => Some(RemoteKind::Device),
+        rustos_user_abi::syscall::VFS_IPC_HANDLE_KIND_INOTIFY => Some(RemoteKind::Inotify),
         _ => None,
     }
 }

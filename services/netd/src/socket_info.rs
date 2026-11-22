@@ -3,10 +3,10 @@
 use super::*;
 
 pub(super) fn handle_getsockname(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    if inet_socket_exists(request.socket_token) {
-        return inet_datagram::socket_name(request, response, false);
-    }
     let state = lock_net_state();
+    if state.inet_sockets.contains_key(&request.socket_token) {
+        return inet_datagram::socket_name_in_state(&state, request, response, false);
+    }
     let Some(socket) = state.sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
@@ -17,10 +17,10 @@ pub(super) fn handle_getsockname(request: &NetdIpcRequest, response: &mut NetdIp
 }
 
 pub(super) fn handle_getpeername(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    if inet_socket_exists(request.socket_token) {
-        return inet_datagram::socket_name(request, response, true);
-    }
     let state = lock_net_state();
+    if state.inet_sockets.contains_key(&request.socket_token) {
+        return inet_datagram::socket_name_in_state(&state, request, response, true);
+    }
     let Some(socket) = state.sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
@@ -28,77 +28,156 @@ pub(super) fn handle_getpeername(request: &NetdIpcRequest, response: &mut NetdIp
         // The only netlink peer is the kernel: nl_pid 0, no groups.
         return netlink::write_kernel_sockaddr(response);
     }
+    let has_peer = matches!(&socket.state, UnixSocketState::Connected(_))
+        || matches!(&socket.state, UnixSocketState::Dgram(d) if d.peer.is_some());
     // A connected endpoint with an unnamed peer (socketpair, unbound client)
     // still has a peer: it reports the unnamed address, not ENOTCONN.
-    if socket.peer_path.is_none() && !matches!(socket.state, UnixSocketState::Connected(_)) {
+    if socket.peer_path.is_none() && !has_peer {
         return libc::ENOTCONN;
     }
     sockaddr_payload(socket.peer_path.as_ref(), response).unwrap_or_else(|errno| errno)
 }
 
+fn write_i32_opt(response: &mut NetdIpcResponse, value: i32) -> i32 {
+    response.payload[..size_of::<i32>()].copy_from_slice(&value.to_ne_bytes());
+    response.payload_len = size_of::<i32>() as u32;
+    response.value = 0;
+    0
+}
+
+fn write_timeval_opt(response: &mut NetdIpcResponse, tv: (i64, i64)) -> i32 {
+    response.payload[0..8].copy_from_slice(&tv.0.to_ne_bytes());
+    response.payload[8..16].copy_from_slice(&tv.1.to_ne_bytes());
+    response.payload_len = TIMEVAL_SIZE as u32;
+    response.value = 0;
+    0
+}
+
 pub(super) fn handle_getsockopt(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    if request.arg1 == libc::IPPROTO_TCP as u64 && request.arg2 == libc::TCP_NODELAY as u64 {
-        let mut state = lock_net_state();
-        let Some(socket) = state.inet_sockets.get(&request.socket_token) else {
-            return if state.sockets.contains_key(&request.socket_token) {
-                libc::ENOPROTOOPT
-            } else {
-                libc::EBADF
-            };
-        };
-        let InetTransport::Tcp(tcp_handle) = socket.transport else {
-            return libc::ENOPROTOOPT;
-        };
-        let Some(stack) = state.inet.as_mut() else {
-            return libc::ENODEV;
-        };
-        let value = i32::from(!stack.sockets.get::<tcp::Socket>(tcp_handle).nagle_enabled());
-        response.payload[..size_of::<i32>()].copy_from_slice(&value.to_ne_bytes());
-        response.payload_len = size_of::<i32>() as u32;
-        response.value = 0;
-        return 0;
-    }
     if request.arg1 == netlink::SOL_NETLINK {
         return netlink::handle_getsockopt(request, response);
     }
-    if request.arg1 != linux_abi::SOL_SOCKET {
-        return inet_datagram::get_ip_option(request, response);
-    }
     let mut state = lock_net_state();
+    handle_getsockopt_in_state(&mut state, request, response)
+}
+
+pub(super) fn handle_getsockopt_in_state(
+    state: &mut NetState,
+    request: &NetdIpcRequest,
+    response: &mut NetdIpcResponse,
+) -> i32 {
+    if (request.arg1 == libc::SOL_IP as u64 && request.arg2 == libc::IP_RECVERR as u64)
+        || (request.arg1 == linux_abi::IPPROTO_IPV6 && request.arg2 == linux_abi::IPV6_RECVERR)
+    {
+        return inet_datagram::get_ip_option_in_state(state, request, response);
+    }
     if state.inet_sockets.contains_key(&request.socket_token) {
-        let pending = if request.arg2 == linux_abi::SO_ERROR {
-            take_inet_socket_error(&mut state, request.socket_token)
+        let pending = if request.arg1 == linux_abi::SOL_SOCKET
+            && request.arg2 == linux_abi::SO_ERROR
+        {
+            take_inet_socket_error(state, request.socket_token)
         } else {
             0
         };
         let socket = &state.inet_sockets[&request.socket_token];
-        let value = match request.arg2 {
-            linux_abi::SO_ERROR => pending,
-            linux_abi::SO_TYPE => socket.transport.socket_type(),
-            linux_abi::SO_DOMAIN => linux_abi::AF_INET as i32,
-            linux_abi::SO_PROTOCOL => socket.transport.protocol(),
-            linux_abi::SO_SNDBUF => socket.options.send_buffer,
-            linux_abi::SO_RCVBUF => socket.options.recv_buffer,
-            linux_abi::SO_KEEPALIVE => socket.options.keepalive as i32,
-            linux_abi::SO_ACCEPTCONN => match socket.transport {
-                InetTransport::Tcp(tcp_handle) => i32::from(
-                    state
-                        .inet
-                        .as_ref()
-                        .is_some_and(|s| s.sockets.get::<tcp::Socket>(tcp_handle).is_listening()),
-                ),
-                _ => 0,
-            },
-            _ => return libc::EOPNOTSUPP,
-        };
-        response.payload[..size_of::<i32>()].copy_from_slice(&value.to_ne_bytes());
-        response.payload_len = size_of::<i32>() as u32;
-        response.value = 0;
-        return 0;
+        match request.arg1 {
+            linux_abi::SOL_SOCKET => {
+                let value = match request.arg2 {
+                    linux_abi::SO_ERROR => pending,
+                    linux_abi::SO_TYPE => socket.transport.socket_type(),
+                    linux_abi::SO_DOMAIN => socket.domain as i32,
+                    linux_abi::SO_PROTOCOL => socket.transport.protocol(),
+                    linux_abi::SO_SNDBUF => socket.options.send_buffer,
+                    linux_abi::SO_RCVBUF => socket.options.recv_buffer,
+                    linux_abi::SO_KEEPALIVE => socket.options.keepalive as i32,
+                    linux_abi::SO_REUSEADDR => socket.options.reuse_addr as i32,
+                    linux_abi::SO_REUSEPORT => socket.options.reuse_port as i32,
+                    linux_abi::SO_BROADCAST => socket.options.broadcast as i32,
+                    linux_abi::SO_LINGER => {
+                        response.payload[0..4]
+                            .copy_from_slice(&i32::from(socket.options.linger.0).to_ne_bytes());
+                        response.payload[4..8]
+                            .copy_from_slice(&socket.options.linger.1.to_ne_bytes());
+                        response.payload_len = 8;
+                        response.value = 0;
+                        return 0;
+                    }
+                    linux_abi::SO_RCVTIMEO => {
+                        return write_timeval_opt(response, socket.options.recv_timeout);
+                    }
+                    linux_abi::SO_SNDTIMEO => {
+                        return write_timeval_opt(response, socket.options.snd_timeout);
+                    }
+                    linux_abi::SO_ACCEPTCONN => {
+                        if socket.tcp_listener.is_some() {
+                            1
+                        } else {
+                            match socket.transport {
+                                InetTransport::Tcp(tcp_handle) => i32::from(
+                                    state
+                                        .inet
+                                        .as_ref()
+                                        .is_some_and(|s| {
+                                            s.sockets.get::<tcp::Socket>(tcp_handle).is_listening()
+                                        }),
+                                ),
+                                _ => 0,
+                            }
+                        }
+                    }
+                    _ => return libc::EOPNOTSUPP,
+                };
+                return write_i32_opt(response, value);
+            }
+            val if val == linux_abi::SOL_IP as u64 => {
+                let value = match request.arg2 {
+                    linux_abi::IP_TOS => i32::from(socket.options.ip_tos),
+                    linux_abi::IP_TTL => socket.options.ip_ttl,
+                    linux_abi::IP_PKTINFO => i32::from(socket.options.ip_pktinfo),
+                    linux_abi::IP_RECVTOS => i32::from(socket.options.ip_recvtos),
+                    _ => return libc::ENOPROTOOPT,
+                };
+                return write_i32_opt(response, value);
+            }
+            linux_abi::IPPROTO_IPV6 if socket.domain == linux_abi::AF_INET6 => {
+                let value = match request.arg2 {
+                    linux_abi::IPV6_V6ONLY => i32::from(socket.options.ipv6_only),
+                    linux_abi::IPV6_TCLASS => socket.options.ipv6_tclass,
+                    linux_abi::IPV6_RECVPKTINFO => i32::from(socket.options.ipv6_recvpktinfo),
+                    _ => return libc::ENOPROTOOPT,
+                };
+                return write_i32_opt(response, value);
+            }
+            linux_abi::SOL_TCP => {
+                let InetTransport::Tcp(tcp_handle) = socket.transport else {
+                    return libc::ENOPROTOOPT;
+                };
+                let value = match request.arg2 {
+                    val if val == libc::TCP_NODELAY as u64 => {
+                        let nagle_disabled = state
+                            .inet
+                            .as_ref()
+                            .map(|s| !s.sockets.get::<tcp::Socket>(tcp_handle).nagle_enabled())
+                            .unwrap_or(socket.options.nodelay);
+                        i32::from(nagle_disabled)
+                    }
+                    val if val == linux_abi::TCP_KEEPIDLE => socket.options.tcp_keepidle,
+                    val if val == linux_abi::TCP_KEEPINTVL => socket.options.tcp_keepintvl,
+                    val if val == linux_abi::TCP_KEEPCNT => socket.options.tcp_keepcnt,
+                    val if val == linux_abi::TCP_USER_TIMEOUT => socket.options.tcp_user_timeout as i32,
+                    _ => return libc::ENOPROTOOPT,
+                };
+                return write_i32_opt(response, value);
+            }
+            _ => return libc::ENOPROTOOPT,
+        }
     }
     let Some(socket) = state.sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
+    if request.arg1 != linux_abi::SOL_SOCKET {
+        return libc::ENOPROTOOPT;
+    }
     let value = match request.arg2 {
         linux_abi::SO_ERROR => 0_i32,
         linux_abi::SO_TYPE => match &socket.state {
@@ -120,24 +199,24 @@ pub(super) fn handle_getsockopt(request: &NetdIpcRequest, response: &mut NetdIpc
         linux_abi::SO_REUSEADDR => socket.options.reuse_addr as i32,
         linux_abi::SO_REUSEPORT => socket.options.reuse_port as i32,
         linux_abi::SO_KEEPALIVE => socket.options.keepalive as i32,
+        linux_abi::SO_BROADCAST => socket.options.broadcast as i32,
+        linux_abi::SO_LINGER => {
+            response.payload[0..4]
+                .copy_from_slice(&i32::from(socket.options.linger.0).to_ne_bytes());
+            response.payload[4..8].copy_from_slice(&socket.options.linger.1.to_ne_bytes());
+            response.payload_len = 8;
+            response.value = 0;
+            return 0;
+        }
         linux_abi::SO_SNDBUF => socket.options.send_buffer,
         linux_abi::SO_RCVBUF => socket.options.recv_buffer,
         linux_abi::SO_PASSCRED => socket.options.passcred as i32,
         linux_abi::SO_PEERCRED => return peercred_payload_from_socket(socket, response),
-        SO_RCVTIMEO => {
-            let (seconds, micros) = socket.options.recv_timeout;
-            response.payload[0..8].copy_from_slice(&seconds.to_ne_bytes());
-            response.payload[8..16].copy_from_slice(&micros.to_ne_bytes());
-            response.payload_len = TIMEVAL_SIZE as u32;
-            response.value = 0;
-            return 0;
-        }
+        SO_RCVTIMEO => return write_timeval_opt(response, socket.options.recv_timeout),
+        linux_abi::SO_SNDTIMEO => return write_timeval_opt(response, socket.options.snd_timeout),
         _ => return libc::EOPNOTSUPP,
     };
-    response.payload[..size_of::<i32>()].copy_from_slice(&value.to_ne_bytes());
-    response.payload_len = size_of::<i32>() as u32;
-    response.value = 0;
-    0
+    write_i32_opt(response, value)
 }
 
 pub(super) fn take_inet_socket_error(state: &mut NetState, token: u64) -> i32 {
@@ -155,70 +234,262 @@ pub(super) fn take_inet_socket_error(state: &mut NetState, token: u64) -> i32 {
     }
 }
 
-pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
-    if request.arg1 == libc::IPPROTO_TCP as u64 && request.arg2 == libc::TCP_NODELAY as u64 {
-        let Some(value) = request_i32_payload(request) else {
-            return libc::EINVAL;
-        };
-        let mut state = lock_net_state();
-        let Some(socket) = state.inet_sockets.get(&request.socket_token) else {
-            return if state.sockets.contains_key(&request.socket_token) {
-                libc::ENOPROTOOPT
-            } else {
-                libc::EBADF
-            };
-        };
-        let InetTransport::Tcp(tcp_handle) = socket.transport else {
-            return libc::ENOPROTOOPT;
-        };
-        let Some(stack) = state.inet.as_mut() else {
-            return libc::ENODEV;
-        };
-        stack
-            .sockets
-            .get_mut::<tcp::Socket>(tcp_handle)
-            .set_nagle_enabled(value == 0);
-        return 0;
+fn parse_timeval(request: &NetdIpcRequest) -> Result<(i64, i64), i32> {
+    if (request.payload_len as usize) < TIMEVAL_SIZE {
+        return Err(libc::EINVAL);
     }
+    let seconds = i64::from_ne_bytes(request.payload[0..8].try_into().unwrap_or_default());
+    let micros = i64::from_ne_bytes(request.payload[8..16].try_into().unwrap_or_default());
+    if !(0..1_000_000).contains(&micros) {
+        return Err(libc::EDOM);
+    }
+    Ok(if seconds < 0 { (0, 0) } else { (seconds, micros) })
+}
+
+pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
     if request.arg1 == netlink::SOL_NETLINK {
         return netlink::handle_setsockopt(request);
     }
-    if request.arg1 != linux_abi::SOL_SOCKET {
-        return inet_datagram::set_ip_option(request);
+    let mut state = lock_net_state();
+    handle_setsockopt_in_state(&mut state, request)
+}
+
+pub(super) fn handle_setsockopt_in_state(state: &mut NetState, request: &NetdIpcRequest) -> i32 {
+    if (request.arg1 == libc::SOL_IP as u64 && request.arg2 == libc::IP_RECVERR as u64)
+        || (request.arg1 == linux_abi::IPPROTO_IPV6 && request.arg2 == linux_abi::IPV6_RECVERR)
+    {
+        return inet_datagram::set_ip_option_in_state(state, request);
     }
-    if request.arg2 == SO_RCVTIMEO {
-        return set_local_receive_timeout(request);
+    if request.arg1 == linux_abi::SOL_SOCKET
+        && matches!(request.arg2, SO_RCVTIMEO | linux_abi::SO_SNDTIMEO)
+    {
+        let tv = match parse_timeval(request) {
+            Ok(tv) => tv,
+            Err(errno) => return errno,
+        };
+        if let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) {
+            if request.arg2 == SO_RCVTIMEO {
+                socket.options.recv_timeout = tv;
+            } else {
+                socket.options.snd_timeout = tv;
+            }
+            return 0;
+        }
+        let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
+            return libc::EBADF;
+        };
+        if request.arg2 == SO_RCVTIMEO {
+            socket.options.recv_timeout = tv;
+        } else {
+            socket.options.snd_timeout = tv;
+        }
+        return 0;
+    }
+    if request.arg1 == linux_abi::SOL_SOCKET && request.arg2 == linux_abi::SO_LINGER {
+        if (request.payload_len as usize) < 8 {
+            return libc::EINVAL;
+        }
+        let onoff = i32::from_ne_bytes(request.payload[0..4].try_into().unwrap_or_default()) != 0;
+        let linger = i32::from_ne_bytes(request.payload[4..8].try_into().unwrap_or_default());
+        if let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) {
+            socket.options.linger = (onoff, linger);
+            return 0;
+        }
+        let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
+            return libc::EBADF;
+        };
+        socket.options.linger = (onoff, linger);
+        return 0;
     }
     let Some(value) = request_i32_payload(request) else {
         return libc::EINVAL;
     };
-    let mut state = lock_net_state();
-    if let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) {
-        match request.arg2 {
-            linux_abi::SO_KEEPALIVE => {
-                socket.options.keepalive = value != 0;
-                let transport = socket.transport;
-                if let InetTransport::Tcp(handle) = transport {
-                    let Some(stack) = state.inet.as_mut() else { return libc::ENODEV; };
-                    stack.sockets.get_mut::<tcp::Socket>(handle).set_keep_alive(
-                        (value != 0).then_some(smoltcp::time::Duration::from_secs(7200)));
+    if state.inet_sockets.contains_key(&request.socket_token) {
+        match request.arg1 {
+            linux_abi::SOL_SOCKET => {
+                let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) else {
+                    return libc::EBADF;
+                };
+                match request.arg2 {
+                    linux_abi::SO_KEEPALIVE => {
+                        socket.options.keepalive = value != 0;
+                        let keepidle = socket.options.tcp_keepidle.max(1) as u64;
+                        let transport = socket.transport;
+                        if let InetTransport::Tcp(handle) = transport {
+                            let Some(stack) = state.inet.as_mut() else {
+                                return libc::ENODEV;
+                            };
+                            stack
+                                .sockets
+                                .get_mut::<tcp::Socket>(handle)
+                                .set_keep_alive(
+                                    (value != 0).then_some(smoltcp::time::Duration::from_secs(keepidle)),
+                                );
+                        }
+                    }
+                    linux_abi::SO_REUSEADDR => socket.options.reuse_addr = value != 0,
+                    linux_abi::SO_REUSEPORT => socket.options.reuse_port = value != 0,
+                    linux_abi::SO_BROADCAST => socket.options.broadcast = value != 0,
+                    linux_abi::SO_SNDBUF | linux_abi::SO_RCVBUF => {
+                        let clamped = value.clamp(4096, MAX_INET_TCP_BUFFER_CAPACITY as i32);
+                        if request.arg2 == linux_abi::SO_SNDBUF {
+                            socket.options.send_buffer = clamped;
+                        } else {
+                            socket.options.recv_buffer = clamped;
+                        }
+                        let transport = socket.transport;
+                        let new_rx = socket.options.recv_buffer as usize;
+                        let new_tx = socket.options.send_buffer as usize;
+                        let options = socket.options;
+                        if let InetTransport::Tcp(handle) = transport {
+                            if let Some(stack) = state.inet.as_mut() {
+                                let tcp_sock = stack.sockets.get_mut::<tcp::Socket>(handle);
+                                if tcp_sock.state() == tcp::State::Closed {
+                                    *tcp_sock = tcp::Socket::new(
+                                        tcp::SocketBuffer::new(vec![0; new_rx]),
+                                        tcp::SocketBuffer::new(vec![0; new_tx]),
+                                    );
+                                    // The replacement socket starts from smoltcp
+                                    // defaults: restore NODELAY/KEEPALIVE/TTL.
+                                    inet_tcp::configure_accepted_or_listening_tcp(
+                                        tcp_sock, options,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => return libc::EOPNOTSUPP,
                 }
+                return 0;
             }
-            // These buffers are fixed for the socket's lifetime. Do not report
-            // a successful resize or port-sharing policy that did not happen.
-            linux_abi::SO_SNDBUF | linux_abi::SO_RCVBUF => return libc::EOPNOTSUPP,
-            linux_abi::SO_REUSEADDR | linux_abi::SO_REUSEPORT if value == 0 => {}
-            _ => return libc::EOPNOTSUPP,
+            val if val == linux_abi::SOL_IP as u64 => {
+                let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) else {
+                    return libc::EBADF;
+                };
+                match request.arg2 {
+                    linux_abi::IP_TOS => socket.options.ip_tos = (value & 0xff) as u8,
+                    linux_abi::IP_TTL => {
+                        let ttl = if value == -1 {
+                            64
+                        } else if (1..=255).contains(&value) {
+                            value
+                        } else {
+                            return libc::EINVAL;
+                        };
+                        socket.options.ip_ttl = ttl;
+                        if let InetTransport::Tcp(handle) = socket.transport {
+                            if let Some(stack) = state.inet.as_mut() {
+                                stack
+                                    .sockets
+                                    .get_mut::<tcp::Socket>(handle)
+                                    .set_hop_limit(Some(ttl as u8));
+                            }
+                        }
+                    }
+                    linux_abi::IP_PKTINFO => socket.options.ip_pktinfo = value != 0,
+                    linux_abi::IP_RECVTOS => socket.options.ip_recvtos = value != 0,
+                    _ => return libc::ENOPROTOOPT,
+                }
+                return 0;
+            }
+            linux_abi::IPPROTO_IPV6 => {
+                let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) else {
+                    return libc::EBADF;
+                };
+                if socket.domain != linux_abi::AF_INET6 {
+                    return libc::ENOPROTOOPT;
+                }
+                match request.arg2 {
+                    linux_abi::IPV6_V6ONLY => {
+                        if socket.local.is_some() {
+                            return libc::EINVAL;
+                        }
+                        socket.options.ipv6_only = value != 0;
+                    }
+                    linux_abi::IPV6_TCLASS => {
+                        if value == -1 {
+                            socket.options.ipv6_tclass = 0;
+                        } else if (0..=255).contains(&value) {
+                            socket.options.ipv6_tclass = value;
+                        } else {
+                            return libc::EINVAL;
+                        }
+                    }
+                    linux_abi::IPV6_RECVPKTINFO => socket.options.ipv6_recvpktinfo = value != 0,
+                    _ => return libc::ENOPROTOOPT,
+                }
+                return 0;
+            }
+            linux_abi::SOL_TCP => {
+                let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) else {
+                    return libc::EBADF;
+                };
+                let InetTransport::Tcp(tcp_handle) = socket.transport else {
+                    return libc::ENOPROTOOPT;
+                };
+                match request.arg2 {
+                    val if val == libc::TCP_NODELAY as u64 => {
+                        socket.options.nodelay = value != 0;
+                        let Some(stack) = state.inet.as_mut() else {
+                            return libc::ENODEV;
+                        };
+                        stack
+                            .sockets
+                            .get_mut::<tcp::Socket>(tcp_handle)
+                            .set_nagle_enabled(value == 0);
+                    }
+                    val if val == linux_abi::TCP_KEEPIDLE => {
+                        if !(1..=32767).contains(&value) {
+                            return libc::EINVAL;
+                        }
+                        socket.options.tcp_keepidle = value;
+                        if socket.options.keepalive {
+                            if let Some(stack) = state.inet.as_mut() {
+                                stack
+                                    .sockets
+                                    .get_mut::<tcp::Socket>(tcp_handle)
+                                    .set_keep_alive(Some(smoltcp::time::Duration::from_secs(
+                                        value as u64,
+                                    )));
+                            }
+                        }
+                    }
+                    val if val == linux_abi::TCP_KEEPINTVL => {
+                        if !(1..=32767).contains(&value) {
+                            return libc::EINVAL;
+                        }
+                        socket.options.tcp_keepintvl = value;
+                    }
+                    val if val == linux_abi::TCP_KEEPCNT => {
+                        if !(1..=127).contains(&value) {
+                            return libc::EINVAL;
+                        }
+                        socket.options.tcp_keepcnt = value;
+                    }
+                    val if val == linux_abi::TCP_USER_TIMEOUT => {
+                        if value < 0 {
+                            return libc::EINVAL;
+                        }
+                        socket.options.tcp_user_timeout = value as u32;
+                    }
+                    _ => return libc::ENOPROTOOPT,
+                }
+                return 0;
+            }
+            _ => return libc::ENOPROTOOPT,
         }
-        return 0;
     }
     let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
         return libc::EBADF;
     };
+    if request.arg1 != linux_abi::SOL_SOCKET {
+        return libc::ENOPROTOOPT;
+    }
     match request.arg2 {
         linux_abi::SO_REUSEADDR => socket.options.reuse_addr = value != 0,
         linux_abi::SO_REUSEPORT => socket.options.reuse_port = value != 0,
         linux_abi::SO_KEEPALIVE => socket.options.keepalive = value != 0,
+        linux_abi::SO_BROADCAST => socket.options.broadcast = value != 0,
         linux_abi::SO_PASSCRED => socket.options.passcred = value != 0,
         linux_abi::SO_SNDBUF => socket.options.send_buffer = clamp_socket_buffer(value),
         linux_abi::SO_RCVBUF => socket.options.recv_buffer = clamp_socket_buffer(value),
@@ -227,30 +498,65 @@ pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
     0
 }
 
-/// `SO_RCVTIMEO` of `SOL_SOCKET`. Only local sockets store it, because only
-/// their blocking receive honours it; inet sockets keep refusing the option.
 const SO_RCVTIMEO: u64 = 20;
 const TIMEVAL_SIZE: usize = 16;
 
-fn set_local_receive_timeout(request: &NetdIpcRequest) -> i32 {
-    if (request.payload_len as usize) < TIMEVAL_SIZE {
-        return libc::EINVAL;
-    }
-    let seconds = i64::from_ne_bytes(request.payload[0..8].try_into().unwrap_or_default());
-    let micros = i64::from_ne_bytes(request.payload[8..16].try_into().unwrap_or_default());
-    if !(0..1_000_000).contains(&micros) {
-        return libc::EDOM;
-    }
+pub(super) fn handle_ioctl(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
     let mut state = lock_net_state();
-    if state.inet_sockets.contains_key(&request.socket_token) {
-        return libc::EOPNOTSUPP;
+    handle_ioctl_in_state(&mut state, request, response)
+}
+
+pub(super) fn handle_ioctl_in_state(
+    state: &mut NetState,
+    request: &NetdIpcRequest,
+    response: &mut NetdIpcResponse,
+) -> i32 {
+    if request.arg1 != linux_abi::FIONREAD {
+        return libc::ENOTTY;
     }
-    let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
+    if state.inet_sockets.contains_key(&request.socket_token) {
+        if let Some(stack) = state.inet.as_mut() {
+            stack.poll_budget(4);
+        }
+        if state.inet_sockets[&request.socket_token].transport.is_datagram() {
+            if let Err(errno) = inet_datagram::stage_one(state, request.socket_token) {
+                return errno;
+            }
+        }
+        let socket = &state.inet_sockets[&request.socket_token];
+        if socket.tcp_listener.is_some() {
+            return libc::EINVAL;
+        }
+        let available = match socket.transport {
+            InetTransport::Tcp(h) => state
+                .inet
+                .as_ref()
+                .map(|s| s.sockets.get::<tcp::Socket>(h).recv_queue())
+                .unwrap_or(0),
+            // Staging moves the next eligible packet out of smoltcp, which
+            // is also what a following recv would consume first.
+            InetTransport::Udp(_) | InetTransport::Icmp(_) => {
+                socket.received.as_ref().map_or(0, |pkt| pkt.bytes.len())
+            }
+        };
+        return write_i32_opt(response, available.min(i32::MAX as usize) as i32);
+    }
+    let Some(socket) = state.sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
-    // Linux treats a negative interval as zero (wait forever).
-    socket.options.recv_timeout = if seconds < 0 { (0, 0) } else { (seconds, micros) };
-    0
+    let available = match &socket.state {
+        UnixSocketState::Connected(connected) => {
+            if socket.kind.preserves_message_boundaries() {
+                connected.incoming.front().map_or(0, |seg| seg.bytes.len())
+            } else {
+                connected.incoming_bytes
+            }
+        }
+        UnixSocketState::Dgram(dgram) => dgram.incoming.front().map_or(0, |seg| seg.bytes.len()),
+        UnixSocketState::Netlink(netlink) => netlink.front_len(),
+        UnixSocketState::Idle | UnixSocketState::Listening { .. } => 0,
+    };
+    write_i32_opt(response, available.min(i32::MAX as usize) as i32)
 }
 
 pub(super) fn handle_shutdown(request: &NetdIpcRequest) -> i32 {
@@ -273,34 +579,54 @@ pub(super) fn handle_shutdown(request: &NetdIpcRequest) -> i32 {
         }
         return 0;
     }
-    let peer = {
+    enum UnixShutdownTarget {
+        StreamPeer(u64),
+        Dgram,
+    }
+    let target = {
         let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
             return libc::EBADF;
         };
-        let UnixSocketState::Connected(connected) = &mut socket.state else {
-            return libc::ENOTCONN;
-        };
-        match request.arg1 {
-            linux_abi::SHUT_RD => connected.recv_closed = true,
-            linux_abi::SHUT_WR => connected.send_closed = true,
-            linux_abi::SHUT_RDWR => {
-                connected.recv_closed = true;
-                connected.send_closed = true;
-            }
-            _ => return libc::EINVAL,
-        }
-        connected.peer
-    };
-    if let Some(peer_socket) = state.sockets.get_mut(&peer) {
-        if let UnixSocketState::Connected(peer_connected) = &mut peer_socket.state {
-            match request.arg1 {
-                linux_abi::SHUT_RD => peer_connected.peer_read_closed = true,
-                linux_abi::SHUT_WR => peer_connected.peer_write_closed = true,
-                linux_abi::SHUT_RDWR => {
-                    peer_connected.peer_read_closed = true;
-                    peer_connected.peer_write_closed = true;
+        match &mut socket.state {
+            UnixSocketState::Connected(connected) => {
+                match request.arg1 {
+                    linux_abi::SHUT_RD => connected.recv_closed = true,
+                    linux_abi::SHUT_WR => connected.send_closed = true,
+                    linux_abi::SHUT_RDWR => {
+                        connected.recv_closed = true;
+                        connected.send_closed = true;
+                    }
+                    _ => return libc::EINVAL,
                 }
-                _ => unreachable!(),
+                UnixShutdownTarget::StreamPeer(connected.peer)
+            }
+            UnixSocketState::Dgram(dgram) => {
+                match request.arg1 {
+                    linux_abi::SHUT_RD => dgram.recv_closed = true,
+                    linux_abi::SHUT_WR => dgram.send_closed = true,
+                    linux_abi::SHUT_RDWR => {
+                        dgram.recv_closed = true;
+                        dgram.send_closed = true;
+                    }
+                    _ => return libc::EINVAL,
+                }
+                UnixShutdownTarget::Dgram
+            }
+            _ => return libc::ENOTCONN,
+        }
+    };
+    if let UnixShutdownTarget::StreamPeer(peer) = target {
+        if let Some(peer_socket) = state.sockets.get_mut(&peer) {
+            if let UnixSocketState::Connected(peer_connected) = &mut peer_socket.state {
+                match request.arg1 {
+                    linux_abi::SHUT_RD => peer_connected.peer_read_closed = true,
+                    linux_abi::SHUT_WR => peer_connected.peer_write_closed = true,
+                    linux_abi::SHUT_RDWR => {
+                        peer_connected.peer_read_closed = true;
+                        peer_connected.peer_write_closed = true;
+                    }
+                    _ => unreachable!(),
+                }
             }
         }
     }
@@ -398,13 +724,18 @@ pub(super) fn sockaddr_payload(
 }
 
 pub(super) fn peercred_payload_from_socket(socket: &UnixSocket, response: &mut NetdIpcResponse) -> i32 {
-    let UnixSocketState::Connected(connected) = &socket.state else {
-        return libc::ENOTCONN;
+    let creds = match &socket.state {
+        UnixSocketState::Connected(connected) => connected.peer_credentials,
+        UnixSocketState::Dgram(dgram) => match dgram.peer_credentials {
+            Some(c) => c,
+            None => return libc::ENOTCONN,
+        },
+        _ => return libc::ENOTCONN,
     };
     let value = linux_abi::LinuxUCred {
-        pid: connected.peer_credentials.pid,
-        uid: connected.peer_credentials.uid,
-        gid: connected.peer_credentials.gid,
+        pid: creds.pid,
+        uid: creds.uid,
+        gid: creds.gid,
     };
     let bytes = unsafe {
         std::slice::from_raw_parts(

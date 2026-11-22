@@ -39,9 +39,10 @@ use crate::gpu_scene::{
     GpuLayerKind, GpuSceneCompiler, GpuSceneError, GpuSceneLayer, GpuTextureCapability,
 };
 use crate::render::{
-    build_gpu_atlas_scene, gpu_cursor_layer, gpu_scene_reuse_signature,
-    update_console_gpu_textures, update_gpu_cursor_texture, update_gpu_layer_destinations,
-    update_wayland_gpu_textures, ConsoleAtlasBinding, GpuAtlasScene, WaylandAtlasBinding,
+    build_gpu_atlas_scene, gpu_cursor_layer, gpu_dock_reuse_signature, gpu_scene_reuse_signature,
+    update_console_gpu_textures, update_dock_gpu_texture, update_gpu_cursor_texture,
+    update_gpu_layer_destinations, update_wayland_gpu_textures, ConsoleAtlasBinding, GpuAtlasScene,
+    WaylandAtlasBinding,
 };
 use crate::sys::{
     debug_line, diag_line, display_create_gpu_atlas_surface, display_get_info,
@@ -147,6 +148,13 @@ struct AtlasDamageEpoch {
     damage: Vec<DvmGpuAtlasDamage>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GpuPresentStats {
+    pub(crate) damage_rect: Option<Rect>,
+    pub(crate) damage_rects: u64,
+    pub(crate) damage_pixels: u64,
+}
+
 pub(crate) struct GpuCompositor {
     display_fd: RawFd,
     info: DisplayGpuInfo,
@@ -154,6 +162,10 @@ pub(crate) struct GpuCompositor {
     compiler: GpuSceneCompiler,
     atlas: Vec<u32>,
     scratch_atlas: Vec<u32>,
+    atlas_used_height: usize,
+    scratch_used_height: usize,
+    dock_source_rect: Option<Rect>,
+    retained_dock_signature: u64,
     layers: Vec<GpuSceneLayer>,
     cursor_source_rect: Option<Rect>,
     cursor_motion: CursorMotion,
@@ -327,18 +339,22 @@ impl GpuCompositorRuntime {
         }
     }
 
-    pub(crate) fn present(&mut self, state: &mut AppState, scene_dirty: bool) -> Result<bool, i32> {
+    pub(crate) fn present(
+        &mut self,
+        state: &mut AppState,
+        scene_dirty: bool,
+    ) -> Result<Option<GpuPresentStats>, i32> {
         match self {
             Self::Active(compositor) => match compositor.present(state, scene_dirty) {
                 Ok(presented) => Ok(presented),
                 Err(ENODEV) => {
                     debug_line("uiserver: DVM GPU compositor lost during submit; recovering");
                     *self = Self::waiting(Instant::now());
-                    Ok(false)
+                    Ok(None)
                 }
                 Err(err) => Err(err),
             },
-            Self::SoftwareFallback | Self::Waiting { .. } => Ok(false),
+            Self::SoftwareFallback | Self::Waiting { .. } => Ok(None),
         }
     }
 
@@ -578,6 +594,10 @@ impl GpuCompositor {
                 compiler,
                 atlas,
                 scratch_atlas,
+                atlas_used_height: info.atlas_height as usize,
+                scratch_used_height: info.atlas_height as usize,
+                dock_source_rect: None,
+                retained_dock_signature: 0,
                 layers: Vec::new(),
                 cursor_source_rect: None,
                 cursor_motion: CursorMotion::stationary(),
@@ -602,7 +622,11 @@ impl GpuCompositor {
         }))
     }
 
-    pub(crate) fn present(&mut self, state: &mut AppState, scene_dirty: bool) -> Result<bool, i32> {
+    pub(crate) fn present(
+        &mut self,
+        state: &mut AppState,
+        scene_dirty: bool,
+    ) -> Result<Option<GpuPresentStats>, i32> {
         let total_started = Instant::now();
         while self.retire_oldest(false)? {}
         let retire_elapsed = total_started.elapsed();
@@ -621,6 +645,7 @@ impl GpuCompositor {
         let mut rebuild_difference_elapsed = Duration::ZERO;
         let mut damage = Vec::new();
         let current_scene_signature = gpu_scene_reuse_signature(state);
+        let current_dock_signature = gpu_dock_reuse_signature(state);
         let mut full_rebuild = !self.active
             || (scene_dirty
                 && (self.cropped || current_scene_signature != self.retained_scene_signature));
@@ -635,13 +660,14 @@ impl GpuCompositor {
         {
             full_rebuild = true;
         }
+        let stride_pixels = self.info.atlas_stride_bytes as usize / size_of::<u32>();
         if scene_dirty && !full_rebuild {
             match update_wayland_gpu_textures(
                 state,
                 self.atlas.as_mut_slice(),
                 self.info.atlas_width as usize,
                 self.info.atlas_height as usize,
-                self.info.atlas_stride_bytes as usize / size_of::<u32>(),
+                stride_pixels,
                 self.wayland_bindings.as_mut_slice(),
             )
             .map_err(gpu_scene_errno)?
@@ -653,7 +679,7 @@ impl GpuCompositor {
                 match update_console_gpu_textures(
                     state,
                     self.atlas.as_mut_slice(),
-                    self.info.atlas_stride_bytes as usize / size_of::<u32>(),
+                    stride_pixels,
                     self.console_bindings.as_mut_slice(),
                 )
                 .map_err(gpu_scene_errno)?
@@ -662,10 +688,40 @@ impl GpuCompositor {
                     None => full_rebuild = true,
                 }
             }
+            if !full_rebuild && current_dock_signature != self.retained_dock_signature {
+                if let Some(dock_rect) = self.dock_source_rect {
+                    if update_dock_gpu_texture(
+                        state,
+                        self.atlas.as_mut_slice(),
+                        self.info.atlas_width as usize,
+                        self.info.atlas_height as usize,
+                        stride_pixels,
+                        dock_rect,
+                    )
+                    .map_err(gpu_scene_errno)?
+                    {
+                        damage.push(damage_from_rect(dock_rect));
+                        self.retained_dock_signature = current_dock_signature;
+                    } else {
+                        full_rebuild = true;
+                    }
+                } else {
+                    full_rebuild = true;
+                }
+            }
         }
         if full_rebuild {
             let allocate_started = Instant::now();
-            self.scratch_atlas.fill(0);
+            let clear_len = self
+                .scratch_used_height
+                .min(self.info.atlas_height as usize)
+                .saturating_mul(stride_pixels)
+                .min(self.scratch_atlas.len());
+            self.scratch_atlas[..clear_len].fill(0);
+            // A rejected build can leave partially placed regions anywhere in
+            // the scratch atlas; only a completed build (below) knows the
+            // true extent, so assume the whole atlas is dirty until then.
+            self.scratch_used_height = self.info.atlas_height as usize;
             rebuild_allocate_elapsed = allocate_started.elapsed();
             let capability = self.capability_for_slot(slot_index, self.next_content_epoch)?;
             let scene_started = Instant::now();
@@ -675,12 +731,14 @@ impl GpuCompositor {
                 wayland_bindings,
                 console_bindings,
                 cropped,
+                used_height: next_used_height,
+                dock_source_rect,
             } = match build_gpu_atlas_scene(
                 state,
                 self.scratch_atlas.as_mut_slice(),
                 self.info.atlas_width as usize,
                 self.info.atlas_height as usize,
-                self.info.atlas_stride_bytes as usize / size_of::<u32>(),
+                stride_pixels,
                 capability,
                 self.cropped && current_scene_signature == self.retained_scene_signature,
             ) {
@@ -694,7 +752,7 @@ impl GpuCompositor {
                         debug_line("uiserver: first GPU frame waiting for retained scene");
                         self.scene_wait_logged = true;
                     }
-                    return Ok(false);
+                    return Ok(None);
                 }
                 Err(error @ (GpuSceneError::AtlasFull | GpuSceneError::CommandLimit)) => {
                     // A capacity rejection is NOT a submitted scene. Keep the
@@ -718,13 +776,20 @@ impl GpuCompositor {
             self.capacity_pressure_logged_at = None;
             rebuild_scene_elapsed = scene_started.elapsed();
             let difference_started = Instant::now();
+            let scan_height = if cropped {
+                self.info.atlas_height as usize
+            } else {
+                self.atlas_used_height
+                    .max(next_used_height)
+                    .min(self.info.atlas_height as usize)
+            };
             damage = if self.active {
                 difference_bounds(
                     self.atlas.as_slice(),
                     self.scratch_atlas.as_slice(),
                     self.info.atlas_width as usize,
-                    self.info.atlas_height as usize,
-                    self.info.atlas_stride_bytes as usize / size_of::<u32>(),
+                    scan_height,
+                    stride_pixels,
                 )
                 .map(damage_from_rect)
                 .into_iter()
@@ -739,6 +804,14 @@ impl GpuCompositor {
             };
             rebuild_difference_elapsed = difference_started.elapsed();
             core::mem::swap(&mut self.atlas, &mut self.scratch_atlas);
+            self.scratch_used_height = self.atlas_used_height;
+            self.atlas_used_height = if cropped {
+                self.info.atlas_height as usize
+            } else {
+                next_used_height
+            };
+            self.dock_source_rect = dock_source_rect;
+            self.retained_dock_signature = gpu_dock_reuse_signature(state);
             self.layers = layers;
             self.cursor_source_rect = Some(cursor_source_rect);
             self.cursor_motion = state.cursor_motion;
@@ -900,6 +973,22 @@ impl GpuCompositor {
                 self.pending.len(),
             ));
         }
+        let stats = {
+            let mut damage_union = Rect::empty();
+            for rect in &damage {
+                damage_union = damage_union.union(Rect {
+                    x: rect.x as usize,
+                    y: rect.y as usize,
+                    width: rect.width as usize,
+                    height: rect.height as usize,
+                });
+            }
+            GpuPresentStats {
+                damage_rect: (!damage_union.is_empty()).then_some(damage_union),
+                damage_rects: damage.len() as u64,
+                damage_pixels: source_damage_pixels,
+            }
+        };
         self.slots[slot_index].content_epoch = self.next_content_epoch;
         self.pending.push(PendingGpuFrame {
             slot_index,
@@ -950,7 +1039,7 @@ impl GpuCompositor {
         self.active = true;
         self.next_slot = (slot_index + 1) % self.slots.len();
         self.next_content_epoch = self.next_content_epoch.checked_add(1).ok_or(EINVAL)?;
-        Ok(true)
+        Ok(Some(stats))
     }
 
     /// Prefer a completed slot that already contains the exact predecessor

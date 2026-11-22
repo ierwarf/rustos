@@ -51,7 +51,7 @@ pub(super) fn handle_socket(
     let domain = request.arg0;
     let socket_type = request.arg1;
     let base_type = socket_type & linux_abi::SOCK_TYPE_MASK;
-    if domain == linux_abi::AF_INET {
+    if domain == linux_abi::AF_INET || domain == linux_abi::AF_INET6 {
         if !rustos_user_abi::syscall::net_broker_inet_socket_shape_valid(
             domain,
             socket_type,
@@ -107,22 +107,33 @@ pub(super) fn handle_socket(
         state.inet_sockets.insert(
             token,
             InetSocket {
+                domain,
                 refs: 1,
-                options: SocketOptions {
-                    send_buffer: INET_TCP_BUFFER_CAPACITY as i32,
-                    recv_buffer: INET_TCP_BUFFER_CAPACITY as i32,
-                    ..SocketOptions::default()
-                },
+                options: SocketOptions::inet_default(),
                 transport,
+                tcp_listener: None,
                 local: None,
                 peer: None,
                 received: None,
                 errors: None,
                 connect_deadline: None,
+                connect_started: None,
+                connect_budget: None,
             },
         );
         drop(state);
-        return prepare_socket_publication(request, response, reply_cap, token, 0, 0, 0, true);
+        notify_inet_worker();
+        return prepare_socket_publication(
+            request,
+            response,
+            reply_cap,
+            token,
+            0,
+            0,
+            domain,
+            0,
+            true,
+        );
     }
     let kind = match local_socket_kind(domain, socket_type, request.arg2) {
         Ok(kind) => kind,
@@ -147,10 +158,10 @@ pub(super) fn handle_socket(
         let _ = provider_accounting::retire_final(token);
         return libc::EAGAIN;
     }
-    let initial_state = if kind == UnixSocketKind::Netlink {
-        UnixSocketState::Netlink(netlink::NetlinkState::new(base_type))
-    } else {
-        UnixSocketState::Idle
+    let initial_state = match kind {
+        UnixSocketKind::Netlink => UnixSocketState::Netlink(netlink::NetlinkState::new(base_type)),
+        UnixSocketKind::Dgram => UnixSocketState::Dgram(UnixDgramState::default()),
+        UnixSocketKind::Stream | UnixSocketKind::SeqPacket => UnixSocketState::Idle,
     };
     state.sockets.insert(
         token,
@@ -160,13 +171,14 @@ pub(super) fn handle_socket(
             refs: 1,
             options: SocketOptions::default(),
             bound_path: None,
+            bound_inode: None,
             local_path: None,
             peer_path: None,
             state: initial_state,
         },
     );
     drop(state);
-    prepare_socket_publication(request, response, reply_cap, token, 0, 0, 0, true)
+    prepare_socket_publication(request, response, reply_cap, token, 0, 0, domain, 0, true)
 }
 
 pub(super) fn handle_socketpair(
@@ -210,6 +222,28 @@ pub(super) fn handle_socketpair(
         let _ = provider_accounting::retire_final(right);
         return libc::EAGAIN;
     }
+    let make_state = |peer| match kind {
+        UnixSocketKind::Dgram => UnixSocketState::Dgram(UnixDgramState {
+            peer: Some(peer),
+            peer_credentials: Some(credentials),
+            ..UnixDgramState::default()
+        }),
+        _ => UnixSocketState::Connected(ConnectedState {
+            incoming: VecDeque::new(),
+            incoming_bytes: 0,
+            incoming_control_bytes: 0,
+            pending_listener: None,
+            channel_id: 0,
+            peer,
+            peer_closed: false,
+            peer_read_closed: false,
+            peer_write_closed: false,
+            peer_credentials: credentials,
+            recv_drain_handoff_armed: false,
+            recv_closed: false,
+            send_closed: false,
+        }),
+    };
     state.sockets.insert(
         left,
         UnixSocket {
@@ -218,23 +252,10 @@ pub(super) fn handle_socketpair(
             refs: 1,
             options: SocketOptions::default(),
             bound_path: None,
+            bound_inode: None,
             local_path: None,
             peer_path: None,
-            state: UnixSocketState::Connected(ConnectedState {
-                incoming: VecDeque::new(),
-                incoming_bytes: 0,
-                incoming_control_bytes: 0,
-                pending_listener: None,
-                channel_id: 0,
-                peer: right,
-                peer_closed: false,
-                peer_read_closed: false,
-                peer_write_closed: false,
-                peer_credentials: credentials,
-                recv_drain_handoff_armed: false,
-                recv_closed: false,
-                send_closed: false,
-            }),
+            state: make_state(right),
         },
     );
     state.sockets.insert(
@@ -245,27 +266,14 @@ pub(super) fn handle_socketpair(
             refs: 1,
             options: SocketOptions::default(),
             bound_path: None,
+            bound_inode: None,
             local_path: None,
             peer_path: None,
-            state: UnixSocketState::Connected(ConnectedState {
-                incoming: VecDeque::new(),
-                incoming_bytes: 0,
-                incoming_control_bytes: 0,
-                pending_listener: None,
-                channel_id: 0,
-                peer: left,
-                peer_closed: false,
-                peer_read_closed: false,
-                peer_write_closed: false,
-                peer_credentials: credentials,
-                recv_drain_handoff_armed: false,
-                recv_closed: false,
-                send_closed: false,
-            }),
+            state: make_state(left),
         },
     );
     drop(state);
-    prepare_socket_publication(request, response, reply_cap, left, right, 0, 0, true)
+    prepare_socket_publication(request, response, reply_cap, left, right, 0, request.arg0, 0, true)
 }
 
 pub(super) fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
@@ -276,12 +284,20 @@ pub(super) fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcRespo
             response.value = socket.refs as u64;
             return 0;
         }
-        let Some(socket) = state.inet_sockets.remove(&request.socket_token) else {
+        let Some(mut socket) = state.inet_sockets.remove(&request.socket_token) else {
             return libc::EBADF;
         };
         state.readiness_generations.remove(&request.socket_token);
+        state.readiness_observations.remove(&request.socket_token);
         if let Some(stack) = state.inet.as_mut() {
-            stack.remove(socket.transport);
+            let immediate_abort = socket.options.linger.0 && socket.options.linger.1 == 0;
+            if let Some(mut listener) = socket.tcp_listener.take() {
+                for handle in listener.handles.drain(..) {
+                    stack.remove(InetTransport::Tcp(handle), true);
+                }
+            } else {
+                stack.remove(socket.transport, immediate_abort);
+            }
             stack.poll_budget(8);
         }
         drop(state);
@@ -328,10 +344,13 @@ pub(super) fn retire_unix_socket(
             continue;
         };
         state.readiness_generations.remove(&token);
+        state.readiness_observations.remove(&token);
+        if let Some(inode) = socket.bound_inode.take() {
+            if state.inode_bindings.get(&inode).copied() == Some(token) {
+                state.inode_bindings.remove(&inode);
+            }
+        }
         if let Some(path) = &socket.bound_path {
-            // Only a bound socket can own an inode binding; skip the table
-            // scan for the common unbound socket.
-            state.inode_bindings.retain(|_, owner| *owner != token);
             if state.bindings.get(path).copied() == Some(token) {
                 state.bindings.remove(path);
             }
@@ -350,6 +369,21 @@ pub(super) fn retire_unix_socket(
                         peer_connected.peer_closed = true;
                         peer_connected.peer_read_closed = true;
                         peer_connected.peer_write_closed = true;
+                    }
+                }
+            }
+            UnixSocketState::Dgram(dgram) => {
+                state.release_unix_queued_bytes(
+                    dgram.incoming_bytes + dgram.incoming_control_bytes,
+                );
+                if let Some(peer_token) = dgram.peer {
+                    peers.push(peer_token);
+                    if let Some(peer) = state.sockets.get_mut(&peer_token) {
+                        if let UnixSocketState::Dgram(peer_dgram) = &mut peer.state {
+                            if peer_dgram.peer == Some(token) {
+                                peer_dgram.peer_closed = true;
+                            }
+                        }
                     }
                 }
             }
@@ -405,35 +439,41 @@ pub(super) fn handle_bind(request: &NetdIpcRequest) -> i32 {
     path_namespace::with_production_namespace(|namespace| handle_bind_with(request, namespace))
 }
 
-/// `bind` for AF_UNIX/AF_NETLINK. No `NetState` lock is held across a
+/// `bind` for AF_UNIX/AF_NETLINK/AF_INET/AF_INET6. No `NetState` lock is held across a
 /// namespace call: validate, ask the namespace, then revalidate and publish.
 pub(super) fn handle_bind_with(request: &NetdIpcRequest, namespace: &mut dyn PathNamespace) -> i32 {
-    if inet_socket_exists(request.socket_token) {
-        return inet_datagram::bind(request);
-    }
-    let kind = lock_net_state()
-        .sockets
-        .get(&request.socket_token)
-        .map(|socket| socket.kind);
-    if kind == Some(UnixSocketKind::Netlink) {
-        return netlink::handle_bind(request);
-    }
-    let requested_address = match sockaddr_bind_address_from_payload(request) {
-        Ok(address) => address,
-        Err(errno) => return errno,
-    };
     let existing_binding = {
-        let state = lock_net_state();
+        let mut state = lock_net_state();
+        if let Some(inet) = state.inet_sockets.get(&request.socket_token) {
+            if inet.transport.is_datagram() {
+                return inet_datagram::bind_request_in_state(&mut state, request);
+            }
+            return inet_tcp::bind_tcp_in_state(&mut state, request);
+        }
         let Some(socket) = state.sockets.get(&request.socket_token) else {
             return libc::EBADF;
         };
-        if socket.bound_path.is_some() || !matches!(socket.state, UnixSocketState::Idle) {
+        if socket.kind == UnixSocketKind::Netlink {
+            drop(state);
+            return netlink::handle_bind(request);
+        }
+        if socket.bound_path.is_some()
+            || !matches!(socket.state, UnixSocketState::Idle | UnixSocketState::Dgram(_))
+        {
             return libc::EINVAL;
         }
-        requested_address
+        drop(state);
+        let requested_address = match sockaddr_bind_address_from_payload(request) {
+            Ok(address) => address,
+            Err(errno) => return errno,
+        };
+        let state = lock_net_state();
+        let exists = requested_address
             .as_ref()
-            .is_some_and(|address| state.bindings.contains_key(address))
+            .is_some_and(|address| state.bindings.contains_key(address));
+        (requested_address, exists)
     };
+    let (requested_address, existing_binding) = existing_binding;
     // Filesystem names additionally need an inode in the namespace.
     let managed_path = match &requested_address {
         Some(UnixAddress::Filesystem(path)) => {
@@ -500,7 +540,9 @@ fn publish_unix_binding(
     let Some(socket) = state.sockets.get(&request.socket_token) else {
         return Err(libc::EBADF);
     };
-    if socket.bound_path.is_some() || !matches!(socket.state, UnixSocketState::Idle) {
+    if socket.bound_path.is_some()
+        || !matches!(socket.state, UnixSocketState::Idle | UnixSocketState::Dgram(_))
+    {
         return Err(libc::EINVAL);
     }
     let address = match requested_address {
@@ -528,9 +570,14 @@ fn publish_unix_binding(
         .get_mut(&request.socket_token)
         .expect("validated unix socket disappeared under net state lock");
     socket.bound_path = Some(address.clone());
+    socket.bound_inode = identity.map(|id| (id.mount, id.node));
     socket.local_path = Some(address.clone());
     state.bindings.insert(address, request.socket_token);
-    if let Some(id) = identity { state.inode_bindings.insert((id.mount, id.node), request.socket_token); }
+    if let Some(id) = identity {
+        state
+            .inode_bindings
+            .insert((id.mount, id.node), request.socket_token);
+    }
     Ok(())
 }
 
@@ -579,10 +626,16 @@ pub(super) fn local_socket_kind(
 
 pub(super) fn handle_listen(request: &NetdIpcRequest) -> i32 {
     let mut state = lock_net_state();
+    if state.inet_sockets.contains_key(&request.socket_token) {
+        return inet_tcp::listen_tcp_in_state(&mut state, request.socket_token, request.arg1);
+    }
     let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
         return libc::EBADF;
     };
-    if socket.kind == UnixSocketKind::Netlink {
+    if matches!(
+        socket.kind,
+        UnixSocketKind::Netlink | UnixSocketKind::Dgram
+    ) {
         return libc::EOPNOTSUPP;
     }
     let backlog = usize::try_from(request.arg1)
@@ -611,19 +664,39 @@ pub(super) fn handle_connect_with(
     request: &NetdIpcRequest,
     namespace: &mut dyn PathNamespace,
 ) -> i32 {
-    if inet_datagram::is_datagram(request.socket_token) {
-        return inet_datagram::connect(request);
-    }
-    if sockaddr_family(request) == Some(linux_abi::AF_INET) {
-        return handle_inet_connect(request);
-    }
-    let client_kind = lock_net_state()
-        .sockets
-        .get(&request.socket_token)
-        .map(|socket| socket.kind);
-    if client_kind == Some(UnixSocketKind::Netlink) {
+    let client_kind = {
+        let mut state = lock_net_state();
+        if let Some(inet) = state.inet_sockets.get(&request.socket_token) {
+            if inet.transport.is_datagram() {
+                return inet_datagram::connect_in_state(&mut state, request);
+            }
+            drop(state);
+            return begin_inet_connect(request);
+        }
+        let Some(socket) = state.sockets.get(&request.socket_token) else {
+            return libc::EBADF;
+        };
+        socket.kind
+    };
+    if client_kind == UnixSocketKind::Netlink {
         // The only netlink peer is the kernel (nl_pid 0): a no-op.
         return netlink::handle_connect(request);
+    }
+    if client_kind == UnixSocketKind::Dgram
+        && sockaddr_family(request) == Some(libc::AF_UNSPEC as u64)
+    {
+        let mut state = lock_net_state();
+        let Some(client) = state.sockets.get_mut(&request.socket_token) else {
+            return libc::EBADF;
+        };
+        if let UnixSocketState::Dgram(dgram) = &mut client.state {
+            dgram.peer = None;
+            dgram.peer_credentials = None;
+            dgram.peer_closed = false;
+            client.peer_path = None;
+            return 0;
+        }
+        return libc::EINVAL;
     }
     let path = match sockaddr_path_from_payload(request) {
         Ok(path) => path,
@@ -638,6 +711,45 @@ pub(super) fn handle_connect_with(
         }
         _ => NodeState::Unmanaged,
     };
+    if client_kind == UnixSocketKind::Dgram {
+        let mut state = lock_net_state();
+        let target_token = match node {
+            NodeState::Absent => return libc::ENOENT,
+            NodeState::NotSocket => return libc::ECONNREFUSED,
+            NodeState::Socket(id) => match state.inode_bindings.get(&(id.mount, id.node)).copied() {
+                Some(token) => token,
+                None => return libc::ECONNREFUSED,
+            },
+            NodeState::Unmanaged => match state.bindings.get(&path).copied() {
+                Some(token) => token,
+                None => {
+                    return if matches!(path, UnixAddress::Abstract(_)) {
+                        libc::ECONNREFUSED
+                    } else {
+                        libc::ENOENT
+                    };
+                }
+            },
+        };
+        let Some(target) = state.sockets.get(&target_token) else {
+            return libc::ECONNREFUSED;
+        };
+        if target.kind != UnixSocketKind::Dgram {
+            return libc::EPROTOTYPE;
+        }
+        let target_creds = target.owner;
+        let Some(client) = state.sockets.get_mut(&request.socket_token) else {
+            return libc::EBADF;
+        };
+        let UnixSocketState::Dgram(dgram) = &mut client.state else {
+            return libc::EINVAL;
+        };
+        dgram.peer = Some(target_token);
+        dgram.peer_closed = false;
+        dgram.peer_credentials = Some(target_creds);
+        client.peer_path = Some(path);
+        return 0;
+    }
     let credentials = request_credentials(request);
     let accepted = match mint_socket_token() {
         Ok(token) => token,
@@ -725,6 +837,7 @@ pub(super) fn handle_connect_with(
             refs: 1,
             options: SocketOptions::default(),
             bound_path: None,
+            bound_inode: None,
             local_path: listener_path,
             peer_path: client_local_path,
             state: UnixSocketState::Connected(ConnectedState {
@@ -782,6 +895,58 @@ pub(super) fn handle_accept(
     if request.arg3 & !(linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC) != 0 {
         return libc::EINVAL;
     }
+    if let Some(accepted_domain) = {
+        let state = lock_net_state();
+        state.inet_sockets.get(&request.socket_token).map(|s| s.domain)
+    } {
+        let accepted_token = match mint_socket_token() {
+            Ok(token) => token,
+            Err(errno) => return errno,
+        };
+        let want_peer_addr = request.arg1 != 0 && request.arg2 != 0;
+        {
+            let mut state = lock_net_state();
+            if let Err(errno) = inet_tcp::pop_ready_tcp_accept_in_state(
+                &mut state,
+                request.socket_token,
+                accepted_token,
+                response,
+                want_peer_addr,
+            ) {
+                return errno;
+            }
+        }
+        if let Err(errno) = provider_accounting::charge_before_publish(accepted_token, request.pid) {
+            let mut state = lock_net_state();
+            if let Some(removed) = state.inet_sockets.remove(&accepted_token) {
+                if let Some(stack) = state.inet.as_mut() {
+                    stack.remove(removed.transport, true);
+                }
+            }
+            return errno;
+        }
+        let pub_res = prepare_socket_publication(
+            request,
+            response,
+            reply_cap,
+            accepted_token,
+            0,
+            0,
+            accepted_domain,
+            linux_abi::SOCK_STREAM,
+            false,
+        );
+        if pub_res != 0 {
+            let _ = provider_accounting::retire_final(accepted_token);
+            let mut state = lock_net_state();
+            if let Some(removed) = state.inet_sockets.remove(&accepted_token) {
+                if let Some(stack) = state.inet.as_mut() {
+                    stack.remove(removed.transport, true);
+                }
+            }
+        }
+        return pub_res;
+    }
     // accept4 flags control the NEW descriptor, not the listener's wait mode.
     let accepted = {
         let mut state = lock_net_state();
@@ -829,6 +994,7 @@ pub(super) fn handle_accept(
             accepted,
             0,
             channel_id,
+            linux_abi::AF_UNIX,
             accepted_kind.unix_socket_type(),
             false,
         )
@@ -840,7 +1006,11 @@ pub(super) fn handle_accept(
     }
     let (retired, _peers, tokens) = {
         let mut state = lock_net_state();
-        settle_unix_accept(&mut state, request.socket_token, accepted, result == 0)
+        if result != 0 && matches!(result, libc::EPROTO | libc::ECONNABORTED | libc::EINVAL) {
+            retire_unix_socket(&mut state, accepted)
+        } else {
+            settle_unix_accept(&mut state, request.socket_token, accepted, result == 0)
+        }
     };
     if let Err(errno) = release_accept_retired_control_with(retired, response, |control| {
         let args = RustosNetBrokerArgs {
@@ -944,6 +1114,7 @@ pub(super) fn prepare_socket_publication(
     socket_token: u64,
     second_socket_token: u64,
     channel_id: u64,
+    accepted_domain: u64,
     accepted_type: u64,
     discard_on_failure: bool,
 ) -> i32 {
@@ -960,25 +1131,36 @@ pub(super) fn prepare_socket_publication(
         discard(socket_token);
         return libc::EINVAL;
     }
+    let (operation, domain, protocol) = if request.op == SYSCALL_OFFLOAD_OP_LINUX_ACCEPT {
+        if accepted_domain == linux_abi::AF_UNIX {
+            (
+                SYSCALL_OFFLOAD_OP_LINUX_ACCEPT as u64,
+                linux_abi::AF_UNIX,
+                0,
+            )
+        } else {
+            // INET accept publishes via SOCKET shape with channel_id == 0 so
+            // kernel net_broker_socket_publication_shape_valid admits AF_INET/AF_INET6.
+            (
+                SYSCALL_OFFLOAD_OP_LINUX_SOCKET as u64,
+                accepted_domain,
+                0,
+            )
+        }
+    } else {
+        (request.op as u64, request.arg0, request.arg2)
+    };
     let publication = NetBrokerPrepareSocketPublication {
         version: NET_BROKER_SOCKET_PUBLICATION_VERSION,
         reply_cap,
         caller_pid: request.pid,
         socket_token,
-        operation: request.op as u64,
+        operation,
         second_socket_token,
         channel_id,
-        domain: if request.op == SYSCALL_OFFLOAD_OP_LINUX_ACCEPT {
-            linux_abi::AF_UNIX
-        } else {
-            request.arg0
-        },
+        domain,
         socket_type: socket_publication_type(request, accepted_type),
-        protocol: if request.op == SYSCALL_OFFLOAD_OP_LINUX_ACCEPT {
-            0
-        } else {
-            request.arg2
-        },
+        protocol,
         ..NetBrokerPrepareSocketPublication::default()
     };
     let args = RustosNetBrokerArgs {

@@ -41,6 +41,10 @@ struct SmokeOptions {
     /// Desktop id runtimed launches once the UI is ready (`--launch-desktop`,
     /// `launch_desktop.rs`), through a private KVM-only contract file.
     launch_desktop: Option<String>,
+    /// Capture rendered DVM `virtio-gpu-gl-pci` PPM framebuffer before guest shutdown.
+    screendump: Option<PathBuf>,
+    /// Boot Chrome with DVM networking + capture & verify non-blank rendered PPM pixels.
+    chrome_web_probe: bool,
     /// Percent of the host cores the run may use that are kept busy for the
     /// whole run (`--host-cpu-pressure`, see `kvm/host_pressure.rs`). `None`
     /// is the idle-host profile; `Some` is a distinct timing profile.
@@ -149,6 +153,8 @@ where
         smp_iteration: false,
         hold_seconds: None,
         launch_desktop: None,
+        screendump: None,
+        chrome_web_probe: false,
         host_cpu_pressure: None,
         smp_formal_profile_override: None,
         smp_ring3_qualification: false,
@@ -244,6 +250,13 @@ where
                 validate_launch_desktop_id(&id)?;
                 options.launch_desktop = Some(id);
             }
+            "--screendump" => {
+                if options.screendump.is_some() {
+                    bail!("--screendump was supplied more than once");
+                }
+                options.screendump = Some(PathBuf::from(next_value(&mut args, "--screendump")?));
+            }
+            "--chrome-web-probe" => options.chrome_web_probe = true,
             "--host-cpu-pressure" => {
                 if options.host_cpu_pressure.is_some() {
                     bail!("--host-cpu-pressure was supplied more than once");
@@ -407,6 +420,52 @@ where
         }
         // uiserver's required display dependency expires 30 s after it starts;
         // a window longer than that can only be held with a display provider.
+        options.gui_dvm_surfaces = true;
+    }
+    if options.chrome_web_probe {
+        let contradiction = if options.storage_only || options.expect_block_flush_fault {
+            Some("--storage-dvm-only")
+        } else if options.smp_iteration {
+            Some("--smp-iteration")
+        } else if options.physical_gpu_bdf.is_some() {
+            Some("--physical-gpu")
+        } else {
+            None
+        };
+        if let Some(other) = contradiction {
+            bail!("--chrome-web-probe needs virtual GUI+network and cannot combine with {other}");
+        }
+        options.gui_dvm_surfaces = true;
+        options.dvm_block_shmem = true;
+        options.dvm_network_shmem = true;
+        options.writable_storage = true;
+        if options.launch_desktop.is_none() {
+            options.launch_desktop = Some(String::from("chrome.desktop"));
+        }
+        if options.hold_seconds.is_none()
+            && options.min_ui_fps.is_none()
+            && matches!(options.recovery_probe, RecoveryProbe::None)
+        {
+            options.hold_seconds = Some(8);
+        }
+        // Chrome's first window arrives tens of seconds after the launch is
+        // accepted; capturing at the `launched` marker photographs the desktop.
+        const CHROME_WINDOW_MARKER: &str = "wayland_windows=2";
+        if !options.expected_markers.iter().any(|m| m == CHROME_WINDOW_MARKER) {
+            options.expected_markers.push(String::from(CHROME_WINDOW_MARKER));
+        }
+    }
+    if options.screendump.is_some() {
+        let contradiction = if options.storage_only || options.expect_block_flush_fault {
+            Some("--storage-dvm-only")
+        } else if options.physical_gpu_bdf.is_some() {
+            Some("--physical-gpu")
+        } else {
+            None
+        };
+        if let Some(other) = contradiction {
+            bail!("--screendump captures virtual virtio-gpu-gl-pci output and cannot combine with {other}");
+        }
         options.gui_dvm_surfaces = true;
     }
     if options.launch_desktop.is_some() {

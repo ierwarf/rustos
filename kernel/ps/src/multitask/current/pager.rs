@@ -71,8 +71,8 @@ pub(in crate::multitask) fn published_current_pager_binding() -> Option<(
         // scalar slot fallback. A missing/foreign bank still refuses.
         owned_current_user_binding()?
     };
-    let process = process_table::published_live_process_identity(handle)?;
-    Some((task_id, handle, process))
+    let (owner_handle, owner_identity) = process_table::published_mm_vma_target(handle)?;
+    Some((task_id, owner_handle, owner_identity))
 }
 
 /// Lock-free authority used to bill one pager fault to the exact native or
@@ -164,8 +164,15 @@ pub fn publish_pager_vma_for_process(
             .live_identity()
             .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
         crate::multitask::pager_vma::ExpectedMm::check(expected, identity)?;
-        let published =
-            crate::multitask::pager_vma::publish(retained.handle(), identity, template, ceiling)?;
+        let (vma_handle, vma_identity) = retained
+            .vma_owner()
+            .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
+        let published = crate::multitask::pager_vma::publish(
+            vma_handle,
+            vma_identity,
+            template,
+            ceiling,
+        )?;
         record_reservation(page_count as u64);
         Ok(published)
     })
@@ -269,10 +276,10 @@ pub fn pager_vma_regions_for_process(
 > {
     let retained = process_table::retain_process_by_pid(process_id)
         .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
-    let identity = retained
-        .live_identity()
+    let (vma_handle, vma_identity) = retained
+        .vma_owner()
         .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
-    crate::multitask::pager_vma::snapshot_regions(retained.handle(), identity)
+    crate::multitask::pager_vma::snapshot_regions(vma_handle, vma_identity)
 }
 
 /// Withdraw one exact non-current pager VMA before its PTEs are removed.
@@ -283,8 +290,8 @@ pub fn revoke_pager_vma_for_process(
 ) -> Result<rustos_user_abi::pager::PagerVmRegionWire, crate::multitask::pager_vma::PagerVmaError> {
     let retained = process_table::retain_process_by_pid(process_id)
         .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
-    let identity = retained
-        .live_identity()
+    let (vma_handle, vma_identity) = retained
+        .vma_owner()
         .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
-    crate::multitask::pager_vma::revoke(retained.handle(), identity, start, vma_generation)
+    crate::multitask::pager_vma::revoke(vma_handle, vma_identity, start, vma_generation)
 }

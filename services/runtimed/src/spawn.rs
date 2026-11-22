@@ -65,6 +65,9 @@ struct KvmAcceptanceContract {
     ui_profile: bool,
     network_exercise: bool,
     google_ping: bool,
+    /// Optional key: `uiserver` reports client pixel statistics (KVM Chrome
+    /// web probe only; the host cannot screendump a virgl scanout).
+    ui_pixel_probe: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -711,8 +714,11 @@ fn apply_kvm_acceptance_contract(entry: &mut LaunchEntry) {
         let _ = CONTRACT.set(contract);
         CONTRACT.get().copied().unwrap_or(contract)
     };
-    if !contract.ui_profile && !contract.network_exercise {
+    if !contract.ui_profile && !contract.network_exercise && !contract.ui_pixel_probe {
         return;
+    }
+    if contract.ui_pixel_probe && entry.desktop_file_id == "uiserver.desktop" {
+        upsert_env(&mut entry.env, "RUSTOS_UI_PIXEL_PROBE=1");
     }
     if contract.ui_profile && entry.desktop_file_id == "uiserver.desktop" {
         upsert_env(&mut entry.env, "RUSTOS_UI_PROFILE=1");
@@ -791,6 +797,7 @@ fn parse_kvm_acceptance_contract(contents: &str) -> Option<KvmAcceptanceContract
     let mut ui_profile = None;
     let mut network_exercise = None;
     let mut google_ping = None;
+    let mut ui_pixel_probe = None;
     for line in contents.lines() {
         match line {
             "contract=rustos-kvm-acceptance-v1" if !contract => contract = true,
@@ -800,6 +807,8 @@ fn parse_kvm_acceptance_contract(contents: &str) -> Option<KvmAcceptanceContract
             "network_exercise=1" if network_exercise.is_none() => network_exercise = Some(true),
             "google_ping=0" if google_ping.is_none() => google_ping = Some(false),
             "google_ping=1" if google_ping.is_none() => google_ping = Some(true),
+            "ui_pixel_probe=0" if ui_pixel_probe.is_none() => ui_pixel_probe = Some(false),
+            "ui_pixel_probe=1" if ui_pixel_probe.is_none() => ui_pixel_probe = Some(true),
             _ => return None,
         }
     }
@@ -811,6 +820,7 @@ fn parse_kvm_acceptance_contract(contents: &str) -> Option<KvmAcceptanceContract
         ui_profile: ui_profile.filter(|_| contract)?,
         network_exercise: network_exercise?,
         google_ping,
+        ui_pixel_probe: ui_pixel_probe.unwrap_or(false),
     })
 }
 

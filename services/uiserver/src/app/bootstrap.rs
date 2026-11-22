@@ -435,7 +435,10 @@ impl AppState {
         Ok(())
     }
 
-    pub(crate) fn present_gpu_update(&mut self, scene_dirty: bool) -> Result<bool, i32> {
+    pub(crate) fn present_gpu_update(
+        &mut self,
+        scene_dirty: bool,
+    ) -> Result<Option<crate::gpu_runtime::GpuPresentStats>, i32> {
         let mut runtime = self.gpu_compositor.take().ok_or(22)?;
         let result = runtime.present(self, scene_dirty);
         self.gpu_compositor = Some(runtime);

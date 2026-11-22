@@ -8,7 +8,31 @@
 //! - **Forbidden:** No poll outside the state lock, no unbounded ingress per turn, no readiness change without a sweep request.
 //! - **Evidence:** `readiness_tests`, `error_queue` tests, `dvm-network-ingress`.
 
+use std::cell::RefCell;
+
 use super::*;
+use smoltcp::phy::ChecksumCapabilities;
+use smoltcp::wire::{
+    ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, EthernetRepr,
+    Icmpv6Packet, Icmpv6Repr, IpProtocol, Ipv4Packet, Ipv6Packet, Ipv6Repr, NdiscNeighborFlags,
+    NdiscRepr, RawHardwareAddress,
+};
+
+pub(super) const LINK_LOCAL_IPV6: Ipv6Address =
+    Ipv6Address::new(0xfe80, 0, 0, 0, 0x5054, 0x00ff, 0xfe12, 0x3456);
+
+fn is_local_ipv4(addr: Ipv4Address) -> bool {
+    addr.octets()[0] == 127 || addr == QEMU_USERNET_ADDR
+}
+
+fn is_local_ipv6(addr: Ipv6Address) -> bool {
+    addr.is_loopback() || addr == LINK_LOCAL_IPV6
+}
+
+thread_local! {
+    static TX_SCRATCH: RefCell<[u8; NET_BROKER_PACKET_MTU]> =
+        const { RefCell::new([0; NET_BROKER_PACKET_MTU]) };
+}
 
 pub(super) struct InetStack {
     pub(super) iface: Interface,
@@ -29,10 +53,7 @@ impl InetStack {
         if packet_provider_state()? != PacketProviderState::Active {
             return Err(libc::ENODEV);
         }
-        let mut device = BrokerDevice {
-            rx: [0; NET_BROKER_PACKET_MTU],
-            errors: inet_datagram::ErrorIngress::default(),
-        };
+        let mut device = BrokerDevice::default();
         let mut config = SmolConfig::new(HardwareAddress::Ethernet(QEMU_USERNET_MAC));
         // TCP sequence/stack randomness must not share a deterministic boot seed.
         let seed = mint_socket_token()?;
@@ -40,12 +61,16 @@ impl InetStack {
         let mut iface = Interface::new(config, &mut device, smol_now());
         iface.update_ip_addrs(|ip_addrs| {
             let _ = ip_addrs.push(IpCidr::new(IpAddress::Ipv4(QEMU_USERNET_ADDR), 24));
+            let _ = ip_addrs.push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::LOCALHOST), 8));
+            let _ = ip_addrs.push(IpCidr::new(IpAddress::Ipv6(Ipv6Address::LOCALHOST), 128));
+            let _ = ip_addrs.push(IpCidr::new(IpAddress::Ipv6(LINK_LOCAL_IPV6), 64));
         });
         iface
             .routes_mut()
             .add_default_ipv4_route(QEMU_USERNET_GATEWAY)
             .map_err(|_| libc::ENOSPC)?;
-        Ok(Self {
+        seed_loopback_neighbors(&mut device);
+        let mut stack = Self {
             iface,
             sockets: SocketSet::new(Vec::new()),
             device,
@@ -54,7 +79,9 @@ impl InetStack {
             closing: Vec::new(),
             readiness_dirty: false,
             last_timer_sweep: StdInstant::now(),
-        })
+        };
+        stack.poll_budget(4);
+        Ok(stack)
     }
 
     pub(super) fn add_tcp_socket(&mut self) -> SocketHandle {
@@ -65,13 +92,18 @@ impl InetStack {
         handle
     }
 
-    pub(super) fn remove(&mut self, transport: InetTransport) {
+    pub(super) fn remove(&mut self, transport: InetTransport, immediate_abort: bool) {
         let handle = transport.handle();
         if transport.is_datagram() {
             self.sockets.remove(handle);
             return;
         }
         let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        if immediate_abort {
+            socket.abort();
+            self.discard_aborted(&[handle]);
+            return;
+        }
         // `close` queues a FIN for a synchronized connection and drops a
         // half-open or listening one straight to Closed.
         socket.close();
@@ -156,7 +188,7 @@ impl InetStack {
         for _ in 0..budget {
             let (processed_ingress, changed) = self.poll_one();
             readiness_changed |= changed;
-            if !processed_ingress {
+            if !processed_ingress && self.device.loopback_rx.is_empty() {
                 break;
             }
         }
@@ -166,20 +198,24 @@ impl InetStack {
 
     pub(super) fn next_ephemeral_port(&mut self) -> Option<u16> {
         // Include lingering closes: smoltcp does not reject duplicate local endpoints.
-        // One pass over the socket set builds the in-use set, so a crowded
-        // range costs O(sockets + candidates) instead of O(sockets * candidates).
-        let used: std::collections::HashSet<u16> = self
-            .sockets
-            .iter()
-            .filter_map(|(_, socket)| match socket {
+        // One pass builds a 16K-bit stack bitset for 49152..=65535 with zero allocation.
+        let mut used = [0_u64; 256];
+        for (_, socket) in self.sockets.iter() {
+            let port = match socket {
                 smoltcp::socket::Socket::Tcp(tcp) if tcp.is_open() => {
                     tcp.local_endpoint().map(|ep| ep.port)
                 }
                 smoltcp::socket::Socket::Udp(udp) if udp.is_open() => Some(udp.endpoint().port),
                 _ => None,
-            })
-            .collect();
-        select_ephemeral_port(&mut self.next_port, |candidate| used.contains(&candidate))
+            };
+            if let Some(offset) = port.and_then(|p| p.checked_sub(49152)) {
+                used[(offset >> 6) as usize] |= 1_u64 << (offset & 63);
+            }
+        }
+        select_ephemeral_port(&mut self.next_port, |candidate| {
+            let offset = candidate - 49152;
+            (used[(offset >> 6) as usize] & (1_u64 << (offset & 63))) != 0
+        })
     }
 }
 
@@ -202,34 +238,69 @@ pub(super) fn poll_turn_changes_readiness(ingress: PollIngressSingleResult, egre
 /// Owns one receive scratch frame so an empty poll costs no allocation.
 pub(super) struct BrokerDevice {
     pub(super) rx: [u8; NET_BROKER_PACKET_MTU],
+    pub(super) loopback_rx: VecDeque<Vec<u8>>,
     pub(super) errors: inet_datagram::ErrorIngress,
+}
+
+impl Default for BrokerDevice {
+    fn default() -> Self {
+        Self {
+            rx: [0; NET_BROKER_PACKET_MTU],
+            loopback_rx: VecDeque::new(),
+            errors: inet_datagram::ErrorIngress::default(),
+        }
+    }
 }
 
 pub(super) struct BrokerRxToken<'a> {
     frame: &'a [u8],
 }
 
-pub(super) struct BrokerTxToken;
+pub(super) struct BrokerTxToken<'a> {
+    loopback_rx: &'a mut VecDeque<Vec<u8>>,
+}
 
 impl Device for BrokerDevice {
     type RxToken<'a> = BrokerRxToken<'a>;
-    type TxToken<'a> = BrokerTxToken;
+    type TxToken<'a> = BrokerTxToken<'a>;
 
     fn receive(
         &mut self,
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if let Some(frame) = self.loopback_rx.pop_front() {
+            let len = frame.len().min(self.rx.len());
+            self.rx[..len].copy_from_slice(&frame[..len]);
+            self.errors.record(&self.rx[..len]);
+            return Some((
+                BrokerRxToken {
+                    frame: &self.rx[..len],
+                },
+                BrokerTxToken {
+                    loopback_rx: &mut self.loopback_rx,
+                },
+            ));
+        }
         match packet_rx(self.rx.as_mut_slice()) {
             Ok(len) if len > 0 && len <= self.rx.len() => {
                 self.errors.record(&self.rx[..len]);
-                Some((BrokerRxToken { frame: &self.rx[..len] }, BrokerTxToken))
-            },
+                Some((
+                    BrokerRxToken {
+                        frame: &self.rx[..len],
+                    },
+                    BrokerTxToken {
+                        loopback_rx: &mut self.loopback_rx,
+                    },
+                ))
+            }
             _ => None,
         }
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(BrokerTxToken)
+        Some(BrokerTxToken {
+            loopback_rx: &mut self.loopback_rx,
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -249,16 +320,204 @@ impl RxToken for BrokerRxToken<'_> {
     }
 }
 
-impl TxToken for BrokerTxToken {
+pub(super) fn seed_loopback_neighbors(device: &mut BrokerDevice) {
+    let push_arp = |queue: &mut VecDeque<Vec<u8>>, src_ip: Ipv4Address| {
+        let arp_repr = ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Reply,
+            source_hardware_addr: QEMU_USERNET_MAC,
+            source_protocol_addr: src_ip,
+            target_hardware_addr: QEMU_USERNET_MAC,
+            target_protocol_addr: QEMU_USERNET_ADDR,
+        };
+        let eth_repr = EthernetRepr {
+            src_addr: QEMU_USERNET_MAC,
+            dst_addr: QEMU_USERNET_MAC,
+            ethertype: EthernetProtocol::Arp,
+        };
+        let mut frame = vec![0_u8; eth_repr.buffer_len() + arp_repr.buffer_len()];
+        let mut eth_pkt = EthernetFrame::new_unchecked(&mut frame);
+        eth_repr.emit(&mut eth_pkt);
+        let mut arp_pkt = ArpPacket::new_unchecked(eth_pkt.payload_mut());
+        arp_repr.emit(&mut arp_pkt);
+        queue.push_back(frame);
+    };
+    let push_na = |queue: &mut VecDeque<Vec<u8>>, src_ip: Ipv6Address| {
+        let advert = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+            flags: NdiscNeighborFlags::OVERRIDE,
+            target_addr: src_ip,
+            lladdr: Some(RawHardwareAddress::from_bytes(&QEMU_USERNET_MAC.0)),
+        });
+        let ip_repr = Ipv6Repr {
+            src_addr: src_ip,
+            dst_addr: Ipv6Address::LOCALHOST,
+            next_header: IpProtocol::Icmpv6,
+            payload_len: advert.buffer_len(),
+            hop_limit: 255,
+        };
+        let eth_repr = EthernetRepr {
+            src_addr: QEMU_USERNET_MAC,
+            dst_addr: QEMU_USERNET_MAC,
+            ethertype: EthernetProtocol::Ipv6,
+        };
+        let mut frame =
+            vec![0_u8; eth_repr.buffer_len() + ip_repr.buffer_len() + advert.buffer_len()];
+        let mut eth_pkt = EthernetFrame::new_unchecked(&mut frame);
+        eth_repr.emit(&mut eth_pkt);
+        let mut ip_pkt = Ipv6Packet::new_unchecked(eth_pkt.payload_mut());
+        ip_repr.emit(&mut ip_pkt);
+        let mut icmp_pkt = Icmpv6Packet::new_unchecked(ip_pkt.payload_mut());
+        advert.emit(
+            &ip_repr.src_addr,
+            &ip_repr.dst_addr,
+            &mut icmp_pkt,
+            &ChecksumCapabilities::default(),
+        );
+        queue.push_back(frame);
+    };
+    push_arp(&mut device.loopback_rx, Ipv4Address::LOCALHOST);
+    push_arp(&mut device.loopback_rx, QEMU_USERNET_ADDR);
+    push_na(&mut device.loopback_rx, Ipv6Address::LOCALHOST);
+    push_na(&mut device.loopback_rx, LINK_LOCAL_IPV6);
+}
+
+fn maybe_reflect_loopback(frame: &[u8], loopback_rx: &mut VecDeque<Vec<u8>>) -> bool {
+    let Ok(eth) = EthernetFrame::new_checked(frame) else {
+        return false;
+    };
+    match eth.ethertype() {
+        EthernetProtocol::Arp => {
+            let Ok(arp) = ArpPacket::new_checked(eth.payload()) else {
+                return false;
+            };
+            let Ok(ArpRepr::EthernetIpv4 {
+                operation: ArpOperation::Request,
+                source_hardware_addr,
+                source_protocol_addr,
+                target_protocol_addr,
+                ..
+            }) = ArpRepr::parse(&arp) else {
+                return false;
+            };
+            if !is_local_ipv4(target_protocol_addr) {
+                return false;
+            }
+            let reply_repr = ArpRepr::EthernetIpv4 {
+                operation: ArpOperation::Reply,
+                source_hardware_addr: QEMU_USERNET_MAC,
+                source_protocol_addr: target_protocol_addr,
+                target_hardware_addr: source_hardware_addr,
+                target_protocol_addr: source_protocol_addr,
+            };
+            let eth_repr = EthernetRepr {
+                src_addr: QEMU_USERNET_MAC,
+                dst_addr: source_hardware_addr,
+                ethertype: EthernetProtocol::Arp,
+            };
+            let mut reply = vec![0_u8; eth_repr.buffer_len() + reply_repr.buffer_len()];
+            let mut eth_pkt = EthernetFrame::new_unchecked(&mut reply);
+            eth_repr.emit(&mut eth_pkt);
+            let mut arp_pkt = ArpPacket::new_unchecked(eth_pkt.payload_mut());
+            reply_repr.emit(&mut arp_pkt);
+            loopback_rx.push_back(reply);
+            true
+        }
+        EthernetProtocol::Ipv4 => {
+            let Ok(ip) = Ipv4Packet::new_checked(eth.payload()) else {
+                return false;
+            };
+            if is_local_ipv4(ip.dst_addr()) {
+                loopback_rx.push_back(frame.to_vec());
+                true
+            } else {
+                false
+            }
+        }
+        EthernetProtocol::Ipv6 => {
+            let Ok(ip) = Ipv6Packet::new_checked(eth.payload()) else {
+                return false;
+            };
+            if is_local_ipv6(ip.dst_addr()) {
+                loopback_rx.push_back(frame.to_vec());
+                return true;
+            }
+            if ip.next_header() == IpProtocol::Icmpv6 {
+                if let Ok(icmp) = Icmpv6Packet::new_checked(ip.payload()) {
+                    if let Ok(Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit { target_addr, .. })) =
+                        Icmpv6Repr::parse(
+                            &ip.src_addr(),
+                            &ip.dst_addr(),
+                            &icmp,
+                            &ChecksumCapabilities::ignored(),
+                        )
+                    {
+                        if is_local_ipv6(target_addr) {
+                            let advert = Icmpv6Repr::Ndisc(NdiscRepr::NeighborAdvert {
+                                flags: NdiscNeighborFlags::SOLICITED
+                                    | NdiscNeighborFlags::OVERRIDE,
+                                target_addr,
+                                lladdr: Some(RawHardwareAddress::from_bytes(&QEMU_USERNET_MAC.0)),
+                            });
+                            let dst_ip = if ip.src_addr().is_unspecified() {
+                                Ipv6Address::LOCALHOST
+                            } else {
+                                ip.src_addr()
+                            };
+                            let ip_repr = Ipv6Repr {
+                                src_addr: target_addr,
+                                dst_addr: dst_ip,
+                                next_header: IpProtocol::Icmpv6,
+                                payload_len: advert.buffer_len(),
+                                hop_limit: 255,
+                            };
+                            let eth_repr = EthernetRepr {
+                                src_addr: QEMU_USERNET_MAC,
+                                dst_addr: eth.src_addr(),
+                                ethertype: EthernetProtocol::Ipv6,
+                            };
+                            let total = eth_repr.buffer_len()
+                                + ip_repr.buffer_len()
+                                + advert.buffer_len();
+                            let mut reply = vec![0_u8; total];
+                            let mut eth_pkt = EthernetFrame::new_unchecked(&mut reply);
+                            eth_repr.emit(&mut eth_pkt);
+                            let mut ip_pkt = Ipv6Packet::new_unchecked(eth_pkt.payload_mut());
+                            ip_repr.emit(&mut ip_pkt);
+                            let mut icmp_pkt = Icmpv6Packet::new_unchecked(ip_pkt.payload_mut());
+                            advert.emit(
+                                &ip_repr.src_addr,
+                                &ip_repr.dst_addr,
+                                &mut icmp_pkt,
+                                &ChecksumCapabilities::default(),
+                            );
+                            loopback_rx.push_back(reply);
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+impl TxToken for BrokerTxToken<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut frame = [0_u8; NET_BROKER_PACKET_MTU];
-        let len = len.min(NET_BROKER_PACKET_MTU);
-        let result = f(&mut frame[..len]);
-        let _ = packet_tx(&frame[..len]);
-        result
+        TX_SCRATCH.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            let len = len.min(NET_BROKER_PACKET_MTU);
+            // smoltcp may leave padding/reserved bytes unwritten; never let a
+            // previous frame's bytes reach the wire.
+            buf[..len].fill(0);
+            let result = f(&mut buf[..len]);
+            if !maybe_reflect_loopback(&buf[..len], self.loopback_rx) {
+                let _ = packet_tx(&buf[..len]);
+            }
+            result
+        })
     }
 }
 

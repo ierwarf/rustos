@@ -28,6 +28,7 @@ pub(super) fn connected_socket(peer: u64) -> UnixSocket {
         refs: 1,
         options: SocketOptions::default(),
         bound_path: None,
+        bound_inode: None,
         local_path: None,
         peer_path: None,
         state: UnixSocketState::Connected(ConnectedState {

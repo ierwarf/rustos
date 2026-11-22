@@ -7,11 +7,15 @@ use smoltcp::wire::Icmpv4Packet;
 mod error_queue;
 pub(super) use error_queue::{ErrorIngress, ErrorState};
 
-pub(super) fn set_ip_option(request: &NetdIpcRequest) -> i32 {
-    error_queue::set_option(request)
+pub(super) fn set_ip_option_in_state(state: &mut NetState, request: &NetdIpcRequest) -> i32 {
+    error_queue::set_option_in_state(state, request)
 }
-pub(super) fn get_ip_option(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    error_queue::get_option(request, response)
+pub(super) fn get_ip_option_in_state(
+    state: &NetState,
+    request: &NetdIpcRequest,
+    response: &mut NetdIpcResponse,
+) -> i32 {
+    error_queue::get_option_in_state(state, request, response)
 }
 pub(super) fn take_socket_error(state: &mut NetState, token: u64) -> i32 {
     if let Err(e) = stage_one(state, token) {
@@ -26,8 +30,9 @@ pub(super) fn take_socket_error(state: &mut NetState, token: u64) -> i32 {
 
 const PACKET_SLOTS: usize = 16;
 const PACKET_BYTES: usize = 16 * 1024;
-// No IPv4 fragmentation is advertised by this stack.
-const MAX_UDP_PAYLOAD: usize = NET_BROKER_PACKET_MTU - 14 - 20 - 8;
+// No IP fragmentation is advertised by this stack.
+const MAX_UDP_PAYLOAD_IPV4: usize = NET_BROKER_PACKET_MTU - 14 - 20 - 8;
+const MAX_UDP_PAYLOAD_IPV6: usize = NET_BROKER_PACKET_MTU - 14 - 40 - 8;
 const MAX_ICMP_PAYLOAD: usize = NET_BROKER_PACKET_MTU - 14 - 20;
 
 pub(super) fn add_socket(stack: &mut InetStack, type_: u64, protocol: u64) -> InetTransport {
@@ -59,6 +64,9 @@ pub(super) fn add_socket(stack: &mut InetStack, type_: u64, protocol: u64) -> In
 
 /// Pure classifier: reads under the raw mutex so the guard's drop does not run
 /// a readiness sweep for a lookup that mutated nothing (see `inet_socket_exists`).
+// TEST-HARNESS: compiled only for unit tests; not every helper has a caller there.
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn is_datagram(token: u64) -> bool {
     match net_state().lock() {
         Ok(state) => state
@@ -74,7 +82,7 @@ pub(super) fn is_datagram(token: u64) -> bool {
 
 pub(super) struct ReceivedPacket {
     source: IpEndpoint,
-    bytes: Vec<u8>,
+    pub(super) bytes: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -88,13 +96,22 @@ impl ReceivedPacket {
 }
 
 fn eligible(socket: &InetSocket, source: IpEndpoint, bytes: &[u8]) -> bool {
+    if socket.domain == linux_abi::AF_INET && !matches!(source.addr, IpAddress::Ipv4(_)) {
+        return false;
+    }
+    if socket.domain == linux_abi::AF_INET6
+        && socket.options.ipv6_only
+        && !matches!(source.addr, IpAddress::Ipv6(_))
+    {
+        return false;
+    }
     match socket.transport {
         InetTransport::Udp(_) => socket.peer.is_none_or(|peer| peer == source),
         InetTransport::Icmp(_) => {
             socket.peer.is_none_or(|peer| peer.addr == source.addr)
                 && bytes.len() >= 8
-                && bytes[0] == 0
-                && bytes[1] == 0
+                && ((matches!(source.addr, IpAddress::Ipv4(_)) && bytes[0] == 0 && bytes[1] == 0)
+                    || (matches!(source.addr, IpAddress::Ipv6(_)) && bytes[0] == 129 && bytes[1] == 0))
         }
         InetTransport::Tcp(_) => false,
     }
@@ -141,7 +158,7 @@ pub(super) fn stage_errors(stack: &mut InetStack, sockets: &mut SocketTable<Inet
     error_queue::stage_all(stack, sockets);
 }
 
-fn stage_one(state: &mut NetState, token: u64) -> Result<(), i32> {
+pub(super) fn stage_one(state: &mut NetState, token: u64) -> Result<(), i32> {
     let stack = state.inet.as_mut().ok_or(libc::ENODEV)?;
     error_queue::stage_all(stack, &mut state.inet_sockets);
     let socket = state.inet_sockets.get_mut(&token).ok_or(libc::EBADF)?;
@@ -197,7 +214,47 @@ pub(super) fn revents(state: &mut NetState, token: u64, requested: u32) -> Resul
     Ok(events)
 }
 
-fn decode_address(bytes: &[u8]) -> Result<IpEndpoint, i32> {
+#[derive(Clone, Copy)]
+pub(super) struct EncodedSockaddr {
+    pub(super) bytes: [u8; netd_message::IPV6_ADDRESS_SIZE],
+    pub(super) len: usize,
+}
+
+impl EncodedSockaddr {
+    pub(super) fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+fn is_ipv4_mapped_v6(octets: &[u8]) -> Option<Ipv4Address> {
+    if octets.len() == 16 && octets[..10] == [0; 10] && octets[10] == 0xff && octets[11] == 0xff {
+        Some(Ipv4Address::new(octets[12], octets[13], octets[14], octets[15]))
+    } else {
+        None
+    }
+}
+
+pub(super) fn decode_inet_endpoint(
+    bytes: &[u8],
+    domain: u64,
+    ipv6_only: bool,
+) -> Result<IpEndpoint, i32> {
+    if domain == linux_abi::AF_INET6 {
+        if bytes.len() != netd_message::IPV6_ADDRESS_SIZE {
+            return Err(libc::EINVAL);
+        }
+        if u16::from_ne_bytes([bytes[0], bytes[1]]) != linux_abi::AF_INET6 as u16 {
+            return Err(libc::EAFNOSUPPORT);
+        }
+        let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+        let v6_octets: [u8; 16] = bytes[8..24].try_into().map_err(|_| libc::EINVAL)?;
+        let addr = if let Some(v4) = is_ipv4_mapped_v6(&v6_octets).filter(|_| !ipv6_only) {
+            IpAddress::Ipv4(v4)
+        } else {
+            IpAddress::Ipv6(Ipv6Address::from_octets(v6_octets))
+        };
+        return Ok(IpEndpoint::new(addr, port));
+    }
     if bytes.len() != netd_message::IPV4_ADDRESS_SIZE {
         return Err(libc::EINVAL);
     }
@@ -210,13 +267,105 @@ fn decode_address(bytes: &[u8]) -> Result<IpEndpoint, i32> {
     ))
 }
 
-fn encode_address(endpoint: IpEndpoint) -> [u8; 16] {
-    let mut bytes = [0; 16];
-    bytes[..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
-    bytes[2..4].copy_from_slice(&endpoint.port.to_be_bytes());
-    let IpAddress::Ipv4(address) = endpoint.addr;
-    bytes[4..8].copy_from_slice(&address.octets());
+pub(super) fn encode_inet_endpoint(endpoint: IpEndpoint, domain: u64) -> EncodedSockaddr {
+    let mut bytes = [0_u8; netd_message::IPV6_ADDRESS_SIZE];
+    if domain == linux_abi::AF_INET6 {
+        bytes[..2].copy_from_slice(&(linux_abi::AF_INET6 as u16).to_ne_bytes());
+        bytes[2..4].copy_from_slice(&endpoint.port.to_be_bytes());
+        match endpoint.addr {
+            IpAddress::Ipv6(v6) => bytes[8..24].copy_from_slice(&v6.octets()),
+            IpAddress::Ipv4(v4) => {
+                bytes[18] = 0xff;
+                bytes[19] = 0xff;
+                bytes[20..24].copy_from_slice(&v4.octets());
+            }
+        }
+        EncodedSockaddr {
+            bytes,
+            len: netd_message::IPV6_ADDRESS_SIZE,
+        }
+    } else {
+        bytes[..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+        bytes[2..4].copy_from_slice(&endpoint.port.to_be_bytes());
+        if let IpAddress::Ipv4(address) = endpoint.addr {
+            bytes[4..8].copy_from_slice(&address.octets());
+        }
+        EncodedSockaddr {
+            bytes,
+            len: netd_message::IPV4_ADDRESS_SIZE,
+        }
+    }
+}
+
+pub(super) fn encode_ipv4_address(endpoint: IpEndpoint) -> [u8; 16] {
+    let encoded = encode_inet_endpoint(endpoint, linux_abi::AF_INET);
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(encoded.as_slice());
     bytes
+}
+
+#[cfg(test)]
+fn decode_address(bytes: &[u8]) -> Result<IpEndpoint, i32> {
+    decode_inet_endpoint(bytes, linux_abi::AF_INET, false)
+}
+
+#[cfg(test)]
+fn encode_address(endpoint: IpEndpoint) -> [u8; 16] {
+    encode_ipv4_address(endpoint)
+}
+
+pub(super) fn local_bind_address_valid(addr: IpAddress, domain: u64, ipv6_only: bool) -> bool {
+    match addr {
+        IpAddress::Ipv4(v4) => {
+            if domain == linux_abi::AF_INET6 && ipv6_only {
+                return false;
+            }
+            v4.is_unspecified() || v4 == QEMU_USERNET_ADDR || v4 == Ipv4Address::LOCALHOST
+        }
+        IpAddress::Ipv6(v6) => {
+            if domain != linux_abi::AF_INET6 {
+                return false;
+            }
+            v6.is_unspecified() || v6.is_loopback() || v6 == LINK_LOCAL_IPV6
+        }
+    }
+}
+
+pub(super) fn inet_bind_endpoints_conflict(
+    a_domain: u64,
+    a_v6only: bool,
+    a_reuse_addr: bool,
+    a_reuse_port: bool,
+    a_ep: IpEndpoint,
+    b_domain: u64,
+    b_v6only: bool,
+    b_reuse_addr: bool,
+    b_reuse_port: bool,
+    b_listening: bool,
+    b_ep: IpEndpoint,
+) -> bool {
+    if a_ep.port != b_ep.port {
+        return false;
+    }
+    if (a_domain == linux_abi::AF_INET && b_domain == linux_abi::AF_INET6 && b_v6only)
+        || (b_domain == linux_abi::AF_INET && a_domain == linux_abi::AF_INET6 && a_v6only)
+    {
+        return false;
+    }
+    let addr_overlap = a_ep.addr.is_unspecified() || b_ep.addr.is_unspecified() || a_ep.addr == b_ep.addr;
+    if !addr_overlap {
+        return false;
+    }
+    if a_reuse_port && b_reuse_port {
+        return false;
+    }
+    // Linux (`inet_csk_bind_conflict`): SO_REUSEADDR on both sockets lets them
+    // share an address unless the existing one is a listener. This is what
+    // lets a restarted server rebind while accepted connections linger.
+    if a_reuse_addr && b_reuse_addr && !b_listening {
+        return false;
+    }
+    true
 }
 
 fn bind_in_state(state: &mut NetState, token: u64, mut local: IpEndpoint) -> Result<(), i32> {
@@ -227,33 +376,56 @@ fn bind_in_state(state: &mut NetState, token: u64, mut local: IpEndpoint) -> Res
     if socket.local.is_some() {
         return Err(libc::EINVAL);
     }
-    if !local.addr.is_unspecified() && local.addr != IpAddress::Ipv4(QEMU_USERNET_ADDR) {
+    let domain = socket.domain;
+    let opts = socket.options;
+    if !local_bind_address_valid(local.addr, domain, opts.ipv6_only) {
         return Err(libc::EADDRNOTAVAIL);
     }
     let transport = socket.transport;
-    let stack = state.inet.as_mut().ok_or(libc::ENODEV)?;
+    if !state.inet_sockets.contains_key(&token) || state.inet.is_none() {
+        return Err(if state.inet.is_none() { libc::ENODEV } else { libc::EBADF });
+    }
     let protocol = transport.protocol();
     let occupied_by_other = |candidate: u16, state: &NetState| {
+        let cand_ep = IpEndpoint::new(local.addr, candidate);
         state.inet_sockets.iter().any(|(other, s)| {
             *other != token
                 && s.transport.protocol() == protocol
-                && s.local.is_some_and(|ep| ep.port == candidate)
+                && s.local.is_some_and(|ep| {
+                    inet_bind_endpoints_conflict(
+                        domain,
+                        opts.ipv6_only,
+                        opts.reuse_addr,
+                        opts.reuse_port,
+                        cand_ep,
+                        s.domain,
+                        s.options.ipv6_only,
+                        s.options.reuse_addr,
+                        s.options.reuse_port,
+                        s.tcp_listener.is_some(),
+                        ep,
+                    )
+                })
         })
     };
     if local.port == 0 {
-        // TCP/UDP ports and ICMP identifiers have separate namespaces. Avoid
-        // duplicate ping identifiers as well as UDP endpoints before binding.
-        // One table pass collects the busy ports; probing candidates against
-        // the set keeps a crowded range linear in sockets.
-        let used: std::collections::HashSet<u16> = state
-            .inet_sockets
-            .iter()
-            .filter(|(other, s)| **other != token && s.transport.protocol() == protocol)
-            .filter_map(|(_, s)| s.local.map(|ep| ep.port))
-            .collect();
-        let mut next = stack.next_port;
-        local.port = select_ephemeral_port(&mut next, |port| used.contains(&port))
-            .ok_or(libc::EADDRINUSE)?;
+        let mut used = [0_u64; 256];
+        for (other, s) in state.inet_sockets.iter() {
+            if *other != token && s.transport.protocol() == protocol {
+                if let Some(ep) = s.local {
+                    if let Some(offset) = ep.port.checked_sub(49152) {
+                        used[(offset >> 6) as usize] |= 1_u64 << (offset & 63);
+                    }
+                }
+            }
+        }
+        let mut next = state.inet.as_ref().ok_or(libc::ENODEV)?.next_port;
+        local.port = select_ephemeral_port(&mut next, |port| {
+            let offset = port - 49152;
+            (used[(offset >> 6) as usize] & (1_u64 << (offset & 63))) != 0
+                && occupied_by_other(port, state)
+        })
+        .ok_or(libc::EADDRINUSE)?;
         state.inet.as_mut().ok_or(libc::ENODEV)?.next_port = next;
     } else if occupied_by_other(local.port, state) {
         return Err(libc::EADDRINUSE);
@@ -290,18 +462,14 @@ fn bind_in_state(state: &mut NetState, token: u64, mut local: IpEndpoint) -> Res
 }
 
 fn autobind(state: &mut NetState, token: u64) -> Result<(), i32> {
-    if state
-        .inet_sockets
-        .get(&token)
-        .ok_or(libc::EBADF)?
-        .local
-        .is_none()
-    {
-        bind_in_state(
-            state,
-            token,
-            IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), 0),
-        )?;
+    let socket = state.inet_sockets.get(&token).ok_or(libc::EBADF)?;
+    if socket.local.is_none() {
+        let addr = if socket.domain == linux_abi::AF_INET6 {
+            IpAddress::Ipv6(Ipv6Address::UNSPECIFIED)
+        } else {
+            IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)
+        };
+        bind_in_state(state, token, IpEndpoint::new(addr, 0))?;
     }
     Ok(())
 }
@@ -314,16 +482,30 @@ fn admit_unprivileged_udp_bind(port: u16) -> Result<(), i32> {
     }
 }
 
+// TEST-HARNESS: compiled only for unit tests; not every helper has a caller there.
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn bind(request: &NetdIpcRequest) -> i32 {
-    let local = match decode_address(&request.payload[..request.payload_len as usize]) {
-        Ok(ep) => ep,
-        Err(e) => return e,
-    };
     let mut state = lock_net_state();
+    bind_request_in_state(&mut state, request)
+}
+
+pub(super) fn bind_request_in_state(state: &mut NetState, request: &NetdIpcRequest) -> i32 {
     let Some(socket) = state.inet_sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
-    if matches!(socket.transport, InetTransport::Udp(_)) {
+    let domain = socket.domain;
+    let ipv6_only = socket.options.ipv6_only;
+    let is_udp = matches!(socket.transport, InetTransport::Udp(_));
+    let local = match decode_inet_endpoint(
+        &request.payload[..request.payload_len as usize],
+        domain,
+        ipv6_only,
+    ) {
+        Ok(ep) => ep,
+        Err(e) => return e,
+    };
+    if is_udp {
         // Linux-visible credentials belong to syscalld, not these bootstrap
         // kernel UID stamps. Until a binding capability is supplied, never
         // infer privileged-port authority from request.euid == 0.
@@ -331,21 +513,28 @@ pub(super) fn bind(request: &NetdIpcRequest) -> i32 {
             return errno;
         }
     }
-    bind_in_state(&mut state, request.socket_token, local)
+    bind_in_state(state, request.socket_token, local)
         .err()
         .unwrap_or(0)
 }
 
 fn unicast_destination(addr: IpAddress) -> bool {
-    let IpAddress::Ipv4(addr) = addr;
-    let bytes = addr.octets();
-    let local = QEMU_USERNET_ADDR.octets();
-    !addr.is_unspecified()
-        && !addr.is_multicast()
-        && !addr.is_broadcast()
-        && !(bytes[..3] == local[..3] && bytes[3] == 255)
+    match addr {
+        IpAddress::Ipv4(addr) => {
+            let bytes = addr.octets();
+            let local = QEMU_USERNET_ADDR.octets();
+            !addr.is_unspecified()
+                && !addr.is_multicast()
+                && !addr.is_broadcast()
+                && !(bytes[..3] == local[..3] && bytes[3] == 255)
+        }
+        IpAddress::Ipv6(addr) => !addr.is_unspecified() && !addr.is_multicast(),
+    }
 }
 
+// TEST-HARNESS: compiled only for unit tests; not every helper has a caller there.
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn connect(request: &NetdIpcRequest) -> i32 {
     let mut state = lock_net_state();
     connect_in_state(&mut state, request)
@@ -359,21 +548,34 @@ pub(super) fn connect_in_state(state: &mut NetState, request: &NetdIpcRequest) -
         socket.peer = None;
         return 0;
     }
-    let mut peer = match decode_address(&request.payload[..request.payload_len as usize]) {
-        Ok(ep) => ep,
-        Err(e) => return e,
-    };
     let Some(socket) = state.inet_sockets.get(&request.socket_token) else {
         return libc::EBADF;
+    };
+    let mut peer = match decode_inet_endpoint(
+        &request.payload[..request.payload_len as usize],
+        socket.domain,
+        socket.options.ipv6_only,
+    ) {
+        Ok(ep) => ep,
+        Err(e) => return e,
     };
     // glibc's address ordering uses UDP connect(port=0) to discover its source
     // address. Linux admits that route probe without a usable peer port.
     if matches!(socket.transport, InetTransport::Icmp(_)) {
         peer.port = 0;
     }
-    // Linux routes a connect to INADDR_ANY (0.0.0.0) to the loopback address.
-    if peer.addr == IpAddress::Ipv4(Ipv4Address::UNSPECIFIED) {
-        peer.addr = IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1));
+    // Linux routes a connect to INADDR_ANY / in6addr_any to loopback.
+    match peer.addr {
+        IpAddress::Ipv4(v4) if v4.is_unspecified() => {
+            peer.addr = IpAddress::Ipv4(Ipv4Address::LOCALHOST);
+        }
+        IpAddress::Ipv6(v6) if v6.is_unspecified() => {
+            peer.addr = IpAddress::Ipv6(Ipv6Address::LOCALHOST);
+        }
+        IpAddress::Ipv6(v6) if socket.options.ipv6_only && is_ipv4_mapped_v6(&v6.octets()).is_some() => {
+            return libc::ENETUNREACH;
+        }
+        _ => {}
     }
     if !unicast_destination(peer.addr) {
         return libc::EOPNOTSUPP;
@@ -389,26 +591,45 @@ pub(super) fn connect_in_state(state: &mut NetState, request: &NetdIpcRequest) -
     0
 }
 
+// TEST-HARNESS: compiled only for unit tests; not every helper has a caller there.
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn socket_name(
     request: &NetdIpcRequest,
     response: &mut NetdIpcResponse,
     peer: bool,
 ) -> i32 {
     let state = lock_net_state();
+    socket_name_in_state(&state, request, response, peer)
+}
+
+pub(super) fn socket_name_in_state(
+    state: &NetState,
+    request: &NetdIpcRequest,
+    response: &mut NetdIpcResponse,
+    peer: bool,
+) -> i32 {
     let Some(socket) = state.inet_sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
+    let domain = socket.domain;
     let endpoint = match socket.transport {
         InetTransport::Tcp(h) => {
             let Some(stack) = state.inet.as_ref() else {
                 return libc::ENODEV;
             };
             let tcp = stack.sockets.get::<tcp::Socket>(h);
-            if peer {
+            let raw = if peer {
                 tcp.remote_endpoint()
             } else {
-                tcp.local_endpoint()
-            }
+                tcp.local_endpoint().or(socket.local)
+            };
+            raw.map(|mut ep| {
+                if !peer && ep.addr.is_unspecified() && domain == linux_abi::AF_INET6 {
+                    ep.addr = IpAddress::Ipv6(Ipv6Address::UNSPECIFIED);
+                }
+                ep
+            })
         }
         _ => {
             if peer {
@@ -417,8 +638,21 @@ pub(super) fn socket_name(
                     .filter(|ep| !matches!(socket.transport, InetTransport::Udp(_)) || ep.port != 0)
             } else {
                 socket.local.map(|mut ep| {
-                    if ep.addr.is_unspecified() && socket.peer.is_some() {
-                        ep.addr = IpAddress::Ipv4(QEMU_USERNET_ADDR);
+                    if ep.addr.is_unspecified() {
+                        if let Some(p) = socket.peer {
+                            ep.addr = match p.addr {
+                                IpAddress::Ipv4(v4) if v4.octets()[0] == 127 => {
+                                    IpAddress::Ipv4(Ipv4Address::LOCALHOST)
+                                }
+                                IpAddress::Ipv4(_) => IpAddress::Ipv4(QEMU_USERNET_ADDR),
+                                IpAddress::Ipv6(v6) if v6.is_loopback() => {
+                                    IpAddress::Ipv6(Ipv6Address::LOCALHOST)
+                                }
+                                IpAddress::Ipv6(_) => IpAddress::Ipv6(LINK_LOCAL_IPV6),
+                            };
+                        } else if domain == linux_abi::AF_INET6 {
+                            ep.addr = IpAddress::Ipv6(Ipv6Address::UNSPECIFIED);
+                        }
                     }
                     ep
                 })
@@ -427,11 +661,19 @@ pub(super) fn socket_name(
     };
     let endpoint = match endpoint {
         Some(ep) => ep,
-        None if !peer => IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::UNSPECIFIED), 0),
+        None if !peer => IpEndpoint::new(
+            if domain == linux_abi::AF_INET6 {
+                IpAddress::Ipv6(Ipv6Address::UNSPECIFIED)
+            } else {
+                IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)
+            },
+            0,
+        ),
         None => return libc::ENOTCONN,
     };
-    let bytes = encode_address(endpoint);
-    response.payload[..bytes.len()].copy_from_slice(&bytes);
+    let encoded = encode_inet_endpoint(endpoint, domain);
+    let bytes = encoded.as_slice();
+    response.payload[..bytes.len()].copy_from_slice(bytes);
     response.payload_len = bytes.len() as u32;
     0
 }
@@ -467,7 +709,7 @@ pub(super) fn send_in_state(
     response: &mut NetdIpcResponse,
 ) -> i32 {
     let flags = request_msg_flags(request);
-    if flags & !((libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u64) != 0 {
+    if flags & !((libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL | libc::MSG_MORE) as u64) != 0 {
         return libc::EOPNOTSUPP;
     }
     let Some(message) = netd_message::decode(&request.payload[..request.payload_len as usize])
@@ -481,22 +723,35 @@ pub(super) fn send_in_state(
         return libc::EBADF;
     };
     let transport = socket.transport;
+    let domain = socket.domain;
+    let ipv6_only = socket.options.ipv6_only;
     let destination = if message.address.is_empty() {
         match socket.peer {
             Some(ep) => ep,
             None => return libc::EDESTADDRREQ,
         }
     } else {
-        match decode_address(message.address) {
+        match decode_inet_endpoint(message.address, domain, ipv6_only) {
             Ok(ep) => ep,
             Err(e) => return e,
         }
     };
+    if domain == linux_abi::AF_INET6
+        && ipv6_only
+        && !matches!(destination.addr, IpAddress::Ipv6(_))
+    {
+        return libc::ENETUNREACH;
+    }
     if !unicast_destination(destination.addr) {
         return libc::EOPNOTSUPP;
     }
+    let max_udp = if matches!(destination.addr, IpAddress::Ipv6(_)) {
+        MAX_UDP_PAYLOAD_IPV6
+    } else {
+        MAX_UDP_PAYLOAD_IPV4
+    };
     if matches!(transport, InetTransport::Udp(_))
-        && (destination.port == 0 || message.data.len() > MAX_UDP_PAYLOAD)
+        && (destination.port == 0 || message.data.len() > max_udp)
     {
         return if destination.port == 0 {
             libc::EINVAL
@@ -561,19 +816,20 @@ fn encode_received(
     response: &mut NetdIpcResponse,
     data: &[u8],
     source: IpEndpoint,
+    domain: u64,
     limit: usize,
     flags: u64,
 ) -> i32 {
     let copied = data.len().min(limit);
     let truncated = copied != data.len();
-    let address = encode_address(source);
+    let address = encode_inet_endpoint(source, domain);
     let output_flags = if truncated { libc::MSG_TRUNC as u32 } else { 0 };
     let Some(len) = netd_message::encode(
         &mut response.payload,
         &data[..copied],
         &[],
         output_flags,
-        &address,
+        address.as_slice(),
     ) else {
         return libc::EMSGSIZE;
     };
@@ -607,9 +863,17 @@ pub(super) fn recv_in_state(
     } else {
         request.arg2.min(usize::MAX as u64) as usize
     };
-    let limit = requested.min(
-        NETD_IPC_PAYLOAD_CAPACITY - netd_message::HEADER_SIZE - netd_message::IPV4_ADDRESS_SIZE,
-    );
+    let domain = state
+        .inet_sockets
+        .get(&request.socket_token)
+        .map(|s| s.domain)
+        .unwrap_or(linux_abi::AF_INET);
+    let addr_reserve = if domain == linux_abi::AF_INET6 {
+        netd_message::IPV6_ADDRESS_SIZE
+    } else {
+        netd_message::IPV4_ADDRESS_SIZE
+    };
+    let limit = requested.min(NETD_IPC_PAYLOAD_CAPACITY - netd_message::HEADER_SIZE - addr_reserve);
     let NetState {
         inet, inet_sockets, ..
     } = state;
@@ -662,7 +926,7 @@ fn recv_direct(
             InetTransport::Tcp(_) => return libc::EOPNOTSUPP,
         };
         if eligible(socket, source, bytes) {
-            return encode_received(response, bytes, source, limit, flags);
+            return encode_received(response, bytes, source, socket.domain, limit, flags);
         }
     }
     libc::EAGAIN
@@ -677,7 +941,7 @@ fn receive_staged(
     let Some(packet) = socket.received.as_ref() else {
         return libc::EAGAIN;
     };
-    let result = encode_received(response, &packet.bytes, packet.source, limit, flags);
+    let result = encode_received(response, &packet.bytes, packet.source, socket.domain, limit, flags);
     if result == 0 && flags & libc::MSG_PEEK as u64 == 0 {
         socket.received = None;
     }
@@ -701,9 +965,11 @@ mod tests {
         };
         let source = IpEndpoint::new(IpAddress::Ipv4(QEMU_USERNET_GATEWAY), 53);
         InetSocket {
+            domain: linux_abi::AF_INET,
             refs: 1,
             options: SocketOptions::default(),
             transport,
+            tcp_listener: None,
             local: None,
             peer: Some(source),
             received: Some(ReceivedPacket {
@@ -712,6 +978,8 @@ mod tests {
             }),
             errors: None,
             connect_deadline: None,
+            connect_started: None,
+            connect_budget: None,
         }
     }
 
@@ -790,7 +1058,7 @@ mod tests {
         for flags in [0, libc::MSG_TRUNC as u64] {
             let mut response = NetdIpcResponse::default();
             assert_eq!(
-                encode_received(&mut response, b"hello", source, 2, flags),
+                encode_received(&mut response, b"hello", source, linux_abi::AF_INET, 2, flags),
                 0
             );
             let message =
@@ -800,7 +1068,7 @@ mod tests {
             assert_eq!(response.value, if flags == 0 { 2 } else { 5 });
         }
         let mut response = NetdIpcResponse::default();
-        assert_eq!(encode_received(&mut response, b"", source, 0, 0), 0);
+        assert_eq!(encode_received(&mut response, b"", source, linux_abi::AF_INET, 0, 0), 0);
         assert_eq!(response.value, 0);
         assert_eq!(
             response.payload_len as usize,
@@ -824,10 +1092,7 @@ mod connect_tests {
     }
 
     fn state_with_udp() -> NetState {
-        let mut device = BrokerDevice {
-            rx: [0; NET_BROKER_PACKET_MTU],
-            errors: ErrorIngress::default(),
-        };
+        let mut device = BrokerDevice::default();
         let config = SmolConfig::new(HardwareAddress::Ethernet(QEMU_USERNET_MAC));
         let iface = Interface::new(config, &mut device, SmolInstant::from_millis(0));
         let mut stack = InetStack {
@@ -844,14 +1109,18 @@ mod connect_tests {
         state.inet_sockets.insert(
             7,
             InetSocket {
+                domain: linux_abi::AF_INET,
                 refs: 1,
                 options: SocketOptions::default(),
                 transport,
+                tcp_listener: None,
                 local: None,
                 peer: None,
                 received: None,
                 errors: None,
                 connect_deadline: None,
+                connect_started: None,
+                connect_budget: None,
             },
         );
         state.inet = Some(stack);

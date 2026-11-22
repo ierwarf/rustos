@@ -102,6 +102,37 @@ fn spawn_guests(
     Ok((rustos, dvm))
 }
 
+/// RustOS guest RAM. The default is the documented 2 GiB profile; a larger
+/// `KVM_RUSTOS_MEMORY_MIB` (>= 2048) is for measuring workloads, such as Chrome,
+/// that exhaust it. `maxmem` stays 1 GiB above the initial size.
+fn rustos_guest_memory_mib() -> Result<u64> {
+    match std::env::var("KVM_RUSTOS_MEMORY_MIB") {
+        Err(_) => Ok(DEFAULT_GUEST_MIB),
+        Ok(text) => text
+            .parse::<u64>()
+            .ok()
+            .filter(|mib| (DEFAULT_GUEST_MIB..=32 * 1024).contains(mib))
+            .with_context(|| {
+                format!("KVM_RUSTOS_MEMORY_MIB={text:?} must be an integer in 2048..=32768")
+            }),
+    }
+}
+
+const DEFAULT_GUEST_MIB: u64 = 2048;
+
+/// Guest-physical address where QEMU's q35 machine places the virtio-pmem
+/// windows for a guest with `ram_mib` of RAM: RAM above 2 GiB moves above 4 GiB
+/// once the guest is 2816 MiB or larger, and the device-memory region follows
+/// the end of RAM (`driver_domain_protocol::dvm_pmem_base`, the same rule the
+/// RustOS kernel applies to its own RAM top).
+fn dvm_pmem_base_for(ram_mib: u64) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    let ram = ram_mib * MIB;
+    let ram_top = if ram >= 0xb000_0000 { 4 * GIB + (ram - 2 * GIB) } else { ram };
+    driver_domain_protocol::dvm_pmem_base(ram_top).expect("RAM size is range-checked")
+}
+
 fn spawn_rustos_guest(
     qemu: &Path,
     config: &Config,
@@ -131,6 +162,7 @@ fn spawn_rustos_guest(
             )
         })?;
     }
+    let rustos_ram_mib = rustos_guest_memory_mib()?;
     let mut rustos_command = Command::new(qemu);
     rustos_command
         .arg("-name")
@@ -141,9 +173,9 @@ fn spawn_rustos_guest(
             "-cpu",
             RUSTOS_DVM_KVM_CPU,
             "-m",
-            "2048M,maxmem=3G,slots=2",
-            "-smp",
         ])
+        .arg(format!("{rustos_ram_mib}M,maxmem={}M,slots=2", rustos_ram_mib + 1024))
+        .arg("-smp")
         // The readiness contract above refuses a requested topology until all
         // AP scheduler, syscall, lifetime, IPI, TLB, futex, and timer
         // prerequisites are explicit. Runtime qualification remains separate.
@@ -215,11 +247,13 @@ fn spawn_rustos_guest(
                 .as_deref()
                 .context("GUI-DVM control exists without a pixel backend")?,
             false,
+            rustos_ram_mib,
         );
         append_dvm_app_buffer_aperture(
             &mut rustos_command,
             layout.gui_dvm_app_buffers.as_deref().context("GUI-DVM app-buffer backend missing")?,
             true,
+            rustos_ram_mib,
         );
     } else {
         rustos_command.arg("-device").arg(format!(
@@ -269,6 +303,14 @@ fn spawn_dvm_guest(
             layout.display_geometry.width, layout.display_geometry.height
         )
     };
+    if layout.dvm_monitor.exists() {
+        fs::remove_file(&layout.dvm_monitor).with_context(|| {
+            format!(
+                "remove stale DVM QEMU monitor socket {}",
+                layout.dvm_monitor.display()
+            )
+        })?;
+    }
     let dvm_display = qemu_display_backend(guest_display, host_render_node, options.fit_host_window)?;
     if guest_display == GuestDisplay::DvmGtk {
         let render_node =
@@ -313,6 +355,8 @@ fn spawn_dvm_guest(
             if append_logs { "on" } else { "off" },
         ))
         .args(["-serial", "chardev:serial"])
+        .arg("-monitor")
+        .arg(format!("unix:{},server,nowait", layout.dvm_monitor.display()))
         .arg("-device")
         .arg(format!("vhost-vsock-pci,guest-cid={}", layout.guest_cid))
         .arg("-fw_cfg")
@@ -361,11 +405,13 @@ fn spawn_dvm_guest(
                 .as_deref()
                 .context("GUI-DVM control exists without a pixel backend")?,
             true,
+            DEFAULT_GUEST_MIB,
         );
         append_dvm_app_buffer_aperture(
             &mut dvm_command,
             layout.gui_dvm_app_buffers.as_deref().context("GUI-DVM app-buffer backend missing")?,
             false,
+            DEFAULT_GUEST_MIB,
         );
     }
     if let Some(shared_network) = layout.dvm_network_shmem.as_deref() {
@@ -451,7 +497,7 @@ fn append_dvm_virtual_storage(command: &mut Command, disk: &Path) {
         .arg(dvm_storage_device_arg());
 }
 
-fn append_dvm_display_pixels(command: &mut Command, path: &Path, read_only: bool) {
+fn append_dvm_display_pixels(command: &mut Command, path: &Path, read_only: bool, guest_mib: u64) {
     let mut backend = format!(
         "memory-backend-file,id=dvm-display-pixels,mem-path={},size={},share=on",
         path.display(),
@@ -470,7 +516,8 @@ fn append_dvm_display_pixels(command: &mut Command, path: &Path, read_only: bool
         .arg(backend)
         .arg("-device")
         .arg(format!(
-            "virtio-pmem-pci,id=dvm-display-pmem,memdev=dvm-display-pixels,memaddr={DVM_DISPLAY_PIXEL_PHYS_ADDR}"
+            "virtio-pmem-pci,id=dvm-display-pmem,memdev=dvm-display-pixels,memaddr={}",
+            dvm_pmem_base_for(guest_mib)
         ));
 }
 
@@ -486,14 +533,16 @@ fn append_dvm_writable_virtual_storage(command: &mut Command, disk: &Path) {
 }
 
 /// Both guests need write access; only the first QEMU preallocates the backing.
-fn append_dvm_app_buffer_aperture(command: &mut Command, path: &Path, prealloc: bool) {
+fn append_dvm_app_buffer_aperture(command: &mut Command, path: &Path, prealloc: bool, guest_mib: u64) {
     let mut backend = format!(
         "memory-backend-file,id=dvm-app-buffers,mem-path={},size={},share=on",
         path.display(), DVM_APP_BUFFER_REGION_BYTES
     );
     if prealloc { backend.push_str(",prealloc=on"); }
     command.arg("-object").arg(backend).arg("-device").arg(format!(
-        "virtio-pmem-pci,id=dvm-app-buffer-pmem,memdev=dvm-app-buffers,memaddr={DVM_APP_BUFFER_PHYS_ADDR}"
+        "virtio-pmem-pci,id=dvm-app-buffer-pmem,memdev=dvm-app-buffers,memaddr={}",
+        driver_domain_protocol::dvm_app_buffer_phys_addr(dvm_pmem_base_for(guest_mib))
+            .expect("RAM size is range-checked")
     ));
 }
 

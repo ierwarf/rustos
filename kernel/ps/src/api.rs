@@ -138,6 +138,11 @@ pub use crate::multitask::{
     task_slot_available,
 };
 pub use crate::multitask::{register_child_waiter, unregister_child_waiter, wake_child_waiters};
+pub use crate::multitask::{
+    begin_vfork_wait, cancel_vfork_wait, complete_vfork, live_process_count,
+    spawn_user_process_vfork_suspended_with_parent_reservation, take_vfork_done,
+    with_fork_parent_vfork_state, LinuxThreadSnapshot,
+};
 pub use crate::multitask::{MemoryCensusEntry, memory_census};
 pub use crate::multitask::{
     task_capacity_snapshot, CapacityLimit, TaskCapacity, TaskCapacitySnapshot, TASK_CAPACITY,

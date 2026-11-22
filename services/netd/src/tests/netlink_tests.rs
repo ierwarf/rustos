@@ -218,6 +218,7 @@ fn netlink_socket(sock_type: u64) -> UnixSocket {
         refs: 1,
         options: SocketOptions::default(),
         bound_path: None,
+        bound_inode: None,
         local_path: None,
         peer_path: None,
         state: UnixSocketState::Netlink(NetlinkState::new(sock_type)),
@@ -524,6 +525,7 @@ fn sol_netlink_membership_options_and_change_notifications_work() {
         links: vec![loopback_link(), provider_link(2, [0x52, 0x54, 0, 1, 2, 3])],
         addrs: vec![loopback_addr(), provider_addr(2, [10, 0, 2, 15], 24)],
         routes: vec![connected_route(2, [10, 0, 2, 15], 24)],
+        ..InterfaceSnapshot::default()
     };
     {
         let mut state = lock_net_state();

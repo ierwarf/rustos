@@ -169,6 +169,7 @@ fn publish_anonymous_policy() {
 }
 
 fn serve(endpoint: u64, pager: &mut PagerState) {
+    const MAX_IPC_BATCH_PER_TURN: usize = 16;
     let mut bytes = [0_u8; IPC_MAX_INLINE_BYTES];
     let mut dispatch = PagerFaultDispatchWire::default();
     loop {
@@ -177,23 +178,26 @@ fn serve(endpoint: u64, pager: &mut PagerState) {
         rustos_svc_runtime::heartbeat::ensure_thread(rustos_user_abi::syscall::IPC_SERVICE_PAGERD);
         #[cfg(not(test))]
         warm_worker::ensure();
-        let mut reply_cap = 0;
-        let mut sender_pid = 0;
-        let mut sender_tid = 0;
-        // SAFETY: `bytes` is writable for `bytes.len()` and `reply_cap`, `sender_pid`,
-        // `sender_tid` are live locals for the call; the kernel fills them only on
-        // success and validates the addresses itself.
-        let received = unsafe {
-            ipc::try_recv_with_sender(
-                endpoint,
-                bytes.as_mut_ptr(),
-                bytes.len(),
-                &mut reply_cap,
-                &mut sender_pid,
-                &mut sender_tid,
-            )
-        };
-        if received >= 0 {
+        for _ in 0..MAX_IPC_BATCH_PER_TURN {
+            let mut reply_cap = 0;
+            let mut sender_pid = 0;
+            let mut sender_tid = 0;
+            // SAFETY: `bytes` is writable for `bytes.len()` and `reply_cap`, `sender_pid`,
+            // `sender_tid` are live locals for the call; the kernel fills them only on
+            // success and validates the addresses itself.
+            let received = unsafe {
+                ipc::try_recv_with_sender(
+                    endpoint,
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                    &mut reply_cap,
+                    &mut sender_pid,
+                    &mut sender_tid,
+                )
+            };
+            if received < 0 {
+                break;
+            }
             let response = handle_request(pager, received as usize, &bytes, sender_pid, sender_tid);
             // SAFETY: `reply_cap` is the one-shot capability returned by the receive above
             // (`received >= 0`); `response` is live and readable for exactly its size, and

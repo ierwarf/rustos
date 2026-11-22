@@ -67,6 +67,7 @@ fn broker_prepare_socket_publication(args: &RustosNetBrokerArgs) -> Result<u64, 
     }
     let netd_process_id = multitask::current_user_process_id().ok_or(LINUX_EPERM)?;
     let descriptors = if publication.domain == linux_abi::AF_INET
+        || publication.domain == linux_abi::AF_INET6
         || publication.domain == rustos_user_abi::syscall::NET_BROKER_PUBLICATION_AF_NETLINK
     {
         alloc::vec![
@@ -215,10 +216,10 @@ fn broker_packet_tx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
     if len == 0 {
         return Ok(0);
     }
-    let mut frame = alloc::vec![0_u8; len];
-    usermem::copy_from_current_user_exact(args.arg0, frame.as_mut_slice())
+    let mut frame = [0_u8; kernel_io_manager::api::network::PACKET_MTU];
+    usermem::copy_from_current_user_exact(args.arg0, &mut frame[..len])
         .map_err(user_pointer_error_to_linux_errno)?;
-    kernel_io_manager::api::network::transmit_frame(frame.as_slice(), packet_authority()?)
+    kernel_io_manager::api::network::transmit_frame(&frame[..len], packet_authority()?)
         .map(|count| count as u64)
         .map_err(packet_error_to_linux_errno)
 }
@@ -231,8 +232,8 @@ fn broker_packet_rx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
     // receive_frame dequeues; refuse a bad destination before the frame is lost.
     usermem::validate_current_user_write_buffer(args.arg0, cap)
         .map_err(user_pointer_error_to_linux_errno)?;
-    let mut frame = alloc::vec![0_u8; cap];
-    let count = kernel_io_manager::api::network::receive_frame(frame.as_mut_slice(), packet_authority()?)
+    let mut frame = [0_u8; kernel_io_manager::api::network::PACKET_MTU];
+    let count = kernel_io_manager::api::network::receive_frame(&mut frame[..cap], packet_authority()?)
         .map_err(packet_error_to_linux_errno)?;
     let received = frame.get(..count).ok_or(LINUX_EIO)?;
     usermem::write_current_user_bytes(args.arg0, received)
@@ -269,7 +270,7 @@ fn initial_unix_publication_entries(
         let socket = multitask::SocketHandle::from_token(
             token,
             publication.domain,
-            // The shape predicate admits only SOCK_STREAM and SOCK_SEQPACKET.
+            // The shape predicate admits SOCK_STREAM, SOCK_DGRAM and SOCK_SEQPACKET.
             publication.socket_type & linux_abi::SOCK_TYPE_MASK,
             publication.protocol,
         );

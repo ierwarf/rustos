@@ -16,120 +16,52 @@
 //! - **Evidence:** `dvm-block-startup`, `dvm-read-cache`,
 //!   `dvm-volume-io`, and `durable-block-mutation`.
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::read_engine::{Engine, Geometry, Transport, COMPLETION_TIMEOUT};
 use rustos_user_abi::syscall::{
     DvmBlockInfoWire, DvmBlockTicketWire, RustosBlockBrokerArgs, BLOCK_BROKER_ABI_VERSION,
-    BLOCK_BROKER_FLAG_FUA, BLOCK_BROKER_INFO_FLAG_READ_ONLY, BLOCK_BROKER_MAX_IO_BYTES,
-    BLOCK_BROKER_OP_DVM_CANCEL, BLOCK_BROKER_OP_DVM_COLLECT, BLOCK_BROKER_OP_DVM_INFO,
-    BLOCK_BROKER_OP_DVM_SUBMIT_FLUSH, BLOCK_BROKER_OP_DVM_SUBMIT_READ,
-    BLOCK_BROKER_OP_DVM_SUBMIT_WRITE, BLOCK_BROKER_OP_DVM_WAIT, SYS_RUSTOS_BLOCK_BROKER,
+    BLOCK_BROKER_FLAG_FUA, BLOCK_BROKER_INFO_FLAG_READ_ONLY, BLOCK_BROKER_OP_DVM_CANCEL,
+    BLOCK_BROKER_OP_DVM_COLLECT, BLOCK_BROKER_OP_DVM_INFO, BLOCK_BROKER_OP_DVM_SUBMIT_FLUSH,
+    BLOCK_BROKER_OP_DVM_SUBMIT_READ, BLOCK_BROKER_OP_DVM_SUBMIT_WRITE, BLOCK_BROKER_OP_DVM_WAIT,
+    SYS_RUSTOS_BLOCK_BROKER,
 };
 
-const COMPLETION_TIMEOUT: Duration = Duration::from_secs(15);
 const WAIT_SLICE_MILLIS: u64 = 1_000;
-// Sequential streams (a miss that starts exactly at the previous read-ahead
-// frontier) keep up to READ_AHEAD_IN_FLIGHT_LIMIT 64 KiB windows outstanding in
-// the DVM virtio-blk queue (depth 64) so one completion latency is shared by the
-// whole batch. Random misses stay one window. The cache keeps headroom above a
-// full batch so interleaved metadata windows are not evicted by speculation.
-const READ_CACHE_WINDOW_LIMIT: usize = 40;
-const READ_AHEAD_IN_FLIGHT_LIMIT: usize = 16;
-const _: () = assert!(READ_AHEAD_IN_FLIGHT_LIMIT < READ_CACHE_WINDOW_LIMIT);
-static READ_CACHE: Mutex<ReadCacheSet> = Mutex::new(ReadCacheSet::new());
-static READ_TELEMETRY: ReadTelemetry = ReadTelemetry::new();
-// A timeout does not cancel Linux I/O. Never re-admit this process after an
-// uncertain operation: only external quiescence/revocation can make reuse safe.
-static PROVIDER_QUARANTINED: AtomicBool = AtomicBool::new(false);
+// Windowed read cache, in-flight tracking and stream read-ahead live in
+// `read_engine`; this module is its DVM transport and the write/flush policy.
+static ENGINE: Engine = Engine::new();
+// A timeout does not cancel Linux I/O. Never re-admit the timed-out
+// generation after an uncertain operation; only a strictly newer DVM
+// generation with proven quiescence may clear quarantine.
+static QUARANTINED_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Where a sequential DVM read stream spends its time, aggregated so a
-/// several-hundred-megabyte executable snapshot produces a handful of lines
-/// instead of one per request. Submit time is the broker round trips that queue
-/// a batch, first-completion time is the latency of the one demanded window
-/// (everything else in the batch overlaps behind it), and wait time is the
-/// whole batch from first submit to last collect. A hit never reaches the DVM.
-struct ReadTelemetry {
-    batches: AtomicU64,
-    windows: AtomicU64,
-    bytes: AtomicU64,
-    hits: AtomicU64,
-    submit_ns: AtomicU64,
-    first_ns: AtomicU64,
-    batch_ns: AtomicU64,
-    max_batch_ns: AtomicU64,
-}
-
-/// One summary per this many DVM batches (at most 16 windows each).
-const READ_TELEMETRY_INTERVAL_BATCHES: u64 = 32;
-
-impl ReadTelemetry {
-    const fn new() -> Self {
-        Self {
-            batches: AtomicU64::new(0),
-            windows: AtomicU64::new(0),
-            bytes: AtomicU64::new(0),
-            hits: AtomicU64::new(0),
-            submit_ns: AtomicU64::new(0),
-            first_ns: AtomicU64::new(0),
-            batch_ns: AtomicU64::new(0),
-            max_batch_ns: AtomicU64::new(0),
-        }
-    }
-
-    fn record_hit(&self) {
-        self.hits.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Accumulates one completed batch; yields the summary line on every
-    /// interval boundary so the caller (not this counter) owns the I/O.
-    fn record_batch(
-        &self,
-        windows: u64,
-        bytes: u64,
-        submit: Duration,
-        first: Duration,
-        batch: Duration,
-    ) -> Option<String> {
-        let nanos = |value: Duration| u64::try_from(value.as_nanos()).unwrap_or(u64::MAX);
-        let batch_ns = nanos(batch);
-        self.windows.fetch_add(windows, Ordering::Relaxed);
-        self.bytes.fetch_add(bytes, Ordering::Relaxed);
-        self.submit_ns.fetch_add(nanos(submit), Ordering::Relaxed);
-        self.first_ns.fetch_add(nanos(first), Ordering::Relaxed);
-        self.batch_ns.fetch_add(batch_ns, Ordering::Relaxed);
-        self.max_batch_ns.fetch_max(batch_ns, Ordering::Relaxed);
-        let batches = self.batches.fetch_add(1, Ordering::Relaxed) + 1;
-        if batches % READ_TELEMETRY_INTERVAL_BATCHES != 0 {
-            return None;
-        }
-        let micros = |counter: &AtomicU64| counter.load(Ordering::Relaxed) / 1_000;
-        let max_batch_us = self.max_batch_ns.swap(0, Ordering::Relaxed) / 1_000;
-        Some(format!(
-            "storaged: dvm read stream batches={batches} windows={} bytes={} hits={} submit_us={} first_us={} batch_us={} max_batch_us={max_batch_us}",
-            self.windows.load(Ordering::Relaxed),
-            self.bytes.load(Ordering::Relaxed),
-            self.hits.load(Ordering::Relaxed),
-            micros(&self.submit_ns),
-            micros(&self.first_ns),
-            micros(&self.batch_ns),
-        ))
-    }
-}
-
-fn require_unquarantined(quarantined: &AtomicBool) -> Result<(), i32> {
-    // ORDERING: Acquire pairs with Release in `quarantine_provider`.
-    if quarantined.load(Ordering::Acquire) {
+fn require_unquarantined_for(quarantined_gen: &AtomicU64, generation: u64) -> Result<(), i32> {
+    // ORDERING: Acquire pairs with the Release store in `quarantine_provider`,
+    // so a request admitted after the quarantine sees it.
+    let q = quarantined_gen.load(Ordering::Acquire);
+    if q != 0 && (generation == 0 || q == generation) {
         Err(libc::EIO)
     } else {
         Ok(())
     }
 }
 
+pub(super) fn clear_quarantine_for_new_generation(new_generation: u64) {
+    // ORDERING: Acquire read of the quarantined generation published by
+    // `quarantine_provider`.
+    let q = QUARANTINED_GENERATION.load(Ordering::Acquire);
+    if q != 0 && new_generation > q {
+        // ORDERING: AcqRel CAS lifts exactly the generation read above; a
+        // concurrent newer quarantine makes it fail and stays in force.
+        let _ = QUARANTINED_GENERATION.compare_exchange(q, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
 fn quarantine_provider(ticket: DvmBlockTicketWire, cause: &str) {
     // ORDERING: Release latches quarantine before cache invalidation.
-    PROVIDER_QUARANTINED.store(true, Ordering::Release);
+    QUARANTINED_GENERATION.store(ticket.generation.max(1), Ordering::Release);
     clear_read_cache();
     eprintln!(
         "storaged: dvm provider quarantined generation={} request_id={} slot={} cause={cause} quiescence=unproven",
@@ -145,326 +77,6 @@ pub(super) struct BlockInfo {
     pub physical_block_size: u32,
     pub features: u64,
     pub flags: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ReadCache {
-    generation: u64,
-    lba: u64,
-    block_count: u64,
-    block_size: usize,
-    bytes: Vec<u8>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ReadAheadWindow {
-    lba: u64,
-    block_count: u64,
-    byte_len: usize,
-}
-
-impl ReadCache {
-    fn slice_bytes(
-        &self,
-        generation: u64,
-        lba: u64,
-        block_count: u64,
-        byte_len: usize,
-    ) -> Result<Option<&[u8]>, i32> {
-        if self.generation != generation || lba < self.lba {
-            return Ok(None);
-        }
-        let offset_blocks = lba - self.lba;
-        if offset_blocks
-            .checked_add(block_count)
-            .is_none_or(|end| end > self.block_count)
-        {
-            return Ok(None);
-        }
-        let expected_len = usize::try_from(self.block_count)
-            .ok()
-            .and_then(|blocks| blocks.checked_mul(self.block_size))
-            .ok_or(libc::EIO)?;
-        if self.block_size == 0 || self.bytes.len() != expected_len {
-            return Err(libc::EIO);
-        }
-        let offset = usize::try_from(offset_blocks)
-            .ok()
-            .and_then(|blocks| blocks.checked_mul(self.block_size))
-            .ok_or(libc::EIO)?;
-        let end = offset.checked_add(byte_len).ok_or(libc::EIO)?;
-        let bytes = self.bytes.get(offset..end).ok_or(libc::EIO)?;
-        Ok(Some(bytes))
-    }
-
-    #[cfg(test)]
-    fn slice(
-        &self,
-        generation: u64,
-        lba: u64,
-        block_count: u64,
-        byte_len: usize,
-    ) -> Result<Option<Vec<u8>>, i32> {
-        Ok(self
-            .slice_bytes(generation, lba, block_count, byte_len)?
-            .map(<[u8]>::to_vec))
-    }
-
-    fn validate(&self) -> Result<(), i32> {
-        let expected_len = usize::try_from(self.block_count)
-            .ok()
-            .and_then(|blocks| blocks.checked_mul(self.block_size))
-            .ok_or(libc::EIO)?;
-        if self.generation == 0
-            || self.block_count == 0
-            || self.block_size == 0
-            || self.bytes.len() != expected_len
-            || self.lba.checked_add(self.block_count).is_none()
-            || self.bytes.len() > BLOCK_BROKER_MAX_IO_BYTES
-        {
-            return Err(libc::EIO);
-        }
-        Ok(())
-    }
-
-    fn overlaps(&self, other: &Self) -> bool {
-        if self.generation != other.generation {
-            return false;
-        }
-        let self_end = self.lba + self.block_count;
-        let other_end = other.lba + other.block_count;
-        self.lba < other_end && other.lba < self_end
-    }
-}
-
-#[cfg(test)]
-enum Coverage {
-    Hit(Vec<u8>),
-    Partial {
-        prefix: Vec<u8>,
-        start: u64,
-        continues_read_ahead: bool,
-    },
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum CoverageInto {
-    Hit(usize),
-    Partial {
-        prefix_len: usize,
-        start: u64,
-        continues_read_ahead: bool,
-    },
-}
-
-#[derive(Debug, Default)]
-struct ReadCacheSet {
-    entries: Vec<ReadCache>,
-    next_read_ahead_lba: Option<(u64, u64)>,
-}
-
-impl ReadCacheSet {
-    const fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            next_read_ahead_lba: None,
-        }
-    }
-
-    #[cfg(test)]
-    fn slice(
-        &mut self,
-        generation: u64,
-        lba: u64,
-        block_count: u64,
-        byte_len: usize,
-    ) -> Result<Option<Vec<u8>>, i32> {
-        let mut hit = None;
-        for index in (0..self.entries.len()).rev() {
-            if let Some(bytes) =
-                self.entries[index].slice(generation, lba, block_count, byte_len)?
-            {
-                hit = Some((index, bytes));
-                break;
-            }
-        }
-        let Some((index, bytes)) = hit else {
-            return Ok(None);
-        };
-        let entry = self.entries.remove(index);
-        self.entries.push(entry);
-        Ok(Some(bytes))
-    }
-
-    /// Assemble a request from one or more contiguous cached windows directly
-    /// into `out`. A full cover is a hit; otherwise the cached prefix and the
-    /// first uncovered block are returned so only the missing tail is read.
-    fn cover_into(
-        &mut self,
-        generation: u64,
-        lba: u64,
-        block_count: u64,
-        block_size: usize,
-        out: &mut [u8],
-    ) -> Result<CoverageInto, i32> {
-        let end = lba.checked_add(block_count).ok_or(libc::EINVAL)?;
-        let total_bytes = usize::try_from(block_count)
-            .ok()
-            .and_then(|blocks| blocks.checked_mul(block_size))
-            .ok_or(libc::EINVAL)?;
-        if total_bytes > out.len() {
-            return Err(libc::EOVERFLOW);
-        }
-        let mut cursor = lba;
-        let mut written = 0_usize;
-        let mut first_used: Option<usize> = None;
-        let mut extra_used: Vec<usize> = Vec::new();
-        while cursor < end {
-            let Some(index) = self.entries.iter().rposition(|entry| {
-                entry.generation == generation
-                    && entry.lba <= cursor
-                    && cursor < entry.lba.saturating_add(entry.block_count)
-            }) else {
-                break;
-            };
-            let entry = &self.entries[index];
-            if entry.block_size != block_size {
-                return Err(libc::EIO);
-            }
-            let take = (entry.lba + entry.block_count).min(end) - cursor;
-            let take_bytes = usize::try_from(take)
-                .ok()
-                .and_then(|blocks| blocks.checked_mul(block_size))
-                .ok_or(libc::EIO)?;
-            let bytes = entry
-                .slice_bytes(generation, cursor, take, take_bytes)?
-                .ok_or(libc::EIO)?;
-            out[written..written + take_bytes].copy_from_slice(bytes);
-            written += take_bytes;
-            match first_used {
-                None => first_used = Some(index),
-                Some(_) => extra_used.push(index),
-            }
-            cursor += take;
-        }
-        if extra_used.is_empty() {
-            if let Some(index) = first_used {
-                let entry = self.entries.remove(index);
-                self.entries.push(entry);
-            }
-        } else {
-            if let Some(first) = first_used {
-                extra_used.push(first);
-            }
-            extra_used.sort_unstable();
-            extra_used.dedup();
-            let mut touched = Vec::with_capacity(extra_used.len());
-            for index in extra_used.into_iter().rev() {
-                touched.push(self.entries.remove(index));
-            }
-            self.entries.extend(touched.into_iter().rev());
-        }
-        if cursor == end {
-            Ok(CoverageInto::Hit(written))
-        } else {
-            Ok(CoverageInto::Partial {
-                prefix_len: written,
-                start: cursor,
-                continues_read_ahead: self.miss_continues_read_ahead(generation, cursor),
-            })
-        }
-    }
-
-    #[cfg(test)]
-    fn cover(
-        &mut self,
-        generation: u64,
-        lba: u64,
-        block_count: u64,
-        block_size: usize,
-    ) -> Result<Coverage, i32> {
-        let total_bytes = usize::try_from(block_count)
-            .ok()
-            .and_then(|blocks| blocks.checked_mul(block_size))
-            .ok_or(libc::EINVAL)?;
-        let mut out = vec![0_u8; total_bytes];
-        match self.cover_into(generation, lba, block_count, block_size, &mut out)? {
-            CoverageInto::Hit(len) => {
-                out.truncate(len);
-                Ok(Coverage::Hit(out))
-            }
-            CoverageInto::Partial {
-                prefix_len,
-                start,
-                continues_read_ahead,
-            } => {
-                out.truncate(prefix_len);
-                Ok(Coverage::Partial {
-                    prefix: out,
-                    start,
-                    continues_read_ahead,
-                })
-            }
-        }
-    }
-
-    fn insert(&mut self, cache: ReadCache) -> Result<(), i32> {
-        cache.validate()?;
-        if self
-            .entries
-            .iter()
-            .any(|entry| entry.generation != cache.generation)
-        {
-            self.entries.clear();
-        }
-        self.entries.retain(|entry| !entry.overlaps(&cache));
-        if self.entries.len() == READ_CACHE_WINDOW_LIMIT {
-            self.entries.remove(0);
-        }
-        self.entries.push(cache);
-        debug_assert!(self.entries.len() <= READ_CACHE_WINDOW_LIMIT);
-        Ok(())
-    }
-
-    fn insert_batch(
-        &mut self,
-        caches: impl IntoIterator<Item = ReadCache>,
-        generation: u64,
-        read_ahead_end: u64,
-    ) -> Result<(), i32> {
-        for cache in caches {
-            self.insert(cache)?;
-        }
-        self.record_read_ahead_end(generation, read_ahead_end);
-        Ok(())
-    }
-
-    fn clear(&mut self) {
-        self.entries.clear();
-        self.next_read_ahead_lba = None;
-    }
-
-    fn invalidate_range(&mut self, generation: u64, lba: u64, block_count: u64) {
-        let end = lba.saturating_add(block_count);
-        self.entries.retain(|entry| {
-            entry.generation != generation
-                || entry.lba >= end
-                || entry.lba.saturating_add(entry.block_count) <= lba
-        });
-        if let Some((gen, next_lba)) = self.next_read_ahead_lba {
-            if gen == generation && next_lba >= lba && next_lba < end {
-                self.next_read_ahead_lba = None;
-            }
-        }
-    }
-
-    fn miss_continues_read_ahead(&self, generation: u64, lba: u64) -> bool {
-        self.next_read_ahead_lba == Some((generation, lba))
-    }
-
-    fn record_read_ahead_end(&mut self, generation: u64, lba: u64) {
-        self.next_read_ahead_lba = Some((generation, lba));
-    }
 }
 
 /// Read the current transport state without turning an ordinary not-ready
@@ -488,7 +100,6 @@ pub(super) fn wait_until_ready(deadline: Instant) -> Result<BlockInfo, i32> {
 }
 
 fn info_once() -> Result<BlockInfo, i32> {
-    require_unquarantined(&PROVIDER_QUARANTINED)?;
     let mut wire = DvmBlockInfoWire::default();
     let args = RustosBlockBrokerArgs {
         abi_version: BLOCK_BROKER_ABI_VERSION,
@@ -497,7 +108,7 @@ fn info_once() -> Result<BlockInfo, i32> {
         ..RustosBlockBrokerArgs::default()
     };
     syscall_block(&args)?;
-    require_unquarantined(&PROVIDER_QUARANTINED)?;
+    require_unquarantined_for(&QUARANTINED_GENERATION, wire.generation)?;
     if wire.generation == 0
         || wire.capacity_sectors == 0
         || wire.logical_block_size < 512
@@ -552,17 +163,52 @@ fn bounded_wait_timeout_ms(remaining: Duration) -> Option<u64> {
     )
 }
 
-pub(super) fn read_into_with_info(
-    info: BlockInfo,
-    expected_generation: u64,
-    lba: u64,
-    block_count: u64,
-    out: &mut [u8],
-) -> Result<usize, i32> {
-    read_into_inner(info, expected_generation, lba, block_count, out)
+/// The DVM block broker as the read engine's transport.
+struct DvmTransport;
+
+impl Transport for DvmTransport {
+    fn submit_read(
+        &self,
+        generation: u64,
+        lba: u64,
+        block_count: u64,
+        byte_len: usize,
+    ) -> Result<DvmBlockTicketWire, i32> {
+        submit(
+            generation,
+            BLOCK_BROKER_OP_DVM_SUBMIT_READ,
+            lba,
+            block_count,
+            0,
+            std::ptr::null(),
+            byte_len,
+        )
+    }
+
+    fn try_collect(&self, ticket: DvmBlockTicketWire, buf: &mut [u8]) -> Result<bool, i32> {
+        try_collect(ticket, Some(buf))
+    }
+
+    fn cancel(&self, ticket: DvmBlockTicketWire) {
+        cancel_best_effort(ticket);
+    }
+
+    fn timed_out(&self, ticket: DvmBlockTicketWire) {
+        quarantine_provider(ticket, "completion-timeout");
+        cancel_best_effort(ticket);
+    }
 }
 
-fn read_into_inner(
+fn read_geometry(info: BlockInfo) -> Option<Geometry> {
+    let sectors_per_block = u64::from(info.logical_block_size / 512);
+    Geometry::new(
+        info.generation,
+        info.logical_block_size as usize,
+        info.capacity_sectors.checked_div(sectors_per_block)?,
+    )
+}
+
+pub(super) fn read_into_with_info(
     info: BlockInfo,
     expected_generation: u64,
     lba: u64,
@@ -585,160 +231,53 @@ fn read_into_inner(
     if byte_len > out.len() {
         return Err(libc::EOVERFLOW);
     }
-    let (prefix_len, start, continues_read_ahead) =
-        match read_cache_lookup_into(info, lba, block_count, out)? {
-            CoverageInto::Hit(len) => {
-                require_unquarantined(&PROVIDER_QUARANTINED)?;
-                READ_TELEMETRY.record_hit();
-                return Ok(len);
-            }
-            CoverageInto::Partial {
-                prefix_len,
-                start,
-                continues_read_ahead,
-            } => (prefix_len, start, continues_read_ahead),
-        };
-    let window_limit = if continues_read_ahead {
-        READ_AHEAD_IN_FLIGHT_LIMIT
-    } else {
-        1
-    };
-    let missing_blocks = lba
-        .checked_add(block_count)
-        .and_then(|end| end.checked_sub(start))
-        .ok_or(libc::EIO)?;
-    let missing_bytes = byte_len.checked_sub(prefix_len).ok_or(libc::EIO)?;
-    let windows = read_ahead_plan(info, start, missing_blocks, window_limit)?;
-    let mut in_flight = Vec::with_capacity(windows.len());
-    let mut submitted_bytes = 0_usize;
-    let batch_started = Instant::now();
-    for window in windows {
-        match submit(
-            expected_generation,
-            BLOCK_BROKER_OP_DVM_SUBMIT_READ,
-            window.lba,
-            window.block_count,
-            0,
-            std::ptr::null(),
-            window.byte_len,
-        ) {
-            Ok(ticket) => {
-                submitted_bytes += window.byte_len;
-                in_flight.push((window, ticket, vec![0_u8; window.byte_len]));
-            }
-            // Speculative windows beyond the demanded range may be refused
-            // (queue full); the demanded range itself must be admitted.
-            Err(_) if submitted_bytes >= missing_bytes => break,
-            Err(errno) => {
-                for (_, ticket, _) in in_flight {
-                    cancel_best_effort(ticket);
-                }
-                eprintln!(
-                    "storaged: dvm read rejected stage=submit lba={} blocks={} bytes={} errno={errno}",
-                    window.lba, window.block_count, window.byte_len
-                );
-                return Err(errno);
-            }
-        }
-    }
-    let submitted_at = Instant::now();
-    let mut first_completion = Duration::ZERO;
-    for index in 0..in_flight.len() {
-        let completion = {
-            let (_, ticket, prefetched) = &mut in_flight[index];
-            wait_and_collect(*ticket, Some(prefetched.as_mut_slice()))
-        };
-        if index == 0 {
-            first_completion = submitted_at.elapsed();
-        }
-        if let Err(errno) = completion {
-            let (window, ticket, _) = &in_flight[index];
-            for (_, pending, _) in &in_flight[index + 1..] {
-                cancel_best_effort(*pending);
-            }
-            clear_read_cache();
+    // A cached window must not outlive a quarantine of its generation.
+    require_unquarantined_for(&QUARANTINED_GENERATION, info.generation)?;
+    let geometry = read_geometry(info).ok_or(libc::EINVAL)?;
+    ENGINE
+        .read(&DvmTransport, geometry, lba, block_count, out)
+        .inspect_err(|errno| {
             eprintln!(
-                "storaged: dvm read rejected stage=completion request_id={} slot={} bytes={} errno={errno}",
-                ticket.request_id, ticket.data_slot, window.byte_len
+                "storaged: dvm read rejected stage=engine lba={lba} blocks={block_count} errno={errno}"
             );
-            return Err(errno);
-        }
-    }
-    if let Some(line) = READ_TELEMETRY.record_batch(
-        in_flight.len() as u64,
-        in_flight.iter().map(|(window, _, _)| window.byte_len as u64).sum(),
-        submitted_at.saturating_duration_since(batch_started),
-        first_completion,
-        batch_started.elapsed(),
-    ) {
-        eprintln!("{line}");
-    }
-    let mut written = prefix_len;
-    for (_, _, bytes) in &in_flight {
-        let want = byte_len - written;
-        if want == 0 {
-            break;
-        }
-        let take = want.min(bytes.len());
-        out[written..written + take].copy_from_slice(&bytes[..take]);
-        written += take;
-    }
-    if written != byte_len {
-        return Err(libc::EIO);
-    }
-    let read_ahead_end = in_flight
-        .last()
-        .and_then(|(window, _, _)| window.lba.checked_add(window.block_count))
-        .ok_or(libc::EIO)?;
-    let block_size = info.logical_block_size as usize;
-    let generation = info.generation;
-    insert_read_ahead_batch(
-        in_flight.into_iter().map(|(window, _, prefetched)| ReadCache {
-            generation,
-            lba: window.lba,
-            block_count: window.block_count,
-            block_size,
-            bytes: prefetched,
-        }),
-        generation,
-        read_ahead_end,
-    )?;
-    Ok(written)
+        })
 }
 
-fn read_ahead_plan(
-    info: BlockInfo,
-    lba: u64,
-    requested_blocks: u64,
-    window_limit: usize,
-) -> Result<Vec<ReadAheadWindow>, i32> {
-    let max_blocks = (BLOCK_BROKER_MAX_IO_BYTES as u64) / u64::from(info.logical_block_size);
-    if max_blocks == 0
-        || requested_blocks == 0
-        || requested_blocks > max_blocks
-        || window_limit == 0
-        || window_limit > READ_AHEAD_IN_FLIGHT_LIMIT
-    {
-        return Err(libc::EINVAL);
+/// Refills stream read-ahead after a reply, so its submit syscalls overlap the
+/// requester's work on its next request.
+pub(super) fn service_read_ahead() {
+    ENGINE.top_up(&DvmTransport);
+}
+
+/// Owns completion collection for the read engine: collects what the DVM has
+/// finished, wakes the readers waiting on it, and otherwise sleeps in the
+/// kernel until the transport signals a completion.
+
+pub(super) fn run_read_pump() -> ! {
+    let mut idle_wakes = 0_u32;
+    loop {
+        let status = ENGINE.pump_once(&DvmTransport);
+        if status.in_flight == 0 {
+            idle_wakes = 0;
+            ENGINE.park_until_work(Duration::from_millis(WAIT_SLICE_MILLIS));
+            continue;
+        }
+        if status.progressed != 0 {
+            idle_wakes = 0;
+            continue;
+        }
+        let woke =
+            wait_for_transport_event(Instant::now() + Duration::from_millis(WAIT_SLICE_MILLIS));
+        // A transport in a terminal state reports an event forever; do not spin.
+        idle_wakes = if woke.is_ok() {
+            idle_wakes + 1
+        } else {
+            idle_wakes
+        };
+        if woke.is_err() || idle_wakes >= 64 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
-    let capacity_blocks = info.capacity_sectors / u64::from(info.logical_block_size / 512);
-    let mut cursor = lba;
-    let mut remaining = capacity_blocks.checked_sub(lba).ok_or(libc::EINVAL)?;
-    if remaining < requested_blocks {
-        return Err(libc::EINVAL);
-    }
-    let mut windows = Vec::with_capacity(window_limit);
-    while remaining != 0 && windows.len() < window_limit {
-        let block_count = remaining.min(max_blocks);
-        windows.push(ReadAheadWindow {
-            lba: cursor,
-            block_count,
-            byte_len: checked_byte_len(info, cursor, block_count)?,
-        });
-        cursor = cursor.checked_add(block_count).ok_or(libc::EINVAL)?;
-        remaining -= block_count;
-    }
-    Ok(windows)
 }
 
 pub(super) fn write_with_info(
@@ -805,46 +344,20 @@ fn validate_write_extent(
     Ok(())
 }
 
-fn read_cache_lookup_into(
-    info: BlockInfo,
-    lba: u64,
-    block_count: u64,
-    out: &mut [u8],
-) -> Result<CoverageInto, i32> {
-    READ_CACHE.lock().map_err(|_| libc::EIO)?.cover_into(
-        info.generation,
-        lba,
-        block_count,
-        info.logical_block_size as usize,
-        out,
-    )
-}
-
-fn insert_read_ahead_batch(
-    caches: impl IntoIterator<Item = ReadCache>,
-    generation: u64,
-    read_ahead_end: u64,
-) -> Result<(), i32> {
-    READ_CACHE
-        .lock()
-        .map_err(|_| libc::EIO)?
-        .insert_batch(caches, generation, read_ahead_end)
-}
-
 fn clear_read_cache() {
-    if let Ok(mut cache) = READ_CACHE.lock() {
-        cache.clear();
-    }
+    ENGINE.clear();
 }
 
 fn invalidate_read_cache_range(generation: u64, lba: u64, block_count: u64) {
-    if let Ok(mut cache) = READ_CACHE.lock() {
-        cache.invalidate_range(generation, lba, block_count);
-    }
+    ENGINE.invalidate_range(generation, lba, block_count);
 }
 
 pub(super) fn flush_with_info(info: BlockInfo, expected_generation: u64) -> Result<(), i32> {
-    flush_with_info_before(info, expected_generation, Instant::now() + COMPLETION_TIMEOUT)
+    flush_with_info_before(
+        info,
+        expected_generation,
+        Instant::now() + COMPLETION_TIMEOUT,
+    )
 }
 
 pub(super) fn flush_before(expected_generation: u64, deadline: Instant) -> Result<(), i32> {
@@ -865,7 +378,7 @@ fn flush_with_info_before(
         out_ticket_ptr: (&mut ticket as *mut DvmBlockTicketWire) as u64,
         ..RustosBlockBrokerArgs::default()
     };
-    require_unquarantined(&PROVIDER_QUARANTINED)?;
+    require_unquarantined_for(&QUARANTINED_GENERATION, expected_generation)?;
     syscall_block(&args)?;
     validate_ticket(ticket)?;
     wait_and_collect_before(ticket, None, deadline)
@@ -893,7 +406,7 @@ fn submit(
         out_ticket_ptr: (&mut ticket as *mut DvmBlockTicketWire) as u64,
         ..RustosBlockBrokerArgs::default()
     };
-    require_unquarantined(&PROVIDER_QUARANTINED)?;
+    require_unquarantined_for(&QUARANTINED_GENERATION, expected_generation)?;
     syscall_block(&args)?;
     validate_ticket(ticket)?;
     Ok(ticket)
@@ -903,6 +416,34 @@ fn wait_and_collect(ticket: DvmBlockTicketWire, read_buffer: Option<&mut [u8]>) 
     wait_and_collect_before(ticket, read_buffer, Instant::now() + COMPLETION_TIMEOUT)
 }
 
+/// One non-blocking attempt to collect `ticket`: `Ok(true)` once it completed
+/// and `read_buffer` holds its bytes, `Ok(false)` while it is still pending.
+fn try_collect(ticket: DvmBlockTicketWire, read_buffer: Option<&mut [u8]>) -> Result<bool, i32> {
+    let (buffer_ptr, buffer_len) = read_buffer.map_or((0, 0), |buffer| {
+        (buffer.as_mut_ptr() as u64, buffer.len() as u64)
+    });
+    let collect = RustosBlockBrokerArgs {
+        abi_version: BLOCK_BROKER_ABI_VERSION,
+        op: BLOCK_BROKER_OP_DVM_COLLECT,
+        buffer_ptr,
+        buffer_len,
+        ticket,
+        ..RustosBlockBrokerArgs::default()
+    };
+    match syscall_block(&collect) {
+        Ok(completed) if completed == buffer_len => Ok(true),
+        Ok(_) => Err(libc::EIO),
+        Err(libc::EAGAIN) => Ok(false),
+        Err(error) => {
+            eprintln!(
+                "storaged: dvm completion rejected stage=collect request_id={} slot={} errno={error}",
+                ticket.request_id, ticket.data_slot
+            );
+            Err(error)
+        }
+    }
+}
+
 fn wait_and_collect_before(
     ticket: DvmBlockTicketWire,
     mut read_buffer: Option<&mut [u8]>,
@@ -910,32 +451,8 @@ fn wait_and_collect_before(
 ) -> Result<(), i32> {
     validate_ticket(ticket)?;
     loop {
-        let (buffer_ptr, buffer_len) = read_buffer.as_deref_mut().map_or((0, 0), |buffer| {
-            (buffer.as_mut_ptr() as u64, buffer.len() as u64)
-        });
-        let collect = RustosBlockBrokerArgs {
-            abi_version: BLOCK_BROKER_ABI_VERSION,
-            op: BLOCK_BROKER_OP_DVM_COLLECT,
-            buffer_ptr,
-            buffer_len,
-            ticket,
-            ..RustosBlockBrokerArgs::default()
-        };
-        match syscall_block(&collect) {
-            Ok(completed) => {
-                if completed != buffer_len {
-                    return Err(libc::EIO);
-                }
-                return Ok(());
-            }
-            Err(libc::EAGAIN) => {}
-            Err(error) => {
-                eprintln!(
-                    "storaged: dvm completion rejected stage=collect request_id={} slot={} errno={error}",
-                    ticket.request_id, ticket.data_slot
-                );
-                return Err(error);
-            }
+        if try_collect(ticket, read_buffer.as_deref_mut())? {
+            return Ok(());
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1049,13 +566,23 @@ fn syscall_block(args: &RustosBlockBrokerArgs) -> Result<u64, i32> {
 mod tests {
     use super::*;
 
+    /// Tests that reach the process-wide `ENGINE` (a valid write invalidates it)
+    /// run one at a time so one test's invalidation cannot clear another's seed.
+    static ENGINE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn engine_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENGINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn quarantined_provider_rejects_admission() {
-        let quarantined = AtomicBool::new(false);
-        assert_eq!(require_unquarantined(&quarantined), Ok(()));
-        // ORDERING: Release pairs with Acquire in `require_unquarantined`.
-        quarantined.store(true, Ordering::Release);
-        assert_eq!(require_unquarantined(&quarantined), Err(libc::EIO));
+        let quarantined = AtomicU64::new(0);
+        assert_eq!(require_unquarantined_for(&quarantined, 7), Ok(()));
+        // ORDERING: Release pairs with Acquire in `require_unquarantined_for`.
+        quarantined.store(7, Ordering::Release);
+        assert_eq!(require_unquarantined_for(&quarantined, 7), Err(libc::EIO));
     }
 
     fn info() -> BlockInfo {
@@ -1078,125 +605,67 @@ mod tests {
 
     #[test]
     fn write_extent_requires_exact_declared_count_before_submission() {
-        let info = BlockInfo { logical_block_size: 512, ..info() };
+        let info = BlockInfo {
+            logical_block_size: 512,
+            ..info()
+        };
         assert_eq!(validate_write_extent(info, 0, 1, 1024), Err(libc::EINVAL));
         assert_eq!(validate_write_extent(info, 0, 2, 512), Err(libc::EINVAL));
-        assert_eq!(validate_write_extent(info, 0, u64::MAX, 512), Err(libc::EINVAL));
+        assert_eq!(
+            validate_write_extent(info, 0, u64::MAX, 512),
+            Err(libc::EINVAL)
+        );
         assert_eq!(validate_write_extent(info, 0, 0, 0), Err(libc::EINVAL));
-        assert_eq!(validate_write_extent(info, 8191, 2, 1024), Err(libc::EINVAL));
+        assert_eq!(
+            validate_write_extent(info, 8191, 2, 1024),
+            Err(libc::EINVAL)
+        );
         assert_eq!(validate_write_extent(info, 0, 2, 1024), Ok(()));
     }
 
     #[test]
     fn write_extent_refusal_has_no_cache_or_submission_side_effects() {
-        let info = BlockInfo { logical_block_size: 512, ..info() };
+        let _engine = engine_test_guard();
+        let info = BlockInfo {
+            logical_block_size: 512,
+            ..info()
+        };
         let bytes = [0_u8; 1024];
         let mut side_effects = 0;
         for count in [0, 1, 3, u64::MAX] {
-            assert_eq!(write_admitted_with(info, 7, 0, count, &bytes, || {
+            assert_eq!(
+                write_admitted_with(info, 7, 0, count, &bytes, || {
+                    side_effects += 1;
+                    Ok(())
+                }),
+                Err(libc::EINVAL)
+            );
+        }
+        assert_eq!(
+            write_admitted_with(info, 6, 0, 2, &bytes, || {
                 side_effects += 1;
                 Ok(())
-            }), Err(libc::EINVAL));
-        }
-        assert_eq!(write_admitted_with(info, 6, 0, 2, &bytes, || {
-            side_effects += 1;
-            Ok(())
-        }), Err(libc::ESTALE));
+            }),
+            Err(libc::ESTALE)
+        );
         assert_eq!(side_effects, 0);
-        assert_eq!(write_admitted_with(info, 7, 0, 2, &bytes, || {
-            side_effects += 1;
+        assert_eq!(
+            write_admitted_with(info, 7, 0, 2, &bytes, || {
+                side_effects += 1;
+                Err(libc::EIO)
+            }),
             Err(libc::EIO)
-        }), Err(libc::EIO));
-        assert_eq!(side_effects, 1, "valid requests submit once and preserve failures");
+        );
+        assert_eq!(
+            side_effects, 1,
+            "valid requests submit once and preserve failures"
+        );
     }
 
     #[test]
     fn generation_mismatch_is_stale_not_a_fallback() {
         assert_eq!(require_generation(info(), 6), Err(libc::ESTALE));
         assert_eq!(require_generation(info(), 7), Ok(()));
-    }
-
-    #[test]
-    fn read_ahead_cache_is_generation_and_range_bound() {
-        let cache = ReadCache {
-            generation: 7,
-            lba: 100,
-            block_count: 4,
-            block_size: 4,
-            bytes: (0_u8..16).collect(),
-        };
-        assert_eq!(cache.slice(7, 101, 2, 8), Ok(Some((4_u8..12).collect())));
-        assert_eq!(cache.slice(8, 101, 2, 8), Ok(None));
-        assert_eq!(cache.slice(7, 99, 1, 4), Ok(None));
-        assert_eq!(cache.slice(7, 103, 2, 8), Ok(None));
-
-        let malformed = ReadCache {
-            bytes: vec![0; 15],
-            ..cache
-        };
-        assert_eq!(malformed.slice(7, 100, 1, 4), Err(libc::EIO));
-    }
-
-    #[test]
-    fn read_ahead_cache_set_is_bounded_lru_and_generation_atomic() {
-        let window = |generation, lba, byte| ReadCache {
-            generation,
-            lba,
-            block_count: 1,
-            block_size: 4,
-            bytes: vec![byte; 4],
-        };
-        let mut caches = ReadCacheSet::new();
-        for index in 0..READ_CACHE_WINDOW_LIMIT {
-            caches
-                .insert(window(7, index as u64, index as u8))
-                .expect("insert cache window");
-        }
-        assert_eq!(caches.entries.len(), READ_CACHE_WINDOW_LIMIT);
-        assert_eq!(caches.slice(7, 0, 1, 4), Ok(Some(vec![0; 4])));
-
-        caches
-            .insert(window(7, READ_CACHE_WINDOW_LIMIT as u64, 8))
-            .expect("evict least recently used window");
-        assert_eq!(caches.entries.len(), READ_CACHE_WINDOW_LIMIT);
-        assert_eq!(caches.slice(7, 1, 1, 4), Ok(None));
-        assert_eq!(caches.slice(7, 0, 1, 4), Ok(Some(vec![0; 4])));
-
-        caches
-            .insert(window(8, 100, 9))
-            .expect("new generation replaces cache epoch");
-        assert_eq!(caches.entries.len(), 1);
-        assert_eq!(caches.slice(7, 0, 1, 4), Ok(None));
-        assert_eq!(caches.slice(8, 100, 1, 4), Ok(Some(vec![9; 4])));
-
-        caches.clear();
-        assert!(caches.entries.is_empty());
-    }
-
-    #[test]
-    fn overlapping_read_ahead_windows_replace_instead_of_aliasing() {
-        let mut caches = ReadCacheSet::new();
-        caches
-            .insert(ReadCache {
-                generation: 7,
-                lba: 100,
-                block_count: 4,
-                block_size: 4,
-                bytes: vec![1; 16],
-            })
-            .expect("insert first window");
-        caches
-            .insert(ReadCache {
-                generation: 7,
-                lba: 102,
-                block_count: 4,
-                block_size: 4,
-                bytes: vec![2; 16],
-            })
-            .expect("replace overlapping window");
-        assert_eq!(caches.entries.len(), 1);
-        assert_eq!(caches.slice(7, 100, 1, 4), Ok(None));
-        assert_eq!(caches.slice(7, 102, 1, 4), Ok(Some(vec![2; 4])));
     }
 
     #[test]
@@ -1210,150 +679,26 @@ mod tests {
     }
 
     #[test]
-    fn read_telemetry_reports_one_bounded_summary_per_interval() {
-        let telemetry = ReadTelemetry::new();
-        telemetry.record_hit();
-        let ms = Duration::from_millis;
-        for batch in 1..READ_TELEMETRY_INTERVAL_BATCHES {
-            assert!(
-                telemetry.record_batch(16, 1 << 20, ms(1), ms(11), ms(170)).is_none(),
-                "batch {batch} must not log"
-            );
-        }
-        let line = telemetry
-            .record_batch(16, 1 << 20, ms(1), ms(11), ms(171))
-            .expect("interval boundary logs");
-        assert!(line.contains(&format!("batches={READ_TELEMETRY_INTERVAL_BATCHES} ")));
-        assert!(line.contains(&format!("windows={} ", 16 * READ_TELEMETRY_INTERVAL_BATCHES)));
-        assert!(line.contains(&format!("bytes={} ", READ_TELEMETRY_INTERVAL_BATCHES << 20)));
-        assert!(line.contains("hits=1 "));
-        assert!(line.contains("max_batch_us=171000"));
-        // The per-interval maximum restarts; totals keep accumulating.
-        for _ in 1..READ_TELEMETRY_INTERVAL_BATCHES {
-            assert!(telemetry.record_batch(1, 4096, ms(0), ms(1), ms(2)).is_none());
-        }
-        let next = telemetry
-            .record_batch(1, 4096, ms(0), ms(1), ms(2))
-            .expect("second interval logs");
-        assert!(next.contains("max_batch_us=2000"));
-    }
-
-    #[test]
-    fn read_ahead_plan_pipelines_bounded_transport_windows() {
-        let windows = read_ahead_plan(info(), 100, 2, READ_AHEAD_IN_FLIGHT_LIMIT)
-            .expect("valid read-ahead plan");
-        assert_eq!(windows.len(), READ_AHEAD_IN_FLIGHT_LIMIT);
+    fn quarantine_rejects_same_generation_and_recovers_on_new_generation() {
+        let q = AtomicU64::new(7);
+        assert_eq!(require_unquarantined_for(&q, 7), Err(libc::EIO));
+        assert_eq!(require_unquarantined_for(&q, 0), Err(libc::EIO));
+        assert_eq!(require_unquarantined_for(&q, 8), Ok(()));
+        // ORDERING: single-threaded test; the orderings mirror production.
+        QUARANTINED_GENERATION.store(7, Ordering::Release);
+        clear_quarantine_for_new_generation(7);
+        // ORDERING: single-threaded test read.
+        assert_eq!(QUARANTINED_GENERATION.load(Ordering::Acquire), 7);
+        clear_quarantine_for_new_generation(6);
+        // ORDERING: single-threaded test read.
         assert_eq!(
-            windows[0],
-            ReadAheadWindow {
-                lba: 100,
-                block_count: 16,
-                byte_len: BLOCK_BROKER_MAX_IO_BYTES,
-            }
+            QUARANTINED_GENERATION.load(Ordering::Acquire),
+            7,
+            "an older generation never lifts quarantine"
         );
-        assert_eq!(windows[1].lba, 116);
-        assert!(windows
-            .windows(2)
-            .all(|pair| pair[0].lba + pair[0].block_count == pair[1].lba));
-    }
-
-    #[test]
-    fn sequential_batch_preserves_recent_interleaved_metadata() {
-        let mut caches = ReadCacheSet::new();
-        let geometry = info();
-        for lba in 0..READ_CACHE_WINDOW_LIMIT as u64 {
-            caches.insert(ReadCache {
-                generation: geometry.generation, lba, block_count: 1,
-                block_size: 4_096, bytes: vec![7; 4_096],
-            }).unwrap();
-        }
-        let metadata = READ_CACHE_WINDOW_LIMIT as u64 - 1;
-        assert!(caches.slice(geometry.generation, metadata, 1, 4_096).unwrap().is_some());
-        let windows = read_ahead_plan(geometry, 100, 2, READ_AHEAD_IN_FLIGHT_LIMIT).unwrap();
-        assert_eq!(windows.len(), READ_AHEAD_IN_FLIGHT_LIMIT, "speculation must leave cache headroom");
-        for window in windows {
-            caches.insert(ReadCache {
-                generation: geometry.generation, lba: window.lba,
-                block_count: window.block_count, block_size: 4_096,
-                bytes: vec![0; window.byte_len],
-            }).unwrap();
-        }
-        assert_eq!(caches.entries.len(), READ_CACHE_WINDOW_LIMIT);
-        assert_eq!(caches.slice(geometry.generation, metadata, 1, 4_096), Ok(Some(vec![7; 4_096])));
-    }
-
-    #[test]
-    fn read_ahead_plan_stops_at_device_end_and_rejects_oversize_requests() {
-        let windows = read_ahead_plan(info(), 1_020, 1, READ_AHEAD_IN_FLIGHT_LIMIT)
-            .expect("tail read-ahead plan");
-        assert_eq!(
-            windows,
-            vec![ReadAheadWindow {
-                lba: 1_020,
-                block_count: 4,
-                byte_len: 16 * 1_024,
-            }]
-        );
-        assert_eq!(
-            read_ahead_plan(info(), 100, 17, READ_AHEAD_IN_FLIGHT_LIMIT),
-            Err(libc::EINVAL)
-        );
-        assert_eq!(
-            read_ahead_plan(info(), 1_024, 1, READ_AHEAD_IN_FLIGHT_LIMIT),
-            Err(libc::EINVAL)
-        );
-        assert_eq!(read_ahead_plan(info(), 100, 1, 0), Err(libc::EINVAL));
-    }
-
-    #[test]
-    fn unaligned_sequential_requests_assemble_across_windows() {
-        let mut caches = ReadCacheSet::new();
-        for (lba, byte) in [(0_u64, 1_u8), (4, 2)] {
-            caches
-                .insert(ReadCache {
-                    generation: 7,
-                    lba,
-                    block_count: 4,
-                    block_size: 2,
-                    bytes: vec![byte; 8],
-                })
-                .unwrap();
-        }
-        // blocks 3..7 straddle both windows.
-        match caches.cover(7, 3, 4, 2).unwrap() {
-            Coverage::Hit(bytes) => assert_eq!(bytes, [1, 1, 2, 2, 2, 2, 2, 2]),
-            Coverage::Partial { .. } => panic!("expected hit"),
-        }
-        // blocks 6..10: cached prefix of 2 blocks, first uncovered block 8.
-        caches.record_read_ahead_end(7, 8);
-        match caches.cover(7, 6, 4, 2).unwrap() {
-            Coverage::Partial { prefix, start, continues_read_ahead } => {
-                assert_eq!(prefix, [2, 2, 2, 2]);
-                assert_eq!(start, 8);
-                assert!(continues_read_ahead);
-            }
-            Coverage::Hit(_) => panic!("expected partial"),
-        }
-        match caches.cover(8, 6, 1, 2).unwrap() {
-            Coverage::Partial { prefix, start, .. } => {
-                assert!(prefix.is_empty());
-                assert_eq!(start, 6);
-            }
-            Coverage::Hit(_) => panic!("generation must not alias"),
-        }
-        assert_eq!(caches.cover(7, 0, 1, 4).err(), Some(libc::EIO));
-    }
-
-    #[test]
-    fn random_miss_stays_one_window_until_a_contiguous_boundary_miss() {
-        let mut caches = ReadCacheSet::new();
-        assert!(!caches.miss_continues_read_ahead(7, 100));
-        caches.record_read_ahead_end(7, 116);
-        assert!(caches.miss_continues_read_ahead(7, 116));
-        assert!(!caches.miss_continues_read_ahead(7, 117));
-        assert!(!caches.miss_continues_read_ahead(8, 116));
-        caches.clear();
-        assert!(!caches.miss_continues_read_ahead(7, 116));
+        clear_quarantine_for_new_generation(8);
+        // ORDERING: single-threaded test read.
+        assert_eq!(QUARANTINED_GENERATION.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -1381,44 +726,22 @@ mod tests {
 
     #[test]
     fn writable_device_permits_multi_block_write_and_invalidates_read_cache() {
+        let _engine = engine_test_guard();
         let rw_info = BlockInfo {
             flags: 0,
             logical_block_size: 512,
             ..info()
         };
-        insert_read_ahead_batch(
-            [ReadCache {
-                generation: rw_info.generation,
-                lba: 0,
-                block_count: 2,
-                block_size: 512,
-                bytes: vec![0x5a; 1024],
-            }],
-            rw_info.generation,
-            2,
-        )
-        .expect("seed read cache");
-
-        let mut cached = [0_u8; 1024];
-        assert_eq!(
-            read_cache_lookup_into(rw_info, 0, 2, &mut cached),
-            Ok(CoverageInto::Hit(1024))
-        );
+        let geometry = read_geometry(rw_info).expect("geometry");
+        ENGINE.seed_ready(geometry, 0, vec![0x5a; crate::read_engine::WINDOW_BYTES]);
+        assert!(ENGINE.has_ready(0));
 
         let bytes = [0xa5_u8; 1024];
         let mut submitted = false;
         assert_eq!(
             write_admitted_with(rw_info, rw_info.generation, 0, 2, &bytes, || {
-                // Read cache must already be invalidated before submission.
-                let mut probe = [0_u8; 1024];
-                assert_eq!(
-                    read_cache_lookup_into(rw_info, 0, 2, &mut probe),
-                    Ok(CoverageInto::Partial {
-                        prefix_len: 0,
-                        start: 0,
-                        continues_read_ahead: false,
-                    })
-                );
+                // The cached window must already be invalidated before submission.
+                assert!(!ENGINE.has_ready(0));
                 submitted = true;
                 Ok(())
             }),

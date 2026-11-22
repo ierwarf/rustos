@@ -384,7 +384,7 @@ fn socket_type_admission_distinguishes_unsupported_type_from_family() {
     );
     assert_eq!(
         kind(unix, libc::SOCK_DGRAM as u64, 0),
-        Err(libc::ESOCKTNOSUPPORT)
+        Ok(UnixSocketKind::Dgram)
     );
     assert_eq!(
         kind(unix, libc::SOCK_RAW as u64, 0),
@@ -453,6 +453,7 @@ fn idle_socket(kind: UnixSocketKind) -> UnixSocket {
         refs: 1,
         options: SocketOptions::default(),
         bound_path: None,
+        bound_inode: None,
         local_path: None,
         peer_path: None,
         state: UnixSocketState::Idle,

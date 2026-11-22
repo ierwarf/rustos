@@ -40,10 +40,11 @@ fn google_ping_option_requires_network_and_rejects_physical_net_none() {
 #[test]
 fn google_ping_private_contract_records_explicit_opt_in() {
     assert_eq!(
-        render_private_acceptance_contract(false, true, true),
+        render_private_acceptance_contract(false, true, true, false),
         "contract=rustos-kvm-acceptance-v1\nui_profile=0\nnetwork_exercise=1\ngoogle_ping=1\n"
     );
-    assert!(render_private_acceptance_contract(false, true, false).ends_with("google_ping=0\n"));
+    assert!(render_private_acceptance_contract(false, true, false, false).ends_with("google_ping=0\n"));
+    assert!(render_private_acceptance_contract(false, false, false, true).ends_with("google_ping=0\nui_pixel_probe=1\n"));
 }
 
 #[test]

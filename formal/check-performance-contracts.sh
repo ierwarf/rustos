@@ -539,24 +539,24 @@ if rg -Fq 'linux_clock_nanosleep_admission_cached' \
     echo "retired per-process Linux time admission cache was reintroduced" >&2
     exit 1
 fi
-storaged_block=services/storaged/src/block.rs
-rg -Fq 'const _: () = assert!(READ_AHEAD_IN_FLIGHT_LIMIT < READ_CACHE_WINDOW_LIMIT);' \
-    "$storaged_block" || {
+storaged_engine=services/storaged/src/read_engine.rs
+rg -Fq 'const _: () = assert!(IN_FLIGHT_LIMIT < WINDOW_LIMIT);' \
+    "$storaged_engine" || {
     echo "storaged read-ahead pipeline lost its cache headroom bound" >&2
     exit 1
 }
-rg -Fq 'let mut in_flight = Vec::with_capacity(windows.len());' \
-    "$storaged_block" || {
-    echo "storaged sequential read-ahead is serialized before DVM submission" >&2
+rg -Fq 'if stream.depth == 0 {' "$storaged_engine" || {
+    echo "storaged random reads can amplify into the read-ahead pipeline" >&2
     exit 1
 }
-rg -Fq 'miss_continues_read_ahead' "$storaged_block" || {
-    echo "storaged random reads can amplify into the full read-ahead pipeline" >&2
+rg -Fq 'Some(State::InFlight { .. }) => ready = false,' \
+    "$storaged_engine" || {
+    echo "storaged concurrent readers no longer share one in-flight window fetch" >&2
     exit 1
 }
-rg -Fq 'for (_, pending, _) in &in_flight[index + 1..]' \
-    "$storaged_block" || {
-    echo "storaged read-ahead completion failure no longer cancels pending tickets" >&2
+rg -Fq 'State::InFlight { stale, .. } => *stale = true,' \
+    "$storaged_engine" || {
+    echo "storaged write invalidation no longer discards in-flight windows" >&2
     exit 1
 }
 

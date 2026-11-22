@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use super::{
-    copy_opaque_wayland_damage_to_atlas, push_console_gpu_layer, push_wayland_gpu_layer,
-    reset_desktop_pixels, update_gpu_texture_layer_destination, wayland_window_client_rect,
-    wayland_window_outer_rect, GpuAtlasPacker, GpuLayerKind, GpuLayerTransform, GpuSceneLayer,
-    GpuTextureCapability, GpuTextureRegion, Rect, WaylandWindowSnapshot,
+    copy_opaque_wayland_damage_to_atlas, copy_wayland_damage_to_atlas, push_console_gpu_layer,
+    push_wayland_gpu_layer, reset_desktop_pixels, update_gpu_texture_layer_destination,
+    wayland_window_client_rect, wayland_window_outer_rect, GpuAtlasPacker, GpuLayerKind,
+    GpuLayerTransform, GpuSceneLayer, GpuTextureCapability, GpuTextureRegion, Rect,
+    WaylandWindowSnapshot,
 };
 
 #[test]
@@ -159,6 +160,50 @@ fn translucent_wayland_damage_falls_back_without_partial_mutation() {
         Ok(None)
     );
     assert_eq!(atlas, before);
+}
+
+#[test]
+fn translucent_csd_wayland_damage_copies_in_place() {
+    let mut pixels = vec![0xff00_0000; 12];
+    pixels[5] = 0x7f00_0001;
+    let mut window = snapshot(
+        pixels,
+        Rect {
+            x: 1,
+            y: 1,
+            width: 1,
+            height: 1,
+        },
+    );
+    window.server_decoration = false;
+    let outer = wayland_window_outer_rect(&window);
+    let source_rect = Rect {
+        x: 8,
+        y: 8,
+        width: outer.width,
+        height: outer.height,
+    };
+    let stride = 128;
+    let mut atlas = vec![0x5566_7788; stride * 128];
+    let damage = copy_wayland_damage_to_atlas(
+        atlas.as_mut_slice(),
+        stride,
+        source_rect,
+        &window,
+        true,
+    )
+    .expect("valid damage")
+    .expect("csd translucent damage uses partial copy");
+    assert_eq!(
+        damage,
+        Rect {
+            x: source_rect.x + 1,
+            y: source_rect.y + 1,
+            width: 1,
+            height: 1,
+        }
+    );
+    assert_eq!(atlas[damage.y * stride + damage.x], 0x7f00_0001);
 }
 
 #[test]

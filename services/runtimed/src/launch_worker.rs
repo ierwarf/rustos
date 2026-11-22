@@ -197,7 +197,11 @@ fn execute(
                 pid: None,
                 // The spawn boundary can fail after loaderd created a child;
                 // its errno alone does not prove that no side effect occurred.
-                result: Err(if job.report_started {
+                // `EAGAIN` is the exception: loaderd only returns it from
+                // admission (application budget, personality gate), before it
+                // creates anything, so the refusal is definite and the caller
+                // may submit the launch again once the budget frees up.
+                result: Err(if job.report_started && errno != libc::EAGAIN {
                     libc::EOWNERDEAD
                 } else {
                     errno
@@ -358,6 +362,38 @@ mod tests {
                 result: Err(libc::ETIMEDOUT)
             }
         ));
+    }
+
+    #[test]
+    fn a_budget_refusal_is_definite_but_other_spawn_errors_stay_unknown() {
+        for (errno, expected) in [
+            (libc::EAGAIN, libc::EAGAIN),
+            (libc::ENOMEM, libc::EOWNERDEAD),
+            (libc::EIO, libc::EOWNERDEAD),
+        ] {
+            let mut calls = calls();
+            calls.spawn = if errno == libc::EAGAIN {
+                |_, _, _| Err(libc::EAGAIN)
+            } else if errno == libc::ENOMEM {
+                |_, _, _| Err(libc::ENOMEM)
+            } else {
+                |_, _, _| Err(libc::EIO)
+            };
+            let (sender, _receiver) = mpsc::sync_channel(2);
+            let job = LaunchJob {
+                entry: entry(),
+                qualification_contract: None,
+                session_handle: None,
+                is_ui_server: false,
+                deadline: None,
+                deadline_ns: None,
+                report_started: true,
+            };
+            let LaunchProgress::Finished { pid: None, result } = execute(&job, &sender, &calls) else {
+                panic!("a refused spawn finishes without a pid");
+            };
+            assert_eq!(result, Err(expected), "spawn errno {errno}");
+        }
     }
 
     /// A child may not become runnable before the loop has recorded it.

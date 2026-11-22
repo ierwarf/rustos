@@ -166,6 +166,8 @@ pub(crate) fn render_frame(state: &mut AppState) {
 
 pub(crate) struct GpuAtlasScene {
     pub(crate) cropped: bool,
+    pub(crate) used_height: usize,
+    pub(crate) dock_source_rect: Option<Rect>,
     pub(crate) layers: Vec<GpuSceneLayer>,
     pub(crate) cursor_source_rect: Rect,
     pub(crate) wayland_bindings: Vec<WaylandAtlasBinding>,
@@ -303,7 +305,7 @@ fn build_full_gpu_atlas_scene(
     // cannot fit, retry with occlusion fragments instead of omitting a window.
     // Dock commands remain last, independent of atlas placement order.
     let mut dock_layers = Vec::new();
-    push_dock_gpu_layer(&mut packer, &mut dock_layers, atlas, state)?;
+    let dock_source_rect = push_dock_gpu_layer(&mut packer, &mut dock_layers, atlas, state)?;
     let mut cursor = vec![0_u32; CURSOR_TEXTURE_SIZE * CURSOR_TEXTURE_SIZE];
     if !render_cursor_bgra(cursor.as_mut_slice(), state.cursor_motion) {
         return Err(GpuSceneError::InvalidLayer);
@@ -385,6 +387,8 @@ fn build_full_gpu_atlas_scene(
     layers.extend(dock_layers);
     Ok(GpuAtlasScene {
         cropped: false,
+        used_height: packer.used_height(),
+        dock_source_rect,
         layers,
         cursor_source_rect,
         wayland_bindings,
@@ -478,12 +482,66 @@ pub(crate) fn gpu_scene_reuse_signature(state: &AppState) -> u64 {
         mix(window.frame.height as u64);
         mix(window.minimized as u64);
         mix(window.server_decoration as u64);
-        for byte in window.title.as_bytes() {
-            mix(u64::from(*byte));
+        if window.server_decoration {
+            for byte in window.title.as_bytes() {
+                mix(u64::from(*byte));
+            }
         }
     }
     mix(state.launcher_programs.len() as u64);
     signature
+}
+
+pub(crate) fn gpu_dock_reuse_signature(state: &AppState) -> u64 {
+    let mut signature = 0xcbf2_9ce4_8422_2325_u64;
+    let mut mix = |value: u64| {
+        signature ^= value;
+        signature = signature.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    mix(crate::font::asset_revision());
+    mix(u64::from(state.surface.width));
+    mix(u64::from(state.surface.height));
+    mix(state.desktop_cache.content_version);
+    mix(state.focused_session_handle);
+    mix(u64::from(state.focused_wayland_surface_id.unwrap_or(0)));
+    mix(state.console_windows.len() as u64);
+    for window in &state.console_windows {
+        mix(window.session_handle);
+        mix(window.minimized as u64);
+        for byte in window.title.as_bytes() {
+            mix(u64::from(*byte));
+        }
+    }
+    mix(state.wayland_windows.len() as u64);
+    for window in &state.wayland_windows {
+        mix(u64::from(window.surface_id));
+        mix(window.minimized as u64);
+        for byte in window.title.as_bytes() {
+            mix(u64::from(*byte));
+        }
+    }
+    signature
+}
+
+pub(crate) fn update_dock_gpu_texture(
+    state: &AppState,
+    atlas_pixels: &mut [u32],
+    atlas_width: usize,
+    atlas_height: usize,
+    atlas_stride_pixels: usize,
+    dock_source_rect: Rect,
+) -> Result<bool, GpuSceneError> {
+    let (destination, pixels) = render_dock_gpu_texture(state)?;
+    if destination.is_empty()
+        || destination.width != dock_source_rect.width
+        || destination.height != dock_source_rect.height
+    {
+        return Ok(false);
+    }
+    let mut packer =
+        GpuAtlasPacker::new(atlas_pixels, atlas_width, atlas_height, atlas_stride_pixels)?;
+    packer.write_xrgb_at(dock_source_rect, &pixels, destination.width)?;
+    Ok(true)
 }
 
 /// Apply position-only window changes to retained GPU commands.
@@ -609,11 +667,12 @@ pub(crate) fn update_wayland_gpu_textures(
         if window.content_version == binding.content_version {
             continue;
         }
-        let partial = copy_opaque_wayland_damage_to_atlas(
+        let partial = copy_wayland_damage_to_atlas(
             atlas_pixels,
             atlas_stride_pixels,
             binding.source_rect,
             window,
+            !window.server_decoration,
         )?;
         if let Some(partial) = partial {
             damage.push(partial);
@@ -751,11 +810,22 @@ fn update_console_gpu_texture(
     Ok(true)
 }
 
+#[cfg(test)]
 fn copy_opaque_wayland_damage_to_atlas(
     atlas_pixels: &mut [u32],
     atlas_stride_pixels: usize,
     source_rect: Rect,
     window: &WaylandWindowSnapshot,
+) -> Result<Option<Rect>, GpuSceneError> {
+    copy_wayland_damage_to_atlas(atlas_pixels, atlas_stride_pixels, source_rect, window, false)
+}
+
+fn copy_wayland_damage_to_atlas(
+    atlas_pixels: &mut [u32],
+    atlas_stride_pixels: usize,
+    source_rect: Rect,
+    window: &WaylandWindowSnapshot,
+    allow_translucent: bool,
 ) -> Result<Option<Rect>, GpuSceneError> {
     let local_outer = Rect {
         x: 0,
@@ -777,22 +847,24 @@ fn copy_opaque_wayland_damage_to_atlas(
     if window.stride_pixels < visible.width {
         return Ok(None);
     }
-    for row in changed.y..changed.y + changed.height {
-        let start = row
-            .checked_mul(window.stride_pixels)
-            .and_then(|offset| offset.checked_add(changed.x))
-            .ok_or(GpuSceneError::InvalidLayer)?;
-        let end = start
-            .checked_add(changed.width)
-            .ok_or(GpuSceneError::InvalidLayer)?;
-        if window
-            .pixels
-            .get(start..end)
-            .ok_or(GpuSceneError::InvalidLayer)?
-            .iter()
-            .any(|pixel| pixel >> 24 != 0xff)
-        {
-            return Ok(None);
+    if !allow_translucent {
+        for row in changed.y..changed.y + changed.height {
+            let start = row
+                .checked_mul(window.stride_pixels)
+                .and_then(|offset| offset.checked_add(changed.x))
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            let end = start
+                .checked_add(changed.width)
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            if window
+                .pixels
+                .get(start..end)
+                .ok_or(GpuSceneError::InvalidLayer)?
+                .iter()
+                .any(|pixel| pixel >> 24 != 0xff)
+            {
+                return Ok(None);
+            }
         }
     }
     let atlas_damage = Rect {
@@ -948,10 +1020,10 @@ fn push_dock_gpu_layer(
     layers: &mut Vec<GpuSceneLayer>,
     atlas: GpuTextureCapability,
     state: &AppState,
-) -> Result<(), GpuSceneError> {
+) -> Result<Option<Rect>, GpuSceneError> {
     let (destination, pixels) = render_dock_gpu_texture(state)?;
     if destination.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     push_xrgb_gpu_layer(
         packer,
@@ -964,7 +1036,7 @@ fn push_dock_gpu_layer(
         destination,
         false,
     )
-    .map(|_| ())
+    .map(Some)
 }
 
 fn render_dock_gpu_texture(state: &AppState) -> Result<(Rect, Vec<u32>), GpuSceneError> {

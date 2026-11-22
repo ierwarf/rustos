@@ -2,8 +2,10 @@
 
 extern crate alloc;
 
+pub mod bulk_plan;
 pub mod checkpoint_wire;
 pub mod directory;
+pub mod inotify;
 pub mod lifecycle;
 pub mod linux_types;
 pub mod locks;

@@ -128,6 +128,23 @@ pub(super) fn syscall_linux_syscalld_sched_getaffinity(
         Ok(mask) => mask,
         Err(error) => return linux_errno(affinity_error_to_linux_errno(error)),
     };
+    if ipc_ops::current_process_has_service_capability(ServiceCapability::VfsPolicy) {
+        // vfsd answers /proc/cpuinfo and /sys CPU lists on its single receive
+        // thread while syscalld can be blocked in the mapping broker waiting for
+        // vfsd (PREAD64). Offloading this call would wait on that blocked
+        // service until the IPC deadline. syscalld's policy is a pure check of
+        // the kernel-stamped task mask against the Online mask, which the kernel
+        // has just done, so vfsd's reply is formed here with the same check.
+        if task_mask == 0 || task_mask & !online_mask != 0 {
+            return linux_errno(LINUX_EINVAL);
+        }
+        let mut payload = [0_u8; LINUX_CPUSET_BYTES];
+        payload[..8].copy_from_slice(&task_mask.to_le_bytes());
+        return match usermem::write_current_user_bytes(mask_ptr, &payload) {
+            Ok(()) => LINUX_CPUSET_BYTES as u64,
+            Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
+        };
+    }
     let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY);
     request.dirfd = pid;
     request.flags = user_len as u64;
@@ -524,6 +541,11 @@ pub(super) fn syscall_linux_syscalld_getrandom(user_ptr: u64, user_len: u64, fla
 }
 
 pub(super) fn syscall_linux_wait4(pid: i64, status_ptr: u64, options: u64, rusage_ptr: u64) -> u64 {
+    const WAIT4_SUPPORTED_OPTIONS: u64 =
+        (linux_abi::WNOHANG | linux_abi::WUNTRACED | linux_abi::WCONTINUED) as u64;
+    if options & !WAIT4_SUPPORTED_OPTIONS != 0 || pid < -1 || pid == 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
     if status_ptr != 0
         && let Err(err) = usermem::validate_current_user_write_buffer(status_ptr, size_of::<i32>())
     {
@@ -538,15 +560,17 @@ pub(super) fn syscall_linux_wait4(pid: i64, status_ptr: u64, options: u64, rusag
         return linux_errno(user_pointer_error_to_linux_errno(err));
     }
 
-    let mut request = new_procd_request(PROCD_OP_WAIT4);
-    request.arg0 = pid as u64;
-    request.arg1 = options;
-    request.arg2 = status_ptr;
-    request.arg3 = rusage_ptr;
-    if let Err(errno) =
-        call_procd(&request).and_then(|response| ensure_empty_procd_response(&response))
-    {
-        return linux_errno(errno);
+    if !ipc_ops::current_process_has_service_capability(ServiceCapability::ProcessPolicy) {
+        let mut request = new_procd_request(PROCD_OP_WAIT4);
+        request.arg0 = pid as u64;
+        request.arg1 = options;
+        request.arg2 = status_ptr;
+        request.arg3 = rusage_ptr;
+        if let Err(errno) =
+            call_procd(&request).and_then(|response| ensure_empty_procd_response(&response))
+        {
+            return linux_errno(errno);
+        }
     }
 
     let parent_pid = match multitask::current_user_process_id() {
@@ -919,5 +943,21 @@ mod tests {
             .expect("acknowledged scheduler/process reclaim");
         let returned = wait.find("return child_pid").expect("terminal wait return");
         assert!(cleanup < reclaim && reclaim < returned);
+    }
+
+    #[test]
+    fn wait4_rejects_invalid_options_or_pgid_filters_before_procd_ipc() {
+        assert_eq!(
+            syscall_linux_wait4(-1, 0, u64::MAX, 0),
+            linux_errno(LINUX_EINVAL)
+        );
+        assert_eq!(
+            syscall_linux_wait4(0, 0, 0, 0),
+            linux_errno(LINUX_EINVAL)
+        );
+        assert_eq!(
+            syscall_linux_wait4(-2, 0, 0, 0),
+            linux_errno(LINUX_EINVAL)
+        );
     }
 }

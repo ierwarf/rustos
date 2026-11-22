@@ -795,16 +795,26 @@ pub fn with_fork_parent_state<R>(
 ) -> Result<R, super::pager_vma::PagerVmaError> {
     let retained = process_table::retain_process_by_pid(process_id)
         .ok_or(super::pager_vma::PagerVmaError::Stale)?;
-    let identity = retained
+    let _identity = retained
         .live_identity()
+        .ok_or(super::pager_vma::PagerVmaError::Stale)?;
+    let (vma_handle, vma_identity) = retained
+        .vma_owner()
         .ok_or(super::pager_vma::PagerVmaError::Stale)?;
     retained
         .with_visible_state_mut(|_, state| {
-            super::pager_vma::with_fork_held_regions(retained.handle(), identity, |regions| {
+            super::pager_vma::with_fork_held_regions(vma_handle, vma_identity, |regions| {
                 f(state, regions)
             })
         })
         .ok_or(super::pager_vma::PagerVmaError::Stale)?
+}
+
+pub fn with_fork_parent_vfork_state<R>(
+    process_id: u64,
+    f: impl FnOnce(&mut UserProcessState, &[rustos_user_abi::pager::PagerVmRegionWire]) -> R,
+) -> Result<R, super::pager_vma::PagerVmaError> {
+    with_fork_parent_state(process_id, f)
 }
 
 pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {

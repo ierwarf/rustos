@@ -231,6 +231,7 @@ enum PollRoute {
     Done(u32),
     Netd { token: u64 },
     Vfs,
+    VfsKeyed { remote_id: u64 },
 }
 
 struct PollEntry {
@@ -259,6 +260,8 @@ fn collect_poll_readiness(
     let mut netd_slots = Vec::new();
     let mut netd_queries = Vec::new();
     let mut vfs_slots = Vec::new();
+    let mut vfs_keyed_slots = Vec::new();
+    let mut vfs_keyed_queries = Vec::new();
     for index in 0..nfds {
         let entry_ptr = fds_ptr
             .checked_add((index * POLLFD_SIZE) as u64)
@@ -272,6 +275,8 @@ fn collect_poll_readiness(
             &mut netd_slots,
             &mut netd_queries,
             &mut vfs_slots,
+            &mut vfs_keyed_slots,
+            &mut vfs_keyed_queries,
             entry_ptr,
             raw,
             fd,
@@ -286,6 +291,8 @@ fn collect_poll_readiness(
         &netd_slots,
         &netd_queries,
         &vfs_slots,
+        &vfs_keyed_slots,
+        &vfs_keyed_queries,
         deadline_tick,
         &mut state,
     )?;
@@ -311,6 +318,8 @@ fn push_poll_entry(
     netd_slots: &mut Vec<usize>,
     netd_queries: &mut Vec<(u64, u32)>,
     vfs_slots: &mut Vec<usize>,
+    vfs_keyed_slots: &mut Vec<usize>,
+    vfs_keyed_queries: &mut Vec<(i32, u32, u64)>,
     ptr: u64,
     raw: [u8; POLLFD_SIZE],
     fd: i32,
@@ -342,6 +351,11 @@ fn push_poll_entry(
             vfs_slots.push(index);
             0
         }
+        PollRoute::VfsKeyed { remote_id } => {
+            vfs_keyed_slots.push(index);
+            vfs_keyed_queries.push((fd, events, remote_id));
+            0
+        }
     };
     entries.push(PollEntry {
         ptr,
@@ -353,16 +367,20 @@ fn push_poll_entry(
     Ok(revents)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_poll_entries(
     entries: &mut [PollEntry],
     netd_slots: &[usize],
     netd_queries: &[(u64, u32)],
     vfs_slots: &[usize],
+    vfs_keyed_slots: &[usize],
+    vfs_keyed_queries: &[(i32, u32, u64)],
     deadline_tick: Option<u64>,
     state: &mut PollReadinessState,
 ) -> Result<(), i64> {
     resolve_poll_netd_batch(entries, netd_slots, netd_queries, deadline_tick, state)?;
     resolve_poll_vfs_batch(entries, vfs_slots, deadline_tick, state)?;
+    resolve_poll_vfs_keyed_batch(entries, vfs_keyed_slots, vfs_keyed_queries, deadline_tick, state)?;
     if state.observations.len()
         > super::super::broker_ops::waitset_broker_ops::WAITSET_MAX_OBSERVATIONS
     {
@@ -433,6 +451,38 @@ fn resolve_poll_vfs_batch(
             Err(LINUX_ETIMEDOUT) => state.provider_timed_out = true,
             Err(errno) if provider_revoke_events(errno).is_some() => {
                 for slot in chunk {
+                    entries[*slot].revents = provider_revoke_events(errno).unwrap();
+                }
+            }
+            Err(errno) => return Err(errno),
+        }
+    }
+    Ok(())
+}
+
+fn resolve_poll_vfs_keyed_batch(
+    entries: &mut [PollEntry],
+    slots: &[usize],
+    queries: &[(i32, u32, u64)],
+    deadline_tick: Option<u64>,
+    state: &mut PollReadinessState,
+) -> Result<(), i64> {
+    for (slot_chunk, query_chunk) in slots
+        .chunks(rustos_user_abi::syscall::VFS_POLL_KEYED_BATCH_MAX)
+        .zip(queries.chunks(rustos_user_abi::syscall::VFS_POLL_KEYED_BATCH_MAX))
+    {
+        match poll_vfs_keyed_batch(query_chunk, deadline_tick) {
+            Ok((revents, generation)) => {
+                for ((slot, &(_, _, remote_id)), revents) in
+                    slot_chunk.iter().zip(query_chunk.iter()).zip(revents)
+                {
+                    note_poll_observation(state, WAITSET_PROVIDER_VFSD, remote_id, generation);
+                    entries[*slot].revents = revents;
+                }
+            }
+            Err(LINUX_ETIMEDOUT) => state.provider_timed_out = true,
+            Err(errno) if provider_revoke_events(errno).is_some() => {
+                for slot in slot_chunk {
                     entries[*slot].revents = provider_revoke_events(errno).unwrap();
                 }
             }
@@ -579,6 +629,13 @@ fn route_one_poll_fd(
             ) =>
         {
             Ok(PollRoute::Done(events & linux_abi::POLLOUT as u32))
+        }
+        multitask::KernelHandle::RemoteVfs(remote)
+            if remote.kind() == multitask::RemoteVfsHandleKind::Inotify =>
+        {
+            Ok(PollRoute::VfsKeyed {
+                remote_id: remote.remote_id(),
+            })
         }
         _ => Ok(PollRoute::Vfs),
     }
@@ -743,6 +800,46 @@ fn poll_vfs_batch(queries: &[(i32, u32)], deadline_tick: Option<u64>) -> Result<
         revents.push(value as u32);
     }
     Ok(revents)
+}
+
+fn poll_vfs_keyed_batch(
+    queries: &[(i32, u32, u64)],
+    deadline_tick: Option<u64>,
+) -> Result<(Vec<u32>, u64), i64> {
+    const ENTRY_SIZE: usize = 16;
+    if queries.is_empty() || queries.len() > rustos_user_abi::syscall::VFS_POLL_KEYED_BATCH_MAX {
+        return Err(LINUX_EINVAL);
+    }
+    let mut request = new_vfs_request(VFS_IPC_OP_POLL_QUERY);
+    request.arg0 = rustos_user_abi::syscall::VFS_POLL_QUERY_POLL_KEYED;
+    request.payload_len = (queries.len() * ENTRY_SIZE) as u32;
+    for (index, (fd, events, remote_id)) in queries.iter().copied().enumerate() {
+        let offset = index * ENTRY_SIZE;
+        request.payload[offset..offset + 4].copy_from_slice(&fd.to_le_bytes());
+        request.payload[offset + 4..offset + 6].copy_from_slice(&(events as i16).to_le_bytes());
+        request.payload[offset + 6..offset + 8].copy_from_slice(&0_i16.to_le_bytes());
+        request.payload[offset + 8..offset + 16].copy_from_slice(&remote_id.to_le_bytes());
+    }
+    let response = call_vfs_ipc_request_with_timeout(
+        &request,
+        waitset_provider_query_timeout_ms(deadline_tick),
+    )?;
+    ensure_vfs_status(&response)?;
+    if response.payload_len as usize != queries.len() * ENTRY_SIZE {
+        return Err(LINUX_EINVAL);
+    }
+    let generation = response.aux.max(1);
+    let mut revents = Vec::with_capacity(queries.len());
+    for index in 0..queries.len() {
+        let offset = index * ENTRY_SIZE;
+        let value = i16::from_le_bytes(
+            response.payload[offset + 6..offset + 8]
+                .try_into()
+                .map_err(|_| LINUX_EINVAL)?,
+        );
+        revents.push(u32::from(value as u16));
+    }
+    Ok((revents, generation))
 }
 
 fn poll_ready_bits(requested: u32) -> u32 {
@@ -1110,12 +1207,16 @@ fn collect_select_readiness(
     let mut netd_slots = Vec::new();
     let mut netd_queries = Vec::new();
     let mut vfs_slots = Vec::new();
+    let mut vfs_keyed_slots = Vec::new();
+    let mut vfs_keyed_queries = Vec::new();
     for req in requests {
         let rev = push_poll_entry(
             &mut entries,
             &mut netd_slots,
             &mut netd_queries,
             &mut vfs_slots,
+            &mut vfs_keyed_slots,
+            &mut vfs_keyed_queries,
             0,
             [0_u8; POLLFD_SIZE],
             req.fd,
@@ -1132,6 +1233,8 @@ fn collect_select_readiness(
         &netd_slots,
         &netd_queries,
         &vfs_slots,
+        &vfs_keyed_slots,
+        &vfs_keyed_queries,
         deadline_tick,
         &mut state,
     )?;
@@ -1625,6 +1728,11 @@ fn epoll_interest_target(fd: u64) -> Result<EpollInterestTarget, i64> {
         multitask::KernelHandle::Console(console) if !current_console_session_is_system() => {
             (WAITSET_PROVIDER_SESSIOND, console.token_id())
         }
+        multitask::KernelHandle::RemoteVfs(remote)
+            if remote.kind() == multitask::RemoteVfsHandleKind::Inotify =>
+        {
+            (WAITSET_PROVIDER_VFSD, remote.remote_id())
+        }
         multitask::KernelHandle::Pipe(_) | multitask::KernelHandle::EventFd(_) => (
             WAITSET_PROVIDER_KERNEL,
             super::local_fd::waitset_object(&handle).ok_or(LINUX_EBADF)?,
@@ -1668,6 +1776,7 @@ fn release_epoll_target_guard(guard: EpollTargetGuard) {
 
 fn waitset_provider_epoch(provider: u16) -> Result<u64, i64> {
     let service_id = match provider {
+        WAITSET_PROVIDER_VFSD => IPC_SERVICE_VFSD,
         WAITSET_PROVIDER_NETD => IPC_SERVICE_NETD,
         WAITSET_PROVIDER_INPUTD => IPC_SERVICE_INPUTD,
         WAITSET_PROVIDER_SESSIOND => IPC_SERVICE_SESSIOND,
@@ -1807,6 +1916,8 @@ fn collect_epoll_readiness(
     let mut scans = Vec::with_capacity(interests.len());
     let mut netd_slots = Vec::new();
     let mut netd_queries = Vec::new();
+    let mut vfs_keyed_slots = Vec::new();
+    let mut vfs_keyed_queries = Vec::new();
     for (index, (wire, revoked, epoch_generation)) in interests.iter().enumerate() {
         let interest = &wire.interest;
         if wire.state & WAITSET_SNAPSHOT_STATE_DISABLED != 0 {
@@ -1826,6 +1937,12 @@ fn collect_epoll_readiness(
         if interest.provider == WAITSET_PROVIDER_NETD {
             netd_slots.push(index);
             netd_queries.push((interest.object_id, provider_events));
+            scans.push(InterestScan::Netd);
+            continue;
+        }
+        if interest.provider == WAITSET_PROVIDER_VFSD {
+            vfs_keyed_slots.push(index);
+            vfs_keyed_queries.push((interest.target_fd as i32, provider_events, interest.object_id));
             scans.push(InterestScan::Netd);
             continue;
         }
@@ -1962,6 +2079,45 @@ fn collect_epoll_readiness(
                 }
             }
             Err(errno) => return Err(errno),
+        }
+    }
+
+    if !vfs_keyed_queries.is_empty() {
+        for (slot_chunk, query_chunk) in vfs_keyed_slots
+            .chunks(rustos_user_abi::syscall::VFS_POLL_KEYED_BATCH_MAX)
+            .zip(vfs_keyed_queries.chunks(rustos_user_abi::syscall::VFS_POLL_KEYED_BATCH_MAX))
+        {
+            match poll_vfs_keyed_batch(query_chunk, deadline_tick) {
+                Ok((outcomes, generation)) => {
+                    for ((slot, &(_, _, remote_id)), revents) in
+                        slot_chunk.iter().zip(query_chunk.iter()).zip(outcomes)
+                    {
+                        merge_provider_observation(
+                            &mut observations,
+                            super::super::broker_ops::waitset_broker_ops::ProviderObservation {
+                                provider: WAITSET_PROVIDER_VFSD,
+                                object_id: remote_id,
+                                generation,
+                            },
+                        );
+                        scans[*slot] = InterestScan::Ready { revents, generation };
+                    }
+                }
+                Err(LINUX_ETIMEDOUT) => {
+                    for slot in slot_chunk {
+                        scans[*slot] = InterestScan::TimedOut;
+                    }
+                }
+                Err(errno) if provider_revoke_events(errno).is_some() => {
+                    for slot in slot_chunk {
+                        scans[*slot] = InterestScan::Ready {
+                            revents: revoke_events,
+                            generation: 1,
+                        };
+                    }
+                }
+                Err(errno) => return Err(errno),
+            }
         }
     }
 

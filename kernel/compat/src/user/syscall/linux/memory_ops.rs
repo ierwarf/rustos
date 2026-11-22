@@ -13,6 +13,11 @@
 //!   shortfall returns a Linux errno and leaves the prior address space intact.
 //! - **Forbidden:** No discarded address-space result, no guest-selected
 //!   frame, no W+X protection, and no partial range left published on error.
+//! - **Service heap growth:** vfsd's hint-free anonymous RW `mmap` (the service
+//!   allocator's only growth request) is mapped here directly, never through
+//!   syscalld: syscalld's mapping broker blocks on vfsd (`FILE_IDENTITY`,
+//!   `PREAD64`) while vfsd's single receiver may be growing its heap, a cycle
+//!   with no timeout that stalled every Chrome thread.
 //! - **Evidence:** `memory-map`.
 
 use core::mem::size_of;
@@ -189,6 +194,20 @@ pub(super) fn syscall_linux_mmap(
     fd: u64,
     offset: u64,
 ) -> u64 {
+    if is_plain_anonymous_heap_growth(requested_addr, prot, flags, fd, offset)
+        && ipc_ops::current_process_has_service_capability(ServiceCapability::VfsPolicy)
+    {
+        // vfsd's single receive thread grows its heap while serving a request,
+        // and syscalld's single receive thread can be inside a vfsd call (the
+        // mapping broker's FILE_IDENTITY / PREAD64) at that moment. Routing this
+        // `mmap` through syscalld would leave each waiting on the other forever,
+        // so vfsd's plain anonymous heap growth is mapped by the kernel
+        // directly; every other mapping vfsd makes still goes to syscalld.
+        return match bootstrap_mmap(requested_addr, user_len, prot, flags, fd, offset) {
+            Ok(addr) => addr,
+            Err(errno) => linux_errno(errno),
+        };
+    }
     let response = match call_syscalld_fast_mem(
         SYSCALL_OFFLOAD_OP_LINUX_MMAP,
         requested_addr,
@@ -484,6 +503,41 @@ fn checked_bootstrap_mapping_end(
 }
 
 #[cfg(test)]
+mod heap_growth_bypass_tests {
+    use super::*;
+
+    const RW: u64 = linux_abi::PROT_READ | linux_abi::PROT_WRITE;
+    const ANON: u64 = linux_abi::MAP_PRIVATE | linux_abi::MAP_ANONYMOUS;
+
+    #[test]
+    fn only_the_service_allocator_request_shape_bypasses_syscalld() {
+        assert!(is_plain_anonymous_heap_growth(0, RW, ANON, u64::MAX, 0));
+        assert!(is_plain_anonymous_heap_growth(0, RW, ANON, u32::MAX as u64, 0));
+        // A hint, a fixed address, a file, a shared mapping, executable or
+        // read-only protections each keep syscalld's policy in the path.
+        assert!(!is_plain_anonymous_heap_growth(0x1000, RW, ANON, u64::MAX, 0));
+        assert!(!is_plain_anonymous_heap_growth(0, RW, ANON | linux_abi::MAP_FIXED, u64::MAX, 0));
+        assert!(!is_plain_anonymous_heap_growth(0, RW, ANON, 3, 0));
+        assert!(!is_plain_anonymous_heap_growth(0, RW, ANON, u64::MAX, 4096));
+        assert!(!is_plain_anonymous_heap_growth(
+            0,
+            RW,
+            linux_abi::MAP_SHARED | linux_abi::MAP_ANONYMOUS,
+            u64::MAX,
+            0
+        ));
+        assert!(!is_plain_anonymous_heap_growth(
+            0,
+            RW | linux_abi::PROT_EXEC,
+            ANON,
+            u64::MAX,
+            0
+        ));
+        assert!(!is_plain_anonymous_heap_growth(0, linux_abi::PROT_READ, ANON, u64::MAX, 0));
+    }
+}
+
+#[cfg(test)]
 mod aslr_tests {
     use super::*;
 
@@ -511,6 +565,23 @@ mod aslr_tests {
         );
         assert!(!state.can_grow_brk_to(guard + PAGE_SIZE));
     }
+}
+
+/// The exact request shape `rustos_svc_runtime::syscall::mmap_anonymous` issues:
+/// a hint-free, private, anonymous, read-write mapping. Nothing else may take
+/// the syscalld bypass.
+fn is_plain_anonymous_heap_growth(
+    requested_addr: u64,
+    prot: u64,
+    flags: u64,
+    fd: u64,
+    offset: u64,
+) -> bool {
+    requested_addr == 0
+        && offset == 0
+        && linux_mmap_fd_is_anonymous(fd)
+        && prot == linux_abi::PROT_READ | linux_abi::PROT_WRITE
+        && linux_mmap_effective_flags(flags) == linux_abi::MAP_PRIVATE | linux_abi::MAP_ANONYMOUS
 }
 
 fn linux_mmap_fd_is_anonymous(fd: u64) -> bool {

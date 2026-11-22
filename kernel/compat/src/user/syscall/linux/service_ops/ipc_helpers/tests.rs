@@ -791,9 +791,10 @@ fn seqpacket_and_netlink_replies_are_prepared_and_typed_exactly() {
         ),
         "a stream handle must not satisfy a seqpacket request"
     );
-    // socket(AF_UNIX, SOCK_DGRAM) is refused by netd and never prepared.
+    // socket(AF_UNIX, SOCK_DGRAM) is a prepared socket handle like the other
+    // AF_UNIX types.
     let dgram = NetdIpcRequest { arg1: linux_abi::SOCK_DGRAM, ..request };
-    assert!(!netd_reply_uses_prepared_socket(&dgram));
+    assert!(netd_reply_uses_prepared_socket(&dgram));
     // socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE): a token handle.
     let netlink = NetdIpcRequest {
         arg0: rustos_user_abi::syscall::NET_BROKER_PUBLICATION_AF_NETLINK,

@@ -255,11 +255,19 @@ pub(super) enum SnapshotPixels {
     Damage { damage: Rect, rows: Vec<u32> },
 }
 
+/// Largest staging buffer a snapshot worker keeps between jobs.
+const MAX_RETAINED_SCRATCH_BYTES: usize = 32 * 1024 * 1024;
+
 impl SnapshotSpec {
     /// Read and convert. Pure with respect to compositor state: nothing here
     /// touches a surface, so a failure or a cancellation leaves no trace.
+    #[cfg(test)]
     pub(super) fn run(self) -> io::Result<SnapshotPixels> {
-        let bytes = super::shm::read_shm_snapshot(self.fd.as_raw_fd(), self.read_start, self.read_len)?;
+        let mut scratch = Vec::new();
+        self.run_with_scratch(&mut scratch)
+    }
+
+    fn run_with_scratch(self, scratch: &mut Vec<u8>) -> io::Result<SnapshotPixels> {
         let bad = || io::Error::from(io::ErrorKind::InvalidData);
         match self.layout {
             SnapshotLayout::Full {
@@ -270,7 +278,46 @@ impl SnapshotSpec {
             } => {
                 let width_bytes = width.checked_mul(4).ok_or_else(bad)?;
                 let count = checked_wayland_pixel_count(width, height).ok_or_else(bad)?;
-                let mut pixels = Vec::new();
+                let expected_tight = width_bytes.checked_mul(height).ok_or_else(bad)?;
+                if stride == width_bytes && self.read_len == expected_tight {
+                    let mut pixels: Vec<u32> = Vec::new();
+                    pixels
+                        .try_reserve_exact(count)
+                        .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
+                    let spare_bytes: &mut [std::mem::MaybeUninit<u8>] = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            pixels.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(),
+                            expected_tight,
+                        )
+                    };
+                    super::shm::read_shm_snapshot_into_uninit(
+                        self.fd.as_raw_fd(),
+                        self.read_start,
+                        spare_bytes,
+                    )?;
+                    // SAFETY: `read_shm_snapshot_into_uninit` initialized all
+                    // `count * 4` bytes, and every bit pattern of `u32` is valid.
+                    unsafe {
+                        pixels.set_len(count);
+                    }
+                    if !has_alpha {
+                        for pixel in &mut pixels {
+                            *pixel |= 0xff00_0000;
+                        }
+                    }
+                    return Ok(SnapshotPixels::Full {
+                        pixels,
+                        width,
+                        height,
+                    });
+                }
+                super::shm::read_shm_snapshot_into(
+                    self.fd.as_raw_fd(),
+                    self.read_start,
+                    self.read_len,
+                    scratch,
+                )?;
+                let mut pixels: Vec<u32> = Vec::new();
                 pixels
                     .try_reserve_exact(count)
                     .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
@@ -279,7 +326,7 @@ impl SnapshotSpec {
                     let src_start = row.checked_mul(stride).ok_or_else(bad)?;
                     let src_end = src_start.checked_add(width_bytes).ok_or_else(bad)?;
                     let dst_start = row.checked_mul(width).ok_or_else(bad)?;
-                    let src = bytes.get(src_start..src_end).ok_or_else(bad)?;
+                    let src = scratch.get(src_start..src_end).ok_or_else(bad)?;
                     let dst = pixels.get_mut(dst_start..dst_start + width).ok_or_else(bad)?;
                     if !copy_wayland_bgra_row(src, dst, has_alpha) {
                         return Err(bad());
@@ -296,9 +343,15 @@ impl SnapshotSpec {
                 stride,
                 has_alpha,
             } => {
+                super::shm::read_shm_snapshot_into(
+                    self.fd.as_raw_fd(),
+                    self.read_start,
+                    self.read_len,
+                    scratch,
+                )?;
                 let width_bytes = damage.width.checked_mul(4).ok_or_else(bad)?;
                 let count = damage.width.checked_mul(damage.height).ok_or_else(bad)?;
-                let mut rows = Vec::new();
+                let mut rows: Vec<u32> = Vec::new();
                 rows.try_reserve_exact(count)
                     .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
                 rows.resize(count, 0);
@@ -306,7 +359,7 @@ impl SnapshotSpec {
                     let src_start = row.checked_mul(stride).ok_or_else(bad)?;
                     let src_end = src_start.checked_add(width_bytes).ok_or_else(bad)?;
                     let dst_start = row * damage.width;
-                    let src = bytes.get(src_start..src_end).ok_or_else(bad)?;
+                    let src = scratch.get(src_start..src_end).ok_or_else(bad)?;
                     let dst = rows
                         .get_mut(dst_start..dst_start + damage.width)
                         .ok_or_else(bad)?;
@@ -419,7 +472,16 @@ impl SnapshotService {
             let spawned = crate::sys::spawn_ui_thread(
                 crate::sys::UiThreadRole::Background,
                 "uiserver-shm-snapshot",
-                move || worker(shared, SnapshotSpec::run),
+                move || {
+                    let mut scratch = Vec::new();
+                    worker(shared, move |spec| {
+                        let result = spec.run_with_scratch(&mut scratch);
+                        // Keep the staging buffer across frames, but never pin
+                        // a one-off huge pool read for the thread's lifetime.
+                        scratch.shrink_to(MAX_RETAINED_SCRATCH_BYTES);
+                        result
+                    });
+                },
             );
             if spawned.is_err() {
                 // The job stays queued for an existing worker; with none at all
@@ -464,7 +526,7 @@ impl SnapshotService {
     }
 }
 
-fn worker(shared: Arc<Shared>, run: impl Fn(SnapshotSpec) -> io::Result<SnapshotPixels>) {
+fn worker(shared: Arc<Shared>, mut run: impl FnMut(SnapshotSpec) -> io::Result<SnapshotPixels>) {
     loop {
         let (id, spec) = {
             let mut state = shared.lock();
@@ -701,6 +763,46 @@ mod tests {
             shared.lock().done.iter().all(|c| c.id != stuck),
             "a cancelled job's result is never delivered"
         );
+    }
+
+    #[test]
+    fn full_snapshot_reads_tight_and_strided_layouts_and_forces_opaque_alpha() {
+        // 2x2 pixels, 4 bytes each, tight: little-endian BGRA with alpha 0.
+        let tight: Vec<u8> = (0..4_u8).flat_map(|i| [i, 0, 0, 0]).collect();
+        let fd = Arc::new(tempfile_with(&tight));
+        let run = |has_alpha, stride, read_len, fd: &Arc<OwnedFd>| {
+            SnapshotSpec {
+                fd: Arc::clone(fd),
+                read_start: 0,
+                read_len,
+                layout: SnapshotLayout::Full { width: 2, height: 2, stride, has_alpha },
+            }
+            .run()
+            .unwrap()
+        };
+        let SnapshotPixels::Full { pixels, .. } = run(false, 8, 16, &fd) else { panic!() };
+        assert_eq!(pixels, [0xff00_0000, 0xff00_0001, 0xff00_0002, 0xff00_0003]);
+        let SnapshotPixels::Full { pixels, .. } = run(true, 8, 16, &fd) else { panic!() };
+        assert_eq!(pixels, [0, 1, 2, 3]);
+
+        // Rows padded to 12 bytes: the padding must not leak into pixels.
+        let mut padded = Vec::new();
+        for row in 0..2_u8 {
+            padded.extend_from_slice(&[row * 2, 0, 0, 0, row * 2 + 1, 0, 0, 0, 0xee, 0xee, 0xee, 0xee]);
+        }
+        let fd = Arc::new(tempfile_with(&padded));
+        let SnapshotPixels::Full { pixels, .. } = run(true, 12, 20, &fd) else { panic!() };
+        assert_eq!(pixels, [0, 1, 2, 3]);
+
+        // A short pool is an error, never uninitialised pixels.
+        let fd = Arc::new(tempfile_with(&tight[..8]));
+        let spec = SnapshotSpec {
+            fd,
+            read_start: 0,
+            read_len: 16,
+            layout: SnapshotLayout::Full { width: 2, height: 2, stride: 8, has_alpha: true },
+        };
+        assert!(spec.run().is_err());
     }
 
     fn limits_big() -> Limits {

@@ -85,10 +85,23 @@ fn process_fork_rejects_non_canonical_child_registers() {
 #[test]
 fn process_fork_commits_child_tid_before_runnable_publication() {
     let source = include_str!("fork.rs");
-    let fork = source
+    let broker = source
         .split("pub(super) fn syscall_linux_rustos_proc_fork_broker")
         .nth(1)
         .expect("fork broker");
+    // The reservation is taken by the broker before either spawn flavour runs.
+    assert!(
+        broker
+            .find("let spawn_reservation = match reserve_spawn_after_reclaim(args.source_pid)")
+            .expect("pre-clone lifecycle reservation")
+            < broker
+                .find("spawn_cow_fork_child(&args")
+                .expect("COW fork dispatch")
+    );
+    let fork = broker
+        .split("fn spawn_cow_fork_child")
+        .nth(1)
+        .expect("COW fork child");
     let logical_validate = fork
         .find("writable_committed_regions_cover")
         .expect("child TID VMA write prevalidation");
@@ -98,9 +111,6 @@ fn process_fork_commits_child_tid_before_runnable_publication() {
     let eager_private = fork
         .find("eager_private_ranges.push")
         .expect("child TID eager-private span");
-    let reservation = fork
-        .find("let spawn_reservation = match reserve_spawn_after_reclaim(args.source_pid)")
-        .expect("pre-clone lifecycle reservation");
     let clone = fork
         .find("clone_user_space")
         .expect("child address-space clone");
@@ -117,7 +127,6 @@ fn process_fork_commits_child_tid_before_runnable_publication() {
     assert!(logical_validate < present_validate);
     assert!(present_validate < eager_private);
     assert!(eager_private < clone);
-    assert!(reservation < clone);
     assert!(clone < suspended);
     assert!(suspended < published_reservation);
     assert!(suspended < write);
@@ -128,9 +137,9 @@ fn process_fork_commits_child_tid_before_runnable_publication() {
 fn process_fork_inherits_the_parent_reservation_before_the_child_is_runnable() {
     let source = include_str!("fork.rs");
     let fork = source
-        .split("pub(super) fn syscall_linux_rustos_proc_fork_broker")
+        .split("fn spawn_cow_fork_child")
         .nth(1)
-        .expect("fork broker");
+        .expect("COW fork child");
     let snapshot = fork
         .find("with_fork_parent_state")
         .expect("atomic parent VMA and page-table snapshot");

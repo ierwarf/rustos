@@ -86,6 +86,7 @@ pub(super) fn dispatch_request(
         SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME => handle_getpeername(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT => handle_setsockopt(request),
         SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT => handle_getsockopt(request, response),
+        SYSCALL_OFFLOAD_OP_LINUX_IOCTL => handle_ioctl(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN => handle_shutdown(request),
         _ => libc::EINVAL,
     };
@@ -206,6 +207,7 @@ pub(super) fn validate_request(received: usize, request: &NetdIpcRequest) -> Res
         | SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME
         | SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT
         | SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT
+        | SYSCALL_OFFLOAD_OP_LINUX_IOCTL
         | SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN
         | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
         | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG

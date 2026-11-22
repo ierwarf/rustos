@@ -242,6 +242,7 @@ pub enum RemoteVfsHandleKind {
     File,
     Directory,
     Device,
+    Inotify,
 }
 
 impl RemoteVfsHandle {
@@ -474,6 +475,9 @@ impl KernelHandle {
                         .union(FileHandleRights::WRITE)
                         .union(FileHandleRights::TRANSFER),
                 ),
+                RemoteVfsHandleKind::Inotify => {
+                    HandleRights::File(FileHandleRights::READ.union(FileHandleRights::TRANSFER))
+                }
             },
             Self::Socket(_) => HandleRights::Socket(
                 SocketHandleRights::SEND

@@ -1,6 +1,163 @@
 // SPDX-License-Identifier: MIT
 
 impl VfsState {
+    fn emit_inotify_with_ctx(
+        &mut self,
+        path: &str,
+        ctx: (u64, u64, u64, u64, bool),
+        event_mask: u32,
+        is_dir: bool,
+        cookie: u32,
+        new_path_on_move_self: Option<&str>,
+    ) {
+        if self.inotify.total_watch_count() == 0 {
+            return;
+        }
+        let (mount_id, mount_generation, node, parent_node, _) = ctx;
+        let (parent_path, child_name) = if path == "/" {
+            (None, None)
+        } else if let Some(pos) = path.rfind('/') {
+            let parent = if pos == 0 { "/" } else { &path[..pos] };
+            let name = &path[pos + 1..];
+            (Some(parent), (!name.is_empty()).then_some(name.as_bytes()))
+        } else {
+            (None, None)
+        };
+        let woken = self.inotify.emit_path_event(
+            mount_id,
+            mount_generation,
+            node,
+            path,
+            parent_node,
+            parent_path,
+            child_name,
+            event_mask,
+            is_dir,
+            cookie,
+            new_path_on_move_self,
+        );
+        if !woken.is_empty() {
+            self.advance_readiness_generation(&woken);
+        }
+    }
+
+    fn emit_inotify(&mut self, path: &str, event_mask: u32, is_dir: bool) {
+        if self.inotify.total_watch_count() == 0 {
+            return;
+        }
+        let ctx = lock_vfs_storage().inotify_path_context_locked(path);
+        self.emit_inotify_with_ctx(path, ctx, event_mask, is_dir, 0, None);
+    }
+
+    fn vfs_inotify_init(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let id = request.arg3;
+        if id == 0 || request.arg0 & !(linux_abi::IN_NONBLOCK | linux_abi::IN_CLOEXEC) != 0 {
+            response.status = EINVAL;
+            return;
+        }
+        if let Some(existing) = self.handles.get(&id).cloned() {
+            if existing.kind != RemoteKind::Inotify {
+                response.status = EINVAL;
+                return;
+            }
+            if let Err(errno) = self.bill_open_description(id, request.pid) {
+                response.status = errno;
+                return;
+            }
+            response.remote_id = id;
+            response.handle_kind = handle_kind_u16(existing.kind);
+            write_vfs_payload_bytes(response, existing.path.as_bytes());
+            response.value = 0;
+            return;
+        }
+        if self.inotify.instance_count() >= vfsd::inotify::MAX_USER_INSTANCES {
+            response.status = EMFILE;
+            return;
+        }
+        let open_flags = linux_abi::O_RDONLY | (request.arg0 & linux_abi::O_NONBLOCK);
+        match self.publish_open_handle(
+            request,
+            id,
+            "/anon_inode/inotify",
+            open_flags,
+            Metadata::plain(RemoteKind::Inotify, 0, id),
+            (0, 0),
+            false,
+            false,
+        ) {
+            Ok((id, handle)) => {
+                if let Err(errno) = self.inotify.create_instance(id) {
+                    self.handles.remove(&id);
+                    response.status = errno;
+                    return;
+                }
+                response.remote_id = id;
+                response.handle_kind = handle_kind_u16(handle.kind);
+                write_vfs_payload_bytes(response, handle.path.as_bytes());
+                response.value = 0;
+            }
+            Err(errno) => response.status = errno,
+        }
+    }
+
+    fn vfs_inotify_add_watch(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(handle) = self.handles.get(&request.remote_id) else {
+            response.status = EBADF;
+            return;
+        };
+        if handle.kind != RemoteKind::Inotify {
+            response.status = EINVAL;
+            return;
+        }
+        let Some(raw) = vfs_request_path(request) else {
+            response.status = EINVAL;
+            return;
+        };
+        let mask = request.arg0 as u32;
+        let follow_last = (mask & linux_abi::IN_DONT_FOLLOW) == 0;
+        let resolved = match self.resolve_path_follow(request, request.dirfd, raw, follow_last) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        let target = match lock_vfs_storage()
+            .inotify_target_for_path(resolved.as_str(), (mask & linux_abi::IN_ONLYDIR) != 0)
+        {
+            Ok(target) => target,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        match self.inotify.add_watch(request.remote_id, target, mask) {
+            Ok(wd) => response.value = wd as u64,
+            Err(errno) => response.status = errno,
+        }
+    }
+
+    fn vfs_inotify_rm_watch(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        let Some(handle) = self.handles.get(&request.remote_id) else {
+            response.status = EBADF;
+            return;
+        };
+        if handle.kind != RemoteKind::Inotify {
+            response.status = EINVAL;
+            return;
+        }
+        let wd = request.arg0 as u32 as i32;
+        match self.inotify.rm_watch(request.remote_id, wd) {
+            Ok(changed) => {
+                if changed {
+                    self.advance_readiness_generation(&[request.remote_id]);
+                }
+                response.value = 0;
+            }
+            Err(errno) => response.status = errno,
+        }
+    }
+
     fn vfs_openat(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
         let Some(path) = vfs_request_path(request) else {
             response.status = EINVAL;
@@ -35,6 +192,14 @@ impl VfsState {
                 return;
             }
         }
+        let check_create_existed = if self.inotify.total_watch_count() > 0
+            && (request.arg0 & linux_abi::O_CREAT) != 0
+            && !self.handles.contains_key(&request.arg3)
+        {
+            Some(lock_vfs_storage().metadata(path).is_ok())
+        } else {
+            None
+        };
         match self.open_remote_checkpointed(request, path, request.arg0) {
             Ok((id, handle)) => {
                 response.remote_id = id;
@@ -45,6 +210,17 @@ impl VfsState {
                 // length, which used to leave every open description's length
                 // equal to its path length.
                 response.value = handle.len;
+                if matches!(handle.kind, RemoteKind::File | RemoteKind::Directory)
+                    && !has_proc_snapshot(id)
+                    && !path.starts_with("/proc/")
+                    && !path.starts_with("/sys/")
+                {
+                    let is_dir = handle.kind == RemoteKind::Directory;
+                    if check_create_existed == Some(false) {
+                        self.emit_inotify(path, linux_abi::IN_CREATE, is_dir);
+                    }
+                    self.emit_inotify(path, linux_abi::IN_OPEN, is_dir);
+                }
             }
             Err(errno) => response.status = errno,
         }
@@ -85,9 +261,24 @@ impl VfsState {
         match self.checkpoint_close_description(request, request.remote_id) {
             Ok(_) => {
                 if let Some(closed) = self.handles.remove(&request.remote_id) {
+                    let had_proc_snap = has_proc_snapshot(request.remote_id);
                     remove_proc_snapshot(request.remote_id);
                     // Final close of the description: its OFD and flock locks.
                     self.locks.release_description(request.remote_id);
+                    if closed.kind == RemoteKind::Inotify {
+                        self.inotify.remove_instance(request.remote_id);
+                    } else if matches!(closed.kind, RemoteKind::File | RemoteKind::Directory)
+                        && !had_proc_snap
+                        && self.inotify.total_watch_count() > 0
+                    {
+                        let is_dir = closed.kind == RemoteKind::Directory;
+                        let mask = if !is_dir && closed.writable {
+                            linux_abi::IN_CLOSE_WRITE
+                        } else {
+                            linux_abi::IN_CLOSE_NOWRITE
+                        };
+                        self.emit_inotify(closed.path.as_str(), mask, is_dir);
+                    }
                     if closed.node != 0 {
                         lock_vfs_storage().unpin_node(closed.mount_id, closed.node);
                     } else if closed.mount_id != 0 {
@@ -110,6 +301,27 @@ impl VfsState {
         response: &mut VfsIpcResponse,
         offset: Option<u64>,
     ) {
+        if let Some(handle) = self.handles.get(&request.remote_id) {
+            if handle.kind == RemoteKind::Inotify {
+                if offset.is_some() {
+                    response.status = ESPIPE;
+                    return;
+                }
+                let len = request.arg1.min(VFS_IPC_PAYLOAD_CAPACITY as u64) as usize;
+                response.aux = self.readiness_generation;
+                match self
+                    .inotify
+                    .read_events(request.remote_id, &mut response.payload[..len])
+                {
+                    Ok(read) => {
+                        response.payload_len = read as u32;
+                        response.value = read as u64;
+                    }
+                    Err(errno) => response.status = errno,
+                }
+                return;
+            }
+        }
         let len = request.arg1.min(VFS_IPC_PAYLOAD_CAPACITY as u64) as usize;
         match self.read_remote_into(request, offset, len, &mut response.payload) {
             Ok(read) => {
@@ -125,6 +337,10 @@ impl VfsState {
             response.status = EBADF;
             return;
         };
+        if handle.kind == RemoteKind::Inotify {
+            response.status = ESPIPE;
+            return;
+        }
         if self.checkpoint_operation_replayed(request, checkpoint_handle_key(request.remote_id)) {
             if handle.last_mutation != VFSD_OPEN_MUTATION_LSEEK
                 || handle.last_start != request.arg0
@@ -375,6 +591,24 @@ impl VfsState {
             response.status = EBADF;
             return;
         };
+        if handle.kind == RemoteKind::Inotify {
+            let stat = vfsd::linux_types::LinuxStat {
+                st_ino: request.remote_id,
+                st_nlink: 1,
+                st_mode: 0o100_600,
+                st_blksize: DEFAULT_BLOCK_SIZE as i64,
+                ..vfsd::linux_types::LinuxStat::default()
+            };
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&stat as *const vfsd::linux_types::LinuxStat).cast::<u8>(),
+                    LINUX_STAT_SIZE,
+                )
+            };
+            response.payload_len = LINUX_STAT_SIZE as u32;
+            response.payload[..LINUX_STAT_SIZE].copy_from_slice(bytes);
+            return;
+        }
         if handle.node != 0 {
             match lock_vfs_storage().node_metadata(handle.mount_id, handle.node) {
                 Ok(metadata) => {
@@ -499,6 +733,13 @@ impl VfsState {
             // supplies an existing funded description and a fresh remote id.
             0x5255_0001 => self.vfs_reopen_description(request, response, &handle),
             linux_abi::F_GETFL => response.value = handle.status_flags,
+            linux_abi::FIONREAD => {
+                if handle.kind == RemoteKind::Inotify {
+                    response.value = self.inotify.pending_bytes(request.remote_id).unwrap_or(0) as u64;
+                } else {
+                    response.status = EINVAL;
+                }
+            }
             linux_abi::F_SETFL => {
                 if self.checkpoint_operation_replayed(
                     request,
@@ -1005,6 +1246,10 @@ impl VfsState {
         let attrs = FsCreateAttrs::new(request.arg0 as u32, request.euid, request.egid);
         let mut storage = lock_vfs_storage();
         response.status = storage.mkdir_path(&path, attrs, request);
+        drop(storage);
+        if response.status == 0 {
+            self.emit_inotify(&path, linux_abi::IN_CREATE | linux_abi::IN_ISDIR, true);
+        }
     }
 
     fn linux_mount_vfs(&mut self, response: &mut VfsIpcResponse) {
@@ -1046,7 +1291,18 @@ impl VfsState {
                 Err(errno) => { response.status = errno; return; }
             }
         }
+        let pre_ctx = if self.inotify.total_watch_count() > 0 {
+            Some(storage.inotify_path_context_locked(path.as_str()))
+        } else {
+            None
+        };
         response.status = storage.unlink_path(path.as_str(), remove_dir);
+        drop(storage);
+        if response.status == 0 {
+            if let Some(ctx) = pre_ctx {
+                self.emit_inotify_with_ctx(path.as_str(), ctx, linux_abi::IN_DELETE, remove_dir, 0, None);
+            }
+        }
     }
 
     fn vfs_write(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
@@ -1092,10 +1348,29 @@ impl VfsState {
             return;
         }
         let len = (request.payload_len as usize).min(request.payload.len());
+        if len == 0 {
+            response.value = 0;
+            return;
+        }
         let data = &request.payload[..len];
         let (start, written, new_len) = {
             let mut storage = lock_vfs_storage();
             if handle.node != 0 {
+                let est_start = if handle.append {
+                    match storage.node_len(handle.mount_id, handle.node) {
+                        Some(l) => l,
+                        None => {
+                            response.status = ESTALE;
+                            return;
+                        }
+                    }
+                } else {
+                    handle.cursor
+                };
+                if vfsd::cursor_after_write(handle.cursor, est_start, len, len).is_none() {
+                    response.status = EOVERFLOW;
+                    return;
+                }
                 let offset = if handle.append { None } else { Some(handle.cursor) };
                 match storage.write_node(handle.mount_id, handle.node, offset, data) {
                     Ok(result) => result,
@@ -1110,6 +1385,10 @@ impl VfsState {
                 } else {
                     handle.cursor
                 };
+                if vfsd::cursor_after_write(handle.cursor, start, len, len).is_none() {
+                    response.status = EOVERFLOW;
+                    return;
+                }
                 match storage.write_at_path(handle.path.as_str(), start, data) {
                     Ok((written, new_len)) => (start, written, new_len),
                     Err(errno) => {
@@ -1142,8 +1421,12 @@ impl VfsState {
             response.status = errno;
             return;
         }
+        let event_path = candidate.path.clone();
         self.handles.insert(request.remote_id, candidate);
         response.value = written as u64;
+        if written > 0 {
+            self.emit_inotify(event_path.as_str(), linux_abi::IN_MODIFY, false);
+        }
     }
 
     fn vfs_pwrite64(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
@@ -1185,6 +1468,7 @@ impl VfsState {
             .min(request.payload_len as usize)
             .min(request.payload.len());
         let data = &request.payload[..len];
+        let event_path = handle.path.clone();
         let result = if handle.node != 0 {
             lock_vfs_storage()
                 .write_node(handle.mount_id, handle.node, Some(request.arg0), data)
@@ -1198,6 +1482,9 @@ impl VfsState {
                     entry.len = new_len;
                 }
                 response.value = written as u64;
+                if written > 0 {
+                    self.emit_inotify(event_path.as_str(), linux_abi::IN_MODIFY, false);
+                }
             }
             Err(errno) => response.status = errno,
         }
@@ -1217,6 +1504,7 @@ impl VfsState {
             response.status = EINVAL;
             return;
         }
+        let event_path = handle.path.clone();
         let result = if handle.node != 0 {
             lock_vfs_storage().truncate_node(handle.mount_id, handle.node, request.arg0)
         } else {
@@ -1228,6 +1516,7 @@ impl VfsState {
                     entry.len = actual_len;
                 }
                 response.value = 0;
+                self.emit_inotify(event_path.as_str(), linux_abi::IN_MODIFY, false);
             }
             Err(errno) => response.status = errno,
         }
@@ -1284,6 +1573,11 @@ impl VfsState {
             Err(errno) => { response.status = errno; return; }
         };
         let mut storage = lock_vfs_storage();
+        let pre_old_ctx = if self.inotify.total_watch_count() > 0 {
+            Some(storage.inotify_path_context_locked(&old_path))
+        } else {
+            None
+        };
         let check = check_parent(&mut storage, &old_path, request, true)
             .and_then(|()| check_parent(&mut storage, &new_path, request, false))
             .and_then(|()| match storage.metadata(&new_path) {
@@ -1291,6 +1585,34 @@ impl VfsState {
                 Err(ENOENT) => Ok(()), Err(e) => Err(e),
             });
         response.status = match check { Ok(()) => storage.rename_paths(&old_path, &new_path, no_replace), Err(e) => e };
+        let new_ctx = if response.status == 0 && pre_old_ctx.is_some() {
+            Some(storage.inotify_path_context_locked(&new_path))
+        } else {
+            None
+        };
+        drop(storage);
+        if response.status == 0 {
+            if let (Some(old_ctx), Some(new_ctx)) = (pre_old_ctx, new_ctx) {
+                let cookie = self.inotify.alloc_cookie();
+                let is_dir = old_ctx.4;
+                self.emit_inotify_with_ctx(
+                    &old_path,
+                    old_ctx,
+                    linux_abi::IN_MOVED_FROM,
+                    is_dir,
+                    cookie,
+                    Some(&new_path),
+                );
+                self.emit_inotify_with_ctx(
+                    &new_path,
+                    new_ctx,
+                    linux_abi::IN_MOVED_TO,
+                    is_dir,
+                    cookie,
+                    None,
+                );
+            }
+        }
     }
 
     fn vfs_statfs(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
@@ -1350,6 +1672,10 @@ impl VfsState {
         let attrs = FsCreateAttrs::new(0o777, request.euid, request.egid);
         let mut storage = lock_vfs_storage();
         response.status = match check_parent(&mut storage, &link_path, request, false) { Ok(()) => storage.symlink_path(target, &link_path, attrs), Err(e) => e };
+        drop(storage);
+        if response.status == 0 {
+            self.emit_inotify(&link_path, linux_abi::IN_CREATE, false);
+        }
     }
 
     fn vfs_set_attrs(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
@@ -1395,6 +1721,8 @@ impl VfsState {
             };
             AttrTarget::Path(path.as_str())
         };
+        let mut event_path: Option<String> = None;
+        let mut is_dir = false;
         let mut storage = lock_vfs_storage();
         let metadata = match target {
             AttrTarget::Node(mount, node) => storage.node_metadata(mount, node),
@@ -1413,14 +1741,27 @@ impl VfsState {
                 let both_now = mask == VFS_ATTR_ATIME | VFS_ATTR_MTIME | VFS_ATTR_ATIME_NOW | VFS_ATTR_MTIME_NOW;
                 response.status = if both_now { EACCES } else { EPERM };
             }
-            Ok(_) => response.status = storage.set_attrs_path(
-                target,
-                request.arg0,
-                request.arg1 as i64,
-                request.arg2 as i64,
-                request.arg3,
-            ),
+            Ok(meta) => {
+                response.status = storage.set_attrs_path(
+                    target,
+                    request.arg0,
+                    request.arg1 as i64,
+                    request.arg2 as i64,
+                    request.arg3,
+                );
+                if response.status == 0 {
+                    is_dir = meta.kind == RemoteKind::Directory;
+                    event_path = match target {
+                        AttrTarget::Path(p) => Some(p.to_string()),
+                        AttrTarget::Node(..) => self.handles.get(&request.remote_id).map(|h| h.path.clone()),
+                    };
+                }
+            }
             Err(errno) => response.status = errno,
+        }
+        drop(storage);
+        if let Some(ep) = event_path {
+            self.emit_inotify(ep.as_str(), linux_abi::IN_ATTRIB, is_dir);
         }
     }
 
@@ -1455,6 +1796,10 @@ impl VfsState {
                 Err(errno) => response.status = errno,
             }
         }
+        drop(storage);
+        if response.status == 0 {
+            self.emit_inotify(&path, linux_abi::IN_CREATE, false);
+        }
     }
 
     /// `VFS_IPC_OP_CHMOD`: permission bits of the node at a path.
@@ -1471,12 +1816,23 @@ impl VfsState {
             }
         };
         let mut storage = lock_vfs_storage();
-        match storage.metadata(path.as_str()) {
+        let is_dir = match storage.metadata(path.as_str()) {
             Ok(metadata) if check_owner(metadata, request).is_err() => {
                 response.status = EPERM;
+                false
             }
-            Ok(_) => response.status = storage.chmod_path(path.as_str(), request.arg0 as u32),
-            Err(errno) => response.status = errno,
+            Ok(metadata) => {
+                response.status = storage.chmod_path(path.as_str(), request.arg0 as u32);
+                metadata.kind == RemoteKind::Directory
+            }
+            Err(errno) => {
+                response.status = errno;
+                false
+            }
+        };
+        drop(storage);
+        if response.status == 0 {
+            self.emit_inotify(path.as_str(), linux_abi::IN_ATTRIB, is_dir);
         }
     }
 
@@ -1486,6 +1842,8 @@ impl VfsState {
             response.status = EBADF;
             return;
         };
+        let event_path = handle.path.clone();
+        let is_dir = handle.kind == RemoteKind::Directory;
         if handle.node != 0 {
             let (mount_id, node) = (handle.mount_id, handle.node);
             let mut storage = lock_vfs_storage();
@@ -1494,7 +1852,7 @@ impl VfsState {
                 Ok(_) => response.status = storage.chmod_node(mount_id, node, request.arg0 as u32),
                 Err(errno) => response.status = errno,
             }
-        } else if handle.kind == RemoteKind::Device {
+        } else if handle.kind == RemoteKind::Device || handle.kind == RemoteKind::Inotify {
             response.status = EINVAL;
         } else {
             let path = handle.path.clone();
@@ -1502,6 +1860,9 @@ impl VfsState {
             response.status = match storage.metadata(&path).and_then(|m| check_owner(m, request)) {
                 Ok(()) => storage.chmod_path(&path, request.arg0 as u32), Err(e) => e,
             };
+        }
+        if response.status == 0 {
+            self.emit_inotify(event_path.as_str(), linux_abi::IN_ATTRIB, is_dir);
         }
     }
 
@@ -1547,6 +1908,12 @@ impl VfsState {
             uid,
             gid,
         );
+        if response.status == 0 {
+            let is_dir = lock_vfs_storage()
+                .metadata(path.as_str())
+                .is_ok_and(|m| m.kind == RemoteKind::Directory);
+            self.emit_inotify(path.as_str(), linux_abi::IN_ATTRIB, is_dir);
+        }
     }
 
     /// `VFS_IPC_OP_FCHOWN`: owner and group of an open description's node.
@@ -1559,17 +1926,22 @@ impl VfsState {
             response.status = EBADF;
             return;
         };
+        let event_path = handle.path.clone();
+        let is_dir = handle.kind == RemoteKind::Directory;
         let cred = Self::owner_credentials(request);
         if handle.node != 0 {
             let (mount_id, node) = (handle.mount_id, handle.node);
             response.status =
                 lock_vfs_storage().chown_target(AttrTarget::Node(mount_id, node), cred, uid, gid);
-        } else if handle.kind == RemoteKind::Device {
+        } else if handle.kind == RemoteKind::Device || handle.kind == RemoteKind::Inotify {
             response.status = EINVAL;
         } else {
             let path = handle.path.clone();
             response.status =
                 lock_vfs_storage().chown_target(AttrTarget::Path(path.as_str()), cred, uid, gid);
+        }
+        if response.status == 0 {
+            self.emit_inotify(event_path.as_str(), linux_abi::IN_ATTRIB, is_dir);
         }
     }
 
@@ -1625,6 +1997,10 @@ impl VfsState {
                 },
                 Err(errno) => errno,
             };
+            drop(storage);
+            if response.status == 0 {
+                self.emit_inotify(&new_path, linux_abi::IN_CREATE, false);
+            }
             return;
         }
         if old_raw.is_empty() {
@@ -1649,6 +2025,10 @@ impl VfsState {
             },
             Err(errno) => errno,
         };
+        drop(storage);
+        if response.status == 0 {
+            self.emit_inotify(&new_path, linux_abi::IN_CREATE, false);
+        }
     }
 
     /// `VFS_IPC_OP_FALLOCATE`: mode 0 and `KEEP_SIZE` on a memory-filesystem

@@ -4,8 +4,30 @@
 //! A record is not authority. It must be bound to an authenticated provider
 //! generation and an independently retained RustOS allocation capability.
 
-/// Separate shared backing, not the read-only GUI/atlas aperture.
-pub const DVM_APP_BUFFER_PHYS_ADDR: u64 = 0x1_2000_0000;
+/// The GUI/atlas aperture is one 512 MiB virtio-pmem; the separate writable
+/// app-buffer aperture follows it directly.
+pub const DVM_PIXEL_APERTURE_BYTES: u64 = 512 * 1024 * 1024;
+/// Both virtio-pmem windows live in QEMU's device-memory region, which starts at
+/// the first 1 GiB boundary at or above the end of guest RAM (and never below
+/// 4 GiB). The RustOS kernel and the host launcher derive the same base from the
+/// guest's RAM top, so the guest RAM size is not a hidden constant.
+pub const DVM_PMEM_MIN_BASE: u64 = 4 * 1024 * 1024 * 1024;
+pub const DVM_PMEM_BASE_ALIGN: u64 = 1024 * 1024 * 1024;
+
+/// Guest-physical base of the pixel aperture for a guest whose RAM ends at
+/// `ram_top`. `None` when rounding overflows.
+pub const fn dvm_pmem_base(ram_top: u64) -> Option<u64> {
+    let Some(rounded) = ram_top.checked_add(DVM_PMEM_BASE_ALIGN - 1) else {
+        return None;
+    };
+    let aligned = rounded & !(DVM_PMEM_BASE_ALIGN - 1);
+    Some(if aligned < DVM_PMEM_MIN_BASE { DVM_PMEM_MIN_BASE } else { aligned })
+}
+
+/// Guest-physical base of the separate shared app-buffer aperture.
+pub const fn dvm_app_buffer_phys_addr(pmem_base: u64) -> Option<u64> {
+    pmem_base.checked_add(DVM_PIXEL_APERTURE_BYTES)
+}
 pub const DVM_APP_BUFFER_APERTURE_BYTES: u64 = 512 * 1024 * 1024;
 pub const DVM_APP_BUFFER_PAGE_BYTES: u64 = 4096;
 pub const DVM_APP_BUFFER_RECORD_BYTES: usize = 64;
@@ -174,5 +196,21 @@ mod tests {
         let mut bytes = r.encode().unwrap();
         bytes[8] = 2;
         assert_eq!(DvmAppBuffer::decode(&bytes), None);
+    }
+
+    #[test]
+    fn pmem_windows_start_at_the_first_gib_boundary_at_or_above_ram() {
+        const GIB: u64 = 1 << 30;
+        // RAM below 4 GiB keeps the historical 4 GiB base and the 0x1_2000_0000 app aperture.
+        assert_eq!(dvm_pmem_base(2 * GIB), Some(4 * GIB));
+        assert_eq!(dvm_pmem_base(0), Some(4 * GIB));
+        assert_eq!(dvm_app_buffer_phys_addr(4 * GIB), Some(0x1_2000_0000));
+        // RAM that ends above 4 GiB pushes the windows to the next GiB boundary.
+        assert_eq!(dvm_pmem_base(4 * GIB), Some(4 * GIB));
+        assert_eq!(dvm_pmem_base(8 * GIB), Some(8 * GIB));
+        assert_eq!(dvm_pmem_base(8 * GIB - 4096), Some(8 * GIB));
+        assert_eq!(dvm_pmem_base(8 * GIB + 4096), Some(9 * GIB));
+        assert_eq!(dvm_pmem_base(u64::MAX), None);
+        assert_eq!(dvm_app_buffer_phys_addr(u64::MAX), None);
     }
 }

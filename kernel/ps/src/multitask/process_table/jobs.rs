@@ -771,7 +771,7 @@ pub fn job_set_memory_qos(id: JobId, high: u64, min: u64) -> Result<JobMemoryQos
 /// Kernel-retained rootd-crash recovery ledger. These records live inside the
 /// exact same process-table lock as Job slots and process membership. Rootd
 /// retains policy/rights while the kernel makes charge/refund idempotent.
-pub(super) const SESSION_TOKEN_SLOTS: usize = 512;
+pub(super) const SESSION_TOKEN_SLOTS: usize = 4096;
 pub(super) const SESSION_OWNER_SLOTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

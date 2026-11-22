@@ -343,10 +343,57 @@ pub fn procd_fork(
     request.arg3 = ctid_ptr;
     request.arg4 = tls;
     request.registers = frame_to_user_registers(frame);
-    match call_procd(&request) {
+    let child_pid = match call_procd(&request) {
         Ok(response) if response.status == 0 => response.result as u64,
-        Ok(response) => fork_refused(1, response.status.unsigned_abs() as i64),
-        Err(errno) => fork_refused(2, errno),
+        Ok(response) => return fork_refused(1, response.status.unsigned_abs() as i64),
+        Err(errno) => return fork_refused(2, errno),
+    };
+    if clone_flags & linux_abi::CLONE_VFORK != 0 {
+        wait_for_vfork_completion(child_pid);
+    }
+    child_pid
+}
+
+fn wait_for_vfork_completion(child_pid: u64) {
+    let Some(parent_tid) = multitask::current_task_id() else {
+        return;
+    };
+    let parent_pid = multitask::current_user_process_id();
+    loop {
+        if multitask::take_vfork_done(child_pid, parent_tid) {
+            return;
+        }
+        while !multitask::arm_block_current_task() {
+            if multitask::current_task_id() != Some(parent_tid) {
+                multitask::cancel_vfork_wait(child_pid, parent_tid);
+                return;
+            }
+            if multitask::take_vfork_done(child_pid, parent_tid) {
+                return;
+            }
+            multitask::cond_resched();
+        }
+        if multitask::take_vfork_done(child_pid, parent_tid) {
+            let _ = multitask::cancel_block_current_task();
+            return;
+        }
+        if !multitask::is_user_task_alive(child_pid)
+            || parent_pid.is_some_and(multitask::is_user_process_exiting)
+        {
+            let _ = multitask::cancel_block_current_task();
+            multitask::cancel_vfork_wait(child_pid, parent_tid);
+            return;
+        }
+        // The vfork parent runs on the child's shared stack, so the wait is
+        // killable only (as on Linux): a pending signal must not resume it
+        // early. The parent-exiting exit above is the only abandon path.
+        if multitask::commit_block_current_task_and_yield().is_none() {
+            multitask::yield_now();
+            continue;
+        }
+        if multitask::take_vfork_done(child_pid, parent_tid) {
+            return;
+        }
     }
 }
 

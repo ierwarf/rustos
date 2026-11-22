@@ -109,7 +109,12 @@ pub(super) fn is_blocking_request(request: &NetdIpcRequest) -> bool {
         return false;
     }
     match request.op {
-        SYSCALL_OFFLOAD_OP_LINUX_CONNECT => sockaddr_family(request) == Some(linux_abi::AF_INET),
+        SYSCALL_OFFLOAD_OP_LINUX_CONNECT => {
+            matches!(
+                sockaddr_family(request),
+                Some(family) if family == linux_abi::AF_INET || family == linux_abi::AF_INET6
+            )
+        }
         SYSCALL_OFFLOAD_OP_LINUX_SENDTO
         | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
         | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
@@ -153,10 +158,13 @@ pub(super) fn consume_local_recv_drain_handoff(socket_token: u64) -> bool {
     let Some(socket) = state.sockets.get_mut(&socket_token) else {
         return false;
     };
-    let UnixSocketState::Connected(connected) = &mut socket.state else {
-        return false;
-    };
-    core::mem::take(&mut connected.recv_drain_handoff_armed)
+    match &mut socket.state {
+        UnixSocketState::Connected(connected) => {
+            core::mem::take(&mut connected.recv_drain_handoff_armed)
+        }
+        UnixSocketState::Dgram(dgram) => core::mem::take(&mut dgram.recv_drain_handoff_armed),
+        _ => false,
+    }
 }
 
 pub(super) fn blocking_request_queue() -> &'static BlockingRequestQueue {
@@ -387,15 +395,17 @@ pub(super) fn run_blocking_request_at(
         return wait_for_socket_readiness(request, response);
     }
     if request.op == SYSCALL_OFFLOAD_OP_LINUX_CONNECT {
+        let mut epoch = state_waiter_epoch();
         let mut status = handle_inet_connect(request);
         let mut attempt = 0_usize;
         while status == libc::EINPROGRESS {
             if let Err(errno) =
-                sleep_within_request_deadline(request, blocking_retry_backoff(attempt))
+                wait_state_within_request_deadline(epoch, request, blocking_retry_backoff(attempt))
             {
                 return errno;
             }
             attempt = attempt.saturating_add(1);
+            epoch = state_waiter_epoch();
             status = poll_inet_connect(request);
         }
         return status;
@@ -405,11 +415,13 @@ pub(super) fn run_blocking_request_at(
         if let Err(errno) = request_deadline_remaining_ns(request) {
             return errno;
         }
+        let epoch = state_waiter_epoch();
         let status = dispatch_request(request, response, reply_cap);
         if status != libc::EAGAIN {
             return status;
         }
-        if let Err(errno) = sleep_within_request_deadline(request, blocking_retry_backoff(attempt))
+        if let Err(errno) =
+            wait_state_within_request_deadline(epoch, request, blocking_retry_backoff(attempt))
         {
             return errno;
         }

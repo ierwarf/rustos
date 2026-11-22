@@ -13,9 +13,11 @@
 //! - **Forbidden:** No descriptor close as backing release, stale process
 //!   snapshot, or policy implementation in this substrate.
 //! - **Evidence:** `memory-map` and `process-address-space-lifecycle`.
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use x86_64::VirtAddr;
@@ -261,19 +263,12 @@ impl ProcessSecurityContext {
     }
 }
 
-pub struct UserProcessState {
+pub struct UserMmState {
     address_space: ProcessAddressSpace,
     futex_namespace_id: u64,
     linux_process_state: Option<LinuxProcessState>,
     linux_memory_map: Option<LinuxMemoryMapState>,
     linux_runtime_profile: Option<LinuxRuntimeProfile>,
-    linux_sigactions: [LinuxSigAction; MAX_SIGNAL_NUMBER + 1],
-    windows_runtime: Option<WindowsProcessRuntimeState>,
-    win32_objects: Win32ProcessObjects,
-    handles: HandleTable,
-    fork_handle_pins: usize,
-    deferred_fork_handle_drops: Vec<KernelHandle>,
-    security: ProcessSecurityContext,
     mapping_cursor: u64,
     shared_memfd_mappings: Vec<SharedMemfdMapping>,
     shared_region_mappings: Vec<SharedRegionMapping>,
@@ -291,12 +286,184 @@ pub struct UserProcessState {
     /// Bytes of the two mapping lists above, billed to the Job as
     /// `Class::Vma` once the process is published.
     mapping_kmem: kernel_mm::api::kmem_charge::SharedMeter,
+}
+
+pub struct UserProcessLocal {
+    linux_sigactions: [LinuxSigAction; MAX_SIGNAL_NUMBER + 1],
+    windows_runtime: Option<WindowsProcessRuntimeState>,
+    win32_objects: Win32ProcessObjects,
+    handles: HandleTable,
+    fork_handle_pins: usize,
+    deferred_fork_handle_drops: Vec<KernelHandle>,
+    security: ProcessSecurityContext,
     exec_path: [u8; PROCESS_EXEC_PATH_CAPACITY],
     exec_path_len: usize,
     /// Monotonic nanoseconds when the process was created. A fork child starts
     /// at its own creation; `exec` keeps the value (same process). Reported as
     /// `starttime` by procfs.
     start_ns: u64,
+}
+
+impl UserProcessLocal {
+    pub fn handles(&self) -> &HandleTable {
+        &self.handles
+    }
+
+    pub fn handles_mut(&mut self) -> &mut HandleTable {
+        &mut self.handles
+    }
+
+    pub fn security(&self) -> ProcessSecurityContext {
+        self.security
+    }
+
+    pub fn exec_path(&self) -> &str {
+        core::str::from_utf8(&self.exec_path[..self.exec_path_len]).unwrap_or("")
+    }
+
+    fn set_exec_path(&mut self, exec_path: &str) {
+        self.exec_path.fill(0);
+        self.exec_path_len = 0;
+        for byte in exec_path.bytes() {
+            if self.exec_path_len == self.exec_path.len() {
+                break;
+            }
+            self.exec_path[self.exec_path_len] = match byte {
+                b' '..=b'~' => byte,
+                _ => b'?',
+            };
+            self.exec_path_len += 1;
+        }
+    }
+}
+
+pub struct UserProcessState {
+    mm: Box<UserMmState>,
+    local: Box<UserProcessLocal>,
+}
+
+/// Old process state captured across `exec` until post-switch retirement.
+pub enum ExecOldState {
+    /// Standard exec replaced an owned address space that must be retired.
+    Owned(UserProcessState),
+    /// `vfork` exec detached a child from the parent's shared `Mm`; the parent's
+    /// address space remains live, so only child-local state is dropped.
+    DetachedVfork(Box<UserProcessLocal>),
+}
+
+impl ExecOldState {
+    pub fn retire_execution_state(self) {
+        match self {
+            Self::Owned(state) => state.retire_execution_state(),
+            Self::DetachedVfork(local) => drop(local),
+        }
+    }
+}
+
+/// Shared execution-state container keyed by owner MM and any live `vfork`
+/// children borrowing that MM under the same `ProcessStateLock`.
+pub(crate) struct ProcessStateBundle {
+    owner_pid: u64,
+    mm: Option<Box<UserMmState>>,
+    owner_local: Option<Box<UserProcessLocal>>,
+    vfork_locals: Vec<(u64, Box<UserProcessLocal>)>,
+}
+
+struct BundleRestoreGuard<'a> {
+    bundle: &'a mut ProcessStateBundle,
+    process_id: u64,
+    state: ManuallyDrop<UserProcessState>,
+}
+
+impl Drop for BundleRestoreGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `state` is moved out exactly once on drop and restored to its
+        // owning `mm` / `local` slots in `bundle`.
+        let UserProcessState { mm, local } = unsafe { ManuallyDrop::take(&mut self.state) };
+        self.bundle.restore_for_pid(self.process_id, mm, local);
+    }
+}
+
+impl ProcessStateBundle {
+    pub(crate) fn new(owner_pid: u64, state: UserProcessState) -> Self {
+        Self {
+            owner_pid,
+            mm: Some(state.mm),
+            owner_local: Some(state.local),
+            vfork_locals: Vec::new(),
+        }
+    }
+
+    pub(crate) fn insert_vfork_local(&mut self, child_pid: u64, local: Box<UserProcessLocal>) {
+        if let Some((_, slot)) = self
+            .vfork_locals
+            .iter_mut()
+            .find(|(pid, _)| *pid == child_pid)
+        {
+            *slot = local;
+        } else {
+            self.vfork_locals.push((child_pid, local));
+        }
+    }
+
+    pub(crate) fn remove_vfork_local(&mut self, child_pid: u64) -> Option<Box<UserProcessLocal>> {
+        let pos = self
+            .vfork_locals
+            .iter()
+            .position(|(pid, _)| *pid == child_pid)?;
+        Some(self.vfork_locals.swap_remove(pos).1)
+    }
+
+    fn take_local_for_pid(&mut self, process_id: u64) -> Option<Box<UserProcessLocal>> {
+        if process_id == self.owner_pid {
+            self.owner_local.take()
+        } else {
+            self.remove_vfork_local(process_id)
+        }
+    }
+
+    fn restore_for_pid(
+        &mut self,
+        process_id: u64,
+        mm: Box<UserMmState>,
+        local: Box<UserProcessLocal>,
+    ) {
+        self.mm = Some(mm);
+        if process_id == self.owner_pid {
+            self.owner_local = Some(local);
+        } else {
+            self.vfork_locals.push((process_id, local));
+        }
+    }
+
+    pub(crate) fn with_state_for_pid<R>(
+        &mut self,
+        process_id: u64,
+        f: impl FnOnce(&mut UserProcessState) -> R,
+    ) -> Option<R> {
+        let mm = self.mm.take()?;
+        let Some(local) = self.take_local_for_pid(process_id) else {
+            self.mm = Some(mm);
+            return None;
+        };
+        let mut guard = BundleRestoreGuard {
+            bundle: self,
+            process_id,
+            state: ManuallyDrop::new(UserProcessState { mm, local }),
+        };
+        Some(f(&mut guard.state))
+    }
+
+    /// Reads the shared MM's mapping charge meter without taking `owner_local`.
+    pub(crate) fn reserve_exec_mapping_kmem(
+        &self,
+        address_space: &ProcessAddressSpace,
+    ) -> Option<kernel_mm::api::kmem_charge::SharedMeter> {
+        self.mm
+            .as_ref()?
+            .mapping_kmem
+            .try_peer(address_space.immutable_mapping_metadata_bytes() as u64)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -627,19 +794,12 @@ impl UserProcessState {
             align_up(highest_region_end.saturating_add(DEFAULT_MAPPING_GAP))
         };
 
-        let mut state = Self {
+        let mut mm = Box::new(UserMmState {
             address_space,
             futex_namespace_id: allocate_futex_namespace_id(),
             linux_process_state,
             linux_memory_map,
             linux_runtime_profile,
-            linux_sigactions: [LinuxSigAction::default(); MAX_SIGNAL_NUMBER + 1],
-            windows_runtime,
-            win32_objects: Win32ProcessObjects::default(),
-            handles: HandleTable::new(),
-            fork_handle_pins: 0,
-            deferred_fork_handle_drops: Vec::new(),
-            security: ProcessSecurityContext::new(logical_admin),
             mapping_cursor: default_cursor,
             shared_memfd_mappings: Vec::new(),
             shared_region_mappings: Vec::new(),
@@ -649,69 +809,82 @@ impl UserProcessState {
             mapping_kmem: kernel_mm::api::kmem_charge::SharedMeter::new(
                 kernel_mm::api::kmem_charge::Class::Vma,
             ),
+        });
+        mm.address_space.set_mapping_meter(mm.mapping_kmem.clone());
+
+        let mut local = Box::new(UserProcessLocal {
+            linux_sigactions: [LinuxSigAction::default(); MAX_SIGNAL_NUMBER + 1],
+            windows_runtime,
+            win32_objects: Win32ProcessObjects::default(),
+            handles: HandleTable::new(),
+            fork_handle_pins: 0,
+            deferred_fork_handle_drops: Vec::new(),
+            security: ProcessSecurityContext::new(logical_admin),
             exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
             exec_path_len: 0,
             start_ns: crate::arch::clock::monotonic_nanos(),
-        };
-        state.address_space.set_mapping_meter(state.mapping_kmem.clone());
-        state.set_exec_path(exec_path);
+        });
+        local.set_exec_path(exec_path);
+
+        let mut state = Self { mm, local };
         state.sync_linux_mapping_cursor();
         state
     }
 
     pub fn address_space(&self) -> &ProcessAddressSpace {
-        &self.address_space
+        &self.mm.address_space
     }
 
     pub fn address_space_root(&self) -> u64 {
-        self.address_space.root_phys().as_u64()
+        self.mm.address_space.root_phys().as_u64()
     }
 
     /// Never-reused address-space generation used by private futex keys.
     pub const fn futex_namespace_id(&self) -> u64 {
-        self.futex_namespace_id
+        self.mm.futex_namespace_id
     }
 
     pub fn address_space_mut(&mut self) -> &mut ProcessAddressSpace {
-        &mut self.address_space
+        &mut self.mm.address_space
     }
 
     pub fn linux_process_state(&self) -> Option<&LinuxProcessState> {
-        self.linux_process_state.as_ref()
+        self.mm.linux_process_state.as_ref()
     }
 
     /// Immutable stack ownership is checked under the same state lock as a
     /// mapping/VMA publication, even when a service planned against an old MM.
     pub fn mapping_below_stack_guard(&self, start: u64, end: u64) -> bool {
-        self.linux_process_state
+        self.mm
+            .linux_process_state
             .as_ref()
             .is_none_or(|state| state.mapping_below_stack_guard(start, end))
     }
 
     pub fn linux_memory_map(&self) -> Option<&LinuxMemoryMapState> {
-        self.linux_memory_map.as_ref()
+        self.mm.linux_memory_map.as_ref()
     }
 
     pub fn linux_memory_map_mut(&mut self) -> Option<&mut LinuxMemoryMapState> {
-        self.linux_memory_map.as_mut()
+        self.mm.linux_memory_map.as_mut()
     }
 
     pub fn linux_runtime_profile(&self) -> Option<&LinuxRuntimeProfile> {
-        self.linux_runtime_profile.as_ref()
+        self.mm.linux_runtime_profile.as_ref()
     }
 
     pub fn address_space_and_linux_process_state_mut(
         &mut self,
     ) -> (&mut ProcessAddressSpace, &mut Option<LinuxProcessState>) {
-        (&mut self.address_space, &mut self.linux_process_state)
+        (&mut self.mm.address_space, &mut self.mm.linux_process_state)
     }
 
     pub fn handles(&self) -> &HandleTable {
-        &self.handles
+        &self.local.handles
     }
 
     pub fn handles_mut(&mut self) -> &mut HandleTable {
-        &mut self.handles
+        &mut self.local.handles
     }
 
     pub fn record_shared_memfd_mapping(
@@ -722,7 +895,7 @@ impl UserProcessState {
         page_flags: PageTableFlags,
         hold: MemfdMappingHold,
     ) {
-        self.shared_memfd_mappings.push(SharedMemfdMapping {
+        self.mm.shared_memfd_mappings.push(SharedMemfdMapping {
             start,
             len,
             backing_offset,
@@ -734,7 +907,7 @@ impl UserProcessState {
 
     pub fn shared_memfd_object_ids_in_range(&self, start: u64, end: u64) -> Vec<u64> {
         let mut ids = Vec::new();
-        for mapping in &self.shared_memfd_mappings {
+        for mapping in &self.mm.shared_memfd_mappings {
             if end > mapping.start && start < mapping.end() {
                 let id = mapping.hold.object_id();
                 if !ids.contains(&id) {
@@ -747,7 +920,7 @@ impl UserProcessState {
 
     pub fn shared_memfd_holds(&self) -> Vec<MemfdMappingHold> {
         let mut holds: Vec<MemfdMappingHold> = Vec::new();
-        for mapping in &self.shared_memfd_mappings {
+        for mapping in &self.mm.shared_memfd_mappings {
             let id = mapping.hold.object_id();
             if !holds.iter().any(|h| h.object_id() == id) {
                 holds.push(mapping.hold.clone());
@@ -762,7 +935,7 @@ impl UserProcessState {
         frames: &[u64],
     ) -> Result<(), crate::memory::paging::AddressSpaceError> {
         let mut ranges = Vec::new();
-        for mapping in &self.shared_memfd_mappings {
+        for mapping in &self.mm.shared_memfd_mappings {
             if mapping.hold.object_id() == object_id {
                 ranges.push((
                     mapping.start,
@@ -781,7 +954,7 @@ impl UserProcessState {
             } else {
                 &[]
             };
-            self.address_space.reconcile_external_user_pages(
+            self.mm.address_space.reconcile_external_user_pages(
                 VirtAddr::new(start),
                 available,
                 page_count,
@@ -793,7 +966,7 @@ impl UserProcessState {
 
     pub fn shared_memfd_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, usize)> {
         let mut overlaps = Vec::new();
-        for mapping in &self.shared_memfd_mappings {
+        for mapping in &self.mm.shared_memfd_mappings {
             let overlap_start = start.max(mapping.start);
             let overlap_end = end.min(mapping.end());
             if overlap_start >= overlap_end {
@@ -809,7 +982,8 @@ impl UserProcessState {
     /// writable admission is where `F_SEAL_WRITE` and the writable-mapping
     /// count are enforced, so a later `mprotect(PROT_WRITE)` would bypass both.
     pub fn shared_memfd_range_forbids_write_upgrade(&self, start: u64, end: u64) -> bool {
-        self.shared_memfd_mappings
+        self.mm
+            .shared_memfd_mappings
             .iter()
             .any(|mapping| {
                 end > mapping.start && start < mapping.end() && !mapping.hold.is_writable()
@@ -820,14 +994,15 @@ impl UserProcessState {
         // Every munmap/mprotect-style release lands here; most ranges touch no
         // shared mapping, so do not rebuild (and reallocate) the list for them.
         if !self
+            .mm
             .shared_memfd_mappings
             .iter()
             .any(|mapping| end > mapping.start && start < mapping.end())
         {
             return;
         }
-        let mut updated = Vec::with_capacity(self.shared_memfd_mappings.len() + 1);
-        for mapping in self.shared_memfd_mappings.drain(..) {
+        let mut updated = Vec::with_capacity(self.mm.shared_memfd_mappings.len() + 1);
+        for mapping in self.mm.shared_memfd_mappings.drain(..) {
             let mapping_end = mapping.end();
             if end <= mapping.start || start >= mapping_end {
                 updated.push(mapping);
@@ -856,7 +1031,7 @@ impl UserProcessState {
                 });
             }
         }
-        self.shared_memfd_mappings = updated;
+        self.mm.shared_memfd_mappings = updated;
         self.sync_mapping_kmem();
     }
 
@@ -867,14 +1042,15 @@ impl UserProcessState {
         page_flags: PageTableFlags,
     ) {
         if !self
+            .mm
             .shared_memfd_mappings
             .iter()
             .any(|mapping| end > mapping.start && start < mapping.end())
         {
             return;
         }
-        let mut updated = Vec::with_capacity(self.shared_memfd_mappings.len() + 2);
-        for mapping in self.shared_memfd_mappings.drain(..) {
+        let mut updated = Vec::with_capacity(self.mm.shared_memfd_mappings.len() + 2);
+        for mapping in self.mm.shared_memfd_mappings.drain(..) {
             let mapping_end = mapping.end();
             if end <= mapping.start || start >= mapping_end {
                 updated.push(mapping);
@@ -914,7 +1090,7 @@ impl UserProcessState {
                 });
             }
         }
-        self.shared_memfd_mappings = updated;
+        self.mm.shared_memfd_mappings = updated;
     }
 
     pub fn record_shared_region_mapping(
@@ -923,7 +1099,7 @@ impl UserProcessState {
         len: u64,
         hold: KernelSharedRegionMappingHold,
     ) {
-        self.shared_region_mappings.push(SharedRegionMapping {
+        self.mm.shared_region_mappings.push(SharedRegionMapping {
             start,
             len,
             backing_offset: 0,
@@ -941,7 +1117,7 @@ impl UserProcessState {
         len: u64,
         hold: crate::user::handles::BufferMappingHold,
     ) {
-        self.device_buffer_mappings.push(DeviceBufferMapping {
+        self.mm.device_buffer_mappings.push(DeviceBufferMapping {
             start,
             len,
             hold: alloc::sync::Arc::new(hold),
@@ -950,7 +1126,8 @@ impl UserProcessState {
     }
 
     pub fn device_buffer_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
-        self.device_buffer_mappings
+        self.mm
+            .device_buffer_mappings
             .iter()
             .filter_map(|mapping| {
                 overlap_segment(mapping.start, mapping.end(), start, end)
@@ -961,14 +1138,15 @@ impl UserProcessState {
 
     pub fn release_device_buffer_mappings_in_range(&mut self, start: u64, end: u64) {
         if !self
+            .mm
             .device_buffer_mappings
             .iter()
             .any(|mapping| end > mapping.start && start < mapping.end())
         {
             return;
         }
-        let mut updated = Vec::with_capacity(self.device_buffer_mappings.len() + 1);
-        for mapping in self.device_buffer_mappings.drain(..) {
+        let mut updated = Vec::with_capacity(self.mm.device_buffer_mappings.len() + 1);
+        for mapping in self.mm.device_buffer_mappings.drain(..) {
             let mapping_end = mapping.end();
             if end <= mapping.start || start >= mapping_end {
                 updated.push(mapping);
@@ -989,17 +1167,18 @@ impl UserProcessState {
                 });
             }
         }
-        self.device_buffer_mappings = updated;
+        self.mm.device_buffer_mappings = updated;
         self.sync_mapping_kmem();
     }
 
     pub fn record_external_physical_mapping(&mut self, start: u64, len: u64) {
-        self.external_physical_mappings.push((start, len));
+        self.mm.external_physical_mappings.push((start, len));
         self.sync_mapping_kmem();
     }
 
     pub fn external_physical_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
-        self.external_physical_mappings
+        self.mm
+            .external_physical_mappings
             .iter()
             .filter_map(|&(map_start, map_len)| {
                 overlap_segment(map_start, map_start.saturating_add(map_len), start, end)
@@ -1009,14 +1188,15 @@ impl UserProcessState {
 
     pub fn release_external_physical_mappings_in_range(&mut self, start: u64, end: u64) {
         if !self
+            .mm
             .external_physical_mappings
             .iter()
             .any(|&(map_start, map_len)| end > map_start && start < map_start.saturating_add(map_len))
         {
             return;
         }
-        let mut updated = Vec::with_capacity(self.external_physical_mappings.len() + 1);
-        for (map_start, map_len) in self.external_physical_mappings.drain(..) {
+        let mut updated = Vec::with_capacity(self.mm.external_physical_mappings.len() + 1);
+        for (map_start, map_len) in self.mm.external_physical_mappings.drain(..) {
             let map_end = map_start.saturating_add(map_len);
             if end <= map_start || start >= map_end {
                 updated.push((map_start, map_len));
@@ -1029,12 +1209,13 @@ impl UserProcessState {
                 updated.push((end, map_end - end));
             }
         }
-        self.external_physical_mappings = updated;
+        self.mm.external_physical_mappings = updated;
         self.sync_mapping_kmem();
     }
 
     pub fn shared_region_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
-        self.shared_region_mappings
+        self.mm
+            .shared_region_mappings
             .iter()
             .filter_map(|mapping| overlap_segment(mapping.start, mapping.end(), start, end))
             .collect()
@@ -1044,14 +1225,15 @@ impl UserProcessState {
         // Every munmap/mprotect-style release lands here; most ranges touch no
         // shared mapping, so do not rebuild (and reallocate) the list for them.
         if !self
+            .mm
             .shared_region_mappings
             .iter()
             .any(|mapping| end > mapping.start && start < mapping.end())
         {
             return;
         }
-        let mut updated = Vec::with_capacity(self.shared_region_mappings.len() + 1);
-        for mapping in self.shared_region_mappings.drain(..) {
+        let mut updated = Vec::with_capacity(self.mm.shared_region_mappings.len() + 1);
+        for mapping in self.mm.shared_region_mappings.drain(..) {
             let mapping_end = mapping.end();
             if end <= mapping.start || start >= mapping_end {
                 updated.push(mapping);
@@ -1078,16 +1260,16 @@ impl UserProcessState {
                 });
             }
         }
-        self.shared_region_mappings = updated;
+        self.mm.shared_region_mappings = updated;
         self.sync_mapping_kmem();
     }
 
     fn mapping_kmem_total(&self) -> u64 {
-        (self.shared_memfd_mappings.len() * core::mem::size_of::<SharedMemfdMapping>()
-            + self.shared_region_mappings.len() * core::mem::size_of::<SharedRegionMapping>()
-            + self.device_buffer_mappings.len() * core::mem::size_of::<DeviceBufferMapping>()
-            + self.external_physical_mappings.len() * core::mem::size_of::<(u64, u64)>()
-            + self.address_space.immutable_mapping_metadata_bytes())
+        (self.mm.shared_memfd_mappings.len() * core::mem::size_of::<SharedMemfdMapping>()
+            + self.mm.shared_region_mappings.len() * core::mem::size_of::<SharedRegionMapping>()
+            + self.mm.device_buffer_mappings.len() * core::mem::size_of::<DeviceBufferMapping>()
+            + self.mm.external_physical_mappings.len() * core::mem::size_of::<(u64, u64)>()
+            + self.mm.address_space.immutable_mapping_metadata_bytes())
             as u64
     }
 
@@ -1097,21 +1279,21 @@ impl UserProcessState {
     /// must not fail. A shrink refunds.
     pub fn sync_mapping_kmem(&mut self) {
         let total = self.mapping_kmem_total();
-        self.mapping_kmem.set_total_forced(total);
+        self.mm.mapping_kmem.set_total_forced(total);
     }
 
     /// Pre-admit immutable private-image metadata splits, independently of
     /// shared mappings. The MM preflights its complete edit before PTE changes.
     pub fn admit_immutable_mapping_edit(&mut self, start: u64, end: u64) -> bool {
-        let extra = self.address_space.immutable_edit_headroom_bytes(start, end) as u64;
-        self.mapping_kmem.set_total(self.mapping_kmem_total().saturating_add(extra))
+        let extra = self.mm.address_space.immutable_edit_headroom_bytes(start, end) as u64;
+        self.mm.mapping_kmem.set_total(self.mapping_kmem_total().saturating_add(extra))
     }
 
     /// Independently reserve the replacement while the old root retains its meter.
     pub fn reserve_exec_mapping_kmem(&self, address_space: &ProcessAddressSpace)
         -> Option<kernel_mm::api::kmem_charge::SharedMeter>
     {
-        self.mapping_kmem.try_peer(address_space.immutable_mapping_metadata_bytes() as u64)
+        self.mm.mapping_kmem.try_peer(address_space.immutable_mapping_metadata_bytes() as u64)
     }
 
     /// Bills the mapping lists to `group` (the Job's charge group); refused,
@@ -1119,7 +1301,7 @@ impl UserProcessState {
     /// present. A state binds once.
     pub fn bind_mapping_kmem(&mut self, group: usize) -> bool {
         let total = self.mapping_kmem_total();
-        self.mapping_kmem.bind(group, total)
+        self.mm.mapping_kmem.bind(group, total)
     }
 
     /// Whether `extra` more shared-mapping records fit the Job's `Vma`
@@ -1128,16 +1310,17 @@ impl UserProcessState {
     pub fn admit_mapping_records(&self, extra: usize) -> bool {
         let per_record = core::mem::size_of::<SharedMemfdMapping>()
             .max(core::mem::size_of::<SharedRegionMapping>());
-        self.mapping_kmem
+        self.mm
+            .mapping_kmem
             .would_admit(self.mapping_kmem_total() + (extra * per_record) as u64)
     }
 
     pub fn memlock(&self) -> &MemlockLedger {
-        &self.memlock
+        &self.mm.memlock
     }
 
     pub fn memlock_mut(&mut self) -> &mut MemlockLedger {
-        &mut self.memlock
+        &mut self.mm.memlock
     }
 
     /// Whether any part of `[start, end)` is mapped through a record this
@@ -1156,7 +1339,7 @@ impl UserProcessState {
     /// Whether `[start, end)` touches the ELF image, heap or stack areas whose
     /// labels `/proc/<pid>/maps` renders from `linux_memory_map`.
     pub fn overlaps_labelled_area(&self, start: u64, end: u64) -> bool {
-        self.linux_memory_map.as_ref().is_some_and(|map| {
+        self.mm.linux_memory_map.as_ref().is_some_and(|map| {
             map.areas()
                 .iter()
                 .any(|area| start < area.end && area.start < end)
@@ -1164,7 +1347,7 @@ impl UserProcessState {
     }
 
     pub fn mapping_kmem_charged(&self) -> u64 {
-        self.mapping_kmem.charged()
+        self.mm.mapping_kmem.charged()
     }
 
     /// Resolve a process-shared futex through retained VMA backing metadata.
@@ -1174,13 +1357,13 @@ impl UserProcessState {
         &self,
         address: u64,
     ) -> Result<SharedFutexBackingKey, AddressSpaceError> {
-        self.address_space.validate_shared_futex_word(address)?;
+        self.mm.address_space.validate_shared_futex_word(address)?;
         let word_end = address
             .checked_add(core::mem::size_of::<u32>() as u64)
             .ok_or(AddressSpaceError::AddressOverflow)?;
         let mut resolved = None;
 
-        for mapping in &self.shared_memfd_mappings {
+        for mapping in &self.mm.shared_memfd_mappings {
             if mapping.start <= address && word_end <= mapping.end() {
                 let key = SharedFutexBackingKey::Memfd {
                     object_id: mapping.hold.object_id(),
@@ -1197,7 +1380,7 @@ impl UserProcessState {
                 }
             }
         }
-        for mapping in &self.shared_region_mappings {
+        for mapping in &self.mm.shared_region_mappings {
             if mapping.start <= address && word_end <= mapping.end() {
                 let key = SharedFutexBackingKey::SharedRegion {
                     region_id: mapping.hold.identity(),
@@ -1219,107 +1402,109 @@ impl UserProcessState {
 
     pub fn linux_signal_action(&self, signal: u64) -> Option<LinuxSigAction> {
         let index = usize::try_from(signal).ok()?;
-        self.linux_sigactions.get(index).copied()
+        self.local.linux_sigactions.get(index).copied()
     }
 
     pub fn windows_runtime(&self) -> Option<WindowsProcessRuntimeState> {
-        self.windows_runtime
+        self.local.windows_runtime
     }
 
     pub fn windows_runtime_mut(&mut self) -> Option<&mut WindowsProcessRuntimeState> {
-        self.windows_runtime.as_mut()
+        self.local.windows_runtime.as_mut()
     }
 
     pub fn win32_objects(&self) -> &Win32ProcessObjects {
-        &self.win32_objects
+        &self.local.win32_objects
     }
 
     pub fn win32_objects_mut(&mut self) -> &mut Win32ProcessObjects {
-        &mut self.win32_objects
+        &mut self.local.win32_objects
     }
 
     pub fn set_linux_signal_action(&mut self, signal: u64, action: LinuxSigAction) -> Option<()> {
         let index = usize::try_from(signal).ok()?;
-        *self.linux_sigactions.get_mut(index)? = action;
+        *self.local.linux_sigactions.get_mut(index)? = action;
         Some(())
     }
 
     pub fn security(&self) -> ProcessSecurityContext {
-        self.security
+        self.local.security
     }
 
     /// Monotonic creation time of the process in nanoseconds.
     pub fn start_ns(&self) -> u64 {
-        self.start_ns
+        self.local.start_ns
     }
 
     pub fn exec_path(&self) -> &str {
-        core::str::from_utf8(&self.exec_path[..self.exec_path_len]).unwrap_or("")
+        self.local.exec_path()
     }
 
     pub fn require_logical_admin_for_file_access(&mut self, path: &str) -> bool {
-        if self.security.logical_admin {
+        if self.local.security.logical_admin {
             return true;
         }
 
-        self.security
+        self.local
+            .security
             .queue_admin_request(PendingAdminRequestKind::FileSystemAccess, path);
         false
     }
 
     pub fn set_uid(&mut self, uid: u32) {
-        self.security.set_uid(uid);
+        self.local.security.set_uid(uid);
     }
 
     /// One-way: there is deliberately no way to clear the flag.
     pub fn set_no_new_privs(&mut self) {
-        self.security.no_new_privs = true;
+        self.local.security.no_new_privs = true;
     }
 
     pub fn set_dumpable(&mut self, dumpable: bool) {
-        self.security.dumpable = dumpable;
+        self.local.security.dumpable = dumpable;
     }
 
     /// Restrict per-process Linux capabilities without allowing escalation.
     pub fn set_capabilities(&mut self, next: LinuxCapabilities) -> bool {
-        let Some(updated) = self.security.capabilities.restrict_to(next) else {
+        let Some(updated) = self.local.security.capabilities.restrict_to(next) else {
             return false;
         };
-        self.security.capabilities = updated;
+        self.local.security.capabilities = updated;
         true
     }
 
     /// Records `/proc/<pid>/oom_score_adj`; `None` when outside `-1000..=1000`.
     pub fn set_oom_score_adj(&mut self, value: i64) -> Option<()> {
-        self.security.oom_score_adj = i16::try_from(value).ok().filter(|v| (-1000..=1000).contains(v))?;
+        self.local.security.oom_score_adj = i16::try_from(value).ok().filter(|v| (-1000..=1000).contains(v))?;
         Some(())
     }
 
     pub fn set_gid(&mut self, gid: u32) {
-        self.security.set_gid(gid);
+        self.local.security.set_gid(gid);
     }
 
     /// Pin open-description reference drops while a concurrent `fork` acquires
     /// inherited references for the snapshotted child handle table.
     pub fn begin_fork_handle_pin(&mut self) {
-        self.fork_handle_pins = self
+        self.local.fork_handle_pins = self
+            .local
             .fork_handle_pins
             .checked_add(1)
             .expect("fork handle pin count overflow");
     }
 
     pub fn end_fork_handle_pin(&mut self) -> Vec<KernelHandle> {
-        self.fork_handle_pins = self.fork_handle_pins.saturating_sub(1);
-        if self.fork_handle_pins == 0 {
-            core::mem::take(&mut self.deferred_fork_handle_drops)
+        self.local.fork_handle_pins = self.local.fork_handle_pins.saturating_sub(1);
+        if self.local.fork_handle_pins == 0 {
+            core::mem::take(&mut self.local.deferred_fork_handle_drops)
         } else {
             Vec::new()
         }
     }
 
     pub fn defer_handle_drop_if_pinned(&mut self, handle: KernelHandle) -> (KernelHandle, bool) {
-        if self.fork_handle_pins > 0 {
-            self.deferred_fork_handle_drops.push(handle.clone());
+        if self.local.fork_handle_pins > 0 {
+            self.local.deferred_fork_handle_drops.push(handle.clone());
             (handle, false)
         } else {
             (handle, true)
@@ -1327,12 +1512,12 @@ impl UserProcessState {
     }
 
     pub fn close_handle_respecting_fork_pin(&mut self, fd: u64) -> Option<(KernelHandle, bool)> {
-        let handle = self.handles.close(fd)?;
+        let handle = self.local.handles.close(fd)?;
         Some(self.defer_handle_drop_if_pinned(handle))
     }
 
     pub fn take_deferred_fork_handle_drops(&mut self) -> Vec<KernelHandle> {
-        core::mem::take(&mut self.deferred_fork_handle_drops)
+        core::mem::take(&mut self.local.deferred_fork_handle_drops)
     }
 
     pub fn fork_clone(
@@ -1340,57 +1525,73 @@ impl UserProcessState {
         address_space: ProcessAddressSpace,
         exec_path_override: Option<&str>,
     ) -> Self {
-        let mut state = Self {
+        let mut mm = Box::new(UserMmState {
             address_space,
             futex_namespace_id: allocate_futex_namespace_id(),
-            linux_process_state: self.linux_process_state,
-            linux_memory_map: self.linux_memory_map.clone(),
-            linux_runtime_profile: self.linux_runtime_profile.clone(),
-            linux_sigactions: self.linux_sigactions,
-            windows_runtime: self.windows_runtime,
-            win32_objects: self.win32_objects.clone(),
-            handles: self.handles.clone(),
-            fork_handle_pins: 0,
-            deferred_fork_handle_drops: Vec::new(),
-            security: self.security,
-            mapping_cursor: self.mapping_cursor,
-            shared_memfd_mappings: self.shared_memfd_mappings.clone(),
-            shared_region_mappings: self.shared_region_mappings.clone(),
+            linux_process_state: self.mm.linux_process_state,
+            linux_memory_map: self.mm.linux_memory_map.clone(),
+            linux_runtime_profile: self.mm.linux_runtime_profile.clone(),
+            mapping_cursor: self.mm.mapping_cursor,
+            shared_memfd_mappings: self.mm.shared_memfd_mappings.clone(),
+            shared_region_mappings: self.mm.shared_region_mappings.clone(),
             device_buffer_mappings: Vec::new(),
-            external_physical_mappings: self.external_physical_mappings.clone(),
+            external_physical_mappings: self.mm.external_physical_mappings.clone(),
             memlock: MemlockLedger::new(),
             // A fork child is billed when it is published, not when cloned.
-            mapping_kmem: kernel_mm::api::kmem_charge::SharedMeter::new(kernel_mm::api::kmem_charge::Class::Vma),
+            mapping_kmem: kernel_mm::api::kmem_charge::SharedMeter::new(
+                kernel_mm::api::kmem_charge::Class::Vma,
+            ),
+        });
+        mm.address_space.set_mapping_meter(mm.mapping_kmem.clone());
+        let local = self.fork_clone_vfork_local(false, exec_path_override);
+        Self { mm, local }
+    }
+
+    /// Clones only process-local metadata (handles, credentials, signal
+    /// dispositions) for a `vfork` child that borrows the parent's `Mm`.
+    pub fn fork_clone_vfork_local(
+        &self,
+        clear_sighand: bool,
+        exec_path_override: Option<&str>,
+    ) -> Box<UserProcessLocal> {
+        let mut linux_sigactions = self.local.linux_sigactions;
+        if clear_sighand {
+            for action in &mut linux_sigactions {
+                if action.handler != SIG_IGN {
+                    *action = LinuxSigAction::default();
+                }
+            }
+        }
+        let mut local = Box::new(UserProcessLocal {
+            linux_sigactions,
+            windows_runtime: self.local.windows_runtime,
+            win32_objects: self.local.win32_objects.clone(),
+            handles: self.local.handles.clone(),
+            fork_handle_pins: 0,
+            deferred_fork_handle_drops: Vec::new(),
+            security: self.local.security,
             exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
             exec_path_len: 0,
             start_ns: crate::arch::clock::monotonic_nanos(),
-        };
-        state.address_space.set_mapping_meter(state.mapping_kmem.clone());
-        state.set_exec_path(exec_path_override.unwrap_or(self.exec_path()));
-        state
+        });
+        local.set_exec_path(exec_path_override.unwrap_or(self.exec_path()));
+        local
     }
 
     pub fn set_mapping_cursor(&mut self, addr: u64) {
-        self.mapping_cursor = align_up(addr);
+        self.mm.mapping_cursor = align_up(addr);
         self.sync_linux_mapping_cursor();
     }
 
     pub fn retire_execution_state(self) {
         // Destructure exhaustively: adding an owned field must decide its cold
         // retirement custody, not silently drop shared backing during execution.
-        let Self {
+        let UserMmState {
             address_space,
             futex_namespace_id,
             linux_process_state,
             linux_memory_map,
             linux_runtime_profile,
-            linux_sigactions,
-            windows_runtime,
-            win32_objects,
-            handles,
-            fork_handle_pins,
-            deferred_fork_handle_drops,
-            security,
             mapping_cursor,
             shared_memfd_mappings,
             shared_region_mappings,
@@ -1398,10 +1599,19 @@ impl UserProcessState {
             external_physical_mappings,
             memlock,
             mapping_kmem,
+        } = *self.mm;
+        let UserProcessLocal {
+            linux_sigactions,
+            windows_runtime,
+            win32_objects,
+            handles,
+            fork_handle_pins,
+            deferred_fork_handle_drops,
+            security,
             exec_path,
             exec_path_len,
             start_ns,
-        } = self;
+        } = *self.local;
         address_space.into_retirement_owner().retire((
             futex_namespace_id,
             linux_process_state,
@@ -1436,13 +1646,40 @@ impl UserProcessState {
         exec_path: &str,
         replacement_mapping_kmem: kernel_mm::api::kmem_charge::SharedMeter,
     ) -> (Vec<KernelHandle>, Self) {
-        let preserved_ignored = self
+        let (closed, fresh) = Self::replace_local_for_exec(
+            &mut self.local,
+            address_space,
+            linux_process_state,
+            linux_memory_map,
+            linux_runtime_profile,
+            exec_path,
+            replacement_mapping_kmem,
+        );
+
+        // Return the old bundle so the exec coordinator can retain its MM and
+        // other generation-owned state until the scheduler has activated the
+        // new root/context. Dropping it before that publication can reclaim an
+        // address space that is still current on the executing CPU.
+        let old = core::mem::replace(self, fresh);
+        (closed, old)
+    }
+
+    pub(crate) fn replace_local_for_exec(
+        old_local: &mut UserProcessLocal,
+        address_space: ProcessAddressSpace,
+        linux_process_state: LinuxProcessState,
+        linux_memory_map: LinuxMemoryMapState,
+        linux_runtime_profile: LinuxRuntimeProfile,
+        exec_path: &str,
+        replacement_mapping_kmem: kernel_mm::api::kmem_charge::SharedMeter,
+    ) -> (Vec<KernelHandle>, Self) {
+        let preserved_ignored = old_local
             .linux_sigactions
             .map(|action| action.handler == SIG_IGN);
-        let security = self.security.for_exec();
-        let mut handles = core::mem::take(&mut self.handles);
+        let security = old_local.security.for_exec();
+        let mut handles = core::mem::take(&mut old_local.handles);
         let mut closed = handles.close_cloexec();
-        closed.append(&mut self.deferred_fork_handle_drops);
+        closed.append(&mut old_local.deferred_fork_handle_drops);
 
         let mut fresh = Self::new(
             address_space,
@@ -1453,12 +1690,15 @@ impl UserProcessState {
             security.logical_admin,
             exec_path,
         );
-        fresh.handles = handles;
-        fresh.start_ns = self.start_ns;
+        fresh.local.handles = handles;
+        fresh.local.start_ns = old_local.start_ns;
         // The old meter remains in old_state until its root is reclaimed.
-        fresh.mapping_kmem = replacement_mapping_kmem;
-        fresh.address_space.set_mapping_meter(fresh.mapping_kmem.clone());
-        fresh.security = security;
+        fresh.mm.mapping_kmem = replacement_mapping_kmem;
+        fresh
+            .mm
+            .address_space
+            .set_mapping_meter(fresh.mm.mapping_kmem.clone());
+        fresh.local.security = security;
         for (signal, ignored) in preserved_ignored
             .iter()
             .enumerate()
@@ -1466,16 +1706,10 @@ impl UserProcessState {
             .skip(1)
         {
             if *ignored {
-                fresh.linux_sigactions[signal] = self.linux_sigactions[signal];
+                fresh.local.linux_sigactions[signal] = old_local.linux_sigactions[signal];
             }
         }
-
-        // Return the old bundle so the exec coordinator can retain its MM and
-        // other generation-owned state until the scheduler has activated the
-        // new root/context. Dropping it before that publication can reclaim an
-        // address space that is still current on the executing CPU.
-        let old = core::mem::replace(self, fresh);
-        (closed, old)
+        (closed, fresh)
     }
 
     pub fn map_zeroed_pages_from_mapping_cursor(
@@ -1487,7 +1721,7 @@ impl UserProcessState {
             return Err(AddressSpaceError::ZeroSizedAllocation);
         }
 
-        let start = align_up(self.mapping_cursor);
+        let start = align_up(self.mm.mapping_cursor);
         let span = (page_count as u64)
             .checked_mul(PAGE_SIZE)
             .ok_or(AddressSpaceError::AddressOverflow)?;
@@ -1495,15 +1729,16 @@ impl UserProcessState {
             .checked_add(span)
             .ok_or(AddressSpaceError::AddressOverflow)?;
 
-        if let Some(linux_process_state) = self.linux_process_state.as_ref()
+        if let Some(linux_process_state) = self.mm.linux_process_state.as_ref()
             && (end > linux_process_state.brk_limit() || start < linux_process_state.brk_mapped_end)
         {
             return Err(AddressSpaceError::OutOfFrames);
         }
 
-        let region =
-            self.address_space
-                .map_zeroed_user_pages_at(VirtAddr::new(start), page_count, flags)?;
+        let region = self
+            .mm
+            .address_space
+            .map_zeroed_user_pages_at(VirtAddr::new(start), page_count, flags)?;
         self.set_mapping_cursor(region.end().as_u64());
         Ok(region)
     }
@@ -1517,7 +1752,7 @@ impl UserProcessState {
             return Err(AddressSpaceError::ZeroSizedAllocation);
         }
 
-        let start = align_up(self.mapping_cursor);
+        let start = align_up(self.mm.mapping_cursor);
         let span = (frames.len() as u64)
             .checked_mul(PAGE_SIZE)
             .ok_or(AddressSpaceError::AddressOverflow)?;
@@ -1525,37 +1760,23 @@ impl UserProcessState {
             .checked_add(span)
             .ok_or(AddressSpaceError::AddressOverflow)?;
 
-        if let Some(linux_process_state) = self.linux_process_state.as_ref()
+        if let Some(linux_process_state) = self.mm.linux_process_state.as_ref()
             && (end > linux_process_state.brk_limit() || start < linux_process_state.brk_mapped_end)
         {
             return Err(AddressSpaceError::OutOfFrames);
         }
 
-        let region =
-            self.address_space
-                .map_existing_user_pages_at(VirtAddr::new(start), frames, flags)?;
+        let region = self
+            .mm
+            .address_space
+            .map_existing_user_pages_at(VirtAddr::new(start), frames, flags)?;
         self.set_mapping_cursor(region.end().as_u64());
         Ok(region)
     }
 
     fn sync_linux_mapping_cursor(&mut self) {
-        if let Some(linux_process_state) = self.linux_process_state.as_mut() {
-            linux_process_state.mmap_next = self.mapping_cursor;
-        }
-    }
-
-    fn set_exec_path(&mut self, exec_path: &str) {
-        self.exec_path.fill(0);
-        self.exec_path_len = 0;
-        for byte in exec_path.bytes() {
-            if self.exec_path_len == self.exec_path.len() {
-                break;
-            }
-            self.exec_path[self.exec_path_len] = match byte {
-                b' '..=b'~' => byte,
-                _ => b'?',
-            };
-            self.exec_path_len += 1;
+        if let Some(linux_process_state) = self.mm.linux_process_state.as_mut() {
+            linux_process_state.mmap_next = self.mm.mapping_cursor;
         }
     }
 }
@@ -1755,37 +1976,37 @@ mod tests {
         state.record_shared_memfd_mapping(0x20000, 3 * 4096, 0, rw, hold);
         state.update_shared_memfd_page_flags_in_range(0x21000, 0x22000, ro);
 
-        assert_eq!(state.shared_memfd_mappings.len(), 3);
+        assert_eq!(state.mm.shared_memfd_mappings.len(), 3);
         assert_eq!(
             (
-                state.shared_memfd_mappings[0].start,
-                state.shared_memfd_mappings[0].len,
-                state.shared_memfd_mappings[0].backing_offset,
-                state.shared_memfd_mappings[0].page_flags,
+                state.mm.shared_memfd_mappings[0].start,
+                state.mm.shared_memfd_mappings[0].len,
+                state.mm.shared_memfd_mappings[0].backing_offset,
+                state.mm.shared_memfd_mappings[0].page_flags,
             ),
             (0x20000, 4096, 0, rw)
         );
         assert_eq!(
             (
-                state.shared_memfd_mappings[1].start,
-                state.shared_memfd_mappings[1].len,
-                state.shared_memfd_mappings[1].backing_offset,
-                state.shared_memfd_mappings[1].page_flags,
+                state.mm.shared_memfd_mappings[1].start,
+                state.mm.shared_memfd_mappings[1].len,
+                state.mm.shared_memfd_mappings[1].backing_offset,
+                state.mm.shared_memfd_mappings[1].page_flags,
             ),
             (0x21000, 4096, 4096, ro)
         );
         assert_eq!(
             (
-                state.shared_memfd_mappings[2].start,
-                state.shared_memfd_mappings[2].len,
-                state.shared_memfd_mappings[2].backing_offset,
-                state.shared_memfd_mappings[2].page_flags,
+                state.mm.shared_memfd_mappings[2].start,
+                state.mm.shared_memfd_mappings[2].len,
+                state.mm.shared_memfd_mappings[2].backing_offset,
+                state.mm.shared_memfd_mappings[2].page_flags,
             ),
             (0x22000, 4096, 8192, rw)
         );
         let holds = state.shared_memfd_holds();
         assert_eq!(holds.len(), 1);
-        assert_eq!(holds[0].object_id(), state.shared_memfd_mappings[0].hold.object_id());
+        assert_eq!(holds[0].object_id(), state.mm.shared_memfd_mappings[0].hold.object_id());
     }
 
     #[test]

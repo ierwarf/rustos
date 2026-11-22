@@ -179,10 +179,11 @@ use sync_handoff::ReplyWakeHandoff;
 // panic. Keep the scheduler allocation-free and explicitly bounded, but size
 // the product contract for service growth and application headroom.
 //
-// 256 slots = the 512 MiB kernel-heap ceiling (`kernel_mm` `MAX_HEAP_SIZE`) over
+// 256 slots = 512 MiB of kernel heap (`kernel_mm` heap is RAM/4, clamped to
+// 64..1024 MiB) over
 // one 2 MiB kernel stack per task. The slot-indexed statics cost a few hundred
 // bytes per slot, so the table itself is cheap; what bounds live tasks on a
-// smaller machine is the heap (about RAM/8, clamped to 64..512 MiB), and a stack
+// smaller machine is the heap (about RAM/4, clamped to 64..1024 MiB), and a stack
 // allocation failure is refused as EAGAIN rather than panicking. 256 is also the
 // widest table the 8-bit slot encodings (`task_directory` hint word, the
 // shadow-dispatch diagnostic bytes, the cohort cookie) can name.

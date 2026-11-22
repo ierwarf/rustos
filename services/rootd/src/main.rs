@@ -1114,6 +1114,12 @@ fn reply_commercial_max_request(
         },
         Err(errno) => errno,
     };
+    if response.status != 0 {
+        response.value0 = 0;
+        response.value1 = 0;
+        response.descriptor_count = 0;
+        response.payload_len = 0;
+    }
     if request.header.op == COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL && response.status != 0 {
         debug_line(b"rootd: readiness denied\n");
     }

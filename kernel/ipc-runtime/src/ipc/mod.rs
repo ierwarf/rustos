@@ -754,7 +754,7 @@ struct SharedRegionQuotaTable {
     entries: [Option<SharedRegionQuota>; MAX_PROCESS_RESOURCE_OWNERS],
 }
 
-const MAX_PROCESS_RESOURCE_OWNERS: usize = 32;
+const MAX_PROCESS_RESOURCE_OWNERS: usize = 128;
 
 impl SharedRegionQuotaTable {
     const fn new() -> Self {

@@ -53,6 +53,13 @@ impl LaunchHost for FakeHost {
     fn ensure_temp_dir(&mut self, dir: &str) -> std::io::Result<()> {
         self.call("temp", dir)
     }
+    fn ensure_session_bus(&mut self, dir: &str) -> std::io::Result<()> {
+        self.calls.push(format!("bus:{dir}"));
+        match self.fail.get(&format!("bus:{dir}")) {
+            Some(errno) => Err(std::io::Error::from_raw_os_error(*errno)),
+            None => Ok(()),
+        }
+    }
     fn log(&mut self, line: &str) {
         self.logs.push(line.to_owned());
     }
@@ -73,6 +80,7 @@ fn staged_defaults() -> Vec<String> {
         "TMPDIR={temp_dir}",
         "LANG=C.UTF-8",
         "WAYLAND_DISPLAY={wayland_display}",
+        "DBUS_SESSION_BUS_ADDRESS=unix:path={runtime_dir}/bus",
         "XDG_SESSION_TYPE=wayland",
         "XDG_CURRENT_DESKTOP=RustOS",
     ])
@@ -92,6 +100,7 @@ fn persistent_profile_is_kept_when_the_data_volume_works() {
     assert!(env.contains(&String::from("XDG_RUNTIME_DIR=/run/user/1000")));
     assert!(env.contains(&String::from("TMPDIR=/tmp")));
     assert!(env.contains(&String::from("WAYLAND_DISPLAY=wayland-0")));
+    assert!(env.contains(&String::from("DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus")));
     assert!(env.contains(&String::from("LANG=C.UTF-8")));
     assert_eq!(
         host.calls,
@@ -100,6 +109,7 @@ fn persistent_profile_is_kept_when_the_data_volume_works() {
             "persistent:/data/config",
             "persistent:/data/cache",
             "session:/run/user/1000",
+            "bus:/run/user/1000",
             "temp:/tmp",
         ]
     );
@@ -185,6 +195,14 @@ fn runtime_dir_and_socket_derive_from_the_launch_credentials() {
         assert!(host.calls.contains(&format!("session:{}", RuntimeDir(uid))));
         assert!(env.contains(&format!("WAYLAND_DISPLAY={WAYLAND_SOCKET_NAME}")));
     }
+}
+
+#[test]
+fn session_bus_failure_is_logged_but_does_not_fail_the_launch() {
+    let mut host = FakeHost::for_uid(1000).failing("bus:/run/user/1000", libc::EADDRINUSE);
+    let env = values(build(&[], &staged_defaults(), &mut host).unwrap());
+    assert!(env.contains(&String::from("XDG_RUNTIME_DIR=/run/user/1000")));
+    assert!(host.logs.iter().any(|line| line.contains("session bus unavailable")), "{:?}", host.logs);
 }
 
 #[test]

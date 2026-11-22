@@ -17,6 +17,10 @@ const NSSWITCH: &str = "passwd: files\ngroup: files\nhosts: files dns\n";
 const RESOLV_CONF: &str = "nameserver 10.0.2.3\noptions timeout:2 attempts:2\n";
 const FONT_DIR: &str = "usr/share/fonts/truetype/rustos";
 const FONTS_CONF_PATH: &str = "etc/fonts/fonts.conf";
+const MACHINE_ID_PATH: &str = "etc/machine-id";
+const DBUS_MACHINE_ID_PATH: &str = "var/lib/dbus/machine-id";
+/// Deterministic 128-bit lowercase-hex machine ID (`systemd`/`libdbus` format: 32 hex + `\n`).
+const DEFAULT_MACHINE_ID: &[u8] = b"727573746f7330303030303030303031\n";
 const CA_BUNDLE_PATH: &str = "etc/ssl/certs/ca-certificates.crt";
 const HOST_CA_BUNDLES: &[&str] = &[
     "/etc/ssl/certs/ca-certificates.crt",
@@ -67,6 +71,8 @@ fn stage_into(image: &Path, font_source: &Path, ca_candidates: &[PathBuf]) -> Re
     write_if_absent(image, "etc/nsswitch.conf", NSSWITCH.as_bytes())?;
     write_if_absent(image, "etc/resolv.conf", RESOLV_CONF.as_bytes())?;
     write_if_absent(image, FONTS_CONF_PATH, FONTS_CONF.as_bytes())?;
+    write_if_absent(image, MACHINE_ID_PATH, DEFAULT_MACHINE_ID)?;
+    write_if_absent(image, DBUS_MACHINE_ID_PATH, DEFAULT_MACHINE_ID)?;
 
     let mut fonts = 0usize;
     if font_source.is_dir() {
@@ -143,6 +149,12 @@ mod tests {
         assert_eq!(read("etc/nsswitch.conf").lines().last(), Some("hosts: files dns"));
         assert_eq!(read("etc/resolv.conf"), "nameserver 1.2.3.4\n");
         assert!(read("etc/fonts/fonts.conf").contains("<dir>/usr/share/fonts</dir>"));
+        for mid_path in [MACHINE_ID_PATH, DBUS_MACHINE_ID_PATH] {
+            let mid = read(mid_path);
+            assert_eq!(mid.len(), 33, "{mid_path}");
+            assert!(mid.ends_with('\n'));
+            assert!(mid[..32].bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        }
         assert_eq!(std::fs::read(image.join(FONT_DIR).join("Inter-Light.ttf")).unwrap(), b"ttf");
         assert!(image.join(FONT_DIR).join("Inter-OFL.txt").is_file());
         assert!(!image.join(FONT_DIR).join("notes.md").exists());
@@ -173,6 +185,7 @@ mod tests {
         assert_eq!(env["XDG_RUNTIME_DIR"], "{runtime_dir}");
         assert_eq!(env["TMPDIR"], "{temp_dir}");
         assert_eq!(env["WAYLAND_DISPLAY"], "{wayland_display}");
+        assert_eq!(env["DBUS_SESSION_BUS_ADDRESS"], "unix:path={runtime_dir}/bus");
     }
 
     #[test]

@@ -296,6 +296,46 @@ fn task_tid_names(pid: u64, tid: u64) -> Vec<snap::DirName> {
     names
 }
 
+/// Linux `oom_score_adj` write rule: the writer needs root (the stand-in for
+/// `CAP_SYS_RESOURCE`) or the target's euid, and an unprivileged writer may not
+/// push the value below `min(current, 0)` (Linux `oom_score_adj_min`).
+fn oom_score_adj_write_permitted(
+    caller_euid: u32,
+    target_euid: u32,
+    current: i16,
+    value: i64,
+) -> Result<(), i64> {
+    if caller_euid == 0 {
+        return Ok(());
+    }
+    if caller_euid != target_euid {
+        return Err(LINUX_EACCES);
+    }
+    if value < i64::from(current.min(0)) {
+        return Err(LINUX_EACCES);
+    }
+    Ok(())
+}
+
+fn proc_target_exists(target_pid: u64, caller_pid: u64) -> Result<(), i64> {
+    if target_pid == caller_pid
+        || multitask::with_process_state_by_pid(target_pid, |_| ()).is_some()
+    {
+        Ok(())
+    } else {
+        Err(LINUX_ENOENT)
+    }
+}
+
+fn resolve_proc_target_pid(node: Node, number: u64, caller_pid: u64) -> Result<u64, i64> {
+    if node == Node::OomScoreAdj && number != 0 && number != caller_pid {
+        proc_target_exists(number, caller_pid)?;
+        Ok(number)
+    } else {
+        Ok(caller_pid)
+    }
+}
+
 /// Content of the node as of now; oversized snapshots fail rather than truncate.
 fn render(node: Node, number: u64, pid: u64) -> Result<Vec<u8>, i64> {
     let caller_tid = multitask::current_user_thread_id().ok_or(LINUX_ESRCH)?;
@@ -306,7 +346,17 @@ fn render(node: Node, number: u64, pid: u64) -> Result<Vec<u8>, i64> {
         Node::Stat => snap::format_stat(&gather_process(pid)?, &caller_thread(caller_tid)),
         Node::Statm => snap::format_statm(&gather_process(pid)?),
         Node::Comm => snap::format_comm(&caller_thread(caller_tid)),
-        Node::OomScoreAdj => snap::format_oom_score_adj(&gather_process(pid)?),
+        Node::OomScoreAdj => {
+            if number != 0 {
+                let adj = multitask::with_process_state_by_pid(pid, |state| {
+                    state.security().oom_score_adj()
+                })
+                .ok_or(LINUX_ENOENT)?;
+                alloc::format!("{adj}\n").into_bytes()
+            } else {
+                snap::format_oom_score_adj(&gather_process(pid)?)
+            }
+        }
         Node::Limits => snap::format_limits(&gather_limits()),
         Node::Cmdline => {
             let process = gather_process(pid)?;
@@ -415,12 +465,13 @@ pub(crate) fn complete_open(aux: u64, flags: u64) -> Option<Result<u64, i64>> {
         if node == Node::FdLink {
             return reopen_fd(number, flags);
         }
-        let bytes = render(node, number, pid)?;
+        let target_pid = resolve_proc_target_pid(node, number, pid)?;
+        let bytes = render(node, number, target_pid)?;
         install_snapshot(
-            node_link(pid, node, number),
+            node_link(target_pid, node, number),
             node,
             number,
-            abi_procfs::node_inode(pid, node, number),
+            abi_procfs::node_inode(target_pid, node, number),
             &bytes,
             flags,
         )
@@ -438,6 +489,7 @@ pub(crate) fn complete_stat(aux: u64, flags: u64, out: StatOut) -> Option<u64> {
 
 fn stat_node(node: Node, number: u64, flags: u64, out: StatOut) -> Result<u64, i64> {
     let pid = caller_pid()?;
+    let target_pid = resolve_proc_target_pid(node, number, pid)?;
     if node == Node::FdLink {
         if !current_fd_exists(number) {
             return Err(LINUX_ENOENT);
@@ -452,15 +504,15 @@ fn stat_node(node: Node, number: u64, flags: u64, out: StatOut) -> Result<u64, i
             });
         }
     } else if matches!(node, Node::TaskTidDir | Node::TaskStat | Node::TaskComm | Node::TaskStatus)
-        && !tid_is_live(pid, number)
+        && !tid_is_live(target_pid, number)
     {
         return Err(LINUX_ENOENT);
     }
     let stat = AnonStat {
         dev: anon_stat::DEV_PROCFS,
-        ino: abi_procfs::node_inode(pid, node, number),
+        ino: abi_procfs::node_inode(target_pid, node, number),
         mode: node.mode(),
-        nlink: anon_stat::proc_node_nlink(Some(pid), node),
+        nlink: anon_stat::proc_node_nlink(Some(target_pid), node),
         size: 0,
     };
     let (uid, gid) = anon_stat::owner_ids();
@@ -486,6 +538,7 @@ pub(crate) fn complete_access(aux: u64, mode: u64) -> Option<u64> {
 
 fn access_node(node: Node, number: u64, mode: u64) -> Result<(), i64> {
     let pid = caller_pid()?;
+    let target_pid = resolve_proc_target_pid(node, number, pid)?;
     match node {
         Node::FdLink => {
             if !current_fd_exists(number) {
@@ -493,7 +546,7 @@ fn access_node(node: Node, number: u64, mode: u64) -> Result<(), i64> {
             }
         }
         Node::TaskTidDir | Node::TaskStat | Node::TaskComm | Node::TaskStatus => {
-            if !tid_is_live(pid, number) {
+            if !tid_is_live(target_pid, number) {
                 return Err(LINUX_ENOENT);
             }
         }
@@ -565,8 +618,16 @@ fn apply_proc_write(node: Node, number: u64, pid: u64, bytes: &[u8]) -> Result<u
             Ok(bytes.len())
         }
         Node::OomScoreAdj => {
+            let target_pid = resolve_proc_target_pid(node, number, pid)?;
             let value = parse_oom_score_adj(bytes)?;
-            let updated = multitask::with_current_user_process_state_mut(|_, _, state| {
+            let caller_euid = multitask::with_current_process_credentials(|security| security.euid())
+                .ok_or(LINUX_ESRCH)?;
+            let (target_euid, current) = multitask::with_process_state_by_pid(target_pid, |state| {
+                (state.security().euid(), state.security().oom_score_adj())
+            })
+            .ok_or(LINUX_ESRCH)?;
+            oom_score_adj_write_permitted(caller_euid, target_euid, current, value)?;
+            let updated = multitask::with_process_state_by_pid_mut(target_pid, |state| {
                 state.set_oom_score_adj(value)
             })
             .flatten();
@@ -968,6 +1029,19 @@ fn reopen_fd(target_fd: u64, flags: u64) -> Result<u64, i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oom_score_adj_write_rule_matches_linux() {
+        // Same uid raises (browser -> renderer) but cannot go below min(cur, 0).
+        assert_eq!(oom_score_adj_write_permitted(1000, 1000, 0, 300), Ok(()));
+        assert_eq!(oom_score_adj_write_permitted(1000, 1000, 300, 0), Ok(()));
+        assert_eq!(oom_score_adj_write_permitted(1000, 1000, 300, -1), Err(LINUX_EACCES));
+        assert_eq!(oom_score_adj_write_permitted(1000, 1000, -200, -200), Ok(()));
+        assert_eq!(oom_score_adj_write_permitted(1000, 1000, -200, -201), Err(LINUX_EACCES));
+        // Cross-uid needs privilege.
+        assert_eq!(oom_score_adj_write_permitted(1000, 1001, 0, 300), Err(LINUX_EACCES));
+        assert_eq!(oom_score_adj_write_permitted(0, 1001, 300, -1000), Ok(()));
+    }
 
     #[test]
     fn oversized_snapshot_fails_instead_of_returning_a_partial_stream() {

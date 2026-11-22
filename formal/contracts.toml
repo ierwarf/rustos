@@ -1151,6 +1151,12 @@ flows = ["dvm-block-startup", "dvm-read-cache"]
 reason = "Storaged binds provider generation, geometry, read-ahead, cancellation, and cache invalidation."
 
 [[risk_surfaces]]
+path = "services/storaged/src/read_engine.rs"
+severity = "critical"
+flows = ["dvm-read-cache"]
+reason = "The storaged read engine owns window publication, stream read-ahead, in-flight sharing, and write/generation invalidation."
+
+[[risk_surfaces]]
 path = "services/inputd/src/main.rs"
 severity = "critical"
 flows = ["input-delivery-lifecycle", "scheduler-dispatch"]

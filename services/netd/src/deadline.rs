@@ -71,7 +71,20 @@ pub(super) fn capped_request_wait(request: &NetdIpcRequest, cap: Duration) -> Re
     capped_request_wait_at(request, rustos_svc_runtime::syscall::monotonic_nanos(), cap)
 }
 
+// TEST-HARNESS: compiled only for unit tests; not every helper has a caller there.
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn sleep_within_request_deadline(request: &NetdIpcRequest, cap: Duration) -> Result<(), i32> {
     thread::sleep(capped_request_wait(request, cap)?);
+    Ok(())
+}
+
+pub(super) fn wait_state_within_request_deadline(
+    seen_epoch: u64,
+    request: &NetdIpcRequest,
+    cap: Duration,
+) -> Result<(), i32> {
+    let wait = capped_request_wait(request, cap)?;
+    wait_state_change(seen_epoch, wait);
     Ok(())
 }

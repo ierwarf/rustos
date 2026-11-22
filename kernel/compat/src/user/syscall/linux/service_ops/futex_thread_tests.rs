@@ -297,3 +297,34 @@ fn thread_spawn_refusals_have_distinct_stages_and_faithful_errnos() {
         assert!(![1, 2, 3, 4, 5, 6, 7, 8, 9, 12].contains(&stage));
     }
 }
+
+#[test]
+fn futex_bucket_table_supports_wait_wake_and_cross_key_requeue() {
+    let mut table = FutexWaiterTable::new();
+    let k1 = FutexKey::Private {
+        mm_generation: 1,
+        address_space_root: 0x1000,
+        uaddr: 0x2000,
+    };
+    let k2 = FutexKey::Private {
+        mm_generation: 1,
+        address_space_root: 0x1000,
+        uaddr: 0x3000,
+    };
+    for tid in 10..14 {
+        table
+            .insert(FutexWaiter {
+                key: k1,
+                task_id: tid,
+                bitset: linux_abi::FUTEX_BITSET_MATCH_ANY,
+            })
+            .expect("insert");
+    }
+    let mut woke = [0_u64; 4];
+    let (w, r) = table.select_requeue(k1, k2, 1, 2, linux_abi::FUTEX_BITSET_MATCH_ANY, &mut woke);
+    assert_eq!((w, r), (1, 2));
+    let (w2, _) = table.select_requeue(k2, k2, 4, 0, linux_abi::FUTEX_BITSET_MATCH_ANY, &mut woke);
+    assert_eq!(w2, 2);
+    assert!(table.take_task(10));
+    assert!(!table.take_task(10));
+}

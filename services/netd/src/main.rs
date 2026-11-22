@@ -53,7 +53,8 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_ACCEPT, SYSCALL_OFFLOAD_OP_LINUX_BIND, SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
     SYSCALL_OFFLOAD_OP_LINUX_CONNECT, SYSCALL_OFFLOAD_OP_LINUX_DUP,
     SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME, SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME,
-    SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT, SYSCALL_OFFLOAD_OP_LINUX_LISTEN,
+    SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT, SYSCALL_OFFLOAD_OP_LINUX_IOCTL,
+    SYSCALL_OFFLOAD_OP_LINUX_LISTEN,
     SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_RECVFROM,
     SYSCALL_OFFLOAD_OP_LINUX_RECVMSG, SYSCALL_OFFLOAD_OP_LINUX_SENDMSG,
     SYSCALL_OFFLOAD_OP_LINUX_SENDTO, SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT,
@@ -71,7 +72,9 @@ use smoltcp::iface::{
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{tcp, udp, icmp};
 use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
+use smoltcp::wire::{
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv6Address,
+};
 
 mod inet_datagram;
 
@@ -186,7 +189,10 @@ const UNIX_QUEUED_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 // Every queued ancillary byte must fit in one kernel-consumed release trailer
 // when read/close discards it. This is a lifecycle bound, not a tuning knob.
 const SOCKET_CONTROL_BUFFER_CAPACITY: usize = rustos_user_abi::syscall::NET_BROKER_SOCKET_CONTROL_CAPACITY;
-const INET_TCP_BUFFER_CAPACITY: usize = 16 * 1024;
+const INET_TCP_BUFFER_CAPACITY: usize = 128 * 1024;
+const MAX_INET_TCP_BUFFER_CAPACITY: usize = 512 * 1024;
+const UNIX_DGRAM_DEFAULT_BUFFER: usize = 256 * 1024;
+const UNIX_DGRAM_MAX_QUEUED_MESSAGES: usize = 256;
 const INET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Abort horizon for an established connection whose peer stays silent with
 /// data queued (Linux `tcp_retries2` default, about 15 minutes).
@@ -315,6 +321,8 @@ enum UnixSocketState {
         pending: VecDeque<u64>,
     },
     Connected(ConnectedState),
+    /// `AF_UNIX`/`SOCK_DGRAM` socket: unconnected or connected datagram queue.
+    Dgram(UnixDgramState),
     /// `AF_NETLINK`/`NETLINK_ROUTE` socket: queued whole reply messages.
     Netlink(netlink::NetlinkState),
 }
@@ -324,6 +332,7 @@ enum UnixSocketState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UnixSocketKind {
     Stream,
+    Dgram,
     SeqPacket,
     Netlink,
 }
@@ -333,6 +342,7 @@ impl UnixSocketKind {
     fn unix_socket_type(self) -> u64 {
         match self {
             Self::SeqPacket => libc::SOCK_SEQPACKET as u64,
+            Self::Dgram => linux_abi::SOCK_DGRAM,
             Self::Stream | Self::Netlink => linux_abi::SOCK_STREAM,
         }
     }
@@ -340,14 +350,28 @@ impl UnixSocketKind {
     fn from_unix_base_type(base_type: u64) -> Option<Self> {
         match base_type as i32 {
             libc::SOCK_STREAM => Some(Self::Stream),
+            libc::SOCK_DGRAM => Some(Self::Dgram),
             libc::SOCK_SEQPACKET => Some(Self::SeqPacket),
             _ => None,
         }
     }
 
     fn preserves_message_boundaries(self) -> bool {
-        matches!(self, Self::SeqPacket)
+        matches!(self, Self::SeqPacket | Self::Dgram)
     }
+}
+
+#[derive(Debug, Default)]
+struct UnixDgramState {
+    incoming: VecDeque<UnixStreamSegment>,
+    incoming_bytes: usize,
+    incoming_control_bytes: usize,
+    peer: Option<u64>,
+    peer_closed: bool,
+    peer_credentials: Option<Credentials>,
+    recv_drain_handoff_armed: bool,
+    recv_closed: bool,
+    send_closed: bool,
 }
 
 #[derive(Debug)]
@@ -381,21 +405,13 @@ struct UnixStreamSegment {
     bytes: VecDeque<u8>,
     control: Vec<u8>,
     sender: Credentials,
+    sender_path: Option<UnixAddress>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum UnixAddress {
     Filesystem(String),
     Abstract(Vec<u8>),
-}
-
-impl UnixAddress {
-    fn as_filesystem_str(&self) -> Option<&str> {
-        match self {
-            Self::Filesystem(path) => Some(path.as_str()),
-            Self::Abstract(_) => None,
-        }
-    }
 }
 
 impl From<&str> for UnixAddress {
@@ -411,15 +427,26 @@ struct UnixSocket {
     refs: usize,
     options: SocketOptions,
     bound_path: Option<UnixAddress>,
+    bound_inode: Option<(u64, u64)>,
     local_path: Option<UnixAddress>,
     peer_path: Option<UnixAddress>,
     state: UnixSocketState,
 }
 
+#[derive(Debug, Default)]
+struct TcpListenerState {
+    backlog: usize,
+    listen_addr: Option<IpAddress>,
+    listen_port: u16,
+    handles: VecDeque<SocketHandle>,
+}
+
 struct InetSocket {
+    domain: u64,
     refs: usize,
     options: SocketOptions,
     transport: InetTransport,
+    tcp_listener: Option<TcpListenerState>,
     local: Option<IpEndpoint>,
     peer: Option<IpEndpoint>,
     received: Option<inet_datagram::ReceivedPacket>,
@@ -428,6 +455,8 @@ struct InetSocket {
     /// and its own connect timeout as a closed socket; the deadline tells
     /// them apart (`ETIMEDOUT` vs `ECONNREFUSED`) and `SO_ERROR` consumes it.
     connect_deadline: Option<StdInstant>,
+    connect_started: Option<StdInstant>,
+    connect_budget: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -465,12 +494,28 @@ struct SocketOptions {
     reuse_addr: bool,
     reuse_port: bool,
     keepalive: bool,
+    nodelay: bool,
+    broadcast: bool,
+    linger: (bool, i32),
     send_buffer: i32,
     recv_buffer: i32,
     passcred: bool,
     /// `SO_RCVTIMEO` as `(seconds, microseconds)`; zero waits forever. The
     /// kernel's blocking local receive reads it back through `getsockopt`.
     recv_timeout: (i64, i64),
+    snd_timeout: (i64, i64),
+    ip_tos: u8,
+    ip_ttl: i32,
+    ip_pktinfo: bool,
+    ip_recvtos: bool,
+    ipv6_only: bool,
+    ipv6_tclass: i32,
+    ipv6_recverr: bool,
+    ipv6_recvpktinfo: bool,
+    tcp_keepidle: i32,
+    tcp_keepintvl: i32,
+    tcp_keepcnt: i32,
+    tcp_user_timeout: u32,
 }
 
 impl Default for SocketOptions {
@@ -479,10 +524,36 @@ impl Default for SocketOptions {
             reuse_addr: false,
             reuse_port: false,
             keepalive: false,
+            nodelay: false,
+            broadcast: false,
+            linger: (false, 0),
             send_buffer: SOCKET_BUFFER_CAPACITY as i32,
             recv_buffer: SOCKET_BUFFER_CAPACITY as i32,
             passcred: false,
             recv_timeout: (0, 0),
+            snd_timeout: (0, 0),
+            ip_tos: 0,
+            ip_ttl: 64,
+            ip_pktinfo: false,
+            ip_recvtos: false,
+            ipv6_only: false,
+            ipv6_tclass: 0,
+            ipv6_recverr: false,
+            ipv6_recvpktinfo: false,
+            tcp_keepidle: 7200,
+            tcp_keepintvl: 75,
+            tcp_keepcnt: 9,
+            tcp_user_timeout: 0,
+        }
+    }
+}
+
+impl SocketOptions {
+    fn inet_default() -> Self {
+        Self {
+            send_buffer: INET_TCP_BUFFER_CAPACITY as i32,
+            recv_buffer: INET_TCP_BUFFER_CAPACITY as i32,
+            ..Self::default()
         }
     }
 }
@@ -598,6 +669,55 @@ fn net_state() -> &'static Mutex<NetState> {
     STATE.get_or_init(|| Mutex::new(NetState::new()))
 }
 
+fn inet_worker_wake_signal() -> &'static (Mutex<u64>, Condvar) {
+    static WAKE: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
+    WAKE.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+fn notify_inet_worker() {
+    let (lock, cv) = inet_worker_wake_signal();
+    if let Ok(mut seq) = lock.lock() {
+        *seq = seq.wrapping_add(1);
+        cv.notify_all();
+    }
+}
+
+fn state_waiters_signal() -> &'static (Mutex<u64>, Condvar) {
+    static WAKE: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
+    WAKE.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+fn state_waiter_epoch() -> u64 {
+    state_waiters_signal()
+        .0
+        .lock()
+        .map(|seq| *seq)
+        .unwrap_or(0)
+}
+
+fn wait_state_change(seen_epoch: u64, timeout: Duration) -> u64 {
+    let (lock, cv) = state_waiters_signal();
+    let Ok(guard) = lock.lock() else {
+        std::thread::sleep(timeout);
+        return seen_epoch;
+    };
+    if *guard != seen_epoch {
+        return *guard;
+    }
+    match cv.wait_timeout(guard, timeout) {
+        Ok((guard, _)) => *guard,
+        Err(poisoned) => *poisoned.into_inner().0,
+    }
+}
+
+fn notify_state_waiters() {
+    let (lock, cv) = state_waiters_signal();
+    if let Ok(mut seq) = lock.lock() {
+        *seq = seq.wrapping_add(1);
+        cv.notify_all();
+    }
+}
+
 #[derive(Default)]
 struct SocketReceive {
     /// Identity of the process whose send produced the first dequeued
@@ -649,6 +769,14 @@ mod path_namespace_tests;
 #[cfg(test)]
 #[path = "tests/netlink_tests.rs"]
 mod netlink_tests;
+
+#[cfg(test)]
+#[path = "tests/unix_dgram_tests.rs"]
+mod unix_dgram_tests;
+
+#[cfg(test)]
+#[path = "tests/ipv6_and_options_tests.rs"]
+mod ipv6_and_options_tests;
 
 #[cfg(test)]
 mod idle_cadence_tests {

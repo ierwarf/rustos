@@ -124,6 +124,41 @@ impl RootJoin {
         self.process = Some(process);
         Ok(self.handle)
     }
+    pub(in crate::multitask) fn publish_vfork(
+        &mut self,
+        parent: Option<u64>,
+        owner_handle: ProcessHandle,
+        state_lock: alloc::sync::Arc<
+            crate::multitask::process_state_lock::ProcessStateLock<
+                crate::user::process_state::ProcessStateBundle,
+            >,
+        >,
+        mm_execution: kernel_mm::api::address_space::ExecutionPin,
+        handles_kmem: u64,
+    ) -> Result<ProcessHandle, crate::multitask::SpawnTaskError> {
+        if !self.live || self.process.is_some() || self.key.registered {
+            return Err(crate::multitask::SpawnTaskError::NoFreeTaskSlot);
+        }
+        let loan = self
+            .spawn_key
+            .as_mut()
+            .ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot)?;
+        let process = process_table::spawn::publish_vfork_root_spawn(
+            loan,
+            parent,
+            owner_handle,
+            state_lock,
+            mm_execution,
+            handles_kmem,
+        )?;
+        assert_eq!(
+            process.handle(),
+            self.handle,
+            "root vfork process changed original generation"
+        );
+        self.process = Some(process);
+        Ok(self.handle)
+    }
     pub(in crate::multitask) fn cancel(self) -> Option<process_table::SpawnReservation> {
         if self.process.is_some() || self.key.registered {
             return None;

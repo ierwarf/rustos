@@ -49,7 +49,10 @@ const PAGE_SIZE: usize = 4096;
 #[cfg(not(test))]
 const MIN_HEAP_SIZE: usize = 64 * 1024 * 1024;
 #[cfg(not(test))]
-const MAX_HEAP_SIZE: usize = 512 * 1024 * 1024;
+/// Every task owns a 2 MiB heap-backed kernel stack and the table holds 256
+/// tasks, so the heap must reach 512 MiB of stacks plus the ordinary kernel
+/// allocations before a full task table is reachable.
+const MAX_HEAP_SIZE: usize = 1024 * 1024 * 1024;
 /// Independent tracker shards; a pointer always hashes to the same shard.
 const TRACKER_SHARD_BITS: u32 = 4;
 const TRACKER_SHARDS: usize = 1 << TRACKER_SHARD_BITS;
@@ -776,7 +779,7 @@ pub fn init_heap() {
     HEAP_INIT.call_once(|| unsafe {
         let usable_bytes = phys::usable_bytes() as usize;
         let target_bytes = usable_bytes
-            .saturating_div(8)
+            .saturating_div(4)
             .clamp(MIN_HEAP_SIZE, MAX_HEAP_SIZE);
         let mut remaining_pages = target_bytes.div_ceil(PAGE_SIZE);
         let mut heap = HEAP.lock();
@@ -814,6 +817,19 @@ pub fn init_heap() {
 
 #[cfg(test)]
 pub fn init_heap() {}
+
+/// Buddy heap occupancy in bytes: `(total, allocated)`. Telemetry only; `None`
+/// when the buddy lock is contended (never waits) or in host tests.
+#[cfg(not(test))]
+pub fn usage_bytes() -> Option<(usize, usize)> {
+    let heap = HEAP.try_lock()?;
+    Some((heap.stats_total_bytes(), heap.stats_alloc_actual()))
+}
+
+#[cfg(test)]
+pub fn usage_bytes() -> Option<(usize, usize)> {
+    None
+}
 
 #[cfg(not(test))]
 pub fn is_initialized() -> bool {

@@ -926,6 +926,9 @@ pub const VFS_IPC_OP_FCHOWN: u16 = 41;
 /// Hard links exist only on volumes with POSIX nodes (`EPERM` elsewhere, as
 /// Linux vfat); a link across mounts is `EXDEV`; a directory is `EPERM`.
 pub const VFS_IPC_OP_LINKAT: u16 = 42;
+pub const VFS_IPC_OP_INOTIFY_INIT: u16 = 43;
+pub const VFS_IPC_OP_INOTIFY_ADD_WATCH: u16 = 44;
+pub const VFS_IPC_OP_INOTIFY_RM_WATCH: u16 = 45;
 /// "Leave this id unchanged" in `VFS_IPC_OP_CHOWN`/`FCHOWN` (`(uid_t)-1`).
 pub const VFS_ID_UNCHANGED: u64 = 0xFFFF_FFFF;
 /// `VfsIpcRequest::flags` bit of `VFS_IPC_OP_CHOWN`: do not follow a final symlink.
@@ -959,6 +962,10 @@ pub const VFS_POLL_QUERY_EPOLL_PURGE_OBJECT: u64 = 6;
 /// payload carries one byte per entry (`1` = this caller owns the report) and
 /// `value` is the accepted count. Level-triggered interests are never claimed.
 pub const VFS_POLL_QUERY_EPOLL_CLAIM: u64 = 7;
+/// Batched fd readiness keyed by `(fd, events, revents, remote_id)` so
+/// object-backed fds such as inotify instances return real per-object readiness.
+pub const VFS_POLL_QUERY_POLL_KEYED: u64 = 8;
+pub const VFS_POLL_KEYED_BATCH_MAX: usize = VFS_IPC_REQUEST_PAYLOAD_CAPACITY / 16;
 
 pub const WAITSET_ABI_VERSION: u16 = 1;
 pub const WAITSET_PROVIDER_VFSD: u16 = 1;
@@ -1210,6 +1217,7 @@ pub const VFS_IPC_PAYLOAD_CAPACITY: usize = IPC_MAX_INLINE_BYTES - VFS_IPC_RESPO
 pub const VFS_IPC_HANDLE_KIND_FILE: u16 = 1;
 pub const VFS_IPC_HANDLE_KIND_DIR: u16 = 2;
 pub const VFS_IPC_HANDLE_KIND_DEVICE: u16 = 3;
+pub const VFS_IPC_HANDLE_KIND_INOTIFY: u16 = 4;
 /// vfsd-selected compatibility route for `/dev/dri/card0`. Compat may retain
 /// a remote VFS device description only for this explicit service decision;
 /// it must not classify the path in ring0.
@@ -3134,6 +3142,7 @@ pub struct NetBrokerPrepareSocketPublication {
 // module whenever the compatibility feature is selected.
 const NET_BROKER_PUBLICATION_AF_UNIX: u64 = 1;
 const NET_BROKER_PUBLICATION_AF_INET: u64 = 2;
+const NET_BROKER_PUBLICATION_AF_INET6: u64 = 10;
 const NET_BROKER_PUBLICATION_SOCK_STREAM: u64 = 1;
 const NET_BROKER_PUBLICATION_SOCK_DGRAM: u64 = 2;
 /// `AF_NETLINK`/`SOCK_RAW`/`SOCK_SEQPACKET`: published sockets that netd owns
@@ -3151,17 +3160,19 @@ const NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS: u64 =
 const _: () = {
     assert!(NET_BROKER_PUBLICATION_AF_UNIX == crate::linux::AF_UNIX);
     assert!(NET_BROKER_PUBLICATION_AF_INET == crate::linux::AF_INET);
+    assert!(NET_BROKER_PUBLICATION_AF_INET6 == crate::linux::AF_INET6);
     assert!(NET_BROKER_PUBLICATION_SOCK_STREAM == crate::linux::SOCK_STREAM);
+    assert!(NET_BROKER_PUBLICATION_SOCK_DGRAM == crate::linux::SOCK_DGRAM);
     assert!(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK == crate::linux::SOCK_TYPE_MASK);
     assert!(NET_BROKER_PUBLICATION_SOCK_NONBLOCK == crate::linux::SOCK_NONBLOCK);
     assert!(NET_BROKER_PUBLICATION_SOCK_CLOEXEC == crate::linux::SOCK_CLOEXEC);
 };
 
-/// Closed, non-raw IPv4 socket envelope shared by publication and handle admission.
+/// Closed, non-raw IPv4/IPv6 socket envelope shared by publication and handle admission.
 /// Datagram ICMP permits echo only; netd enforces the packet policy in Ring3.
 pub const fn net_broker_inet_socket_shape_valid(domain: u64, socket_type: u64, protocol: u64) -> bool {
     let base_type = socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK;
-    domain == NET_BROKER_PUBLICATION_AF_INET
+    (domain == NET_BROKER_PUBLICATION_AF_INET || domain == NET_BROKER_PUBLICATION_AF_INET6)
         && socket_type & !(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK | NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS) == 0
         && match base_type {
             NET_BROKER_PUBLICATION_SOCK_STREAM => protocol == 0 || protocol == 6,
@@ -3170,13 +3181,13 @@ pub const fn net_broker_inet_socket_shape_valid(domain: u64, socket_type: u64, p
         }
 }
 
-/// AF_UNIX stream and seqpacket sockets have no selectable transport protocol.
-/// `SOCK_DGRAM` and every other type are not published here (netd answers
-/// `ESOCKTNOSUPPORT` before publication).
+/// AF_UNIX stream, dgram, and seqpacket sockets have no selectable transport protocol.
 pub const fn net_broker_unix_socket_shape_valid(domain:u64, socket_type:u64, protocol:u64)->bool {
     domain == NET_BROKER_PUBLICATION_AF_UNIX && protocol == 0
         && match socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK {
-            NET_BROKER_PUBLICATION_SOCK_STREAM | NET_BROKER_PUBLICATION_SOCK_SEQPACKET => true,
+            NET_BROKER_PUBLICATION_SOCK_STREAM
+            | NET_BROKER_PUBLICATION_SOCK_DGRAM
+            | NET_BROKER_PUBLICATION_SOCK_SEQPACKET => true,
             _ => false,
         }
         && socket_type & !(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK | NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS) == 0

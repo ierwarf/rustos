@@ -2,6 +2,10 @@ pub(crate) mod slot_dir;
 mod child_wait;
 mod context;
 pub use self::child_wait::{register_child_waiter, unregister_child_waiter, wake_child_waiters};
+mod vfork_wait;
+pub use self::vfork_wait::{
+    begin_vfork_wait, cancel_vfork_wait, complete_vfork, take_vfork_done,
+};
 mod housekeeping_kick;
 pub use self::housekeeping_kick::{
     housekeeping_kicked, kick_housekeeping, prioritize_housekeeping, register_housekeeping_task,
@@ -92,10 +96,11 @@ pub use self::current::{
     with_current_mm, with_current_process_credentials, with_current_process_state,
     with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
-    with_current_user_process_state_mut, with_fork_parent_state, with_process_state_by_pid,
+    with_current_user_process_state_mut, with_fork_parent_state, with_fork_parent_vfork_state,
+    with_process_state_by_pid,
     with_process_state_by_pid_mut, with_process_state_for_teardown_mut, with_process_state_by_generation_mut, ExecRefusal, PagerChargeSnapshot,
 };
-pub use self::process_table::for_each_visible_process_state_mut;
+pub use self::process_table::{for_each_visible_process_state_mut, live_process_count};
 pub use self::pager_fault::{
     cancel_pager_fault, claim_pager_fault_reply_from_pager, consume_pager_fault_reply,
     mark_pager_fault_blocked, pager_fault_snapshot, register_pager_fault_waiter,
@@ -164,6 +169,7 @@ pub use self::irq::{
 };
 pub use self::spawn::{
     spawn_user_process_state_suspended_with_parent_reservation,
+    spawn_user_process_vfork_suspended_with_parent_reservation,
     spawn_user_process_suspended_with_scheduling_context,
     spawn_user_process_with_scheduling_context,
     spawn_user_process_without_deferred_reschedule_with_scheduling_context,

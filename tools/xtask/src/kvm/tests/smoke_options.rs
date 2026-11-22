@@ -303,3 +303,21 @@
         let panicked = format!("{rustos}initd: fatal service endpoint not ready exec=a pid=1 errno=5\n");
         assert!(super::held_state_failure(&panicked, &dvm, &options).is_some());
     }
+
+    #[test]
+    fn screendump_and_chrome_web_probe_options_enforce_topology() {
+        let sd = parse(&["--screendump", "build/kvm/test.ppm"]).unwrap();
+        assert_eq!(sd.screendump.as_deref(), Some(Path::new("build/kvm/test.ppm")));
+        assert!(sd.gui_dvm_surfaces);
+        assert!(parse(&["--screendump", "a.ppm", "--physical-gpu", "0000:03:00.0"]).is_err());
+        assert!(parse(&["--screendump", "a.ppm", "--storage-dvm-only"]).is_err());
+
+        let probe = parse(&["--chrome-web-probe"]).unwrap();
+        assert!(probe.chrome_web_probe);
+        assert!(probe.gui_dvm_surfaces && probe.dvm_block_shmem && probe.dvm_network_shmem);
+        assert_eq!(probe.launch_desktop.as_deref(), Some("chrome.desktop"));
+        assert!(probe.expected_markers.contains(&super::launch_desktop_launched_marker("chrome.desktop")));
+        assert!(probe.expected_markers.iter().any(|m| m == "wayland_windows=2"));
+        assert_eq!(probe.hold_seconds, Some(8));
+        assert!(parse(&["--chrome-web-probe", "--storage-dvm-only"]).is_err());
+    }

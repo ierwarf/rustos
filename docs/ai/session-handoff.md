@@ -4,6 +4,158 @@ Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
 
+## Storage read path: read engine, lanes, lookahead, pipelined relay (2026-11-22)
+
+Goal: make the DVM-backed read path (vfsd -> storaged -> DVM relay) closer to host speed. Measured with `kvm-smoke --launch-desktop chrome.desktop`, 16 vCPU, 6 GiB, vfsd `snapshot transfer` line for the 306,789,704-byte Chrome snapshot. `read_us` is the time the snapshot worker was blocked reading; `total_us` is read+write+hash wall time.
+
+| step | read_us | total_us |
+|---|---|---|
+| baseline (single 64 KiB window, serial loop) | ~1.83 s | ~2.1 s |
+| storaged stream prefetcher only | ~1.65 s | - |
+| read engine + 4 storaged receivers | 1.15-1.25 s | - |
+| + 4 MiB vfsd snapshot window (lanes actually used) + rebuilt relay + read-ahead depth 40 | 0.45-0.62 s | 0.86 s (mean of 4) |
+| + vfsd lookahead (next 4 MiB read by helpers while vfsd hashes/writes) | 0.41-0.49 s | 0.77 s (mean of 4, interleaved A/B, ranges do not overlap) |
+
+Corrections to earlier notes (do not rely on them): (1) the 1.25 s and 1.146 s rows ran with vfsd reading 256 KiB windows, below the 2 MiB lane threshold, so `bulk_lanes` never ran for the snapshot; their gain came from the engine and receivers. (2) The "pipelined relay" smoke ran a DVM rootfs built before the C change (`driver-domains/linux/out/artifacts/*.rootfs.cpio.zst` is only refreshed by `make -C driver-domains/linux rebuild-block`; `cargo xtask kvm-smoke` does not rebuild it). The relay change was first really exercised on 2026-11-22 22:16 and since then.
+
+Done:
+- `services/storaged/src/read_engine.rs` (new): windowed cache/in-flight table with per-window publication, stream table (8 streams, adaptive depth 4..40), shared fetch for concurrent readers, write/generation invalidation, one pump thread; 12 unit tests. `block.rs` keeps only the DVM transport binding; old `ReadCache*`/`read_ahead_plan` removed. `main.rs` runs 4 receiver threads with per-thread bulk reply slots. Limits: 192 windows, 48 in flight.
+- `services/vfsd/src/bulk_lanes.rs` (new): reads >= 2 MiB split across the caller plus 3 helper threads (futex-coordinated, first error aborts), plus a lookahead job slot (`JOB_FREE/CALLER/PREFETCH`, 4 MiB private buffer, adopted by the next sequential read, discarded on mismatch/error/vfsd block write). Sizing rules live in `services/vfsd/src/bulk_plan.rs` (library, unit-tested). `snapshot_budget.rs`: vfsd's snapshot window is now 4 MiB (loaderd/early-system broker keep 256 KiB). `snapshot_worker.rs` exposes `spawn_thread_on_stack`. The snapshot transfer line gained `total_us`.
+- Relay (`rustos-dvm-block.c`): completion events are no longer acked one by one; the supervisor rings the doorbell every 8 completions or when the queue empties. Smoke runs since the image rebuild: no revoke/quarantine/long-blocked.
+- Formal: `DvmReadCache.tla` models per-window publication and reader-only failure (TLC passes); pins in `check-performance-contracts.sh`, witness rows in `run-source-conformance.sh`, `system-flows.tsv`, `contracts.toml` risk surface, `rust-source-debt.tsv`, prose in `formal/{models,COVERAGE,CONFORMANCE}.md`, regenerated `formal-contracts.generated.md`.
+
+Step 4 (shared-memory lane / larger vfsd<->storaged payload) was evaluated and NOT implemented. Measurements at the ~450-500 MB/s ceiling: relay worker ~47% busy and storaged pump 12-31% busy (neither saturated); kernel submit syscall ~5-7 us; relay sees a request backlog of ~9 on average (max 37); raising vfsd helper lanes 3->7 with 8 storaged receivers, or read-ahead depth 40->56 with 60 in flight, did not change `read_us` (the 8-lane run also failed one launch with errno 11, unexplained, not reproduced with 3/4). So the vfsd<->storaged IPC payload and copies are not the limiting stage; a shared-memory lane would only remove ~2 memcpy of 306 MB. The unexplained serialized stage costs ~140 us per 64 KiB window. Next candidates, in order: (a) per-request latency chain inside the DVM relay (worker + supervisor + two doorbell/interrupt hops on a 2-vCPU guest; add timestamps per request to find where a request waits); (b) larger transport slots (64 KiB -> 256 KiB needs a 16 MiB BAR2 aperture, header/ABI, kernel io-manager, relay, hostd/xtask and formal updates); (c) doorbell suppression when the relay is already draining.
+
+Not verified / disconnected:
+- PR gate was run before the lookahead/window/depth changes; rerun `bash formal/verify-all.sh --profile pr` before pushing (unit tests and `tools/agent/formal-preflight.sh` were rerun).
+- No >=40-boot flake check for the new threads (storaged receivers, vfsd lanes, relay pipelining); see `kvm-smoke-flake-baseline`. 8 interleaved boots with lookahead on/off all passed.
+- Chrome end-to-end launch time was not re-measured; the eager file-map copy cost is still unmeasured without tracing.
+- Partial/lazy loading of the 300 MB Chrome binary is deliberately not implemented (user decision).
+
+## Chrome gap batch: netd IPv6/UNIX dgram, vfork, inotify, D-Bus, screendump (2026-11-22)
+
+Uncommitted. Four swarm patches (net, proc-vfork, vfs-inotify, ui-dbus) were merged, then reviewed
+and fixed by four per-area review agents plus integration fixes. Host-side only; KVM result below
+if one was recorded.
+
+- **Implemented**: AF_INET6 and more socket options, AF_UNIX `SOCK_DGRAM`, error queue (IPv4);
+  `SYS_VFORK` / `CLONE_VFORK` / `CLONE_CLEAR_SIGHAND` (clone3 only) with
+  `kernel/ps/src/multitask/vfork_wait.rs`; inotify (`services/vfsd/src/inotify.rs`,
+  `RemoteVfsHandleKind::Inotify`, dispatch in `linux.rs`, `int_args.rs` rows); cross-pid
+  `/proc/<pid>/oom_score_adj` with an euid/ancestor check; session D-Bus in
+  `services/runtimed/src/dbus.rs`; `tools/xtask/src/kvm/screendump.rs` QEMU screenshot.
+- **Integration fixes**: `SYS_VFORK` and the four inotify syscalls were never dispatched; the vfork
+  parent wait is now killable-only (a pending signal used to resume the parent on the child's
+  shared stack); `copy_file_range` arm for `Inotify`; `front_len` was test-only but used in prod;
+  netd parallel tests shared fake inode ids, token `0x9b0_0021` and `wayland-0` (poisoned the
+  global state lock, exit 101).
+- **KVM (4 vCPU, `kvm-smoke --chrome-web-probe`) passed, rc=0**: Chrome window 1584x1080,
+  414 colors, `xtask: chrome pixels verified` (title "Google Chrome and ChromeOS Additional Terms of
+  Service", i.e. the first-run page, not about:blank). Evidence is the committed Wayland buffer
+  reported by `uiserver: pixel-probe` (`services/uiserver/src/pixel_probe.rs`, contract key
+  `ui_pixel_probe=1`, late-watched in `acceptance_profile.rs`, judged by
+  `tools/xtask/src/kvm/pixel_evidence.rs`), NOT the host display: QEMU `screendump` returns
+  `Error: no surface` under egl-headless + virtio-gpu-gl blob, so `--chrome-web-probe` no longer
+  uses it. Fixed on the way: launch-desktop retry window (ipcbench held 12/48 while Chrome asked
+  24/144), vfsd `O_CREAT` on delegated `/proc/<pid>/oom_score_adj`, kernel buddy heap RAM/8 ->
+  RAM/4 (2 MiB kernel stack per thread exhausted 255 MiB), late-watcher parser rejecting
+  `google_ping=`. `formal/run-source-conformance.sh` anchors were renamed, never run.
+- **Known open**: `mark_process_exiting_inner` completes the vfork wait at exit-mark time (a child
+  killed on another CPU can still run briefly); a vfork child that exits without exec keeps the
+  parent's Mm until reaped; no unit test for the borrower-refcount refusal; ICMPv6/IPv6 error
+  queue, `IP_ADD_MEMBERSHIP`, `TCP_INFO` (ENOPROTOOPT), `TCP_KEEP*` stored not applied;
+  `IN_ACCESS` never emitted; D-Bus needs `SO_PEERCRED` (netd has it, untested in guest) and is
+  EXTERNAL-auth only; screendump never run against QEMU; GPU upload fence wait was removed (GL
+  ordering assumed); `rustos-dvm-display.c` per-flip full-plane damage blob costs 2 ioctls for no
+  gain; `procd`/`rootd` host tests SIGSEGV without `--features host-test`.
+- **Pre-existing**: `parse_strict_decimal_u64`, `proc_self_fd_target`, `proc_fd_readlink_target`
+  in `vfs_socket.rs` have no production callers (same at HEAD).
+
+## PR gate maintenance for the Chrome gap batch (2026-11-22)
+
+`tools/agent/formal-preflight.sh` is 23/23 after realigning formal metadata with
+the uncommitted batch (no behavior change except as noted):
+
+- `rust-source-contracts`: `ORDERING:`/`SAFETY:` comments in
+  `process_table/identity.rs` and `services/storaged/src/block.rs`;
+  `TEST-HARNESS:` rationale on test-only `#[allow(dead_code)]` (`process_state_lock.rs`,
+  `netd/deadline.rs`, `netd/inet_datagram.rs`).
+- SMP/concurrency contracts re-pointed at the refactored sources
+  (`pid_index_link(index, ..)`, `other.materialize(`, `waiters.insert(FutexWaiter {`,
+  `waiters.select_requeue(`, `pin_owner::close(index, old_gen)`, exhaustive
+  `UserMmState`/`UserProcessLocal` destructure); pager binding now asserts
+  `published_mm_vma_target(handle)`.
+- `formal/zero-trust-subsystems.tsv`: new `dbus-broker` local-socket row for
+  `services/runtimed/src/dbus.rs`. It reuses the RuntimeControlAuthority model
+  and `runtime-control-ingress` flow (peer-credential admission); there is no
+  D-Bus-specific model yet (approximation, not a dedicated proof).
+- `formal/implementation-mutations.tsv`: occurrence selectors updated for the
+  vfork duplicates; only the fork/regular-publish and stream/inet variants are
+  killed by existing tests. The vfork publish paths (`publish_vfork_inner`) and
+  netd datagram `connect` (`socket_lifecycle.rs` occurrence 1) have no mutation
+  rows and no killing test. `process-lifecycle-fork-shared-state-admission` now
+  mutates the CLONE_VM/CLONE_VFORK pairing check.
+- xtask's `chrome pixels verified` message is one line: the dispatch-source
+  checker's lexer cannot parse `\`-newline string continuations.
+
+The full `--profile pr` result is recorded below when it finishes. (Not run
+after the changes in the next section; every later source edit needs a re-seal.)
+
+## F5 path: 6 GiB RAM, launch retry, vfsd/syscalld deadlock (2026-11-22)
+
+- F5 runs `KVM_RUSTOS_MEMORY_MIB=6144 cargo xtask kvm-run --build --rustos-vcpus 16`.
+  virtio-pmem windows are no longer fixed at 4 GiB-relative addresses: q35 puts
+  the device-memory region at the first 1 GiB boundary at/above RAM top (min
+  4 GiB), so xtask (`guest.rs`), `driver-domain-protocol::app_buffer`
+  (`dvm_pmem_base`) and the kernel (`phys::boot_ram_top`) derive the same base.
+  `failure_snapshot.rs` still assumes 4 GiB in two places (stale).
+- Chrome click "errno 130": ipcbench holds the Application Job thread budget at
+  boot; runtimed now reports a budget EAGAIN as a definite rejection and
+  uiserver retries it (1 s x 90). Other spawn errors stay `EOWNERDEAD`/unknown.
+- Chrome showed no window / very slow launch in 6 GiB sessions: syscalld
+  (task 20) and vfsd (task 21) blocked on each other until the 30 s IPC deadline
+  (`kernel-scheduler-long-blocked-reply`, same reply handle for 20+ s, all Chrome
+  syscalls queued behind). Measured with a temporary kernel call trace: syscalld's
+  mapping broker was inside ~8000 vfsd `PREAD64` calls (eager file-mapping copy
+  for Chrome's child processes) while vfsd's single receive thread called
+  `sched_getaffinity` (for `/proc/cpuinfo`, `/sys/devices/system/cpu/*`) and
+  heap-growth `mmap`, both routed to syscalld. Fix, following the existing vfsd
+  `memfd_create` precedent: for the `VfsPolicy` holder the kernel answers
+  `sched_getaffinity` (`syscalld_ops.rs`) and plain anonymous RW `mmap`
+  (`memory_ops.rs`, `is_plain_anonymous_heap_growth`) itself.
+  `note_syscalld_call_from_vfsd` (`ipc_ops.rs`) emits milestone
+  `vfsd-syscalld-call` (arg0 op, arg1 count) for any other vfsd->syscalld call;
+  it must stay 0. 16 vCPU / 6 GiB Chrome smoke after the fix: no
+  long-blocked records, no `vfsd-syscalld-call`, Chrome window up.
+- Storage/launch timing, corrected. An earlier version of this note reported a
+  10.5 s executable snapshot and ~30 s of eager file-mapping copy; those were
+  inflated by the temporary per-call debugcon trace used to find the cycle
+  (one VM exit per call, ~23k lines). Clean 16 vCPU / 6 GiB numbers: Chrome's
+  306 MB snapshot takes ~2.1 s (`read_us` ~1.85 s, 5901 storaged calls of
+  ~52 KB, ~295 us per call as seen by vfsd), and Chrome's first window appears
+  ~4 s after its process starts (GPU process ~7 s). The eager private
+  file-mapping copy through syscalld (PREAD64) has NOT been re-measured clean.
+- Where the storage time goes (measured with temporary storaged timers, since
+  removed): per 52 KB bulk read, storaged spends ~100 us waiting for DVM batches
+  (a batch of ~14 x 64 KiB windows is only submitted on a demand miss, so DVM
+  latency is not hidden), ~11 us replying, and ~220 us is idle between reply and
+  the next request (vfsd work ~45 us plus ~175 us IPC transit/wake). DVM batches
+  run at ~500 MB/s in-batch; the Linux relay (`rustos-dvm-block.c`) executes one
+  request at a time (pread into a bounce buffer, WC memcpy to the slot, two
+  watchdog socket round trips per request). Host O_DIRECT sequential read of
+  the same image: 1.0 GB/s at 64 KiB, 2.8 GB/s at 1 MiB. QEMU `iothread` +
+  `aio=native` + `queue-size=256` measured no change (1.84 s vs 1.86 s) and was
+  reverted, so the QEMU backend is not the bottleneck.
+- Candidate storage work, in expected-gain order, none started: (1) storaged
+  background stream prefetcher feeding the read cache so DVM latency overlaps the
+  IPC cycle; (2) several outstanding bulk reads from vfsd with multiple storaged
+  receiver threads (needs per-thread response slots; the sequential-frontier
+  heuristic in `block.rs` must be replaced by the prefetcher first); (3) relay:
+  batch watchdog events, drop the bounce copy; (4) larger IPC payloads or a
+  shared-memory bulk lane to cut per-call wakes.
+- `apps/chrome/RUSTOS.package.toml` still carries `--enable-logging=stderr
+  --log-level=0` (diagnostic).
+
 ## Chrome launch & virtio-blk KVM validation (2026-11-21)
 
 KVM validation and root-cause fixes completed on top of the uncommitted redesign batch (`apps/chrome/RUSTOS.package.toml` interim manifest with `--no-sandbox --disable-gpu --disable-background-networking --user-data-dir=/tmp/chrome-profile about:blank`).
@@ -1605,3 +1757,17 @@ failure is refused as EAGAIN). Unverified: KVM boots; real stack depth of a user
 thread (a smaller user-thread kernel stack would be the lever, needs a
 high-water measurement first). Not raised: `PAGER_MAX_FAULT_SLOTS` (128, ABI,
 Pressure is back-pressure), `MAX_TASK` beyond 256 (needs 9-bit slot encodings).
+
+## Chrome KVM follow-up (oom_score_adj EACCES, stack exhaustion)
+
+- `/proc/<pid>/oom_score_adj` EACCES root cause: Chrome `WriteFile` opens it with
+  `O_CREAT|O_TRUNC`; vfsd `delegated_open_errno` refused every `O_CREAT`. Now only
+  `O_CREAT|O_EXCL` fails (EEXIST). Kernel write rule is Linux-like (same euid or
+  root; unprivileged cannot go below `min(current, 0)`); the ancestor exemption was
+  removed.
+- `pthread_create` EAGAIN root cause (capacity, not a leak): new milestone
+  `linux-thread-stack-exhausted` showed live_tasks=128, heap 254/255 MiB used.
+  Every task has a 2 MiB heap-backed stack; heap was RAM/8 (255 MiB at 2 GiB).
+  Heap is now RAM/4 clamped 64..1024 MiB (512 MiB at the 2 GiB default).
+- Open: a Chrome child faulted after `mm-broker-refused errno=110` (ETIMEDOUT) under
+  heavy storaged DVM read streaming; run-to-run variable, not investigated.

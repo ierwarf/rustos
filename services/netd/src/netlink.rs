@@ -34,6 +34,7 @@
 use super::*;
 
 const AF_INET_FAMILY: u8 = 2;
+const AF_INET6_FAMILY: u8 = 10;
 
 pub(super) const NLMSG_HDRLEN: usize = 16;
 pub(super) const NLMSG_ERROR: u16 = 2;
@@ -54,6 +55,8 @@ pub(super) const RTM_GETNEIGH: u16 = 30;
 pub(super) const RTMGRP_LINK: u32 = 1 << 0;
 pub(super) const RTMGRP_IPV4_IFADDR: u32 = 1 << 4;
 pub(super) const RTMGRP_IPV4_ROUTE: u32 = 1 << 6;
+pub(super) const RTMGRP_IPV6_IFADDR: u32 = 1 << 8;
+pub(super) const RTMGRP_IPV6_ROUTE: u32 = 1 << 10;
 /// `RTNLGRP_MAX` is 31 on current kernels: group numbers 1..=31 are valid.
 const NETLINK_GROUP_NUMBER_MAX: u32 = 31;
 pub(super) const NETLINK_ADD_MEMBERSHIP: u64 = 1;
@@ -141,12 +144,34 @@ pub(super) struct RouteInfo {
     pub(super) protocol: u8,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct Addr6Info {
+    pub(super) index: i32,
+    pub(super) prefix_len: u8,
+    pub(super) scope: u8,
+    pub(super) flags: u8,
+    pub(super) local: [u8; 16],
+    pub(super) label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct Route6Info {
+    pub(super) oif: i32,
+    pub(super) dst: [u8; 16],
+    pub(super) dst_len: u8,
+    pub(super) prefsrc: Option<[u8; 16]>,
+    pub(super) scope: u8,
+    pub(super) protocol: u8,
+}
+
 /// Everything a dump or an event comparison needs, taken under one lock.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct InterfaceSnapshot {
     pub(super) links: Vec<LinkInfo>,
     pub(super) addrs: Vec<AddrInfo>,
     pub(super) routes: Vec<RouteInfo>,
+    pub(super) addrs_v6: Vec<Addr6Info>,
+    pub(super) routes_v6: Vec<Route6Info>,
 }
 
 pub(super) fn loopback_link() -> LinkInfo {
@@ -282,6 +307,50 @@ fn addr_record(addr: &AddrInfo, msg_type: u16, flags: u16, seq: u32, pid: u32) -
     finish_message(body, msg_type, flags, seq, pid)
 }
 
+pub(super) fn build_addr6_message(addr: &Addr6Info, seq: u32, pid: u32) -> Vec<u8> {
+    addr6_record(addr, RTM_NEWADDR, NLM_F_MULTI, seq, pid)
+}
+
+fn addr6_record(addr: &Addr6Info, msg_type: u16, flags: u16, seq: u32, pid: u32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(64);
+    body.push(AF_INET6_FAMILY);
+    body.push(addr.prefix_len);
+    body.push(addr.flags);
+    body.push(addr.scope);
+    body.extend_from_slice(&(addr.index as u32).to_ne_bytes());
+    push_attr(&mut body, IFA_ADDRESS, &addr.local);
+    let mut label = addr.label.clone().into_bytes();
+    label.push(0);
+    push_attr(&mut body, IFA_LABEL, &label);
+    finish_message(body, msg_type, flags, seq, pid)
+}
+
+pub(super) fn build_route6_message(route: &Route6Info, seq: u32, pid: u32) -> Vec<u8> {
+    route6_record(route, RTM_NEWROUTE, NLM_F_MULTI, seq, pid)
+}
+
+fn route6_record(route: &Route6Info, msg_type: u16, flags: u16, seq: u32, pid: u32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(80);
+    body.push(AF_INET6_FAMILY);
+    body.push(route.dst_len);
+    body.push(0);
+    body.push(0);
+    body.push(RT_TABLE_MAIN);
+    body.push(route.protocol);
+    body.push(route.scope);
+    body.push(RTN_UNICAST);
+    body.extend_from_slice(&0_u32.to_ne_bytes());
+    push_attr(&mut body, RTA_TABLE, &u32::from(RT_TABLE_MAIN).to_ne_bytes());
+    if route.dst_len != 0 {
+        push_attr(&mut body, RTA_DST, &route.dst);
+    }
+    push_attr(&mut body, RTA_OIF, &(route.oif as u32).to_ne_bytes());
+    if let Some(prefsrc) = route.prefsrc {
+        push_attr(&mut body, RTA_PREFSRC, &prefsrc);
+    }
+    finish_message(body, msg_type, flags, seq, pid)
+}
+
 /// `RTM_NEWROUTE` record: `rtmsg` + TABLE, [DST], OIF, [GATEWAY], [PREFSRC].
 pub(super) fn build_route_message(route: &RouteInfo, seq: u32, pid: u32) -> Vec<u8> {
     route_record(route, RTM_NEWROUTE, NLM_F_MULTI, seq, pid)
@@ -349,7 +418,7 @@ pub(super) fn process_request(
     let snapshot = InterfaceSnapshot {
         links: links.to_vec(),
         addrs: addrs.to_vec(),
-        routes: Vec::new(),
+        ..InterfaceSnapshot::default()
     };
     process_request_snapshot(request, portid, &snapshot)
 }
@@ -404,8 +473,11 @@ pub(super) fn process_request_snapshot(
                         reply.extend_from_slice(&build_addr_message(addr, seq, portid));
                     }
                 }
-                // Other families (AF_INET6, ...) have no address table here:
-                // an empty dump, still terminated by NLMSG_DONE.
+                if family == 0 || family == AF_INET6_FAMILY {
+                    for addr in &snapshot.addrs_v6 {
+                        reply.extend_from_slice(&build_addr6_message(addr, seq, portid));
+                    }
+                }
                 reply.extend_from_slice(&build_done(seq, portid));
             }
             RTM_GETROUTE if dump => {
@@ -413,6 +485,11 @@ pub(super) fn process_request_snapshot(
                 if family == 0 || family == AF_INET_FAMILY {
                     for route in &snapshot.routes {
                         reply.extend_from_slice(&build_route_message(route, seq, portid));
+                    }
+                }
+                if family == 0 || family == AF_INET6_FAMILY {
+                    for route in &snapshot.routes_v6 {
+                        reply.extend_from_slice(&build_route6_message(route, seq, portid));
                     }
                 }
                 reply.extend_from_slice(&build_done(seq, portid));
@@ -465,7 +542,10 @@ impl NetlinkState {
         self.groups
     }
 
-    #[cfg(test)]
+    pub(super) fn front_len(&self) -> usize {
+        self.rx.front().map_or(0, Vec::len)
+    }
+
     pub(super) fn queued_messages(&self) -> usize {
         self.rx.len()
     }
@@ -603,6 +683,15 @@ pub(super) fn current_interfaces(state: &mut NetState) -> InterfaceSnapshot {
         links: vec![loopback_link()],
         addrs: vec![loopback_addr()],
         routes: Vec::new(),
+        addrs_v6: vec![Addr6Info {
+            index: 1,
+            prefix_len: 128,
+            scope: RT_SCOPE_HOST,
+            flags: IFA_F_PERMANENT,
+            local: Ipv6Address::LOCALHOST.octets(),
+            label: "lo".to_string(),
+        }],
+        routes_v6: Vec::new(),
     };
     #[cfg(not(test))]
     let provider_active = packet_provider_state() == Ok(PacketProviderState::Active);
@@ -610,30 +699,76 @@ pub(super) fn current_interfaces(state: &mut NetState) -> InterfaceSnapshot {
     let provider_active = true;
     if let Some(stack) = state.inet.as_ref().filter(|_| provider_active) {
         const INDEX: i32 = 2;
-        // Both enums are single-variant under this crate's smoltcp features
-        // (ethernet medium, IPv4 only).
         let HardwareAddress::Ethernet(mac) = stack.iface.hardware_addr();
         snapshot.links.push(provider_link(INDEX, mac.0));
         for cidr in stack.iface.ip_addrs() {
-            let IpCidr::Ipv4(cidr) = cidr;
-            let (address, prefix_len) = (cidr.address().octets(), cidr.prefix_len());
-            snapshot.addrs.push(provider_addr(INDEX, address, prefix_len));
-            snapshot.routes.push(connected_route(INDEX, address, prefix_len));
+            match cidr {
+                IpCidr::Ipv4(cidr) => {
+                    let (address, prefix_len) = (cidr.address().octets(), cidr.prefix_len());
+                    if address[0] == 127 {
+                        continue;
+                    }
+                    snapshot.addrs.push(provider_addr(INDEX, address, prefix_len));
+                    snapshot.routes.push(connected_route(INDEX, address, prefix_len));
+                }
+                IpCidr::Ipv6(cidr) => {
+                    let address = cidr.address();
+                    let prefix_len = cidr.prefix_len();
+                    if address.is_loopback() {
+                        continue;
+                    }
+                    let octets = address.octets();
+                    let scope = if address.is_unicast_link_local() {
+                        RT_SCOPE_LINK
+                    } else {
+                        RT_SCOPE_UNIVERSE
+                    };
+                    snapshot.addrs_v6.push(Addr6Info {
+                        index: INDEX,
+                        prefix_len,
+                        scope,
+                        flags: IFA_F_PERMANENT,
+                        local: octets,
+                        label: PROVIDER_INTERFACE_NAME.to_string(),
+                    });
+                    snapshot.routes_v6.push(Route6Info {
+                        oif: INDEX,
+                        dst: mask_ipv6(octets, prefix_len),
+                        dst_len: prefix_len,
+                        prefsrc: Some(octets),
+                        scope: RT_SCOPE_LINK,
+                        protocol: RTPROT_KERNEL,
+                    });
+                }
+            }
         }
         if let Some(route) = stack.iface.routes().get_default_ipv4_route() {
-            let IpAddress::Ipv4(gateway) = route.via_router;
-            snapshot.routes.push(RouteInfo {
-                oif: INDEX,
-                dst: [0; 4],
-                dst_len: 0,
-                gateway: Some(gateway.octets()),
-                prefsrc: None,
-                scope: RT_SCOPE_UNIVERSE,
-                protocol: RTPROT_BOOT,
-            });
+            if let IpAddress::Ipv4(gateway) = route.via_router {
+                snapshot.routes.push(RouteInfo {
+                    oif: INDEX,
+                    dst: [0; 4],
+                    dst_len: 0,
+                    gateway: Some(gateway.octets()),
+                    prefsrc: None,
+                    scope: RT_SCOPE_UNIVERSE,
+                    protocol: RTPROT_BOOT,
+                });
+            }
         }
     }
     snapshot
+}
+
+fn mask_ipv6(octets: [u8; 16], prefix_len: u8) -> [u8; 16] {
+    let mut masked = [0_u8; 16];
+    let bits = prefix_len.min(128) as usize;
+    let full = bits / 8;
+    let rem = bits % 8;
+    masked[..full].copy_from_slice(&octets[..full]);
+    if rem != 0 && full < 16 {
+        masked[full] = octets[full] & (!0_u8 << (8 - rem));
+    }
+    masked
 }
 
 /// The on-link route the kernel installs for an interface address.
@@ -688,6 +823,26 @@ pub(super) fn diff_events(old: &InterfaceSnapshot, new: &InterfaceSnapshot) -> V
             events.push((RTMGRP_IPV4_ROUTE, route_record(route, RTM_DELROUTE, 0, 0, 0)));
         }
     }
+    for addr in &new.addrs_v6 {
+        if !old.addrs_v6.contains(addr) {
+            events.push((RTMGRP_IPV6_IFADDR, addr6_record(addr, RTM_NEWADDR, 0, 0, 0)));
+        }
+    }
+    for addr in &old.addrs_v6 {
+        if !new.addrs_v6.contains(addr) {
+            events.push((RTMGRP_IPV6_IFADDR, addr6_record(addr, RTM_DELADDR, 0, 0, 0)));
+        }
+    }
+    for route in &new.routes_v6 {
+        if !old.routes_v6.contains(route) {
+            events.push((RTMGRP_IPV6_ROUTE, route6_record(route, RTM_NEWROUTE, 0, 0, 0)));
+        }
+    }
+    for route in &old.routes_v6 {
+        if !new.routes_v6.contains(route) {
+            events.push((RTMGRP_IPV6_ROUTE, route6_record(route, RTM_DELROUTE, 0, 0, 0)));
+        }
+    }
     events
 }
 
@@ -695,7 +850,13 @@ pub(super) fn diff_events(old: &InterfaceSnapshot, new: &InterfaceSnapshot) -> V
 fn has_observed_members(state: &NetState) -> bool {
     state.sockets.values().any(|socket| {
         matches!(&socket.state, UnixSocketState::Netlink(netlink)
-            if netlink.groups & (RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE) != 0)
+            if netlink.groups
+                & (RTMGRP_LINK
+                    | RTMGRP_IPV4_IFADDR
+                    | RTMGRP_IPV4_ROUTE
+                    | RTMGRP_IPV6_IFADDR
+                    | RTMGRP_IPV6_ROUTE)
+                != 0)
     })
 }
 

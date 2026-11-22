@@ -175,6 +175,68 @@ pub fn spawn_user_process_state_suspended_with_parent_reservation(
     )
 }
 
+/// Spawns a suspended `vfork` child sharing `parent_process_id`'s live MM and
+/// Pager VMAs while owning an isolated `UserProcessLocal` (fd table, credentials).
+pub fn spawn_user_process_vfork_suspended_with_parent_reservation(
+    mut vfork_local: alloc::boxed::Box<crate::user::process_state::UserProcessLocal>,
+    bootstrap: UserTaskBootstrap,
+    parent_process_id: u64,
+    weight_micros: u64,
+    reservation: SpawnReservation,
+) -> Result<u64, SpawnTaskError> {
+    let (id, pit_divisor) =
+        match prepare_user_spawn(weight_micros, process_spawn_faulted(), allocate_task_id) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = cancel_process_spawn(reservation);
+                return Err(error);
+            }
+        };
+    let Some(attachment) = super::process_table::prepare_vfork_attachment(parent_process_id) else {
+        let _ = cancel_process_spawn(reservation);
+        return Err(SpawnTaskError::ProcessExiting);
+    };
+    if !vfork_local
+        .handles_mut()
+        .bind_kmem_group(attachment.job_index)
+    {
+        let _ = cancel_process_spawn(reservation);
+        return Err(SpawnTaskError::MemoryQuota);
+    }
+    let handles_kmem = 0;
+    let state_lock = attachment.state_lock.clone();
+    state_lock.lock().insert_vfork_local(id, vfork_local);
+
+    let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
+    let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
+    let rflags = initial_task_rflags().bits();
+    let allocation = super::scheduler::root_creation::allocate(
+        id,
+        super::scheduler::root_creation::Input::Vfork {
+            owner_handle: attachment.owner_handle,
+            state_lock: attachment.state_lock,
+            mm_execution: attachment.mm_execution,
+            address_space_root: attachment.address_space_root,
+            handles_kmem,
+        },
+        bootstrap,
+        Some(parent_process_id),
+        pit_divisor,
+        user_cs,
+        user_ss,
+        rflags,
+        true,
+        None,
+        reservation,
+    );
+    if let Err(error) = allocation {
+        let _ = state_lock.lock().remove_vfork_local(id);
+        let _ = cancel_process_spawn(reservation);
+        return Err(error);
+    }
+    Ok(id)
+}
+
 fn spawn_user_process_state_inner(
     process_state: UserProcessState,
     bootstrap: UserTaskBootstrap,

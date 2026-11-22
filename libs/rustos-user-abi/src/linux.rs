@@ -108,8 +108,13 @@ raw_u64! {
     SYS_NANOSLEEP = linux::__NR_nanosleep;
     SYS_GETPID = linux::__NR_getpid;
     SYS_FORK = linux::__NR_fork;
+    SYS_VFORK = linux::__NR_vfork;
     SYS_WAIT4 = linux::__NR_wait4;
     SYS_CLONE = linux::__NR_clone;
+    SYS_INOTIFY_INIT = linux::__NR_inotify_init;
+    SYS_INOTIFY_ADD_WATCH = linux::__NR_inotify_add_watch;
+    SYS_INOTIFY_RM_WATCH = linux::__NR_inotify_rm_watch;
+    SYS_INOTIFY_INIT1 = linux::__NR_inotify_init1;
     SYS_UNAME = linux::__NR_uname;
     SYS_FCNTL = linux::__NR_fcntl;
     SYS_MOUNT = linux::__NR_mount;
@@ -361,6 +366,7 @@ raw_u64! {
     CLONE_FS = linux::CLONE_FS;
     CLONE_FILES = linux::CLONE_FILES;
     CLONE_SIGHAND = linux::CLONE_SIGHAND;
+    CLONE_VFORK = linux::CLONE_VFORK;
     CLONE_PIDFD = linux::CLONE_PIDFD;
     CLONE_THREAD = linux::CLONE_THREAD;
     CLONE_SYSVSEM = linux::CLONE_SYSVSEM;
@@ -393,6 +399,57 @@ pub const CLOSE_RANGE_UNSHARE: u64 = 1 << 1;
 pub const CLOSE_RANGE_CLOEXEC: u64 = 1 << 2;
 
 pub const SCM_CREDENTIALS: u64 = 2;
+pub const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+pub const AF_UNSPEC: u64 = 0;
+pub const AF_INET6: u64 = 10;
+pub const IPPROTO_IP: u64 = 0;
+pub const IPPROTO_ICMP: u64 = 1;
+pub const IPPROTO_TCP: u64 = 6;
+pub const IPPROTO_UDP: u64 = 17;
+pub const IPPROTO_IPV6: u64 = 41;
+pub const SOL_TCP: u64 = 6;
+pub const IP_TOS: u64 = 1;
+pub const IP_TTL: u64 = 2;
+pub const IP_PKTINFO: u64 = 8;
+pub const IP_RECVTOS: u64 = 13;
+pub const IPV6_V6ONLY: u64 = 26;
+pub const IPV6_RECVERR: u64 = 25;
+pub const IPV6_RECVPKTINFO: u64 = 49;
+pub const IPV6_TCLASS: u64 = 67;
+pub const SO_BROADCAST: u64 = 6;
+pub const SO_LINGER: u64 = 13;
+pub const SO_RCVTIMEO: u64 = 20;
+pub const SO_SNDTIMEO: u64 = 21;
+pub const TCP_NODELAY: u64 = 1;
+pub const TCP_KEEPIDLE: u64 = 4;
+pub const TCP_KEEPINTVL: u64 = 5;
+pub const TCP_KEEPCNT: u64 = 6;
+pub const TCP_USER_TIMEOUT: u64 = 18;
+pub const IN_ACCESS: u32 = 0x0000_0001;
+pub const IN_MODIFY: u32 = 0x0000_0002;
+pub const IN_ATTRIB: u32 = 0x0000_0004;
+pub const IN_CLOSE_WRITE: u32 = 0x0000_0008;
+pub const IN_CLOSE_NOWRITE: u32 = 0x0000_0010;
+pub const IN_OPEN: u32 = 0x0000_0020;
+pub const IN_MOVED_FROM: u32 = 0x0000_0040;
+pub const IN_MOVED_TO: u32 = 0x0000_0080;
+pub const IN_CREATE: u32 = 0x0000_0100;
+pub const IN_DELETE: u32 = 0x0000_0200;
+pub const IN_DELETE_SELF: u32 = 0x0000_0400;
+pub const IN_MOVE_SELF: u32 = 0x0000_0800;
+pub const IN_ALL_EVENTS: u32 = 0x0000_0fff;
+pub const IN_UNMOUNT: u32 = 0x0000_2000;
+pub const IN_Q_OVERFLOW: u32 = 0x0000_4000;
+pub const IN_IGNORED: u32 = 0x0000_8000;
+pub const IN_ONLYDIR: u32 = 0x0100_0000;
+pub const IN_DONT_FOLLOW: u32 = 0x0200_0000;
+pub const IN_EXCL_UNLINK: u32 = 0x0400_0000;
+pub const IN_MASK_CREATE: u32 = 0x1000_0000;
+pub const IN_MASK_ADD: u32 = 0x2000_0000;
+pub const IN_ISDIR: u32 = 0x4000_0000;
+pub const IN_ONESHOT: u32 = 0x8000_0000;
+pub const IN_NONBLOCK: u64 = O_NONBLOCK;
+pub const IN_CLOEXEC: u64 = O_CLOEXEC;
 pub const MADV_NORMAL: u64 = 0;
 pub const MADV_RANDOM: u64 = 1;
 pub const MADV_SEQUENTIAL: u64 = 2;
@@ -575,6 +632,25 @@ pub struct LinuxSockaddrIn {
     pub sin_port: u16,
     pub sin_addr: u32,
     pub sin_zero: [u8; 8],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinuxSockaddrIn6 {
+    pub sin6_family: u16,
+    pub sin6_port: u16,
+    pub sin6_flowinfo: u32,
+    pub sin6_addr: [u8; 16],
+    pub sin6_scope_id: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinuxInotifyEventHeader {
+    pub wd: i32,
+    pub mask: u32,
+    pub cookie: u32,
+    pub len: u32,
 }
 
 impl Default for LinuxSockaddrUn {
@@ -1820,6 +1896,8 @@ mod tests {
 crate::user_wire!(LinuxMsghdr { msg_name: u64, msg_namelen: u32, __pad0: u32, msg_iov: u64, msg_iovlen: u64, msg_control: u64, msg_controllen: u64, msg_flags: u32, __pad1: u32 });
 crate::user_wire!(LinuxRusage { ru_utime: LinuxTimeval, ru_stime: LinuxTimeval, ru_maxrss: i64, ru_ixrss: i64, ru_idrss: i64, ru_isrss: i64, ru_minflt: i64, ru_majflt: i64, ru_nswap: i64, ru_inblock: i64, ru_oublock: i64, ru_msgsnd: i64, ru_msgrcv: i64, ru_nsignals: i64, ru_nvcsw: i64, ru_nivcsw: i64 });
 crate::user_wire!(LinuxTimeval { tv_sec: i64, tv_usec: i64 });
+crate::user_wire!(LinuxSockaddrIn6 { sin6_family: u16, sin6_port: u16, sin6_flowinfo: u32, sin6_addr: [u8; 16], sin6_scope_id: u32 });
+crate::user_wire!(LinuxInotifyEventHeader { wd: i32, mask: u32, cookie: u32, len: u32 });
 crate::user_wire!(LinuxSysinfo { uptime: i64, loads: [u64; 3], totalram: u64, freeram: u64, sharedram: u64, bufferram: u64, totalswap: u64, freeswap: u64, procs: u16, pad: u16, _pad2: u32, totalhigh: u64, freehigh: u64, mem_unit: u32, _pad3: u32 });
 crate::user_wire!(LinuxTms { tms_utime: i64, tms_stime: i64, tms_cutime: i64, tms_cstime: i64 });
 crate::user_wire!(LinuxSchedParam { sched_priority: i32 });

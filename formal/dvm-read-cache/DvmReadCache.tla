@@ -6,13 +6,16 @@ Models the storaged read-ahead cache as a composition boundary between
 generation-bound DVM transport and vfsd filesystem reads.
 
 Only an exact live generation may hit. A cache miss arms a bounded multi-ticket
-read-ahead batch and publishes no window until every completion succeeds.
-A failed completion clears cached authority. A fresh fill replaces a different
-epoch, overlapping windows do not coexist, the cache remains bounded, and write
-or restart clears all cached authority before completing.
+read-ahead batch; each window is published individually when its own
+completion succeeds. A failed completion fails only its waiting reader and
+publishes nothing: windows already cached keep their exact epoch. A fill adds
+to the cache under one epoch, the cache remains bounded (least-recently-used
+and already-consumed streaming windows are evicted first), and write or restart
+clears all cached authority before completing.
 
 Concrete owner:
-  * services/storaged/src/block.rs
+  * services/storaged/src/read_engine.rs
+  * services/storaged/src/block.rs (transport binding and generation check)
 *******************************************************************************)
 
 CONSTANT MaxCacheWindows
@@ -72,7 +75,9 @@ FillFresh ==
     /\ scenario = "read"
     /\ phase' = "fresh-served"
     /\ cacheGeneration' = liveGeneration
-    /\ cacheWindows' = fillWindows
+    /\ cacheWindows' =
+        IF cacheWindows + fillWindows > MaxCacheWindows
+        THEN MaxCacheWindows ELSE cacheWindows + fillWindows
     /\ UNCHANGED
         <<scenario, liveGeneration, requestGeneration,
           rangeCovered, fillWindows, sequentialMiss>>
@@ -81,10 +86,9 @@ FailFill ==
     /\ phase = "filling"
     /\ scenario = "read-fail"
     /\ phase' = "fill-failed"
-    /\ cacheGeneration' = 0
-    /\ cacheWindows' = 0
     /\ UNCHANGED
         <<scenario, liveGeneration, requestGeneration,
+          cacheGeneration, cacheWindows,
           rangeCovered, fillWindows, sequentialMiss>>
 
 RejectStale ==
@@ -157,7 +161,7 @@ CacheHitRequiresExactEpoch ==
         /\ cacheGeneration = liveGeneration
 
 MutationAndRestartClearCache ==
-    phase \in {"fill-failed", "mutated", "restarted"} =>
+    phase \in {"mutated", "restarted"} =>
         /\ cacheWindows = 0
         /\ cacheGeneration = 0
 
@@ -165,7 +169,14 @@ FreshFillRequiresBoundedPipeline ==
     phase = "fresh-served" =>
         /\ fillWindows > 0
         /\ fillWindows <= MaxCacheWindows
-        /\ cacheWindows = fillWindows
+        /\ cacheWindows > 0
+        /\ cacheWindows <= MaxCacheWindows
+        /\ cacheGeneration = liveGeneration
+
+FailedFillPublishesNothing ==
+    phase = "fill-failed" =>
+        /\ cacheWindows > 0 => cacheGeneration = liveGeneration
+        /\ cacheWindows = 0 => cacheGeneration = 0
 
 NonSequentialFillIsOneWindow ==
     phase = "fresh-served" /\ ~sequentialMiss =>

@@ -646,29 +646,16 @@ fn copy_wayland_bgra_row(src: &[u8], dst: &mut [u32], has_alpha: bool) -> bool {
     if src.len() != dst.len().saturating_mul(4) {
         return false;
     }
-    if has_alpha {
-        // SAFETY: `src.len() == dst.len() * 4` is checked above; `src` and `dst`
-        // are non-overlapping slices and every bit pattern of `u32` is valid on
-        // little-endian RustOS.
-        unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<u8>(), src.len());
-        }
-        return true;
+    // SAFETY: `src.len() == dst.len() * 4` is checked above; `src` and `dst`
+    // are non-overlapping slices and every bit pattern of `u32` is valid on
+    // little-endian RustOS.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<u8>(), src.len());
     }
-
-    const OPAQUE_4: u128 = 0xff00_0000_ff00_0000_ff00_0000_ff00_0000;
-    let mut chunks = src.chunks_exact(16);
-    let mut out = dst.chunks_exact_mut(4);
-    for (source, target) in chunks.by_ref().zip(out.by_ref()) {
-        let packed = u128::from_le_bytes(source.try_into().expect("four pixels")) | OPAQUE_4;
-        for (pixel, value) in target.iter_mut().zip(packed.to_le_bytes().chunks_exact(4)) {
-            *pixel = u32::from_le_bytes(value.try_into().expect("four-byte pixel"));
+    if !has_alpha {
+        for pixel in dst.iter_mut() {
+            *pixel |= 0xff00_0000;
         }
-    }
-    let remainder = chunks.remainder();
-    let output_remainder = out.into_remainder();
-    for (target, bytes) in output_remainder.iter_mut().zip(remainder.chunks_exact(4)) {
-        *target = u32::from_le_bytes(bytes.try_into().expect("four-byte pixel")) | 0xff00_0000;
     }
     true
 }

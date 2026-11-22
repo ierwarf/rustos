@@ -180,6 +180,12 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
         SYS_PIPE2 => [W, U, W, W, W, W],
         SYS_EVENTFD => [U, W, W, W, W, W],
         SYS_EVENTFD2 => [U, U, W, W, W, W],
+        // int flags
+        SYS_INOTIFY_INIT1 => [U, W, W, W, W, W],
+        // int fd, const char *path, uint32_t mask
+        SYS_INOTIFY_ADD_WATCH => [S, W, U, W, W, W],
+        // int fd, int wd
+        SYS_INOTIFY_RM_WATCH => [S, S, W, W, W, W],
         // old*, size_t old_len, size_t new_len, int flags, new*
         SYS_MREMAP => [W, W, W, U, W, W],
         // int flags

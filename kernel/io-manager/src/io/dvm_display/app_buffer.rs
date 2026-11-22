@@ -19,7 +19,7 @@
 //!   `kvm-smoke --app-dmabuf-probe`.
 use super::*;
 use driver_domain_protocol::{
-    DVM_APP_BUFFER_APERTURE_BYTES, DVM_APP_BUFFER_PAGE_BYTES, DVM_APP_BUFFER_PHYS_ADDR,
+    DVM_APP_BUFFER_APERTURE_BYTES, DVM_APP_BUFFER_PAGE_BYTES,
     DVM_APP_BUFFER_REQUEST_EXPORT, DVM_APP_BUFFER_REQUEST_KIND_OFFSET,
     DVM_APP_BUFFER_REQUEST_RECORD_OFFSET, DVM_APP_BUFFER_REQUEST_REVOKE,
     DVM_APP_BUFFER_REQUEST_SEQUENCE_OFFSET, DVM_APP_BUFFER_RESPONSE_SEQUENCE_OFFSET,
@@ -32,10 +32,11 @@ const VIRTIO_PMEM_VENDOR_ID: u16 = 0x1af4;
 const VIRTIO_PMEM_DEVICE_ID: u16 = 0x105b;
 static APERTURE_VERIFIED: AtomicBool = AtomicBool::new(false);
 
-// The atlas pixel pool ends exactly where the app aperture begins.
-const _: () = assert!(
-    GUI_DVM_PIXEL_REGION_PHYS_ADDR + GUI_DVM_PIXEL_REGION_BYTES == DVM_APP_BUFFER_PHYS_ADDR
-);
+/// The app aperture begins exactly where the atlas pixel pool ends; both bases
+/// follow the end of guest RAM (see `gui_dvm_pixel_region_phys_addr`).
+fn app_buffer_phys_addr() -> Option<u64> {
+    driver_domain_protocol::dvm_app_buffer_phys_addr(gui_dvm_pixel_region_phys_addr()?)
+}
 
 /// Authenticate the fixed app aperture before any physical address derived from
 /// it can reach a user page table. Both conditions are required: the physical
@@ -51,9 +52,12 @@ pub fn verify_aperture() -> bool {
     if APERTURE_VERIFIED.load(Ordering::Acquire) {
         return true;
     }
-    if driver_domain_protocol::DVM_APP_BUFFER_PHYS_ADDR % DVM_APP_BUFFER_PAGE_BYTES != 0
+    let Some(aperture_base) = app_buffer_phys_addr() else {
+        return false;
+    };
+    if aperture_base % DVM_APP_BUFFER_PAGE_BYTES != 0
         || kernel_mm::api::phys::range_overlaps_boot_usable(
-            DVM_APP_BUFFER_PHYS_ADDR,
+            aperture_base,
             DVM_APP_BUFFER_APERTURE_BYTES,
         )
     {
@@ -78,7 +82,9 @@ pub fn aperture_phys(offset: u64, len: u64) -> Option<u64> {
         return None;
     }
     let end = offset.checked_add(len)?;
-    (end <= DVM_APP_BUFFER_APERTURE_BYTES).then_some(DVM_APP_BUFFER_PHYS_ADDR + offset)
+    (end <= DVM_APP_BUFFER_APERTURE_BYTES)
+        .then(|| app_buffer_phys_addr()?.checked_add(offset))
+        .flatten()
 }
 
 /// Bounded copy out of the verified aperture. The caller holds a mapping hold

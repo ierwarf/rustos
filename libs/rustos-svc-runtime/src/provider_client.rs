@@ -325,10 +325,11 @@ pub fn call_rootd(frame:Frame)->Result<Frame,i32>{
     if got<0{return Err(errno_of(got))}
     if got as usize!=size_of::<CommercialMaxProtocolResponse>()
         ||!reply.is_valid_envelope_for(&req)
-        ||reply.descriptor_count!=0||reply.value0!=0||reply.value1!=0{
+        ||reply.descriptor_count!=0{
         return Err(EPROTO)
     }
     if reply.status!=0{return Err(reply.status)}
+    if reply.value0!=0||reply.value1!=0{return Err(EPROTO)}
     if reply.payload_len as usize!=provider_wire::BYTES{return Err(EPROTO)}
     let ack=provider_wire::decode(&reply.payload[..provider_wire::BYTES])
         .map_err(|_|EPROTO)?;

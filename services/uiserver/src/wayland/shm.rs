@@ -300,28 +300,60 @@ fn require_regular_file(fd: std::os::fd::RawFd) -> std::io::Result<u64> {
 /// both local memfds (locked read_at + bounce copy) and remote VFS files.
 /// Concurrent writes need not be frame-atomic, but successful bytes belong to
 /// the compositor and remain safe after truncation, close, or object destroy.
+#[cfg(test)]
 pub(super) fn read_shm_snapshot(
     fd: std::os::fd::RawFd,
     offset: usize,
     len: usize,
 ) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    read_shm_snapshot_into(fd, offset, len, &mut bytes)?;
+    Ok(bytes)
+}
+
+pub(super) fn read_shm_snapshot_into(
+    fd: std::os::fd::RawFd,
+    offset: usize,
+    len: usize,
+    bytes: &mut Vec<u8>,
+) -> std::io::Result<()> {
     if offset
         .checked_add(len)
         .is_none_or(|end| end > MAX_WAYLAND_SHM_POOL_BYTES)
     {
         return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
     }
-    let mut bytes = Vec::new();
+    bytes.clear();
     bytes
         .try_reserve_exact(len)
         .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOMEM))?;
-    bytes.resize(len, 0);
+    read_shm_snapshot_into_uninit(fd, offset, &mut bytes.spare_capacity_mut()[..len])?;
+    // SAFETY: `read_shm_snapshot_into_uninit` guarantees all `len` bytes were
+    // initialized by `pread` before returning `Ok(())`.
+    unsafe {
+        bytes.set_len(len);
+    }
+    Ok(())
+}
+
+pub(super) fn read_shm_snapshot_into_uninit(
+    fd: std::os::fd::RawFd,
+    offset: usize,
+    dst: &mut [std::mem::MaybeUninit<u8>],
+) -> std::io::Result<()> {
+    let len = dst.len();
+    if offset
+        .checked_add(len)
+        .is_none_or(|end| end > MAX_WAYLAND_SHM_POOL_BYTES)
+    {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
     let mut copied = 0;
     while copied < len {
         let count = unsafe {
             libc::pread(
                 fd,
-                bytes[copied..].as_mut_ptr().cast(),
+                dst[copied..].as_mut_ptr().cast(),
                 len - copied,
                 (offset + copied) as libc::off_t,
             )
@@ -338,5 +370,5 @@ pub(super) fn read_shm_snapshot(
         }
         copied += count as usize;
     }
-    Ok(bytes)
+    Ok(())
 }

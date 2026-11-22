@@ -42,6 +42,10 @@ pub(super) trait LaunchHost {
     fn ensure_session_dir(&mut self, dir: &str) -> std::io::Result<()>;
     /// The shared temporary directory must exist as a directory.
     fn ensure_temp_dir(&mut self, dir: &str) -> std::io::Result<()>;
+    /// Ensure a session D-Bus listener exists inside `dir` for the launch identity.
+    fn ensure_session_bus(&mut self, _dir: &str) -> std::io::Result<()> {
+        Ok(())
+    }
     fn log(&mut self, line: &str);
 }
 
@@ -167,6 +171,15 @@ pub(super) fn resolve_launch_env(
             ));
             return Err(errno);
         }
+        // The session bus is optional for launched programs (toolkits degrade
+        // when it is absent), so a bind failure is reported but never blocks
+        // the launch.
+        if let Err(error) = host.ensure_session_bus(&runtime_dir) {
+            let errno = errno_of(&error);
+            host.log(&format!(
+                "runtimed: session bus unavailable path={runtime_dir}/bus errno={errno} uid={uid}"
+            ));
+        }
     }
     if parsed.iter().any(|(_, _, template)| template.uses(Placeholder::TempDir)) {
         if let Err(error) = host.ensure_temp_dir(TEMP_DIR) {
@@ -209,12 +222,17 @@ pub(super) fn resolve_launch_env(
 pub(super) struct SystemLaunchHost {
     uid: u32,
     gid: u32,
+    probed_persistent_writable: bool,
 }
 
 impl SystemLaunchHost {
     pub(super) fn for_launch(logical_admin: bool) -> Self {
         let (uid, gid) = launch_credentials(logical_admin);
-        Self { uid, gid }
+        Self {
+            uid,
+            gid,
+            probed_persistent_writable: false,
+        }
     }
 }
 
@@ -225,7 +243,16 @@ impl LaunchHost for SystemLaunchHost {
 
     fn ensure_persistent_dir(&mut self, dir: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        probe_writable(dir)
+        // Probe writability once per launch when all subdirectories sit on the
+        // same persistent volume instead of creating+unlinking a probe file
+        // for every suffix (`/data/home`, `/data/config`, `/data/cache`).
+        if !self.probed_persistent_writable {
+            probe_writable(dir)?;
+            if dir.starts_with(PERSISTENT_DATA_DIR) {
+                self.probed_persistent_writable = true;
+            }
+        }
+        Ok(())
     }
 
     fn ensure_private_dir(&mut self, dir: &str) -> std::io::Result<()> {
@@ -235,6 +262,10 @@ impl LaunchHost for SystemLaunchHost {
 
     fn ensure_session_dir(&mut self, dir: &str) -> std::io::Result<()> {
         ensure_owned_private_dir(dir, self.uid, self.gid)
+    }
+
+    fn ensure_session_bus(&mut self, dir: &str) -> std::io::Result<()> {
+        super::dbus::ensure_session_bus(dir, self.uid, self.gid)
     }
 
     fn ensure_temp_dir(&mut self, dir: &str) -> std::io::Result<()> {

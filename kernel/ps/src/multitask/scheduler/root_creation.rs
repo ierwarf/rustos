@@ -144,6 +144,17 @@ impl Admission {
 pub(in crate::multitask) enum Input {
     AddressSpace(ProcessAddressSpace),
     State(UserProcessState),
+    Vfork {
+        owner_handle: process_table::ProcessHandle,
+        state_lock: alloc::sync::Arc<
+            crate::multitask::process_state_lock::ProcessStateLock<
+                crate::user::process_state::ProcessStateBundle,
+            >,
+        >,
+        mm_execution: kernel_mm::api::address_space::ExecutionPin,
+        address_space_root: u64,
+        handles_kmem: u64,
+    },
 }
 impl Input {
     pub(super) fn materialize(
@@ -198,6 +209,7 @@ impl Input {
                 }
                 Some(state)
             }
+            Self::Vfork { .. } => None,
         }
     }
 }
@@ -312,32 +324,94 @@ fn construct(
                 return refused(4).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot);
             }
         };
-    let Some(state) = input.materialize(&mut bootstrap, id) else {
-        root.cancel();
-        return refused(5).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot);
-    };
-    let phys = state.address_space_root();
     let slot = root.ticket().slot();
     let mut scheduling = scheduling_context::SchedulingContext::bind(slot, id);
-    if !scheduling.admit(
-        admission.policy,
-        admission.domain.slot(),
-        admission.domain.generation(),
-    ) {
-        drop(state);
-        root.cancel();
-        return refused(6).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot);
-    }
-    let rsp = execution_image::reserved_user_entry(root.ticket(), &bootstrap, cs, ss, flags);
-    let handle = match root.publish_process(parent, state) {
-        Ok(handle) => handle,
-        Err(error) => {
-            scheduling_runtime::release(slot, scheduling.identity());
-            root.cancel();
-            let _: Option<()> = refused(7);
-            return Err(error);
+    let (phys, handle) = match input {
+        Input::Vfork {
+            owner_handle,
+            state_lock,
+            mm_execution,
+            address_space_root,
+            handles_kmem,
+        } => {
+            if !scheduling.admit(
+                admission.policy,
+                admission.domain.slot(),
+                admission.domain.generation(),
+            ) {
+                root.cancel();
+                return refused(6).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot);
+            }
+            let rsp = execution_image::reserved_user_entry(root.ticket(), &bootstrap, cs, ss, flags);
+            let handle = match root.publish_vfork_process(
+                parent,
+                owner_handle,
+                state_lock,
+                mm_execution,
+                handles_kmem,
+            ) {
+                Ok(handle) => (rsp, handle),
+                Err(error) => {
+                    scheduling_runtime::release(slot, scheduling.identity());
+                    root.cancel();
+                    let _: Option<()> = refused(7);
+                    return Err(error);
+                }
+            };
+            let _rsp_unused = handle.0;
+            // Store rsp and continue with shared publish path cleanly:
+            let rsp = handle.0;
+            let handle = handle.1;
+            let slot = publish(
+                root,
+                handle,
+                bootstrap,
+                scheduling,
+                address_space_root,
+                rsp,
+                pit,
+                vruntime,
+                suspended,
+                eligible_cpus,
+                admission,
+                before_wake,
+            );
+            if let Actor::Kernel(executor) = actor {
+                executor.assert_current_in(turn);
+            }
+            return Ok((actor.is_user(), slot));
+        }
+        other => {
+            let Some(state) = other.materialize(&mut bootstrap, id) else {
+                root.cancel();
+                return refused(5).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot);
+            };
+            let phys = state.address_space_root();
+            if !scheduling.admit(
+                admission.policy,
+                admission.domain.slot(),
+                admission.domain.generation(),
+            ) {
+                drop(state);
+                root.cancel();
+                return refused(6).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot);
+            }
+            let rsp =
+                execution_image::reserved_user_entry(root.ticket(), &bootstrap, cs, ss, flags);
+            let handle = match root.publish_process(parent, state) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    scheduling_runtime::release(slot, scheduling.identity());
+                    root.cancel();
+                    let _: Option<()> = refused(7);
+                    return Err(error);
+                }
+            };
+            let _ = rsp;
+            (phys, (rsp, handle))
         }
     };
+    let (phys, (rsp, handle)) = (phys, handle);
     let slot = publish(
         root,
         handle,

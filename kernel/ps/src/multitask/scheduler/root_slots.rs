@@ -113,6 +113,21 @@ impl RootPublication {
     ) -> Result<crate::multitask::process_table::ProcessHandle, crate::multitask::SpawnTaskError> {
         self.join.publish(parent, state)
     }
+    pub(super) fn publish_vfork_process(
+        &mut self,
+        parent: Option<u64>,
+        owner_handle: crate::multitask::process_table::ProcessHandle,
+        state_lock: alloc::sync::Arc<
+            crate::multitask::process_state_lock::ProcessStateLock<
+                crate::user::process_state::ProcessStateBundle,
+            >,
+        >,
+        mm_execution: kernel_mm::api::address_space::ExecutionPin,
+        handles_kmem: u64,
+    ) -> Result<crate::multitask::process_table::ProcessHandle, crate::multitask::SpawnTaskError> {
+        self.join
+            .publish_vfork(parent, owner_handle, state_lock, mm_execution, handles_kmem)
+    }
     pub(super) fn cancel(self) {
         let Self { ticket, join, .. } = self;
         let _cancelled = join

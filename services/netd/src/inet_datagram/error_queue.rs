@@ -130,40 +130,56 @@ fn capture(frame: &[u8]) -> Option<WireError> {
     })
 }
 
-pub(super) fn set_option(request: &NetdIpcRequest) -> i32 {
-    let mut state = lock_net_state();
+pub(super) fn set_option_in_state(state: &mut NetState, request: &NetdIpcRequest) -> i32 {
     let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) else {
         return libc::EBADF;
     };
-    if request.arg1 != libc::SOL_IP as u64
-        || request.arg2 != libc::IP_RECVERR as u64
-        || !matches!(socket.transport, InetTransport::Udp(_))
-    {
+    let is_ipv4_recverr =
+        request.arg1 == libc::SOL_IP as u64 && request.arg2 == libc::IP_RECVERR as u64;
+    let is_ipv6_recverr = request.arg1 == linux_abi::IPPROTO_IPV6
+        && request.arg2 == linux_abi::IPV6_RECVERR
+        && socket.domain == linux_abi::AF_INET6;
+    if (!is_ipv4_recverr && !is_ipv6_recverr) || !matches!(socket.transport, InetTransport::Udp(_)) {
         return libc::ENOPROTOOPT;
     }
     let Some(value) = request_i32_payload(request) else {
         return libc::EINVAL;
     };
+    if is_ipv6_recverr {
+        socket.options.ipv6_recverr = value != 0;
+    }
     if value == 0 {
-        socket.errors = None;
+        if !socket.options.ipv6_recverr {
+            socket.errors = None;
+        }
     } else {
         socket.errors.get_or_insert_with(ErrorState::new);
     }
     0
 }
 
-pub(super) fn get_option(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    let state = lock_net_state();
+pub(super) fn get_option_in_state(
+    state: &NetState,
+    request: &NetdIpcRequest,
+    response: &mut NetdIpcResponse,
+) -> i32 {
     let Some(socket) = state.inet_sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
-    if request.arg1 != libc::SOL_IP as u64
-        || request.arg2 != libc::IP_RECVERR as u64
-        || !matches!(socket.transport, InetTransport::Udp(_))
-    {
+    let is_ipv4_recverr =
+        request.arg1 == libc::SOL_IP as u64 && request.arg2 == libc::IP_RECVERR as u64;
+    let is_ipv6_recverr = request.arg1 == linux_abi::IPPROTO_IPV6
+        && request.arg2 == linux_abi::IPV6_RECVERR
+        && socket.domain == linux_abi::AF_INET6;
+    if (!is_ipv4_recverr && !is_ipv6_recverr) || !matches!(socket.transport, InetTransport::Udp(_)) {
         return libc::ENOPROTOOPT;
     }
-    response.payload[..4].copy_from_slice(&i32::from(socket.errors.is_some()).to_ne_bytes());
+    let val = if is_ipv6_recverr {
+        i32::from(socket.options.ipv6_recverr)
+    } else {
+        i32::from(socket.errors.is_some())
+    };
+    response.payload[..4].copy_from_slice(&val.to_ne_bytes());
     response.payload_len = 4;
     0
 }
@@ -277,7 +293,7 @@ fn control(error: &DatagramError) -> [u8; CONTROL_BYTES] {
     control[21] = error.type_;
     control[22] = error.code;
     control[24..28].copy_from_slice(&error.info.to_ne_bytes());
-    control[32..].copy_from_slice(&encode_address(IpEndpoint::new(error.offender, 0)));
+    control[32..].copy_from_slice(&encode_ipv4_address(IpEndpoint::new(error.offender, 0)));
     control
 }
 
@@ -304,13 +320,13 @@ pub(super) fn receive(
         } else {
             0
         };
-    let address = encode_address(error.destination);
+    let address = encode_inet_endpoint(error.destination, socket.domain);
     let Some(len) = netd_message::encode(
         &mut response.payload,
         &error.payload[..copied],
         &control(error),
         output_flags,
-        &address,
+        address.as_slice(),
     ) else {
         return libc::EMSGSIZE;
     };
@@ -405,10 +421,7 @@ mod tests {
     }
 
     fn ingress_state(error: &[u8]) -> NetState {
-        let mut device = BrokerDevice {
-            rx: [0; NET_BROKER_PACKET_MTU],
-            errors: ErrorIngress::default(),
-        };
+        let mut device = BrokerDevice::default();
         let config = SmolConfig::new(HardwareAddress::Ethernet(QEMU_USERNET_MAC));
         let mut iface = Interface::new(config, &mut device, SmolInstant::from_millis(0));
         iface.update_ip_addrs(|a| {

@@ -201,6 +201,9 @@ struct relay_state {
     struct read_stats stats;
 };
 
+/* Unacknowledged completions between doorbell rings inside one batch. */
+#define COMPLETION_NOTIFY_EVERY 8U
+
 struct watchdog_event {
     uint64_t request_id;
     uint32_t operation;
@@ -1130,6 +1133,8 @@ static inline void wc_store_fence(void)
 
 static uint8_t read_bounce[DVM_BLOCK_DATA_SLOT_BYTES]
     __attribute__((aligned(4096)));
+static uint8_t write_bounce[DVM_BLOCK_DATA_SLOT_BYTES]
+    __attribute__((aligned(4096)));
 
 static int execute_request(struct relay_state *state,
                            const struct block_request *request,
@@ -1168,8 +1173,14 @@ static int execute_request(struct relay_state *state,
             }
             break;
         case DVM_BLOCK_OP_WRITE:
-            result = pwrite_full(state->device.fd, slot, request->data_len,
-                                 offset);
+            if (request->data_len > sizeof(write_bounce)) {
+                errno = EINVAL;
+                result = -1;
+            } else {
+                memcpy(write_bounce, (const void *)slot, request->data_len);
+                result = pwrite_full(state->device.fd, write_bounce,
+                                     request->data_len, offset);
+            }
             if (result == 0 &&
                 ((request->flags & DVM_BLOCK_REQUEST_FLAG_FUA) != 0U ||
                  (state->header.features &
@@ -1403,6 +1414,7 @@ static void prefetch_pending_reads(struct relay_state *state,
     state->prefetched_through = scanned_through;
 }
 
+
 static void account_read(struct relay_state *state, uint32_t bytes,
                          uint64_t elapsed_ns)
 {
@@ -1427,6 +1439,8 @@ static void account_read(struct relay_state *state, uint32_t bytes,
 
 static int drain_requests(struct relay_state *state)
 {
+    uint64_t completion_producer;
+
     if (verify_live_header(state) != 0)
         return -1;
     for (;;) {
@@ -1443,14 +1457,18 @@ static int drain_requests(struct relay_state *state)
         }
         if (request_consumer == request_producer)
             break;
+        /* Every earlier batch ended with an acknowledged completion, so the
+         * published cursor is exact here. Inside the batch the supervisor
+         * publishes completions asynchronously, so the worker counts them
+         * itself: it is the only writer of events and the supervisor applies
+         * them strictly in order. */
+        completion_producer =
+            load_cursor(state->transport.base, COMPLETION_PRODUCER_OFFSET,
+                        __ATOMIC_ACQUIRE);
         while (request_consumer < request_producer) {
             uint64_t completion_consumer =
                 load_cursor(state->transport.base,
                             COMPLETION_CONSUMER_OFFSET,
-                            __ATOMIC_ACQUIRE);
-            uint64_t completion_producer =
-                load_cursor(state->transport.base,
-                            COMPLETION_PRODUCER_OFFSET,
                             __ATOMIC_ACQUIRE);
             volatile uint8_t *request_record;
             struct block_request request;
@@ -1497,16 +1515,26 @@ static int drain_requests(struct relay_state *state)
                 errno = EIO;
                 return -1;
             }
-            event.begin = 0U;
+            event.begin = (request_consumer + 1U < request_producer) ? 2U : 0U;
             event.request_consumer = request_consumer;
             event.completion_producer = completion_producer;
             encode_completion(event.completion, &completion);
-            if (watchdog_event_send(state->watchdog_fd, &event) != 0 ||
-                read(state->watchdog_fd, &ack, 1) != 1 || ack != 1U) {
+            if (watchdog_event_send(state->watchdog_fd, &event) != 0) {
+                errno = EIO;
+                return -1;
+            }
+            /* A completion with more requests queued is not acknowledged: the
+             * worker starts the next request while the supervisor publishes
+             * this one. Only the last completion of a batch waits, so the
+             * worker never goes back to sleep on the doorbell with a
+             * completion unpublished. */
+            if (event.begin == 0U &&
+                (read(state->watchdog_fd, &ack, 1) != 1 || ack != 1U)) {
                 errno = EIO;
                 return -1;
             }
             request_consumer++;
+            completion_producer++;
         }
     }
     return 0;
@@ -1708,6 +1736,7 @@ static void supervise_worker(struct relay_state *state, int event_fd, pid_t work
 {
     struct watchdog_event active = {0};
     struct timespec deadline = {0};
+    unsigned int unnotified = 0U;
     const char *cause = "worker-lost";
     for (;;) {
         struct pollfd pfd = {.fd = event_fd, .events = POLLIN};
@@ -1741,14 +1770,14 @@ static void supervise_worker(struct relay_state *state, int event_fd, pid_t work
             struct watchdog_event event;
             ssize_t count = read(event_fd, &event, sizeof(event));
             if (count != (ssize_t)sizeof(event) || event.request_id == 0U ||
-                event.begin > 1U ||
-                (event.begin && active.request_id != 0U) ||
-                (!event.begin && (event.request_id != active.request_id ||
-                                   event.operation != active.operation))) {
+                event.begin > 2U ||
+                (event.begin == 1U && active.request_id != 0U) ||
+                (event.begin != 1U && (event.request_id != active.request_id ||
+                                       event.operation != active.operation))) {
                 cause = "watchdog-protocol";
                 break;
             }
-            if (event.begin) {
+            if (event.begin == 1U) {
                 active = event;
                 if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
                     cause = "clock-error";
@@ -1769,11 +1798,27 @@ static void supervise_worker(struct relay_state *state, int event_fd, pid_t work
                     cause = "io-timeout";
                     break;
                 }
-                if (publish_watchdog_completion(state, &event) != 0 ||
-                    notify_host(&state->transport) != 0 ||
-                    send(event_fd, &ack, 1, MSG_NOSIGNAL) != 1) {
+                if (publish_watchdog_completion(state, &event) != 0) {
                     cause = "completion-publication";
                     break;
+                }
+                /* The last completion of a batch rings the doorbell and is
+                 * acknowledged; earlier ones ring it every NOTIFY_EVERY
+                 * completions so RustOS can consume a long batch while it is
+                 * still running instead of only at its end. */
+                if (event.begin == 0U) {
+                    unnotified = 0U;
+                    if (notify_host(&state->transport) != 0 ||
+                        send(event_fd, &ack, 1, MSG_NOSIGNAL) != 1) {
+                        cause = "completion-publication";
+                        break;
+                    }
+                } else if (++unnotified >= COMPLETION_NOTIFY_EVERY) {
+                    unnotified = 0U;
+                    if (notify_host(&state->transport) != 0) {
+                        cause = "completion-publication";
+                        break;
+                    }
                 }
                 active.request_id = 0U;
             }

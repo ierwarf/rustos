@@ -1003,8 +1003,6 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
     struct gpu_source source;
     uint32_t index;
     int source_referenced = 0;
-    GLsync acquire_fence;
-    GLenum wait_result;
     uint64_t now_ns, remaining_ns;
     if (runtime != NULL)
         runtime->stage = "gpu-batch-validate";
@@ -1109,6 +1107,8 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
                       (GLint)(runtime->atlas_stride_bytes / 4U));
         for (index = 0U; index < damage_count; index++) {
             uint32_t row_offset = 0U;
+            /* Strips with a blocking yield keep full-atlas uploads under the
+             * RLIMIT_RTTIME soft limit (SIGXCPU) on a loaded host. */
             while (row_offset < damage[index].height) {
                 uint32_t strip_height = damage[index].height - row_offset;
                 const uint8_t *pixels;
@@ -1131,28 +1131,6 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
             }
         }
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-    }
-    if (!runtime->dmabuf_sources_ready) {
-        runtime->stage = "gpu-batch-upload-fence";
-        acquire_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0U);
-        if (acquire_fence == NULL) {
-            errno = EIO;
-            return -1;
-        }
-        glFlush();
-        if (monotonic_ns(&now_ns) != 0 ||
-            gpu_deadline_remaining(now_ns, frame->render_deadline_ns, &remaining_ns) != 0) {
-            glDeleteSync(acquire_fence);
-            return -1;
-        }
-        wait_result = glClientWaitSync(acquire_fence, GL_SYNC_FLUSH_COMMANDS_BIT,
-                                       (GLuint64)remaining_ns);
-        glDeleteSync(acquire_fence);
-        if (wait_result != GL_ALREADY_SIGNALED &&
-            wait_result != GL_CONDITION_SATISFIED) {
-            errno = wait_result == GL_TIMEOUT_EXPIRED ? ETIMEDOUT : EIO;
-            return -1;
-        }
     }
     runtime->completed_acquire = header.acquire_value;
     runtime->last_content_epoch = source.content_epoch;

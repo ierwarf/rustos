@@ -1408,7 +1408,8 @@ fn link_node_locked(
 /// not natively keep an in-memory inode per open file. While a file has an
 /// active entry here, `read`, `write`, `truncate`, `O_TRUNC`, `stat`, and
 /// `MAP_SHARED` all operate on the same [`SharedFrames`] object, and
-/// `flush_entry` / `flush_by_object_id` write the frames back to the volume.
+/// `flush_entry` / `flush_by_object_id` write the frames back to the
+/// volume.
 pub struct SharedPathEntry {
     pub frames: Box<dyn SharedFrames>,
     pub rel_path: String,
@@ -2892,5 +2893,25 @@ mod tests {
         assert!(matches!(failed, Some(Err(FsError::Io(_)))));
         assert_eq!(store.len_of(&key), Some(5));
         assert_eq!(fake(backing.object).lock().data.len(), 5);
+    }
+
+    #[test]
+    fn shared_path_flush_entry_persists_frames_dirtied_outside_the_store() {
+        // MAP_SHARED stores hit the frames directly and never pass through
+        // `write_at`, so close/fsync must write every page back, not only the
+        // pages the store saw being written.
+        let vol = alloc::sync::Arc::new(fs());
+        let initial = alloc::vec![0xAA_u8; 3 * CHUNK];
+        put(&vol, "paged", &initial);
+        let mut store: SharedPathStore<(u64, String)> = SharedPathStore::new();
+        let key = (1, String::from("paged"));
+        let backing = store
+            .ensure_shared(key.clone(), "paged", &*vol, fake_factory, true, 1)
+            .unwrap();
+        fake(backing.object).lock().data[CHUNK + 8] = 0x5C;
+        store.flush_entry(&key, &*vol).unwrap();
+        let mut got = [0u8; 1];
+        vol.read_at("paged", (CHUNK + 8) as u64, &mut got).unwrap();
+        assert_eq!(got[0], 0x5C);
     }
 }

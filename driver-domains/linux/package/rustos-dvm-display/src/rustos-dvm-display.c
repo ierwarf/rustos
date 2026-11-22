@@ -1735,8 +1735,9 @@ static int wait_sync_file_until(int fd, uint64_t deadline_ns) {
 
 static int add_gpu_plane_properties(const struct kms_display *display,
                                     drmModeAtomicReq *request,
-                                    uint32_t framebuffer_id, int in_fence_fd) {
-    if (add_plane_properties(display, request, framebuffer_id, 0U) != 0 ||
+                                    uint32_t framebuffer_id, int in_fence_fd,
+                                    uint32_t damage_blob_id) {
+    if (add_plane_properties(display, request, framebuffer_id, damage_blob_id) != 0 ||
         drmModeAtomicAddProperty(request, display->primary_plane_id,
                                  display->properties.plane_in_fence_fd,
                                  (uint64_t)(int64_t)in_fence_fd) < 0)
@@ -1794,7 +1795,7 @@ static int atomic_gpu_initial_modeset(struct kms_display *display,
                                       display->properties.crtc_out_fence_ptr,
                                       (uint64_t)(uintptr_t)&out_fence_fd) < 0 ||
              add_gpu_plane_properties(display, request, frame->framebuffer_id,
-                                      frame->in_fence_fd) != 0
+                                      frame->in_fence_fd, 0U) != 0
                  ? -1
                  : drmModeAtomicCommit(display->fd, request,
                                        DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
@@ -1864,6 +1865,13 @@ static int atomic_gpu_page_flip(struct kms_display *display,
                                 uint64_t *atomic_commit_time_ns,
                                 uint64_t *atomic_commit_measurements) {
     drmModeAtomicReq *request;
+    struct drm_mode_rect damage_clip = {
+        .x1 = 0,
+        .y1 = 0,
+        .x2 = (int32_t)display->source_width,
+        .y2 = (int32_t)display->source_height,
+    };
+    uint32_t damage_blob_id = 0U;
     struct gpu_flip_wait wait = {0};
     drmEventContext event = {
         .version = DRM_EVENT_CONTEXT_VERSION,
@@ -1886,14 +1894,19 @@ static int atomic_gpu_page_flip(struct kms_display *display,
         return -1;
     }
     display->setup_stage = "gpu-frame-atomic-request";
+    if (drmModeCreatePropertyBlob(display->fd, &damage_clip, sizeof(damage_clip),
+                                  &damage_blob_id) != 0)
+        damage_blob_id = 0U;
     request = drmModeAtomicAlloc();
     if (request == NULL) {
+        if (damage_blob_id != 0U)
+            (void)drmModeDestroyPropertyBlob(display->fd, damage_blob_id);
         close(frame->in_fence_fd);
         frame->in_fence_fd = -1;
         return -1;
     }
     result = add_gpu_plane_properties(display, request, frame->framebuffer_id,
-                                      frame->in_fence_fd);
+                                      frame->in_fence_fd, damage_blob_id);
     if (result == 0 &&
         drmModeAtomicAddProperty(request, display->crtc_id,
                                  display->properties.crtc_out_fence_ptr,
@@ -1909,6 +1922,8 @@ static int atomic_gpu_page_flip(struct kms_display *display,
     if (result == 0 && monotonic_time_ns(&commit_completed_ns) != 0)
         result = -1;
     drmModeAtomicFree(request);
+    if (damage_blob_id != 0U)
+        (void)drmModeDestroyPropertyBlob(display->fd, damage_blob_id);
     if (result != 0 || out_fence_fd < 0) {
         if (out_fence_fd >= 0)
             close(out_fence_fd);

@@ -14,6 +14,8 @@
 //! - **Evidence:** `process-address-space-lifecycle`, `endpoint-lifecycle`, and
 //!   `kernel-resource-lifecycle`.
 use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -23,7 +25,14 @@ use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use super::process_state_lock::ProcessStateLock;
 use super::slot_dir::{ChunkTable, SLOT_CEILING};
 use crate::memory::paging::ProcessAddressSpace;
-use crate::user::process_state::UserProcessState;
+use crate::user::process_state::{ExecOldState, ProcessStateBundle, UserProcessState};
+
+static OCCUPIED_PROCESS_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of currently occupied (live or un-reaped) entries in the process table.
+pub fn live_process_count() -> usize {
+    OCCUPIED_PROCESS_COUNT.load(Ordering::Relaxed)
+}
 
 /// Process slots the system admits until policy says otherwise. This is the
 /// boot default of the root job's `processes.max`, not a structural limit: the
@@ -122,7 +131,8 @@ pub struct StagedExec {
     new_mm: MmExecutionPin,
     process_id: u64,
     closed: alloc::vec::Vec<crate::user::handles::KernelHandle>,
-    old_state: UserProcessState,
+    old_state: ExecOldState,
+    detached_owner: Option<ProcessHandle>,
 }
 
 impl StagedExec {
@@ -147,7 +157,7 @@ pub struct ExecFinalize {
     process_id: u64,
     exit_pending: bool,
     closed: alloc::vec::Vec<crate::user::handles::KernelHandle>,
-    old_state: UserProcessState,
+    old_state: ExecOldState,
 }
 
 impl ExecFinalize {
@@ -165,7 +175,7 @@ impl ExecFinalize {
         u64,
         bool,
         alloc::vec::Vec<crate::user::handles::KernelHandle>,
-        UserProcessState,
+        ExecOldState,
     ) {
         (
             self.process_id,
@@ -176,9 +186,42 @@ impl ExecFinalize {
     }
 }
 
+pub(in crate::multitask) struct VforkAttachment {
+    pub(in crate::multitask) owner_handle: ProcessHandle,
+    pub(in crate::multitask) job_index: usize,
+    pub(in crate::multitask) state_lock: Arc<ProcessStateLock<ProcessStateBundle>>,
+    pub(in crate::multitask) mm_execution: kernel_mm::api::address_space::ExecutionPin,
+    pub(in crate::multitask) address_space_root: u64,
+}
+
+pub(in crate::multitask) fn prepare_vfork_attachment(parent_pid: u64) -> Option<VforkAttachment> {
+    let table = PROCESS_TABLE.lock();
+    let parent_index = table.find_pid_slot(parent_pid, |object| {
+        !object.exiting && !object.exec_in_progress && !object.exec_state_staged
+    })?;
+    let parent_handle = ProcessHandle::new(parent_index, table.slots[parent_index].generation);
+    let parent_object = table.slots[parent_index].object.as_deref()?;
+    let owner_handle = parent_object.mm_owner.unwrap_or(parent_handle);
+    let owner_object = table.lookup_object(owner_handle)?;
+    if owner_object.exiting || owner_object.exec_in_progress || owner_object.exec_state_staged {
+        return None;
+    }
+    let mm_execution = owner_object.mm_execution.try_clone()?;
+    let address_space_root = mm_execution.root_phys();
+    Some(VforkAttachment {
+        owner_handle,
+        job_index: parent_object.job.index() as usize,
+        state_lock: Arc::clone(&owner_object.state_lock),
+        mm_execution,
+        address_space_root,
+    })
+}
+
 struct ProcessObject {
     process_id: u64,
     parent_process_id: Option<u64>,
+    mm_owner: Option<ProcessHandle>,
+    mm_borrowers: usize,
     ref_count: usize,
     thread_count: usize,
     mm_generation: u32,
@@ -202,7 +245,10 @@ struct ProcessObject {
     /// Kernel stack bytes billed to `job` for this process's live threads
     /// (`Class::Thread`); refunded one thread at a time and on drop.
     thread_kmem: u64,
-    state: ProcessStateLock<UserProcessState>,
+    state_lock: Arc<ProcessStateLock<ProcessStateBundle>>,
+    /// Retains an unshared prior lock across a `vfork` child's `exec` so any
+    /// counted `ProcessRef` captured beforehand still points to live memory.
+    retired_state_locks: Vec<Arc<ProcessStateLock<ProcessStateBundle>>>,
 }
 
 /// Kernel bytes one user thread pins: its heap-backed kernel stack. The
@@ -212,6 +258,16 @@ const THREAD_KMEM_BYTES: u64 = super::scheduler::TASK_STACK_SIZE as u64;
 
 impl Drop for ProcessObject {
     fn drop(&mut self) {
+        if let Some(owner_handle) = self.mm_owner {
+            // Child never exec'd: remove its local state from the shared bundle
+            // and drop its MM pin on the parent owner without nesting locks.
+            let removed = {
+                let mut bundle = self.state_lock.lock();
+                bundle.remove_vfork_local(self.process_id)
+            };
+            drop(removed);
+            release_mm_borrower_ref(owner_handle);
+        }
         if self.thread_kmem != 0 {
             kernel_mm::api::kmem_charge::uncharge(
                 kernel_mm::api::kmem_charge::Class::Thread,
@@ -230,16 +286,19 @@ impl ProcessObject {
         lifecycle_transaction_id: u64,
         job: jobs::JobId,
     ) -> Self {
+        let mm_execution = state
+            .address_space()
+            .pin_execution()
+            .expect("new process missing MM execution owner");
         Self {
             process_id,
             parent_process_id,
+            mm_owner: None,
+            mm_borrowers: 0,
             ref_count: 1,
             thread_count: 1,
             mm_generation: 1,
-            mm_execution: state
-                .address_space()
-                .pin_execution()
-                .expect("new process missing MM execution owner"),
+            mm_execution,
             lifecycle_transaction_id,
             pending_exit_transaction_id: None,
             exec_in_progress: false,
@@ -254,12 +313,57 @@ impl ProcessObject {
             waited: parent_process_id.is_none(),
             job,
             thread_kmem: 0,
-            state: ProcessStateLock::new(state),
+            state_lock: Arc::new(ProcessStateLock::new(ProcessStateBundle::new(
+                process_id,
+                state,
+            ))),
+            retired_state_locks: Vec::new(),
         }
     }
 
-    fn state_ptr(&self) -> NonNull<ProcessStateLock<UserProcessState>> {
-        NonNull::from(&self.state)
+    #[allow(clippy::too_many_arguments)]
+    fn new_vfork(
+        process_id: u64,
+        parent_process_id: Option<u64>,
+        mm_generation: u32,
+        mm_execution: kernel_mm::api::address_space::ExecutionPin,
+        lifecycle_transaction_id: u64,
+        job: jobs::JobId,
+        state_lock: Arc<ProcessStateLock<ProcessStateBundle>>,
+    ) -> Self {
+        Self {
+            process_id,
+            parent_process_id,
+            // Set by publication only once the owner's borrower count was taken;
+            // `Drop` releases exactly that count, so an unpublished (refused)
+            // object must not claim it.
+            mm_owner: None,
+            mm_borrowers: 0,
+            ref_count: 1,
+            thread_count: 1,
+            mm_generation,
+            mm_execution,
+            lifecycle_transaction_id,
+            pending_exit_transaction_id: None,
+            exec_in_progress: false,
+            exec_commit_authorized: false,
+            exec_state_staged: false,
+            exit_pending: false,
+            exiting: false,
+            fault_termination: None,
+            queued_for_reap: false,
+            exit_status: None,
+            child_state_change: None,
+            waited: parent_process_id.is_none(),
+            job,
+            thread_kmem: 0,
+            state_lock,
+            retired_state_locks: Vec::new(),
+        }
+    }
+
+    fn state_ptr(&self) -> NonNull<ProcessStateLock<ProcessStateBundle>> {
+        NonNull::from(&*self.state_lock)
     }
 }
 
@@ -296,8 +400,11 @@ fn pid_bucket(process_id: u64) -> usize {
     (process_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - PID_BUCKET_BITS)) as usize
 }
 
+const OCCUPIED_WORDS: usize = SLOT_CEILING.div_ceil(64);
+
 struct ProcessTable {
     slots: ChunkTable<ProcessSlot>,
+    occupied_mask: [u64; OCCUPIED_WORDS],
     /// Chain heads (slot index + 1, 0 = empty) of every slot holding a process
     /// object, keyed by its immutable `process_id`. Linked in `publish_inner`
     /// right after `slot.object` is stored and unlinked in `reclaim_slot` next
@@ -318,6 +425,7 @@ impl ProcessTable {
     const fn new() -> Self {
         Self {
             slots: ChunkTable::new(),
+            occupied_mask: [0; OCCUPIED_WORDS],
             pid_buckets: [0; PID_BUCKETS],
             jobs: {
                 let mut jobs = [const { jobs::JobSlot::empty() }; jobs::JOB_SLOTS];
@@ -330,6 +438,31 @@ impl ProcessTable {
             reap_len: 0,
             reap_scan_pending: false,
         }
+    }
+
+    fn mark_occupied(&mut self, index: usize, occupied: bool) {
+        let word = index >> 6;
+        let bit = 1_u64 << (index & 63);
+        let Some(entry) = self.occupied_mask.get_mut(word) else {
+            return;
+        };
+        let was = (*entry & bit) != 0;
+        if occupied && !was {
+            *entry |= bit;
+            OCCUPIED_PROCESS_COUNT.fetch_add(1, Ordering::Relaxed);
+        } else if !occupied && was {
+            *entry &= !bit;
+            OCCUPIED_PROCESS_COUNT.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    fn lookup_slot(&self, handle: ProcessHandle) -> Option<&ProcessSlot> {
+        let slot = self.slots.get(handle.index())?;
+        (slot.generation == handle.generation()).then_some(slot)
+    }
+
+    fn lookup_object(&self, handle: ProcessHandle) -> Option<&ProcessObject> {
+        self.lookup_slot(handle)?.object.as_deref()
     }
 
     fn lookup_slot_mut(&mut self, handle: ProcessHandle) -> Option<&mut ProcessSlot> {
@@ -431,7 +564,10 @@ mod identity;
 pub mod jobs;
 mod mm_execution;
 pub(in crate::multitask) mod pin_owner;
-pub(super) use identity::{published_live_process_identity, published_process_job};
+pub(super) use identity::{
+    mm_owner_identity, published_live_process_identity, published_mm_owner_identity,
+    published_mm_vma_target, published_process_job,
+};
 #[cfg(test)]
 use identity::{clear_publication_for_test, process_state_is_visible};
 pub use identity::{
@@ -523,35 +659,68 @@ fn publish_slot_visibility(index: usize, slot: &ProcessSlot) {
             job: object.job,
             mm_generation: object.mm_generation,
             live: !object.exiting && !object.exec_in_progress && !object.exec_state_staged,
+            mm_owner_live: (!object.exiting || object.mm_borrowers > 0)
+                && !object.exec_in_progress
+                && !object.exec_state_staged,
+            mm_vma_owner: object.mm_owner,
             state: object.state_ptr().as_ptr(),
         });
     identity::publish_slot_visibility(index, slot.generation, publication);
 }
 
+fn release_mm_borrower_ref(owner_handle: ProcessHandle) {
+    let mut table = PROCESS_TABLE.lock();
+    let should_queue = {
+        let Some(object) = table.lookup_object_mut(owner_handle) else {
+            return;
+        };
+        object.mm_borrowers = object.mm_borrowers.saturating_sub(1);
+        object.ref_count = object.ref_count.saturating_sub(1);
+        let should_queue =
+            object.thread_count == 0 && object.ref_count == 0 && !object.queued_for_reap;
+        if should_queue {
+            object.queued_for_reap = true;
+        }
+        should_queue
+    };
+    publish_slot_visibility(owner_handle.index(), &table.slots[owner_handle.index()]);
+    if should_queue {
+        table.push_reap_handle(owner_handle);
+    }
+}
+
 fn reclaim_slot(table: &mut ProcessTable, index: usize) -> Option<Box<ProcessObject>> {
-    let slot = table.slots.get_mut(index)?;
-    let object = slot.object.as_mut()?;
-    if object.ref_count != 0 || object.thread_count != 0 {
-        object.queued_for_reap = false;
-        return None;
-    }
-    // A child with a parent cannot be reclaimed before `wait_for_child` consumes
-    // it, even in the window after its last thread detaches and before the
-    // terminator publishes `exit_status`.
-    if !object.waited {
-        object.queued_for_reap = false;
-        return None;
-    }
+    let old_gen = {
+        let slot = table.slots.get_mut(index)?;
+        let object = slot.object.as_mut()?;
+        if object.ref_count != 0 || object.thread_count != 0 {
+            object.queued_for_reap = false;
+            return None;
+        }
+        // A child with a parent cannot be reclaimed before `wait_for_child` consumes
+        // it, even in the window after its last thread detaches and before the
+        // terminator publishes `exit_status`.
+        if !object.waited {
+            object.queued_for_reap = false;
+            return None;
+        }
+        slot.generation
+    };
 
     // Close-before-zero prevents a lock-free reader from entering between
     // the reaper's last reference observation and pointer revocation.
-    if !pin_owner::close(index, slot.generation) {
+    if !pin_owner::close(index, old_gen) {
         return None;
     }
-    let object = slot.object.take()?;
-    // Generation exhaustion permanently retires this slot. Reusing generation
-    // one would let a stale ProcessHandle alias a new process.
-    slot.generation = ProcessTable::next_generation(slot.generation).unwrap_or(0);
+    let object = {
+        let slot = table.slots.get_mut(index)?;
+        let object = slot.object.take()?;
+        // Generation exhaustion permanently retires this slot. Reusing generation
+        // one would let a stale ProcessHandle alias a new process.
+        slot.generation = ProcessTable::next_generation(slot.generation).unwrap_or(0);
+        object
+    };
+    table.mark_occupied(index, false);
     // The pid index entry dies with the object, in the same locked section.
     table.pid_index_unlink(index, object.process_id);
     publish_slot_visibility(index, &table.slots[index]);
@@ -625,7 +794,7 @@ pub fn attach_task(handle: ProcessHandle) -> Result<(), super::SpawnTaskError> {
 
 pub fn detach_task(handle: ProcessHandle) -> Option<()> {
     let mut table = PROCESS_TABLE.lock();
-    let (should_queue, exit_marker) = {
+    let (should_queue, exited_pid, exit_marker) = {
         let object = table.lookup_object_mut(handle)?;
         if object.thread_count == 0 || object.ref_count == 0 {
             return Some(());
@@ -647,6 +816,7 @@ pub fn detach_task(handle: ProcessHandle) -> Option<()> {
         if object.thread_count == 0 {
             object.exiting = true;
         }
+        let exited_pid = (object.thread_count == 0).then_some(object.process_id);
         let should_queue =
             object.thread_count == 0 && object.ref_count == 0 && !object.queued_for_reap;
         if should_queue {
@@ -654,6 +824,7 @@ pub fn detach_task(handle: ProcessHandle) -> Option<()> {
         }
         (
             should_queue,
+            exited_pid,
             final_thread_starts_exit
                 .then_some((object.mm_generation, object.lifecycle_transaction_id)),
         )
@@ -663,6 +834,9 @@ pub fn detach_task(handle: ProcessHandle) -> Option<()> {
         table.push_reap_handle(handle);
     }
     drop(table);
+    if let Some(pid) = exited_pid {
+        super::vfork_wait::complete_vfork(pid);
+    }
     if let Some((mm_generation, transaction_id)) = exit_marker {
         record_lifecycle_marker(
             "lifecycle-exit-final-thread",
@@ -883,31 +1057,45 @@ pub fn stage_exec_state_checked(
             .pin_execution()
             .ok_or(StageRefusal::NewImagePin)?,
     );
-    let process = retain_process(reservation.handle).ok_or(StageRefusal::ProcessGone)?;
-    let staged = process.with_state_mut(|process_id, state| {
-        let job_index = {
-            let mut table = PROCESS_TABLE.lock();
-            let Some(object) = table.lookup_object_mut(reservation.handle) else {
-                return Err(StageRefusal::ProcessGone);
-            };
-            if !exec_commit_may_transfer(object, reservation) {
-                return Err(StageRefusal::Transfer);
-            }
-            object.job.index() as usize
+    let _process = retain_process(reservation.handle).ok_or(StageRefusal::ProcessGone)?;
+    let (process_id, job_index, detached_owner, state_lock) = {
+        let mut table = PROCESS_TABLE.lock();
+        let Some(object) = table.lookup_object_mut(reservation.handle) else {
+            return Err(StageRefusal::ProcessGone);
         };
+        if !exec_commit_may_transfer(object, reservation) {
+            return Err(StageRefusal::Transfer);
+        }
+        (
+            object.process_id,
+            object.job.index() as usize,
+            object.mm_owner,
+            Arc::clone(&object.state_lock),
+        )
+    };
 
-        let replacement_mapping_kmem = state.reserve_exec_mapping_kmem(&address_space)
-            .ok_or(StageRefusal::MappingQuota)?;
-        // A later root-bind or seal refusal can still leave execution pins on
-        // the staged root. Keep its meter until cold root reclamation too.
+    let staged = if let Some(owner_handle) = detached_owner {
+        let replacement_mapping_kmem = kernel_mm::api::kmem_charge::SharedMeter::new(
+            kernel_mm::api::kmem_charge::Class::Vma,
+        );
+        if !replacement_mapping_kmem.bind(
+            job_index,
+            address_space.immutable_mapping_metadata_bytes() as u64,
+        ) {
+            return Err(StageRefusal::MappingQuota);
+        }
         address_space.set_mapping_meter(replacement_mapping_kmem.clone());
         if !bind_process_root_charge(&mut address_space, job_index) {
             return Err(StageRefusal::MappingQuota);
         }
-        if !state.address_space().seal_execution() {
-            return Err(StageRefusal::SealBusy);
-        }
-        let (closed, old_state) = state.replace_for_exec(
+        let mut bundle = state_lock.lock();
+        let mut old_local = bundle
+            .remove_vfork_local(process_id)
+            .ok_or(StageRefusal::ProcessGone)?;
+        drop(bundle);
+
+        let (closed, fresh_state) = UserProcessState::replace_local_for_exec(
+            &mut old_local,
             address_space,
             linux_process_state,
             linux_memory_map,
@@ -915,6 +1103,69 @@ pub fn stage_exec_state_checked(
             exec_path,
             replacement_mapping_kmem,
         );
+        let new_lock = Arc::new(ProcessStateLock::new(ProcessStateBundle::new(
+            process_id,
+            fresh_state,
+        )));
+
+        {
+            let mut table = PROCESS_TABLE.lock();
+            let object = table
+                .lookup_object_mut(reservation.handle)
+                .expect("authorized exec process disappeared before generation publication");
+            assert!(
+                exec_commit_may_transfer(object, reservation),
+                "authorized exec reservation changed before generation publication"
+            );
+            let old_lock = core::mem::replace(&mut object.state_lock, new_lock);
+            object.retired_state_locks.push(old_lock);
+            object.mm_owner = None;
+            object.mm_execution = new_mm.pin_for_publication();
+            object.mm_generation = reservation.next_mm_generation;
+            object.exec_state_staged = true;
+            let index = reservation.handle.index();
+            let slot = &table.slots[index];
+            publish_slot_visibility(index, slot);
+        }
+
+        Ok(StagedExec {
+            reservation,
+            new_root,
+            new_mm,
+            process_id,
+            closed,
+            old_state: ExecOldState::DetachedVfork(old_local),
+            detached_owner: Some(owner_handle),
+        })
+    } else {
+        let mut bundle = state_lock.lock();
+        let replacement_mapping_kmem = bundle
+            .reserve_exec_mapping_kmem(&address_space)
+            .ok_or(StageRefusal::MappingQuota)?;
+        // A later root-bind or seal refusal can still leave execution pins on
+        // the staged root. Keep its meter until cold root reclamation too.
+        address_space.set_mapping_meter(replacement_mapping_kmem.clone());
+        if !bind_process_root_charge(&mut address_space, job_index) {
+            return Err(StageRefusal::MappingQuota);
+        }
+        let result = bundle
+            .with_state_for_pid(process_id, |state| {
+                if !state.address_space().seal_execution() {
+                    return Err(StageRefusal::SealBusy);
+                }
+                let (closed, old_state) = state.replace_for_exec(
+                    address_space,
+                    linux_process_state,
+                    linux_memory_map,
+                    linux_runtime_profile,
+                    exec_path,
+                    replacement_mapping_kmem,
+                );
+                Ok((closed, old_state))
+            })
+            .ok_or(StageRefusal::ProcessGone)?;
+        drop(bundle);
+        let (closed, old_state) = result?;
 
         {
             let mut table = PROCESS_TABLE.lock();
@@ -938,9 +1189,10 @@ pub fn stage_exec_state_checked(
             new_mm,
             process_id,
             closed,
-            old_state,
+            old_state: ExecOldState::Owned(old_state),
+            detached_owner: None,
         })
-    });
+    };
     if staged.is_ok() {
         record_lifecycle_marker(
             "lifecycle-exec-stage",
@@ -985,6 +1237,10 @@ pub(super) fn finalize_exec_state(
         publish_slot_visibility(index, &table.slots[index]);
         exit_pending
     };
+    if let Some(owner_handle) = staged.detached_owner {
+        release_mm_borrower_ref(owner_handle);
+    }
+    super::vfork_wait::complete_vfork(staged.process_id);
     record_lifecycle_marker(
         if exit_pending {
             "lifecycle-exec-publish-exit-pending"
@@ -1163,6 +1419,7 @@ pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {
     let parent = object.parent_process_id;
     publish_slot_visibility(index, &table.slots[index]);
     drop(table);
+    super::vfork_wait::complete_vfork(process_id);
     // Publish first, wake second: a parent parked in `wait4` re-runs
     // `wait_for_child` and finds this status.
     if let Some(parent) = parent {
@@ -1251,6 +1508,7 @@ fn mark_process_exiting_inner(process_id: u64, expected: Option<ProcessHandle>) 
     let marker = (object.mm_generation, object.lifecycle_transaction_id);
     publish_slot_visibility(handle.index(), &table.slots[handle.index()]);
     drop(table);
+    super::vfork_wait::complete_vfork(process_id);
     record_lifecycle_marker("lifecycle-exit-seal", handle, marker.0, marker.1);
     Some(())
 }
@@ -1379,37 +1637,33 @@ pub fn wait_for_child(
     include_stopped: bool,
     include_continued: bool,
 ) -> WaitResult {
+    if target_pid == 0 || target_pid < -1 {
+        return WaitResult::NoMatchingChild;
+    }
+
     let mut table = PROCESS_TABLE.lock();
     let mut saw_child = false;
     let mut queued_handle = None;
     let mut queued_identity = None;
     let mut exited = None;
 
-    for (index, slot) in table.slots.iter_mut().enumerate() {
+    let mut check_slot = |index: usize, slot: &mut ProcessSlot| -> bool {
+        let generation = slot.generation;
         let Some(object) = slot.object.as_deref_mut() else {
-            continue;
+            return false;
         };
         // Logical wait consumption is final even while references or threads
         // keep the physical process object alive for teardown.
         if object.parent_process_id != Some(parent_process_id) || object.waited {
-            continue;
+            return false;
         }
         let pid = object.process_id;
-        let matches = match target_pid {
-            -1 => true,
-            pid_filter if pid_filter > 0 => pid == pid_filter as u64,
-            _ => false,
-        };
-        if !matches {
-            continue;
-        }
-
         saw_child = true;
         if let Some(status) = object.exit_status {
             object.waited = true;
             if object.thread_count == 0 && object.ref_count == 0 && !object.queued_for_reap {
                 object.queued_for_reap = true;
-                let handle = ProcessHandle::new(index, slot.generation);
+                let handle = ProcessHandle::new(index, generation);
                 queued_handle = Some(handle);
                 queued_identity = Some((
                     handle,
@@ -1418,7 +1672,7 @@ pub fn wait_for_child(
                 ));
             }
             exited = Some(WaitResult::Exited { pid, status });
-            break;
+            return true;
         }
         let status = match object.child_state_change {
             Some(ChildStateChange::Stopped(signal)) if include_stopped => {
@@ -1430,7 +1684,33 @@ pub fn wait_for_child(
         if let Some(status) = status {
             object.child_state_change = None;
             exited = Some(WaitResult::StateChanged { pid, status });
-            break;
+            return true;
+        }
+        false
+    };
+
+    if target_pid > 0 {
+        if let Some(index) = table.find_pid_slot(target_pid as u64, |object| {
+            object.parent_process_id == Some(parent_process_id) && !object.waited
+        }) {
+            if let Some(slot) = table.slots.get_mut(index) {
+                let _ = check_slot(index, slot);
+            }
+        }
+    } else {
+        let word_limit = table.slots.len().div_ceil(64).min(OCCUPIED_WORDS);
+        'scan: for word_idx in 0..word_limit {
+            let mut bits = table.occupied_mask[word_idx];
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let index = word_idx * 64 + bit;
+                if let Some(slot) = table.slots.get_mut(index) {
+                    if check_slot(index, slot) {
+                        break 'scan;
+                    }
+                }
+            }
         }
     }
 
@@ -1582,6 +1862,7 @@ fn grow_slots(expected_len: usize) -> bool {
 #[cfg(test)]
 fn reset_for_tests() {
     NEXT_LIFECYCLE_TRANSACTION_ID.store(1, Ordering::Relaxed);
+    OCCUPIED_PROCESS_COUNT.store(0, Ordering::Relaxed);
     let retired = {
         let mut table = PROCESS_TABLE.lock();
         pin_owner::reset_for_tests();
@@ -2138,10 +2419,10 @@ pub(crate) mod tests {
     #[test]
     fn process_address_space_and_exec_exit_are_serialized() {
         let mut object = ProcessObject::new(7, None, new_state(), 41, super::jobs::ROOT_JOB);
-        let held = object.state.lock();
-        assert!(object.state.try_lock().is_none());
+        let held = object.state_lock.lock();
+        assert!(object.state_lock.try_lock().is_none());
         drop(held);
-        assert!(object.state.try_lock().is_some());
+        assert!(object.state_lock.try_lock().is_some());
         assert!(!super::exec_may_replace(&object));
         object.exec_in_progress = true;
         assert!(super::exec_may_replace(&object));
@@ -2483,5 +2764,159 @@ pub(crate) mod tests {
             !process_state_is_visible(handle),
             "a reclaimed slot must not read as visible"
         );
+    }
+
+    #[test]
+    fn vfork_child_shares_mm_and_unblocks_parent_only_on_exec_commit() {
+        use super::{jobs, live_process_count, reserve_spawn, retain_process_by_pid, spawn};
+        use crate::user::handles::FD_CLOEXEC;
+        use crate::user::linux::{LinuxSigAction, SIG_IGN};
+        let _isolation = isolate_process_table();
+
+        let parent = create_process(930_001, new_state()).expect("parent");
+        assert_eq!(live_process_count(), 1);
+        let parent_ref = retain_process(parent).expect("retain parent");
+        let (parent_ns, vfork_local) = parent_ref.with_state_mut(|_, state| {
+            state.handles_mut().get_entry_mut(0).unwrap().set_fd_flags(FD_CLOEXEC);
+            state.set_linux_signal_action(
+                2,
+                LinuxSigAction {
+                    handler: 0x401000,
+                    flags: 0,
+                    restorer: 0,
+                    mask: 0,
+                },
+            );
+            state.set_linux_signal_action(
+                13,
+                LinuxSigAction {
+                    handler: SIG_IGN,
+                    flags: 0,
+                    restorer: 0,
+                    mask: 0,
+                },
+            );
+            (
+                state.futex_namespace_id(),
+                state.fork_clone_vfork_local(true, None),
+            )
+        });
+        let parent_id = parent_ref.live_identity().expect("parent live");
+        drop(parent_ref);
+
+        let spawn = reserve_spawn().expect("reserve vfork child");
+        let child = spawn::publish_vfork_spawn(spawn, 930_002, 930_001, vfork_local)
+            .expect("publish vfork child");
+        assert_eq!(live_process_count(), 2);
+        assert!(super::super::vfork_wait::begin_vfork_wait(930_002, 930_001));
+        assert!(!super::super::vfork_wait::take_vfork_done(930_002, 930_001));
+
+        let child_ref = retain_process_by_pid(930_002).expect("retain vfork child");
+        assert_eq!(child_ref.vma_owner(), Some((parent, parent_id)));
+        child_ref.with_state(|_, state| {
+            assert_eq!(state.futex_namespace_id(), parent_ns);
+            assert_eq!(state.linux_signal_action(2).unwrap().handler, 0);
+            assert_eq!(state.linux_signal_action(13).unwrap().handler, SIG_IGN);
+        });
+
+        // Failed exec stage must NOT unblock parent or detach child's shared MM.
+        let mut denied_mm = ProcessAddressSpace::empty_for_tests();
+        denied_mm.add_immutable_metadata_for_tests();
+        jobs::job_set_kmem_class_limit(jobs::ROOT_JOB, kernel_mm::api::kmem_charge::Class::Vma, 0)
+            .unwrap();
+        let failed_res = begin_exec(child).expect("begin failed exec");
+        assert!(super::authorize_exec(failed_res));
+        assert!(matches!(
+            super::stage_exec_state_checked(
+                failed_res,
+                denied_mm,
+                crate::user::linux::LinuxProcessState::default(),
+                crate::user::linux::LinuxMemoryMapState::new(),
+                crate::user::linux::LinuxRuntimeProfile::new(),
+                "/denied",
+            ),
+            Err(super::StageRefusal::MappingQuota)
+        ));
+        assert!(cancel_exec(failed_res));
+        assert!(!super::super::vfork_wait::take_vfork_done(930_002, 930_001));
+        assert_eq!(child_ref.vma_owner(), Some((parent, parent_id)));
+
+        // Successful exec detaches child onto fresh Mm, keeps parent's Mm live, and completes vfork.
+        let res = begin_exec(child).expect("begin exec");
+        assert!(super::authorize_exec(res));
+        let staged = super::stage_exec_state_checked(
+            res,
+            ProcessAddressSpace::empty_for_tests(),
+            crate::user::linux::LinuxProcessState::default(),
+            crate::user::linux::LinuxMemoryMapState::new(),
+            crate::user::linux::LinuxRuntimeProfile::new(),
+            "/execed.elf",
+        )
+        .expect("stage child vfork exec");
+        let finalized = super::finalize_exec_state(
+            staged,
+            crate::multitask::scheduler::exec_transaction::test_publication(res, 0),
+        );
+        let (_, _, closed, old_state) = finalized.into_parts();
+        assert_eq!(closed.len(), 1, "child CLOEXEC handle closed on exec");
+        old_state.retire_execution_state();
+
+        assert!(super::super::vfork_wait::take_vfork_done(930_002, 930_001));
+        assert_ne!(child_ref.with_state(|_, s| s.futex_namespace_id()), parent_ns);
+        assert_eq!(child_ref.vma_owner().unwrap().0, child);
+        drop(child_ref);
+
+        let parent_ref = retain_process(parent).expect("parent still live");
+        assert_eq!(parent_ref.with_state(|_, s| s.futex_namespace_id()), parent_ns);
+        assert!(parent_ref.with_state(|_, s| s.handles().get_entry(0).is_some()));
+        drop(parent_ref);
+
+        mark_process_exiting(930_002);
+        note_process_exit_status(930_002, 0).unwrap();
+        detach_task(child).unwrap();
+        assert!(matches!(
+            wait_for_child(930_001, 930_002, false, false),
+            WaitResult::Exited { pid: 930_002, status: 0 }
+        ));
+        mark_process_exiting(930_001);
+        detach_task(parent).unwrap();
+        assert_eq!(reap_exited_processes(), 2);
+        assert_eq!(live_process_count(), 0);
+    }
+
+    #[test]
+    fn vfork_child_exit_without_exec_wakes_parent_and_unpins_exited_owner() {
+        use super::{live_process_count, reserve_spawn, spawn};
+        let _isolation = isolate_process_table();
+
+        let parent = create_process(931_001, new_state()).expect("parent");
+        let parent_ref = retain_process(parent).expect("retain parent");
+        let parent_identity = parent_ref.live_identity().expect("parent id");
+        let vfork_local = parent_ref.with_state(|_, s| s.fork_clone_vfork_local(false, None));
+        drop(parent_ref);
+
+        let spawn = reserve_spawn().expect("reserve");
+        let child = spawn::publish_vfork_spawn(spawn, 931_002, 931_001, vfork_local)
+            .expect("publish");
+        assert!(super::super::vfork_wait::begin_vfork_wait(931_002, 931_001));
+
+        // Even if parent exits first, parent stays pinned and mm_owner_identity
+        // stays valid until child stops borrowing Mm and is reaped.
+        mark_process_exiting(931_001);
+        detach_task(parent).unwrap();
+        assert_eq!(reap_exited_processes(), 0, "pinned owner must not be reaped early");
+        assert_eq!(super::mm_owner_identity(parent), Some(parent_identity));
+
+        note_process_exit_status(931_002, 7 << 8).unwrap();
+        detach_task(child).unwrap();
+        assert!(super::super::vfork_wait::take_vfork_done(931_002, 931_001));
+
+        assert!(matches!(
+            wait_for_child(931_001, 931_002, false, false),
+            WaitResult::Exited { pid: 931_002, status } if status == (7 << 8)
+        ));
+        assert_eq!(reap_exited_processes(), 1, "child reaped first");
+        assert_eq!(reap_exited_processes(), 1, "unpinned parent reaped second");
+        assert_eq!(live_process_count(), 0);
     }
 }

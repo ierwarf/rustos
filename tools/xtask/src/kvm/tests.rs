@@ -1041,7 +1041,7 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
         let path = std::path::Path::new("/dev/shm/rustos-kvm-test-pixels");
 
         let mut producer = Command::new("qemu-system-x86_64");
-        append_dvm_display_pixels(&mut producer, path, false);
+        append_dvm_display_pixels(&mut producer, path, false, 2048);
         let producer_args = producer
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -1055,7 +1055,7 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
         }));
 
         let mut consumer = Command::new("qemu-system-x86_64");
-        append_dvm_display_pixels(&mut consumer, path, true);
+        append_dvm_display_pixels(&mut consumer, path, true, 2048);
         let consumer_args = consumer
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -1070,19 +1070,37 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
 
     #[test]
     fn app_buffer_aperture_is_separate_writable_and_preallocated_once() {
-        assert_eq!(super::DVM_DISPLAY_PIXEL_PHYS_ADDR + super::DVM_DISPLAY_REGION_BYTES,
-                   super::DVM_APP_BUFFER_PHYS_ADDR);
+        // 2 GiB keeps RAM below 4 GiB, so the windows stay at the historical 4 GiB.
+        assert_eq!(super::dvm_pmem_base_for(2048), 0x1_0000_0000);
+        assert_eq!(
+            super::dvm_pmem_base_for(2048) + super::DVM_DISPLAY_REGION_BYTES,
+            0x1_2000_0000
+        );
         let path = Path::new("/dev/shm/rustos-kvm-app-buffers");
         for prealloc in [true, false] {
             let mut command = Command::new("qemu-system-x86_64");
-            super::append_dvm_app_buffer_aperture(&mut command, path, prealloc);
+            super::append_dvm_app_buffer_aperture(&mut command, path, prealloc, 2048);
             let args = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
             let backend = args.iter().find(|arg| arg.starts_with("memory-backend-file,id=dvm-app-buffers,")).unwrap();
             assert!(backend.contains("share=on"));
             assert!(!backend.contains("readonly=on"));
             assert_eq!(backend.contains("prealloc=on"), prealloc);
-            assert!(args.iter().any(|arg| arg.contains(&format!("memaddr={}", super::DVM_APP_BUFFER_PHYS_ADDR))));
+            assert!(args.iter().any(|arg| arg.contains("memaddr=4831838208")));
         }
+    }
+
+    #[test]
+    fn pmem_windows_follow_the_end_of_guest_ram() {
+        const GIB: u64 = 1 << 30;
+        // Below 2816 MiB q35 keeps all RAM under 4 GiB.
+        assert_eq!(super::dvm_pmem_base_for(2688), 4 * GIB);
+        // From 2816 MiB RAM above 2 GiB moves above 4 GiB and the windows follow it.
+        assert_eq!(super::dvm_pmem_base_for(3072), 5 * GIB);
+        assert_eq!(super::dvm_pmem_base_for(6144), 8 * GIB);
+        let mut command = Command::new("qemu-system-x86_64");
+        super::append_dvm_display_pixels(&mut command, Path::new("/dev/shm/x"), false, 6144);
+        let args = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert!(args.iter().any(|arg| arg.contains(&format!("memaddr={}", 8 * GIB))));
     }
 
     #[test]

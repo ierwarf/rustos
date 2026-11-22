@@ -148,6 +148,7 @@ pub(crate) struct GpuAtlasPacker<'a> {
     width: usize,
     height: usize,
     stride_pixels: usize,
+    used_height: usize,
     /// Disjoint free rectangles, including the padding texel. Each placement
     /// carves one of them, so room left beside or under a large region (the
     /// desktop, say) stays usable instead of being stranded by a row cursor.
@@ -179,6 +180,7 @@ impl<'a> GpuAtlasPacker<'a> {
             width,
             height,
             stride_pixels,
+            used_height: 0,
             free: vec![Rect {
                 x: 0,
                 y: 0,
@@ -186,6 +188,10 @@ impl<'a> GpuAtlasPacker<'a> {
                 height,
             }],
         })
+    }
+
+    pub(crate) fn used_height(&self) -> usize {
+        self.used_height
     }
 
     /// The atlas pixels and their stride, so a region that was just written can
@@ -310,6 +316,9 @@ impl<'a> GpuAtlasPacker<'a> {
             return Err(GpuSceneError::InvalidLayer);
         }
         self.zero_padding_border(destination)?;
+        self.used_height = self
+            .used_height
+            .max(destination.y + destination.height + Self::PADDING);
         for row in 0..destination.height {
             let source_start = row
                 .checked_mul(stride_pixels)
@@ -438,6 +447,7 @@ impl<'a> GpuAtlasPacker<'a> {
             height,
         };
         self.zero_padding_border(destination)?;
+        self.used_height = self.used_height.max(outer_y + outer_height);
         self.carve_free_rect(free_index, free, outer_width, outer_height);
         Ok(destination)
     }

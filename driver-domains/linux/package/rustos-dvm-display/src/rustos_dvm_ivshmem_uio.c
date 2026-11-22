@@ -668,7 +668,10 @@ static long rustos_dvm_app_take(struct rustos_dvm_ivshmem *state, unsigned long 
 		err = -EFAULT;
 		goto out;
 	}
-	/* Host has reserved the range exclusively and has not exposed it yet. */
+	/* Host has reserved the range exclusively and has not exposed it yet.
+	 * The scrub stays under `app_lock`: the entry must not be visible to
+	 * revoke/overlap checks (or racing teardown of `app_pixels`) before the
+	 * dma-buf exists. */
 	memset(state->app_pixels + offset, 0, app->bytes);
 	wmb();
 	info.ops = &rustos_dvm_app_ops;

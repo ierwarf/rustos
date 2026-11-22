@@ -5,18 +5,17 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, DvmBlockInfoWire,
-    StoragedBulkReadResponse, BLOCK_BROKER_INFO_FLAG_READ_ONLY,
+    StoragedBulkReadResponse, StoragedBulkWriteRequest, BLOCK_BROKER_INFO_FLAG_READ_ONLY,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_STORAGED,
     COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_FLUSH, COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_INFO,
     COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK, COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE,
-    COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE_BULK,
-    IPC_SERVICE_STORAGED, STORAGED_BULK_READ_PAYLOAD_CAPACITY, STORAGED_BULK_WRITE_PAYLOAD_CAPACITY,
-    StoragedBulkWriteRequest, SYS_RUSTOS_IPC_CALL,
+    COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE_BULK, IPC_SERVICE_STORAGED,
+    STORAGED_BULK_READ_PAYLOAD_CAPACITY, STORAGED_BULK_WRITE_PAYLOAD_CAPACITY, SYS_RUSTOS_IPC_CALL,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
 };
 use storage_core::{BlockDevice, IoResult, StorageError};
 
-use super::{EAGAIN, EINVAL, EIO, ENODEV, ENOSYS, ENOMEM};
+use super::{EAGAIN, EINVAL, EIO, ENODEV, ENOMEM, ENOSYS};
 use vfsd::{
     admit_dvm_block_geometry_with_allowed_flags, cooperative_bulk_yield_state,
     storage_error_from_linux_status, storage_service_lookup_errno, validate_dvm_block_range,
@@ -35,7 +34,8 @@ const IPC_BLOCK_PAYLOAD_BYTES: usize =
 const BULK_COOPERATIVE_YIELD_BYTES: usize = 256 * 1024;
 // A detached old mount and a newly admitted mount can overlap. Response
 // storage belongs to each device lease, not one unsynchronized global slot.
-const _: () = assert!(core::mem::align_of::<StoragedBulkReadResponse>() <= core::mem::align_of::<u64>());
+const _: () =
+    assert!(core::mem::align_of::<StoragedBulkReadResponse>() <= core::mem::align_of::<u64>());
 // Not-ready is an expected, bounded state while the DVM proves its initial
 // generation. Keep one diagnostic transition instead of turning every glibc
 // negative probe into debugcon I/O and scheduler pressure.
@@ -115,7 +115,9 @@ impl BootBlockDevice {
         bulk_response.resize(words, 0);
         let write_words = size_of::<StoragedBulkWriteRequest>().div_ceil(size_of::<u64>());
         let mut bulk_write_request = alloc::vec::Vec::new();
-        bulk_write_request.try_reserve_exact(write_words).map_err(|_| ENOMEM)?;
+        bulk_write_request
+            .try_reserve_exact(write_words)
+            .map_err(|_| ENOMEM)?;
         bulk_write_request.resize(write_words, 0);
         Ok(Self {
             generation: info.generation,
@@ -134,6 +136,21 @@ impl BootBlockDevice {
         if max_blocks == 0 {
             return Err(StorageError::Unsupported);
         }
+        // A large range keeps several storaged calls in flight; a small one, or
+        // a pool that is unavailable or busy, reads on this thread.
+        if let Some(result) = super::bulk_lanes::read_parallel(
+            self.generation,
+            self.block_size,
+            max_blocks,
+            self.block_count,
+            lba,
+            out,
+            &mut self.bulk_response,
+        ) {
+            result.map_err(|errno| storage_error_from_linux_status(-(errno as i64)))?;
+            self.account_bulk_progress(out.len());
+            return Ok(());
+        }
         let mut done = 0usize;
         while done < out.len() {
             let remaining_blocks = ((out.len() - done) / self.block_size) as u64;
@@ -146,8 +163,12 @@ impl BootBlockDevice {
             request.arg0 = self.generation;
             request.arg1 = chunk_lba;
             request.arg2 = block_count;
-            call_storaged_bulk(&request, &mut out[done..done + byte_len], &mut self.bulk_response)
-                .map_err(|errno| storage_error_from_linux_status(-(errno as i64)))?;
+            call_storaged_bulk(
+                &request,
+                &mut out[done..done + byte_len],
+                &mut self.bulk_response,
+            )
+            .map_err(|errno| storage_error_from_linux_status(-(errno as i64)))?;
             self.account_bulk_progress(byte_len);
             done += byte_len;
         }
@@ -155,6 +176,15 @@ impl BootBlockDevice {
     }
 
     fn write_transfer(&mut self, lba: u64, input: &[u8]) -> IoResult<()> {
+        // Lookahead bytes read before this write must not outlive it, and one
+        // started while it ran may have read either side of it.
+        super::bulk_lanes::invalidate_prefetch();
+        let result = self.write_transfer_blocks(lba, input);
+        super::bulk_lanes::invalidate_prefetch();
+        result
+    }
+
+    fn write_transfer_blocks(&mut self, lba: u64, input: &[u8]) -> IoResult<()> {
         validate_dvm_block_range(self.block_size, self.block_count, lba, input.len())?;
         let small_max_blocks = (IPC_BLOCK_PAYLOAD_BYTES / self.block_size) as u64;
         let bulk_max_blocks = (STORAGED_BULK_WRITE_PAYLOAD_CAPACITY / self.block_size) as u64;
@@ -271,7 +301,7 @@ impl BlockDevice for BootBlockDevice {
     }
 }
 
-fn storage_request(operation: u16) -> CommercialMaxProtocolRequest {
+pub(super) fn storage_request(operation: u16) -> CommercialMaxProtocolRequest {
     let mut request = CommercialMaxProtocolRequest::default();
     request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
     request.header.protocol = COMMERCIAL_MAX_PROTOCOL_STORAGED;
@@ -342,9 +372,15 @@ fn call_storaged(
     Ok(response)
 }
 
-fn call_storaged_bulk(request: &CommercialMaxProtocolRequest, out: &mut [u8], response_words: &mut [u64]) -> Result<(), i32> {
-    if out.is_empty() || out.len() > STORAGED_BULK_READ_PAYLOAD_CAPACITY
-        || response_words.len() < size_of::<StoragedBulkReadResponse>().div_ceil(size_of::<u64>()) {
+pub(super) fn call_storaged_bulk(
+    request: &CommercialMaxProtocolRequest,
+    out: &mut [u8],
+    response_words: &mut [u64],
+) -> Result<(), i32> {
+    if out.is_empty()
+        || out.len() > STORAGED_BULK_READ_PAYLOAD_CAPACITY
+        || response_words.len() < size_of::<StoragedBulkReadResponse>().div_ceil(size_of::<u64>())
+    {
         return Err(EINVAL);
     }
     let endpoint = unsafe {
@@ -365,7 +401,9 @@ fn call_storaged_bulk(request: &CommercialMaxProtocolRequest, out: &mut [u8], re
 
     // SAFETY: u64 storage has sufficient size/alignment (asserted above),
     // is exclusively borrowed, and the all-integer wire type admits zero bits.
-    let response = response_words.as_mut_ptr().cast::<StoragedBulkReadResponse>();
+    let response = response_words
+        .as_mut_ptr()
+        .cast::<StoragedBulkReadResponse>();
     unsafe {
         core::ptr::write_bytes(
             response.cast::<u8>(),
@@ -456,7 +494,9 @@ fn call_storaged_bulk_write(
         return Err(errno);
     }
     let base = storage_request(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE_BULK);
-    let req_ptr = request_words.as_mut_ptr().cast::<StoragedBulkWriteRequest>();
+    let req_ptr = request_words
+        .as_mut_ptr()
+        .cast::<StoragedBulkWriteRequest>();
     unsafe {
         (*req_ptr).header = base.header;
         (*req_ptr).flags = 0;

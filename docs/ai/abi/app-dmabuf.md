@@ -22,8 +22,15 @@ See "Not done / unverified" before relying on any part of this.
 
 ## Aperture
 
-512 MiB shared writable virtio-pmem at GPA `0x1_2000_0000`, adjacent to (and
-disjoint from) the read-only atlas pixel pool. `verify_aperture()`
+512 MiB shared writable virtio-pmem, adjacent to (and disjoint from) the
+read-only atlas pixel pool. Both windows sit in QEMU's device-memory region, which
+starts at the first 1 GiB boundary at or above the end of guest RAM and never
+below 4 GiB (`driver_domain_protocol::dvm_pmem_base`). With the default 2 GiB
+RustOS guest that is the historical `0x1_0000_0000` pixel pool and
+`0x1_2000_0000` app aperture; a larger guest (`KVM_RUSTOS_MEMORY_MIB`, 2048..=32768,
+`cargo xtask kvm-run`/`kvm-smoke` only) moves both up. The kernel derives the base
+from `phys::boot_ram_top()`, xtask from the q35 RAM split (RAM >= 2816 MiB keeps
+2 GiB below 4 GiB). The DVM (Linux) guest and the physical supervisor keep 2 GiB. `verify_aperture()`
 (`kernel/io-manager/src/io/dvm_display/app_buffer.rs`) requires the physical
 allocator to own no frame of the range (`phys::range_overlaps_boot_usable`) and
 a virtio-pmem PCI function (1af4:105b) to be present. It does not read the

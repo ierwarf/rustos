@@ -611,7 +611,7 @@ fn handle_fork(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
         response.status = (-pid) as i32;
     } else {
         response.result = pid;
-        inherit_signal_policy_after_fork(request.pid, request.tid, pid as u64);
+        inherit_signal_policy_after_fork(request.pid, request.tid, pid as u64, clone_flags);
     }
 }
 
@@ -657,16 +657,35 @@ fn user_pointer_in_range(ptr: u64) -> bool {
 fn valid_process_fork_plan(request: &ProcdIpcRequest) -> bool {
     const CSIGNAL: u64 = 0xff;
     const SIGCHLD: u64 = 17;
+    const CLONE_VM: u64 = 0x0000_0100;
+    const CLONE_VFORK: u64 = 0x0000_4000;
+    const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
     const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
     const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+    const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
 
     let flags = request.arg0;
-    let supported = CSIGNAL | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+    let is_vfork = flags & (CLONE_VM | CLONE_VFORK) != 0;
+    if is_vfork && (flags & (CLONE_VM | CLONE_VFORK)) != (CLONE_VM | CLONE_VFORK) {
+        return false;
+    }
+    let supported = if is_vfork {
+        CSIGNAL
+            | CLONE_VM
+            | CLONE_VFORK
+            | CLONE_CLEAR_SIGHAND
+            | CLONE_PARENT_SETTID
+            | CLONE_CHILD_SETTID
+            | CLONE_CHILD_CLEARTID
+    } else {
+        CSIGNAL | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID
+    };
     let exit_signal = flags & CSIGNAL;
     flags & !supported == 0
         && (exit_signal == 0 || exit_signal == SIGCHLD)
         && (request.arg1 == 0 || user_pointer_in_range(request.arg1))
-        && request.arg2 == 0
+        && ((flags & CLONE_PARENT_SETTID == 0 && request.arg2 == 0)
+            || (flags & CLONE_PARENT_SETTID != 0 && user_pointer_in_range(request.arg2)))
         && request.arg4 == 0
         && (flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) == 0
             || user_pointer_in_range(request.arg3))
@@ -968,13 +987,30 @@ impl ThreadSignalPolicy {
     }
 }
 
-fn inherit_signal_policy_after_fork(parent_pid: u64, parent_tid: u64, child_pid: u64) {
+fn inherit_signal_policy_after_fork(
+    parent_pid: u64,
+    parent_tid: u64,
+    child_pid: u64,
+    clone_flags: u64,
+) {
+    const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
     // A child pid is a fresh identity: it either inherits the parent's state or
     // starts empty. Replace (or drop) any entry left by an earlier owner of the
     // same pid so a missed exit event can never leak its dispositions or mask.
     {
         let mut processes = PROCESS_SIGNAL_POLICY.lock();
-        match processes.get(&parent_pid).copied() {
+        let inherited = processes.get(&parent_pid).copied().map(|mut parent| {
+            if clone_flags & CLONE_CLEAR_SIGHAND != 0 {
+                // CLONE_CLEAR_SIGHAND resets caught handlers; SIG_IGN stays ignored.
+                for action in &mut parent.sigactions {
+                    if action.handler != 1 {
+                        *action = LinuxSigAction::default();
+                    }
+                }
+            }
+            parent
+        });
+        match inherited {
             Some(parent) => {
                 processes.insert(child_pid, parent);
             }
@@ -1005,7 +1041,7 @@ fn reset_signal_policy_after_exec(pid: u64, tid: u64) {
         .unwrap_or(0);
     remove_process_threads(&mut threads, pid);
     threads.insert(
-        (pid, pid),
+        (pid, tid),
         ThreadSignalPolicy {
             signal_mask: mask,
             ..ThreadSignalPolicy::default()
@@ -1114,7 +1150,7 @@ mod tests {
         let (parent, child) = (u64::MAX - 10, u64::MAX - 11);
         PROCESS_SIGNAL_POLICY.lock().insert(child, ProcessSignalPolicy::default());
         THREAD_SIGNAL_POLICY.lock().insert((child, 100), ThreadSignalPolicy::default());
-        inherit_signal_policy_after_fork(parent, parent, child);
+        inherit_signal_policy_after_fork(parent, parent, child, 0);
         assert!(!PROCESS_SIGNAL_POLICY.lock().contains_key(&child));
         assert!(THREAD_SIGNAL_POLICY.lock().keys().all(|(pid, _)| *pid != child));
     }
@@ -1242,5 +1278,94 @@ mod tests {
         assert_eq!(mresp.payload_len, 8);
         assert_eq!(read_u64(&mresp.payload[..8], 0), 0b100);
         assert!(!THREAD_SIGNAL_POLICY.lock().contains_key(&(pid, pid)));
+    }
+
+    #[test]
+    fn valid_process_fork_plan_admits_vfork_with_clear_sighand_and_tids() {
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_VFORK: u64 = 0x0000_4000;
+        const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+        const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+        const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+        const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+        let ptr = LINUX_USER_SPACE_BASE + 0x2000;
+
+        let mut req = ProcdIpcRequest::default();
+        req.arg0 = CLONE_VM
+            | CLONE_VFORK
+            | CLONE_CLEAR_SIGHAND
+            | CLONE_PARENT_SETTID
+            | CLONE_CHILD_SETTID
+            | CLONE_CHILD_CLEARTID
+            | (SIGCHLD as u64);
+        req.arg1 = ptr;
+        req.arg2 = ptr + 8;
+        req.arg3 = ptr + 16;
+        assert!(valid_process_fork_plan(&req));
+
+        // Zero stack/exit signal is valid for vfork().
+        let mut bare_vfork = ProcdIpcRequest::default();
+        bare_vfork.arg0 = CLONE_VM | CLONE_VFORK | (SIGCHLD as u64);
+        assert!(valid_process_fork_plan(&bare_vfork));
+
+        // CLONE_VM without CLONE_VFORK or vice versa must be refused.
+        req.arg0 = CLONE_VM | (SIGCHLD as u64);
+        assert!(!valid_process_fork_plan(&req));
+        req.arg0 = CLONE_VFORK | (SIGCHLD as u64);
+        assert!(!valid_process_fork_plan(&req));
+        // CLONE_PARENT_SETTID requires an in-range pointer.
+        req.arg0 = CLONE_VM | CLONE_VFORK | CLONE_PARENT_SETTID;
+        req.arg2 = 0;
+        assert!(!valid_process_fork_plan(&req));
+    }
+
+    #[test]
+    fn clear_sighand_fork_resets_caught_handlers_but_keeps_sig_ign() {
+        const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+        let (parent, child) = (u64::MAX - 50, u64::MAX - 51);
+        let mut policy = ProcessSignalPolicy::default();
+        policy.sigactions[2] = LinuxSigAction {
+            handler: 0x401000,
+            flags: 0,
+            restorer: 0,
+            mask: 0,
+        };
+        policy.sigactions[13] = LinuxSigAction {
+            handler: 1, // SIG_IGN
+            flags: 0,
+            restorer: 0,
+            mask: 0,
+        };
+        PROCESS_SIGNAL_POLICY.lock().insert(parent, policy);
+        inherit_signal_policy_after_fork(parent, parent, child, CLONE_CLEAR_SIGHAND);
+        let processes = PROCESS_SIGNAL_POLICY.lock();
+        let child_policy = processes.get(&child).expect("child policy");
+        assert_eq!(child_policy.sigactions[2].handler, 0);
+        assert_eq!(child_policy.sigactions[13].handler, 1);
+    }
+
+    #[test]
+    fn reset_signal_policy_after_exec_preserves_mask_on_calling_tid() {
+        let pid = u64::MAX - 60;
+        let tid = pid + 1;
+        {
+            let mut threads = THREAD_SIGNAL_POLICY.lock();
+            threads.insert(
+                (pid, tid),
+                ThreadSignalPolicy {
+                    signal_mask: 0x55,
+                    sigaltstack_sp: 0x8000,
+                    sigaltstack_size: 0x4000,
+                    sigaltstack_flags: 0,
+                },
+            );
+            threads.insert((pid, pid), ThreadSignalPolicy::default());
+        }
+        reset_signal_policy_after_exec(pid, tid);
+        let threads = THREAD_SIGNAL_POLICY.lock();
+        let state = threads.get(&(pid, tid)).expect("exec tid policy");
+        assert_eq!(state.signal_mask, 0x55);
+        assert_eq!(state.sigaltstack_sp, 0);
+        assert!(!threads.contains_key(&(pid, pid)));
     }
 }

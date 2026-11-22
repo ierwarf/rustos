@@ -13,6 +13,7 @@ mod input_completion;
 mod keytrace;
 mod layout;
 mod loop_timing;
+mod pixel_probe;
 mod profile;
 mod render;
 mod runtime_sync;
@@ -304,13 +305,13 @@ fn present_drawable_update(
 
     let gpu_started = Instant::now();
     match state.present_gpu_update(drawable_update.scene_dirty()) {
-        Ok(true) => {
+        Ok(Some(stats)) => {
             let elapsed = gpu_started.elapsed();
-            let pixel_count = u64::from(state.surface.width) * u64::from(state.surface.height);
+            let rect_count = stats.damage_rects.max(1);
             profile::record_present(
                 drawable_update.needs_full_redraw,
-                1,
-                pixel_count,
+                rect_count,
+                stats.damage_pixels,
                 Duration::ZERO,
                 elapsed,
             );
@@ -321,9 +322,9 @@ fn present_drawable_update(
                     Duration::ZERO,
                     elapsed,
                     drawable_update.needs_full_redraw,
-                    None,
-                    1,
-                    pixel_count,
+                    stats.damage_rect,
+                    rect_count,
+                    stats.damage_pixels,
                     0,
                 );
             }
@@ -331,10 +332,10 @@ fn present_drawable_update(
                 deferred_update: VisualUpdate::default(),
             });
         }
-        Ok(false) if !state.gpu_admits_cpu_present() => {
+        Ok(None) if !state.gpu_admits_cpu_present() => {
             return Ok(PresentUpdateResult::Backpressured)
         }
-        Ok(false) => {}
+        Ok(None) => {}
         Err(crate::sys::EAGAIN) => return Ok(PresentUpdateResult::Backpressured),
         Err(err) if state.recover_if_stale_surface_error(err)? => {
             return Ok(PresentUpdateResult::StaleSurface);

@@ -87,7 +87,7 @@ ordered(body(pager_vma, 'rewrite_range'), ['let _rewrite = RangeRewrite::begin(h
 ordered(body(Path('kernel/ps/src/multitask/current/pager.rs').read_text(),
     'published_current_pager_binding'), ['published_current_identity()',
     'identity.user_binding()?', 'owned_current_user_binding()?',
-    'published_live_process_identity(handle)'],
+    'published_mm_vma_target(handle)?'],
     'overlapping current identity publication retains only original Current-bank binding')
 
 # Shared ordinary byte/handle RPC waits refine ArmBlock with the SAME reply

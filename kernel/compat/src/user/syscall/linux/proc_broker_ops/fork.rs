@@ -78,6 +78,235 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
         Some(reservation) => reservation,
         None => return fork_stage_failed(20, LINUX_EAGAIN, 0),
     };
+    let is_vfork = (args.clone_flags & (linux_abi::CLONE_VM | linux_abi::CLONE_VFORK))
+        == (linux_abi::CLONE_VM | linux_abi::CLONE_VFORK);
+    let child_pid = if is_vfork {
+        spawn_vfork_child(&args, &thread_snapshot, spawn_reservation)
+    } else {
+        spawn_cow_fork_child(&args, &thread_snapshot, spawn_reservation)
+    };
+    child_pid
+}
+
+fn spawn_vfork_child(
+    args: &RustosProcForkBrokerArgs,
+    thread_snapshot: &multitask::LinuxThreadSnapshot,
+    spawn_reservation: multitask::SpawnReservation,
+) -> u64 {
+    let clear_sighand = args.clone_flags & linux_abi::CLONE_CLEAR_SIGHAND != 0;
+    let vforked = multitask::with_fork_parent_vfork_state(args.source_pid, |parent, regions| {
+        if args.clone_flags & linux_abi::CLONE_CHILD_SETTID != 0 {
+            let byte_len = core::mem::size_of::<u32>();
+            if !writable_committed_regions_cover(regions, args.ctid_ptr, byte_len) {
+                return Err(crate::memory::paging::AddressSpaceError::ProtectionViolation);
+            }
+            parent
+                .address_space()
+                .validate_user_write_buffer(VirtAddr::new(args.ctid_ptr), byte_len)?;
+        }
+        if args.clone_flags & linux_abi::CLONE_PARENT_SETTID != 0 {
+            let byte_len = core::mem::size_of::<u32>();
+            if !writable_committed_regions_cover(regions, args.ptid_ptr, byte_len) {
+                return Err(crate::memory::paging::AddressSpaceError::ProtectionViolation);
+            }
+            parent
+                .address_space()
+                .validate_user_write_buffer(VirtAddr::new(args.ptid_ptr), byte_len)?;
+        }
+        let vfork_local = parent.fork_clone_vfork_local(clear_sighand, None);
+        let logical_admin = parent.security().is_logical_admin();
+        let linux_process_state = parent.linux_process_state().copied();
+        let linux_memory_map = parent.linux_memory_map().cloned();
+        let linux_runtime_profile = parent.linux_runtime_profile().cloned();
+        parent.begin_fork_handle_pin();
+        Ok::<_, crate::memory::paging::AddressSpaceError>((
+            vfork_local,
+            logical_admin,
+            linux_process_state,
+            linux_memory_map,
+            linux_runtime_profile,
+        ))
+    });
+    let (vfork_local, logical_admin, linux_process_state, linux_memory_map, linux_runtime_profile) =
+        match vforked {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => {
+                let _ = multitask::cancel_process_spawn(spawn_reservation);
+                return fork_stage_failed(1, address_space_error_to_linux_errno(err), err as u64);
+            }
+            Err(error) => {
+                let _ = multitask::cancel_process_spawn(spawn_reservation);
+                return fork_stage_failed(5 + error as i64 as u64, LINUX_ENOMEM, 0);
+            }
+        };
+    let fork_pin = ForkHandlePinGuard::new(args.source_pid);
+    let bootstrap = build_fork_bootstrap(
+        args,
+        thread_snapshot,
+        logical_admin,
+        linux_process_state,
+        linux_memory_map,
+        linux_runtime_profile,
+        vfork_local.exec_path(),
+    );
+    let inherited_service_refs = match acquire_cloned_service_handle_refs_from_table(
+        vfork_local.handles(),
+    ) {
+        Ok(refs) => {
+            drop(fork_pin);
+            refs
+        }
+        Err(errno) => {
+            drop(fork_pin);
+            let _ = multitask::cancel_process_spawn(spawn_reservation);
+            return fork_stage_failed(24, errno, args.source_pid);
+        }
+    };
+    let child_pid = match multitask::spawn_user_process_vfork_suspended_with_parent_reservation(
+        vfork_local,
+        bootstrap,
+        args.source_pid,
+        multitask::DEFAULT_USER_TASK_WEIGHT_MICROS,
+        spawn_reservation,
+    ) {
+        Ok(pid) => pid,
+        Err(err) => {
+            release_service_handle_refs(&inherited_service_refs);
+            let _ = multitask::cancel_process_spawn(spawn_reservation);
+            return fork_stage_failed(
+                23,
+                process_spawn_error_to_linux_errno(err),
+                args.source_pid,
+            );
+        }
+    };
+    if args.clone_flags & linux_abi::CLONE_CHILD_SETTID != 0 {
+        let child_tid = (child_pid as u32).to_le_bytes();
+        let write_result = multitask::with_process_state_by_pid_mut(child_pid, |child| {
+            child
+                .address_space()
+                .copy_into_user(VirtAddr::new(args.ctid_ptr), &child_tid)
+        });
+        match write_result {
+            Some(Ok(())) => {}
+            Some(Err(err)) => {
+                let _ = multitask::terminate_user_task(child_pid);
+                return fork_stage_failed(3, address_space_error_to_linux_errno(err), err as u64);
+            }
+            None => {
+                let _ = multitask::terminate_user_task(child_pid);
+                return fork_stage_failed(21, LINUX_EAGAIN, child_pid);
+            }
+        }
+    }
+    if args.clone_flags & linux_abi::CLONE_PARENT_SETTID != 0 {
+        let child_tid = (child_pid as u32).to_le_bytes();
+        let write_result = multitask::with_process_state_by_pid_mut(args.source_pid, |parent| {
+            parent
+                .address_space()
+                .copy_into_user(VirtAddr::new(args.ptid_ptr), &child_tid)
+        });
+        match write_result {
+            Some(Ok(())) => {}
+            Some(Err(err)) => {
+                let _ = multitask::terminate_user_task(child_pid);
+                return fork_stage_failed(3, address_space_error_to_linux_errno(err), err as u64);
+            }
+            None => {
+                let _ = multitask::terminate_user_task(child_pid);
+                return fork_stage_failed(21, LINUX_EAGAIN, child_pid);
+            }
+        }
+    }
+    offload_ops::record_process_fork(child_pid, args.source_pid);
+    if !multitask::begin_vfork_wait(child_pid, args.source_tid) {
+        offload_ops::record_process_fork_abandoned(child_pid);
+        let _ = multitask::terminate_user_task(child_pid);
+        return fork_stage_failed(22, LINUX_EAGAIN, child_pid);
+    }
+    if !multitask::activate_suspended_user_task(child_pid) {
+        multitask::cancel_vfork_wait(child_pid, args.source_tid);
+        offload_ops::record_process_fork_abandoned(child_pid);
+        let _ = multitask::terminate_user_task(child_pid);
+        return fork_stage_failed(22, LINUX_EAGAIN, child_pid);
+    }
+    multitask::set_next_spawn_pick_hint(child_pid);
+    multitask::request_deferred_reschedule();
+    child_pid
+}
+
+fn acquire_cloned_service_handle_refs_from_table(
+    handles: &multitask::HandleTable,
+) -> Result<Vec<ServiceHandleRef>, i64> {
+    let refs: Vec<ServiceHandleRef> = handles
+        .entries_snapshot(false)
+        .into_iter()
+        .filter_map(|(_, entry)| service_handle_ref_for_handle(entry.handle()))
+        .collect();
+    let mut acquired = Vec::with_capacity(refs.len());
+    for handle_ref in refs {
+        if let Err(errno) = acquire_service_handle_ref(&handle_ref) {
+            release_service_handle_refs(&acquired);
+            return Err(errno);
+        }
+        acquired.push(handle_ref);
+    }
+    Ok(acquired)
+}
+
+fn build_fork_bootstrap(
+    args: &RustosProcForkBrokerArgs,
+    thread_snapshot: &multitask::LinuxThreadSnapshot,
+    logical_admin: bool,
+    linux_process_state: Option<crate::multitask::LinuxProcessState>,
+    linux_memory_map: Option<crate::multitask::LinuxMemoryMapState>,
+    linux_runtime_profile: Option<crate::multitask::LinuxRuntimeProfile>,
+    exec_path: &str,
+) -> multitask::UserTaskBootstrap {
+    let mut child_thread_state = thread_snapshot.thread_state;
+    child_thread_state.clear_child_tid = if args.clone_flags & linux_abi::CLONE_CHILD_CLEARTID != 0
+    {
+        args.ctid_ptr
+    } else {
+        0
+    };
+    child_thread_state.robust_list_head = 0;
+    child_thread_state.robust_list_len = 0;
+    child_thread_state.rseq_area = 0;
+    child_thread_state.rseq_len = 0;
+    child_thread_state.rseq_signature = 0;
+    child_thread_state.pending_signals = 0;
+    child_thread_state.pending_sigchld_events = 0;
+
+    let mut bootstrap = multitask::UserTaskBootstrap::new(
+        crate::user::abi::UserAbi::Linux,
+        VirtAddr::new(args.registers.rip),
+        VirtAddr::new(if args.stack_ptr != 0 {
+            args.stack_ptr
+        } else {
+            args.registers.rsp
+        }),
+    );
+    bootstrap.registers = user_registers_to_task_registers(args.registers);
+    bootstrap.registers.rax = 0;
+    bootstrap.registers.rcx = args.registers.rip;
+    bootstrap.registers.r11 = args.registers.rflags;
+    bootstrap.user_stack = thread_snapshot.user_stack;
+    bootstrap.console_session = thread_snapshot.console_session;
+    bootstrap.logical_admin = logical_admin;
+    bootstrap.linux_process_state = linux_process_state;
+    bootstrap.linux_memory_map = linux_memory_map;
+    bootstrap.linux_runtime_profile = linux_runtime_profile;
+    bootstrap.linux_thread_state = Some(child_thread_state);
+    bootstrap.set_exec_path(exec_path);
+    bootstrap
+}
+
+fn spawn_cow_fork_child(
+    args: &RustosProcForkBrokerArgs,
+    thread_snapshot: &multitask::LinuxThreadSnapshot,
+    spawn_reservation: multitask::SpawnReservation,
+) -> u64 {
     // One mmap-lock-equivalent transaction now covers both authorities the
     // child inherits. The process state lock stabilizes page tables while the
     // VMA writer holds every live publication at an odd sequence; concurrent
@@ -178,42 +407,15 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
             clone_ns,
         );
     }
-    let mut child_thread_state = thread_snapshot.thread_state;
-    child_thread_state.clear_child_tid = if args.clone_flags & linux_abi::CLONE_CHILD_CLEARTID != 0
-    {
-        args.ctid_ptr
-    } else {
-        0
-    };
-    child_thread_state.robust_list_head = 0;
-    child_thread_state.robust_list_len = 0;
-    child_thread_state.rseq_area = 0;
-    child_thread_state.rseq_len = 0;
-    child_thread_state.rseq_signature = 0;
-    child_thread_state.pending_signals = 0;
-    child_thread_state.pending_sigchld_events = 0;
-
-    let mut bootstrap = multitask::UserTaskBootstrap::new(
-        crate::user::abi::UserAbi::Linux,
-        VirtAddr::new(args.registers.rip),
-        VirtAddr::new(if args.stack_ptr != 0 {
-            args.stack_ptr
-        } else {
-            args.registers.rsp
-        }),
+    let bootstrap = build_fork_bootstrap(
+        args,
+        thread_snapshot,
+        child_state.security().is_logical_admin(),
+        child_state.linux_process_state().copied(),
+        child_state.linux_memory_map().cloned(),
+        child_state.linux_runtime_profile().cloned(),
+        child_state.exec_path(),
     );
-    bootstrap.registers = user_registers_to_task_registers(args.registers);
-    bootstrap.registers.rax = 0;
-    bootstrap.registers.rcx = args.registers.rip;
-    bootstrap.registers.r11 = args.registers.rflags;
-    bootstrap.user_stack = thread_snapshot.user_stack;
-    bootstrap.console_session = thread_snapshot.console_session;
-    bootstrap.logical_admin = child_state.security().is_logical_admin();
-    bootstrap.linux_process_state = child_state.linux_process_state().copied();
-    bootstrap.linux_memory_map = child_state.linux_memory_map().cloned();
-    bootstrap.linux_runtime_profile = child_state.linux_runtime_profile().cloned();
-    bootstrap.linux_thread_state = Some(child_thread_state);
-    bootstrap.set_exec_path(child_state.exec_path());
 
     let inherited_service_refs = match acquire_cloned_service_handle_refs(&child_state) {
         Ok(refs) => {
@@ -346,8 +548,24 @@ fn writable_committed_regions_cover(
 }
 
 pub(super) fn valid_process_fork_plan_locally(args: &RustosProcForkBrokerArgs) -> bool {
-    let supported =
-        linux_abi::CSIGNAL | linux_abi::CLONE_CHILD_SETTID | linux_abi::CLONE_CHILD_CLEARTID;
+    let is_vfork = args.clone_flags & (linux_abi::CLONE_VM | linux_abi::CLONE_VFORK) != 0;
+    if is_vfork
+        && (args.clone_flags & (linux_abi::CLONE_VM | linux_abi::CLONE_VFORK))
+            != (linux_abi::CLONE_VM | linux_abi::CLONE_VFORK)
+    {
+        return false;
+    }
+    let supported = if is_vfork {
+        linux_abi::CSIGNAL
+            | linux_abi::CLONE_VM
+            | linux_abi::CLONE_VFORK
+            | linux_abi::CLONE_CLEAR_SIGHAND
+            | linux_abi::CLONE_PARENT_SETTID
+            | linux_abi::CLONE_CHILD_SETTID
+            | linux_abi::CLONE_CHILD_CLEARTID
+    } else {
+        linux_abi::CSIGNAL | linux_abi::CLONE_CHILD_SETTID | linux_abi::CLONE_CHILD_CLEARTID
+    };
     let exit_signal = args.clone_flags & linux_abi::CSIGNAL;
     // The child's initial rip/rsp become `VirtAddr::new` operands, which panics
     // on a non-canonical address. The registers originate from the forking
@@ -361,7 +579,10 @@ pub(super) fn valid_process_fork_plan_locally(args: &RustosProcForkBrokerArgs) -
         && VirtAddr::try_new(child_stack).is_ok()
         && args.clone_flags & !supported == 0
         && (exit_signal == 0 || exit_signal == linux_abi::SIGCHLD)
-        && args.ptid_ptr == 0
+        && ((args.clone_flags & linux_abi::CLONE_PARENT_SETTID == 0 && args.ptid_ptr == 0)
+            || (args.clone_flags & linux_abi::CLONE_PARENT_SETTID != 0
+                && (PROC_BROKER_USER_SPACE_BASE..PROC_BROKER_USER_SPACE_END_EXCLUSIVE)
+                    .contains(&args.ptid_ptr)))
         && args.tls == 0
         && (args.clone_flags & (linux_abi::CLONE_CHILD_SETTID | linux_abi::CLONE_CHILD_CLEARTID)
             == 0
@@ -371,10 +592,33 @@ pub(super) fn valid_process_fork_plan_locally(args: &RustosProcForkBrokerArgs) -
 
 #[cfg(test)]
 mod tests {
-    use super::writable_committed_regions_cover;
+    use super::{RustosProcForkBrokerArgs, valid_process_fork_plan_locally, writable_committed_regions_cover};
+    use super::super::{PROC_BROKER_USER_SPACE_BASE, linux_abi};
     use rustos_user_abi::pager::{
         PagerVmRegionWire, VM_COMMIT_COMMITTED, VM_COMMIT_RESERVED, VM_PROT_READ, VM_PROT_WRITE,
     };
+
+    #[test]
+    fn valid_process_fork_plan_locally_admits_vfork_and_rejects_half_vfork() {
+        let mut args = RustosProcForkBrokerArgs::default();
+        args.registers.rip = PROC_BROKER_USER_SPACE_BASE + 0x1000;
+        args.registers.rsp = PROC_BROKER_USER_SPACE_BASE + 0x4000;
+        args.clone_flags = linux_abi::CLONE_VM
+            | linux_abi::CLONE_VFORK
+            | linux_abi::CLONE_CLEAR_SIGHAND
+            | linux_abi::CLONE_PARENT_SETTID
+            | linux_abi::CLONE_CHILD_SETTID
+            | linux_abi::CLONE_CHILD_CLEARTID
+            | linux_abi::SIGCHLD;
+        args.ptid_ptr = PROC_BROKER_USER_SPACE_BASE + 0x2000;
+        args.ctid_ptr = PROC_BROKER_USER_SPACE_BASE + 0x2008;
+        assert!(valid_process_fork_plan_locally(&args));
+
+        args.clone_flags = linux_abi::CLONE_VM | linux_abi::SIGCHLD;
+        assert!(!valid_process_fork_plan_locally(&args));
+        args.clone_flags = linux_abi::CLONE_VFORK | linux_abi::SIGCHLD;
+        assert!(!valid_process_fork_plan_locally(&args));
+    }
 
     fn region(start: u64, end: u64, prot: u32, commit_state: u16) -> PagerVmRegionWire {
         PagerVmRegionWire {

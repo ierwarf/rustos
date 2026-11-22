@@ -925,7 +925,7 @@ pub fn validate_fault_request(
     let generation = u32::try_from(request.process_generation).map_err(|_| PagerVmaError::Stale)?;
     let handle = ProcessHandle::new(index, generation);
     let identity =
-        super::process_table::live_process_identity(handle).ok_or(PagerVmaError::Stale)?;
+        super::process_table::mm_owner_identity(handle).ok_or(PagerVmaError::Stale)?;
     let region = lookup(handle, identity, request.virtual_address, request.access)?;
     let delta = request
         .virtual_address
@@ -969,10 +969,10 @@ pub fn with_validated_fault_address_space<R>(
     let generation = u32::try_from(request.process_generation).map_err(|_| PagerVmaError::Stale)?;
     let handle = ProcessHandle::new(index, generation);
     let expected =
-        super::process_table::live_process_identity(handle).ok_or(PagerVmaError::Stale)?;
+        super::process_table::mm_owner_identity(handle).ok_or(PagerVmaError::Stale)?;
     let process = super::process_table::retain_process(handle).ok_or(PagerVmaError::Stale)?;
     process
-        .with_exact_visible_state_mut(expected, |process_id, state| {
+        .with_exact_mm_owner_state_mut(expected, |process_id, state| {
             let region = lookup(handle, expected, request.virtual_address, request.access)?;
             let delta = request
                 .virtual_address
@@ -1353,18 +1353,18 @@ pub fn protect_for_process_with_ceiling(
         super::process_table::retain_process_by_pid(process_id).ok_or(PagerVmaError::Stale)?;
     let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
     ExpectedMm::check(expected, identity)?;
+    let (vma_handle, vma_identity) = retained.vma_owner().ok_or(PagerVmaError::Stale)?;
     let page_count = end
         .checked_sub(start)
         .and_then(|bytes| usize::try_from(bytes / PAGER_PAGE_BYTES).ok())
         .ok_or(PagerVmaError::Malformed)?;
-    let process = retained
-        .handle()
+    let process = vma_handle
         .object_identity()
         .ok_or(PagerVmaError::Stale)?;
     let rewritten = retained.with_state_mut(|_, state| {
         rewrite_attenuated_range_with_ceiling(
-            retained.handle(),
-            identity,
+            vma_handle,
+            vma_identity,
             start,
             end,
             Some(prot),
@@ -1492,8 +1492,8 @@ fn unmap_for_process_inner_with_ceiling(
         super::process_table::retain_process_by_pid(process_id).ok_or(PagerVmaError::Stale)?;
     let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
     ExpectedMm::check(expected, identity)?;
-    let process = retained
-        .handle()
+    let (vma_handle, vma_identity) = retained.vma_owner().ok_or(PagerVmaError::Stale)?;
+    let process = vma_handle
         .object_identity()
         .ok_or(PagerVmaError::Stale)?;
     let unmapped = retained.with_state_mut(|_, state| {
@@ -1502,17 +1502,19 @@ fn unmap_for_process_inner_with_ceiling(
         // take the lower-ranked process table from this leaf on a miss.
         if super::process_table::published_live_process_identity(retained.handle())
             != Some(identity)
+            || super::process_table::published_mm_owner_identity(vma_handle)
+                != Some(vma_identity)
         {
             return Err(PagerVmaError::Unstable);
         }
         let mut mutate = Some(mutate);
         let rewritten = match ceiling {
-            None => rewrite_attenuated_range(retained.handle(), identity, start, end, None, || {
+            None => rewrite_attenuated_range(vma_handle, vma_identity, start, end, None, || {
                 mutate.take().expect("unmap mutation consumed once")(state)
             })?,
             Some(ceiling) => rewrite_attenuated_range_with_ceiling(
-                retained.handle(),
-                identity,
+                vma_handle,
+                vma_identity,
                 start,
                 end,
                 None,
@@ -1547,19 +1549,19 @@ pub fn set_commit_state_for_process(
 ) -> Result<Option<(u64, u64)>, PagerVmaError> {
     let retained =
         super::process_table::retain_process_by_pid(process_id).ok_or(PagerVmaError::Stale)?;
-    let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
+    let _identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
+    let (vma_handle, vma_identity) = retained.vma_owner().ok_or(PagerVmaError::Stale)?;
     let page_count = end
         .checked_sub(start)
         .and_then(|bytes| usize::try_from(bytes / PAGER_PAGE_BYTES).ok())
         .ok_or(PagerVmaError::Malformed)?;
-    let process = retained
-        .handle()
+    let process = vma_handle
         .object_identity()
         .ok_or(PagerVmaError::Stale)?;
     let rewritten = retained.with_state_mut(|_, state| {
         rewrite_range(
-            retained.handle(),
-            identity,
+            vma_handle,
+            vma_identity,
             start,
             end,
             None,
@@ -1637,16 +1639,19 @@ pub fn move_for_process_with_ceiling(
         super::process_table::retain_process_by_pid(process_id).ok_or(PagerVmaError::Stale)?;
     let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
     ExpectedMm::check(expected, identity)?;
+    let (vma_handle, vma_identity) = retained.vma_owner().ok_or(PagerVmaError::Stale)?;
     retained.with_state_mut(|_, state| {
         if super::process_table::published_live_process_identity(retained.handle())
             != Some(identity)
+            || super::process_table::published_mm_owner_identity(vma_handle)
+                != Some(vma_identity)
         {
             return Err(PagerVmaError::Unstable);
         }
         let mut mutate = Some(mutate);
         relocate_range_with(
-            retained.handle(),
-            identity,
+            vma_handle,
+            vma_identity,
             old_start,
             old_end,
             new_start,
@@ -1935,15 +1940,15 @@ pub fn first_mapping_conflict(
         .ok_or(PagerVmaError::Stale)?;
     let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
     ExpectedMm::check(expected, identity)?;
-    let handle = retained.handle();
-    let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
+    let (vma_handle, vma_identity) = retained.vma_owner().ok_or(PagerVmaError::Stale)?;
+    let process = vma_handle.object_identity().ok_or(PagerVmaError::Stale)?;
     retained.with_exact_visible_state_mut(identity, |_, state| {
-        let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
+        let _writer = writer_lock(vma_handle).ok_or(PagerVmaError::Stale)?.lock();
         let mut first: Option<(u64, u64)> = None;
-        for slot in process_slots(handle).ok_or(PagerVmaError::Stale)?.iter() {
+        for slot in process_slots(vma_handle).ok_or(PagerVmaError::Stale)?.iter() {
             let Some(region) = slot.snapshot()? else { continue; };
             if region.start < end && start < region.end
-                && region_matches_identity(region, process.slot(), identity)
+                && region_matches_identity(region, process.slot(), vma_identity)
                 && first.is_none_or(|old| region.start < old.0)
             {
                 first = Some((region.start, region.end));

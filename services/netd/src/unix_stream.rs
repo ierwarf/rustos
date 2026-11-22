@@ -2,6 +2,8 @@
 
 use super::*;
 
+use rustos_user_abi::syscall::{netd_message, NETD_IPC_PAYLOAD_CAPACITY};
+
 pub(super) fn handle_send(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
     let mut state = lock_net_state();
     if let Some(inet) = state.inet_sockets.get(&request.socket_token) {
@@ -28,6 +30,31 @@ pub(super) fn handle_send(request: &NetdIpcRequest, response: &mut NetdIpcRespon
         }
         let len = request.payload_len as usize;
         return handle_inet_send_in_state(&mut state, request, &request.payload[..len], response);
+    }
+    if state
+        .sockets
+        .get(&request.socket_token)
+        .is_some_and(|socket| socket.kind == UnixSocketKind::Dgram)
+    {
+        return match dgram_send_in_state(&mut state, request, response, None) {
+            Ok(()) => 0,
+            Err(DgramSendOutcome::Errno(errno)) => errno,
+            Err(DgramSendOutcome::NeedStat(path)) => {
+                drop(state);
+                let node = match path_namespace::with_production_namespace(|ns| {
+                    ns.stat_socket_node(request.pid, &path, request.euid, request.egid, true)
+                }) {
+                    Ok(node) => node,
+                    Err(errno) => return errno,
+                };
+                let mut state = lock_net_state();
+                match dgram_send_in_state(&mut state, request, response, Some(node)) {
+                    Ok(()) => 0,
+                    Err(DgramSendOutcome::Errno(errno)) => errno,
+                    Err(DgramSendOutcome::NeedStat(_)) => libc::EINVAL,
+                }
+            }
+        };
     }
     if request.op == SYSCALL_OFFLOAD_OP_LINUX_SENDMSG {
         let (data, control) = match split_sendmsg_payload(request) {
@@ -96,12 +123,15 @@ pub(super) fn handle_recv(request: &NetdIpcRequest, response: &mut NetdIpcRespon
         }
         return handle_inet_recv_in_state(&mut state, request, response);
     }
-    if request.op == SYSCALL_OFFLOAD_OP_LINUX_RECVMSG {
-        return recvmsg_in_state(&mut state, request, response);
-    }
     let kind = state.sockets.get(&request.socket_token).map(|socket| socket.kind);
     if kind == Some(UnixSocketKind::Netlink) {
         return netlink::handle_recv(&mut state, request, response);
+    }
+    if kind == Some(UnixSocketKind::Dgram) {
+        return dgram_recv_in_state(&mut state, request, response);
+    }
+    if request.op == SYSCALL_OFFLOAD_OP_LINUX_RECVMSG {
+        return recvmsg_in_state(&mut state, request, response);
     }
     let seqpacket = kind == Some(UnixSocketKind::SeqPacket);
     let flags = request_msg_flags(request);
@@ -368,6 +398,7 @@ pub(super) fn send_socket_message_in_state(
             bytes: bytes[..write_len].iter().copied().collect(),
             control: control.to_vec(),
             sender,
+            sender_path: None,
         }),
     }
     state.set_unix_queued_bytes(state.unix_queued_bytes + write_len + control_charge);
@@ -702,4 +733,349 @@ pub(super) fn write_plain_old_data<T: Copy>(dest: &mut [u8], value: &T) {
 pub(super) fn cmsg_align(len: usize) -> usize {
     let align = size_of::<usize>();
     (len + align - 1) & !(align - 1)
+}
+
+pub(super) enum DgramSendOutcome {
+    Errno(i32),
+    NeedStat(String),
+}
+
+pub(super) fn decode_unix_address_bytes(bytes: &[u8]) -> Result<UnixAddress, i32> {
+    if bytes.len() < size_of::<u16>() {
+        return Err(libc::EINVAL);
+    }
+    let family = u16::from_ne_bytes([bytes[0], bytes[1]]) as u64;
+    if family != linux_abi::AF_UNIX {
+        return Err(libc::EAFNOSUPPORT);
+    }
+    let path_bytes = &bytes[size_of::<u16>()..];
+    if path_bytes.is_empty() || path_bytes.len() > linux_abi::UNIX_PATH_MAX {
+        return Err(libc::EINVAL);
+    }
+    if path_bytes[0] == 0 {
+        return Ok(UnixAddress::Abstract(path_bytes.to_vec()));
+    }
+    let end = path_bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(path_bytes.len());
+    if end == 0 {
+        return Err(libc::EINVAL);
+    }
+    String::from_utf8(path_bytes[..end].to_vec())
+        .map(UnixAddress::Filesystem)
+        .map_err(|_| libc::EINVAL)
+}
+
+pub(super) fn encode_unix_address_bytes(
+    address: Option<&UnixAddress>,
+    out: &mut [u8; netd_message::MAX_UNIX_ADDRESS_SIZE],
+) -> usize {
+    let Some(address) = address else {
+        return 0;
+    };
+    out[..2].copy_from_slice(&(linux_abi::AF_UNIX as u16).to_ne_bytes());
+    match address {
+        UnixAddress::Filesystem(path) => {
+            if path.len() > linux_abi::UNIX_PATH_MAX {
+                return 0;
+            }
+            let needed =
+                size_of::<u16>() + path.len() + usize::from(path.len() < linux_abi::UNIX_PATH_MAX);
+            out[2..2 + path.len()].copy_from_slice(path.as_bytes());
+            if path.len() < linux_abi::UNIX_PATH_MAX {
+                out[2 + path.len()] = 0;
+            }
+            needed
+        }
+        UnixAddress::Abstract(bytes) => {
+            if bytes.is_empty() || bytes.len() > linux_abi::UNIX_PATH_MAX {
+                return 0;
+            }
+            out[2..2 + bytes.len()].copy_from_slice(bytes);
+            size_of::<u16>() + bytes.len()
+        }
+    }
+}
+
+pub(super) fn dgram_send_in_state(
+    state: &mut NetState,
+    request: &NetdIpcRequest,
+    response: &mut NetdIpcResponse,
+    resolved_node: Option<path_namespace::NodeState>,
+) -> Result<(), DgramSendOutcome> {
+    let flags = request_msg_flags(request);
+    if flags & !((libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u64) != 0 {
+        return Err(DgramSendOutcome::Errno(libc::EOPNOTSUPP));
+    }
+    let payload_len = request.payload_len as usize;
+    let Some(message) = request
+        .payload
+        .get(..payload_len)
+        .and_then(netd_message::decode)
+    else {
+        return Err(DgramSendOutcome::Errno(libc::EINVAL));
+    };
+    if message.flags != 0 {
+        return Err(DgramSendOutcome::Errno(libc::EOPNOTSUPP));
+    }
+    validate_sendmsg_control(message.control).map_err(DgramSendOutcome::Errno)?;
+    let sender = request_credentials(request);
+    validate_sendmsg_credentials(message.control, sender).map_err(DgramSendOutcome::Errno)?;
+    if message.data.len() > UNIX_DGRAM_DEFAULT_BUFFER
+        || message.control.len() > SOCKET_CONTROL_BUFFER_CAPACITY
+    {
+        return Err(DgramSendOutcome::Errno(libc::EMSGSIZE));
+    }
+    let (sender_local_path, connected_peer, send_closed, peer_closed) = {
+        let Some(socket) = state.sockets.get(&request.socket_token) else {
+            return Err(DgramSendOutcome::Errno(libc::EBADF));
+        };
+        let UnixSocketState::Dgram(dgram) = &socket.state else {
+            return Err(DgramSendOutcome::Errno(libc::EINVAL));
+        };
+        (
+            socket.local_path.clone(),
+            dgram.peer,
+            dgram.send_closed,
+            dgram.peer_closed,
+        )
+    };
+    if send_closed {
+        return Err(DgramSendOutcome::Errno(libc::EPIPE));
+    }
+    let target_token = if message.address.is_empty() {
+        if peer_closed {
+            return Err(DgramSendOutcome::Errno(libc::ECONNREFUSED));
+        }
+        connected_peer.ok_or(DgramSendOutcome::Errno(libc::ENOTCONN))?
+    } else {
+        let addr = decode_unix_address_bytes(message.address).map_err(DgramSendOutcome::Errno)?;
+        match &addr {
+            UnixAddress::Filesystem(path) => {
+                let node = match resolved_node {
+                    Some(node) => node,
+                    None => return Err(DgramSendOutcome::NeedStat(path.clone())),
+                };
+                match node {
+                    path_namespace::NodeState::Absent => {
+                        return Err(DgramSendOutcome::Errno(libc::ENOENT))
+                    }
+                    path_namespace::NodeState::NotSocket => {
+                        return Err(DgramSendOutcome::Errno(libc::ECONNREFUSED))
+                    }
+                    path_namespace::NodeState::Socket(id) => state
+                        .inode_bindings
+                        .get(&(id.mount, id.node))
+                        .copied()
+                        .ok_or(DgramSendOutcome::Errno(libc::ECONNREFUSED))?,
+                    path_namespace::NodeState::Unmanaged => state
+                        .bindings
+                        .get(&addr)
+                        .copied()
+                        .ok_or(DgramSendOutcome::Errno(libc::ENOENT))?,
+                }
+            }
+            UnixAddress::Abstract(_) => state
+                .bindings
+                .get(&addr)
+                .copied()
+                .ok_or(DgramSendOutcome::Errno(libc::ECONNREFUSED))?,
+        }
+    };
+    let control_charge = cmsg_align(message.control.len());
+    let global_room = UNIX_QUEUED_BYTE_CAPACITY
+        .saturating_sub(state.unix_queued_bytes)
+        .saturating_sub(control_charge);
+    let peer_socket = state
+        .sockets
+        .get_mut(&target_token)
+        .ok_or(DgramSendOutcome::Errno(libc::ECONNREFUSED))?;
+    if peer_socket.kind != UnixSocketKind::Dgram {
+        return Err(DgramSendOutcome::Errno(libc::EPROTOTYPE));
+    }
+    let peer_limit = (peer_socket.options.recv_buffer as usize).min(SOCKET_BUFFER_CAPACITY);
+    let UnixSocketState::Dgram(target_dgram) = &mut peer_socket.state else {
+        return Err(DgramSendOutcome::Errno(libc::EPROTOTYPE));
+    };
+    if target_dgram.recv_closed {
+        return Err(DgramSendOutcome::Errno(libc::EPIPE));
+    }
+    if message.data.len() > peer_limit {
+        // Can never fit even in an empty queue: refuse instead of parking
+        // a blocking sender until its deadline.
+        return Err(DgramSendOutcome::Errno(libc::EMSGSIZE));
+    }
+    let room = peer_limit
+        .saturating_sub(target_dgram.incoming_bytes)
+        .min(global_room);
+    if room < message.data.len()
+        || target_dgram.incoming.len() >= UNIX_DGRAM_MAX_QUEUED_MESSAGES
+        || (control_charge != 0
+            && target_dgram
+                .incoming_control_bytes
+                .saturating_add(control_charge)
+                > SOCKET_CONTROL_BUFFER_CAPACITY)
+    {
+        return Err(DgramSendOutcome::Errno(libc::EAGAIN));
+    }
+    target_dgram.incoming_bytes += message.data.len();
+    if control_charge != 0 {
+        target_dgram.incoming_control_bytes = target_dgram
+            .incoming_control_bytes
+            .saturating_add(control_charge);
+    }
+    target_dgram.incoming.push_back(UnixStreamSegment {
+        bytes: message.data.iter().copied().collect(),
+        control: message.control.to_vec(),
+        sender,
+        sender_path: sender_local_path,
+    });
+    state.set_unix_queued_bytes(state.unix_queued_bytes + message.data.len() + control_charge);
+    response.value = message.data.len() as u64;
+    Ok(())
+}
+
+pub(super) fn dgram_recv_in_state(
+    state: &mut NetState,
+    request: &NetdIpcRequest,
+    response: &mut NetdIpcResponse,
+) -> i32 {
+    let flags = request_msg_flags(request);
+    if flags
+        & !((libc::MSG_DONTWAIT
+            | libc::MSG_PEEK
+            | libc::MSG_TRUNC
+            | libc::MSG_CMSG_CLOEXEC) as u64)
+        != 0
+    {
+        return libc::EOPNOTSUPP;
+    }
+    let recvmsg = request.op == SYSCALL_OFFLOAD_OP_LINUX_RECVMSG;
+    let requested = if recvmsg {
+        request.payload_len as usize
+    } else {
+        usize::try_from(request.arg2).unwrap_or(usize::MAX)
+    };
+    let peek = flags & libc::MSG_PEEK as u64 != 0;
+    let mut addr_buf = [0_u8; netd_message::MAX_UNIX_ADDRESS_SIZE];
+    let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
+        return libc::EBADF;
+    };
+    let passcred = socket.options.passcred;
+    let UnixSocketState::Dgram(dgram) = &mut socket.state else {
+        return libc::EINVAL;
+    };
+    let Some(front) = dgram.incoming.front() else {
+        if dgram.recv_closed {
+            let Some(len) = netd_message::encode(&mut response.payload, &[], &[], 0, &[]) else {
+                return libc::EMSGSIZE;
+            };
+            response.payload_len = len as u32;
+            response.value = 0;
+            response.reserved0 = 0;
+            return 0;
+        }
+        return libc::EAGAIN;
+    };
+    let addr_len = encode_unix_address_bytes(front.sender_path.as_ref(), &mut addr_buf);
+    let addr = &addr_buf[..addr_len];
+    let total = front.bytes.len();
+    if peek {
+        let room = NETD_IPC_PAYLOAD_CAPACITY
+            .saturating_sub(netd_message::HEADER_SIZE)
+            .saturating_sub(addr.len());
+        let limit = requested.min(room);
+        let copied = total.min(limit);
+        let (first, second) = front.bytes.as_slices();
+        let mut msg_bytes = Vec::with_capacity(copied);
+        let first_len = copied.min(first.len());
+        msg_bytes.extend_from_slice(&first[..first_len]);
+        msg_bytes.extend_from_slice(&second[..copied - first_len]);
+        let mut out_flags = 0_u32;
+        if copied < total {
+            out_flags |= libc::MSG_TRUNC as u32;
+        }
+        if recvmsg && (!front.control.is_empty() || passcred) {
+            out_flags |= libc::MSG_CTRUNC as u32;
+        }
+        let Some(len) =
+            netd_message::encode(&mut response.payload, &msg_bytes, &[], out_flags, addr)
+        else {
+            return libc::EMSGSIZE;
+        };
+        response.payload_len = len as u32;
+        response.reserved0 = 0;
+        response.value = if flags & libc::MSG_TRUNC as u64 != 0 {
+            total as u64
+        } else {
+            copied as u64
+        };
+        return 0;
+    }
+    let creds_len = if recvmsg && passcred && !control_carries_credentials(&front.control) {
+        cmsg_align(size_of::<linux_abi::LinuxCmsghdr>() + size_of::<linux_abi::LinuxUCred>())
+    } else {
+        0
+    };
+    let control_reserve = if recvmsg {
+        cmsg_align(front.control.len()) + creds_len
+    } else {
+        front.control.len()
+    };
+    let Some(available) = NETD_IPC_PAYLOAD_CAPACITY
+        .checked_sub(netd_message::HEADER_SIZE)
+        .and_then(|r| r.checked_sub(addr.len()))
+        .and_then(|r| r.checked_sub(control_reserve))
+    else {
+        return libc::EMSGSIZE;
+    };
+    let limit = requested.min(available);
+    let mut segment = dgram.incoming.pop_front().expect("checked front");
+    let control_charge = cmsg_align(segment.control.len());
+    dgram.incoming_bytes = dgram.incoming_bytes.saturating_sub(total);
+    dgram.incoming_control_bytes = dgram.incoming_control_bytes.saturating_sub(control_charge);
+    dgram.recv_drain_handoff_armed = true;
+    let copied = total.min(limit);
+    let mut msg_bytes = vec![0_u8; copied];
+    {
+        let (first, second) = segment.bytes.as_slices();
+        let first_len = copied.min(first.len());
+        msg_bytes[..first_len].copy_from_slice(&first[..first_len]);
+        msg_bytes[first_len..].copy_from_slice(&second[..copied - first_len]);
+    }
+    let out_flags = if copied < total {
+        libc::MSG_TRUNC as u32
+    } else {
+        0
+    };
+    let raw_control = core::mem::take(&mut segment.control);
+    let (msg_control, discarded) = if recvmsg {
+        let creds = passcred.then_some(segment.sender);
+        (append_recvmsg_credentials(creds, raw_control), Vec::new())
+    } else {
+        (Vec::new(), raw_control)
+    };
+    let Some(msg_len) = netd_message::encode(
+        &mut response.payload,
+        &msg_bytes,
+        &msg_control,
+        out_flags,
+        addr,
+    ) else {
+        return libc::EMSGSIZE;
+    };
+    response.payload[msg_len..msg_len + discarded.len()].copy_from_slice(&discarded);
+    response.payload_len = (msg_len + discarded.len()) as u32;
+    response.reserved0 = discarded.len() as u32;
+    if !msg_control.is_empty() {
+        response.reserved1 |= NETD_IPC_RESPONSE_FLAG_RECORD_PRESENT;
+    }
+    response.value = if flags & libc::MSG_TRUNC as u64 != 0 {
+        total as u64
+    } else {
+        copied as u64
+    };
+    state.release_unix_queued_bytes(total + control_charge);
+    0
 }

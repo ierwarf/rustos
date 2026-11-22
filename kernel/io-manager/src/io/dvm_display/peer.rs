@@ -457,7 +457,10 @@ pub(crate) fn scanout_region_contains(addr: u64, size: u64) -> bool {
     // whatever the pool handshake has published so far. Provenance is a
     // property of the memory, so it must not depend on how much of the
     // transport happens to be installed when a provider registers.
-    let region_start = crate::memory::higher_half_addr(GUI_DVM_PIXEL_REGION_PHYS_ADDR);
+    let Some(region_phys) = gui_dvm_pixel_region_phys_addr() else {
+        return false;
+    };
+    let region_start = crate::memory::higher_half_addr(region_phys);
     if size == 0 {
         return false;
     }

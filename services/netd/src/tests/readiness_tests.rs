@@ -160,7 +160,7 @@ fn a_stack_advance_stamps_every_inet_socket_it_changed_and_only_those() {
 fn retiring_an_inet_socket_during_a_stack_advance_publishes_its_final_close() {
     let mut state = bench_state(4, 0);
     let transport = state.inet_sockets.remove(&1001).unwrap().transport;
-    state.inet.as_mut().unwrap().remove(transport);
+    state.inet.as_mut().unwrap().remove(transport, false);
     state.inet.as_mut().unwrap().readiness_dirty = true;
     state.record_readiness_changes();
     assert_eq!(state.readiness_publications.len(), 1);
@@ -185,10 +185,7 @@ fn unix_and_inet_changes_in_one_transaction_publish_in_token_order() {
 }
 
 fn bench_state(inet: usize, unix_pairs: u64) -> NetState {
-    let mut device = BrokerDevice {
-        rx: [0; NET_BROKER_PACKET_MTU],
-        errors: inet_datagram::ErrorIngress::default(),
-    };
+    let mut device = BrokerDevice::default();
     let config = SmolConfig::new(HardwareAddress::Ethernet(QEMU_USERNET_MAC));
     let mut iface = Interface::new(config, &mut device, SmolInstant::from_millis(0));
     iface.update_ip_addrs(|a| {
@@ -220,14 +217,18 @@ fn bench_state(inet: usize, unix_pairs: u64) -> NetState {
         state.inet_sockets.insert(
             1000 + i,
             InetSocket {
+                domain: linux_abi::AF_INET,
                 refs: 1,
                 options: SocketOptions::default(),
                 transport,
+                tcp_listener: None,
                 local: None,
                 peer: None,
                 received: None,
                 errors: None,
                 connect_deadline: None,
+                connect_started: None,
+                connect_budget: None,
             },
         );
     }

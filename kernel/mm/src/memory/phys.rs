@@ -976,6 +976,18 @@ pub fn range_overlaps_boot_usable(phys_start: u64, byte_len: u64) -> bool {
     })
 }
 
+/// End of the highest boot-usable RAM frame, `None` before the allocator is
+/// initialised. Device apertures that a hypervisor places after guest RAM derive
+/// their base from this.
+pub fn boot_ram_top() -> Option<u64> {
+    irq_safe(|| {
+        let state = PHYS_POOL.state.lock();
+        state
+            .initialized
+            .then(|| state.geo.frame_count as u64 * PAGE_SIZE)
+    })
+}
+
 fn range_overlaps_boot_usable_locked(state: &PhysAllocatorState, phys_start: u64, byte_len: u64) -> bool {
     // Fail closed: an uninitialised allocator or malformed range claims overlap.
     if !state.initialized

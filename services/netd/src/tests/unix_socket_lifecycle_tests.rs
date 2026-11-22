@@ -7,6 +7,7 @@ fn connected_socket(peer: u64, pending_listener: Option<u64>) -> UnixSocket {
         refs: 1,
         options: SocketOptions::default(),
         bound_path: None,
+        bound_inode: None,
         local_path: None,
         peer_path: None,
         state: UnixSocketState::Connected(ConnectedState {
@@ -84,6 +85,7 @@ fn enqueue(state: &mut NetState, token: u64, bytes: &[u8], control: &[u8]) {
         bytes: bytes.iter().copied().collect(),
         control: control.to_vec(),
         sender: QUEUED_SENDER,
+        sender_path: None,
     });
 }
 

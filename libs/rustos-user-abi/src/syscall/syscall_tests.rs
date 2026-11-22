@@ -661,7 +661,7 @@ fn prepared_unix_publication_requires_exact_operation_tokens_and_channel() {
 }
 
 #[test]
-fn unix_socket_shape_admits_only_stream_and_seqpacket() {
+fn unix_socket_shape_admits_only_stream_dgram_and_seqpacket() {
     use super::{
         NET_BROKER_PUBLICATION_SOCK_SEQPACKET, SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
         SYSCALL_OFFLOAD_OP_LINUX_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
@@ -669,15 +669,16 @@ fn unix_socket_shape_admits_only_stream_and_seqpacket() {
     };
     let flags = NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS;
     assert!(unix(1, NET_BROKER_PUBLICATION_SOCK_STREAM, 0));
+    assert!(unix(1, 2 | flags, 0));
     assert!(unix(1, NET_BROKER_PUBLICATION_SOCK_SEQPACKET | flags, 0));
-    // DGRAM (2), RAW (3), RDM (4), DCCP (6), PACKET (10) are not published.
-    for ty in [0, 2, 3, 4, 6, 10, 15] {
+    // RAW (3), RDM (4), DCCP (6), PACKET (10) are not published.
+    for ty in [0, 3, 4, 6, 10, 15] {
         assert!(!unix(1, ty, 0), "type {ty}");
     }
     assert!(!unix(1, NET_BROKER_PUBLICATION_SOCK_SEQPACKET, 1), "protocol must be 0");
     assert!(!unix(1, NET_BROKER_PUBLICATION_SOCK_SEQPACKET | 1 << 30, 0), "unknown flag");
     assert!(!unix(2, NET_BROKER_PUBLICATION_SOCK_SEQPACKET, 0), "wrong domain");
-    // A seqpacket socket, socketpair and accept all publish; the kernel reads
+    // A seqpacket socket, dgram socket, socketpair and accept all publish; the kernel reads
     // the type from the publication, so it must survive every operation.
     let base = NetBrokerPrepareSocketPublication {
         version: NET_BROKER_SOCKET_PUBLICATION_VERSION,
@@ -705,9 +706,9 @@ fn unix_socket_shape_admits_only_stream_and_seqpacket() {
         },
     ] {
         assert!(net_broker_socket_publication_shape_valid(&publication));
-        let mut dgram = publication;
-        dgram.socket_type = 2;
-        assert!(!net_broker_socket_publication_shape_valid(&dgram));
+        let mut raw = publication;
+        raw.socket_type = 3;
+        assert!(!net_broker_socket_publication_shape_valid(&raw));
     }
 }
 

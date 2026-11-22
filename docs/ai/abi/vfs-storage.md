@@ -830,26 +830,62 @@ the read-only accelerator; TmpFs has it (next section).
   but does not print a per-input-pulse line while a pointer moves. Input state
   remains in the service-owned queue and its readiness generation; eliminating
   that debug-console work cannot alter delivery, wake, or compositor policy.
-- Storaged may satisfy repeated FAT metadata and executable reads from at
-  most forty validated 64-KiB read-ahead windows (2.5 MiB total), but it first
-  revalidates live DVM geometry and the exact caller generation on every
-  request. A hit is assembled from one or more contiguous exact-generation
-  windows (bulk requests are 63488 B and never align to a 64-KiB window). A
-  partial hit reads only the uncovered tail. A first or noncontiguous miss
-  submits one forward window. A miss whose first uncovered block equals the
-  exact preceding read-ahead end may submit up to sixteen contiguous forward
-  windows (1 MiB), each no larger than one fixed DVM slot, before waiting for
-  the first completion; the 64-entry transport queue overlaps device latency
-  for proven sequential demand. A refused speculative submit is dropped once
-  the demanded range is covered; a refused demanded submit cancels every
-  issued ticket. No window is published to the cache until the complete batch
-  succeeds; completion failure cancels the remaining tickets and clears the
-  cache epoch.
-  overlapping replacements cannot coexist, a different generation atomically
-  replaces the complete cache epoch, and every write clears all windows before
-  submission. Transport-info failure also clears them. Cached bytes therefore
-  cannot survive revoke, restart, or mutation, and the optimization adds no
-  controller authority or hidden fallback to vfsd.
+- Storaged serves reads through one read engine (`services/storaged/src/read_engine.rs`).
+  The device is cached and fetched in aligned 64-KiB windows (the size of one
+  fixed DVM slot; the last window is short at the device end). A window is
+  `Ready`, `InFlight` (one DVM ticket) or `Failed`, and is requested from the
+  transport at most once, so concurrent readers of one range share a single
+  fetch. At most 192 windows (12 MiB) are cached or in flight and at most 48
+  tickets are outstanding, leaving transport slots for writes and flushes; a
+  window a stream has fully consumed is evicted first. Every read still
+  revalidates live DVM geometry and the exact caller generation, and a cached
+  window never outlives a quarantine, revoke, restart or generation change.
+  - Streams: a read that starts at most two windows past, or four windows
+    before, the previous read's last window continues that stream (the
+    backward slack absorbs parallel readers whose adjacent chunks arrive out of
+    order). From the second sequential read the stream reads ahead; its depth
+    starts at four windows and doubles per sequential read up to forty (2.5 MiB, so
+    read-ahead keeps running while vfsd hashes and writes), as in Linux
+    readahead ramp-up. Up to eight streams are tracked independently.
+    Random reads create a stream but never read ahead. Read-ahead is refilled
+    after the reply has been sent, so its submit syscalls overlap the
+    requester's own work.
+  - Completion: one pump thread (`storaged-read-pump`) collects completed
+    tickets outside the engine lock and wakes the waiting readers; readers never
+    wait on the transport themselves. If the pump cannot start, storaged exits
+    rather than let every read time out. A ticket older than the 15-second
+    deadline quarantines the generation, is cancelled and its window dropped.
+  - Concurrency: storaged serves its endpoint from four receive threads, each
+    with its own bulk reply slot, so several vfsd lanes are in flight at once.
+  - Invalidation: every write first drops overlapping cached windows and flags
+    overlapping in-flight windows stale; a stale window is collected and
+    discarded, never cached, so bytes read before a write cannot repopulate the
+    cache after it. A transport error fails only the waiting reader and is not
+    cached. Cached bytes therefore cannot survive revoke, restart, or mutation,
+    and the optimization adds no controller authority or hidden fallback to
+    vfsd.
+- Vfsd reads a large range (at least 2 MiB; the executable snapshot transfer uses
+  its own 4-MiB window, `SNAPSHOT_WINDOW_BYTES`, so it qualifies, while loaderd
+  and the early-system broker keep the shared 256-KiB window)
+  through `services/vfsd/src/bulk_lanes.rs`: the calling snapshot worker and up
+  to three helper threads claim chunk indexes from one cursor and each issue
+  one bulk storaged call per chunk, so adjacent chunks are read concurrently.
+  A lane is never the VFS receive owner and uses only storaged IPC and
+  kernel-direct futexes, so it cannot wait on syscalld. One job runs at a time;
+  a second concurrent large read, a smaller read, or an unavailable pool reads
+  on its own thread. The caller does not return before every claimed chunk
+  completed (including after an error), the first error aborts unclaimed
+  chunks, and each chunk's echoed header, generation, LBA, block count and
+  length are validated exactly as for a single bulk call. When a read starts
+  where the previous one ended, the helpers then read the next range of the same
+  size into a private 4-MiB buffer while the caller hashes or writes what it
+  received; the next read adopts that job, helps finish it and copies the bytes
+  out. A different range or generation, a prefetch error, or any vfsd block
+  write (`invalidate_prefetch`, before and after the write) discards the
+  lookahead and reads normally, so it can change latency but never the bytes or
+  the error a caller sees. Measured over four interleaved boots per arm, the
+  306 MB Chrome snapshot's read+write+hash took 0.77 s with lookahead and 0.86 s
+  without.
 - The storage-DVM relay (`rustos-dvm-block.c`) executes ring requests strictly
   one at a time, so a sequential stream is bounded by the guest block layer's
   per-command latency unless the page cache can overlap commands (measured:
@@ -863,13 +899,27 @@ the read-only accelerator; TmpFs has it (next section).
   first record that is not a well-formed read of the current generation, and
   request admission, ordering, durability, FUA/flush and completion publication
   are unchanged. Failure of either hint is reported once and ignored.
+- The relay's worker and supervisor keep the strict watchdog protocol: only the
+  supervisor publishes cursors and completions, each request has its own
+  deadline that starts at its `begin` event, and a stopped worker cannot publish
+  after quarantine. Inside one batch the worker does not wait for the
+  supervisor between requests: a completion with more requests queued
+  (`begin == 2`) is sent and the next request starts at once, the worker counts
+  the completion cursor itself because the supervisor applies events strictly in
+  order, and only the last completion of the batch (`begin == 0`) is
+  acknowledged, after the supervisor has published it and rung the doorbell, so
+  the worker never sleeps on the doorbell with an unpublished completion. The
+  supervisor also rings the doorbell every eight unacknowledged completions so
+  RustOS can consume a long batch while it is still running. A cursor mismatch,
+  a missed deadline or an event out of order still quarantines the generation.
 - Sequential-read diagnostics (bounded, aggregate): the relay logs
   `rustos-dvm-block: read-stats` every 256 reads (`pread_us`, `pread_max_us`,
-  `readahead_*`); storaged logs `storaged: dvm read stream` every 32 DVM
-  batches (`submit_us`, `first_us` = demanded-window latency, `batch_us`,
-  `hits`); vfsd's `snapshot transfer` line carries `storaged_calls`,
-  `storaged_us`, `storaged_max_us`. Together they split a slow snapshot into
-  DVM device time, broker/IPC time and vfsd time without per-request output.
+  `readahead_*`); storaged logs `storaged: read engine` every 1024 reads
+  (`waited` = reads that blocked on a window, `stall_us` = their total wait,
+  `demand_windows`, `ahead_windows`, `in_flight_peak`, `streams`); vfsd's
+  `snapshot transfer` line carries `storaged_calls`, `storaged_us`,
+  `storaged_max_us`. Together they split a slow snapshot into DVM device time,
+  broker/IPC time and vfsd time without per-request output.
 - TmpFs mounts `/tmp`, `/dev/shm` and `/run` use `CasePolicy::Exact` and
   independent allocation-byte quotas, sparse holes, inode-pinned descriptions,
   symlinks/socket nodes, rename modes, metadata updates and orphan reclamation.
@@ -917,9 +967,9 @@ the read-only accelerator; TmpFs has it (next section).
   caller's requested write extent. On a read-only device
   (`BLOCK_BROKER_INFO_FLAG_READ_ONLY`), `storaged` marks its descriptor
   `STORAGE_FLAG_READONLY` and rejects `COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE`
-  (and `write_admitted_with`) with `EROFS` before invalidating `READ_CACHE` or
-  submitting a DVM ticket; on a writable device it clears `READ_CACHE` before
-  submission and supports `COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_FLUSH`
+  (and `write_admitted_with`) with `EROFS` before invalidating the read engine or
+  submitting a DVM ticket; on a writable device it invalidates the overlapping
+  read-engine windows before submission and supports `COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_FLUSH`
   (`BLOCK_BROKER_OP_DVM_SUBMIT_FLUSH`).
 - Storaged invokes RustOS-private syscalls only through the raw
   `rustos-svc-runtime` entrypoints. A libc wrapper must not collapse raw

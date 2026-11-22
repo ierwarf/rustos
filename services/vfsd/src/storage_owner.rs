@@ -52,20 +52,75 @@ pub(crate) fn next_executable_snapshot_request_id() -> Result<u64, i32> {
 /// could never hit a warm entry and two independent mutable views of one
 /// device existed at once. Storage is therefore a single shared owner, and a
 /// namespace-only request never has to wait behind a bulk read.
+pub(crate) struct LruIndex<K: Ord + Clone> {
+    stamps: BTreeMap<K, u64>,
+    queue: alloc::collections::VecDeque<(K, u64)>,
+    seq: u64,
+}
+
+impl<K: Ord + Clone> LruIndex<K> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            stamps: BTreeMap::new(),
+            queue: alloc::collections::VecDeque::new(),
+            seq: 0,
+        }
+    }
+
+    pub(crate) fn touch(&mut self, key: &K) {
+        self.seq = self.seq.wrapping_add(1);
+        let stamp = self.seq;
+        self.stamps.insert(key.clone(), stamp);
+        self.queue.push_back((key.clone(), stamp));
+        if self.queue.len() > self.stamps.len().saturating_mul(4).max(256) {
+            let mut rebuilt = alloc::collections::VecDeque::with_capacity(self.stamps.len());
+            for (k, s) in &self.queue {
+                if self.stamps.get(k) == Some(s) {
+                    rebuilt.push_back((k.clone(), *s));
+                }
+            }
+            self.queue = rebuilt;
+        }
+    }
+
+    pub(crate) fn remove(&mut self, key: &K) {
+        self.stamps.remove(key);
+    }
+
+    pub(crate) fn pop_lru(&mut self) -> Option<K> {
+        while let Some((key, stamp)) = self.queue.pop_front() {
+            if self.stamps.get(&key) == Some(&stamp) {
+                self.stamps.remove(&key);
+                return Some(key);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.stamps.clear();
+        self.queue.clear();
+        self.seq = 0;
+    }
+}
+
 pub(crate) struct VfsStorage {
     pub(crate) mounts: MountTable,
     /// Positive + negative metadata cache. `Ok(_)` is a resolved entry;
     /// `Err(errno)` is a negative cache (e.g. ENOENT) so back-to-back stat()s
-    /// of common missing libc paths return without touching the volume. The
-    /// whole map is dropped whenever `mount_generation` changes.
+    /// of common missing libc paths return without touching the volume.
     pub(crate) metadata_cache: BTreeMap<CacheKey, Result<Metadata, i32>>,
+    pub(crate) metadata_cache_lru: LruIndex<CacheKey>,
     /// Cached directory listings, keyed by `(mount_id, canonical_rel_path)`.
     pub(crate) dir_entries_cache: BTreeMap<CacheKey, Vec<DirEntry>>,
+    pub(crate) dir_entries_cache_lru: LruIndex<CacheKey>,
     /// Complete bytes for bounded files on the current mount generation,
     /// invalidated on any mutation or remount.
     pub(crate) file_bytes_cache: BTreeMap<CacheKey, Vec<u8>>,
+    pub(crate) file_bytes_cache_lru: LruIndex<CacheKey>,
     pub(crate) file_bytes_cache_bytes: usize,
     pub(crate) read_maps: BTreeMap<CacheKey, storage_core::file_io::FileReadMap>,
+    pub(crate) read_maps_lru: LruIndex<CacheKey>,
     pub(crate) read_map_bytes: usize,
     /// Terminally sealed executable images owned by the current mount
     /// generation. Handle transfer duplicates the descriptor into loaderd;
@@ -90,10 +145,14 @@ impl VfsStorage {
         Self {
             mounts: MountTable::new(),
             metadata_cache: BTreeMap::new(),
+            metadata_cache_lru: LruIndex::new(),
             dir_entries_cache: BTreeMap::new(),
+            dir_entries_cache_lru: LruIndex::new(),
             file_bytes_cache: BTreeMap::new(),
+            file_bytes_cache_lru: LruIndex::new(),
             file_bytes_cache_bytes: 0,
             read_maps: BTreeMap::new(),
+            read_maps_lru: LruIndex::new(),
             read_map_bytes: 0,
             executable_snapshot_cache: BTreeMap::new(),
             executable_snapshot_cache_bytes: 0,
@@ -353,6 +412,7 @@ pub(crate) fn open_executable_snapshot(
     window.resize(window_bytes, 0);
     let mut digest = Sha256::new();
     let mut hash_ns = 0u64;
+    let transfer_started = monotonic_nanos();
     let bulk_before = crate::block::bulk_read_counters();
     let _ = crate::block::take_bulk_read_max_nanos();
     let transfer = transfer_exact(&mut reader, &mut writer, &mut window,
@@ -371,8 +431,9 @@ pub(crate) fn open_executable_snapshot(
     if let Err(error) = &transfer { control.progress(error.completed_bytes); }
     if file_len > 128 * 1024 * 1024 {
         let bulk = crate::block::bulk_read_counters().since(bulk_before);
-        ipc::debug_line(&format!("vfsd: snapshot transfer path={path} completed={} read_us={} write_us={} hash_us={} storaged_calls={} storaged_us={} storaged_max_us={} status={}",
-            control.completed_bytes(), reader.read_ns / 1000, writer.write_ns() / 1000,
+        ipc::debug_line(&format!("vfsd: snapshot transfer path={path} completed={} total_us={} read_us={} write_us={} hash_us={} storaged_calls={} storaged_us={} storaged_max_us={} status={}",
+            control.completed_bytes(),
+            monotonic_nanos().saturating_sub(transfer_started) / 1000, reader.read_ns / 1000, writer.write_ns() / 1000,
             hash_ns / 1000, bulk.calls, bulk.nanos / 1000,
             crate::block::take_bulk_read_max_nanos() / 1000,
             transfer.as_ref().err().map_or(0, transfer_errno)));

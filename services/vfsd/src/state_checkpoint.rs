@@ -7,6 +7,7 @@ impl VfsState {
             cwd: BTreeMap::new(),
             handles: BTreeMap::new(),
             epolls: WaitSetRegistry::default(),
+            inotify: vfsd::inotify::InotifyRegistry::new(),
             locks: vfsd::locks::LockTable::new(),
             checkpoint_revisions: BTreeMap::new(),
             checkpoint_operations: BTreeMap::new(),
@@ -357,10 +358,14 @@ impl VfsStorage {
     fn invalidate_caches_if_remounted(&mut self) {
         if self.cache_generation != self.mount_generation {
             self.metadata_cache.clear();
+            self.metadata_cache_lru.clear();
             self.dir_entries_cache.clear();
+            self.dir_entries_cache_lru.clear();
             self.file_bytes_cache.clear();
+            self.file_bytes_cache_lru.clear();
             self.file_bytes_cache_bytes = 0;
             self.read_maps.clear();
+            self.read_maps_lru.clear();
             self.read_map_bytes = 0;
             for snapshot in self.executable_snapshot_cache.values() {
                 close_fd(snapshot.fd);

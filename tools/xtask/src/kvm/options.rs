@@ -72,6 +72,7 @@ struct KvmLayout {
     dvm_input_ring: PathBuf,
     dvm_input_doorbell: PathBuf,
     rustos_monitor: PathBuf,
+    dvm_monitor: PathBuf,
     dvm_control_secret: PathBuf,
     // Keep the private tmpfs directory alive until both QEMU children have
     // exited. Dropping it then removes both DMA-pinnable display backings.
@@ -507,11 +508,53 @@ fn run_one_smoke_unarchived(
             }
         }
     });
+    // The Chrome web probe does not screendump: virgl scanouts leave QEMU no
+    // surface. Its pixels come from uiserver (`pixel_evidence.rs`).
+    let screendump_path = options.screendump.clone();
+    let result = if result.is_ok()
+        && let Some(ppm_path) = screendump_path.as_deref()
+    {
+        match capture_dvm_screendump(&layout.dvm_monitor, ppm_path, Duration::from_secs(10))
+            .and_then(|()| parse_ppm_p6(&fs::read(ppm_path)?))
+            .and_then(|img| verify_ppm_non_blank(&img))
+        {
+            Ok(stats) => {
+                println!(
+                    "xtask: screendump verified {}x{} non_black={} distinct_colors={} path={}",
+                    stats.width,
+                    stats.height,
+                    stats.non_black_pixels,
+                    stats.distinct_colors,
+                    ppm_path.display()
+                );
+                result
+            }
+            Err(err) => Err(err),
+        }
+    } else {
+        result
+    };
     phase("smoke-probe-ended");
     stop_guest(&mut rustos);
     stop_guest(&mut dvm);
     phase("smoke-guests-stopped");
     let probe = result?;
+    if options.chrome_web_probe {
+        let log = rejoin_user_debug_records(&read_runtime_log_if_present(&layout.debugcon_log)?);
+        let verdict = verify_chrome_pixels(&log)
+            .with_context(|| format!("Chrome pixel evidence; inspect {}", layout.debugcon_log.display()))?;
+        println!(
+            "xtask: chrome pixels verified surface={} title={:?} {}x{} non_black={} colors={} reports={} frames={}",
+            verdict.surface,
+            verdict.title,
+            verdict.width,
+            verdict.height,
+            verdict.non_black,
+            verdict.distinct,
+            verdict.frames_seen,
+            verdict.distinct_hashes,
+        );
+    }
     validate_ui_fps_proof(&layout, &options)?;
     if let (Some(shared_display), Some(shared_pixels)) = (
         layout.gui_dvm_surfaces.as_deref(),
@@ -766,6 +809,8 @@ pub(crate) fn kvm_run_command(
         smp_iteration: rustos_vcpus > 1,
         hold_seconds: None,
         launch_desktop: None,
+        screendump: None,
+        chrome_web_probe: false,
         host_cpu_pressure: None,
         smp_formal_profile_override: None,
         smp_ring3_qualification: false,

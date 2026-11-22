@@ -2,19 +2,19 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `a71f2ca1aa314262fd5c4804fe468ebe1a84391eb9386e97c2cd4cc6ad717f39`
+- Registry SHA-256: `89b0f3b501f549d1ee8f39b2274eec9de6d13a72846be8c2645209c3928499ed`
 - Models: `160`
 - Whole flows: `84`
 - Transitions: `1028`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `1571`
+- Exact source witnesses: `1575`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
 - Intentional-terminal exceptions: `87` (ceiling `87`)
 - Cyclic strongly connected components: `59`
 - Supporting model bindings: `138`
-- Explicit critical/high risk surfaces: `264`
+- Explicit critical/high risk surfaces: `265`
 - Additional source mappings: `408`
 
 | Flow | Severity | Owners | Models | Requirements | Hazards | Sinks |

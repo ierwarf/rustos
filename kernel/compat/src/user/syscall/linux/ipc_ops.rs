@@ -3250,8 +3250,40 @@ pub(super) fn syscall_linux_rustos_ipc_reply_with_handles(args_ptr: u64) -> u64 
     0
 }
 
+/// vfsd must never wait on syscalld: syscalld's single receive thread can be
+/// inside a mapping-broker call that is waiting for vfsd, and the two then
+/// block each other until the 30 s IPC deadline (every Chrome syscall stalled
+/// behind it). The kernel therefore answers vfsd's `memfd_create`,
+/// `sched_getaffinity`, and heap-growth `mmap` itself. Any other syscalld call
+/// from vfsd is a regression of that rule, so it is reported rather than
+/// silent: arg0 = op, arg1 = calls so far (first four, then powers of two).
+fn note_syscalld_call_from_vfsd(request: &[u8]) {
+    static VFSD_SYSCALLD_CALLS: AtomicU64 = AtomicU64::new(0);
+    let Some(pid) = multitask::current_user_process_id() else {
+        return;
+    };
+    if !process_owns_published_service_endpoint(pid, linux_abi::IPC_SERVICE_VFSD) {
+        return;
+    }
+    // ORDERING: Relaxed is exact; the counter owns this diagnostic only.
+    let total = VFSD_SYSCALLD_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if total > 4 && !total.is_power_of_two() {
+        return;
+    }
+    let op = request
+        .get(2..4)
+        .map_or(0, |b| u64::from(u16::from_le_bytes([b[0], b[1]])));
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "vfsd-syscalld-call",
+        op,
+        total,
+    );
+}
+
 pub(super) fn call_linux_syscall_endpoint(request: &[u8]) -> Result<Vec<u8>, i64> {
     let endpoint = linux_syscall_endpoint().ok_or(LINUX_ENOSYS)?;
+    note_syscalld_call_from_vfsd(request);
     let start_ticks = crate::arch::rtc::ticks();
     let reply = enqueue_call_and_wake(endpoint, request)?;
     let send_ticks = crate::arch::rtc::ticks();
@@ -3277,6 +3309,7 @@ pub(super) fn call_linux_syscall_fast_endpoint(
     response_capacity: usize,
 ) -> Result<(usize, [u8; kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES]), i64> {
     let endpoint = linux_syscall_endpoint().ok_or(LINUX_ENOSYS)?;
+    note_syscalld_call_from_vfsd(request);
     let (caller_process_id, caller_task_id) =
         multitask::current_user_log_ids().ok_or(LINUX_EINVAL)?;
     note_fast_ipc(IpcFastCounter::AdmissionAttempt);

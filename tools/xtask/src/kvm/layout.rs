@@ -91,11 +91,17 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
             // `--exercise-network` alone must still publish the contract:
             // runtimed arms netprobe's QEMU-gateway mode only from it, and
             // without the file netprobe silently probes a public address.
-            (private_ui_profile_requested(options) || options.exercise_network).then_some((
-                private_ui_profile_requested(options),
-                options.exercise_network,
-                options.exercise_google_ping,
-            )),
+            (private_ui_profile_requested(options)
+                || options.exercise_network
+                || options.chrome_web_probe)
+                .then_some((
+                    private_ui_profile_requested(options),
+                    options.exercise_network,
+                    options.exercise_google_ping,
+                    // Only the Chrome web probe reads client pixels; its
+                    // `--screendump` has no surface to capture under virgl.
+                    options.chrome_web_probe,
+                )),
             options
                 .smp_ring3_qualification
                 .then_some(options.rustos_vcpus),
@@ -249,6 +255,10 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
     if rustos_monitor.exists() {
         fs::remove_file(&rustos_monitor)?;
     }
+    let dvm_monitor = run_dir.join("dvm-monitor.sock");
+    if dvm_monitor.exists() {
+        fs::remove_file(&dvm_monitor)?;
+    }
     let dvm_control_secret = run_dir.join("linux-dvm-control.secret");
     let control_secret = ControlSecret::random()?;
     fs::write(&dvm_control_secret, control_secret.as_hex())?;
@@ -276,6 +286,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         dvm_input_ring,
         dvm_input_doorbell,
         rustos_monitor,
+        dvm_monitor,
         dvm_control_secret,
         _display_backing_dir: display_backing_dir,
         gui_dvm_surfaces,
@@ -679,12 +690,20 @@ fn verify_dvm_block_ready_generation(layout: &KvmLayout, expected_generation: u6
     Ok(())
 }
 
-fn render_private_acceptance_contract(ui_profile: bool, network_exercise: bool, google_ping: bool) -> String {
+fn render_private_acceptance_contract(
+    ui_profile: bool,
+    network_exercise: bool,
+    google_ping: bool,
+    ui_pixel_probe: bool,
+) -> String {
+    // The optional key is emitted only when set, so contracts written for every
+    // other proof stay byte-identical.
     format!(
-        "contract=rustos-kvm-acceptance-v1\nui_profile={}\nnetwork_exercise={}\ngoogle_ping={}\n",
+        "contract=rustos-kvm-acceptance-v1\nui_profile={}\nnetwork_exercise={}\ngoogle_ping={}\n{}",
         u8::from(ui_profile),
         u8::from(network_exercise),
         u8::from(google_ping),
+        if ui_pixel_probe { "ui_pixel_probe=1\n" } else { "" },
     )
 }
 
@@ -706,7 +725,7 @@ fn render_ipcbench_probe_contract(probe: &str) -> String {
 /// Ring3 qualification uses a disjoint path and proof mode.
 fn write_private_kvm_contracts(
     runtime_disk: &Path,
-    acceptance: Option<(bool, bool, bool)>,
+    acceptance: Option<(bool, bool, bool, bool)>,
     smp_ring3_workers: Option<u8>,
     ipcbench_probe: Option<&str>,
     oom_hog: bool,
@@ -730,12 +749,12 @@ fn write_private_kvm_contracts(
     let fs = fatfs::FileSystem::new(image, fatfs::FsOptions::new())?;
     {
         let root = fs.root_dir();
-        if let Some((ui_profile, network_exercise, google_ping)) = acceptance {
+        if let Some((ui_profile, network_exercise, google_ping, ui_pixel_probe)) = acceptance {
             let mut contract = root
                 .create_file(PRIVATE_ACCEPTANCE_CONTRACT_PATH)
                 .context("create private KVM acceptance contract file")?;
             contract.truncate()?;
-            let contents = render_private_acceptance_contract(ui_profile, network_exercise, google_ping);
+            let contents = render_private_acceptance_contract(ui_profile, network_exercise, google_ping, ui_pixel_probe);
             FatWrite::write_all(&mut contract, contents.as_bytes())?;
             FatWrite::flush(&mut contract)?;
         }

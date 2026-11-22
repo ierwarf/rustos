@@ -94,6 +94,8 @@ const DEFAULT_RUNTIME_ASSET_FILES: &[&str] = &[
     "/etc/hosts",
     "/etc/resolv.conf",
     "/etc/localtime",
+    "/etc/machine-id",
+    "/var/lib/dbus/machine-id",
     "/system/registry/system/desktop-programs.tsv",
     "/system/registry/system/startup-programs.tsv",
     "/system/registry/system/runtime-launch-programs.tsv",
@@ -125,6 +127,7 @@ const DEFAULT_RUNTIME_ENV: &[(&str, &str)] = &[
     ("TMPDIR", "{temp_dir}"),
     ("LANG", "C.UTF-8"),
     ("WAYLAND_DISPLAY", "{wayland_display}"),
+    ("DBUS_SESSION_BUS_ADDRESS", "unix:path={runtime_dir}/bus"),
     ("XDG_SESSION_TYPE", "wayland"),
     ("XDG_CURRENT_DESKTOP", "RustOS"),
 ];
@@ -1703,6 +1706,7 @@ mod tests {
         assert_eq!(get("runtime", "XDG_RUNTIME_DIR"), Some("{runtime_dir}"));
         assert_eq!(get("runtime", "TMPDIR"), Some("{temp_dir}"));
         assert_eq!(get("runtime", "WAYLAND_DISPLAY"), Some("{wayland_display}"));
+        assert_eq!(get("runtime", "DBUS_SESSION_BUS_ADDRESS"), Some("unix:path={runtime_dir}/bus"));
         assert!(rows.iter().filter(|row| row.0 == "init").all(|row| !row.2.contains('{')));
     }
 

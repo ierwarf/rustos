@@ -8,9 +8,12 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 use rustos_user_abi::syscall::EXECUTABLE_IMAGE_TRANSFER_WINDOW_BYTES;
 
-/// One definition shared with loaderd's ELF read window and the early-system
-/// broker ceiling (`rustos-user-abi`).
-pub const SNAPSHOT_WINDOW_BYTES: usize = EXECUTABLE_IMAGE_TRANSFER_WINDOW_BYTES;
+/// vfsd's own snapshot read/write window. It is larger than the shared
+/// `EXECUTABLE_IMAGE_TRANSFER_WINDOW_BYTES` (loaderd's ELF read window and the
+/// early-system broker ceiling) so one volume read is big enough to be split
+/// across the parallel storaged lanes (`bulk_lanes::PARALLEL_MIN_BYTES`).
+pub const SNAPSHOT_WINDOW_BYTES: usize = 4 * 1024 * 1024;
+const _: () = assert!(SNAPSHOT_WINDOW_BYTES >= EXECUTABLE_IMAGE_TRANSFER_WINDOW_BYTES);
 pub const SNAPSHOT_MAP_BYTES: usize = 2 * 1024 * 1024;
 pub const SNAPSHOT_IN_FLIGHT_BYTES: usize = 640 * 1024 * 1024;
 

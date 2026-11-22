@@ -15,7 +15,7 @@
 //! Failure: a malformed contract, an id that is not a launchable catalog
 //! program, or a permanent launch error is a hard error (`... FAIL ...` record,
 //! no retry). Storage not yet readable and transient launch errors retry on a
-//! bounded backoff for a bounded number of attempts.
+//! bounded backoff for a bounded number of attempts (see `MAX_LAUNCH_ATTEMPTS`).
 //! Forbidden: launching anything but a manual, non-service catalog program;
 //! acting on a contract more than once per boot.
 
@@ -31,7 +31,14 @@ const CONTRACT_HEADER: &str = "contract=rustos-kvm-launch-desktop-v1";
 /// Must equal `LAUNCH_DESKTOP_ID_MAX_BYTES` in the xtask writer.
 const MAX_DESKTOP_ID_BYTES: usize = 64;
 const CONTRACT_MAX_BYTES: usize = 160;
-const MAX_LAUNCH_ATTEMPTS: u32 = 5;
+/// Transient failures include `EAGAIN` from the application budget while a
+/// session harness program (`ipcbench`, which holds the default 12/48 request
+/// for its whole run) still runs; the window must outlast it. The backoff caps
+/// at `MAX_LAUNCH_RETRY_BACKOFF`, so this bounds the retry to about 2.4 minutes
+/// and the run's own timeout ends it sooner.
+const MAX_LAUNCH_ATTEMPTS: u32 = 32;
+/// Contract reads while the volume is not yet readable (unchanged bound).
+const MAX_CONTRACT_READ_ATTEMPTS: u32 = 20;
 
 type ContractLoad = Result<Option<String>, i32>;
 
@@ -159,7 +166,7 @@ impl LaunchDesktopRequest {
             Err(errno) => {
                 // The volume may not be mounted yet; bounded retry.
                 self.defer();
-                if self.failures >= MAX_LAUNCH_ATTEMPTS * 4 {
+                if self.failures >= MAX_CONTRACT_READ_ATTEMPTS {
                     self.finish_failed("-", "contract-unreadable", errno);
                 }
                 return false;
@@ -387,7 +394,7 @@ mod tests {
         assert!(!request.resolve(Err(libc::EAGAIN)));
         assert_eq!(request.phase, Phase::Unresolved);
         assert!(request.retry_after.is_some());
-        request.failures = MAX_LAUNCH_ATTEMPTS * 4;
+        request.failures = MAX_CONTRACT_READ_ATTEMPTS;
         request.resolve(Err(libc::EAGAIN));
         assert_eq!(request.phase, Phase::Done);
     }

@@ -640,6 +640,19 @@ impl WaylandState {
     /// The commit's visible effects, shared by the synchronous and the
     /// completed-snapshot paths.
     fn finish_commit(&mut self, shared: &Arc<Mutex<WaylandSurfaceState>>, mut outcome: Outcome) {
+        // Every commit ends here, whether its pixels were read off-thread or
+        // retained, so this is the one place the applied content is observed.
+        if crate::pixel_probe::enabled() {
+            if let Ok(surface) = shared.lock() {
+                crate::pixel_probe::observe(
+                    surface.surface_id,
+                    &surface.title,
+                    &surface.pixels,
+                    surface.width,
+                    surface.height,
+                );
+            }
+        }
         let released_fallback = outcome.release.take();
         if released_fallback.is_some() || !outcome.mapped || !outcome.dirty {
             if let Ok(mut surface) = shared.lock() {

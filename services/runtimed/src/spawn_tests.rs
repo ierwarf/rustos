@@ -217,6 +217,17 @@
     }
 
     #[test]
+    fn ui_pixel_probe_key_is_optional_exact_and_unique() {
+        let base = "contract=rustos-kvm-acceptance-v1\nui_profile=0\nnetwork_exercise=0\n";
+        assert!(!parse_kvm_acceptance_contract(base).unwrap().ui_pixel_probe);
+        assert!(parse_kvm_acceptance_contract(&format!("{base}ui_pixel_probe=1\n")).unwrap().ui_pixel_probe);
+        assert!(!parse_kvm_acceptance_contract(&format!("{base}ui_pixel_probe=0\n")).unwrap().ui_pixel_probe);
+        for suffix in ["ui_pixel_probe=yes\n", "ui_pixel_probe=1\nui_pixel_probe=1\n"] {
+            assert!(parse_kvm_acceptance_contract(&format!("{base}{suffix}")).is_none());
+        }
+    }
+
+    #[test]
     fn google_ping_contract_is_opt_in_and_requires_network_exercise() {
         let base = "contract=rustos-kvm-acceptance-v1\nui_profile=0\nnetwork_exercise=1\n";
         assert!(!parse_kvm_acceptance_contract(base).unwrap().google_ping);

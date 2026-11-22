@@ -504,6 +504,8 @@ pub(super) fn build_cropped_gpu_atlas_scene(
         })
         .collect();
     Ok(GpuAtlasScene {
+        used_height: packer.used_height(),
+        dock_source_rect: None,
         layers,
         cursor_source_rect,
         wayland_bindings: Vec::new(),

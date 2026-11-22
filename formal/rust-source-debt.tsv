@@ -230,6 +230,7 @@ services/loaderd/src/lib.rs	0	0
 services/loaderd/src/main.rs	10	2
 services/vfsd/src/main.rs	33	2
 services/storaged/src/block.rs	1	0
+services/storaged/src/read_engine.rs	0	0
 services/inputd/src/main.rs	10	2
 services/inputd/src/service_loop.rs	0	0
 services/runtimed/src/spawn.rs	10	0

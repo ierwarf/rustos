@@ -172,12 +172,22 @@ impl NetState {
         touched.clear();
         touched.extend(dirty.iter().copied());
         for &token in &touched {
-            if let Some(UnixSocket {
-                state: UnixSocketState::Connected(connected),
-                ..
-            }) = self.sockets.get(&token)
-            {
-                dirty.insert(connected.peer);
+            match self.sockets.get(&token) {
+                Some(UnixSocket {
+                    state: UnixSocketState::Connected(connected),
+                    ..
+                }) => {
+                    dirty.insert(connected.peer);
+                }
+                Some(UnixSocket {
+                    state: UnixSocketState::Dgram(dgram),
+                    ..
+                }) => {
+                    if let Some(peer) = dgram.peer {
+                        dirty.insert(peer);
+                    }
+                }
+                _ => {}
             }
             if let Some(Readiness::Unix {
                 peer: Some(peer), ..
@@ -194,6 +204,7 @@ impl NetState {
                     (linux_abi::POLLIN | linux_abi::POLLOUT | linux_abi::POLLRDHUP) as u32;
                 let peer = match &socket.state {
                     UnixSocketState::Connected(connected) => Some(connected.peer),
+                    UnixSocketState::Dgram(dgram) => dgram.peer,
                     _ => None,
                 };
                 Some(Readiness::Unix {
@@ -289,11 +300,15 @@ impl Drop for NetStateGuard<'_> {
     fn drop(&mut self) {
         self.record_readiness_changes();
         let publications = std::mem::take(&mut self.readiness_publications);
+        let notify = !publications.is_empty();
         drop(self.state.take());
         // Broker wake matching accepts only strictly newer generations, so
         // concurrent publishers may arrive out of order without a downgrade.
         for (token, generation) in publications {
             publish_readiness_generation(token, generation);
+        }
+        if notify {
+            notify_state_waiters();
         }
     }
 }

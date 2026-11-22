@@ -11,16 +11,19 @@ use rustos_svc_runtime::ipc;
 use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::syscall::{
     VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse,
-    VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION,
-    VFS_EXECUTABLE_SNAPSHOT_OP_POLL, VFS_EXECUTABLE_SNAPSHOT_OP_CANCEL,
-    VFS_EXECUTABLE_SNAPSHOT_PENDING, VFS_EXECUTABLE_SNAPSHOT_MAX_LEASE_MS,
+    VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_MAX_LEASE_MS,
+    VFS_EXECUTABLE_SNAPSHOT_OP_CANCEL, VFS_EXECUTABLE_SNAPSHOT_OP_POLL,
+    VFS_EXECUTABLE_SNAPSHOT_PENDING,
 };
+use vfsd::snapshot_sessions::{SessionError, SessionPoll, SnapshotControl, SnapshotSessions};
 use vfsd::{SnapshotWorkerAdmission, SnapshotWorkerSignal};
-use vfsd::snapshot_sessions::{SnapshotControl, SnapshotSessions, SessionError, SessionPoll};
 
 #[cfg(test)]
 use super::ENOSYS;
-use super::{reply_executable_snapshot, ExecutableSnapshotOpen, EAGAIN, EINVAL, EACCES, ETIMEDOUT, EOVERFLOW, ENOENT};
+use super::{
+    reply_executable_snapshot, ExecutableSnapshotOpen, EACCES, EAGAIN, EINVAL, ENOENT, EOVERFLOW,
+    ETIMEDOUT,
+};
 
 const SNAPSHOT_WORKER_STACK_BYTES: usize = 128 * 1024;
 const SYS_CLONE: u64 = 56;
@@ -168,8 +171,10 @@ pub(super) fn enqueue_executable_snapshot(
     SNAPSHOT_JOB_ADMISSION[index].publish_ready();
     wake_snapshot_workers(SNAPSHOT_WORK_SIGNAL.publish());
     let response = VfsExecutableSnapshotResponse {
-        version: VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, op: request.op,
-        status: VFS_EXECUTABLE_SNAPSHOT_PENDING, job_id: id,
+        version: VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION,
+        op: request.op,
+        status: VFS_EXECUTABLE_SNAPSHOT_PENDING,
+        job_id: id,
         ..VfsExecutableSnapshotResponse::default()
     };
     let reply = reply_control(reply_cap, &response);
@@ -183,48 +188,99 @@ pub(super) fn enqueue_executable_snapshot(
 
 fn session_errno(error: SessionError) -> i32 {
     match error {
-        SessionError::Full => EAGAIN, SessionError::Exhausted => EOVERFLOW,
-        SessionError::Unknown => ENOENT, SessionError::Owner => EACCES,
+        SessionError::Full => EAGAIN,
+        SessionError::Exhausted => EOVERFLOW,
+        SessionError::Unknown => ENOENT,
+        SessionError::Owner => EACCES,
         SessionError::Lease => ETIMEDOUT,
     }
 }
 fn reply_control(reply_cap: u64, response: &VfsExecutableSnapshotResponse) -> i64 {
     // SAFETY: the initialized wire value stays live during the reply copy.
-    unsafe { ipc::reply(reply_cap, (response as *const VfsExecutableSnapshotResponse).cast(), size_of::<VfsExecutableSnapshotResponse>()) }
+    unsafe {
+        ipc::reply(
+            reply_cap,
+            (response as *const VfsExecutableSnapshotResponse).cast(),
+            size_of::<VfsExecutableSnapshotResponse>(),
+        )
+    }
 }
 
-pub(super) fn continue_executable_snapshot(reply_cap: u64, sender_pid: u64, sender_tid: u64,
-    request: &VfsExecutableSnapshotRequest) -> i64 {
-    if request.version != VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION || request.flags != 0
-        || request.reserved0 != 0 || request.job_id == 0 || request.path_len != 0
-        || request.target_pid != 0 || request.dirfd != 0 || request.max_bytes != 0
-        || !matches!(request.op, VFS_EXECUTABLE_SNAPSHOT_OP_POLL | VFS_EXECUTABLE_SNAPSHOT_OP_CANCEL)
-    { return reply_snapshot_status(reply_cap, request.op, EINVAL); }
+pub(super) fn continue_executable_snapshot(
+    reply_cap: u64,
+    sender_pid: u64,
+    sender_tid: u64,
+    request: &VfsExecutableSnapshotRequest,
+) -> i64 {
+    if request.version != VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION
+        || request.flags != 0
+        || request.reserved0 != 0
+        || request.job_id == 0
+        || request.path_len != 0
+        || request.target_pid != 0
+        || request.dirfd != 0
+        || request.max_bytes != 0
+        || !matches!(
+            request.op,
+            VFS_EXECUTABLE_SNAPSHOT_OP_POLL | VFS_EXECUTABLE_SNAPSHOT_OP_CANCEL
+        )
+    {
+        return reply_snapshot_status(reply_cap, request.op, EINVAL);
+    }
     let owner = (sender_pid, sender_tid);
     if request.op == VFS_EXECUTABLE_SNAPSHOT_OP_CANCEL {
-        let result = { SESSIONS.lock().cancel(request.job_id, owner, request.deadline_ns) };
+        let result = {
+            SESSIONS
+                .lock()
+                .cancel(request.job_id, owner, request.deadline_ns)
+        };
         wake_snapshot_workers(SNAPSHOT_WORK_SIGNAL.publish());
-        return reply_snapshot_status(reply_cap, request.op, result.map_or_else(session_errno, |_| 0));
+        return reply_snapshot_status(
+            reply_cap,
+            request.op,
+            result.map_or_else(session_errno, |_| 0),
+        );
     }
-    let outcome = { SESSIONS.lock().poll(request.job_id, owner, request.deadline_ns,
-        rustos_svc_runtime::syscall::monotonic_nanos()) };
+    let outcome = {
+        SESSIONS.lock().poll(
+            request.job_id,
+            owner,
+            request.deadline_ns,
+            rustos_svc_runtime::syscall::monotonic_nanos(),
+        )
+    };
     match outcome {
         Err(error) => reply_snapshot_status(reply_cap, request.op, session_errno(error)),
         Ok(SessionPoll::Ready(Err(errno))) => reply_snapshot_status(reply_cap, request.op, errno),
-        Ok(SessionPoll::Ready(Ok(complete))) => reply_executable_snapshot(reply_cap, request.job_id, complete),
-        Ok(SessionPoll::Pending { completed, total }) => reply_control(reply_cap, &VfsExecutableSnapshotResponse {
-            version: VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, op: request.op,
-            status: VFS_EXECUTABLE_SNAPSHOT_PENDING, job_id: request.job_id,
-            completed_bytes: completed, file_bytes: total,
-            ..VfsExecutableSnapshotResponse::default()
-        }),
+        Ok(SessionPoll::Ready(Ok(complete))) => {
+            reply_executable_snapshot(reply_cap, request.job_id, complete)
+        }
+        Ok(SessionPoll::Pending { completed, total }) => reply_control(
+            reply_cap,
+            &VfsExecutableSnapshotResponse {
+                version: VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION,
+                op: request.op,
+                status: VFS_EXECUTABLE_SNAPSHOT_PENDING,
+                job_id: request.job_id,
+                completed_bytes: completed,
+                file_bytes: total,
+                ..VfsExecutableSnapshotResponse::default()
+            },
+        ),
     }
 }
 
 fn reap_expired_sessions() {
     loop {
-        let expired = { SESSIONS.lock().expire_one(rustos_svc_runtime::syscall::monotonic_nanos()) };
-        match expired { Some(payload) => drop(payload), None => break }
+        let expired = {
+            SESSIONS
+                .lock()
+                .expire_one(rustos_svc_runtime::syscall::monotonic_nanos())
+        };
+        match expired {
+            Some(payload) => drop(payload),
+            None => break,
+        }
     }
 }
 
@@ -320,25 +376,38 @@ fn spawn_snapshot_worker(index: usize) -> Result<(), i64> {
             .cast::<u8>()
             .add(SNAPSHOT_WORKER_STACK_BYTES) as u64
     };
+    spawn_thread_on_stack(stack_top, snapshot_worker_entry)
+}
+
+/// Starts a thread of this process on a caller-owned static stack.
+///
+/// `stack_top` is the 16-byte aligned one-past-the-end address of a stack no
+/// other thread uses; `entry` never returns. The child resumes with the
+/// parent's registers except `rax`, so the entry address travels in `r12`.
+#[cfg(not(test))]
+pub(super) fn spawn_thread_on_stack(
+    stack_top: u64,
+    entry: extern "C" fn() -> !,
+) -> Result<(), i64> {
     let flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
     let result: i64;
     // SAFETY: the clone ABI receives the aligned exclusive stack top; the
-    // child branches directly to the non-returning worker entry.
+    // child branches directly to the non-returning entry.
     unsafe {
         asm!(
             "syscall",
             "test rax, rax",
             "jnz 2f",
-            "call {entry}",
+            "call r12",
             "ud2",
             "2:",
-            entry = sym snapshot_worker_entry,
             inlateout("rax") SYS_CLONE as i64 => result,
             in("rdi") flags,
             in("rsi") stack_top,
             in("rdx") 0_u64,
             in("r10") 0_u64,
             in("r8") 0_u64,
+            in("r12") entry as usize as u64,
             lateout("rcx") _,
             lateout("r11") _,
         );
@@ -348,6 +417,14 @@ fn spawn_snapshot_worker(index: usize) -> Result<(), i64> {
     } else {
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(super) fn spawn_thread_on_stack(
+    _stack_top: u64,
+    _entry: extern "C" fn() -> !,
+) -> Result<(), i64> {
+    Err(ENOSYS as i64)
 }
 
 #[cfg(test)]
@@ -375,14 +452,26 @@ extern "C" fn snapshot_worker_entry() -> ! {
         let job = unsafe { (*SNAPSHOT_JOB[index].0.get()).assume_init_read() };
         // Storage is acquired inside, per phase, never held across the bulk
         // read.
-        let result = super::open_executable_snapshot(&job.request, &job.control)
-            .map(|snapshot| CompletedSnapshot { snapshot, request: job.request });
+        let result = super::open_executable_snapshot(&job.request, &job.control).map(|snapshot| {
+            CompletedSnapshot {
+                snapshot,
+                request: job.request,
+            }
+        });
         if let Err(errno) = &result {
-            ipc::debug_line(&format!("vfsd: executable snapshot rejected stage=open errno={errno} completed={} total={}",
-                job.control.completed_bytes(), job.control.total_bytes()));
+            ipc::debug_line(&format!(
+                "vfsd: executable snapshot rejected stage=open errno={errno} completed={} total={}",
+                job.control.completed_bytes(),
+                job.control.total_bytes()
+            ));
         }
-        let rejected = { SESSIONS.lock().finish(job.id, result,
-            rustos_svc_runtime::syscall::monotonic_nanos()) };
+        let rejected = {
+            SESSIONS.lock().finish(
+                job.id,
+                result,
+                rustos_svc_runtime::syscall::monotonic_nanos(),
+            )
+        };
         // Frame release and budget refunds happen outside every table/storage
         // lock, on a worker, including cancellation and an abandoned client.
         drop(rejected);

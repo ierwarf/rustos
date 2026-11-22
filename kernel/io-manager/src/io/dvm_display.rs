@@ -68,8 +68,24 @@ const IVSHMEM_DEVICE_ID: u16 = 0x1110;
 const IVSHMEM_REGISTERS_BAR: usize = 0;
 const IVSHMEM_SHARED_MEMORY_BAR: usize = 2;
 const IVSHMEM_DOORBELL_OFFSET: usize = 12;
-const GUI_DVM_PIXEL_REGION_PHYS_ADDR: u64 = 0x1_0000_0000;
-const GUI_DVM_PIXEL_REGION_BYTES: u64 = 512 * 1024 * 1024;
+const GUI_DVM_PIXEL_REGION_BYTES: u64 = driver_domain_protocol::DVM_PIXEL_APERTURE_BYTES;
+
+/// Guest-physical base of the GUI/atlas virtio-pmem. The hypervisor places it in
+/// its device-memory region right after guest RAM, so it is derived from the RAM
+/// top (the same rule the host launcher applies) rather than assumed.
+fn gui_dvm_pixel_region_phys_addr() -> Option<u64> {
+    static BASE: AtomicU64 = AtomicU64::new(0);
+    // ORDERING: Acquire pairs with the Release store below; the value is a pure
+    // function of the boot memory map, so a racing duplicate store is identical.
+    let cached = BASE.load(Ordering::Acquire);
+    if cached != 0 {
+        return Some(cached);
+    }
+    let base = driver_domain_protocol::dvm_pmem_base(kernel_mm::api::phys::boot_ram_top()?)?;
+    // ORDERING: Release publishes the derived base to Acquire readers above.
+    BASE.store(base, Ordering::Release);
+    Some(base)
+}
 const GUI_DVM_PEER_ID: u32 = 1;
 const GUI_DVM_CONTROL_VECTOR_INDEX: usize = 0;
 const GUI_DVM_OFFLINE_VECTOR_INDEX: usize = 1;
@@ -374,7 +390,7 @@ pub(crate) fn gpu_atlas_slot_mapping(slot: u32) -> Option<(u64, *mut u8, usize)>
         .checked_mul(u64::from(slot))
         // ORDERING: Acquire pairs with the install-time Release store of the atlas offset.
         .and_then(|offset| GPU_ATLAS_OFFSET.load(Ordering::Acquire).checked_add(offset))?;
-    let phys_start = GUI_DVM_PIXEL_REGION_PHYS_ADDR.checked_add(slot_offset)?;
+    let phys_start = gui_dvm_pixel_region_phys_addr()?.checked_add(slot_offset)?;
     let len = usize::try_from(slot_bytes).ok()?;
     if len == 0
         || !phys_start.is_multiple_of(4096)

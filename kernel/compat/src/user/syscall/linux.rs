@@ -353,6 +353,13 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_NANOSLEEP => syscall_linux_nanosleep(frame.rdi, frame.rsi),
         linux_abi::SYS_GETPID => syscall_linux_getpid(),
         linux_abi::SYS_FORK => syscall_linux_fork(frame),
+        linux_abi::SYS_VFORK => syscall_linux_vfork(frame),
+        linux_abi::SYS_INOTIFY_INIT => syscall_linux_inotify_init(),
+        linux_abi::SYS_INOTIFY_INIT1 => syscall_linux_inotify_init1(frame.rdi),
+        linux_abi::SYS_INOTIFY_ADD_WATCH => {
+            syscall_linux_inotify_add_watch(frame.rdi, frame.rsi, frame.rdx)
+        }
+        linux_abi::SYS_INOTIFY_RM_WATCH => syscall_linux_inotify_rm_watch(frame.rdi, frame.rsi),
         linux_abi::SYS_WAIT4 => {
             // `pid` is a C `int`; the register's upper half is not ABI, and a
             // zero-extended -1 would otherwise name a nonexistent child.

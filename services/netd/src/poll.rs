@@ -159,6 +159,39 @@ pub(super) fn unix_socket_revents_for(state: &NetState, socket: &UnixSocket, req
                 revents |= linux_abi::POLLERR as u32;
             }
         }
+        UnixSocketState::Dgram(dgram) => {
+            if requested & linux_abi::POLLIN as u32 != 0
+                && (!dgram.incoming.is_empty() || dgram.recv_closed)
+            {
+                revents |= linux_abi::POLLIN as u32;
+            }
+            if requested & linux_abi::POLLOUT as u32 != 0 {
+                let peer_ok = match dgram.peer {
+                    Some(peer_token) => state.sockets.get(&peer_token).is_some_and(|peer| {
+                        let peer_limit = (peer.options.recv_buffer as usize).min(SOCKET_BUFFER_CAPACITY);
+                        matches!(&peer.state, UnixSocketState::Dgram(pd)
+                            if !pd.recv_closed
+                                && pd.incoming_bytes < peer_limit
+                                && pd.incoming.len() < UNIX_DGRAM_MAX_QUEUED_MESSAGES
+                                && pd.incoming_control_bytes < SOCKET_CONTROL_BUFFER_CAPACITY)
+                    }),
+                    None => true,
+                };
+                if !dgram.send_closed
+                    && !dgram.peer_closed
+                    && state.unix_queued_bytes < UNIX_QUEUED_BYTE_CAPACITY
+                    && peer_ok
+                {
+                    revents |= linux_abi::POLLOUT as u32;
+                }
+            }
+            if requested & linux_abi::POLLRDHUP as u32 != 0 && dgram.recv_closed {
+                revents |= linux_abi::POLLRDHUP as u32;
+            }
+            if dgram.peer_closed {
+                revents |= linux_abi::POLLERR as u32;
+            }
+        }
         UnixSocketState::Netlink(netlink) => {
             if requested & linux_abi::POLLIN as u32 != 0 && netlink.readable() {
                 revents |= linux_abi::POLLIN as u32;
@@ -182,11 +215,13 @@ pub(super) fn wait_for_socket_readiness(request: &NetdIpcRequest, response: &mut
         if let Err(errno) = request_deadline_remaining_ns(request) {
             return errno;
         }
+        let epoch = state_waiter_epoch();
         let status = handle_poll_socket(request, response);
         if status != 0 || response.value != 0 {
             return status;
         }
-        if let Err(errno) = sleep_within_request_deadline(request, blocking_retry_backoff(attempt))
+        if let Err(errno) =
+            wait_state_within_request_deadline(epoch, request, blocking_retry_backoff(attempt))
         {
             return errno;
         }

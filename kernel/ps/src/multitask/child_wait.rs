@@ -17,7 +17,7 @@
 //! - **Evidence:** `core_lifecycle` fork+wait latency; `wait4` blocking witness.
 use core::sync::atomic::{fence, AtomicU64, Ordering};
 
-const CAPACITY: usize = 64;
+const CAPACITY: usize = 256;
 
 struct Slot {
     task: AtomicU64,

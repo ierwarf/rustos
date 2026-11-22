@@ -74,7 +74,7 @@ source_symbol = "futex_wait"
 source_anchors = [
   "let mut waiters = FUTEX_WAITERS.lock();",
   ".atomic_load_user_u32(uaddr)",
-  "register_futex_waiter_in(",
+  "waiters.insert(FutexWaiter {",
 ]
 invariant = "FUTEX_WAIT comparison and waiter publication share one bucket transaction that a store plus WAKE cannot pass"
 loom_test = "futex_compare_and_waiter_publication_have_one_linearization_point"

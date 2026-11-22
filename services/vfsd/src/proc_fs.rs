@@ -48,8 +48,10 @@ use crate::path::path_inode;
 use crate::{EINVAL, ELOOP, ENOENT, ENOTDIR};
 
 const EACCES: i32 = 13;
+const EEXIST: i32 = 17;
 const O_ACCMODE: u64 = 3;
 const O_CREAT: u64 = 0o100;
+const O_EXCL: u64 = 0o200;
 const O_TRUNC: u64 = 0o1000;
 const O_DIRECTORY: u64 = 0o200_000;
 const O_NOFOLLOW: u64 = 0o400_000;
@@ -63,6 +65,13 @@ const PID_DIR_MODE: u32 = S_IFDIR | 0o555;
 const BLOCK_SIZE: u32 = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InotifySysctlKind {
+    MaxUserWatches,
+    MaxUserInstances,
+    MaxQueuedEvents,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcNode {
     /// `/proc/self`: symlink to the caller's pid.
     SelfLink,
@@ -70,6 +79,8 @@ pub enum ProcNode {
     PidDir,
     /// `/proc/<caller pid>/exe`: symlink to the caller's executable path.
     ExeLink,
+    /// `/proc/cpuinfo`: processor inventory formatted per online CPU.
+    CpuinfoFile,
     /// `/proc/meminfo`: kernel memory usage summary.
     MeminfoFile,
     /// `/proc/filesystems`: filesystem types implemented by `vfsd`.
@@ -78,8 +89,17 @@ pub enum ProcNode {
     MountsFile,
     /// `/proc/uptime`: monotonic uptime in seconds.
     UptimeFile,
+    /// `/proc/sys`
+    SysDir,
+    /// `/proc/sys/fs`
+    SysFsDir,
+    /// `/proc/sys/fs/inotify`
+    SysFsInotifyDir,
+    /// `/proc/sys/fs/inotify/{max_user_watches,max_user_instances,max_queued_events}`
+    InotifySysctl(InotifySysctlKind),
     /// A node whose content is a kernel fact (see the module comment). The
-    /// number is the fd or tid for `FdLink`/`Task*` nodes, zero otherwise.
+    /// number is the fd or tid for `FdLink`/`Task*` nodes, or target pid for
+    /// `/proc/<child>/oom_score_adj`, zero otherwise.
     Kernel(ProcKernelNode, u64),
     /// `/proc/<caller pid>/ns`
     NsDir,
@@ -126,14 +146,40 @@ pub fn lookup(path: &str, caller_pid: u64) -> Option<Result<ProcNode, i32>> {
     if count == 1 {
         match first {
             "self" => return Some(Ok(ProcNode::SelfLink)),
+            "cpuinfo" => return Some(Ok(ProcNode::CpuinfoFile)),
             "meminfo" => return Some(Ok(ProcNode::MeminfoFile)),
             "filesystems" => return Some(Ok(ProcNode::FilesystemsFile)),
             "mounts" => return Some(Ok(ProcNode::MountsFile)),
             "uptime" => return Some(Ok(ProcNode::UptimeFile)),
+            "sys" => return Some(Ok(ProcNode::SysDir)),
             _ => {}
         }
     }
+    if first == "sys" {
+        return Some(match &parts[1..count] {
+            ["fs"] => Ok(ProcNode::SysFsDir),
+            ["fs", "inotify"] => Ok(ProcNode::SysFsInotifyDir),
+            ["fs", "inotify", "max_user_watches"] => {
+                Ok(ProcNode::InotifySysctl(InotifySysctlKind::MaxUserWatches))
+            }
+            ["fs", "inotify", "max_user_instances"] => {
+                Ok(ProcNode::InotifySysctl(InotifySysctlKind::MaxUserInstances))
+            }
+            ["fs", "inotify", "max_queued_events"] => {
+                Ok(ProcNode::InotifySysctl(InotifySysctlKind::MaxQueuedEvents))
+            }
+            _ => Err(ENOENT),
+        });
+    }
     if first != "self" && parse_pid(first) != Some(caller_pid) {
+        if let Some(target_pid) = parse_pid(first) {
+            if &parts[1..count] == ["oom_score_adj"] {
+                return Some(Ok(ProcNode::Kernel(
+                    ProcKernelNode::OomScoreAdj,
+                    target_pid,
+                )));
+            }
+        }
         return Some(Err(ENOENT));
     }
     Some(lookup_in_pid_dir(&parts[1..count]))
@@ -181,7 +227,10 @@ fn lookup_in_pid_dir(parts: &[&str]) -> Result<ProcNode, i32> {
 pub fn kernel_only_delegate(node: ProcNode) -> Option<u64> {
     match node {
         ProcNode::Kernel(kernel, number)
-            if kernel.is_directory() || kernel.is_link() || kernel.takes_number() =>
+            if kernel.is_directory()
+                || kernel.is_link()
+                || kernel.takes_number()
+                || (kernel == ProcKernelNode::OomScoreAdj && number != 0) =>
         {
             Some(abi_procfs::encode_delegate(kernel, number))
         }
@@ -224,6 +273,9 @@ pub fn open_delegate_for_flags(node: ProcNode, flags: u64) -> Option<u64> {
     let ProcNode::Kernel(kernel, number) = node else {
         return None;
     };
+    if kernel == ProcKernelNode::OomScoreAdj && number != 0 {
+        return Some(abi_procfs::encode_delegate(kernel, number));
+    }
     if is_ring3_formatted(kernel) && (flags & O_ACCMODE == 0) {
         return None;
     }
@@ -233,14 +285,17 @@ pub fn open_delegate_for_flags(node: ProcNode, flags: u64) -> Option<u64> {
 /// Errno for an `open(flags)` of a delegated node that can never succeed, or
 /// `None` when the kernel should build the snapshot. Only `comm`,
 /// `task/<tid>/comm` and `oom_score_adj` may be opened for writing or with
-/// `O_TRUNC`; `O_CREAT` is always refused; a regular file is not a directory;
+/// `O_TRUNC`; `O_CREAT|O_EXCL` fails with `EEXIST`; a regular file is not a directory;
 /// a magic link is not followed under `O_NOFOLLOW`.
 pub fn delegated_open_errno(node: ProcNode, flags: u64) -> Option<i32> {
     let ProcNode::Kernel(kernel, _) = node else {
         return None;
     };
-    if flags & O_CREAT != 0 {
-        return Some(EACCES);
+    // Every node here already exists, so a plain `O_CREAT` open is an open of
+    // the existing file (Chrome's `WriteFile` opens `oom_score_adj` with
+    // `O_CREAT|O_TRUNC`); only `O_CREAT|O_EXCL` collides.
+    if flags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL) {
+        return Some(EEXIST);
     }
     if !kernel.is_writable() && (flags & O_ACCMODE != 0 || flags & O_TRUNC != 0) {
         return Some(EACCES);
@@ -277,11 +332,225 @@ pub fn ns_dir_entries() -> Vec<(&'static str, u8)> {
 pub fn is_virtual_file(node: ProcNode) -> bool {
     matches!(
         node,
-        ProcNode::MeminfoFile
+        ProcNode::CpuinfoFile
+            | ProcNode::MeminfoFile
             | ProcNode::FilesystemsFile
             | ProcNode::MountsFile
             | ProcNode::UptimeFile
+            | ProcNode::InotifySysctl(_)
     )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CpuInfoSpec {
+    pub vendor_id: String,
+    pub cpu_family: u32,
+    pub model: u32,
+    pub model_name: String,
+    pub stepping: u32,
+    pub flags: String,
+    pub clflush_size: u32,
+    pub phys_bits: u32,
+    pub virt_bits: u32,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn query_x86_cpu_spec() -> CpuInfoSpec {
+    #[allow(unused_unsafe)]
+    let leaf0 = unsafe { core::arch::x86_64::__cpuid(0) };
+    let mut vendor = [0_u8; 12];
+    vendor[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
+    vendor[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
+    vendor[8..12].copy_from_slice(&leaf0.ecx.to_le_bytes());
+    let vendor_id = String::from(core::str::from_utf8(&vendor).unwrap_or("GenuineIntel"));
+
+    let mut cpu_family = 6_u32;
+    let mut model = 0_u32;
+    let mut stepping = 0_u32;
+    let mut clflush_size = 64_u32;
+    let mut flags_list: Vec<&'static str> = Vec::new();
+    if leaf0.eax >= 1 {
+        #[allow(unused_unsafe)]
+        let leaf1 = unsafe { core::arch::x86_64::__cpuid(1) };
+        stepping = leaf1.eax & 0xf;
+        let base_model = (leaf1.eax >> 4) & 0xf;
+        let base_family = (leaf1.eax >> 8) & 0xf;
+        let ext_model = (leaf1.eax >> 16) & 0xf;
+        let ext_family = (leaf1.eax >> 20) & 0xff;
+        cpu_family = if base_family == 0xf {
+            base_family + ext_family
+        } else {
+            base_family
+        };
+        model = if base_family == 6 || base_family == 0xf {
+            (ext_model << 4) | base_model
+        } else {
+            base_model
+        };
+        let line_words = (leaf1.ebx >> 8) & 0xff;
+        if line_words != 0 {
+            clflush_size = line_words * 8;
+        }
+        const EDX_FLAGS: [(u32, &str); 21] = [
+            (0, "fpu"), (1, "vme"), (2, "de"), (3, "pse"), (4, "tsc"),
+            (5, "msr"), (6, "pae"), (7, "mce"), (8, "cx8"), (9, "apic"),
+            (11, "sep"), (12, "mtrr"), (13, "pge"), (14, "mca"), (15, "cmov"),
+            (16, "pat"), (17, "pse36"), (19, "clflush"), (23, "mmx"), (24, "fxsr"),
+            (25, "sse"),
+        ];
+        for (bit, name) in EDX_FLAGS {
+            if (leaf1.edx >> bit) & 1 != 0 {
+                flags_list.push(name);
+            }
+        }
+        if (leaf1.edx >> 26) & 1 != 0 {
+            flags_list.push("sse2");
+        }
+        const ECX_FLAGS: [(u32, &str); 14] = [
+            (0, "pni"), (1, "pclmulqdq"), (9, "ssse3"), (12, "fma"), (13, "cx16"),
+            (19, "sse4_1"), (20, "sse4_2"), (21, "x2apic"), (22, "movbe"),
+            (23, "popcnt"), (25, "aes"), (26, "xsave"), (28, "avx"), (30, "rdrand"),
+        ];
+        for (bit, name) in ECX_FLAGS {
+            if (leaf1.ecx >> bit) & 1 != 0 {
+                flags_list.push(name);
+            }
+        }
+        if (leaf1.ecx >> 31) & 1 != 0 {
+            flags_list.push("hypervisor");
+        }
+    }
+
+    #[allow(unused_unsafe)]
+    let max_ext = unsafe { core::arch::x86_64::__cpuid(0x8000_0000) }.eax;
+    let mut model_name = String::new();
+    if max_ext >= 0x8000_0004 {
+        let mut brand = [0_u8; 48];
+        for i in 0..3_u32 {
+            #[allow(unused_unsafe)]
+            let l = unsafe { core::arch::x86_64::__cpuid(0x8000_0002 + i) };
+            let base = (i as usize) * 16;
+            brand[base..base + 4].copy_from_slice(&l.eax.to_le_bytes());
+            brand[base + 4..base + 8].copy_from_slice(&l.ebx.to_le_bytes());
+            brand[base + 8..base + 12].copy_from_slice(&l.ecx.to_le_bytes());
+            brand[base + 12..base + 16].copy_from_slice(&l.edx.to_le_bytes());
+        }
+        let end = brand.iter().position(|&b| b == 0).unwrap_or(brand.len());
+        if let Ok(s) = core::str::from_utf8(&brand[..end]) {
+            model_name.push_str(s.trim());
+        }
+    }
+    if model_name.is_empty() {
+        model_name.push_str("x86_64 CPU");
+    }
+    if max_ext >= 0x8000_0001 {
+        #[allow(unused_unsafe)]
+        let ext1 = unsafe { core::arch::x86_64::__cpuid(0x8000_0001) };
+        if (ext1.edx >> 11) & 1 != 0 { flags_list.push("syscall"); }
+        if (ext1.edx >> 20) & 1 != 0 { flags_list.push("nx"); }
+        if (ext1.edx >> 29) & 1 != 0 { flags_list.push("lm"); }
+    }
+    let (mut phys_bits, mut virt_bits) = (40_u32, 48_u32);
+    if max_ext >= 0x8000_0008 {
+        #[allow(unused_unsafe)]
+        let ext8 = unsafe { core::arch::x86_64::__cpuid(0x8000_0008) };
+        if ext8.eax & 0xff != 0 { phys_bits = ext8.eax & 0xff; }
+        if (ext8.eax >> 8) & 0xff != 0 { virt_bits = (ext8.eax >> 8) & 0xff; }
+    }
+    CpuInfoSpec {
+        vendor_id,
+        cpu_family,
+        model,
+        model_name,
+        stepping,
+        flags: flags_list.join(" "),
+        clflush_size,
+        phys_bits,
+        virt_bits,
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn query_x86_cpu_spec() -> CpuInfoSpec {
+    CpuInfoSpec {
+        vendor_id: String::from("RustOS"),
+        cpu_family: 6,
+        model: 1,
+        model_name: String::from("Generic CPU"),
+        stepping: 0,
+        flags: String::from("fpu tsc sse sse2 syscall nx lm"),
+        clflush_size: 64,
+        phys_bits: 40,
+        virt_bits: 48,
+    }
+}
+
+pub fn format_cpuinfo_from_spec(online_mask: u64, spec: &CpuInfoSpec) -> Vec<u8> {
+    let mask = if online_mask == 0 { 1 } else { online_mask };
+    let cpu_count = mask.count_ones().max(1);
+    let mut out = String::new();
+    for cpu in 0..64_u32 {
+        if (mask >> cpu) & 1 == 0 {
+            continue;
+        }
+        out.push_str(&format!(
+            "processor\t: {cpu}\n\
+             vendor_id\t: {}\n\
+             cpu family\t: {}\n\
+             model\t\t: {}\n\
+             model name\t: {}\n\
+             stepping\t: {}\n\
+             physical id\t: 0\n\
+             siblings\t: {cpu_count}\n\
+             core id\t\t: {cpu}\n\
+             cpu cores\t: {cpu_count}\n\
+             fpu\t\t: yes\n\
+             fpu_exception\t: yes\n\
+             wp\t\t: yes\n\
+             flags\t\t: {}\n\
+             clflush size\t: {}\n\
+             cache_alignment\t: {}\n\
+             address sizes\t: {} bits physical, {} bits virtual\n\n",
+            spec.vendor_id,
+            spec.cpu_family,
+            spec.model,
+            spec.model_name,
+            spec.stepping,
+            spec.flags,
+            spec.clflush_size,
+            spec.clflush_size,
+            spec.phys_bits,
+            spec.virt_bits,
+        ));
+    }
+    out.into_bytes()
+}
+
+pub fn format_cpuinfo(online_mask: u64) -> Vec<u8> {
+    let spec = query_x86_cpu_spec();
+    format_cpuinfo_from_spec(online_mask, &spec)
+}
+
+pub fn format_inotify_sysctl(kind: InotifySysctlKind) -> Vec<u8> {
+    let val = match kind {
+        InotifySysctlKind::MaxUserWatches => crate::inotify::MAX_USER_WATCHES,
+        InotifySysctlKind::MaxUserInstances => crate::inotify::MAX_USER_INSTANCES,
+        InotifySysctlKind::MaxQueuedEvents => crate::inotify::MAX_QUEUED_EVENTS,
+    };
+    format!("{val}\n").into_bytes()
+}
+
+pub fn proc_sys_dir_children(path: &str) -> Option<&'static [(&'static str, u8)]> {
+    Some(match path {
+        "/proc/sys" => &[("fs", DT_DIR)],
+        "/proc/sys/fs" => &[("inotify", DT_DIR)],
+        "/proc/sys/fs/inotify" => &[
+            ("max_queued_events", DT_REG),
+            ("max_user_instances", DT_REG),
+            ("max_user_watches", DT_REG),
+        ],
+        _ => return None,
+    })
 }
 
 pub fn format_meminfo(snapshot: &MemInfoSnapshot) -> Vec<u8> {
@@ -427,11 +696,16 @@ pub fn link_target(node: ProcNode, caller_pid: u64, exec_path: &[u8]) -> Result<
         }
         ProcNode::PidDir
         | ProcNode::NsDir
+        | ProcNode::SysDir
+        | ProcNode::SysFsDir
+        | ProcNode::SysFsInotifyDir
         | ProcNode::Kernel(..)
+        | ProcNode::CpuinfoFile
         | ProcNode::MeminfoFile
         | ProcNode::FilesystemsFile
         | ProcNode::MountsFile
-        | ProcNode::UptimeFile => Err(EINVAL),
+        | ProcNode::UptimeFile
+        | ProcNode::InotifySysctl(_) => Err(EINVAL),
     }
 }
 
@@ -473,10 +747,23 @@ fn node_inode(node: ProcNode, caller_pid: u64) -> u64 {
             name.push_str(core::str::from_utf8(&pid).unwrap_or(""));
             name.push_str("/exe");
         }
+        ProcNode::CpuinfoFile => name.push_str("cpuinfo"),
         ProcNode::MeminfoFile => name.push_str("meminfo"),
         ProcNode::FilesystemsFile => name.push_str("filesystems"),
         ProcNode::MountsFile => name.push_str("mounts"),
         ProcNode::UptimeFile => name.push_str("uptime"),
+        ProcNode::SysDir => name.push_str("sys"),
+        ProcNode::SysFsDir => name.push_str("sys/fs"),
+        ProcNode::SysFsInotifyDir => name.push_str("sys/fs/inotify"),
+        ProcNode::InotifySysctl(InotifySysctlKind::MaxUserWatches) => {
+            name.push_str("sys/fs/inotify/max_user_watches")
+        }
+        ProcNode::InotifySysctl(InotifySysctlKind::MaxUserInstances) => {
+            name.push_str("sys/fs/inotify/max_user_instances")
+        }
+        ProcNode::InotifySysctl(InotifySysctlKind::MaxQueuedEvents) => {
+            name.push_str("sys/fs/inotify/max_queued_events")
+        }
         ProcNode::NsDir => {
             name.push_str(core::str::from_utf8(&pid).unwrap_or(""));
             name.push_str("/ns");
@@ -493,13 +780,19 @@ fn node_inode(node: ProcNode, caller_pid: u64) -> u64 {
 
 fn node_mode(node: ProcNode) -> u32 {
     match node {
-        ProcNode::PidDir | ProcNode::NsDir => PID_DIR_MODE,
+        ProcNode::PidDir
+        | ProcNode::NsDir
+        | ProcNode::SysDir
+        | ProcNode::SysFsDir
+        | ProcNode::SysFsInotifyDir => PID_DIR_MODE,
         ProcNode::Kernel(kernel, _) => kernel.mode(),
         ProcNode::SelfLink | ProcNode::ExeLink | ProcNode::NsLink(_) => SYMLINK_MODE,
-        ProcNode::MeminfoFile
+        ProcNode::CpuinfoFile
+        | ProcNode::MeminfoFile
         | ProcNode::FilesystemsFile
         | ProcNode::MountsFile
-        | ProcNode::UptimeFile => REG_READONLY_MODE,
+        | ProcNode::UptimeFile
+        | ProcNode::InotifySysctl(_) => REG_READONLY_MODE,
     }
 }
 
@@ -507,7 +800,10 @@ fn node_nlink(node: ProcNode) -> u32 {
     match node {
         // `/proc/<pid>` contains `.`, `..`, `fd`, `ns`, and `task`.
         ProcNode::PidDir => 5,
-        ProcNode::NsDir => 2,
+        ProcNode::NsDir
+        | ProcNode::SysDir
+        | ProcNode::SysFsDir
+        | ProcNode::SysFsInotifyDir => 2,
         ProcNode::Kernel(ProcKernelNode::TaskDir, _) => 3,
         ProcNode::Kernel(kernel, _) if kernel.is_directory() => 2,
         _ => 1,
@@ -617,7 +913,41 @@ mod tests {
             Some(Ok(ProcNode::MountsFile))
         );
         assert_eq!(lookup("/proc/7/mounts", 7), Some(Ok(ProcNode::MountsFile)));
-        assert_eq!(lookup("/proc/cpuinfo", 7), Some(Err(ENOENT)));
+        assert_eq!(lookup("/proc/cpuinfo", 7), Some(Ok(ProcNode::CpuinfoFile)));
+        assert_eq!(
+            lookup("/proc/sys/fs/inotify/max_user_watches", 7),
+            Some(Ok(ProcNode::InotifySysctl(InotifySysctlKind::MaxUserWatches)))
+        );
+        assert_eq!(
+            lookup("/proc/8/oom_score_adj", 7),
+            Some(Ok(ProcNode::Kernel(ProcKernelNode::OomScoreAdj, 8)))
+        );
+        assert_ne!(kernel_only_delegate(ProcNode::Kernel(ProcKernelNode::OomScoreAdj, 8)), None);
+        assert_ne!(open_delegate_for_flags(ProcNode::Kernel(ProcKernelNode::OomScoreAdj, 8), 0), None);
+        assert_eq!(open_delegate_for_flags(ProcNode::Kernel(ProcKernelNode::OomScoreAdj, 0), 0), None);
+        let cpuinfo = format_cpuinfo_from_spec(
+            0b101,
+            &CpuInfoSpec {
+                vendor_id: String::from("GenuineIntel"),
+                cpu_family: 6,
+                model: 85,
+                model_name: String::from("Test Xeon"),
+                stepping: 4,
+                flags: String::from("fpu sse sse2 lm"),
+                clflush_size: 64,
+                phys_bits: 40,
+                virt_bits: 48,
+            },
+        );
+        let text = core::str::from_utf8(&cpuinfo).unwrap();
+        assert!(text.contains("processor\t: 0\n"));
+        assert!(text.contains("processor\t: 2\n"));
+        assert!(!text.contains("processor\t: 1\n"));
+        assert!(text.contains("siblings\t: 2\n"));
+        assert_eq!(
+            format_inotify_sysctl(InotifySysctlKind::MaxUserWatches),
+            format!("{}\n", crate::inotify::MAX_USER_WATCHES).into_bytes()
+        );
         assert_eq!(lookup("/proc/self/exe/x", 7), Some(Err(ENOENT)));
         assert_eq!(lookup("/proc/self/mem", 7), Some(Err(ENOENT)));
         assert_eq!(lookup("/proc/self/fd/abc", 7), Some(Err(ENOENT)));
@@ -709,7 +1039,8 @@ mod tests {
             assert_eq!(delegated_open_errno(writable, 1), None);
             assert_eq!(delegated_open_errno(writable, 2), None);
             assert_eq!(delegated_open_errno(writable, 1 | O_TRUNC), None);
-            assert_eq!(delegated_open_errno(writable, 1 | O_CREAT), Some(EACCES));
+            assert_eq!(delegated_open_errno(writable, 1 | O_CREAT | O_TRUNC), None);
+            assert_eq!(delegated_open_errno(writable, 1 | O_CREAT | O_EXCL), Some(EEXIST));
             assert_eq!(delegated_open_errno(writable, O_DIRECTORY), Some(ENOTDIR));
         }
     }

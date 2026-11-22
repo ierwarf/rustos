@@ -122,6 +122,30 @@ fn report_mutation_result(action: &str, result: MutationCompletion) {
     }
 }
 
+/// How long a click keeps asking while other programs hold the application
+/// budget (a session harness such as `ipcbench` holds it for its whole run).
+const BUDGET_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const BUDGET_RETRY_ATTEMPTS: u32 = 90;
+
+/// `EAGAIN` from runtimed is a definite refusal at admission: nothing was
+/// created, so a fresh transaction is safe. Every other outcome, `Unknown`
+/// included, is final here and is never resubmitted.
+fn launch_until_budget_admits(
+    mut attempt: impl FnMut() -> Result<MutationCompletion, i32>,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<MutationCompletion, i32> {
+    let mut refused = 0;
+    loop {
+        match attempt()? {
+            MutationCompletion::Rejected(libc::EAGAIN) if refused < BUDGET_RETRY_ATTEMPTS => {
+                refused += 1;
+                sleep(BUDGET_RETRY_INTERVAL);
+            }
+            other => return Ok(other),
+        }
+    }
+}
+
 pub(super) fn launch_program_async(desktop_file_id: String) {
     if !LAUNCH_GATE.try_begin(&desktop_file_id) {
         diag_line("uiserver: launch request ignored: already launching or too many in flight");
@@ -133,8 +157,13 @@ pub(super) fn launch_program_async(desktop_file_id: String) {
         "uiserver-program-launch",
         move || {
             match RuntimeClient::open_default().and_then(|runtime| {
-                let transaction = runtime.launch_transaction(for_thread.as_str())?;
-                Ok(execute_mutation(&runtime, &transaction))
+                launch_until_budget_admits(
+                    || {
+                        let transaction = runtime.launch_transaction(for_thread.as_str())?;
+                        Ok(execute_mutation(&runtime, &transaction))
+                    },
+                    std::thread::sleep,
+                )
             }) {
                 Ok(result) => report_mutation_result("launch", result),
                 Err(errno) => diag_line(format!(
@@ -191,8 +220,8 @@ pub(super) fn terminate_session_async(session_handle: u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_mutation, reconcile_mutation, LaunchGate, MutationCompletion,
-        MAX_LAUNCHES_IN_FLIGHT,
+        execute_mutation, launch_until_budget_admits, reconcile_mutation, LaunchGate,
+        MutationCompletion, BUDGET_RETRY_ATTEMPTS, MAX_LAUNCHES_IN_FLIGHT,
     };
     use runtime_control::protocol::{
         RuntimeRequest, RuntimeResponse, PROTOCOL_VERSION, REQUEST_FLAG_QUERY,
@@ -361,6 +390,54 @@ mod tests {
             );
             assert_eq!(outcome, expected);
         }
+    }
+
+    #[test]
+    fn a_budget_refusal_is_retried_but_unknown_and_other_rejections_are_not() {
+        let mut results = vec![
+            Ok(MutationCompletion::Rejected(libc::EAGAIN)),
+            Ok(MutationCompletion::Rejected(libc::EAGAIN)),
+            Ok(MutationCompletion::Committed),
+        ]
+        .into_iter();
+        let mut sleeps = 0;
+        let outcome = launch_until_budget_admits(|| results.next().unwrap(), |_| sleeps += 1);
+        assert_eq!(outcome, Ok(MutationCompletion::Committed));
+        assert_eq!(sleeps, 2);
+
+        for terminal in [
+            MutationCompletion::Unknown(libc::EOWNERDEAD),
+            MutationCompletion::Rejected(libc::EINVAL),
+        ] {
+            let mut calls = 0;
+            let outcome = launch_until_budget_admits(
+                || {
+                    calls += 1;
+                    Ok(match terminal {
+                        MutationCompletion::Unknown(e) => MutationCompletion::Unknown(e),
+                        MutationCompletion::Rejected(e) => MutationCompletion::Rejected(e),
+                        MutationCompletion::Committed => MutationCompletion::Committed,
+                    })
+                },
+                |_| panic!("a final outcome must not sleep"),
+            );
+            assert_eq!(outcome, Ok(terminal));
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn a_permanent_budget_refusal_gives_up_after_the_bounded_retries() {
+        let mut calls = 0;
+        let outcome = launch_until_budget_admits(
+            || {
+                calls += 1;
+                Ok(MutationCompletion::Rejected(libc::EAGAIN))
+            },
+            |_| {},
+        );
+        assert_eq!(outcome, Ok(MutationCompletion::Rejected(libc::EAGAIN)));
+        assert_eq!(calls, BUDGET_RETRY_ATTEMPTS + 1);
     }
 
     #[test]

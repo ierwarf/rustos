@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use driver_domain_protocol::{
-    DVM_APP_BUFFER_APERTURE_BYTES, DVM_APP_BUFFER_PHYS_ADDR, DVM_BLOCK_APERTURE_BYTES, DVM_BLOCK_FEATURE_FLUSH, DVM_BLOCK_FLAG_DVM_READY,
+    DVM_APP_BUFFER_APERTURE_BYTES, DVM_BLOCK_APERTURE_BYTES, DVM_BLOCK_FEATURE_FLUSH, DVM_BLOCK_FLAG_DVM_READY,
     DVM_BLOCK_FLAG_READ_ONLY, DVM_BLOCK_FLAG_RUSTOS_READY, DVM_BLOCK_HEADER_RECORD_BYTES,
     DVM_GPU_ATLAS_POOL_HEADER_OFFSET, DVM_GPU_RENDER_MAX_DIMENSION,
     DVM_GUI_SURFACE_POOL_HOST_RECORD_OFFSET,
@@ -244,7 +244,6 @@ const DVM_GUEST_MEMORY: &str = "2048M,maxmem=3G,slots=2";
 // QEMU maps the shared pixel backend as cacheable device memory at this
 // reserved, 2 MiB-aligned guest-physical address in both guests. The ivshmem
 // BAR carries only bounded control records and MSI-X doorbells.
-const DVM_DISPLAY_PIXEL_PHYS_ADDR: u64 = 0x1_0000_0000;
 const DVM_DISPLAY_FIRST_PEER_TIMEOUT: Duration = Duration::from_secs(5);
 const DVM_BLOCK_FIRST_PEER_TIMEOUT: Duration = Duration::from_secs(5);
 const INTERACTIVE_IDLE_TICKS: usize = 3;
@@ -898,4 +897,6 @@ include!("kvm/launch_desktop.rs");
 include!("kvm/mmap_cost_probe.rs");
 include!("kvm/application_limit.rs");
 include!("kvm/job_policy.rs");
+include!("kvm/screendump.rs");
+include!("kvm/pixel_evidence.rs");
 include!("kvm/tests.rs");

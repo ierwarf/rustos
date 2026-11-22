@@ -61,6 +61,7 @@ pub(super) fn milestone_output_class(name: &str) -> MilestoneOutputClass {
             || name == "pager-user-anon-fault-refused"
             || name == "linux-thread-clone-rejected"
             || name == "linux-thread-clone-stage"
+            || name == "linux-thread-stack-exhausted"
             || name == "linux-fork-stage"
             || name == "linux-fork-procd-refused"
             || name == "root-creation-refused"

@@ -23,8 +23,9 @@ use nucleus_core::util::{
     ring::RingBuffer,
 };
 use rustos_user_abi::syscall::{
-    VFS_DEVICE_ACCESS_DRM_COMPAT, VFS_IPC_OP_CHMOD, VFS_IPC_OP_FSYNC, VFS_IPC_OP_MKNOD,
-    VFS_IPC_OP_PWRITE64,
+    VFS_DEVICE_ACCESS_DRM_COMPAT, VFS_IPC_HANDLE_KIND_INOTIFY, VFS_IPC_OP_CHMOD,
+    VFS_IPC_OP_FSYNC, VFS_IPC_OP_INOTIFY_ADD_WATCH, VFS_IPC_OP_INOTIFY_INIT,
+    VFS_IPC_OP_INOTIFY_RM_WATCH, VFS_IPC_OP_MKNOD, VFS_IPC_OP_PWRITE64,
 };
 
 const VFS_DEVICE_ACCESS_NULL: u16 = VFS_DEVICE_ACCESS_DRM_COMPAT + 1;
@@ -289,6 +290,7 @@ fn install_remote_vfs_response(
         VFS_IPC_HANDLE_KIND_FILE => multitask::RemoteVfsHandleKind::File,
         VFS_IPC_HANDLE_KIND_DIR => multitask::RemoteVfsHandleKind::Directory,
         VFS_IPC_HANDLE_KIND_DEVICE => multitask::RemoteVfsHandleKind::Device,
+        VFS_IPC_HANDLE_KIND_INOTIFY => multitask::RemoteVfsHandleKind::Inotify,
         _ => {
             let _ = call_vfs_remote_close_bounded(remote_id);
             return Err(LINUX_EINVAL);
@@ -774,6 +776,9 @@ pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
             }
         }
     }
+    if remote.kind() == multitask::RemoteVfsHandleKind::Inotify {
+        return read_inotify_vfs(fd, remote.remote_id(), user_ptr, user_len);
+    }
     read_remote_vfs(fd, remote.remote_id(), user_ptr, user_len, None)
 }
 
@@ -890,6 +895,9 @@ pub fn syscall_linux_vfs_pread64(fd: u64, user_ptr: u64, user_len: u64, offset: 
     };
     if !rights.allows_read() {
         return linux_errno(LINUX_EBADF);
+    }
+    if remote.kind() == multitask::RemoteVfsHandleKind::Inotify {
+        return linux_errno(LINUX_ESPIPE);
     }
     if remote.kind() == multitask::RemoteVfsHandleKind::Device
         && let Some(result) = try_read_virtual_device(remote.device_access(), user_ptr, user_len)
@@ -1058,6 +1066,9 @@ pub fn syscall_linux_vfs_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
     if !rights.allows_write() {
         return linux_errno(LINUX_EBADF);
     }
+    if remote.kind() == multitask::RemoteVfsHandleKind::Inotify {
+        return linux_errno(LINUX_ESPIPE);
+    }
     if remote.kind() == multitask::RemoteVfsHandleKind::Device
         && let Some(result) = try_write_virtual_device(remote.device_access(), user_ptr, user_len)
     {
@@ -1099,6 +1110,9 @@ pub fn syscall_linux_vfs_pwrite64(fd: u64, user_ptr: u64, user_len: u64, offset:
     };
     if !rights.allows_write() {
         return linux_errno(LINUX_EBADF);
+    }
+    if remote.kind() == multitask::RemoteVfsHandleKind::Inotify {
+        return linux_errno(LINUX_ESPIPE);
     }
     if remote.kind() == multitask::RemoteVfsHandleKind::Device
         && let Some(result) = try_write_virtual_device(remote.device_access(), user_ptr, user_len)
@@ -2417,6 +2431,266 @@ fn socket_writev_errno(errno: i64, nonblocking: bool) -> i64 {
 
 fn socket_read_with_length(len: u64, read: impl FnOnce() -> u64) -> u64 {
     if len == 0 { 0 } else { read() }
+}
+
+pub fn syscall_linux_inotify_init() -> u64 {
+    syscall_linux_inotify_init1(0)
+}
+
+pub fn syscall_linux_inotify_init1(flags: u64) -> u64 {
+    if flags & !(linux_abi::IN_NONBLOCK | linux_abi::IN_CLOEXEC) != 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mut request = new_vfs_request(VFS_IPC_OP_INOTIFY_INIT);
+    request.arg0 = flags;
+    request.arg3 = mint_service_object_id();
+    let response = match call_pinned_remote_vfs_request(&request) {
+        Ok(response) => response,
+        Err(errno) => {
+            let _ = call_vfs_remote_close_bounded(request.arg3);
+            return linux_errno(errno);
+        }
+    };
+    if let Err(errno) = ensure_vfs_status(&response) {
+        let _ = call_vfs_remote_close_bounded(request.arg3);
+        return linux_errno(errno);
+    }
+    let open_flags = linux_abi::O_RDONLY | (flags & (linux_abi::O_NONBLOCK | linux_abi::O_CLOEXEC));
+    match install_remote_vfs_response(response, request.arg3, open_flags, false) {
+        Ok(fd) => fd,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+pub fn syscall_linux_inotify_add_watch(fd: u64, pathname: u64, mask: u64) -> u64 {
+    let Some(remote) = current_remote_vfs_handle(fd) else {
+        let exists = multitask::with_current_user_process_state(|_, _, process_state| {
+            process_state.handles().get(fd).is_some()
+        })
+        .unwrap_or(false);
+        return linux_errno(if exists { LINUX_EINVAL } else { LINUX_EBADF });
+    };
+    if remote.kind() != multitask::RemoteVfsHandleKind::Inotify {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mask_u32 = mask as u32;
+    if (mask_u32 & (linux_abi::IN_MASK_ADD | linux_abi::IN_MASK_CREATE))
+        == (linux_abi::IN_MASK_ADD | linux_abi::IN_MASK_CREATE)
+    {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let allowed = linux_abi::IN_ALL_EVENTS
+        | linux_abi::IN_UNMOUNT
+        | linux_abi::IN_Q_OVERFLOW
+        | linux_abi::IN_IGNORED
+        | linux_abi::IN_ONLYDIR
+        | linux_abi::IN_DONT_FOLLOW
+        | linux_abi::IN_EXCL_UNLINK
+        | linux_abi::IN_MASK_CREATE
+        | linux_abi::IN_MASK_ADD
+        | linux_abi::IN_ISDIR
+        | linux_abi::IN_ONESHOT;
+    if mask_u32 & !allowed != 0 || mask_u32 & linux_abi::IN_ALL_EVENTS == 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let path = match copy_current_user_path(pathname, VFS_IPC_PATH_CAPACITY) {
+        Ok(path) => path,
+        Err(errno) => return linux_errno(errno),
+    };
+    let mut request = new_vfs_request(VFS_IPC_OP_INOTIFY_ADD_WATCH);
+    request.fd = fd;
+    request.remote_id = remote.remote_id();
+    request.arg0 = u64::from(mask_u32);
+    if let Err(errno) = populate_vfs_path_base(&mut request, linux_abi::AT_FDCWD as u64, &path) {
+        return linux_errno(errno);
+    }
+    match call_pinned_remote_vfs_request(&request).and_then(|response| {
+        ensure_vfs_status(&response)?;
+        Ok(response.value)
+    }) {
+        Ok(wd) => wd,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+pub fn syscall_linux_inotify_rm_watch(fd: u64, wd: u64) -> u64 {
+    let Some(remote) = current_remote_vfs_handle(fd) else {
+        let exists = multitask::with_current_user_process_state(|_, _, process_state| {
+            process_state.handles().get(fd).is_some()
+        })
+        .unwrap_or(false);
+        return linux_errno(if exists { LINUX_EINVAL } else { LINUX_EBADF });
+    };
+    if remote.kind() != multitask::RemoteVfsHandleKind::Inotify {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let wd_i32 = wd as u32 as i32;
+    if wd_i32 <= 0 {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let mut request = new_vfs_request(VFS_IPC_OP_INOTIFY_RM_WATCH);
+    request.fd = fd;
+    request.remote_id = remote.remote_id();
+    request.arg0 = u64::from(wd_i32 as u32);
+    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response)) {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+pub(super) fn try_inotify_fionread(fd: u64, arg: u64) -> Option<u64> {
+    let remote = current_remote_vfs_handle(fd)?;
+    if remote.kind() != multitask::RemoteVfsHandleKind::Inotify {
+        return None;
+    }
+    let mut request = new_vfs_request(VFS_IPC_OP_FCNTL);
+    request.fd = fd;
+    request.remote_id = remote.remote_id();
+    request.arg0 = linux_abi::FIONREAD;
+    let bytes = match call_pinned_remote_vfs_request(&request).and_then(|response| {
+        ensure_vfs_status(&response)?;
+        Ok(response.value.min(i32::MAX as u64) as i32)
+    }) {
+        Ok(bytes) => bytes,
+        Err(errno) => return Some(linux_errno(errno)),
+    };
+    Some(match usermem::write_current_user_bytes(arg, &bytes.to_le_bytes()) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+    })
+}
+
+fn read_inotify_vfs(fd: u64, remote_id: u64, user_ptr: u64, user_len: u64) -> u64 {
+    if let Err(errno) = acquire_current_remote_vfs_ref(fd, remote_id) {
+        return linux_errno(errno);
+    }
+    let result = read_inotify_vfs_pinned(fd, remote_id, user_ptr, user_len);
+    release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
+    result
+}
+
+fn read_inotify_vfs_pinned(fd: u64, remote_id: u64, user_ptr: u64, user_len: u64) -> u64 {
+    let Ok(user_len) = usize::try_from(user_len) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if user_len < core::mem::size_of::<linux_abi::LinuxInotifyEventHeader>() {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    let chunk_len = user_len.min(VFS_IPC_PAYLOAD_CAPACITY);
+    let issue_read = || -> Result<VfsIpcResponse, i64> {
+        let mut request = new_vfs_request(VFS_IPC_OP_READ);
+        request.fd = fd;
+        request.remote_id = remote_id;
+        request.arg1 = chunk_len as u64;
+        call_vfs_ipc_request(&request)
+    };
+    let copy_events = |response: &VfsIpcResponse| -> u64 {
+        let count = response.payload_len as usize;
+        if count == 0 || count > chunk_len || count > response.payload.len() {
+            return linux_errno(LINUX_EINVAL);
+        }
+        match usermem::write_current_user_bytes(user_ptr, &response.payload[..count]) {
+            Ok(()) => count as u64,
+            Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+        }
+    };
+    loop {
+        let response = match issue_read() {
+            Ok(response) => response,
+            Err(errno) => return linux_errno(errno),
+        };
+        if response.status == 0 {
+            return copy_events(&response);
+        }
+        if response.status.unsigned_abs() != LINUX_EAGAIN as u32 {
+            return linux_errno(i64::from(response.status.unsigned_abs()));
+        }
+        let Some(status_flags) = current_fd_status_flags(fd) else {
+            return linux_errno(LINUX_EBADF);
+        };
+        if status_flags & linux_abi::O_NONBLOCK != 0 {
+            return linux_errno(LINUX_EAGAIN);
+        }
+        if current_wait_interrupted() {
+            return linux_errno(LINUX_EINTR);
+        }
+        let Some(task_id) = multitask::current_task_id() else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        let Some(process_id) = multitask::current_user_process_id() else {
+            return linux_errno(LINUX_EINVAL);
+        };
+        let observation = [super::super::broker_ops::waitset_broker_ops::ProviderObservation {
+            provider: rustos_user_abi::syscall::WAITSET_PROVIDER_VFSD,
+            object_id: remote_id,
+            generation: response.aux.max(1),
+        }];
+        if let Err(errno) = super::super::broker_ops::waitset_broker_ops::register_waitset_waiters(
+            task_id,
+            process_id,
+            &observation,
+        ) {
+            return linux_errno(errno);
+        }
+        let second = match issue_read() {
+            Ok(response) => response,
+            Err(errno) => {
+                super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+                return linux_errno(errno);
+            }
+        };
+        if second.status == 0 {
+            super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+            return copy_events(&second);
+        }
+        if second.status.unsigned_abs() != LINUX_EAGAIN as u32 {
+            super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+            return linux_errno(i64::from(second.status.unsigned_abs()));
+        }
+        if second.aux.max(1) != observation[0].generation {
+            super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+            continue;
+        }
+        if !multitask::arm_block_current_task() {
+            super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+            if multitask::current_task_id() != Some(task_id) {
+                return linux_errno(LINUX_EINVAL);
+            }
+            multitask::cond_resched();
+            continue;
+        }
+        if !super::super::broker_ops::waitset_broker_ops::waitset_waiters_match(
+            task_id,
+            process_id,
+            &observation,
+        ) {
+            super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+            let _ = multitask::cancel_block_current_task();
+            continue;
+        }
+        if super::poll_epoll::has_unmasked_pending_signal() {
+            super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+            let _ = multitask::cancel_block_current_task();
+            if current_wait_interrupted() {
+                return linux_errno(LINUX_EINTR);
+            }
+            continue;
+        }
+        match multitask::commit_block_current_task_and_yield() {
+            Some(true) | Some(false) => {}
+            None => {
+                super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+                return linux_errno(LINUX_EINVAL);
+            }
+        }
+        super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+        if current_wait_interrupted() {
+            return linux_errno(LINUX_EINTR);
+        }
+    }
 }
 
 fn populate_writev_socket_payload(request: &mut NetdIpcRequest, snapshot: &super::vfs_meta::SocketSnapshot, payload: &[u8]) -> Result<(), i64> {

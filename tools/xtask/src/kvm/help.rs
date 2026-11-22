@@ -130,6 +130,16 @@ options:
                        `launched` record. Implies --gui-dvm-surfaces; an id that is
                        malformed or absent from the staged registry is refused
                        before boot. Refused with --storage-dvm-only/--smp-iteration
+  --screendump <path>  capture the live DVM virtio-gpu-gl-pci framebuffer via HMP
+                       `screendump` to this P6 PPM path before shutting down and
+                       verify non-blank multi-color UI pixels (implies
+                       --gui-dvm-surfaces; refused with --physical-gpu)
+  --chrome-web-probe   boot Chrome (`chrome.desktop`) with `--dvm-network-shmem`
+                       and writable storage, wait for its Wayland window, hold
+                       briefly, then require uiserver's `pixel-probe` report of a
+                       Chrome-titled window with real (non-blank, multi-color)
+                       committed pixels. No host screendump: virgl scanouts leave
+                       QEMU no surface
   --smp-iteration      require framed, checksummed per-CPU scheduler lifecycle
                        evidence; restricted to a bounded 30-second KVM smoke
   --smp-ring3-qualification

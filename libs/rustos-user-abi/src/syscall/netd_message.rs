@@ -4,6 +4,13 @@
 
 pub const HEADER_SIZE: usize = 16;
 pub const IPV4_ADDRESS_SIZE: usize = 16;
+pub const IPV6_ADDRESS_SIZE: usize = 28;
+pub const MIN_ADDRESS_SIZE: usize = 2;
+pub const MAX_UNIX_ADDRESS_SIZE: usize = 110;
+
+fn valid_address_len(len: usize) -> bool {
+    len == 0 || (MIN_ADDRESS_SIZE..=MAX_UNIX_ADDRESS_SIZE).contains(&len)
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct Message<'a> {
@@ -23,7 +30,7 @@ pub fn decode(bytes: &[u8]) -> Option<Message<'_>> {
     let data_len: usize = field(0)?;
     let control_len: usize = field(4)?;
     let address_len: usize = field(12)?;
-    if address_len != 0 && address_len != IPV4_ADDRESS_SIZE {
+    if !valid_address_len(address_len) {
         return None;
     }
     let control_start = HEADER_SIZE.checked_add(data_len)?;
@@ -47,7 +54,7 @@ pub fn encode(
     flags: u32,
     address: &[u8],
 ) -> Option<usize> {
-    if !address.is_empty() && address.len() != IPV4_ADDRESS_SIZE {
+    if !valid_address_len(address.len()) {
         return None;
     }
     let control_start = HEADER_SIZE.checked_add(data.len())?;

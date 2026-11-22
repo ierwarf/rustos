@@ -331,7 +331,11 @@ impl VfsState {
                         }
                         Metadata::plain(RemoteKind::Directory, 0, path_inode(path.as_bytes()))
                     }
-                    vfsd::proc_fs::ProcNode::PidDir | vfsd::proc_fs::ProcNode::NsDir => {
+                    vfsd::proc_fs::ProcNode::PidDir
+                    | vfsd::proc_fs::ProcNode::NsDir
+                    | vfsd::proc_fs::ProcNode::SysDir
+                    | vfsd::proc_fs::ProcNode::SysFsDir
+                    | vfsd::proc_fs::ProcNode::SysFsInotifyDir => {
                         if writable || create || truncate {
                             return Err(EACCES);
                         }
@@ -390,17 +394,30 @@ impl VfsState {
                         if writable {
                             return Err(EACCES);
                         }
-                        let len = lock_vfs_storage().proc_virtual_file_bytes(file)?.len() as u64;
+                        let bytes = lock_vfs_storage().proc_virtual_file_bytes(file)?;
+                        let len = bytes.len() as u64;
+                        pending_proc_snapshot = Some(bytes);
                         Metadata::plain(RemoteKind::File, len, path_inode(path.as_bytes()))
                     }
                 }
             }
             Some(Err(errno)) => return Err(errno),
             None => {
-                if vfsd::proc_fs::sys_virtual_file(path).is_some()
-                    || path == "/sys"
-                    || path.starts_with("/sys/")
-                {
+                if let Some(sys_file) = vfsd::proc_fs::sys_virtual_file(path) {
+                    if flags & O_DIRECTORY != 0 {
+                        return Err(ENOTDIR);
+                    }
+                    if writable {
+                        return Err(EACCES);
+                    }
+                    if create || truncate {
+                        return Err(EROFS);
+                    }
+                    let bytes = lock_vfs_storage().sys_virtual_file_bytes(sys_file)?;
+                    let len = bytes.len() as u64;
+                    pending_proc_snapshot = Some(bytes);
+                    Metadata::plain(RemoteKind::File, len, path_inode(path.as_bytes()))
+                } else if path == "/sys" || path.starts_with("/sys/") {
                     if writable {
                         return Err(EACCES);
                     }
@@ -723,6 +740,22 @@ impl VfsStorage {
                     swap_free_bytes: info.freeswap.saturating_mul(unit),
                 }))
             }
+            ProcNode::CpuinfoFile => {
+                let mut mask = 0_u64;
+                let status = unsafe {
+                    rustos_svc_runtime::syscall::syscall3(
+                        linux_abi::SYS_SCHED_GETAFFINITY,
+                        0,
+                        core::mem::size_of::<u64>() as u64,
+                        (&mut mask as *mut u64) as u64,
+                    )
+                };
+                if status < 0 || mask == 0 {
+                    mask = 1;
+                }
+                Ok(proc_fs::format_cpuinfo(mask))
+            }
+            ProcNode::InotifySysctl(kind) => Ok(proc_fs::format_inotify_sysctl(kind)),
             ProcNode::FilesystemsFile => Ok(proc_fs::format_filesystems().to_vec()),
             ProcNode::MountsFile => Ok(proc_fs::format_mounts(&self.mounts.mount_infos())),
             ProcNode::UptimeFile => {
@@ -731,6 +764,9 @@ impl VfsStorage {
             ProcNode::SelfLink
             | ProcNode::PidDir
             | ProcNode::ExeLink
+            | ProcNode::SysDir
+            | ProcNode::SysFsDir
+            | ProcNode::SysFsInotifyDir
             | ProcNode::NsDir
             | ProcNode::NsLink(_)
             | ProcNode::Kernel(..) => Err(EINVAL),
@@ -799,6 +835,9 @@ impl VfsStorage {
                         return res.map_err(vfsd::map_fs_error);
                     }
                 }
+                if self.file_bytes_cache.contains_key(&key) {
+                    self.file_bytes_cache_lru.touch(&key);
+                }
                 if let Some(bytes) = self.file_bytes_cache.get(&key) {
                     return Ok(copy_file_cache_range(bytes, start, dest));
                 }
@@ -807,16 +846,26 @@ impl VfsStorage {
                 if let Some(expected_len) = cacheable_len {
                     let bytes = read_volume_file_to_vec(&*volume, &rel_path, expected_len)?;
                     let read = copy_file_cache_range(&bytes, start, dest);
-                    if self
+                    while self
                         .file_bytes_cache_bytes
                         .checked_add(bytes.len())
                         .is_none_or(|total| total > FILE_BYTES_CACHE_BUDGET_BYTES)
                     {
-                        self.file_bytes_cache.clear();
-                        self.file_bytes_cache_bytes = 0;
+                        let Some(evict_key) = self.file_bytes_cache_lru.pop_lru() else {
+                            self.file_bytes_cache.clear();
+                            self.file_bytes_cache_bytes = 0;
+                            break;
+                        };
+                        if let Some(old) = self.file_bytes_cache.remove(&evict_key) {
+                            self.file_bytes_cache_bytes =
+                                self.file_bytes_cache_bytes.saturating_sub(old.len());
+                        }
                     }
-                    self.file_bytes_cache_bytes += bytes.len();
-                    self.file_bytes_cache.insert(key, bytes);
+                    if bytes.len() <= FILE_BYTES_CACHE_BUDGET_BYTES {
+                        self.file_bytes_cache_bytes += bytes.len();
+                        self.file_bytes_cache_lru.touch(&key);
+                        self.file_bytes_cache.insert(key, bytes);
+                    }
                     return Ok(read);
                 }
 
@@ -848,17 +897,26 @@ impl VfsStorage {
                 return Err(EIO);
             }
             let cost = map.metadata_bytes();
-            if self.read_maps.len() >= 128
+            while self.read_maps.len() >= 128
                 || self
                     .read_map_bytes
                     .checked_add(cost)
                     .is_none_or(|n| n > 8 * 1024 * 1024)
             {
-                self.read_maps.clear();
-                self.read_map_bytes = 0;
+                let Some(evict_key) = self.read_maps_lru.pop_lru() else {
+                    self.read_maps.clear();
+                    self.read_map_bytes = 0;
+                    break;
+                };
+                if let Some(old) = self.read_maps.remove(&evict_key) {
+                    self.read_map_bytes = self.read_map_bytes.saturating_sub(old.metadata_bytes());
+                }
             }
             self.read_map_bytes += cost;
+            self.read_maps_lru.touch(key);
             self.read_maps.insert(key.clone(), map);
+        } else {
+            self.read_maps_lru.touch(key);
         }
         Ok(())
     }
@@ -1426,10 +1484,14 @@ impl VfsStorage {
         parent_key: Option<&CacheKey>,
     ) {
         self.metadata_cache.remove(key);
+        self.metadata_cache_lru.remove(key);
         self.dir_entries_cache.remove(key);
+        self.dir_entries_cache_lru.remove(key);
+        self.file_bytes_cache_lru.remove(key);
         if let Some(bytes) = self.file_bytes_cache.remove(key) {
             self.file_bytes_cache_bytes = self.file_bytes_cache_bytes.saturating_sub(bytes.len());
         }
+        self.read_maps_lru.remove(key);
         if let Some(map) = self.read_maps.remove(key) {
             self.read_map_bytes = self.read_map_bytes.saturating_sub(map.metadata_bytes());
         }
@@ -1446,11 +1508,14 @@ impl VfsStorage {
         if !key.1.is_empty() {
             for k in vfsd::mount_table::descendant_keys(&self.metadata_cache, key) {
                 self.metadata_cache.remove(&k);
+                self.metadata_cache_lru.remove(&k);
             }
         }
         if let Some(pk) = parent_key {
             self.dir_entries_cache.remove(pk);
+            self.dir_entries_cache_lru.remove(pk);
             self.metadata_cache.remove(pk);
+            self.metadata_cache_lru.remove(pk);
         }
     }
 
@@ -1466,16 +1531,20 @@ impl VfsStorage {
     fn invalidate_subtree_caches(&mut self, key: &CacheKey) {
         for k in Self::subtree_keys(&self.metadata_cache, key) {
             self.metadata_cache.remove(&k);
+            self.metadata_cache_lru.remove(&k);
         }
         for k in Self::subtree_keys(&self.dir_entries_cache, key) {
             self.dir_entries_cache.remove(&k);
+            self.dir_entries_cache_lru.remove(&k);
         }
         for k in Self::subtree_keys(&self.file_bytes_cache, key) {
+            self.file_bytes_cache_lru.remove(&k);
             if let Some(bytes) = self.file_bytes_cache.remove(&k) {
                 self.file_bytes_cache_bytes = self.file_bytes_cache_bytes.saturating_sub(bytes.len());
             }
         }
         for k in Self::subtree_keys(&self.read_maps, key) {
+            self.read_maps_lru.remove(&k);
             if let Some(map) = self.read_maps.remove(&k) {
                 self.read_map_bytes = self.read_map_bytes.saturating_sub(map.metadata_bytes());
             }
@@ -2393,6 +2462,17 @@ impl VfsStorage {
         if !owned && (path == "/" || path == "/proc") {
             return Ok(Metadata::plain(RemoteKind::Directory, 0, path_inode(path.as_bytes())));
         }
+        if !owned && vfsd::proc_fs::proc_sys_dir_children(path).is_some() {
+            return Ok(Metadata::plain(RemoteKind::Directory, 0, path_inode(path.as_bytes())));
+        }
+        if !owned {
+            if let Some(Ok(node)) = vfsd::proc_fs::lookup(path, 0) {
+                if vfsd::proc_fs::is_virtual_file(node) {
+                    let len = self.proc_virtual_file_bytes(node)?.len() as u64;
+                    return Ok(Metadata::plain(RemoteKind::File, len, path_inode(path.as_bytes())));
+                }
+            }
+        }
         if owned {
             // Memory filesystem: authoritative and mutable, so never cached.
             let (mid, rel_path, _key, _pk, _caps, _imm, volume, _rms) = self.resolve_mount(path)?;
@@ -2439,8 +2519,9 @@ impl VfsStorage {
             shared.sync_generation(self.mount_generation);
             shared.len_of(&key)
         };
-        if let Some(entry) = self.metadata_cache.get(&key) {
-            return match (*entry, shared_len) {
+        if let Some(entry) = self.metadata_cache.get(&key).copied() {
+            self.metadata_cache_lru.touch(&key);
+            return match (entry, shared_len) {
                 (Ok(mut meta), Some(len)) => {
                     meta.len = len;
                     Ok(meta)
@@ -2476,10 +2557,65 @@ impl VfsStorage {
     /// so the cache must have a hard entry bound or a path-probing client could
     /// exhaust the namespace service heap.
     fn insert_metadata_cache(&mut self, key: CacheKey, result: Result<Metadata, i32>) {
-        if self.metadata_cache.len() >= vfsd::METADATA_CACHE_MAX_ENTRIES {
-            self.metadata_cache.clear();
+        while self.metadata_cache.len() >= vfsd::METADATA_CACHE_MAX_ENTRIES {
+            let Some(evict_key) = self.metadata_cache_lru.pop_lru() else {
+                self.metadata_cache.clear();
+                break;
+            };
+            self.metadata_cache.remove(&evict_key);
         }
+        self.metadata_cache_lru.touch(&key);
         self.metadata_cache.insert(key, result);
+    }
+
+    fn inotify_target_for_path(
+        &mut self,
+        path: &str,
+        only_dir: bool,
+    ) -> Result<vfsd::inotify::WatchTarget, i32> {
+        let meta = self.metadata(path)?;
+        let is_dir = meta.kind == RemoteKind::Directory;
+        if only_dir && !is_dir {
+            return Err(ENOTDIR);
+        }
+        let (mount_id, mount_generation, node) = if let Ok((mid, _, _, _, _, _, _, _)) = self.resolve_mount(path) {
+            (mid, self.mount_generation, meta.fs.map_or(0, |f| f.node_id))
+        } else {
+            (0, 1, 0)
+        };
+        Ok(vfsd::inotify::WatchTarget {
+            mount_id,
+            mount_generation,
+            node,
+            canonical_path: path.to_string(),
+            is_dir,
+        })
+    }
+
+    /// Returns `(mount_id, mount_generation, node, parent_node, is_dir)` for `path`.
+    fn inotify_path_context_locked(&mut self, path: &str) -> (u64, u64, u64, u64, bool) {
+        let meta = self.metadata(path).ok();
+        let is_dir = meta.is_some_and(|m| m.kind == RemoteKind::Directory);
+        let node = meta.and_then(|m| m.fs.map(|f| f.node_id)).unwrap_or(0);
+        let parent_path = match path.rfind('/') {
+            Some(0) => "/",
+            Some(pos) => &path[..pos],
+            None => "/",
+        };
+        let parent_node = if path == "/" {
+            0
+        } else {
+            self.metadata(parent_path)
+                .ok()
+                .and_then(|m| m.fs.map(|f| f.node_id))
+                .unwrap_or(0)
+        };
+        let (mount_id, mount_generation) = if let Ok((mid, _, _, _, _, _, _, _)) = self.resolve_mount(path) {
+            (mid, self.mount_generation)
+        } else {
+            (0, 1)
+        };
+        (mount_id, mount_generation, node, parent_node, is_dir)
     }
 
     fn visit_directory(
@@ -2528,10 +2664,17 @@ impl VfsStorage {
         if !self.dir_entries_cache.contains_key(&key) {
             let resolved = volume.read_dir(&rel_path).map_err(vfsd::map_fs_error)?
                 .into_iter().map(DirEntry::from_fs).collect();
-            if self.dir_entries_cache.len() >= vfsd::DIR_ENTRIES_CACHE_MAX_ENTRIES {
-                self.dir_entries_cache.clear();
+            while self.dir_entries_cache.len() >= vfsd::DIR_ENTRIES_CACHE_MAX_ENTRIES {
+                let Some(evict_key) = self.dir_entries_cache_lru.pop_lru() else {
+                    self.dir_entries_cache.clear();
+                    break;
+                };
+                self.dir_entries_cache.remove(&evict_key);
             }
+            self.dir_entries_cache_lru.touch(&key);
             self.dir_entries_cache.insert(key.clone(), resolved);
+        } else {
+            self.dir_entries_cache_lru.touch(&key);
         }
         let cached = self.dir_entries_cache.get(&key).ok_or(EIO)?;
         let hide_failed_data = handle.path == "/" && self.mounts.data_mount_error("/data").is_some();
@@ -2596,9 +2739,22 @@ fn virtual_dir_entries(path: &str, caller_pid: u64) -> Result<Option<Vec<DirEntr
         return devmgrd_dir_entries(path).map(Some);
     }
     if path == "/proc" {
-        return Ok(Some(["filesystems", "meminfo", "mounts", "self", "uptime"].into_iter()
-            .map(|name| DirEntry::new(name, if name == "self" { RemoteKind::Symlink } else { RemoteKind::File }))
+        return Ok(Some(["cpuinfo", "filesystems", "meminfo", "mounts", "self", "sys", "uptime"].into_iter()
+            .map(|name| DirEntry::new(name, match name {
+                "self" => RemoteKind::Symlink,
+                "sys" => RemoteKind::Directory,
+                _ => RemoteKind::File,
+            }))
             .collect()));
+    }
+    if let Some(children) = vfsd::proc_fs::proc_sys_dir_children(path) {
+        return Ok(Some(children.iter().map(|&(name, dt)| {
+            DirEntry::new(name, if dt == rustos_user_abi::procfs::DT_DIR {
+                RemoteKind::Directory
+            } else {
+                RemoteKind::File
+            })
+        }).collect()));
     }
     if let Some(Ok(node @ (vfsd::proc_fs::ProcNode::PidDir | vfsd::proc_fs::ProcNode::SelfLink
         | vfsd::proc_fs::ProcNode::NsDir))) = vfsd::proc_fs::lookup(path, caller_pid)

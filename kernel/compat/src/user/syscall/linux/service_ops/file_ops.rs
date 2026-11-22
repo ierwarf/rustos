@@ -698,7 +698,9 @@ fn resolve_copy_end(fd: u64, need_read: bool) -> Result<(CopyEnd, u64), i64> {
                 status,
             )),
             multitask::RemoteVfsHandleKind::Directory => Err(LINUX_EISDIR),
-            multitask::RemoteVfsHandleKind::Device => Err(LINUX_EINVAL),
+            multitask::RemoteVfsHandleKind::Device | multitask::RemoteVfsHandleKind::Inotify => {
+                Err(LINUX_EINVAL)
+            }
         };
     }
     Err(if current_kernel_handle(fd).is_some() { LINUX_EINVAL } else { LINUX_EBADF })

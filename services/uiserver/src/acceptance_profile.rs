@@ -64,10 +64,22 @@ pub(crate) fn announce_if_enabled() {
     }
 }
 
-fn exact_contract_enables_profile(contents: &str) -> bool {
+/// What the private acceptance contract asks of uiserver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AcceptanceRequest {
+    ui_profile: bool,
+    ui_pixel_probe: bool,
+}
+
+/// Exact parse of `kvm-acceptance-v1.env`: the same key set `runtimed` accepts
+/// (`ui_profile`, `network_exercise`, optional `google_ping` and
+/// `ui_pixel_probe`), each at most once, nothing else.
+fn parse_contract(contents: &str) -> Option<AcceptanceRequest> {
     let mut contract = false;
     let mut ui_profile = None;
     let mut network_exercise = None;
+    let mut google_ping = None;
+    let mut ui_pixel_probe = None;
     for line in contents.lines() {
         match line {
             "contract=rustos-kvm-acceptance-v1" if !contract => contract = true,
@@ -75,10 +87,19 @@ fn exact_contract_enables_profile(contents: &str) -> bool {
             "ui_profile=1" if ui_profile.is_none() => ui_profile = Some(true),
             "network_exercise=0" if network_exercise.is_none() => network_exercise = Some(false),
             "network_exercise=1" if network_exercise.is_none() => network_exercise = Some(true),
-            _ => return false,
+            "google_ping=0" | "google_ping=1" if google_ping.is_none() => google_ping = Some(()),
+            "ui_pixel_probe=0" if ui_pixel_probe.is_none() => ui_pixel_probe = Some(false),
+            "ui_pixel_probe=1" if ui_pixel_probe.is_none() => ui_pixel_probe = Some(true),
+            _ => return None,
         }
     }
-    contract && ui_profile == Some(true) && network_exercise.is_some()
+    if !contract || network_exercise.is_none() {
+        return None;
+    }
+    Some(AcceptanceRequest {
+        ui_profile: ui_profile?,
+        ui_pixel_probe: ui_pixel_probe.unwrap_or(false),
+    })
 }
 
 /// Bootstrap can start uiserver before the private acceptance registry exists.
@@ -97,23 +118,29 @@ pub(crate) fn start_late_watcher() {
     let _ = spawn_ui_thread(UiThreadRole::Background, "ui-acceptance-watch", || {
         let deadline = Instant::now() + WATCH_LIMIT;
         while Instant::now() < deadline {
-            let enabled = read_bounded_config_snapshot(CONTRACT_PATH, CONTRACT_MAX_BYTES)
+            let request = read_bounded_config_snapshot(CONTRACT_PATH, CONTRACT_MAX_BYTES)
                 .ok()
-                .is_some_and(|contents| exact_contract_enables_profile(&contents));
-            if enabled {
-                publish_input_completion_selector();
-                ENABLED.store(true, Ordering::Release);
-                announce_if_enabled();
+                .and_then(|contents| parse_contract(&contents));
+            if let Some(request) = request.filter(|r| r.ui_profile || r.ui_pixel_probe) {
+                if request.ui_pixel_probe {
+                    crate::pixel_probe::enable();
+                }
+                if request.ui_profile {
+                    publish_input_completion_selector();
+                    ENABLED.store(true, Ordering::Release);
+                    announce_if_enabled();
+                }
                 return;
             }
             thread::sleep(WATCH_INTERVAL);
         }
+        diag_line("uiserver: acceptance contract watch ended without a request");
     });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{exact_contract_enables_profile, exact_input_completion_contract};
+    use super::{exact_input_completion_contract, parse_contract, AcceptanceRequest};
 
     #[test]
     fn input_completion_requires_the_exact_private_benchmark_selector() {
@@ -129,18 +156,28 @@ mod tests {
     }
 
     #[test]
-    fn late_acceptance_profile_requires_the_exact_complete_contract() {
-        assert!(exact_contract_enables_profile(
-            "contract=rustos-kvm-acceptance-v1\nui_profile=1\nnetwork_exercise=0\n"
-        ));
-        assert!(!exact_contract_enables_profile(
-            "contract=rustos-kvm-acceptance-v1\nui_profile=0\nnetwork_exercise=0\n"
-        ));
-        assert!(!exact_contract_enables_profile(
-            "contract=rustos-kvm-acceptance-v1\nui_profile=1\n"
-        ));
-        assert!(!exact_contract_enables_profile(
+    fn late_acceptance_contract_requires_the_exact_complete_key_set() {
+        let profile = parse_contract(
+            "contract=rustos-kvm-acceptance-v1\nui_profile=1\nnetwork_exercise=0\n",
+        );
+        assert_eq!(profile, Some(AcceptanceRequest { ui_profile: true, ui_pixel_probe: false }));
+        // Every key the xtask writer emits, in its order.
+        let full = parse_contract(
+            "contract=rustos-kvm-acceptance-v1\nui_profile=0\nnetwork_exercise=0\ngoogle_ping=0\nui_pixel_probe=1\n",
+        );
+        assert_eq!(full, Some(AcceptanceRequest { ui_profile: false, ui_pixel_probe: true }));
+        assert!(parse_contract("contract=rustos-kvm-acceptance-v1\nui_profile=1\n").is_none());
+        assert!(parse_contract(
             "contract=rustos-kvm-acceptance-v1\nui_profile=1\nnetwork_exercise=0\nui_profile=1\n"
-        ));
+        )
+        .is_none());
+        assert!(parse_contract(
+            "contract=rustos-kvm-acceptance-v1\nui_profile=1\nnetwork_exercise=0\nui_pixel_probe=yes\n"
+        )
+        .is_none());
+        assert!(parse_contract(
+            "contract=rustos-kvm-acceptance-v1\nui_profile=1\nnetwork_exercise=0\nextra=1\n"
+        )
+        .is_none());
     }
 }

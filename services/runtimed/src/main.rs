@@ -20,6 +20,7 @@ use rustos_user_abi::performance::IPC_CONTROL_DRAIN_BUDGET;
 use rustos_user_abi::syscall::{SYS_RUSTOS_SCHED_DEMOTE_SELF, TASK_WEIGHT_INTERACTIVE_FLAG};
 
 mod catalog;
+mod dbus;
 mod heartbeat;
 mod image_probe;
 mod kvm_launch_desktop;
@@ -280,6 +281,7 @@ fn main() {
     };
     spawn::debug_line("runtimed: runtime socket ready");
     boot_line("runtimed: runtime socket ready");
+    dbus::start();
     let session_endpoint = match session::create_session_endpoint() {
         Some(endpoint) => Some(endpoint),
         None => {

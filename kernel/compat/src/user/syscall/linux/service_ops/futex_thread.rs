@@ -55,10 +55,255 @@ struct FutexWaiter {
     bitset: u32,
 }
 
-static FUTEX_WAITERS: TrackedSpinLock<
-    [Option<FutexWaiter>; FUTEX_WAITERS_CAPACITY],
-    { LockClass::FutexWaiter as u8 },
-> = TrackedSpinLock::new([None; FUTEX_WAITERS_CAPACITY]);
+const FUTEX_KEY_BUCKETS: usize = 128;
+const FUTEX_TASK_BUCKETS: usize = 64;
+const FUTEX_EMPTY: u16 = u16::MAX;
+// Slot links are `u16`; the sentinel must stay outside the slot index range.
+const _: () = assert!(FUTEX_WAITERS_CAPACITY < FUTEX_EMPTY as usize);
+
+#[derive(Clone, Copy)]
+struct FutexSlot {
+    waiter: FutexWaiter,
+    key_prev: u16,
+    key_next: u16,
+    task_prev: u16,
+    task_next: u16,
+    occupied: bool,
+    free_next: u16,
+}
+
+impl FutexSlot {
+    const EMPTY: Self = Self {
+        waiter: FutexWaiter {
+            key: FutexKey::Private {
+                mm_generation: 0,
+                address_space_root: 0,
+                uaddr: 0,
+            },
+            task_id: 0,
+            bitset: 0,
+        },
+        key_prev: FUTEX_EMPTY,
+        key_next: FUTEX_EMPTY,
+        task_prev: FUTEX_EMPTY,
+        task_next: FUTEX_EMPTY,
+        occupied: false,
+        free_next: FUTEX_EMPTY,
+    };
+}
+
+struct FutexWaiterTable {
+    slots: [FutexSlot; FUTEX_WAITERS_CAPACITY],
+    key_buckets: [u16; FUTEX_KEY_BUCKETS],
+    task_buckets: [u16; FUTEX_TASK_BUCKETS],
+    free_head: u16,
+    initialized: bool,
+}
+
+impl FutexWaiterTable {
+    const fn new() -> Self {
+        Self {
+            slots: [FutexSlot::EMPTY; FUTEX_WAITERS_CAPACITY],
+            key_buckets: [FUTEX_EMPTY; FUTEX_KEY_BUCKETS],
+            task_buckets: [FUTEX_EMPTY; FUTEX_TASK_BUCKETS],
+            free_head: 0,
+            initialized: false,
+        }
+    }
+
+    #[inline]
+    fn ensure_init(&mut self) {
+        if self.initialized {
+            return;
+        }
+        let mut i = 0;
+        while i < FUTEX_WAITERS_CAPACITY {
+            self.slots[i].free_next = if i + 1 < FUTEX_WAITERS_CAPACITY {
+                (i + 1) as u16
+            } else {
+                FUTEX_EMPTY
+            };
+            i += 1;
+        }
+        self.free_head = if FUTEX_WAITERS_CAPACITY == 0 {
+            FUTEX_EMPTY
+        } else {
+            0
+        };
+        self.initialized = true;
+    }
+
+    #[inline]
+    fn key_bucket(key: FutexKey) -> usize {
+        let h = match key {
+            FutexKey::Private {
+                mm_generation,
+                address_space_root,
+                uaddr,
+            } => mm_generation
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ address_space_root.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+                ^ uaddr.wrapping_mul(0x94D0_49BB_1331_11EB),
+            FutexKey::Shared { backing } => match backing {
+                multitask::SharedFutexBackingKey::Memfd {
+                    object_id,
+                    byte_offset,
+                } => object_id.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ byte_offset.wrapping_mul(0xBF58_476D_1CE4_E5B9),
+                multitask::SharedFutexBackingKey::SharedRegion {
+                    region_id,
+                    byte_offset,
+                } => region_id.wrapping_mul(0x94D0_49BB_1331_11EB)
+                    ^ byte_offset.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            },
+        };
+        ((h ^ (h >> 32)) as usize) & (FUTEX_KEY_BUCKETS - 1)
+    }
+
+    #[inline]
+    fn task_bucket(task_id: u64) -> usize {
+        (task_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - 6)) as usize
+    }
+
+    fn link_key(&mut self, slot: u16, key: FutexKey) {
+        let b = Self::key_bucket(key);
+        let head = self.key_buckets[b];
+        self.slots[slot as usize].key_prev = FUTEX_EMPTY;
+        self.slots[slot as usize].key_next = head;
+        if head != FUTEX_EMPTY {
+            self.slots[head as usize].key_prev = slot;
+        }
+        self.key_buckets[b] = slot;
+    }
+
+    fn unlink_key(&mut self, slot: u16, key: FutexKey) {
+        let b = Self::key_bucket(key);
+        let prev = self.slots[slot as usize].key_prev;
+        let next = self.slots[slot as usize].key_next;
+        if prev != FUTEX_EMPTY {
+            self.slots[prev as usize].key_next = next;
+        } else {
+            self.key_buckets[b] = next;
+        }
+        if next != FUTEX_EMPTY {
+            self.slots[next as usize].key_prev = prev;
+        }
+        self.slots[slot as usize].key_prev = FUTEX_EMPTY;
+        self.slots[slot as usize].key_next = FUTEX_EMPTY;
+    }
+
+    fn link_task(&mut self, slot: u16, task_id: u64) {
+        let b = Self::task_bucket(task_id);
+        let head = self.task_buckets[b];
+        self.slots[slot as usize].task_prev = FUTEX_EMPTY;
+        self.slots[slot as usize].task_next = head;
+        if head != FUTEX_EMPTY {
+            self.slots[head as usize].task_prev = slot;
+        }
+        self.task_buckets[b] = slot;
+    }
+
+    fn unlink_task(&mut self, slot: u16, task_id: u64) {
+        let b = Self::task_bucket(task_id);
+        let prev = self.slots[slot as usize].task_prev;
+        let next = self.slots[slot as usize].task_next;
+        if prev != FUTEX_EMPTY {
+            self.slots[prev as usize].task_next = next;
+        } else {
+            self.task_buckets[b] = next;
+        }
+        if next != FUTEX_EMPTY {
+            self.slots[next as usize].task_prev = prev;
+        }
+        self.slots[slot as usize].task_prev = FUTEX_EMPTY;
+        self.slots[slot as usize].task_next = FUTEX_EMPTY;
+    }
+
+    fn remove_slot(&mut self, slot: u16) {
+        let waiter = self.slots[slot as usize].waiter;
+        self.unlink_key(slot, waiter.key);
+        self.unlink_task(slot, waiter.task_id);
+        self.slots[slot as usize].occupied = false;
+        self.slots[slot as usize].free_next = self.free_head;
+        self.free_head = slot;
+    }
+
+    fn insert(&mut self, waiter: FutexWaiter) -> Result<(), i64> {
+        self.ensure_init();
+        let _ = self.take_task(waiter.task_id);
+        let slot = self.free_head;
+        if slot == FUTEX_EMPTY {
+            return Err(LINUX_ENOMEM);
+        }
+        self.free_head = self.slots[slot as usize].free_next;
+        self.slots[slot as usize].waiter = waiter;
+        self.slots[slot as usize].occupied = true;
+        self.slots[slot as usize].free_next = FUTEX_EMPTY;
+        self.link_key(slot, waiter.key);
+        self.link_task(slot, waiter.task_id);
+        Ok(())
+    }
+
+    fn take_task(&mut self, task_id: u64) -> bool {
+        if !self.initialized {
+            return false;
+        }
+        let mut cursor = self.task_buckets[Self::task_bucket(task_id)];
+        let mut removed = false;
+        while cursor != FUTEX_EMPTY {
+            let next = self.slots[cursor as usize].task_next;
+            if self.slots[cursor as usize].waiter.task_id == task_id {
+                self.remove_slot(cursor);
+                removed = true;
+            }
+            cursor = next;
+        }
+        removed
+    }
+
+    fn select_requeue(
+        &mut self,
+        from_key: FutexKey,
+        to_key: FutexKey,
+        max_wake: usize,
+        max_requeue: usize,
+        bitset: u32,
+        task_ids: &mut [u64],
+    ) -> (usize, usize) {
+        if !self.initialized || (max_wake == 0 && max_requeue == 0) {
+            return (0, 0);
+        }
+        let mut wake_count = 0usize;
+        let mut requeue_count = 0usize;
+        let max_wake = max_wake.min(task_ids.len());
+        let mut cursor = self.key_buckets[Self::key_bucket(from_key)];
+        while cursor != FUTEX_EMPTY {
+            let next = self.slots[cursor as usize].key_next;
+            let waiter = self.slots[cursor as usize].waiter;
+            if waiter.key == from_key && (waiter.bitset & bitset) != 0 {
+                if wake_count < max_wake {
+                    task_ids[wake_count] = waiter.task_id;
+                    self.remove_slot(cursor);
+                    wake_count += 1;
+                } else if requeue_count < max_requeue {
+                    if from_key != to_key {
+                        self.unlink_key(cursor, from_key);
+                        self.slots[cursor as usize].waiter.key = to_key;
+                        self.link_key(cursor, to_key);
+                    }
+                    requeue_count += 1;
+                } else {
+                    break;
+                }
+            }
+            cursor = next;
+        }
+        (wake_count, requeue_count)
+    }
+}
+
+static FUTEX_WAITERS: TrackedSpinLock<FutexWaiterTable, { LockClass::FutexWaiter as u8 }> =
+    TrackedSpinLock::new(FutexWaiterTable::new());
 
 // Futex opcode/flag admission is part of the scheduler wait/wake substrate.
 // Keep it local and allocation-free: putting a synchronous policy-service
@@ -135,11 +380,17 @@ pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, 
     }
     // A successful pthread join resumes through FUTEX_WAIT after the exiting
     // child cleared its TID. Advance the same bounded retirement owner used by
-    // wait4 before returning to the joining thread, otherwise a tight
-    // create/join loop can pin every retired scheduler slot while executive
-    // housekeeping is starved.
-    let _ = service_retired_task_runtime_cleanup(RETIRED_TASK_CLEANUP_BUDGET);
-    multitask::service_deferred_work();
+    // wait4 before returning to the joining thread without running cleanup on
+    // uncontended FUTEX_WAKE(0) or validation-error fast paths.
+    let should_service_cleanup = matches!(
+        cmd,
+        c if c == linux_abi::FUTEX_WAIT || c == linux_abi::FUTEX_WAIT_BITSET
+    ) && matches!(result, Ok(_) | Err(LINUX_EAGAIN))
+        || matches!(result, Ok(woken) if woken > 0);
+    if should_service_cleanup {
+        let _ = service_retired_task_runtime_cleanup(RETIRED_TASK_CLEANUP_BUDGET);
+        multitask::service_deferred_work();
+    }
     match result {
         Ok(value) => value,
         Err(errno) => linux_errno(errno),
@@ -254,12 +505,41 @@ const fn clone_spawn_refusal_stage(error: multitask::SpawnTaskError) -> u64 {
     }
 }
 
+/// Names the occupancy behind a refused 2 MiB kernel stack: live task slots and
+/// the kernel buddy heap that backs every stack (bounded like the stage record).
+fn record_stack_exhaustion() {
+    static RECORDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    // ORDERING: Relaxed; saturating telemetry budget counter.
+    let within_budget = RECORDED
+        .fetch_update(
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+            |recorded| (recorded < 8).then_some(recorded + 1),
+        )
+        .is_ok();
+    if !within_budget {
+        return;
+    }
+    let snapshot = multitask::task_capacity_snapshot();
+    let (total, allocated) = kernel_mm::api::heap::usage_bytes().unwrap_or((0, 0));
+    const MIB: u64 = 1024 * 1024;
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "linux-thread-stack-exhausted",
+        (snapshot.live_tasks << 32) | snapshot.reservable_slots,
+        ((allocated as u64 / MIB) << 32) | (total as u64 / MIB),
+    );
+}
+
 /// Records and returns the errno of a refused thread spawn. When the capacity
 /// authority's limit rejected it, the record's address field carries that
 /// limit's value (task-table slots, per-process thread ceiling, root process
 /// ceiling or kernel stack bytes) so the log names the limit that was hit; a
 /// Job limit or a transient refusal carries the clone flags as before.
 fn clone_spawn_refused(error: multitask::SpawnTaskError, flags: u64) -> u64 {
+    if error == multitask::SpawnTaskError::ThreadStackAllocation {
+        record_stack_exhaustion();
+    }
     let detail = error
         .rejecting_limit()
         .map_or(flags, |limit| multitask::TASK_CAPACITY.limit_value(limit));
@@ -516,14 +796,11 @@ fn futex_wait(
         if actual != expected {
             return Err(LINUX_EAGAIN);
         }
-        register_futex_waiter_in(
-            &mut waiters[..],
-            FutexWaiter {
-                key,
-                task_id,
-                bitset,
-            },
-        )
+        waiters.insert(FutexWaiter {
+            key,
+            task_id,
+            bitset,
+        })
     });
     if let Err(errno) = registration {
         let _ = multitask::cancel_block_current_task();
@@ -714,8 +991,7 @@ fn futex_cmp_requeue(
         if actual != expected as u32 {
             return Err(LINUX_EAGAIN);
         }
-        Ok::<(usize, usize), i64>(select_requeue_futex_waiters(
-            &mut waiters[..],
+        Ok::<(usize, usize), i64>(waiters.select_requeue(
             from_key,
             to_key,
             max_wake,
@@ -778,27 +1054,27 @@ fn futex_wake_op(
             4 => (oldval as i32) > decoded.cmparg,
             _ => (oldval as i32) >= decoded.cmparg,
         };
-        let count1 = select_requeue_futex_waiters(
-            &mut waiters[..],
-            key1,
-            key1,
-            max_wake1,
-            0,
-            linux_abi::FUTEX_BITSET_MATCH_ANY,
-            &mut task_ids1,
-        )
-        .0;
-        let count2 = if cond {
-            select_requeue_futex_waiters(
-                &mut waiters[..],
-                key2,
-                key2,
-                max_wake2,
+        let count1 = waiters
+            .select_requeue(
+                key1,
+                key1,
+                max_wake1,
                 0,
                 linux_abi::FUTEX_BITSET_MATCH_ANY,
-                &mut task_ids2,
+                &mut task_ids1,
             )
-            .0
+            .0;
+        let count2 = if cond {
+            waiters
+                .select_requeue(
+                    key2,
+                    key2,
+                    max_wake2,
+                    0,
+                    linux_abi::FUTEX_BITSET_MATCH_ANY,
+                    &mut task_ids2,
+                )
+                .0
         } else {
             0
         };
@@ -827,8 +1103,7 @@ fn futex_requeue_inner(
         let from_key = futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
         let to_key = futex_key_for_process_state(process_state, address_space_root, uaddr2, op)?;
         let mut waiters = FUTEX_WAITERS.lock();
-        Ok::<(usize, usize), i64>(select_requeue_futex_waiters(
-            &mut waiters[..],
+        Ok::<(usize, usize), i64>(waiters.select_requeue(
             from_key,
             to_key,
             max_wake,
@@ -937,9 +1212,10 @@ fn current_futex_waiter_context(uaddr: u64, op: u64) -> Result<(u64, FutexKey), 
 #[cfg(test)]
 fn register_futex_waiter(waiter: FutexWaiter) -> Result<(), i64> {
     let mut waiters = FUTEX_WAITERS.lock();
-    register_futex_waiter_in(&mut waiters[..], waiter)
+    waiters.insert(waiter)
 }
 
+#[cfg(test)]
 fn register_futex_waiter_in(
     waiters: &mut [Option<FutexWaiter>],
     waiter: FutexWaiter,
@@ -948,10 +1224,6 @@ fn register_futex_waiter_in(
     for slot in 0..waiters.len() {
         match waiters[slot] {
             Some(existing) if existing.task_id == waiter.task_id => {
-                // A task executing FUTEX_WAIT is running, so an entry it still
-                // owns is stale (a wake/cleanup that lost its removal). Replace
-                // it rather than leak a slot or fail with an errno Linux never
-                // returns from futex wait.
                 waiters[slot] = Some(waiter);
                 return Ok(());
             }
@@ -959,8 +1231,6 @@ fn register_futex_waiter_in(
             _ => {}
         }
     }
-    // Unreachable while the table has a slot per scheduler task; ENOMEM is
-    // Linux's errno for a failed futex_q/kernel allocation.
     let Some(slot) = free_slot else {
         return Err(LINUX_ENOMEM);
     };
@@ -978,9 +1248,10 @@ pub(crate) fn cleanup_retired_task_waiter(task_id: u64) -> bool {
 
 fn take_futex_waiter(task_id: u64) -> bool {
     let mut waiters = FUTEX_WAITERS.lock();
-    take_futex_waiter_from(&mut waiters[..], task_id)
+    waiters.take_task(task_id)
 }
 
+#[cfg(test)]
 fn take_futex_waiter_from(waiters: &mut [Option<FutexWaiter>], task_id: u64) -> bool {
     let mut removed = false;
     for slot in waiters.iter_mut() {
@@ -996,25 +1267,40 @@ fn take_futex_waiter_from(waiters: &mut [Option<FutexWaiter>], task_id: u64) -> 
 }
 
 fn wake_futex_waiters(key: FutexKey, max_wake: usize, bitset: u32) -> usize {
-    let mut task_ids = [0_u64; FUTEX_WAITERS_CAPACITY];
-    let mut wake_count = 0usize;
-    {
-        let mut waiters = FUTEX_WAITERS.lock();
-        for slot in 0..waiters.len() {
-            if wake_count == max_wake {
-                break;
-            }
-            let Some(waiter) = waiters[slot] else {
-                continue;
-            };
-            if waiter.key != key || (waiter.bitset & bitset) == 0 {
-                continue;
-            }
-            task_ids[wake_count] = waiter.task_id;
-            waiters[slot] = None;
-            wake_count += 1;
-        }
+    const INLINE_WAKE_CAP: usize = 16;
+    if max_wake == 0 {
+        return 0;
     }
+    if max_wake <= INLINE_WAKE_CAP {
+        let mut task_ids = [0_u64; INLINE_WAKE_CAP];
+        let wake_count = {
+            let mut waiters = FUTEX_WAITERS.lock();
+            waiters
+                .select_requeue(key, key, max_wake, 0, bitset, &mut task_ids)
+                .0
+        };
+        let mut woken = 0usize;
+        for task_id in task_ids.into_iter().take(wake_count) {
+            if multitask::wake_user_task(task_id) {
+                woken += 1;
+            } else {
+                crate::debug::println!("futex: selected waiter had no live task task={task_id}");
+            }
+        }
+        return woken;
+    }
+    wake_futex_waiters_many(key, max_wake, bitset)
+}
+
+#[cold]
+fn wake_futex_waiters_many(key: FutexKey, max_wake: usize, bitset: u32) -> usize {
+    let mut task_ids = [0_u64; FUTEX_WAITERS_CAPACITY];
+    let wake_count = {
+        let mut waiters = FUTEX_WAITERS.lock();
+        waiters
+            .select_requeue(key, key, max_wake, 0, bitset, &mut task_ids)
+            .0
+    };
     let mut woken = 0usize;
     for task_id in task_ids.into_iter().take(wake_count) {
         if multitask::wake_user_task(task_id) {
@@ -1041,42 +1327,7 @@ fn wake_futex_waiter_candidates(
     woken
 }
 
-fn select_requeue_futex_waiters(
-    waiters: &mut [Option<FutexWaiter>],
-    from_key: FutexKey,
-    to_key: FutexKey,
-    max_wake: usize,
-    max_requeue: usize,
-    bitset: u32,
-    task_ids: &mut [u64; FUTEX_WAITERS_CAPACITY],
-) -> (usize, usize) {
-    let mut wake_count = 0usize;
-    let mut requeue_count = 0usize;
-    for slot in waiters.iter_mut() {
-        let Some(mut waiter) = *slot else {
-            continue;
-        };
-        if waiter.key != from_key || (waiter.bitset & bitset) == 0 {
-            continue;
-        }
-        if wake_count < max_wake {
-            task_ids[wake_count] = waiter.task_id;
-            *slot = None;
-            wake_count += 1;
-            continue;
-        }
-        if requeue_count < max_requeue {
-            waiter.key = to_key;
-            *slot = Some(waiter);
-            requeue_count += 1;
-            continue;
-        }
-        break;
-    }
-    (wake_count, requeue_count)
-}
-
-fn wake_selected_futex_tasks(task_ids: &[u64; FUTEX_WAITERS_CAPACITY], count: usize) -> usize {
+fn wake_selected_futex_tasks(task_ids: &[u64], count: usize) -> usize {
     let mut woken = 0usize;
     for task_id in task_ids.iter().copied().take(count) {
         if multitask::wake_user_task(task_id) {

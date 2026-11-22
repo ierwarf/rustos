@@ -155,7 +155,8 @@ impl VfsState {
                 VFS_IPC_OP_LSEEK | VFS_IPC_OP_FSTAT | VFS_IPC_OP_GETDENTS64 |
                 VFS_IPC_OP_FCNTL | VFS_IPC_OP_CURSOR_SETTLE | VFS_IPC_OP_FTRUNCATE |
                 VFS_IPC_OP_FILE_IDENTITY | VFS_IPC_OP_FCHMOD | VFS_IPC_OP_FALLOCATE | VFS_IPC_OP_FCHOWN |
-                VFS_IPC_OP_FILE_LOCK | VFS_IPC_OP_SHARED_BACKING)
+                VFS_IPC_OP_FILE_LOCK | VFS_IPC_OP_SHARED_BACKING |
+                VFS_IPC_OP_INOTIFY_ADD_WATCH | VFS_IPC_OP_INOTIFY_RM_WATCH)
             && !self.has_funded_open_description(request.remote_id)
         {
             response.status=116; // ESTALE, forces reopen against new provider
@@ -200,6 +201,9 @@ impl VfsState {
             VFS_IPC_OP_CHOWN => self.vfs_chown(request, response),
             VFS_IPC_OP_FCHOWN => self.vfs_fchown(request, response),
             VFS_IPC_OP_LINKAT => self.vfs_linkat(request, response),
+            VFS_IPC_OP_INOTIFY_INIT => self.vfs_inotify_init(request, response),
+            VFS_IPC_OP_INOTIFY_ADD_WATCH => self.vfs_inotify_add_watch(request, response),
+            VFS_IPC_OP_INOTIFY_RM_WATCH => self.vfs_inotify_rm_watch(request, response),
             VFS_IPC_OP_FILE_LOCK => self.vfs_file_lock(request, response),
             VFS_IPC_OP_SHARED_BACKING => self.vfs_shared_backing(request, response),
             VFS_IPC_OP_POLL_QUERY => self.vfs_poll_query(request, response),
@@ -212,6 +216,7 @@ impl VfsState {
         let mut mutated_epolls = Vec::new();
         match request.arg0 {
             VFS_POLL_QUERY_POLL => self.vfs_poll_once(request, response),
+            VFS_POLL_QUERY_POLL_KEYED => self.vfs_poll_keyed(request, response),
             VFS_POLL_QUERY_EPOLL_CREATE => {
                 let key = checkpoint_epoll_key(request.remote_id);
                 if self.checkpoint_operation_replayed(request, key) {
@@ -337,6 +342,55 @@ impl VfsState {
             response.payload[offset + 6..offset + 8].copy_from_slice(&revents.to_le_bytes());
         }
         response.value = ready;
+        response.payload_len = len as u32;
+    }
+
+    fn vfs_poll_keyed(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        const ENTRY_SIZE: usize = 16;
+        let len = request.payload_len as usize;
+        if len == 0
+            || !len.is_multiple_of(ENTRY_SIZE)
+            || len / ENTRY_SIZE > VFS_POLL_KEYED_BATCH_MAX
+            || len > response.payload.len().min(request.payload.len())
+        {
+            response.status = EINVAL;
+            return;
+        }
+        let mut ready = 0_u64;
+        for offset in (0..len).step_by(ENTRY_SIZE) {
+            let fd = i32::from_le_bytes(request.payload[offset..offset + 4].try_into().unwrap());
+            let events =
+                i16::from_le_bytes(request.payload[offset + 4..offset + 6].try_into().unwrap());
+            let remote_id =
+                u64::from_le_bytes(request.payload[offset + 8..offset + 16].try_into().unwrap());
+            let revents = if fd < 0 {
+                0
+            } else if let Some(handle) = self.handles.get(&remote_id) {
+                let bits = if handle.kind == RemoteKind::Inotify {
+                    if self.inotify.is_readable(remote_id).unwrap_or(false) {
+                        (poll_ready_bits(events as u32) & linux_abi::EPOLLIN) as i16
+                    } else {
+                        0
+                    }
+                } else {
+                    (poll_ready_bits(events as u32) & (linux_abi::EPOLLIN | linux_abi::EPOLLOUT))
+                        as i16
+                };
+                if bits != 0 {
+                    ready += 1;
+                }
+                bits
+            } else {
+                (linux_abi::POLLERR | linux_abi::POLLHUP) as i16
+            };
+            response.payload[offset..offset + 6]
+                .copy_from_slice(&request.payload[offset..offset + 6]);
+            response.payload[offset + 6..offset + 8].copy_from_slice(&revents.to_le_bytes());
+            response.payload[offset + 8..offset + 16]
+                .copy_from_slice(&request.payload[offset + 8..offset + 16]);
+        }
+        response.value = ready;
+        response.aux = self.readiness_generation;
         response.payload_len = len as u32;
     }
 

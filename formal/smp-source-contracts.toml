@@ -346,7 +346,7 @@ tokens = [
 # Shared real root/fork constructor seals both unpublished owners before visibility.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/process_table/spawn.rs"
-tokens = ["struct RootSpawnKey", "slot_generation: u64", "nonce: u64", "struct RootSpawnLoan", "live: bool", "fn seal_root_spawn(", "slot_generation == 0 || nonce == 0", "slot.spawn_transaction_id != Some(reservation.transaction_id)", "slot.root_spawn.is_some()", "slot.root_spawn = Some(key)", "fn release_root_spawn(", "!loan.live", "slot.root_spawn != Some(key)", "slot.spawn_transaction_id = None", "slot.root_spawn = None", "loan.live = false", "drop(table)", "fn publish_root_spawn(", "!loan.live", "publish_inner(key.reservation", "loan.live = false", "fn publish_inner(", "Box::new(", "PROCESS_TABLE.lock()", "slot.spawn_transaction_id != Some(reservation.transaction_id)", "slot.root_spawn != root", "slot.object = Some(object)", "pin_owner::bind(", "pin_owner::pin(reservation.handle)", "table.pid_index_link(reservation.handle.index(), process_id)", "publish_slot_visibility(", "drop(table)", "fn cancel_spawn(", "slot.root_spawn.is_some()"]
+tokens = ["struct RootSpawnKey", "slot_generation: u64", "nonce: u64", "struct RootSpawnLoan", "live: bool", "fn seal_root_spawn(", "slot_generation == 0 || nonce == 0", "slot.spawn_transaction_id != Some(reservation.transaction_id)", "slot.root_spawn.is_some()", "slot.root_spawn = Some(key)", "fn release_root_spawn(", "!loan.live", "slot.root_spawn != Some(key)", "slot.spawn_transaction_id = None", "slot.root_spawn = None", "loan.live = false", "drop(table)", "fn publish_root_spawn(", "!loan.live", "publish_inner(key.reservation", "loan.live = false", "fn publish_inner(", "Box::new(", "PROCESS_TABLE.lock()", "slot.spawn_transaction_id != Some(reservation.transaction_id)", "slot.root_spawn != root", "slot.object = Some(object)", "pin_owner::bind(", "pin_owner::pin(reservation.handle)", "table.pid_index_link(index, process_id)", "publish_slot_visibility(", "drop(table)", "fn cancel_spawn(", "slot.root_spawn.is_some()"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/root_creation.rs"
 tokens = ["enum Actor", "BindingPin", "cohort::Cohort", "fn capture(cpu:", "current_cpu_task_slot()?", "cpu_leases::owns_current(cpu, slot)", "context::read(slot)?", "task_start::read(slot)?.id", "scheduling_context.is_bound_to(id)", "capture_binding(", "thread_creation::capture_creator(slot)?", "Cohort::begin(&[(slot, id)])?", "struct Parent", "BindingPin", "cohort::Cohort", "fn parent_inputs(", "process_placement::mask(context.process_handle?)?", "impl Admission", "context.process_id == Some(pid)", "parent_inputs(*slot, *id, pid)?", "thread_creation::capture_creator(slot)?", "Cohort::begin(&[(slot, id)])?", "parent_inputs(slot, id, pid)?", ".or(inherited)?", "!policy.is_valid()", "process_mask & policy.cpu_mask", "domain_admission::admit(policy)?", "enum Input", "fn materialize(", "initialize_windows_thread_identifiers(", ".is_err()"]
@@ -356,7 +356,7 @@ regex = '(scheduler_mut|scheduler_ref|Scheduler::|SCHEDULER|TrackedSpinLock)'
 reason = "Root construction owns original actor, parent loans, process reservation and slot producer, not a directory facade."
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/root_creation.rs"
-tokens = ["fn allocate(", "scheduler_initialized()", "DispatchPreemption::enter()", "turn.mask_irqs()", "Actor::capture(turn.cpu())", "Admission::capture(", "construct(", "flush_deferred_target_reschedules()", "fn construct(", "executor.assert_current_in(turn)", "creation_floor(turn.cpu())", "root_slots::reserve(slot, id)", "RootPublication::prepare(reservation, ticket, admission.process_mask)", "input.materialize(", "root.cancel()", "scheduling.admit(", "execution_image::reserved_user_entry(", "root.publish_process(parent, state)", "scheduling_runtime::release(", "root.cancel()", "publish(", "fn publish(", "root.begin_commit()", "root.install_context(context)", "initialize_vruntime(", "initialize_saved_rsp(", "initialize_simd_state(", "root.publish_start(", "publish_binding(", "frame_publication::publish(", "PagerChargeStamp", "identity::publish_metadata(", "LifecycleGate::Retired", "LifecycleGate::Suspended", "LifecycleGate::JobStopped", "LifecycleGate::ExecQuiesced", "install_reserved(", "initialize_reserved(", "root.ticket(), admission.task_mask, admission.process_mask", "root.finish_retaining(view)", "before_wake(slot, id)", "if !suspended", "publish_local_wake(", "publish_remote_wake(", "request_target_reschedule(", "drop(backing)"]
+tokens = ["fn allocate(", "scheduler_initialized()", "DispatchPreemption::enter()", "turn.mask_irqs()", "Actor::capture(turn.cpu())", "Admission::capture(", "construct(", "flush_deferred_target_reschedules()", "fn construct(", "executor.assert_current_in(turn)", "creation_floor(turn.cpu())", "root_slots::reserve(slot, id)", "RootPublication::prepare(reservation, ticket, admission.process_mask)", "other.materialize(", "root.cancel()", "scheduling.admit(", "execution_image::reserved_user_entry(", "root.publish_process(parent, state)", "scheduling_runtime::release(", "root.cancel()", "publish(", "fn publish(", "root.begin_commit()", "root.install_context(context)", "initialize_vruntime(", "initialize_saved_rsp(", "initialize_simd_state(", "root.publish_start(", "publish_binding(", "frame_publication::publish(", "PagerChargeStamp", "identity::publish_metadata(", "LifecycleGate::Retired", "LifecycleGate::Suspended", "LifecycleGate::JobStopped", "LifecycleGate::ExecQuiesced", "install_reserved(", "initialize_reserved(", "root.ticket(), admission.task_mask, admission.process_mask", "root.finish_retaining(view)", "before_wake(slot, id)", "if !suspended", "publish_local_wake(", "publish_remote_wake(", "request_target_reschedule(", "drop(backing)"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/root_slots.rs"
@@ -738,7 +738,7 @@ tokens = [
     "fn futex_wait(",
     "let mut waiters = FUTEX_WAITERS.lock();",
     ".atomic_load_user_u32(uaddr)",
-    "register_futex_waiter_in(",
+    "waiters.insert(FutexWaiter {",
     "commit_block_current_task_and_yield()",
 ]
 
@@ -748,7 +748,7 @@ tokens = [
     "fn futex_cmp_requeue(",
     "let mut waiters = FUTEX_WAITERS.lock();",
     ".atomic_load_user_u32(uaddr)",
-    "select_requeue_futex_waiters(",
+    "waiters.select_requeue(",
     "wake_selected_futex_tasks(&task_ids, wake_count)",
 ]
 
@@ -2630,7 +2630,7 @@ path = "kernel/ps/src/multitask/process_table.rs"
 tokens = [
     "fn reclaim_slot(",
     "object.ref_count != 0 || object.thread_count != 0",
-    "if !pin_owner::close(index, slot.generation)",
+    "if !pin_owner::close(index, old_gen)",
     "let object = slot.object.take()?",
     "table.pid_index_unlink(index, object.process_id)",
     "pub fn attach_task(",
@@ -2843,7 +2843,7 @@ tokens = [
 [[required_sequences]]
 path = "kernel/ps/src/user/process_state.rs"
 tokens = [
-    "fn retire_execution_state(self)", "let Self {", "shared_memfd_mappings", "shared_region_mappings", "} = self",
+    "fn retire_execution_state(self)", "let UserMmState {", "shared_memfd_mappings", "shared_region_mappings", "} = *self.mm", "let UserProcessLocal {", "} = *self.local",
     "address_space.into_retirement_owner().retire((", "shared_memfd_mappings", "shared_region_mappings",
 ]
 

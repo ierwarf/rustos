@@ -182,7 +182,7 @@ pub(super) fn try_install_serialized() -> bool {
         pool.atlas_header.atlas_width,
         pool.atlas_header.atlas_height,
         pool.atlas_header.atlas_stride_bytes,
-        GUI_DVM_PIXEL_REGION_PHYS_ADDR,
+        gui_dvm_pixel_region_phys_addr().unwrap_or(0),
     );
     true
 }
@@ -392,7 +392,11 @@ pub(super) fn find_ivshmem_gui_pool() -> Option<MappedGuiDvmPool> {
             release_gui_mappings(control, doorbell);
             return false;
         }
-        let pixels = crate::memory::higher_half_addr(GUI_DVM_PIXEL_REGION_PHYS_ADDR) as *mut u8;
+        let Some(pixel_phys) = gui_dvm_pixel_region_phys_addr() else {
+            release_gui_mappings(control, doorbell);
+            return false;
+        };
+        let pixels = crate::memory::higher_half_addr(pixel_phys) as *mut u8;
         let Some(pixel_header) = read_pool_header(pixels) else {
             release_gui_mappings(control, doorbell);
             return false;

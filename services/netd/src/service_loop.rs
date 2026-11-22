@@ -83,18 +83,33 @@ pub(super) fn start_inet_readiness_worker() {
 
 pub(super) fn inet_readiness_worker_loop() {
     loop {
-        let has_sockets = {
+        let wait_for = {
             let mut state = lock_net_state();
-            if let Some(stack) = state.inet.as_mut() {
+            let poll_delay = if let Some(stack) = state.inet.as_mut() {
                 stack.poll_budget(INET_READINESS_POLL_BUDGET);
+                let now = smol_now();
+                stack
+                    .iface
+                    .poll_delay(now, &stack.sockets)
+                    .map(|d| Duration::from_millis(d.total_millis()))
+            } else {
+                None
+            };
+            if state.inet_sockets.is_empty() {
+                INET_IDLE_POLL_INTERVAL
+            } else {
+                match poll_delay {
+                    Some(delay) => delay.clamp(Duration::from_millis(1), INET_READINESS_POLL_INTERVAL),
+                    None => INET_READINESS_POLL_INTERVAL,
+                }
             }
-            !state.inet_sockets.is_empty()
         };
-        thread::sleep(if has_sockets {
-            INET_READINESS_POLL_INTERVAL
+        let (lock, cv) = inet_worker_wake_signal();
+        if let Ok(guard) = lock.lock() {
+            let _ = cv.wait_timeout(guard, wait_for);
         } else {
-            INET_IDLE_POLL_INTERVAL
-        });
+            thread::sleep(wait_for);
+        }
     }
 }
 

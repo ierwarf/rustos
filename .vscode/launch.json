@@ -5,7 +5,7 @@
       "name": "RustOS: verified KVM desktop",
       "type": "node-terminal",
       "request": "launch",
-      "command": "exec cargo xtask kvm-run --build --rustos-vcpus 16",
+      "command": "exec env KVM_RUSTOS_MEMORY_MIB=6144 cargo xtask kvm-run --build --rustos-vcpus 16",
       "cwd": "${workspaceFolder}"
     }
   ]

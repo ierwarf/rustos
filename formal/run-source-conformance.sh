@@ -366,10 +366,10 @@ if [[ "$(wc -l <<<"$ui_direct_spawns")" -ne 1 ]] \
 fi
 
 acceptance_body="$(
-    sed -n '/^fn exact_contract_enables_profile(/,/^#\[cfg(test)\]/p' \
+    sed -n '/^fn parse_contract(/,/^#\[cfg(test)\]/p' \
         services/uiserver/src/acceptance_profile.rs
 )"
-if ! grep -Fq 'contract && ui_profile == Some(true) && network_exercise.is_some()' <<<"$acceptance_body" \
+if ! grep -Fq 'if !contract || network_exercise.is_none()' <<<"$acceptance_body" \
     || ! grep -Fq 'WATCH_LIMIT' <<<"$acceptance_body" \
     || ! grep -Fq 'spawn_ui_thread(UiThreadRole::Background' <<<"$acceptance_body" \
     || ! grep -Fq 'read_bounded_config_snapshot(CONTRACT_PATH, CONTRACT_MAX_BYTES)' <<<"$acceptance_body" \
@@ -2087,12 +2087,16 @@ dvm-volume-io/DvmVolumeIo|kernel-io-manager|io::dvm_block::tests::request_and_co
 dvm-volume-io/DvmVolumeIo|kernel-io-manager|io::dvm_block::tests::stale_completion_revokes_the_transport
 dvm-volume-io/DvmVolumeIo|kernel-io-manager|io::dvm_block::tests::fault_points_cover_reads_mutations_and_durability
 dvm-volume-io/DvmVolumeIo|xtask|kvm::tests::storage_flush_fault_gate_requires_one_exact_fail_rule_and_rejects_success
-dvm-read-cache/DvmReadCache|storaged|block::tests::read_ahead_cache_is_generation_and_range_bound
-dvm-read-cache/DvmReadCache|storaged|block::tests::read_ahead_cache_set_is_bounded_lru_and_generation_atomic
-dvm-read-cache/DvmReadCache|storaged|block::tests::overlapping_read_ahead_windows_replace_instead_of_aliasing
-dvm-read-cache/DvmReadCache|storaged|block::tests::read_ahead_plan_pipelines_bounded_transport_windows
-dvm-read-cache/DvmReadCache|storaged|block::tests::read_ahead_plan_stops_at_device_end_and_rejects_oversize_requests
-dvm-read-cache/DvmReadCache|storaged|block::tests::random_miss_stays_one_window_until_a_contiguous_boundary_miss
+dvm-read-cache/DvmReadCache|storaged|read_engine::tests::cold_read_fetches_one_window_and_the_next_read_hits
+dvm-read-cache/DvmReadCache|storaged|read_engine::tests::sequential_stream_reads_ahead_and_never_fetches_a_window_twice
+dvm-read-cache/DvmReadCache|storaged|read_engine::tests::concurrent_readers_of_one_window_share_one_fetch
+dvm-read-cache/DvmReadCache|storaged|read_engine::tests::write_invalidation_drops_cached_and_in_flight_windows
+dvm-read-cache/DvmReadCache|storaged|read_engine::tests::generation_change_drops_the_cache
+dvm-read-cache/DvmReadCache|storaged|read_engine::tests::transport_error_fails_the_reader_and_is_not_cached
+dvm-read-cache/DvmReadCache|storaged|read_engine::tests::random_reads_do_not_read_ahead
+dvm-read-cache/DvmReadCache|storaged|read_engine::tests::streamed_windows_are_evicted_before_the_working_set
+dvm-read-cache/DvmReadCache|storaged|read_engine::tests::expired_ticket_is_reported_and_its_window_dropped
+dvm-read-cache/DvmReadCache|storaged|block::tests::generation_mismatch_is_stale_not_a_fallback
 page-cache-lifecycle/PageCacheLifecycle|pagerd|page_cache::tests::concurrent_miss_has_one_load_owner_and_exact_backing_generation
 page-cache-lifecycle/PageCacheLifecycle|pagerd|page_cache::tests::private_cow_never_changes_the_shared_clean_source
 page-cache-lifecycle/PageCacheLifecycle|pagerd|page_cache::tests::dirty_page_requires_exact_writeback_before_reclaim
@@ -2855,7 +2859,7 @@ exception-retirement-lifecycle/ExceptionRetirementLifecycle|kernel-hal|arch::gdt
 ipc-handle-transfer/IpcHandleTransfer|rustos-user-abi|tests::ipc_transfer_ticket_wire_is_canonical_and_rejects_zero_authority
 robust-futex-owner-death/RobustFutexOwnerDeath|kernel-compat|user::syscall::linux::service_ops::futex_thread::tests::kernel_generated_wake_uses_shared_then_exact_private_fallback
 gpu-submit-transaction/GpuSubmitTransaction|uiserver|gpu_scene::tests::rejected_transport_submit_restores_exact_compiler_timeline
-acceptance-profile-publication/AcceptanceProfilePublication|uiserver|acceptance_profile::tests::late_acceptance_profile_requires_the_exact_complete_contract
+acceptance-profile-publication/AcceptanceProfilePublication|uiserver|acceptance_profile::tests::late_acceptance_contract_requires_the_exact_complete_key_set
 smp-ring3-qualification/SmpRing3Qualification|rustos-user-abi|syscall::syscall_tests::smp_qualification_worker_shape_is_exact_and_bounded
 smp-ring3-qualification/SmpRing3Qualification|rustos-user-abi|syscall::syscall_tests::smp_qualification_bind_shape_is_closed_and_bounded
 smp-ring3-qualification/SmpRing3Qualification|kernel-compat|user::syscall::linux::debug_ops::product_milestone_tests::smp_qualification_milestone_binds_worker_to_the_kernel_observed_cpu

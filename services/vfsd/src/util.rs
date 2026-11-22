@@ -33,11 +33,13 @@ pub(super) fn map_fat_error(err: FatError) -> i32 {
 pub(super) fn handle_kind_u16(kind: RemoteKind) -> u16 {
     use rustos_user_abi::syscall::{
         VFS_IPC_HANDLE_KIND_DEVICE, VFS_IPC_HANDLE_KIND_DIR, VFS_IPC_HANDLE_KIND_FILE,
+        VFS_IPC_HANDLE_KIND_INOTIFY,
     };
     match kind {
         RemoteKind::File => VFS_IPC_HANDLE_KIND_FILE,
         RemoteKind::Directory => VFS_IPC_HANDLE_KIND_DIR,
         RemoteKind::Device => VFS_IPC_HANDLE_KIND_DEVICE,
+        RemoteKind::Inotify => VFS_IPC_HANDLE_KIND_INOTIFY,
         // Never a handle kind; unreachable for a published description.
         RemoteKind::Symlink | RemoteKind::Socket | RemoteKind::Fifo => VFS_IPC_HANDLE_KIND_FILE,
     }
@@ -67,7 +69,7 @@ fn node_mode(metadata: &Metadata) -> u32 {
                 RemoteKind::Symlink => S_IFLNK,
                 RemoteKind::Socket => S_IFSOCK,
                 RemoteKind::Fifo => S_IFIFO,
-                RemoteKind::File | RemoteKind::Device => super::S_IFREG,
+                RemoteKind::File | RemoteKind::Device | RemoteKind::Inotify => super::S_IFREG,
             };
             kind | (fs.mode & 0o7777)
         }
@@ -170,6 +172,7 @@ pub(super) fn mode_bits(kind: RemoteKind) -> u32 {
         RemoteKind::Symlink => S_IFLNK | 0o777,
         RemoteKind::Socket => S_IFSOCK | 0o755,
         RemoteKind::Fifo => S_IFIFO | 0o644,
+        RemoteKind::Inotify => super::S_IFREG | 0o600,
     }
 }
 
@@ -207,6 +210,7 @@ pub(super) fn encode_dirent_into(
         RemoteKind::Symlink => DT_LNK,
         RemoteKind::Socket => DT_SOCK,
         RemoteKind::Fifo => DT_FIFO,
+        RemoteKind::Inotify => DT_REG,
     };
     out[19..19 + entry.name.len()].copy_from_slice(entry.name.as_bytes());
     out[19 + entry.name.len()..record_len].fill(0);

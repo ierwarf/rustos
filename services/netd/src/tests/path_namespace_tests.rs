@@ -5,7 +5,10 @@ use std::collections::BTreeSet;
 use path_namespace::NodeIdentity;
 
 /// Recording fake of the vfsd namespace: a set of socket nodes.
-#[derive(Default)]
+///
+/// Inode bindings live in the process-global net state, so concurrently running
+/// tests must not hand out the same `(mount, node)`: every instance numbers its
+/// nodes from a disjoint range.
 struct FakeNamespace {
     nodes: BTreeSet<String>,
     ids: BTreeMap<String, u64>,
@@ -13,6 +16,20 @@ struct FakeNamespace {
     created: Vec<(String, u32, u32, u32)>,
     stats: Vec<String>,
     fail_create: Option<i32>,
+}
+
+impl Default for FakeNamespace {
+    fn default() -> Self {
+        static NEXT_RANGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            nodes: BTreeSet::new(),
+            ids: BTreeMap::new(),
+            next_id: NEXT_RANGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 20,
+            created: Vec::new(),
+            stats: Vec::new(),
+            fail_create: None,
+        }
+    }
 }
 
 impl FakeNamespace {
@@ -59,6 +76,7 @@ fn idle(kind: UnixSocketKind) -> UnixSocket {
         refs: 1,
         options: SocketOptions::default(),
         bound_path: None,
+        bound_inode: None,
         local_path: None,
         peer_path: None,
         state: UnixSocketState::Idle,
@@ -479,7 +497,7 @@ mod vfsd_backed {
 
     #[test]
     fn missing_parent_and_vfsd_failures_surface_without_binding() {
-        let sock = 0x9b0_0021;
+        let sock = 0x9b0_0121;
         fresh(&[sock]);
         let vfsd = Shared::with_dirs(&["/"]);
         let mut ns = namespace(&vfsd);
@@ -547,9 +565,9 @@ mod vfsd_backed {
         let mut ns = namespace(&vfsd);
         assert_eq!(handle_bind_with(&sockaddr(a, b"rel/path.sock\0"), &mut ns), 0);
         assert_eq!(handle_bind_with(&sockaddr(b, b"\0abstract"), &mut ns), 0);
-        assert_eq!(handle_bind_with(&sockaddr(c, b"/run/user/1000/wayland-0\0"), &mut ns), 0);
+        assert_eq!(handle_bind_with(&sockaddr(c, b"/run/user/1000/wayland-7\0"), &mut ns), 0);
         assert!(vfsd.has_socket("/cwd/rel/path.sock"));
-        assert!(vfsd.has_socket("/run/user/1000/wayland-0"));
+        assert!(vfsd.has_socket("/run/user/1000/wayland-7"));
         assert_eq!(vfsd.0.lock().unwrap().requests.len(), 4);
         drop_sockets(&[a, b, c]);
     }

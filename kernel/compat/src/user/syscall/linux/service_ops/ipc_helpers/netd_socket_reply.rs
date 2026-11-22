@@ -6,7 +6,7 @@ pub(super) fn netd_reply_uses_prepared_socket(request: &NetdIpcRequest) -> bool 
     match request.op {
         SYSCALL_OFFLOAD_OP_LINUX_SOCKET | SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR => {
             (request.op == SYSCALL_OFFLOAD_OP_LINUX_SOCKET
-                && request.arg0 == linux_abi::AF_INET
+                && (request.arg0 == linux_abi::AF_INET || request.arg0 == linux_abi::AF_INET6)
                 && rustos_user_abi::syscall::net_broker_inet_socket_shape_valid(
                     request.arg0,
                     request.arg1,
@@ -165,6 +165,7 @@ fn unix_socket_type_matches(
     listener_type: u64,
 ) -> bool {
     let valid_unix_type = entry_type == linux_abi::SOCK_STREAM
+        || entry_type == linux_abi::SOCK_DGRAM
         || entry_type == rustos_user_abi::syscall::NET_BROKER_PUBLICATION_SOCK_SEQPACKET;
     if !accept {
         return entry_type == requested_type & linux_abi::SOCK_TYPE_MASK && valid_unix_type;
@@ -212,7 +213,11 @@ pub(super) fn prepared_netd_socket_response_matches(
         return false;
     }
     let domain = if accept {
-        linux_abi::AF_UNIX
+        if request.arg5 == linux_abi::AF_INET || request.arg5 == linux_abi::AF_INET6 {
+            request.arg5
+        } else {
+            linux_abi::AF_UNIX
+        }
     } else {
         request.arg0
     };
@@ -229,11 +234,12 @@ pub(super) fn prepared_netd_socket_response_matches(
             // bookkeeping, exactly like internet sockets.
             multitask::KernelHandle::InetSocket(socket) => {
                 (domain == linux_abi::AF_INET
+                    || domain == linux_abi::AF_INET6
                     || domain == rustos_user_abi::syscall::NET_BROKER_PUBLICATION_AF_NETLINK)
                     && socket.token_id() == token
                     && socket.domain() == domain
                     && socket.type_() == (socket_type & linux_abi::SOCK_TYPE_MASK)
-                    && socket.protocol() == protocol
+                    && (socket.protocol() == protocol || (accept && socket.protocol() == linux_abi::IPPROTO_TCP))
             }
             multitask::KernelHandle::Socket(socket) => {
                 domain == linux_abi::AF_UNIX
