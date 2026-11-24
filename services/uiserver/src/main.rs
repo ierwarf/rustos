@@ -23,6 +23,7 @@ mod sys;
 mod terminal;
 mod ui_assets;
 mod ui_config;
+mod ui_scale;
 mod wayland;
 mod wayland_accept;
 
@@ -668,11 +669,18 @@ fn run() -> Result<(), i32> {
         if let Ok(load) = ui_assets_loaded.try_recv() {
             match load {
                 ui_assets::AssetLoad::Ready(loaded) => {
+                    let loaded_scale = loaded.display_scale();
                     if ui_assets::promote(
                         loaded,
                         &mut state.desktop_cache,
                         &mut state.console_windows,
                     ) {
+                        let _ = ui_assets::apply_scale(
+                            loaded_scale,
+                            &mut state.desktop_cache,
+                            &mut state.console_windows,
+                            Some(&mut wayland),
+                        );
                         pending_update.request_full();
                     }
                 }

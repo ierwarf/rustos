@@ -74,27 +74,6 @@ pub(crate) struct PagerFaultLeaf {
     physical_address: u64,
 }
 
-/// The tagged frames a retirement walk reconciles with physical descriptors.
-///
-/// Every address-space-owned data leaf has both a PTE tag and an exact
-/// `(root, virtual_address)` descriptor. Every dynamically created user table,
-/// from either normal-time mapping or fault entry, has the directory tag and a
-/// root-owned descriptor-list entry.
-#[derive(Debug)]
-pub(crate) struct PagerFaultOwnership {
-    leaves: Vec<PagerFaultLeaf>,
-    tables: Vec<u64>,
-}
-
-impl PagerFaultOwnership {
-    const fn empty() -> Self {
-        Self {
-            leaves: Vec::new(),
-            tables: Vec::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressSpaceError {
     ZeroSizedAllocation,
@@ -128,6 +107,23 @@ struct ClonedLeaf {
     virtual_address: VirtAddr,
     child_frame_phys: u64,
     shared_alias: Option<phys::SharedAliasTicket>,
+    /// The parent's PTE flags before the fork downgrade (restored on failure).
+    parent_flags: PageTableFlags,
+}
+
+#[derive(Clone, Copy)]
+struct PendingSharedLeaf {
+    slot: u16,
+    parent_flags: PageTableFlags,
+    child_flags: PageTableFlags,
+}
+
+impl PendingSharedLeaf {
+    const EMPTY: Self = Self {
+        slot: 0,
+        parent_flags: PageTableFlags::empty(),
+        child_flags: PageTableFlags::empty(),
+    };
 }
 
 impl UserRegion {
@@ -269,178 +265,298 @@ impl ProcessAddressSpace {
     ) -> Result<Self, AddressSpaceError> {
         let mut cloned = Self::new()?;
         cloned.next_user_addr = self.next_user_addr;
-        let ownership = self.pager_fault_ownership()?;
+        // Only page-table pages are recorded here; the leaves themselves are
+        // read straight from each 512-entry page below, so the walk neither
+        // allocates per leaf nor re-translates an address it already holds.
+        let (leaf_pages, leaf_count) = self.owned_leaf_table_pages()?;
         let mut cloned_leaves = Vec::new();
         cloned_leaves
-            .try_reserve_exact(ownership.leaves.len())
-            .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        let mut downgraded = Vec::new();
-        downgraded
-            .try_reserve_exact(ownership.leaves.len())
+            .try_reserve_exact(leaf_count)
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
         // The child mapper acquires its own mutation stripe. Clone immutable
         // aliases before taking the parent stripe to avoid nested class-38
         // locks; the caller's fork hold still excludes parent VMA mutation.
         self.clone_immutable_mappings_into(&mut cloned)?;
         let mutation = begin_address_space_mutation(self.root_phys());
+        let parent_root = self.pml4_frame_phys;
+        let child_root = cloned.pml4_frame_phys;
+        let mut cow_cursor = RegionCursor::new(cow_ranges);
+        let mut eager_cursor = RegionCursor::new(eager_private_ranges);
+        // Runs of leaves usually share one flag word, so the normalization of
+        // the child's COW flags is computed once per distinct input.
+        let mut shared_flags_memo: Option<(PageTableFlags, PageTableFlags)> = None;
 
-        for leaf in ownership.leaves {
-            let virt = VirtAddr::new(leaf.virtual_address);
-            let Some((src_phys, flags)) = self.translate_user_with_flags(virt) else {
-                rollback_cloned_leaves(&mut cloned, &cloned_leaves);
-                drop(mutation);
-                return Err(AddressSpaceError::NotMapped);
-            };
-            if src_phys.as_u64() != leaf.physical_address
-                || !phys::data_leaf_is_owned(
-                    self.pml4_frame_phys,
-                    leaf.virtual_address,
-                    leaf.physical_address,
-                )
-            {
-                rollback_cloned_leaves(&mut cloned, &cloned_leaves);
-                drop(mutation);
-                return Err(AddressSpaceError::InvalidFrameOwnership);
-            }
+        let mut pending_leaves = [PendingSharedLeaf::EMPTY; phys::SHARED_ALIAS_RUN_MAX];
+        let mut pending_requests = [phys::SharedAliasRequest::EMPTY; phys::SHARED_ALIAS_RUN_MAX];
+        let mut pending_tickets = [phys::SharedAliasTicket::EMPTY; phys::SHARED_ALIAS_RUN_MAX];
+        let mut pending_len = 0_usize;
 
-            let eager_private = user_regions_contain(eager_private_ranges, virt);
-            let inherited_cow = if flags.contains(COW_USER_LEAF) {
-                match phys::data_leaf_cow_identity(
-                    self.pml4_frame_phys,
-                    leaf.virtual_address,
-                    leaf.physical_address,
-                ) {
-                    Some(identity) => Some(identity),
-                    None => {
-                        rollback_cloned_leaves(&mut cloned, &cloned_leaves);
-                        drop(mutation);
-                        return Err(AddressSpaceError::InvalidFrameOwnership);
-                    }
-                }
-            } else {
-                None
-            };
-            let shared_identity = if eager_private {
-                None
-            } else {
-                inherited_cow.or_else(|| {
-                    user_regions_contain(cow_ranges, virt)
-                        .then_some((phys::CowFrameKind::AnonymousFork, 0))
-                })
-            };
-
-            if let Some((kind, backing_identity)) = shared_identity {
-                let Some(ticket) = phys::prepare_shared_alias(
-                    self.pml4_frame_phys,
-                    leaf.virtual_address,
-                    cloned.pml4_frame_phys,
-                    leaf.virtual_address,
-                    leaf.physical_address,
-                    kind,
-                    backing_identity,
-                ) else {
-                    rollback_cloned_leaves(&mut cloned, &cloned_leaves);
-                    drop(mutation);
-                    return Err(AddressSpaceError::OutOfFrames);
-                };
-                if let Err(error) =
-                    cloned.map_shared_cow_leaf_without_mutation(virt, leaf.physical_address, flags)
-                {
-                    phys::cancel_shared_alias(ticket);
-                    rollback_cloned_leaves(&mut cloned, &cloned_leaves);
-                    drop(mutation);
-                    return Err(error);
-                }
-                phys::publish_shared_alias(ticket);
-                cloned_leaves.push(ClonedLeaf {
-                    virtual_address: virt,
-                    child_frame_phys: leaf.physical_address,
-                    shared_alias: Some(ticket),
-                });
-                continue;
-            }
-
-            let Some(dst_phys) = phys::alloc_frame_user() else {
-                rollback_cloned_leaves(&mut cloned, &cloned_leaves);
-                drop(mutation);
-                return Err(AddressSpaceError::OutOfFrames);
-            };
-            let child_root = cloned.pml4_frame_phys;
-            if let Err(error) = data_claim_result(phys::claim_data_leaf(child_root, leaf.virtual_address, dst_phys.as_u64())) {
-                phys::free_frame(dst_phys);
+        macro_rules! fail {
+            ($error:expr) => {{
+                let error = $error;
                 rollback_cloned_leaves(&mut cloned, &cloned_leaves);
                 drop(mutation);
                 return Err(error);
-            }
-            // SAFETY: `src_phys` is the parent's leaf, re-translated and ownership-checked
-            // above under the mutation stripe; `dst_phys` is a fresh exclusive frame from
-            // `alloc_frame_user`. Both are direct-mapped, 4 KiB, and distinct frames, so
-            // the two PAGE_4KIB ranges cannot overlap.
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    higher_half_ptr(src_phys),
-                    higher_half_ptr(dst_phys),
-                    PAGE_4KIB,
-                );
-            }
-            let inherited_flags = without_root_owned_user_leaf_tag(flags);
-            let child_source_flags = if eager_private {
-                inherited_flags
-                    .difference(COW_USER_LEAF)
-                    .union(PageTableFlags::WRITABLE)
-            } else {
-                inherited_flags
-            };
-            let child_flags = match normalize_user_page_flags(child_source_flags) {
-                Ok(flags) => flags | ROOT_OWNED_USER_LEAF,
-                Err(error) => {
-                    phys::cancel_data_leaf(child_root, leaf.virtual_address, dst_phys.as_u64());
-                    phys::free_frame(dst_phys);
-                    rollback_cloned_leaves(&mut cloned, &cloned_leaves);
-                    drop(mutation);
-                    return Err(error);
-                }
-            };
-            if let Err(error) = cloned.map_user_page(virt, dst_phys, child_flags) {
-                phys::cancel_data_leaf(child_root, leaf.virtual_address, dst_phys.as_u64());
-                phys::free_frame(dst_phys);
-                rollback_cloned_leaves(&mut cloned, &cloned_leaves);
-                drop(mutation);
-                return Err(error);
-            }
-            phys::publish_data_leaf(child_root, leaf.virtual_address, dst_phys.as_u64());
-            cloned_leaves.push(ClonedLeaf {
-                virtual_address: virt,
-                child_frame_phys: dst_phys.as_u64(),
-                shared_alias: None,
-            });
+            }};
         }
 
-        for leaf in cloned_leaves
-            .iter()
-            .filter(|leaf| leaf.shared_alias.is_some())
-        {
-            let old_flags = match self.user_page_flags(leaf.virtual_address) {
-                Ok(flags) => flags,
-                Err(error) => {
-                    restore_parent_flags(self, &downgraded);
-                    rollback_cloned_leaves(&mut cloned, &cloned_leaves);
-                    drop(mutation);
-                    return Err(error);
+        macro_rules! flush_shared_run {
+            ($child_table:expr) => {{
+                if pending_len != 0 {
+                    let count = pending_len;
+                    pending_len = 0;
+                    let needed = cloned_leaves.len().saturating_add(count);
+                    if needed > cloned_leaves.capacity()
+                        && cloned_leaves.try_reserve(count).is_err()
+                    {
+                        fail!(AddressSpaceError::OutOfFrames);
+                    }
+                    if let Err(error) = phys::prepare_shared_alias_run(
+                        parent_root,
+                        child_root,
+                        &pending_requests[..count],
+                        &mut pending_tickets[..count],
+                    ) {
+                        let mapped = match error {
+                            phys::SharedAliasRunError::OutOfFrames => {
+                                AddressSpaceError::OutOfFrames
+                            }
+                            phys::SharedAliasRunError::InvalidFrameOwnership => {
+                                AddressSpaceError::InvalidFrameOwnership
+                            }
+                        };
+                        fail!(mapped);
+                    }
+                    // SAFETY: `child_table` is the child's own PT, created or
+                    // found by `ensure_leaf_table` under the same mutation
+                    // stripe; the child root is unpublished and never loaded,
+                    // so no CPU can hold a translation that needs a flush.
+                    let installed = {
+                        let table = unsafe { kernel_vm::phys_to_table_mut($child_table) };
+                        let mut written = 0_usize;
+                        while written < count {
+                            let slot = pending_leaves[written].slot as usize;
+                            let entry = &mut table[slot];
+                            if !entry.is_unused() {
+                                for undo in &pending_leaves[..written] {
+                                    table[undo.slot as usize].set_unused();
+                                }
+                                break;
+                            }
+                            entry.set_addr(
+                                PhysAddr::new(pending_requests[written].frame_phys),
+                                pending_leaves[written].child_flags,
+                            );
+                            written += 1;
+                        }
+                        written == count
+                    };
+                    if !installed {
+                        phys::cancel_shared_alias_run(&pending_tickets[..count]);
+                        fail!(AddressSpaceError::AlreadyMapped);
+                    }
+                    phys::publish_shared_alias_run(&pending_tickets[..count]);
+                    for i in 0..count {
+                        cloned_leaves.push(ClonedLeaf {
+                            virtual_address: VirtAddr::new(pending_requests[i].new_va),
+                            child_frame_phys: pending_requests[i].frame_phys,
+                            shared_alias: Some(pending_tickets[i]),
+                            parent_flags: pending_leaves[i].parent_flags,
+                        });
+                    }
                 }
+            }};
+        }
+
+        for page in &leaf_pages {
+            // One directory walk per page-table page for the child; the parent
+            // page is addressed directly through the direct map.
+            let child_table = match cloned.ensure_leaf_table(page.base_virtual_address) {
+                Ok(table) => table,
+                Err(error) => fail!(error),
             };
-            let cow_flags = old_flags
-                .difference(PageTableFlags::WRITABLE)
-                .union(ROOT_OWNED_USER_LEAF | COW_USER_LEAF);
-            if let Err(error) =
-                self.set_user_page_flags_exact_without_flush(leaf.virtual_address, cow_flags)
-            {
-                restore_parent_flags(self, &downgraded);
+            for slot in 0..512_usize {
+                // SAFETY: `page.table_phys` is a present, non-huge parent PT
+                // recorded under the caller's fork hold; the parent mutation
+                // stripe and `&mut self` exclude other normal-time writers and
+                // tables are freed only at retirement. The reference is
+                // dropped before any call that could re-derive this table.
+                let (src_phys, flags) = {
+                    let entry = &unsafe { kernel_vm::phys_to_table_ref(page.table_phys) }[slot];
+                    if entry.is_unused() || !entry.flags().contains(ROOT_OWNED_USER_LEAF) {
+                        continue;
+                    }
+                    if !entry.flags().contains(PageTableFlags::PRESENT) {
+                        fail!(AddressSpaceError::InvalidFrameOwnership);
+                    }
+                    (entry.addr(), entry.flags())
+                };
+                let virt_address = page.base_virtual_address | ((slot as u64) << 12);
+                let virt = VirtAddr::new(virt_address);
+
+                let eager_private = eager_cursor.contains(virt_address);
+                let shared_mode = if eager_private {
+                    None
+                } else if flags.contains(COW_USER_LEAF) {
+                    Some(phys::SharedAliasMode::InheritShared)
+                } else if cow_cursor.contains(virt_address) {
+                    Some(phys::SharedAliasMode::AnonymousFork)
+                } else {
+                    None
+                };
+
+                if let Some(mode) = shared_mode {
+                    let child_flags = match shared_flags_memo {
+                        Some((input, output)) if input == flags => output,
+                        _ => match normalize_user_page_flags(flags) {
+                            Ok(normalized) => {
+                                let output = normalized
+                                    .difference(PageTableFlags::WRITABLE)
+                                    .union(ROOT_OWNED_USER_LEAF | COW_USER_LEAF);
+                                shared_flags_memo = Some((flags, output));
+                                output
+                            }
+                            Err(error) => fail!(error),
+                        },
+                    };
+                    pending_leaves[pending_len] = PendingSharedLeaf {
+                        slot: slot as u16,
+                        parent_flags: flags,
+                        child_flags,
+                    };
+                    pending_requests[pending_len] = phys::SharedAliasRequest {
+                        owner_va: virt_address,
+                        new_va: virt_address,
+                        frame_phys: src_phys.as_u64(),
+                        mode,
+                    };
+                    pending_len += 1;
+                    if pending_len == phys::SHARED_ALIAS_RUN_MAX {
+                        flush_shared_run!(child_table);
+                    }
+                    continue;
+                }
+
+                flush_shared_run!(child_table);
+                if cloned_leaves.len() == cloned_leaves.capacity()
+                    && cloned_leaves.try_reserve(1).is_err()
+                {
+                    fail!(AddressSpaceError::OutOfFrames);
+                }
+                if flags.contains(COW_USER_LEAF)
+                    && phys::data_leaf_cow_identity(parent_root, virt_address, src_phys.as_u64())
+                        .is_none()
+                {
+                    fail!(AddressSpaceError::InvalidFrameOwnership);
+                }
+
+                if !phys::data_leaf_is_owned(parent_root, virt_address, src_phys.as_u64()) {
+                    fail!(AddressSpaceError::InvalidFrameOwnership);
+                }
+                let Some(dst_phys) = phys::alloc_frame_user() else {
+                    fail!(AddressSpaceError::OutOfFrames);
+                };
+                if let Err(error) = data_claim_result(phys::claim_data_leaf(
+                    child_root,
+                    virt_address,
+                    dst_phys.as_u64(),
+                )) {
+                    phys::free_frame(dst_phys);
+                    fail!(error);
+                }
+                // SAFETY: `src_phys` is the parent's leaf, read from its PTE
+                // under the mutation stripe and ownership-checked above;
+                // `dst_phys` is a fresh exclusive frame from `alloc_frame_user`.
+                // Both are direct-mapped, 4 KiB, and distinct frames, so the
+                // two PAGE_4KIB ranges cannot overlap.
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        higher_half_ptr(src_phys),
+                        higher_half_ptr(dst_phys),
+                        PAGE_4KIB,
+                    );
+                }
+                let inherited_flags = without_root_owned_user_leaf_tag(flags);
+                let child_source_flags = if eager_private {
+                    inherited_flags
+                        .difference(COW_USER_LEAF)
+                        .union(PageTableFlags::WRITABLE)
+                } else {
+                    inherited_flags
+                };
+                let child_flags = match normalize_user_page_flags(child_source_flags) {
+                    Ok(flags) => flags | ROOT_OWNED_USER_LEAF,
+                    Err(error) => {
+                        phys::cancel_data_leaf(child_root, virt_address, dst_phys.as_u64());
+                        phys::free_frame(dst_phys);
+                        fail!(error);
+                    }
+                };
+                if let Err(error) = cloned.map_user_page(virt, dst_phys, child_flags) {
+                    phys::cancel_data_leaf(child_root, virt_address, dst_phys.as_u64());
+                    phys::free_frame(dst_phys);
+                    fail!(error);
+                }
+                phys::publish_data_leaf(child_root, virt_address, dst_phys.as_u64());
+                cloned_leaves.push(ClonedLeaf {
+                    virtual_address: virt,
+                    child_frame_phys: dst_phys.as_u64(),
+                    shared_alias: None,
+                    parent_flags: flags,
+                });
+            }
+            flush_shared_run!(child_table);
+        }
+
+        // Pass 2: write-protect the parent. `cloned_leaves` is in ascending
+        // address order, so each run inside one page-table page costs a single
+        // directory walk. The flag word is re-read from the live PTE (not the
+        // pass-1 snapshot) so hardware accessed/dirty updates are preserved.
+        let mut done = 0_usize;
+        while done < cloned_leaves.len() {
+            let table_key = cloned_leaves[done].virtual_address.as_u64() >> 21;
+            let run_end = done
+                + cloned_leaves[done..]
+                    .iter()
+                    .take_while(|leaf| leaf.virtual_address.as_u64() >> 21 == table_key)
+                    .count();
+            let first = cloned_leaves[done].virtual_address;
+            let mut failure = None;
+            match self.leaf_pt_mut(first) {
+                Err(error) => failure = Some(error),
+                Ok(table) => {
+                    for index in done..run_end {
+                        let leaf = &mut cloned_leaves[index];
+                        if leaf.shared_alias.is_none() {
+                            continue;
+                        }
+                        let entry = &mut table[p1_index(leaf.virtual_address)];
+                        if entry.is_unused() {
+                            failure = Some(AddressSpaceError::NotMapped);
+                            break;
+                        }
+                        if entry.addr().as_u64() != leaf.child_frame_phys {
+                            failure = Some(AddressSpaceError::InvalidFrameOwnership);
+                            break;
+                        }
+                        let old_flags = entry.flags();
+                        let cow_flags = old_flags
+                            .difference(PageTableFlags::WRITABLE)
+                            .union(ROOT_OWNED_USER_LEAF | COW_USER_LEAF);
+                        entry.set_addr(entry.addr(), cow_flags);
+                        leaf.parent_flags = old_flags;
+                        // Count the entry as downgraded only after the write.
+                        done = index + 1;
+                    }
+                }
+            }
+            if let Some(error) = failure {
+                restore_parent_flags(self, &cloned_leaves[..done]);
                 rollback_cloned_leaves(&mut cloned, &cloned_leaves);
                 drop(mutation);
                 return Err(error);
             }
-            downgraded.push((leaf.virtual_address, old_flags));
+            done = run_end;
         }
 
         // Drop performs the one parent-root shootdown and waits for every CPU
@@ -448,6 +564,21 @@ impl ProcessAddressSpace {
         // become runnable.
         drop(mutation);
         Ok(cloned)
+    }
+
+    /// Returns the child-side leaf page table covering `base_virtual_address`,
+    /// creating the directory chain through the unified claim/CAS protocol.
+    fn ensure_leaf_table(
+        &mut self,
+        base_virtual_address: u64,
+    ) -> Result<PhysAddr, AddressSpaceError> {
+        let virt = VirtAddr::new(base_virtual_address);
+        validate_user_page_range(virt, 1)?;
+        let root = self.root_phys();
+        let root_phys = root.as_u64();
+        let pdpt = ensure_next_table(root_phys, root, p4_index(virt))?;
+        let pd = ensure_next_table(root_phys, pdpt, p3_index(virt))?;
+        ensure_next_table(root_phys, pd, p2_index(virt))
     }
 
     pub fn alloc_user_bytes(
@@ -1052,12 +1183,6 @@ impl ProcessAddressSpace {
         Ok(())
     }
 
-    fn user_page_flags(&self, virt: VirtAddr) -> Result<PageTableFlags, AddressSpaceError> {
-        self.translate_user_with_flags(virt)
-            .map(|(_, flags)| flags)
-            .ok_or(AddressSpaceError::NotMapped)
-    }
-
     fn set_user_page_flags_exact_without_flush(
         &mut self,
         virt: VirtAddr,
@@ -1124,18 +1249,44 @@ impl ProcessAddressSpace {
     }
 }
 
-fn user_regions_contain(regions: &[UserRegion], address: VirtAddr) -> bool {
-    let index = regions.partition_point(|region| region.start <= address);
-    index != 0 && address < regions[index - 1].end()
+/// Membership test over sorted, disjoint regions for queries issued in
+/// ascending address order; each query resumes where the last one stopped, so
+/// a whole fork walk is linear in `regions + leaves` instead of a binary
+/// search per leaf.
+struct RegionCursor<'a> {
+    regions: &'a [UserRegion],
+    index: usize,
 }
 
-fn restore_parent_flags(
-    space: &mut ProcessAddressSpace,
-    downgraded: &[(VirtAddr, PageTableFlags)],
-) {
-    for (virt, flags) in downgraded.iter().rev().copied() {
+impl<'a> RegionCursor<'a> {
+    fn new(regions: &'a [UserRegion]) -> Self {
+        Self { regions, index: 0 }
+    }
+
+    fn contains(&mut self, address: u64) -> bool {
+        while self
+            .regions
+            .get(self.index)
+            .is_some_and(|region| region.end().as_u64() <= address)
+        {
+            self.index += 1;
+        }
+        self.regions
+            .get(self.index)
+            .is_some_and(|region| region.start.as_u64() <= address)
+    }
+}
+
+/// Re-installs the pre-fork flags of every parent leaf that pass 2 already
+/// downgraded (`leaves` is exactly that prefix).
+fn restore_parent_flags(space: &mut ProcessAddressSpace, leaves: &[ClonedLeaf]) {
+    for leaf in leaves
+        .iter()
+        .rev()
+        .filter(|leaf| leaf.shared_alias.is_some())
+    {
         space
-            .set_user_page_flags_exact_without_flush(virt, flags)
+            .set_user_page_flags_exact_without_flush(leaf.virtual_address, leaf.parent_flags)
             .expect("fork COW rollback lost a parent leaf");
     }
 }

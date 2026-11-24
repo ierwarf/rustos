@@ -760,6 +760,33 @@ pub(super) fn create_session_endpoint() -> Option<u64> {
     Some(endpoint as u64)
 }
 
+/// Longest the broker itself holds a console-graph wait before answering.
+///
+/// Kernel compat issues `CONSOLE_ROUTE_GRAPH_READINESS` under
+/// `InteractiveControl` (100 ms hard ceiling). Because `runtimed` runs in the
+/// `User` scheduling class after UI bootstrap, parking for the full 80 ms ABI
+/// cap leaves only 20 ms for arrival, `IDLE_POLL_INTERVAL` wakeup, and reply
+/// under 16-vCPU contention. Capping internal park duration at 40 ms preserves
+/// 60 ms of scheduling headroom while still waking immediately on every edge.
+const CONSOLE_GRAPH_PARK_BUDGET_CAP_MS: u64 = 40;
+
+static LAST_SESSION_WAIT_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+static PARKED_GRAPH_ABANDONED_DIAGNOSTICS: rustos_svc_runtime::ipc::ReplyFailureDiagnostics =
+    rustos_svc_runtime::ipc::ReplyFailureDiagnostics::new();
+static PARKED_GRAPH_REPLY_FAILURE_DIAGNOSTICS: rustos_svc_runtime::ipc::ReplyFailureDiagnostics =
+    rustos_svc_runtime::ipc::ReplyFailureDiagnostics::new();
+
+pub(super) fn take_last_session_wait() -> Option<Duration> {
+    let nanos = LAST_SESSION_WAIT_NANOS.swap(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+    (nanos != u64::MAX).then(|| Duration::from_nanos(nanos))
+}
+
+fn record_last_session_wait(elapsed: Duration) {
+    let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX - 1);
+    LAST_SESSION_WAIT_NANOS.store(nanos.min(u64::MAX - 1), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Service one session request.
 ///
 /// `wait` is `None` for a drain pass, which must never block because the caller
@@ -805,13 +832,16 @@ pub(super) fn service_session_endpoint(
                 sender_pid_ptr: (&mut sender_pid as *mut u64) as u64,
                 sender_tid_ptr: (&mut sender_tid as *mut u64) as u64,
             };
-            unsafe {
+            let wait_started = Instant::now();
+            let received = unsafe {
                 rustos_svc_runtime::syscall::syscall2(
                     SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED,
                     (&args as *const IpcRecvWithSenderArgs) as u64,
                     budget_ms,
                 ) as i64
-            }
+            };
+            record_last_session_wait(wait_started.elapsed());
+            received
         }
     };
     if received < 0 {
@@ -924,7 +954,10 @@ fn console_graph_wait_park_budget(
         return None;
     }
     Some(Duration::from_millis(
-        request.arg1.min(SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS),
+        request
+            .arg1
+            .min(SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS)
+            .min(CONSOLE_GRAPH_PARK_BUDGET_CAP_MS),
     ))
 }
 
@@ -1125,7 +1158,20 @@ fn answer_parked_console_graph_wait(waiter: ConsoleGraphWaiter, state: &mut Brok
         )
     };
     if reply < 0 {
-        super::spawn::debug_line("runtimed: parked console graph reply failed");
+        let errno = reply.checked_neg().unwrap_or(i64::MAX);
+        if errno == i64::from(libc::EINVAL) {
+            PARKED_GRAPH_ABANDONED_DIAGNOSTICS.record(
+                "runtimed",
+                "parked console graph abandoned-caller",
+                errno,
+            );
+        } else {
+            PARKED_GRAPH_REPLY_FAILURE_DIAGNOSTICS.record(
+                "runtimed",
+                "parked console graph",
+                errno,
+            );
+        }
     }
 }
 
@@ -2079,9 +2125,10 @@ mod tests {
             .expect("an unchanged graph is exactly what a wait is for");
         assert_eq!(
             budget,
-            std::time::Duration::from_millis(SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS),
-            "an over-long request is clamped, not refused"
+            std::time::Duration::from_millis(super::CONSOLE_GRAPH_PARK_BUDGET_CAP_MS),
+            "an over-long request is clamped below the InteractiveControl deadline with headroom"
         );
+        assert!(super::CONSOLE_GRAPH_PARK_BUDGET_CAP_MS < SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS);
 
         let moved = CommercialMaxProtocolResponse {
             value1: 8,

@@ -208,7 +208,11 @@ fn serve(endpoint: u64, sessiond_workers: &SessiondIoctlWorkers, app_buffers: &a
             thread::sleep(RECV_BACKOFF);
             continue;
         }
-        if received == 0 {
+        // A zero-byte call still owns a live one-shot reply capability; only an
+        // empty wake without one may be skipped. Otherwise it falls through to
+        // the `EINVAL` arm below instead of stranding the caller until its
+        // deadline.
+        if empty_receive_without_reply(received, reply_cap) {
             thread::sleep(RECV_BACKOFF);
             continue;
         }
@@ -282,6 +286,10 @@ fn serve(endpoint: u64, sessiond_workers: &SessiondIoctlWorkers, app_buffers: &a
             REPLY_FAILURE_DIAGNOSTICS.record("devmgrd", "ipc", -reply);
         }
     }
+}
+
+fn empty_receive_without_reply(received: i64, reply_cap: u64) -> bool {
+    received == 0 && reply_cap == 0
 }
 
 fn reply_app_buffer_status(reply_cap: u64, status: i32) -> i64 {
@@ -1265,6 +1273,18 @@ fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
     // SAFETY: The length assertion covers one complete `T`; unaligned read
     // imposes no alignment precondition and `T: Copy` permits a bitwise value.
     unsafe { bytes.as_ptr().cast::<T>().read_unaligned() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::empty_receive_without_reply;
+
+    #[test]
+    fn empty_call_with_a_reply_capability_is_answered_not_dropped() {
+        assert!(empty_receive_without_reply(0, 0));
+        assert!(!empty_receive_without_reply(0, 7));
+        assert!(!empty_receive_without_reply(8, 0));
+    }
 }
 
 // Native ABI revision stamp (hint, not authority); see docs/architecture/evolution-rules.md.

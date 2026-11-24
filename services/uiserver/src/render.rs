@@ -13,21 +13,22 @@ use std::time::{Duration, Instant};
 
 use crate::app::{AppState, ConsoleWindow, CursorMotion, DesktopSurfaceCache, WindowId};
 use crate::canvas::{
-    div255_round, render_cursor_bgra, Rect, SurfaceCanvas, CURSOR_TEXTURE_SIZE,
-    CURSOR_VISUAL_RADIUS,
+    CURSOR_TEXTURE_SIZE, CURSOR_VISUAL_RADIUS, Rect, SurfaceCanvas, div255_round,
+    render_cursor_bgra,
 };
 use crate::gpu_scene::{
     GpuAtlasPacker, GpuLayerKind, GpuLayerTransform, GpuSceneError, GpuSceneLayer,
     GpuTextureCapability, GpuTextureRegion,
 };
 use crate::layout::{
-    clamp_window_rect, default_console_window_rect as layout_default_console_window_rect,
-    desktop_bounds, home_cell, home_clock, launcher_button_rect as layout_launcher_button_rect,
-    taskbar_rail_rect, taskbar_slot_rect as layout_taskbar_slot_rect,
+    WINDOW_SHADOW_STEPS, clamp_window_rect,
+    default_console_window_rect as layout_default_console_window_rect, desktop_bounds, home_cell,
+    home_clock, launcher_button_rect as layout_launcher_button_rect, taskbar_rail_rect,
+    taskbar_slot_rect as layout_taskbar_slot_rect,
     wayland_client_rect as layout_wayland_client_rect,
-    wayland_outer_rect as layout_wayland_outer_rect, WINDOW_SHADOW_STEPS,
+    wayland_outer_rect as layout_wayland_outer_rect,
 };
-use crate::sys::{diag_line, ui_profile_enabled, ConsoleSessionHandle};
+use crate::sys::{ConsoleSessionHandle, diag_line, ui_profile_enabled};
 use crate::wayland::WaylandWindowSnapshot;
 
 mod background;
@@ -37,7 +38,7 @@ mod fragments;
 mod glass;
 mod icons;
 
-pub(crate) use background::{start_desktop_background_loader, DesktopBackground};
+pub(crate) use background::{DesktopBackground, start_desktop_background_loader};
 pub(crate) use fragments::WaylandOpaqueCacheEntry;
 
 const SLOW_DESKTOP_REFRESH_THRESHOLD: Duration = Duration::from_millis(8);
@@ -172,6 +173,29 @@ pub(crate) struct GpuAtlasScene {
     pub(crate) cursor_source_rect: Rect,
     pub(crate) wayland_bindings: Vec<WaylandAtlasBinding>,
     pub(crate) console_bindings: Vec<ConsoleAtlasBinding>,
+    /// Cropped scenes only: retained fragment placement per visible Wayland
+    /// window, so a client commit patches its fragments instead of
+    /// rebuilding the whole atlas.
+    pub(crate) cropped_wayland_bindings: Vec<CroppedWaylandBinding>,
+    /// False when a visible fragment belongs to a console window; console
+    /// content has no fragment binding, so such a scene rebuilds on any change.
+    pub(crate) cropped_reusable: bool,
+}
+
+/// One visible Wayland window inside a cropped (occlusion-fragment) scene.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CroppedWaylandBinding {
+    pub(crate) surface_id: u32,
+    pub(crate) content_version: u64,
+    /// Outer window rectangle the fragments were cut from.
+    pub(crate) outer: Rect,
+    pub(crate) focused: bool,
+    /// The window's pixels were proven opaque and therefore may occlude
+    /// layers below it; damage that makes them translucent invalidates the
+    /// fragment set.
+    pub(crate) pixels_opaque: bool,
+    /// `(source rect in outer-window coordinates, atlas region)`.
+    pub(crate) fragments: Vec<(Rect, Rect)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -393,6 +417,8 @@ fn build_full_gpu_atlas_scene(
         cursor_source_rect,
         wayland_bindings,
         console_bindings,
+        cropped_wayland_bindings: Vec::new(),
+        cropped_reusable: true,
     })
 }
 
@@ -437,7 +463,21 @@ pub(crate) fn gpu_window_draw_plan(
         .collect()
 }
 
-pub(crate) fn gpu_scene_reuse_signature(state: &AppState) -> u64 {
+/// Identity of everything a retained scene depends on besides pixel content
+/// that a binding patches. A cropped scene cuts fragments from the exact
+/// visible geometry, so unlike an uncropped scene (whose retained commands are
+/// re-targeted by `update_gpu_layer_destinations`) it also depends on every
+/// window position and on console output.
+/// A cropped (occlusion-fragment) scene stores each window as fragments cut at
+/// its exact geometry, so only that scene's reuse signature depends on window
+/// positions. The structural signature of the uncropped scene must stay
+/// position-free so dragging a window never forces a full rebuild; keeping the
+/// packing here keeps the two cases apart (see `check-performance-contracts.sh`).
+fn cropped_scene_position_key(x: usize, y: usize) -> u64 {
+    ((x as u64) << 32) ^ (y as u64)
+}
+
+pub(crate) fn gpu_scene_reuse_signature(state: &AppState, cropped: bool) -> u64 {
     let mut signature = 0xcbf2_9ce4_8422_2325_u64;
     let mut mix = |value: u64| {
         signature ^= value;
@@ -489,6 +529,17 @@ pub(crate) fn gpu_scene_reuse_signature(state: &AppState) -> u64 {
         }
     }
     mix(state.launcher_programs.len() as u64);
+    if cropped {
+        for window in &state.wayland_windows {
+            let outer = wayland_window_outer_rect(window);
+            mix(cropped_scene_position_key(outer.x, outer.y));
+        }
+        for window in &state.console_windows {
+            mix(cropped_scene_position_key(window.frame.x, window.frame.y));
+            mix(window.output_generation);
+            mix(u64::from(window.terminal_dirty));
+        }
+    }
     signature
 }
 
@@ -632,7 +683,7 @@ fn update_gpu_texture_layer_destination(
 }
 
 pub(crate) fn update_wayland_gpu_textures(
-    state: &AppState,
+    state: &mut AppState,
     atlas_pixels: &mut [u32],
     atlas_width: usize,
     atlas_height: usize,
@@ -657,21 +708,25 @@ pub(crate) fn update_wayland_gpu_textures(
 
     let mut damage = Vec::new();
     for binding in bindings.iter_mut() {
-        let Some(window) = state
+        let Some(index) = state
             .wayland_windows
             .iter()
-            .find(|window| !window.minimized && window.surface_id == binding.surface_id)
+            .position(|window| !window.minimized && window.surface_id == binding.surface_id)
         else {
             return Ok(None);
         };
-        if window.content_version == binding.content_version {
+        if state.wayland_windows[index].content_version == binding.content_version {
             continue;
         }
+        let pending = state.take_wayland_pending_damage(binding.surface_id);
+        let window = &state.wayland_windows[index];
+        let client_damage = pending_or_whole_client(window, pending);
         let partial = copy_wayland_damage_to_atlas(
             atlas_pixels,
             atlas_stride_pixels,
             binding.source_rect,
             window,
+            client_damage,
             !window.server_decoration,
         )?;
         if let Some(partial) = partial {
@@ -709,6 +764,164 @@ pub(crate) fn update_wayland_gpu_textures(
         binding.content_version = window.content_version;
     }
     Ok(Some(damage))
+}
+
+/// A commit whose damage was already consumed (or never reported) still has to
+/// reach the atlas: treat it as damaging the whole client.
+fn pending_or_whole_client(window: &WaylandWindowSnapshot, pending: Option<Rect>) -> Rect {
+    pending.filter(|rect| !rect.is_empty()).unwrap_or(Rect {
+        x: 0,
+        y: 0,
+        width: window.width,
+        height: window.height,
+    })
+}
+
+/// Patch the retained fragments of visible Wayland windows in a cropped scene.
+///
+/// Returns `None` when the change cannot be expressed as a patch of the
+/// retained fragment set (window moved/resized/refocused, or an
+/// occlusion-proving window became translucent); the caller then rebuilds.
+pub(crate) fn update_cropped_wayland_textures(
+    state: &mut AppState,
+    atlas_pixels: &mut [u32],
+    atlas_stride_pixels: usize,
+    bindings: &mut [CroppedWaylandBinding],
+) -> Result<Option<Vec<Rect>>, GpuSceneError> {
+    let focused = state.focused_wayland_surface_id;
+    if bindings.iter().any(|binding| {
+        state
+            .wayland_windows
+            .iter()
+            .find(|window| !window.minimized && window.surface_id == binding.surface_id)
+            .is_none_or(|window| {
+                wayland_window_outer_rect(window) != binding.outer
+                    || (Some(window.surface_id) == focused) != binding.focused
+            })
+    }) {
+        return Ok(None);
+    }
+    let mut damage = Vec::new();
+    for binding in bindings.iter_mut() {
+        let Some(index) = state
+            .wayland_windows
+            .iter()
+            .position(|window| window.surface_id == binding.surface_id)
+        else {
+            return Ok(None);
+        };
+        if state.wayland_windows[index].content_version == binding.content_version {
+            continue;
+        }
+        let pending = state.take_wayland_pending_damage(binding.surface_id);
+        let window = &state.wayland_windows[index];
+        let client_damage = pending_or_whole_client(window, pending);
+        if !copy_wayland_damage_to_fragments(
+            atlas_pixels,
+            atlas_stride_pixels,
+            binding,
+            window,
+            client_damage,
+            &mut damage,
+        )? {
+            return Ok(None);
+        }
+        binding.content_version = window.content_version;
+    }
+    Ok(Some(damage))
+}
+
+fn copy_wayland_damage_to_fragments(
+    atlas_pixels: &mut [u32],
+    atlas_stride_pixels: usize,
+    binding: &CroppedWaylandBinding,
+    window: &WaylandWindowSnapshot,
+    client_damage: Rect,
+    damage: &mut Vec<Rect>,
+) -> Result<bool, GpuSceneError> {
+    let local_outer = Rect {
+        x: 0,
+        y: 0,
+        width: binding.outer.width,
+        height: binding.outer.height,
+    };
+    let local_client = wayland_window_client_rect_for(window, local_outer);
+    let visible = Rect {
+        x: 0,
+        y: 0,
+        width: window.width.min(local_client.width),
+        height: window.height.min(local_client.height),
+    };
+    let changed = client_damage.intersect(visible);
+    if changed.is_empty() {
+        return Ok(true);
+    }
+    if window.stride_pixels < visible.width {
+        return Ok(false);
+    }
+    let row_range = |row: usize, x: usize, width: usize| {
+        row.checked_mul(window.stride_pixels)
+            .and_then(|offset| offset.checked_add(x))
+            .and_then(|start| Some(start..start.checked_add(width)?))
+    };
+    if binding.pixels_opaque {
+        for row in changed.y..changed.y + changed.height {
+            let range =
+                row_range(row, changed.x, changed.width).ok_or(GpuSceneError::InvalidLayer)?;
+            if window
+                .pixels
+                .get(range)
+                .ok_or(GpuSceneError::InvalidLayer)?
+                .iter()
+                .any(|pixel| pixel >> 24 != 0xff)
+            {
+                return Ok(false);
+            }
+        }
+    }
+    let changed_outer = Rect {
+        x: changed.x + local_client.x,
+        y: changed.y + local_client.y,
+        width: changed.width,
+        height: changed.height,
+    };
+    for &(source, region) in &binding.fragments {
+        let part = source.intersect(changed_outer);
+        if part.is_empty() {
+            continue;
+        }
+        let atlas_x = region.x + (part.x - source.x);
+        let atlas_y = region.y + (part.y - source.y);
+        for row in 0..part.height {
+            let client_y = part.y - local_client.y + row;
+            let client_x = part.x - local_client.x;
+            let source_range =
+                row_range(client_y, client_x, part.width).ok_or(GpuSceneError::InvalidLayer)?;
+            let destination_start = (atlas_y + row)
+                .checked_mul(atlas_stride_pixels)
+                .and_then(|offset| offset.checked_add(atlas_x))
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            let destination_end = destination_start
+                .checked_add(part.width)
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            atlas_pixels
+                .get_mut(destination_start..destination_end)
+                .ok_or(GpuSceneError::InvalidLayer)?
+                .copy_from_slice(
+                    window
+                        .pixels
+                        .get(source_range)
+                        .ok_or(GpuSceneError::InvalidLayer)?,
+                );
+        }
+        damage.push(Rect {
+            x: atlas_x,
+            y: atlas_y,
+            width: part.width,
+            height: part.height,
+        });
+    }
+    Ok(true)
 }
 
 pub(crate) fn update_console_gpu_textures(
@@ -817,7 +1030,14 @@ fn copy_opaque_wayland_damage_to_atlas(
     source_rect: Rect,
     window: &WaylandWindowSnapshot,
 ) -> Result<Option<Rect>, GpuSceneError> {
-    copy_wayland_damage_to_atlas(atlas_pixels, atlas_stride_pixels, source_rect, window, false)
+    copy_wayland_damage_to_atlas(
+        atlas_pixels,
+        atlas_stride_pixels,
+        source_rect,
+        window,
+        window.damage,
+        false,
+    )
 }
 
 fn copy_wayland_damage_to_atlas(
@@ -825,6 +1045,7 @@ fn copy_wayland_damage_to_atlas(
     atlas_stride_pixels: usize,
     source_rect: Rect,
     window: &WaylandWindowSnapshot,
+    client_damage: Rect,
     allow_translucent: bool,
 ) -> Result<Option<Rect>, GpuSceneError> {
     let local_outer = Rect {
@@ -840,7 +1061,7 @@ fn copy_wayland_damage_to_atlas(
         width: window.width.min(local_client.width),
         height: window.height.min(local_client.height),
     };
-    let changed = window.damage.intersect(visible);
+    let changed = client_damage.intersect(visible);
     if changed.is_empty() {
         return Ok(Some(Rect::empty()));
     }
@@ -1535,6 +1756,51 @@ fn reset_desktop_pixels(pixels: &mut Vec<u32>, background: &[u32]) {
 /// strips) whenever the launchers or display geometry change. The
 /// expensive aurora background is built once on a background thread and
 /// the chrome strips are repainted on demand.
+/// Repaint only the clock block on top of the clean wallpaper. The clock
+/// block is disjoint from the launcher grid and the rail, so a minute change
+/// never needs the glass-rail rebuild.
+fn repaint_home_clock(state: &mut AppState) {
+    let width = state.desktop_cache.width;
+    let height = state.desktop_cache.height;
+    let block = crate::layout::home_clock_dirty_rect(width as u32, height as u32).intersect(Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    });
+    let clock = home_clock(width as u32, height as u32);
+    let reading = crate::clock::ClockReading::now();
+    let (Some(clock), Some(reading)) = (clock, reading.as_ref()) else {
+        // Nothing to draw this pass; stay stale so the next poll retries.
+        state.desktop_cache.clock_stale = false;
+        state.desktop_cache.clock_minute = None;
+        return;
+    };
+    for row in block.y..block.y + block.height {
+        let start = row * width + block.x;
+        let end = start + block.width;
+        let (Some(source), Some(destination)) = (
+            state.desktop_cache.background_pixels.get(start..end),
+            state.desktop_cache.pixels.get_mut(start..end),
+        ) else {
+            state.desktop_cache.invalidate_chrome();
+            return;
+        };
+        destination.copy_from_slice(source);
+    }
+    let mut canvas = SurfaceCanvas::new(
+        state.desktop_cache.pixels.as_mut_slice(),
+        width as u32,
+        height as u32,
+        width,
+    );
+    chrome::draw_home_clock(&mut canvas, clock, reading);
+    state.desktop_cache.clock_minute = Some(reading.minute_key);
+    state.desktop_cache.clock_stale = false;
+    state.desktop_cache.content_version =
+        state.desktop_cache.content_version.wrapping_add(1).max(1);
+}
+
 fn refresh_desktop_surface(state: &mut AppState) {
     let refresh_started = Instant::now();
     let width = state.surface.width as usize;
@@ -1549,6 +1815,9 @@ fn refresh_desktop_surface(state: &mut AppState) {
         state.desktop_cache.invalidate_all();
     }
     if state.desktop_cache.fully_valid() {
+        if state.desktop_cache.clock_stale {
+            repaint_home_clock(state);
+        }
         return;
     }
     let mut chrome_split: Option<(Duration, Duration, Duration, usize)> = None;
@@ -1624,6 +1893,7 @@ fn refresh_desktop_surface(state: &mut AppState) {
             state.launcher_programs.len(),
         ));
         state.desktop_cache.chrome_valid = true;
+        state.desktop_cache.clock_stale = false;
         state.desktop_cache.content_version =
             state.desktop_cache.content_version.wrapping_add(1).max(1);
     }

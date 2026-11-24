@@ -391,15 +391,17 @@ fn main() {
             spawn::next_idle_delay(&state, runtime_connections.earliest_watch_deadline());
         pass.report_if_slow("idle");
         let idle_started = Instant::now();
-        if session_endpoint.is_some() {
+        let wait_elapsed = if session_endpoint.is_some() {
             session::service_session_endpoint(session_endpoint, &mut state, Some(idle_delay));
+            session::take_last_session_wait().unwrap_or_else(|| idle_started.elapsed())
         } else {
             thread::sleep(idle_delay);
-        }
+            idle_started.elapsed()
+        };
         // An idle wait that outruns the budget it was given is the broker
         // failing to be where its parked callers were promised it would be,
         // and it is invisible from inside any single phase above.
-        report_idle_overshoot(idle_started.elapsed(), idle_delay);
+        report_idle_overshoot(wait_elapsed, idle_delay);
     }
 }
 

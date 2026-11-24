@@ -249,18 +249,39 @@ pub unsafe fn mmap_anonymous(len: usize) -> i64 {
 /// fabricate zero (which turns finite deadlines into unlimited authority).
 #[inline]
 pub fn monotonic_nanos() -> u64 {
-    match try_monotonic_nanos() {
+    let (status, ts) = read_monotonic_raw();
+    match decode_monotonic_read(status, ts) {
         Ok(now) => now,
         Err(_) => {
             crate::ipc::debug_bytes(b"service: fatal monotonic clock unavailable\n");
+            // The raw status and stamp are the only evidence of why the clock
+            // read failed (unwritable buffer vs. a stamp the kernel never
+            // wrote), and a fresh read says whether the failure was transient.
+            let (retry_status, retry) = read_monotonic_raw();
+            report_clock_word(b"service: monotonic clock status=", status as u64);
+            report_clock_word(b"service: monotonic clock tv_sec=", ts.tv_sec as u64);
+            report_clock_word(b"service: monotonic clock tv_nsec=", ts.tv_nsec as u64);
+            report_clock_word(b"service: monotonic clock retry status=", retry_status as u64);
+            report_clock_word(b"service: monotonic clock retry tv_sec=", retry.tv_sec as u64);
+            report_clock_word(b"service: monotonic clock retry tv_nsec=", retry.tv_nsec as u64);
             exit_group(125)
         }
     }
 }
 
-/// Read the kernel-wide CLOCK_MONOTONIC nanosecond domain without fallback.
-#[inline]
-pub fn try_monotonic_nanos() -> Result<u64, rustos_user_abi::deadline::MonotonicClockError> {
+/// Prints `label` followed by `value` as 16 hex digits and a newline.
+fn report_clock_word(label: &[u8], value: u64) {
+    let mut digits = [0_u8; 17];
+    for (index, digit) in digits[..16].iter_mut().enumerate() {
+        let nibble = ((value >> ((15 - index) * 4)) & 0xf) as u8;
+        *digit = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+    }
+    digits[16] = b'\n';
+    crate::ipc::debug_bytes(label);
+    crate::ipc::debug_bytes(&digits);
+}
+
+fn read_monotonic_raw() -> (i64, KTimespec) {
     let mut ts = KTimespec::default();
     // SAFETY: the syscall writes exactly one `KTimespec` through this exclusive
     // borrow and consumes no other pointer.
@@ -271,6 +292,13 @@ pub fn try_monotonic_nanos() -> Result<u64, rustos_user_abi::deadline::Monotonic
             (&mut ts as *mut KTimespec) as u64,
         )
     };
+    (status, ts)
+}
+
+/// Read the kernel-wide CLOCK_MONOTONIC nanosecond domain without fallback.
+#[inline]
+pub fn try_monotonic_nanos() -> Result<u64, rustos_user_abi::deadline::MonotonicClockError> {
+    let (status, ts) = read_monotonic_raw();
     decode_monotonic_read(status, ts)
 }
 

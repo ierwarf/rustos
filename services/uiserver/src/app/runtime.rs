@@ -1,24 +1,24 @@
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use std::vec::Vec;
 
 use super::{
-    AppState, ConsoleWindow, DragTarget, VisualUpdate, CONSOLE_POLL_SLEEP, MAX_RUNNING_PROGRAMS,
+    AppState, CONSOLE_POLL_SLEEP, ConsoleWindow, DragTarget, MAX_RUNNING_PROGRAMS, VisualUpdate,
 };
 use crate::canvas;
 use crate::input_loop::UiWakeSender;
 use crate::render::{self, default_console_window_rect, taskbar_slot_rect};
-use crate::runtime_sync::{runtime_program_is_hidden, runtime_program_title, RuntimeState};
+use crate::runtime_sync::{RuntimeState, runtime_program_is_hidden, runtime_program_title};
 use crate::sys::{
-    console_get_state, console_send_input_event, console_set_focus,
-    console_snapshot_session_output, console_snapshot_sessions, console_wait_graph, open_console,
-    spawn_ui_thread, ConsoleSessionHandle, ConsoleSessionInfo, ConsoleStateInfo, InputEvent,
-    UiThreadRole, MAX_CONSOLE_SNAPSHOT_BYTES,
+    ConsoleSessionHandle, ConsoleSessionInfo, ConsoleStateInfo, InputEvent,
+    MAX_CONSOLE_SNAPSHOT_BYTES, UiThreadRole, console_get_state, console_send_input_event,
+    console_set_focus, console_snapshot_session_output, console_snapshot_sessions,
+    console_wait_graph, open_console, spawn_ui_thread,
 };
 use crate::wayland::WaylandCompositor;
 use runtime_control::RuntimeRunningProgram;

@@ -118,8 +118,15 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                 y,
                 width,
                 height,
+            } => {
+                if let Some(rect) = surface_damage_rect(x, y, width, height) {
+                    if let Ok(mut surface) = data.shared.lock() {
+                        surface.pending_surface_damage =
+                            surface.pending_surface_damage.union(rect);
+                    }
+                }
             }
-            | wl_surface::Request::DamageBuffer {
+            wl_surface::Request::DamageBuffer {
                 x,
                 y,
                 width,
@@ -127,7 +134,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
             } => {
                 if let Some(rect) = surface_damage_rect(x, y, width, height) {
                     if let Ok(mut surface) = data.shared.lock() {
-                        surface.pending_damage = surface.pending_damage.union(rect);
+                        surface.pending_buffer_damage = surface.pending_buffer_damage.union(rect);
                     }
                 }
             }

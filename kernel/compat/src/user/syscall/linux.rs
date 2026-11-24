@@ -61,14 +61,14 @@ pub(crate) use syscalld_ops::call_syscalld_raw;
 use syscalld_ops::*;
 
 use rustos_user_abi::syscall::{
-    waitset_snapshot_shape_valid, CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
     DevmgrdDeviceIoctlRequest, DevmgrdDeviceIoctlResponse, DevmgrdDeviceOpenRequest,
     DevmgrdDeviceOpenResponse, InputdIpcRequest, InputdIpcResponse, InputdReadResponse,
     LinuxSigActionWire, LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, LinuxTimespecWire,
     NetdIpcRequest, NetdIpcResponse, NetdPollQueryWire, NetdPollResultWire, ProcdIpcRequest,
     ProcdIpcResponse, RustosIpcValidateServiceOwnerArgs, RustosIpcWaitServiceEndpointArgs,
     RustosUserRegisters, ServiceCapability, VfsIpcRequest, VfsIpcResponse, WaitSetClaimWire,
-    WaitSetInterestWire, WaitSetSnapshotWire, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_SESSIOND, COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS,
     COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ, COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS,
     COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE, COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE,
@@ -98,41 +98,42 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_GETGID, SYSCALL_OFFLOAD_OP_LINUX_GETGROUPS,
     SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME, SYSCALL_OFFLOAD_OP_LINUX_GETPGID,
     SYSCALL_OFFLOAD_OP_LINUX_GETPPID, SYSCALL_OFFLOAD_OP_LINUX_GETPRIORITY,
-    SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM, SYSCALL_OFFLOAD_OP_LINUX_GETRESGID,
+    SYSCALL_OFFLOAD_OP_LINUX_GETRESGID,
     SYSCALL_OFFLOAD_OP_LINUX_GETRESUID, SYSCALL_OFFLOAD_OP_LINUX_GETSID,
     SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME, SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT,
-    SYSCALL_OFFLOAD_OP_LINUX_GETUID, SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST,
-    SYSCALL_OFFLOAD_OP_LINUX_LISTEN, SYSCALL_OFFLOAD_OP_LINUX_MADVISE,
+    SYSCALL_OFFLOAD_OP_LINUX_GETUID, SYSCALL_OFFLOAD_OP_LINUX_LISTEN, SYSCALL_OFFLOAD_OP_LINUX_MADVISE,
     SYSCALL_OFFLOAD_OP_LINUX_MEMFD_CREATE, SYSCALL_OFFLOAD_OP_LINUX_MMAP,
     SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_MUNMAP,
     SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64,
     SYSCALL_OFFLOAD_OP_LINUX_RECVFROM, SYSCALL_OFFLOAD_OP_LINUX_RECVMSG,
-    SYSCALL_OFFLOAD_OP_LINUX_RSEQ, SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY,
+    SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY,
     SYSCALL_OFFLOAD_OP_LINUX_SCHED_SETAFFINITY, SYSCALL_OFFLOAD_OP_LINUX_SENDMSG,
     SYSCALL_OFFLOAD_OP_LINUX_SENDTO, SYSCALL_OFFLOAD_OP_LINUX_SETGID,
     SYSCALL_OFFLOAD_OP_LINUX_SETPGID, SYSCALL_OFFLOAD_OP_LINUX_SETPRIORITY,
     SYSCALL_OFFLOAD_OP_LINUX_SETSID,
     SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT, SYSCALL_OFFLOAD_OP_LINUX_SETUID,
-    SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST, SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN,
+    SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN,
     SYSCALL_OFFLOAD_OP_LINUX_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
-    SYSCALL_OFFLOAD_OP_LINUX_UMASK, SYSCALL_OFFLOAD_OP_LINUX_UNAME,
+    SYSCALL_OFFLOAD_OP_LINUX_UMASK,
     SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER,
     SYS_RUSTOS_PROC_ACTIVATE_BROKER, SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER,
     SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER, SYS_RUSTOS_SCHED_DEMOTE_SELF,
-    VFS_CURSOR_SETTLE_CANCEL, VFS_CURSOR_SETTLE_COMMIT, VFS_EPOLL_CLAIM_MAX, VFS_IPC_ABI_VERSION,
+    VFS_BULK_READ_MAX_BYTES, VFS_BULK_READ_MIN_BYTES, VFS_CURSOR_SETTLE_CANCEL,
+    VFS_CURSOR_SETTLE_COMMIT, VFS_CURSOR_SETTLE_SYNC, VFS_IPC_ABI_VERSION,
     VFS_IPC_HANDLE_KIND_DEVICE, VFS_IPC_HANDLE_KIND_DIR, VFS_IPC_HANDLE_KIND_FILE,
-    VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CHECKPOINT_ACK, VFS_IPC_OP_CLOSE,
-    VFS_IPC_OP_CURSOR_SETTLE, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT, VFS_IPC_OP_FTRUNCATE,
-    VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK, VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT,
-    VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT, VFS_IPC_OP_POLL_QUERY, VFS_IPC_OP_PREAD64,
-    VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT, VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2,
-    VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE, VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY,
-    VFS_IPC_REQUEST_PAYLOAD_CAPACITY, VFS_POLL_BATCH_MAX, VFS_POLL_QUERY_EPOLL_CLAIM,
-    VFS_POLL_QUERY_EPOLL_CREATE, VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT,
-    VFS_POLL_QUERY_EPOLL_RETIRE, VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_POLL,
-    WAITSET_ABI_VERSION, WAITSET_INPUT_EVDEV_OBJECT_ID, WAITSET_INPUT_NATIVE_OBJECT_ID,
+    VFS_IPC_OP_ACCESS, VFS_IPC_OP_BULK_READ, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CHECKPOINT_ACK,
+    VFS_IPC_OP_CLOSE, VFS_IPC_OP_CURSOR_SETTLE, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT,
+    VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD, VFS_IPC_OP_GETDENTS64, VFS_IPC_OP_LSEEK,
+    VFS_IPC_OP_MKDIR, VFS_IPC_OP_MOUNT, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_OPENAT,
+    VFS_IPC_OP_POLL_QUERY, VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT,
+    VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE,
+    VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY, VFS_IPC_REQUEST_PAYLOAD_CAPACITY,
+    VFS_LSEEK_FLAG_SYNC_CURSOR, VFS_POLL_BATCH_MAX, VFS_POLL_QUERY_EPOLL_CREATE,
+    VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT, VFS_POLL_QUERY_EPOLL_RETIRE,
+    VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_POLL, VFS_WRITE_FLAG_CURSOR_SYNC,
+    VfsBulkReadResponse, WAITSET_INPUT_EVDEV_OBJECT_ID, WAITSET_INPUT_NATIVE_OBJECT_ID,
     WAITSET_MAX_INTERESTS, WAITSET_PROVIDER_INPUTD, WAITSET_PROVIDER_KERNEL,
-    WAITSET_PROVIDER_NETD, WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD, WAITSET_SNAPSHOT_STATE_DISABLED,
+    WAITSET_PROVIDER_NETD, WAITSET_PROVIDER_SESSIOND, WAITSET_PROVIDER_VFSD,
 };
 
 use super::SyscallFrame;
@@ -256,29 +257,45 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
             ipc_ops::dispatch_linux_rustos_ipc_syscall(frame)
         }
         linux_abi::SYS_CLOSE => syscall_linux_vfs_close(frame.rdi),
-        linux_abi::SYS_SOCKET => syscall_linux_net4(
-            SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            0,
-        ),
-        linux_abi::SYS_SENDTO => syscall_linux_net6(
-            SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            frame.r10,
-            frame.r8,
-            frame.r9,
-        ),
-        linux_abi::SYS_ACCEPT => syscall_linux_net4(
-            SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            0,
-        ),
+        linux_abi::SYS_SOCKET => {
+            if frame.rdi == linux_abi::AF_UNIX {
+                service_ops::local_unix::syscall_linux_unix_socket(frame.rsi, frame.rdx)
+            } else {
+                syscall_linux_net4(
+                    SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
+                    frame.rdi,
+                    frame.rsi,
+                    frame.rdx,
+                    0,
+                )
+            }
+        }
+        linux_abi::SYS_SENDTO => service_ops::local_unix::try_sendto(
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+        )
+        .unwrap_or_else(|| {
+            syscall_linux_net6(
+                SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
+                frame.rdi,
+                frame.rsi,
+                frame.rdx,
+                frame.r10,
+                frame.r8,
+                frame.r9,
+            )
+        }),
+        linux_abi::SYS_ACCEPT => {
+            service_ops::local_unix::try_accept4(frame.rdi, frame.rsi, frame.rdx, 0)
+                .unwrap_or_else(|| {
+                    syscall_linux_net4(
+                        SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
+                        frame.rdi,
+                        frame.rsi,
+                        frame.rdx,
+                        0,
+                    )
+                })
+        }
         linux_abi::SYS_FTRUNCATE => syscall_linux_vfs_ftruncate(frame.rdi, frame.rsi),
         linux_abi::SYS_STAT => syscall_linux_vfs_newfstatat(
             linux_abi::AT_FDCWD as u64,
@@ -428,99 +445,159 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         ),
         linux_abi::SYS_OPENAT => syscall_linux_openat(frame.rdi, frame.rsi, frame.rdx, frame.r10),
         linux_abi::SYS_UNLINKAT => syscall_linux_vfs_unlinkat(frame.rdi, frame.rsi, frame.rdx),
-        linux_abi::SYS_SOCKETPAIR => syscall_linux_net4(
-            SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            frame.r10,
-        ),
-        linux_abi::SYS_BIND => syscall_linux_net4(
-            SYSCALL_OFFLOAD_OP_LINUX_BIND,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            0,
-        ),
-        linux_abi::SYS_CONNECT => syscall_linux_net4(
-            SYSCALL_OFFLOAD_OP_LINUX_CONNECT,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            0,
-        ),
-        linux_abi::SYS_LISTEN => {
-            syscall_linux_net4(SYSCALL_OFFLOAD_OP_LINUX_LISTEN, frame.rdi, frame.rsi, 0, 0)
+        linux_abi::SYS_SOCKETPAIR => {
+            if frame.rdi == linux_abi::AF_UNIX {
+                service_ops::local_unix::syscall_linux_unix_socketpair(
+                    frame.rsi, frame.rdx, frame.r10,
+                )
+            } else {
+                syscall_linux_net4(
+                    SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
+                    frame.rdi,
+                    frame.rsi,
+                    frame.rdx,
+                    frame.r10,
+                )
+            }
         }
-        linux_abi::SYS_ACCEPT4 => syscall_linux_net4(
-            SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            frame.r10,
-        ),
-        linux_abi::SYS_GETSOCKNAME => syscall_linux_net4(
-            SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            0,
-        ),
-        linux_abi::SYS_GETPEERNAME => syscall_linux_net4(
-            SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            0,
-        ),
-        linux_abi::SYS_SETSOCKOPT => syscall_linux_net6(
-            SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            frame.r10,
-            frame.r8,
-            0,
-        ),
-        linux_abi::SYS_GETSOCKOPT => syscall_linux_net6(
-            SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            frame.r10,
-            frame.r8,
-            0,
-        ),
-        linux_abi::SYS_SHUTDOWN => syscall_linux_net4(
-            SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN,
-            frame.rdi,
-            frame.rsi,
-            0,
-            0,
-        ),
-        linux_abi::SYS_SENDMSG => syscall_linux_net4(
-            SYSCALL_OFFLOAD_OP_LINUX_SENDMSG,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            0,
-        ),
-        linux_abi::SYS_RECVFROM => syscall_linux_net6(
-            SYSCALL_OFFLOAD_OP_LINUX_RECVFROM,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            frame.r10,
-            frame.r8,
-            frame.r9,
-        ),
-        linux_abi::SYS_RECVMSG => syscall_linux_net4(
-            SYSCALL_OFFLOAD_OP_LINUX_RECVMSG,
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            0,
-        ),
+        linux_abi::SYS_BIND => {
+            service_ops::local_unix::try_bind(frame.rdi, frame.rsi, frame.rdx).unwrap_or_else(
+                || {
+                    syscall_linux_net4(
+                        SYSCALL_OFFLOAD_OP_LINUX_BIND,
+                        frame.rdi,
+                        frame.rsi,
+                        frame.rdx,
+                        0,
+                    )
+                },
+            )
+        }
+        linux_abi::SYS_CONNECT => {
+            service_ops::local_unix::try_connect(frame.rdi, frame.rsi, frame.rdx).unwrap_or_else(
+                || {
+                    syscall_linux_net4(
+                        SYSCALL_OFFLOAD_OP_LINUX_CONNECT,
+                        frame.rdi,
+                        frame.rsi,
+                        frame.rdx,
+                        0,
+                    )
+                },
+            )
+        }
+        linux_abi::SYS_LISTEN => service_ops::local_unix::try_listen(frame.rdi, frame.rsi)
+            .unwrap_or_else(|| {
+                syscall_linux_net4(SYSCALL_OFFLOAD_OP_LINUX_LISTEN, frame.rdi, frame.rsi, 0, 0)
+            }),
+        linux_abi::SYS_ACCEPT4 => {
+            service_ops::local_unix::try_accept4(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+                .unwrap_or_else(|| {
+                    syscall_linux_net4(
+                        SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
+                        frame.rdi,
+                        frame.rsi,
+                        frame.rdx,
+                        frame.r10,
+                    )
+                })
+        }
+        linux_abi::SYS_GETSOCKNAME => {
+            service_ops::local_unix::try_getsockname(frame.rdi, frame.rsi, frame.rdx)
+                .unwrap_or_else(|| {
+                    syscall_linux_net4(
+                        SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME,
+                        frame.rdi,
+                        frame.rsi,
+                        frame.rdx,
+                        0,
+                    )
+                })
+        }
+        linux_abi::SYS_GETPEERNAME => {
+            service_ops::local_unix::try_getpeername(frame.rdi, frame.rsi, frame.rdx)
+                .unwrap_or_else(|| {
+                    syscall_linux_net4(
+                        SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME,
+                        frame.rdi,
+                        frame.rsi,
+                        frame.rdx,
+                        0,
+                    )
+                })
+        }
+        linux_abi::SYS_SETSOCKOPT => service_ops::local_unix::try_setsockopt(
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8,
+        )
+        .unwrap_or_else(|| {
+            syscall_linux_net6(
+                SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT,
+                frame.rdi,
+                frame.rsi,
+                frame.rdx,
+                frame.r10,
+                frame.r8,
+                0,
+            )
+        }),
+        linux_abi::SYS_GETSOCKOPT => service_ops::local_unix::try_getsockopt(
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8,
+        )
+        .unwrap_or_else(|| {
+            syscall_linux_net6(
+                SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT,
+                frame.rdi,
+                frame.rsi,
+                frame.rdx,
+                frame.r10,
+                frame.r8,
+                0,
+            )
+        }),
+        linux_abi::SYS_SHUTDOWN => service_ops::local_unix::try_shutdown(frame.rdi, frame.rsi)
+            .unwrap_or_else(|| {
+                syscall_linux_net4(SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN, frame.rdi, frame.rsi, 0, 0)
+            }),
+        linux_abi::SYS_SENDMSG => {
+            service_ops::local_unix::try_sendmsg(frame.rdi, frame.rsi, frame.rdx).unwrap_or_else(
+                || {
+                    syscall_linux_net4(
+                        SYSCALL_OFFLOAD_OP_LINUX_SENDMSG,
+                        frame.rdi,
+                        frame.rsi,
+                        frame.rdx,
+                        0,
+                    )
+                },
+            )
+        }
+        linux_abi::SYS_RECVFROM => service_ops::local_unix::try_recvfrom(
+            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+        )
+        .unwrap_or_else(|| {
+            syscall_linux_net6(
+                SYSCALL_OFFLOAD_OP_LINUX_RECVFROM,
+                frame.rdi,
+                frame.rsi,
+                frame.rdx,
+                frame.r10,
+                frame.r8,
+                frame.r9,
+            )
+        }),
+        linux_abi::SYS_RECVMSG => {
+            service_ops::local_unix::try_recvmsg(frame.rdi, frame.rsi, frame.rdx).unwrap_or_else(
+                || {
+                    syscall_linux_net4(
+                        SYSCALL_OFFLOAD_OP_LINUX_RECVMSG,
+                        frame.rdi,
+                        frame.rsi,
+                        frame.rdx,
+                        0,
+                    )
+                },
+            )
+        }
         linux_abi::SYS_GETDENTS64 => syscall_linux_vfs_getdents64(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_EXECVEAT => {
             syscall_linux_execveat(frame, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)

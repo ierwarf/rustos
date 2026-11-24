@@ -678,9 +678,8 @@ pub const SYSCALL_OFFLOAD_OP_LINUX_RT_SIGPROCMASK: u16 = 50;
 // Operations 51..=53 are permanently retired. Clock reads and finite sleeps
 // are timer/scheduler substrate; their fixed ABI envelopes are validated
 // locally and must not depend on a policy-service round trip.
-pub const SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST: u16 = 54;
-pub const SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST: u16 = 55;
-pub const SYSCALL_OFFLOAD_OP_LINUX_RSEQ: u16 = 56;
+// Operations 54..=56 (robust list, rseq) are permanently retired: thread
+// start metadata is kernel-local state and must not depend on a policy service.
 pub const SYSCALL_OFFLOAD_OP_LINUX_MADVISE: u16 = 57;
 pub const SYSCALL_OFFLOAD_OP_LINUX_SIGALTSTACK: u16 = 58;
 pub const SYSCALL_OFFLOAD_OP_LINUX_BRK: u16 = 59;
@@ -693,7 +692,8 @@ pub const SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT: u16 = 65;
 // Operation 66 is permanently retired: futex opcode/flag admission is an
 // inseparable part of the ring0 scheduler wait/wake substrate and must never
 // synchronously depend on a policy service.
-pub const SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY: u16 = 67;
+// Operation 67 is permanently retired: arch_prctl admission is a pure
+// address-range check owned by the kernel.
 pub const SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET: u16 = 68;
 pub const SYSCALL_OFFLOAD_OP_LINUX_GETRESUID: u16 = 70;
 pub const SYSCALL_OFFLOAD_OP_LINUX_GETRESGID: u16 = 71;
@@ -788,6 +788,8 @@ pub const VFS_IPC_ABI_VERSION: u16 = 5;
 pub const VFS_IPC_OP_OPENAT: u16 = 1;
 pub const VFS_IPC_OP_CLOSE: u16 = 2;
 pub const VFS_IPC_OP_DUP: u16 = 3;
+/// Legacy cursor-mutating sequential read (retained for inotify / device reads;
+/// sequential regular-file reads use stateless `PREAD64` / `BULK_READ`).
 pub const VFS_IPC_OP_READ: u16 = 4;
 pub const VFS_IPC_OP_WRITE: u16 = 5;
 pub const VFS_IPC_OP_PREAD64: u16 = 6;
@@ -929,6 +931,21 @@ pub const VFS_IPC_OP_LINKAT: u16 = 42;
 pub const VFS_IPC_OP_INOTIFY_INIT: u16 = 43;
 pub const VFS_IPC_OP_INOTIFY_ADD_WATCH: u16 = 44;
 pub const VFS_IPC_OP_INOTIFY_RM_WATCH: u16 = 45;
+/// Positioned bulk read returning file bytes via a transferred sealed memfd.
+///
+/// Reuses `VfsIpcRequest` (`remote_id`, `arg0` = file offset, `arg1` = byte
+/// count in `1..=VFS_BULK_READ_MAX_BYTES`) and replies with one 32-byte
+/// `VfsBulkReadResponse`. When `status == 0 && bytes_read > 0`, the reply
+/// carries exactly one sealed read-only memfd handle containing `bytes_read`
+/// bytes at offset 0; on EOF (`bytes_read == 0`) or error, zero handles are
+/// transferred. Callers MUST use the queued handle-receiving transport so
+/// `vfsd` can reply from a transient worker thread without head-of-line
+/// blocking its receive loop.
+pub const VFS_IPC_OP_BULK_READ: u16 = 46;
+/// Minimum read size where callers prefer `VFS_IPC_OP_BULK_READ` over inline `PREAD64`.
+pub const VFS_BULK_READ_MIN_BYTES: usize = 256 * 1024;
+/// Maximum bytes transferred in one `VFS_IPC_OP_BULK_READ` call (4 MiB).
+pub const VFS_BULK_READ_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// "Leave this id unchanged" in `VFS_IPC_OP_CHOWN`/`FCHOWN` (`(uid_t)-1`).
 pub const VFS_ID_UNCHANGED: u64 = 0xFFFF_FFFF;
 /// `VfsIpcRequest::flags` bit of `VFS_IPC_OP_CHOWN`: do not follow a final symlink.
@@ -939,6 +956,16 @@ pub const VFS_LINKAT_FLAG_SOURCE_DESCRIPTION: u32 = 1;
 pub const VFS_LIBRARY_READ_MAX_BYTES: usize = 8 * 4096;
 pub const VFS_CURSOR_SETTLE_COMMIT: u64 = 1;
 pub const VFS_CURSOR_SETTLE_CANCEL: u64 = 2;
+/// Reconcile a kernel-owned regular-file `RemoteVfsOpenDescription` cursor to
+/// `vfsd` (`arg0 = kernel_cursor`, `response.value = settled cursor`).
+pub const VFS_CURSOR_SETTLE_SYNC: u64 = 3;
+/// `VfsIpcRequest::flags` bit for `VFS_IPC_OP_LSEEK`: `arg2` carries the live
+/// kernel cursor so `SEEK_CUR` computes relative to it and settles `rootd`.
+pub const VFS_LSEEK_FLAG_SYNC_CURSOR: u32 = 1 << 0;
+/// `VfsIpcRequest::flags` bit for `VFS_IPC_OP_WRITE`: `arg0` carries the live
+/// kernel cursor for non-`O_APPEND` writes and `response.aux` returns the
+/// updated durable cursor.
+pub const VFS_WRITE_FLAG_CURSOR_SYNC: u32 = 1 << 0;
 /// Batched fd readiness: `payload_len` is `n * size_of::<LinuxPollFd>()` for
 /// `1 <= n <= VFS_POLL_BATCH_MAX` and the reply echoes the same array with
 /// `revents` filled in. `value` is the number of ready entries. The bound is
@@ -1437,7 +1464,8 @@ pub const PROCD_OP_RT_SIGPROCMASK: u16 = 6;
 pub const PROCD_OP_SIGALTSTACK: u16 = 7;
 pub const PROCD_OP_TGKILL: u16 = 8;
 pub const PROCD_OP_SELECT_SIGNAL: u16 = 9;
-pub const PROCD_OP_THREAD_PLAN: u16 = 10;
+// Procd operation 10 (thread-plan) is permanently retired: clone-thread flag
+// admission is a pure function validated by the kernel.
 pub const PROCD_PATH_CAPACITY: usize = LOADER_SPAWN_EXEC_PATH_CAPACITY;
 pub const PROCD_ARG_BYTES: usize = LOADER_SPAWN_ARG_BYTES;
 pub const PROCD_ENV_BYTES: usize = LOADER_SPAWN_ENV_BYTES;
@@ -1719,6 +1747,21 @@ pub const COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CANCEL: u16 = 27;
 /// Provider ACK of a committed release/cancel. Rootd may compact a settled
 /// receipt only after this signal and the kernel's high-water mark remain.
 pub const COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK: u16 = 28;
+/// Ordered batch of `PROVIDER_RECEIPT_ACK` frames from one provider
+/// (payload: `n` canonical IDL 520 frames of exactly `provider_wire::BYTES`
+/// each, `1 <= n <= PROVIDER_RECEIPT_ACK_BATCH_MAX_FRAMES`; every `arg` and
+/// `path_len` zero). One authorization (the same `ChargeClientSession` slow
+/// grant as op 28) covers the batch and every frame is checked exactly as a
+/// single op-28 request. A structurally malformed or foreign frame fails the
+/// whole request with its errno and applies nothing. On success `value1` = `n`
+/// and `value0` bit `i` is set when frame `i` was acknowledged (or was already
+/// absent, which op 28 also treats as success); a clear bit means rootd kept
+/// that receipt and the provider must keep it queued. An ACK is compaction
+/// only: it never charges, refunds, or moves the nonce watermark.
+pub const COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK_BATCH: u16 = 31;
+/// Upper bound on frames per `PROVIDER_RECEIPT_ACK_BATCH` (the 4 KiB request
+/// payload would hold 23; 16 keeps the retired mask and latency bounded).
+pub const PROVIDER_RECEIPT_ACK_BATCH_MAX_FRAMES: usize = 16;
 /// Store one versioned, service-owned checkpoint record.  Rootd authenticates
 /// the current service lease and retains the opaque record across a supervised
 /// service restart; it never interprets the service-private value bytes.
@@ -1739,6 +1782,18 @@ pub const COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT: u16 = 14;
 /// namespace on a class of slow request? Decided by rootd's exact-incarnation
 /// personality policy; the caller must hold the SpawnProcess slow grant.
 pub const COMMERCIAL_MAX_ROOTD_OP_SLOW_REQUEST_AUTHORIZE: u16 = 29;
+/// Ordered batch of `SERVICE_CHECKPOINT_MUTATE` records for one service
+/// (payload: `[u16 len][IDL record]` frames, `arg0` = service id). One
+/// authorization covers the batch; each record is preflighted, journaled and
+/// applied strictly in order, exactly as a sequence of single MUTATE calls.
+/// Semantics are *committed prefix*: on failure of record `k` the reply carries
+/// the errno in `status` and the number of records already committed (journal
+/// and DAG) in `value0`; records `k..` were not touched. Success implies
+/// `value0 == record count`, `value1` = how many were exact duplicate replays.
+pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE_BATCH: u16 = 30;
+/// Upper bound on records per MUTATE_BATCH request (also bounded by the
+/// 4 KiB request payload).
+pub const SERVICE_CHECKPOINT_BATCH_MAX_RECORDS: usize = 16;
 pub const SERVICE_CHECKPOINT_ABI_VERSION: u16 = 1;
 pub const SERVICE_CHECKPOINT_FLAG_TOMBSTONE: u16 = 1 << 0;
 pub const SERVICE_CHECKPOINT_VALUE_CAPACITY: usize = 64;
@@ -2774,6 +2829,60 @@ impl Default for VfsIpcResponse {
     }
 }
 
+/// Compact 32-byte reply for `VFS_IPC_OP_BULK_READ` (omits the 64 KiB inline payload).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VfsBulkReadResponse {
+    pub version: u16,
+    pub op: u16,
+    pub status: i32,
+    pub bytes_read: u64,
+    pub file_len: u64,
+    pub reserved0: u64,
+}
+
+impl VfsBulkReadResponse {
+    pub const WIRE_BYTES: usize = 32;
+
+    pub const fn to_bytes(self) -> [u8; Self::WIRE_BYTES] {
+        let v = self.version.to_le_bytes();
+        let o = self.op.to_le_bytes();
+        let s = self.status.to_le_bytes();
+        let b = self.bytes_read.to_le_bytes();
+        let f = self.file_len.to_le_bytes();
+        let r = self.reserved0.to_le_bytes();
+        [
+            v[0], v[1], o[0], o[1], s[0], s[1], s[2], s[3],
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
+            r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+        ]
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::WIRE_BYTES {
+            return None;
+        }
+        Some(Self {
+            version: u16::from_le_bytes([bytes[0], bytes[1]]),
+            op: u16::from_le_bytes([bytes[2], bytes[3]]),
+            status: i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            bytes_read: u64::from_le_bytes([
+                bytes[8], bytes[9], bytes[10], bytes[11],
+                bytes[12], bytes[13], bytes[14], bytes[15],
+            ]),
+            file_len: u64::from_le_bytes([
+                bytes[16], bytes[17], bytes[18], bytes[19],
+                bytes[20], bytes[21], bytes[22], bytes[23],
+            ]),
+            reserved0: u64::from_le_bytes([
+                bytes[24], bytes[25], bytes[26], bytes[27],
+                bytes[28], bytes[29], bytes[30], bytes[31],
+            ]),
+        })
+    }
+}
+
 /// Fixed-width little-endian `statfs` wire payload carried by `VFS_IPC_OP_STATFS`,
 /// matching x86_64 Linux `struct statfs` (`120` bytes).
 #[repr(C)]
@@ -3247,10 +3356,11 @@ pub const fn net_broker_unix_socket_shape_valid(domain:u64, socket_type:u64, pro
         && socket_type & !(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK | NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS) == 0
 }
 
-/// `AF_NETLINK` `NETLINK_ROUTE` (protocol 0) over `SOCK_RAW` or `SOCK_DGRAM`.
-/// Other netlink families are refused with `EPROTONOSUPPORT` by netd.
+/// `AF_NETLINK` `NETLINK_ROUTE` (protocol 0) or `NETLINK_KOBJECT_UEVENT` (protocol 15) over
+/// `SOCK_RAW` or `SOCK_DGRAM`. Other netlink families are refused with `EPROTONOSUPPORT` by netd.
 pub const fn net_broker_netlink_socket_shape_valid(domain:u64, socket_type:u64, protocol:u64)->bool {
-    domain == NET_BROKER_PUBLICATION_AF_NETLINK && protocol == 0
+    domain == NET_BROKER_PUBLICATION_AF_NETLINK
+        && (protocol == 0 || protocol == 15)
         && match socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK {
             NET_BROKER_PUBLICATION_SOCK_RAW | NET_BROKER_PUBLICATION_SOCK_DGRAM => true,
             _ => false,

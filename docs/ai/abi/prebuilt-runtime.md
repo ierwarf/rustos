@@ -110,6 +110,19 @@ runtimed (`services/runtimed/src/launch_profile.rs`) resolves them per launch:
   entry is ensured the same way (`mkdir -p` plus writable probe) and fails the
   launch if it cannot exist.
 
+## Baked font cache
+
+`stage` ships a fontconfig cache so a launch never scans every font and then
+fails to write the result onto a read-only `/data`. `bake_font_cache` runs the
+host `fc-cache --force --sysroot <image>` after the fonts are staged and keeps
+only the regular `*-le64.cache-12` files under `/usr/share/fontconfig-cache`,
+which `fonts.conf` lists as the first `<cachedir>`. Staging fails when `fc-cache`
+is missing, writes another cache format, or does not cover every staged font
+directory. A cache is valid for fontconfig when its recorded checksum equals the
+directory mtime or the directory mtime is 0; the image FAT writes no timestamps,
+so staged directories report mtime 0. Not verified in a guest: that the Chrome
+build's bundled fontconfig accepts the host-generated cache-12 bytes.
+
 ## Provenance and updates
 
 `tools/xtask/src/stage/noble/lock.json` pins package paths, sizes and SHA-256

@@ -74,6 +74,9 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
     else {
         return linux_errno(LINUX_ESRCH);
     };
+    if !source_thread_waiting_for_fork_reply(args.source_pid, args.source_tid) {
+        return fork_stage_failed(25, LINUX_ETIMEDOUT, args.source_tid);
+    }
     let spawn_reservation = match reserve_spawn_after_reclaim(args.source_pid) {
         Some(reservation) => reservation,
         None => return fork_stage_failed(20, LINUX_EAGAIN, 0),
@@ -217,6 +220,10 @@ fn spawn_vfork_child(
                 return fork_stage_failed(21, LINUX_EAGAIN, child_pid);
             }
         }
+    }
+    if !source_thread_waiting_for_fork_reply(args.source_pid, args.source_tid) {
+        let _ = multitask::terminate_user_task(child_pid);
+        return fork_stage_failed(25, LINUX_ETIMEDOUT, child_pid);
     }
     offload_ops::record_process_fork(child_pid, args.source_pid);
     if !multitask::begin_vfork_wait(child_pid, args.source_tid) {
@@ -481,6 +488,10 @@ fn spawn_cow_fork_child(
             }
         }
     }
+    if !source_thread_waiting_for_fork_reply(args.source_pid, args.source_tid) {
+        let _ = multitask::terminate_user_task(child_pid);
+        return fork_stage_failed(25, LINUX_ETIMEDOUT, child_pid);
+    }
     // Publish the child to vfsd before it can run: the child is still
     // suspended, so its first namespace request cannot precede this event, and
     // the parent cannot return from fork (and chdir) before it is queued.
@@ -686,8 +697,17 @@ mod tests {
 /// process slot after the reclaim wait, 21 the child vanished before its tid
 /// store, 22 the child could not be activated, 23 the scheduler refused the
 /// child task (slot table, Job process/thread/kmem limit), 24 inherited
-/// service handles could not be acquired), so a
-/// bare errno under concurrent address-space churn is attributable. Bounded.
+/// service handles could not be acquired, 25 the calling thread already timed
+/// out or began exiting before child activation), so a bare errno under
+/// concurrent address-space churn is attributable. Bounded.
+fn source_thread_waiting_for_fork_reply(source_pid: u64, source_tid: u64) -> bool {
+    !multitask::is_user_process_exiting(source_pid)
+        && matches!(
+            multitask::linux_thread_runnable_by_ids(source_pid, source_tid),
+            Some(false)
+        )
+}
+
 struct ForkHandlePinGuard {
     pid: u64,
 }

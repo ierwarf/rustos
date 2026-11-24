@@ -22,7 +22,7 @@ use rustos_user_abi::syscall::{
 };
 
 const _: () =
-    assert!(frame_source::MAX_FRAME_SOURCES == rustos_user_abi::syscall::FRAME_SOURCE_MAX_LIVE);
+    assert!(frame_source::MAX_FRAME_SOURCES == rustos_user_abi::syscall::FRAME_SOURCE_TABLE_SLOTS);
 const _: () = assert!(rustos_user_abi::syscall::FRAME_SOURCE_PAGE_BYTES == 4096);
 
 pub(super) fn source_errno(error: FrameSourceError) -> i64 {

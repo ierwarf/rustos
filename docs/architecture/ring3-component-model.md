@@ -202,12 +202,70 @@ tombstones under pressure while a per-owner nonce watermark keeps every spent
 token unspendable. A restarted rootd drains the kernel token ledger at startup,
 so surviving sessions are unbilled until they close (see the status ledger).
 
+### Checkpoint MUTATE_BATCH (rootd op 30)
+
+`arg0` = service id; payload = 1..=16 `[u16 len][IDL 521 record]` frames
+(`SERVICE_CHECKPOINT_BATCH_MAX_RECORDS`, and at most the 4 KiB request payload).
+One `WriteRecoveryCheckpoint` authorization covers the batch. Every frame is
+decoded before the first record commits (malformed => `EINVAL`, nothing
+applied). Records are then preflighted, journaled (one kernel
+`checkpoint_journal::append` each, in request order) and applied strictly in
+order, so each sees the DAG its predecessors left; the result is identical to N
+single MUTATE calls. **Committed-prefix semantics**: on the first refused record
+`k`, `status` is its errno and `value0` = `k` (records `0..k` are committed in
+journal and DAG, `k..` untouched, even though `status != 0`); on success
+`value0` = count and `value1` = exact-duplicate replays. There is no rollback of
+the prefix, by design: it is the same state a crash between single calls leaves,
+which vfsd already recovers (a staging parent without its final record is an
+interrupted OPEN). A transport failure carries no prefix information; the exact
+retry is idempotent by operation id. For that retry an older revision of a key
+that a later record *of the same batch* already holds verbatim (OPEN staging vs
+its final record) is skipped as superseded history; no other staleness is
+excused. vfsd (`vfsd::checkpoint_batch`) uses it for OPEN (staging + path
+chunks + final record in one IPC, falling back to several requests only when
+the frames exceed the payload) and advances its acknowledged-record mirror by
+exactly the reported prefix. Provider billing (ops 25-28) is a separate
+authorization domain (exact kernel Job token, provider receipts) and is not
+folded into checkpoint batches. vfsd caches the rootd endpoint (generational
+handle, invalidated and retried once on transport failure) and its own PID.
+
+Provider billing wire/transport (ops 25-28, 31). Op 31 `PROVIDER_RECEIPT_ACK_BATCH`
+carries 1..=16 op-28 ACK frames (payload `n * 172` bytes, all args zero); one
+`ChargeClientSession` authorization covers the batch, every frame is checked
+exactly like an op-28 frame (provider service/PID/lease must equal the
+kernel-stamped sender), a malformed or foreign frame fails the whole request
+with nothing applied, and the reply carries `value1 = n` and a retired bitmask
+in `value0` (a clear bit means rootd refused that receipt; the provider keeps
+it queued). An ACK is compaction only: it never charges, refunds or moves the
+nonce watermark. CHARGE/RELEASE/CANCEL stay one request per description and are
+NOT folded into one another, into ACKs or into checkpoint batches: each needs
+its own exact kernel Job-token authorization and its own committed receipt.
+`provider_client::call_rootd` caches the rootd endpoint (generational handle)
+and the process PID. A transport failure on a cached endpoint invalidates it and
+is replayed once on a fresh lookup (never after a timeout). Replay is safe for
+every op because rootd is idempotent by `(owner, token)`: a repeated CHARGE
+returns the prior receipt or reconciles the same kernel token, a repeated
+RELEASE/CANCEL of a Settled or absent token succeeds without a second refund,
+and an ACK of an absent token succeeds.
+Receipt ACKs are deferred (`ProviderClient::flush_ack_batches`): vfsd sends
+nothing until 16 are queued, then one batched call (at most two per billing
+operation), so steady state is 1 rootd IPC per open, 1 per close and 1/16
+per close for compaction. Bound/invariant: unACKed receipts are rootd `Settled`
+tombstones; there are at most 15 in steady state, at most `MAX_ACK_OUTBOX`
+(4096) during a rootd outage, and rootd reclaims any Settled tombstone under
+table pressure; the owner nonce watermark (not the tombstone) fences re-use of
+a spent token, a restarted rootd treats an absent token as settled, and a
+restarted vfsd's tombstones are dropped when rootd observes the old PID exit.
+Deferral therefore cannot double-charge or leak. netd still drains one ACK per
+call (`acknowledge_frame`); moving it to batches is netd-owner work.
+
 ### Generated-IDL control protocols
 
 Live generated schemas: 514 heartbeat, 515 update approval, 517/518 post-init
 lease snapshot/reclaim, 519 client-Job session accounting, 520 provider
 session accounting, 521 service-checkpoint records (rootd ops MUTATE,
-COMPACT and SCAN; SCAN replies are length-prefixed IDL frames), 522 post-init
+MUTATE_BATCH (op 30), COMPACT and SCAN; SCAN replies and MUTATE_BATCH requests
+are length-prefixed IDL frames), 522 post-init
 service lease report (the scalar form is refused), 523 slow-request
 authorization (rootd op 29: may the calling service act for a personality and
 namespace; decided by rootd's exact-incarnation `PersonalityPolicy`, consulted

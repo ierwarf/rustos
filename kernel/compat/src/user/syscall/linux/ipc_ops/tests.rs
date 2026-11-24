@@ -368,3 +368,68 @@ fn received_descriptors_take_only_the_receivers_cloexec_choice() {
         }
     }
 }
+
+/// Every byte-only service wire envelope the kernel originates fits the
+/// rendezvous frame, so the generic service call can use the direct switch
+/// instead of the queued transport (heap request, IPI wake, IPI reply wake).
+/// A service whose envelope outgrows the frame would silently fall back to
+/// the queued path; this pins the sizes the fast transport was admitted for.
+#[test]
+fn kernel_originated_service_envelopes_fit_the_rendezvous_frame() {
+    use rustos_user_abi::syscall::{
+        LinuxSyscallOffloadRequest, LinuxSyscallOffloadResponse, ProcdIpcRequest,
+        ProcdIpcResponse, VfsIpcRequest, VfsIpcResponse,
+    };
+    let frame = kernel_ipc_runtime::api::IPC_FAST_MAX_BYTES;
+    for (name, request, response) in [
+        ("vfsd", size_of::<VfsIpcRequest>(), size_of::<VfsIpcResponse>()),
+        ("procd", size_of::<ProcdIpcRequest>(), size_of::<ProcdIpcResponse>()),
+        (
+            "syscalld",
+            size_of::<LinuxSyscallOffloadRequest>(),
+            size_of::<LinuxSyscallOffloadResponse>(),
+        ),
+    ] {
+        assert!(request <= frame, "{name} request {request} exceeds the fast frame");
+        assert!(response <= frame, "{name} response {response} exceeds the fast frame");
+    }
+}
+
+#[test]
+fn service_rendezvous_is_refused_for_empty_oversized_and_locked_callers() {
+    let max = kernel_ipc_runtime::api::IPC_FAST_MAX_BYTES;
+    assert!(service_rendezvous_shape_admits(1, false, 0));
+    assert!(service_rendezvous_shape_admits(max, false, 0));
+    assert!(!service_rendezvous_shape_admits(0, false, 0));
+    assert!(!service_rendezvous_shape_admits(max + 1, false, 0));
+    // The queued path answers these with ENOSPC; the rendezvous commit panics.
+    assert!(!service_rendezvous_shape_admits(64, true, 0));
+    assert!(!service_rendezvous_shape_admits(64, false, 1));
+}
+
+/// The generic call must stay a rendezvous attempt followed by the queued
+/// transport under one deadline computed before either.
+#[test]
+fn generic_service_call_tries_the_rendezvous_before_the_queued_transport() {
+    let source = include_str!("../ipc_ops.rs");
+    let body = source
+        .split(concat!("fn call_service_endpoint_with_timeout", "("))
+        .nth(1)
+        .and_then(|rest| rest.split("pub(super) fn call_service_endpoint_with_received_entries(").next())
+        .expect("generic call body");
+    let deadline = body.find("service_reply_deadline_tick_for_service").expect("deadline");
+    let fast = body.find("try_service_rendezvous_call(").expect("rendezvous attempt");
+    let queued = body.find("enqueue_call_and_wake(endpoint, request)").expect("queued fallback");
+    assert!(deadline < fast && fast < queued);
+}
+
+#[test]
+fn only_receive_thread_replying_services_take_the_rendezvous() {
+    assert!(service_replies_on_receive_thread(linux_abi::IPC_SERVICE_VFSD));
+    assert!(service_replies_on_receive_thread(linux_abi::IPC_SERVICE_PROCD));
+    assert!(service_replies_on_receive_thread(linux_abi::IPC_SERVICE_LOADERD));
+    // devmgrd hands reply capabilities to ioctl workers; a pinned frame would
+    // answer them PermissionDenied.
+    assert!(!service_replies_on_receive_thread(linux_abi::IPC_SERVICE_DEVMGRD));
+    assert!(!service_replies_on_receive_thread(linux_abi::IPC_SERVICE_NETD));
+}

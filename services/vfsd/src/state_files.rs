@@ -327,9 +327,130 @@ impl VfsState {
             Ok(read) => {
                 response.payload_len = read as u32;
                 response.value = read as u64;
+                if read > 0 {
+                    if let Some(path) = self
+                        .handles
+                        .get(&request.remote_id)
+                        .filter(|handle| handle.kind == RemoteKind::File)
+                        .map(|handle| handle.path.clone())
+                    {
+                        self.emit_inotify(path.as_str(), linux_abi::IN_ACCESS, false);
+                    }
+                }
             }
             Err(errno) => response.status = errno,
         }
+    }
+
+    /// Validates and plans a `VFS_IPC_OP_BULK_READ` on the receive owner under
+    /// one short `VFS_STORAGE` hold so the transient worker can execute the
+    /// multi-hundred-KiB transfer without head-of-line blocking `serve()`.
+    fn plan_bulk_read(
+        &mut self,
+        reply_cap: u64,
+        request: &VfsIpcRequest,
+    ) -> Result<bulk_read_worker::BulkReadPlan, i32> {
+        let id = request.remote_id;
+        let handle = self.handles.get(&id).ok_or(EBADF)?;
+        if handle.kind != RemoteKind::File {
+            return Err(if handle.kind == RemoteKind::Directory {
+                EISDIR
+            } else {
+                EOPNOTSUPP
+            });
+        }
+        if has_proc_snapshot(id) {
+            return Err(EOPNOTSUPP);
+        }
+        let path = handle.path.clone();
+        let mount_id = handle.mount_id;
+        let node = handle.node;
+        let handle_len = handle.len;
+        let offset = request.arg0;
+
+        let mut storage = lock_vfs_storage();
+        storage.invalidate_caches_if_remounted();
+        let file_len = if node != 0 {
+            storage.node_len(mount_id, node).ok_or(ESTALE)?
+        } else {
+            storage.live_len_for_path(path.as_str(), handle_len)
+        };
+        let count = vfsd::validate_bulk_read_request_bounds(
+            offset,
+            request.arg1,
+            file_len,
+            VFS_BULK_READ_MAX_BYTES,
+        )?;
+        if count == 0 {
+            return Ok(bulk_read_worker::BulkReadPlan::Eof { file_len });
+        }
+
+        let source = if node != 0 {
+            bulk_read_worker::BulkReadSource::TmpfsNode { mount_id, node }
+        } else if vfsd::proc_fs::lookup(path.as_str(), request.pid)
+            .is_some_and(|res| res.is_ok_and(vfsd::proc_fs::is_virtual_file))
+            || vfsd::proc_fs::sys_virtual_file(path.as_str()).is_some()
+        {
+            return Err(EOPNOTSUPP);
+        } else if early_system::file_len(path.as_str())?.is_some() {
+            bulk_read_worker::BulkReadSource::EarlySystem { path }
+        } else {
+            let (resolved_mount_id, rel_path, key, _parent_key, caps, _is_immutable, _volume, read_map_source) =
+                storage.resolve_mount(path.as_str())?;
+            let mount_generation = storage.mount_generation;
+            let in_shared_path = {
+                let mut shared = SHARED_PATH_FILES.lock();
+                shared.sync_generation(mount_generation);
+                shared.read_at(&key, 0, &mut []).is_some()
+            };
+            let in_bytes_cache = storage.file_bytes_cache.contains_key(&key);
+            let mapped = if !caps.posix_nodes()
+                && !in_shared_path
+                && !in_bytes_cache
+                && storage.dvm_storage_epoch != 0
+            {
+                if let Some(rms) = read_map_source {
+                    match rms.plan_read(
+                        rel_path.as_str(),
+                        vfsd::snapshot_budget::SNAPSHOT_MAP_BYTES,
+                    ) {
+                        Ok(map) if map.len() == file_len => {
+                            let read_map = alloc::sync::Arc::new(map);
+                            let detached =
+                                rms.read_source(read_map.clone()).map_err(map_range_error)?;
+                            Some(bulk_read_worker::BulkReadSource::Mapped {
+                                mount_id: resolved_mount_id,
+                                read_map,
+                                source: detached,
+                                mount_generation,
+                                storage_epoch: storage.dvm_storage_epoch,
+                            })
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            mapped.unwrap_or(bulk_read_worker::BulkReadSource::PathChunked {
+                path,
+                pid: request.pid,
+                file_len,
+                mount_generation,
+            })
+        };
+
+        Ok(bulk_read_worker::BulkReadPlan::Job(
+            bulk_read_worker::BulkReadJob {
+                reply_cap,
+                offset,
+                count,
+                file_len,
+                source,
+            },
+        ))
     }
 
     fn vfs_lseek(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
@@ -341,6 +462,17 @@ impl VfsState {
             response.status = ESPIPE;
             return;
         }
+        let base_cursor = match vfsd::cursor_sync::resolve_lseek_base_cursor(
+            request.flags,
+            request.arg2,
+            handle.cursor,
+        ) {
+            Ok(cursor) => cursor,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
         if self.checkpoint_operation_replayed(request, checkpoint_handle_key(request.remote_id)) {
             if handle.last_mutation != VFSD_OPEN_MUTATION_LSEEK
                 || handle.last_start != request.arg0
@@ -370,7 +502,7 @@ impl VfsState {
             lock_vfs_storage().live_len_for_path(handle.path.as_str(), handle.len)
         };
         let next = match checked_seek_position(
-            handle.cursor,
+            base_cursor,
             file_len,
             request.arg0 as i64,
             request.arg1,
@@ -864,7 +996,48 @@ impl VfsState {
             response.status = EBADF;
             return;
         };
-        if self.checkpoint_operation_replayed(request, checkpoint_handle_key(request.remote_id)) {
+        let key = checkpoint_handle_key(request.remote_id);
+        let replayed = self.checkpoint_operation_replayed(request, key);
+        if request.arg2 == VFS_CURSOR_SETTLE_SYNC {
+            match vfsd::cursor_sync::plan_cursor_settle_sync(
+                handle.kind == RemoteKind::File,
+                handle.last_mutation,
+                handle.cursor,
+                replayed,
+                request.arg0,
+                request.arg1,
+                request.arg3,
+                request.path_len,
+                request.payload_len,
+            ) {
+                Ok(vfsd::cursor_sync::SettleSyncOutcome::ReplayHit(cursor)) => {
+                    response.value = cursor;
+                }
+                Ok(vfsd::cursor_sync::SettleSyncOutcome::CommitCursor(cursor)) => {
+                    let mut candidate = handle;
+                    candidate.cursor = cursor;
+                    candidate.last_mutation = VFSD_OPEN_MUTATION_STABLE;
+                    candidate.last_start = 0;
+                    candidate.last_result = 0;
+                    if let Err(errno) = self.checkpoint_handle_state(
+                        request,
+                        request.remote_id,
+                        &candidate,
+                        VFSD_OPEN_MUTATION_STABLE,
+                        0,
+                        0,
+                    ) {
+                        response.status = errno;
+                        return;
+                    }
+                    response.value = candidate.cursor;
+                    self.handles.insert(request.remote_id, candidate);
+                }
+                Err(errno) => response.status = errno,
+            }
+            return;
+        }
+        if replayed {
             if handle.last_mutation != VFSD_OPEN_MUTATION_STABLE {
                 response.status = EIO;
             } else {
@@ -875,7 +1048,7 @@ impl VfsState {
         if !cursor_mutation_prepared(&handle)
             || self
                 .checkpoint_operations
-                .get(&checkpoint_handle_key(request.remote_id))
+                .get(&key)
                 .copied()
                 != Some((request.arg0, request.arg1))
             || !matches!(
@@ -920,15 +1093,8 @@ impl VfsState {
             || request.fd != 0
             || request.path_len != 0
             || request.payload_len != 0
-            || !matches!(original_op, VFS_IPC_OP_CLOSE | VFS_IPC_OP_POLL_QUERY)
-            || (original_op == VFS_IPC_OP_CLOSE && request.arg3 != 0)
-            || (original_op == VFS_IPC_OP_POLL_QUERY
-                && !matches!(
-                    request.arg3,
-                    VFS_POLL_QUERY_EPOLL_RETIRE
-                        | VFS_POLL_QUERY_EPOLL_CTL
-                        | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
-                ))
+            || original_op != VFS_IPC_OP_CLOSE
+            || request.arg3 != 0
         {
             response.status = EINVAL;
             return;
@@ -940,11 +1106,10 @@ impl VfsState {
             .filter(|record| {
                 record.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE != 0
                     && (record.operation_hi, record.operation_lo) == (request.arg0, request.arg1)
-                    && (original_op != VFS_IPC_OP_CLOSE
-                        || (record.parent_hi == 0
-                            && record.parent_lo == 0
-                            && record.key_hi == request.remote_id
-                            && record.key_lo == VFSD_CHECKPOINT_HANDLE_TAG))
+                    && record.parent_hi == 0
+                    && record.parent_lo == 0
+                    && record.key_hi == request.remote_id
+                    && record.key_lo == VFSD_CHECKPOINT_HANDLE_TAG
             })
             .collect::<Vec<_>>();
         for proof in proofs {
@@ -1335,12 +1500,25 @@ impl VfsState {
             response.status = EISDIR;
             return;
         }
+        let sync_cursor = (request.flags & rustos_user_abi::syscall::VFS_WRITE_FLAG_CURSOR_SYNC) != 0;
+        let base_cursor = match vfsd::cursor_sync::resolve_write_base_cursor(
+            request.flags,
+            request.arg0,
+            handle.cursor,
+        ) {
+            Ok(cursor) => cursor,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
         if self.checkpoint_operation_replayed(request, checkpoint_handle_key(request.remote_id)) {
             if handle.last_mutation != VFSD_OPEN_MUTATION_STABLE {
                 response.status = EIO;
                 return;
             }
             response.value = handle.last_result;
+            response.aux = handle.cursor;
             return;
         }
         if cursor_mutation_prepared(&handle) {
@@ -1349,7 +1527,30 @@ impl VfsState {
         }
         let len = (request.payload_len as usize).min(request.payload.len());
         if len == 0 {
-            response.value = 0;
+            if sync_cursor {
+                let mut candidate = handle;
+                candidate.cursor = base_cursor;
+                candidate.last_mutation = VFSD_OPEN_MUTATION_STABLE;
+                candidate.last_start = base_cursor;
+                candidate.last_result = 0;
+                if let Err(errno) = self.checkpoint_handle_state(
+                    request,
+                    request.remote_id,
+                    &candidate,
+                    VFSD_OPEN_MUTATION_STABLE,
+                    base_cursor,
+                    0,
+                ) {
+                    response.status = errno;
+                    return;
+                }
+                response.value = 0;
+                response.aux = candidate.cursor;
+                self.handles.insert(request.remote_id, candidate);
+            } else {
+                response.value = 0;
+                response.aux = handle.cursor;
+            }
             return;
         }
         let data = &request.payload[..len];
@@ -1365,13 +1566,13 @@ impl VfsState {
                         }
                     }
                 } else {
-                    handle.cursor
+                    base_cursor
                 };
-                if vfsd::cursor_after_write(handle.cursor, est_start, len, len).is_none() {
+                if vfsd::cursor_after_write(base_cursor, est_start, len, len).is_none() {
                     response.status = EOVERFLOW;
                     return;
                 }
-                let offset = if handle.append { None } else { Some(handle.cursor) };
+                let offset = if handle.append { None } else { Some(base_cursor) };
                 match storage.write_node(handle.mount_id, handle.node, offset, data) {
                     Ok(result) => result,
                     Err(errno) => {
@@ -1383,9 +1584,9 @@ impl VfsState {
                 let start = if handle.append {
                     storage.live_len_for_path(handle.path.as_str(), handle.len)
                 } else {
-                    handle.cursor
+                    base_cursor
                 };
-                if vfsd::cursor_after_write(handle.cursor, start, len, len).is_none() {
+                if vfsd::cursor_after_write(base_cursor, start, len, len).is_none() {
                     response.status = EOVERFLOW;
                     return;
                 }
@@ -1399,7 +1600,7 @@ impl VfsState {
             }
         };
         let mut candidate = handle;
-        candidate.cursor = match vfsd::cursor_after_write(candidate.cursor, start, len, written) {
+        candidate.cursor = match vfsd::cursor_after_write(base_cursor, start, len, written) {
             Some(c) => c,
             None => {
                 response.status = EOVERFLOW;
@@ -1422,8 +1623,9 @@ impl VfsState {
             return;
         }
         let event_path = candidate.path.clone();
-        self.handles.insert(request.remote_id, candidate);
         response.value = written as u64;
+        response.aux = candidate.cursor;
+        self.handles.insert(request.remote_id, candidate);
         if written > 0 {
             self.emit_inotify(event_path.as_str(), linux_abi::IN_MODIFY, false);
         }

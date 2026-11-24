@@ -21,6 +21,7 @@ read the sections you need, rather than paging from line 1 by habit.
 | --- | --- | --- |
 | Resume prior work / prepare session handoff | `session-handoff.md` repository snapshot, never local authority | live goal + `git status --short` + `git log -1`, then one owner contract |
 | Linux `pipe`/`eventfd` semantics, local fd kinds, `WAITSET_PROVIDER_KERNEL` | `abi/local-fd.md` | `kernel/ps/src/user/{pipe,eventfd,local_wait}.rs`, `service_ops/local_fd.rs`; probe `kvm-smoke --local-fd-probe` |
+| VFS sequential read cursor ownership & checkpoint ABI redesign (Item 2.3) | `abi/vfs-cursor-checkpoint.md` | `abi/vfs-storage.md`, `services/vfsd/src/{state_storage.rs,state_checkpoint.rs,state_files.rs}`, `formal/vfs-open-description-recovery/VfsOpenDescriptionRecovery.tla` |
 | Build/check issue | `.agents/skills/rustos-build/SKILL.md` or the failing diagnostic | search `commands.md` only if exact invocation remains unclear |
 | Development-speed/tooling change | relevant `token-policy.md` section + exact active hook/config | search `commands.md` only if a build invocation is part of the issue |
 | Run/KVM/debug issue | `.agents/skills/rustos-kvm/SKILL.md` | exact KVM owner; bounded `build/kvm/` evidence after symptom is known |

@@ -20,7 +20,7 @@ use super::{
     STORAGED_BULK_READ_RESPONSE_HEADER_BYTES, STORAGED_BULK_WRITE_PAYLOAD_CAPACITY,
     STORAGED_BULK_WRITE_REQUEST_HEADER_BYTES, SYS_RUSTOS_PAGER_FAULT_REPLY,
     SYS_RUSTOS_PAGER_FAULT_WAIT, SYSCALL_OFFLOAD_ABI_VERSION,
-    SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
+    SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT,
     SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_STATX,
     SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, StoragedBulkReadResponse,
     StoragedBulkWriteRequest,
@@ -580,7 +580,7 @@ fn socket_poll_owns_a_unique_offload_operation() {
         SYSCALL_OFFLOAD_OP_LINUX_MPROTECT
     );
     const {
-        assert!(SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET > SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY);
+        assert!(SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET > SYSCALL_OFFLOAD_OP_LINUX_PROCESS_EXIT);
     }
 }
 
@@ -776,11 +776,16 @@ fn netlink_socket_shape_is_route_raw_or_dgram_and_socket_only() {
     let flags = NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS;
     let n = NET_BROKER_PUBLICATION_AF_NETLINK;
     assert!(netlink(n, NET_BROKER_PUBLICATION_SOCK_RAW | flags, 0));
+    assert!(netlink(n, NET_BROKER_PUBLICATION_SOCK_RAW | flags, 15));
     assert!(netlink(n, 2, 0));
+    assert!(netlink(n, 2, 15));
     for ty in [0, 1, 4, 5, 6] {
         assert!(!netlink(n, ty, 0), "type {ty}");
     }
-    assert!(!netlink(n, NET_BROKER_PUBLICATION_SOCK_RAW, 9), "only NETLINK_ROUTE");
+    assert!(
+        !netlink(n, NET_BROKER_PUBLICATION_SOCK_RAW, 9),
+        "only NETLINK_ROUTE or NETLINK_KOBJECT_UEVENT"
+    );
     assert!(!netlink(n, NET_BROKER_PUBLICATION_SOCK_RAW | 1 << 30, 0), "unknown flag");
     assert!(!netlink(1, NET_BROKER_PUBLICATION_SOCK_RAW, 0), "AF_UNIX is not netlink");
     let socket = NetBrokerPrepareSocketPublication {
@@ -931,4 +936,17 @@ fn vfs_two_path_payload_round_trip_and_bounds() {
     let mut trailing = [0_u8; 4 + 16 + 16 + 1];
     let _ = encode_two_path_payload(b"/mnt/fat/old.txt", b"/mnt/fat/new.txt", &mut trailing);
     assert_eq!(decode_two_path_payload(&trailing), None);
+}
+
+#[test]
+fn vfs_cursor_sync_constants_are_distinct_and_nonzero() {
+    use super::{
+        VFS_CURSOR_SETTLE_CANCEL, VFS_CURSOR_SETTLE_COMMIT, VFS_CURSOR_SETTLE_SYNC,
+        VFS_LSEEK_FLAG_SYNC_CURSOR, VFS_WRITE_FLAG_CURSOR_SYNC,
+    };
+    assert_eq!(VFS_CURSOR_SETTLE_COMMIT, 1);
+    assert_eq!(VFS_CURSOR_SETTLE_CANCEL, 2);
+    assert_eq!(VFS_CURSOR_SETTLE_SYNC, 3);
+    assert_eq!(VFS_LSEEK_FLAG_SYNC_CURSOR, 1);
+    assert_eq!(VFS_WRITE_FLAG_CURSOR_SYNC, 1);
 }

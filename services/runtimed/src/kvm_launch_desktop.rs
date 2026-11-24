@@ -58,6 +58,8 @@ pub(crate) struct LaunchDesktopRequest {
     phase: Phase,
     retry_after: Option<Instant>,
     failures: u32,
+    last_error: Option<i32>,
+    waiting_for_probes_logged: bool,
     load: Option<Offload<ContractLoad>>,
 }
 
@@ -67,6 +69,8 @@ impl Default for LaunchDesktopRequest {
             phase: Phase::Unresolved,
             retry_after: None,
             failures: 0,
+            last_error: None,
+            waiting_for_probes_logged: false,
             load: Offload::start("runtimed-launch-desktop", load_contract),
         }
     }
@@ -139,8 +143,9 @@ impl LaunchDesktopRequest {
         self.phase = Phase::Done;
     }
 
-    fn defer(&mut self) {
+    fn defer(&mut self, errno: i32) {
         self.failures = self.failures.saturating_add(1);
+        self.last_error = Some(errno);
         let exponent = self.failures.saturating_sub(1).min(6);
         self.retry_after = Some(
             Instant::now()
@@ -160,12 +165,14 @@ impl LaunchDesktopRequest {
                 debug_line(format!("runtimed: kvm launch-desktop requested desktop_id={id}").as_str());
                 self.failures = 0;
                 self.retry_after = None;
+                self.last_error = None;
+                self.waiting_for_probes_logged = false;
                 self.phase = Phase::Requested(id);
             }
             Err(libc::EINVAL) => self.finish_failed("-", "malformed-contract", libc::EINVAL),
             Err(errno) => {
                 // The volume may not be mounted yet; bounded retry.
-                self.defer();
+                self.defer(errno);
                 if self.failures >= MAX_CONTRACT_READ_ATTEMPTS {
                     self.finish_failed("-", "contract-unreadable", errno);
                 }
@@ -197,8 +204,14 @@ impl LaunchDesktopRequest {
 /// Advance the request by at most one step. Called every broker pass; free
 /// (one comparison) once the request is settled.
 pub(super) fn drive(state: &mut BrokerState) -> bool {
-    if state.kvm_launch_desktop.phase == Phase::Done
-        || !state.ui_ready
+    if state.kvm_launch_desktop.phase == Phase::Done {
+        // Settled for the boot (every ordinary boot settles on the first read):
+        // dropping the handle ends the otherwise idle reader thread, which
+        // would hold a task slot for the life of the service.
+        state.kvm_launch_desktop.load = None;
+        return false;
+    }
+    if !state.ui_ready
         || !state.launch_catalog_loaded
         || state
             .kvm_launch_desktop
@@ -222,8 +235,79 @@ pub(super) fn drive(state: &mut BrokerState) -> bool {
     }
 }
 
+fn is_finite_boot_probe(state: &BrokerState, entry: &LaunchEntry, target_id: &str) -> bool {
+    if entry.desktop_file_id == target_id
+        || entry.restart
+        || entry.exec.starts_with("services/")
+        || entry.desktop_file_id == "netprobe.desktop"
+    {
+        return false;
+    }
+    entry.private_smp_qualification.is_some()
+        || state
+            .programs
+            .get(entry.desktop_file_id.as_str())
+            .is_some_and(|meta| meta.startup == crate::StartupMode::Session)
+}
+
+fn runtime_deps_achievable(
+    state: &BrokerState,
+    deps: &[String],
+    running_packages: &std::collections::BTreeSet<String>,
+) -> bool {
+    deps.iter().all(|dep| {
+        running_packages.contains(dep.as_str())
+            || state.launched_once.contains(dep.as_str())
+            || state.launch_entries.iter().any(|candidate| {
+                candidate.package_id == *dep
+                    && !state
+                        .permanent_launch_failures
+                        .contains_key(candidate.desktop_file_id.as_str())
+            })
+    })
+}
+
+fn boot_probes_pending_or_running(state: &BrokerState, target_id: &str) -> bool {
+    let running_packages = super::catalog::running_packages(state);
+    state.launch_entries.iter().any(|entry| {
+        if !is_finite_boot_probe(state, entry, target_id) {
+            return false;
+        }
+        if state
+            .running
+            .values()
+            .any(|process| process.desktop_file_id == entry.desktop_file_id)
+        {
+            return true;
+        }
+        !state.launched_once.contains(entry.package_id.as_str())
+            && !state
+                .permanent_launch_failures
+                .contains_key(entry.desktop_file_id.as_str())
+            && runtime_deps_achievable(state, &entry.runtime_deps, &running_packages)
+    })
+}
+
+pub(super) fn on_process_reaped(state: &mut BrokerState) {
+    if matches!(state.kvm_launch_desktop.phase, Phase::Requested(_))
+        && state.kvm_launch_desktop.last_error == Some(libc::EAGAIN)
+    {
+        state.kvm_launch_desktop.retry_after = None;
+    }
+}
+
 fn start_launch(state: &mut BrokerState, id: String) -> bool {
     if state.launch_in_flight.is_some() {
+        return false;
+    }
+    if boot_probes_pending_or_running(state, &id) {
+        if !state.kvm_launch_desktop.waiting_for_probes_logged {
+            state.kvm_launch_desktop.waiting_for_probes_logged = true;
+            debug_line(
+                format!("runtimed: kvm launch-desktop waiting for boot probes desktop_id={id}")
+                    .as_str(),
+            );
+        }
         return false;
     }
     // Strictly the catalog's own entry for this exact id; resolution by exec
@@ -283,7 +367,7 @@ fn start_launch(state: &mut BrokerState, id: String) -> bool {
 }
 
 fn retry_or_fail(request: &mut LaunchDesktopRequest, id: &str, errno: i32) {
-    request.defer();
+    request.defer(errno);
     if request.failures >= MAX_LAUNCH_ATTEMPTS {
         request.finish_failed(id, "launch-failed", errno);
     } else {
@@ -329,6 +413,8 @@ mod tests {
             phase: Phase::Unresolved,
             retry_after: None,
             failures: 0,
+            last_error: None,
+            waiting_for_probes_logged: false,
             load: None,
         }
     }
@@ -379,6 +465,15 @@ mod tests {
         let mut request = request();
         assert!(request.resolve(Ok(None)));
         assert_eq!(request.phase, Phase::Done);
+    }
+
+    #[test]
+    fn a_settled_request_releases_its_reader_thread() {
+        let mut state = BrokerState::default();
+        assert!(state.kvm_launch_desktop.load.is_some());
+        state.kvm_launch_desktop.phase = Phase::Done;
+        assert!(!drive(&mut state));
+        assert!(state.kvm_launch_desktop.load.is_none());
     }
 
     #[test]
@@ -448,5 +543,110 @@ mod tests {
             .expect("drive ends")
             .0;
         assert!(!drive_body.contains("read_bounded_config_snapshot("));
+    }
+
+    #[test]
+    fn waits_for_running_and_pending_session_probes_before_launching_desktop() {
+        use std::time::Duration;
+
+        let mut state = BrokerState::default();
+        state.ui_ready = true;
+        state.launch_catalog_loaded = true;
+        state.kvm_launch_desktop = request();
+        state.kvm_launch_desktop.phase = Phase::Requested(String::from("chrome.desktop"));
+
+        let session_meta = |id: &str, deps: Vec<&str>| crate::ProgramMetadata {
+            package_id: id.trim_end_matches(".desktop").to_owned(),
+            desktop_file_id: id.to_owned(),
+            display_name: id.to_owned(),
+            exec: format!("apps/{id}/app.elf"),
+            runtime_deps: deps.into_iter().map(str::to_owned).collect(),
+            startup: crate::StartupMode::Session,
+            weight_micros: 100,
+            logical_admin: false,
+            console_hosted: false,
+            args: Vec::new(),
+            env: Vec::new(),
+            application_request: runtime_control::ApplicationRequest::NONE,
+        };
+        let session_entry = |id: &str, deps: Vec<&str>| LaunchEntry {
+            package_id: id.trim_end_matches(".desktop").to_owned(),
+            desktop_file_id: id.to_owned(),
+            display_name: id.to_owned(),
+            exec: format!("apps/{id}/app.elf"),
+            runtime_deps: deps.into_iter().map(str::to_owned).collect(),
+            restart: false,
+            weight_micros: 100,
+            logical_admin: false,
+            console_hosted: false,
+            args: Vec::new(),
+            env: Vec::new(),
+            application_request: runtime_control::ApplicationRequest::NONE,
+            private_smp_qualification: None,
+        };
+
+        state.programs.insert(String::from("ipcbench.desktop"), session_meta("ipcbench.desktop", vec![]));
+        state.programs.insert(String::from("netprobe.desktop"), session_meta("netprobe.desktop", vec![]));
+        state.programs.insert(String::from("abifuzz.desktop"), session_meta("abifuzz.desktop", vec!["wayclick"]));
+        state.launch_entries.push(session_entry("ipcbench.desktop", vec![]));
+        state.launch_entries.push(session_entry("netprobe.desktop", vec![]));
+        state.launch_entries.push(session_entry("abifuzz.desktop", vec!["wayclick"]));
+
+        // Pending ipcbench must defer chrome.desktop cleanly without burning failures.
+        assert!(!drive(&mut state));
+        assert_eq!(state.kvm_launch_desktop.failures, 0);
+        assert!(state.kvm_launch_desktop.retry_after.is_none());
+
+        // Running ipcbench must also defer chrome.desktop cleanly.
+        state.running.insert(
+            99,
+            crate::RunningProcess {
+                pid: 99,
+                package_id: String::from("ipcbench"),
+                desktop_file_id: String::from("ipcbench.desktop"),
+                display_name: String::from("ipcbench"),
+                exec: String::from("apps/ipcbench/ipcbench.elf"),
+                session_handle: 0,
+                restart: false,
+                logical_admin: false,
+            },
+        );
+        assert!(!drive(&mut state));
+        assert_eq!(state.kvm_launch_desktop.failures, 0);
+
+        // Once ipcbench exits and is reaped, running netprobe and unsatisfiable
+        // abifuzz must not block chrome.desktop; it proceeds to catalog lookup.
+        state.running.remove(&99);
+        state.launched_once.insert(String::from("ipcbench"));
+        state.running.insert(
+            100,
+            crate::RunningProcess {
+                pid: 100,
+                package_id: String::from("netprobe"),
+                desktop_file_id: String::from("netprobe.desktop"),
+                display_name: String::from("netprobe"),
+                exec: String::from("apps/netprobe/netprobe.elf"),
+                session_handle: 0,
+                restart: false,
+                logical_admin: false,
+            },
+        );
+        // chrome.desktop isn't in state.programs here, so proceeding reaches
+        // unknown-desktop-id and settles to Done.
+        assert!(drive(&mut state));
+        assert_eq!(state.kvm_launch_desktop.phase, Phase::Done);
+
+        // Reaping a process clears an EAGAIN retry_after backoff, but keeps non-EAGAIN.
+        let mut state = BrokerState::default();
+        state.kvm_launch_desktop = request();
+        retry_or_fail(&mut state.kvm_launch_desktop, "chrome.desktop", libc::EAGAIN);
+        assert!(state.kvm_launch_desktop.retry_after.is_some());
+        on_process_reaped(&mut state);
+        assert!(state.kvm_launch_desktop.retry_after.is_none());
+
+        state.kvm_launch_desktop.retry_after = Some(Instant::now() + Duration::from_secs(5));
+        state.kvm_launch_desktop.last_error = Some(libc::EIO);
+        on_process_reaped(&mut state);
+        assert!(state.kvm_launch_desktop.retry_after.is_some());
     }
 }

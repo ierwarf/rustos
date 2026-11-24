@@ -328,3 +328,16 @@ fn futex_bucket_table_supports_wait_wake_and_cross_key_requeue() {
     assert!(table.take_task(10));
     assert!(!table.take_task(10));
 }
+
+#[test]
+fn thread_start_metadata_syscalls_need_no_service_round_trip() {
+    // rseq is unsupported by definition; arch_prctl validation is a pure
+    // function of (code, arg) and the user VA bound.
+    assert_eq!(syscall_linux_rseq(0, 32, 0, 0), linux_errno(LINUX_ENOSYS));
+    assert!(valid_arch_prctl_locally(linux_abi::ARCH_SET_FS, 0));
+    assert!(valid_arch_prctl_locally(linux_abi::ARCH_SET_FS, paging::USER_SPACE_BASE));
+    assert!(!valid_arch_prctl_locally(linux_abi::ARCH_SET_FS, paging::USER_SPACE_END_EXCLUSIVE));
+    assert!(!valid_arch_prctl_locally(0x1234, 0));
+    // A bad robust-list length is refused before any state is touched.
+    assert_eq!(syscall_linux_set_robust_list(0, 8), linux_errno(LINUX_EINVAL));
+}

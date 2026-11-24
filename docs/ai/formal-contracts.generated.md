@@ -2,12 +2,12 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `474a12ce240cb7e94a7564a1db1472a06fb266687cbff0a882602ad38938a444`
+- Registry SHA-256: `075fa4e7c74626a2e39c83715bd648b29bfd7ab3706f6fa5b3e53e15edef74d6`
 - Models: `160`
 - Whole flows: `84`
-- Transitions: `1028`
+- Transitions: `1030`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `1576`
+- Exact source witnesses: `1578`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
@@ -99,7 +99,7 @@
 | `tlb-shootdown-lifecycle` | `critical` | kernel-hal, kernel-mm | tlb-shootdown-lifecycle/TlbShootdownLifecycle | 7 | 7 | invariant-panic, reclaimed |
 | `ui-main-loop-wakeup` | `critical` | kernel-hal, uiserver | ui-main-loop-wakeup/UiMainLoopWakeup | 5 | 5 | presented |
 | `user-memory-access` | `critical` | kernel-mm, kernel-ps | page-table-lifecycle/PageTableLifecycle, process-address-space-lifetime/ProcessAddressSpaceLifetime | 7 | 7 | rejected, returned, revoked |
-| `vfs-open-description` | `critical` | kernel-compat, kernel-ps, vfsd | userspace-wait-set/UserspaceWaitSet, vfs-open-description-recovery/VfsOpenDescriptionRecovery | 17 | 17 | tombstoned |
+| `vfs-open-description` | `critical` | kernel-compat, kernel-ps, vfsd | userspace-wait-set/UserspaceWaitSet, vfs-open-description-recovery/VfsOpenDescriptionRecovery | 19 | 19 | tombstoned |
 | `waitset` | `critical` | kernel-compat, kernel-ps, vfsd | service-mutation-recovery/ServiceMutationRecovery, userspace-wait-set/UserspaceWaitSet, userspace-wait-set/WaitSetRegistry | 15 | 15 | capacity-rejected, interrupted, ready, restore-rejected, revoked, timed-out |
 | `wayland-client-ingress` | `critical` | uiserver | wayland-accept-isolation/WaylandAcceptIsolation | 9 | 9 | delivered, rejected, revoked |
 | `zero-trust-e2e` | `critical` | caller, kernel-ipc, object-owner, service-owner | zero-trust-service-flow/ZeroTrustServiceFlow | 10 | 10 | admitted, rejected, revoked, timed-out |

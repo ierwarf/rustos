@@ -32,7 +32,7 @@ use core::mem::{size_of, MaybeUninit};
 #[cfg(all(not(test), not(clippy)))]
 use core::panic::PanicInfo;
 use core::str;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rustos_svc_runtime::ipc;
 use rustos_svc_runtime::syscall::monotonic_nanos;
@@ -42,14 +42,15 @@ use rustos_user_abi::syscall::{
     LifecycleDrainBrokerArgs, LifecycleEventWire, LifecyclePidProbeWire, ProcFactsBrokerArgs,
     LIFECYCLE_BROKER_MODE_PROBE_PIDS, LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
     LIFECYCLE_DRAIN_MAX_EVENTS, PROC_FACTS_BROKER_ABI_VERSION, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
-    SYS_RUSTOS_PROC_FACTS_BROKER, waitset_claim_shape_valid, CommercialMaxCapabilityLeaseWire,
+    SYS_RUSTOS_PROC_FACTS_BROKER, CommercialMaxCapabilityLeaseWire,
     CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
     CommercialMaxProtocolResponse, IpcReplyWithHandlesArgs, ServiceCheckpointRecordWire,
     VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse, VfsIpcRequest, VfsIpcResponse,
-    WaitSetClaimWire, WaitSetInterestWire, WaitSetSnapshotWire, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
     COMMERCIAL_MAX_PROTOCOL_VFSD, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
+    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE_BATCH,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR,
     COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN, COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR,
     COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY, COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH,
@@ -65,7 +66,8 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_READLINKAT, SYSCALL_OFFLOAD_OP_LINUX_STATX,
     SYSCALL_OFFLOAD_OP_LINUX_UMOUNT2, SYSCALL_OFFLOAD_OP_LINUX_UNLINKAT,
     SYS_RUSTOS_IPC_REPLY_WITH_HANDLES, SYS_RUSTOS_SCHED_DEMOTE_SELF, VFS_CURSOR_SETTLE_CANCEL,
-    VFS_CURSOR_SETTLE_COMMIT, VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN,
+    VFS_CURSOR_SETTLE_COMMIT, VFS_CURSOR_SETTLE_SYNC, VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION,
+    VFS_EXECUTABLE_SNAPSHOT_OP_OPEN,
     VFS_IPC_ABI_VERSION, VFS_IPC_OP_ACCESS, VFS_IPC_OP_CHDIR, VFS_IPC_OP_CHECKPOINT_ACK,
     VFS_IPC_OP_CLOSE, VFS_IPC_OP_CURSOR_SETTLE, VFS_IPC_OP_DUP, VFS_IPC_OP_FCNTL, VFS_IPC_OP_FSTAT,
     VFS_IPC_OP_FILE_IDENTITY, VFS_IPC_OP_FSYNC, VFS_IPC_OP_FTRUNCATE, VFS_IPC_OP_GETCWD,
@@ -77,12 +79,12 @@ use rustos_user_abi::syscall::{
     VFS_IPC_OP_FCHMOD, VFS_IPC_OP_FALLOCATE, VFS_IPC_OP_FILE_LOCK, VFS_IPC_OP_SHARED_BACKING,
     VFS_IPC_OP_CHOWN, VFS_IPC_OP_FCHOWN, VFS_IPC_OP_LINKAT,
     VFS_IPC_OP_INOTIFY_INIT, VFS_IPC_OP_INOTIFY_ADD_WATCH, VFS_IPC_OP_INOTIFY_RM_WATCH,
+    VFS_IPC_OP_BULK_READ, VFS_BULK_READ_MAX_BYTES,
     VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY, VFS_POLL_QUERY_EPOLL_CREATE,
-    VFS_EPOLL_CLAIM_MAX, VFS_POLL_BATCH_MAX, VFS_POLL_KEYED_BATCH_MAX,
+    VFS_POLL_BATCH_MAX, VFS_POLL_KEYED_BATCH_MAX,
     VFS_POLL_QUERY_EPOLL_CLAIM, VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT,
     VFS_POLL_QUERY_EPOLL_RETIRE, VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_POLL,
     VFS_POLL_QUERY_POLL_KEYED,
-    WAITSET_ABI_VERSION, WAITSET_MAX_INTERESTS, WAITSET_SNAPSHOT_STATE_DISABLED,
     VfsFileIdentityWire, VfsStatFsWire, decode_two_path_payload,
     VFS_FILE_IDENTITY_FLAG_IMMUTABLE_VOLUME, VFS_FILE_IDENTITY_FLAG_MUTABLE_VOLUME,
     VFS_IPC_OP_LIBRARY_READ, VFS_LIBRARY_READ_MAX_BYTES, IPC_SERVICE_PAGERD,
@@ -90,34 +92,32 @@ use rustos_user_abi::syscall::{
 };
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
-    WaitSetSignalBrokerArgs, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_PROVIDER_VFSD,
+    WaitSetSignalBrokerArgs, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
+    WAITSET_PROVIDER_VFSD,
 };
 use storage_core::fs::{FsCreateAttrs, FsMetadata, FsNodeKind, FsOpenOptions, FsTimestamp};
 use vfsd::mount_table::{
     cache_key_for_mount, parent_rel_path, read_volume_file_to_vec, CacheKey, MountTable,
     OpenNodeState, SharedBlockDevice,
 };
-use vfsd::checkpoint_wire::{
-    checkpoint_epoll_record, checkpoint_interest_key, checkpoint_interest_record,
-    copy_file_cache_range, waitset_interest_from_wire, CHECKPOINT_EPOLL_TAG,
-};
+use vfsd::checkpoint_wire::copy_file_cache_range;
 use vfsd::{
     cacheable_metadata_errno, checked_seek_position, checkpoint_path_key,
     executable_snapshot_marker, executable_snapshot_resolution_base,
     reply_failure_diagnostic_due, should_materialize_file_cache,
     ui_bootstrap_snapshot_reply_completed, valid_checkpoint_record,
     ExecutableSnapshotBacking, OpenDescriptionCheckpointWire, SeekPositionError,
-    WaitSetInterestKey, WaitSetInterestRecord, WaitSetRegistry, WaitSetRegistryError,
     FILE_BYTES_CACHE_BUDGET_BYTES, VFSD_CHECKPOINT_HANDLE_TAG, VFSD_OPEN_CHECKPOINT_VERSION,
     VFSD_OPEN_MUTATION_FCNTL, VFSD_OPEN_MUTATION_GETDENTS, VFSD_OPEN_MUTATION_LSEEK,
-    VFSD_OPEN_MUTATION_OPEN, VFSD_OPEN_MUTATION_READ, VFSD_OPEN_MUTATION_STABLE,
-    VFSD_OPEN_MUTATION_STAGING,
+    VFSD_OPEN_MUTATION_OPEN, VFSD_OPEN_MUTATION_STABLE, VFSD_OPEN_MUTATION_STAGING,
 };
 
 mod block;
 mod bulk_lanes;
+mod bulk_read_worker;
 mod devmgrd;
 mod early_system;
+mod snapshot_cache;
 mod snapshot_worker;
 mod snapshot_output;
 mod shared_frames;
@@ -337,7 +337,7 @@ pub extern "C" fn rust_eh_personality() {}
 
 fn service_main() {
     let mut state = VfsState::new();
-    if state.restore_waitset_checkpoint().is_err() {
+    if state.restore_checkpoints().is_err() {
         ipc::debug_line("vfsd: checkpoint replay failed");
         return;
     }
@@ -473,19 +473,33 @@ fn serve(endpoint: u64, mut state: VfsState) {
                 // SAFETY: `received` equals size_of VfsIpcRequest exactly; same 8-aligned
                 // receive buffer and all-integer `repr(C)` layout as above.
                 let request = unsafe { &*request.as_ptr().cast::<VfsIpcRequest>() };
-                let response = reset_vfs_response_slot(request.op);
-                if !vfs_request_identity_admitted(request, sender_pid, sender_tid)
-                    || !netd_namespace_request_admitted(request)
-                {
-                    // SAFETY: `response` is the exclusive static slot just reset by
-                    // reset_vfs_response_slot on this receive-owner thread.
-                    unsafe { (*response).status = EACCES };
+                if request.op == VFS_IPC_OP_BULK_READ {
+                    // Bulk reads offload to a transient worker and reply with a
+                    // transferred memfd handle, so they never join the fused turn.
+                    Served::Settled(
+                        if !vfs_request_identity_admitted(request, sender_pid, sender_tid)
+                            || !netd_namespace_request_admitted(request)
+                        {
+                            bulk_read_worker::reply_bulk_read_status(reply_cap, EACCES, 0, 0)
+                        } else {
+                            state.handle_vfs_bulk_read(reply_cap, request)
+                        },
+                    )
                 } else {
-                    // SAFETY: `response` is the exclusive static slot just reset on this receive-owner
-                    // thread; no other reference to it exists while the handler runs.
-                    state.handle_vfs_request(request, unsafe { &mut *response });
+                    let response = reset_vfs_response_slot(request.op);
+                    if !vfs_request_identity_admitted(request, sender_pid, sender_tid)
+                        || !netd_namespace_request_admitted(request)
+                    {
+                        // SAFETY: `response` is the exclusive static slot just reset by
+                        // reset_vfs_response_slot on this receive-owner thread.
+                        unsafe { (*response).status = EACCES };
+                    } else {
+                        // SAFETY: `response` is the exclusive static slot just reset on this receive-owner
+                        // thread; no other reference to it exists while the handler runs.
+                        state.handle_vfs_request(request, unsafe { &mut *response });
+                    }
+                    Served::Reply(response.cast::<u8>(), size_of::<VfsIpcResponse>())
                 }
-                Served::Reply(response.cast::<u8>(), size_of::<VfsIpcResponse>())
             } else if received as usize == size_of::<CommercialMaxProtocolRequest>() {
                 // SAFETY: `received` equals size_of CommercialMaxProtocolRequest exactly; same
                 // 8-aligned receive buffer and all-integer `repr(C)` layout as above.
@@ -870,7 +884,6 @@ struct VfsState {
     billing: Option<provider_accounting::OpenDescriptionBilling>,
     cwd: BTreeMap<u64, String>,
     handles: BTreeMap<u64, RemoteHandle>,
-    epolls: WaitSetRegistry,
     inotify: vfsd::inotify::InotifyRegistry,
     /// Advisory file locks (`VFS_IPC_OP_FILE_LOCK`). Not checkpointed: locks
     /// die with a vfsd restart exactly as the kernel would drop them with the
@@ -1009,29 +1022,124 @@ fn close_fd(fd: i32) {
     }
 }
 
-fn call_rootd_checkpoint(
-    op: u16,
-    cursor: u64,
-    record: Option<&ServiceCheckpointRecordWire>,
-) -> Result<CommercialMaxProtocolResponse, i32> {
+/// Cached rootd supervisor endpoint (a generational kernel handle, so a stale
+/// value after a rootd restart fails instead of reaching another object). Zero
+/// means "not resolved". Invalidated on any transport failure.
+static ROOTD_ENDPOINT: AtomicU64 = AtomicU64::new(0);
+/// vfsd's own PID never changes for the life of the process.
+static ROOTD_SUBJECT_PID: AtomicU64 = AtomicU64::new(0);
+
+fn rootd_endpoint() -> Result<(u64, bool), i32> {
+    // ORDERING: Acquire pairs with the Release stores below. The handle is a
+    // self-contained integer and publishes no other memory, so this is stronger
+    // than the value strictly needs; a stale value fails at the kernel, not here.
+    let cached = ROOTD_ENDPOINT.load(Ordering::Acquire);
+    if cached != 0 {
+        return Ok((cached, true));
+    }
     let endpoint = ipc::lookup_service_endpoint(IPC_SERVICE_ROOTD);
     if endpoint < 0 {
         return Err((-endpoint) as i32);
     }
+    if endpoint == 0 {
+        return Err(EIO);
+    }
+    // ORDERING: Release pairs with the Acquire load above; racing resolvers
+    // store the same live handle or a newer one, and either is valid to use.
+    ROOTD_ENDPOINT.store(endpoint as u64, Ordering::Release);
+    Ok((endpoint as u64, false))
+}
+
+fn rootd_subject_pid() -> Result<u64, i32> {
+    // ORDERING: Relaxed. The PID is immutable for the life of the process and
+    // every writer stores the same value, so a racing first call is benign.
+    let cached = ROOTD_SUBJECT_PID.load(Ordering::Relaxed);
+    if cached != 0 {
+        return Ok(cached);
+    }
     // SAFETY: raw `getpid` syscall with no arguments and no memory access.
     let pid = unsafe { rustos_svc_runtime::syscall::syscall0(linux_abi::SYS_GETPID) };
-    // SAFETY: raw `gettid` syscall with no arguments and no memory access.
+    if pid <= 0 {
+        return Err(EIO);
+    }
+    // ORDERING: Relaxed, see the load above; no other memory is published.
+    ROOTD_SUBJECT_PID.store(pid as u64, Ordering::Relaxed);
+    Ok(pid as u64)
+}
+
+fn rootd_checkpoint_request(op: u16) -> Result<CommercialMaxProtocolRequest, i32> {
+    let pid = rootd_subject_pid()?;
+    // SAFETY: raw `gettid` syscall with no arguments and no memory access. The
+    // TID is per thread, so it is never cached.
     let tid = unsafe { rustos_svc_runtime::syscall::syscall0(linux_abi::SYS_GETTID) };
-    if pid <= 0 || tid <= 0 {
+    if tid <= 0 {
         return Err(EIO);
     }
     let mut request = CommercialMaxProtocolRequest::default();
     request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
     request.header.protocol = COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
     request.header.op = op;
-    request.header.subject_pid = pid as u64;
+    request.header.subject_pid = pid;
     request.header.subject_tid = tid as u64;
     request.arg0 = IPC_SERVICE_VFSD;
+    Ok(request)
+}
+
+/// One synchronous rootd call. `Ok` means a well-formed reply envelope arrived
+/// (its `status` may still be non-zero); `Err` is a transport failure, after
+/// which nothing is known about whether rootd applied the request. A failed
+/// call on a *cached* endpoint (typically a restarted rootd) is retried once
+/// with a fresh lookup; every checkpoint op is idempotent by operation id.
+fn rootd_checkpoint_transact(
+    request: &CommercialMaxProtocolRequest,
+) -> Result<CommercialMaxProtocolResponse, i32> {
+    let op = request.header.op;
+    for attempt in 0..2 {
+        let (endpoint, cached) = rootd_endpoint()?;
+        let mut response = CommercialMaxProtocolResponse::default();
+        // SAFETY: `request` is readable for its exact size and `response` is writable for
+        // its exact size, both live across the synchronous call; the kernel keeps
+        // no pointer after it returns.
+        let received = unsafe {
+            ipc::call(
+                endpoint,
+                (request as *const CommercialMaxProtocolRequest).cast::<u8>(),
+                size_of::<CommercialMaxProtocolRequest>(),
+                (&mut response as *mut CommercialMaxProtocolResponse).cast::<u8>(),
+                size_of::<CommercialMaxProtocolResponse>(),
+            )
+        };
+        let valid_envelope = response.is_valid_envelope_for(request);
+        if received as usize == size_of::<CommercialMaxProtocolResponse>()
+            && valid_envelope
+            && response.descriptor_count == 0
+        {
+            return Ok(response);
+        }
+        // ORDERING: Release pairs with the Acquire load in `rootd_endpoint`;
+        // the next call re-resolves. A concurrent store of a fresh handle may
+        // be overwritten with 0, which only costs one extra lookup.
+        ROOTD_ENDPOINT.store(0, Ordering::Release);
+        if attempt == 0 && cached && received < 0 && received != -i64::from(ETIMEDOUT) {
+            continue;
+        }
+        debug_line(&format!(
+            "vfsd: checkpoint transport failed op={op} received={received} expected={} envelope={} descriptors={}",
+            size_of::<CommercialMaxProtocolResponse>(),
+            u8::from(valid_envelope),
+            response.descriptor_count
+        ));
+        return Err(EIO);
+    }
+    Err(EIO)
+}
+
+fn call_rootd_checkpoint(
+    op: u16,
+    cursor: u64,
+    record: Option<&ServiceCheckpointRecordWire>,
+) -> Result<CommercialMaxProtocolResponse, i32> {
+    let mut request = rootd_checkpoint_request(op)?;
     request.arg1 = cursor;
     if let Some(record) = record {
         let bytes = rustos_svc_runtime::checkpoint_idl::encode(record).map_err(|_| EIO)?;
@@ -1041,32 +1149,7 @@ fn call_rootd_checkpoint(
         request.payload_len = bytes.len() as u32;
         request.payload[..bytes.len()].copy_from_slice(&bytes);
     }
-    let mut response = CommercialMaxProtocolResponse::default();
-    // SAFETY: `request` is readable for its exact size and `response` is writable for
-    // its exact size, both live locals across the synchronous call; the kernel keeps
-    // no pointer after it returns.
-    let received = unsafe {
-        ipc::call(
-            endpoint as u64,
-            (&request as *const CommercialMaxProtocolRequest).cast::<u8>(),
-            size_of::<CommercialMaxProtocolRequest>(),
-            (&mut response as *mut CommercialMaxProtocolResponse).cast::<u8>(),
-            size_of::<CommercialMaxProtocolResponse>(),
-        )
-    };
-    let valid_envelope = response.is_valid_envelope_for(&request);
-    if received as usize != size_of::<CommercialMaxProtocolResponse>()
-        || !valid_envelope
-        || response.descriptor_count != 0
-    {
-        debug_line(&format!(
-            "vfsd: checkpoint transport failed op={op} received={received} expected={} envelope={} descriptors={}",
-            size_of::<CommercialMaxProtocolResponse>(),
-            u8::from(valid_envelope),
-            response.descriptor_count
-        ));
-        return Err(EIO);
-    }
+    let response = rootd_checkpoint_transact(&request)?;
     if response.status != 0 {
         debug_line(&format!(
             "vfsd: checkpoint rejected op={op} errno={} key={:016x}:{:016x}",
@@ -1077,6 +1160,37 @@ fn call_rootd_checkpoint(
         return Err(response.status);
     }
     Ok(response)
+}
+
+/// Rootd transport for `vfsd::checkpoint_batch`: one MUTATE_BATCH IPC per call.
+struct RootdCheckpointTransport;
+
+impl vfsd::checkpoint_batch::CheckpointTransport for RootdCheckpointTransport {
+    fn mutate_batch(
+        &mut self,
+        _count: usize,
+        payload: &[u8],
+    ) -> Result<vfsd::checkpoint_batch::BatchReply, i32> {
+        let mut request =
+            rootd_checkpoint_request(COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE_BATCH)?;
+        if payload.is_empty() || payload.len() > request.payload.len() {
+            return Err(EIO);
+        }
+        request.payload_len = payload.len() as u32;
+        request.payload[..payload.len()].copy_from_slice(payload);
+        let response = rootd_checkpoint_transact(&request)?;
+        if response.status != 0 {
+            debug_line(&format!(
+                "vfsd: checkpoint batch rejected errno={} committed={}",
+                response.status, response.value0
+            ));
+        }
+        Ok(vfsd::checkpoint_batch::BatchReply {
+            status: response.status,
+            applied: response.value0,
+            duplicates: response.value1,
+        })
+    }
 }
 
 fn debug_line(message: &str) {
@@ -1175,27 +1289,6 @@ fn checkpoint_handle_tombstone(remote_id: u64) -> Result<ServiceCheckpointRecord
     })
 }
 
-fn checkpoint_path_record(
-    remote_id: u64,
-    chunk_index: usize,
-    bytes: &[u8],
-) -> Result<ServiceCheckpointRecordWire, i32> {
-    if bytes.is_empty() || bytes.len() > SERVICE_CHECKPOINT_VALUE_CAPACITY {
-        return Err(EINVAL);
-    }
-    let (key_hi, key_lo) = checkpoint_path_key(remote_id, chunk_index).ok_or(EOVERFLOW)?;
-    let mut record = ServiceCheckpointRecordWire {
-        key_hi,
-        key_lo,
-        parent_hi: remote_id,
-        parent_lo: VFSD_CHECKPOINT_HANDLE_TAG,
-        value_len: bytes.len() as u32,
-        ..ServiceCheckpointRecordWire::default()
-    };
-    record.value[..bytes.len()].copy_from_slice(bytes);
-    Ok(record)
-}
-
 fn remote_kind_from_u16(kind: u16) -> Option<RemoteKind> {
     match kind {
         rustos_user_abi::syscall::VFS_IPC_HANDLE_KIND_FILE => Some(RemoteKind::File),
@@ -1206,25 +1299,8 @@ fn remote_kind_from_u16(kind: u16) -> Option<RemoteKind> {
     }
 }
 
-fn pack_u32_pair(first: usize, second: usize) -> Result<u64, i32> {
-    let first = u32::try_from(first).map_err(|_| EOVERFLOW)?;
-    let second = u32::try_from(second).map_err(|_| EOVERFLOW)?;
-    Ok((u64::from(first) << 32) | u64::from(second))
-}
-
-fn unpack_u32_pair(value: u64) -> (u32, u32) {
-    ((value >> 32) as u32, value as u32)
-}
-
 fn cursor_mutation_prepared(handle: &RemoteHandle) -> bool {
-    matches!(
-        handle.last_mutation,
-        VFSD_OPEN_MUTATION_READ | VFSD_OPEN_MUTATION_GETDENTS
-    )
-}
-
-fn checkpoint_epoll_key(token: u64) -> CheckpointRevisionKey {
-    (0, 0, token, CHECKPOINT_EPOLL_TAG)
+    vfsd::cursor_sync::is_cursor_mutation_prepared(handle.last_mutation)
 }
 
 fn checkpoint_handle_key(token: u64) -> CheckpointRevisionKey {
@@ -1238,33 +1314,6 @@ fn poll_ready_bits(requested: u32) -> u32 {
             | linux_abi::EPOLLOUT
             | linux_abi::EPOLLERR
             | linux_abi::EPOLLHUP)
-}
-
-fn waitset_registry_status(err: WaitSetRegistryError) -> i32 {
-    match err {
-        WaitSetRegistryError::Exists => EEXIST,
-        WaitSetRegistryError::NotFound => ENOENT,
-        WaitSetRegistryError::Capacity => ENOSPC,
-        WaitSetRegistryError::Overflow => EOVERFLOW,
-        WaitSetRegistryError::Invalid => EINVAL,
-    }
-}
-
-fn epoll_interest_from_request(request: &VfsIpcRequest) -> Option<WaitSetInterestRecord> {
-    let wire_size = size_of::<WaitSetInterestWire>();
-    if request.payload_len as usize != wire_size {
-        return None;
-    }
-    // SAFETY: `payload_len` was checked equal to size_of WaitSetInterestWire (48),
-    // within the payload array; `read_unaligned` needs no alignment and the
-    // all-integer wire struct accepts any bit pattern.
-    let wire = unsafe {
-        core::ptr::read_unaligned(request.payload.as_ptr().cast::<WaitSetInterestWire>())
-    };
-    if wire.target_fd != request.fd {
-        return None;
-    }
-    waitset_interest_from_wire(&wire)
 }
 
 fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {

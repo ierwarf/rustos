@@ -93,6 +93,10 @@ pub(super) fn handle_getsockopt_in_state(
                     linux_abi::SO_REUSEADDR => socket.options.reuse_addr as i32,
                     linux_abi::SO_REUSEPORT => socket.options.reuse_port as i32,
                     linux_abi::SO_BROADCAST => socket.options.broadcast as i32,
+                    SO_OOBINLINE => i32::from(socket.options.oobinline),
+                    SO_PRIORITY => socket.options.priority,
+                    SO_TIMESTAMP => i32::from(socket.options.timestamp),
+                    SO_TIMESTAMPNS => i32::from(socket.options.timestampns),
                     linux_abi::SO_LINGER => {
                         response.payload[0..4]
                             .copy_from_slice(&i32::from(socket.options.linger.0).to_ne_bytes());
@@ -135,6 +139,14 @@ pub(super) fn handle_getsockopt_in_state(
                     linux_abi::IP_TTL => socket.options.ip_ttl,
                     linux_abi::IP_PKTINFO => i32::from(socket.options.ip_pktinfo),
                     linux_abi::IP_RECVTOS => i32::from(socket.options.ip_recvtos),
+                    IP_MULTICAST_IF => {
+                        response.payload[..4].copy_from_slice(&socket.options.ip_multicast_if);
+                        response.payload_len = 4;
+                        response.value = 0;
+                        return 0;
+                    }
+                    IP_MULTICAST_TTL => socket.options.ip_multicast_ttl,
+                    IP_MULTICAST_LOOP => i32::from(socket.options.ip_multicast_loop),
                     _ => return libc::ENOPROTOOPT,
                 };
                 return write_i32_opt(response, value);
@@ -144,6 +156,9 @@ pub(super) fn handle_getsockopt_in_state(
                     linux_abi::IPV6_V6ONLY => i32::from(socket.options.ipv6_only),
                     linux_abi::IPV6_TCLASS => socket.options.ipv6_tclass,
                     linux_abi::IPV6_RECVPKTINFO => i32::from(socket.options.ipv6_recvpktinfo),
+                    IPV6_MULTICAST_IF => socket.options.ipv6_multicast_if,
+                    IPV6_MULTICAST_HOPS => socket.options.ipv6_multicast_hops,
+                    IPV6_MULTICAST_LOOP => i32::from(socket.options.ipv6_multicast_loop),
                     _ => return libc::ENOPROTOOPT,
                 };
                 return write_i32_opt(response, value);
@@ -161,9 +176,15 @@ pub(super) fn handle_getsockopt_in_state(
                             .unwrap_or(socket.options.nodelay);
                         i32::from(nagle_disabled)
                     }
+                    TCP_CORK => i32::from(socket.options.tcp_cork),
                     val if val == linux_abi::TCP_KEEPIDLE => socket.options.tcp_keepidle,
                     val if val == linux_abi::TCP_KEEPINTVL => socket.options.tcp_keepintvl,
                     val if val == linux_abi::TCP_KEEPCNT => socket.options.tcp_keepcnt,
+                    TCP_DEFER_ACCEPT => socket.options.tcp_defer_accept,
+                    TCP_INFO => {
+                        return write_tcp_info_opt(state.inet.as_ref(), socket, tcp_handle, response);
+                    }
+                    TCP_QUICKACK => i32::from(socket.options.tcp_quickack),
                     val if val == linux_abi::TCP_USER_TIMEOUT => socket.options.tcp_user_timeout as i32,
                     _ => return libc::ENOPROTOOPT,
                 };
@@ -188,7 +209,10 @@ pub(super) fn handle_getsockopt_in_state(
             UnixSocketKind::Netlink => libc::AF_NETLINK,
             _ => linux_abi::AF_UNIX as i32,
         },
-        linux_abi::SO_PROTOCOL => 0_i32,
+        linux_abi::SO_PROTOCOL => match &socket.state {
+            UnixSocketState::Netlink(netlink) => netlink.protocol() as i32,
+            _ => 0_i32,
+        },
         linux_abi::SO_ACCEPTCONN => {
             if matches!(socket.state, UnixSocketState::Listening { .. }) {
                 1
@@ -200,6 +224,10 @@ pub(super) fn handle_getsockopt_in_state(
         linux_abi::SO_REUSEPORT => socket.options.reuse_port as i32,
         linux_abi::SO_KEEPALIVE => socket.options.keepalive as i32,
         linux_abi::SO_BROADCAST => socket.options.broadcast as i32,
+        SO_OOBINLINE => i32::from(socket.options.oobinline),
+        SO_PRIORITY => socket.options.priority,
+        SO_TIMESTAMP => i32::from(socket.options.timestamp),
+        SO_TIMESTAMPNS => i32::from(socket.options.timestampns),
         linux_abi::SO_LINGER => {
             response.payload[0..4]
                 .copy_from_slice(&i32::from(socket.options.linger.0).to_ne_bytes());
@@ -301,6 +329,23 @@ pub(super) fn handle_setsockopt_in_state(state: &mut NetState, request: &NetdIpc
         socket.options.linger = (onoff, linger);
         return 0;
     }
+    if request.arg1 == linux_abi::SOL_IP as u64
+        && matches!(
+            request.arg2,
+            IP_MULTICAST_IF
+                | IP_MULTICAST_TTL
+                | IP_MULTICAST_LOOP
+                | IP_ADD_MEMBERSHIP
+                | IP_DROP_MEMBERSHIP
+        )
+    {
+        return set_ipv4_multicast_option(state, request);
+    }
+    if request.arg1 == linux_abi::IPPROTO_IPV6
+        && matches!(request.arg2, IPV6_JOIN_GROUP | IPV6_LEAVE_GROUP)
+    {
+        return set_ipv6_multicast_membership(state, request);
+    }
     let Some(value) = request_i32_payload(request) else {
         return libc::EINVAL;
     };
@@ -330,6 +375,10 @@ pub(super) fn handle_setsockopt_in_state(state: &mut NetState, request: &NetdIpc
                     linux_abi::SO_REUSEADDR => socket.options.reuse_addr = value != 0,
                     linux_abi::SO_REUSEPORT => socket.options.reuse_port = value != 0,
                     linux_abi::SO_BROADCAST => socket.options.broadcast = value != 0,
+                    SO_OOBINLINE => socket.options.oobinline = value != 0,
+                    SO_PRIORITY => socket.options.priority = value,
+                    SO_TIMESTAMP => socket.options.timestamp = value != 0,
+                    SO_TIMESTAMPNS => socket.options.timestampns = value != 0,
                     linux_abi::SO_SNDBUF | linux_abi::SO_RCVBUF => {
                         let clamped = value.clamp(4096, MAX_INET_TCP_BUFFER_CAPACITY as i32);
                         if request.arg2 == linux_abi::SO_SNDBUF {
@@ -416,6 +465,22 @@ pub(super) fn handle_setsockopt_in_state(state: &mut NetState, request: &NetdIpc
                         }
                     }
                     linux_abi::IPV6_RECVPKTINFO => socket.options.ipv6_recvpktinfo = value != 0,
+                    IPV6_MULTICAST_IF => {
+                        if value < 0 {
+                            return libc::EINVAL;
+                        }
+                        socket.options.ipv6_multicast_if = value;
+                    }
+                    IPV6_MULTICAST_HOPS => {
+                        if value == -1 {
+                            socket.options.ipv6_multicast_hops = 1;
+                        } else if (0..=255).contains(&value) {
+                            socket.options.ipv6_multicast_hops = value;
+                        } else {
+                            return libc::EINVAL;
+                        }
+                    }
+                    IPV6_MULTICAST_LOOP => socket.options.ipv6_multicast_loop = value != 0,
                     _ => return libc::ENOPROTOOPT,
                 }
                 return 0;
@@ -438,6 +503,7 @@ pub(super) fn handle_setsockopt_in_state(state: &mut NetState, request: &NetdIpc
                             .get_mut::<tcp::Socket>(tcp_handle)
                             .set_nagle_enabled(value == 0);
                     }
+                    TCP_CORK => socket.options.tcp_cork = value != 0,
                     val if val == linux_abi::TCP_KEEPIDLE => {
                         if !(1..=32767).contains(&value) {
                             return libc::EINVAL;
@@ -466,6 +532,8 @@ pub(super) fn handle_setsockopt_in_state(state: &mut NetState, request: &NetdIpc
                         }
                         socket.options.tcp_keepcnt = value;
                     }
+                    TCP_DEFER_ACCEPT => socket.options.tcp_defer_accept = value.max(0),
+                    TCP_QUICKACK => socket.options.tcp_quickack = value != 0,
                     val if val == linux_abi::TCP_USER_TIMEOUT => {
                         if value < 0 {
                             return libc::EINVAL;
@@ -490,16 +558,202 @@ pub(super) fn handle_setsockopt_in_state(state: &mut NetState, request: &NetdIpc
         linux_abi::SO_REUSEPORT => socket.options.reuse_port = value != 0,
         linux_abi::SO_KEEPALIVE => socket.options.keepalive = value != 0,
         linux_abi::SO_BROADCAST => socket.options.broadcast = value != 0,
+        SO_OOBINLINE => socket.options.oobinline = value != 0,
+        SO_PRIORITY => socket.options.priority = value,
+        SO_TIMESTAMP => socket.options.timestamp = value != 0,
+        SO_TIMESTAMPNS => socket.options.timestampns = value != 0,
         linux_abi::SO_PASSCRED => socket.options.passcred = value != 0,
         linux_abi::SO_SNDBUF => socket.options.send_buffer = clamp_socket_buffer(value),
         linux_abi::SO_RCVBUF => socket.options.recv_buffer = clamp_socket_buffer(value),
+        SO_SNDBUFFORCE => {
+            if request.euid != 0 {
+                return libc::EPERM;
+            }
+            socket.options.send_buffer = clamp_socket_buffer(value);
+        }
+        SO_RCVBUFFORCE => {
+            if request.euid != 0 {
+                return libc::EPERM;
+            }
+            socket.options.recv_buffer = clamp_socket_buffer(value);
+        }
         _ => return libc::EOPNOTSUPP,
     }
     0
 }
 
+const SO_OOBINLINE: u64 = 10;
+const SO_PRIORITY: u64 = 12;
 const SO_RCVTIMEO: u64 = 20;
+const SO_TIMESTAMP: u64 = 29;
+const SO_SNDBUFFORCE: u64 = 32;
+const SO_RCVBUFFORCE: u64 = 33;
+const SO_TIMESTAMPNS: u64 = 35;
 const TIMEVAL_SIZE: usize = 16;
+
+const IP_MULTICAST_IF: u64 = 32;
+const IP_MULTICAST_TTL: u64 = 33;
+const IP_MULTICAST_LOOP: u64 = 34;
+const IP_ADD_MEMBERSHIP: u64 = 35;
+const IP_DROP_MEMBERSHIP: u64 = 36;
+
+const IPV6_MULTICAST_IF: u64 = 17;
+const IPV6_MULTICAST_HOPS: u64 = 18;
+const IPV6_MULTICAST_LOOP: u64 = 19;
+const IPV6_JOIN_GROUP: u64 = 20;
+const IPV6_LEAVE_GROUP: u64 = 21;
+
+const TCP_CORK: u64 = 3;
+const TCP_DEFER_ACCEPT: u64 = 9;
+const TCP_INFO: u64 = 11;
+const TCP_QUICKACK: u64 = 12;
+
+const TCP_INFO_LEN: usize = 104;
+
+fn set_ipv4_multicast_option(state: &mut NetState, request: &NetdIpcRequest) -> i32 {
+    let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) else {
+        return if state.sockets.contains_key(&request.socket_token) {
+            libc::ENOPROTOOPT
+        } else {
+            libc::EBADF
+        };
+    };
+    let len = request.payload_len as usize;
+    match request.arg2 {
+        IP_MULTICAST_IF => {
+            // Linux accepts struct ip_mreqn (12), struct ip_mreq (8), or struct in_addr (4).
+            let addr: [u8; 4] = if len >= 8 {
+                request.payload[4..8].try_into().unwrap_or_default()
+            } else if len >= 4 {
+                request.payload[0..4].try_into().unwrap_or_default()
+            } else {
+                return libc::EINVAL;
+            };
+            socket.options.ip_multicast_if = addr;
+            0
+        }
+        IP_MULTICAST_TTL => {
+            let value = if len >= 4 {
+                i32::from_ne_bytes(request.payload[0..4].try_into().unwrap_or_default())
+            } else if len == 1 {
+                i32::from(request.payload[0])
+            } else {
+                return libc::EINVAL;
+            };
+            let ttl = if value == -1 {
+                1
+            } else if (0..=255).contains(&value) {
+                value
+            } else {
+                return libc::EINVAL;
+            };
+            socket.options.ip_multicast_ttl = ttl;
+            0
+        }
+        IP_MULTICAST_LOOP => {
+            let value = if len >= 4 {
+                i32::from_ne_bytes(request.payload[0..4].try_into().unwrap_or_default())
+            } else if len == 1 {
+                i32::from(request.payload[0])
+            } else {
+                return libc::EINVAL;
+            };
+            socket.options.ip_multicast_loop = value != 0;
+            0
+        }
+        IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP => {
+            // struct ip_mreq (8 bytes) or struct ip_mreqn (12 bytes).
+            if len < 8 {
+                return libc::EINVAL;
+            }
+            if (request.payload[0] & 0xf0) != 0xe0 {
+                return libc::EINVAL;
+            }
+            0
+        }
+        _ => libc::ENOPROTOOPT,
+    }
+}
+
+fn set_ipv6_multicast_membership(state: &mut NetState, request: &NetdIpcRequest) -> i32 {
+    let Some(socket) = state.inet_sockets.get(&request.socket_token) else {
+        return if state.sockets.contains_key(&request.socket_token) {
+            libc::ENOPROTOOPT
+        } else {
+            libc::EBADF
+        };
+    };
+    if socket.domain != linux_abi::AF_INET6 {
+        return libc::ENOPROTOOPT;
+    }
+    // struct ipv6_mreq: 16-byte in6_addr + 4-byte interface index = 20 bytes.
+    if (request.payload_len as usize) < 20 {
+        return libc::EINVAL;
+    }
+    // IPv6 multicast addresses are ff00::/8.
+    if request.payload[0] != 0xff {
+        return libc::EINVAL;
+    }
+    0
+}
+
+fn linux_tcp_state(state: tcp::State) -> u8 {
+    match state {
+        tcp::State::Established => 1,
+        tcp::State::SynSent => 2,
+        tcp::State::SynReceived => 3,
+        tcp::State::FinWait1 => 4,
+        tcp::State::FinWait2 => 5,
+        tcp::State::TimeWait => 6,
+        tcp::State::Closed => 7,
+        tcp::State::CloseWait => 8,
+        tcp::State::LastAck => 9,
+        tcp::State::Listen => 10,
+        tcp::State::Closing => 11,
+    }
+}
+
+fn write_tcp_info_opt(
+    stack: Option<&InetStack>,
+    socket: &InetSocket,
+    tcp_handle: SocketHandle,
+    response: &mut NetdIpcResponse,
+) -> i32 {
+    let mut info = [0_u8; TCP_INFO_LEN];
+    let (tcpi_state, rcv_space) = if socket.tcp_listener.is_some() {
+        (10_u8, socket.options.recv_buffer.max(0) as u32)
+    } else if let Some(stack) = stack {
+        let tcp_sock = stack.sockets.get::<tcp::Socket>(tcp_handle);
+        (
+            linux_tcp_state(tcp_sock.state()),
+            tcp_sock.recv_capacity().min(u32::MAX as usize) as u32,
+        )
+    } else {
+        (7_u8, socket.options.recv_buffer.max(0) as u32)
+    };
+    let write_u32 = |buf: &mut [u8], offset: usize, value: u32| {
+        buf[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+    };
+    info[0] = tcpi_state;
+    write_u32(&mut info, 8, 200_000); // tcpi_rto (200ms)
+    write_u32(&mut info, 12, 40_000); // tcpi_ato (40ms)
+    write_u32(&mut info, 16, 1448); // tcpi_snd_mss
+    write_u32(&mut info, 20, 1448); // tcpi_rcv_mss
+    write_u32(&mut info, 60, 1500); // tcpi_pmtu
+    write_u32(&mut info, 64, 65535); // tcpi_rcv_ssthresh
+    write_u32(&mut info, 68, 1_000); // tcpi_rtt (1ms)
+    write_u32(&mut info, 72, 500); // tcpi_rttvar
+    write_u32(&mut info, 76, 0x7fff_ffff); // tcpi_snd_ssthresh
+    write_u32(&mut info, 80, 10); // tcpi_snd_cwnd
+    write_u32(&mut info, 84, 1448); // tcpi_advmss
+    write_u32(&mut info, 88, 3); // tcpi_reordering
+    write_u32(&mut info, 96, rcv_space); // tcpi_rcv_space
+
+    response.payload[..TCP_INFO_LEN].copy_from_slice(&info);
+    response.payload_len = TCP_INFO_LEN as u32;
+    response.value = 0;
+    0
+}
 
 pub(super) fn handle_ioctl(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
     let mut state = lock_net_state();

@@ -105,6 +105,32 @@ restoration is not required and must not be claimed. Both cases forbid a frame
 leak or runnable child with an incomplete ledger. `clone_user_space` cannot
 remain an immutable `&self` byte-copy helper for this transaction.
 
+### Batched leaf duplication
+
+`clone_user_space_cow` walks the parent one leaf page-table page (512 entries)
+at a time. The parent hierarchy is scanned once to list leaf-bearing pages and
+count owned leaves (the child record vector is reserved exactly from that
+count; no per-leaf allocation, and no separate ownership/leaf collection).
+Within a page the PTE is read directly: the same read supplies the physical
+address and the flags, so a leaf costs no additional directory walk in pass 1.
+The child leaf table is ensured once per page through the ordinary
+claim-before-CAS table protocol and entries are written in place without a
+per-leaf CR3 probe because the child root is unpublished and never loaded.
+
+Pass 2 (parent write-protect) runs after every child record exists, grouped by
+page-table page, re-reads each live PTE (hardware accessed/dirty bits are not
+overwritten from a stale snapshot), clears `WRITABLE`, and records the old
+flags in the child record so rollback restores exactly the downgraded prefix.
+The exact shootdown still happens once, when the mutation guard drops.
+
+Ledger transitions stay per frame and per mapping: each shared frame's
+descriptor, mapping record and root charge are individually owned state and
+are not batched. `prepare_shared_alias` already proves the parent's exact
+exclusive or shared mapping, so the separate `data_leaf_is_owned` probe is used
+only for eagerly copied leaves and to classify a refused alias
+(`InvalidFrameOwnership` versus `OutOfFrames`). The COW and eager-private
+region lists are consumed with a monotonic cursor (queries are ascending).
+
 ## 4. Present-write fault
 
 The COW path is a distinct present-write classifier. It accepts only an exact

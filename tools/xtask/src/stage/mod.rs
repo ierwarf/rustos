@@ -86,6 +86,7 @@ const DEFAULT_RUNTIME_ASSET_DIRS: &[&str] = &[
     "/usr/lib/gconv",
     "/usr/share/zoneinfo",
     "/usr/share/fonts",
+    "/usr/share/fontconfig-cache",
     "/etc/fonts",
     "/etc/ssl",
 ];
@@ -408,7 +409,14 @@ fn write_boot_disk_image(config: &Config) -> Result<()> {
             .volume_id(0x5255_5354),
     )?;
     image.seek(fatfs::SeekFrom::Start(0))?;
-    let fs = fatfs::FileSystem::new(image, fatfs::FsOptions::new())?;
+    // Use NullTimeProvider so every FAT directory carries the zero FAT date
+    // (reported by storage-fat as mtime=0). This makes the boot image
+    // reproducible and lets fontconfig's FcCacheTimeValid accept the
+    // pre-generated /usr/share/fontconfig-cache/*.cache-12 files.
+    let fs = fatfs::FileSystem::new(
+        image,
+        fatfs::FsOptions::new().time_provider(fatfs::NullTimeProvider::new()),
+    )?;
     {
         let root = fs.root_dir();
         for file in &files {
@@ -885,8 +893,8 @@ fn boot_disk_image_len(payload_bytes: u64) -> u64 {
     requested.max(MIN_IMAGE_BYTES).div_ceil(MIB) * MIB
 }
 
-fn ensure_fat_parent_dirs<D: fatfs::ReadWriteSeek>(
-    root: &fatfs::Dir<'_, D, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
+fn ensure_fat_parent_dirs<D: fatfs::ReadWriteSeek, T: fatfs::TimeProvider>(
+    root: &fatfs::Dir<'_, D, T, fatfs::LossyOemCpConverter>,
     path: &str,
 ) -> Result<()>
 where
@@ -912,9 +920,9 @@ where
     Ok(())
 }
 
-fn copy_host_file_to_fat<D: fatfs::ReadWriteSeek>(
+fn copy_host_file_to_fat<D: fatfs::ReadWriteSeek, T: fatfs::TimeProvider>(
     src: &Path,
-    dst: &mut fatfs::File<'_, D, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
+    dst: &mut fatfs::File<'_, D, T, fatfs::LossyOemCpConverter>,
 ) -> Result<()>
 where
     D::Error: std::error::Error + Send + Sync + 'static,

@@ -341,6 +341,71 @@ pub unsafe fn reply_recv_with_sender(
     )
 }
 
+static REPLY_THEN_RECV_ABANDONED_COUNT: AtomicU64 = AtomicU64::new(0);
+static REPLY_THEN_RECV_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn next_diagnostic_due(counter: &AtomicU64) -> bool {
+    let total = counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_add(1)
+        })
+        .map_or(u64::MAX, |previous| previous + 1);
+    reply_failure_diagnostic_due(total)
+}
+
+#[inline]
+const fn is_abandoned_reply_errno(errno: i64) -> bool {
+    // EINVAL (22): caller retired/cancelled its one-shot reply capability.
+    // EPIPE (32): peer closed before reply publication.
+    matches!(errno, 22 | 32)
+}
+
+fn reply_then_recv_with(
+    do_reply_recv: impl FnOnce() -> i64,
+    do_reply: impl FnOnce() -> i64,
+    mut on_failure: impl FnMut(&'static str),
+    abandoned_counter: &AtomicU64,
+    failure_counter: &AtomicU64,
+) -> i64 {
+    let result = do_reply_recv();
+    match reply_recv_result_kind(result) {
+        IpcReplyRecvResultKind::Success => {}
+        IpcReplyRecvResultKind::PostCommitError(_) => {
+            if next_diagnostic_due(failure_counter) {
+                on_failure("reply-recv receive failed");
+            }
+        }
+        IpcReplyRecvResultKind::PreCommitError(pre_errno) => {
+            // Only the pre-commit partition reaches here, so the old capability
+            // and the immutable response are live for at most one standalone
+            // reply try. If the caller already died or timed out, both the
+            // fused call and standalone reply reject the capability with
+            // EINVAL/EPIPE: classify that as an abandoned caller instead of a
+            // recovery failure, and rate-limit the diagnostic.
+            let recovery = do_reply();
+            if recovery >= 0 {
+                if next_diagnostic_due(failure_counter) {
+                    on_failure("reply-recv receive preflight failed");
+                }
+            } else {
+                let recovery_errno = recovery.checked_neg().unwrap_or(i64::MAX);
+                if is_abandoned_reply_errno(pre_errno) && is_abandoned_reply_errno(recovery_errno) {
+                    if next_diagnostic_due(abandoned_counter) {
+                        on_failure("reply-recv abandoned caller");
+                    }
+                } else if next_diagnostic_due(failure_counter) {
+                    on_failure("reply-recv reply failed");
+                    on_failure("reply-recv recovery failed");
+                }
+            }
+        }
+        IpcReplyRecvResultKind::Invalid => {
+            panic!("invalid reply-recv result outside native ABI partition")
+        }
+    }
+    result
+}
+
 /// One turn of a single-endpoint service loop: reply to `reply_cap` and receive
 /// the next request in a single syscall.
 ///
@@ -366,35 +431,25 @@ pub unsafe fn reply_then_recv(
     sender_tid_out: *mut u64,
     on_failure: fn(&'static str),
 ) -> i64 {
-    let result = unsafe {
-        reply_recv_with_sender(
-            endpoint,
-            reply_cap,
-            response,
-            response_len,
-            request_buf,
-            request_capacity,
-            next_reply_cap_out,
-            sender_pid_out,
-            sender_tid_out,
-        )
-    };
-    match reply_recv_result_kind(result) {
-        IpcReplyRecvResultKind::Success => {}
-        IpcReplyRecvResultKind::PostCommitError(_) => on_failure("reply-recv receive failed"),
-        IpcReplyRecvResultKind::PreCommitError(_) => {
-            on_failure("reply-recv reply failed");
-            // Only the pre-commit partition reaches here, so the old capability
-            // and the immutable response are live for exactly one recovery try.
-            if unsafe { reply(reply_cap, response, response_len) } < 0 {
-                on_failure("reply-recv recovery failed");
-            }
-        }
-        IpcReplyRecvResultKind::Invalid => {
-            panic!("invalid reply-recv result outside native ABI partition")
-        }
-    }
-    result
+    reply_then_recv_with(
+        || unsafe {
+            reply_recv_with_sender(
+                endpoint,
+                reply_cap,
+                response,
+                response_len,
+                request_buf,
+                request_capacity,
+                next_reply_cap_out,
+                sender_pid_out,
+                sender_tid_out,
+            )
+        },
+        || unsafe { reply(reply_cap, response, response_len) },
+        on_failure,
+        &REPLY_THEN_RECV_ABANDONED_COUNT,
+        &REPLY_THEN_RECV_FAILURE_COUNT,
+    )
 }
 
 /// Returns the underlying receive errno only when `result` proves that the
@@ -574,5 +629,96 @@ mod tests {
             reply_recv_result_kind(-4096),
             IpcReplyRecvResultKind::Invalid
         );
+    }
+
+    #[test]
+    fn reply_then_recv_classifies_abandoned_caller_and_never_retries_post_commit() {
+        use alloc::vec::Vec;
+        use core::sync::atomic::{AtomicU64, Ordering};
+        use rustos_user_abi::syscall::IPC_REPLY_RECV_COMMITTED_ERROR_BASE;
+
+        let mut events = Vec::new();
+        let abandoned = AtomicU64::new(0);
+        let failures = AtomicU64::new(0);
+
+        // Success: no recovery, no failure diagnostic.
+        assert_eq!(
+            super::reply_then_recv_with(
+                || 16,
+                || panic!("success must not invoke standalone reply"),
+                |msg| events.push(msg),
+                &abandoned,
+                &failures,
+            ),
+            16
+        );
+        assert!(events.is_empty());
+
+        // PostCommitError: reply already committed; must not retry reply.
+        let post_commit = -(IPC_REPLY_RECV_COMMITTED_ERROR_BASE + 14);
+        assert_eq!(
+            super::reply_then_recv_with(
+                || post_commit,
+                || panic!("post-commit error must never retry reply"),
+                |msg| events.push(msg),
+                &abandoned,
+                &failures,
+            ),
+            post_commit
+        );
+        assert_eq!(events, ["reply-recv receive failed"]);
+        events.clear();
+
+        // PreCommitError from receive preflight (e.g. EFAULT): standalone reply succeeds.
+        let mut retried = 0;
+        assert_eq!(
+            super::reply_then_recv_with(
+                || -14,
+                || {
+                    retried += 1;
+                    0
+                },
+                |msg| events.push(msg),
+                &abandoned,
+                &failures,
+            ),
+            -14
+        );
+        assert_eq!(retried, 1);
+        assert_eq!(events, ["reply-recv receive preflight failed"]);
+        events.clear();
+
+        // PreCommitError(-EINVAL) where standalone reply also returns -EINVAL:
+        // caller retired/abandoned the one-shot capability, not a recovery failure.
+        for _ in 0..8 {
+            assert_eq!(
+                super::reply_then_recv_with(
+                    || -22,
+                    || -22,
+                    |msg| events.push(msg),
+                    &abandoned,
+                    &failures,
+                ),
+                -22
+            );
+        }
+        assert_eq!(abandoned.load(Ordering::Relaxed), 8);
+        assert_eq!(events.len(), 5, "first 4 plus power-of-two sample 8");
+        assert!(events.iter().all(|&msg| msg == "reply-recv abandoned caller"));
+        events.clear();
+
+        // Genuine recovery failure (e.g. ENOMEM on standalone reply).
+        let fresh_failures = AtomicU64::new(0);
+        assert_eq!(
+            super::reply_then_recv_with(
+                || -14,
+                || -12,
+                |msg| events.push(msg),
+                &abandoned,
+                &fresh_failures,
+            ),
+            -14
+        );
+        assert_eq!(events, ["reply-recv reply failed", "reply-recv recovery failed"]);
     }
 }

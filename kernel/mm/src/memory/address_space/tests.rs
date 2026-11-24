@@ -135,3 +135,31 @@ fn external_frames_must_be_aligned_and_below_the_physical_ceiling() {
     assert!(!external_frame_is_encodable(limit, limit));
     assert!(!external_frame_is_encodable(u64::MAX & !(PAGE_4KIB_U64 - 1), limit));
 }
+
+fn region(start_page: u64, pages: usize) -> UserRegion {
+    UserRegion {
+        start: VirtAddr::new(USER_SPACE_BASE + start_page * PAGE_4KIB_U64),
+        page_count: pages,
+    }
+}
+
+#[test]
+fn region_cursor_matches_binary_search_for_ascending_queries() {
+    let regions = [region(2, 3), region(7, 1), region(9, 4), region(100, 2)];
+    let reference = |address: u64| {
+        let index = regions.partition_point(|r| r.start.as_u64() <= address);
+        index != 0 && address < regions[index - 1].end().as_u64()
+    };
+    let mut cursor = RegionCursor::new(&regions);
+    for page in 0..110_u64 {
+        let address = USER_SPACE_BASE + page * PAGE_4KIB_U64;
+        assert_eq!(cursor.contains(address), reference(address), "page {page}");
+    }
+    // Sparse ascending queries (skipping whole regions) must agree as well.
+    let mut cursor = RegionCursor::new(&regions);
+    for page in [0_u64, 3, 8, 8, 12, 50, 101, 102, 500] {
+        let address = USER_SPACE_BASE + page * PAGE_4KIB_U64;
+        assert_eq!(cursor.contains(address), reference(address), "page {page}");
+    }
+    assert!(!RegionCursor::new(&[]).contains(USER_SPACE_BASE));
+}

@@ -650,3 +650,388 @@ fn rekey_moves_one_member_of_a_shared_cow_set() {
     ledger.unregister_root(child);
     ledger.unregister_root(parent);
 }
+
+#[test]
+fn shared_alias_run_batches_mixed_exclusive_inherited_and_duplicate_frames() {
+    use crate::memory::charge;
+    let (ledger, _records, _mappings) = ledger();
+    let (parent, child, sibling) = (PAGE_SIZE, PAGE_SIZE * 2, PAGE_SIZE * 3);
+    let (f_excl_hi, f_excl_lo, f_file, f_anon_shared) =
+        (PAGE_SIZE * 7, PAGE_SIZE * 4, PAGE_SIZE * 5, PAGE_SIZE * 6);
+    let va_base = 0x8000_0000_u64;
+    charge::init_group(25, None);
+    ledger.register_root(parent);
+    ledger.register_root(child);
+    ledger.register_root(sibling);
+    assert!(ledger.bind_charge(child, 25));
+
+    // Parent owns two exclusive frames (placed out of phys order in the run).
+    assert_eq!(ledger.claim_exclusive_data(parent, va_base, f_excl_hi, true), DataClaim::Claimed);
+    ledger.publish_exclusive_data(parent, va_base, f_excl_hi);
+    assert_eq!(
+        ledger.claim_exclusive_data(parent, va_base + PAGE_SIZE, f_excl_lo, true),
+        DataClaim::Claimed
+    );
+    ledger.publish_exclusive_data(parent, va_base + PAGE_SIZE, f_excl_lo);
+
+    // Parent owns two aliases of the same private-file frame (duplicate phys in one run).
+    assert!(ledger.claim_private_file_cache(f_file, 77));
+    let t1 = ledger
+        .prepare_shared_alias(0, 0, parent, va_base + PAGE_SIZE * 2, f_file, CowFrameKind::PrivateFileSection, 77)
+        .unwrap();
+    ledger.publish_shared_alias(t1);
+    let t2 = ledger
+        .prepare_shared_alias(0, 0, parent, va_base + PAGE_SIZE * 3, f_file, CowFrameKind::PrivateFileSection, 77)
+        .unwrap();
+    ledger.publish_shared_alias(t2);
+
+    // Parent and sibling already share an anonymous COW frame.
+    assert_eq!(
+        ledger.claim_exclusive_data(parent, va_base + PAGE_SIZE * 4, f_anon_shared, true),
+        DataClaim::Claimed
+    );
+    ledger.publish_exclusive_data(parent, va_base + PAGE_SIZE * 4, f_anon_shared);
+    let t3 = ledger
+        .prepare_shared_alias(
+            parent,
+            va_base + PAGE_SIZE * 4,
+            sibling,
+            va_base + PAGE_SIZE * 4,
+            f_anon_shared,
+            CowFrameKind::AnonymousFork,
+            0,
+        )
+        .unwrap();
+    ledger.publish_shared_alias(t3);
+
+    let requests = [
+        SharedAliasRequest {
+            owner_va: va_base,
+            new_va: va_base,
+            frame_phys: f_excl_hi,
+            mode: SharedAliasMode::AnonymousFork,
+        },
+        SharedAliasRequest {
+            owner_va: va_base + PAGE_SIZE * 2,
+            new_va: va_base + PAGE_SIZE * 2,
+            frame_phys: f_file,
+            mode: SharedAliasMode::InheritShared,
+        },
+        SharedAliasRequest {
+            owner_va: va_base + PAGE_SIZE,
+            new_va: va_base + PAGE_SIZE,
+            frame_phys: f_excl_lo,
+            mode: SharedAliasMode::AnonymousFork,
+        },
+        SharedAliasRequest {
+            owner_va: va_base + PAGE_SIZE * 3,
+            new_va: va_base + PAGE_SIZE * 3,
+            frame_phys: f_file,
+            mode: SharedAliasMode::InheritShared,
+        },
+        SharedAliasRequest {
+            owner_va: va_base + PAGE_SIZE * 4,
+            new_va: va_base + PAGE_SIZE * 4,
+            frame_phys: f_anon_shared,
+            mode: SharedAliasMode::InheritShared,
+        },
+    ];
+    let mut tickets = [SharedAliasTicket::EMPTY; 5];
+    assert_eq!(
+        ledger.prepare_shared_alias_run(parent, child, &requests, &mut tickets),
+        Ok(())
+    );
+    // Charge is reserved once on prepare; leaf count updates once on publish.
+    assert_eq!(charge::usage(25), 5);
+    assert_eq!(
+        ledger.verify_root(child).unwrap().data_leaf_count_or_map_head.load(DESCRIPTOR_ACQUIRE),
+        0
+    );
+    ledger.publish_shared_alias_run(&tickets);
+    assert_eq!(charge::usage(25), 5);
+    assert_eq!(
+        ledger.verify_root(child).unwrap().data_leaf_count_or_map_head.load(DESCRIPTOR_ACQUIRE),
+        5
+    );
+
+    assert_eq!(
+        ledger.cow_identity(child, va_base, f_excl_hi),
+        Some((CowFrameKind::AnonymousFork, 0))
+    );
+    assert_eq!(
+        ledger.cow_identity(child, va_base + PAGE_SIZE, f_excl_lo),
+        Some((CowFrameKind::AnonymousFork, 0))
+    );
+    assert_eq!(
+        ledger.cow_identity(child, va_base + PAGE_SIZE * 2, f_file),
+        Some((CowFrameKind::PrivateFileSection, 77))
+    );
+    assert_eq!(
+        ledger.cow_identity(child, va_base + PAGE_SIZE * 3, f_file),
+        Some((CowFrameKind::PrivateFileSection, 77))
+    );
+    assert_eq!(
+        ledger.cow_identity(child, va_base + PAGE_SIZE * 4, f_anon_shared),
+        Some((CowFrameKind::AnonymousFork, 0))
+    );
+
+    // Release every child leaf and verify exact charge drainage.
+    for req in &requests {
+        assert_eq!(
+            ledger.release_data(child, req.new_va, req.frame_phys),
+            Some(DataLeafRelease::FrameRetained)
+        );
+    }
+    assert_eq!(charge::usage(25), 0);
+    assert_eq!(
+        ledger.verify_root(child).unwrap().data_leaf_count_or_map_head.load(DESCRIPTOR_ACQUIRE),
+        0
+    );
+
+    // Release parent/sibling/cache custody to verify full reusability.
+    assert_eq!(ledger.release_data(parent, va_base, f_excl_hi), Some(DataLeafRelease::FrameReusable));
+    assert_eq!(
+        ledger.release_data(parent, va_base + PAGE_SIZE, f_excl_lo),
+        Some(DataLeafRelease::FrameReusable)
+    );
+    assert_eq!(
+        ledger.release_data(parent, va_base + PAGE_SIZE * 2, f_file),
+        Some(DataLeafRelease::FrameRetained)
+    );
+    assert_eq!(
+        ledger.release_data(parent, va_base + PAGE_SIZE * 3, f_file),
+        Some(DataLeafRelease::FrameRetained)
+    );
+    assert_eq!(
+        ledger.release_private_file_cache(f_file, 77),
+        Some(DataLeafRelease::FrameReusable)
+    );
+    assert_eq!(
+        ledger.release_data(sibling, va_base + PAGE_SIZE * 4, f_anon_shared),
+        Some(DataLeafRelease::FrameRetained)
+    );
+    assert_eq!(
+        ledger.release_data(parent, va_base + PAGE_SIZE * 4, f_anon_shared),
+        Some(DataLeafRelease::FrameReusable)
+    );
+    ledger.unregister_root(sibling);
+    ledger.unregister_root(child);
+    ledger.unregister_root(parent);
+}
+
+#[test]
+fn shared_alias_run_mid_batch_failure_rolls_back_all_prior_frames_and_charge() {
+    use crate::memory::charge;
+    let (ledger, _records, _mappings) = ledger();
+    let (parent, child) = (PAGE_SIZE, PAGE_SIZE * 2);
+    let (f0, f1, f2_unowned) = (PAGE_SIZE * 3, PAGE_SIZE * 4, PAGE_SIZE * 5);
+    let va = 0x8000_0000_u64;
+    charge::init_group(26, None);
+    ledger.register_root(parent);
+    ledger.register_root(child);
+    assert!(ledger.bind_charge(child, 26));
+
+    assert_eq!(ledger.claim_exclusive_data(parent, va, f0, true), DataClaim::Claimed);
+    ledger.publish_exclusive_data(parent, va, f0);
+    assert_eq!(ledger.claim_exclusive_data(parent, va + PAGE_SIZE, f1, true), DataClaim::Claimed);
+    ledger.publish_exclusive_data(parent, va + PAGE_SIZE, f1);
+
+    // 1. Mid-batch invalid ownership (f2_unowned is ROLE_FREE) must unwind f0 and f1.
+    let bad_requests = [
+        SharedAliasRequest {
+            owner_va: va,
+            new_va: va,
+            frame_phys: f0,
+            mode: SharedAliasMode::AnonymousFork,
+        },
+        SharedAliasRequest {
+            owner_va: va + PAGE_SIZE,
+            new_va: va + PAGE_SIZE,
+            frame_phys: f1,
+            mode: SharedAliasMode::AnonymousFork,
+        },
+        SharedAliasRequest {
+            owner_va: va + PAGE_SIZE * 2,
+            new_va: va + PAGE_SIZE * 2,
+            frame_phys: f2_unowned,
+            mode: SharedAliasMode::AnonymousFork,
+        },
+    ];
+    let mut tickets = [SharedAliasTicket::EMPTY; 3];
+    assert_eq!(
+        ledger.prepare_shared_alias_run(parent, child, &bad_requests, &mut tickets),
+        Err(SharedAliasRunError::InvalidFrameOwnership)
+    );
+    assert_eq!(charge::usage(26), 0);
+    assert_eq!(ledger.record(f0).unwrap().role.load(DESCRIPTOR_ACQUIRE), ROLE_EXCLUSIVE_DATA_LIVE);
+    assert_eq!(ledger.record(f1).unwrap().role.load(DESCRIPTOR_ACQUIRE), ROLE_EXCLUSIVE_DATA_LIVE);
+    assert_eq!(
+        ledger.record(f0).unwrap().data_leaf_count_or_map_head.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        ledger.record(f1).unwrap().data_leaf_count_or_map_head.load(Ordering::Relaxed),
+        0
+    );
+    assert!(!ledger.data_is_owned(child, va, f0));
+    assert!(!ledger.data_is_owned(child, va + PAGE_SIZE, f1));
+    assert!(ledger.data_is_owned(parent, va, f0));
+    assert!(ledger.data_is_owned(parent, va + PAGE_SIZE, f1));
+
+    // 2. Quota refusal leaves all prior frames untouched and usage at zero.
+    charge::set_limit(26, 1);
+    assert_eq!(
+        ledger.prepare_shared_alias_run(parent, child, &bad_requests[..2], &mut tickets[..2]),
+        Err(SharedAliasRunError::OutOfFrames)
+    );
+    assert_eq!(charge::usage(26), 0);
+    assert_eq!(ledger.record(f0).unwrap().role.load(DESCRIPTOR_ACQUIRE), ROLE_EXCLUSIVE_DATA_LIVE);
+    assert_eq!(ledger.record(f1).unwrap().role.load(DESCRIPTOR_ACQUIRE), ROLE_EXCLUSIVE_DATA_LIVE);
+
+    // 3. Pool exhaustion mid-run (only 2 mapping slots for a 3-frame run) rolls back cleanly.
+    let mut small_records: Vec<FrameDescriptorRecord> =
+        (0..8).map(|_| FrameDescriptorRecord::empty()).collect();
+    let mut small_mappings: Vec<CowMappingRecord> =
+        (0..2).map(|_| CowMappingRecord::empty()).collect();
+    let small = FrameDescriptorLedger::empty();
+    small.install(
+        small_records.as_mut_ptr(),
+        small_records.len(),
+        small_mappings.as_mut_ptr(),
+        small_mappings.len(),
+    );
+    charge::init_group(28, None);
+    small.register_root(parent);
+    small.register_root(child);
+    assert!(small.bind_charge(child, 28));
+    for (idx, frame) in [f0, f1, f2_unowned].iter().enumerate() {
+        let leaf_va = va + (idx as u64) * PAGE_SIZE;
+        assert_eq!(small.claim_exclusive_data(parent, leaf_va, *frame, true), DataClaim::Claimed);
+        small.publish_exclusive_data(parent, leaf_va, *frame);
+    }
+    assert_eq!(
+        small.prepare_shared_alias_run(parent, child, &bad_requests, &mut tickets),
+        Err(SharedAliasRunError::OutOfFrames)
+    );
+    assert_eq!(charge::usage(28), 0);
+    for frame in [f0, f1, f2_unowned] {
+        assert_eq!(small.record(frame).unwrap().role.load(DESCRIPTOR_ACQUIRE), ROLE_EXCLUSIVE_DATA_LIVE);
+    }
+    // Both mapping records must have been returned to the free pool so a 2-page run succeeds.
+    assert_eq!(
+        small.prepare_shared_alias_run(parent, child, &bad_requests[..2], &mut tickets[..2]),
+        Ok(())
+    );
+    small.cancel_shared_alias_run(&tickets[..2]);
+    assert_eq!(charge::usage(28), 0);
+    for (idx, frame) in [f0, f1, f2_unowned].iter().enumerate() {
+        let leaf_va = va + (idx as u64) * PAGE_SIZE;
+        assert_eq!(small.release_data(parent, leaf_va, *frame), Some(DataLeafRelease::FrameReusable));
+    }
+    small.unregister_root(child);
+    small.unregister_root(parent);
+
+    assert_eq!(ledger.release_data(parent, va, f0), Some(DataLeafRelease::FrameReusable));
+    assert_eq!(ledger.release_data(parent, va + PAGE_SIZE, f1), Some(DataLeafRelease::FrameReusable));
+    ledger.unregister_root(child);
+    ledger.unregister_root(parent);
+}
+
+#[test]
+fn shared_alias_run_charges_root_once_and_cancel_refunds_atomically() {
+    use crate::memory::charge;
+    let (ledger, _records, _mappings) = ledger();
+    let (parent, child) = (PAGE_SIZE, PAGE_SIZE * 2);
+    let (f0, f1, f_file) = (PAGE_SIZE * 3, PAGE_SIZE * 4, PAGE_SIZE * 5);
+    let va = 0x8000_0000_u64;
+    charge::init_group(27, None);
+    charge::set_qos(27, 2, 0);
+    charge::set_limit(27, 8);
+    ledger.register_root(parent);
+    ledger.register_root(child);
+    assert!(ledger.bind_charge(child, 27));
+
+    assert_eq!(ledger.claim_exclusive_data(parent, va, f0, true), DataClaim::Claimed);
+    ledger.publish_exclusive_data(parent, va, f0);
+    assert_eq!(ledger.claim_exclusive_data(parent, va + PAGE_SIZE, f1, true), DataClaim::Claimed);
+    ledger.publish_exclusive_data(parent, va + PAGE_SIZE, f1);
+    assert!(ledger.claim_private_file_cache(f_file, 91));
+    let t1 = ledger
+        .prepare_shared_alias(0, 0, parent, va + PAGE_SIZE * 2, f_file, CowFrameKind::PrivateFileSection, 91)
+        .unwrap();
+    ledger.publish_shared_alias(t1);
+    let t2 = ledger
+        .prepare_shared_alias(0, 0, parent, va + PAGE_SIZE * 3, f_file, CowFrameKind::PrivateFileSection, 91)
+        .unwrap();
+    ledger.publish_shared_alias(t2);
+
+    // 4-page run with duplicate `f_file` crosses high=2 in one single charge call.
+    let requests = [
+        SharedAliasRequest {
+            owner_va: va + PAGE_SIZE * 2,
+            new_va: va + PAGE_SIZE * 2,
+            frame_phys: f_file,
+            mode: SharedAliasMode::InheritShared,
+        },
+        SharedAliasRequest {
+            owner_va: va,
+            new_va: va,
+            frame_phys: f0,
+            mode: SharedAliasMode::AnonymousFork,
+        },
+        SharedAliasRequest {
+            owner_va: va + PAGE_SIZE * 3,
+            new_va: va + PAGE_SIZE * 3,
+            frame_phys: f_file,
+            mode: SharedAliasMode::InheritShared,
+        },
+        SharedAliasRequest {
+            owner_va: va + PAGE_SIZE,
+            new_va: va + PAGE_SIZE,
+            frame_phys: f1,
+            mode: SharedAliasMode::AnonymousFork,
+        },
+    ];
+    let mut tickets = [SharedAliasTicket::EMPTY; 4];
+    assert_eq!(
+        ledger.prepare_shared_alias_run(parent, child, &requests, &mut tickets),
+        Ok(())
+    );
+    assert_eq!(charge::usage(27), 4);
+    assert_eq!(charge::high_events(27), 1);
+
+    // Cancel the entire run in caller order (including both duplicate tickets).
+    ledger.cancel_shared_alias_run(&tickets);
+    assert_eq!(charge::usage(27), 0);
+    assert_eq!(
+        ledger.verify_root(child).unwrap().data_leaf_count_or_map_head.load(DESCRIPTOR_ACQUIRE),
+        0
+    );
+    assert_eq!(ledger.record(f0).unwrap().role.load(DESCRIPTOR_ACQUIRE), ROLE_EXCLUSIVE_DATA_LIVE);
+    assert_eq!(ledger.record(f1).unwrap().role.load(DESCRIPTOR_ACQUIRE), ROLE_EXCLUSIVE_DATA_LIVE);
+    assert_eq!(
+        ledger.record(f_file).unwrap().role.load(DESCRIPTOR_ACQUIRE),
+        ROLE_SHARED_PRIVATE_FILE_LIVE
+    );
+    assert_eq!(
+        shared_count(ledger.record(f_file).unwrap().data_leaf_count_or_map_head.load(Ordering::Relaxed)),
+        3
+    );
+
+    assert_eq!(ledger.release_data(parent, va, f0), Some(DataLeafRelease::FrameReusable));
+    assert_eq!(ledger.release_data(parent, va + PAGE_SIZE, f1), Some(DataLeafRelease::FrameReusable));
+    assert_eq!(
+        ledger.release_data(parent, va + PAGE_SIZE * 2, f_file),
+        Some(DataLeafRelease::FrameRetained)
+    );
+    assert_eq!(
+        ledger.release_data(parent, va + PAGE_SIZE * 3, f_file),
+        Some(DataLeafRelease::FrameRetained)
+    );
+    assert_eq!(
+        ledger.release_private_file_cache(f_file, 91),
+        Some(DataLeafRelease::FrameReusable)
+    );
+    ledger.unregister_root(child);
+    ledger.unregister_root(parent);
+}

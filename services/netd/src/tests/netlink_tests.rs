@@ -211,7 +211,7 @@ fn sockaddr_nl_is_twelve_bytes() {
     assert_eq!(&bytes[8..12], &5_u32.to_ne_bytes());
 }
 
-fn netlink_socket(sock_type: u64) -> UnixSocket {
+fn netlink_socket_with_protocol(sock_type: u64, protocol: u64) -> UnixSocket {
     UnixSocket {
         kind: UnixSocketKind::Netlink,
         owner: Credentials::default(),
@@ -221,8 +221,12 @@ fn netlink_socket(sock_type: u64) -> UnixSocket {
         bound_inode: None,
         local_path: None,
         peer_path: None,
-        state: UnixSocketState::Netlink(NetlinkState::new(sock_type)),
+        state: UnixSocketState::Netlink(NetlinkState::new(sock_type, protocol)),
     }
+}
+
+fn netlink_socket(sock_type: u64) -> UnixSocket {
+    netlink_socket_with_protocol(sock_type, NETLINK_ROUTE)
 }
 
 fn request(token: u64, pid: u64) -> NetdIpcRequest {
@@ -553,4 +557,243 @@ fn sol_netlink_membership_options_and_change_notifications_work() {
     let mut state = lock_net_state();
     state.sockets.remove(&a);
     state.sockets.remove(&b);
+}
+
+#[test]
+fn kobject_uevent_socket_admission_bind_options_recv_poll_and_teardown() {
+    let flags = linux_abi::SOCK_CLOEXEC | linux_abi::SOCK_NONBLOCK;
+    assert_eq!(
+        local_socket_kind(
+            libc::AF_NETLINK as u64,
+            libc::SOCK_DGRAM as u64 | flags,
+            NETLINK_KOBJECT_UEVENT,
+        ),
+        Ok(UnixSocketKind::Netlink)
+    );
+    assert_eq!(
+        local_socket_kind(
+            libc::AF_NETLINK as u64,
+            libc::SOCK_RAW as u64 | flags,
+            NETLINK_KOBJECT_UEVENT,
+        ),
+        Ok(UnixSocketKind::Netlink)
+    );
+    assert_eq!(
+        local_socket_kind(libc::AF_NETLINK as u64, libc::SOCK_STREAM as u64, NETLINK_KOBJECT_UEVENT),
+        Err(libc::ESOCKTNOSUPPORT)
+    );
+    assert_eq!(
+        local_socket_kind(libc::AF_NETLINK as u64, libc::SOCK_DGRAM as u64, 9),
+        Err(libc::EPROTONOSUPPORT)
+    );
+    assert_eq!(
+        local_socket_kind(
+            libc::AF_NETLINK as u64,
+            libc::SOCK_DGRAM as u64 | (1 << 30),
+            NETLINK_KOBJECT_UEVENT,
+        ),
+        Err(libc::EINVAL)
+    );
+    let pair_req = NetdIpcRequest {
+        arg0: libc::AF_NETLINK as u64,
+        arg1: libc::SOCK_DGRAM as u64 | flags,
+        arg2: NETLINK_KOBJECT_UEVENT,
+        ..NetdIpcRequest::default()
+    };
+    assert_eq!(
+        handle_socketpair(&pair_req, &mut NetdIpcResponse::default(), 0),
+        libc::EOPNOTSUPP
+    );
+
+    // Per-protocol portid allocation: NETLINK_ROUTE and NETLINK_KOBJECT_UEVENT
+    // opened by the same process both receive that process's pid on bind(nl_pid=0).
+    let (route_tok, uevent_tok) = (0x9b0_1001_u64, 0x9b0_1002_u64);
+    {
+        let mut state = lock_net_state();
+        state
+            .sockets
+            .insert(route_tok, netlink_socket_with_protocol(libc::SOCK_RAW as u64, NETLINK_ROUTE));
+        state.sockets.insert(
+            uevent_tok,
+            netlink_socket_with_protocol(libc::SOCK_DGRAM as u64, NETLINK_KOBJECT_UEVENT),
+        );
+    }
+    let bind_req = |token: u64, pid: u64, nl_pid: u32, groups: u32| {
+        let mut req = request(token, pid);
+        req.payload[..12].copy_from_slice(&sockaddr_nl_bytes(nl_pid, groups));
+        req.payload_len = 12;
+        netlink::handle_bind(&req)
+    };
+    assert_eq!(bind_req(route_tok, 152, 0, RTMGRP_LINK), 0);
+    // UDEV_MONITOR_KERNEL (1) | UDEV_MONITOR_UDEV (2) = 3.
+    assert_eq!(bind_req(uevent_tok, 152, 0, 0x3), 0);
+
+    {
+        let mut state = lock_net_state();
+        // getsockname & getpeername
+        let mut name = NetdIpcResponse::default();
+        let UnixSocketState::Netlink(uevent) = &state.sockets[&uevent_tok].state else {
+            panic!();
+        };
+        assert_eq!(uevent.portid(), 152);
+        assert_eq!(uevent.groups(), 0x3);
+        assert_eq!(uevent.protocol(), NETLINK_KOBJECT_UEVENT);
+        assert_eq!(uevent.write_sockaddr(&mut name), 0);
+        assert_eq!(name.payload_len, 12);
+        assert_eq!(&name.payload[..12], &sockaddr_nl_bytes(152, 0x3));
+
+        let mut peer = NetdIpcResponse::default();
+        assert_eq!(netlink::write_kernel_sockaddr(&mut peer), 0);
+        assert_eq!(&peer.payload[..12], &sockaddr_nl_bytes(0, 0));
+
+        // Interface snapshots must never enqueue rtnetlink messages onto uevent sockets
+        // even when uevent has group bit 0 (UDEV_MONITOR_KERNEL == RTMGRP_LINK == 1) set.
+        let updated = InterfaceSnapshot {
+            links: vec![loopback_link(), provider_link(2, [0x52, 0x54, 0, 1, 2, 3])],
+            addrs: vec![loopback_addr(), provider_addr(2, [10, 0, 2, 15], 24)],
+            ..InterfaceSnapshot::default()
+        };
+        apply_interface_snapshot(&mut state, updated);
+        netlink::refresh_for_member(&mut state, uevent_tok);
+        let UnixSocketState::Netlink(uevent) = &state.sockets[&uevent_tok].state else {
+            panic!();
+        };
+        assert_eq!(uevent.queued_messages(), 0);
+
+        // Poll: not readable, writable.
+        let revents = unix_socket_revents(
+            &state,
+            uevent_tok,
+            (linux_abi::POLLIN | linux_abi::POLLOUT) as u32,
+        )
+        .unwrap();
+        assert_eq!(revents, linux_abi::POLLOUT as u32);
+
+        // Empty recvfrom / recvmsg return EAGAIN.
+        let mut resp = NetdIpcResponse::default();
+        assert_eq!(
+            netlink::handle_recv(&mut state, &recv_request(uevent_tok, 4096, 0), &mut resp),
+            libc::EAGAIN
+        );
+        let recvmsg = NetdIpcRequest {
+            op: SYSCALL_OFFLOAD_OP_LINUX_RECVMSG,
+            payload_len: 4096,
+            ..request(uevent_tok, 152)
+        };
+        assert_eq!(
+            netlink::handle_recvmsg(&mut state, &recvmsg, &mut resp),
+            libc::EAGAIN
+        );
+
+        // send on NETLINK_KOBJECT_UEVENT does not synthesize rtnetlink replies.
+        assert_eq!(
+            send_socket_message_in_state(
+                &mut state,
+                &request(uevent_tok, 152),
+                &dump_request(RTM_GETLINK, 0, 1),
+                &[],
+            ),
+            Err(libc::ECONNREFUSED)
+        );
+    }
+
+    // getsockopt / setsockopt: SO_TYPE, SO_DOMAIN, SO_PROTOCOL, SO_RCVBUF, SO_RCVBUFFORCE,
+    // SO_PASSCRED, SOL_NETLINK membership + NETLINK_NO_ENOBUFS.
+    let get_opt_i32 = |level: u64, option: u64| {
+        let req = NetdIpcRequest {
+            socket_token: uevent_tok,
+            arg1: level,
+            arg2: option,
+            ..NetdIpcRequest::default()
+        };
+        let mut response = NetdIpcResponse::default();
+        assert_eq!(super::handle_getsockopt(&req, &mut response), 0);
+        i32::from_ne_bytes(response.payload[..4].try_into().unwrap())
+    };
+    let set_opt_i32 = |level: u64, option: u64, value: i32, euid: u32| {
+        let mut req = NetdIpcRequest {
+            socket_token: uevent_tok,
+            euid,
+            arg1: level,
+            arg2: option,
+            payload_len: 4,
+            ..NetdIpcRequest::default()
+        };
+        req.payload[..4].copy_from_slice(&value.to_ne_bytes());
+        super::handle_setsockopt(&req)
+    };
+
+    assert_eq!(get_opt_i32(linux_abi::SOL_SOCKET, linux_abi::SO_TYPE), libc::SOCK_DGRAM);
+    assert_eq!(get_opt_i32(linux_abi::SOL_SOCKET, linux_abi::SO_DOMAIN), libc::AF_NETLINK);
+    assert_eq!(
+        get_opt_i32(linux_abi::SOL_SOCKET, linux_abi::SO_PROTOCOL),
+        NETLINK_KOBJECT_UEVENT as i32
+    );
+
+    assert_eq!(set_opt_i32(linux_abi::SOL_SOCKET, linux_abi::SO_PASSCRED, 1, 1000), 0);
+    assert_eq!(get_opt_i32(linux_abi::SOL_SOCKET, linux_abi::SO_PASSCRED), 1);
+
+    assert_eq!(set_opt_i32(linux_abi::SOL_SOCKET, linux_abi::SO_RCVBUF, 65536, 1000), 0);
+    assert_eq!(get_opt_i32(linux_abi::SOL_SOCKET, linux_abi::SO_RCVBUF), 65536);
+
+    // SO_RCVBUFFORCE (33) requires root (euid == 0).
+    assert_eq!(set_opt_i32(linux_abi::SOL_SOCKET, 33, 131072, 1000), libc::EPERM);
+    assert_eq!(set_opt_i32(linux_abi::SOL_SOCKET, 33, 131072, 0), 0);
+    assert_eq!(get_opt_i32(linux_abi::SOL_SOCKET, linux_abi::SO_RCVBUF), 131072);
+
+    assert_eq!(set_opt_i32(SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, 4, 1000), 0);
+    assert_eq!(get_opt_i32(SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS), 0x3 | (1 << 3));
+    assert_eq!(set_opt_i32(SOL_NETLINK, NETLINK_DROP_MEMBERSHIP, 1, 1000), 0);
+    assert_eq!(get_opt_i32(SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS), 0x2 | (1 << 3));
+
+    assert_eq!(set_opt_i32(SOL_NETLINK, NETLINK_NO_ENOBUFS, 1, 1000), 0);
+    assert_eq!(get_opt_i32(SOL_NETLINK, NETLINK_NO_ENOBUFS), 1);
+    assert_eq!(set_opt_i32(SOL_NETLINK, 99, 1, 1000), libc::ENOPROTOOPT);
+
+    // Proper teardown removes socket, readiness state, and returns token.
+    let mut state = lock_net_state();
+    state.socket_readiness_generation(uevent_tok);
+    let (retired_u, _, tokens_u) = retire_unix_socket(&mut state, uevent_tok);
+    let (retired_r, _, tokens_r) = retire_unix_socket(&mut state, route_tok);
+    assert_eq!(retired_u.len(), 1);
+    assert_eq!(tokens_u, vec![uevent_tok]);
+    assert_eq!(retired_r.len(), 1);
+    assert_eq!(tokens_r, vec![route_tok]);
+    assert!(!state.sockets.contains_key(&uevent_tok));
+    assert!(!state.readiness_generations.contains_key(&uevent_tok));
+    assert!(!state.readiness_observations.contains_key(&uevent_tok));
+}
+
+#[test]
+fn netlink_no_enobufs_suppresses_overrun_error() {
+    let mut state = NetState::new();
+    let mut socket = netlink_socket(libc::SOCK_RAW as u64);
+    socket.options.recv_buffer = 4096;
+    state.sockets.insert(1, socket);
+    let dump = dump_request(RTM_GETLINK, 0, 1);
+    let mut sent = 0;
+    while sent < 64 {
+        {
+            let UnixSocketState::Netlink(netlink) = &mut state.sockets.get_mut(&1).unwrap().state
+            else {
+                panic!();
+            };
+            if sent == 0 {
+                netlink.no_enobufs_for_test(true);
+            }
+            if netlink.queued_messages() != sent {
+                break;
+            }
+        }
+        send_socket_message_in_state(&mut state, &request(1, 5), &dump, &[]).unwrap();
+        sent += 1;
+    }
+    let mut response = NetdIpcResponse::default();
+    loop {
+        match netlink::handle_recv(&mut state, &recv_request(1, 4096, 0), &mut response) {
+            0 => {}
+            libc::EAGAIN => break,
+            other => panic!("unexpected errno {other} with NETLINK_NO_ENOBUFS"),
+        }
+    }
 }

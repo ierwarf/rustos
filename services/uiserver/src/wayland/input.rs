@@ -51,16 +51,17 @@ impl WaylandState {
             // pixels.
             let visible_w = surface.width.min(surface.frame.width);
             let visible_h = surface.height.min(surface.frame.height);
+            let border = window_border();
             let client_rect = Rect {
                 x: surface.frame.x
                     + if surface.decoration_server {
-                        WINDOW_BORDER
+                        border
                     } else {
                         0
                     },
                 y: surface.frame.y
                     + if surface.decoration_server {
-                        WINDOW_TITLE_HEIGHT + WINDOW_BORDER
+                        window_title_height() + border
                     } else {
                         0
                     },
@@ -70,11 +71,12 @@ impl WaylandState {
             if !grabbed && !client_rect.contains(x, y) {
                 continue;
             }
+            let scale = f64::from(self.output_scale.max(1));
             return Some(PointerHit {
                 surface: resource,
                 client_id,
-                surface_x: f64::from(x) - client_rect.x as f64,
-                surface_y: f64::from(y) - client_rect.y as f64,
+                surface_x: (f64::from(x) - client_rect.x as f64) / scale,
+                surface_y: (f64::from(y) - client_rect.y as f64) / scale,
             });
         }
         None

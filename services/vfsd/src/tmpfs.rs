@@ -1276,6 +1276,14 @@ fn shared_write(
             return Err(err);
         }
     };
+    // A short frame write must not leave the file longer than the bytes that
+    // landed: the unwritten tail of the extension would read back as zeros.
+    let new_len = if new_len > old_len && old_len.max(offset + written as u64) < new_len {
+        let landed = old_len.max(offset + written as u64);
+        if frames.set_len(landed).is_ok() { landed } else { new_len }
+    } else {
+        new_len
+    };
     if new_len > old_len {
         *used_bytes += (pages(new_len) - cur_pages) * CHUNK as u64;
         *len = new_len;
@@ -2457,6 +2465,16 @@ mod tests {
         assert_eq!(fs.metadata("f").unwrap().allocation_size, 2 * 4096);
         assert_eq!(fs.shared_backing_node(node).unwrap(), backing, "idempotent");
         assert_eq!(read_all(&fs, "f"), vec![7u8; 5000]);
+    }
+
+    #[test]
+    fn shared_short_frame_write_does_not_extend_past_landed_bytes() {
+        let fs = fs_with(64 * 4096, 64).with_shared_frames(short_frame_write_factory);
+        let node = put(&fs, "f", b"ab");
+        fs.shared_backing_node(node).unwrap();
+        let (written, len) = fs.write_node_at(node, 2, b"WXYZ").unwrap();
+        assert_eq!((written, len), (2, 4));
+        assert_eq!(fs.metadata_node(node).unwrap().len, 4);
     }
 
     #[test]

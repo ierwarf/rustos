@@ -440,3 +440,241 @@ fn fionread_on_udp_reports_next_datagram_size() {
     assert_eq!(socket_info::handle_ioctl_in_state(&mut state, &ioctl, &mut resp), 0);
     assert_eq!(i32::from_ne_bytes(resp.payload[..4].try_into().unwrap()), 5);
 }
+
+#[test]
+fn tcp_info_reports_real_state_across_closed_listen_and_established() {
+    let mut state = loopback_test_state();
+    let (listener, client, accepted) = (0x81_0001, 0x81_0002, 0x81_0003);
+    insert_inet_sock(&mut state, listener, linux_abi::AF_INET, linux_abi::SOCK_STREAM);
+    insert_inet_sock(&mut state, client, linux_abi::AF_INET, linux_abi::SOCK_STREAM);
+
+    let get_tcp_info = |st: &mut NetState, tok: u64| {
+        let req = NetdIpcRequest {
+            socket_token: tok,
+            arg1: linux_abi::SOL_TCP,
+            arg2: libc::TCP_INFO as u64,
+            ..NetdIpcRequest::default()
+        };
+        let mut resp = NetdIpcResponse::default();
+        assert_eq!(socket_info::handle_getsockopt_in_state(st, &req, &mut resp), 0);
+        assert_eq!(resp.payload_len, 104);
+        let mut out = [0_u8; 104];
+        out.copy_from_slice(&resp.payload[..104]);
+        out
+    };
+
+    // Unbound/closed TCP socket -> TCP_CLOSE (7).
+    let closed = get_tcp_info(&mut state, listener);
+    assert_eq!(closed[0], 7);
+    assert_eq!(u32::from_ne_bytes(closed[16..20].try_into().unwrap()), 1448);
+
+    // Listening TCP socket -> TCP_LISTEN (10).
+    assert_eq!(
+        inet_tcp::bind_tcp_in_state(&mut state, &sockaddr_in4_req(listener, [127, 0, 0, 1], 19443)),
+        0
+    );
+    assert_eq!(inet_tcp::listen_tcp_in_state(&mut state, listener, 4), 0);
+    let listening = get_tcp_info(&mut state, listener);
+    assert_eq!(listening[0], 10);
+
+    // Connect and accept -> TCP_ESTABLISHED (1) on both sides.
+    let status = inet_tcp::begin_inet_connect_in_state(
+        &mut state,
+        client,
+        IpAddress::Ipv4(Ipv4Address::LOCALHOST),
+        19443,
+        Duration::from_secs(5),
+        5000,
+    );
+    assert!(matches!(status, 0 | libc::EINPROGRESS));
+    state.inet.as_mut().unwrap().poll_budget(16);
+    assert_eq!(inet_tcp::inet_connect_status(&mut state, client), 0);
+    let mut acc_resp = NetdIpcResponse::default();
+    assert_eq!(
+        inet_tcp::pop_ready_tcp_accept_in_state(&mut state, listener, accepted, &mut acc_resp, false),
+        Ok(())
+    );
+    assert_eq!(get_tcp_info(&mut state, client)[0], 1);
+    assert_eq!(get_tcp_info(&mut state, accepted)[0], 1);
+
+    // TCP_INFO on a UDP socket must stay ENOPROTOOPT.
+    let udp = 0x81_0004;
+    insert_inet_sock(&mut state, udp, linux_abi::AF_INET, linux_abi::SOCK_DGRAM);
+    let mut resp = NetdIpcResponse::default();
+    assert_eq!(
+        socket_info::handle_getsockopt_in_state(
+            &mut state,
+            &NetdIpcRequest {
+                socket_token: udp,
+                arg1: linux_abi::SOL_TCP,
+                arg2: libc::TCP_INFO as u64,
+                ..NetdIpcRequest::default()
+            },
+            &mut resp,
+        ),
+        libc::ENOPROTOOPT
+    );
+}
+
+#[test]
+fn multicast_and_chrome_tcp_and_socket_options_validate_and_round_trip() {
+    let mut state = loopback_test_state();
+    let (v4_udp, v6_udp, v4_tcp) = (0x82_0001, 0x82_0002, 0x82_0003);
+    insert_inet_sock(&mut state, v4_udp, linux_abi::AF_INET, linux_abi::SOCK_DGRAM);
+    insert_inet_sock(&mut state, v6_udp, linux_abi::AF_INET6, linux_abi::SOCK_DGRAM);
+    insert_inet_sock(&mut state, v4_tcp, linux_abi::AF_INET, linux_abi::SOCK_STREAM);
+
+    let set_bytes = |st: &mut NetState, tok, level, opt, bytes: &[u8]| {
+        let mut req = NetdIpcRequest {
+            socket_token: tok,
+            arg1: level,
+            arg2: opt,
+            payload_len: bytes.len() as u32,
+            ..NetdIpcRequest::default()
+        };
+        req.payload[..bytes.len()].copy_from_slice(bytes);
+        socket_info::handle_setsockopt_in_state(st, &req)
+    };
+    let get_i32 = |st: &mut NetState, tok, level, opt| {
+        let req = NetdIpcRequest {
+            socket_token: tok,
+            arg1: level,
+            arg2: opt,
+            ..NetdIpcRequest::default()
+        };
+        let mut resp = NetdIpcResponse::default();
+        assert_eq!(socket_info::handle_getsockopt_in_state(st, &req, &mut resp), 0);
+        assert_eq!(resp.payload_len, 4);
+        i32::from_ne_bytes(resp.payload[..4].try_into().unwrap())
+    };
+
+    // IPv4 multicast options.
+    assert_eq!(get_i32(&mut state, v4_udp, linux_abi::SOL_IP, libc::IP_MULTICAST_TTL as u64), 1);
+    assert_eq!(get_i32(&mut state, v4_udp, linux_abi::SOL_IP, libc::IP_MULTICAST_LOOP as u64), 1);
+    assert_eq!(set_bytes(&mut state, v4_udp, linux_abi::SOL_IP, libc::IP_MULTICAST_TTL as u64, &[4_u8]), 0);
+    assert_eq!(get_i32(&mut state, v4_udp, linux_abi::SOL_IP, libc::IP_MULTICAST_TTL as u64), 4);
+    assert_eq!(set_bytes(&mut state, v4_udp, linux_abi::SOL_IP, libc::IP_MULTICAST_TTL as u64, &300_i32.to_ne_bytes()), libc::EINVAL);
+    assert_eq!(set_bytes(&mut state, v4_udp, linux_abi::SOL_IP, libc::IP_MULTICAST_LOOP as u64, &[0_u8]), 0);
+    assert_eq!(get_i32(&mut state, v4_udp, linux_abi::SOL_IP, libc::IP_MULTICAST_LOOP as u64), 0);
+    assert_eq!(set_bytes(&mut state, v4_udp, linux_abi::SOL_IP, libc::IP_MULTICAST_IF as u64, &[127, 0, 0, 1]), 0);
+    let mut if_resp = NetdIpcResponse::default();
+    assert_eq!(
+        socket_info::handle_getsockopt_in_state(
+            &mut state,
+            &NetdIpcRequest {
+                socket_token: v4_udp,
+                arg1: linux_abi::SOL_IP,
+                arg2: libc::IP_MULTICAST_IF as u64,
+                ..NetdIpcRequest::default()
+            },
+            &mut if_resp,
+        ),
+        0
+    );
+    assert_eq!(&if_resp.payload[..4], &[127, 0, 0, 1]);
+
+    // IP_ADD_MEMBERSHIP / IP_DROP_MEMBERSHIP: 224.0.0.251 (mDNS).
+    let mreq_valid = [224, 0, 0, 251, 0, 0, 0, 0];
+    let mreq_unicast = [127, 0, 0, 1, 0, 0, 0, 0];
+    assert_eq!(set_bytes(&mut state, v4_udp, linux_abi::SOL_IP, libc::IP_ADD_MEMBERSHIP as u64, &mreq_valid), 0);
+    assert_eq!(set_bytes(&mut state, v4_udp, linux_abi::SOL_IP, libc::IP_DROP_MEMBERSHIP as u64, &mreq_valid), 0);
+    assert_eq!(set_bytes(&mut state, v4_udp, linux_abi::SOL_IP, libc::IP_ADD_MEMBERSHIP as u64, &mreq_unicast), libc::EINVAL);
+    assert_eq!(set_bytes(&mut state, v4_udp, linux_abi::SOL_IP, libc::IP_ADD_MEMBERSHIP as u64, &[224, 0, 0, 251]), libc::EINVAL);
+
+    // IPv6 multicast options.
+    assert_eq!(get_i32(&mut state, v6_udp, linux_abi::IPPROTO_IPV6, libc::IPV6_MULTICAST_HOPS as u64), 1);
+    assert_eq!(get_i32(&mut state, v6_udp, linux_abi::IPPROTO_IPV6, libc::IPV6_MULTICAST_LOOP as u64), 1);
+    assert_eq!(set_bytes(&mut state, v6_udp, linux_abi::IPPROTO_IPV6, libc::IPV6_MULTICAST_IF as u64, &1_i32.to_ne_bytes()), 0);
+    assert_eq!(get_i32(&mut state, v6_udp, linux_abi::IPPROTO_IPV6, libc::IPV6_MULTICAST_IF as u64), 1);
+    assert_eq!(set_bytes(&mut state, v6_udp, linux_abi::IPPROTO_IPV6, libc::IPV6_MULTICAST_HOPS as u64, &8_i32.to_ne_bytes()), 0);
+    assert_eq!(get_i32(&mut state, v6_udp, linux_abi::IPPROTO_IPV6, libc::IPV6_MULTICAST_HOPS as u64), 8);
+    assert_eq!(set_bytes(&mut state, v6_udp, linux_abi::IPPROTO_IPV6, libc::IPV6_MULTICAST_LOOP as u64, &0_i32.to_ne_bytes()), 0);
+    assert_eq!(get_i32(&mut state, v6_udp, linux_abi::IPPROTO_IPV6, libc::IPV6_MULTICAST_LOOP as u64), 0);
+    let mut v6_mreq = [0_u8; 20];
+    v6_mreq[0] = 0xff;
+    v6_mreq[1] = 0x02;
+    v6_mreq[15] = 0xfb;
+    assert_eq!(set_bytes(&mut state, v6_udp, linux_abi::IPPROTO_IPV6, libc::IPV6_ADD_MEMBERSHIP as u64, &v6_mreq), 0);
+    assert_eq!(set_bytes(&mut state, v6_udp, linux_abi::IPPROTO_IPV6, libc::IPV6_DROP_MEMBERSHIP as u64, &v6_mreq), 0);
+    assert_eq!(set_bytes(&mut state, v6_udp, linux_abi::IPPROTO_IPV6, libc::IPV6_ADD_MEMBERSHIP as u64, &[0_u8; 20]), libc::EINVAL);
+    assert_eq!(set_bytes(&mut state, v6_udp, linux_abi::IPPROTO_IPV6, libc::IPV6_ADD_MEMBERSHIP as u64, &[0xff; 16]), libc::EINVAL);
+    // IPv6 multicast on IPv4 socket -> ENOPROTOOPT.
+    assert_eq!(set_bytes(&mut state, v4_udp, linux_abi::IPPROTO_IPV6, libc::IPV6_ADD_MEMBERSHIP as u64, &v6_mreq), libc::ENOPROTOOPT);
+
+    // SOL_TCP options: TCP_CORK, TCP_QUICKACK, TCP_DEFER_ACCEPT.
+    assert_eq!(set_bytes(&mut state, v4_tcp, linux_abi::SOL_TCP, libc::TCP_CORK as u64, &1_i32.to_ne_bytes()), 0);
+    assert_eq!(get_i32(&mut state, v4_tcp, linux_abi::SOL_TCP, libc::TCP_CORK as u64), 1);
+    assert_eq!(set_bytes(&mut state, v4_tcp, linux_abi::SOL_TCP, libc::TCP_QUICKACK as u64, &1_i32.to_ne_bytes()), 0);
+    assert_eq!(get_i32(&mut state, v4_tcp, linux_abi::SOL_TCP, libc::TCP_QUICKACK as u64), 1);
+    assert_eq!(set_bytes(&mut state, v4_tcp, linux_abi::SOL_TCP, libc::TCP_DEFER_ACCEPT as u64, &5_i32.to_ne_bytes()), 0);
+    assert_eq!(get_i32(&mut state, v4_tcp, linux_abi::SOL_TCP, libc::TCP_DEFER_ACCEPT as u64), 5);
+    assert_eq!(set_bytes(&mut state, v4_tcp, linux_abi::SOL_TCP, libc::TCP_DEFER_ACCEPT as u64, &(-3_i32).to_ne_bytes()), 0);
+    assert_eq!(get_i32(&mut state, v4_tcp, linux_abi::SOL_TCP, libc::TCP_DEFER_ACCEPT as u64), 0);
+
+    // SOL_SOCKET options: SO_TIMESTAMP, SO_TIMESTAMPNS, SO_PRIORITY, SO_LINGER, SO_BROADCAST, SO_OOBINLINE.
+    for (opt, val) in [
+        (libc::SO_TIMESTAMP as u64, 1_i32),
+        (libc::SO_TIMESTAMPNS as u64, 1_i32),
+        (libc::SO_PRIORITY as u64, 6_i32),
+        (linux_abi::SO_BROADCAST, 1_i32),
+        (libc::SO_OOBINLINE as u64, 1_i32),
+    ] {
+        assert_eq!(set_bytes(&mut state, v4_tcp, linux_abi::SOL_SOCKET, opt, &val.to_ne_bytes()), 0);
+        assert_eq!(get_i32(&mut state, v4_tcp, linux_abi::SOL_SOCKET, opt), val);
+    }
+    let mut linger_bytes = [0_u8; 8];
+    linger_bytes[0..4].copy_from_slice(&1_i32.to_ne_bytes());
+    linger_bytes[4..8].copy_from_slice(&3_i32.to_ne_bytes());
+    assert_eq!(set_bytes(&mut state, v4_tcp, linux_abi::SOL_SOCKET, linux_abi::SO_LINGER, &linger_bytes), 0);
+    let mut linger_resp = NetdIpcResponse::default();
+    assert_eq!(
+        socket_info::handle_getsockopt_in_state(
+            &mut state,
+            &NetdIpcRequest {
+                socket_token: v4_tcp,
+                arg1: linux_abi::SOL_SOCKET,
+                arg2: linux_abi::SO_LINGER,
+                ..NetdIpcRequest::default()
+            },
+            &mut linger_resp,
+        ),
+        0
+    );
+    assert_eq!(&linger_resp.payload[..8], &linger_bytes);
+}
+
+#[test]
+fn simultaneous_connects_within_backlog_are_all_queued_without_a_listener_poll() {
+    let mut state = loopback_test_state();
+    let listener = 0x90_0001;
+    insert_inet_sock(&mut state, listener, linux_abi::AF_INET, linux_abi::SOCK_STREAM);
+    assert_eq!(
+        inet_tcp::bind_tcp_in_state(&mut state, &sockaddr_in4_req(listener, [127, 0, 0, 1], 19555)),
+        0
+    );
+    assert_eq!(inet_tcp::listen_tcp_in_state(&mut state, listener, 8), 0);
+    let clients: Vec<u64> = (1..=5).map(|i| 0x90_0100 + i).collect();
+    for &client in &clients {
+        insert_inet_sock(&mut state, client, linux_abi::AF_INET, linux_abi::SOCK_STREAM);
+        let status = inet_tcp::begin_inet_connect_in_state(
+            &mut state,
+            client,
+            IpAddress::Ipv4(Ipv4Address::LOCALHOST),
+            19555,
+            Duration::from_secs(5),
+            5000,
+        );
+        assert!(matches!(status, 0 | libc::EINPROGRESS | libc::ECONNREFUSED), "{status}");
+    }
+    // Only the stack advances (the readiness worker), nobody polls or accepts.
+    for _ in 0..4 {
+        state.inet.as_mut().unwrap().poll_budget(16);
+    }
+    let mut refused = 0;
+    for &client in &clients {
+        if inet_tcp::inet_connect_status(&mut state, client) == libc::ECONNREFUSED {
+            refused += 1;
+        }
+    }
+    assert_eq!(refused, 0, "{refused} of 5 connects within backlog 8 were refused");
+}

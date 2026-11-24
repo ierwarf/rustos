@@ -205,8 +205,12 @@ pub(super) fn terminate_session_async(session_handle: u64) {
                 let transaction = runtime.terminate_session_transaction(session_handle)?;
                 Ok(execute_mutation(&runtime, &transaction))
             }) {
-                Ok(result) => report_mutation_result(&format!("terminate session {session_handle}"), result),
-                Err(errno) => diag_line(format!("uiserver: terminate session {session_handle} could not be prepared errno={errno}")),
+                Ok(result) => {
+                    report_mutation_result(&format!("terminate session {session_handle}"), result)
+                }
+                Err(errno) => diag_line(format!(
+                    "uiserver: terminate session {session_handle} could not be prepared errno={errno}"
+                )),
             }
             TERMINATE_GATE.finish(for_thread.as_str());
         },
@@ -220,11 +224,11 @@ pub(super) fn terminate_session_async(session_handle: u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_mutation, launch_until_budget_admits, reconcile_mutation, LaunchGate,
-        MutationCompletion, BUDGET_RETRY_ATTEMPTS, MAX_LAUNCHES_IN_FLIGHT,
+        BUDGET_RETRY_ATTEMPTS, LaunchGate, MAX_LAUNCHES_IN_FLIGHT, MutationCompletion,
+        execute_mutation, launch_until_budget_admits, reconcile_mutation,
     };
     use runtime_control::protocol::{
-        RuntimeRequest, RuntimeResponse, PROTOCOL_VERSION, REQUEST_FLAG_QUERY,
+        PROTOCOL_VERSION, REQUEST_FLAG_QUERY, RuntimeRequest, RuntimeResponse,
     };
     use runtime_control::{MutationOutcome, RuntimeClient};
     use std::io::{Read, Write};

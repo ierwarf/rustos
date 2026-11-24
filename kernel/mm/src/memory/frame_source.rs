@@ -33,9 +33,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use super::{charge, frame_capability, phys};
 use x86_64::PhysAddr;
 
-pub const MAX_FRAME_SOURCES: usize = 16_384;
+/// Sized for the pager's warmed libraries (12,288 pages) plus the MM broker's
+/// demand objects (65,536 pages), with headroom for other suppliers.
+pub const MAX_FRAME_SOURCES: usize = 81_920;
 const FRAME_BYTES: u64 = 4096;
-const INDEX_BITS: u32 = 16;
+const INDEX_BITS: u32 = 17;
 const INDEX_MASK: u64 = (1 << INDEX_BITS) - 1;
 const STATE_MASK: u64 = 3;
 const FREE: u64 = 0;

@@ -16,10 +16,6 @@
 //! - **Evidence:** `futex-wait-lifecycle`.
 use super::*;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
-use rustos_user_abi::syscall::{ServiceCapability,
-    PROCD_OP_THREAD_PLAN,
-    SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY,
-};
 use x86_64::VirtAddr;
 
 /// A task owns at most one futex wait, so one slot per scheduler task can
@@ -454,14 +450,6 @@ fn decode_wake_op(encoded: u32) -> Result<FutexWakeOp, i64> {
     })
 }
 
-fn current_process_is_syscalld_policy_owner() -> bool {
-    ipc_ops::current_process_has_service_capability(ServiceCapability::LinuxSyscallPolicy)
-}
-
-fn current_process_is_procd_policy_owner() -> bool {
-    ipc_ops::current_process_has_service_capability(ServiceCapability::ProcessPolicy)
-}
-
 /// Waits up to about 100 ms for the scheduler to have a task slot to give,
 /// kicking the housekeeping pass that returns exited tasks' slots.
 fn wait_for_task_slot() -> bool {
@@ -603,21 +591,11 @@ pub fn clone_linux_thread(
             tls,
         );
     }
-    if current_process_is_procd_policy_owner() {
-        if !valid_thread_plan_locally(flags, child_stack, tls) {
-            return clone_stage_failed(5, LINUX_EINVAL, flags);
-        }
-    } else {
-        let mut request = new_procd_request(PROCD_OP_THREAD_PLAN);
-        request.arg0 = flags;
-        request.arg1 = child_stack;
-        request.arg2 = parent_tid_ptr;
-        request.arg3 = child_tid_ptr;
-        request.arg4 = tls;
-        match call_procd(&request).and_then(|response| ensure_empty_procd_response(&response)) {
-            Ok(()) => {}
-            Err(errno) => return clone_stage_failed(1, errno, 0),
-        }
+    // The thread-plan check is a pure function of the clone arguments and the
+    // user VA range, both of which ring0 already owns for the mapping it is
+    // about to create. It used to cost a procd round trip per thread start.
+    if !valid_thread_plan_locally(flags, child_stack, tls) {
+        return clone_stage_failed(5, LINUX_EINVAL, flags);
     }
 
     // The tid words live in the new thread's stack block, which a concurrent
@@ -782,26 +760,28 @@ fn futex_wait(
         }
         multitask::cond_resched();
     }
-    let registration = retained.with_process_state(|process_state| {
-        let key = futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
-        // Linearization point: the retained process mapping is faulted/pinned
-        // by its state owner before the raw waiter lock. The atomic compare
-        // and waiter publication then occur in the same futex transaction, so
-        // a paired WAKE cannot pass between them.
-        let mut waiters = FUTEX_WAITERS.lock();
-        let actual = process_state
-            .address_space()
-            .atomic_load_user_u32(uaddr)
-            .map_err(user_pointer_error_to_linux_errno)?;
-        if actual != expected {
-            return Err(LINUX_EAGAIN);
-        }
-        waiters.insert(FutexWaiter {
-            key,
-            task_id,
-            bitset,
+    let registration = retained
+        .try_with_process_state(|process_state| {
+            let key = futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
+            // Linearization point: the retained process mapping is faulted/pinned
+            // by its state owner before the raw waiter lock. The atomic compare
+            // and waiter publication then occur in the same futex transaction, so
+            // a paired WAKE cannot pass between them.
+            let mut waiters = FUTEX_WAITERS.lock();
+            let actual = process_state
+                .address_space()
+                .atomic_load_user_u32(uaddr)
+                .map_err(user_pointer_error_to_linux_errno)?;
+            if actual != expected {
+                return Err(LINUX_EAGAIN);
+            }
+            waiters.insert(FutexWaiter {
+                key,
+                task_id,
+                bitset,
+            })
         })
-    });
+        .unwrap_or(Err(LINUX_EINTR));
     if let Err(errno) = registration {
         let _ = multitask::cancel_block_current_task();
         return Err(errno);
@@ -978,28 +958,32 @@ fn futex_cmp_requeue(
     // queue mutation. A user atomic store may race, but it is ordered either
     // before or after this load; no FUTEX_WAIT/WAKE/REQUEUE operation can slip
     // between the comparison and requeue commit.
-    let (wake_count, requeued) = retained.with_process_state(|process_state| {
-        let from_key = futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
-        let to_key = futex_key_for_process_state(process_state, address_space_root, uaddr2, op)?;
-        let mut waiters = FUTEX_WAITERS.lock();
-        let actual = process_state
-            .address_space()
-            .atomic_load_user_u32(uaddr)
-            .map_err(address_space_error_to_linux_errno)?;
-        // Linux compares the 32-bit futex word with `(u32)val3`; the upper
-        // register half of an `int` argument is not part of the ABI.
-        if actual != expected as u32 {
-            return Err(LINUX_EAGAIN);
-        }
-        Ok::<(usize, usize), i64>(waiters.select_requeue(
-            from_key,
-            to_key,
-            max_wake,
-            max_requeue,
-            linux_abi::FUTEX_BITSET_MATCH_ANY,
-            &mut task_ids,
-        ))
-    })?;
+    let (wake_count, requeued) = retained
+        .try_with_process_state(|process_state| {
+            let from_key =
+                futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
+            let to_key =
+                futex_key_for_process_state(process_state, address_space_root, uaddr2, op)?;
+            let mut waiters = FUTEX_WAITERS.lock();
+            let actual = process_state
+                .address_space()
+                .atomic_load_user_u32(uaddr)
+                .map_err(address_space_error_to_linux_errno)?;
+            // Linux compares the 32-bit futex word with `(u32)val3`; the upper
+            // register half of an `int` argument is not part of the ABI.
+            if actual != expected as u32 {
+                return Err(LINUX_EAGAIN);
+            }
+            Ok::<(usize, usize), i64>(waiters.select_requeue(
+                from_key,
+                to_key,
+                max_wake,
+                max_requeue,
+                linux_abi::FUTEX_BITSET_MATCH_ANY,
+                &mut task_ids,
+            ))
+        })
+        .ok_or(LINUX_EINTR)??;
     let woken = wake_selected_futex_tasks(&task_ids, wake_count);
     Ok((woken + requeued) as u64)
 }
@@ -1021,65 +1005,67 @@ fn futex_wake_op(
     let (_, address_space_root, retained) = current_futex_binding()?;
     let mut task_ids1 = [0_u64; FUTEX_WAITERS_CAPACITY];
     let mut task_ids2 = [0_u64; FUTEX_WAITERS_CAPACITY];
-    let (count1, count2) = retained.with_process_state(|process_state| {
-        let key1 = futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
-        let key2 = futex_key_for_process_state(process_state, address_space_root, uaddr2, op)?;
-        let mut waiters = FUTEX_WAITERS.lock();
-        let mut oldval = process_state
-            .address_space()
-            .atomic_load_user_u32(uaddr2)
-            .map_err(address_space_error_to_linux_errno)?;
-        loop {
-            let newval = match decoded.op {
-                0 => decoded.oparg as u32,
-                1 => oldval.wrapping_add(decoded.oparg as u32),
-                2 => oldval | (decoded.oparg as u32),
-                3 => oldval & !(decoded.oparg as u32),
-                _ => oldval ^ (decoded.oparg as u32),
-            };
-            match process_state
+    let (count1, count2) = retained
+        .try_with_process_state(|process_state| {
+            let key1 = futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
+            let key2 = futex_key_for_process_state(process_state, address_space_root, uaddr2, op)?;
+            let mut waiters = FUTEX_WAITERS.lock();
+            let mut oldval = process_state
                 .address_space()
-                .atomic_compare_exchange_user_u32(uaddr2, oldval, newval)
-                .map_err(address_space_error_to_linux_errno)?
-            {
-                Ok(_) => break,
-                Err(observed) => oldval = observed,
+                .atomic_load_user_u32(uaddr2)
+                .map_err(address_space_error_to_linux_errno)?;
+            loop {
+                let newval = match decoded.op {
+                    0 => decoded.oparg as u32,
+                    1 => oldval.wrapping_add(decoded.oparg as u32),
+                    2 => oldval | (decoded.oparg as u32),
+                    3 => oldval & !(decoded.oparg as u32),
+                    _ => oldval ^ (decoded.oparg as u32),
+                };
+                match process_state
+                    .address_space()
+                    .atomic_compare_exchange_user_u32(uaddr2, oldval, newval)
+                    .map_err(address_space_error_to_linux_errno)?
+                {
+                    Ok(_) => break,
+                    Err(observed) => oldval = observed,
+                }
             }
-        }
-        let cond = match decoded.cmp {
-            0 => (oldval as i32) == decoded.cmparg,
-            1 => (oldval as i32) != decoded.cmparg,
-            2 => (oldval as i32) < decoded.cmparg,
-            3 => (oldval as i32) <= decoded.cmparg,
-            4 => (oldval as i32) > decoded.cmparg,
-            _ => (oldval as i32) >= decoded.cmparg,
-        };
-        let count1 = waiters
-            .select_requeue(
-                key1,
-                key1,
-                max_wake1,
-                0,
-                linux_abi::FUTEX_BITSET_MATCH_ANY,
-                &mut task_ids1,
-            )
-            .0;
-        let count2 = if cond {
-            waiters
+            let cond = match decoded.cmp {
+                0 => (oldval as i32) == decoded.cmparg,
+                1 => (oldval as i32) != decoded.cmparg,
+                2 => (oldval as i32) < decoded.cmparg,
+                3 => (oldval as i32) <= decoded.cmparg,
+                4 => (oldval as i32) > decoded.cmparg,
+                _ => (oldval as i32) >= decoded.cmparg,
+            };
+            let count1 = waiters
                 .select_requeue(
-                    key2,
-                    key2,
-                    max_wake2,
+                    key1,
+                    key1,
+                    max_wake1,
                     0,
                     linux_abi::FUTEX_BITSET_MATCH_ANY,
-                    &mut task_ids2,
+                    &mut task_ids1,
                 )
-                .0
-        } else {
-            0
-        };
-        Ok::<(usize, usize), i64>((count1, count2))
-    })?;
+                .0;
+            let count2 = if cond {
+                waiters
+                    .select_requeue(
+                        key2,
+                        key2,
+                        max_wake2,
+                        0,
+                        linux_abi::FUTEX_BITSET_MATCH_ANY,
+                        &mut task_ids2,
+                    )
+                    .0
+            } else {
+                0
+            };
+            Ok::<(usize, usize), i64>((count1, count2))
+        })
+        .ok_or(LINUX_EINTR)??;
     let woken1 = wake_selected_futex_tasks(&task_ids1, count1);
     let woken2 = wake_selected_futex_tasks(&task_ids2, count2);
     Ok((woken1 + woken2) as u64)
@@ -1099,19 +1085,23 @@ fn futex_requeue_inner(
     let max_requeue = futex_int_count(max_requeue)?;
     let (_, address_space_root, retained) = current_futex_binding()?;
     let mut task_ids = [0_u64; FUTEX_WAITERS_CAPACITY];
-    let (wake_count, requeued) = retained.with_process_state(|process_state| {
-        let from_key = futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
-        let to_key = futex_key_for_process_state(process_state, address_space_root, uaddr2, op)?;
-        let mut waiters = FUTEX_WAITERS.lock();
-        Ok::<(usize, usize), i64>(waiters.select_requeue(
-            from_key,
-            to_key,
-            max_wake,
-            max_requeue,
-            linux_abi::FUTEX_BITSET_MATCH_ANY,
-            &mut task_ids,
-        ))
-    })?;
+    let (wake_count, requeued) = retained
+        .try_with_process_state(|process_state| {
+            let from_key =
+                futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
+            let to_key =
+                futex_key_for_process_state(process_state, address_space_root, uaddr2, op)?;
+            let mut waiters = FUTEX_WAITERS.lock();
+            Ok::<(usize, usize), i64>(waiters.select_requeue(
+                from_key,
+                to_key,
+                max_wake,
+                max_requeue,
+                linux_abi::FUTEX_BITSET_MATCH_ANY,
+                &mut task_ids,
+            ))
+        })
+        .ok_or(LINUX_EINTR)??;
     let woken = wake_selected_futex_tasks(&task_ids, wake_count);
     Ok((woken + requeued) as u64)
 }
@@ -1125,8 +1115,9 @@ fn current_futex_binding() -> Result<(u64, u64, multitask::RetainedCurrentUserAd
     }
     let retained =
         usermem::current_user_address_space().map_err(address_space_error_to_linux_errno)?;
-    let retained_root =
-        retained.with_address_space(|address_space| address_space.root_phys().as_u64());
+    let retained_root = retained
+        .try_with_address_space(|address_space| address_space.root_phys().as_u64())
+        .ok_or(LINUX_EINTR)?;
     assert_eq!(
         retained_root, address_space_root,
         "futex invariant: scheduler and retained process disagree on address-space root"
@@ -1203,9 +1194,11 @@ fn kernel_generated_futex_key_candidates(
 
 fn current_futex_waiter_context(uaddr: u64, op: u64) -> Result<(u64, FutexKey), i64> {
     let (task_id, address_space_root, retained) = current_futex_binding()?;
-    let key = retained.with_process_state(|process_state| {
-        futex_key_for_process_state(process_state, address_space_root, uaddr, op)
-    })?;
+    let key = retained
+        .try_with_process_state(|process_state| {
+            futex_key_for_process_state(process_state, address_space_root, uaddr, op)
+        })
+        .ok_or(LINUX_EINTR)??;
     Ok((task_id, key))
 }
 
@@ -1563,19 +1556,9 @@ pub fn cleanup_linux_thread_exit() {
 // syscalld/procd own Linux thread metadata admission policy. Ring0 keeps
 // FS-base mutation and clear_child_tid substrate.
 pub fn syscall_linux_arch_prctl(_code: u64, _arg: u64) -> u64 {
-    if current_process_is_syscalld_policy_owner() {
-        if !valid_arch_prctl_locally(_code, _arg) {
-            return linux_errno(LINUX_EINVAL);
-        }
-    } else {
-        let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY);
-        request.arg0 = _code;
-        request.arg1 = _arg;
-        match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response))
-        {
-            Ok(()) => {}
-            Err(errno) => return linux_errno(errno),
-        }
+    // Pure range check on the code and the user VA bound; no service state.
+    if !valid_arch_prctl_locally(_code, _arg) {
+        return linux_errno(LINUX_EINVAL);
     }
     match _code {
         linux_abi::ARCH_SET_FS => {
@@ -1692,44 +1675,29 @@ pub fn syscall_linux_set_robust_list(head_ptr: u64, len: u64) -> u64 {
     {
         return linux_errno(LINUX_EFAULT);
     }
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_SET_ROBUST_LIST);
-    request.arg0 = head_ptr;
-    request.arg1 = len;
-    match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response)) {
-        Ok(()) => {
-            let updated =
-                multitask::with_current_user_linux_state_mut(|_, _, abi, _, _, thread_state| {
-                    if abi != crate::user::abi::UserAbi::Linux {
-                        return false;
-                    }
-                    let Some(state) = thread_state.as_mut() else {
-                        return false;
-                    };
-                    state.robust_list_head = head_ptr;
-                    state.robust_list_len = len;
-                    true
-                })
-                .unwrap_or(false);
-            if updated {
-                0
-            } else {
-                linux_errno(LINUX_ENOSYS)
-            }
+    // The thread's robust-list head lives only in `thread_state`, which
+    // `get_robust_list`, exit cleanup and fork read; the syscalld mirror it
+    // used to update was never consulted, so no round trip is needed.
+    let updated = multitask::with_current_user_linux_state_mut(|_, _, abi, _, _, thread_state| {
+        if abi != crate::user::abi::UserAbi::Linux {
+            return false;
         }
-        Err(errno) => linux_errno(errno),
+        let Some(state) = thread_state.as_mut() else {
+            return false;
+        };
+        state.robust_list_head = head_ptr;
+        state.robust_list_len = len;
+        true
+    })
+    .unwrap_or(false);
+    if updated {
+        0
+    } else {
+        linux_errno(LINUX_ENOSYS)
     }
 }
 
 pub fn syscall_linux_get_robust_list(pid: u64, head_ptr_ptr: u64, len_ptr: u64) -> u64 {
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_GET_ROBUST_LIST);
-    request.arg0 = pid;
-    let response = match call_syscalld(request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_syscalld_payload(&response, 16) {
-        return linux_errno(errno);
-    }
     let Some(current_process_id) = multitask::current_user_process_id() else {
         return linux_errno(LINUX_ENOSYS);
     };
@@ -1753,16 +1721,12 @@ pub fn syscall_linux_get_robust_list(pid: u64, head_ptr_ptr: u64, len_ptr: u64) 
     0
 }
 
-pub fn syscall_linux_rseq(area_ptr: u64, len: u64, flags: u64, signature: u64) -> u64 {
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_RSEQ);
-    request.arg0 = area_ptr;
-    request.arg1 = len;
-    request.arg2 = flags;
-    request.arg3 = signature;
-    match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response)) {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+/// rseq is not implemented: `ENOSYS` is the documented "unsupported" answer and
+/// makes libc fall back to its non-rseq paths. syscalld used to be asked and
+/// always answered `ENOSYS` without reading the request, one round trip per
+/// thread start.
+pub fn syscall_linux_rseq(_area_ptr: u64, _len: u64, _flags: u64, _signature: u64) -> u64 {
+    linux_errno(LINUX_ENOSYS)
 }
 
 #[cfg(test)]

@@ -49,7 +49,7 @@ use crate::canvas::Rect;
 use crate::input_loop::UiWakeSender;
 use crate::layout::{
     self, clamp_wayland_frame, wayland_client_size_for_buffer, wayland_max_client_size,
-    WINDOW_BORDER, WINDOW_TITLE_HEIGHT,
+    window_border, window_title_height,
 };
 use crate::sys::{
     diag_line, spawn_ui_thread, ui_profile_enabled, InputEvent, UiThreadRole, INPUT_ACTION_PRESSED,
@@ -79,7 +79,7 @@ use self::buffer::*;
 use self::commit::CommitSlot;
 use self::data_device::{DataDeviceResource, DragState, Selection};
 use self::snapshot::{SnapshotLayout, SnapshotPixels, SnapshotService, SnapshotSpec};
-use self::viewport::ViewportState;
+use self::viewport::{map_buffer_for_output, ViewportState};
 
 use rustos_user_abi::desktop_session::{RuntimeDir, WAYLAND_SOCKET_NAME};
 const LINUX_BTN_LEFT: u32 = 0x110;
@@ -636,6 +636,15 @@ impl WaylandCompositor {
     pub(crate) fn clear_focus(&mut self) {
         self.state.clear_focus();
     }
+
+    /// Dynamically updates the Wayland output scale and re-notifies clients.
+    pub(crate) fn set_output_scale(&mut self, output_scale: i32) -> bool {
+        let changed = self.state.set_output_scale(output_scale);
+        if changed {
+            let _ = self.display.flush_clients();
+        }
+        changed
+    }
 }
 
 /// Decode one validated Wayland shm row. RustOS' supported architecture is
@@ -910,6 +919,18 @@ fn surface_damage_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> 
     })
 }
 
+fn scale_damage_rect(damage: Rect, scale: usize) -> Rect {
+    if damage.is_empty() || scale <= 1 {
+        return damage;
+    }
+    Rect {
+        x: damage.x.saturating_mul(scale),
+        y: damage.y.saturating_mul(scale),
+        width: damage.width.saturating_mul(scale),
+        height: damage.height.saturating_mul(scale),
+    }
+}
+
 fn linux_pointer_button_code(button: u32) -> Option<u32> {
     Some(match button {
         crate::sys::POINTER_BUTTON_LEFT => LINUX_BTN_LEFT,
@@ -1117,6 +1138,7 @@ impl Drop for LiveObjectTicket {
 struct WaylandState {
     display_width: u32,
     display_height: u32,
+    output_scale: i32,
     next_serial: u32,
     /// Next compositor-unique surface identity. Protocol object ids are
     /// per-client, so two clients routinely own the same `wl_surface` id.
@@ -1238,7 +1260,10 @@ struct WaylandSurfaceState {
     decoration_configures: Vec<(u32, bool)>,
     pending_buffer: Option<Option<BufferAttachment>>,
     current_buffer: Option<BufferData>,
-    pending_damage: Rect,
+    /// Pending `wl_surface.damage` in surface-local logical coordinates.
+    pending_surface_damage: Rect,
+    /// Pending `wl_surface.damage_buffer` in buffer pixel coordinates.
+    pending_buffer_damage: Rect,
     last_damage: Rect,
     pending_callbacks: Vec<PendingFrameCallback>,
     pending_buffer_releases: Vec<wl_buffer::WlBuffer>,

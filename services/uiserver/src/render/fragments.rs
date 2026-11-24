@@ -1,12 +1,12 @@
 //! Occlusion is source selection, not CPU composition: every fragment still
 //! samples exactly one independently rasterized layer, in original draw order.
 use super::{
-    chrome, gpu_window_draw_plan, render_dock_gpu_texture, render_wayland_gpu_texture,
-    taskbar_dirty_rect, wayland_window_client_rect_for, wayland_window_outer_rect, GpuAtlasScene,
-    PlannedWindow,
+    CroppedWaylandBinding, GpuAtlasScene, PlannedWindow, chrome, gpu_window_draw_plan,
+    render_dock_gpu_texture, render_wayland_gpu_texture, taskbar_dirty_rect,
+    wayland_window_client_rect_for, wayland_window_outer_rect,
 };
 use crate::app::AppState;
-use crate::canvas::{render_cursor_bgra, Rect, CURSOR_TEXTURE_SIZE};
+use crate::canvas::{CURSOR_TEXTURE_SIZE, Rect, render_cursor_bgra};
 use crate::gpu_scene::{
     GpuAtlasPacker, GpuLayerKind, GpuLayerTransform, GpuSceneError, GpuSceneLayer,
     GpuTextureCapability, GpuTextureRegion,
@@ -240,8 +240,8 @@ pub(super) fn write_fragment_layer(
 /// Keep titles, outlines and rounded corners out of the occlusion proof. The
 /// alpha mask is opaque in this interior band, for consoles and Wayland alike.
 fn opaque_window_interior(outer: Rect) -> Rect {
-    let inset = crate::layout::WINDOW_RADIUS;
-    let top = crate::layout::WINDOW_TITLE_HEIGHT + inset;
+    let inset = crate::layout::window_radius();
+    let top = crate::layout::window_title_height() + inset;
     Rect {
         x: outer.x + inset,
         y: outer.y + top,
@@ -296,7 +296,11 @@ fn opaque_wayland_interior(window: &WaylandWindowSnapshot) -> Rect {
     let client = wayland_window_client_rect_for(window, wayland_window_outer_rect(window));
     let width = window.width.min(client.width);
     let height = window.height.min(client.height);
-    wayland_opaque_rect(window, client, wayland_pixels_are_opaque(window, width, height))
+    wayland_opaque_rect(
+        window,
+        client,
+        wayland_pixels_are_opaque(window, width, height),
+    )
 }
 
 fn cached_opaque_wayland_interior(
@@ -327,7 +331,10 @@ fn cached_opaque_wayland_interior(
         stride_pixels: window.stride_pixels,
         pixels_opaque,
     };
-    if let Some(slot) = cache.iter_mut().find(|entry| entry.surface_id == window.surface_id) {
+    if let Some(slot) = cache
+        .iter_mut()
+        .find(|entry| entry.surface_id == window.surface_id)
+    {
         *slot = new_entry;
     } else {
         cache.push(new_entry);
@@ -490,6 +497,33 @@ pub(super) fn build_cropped_gpu_atlas_scene(
             true,
         )?;
     }
+    let mut cropped_reusable = true;
+    let mut cropped_wayland_bindings = Vec::new();
+    for (plan_index, planned) in plan.iter().enumerate() {
+        let layer_fragments: Vec<(Rect, Rect)> = fragments
+            .iter()
+            .zip(regions.iter())
+            .filter(|(fragment, _)| fragment.layer_index == plan_index + 1)
+            .map(|(fragment, region)| (fragment.source, *region))
+            .collect();
+        if layer_fragments.is_empty() {
+            continue;
+        }
+        match *planned {
+            PlannedWindow::Wayland { index, focused } => {
+                let window = &state.wayland_windows[index];
+                cropped_wayland_bindings.push(CroppedWaylandBinding {
+                    surface_id: window.surface_id,
+                    content_version: window.content_version,
+                    outer: wayland_window_outer_rect(window),
+                    focused,
+                    pixels_opaque: !inputs[plan_index + 1].opaque.is_empty(),
+                    fragments: layer_fragments,
+                });
+            }
+            PlannedWindow::Console { .. } => cropped_reusable = false,
+        }
+    }
     let layers = fragments
         .iter()
         .zip(regions)
@@ -510,6 +544,8 @@ pub(super) fn build_cropped_gpu_atlas_scene(
         cursor_source_rect,
         wayland_bindings: Vec::new(),
         console_bindings: Vec::new(),
+        cropped_wayland_bindings,
+        cropped_reusable,
         cropped: true,
     })
 }

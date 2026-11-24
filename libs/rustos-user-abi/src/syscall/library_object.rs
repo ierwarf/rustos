@@ -18,6 +18,25 @@ pub const LIBRARY_OBJECT_MAX_PAGES: u64 = 1024;
 /// Backing namespace stamped into every VMA that maps a library object.
 pub const LIBRARY_OBJECT_BACKING_NAMESPACE: u64 = crate::syscall::IPC_SERVICE_PAGERD;
 
+/// `MM_BROKER_OP_BIND_LIBRARY` request flag (in `RustosMmBrokerArgs::flags`):
+/// the mapping that follows is a large private file mapping, and `len` names its
+/// length. When no pager-warmed object matches the attested file, ring0 may then
+/// create a *demand object* for the exact vfsd-attested immutable file, fill it
+/// page by page from vfsd as mappings need those pages, and serve this and every
+/// later private mapping of the same file by aliasing the resident frames
+/// copy-on-write. Whether a mapping is large enough to be worth it is syscalld
+/// policy (`library_demand_candidate`); ring0 only enforces the mechanical caps
+/// below. Without the flag the bind never creates an object.
+pub const MM_BROKER_BIND_FLAG_DEMAND: u32 = 1 << 0;
+/// Largest file (in pages) a demand object may describe: 512 MiB.
+pub const LIBRARY_DEMAND_MAX_OBJECT_PAGES: u64 = 131_072;
+/// Pages that demand objects may hold resident at once (256 MiB). Beyond it the
+/// least recently used demand object is retired; existing mappings keep their
+/// own frame references.
+pub const LIBRARY_DEMAND_MAX_RESIDENT_PAGES: u64 = 65_536;
+/// Demand objects that may exist at once.
+pub const LIBRARY_DEMAND_MAX_OBJECTS: usize = 32;
+
 /// CREATE registers an identity and reserves `identity.len` bytes of pages.
 /// Returns the object handle (`generation << 16 | slot`).
 pub const LIBRARY_OBJECT_OP_CREATE: u16 = 1;

@@ -23,7 +23,8 @@
 //! - **Evidence:** `vfs-open-description`, `userspace-wait-set`.
 use alloc::vec::Vec;
 use kernel_ps::api::{
-    EventFdError, EventFdHandle, LocalRelease, PipeCapacityError, PipeError, PipeHandle, PipeReadError, PipeRole,
+    EventFdError, EventFdHandle, LocalRelease, PipeCapacityError, PipeError, PipeHandle,
+    PipeReadError, PipeRole, UnixSocketHandle,
 };
 
 use super::*;
@@ -48,6 +49,7 @@ const FIONREAD_RESULT_BYTES: usize = 4;
 pub(in crate::user::syscall::linux) enum LocalFd {
     Pipe(PipeHandle),
     EventFd(EventFdHandle),
+    UnixSocket(UnixSocketHandle),
 }
 
 impl Drop for LocalFd {
@@ -55,6 +57,9 @@ impl Drop for LocalFd {
         match self {
             Self::Pipe(pipe) => release_pipe(pipe, true),
             Self::EventFd(eventfd) => release_eventfd(eventfd, true),
+            Self::UnixSocket(sock) => {
+                release_service_handle_refs_bounded(&[ServiceHandleRef::UnixSocket(sock.clone())]);
+            }
         }
     }
 }
@@ -64,6 +69,7 @@ impl LocalFd {
         match self {
             Self::Pipe(pipe) => pipe.status_flags(),
             Self::EventFd(eventfd) => eventfd.status_flags(),
+            Self::UnixSocket(sock) => sock.status_flags(),
         }
     }
 
@@ -71,6 +77,7 @@ impl LocalFd {
         match self {
             Self::Pipe(pipe) => pipe.set_nonblocking(value),
             Self::EventFd(eventfd) => eventfd.set_nonblocking(value),
+            Self::UnixSocket(sock) => sock.set_nonblocking(value),
         }
     }
 }
@@ -87,6 +94,11 @@ pub(in crate::user::syscall::linux) fn current_local_fd(fd: u64) -> Option<Local
                 if eventfd.try_acquire_descriptor_reference() =>
             {
                 Some(LocalFd::EventFd(eventfd.clone()))
+            }
+            Some(multitask::KernelHandle::UnixSocket(sock))
+                if sock.try_acquire_descriptor_reference() =>
+            {
+                Some(LocalFd::UnixSocket(sock.clone()))
             }
             _ => None,
         }
@@ -115,16 +127,17 @@ pub(super) fn release_eventfd(eventfd: &EventFdHandle, bounded: bool) {
     );
 }
 
-fn settle_release(release: LocalRelease, epoll_registered: bool, token: u64, bounded: bool) {
+pub(super) fn settle_release(
+    release: LocalRelease,
+    epoll_registered: bool,
+    token: u64,
+    _bounded: bool,
+) {
     publish(release.wake);
     if release.last && epoll_registered {
         // Linux drops an object's epoll interests when its last descriptor
-        // closes; vfsd keeps them keyed by (fd, provider, object).
-        let _ = if bounded {
-            purge_vfs_epoll_object_bounded(WAITSET_PROVIDER_KERNEL, token)
-        } else {
-            purge_vfs_epoll_object(WAITSET_PROVIDER_KERNEL, token)
-        };
+        // closes; the kernel epoll registry keeps them keyed by (fd, provider, object).
+        purge_kernel_epoll_object(WAITSET_PROVIDER_KERNEL, token);
     }
 }
 
@@ -377,6 +390,7 @@ pub(in crate::user::syscall::linux) fn read(fd: u64, user_ptr: u64, user_len: u6
     Some(match &local {
         LocalFd::Pipe(pipe) => pipe_read(pipe, user_ptr, user_len),
         LocalFd::EventFd(eventfd) => eventfd_read(eventfd, user_ptr, user_len),
+        LocalFd::UnixSocket(sock) => super::local_unix::read_unix_socket(sock, user_ptr, user_len),
     })
 }
 
@@ -386,6 +400,7 @@ pub(in crate::user::syscall::linux) fn write(fd: u64, user_ptr: u64, user_len: u
     Some(match &local {
         LocalFd::Pipe(pipe) => pipe_write(pipe, user_ptr, user_len),
         LocalFd::EventFd(eventfd) => eventfd_write(eventfd, user_ptr, user_len),
+        LocalFd::UnixSocket(sock) => super::local_unix::write_unix_socket(sock, user_ptr, user_len),
     })
 }
 
@@ -658,7 +673,7 @@ pub(in crate::user::syscall::linux) fn fcntl(local: &LocalFd, cmd: u64, arg: u64
         }
         linux_abi::F_GETPIPE_SZ => Some(match local {
             LocalFd::Pipe(pipe) => pipe.shared().capacity() as u64,
-            LocalFd::EventFd(_) => linux_errno(LINUX_EBADF),
+            LocalFd::EventFd(_) | LocalFd::UnixSocket(_) => linux_errno(LINUX_EBADF),
         }),
         linux_abi::F_SETPIPE_SZ => Some(match local {
             LocalFd::Pipe(pipe) => {
@@ -677,7 +692,7 @@ pub(in crate::user::syscall::linux) fn fcntl(local: &LocalFd, cmd: u64, arg: u64
                     Err(PipeCapacityError::Busy) => linux_errno(LINUX_EBUSY),
                 }
             }
-            LocalFd::EventFd(_) => linux_errno(LINUX_EBADF),
+            LocalFd::EventFd(_) | LocalFd::UnixSocket(_) => linux_errno(LINUX_EBADF),
         }),
         _ => Some(linux_errno(LINUX_EINVAL)),
     }
@@ -688,6 +703,13 @@ pub(in crate::user::syscall::linux) fn ioctl(local: &LocalFd, request: u64, arg:
         linux_abi::FIONREAD => match local {
             LocalFd::Pipe(pipe) => {
                 let available = pipe.shared().bytes_available() as u32;
+                match usermem::write_current_user_bytes(arg, &available.to_ne_bytes()) {
+                    Ok(()) => 0,
+                    Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
+                }
+            }
+            LocalFd::UnixSocket(sock) => {
+                let available = sock.bytes_available() as u32;
                 match usermem::write_current_user_bytes(arg, &available.to_ne_bytes()) {
                     Ok(()) => 0,
                     Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
@@ -753,6 +775,7 @@ pub(in crate::user::syscall::linux) fn waitset_object(
     match handle {
         multitask::KernelHandle::Pipe(pipe) => Some(pipe.token_id()),
         multitask::KernelHandle::EventFd(eventfd) => Some(eventfd.token_id()),
+        multitask::KernelHandle::UnixSocket(sock) => Some(sock.token_id()),
         _ => None,
     }
 }
@@ -763,6 +786,7 @@ pub(in crate::user::syscall::linux) fn note_epoll_registered(handle: &multitask:
     match handle {
         multitask::KernelHandle::Pipe(pipe) => pipe.mark_epoll_registered(),
         multitask::KernelHandle::EventFd(eventfd) => eventfd.mark_epoll_registered(),
+        multitask::KernelHandle::UnixSocket(sock) => sock.mark_epoll_registered(),
         _ => {}
     }
 }

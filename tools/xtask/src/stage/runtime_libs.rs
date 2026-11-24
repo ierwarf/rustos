@@ -354,6 +354,15 @@ pub(super) fn stage_prebuilt_app_runtime_libraries(
         // Qt loads these via its plugin directories, not Chrome's DT_NEEDED.
         // Admit each as an explicit relocation root before final cache checks.
         apps.extend(stage_qt_wayland_plugins(&config.image_dir, &source)?);
+        // libnss3 dlopens its softoken module (and softoken dlopens freebl) at
+        // NSS_Init; neither is a DT_NEEDED of anything, so the closure alone
+        // omits them and Chrome aborts with `libsoftokn3.so: cannot open`.
+        apps.extend(stage_dlopen_roots(
+            &config.image_dir,
+            &source,
+            &nss_dlopen_roots()?,
+            "NSS module",
+        )?);
         let xkb = Path::new("/usr/share/X11/xkb");
         let from = image_path(&source, xkb)?;
         let to = image_path(&config.image_dir, xkb)?;
@@ -376,21 +385,40 @@ fn qt_wayland_plugin_roots() -> Result<Vec<PathBuf>> {
 }
 
 fn stage_qt_wayland_plugins(image: &Path, source: &Path) -> Result<Vec<PathBuf>> {
-    let roots = qt_wayland_plugin_roots()?;
+    stage_dlopen_roots(image, source, &qt_wayland_plugin_roots()?, "Qt Wayland plugin")
+}
+
+/// Shared libraries that Chrome's dependencies load with `dlopen`, so no
+/// DT_NEEDED edge reaches them.
+const NSS_DLOPEN_MODULES: &[&str] = &["libsoftokn3.so", "libfreeblpriv3.so", "libfreebl3.so", "libnssckbi.so"];
+
+fn nss_dlopen_roots() -> Result<Vec<PathBuf>> {
+    NSS_DLOPEN_MODULES
+        .iter()
+        .map(|name| safe_virtual(&Path::new("/usr/lib/x86_64-linux-gnu").join(name)))
+        .collect()
+}
+
+fn stage_dlopen_roots(
+    image: &Path,
+    source: &Path,
+    roots: &[PathBuf],
+    what: &str,
+) -> Result<Vec<PathBuf>> {
     let canonical_source = fs::canonicalize(source)?;
-    for virt in &roots {
+    for virt in roots {
         let src = fs::canonicalize(image_path(source, virt)?)
-            .with_context(|| format!("missing pinned Qt Wayland plugin {}", virt.display()))?;
-        ensure!(src.starts_with(&canonical_source), "Qt Wayland plugin escapes provisioned root");
+            .with_context(|| format!("missing pinned {what} {}", virt.display()))?;
+        ensure!(src.starts_with(&canonical_source), "{what} escapes provisioned root");
         let info = inspect(&src)?;
         ensure!(info.object_type == 3 && info.dynamic && info.interp.is_none(),
-            "Qt Wayland plugin is not an ELF shared library: {}", virt.display());
+            "{what} is not an ELF shared library: {}", virt.display());
         let dest = image_path(image, virt)?;
-        ensure!(!dest.exists(), "refusing to overwrite Qt Wayland plugin {}", dest.display());
-        fs::create_dir_all(dest.parent().context("Qt Wayland plugin has no parent")?)?;
+        ensure!(!dest.exists(), "refusing to overwrite {what} {}", dest.display());
+        fs::create_dir_all(dest.parent().with_context(|| format!("{what} has no parent"))?)?;
         fs::copy(src, dest)?;
     }
-    Ok(roots)
+    Ok(roots.to_vec())
 }
 
 fn resolve_closures(image: &Path, source: &Path, apps: &[PathBuf]) -> Result<()> {
@@ -539,7 +567,8 @@ pub(super) fn verify_relocations(image: &Path, apps: &[PathBuf]) -> Result<Vec<s
     fs::copy(&loader, &copy).context("copy image loader for relocation check")?;
     fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755))?;
     let mut uses = Vec::new();
-    let qt_wayland = qt_wayland_plugin_roots()?;
+    let mut dlopen_roots = qt_wayland_plugin_roots()?;
+    dlopen_roots.extend(nss_dlopen_roots()?);
     for app in apps {
         let info = inspect(&image_path(image, app)?)?;
         let interpreter = info.interp.as_deref().unwrap_or(LOADER);
@@ -583,7 +612,7 @@ pub(super) fn verify_relocations(image: &Path, apps: &[PathBuf]) -> Result<Vec<s
             stderr
         );
         // A dlopen root is still part of Chrome, not an additional prewarm consumer.
-        let application = if qt_wayland.contains(app) { Path::new("/apps/chrome/chrome") } else { app };
+        let application = if dlopen_roots.contains(app) { Path::new("/apps/chrome/chrome") } else { app };
         uses.extend(verify_baseline_resolution(image, &stdout, &baseline)?.into_iter()
             .map(|(requested, path)| super::library_cache::LibraryUse {
                 application: application.to_owned(), path, requested,

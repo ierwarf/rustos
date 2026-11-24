@@ -91,6 +91,23 @@ pub fn cancel_shared_alias(ticket: SharedAliasTicket) {
     FRAME_DESCRIPTORS.cancel_shared_alias(ticket);
 }
 
+pub fn prepare_shared_alias_run(
+    owner_root: u64,
+    new_root: u64,
+    requests: &[SharedAliasRequest],
+    tickets_out: &mut [SharedAliasTicket],
+) -> Result<(), SharedAliasRunError> {
+    FRAME_DESCRIPTORS.prepare_shared_alias_run(owner_root, new_root, requests, tickets_out)
+}
+
+pub fn publish_shared_alias_run(tickets: &[SharedAliasTicket]) {
+    FRAME_DESCRIPTORS.publish_shared_alias_run(tickets);
+}
+
+pub fn cancel_shared_alias_run(tickets: &[SharedAliasTicket]) {
+    FRAME_DESCRIPTORS.cancel_shared_alias_run(tickets);
+}
+
 pub fn rollback_shared_alias(ticket: SharedAliasTicket) -> bool {
     FRAME_DESCRIPTORS.rollback_shared_alias(ticket)
 }

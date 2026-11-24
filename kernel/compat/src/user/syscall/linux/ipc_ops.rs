@@ -1694,6 +1694,15 @@ impl<const N: usize> FastCallResponse<N> {
             None => &self.bytes[..self.len],
         }
     }
+
+    /// Moves a spilled response out without a copy; an inline one is copied
+    /// once into an exact-length vector.
+    fn into_vec(self) -> Vec<u8> {
+        match self.spill {
+            Some(spill) => spill,
+            None => self.bytes[..self.len].to_vec(),
+        }
+    }
 }
 
 fn try_fast_ipc_call_bytes<const N: usize>(
@@ -3426,9 +3435,29 @@ fn call_service_endpoint_with_timeout(
 ) -> Result<Vec<u8>, i64> {
     let endpoint = service_endpoint(service_id).ok_or(LINUX_ENOSYS)?;
     let start_ticks = crate::arch::rtc::ticks();
+    // One absolute end for the whole call, fixed before transport selection so
+    // neither the rendezvous attempt nor its queued fallback renews it.
+    let reply_deadline = service_reply_deadline_tick_for_service(service_id, request, timeout_ms);
+    if let Some(response) =
+        try_service_rendezvous_call(service_id, endpoint, request, reply_deadline, timeout_ms)?
+    {
+        let reply_ticks = crate::arch::rtc::ticks();
+        log_slow_ipc_call(
+            "service",
+            endpoint.raw(),
+            start_ticks,
+            start_ticks,
+            start_ticks,
+            start_ticks,
+            reply_ticks,
+            reply_ticks,
+            request.len(),
+            response.len(),
+        );
+        return Ok(response);
+    }
     let reply = enqueue_call_and_wake(endpoint, request)?;
     let send_ticks = crate::arch::rtc::ticks();
-    let reply_deadline = service_reply_deadline_tick_for_service(service_id, request, timeout_ms);
     let response = wait_for_service_reply_with_deadline_tick(reply, reply_deadline, timeout_ms)?;
     let reply_ticks = crate::arch::rtc::ticks();
     log_slow_ipc_call(
@@ -3444,6 +3473,108 @@ fn call_service_endpoint_with_timeout(
         response.len(),
     );
     Ok(response)
+}
+
+/// Services whose receive loops reply from the thread that received the
+/// request. A rendezvous frame is pinned to that exact receiver task: a reply
+/// from any other thread of the service is `PermissionDenied`, where the queued
+/// transport accepts any thread of the receiving process. Only services
+/// audited to reply on their receive thread are admitted; a service that hands
+/// its reply capability to a worker (devmgrd's ioctl workers) keeps the queued
+/// transport until it is converted.
+const fn service_replies_on_receive_thread(service_id: u64) -> bool {
+    matches!(
+        service_id,
+        linux_abi::IPC_SERVICE_VFSD
+            | linux_abi::IPC_SERVICE_PROCD
+            | linux_abi::IPC_SERVICE_LOADERD
+    )
+}
+
+/// Whether a byte-only service call may use the rendezvous transport.
+///
+/// The queued transport allocates a request message, wakes the receiver through
+/// the ordinary wake path (an IPI to its last CPU, which is usually halted),
+/// and wakes the caller back the same way. The rendezvous transport binds the
+/// request to the exact parked receiver and switches to it on the caller's CPU,
+/// and the reply switches back at the server's next boundary. It needs a
+/// non-empty request that fits the fast frame, and a caller that holds no raw
+/// lock: the queued path returns `ENOSPC` for that, the rendezvous commit
+/// would panic, so such a caller must reach the queued path's refusal.
+const fn service_rendezvous_shape_admits(
+    request_len: usize,
+    preemption_disabled: bool,
+    held_spin_lock_depth: usize,
+) -> bool {
+    request_len != 0
+        && request_len <= kernel_ipc_runtime::api::IPC_FAST_MAX_BYTES
+        && !preemption_disabled
+        && held_spin_lock_depth == 0
+}
+
+/// Tries the byte-only rendezvous transport for a kernel-originated service
+/// call from a user task. `Ok(None)` means nothing was published and the caller
+/// must use the queued transport with the same deadline: no parked receiver at
+/// the front of an otherwise idle endpoint, a receive buffer smaller than the
+/// request, or a refused scheduler handoff.
+///
+/// Every service reply is bounded by the maximum inline message, so the
+/// response capacity is that maximum rather than a per-service guess; a larger
+/// reply would have been refused by the queued transport as well.
+fn try_service_rendezvous_call(
+    service_id: u64,
+    endpoint: KernelEndpointHandle,
+    request: &[u8],
+    deadline_tick: u64,
+    timeout_ms: u64,
+) -> Result<Option<Vec<u8>>, i64> {
+    if !service_replies_on_receive_thread(service_id) {
+        return Ok(None);
+    }
+    if !service_rendezvous_shape_admits(
+        request.len(),
+        nucleus_core::util::lockdep::preemption_disabled(),
+        nucleus_core::util::lockdep::held_spin_lock_depth(),
+    ) {
+        return Ok(None);
+    }
+    // Kernel tasks have no user identity; only a user task's syscall context
+    // owns the scheduling-context custody the rendezvous commit requires.
+    let Some((caller_process_id, caller_task_id)) = multitask::current_user_log_ids() else {
+        return Ok(None);
+    };
+    note_fast_ipc(IpcFastCounter::AdmissionAttempt);
+    match try_fast_ipc_call_bytes::<{ kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES }>(
+        endpoint,
+        caller_process_id,
+        caller_task_id,
+        request,
+        kernel_ipc_runtime::api::IPC_FAST_MAX_BYTES,
+        deadline_tick,
+        None,
+    ) {
+        Ok(Some(response)) => Ok(Some(response.into_vec())),
+        Ok(None) => {
+            note_fast_ipc(IpcFastCounter::AdmissionFallback);
+            Ok(None)
+        }
+        Err(errno) => {
+            if errno == LINUX_ETIMEDOUT {
+                // Same attribution the queued wait records for a missed deadline.
+                // ORDERING: Relaxed is exact; diagnostics only.
+                let total = SERVICE_REPLY_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
+                if total <= EARLY_SERVICE_REPLY_TIMEOUT_SAMPLES || total.is_power_of_two() {
+                    nucleus_core::debug::record_milestone(
+                        nucleus_core::debug::LogCategory::Compat,
+                        "ipc-service-reply-timeout",
+                        endpoint.raw(),
+                        ((timeout_ms & 0xffff_ffff) << 32) | errno.unsigned_abs(),
+                    );
+                }
+            }
+            Err(errno)
+        }
+    }
 }
 
 pub(super) fn call_service_endpoint_with_received_entries(

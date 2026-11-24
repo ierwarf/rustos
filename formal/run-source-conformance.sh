@@ -2298,6 +2298,8 @@ service-mutation-recovery/ServiceMutationRecovery|rootd|tests::service_lookup_us
 service-mutation-recovery/ServiceMutationRecovery|vfsd|tests::checkpoint_wire_rejects_unknown_or_noncanonical_state
 vfs-open-description-recovery/VfsOpenDescriptionRecovery|vfsd|tests::open_description_wire_is_one_checkpoint_value_and_strictly_bounded
 vfs-open-description-recovery/VfsOpenDescriptionRecovery|vfsd|tests::seek_position_never_wraps_signed_linux_off_t
+vfs-open-description-recovery/VfsOpenDescriptionRecovery|rustos-user-abi|syscall::syscall_tests::vfs_cursor_sync_constants_are_distinct_and_nonzero
+vfs-open-description-recovery/VfsOpenDescriptionRecovery|kernel-ps|user::handles::table::tests::remote_vfs_cursor_shared_across_dup_and_transfer_but_not_fresh_open
 vfs-open-description-recovery/VfsOpenDescriptionRecovery|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::remote_vfs_refs_are_local_and_provider_close_is_final_only
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::exit_service_refs_come_from_the_exact_closed_handle_set
 userspace-wait-set/UserspaceWaitSet|inputd|tests::readiness_generation_closes_empty_queue_lost_wake_window
@@ -2343,7 +2345,7 @@ dvm-gpu-compositor/DvmGpuCompositor|driver-domain-protocol|tests::gpu_timeline_r
 dvm-gpu-compositor/DvmGpuCompositor|driver-domain-protocol|tests::gpu_timeline_is_monotonic_bounded_and_reset_by_epoch
 dvm-gpu-compositor/DvmGpuCompositor|uiserver|gpu_scene::tests::scene_compiler_normalizes_atlas_subrect_and_rejects_escape
 dvm-gpu-compositor/DvmGpuCompositor|uiserver|gpu_runtime::tests::slot_reconstruction_budget_rejects_atlas_amplification
-dvm-gpu-compositor/DvmGpuCompositor|uiserver|gpu_runtime::tests::frame_deadline_skips_missed_slots_without_drift_or_burst
+dvm-gpu-compositor/DvmGpuCompositor|uiserver|gpu_runtime::tests::frame_deadline_is_spacing_from_submission_not_a_phase_grid
 dvm-gpu-compositor/DvmGpuCompositor|uiserver|gpu_runtime::tests::completion_timeout_separates_activation_from_steady_state
 dvm-gpu-admission/DvmGpuAdmission|uiserver|gpu_runtime::tests::completion_timeout_separates_activation_from_steady_state
 msi-vector-lifecycle/MsiVectorLifecycle|kernel-hal|arch::msi::tests::unallocated_vector_has_no_registration_authority
@@ -2828,7 +2830,7 @@ ivshmem-pairing/IvshmemPairing|rustos-driver-domain-host|tests::control_secret_a
 network-payload-session/NetworkPayloadSession|driver-domain-protocol|tests::dvm_ethernet_payload_accepts_only_bounded_ipv4_or_arp
 post-init-supervisor-recovery/PostInitSupervisorRecovery|rootd|tests::reporter_exit_cascades_and_capability_requires_live_reporter_chain|host-test
 trusted-ui-boundary/TrustedUiBoundary|uiserver|sys::tests::trusted_ui_status_fails_closed_for_every_current_scanout
-ui-frame-budget/UiFrameBudget|uiserver|gpu_runtime::tests::frame_deadline_skips_missed_slots_without_drift_or_burst
+ui-frame-budget/UiFrameBudget|uiserver|gpu_runtime::tests::frame_deadline_is_spacing_from_submission_not_a_phase_grid
 ui-main-loop-wakeup/UiMainLoopWakeup|uiserver|input_loop::tests::prequeued_wake_never_commits_a_timeout_sleep
 ui-main-loop-wakeup/UiMainLoopWakeup|uiserver|input_loop::tests::coalesced_notification_tokens_still_advance_readiness_generation
 ui-main-loop-wakeup/UiMainLoopWakeup|kernel-hal|arch::rtc::tests::sleep_waiter_update_expiry_and_cancel_preserve_exact_task_ownership
@@ -2841,7 +2843,7 @@ product-boot/ProductBoot|rootd|tests::core_readiness_budget_is_bounded_and_reset
 product-boot/ProductBoot|kernel-io-manager|input::dvm_ring::tests::policy_consumer_readiness_requires_transport_and_is_idempotent
 product-boot/ProductBoot|uiserver|gpu_runtime::tests::dvm_gpu_admission_waits_without_hiding_behind_software
 product-boot/ProductBoot|storaged|tests::dvm_block_e2e_marker_names_the_complete_authority_path
-product-boot/ProductBoot|uiserver|gpu_runtime::tests::frame_deadline_skips_missed_slots_without_drift_or_burst
+product-boot/ProductBoot|uiserver|gpu_runtime::tests::frame_deadline_is_spacing_from_submission_not_a_phase_grid
 product-boot/ProductBoot|uiserver|input_loop::tests::input_waitset_startup_retries_only_transient_control_failures
 product-boot/ProductBoot|xtask|kvm::tests::dvm_display_mode_requires_the_observed_display_contract
 dvm-gpu-compositor/DvmGpuCompositor|uiserver|gpu_runtime::tests::mandatory_gpu_wait_never_admits_cpu_present_as_retry

@@ -10,7 +10,7 @@
 //! dependency is satisfied. Nothing in this file waits on a client fd.
 
 use super::snapshot::{blit_damage, Completion, JobId, Refused};
-use super::viewport::{map_buffer, ViewportError};
+use super::viewport::{map_buffer_for_output, ViewportError};
 use super::*;
 
 /// The state a `wl_surface.commit` carries, captured at request time.
@@ -117,8 +117,14 @@ impl WaylandState {
                 post_protocol_error(resource, "wl_surface.commit: surface unavailable".into());
                 return;
             };
-            let damage = surface.pending_damage;
-            surface.pending_damage = Rect::empty();
+            let surface_damage = surface.pending_surface_damage;
+            let buffer_damage = surface.pending_buffer_damage;
+            surface.pending_surface_damage = Rect::empty();
+            surface.pending_buffer_damage = Rect::empty();
+            let damage = buffer_damage.union(scale_damage_rect(
+                surface_damage,
+                surface.pending_buffer_mapping.scale,
+            ));
             let offset = std::mem::take(&mut surface.pending_offset);
             let pending_buffer = surface.pending_buffer.take();
             if !surface.alive {
@@ -351,11 +357,16 @@ impl WaylandState {
         has_damage: bool,
         outcome: &mut Outcome,
     ) -> Planned {
+        let output_scale = self.output_scale.max(1) as usize;
         let viewport_active = shared.lock().is_ok_and(|surface| {
-            surface.viewport.is_active() || surface.buffer_mapping != BufferMapping::default()
+            surface.viewport.is_active()
+                || surface.buffer_mapping.transform != 0
+                || surface.buffer_mapping.scale != output_scale
         });
-        // A damage patch is in buffer coordinates; under a viewport the
-        // presented pixels are resampled, so only a full read is correct.
+        // `damage` is in buffer coordinates; when the client renders at native
+        // `output_scale` without a transform or wp_viewport resample, buffer
+        // coordinates map 1:1 to retained physical pixels and partial blits are
+        // exact. Under any transform, viewport, or scale mismatch, read full.
         if has_damage && !viewport_active {
             let (width, height, stride, len) = shared.lock().map_or((0, 0, 0, 0), |surface| {
                 (
@@ -554,14 +565,27 @@ impl WaylandState {
             Err(_) => return false,
         };
         let (original_width, original_height) = (width, height);
-        let (pixels, width, height) = match map_buffer(&original, width, height, mapping, &viewport)
-        {
+        let (pixels, width, height) = match map_buffer_for_output(
+            &original,
+            width,
+            height,
+            mapping,
+            &viewport,
+            self.output_scale.max(1) as usize,
+        ) {
             Ok(None) => (original.clone(), width, height),
             Ok(Some((pixels, width, height))) => (Arc::new(pixels), width, height),
             Err(ViewportError::BufferSize) => {
                 resource.post_error(
                     wl_surface::Error::InvalidSize,
-                    "buffer dimensions must be a multiple of scale".to_string(),
+                    format!(
+                        "buffer dimensions must be a multiple of scale (buffer={}x{} scale={} transform={} output_scale={})",
+                        original_width,
+                        original_height,
+                        mapping.scale,
+                        mapping.transform,
+                        self.output_scale
+                    ),
                 );
                 return false;
             }

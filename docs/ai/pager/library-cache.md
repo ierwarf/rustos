@@ -147,6 +147,41 @@ Implemented design (differs from the earlier memfd-record plan; no memfd exists)
    refused=` (stage = `library_warm::Stage` ordinal), `manifest refused`, or
    `gave up`. 1-vCPU KVM boot: `pagerd: library cache warmed`.
 
+**Demand objects (2026-11-23; unit-tested, not yet KVM-verified).** Large private
+mappings of immutable-volume files that pagerd did not warm (Chrome's 306 MB
+image, mapped ~10 times per launch at 70-95 ms each by the eager copy) are
+served from a shared, page-granular object instead:
+
+- *Policy (syscalld, `mmap_policy::library_demand_candidate`):* a readable,
+  page-aligned `MAP_PRIVATE` file mapping of at least 1 MiB sets
+  `MM_BROKER_BIND_FLAG_DEMAND` in `RustosMmBrokerArgs::flags` and passes its
+  length in `len` on `MM_BROKER_OP_BIND_LIBRARY`. Smaller mappings still bind to
+  an object that already exists but never create one.
+- *Mechanism (ring0, `library_cache.rs` + `mm_broker_ops.rs`):* when vfsd's
+  exact attestation matches no warm object, `Registry::create_demand` creates a
+  `State::Demand` object (immutable volume only, at most 512 MiB, 32 objects,
+  65,536 resident pages across all, least recently used evicted first; token
+  words allocated per 512-page chunk and billed to the creating Job). It is
+  filed under the live pagerd lease (`FrameSourceOwner{PAGERD, epoch}`), so a
+  pager restart withdraws it, but pagerd neither creates, fills nor retires it.
+  The binding then points at it like any warm object.
+- *Fill:* before pinning, `map_library_alias` calls `fill_demand_pages`. Missing
+  pages are *claimed* in runs of up to 64 (`claim_gap`; a concurrent mapper of
+  the same range waits up to 3 s, then copies privately), read through
+  `read_source_range` (same source and path as the eager copy) and supplied once
+  (`supply_claimed`, kernel zero-fills the EOF tail). A failed or refused fill
+  `unclaim`s its pages; free memory below 128 MiB + the run refuses growth.
+  Only after the whole range is resident does `pin_range` succeed (a claimed or
+  empty page is `Incomplete`, never served).
+- *Serving* is the existing alias path unchanged: pager `FILE_PRIVATE` VMA,
+  read-only COW leaves, write copies one page, fork clones leaves, eviction only
+  withdraws the cache's own reference. Every refusal falls back to the eager copy.
+- `FRAME_SOURCE_TABLE_SLOTS` (kernel table) is now 81,920; `FRAME_SOURCE_MAX_LIVE`
+  stays the pager's 16,384 envelope that the boot plan is validated against.
+- Counters: any failure reports once per boot as milestone `library-alias-declined`
+  reason 7 (`DemandUnavailable`, detail `stage << 32 | code`; stages 1-3 create,
+  4-11 fill) and reason 2/3/5/6 as before.
+
 Runtime-proven (KVM 1 vCPU, `cargo xtask kvm-smoke --library-map-probe`,
 `apps/libmapprobe`, kernel diagnostic `SYS_RUSTOS_LIBRARY_MAP_PROBE` honoured
 only for `/apps/libmapprobe/libmapprobe.elf`): libgcc_s (45 pages, 1296-byte

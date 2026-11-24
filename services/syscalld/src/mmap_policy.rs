@@ -80,14 +80,13 @@ pub fn plan_mmap_with_write(
     anonymous: bool,
     sharing: MmapSharing,
     prot_none: bool,
-    writable: bool,
+    _writable: bool,
     fd_kind: Option<MmapFdKind>,
 ) -> Result<MmapPlan, MmapPlanError> {
     match (anonymous, sharing, fd_kind) {
         (true, MmapSharing::Private, None) if prot_none => Ok(MmapPlan::Reserved),
         (true, MmapSharing::Private, None) => Ok(MmapPlan::Anonymous),
         (false, MmapSharing::Private, Some(MmapFdKind::File)) => Ok(MmapPlan::FilePrivate),
-        (false, MmapSharing::Shared, Some(MmapFdKind::File)) if !writable => Ok(MmapPlan::FilePrivate),
         (false, MmapSharing::Shared, Some(MmapFdKind::File)) => Ok(MmapPlan::FileShared),
         (false, MmapSharing::Private, Some(_)) => Err(MmapPlanError::InvalidBacking),
         (false, MmapSharing::Shared, Some(MmapFdKind::Memfd)) => Ok(MmapPlan::MemfdShared),
@@ -110,9 +109,34 @@ pub fn library_bind_candidate(plan: MmapPlan, prot: u64, offset: u64) -> bool {
     plan == MmapPlan::FilePrivate && prot & PROT_READ != 0 && offset.is_multiple_of(4096)
 }
 
+/// Private file mappings at least this long ask the kernel to cache the file's
+/// pages for every later mapper (a demand object) when no pager-warmed object
+/// covers the file. Smaller mappings only join an object that already exists:
+/// below this size the eager copy costs less than the bookkeeping it would
+/// share. The kernel enforces the mechanical caps; this is the policy.
+pub const LIBRARY_DEMAND_MIN_MAP_BYTES: u64 = 1 << 20;
+
+/// Whether a bind request should carry the demand-object flag.
+pub fn library_demand_candidate(plan: MmapPlan, prot: u64, offset: u64, map_len: u64) -> bool {
+    library_bind_candidate(plan, prot, offset) && map_len >= LIBRARY_DEMAND_MIN_MAP_BYTES
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_large_bind_candidates_request_a_demand_object() {
+        let big = LIBRARY_DEMAND_MIN_MAP_BYTES;
+        assert!(library_demand_candidate(MmapPlan::FilePrivate, 0x1, 0, big));
+        // Chrome's image mappings: RO whole-image and RW fixed follow-ups.
+        assert!(library_demand_candidate(MmapPlan::FilePrivate, 0x1 | 0x2, 0x1d5c000, 0x1d5c000));
+        assert!(!library_demand_candidate(MmapPlan::FilePrivate, 0x1, 0, big - 4096));
+        assert!(!library_demand_candidate(MmapPlan::FilePrivate, 0, 0, big));
+        assert!(!library_demand_candidate(MmapPlan::FilePrivate, 0x1, 0x2001, big));
+        assert!(!library_demand_candidate(MmapPlan::FileShared, 0x1, 0, big));
+        assert!(!library_demand_candidate(MmapPlan::Anonymous, 0x1, 0, big));
+    }
 
     #[test]
     fn only_readable_aligned_private_file_mappings_are_bind_candidates() {
@@ -172,16 +196,18 @@ mod tests {
         );
         assert_eq!(
             plan_mmap_with_write(false, MmapSharing::Shared, false, false, Some(MmapFdKind::File)),
-            Ok(MmapPlan::FilePrivate)
+            Ok(MmapPlan::FileShared)
         );
         assert_eq!(
             plan_mmap_with_write(false, MmapSharing::Shared, false, true, Some(MmapFdKind::File)),
             Ok(MmapPlan::FileShared)
         );
-        // A read-only shared file mapping keeps the private-snapshot path.
+        // Read-only / PROT_NONE shared file mappings also use the shared-backing
+        // path so writes to mutable files (e.g. SQLite on TmpFs) stay coherent,
+        // with read-only fallback to private snapshot only for immutable volumes.
         assert_eq!(
             plan_mmap_with_write(false, MmapSharing::Shared, true, false, Some(MmapFdKind::File)),
-            Ok(MmapPlan::FilePrivate)
+            Ok(MmapPlan::FileShared)
         );
         assert_eq!(
             plan_mmap(false, MmapSharing::Shared, false, Some(MmapFdKind::Memfd)),

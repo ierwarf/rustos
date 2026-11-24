@@ -191,6 +191,11 @@ fn only_tombstoning_vfs_mutations_require_visibility_ack() {
         ..VfsIpcRequest::default()
     };
     assert!(!vfs_checkpoint_ack_required(&read));
+    let pread = VfsIpcRequest {
+        op: VFS_IPC_OP_PREAD64,
+        ..VfsIpcRequest::default()
+    };
+    assert!(!vfs_checkpoint_ack_required(&pread));
 }
 
 #[test]
@@ -227,6 +232,9 @@ fn vfs_cursor_and_checkpoint_mutations_are_control_not_readiness_work() {
     }
     let read = VfsIpcRequest { op: VFS_IPC_OP_READ, ..VfsIpcRequest::default() };
     assert!(matches!(vfs_request_service_class(&read), ipc_ops::ServiceIpcClass::BulkData));
+    let pread = VfsIpcRequest { op: VFS_IPC_OP_PREAD64, ..VfsIpcRequest::default() };
+    assert!(matches!(vfs_request_service_class(&pread), ipc_ops::ServiceIpcClass::BulkData));
+    assert!(vfs_request_is_replay_safe(&pread));
 }
 
 #[test]
@@ -240,9 +248,55 @@ fn a_prepared_cursor_cannot_orphan_a_rejected_final_close() {
         let response = VfsIpcResponse { status, ..VfsIpcResponse::default() };
         assert!(!vfs_response_needs_reconciliation(&request, &response));
     }
-    request.op = VFS_IPC_OP_READ;
+    request.op = VFS_IPC_OP_PREAD64;
     let response = VfsIpcResponse { status: LINUX_EBUSY as i32, ..VfsIpcResponse::default() };
     assert!(!vfs_response_needs_reconciliation(&request, &response));
+}
+
+#[test]
+fn cursor_settle_sync_preserves_cursor_payload_and_cannot_be_overtaken_by_close() {
+    let settle_sync = VfsIpcRequest {
+        op: VFS_IPC_OP_CURSOR_SETTLE,
+        fd: 4,
+        remote_id: 99,
+        arg0: 4096,
+        arg2: VFS_CURSOR_SETTLE_SYNC,
+        operation_hi: 1,
+        operation_lo: 2,
+        ..VfsIpcRequest::default()
+    };
+    assert!(matches!(
+        vfs_request_service_class(&settle_sync),
+        ipc_ops::ServiceIpcClass::StateMutation
+    ));
+    assert!(vfs_request_is_replay_safe(&settle_sync));
+    let pending = PendingVfsMutation::capture(&settle_sync).unwrap();
+    let mut restored = VfsIpcRequest::default();
+    pending.restore_into(&mut restored);
+    assert_eq!(restored.arg0, 4096);
+    assert_eq!(restored.arg2, VFS_CURSOR_SETTLE_SYNC);
+
+    let mut queue = PendingVfsMutationQueue::<4>::new();
+    assert!(queue.push(pending));
+    assert!(matches!(queue.try_claim_cursor(99), VfsCursorClaim::Busy));
+    let close = PendingVfsMutation::capture(&VfsIpcRequest {
+        op: VFS_IPC_OP_CLOSE,
+        remote_id: 99,
+        operation_hi: 1,
+        operation_lo: 3,
+        ..VfsIpcRequest::default()
+    })
+    .unwrap();
+    assert!(queue.push(close));
+    let first = queue.pop(Some(VfsMutationLane::Description(99))).unwrap();
+    assert_eq!(first.op, VFS_IPC_OP_CURSOR_SETTLE);
+    assert_eq!(first.arg2, VFS_CURSOR_SETTLE_SYNC);
+    queue.finish(first, None);
+    let second = queue.pop(Some(VfsMutationLane::Description(99))).unwrap();
+    assert_eq!(second.op, VFS_IPC_OP_CLOSE);
+    queue.finish(second, None);
+    assert!(matches!(queue.try_claim_cursor(99), VfsCursorClaim::Claimed));
+    queue.release_cursor(99);
 }
 
 #[test]

@@ -55,7 +55,7 @@ const MAPPING_STATE_FREE: u64 = 0;
 const MAPPING_STATE_CLAIMED: u64 = 1;
 const MAPPING_STATE_LIVE: u64 = 2;
 const MAPPING_STATE_REPLACING: u64 = 3;
-const SHARED_LOCK_SPINS: usize = 1_000_000;
+const SHARED_LOCK_SPINS: usize = 100_000_000;
 
 // ORDERING: Acquire observes payload initialized before a descriptor or free-list
 // head was release-published.
@@ -77,6 +77,50 @@ pub enum DataLeafRelease {
     FrameReusable,
 }
 
+/// Maximum number of shared-alias leaves prepared in one batched ledger run.
+pub const SHARED_ALIAS_RUN_MAX: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SharedAliasMode {
+    /// Convert an exclusive parent leaf or attach to an existing anonymous-fork
+    /// shared leaf (`CowFrameKind::AnonymousFork`, backing identity 0).
+    AnonymousFork,
+    /// Inherit the existing shared COW kind and backing identity from the
+    /// parent's live shared descriptor without an extra lock round-trip.
+    InheritShared,
+    /// Attach with an explicit COW kind and backing identity.
+    Explicit {
+        kind: CowFrameKind,
+        backing_identity: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SharedAliasRequest {
+    pub owner_va: u64,
+    pub new_va: u64,
+    pub frame_phys: u64,
+    pub mode: SharedAliasMode,
+}
+
+impl SharedAliasRequest {
+    pub const EMPTY: Self = Self {
+        owner_va: 0,
+        new_va: 0,
+        frame_phys: 0,
+        mode: SharedAliasMode::AnonymousFork,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SharedAliasRunError {
+    /// Root charge quota, COW mapping record pool, or shared mapping count was
+    /// exhausted.
+    OutOfFrames,
+    /// Root, mapping key, parent ownership, or shared role validation failed.
+    InvalidFrameOwnership,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SharedAliasTicket {
     frame_phys: u64,
@@ -85,6 +129,19 @@ pub struct SharedAliasTicket {
     mapping_id: u32,
     kind: CowFrameKind,
     converted_exclusive: bool,
+    owns_frame_lock: bool,
+}
+
+impl SharedAliasTicket {
+    pub const EMPTY: Self = Self {
+        frame_phys: 0,
+        root_phys: 0,
+        virtual_address: 0,
+        mapping_id: 0,
+        kind: CowFrameKind::AnonymousFork,
+        converted_exclusive: false,
+        owns_frame_lock: false,
+    };
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -607,12 +664,448 @@ impl FrameDescriptorLedger {
             mapping_id,
             kind,
             converted_exclusive,
+            owns_frame_lock: true,
         };
         if !self.try_charge_root(new_root, 1) {
             self.cancel_shared_alias_inner(ticket);
             return None;
         }
         Some(ticket)
+    }
+
+    /// Prepares a run of shared COW aliases from `owner_root` into `new_root`
+    /// under a single root charge and ascending physical-frame lock order.
+    ///
+    /// On any validation, quota, pool, or lock failure, every prior frame in
+    /// the run is unwound in reverse lock order and the entire run charge is
+    /// refunded, leaving no frame mutated or charged.
+    fn prepare_shared_alias_run(
+        &self,
+        owner_root: u64,
+        new_root: u64,
+        requests: &[SharedAliasRequest],
+        tickets_out: &mut [SharedAliasTicket],
+    ) -> Result<(), SharedAliasRunError> {
+        let len = requests.len();
+        if len == 0 {
+            return Ok(());
+        }
+        if len > SHARED_ALIAS_RUN_MAX || tickets_out.len() < len {
+            return Err(SharedAliasRunError::InvalidFrameOwnership);
+        }
+        if self.verify_root(owner_root).is_none() {
+            return Err(SharedAliasRunError::InvalidFrameOwnership);
+        }
+        let Some(new_root_record) = self.verify_root(new_root) else {
+            return Err(SharedAliasRunError::InvalidFrameOwnership);
+        };
+
+        // Pre-validate every request key and mode before charging or locking
+        // any frame descriptor, and check whether frames are already strictly
+        // ascending in physical address.
+        let mut strictly_ascending = true;
+        let mut prev_phys = 0_u64;
+        for (idx, req) in requests.iter().enumerate() {
+            if !valid_mapping(owner_root, req.owner_va, req.frame_phys)
+                || !valid_mapping(new_root, req.new_va, req.frame_phys)
+                || self.record(req.frame_phys).is_none()
+            {
+                return Err(SharedAliasRunError::InvalidFrameOwnership);
+            }
+            if let SharedAliasMode::Explicit {
+                kind,
+                backing_identity,
+            } = req.mode
+                && ((kind == CowFrameKind::PrivateFileSection && backing_identity == 0)
+                    || (kind == CowFrameKind::AnonymousFork && backing_identity != 0))
+            {
+                return Err(SharedAliasRunError::InvalidFrameOwnership);
+            }
+            if idx != 0 && req.frame_phys <= prev_phys {
+                strictly_ascending = false;
+            }
+            prev_phys = req.frame_phys;
+        }
+
+        // Single hierarchical charge reservation for the entire run.
+        let pages = len as u64;
+        if !self.try_charge_root(new_root, pages) {
+            return Err(SharedAliasRunError::OutOfFrames);
+        }
+
+        // Build lock-acquisition order in ascending `frame_phys` so concurrent
+        // runs can never AB-BA deadlock and duplicate physical frames in one
+        // run are adjacent.
+        let mut order = [0_u16; SHARED_ALIAS_RUN_MAX];
+        for (pos, slot) in order[..len].iter_mut().enumerate() {
+            *slot = pos as u16;
+        }
+        if !strictly_ascending {
+            for i in 1..len {
+                let key_idx = order[i];
+                let key_phys = requests[key_idx as usize].frame_phys;
+                let mut j = i;
+                while j > 0 && requests[order[j - 1] as usize].frame_phys > key_phys {
+                    order[j] = order[j - 1];
+                    j -= 1;
+                }
+                order[j] = key_idx;
+            }
+        }
+
+        for pos in 0..len {
+            let idx = order[pos] as usize;
+            let req = requests[idx];
+            let same_as_prev = pos > 0
+                && requests[order[pos - 1] as usize].frame_phys == req.frame_phys;
+            let prev_kind = if same_as_prev {
+                Some(tickets_out[order[pos - 1] as usize].kind)
+            } else {
+                None
+            };
+            match self.prepare_shared_alias_run_entry(
+                owner_root,
+                new_root,
+                req,
+                prev_kind,
+            ) {
+                Ok(ticket) => {
+                    tickets_out[idx] = ticket;
+                }
+                Err(error) => {
+                    for undo_pos in (0..pos).rev() {
+                        let undo_ticket = tickets_out[order[undo_pos] as usize];
+                        if undo_ticket.owns_frame_lock {
+                            self.cancel_shared_alias_inner(undo_ticket);
+                        } else {
+                            self.cancel_shared_alias_duplicate_head(undo_ticket);
+                        }
+                    }
+                    self.uncharge_root(new_root_record, pages);
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn prepare_shared_alias_run_entry(
+        &self,
+        owner_root: u64,
+        new_root: u64,
+        req: SharedAliasRequest,
+        already_locked_kind: Option<CowFrameKind>,
+    ) -> Result<SharedAliasTicket, SharedAliasRunError> {
+        let frame = self
+            .record(req.frame_phys)
+            .ok_or(SharedAliasRunError::InvalidFrameOwnership)?;
+        let mapping_id = self
+            .claim_mapping(new_root, req.new_va)
+            .ok_or(SharedAliasRunError::OutOfFrames)?;
+
+        let (kind, converted_exclusive, owns_frame_lock) =
+            if let Some(locked_kind) = already_locked_kind {
+                // This physical frame is already locked by an earlier entry in
+                // the same run. Verify mode compatibility and exact parent
+                // ownership without re-acquiring the role lock.
+                let backing = frame.shared_backing_identity.load(Ordering::Relaxed);
+                let mode_ok = match req.mode {
+                    SharedAliasMode::InheritShared => true,
+                    SharedAliasMode::AnonymousFork => {
+                        locked_kind == CowFrameKind::AnonymousFork && backing == 0
+                    }
+                    SharedAliasMode::Explicit {
+                        kind,
+                        backing_identity,
+                    } => kind == locked_kind && backing == backing_identity,
+                };
+                if !mode_ok
+                    || !self.shared_mapping_is_exact_locked(frame, owner_root, req.owner_va)
+                {
+                    self.release_mapping_record(mapping_id);
+                    return Err(SharedAliasRunError::InvalidFrameOwnership);
+                }
+                (locked_kind, false, false)
+            } else {
+                match req.mode {
+                    SharedAliasMode::InheritShared => {
+                        let role = frame.role.load(DESCRIPTOR_ACQUIRE);
+                        let kind = match role {
+                            ROLE_SHARED_ANONYMOUS_LIVE | ROLE_SHARED_ANONYMOUS_LOCKED => {
+                                CowFrameKind::AnonymousFork
+                            }
+                            ROLE_SHARED_PRIVATE_FILE_LIVE | ROLE_SHARED_PRIVATE_FILE_LOCKED => {
+                                CowFrameKind::PrivateFileSection
+                            }
+                            _ => {
+                                self.release_mapping_record(mapping_id);
+                                return Err(SharedAliasRunError::InvalidFrameOwnership);
+                            }
+                        };
+                        if !self.lock_shared(frame, kind, false) {
+                            self.release_mapping_record(mapping_id);
+                            return Err(SharedAliasRunError::InvalidFrameOwnership);
+                        }
+                        if !self.shared_mapping_is_exact_locked(frame, owner_root, req.owner_va) {
+                            frame
+                                .role
+                                .store(shared_live_role(kind), DESCRIPTOR_RELEASE);
+                            self.release_mapping_record(mapping_id);
+                            return Err(SharedAliasRunError::InvalidFrameOwnership);
+                        }
+                        (kind, false, true)
+                    }
+                    SharedAliasMode::AnonymousFork | SharedAliasMode::Explicit { .. } => {
+                        let (kind, backing_identity) = match req.mode {
+                            SharedAliasMode::AnonymousFork => (CowFrameKind::AnonymousFork, 0),
+                            SharedAliasMode::Explicit {
+                                kind,
+                                backing_identity,
+                            } => (kind, backing_identity),
+                            SharedAliasMode::InheritShared => unreachable!(),
+                        };
+                        let live_role = shared_live_role(kind);
+                        let locked_role = shared_locked_role(kind);
+                        let role = frame.role.load(DESCRIPTOR_ACQUIRE);
+                        let converted = if matches!(
+                            role,
+                            ROLE_EXCLUSIVE_DATA_LIVE | ROLE_EXCLUSIVE_DATA_CLAIMED
+                        ) && frame.owner_or_table_head.load(Ordering::Relaxed)
+                            == owner_root
+                            && frame.next_or_virtual_address.load(Ordering::Relaxed)
+                                == req.owner_va
+                        {
+                            let mut acquired = false;
+                            for _ in 0..SHARED_LOCK_SPINS {
+                                match frame.role.compare_exchange(
+                                    ROLE_EXCLUSIVE_DATA_LIVE,
+                                    locked_role,
+                                    DESCRIPTOR_ACQ_REL,
+                                    DESCRIPTOR_ACQUIRE,
+                                ) {
+                                    Ok(_) => {
+                                        acquired = true;
+                                        break;
+                                    }
+                                    Err(ROLE_EXCLUSIVE_DATA_CLAIMED) => spin_loop(),
+                                    Err(_) => break,
+                                }
+                            }
+                            if !acquired {
+                                self.release_mapping_record(mapping_id);
+                                return Err(SharedAliasRunError::InvalidFrameOwnership);
+                            }
+                            frame
+                                .data_leaf_count_or_map_head
+                                .store(pack_shared(1, 0), Ordering::Relaxed);
+                            frame
+                                .shared_backing_identity
+                                .store(backing_identity, Ordering::Relaxed);
+                            true
+                        } else if role == live_role || role == locked_role {
+                            if !self.lock_shared(frame, kind, false) {
+                                self.release_mapping_record(mapping_id);
+                                return Err(SharedAliasRunError::InvalidFrameOwnership);
+                            }
+                            if frame.shared_backing_identity.load(Ordering::Relaxed)
+                                != backing_identity
+                                || !self.shared_mapping_is_exact_locked(
+                                    frame,
+                                    owner_root,
+                                    req.owner_va,
+                                )
+                            {
+                                frame.role.store(live_role, DESCRIPTOR_RELEASE);
+                                self.release_mapping_record(mapping_id);
+                                return Err(SharedAliasRunError::InvalidFrameOwnership);
+                            }
+                            false
+                        } else {
+                            self.release_mapping_record(mapping_id);
+                            return Err(SharedAliasRunError::InvalidFrameOwnership);
+                        };
+                        (kind, converted, true)
+                    }
+                }
+            };
+
+        let packed = frame.data_leaf_count_or_map_head.load(Ordering::Relaxed);
+        let count = shared_count(packed);
+        let head = shared_head(packed);
+        let Some(next_count) = count.checked_add(1) else {
+            if owns_frame_lock {
+                if converted_exclusive {
+                    frame
+                        .data_leaf_count_or_map_head
+                        .store(0, Ordering::Relaxed);
+                    frame.shared_backing_identity.store(0, Ordering::Relaxed);
+                    frame
+                        .role
+                        .store(ROLE_EXCLUSIVE_DATA_LIVE, DESCRIPTOR_RELEASE);
+                } else {
+                    frame
+                        .role
+                        .store(shared_live_role(kind), DESCRIPTOR_RELEASE);
+                }
+            }
+            self.release_mapping_record(mapping_id);
+            return Err(SharedAliasRunError::OutOfFrames);
+        };
+        let mapping = self
+            .mapping(mapping_id)
+            .expect("claimed shared mapping escaped the boot-sized pool");
+        mapping.next.store(u64::from(head), Ordering::Relaxed);
+        frame
+            .data_leaf_count_or_map_head
+            .store(pack_shared(next_count, mapping_id), Ordering::Relaxed);
+        Ok(SharedAliasTicket {
+            frame_phys: req.frame_phys,
+            root_phys: new_root,
+            virtual_address: req.new_va,
+            mapping_id,
+            kind,
+            converted_exclusive,
+            owns_frame_lock,
+        })
+    }
+
+    /// Publishes every prepared ticket in a run targeting one root, updating
+    /// the root's data-leaf count once and unlocking each distinct frame only
+    /// after all of its claimed mapping records are marked live.
+    fn publish_shared_alias_run(&self, tickets: &[SharedAliasTicket]) {
+        let Some(first) = tickets.first() else {
+            return;
+        };
+        let root_phys = first.root_phys;
+        let root = self
+            .verify_root(root_phys)
+            .expect("shared alias root disappeared");
+        for ticket in tickets {
+            assert_eq!(ticket.root_phys, root_phys, "mixed roots in shared alias run");
+            let mapping = self
+                .mapping(ticket.mapping_id)
+                .expect("shared alias mapping disappeared");
+            assert_eq!(
+                mapping.root_and_state.compare_exchange(
+                    ticket.root_phys | MAPPING_STATE_CLAIMED,
+                    ticket.root_phys | MAPPING_STATE_LIVE,
+                    DESCRIPTOR_RELEASE,
+                    DESCRIPTOR_ACQUIRE,
+                ),
+                Ok(ticket.root_phys | MAPPING_STATE_CLAIMED)
+            );
+        }
+        root.data_leaf_count_or_map_head
+            .fetch_add(tickets.len() as u64, DESCRIPTOR_ACQ_REL);
+        for ticket in tickets {
+            if ticket.owns_frame_lock {
+                let frame = self
+                    .record(ticket.frame_phys)
+                    .expect("shared alias frame disappeared");
+                assert_eq!(
+                    frame
+                        .role
+                        .swap(shared_live_role(ticket.kind), DESCRIPTOR_RELEASE),
+                    shared_locked_role(ticket.kind)
+                );
+            }
+        }
+    }
+
+    /// Cancels every prepared ticket in a run targeting one root, refunding
+    /// the entire run charge in one uncharge and restoring every descriptor.
+    fn cancel_shared_alias_run(&self, tickets: &[SharedAliasTicket]) {
+        let Some(first) = tickets.first() else {
+            return;
+        };
+        let root_phys = first.root_phys;
+        let root = self
+            .verify_root(root_phys)
+            .expect("missing alias root");
+        self.uncharge_root(root, tickets.len() as u64);
+        // Pass 1: unlink all duplicate (non-lock-owning) tickets while their
+        // frame descriptors remain locked.
+        for ticket in tickets {
+            assert_eq!(ticket.root_phys, root_phys, "mixed roots in shared alias run");
+            if !ticket.owns_frame_lock {
+                self.cancel_shared_alias_duplicate_any(*ticket);
+            }
+        }
+        // Pass 2: unlink each lock-owning ticket (now guaranteed to be head of
+        // its frame's list) and restore/unlock the frame descriptor.
+        for ticket in tickets {
+            if ticket.owns_frame_lock {
+                self.cancel_shared_alias_inner(*ticket);
+            }
+        }
+    }
+
+    /// Unlinks a duplicate ticket known to be at the head of its locked frame's
+    /// shared list (used during reverse-order rollback inside prepare).
+    fn cancel_shared_alias_duplicate_head(&self, ticket: SharedAliasTicket) {
+        let frame = self
+            .record(ticket.frame_phys)
+            .expect("cancelled shared alias frame disappeared");
+        let packed = frame.data_leaf_count_or_map_head.load(Ordering::Relaxed);
+        assert_eq!(shared_head(packed), ticket.mapping_id);
+        let mapping = self
+            .mapping(ticket.mapping_id)
+            .expect("cancelled shared alias mapping disappeared");
+        let next = u32::try_from(mapping.next.load(Ordering::Relaxed))
+            .expect("shared mapping next id overflow");
+        let count = shared_count(packed);
+        assert!(count >= 2);
+        frame
+            .data_leaf_count_or_map_head
+            .store(pack_shared(count - 1, next), Ordering::Relaxed);
+        self.release_mapping_record(ticket.mapping_id);
+    }
+
+    /// Unlinks a duplicate ticket at any position in its locked frame's shared
+    /// list (used by `cancel_shared_alias_run`, whose slice is in caller order).
+    fn cancel_shared_alias_duplicate_any(&self, ticket: SharedAliasTicket) {
+        let frame = self
+            .record(ticket.frame_phys)
+            .expect("cancelled shared alias frame disappeared");
+        let packed = frame.data_leaf_count_or_map_head.load(Ordering::Relaxed);
+        let count = shared_count(packed);
+        let head = shared_head(packed);
+        assert!(count >= 2);
+        let mut previous = 0_u32;
+        let mut current = head;
+        let mut traversed = 0_usize;
+        let maximum = self.mapping_count.load(DESCRIPTOR_ACQUIRE);
+        while current != ticket.mapping_id {
+            traversed += 1;
+            assert!(traversed <= maximum, "shared mapping list cycle");
+            let record = self
+                .mapping(current)
+                .expect("shared mapping id escaped pool");
+            previous = current;
+            current = u32::try_from(record.next.load(Ordering::Relaxed))
+                .expect("shared mapping next id overflow");
+            assert_ne!(current, 0, "cancelled duplicate mapping was not linked");
+        }
+        let record = self
+            .mapping(ticket.mapping_id)
+            .expect("cancelled shared alias mapping disappeared");
+        let next = u32::try_from(record.next.load(Ordering::Relaxed))
+            .expect("shared mapping next id overflow");
+        if previous == 0 {
+            frame
+                .data_leaf_count_or_map_head
+                .store(pack_shared(count - 1, next), Ordering::Relaxed);
+        } else {
+            self.mapping(previous)
+                .expect("shared mapping predecessor escaped pool")
+                .next
+                .store(u64::from(next), Ordering::Relaxed);
+            frame
+                .data_leaf_count_or_map_head
+                .store(pack_shared(count - 1, head), Ordering::Relaxed);
+        }
+        self.release_mapping_record(ticket.mapping_id);
     }
 
     fn publish_shared_alias(&self, ticket: SharedAliasTicket) {
@@ -889,7 +1382,9 @@ impl FrameDescriptorLedger {
                         return exact;
                     }
                 }
-                ROLE_SHARED_ANONYMOUS_LOCKED | ROLE_SHARED_PRIVATE_FILE_LOCKED => spin_loop(),
+                ROLE_EXCLUSIVE_DATA_CLAIMED
+                | ROLE_SHARED_ANONYMOUS_LOCKED
+                | ROLE_SHARED_PRIVATE_FILE_LOCKED => spin_loop(),
                 _ => return false,
             }
         }
@@ -1099,7 +1594,9 @@ impl FrameDescriptorLedger {
                         );
                     }
                 }
-                ROLE_SHARED_ANONYMOUS_LOCKED | ROLE_SHARED_PRIVATE_FILE_LOCKED => spin_loop(),
+                ROLE_EXCLUSIVE_DATA_CLAIMED
+                | ROLE_SHARED_ANONYMOUS_LOCKED
+                | ROLE_SHARED_PRIVATE_FILE_LOCKED => spin_loop(),
                 _ => return None,
             }
         }
@@ -1181,7 +1678,9 @@ impl FrameDescriptorLedger {
                     frame.role.store(role, DESCRIPTOR_RELEASE);
                     return updated;
                 }
-                ROLE_SHARED_ANONYMOUS_LOCKED | ROLE_SHARED_PRIVATE_FILE_LOCKED => spin_loop(),
+                ROLE_EXCLUSIVE_DATA_CLAIMED
+                | ROLE_SHARED_ANONYMOUS_LOCKED
+                | ROLE_SHARED_PRIVATE_FILE_LOCKED => spin_loop(),
                 _ => return false,
             }
         }

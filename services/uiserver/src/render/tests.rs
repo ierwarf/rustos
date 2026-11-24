@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use super::{
-    copy_opaque_wayland_damage_to_atlas, copy_wayland_damage_to_atlas, push_console_gpu_layer,
-    push_wayland_gpu_layer, reset_desktop_pixels, update_gpu_texture_layer_destination,
-    wayland_window_client_rect, wayland_window_outer_rect, GpuAtlasPacker, GpuLayerKind,
-    GpuLayerTransform, GpuSceneLayer, GpuTextureCapability, GpuTextureRegion, Rect,
-    WaylandWindowSnapshot,
+    GpuAtlasPacker, GpuLayerKind, GpuLayerTransform, GpuSceneLayer, GpuTextureCapability,
+    GpuTextureRegion, Rect, WaylandWindowSnapshot, copy_opaque_wayland_damage_to_atlas,
+    copy_wayland_damage_to_atlas, push_console_gpu_layer, push_wayland_gpu_layer,
+    reset_desktop_pixels, update_gpu_texture_layer_destination, wayland_window_client_rect,
+    wayland_window_outer_rect,
 };
 
 #[test]
@@ -43,16 +43,18 @@ fn shell_echo_updates_retained_atlas_without_dragging_the_window() {
     update.add_partial_rect(super::console_window_dirty_rect(frame));
     let mut damage = Vec::new();
     if update.scene_dirty() {
-        assert!(super::update_console_gpu_texture(
-            &mut window,
-            true,
-            &mut atlas,
-            frame.width,
-            &mut bindings,
-            &mut 0,
-            &mut damage,
-        )
-        .unwrap());
+        assert!(
+            super::update_console_gpu_texture(
+                &mut window,
+                true,
+                &mut atlas,
+                frame.width,
+                &mut bindings,
+                &mut 0,
+                &mut damage,
+            )
+            .unwrap()
+        );
     }
     assert_eq!(window.frame, frame, "echo must not depend on window motion");
     assert_eq!(damage, vec![source_rect]);
@@ -190,6 +192,7 @@ fn translucent_csd_wayland_damage_copies_in_place() {
         stride,
         source_rect,
         &window,
+        window.damage,
         true,
     )
     .expect("valid damage")
@@ -416,17 +419,17 @@ fn a_console_window_has_translucent_title_glass_and_an_opaque_body() {
 
 #[test]
 fn a_wayland_window_has_translucent_title_glass_and_an_opaque_client() {
-    let mut pixels = vec![0_u32; 64 * 64];
-    let mut packer = GpuAtlasPacker::new(pixels.as_mut_slice(), 64, 64, 64).expect("packer");
+    let mut pixels = vec![0_u32; 128 * 128];
+    let mut packer = GpuAtlasPacker::new(pixels.as_mut_slice(), 128, 128, 128).expect("packer");
     let mut layers = Vec::new();
     let atlas = GpuTextureCapability {
         token: 1,
         generation: 1,
         content_epoch: 1,
         binding_slot: 0,
-        width: 64,
-        height: 64,
-        stride_bytes: 256,
+        width: 128,
+        height: 128,
+        stride_bytes: 512,
     };
     let window = snapshot(vec![0xff00_0000; 12], Rect::empty());
     let region = push_wayland_gpu_layer(&mut packer, &mut layers, atlas, &window, true)
@@ -435,13 +438,14 @@ fn a_wayland_window_has_translucent_title_glass_and_an_opaque_client() {
     assert!(layers[0].source_over);
     drop(packer);
 
-    let at = |x: usize, y: usize| alpha_at(&pixels, 64, region.x + x, region.y + y);
+    let at = |x: usize, y: usize| alpha_at(&pixels, 128, region.x + x, region.y + y);
     let title = at(3, 10);
     assert!(
         title > 0 && title < 255,
         "title glass is translucent: {title}"
     );
-    assert_eq!(at(2, 38), 255, "the client area stays opaque");
+    let client_y = crate::layout::window_title_height() + crate::layout::window_border() + 1;
+    assert_eq!(at(crate::layout::window_border() + 1, client_y), 255, "the client area stays opaque");
 }
 
 #[test]
@@ -480,16 +484,18 @@ fn a_retained_console_update_keeps_the_title_glass_translucent() {
     window.terminal_dirty = true;
     window.invalidate_surface();
     let mut damage = Vec::new();
-    assert!(super::update_console_gpu_texture(
-        &mut window,
-        true,
-        &mut atlas,
-        frame.width,
-        &mut bindings,
-        &mut 0,
-        &mut damage,
-    )
-    .unwrap());
+    assert!(
+        super::update_console_gpu_texture(
+            &mut window,
+            true,
+            &mut atlas,
+            frame.width,
+            &mut bindings,
+            &mut 0,
+            &mut damage,
+        )
+        .unwrap()
+    );
 
     let title = alpha_at(&atlas, frame.width, 100, 12);
     assert!(
@@ -540,7 +546,7 @@ fn plan_snapshot(surface_id: u32, minimized: bool) -> WaylandWindowSnapshot {
 
 #[test]
 fn gpu_draw_plan_paints_the_focused_window_last_and_packs_it_first() {
-    use super::{gpu_window_draw_plan, PlannedWindow};
+    use super::{PlannedWindow, gpu_window_draw_plan};
     use crate::app::ConsoleWindow;
     use crate::app::WindowId::{Console, Wayland};
     let frame = Rect {
@@ -638,20 +644,23 @@ fn gpu_draw_plan_paints_the_focused_window_last_and_packs_it_first() {
             Wayland(11),
         ],
     );
-    assert!(plan
-        .iter()
-        .all(|window| !matches!(window, PlannedWindow::Wayland { index: 1, .. })));
-    assert!(plan
-        .iter()
-        .all(|window| !matches!(window, PlannedWindow::Console { focused: true, .. })));
+    assert!(
+        plan.iter()
+            .all(|window| !matches!(window, PlannedWindow::Wayland { index: 1, .. }))
+    );
+    assert!(
+        plan.iter()
+            .all(|window| !matches!(window, PlannedWindow::Console { focused: true, .. }))
+    );
 }
 
 #[test]
 fn mixed_draw_order_and_pointer_hits_agree_when_console_occludes_wayland() {
-    use super::{gpu_window_draw_plan, PlannedWindow};
+    use super::{PlannedWindow, gpu_window_draw_plan};
     use crate::app::{
-        window_hit_test, ConsoleWindow,
+        ConsoleWindow,
         WindowId::{Console, Wayland},
+        window_hit_test,
     };
     use crate::layout::WindowChromeHit;
     let frame = Rect {
@@ -703,7 +712,7 @@ fn mixed_draw_order_and_pointer_hits_agree_when_console_occludes_wayland() {
 
 #[test]
 fn upper_wayland_chrome_occludes_lower_client_area() {
-    use crate::app::{window_hit_test, WindowId::Wayland};
+    use crate::app::{WindowId::Wayland, window_hit_test};
     use crate::layout::WindowChromeHit;
     let mut lower = plan_snapshot(1, false);
     lower.frame = Rect {

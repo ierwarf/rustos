@@ -14,7 +14,7 @@ use rustos_user_abi::syscall::{ServiceCapability,
     CHECKPOINT_JOURNAL_RECORD_MUTATE, SERVICE_CHECKPOINT_ABI_VERSION,
     };
 
-const MAX_JOURNAL_ENTRIES: usize = 8_192;
+const MAX_JOURNAL_ENTRIES: usize = 32_768;
 const ENOSPC: i64 = 28;
 const EPROTO: i64 = 71;
 

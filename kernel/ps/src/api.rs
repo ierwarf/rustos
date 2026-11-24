@@ -83,7 +83,11 @@ pub use crate::multitask::{
 };
 pub use crate::multitask::{ProcessIdentity, SpawnReservation};
 pub use crate::user::abi::UserAbi;
-pub use crate::user::epoll::{EpollError, EpollHandle, EpollInterestSnapshot};
+pub use crate::user::epoll::{
+    epoll_claim, epoll_create, epoll_ctl, epoll_purge_object, epoll_retire, epoll_snapshot,
+    EpollError, EpollHandle, EpollInterestKey, EpollInterestRecord, EpollInterestSnapshot,
+    EpollRegistry, EpollReportState,
+};
 pub use crate::user::handles::{
     bind_ipc_transfer_receiver_by_tickets, bind_ipc_transfer_tickets,
     claim_ipc_transfer_entries_by_tickets, commit_ipc_transfer_enqueue,
@@ -118,6 +122,12 @@ pub use crate::user::process_state::{
 };
 pub use crate::user::socket::{
     PassedHandle, SocketCredentials, SocketError, SocketHandle, SocketStreamGuard,
+};
+pub use crate::user::unix_socket::{
+    UnixAddress, UnixNamespaceKey, UnixReceivedMessage, UnixSendOutcome, UnixSocketError,
+    UnixSocketHandle, UnixSocketType, UNIX_DEFAULT_BACKLOG, UNIX_DEFAULT_BUF_SIZE,
+    UNIX_MAX_BACKLOG, UNIX_MAX_BUF_SIZE, UNIX_MAX_PATH_LEN, UNIX_MAX_SCM_RIGHTS,
+    UNIX_MIN_BUF_SIZE, UNIX_SOCK_SEQPACKET,
 };
 pub use x86_64::VirtAddr;
 

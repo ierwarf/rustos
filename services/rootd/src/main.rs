@@ -86,10 +86,12 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
+    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE_BATCH,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN,
     COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE, COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE,
     COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CHARGE, COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_RELEASE,
     COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CANCEL, COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK,
+    COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK_BATCH, PROVIDER_RECEIPT_ACK_BATCH_MAX_FRAMES,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT,
     COMMERCIAL_MAX_ROOTD_OP_UPDATE_STAGE, COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM,
     COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK, COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL,
@@ -1083,6 +1085,17 @@ fn reply_commercial_max_error(reply_cap: u64, request: &CommercialMaxProtocolReq
     );
 }
 
+/// MUTATE_BATCH reports its committed-prefix length in value0, so a request
+/// refused before its handler runs (envelope, sender, protocol) must carry
+/// exactly zero there, not the lease-count preamble every other reply seeds.
+fn reply_preamble_value0(op: u16, lease_count: usize) -> u64 {
+    if op == COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE_BATCH {
+        0
+    } else {
+        lease_count as u64
+    }
+}
+
 fn reply_commercial_max_request(
     reply_cap: u64,
     request: &CommercialMaxProtocolRequest,
@@ -1093,7 +1106,7 @@ fn reply_commercial_max_request(
 ) {
     let mut response = CommercialMaxProtocolResponse {
         header: request.header,
-        value0: leases.len() as u64,
+        value0: reply_preamble_value0(request.header.op, leases.len()),
         ..CommercialMaxProtocolResponse::default()
     };
     if request.header.op == COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL {
@@ -1115,8 +1128,12 @@ fn reply_commercial_max_request(
         Err(errno) => errno,
     };
     if response.status != 0 {
-        response.value0 = 0;
-        response.value1 = 0;
+        // MUTATE_BATCH reports its committed prefix length in value0/value1
+        // even on failure; every other failed reply carries no values.
+        if request.header.op != COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE_BATCH {
+            response.value0 = 0;
+            response.value1 = 0;
+        }
         response.descriptor_count = 0;
         response.payload_len = 0;
     }
@@ -1161,6 +1178,7 @@ fn validate_commercial_max_request(
             | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL
             | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM_IDL
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE
+            | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE_BATCH
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN
             | COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE
@@ -1169,6 +1187,7 @@ fn validate_commercial_max_request(
             | COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_RELEASE
             | COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CANCEL
             | COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK
+            | COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK_BATCH
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT
             | COMMERCIAL_MAX_ROOTD_OP_UPDATE_STAGE
             | COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM
@@ -1505,6 +1524,16 @@ fn fill_commercial_max_response(
             response.value1 = 0;
             Ok(())
         }
+        COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK_BATCH => {
+            let (retired, count) = provider_control::execute_ack_batch(
+                request, sender, leases, post_init_leases,
+                &mut service_checkpoints.providers,
+            )?;
+            response.payload_len = 0;
+            response.value0 = retired;
+            response.value1 = count;
+            Ok(())
+        }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT => {
             use rustos_component_model::health_wire;
             if request.arg0 != 0 || request.arg1 != 0
@@ -1677,20 +1706,87 @@ fn fill_commercial_max_response(
                 &request.payload[..request.payload_len as usize],
             )
             .map_err(|_| 22)?;
-            // The supervisor validates the entire DAG mutation first.
-            // Kernel-resident journal publication is the durable-within-boot
-            // commit point; no in-memory state changes before that.
-            service_checkpoints.preflight_mutate(request.arg0, record)?;
-            checkpoint_journal::append(
-                request.arg0,
-                rustos_user_abi::syscall::CHECKPOINT_JOURNAL_RECORD_MUTATE,
-                record,
+            // The supervisor validates the entire DAG mutation first (one
+            // plan, reused for the commit). Kernel-resident journal
+            // publication is the durable-within-boot commit point; no
+            // in-memory state changes before that.
+            let service = request.arg0;
+            match service_checkpoints.mutate_batch(service, &[record], |record| {
+                checkpoint_journal::append(
+                    service,
+                    rustos_user_abi::syscall::CHECKPOINT_JOURNAL_RECORD_MUTATE,
+                    record,
+                )
+                .map(|_| ())
+            }) {
+                Ok(commit) => {
+                    response.value0 = record.revision;
+                    response.value1 = commit.duplicates as u64;
+                    Ok(())
+                }
+                Err(failure) => {
+                    if failure.after_journal {
+                        fail_closed(b"rootd: fatal journaled checkpoint apply failed\n");
+                    }
+                    Err(failure.errno)
+                }
+            }
+        }
+        COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE_BATCH => {
+            // The reply preamble seeds value0 with an unrelated count; a
+            // rejected batch must report exactly zero committed records.
+            response.value0 = 0;
+            response.value1 = 0;
+            // One authorization (the same grant as single MUTATE) covers the
+            // whole ordered batch; see the op's ABI doc for prefix semantics.
+            authorize_service_slow_grant(
+                leases, post_init_leases, request.arg0, sender,
+                rustos_component_model::policy_ops::SlowBrokerOperation::WriteRecoveryCheckpoint,
             )?;
-            let duplicate = service_checkpoints.mutate(request.arg0, record)
-                .unwrap_or_else(|_| fail_closed(b"rootd: fatal journaled checkpoint apply failed\n"));
-            response.value0 = record.revision;
-            response.value1 = u64::from(duplicate);
-            Ok(())
+            if request.path_len != 0
+                || request.payload_len == 0
+                || request.payload_len as usize > request.payload.len()
+                || request.arg1 != 0
+                || request.arg2 != 0
+                || request.arg3 != 0
+            {
+                return Err(22);
+            }
+            // Decode and bound every frame before the first record commits so
+            // a malformed batch is rejected with nothing applied.
+            let records = rustos_svc_runtime::checkpoint_idl::decode_framed(
+                &request.payload[..request.payload_len as usize],
+            )
+            .map_err(|_| 22)?;
+            if records.is_empty()
+                || records.len() > rustos_user_abi::syscall::SERVICE_CHECKPOINT_BATCH_MAX_RECORDS
+            {
+                return Err(22);
+            }
+            let service = request.arg0;
+            match service_checkpoints.mutate_batch(service, &records, |record| {
+                checkpoint_journal::append(
+                    service,
+                    rustos_user_abi::syscall::CHECKPOINT_JOURNAL_RECORD_MUTATE,
+                    record,
+                )
+                .map(|_| ())
+            }) {
+                Ok(commit) => {
+                    response.value0 = commit.applied as u64;
+                    response.value1 = commit.duplicates as u64;
+                    Ok(())
+                }
+                Err(failure) => {
+                    if failure.after_journal {
+                        fail_closed(b"rootd: fatal journaled checkpoint apply failed\n");
+                    }
+                    // The committed prefix length must survive the error reply.
+                    response.value0 = failure.applied as u64;
+                    response.value1 = failure.duplicates as u64;
+                    Err(failure.errno)
+                }
+            }
         }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT => {
             authorize_service_slow_grant(
@@ -3497,6 +3593,12 @@ mod tests {
     use rustos_user_abi::syscall::{
         IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER,
     };
+
+    #[test]
+    fn refused_mutate_batch_reports_zero_committed_records() {
+        assert_eq!(reply_preamble_value0(COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE_BATCH, 6), 0);
+        assert_eq!(reply_preamble_value0(COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE, 6), 6);
+    }
 
     #[test]
     fn restart_dependency_deferrals_preserve_budget_but_real_eagain_is_charged() {

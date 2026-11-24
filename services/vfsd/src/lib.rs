@@ -3,7 +3,9 @@
 extern crate alloc;
 
 pub mod bulk_plan;
+pub mod checkpoint_batch;
 pub mod checkpoint_wire;
+pub mod cursor_sync;
 pub mod directory;
 pub mod inotify;
 pub mod lifecycle;
@@ -11,6 +13,7 @@ pub mod linux_types;
 pub mod locks;
 pub mod lru;
 pub mod mount_table;
+pub mod open_billing;
 pub mod path;
 pub mod permissions;
 pub mod proc_fs;
@@ -650,6 +653,10 @@ pub struct WaitSetReportState {
     pub disabled: bool,
 }
 
+/// Runtime epoll dispatch in `vfsd` has been retired to Ring0 `EpollHandle`
+/// (`kernel/ps/src/user/epoll.rs`); `WaitSetRegistry` remains in `vfsd`'s
+/// library surface while `formal/userspace-wait-set/WaitSetRegistry.tla` and
+/// its conformance/mutation witnesses are still bound here.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WaitSetRegistry {
     epolls: BTreeMap<u64, WaitSetEpoll>,
@@ -1865,9 +1872,39 @@ pub fn client_proxy_shape(
         rustos_user_abi::syscall::VFS_IPC_OP_FILE_IDENTITY
             | rustos_user_abi::syscall::VFS_IPC_OP_PREAD64
             | rustos_user_abi::syscall::VFS_IPC_OP_SHARED_BACKING
+            | rustos_user_abi::syscall::VFS_IPC_OP_BULK_READ
     ) && request_tid == sender_tid
         && request_pid != 0
         && request_pid != sender_pid
+}
+
+/// Validates and clamps the byte count for a `VFS_IPC_OP_BULK_READ` request.
+///
+/// Rejects zero-length or over-maximum requests with `EINVAL` and overflowing
+/// offsets with `EOVERFLOW`. Returns `Ok(0)` when `offset >= file_len` (EOF),
+/// otherwise the exact readable byte count clamped to `file_len - offset`.
+pub fn validate_bulk_read_request_bounds(
+    offset: u64,
+    requested: u64,
+    file_len: u64,
+    max_bytes: usize,
+) -> Result<usize, i32> {
+    if requested == 0 || max_bytes == 0 {
+        return Err(EINVAL);
+    }
+    let requested = usize::try_from(requested).map_err(|_| EINVAL)?;
+    if requested > max_bytes {
+        return Err(EINVAL);
+    }
+    if offset > i64::MAX as u64 {
+        return Err(EINVAL);
+    }
+    let available = file_len.saturating_sub(offset);
+    let count = requested.min(usize::try_from(available).unwrap_or(usize::MAX));
+    if offset.checked_add(count as u64).is_none() {
+        return Err(75); // EOVERFLOW
+    }
+    Ok(count)
 }
 
 // BEGIN lock-release-proxy
@@ -2121,6 +2158,12 @@ mod file_identity_proxy_tests {
         assert!(file_identity_proxy_shape(VFS_IPC_OP_PREAD64, 80, 7, 5, 7));
         assert!(file_identity_proxy_shape(
             rustos_user_abi::syscall::VFS_IPC_OP_SHARED_BACKING, 80, 7, 5, 7));
+        assert!(file_identity_proxy_shape(
+            rustos_user_abi::syscall::VFS_IPC_OP_BULK_READ, 80, 7, 5, 7));
+        assert!(!file_identity_proxy_shape(
+            rustos_user_abi::syscall::VFS_IPC_OP_BULK_READ, 80, 8, 5, 7), "thread must match");
+        assert!(!file_identity_proxy_shape(
+            rustos_user_abi::syscall::VFS_IPC_OP_BULK_READ, 5, 7, 5, 7), "equal pid is the ordinary path");
         assert!(!file_identity_proxy_shape(
             rustos_user_abi::syscall::VFS_IPC_OP_SHARED_BACKING, 80, 8, 5, 7), "thread must match");
         assert!(!file_identity_proxy_shape(
@@ -2170,5 +2213,65 @@ mod file_identity_proxy_tests {
         assert_eq!(reg.check_delete(1, key), Ok(()));
         reg.delete(1, key).unwrap();
         reg.retire(1).unwrap();
+    }
+
+    #[test]
+    fn bulk_read_bounds_and_wire_roundtrip() {
+        use rustos_user_abi::syscall::{
+            VfsBulkReadResponse, VFS_BULK_READ_MAX_BYTES, VFS_IPC_ABI_VERSION,
+            VFS_IPC_OP_BULK_READ,
+        };
+        assert_eq!(
+            super::validate_bulk_read_request_bounds(0, 0, 1024, VFS_BULK_READ_MAX_BYTES),
+            Err(super::EINVAL)
+        );
+        assert_eq!(
+            super::validate_bulk_read_request_bounds(
+                0,
+                (VFS_BULK_READ_MAX_BYTES as u64) + 1,
+                u64::MAX / 2,
+                VFS_BULK_READ_MAX_BYTES,
+            ),
+            Err(super::EINVAL)
+        );
+        assert_eq!(
+            super::validate_bulk_read_request_bounds(
+                u64::MAX,
+                4096,
+                u64::MAX,
+                VFS_BULK_READ_MAX_BYTES,
+            ),
+            Err(super::EINVAL)
+        );
+        assert_eq!(
+            super::validate_bulk_read_request_bounds(4096, 4096, 4096, VFS_BULK_READ_MAX_BYTES),
+            Ok(0)
+        );
+        assert_eq!(
+            super::validate_bulk_read_request_bounds(3072, 4096, 4096, VFS_BULK_READ_MAX_BYTES),
+            Ok(1024)
+        );
+        assert_eq!(
+            super::validate_bulk_read_request_bounds(
+                0,
+                1024 * 1024,
+                64 * 1024 * 1024,
+                VFS_BULK_READ_MAX_BYTES,
+            ),
+            Ok(1024 * 1024)
+        );
+
+        let resp = VfsBulkReadResponse {
+            version: VFS_IPC_ABI_VERSION,
+            op: VFS_IPC_OP_BULK_READ,
+            status: 0,
+            bytes_read: 1024 * 1024,
+            file_len: 64 * 1024 * 1024,
+            reserved0: 0,
+        };
+        let bytes = resp.to_bytes();
+        assert_eq!(bytes.len(), VfsBulkReadResponse::WIRE_BYTES);
+        assert_eq!(VfsBulkReadResponse::from_bytes(&bytes), Some(resp));
+        assert_eq!(VfsBulkReadResponse::from_bytes(&bytes[..31]), None);
     }
 }

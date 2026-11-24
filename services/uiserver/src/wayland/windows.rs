@@ -180,7 +180,8 @@ impl WaylandState {
         state.title.clear();
         state.title.push_str("Wayland App");
         state.decoration_requested_server = true;
-        state.pending_damage = Rect::empty();
+        state.pending_surface_damage = Rect::empty();
+        state.pending_buffer_damage = Rect::empty();
         state.needs_initial_configure = true;
         state.configured_serial = 0;
         state.acknowledged_serial = 0;
@@ -297,14 +298,15 @@ impl WaylandState {
         } else {
             state.pre_maximize_frame = Some(state.frame);
             let bounds = layout::desktop_bounds(display_width, display_height);
+            let border = window_border();
             clamp_wayland_frame(
                 Rect {
                     x: bounds.x,
                     y: bounds.y,
-                    width: bounds.width.saturating_sub(WINDOW_BORDER * 2),
+                    width: bounds.width.saturating_sub(border * 2),
                     height: bounds
                         .height
-                        .saturating_sub(WINDOW_BORDER * 2 + WINDOW_TITLE_HEIGHT),
+                        .saturating_sub(border * 2 + window_title_height()),
                 },
                 display_width,
                 display_height,

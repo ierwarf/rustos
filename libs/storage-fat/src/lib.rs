@@ -54,9 +54,17 @@ const READ_WINDOW_BYTES: usize = 60 * 1024;
 ///
 /// fatfs reads a file one cluster at a time and consults the FAT between
 /// clusters, so a single-block cache made every cluster cost two device
-/// round trips (data, then a re-read of the FAT sector). Two windows keep the
-/// FAT region and the data region resident at once, and a window that follows
-/// directly on a previous one grows to the full read-ahead size.
+/// round trips (data, then a re-read of the FAT sector). Several windows keep
+/// the FAT region, the directory clusters a path walk revisits and the data
+/// region resident at once; a window that follows directly on a previous one
+/// grows to the full read-ahead size, and a miss elsewhere reads around the
+/// wanted block (an aligned window) because FAT and directory structures are
+/// dense, so one fetch serves the neighbouring entries of the next lookups.
+/// Resident read windows (LRU). Path resolution touches the FAT, a few
+/// directory clusters per component and the file data; two windows made every
+/// `openat` of a deep path re-fetch metadata over storaged IPC.
+const READ_WINDOW_COUNT: usize = 8;
+
 struct ReadWindow {
     start_lba: u64,
     blocks: usize,
@@ -117,7 +125,7 @@ pub struct FatDisk<D: BlockDevice> {
     pos: u64,
     block_size: usize,
     bytes_len: u64,
-    windows: [ReadWindow; 2],
+    windows: [ReadWindow; READ_WINDOW_COUNT],
     tick: u64,
     dirty: BTreeMap<u64, Vec<u8>>,
     writeback_no_barrier: bool,
@@ -144,7 +152,7 @@ impl<D: BlockDevice> FatDisk<D> {
             pos: 0,
             block_size,
             bytes_len,
-            windows: [ReadWindow::empty(), ReadWindow::empty()],
+            windows: core::array::from_fn(|_| ReadWindow::empty()),
             tick: 0,
             dirty: BTreeMap::new(),
             writeback_no_barrier: false,
@@ -163,20 +171,27 @@ impl<D: BlockDevice> FatDisk<D> {
             .windows
             .iter()
             .any(|window| window.blocks != 0 && window.start_lba + window.blocks as u64 == lba);
-        let span = if sequential {
-            window_blocks
+        // A sequential refill continues exactly at `lba`; any other miss reads
+        // around `lba` from its window-aligned start so the neighbouring
+        // directory entries and FAT sectors of the next lookups are resident.
+        let (start, span) = if sequential {
+            (lba, window_blocks)
         } else {
-            need_blocks.min(window_blocks)
+            let around = lba - lba % window_blocks as u64;
+            let wanted_end = lba + need_blocks.min(window_blocks) as u64;
+            (around, ((wanted_end - around) as usize).max(window_blocks))
         };
-        let span = (span.max(1) as u64).min(total_blocks.saturating_sub(lba)) as usize;
-        if span == 0 {
+        let span = (span.max(1) as u64).min(total_blocks.saturating_sub(start)) as usize;
+        if span == 0 || start + span as u64 <= lba {
             return Err(StorageError::InvalidInput);
         }
-        let victim = if self.windows[0].stamp <= self.windows[1].stamp {
-            0
-        } else {
-            1
-        };
+        let lba = start;
+        let victim = self
+            .windows
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, window)| (window.blocks != 0, window.stamp))
+            .map_or(0, |(index, _)| index);
         let block_size = self.block_size;
         let window = &mut self.windows[victim];
         window.blocks = 0;
@@ -761,9 +776,10 @@ impl<D: BlockDevice> FatVolume<D> {
     }
 
     pub fn read_file_into(&self, path: &str, dest: &mut [u8]) -> Result<usize, FatError> {
-        let normalized = normalize_fat_path_cow(path);
         let fs = self.lock_fs();
-        let mut file = fs.root_dir().open_file(normalized.as_ref())?;
+        // Bounded walk: fatfs's own path lookup follows a cyclic directory
+        // cluster chain forever when the name is absent.
+        let (mut file, _) = Self::open_file_with_len_in(&fs, self.max_dir_entries(), path)?;
         let mut done = 0usize;
         while done < dest.len() {
             let chunk_len = (dest.len() - done).min(FILE_READ_CHUNK_CAP);
@@ -782,9 +798,8 @@ impl<D: BlockDevice> FatVolume<D> {
         offset: u64,
         dest: &mut [u8],
     ) -> Result<usize, FatError> {
-        let normalized = normalize_fat_path_cow(path);
         let fs = self.lock_fs();
-        let mut file = fs.root_dir().open_file(normalized.as_ref())?;
+        let (mut file, _) = Self::open_file_with_len_in(&fs, self.max_dir_entries(), path)?;
         file.seek(SeekFrom::Start(offset))?;
         let mut done = 0usize;
         while done < dest.len() {
@@ -1098,6 +1113,32 @@ mod tests {
     }
 
     #[test]
+    fn scattered_metadata_probes_read_around_and_stay_resident() {
+        // A path walk probes a few scattered 512-byte spots (FAT sector,
+        // directory clusters). Each used to cost one device call per probe and
+        // two windows thrashed; read-around windows serve neighbours and the
+        // resident set serves repeats.
+        let mut inner = MemBlockDevice::new_zeroed(512, 4096);
+        let pattern = (0..512 * 4096).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        inner.write_blocks(0, &pattern).expect("seed");
+        let mut disk =
+            FatDisk::new(CountingBlockDevice { inner, reads: 0 }).expect("valid counting disk");
+        let spots = [3_u64, 700, 1500, 2300, 3100, 3900, 5, 710, 1512, 2310, 3110, 3910];
+        let mut sector = [0_u8; 512];
+        for round in 0..4 {
+            for &lba in &spots {
+                let at = lba * 512;
+                disk.seek(SeekFrom::Start(at)).expect("seek");
+                disk.read(&mut sector).expect("read");
+                assert_eq!(&sector[..], &pattern[at as usize..at as usize + 512], "round {round}");
+            }
+        }
+        // Six distinct 60 KiB regions; one fill each, nothing refetched.
+        let reads = disk.dev.lock().device.reads;
+        assert!(reads <= 6, "reads = {reads}");
+    }
+
+    #[test]
     fn case_variants_and_short_aliases_resolve_to_one_canonical_path() {
         let disk = format_disk(512, 4096, 0x0A0B_0C0D);
         let mut volume = FatVolume::new(disk).expect("open FAT volume");
@@ -1140,6 +1181,35 @@ mod tests {
                 .is_err()
         );
         volume.unmount().expect("unmount");
+    }
+
+    #[test]
+    fn read_file_into_terminates_on_cyclic_directory_chain() {
+        let disk = format_disk(512, 4096, 0x0BAD_C0DE);
+        let volume = FatVolume::new(disk).expect("open FAT volume");
+        volume.create_dir("d").expect("create dir");
+        volume.lock_fs().flush_disk().expect("flush");
+        let mut bytes = volume.device.lock().device.as_bytes().to_vec();
+        drop(volume);
+        let reserved = u16::from_le_bytes([bytes[14], bytes[15]]) as usize;
+        let fats = bytes[16] as usize;
+        let root_entries = u16::from_le_bytes([bytes[17], bytes[18]]) as usize;
+        let fat_sectors = u16::from_le_bytes([bytes[22], bytes[23]]) as usize;
+        let cluster_bytes = 512 * bytes[13] as usize;
+        let data_start = (reserved + fats * fat_sectors + (root_entries * 32).div_ceil(512)) * 512;
+        // Directory "d" owns cluster 2: fill it with deleted entries (no end
+        // marker) and link the cluster to itself.
+        for entry in bytes[data_start..data_start + cluster_bytes].chunks_exact_mut(32) {
+            entry.fill(0);
+            entry[0] = 0xe5;
+        }
+        let fat_start = reserved * 512;
+        bytes[fat_start + 4..fat_start + 6].copy_from_slice(&2_u16.to_le_bytes());
+        let device = MemBlockDevice::from_bytes(512, bytes).expect("device");
+        let volume = FatVolume::new(device).expect("remount");
+        let mut dest = [0_u8; 8];
+        assert!(volume.read_file_into("d/missing.txt", &mut dest).is_err());
+        assert!(volume.read_file_range_into("d/missing.txt", 0, &mut dest).is_err());
     }
 
     #[test]

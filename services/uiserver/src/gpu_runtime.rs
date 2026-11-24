@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use std::vec::Vec;
 
 use driver_domain_protocol::{
-    DvmGpuAtlasCompletion, DvmGpuAtlasDamage, DvmGpuPrimeCompletion, DvmGpuPrimeCompletionStatus,
-    DVM_GPU_RENDER_MAX_IN_FLIGHT,
+    DVM_GPU_RENDER_MAX_IN_FLIGHT, DvmGpuAtlasCompletion, DvmGpuAtlasDamage, DvmGpuPrimeCompletion,
+    DvmGpuPrimeCompletionStatus,
 };
 use rustos_user_abi::device::{DISPLAY_INFO_FLAG_DVM_SCANOUT, DISPLAY_INFO_FLAG_GPU_COMPOSITOR};
 use rustos_user_abi::syscall::PRODUCT_MILESTONE_DISPLAY_READY;
@@ -39,16 +39,16 @@ use crate::gpu_scene::{
     GpuLayerKind, GpuSceneCompiler, GpuSceneError, GpuSceneLayer, GpuTextureCapability,
 };
 use crate::render::{
+    ConsoleAtlasBinding, CroppedWaylandBinding, GpuAtlasScene, WaylandAtlasBinding,
     build_gpu_atlas_scene, gpu_cursor_layer, gpu_dock_reuse_signature, gpu_scene_reuse_signature,
-    update_console_gpu_textures, update_dock_gpu_texture, update_gpu_cursor_texture,
-    update_gpu_layer_destinations, update_wayland_gpu_textures, ConsoleAtlasBinding, GpuAtlasScene,
-    WaylandAtlasBinding,
+    update_console_gpu_textures, update_cropped_wayland_textures, update_dock_gpu_texture,
+    update_gpu_cursor_texture, update_gpu_layer_destinations, update_wayland_gpu_textures,
 };
 use crate::sys::{
-    debug_line, diag_line, display_create_gpu_atlas_surface, display_get_info,
-    display_gpu_get_info, display_gpu_query_completion, display_gpu_submit, map_surface,
-    spawn_ui_thread, DisplayGpuInfo, DisplayInfo, DisplaySurfaceCreate, SurfaceMapping,
-    UiThreadRole, EAGAIN, EINVAL, ENODEV, ESTALE,
+    DisplayGpuInfo, DisplayInfo, DisplaySurfaceCreate, EAGAIN, EINVAL, ENODEV, ESTALE,
+    SurfaceMapping, UiThreadRole, debug_line, diag_line, display_create_gpu_atlas_surface,
+    display_get_info, display_gpu_get_info, display_gpu_query_completion, display_gpu_submit,
+    map_surface, spawn_ui_thread,
 };
 
 // Upper bound on one atlas backing (the shipped atlas is 2048x2048 BGRA, 16 MiB).
@@ -171,6 +171,8 @@ pub(crate) struct GpuCompositor {
     cursor_motion: CursorMotion,
     retained_scene_signature: u64,
     cropped: bool,
+    cropped_reusable: bool,
+    cropped_wayland_bindings: Vec<CroppedWaylandBinding>,
     capacity_pressure_logged_at: Option<Instant>,
     wayland_bindings: Vec<WaylandAtlasBinding>,
     console_bindings: Vec<ConsoleAtlasBinding>,
@@ -183,6 +185,8 @@ pub(crate) struct GpuCompositor {
     /// treating the rejected damage as externally committed.
     force_full_snapshot: bool,
     active: bool,
+    activation_epoch: u64,
+    activation_damage_rects: usize,
     activation_deadline: Instant,
     next_health_probe: Instant,
     last_completion_at: Instant,
@@ -543,8 +547,8 @@ impl GpuCompositor {
             .map_err(|error| {
                 let errno = gpu_scene_errno(error);
                 debug_line(&format!(
-                "uiserver: GPU initialization rejected stage=compiler-prime-begin errno={errno}"
-            ));
+                    "uiserver: GPU initialization rejected stage=compiler-prime-begin errno={errno}"
+                ));
                 errno
             })?;
         // GPU_GET_INFO carries the DVM-produced, kernel-module-validated
@@ -603,6 +607,8 @@ impl GpuCompositor {
                 cursor_motion: CursorMotion::stationary(),
                 retained_scene_signature: 0,
                 cropped: false,
+                cropped_reusable: false,
+                cropped_wayland_bindings: Vec::new(),
                 capacity_pressure_logged_at: None,
                 wayland_bindings: Vec::new(),
                 console_bindings: Vec::new(),
@@ -612,6 +618,8 @@ impl GpuCompositor {
                 pending: Vec::with_capacity(info.slot_count as usize),
                 force_full_snapshot: false,
                 active: false,
+                activation_epoch: 0,
+                activation_damage_rects: 0,
                 activation_deadline: Instant::now() + GPU_FIRST_FRAME_TIMEOUT,
                 next_health_probe: Instant::now() + GPU_PROVIDER_HEALTH_INTERVAL,
                 last_completion_at: Instant::now(),
@@ -629,6 +637,12 @@ impl GpuCompositor {
     ) -> Result<Option<GpuPresentStats>, i32> {
         let total_started = Instant::now();
         while self.retire_oldest(false)? {}
+        if !self.active && !self.pending.is_empty() {
+            // The activation frame is in flight; submitting another full
+            // snapshot would race it. `retire_oldest` above already reports
+            // the first-frame timeout.
+            return Err(EAGAIN);
+        }
         let retire_elapsed = total_started.elapsed();
         let submission_started = Instant::now();
         if submission_started < self.next_submission_at {
@@ -644,11 +658,16 @@ impl GpuCompositor {
         let mut rebuild_scene_elapsed = Duration::ZERO;
         let mut rebuild_difference_elapsed = Duration::ZERO;
         let mut damage = Vec::new();
-        let current_scene_signature = gpu_scene_reuse_signature(state);
+        let current_scene_signature = gpu_scene_reuse_signature(state, self.cropped);
         let current_dock_signature = gpu_dock_reuse_signature(state);
         let mut full_rebuild = !self.active
             || (scene_dirty
-                && (self.cropped || current_scene_signature != self.retained_scene_signature));
+                && ((self.cropped && !self.cropped_reusable)
+                    // Chrome/clock invalidation only changes the content
+                    // version when the desktop layer is actually repainted.
+                    || !state.desktop_cache.fully_valid()
+                    || state.desktop_cache.clock_stale
+                    || current_scene_signature != self.retained_scene_signature));
         if scene_dirty
             && !full_rebuild
             && !update_gpu_layer_destinations(
@@ -674,6 +693,19 @@ impl GpuCompositor {
             {
                 Some(changed) => damage.extend(changed.into_iter().map(damage_from_rect)),
                 None => full_rebuild = true,
+            }
+            if !full_rebuild && self.cropped {
+                match update_cropped_wayland_textures(
+                    state,
+                    self.atlas.as_mut_slice(),
+                    stride_pixels,
+                    self.cropped_wayland_bindings.as_mut_slice(),
+                )
+                .map_err(gpu_scene_errno)?
+                {
+                    Some(changed) => damage.extend(changed.into_iter().map(damage_from_rect)),
+                    None => full_rebuild = true,
+                }
             }
             if !full_rebuild {
                 match update_console_gpu_textures(
@@ -730,6 +762,8 @@ impl GpuCompositor {
                 cursor_source_rect,
                 wayland_bindings,
                 console_bindings,
+                cropped_wayland_bindings,
+                cropped_reusable,
                 cropped,
                 used_height: next_used_height,
                 dock_source_rect,
@@ -763,10 +797,13 @@ impl GpuCompositor {
                     self.force_full_snapshot = true;
                     self.next_submission_at = Instant::now() + GPU_FRAME_INTERVAL;
                     let now = Instant::now();
-                    if self.capacity_pressure_logged_at.is_none_or(|last| {
-                        now.duration_since(last) >= Duration::from_secs(1)
-                    }) {
-                        diag_line(format!("uiserver: gpu scene backpressured capacity={error:?}; retaining previous complete frame"));
+                    if self
+                        .capacity_pressure_logged_at
+                        .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
+                    {
+                        diag_line(format!(
+                            "uiserver: gpu scene backpressured capacity={error:?}; retaining previous complete frame"
+                        ));
                         self.capacity_pressure_logged_at = Some(now);
                     }
                     return Err(EAGAIN);
@@ -818,7 +855,12 @@ impl GpuCompositor {
             self.wayland_bindings = wayland_bindings;
             self.console_bindings = console_bindings;
             self.cropped = cropped;
-            self.retained_scene_signature = gpu_scene_reuse_signature(state);
+            self.cropped_reusable = cropped_reusable;
+            self.cropped_wayland_bindings = cropped_wayland_bindings;
+            // The rebuilt atlas was cut from the current snapshots, which
+            // already contain every accepted commit.
+            state.wayland_pending_damage.clear();
+            self.retained_scene_signature = gpu_scene_reuse_signature(state, cropped);
         } else if state.cursor_motion != self.cursor_motion {
             let cursor_source_rect = self.cursor_source_rect.ok_or(EINVAL)?;
             update_gpu_cursor_texture(
@@ -997,7 +1039,10 @@ impl GpuCompositor {
             // Attach before the first-frame blocking retirement: it can
             // complete synchronously before this present call returns.
             input_completion: crate::input_completion::submitted(
-                submit_accepted, self.info.generation, self.next_content_epoch, surface_handle,
+                submit_accepted,
+                self.info.generation,
+                self.next_content_epoch,
+                surface_handle,
             ),
         });
         self.damage_history.push_back(AtlasDamageEpoch {
@@ -1007,36 +1052,14 @@ impl GpuCompositor {
         while self.damage_history.len() > self.slots.len() {
             self.damage_history.pop_front();
         }
-        self.next_submission_at = next_frame_deadline(self.next_submission_at, submission_started);
+        self.next_submission_at = next_frame_deadline(submission_started);
         if !self.active {
-            if !self.retire_oldest(true)? {
-                return Err(EINVAL);
-            }
-            let (source_path, zero_copy) = match self.info.flags {
-                rustos_user_abi::device::DISPLAY_GPU_INFO_FLAG_STAGED_COPY => ("staged-copy", 0),
-                rustos_user_abi::device::DISPLAY_GPU_INFO_FLAG_DIRECT_DMABUF => ("dmabuf", 1),
-                _ => return Err(EINVAL),
-            };
-            let active_contract = format!(
-                "uiserver: gpu-compositor active contract=3 source-path={} zero-copy={} public-abi=0 atlas={}x{} damage-rects={}",
-                source_path,
-                zero_copy,
-                self.info.atlas_width,
-                self.info.atlas_height,
-                submit_damage.len(),
-            );
-            // This one-shot transition is release evidence. Do not let a full
-            // asynchronous observability queue erase it.
-            debug_line(&active_contract);
-            let _ = rustos_svc_runtime::ipc::product_milestone(
-                PRODUCT_MILESTONE_DISPLAY_READY,
-                self.info.generation,
-                self.next_content_epoch,
-            );
-            diag_line(active_contract);
-            crate::startup::global().succeed(crate::startup::Dependency::Gpu);
+            // The activation frame never blocks the UI thread: the first-frame
+            // contract allows 5 s, the UI phase watchdog 3 s. Completion is
+            // consumed by `retire_oldest`, which then runs `complete_activation`.
+            self.activation_epoch = self.next_content_epoch;
+            self.activation_damage_rects = submit_damage.len();
         }
-        self.active = true;
         self.next_slot = (slot_index + 1) % self.slots.len();
         self.next_content_epoch = self.next_content_epoch.checked_add(1).ok_or(EINVAL)?;
         Ok(Some(stats))
@@ -1094,6 +1117,34 @@ impl GpuCompositor {
         Ok(best.map(|(slot_index, _)| slot_index))
     }
 
+    fn complete_activation(&mut self) -> Result<(), i32> {
+        let (source_path, zero_copy) = match self.info.flags {
+            rustos_user_abi::device::DISPLAY_GPU_INFO_FLAG_STAGED_COPY => ("staged-copy", 0),
+            rustos_user_abi::device::DISPLAY_GPU_INFO_FLAG_DIRECT_DMABUF => ("dmabuf", 1),
+            _ => return Err(EINVAL),
+        };
+        let active_contract = format!(
+            "uiserver: gpu-compositor active contract=3 source-path={} zero-copy={} public-abi=0 atlas={}x{} damage-rects={}",
+            source_path,
+            zero_copy,
+            self.info.atlas_width,
+            self.info.atlas_height,
+            self.activation_damage_rects,
+        );
+        // This one-shot transition is release evidence. Do not let a full
+        // asynchronous observability queue erase it.
+        debug_line(&active_contract);
+        let _ = rustos_svc_runtime::ipc::product_milestone(
+            PRODUCT_MILESTONE_DISPLAY_READY,
+            self.info.generation,
+            self.activation_epoch,
+        );
+        diag_line(active_contract);
+        crate::startup::global().succeed(crate::startup::Dependency::Gpu);
+        self.active = true;
+        Ok(())
+    }
+
     pub(crate) fn poll_completions(&mut self) -> Result<(), i32> {
         if !self.active && Instant::now() >= self.activation_deadline {
             debug_line("uiserver: first GPU frame readiness timed out");
@@ -1147,6 +1198,9 @@ impl GpuCompositor {
                     self.completion_stall_logged = false;
                     // Both exact render and present receipts validated above.
                     crate::input_completion::completed(frame.input_completion);
+                    if !self.active {
+                        self.complete_activation()?;
+                    }
                     return Ok(true);
                 }
                 Err(EAGAIN) if !blocking && !timed_out => {
@@ -1167,7 +1221,9 @@ impl GpuCompositor {
                 Err(EAGAIN) if self.active => {
                     if !self.completion_stall_logged {
                         self.completion_stall_logged = true;
-                        diag_line("uiserver: DVM GPU completion stalled; waiting for completion or provider loss");
+                        diag_line(
+                            "uiserver: DVM GPU completion stalled; waiting for completion or provider loss",
+                        );
                     }
                     return Ok(false);
                 }
@@ -1211,12 +1267,12 @@ fn gpu_completion_timed_out(
     }
 }
 
-fn next_frame_deadline(mut deadline: Instant, now: Instant) -> Instant {
-    deadline += GPU_FRAME_INTERVAL;
-    while deadline <= now {
-        deadline += GPU_FRAME_INTERVAL;
-    }
-    deadline
+/// Earliest next submission: a minimum spacing from this one, not a fixed
+/// phase grid. A grid made an input event that wakes an idle compositor wait
+/// for an unrelated slot boundary (up to a whole interval); spacing keeps the
+/// same maximum submission rate while an isolated update presents at once.
+fn next_frame_deadline(submitted_at: Instant) -> Instant {
+    submitted_at + GPU_FRAME_INTERVAL
 }
 
 fn rebind_layers(layers: &mut [GpuSceneLayer], capability: GpuTextureCapability) {

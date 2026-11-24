@@ -40,6 +40,26 @@ are applied; privilege bits are stripped during extraction. The recorded digest
 is a local pin, not an independent verification of Google's package signature.
 Locally imported payloads are not checked-in formal source evidence.
 
+### Startup work removed from every launch
+
+- **Font cache.** `cargo xtask stage` runs the host `fc-cache` against the image
+  and ships `/usr/share/fontconfig-cache` (first `<cachedir>` of the staged
+  `/etc/fonts/fonts.conf`), one `*-le64.cache-12` per font directory, so Chrome's
+  bundled fontconfig reads parsed font data instead of scanning every font file
+  and failing to write the result. fontconfig accepts a cache when its recorded
+  directory mtime equals the directory's mtime or the directory's mtime is `0`
+  (the image's FAT directories carry the zero FAT date, which the FAT driver
+  reports as unset), so the cache stays valid whatever time the host staged it.
+  A guest that reports a non-zero directory mtime rejects the caches and falls
+  back to scanning into the writable cache directory (the previous behaviour).
+  Staging fails if `fc-cache` is missing or writes a cache format other than 12.
+- **Probes and background services.** The manifest passes `--no-first-run`,
+  `--no-default-browser-check`, `--password-store=basic` (no keyring D-Bus
+  probe), and disables component update, sync, default apps, domain reliability,
+  `MediaRouter`, `OptimizationHints` and `Translate`; `GSETTINGS_BACKEND=memory`
+  and `GIO_USE_VFS=local` stop GIO looking for dconf and gvfs. None of these
+  touch the sandbox policy; `--no-sandbox` remains the documented interim.
+
 ## 한국어
 
 Chrome은 RustOS가 빌드하는 프로그램이 아니라 외부 Linux 앱입니다. 바이너리는

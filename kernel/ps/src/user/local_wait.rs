@@ -165,9 +165,10 @@ impl LocalDescription {
     }
 }
 
-// Four thousand live objects system wide. A pipe is two objects; this bounds
-// registry memory (128 KiB of `.bss`) independently of the per-process fd cap.
-const REGISTRY_CAPACITY: usize = 4096;
+// Eight thousand live objects system wide. A pipe or connected Unix socket pair
+// is two objects; this bounds registry memory (256 KiB of `.bss`) independently
+// of the per-process fd cap.
+const REGISTRY_CAPACITY: usize = 8192;
 const _: () = assert!(REGISTRY_CAPACITY.is_power_of_two());
 
 enum Slot {

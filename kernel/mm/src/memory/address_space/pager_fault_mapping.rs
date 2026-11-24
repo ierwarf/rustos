@@ -162,6 +162,14 @@ fn tagged_child_of(
     Ok(Some(entry.addr()))
 }
 
+/// One page-table page that holds root-owned leaves, with the virtual address
+/// of its first entry.
+#[derive(Clone, Copy)]
+pub(super) struct LeafTablePage {
+    pub(super) base_virtual_address: u64,
+    pub(super) table_phys: PhysAddr,
+}
+
 /// The virtual-address bit position each paging level indexes.
 const PML4_SHIFT: u32 = 39;
 const PDPT_SHIFT: u32 = 30;
@@ -1320,7 +1328,72 @@ impl ProcessAddressSpace {
             })
     }
 
-    /// Collects every frame whose page-table tag must agree with a descriptor.
+    /// Lists every leaf-bearing page-table page that holds at least one
+    /// root-owned leaf, plus the total owned-leaf count.
+    ///
+    /// Fork duplication walks the parent one 512-entry page at a time from this
+    /// list instead of re-translating every virtual address. The scan applies
+    /// the same validity rules as [`Self::walk_pager_fault_ownership`] (a huge
+    /// directory entry or a non-present owned leaf is corruption), but records
+    /// only the page, so its allocation is proportional to the number of
+    /// page-table pages rather than to the number of resident leaves.
+    pub(super) fn owned_leaf_table_pages(
+        &self,
+    ) -> Result<(Vec<LeafTablePage>, usize), AddressSpaceError> {
+        let mut pages = Vec::new();
+        let mut total = 0_usize;
+        if self.pml4_frame_phys == 0 {
+            return Ok((pages, total));
+        }
+        let mut ignore = |_table: u64| {};
+        let root = self.root_table_ref();
+        let Some(pdpt_phys) = tagged_child_of(&root[USER_PML4_INDEX], &mut ignore)? else {
+            return Ok((pages, total));
+        };
+        // SAFETY: the caller holds this address space's fork/mutation authority,
+        // so the hierarchy is stable and its tables outlive this `&self`.
+        let pdpt = unsafe { kernel_vm::phys_to_table_ref(pdpt_phys) };
+        for p3 in 0..ENTRIES_PER_TABLE {
+            let Some(pd_phys) = tagged_child_of(&pdpt[p3], &mut ignore)? else {
+                continue;
+            };
+            // SAFETY: as above for the next present non-huge table.
+            let pd = unsafe { kernel_vm::phys_to_table_ref(pd_phys) };
+            for p2 in 0..ENTRIES_PER_TABLE {
+                let Some(pt_phys) = tagged_child_of(&pd[p2], &mut ignore)? else {
+                    continue;
+                };
+                // SAFETY: as above for the leaf-bearing table.
+                let pt = unsafe { kernel_vm::phys_to_table_ref(pt_phys) };
+                let mut leaves = 0_usize;
+                for entry in pt.iter() {
+                    if entry.is_unused() || !entry.flags().contains(ROOT_OWNED_USER_LEAF) {
+                        continue;
+                    }
+                    if !entry.flags().contains(PageTableFlags::PRESENT) {
+                        return Err(AddressSpaceError::InvalidFrameOwnership);
+                    }
+                    leaves += 1;
+                }
+                if leaves == 0 {
+                    continue;
+                }
+                pages
+                    .try_reserve(1)
+                    .map_err(|_| AddressSpaceError::OutOfFrames)?;
+                pages.push(LeafTablePage {
+                    base_virtual_address: ((USER_PML4_INDEX as u64) << PML4_SHIFT)
+                        | ((p3 as u64) << PDPT_SHIFT)
+                        | ((p2 as u64) << PD_SHIFT),
+                    table_phys: pt_phys,
+                });
+                total += leaves;
+            }
+        }
+        Ok((pages, total))
+    }
+
+    /// Visits every frame whose page-table tag must agree with a descriptor.
     ///
     /// Every owned leaf carries `ROOT_OWNED_USER_LEAF`. Every dynamically created
     /// user table carries `ROOT_OWNED_USER_TABLE`, regardless of whether a
@@ -1331,15 +1404,8 @@ impl ProcessAddressSpace {
     /// the user subtree, is not a reclaim failure but a structural violation:
     /// nothing in this tree can produce either, so the walk reports it rather
     /// than guessing what the topology meant.
-    pub(crate) fn pager_fault_ownership(&self) -> Result<PagerFaultOwnership, AddressSpaceError> {
-        let mut owned = PagerFaultOwnership::empty();
-        let PagerFaultOwnership { leaves, tables } = &mut owned;
-        self.walk_pager_fault_ownership(|table| tables.push(table), |leaf| leaves.push(leaf))?;
-        Ok(owned)
-    }
-
-    /// Visits the same tagged tables and leaves as [`Self::pager_fault_ownership`]
-    /// without collecting them, so a caller can settle each one as it is found.
+    ///
+    /// Nothing is collected, so a caller can settle each one as it is found.
     ///
     /// Retirement uses this to avoid a heap allocation proportional to the
     /// address space at the moment the system is most likely to be short of

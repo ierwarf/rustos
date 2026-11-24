@@ -2,14 +2,17 @@ use vte::{Params, Parser, Perform};
 
 use crate::canvas::{Rect, SurfaceCanvas};
 use crate::font;
+use crate::layout;
+use crate::ui_scale;
 
-const TERMINAL_PADDING_X: usize = 16;
-const TERMINAL_PADDING_Y: usize = 14;
 const MAX_CONSOLE_COLS: usize = 240;
 const MAX_CONSOLE_ROWS: usize = 128;
 const MAX_CONSOLE_CELLS: usize = MAX_CONSOLE_COLS * MAX_CONSOLE_ROWS;
 const MAX_SCROLLBACK_LINES: usize = 256;
-const CURSOR_UNDERLINE_HEIGHT: usize = 2;
+
+fn cursor_underline_height() -> usize {
+    ui_scale::px(2)
+}
 
 /// Packed terminal cell storing ASCII character and 1-based ANSI 16-color
 /// indices (`0` = default theme foreground/background).
@@ -64,8 +67,8 @@ impl TerminalLayout {
             bounds: Rect::empty(),
             cols: 0,
             rows: 0,
-            padding_x: TERMINAL_PADDING_X,
-            padding_y: TERMINAL_PADDING_Y,
+            padding_x: 0,
+            padding_y: 0,
             cell_width: 10,
             cell_height: 20,
         }
@@ -80,8 +83,10 @@ impl TerminalLayout {
     }
 
     fn with_cell_metrics(bounds: Rect, cell_width: usize, cell_height: usize) -> Self {
-        let usable_width = bounds.width.saturating_sub(TERMINAL_PADDING_X * 2);
-        let usable_height = bounds.height.saturating_sub(TERMINAL_PADDING_Y * 2);
+        let padding_x = layout::terminal_padding_x();
+        let padding_y = layout::terminal_padding_y();
+        let usable_width = bounds.width.saturating_sub(padding_x * 2);
+        let usable_height = bounds.height.saturating_sub(padding_y * 2);
 
         Self {
             bounds,
@@ -93,8 +98,8 @@ impl TerminalLayout {
                 .checked_div(cell_height)
                 .unwrap_or(0)
                 .clamp(1, MAX_CONSOLE_ROWS),
-            padding_x: TERMINAL_PADDING_X,
-            padding_y: TERMINAL_PADDING_Y,
+            padding_x,
+            padding_y,
             cell_width,
             cell_height,
         }
@@ -573,7 +578,7 @@ impl TerminalState {
             && row == self.cursor_row
             && col == self.cursor_col
         {
-            let underline_height = CURSOR_UNDERLINE_HEIGHT.min(cell_rect.height);
+            let underline_height = cursor_underline_height().min(cell_rect.height);
             let underline_y = cell_rect.y + cell_rect.height - underline_height;
             canvas.fill_rect(
                 Rect {
@@ -706,8 +711,8 @@ mod tests {
         let bounds = Rect {
             x: 0,
             y: 0,
-            width: 160,
-            height: 100,
+            width: crate::ui_scale::px(160),
+            height: crate::ui_scale::px(100),
         };
         let mut terminal = TerminalState::new();
         let bytes = b"abcdefghijklmnop";

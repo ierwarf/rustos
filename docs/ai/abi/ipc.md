@@ -238,6 +238,18 @@ no cell/epoch state to refine.
 
 ## IPC Wait Discipline
 
+- Kernel-originated byte-only calls to the allow-listed named services (vfsd,
+  procd, loaderd) first try the same rendezvous (direct-switch) transport that
+  user `SYS_RUSTOS_IPC_CALL` uses, with the reply deadline computed once up
+  front, and fall back to the queued transport with that same deadline when the
+  rendezvous is refused (no parked receiver at the front of an idle endpoint,
+  empty or over-64 KiB request, preemption disabled or a spinlock held, no user
+  identity, scheduler refusal). A rendezvous frame is pinned to the receiving
+  task, so these services must reply from the thread that received the request;
+  a reply from another thread of the process is refused with `EPERM`, whereas
+  the queued transport accepts any thread. A service that replies from a worker
+  (devmgrd ioctl workers, netd) must stay off the allow-list. Rendezvous calls
+  skip the Job `IpcMessage` charge, as other fast calls do.
 - A user-created endpoint and every reply capability queued through it are
   owned by the creating **process**, not a single creating task. Any worker in
   that process may receive/reply; a different process must receive `EPERM`

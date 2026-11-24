@@ -28,6 +28,7 @@ const MAX_CLIENT_IN_BYTES: usize = 4 * 1024 * 1024 + 4096;
 const MAX_CLIENT_OUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BUS_CLIENTS: usize = 128;
 const MAX_MATCHES_PER_CLIENT: usize = 256;
+const MAX_NAMES_PER_CLIENT: usize = 256;
 const MAX_READS_PER_TURN: usize = 64;
 
 const MSG_METHOD_CALL: u8 = 1;
@@ -950,6 +951,25 @@ impl BusState {
                 let scope = Self::bus_scope(bus);
                 let reply_code = match self.names.get(&(scope, name.clone())).copied() {
                     None => {
+                        // Every name is a heap key held for the connection's
+                        // life; an unbounded count is client-driven growth.
+                        let owned = self
+                            .names
+                            .iter()
+                            .filter(|((s, _), owner)| *s == scope && **owner == sender_id)
+                            .count();
+                        if owned >= MAX_NAMES_PER_CLIENT {
+                            if !no_reply {
+                                self.send_error(
+                                    sender_id,
+                                    unique,
+                                    msg.serial,
+                                    "org.freedesktop.DBus.Error.LimitsExceeded",
+                                    "too many names owned by this connection",
+                                );
+                            }
+                            return true;
+                        }
                         self.names.insert((scope, name.clone()), sender_id);
                         let mut sig_body = Vec::new();
                         encode_string(&mut sig_body, &name);
@@ -1178,13 +1198,27 @@ impl BusState {
                     return true;
                 };
                 let rule = MatchRule::parse(&spec);
+                let mut accepted = false;
                 if let Some(c) = self.clients.get_mut(&sender_id) {
                     if c.matches.len() < MAX_MATCHES_PER_CLIENT {
                         c.matches.push(rule);
+                        accepted = true;
                     }
                 }
                 if !no_reply {
-                    self.send_reply(sender_id, unique, msg.serial, "", Vec::new());
+                    // A rule that was dropped must not be acknowledged: the
+                    // client would wait forever for signals it never subscribed to.
+                    if accepted {
+                        self.send_reply(sender_id, unique, msg.serial, "", Vec::new());
+                    } else {
+                        self.send_error(
+                            sender_id,
+                            unique,
+                            msg.serial,
+                            "org.freedesktop.DBus.Error.LimitsExceeded",
+                            "too many match rules on this connection",
+                        );
+                    }
                 }
             }
             "RemoveMatch" => {
@@ -1972,5 +2006,101 @@ mod tests {
         client.in_buf.extend_from_slice(b"\r\n");
         state.clients.insert(1, client);
         assert!(!state.advance_sasl(1));
+    }
+    fn test_client(bus: BusKind, unique: &str) -> (BusClient, UnixStream) {
+        let (a, b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        (
+            BusClient {
+                id: 1,
+                bus,
+                stream: a,
+                creds: PeerCreds { pid: 1, uid: 0 },
+                auth: ClientAuthState::Authenticated,
+                unique_name: Some(unique.to_owned()),
+                in_buf: Vec::new(),
+                out_buf: VecDeque::new(),
+                matches: Vec::new(),
+                overflowed: false,
+            },
+            b,
+        )
+    }
+
+    fn driver_call(member: &str, serial: u32, arg: &str) -> DbusMessage {
+        let mut body = Vec::new();
+        encode_string(&mut body, arg);
+        DbusMessage {
+            endian: b'l',
+            msg_type: MSG_METHOD_CALL,
+            flags: 0,
+            serial,
+            path: Some(String::from("/org/freedesktop/DBus")),
+            interface: Some(String::from("org.freedesktop.DBus")),
+            member: Some(member.to_owned()),
+            error_name: None,
+            reply_serial: None,
+            destination: Some(String::from("org.freedesktop.DBus")),
+            sender: None,
+            signature: String::from("s"),
+            body,
+        }
+    }
+
+    fn last_queued(client: &mut BusClient) -> DbusMessage {
+        let bytes: Vec<u8> = client.out_buf.iter().copied().collect();
+        let mut pos = 0;
+        let mut last = None;
+        while let Some((msg, used)) = DbusMessage::decode(&bytes[pos..]).unwrap() {
+            pos += used;
+            last = Some(msg);
+        }
+        last.expect("a queued reply")
+    }
+
+    #[test]
+    fn rejected_match_and_name_registrations_are_errors_not_acknowledged() {
+        let mut state = BusState::new();
+        let (client, _peer) = test_client(BusKind::System, ":1.1");
+        state.clients.insert(1, client);
+        let creds = PeerCreds { pid: 1, uid: 0 };
+
+        for i in 0..MAX_MATCHES_PER_CLIENT {
+            let call = driver_call("AddMatch", 2 + i as u32, &format!("type='signal',member='M{i}'"));
+            assert!(state.handle_driver_call(1, BusKind::System, ":1.1", creds, &call));
+            let reply = last_queued(state.clients.get_mut(&1).unwrap());
+            assert_eq!(reply.msg_type, MSG_METHOD_RETURN);
+            state.clients.get_mut(&1).unwrap().out_buf.clear();
+        }
+        let call = driver_call("AddMatch", 9_000, "type='signal',member='Overflow'");
+        assert!(state.handle_driver_call(1, BusKind::System, ":1.1", creds, &call));
+        let client = state.clients.get_mut(&1).unwrap();
+        assert_eq!(client.matches.len(), MAX_MATCHES_PER_CLIENT);
+        let reply = last_queued(client);
+        assert_eq!(reply.msg_type, MSG_ERROR);
+        assert_eq!(reply.reply_serial, Some(9_000));
+        assert_eq!(
+            reply.error_name.as_deref(),
+            Some("org.freedesktop.DBus.Error.LimitsExceeded")
+        );
+        client.out_buf.clear();
+
+        for i in 0..MAX_NAMES_PER_CLIENT {
+            let mut call = driver_call("RequestName", 10_000 + i as u32, &format!("org.example.N{i}"));
+            encode_u32(&mut call.body, 0);
+            call.signature = String::from("su");
+            assert!(state.handle_driver_call(1, BusKind::System, ":1.1", creds, &call));
+            state.clients.get_mut(&1).unwrap().out_buf.clear();
+        }
+        let mut call = driver_call("RequestName", 20_000, "org.example.Overflow");
+        encode_u32(&mut call.body, 0);
+        call.signature = String::from("su");
+        assert!(state.handle_driver_call(1, BusKind::System, ":1.1", creds, &call));
+        assert!(!state
+            .names
+            .contains_key(&(BusState::bus_scope(BusKind::System), String::from("org.example.Overflow"))));
+        let reply = last_queued(state.clients.get_mut(&1).unwrap());
+        assert_eq!(reply.msg_type, MSG_ERROR);
+        assert_eq!(reply.reply_serial, Some(20_000));
     }
 }

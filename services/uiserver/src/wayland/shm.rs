@@ -283,7 +283,7 @@ pub(super) fn validate_shm_extent(fd: std::os::fd::RawFd, len: usize) -> std::io
 /// deadline-bounded service call) has a bounded read. A FIFO, socket, tty or
 /// device can park a worker for as long as its peer likes, so those are refused
 /// at admission instead of being read. Returns the file size.
-fn require_regular_file(fd: std::os::fd::RawFd) -> std::io::Result<u64> {
+pub(super) fn require_regular_file(fd: std::os::fd::RawFd) -> std::io::Result<u64> {
     // SAFETY: `stat` is plain data and `fstat` fully initialises it on success.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `stat` is a valid out-pointer for the duration of the call.

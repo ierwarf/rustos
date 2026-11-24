@@ -6,7 +6,6 @@ impl VfsState {
             billing: None,
             cwd: BTreeMap::new(),
             handles: BTreeMap::new(),
-            epolls: WaitSetRegistry::default(),
             inotify: vfsd::inotify::InotifyRegistry::new(),
             locks: vfsd::locks::LockTable::new(),
             checkpoint_revisions: BTreeMap::new(),
@@ -17,11 +16,10 @@ impl VfsState {
         }
     }
 
-    fn restore_waitset_checkpoint(&mut self) -> Result<(), i32> {
+    fn restore_checkpoints(&mut self) -> Result<(), i32> {
         // Rootd's checkpoint stream is untrusted until every parent, child,
         // and capacity check succeeds. Build a new state and publish it only
-        // after the complete replay; an oversized epoll set cannot leave a
-        // partially restored live registry behind.
+        // after the complete replay.
         let mut candidate = Self::new();
         let mut cursor = 0_u64;
         let mut records = Vec::new();
@@ -73,42 +71,6 @@ impl VfsState {
             cursor = response.value0;
         }
 
-        let mut epoll_tokens = Vec::new();
-        for record in records.iter().filter(|record| {
-            record.parent_hi == 0
-                && record.parent_lo == 0
-                && record.key_lo == CHECKPOINT_EPOLL_TAG
-                && record.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
-        }) {
-            if record.value_len != 0 {
-                return Err(EIO);
-            }
-            epoll_tokens.push(record.key_hi);
-        }
-        candidate
-            .epolls
-            .restore_all(&epoll_tokens)
-            .map_err(|_| EIO)?;
-        for record in records.iter().filter(|record| {
-            record.parent_lo == CHECKPOINT_EPOLL_TAG
-                && record.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
-        }) {
-            if record.value_len as usize != size_of::<WaitSetInterestWire>() {
-                return Err(EIO);
-            }
-            let wire = unsafe {
-                core::ptr::read_unaligned(record.value.as_ptr().cast::<WaitSetInterestWire>())
-            };
-            let interest = waitset_interest_from_wire(&wire).ok_or(EIO)?;
-            let (key_hi, key_lo) = checkpoint_interest_key(&interest);
-            if record.key_hi != key_hi || record.key_lo != key_lo {
-                return Err(EIO);
-            }
-            candidate
-                .epolls
-                .add(record.parent_hi, interest)
-                .map_err(|_| EIO)?;
-        }
         candidate.restore_open_descriptions(&records)?;
         *self = candidate;
         Ok(())
@@ -302,7 +264,6 @@ impl VfsState {
         if path_bytes.is_empty() || path_bytes.len() > VFS_IPC_PATH_CAPACITY {
             return Err(EINVAL);
         }
-        let chunk_count = path_bytes.len().div_ceil(SERVICE_CHECKPOINT_VALUE_CAPACITY);
         let staging = checkpoint_handle_record(
             remote_id,
             handle,
@@ -310,21 +271,25 @@ impl VfsState {
             request.arg0,
             0,
         )?;
-        let (operation_hi, operation_lo) = checkpoint_suboperation(request, 0);
-        self.checkpoint_mutate_with_operation(staging, operation_hi, operation_lo)?;
-        for chunk_index in 0..chunk_count {
-            let start = chunk_index * SERVICE_CHECKPOINT_VALUE_CAPACITY;
-            let end = (start + SERVICE_CHECKPOINT_VALUE_CAPACITY).min(path_bytes.len());
-            let record = checkpoint_path_record(remote_id, chunk_index, &path_bytes[start..end])?;
-            let (operation_hi, operation_lo) =
-                checkpoint_suboperation(request, chunk_index as u64 + 1);
-            self.checkpoint_mutate_with_operation(record, operation_hi, operation_lo)?;
-        }
         let final_record =
             checkpoint_handle_record(remote_id, handle, VFSD_OPEN_MUTATION_OPEN, request.arg0, 0)?;
-        let (operation_hi, operation_lo) = checkpoint_suboperation(request, chunk_count as u64 + 1);
-        self.checkpoint_mutate_with_operation(final_record, operation_hi, operation_lo)?;
-        Ok(())
+        // Staging parent, every path chunk and the final handle record go to
+        // rootd as ordered MUTATE_BATCH requests (normally exactly one IPC)
+        // with the same per-record DAG validation and journal order as
+        // sequential single mutations. See `vfsd::checkpoint_batch`.
+        let items = vfsd::checkpoint_batch::open_description_items(
+            remote_id,
+            path_bytes,
+            staging,
+            final_record,
+            |ordinal| checkpoint_suboperation(request, ordinal),
+        )?;
+        let mut mirror = VfsCheckpointMirror {
+            revisions: &mut self.checkpoint_revisions,
+            operations: &mut self.checkpoint_operations,
+            records: &mut self.checkpoint_records,
+        };
+        vfsd::checkpoint_batch::commit_ordered(&mut mirror, &mut RootdCheckpointTransport, &items)
     }
 
     fn checkpoint_handle_state(
@@ -352,6 +317,28 @@ impl VfsState {
         self.checkpoint_records.get(&key).copied().ok_or(EIO)
     }
 
+}
+
+/// vfsd's acknowledged-checkpoint mirror, advanced only by rootd-confirmed
+/// records (see `vfsd::checkpoint_batch`).
+struct VfsCheckpointMirror<'a> {
+    revisions: &'a mut BTreeMap<CheckpointRevisionKey, u64>,
+    operations: &'a mut BTreeMap<CheckpointRevisionKey, (u64, u64)>,
+    records: &'a mut BTreeMap<CheckpointRevisionKey, ServiceCheckpointRecordWire>,
+}
+
+impl vfsd::checkpoint_batch::CheckpointMirror for VfsCheckpointMirror<'_> {
+    fn current(&self, key: CheckpointRevisionKey) -> Option<ServiceCheckpointRecordWire> {
+        self.records.get(&key).copied()
+    }
+
+    fn publish(&mut self, record: ServiceCheckpointRecordWire) {
+        let key = checkpoint_revision_key(&record);
+        self.revisions.insert(key, record.revision);
+        self.operations
+            .insert(key, (record.operation_hi, record.operation_lo));
+        self.records.insert(key, record);
+    }
 }
 
 impl VfsStorage {

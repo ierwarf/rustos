@@ -5,8 +5,13 @@
 /// the syscall-number uniqueness test below was added.
 pub const SYS_RUSTOS_FRAME_SOURCE: u64 = 0x5255_0063;
 pub const FRAME_SOURCE_ABI_VERSION: u16 = 1;
-/// Mechanical source-capability envelope, not a cache replacement policy.
+/// Mechanical envelope of sources an external pager (`pagerd`) may keep live,
+/// not a cache replacement policy. The boot library-cache plan is validated
+/// against it.
 pub const FRAME_SOURCE_MAX_LIVE: usize = 16_384;
+/// Slots of the kernel's frame-source table. It also holds the MM broker's
+/// demand-object pages (`LIBRARY_DEMAND_MAX_RESIDENT_PAGES`) beside the pager's.
+pub const FRAME_SOURCE_TABLE_SLOTS: usize = 81_920;
 pub const FRAME_SOURCE_PAGE_BYTES: u64 = 4096;
 pub const FRAME_SOURCE_OP_SUPPLY: u16 = 1;
 pub const FRAME_SOURCE_OP_RETIRE: u16 = 2;

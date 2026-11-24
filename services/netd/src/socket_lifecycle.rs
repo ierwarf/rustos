@@ -159,7 +159,9 @@ pub(super) fn handle_socket(
         return libc::EAGAIN;
     }
     let initial_state = match kind {
-        UnixSocketKind::Netlink => UnixSocketState::Netlink(netlink::NetlinkState::new(base_type)),
+        UnixSocketKind::Netlink => {
+            UnixSocketState::Netlink(netlink::NetlinkState::new(base_type, request.arg2))
+        }
         UnixSocketKind::Dgram => UnixSocketState::Dgram(UnixDgramState::default()),
         UnixSocketKind::Stream | UnixSocketKind::SeqPacket => UnixSocketState::Idle,
     };
@@ -607,17 +609,28 @@ pub(super) fn local_socket_kind(
     } else {
         return Err(libc::ESOCKTNOSUPPORT);
     };
-    // AF_UNIX takes only protocol 0; netd implements only NETLINK_ROUTE (0).
-    if protocol != 0 {
+    // AF_UNIX takes only protocol 0; netd implements NETLINK_ROUTE (0) and
+    // NETLINK_KOBJECT_UEVENT (15).
+    if unix && protocol != 0 {
+        return Err(libc::EPROTONOSUPPORT);
+    }
+    if netlink && !netlink::is_supported_protocol(protocol) {
         return Err(libc::EPROTONOSUPPORT);
     }
     // The published shape is the kernel broker's admission predicate; the two
     // must agree or the publication would be refused after charging.
-    let shape_valid = rustos_user_abi::syscall::net_broker_unix_socket_shape_valid(
-        domain, socket_type, protocol,
-    ) || rustos_user_abi::syscall::net_broker_netlink_socket_shape_valid(
-        domain, socket_type, protocol,
-    );
+    let shape_valid = if unix {
+        rustos_user_abi::syscall::net_broker_unix_socket_shape_valid(
+            domain, socket_type, protocol,
+        )
+    } else {
+        rustos_user_abi::syscall::net_broker_netlink_socket_shape_valid(
+            domain, socket_type, protocol,
+        ) || (netlink::is_supported_protocol(protocol)
+            && rustos_user_abi::syscall::net_broker_netlink_socket_shape_valid(
+                domain, socket_type, 0,
+            ))
+    };
     if !shape_valid {
         return Err(libc::EINVAL);
     }

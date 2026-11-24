@@ -29,6 +29,93 @@ const MAX_FONT_SIZE_PX: u16 = 512;
 const MAX_LINE_HEIGHT_PX: u16 = 1024;
 const MIN_UTC_OFFSET_MINUTES: i32 = -12 * 60;
 const MAX_UTC_OFFSET_MINUTES: i32 = 14 * 60;
+pub(crate) const DEFAULT_DISPLAY_SCALE_PERCENT: u32 = 200;
+const MIN_DISPLAY_SCALE_PERCENT: u32 = 50;
+const MAX_DISPLAY_SCALE_PERCENT: u32 = 400;
+const MAX_LAYOUT_PX: usize = 4096;
+
+/// Major UI lengths in logical 100%-DPI pixels. All values are scaled dynamically
+/// by the active `UiScale` when computing screen geometry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UiLayoutConfig {
+    pub(crate) taskbar_margin_bottom: usize,
+    pub(crate) taskbar_rail_height: usize,
+    pub(crate) rail_side_margin: usize,
+    pub(crate) rail_radius: usize,
+    pub(crate) desktop_margin_x: usize,
+    pub(crate) desktop_margin_y: usize,
+    pub(crate) home_icon_size: usize,
+    pub(crate) home_cell_width: usize,
+    pub(crate) home_grid_top_padding: usize,
+    pub(crate) home_label_gap: usize,
+    pub(crate) home_cell_bottom_padding: usize,
+    pub(crate) home_clock_top_padding: usize,
+    pub(crate) home_clock_date_gap: usize,
+    pub(crate) home_clock_bottom_gap: usize,
+    pub(crate) dock_icon_size: usize,
+    pub(crate) dock_icon_gap: usize,
+    pub(crate) dock_inner_padding_x: usize,
+    pub(crate) window_radius: usize,
+    pub(crate) window_border: usize,
+    pub(crate) window_title_height: usize,
+    pub(crate) window_padding_x: usize,
+    pub(crate) window_padding_y: usize,
+    pub(crate) window_button_height: usize,
+    pub(crate) window_button_width: usize,
+    pub(crate) window_close_button_width: usize,
+    pub(crate) window_button_margin_right: usize,
+    pub(crate) window_button_margin_top: usize,
+    pub(crate) default_window_width: usize,
+    pub(crate) default_window_height: usize,
+    pub(crate) min_window_width: usize,
+    pub(crate) min_window_height: usize,
+    pub(crate) window_cascade_x: usize,
+    pub(crate) window_cascade_y: usize,
+    pub(crate) terminal_padding_x: usize,
+    pub(crate) terminal_padding_y: usize,
+}
+
+impl Default for UiLayoutConfig {
+    fn default() -> Self {
+        Self {
+            taskbar_margin_bottom: 10,
+            taskbar_rail_height: 52,
+            rail_side_margin: 18,
+            rail_radius: 16,
+            desktop_margin_x: 24,
+            desktop_margin_y: 16,
+            home_icon_size: 56,
+            home_cell_width: 104,
+            home_grid_top_padding: 20,
+            home_label_gap: 8,
+            home_cell_bottom_padding: 16,
+            home_clock_top_padding: 28,
+            home_clock_date_gap: 2,
+            home_clock_bottom_gap: 36,
+            dock_icon_size: 34,
+            dock_icon_gap: 8,
+            dock_inner_padding_x: 14,
+            window_radius: 10,
+            window_border: 1,
+            window_title_height: 32,
+            window_padding_x: 12,
+            window_padding_y: 10,
+            window_button_height: 22,
+            window_button_width: 32,
+            window_close_button_width: 44,
+            window_button_margin_right: 8,
+            window_button_margin_top: 1,
+            default_window_width: 680,
+            default_window_height: 440,
+            min_window_width: 320,
+            min_window_height: 220,
+            window_cascade_x: 28,
+            window_cascade_y: 24,
+            terminal_padding_x: 12,
+            terminal_padding_y: 10,
+        }
+    }
+}
 
 /// A place text is drawn. The code only knows these roles; the file, size and
 /// metrics behind each one come from the configuration.
@@ -106,8 +193,32 @@ pub(crate) struct FontSpec {
     pub(crate) charset: Charset,
 }
 
+impl FontSpec {
+    /// Returns a copy of this font specification scaled by `scale_percent`
+    /// (100 = 1x, 200 = 2x), clamped to valid rasterization bounds.
+    pub(crate) fn scaled(&self, scale_percent: u32) -> Self {
+        let scale_u16 = |value: u16, min: u16, max: u16| -> u16 {
+            let scaled = (u64::from(value) * u64::from(scale_percent) + 50) / 100;
+            (scaled as u16).clamp(min, max)
+        };
+        Self {
+            file: self.file.clone(),
+            size_px: scale_u16(self.size_px, MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX),
+            line_height_px: self
+                .line_height_px
+                .map(|lh| scale_u16(lh, 1, MAX_LINE_HEIGHT_PX)),
+            monospace: self.monospace,
+            charset: self.charset,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UiConfig {
+    /// UI DPI scale percentage (100 = 1x, 200 = 2x HiDPI).
+    pub(crate) display_scale_percent: u32,
+    /// Major UI lengths in logical 100%-DPI pixels.
+    pub(crate) layout: UiLayoutConfig,
     /// Minutes east of UTC. RustOS keeps UTC and has no timezone database.
     pub(crate) clock_utc_offset_minutes: i32,
     pub(crate) fonts: BTreeMap<FontRole, FontSpec>,
@@ -138,6 +249,8 @@ fn error(line: usize, message: impl Into<String>) -> ConfigError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Section {
+    Display,
+    Layout,
     Clock,
     Font(FontRole),
 }
@@ -152,6 +265,11 @@ struct PartialFont {
 }
 
 pub(crate) fn parse(text: &str) -> Result<UiConfig, ConfigError> {
+    let mut display_scale_percent = None;
+    let mut seen_display = false;
+    let mut layout = UiLayoutConfig::default();
+    let mut seen_layout = false;
+    let mut seen_layout_keys = std::collections::BTreeSet::new();
     let mut clock_offset = None;
     let mut seen_clock = false;
     let mut partial: BTreeMap<FontRole, PartialFont> = BTreeMap::new();
@@ -168,7 +286,19 @@ pub(crate) fn parse(text: &str) -> Result<UiConfig, ConfigError> {
                 .strip_suffix(']')
                 .ok_or_else(|| error(line_no, "section header is missing its closing ]"))?
                 .trim();
-            section = Some(if name == "clock" {
+            section = Some(if name == "display" {
+                if seen_display {
+                    return Err(error(line_no, "duplicate [display] section"));
+                }
+                seen_display = true;
+                Section::Display
+            } else if name == "layout" {
+                if seen_layout {
+                    return Err(error(line_no, "duplicate [layout] section"));
+                }
+                seen_layout = true;
+                Section::Layout
+            } else if name == "clock" {
                 if seen_clock {
                     return Err(error(line_no, "duplicate [clock] section"));
                 }
@@ -195,6 +325,33 @@ pub(crate) fn parse(text: &str) -> Result<UiConfig, ConfigError> {
         }
         match section {
             None => return Err(error(line_no, "key outside any section")),
+            Some(Section::Display) => match key {
+                "scale_percent" => {
+                    if display_scale_percent.is_some() {
+                        return Err(error(line_no, "duplicate `scale_percent`"));
+                    }
+                    let percent = value
+                        .parse::<u32>()
+                        .map_err(|_| error(line_no, "`scale_percent` must be a whole number"))?;
+                    if !(MIN_DISPLAY_SCALE_PERCENT..=MAX_DISPLAY_SCALE_PERCENT).contains(&percent) {
+                        return Err(error(
+                            line_no,
+                            format!(
+                                "`scale_percent` must be within \
+                                 {MIN_DISPLAY_SCALE_PERCENT}..={MAX_DISPLAY_SCALE_PERCENT}"
+                            ),
+                        ));
+                    }
+                    display_scale_percent = Some(percent);
+                }
+                _ => return Err(error(line_no, format!("unknown display key `{key}`"))),
+            },
+            Some(Section::Layout) => {
+                if !seen_layout_keys.insert(key.to_string()) {
+                    return Err(error(line_no, format!("duplicate `{key}`")));
+                }
+                parse_layout_key(&mut layout, key, value, line_no)?;
+            }
             Some(Section::Clock) => match key {
                 "utc_offset_minutes" => {
                     if clock_offset.is_some() {
@@ -242,9 +399,71 @@ pub(crate) fn parse(text: &str) -> Result<UiConfig, ConfigError> {
         );
     }
     Ok(UiConfig {
+        display_scale_percent: display_scale_percent.unwrap_or(DEFAULT_DISPLAY_SCALE_PERCENT),
+        layout,
         clock_utc_offset_minutes: clock_offset.unwrap_or(0),
         fonts,
     })
+}
+
+fn parse_layout_key(
+    layout: &mut UiLayoutConfig,
+    key: &str,
+    value: &str,
+    line_no: usize,
+) -> Result<(), ConfigError> {
+    let parse_px = |min: usize| -> Result<usize, ConfigError> {
+        let parsed = value
+            .parse::<usize>()
+            .map_err(|_| error(line_no, format!("`{key}` must be a whole number")))?;
+        if !(min..=MAX_LAYOUT_PX).contains(&parsed) {
+            return Err(error(
+                line_no,
+                format!("`{key}` must be within {min}..={MAX_LAYOUT_PX}"),
+            ));
+        }
+        Ok(parsed)
+    };
+    let slot = match key {
+        "taskbar_margin_bottom" => (&mut layout.taskbar_margin_bottom, 0),
+        "taskbar_rail_height" => (&mut layout.taskbar_rail_height, 1),
+        "rail_side_margin" => (&mut layout.rail_side_margin, 0),
+        "rail_radius" => (&mut layout.rail_radius, 0),
+        "desktop_margin_x" => (&mut layout.desktop_margin_x, 0),
+        "desktop_margin_y" => (&mut layout.desktop_margin_y, 0),
+        "home_icon_size" => (&mut layout.home_icon_size, 1),
+        "home_cell_width" => (&mut layout.home_cell_width, 1),
+        "home_grid_top_padding" => (&mut layout.home_grid_top_padding, 0),
+        "home_label_gap" => (&mut layout.home_label_gap, 0),
+        "home_cell_bottom_padding" => (&mut layout.home_cell_bottom_padding, 0),
+        "home_clock_top_padding" => (&mut layout.home_clock_top_padding, 0),
+        "home_clock_date_gap" => (&mut layout.home_clock_date_gap, 0),
+        "home_clock_bottom_gap" => (&mut layout.home_clock_bottom_gap, 0),
+        "dock_icon_size" => (&mut layout.dock_icon_size, 1),
+        "dock_icon_gap" => (&mut layout.dock_icon_gap, 0),
+        "dock_inner_padding_x" => (&mut layout.dock_inner_padding_x, 0),
+        "window_radius" => (&mut layout.window_radius, 0),
+        "window_border" => (&mut layout.window_border, 0),
+        "window_title_height" => (&mut layout.window_title_height, 1),
+        "window_padding_x" => (&mut layout.window_padding_x, 0),
+        "window_padding_y" => (&mut layout.window_padding_y, 0),
+        "window_button_height" => (&mut layout.window_button_height, 1),
+        "window_button_width" => (&mut layout.window_button_width, 1),
+        "window_close_button_width" => (&mut layout.window_close_button_width, 1),
+        "window_button_margin_right" => (&mut layout.window_button_margin_right, 0),
+        "window_button_margin_top" => (&mut layout.window_button_margin_top, 0),
+        "default_window_width" => (&mut layout.default_window_width, 1),
+        "default_window_height" => (&mut layout.default_window_height, 1),
+        "min_window_width" => (&mut layout.min_window_width, 1),
+        "min_window_height" => (&mut layout.min_window_height, 1),
+        "window_cascade_x" => (&mut layout.window_cascade_x, 0),
+        "window_cascade_y" => (&mut layout.window_cascade_y, 0),
+        "terminal_padding_x" => (&mut layout.terminal_padding_x, 0),
+        "terminal_padding_y" => (&mut layout.terminal_padding_y, 0),
+        _ => return Err(error(line_no, format!("unknown layout key `{key}`"))),
+    };
+    *slot.0 = parse_px(slot.1)?;
+    Ok(())
 }
 
 fn parse_font_key(
@@ -389,6 +608,29 @@ charset = clock
     #[test]
     fn the_clock_defaults_to_utc() {
         assert_eq!(parse("").unwrap().clock_utc_offset_minutes, 0);
+    }
+
+    #[test]
+    fn layout_section_overrides_defaults_and_rejects_invalid_keys() {
+        let config = parse(
+            "[layout]\nhome_icon_size = 60\nhome_cell_width = 110\ndock_icon_size = 36\n",
+        )
+        .expect("valid layout");
+        assert_eq!(config.layout.home_icon_size, 60);
+        assert_eq!(config.layout.home_cell_width, 110);
+        assert_eq!(config.layout.dock_icon_size, 36);
+        assert_eq!(
+            config.layout.window_title_height,
+            UiLayoutConfig::default().window_title_height
+        );
+        assert!(parse("[layout]\nunknown_metric = 10\n")
+            .unwrap_err()
+            .to_string()
+            .contains("unknown layout key"));
+        assert!(parse("[layout]\nhome_icon_size = 0\n")
+            .unwrap_err()
+            .to_string()
+            .contains("must be within"));
     }
 
     #[test]

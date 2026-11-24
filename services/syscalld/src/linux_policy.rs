@@ -26,7 +26,7 @@ use rustos_user_abi::syscall::{
     RustosMmLibraryBindBrokerResult, RustosMmMapBrokerResult, LINUX_DEFAULT_STACK_RLIMIT_BYTES, LINUX_RLIMIT_SIZE,
     MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE, MM_BROKER_FD_KIND_DEVICE_BUFFER, MM_BROKER_FD_KIND_DISPLAY_SURFACE,
     MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD, MM_BROKER_FD_RIGHT_READ, MM_BROKER_FD_RIGHT_WRITE,
-    MM_BROKER_OP_BIND_LIBRARY, MM_BROKER_OP_DESCRIBE_FD,
+    MM_BROKER_BIND_FLAG_DEMAND, MM_BROKER_OP_BIND_LIBRARY, MM_BROKER_OP_DESCRIBE_FD,
     MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED, MM_BROKER_OP_MAP_FILE_PRIVATE,
     MM_BROKER_OP_MAP_FILE_SHARED,
     MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_QUERY_CONFLICT,
@@ -37,7 +37,7 @@ use spin::Mutex;
 
 use crate::errno;
 use crate::mmap_policy::{
-    library_bind_candidate, parse_mmap_sharing, plan_mmap_with_write, MmapFdKind, MmapPlan,
+    library_bind_candidate, library_demand_candidate, parse_mmap_sharing, plan_mmap_with_write, MmapFdKind, MmapPlan,
     MmapPlanError, MAP_PRIVATE, MAP_SHARED, MAP_TYPE,
 };
 use crate::vma_policy::{next_fit_with_wrap, AddressRange, VmaEntry, VmaMap};
@@ -95,8 +95,6 @@ const MAX_VMA_RECORDS: usize = 262_144;
 /// One mprotect can split at most the two boundary records.
 const VMA_SPLIT_HEADROOM: usize = 2;
 const MEMFD_NAME_MAX: usize = 249;
-const ARCH_SET_FS: u64 = 0x1002;
-const ARCH_GET_FS: u64 = 0x1003;
 
 #[derive(Clone, Copy, Debug)]
 struct LinuxPolicyState {
@@ -107,8 +105,6 @@ struct LinuxPolicyState {
     parent_pid: u64,
     pgid: u64,
     sid: u64,
-    robust_head: u64,
-    robust_len: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -524,8 +520,6 @@ fn initial_state(request: &LinuxSyscallOffloadRequest) -> LinuxPolicyState {
         parent_pid: request.parent_pid,
         pgid: request.pid,
         sid: request.pid,
-        robust_head: 0,
-        robust_len: 0,
     }
 }
 
@@ -743,64 +737,6 @@ pub fn handle_getrandom(
     response.payload_len = len as u32;
 }
 
-pub fn handle_set_robust_list(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    if request.arg1 != 24 {
-        response.status = errno::EINVAL;
-        response.payload_len = 0;
-        return;
-    }
-    let mut policy = policy_db().lock();
-    let state = ensure_state_with_inheritance(&mut policy, request);
-    state.robust_head = request.arg0;
-    state.robust_len = request.arg1;
-    response.status = 0;
-    response.payload_len = 0;
-}
-
-pub fn handle_get_robust_list(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    let mut policy = policy_db().lock();
-    let state = ensure_state_with_inheritance(&mut policy, request);
-    response.status = 0;
-    response.payload_len = 16;
-    response.payload[..8].copy_from_slice(&state.robust_head.to_le_bytes());
-    response.payload[8..16].copy_from_slice(&state.robust_len.to_le_bytes());
-}
-
-pub fn handle_rseq(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    let _ = request;
-    response.status = errno::ENOSYS;
-    response.payload_len = 0;
-}
-
-pub fn handle_arch_prctl_policy(
-    request: &LinuxSyscallOffloadRequest,
-    response: &mut LinuxSyscallOffloadResponse,
-) {
-    match request.arg0 {
-        ARCH_SET_FS => {
-            if request.arg1 != 0
-                && !(LINUX_USER_SPACE_BASE..LINUX_USER_SPACE_END).contains(&request.arg1)
-            {
-                response.status = errno::EINVAL;
-            } else {
-                response.status = 0;
-            }
-        }
-        ARCH_GET_FS => response.status = 0,
-        _ => response.status = errno::EINVAL,
-    }
-    response.payload_len = 0;
-}
-
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes([
         bytes[offset],
@@ -874,6 +810,25 @@ pub fn handle_madvise(
                 return;
             }
             response.status = 0;
+            response.payload_len = 0;
+        }
+        // Kernel-compat queries whether `[start, end)` is covered by syscalld's
+        // VMA map (including `MmVmaKind::Reserved` `PROT_NONE` cages that have
+        // no Ring0 `pager_vma` entry) before failing `MADV_DONTNEED`/`MADV_FREE`
+        // with `ENOMEM`.
+        advice if advice == (MADV_DONTNEED | (1_u64 << 63)) => {
+            let state = match mm_state_for(MmTarget::of(request)) {
+                Ok(state) => state,
+                Err(errno) => {
+                    response.status = errno;
+                    return;
+                }
+            };
+            response.status = if range_is_covered(&state, start, end) {
+                0
+            } else {
+                errno::ENOMEM
+            };
             response.payload_len = 0;
         }
         // Handled directly in caller context (kernel-compat `mm_query_ops`)
@@ -960,9 +915,37 @@ pub fn handle_brk(
         state.brk_current = requested;
         upsert_heap_vma(&mut state);
     } else {
+        // Pages above the new break are released, as in Linux: a later grow
+        // must hand out fresh zero pages, never the previous heap contents
+        // (glibc `calloc` relies on that for memory extended with `brk`).
+        let target = MmTarget::of(request);
+        let shrunk = shrink_brk_mapping(&mut state, requested_end, |start, end| {
+            broker_simple(target, MM_BROKER_OP_UNMAP, start, end - start, 0, 0, u64::MAX, 0)
+        });
+        if shrunk.is_err() {
+            copy_payload(response, &state.brk_current);
+            return;
+        }
         state.brk_current = requested;
     }
     copy_payload(response, &state.brk_current);
+}
+
+/// Releases `[new_end, brk_mapped_end)` through `revoke`; policy records and
+/// `brk_mapped_end` change only after the revocation succeeded.
+fn shrink_brk_mapping(
+    state: &mut MmPolicyState,
+    new_end: u64,
+    revoke: impl FnOnce(u64, u64) -> Result<(), i32>,
+) -> Result<(), i32> {
+    if new_end >= state.brk_mapped_end {
+        return Ok(());
+    }
+    let old_end = state.brk_mapped_end;
+    unmap_range_with(state, new_end, old_end, revoke)?;
+    state.brk_mapped_end = new_end;
+    upsert_heap_vma(state);
+    Ok(())
 }
 
 pub fn handle_mmap(
@@ -1119,6 +1102,9 @@ pub fn handle_mmap(
         }
     }
 
+    let use_cursor = !fixed
+        && !noreplace
+        && !in_hint_window(&state, requested_addr);
     let (op, kind) = match plan {
         MmapPlan::Reserved => {
             insert_vma(
@@ -1131,7 +1117,9 @@ pub fn handle_mmap(
                     kind: MmVmaKind::Reserved,
                 },
             );
-            state.mmap_next = state.mmap_next.max(addr + map_len);
+            if use_cursor {
+                state.mmap_next = state.mmap_next.max(addr + map_len);
+            }
             copy_payload(response, &addr);
             return;
         }
@@ -1147,7 +1135,12 @@ pub fn handle_mmap(
         // library object only after vfsd attests its backing file, and the map
         // below aliases that object's frames. Any refusal or failure here is
         // "not eligible", never an mmap error; the eager copy path is exact.
-        let _ = broker_bind_library(MmTarget::of(request), fd);
+        let demand_len = if library_demand_candidate(plan, prot, offset, map_len) {
+            map_len
+        } else {
+            0
+        };
+        let _ = broker_bind_library(MmTarget::of(request), fd, demand_len);
     }
 
     match broker_map(MmTarget::of(request), op, addr, map_len, prot, flags, fd, offset) {
@@ -1162,7 +1155,9 @@ pub fn handle_mmap(
                     kind,
                 },
             );
-            state.mmap_next = state.mmap_next.max(mapped_addr.saturating_add(map_len));
+            if use_cursor {
+                state.mmap_next = state.mmap_next.max(mapped_addr.saturating_add(map_len));
+            }
             copy_payload(response, &mapped_addr);
         }
         Err(errno) => {
@@ -1267,12 +1262,25 @@ pub fn handle_mprotect(
         return;
     }
 
-    if prot != 0 {
+    // Only non-Reserved segments exist in Ring0's `pager_vma` table and page
+    // tables: if `prot != 0`, any Reserved segments in `[start, end)` were
+    // materialized by `MM_BROKER_OP_MAP_ANON` above (with `prot` already set),
+    // and if `prot == 0`, Reserved segments are already inaccessible holes in
+    // Ring0. Calling `MM_BROKER_OP_PROTECT` across a span that still contains
+    // a `Reserved` hole would fail in Ring0 (`PagerVmaError::Stale` -> `EFAULT`)
+    // because `pager_vma::rewrite_range` requires contiguous Ring0 VMA coverage.
+    for vma in state
+        .vmas
+        .overlapping(start, end)
+        .filter(|vma| vma.kind != MmVmaKind::Reserved)
+    {
+        let seg_start = vma.start.max(start);
+        let seg_end = vma.end.min(end);
         if let Err(errno) = broker_simple(
             MmTarget::of(request),
             MM_BROKER_OP_PROTECT,
-            start,
-            map_len,
+            seg_start,
+            seg_end - seg_start,
             prot,
             0,
             u64::MAX,
@@ -1280,28 +1288,6 @@ pub fn handle_mprotect(
         ) {
             response.status = errno;
             return;
-        }
-    } else {
-        for vma in state
-            .vmas
-            .overlapping(start, end)
-            .filter(|vma| vma.kind != MmVmaKind::Reserved)
-        {
-            let seg_start = vma.start.max(start);
-            let seg_end = vma.end.min(end);
-            if let Err(errno) = broker_simple(
-                MmTarget::of(request),
-                MM_BROKER_OP_PROTECT,
-                seg_start,
-                seg_end - seg_start,
-                prot,
-                0,
-                u64::MAX,
-                0,
-            ) {
-                response.status = errno;
-                return;
-            }
         }
     }
     set_vma_prot(&mut state, start, end, prot);
@@ -1369,22 +1355,32 @@ fn mm_state_for(target: MmTarget) -> Result<MmLease, i32> {
     Ok(MmLease { pid, state: Some(mm_state_from_layout(layout)) })
 }
 
+const MMAP_NEAR_ELF_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
+
 fn mm_state_from_layout(layout: RustosMmLayoutBrokerResult) -> MmPolicyState {
+    let user_range_start = if layout.user_range_start == 0 {
+        PAGE_SIZE
+    } else {
+        layout.user_range_start.max(PAGE_SIZE)
+    };
+    let user_range_end = if layout.user_range_end == 0 {
+        LINUX_USER_SPACE_END
+    } else {
+        layout.user_range_end
+    };
+    let mut mmap_next = layout.mmap_next.max(layout.brk_mapped_end).max(PAGE_SIZE);
+    // Keep a 2 GiB near-image window open for V8 CodeRange JIT hints when the
+    // process address space has ample headroom above brk_mapped_end.
+    if user_range_end.saturating_sub(layout.brk_mapped_end) >= 4 * 1024 * 1024 * 1024 {
+        mmap_next = mmap_next.max(layout.brk_mapped_end.saturating_add(MMAP_NEAR_ELF_RESERVE));
+    }
     let mut state = MmPolicyState {
         brk_start: layout.brk_start,
         brk_current: layout.brk_current,
         brk_mapped_end: layout.brk_mapped_end,
-        mmap_next: layout.mmap_next.max(layout.brk_mapped_end).max(PAGE_SIZE),
-        user_range_start: if layout.user_range_start == 0 {
-            PAGE_SIZE
-        } else {
-            layout.user_range_start.max(PAGE_SIZE)
-        },
-        user_range_end: if layout.user_range_end == 0 {
-            LINUX_USER_SPACE_END
-        } else {
-            layout.user_range_end
-        },
+        mmap_next,
+        user_range_start,
+        user_range_end,
         vmas: VmaMap::new(),
     };
     upsert_heap_vma(&mut state);
@@ -1400,11 +1396,15 @@ fn save_mm_state(pid: u64, state: MmPolicyState) {
     mm_db().lock().insert(pid, state);
 }
 
-fn broker_bind_library(target: MmTarget, fd: u64) -> Result<bool, i32> {
+/// `demand_len` is the length of the large private mapping about to be made, or
+/// zero when this mapping should only join an object that already exists.
+fn broker_bind_library(target: MmTarget, fd: u64, demand_len: u64) -> Result<bool, i32> {
     let mut result = RustosMmLibraryBindBrokerResult::default();
     let args = RustosMmBrokerArgs {
         abi_version: MM_BROKER_ABI_VERSION,
         op: MM_BROKER_OP_BIND_LIBRARY,
+        flags: if demand_len != 0 { MM_BROKER_BIND_FLAG_DEMAND } else { 0 },
+        len: demand_len,
         target_pid: target.pid,
         ticket: target.ticket,
         fd,
@@ -1557,8 +1557,6 @@ pub fn handle_process_fork_pid(child_pid: u64, parent_pid: u64) {
         let mut policy = PROCESS_POLICY.lock();
         if let Some(mut parent) = policy.get(&parent_pid).copied() {
             parent.parent_pid = parent_pid;
-            parent.robust_head = 0;
-            parent.robust_len = 0;
             policy.insert(child_pid, parent);
         } else {
             policy.remove(&child_pid);
@@ -1641,6 +1639,23 @@ fn query_conflict(target: MmTarget, address: u64, len: u64) -> Result<Option<(u6
     }
 }
 
+fn in_hint_window(state: &MmPolicyState, requested: u64) -> bool {
+    requested != 0
+        && requested >= state.user_range_start.saturating_sub(MMAP_NEAR_ELF_RESERVE)
+        && requested < state.user_range_end
+}
+
+fn free_region_bounds(state: &MmPolicyState, requested: u64) -> Result<(u64, u64), i32> {
+    if in_hint_window(state, requested) {
+        let lower_bound = align_up(state.user_range_start).ok_or(errno::ENOMEM)?;
+        Ok((lower_bound, requested.max(lower_bound)))
+    } else {
+        let lower_bound =
+            align_up(state.brk_mapped_end.max(state.user_range_start)).ok_or(errno::ENOMEM)?;
+        Ok((lower_bound, state.mmap_next))
+    }
+}
+
 fn find_current_free_region(target: MmTarget, state: &MmPolicyState, requested: u64, len: u64) -> Result<u64, i32> {
     choose_free_region_with_conflicts(state, requested, len, |address| {
         query_conflict(target, address, len)
@@ -1655,7 +1670,16 @@ fn choose_free_region_with_conflicts(
     len: u64,
     mut query: impl FnMut(u64) -> Result<Option<(u64, u64)>, i32>,
 ) -> Result<u64, i32> {
-    let first = find_free_region(state, requested, len)?;
+    let (lower_bound, hint) = free_region_bounds(state, requested)?;
+    let first = next_fit_with_wrap(
+        &state.vmas,
+        lower_bound,
+        state.user_range_end,
+        hint,
+        len,
+        PAGE_SIZE,
+    )
+    .ok_or(errno::ENOMEM)?;
     let mut candidate = first;
     let mut wrapped = false;
     loop {
@@ -1664,7 +1688,15 @@ fn choose_free_region_with_conflicts(
         if start >= end || end <= candidate || start >= limit
             || !start.is_multiple_of(PAGE_SIZE) || !end.is_multiple_of(PAGE_SIZE)
         { return Err(errno::EIO); }
-        let next = find_free_region(state, end, len)?;
+        let next = next_fit_with_wrap(
+            &state.vmas,
+            lower_bound,
+            state.user_range_end,
+            end,
+            len,
+            PAGE_SIZE,
+        )
+        .ok_or(errno::ENOMEM)?;
         if next <= candidate {
             if wrapped { return Err(errno::ENOMEM); }
             wrapped = true;
@@ -1675,13 +1707,7 @@ fn choose_free_region_with_conflicts(
 }
 
 fn find_free_region(state: &MmPolicyState, requested: u64, len: u64) -> Result<u64, i32> {
-    let lower_bound =
-        align_up(state.brk_mapped_end.max(state.user_range_start)).ok_or(errno::ENOMEM)?;
-    let hint = if requested != 0 {
-        requested
-    } else {
-        state.mmap_next
-    };
+    let (lower_bound, hint) = free_region_bounds(state, requested)?;
     next_fit_with_wrap(
         &state.vmas,
         lower_bound,
@@ -2021,6 +2047,39 @@ mod tests {
     }
 
     #[test]
+    fn brk_shrink_releases_pages_above_the_new_break_only_on_success() {
+        let base = LINUX_USER_SPACE_BASE + 0x10_0000;
+        let mut state = mm_state_from_layout(RustosMmLayoutBrokerResult {
+            brk_start: base,
+            brk_current: base + 0x4000,
+            brk_mapped_end: base + 0x4000,
+            mmap_next: base + 0x20_0000,
+            user_range_start: LINUX_USER_SPACE_BASE,
+            user_range_end: LINUX_USER_SPACE_END,
+        });
+        assert_eq!(spans(&state), [(base, base + 0x4000)]);
+        let mut revoked = None;
+        assert_eq!(
+            shrink_brk_mapping(&mut state, base + 0x2000, |start, end| {
+                revoked = Some((start, end));
+                Err(errno::ENOMEM)
+            }),
+            Err(errno::ENOMEM)
+        );
+        assert_eq!(revoked, Some((base + 0x2000, base + 0x4000)));
+        assert_eq!(state.brk_mapped_end, base + 0x4000, "a refusal keeps the mapping");
+        assert_eq!(spans(&state), [(base, base + 0x4000)]);
+        assert_eq!(shrink_brk_mapping(&mut state, base + 0x2000, |_, _| Ok(())), Ok(()));
+        assert_eq!(state.brk_mapped_end, base + 0x2000);
+        assert_eq!(spans(&state), [(base, base + 0x2000)]);
+        // Growing or keeping the break never reaches the broker.
+        assert_eq!(
+            shrink_brk_mapping(&mut state, base + 0x2000, |_, _| Err(errno::EIO)),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn prlimit_getres_and_priority_policies_enforce_bounds() {
         let pid = u64::MAX - 29;
         let base = LinuxSyscallOffloadRequest {
@@ -2272,5 +2331,46 @@ mod tests {
         ));
 
         handle_process_exit_pid(child_pid);
+    }
+
+    #[test]
+    fn hinted_mmap_respects_below_brk_hints_and_keeps_near_elf_window_open() {
+        let base = LINUX_USER_SPACE_BASE;
+        let elf_start = base + 4 * 1024 * 1024 * 1024;
+        let brk = elf_start + 512 * 1024 * 1024;
+        let state = mm_state_from_layout(RustosMmLayoutBrokerResult {
+            brk_start: brk,
+            brk_current: brk,
+            brk_mapped_end: brk,
+            mmap_next: brk + 16 * 1024 * 1024,
+            user_range_start: base,
+            user_range_end: LINUX_USER_SPACE_END,
+        });
+        assert!(state.mmap_next >= brk + MMAP_NEAR_ELF_RESERVE);
+
+        // An out-of-range Linux 47-bit hint lands at mmap_next, not inside [brk, brk + 2 GiB).
+        let oob_selected = find_free_region(&state, 0x2f00_0000_0000, 512 * 1024 * 1024).unwrap();
+        assert!(oob_selected >= state.mmap_next);
+
+        // An in-range hint below Chrome ELF succeeds below brk instead of clamping above it.
+        let low_hint = elf_start - 1024 * 1024 * 1024;
+        let low_selected = find_free_region(&state, low_hint, 512 * 1024 * 1024).unwrap();
+        assert_eq!(low_selected, low_hint);
+
+        // An in-range hint colliding with the ELF skips past the ELF into the free near-ELF window.
+        let skipped = choose_free_region_with_conflicts(
+            &state,
+            elf_start + 0x1000,
+            512 * 1024 * 1024,
+            |candidate| {
+                if candidate < brk && candidate + 512 * 1024 * 1024 > elf_start {
+                    Ok(Some((elf_start, brk)))
+                } else {
+                    Ok(None)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(skipped, brk);
     }
 }

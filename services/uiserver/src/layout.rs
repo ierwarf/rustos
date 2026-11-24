@@ -4,99 +4,113 @@
 //! impossible.
 
 use crate::canvas::Rect;
+use crate::font;
+use crate::ui_assets;
+use crate::ui_config::FontRole;
+use crate::ui_scale;
 
-// ---- top-level chrome ----
+// ---- top-level chrome & layout (configured via `ui.conf` `[layout]` in logical
+// 100% design units and scaled dynamically via `ui_scale`) ----
 
 // The desktop has no top bar: the home screen and windows use the whole top of
 // the display. Only the dock (taskbar) rail floats above the desktop.
 
-pub(crate) const TASKBAR_MARGIN_BOTTOM: usize = 14;
-pub(crate) const TASKBAR_RAIL_HEIGHT: usize = 64;
-pub(crate) const TASKBAR_HEIGHT: usize = TASKBAR_MARGIN_BOTTOM + TASKBAR_RAIL_HEIGHT;
-
-pub(crate) const RAIL_SIDE_MARGIN: usize = 24;
-pub(crate) const DESKTOP_MARGIN_X: usize = 36;
-pub(crate) const DESKTOP_MARGIN_Y: usize = 24;
-
-// ---- home screen grid ----
-//
-// Launcher programs live on the home screen as a tablet-style grid of large
-// icons with a name label under each. The sizes below are the full-size
-// design; when more launchers exist than a full-size grid can show, the whole
-// grid scales down (see `home_grid_metrics`) so every launcher stays visible.
-
-pub(crate) const HOME_ICON_SIZE: usize = 88;
-pub(crate) const HOME_CELL_WIDTH: usize = 156;
-pub(crate) const HOME_GRID_TOP_PADDING: usize = 28;
-pub(crate) const HOME_LABEL_GAP: usize = 12;
-pub(crate) const HOME_LABEL_HEIGHT: usize = 20;
-/// Space under the label, so rows do not touch.
-pub(crate) const HOME_CELL_BOTTOM_PADDING: usize = 24;
-// The clock sits at the top of the home screen and the app grid starts below
-// it, like a tablet. The time's height matches the clock face's line height.
-pub(crate) const HOME_CLOCK_TOP_PADDING: usize = 52;
-pub(crate) const HOME_CLOCK_TIME_HEIGHT: usize = 107;
-pub(crate) const HOME_CLOCK_DATE_GAP: usize = 2;
-pub(crate) const HOME_CLOCK_DATE_HEIGHT: usize = 22;
-pub(crate) const HOME_CLOCK_BOTTOM_GAP: usize = 68;
-pub(crate) const HOME_CLOCK_BLOCK_HEIGHT: usize = HOME_CLOCK_TOP_PADDING
-    + HOME_CLOCK_TIME_HEIGHT
-    + HOME_CLOCK_DATE_GAP
-    + HOME_CLOCK_DATE_HEIGHT
-    + HOME_CLOCK_BOTTOM_GAP;
-/// The clock is only shown when the desktop is wide enough for it and tall
-/// enough to leave room for at least two rows of apps under it.
-const HOME_CLOCK_MIN_WIDTH: usize = 320;
-const HOME_CLOCK_MIN_APP_ROWS_HEIGHT: usize = 2 * 60;
-
 /// Grid scales to try, largest first, as a percentage of the full size.
-const HOME_GRID_SCALES: [usize; 6] = [100, 85, 70, 60, 50, 40];
+const HOME_GRID_SCALES: [usize; 7] = [100, 85, 70, 60, 50, 40, 30];
 
-pub(crate) const DOCK_ICON_SIZE: usize = 44;
-pub(crate) const DOCK_ICON_GAP: usize = 12;
-pub(crate) const DOCK_INNER_PADDING_X: usize = 18;
-
-// ---- window chrome ----
-
-pub(crate) const WINDOW_RADIUS: usize = 12;
-pub(crate) const WINDOW_BORDER: usize = 1;
-pub(crate) const WINDOW_TITLE_HEIGHT: usize = 36;
-pub(crate) const WINDOW_PADDING_X: usize = 16;
-pub(crate) const WINDOW_PADDING_Y: usize = 14;
 pub(crate) const WINDOW_SHADOW_STEPS: usize = 6;
-
-// Generous click targets so a clumsy tap on the X still registers as close.
-pub(crate) const WINDOW_BUTTON_HEIGHT: usize = 24;
-pub(crate) const WINDOW_BUTTON_WIDTH: usize = 34;
-pub(crate) const WINDOW_CLOSE_BUTTON_WIDTH: usize = 48;
-pub(crate) const WINDOW_BUTTON_MARGIN_RIGHT: usize = 8;
-pub(crate) const WINDOW_BUTTON_MARGIN_TOP: usize = 1;
-
-pub(crate) const DEFAULT_WINDOW_WIDTH: usize = 720;
-pub(crate) const DEFAULT_WINDOW_HEIGHT: usize = 460;
-pub(crate) const MIN_WINDOW_WIDTH: usize = 360;
-pub(crate) const MIN_WINDOW_HEIGHT: usize = 240;
-pub(crate) const WINDOW_CASCADE_X: usize = 36;
-pub(crate) const WINDOW_CASCADE_Y: usize = 32;
 pub(crate) const WINDOW_CASCADE_SLOTS: usize = 6;
+
+const BASE_HOME_CLOCK_MIN_WIDTH: usize = 240;
+const BASE_RESIZE_BORDER_PX: usize = 6;
+const BASE_RESIZE_CORNER_PX: usize = 12;
+const BASE_WAYLAND_TITLE_VISIBLE_PX: usize = 120;
+
+fn cfg() -> crate::ui_config::UiLayoutConfig {
+    ui_assets::layout()
+}
+
+pub(crate) fn taskbar_margin_bottom() -> usize { ui_scale::px(cfg().taskbar_margin_bottom) }
+pub(crate) fn taskbar_rail_height() -> usize { ui_scale::px(cfg().taskbar_rail_height) }
+pub(crate) fn taskbar_height() -> usize { taskbar_margin_bottom() + taskbar_rail_height() }
+pub(crate) fn rail_side_margin() -> usize { ui_scale::px(cfg().rail_side_margin) }
+pub(crate) fn rail_radius() -> usize { ui_scale::px(cfg().rail_radius) }
+pub(crate) fn desktop_margin_x() -> usize { ui_scale::px(cfg().desktop_margin_x) }
+pub(crate) fn desktop_margin_y() -> usize { ui_scale::px(cfg().desktop_margin_y) }
+pub(crate) fn home_icon_size() -> usize { ui_scale::px(cfg().home_icon_size) }
+pub(crate) fn home_cell_width() -> usize { ui_scale::px(cfg().home_cell_width) }
+pub(crate) fn home_grid_top_padding() -> usize { ui_scale::px(cfg().home_grid_top_padding) }
+pub(crate) fn home_label_gap() -> usize { ui_scale::px(cfg().home_label_gap) }
+pub(crate) fn home_label_height() -> usize {
+    font::line_height(FontRole::UiMedium).max(ui_scale::px(12))
+}
+pub(crate) fn home_cell_bottom_padding() -> usize { ui_scale::px(cfg().home_cell_bottom_padding) }
+pub(crate) fn home_clock_top_padding() -> usize { ui_scale::px(cfg().home_clock_top_padding) }
+pub(crate) fn home_clock_time_height() -> usize {
+    font::line_height(FontRole::Clock).max(ui_scale::px(24))
+}
+pub(crate) fn home_clock_date_gap() -> usize { ui_scale::px(cfg().home_clock_date_gap) }
+pub(crate) fn home_clock_date_height() -> usize {
+    font::line_height(FontRole::UiLarge).max(ui_scale::px(12))
+}
+pub(crate) fn home_clock_bottom_gap() -> usize { ui_scale::px(cfg().home_clock_bottom_gap) }
+pub(crate) fn home_clock_block_height() -> usize {
+    home_clock_top_padding()
+        + home_clock_time_height()
+        + home_clock_date_gap()
+        + home_clock_date_height()
+        + home_clock_bottom_gap()
+}
+fn home_clock_min_app_rows_height() -> usize {
+    (home_icon_size() + home_label_gap() + home_label_height()).max(ui_scale::px(96))
+}
+pub(crate) fn dock_icon_size() -> usize { ui_scale::px(cfg().dock_icon_size) }
+pub(crate) fn dock_icon_gap() -> usize { ui_scale::px(cfg().dock_icon_gap) }
+pub(crate) fn dock_inner_padding_x() -> usize { ui_scale::px(cfg().dock_inner_padding_x) }
+pub(crate) fn window_radius() -> usize { ui_scale::px(cfg().window_radius) }
+pub(crate) fn window_border() -> usize { ui_scale::px(cfg().window_border) }
+pub(crate) fn window_title_height() -> usize { ui_scale::px(cfg().window_title_height) }
+pub(crate) fn window_padding_x() -> usize { ui_scale::px(cfg().window_padding_x) }
+pub(crate) fn window_padding_y() -> usize { ui_scale::px(cfg().window_padding_y) }
+pub(crate) fn window_button_height() -> usize { ui_scale::px(cfg().window_button_height) }
+pub(crate) fn window_button_width() -> usize { ui_scale::px(cfg().window_button_width) }
+pub(crate) fn window_close_button_width() -> usize { ui_scale::px(cfg().window_close_button_width) }
+pub(crate) fn window_button_margin_right() -> usize { ui_scale::px(cfg().window_button_margin_right) }
+pub(crate) fn window_button_margin_top() -> usize { ui_scale::px(cfg().window_button_margin_top) }
+pub(crate) fn default_window_width() -> usize { ui_scale::px(cfg().default_window_width) }
+pub(crate) fn default_window_height() -> usize { ui_scale::px(cfg().default_window_height) }
+pub(crate) fn min_window_width() -> usize { ui_scale::px(cfg().min_window_width) }
+pub(crate) fn min_window_height() -> usize { ui_scale::px(cfg().min_window_height) }
+pub(crate) fn window_cascade_x() -> usize { ui_scale::px(cfg().window_cascade_x) }
+pub(crate) fn window_cascade_y() -> usize { ui_scale::px(cfg().window_cascade_y) }
+pub(crate) fn terminal_padding_x() -> usize { ui_scale::px(cfg().terminal_padding_x) }
+pub(crate) fn terminal_padding_y() -> usize { ui_scale::px(cfg().terminal_padding_y) }
+fn resize_border_px() -> usize { ui_scale::px(BASE_RESIZE_BORDER_PX) }
+fn resize_corner_px() -> usize { ui_scale::px(BASE_RESIZE_CORNER_PX) }
+pub(crate) fn wayland_title_visible_px() -> usize { ui_scale::px(BASE_WAYLAND_TITLE_VISIBLE_PX) }
 
 // ---- desktop & rail geometry ----
 
 pub(crate) fn taskbar_rail_rect(width: usize, height: usize) -> Rect {
+    let side = rail_side_margin();
+    let rail_h = taskbar_rail_height();
+    let margin_bottom = taskbar_margin_bottom();
     Rect {
-        x: RAIL_SIDE_MARGIN,
-        y: height.saturating_sub(TASKBAR_MARGIN_BOTTOM + TASKBAR_RAIL_HEIGHT),
-        width: width.saturating_sub(RAIL_SIDE_MARGIN * 2),
-        height: TASKBAR_RAIL_HEIGHT,
+        x: side,
+        y: height.saturating_sub(margin_bottom + rail_h),
+        width: width.saturating_sub(side * 2),
+        height: rail_h,
     }
 }
 
 pub(crate) fn desktop_bounds(width: u32, height: u32) -> Rect {
+    let mx = desktop_margin_x();
+    let my = desktop_margin_y();
     Rect {
-        x: DESKTOP_MARGIN_X,
-        y: DESKTOP_MARGIN_Y,
-        width: (width as usize).saturating_sub(DESKTOP_MARGIN_X * 2),
-        height: (height as usize).saturating_sub(TASKBAR_HEIGHT + DESKTOP_MARGIN_Y * 2),
+        x: mx,
+        y: my,
+        width: (width as usize).saturating_sub(mx * 2),
+        height: (height as usize).saturating_sub(taskbar_height() + my * 2),
     }
 }
 
@@ -139,23 +153,24 @@ impl HomeGridMetrics {
 }
 
 fn home_clock_visible(bounds: Rect) -> bool {
-    bounds.width >= HOME_CLOCK_MIN_WIDTH
-        && bounds.height >= HOME_CLOCK_BLOCK_HEIGHT + HOME_CLOCK_MIN_APP_ROWS_HEIGHT
+    bounds.width >= ui_scale::px(BASE_HOME_CLOCK_MIN_WIDTH)
+        && bounds.height >= home_clock_block_height() + home_clock_min_app_rows_height()
 }
 
 fn home_grid_metrics_at(bounds: Rect, scale_percent: usize) -> Option<HomeGridMetrics> {
     let scaled = |value: usize| value * scale_percent / 100;
-    let cell_width = scaled(HOME_CELL_WIDTH);
-    let icon_size = scaled(HOME_ICON_SIZE);
-    let label_gap = scaled(HOME_LABEL_GAP).max(4);
+    let cell_width = scaled(home_cell_width());
+    let icon_size = scaled(home_icon_size());
+    let label_gap = scaled(home_label_gap()).max(ui_scale::px(4));
     // The clock block is a fixed size, so the apps below it start at a fixed
     // offset whatever the grid scale; without the clock they sit near the top.
     let top_padding = if home_clock_visible(bounds) {
-        HOME_CLOCK_BLOCK_HEIGHT
+        home_clock_block_height()
     } else {
-        scaled(HOME_GRID_TOP_PADDING).max(8)
+        scaled(home_grid_top_padding()).max(ui_scale::px(8))
     };
-    let cell_height = icon_size + label_gap + HOME_LABEL_HEIGHT + scaled(HOME_CELL_BOTTOM_PADDING);
+    let cell_height =
+        icon_size + label_gap + home_label_height() + scaled(home_cell_bottom_padding());
     if cell_width == 0 || icon_size == 0 || bounds.width < cell_width {
         return None;
     }
@@ -220,11 +235,12 @@ pub(crate) fn home_cell(width: u32, height: u32, count: usize, index: usize) -> 
         width: metrics.icon_size,
         height: metrics.icon_size,
     };
+    let label_pad = ui_scale::px(4);
     let label = Rect {
-        x: cell.x + 4,
+        x: cell.x + label_pad,
         y: icon.y + metrics.icon_size + metrics.label_gap,
-        width: cell.width.saturating_sub(8),
-        height: HOME_LABEL_HEIGHT,
+        width: cell.width.saturating_sub(label_pad * 2),
+        height: home_label_height(),
     };
     Some(HomeCell { cell, icon, label })
 }
@@ -245,15 +261,15 @@ pub(crate) fn home_clock(width: u32, height: u32) -> Option<HomeClock> {
     }
     let time = Rect {
         x: bounds.x,
-        y: bounds.y + HOME_CLOCK_TOP_PADDING,
+        y: bounds.y + home_clock_top_padding(),
         width: bounds.width,
-        height: HOME_CLOCK_TIME_HEIGHT,
+        height: home_clock_time_height(),
     };
     let date = Rect {
         x: bounds.x,
-        y: time.y + time.height + HOME_CLOCK_DATE_GAP,
+        y: time.y + time.height + home_clock_date_gap(),
         width: bounds.width,
-        height: HOME_CLOCK_DATE_HEIGHT,
+        height: home_clock_date_height(),
     };
     Some(HomeClock { time, date })
 }
@@ -269,7 +285,7 @@ pub(crate) fn home_clock_dirty_rect(width: u32, height: u32) -> Rect {
         x: bounds.x,
         y: bounds.y,
         width: bounds.width,
-        height: HOME_CLOCK_BLOCK_HEIGHT,
+        height: home_clock_block_height(),
     }
 }
 
@@ -280,19 +296,21 @@ pub(crate) fn launcher_button_rect(width: u32, height: u32, count: usize, index:
 
 pub(crate) fn taskbar_slot_rect(width: u32, height: u32, index: usize) -> Rect {
     let rail = taskbar_rail_rect(width as usize, height as usize);
-    let x = rail.x + DOCK_INNER_PADDING_X + index * (DOCK_ICON_SIZE + DOCK_ICON_GAP);
+    let icon_size = dock_icon_size();
+    let pad_x = dock_inner_padding_x();
+    let x = rail.x + pad_x + index * (icon_size + dock_icon_gap());
     let max_x = rail
         .x
         .saturating_add(rail.width)
-        .saturating_sub(DOCK_INNER_PADDING_X);
-    if x + DOCK_ICON_SIZE > max_x {
+        .saturating_sub(pad_x);
+    if x + icon_size > max_x {
         return Rect::empty();
     }
     Rect {
         x,
-        y: rail.y + (rail.height.saturating_sub(DOCK_ICON_SIZE)) / 2,
-        width: DOCK_ICON_SIZE,
-        height: DOCK_ICON_SIZE,
+        y: rail.y + (rail.height.saturating_sub(icon_size)) / 2,
+        width: icon_size,
+        height: icon_size,
     }
 }
 
@@ -303,7 +321,7 @@ pub(crate) fn window_title_bar_rect(outer: Rect) -> Rect {
         x: outer.x,
         y: outer.y,
         width: outer.width,
-        height: WINDOW_TITLE_HEIGHT,
+        height: window_title_height(),
     }
 }
 
@@ -313,35 +331,38 @@ pub(crate) fn window_title_bar_rect(outer: Rect) -> Rect {
 
 pub(crate) fn window_close_button_rect(outer: Rect) -> Rect {
     let title_rect = window_title_bar_rect(outer);
+    let close_w = window_close_button_width();
     let x = title_rect
         .x
         .saturating_add(title_rect.width)
-        .saturating_sub(WINDOW_BUTTON_MARGIN_RIGHT + WINDOW_CLOSE_BUTTON_WIDTH);
+        .saturating_sub(window_button_margin_right() + close_w);
     Rect {
         x,
-        y: title_rect.y + WINDOW_BUTTON_MARGIN_TOP,
-        width: WINDOW_CLOSE_BUTTON_WIDTH,
-        height: WINDOW_BUTTON_HEIGHT,
+        y: title_rect.y + window_button_margin_top(),
+        width: close_w,
+        height: window_button_height(),
     }
 }
 
 pub(crate) fn window_maximize_button_rect(outer: Rect) -> Rect {
     let close_rect = window_close_button_rect(outer);
+    let btn_w = window_button_width();
     Rect {
-        x: close_rect.x.saturating_sub(WINDOW_BUTTON_WIDTH),
+        x: close_rect.x.saturating_sub(btn_w),
         y: close_rect.y,
-        width: WINDOW_BUTTON_WIDTH,
-        height: WINDOW_BUTTON_HEIGHT,
+        width: btn_w,
+        height: window_button_height(),
     }
 }
 
 pub(crate) fn window_minimize_button_rect(outer: Rect) -> Rect {
     let max_rect = window_maximize_button_rect(outer);
+    let btn_w = window_button_width();
     Rect {
-        x: max_rect.x.saturating_sub(WINDOW_BUTTON_WIDTH),
+        x: max_rect.x.saturating_sub(btn_w),
         y: max_rect.y,
-        width: WINDOW_BUTTON_WIDTH,
-        height: WINDOW_BUTTON_HEIGHT,
+        width: btn_w,
+        height: window_button_height(),
     }
 }
 
@@ -362,28 +383,24 @@ pub(crate) struct ResizeEdge {
     pub(crate) bottom: bool,
 }
 
-const RESIZE_BORDER_PX: usize = 6;
-const RESIZE_CORNER_PX: usize = 12;
-
-/// Detect whether a pointer position inside `outer` lies on a resizable border
-/// or bottom corner. Excludes the title bar band so title dragging and caption
-/// buttons keep priority.
 pub(crate) fn window_resize_hit(outer: Rect, x: u32, y: u32) -> Option<ResizeEdge> {
     if !outer.contains(x, y) {
         return None;
     }
     let px = x as usize;
     let py = y as usize;
-    let title_bottom = outer.y + WINDOW_BORDER + WINDOW_TITLE_HEIGHT;
+    let title_bottom = outer.y + window_border() + window_title_height();
     if py < title_bottom {
         return None;
     }
     let right_edge = outer.x + outer.width;
     let bottom_edge = outer.y + outer.height;
-    let near_bottom = py >= bottom_edge.saturating_sub(RESIZE_BORDER_PX);
-    let corner_y = py >= bottom_edge.saturating_sub(RESIZE_CORNER_PX);
-    let left_margin = if corner_y { RESIZE_CORNER_PX } else { RESIZE_BORDER_PX };
-    let right_margin = if corner_y { RESIZE_CORNER_PX } else { RESIZE_BORDER_PX };
+    let resize_border = resize_border_px();
+    let resize_corner = resize_corner_px();
+    let near_bottom = py >= bottom_edge.saturating_sub(resize_border);
+    let corner_y = py >= bottom_edge.saturating_sub(resize_corner);
+    let left_margin = if corner_y { resize_corner } else { resize_border };
+    let right_margin = if corner_y { resize_corner } else { resize_border };
     let left = px < outer.x + left_margin;
     let right = !left && px >= right_edge.saturating_sub(right_margin);
     let bottom = near_bottom || (corner_y && (left || right));
@@ -458,30 +475,34 @@ pub(crate) fn window_chrome_hit(outer: Rect, x: u32, y: u32) -> WindowChromeHit 
 }
 
 pub(crate) fn window_button_cluster_width() -> usize {
-    WINDOW_BUTTON_MARGIN_RIGHT + WINDOW_BUTTON_WIDTH * 2 + WINDOW_CLOSE_BUTTON_WIDTH
+    window_button_margin_right() + window_button_width() * 2 + window_close_button_width()
 }
 
 pub(crate) fn window_client_rect(outer: Rect) -> Rect {
+    let border = window_border();
+    let title_h = window_title_height();
+    let pad_x = window_padding_x();
+    let pad_y = window_padding_y();
     Rect {
-        x: outer.x + WINDOW_BORDER + WINDOW_PADDING_X,
-        y: outer.y + WINDOW_BORDER + WINDOW_TITLE_HEIGHT + WINDOW_PADDING_Y,
+        x: outer.x + border + pad_x,
+        y: outer.y + border + title_h + pad_y,
         width: outer
             .width
-            .saturating_sub(WINDOW_BORDER * 2 + WINDOW_PADDING_X * 2),
+            .saturating_sub(border * 2 + pad_x * 2),
         height: outer
             .height
-            .saturating_sub(WINDOW_BORDER * 2 + WINDOW_TITLE_HEIGHT + WINDOW_PADDING_Y * 2),
+            .saturating_sub(border * 2 + title_h + pad_y * 2),
     }
 }
 
 pub(crate) fn default_console_window_rect(width: u32, height: u32, index: usize) -> Rect {
     let bounds = desktop_bounds(width, height);
-    let frame_width = DEFAULT_WINDOW_WIDTH
+    let frame_width = default_window_width()
         .min(bounds.width)
-        .max(bounds.width.min(MIN_WINDOW_WIDTH));
-    let frame_height = DEFAULT_WINDOW_HEIGHT
+        .max(bounds.width.min(min_window_width()));
+    let frame_height = default_window_height()
         .min(bounds.height)
-        .max(bounds.height.min(MIN_WINDOW_HEIGHT));
+        .max(bounds.height.min(min_window_height()));
     let (x, y) = cascade_origin(bounds, index);
 
     clamp_window_rect(
@@ -504,8 +525,8 @@ pub(crate) fn default_console_window_rect(width: u32, height: u32, index: usize)
 pub(crate) fn cascade_origin(bounds: Rect, index: usize) -> (usize, usize) {
     let step = index % WINDOW_CASCADE_SLOTS;
     (
-        bounds.x + step * WINDOW_CASCADE_X,
-        bounds.y + step * WINDOW_CASCADE_Y,
+        bounds.x + step * window_cascade_x(),
+        bounds.y + step * window_cascade_y(),
     )
 }
 
@@ -518,10 +539,11 @@ pub(crate) fn cascade_origin(bounds: Rect, index: usize) -> (usize, usize) {
 
 pub(crate) fn wayland_max_client_size(display_width: u32, display_height: u32) -> (usize, usize) {
     let bounds = desktop_bounds(display_width, display_height);
-    let max_w = bounds.width.saturating_sub(WINDOW_BORDER * 2);
+    let border = window_border();
+    let max_w = bounds.width.saturating_sub(border * 2);
     let max_h = bounds
         .height
-        .saturating_sub(WINDOW_BORDER * 2 + WINDOW_TITLE_HEIGHT);
+        .saturating_sub(border * 2 + window_title_height());
     (max_w.max(1), max_h.max(1))
 }
 
@@ -535,49 +557,30 @@ pub(crate) fn wayland_client_size_for_buffer(
     (buffer_width.min(max_w), buffer_height.min(max_h))
 }
 
-/// How much of the title bar must remain inside the desktop region after
-/// a clamp. We require enough horizontal overlap to keep the close button
-/// reachable and full vertical visibility so the title stays clickable
-/// for re-grab.
-pub(crate) const WAYLAND_TITLE_VISIBLE_PX: usize = 120;
-
 /// Clamp a Wayland surface frame so the title bar stays grabbable.
-///
-/// `frame.width` / `frame.height` are interpreted as the *client content*
-/// size — the title bar and border are added on top. The content size is
-/// capped to what the desktop can show so a misbehaving client (e.g.
-/// wayclick ignoring our configure) cannot push the buffer over the
-/// topbar or dock. The *position*, however, only needs to keep
-/// `WAYLAND_TITLE_VISIBLE_PX` of the title bar inside the desktop — we
-/// deliberately allow windows to be dragged partly off-screen so the
-/// user has free range of motion even when the chrome size matches the
-/// available area.
 pub(crate) fn clamp_wayland_frame(frame: Rect, display_width: u32, display_height: u32) -> Rect {
     let (max_w, max_h) = wayland_max_client_size(display_width, display_height);
     let width = frame.width.min(max_w).max(1);
     let height = frame.height.min(max_h).max(1);
     let bounds = desktop_bounds(display_width, display_height);
-    let outer_w = width.saturating_add(WINDOW_BORDER * 2);
-    let outer_h = height.saturating_add(WINDOW_TITLE_HEIGHT + WINDOW_BORDER * 2);
+    let border = window_border();
+    let title_h = window_title_height();
+    let outer_w = width.saturating_add(border * 2);
+    let outer_h = height.saturating_add(title_h + border * 2);
 
-    // Horizontal: keep at least `WAYLAND_TITLE_VISIBLE_PX` of chrome inside
-    // the desktop on either side. Allows dragging off the left or right
-    // edge until the title bar would disappear.
-    let min_visible = WAYLAND_TITLE_VISIBLE_PX.min(outer_w);
+    // Horizontal: keep at least `wayland_title_visible_px()` of chrome inside
+    // the desktop on either side.
+    let min_visible = wayland_title_visible_px().min(outer_w);
     let min_x = bounds.x.saturating_add(min_visible).saturating_sub(outer_w);
     let max_x = bounds
         .x
         .saturating_add(bounds.width)
         .saturating_sub(min_visible)
-        // A desktop narrower than the visible-title requirement would invert
-        // the range, and `clamp` panics when min > max.
         .max(min_x);
 
-    // Vertical: title bar must stay below the topbar and above the dock
-    // (otherwise the window can't be grabbed back). The body may extend
-    // past the bottom margin.
+    // Vertical: title bar must stay below the topbar and above the dock.
     let min_y = bounds.y;
-    let title_strip = WINDOW_TITLE_HEIGHT.saturating_add(WINDOW_BORDER);
+    let title_strip = title_h.saturating_add(border);
     let max_y = bounds
         .y
         .saturating_add(bounds.height)
@@ -598,22 +601,25 @@ pub(crate) fn wayland_outer_rect(
     client_width: usize,
     client_height: usize,
 ) -> Rect {
+    let border = window_border();
     Rect {
         x: frame_x,
         y: frame_y,
-        width: client_width.saturating_add(WINDOW_BORDER * 2),
-        height: client_height.saturating_add(WINDOW_TITLE_HEIGHT + WINDOW_BORDER * 2),
+        width: client_width.saturating_add(border * 2),
+        height: client_height.saturating_add(window_title_height() + border * 2),
     }
 }
 
 pub(crate) fn wayland_client_rect(outer: Rect) -> Rect {
+    let border = window_border();
+    let title_h = window_title_height();
     Rect {
-        x: outer.x + WINDOW_BORDER,
-        y: outer.y + WINDOW_BORDER + WINDOW_TITLE_HEIGHT,
-        width: outer.width.saturating_sub(WINDOW_BORDER * 2),
+        x: outer.x + border,
+        y: outer.y + border + title_h,
+        width: outer.width.saturating_sub(border * 2),
         height: outer
             .height
-            .saturating_sub(WINDOW_BORDER * 2 + WINDOW_TITLE_HEIGHT),
+            .saturating_sub(border * 2 + title_h),
     }
 }
 
@@ -691,7 +697,7 @@ mod tests {
 
     #[test]
     fn home_grid_is_centered_and_stays_between_the_rails() {
-        let (width, height) = (1600_u32, 900_u32);
+        let (width, height) = (ui_scale::px(1600) as u32, ui_scale::px(900) as u32);
         let bounds = desktop_bounds(width, height);
         let cells = home_cells(width, height, 27);
         assert_eq!(
@@ -700,7 +706,7 @@ mod tests {
             "one full-size home page fits under the clock"
         );
         assert_eq!(
-            cells[0].icon.width, HOME_ICON_SIZE,
+            cells[0].icon.width, home_icon_size(),
             "a small list keeps full size"
         );
         assert_grid_is_sound(width, height, &cells);
@@ -720,12 +726,19 @@ mod tests {
 
     #[test]
     fn a_long_launcher_list_shrinks_the_grid_instead_of_dropping_launchers() {
-        let (width, height) = (1600_u32, 900_u32);
-        // A full-size page holds 27 launchers (9 columns, 3 rows) under the clock.
-        for count in [28_usize, 36, 48, 90, 130] {
+        let (width, height) = (ui_scale::px(1600) as u32, ui_scale::px(900) as u32);
+        let full_capacity = home_grid_metrics_at(desktop_bounds(width, height), 100)
+            .expect("full-size grid fits")
+            .capacity();
+        for count in [
+            full_capacity + 1,
+            full_capacity + 12,
+            full_capacity * 2,
+            full_capacity * 3,
+        ] {
             let cells = home_cells(width, height, count);
             assert_eq!(cells.len(), count, "all {count} launchers stay visible");
-            assert!(cells[0].icon.width < HOME_ICON_SIZE, "the grid scaled down");
+            assert!(cells[0].icon.width < home_icon_size(), "the grid scaled down");
             assert!(cells[0].icon.width >= 8, "icons stay usable");
             assert_grid_is_sound(width, height, &cells);
         }
@@ -744,8 +757,8 @@ mod tests {
     #[test]
     fn a_display_too_small_for_any_grid_has_no_cells() {
         // A narrow display still gets a scaled-down grid...
-        let narrow = home_cell(HOME_CELL_WIDTH as u32, 900, 1, 0).expect("scaled grid fits");
-        assert!(narrow.icon.width < HOME_ICON_SIZE);
+        let narrow = home_cell(home_cell_width() as u32, 900, 1, 0).expect("scaled grid fits");
+        assert!(narrow.icon.width < home_icon_size());
         // ...but one narrower than the smallest scale has none.
         assert!(home_cell(100, 900, 1, 0).is_none());
         assert!(home_cell(1600, 120, 1, 0).is_none());
@@ -780,13 +793,13 @@ mod tests {
             assert_eq!(maximize.x + maximize.width, close.x, "flush to each other");
             assert_eq!(
                 title.x + title.width - (close.x + close.width),
-                WINDOW_BUTTON_MARGIN_RIGHT,
+                window_button_margin_right(),
                 "the group ends at the right margin"
             );
             for button in [minimize, maximize, close] {
                 assert!(button.y >= title.y && button.y + button.height <= title.y + title.height);
                 assert!(button.x >= title.x);
-                assert_eq!(button.height, WINDOW_BUTTON_HEIGHT);
+                assert_eq!(button.height, window_button_height());
             }
             assert!(close.width > maximize.width, "close is the wider target");
             assert_eq!(
@@ -871,10 +884,10 @@ mod tests {
                 }
             }
         }
-        let group = window_button_cluster_width() - WINDOW_BUTTON_MARGIN_RIGHT;
+        let group = window_button_cluster_width() - window_button_margin_right();
         assert_eq!(
             buttons,
-            group * WINDOW_BUTTON_HEIGHT,
+            group * window_button_height(),
             "buttons are the drawn group"
         );
         assert!(handle > buttons, "most of the title bar still drags");
@@ -903,10 +916,10 @@ mod tests {
 
     #[test]
     fn the_clock_sits_above_the_app_grid_and_never_overlaps_it() {
-        let (width, height) = (1600_u32, 900_u32);
+        let (width, height) = (ui_scale::px(1600) as u32, ui_scale::px(900) as u32);
         let bounds = desktop_bounds(width, height);
         let clock = home_clock(width, height).expect("a 1600x900 display shows a clock");
-        assert_eq!(clock.time.y - bounds.y, HOME_CLOCK_TOP_PADDING);
+        assert_eq!(clock.time.y - bounds.y, home_clock_top_padding());
         assert!(clock.time.y >= bounds.y && clock.date.y >= clock.time.y + clock.time.height);
         assert_eq!((clock.time.x, clock.time.width), (bounds.x, bounds.width));
 
@@ -915,25 +928,27 @@ mod tests {
             assert!(!cells.is_empty());
             assert_eq!(
                 cells[0].cell.y - (clock.date.y + clock.date.height),
-                HOME_CLOCK_BOTTOM_GAP
+                home_clock_bottom_gap()
             );
             for home in &cells {
                 assert!(
-                    home.cell.y >= clock.date.y + clock.date.height + HOME_CLOCK_BOTTOM_GAP,
+                    home.cell.y >= clock.date.y + clock.date.height + home_clock_bottom_gap(),
                     "apps start below the clock block padding"
                 );
             }
         }
         let block = home_clock_dirty_rect(width, height);
-        assert_eq!(block.height, HOME_CLOCK_BLOCK_HEIGHT);
+        assert_eq!(block.height, home_clock_block_height());
         assert!(home_cells(width, height, 90)[0].cell.y >= block.y + block.height);
     }
 
     #[test]
     fn a_display_too_small_for_the_clock_still_shows_its_apps() {
         // Short: no room for the clock plus two rows of apps.
-        let height =
-            (HOME_CLOCK_BLOCK_HEIGHT + 2 * 60) as u32 - 1 + 24 + TASKBAR_HEIGHT as u32 + 24;
+        let height = (home_clock_block_height() + home_clock_min_app_rows_height())
+            as u32
+            - 1
+            + (desktop_margin_y() * 2 + taskbar_height()) as u32;
         assert!(home_clock(1600, height).is_none());
         assert!(home_clock_dirty_rect(1600, height).is_empty());
         assert!(
@@ -949,12 +964,12 @@ mod tests {
         let outer = Rect {
             x: 100,
             y: 80,
-            width: 600,
-            height: 400,
+            width: 800,
+            height: 600,
         };
         assert_eq!(window_resize_hit(outer, 102, 84), None);
         assert_eq!(
-            window_resize_hit(outer, 102, 200),
+            window_resize_hit(outer, 102, 300),
             Some(ResizeEdge {
                 left: true,
                 right: false,
@@ -962,16 +977,16 @@ mod tests {
             })
         );
         assert_eq!(
-            window_resize_hit(outer, 695, 475),
+            window_resize_hit(outer, 895, 675),
             Some(ResizeEdge {
                 left: false,
                 right: true,
                 bottom: true,
             })
         );
-        assert_eq!(window_resize_hit(outer, 300, 200), None);
+        assert_eq!(window_resize_hit(outer, 400, 300), None);
 
-        let bounds = desktop_bounds(1920, 1080);
+        let bounds = desktop_bounds(2880, 1800);
         let shrunk = resized_window_rect(
             outer,
             ResizeEdge {
@@ -981,12 +996,57 @@ mod tests {
             },
             500,
             -300,
-            MIN_WINDOW_WIDTH,
-            MIN_WINDOW_HEIGHT,
+            min_window_width(),
+            min_window_height(),
             bounds,
         );
-        assert_eq!(shrunk.width, MIN_WINDOW_WIDTH);
-        assert_eq!(shrunk.height, MIN_WINDOW_HEIGHT);
+        assert_eq!(shrunk.width, min_window_width());
+        assert_eq!(shrunk.height, min_window_height());
         assert_eq!(shrunk.x + shrunk.width, outer.x + outer.width);
+    }
+
+    #[test]
+    fn hidpi_200_viewports_fit_clock_grid_rail_and_caption_buttons_without_overlap() {
+        assert_eq!(ui_scale::UiScale::default_scale().percent(), 200);
+        for (width, height) in [(2880_u32, 1800_u32), (1440, 900)] {
+            let bounds = desktop_bounds(width, height);
+            let rail = taskbar_rail_rect(width as usize, height as usize);
+            assert!(rail.x + rail.width <= width as usize);
+            assert!(rail.y + rail.height <= height as usize);
+            assert!(bounds.y + bounds.height <= rail.y);
+
+            let clock = home_clock(width, height).expect("clock must fit at HiDPI viewports");
+            for rect in [clock.time, clock.date] {
+                assert!(rect.x >= bounds.x && rect.x + rect.width <= bounds.x + bounds.width);
+                assert!(rect.y >= bounds.y && rect.y + rect.height <= bounds.y + bounds.height);
+            }
+            assert!(clock.time.intersect(clock.date).is_empty());
+
+            let cells = home_cells(width, height, 6);
+            assert_eq!(cells.len(), 6);
+            assert_grid_is_sound(width, height, &cells);
+            for cell in &cells {
+                assert!(cell.cell.y >= clock.date.y + clock.date.height);
+            }
+
+            let dock_slot = taskbar_slot_rect(width, height, 0);
+            assert!(!dock_slot.is_empty());
+            assert!(dock_slot.x >= rail.x && dock_slot.x + dock_slot.width <= rail.x + rail.width);
+            assert!(dock_slot.y >= rail.y && dock_slot.y + dock_slot.height <= rail.y + rail.height);
+
+            let win = Rect {
+                x: bounds.x,
+                y: bounds.y,
+                width: default_window_width().min(bounds.width),
+                height: default_window_height().min(bounds.height),
+            };
+            let title = window_title_bar_rect(win);
+            let minimize = window_minimize_button_rect(win);
+            let maximize = window_maximize_button_rect(win);
+            let close = window_close_button_rect(win);
+            assert!(minimize.x >= title.x && close.x + close.width <= title.x + title.width);
+            assert!(minimize.intersect(maximize).is_empty());
+            assert!(maximize.intersect(close).is_empty());
+        }
     }
 }

@@ -96,7 +96,7 @@ pub const IPC_MESSAGE_BYTES_PER_PROCESS: u64 = 512 * 1024;
 /// aperture, not per process.
 pub const DEVICE_BUFFER_QUOTAS_PER_JOB: u64 = 2;
 /// Client-funded session ceiling (`SYS_RUSTOS_JOB_SESSION`) per granted process.
-pub const SESSIONS_PER_PROCESS: u64 = 4;
+pub const SESSIONS_PER_PROCESS: u64 = 128;
 /// `memory.high` pressure telemetry fires at this fraction of the Job's page
 /// limit (numerator/denominator).
 pub const MEMORY_HIGH_NUMERATOR: u64 = 4;

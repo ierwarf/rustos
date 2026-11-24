@@ -26,18 +26,37 @@ pub(crate) fn call_syscalld_raw(request: &[u8]) -> Result<Vec<u8>, i64> {
     ipc_ops::call_linux_syscall_endpoint(request)
 }
 
+fn write_uts_field(dst: &mut [u8; 65], value: &[u8]) {
+    dst.fill(0);
+    let len = value.len().min(dst.len() - 1);
+    dst[..len].copy_from_slice(&value[..len]);
+}
+
+fn local_utsname() -> rustos_user_abi::syscall::LinuxUtsName {
+    let mut uts = rustos_user_abi::syscall::LinuxUtsName::default();
+    write_uts_field(&mut uts.sysname, b"RustOS");
+    write_uts_field(&mut uts.nodename, b"rustos");
+    write_uts_field(&mut uts.release, b"6.6.0-rustos");
+    write_uts_field(&mut uts.version, b"RustOS 0.1");
+    write_uts_field(&mut uts.machine, b"x86_64");
+    write_uts_field(&mut uts.domainname, b"localdomain");
+    uts
+}
+
 pub(super) fn syscall_linux_syscalld_uname(buf_ptr: u64) -> u64 {
     if let Err(err) = usermem::validate_current_user_write_buffer(buf_ptr, LINUX_UTSNAME_SIZE) {
         return linux_errno(user_pointer_error_to_linux_errno(err));
     }
-    let response = match call_syscalld(new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_UNAME)) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
+    let uts = local_utsname();
+    // SAFETY: `LinuxUtsName` is `#[repr(C)]` plain byte arrays of exact size
+    // `LINUX_UTSNAME_SIZE` with no padding or uninitialized bytes.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&uts as *const rustos_user_abi::syscall::LinuxUtsName).cast::<u8>(),
+            LINUX_UTSNAME_SIZE,
+        )
     };
-    if let Err(errno) = ensure_syscalld_payload(&response, LINUX_UTSNAME_SIZE) {
-        return linux_errno(errno);
-    }
-    match usermem::write_current_user_bytes(buf_ptr, &response.payload[..LINUX_UTSNAME_SIZE]) {
+    match usermem::write_current_user_bytes(buf_ptr, bytes) {
         Ok(()) => 0,
         Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
     }
@@ -499,10 +518,23 @@ pub(super) fn syscall_linux_syscalld_setpriority(which: u64, who: u64, prio: i64
     }
 }
 
+fn validate_getrandom_flags(flags: u64) -> Result<(), i64> {
+    const GRND_NONBLOCK: u64 = 0x0001;
+    const GRND_RANDOM: u64 = 0x0002;
+    const GRND_INSECURE: u64 = 0x0004;
+    const ALLOWED: u64 = GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE;
+    if flags & !ALLOWED != 0 || flags & (GRND_RANDOM | GRND_INSECURE) == GRND_RANDOM | GRND_INSECURE
+    {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(())
+}
+
 pub(super) fn syscall_linux_syscalld_getrandom(user_ptr: u64, user_len: u64, flags: u64) -> u64 {
-    // Linux clamps a single read-style request to MAX_RW_COUNT. Without the
-    // clamp an attacker-sized length keeps this thread in a service round trip
-    // loop for as long as the user mapping stays writable.
+    if let Err(errno) = validate_getrandom_flags(flags) {
+        return linux_errno(errno);
+    }
+    // Linux clamps a single read-style request to MAX_RW_COUNT.
     const MAX_RW_COUNT: usize = 0x7fff_f000;
     let Ok(len) = usize::try_from(user_len).map(|len| len.min(MAX_RW_COUNT)) else {
         return linux_errno(LINUX_EINVAL);
@@ -510,32 +542,19 @@ pub(super) fn syscall_linux_syscalld_getrandom(user_ptr: u64, user_len: u64, fla
     if len == 0 {
         return 0;
     }
+    let mut chunk = [0_u8; 256];
+    let mut rng = nucleus_core::util::random::Random::new();
     let mut copied = 0usize;
     while copied < len {
-        let chunk_len = (len - copied).min(SYSCALL_OFFLOAD_PAYLOAD_CAPACITY);
-        let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM);
-        request.flags = chunk_len as u64;
-        request.arg0 = flags;
-        let response = match call_syscalld(request) {
-            Ok(response) => response,
-            Err(errno) => return linux_errno(errno),
-        };
-        if let Err(errno) = ensure_syscalld_status(&response) {
-            return linux_errno(errno);
-        }
-        let payload_len = response.payload_len as usize;
-        if payload_len == 0 || payload_len > chunk_len {
-            return linux_errno(LINUX_EINVAL);
-        }
+        let chunk_len = (len - copied).min(chunk.len());
+        rng.fill_bytes(&mut chunk[..chunk_len]);
         let Some(dest_ptr) = user_ptr.checked_add(copied as u64) else {
             return linux_errno(LINUX_EINVAL);
         };
-        if let Err(err) =
-            usermem::write_current_user_bytes(dest_ptr, &response.payload[..payload_len])
-        {
+        if let Err(err) = usermem::write_current_user_bytes(dest_ptr, &chunk[..chunk_len]) {
             return linux_errno(user_pointer_error_to_linux_errno(err));
         }
-        copied += payload_len;
+        copied += chunk_len;
     }
     copied as u64
 }
@@ -855,6 +874,26 @@ pub(super) fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustos_user_abi::syscall::SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM;
+
+    #[test]
+    fn local_getrandom_flag_validation_matches_linux_rules() {
+        assert_eq!(validate_getrandom_flags(0), Ok(()));
+        assert_eq!(validate_getrandom_flags(0x1), Ok(())); // GRND_NONBLOCK
+        assert_eq!(validate_getrandom_flags(0x2), Ok(())); // GRND_RANDOM
+        assert_eq!(validate_getrandom_flags(0x4), Ok(())); // GRND_INSECURE
+        assert_eq!(validate_getrandom_flags(0x1 | 0x4), Ok(()));
+        assert_eq!(validate_getrandom_flags(0x2 | 0x4), Err(LINUX_EINVAL));
+        assert_eq!(validate_getrandom_flags(0x8), Err(LINUX_EINVAL));
+    }
+
+    #[test]
+    fn local_utsname_matches_rustos_identity() {
+        let uts = local_utsname();
+        assert!(uts.sysname.starts_with(b"RustOS\0"));
+        assert!(uts.release.starts_with(b"6.6.0-rustos\0"));
+        assert!(uts.machine.starts_with(b"x86_64\0"));
+    }
 
     #[test]
     fn syscalld_response_envelope_rejects_oversized_payload_before_slice_use() {

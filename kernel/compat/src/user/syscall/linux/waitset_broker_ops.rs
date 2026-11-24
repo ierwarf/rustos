@@ -68,26 +68,194 @@ struct InputOpenDescription {
 /// waiter slab.
 static KERNEL_OBSERVERS: AtomicUsize = AtomicUsize::new(0);
 
-fn clear_waiter_slot(slot: &mut Option<WaitSetWaiter>) {
-    if let Some(waiter) = slot.take()
-        && waiter.observation.provider == WAITSET_PROVIDER_KERNEL
-    {
-        KERNEL_OBSERVERS.fetch_sub(1, Ordering::Relaxed);
-    }
+/// Monotonic count of every waitset signal or provider revocation delivered
+/// through this module. Sampled before a blocking `epoll_wait` scan and
+/// re-checked after `register_waitset_waiters`'s `SeqCst` fence so an
+/// undisturbed wait skips the redundant second readiness scan without risking
+/// a lost wakeup.
+static WAITSET_SIGNAL_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn signal_epoch() -> u64 {
+    // ORDERING: Acquire pairs with `SeqCst` increments in `bump_signal_epoch`
+    // and follows the `SeqCst` fence in `register_waitset_waiters`.
+    WAITSET_SIGNAL_EPOCH.load(Ordering::Acquire)
 }
 
-fn install_waiter_slot(slot: &mut Option<WaitSetWaiter>, waiter: WaitSetWaiter) {
-    if waiter.observation.provider == WAITSET_PROVIDER_KERNEL {
-        KERNEL_OBSERVERS.fetch_add(1, Ordering::Relaxed);
+fn bump_signal_epoch() {
+    // ORDERING: SeqCst participates in the total order with
+    // `register_waitset_waiters`'s `SeqCst` fence so a waiter either sees the
+    // bumped epoch or has its registration visible to the wake that follows.
+    WAITSET_SIGNAL_EPOCH.fetch_add(1, Ordering::SeqCst);
+}
+
+const WAITSET_NO_SLOT: u16 = u16::MAX;
+const WAITSET_INDEX_BUCKETS: usize = 256;
+const _: () = assert!(WAITSET_WAITER_CAPACITY < WAITSET_NO_SLOT as usize);
+
+fn object_bucket(provider: u16, object_id: u64) -> usize {
+    let mixed = object_id
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (u64::from(provider) << 48);
+    ((mixed ^ (mixed >> 24) ^ (mixed >> 48)) as usize) & (WAITSET_INDEX_BUCKETS - 1)
+}
+
+fn task_bucket(task_id: u64) -> usize {
+    let mixed = task_id.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    ((mixed ^ (mixed >> 24) ^ (mixed >> 48)) as usize) & (WAITSET_INDEX_BUCKETS - 1)
+}
+
+struct WaiterTable {
+    slots: [Option<WaitSetWaiter>; WAITSET_WAITER_CAPACITY],
+    active_count: usize,
+    free_head: u16,
+    next_free: [u16; WAITSET_WAITER_CAPACITY],
+    object_heads: [u16; WAITSET_INDEX_BUCKETS],
+    object_prev: [u16; WAITSET_WAITER_CAPACITY],
+    object_next: [u16; WAITSET_WAITER_CAPACITY],
+    task_heads: [u16; WAITSET_INDEX_BUCKETS],
+    task_prev: [u16; WAITSET_WAITER_CAPACITY],
+    task_next: [u16; WAITSET_WAITER_CAPACITY],
+}
+
+impl WaiterTable {
+    fn boxed() -> alloc::boxed::Box<Self> {
+        let mut table = alloc::boxed::Box::new(Self {
+            slots: [None; WAITSET_WAITER_CAPACITY],
+            active_count: 0,
+            free_head: 0,
+            next_free: [WAITSET_NO_SLOT; WAITSET_WAITER_CAPACITY],
+            object_heads: [WAITSET_NO_SLOT; WAITSET_INDEX_BUCKETS],
+            object_prev: [WAITSET_NO_SLOT; WAITSET_WAITER_CAPACITY],
+            object_next: [WAITSET_NO_SLOT; WAITSET_WAITER_CAPACITY],
+            task_heads: [WAITSET_NO_SLOT; WAITSET_INDEX_BUCKETS],
+            task_prev: [WAITSET_NO_SLOT; WAITSET_WAITER_CAPACITY],
+            task_next: [WAITSET_NO_SLOT; WAITSET_WAITER_CAPACITY],
+        });
+        for idx in 0..WAITSET_WAITER_CAPACITY - 1 {
+            table.next_free[idx] = (idx + 1) as u16;
+        }
+        table
     }
-    *slot = Some(waiter);
+
+    fn free_count(&self) -> usize {
+        WAITSET_WAITER_CAPACITY - self.active_count
+    }
+
+    fn count_for_task(&self, task_id: u64) -> usize {
+        let mut count = 0;
+        let mut cur = self.task_heads[task_bucket(task_id)];
+        while cur != WAITSET_NO_SLOT {
+            let idx = cur as usize;
+            if let Some(waiter) = self.slots[idx]
+                && waiter.task_id == task_id
+            {
+                count += 1;
+            }
+            cur = self.task_next[idx];
+        }
+        count
+    }
+
+    fn install(&mut self, waiter: WaitSetWaiter) {
+        let idx = self.free_head as usize;
+        debug_assert!(self.free_head != WAITSET_NO_SLOT && self.slots[idx].is_none());
+        self.free_head = self.next_free[idx];
+        self.next_free[idx] = WAITSET_NO_SLOT;
+        self.slots[idx] = Some(waiter);
+        self.active_count += 1;
+        if waiter.observation.provider == WAITSET_PROVIDER_KERNEL {
+            KERNEL_OBSERVERS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let ob = object_bucket(waiter.observation.provider, waiter.observation.object_id);
+        let old_ob = self.object_heads[ob];
+        self.object_prev[idx] = WAITSET_NO_SLOT;
+        self.object_next[idx] = old_ob;
+        if old_ob != WAITSET_NO_SLOT {
+            self.object_prev[old_ob as usize] = idx as u16;
+        }
+        self.object_heads[ob] = idx as u16;
+
+        let tb = task_bucket(waiter.task_id);
+        let old_tb = self.task_heads[tb];
+        self.task_prev[idx] = WAITSET_NO_SLOT;
+        self.task_next[idx] = old_tb;
+        if old_tb != WAITSET_NO_SLOT {
+            self.task_prev[old_tb as usize] = idx as u16;
+        }
+        self.task_heads[tb] = idx as u16;
+    }
+
+    fn remove_slot(&mut self, idx: usize) {
+        let Some(waiter) = self.slots[idx].take() else {
+            return;
+        };
+        self.active_count -= 1;
+        if waiter.observation.provider == WAITSET_PROVIDER_KERNEL {
+            KERNEL_OBSERVERS.fetch_sub(1, Ordering::Relaxed);
+        }
+
+        let ob = object_bucket(waiter.observation.provider, waiter.observation.object_id);
+        let op = self.object_prev[idx];
+        let on = self.object_next[idx];
+        if op != WAITSET_NO_SLOT {
+            self.object_next[op as usize] = on;
+        } else {
+            self.object_heads[ob] = on;
+        }
+        if on != WAITSET_NO_SLOT {
+            self.object_prev[on as usize] = op;
+        }
+        self.object_prev[idx] = WAITSET_NO_SLOT;
+        self.object_next[idx] = WAITSET_NO_SLOT;
+
+        let tb = task_bucket(waiter.task_id);
+        let tp = self.task_prev[idx];
+        let tn = self.task_next[idx];
+        if tp != WAITSET_NO_SLOT {
+            self.task_next[tp as usize] = tn;
+        } else {
+            self.task_heads[tb] = tn;
+        }
+        if tn != WAITSET_NO_SLOT {
+            self.task_prev[tn as usize] = tp;
+        }
+        self.task_prev[idx] = WAITSET_NO_SLOT;
+        self.task_next[idx] = WAITSET_NO_SLOT;
+
+        self.next_free[idx] = self.free_head;
+        self.free_head = idx as u16;
+    }
+
+    fn remove_for_task(&mut self, task_id: u64) -> usize {
+        let mut removed = 0;
+        let mut cur = self.task_heads[task_bucket(task_id)];
+        while cur != WAITSET_NO_SLOT {
+            let idx = cur as usize;
+            let next = self.task_next[idx];
+            if self.slots[idx].is_some_and(|waiter| waiter.task_id == task_id) {
+                self.remove_slot(idx);
+                removed += 1;
+            }
+            cur = next;
+        }
+        removed
+    }
+
+    fn remove_for_process(&mut self, process_id: u64) {
+        for idx in 0..WAITSET_WAITER_CAPACITY {
+            if self.slots[idx].is_some_and(|waiter| waiter.process_id == process_id) {
+                self.remove_slot(idx);
+            }
+        }
+    }
 }
 
 lazy_static! {
     static ref WAITSET_WAITERS: TrackedSpinLock<
-        [Option<WaitSetWaiter>; WAITSET_WAITER_CAPACITY],
+        alloc::boxed::Box<WaiterTable>,
         { LockClass::CompatWaitset as u8 },
-    > = TrackedSpinLock::new([None; WAITSET_WAITER_CAPACITY]);
+    > = TrackedSpinLock::new(WaiterTable::boxed());
     static ref INPUT_OPEN_DESCRIPTIONS: TrackedSpinLock<
         [Option<InputOpenDescription>; INPUT_OPEN_DESCRIPTION_CAPACITY],
         { LockClass::InputOpenDescription as u8 },
@@ -300,39 +468,21 @@ fn register_waitset_waiters_faultable(
         return Err(LINUX_EBUSY);
     }
     let mut waiters = WAITSET_WAITERS.lock();
-    let existing = waiters
-        .iter()
-        .flatten()
-        .filter(|waiter| waiter.task_id == task_id)
-        .count();
-    let free = waiters.iter().filter(|slot| slot.is_none()).count();
+    let existing = waiters.count_for_task(task_id);
+    let free = waiters.free_count();
     if free.saturating_add(existing) < observations.len() {
         return Err(LINUX_EBUSY);
     }
     // Replacement is one bounded transaction: capacity is proved first, the
     // prior set is removed, then the complete new set is installed without an
     // allocator or fallible operation under the registry lock.
-    for slot in waiters.iter_mut() {
-        if slot
-            .as_ref()
-            .is_some_and(|waiter| waiter.task_id == task_id)
-        {
-            clear_waiter_slot(slot);
-        }
-    }
+    waiters.remove_for_task(task_id);
     for observation in observations.iter().copied() {
-        let slot = waiters
-            .iter_mut()
-            .find(|slot| slot.is_none())
-            .expect("waitset capacity preflight diverged");
-        install_waiter_slot(
-            slot,
-            WaitSetWaiter {
-                task_id,
-                process_id,
-                observation,
-            },
-        );
+        waiters.install(WaitSetWaiter {
+            task_id,
+            process_id,
+            observation,
+        });
     }
     drop(waiters);
     // ORDERING: pairs with the fence in `wake_local_fd_object`: either its counter load
@@ -343,18 +493,7 @@ fn register_waitset_waiters_faultable(
 }
 
 pub(crate) fn remove_waitset_waiters(task_id: u64) -> usize {
-    let mut waiters = WAITSET_WAITERS.lock();
-    let mut removed = 0;
-    for slot in waiters.iter_mut() {
-        if slot
-            .as_ref()
-            .is_some_and(|waiter| waiter.task_id == task_id)
-        {
-            clear_waiter_slot(slot);
-            removed += 1;
-        }
-    }
-    removed
+    WAITSET_WAITERS.lock().remove_for_task(task_id)
 }
 
 /// Returns true only while the exact provider observations installed by the
@@ -370,30 +509,32 @@ pub(crate) fn waitset_waiters_match(
         return true;
     }
     let waiters = WAITSET_WAITERS.lock();
-    let mut installed = waiters
-        .iter()
-        .flatten()
-        .filter(|waiter| waiter.task_id == task_id && waiter.process_id == process_id);
-    installed.clone().count() == observations.len()
-        && installed.all(|waiter| observations.contains(&waiter.observation))
+    let mut matched = 0usize;
+    let mut cur = waiters.task_heads[task_bucket(task_id)];
+    while cur != WAITSET_NO_SLOT {
+        let idx = cur as usize;
+        if let Some(waiter) = waiters.slots[idx] {
+            if waiter.task_id == task_id && waiter.process_id == process_id {
+                if !observations.contains(&waiter.observation) {
+                    return false;
+                }
+                matched += 1;
+            }
+        }
+        cur = waiters.task_next[idx];
+    }
+    matched == observations.len()
 }
 
 pub(crate) fn remove_waitset_waiters_for_process(process_id: u64) {
-    let mut waiters = WAITSET_WAITERS.lock();
-    for slot in waiters.iter_mut() {
-        if slot
-            .as_ref()
-            .is_some_and(|waiter| waiter.process_id == process_id)
-        {
-            clear_waiter_slot(slot);
-        }
-    }
+    WAITSET_WAITERS.lock().remove_for_process(process_id);
 }
 
 pub(crate) fn revoke_waitset_provider(service_id: u64) {
     let Some(provider) = provider_for_service(service_id) else {
         return;
     };
+    bump_signal_epoch();
     wake_matching(provider, None, None);
 }
 
@@ -423,6 +564,7 @@ pub(super) fn syscall_linux_rustos_waitset_signal_broker(args_ptr: u64) -> u64 {
         args.generation,
         args.flags & WAITSET_SIGNAL_FLAG_READY != 0,
     );
+    bump_signal_epoch();
     wake_matching(args.provider, Some(args.object_id), Some(args.generation));
     0
 }
@@ -434,8 +576,10 @@ pub(super) fn syscall_linux_rustos_waitset_signal_broker(args_ptr: u64) -> u64 {
 /// wait.
 pub(crate) fn wake_local_fd_object(token: u64, generation: u64) {
     const BATCH: usize = 8;
-    // ORDERING: pairs with the fence closing `register_waitset_waiters`.
-    fence(Ordering::SeqCst);
+    // Bump the global signal epoch before checking `KERNEL_OBSERVERS` so a
+    // waiter racing into `register_waitset_waiters` observes the epoch change
+    // even if its observer count was not yet visible here.
+    bump_signal_epoch();
     if KERNEL_OBSERVERS.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -457,29 +601,29 @@ fn take_local_waiters(token: u64, generation: u64, task_ids: &mut [u64]) -> (usi
     let mut count = 0_usize;
     let mut more = false;
     let mut waiters = WAITSET_WAITERS.lock();
-    for waiter in waiters.iter().flatten() {
-        let observation = waiter.observation;
-        if observation.provider != WAITSET_PROVIDER_KERNEL
-            || observation.object_id != token
-            || !generation_advances(observation.generation, generation)
-            || task_ids[..count].contains(&waiter.task_id)
-        {
-            continue;
+    let mut cur = waiters.object_heads[object_bucket(WAITSET_PROVIDER_KERNEL, token)];
+    while cur != WAITSET_NO_SLOT {
+        let idx = cur as usize;
+        let next = waiters.object_next[idx];
+        if let Some(waiter) = waiters.slots[idx] {
+            let observation = waiter.observation;
+            if observation.provider == WAITSET_PROVIDER_KERNEL
+                && observation.object_id == token
+                && generation_advances(observation.generation, generation)
+                && !task_ids[..count].contains(&waiter.task_id)
+            {
+                if count == task_ids.len() {
+                    more = true;
+                    break;
+                }
+                task_ids[count] = waiter.task_id;
+                count += 1;
+            }
         }
-        if count == task_ids.len() {
-            more = true;
-            break;
-        }
-        task_ids[count] = waiter.task_id;
-        count += 1;
+        cur = next;
     }
-    for slot in waiters.iter_mut() {
-        if slot
-            .as_ref()
-            .is_some_and(|waiter| task_ids[..count].contains(&waiter.task_id))
-        {
-            clear_waiter_slot(slot);
-        }
+    for &task_id in &task_ids[..count] {
+        waiters.remove_for_task(task_id);
     }
     (count, more)
 }
@@ -501,29 +645,40 @@ fn take_matching_waiters(
     let mut count = 0usize;
     {
         let mut waiters = WAITSET_WAITERS.lock();
-        for waiter in waiters.iter().flatten() {
-            let matches = {
+        if let Some(object) = object_id {
+            let mut cur = waiters.object_heads[object_bucket(provider, object)];
+            while cur != WAITSET_NO_SLOT {
+                let idx = cur as usize;
+                let next = waiters.object_next[idx];
+                if let Some(waiter) = waiters.slots[idx] {
+                    let observation = waiter.observation;
+                    if observation.provider == provider
+                        && observation.object_id == object
+                        && generation
+                            .is_none_or(|value| generation_advances(observation.generation, value))
+                        && !task_ids[..count].contains(&waiter.task_id)
+                    {
+                        task_ids[count] = waiter.task_id;
+                        count += 1;
+                    }
+                }
+                cur = next;
+            }
+        } else {
+            for waiter in waiters.slots.iter().flatten() {
                 let observation = waiter.observation;
-                observation.provider == provider
-                    && object_id.is_none_or(|object| observation.object_id == object)
+                if observation.provider == provider
                     && generation
                         .is_none_or(|value| generation_advances(observation.generation, value))
-            };
-            if !matches {
-                continue;
-            }
-            if !task_ids[..count].contains(&waiter.task_id) {
-                task_ids[count] = waiter.task_id;
-                count += 1;
+                    && !task_ids[..count].contains(&waiter.task_id)
+                {
+                    task_ids[count] = waiter.task_id;
+                    count += 1;
+                }
             }
         }
-        for slot in waiters.iter_mut() {
-            if slot
-                .as_ref()
-                .is_some_and(|waiter| task_ids[..count].contains(&waiter.task_id))
-            {
-                clear_waiter_slot(slot);
-            }
+        for &task_id in &task_ids[..count] {
+            waiters.remove_for_task(task_id);
         }
     }
     count
@@ -692,7 +847,7 @@ mod tests {
             remaining -= count;
         }
         assert_eq!(
-            super::WAITSET_WAITERS.lock().iter().flatten().count(),
+            super::WAITSET_WAITERS.lock().active_count,
             WAITSET_WAITER_CAPACITY
         );
 
@@ -837,9 +992,15 @@ mod tests {
             object_id: 41,
             generation: 7,
         }];
+        let colliding_object = (42..)
+            .find(|&id| {
+                super::object_bucket(WAITSET_PROVIDER_NETD, id)
+                    == super::object_bucket(WAITSET_PROVIDER_NETD, 41)
+            })
+            .expect("hash bucket collision for object 41");
         let second = [ProviderObservation {
             provider: WAITSET_PROVIDER_NETD,
-            object_id: 42,
+            object_id: colliding_object,
             generation: 7,
         }];
         register_waitset_waiters(first_task, process_id, &first).expect("first exact waiter");

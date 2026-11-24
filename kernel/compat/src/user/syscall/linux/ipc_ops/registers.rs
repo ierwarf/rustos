@@ -359,12 +359,18 @@ fn reply_receive(
                     identity.process_id(),
                     response,
                 )
-                .map_err(ipc_error_to_linux_errno)?;
+                .map_err(|err| {
+                    record_ipc_reply_rejection(reply, identity.process_id(), err);
+                    ipc_error_to_linux_errno(err)
+                })?;
             // Queued calls carry the same exact caller/context custody. Fuse
             // settlement with receive's park just as for a rendezvous reply.
             fast_reply::DeferredFastReply::new(reply, completion)
         }
-        Err(error) => return Err(ipc_error_to_linux_errno(error)),
+        Err(error) => {
+            record_ipc_reply_rejection(reply, identity.process_id(), error);
+            return Err(ipc_error_to_linux_errno(error));
+        }
     };
     let result = recv_with_sender_blocking_prepared_inner::<IPC_REGISTER_BYTES>(
         endpoint,
@@ -400,13 +406,19 @@ fn reply_only(raw: u64, response: &[u8], entry: Option<EntryIdentity>) -> Result
                     identity.process_id(),
                     response,
                 )
-                .map_err(ipc_error_to_linux_errno)?;
+                .map_err(|err| {
+                    record_ipc_reply_rejection(raw, identity.process_id(), err);
+                    ipc_error_to_linux_errno(err)
+                })?;
             if multitask::publish_ipc_reply(raw, completion) {
                 multitask::request_deferred_reschedule();
             }
             Ok(0)
         }
-        Err(error) => Err(ipc_error_to_linux_errno(error)),
+        Err(error) => {
+            record_ipc_reply_rejection(raw, identity.process_id(), error);
+            Err(ipc_error_to_linux_errno(error))
+        }
     }
 }
 
@@ -477,5 +489,26 @@ mod tests {
             Err(LINUX_EOVERFLOW)
         );
         assert_eq!(frame.r8, 0);
+    }
+
+    #[test]
+    fn register_reply_paths_record_rejected_replies() {
+        let source = include_str!("registers.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let reply_recv = source.split_once("fn reply_receive(").unwrap().1
+            .split_once("fn reply_only(").unwrap().0;
+        let reply_only = source.split_once("fn reply_only(").unwrap().1;
+        assert_eq!(
+            reply_recv.matches("record_ipc_reply_rejection(").count(),
+            2,
+            "both fast and queued rejection branches in register reply-recv must record rejections"
+        );
+        assert_eq!(
+            reply_only.matches("record_ipc_reply_rejection(").count(),
+            2,
+            "both fast and queued rejection branches in register reply-only must record rejections"
+        );
     }
 }

@@ -44,34 +44,39 @@ pub(crate) fn asset_revision() -> u64 {
 }
 
 pub(crate) fn terminal_cell_width() -> usize {
-    atlas(FontRole::Terminal).cell_width
+    with_atlas(FontRole::Terminal, |atlas| atlas.cell_width)
 }
 
 pub(crate) fn terminal_line_height() -> usize {
-    atlas(FontRole::Terminal).line_height
+    with_atlas(FontRole::Terminal, |atlas| atlas.line_height)
 }
 
 /// Line height of the active face (bundled until custom assets are promoted).
 pub(crate) fn line_height(role: FontRole) -> usize {
-    atlas(role).line_height
+    with_atlas(role, |atlas| atlas.line_height)
 }
 
 /// Widest digit in the clock face, so the time can be laid out in equal cells
 /// and not shift sideways as the digits change.
 pub(crate) fn widest_digit(role: FontRole) -> usize {
-    let atlas = atlas(role);
-    ('0'..='9')
-        .map(|digit| atlas.glyph(digit).advance)
-        .max()
-        .unwrap_or(0)
+    with_atlas(role, |atlas| {
+        ('0'..='9')
+            .map(|digit| atlas.glyph(digit).advance)
+            .max()
+            .unwrap_or(0)
+    })
 }
 
-fn atlas(role: FontRole) -> &'static GlyphAtlas {
-    ui_assets::assets().atlas(role).unwrap_or_else(|| {
-        ui_assets::bundled_assets()
+fn with_atlas<R>(role: FontRole, f: impl FnOnce(&GlyphAtlas) -> R) -> R {
+    let active = ui_assets::assets();
+    if let Some(atlas) = active.atlas(role) {
+        f(atlas)
+    } else {
+        let bundled = ui_assets::bundled_assets()
             .atlas(role)
-            .expect("every bundled font role exists")
-    })
+            .expect("every bundled font role exists");
+        f(bundled)
+    }
 }
 
 pub(crate) fn draw_text_clipped(
@@ -82,41 +87,43 @@ pub(crate) fn draw_text_clipped(
     max_width: usize,
     style: TextStyle,
 ) {
-    let atlas = atlas(style.role);
-    let mut cursor_x = x;
-    let limit_x = x.saturating_add(max_width);
-    for ch in text.chars() {
-        let glyph = atlas.glyph(ch);
-        let advance = if atlas.monospace {
-            atlas.cell_width
-        } else {
-            glyph.advance.saturating_add(style.tracking_px)
-        };
-        if cursor_x >= limit_x {
-            break;
+    with_atlas(style.role, |atlas| {
+        let mut cursor_x = x;
+        let limit_x = x.saturating_add(max_width);
+        for ch in text.chars() {
+            let glyph = atlas.glyph(ch);
+            let advance = if atlas.monospace {
+                atlas.cell_width
+            } else {
+                glyph.advance.saturating_add(style.tracking_px)
+            };
+            if cursor_x >= limit_x {
+                break;
+            }
+            let draw_width = if atlas.monospace {
+                atlas.cell_width
+            } else {
+                glyph.width
+            };
+            if cursor_x.saturating_add(draw_width) > limit_x {
+                break;
+            }
+            atlas.blit(canvas, glyph, cursor_x, y, style.color);
+            cursor_x = cursor_x.saturating_add(advance);
         }
-        let draw_width = if atlas.monospace {
-            atlas.cell_width
-        } else {
-            glyph.width
-        };
-        if cursor_x.saturating_add(draw_width) > limit_x {
-            break;
-        }
-        atlas.blit(canvas, glyph, cursor_x, y, style.color);
-        cursor_x = cursor_x.saturating_add(advance);
-    }
+    });
 }
 
 /// Rendered width of `text` in pixels, using the same advances as
 /// [`draw_text_clipped`], so callers can center or right-align a label.
 pub(crate) fn text_width(text: &str, style: TextStyle) -> usize {
-    let atlas = atlas(style.role);
-    text.chars().fold(0_usize, |width, ch| {
-        width.saturating_add(if atlas.monospace {
-            atlas.cell_width
-        } else {
-            atlas.glyph(ch).advance.saturating_add(style.tracking_px)
+    with_atlas(style.role, |atlas| {
+        text.chars().fold(0_usize, |width, ch| {
+            width.saturating_add(if atlas.monospace {
+                atlas.cell_width
+            } else {
+                atlas.glyph(ch).advance.saturating_add(style.tracking_px)
+            })
         })
     })
 }
@@ -128,8 +135,9 @@ pub(crate) fn draw_terminal_glyph(
     byte: u8,
     color: u32,
 ) {
-    let atlas = atlas(FontRole::Terminal);
-    atlas.blit(canvas, atlas.glyph(byte as char), x, y, color);
+    with_atlas(FontRole::Terminal, |atlas| {
+        atlas.blit(canvas, atlas.glyph(byte as char), x, y, color);
+    });
 }
 
 /// Draw one character of `style` at `x`, centered in a cell `cell_width` wide.
@@ -141,15 +149,16 @@ pub(crate) fn draw_glyph_centered(
     ch: char,
     style: TextStyle,
 ) {
-    let atlas = atlas(style.role);
-    let glyph = atlas.glyph(ch);
-    let offset = cell_width.saturating_sub(glyph.advance) / 2;
-    atlas.blit(canvas, glyph, x.saturating_add(offset), y, style.color);
+    with_atlas(style.role, |atlas| {
+        let glyph = atlas.glyph(ch);
+        let offset = cell_width.saturating_sub(glyph.advance) / 2;
+        atlas.blit(canvas, glyph, x.saturating_add(offset), y, style.color);
+    });
 }
 
 /// Advance of one character in `style`, for laying out cells.
 pub(crate) fn glyph_advance(ch: char, style: TextStyle) -> usize {
-    atlas(style.role).glyph(ch).advance
+    with_atlas(style.role, |atlas| atlas.glyph(ch).advance)
 }
 
 impl GlyphAtlas {
@@ -226,18 +235,20 @@ mod tests {
     fn the_terminal_grid_comes_from_the_terminal_face() {
         assert!(terminal_cell_width() >= 6);
         assert!(terminal_line_height() >= 12);
-        let atlas = atlas(FontRole::Terminal);
-        assert!(atlas.monospace);
-        assert_eq!(atlas.glyph('i').advance, atlas.glyph('W').advance);
+        with_atlas(FontRole::Terminal, |atlas| {
+            assert!(atlas.monospace);
+            assert_eq!(atlas.glyph('i').advance, atlas.glyph('W').advance);
+        });
     }
 
     #[test]
     fn the_clock_face_only_rasterizes_clock_characters() {
-        let atlas = atlas(FontRole::Clock);
-        assert!(atlas.glyph('8').width > 0);
-        assert!(atlas.glyph(':').width > 0);
-        assert_eq!(atlas.glyph('A').width, 0, "letters are outside the charset");
-        assert!(widest_digit(FontRole::Clock) >= atlas.glyph('1').advance);
+        with_atlas(FontRole::Clock, |atlas| {
+            assert!(atlas.glyph('8').width > 0);
+            assert!(atlas.glyph(':').width > 0);
+            assert_eq!(atlas.glyph('A').width, 0, "letters are outside the charset");
+            assert!(widest_digit(FontRole::Clock) >= atlas.glyph('1').advance);
+        });
     }
 
     #[test]

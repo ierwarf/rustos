@@ -4,11 +4,11 @@
 //! once and renders an Aspect-Fill (`cover`, center-cropped, aspect-preserving)
 //! background surface for the active display resolution.
 
-use std::sync::mpsc::{self, Receiver};
 use std::sync::OnceLock;
+use std::sync::mpsc::{self, Receiver};
 
 use crate::canvas::{Rect, SurfaceCanvas};
-use crate::sys::{require_background_thread_class, spawn_ui_thread, UiThreadRole};
+use crate::sys::{UiThreadRole, require_background_thread_class, spawn_ui_thread};
 
 use super::colors::{COLOR_BG_DEEP, COLOR_BG_MID, COLOR_BG_TOP};
 
@@ -198,12 +198,7 @@ fn sample_axis_fp(index: usize, origin_fp: u128, step_fp: u128, max_fp: u128) ->
     center.saturating_sub(FP_ONE / 2).min(max_fp)
 }
 
-fn render_aspect_fill(
-    src: &DecodedImage,
-    dst_w: usize,
-    dst_h: usize,
-    bilinear: bool,
-) -> Vec<u32> {
+fn render_aspect_fill(src: &DecodedImage, dst_w: usize, dst_h: usize, bilinear: bool) -> Vec<u32> {
     let Some(total) = dst_w.checked_mul(dst_h) else {
         return Vec::new();
     };
@@ -264,9 +259,9 @@ fn render_aspect_fill(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_desktop_background, build_fast_desktop_background, bundled_wallpaper,
-        compute_aspect_fill_geometry, sample_axis_fp, DecodedImage, DesktopBackground, FP_BITS,
-        render_aspect_fill,
+        DecodedImage, DesktopBackground, FP_BITS, build_desktop_background,
+        build_fast_desktop_background, bundled_wallpaper, compute_aspect_fill_geometry,
+        render_aspect_fill, sample_axis_fp,
     };
 
     #[test]
@@ -314,8 +309,7 @@ mod tests {
         assert!(last_fy >= 235);
 
         let first_x = sample_axis_fp(0, geom.origin_x_fp, geom.step_fp, geom.max_x_fp) >> FP_BITS;
-        let last_x =
-            sample_axis_fp(1279, geom.origin_x_fp, geom.step_fp, geom.max_x_fp) >> FP_BITS;
+        let last_x = sample_axis_fp(1279, geom.origin_x_fp, geom.step_fp, geom.max_x_fp) >> FP_BITS;
         assert!(first_x > 260 && first_x < 300);
         assert!(last_x > 1700 && last_x < 1740);
 
@@ -324,8 +318,8 @@ mod tests {
             width: 4,
             height: 2,
             pixels: vec![
-                0x11_0000, 0x22_0000, 0x33_0000, 0x44_0000,
-                0x11_0000, 0x22_0000, 0x33_0000, 0x44_0000,
+                0x11_0000, 0x22_0000, 0x33_0000, 0x44_0000, 0x11_0000, 0x22_0000, 0x33_0000,
+                0x44_0000,
             ],
         };
         let out = render_aspect_fill(&src, 2, 2, true);

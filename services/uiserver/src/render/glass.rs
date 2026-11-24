@@ -807,9 +807,24 @@ mod tests {
                 title_bottom: 150,
                 title_edge: 238,
                 solid: [
-                    Rect { x: 4, y: 2, width: 10, height: 8 },
-                    Rect { x: 20, y: 2, width: 10, height: 8 },
-                    Rect { x: 40, y: 2, width: 10, height: 8 },
+                    Rect {
+                        x: 4,
+                        y: 2,
+                        width: 10,
+                        height: 8,
+                    },
+                    Rect {
+                        x: 20,
+                        y: 2,
+                        width: 10,
+                        height: 8,
+                    },
+                    Rect {
+                        x: 40,
+                        y: 2,
+                        width: 10,
+                        height: 8,
+                    },
                 ],
                 solid_alpha: 226,
             };

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 
 use super::{
-    completion_wait_origin, copy_atlas_damage_to_slot, difference_bounds, gpu_completion_timed_out,
-    gpu_provider_admission, gpu_ready_retry_backoff, next_frame_deadline,
-    reconstruction_damage_within_budget, snapshot_damage_for_slot, AtlasDamageEpoch,
-    DvmGpuAtlasDamage, GpuCompositorRuntime, GpuProviderAdmission, Rect, GPU_COMPLETION_TIMEOUT,
-    GPU_FIRST_FRAME_TIMEOUT, GPU_FRAME_INTERVAL, GPU_INITIALIZATION_RETAINS_BOOT_CLASS,
-    GPU_PROVIDER_HEALTH_INTERVAL,
+    AtlasDamageEpoch, DvmGpuAtlasDamage, GPU_COMPLETION_TIMEOUT, GPU_FIRST_FRAME_TIMEOUT,
+    GPU_FRAME_INTERVAL, GPU_INITIALIZATION_RETAINS_BOOT_CLASS, GPU_PROVIDER_HEALTH_INTERVAL,
+    GpuCompositorRuntime, GpuProviderAdmission, Rect, completion_wait_origin,
+    copy_atlas_damage_to_slot, difference_bounds, gpu_completion_timed_out, gpu_provider_admission,
+    gpu_ready_retry_backoff, next_frame_deadline, reconstruction_damage_within_budget,
+    snapshot_damage_for_slot,
 };
 use crate::sys::DisplayInfo;
 use rustos_user_abi::device::{DISPLAY_INFO_FLAG_DVM_SCANOUT, DISPLAY_INFO_FLAG_GPU_COMPOSITOR};
@@ -115,16 +115,12 @@ fn difference_bounds_rejects_incompatible_geometry() {
 }
 
 #[test]
-fn frame_deadline_skips_missed_slots_without_drift_or_burst() {
+fn frame_deadline_is_spacing_from_submission_not_a_phase_grid() {
     let origin = Instant::now();
-    assert_eq!(
-        next_frame_deadline(origin, origin),
-        origin + GPU_FRAME_INTERVAL
-    );
-    assert_eq!(
-        next_frame_deadline(origin, origin + Duration::from_millis(49)),
-        origin + Duration::from_millis(60)
-    );
+    assert_eq!(next_frame_deadline(origin), origin + GPU_FRAME_INTERVAL);
+    // An update after a long idle gap is never delayed by a stale grid slot.
+    let later = origin + Duration::from_millis(49);
+    assert!(next_frame_deadline(origin) < later);
 }
 
 #[test]
@@ -327,7 +323,13 @@ fn slot_reconstruction_budget_rejects_atlas_amplification() {
 
 #[test]
 fn difference_bounds_matches_a_per_pixel_scan() {
-    fn per_pixel(previous: &[u32], next: &[u32], width: usize, height: usize, stride: usize) -> Option<Rect> {
+    fn per_pixel(
+        previous: &[u32],
+        next: &[u32],
+        width: usize,
+        height: usize,
+        stride: usize,
+    ) -> Option<Rect> {
         let (mut left, mut top, mut right, mut bottom) = (width, height, 0, 0);
         for y in 0..height {
             for x in 0..width {
@@ -368,15 +370,24 @@ fn difference_bounds_matches_a_per_pixel_scan() {
     // Padding between rows is not part of the image.
     let mut padded = base.clone();
     padded[4 * stride + width + 1] ^= 1;
-    assert_eq!(difference_bounds(&base, &padded, width, height, stride), None);
+    assert_eq!(
+        difference_bounds(&base, &padded, width, height, stride),
+        None
+    );
 }
 
 #[test]
 fn queued_frame_deadline_starts_at_predecessor_completion() {
     let submitted_at = Instant::now();
     let completed_at = submitted_at + Duration::from_millis(40);
-    assert_eq!(completion_wait_origin(submitted_at, completed_at), completed_at);
-    assert_eq!(completion_wait_origin(completed_at, submitted_at), completed_at);
+    assert_eq!(
+        completion_wait_origin(submitted_at, completed_at),
+        completed_at
+    );
+    assert_eq!(
+        completion_wait_origin(completed_at, submitted_at),
+        completed_at
+    );
 }
 
 #[test]

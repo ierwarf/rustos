@@ -6,6 +6,7 @@ pub mod futex_thread;
 pub mod ipc_helpers;
 pub(in crate::user::syscall) mod local_fd;
 mod local_memfd_io;
+pub(in crate::user::syscall) mod local_unix;
 pub mod poll_epoll;
 pub mod proc_identity;
 mod proc_snapshot;

@@ -645,6 +645,7 @@ fn vfs_request_is_replay_safe(request: &VfsIpcRequest) -> bool {
         VFS_IPC_OP_OPENAT
             | VFS_IPC_OP_CLOSE
             | VFS_IPC_OP_READ
+            | VFS_IPC_OP_PREAD64
             | VFS_IPC_OP_LSEEK
             | VFS_IPC_OP_GETDENTS64
             | VFS_IPC_OP_FCNTL
@@ -875,6 +876,27 @@ pub fn settle_vfs_cursor_mutation(prepared: &VfsIpcRequest, commit: bool) -> Res
     let response = call_vfs_ipc_request_with_timeout(&request,
         rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS)?;
     ensure_vfs_status(&response)
+}
+
+/// Explicitly synchronizes a dirty kernel-owned regular-file cursor to `vfsd`
+/// (`VFS_CURSOR_SETTLE_SYNC`). Returns the settled cursor confirmed by `vfsd`.
+pub fn settle_vfs_cursor_sync(fd: u64, remote_id: u64, cursor: u64) -> Result<u64, i64> {
+    if cursor > i64::MAX as u64 {
+        return Err(LINUX_EINVAL);
+    }
+    let mut request = new_vfs_request(VFS_IPC_OP_CURSOR_SETTLE);
+    request.fd = fd;
+    request.remote_id = remote_id;
+    request.arg0 = cursor;
+    request.arg1 = 0;
+    request.arg2 = VFS_CURSOR_SETTLE_SYNC;
+    request.arg3 = 0;
+    let response = call_vfs_ipc_request_with_timeout(
+        &request,
+        rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
+    )?;
+    ensure_vfs_status(&response)?;
+    Ok(response.value)
 }
 
 impl PendingVfsMutation {

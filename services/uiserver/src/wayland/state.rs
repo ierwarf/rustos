@@ -7,6 +7,7 @@ impl WaylandState {
         Self {
             display_width,
             display_height,
+            output_scale: crate::ui_scale::current().wayland_output_scale(),
             next_serial: 1,
             next_surface_id: 1,
             cascade_base: 0,
@@ -673,6 +674,9 @@ impl WaylandState {
             let Some(toplevel) = state.toplevel.clone() else {
                 return;
             };
+            let scale = self.output_scale.max(1) as usize;
+            let logical_w = (state.frame.width / scale).max(1);
+            let logical_h = (state.frame.height / scale).max(1);
             (
                 xdg_surface,
                 toplevel,
@@ -682,8 +686,8 @@ impl WaylandState {
                 } else {
                     state.decoration_ack_server
                 },
-                i32::try_from(state.frame.width).unwrap_or(0),
-                i32::try_from(state.frame.height).unwrap_or(0),
+                i32::try_from(logical_w).unwrap_or(0),
+                i32::try_from(logical_h).unwrap_or(0),
             )
         };
 
@@ -712,5 +716,90 @@ impl WaylandState {
             state.outstanding_configures.push(serial);
             state.needs_initial_configure = false;
         }
+    }
+
+    /// Dynamically updates the Wayland output scale, notifies every bound
+    /// `wl_output` client, rescales existing surface buffers for the new output
+    /// scale, and re-configures every toplevel with updated logical dimensions.
+    pub(super) fn set_output_scale(&mut self, output_scale: i32) -> bool {
+        let next_scale = output_scale.clamp(1, 4);
+        if self.output_scale == next_scale {
+            return false;
+        }
+        self.output_scale = next_scale;
+        self.output_resources
+            .retain(|output| output.resource.is_alive());
+        for output in &self.output_resources {
+            output.resource.scale(next_scale);
+            if output.resource.version() >= 2 {
+                output.resource.done();
+            }
+        }
+        let surfaces: Vec<Arc<Mutex<WaylandSurfaceState>>> = self
+            .surfaces
+            .iter()
+            .map(|entry| Arc::clone(&entry.shared))
+            .collect();
+        for shared in surfaces {
+            let remap = {
+                let Ok(state) = shared.lock() else {
+                    continue;
+                };
+                if !state.alive {
+                    continue;
+                }
+                (
+                    state.original_pixels.clone(),
+                    state.original_width,
+                    state.original_height,
+                    state.buffer_mapping,
+                    state.viewport,
+                )
+            };
+            let (original, orig_w, orig_h, mapping, viewport) = remap;
+            if orig_w > 0 && orig_h > 0 && !original.is_empty() {
+                if let Ok(mapped) = map_buffer_for_output(
+                    &original,
+                    orig_w,
+                    orig_h,
+                    mapping,
+                    &viewport,
+                    next_scale as usize,
+                ) {
+                    let (pixels, w, h) = match mapped {
+                        Some((buf, w, h)) => (Arc::new(buf), w, h),
+                        None => (original, orig_w, orig_h),
+                    };
+                    if let Ok(mut state) = shared.lock() {
+                        state.pixels = pixels;
+                        state.width = w;
+                        state.height = h;
+                        state.stride_pixels = w;
+                        state.content_version = next_content_version(state.content_version);
+                        if !state.drag_icon_role {
+                            let (vis_w, vis_h) = wayland_client_size_for_buffer(
+                                w,
+                                h,
+                                self.display_width,
+                                self.display_height,
+                            );
+                            state.frame = clamp_wayland_frame(
+                                Rect {
+                                    x: state.frame.x,
+                                    y: state.frame.y,
+                                    width: vis_w,
+                                    height: vis_h,
+                                },
+                                self.display_width,
+                                self.display_height,
+                            );
+                        }
+                    }
+                }
+            }
+            self.send_toplevel_configure(&shared);
+        }
+        self.mark_dirty();
+        true
     }
 }

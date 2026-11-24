@@ -5,9 +5,9 @@ use super::launch::{launch_program_async, terminate_session_async};
 use super::{AppState, DragTarget, VisualUpdate, WindowId};
 use crate::canvas;
 use crate::layout::{
-    clamp_wayland_frame, desktop_bounds, maximized_window_rect, resized_window_rect,
-    window_resize_hit, ResizeEdge, WindowChromeHit, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH,
-    WINDOW_BORDER, WINDOW_TITLE_HEIGHT,
+    ResizeEdge, WindowChromeHit, clamp_wayland_frame, desktop_bounds, maximized_window_rect,
+    min_window_height, min_window_width, resized_window_rect, window_border, window_resize_hit,
+    window_title_height,
 };
 use crate::profile;
 use crate::render::{
@@ -15,8 +15,8 @@ use crate::render::{
     wayland_window_client_rect, wayland_window_dirty_rect, wayland_window_outer_rect,
 };
 use crate::sys::{
-    self, ConsoleSessionHandle, InputEvent, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON,
-    INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, INPUT_KIND_POINTER_SCROLL,
+    self, ConsoleSessionHandle, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON,
+    INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION, INPUT_KIND_POINTER_SCROLL, InputEvent,
     POINTER_BUTTON_LEFT,
 };
 use crate::wayland::WaylandCompositor;
@@ -458,7 +458,11 @@ impl AppState {
         self.drag_offset_y = self.cursor_y.saturating_sub(window.frame.y as u32) as usize;
     }
 
-    fn start_console_window_resize(&mut self, session_handle: ConsoleSessionHandle, edge: ResizeEdge) {
+    fn start_console_window_resize(
+        &mut self,
+        session_handle: ConsoleSessionHandle,
+        edge: ResizeEdge,
+    ) {
         let Some(window) = self
             .console_windows
             .iter()
@@ -694,8 +698,8 @@ impl AppState {
                     edge,
                     dx,
                     dy,
-                    MIN_WINDOW_WIDTH,
-                    MIN_WINDOW_HEIGHT,
+                    min_window_width(),
+                    min_window_height(),
                     bounds,
                 );
                 if window.frame == next_frame {
@@ -774,9 +778,10 @@ impl AppState {
                 let bounds = desktop_bounds(self.display.width, self.display.height);
                 let dx = self.cursor_x as i64 - start_x as i64;
                 let dy = self.cursor_y as i64 - start_y as i64;
-                let min_outer_w = MIN_WINDOW_WIDTH.max(WINDOW_BORDER * 2 + 1);
+                let border = window_border();
+                let min_outer_w = min_window_width().max(border * 2 + 1);
                 let min_outer_h =
-                    MIN_WINDOW_HEIGHT.max(WINDOW_BORDER * 2 + WINDOW_TITLE_HEIGHT + 1);
+                    min_window_height().max(border * 2 + window_title_height() + 1);
                 let next_outer = resized_window_rect(
                     start_outer,
                     edge,

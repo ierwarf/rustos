@@ -36,15 +36,25 @@ use rustos_user_abi::syscall::{ServiceCapability,
 };
 
 use rustos_user_abi::pager::MM_BROKER_OP_SET_ANON_POLICY;
+use rustos_user_abi::syscall::{
+    IPC_SERVICE_PAGERD, IPC_SERVICE_VFSD, MM_BROKER_BIND_FLAG_DEMAND, VfsBulkReadResponse,
+    VfsIpcRequest, VFS_BULK_READ_MAX_BYTES, VFS_BULK_READ_MIN_BYTES, VFS_IPC_ABI_VERSION,
+    VFS_IPC_OP_BULK_READ,
+};
+use kernel_mm::api::frame_source::FrameSourceOwner;
 use rustos_user_abi::syscall::MM_BROKER_OP_MAP_FILE_SHARED;
 
 use crate::user::handles::{KernelHandle, LibraryBinding, RemoteVfsHandleKind};
-use crate::library_cache::{decide_bind, BindDecision, KernelSources, REGISTRY};
+use crate::library_cache::{decide_bind, BindDecision, GapClaim, KernelSources, REGISTRY};
 use crate::user::memfd::{MemfdError, MemfdHandle};
 use super::mm_request_lease::{self, MmTarget};
 
 const PAGE_SIZE: u64 = 4096;
 const FILE_COPY_CHUNK: usize = VFS_IPC_PAYLOAD_CAPACITY;
+/// Chunk size used by `copy_file_mapping` when the mapping is large enough for
+/// `VFS_IPC_OP_BULK_READ` (1 MiB -> 64 IPCs for a 64 MiB file instead of ~1,000).
+const FILE_COPY_BULK_CHUNK: usize = 1024 * 1024;
+const LINUX_EOPNOTSUPP_ERRNO: i64 = 95;
 
 #[derive(Clone)]
 enum FileMappingSource {
@@ -400,7 +410,7 @@ fn broker_map_file_private(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(),
     // A description bound to a sealed shared library object is served by
     // aliasing the object's immutable frames copy-on-write. Anything that
     // cannot be served completely falls through to the eager copy below.
-    if let Some(result) = map_library_alias(args, t, start, len, mapping_end)? {
+    if let Some(result) = map_library_alias(args, t, start, len, mapping_end, &source)? {
         return publish_map_result(args, t, &result);
     }
 
@@ -498,6 +508,9 @@ fn broker_bind_library(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64
     };
     let snapshot = snapshot?;
     let not_bound = RustosMmLibraryBindBrokerResult::default();
+    // syscalld's policy says this mapping is large enough to justify a demand
+    // object; `len` is the mapping length it will ask for next.
+    let demand_requested = args.flags & MM_BROKER_BIND_FLAG_DEMAND != 0 && args.len != 0;
 
     // Already attested: revalidate the generation and answer without IPC.
     match snapshot.binding {
@@ -512,32 +525,28 @@ fn broker_bind_library(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64
             }
         }
         LibraryBinding::Ineligible { registry_epoch } => {
-            if registry_epoch == REGISTRY.lock().epoch() {
+            // A verdict recorded for a small mapping said "no object", not "no
+            // object may ever be created"; a demand request re-attests once.
+            if registry_epoch == REGISTRY.lock().epoch() && !demand_requested {
                 return write_out(args, &not_bound);
             }
         }
         LibraryBinding::Unknown => {}
     }
-    // Nothing sealed means nothing can match; do not spend a vfsd round trip.
-    if !REGISTRY.lock().has_sealed_objects() {
+    // Nothing servable means nothing can match, and without a demand request
+    // nothing will be created; do not spend a vfsd round trip.
+    if !demand_requested && !REGISTRY.lock().has_sealed_objects() {
         crate::library_cache::note_decline(crate::library_cache::Decline::NothingSealed, 0);
         return write_out(args, &not_bound);
     }
 
     // vfsd attestation failing (timeout, ENOENT, a non-volume file) is "not
     // eligible", never an error for the mmap that follows.
+    let attested;
     let decision = match offload_ops::call_remote_vfs_file_identity(snapshot.remote_id, t.pid) {
         Ok(file) => {
             let decision = decide_bind(&REGISTRY.lock(), &file, snapshot.len);
-            if matches!(decision, BindDecision::NotEligible { .. }) {
-                // Name the attested identity (volume, object, length) once.
-                nucleus_core::debug::record_milestone(
-                    nucleus_core::debug::LogCategory::Compat,
-                    "library-bind-mismatch",
-                    file.object,
-                    file.len ^ (snapshot.len << 32),
-                );
-            }
+            attested = file;
             decision
         }
         Err(errno) => {
@@ -548,7 +557,24 @@ fn broker_bind_library(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64
             return write_out(args, &not_bound);
         }
     };
+    // No pager-warmed object matches. For a large private mapping of an exactly
+    // attested immutable file, create the file's demand object instead; the map
+    // that follows fills it and every later mapping of the file aliases it.
+    let decision = match (decision, attested) {
+        (BindDecision::NotEligible { .. }, file)
+            if demand_requested && file.is_immutable() && file.len == snapshot.len =>
+        {
+            match create_demand_object(&file) {
+                Some(object) => BindDecision::Bound(object),
+                None => decision,
+            }
+        }
+        _ => decision,
+    };
     if matches!(decision, BindDecision::NotEligible { .. }) {
+        if attested.is_immutable() {
+            record_library_bind_mismatch(&attested, snapshot.len);
+        }
         crate::library_cache::note_decline(
             crate::library_cache::Decline::NoMatchingObject,
             snapshot.len,
@@ -591,6 +617,39 @@ fn broker_bind_library(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64
     }
 }
 
+/// Throttled diagnostic for immutable files that failed both warm-object
+/// binding and demand-object creation, avoiding milestone ringbuffer drops.
+fn record_library_bind_mismatch(
+    file: &rustos_user_abi::syscall::VfsFileIdentityWire,
+    guest_len: u64,
+) {
+    static SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    // ORDERING: Relaxed; monotonic telemetry throttle only.
+    let count = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if count <= 16 || count.is_power_of_two() {
+        nucleus_core::debug::record_milestone(
+            nucleus_core::debug::LogCategory::Compat,
+            "library-bind-mismatch",
+            file.object,
+            file.len ^ (guest_len << 32),
+        );
+    }
+}
+
+/// Splits a page-aligned file mapping `[first_page, first_page + pages)` into
+/// the prefix of pages backed by `file_len` and any zero-filled tail pages
+/// completely beyond EOF's page (e.g., an ELF `.bss` span mapped by `ld.so`).
+/// Returns `None` if `first_page` starts at or beyond EOF's page or overflows.
+fn library_alias_page_split(first_page: u64, pages: u64, file_len: u64) -> Option<(u64, u64)> {
+    let _ = first_page.checked_add(pages)?;
+    let file_pages = file_len.div_ceil(PAGE_SIZE);
+    if first_page >= file_pages {
+        return None;
+    }
+    let alias_pages = pages.min(file_pages - first_page);
+    Some((alias_pages, pages - alias_pages))
+}
+
 fn library_error_detail(error: crate::library_cache::LibraryError) -> u64 {
     use crate::library_cache::LibraryError;
     match error {
@@ -612,13 +671,17 @@ fn library_error_detail(error: crate::library_cache::LibraryError) -> u64 {
 /// performs the ordinary eager copy. `Ok(Some(_))` is a complete mapping with
 /// its VMA published. All pages are pinned before the first PTE is written, the
 /// VMA is published before any leaf exists, and a failure after that point
-/// withdraws both, so no partial range survives.
+/// withdraws both, so no partial range survives. When a mapping (such as an ELF
+/// whole-span `mmap` including `.bss`) extends past EOF's page, the file-backed
+/// prefix is aliased COW and the past-EOF tail is published as a contiguous
+/// anonymous zeroed VMA.
 fn map_library_alias(
     args: &RustosMmBrokerArgs,
     t: MmTarget,
     start: u64,
     len: usize,
     mapping_end: u64,
+    source: &FileMappingSource,
 ) -> Result<Option<RustosMmMapBrokerResult>, i64> {
     // Only read-capable, page-aligned private mappings are served; PROT_NONE
     // reservations and unaligned offsets use the existing path.
@@ -631,16 +694,27 @@ fn map_library_alias(
     };
     let pages = page_count(len)? as u64;
     let first_page = args.offset / PAGE_SIZE;
-    // The mapping must lie inside the file's pages. A mapping that reaches
-    // past EOF's page has bytes the object does not hold, so it is not served.
-    let Some(end_byte) = first_page.checked_add(pages).and_then(|p| p.checked_mul(PAGE_SIZE)) else {
-        return Ok(None);
-    };
-    if end_byte > file_len.next_multiple_of(PAGE_SIZE) {
+    let Some((alias_pages, tail_pages)) = library_alias_page_split(first_page, pages, file_len) else {
+        let end_byte = first_page
+            .checked_add(pages)
+            .and_then(|p| p.checked_mul(PAGE_SIZE))
+            .unwrap_or(u64::MAX);
         crate::library_cache::note_decline(crate::library_cache::Decline::OutOfRange, end_byte);
         return Ok(None);
-    }
+    };
+    let alias_end = start
+        .checked_add(alias_pages.checked_mul(PAGE_SIZE).ok_or(LINUX_EOVERFLOW)?)
+        .ok_or(LINUX_EOVERFLOW)?;
     let page_flags = protection_to_page_flags(args.prot)?;
+    // A demand object holds only the pages earlier mappings needed. Make this
+    // range resident (reading each missing page from vfsd exactly once across
+    // all processes) before pinning it; if that is not possible the eager copy
+    // below serves the mapping.
+    if REGISTRY.lock().is_demand(object)
+        && !fill_demand_pages(t, source, object, file_len, first_page, alias_pages)
+    {
+        return Ok(None);
+    }
     let (view, pins) = {
         let registry = REGISTRY.lock();
         let Ok(view) = registry.view(object) else {
@@ -649,7 +723,7 @@ fn map_library_alias(
         if view.len != file_len {
             return Ok(None);
         }
-        let pins = match registry.pin_range(&KernelSources, object, first_page, pages) {
+        let pins = match registry.pin_range(&KernelSources, object, first_page, alias_pages) {
             Ok(pins) => pins,
             Err(error) => {
                 drop(registry);
@@ -663,7 +737,7 @@ fn map_library_alias(
         (view, pins)
     };
 
-    match pager_admission::admit_library_region(t, start, mapping_end, args.prot, &view, args.offset) {
+    match pager_admission::admit_library_region(t, start, alias_end, args.prot, &view, args.offset) {
         Ok(()) => {}
         Err(pager_admission::LibraryAdmission::Unavailable) => {
             crate::library_cache::note_decline(
@@ -674,6 +748,56 @@ fn map_library_alias(
         }
         Err(pager_admission::LibraryAdmission::Refused(errno)) => return Err(errno),
     }
+
+    let eager_tail = if tail_pages > 0 {
+        match pager_admission::admit_anonymous_region(t, alias_end, mapping_end, args.prot) {
+            pager_admission::AnonymousAdmission::Demand => false,
+            pager_admission::AnonymousAdmission::Eager(
+                pager_admission::EagerByContract::PagerControlGraph
+                | pager_admission::EagerByContract::PolicyDisabled,
+            ) => true,
+            pager_admission::AnonymousAdmission::Eager(
+                pager_admission::EagerByContract::PagerTransportAbsent
+                | pager_admission::EagerByContract::StaleRegionOverlap,
+            ) => {
+                let _ = multitask::unmap_pager_vma_for_process(
+                    t.pid,
+                    Some(t.expected()),
+                    start,
+                    alias_end,
+                );
+                crate::library_cache::note_decline(
+                    crate::library_cache::Decline::AdmissionUnavailable,
+                    0,
+                );
+                return Ok(None);
+            }
+            pager_admission::AnonymousAdmission::Failed(LINUX_ENOMEM) => {
+                let _ = multitask::unmap_pager_vma_for_process(
+                    t.pid,
+                    Some(t.expected()),
+                    start,
+                    alias_end,
+                );
+                crate::library_cache::note_decline(
+                    crate::library_cache::Decline::AdmissionUnavailable,
+                    1,
+                );
+                return Ok(None);
+            }
+            pager_admission::AnonymousAdmission::Failed(errno) => {
+                let _ = multitask::unmap_pager_vma_for_process(
+                    t.pid,
+                    Some(t.expected()),
+                    start,
+                    alias_end,
+                );
+                return Err(errno);
+            }
+        }
+    } else {
+        false
+    };
 
     let Some(mapped) = multitask::with_process_state_by_generation_mut(
         t.pid,
@@ -691,6 +815,21 @@ fn map_library_alias(
                     &pins,
                 )
                 .map_err(address_space_error_to_linux_errno)?;
+            if tail_pages > 0 && eager_tail && args.prot != 0 {
+                if let Err(err) = process_state
+                    .address_space_mut()
+                    .map_zeroed_user_pages_at(
+                        VirtAddr::new(alias_end),
+                        tail_pages as usize,
+                        page_flags,
+                    )
+                {
+                    let _ = process_state
+                        .address_space_mut()
+                        .unmap_present_user_pages_at(VirtAddr::new(start), alias_pages as usize);
+                    return Err(address_space_error_to_linux_errno(err));
+                }
+            }
             process_state.set_mapping_cursor(mapping_end);
             Ok(RustosMmMapBrokerResult { addr: start, len: args.len })
         },
@@ -700,11 +839,11 @@ fn map_library_alias(
     };
     match mapped {
         Ok(result) => {
-            crate::library_cache::note_alias_map(pages);
+            crate::library_cache::note_alias_map(alias_pages);
             Ok(Some(result))
         }
         Err(errno) => {
-            // Withdraw ONLY the newly installed VMA record; any preflighted
+            // Withdraw ONLY the newly installed VMA records; any preflighted
             // failure leaves prior mappings untouched.
             let _ = multitask::unmap_pager_vma_for_process(
                 t.pid,
@@ -715,6 +854,193 @@ fn map_library_alias(
             Err(errno)
         }
     }
+}
+
+/// The frame-source owner identity of the live pager lease. Demand objects are
+/// filed under it so a pager restart withdraws them together with its own
+/// objects; they are not pager policy, the broker creates and fills them.
+fn pager_frame_owner() -> Option<FrameSourceOwner> {
+    let epoch = ipc_ops::service_endpoint_epoch(IPC_SERVICE_PAGERD)?;
+    Some(FrameSourceOwner { service_slot: IPC_SERVICE_PAGERD, service_generation: epoch })
+}
+
+/// Free memory the system keeps untouched by demand growth.
+const DEMAND_FREE_RESERVE_BYTES: u64 = 128 * 1024 * 1024;
+/// Pages one vfsd read run fills; also the granule of claims (1 MiB so large
+/// demand-filled libraries transfer via `VFS_IPC_OP_BULK_READ` instead of
+/// many sequential 64 KiB `PREAD64` IPCs).
+const DEMAND_FILL_RUN_PAGES: u64 = 256;
+/// Longest a mapper waits for another process's in-flight fill of the pages it
+/// needs before it copies privately instead.
+const DEMAND_FILL_WAIT_NS: u64 = 3_000_000_000;
+
+fn demand_decline(stage: u64, detail: u64) {
+    crate::library_cache::note_decline(
+        crate::library_cache::Decline::DemandUnavailable,
+        stage << 32 | detail & 0xffff_ffff,
+    );
+}
+
+fn drain_retired_frame_sources(max_batches: usize) {
+    const BATCH: usize = 256;
+    for _ in 0..max_batches {
+        if kernel_mm::api::frame_source::reclaim_frame_sources(BATCH) < BATCH {
+            break;
+        }
+    }
+}
+
+/// Creates (or finds) the demand object of an attested immutable file.
+/// `None` leaves the description unbound and the eager copy in force.
+fn create_demand_object(file: &rustos_user_abi::syscall::VfsFileIdentityWire) -> Option<u64> {
+    let Some(owner) = pager_frame_owner() else {
+        demand_decline(1, 0);
+        return None;
+    };
+    let Some(group) = multitask::current_user_job_charge_group() else {
+        demand_decline(2, 0);
+        return None;
+    };
+    let created = REGISTRY.lock().create_demand(&KernelSources, owner, group, file);
+    // Eviction inside create may have withdrawn up to a full demand object;
+    // drain retired slots outside any registry lock so frames/slots return promptly.
+    drain_retired_frame_sources(16);
+    match created {
+        Ok(object) => Some(object),
+        // Another mapper of the same file won the race.
+        Err(crate::library_cache::LibraryError::Exists) => {
+            REGISTRY.lock().find(file).map(|view| view.handle)
+        }
+        Err(error) => {
+            demand_decline(3, library_error_detail(error));
+            None
+        }
+    }
+}
+
+/// Makes pages `[first_page, first_page + pages)` of a demand object resident.
+///
+/// Missing pages are claimed in runs, read from vfsd into a scratch buffer and
+/// supplied one by one, so a file range is read once no matter how many
+/// processes map it. A range another process is already filling is waited for
+/// (bounded); any failure releases this caller's claims and returns `false`,
+/// leaving the object consistent for the next mapper.
+fn fill_demand_pages(
+    t: MmTarget,
+    source: &FileMappingSource,
+    object: u64,
+    file_len: u64,
+    first_page: u64,
+    pages: u64,
+) -> bool {
+    let Some(owner) = pager_frame_owner() else {
+        demand_decline(4, 0);
+        return false;
+    };
+    let Some(group) = multitask::current_user_job_charge_group() else {
+        demand_decline(5, 0);
+        return false;
+    };
+    let end = first_page + pages;
+    let mut from = first_page;
+    let mut buffer: Vec<u8> = Vec::new();
+    let started = crate::arch::clock::monotonic_nanos();
+    loop {
+        let claim = REGISTRY.lock().claim_gap(&KernelSources, object, from, end, DEMAND_FILL_RUN_PAGES);
+        // A claim may have evicted another demand object; drain retired slots
+        // outside the lock before checking free memory or supplying new frames.
+        drain_retired_frame_sources(16);
+        match claim {
+            Ok(GapClaim::Done) => return true,
+            Ok(GapClaim::Wait { resume }) => {
+                from = resume;
+                if crate::arch::clock::monotonic_nanos().saturating_sub(started) > DEMAND_FILL_WAIT_NS {
+                    demand_decline(6, 0);
+                    return false;
+                }
+                multitask::yield_now();
+            }
+            Ok(GapClaim::Run { start, pages: run, resume }) => {
+                from = resume;
+                let admitted =
+                    crate::memory::phys::free_bytes() >= DEMAND_FREE_RESERVE_BYTES + run * PAGE_SIZE;
+                let filled = admitted
+                    && fill_demand_run(t, source, object, owner, group, file_len, start, run, &mut buffer);
+                if !filled {
+                    REGISTRY.lock().unclaim(object, start, run);
+                    if !admitted {
+                        demand_decline(7, 0);
+                    }
+                    return false;
+                }
+            }
+            Err(error) => {
+                demand_decline(8, library_error_detail(error));
+                return false;
+            }
+        }
+    }
+}
+
+fn fill_demand_run(
+    t: MmTarget,
+    source: &FileMappingSource,
+    object: u64,
+    owner: FrameSourceOwner,
+    group: usize,
+    file_len: u64,
+    start: u64,
+    run: u64,
+    buffer: &mut Vec<u8>,
+) -> bool {
+    let offset = start * PAGE_SIZE;
+    let want = (run * PAGE_SIZE).min(file_len.saturating_sub(offset)) as usize;
+    buffer.clear();
+    buffer.resize(want, 0);
+    match read_source_range(t, source, offset, buffer) {
+        Ok(read) if read == want => {}
+        Ok(read) => {
+            demand_decline(9, read as u64);
+            return false;
+        }
+        Err(errno) => {
+            demand_decline(10, errno as u64);
+            return false;
+        }
+    }
+    for (index, bytes) in buffer.chunks(PAGE_SIZE as usize).enumerate() {
+        let page = start + index as u64;
+        let mut supplied = REGISTRY.lock().supply_claimed(
+            &KernelSources,
+            object,
+            owner,
+            page,
+            group,
+            bytes,
+        );
+        if matches!(
+            supplied,
+            Err(crate::library_cache::LibraryError::Source(
+                kernel_mm::api::frame_source::FrameSourceError::NoSlots
+                    | kernel_mm::api::frame_source::FrameSourceError::NoMemory
+            ))
+        ) {
+            drain_retired_frame_sources(32);
+            supplied = REGISTRY.lock().supply_claimed(
+                &KernelSources,
+                object,
+                owner,
+                page,
+                group,
+                bytes,
+            );
+        }
+        if let Err(error) = supplied {
+            demand_decline(11, library_error_detail(error));
+            return false;
+        }
+    }
+    true
 }
 
 fn broker_map_memfd_shared(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64> {
@@ -1415,6 +1741,138 @@ fn memfd_source(t: MmTarget, fd: u64, writable: bool) -> Result<MemfdHandle, i64
     source
 }
 
+/// Reads up to `VFS_BULK_READ_MAX_BYTES` from `remote_id` via `VFS_IPC_OP_BULK_READ`
+/// using the queued handle-receiving IPC transport (never rendezvous) so `vfsd`
+/// can offload the transfer to a transient worker and return a sealed memfd.
+fn call_remote_vfs_bulk_read(
+    remote_id: u64,
+    client_pid: u64,
+    offset: u64,
+    dest: &mut [u8],
+) -> Result<usize, i64> {
+    let want = dest.len().min(VFS_BULK_READ_MAX_BYTES);
+    if want == 0 {
+        return Ok(0);
+    }
+    let mut request = new_vfs_request(VFS_IPC_OP_BULK_READ);
+    request.remote_id = remote_id;
+    request.pid = client_pid;
+    request.arg0 = offset;
+    request.arg1 = want as u64;
+    // SAFETY: `VfsIpcRequest` is an initialized all-integer `repr(C)` wire
+    // struct; viewing it as an immutable byte slice is valid for the call.
+    let request_bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&request as *const VfsIpcRequest).cast::<u8>(),
+            core::mem::size_of::<VfsIpcRequest>(),
+        )
+    };
+    let (response_bytes, entries) =
+        ipc_ops::call_service_endpoint_with_received_entries(IPC_SERVICE_VFSD, request_bytes, 1)?;
+    let Some(response) = VfsBulkReadResponse::from_bytes(&response_bytes) else {
+        ipc_ops::drop_transfer_entries(entries);
+        return Err(LINUX_EINVAL);
+    };
+    if response.version != VFS_IPC_ABI_VERSION
+        || response.op != VFS_IPC_OP_BULK_READ
+        || response.reserved0 != 0
+    {
+        ipc_ops::drop_transfer_entries(entries);
+        return Err(LINUX_EINVAL);
+    }
+    if response.status != 0 {
+        ipc_ops::drop_transfer_entries(entries);
+        return Err(i64::from(response.status));
+    }
+    if response.bytes_read == 0 {
+        let extra_handles = !entries.is_empty();
+        ipc_ops::drop_transfer_entries(entries);
+        return if extra_handles { Err(LINUX_EINVAL) } else { Ok(0) };
+    }
+    let Ok(bytes_read) = usize::try_from(response.bytes_read) else {
+        ipc_ops::drop_transfer_entries(entries);
+        return Err(LINUX_EINVAL);
+    };
+    if bytes_read > want || entries.len() != 1 {
+        ipc_ops::drop_transfer_entries(entries);
+        return Err(LINUX_EINVAL);
+    }
+    let copied = match entries[0].entry().handle() {
+        KernelHandle::Memfd(memfd) => memfd.read_at(0, &mut dest[..bytes_read]),
+        _ => {
+            ipc_ops::drop_transfer_entries(entries);
+            return Err(LINUX_EINVAL);
+        }
+    };
+    ipc_ops::drop_transfer_entries(entries);
+    if copied != bytes_read {
+        return Err(LINUX_EIO);
+    }
+    Ok(bytes_read)
+}
+
+/// Fills `buf` from `source` at `offset`, short only at end of file.
+fn read_source_range(
+    t: MmTarget,
+    source: &FileMappingSource,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<usize, i64> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let file_offset = offset.checked_add(filled as u64).ok_or(LINUX_EOVERFLOW)?;
+        let count = buf.len() - filled;
+        let read = match source {
+            FileMappingSource::Remote { remote_id, path } => {
+                match kernel_io_manager::api::block::read_bootstrap_file_range(
+                    path,
+                    file_offset,
+                    &mut buf[filled..],
+                ) {
+                    Ok(Some(read)) => read,
+                    Ok(None) => {
+                        let bulk = if count >= VFS_BULK_READ_MIN_BYTES {
+                            match call_remote_vfs_bulk_read(
+                                *remote_id,
+                                t.pid,
+                                file_offset,
+                                &mut buf[filled..],
+                            ) {
+                                Ok(read) => Some(read),
+                                // Transient worker saturation or unsupported virtual file:
+                                // fall back seamlessly to inline `PREAD64`.
+                                Err(LINUX_EAGAIN | LINUX_EOPNOTSUPP_ERRNO) => None,
+                                Err(errno) => return Err(errno),
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(read) = bulk {
+                            read
+                        } else {
+                            let bytes = offload_ops::call_remote_vfs_read_bytes(
+                                *remote_id,
+                                t.pid,
+                                file_offset,
+                                count,
+                            )?;
+                            let read = bytes.len().min(count);
+                            buf[filled..filled + read].copy_from_slice(&bytes[..read]);
+                            read
+                        }
+                    }
+                    Err(_) => return Err(LINUX_EIO),
+                }
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    Ok(filled)
+}
+
 fn copy_file_mapping(
     t: MmTarget,
     start: u64,
@@ -1423,38 +1881,17 @@ fn copy_file_mapping(
     source: &FileMappingSource,
 ) -> Result<(), i64> {
     let mut copied = 0usize;
-    let mut chunk = vec![0; FILE_COPY_CHUNK.min(len)];
+    let chunk_cap = if len >= VFS_BULK_READ_MIN_BYTES {
+        FILE_COPY_BULK_CHUNK
+    } else {
+        FILE_COPY_CHUNK
+    };
+    let mut chunk = vec![0; chunk_cap.min(len)];
 
     while copied < len {
         let count = (len - copied).min(chunk.len());
-        let read = match source {
-            FileMappingSource::Remote { remote_id, path } => {
-                let file_offset = offset.checked_add(copied as u64).ok_or(LINUX_EOVERFLOW)?;
-                match kernel_io_manager::api::block::read_bootstrap_file_range(
-                    path,
-                    file_offset,
-                    &mut chunk[..count],
-                ) {
-                    Ok(Some(read)) => read,
-                    Ok(None) => {
-                        match offload_ops::call_remote_vfs_read_bytes(
-                            *remote_id,
-                            t.pid,
-                            file_offset,
-                            count,
-                        ) {
-                            Ok(bytes) => {
-                                let read = bytes.len().min(count);
-                                chunk[..read].copy_from_slice(&bytes[..read]);
-                                read
-                            }
-                            Err(err) => return Err(err),
-                        }
-                    }
-                    Err(_) => return Err(LINUX_EIO),
-                }
-            }
-        };
+        let file_offset = offset.checked_add(copied as u64).ok_or(LINUX_EOVERFLOW)?;
+        let read = read_source_range(t, source, file_offset, &mut chunk[..count])?;
         if read == 0 {
             break;
         }
@@ -1470,6 +1907,9 @@ fn copy_file_mapping(
         };
         result?;
         copied += read;
+        if read < count {
+            break;
+        }
     }
     Ok(())
 }
@@ -1695,5 +2135,26 @@ mod tests {
         let pages = page_count(PAGE_SIZE as usize + 1).expect("page count");
         assert_eq!(pages, 2);
         assert_eq!(checked_mapping_end(start, pages), Ok(start + 2 * PAGE_SIZE));
+    }
+
+    #[test]
+    fn library_alias_split_serves_file_prefix_across_elf_bss_tail() {
+        // Exact libc.so.6 case from KVM logs: file_len=0x206e10 (519 pages),
+        // ld.so whole-span mmap len=0x212000 (530 pages, 11-page .bss tail).
+        assert_eq!(
+            library_alias_page_split(0, 530, 0x206e10),
+            Some((519, 11))
+        );
+        // Exact mapping inside file pages has no tail.
+        assert_eq!(library_alias_page_split(0, 45, 183_024), Some((45, 0)));
+        // Non-zero offset straddling EOF's page aliases only the live file pages.
+        assert_eq!(
+            library_alias_page_split(500, 30, 0x206e10),
+            Some((19, 11))
+        );
+        // Mapping starting at or beyond EOF's page has no file pages to alias.
+        assert_eq!(library_alias_page_split(519, 11, 0x206e10), None);
+        assert_eq!(library_alias_page_split(0, 1, 0), None);
+        assert_eq!(library_alias_page_split(u64::MAX, 1, PAGE_SIZE), None);
     }
 }

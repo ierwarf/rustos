@@ -316,6 +316,11 @@ impl RetainedCurrentUserAddressSpace {
             .expect("retained current process crossed its exact MM generation")
     }
 
+    pub fn try_with_process_state<R>(&self, f: impl FnOnce(&UserProcessState) -> R) -> Option<R> {
+        self.process
+            .with_exact_visible_state(self.identity, |_, state| f(state))
+    }
+
     pub fn with_address_space<R>(&self, f: impl FnOnce(&ProcessAddressSpace) -> R) -> R {
         self.process
             .with_exact_visible_state(self.identity, |_, state| f(state.address_space()))

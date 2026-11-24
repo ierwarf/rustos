@@ -106,11 +106,17 @@ pub(super) fn draw_app_icon(canvas: &mut SurfaceCanvas<'_>, rect: Rect, title: &
     let scaled = |value: u32| ((alpha as u32) * value / 255) as u8;
 
     // Soft layered drop shadow under the tile.
-    for (grow, shade) in [(4_usize, 14_u32), (2, 22), (0, 34)] {
+    let y_drop = crate::ui_scale::px(3);
+    for (base_grow, shade) in [(4_usize, 14_u32), (2, 22), (0, 34)] {
+        let grow = if base_grow == 0 {
+            0
+        } else {
+            crate::ui_scale::px(base_grow)
+        };
         canvas.fill_rounded_rect_alpha(
             Rect {
                 x: rect.x.saturating_sub(grow),
-                y: (rect.y + 3).saturating_sub(grow),
+                y: (rect.y + y_drop).saturating_sub(grow),
                 width: rect.width + grow * 2,
                 height: rect.height + grow * 2,
             },
@@ -189,7 +195,12 @@ fn fill_chrome(canvas: &mut SurfaceCanvas<'_>, rect: Rect, alpha: u8) {
                 0xff34_a853
             };
             canvas.fill_rect_alpha(
-                Rect { x: left + x, y: top + y, width: 1, height: 1 },
+                Rect {
+                    x: left + x,
+                    y: top + y,
+                    width: 1,
+                    height: 1,
+                },
                 color,
                 alpha,
             );
@@ -213,9 +224,19 @@ pub(super) fn fill_convex_polygon(
     if vertices.len() < 3 {
         return;
     }
-    let min_x = vertices.iter().map(|v| v.0).min().unwrap_or(0).div_euclid(8);
+    let min_x = vertices
+        .iter()
+        .map(|v| v.0)
+        .min()
+        .unwrap_or(0)
+        .div_euclid(8);
     let max_x = (vertices.iter().map(|v| v.0).max().unwrap_or(0) + 7).div_euclid(8);
-    let min_y = vertices.iter().map(|v| v.1).min().unwrap_or(0).div_euclid(8);
+    let min_y = vertices
+        .iter()
+        .map(|v| v.1)
+        .min()
+        .unwrap_or(0)
+        .div_euclid(8);
     let max_y = (vertices.iter().map(|v| v.1).max().unwrap_or(0) + 7).div_euclid(8);
     if min_x < 0 || min_y < 0 {
         return;
@@ -354,9 +375,17 @@ mod tests {
     #[test]
     fn chrome_has_a_distinct_browser_glyph_and_obeys_transparency() {
         for title in ["Chrome", " Google Chrome "] {
-            assert!(matches!(icon_theme_for_title(title).shape, IconShape::Chrome));
+            assert!(matches!(
+                icon_theme_for_title(title).shape,
+                IconShape::Chrome
+            ));
         }
-        let rect = Rect { x: 4, y: 4, width: 24, height: 24 };
+        let rect = Rect {
+            x: 4,
+            y: 4,
+            width: 24,
+            height: 24,
+        };
         let (pixels, ()) = canvas_with(|canvas| fill_chrome(canvas, rect, 255));
         for color in [0xff42_85f4, 0xffea_4335, 0xfffb_bc05, 0xff34_a853] {
             assert!(pixels.contains(&color), "missing Chrome color {color:x}");
@@ -371,7 +400,12 @@ mod tests {
     fn a_polygon_edge_gets_partial_coverage_and_its_interior_is_solid() {
         // A right triangle whose hypotenuse cuts diagonally through pixels.
         let (pixels, ()) = canvas_with(|canvas| {
-            fill_convex_polygon(canvas, &[(8 * 4, 8 * 4), (8 * 20, 8 * 4), (8 * 4, 8 * 20)], 0xffff_ffff, 255);
+            fill_convex_polygon(
+                canvas,
+                &[(8 * 4, 8 * 4), (8 * 20, 8 * 4), (8 * 4, 8 * 20)],
+                0xffff_ffff,
+                255,
+            );
         });
         let at = |x: usize, y: usize| pixels[y * 32 + x] & 0xff;
         assert_eq!(at(6, 6), 0xff, "interior is opaque");
@@ -395,7 +429,14 @@ mod tests {
     #[test]
     fn a_stroke_covers_its_line_and_is_about_its_thickness() {
         let (pixels, ()) = canvas_with(|canvas| {
-            stroke_line(canvas, (8 * 4, 8 * 16), (8 * 28, 8 * 16), 16, 0xffff_ffff, 255);
+            stroke_line(
+                canvas,
+                (8 * 4, 8 * 16),
+                (8 * 28, 8 * 16),
+                16,
+                0xffff_ffff,
+                255,
+            );
         });
         // A horizontal 2 px stroke centred on y = 16 fills rows 15 and 16.
         let column: Vec<u32> = (0..32).map(|y| pixels[y * 32 + 16] & 0xff).collect();

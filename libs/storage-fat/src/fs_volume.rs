@@ -117,15 +117,29 @@ fn datetime_to_timestamp(dt: DateTime) -> FsTimestamp {
 fn timestamp_to_date(ts: FsTimestamp) -> Date {
     let days = ts.secs.div_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
-    let year = y.clamp(1980, 2107) as u16;
-    Date::new(year, m as u16, d as u16)
+    // Out-of-range years saturate to the representable boundary day; keeping
+    // the real month/day under a clamped year fabricates another date (and
+    // Feb 29 in a non-leap clamped year).
+    if y < 1980 {
+        return Date::new(1980, 1, 1);
+    }
+    if y > 2107 {
+        return Date::new(2107, 12, 31);
+    }
+    Date::new(y as u16, m as u16, d as u16)
 }
 
 fn timestamp_to_datetime(ts: FsTimestamp) -> DateTime {
     let days = ts.secs.div_euclid(86_400);
     let rem = ts.secs.rem_euclid(86_400) as u64;
     let (y, m, d) = civil_from_days(days);
-    let year = y.clamp(1980, 2107) as u16;
+    if y < 1980 {
+        return DateTime::new(Date::new(1980, 1, 1), Time::new(0, 0, 0, 0));
+    }
+    if y > 2107 {
+        return DateTime::new(Date::new(2107, 12, 31), Time::new(23, 59, 58, 0));
+    }
+    let year = y as u16;
     let hour = (rem / 3_600) as u16;
     let min = ((rem % 3_600) / 60) as u16;
     let sec = (rem % 60) as u16;
@@ -1205,5 +1219,15 @@ mod tests {
         let mut out = [0_u8; 3000];
         assert_eq!(view.read_at(0, &mut out).unwrap(), 3000);
         assert!(out.iter().all(|byte| *byte == 7));
+    }
+
+    #[test]
+    fn out_of_range_years_saturate_to_boundary_days() {
+        let low = timestamp_to_datetime(FsTimestamp { secs: 15_000_000, nanos: 0 });
+        assert_eq!((low.date.year, low.date.month, low.date.day), (1980, 1, 1));
+        // 2204-02-29 must not become the invalid 2107-02-29.
+        let high_days = days_from_civil(2204, 2, 29);
+        let high = timestamp_to_date(FsTimestamp { secs: high_days * 86_400, nanos: 0 });
+        assert_eq!((high.year, high.month, high.day), (2107, 12, 31));
     }
 }

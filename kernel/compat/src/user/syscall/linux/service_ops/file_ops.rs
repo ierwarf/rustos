@@ -14,8 +14,8 @@
 //! - **Bulk copy:** `sendfile` and `copy_file_range` bounce through one
 //!   kernel buffer of at most [`COPY_CHUNK`] bytes and loop on positional
 //!   read/write requests. Explicit offsets never touch the descriptor cursor;
-//!   a cursor end is read with `lseek(CUR)`, advanced by exactly the bytes
-//!   written, and held under the description's cursor gate for the whole call.
+//!   a remote-file cursor end reads and advances `RemoteVfsOpenDescription`
+//!   directly under the description's cursor gate for the whole call.
 //! - **Failure:** progress already made is returned instead of a later error.
 use super::*;
 use alloc::vec;
@@ -36,8 +36,6 @@ const COPY_CHUNK: usize = 16 * 4096;
 const MAX_RW_COUNT: u64 = 0x7fff_f000;
 const PERMISSION_BITS: u64 = 0o7777;
 const O_APPEND_FLAG: u64 = 0o2000;
-const SEEK_SET: u64 = 0;
-const SEEK_CUR: u64 = 1;
 /// `VFS_IPC_OP_SET_ATTRS` mask bits (see vfsd `set_attrs_path`).
 const ATTR_ATIME: u64 = rustos_user_abi::syscall::VFS_ATTR_ATIME;
 const ATTR_MTIME: u64 = rustos_user_abi::syscall::VFS_ATTR_MTIME;
@@ -526,7 +524,7 @@ pub fn syscall_linux_vfs_futimesat(dirfd: u64, path_ptr: u64, times_ptr: u64) ->
 /// One end of a bulk copy: a regular VFS file, memfd, or (for `sendfile`
 /// output) a pipe or socket.
 enum CopyEnd {
-    Remote { fd: u64, remote_id: u64 },
+    Remote { fd: u64, remote: multitask::RemoteVfsHandle },
     Memfd(multitask::MemfdHandle),
     Pipe(u64),
     Socket { fd: u64, snapshot: SocketSnapshot },
@@ -538,7 +536,7 @@ impl CopyEnd {
     /// separate opens of the same path do not (vfsd offers no cheaper identity).
     fn file_identity(&self) -> (u8, u64) {
         match self {
-            CopyEnd::Remote { remote_id, .. } => (0, *remote_id),
+            CopyEnd::Remote { remote, .. } => (0, remote.remote_id()),
             CopyEnd::Memfd(memfd) => (1, memfd.object_id()),
             CopyEnd::Pipe(fd) => (2, *fd),
             CopyEnd::Socket { snapshot, .. } => (3, snapshot.token()),
@@ -548,7 +546,7 @@ impl CopyEnd {
     /// Identity of the open description (cursor owner).
     fn description_identity(&self) -> (u8, u64) {
         match self {
-            CopyEnd::Remote { remote_id, .. } => (0, *remote_id),
+            CopyEnd::Remote { remote, .. } => (0, remote.remote_id()),
             CopyEnd::Memfd(memfd) => (1, memfd.token_id()),
             CopyEnd::Pipe(fd) => (2, *fd),
             CopyEnd::Socket { snapshot, .. } => (3, snapshot.token()),
@@ -557,8 +555,8 @@ impl CopyEnd {
 
     fn pread(&self, offset: u64, dest: &mut [u8]) -> Result<usize, i64> {
         match self {
-            CopyEnd::Remote { fd, remote_id } => {
-                kernel_vfs_pread_bytes_pinned(*fd, *remote_id, offset, dest)
+            CopyEnd::Remote { fd, remote } => {
+                kernel_vfs_pread_bytes_pinned(*fd, remote.remote_id(), offset, dest)
             }
             CopyEnd::Memfd(memfd) => {
                 let offset = usize::try_from(offset).map_err(|_| LINUX_EINVAL)?;
@@ -571,7 +569,7 @@ impl CopyEnd {
     /// Positional write of up to `data.len()` bytes; a short count is progress.
     fn pwrite(&self, offset: u64, data: &[u8]) -> Result<usize, i64> {
         match self {
-            CopyEnd::Remote { fd, remote_id } => {
+            CopyEnd::Remote { fd, remote } => {
                 let mut written = 0usize;
                 while written < data.len() {
                     let chunk = &data[written..];
@@ -582,7 +580,7 @@ impl CopyEnd {
                     }
                     let mut request = new_vfs_request(VFS_IPC_OP_PWRITE64);
                     request.fd = *fd;
-                    request.remote_id = *remote_id;
+                    request.remote_id = remote.remote_id();
                     request.arg0 = at;
                     request.arg1 = chunk.len() as u64;
                     request.payload_len = chunk.len() as u32;
@@ -613,29 +611,29 @@ impl CopyEnd {
     }
 
     fn cursor(&mut self) -> Result<u64, i64> {
-        self.seek(0, SEEK_CUR)
+        match self {
+            CopyEnd::Remote { remote, .. } => Ok(remote.cursor()),
+            CopyEnd::Memfd(memfd) => memfd
+                .seek(0, multitask::FileHandleSeekWhence::Current)
+                .map_err(|_| LINUX_EINVAL),
+            CopyEnd::Pipe(_) | CopyEnd::Socket { .. } => Err(LINUX_ESPIPE),
+        }
     }
 
-    fn seek(&mut self, offset: u64, whence: u64) -> Result<u64, i64> {
+    fn advance_cursor(&mut self, start: u64, copied: u64) -> Result<(), i64> {
         match self {
-            CopyEnd::Remote { fd, remote_id } => {
-                let mut request = new_vfs_request(VFS_IPC_OP_LSEEK);
-                request.fd = *fd;
-                request.remote_id = *remote_id;
-                request.arg0 = offset;
-                request.arg1 = whence;
-                let response = call_vfs_ipc_request(&request)?;
-                ensure_vfs_status(&response)?;
-                Ok(response.value)
+            CopyEnd::Remote { remote, .. } => {
+                let delta = usize::try_from(copied).map_err(|_| LINUX_EOVERFLOW)?;
+                remote.advance_cursor(delta);
+                Ok(())
             }
-            CopyEnd::Memfd(memfd) => {
-                let whence = if whence == SEEK_SET {
-                    multitask::FileHandleSeekWhence::Start
-                } else {
-                    multitask::FileHandleSeekWhence::Current
-                };
-                memfd.seek(offset as i64, whence).map_err(|_| LINUX_EINVAL)
-            }
+            CopyEnd::Memfd(memfd) => memfd
+                .seek(
+                    (start + copied) as i64,
+                    multitask::FileHandleSeekWhence::Start,
+                )
+                .map(|_| ())
+                .map_err(|_| LINUX_EINVAL),
             CopyEnd::Pipe(_) | CopyEnd::Socket { .. } => Err(LINUX_ESPIPE),
         }
     }
@@ -643,11 +641,15 @@ impl CopyEnd {
     /// Write at the descriptor cursor (honours `O_APPEND` in vfsd) and advance it.
     fn write_cursor(&mut self, data: &[u8]) -> Result<usize, i64> {
         match self {
-            CopyEnd::Remote { fd, remote_id } => {
+            CopyEnd::Remote { fd, remote } => {
                 let chunk = &data[..data.len().min(VFS_IPC_REQUEST_PAYLOAD_CAPACITY)];
+                let observed_epoch =
+                    ipc_ops::service_endpoint_epoch(IPC_SERVICE_VFSD).unwrap_or(0);
                 let mut request = new_vfs_request(VFS_IPC_OP_WRITE);
                 request.fd = *fd;
-                request.remote_id = *remote_id;
+                request.remote_id = remote.remote_id();
+                request.flags |= VFS_WRITE_FLAG_CURSOR_SYNC;
+                request.arg0 = remote.cursor();
                 request.payload_len = chunk.len() as u32;
                 request.payload[..chunk.len()].copy_from_slice(chunk);
                 let response = call_vfs_ipc_request(&request)?;
@@ -655,6 +657,7 @@ impl CopyEnd {
                 if response.value > chunk.len() as u64 {
                     return Err(LINUX_EINVAL);
                 }
+                remote.set_synced_cursor(response.aux, observed_epoch);
                 Ok(response.value as usize)
             }
             CopyEnd::Memfd(memfd) => memfd.write_from(data).map_err(memfd_error_to_linux_errno),
@@ -693,7 +696,7 @@ fn resolve_copy_end(fd: u64, need_read: bool) -> Result<(CopyEnd, u64), i64> {
             multitask::RemoteVfsHandleKind::File => Ok((
                 CopyEnd::Remote {
                     fd,
-                    remote_id: remote.remote_id(),
+                    remote,
                 },
                 status,
             )),
@@ -754,11 +757,12 @@ fn copy_bytes(
     let mut gates = [None, None];
     let mut want: [Option<u64>; 2] = [None, None];
     for (end, pos) in [(&*src, src_pos), (&*dst, dst_pos)] {
-        if let (CopyEnd::Remote { remote_id, .. }, CopyPos::Cursor) = (end, pos)
-            && !want.contains(&Some(*remote_id))
-        {
-            let slot = usize::from(want[0].is_some());
-            want[slot] = Some(*remote_id);
+        if let (CopyEnd::Remote { remote, .. }, CopyPos::Cursor) = (end, pos) {
+            let remote_id = remote.remote_id();
+            if !want.contains(&Some(remote_id)) {
+                let slot = usize::from(want[0].is_some());
+                want[slot] = Some(remote_id);
+            }
         }
     }
     if let [Some(a), Some(b)] = want
@@ -831,7 +835,7 @@ fn copy_bytes(
     // bytes that were read but not written.
     if matches!(src_pos, CopyPos::Cursor)
         && copied > 0
-        && let Err(errno) = src.seek(src_start + copied, SEEK_SET)
+        && let Err(errno) = src.advance_cursor(src_start, copied)
     {
         failure.get_or_insert(errno);
     }
@@ -1001,12 +1005,14 @@ pub fn syscall_linux_vfs_sendfile(out_fd: u64, in_fd: u64, offset_ptr: u64, coun
 /// stays pinned.
 fn pin_ends(ends: &[&CopyEnd]) -> Result<(), i64> {
     for (index, end) in ends.iter().enumerate() {
-        if let CopyEnd::Remote { fd, remote_id } = end
-            && let Err(errno) = acquire_current_remote_vfs_ref(*fd, *remote_id)
+        if let CopyEnd::Remote { fd, remote } = end
+            && let Err(errno) = acquire_current_remote_vfs_ref(*fd, remote.remote_id())
         {
             for earlier in &ends[..index] {
-                if let CopyEnd::Remote { remote_id, .. } = earlier {
-                    release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(*remote_id)]);
+                if let CopyEnd::Remote { remote, .. } = earlier {
+                    release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(
+                        remote.remote_id(),
+                    )]);
                 }
             }
             return Err(errno);
@@ -1018,8 +1024,8 @@ fn pin_ends(ends: &[&CopyEnd]) -> Result<(), i64> {
 /// Releases the pins [`pin_ends`] took. Only called after a successful pin.
 fn unpin_ends(ends: &[&CopyEnd]) {
     for end in ends {
-        if let CopyEnd::Remote { remote_id, .. } = end {
-            release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(*remote_id)]);
+        if let CopyEnd::Remote { remote, .. } = end {
+            release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote.remote_id())]);
         }
     }
 }
@@ -1135,5 +1141,29 @@ mod tests {
         assert!(!ranges_overlap(10, 0, 10));
         assert!(ranges_overlap(3, 3, 1));
         assert!(!ranges_overlap(3, 3, 0));
+    }
+
+    #[test]
+    fn remote_copy_end_reads_and_advances_kernel_cursor_without_lseek() {
+        let remote = multitask::RemoteVfsHandle::new_with_epoch(
+            42,
+            multitask::RemoteVfsHandleKind::File,
+            alloc::string::String::from("/data/copy.bin"),
+            8192,
+            0,
+            7,
+        )
+        .expect("remote handle");
+        remote.set_synced_cursor(100, 7);
+        let mut end = CopyEnd::Remote {
+            fd: 3,
+            remote: remote.clone(),
+        };
+        assert_eq!(end.cursor(), Ok(100));
+        assert_eq!(end.advance_cursor(100, 512), Ok(()));
+        assert_eq!(end.cursor(), Ok(612));
+        assert_eq!(remote.cursor(), 612);
+        assert_eq!(remote.durable_cursor(), 100);
+        assert!(remote.is_dirty(7));
     }
 }

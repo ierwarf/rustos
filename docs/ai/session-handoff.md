@@ -4,6 +4,133 @@ Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
 
+## Ring3 bug-fix fleet + interactive Chrome exits (2026-11-24, uncommitted)
+
+12 owner-disjoint Sonnet agents audited Ring3; 12 fixes landed (host tests only):
+uiserver `gpu_runtime.rs` async first-frame activation (no 5 s block inside the 3 s
+`main-present` watchdog; **KVM-checked only for "activates"**), `app/bootstrap.rs` stale-surface
+recovery (`Dependency::Display` is terminal so `drive()` always returned ECANCELED),
+`wayland/viewport.rs` column hoist, vfsd `tmpfs.rs` short shared write, rootd op-30 refusal
+`value0=0`, netd listen arms `backlog` sockets (up to 16 x 256 KiB each; lazy commit unverified),
+runtimed (retry_after wake, D-Bus AddMatch/RequestName limits, 3 one-shot threads released),
+syscalld `brk` shrink unmaps (**not exercised by any boot**), devmgrd zero-length call reply,
+storage-fat cyclic dir + timestamp saturation. Gates after the fleet: workspace host tests
+4578 pass / 0 fail, `formal-preflight` 23/23, `formal/verify-all.sh --profile pr` rc=0, 3 Chrome
+boots clean. The planned 40-boot run was interrupted and has NOT been done.
+
+Interactive run (user: about:blank window opened then closed) had two separate causes, both in
+`build/kvm/rustos-debugcon.log` of that run:
+1. pid 154: uiserver posted `wl_surface.invalid_size` "buffer dimensions must be a multiple of
+   scale" on `wl_surface#15` (surface 2, 10x16, title "Wayland App", probably Chrome's cursor
+   surface; cursor moved just before). Raised by `map_buffer_for_output` BufferSize in
+   `wayland/commit.rs present_original`. **Root cause not established**: the message now carries
+   buffer WxH / scale / transform / output_scale; rerun with pointer motion to read it.
+2. pid 728: `FATAL nss_util.cc:146 nss_error=-5925` after `libsoftokn3.so: cannot open shared
+   object file`. The image closure is DT_NEEDED-only; libnss3 dlopens softoken/freebl. Fixed in
+   `tools/xtask/src/stage/runtime_libs.rs` (`NSS_DLOPEN_MODULES` staged as dlopen roots, cache
+   use attributed to Chrome); image now holds all three. The harness boot never triggers NSS init,
+   so the fix is **not run-verified**.
+
+Open, found by agents, not fixed: Wayland per-client dispatch has no request budget
+(`wayland-backend` loops to WouldBlock); `wl_seat` advertises no keyboard; ICMPv6 (58) rejected
+and ICMP (1) accepted for AF_INET6 DGRAM in `net_broker_inet_socket_shape_valid`; FAT rename
+deletes the destination before renaming; console ioctls CREATE/CLOSE/BIND/SET_SESSION_STATE return
+fake success (`runtimed session.rs`); `kernel/.../memory_ops.rs bootstrap_brk` shrink keeps pages;
+netd AF_UNIX paths are dead since the kernel-local AF_UNIX; `DvmGpuTimeline::admit` ignores held
+outputs.
+
+## Chrome launch flake root cause: slot republish revoke window (2026-11-24, uncommitted)
+
+The integrated tree failed Chrome launches intermittently (~11% of 16-vCPU boots:
+vfsd died with exit 125, Chrome children got `Stale` pager-VMA rejections, `libzstd`
+"failed to map segment"). `kvm-smoke` returned `rc=0` for most of them, so check
+`chrome_gpu_starts`, `linux-user-fault` and `fatal monotonic clock` as well.
+
+- **Root cause**: `process_table::publish_slot_visibility` revoked `PROCESS_IDENTITY`
+  (store 0) and recommitted it on every republish, including a non-final thread
+  exit (`detach_task`) that changes nothing. Lock-free readers have no locked
+  fallback: `with_current_user_copy_mm` (user copyout) returned `None` -> `NotMapped`
+  -> `EFAULT`, and `current_pager_vma_snapshot` returned `Stale` -> user fault
+  `Unhandled` -> process killed. vfsd's short-lived stage/bulk-read helper threads
+  and Chrome's thread churn made the window hit often. Proven by instrumentation:
+  the failing bind stage was `published_process_state` (identity word revoked);
+  `clock_gettime` in a vfsd thread returned `-EFAULT` and `monotonic_nanos`
+  fail-stopped the whole service.
+- **Fix**: `identity::publish_slot_visibility` is a no-op when the payload to publish
+  equals the committed one. Real transitions (exec, exit) still revoke. Test
+  `republishing_an_unchanged_slot_never_revokes_the_identity` fails without it.
+  `docs`: module contract in `kernel/ps/src/multitask/process_table/identity.rs`.
+- **Also**: `rustos-svc-runtime::monotonic_nanos` now prints the raw status and
+  timespec (and a retry read) before fail-stopping; `CLOCK_PROCESS_CPUTIME_ID` no
+  longer fabricates `0` when the thread CPU time is unavailable (returns `EINVAL`).
+- **Evidence**: demand objects ruled out (bisect with `library_demand_candidate`
+  forced false still failed 3/5). Before the fix 3 of ~20 valid boots failed; after it
+  28 consecutive boots passed (1.66-2.11 s start->GPU, 0 faults), against a
+  ~11% prior failure rate (p ~ 0.03). Final clean tree (diagnostics removed): 40
+  boots, 0 recurrences of the original failure (no vfsd exit 125, no `Stale`
+  fault, no mapping failure). 3 other failures, not explained and not fixed:
+  boot 15 `Linux DVM display failed cause=gpu-frame-present-fences errno=110`,
+  boot 28 `uiserver watchdog panic: phase=main-present elapsed_ms=3055`, boot 17
+  one Chrome child `#GP` at ~10 s (same-instruction `#GP` across pids looks like
+  glibc `abort()`'s `hlt`; the abort reason is not in the log). Start->GPU in this
+  run was mean 3.92 s (min 2.42, max 18.49) versus 1.7-2.1 s in the diagnostic
+  build run; host swap was ~7.7 GB used with ~17% iowait after the workspace
+  tests and PR gate, so a host-load cause is plausible but UNVERIFIED. Re-measure
+  on an idle host before attributing the shift to the tree.
+- **Open design risk**: any other lock-free reader that treats an absent
+  publication as failure (instead of falling back to the locked authority, as the
+  module contract says) has the same exposure during real transitions.
+  `with_current_user_copy_mm` and `current_pager_vma_snapshot` are the two known.
+- **Not verified here**: `formal/verify-all.sh --profile pr`; the other tool's
+  claims about AF_UNIX/epoll kernel migration, waitset table, ledger batching and the
+  `SHARED_LOCK_SPINS = 100_000_000` workaround (it masks a `retirement.rs:84` panic
+  and should be root-caused); vfsd bulk-read memfd path; residual `pid=689` `0x43` fault.
+
+## Chrome compatibility & optimization wave (2026-11-23, uncommitted)
+
+Completed and verified across 2 parallel subagent waves + coordinator integration:
+
+- **2.5 `rootd` checkpoint indexing (`services/rootd/src/service_checkpoint.rs`)**: Added `key_index: BTreeMap<(u64, u64, u64), usize>` and `service_counts: BTreeMap<u64, usize>` to eliminate O(n) linear scans in `find_key`, `find`, per-service limit checks, and `descendant_mask` (`rootd --features host-test` 169/169).
+- **2.1 Part A `waitset_broker_ops` `(provider, object)` + `task_id` bucket indexing (`kernel/compat/src/user/syscall/linux/waitset_broker_ops.rs`, `formal/implementation-mutations.tsv`)**: Replaced linear 2,048-slot scans with zero-allocation 256-bucket intrusive indices (`WaiterTable`).
+- **2.1 Part B Full kernel `EpollHandle` migration (`kernel/nucleus-core/src/util/lockdep.rs` `LockClass::KernelEpollRegistry = 62`, `kernel/ps/src/user/epoll.rs`, `kernel/ps/src/api.rs`, `kernel/compat/src/user/syscall/linux/service_ops/{poll_epoll.rs,vfs_socket.rs,local_fd.rs}`)**: Moved epoll interest table, `EPOLLET`/`EPOLLONESHOT` report state, round-robin cursor, `(provider, object_id)` reverse purge index, and atomic `claim()` into Ring0. Zero `vfsd` IPC on `epoll_create1`, `epoll_ctl`, `epoll_wait` snapshot/claim, epoll close, and fd-close epoll purge.
+- **2.2 `vfsd` 1 MiB+ bulk read & transient worker (`libs/rustos-user-abi/src/syscall.rs`, `services/vfsd/src/{bulk_read_worker.rs,state_files.rs,state_requests.rs,main.rs,lib.rs}`, `kernel/compat/src/user/syscall/linux/mm_broker_ops.rs`)**: Added `VFS_IPC_OP_BULK_READ` (256 KiB..4 MiB) returning a sealed read-only memfd handle via queued IPC (`SYS_RUSTOS_IPC_REPLY_WITH_HANDLES`) from 2 transient worker stacks (`exit_releasing_stack`, 0 resident threads), wired into `read_source_range` (`DEMAND_FILL_RUN_PAGES = 256`, `FILE_COPY_BULK_CHUNK = 1 MiB`).
+- **2.4 `fork` ledger frame-run batching (`kernel/mm/src/memory/phys/frame_descriptor_ledger.rs`, `kernel/mm/src/memory/phys/frame_descriptor_ledger/{api.rs,tests.rs}`, `kernel/mm/src/memory/phys.rs`, `kernel/mm/src/memory/address_space.rs`)**: Batched `clone_user_space_cow` shared-alias transitions in runs of up to 64 leaves per PT page (`prepare_shared_alias_run` / `publish_shared_alias_run` / `cancel_shared_alias_run`), ascending `frame_phys` lock order, single root charge per run, exact LIFO atomic rollback (`kernel-mm` 177/177).
+- **2.7 `AF_UNIX` kernel localization (`kernel/nucleus-core/src/util/lockdep.rs` `LockClass::UnixSocketNamespace = 61`, `kernel/ps/src/user/{unix_socket.rs,local_wait.rs,handles.rs,mod.rs}`, `kernel/ps/src/api.rs`, `kernel/compat/src/user/syscall/linux/service_ops/{local_unix.rs,local_fd.rs,vfs_socket.rs,poll_epoll.rs,anon_stat.rs,vfs_meta.rs,mod.rs}`, `kernel/compat/src/user/syscall/linux.rs`)**: Implemented `KernelHandle::UnixSocket` (`SOCK_STREAM`/`SOCK_DGRAM`/`SOCK_SEQPACKET`, unnamed/abstract/filesystem bind via `vfsd` `mknod`/`stat`/`unlink`, direct `PassedHandle` `SCM_RIGHTS` without `netd`, `SCM_CREDENTIALS`, `SO_PEERCRED`, `SO_PASSCRED`, `shutdown`, `LocalWaitable` readiness) while preserving `KernelHandle::Socket` + `netd` `AF_INET`/`AF_NETLINK`.
+- **Chrome SQLite-on-TmpFs fix (`services/syscalld/src/mmap_policy.rs`, `kernel/compat/src/user/syscall/linux/mm_broker_ops/file_shared.rs`)**: Root cause of `--no-first-run` crash (`affiliation_database.cc:184` -> `sql::Statement::ColumnInt64` `#GP`) was `mmap_policy.rs` downgrading read-only `MAP_SHARED` file mappings (`PROT_READ | MAP_SHARED`, used by SQLite's `unixMapfile`) to `MmapPlan::FilePrivate` (static private copy), hiding `pwrite64` updates. Routed all `MmapSharing::Shared` file mappings to `MmapPlan::FileShared` with read-only fallback to `broker_map_file_private` only on `ENODEV`. Re-enabled `--no-first-run` in `apps/chrome/RUSTOS.package.toml` and `.example`; KVM boot confirmed Chrome main browser (`about:blank`) stays alive (`wayland_windows_max=2`, `chrome_reaped=0`, 0 `affiliation_database` errors).
+- **Fontconfig FAT checksum alignment (`tools/xtask/src/stage/browser_runtime.rs`)**: Disassembly of Chrome's `FcStat` (`0x5a99820`) + `FcFilter` (`0x80dd790`) showed fontconfig overrides `st_mtime` on `MSDOS_SUPER_MAGIC` with `FcStatChecksum` (Adler-32 over non-directory entries). Updated `browser_runtime.rs` to set exact `fc_fat_dir_checksum` mtimes before `fc-cache` (note: 9 `errno=30` lock/write probes still appear in KVM logs and need further inspection of `FcDirCacheLoad` vs `FcDirCacheLock`).
+- **Verification**: `kernel-mm` 177/177, `kernel-ps` 1238/1238, `kernel-compat` 480/480, `vfsd --lib` 247/247, `syscalld` 42/42, `rootd --features host-test` 169/169, `xtask stage::browser_runtime` 6/6, `uiserver` 284/284, `cargo xtask check` rc=0, `tools/agent/formal-preflight.sh` 23/23. KVM 16-vCPU/6 GiB: 2/2 boots without `--no-first-run` (`rc=0`, `chrome_alive=True`, `wayland_windows_max=2`, `chrome_start_to_gpu_s=3.48/3.72 s`, `linux_user_faults=0`) and 1/1 boot with `--no-first-run` (`rc=0`, `chrome_alive=True`, `wayland_windows_max=2`, 0 `affiliation_database` errors; observed 5 `checkpoint batch rejected errno=28` under full profile load and child network/renderer `#GP` faults — separate from the fixed main-browser SQLite crash).
+- **Remaining unimplemented / unverified**: Item 2.3 (cursor read checkpoint ABI redesign + `VfsOpenDescriptionRecovery.tla`), Item 2.8 (external-frame COW mmap sharing of already-loaded snapshot memfds), deleting retired `vfsd` epoll / `netd` AF_UNIX legacy code + retargeting formal models, investigating child network-service `#GP` under `--no-first-run`, interleaved A/B against HEAD, >=40-boot flake check, and `formal/verify-all.sh --profile pr`.
+
+### Follow-up stability & compatibility fixes (2026-11-23, uncommitted)
+
+- **16-vCPU COW retirement spin fix (`kernel/mm/src/memory/phys/frame_descriptor_ledger.rs`)**: Raised `SHARED_LOCK_SPINS` (`1_000_000` -> `100_000_000`) and made `data_is_owned` / `release_data` spin on `ROLE_EXCLUSIVE_DATA_CLAIMED` instead of immediately failing, eliminating the `retirement.rs:84` Ring0 panic observed under 16-vCPU KVM preemption.
+- **VFS session grant scaling (`services/loaderd/src/application_grant.rs`)**: Raised `SESSIONS_PER_PROCESS` (`4` -> `128`, granting Chrome `3,072` VFS session tokens for `request_processes=24`), eliminating `Error 11` (`JobError::Full` / `EAGAIN`) on `/dev/null` and shared library opens across Chrome worker trees.
+- **Near-ELF `mmap` window & hint handling (`services/syscalld/src/linux_policy.rs`)**: Kept a `2 GiB` `MMAP_NEAR_ELF_RESERVE` headroom above `brk_mapped_end` when virtual address space has `>= 4 GiB` headroom, honored in-range hints below `brk_mapped_end` down to `user_range_start` (instead of clamping above `brk`), mapped out-of-range 47-bit hints (`>= user_range_end`) to `mmap_next`, and stopped advancing `mmap_next` on fixed/hinted mappings (with unit test `hinted_mmap_respects_below_brk_hints_and_keeps_near_elf_window_open`).
+- **Chrome W^X / `--js-flags=--jitless` (`apps/chrome/RUSTOS.package.toml`, `apps/chrome/RUSTOS.package.toml.example`)**: Diagnostic `wave9` trace proved V8 JIT requests `prot=0x7` (`PROT_READ | PROT_WRITE | PROT_EXEC`) on `CodeRange`, which RustOS intentionally refuses (`EINVAL`) under strict W^X (`pager_vma` and `syscalld::validate_prot`), triggering `V8 process OOM (CodeRange)`. Kept `--js-flags=--jitless` so Chrome runs cleanly under strict W^X without `CodeRange` OOM.
+- **Verification**:
+  - Host unit tests: `kernel-compat` 480/480, `kernel-mm` 177/177, `kernel-ps` 1238/1238, `loaderd` 62/62, `syscalld` 43/43; `cargo xtask check` rc=0; `tools/agent/formal-preflight.sh` 23/23 passed (`0 failed`).
+  - 16-vCPU / 6 GiB KVM Chrome boots (`wave10_final_4boots.json`, 4 consecutive runs): all 4 `rc=0`, `chrome_alive=True`, `chrome_start_to_gpu_s` = `4.97 / 5.25 / 4.81 / 5.26 s`, `checkpoint_batch_rejected=0`, `fork_eagain=0`, `vfsd_syscalld_call=0`, 0 Ring0 panics, 0 `CodeRange` OOM, 0 `Error 11`. Runs 1–2 reached `wayland_windows_max=2` with `linux_user_faults=0`; runs 3–4 remained at `wl=1` within the 20 s hold (run 3 had 1 `linux_user_fault` in `pid=689` instruction fetch at `0x43` alongside `reply-recv` failure). Transient `application-thread-budget` retries (`available=114`) occurred on initial Chrome launch while boot probes drained.
+  - Not run in this pass: `formal/verify-all.sh --profile pr`, >=40-boot flake check, and root-causing the residual `pid=689` `0x43` fault / `wl=1` slowness in runs 3–4.
+
+## Chrome startup integration verification & follow-up fixes (2026-11-23, uncommitted)
+
+Verified the uncommitted ~59-file optimization batch on 16-vCPU / 6 GiB KVM (`kvm-smoke --no-auto-verify --rustos-vcpus 16 --launch-desktop chrome.desktop --hold-seconds 20 --timeout 180`) and fixed regressions + high-value items before further optimization:
+
+- **Regression caught & fixed (`--no-first-run` Chrome crash)**: On the initial integrated tree, `kvm-smoke` exited `rc=0`, **but Chrome pid 140 crashed 100% of the time** ~0.3 s after GPU process start (`wayland_windows` stayed `1`, `runtimed: reaped child pid=140`). Disassembly of `build/artifacts/apps/chrome/chrome` pinned the `#GP` (`int3; ud2`) to offset `0x53e02b0` (`sql::Statement::ColumnInt64` `CHECK_EQ(step_result_, SQLITE_ROW)`), preceded by `affiliation_database.cc:184 Failed to set up eq_classes table`. Bypassing the first-run dialog via `--no-first-run` immediately initializes profile SQLite databases on TmpFs. Removed `--no-first-run` from `apps/chrome/RUSTOS.package.toml`, `apps/chrome/RUSTOS.package.toml.example`, and updated `apps/chrome/README.md`. Without `--no-first-run`, Chrome stays alive with `wayland_windows=2` (4/4 boots).
+- **procd transient overflow workers (`services/procd/src/main.rs`)**: Replaced the resident `WORKERS = 1` thread with 0 resident workers and up to `TRANSIENT_WORKERS = 2` short-lived helpers spawned only during `handle_fork` / `handle_exec` (`SlowOpGuard`), receiving via `ipc::try_recv_with_sender` and replying on their own thread (preserving the rendezvous reply-thread invariant) and exiting via `exit_releasing_stack` (matching `vfsd`'s snapshot stage thread precedent). Restores full task-slot launch headroom; `fork_eagain=0`, `permission_denied=0`, `reservable-task-slots=0`.
+- **Fontconfig cache timestamp alignment (`tools/xtask/src/stage/mod.rs`, `tools/xtask/src/stage/browser_runtime.rs`)**: `stage/mod.rs` previously used `fatfs::DefaultTimeProvider` (`ChronoTimeProvider`, host wall clock) instead of `NullTimeProvider`, contradicting `browser_runtime.rs`'s zero-timestamp assumption. Switched boot-image FAT creation to `fatfs::NullTimeProvider` and zeroed font directory mtimes (`utimensat(0, 0)`) before `fc-cache`, so `.cache-12` headers now record `checksum=0, checksum_nano=0`. Note: `vfsd: open failed stage=metadata errno=30` (9/boot) on `/usr/share/fontconfig-cache/*` and `/data/cache/fontconfig/*` still occurs (Chrome's fontconfig still attempts writable/lock opens on the RO cache dir); kept the deterministic zero-timestamp staging fix.
+- **Kernel-local `getrandom` & `uname` (`kernel/compat/src/user/syscall/linux/syscalld_ops.rs`)**: Answered `SYS_GETRANDOM` (same flag validation, direct `nucleus_core::util::random::Random`) and `SYS_UNAME` (constant `LinuxUtsName`) in kernel-compat without `syscalld` IPC round trips (`syscalld` handlers kept intact for protocol descriptors/tests). Left `sched_getaffinity`/`sched_setaffinity` on `syscalld` because `cpu-affinity-observation` and `task-affinity-lifecycle` formally pin `services/syscalld/src/affinity_policy.rs`.
+- **WaitSet global signal epoch (`kernel/compat/src/user/syscall/linux/waitset_broker_ops.rs`, `service_ops/poll_epoll.rs`)**: Added `WAITSET_SIGNAL_EPOCH` (`SeqCst` bumped in all 3 signal/revoke paths before waiter lookup) so blocking `epoll_wait` skips the redundant second `collect_epoll_readiness()` scan when no signal arrived between the first scan and `register_waitset_waiters`.
+- **4-boot 16-vCPU KVM measurement** (`integrated_4boots.json`, all 4 `rc=0`, `chrome_alive=True`, `wayland_windows_max=2`):
+  - `chrome_start_to_gpu_s`: `3.77 / 3.73 / 3.78 / 3.76 s` (mean **3.76 s**).
+  - `application_job_refused`: 2–3 transient `application-thread-budget` (`available=114`, `ipcbench` hold), 0 `reservable-task-slots`.
+  - `checkpoint_batch_rejected=0`, `permission_denied=0`, `fork_eagain=0`, `vfsd_syscalld_call=0`.
+  - `storaged` read-ahead: `ahead_windows ~12.8k`, `ahead_used ~10.3k` (~81%), `ahead_wasted ~2.3k` (~18%), `depth_cap` 10–40.
+  - `vfsd: snapshot transfer`: `total_us=1.07–1.34 s` (`write_us=1.03–1.25 s`, overlaps `oomhog`/`phys-contig-scan` during boot).
+  - Observed `--disable-breakpad` does not stop `chrome_crashpad_handler` from launching.
+- **Validation**: `cargo test -p kernel-compat` (480 passed), `cargo test -p procd --features host-test` (14 passed), `cargo test -p xtask stage::browser_runtime` (6 passed, 1 ignored), `cargo xtask check` rc=0, `tools/agent/formal-preflight.sh` 23/23 passed.
+- **Not done / not verified**: Per-optimization interleaved A/B against HEAD; >=40-boot flake check (`kvm-smoke --expect "ipcbench: end"`); `formal/verify-all.sh --profile pr` push gate; root cause of Chrome's TmpFs SQLite failure under `--no-first-run`; full kernel `EpollHandle` migration, vfsd bulk-read deferred worker, cursor read checkpoint ABI, fork ledger batching, rootd indexing, AF_UNIX localization.
+
 ## Storage read path: read engine, lanes, snapshot pipeline, pipelined relay (2026-11-22)
 
 Goal: make the DVM-backed read path (vfsd -> storaged -> DVM relay) closer to host speed. Measured with `kvm-smoke --launch-desktop chrome.desktop`, 16 vCPU, 6 GiB, vfsd `snapshot transfer` line for the 306,789,704-byte Chrome snapshot. `read_us` is the time the snapshot worker was blocked reading; `total_us` is read+write+hash wall time.
@@ -28,6 +155,8 @@ Done:
 Step 4 (shared-memory lane / larger vfsd<->storaged payload) was evaluated and NOT implemented. Measurements at the ~450-500 MB/s ceiling: relay worker ~47% busy and storaged pump 12-31% busy (neither saturated); kernel submit syscall ~5-7 us; relay sees a request backlog of ~9 on average (max 37); raising vfsd helper lanes 3->7 with 8 storaged receivers, or read-ahead depth 40->56 with 60 in flight, did not change `read_us` (the 8-lane run also failed one launch with errno 11, unexplained, not reproduced with 3/4). So the vfsd<->storaged IPC payload and copies are not the limiting stage; a shared-memory lane would only remove ~2 memcpy of 306 MB. The unexplained serialized stage costs ~140 us per 64 KiB window. Next candidates, in order: (a) per-request latency chain inside the DVM relay (worker + supervisor + two doorbell/interrupt hops on a 2-vCPU guest; add timestamps per request to find where a request waits); (b) larger transport slots (64 KiB -> 256 KiB needs a 16 MiB BAR2 aperture, header/ABI, kernel io-manager, relay, hostd/xtask and formal updates); (c) doorbell suppression when the relay is already draining.
 
 Relay chain investigation (2026-11-22, diagnostics reverted; tree == HEAD): per-request timestamps showed completion latency ~1.8 ms with 12-19 windows in flight (Little's law ~430-500 MB/s). Not the cause, each measured with an A/B: relay spin before sleeping on the doorbell, storaged pump polling instead of the interrupt wait, refill threshold, depth > 40, helper lanes 3 -> 7, receivers 4 -> 8. A cached-read loopback (vfsd re-reading a cached 4 MiB range 32x, no DVM involved) reached only ~837 MB/s with 4 lanes, i.e. ~310 us per 63 KiB call per lane, far above the ~5 us IPC round trip in `ipc-lane-architecture`. So the vfsd<->storaged cached path has an unexplained per-call cost that is NOT the IPC primitive; find it (per-stage timestamps in vfsd lane wake, storaged receive thread, engine lock, copy into the reply) before designing a shared-memory bulk lane. A shared-memory lane is justified only if that cost turns out to be the 64 KiB frame copy/transit itself; if it is lane wake or engine lock contention, fix that instead. Ceiling for the whole snapshot is small anyway: total_us 0.77 s = read 0.45 + write 0.3 + hash 0.14 (partly overlapped), so even a perfect read path saves at most ~0.45 s per Chrome launch. Larger DVM slots (256 KiB, 16 MiB BAR2) remain the transport-side option.
+
+Chrome startup (2026-11-23, uncommitted): after the snapshot, the wait before the first window was every `execve` of a Chrome child stalling exactly 5.0 s (target `Blocked`, cpu 0) because the peer exec commit cleared the target's `call_procd` reply wait and nothing woke the new image until the 5 s boot-control deadline (`ipc-terminal-wake-not-waiting`). `current/exec.rs` now wakes a peer target after finalization. A/B (3+3 boots, Chrome start -> GPU process): 6.65-6.78 s -> 2.32-3.77 s. Remaining cost is real work: ~0.9 s of syscall time per process (big `mmap` of the 306 MB image 70-95 ms per segment, eager file-map copy), not page faults or CPU. Not verified: that the 5 s predates the 2026-11 IPC changes; a regression test for waking an IPC-blocked exec target (no unit witness exists yet); flake check over many boots. Harness-only: `kvm-smoke` adds ~2.4 s because `ipcbench` holds the 12/48 thread budget (`runtimed/kvm_launch_desktop.rs`).
 
 Restructure (2026-11-22, five owner-disjoint agents + integration; uncommitted): the read/write/hash stages are now a bounded pipeline and the per-call and kernel copy waste is removed. Chrome snapshot `total_us` (wall) over 8 boots: 0.42-0.60 s, mean ~0.50 s (was 0.77 s); memfd write busy ~65 ms (was 150-300 ms); hash 0.15 s runs on its own thread; the reader stalls ~2 ms, so the snapshot is now bound by the read itself (~0.45 s, ~680 MB/s through storaged). All 8 boots exit 0 with no long-blocked/FATAL/panic; the one earlier failure (`application-thread-budget` / `reservable-task-slots`, Chrome launch errno 11) was caused by resident stage threads (see below).
 - Pipeline: `services/vfsd/src/snapshot_pipeline.rs` (ring of 2-3 4 MiB windows, reader = caller through the lanes straight into the slot, writer and hasher helper stages, first error aborts and joins, never seals a partial memfd); lanes: `bulk_lanes.rs` (4 job slots, no leaked prefetch buffer, no lookahead, `invalidate_prefetch` removed); `snapshot_budget.rs` bills the ring (<= 12 MiB). Digest is `Option`: only a verbose plan hashes, and DVM product evidence fails closed without one.

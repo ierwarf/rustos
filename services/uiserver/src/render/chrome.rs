@@ -11,10 +11,12 @@ use crate::canvas::{Rect, SurfaceCanvas};
 use crate::clock::ClockReading;
 use crate::font::{self, TextStyle};
 use crate::layout::{
-    window_button_cluster_width, window_client_rect, window_close_button_rect,
-    window_maximize_button_rect, window_minimize_button_rect, window_title_bar_rect, HomeCell,
-    HomeClock, WINDOW_RADIUS, WINDOW_SHADOW_STEPS,
+    HomeCell, HomeClock, WINDOW_SHADOW_STEPS, rail_radius, window_button_cluster_width,
+    window_client_rect, window_close_button_rect, window_maximize_button_rect,
+    window_minimize_button_rect, window_radius, window_title_bar_rect,
 };
+use crate::ui_config::FontRole;
+use crate::ui_scale;
 use crate::wayland::WaylandWindowSnapshot;
 
 use super::colors::{
@@ -24,13 +26,11 @@ use super::colors::{
     COLOR_TEXT_PRIMARY,
 };
 use super::glass::{
-    apply_window_alpha, corner_inset, draw_glass_chip, draw_glass_panel, mix, Backdrop, GlassStyle,
-    WindowAlpha,
+    Backdrop, GlassStyle, WindowAlpha, apply_window_alpha, corner_inset, draw_glass_chip,
+    draw_glass_panel, mix,
 };
 use super::icons::{draw_app_icon, stroke_line};
 use super::{wayland_window_client_rect_for, wayland_window_outer_rect};
-
-const RAIL_RADIUS: usize = 18;
 
 // ---- top-level rails (topbar / dock) ----
 
@@ -46,7 +46,7 @@ pub(super) fn draw_rail_panel(canvas: &mut SurfaceCanvas<'_>, backdrop: Backdrop
         backdrop,
         rect,
         GlassStyle {
-            radius: RAIL_RADIUS,
+            radius: rail_radius(),
             shade_alpha: 46,
             tint_alpha: 34,
             edge_alpha: 150,
@@ -55,6 +55,7 @@ pub(super) fn draw_rail_panel(canvas: &mut SurfaceCanvas<'_>, backdrop: Backdrop
 }
 
 fn draw_panel_shadow(canvas: &mut SurfaceCanvas<'_>, rect: Rect) {
+    let radius = rail_radius();
     for step in 0..4 {
         let alpha = 36u32.saturating_sub((step as u32).saturating_mul(8)) as u8;
         if alpha == 0 {
@@ -66,7 +67,7 @@ fn draw_panel_shadow(canvas: &mut SurfaceCanvas<'_>, rect: Rect) {
             width: rect.width.saturating_add(step * 2),
             height: rect.height.saturating_add(step + 1),
         };
-        canvas.fill_rounded_rect_alpha(shadow, COLOR_SHADOW, alpha, RAIL_RADIUS + step);
+        canvas.fill_rounded_rect_alpha(shadow, COLOR_SHADOW, alpha, radius + step);
     }
 }
 
@@ -86,11 +87,12 @@ pub(super) fn draw_home_launcher(canvas: &mut SurfaceCanvas<'_>, home: HomeCell,
     };
     let width = font::text_width(text, TextStyle::ui_medium(COLOR_TEXT_PRIMARY)).min(label.width);
     let x = label.x + label.width.saturating_sub(width) / 2;
-    // A one-pixel dark offset keeps the label readable on any wallpaper glow.
+    let shadow_px = ui_scale::px(1);
+    // A subtle dark offset keeps the label readable on any wallpaper glow.
     font::draw_text_clipped(
         canvas,
-        x + 1,
-        label.y + 2,
+        x + shadow_px,
+        label.y + shadow_px * 2,
         text,
         label.width,
         TextStyle::ui_medium(COLOR_ICON_GLYPH),
@@ -98,7 +100,7 @@ pub(super) fn draw_home_launcher(canvas: &mut SurfaceCanvas<'_>, home: HomeCell,
     font::draw_text_clipped(
         canvas,
         x,
-        label.y + 1,
+        label.y + shadow_px,
         text,
         label.width,
         TextStyle::ui_medium(COLOR_TEXT_PRIMARY),
@@ -129,7 +131,8 @@ pub(super) fn draw_home_clock(
     let line = font::line_height(time_style.role);
     let time_y = clock.time.y + clock.time.height.saturating_sub(line) / 2;
     let start_x = clock.time.x + clock.time.width.saturating_sub(time_width) / 2;
-    for (dx, dy, color) in [(0, 2, COLOR_ICON_GLYPH), (0, 0, COLOR_TEXT_PRIMARY)] {
+    let clock_shadow_y = ui_scale::px(2);
+    for (dx, dy, color) in [(0, clock_shadow_y, COLOR_ICON_GLYPH), (0, 0, COLOR_TEXT_PRIMARY)] {
         let mut x = start_x;
         for ch in time.chars() {
             let cell = cell_width(ch);
@@ -151,10 +154,11 @@ pub(super) fn draw_home_clock(
     let date_line = font::line_height(date_style.role);
     let date_x = clock.date.x + clock.date.width.saturating_sub(date_width) / 2;
     let date_y = clock.date.y + clock.date.height.saturating_sub(date_line) / 2;
+    let date_shadow = ui_scale::px(1);
     font::draw_text_clipped(
         canvas,
-        date_x + 1,
-        date_y + 1,
+        date_x + date_shadow,
+        date_y + date_shadow,
         &date,
         clock.date.width,
         TextStyle::ui_large(COLOR_ICON_GLYPH),
@@ -175,49 +179,56 @@ pub(super) fn draw_dock_slot(
 
     let alpha = if minimized { 150 } else { 255 };
     if focused {
+        let chip_pad_x = ui_scale::px(5);
+        let chip_pad_y = ui_scale::px(4);
         // The focused window's slot sits in a frosted pill.
         draw_glass_chip(
             canvas,
             Rect {
-                x: rect.x.saturating_sub(6),
-                y: rect.y.saturating_sub(5),
-                width: rect.width + 12,
-                height: rect.height + 10,
+                x: rect.x.saturating_sub(chip_pad_x),
+                y: rect.y.saturating_sub(chip_pad_y),
+                width: rect.width + chip_pad_x * 2,
+                height: rect.height + chip_pad_y * 2,
             },
-            16,
+            ui_scale::px(12),
             46,
         );
     }
     draw_app_icon(canvas, rect, title, alpha);
 
-    let indicator_y = rect.y.saturating_add(rect.height).saturating_add(4);
+    let indicator_y = rect
+        .y
+        .saturating_add(rect.height)
+        .saturating_add(ui_scale::px(3));
+    let dot_height = ui_scale::px(2).max(2);
+    let dot_radius = ui_scale::px(1);
     if focused {
-        let dot_width = 14;
+        let dot_width = ui_scale::px(12);
         let dot_x = rect.x + (rect.width.saturating_sub(dot_width)) / 2;
         canvas.fill_rounded_rect_alpha(
             Rect {
                 x: dot_x,
                 y: indicator_y,
                 width: dot_width,
-                height: 3,
+                height: dot_height,
             },
             COLOR_PANEL_HIGHLIGHT,
             255,
-            1,
+            dot_radius,
         );
     } else if !minimized {
-        let dot_width = 4;
+        let dot_width = ui_scale::px(4);
         let dot_x = rect.x + (rect.width.saturating_sub(dot_width)) / 2;
         canvas.fill_rounded_rect_alpha(
             Rect {
                 x: dot_x,
                 y: indicator_y,
                 width: dot_width,
-                height: 3,
+                height: dot_height,
             },
             COLOR_TEXT_DIM,
             220,
-            1,
+            dot_radius,
         );
     }
 }
@@ -367,7 +378,7 @@ pub(super) fn paint_window_chrome(
     title: &str,
     focused: bool,
 ) {
-    paint_window_chrome_rounded(canvas, outer, client_rect, title, focused, WINDOW_RADIUS);
+    paint_window_chrome_rounded(canvas, outer, client_rect, title, focused, window_radius());
 }
 
 /// Window chrome with an explicit corner radius. Console windows are blitted
@@ -392,12 +403,17 @@ fn paint_window_chrome_rounded(
     } else {
         COLOR_AERO_TEXT_IDLE
     };
-    let button_cluster_width = window_button_cluster_width() + 8;
-    let text_x = title_rect.x + 16;
-    let text_y = title_rect.y + (title_rect.height.saturating_sub(20)) / 2;
-    let text_width = title_rect.width.saturating_sub(button_cluster_width + 16);
+    let button_cluster_width = window_button_cluster_width() + ui_scale::px(8);
+    let title_pad_x = ui_scale::px(12);
+    let title_line_h = font::line_height(FontRole::UiMedium);
+    let text_x = title_rect.x + title_pad_x;
+    let text_y = title_rect.y + title_rect.height.saturating_sub(title_line_h) / 2;
+    let text_width = title_rect
+        .width
+        .saturating_sub(button_cluster_width + title_pad_x);
+    let glow = ui_scale::px(1);
     // A soft white glow under dark text keeps the title legible on any glass.
-    for (dx, dy) in [(1, 1), (0, 1), (1, 0)] {
+    for (dx, dy) in [(glow, glow), (0, glow), (glow, 0)] {
         font::draw_text_clipped(
             canvas,
             text_x + dx,
@@ -495,7 +511,7 @@ pub(super) fn window_texture_alpha(width: usize, height: usize, focused: bool) -
     };
     WindowAlpha {
         title_height: window_title_bar_rect(local).height,
-        radius: WINDOW_RADIUS,
+        radius: window_radius(),
         title_top: if focused { 196 } else { 164 },
         title_bottom: if focused { 150 } else { 124 },
         title_edge: if focused { 238 } else { 196 },
@@ -578,7 +594,9 @@ enum CaptionGlyph {
 }
 
 /// Corner radius of the caption group's outer bottom corners.
-const CAPTION_RADIUS: usize = 6;
+fn caption_radius() -> usize {
+    ui_scale::px(5)
+}
 
 /// One glass caption button. The group's outer bottom corners are rounded;
 /// `red` paints the close button's red glass instead of the neutral glass.
@@ -593,6 +611,7 @@ fn draw_caption_button(
     if rect.is_empty() {
         return;
     }
+    let radius = caption_radius();
     let (top, bottom) = if red {
         (COLOR_AERO_CLOSE_TOP, COLOR_AERO_CLOSE_BOTTOM)
     } else {
@@ -612,12 +631,12 @@ fn draw_caption_button(
         };
         let from_bottom = rect.height - 1 - row;
         let left_inset = if first {
-            corner_inset(CAPTION_RADIUS, from_bottom)
+            corner_inset(radius, from_bottom)
         } else {
             0
         };
         let right_inset = if last {
-            corner_inset(CAPTION_RADIUS, from_bottom)
+            corner_inset(radius, from_bottom)
         } else {
             0
         };
@@ -632,12 +651,13 @@ fn draw_caption_button(
         );
     }
     // Separator between buttons and a bright top edge.
+    let edge = ui_scale::px(1);
     if !first {
         canvas.fill_rect_alpha(
             Rect {
                 x: rect.x,
                 y: rect.y,
-                width: 1,
+                width: edge,
                 height: rect.height,
             },
             COLOR_SHADOW,
@@ -646,10 +666,10 @@ fn draw_caption_button(
     }
     canvas.fill_rect_alpha(
         Rect {
-            x: rect.x + 1,
+            x: rect.x + edge,
             y: rect.y,
-            width: rect.width.saturating_sub(2),
-            height: 1,
+            width: rect.width.saturating_sub(edge * 2),
+            height: edge,
         },
         COLOR_PANEL_HIGHLIGHT,
         150,
@@ -657,23 +677,26 @@ fn draw_caption_button(
     draw_caption_glyph(canvas, rect, glyph);
 }
 
-/// White glyph with a one-pixel dark offset so it reads on light and red glass.
+/// White glyph with a subtle dark offset so it reads on light and red glass.
 fn draw_caption_glyph(canvas: &mut SurfaceCanvas<'_>, rect: Rect, glyph: CaptionGlyph) {
     let (glyph_w, glyph_h) = match glyph {
-        CaptionGlyph::Minimize => (10, 3),
-        CaptionGlyph::Maximize => (11, 10),
-        CaptionGlyph::Close => (10, 9),
+        CaptionGlyph::Minimize => (ui_scale::px(9), ui_scale::px(2).max(2)),
+        CaptionGlyph::Maximize => (ui_scale::px(10), ui_scale::px(9)),
+        CaptionGlyph::Close => (ui_scale::px(9), ui_scale::px(8)),
     };
     let x = rect.x + rect.width.saturating_sub(glyph_w) / 2;
     let y = match glyph {
-        CaptionGlyph::Minimize => rect.y + rect.height.saturating_sub(glyph_h) / 2 + 4,
+        CaptionGlyph::Minimize => {
+            rect.y + rect.height.saturating_sub(glyph_h) / 2 + ui_scale::px(3)
+        }
         _ => rect.y + rect.height.saturating_sub(glyph_h) / 2,
     };
+    let shadow_dy = ui_scale::px(1);
     for (offset, color, alpha) in [
-        (1, COLOR_ICON_GLYPH, 150_u8),
+        (shadow_dy, COLOR_ICON_GLYPH, 150_u8),
         (0, COLOR_PANEL_HIGHLIGHT, 255),
     ] {
-        draw_glyph_strokes(canvas, glyph, x, y + offset, color, alpha);
+        draw_glyph_strokes(canvas, glyph, x, y + offset, glyph_w, glyph_h, color, alpha);
     }
 }
 
@@ -682,6 +705,8 @@ fn draw_glyph_strokes(
     glyph: CaptionGlyph,
     x: usize,
     y: usize,
+    glyph_w: usize,
+    glyph_h: usize,
     color: u32,
     alpha: u8,
 ) {
@@ -698,22 +723,35 @@ fn draw_glyph_strokes(
         );
     };
     match glyph {
-        CaptionGlyph::Minimize => fill(x, y, 10, 3),
+        CaptionGlyph::Minimize => fill(x, y, glyph_w, glyph_h),
         CaptionGlyph::Maximize => {
-            fill(x, y, 11, 3);
-            fill(x, y + 3, 1, 7);
-            fill(x + 10, y + 3, 1, 7);
-            fill(x, y + 9, 11, 1);
+            let top_bar = ui_scale::px(2).max(2).min(glyph_h);
+            let side = ui_scale::px(1).min(glyph_w / 2);
+            let body_h = glyph_h.saturating_sub(top_bar);
+            fill(x, y, glyph_w, top_bar);
+            fill(x, y + top_bar, side, body_h);
+            fill(
+                x + glyph_w.saturating_sub(side),
+                y + top_bar,
+                side,
+                body_h,
+            );
+            fill(x, y + glyph_h.saturating_sub(side), glyph_w, side);
         }
         CaptionGlyph::Close => {
             // Two crossing strokes with edge coverage, so the X reads as
-            // smooth lines and not a staircase of 2 px steps.
+            // smooth lines and not a staircase of steps.
             let (left, top) = (x as i64 * 8, y as i64 * 8);
+            let right = left + glyph_w as i64 * 8;
+            let bottom = top + glyph_h as i64 * 8;
+            let scale = i64::from(ui_scale::current().percent());
+            let inset = (4 * scale / 100).max(4);
+            let thickness = (14 * scale / 100).max(8);
             for (from, to) in [
-                ((left + 4, top + 4), (left + 76, top + 68)),
-                ((left + 76, top + 4), (left + 4, top + 68)),
+                ((left + inset, top + inset), (right - inset, bottom - inset)),
+                ((right - inset, top + inset), (left + inset, bottom - inset)),
             ] {
-                stroke_line(canvas, from, to, 14, color, alpha);
+                stroke_line(canvas, from, to, thickness, color, alpha);
             }
         }
     }
@@ -747,7 +785,7 @@ const MAX_SHADOW_MASKS: usize = 16;
 const MAX_SHADOW_MASK_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 struct ShadowMaskCache {
-    entries: HashMap<(usize, usize), (Arc<ShadowMask>, u64)>,
+    entries: HashMap<(usize, usize, u32), (Arc<ShadowMask>, u64)>,
     bytes: usize,
     clock: u64,
     max_entries: usize,
@@ -765,7 +803,7 @@ impl ShadowMaskCache {
         }
     }
 
-    fn get(&mut self, key: (usize, usize)) -> Option<Arc<ShadowMask>> {
+    fn get(&mut self, key: (usize, usize, u32)) -> Option<Arc<ShadowMask>> {
         self.clock += 1;
         let clock = self.clock;
         self.entries.get_mut(&key).map(|(mask, used)| {
@@ -777,7 +815,7 @@ impl ShadowMaskCache {
     /// Cache `mask`, evicting the least recently used masks to make room.
     /// Returns the mask to use, which is the cached one if another thread
     /// built the same size first.
-    fn insert(&mut self, key: (usize, usize), mask: Arc<ShadowMask>) -> Arc<ShadowMask> {
+    fn insert(&mut self, key: (usize, usize, u32), mask: Arc<ShadowMask>) -> Arc<ShadowMask> {
         if let Some(existing) = self.get(key) {
             return existing;
         }
@@ -819,7 +857,7 @@ fn shadow_mask_cache() -> &'static Mutex<ShadowMaskCache> {
 }
 
 fn ensure_shadow_mask(outer_w: usize, outer_h: usize) -> Arc<ShadowMask> {
-    let key = (outer_w, outer_h);
+    let key = (outer_w, outer_h, ui_scale::current().percent());
     if let Ok(mut cache) = shadow_mask_cache().lock() {
         if let Some(mask) = cache.get(key) {
             return mask;
@@ -861,7 +899,7 @@ fn build_shadow_mask(outer_w: usize, outer_h: usize) -> ShadowMask {
                 width: local_rect.width.saturating_add(inset * 2),
                 height: local_rect.height.saturating_add(inset + 2),
             };
-            canvas.fill_rounded_rect_alpha(layer, COLOR_SHADOW, alpha, WINDOW_RADIUS + step);
+            canvas.fill_rounded_rect_alpha(layer, COLOR_SHADOW, alpha, window_radius() + step);
         }
     }
     let alpha: Vec<u8> = scratch
@@ -904,7 +942,7 @@ mod shadow_cache_tests {
     fn the_cache_never_holds_more_than_its_entry_limit() {
         let mut cache = ShadowMaskCache::new(4, usize::MAX);
         for width in 40..80 {
-            cache.insert((width, 50), mask(width, 50));
+            cache.insert((width, 50, 200), mask(width, 50));
         }
         assert_eq!(cache.entries.len(), 4);
         let counted: usize = cache.entries.values().map(|(m, _)| m.alpha.len()).sum();
@@ -914,15 +952,18 @@ mod shadow_cache_tests {
     #[test]
     fn the_least_recently_used_mask_is_evicted_first() {
         let mut cache = ShadowMaskCache::new(2, usize::MAX);
-        cache.insert((40, 50), mask(40, 50));
-        cache.insert((41, 50), mask(41, 50));
-        assert!(cache.get((40, 50)).is_some(), "touch the older entry");
-        cache.insert((42, 50), mask(42, 50));
+        cache.insert((40, 50, 200), mask(40, 50));
+        cache.insert((41, 50, 200), mask(41, 50));
+        assert!(cache.get((40, 50, 200)).is_some(), "touch the older entry");
+        cache.insert((42, 50, 200), mask(42, 50));
         assert!(
-            cache.get((40, 50)).is_some(),
+            cache.get((40, 50, 200)).is_some(),
             "recently used entry survives"
         );
-        assert!(cache.get((41, 50)).is_none(), "the idle entry was evicted");
+        assert!(
+            cache.get((41, 50, 200)).is_none(),
+            "the idle entry was evicted"
+        );
     }
 
     #[test]
@@ -930,7 +971,7 @@ mod shadow_cache_tests {
         let mut cache = ShadowMaskCache::new(8, 1024);
         let big = mask(200, 200);
         assert!(big.alpha.len() > 1024);
-        let used = cache.insert((200, 200), Arc::clone(&big));
+        let used = cache.insert((200, 200, 200), Arc::clone(&big));
         assert!(Arc::ptr_eq(&used, &big));
         assert!(cache.entries.is_empty() && cache.bytes == 0);
     }
@@ -938,8 +979,8 @@ mod shadow_cache_tests {
     #[test]
     fn inserting_a_size_twice_keeps_the_first_mask() {
         let mut cache = ShadowMaskCache::new(4, usize::MAX);
-        let first = cache.insert((40, 50), mask(40, 50));
-        let second = cache.insert((40, 50), mask(40, 50));
+        let first = cache.insert((40, 50, 200), mask(40, 50));
+        let second = cache.insert((40, 50, 200), mask(40, 50));
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(cache.entries.len(), 1);
     }

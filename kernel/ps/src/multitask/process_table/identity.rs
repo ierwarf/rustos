@@ -6,7 +6,11 @@
 //!   slot generation and exact MM generation.
 //! - **Publication:** writers revoke the committed word, update pointer/PID
 //!   payloads, then release-store one generation word. Readers validate that
-//!   word before and after reading the payload.
+//!   word before and after reading the payload. A republish that would store
+//!   exactly the committed payload (every non-final thread exit) writes
+//!   nothing: user-copy binds and pager fault lookups have no locked fallback,
+//!   so a revoke window that changes nothing turns a sibling thread's copyout
+//!   into `EFAULT` and its page fault into a killed process.
 //! - **Concurrency:** release/acquire payload bridges join replacement to prior
 //!   revocation; IRQ masking alone does not exclude remote lifecycle writers.
 //! - **Lifetime:** counted references or exact atomic allocation pins retain
@@ -193,6 +197,15 @@ fn decode_identity(word: u64, process_id: u64) -> ProcessIdentity {
 ///
 /// Revocation is first so no reader can combine an old committed generation
 /// with a new PID or pointer. The final release store is the only commit point.
+///
+/// A republish that would store exactly what is already committed is a no-op.
+/// Lock-free readers (user-copy binds, exact-identity checks) refuse while the
+/// identity word is revoked and have no fallback, so a revoke window that
+/// changes nothing turns every concurrent copyout of an unrelated thread into
+/// a spurious `EFAULT`. Thread exit republishes its slot on every detach, and
+/// a service that runs short-lived helper threads exits one constantly.
+/// Callers hold the process-table lock, which serializes every writer, so the
+/// comparison below cannot race another publication.
 pub(super) fn publish_slot_visibility(
     index: usize,
     generation: u32,
@@ -201,10 +214,6 @@ pub(super) fn publish_slot_visibility(
     if publication.is_some() {
         super::pin_owner::bind(index, generation);
     }
-    // ORDERING: Release revokes the old generation before membership payload
-    // replacement. A reader acquiring a replacement job observes this revoke.
-    PROCESS_IDENTITY[index].store(0, Ordering::Release);
-    MM_OWNER_IDENTITY[index].store(0, Ordering::Release);
     let (process_id, job, state, mm_vma_owner, committed, mm_owner_committed) =
         publication.map_or((0, 0, core::ptr::null_mut(), 0, 0, 0), |publication| {
             let identity_word = encode_identity(generation, publication.mm_generation);
@@ -222,6 +231,24 @@ pub(super) fn publish_slot_visibility(
                 mm_owner_committed,
             )
         });
+    // ORDERING: Acquire pairs with the previous commit's Release store, and the
+    // payload words below were written under the same table lock this caller
+    // holds, so equality proves the committed publication is already exact.
+    if PROCESS_IDENTITY[index].load(Ordering::Acquire) == committed
+        && MM_OWNER_IDENTITY[index].load(Ordering::Acquire) == mm_owner_committed
+        && PROCESS_JOB[index].load(Ordering::Relaxed) == job
+        && PROCESS_STATE_PTR[index].load(Ordering::Relaxed) == state
+        && MM_VMA_OWNER_HANDLE[index].load(Ordering::Relaxed) == mm_vma_owner
+        && PROCESS_ID[index].load(Ordering::Relaxed) == process_id
+    {
+        return;
+    }
+    #[cfg(test)]
+    SLOT_REVOCATIONS.fetch_add(1, Ordering::Relaxed);
+    // ORDERING: Release revokes the old generation before membership payload
+    // replacement. A reader acquiring a replacement job observes this revoke.
+    PROCESS_IDENTITY[index].store(0, Ordering::Release);
+    MM_OWNER_IDENTITY[index].store(0, Ordering::Release);
     // ORDERING: Release binds a changed membership payload to the preceding
     // process-generation revocation, even before the final commit is visible.
     PROCESS_JOB[index].store(job, Ordering::Release);
@@ -755,6 +782,11 @@ pub(in crate::multitask) fn with_own_exact_visible_state<R>(
     }
     bundle.with_state_for_pid(expected.process_id(), |state| f(state))
 }
+
+/// Counts publications that actually revoked the slot, so a test can prove a
+/// no-change republish never opens a revoke window.
+#[cfg(test)]
+pub(in crate::multitask) static SLOT_REVOCATIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Compares publication with locked lifecycle authority. Called only from the
 /// out-of-scheduler-guard profile drain; a zero result emits nothing.

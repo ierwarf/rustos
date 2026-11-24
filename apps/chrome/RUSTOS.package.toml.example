@@ -36,4 +36,17 @@ request_processes = 24
 request_threads = 144
 # Interim: RustOS has no user namespaces or setuid sandbox yet, and /data may be
 # absent, so Chrome runs unsandboxed with its profile on tmpfs.
-args = ["/apps/chrome/chrome", "--ozone-platform=wayland", "--no-sandbox", "--disable-gpu", "--disable-background-networking", "--user-data-dir=/tmp/chrome-profile", "about:blank"]
+args = ["/apps/chrome/chrome", "--ozone-platform=wayland", "--no-sandbox", "--disable-gpu", "--js-flags=--jitless", "--disable-background-networking", "--user-data-dir=/tmp/chrome-profile", "--no-first-run", "--no-default-browser-check", "--password-store=basic", "--disable-component-update", "--disable-sync", "--disable-default-apps", "--disable-component-extensions-with-background-pages", "--disable-domain-reliability", "--metrics-recording-only", "--disable-breakpad", "--disable-features=Translate,MediaRouter,OptimizationHints", "about:blank"]
+# Startup work Chrome would otherwise do on every launch against services this
+# image does not have (all names verified present in the 157 binary; none touch
+# the sandbox policy): `--no-first-run` skips the first-run flow, including the
+# "Google Chrome and ChromeOS Additional Terms" window, which a fresh TmpFs
+# profile would show on every boot (it is a no-op once the profile's "First
+# Run" sentinel exists); `--no-default-browser-check` skips the xdg-settings
+# probe; `--password-store=basic` skips the libsecret/kwallet/gnome-keyring
+# D-Bus probe; the component/sync/default-app/domain-reliability/metrics
+# switches and the `MediaRouter` (mDNS Cast discovery), `OptimizationHints` and
+# `Translate` features skip background network and service starts. Env:
+# `GSETTINGS_BACKEND=memory` stops GIO from searching for the dconf module and
+# `GIO_USE_VFS=local` from connecting to gvfsd, neither of which exists here.
+env = ["GSETTINGS_BACKEND=memory", "GIO_USE_VFS=local"]

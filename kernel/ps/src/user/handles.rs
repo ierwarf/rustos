@@ -5,6 +5,7 @@ use crate::user::linux as linux_abi;
 use crate::user::memfd::MemfdHandle;
 use crate::user::pipe::PipeHandle;
 use crate::user::socket::SocketHandle;
+use crate::user::unix_socket::UnixSocketHandle;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -196,6 +197,7 @@ pub enum KernelHandle {
     Pipe(PipeHandle),
     RemoteVfs(RemoteVfsHandle),
     Socket(SocketHandle),
+    UnixSocket(UnixSocketHandle),
     VfsDirectory(VfsDirectoryHandle),
     DisplaySurface(DisplaySurfaceHandle),
     DeviceBuffer(BufferCapability),
@@ -209,7 +211,81 @@ pub struct InetSocketHandle {
     protocol: u64,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct RemoteVfsCursorState {
+    cursor: u64,
+    durable_cursor: u64,
+    durable_epoch: u64,
+}
+
+/// Kernel-owned open-description cursor state for regular remote VFS files.
+/// Shared across `dup`/`fork`/`SCM_RIGHTS` clones of one [`RemoteVfsHandle`].
+pub struct RemoteVfsOpenDescription {
+    cursor_state: TrackedSpinLock<RemoteVfsCursorState, { LockClass::LocalFdObject as u8 }>,
+}
+
+impl core::fmt::Debug for RemoteVfsOpenDescription {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RemoteVfsOpenDescription")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemoteVfsOpenDescription {
+    pub const fn new(durable_epoch: u64) -> Self {
+        Self {
+            cursor_state: TrackedSpinLock::new(RemoteVfsCursorState {
+                cursor: 0,
+                durable_cursor: 0,
+                durable_epoch,
+            }),
+        }
+    }
+
+    pub fn cursor(&self) -> u64 {
+        self.cursor_state.lock().cursor
+    }
+
+    pub fn durable_cursor(&self) -> u64 {
+        self.cursor_state.lock().durable_cursor
+    }
+
+    pub fn durable_epoch(&self) -> u64 {
+        self.cursor_state.lock().durable_epoch
+    }
+
+    pub fn advance_cursor(&self, delta: usize) -> u64 {
+        let mut state = self.cursor_state.lock();
+        let next = state
+            .cursor
+            .saturating_add(delta as u64)
+            .min(i64::MAX as u64);
+        state.cursor = next;
+        next
+    }
+
+    pub fn set_synced_cursor(&self, cursor: u64, durable_epoch: u64) {
+        let bounded = cursor.min(i64::MAX as u64);
+        let mut state = self.cursor_state.lock();
+        state.cursor = bounded;
+        state.durable_cursor = bounded;
+        state.durable_epoch = durable_epoch;
+    }
+
+    pub fn is_dirty(&self, current_epoch: u64) -> bool {
+        let state = self.cursor_state.lock();
+        state.cursor != state.durable_cursor || state.durable_epoch != current_epoch
+    }
+
+    pub fn mark_settled(&self, settled_cursor: u64, durable_epoch: u64) {
+        let bounded = settled_cursor.min(i64::MAX as u64);
+        let mut state = self.cursor_state.lock();
+        state.durable_cursor = bounded;
+        state.durable_epoch = durable_epoch;
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct RemoteVfsHandle {
     token: u64,
     remote_id: u64,
@@ -218,7 +294,23 @@ pub struct RemoteVfsHandle {
     len: u64,
     device_access: u16,
     library: LibraryBinding,
+    description: Arc<RemoteVfsOpenDescription>,
 }
+
+impl PartialEq for RemoteVfsHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.token == other.token
+            && self.remote_id == other.remote_id
+            && self.kind == other.kind
+            && self.path == other.path
+            && self.len == other.len
+            && self.device_access == other.device_access
+            && self.library == other.library
+            && Arc::ptr_eq(&self.description, &other.description)
+    }
+}
+
+impl Eq for RemoteVfsHandle {}
 
 /// Whether this open file description is known to be a sealed shared library
 /// object. The record lives in the description's handle, so it follows
@@ -262,7 +354,53 @@ impl RemoteVfsHandle {
             len,
             device_access,
             library: LibraryBinding::Unknown,
+            description: Arc::new(RemoteVfsOpenDescription::new(0)),
         })
+    }
+
+    pub fn new_with_epoch(
+        remote_id: u64,
+        kind: RemoteVfsHandleKind,
+        path: String,
+        len: u64,
+        device_access: u16,
+        durable_epoch: u64,
+    ) -> Option<Self> {
+        let handle = Self::new(remote_id, kind, path, len, device_access)?;
+        handle.description.mark_settled(0, durable_epoch);
+        Some(handle)
+    }
+
+    pub fn description(&self) -> &Arc<RemoteVfsOpenDescription> {
+        &self.description
+    }
+
+    pub fn cursor(&self) -> u64 {
+        self.description.cursor()
+    }
+
+    pub fn durable_cursor(&self) -> u64 {
+        self.description.durable_cursor()
+    }
+
+    pub fn durable_epoch(&self) -> u64 {
+        self.description.durable_epoch()
+    }
+
+    pub fn advance_cursor(&self, delta: usize) -> u64 {
+        self.description.advance_cursor(delta)
+    }
+
+    pub fn set_synced_cursor(&self, cursor: u64, durable_epoch: u64) {
+        self.description.set_synced_cursor(cursor, durable_epoch);
+    }
+
+    pub fn is_dirty(&self, current_epoch: u64) -> bool {
+        self.description.is_dirty(current_epoch)
+    }
+
+    pub fn mark_settled(&self, settled_cursor: u64, durable_epoch: u64) {
+        self.description.mark_settled(settled_cursor, durable_epoch);
     }
 
     pub const fn token_id(&self) -> u64 {
@@ -371,6 +509,11 @@ impl KernelHandle {
                     .expect("remote VFS open-description token is nonzero and nonreusable")
             }
             Self::Socket(socket) => HandleToken::new(HandleOwner::Compat, socket.token_id()),
+            Self::UnixSocket(socket) => HandleToken::from_nonreusable_open_description(
+                HandleOwner::Ps,
+                socket.token_id(),
+            )
+            .expect("unix socket open-description token is nonzero and nonreusable"),
             Self::VfsDirectory(directory) => {
                 HandleToken::new(HandleOwner::Io, directory.token_id())
             }
@@ -393,6 +536,7 @@ impl KernelHandle {
             Self::Memfd(_) => "memfd",
             Self::RemoteVfs(_) => "remote-vfs",
             Self::Socket(_) => "socket",
+            Self::UnixSocket(_) => "unix-socket",
             Self::VfsDirectory(_) => "vfs-dir",
             Self::DisplaySurface(_) => "display-surface",
             Self::DeviceBuffer(_) => "device-buffer",
@@ -479,7 +623,7 @@ impl KernelHandle {
                     HandleRights::File(FileHandleRights::READ.union(FileHandleRights::TRANSFER))
                 }
             },
-            Self::Socket(_) => HandleRights::Socket(
+            Self::Socket(_) | Self::UnixSocket(_) => HandleRights::Socket(
                 SocketHandleRights::SEND
                     .union(SocketHandleRights::RECV)
                     .union(SocketHandleRights::PASS_FD)
@@ -514,6 +658,7 @@ impl KernelHandle {
             self,
             Self::Job(_)
                 | Self::Socket(_)
+                | Self::UnixSocket(_)
                 | Self::Memfd(_)
                 | Self::Pipe(_)
                 | Self::VfsDirectory(_)
@@ -546,6 +691,7 @@ impl KernelHandle {
             Self::Socket(socket) => socket.bound_path().unwrap_or_else(|| {
                 alloc::format!("socket:[rustos-unix-stream:{}]", token.object_id())
             }),
+            Self::UnixSocket(socket) => alloc::format!("socket:[{}]", socket.token_id()),
             Self::VfsDirectory(directory) => alloc::string::String::from(directory.path()),
             Self::DisplaySurface(_) => {
                 alloc::format!("anon_inode:[rustos-display-surface:{}]", token.object_id())

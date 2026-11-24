@@ -16,7 +16,11 @@ pub(super) fn begin_ref_result(
     }
     let mut log = ref_replay_log().lock().map_err(|_| libc::EIO)?;
     if let Some(entry) = log.get(&(request.operation_hi, request.operation_lo)) {
-        if entry.op != request.op || entry.socket_token != request.socket_token {
+        if entry.operation_hi != request.operation_hi
+            || entry.operation_lo != request.operation_lo
+            || entry.op != request.op
+            || entry.socket_token != request.socket_token
+        {
             return Err(libc::EPROTO);
         }
         if !entry.complete {

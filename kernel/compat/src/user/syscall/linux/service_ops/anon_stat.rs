@@ -98,6 +98,13 @@ pub(super) fn identity_of(handle: &multitask::KernelHandle) -> Option<AnonStat> 
             nlink: 1,
             size: 0,
         },
+        multitask::KernelHandle::UnixSocket(socket) => AnonStat {
+            dev: DEV_SOCKFS,
+            ino: socket.token_id(),
+            mode: S_IFSOCK | 0o777,
+            nlink: 1,
+            size: 0,
+        },
         multitask::KernelHandle::InetSocket(socket) => AnonStat {
             dev: DEV_SOCKFS_INET,
             ino: socket.token_id(),

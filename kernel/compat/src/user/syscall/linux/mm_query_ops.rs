@@ -558,32 +558,57 @@ fn madvise_discard_range(
     {
         return linux_errno(LINUX_EINVAL);
     }
-    let holes = match unmapped_ranges(start, end) {
-        Ok(holes) => holes,
-        Err(errno) => return linux_errno(errno),
-    };
     let pieces = anonymous_private_pieces(&spans, start, end);
     let result = multitask::with_current_user_process_state_mut(|_, _, process_state| {
         if !allow_locked && process_state.memlock().locked_bytes_in(start, end) > 0 {
             return Err(LINUX_EINVAL);
         }
-        for (piece_start, piece_end) in pieces {
+        for (piece_start, piece_end) in &pieces {
             let page_count =
-                usize::try_from((piece_end - piece_start) / PAGE).map_err(|_| LINUX_EINVAL)?;
+                usize::try_from((*piece_end - *piece_start) / PAGE).map_err(|_| LINUX_EINVAL)?;
             process_state
                 .address_space_mut()
-                .unmap_present_user_pages_at(VirtAddr::new(piece_start), page_count)
+                .unmap_present_user_pages_at(VirtAddr::new(*piece_start), page_count)
                 .map_err(address_space_error_to_linux_errno)?;
         }
         process_state.sync_mapping_kmem();
         Ok(())
     });
     match result {
-        None => linux_errno(LINUX_ESRCH),
-        Some(Err(errno)) => linux_errno(errno),
-        Some(Ok(())) if holes.is_empty() => 0,
-        Some(Ok(())) => linux_errno(LINUX_ENOMEM),
+        None => return linux_errno(LINUX_ESRCH),
+        Some(Err(errno)) => return linux_errno(errno),
+        Some(Ok(())) => {}
     }
+    // Fast path: if published Ring0 `pager_vma` spans alone already cover
+    // `[start, end)`, every page is mapped and we avoid scanning all page-table
+    // leaves or querying `syscalld` across multi-megabyte V8/PartitionAlloc cages.
+    if uncovered_ranges(&spans, start, end).is_empty() {
+        return 0;
+    }
+    let holes = match unmapped_ranges(start, end) {
+        Ok(holes) => holes,
+        Err(errno) => return linux_errno(errno),
+    };
+    if holes.is_empty() || syscalld_vma_covers_range(start, end - start) {
+        0
+    } else {
+        linux_errno(LINUX_ENOMEM)
+    }
+}
+
+/// Checks with `syscalld` whether `[start, start + len)` is covered by tracked
+/// VMAs (including `MmVmaKind::Reserved` `PROT_NONE` reservations that have not
+/// been materialized in Ring0's `pager_vma` table).
+fn syscalld_vma_covers_range(start: u64, len: u64) -> bool {
+    let mut request = new_syscalld_request(
+        rustos_user_abi::syscall::SYSCALL_OFFLOAD_OP_LINUX_MADVISE,
+    );
+    request.arg0 = start;
+    request.arg1 = len;
+    request.flags = linux_abi::MADV_DONTNEED | (1_u64 << 63);
+    call_syscalld(request)
+        .and_then(|response| ensure_empty_syscalld_response(&response))
+        .is_ok()
 }
 
 pub(super) fn syscall_linux_madvise_dontneed(start: u64, len: u64, allow_locked: bool) -> u64 {

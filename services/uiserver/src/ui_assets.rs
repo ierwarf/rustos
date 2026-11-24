@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::app::{ConsoleWindow, DesktopSurfaceCache};
@@ -14,12 +14,20 @@ use crate::glyph_atlas::{build_atlas, GlyphAtlas};
 use crate::startup::Dependency;
 use crate::sys::{spawn_ui_thread, UiThreadRole};
 use crate::ui_config::{self, FontRole, MAX_CONFIG_BYTES, MAX_FONT_FILE_BYTES};
+use crate::ui_scale::{self, UiScale};
+use crate::wayland::WaylandCompositor;
 
 pub(crate) struct UiAssets {
     atlases: BTreeMap<FontRole, GlyphAtlas>,
+    display_scale_percent: u32,
+    layout: ui_config::UiLayoutConfig,
     clock_utc_offset_minutes: i32,
     /// One line for the boot log: what loaded.
     summary: String,
+    /// Retained config and parsed font faces so dynamic runtime DPI scale
+    /// changes can re-rasterize glyph atlases without disk I/O.
+    config: Option<ui_config::UiConfig>,
+    faces: BTreeMap<PathBuf, Arc<fontdue::Font>>,
 }
 
 /// Why a load failed, which decides whether trying again can help.
@@ -47,20 +55,41 @@ pub(crate) enum AssetLoad {
 }
 
 struct AssetStore {
-    configured: OnceLock<UiAssets>,
+    configured: RwLock<Option<Arc<UiAssets>>>,
     revision: AtomicU64,
 }
 
 impl AssetStore {
     const fn new() -> Self {
         Self {
-            configured: OnceLock::new(),
+            configured: RwLock::new(None),
             revision: AtomicU64::new(1),
         }
     }
 
-    fn assets(&self) -> &UiAssets {
-        self.configured.get().unwrap_or_else(|| bundled_assets())
+    fn assets(&self) -> Arc<UiAssets> {
+        if let Ok(guard) = self.configured.read() {
+            if let Some(assets) = guard.as_ref() {
+                return Arc::clone(assets);
+            }
+        }
+        Arc::clone(bundled_assets())
+    }
+
+    fn invalidate_caches(
+        &self,
+        desktop: &mut DesktopSurfaceCache,
+        consoles: &mut [ConsoleWindow],
+    ) {
+        desktop.invalidate_chrome();
+        desktop.clock_checked = None;
+        for window in consoles {
+            window.terminal_dirty = true;
+            window.invalidate_surface();
+        }
+        // ORDERING: Release publishes the updated asset store before readers
+        // observe the incremented revision.
+        self.revision.fetch_add(1, Ordering::Release);
     }
 
     // Only the UI thread promotes, before any drawing in that loop iteration.
@@ -71,30 +100,68 @@ impl AssetStore {
         desktop: &mut DesktopSurfaceCache,
         consoles: &mut [ConsoleWindow],
     ) -> bool {
-        if self.configured.set(loaded).is_err() {
+        let Ok(mut guard) = self.configured.write() else {
+            return false;
+        };
+        if guard.is_some() {
             return false;
         }
-        desktop.invalidate_chrome();
-        desktop.clock_checked = None;
-        for window in consoles {
-            window.terminal_dirty = true;
-            window.invalidate_surface();
-        }
-        self.revision.store(2, Ordering::Release);
+        let loaded_scale = loaded.display_scale();
+        *guard = Some(Arc::new(loaded));
+        drop(guard);
+        ui_scale::set(loaded_scale);
+        self.invalidate_caches(desktop, consoles);
         true
+    }
+
+    /// Dynamically updates the active UI scale, re-rasterizing loaded font
+    /// atlases in memory when available, invalidating retained chrome/console
+    /// caches, and notifying the Wayland compositor.
+    fn apply_scale(
+        &self,
+        scale: UiScale,
+        desktop: &mut DesktopSurfaceCache,
+        consoles: &mut [ConsoleWindow],
+        wayland: Option<&mut WaylandCompositor>,
+    ) -> bool {
+        let scale_changed = ui_scale::set(scale);
+        let mut fonts_updated = false;
+        if let Ok(mut guard) = self.configured.write() {
+            if let Some(current) = guard.as_ref() {
+                if current.display_scale_percent != scale.percent() {
+                    if let Some(rescaled) = current.rescaled(scale) {
+                        *guard = Some(Arc::new(rescaled));
+                        fonts_updated = true;
+                    }
+                }
+            }
+        }
+        let wayland_changed = wayland
+            .map(|compositor| compositor.set_output_scale(scale.wayland_output_scale()))
+            .unwrap_or(false);
+        if scale_changed || fonts_updated || wayland_changed {
+            self.invalidate_caches(desktop, consoles);
+            true
+        } else {
+            false
+        }
     }
 }
 
 static ASSETS: AssetStore = AssetStore::new();
-static BUNDLED: OnceLock<UiAssets> = OnceLock::new();
+static BUNDLED: OnceLock<Arc<UiAssets>> = OnceLock::new();
 include!(concat!(env!("OUT_DIR"), "/ui_bundled_atlases.rs"));
 
-pub(crate) fn bundled_assets() -> &'static UiAssets {
-    BUNDLED.get_or_init(make_bundled_assets)
+pub(crate) fn bundled_assets() -> &'static Arc<UiAssets> {
+    BUNDLED.get_or_init(|| Arc::new(make_bundled_assets()))
 }
 
 pub(crate) fn asset_revision() -> u64 {
-    ASSETS.revision.load(Ordering::Acquire)
+    // ORDERING: Acquire pairs with the Release increment in `invalidate_caches`.
+    ASSETS
+        .revision
+        .load(Ordering::Acquire)
+        .wrapping_add(ui_scale::revision().saturating_sub(1))
 }
 
 pub(crate) fn promote(
@@ -103,6 +170,16 @@ pub(crate) fn promote(
     consoles: &mut [ConsoleWindow],
 ) -> bool {
     ASSETS.promote(loaded, desktop, consoles)
+}
+
+/// Applies a new UI DPI scale dynamically between rendered frames.
+pub(crate) fn apply_scale(
+    scale: UiScale,
+    desktop: &mut DesktopSurfaceCache,
+    consoles: &mut [ConsoleWindow],
+    wayland: Option<&mut WaylandCompositor>,
+) -> bool {
+    ASSETS.apply_scale(scale, desktop, consoles, wayland)
 }
 
 /// The wait between attempts and the total budget are the `Assets`
@@ -118,12 +195,16 @@ fn retry_interval() -> Duration {
 }
 
 /// The active set; bundled geometry and pixels are available without storage.
-pub(crate) fn assets() -> &'static UiAssets {
+pub(crate) fn assets() -> Arc<UiAssets> {
     ASSETS.assets()
 }
 
 pub(crate) fn clock_utc_offset_minutes() -> i32 {
     assets().clock_utc_offset_minutes()
+}
+
+pub(crate) fn layout() -> ui_config::UiLayoutConfig {
+    assets().layout()
 }
 
 /// Where the `ui-assets` data package installs its configuration. runtimed
@@ -236,7 +317,7 @@ impl UiAssets {
         let base = config_path.parent().unwrap_or(Path::new("."));
 
         // Several roles may share one face; parse each file once.
-        let mut faces: BTreeMap<PathBuf, fontdue::Font> = BTreeMap::new();
+        let mut faces: BTreeMap<PathBuf, Arc<fontdue::Font>> = BTreeMap::new();
         let mut atlases = BTreeMap::new();
         for (role, spec) in &config.fonts {
             let path = base.join(&spec.file);
@@ -257,24 +338,66 @@ impl UiAssets {
                     .map_err(|err| {
                         LoadError::Invalid(format!("cannot parse font {}: {err}", path.display()))
                     })?;
-                faces.insert(path.clone(), face);
+                faces.insert(path.clone(), Arc::new(face));
             }
-            let atlas = build_atlas(&faces[&path], spec)
+            let scaled_spec = spec.scaled(config.display_scale_percent);
+            let atlas = build_atlas(&faces[&path], &scaled_spec)
                 .map_err(|err| LoadError::Invalid(format!("font {}: {err}", path.display())))?;
             atlases.insert(*role, atlas);
         }
         let summary = format!(
-            "loaded config={} fonts={} files={} utc_offset_minutes={}",
+            "loaded config={} fonts={} files={} scale_percent={} utc_offset_minutes={}",
             config_path.display(),
             atlases.len(),
             faces.len(),
+            config.display_scale_percent,
             config.clock_utc_offset_minutes
         );
+        let retained_faces = config
+            .fonts
+            .values()
+            .filter_map(|spec| {
+                let path = base.join(&spec.file);
+                faces.get(&path).map(|face| (spec.file.clone(), Arc::clone(face)))
+            })
+            .collect();
         Ok(Self {
             atlases,
+            display_scale_percent: config.display_scale_percent,
+            layout: config.layout,
             clock_utc_offset_minutes: config.clock_utc_offset_minutes,
             summary,
+            config: Some(config),
+            faces: retained_faces,
         })
+    }
+
+    pub(crate) fn rescaled(&self, scale: UiScale) -> Option<Self> {
+        let config = self.config.as_ref()?;
+        let mut atlases = BTreeMap::new();
+        for (role, spec) in &config.fonts {
+            let face = self.faces.get(&spec.file)?;
+            let scaled_spec = spec.scaled(scale.percent());
+            let atlas = build_atlas(face, &scaled_spec).ok()?;
+            atlases.insert(*role, atlas);
+        }
+        Some(Self {
+            atlases,
+            display_scale_percent: scale.percent(),
+            layout: self.layout,
+            clock_utc_offset_minutes: self.clock_utc_offset_minutes,
+            summary: format!("rescaled runtime atlases scale_percent={}", scale.percent()),
+            config: Some(config.clone()),
+            faces: self.faces.clone(),
+        })
+    }
+
+    pub(crate) fn display_scale(&self) -> UiScale {
+        UiScale::new(self.display_scale_percent).unwrap_or_else(UiScale::default_scale)
+    }
+
+    pub(crate) fn layout(&self) -> ui_config::UiLayoutConfig {
+        self.layout
     }
 
     pub(crate) fn atlas(&self, role: FontRole) -> Option<&GlyphAtlas> {
@@ -394,7 +517,13 @@ mod tests {
         let bundled = bundled_assets().atlas(FontRole::Terminal).unwrap();
         let custom = loaded.atlas(FontRole::Terminal).unwrap();
         assert!(custom.cell_width > bundled.cell_width);
-        assert_eq!(custom.line_height, 30);
+        // Default display scale is 200%, so logical line_height=30 rasterizes at 60px.
+        assert_eq!(custom.line_height, 60);
+        // Dynamic rescaling to 100% re-rasterizes from cached font faces to 30px.
+        let rescaled = loaded
+            .rescaled(UiScale::new(100).unwrap())
+            .expect("dynamic rescale");
+        assert_eq!(rescaled.atlas(FontRole::Terminal).unwrap().line_height, 30);
         let store = AssetStore::new();
         assert!(store.promote(loaded, &mut DesktopSurfaceCache::default(), &mut []));
         assert_eq!(store.assets().clock_utc_offset_minutes(), -300);
@@ -404,7 +533,7 @@ mod tests {
                 .atlas(FontRole::Terminal)
                 .unwrap()
                 .line_height,
-            30
+            60
         );
     }
 

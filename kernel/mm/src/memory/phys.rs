@@ -70,16 +70,20 @@ pub(crate) const fn min_free_for(free_frames: usize) -> usize {
 
 mod frame_descriptor_ledger;
 pub use frame_descriptor_ledger::{
-    CowFrameKind, CowMappingClaim, DataClaim, DataLeafRelease, SharedAliasTicket, bind_root_charge,
+    CowFrameKind, CowMappingClaim, DataClaim, DataLeafRelease, SHARED_ALIAS_RUN_MAX,
+    SharedAliasMode, SharedAliasRequest, SharedAliasRunError, SharedAliasTicket, bind_root_charge,
     claim_cow_replacement, cancel_cow_replacement,
     claim_private_file_cache_frame, release_private_file_cache_frame,
     root_admits, cancel_cow_mapping,
     cancel_data_leaf, cancel_lazy_table_record, cancel_private_file_data_leaf, cancel_shared_alias,
+    cancel_shared_alias_run,
     TableClaim, claim_data_leaf, claim_lazy_table_record, claim_private_file_data_leaf, commit_cow_mapping,
     data_leaf_count, data_leaf_cow_identity, data_leaf_is_owned, lazy_table_record_count,
     lazy_table_record_is_owned, pop_lazy_table_record, prepare_shared_alias,
+    prepare_shared_alias_run,
     promote_cow_mapping_in_place, publish_data_leaf, publish_lazy_table_record,
-    publish_private_file_data_leaf, publish_shared_alias, register_data_leaf_root,
+    publish_private_file_data_leaf, publish_shared_alias, publish_shared_alias_run,
+    register_data_leaf_root,
     register_lazy_table_root, rekey_data_leaf, release_data_leaf, rollback_shared_alias, try_claim_cow_mapping,
     unregister_data_leaf_root,
 };

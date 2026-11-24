@@ -157,9 +157,16 @@ pub enum LockClass {
     TaskWaitEpoch = 58, // per-slot payload/arm arbitration; no frame/queue/hardware work
     /// Per-CPU physical-frame magazine: one slot at a time, before `PhysicalAllocator`.
     PhysicalFrameCache = 59,
-    /// Kernel-local fd object state (pipe, eventfd) and the readiness registry:
+    /// Kernel-local fd object state (pipe, eventfd, unix socket) and the readiness registry:
     /// bounded, allocation-free leaves; never nested, no user copy or wake.
     LocalFdObject = 60,
+    /// Global AF_UNIX socket bind namespace (abstract and filesystem-inode keys):
+    /// leaf lock; never held across vfsd IPC, user copy, `LocalFdObject`, or wakes.
+    UnixSocketNamespace = 61,
+    /// Kernel-local epoll interest, report, and reverse-index registry:
+    /// never acquired while holding `LocalFdObject` or `ProcessState`, and
+    /// never calls `wake_local_fd_object` or provider IPC while held.
+    KernelEpollRegistry = 62,
 }
 #[cfg(rustos_boot_image)]
 #[derive(Clone, Copy)]

@@ -2,6 +2,7 @@ use super::session_accounting::SessionLedger;
 use super::provider_billing::ProviderBilling;
 use super::service_health::HealthBook;
 use super::service_updates::UpdateBook;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use rustos_user_abi::syscall::{
     ServiceCheckpointRecordWire, SERVICE_CHECKPOINT_ABI_VERSION, SERVICE_CHECKPOINT_FLAG_TOMBSTONE,
@@ -16,7 +17,7 @@ const ESTALE: i32 = 116;
 
 /// No one service can consume the entire rootd checkpoint ledger.
 /// The global ABI limit remains unchanged for compatibility.
-const MAX_RECORDS_PER_SERVICE: usize = 4_096;
+const MAX_RECORDS_PER_SERVICE: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StoredRecord {
@@ -29,6 +30,12 @@ struct StoredRecord {
 /// crash-consistency rules; record contents remain owned by the service.
 pub(crate) struct ServiceCheckpointStore {
     records: Vec<StoredRecord>,
+    /// Index from `(service_id, key_hi, key_lo)` to index in `records`.
+    /// Maintained on every insert and rebuilt on compaction so `find`,
+    /// `find_key`, and `descendant_mask` avoid O(n) linear scans.
+    key_index: BTreeMap<(u64, u64, u64), usize>,
+    /// Per-service record counts, matching `records.iter().filter(|r| r.service_id == id).count()`.
+    service_counts: BTreeMap<u64, usize>,
     /// Supervisor control state: session accounts are independent of the
     /// checkpoint records but share rootd's one serialized service loop.
     pub(crate) sessions: SessionLedger,
@@ -40,7 +47,26 @@ pub(crate) struct ServiceCheckpointStore {
     pub(crate) personality: super::personality_policy::PersonalityPolicy,
 }
 
-struct MutatePlan {
+/// Result of a fully committed `mutate_batch`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BatchCommit {
+    pub(crate) applied: usize,
+    pub(crate) duplicates: usize,
+}
+
+/// A batch stopped at record index `applied`; records before it are committed.
+/// `after_journal` means the failing record was already journaled but could not
+/// be applied: the journal and the DAG diverge and the supervisor must fail
+/// closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BatchFailure {
+    pub(crate) errno: i32,
+    pub(crate) after_journal: bool,
+    pub(crate) applied: usize,
+    pub(crate) duplicates: usize,
+}
+
+pub(crate) struct MutatePlan {
     existing_index: Option<usize>,
     descendants: Option<Vec<bool>>,
     duplicate: bool,
@@ -53,6 +79,8 @@ impl ServiceCheckpointStore {
         // Allocate incrementally on successful admission instead.
         Self {
             records: Vec::new(),
+            key_index: BTreeMap::new(),
+            service_counts: BTreeMap::new(),
             sessions: SessionLedger::new(),
             providers: ProviderBilling::new(),
             health: HealthBook::new(),
@@ -71,12 +99,75 @@ impl ServiceCheckpointStore {
         &mut self,
         service_id: u64,
         record: ServiceCheckpointRecordWire,
-    ) -> Result<(), i32> {
+    ) -> Result<MutatePlan, i32> {
         let plan = self.plan_mutate(service_id, record)?;
         if !plan.duplicate && plan.existing_index.is_none() {
             self.records.try_reserve(1).map_err(|_| ENOMEM)?;
         }
-        Ok(())
+        Ok(plan)
+    }
+
+    /// Ordered batch of `mutate` records with *committed-prefix* semantics.
+    ///
+    /// Each record is planned against the DAG as left by its predecessors,
+    /// handed to `journal` (the durable-within-boot commit point; it must not
+    /// touch this store) and only then applied. This is exactly the sequence
+    /// of N single-record mutations, so journal order, per-record preflight and
+    /// DAG validation are unchanged. The first failing record stops the batch;
+    /// everything before it stays committed and nothing after it is touched.
+    pub(crate) fn mutate_batch(
+        &mut self,
+        service_id: u64,
+        records: &[ServiceCheckpointRecordWire],
+        mut journal: impl FnMut(ServiceCheckpointRecordWire) -> Result<(), i32>,
+    ) -> Result<BatchCommit, BatchFailure> {
+        let mut commit = BatchCommit { applied: 0, duplicates: 0 };
+        for (position, &record) in records.iter().enumerate() {
+            let fail = |errno, after_journal, commit: &BatchCommit| BatchFailure {
+                errno,
+                after_journal,
+                applied: commit.applied,
+                duplicates: commit.duplicates,
+            };
+            let plan = match self.preflight_mutate(service_id, record) {
+                Ok(plan) => plan,
+                // Replay of an already-committed batch whose reply was lost:
+                // an earlier revision of a key that a *later record of this
+                // same batch* already holds verbatim (OPEN's staging record
+                // is superseded by its final record) is history the store has
+                // provably passed. Skip it; it is not journaled again. Any
+                // other staleness stays a hard refusal.
+                Err(ESTALE) if self.superseded_by_committed(service_id, record, &records[position + 1..]) => {
+                    commit.applied += 1;
+                    commit.duplicates += 1;
+                    continue;
+                }
+                Err(errno) => return Err(fail(errno, false, &commit)),
+            };
+            journal(record).map_err(|errno| fail(errno, false, &commit))?;
+            let duplicate = self
+                .apply_plan(service_id, record, plan)
+                .map_err(|errno| fail(errno, true, &commit))?;
+            commit.applied += 1;
+            commit.duplicates += usize::from(duplicate);
+        }
+        Ok(commit)
+    }
+
+    fn superseded_by_committed(
+        &self,
+        service_id: u64,
+        record: ServiceCheckpointRecordWire,
+        later: &[ServiceCheckpointRecordWire],
+    ) -> bool {
+        later.iter().any(|next| {
+            (next.parent_hi, next.parent_lo, next.key_hi, next.key_lo)
+                == (record.parent_hi, record.parent_lo, record.key_hi, record.key_lo)
+                && next.revision > record.revision
+                && self
+                    .find(service_id, next.parent_hi, next.parent_lo, next.key_hi, next.key_lo)
+                    .is_some_and(|index| self.records[index].wire == *next)
+        })
     }
 
     pub(crate) fn preflight_compact(
@@ -93,6 +184,16 @@ impl ServiceCheckpointStore {
         incoming: ServiceCheckpointRecordWire,
     ) -> Result<bool, i32> {
         let plan = self.plan_mutate(service_id, incoming)?;
+        self.apply_plan(service_id, incoming, plan)
+    }
+
+    /// Commit a plan produced by `plan_mutate` for the same, unchanged store.
+    fn apply_plan(
+        &mut self,
+        service_id: u64,
+        incoming: ServiceCheckpointRecordWire,
+        plan: MutatePlan,
+    ) -> Result<bool, i32> {
         if plan.duplicate {
             return Ok(true);
         }
@@ -103,10 +204,14 @@ impl ServiceCheckpointStore {
                 // Reserve before changing any state (including dependent
                 // tombstones); OOM must not partially publish a checkpoint.
                 self.records.try_reserve(1).map_err(|_| ENOMEM)?;
+                let new_index = self.records.len();
                 self.records.push(StoredRecord {
                     service_id,
                     wire: incoming,
                 });
+                self.key_index
+                    .insert((service_id, incoming.key_hi, incoming.key_lo), new_index);
+                *self.service_counts.entry(service_id).or_insert(0) += 1;
             }
         }
 
@@ -171,11 +276,7 @@ impl ServiceCheckpointStore {
                 return Err(ESTALE);
             }
             if self.records.len() >= SERVICE_CHECKPOINT_MAX_RECORDS
-                || self
-                    .records
-                    .iter()
-                    .filter(|record| record.service_id == service_id)
-                    .count()
+                || self.service_counts.get(&service_id).copied().unwrap_or(0)
                     >= MAX_RECORDS_PER_SERVICE
             {
                 return Err(ENOSPC);
@@ -259,7 +360,20 @@ impl ServiceCheckpointStore {
             cursor += 1;
             keep
         });
+        self.rebuild_indices();
         Ok(false)
+    }
+
+    fn rebuild_indices(&mut self) {
+        self.key_index.clear();
+        self.service_counts.clear();
+        for (index, record) in self.records.iter().enumerate() {
+            self.key_index.insert(
+                (record.service_id, record.wire.key_hi, record.wire.key_lo),
+                index,
+            );
+            *self.service_counts.entry(record.service_id).or_insert(0) += 1;
+        }
     }
 
     /// Read-only validation of one compaction. `None` means the key is
@@ -293,16 +407,12 @@ impl ServiceCheckpointStore {
     /// Unique key lookup. Parent is deliberately *not* part of identity.
     /// Parent links never cross a service namespace.
     fn find_key(&self, service_id: u64, key_hi: u64, key_lo: u64) -> Option<usize> {
-        self.records.iter().position(|record| {
-            record.service_id == service_id
-                && record.wire.key_hi == key_hi
-                && record.wire.key_lo == key_lo
-        })
+        self.key_index.get(&(service_id, key_hi, key_lo)).copied()
     }
 
-    /// A bounded ancestry walk, without recursion, heap allocation or a
-    /// kernel call. The caller uses it only for slow checkpoint mutation and
-    /// compaction, never for IPC transport or scheduler hot paths.
+    /// A bounded ancestry walk, without recursion or a kernel call. The caller
+    /// uses it only for slow checkpoint mutation and compaction, never for IPC
+    /// transport or scheduler hot paths.
     /// Parent-before-child insertion is the index invariant. This one-pass
     /// closure is bounded by service checkpoint count; unlike repeated
     /// ancestry searches it cannot explode with pathological tree depth.
@@ -313,22 +423,6 @@ impl ServiceCheckpointStore {
         descendants
             .try_reserve_exact(self.records.len())
             .map_err(|_| ENOMEM)?;
-        // Keys are unique within a service, so a key-sorted index of this
-        // service's records answers each parent lookup in O(log n) instead of
-        // a full-ledger scan per record (quadratic stall of the single-threaded
-        // supervisor). It is reserved fallibly before any state changes.
-        let key_of = |index: usize| {
-            let wire = &self.records[index].wire;
-            (wire.key_hi, wire.key_lo)
-        };
-        let mut by_key = Vec::new();
-        by_key
-            .try_reserve_exact(self.records.len())
-            .map_err(|_| ENOMEM)?;
-        by_key.extend(
-            (0..self.records.len()).filter(|&index| self.records[index].service_id == service_id),
-        );
-        by_key.sort_unstable_by_key(|&index| key_of(index));
         for (index, record) in self.records.iter().enumerate() {
             if record.service_id != service_id {
                 descendants.push(false);
@@ -340,10 +434,11 @@ impl ServiceCheckpointStore {
             } else if parent == ancestor_key {
                 true
             } else {
-                let parent_index = by_key
-                    .binary_search_by_key(&parent, |&candidate| key_of(candidate))
-                    .map(|slot| by_key[slot])
-                    .map_err(|_| ESTALE)?;
+                let parent_index = self
+                    .key_index
+                    .get(&(service_id, parent.0, parent.1))
+                    .copied()
+                    .ok_or(ESTALE)?;
                 if parent_index >= index {
                     return Err(EPROTO);
                 }
@@ -362,13 +457,9 @@ impl ServiceCheckpointStore {
         key_hi: u64,
         key_lo: u64,
     ) -> Option<usize> {
-        self.records.iter().position(|record| {
-            record.service_id == service_id
-                && record.wire.parent_hi == parent_hi
-                && record.wire.parent_lo == parent_lo
-                && record.wire.key_hi == key_hi
-                && record.wire.key_lo == key_lo
-        })
+        let index = self.find_key(service_id, key_hi, key_lo)?;
+        let wire = &self.records[index].wire;
+        (wire.parent_hi == parent_hi && wire.parent_lo == parent_lo).then_some(index)
     }
 }
 
@@ -652,17 +743,17 @@ mod tests {
         let root = record((1, 1), (0, 0), 1, 10);
         let child = record((2, 2), (1, 1), 1, 11);
         // Accepted dry-runs change nothing.
-        assert_eq!(store.preflight_mutate(3, root), Ok(()));
+        assert!(store.preflight_mutate(3, root).is_ok());
         assert!(store.scan(3, 0, 8).unwrap().0.is_empty());
         store.mutate(3, root).unwrap();
         // A child of an absent parent is refused by both phases.
-        assert_eq!(store.preflight_mutate(3, child.clone()), Ok(()));
+        assert!(store.preflight_mutate(3, child.clone()).is_ok());
         let orphan = record((9, 9), (8, 8), 1, 12);
-        assert_eq!(store.preflight_mutate(3, orphan), Err(ESTALE));
+        assert_eq!(store.preflight_mutate(3, orphan).err(), Some(ESTALE));
         assert_eq!(store.mutate(3, orphan), Err(ESTALE));
         store.mutate(3, child).unwrap();
         // Exact replay is accepted (idempotent) by the dry-run too.
-        assert_eq!(store.preflight_mutate(3, child), Ok(()));
+        assert!(store.preflight_mutate(3, child).is_ok());
         // Tombstone dry-run does not touch descendants.
         let mut tomb = root;
         tomb.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
@@ -670,7 +761,7 @@ mod tests {
         tomb.value.fill(0);
         tomb.operation_lo = 20;
         tomb.revision = 2;
-        assert_eq!(store.preflight_mutate(3, tomb), Ok(()));
+        assert!(store.preflight_mutate(3, tomb).is_ok());
         assert_eq!(store.scan(3, 0, 8).unwrap().0, vec![root, child]);
         assert_eq!(store.preflight_compact(3, tomb), Err(ESTALE));
         store.mutate(3, tomb).unwrap();
@@ -678,5 +769,109 @@ mod tests {
         assert_eq!(store.scan(3, 0, 8).unwrap().0.len(), 2);
         assert_eq!(store.compact(3, tomb), Ok(false));
         assert!(store.scan(3, 0, 8).unwrap().0.is_empty());
+    }
+
+    fn open_shape() -> Vec<ServiceCheckpointRecordWire> {
+        // staging parent, two path children, final revision of the parent.
+        vec![
+            record((1, 1), (0, 0), 1, 10),
+            record((1, 2), (1, 1), 1, 11),
+            record((1, 3), (1, 1), 1, 12),
+            record((1, 1), (0, 0), 2, 13),
+        ]
+    }
+
+    #[test]
+    fn batch_commits_in_order_through_one_journal_stream() {
+        let mut store = ServiceCheckpointStore::new();
+        let batch = open_shape();
+        let mut journal = Vec::new();
+        let commit = store
+            .mutate_batch(3, &batch, |record| {
+                journal.push(record);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(commit, BatchCommit { applied: 4, duplicates: 0 });
+        // Journal order is exactly the request order, so replay is identical
+        // to four single MUTATE calls.
+        assert_eq!(journal, batch);
+        let stored = store.scan(3, 0, 8).unwrap().0;
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored[0], batch[3]);
+    }
+
+    #[test]
+    fn batch_failure_keeps_the_committed_prefix_and_touches_nothing_after() {
+        let mut store = ServiceCheckpointStore::new();
+        let mut batch = open_shape();
+        batch[2] = record((1, 3), (7, 7), 1, 12); // child of an absent parent
+        let mut journal = Vec::new();
+        let failure = store
+            .mutate_batch(3, &batch, |record| {
+                journal.push(record);
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(
+            failure,
+            BatchFailure { errno: ESTALE, after_journal: false, applied: 2, duplicates: 0 }
+        );
+        assert_eq!(journal, batch[..2].to_vec());
+        assert_eq!(store.scan(3, 0, 8).unwrap().0, batch[..2].to_vec());
+    }
+
+    #[test]
+    fn batch_journal_refusal_does_not_apply_that_record() {
+        let mut store = ServiceCheckpointStore::new();
+        let batch = open_shape();
+        let mut calls = 0;
+        let failure = store
+            .mutate_batch(3, &batch, |_| {
+                calls += 1;
+                if calls == 2 { Err(ENOSPC) } else { Ok(()) }
+            })
+            .unwrap_err();
+        assert_eq!(failure.errno, ENOSPC);
+        assert_eq!((failure.applied, failure.after_journal), (1, false));
+        assert_eq!(store.scan(3, 0, 8).unwrap().0, batch[..1].to_vec());
+    }
+
+    #[test]
+    fn replayed_batch_after_lost_reply_is_idempotent_and_not_rejournaled() {
+        let mut store = ServiceCheckpointStore::new();
+        let batch = open_shape();
+        store.mutate_batch(3, &batch, |_| Ok(())).unwrap();
+        let mut journal = Vec::new();
+        let commit = store
+            .mutate_batch(3, &batch, |record| {
+                journal.push(record);
+                Ok(())
+            })
+            .unwrap();
+        // Staging (rev 1) is superseded by the final record the store already
+        // holds verbatim; the rest are exact duplicates.
+        assert_eq!(commit, BatchCommit { applied: 4, duplicates: 4 });
+        assert_eq!(journal.len(), 3); // exact duplicates are still journaled, as for single MUTATE
+        assert_eq!(store.scan(3, 0, 8).unwrap().0.len(), 3);
+    }
+
+    #[test]
+    fn superseded_revision_is_not_accepted_without_a_committed_later_record() {
+        let mut store = ServiceCheckpointStore::new();
+        let batch = open_shape();
+        store.mutate_batch(3, &batch, |_| Ok(())).unwrap();
+        // A stale rev-1 record alone (no later committed record in the batch)
+        // remains a hard refusal.
+        let stale = [batch[0]];
+        let failure = store.mutate_batch(3, &stale, |_| Ok(())).unwrap_err();
+        assert_eq!((failure.errno, failure.applied), (ESTALE, 0));
+        // A "later" record that is not what the store holds does not excuse it.
+        let mut forged = batch[3];
+        forged.operation_lo = 99;
+        let failure = store
+            .mutate_batch(3, &[batch[0], forged], |_| Ok(()))
+            .unwrap_err();
+        assert_eq!((failure.errno, failure.applied), (ESTALE, 0));
     }
 }

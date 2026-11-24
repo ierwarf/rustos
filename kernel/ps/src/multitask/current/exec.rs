@@ -332,6 +332,17 @@ pub fn exec_user_process_by_pid_checked(
         );
     }
     complete_retirement_side_effects();
+    // A peer target (`execve` served through procd/loaderd) was blocked in the
+    // IPC wait for procd's reply when the image was replaced. Publishing the
+    // image clears that wait, so procd's later reply wake finds no wait
+    // instance (`ipc-terminal-wake-not-waiting`) and the new image would stay
+    // Blocked until the call's 5 s boot-control deadline expired. The committer
+    // is the only party that knows the image is now runnable, so it wakes the
+    // target exactly once after finalization. A self exec never gets here: its
+    // thread is the caller and keeps running.
+    if cpu_local::current_cpu_task_slot() != Some(slot) {
+        let _ = super::ipc::wake_task(process_id);
+    }
     Ok(closed)
 }
 
@@ -349,5 +360,159 @@ fn cancel_intent(intent: super::super::current_identity::exec_intent::Intent) {
             super::super::request_user_return_reschedule();
         }
         complete_retirement_side_effects();
+    }
+}
+
+#[cfg(test)]
+mod peer_exec_tests {
+    use super::*;
+    use crate::memory::paging::{ProcessAddressSpace, USER_SPACE_BASE};
+    use crate::multitask::{
+        UserTaskBootstrap, process_placement::exec_membership::ExecMembership, process_table,
+        scheduler::{root_creation, wake_publication},
+    };
+    use crate::user::abi::UserAbi;
+    use crate::user::linux::{
+        LinuxMemoryMapState, LinuxProcessState, LinuxRuntimeProfile, LinuxThreadState,
+    };
+
+    fn user_bootstrap(path: &str, entry_offset: u64, stack_offset: u64) -> UserTaskBootstrap {
+        let mut bootstrap = root_creation::tests::bootstrap(UserAbi::Linux);
+        bootstrap.entry = x86_64::VirtAddr::new(USER_SPACE_BASE + entry_offset);
+        bootstrap.stack_pointer = x86_64::VirtAddr::new(USER_SPACE_BASE + stack_offset);
+        bootstrap.linux_process_state = Some(LinuxProcessState::default());
+        bootstrap.linux_memory_map = Some(LinuxMemoryMapState::new());
+        bootstrap.linux_runtime_profile = Some(LinuxRuntimeProfile::new());
+        bootstrap.linux_thread_state = Some(LinuxThreadState::default());
+        bootstrap.set_exec_path(path);
+        bootstrap
+    }
+
+    #[test]
+    fn peer_exec_refuses_incomplete_bootstrap_before_claiming_target() {
+        let mut incomplete = user_bootstrap("/incomplete.elf", 0x40_0000, 0x70_0000);
+        incomplete.linux_memory_map = None;
+        assert!(matches!(
+            exec_user_process_by_pid_checked(
+                132_400,
+                132_400,
+                ProcessAddressSpace::modeled_root_for_host(0x5000),
+                incomplete,
+            ),
+            Err(ExecRefusal::IncompleteBootstrap)
+        ));
+    }
+
+    #[test]
+    fn peer_exec_completes_through_real_root_and_wakes_noncurrent_target() {
+        const PEER_ID: u64 = 132_401;
+        let initial = user_bootstrap("/old-peer.elf", 0x40_0000, 0x70_0000);
+        root_creation::tests::exec_root(PEER_ID, false, initial, |expected_slot, _handle| {
+            assert_ne!(cpu_local::current_cpu_task_slot(), Some(expected_slot));
+            let (slot, handle) = exec_transaction::peer_exec_candidate(PEER_ID, PEER_ID)
+                .expect("peer Linux process must be a valid exec candidate");
+            assert_eq!(slot, expected_slot);
+
+            let exec_reservation = process_table::begin_exec(handle).unwrap();
+            let (intent, current) = exec_transaction::claim_exec_candidate(
+                Some((slot, PEER_ID, PEER_ID)),
+                exec_reservation,
+                true,
+            )
+            .unwrap();
+            assert!(!current);
+            let census = ExecMembership::begin(&intent).unwrap();
+            assert_eq!(exec_transaction::quiescence::retry(&intent, &census), Some(true));
+            assert!(process_table::authorize_exec(exec_reservation));
+
+            let mut replacement = user_bootstrap("/new-peer.elf", 0x44_0000, 0x78_0000);
+            replacement.registers.rax = 0x5150;
+            let linux_process_state = replacement.linux_process_state.take().unwrap();
+            let linux_memory_map = replacement.linux_memory_map.take().unwrap();
+            let linux_runtime_profile = replacement.linux_runtime_profile.take().unwrap();
+            let new_root = 0x6000;
+            let replacement_mm = ProcessAddressSpace::modeled_root_for_host(new_root);
+
+            let finalized = exec_transaction::with_census_image(
+                &intent,
+                &census,
+                exec_reservation,
+                new_root,
+                current,
+                |lease| {
+                    let staged = process_table::stage_exec_state_checked(
+                        exec_reservation,
+                        replacement_mm,
+                        linux_process_state,
+                        linux_memory_map,
+                        linux_runtime_profile,
+                        replacement.exec_path(),
+                    )
+                    .unwrap();
+                    census.mark_staged();
+                    lease.bind_staged_mm(&staged);
+                    let published = lease
+                        .commit_image(&mut replacement, Some((PEER_ID, PEER_ID)))
+                        .unwrap();
+                    Some(process_table::finalize_exec_state(staged, published))
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+            census.finish(&finalized);
+            let (_pid, exit_pending, closed, old_state) = finalized.into_parts();
+            assert!(!exit_pending);
+            assert!(closed.is_empty());
+            old_state.retire_execution_state();
+            kernel_mm::api::address_space::drain_retired_address_spaces(16);
+
+            // Production `exec_user_process_by_pid_checked` calls `super::ipc::wake_task(PEER_ID)`
+            // here when `current_cpu_task_slot() != Some(slot)`; native host tests have no HAL
+            // topology published for `online_affinity_mask`, so exercise the underlying
+            // `wake_publication::wake` with a modeled single-CPU mask (`&|_| 1`).
+            let mut scope = nucleus_core::util::lockdep::DispatchPreemption::enter_model(0);
+            scope.mask_irqs();
+            assert!(wake_publication::wake(&scope, PEER_ID, &|_| 1));
+            drop(scope);
+
+            assert_eq!(exec_transaction::peer_exec_candidate(PEER_ID, PEER_ID), Some((slot, handle)));
+            let exec_path = process_table::retain_process(handle)
+                .unwrap()
+                .with_state_mut(|_, state| alloc::string::String::from(state.exec_path()));
+            assert_eq!(exec_path.as_str(), "/new-peer.elf");
+        });
+    }
+
+    #[test]
+    fn peer_exec_wakes_noncurrent_target_only_after_finalization() {
+        let source = include_str!("exec.rs");
+        let peer_fn = source
+            .split("pub fn exec_user_process_by_pid_checked(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn cancel_intent(").next())
+            .expect("exec_user_process_by_pid_checked source must exist");
+        let commit_pos = peer_fn
+            .find("commit_image(")
+            .expect("peer exec must commit image");
+        let finalize_pos = peer_fn
+            .find("finalize_exec_state(")
+            .expect("peer exec must finalize staged state");
+        let census_finish_pos = peer_fn
+            .find("census.finish(&finalized)")
+            .expect("peer exec must finish census before waking");
+        let guard_pos = peer_fn
+            .find("if cpu_local::current_cpu_task_slot() != Some(slot)")
+            .expect("peer exec must guard target wake against current slot");
+        let wake_pos = peer_fn[guard_pos..]
+            .find("super::ipc::wake_task(process_id)")
+            .map(|offset| guard_pos + offset)
+            .expect("peer exec must wake IPC-blocked target by process_id");
+        assert!(
+            commit_pos < finalize_pos
+                && finalize_pos < census_finish_pos
+                && census_finish_pos < guard_pos
+                && guard_pos < wake_pos
+        );
     }
 }

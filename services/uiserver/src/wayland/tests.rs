@@ -477,9 +477,14 @@ fn shm_pool_admission_refuses_fds_whose_read_can_block_the_compositor() {
     for end in ends {
         let error = super::shm::validate_shm_extent(end, 4096).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        let direct_error = super::shm::require_regular_file(end).unwrap_err();
+        assert_eq!(direct_error.raw_os_error(), Some(libc::EINVAL));
         // SAFETY: both fds were created above and are closed exactly once.
         unsafe { libc::close(end) };
     }
+    let dir = std::fs::File::open(".").expect("open current directory");
+    let dir_error = super::shm::validate_shm_extent(dir.as_raw_fd(), 1).unwrap_err();
+    assert_eq!(dir_error.raw_os_error(), Some(libc::EINVAL));
 }
 
 #[test]
@@ -910,8 +915,9 @@ fn decoration_preference_is_configured_then_acknowledged_and_committed() {
         surface.surface_id
     };
     state.pointer_target = Some(surface_id);
+    let client_top = (100 + crate::layout::window_title_height() + crate::layout::window_border() + 1) as u32;
     state.pointer_x = 110;
-    state.pointer_y = 138;
+    state.pointer_y = client_top;
     assert!(state.pointer_button(1, true));
     let grab_serial = state.pointer_grab_serial.unwrap();
     wire::send(
@@ -920,7 +926,7 @@ fn decoration_preference_is_configured_then_acknowledged_and_committed() {
     );
     pump(&mut display, &mut state);
     assert!(state.moving_surface.is_some());
-    state.pointer_motion(210, 238);
+    state.pointer_motion(210, client_top + 100);
     assert!(state.surfaces[0].shared.lock().unwrap().frame.x > 100);
     assert!(state.pointer_button(1, false));
     wire::send(&mut peer, &wire::message(5, 1, &wire::u32s(&[11, 8])));
@@ -1408,7 +1414,14 @@ fn viewport_only_commit_never_rereads_released_shm() {
     wire::send(&mut peer, &wire::message(4, 6, &[]));
     pump(&mut display, &mut state);
     let surface = state.surfaces[0].shared.lock().unwrap();
-    assert_eq!(surface.pixels.as_ref(), &[0xff06_0504]);
+    if state.output_scale == 2 {
+        assert_eq!(
+            surface.pixels.as_ref(),
+            &[0xff03_0201, 0xff06_0504, 0xff03_0201, 0xff06_0504]
+        );
+    } else {
+        assert_eq!(surface.pixels.as_ref(), &[0xff06_0504]);
+    }
     assert_eq!(
         surface.original_pixels.as_ref(),
         &[0xff03_0201, 0xff06_0504]
@@ -1674,11 +1687,12 @@ fn undamaged_replacement_uses_original_buffer_dimensions_for_viewport() {
     wire::send(&mut peer, &wire::message(6, 6, &[]));
     pump(&mut display, &mut state);
     wait_for_snapshot(&mut state);
+    let scale = state.output_scale.max(1) as usize;
     let surface = state.surfaces[0].shared.lock().unwrap();
     assert_eq!((surface.original_width, surface.original_height), (4, 4));
     assert_eq!(surface.original_pixels.len(), 16);
-    assert_eq!((surface.width, surface.height), (2, 2));
-    assert_eq!(surface.pixels.as_ref(), &[0xff22_2222; 4]);
+    assert_eq!((surface.width, surface.height), (2 * scale, 2 * scale));
+    assert_eq!(surface.pixels.as_ref(), &vec![0xff22_2222; 4 * scale * scale][..]);
 }
 
 #[test]
@@ -1755,8 +1769,9 @@ fn xdg_ack_survives_later_decoration_configure_and_duplicate_is_error() {
     let events = wire::events(&mut peer);
     assert!(!events.iter().any(|(obj, op, _)| *obj == 1 && *op == 0));
     assert!(events.iter().any(|(obj, op, _)| *obj == 12 && *op == 0));
+    let scale = state.output_scale.max(1) as usize;
     let surface = state.surfaces[0].shared.lock().unwrap();
-    assert_eq!((surface.width, surface.height), (2, 2));
+    assert_eq!((surface.width, surface.height), (2 * scale, 2 * scale));
     assert!(!surface.decoration_server);
     drop(surface);
     wire::send(&mut peer, &wire::message(8, 4, &wire::u32s(&[serial])));
@@ -2074,4 +2089,129 @@ fn compositor_and_clients_agree_on_the_runtime_dir_by_construction() {
     assert_eq!(super::runtime_dir_from(None, uid), advertised);
     assert_eq!(super::runtime_dir_from(Some(advertised.clone()), uid), advertised);
     assert_eq!(super::runtime_dir_from(Some(String::from("relative")), uid), advertised);
+}
+
+#[test]
+fn surface_damage_scales_by_buffer_scale_while_damage_buffer_stays_in_buffer_pixels() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+
+    let mut display = test_display();
+    super::create_wayland_globals(&display.handle());
+    let mut state = super::WaylandState::new(1440, 900);
+    state.set_output_scale(2);
+    let (server, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server, Arc::new(super::WaylandClientState::default()))
+        .unwrap();
+    wire::send(&mut peer, &wire::message(1, 1, &wire::u32s(&[2])));
+    pump(&mut display, &mut state);
+    let mut names = std::collections::HashMap::new();
+    for (obj, op, p) in wire::events(&mut peer) {
+        if obj == 2 && op == 0 {
+            let len = u32::from_ne_bytes(p[4..8].try_into().unwrap()) as usize;
+            names.insert(
+                String::from_utf8(p[8..8 + len - 1].to_vec()).unwrap(),
+                u32::from_ne_bytes(p[..4].try_into().unwrap()),
+            );
+        }
+    }
+    for (iface, ver, id) in [
+        ("wl_compositor", 6, 3),
+        ("wl_shm", 1, 4),
+        ("xdg_wm_base", 6, 5),
+    ] {
+        let mut args = wire::u32s(&[names[iface]]);
+        args.extend(wire::string(iface));
+        args.extend(wire::u32s(&[ver, id]));
+        wire::send(&mut peer, &wire::message(2, 0, &args));
+    }
+    wire::send(&mut peer, &wire::message(3, 0, &wire::u32s(&[6])));
+    wire::send(&mut peer, &wire::message(5, 2, &wire::u32s(&[7, 6])));
+    wire::send(&mut peer, &wire::message(7, 1, &wire::u32s(&[8])));
+    pump(&mut display, &mut state);
+    let serial = wire::events(&mut peer)
+        .iter()
+        .find(|(obj, op, _)| *obj == 7 && *op == 0)
+        .map(|(_, _, p)| u32::from_ne_bytes(p[..4].try_into().unwrap()))
+        .expect("initial configure");
+    wire::send(&mut peer, &wire::message(7, 4, &wire::u32s(&[serial])));
+
+    // 16x16 ARGB8888 buffer at buffer_scale = 2 matches output_scale = 2 (8x8 logical).
+    let buf_w = 16_usize;
+    let buf_h = 16_usize;
+    let stride = buf_w * 4;
+    let pool_bytes = vec![0x11_u8; stride * buf_h];
+    let file = shm_file(&pool_bytes);
+    wire::send_fd(
+        &peer,
+        &wire::message(4, 0, &wire::u32s(&[9, (stride * buf_h) as u32])),
+        file.as_raw_fd(),
+    );
+    wire::send(
+        &mut peer,
+        &wire::message(
+            9,
+            0,
+            &wire::u32s(&[10, 0, buf_w as u32, buf_h as u32, stride as u32, 0]),
+        ),
+    );
+    wire::send(&mut peer, &wire::message(6, 8, &wire::u32s(&[2])));
+    wire::send(&mut peer, &wire::message(6, 1, &wire::u32s(&[10, 0, 0])));
+    wire::send(&mut peer, &wire::message(6, 6, &[]));
+    pump(&mut display, &mut state);
+    wait_for_snapshot(&mut state);
+
+    // Paint physical pixel (6, 4) -> logical (3, 2), and submit logical wl_surface.damage(3, 2, 2, 1).
+    let mut blue = [0_u8; 4];
+    blue.copy_from_slice(&0xff22_4488_u32.to_ne_bytes());
+    for y in 4..6 {
+        for x in 6..10 {
+            file.write_all_at(&blue, (y * stride + x * 4) as u64).unwrap();
+        }
+    }
+    wire::send(&mut peer, &wire::message(6, 1, &wire::u32s(&[10, 0, 0])));
+    wire::send(&mut peer, &wire::message(6, 2, &wire::u32s(&[3, 2, 2, 1])));
+    wire::send(&mut peer, &wire::message(6, 6, &[]));
+    pump(&mut display, &mut state);
+    wait_for_snapshot(&mut state);
+
+    {
+        let surf = state.surfaces[0].shared.lock().unwrap();
+        assert_eq!(
+            surf.last_damage,
+            Rect {
+                x: 6,
+                y: 4,
+                width: 4,
+                height: 2,
+            },
+            "wl_surface.damage must scale logical coords by buffer_scale=2"
+        );
+        assert_eq!(surf.pixels[4 * buf_w + 6], 0xff22_4488);
+    }
+
+    // Now paint buffer pixel (1, 1) and submit wl_surface.damage_buffer(1, 1, 1, 1).
+    let mut green = [0_u8; 4];
+    green.copy_from_slice(&0xff11_aa33_u32.to_ne_bytes());
+    file.write_all_at(&green, (stride + 4) as u64).unwrap();
+    wire::send(&mut peer, &wire::message(6, 1, &wire::u32s(&[10, 0, 0])));
+    wire::send(&mut peer, &wire::message(6, 9, &wire::u32s(&[1, 1, 1, 1])));
+    wire::send(&mut peer, &wire::message(6, 6, &[]));
+    pump(&mut display, &mut state);
+    wait_for_snapshot(&mut state);
+
+    let surf = state.surfaces[0].shared.lock().unwrap();
+    assert_eq!(
+        surf.last_damage,
+        Rect {
+            x: 1,
+            y: 1,
+            width: 1,
+            height: 1,
+        },
+        "wl_surface.damage_buffer must remain in unscaled buffer pixels"
+    );
+    assert_eq!(surf.pixels[buf_w + 1], 0xff11_aa33);
 }

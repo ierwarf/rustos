@@ -76,6 +76,9 @@ pub(super) fn load_launch_catalog_into_state(state: &mut BrokerState) -> bool {
     state.programs = programs;
     state.launch_entries = launch_entries;
     state.launch_catalog_loaded = true;
+    // The catalog is read once per boot; ending the reader thread returns its
+    // task slot to the applications.
+    state.launch_catalog_load = None;
     state.launch_catalog_retry_after = None;
     state.launch_catalog_last_error = None;
     debug_line("runtimed: launch catalog load done");
@@ -223,6 +226,8 @@ pub(super) fn reconcile_kvm_smp_qualification_into_state(state: &mut BrokerState
     let injected = candidate.len() != state.launch_entries.len();
     state.launch_entries = candidate;
     state.qualification_catalog_resolved = true;
+    // Resolved once per boot; see `launch_catalog_load` above.
+    state.qualification_load = None;
     state.qualification_catalog_retry_after = None;
     state.qualification_catalog_last_error = None;
     state.qualification_catalog_failures = 0;

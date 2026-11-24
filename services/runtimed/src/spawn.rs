@@ -1134,6 +1134,9 @@ pub(super) fn reap_children(state: &mut BrokerState) -> bool {
             }
         }
     }
+    if reaped_any {
+        super::kvm_launch_desktop::on_process_reaped(state);
+    }
     reaped_any
 }
 
@@ -1149,9 +1152,14 @@ pub(super) fn next_idle_delay(
     earliest_watch_deadline: Option<Instant>,
 ) -> Duration {
     let now = Instant::now();
+    // Only a retry that is still in the future can shorten the wait. Entries
+    // are never pruned once they lapse (a permanently failed or dependency-
+    // blocked launch keeps its old deadline), and counting a lapsed one as a
+    // zero delay turned every idle wait into the 1 ms kernel floor.
     let retry_delay = state
         .retry_after
         .values()
+        .filter(|deadline| **deadline > now)
         .map(|deadline| deadline.saturating_duration_since(now))
         .min()
         .unwrap_or(IDLE_POLL_INTERVAL);

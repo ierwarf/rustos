@@ -12,3 +12,4 @@ pub mod process_state;
 pub mod socket;
 pub mod syscall;
 pub mod sysops;
+pub mod unix_socket;

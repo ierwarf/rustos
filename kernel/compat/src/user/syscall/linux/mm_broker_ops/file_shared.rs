@@ -99,8 +99,13 @@ pub(super) fn broker_map_file_shared(args: &RustosMmBrokerArgs, t: MmTarget) -> 
     )
     .ok_or(LINUX_ESRCH)??;
 
-    let (token, object) =
-        call_remote_vfs_shared_backing(remote_id, t.pid, writable).map_err(map_vfs_errno)?;
+    let (token, object) = match call_remote_vfs_shared_backing(remote_id, t.pid, writable) {
+        Ok(pair) => pair,
+        // Immutable non-shared backings (e.g. early-system image) have no live
+        // writers; read-only MAP_SHARED safely falls back to a private copy.
+        Err(LINUX_ENODEV_ERRNO) if !writable => return super::broker_map_file_private(args, t),
+        Err(errno) => return Err(map_vfs_errno(errno)),
+    };
     let (service_pid, _epoch) =
         ipc_ops::live_service_endpoint_owner_and_epoch(rustos_user_abi::syscall::IPC_SERVICE_VFSD)
             .ok_or(LINUX_ESTALE)?;

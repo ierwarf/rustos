@@ -378,9 +378,11 @@ mod placement_tests {
         let mut occupied = Vec::new();
         for _ in 0..64 {
             let frame = place_window(2560, 1440, wayland_frame(), true, &occupied);
-            assert!(occupied
-                .iter()
-                .all(|other: &Rect| (other.x, other.y) != (frame.x, frame.y)));
+            assert!(
+                occupied
+                    .iter()
+                    .all(|other: &Rect| (other.x, other.y) != (frame.x, frame.y))
+            );
             occupied.push(frame);
         }
     }

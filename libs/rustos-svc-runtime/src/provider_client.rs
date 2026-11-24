@@ -4,7 +4,9 @@
 //! filesystem object or provider-session bookkeeping mutex may be held over
 //! the synchronous rootd call. It must not run from a kernel hot path.
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU64,Ordering};
 use rustos_component_model::provider_wire::{self, Frame, Operation, Phase};
 // Native x86_64 Linux ABI syscall numbers, also valid without optional
 // rustos-user-abi linux-compat-state feature (svc-runtime is no_std).
@@ -18,10 +20,12 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_RELEASE,
     COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CANCEL,
     COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK,
+    COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK_BATCH,
+    PROVIDER_RECEIPT_ACK_BATCH_MAX_FRAMES,
     IPC_SERVICE_ROOTD,SYS_RUSTOS_IPC_CALL_BOUNDED,
 };
 use crate::{ipc,syscall};
-const EINVAL:i32=22;const EPROTO:i32=71;
+const EINVAL:i32=22;const EPROTO:i32=71;const ETIMEDOUT:i32=110;
 
 pub const MAX_LOCAL_SESSIONS:usize=4096;
 /// Terminal receipts awaiting rootd compaction. Losing the oldest one only
@@ -234,6 +238,49 @@ impl ProviderClient {
         }
         done
     }
+    /// Up to `max` oldest terminal receipts for one batched ACK call.
+    pub fn next_ack_batch(&self,max:usize)->Vec<Frame>{
+        self.ack_outbox.values().take(max).copied().collect()
+    }
+    /// Retire the frames of `sent` whose bit is set in `retired` (bit `i` =
+    /// `sent[i]`). A clear bit, or a frame no longer queued byte-for-byte, is
+    /// left alone; a bit beyond `sent.len()` is a protocol violation and
+    /// retires nothing. Returns how many entries were removed.
+    pub fn ack_batch_done(&mut self,sent:&[Frame],retired:u64)->Result<usize,Error>{
+        if sent.len()>64||(sent.len()<64&&retired>>sent.len()!=0){
+            return Err(Error::WrongAck)
+        }
+        let mut removed=0;
+        for (i,frame) in sent.iter().enumerate(){
+            if retired>>i&1==0{continue}
+            let key=(frame.token_epoch,frame.token_nonce);
+            if self.ack_outbox.get(&key)==Some(frame){
+                self.ack_outbox.remove(&key);removed+=1;
+            }
+        }
+        Ok(removed)
+    }
+    /// Deferred, batched drain. Receipt ACKs are rootd compaction only (see
+    /// `MAX_ACK_OUTBOX`), so nothing needs them promptly: do nothing until at
+    /// least `low_water` are queued, then send full batches of `max_batch`
+    /// (one IPC each, at most `max_calls` per invocation to bound the time on
+    /// the caller's request path). A transport error or a batch that retired
+    /// nothing stops the drain and leaves every receipt queued; the next
+    /// invocation retries the same frames. Returns receipts retired.
+    pub fn flush_ack_batches(&mut self,low_water:usize,max_batch:usize,
+        max_calls:usize,mut send:impl FnMut(&[Frame])->Result<u64,i32>)->usize{
+        let max_batch=max_batch.clamp(1,PROVIDER_RECEIPT_ACK_BATCH_MAX_FRAMES);
+        let mut done=0;
+        for _ in 0..max_calls{
+            if self.ack_outbox.len()<low_water.max(1){break}
+            let batch=self.next_ack_batch(max_batch);
+            let Ok(mask)=send(&batch) else {break};
+            let Ok(n)=self.ack_batch_done(&batch,mask) else {break};
+            if n==0{break}
+            done+=n;
+        }
+        done
+    }
     /// A failed or timed-out RPC never deletes a local token. The caller
     /// can retry exactly the same prepared frame, or fail-stop on shutdown.
     pub fn pending(&self,session:u64)->Result<(State,Frame),Error>{
@@ -283,6 +330,84 @@ pub fn acknowledge_frame(accepted:Frame)->Result<Frame,i32>{
     if ack.phase!=Phase::Committed || ack.status!=0 {return Err(EPROTO)}
     Ok(ack)
 }
+/// Cached rootd supervisor endpoint: a generational kernel handle, so a value
+/// left over from a restarted rootd fails with an error instead of reaching
+/// another object. Zero = unresolved. Cleared on any transport failure.
+static ROOTD_ENDPOINT:AtomicU64=AtomicU64::new(0);
+/// This process's PID never changes (service processes never `fork`).
+static SELF_PID:AtomicU64=AtomicU64::new(0);
+fn rootd_endpoint()->Result<(u64,bool),i32>{
+    let cached=ROOTD_ENDPOINT.load(Ordering::Acquire);
+    if cached!=0{return Ok((cached,true))}
+    let endpoint=ipc::lookup_service_endpoint(IPC_SERVICE_ROOTD);
+    if endpoint<=0{return Err(if endpoint==0{EPROTO}else{errno_of(endpoint)})}
+    ROOTD_ENDPOINT.store(endpoint as u64,Ordering::Release);
+    Ok((endpoint as u64,false))
+}
+fn self_pid()->Result<u64,i32>{
+    let cached=SELF_PID.load(Ordering::Relaxed);
+    if cached!=0{return Ok(cached)}
+    let pid=unsafe{syscall::syscall0(SYS_GETPID)};
+    if pid<=0{return Err(EINVAL)}
+    SELF_PID.store(pid as u64,Ordering::Relaxed);
+    Ok(pid as u64)
+}
+/// One synchronous rootd call for `op` with an already encoded payload.
+/// `Ok` is a well-formed reply envelope (its `status` may still be non-zero);
+/// `Err` is a transport failure after which nothing is known about whether
+/// rootd applied the request.
+///
+/// A transport failure on the CACHED endpoint (typically a restarted rootd,
+/// whose old handle is dead) invalidates it and is retried exactly once on a
+/// fresh lookup, except for a timeout (rootd is alive but slow: another full
+/// wait on the same request would double the caller's stall, and the caller
+/// already owns the retry policy). The replay is safe because every op this
+/// module sends is idempotent at rootd by `(owner, token)`, and callers
+/// already resend the identical frame after any transport error:
+///  * CHARGE: `book.charge` returns the prior receipt for an exact repeat of a
+///    `Charged` token and `reconcile_charge` reuses the same kernel token for
+///    `ChargeUnknown`; a spent nonce is fenced by the owner watermark.
+///  * RELEASE / CANCEL: a `Settled` or absent token succeeds without a second
+///    refund (`ProviderBilling::release` / `cancel`).
+///  * RECEIPT_ACK (single and batch): compaction only; absent is success.
+fn rootd_transact(req:&CommercialMaxProtocolRequest)
+    ->Result<CommercialMaxProtocolResponse,i32>{
+    for attempt in 0..2{
+        let (endpoint,cached)=rootd_endpoint()?;
+        let mut reply=CommercialMaxProtocolResponse::default();
+        let got=unsafe{syscall::syscall6(
+            SYS_RUSTOS_IPC_CALL_BOUNDED,endpoint,
+            (req as *const CommercialMaxProtocolRequest) as u64,
+            size_of::<CommercialMaxProtocolRequest>() as u64,
+            (&mut reply as *mut CommercialMaxProtocolResponse) as u64,
+            size_of::<CommercialMaxProtocolResponse>() as u64,
+            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+        )};
+        if got>=0&&got as usize==size_of::<CommercialMaxProtocolResponse>()
+            &&reply.is_valid_envelope_for(req)&&reply.descriptor_count==0{
+            return Ok(reply)
+        }
+        ROOTD_ENDPOINT.store(0,Ordering::Release);
+        if attempt==0&&cached&&got<0&&errno_of(got)!=ETIMEDOUT{continue}
+        return Err(if got<0{errno_of(got)}else{EPROTO})
+    }
+    Err(EPROTO)
+}
+fn rootd_request(op:u16,payload:&[u8])->Result<CommercialMaxProtocolRequest,i32>{
+    let pid=self_pid()?;
+    let tid=unsafe{syscall::syscall0(SYS_GETTID)};
+    if tid<=0{return Err(EINVAL)}
+    let mut req=CommercialMaxProtocolRequest::default();
+    if payload.len()>req.payload.len(){return Err(EINVAL)}
+    req.header.version=COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    req.header.protocol=COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
+    req.header.op=op;
+    req.header.subject_pid=pid;
+    req.header.subject_tid=tid as u64;
+    req.payload_len=payload.len() as u32;
+    req.payload[..payload.len()].copy_from_slice(payload);
+    Ok(req)
+}
 /// Stateless transport; must be invoked AFTER releasing all local state
 /// locks. Exact service identity and the client Job are checked by rootd.
 pub fn call_rootd(frame:Frame)->Result<Frame,i32>{
@@ -298,36 +423,10 @@ pub fn call_rootd(frame:Frame)->Result<Frame,i32>{
             COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK,
         _=>return Err(EINVAL),
     };
-    let endpoint=ipc::lookup_service_endpoint(IPC_SERVICE_ROOTD);
-    if endpoint<=0{return Err(if endpoint==0{EPROTO}else{errno_of(endpoint)})}
-    let pid=unsafe{syscall::syscall0(SYS_GETPID)};
-    let tid=unsafe{syscall::syscall0(SYS_GETTID)};
-    if pid<=0||tid<=0||frame.provider_pid!=pid as u64{return Err(EINVAL)}
+    if frame.provider_pid!=self_pid()?{return Err(EINVAL)}
     let bytes=provider_wire::encode(frame).map_err(|_|EINVAL)?;
-    let mut req=CommercialMaxProtocolRequest::default();
-    if bytes.len()>req.payload.len(){return Err(EINVAL)}
-    req.header.version=COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
-    req.header.protocol=COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
-    req.header.op=op;
-    req.header.subject_pid=pid as u64;
-    req.header.subject_tid=tid as u64;
-    req.payload_len=bytes.len() as u32;
-    req.payload[..bytes.len()].copy_from_slice(&bytes);
-    let mut reply=CommercialMaxProtocolResponse::default();
-    let got=unsafe{syscall::syscall6(
-        SYS_RUSTOS_IPC_CALL_BOUNDED,endpoint as u64,
-        (&req as *const CommercialMaxProtocolRequest) as u64,
-        size_of::<CommercialMaxProtocolRequest>() as u64,
-        (&mut reply as *mut CommercialMaxProtocolResponse) as u64,
-        size_of::<CommercialMaxProtocolResponse>() as u64,
-        IPC_BOOT_CONTROL_HARD_LIMIT_MS,
-    )};
-    if got<0{return Err(errno_of(got))}
-    if got as usize!=size_of::<CommercialMaxProtocolResponse>()
-        ||!reply.is_valid_envelope_for(&req)
-        ||reply.descriptor_count!=0{
-        return Err(EPROTO)
-    }
+    let req=rootd_request(op,&bytes)?;
+    let reply=rootd_transact(&req)?;
     if reply.status!=0{return Err(reply.status)}
     if reply.value0!=0||reply.value1!=0{return Err(EPROTO)}
     if reply.payload_len as usize!=provider_wire::BYTES{return Err(EPROTO)}
@@ -335,6 +434,29 @@ pub fn call_rootd(frame:Frame)->Result<Frame,i32>{
         .map_err(|_|EPROTO)?;
     ack.validate_ack(frame).map_err(|_|EPROTO)?;
     Ok(ack)
+}
+/// Acknowledge up to `PROVIDER_RECEIPT_ACK_BATCH_MAX_FRAMES` queued receipts
+/// in one rootd call. Returns the retired mask (bit `i` = `frames[i]`); a
+/// transport or authorization failure retires nothing and leaves every frame
+/// queued.
+pub fn acknowledge_batch(frames:&[Frame])->Result<u64,i32>{
+    let n=frames.len();
+    if n==0||n>PROVIDER_RECEIPT_ACK_BATCH_MAX_FRAMES{return Err(EINVAL)}
+    let pid=self_pid()?;
+    let mut payload=Vec::with_capacity(n*provider_wire::BYTES);
+    for f in frames{
+        if !matches!(f.operation,Operation::Cancel|Operation::Release)
+            ||f.phase!=Phase::Accepted||f.status!=0||f.kernel_receipt!=0
+            ||f.provider_pid!=pid{return Err(EINVAL)}
+        payload.extend_from_slice(&provider_wire::encode(*f).map_err(|_|EINVAL)?);
+    }
+    let req=rootd_request(COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK_BATCH,&payload)?;
+    let reply=rootd_transact(&req)?;
+    if reply.status!=0{return Err(reply.status)}
+    if reply.payload_len!=0||reply.value1!=n as u64||reply.value0>>n!=0{
+        return Err(EPROTO)
+    }
+    Ok(reply.value0)
 }
 #[cfg(test)]
 mod tests {
@@ -455,6 +577,59 @@ mod tests {
         assert_eq!(b.released(11,wrong),Err(Error::WrongAck));
         b.released(11,Frame{phase:Phase::Committed,..release}).unwrap();
         assert_eq!(b.live_count(),0);
+    }
+
+    fn settle_one(b:&mut ProviderClient,session:u64){
+        let c=b.begin_charge(session,98).unwrap();
+        b.dispatch_charge(session).unwrap();
+        b.charged(session,Frame{phase:Phase::Committed,client_job:0x200000007,
+            client_job_generation:7,kernel_receipt:3,..c}).unwrap();
+        let r=b.begin_release(session).unwrap();
+        b.dispatch_release(session).unwrap();
+        b.released(session,Frame{phase:Phase::Committed,..r}).unwrap();
+    }
+    #[test]
+    fn ack_batches_are_deferred_until_low_water_and_cost_one_call_per_batch(){
+        let mut b=ProviderClient::new(2,88,15).unwrap();
+        let mut calls=0;
+        for s in 1..=40u64{
+            settle_one(&mut b,s);
+            let n=b.flush_ack_batches(16,16,2,|f|{
+                calls+=1;Ok((1u64<<f.len())-1)
+            });
+            // Nothing is sent below the low-water mark.
+            if s<16{assert_eq!((calls,n),(0,0))}
+        }
+        // 40 receipts, one call per 16: 2 calls retire 32, 8 stay queued.
+        assert_eq!(calls,2);
+        assert_eq!(b.ack_pending(),8);
+    }
+    #[test]
+    fn lost_ack_batch_reply_keeps_every_receipt_and_retries_identically(){
+        let mut b=ProviderClient::new(2,88,15).unwrap();
+        for s in 1..=4u64{settle_one(&mut b,s)}
+        let first=b.next_ack_batch(16);
+        assert_eq!(b.flush_ack_batches(1,16,2,|_|Err(110)),0);
+        assert_eq!(b.ack_pending(),4);
+        assert_eq!(b.next_ack_batch(16),first);
+        // Partial mask: only frames rootd retired leave the outbox.
+        assert_eq!(b.flush_ack_batches(1,16,1,|_|Ok(0b0101)),2);
+        assert_eq!(b.ack_pending(),2);
+        // A bit beyond the batch, or a zero mask, retires nothing and stops.
+        assert_eq!(b.flush_ack_batches(1,16,4,|_|Ok(1<<5)),0);
+        assert_eq!(b.flush_ack_batches(1,16,4,|_|Ok(0)),0);
+        assert_eq!(b.ack_pending(),2);
+        assert_eq!(b.flush_ack_batches(1,16,4,|f|Ok((1u64<<f.len())-1)),2);
+        assert_eq!(b.ack_pending(),0);
+    }
+    #[test]
+    fn ack_batch_done_ignores_a_frame_that_changed_since_it_was_sent(){
+        let mut b=ProviderClient::new(2,88,15).unwrap();
+        settle_one(&mut b,1);
+        let mut sent=b.next_ack_batch(1);
+        sent[0].session+=1;
+        assert_eq!(b.ack_batch_done(&sent,1),Ok(0));
+        assert_eq!(b.ack_pending(),1);
     }
 
 }

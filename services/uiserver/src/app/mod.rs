@@ -4,12 +4,12 @@ mod launch;
 mod runtime;
 mod stacking;
 
-pub(crate) use stacking::{window_hit_test, WindowId, WindowStack};
+pub(crate) use stacking::{WindowId, WindowStack, window_hit_test};
 
 pub(crate) use bootstrap::start_launcher_program_loader;
 pub(crate) use runtime::{
-    drain_console_refreshes, start_console_command_dispatcher, start_console_refresh_worker,
-    ConsoleCommandDispatcher, ConsoleCommandSnapshot,
+    ConsoleCommandDispatcher, ConsoleCommandSnapshot, drain_console_refreshes,
+    start_console_command_dispatcher, start_console_refresh_worker,
 };
 
 use std::os::fd::OwnedFd;
@@ -23,7 +23,7 @@ use crate::cursor_sprites::CURSOR_SPRITE_MAX_DISTANCE;
 use crate::gpu_runtime::GpuCompositorRuntime;
 use crate::profile;
 use crate::sys::{
-    diag_line, ConsoleSessionHandle, DisplayInfo, DisplaySurfaceCreate, SurfaceMapping,
+    ConsoleSessionHandle, DisplayInfo, DisplaySurfaceCreate, SurfaceMapping, diag_line,
 };
 use crate::terminal::TerminalState;
 use crate::wayland::WaylandWindowSnapshot;
@@ -315,6 +315,9 @@ pub(crate) struct DesktopSurfaceCache {
     /// The local minute the cached chrome's clock shows, or `None` when it
     /// shows no clock. A different minute means the chrome is stale.
     pub(crate) clock_minute: Option<i64>,
+    /// The clock block is a minute behind. Only that block is repainted; the
+    /// rails and launchers (the bulk of a chrome rebuild) stay cached.
+    pub(crate) clock_stale: bool,
     /// When the system clock was last compared with `clock_minute`.
     pub(crate) clock_checked: Option<std::time::Instant>,
 }
@@ -352,13 +355,13 @@ impl DesktopSurfaceCache {
         self.clock_checked = Some(now);
         // A pending rebuild will draw whatever minute it is by then, and a
         // display too small for a clock has nothing to keep fresh.
-        if !self.chrome_valid || !clock_shown {
+        if !self.chrome_valid || self.clock_stale || !clock_shown {
             return false;
         }
         if reading().map(|reading| reading.minute_key) == self.clock_minute {
             return false;
         }
-        self.invalidate_chrome();
+        self.clock_stale = true;
         true
     }
 }
@@ -456,7 +459,10 @@ pub(crate) enum DragTarget {
 impl DragTarget {
     pub(crate) fn console_session(self) -> Option<ConsoleSessionHandle> {
         match self {
-            Self::Console(id) | Self::ConsoleResize { session_handle: id, .. } => Some(id),
+            Self::Console(id)
+            | Self::ConsoleResize {
+                session_handle: id, ..
+            } => Some(id),
             Self::Wayland(_) | Self::WaylandResize { .. } => None,
         }
     }
@@ -526,6 +532,12 @@ pub(crate) struct AppState {
     pub(crate) next_console_snapshot_index: usize,
     pub(crate) wayland_windows: Vec<WaylandWindowSnapshot>,
     pub(crate) wayland_opaque_cache: Vec<crate::render::WaylandOpaqueCacheEntry>,
+    /// Client damage accepted from the compositor but not yet copied into the
+    /// retained GPU atlas. A snapshot carries only the damage since the
+    /// previous sync, while a present can be deferred by backpressure; without
+    /// this accumulator a deferred present would drop a commit's damage and
+    /// leave stale atlas pixels.
+    pub(crate) wayland_pending_damage: Vec<(u32, canvas::Rect)>,
     dragging_window: Option<DragTarget>,
     drag_offset_x: usize,
     drag_offset_y: usize,
@@ -562,6 +574,35 @@ impl AppState {
         self.console_commands.snapshot()
     }
 
+    /// Remove and return the undelivered client damage of one surface.
+    pub(crate) fn take_wayland_pending_damage(&mut self, surface_id: u32) -> Option<canvas::Rect> {
+        let index = self
+            .wayland_pending_damage
+            .iter()
+            .position(|(id, _)| *id == surface_id)?;
+        Some(self.wayland_pending_damage.swap_remove(index).1)
+    }
+
+    fn accumulate_wayland_damage(&mut self, windows: &[WaylandWindowSnapshot]) {
+        self.wayland_pending_damage
+            .retain(|(id, _)| windows.iter().any(|window| window.surface_id == *id));
+        for window in windows {
+            if window.damage.is_empty() {
+                continue;
+            }
+            match self
+                .wayland_pending_damage
+                .iter_mut()
+                .find(|(id, _)| *id == window.surface_id)
+            {
+                Some((_, pending)) => *pending = pending.union(window.damage),
+                None => self
+                    .wayland_pending_damage
+                    .push((window.surface_id, window.damage)),
+            }
+        }
+    }
+
     pub(crate) fn sync_wayland_windows(
         &mut self,
         windows: Vec<WaylandWindowSnapshot>,
@@ -569,6 +610,7 @@ impl AppState {
         let before_dirty = self
             .wayland_stack_dirty_rect()
             .union(self.wayland_taskbar_dirty_rect());
+        self.accumulate_wayland_damage(&windows);
         self.plan_new_wayland_placements(&windows);
         let previous_windows = std::mem::take(&mut self.wayland_windows);
         let previous_dragging = self.dragging_window;
@@ -750,7 +792,7 @@ impl AppState {
 
 #[cfg(test)]
 mod visual_update_tests {
-    use super::{canvas::Rect, VisualUpdate};
+    use super::{VisualUpdate, canvas::Rect};
 
     fn damage() -> Rect {
         Rect {
@@ -802,7 +844,7 @@ mod visual_update_tests {
 
 #[cfg(test)]
 mod clock_refresh_tests {
-    use super::{DesktopSurfaceCache, CLOCK_POLL_INTERVAL};
+    use super::{CLOCK_POLL_INTERVAL, DesktopSurfaceCache};
     use crate::clock::ClockReading;
     use std::time::{Duration, Instant};
 
@@ -819,7 +861,7 @@ mod clock_refresh_tests {
     }
 
     #[test]
-    fn a_new_minute_invalidates_the_chrome_once() {
+    fn a_new_minute_marks_only_the_clock_stale_once() {
         let start = Instant::now();
         let mut cache = shown_at(100);
         assert!(
@@ -833,7 +875,10 @@ mod clock_refresh_tests {
             cache.refresh_clock(later, true, || reading(101)),
             "next minute"
         );
-        assert!(!cache.chrome_valid);
+        assert!(
+            cache.chrome_valid && cache.clock_stale,
+            "only the clock block is stale; the rails stay cached"
+        );
 
         // The rebuild has not happened yet, so a second poll must not ask for
         // another repaint.

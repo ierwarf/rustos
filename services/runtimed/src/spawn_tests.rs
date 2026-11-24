@@ -297,3 +297,24 @@
         );
         assert_eq!(cleanup_failed_spawn(0, |_| Ok(())), Err(libc::EINVAL));
     }
+
+    #[test]
+    fn a_lapsed_retry_deadline_never_collapses_the_idle_wait() {
+        let mut state = crate::BrokerState::default();
+        let now = std::time::Instant::now();
+        // A permanently failed or dependency-blocked launch keeps the deadline
+        // of its last transient failure forever.
+        state
+            .retry_after
+            .insert(String::from("stale.desktop"), now - std::time::Duration::from_secs(1));
+        assert_eq!(
+            super::next_idle_delay(&state, None),
+            crate::IDLE_POLL_INTERVAL
+        );
+        state.retry_after.insert(
+            String::from("soon.desktop"),
+            now + std::time::Duration::from_millis(3),
+        );
+        let delay = super::next_idle_delay(&state, None);
+        assert!(delay > std::time::Duration::ZERO && delay <= std::time::Duration::from_millis(3));
+    }

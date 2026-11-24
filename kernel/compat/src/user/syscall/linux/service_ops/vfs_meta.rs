@@ -27,16 +27,31 @@ pub fn syscall_linux_vfs_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
         Ok(gate) => gate,
         Err(errno) => return linux_errno(errno),
     };
+    let is_file = remote.kind() == multitask::RemoteVfsHandleKind::File;
+    let observed_epoch = if is_file {
+        ipc_ops::service_endpoint_epoch(IPC_SERVICE_VFSD).unwrap_or(0)
+    } else {
+        0
+    };
     let mut request = new_vfs_request(VFS_IPC_OP_LSEEK);
     request.fd = fd;
     request.remote_id = remote.remote_id();
     request.arg0 = offset as u64;
     request.arg1 = whence;
+    if is_file {
+        request.flags |= VFS_LSEEK_FLAG_SYNC_CURSOR;
+        request.arg2 = remote.cursor();
+    }
     match call_pinned_remote_vfs_request(&request).and_then(|response| {
         ensure_vfs_status(&response)?;
         Ok(response.value)
     }) {
-        Ok(value) => value,
+        Ok(value) => {
+            if is_file {
+                remote.set_synced_cursor(value, observed_epoch);
+            }
+            value
+        }
         Err(errno) => linux_errno(errno),
     }
 }
@@ -1068,7 +1083,9 @@ fn kernel_handle_kind_code(handle: &multitask::KernelHandle) -> u64 {
         multitask::KernelHandle::InetSocket(_) => rustos_user_abi::handle_kind::HANDLE_KIND_INET_SOCKET,
         multitask::KernelHandle::Memfd(_) => rustos_user_abi::handle_kind::HANDLE_KIND_MEMFD,
         multitask::KernelHandle::RemoteVfs(_) => rustos_user_abi::handle_kind::HANDLE_KIND_REMOTE_VFS,
-        multitask::KernelHandle::Socket(_) => rustos_user_abi::handle_kind::HANDLE_KIND_SOCKET,
+        multitask::KernelHandle::Socket(_) | multitask::KernelHandle::UnixSocket(_) => {
+            rustos_user_abi::handle_kind::HANDLE_KIND_SOCKET
+        }
         multitask::KernelHandle::VfsDirectory(_) => rustos_user_abi::handle_kind::HANDLE_KIND_VFS_DIRECTORY,
         multitask::KernelHandle::DisplaySurface(_) => rustos_user_abi::handle_kind::HANDLE_KIND_DISPLAY_SURFACE,
         multitask::KernelHandle::DeviceBuffer(_) => rustos_user_abi::handle_kind::HANDLE_KIND_DEVICE_BUFFER,

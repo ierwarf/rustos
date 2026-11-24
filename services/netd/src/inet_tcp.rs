@@ -716,7 +716,11 @@ pub(super) fn listen_tcp_in_state(state: &mut NetState, token: u64, backlog_arg:
     }
     let mut handles = VecDeque::new();
     handles.push_back(primary);
-    let initial = backlog.min(2);
+    // smoltcp has no accept queue: each pending handshake consumes one
+    // listening socket and an unmatched SYN is answered with RST. Replenishing
+    // happens only on poll/accept, so a burst of connects between two requests
+    // would be refused unless the whole backlog is listening up front.
+    let initial = backlog;
     for _ in 1..initial {
         let h = stack.add_tcp_socket();
         let sock = stack.sockets.get_mut::<tcp::Socket>(h);

@@ -8,6 +8,7 @@
 //! - **Forbidden:** Never charge a state-changing epoll operation to the 16 ms readiness rail.
 //! - **Evidence:** `waitset` and `service-mutation-recovery`.
 
+#[cfg(test)]
 pub(super) const fn deadline_ms() -> u64 {
     rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS
 }

@@ -131,6 +131,29 @@ impl VfsState {
         response
     }
 
+    fn handle_vfs_bulk_read(&mut self, reply_cap: u64, request: &VfsIpcRequest) -> i64 {
+        if let Err(errno) = validate_vfs_request(request) {
+            return bulk_read_worker::reply_bulk_read_status(reply_cap, errno, 0, 0);
+        }
+        if self.handles.get(&request.remote_id).is_some_and(|handle| handle.stale) {
+            return bulk_read_worker::reply_bulk_read_status(reply_cap, ESTALE, 0, 0);
+        }
+        if self.handles.contains_key(&request.remote_id)
+            && !self.has_funded_open_description(request.remote_id)
+        {
+            return bulk_read_worker::reply_bulk_read_status(reply_cap, ESTALE, 0, 0);
+        }
+        match self.plan_bulk_read(reply_cap, request) {
+            Ok(bulk_read_worker::BulkReadPlan::Eof { file_len }) => {
+                bulk_read_worker::reply_bulk_read_status(reply_cap, 0, 0, file_len)
+            }
+            Ok(bulk_read_worker::BulkReadPlan::Job(job)) => {
+                bulk_read_worker::enqueue_bulk_read(job)
+            }
+            Err(errno) => bulk_read_worker::reply_bulk_read_status(reply_cap, errno, 0, 0),
+        }
+    }
+
     fn handle_vfs_request(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
         if let Err(errno) = validate_vfs_request(request) {
             response.status = errno;
@@ -212,99 +235,17 @@ impl VfsState {
     }
 
     fn vfs_poll_query(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let mut mutated = false;
-        let mut mutated_epolls = Vec::new();
         match request.arg0 {
             VFS_POLL_QUERY_POLL => self.vfs_poll_once(request, response),
             VFS_POLL_QUERY_POLL_KEYED => self.vfs_poll_keyed(request, response),
-            VFS_POLL_QUERY_EPOLL_CREATE => {
-                let key = checkpoint_epoll_key(request.remote_id);
-                if self.checkpoint_operation_replayed(request, key) {
-                    return;
-                }
-                if let Err(err) = self.epolls.check_create(request.remote_id) {
-                    response.status = waitset_registry_status(err);
-                    return;
-                }
-                let record = checkpoint_epoll_record(request.remote_id, false);
-                if let Err(errno) = self.checkpoint_mutate(request, record) {
-                    response.status = errno;
-                    return;
-                }
-                self.epolls
-                    .create(request.remote_id)
-                    .expect("validated epoll create");
-                mutated = true;
-                mutated_epolls.push(request.remote_id);
-            }
-            VFS_POLL_QUERY_EPOLL_CTL => {
-                self.vfs_epoll_ctl(request, response);
-                mutated = response.status == 0;
-                if mutated {
-                    mutated_epolls.push(request.remote_id);
-                }
-            }
-            VFS_POLL_QUERY_EPOLL_SNAPSHOT => self.vfs_epoll_snapshot(request, response),
-            VFS_POLL_QUERY_EPOLL_CLAIM => self.vfs_epoll_claim(request, response),
-            VFS_POLL_QUERY_EPOLL_RETIRE => {
-                let key = checkpoint_epoll_key(request.remote_id);
-                if self.checkpoint_operation_replayed(request, key) {
-                    return;
-                }
-                if let Err(err) = self.epolls.check_retire(request.remote_id) {
-                    response.status = waitset_registry_status(err);
-                    return;
-                }
-                let record = checkpoint_epoll_record(request.remote_id, true);
-                if let Err(errno) = self.checkpoint_mutate(request, record) {
-                    response.status = errno;
-                    return;
-                }
-                self.epolls
-                    .retire(request.remote_id)
-                    .expect("validated epoll retire");
-                mutated = true;
-                mutated_epolls.push(request.remote_id);
-            }
-            VFS_POLL_QUERY_EPOLL_PURGE_OBJECT => {
-                let Ok(provider) = u16::try_from(request.arg1) else {
-                    response.status = EINVAL;
-                    return;
-                };
-                if provider == 0 || request.arg2 == 0 {
-                    response.status = EINVAL;
-                    return;
-                }
-                let interests = self.epolls.matching_interests(provider, request.arg2);
-                let expected_purged = interests.len();
-                let mut previous_token = None;
-                for (token, interest) in interests {
-                    if previous_token != Some(token) {
-                        mutated_epolls.push(token);
-                        previous_token = Some(token);
-                    }
-                    let record = checkpoint_interest_record(token, interest, true);
-                    let key = checkpoint_revision_key(&record);
-                    if !self.checkpoint_operation_replayed(request, key) {
-                        if let Err(errno) = self.checkpoint_mutate(request, record) {
-                            response.status = errno;
-                            return;
-                        }
-                    }
-                }
-                let purged = self.epolls.purge(provider, request.arg2);
-                assert_eq!(
-                    purged, expected_purged,
-                    "vfsd epoll purge lost reverse-index membership"
-                );
-                mutated = purged != 0;
-            }
+            // Epoll state moved to Ring0 `EpollHandle`; `vfsd` no longer hosts epoll objects.
+            VFS_POLL_QUERY_EPOLL_CREATE
+            | VFS_POLL_QUERY_EPOLL_CTL
+            | VFS_POLL_QUERY_EPOLL_SNAPSHOT
+            | VFS_POLL_QUERY_EPOLL_CLAIM
+            | VFS_POLL_QUERY_EPOLL_RETIRE
+            | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT => response.status = EOPNOTSUPP,
             _ => response.status = EINVAL,
-        }
-        if mutated {
-            mutated_epolls.sort_unstable();
-            mutated_epolls.dedup();
-            self.advance_readiness_generation(&mutated_epolls);
         }
     }
 
@@ -392,150 +333,6 @@ impl VfsState {
         response.value = ready;
         response.aux = self.readiness_generation;
         response.payload_len = len as u32;
-    }
-
-    fn vfs_epoll_ctl(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(interest) = epoll_interest_from_request(request) else {
-            response.status = EINVAL;
-            return;
-        };
-        let tombstone = request.arg1 == linux_abi::EPOLL_CTL_DEL;
-        let checkpoint = checkpoint_interest_record(request.remote_id, interest, tombstone);
-        let checkpoint_key = checkpoint_revision_key(&checkpoint);
-        if self.checkpoint_operation_replayed(request, checkpoint_key) {
-            return;
-        }
-        let check = match request.arg1 {
-            linux_abi::EPOLL_CTL_ADD => self.epolls.check_add(request.remote_id, interest),
-            linux_abi::EPOLL_CTL_MOD => self.epolls.check_modify(request.remote_id, interest),
-            linux_abi::EPOLL_CTL_DEL => self.epolls.check_delete(request.remote_id, interest.key),
-            _ => {
-                response.status = EINVAL;
-                return;
-            }
-        };
-        if let Err(err) = check {
-            response.status = waitset_registry_status(err);
-            return;
-        }
-        if let Err(errno) = self.checkpoint_mutate(request, checkpoint) {
-            response.status = errno;
-            return;
-        }
-        let result = match request.arg1 {
-            linux_abi::EPOLL_CTL_ADD => self.epolls.add(request.remote_id, interest),
-            linux_abi::EPOLL_CTL_MOD => self.epolls.modify(request.remote_id, interest),
-            linux_abi::EPOLL_CTL_DEL => self.epolls.delete(request.remote_id, interest.key),
-            _ => unreachable!(),
-        };
-        result.expect("validated epoll_ctl mutation");
-    }
-
-    fn vfs_epoll_snapshot(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Ok(maxevents) = usize::try_from(request.arg1) else {
-            response.status = EINVAL;
-            return;
-        };
-        let wire_size = size_of::<WaitSetSnapshotWire>();
-        let capacity = response.payload.len() / wire_size;
-        if maxevents == 0 || maxevents > WAITSET_MAX_INTERESTS || maxevents > capacity {
-            response.status = EINVAL;
-            return;
-        }
-        let count = match self.epolls.visit_snapshot_entries(
-            request.remote_id,
-            maxevents,
-            |written, interest, report| {
-                let wire = WaitSetSnapshotWire {
-                    interest: WaitSetInterestWire {
-                        abi_version: WAITSET_ABI_VERSION,
-                        provider: interest.key.provider,
-                        flags: 0,
-                        target_fd: interest.key.target_fd,
-                        object_id: interest.key.object_id,
-                        provider_epoch: interest.provider_epoch,
-                        events: interest.events,
-                        reserved0: 0,
-                        data: interest.data,
-                    },
-                    edge_generation: report.edge_generation,
-                    state: if report.disabled {
-                        WAITSET_SNAPSHOT_STATE_DISABLED
-                    } else {
-                        0
-                    },
-                    reserved0: 0,
-                };
-                // SAFETY: `WaitSetSnapshotWire` is a `repr(C)` plain-data wire
-                // struct that outlives this view, which spans exactly its own bytes.
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        (&wire as *const WaitSetSnapshotWire).cast::<u8>(),
-                        wire_size,
-                    )
-                };
-                let offset = written * wire_size;
-                response.payload[offset..offset + wire_size].copy_from_slice(bytes);
-            },
-        ) {
-            Ok(count) => count,
-            Err(err) => {
-                response.status = waitset_registry_status(err);
-                return;
-            }
-        };
-        response.value = count as u64;
-        response.aux = self.readiness_generation;
-        response.payload_len = (count * wire_size) as u32;
-    }
-
-    /// Atomically consume edge-triggered / one-shot reports. The reply is one
-    /// byte per candidate: `1` when this caller owns the report.
-    fn vfs_epoll_claim(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        const CLAIM_SIZE: usize = size_of::<WaitSetClaimWire>();
-        let len = request.payload_len as usize;
-        let count = len / CLAIM_SIZE;
-        if len == 0
-            || !len.is_multiple_of(CLAIM_SIZE)
-            || count > VFS_EPOLL_CLAIM_MAX
-            || len > request.payload.len()
-            || count > response.payload.len()
-        {
-            response.status = EINVAL;
-            return;
-        }
-        let raw_claims = &request.payload[..len];
-        for chunk in raw_claims.chunks_exact(CLAIM_SIZE) {
-            // SAFETY: `chunk.len() == CLAIM_SIZE` and `read_unaligned` tolerates
-            // the byte slice's alignment.
-            let wire = unsafe { core::ptr::read_unaligned(chunk.as_ptr().cast::<WaitSetClaimWire>()) };
-            if !waitset_claim_shape_valid(&wire) {
-                response.status = EINVAL;
-                return;
-            }
-        }
-        let mut accepted = 0_u64;
-        for (index, chunk) in raw_claims.chunks_exact(CLAIM_SIZE).enumerate() {
-            // SAFETY: validated above; `chunk.len() == CLAIM_SIZE`.
-            let wire = unsafe { core::ptr::read_unaligned(chunk.as_ptr().cast::<WaitSetClaimWire>()) };
-            let key = WaitSetInterestKey {
-                target_fd: wire.target_fd,
-                provider: wire.provider,
-                object_id: wire.object_id,
-            };
-            match self.epolls.claim(request.remote_id, key, wire.generation) {
-                Ok(owned) => {
-                    response.payload[index] = u8::from(owned);
-                    accepted += u64::from(owned);
-                }
-                Err(err) => {
-                    response.status = waitset_registry_status(err);
-                    return;
-                }
-            }
-        }
-        response.value = accepted;
-        response.payload_len = count as u32;
     }
 
     fn advance_readiness_generation(&mut self, object_ids: &[u64]) {

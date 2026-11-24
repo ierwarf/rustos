@@ -58,7 +58,8 @@ fn build_bundled_atlases(bundle: &Path) -> Result<(), Box<dyn Error>> {
             let face = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())?;
             faces.insert(path.clone(), face);
         }
-        let atlas = glyph_atlas::build_atlas(&faces[&path], spec)?;
+        let scaled_spec = spec.scaled(config.display_scale_percent);
+        let atlas = glyph_atlas::build_atlas(&faces[&path], &scaled_spec)?;
         let alpha_name = format!("{role:?}.alpha");
         std::fs::write(out.join(&alpha_name), &atlas.alpha)?;
         writeln!(generated, "atlases.insert(FontRole::{role:?}, GlyphAtlas {{ glyphs: std::borrow::Cow::Borrowed(&[")?;
@@ -67,7 +68,11 @@ fn build_bundled_atlases(bundle: &Path) -> Result<(), Box<dyn Error>> {
         }
         writeln!(generated, "] ), alpha: std::borrow::Cow::Borrowed(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{alpha_name}\"))), line_height: {}, cell_width: {}, monospace: {} }});", atlas.line_height, atlas.cell_width, atlas.monospace)?;
     }
-    writeln!(generated, "UiAssets {{ atlases, clock_utc_offset_minutes: {}, summary: String::from(\"bundled build-time atlases\") }}\n}}", config.clock_utc_offset_minutes)?;
+    writeln!(
+        generated,
+        "UiAssets {{ atlases, display_scale_percent: {}, layout: crate::ui_config::{:?}, clock_utc_offset_minutes: {}, summary: String::from(\"bundled build-time atlases\"), config: None, faces: BTreeMap::new() }}\n}}",
+        config.display_scale_percent, config.layout, config.clock_utc_offset_minutes
+    )?;
     std::fs::write(out.join("ui_bundled_atlases.rs"), generated)?;
     Ok(())
 }

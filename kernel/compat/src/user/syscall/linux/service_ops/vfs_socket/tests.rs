@@ -158,17 +158,6 @@ fn remote_vfs_registry_preserves_collision_chains_across_tombstones() {
 }
 
 #[test]
-fn proc_self_fd_target_matches_only_caller_fd_entries() {
-    assert_eq!(proc_self_fd_target("/proc/self/fd/0", 42), Some(0));
-    assert_eq!(proc_self_fd_target("/proc/self/fd/17", 42), Some(17));
-    assert_eq!(proc_self_fd_target("/proc/42/fd/17", 42), Some(17));
-    assert_eq!(proc_self_fd_target("/proc/43/fd/17", 42), None);
-    assert_eq!(proc_self_fd_target("/proc/self/fd/017", 42), None);
-    assert_eq!(proc_self_fd_target("/proc/self/fd/17/extra", 42), None);
-    assert_eq!(proc_self_fd_target("/proc/self/exe", 42), None);
-}
-
-#[test]
 fn memfd_reopen_flags_preserve_attenuated_rights_and_install_distinct_description() {
     let mut table = multitask::HandleTable::new();
     let memfd = multitask::MemfdHandle::new(alloc::string::String::from("shm"), true, None);
@@ -268,11 +257,238 @@ fn remote_vfs_handle_table_enforces_write_rights_by_open_flags() {
     assert!(rw_entry.rights().allows_write());
 }
 
+struct MockRegularFileReadTransport {
+    ops: alloc::vec::Vec<(u16, u64, usize)>,
+    bulk_error: Option<i64>,
+    file_len: usize,
+    bulk_subchunk: usize,
+}
+
+impl MockRegularFileReadTransport {
+    fn new(file_len: usize) -> Self {
+        Self {
+            ops: alloc::vec::Vec::new(),
+            bulk_error: None,
+            file_len,
+            bulk_subchunk: VFS_IPC_PAYLOAD_CAPACITY,
+        }
+    }
+}
+
+impl RegularFileReadTransport for MockRegularFileReadTransport {
+    fn bulk_read(
+        &mut self,
+        offset: u64,
+        want: usize,
+        deliver: &mut dyn FnMut(&[u8]) -> Result<(), i64>,
+    ) -> Result<usize, i64> {
+        self.ops.push((VFS_IPC_OP_BULK_READ, offset, want));
+        if let Some(errno) = self.bulk_error {
+            return Err(errno);
+        }
+        let start = offset as usize;
+        let available = self.file_len.saturating_sub(start).min(want);
+        let mut sent = 0usize;
+        while sent < available {
+            let step = (available - sent).min(self.bulk_subchunk);
+            let chunk = alloc::vec![0x5a_u8; step];
+            deliver(&chunk)?;
+            sent += step;
+        }
+        Ok(available)
+    }
+
+    fn pread64(
+        &mut self,
+        offset: u64,
+        want: usize,
+        deliver: &mut dyn FnMut(&[u8]) -> Result<(), i64>,
+    ) -> Result<usize, i64> {
+        self.ops.push((VFS_IPC_OP_PREAD64, offset, want));
+        let start = offset as usize;
+        let available = self.file_len.saturating_sub(start).min(want);
+        if available > 0 {
+            let chunk = alloc::vec![0x3c_u8; available];
+            deliver(&chunk)?;
+        }
+        Ok(available)
+    }
+
+    fn yield_between_chunks(&mut self) {}
+}
+
 #[test]
-fn proc_fd_path_parser_matches_self_and_caller_pid_only() {
-    assert_eq!(proc_self_fd_target("/proc/self/fd/3", 7), Some(3));
-    assert_eq!(proc_self_fd_target("/proc/7/fd/0", 7), Some(0));
-    assert_eq!(proc_self_fd_target("/proc/8/fd/3", 7), None);
-    assert_eq!(proc_self_fd_target("/proc/self/fd/03", 7), None);
-    assert_eq!(proc_self_fd_target("/proc/self/fd/3/extra", 7), None);
+fn regular_file_read_fault_at_zero_leaves_cursor_and_dirty_state_untouched() {
+    let remote = multitask::RemoteVfsHandle::new_with_epoch(
+        77,
+        multitask::RemoteVfsHandleKind::File,
+        alloc::string::String::from("/data/a.bin"),
+        4096,
+        0,
+        3,
+    )
+    .expect("remote handle");
+    remote.set_synced_cursor(128, 3);
+    let mut transport = MockRegularFileReadTransport::new(4096);
+
+    let result = read_remote_vfs_file_loop(
+        Some(remote.description().as_ref()),
+        remote.cursor(),
+        0x1000,
+        512,
+        &mut transport,
+        |_, _| Err(LINUX_EFAULT),
+    );
+    assert_eq!(result, linux_errno(LINUX_EFAULT));
+    assert_eq!(remote.cursor(), 128);
+    assert_eq!(remote.durable_cursor(), 128);
+    assert!(!remote.is_dirty(3));
+    assert_eq!(transport.ops, alloc::vec![(VFS_IPC_OP_PREAD64, 128, 512)]);
+}
+
+#[test]
+fn regular_file_read_mid_transfer_fault_advances_cursor_by_exact_copied_chunks() {
+    let remote = multitask::RemoteVfsHandle::new_with_epoch(
+        78,
+        multitask::RemoteVfsHandleKind::File,
+        alloc::string::String::from("/data/b.bin"),
+        200_000,
+        0,
+        4,
+    )
+    .expect("remote handle");
+    let mut transport = MockRegularFileReadTransport::new(200_000);
+    let mut chunk_index = 0usize;
+
+    let result = read_remote_vfs_file_loop(
+        Some(remote.description().as_ref()),
+        remote.cursor(),
+        0x2000,
+        150_000,
+        &mut transport,
+        |dest, bytes| {
+            chunk_index += 1;
+            if chunk_index == 1 {
+                assert_eq!(dest, 0x2000);
+                assert_eq!(bytes.len(), VFS_IPC_PAYLOAD_CAPACITY);
+                Ok(())
+            } else {
+                Err(LINUX_EFAULT)
+            }
+        },
+    );
+    assert_eq!(result, VFS_IPC_PAYLOAD_CAPACITY as u64);
+    assert_eq!(remote.cursor(), VFS_IPC_PAYLOAD_CAPACITY as u64);
+    assert_eq!(remote.durable_cursor(), 0);
+    assert!(remote.is_dirty(4));
+    assert_eq!(
+        transport.ops,
+        alloc::vec![
+            (VFS_IPC_OP_PREAD64, 0, VFS_IPC_PAYLOAD_CAPACITY),
+            (
+                VFS_IPC_OP_PREAD64,
+                VFS_IPC_PAYLOAD_CAPACITY as u64,
+                VFS_IPC_PAYLOAD_CAPACITY
+            ),
+        ]
+    );
+}
+
+#[test]
+fn regular_file_bulk_read_partial_fault_and_eopnotsupp_fallback_keep_exact_cursor() {
+    let bulk_remote = multitask::RemoteVfsHandle::new_with_epoch(
+        79,
+        multitask::RemoteVfsHandleKind::File,
+        alloc::string::String::from("/data/bulk.bin"),
+        512 * 1024,
+        0,
+        2,
+    )
+    .expect("remote handle");
+    let mut bulk_transport = MockRegularFileReadTransport::new(512 * 1024);
+    let mut calls = 0usize;
+    let partial = read_remote_vfs_file_loop(
+        Some(bulk_remote.description().as_ref()),
+        bulk_remote.cursor(),
+        0x4000,
+        VFS_BULK_READ_MIN_BYTES,
+        &mut bulk_transport,
+        |_, _| {
+            calls += 1;
+            if calls <= 2 {
+                Ok(())
+            } else {
+                Err(LINUX_EFAULT)
+            }
+        },
+    );
+    assert_eq!(partial, (2 * VFS_IPC_PAYLOAD_CAPACITY) as u64);
+    assert_eq!(bulk_remote.cursor(), (2 * VFS_IPC_PAYLOAD_CAPACITY) as u64);
+    assert!(bulk_remote.is_dirty(2));
+    assert_eq!(
+        bulk_transport.ops,
+        alloc::vec![(VFS_IPC_OP_BULK_READ, 0, VFS_BULK_READ_MIN_BYTES)]
+    );
+
+    let fallback_remote = multitask::RemoteVfsHandle::new_with_epoch(
+        80,
+        multitask::RemoteVfsHandleKind::File,
+        alloc::string::String::from("/proc/1/stat"),
+        (VFS_BULK_READ_MIN_BYTES + 128) as u64,
+        0,
+        2,
+    )
+    .expect("remote handle");
+    let mut fallback_transport = MockRegularFileReadTransport::new(VFS_BULK_READ_MIN_BYTES + 128);
+    fallback_transport.bulk_error = Some(LINUX_EOPNOTSUPP);
+    let fallback_read = read_remote_vfs_file_loop(
+        Some(fallback_remote.description().as_ref()),
+        fallback_remote.cursor(),
+        0x8000,
+        VFS_BULK_READ_MIN_BYTES + 128,
+        &mut fallback_transport,
+        |_, _| Ok(()),
+    );
+    assert_eq!(fallback_read, (VFS_BULK_READ_MIN_BYTES + 128) as u64);
+    assert_eq!(
+        fallback_remote.cursor(),
+        (VFS_BULK_READ_MIN_BYTES + 128) as u64
+    );
+    assert_eq!(fallback_transport.ops[0].0, VFS_IPC_OP_BULK_READ);
+    assert!(
+        fallback_transport.ops[1..]
+            .iter()
+            .all(|(op, _, _)| *op == VFS_IPC_OP_PREAD64),
+        "after EOPNOTSUPP, remaining chunks must stay on PREAD64 without re-probing BULK_READ"
+    );
+}
+
+#[test]
+fn remote_vfs_cursor_dirty_tracking_tracks_reads_settle_sync_and_epoch_restarts() {
+    let remote = multitask::RemoteVfsHandle::new_with_epoch(
+        81,
+        multitask::RemoteVfsHandleKind::File,
+        alloc::string::String::from("/data/sync.bin"),
+        1024,
+        0,
+        10,
+    )
+    .expect("remote handle");
+    assert!(!remote.is_dirty(10));
+    assert!(remote.is_dirty(11));
+
+    remote.advance_cursor(256);
+    assert_eq!(remote.cursor(), 256);
+    assert_eq!(remote.durable_cursor(), 0);
+    assert!(remote.is_dirty(10));
+
+    remote.mark_settled(256, 10);
+    assert!(!remote.is_dirty(10));
+    assert!(remote.is_dirty(11));
+
+    remote.set_synced_cursor(512, 11);
+    assert_eq!(remote.cursor(), 512);
+    assert_eq!(remote.durable_cursor(), 512);
+    assert_eq!(remote.durable_epoch(), 11);
+    assert!(!remote.is_dirty(11));
 }

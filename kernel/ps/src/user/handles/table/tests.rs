@@ -946,3 +946,59 @@ fn o_path_remote_device_has_no_io_authority() {
     assert!(!rights.allows_write());
     assert!(rights.allows_transfer());
 }
+
+#[test]
+fn remote_vfs_cursor_shared_across_dup_and_transfer_but_not_fresh_open() {
+    use crate::user::handles::{RemoteVfsHandle, RemoteVfsHandleKind};
+    let primary = RemoteVfsHandle::new_with_epoch(
+        10,
+        RemoteVfsHandleKind::File,
+        "/tmp/data.bin".into(),
+        4096,
+        0,
+        7,
+    )
+    .unwrap();
+    let independent = RemoteVfsHandle::new_with_epoch(
+        11,
+        RemoteVfsHandleKind::File,
+        "/tmp/data.bin".into(),
+        4096,
+        0,
+        7,
+    )
+    .unwrap();
+
+    let mut table = HandleTable::new();
+    let fd1 = table
+        .install_with_open_flags(KernelHandle::RemoteVfs(primary.clone()), linux_abi::O_RDWR)
+        .unwrap();
+    let fd2 = table.duplicate_min(fd1, 0, false).unwrap();
+
+    // Clone / dup shares the open-description cursor and dirty state.
+    assert!(!primary.is_dirty(7));
+    assert_eq!(primary.advance_cursor(128), 128);
+    let KernelHandle::RemoteVfs(dup_handle) = table.get_entry(fd2).unwrap().handle() else {
+        panic!("expected RemoteVfs");
+    };
+    assert_eq!(dup_handle.cursor(), 128);
+    assert!(dup_handle.is_dirty(7));
+    assert_eq!(independent.cursor(), 0);
+
+    // Transfer clone preserves shared open-description state while settle clears dirtiness.
+    let transferred = dup_handle.clone();
+    assert!(alloc::sync::Arc::ptr_eq(
+        primary.description(),
+        transferred.description()
+    ));
+    transferred.mark_settled(128, 7);
+    assert!(!primary.is_dirty(7));
+    // Service restart bumps endpoint epoch and marks the handle dirty for lazy resync.
+    assert!(primary.is_dirty(8));
+
+    transferred.set_synced_cursor(512, 8);
+    assert_eq!(primary.cursor(), 512);
+    assert_eq!(primary.durable_cursor(), 512);
+    assert!(!primary.is_dirty(8));
+    assert_eq!(independent.cursor(), 0);
+}

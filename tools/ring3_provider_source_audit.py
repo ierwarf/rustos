@@ -114,7 +114,7 @@ def review_service(path: str, findings: list[Finding]) -> None:
             ("socketpair-charge", pair, ("provider_accounting::charge_before_publish(left", "provider_accounting::charge_before_publish(right", "state.sockets.insert(")),
             ("close-refund", close[close.find("retire_unix_socket("):], ("retire_unix_socket(", "provider_accounting::retire_final(")),
             ("inet-close-refund", close, ("state.inet_sockets.remove(", "drop(state)", "provider_accounting::retire_final(")),
-            ("accept-charge", accept, ("provider_accounting::charge_before_publish(accepted", "call_net_broker(")),
+            ("accept-charge", accept, ("provider_accounting::charge_before_publish(accepted", "prepare_socket_publication(")),
         ]:
             check(ordered(body, *markers), path, label,
                   "client Job charge before public socket identity; close refund after retirement",
@@ -122,7 +122,7 @@ def review_service(path: str, findings: list[Finding]) -> None:
         check("socket.refs > 1" in close and "socket.refs -= 1" in close,
               path, "dup-guard", "dup references must not retire charge early", findings)
     elif path.endswith("/vfsd/src/state_storage.rs"):
-        body = lexical_block(text, "fn open_remote_checkpointed(")
+        body = lexical_block(text, "fn publish_open_handle(")
         check(ordered(body, "self.bill_open_description(", "self.checkpoint_open_description("),
               path, "vfs-charge", "charge before successful OPEN checkpoint", findings)
         check("self.cancel_unpublished_open_description(id)" in body,

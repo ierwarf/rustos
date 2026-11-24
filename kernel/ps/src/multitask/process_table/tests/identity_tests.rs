@@ -159,6 +159,39 @@ fn exact_identity_publication_tracks_exec_cancel_and_exit() {
     assert_eq!(publication_divergence_count(), 0);
 }
 
+/// A non-final thread exit republishes the slot from unchanged authority. That
+/// republish must not revoke the identity: lock-free user-copy binds refuse
+/// while it is revoked, so any window turns an unrelated thread's copyout into
+/// a spurious `EFAULT`. A real transition (exit) still revokes.
+#[test]
+fn republishing_an_unchanged_slot_never_revokes_the_identity() {
+    use super::super::identity::SLOT_REVOCATIONS;
+    use core::sync::atomic::Ordering;
+
+    let _isolation = isolate_process_table();
+    let handle = create_process(80_110, new_state()).expect("process");
+    attach_task(handle).expect("first thread");
+    attach_task(handle).expect("second thread");
+    let expected = live_process_identity(handle).expect("initial identity");
+
+    let before = SLOT_REVOCATIONS.load(Ordering::Relaxed);
+    detach_task(handle).expect("non-final thread exit");
+    assert_eq!(
+        SLOT_REVOCATIONS.load(Ordering::Relaxed),
+        before,
+        "an unchanged republish opened a revoke window"
+    );
+    assert_eq!(live_process_identity(handle), Some(expected));
+
+    assert_eq!(mark_process_exiting(80_110), Some(()));
+    assert!(
+        SLOT_REVOCATIONS.load(Ordering::Relaxed) > before,
+        "a real lifecycle transition must still revoke"
+    );
+    assert_eq!(live_process_identity(handle), None);
+    assert_eq!(publication_divergence_count(), 0);
+}
+
 /// The out-of-guard sweep detects publication damage while the exact locked
 /// fallback continues to preserve correctness for the affected access.
 #[test]

@@ -112,8 +112,9 @@ billing paths compiled in; the billing RPC volume was not instrumented.
 ## Receipt ACK and tombstone lifecycle
 
 CANCEL and RELEASE leave a Settled tombstone in rootd. The provider confirms it
-with op 28 from its bounded `ProviderClient` outbox (retried by netd's refund
-worker and at every vfsd billing operation). Rootd removes the tombstone only on
+with op 28 (netd) or batched op 31 (vfsd: deferred until 16 receipts are queued,
+retried at every billing operation that finds the backlog at or above that mark)
+from its bounded `ProviderClient` outbox. Rootd removes the tombstone only on
 an exact ACK. Under table pressure (4096 tickets) it reclaims the oldest Settled
 tombstone; unsettled tickets are never reclaimed and a full table of them
 refuses with ENOSPC. The per-owner nonce watermark is never reset by either
@@ -138,6 +139,8 @@ finish closing without wedging.
 | Lost ACKs do not exhaust the table; unsettled exhaustion still refuses | `settled_tombstones_are_reclaimed_under_pressure_without_unspending_tokens`, `unsettled_table_exhaustion_still_refuses` |
 | Rootd restart does not wedge RELEASE/ACK | `rootd_restart_does_not_wedge_provider_release_or_receipt_ack` |
 | Provider-side ACK outbox retry, wrong-nonce reply, overflow eviction | `provider_client::tests::lost_receipt_ack_is_retained_and_retried_until_exact_commit`, `cancel_receipts_queue_acks_and_overflow_evicts_oldest` |
+| Batched ACK: exact shape, per-frame refusal, foreign frame fails closed, replay idempotent | `provider_control::tests::ack_batch_*` (3) |
+| Deferred ACK batches: calls per open/close, lost batch reply, partial mask | `provider_client::tests::ack_batches_are_deferred_*`, `lost_ack_batch_reply_*`, `ack_batch_done_ignores_*`; `vfsd::open_billing::tests` (5, incl. 66 vs 96 rootd calls per 32 open/close) |
 | Client and provider ledgers: replay, cancel, nonce mismatch | `provider_client::tests` (remaining) |
 | netd UNIX lifecycle matrix (dup, close, accept requeue) | `netd` `unix_socket_lifecycle_tests` |
 | Source ordering of charge/checkpoint/refund call sites | `tools/ring3_provider_source_audit.py` (string-order aid only) |

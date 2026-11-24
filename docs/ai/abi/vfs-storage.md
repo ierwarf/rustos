@@ -55,14 +55,15 @@
   the lease. They do not split the deadline or retry a real timeout; exact
   mutation identity transfers to housekeeping. Checkpointed epoll
   create/ADD/MOD/DEL/retire and matching purges follow the same control rail.
-  Cursor COMMIT/CANCEL and checkpoint visibility ACK likewise mutate provider
-  custody and use one full state-mutation lease attempt, not the 16 ms
-  readiness rail or the 100 ms interactive rail. Explicit final remote-VFS
-  `close` waits for the 5 s state-mutation lease and reports a provider error
-  after retiring the numeric fd; a successful close must not leave a
-  path-backed inode pinned against an immediate rename. Implicit cleanup
-  keeps the short rail. If a prepared cursor rejects either with `EBUSY`,
-  retain the exact close in deferred reconciliation.
+  `VFS_IPC_OP_CURSOR_SETTLE` (`COMMIT`/`CANCEL`/`SYNC`) and checkpoint visibility
+  ACK mutate provider custody and use one full state-mutation lease attempt, not
+  the 16 ms readiness rail or the 100 ms interactive rail. Explicit final
+  remote-VFS `close` waits for the 5 s state-mutation lease and reports a
+  provider error after retiring the numeric fd; a successful close must not
+  leave a path-backed inode pinned against an immediate rename. Implicit cleanup
+  keeps the short rail. If a prepared directory cursor rejects `close` with
+  `EBUSY`, retain the exact close in deferred reconciliation (regular files
+  never enter `prepared` state).
   Deferred replay preserves all four operation arguments,
   flags, dirfd, mutation identity, and bounded payload; in particular an epoll
   checkpoint ACK retains its original suboperation in arg3. Unconfirmed work
@@ -74,19 +75,33 @@
   A confirmed mutation awaiting ACK replaces itself by that ACK in its own
   reserved lane slot rather than replaying an older mutation or competing for
   fresh queue capacity.
-  Cursor-mutating foreground syscalls (cursor read, write, lseek, getdents64)
-  first take a per-description cursor gate (64 slots, 5 s wait) that is held
-  from the prepared request through user copy and COMMIT/CANCEL. The gate is
-  granted only when no other foreground owner and no queued or in-flight
-  deferred mutation exists for that description; while waiting, the caller
-  replays that description's lane itself (one replay owner at a time) instead
-  of waiting for housekeeping. vfsd therefore never sees a second cursor
-  operation on a prepared description, so a timed-out COMMIT or two threads
-  sharing a description no longer surface EBUSY (this was the libc resolv.conf
-  read: first read prepared, COMMIT timed out, the EOF read got errno 16). A
-  gate that cannot be granted in 5 s returns ETIMEDOUT, never EBUSY. Residual
-  gap: queue saturation (ENOSPC on admission) and a prepare that reaches a
-  multi-receiver vfsd after its CANCEL are not fenced; vfsd is single-receiver.
+  Regular-file (`RemoteVfsHandleKind::File`) live sequential cursors are owned
+  by the kernel in `RemoteVfsOpenDescription` (shared via `Arc` across
+  `dup`/`fork`/`SCM_RIGHTS`), so sequential `read()` translates to stateless
+  positioned `VFS_IPC_OP_PREAD64` / `VFS_IPC_OP_BULK_READ` requests at
+  `desc.cursor()`, advances `desc.cursor` only after `copy_to_user` succeeds,
+  and emits zero `rootd` checkpoints per read. Regular-file cursors settle
+  durably in `vfsd`/`rootd` at explicit settle points: `lseek` passes
+  `arg2 = desc.cursor()` with `VFS_LSEEK_FLAG_SYNC_CURSOR`; `write` passes
+  `arg0 = desc.cursor()` with `VFS_WRITE_FLAG_CURSOR_SYNC` and updates the
+  kernel cursor from `response.aux`; and `fsync`/`fdatasync` flushes a dirty
+  cursor via `VFS_IPC_OP_CURSOR_SETTLE` (`VFS_CURSOR_SETTLE_SYNC = 3`) before
+  `VFS_IPC_OP_FSYNC`. Directory `getdents64` retains `vfsd`-owned opaque
+  cookies and the `COMMIT`/`CANCEL` prepare/settle protocol.
+  Cursor-using foreground syscalls (`read`, `write`, `lseek`, `fsync`,
+  `sendfile`, `copy_file_range`, `getdents64`) first take a per-description
+  cursor gate (64 slots, 5 s wait) held across stateless file read chunks or
+  from the prepared directory request through user copy and `COMMIT`/`CANCEL`.
+  The gate is granted only when no other foreground owner and no queued or
+  in-flight deferred mutation exists for that description; while waiting, the
+  caller replays that description's lane itself (one replay owner at a time)
+  instead of waiting for housekeeping. `vfsd` therefore never sees a second
+  cursor operation on a prepared directory description, so a timed-out
+  `COMMIT` or two threads sharing a description no longer surface `EBUSY`. A
+  gate that cannot be granted in 5 s returns `ETIMEDOUT`, never `EBUSY`. Residual
+  gap: queue saturation (`ENOSPC` on admission) and a prepare that reaches a
+  multi-receiver `vfsd` after its `CANCEL` are not fenced; `vfsd` is
+  single-receiver.
   Only non-consuming provider readiness queries use the 16 ms deadline. vfsd is
   the only intended caller of `SYS_RUSTOS_FD_*_BROKER`; gated by `VFS_POLICY`.
   Generic apps must not call those brokers directly.
@@ -272,8 +287,10 @@
   early-system table and provides only file length or at most 4 KiB of
   read-only bytes. It has no enumeration, directory, physical LBA, controller,
   mutation, or fallback operation. Vfsd owns path normalization, open
-  descriptions, cursors, checkpointing, and the overlay decision; digest and
-  exact-entry admission remain in the bounded ring0 reader.
+  descriptions, durable checkpointing, directory cursors, and the overlay
+  decision (while kernel `RemoteVfsOpenDescription` owns live sequential
+  regular-file cursors); digest and exact-entry admission remain in the bounded
+  ring0 reader.
 
 ### Read-only large-file adapter
 

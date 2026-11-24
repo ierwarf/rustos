@@ -2,20 +2,20 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Instant;
 
-use runtime_control::{load_desktop_program_entries, StartupMode, DEFAULT_APPLICATIONS_DIR};
+use runtime_control::{DEFAULT_APPLICATIONS_DIR, StartupMode, load_desktop_program_entries};
 
 use super::{
-    align_up, start_console_command_dispatcher, AppState, CursorMotion, DesktopSurfaceCache,
-    LauncherProgram, MAX_DISPLAY_HEIGHT, MAX_DISPLAY_WIDTH, PAGE_SIZE,
+    AppState, CursorMotion, DesktopSurfaceCache, LauncherProgram, MAX_DISPLAY_HEIGHT,
+    MAX_DISPLAY_WIDTH, PAGE_SIZE, align_up, start_console_command_dispatcher,
 };
 use crate::clock::ClockReading;
 use crate::gpu_runtime::GpuCompositorRuntime;
 use crate::layout::home_clock;
 use crate::sys::{
-    boot_line, debug_line, diag_line, display_create_surface, display_get_info, display_present,
-    display_present_rect, map_surface, open_console, open_display, open_input,
-    publish_input_pointer_surface, spawn_ui_thread, DisplayInfo, DisplaySurfaceCreate,
-    SurfaceMapping, UiThreadRole, EAGAIN, ENODEV, ESTALE, PIXEL_FORMAT_BGRA8888,
+    DisplayInfo, DisplaySurfaceCreate, EAGAIN, ENODEV, ESTALE, PIXEL_FORMAT_BGRA8888,
+    SurfaceMapping, UiThreadRole, boot_line, debug_line, diag_line, display_create_surface,
+    display_get_info, display_present, display_present_rect, map_surface, open_console,
+    open_display, open_input, publish_input_pointer_surface, spawn_ui_thread,
 };
 const SURFACE_CREATE_RETRIES: usize = 4;
 // The wait for a primary display provider (for example the DVM display
@@ -149,45 +149,91 @@ fn validate_surface_metadata(
     Ok(surface_mapping_len)
 }
 
+/// Wait budget for re-acquiring the primary display after a stale surface. The
+/// recovery runs inside the main-present phase, so it must stay under the 3 s
+/// UI watchdog; a provider that is still gone after this fails the service
+/// with its errno for the supervisor to restart.
+const DISPLAY_RECOVERY_BUDGET: std::time::Duration = std::time::Duration::from_millis(2_000);
+const DISPLAY_RECOVERY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Retry `operation` while it fails with a retryable errno, for at most
+/// `budget`. The startup readiness machine cannot drive this: `Display` is
+/// already terminal once the first surface was published, so
+/// `StartupDriver::drive` refuses (ECANCELED) every later attempt.
+fn retry_within_budget<T>(
+    budget: std::time::Duration,
+    backoff: std::time::Duration,
+    retryable: impl Fn(i32) -> bool,
+    mut operation: impl FnMut() -> Result<T, i32>,
+) -> Result<T, i32> {
+    let started = Instant::now();
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(errno) if retryable(errno) && started.elapsed() < budget => {
+                std::thread::sleep(backoff);
+            }
+            Err(errno) => return Err(errno),
+        }
+    }
+}
+
+fn probe_primary_display(
+    display_fd: i32,
+    first_wait_logged: &mut bool,
+) -> Result<(DisplayInfo, usize), i32> {
+    let mut note = |detail: String| {
+        if !std::mem::replace(first_wait_logged, true) {
+            diag_line(
+                format!("uiserver: waiting for primary display provider ({detail})").as_str(),
+            );
+        }
+    };
+    match display_get_info(display_fd) {
+        Ok(display) => match validate_display_info_with_retry(&display) {
+            Ok(stride) => Ok((display, stride)),
+            Err(DisplayValidationError::Fatal(err)) => Err(err),
+            Err(DisplayValidationError::NotPrimaryYet) => {
+                note(format!(
+                    "initial flags={:#x} gen={}",
+                    display.flags, display.generation
+                ));
+                Err(EAGAIN)
+            }
+        },
+        Err(errno) if display_info_unavailable_is_retryable(errno) => {
+            note(format!("get-info errno={errno}"));
+            Err(EAGAIN)
+        }
+        Err(errno) => {
+            debug_line(&format!("uiserver: display_get_info failed errno={errno}"));
+            diag_line("uiserver: display_get_info failed");
+            Err(13)
+        }
+    }
+}
+
 fn wait_for_primary_display(display_fd: i32) -> Result<(DisplayInfo, usize), i32> {
-    use crate::startup::{global, Dependency};
+    use crate::startup::{Dependency, global};
     let mut first_wait_logged = false;
     global().drive(
         Dependency::Display,
         |errno| errno == EAGAIN,
-        || {
-            let mut note = |detail: String| {
-                if !std::mem::replace(&mut first_wait_logged, true) {
-                    diag_line(format!("uiserver: waiting for primary display provider ({detail})").as_str());
-                }
-            };
-            match display_get_info(display_fd) {
-                Ok(display) => match validate_display_info_with_retry(&display) {
-                    Ok(stride) => Ok((display, stride)),
-                    Err(DisplayValidationError::Fatal(err)) => Err(err),
-                    Err(DisplayValidationError::NotPrimaryYet) => {
-                        note(format!(
-                            "initial flags={:#x} gen={}",
-                            display.flags, display.generation
-                        ));
-                        Err(EAGAIN)
-                    }
-                },
-                Err(errno) if display_info_unavailable_is_retryable(errno) => {
-                    note(format!("get-info errno={errno}"));
-                    Err(EAGAIN)
-                }
-                Err(errno) => {
-                    debug_line(&format!("uiserver: display_get_info failed errno={errno}"));
-                    diag_line("uiserver: display_get_info failed");
-                    Err(13)
-                }
-            }
-        },
+        || probe_primary_display(display_fd, &mut first_wait_logged),
     )
 }
 
-fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
+fn recover_primary_display(display_fd: i32) -> Result<(DisplayInfo, usize), i32> {
+    let mut first_wait_logged = false;
+    retry_within_budget(
+        DISPLAY_RECOVERY_BUDGET,
+        DISPLAY_RECOVERY_BACKOFF,
+        |errno| errno == EAGAIN,
+        || probe_primary_display(display_fd, &mut first_wait_logged),
+    )
+}
+
+fn fetch_surface_state(display_fd: i32, recovering: bool) -> Result<DisplaySurfaceState, i32> {
     // Wait for the primary display provider to register before we attempt
     // surface creation. This guards against the boot-time race where
     // `runtimed` can spawn uiserver before the DVM/hardware display provider
@@ -197,7 +243,11 @@ fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
         // Re-fetch display info each surface attempt: after a generation
         // mismatch (or the primary-provider wait below) the geometry may have
         // changed and we need fresh dimensions for create_surface.
-        let (display, display_stride_bytes) = wait_for_primary_display(display_fd)?;
+        let (display, display_stride_bytes) = if recovering {
+            recover_primary_display(display_fd)?
+        } else {
+            wait_for_primary_display(display_fd)?
+        };
 
         let display_contract = format!(
             "uiserver: display_get_info attempt={} width={} height={} stride={} bpp={} fmt={} flags={:#x} gen={}",
@@ -336,7 +386,7 @@ impl AppState {
 
         diag_line("uiserver: init fetch_surface begin");
         boot_line("uiserver: init fetch_surface begin");
-        let surface_state = fetch_surface_state(display_fd.as_raw_fd())?;
+        let surface_state = fetch_surface_state(display_fd.as_raw_fd(), false)?;
         diag_line("uiserver: init fetch_surface done");
         boot_line("uiserver: init fetch_surface done");
         crate::startup::global().succeed(crate::startup::Dependency::Display);
@@ -408,6 +458,7 @@ impl AppState {
             next_console_snapshot_index: 0,
             wayland_windows: Vec::new(),
             wayland_opaque_cache: Vec::new(),
+            wayland_pending_damage: Vec::new(),
             dragging_window: None,
             drag_offset_x: 0,
             drag_offset_y: 0,
@@ -416,7 +467,7 @@ impl AppState {
 
     pub(crate) fn refresh_display_surface(&mut self) -> Result<(), i32> {
         self.gpu_compositor = None;
-        let surface_state = fetch_surface_state(self.display_fd.as_raw_fd())?;
+        let surface_state = fetch_surface_state(self.display_fd.as_raw_fd(), true)?;
         self.display = surface_state.display;
         self.surface = surface_state.surface;
         self.surface_fd = surface_state.surface_fd;
@@ -579,9 +630,7 @@ fn load_launcher_programs() -> Vec<LauncherProgram> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        display_info_unavailable_is_retryable, validate_surface_metadata,
-    };
+    use super::{display_info_unavailable_is_retryable, validate_surface_metadata};
     use crate::sys::{
         DisplayInfo, DisplaySurfaceCreate, EAGAIN, EINVAL, ENODEV, PIXEL_FORMAT_BGRA8888,
     };
@@ -631,6 +680,38 @@ mod tests {
         let policy = crate::startup::Dependency::Display.policy();
         assert!(policy.total_budget >= std::time::Duration::from_secs(10));
         assert!(policy.total_budget <= std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn recovery_retry_is_bounded_and_ignores_the_terminal_startup_state() {
+        use std::time::Duration;
+        // Display is already Ready after the first surface; recovery must not
+        // route through the startup driver (which would answer ECANCELED).
+        let mut calls = 0;
+        let ok = super::retry_within_budget(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            |errno| errno == EAGAIN,
+            || {
+                calls += 1;
+                if calls < 3 { Err(EAGAIN) } else { Ok(calls) }
+            },
+        );
+        assert_eq!(ok, Ok(3));
+        let fatal: Result<(), i32> = super::retry_within_budget(
+            Duration::from_secs(5),
+            Duration::ZERO,
+            |errno| errno == EAGAIN,
+            || Err(EINVAL),
+        );
+        assert_eq!(fatal, Err(EINVAL));
+        let exhausted: Result<(), i32> = super::retry_within_budget(
+            Duration::ZERO,
+            Duration::ZERO,
+            |errno| errno == EAGAIN,
+            || Err(EAGAIN),
+        );
+        assert_eq!(exhausted, Err(EAGAIN));
     }
 
     #[test]

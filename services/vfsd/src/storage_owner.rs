@@ -263,7 +263,15 @@ impl ReadAt for SnapshotReader<'_> {
         // before device IPC. The data lease contains no FAT namespace borrow.
         let started = monotonic_nanos();
         let result = (|| {
-            lock_vfs_storage().validate_executable_snapshot_plan(self.plan)?;
+            let (valid, mount_gen, storage_epoch) = {
+                let mut storage = lock_vfs_storage();
+                let res = storage.validate_executable_snapshot_plan(self.plan);
+                (res, storage.mount_generation, storage.dvm_storage_epoch)
+            };
+            if valid.is_err() {
+                snapshot_cache::invalidate_if_stale(mount_gen, storage_epoch);
+            }
+            valid?;
             match self.source.as_mut() {
                 Some(source) => source.read_at(offset, output).map_err(map_range_error),
                 None => early_system::read(self.plan.path.as_str(), offset, output)?.ok_or(EIO),
@@ -354,7 +362,13 @@ pub(crate) fn open_executable_snapshot(
     if budget_expired(deadline, started_ns) {
         return Err(ETIMEDOUT);
     }
-    let plan = match lock_vfs_storage().plan_executable_snapshot(request)? {
+    let (admission, current_mount_gen, current_storage_epoch) = {
+        let mut storage = lock_vfs_storage();
+        let res = storage.plan_executable_snapshot(request);
+        (res, storage.mount_generation, storage.dvm_storage_epoch)
+    };
+    snapshot_cache::invalidate_if_stale(current_mount_gen, current_storage_epoch);
+    let plan = match admission? {
         ExecutableSnapshotAdmission::Cached(open) => {
             control.set_total(open.file_bytes());
             control.progress(open.file_bytes());
@@ -432,13 +446,37 @@ pub(crate) fn open_executable_snapshot(
     if budget_expired(deadline, monotonic_nanos()) { return Err(ETIMEDOUT); }
     let digest_bytes = digest.map(SnapshotDigest::finalize);
     let read_ns = monotonic_nanos();
-    let publication = {
+    let (publication, cache_key, current_mount_gen, current_storage_epoch) = {
         let mut storage = lock_vfs_storage();
-        storage.commit_executable_snapshot(&plan, &snapshot, digest_bytes)
+        let pub_res = storage.commit_executable_snapshot(&plan, &snapshot, digest_bytes);
+        // Retain in the 1-entry sealed snapshot cache only when the image is
+        // small enough not to pin multi-hundred-MiB physical RAM across the boot
+        // (<= 32 MiB; the 300 MiB Chrome binary is already backed by the kernel
+        // demand-paged shared library object on first `mmap`).
+        let is_immutable_dvm = plan.backing == ExecutableSnapshotBacking::DvmVolume
+            && plan.storage_epoch != 0
+            && plan.metadata_len <= 32 * 1024 * 1024
+            && storage
+                .mounts
+                .by_id(plan.mount_id)
+                .is_some_and(|mount| mount.volume.is_immutable());
+        let key = (pub_res.is_ok() && is_immutable_dvm).then(|| snapshot_cache::SnapshotCacheKey {
+            path: plan.path.clone(),
+            mount_id: plan.mount_id,
+            file_identity: plan.read_map.as_ref().map(|map| map.identity()),
+            file_len: plan.metadata_len,
+            mount_generation: plan.mount_generation,
+            dvm_storage_epoch: plan.storage_epoch,
+        });
+        (pub_res, key, storage.mount_generation, storage.dvm_storage_epoch)
     };
+    snapshot_cache::invalidate_if_stale(current_mount_gen, current_storage_epoch);
     // The old object (including hundreds of MiB of frames on error) must be
     // destroyed only after the storage owner has been released.
     let result = publication.map(|cached| cached.unwrap_or(snapshot));
+    if let (Ok(ref open), Some(key)) = (&result, cache_key) {
+        snapshot_cache::register(key, open.fd());
+    }
     let committed_ns = monotonic_nanos();
     // Emitted for every snapshot, not only slow ones. The caller can only ever
     // report "the reply did not arrive"; without a provider-side split of plan,

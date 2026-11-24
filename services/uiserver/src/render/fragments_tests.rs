@@ -11,10 +11,11 @@ fn rect(x: usize, y: usize, width: usize, height: usize) -> Rect {
 }
 
 fn window(outer: Rect, alpha: u32) -> WaylandWindowSnapshot {
-    // The wire snapshot stores client dimensions; outer includes a 36px title
-    // and one-pixel border on each side.
-    let width = outer.width - 2;
-    let height = outer.height - crate::layout::WINDOW_TITLE_HEIGHT - 2;
+    // The wire snapshot stores client dimensions; outer includes title bar
+    // and borders on each side.
+    let border = crate::layout::window_border();
+    let width = outer.width - border * 2;
+    let height = outer.height - crate::layout::window_title_height() - border * 2;
     WaylandWindowSnapshot {
         surface_id: 1,
         title: "fragments".into(),
@@ -73,10 +74,12 @@ fn desktop_and_2530x1390_maximized_window_fit_actual_2688x2560_atlas() {
             .any(|f| f.layer_index == 0 && f.destination.contains(20, 30)),
         "desktop must remain beneath translucent title/corners"
     );
-    assert!(fragments
-        .iter()
-        .filter(|f| f.layer_index == 0)
-        .all(|f| f.destination.intersect(opaque).is_empty()));
+    assert!(
+        fragments
+            .iter()
+            .filter(|f| f.layer_index == 0)
+            .all(|f| f.destination.intersect(opaque).is_empty())
+    );
     for (fragment, region) in fragments.iter().zip(&regions) {
         assert_eq!(
             (fragment.destination.width, fragment.destination.height),
@@ -507,4 +510,87 @@ fn desktop_and_maximized_window_at_2880x1800_fit_dynamic_atlas() {
         packed(&layers, output, 3008, 2944).expect("2880x1800 desktop + maximized client + dock");
     assert_eq!(fragments.len(), regions.len());
     assert!(fragments.iter().any(|f| f.layer_index == 1));
+}
+
+#[test]
+fn cropped_client_commit_patches_only_damaged_fragment_pixels() {
+    let outer = rect(10, 20, 200, 160);
+    let mut win = window(outer, 255);
+    let client = wayland_window_client_rect_for(&win, rect(0, 0, outer.width, outer.height));
+    // Two retained fragments: the left strip and the right strip of the window.
+    let left = rect(0, 0, 100, outer.height);
+    let right = rect(100, 0, 100, outer.height);
+    let stride = 256;
+    let left_region = rect(0, 0, 100, outer.height);
+    let right_region = rect(120, 0, 100, outer.height);
+    let mut atlas = vec![0xdead_beef_u32; stride * 200];
+    let binding = super::super::CroppedWaylandBinding {
+        surface_id: 1,
+        content_version: 1,
+        outer,
+        focused: true,
+        pixels_opaque: true,
+        fragments: vec![(left, left_region), (right, right_region)],
+    };
+    // Client damage straddling the fragment seam, 4x2 at client (client.width/2 - 2, 3).
+    let seam = 100 - client.x;
+    let damage_rect = rect(seam - 2, 3, 4, 2);
+    let width = win.width;
+    let mut pixels = vec![0xff11_2233_u32; width * win.height];
+    for row in 3..5 {
+        for column in seam - 2..seam + 2 {
+            pixels[row * width + column] = 0xff00_00ff;
+        }
+    }
+    win.pixels = Arc::new(pixels);
+    let mut damage = Vec::new();
+    assert!(
+        super::super::copy_wayland_damage_to_fragments(
+            &mut atlas,
+            stride,
+            &binding,
+            &win,
+            damage_rect,
+            &mut damage,
+        )
+        .unwrap()
+    );
+    assert_eq!(damage.len(), 2, "one patch per touched fragment");
+    let touched: usize = damage.iter().map(|r| r.width * r.height).sum();
+    assert_eq!(touched, 4 * 2, "only the damaged pixels are copied");
+    let changed = atlas.iter().filter(|&&p| p == 0xff00_00ff).count();
+    assert_eq!(changed, 8);
+    assert_eq!(
+        atlas.iter().filter(|&&p| p != 0xdead_beef).count(),
+        8,
+        "undamaged atlas pixels must not be touched"
+    );
+    // Exact placement: outer-local (seam+client.x-2, 3+client.y) -> left region.
+    let y = 3 + client.y;
+    let x = seam + client.x - 2;
+    assert_eq!(
+        atlas[(left_region.y + y) * stride + left_region.x + x],
+        0xff00_00ff
+    );
+    assert_eq!(
+        atlas[(right_region.y + y) * stride + right_region.x + (x + 2 - 100)],
+        0xff00_00ff
+    );
+
+    // A translucent pixel in an occlusion-proving window invalidates the fragment set.
+    let mut translucent = vec![0xff11_2233_u32; width * win.height];
+    translucent[3 * width + seam] = 0x7f00_0000;
+    win.pixels = Arc::new(translucent);
+    let mut ignored = Vec::new();
+    assert!(
+        !super::super::copy_wayland_damage_to_fragments(
+            &mut atlas,
+            stride,
+            &binding,
+            &win,
+            damage_rect,
+            &mut ignored,
+        )
+        .unwrap()
+    );
 }

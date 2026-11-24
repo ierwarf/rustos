@@ -13,9 +13,18 @@
 //! - **Streams:** a small table of sequential streams. A read that starts at or
 //!   just past the previous read's last window continues that stream; from the
 //!   second sequential read on the stream reads ahead, and its depth doubles per
-//!   sequential read up to `MAX_DEPTH` (Linux readahead ramp-up). Interleaved
-//!   streams, such as several parallel readers of one file, are tracked
-//!   independently instead of resetting one shared frontier.
+//!   sequential read up to the current cap (Linux readahead ramp-up). A read
+//!   that skips windows ahead of its stream halves the depth and, below
+//!   `INITIAL_DEPTH`, stops read-ahead until sequential order is seen again
+//!   (ramp-down): a stream that jumps around fetches nothing speculative.
+//!   Interleaved streams, such as several parallel readers of one file, are
+//!   tracked independently instead of resetting one shared frontier.
+//! - **Feedback:** every speculative window is tagged. Consuming it counts as
+//!   used; being evicted or dropped unread counts as wasted. Each epoch of
+//!   resolved windows moves a global depth cap down when most were wasted and
+//!   back up when nearly all were used, so a workload whose access pattern
+//!   merely looks sequential (many processes faulting one big file) cannot keep
+//!   the device busy with data nobody reads.
 //! - **Completion:** exactly one pump thread collects completed tickets and
 //!   wakes the readers waiting on them, so readers never contend for transport
 //!   waits and a read-ahead window completes without any reader asking for it.
@@ -65,6 +74,8 @@ const STREAM_SLACK_WINDOWS: u64 = 2;
 const STREAM_BACKWARD_WINDOWS: u64 = 4;
 const FREE_BUFFER_LIMIT: usize = 64;
 const REPORT_INTERVAL_READS: u64 = 1024;
+/// Resolved speculative windows per feedback epoch.
+const FEEDBACK_EPOCH: u64 = 32;
 
 /// Device geometry a read is validated against. A change of any field drops
 /// every cached and in-flight window.
@@ -148,6 +159,8 @@ struct Segment {
 
 struct Window {
     state: State,
+    /// Fetched speculatively and not read yet.
+    ahead: bool,
     /// Larger is more recent; zero marks consumed streaming data, evicted first.
     stamp: u64,
     submitted: Instant,
@@ -163,6 +176,12 @@ struct Stream {
 }
 
 struct Inner {
+    /// Current ceiling of any stream's depth, moved by used/wasted feedback.
+    depth_cap: u64,
+    epoch_used: u64,
+    epoch_wasted: u64,
+    ahead_used_total: u64,
+    ahead_wasted_total: u64,
     geometry: Option<Geometry>,
     windows: BTreeMap<u64, Window>,
     streams: Vec<Stream>,
@@ -203,6 +222,11 @@ pub(crate) struct Engine {
 impl Inner {
     const fn new() -> Self {
         Self {
+            depth_cap: MAX_DEPTH,
+            epoch_used: 0,
+            epoch_wasted: 0,
+            ahead_used_total: 0,
+            ahead_wasted_total: 0,
             geometry: None,
             windows: BTreeMap::new(),
             streams: Vec::new(),
@@ -258,11 +282,35 @@ impl Inner {
                     };
                     self.windows.insert(index, window);
                 }
-                State::Ready(bytes) => self.release(bytes),
+                State::Ready(bytes) => {
+                    if window.ahead {
+                        self.resolve_ahead(0, 1);
+                    }
+                    self.release(bytes);
+                }
                 State::Failed(_) => {}
             }
         }
         self.streams.clear();
+    }
+
+    /// Feeds speculative-window outcomes back into the depth cap.
+    fn resolve_ahead(&mut self, used: u64, wasted: u64) {
+        self.epoch_used += used;
+        self.epoch_wasted += wasted;
+        self.ahead_used_total += used;
+        self.ahead_wasted_total += wasted;
+        let total = self.epoch_used + self.epoch_wasted;
+        if total < FEEDBACK_EPOCH {
+            return;
+        }
+        if self.epoch_wasted * 2 > total {
+            self.depth_cap = (self.depth_cap / 2).max(INITIAL_DEPTH);
+        } else if self.epoch_wasted * 4 <= total {
+            self.depth_cap = (self.depth_cap * 2).min(MAX_DEPTH);
+        }
+        self.epoch_used = 0;
+        self.epoch_wasted = 0;
     }
 
     /// Rebinds to `geometry`, dropping state of any other generation or shape.
@@ -290,9 +338,13 @@ impl Inner {
             Some(index) => {
                 if let Some(Window {
                     state: State::Ready(bytes),
+                    ahead,
                     ..
                 }) = self.windows.remove(&index)
                 {
+                    if ahead {
+                        self.resolve_ahead(0, 1);
+                    }
                     self.release(bytes);
                 }
                 true
@@ -304,19 +356,34 @@ impl Inner {
     /// Records a read of windows `first..=last`; returns its stream id.
     fn note_access(&mut self, first: u64, last: u64) -> u64 {
         let stamp = self.next_stamp();
+        let cap = self.depth_cap;
         if let Some(stream) = self.streams.iter_mut().find(|s| {
             first + STREAM_BACKWARD_WINDOWS >= s.last_window
                 && first <= s.last_window + STREAM_SLACK_WINDOWS
         }) {
-            stream.run = stream.run.saturating_add(1);
+            let skipped = first > stream.last_window + 1;
             stream.last_window = last.max(stream.last_window);
             stream.stamp = stamp;
-            if stream.run >= 2 {
-                stream.depth = if stream.depth == 0 {
-                    INITIAL_DEPTH
-                } else {
-                    (stream.depth * 2).min(MAX_DEPTH)
-                };
+            if skipped {
+                // Ramp-down: windows were jumped over, so the stream is not
+                // reading what was fetched for it. Halve the depth; below the
+                // initial depth stop reading ahead until order returns.
+                stream.depth /= 2;
+                if stream.depth < INITIAL_DEPTH {
+                    stream.depth = 0;
+                    stream.run = 1;
+                }
+                stream.ahead_end = stream.ahead_end.min(stream.last_window);
+            } else {
+                stream.run = stream.run.saturating_add(1);
+                if stream.run >= 2 {
+                    stream.depth = if stream.depth == 0 {
+                        INITIAL_DEPTH
+                    } else {
+                        stream.depth * 2
+                    }
+                    .min(cap);
+                }
             }
             return stream.id;
         }
@@ -392,6 +459,7 @@ impl Engine {
                     buf: Some(buf),
                     stale: false,
                 },
+                ahead: !demand,
                 stamp,
                 submitted: Instant::now(),
             },
@@ -425,14 +493,15 @@ impl Engine {
         let Some(stream) = inner.streams.iter().find(|s| s.id == stream_id) else {
             return;
         };
-        if stream.depth == 0 {
+        let depth = stream.depth.min(inner.depth_cap);
+        if depth == 0 {
             return;
         }
         let lead = stream.ahead_end.saturating_sub(stream.last_window);
-        if only_when_low && lead >= stream.depth / 2 {
+        if only_when_low && lead >= depth / 2 {
             return;
         }
-        let target = (stream.last_window + stream.depth).min(geometry.last_window());
+        let target = (stream.last_window + depth).min(geometry.last_window());
         let mut next = stream.ahead_end.max(stream.last_window) + 1;
         while next <= target && inner.in_flight < IN_FLIGHT_LIMIT {
             if !inner.windows.contains_key(&next) {
@@ -561,10 +630,11 @@ impl Engine {
             .streams
             .iter()
             .any(|s| s.id == stream_id && s.depth > 0);
+        let cap = inner.depth_cap;
         let low = inner.streams.iter().any(|s| {
             s.id == stream_id
                 && s.depth > 0
-                && s.ahead_end.saturating_sub(s.last_window) < s.depth / 2
+                && s.ahead_end.saturating_sub(s.last_window) < s.depth.min(cap) / 2
         });
         if low {
             // ORDERING: Relaxed; `top_up` re-reads the state under the lock.
@@ -572,6 +642,7 @@ impl Engine {
         }
         let expected = (last - first + 1) as usize;
         let mut segments = Vec::with_capacity(expected);
+        let mut used = 0;
         for index in first..=last {
             let (start, blocks) = geometry.window_extent(index);
             let from = lba.max(start);
@@ -592,7 +663,14 @@ impl Engine {
                     });
                 }
                 window.stamp = stamp;
+                if window.ahead {
+                    window.ahead = false;
+                    used += 1;
+                }
             }
+        }
+        if used != 0 {
+            inner.resolve_ahead(used, 0);
         }
         // Every window was `Ready` under this same lock hold, so a gap is an
         // engine bug; never report success with bytes missing from `out`.
@@ -656,6 +734,7 @@ impl Engine {
             index,
             Window {
                 state: State::Ready(Arc::new(bytes)),
+                ahead: false,
                 stamp,
                 submitted: Instant::now(),
             },
@@ -799,9 +878,17 @@ impl Engine {
         if reads == 0 || reads % REPORT_INTERVAL_READS != 0 {
             return;
         }
-        let streams = self.lock().streams.len();
+        let (streams, used, wasted, cap) = {
+            let inner = self.lock();
+            (
+                inner.streams.len(),
+                inner.ahead_used_total,
+                inner.ahead_wasted_total,
+                inner.depth_cap,
+            )
+        };
         eprintln!(
-            "storaged: read engine reads={reads} waited={} stall_us={} demand_windows={} ahead_windows={} in_flight_peak={} streams={streams}",
+            "storaged: read engine reads={reads} waited={} stall_us={} demand_windows={} ahead_windows={} in_flight_peak={} streams={streams} ahead_used={used} ahead_wasted={wasted} depth_cap={cap}",
             self.stats.waited.load(Ordering::Relaxed),
             self.stats.stall_ns.load(Ordering::Relaxed) / 1_000,
             self.stats.demand_windows.load(Ordering::Relaxed),
@@ -1012,6 +1099,81 @@ mod tests {
             "the stream must have read ahead of what it consumed"
         );
         assert!(submitted.len() as u64 <= read_windows + MAX_DEPTH + 1);
+    }
+
+    #[test]
+    fn reads_that_skip_windows_ramp_the_stream_down_to_no_read_ahead() {
+        let engine = Engine::new();
+        let fake = Fake::default();
+        let geo = geometry(512 * WINDOW_BLOCKS);
+        let mut last_read_window = 0;
+        with_pump(&engine, &fake, || {
+            let mut out = vec![0_u8; BLOCK];
+            // Sequential phase: the stream ramps up to its full depth.
+            for window in 0..8_u64 {
+                engine
+                    .read(&fake, geo, window * WINDOW_BLOCKS, 1, &mut out)
+                    .expect("sequential read");
+                engine.top_up(&fake);
+            }
+            // Strided phase: every read skips one window, as a process that
+            // faults every other page range of a mapped file does.
+            for step in 0..40_u64 {
+                let window = 8 + step * 2 + 1;
+                engine
+                    .read(&fake, geo, window * WINDOW_BLOCKS, 1, &mut out)
+                    .expect("strided read");
+                engine.top_up(&fake);
+                last_read_window = window;
+            }
+        });
+        let farthest = fake
+            .submitted()
+            .iter()
+            .map(|(lba, _)| lba / WINDOW_BLOCKS)
+            .max()
+            .unwrap();
+        assert!(
+            farthest <= last_read_window + 8,
+            "a skipping stream kept reading {} windows ahead",
+            farthest - last_read_window
+        );
+    }
+
+    #[test]
+    fn wasted_read_ahead_lowers_the_depth_cap_and_used_read_ahead_restores_it() {
+        let mut inner = Inner::new();
+        assert_eq!(inner.depth_cap, MAX_DEPTH);
+        for _ in 0..FEEDBACK_EPOCH {
+            inner.resolve_ahead(0, 1);
+        }
+        assert_eq!(inner.depth_cap, MAX_DEPTH / 2);
+        for _ in 0..8 {
+            for _ in 0..FEEDBACK_EPOCH {
+                inner.resolve_ahead(0, 1);
+            }
+        }
+        assert_eq!(inner.depth_cap, INITIAL_DEPTH, "never below the initial depth");
+        for _ in 0..8 {
+            for _ in 0..FEEDBACK_EPOCH {
+                inner.resolve_ahead(1, 0);
+            }
+        }
+        assert_eq!(inner.depth_cap, MAX_DEPTH);
+        // A mixed epoch (a third wasted) holds the cap where it is.
+        inner.depth_cap = 10;
+        for index in 0..FEEDBACK_EPOCH {
+            if index % 3 == 0 {
+                inner.resolve_ahead(0, 1);
+            } else {
+                inner.resolve_ahead(1, 0);
+            }
+        }
+        assert_eq!(inner.depth_cap, 10);
+        assert_eq!(
+            inner.ahead_used_total + inner.ahead_wasted_total,
+            18 * FEEDBACK_EPOCH
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ use rustos_user_abi::syscall::{
     LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROCD_ARG_BYTES, PROCD_ENV_BYTES,
     PROCD_IPC_ABI_VERSION, PROCD_OP_EXECVE, PROCD_OP_EXECVEAT, PROCD_OP_FORK,
     PROCD_OP_RT_SIGACTION, PROCD_OP_RT_SIGPROCMASK, PROCD_OP_SELECT_SIGNAL, PROCD_OP_SIGALTSTACK,
-    PROCD_OP_TGKILL, PROCD_OP_THREAD_PLAN, PROCD_OP_WAIT4, PROCD_PATH_CAPACITY,
+    PROCD_OP_TGKILL, PROCD_OP_WAIT4, PROCD_PATH_CAPACITY,
     PROCD_PAYLOAD_CAPACITY, PROCD_SELECT_SIGNAL_HANDLER, PROCD_SELECT_SIGNAL_IGNORE,
     PROCD_SELECT_SIGNAL_NONE, PROCD_SELECT_SIGNAL_STOP, PROCD_SELECT_SIGNAL_TERMINATE,
     PROCD_SIGCHLD_EVENT_MASK, PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
@@ -65,6 +65,21 @@ static PROCESS_SIGNAL_POLICY: Mutex<BTreeMap<u64, ProcessSignalPolicy>> =
     Mutex::new(BTreeMap::new());
 static THREAD_SIGNAL_POLICY: Mutex<BTreeMap<(u64, u64), ThreadSignalPolicy>> =
     Mutex::new(BTreeMap::new());
+/// Serializes "drain the kernel's lifecycle queue and apply it" across the
+/// receiver threads, so a request never runs before exit evidence another
+/// receiver already took from the queue has been applied.
+static LIFECYCLE_DRAIN: Mutex<()> = Mutex::new(());
+/// Parents with a fork in progress, with the number of forks outstanding.
+static FORKS_IN_FLIGHT: Mutex<BTreeMap<u64, u32>> = Mutex::new(BTreeMap::new());
+/// Monotonic epoch bumped whenever a `ForkInFlight` finishes, so child
+/// requests sleep on a futex instead of spinning on `sched_yield`.
+static FORK_IN_FLIGHT_EPOCH: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+/// Upper bound a child's first request waits for its parent's fork to finish
+/// inheriting policy. A fork that is still unpublished never has a running
+/// child, so reaching this bound means procd itself is wedged.
+const FORK_INHERIT_WAIT_NS: u64 = 5_000_000_000;
+const EAGAIN: i32 = 11;
 
 #[cfg(not(test))]
 rustos_svc_runtime::entry!(service_main);
@@ -98,9 +113,13 @@ fn service_main() {
     // acknowledges evidence accumulated while its predecessor was absent.
     drain_lifecycle_events();
     ipc::debug_line("procd: lifecycle drain ready");
+    pool::publish_endpoint(endpoint as u64);
     serve(endpoint as u64);
 }
 
+/// Main receive loop. Long-running fork/exec calls spawn transient overflow
+/// receivers (see `pool`) so signal-policy calls do not queue behind them
+/// without occupying permanent task-table slots when procd is idle.
 fn serve(endpoint: u64) {
     let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
     let mut reply_cap = 0_u64;
@@ -147,6 +166,70 @@ fn serve(endpoint: u64) {
         } else {
             next
         };
+    }
+}
+
+/// Transient overflow receive loop run only while a fork or exec is in flight.
+/// Replies on the same thread that received each request, preserving the
+/// rendezvous reply-thread invariant, and exits as soon as no slow op remains.
+#[cfg(not(test))]
+fn serve_transient(endpoint: u64) {
+    const TRANSIENT_IDLE_TIMEOUT_MS: u64 = 5;
+    const EINTR: i64 = 4;
+    let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
+    let mut reply_cap = 0_u64;
+    let mut sender_pid = 0_u64;
+    let mut sender_tid = 0_u64;
+    loop {
+        // Drain any immediately queued request before parking on the endpoint.
+        // SAFETY: every output is exclusive and live for the non-blocking receive.
+        let mut received = unsafe {
+            ipc::try_recv_with_sender(
+                endpoint,
+                request.as_mut_ptr(),
+                request.len(),
+                &mut reply_cap as *mut u64,
+                &mut sender_pid as *mut u64,
+                &mut sender_tid as *mut u64,
+            )
+        };
+        if received < 0 {
+            if pool::slow_ops_in_flight() == 0 {
+                break;
+            }
+            let args = rustos_user_abi::syscall::IpcRecvWithSenderArgs {
+                endpoint,
+                request_ptr: request.as_mut_ptr() as u64,
+                request_capacity: request.len() as u64,
+                reply_cap_ptr: (&mut reply_cap as *mut u64) as u64,
+                sender_pid_ptr: (&mut sender_pid as *mut u64) as u64,
+                sender_tid_ptr: (&mut sender_tid as *mut u64) as u64,
+            };
+            // Park on the endpoint with a short bounded budget instead of spinning
+            // on `sched_yield`, so idle helpers consume zero scheduling budget.
+            // SAFETY: `args` and all output buffers are live and exclusive.
+            received = unsafe {
+                rustos_svc_runtime::syscall::syscall2(
+                    rustos_user_abi::syscall::SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED,
+                    (&args as *const rustos_user_abi::syscall::IpcRecvWithSenderArgs) as u64,
+                    TRANSIENT_IDLE_TIMEOUT_MS,
+                )
+            };
+        }
+        if received >= 0 {
+            drain_lifecycle_events();
+            let response = handle_wire_request(received as usize, &request, sender_pid, sender_tid);
+            // SAFETY: `reply_cap` is the one-shot capability from the receive
+            // above and `response` lives for the synchronous reply copy.
+            let _ = unsafe { ipc::reply(reply_cap, response.as_ptr(), response.len()) };
+            continue;
+        }
+        if pool::slow_ops_in_flight() == 0 {
+            break;
+        }
+        if received != -i64::from(EAGAIN) && received != -EINTR {
+            break;
+        }
     }
 }
 
@@ -217,6 +300,7 @@ fn handle_wire_request(
 }
 
 fn drain_lifecycle_events() {
+    let _serialized = LIFECYCLE_DRAIN.lock();
     let mut events = [LifecycleEventWire::default(); LIFECYCLE_DRAIN_MAX_EVENTS];
     let mut count: u32 = 0;
     let args = LifecycleDrainBrokerArgs {
@@ -294,6 +378,12 @@ fn handle_request(
         response.status = errno;
         return response;
     }
+    // A child's first request can be received on another thread before the
+    // forking thread has copied the parent's dispositions to it.
+    if request.op != PROCD_OP_FORK && !wait_for_parent_fork(request.parent_pid) {
+        response.status = EAGAIN;
+        return response;
+    }
 
     match request.op {
         PROCD_OP_EXECVE | PROCD_OP_EXECVEAT => handle_exec(request, &mut response),
@@ -304,7 +394,6 @@ fn handle_request(
         PROCD_OP_SIGALTSTACK => handle_sigaltstack(request, &mut response),
         PROCD_OP_TGKILL => handle_tgkill(request, &mut response),
         PROCD_OP_SELECT_SIGNAL => handle_select_signal(request, &mut response),
-        PROCD_OP_THREAD_PLAN => handle_thread_plan(request, &mut response),
         _ => response.status = EINVAL,
     }
     response
@@ -482,6 +571,7 @@ fn handle_exec(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
         response.status = EINVAL;
         return;
     }
+    let _slow = pool::SlowOpGuard::enter();
 
     let ticket_args = RustosProcAuthorizeExecBrokerArgs {
         abi_version: rustos_user_abi::syscall::PROC_BROKER_ABI_VERSION,
@@ -589,6 +679,8 @@ fn handle_fork(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
         return;
     }
     let clone_flags = request.arg0;
+    let _fork = ForkInFlight::begin(request.pid);
+    let _slow = pool::SlowOpGuard::enter();
     let args = RustosProcForkBrokerArgs {
         abi_version: rustos_user_abi::syscall::PROC_BROKER_ABI_VERSION,
         source_pid: request.pid,
@@ -615,39 +707,250 @@ fn handle_fork(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
     }
 }
 
-fn handle_thread_plan(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
-    if !valid_thread_plan(request) {
-        response.status = EINVAL;
+/// Marks `parent` as forking from before the kernel can publish the child
+/// until its signal policy has been inherited.
+struct ForkInFlight(u64);
+
+impl ForkInFlight {
+    fn begin(parent: u64) -> Self {
+        *FORKS_IN_FLIGHT.lock().entry(parent).or_insert(0) += 1;
+        Self(parent)
     }
 }
 
-fn valid_thread_plan(request: &ProcdIpcRequest) -> bool {
-    const CSIGNAL: u64 = 0xff;
-    const CLONE_VM: u64 = 0x0000_0100;
-    const CLONE_FS: u64 = 0x0000_0200;
-    const CLONE_FILES: u64 = 0x0000_0400;
-    const CLONE_SIGHAND: u64 = 0x0000_0800;
-    const CLONE_THREAD: u64 = 0x0001_0000;
-    const CLONE_SYSVSEM: u64 = 0x0004_0000;
-    const CLONE_SETTLS: u64 = 0x0008_0000;
-    const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
-    const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
-    const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
-    const REQUIRED_THREAD_FLAGS: u64 =
-        CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
-    const OPTIONAL_THREAD_FLAGS: u64 = CLONE_SYSVSEM
-        | CLONE_SETTLS
-        | CLONE_PARENT_SETTID
-        | CLONE_CHILD_CLEARTID
-        | CLONE_CHILD_SETTID;
-    let flags = request.arg0;
-    let supported_flags = REQUIRED_THREAD_FLAGS | OPTIONAL_THREAD_FLAGS | CSIGNAL;
-    flags & REQUIRED_THREAD_FLAGS == REQUIRED_THREAD_FLAGS
-        && flags & CSIGNAL == 0
-        && flags & !supported_flags == 0
-        && request.arg1 != 0
-        && user_pointer_in_range(request.arg1)
-        && (flags & CLONE_SETTLS == 0 || request.arg4 == 0 || user_pointer_in_range(request.arg4))
+impl Drop for ForkInFlight {
+    fn drop(&mut self) {
+        {
+            let mut forks = FORKS_IN_FLIGHT.lock();
+            if let Some(count) = forks.get_mut(&self.0) {
+                *count -= 1;
+                if *count == 0 {
+                    forks.remove(&self.0);
+                }
+            }
+        }
+        // ORDERING: Release ensures the FORKS_IN_FLIGHT removal above is visible
+        // before any woken waiter re-reads `parent_is_forking`.
+        FORK_IN_FLIGHT_EPOCH.fetch_add(1, core::sync::atomic::Ordering::Release);
+        #[cfg(not(test))]
+        // SAFETY: `FORK_IN_FLIGHT_EPOCH` is a static aligned `AtomicU32`.
+        unsafe {
+            let _ = rustos_svc_runtime::syscall::futex_wake_private(
+                FORK_IN_FLIGHT_EPOCH.as_ptr(),
+                u32::MAX,
+            );
+        }
+    }
+}
+
+fn parent_is_forking(parent: u64) -> bool {
+    parent != 0 && FORKS_IN_FLIGHT.lock().contains_key(&parent)
+}
+
+/// Blocks while `parent_pid` is inside a fork, so the child it may be creating
+/// never observes (or overwrites) policy before inheritance. `false` means
+/// the bound expired and the request must fail rather than run on state that
+/// may be missing.
+fn wait_for_parent_fork(parent_pid: u64) -> bool {
+    if !parent_is_forking(parent_pid) {
+        return true;
+    }
+    // Keep endpoint service capacity available while this worker waits for the
+    // parent's fork inheritance to settle.
+    let _slow = pool::SlowOpGuard::enter();
+    let deadline = rustos_svc_runtime::syscall::monotonic_nanos().saturating_add(FORK_INHERIT_WAIT_NS);
+    loop {
+        // ORDERING: Acquire pairs with the Release bump in `ForkInFlight::drop`
+        // so we cannot miss a concurrent completion between checking the map
+        // and entering the futex sleep.
+        let epoch = FORK_IN_FLIGHT_EPOCH.load(core::sync::atomic::Ordering::Acquire);
+        if !parent_is_forking(parent_pid) {
+            return true;
+        }
+        let now = rustos_svc_runtime::syscall::monotonic_nanos();
+        if now >= deadline {
+            return false;
+        }
+        #[cfg(not(test))]
+        {
+            const FUTEX_WAIT_PRIVATE: u64 = 128;
+            let wait_ns = deadline.saturating_sub(now).min(100_000_000);
+            let ts = rustos_svc_runtime::syscall::KTimespec {
+                tv_sec: (wait_ns / 1_000_000_000) as i64,
+                tv_nsec: (wait_ns % 1_000_000_000) as i64,
+            };
+            // SAFETY: `FORK_IN_FLIGHT_EPOCH` and `ts` are live, aligned, and
+            // read-only for the kernel across the bounded private futex wait.
+            let _ = unsafe {
+                rustos_svc_runtime::syscall::syscall4(
+                    rustos_svc_runtime::syscall::SYS_FUTEX,
+                    FORK_IN_FLIGHT_EPOCH.as_ptr() as u64,
+                    FUTEX_WAIT_PRIVATE,
+                    u64::from(epoch),
+                    (&ts as *const rustos_svc_runtime::syscall::KTimespec) as u64,
+                )
+            };
+        }
+        #[cfg(test)]
+        {
+            let _ = epoch;
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// Extra receive threads on procd's endpoint. A thread is created through the
+/// kernel's own policy-owner path for procd, exactly like the heartbeat
+/// thread, so it never needs procd to plan it. If the kernel refuses (clone
+/// Transient overflow receive workers for slow fork/exec operations.
+///
+/// Every resident service thread consumes one slot of the 256-slot task table
+/// that application launch policy reserves against (Chrome requests 144 slots).
+/// Keeping zero resident workers preserves full launch headroom while still
+/// spawning up to `TRANSIENT_WORKERS` short-lived helpers onto static stacks
+/// whenever a fork or exec is in flight, releasing the stack in the same asm
+/// block that exits the thread (mirroring vfsd's snapshot stage threads).
+#[cfg(not(test))]
+mod pool {
+    use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+    const TRANSIENT_WORKERS: usize = 6;
+    const STACK_BYTES: usize = 256 * 1024;
+    const STACK_FREE: u32 = 0;
+    const STACK_BUSY: u32 = 1;
+    const SYS_EXIT: u64 = 60;
+
+    #[repr(align(16))]
+    // LAYOUT: the field is only addressed, never read, as a worker's stack.
+    struct Stack(#[allow(dead_code)] [u8; STACK_BYTES]);
+
+    // Each stack slot is exclusively owned by one transient worker from the
+    // `STACK_FREE -> STACK_BUSY` CAS until `exit_releasing_stack` stores
+    // `STACK_FREE` immediately before `SYS_EXIT`.
+    static mut STACKS: [Stack; TRANSIENT_WORKERS] = [const { Stack([0; STACK_BYTES]) }; TRANSIENT_WORKERS];
+    static STACK_STATE: [AtomicU32; TRANSIENT_WORKERS] = [const { AtomicU32::new(STACK_FREE) }; TRANSIENT_WORKERS];
+    static SLOW_OPS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+    static ENDPOINT: AtomicU64 = AtomicU64::new(0);
+
+    pub struct SlowOpGuard;
+
+    impl SlowOpGuard {
+        pub fn enter() -> Self {
+            // ORDERING: AcqRel publishes the active slow-op count before a
+            // newly spawned or running helper checks `slow_ops_in_flight`.
+            SLOW_OPS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+            maybe_spawn_helper();
+            Self
+        }
+    }
+
+    impl Drop for SlowOpGuard {
+        fn drop(&mut self) {
+            // ORDERING: Release pairs with the Acquire load in
+            // `slow_ops_in_flight` so helpers observe completion before exit.
+            SLOW_OPS_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    pub fn publish_endpoint(endpoint: u64) {
+        // ORDERING: Release pairs with the Acquire load in `entry`.
+        ENDPOINT.store(endpoint, Ordering::Release);
+    }
+
+    pub fn slow_ops_in_flight() -> usize {
+        // ORDERING: Acquire pairs with the Release decrement in `SlowOpGuard::drop`.
+        SLOW_OPS_IN_FLIGHT.load(Ordering::Acquire)
+    }
+
+    fn current_worker_index() -> usize {
+        let sp: usize;
+        // SAFETY: reads the current thread's stack pointer only.
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
+        }
+        let base = core::ptr::addr_of!(STACKS) as usize;
+        (sp - base - 1) / STACK_BYTES
+    }
+
+    fn exit_releasing_stack(state: &AtomicU32) -> ! {
+        // SAFETY: `state` is a static atomic; storing `STACK_FREE` has release
+        // semantics on x86 and the immediately following `SYS_EXIT` never
+        // touches the stack again, so a subsequent clone onto this stack
+        // cannot race with this exiting thread.
+        unsafe {
+            core::arch::asm!(
+                "mov dword ptr [{state}], {free}",
+                "syscall",
+                state = in(reg) state.as_ptr(),
+                free = const STACK_FREE,
+                in("rax") SYS_EXIT,
+                in("rdi") 0_u64,
+                options(noreturn),
+            );
+        }
+    }
+
+    extern "C" fn entry() -> ! {
+        let index = current_worker_index();
+        // ORDERING: Acquire pairs with the Release store in `publish_endpoint`.
+        let endpoint = ENDPOINT.load(Ordering::Acquire);
+        if endpoint != 0 {
+            super::serve_transient(endpoint);
+        }
+        exit_releasing_stack(&STACK_STATE[index])
+    }
+
+    fn maybe_spawn_helper() {
+        // ORDERING: Acquire pairs with `publish_endpoint`.
+        if ENDPOINT.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let target = SLOW_OPS_IN_FLIGHT
+            .load(Ordering::Acquire)
+            .min(TRANSIENT_WORKERS);
+        let mut active = STACK_STATE
+            .iter()
+            .filter(|state| state.load(Ordering::Acquire) == STACK_BUSY)
+            .count();
+        for index in 0..TRANSIENT_WORKERS {
+            if active >= target {
+                return;
+            }
+            // ORDERING: AcqRel claims exclusive ownership of `STACKS[index]`
+            // after the previous worker released it in `exit_releasing_stack`.
+            if STACK_STATE[index]
+                .compare_exchange(STACK_FREE, STACK_BUSY, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            // SAFETY: `index < TRANSIENT_WORKERS` and the CAS above granted
+            // exclusive ownership of this stack slot until `entry` releases it.
+            let top = unsafe {
+                (core::ptr::addr_of_mut!(STACKS) as *mut Stack).add(index) as *mut u8
+            }
+            .wrapping_add(STACK_BYTES) as u64;
+            // SAFETY: `top` ends an exclusively owned 16-byte aligned static
+            // stack, and `entry` never returns into this frame.
+            if unsafe { rustos_svc_runtime::worker::spawn(top, entry) }.is_err() {
+                // ORDERING: Release returns the unused stack slot to `STACK_FREE`.
+                STACK_STATE[index].store(STACK_FREE, Ordering::Release);
+                return;
+            }
+            active += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod pool {
+    pub struct SlowOpGuard;
+    impl SlowOpGuard {
+        pub fn enter() -> Self {
+            Self
+        }
+    }
+    pub fn publish_endpoint(_endpoint: u64) {}
 }
 
 fn user_pointer_in_range(ptr: u64) -> bool {
@@ -1143,6 +1446,41 @@ mod tests {
         let state = ThreadSignalPolicy::initial_from_request(&request);
         assert_eq!(state.signal_mask & unblockable_signal_bits(), 0);
         assert_eq!(state.signal_mask, !unblockable_signal_bits());
+    }
+
+    #[test]
+    fn fork_in_flight_gates_only_children_of_the_forking_parent() {
+        let parent = 7_001;
+        assert!(!parent_is_forking(parent));
+        assert!(wait_for_parent_fork(parent));
+        let outer = ForkInFlight::begin(parent);
+        let sibling = ForkInFlight::begin(parent);
+        assert!(parent_is_forking(parent));
+        // Unrelated processes and a parentless request are never delayed.
+        assert!(!parent_is_forking(7_002));
+        assert!(!parent_is_forking(0));
+        drop(outer);
+        assert!(parent_is_forking(parent), "one fork is still outstanding");
+        drop(sibling);
+        assert!(!parent_is_forking(parent));
+        assert!(FORKS_IN_FLIGHT.lock().get(&parent).is_none());
+    }
+
+    #[test]
+    fn child_request_waits_for_parent_inheritance_then_runs() {
+        let parent = 7_101;
+        let epoch_before = FORK_IN_FLIGHT_EPOCH.load(core::sync::atomic::Ordering::Relaxed);
+        let fork = ForkInFlight::begin(parent);
+        let waiter = std::thread::spawn(move || wait_for_parent_fork(parent));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!waiter.is_finished(), "child must wait while the fork is open");
+        drop(fork);
+        assert!(waiter.join().unwrap());
+        assert_ne!(
+            FORK_IN_FLIGHT_EPOCH.load(core::sync::atomic::Ordering::Relaxed),
+            epoch_before,
+            "completing an in-flight fork must advance the wake epoch"
+        );
     }
 
     #[test]

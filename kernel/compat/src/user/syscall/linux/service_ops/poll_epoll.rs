@@ -25,10 +25,6 @@ use alloc::vec;
 const MAX_POLL_FDS: usize = WAITSET_MAX_INTERESTS;
 const POLLFD_SIZE: usize = size_of::<linux_abi::LinuxPollFd>();
 const EPOLL_EVENT_SIZE: usize = size_of::<linux_abi::LinuxEpollEvent>();
-const WAITSET_INTEREST_SIZE: usize = size_of::<WaitSetInterestWire>();
-const WAITSET_SNAPSHOT_SIZE: usize = size_of::<WaitSetSnapshotWire>();
-const WAITSET_CLAIM_SIZE: usize = size_of::<WaitSetClaimWire>();
-const _: () = assert!(WAITSET_MAX_INTERESTS * WAITSET_SNAPSHOT_SIZE <= VFS_IPC_PAYLOAD_CAPACITY);
 const _: () = assert!(NETD_POLL_BATCH_MAX >= MAX_POLL_FDS);
 const WAITSET_PROVIDER_QUERY_TIMEOUT_MS: u64 =
     rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS;
@@ -532,7 +528,9 @@ fn route_one_poll_fd(
                 events & linux_abi::POLLIN as u32
             }))
         }
-        multitask::KernelHandle::Pipe(_) | multitask::KernelHandle::EventFd(_) => {
+        multitask::KernelHandle::Pipe(_)
+        | multitask::KernelHandle::EventFd(_)
+        | multitask::KernelHandle::UnixSocket(_) => {
             // Kernel-local object: readiness is read directly, with no
             // provider round trip, and its generation arms the waiter.
             let token = super::local_fd::waitset_object(&handle).ok_or(LINUX_EBADF)?;
@@ -1338,25 +1336,26 @@ fn sanitize_wait_signal_mask(mask: u64) -> u64 {
     mask & !unblockable
 }
 
+fn epoll_error_to_linux_errno(err: multitask::EpollError) -> i64 {
+    match err {
+        multitask::EpollError::Busy => LINUX_EBUSY,
+        multitask::EpollError::Capacity => LINUX_ENOSPC,
+        multitask::EpollError::Exists => LINUX_EEXIST,
+        multitask::EpollError::InvalidArgument => LINUX_EINVAL,
+        multitask::EpollError::NotFound => LINUX_ENOENT,
+    }
+}
+
 pub fn syscall_linux_epoll_create1(flags: u64) -> u64 {
     if flags & !linux_abi::EPOLL_CLOEXEC != 0 {
         return linux_errno(LINUX_EINVAL);
     }
-    let epoll = multitask::EpollHandle::new();
+    let epoll = match multitask::EpollHandle::create() {
+        Ok(epoll) => epoll,
+        Err(multitask::EpollError::Capacity) => return linux_errno(LINUX_EMFILE),
+        Err(err) => return linux_errno(epoll_error_to_linux_errno(err)),
+    };
     let epoll_token = epoll.token_id();
-    let mut request = new_vfs_request(VFS_IPC_OP_POLL_QUERY);
-    request.arg0 = VFS_POLL_QUERY_EPOLL_CREATE;
-    request.remote_id = epoll_token;
-    if let Err(errno) = call_vfs_ipc_request_with_timeout(&request, control::deadline_ms())
-        .and_then(|response| ensure_vfs_status(&response))
-    {
-        // A timeout can race the service commit. The token is globally unique
-        // and not yet published in the fd table, so an idempotent bounded
-        // retire safely removes a possibly-created orphan and otherwise gets
-        // ENOENT without affecting another epoll object.
-        let _ = retire_vfs_epoll_bounded(epoll_token);
-        return linux_errno(errno);
-    }
     let fd_flags = if flags & linux_abi::EPOLL_CLOEXEC != 0 {
         multitask::FD_CLOEXEC
     } else {
@@ -1373,11 +1372,11 @@ pub fn syscall_linux_epoll_create1(flags: u64) -> u64 {
     }) {
         Some(Some(fd)) => fd,
         Some(None) => {
-            let _ = retire_vfs_epoll(epoll_token);
+            retire_kernel_epoll(epoll_token);
             linux_errno(LINUX_EMFILE)
         }
         None => {
-            let _ = retire_vfs_epoll(epoll_token);
+            retire_kernel_epoll(epoll_token);
             linux_errno(LINUX_ENOSYS)
         }
     }
@@ -1391,11 +1390,6 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
         Ok(epoll) => epoll,
         Err(errno) => return linux_errno(errno),
     };
-    let mut request = new_vfs_request(VFS_IPC_OP_POLL_QUERY);
-    request.arg0 = VFS_POLL_QUERY_EPOLL_CTL;
-    request.arg1 = op;
-    request.fd = fd;
-    request.remote_id = epoll.token_id();
 
     if !matches!(
         op,
@@ -1414,21 +1408,12 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
         }
     } else {
         // DEL is keyed only by target fd plus open-description identity. Keep
-        // the wire structurally valid without making cleanup depend on a live
+        // the record structurally valid without making cleanup depend on a live
         // provider or its replacement epoch.
         1
     };
-    let mut wire = WaitSetInterestWire {
-        abi_version: WAITSET_ABI_VERSION,
-        provider: target.provider,
-        flags: 0,
-        target_fd: fd,
-        object_id: target.object_id,
-        provider_epoch,
-        ..WaitSetInterestWire::default()
-    };
 
-    match op {
+    let (events, data) = match op {
         linux_abi::EPOLL_CTL_ADD | linux_abi::EPOLL_CTL_MOD => {
             if event_ptr == 0 {
                 return linux_errno(LINUX_EINVAL);
@@ -1439,7 +1424,7 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
             };
             // Linux: EPOLLEXCLUSIVE is ADD-only and combines only with the
             // bits that make a wake-one hint meaningful. An interest added
-            // that way is later immutable (vfsd rejects the MOD too).
+            // that way is later immutable (the kernel registry rejects MOD too).
             if events & linux_abi::EPOLLEXCLUSIVE != 0
                 && (op == linux_abi::EPOLL_CTL_MOD
                     || events & !linux_abi::EPOLLEXCLUSIVE_OK_BITS != 0)
@@ -1448,25 +1433,22 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
             }
             // EPOLLWAKEUP needs CAP_BLOCK_SUSPEND; RustOS has no suspend
             // blockers, so it is dropped exactly as for an unprivileged caller.
-            wire.events = events & !linux_abi::EPOLLWAKEUP;
-            wire.data = data;
+            (events & !linux_abi::EPOLLWAKEUP, data)
         }
-        linux_abi::EPOLL_CTL_DEL => {}
+        linux_abi::EPOLL_CTL_DEL => (0, 0),
         _ => unreachable!(),
-    }
-
-    request.payload_len = WAITSET_INTEREST_SIZE as u32;
-    // SAFETY: `wire` is a live local `#[repr(C)]` WaitSetInterestWire made only of
-    // integers with no padding (u16,u16,u32 then u64/u32 fields, 48 bytes), so all
-    // WAITSET_INTEREST_SIZE bytes are initialized; the byte view is read-only and
-    // dies before `wire` is touched again.
-    let bytes = unsafe {
-        core::slice::from_raw_parts(
-            (&wire as *const WaitSetInterestWire).cast::<u8>(),
-            WAITSET_INTEREST_SIZE,
-        )
     };
-    request.payload[..WAITSET_INTEREST_SIZE].copy_from_slice(bytes);
+
+    let record = multitask::EpollInterestRecord {
+        key: multitask::EpollInterestKey {
+            target_fd: fd,
+            provider: target.provider,
+            object_id: target.object_id,
+        },
+        provider_epoch,
+        events,
+        data,
+    };
 
     let guard = if epoll_ctl_requires_live_provider_epoch(op) {
         match acquire_epoll_target_guard(&target.handle) {
@@ -1476,17 +1458,22 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
     } else {
         None
     };
-    let result = call_vfs_ipc_request_with_timeout(&request, control::deadline_ms())
-        .and_then(|response| ensure_vfs_status(&response));
+    let result = multitask::epoll_ctl(epoll.token_id(), op, record);
     if result.is_ok() && op != linux_abi::EPOLL_CTL_DEL {
         super::local_fd::note_epoll_registered(&target.handle);
+    }
+    if let Ok(new_gen) = result {
+        super::super::broker_ops::waitset_broker_ops::wake_local_fd_object(
+            epoll.token_id(),
+            new_gen,
+        );
     }
     if let Some(guard) = guard {
         release_epoll_target_guard(guard);
     }
     match result {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
+        Ok(_) => 0,
+        Err(err) => linux_errno(epoll_error_to_linux_errno(err)),
     }
 }
 
@@ -1546,6 +1533,7 @@ pub fn syscall_linux_epoll_wait(
     });
 
     loop {
+        let signal_epoch_before = super::super::broker_ops::waitset_broker_ops::signal_epoch();
         let first = match collect_epoll_readiness(epoll.token_id(), maxevents, deadline_tick, EpollScanMode::Consume) {
             Ok(state) => state,
             Err(LINUX_ETIMEDOUT)
@@ -1592,42 +1580,57 @@ pub fn syscall_linux_epoll_wait(
             return epoll_wait_failed(2, errno);
         }
 
-        let second = match collect_epoll_readiness(epoll.token_id(), maxevents, deadline_tick, EpollScanMode::Consume) {
-            Ok(state) => state,
-            Err(LINUX_ETIMEDOUT)
-                if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) =>
+        // If no waitset signal or provider revocation occurred between the
+        // epoch sample before `first` and the `SeqCst` fence closing
+        // `register_waitset_waiters`, the second readiness scan cannot observe
+        // a newly ready object and can be skipped without losing wakeups.
+        let armed_observations = if super::super::broker_ops::waitset_broker_ops::signal_epoch()
+            == signal_epoch_before
+        {
+            if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) {
+                super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+                continue;
+            }
+            first.observations
+        } else {
+            let second = match collect_epoll_readiness(epoll.token_id(), maxevents, deadline_tick, EpollScanMode::Consume) {
+                Ok(state) => state,
+                Err(LINUX_ETIMEDOUT)
+                    if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) =>
+                {
+                    super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+                    return 0;
+                }
+                Err(LINUX_ETIMEDOUT) => {
+                    super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+                    if current_wait_interrupted() {
+                        return linux_errno(LINUX_EINTR);
+                    }
+                    multitask::cond_resched();
+                    continue;
+                }
+                Err(errno) if transient_waitset_scan_error(errno) => {
+                    super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+                    multitask::cond_resched();
+                    continue;
+                }
+                Err(errno) => {
+                    super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
+                    return epoll_wait_failed(3, errno);
+                }
+            };
+            if !second.ready.is_empty()
+                || second.observations != first.observations
+                || deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline)
             {
                 super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
-                return 0;
-            }
-            Err(LINUX_ETIMEDOUT) => {
-                super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
-                if current_wait_interrupted() {
-                    return linux_errno(LINUX_EINTR);
+                if !second.ready.is_empty() {
+                    return write_epoll_ready_events(events_ptr, &second.ready);
                 }
-                multitask::cond_resched();
                 continue;
             }
-            Err(errno) if transient_waitset_scan_error(errno) => {
-                super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
-                multitask::cond_resched();
-                continue;
-            }
-            Err(errno) => {
-                super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
-                return epoll_wait_failed(3, errno);
-            }
+            second.observations
         };
-        if !second.ready.is_empty()
-            || second.observations != first.observations
-            || deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline)
-        {
-            super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
-            if !second.ready.is_empty() {
-                return write_epoll_ready_events(events_ptr, &second.ready);
-            }
-            continue;
-        }
         if !multitask::arm_block_current_task() {
             super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
             // A prior typed reply wake from the readiness scan can still own
@@ -1642,7 +1645,7 @@ pub fn syscall_linux_epoll_wait(
         if !super::super::broker_ops::waitset_broker_ops::waitset_waiters_match(
             task_id,
             process_id,
-            &second.observations,
+            &armed_observations,
         ) {
             super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
             let _ = multitask::cancel_block_current_task();
@@ -1733,7 +1736,9 @@ fn epoll_interest_target(fd: u64) -> Result<EpollInterestTarget, i64> {
         {
             (WAITSET_PROVIDER_VFSD, remote.remote_id())
         }
-        multitask::KernelHandle::Pipe(_) | multitask::KernelHandle::EventFd(_) => (
+        multitask::KernelHandle::Pipe(_)
+        | multitask::KernelHandle::EventFd(_)
+        | multitask::KernelHandle::UnixSocket(_) => (
             WAITSET_PROVIDER_KERNEL,
             super::local_fd::waitset_object(&handle).ok_or(LINUX_EBADF)?,
         ),
@@ -1767,8 +1772,7 @@ fn release_epoll_target_guard(guard: EpollTargetGuard) {
         }
         EpollTargetGuard::Console(console) => {
             if console.release_descriptor_reference() {
-                let _ =
-                    purge_vfs_epoll_object_bounded(WAITSET_PROVIDER_SESSIOND, console.token_id());
+                purge_kernel_epoll_object(WAITSET_PROVIDER_SESSIOND, console.token_id());
             }
         }
     }
@@ -1845,71 +1849,42 @@ fn epoll_report_events(provider_revents: u32, requested: u32) -> u32 {
     out
 }
 
-fn decode_snapshot_entry(bytes: &[u8]) -> WaitSetSnapshotWire {
-    debug_assert!(bytes.len() >= WAITSET_SNAPSHOT_SIZE);
-    // SAFETY: the caller sliced at least `WAITSET_SNAPSHOT_SIZE` bytes and
-    // `WaitSetSnapshotWire` is plain `repr(C)` data valid for any bit pattern;
-    // `read_unaligned` tolerates the byte buffer's alignment.
-    unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<WaitSetSnapshotWire>()) }
-}
-
 fn collect_epoll_readiness(
     epoll_token: u64,
     maxevents: usize,
     deadline_tick: Option<u64>,
     mode: EpollScanMode,
 ) -> Result<EpollReadinessState, i64> {
-    let mut request = new_vfs_request(VFS_IPC_OP_POLL_QUERY);
-    request.arg0 = VFS_POLL_QUERY_EPOLL_SNAPSHOT;
-    request.arg1 = WAITSET_MAX_INTERESTS as u64;
-    request.remote_id = epoll_token;
-    let response = call_vfs_ipc_request_with_timeout(
-        &request,
-        waitset_provider_query_timeout_ms(deadline_tick),
-    )?;
-    ensure_vfs_status(&response).map_err(|errno| {
-        if errno == LINUX_ENOENT {
-            LINUX_EIO
-        } else {
-            errno
-        }
-    })?;
-    let count = response.value as usize;
-    if response.aux == 0
-        || count > WAITSET_MAX_INTERESTS
-        || response.payload_len as usize != count.saturating_mul(WAITSET_SNAPSHOT_SIZE)
-    {
-        debug::record_milestone(debug::LogCategory::Compat, "epoll-snapshot-bad-header", response.aux, ((count as u64) << 32) | u64::from(response.payload_len));
-        return Err(LINUX_EINVAL);
-    }
-    let mut interests = Vec::with_capacity(count);
-    for index in 0..count {
-        let offset = index * WAITSET_SNAPSHOT_SIZE;
-        let wire = decode_snapshot_entry(&response.payload[offset..offset + WAITSET_SNAPSHOT_SIZE]);
-        if !waitset_snapshot_shape_valid(&wire) {
-            debug::record_milestone(debug::LogCategory::Compat, "epoll-snapshot-bad-entry", index as u64, (u64::from(wire.state) << 32) | u64::from(wire.interest.events));
-            return Err(LINUX_EINVAL);
-        }
+    let (snapshot_generation, entries) =
+        multitask::epoll_snapshot(epoll_token, WAITSET_MAX_INTERESTS).map_err(|err| {
+            if err == multitask::EpollError::NotFound {
+                LINUX_EIO
+            } else {
+                epoll_error_to_linux_errno(err)
+            }
+        })?;
+    let mut interests = Vec::with_capacity(entries.len());
+    for (record, report) in entries {
         // A provider restart advances its endpoint epoch. Report the interest
         // as ERR|HUP, keyed by the new epoch so an edge-triggered consumer
         // sees the revoke once rather than on every scan.
-        let (revoked, epoch_generation) = match waitset_provider_epoch(wire.interest.provider) {
+        let (revoked, epoch_generation) = match waitset_provider_epoch(record.key.provider) {
             Ok(current_epoch) => (
-                current_epoch != wire.interest.provider_epoch,
+                current_epoch != record.provider_epoch,
                 current_epoch.max(1),
             ),
             Err(errno) if provider_revoke_events(errno).is_some() => (true, 1),
             Err(errno) => return Err(errno),
         };
-        interests.push((wire, revoked, epoch_generation));
+        interests.push((record, report, revoked, epoch_generation));
     }
 
     let mut observations = Vec::with_capacity(interests.len().saturating_add(1));
     observations.push(
         super::super::broker_ops::waitset_broker_ops::ProviderObservation {
-            provider: WAITSET_PROVIDER_VFSD,
+            provider: WAITSET_PROVIDER_KERNEL,
             object_id: epoll_token,
-            generation: response.aux,
+            generation: snapshot_generation,
         },
     );
     let revoke_events = linux_abi::EPOLLERR | linux_abi::EPOLLHUP;
@@ -1918,9 +1893,8 @@ fn collect_epoll_readiness(
     let mut netd_queries = Vec::new();
     let mut vfs_keyed_slots = Vec::new();
     let mut vfs_keyed_queries = Vec::new();
-    for (index, (wire, revoked, epoch_generation)) in interests.iter().enumerate() {
-        let interest = &wire.interest;
-        if wire.state & WAITSET_SNAPSHOT_STATE_DISABLED != 0 {
+    for (index, (record, report, revoked, epoch_generation)) in interests.iter().enumerate() {
+        if report.disabled {
             // A reported one-shot stays silent until EPOLL_CTL_MOD re-arms it,
             // and that mutation advances the epoll object's own generation.
             scans.push(InterestScan::Skip);
@@ -1933,25 +1907,29 @@ fn collect_epoll_readiness(
             });
             continue;
         }
-        let provider_events = epoll_provider_events(interest.events);
-        if interest.provider == WAITSET_PROVIDER_NETD {
+        let provider_events = epoll_provider_events(record.events);
+        if record.key.provider == WAITSET_PROVIDER_NETD {
             netd_slots.push(index);
-            netd_queries.push((interest.object_id, provider_events));
+            netd_queries.push((record.key.object_id, provider_events));
             scans.push(InterestScan::Netd);
             continue;
         }
-        if interest.provider == WAITSET_PROVIDER_VFSD {
+        if record.key.provider == WAITSET_PROVIDER_VFSD {
             vfs_keyed_slots.push(index);
-            vfs_keyed_queries.push((interest.target_fd as i32, provider_events, interest.object_id));
+            vfs_keyed_queries.push((
+                record.key.target_fd as i32,
+                provider_events,
+                record.key.object_id,
+            ));
             scans.push(InterestScan::Netd);
             continue;
         }
         let queried = (|| -> Result<(u32, u64), i64> {
-            Ok(match interest.provider {
+            Ok(match record.key.provider {
                 WAITSET_PROVIDER_INPUTD => {
                     let access =
                         super::super::broker_ops::waitset_broker_ops::input_open_description_access(
-                            interest.object_id,
+                            record.key.object_id,
                         )
                         .ok_or(LINUX_EBADF)?;
                     let (is_ready, generation) = input_readiness_for_access(access, deadline_tick)?;
@@ -1971,7 +1949,7 @@ fn collect_epoll_readiness(
                     (revents, generation)
                 }
                 WAITSET_PROVIDER_SESSIOND => {
-                    let stream = multitask::ConsoleHandle::stream_for_token(interest.object_id)
+                    let stream = multitask::ConsoleHandle::stream_for_token(record.key.object_id)
                         .ok_or(LINUX_EBADF)?;
                     let session = multitask::current_console_session()
                         .ok_or(LINUX_EBADF)?
@@ -1994,14 +1972,14 @@ fn collect_epoll_readiness(
                     )
                 }
                 WAITSET_PROVIDER_KERNEL => match kernel_ps::api::local_fd_readiness_of(
-                    interest.object_id,
+                    record.key.object_id,
                 ) {
                     Some(readiness) => {
                         merge_provider_observation(
                             &mut observations,
                             super::super::broker_ops::waitset_broker_ops::ProviderObservation {
                                 provider: WAITSET_PROVIDER_KERNEL,
-                                object_id: interest.object_id,
+                                object_id: record.key.object_id,
                                 generation: readiness.generation,
                             },
                         );
@@ -2026,8 +2004,8 @@ fn collect_epoll_readiness(
                 crate::debug::info!(
                     compat,
                     "epoll provider query failed: provider={} object={:#x} errno={}",
-                    interest.provider,
-                    interest.object_id,
+                    record.key.provider,
+                    record.key.object_id,
                     errno
                 );
                 return Err(errno);
@@ -2123,8 +2101,7 @@ fn collect_epoll_readiness(
 
     let mut provider_timed_out = false;
     let mut candidates = Vec::new();
-    for ((wire, _, _), scan) in interests.iter().zip(scans) {
-        let interest = &wire.interest;
+    for ((record, report, _, _), scan) in interests.iter().zip(scans) {
         let (revents, generation) = match scan {
             InterestScan::Skip | InterestScan::Netd => continue,
             InterestScan::TimedOut => {
@@ -2133,23 +2110,23 @@ fn collect_epoll_readiness(
             }
             InterestScan::Ready { revents, generation } => (revents, generation),
         };
-        let reported = epoll_report_events(revents, interest.events);
+        let reported = epoll_report_events(revents, record.events);
         if reported == 0 {
             continue;
         }
-        let edge = interest.events & linux_abi::EPOLLET != 0;
-        let oneshot = interest.events & linux_abi::EPOLLONESHOT != 0;
+        let edge = record.events & linux_abi::EPOLLET != 0;
+        let oneshot = record.events & linux_abi::EPOLLONESHOT != 0;
         // An edge was already reported when no newer provider generation exists.
-        if edge && generation <= wire.edge_generation {
+        if edge && generation <= report.edge_generation {
             continue;
         }
         candidates.push(EpollCandidate {
             events: reported,
-            data: interest.data,
+            data: record.data,
             claim: WaitSetClaimWire {
-                provider: interest.provider,
-                target_fd: interest.target_fd,
-                object_id: interest.object_id,
+                provider: record.key.provider,
+                target_fd: record.key.target_fd,
+                object_id: record.key.object_id,
                 generation,
                 ..WaitSetClaimWire::default()
             },
@@ -2166,9 +2143,10 @@ fn collect_epoll_readiness(
 }
 
 /// Pick up to `maxevents` events in snapshot order. Level-triggered candidates
-/// are taken as they are; edge-triggered and one-shot ones are claimed in
-/// vfsd first, and a candidate another waiter already claimed is replaced by
-/// the next one so a lost race never turns a ready set into an empty result.
+/// are taken as they are; edge-triggered and one-shot ones are claimed in the
+/// kernel epoll registry first, and a candidate another waiter already claimed
+/// is replaced by the next one so a lost race never turns a ready set into an
+/// empty result.
 fn select_epoll_events(
     epoll_token: u64,
     candidates: &[EpollCandidate],
@@ -2197,41 +2175,22 @@ fn select_epoll_events(
     Ok(ready)
 }
 
-/// Ask vfsd which of the gated candidates this caller owns. The answer is one
-/// flag per gated candidate, in order. The exchange is not replayed: a lost
-/// reply after vfsd consumed the report can drop one edge, which is why it
-/// rides the interactive rail instead of the 16 ms readiness rail.
+/// Atomically claims edge-triggered and one-shot candidates in the kernel epoll
+/// registry. The answer is one flag per gated candidate, in order.
 fn claim_epoll_reports(
     epoll_token: u64,
     candidates: &[EpollCandidate],
 ) -> Result<Vec<bool>, i64> {
-    let gated = candidates
-        .iter()
-        .filter(|candidate| candidate.gated)
-        .map(|candidate| candidate.claim)
-        .collect::<Vec<_>>();
-    let mut owned = Vec::with_capacity(gated.len());
-    for chunk in gated.chunks(VFS_EPOLL_CLAIM_MAX) {
-        let mut request = new_vfs_request(VFS_IPC_OP_POLL_QUERY);
-        request.arg0 = VFS_POLL_QUERY_EPOLL_CLAIM;
-        request.remote_id = epoll_token;
-        request.payload_len = (chunk.len() * WAITSET_CLAIM_SIZE) as u32;
-        for (index, claim) in chunk.iter().enumerate() {
-            let offset = index * WAITSET_CLAIM_SIZE;
-            request.payload[offset..offset + 2].copy_from_slice(&claim.provider.to_le_bytes());
-            request.payload[offset + 2..offset + 4].copy_from_slice(&claim.reserved0.to_le_bytes());
-            request.payload[offset + 4..offset + 8].copy_from_slice(&claim.reserved1.to_le_bytes());
-            request.payload[offset + 8..offset + 16].copy_from_slice(&claim.target_fd.to_le_bytes());
-            request.payload[offset + 16..offset + 24].copy_from_slice(&claim.object_id.to_le_bytes());
-            request.payload[offset + 24..offset + 32].copy_from_slice(&claim.generation.to_le_bytes());
-        }
-        let response = call_vfs_ipc_request_with_timeout(&request, control::deadline_ms())?;
-        ensure_vfs_status(&response)?;
-        if response.payload_len as usize != chunk.len() || response.value > chunk.len() as u64 {
-            debug::record_milestone(debug::LogCategory::Compat, "epoll-claim-bad-reply", u64::from(response.payload_len), response.value);
-            return Err(LINUX_EINVAL);
-        }
-        owned.extend(response.payload[..chunk.len()].iter().map(|flag| *flag != 0));
+    let mut owned = Vec::new();
+    for candidate in candidates.iter().filter(|candidate| candidate.gated) {
+        let key = multitask::EpollInterestKey {
+            target_fd: candidate.claim.target_fd,
+            provider: candidate.claim.provider,
+            object_id: candidate.claim.object_id,
+        };
+        let won = multitask::epoll_claim(epoll_token, key, candidate.claim.generation)
+            .map_err(epoll_error_to_linux_errno)?;
+        owned.push(won);
     }
     Ok(owned)
 }
@@ -2248,50 +2207,20 @@ fn write_epoll_ready_events(events_ptr: u64, ready: &[(u32, u64)]) -> u64 {
     ready.len() as u64
 }
 
-pub fn retire_vfs_epoll(token: u64) -> Result<(), i64> {
-    retire_vfs_epoll_bounded(token)
-}
-
-pub fn retire_vfs_epoll_bounded(token: u64) -> Result<(), i64> {
-    retire_vfs_epoll_with_timeout(token, Some(control::deadline_ms()))
-}
-
-fn retire_vfs_epoll_with_timeout(token: u64, timeout_ms: Option<u64>) -> Result<(), i64> {
-    let mut request = new_vfs_request(VFS_IPC_OP_POLL_QUERY);
-    request.arg0 = VFS_POLL_QUERY_EPOLL_RETIRE;
-    request.remote_id = token;
-    let response = match timeout_ms {
-        Some(timeout_ms) => call_vfs_ipc_request_with_timeout(&request, timeout_ms),
-        None => call_vfs_ipc_request(&request),
-    }?;
-    ensure_vfs_status(&response)
-}
-
-pub fn purge_vfs_epoll_object(provider: u16, object_id: u64) -> Result<(), i64> {
-    purge_vfs_epoll_object_bounded(provider, object_id)
-}
-
-pub fn purge_vfs_epoll_object_bounded(provider: u16, object_id: u64) -> Result<(), i64> {
-    purge_vfs_epoll_object_with_timeout(provider, object_id, Some(control::deadline_ms()))
-}
-
-fn purge_vfs_epoll_object_with_timeout(
-    provider: u16,
-    object_id: u64,
-    timeout_ms: Option<u64>,
-) -> Result<(), i64> {
-    if provider == 0 || object_id == 0 {
-        return Err(LINUX_EINVAL);
+pub fn retire_kernel_epoll(token: u64) {
+    if let Some(new_gen) = multitask::epoll_retire(token) {
+        super::super::broker_ops::waitset_broker_ops::wake_local_fd_object(token, new_gen);
     }
-    let mut request = new_vfs_request(VFS_IPC_OP_POLL_QUERY);
-    request.arg0 = VFS_POLL_QUERY_EPOLL_PURGE_OBJECT;
-    request.arg1 = provider as u64;
-    request.arg2 = object_id;
-    let response = match timeout_ms {
-        Some(timeout_ms) => call_vfs_ipc_request_with_timeout(&request, timeout_ms),
-        None => call_vfs_ipc_request(&request),
-    }?;
-    ensure_vfs_status(&response)
+}
+
+pub fn purge_kernel_epoll_object(provider: u16, object_id: u64) {
+    if provider == 0 || object_id == 0 {
+        return;
+    }
+    let wakes = multitask::epoll_purge_object(provider, object_id);
+    for (epoll_token, new_gen) in wakes {
+        super::super::broker_ops::waitset_broker_ops::wake_local_fd_object(epoll_token, new_gen);
+    }
 }
 
 #[cfg(test)]
