@@ -7,13 +7,10 @@ pub(super) fn handle_getsockname(request: &NetdIpcRequest, response: &mut NetdIp
     if state.inet_sockets.contains_key(&request.socket_token) {
         return inet_datagram::socket_name_in_state(&state, request, response, false);
     }
-    let Some(socket) = state.sockets.get(&request.socket_token) else {
+    let Some(socket) = state.netlink_sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
-    if let UnixSocketState::Netlink(netlink) = &socket.state {
-        return netlink.write_sockaddr(response);
-    }
-    sockaddr_payload(socket.local_path.as_ref(), response).unwrap_or_else(|errno| errno)
+    socket.state.write_sockaddr(response)
 }
 
 pub(super) fn handle_getpeername(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
@@ -21,21 +18,11 @@ pub(super) fn handle_getpeername(request: &NetdIpcRequest, response: &mut NetdIp
     if state.inet_sockets.contains_key(&request.socket_token) {
         return inet_datagram::socket_name_in_state(&state, request, response, true);
     }
-    let Some(socket) = state.sockets.get(&request.socket_token) else {
+    if !state.netlink_sockets.contains_key(&request.socket_token) {
         return libc::EBADF;
-    };
-    if let UnixSocketState::Netlink(_) = &socket.state {
-        // The only netlink peer is the kernel: nl_pid 0, no groups.
-        return netlink::write_kernel_sockaddr(response);
     }
-    let has_peer = matches!(&socket.state, UnixSocketState::Connected(_))
-        || matches!(&socket.state, UnixSocketState::Dgram(d) if d.peer.is_some());
-    // A connected endpoint with an unnamed peer (socketpair, unbound client)
-    // still has a peer: it reports the unnamed address, not ENOTCONN.
-    if socket.peer_path.is_none() && !has_peer {
-        return libc::ENOTCONN;
-    }
-    sockaddr_payload(socket.peer_path.as_ref(), response).unwrap_or_else(|errno| errno)
+    // The only netlink peer is the kernel: nl_pid 0, no groups.
+    netlink::write_kernel_sockaddr(response)
 }
 
 fn write_i32_opt(response: &mut NetdIpcResponse, value: i32) -> i32 {
@@ -193,7 +180,7 @@ pub(super) fn handle_getsockopt_in_state(
             _ => return libc::ENOPROTOOPT,
         }
     }
-    let Some(socket) = state.sockets.get(&request.socket_token) else {
+    let Some(socket) = state.netlink_sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
     if request.arg1 != linux_abi::SOL_SOCKET {
@@ -201,25 +188,10 @@ pub(super) fn handle_getsockopt_in_state(
     }
     let value = match request.arg2 {
         linux_abi::SO_ERROR => 0_i32,
-        linux_abi::SO_TYPE => match &socket.state {
-            UnixSocketState::Netlink(netlink) => netlink.sock_type() as i32,
-            _ => socket.kind.unix_socket_type() as i32,
-        },
-        linux_abi::SO_DOMAIN => match socket.kind {
-            UnixSocketKind::Netlink => libc::AF_NETLINK,
-            _ => linux_abi::AF_UNIX as i32,
-        },
-        linux_abi::SO_PROTOCOL => match &socket.state {
-            UnixSocketState::Netlink(netlink) => netlink.protocol() as i32,
-            _ => 0_i32,
-        },
-        linux_abi::SO_ACCEPTCONN => {
-            if matches!(socket.state, UnixSocketState::Listening { .. }) {
-                1
-            } else {
-                0
-            }
-        }
+        linux_abi::SO_TYPE => socket.state.sock_type() as i32,
+        linux_abi::SO_DOMAIN => libc::AF_NETLINK,
+        linux_abi::SO_PROTOCOL => socket.state.protocol() as i32,
+        linux_abi::SO_ACCEPTCONN => 0,
         linux_abi::SO_REUSEADDR => socket.options.reuse_addr as i32,
         linux_abi::SO_REUSEPORT => socket.options.reuse_port as i32,
         linux_abi::SO_KEEPALIVE => socket.options.keepalive as i32,
@@ -239,7 +211,8 @@ pub(super) fn handle_getsockopt_in_state(
         linux_abi::SO_SNDBUF => socket.options.send_buffer,
         linux_abi::SO_RCVBUF => socket.options.recv_buffer,
         linux_abi::SO_PASSCRED => socket.options.passcred as i32,
-        linux_abi::SO_PEERCRED => return peercred_payload_from_socket(socket, response),
+        // The only netlink peer is the kernel, which has no credentials to report.
+        linux_abi::SO_PEERCRED => return libc::ENOTCONN,
         SO_RCVTIMEO => return write_timeval_opt(response, socket.options.recv_timeout),
         linux_abi::SO_SNDTIMEO => return write_timeval_opt(response, socket.options.snd_timeout),
         _ => return libc::EOPNOTSUPP,
@@ -303,7 +276,7 @@ pub(super) fn handle_setsockopt_in_state(state: &mut NetState, request: &NetdIpc
             }
             return 0;
         }
-        let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
+        let Some(socket) = state.netlink_sockets.get_mut(&request.socket_token) else {
             return libc::EBADF;
         };
         if request.arg2 == SO_RCVTIMEO {
@@ -323,7 +296,7 @@ pub(super) fn handle_setsockopt_in_state(state: &mut NetState, request: &NetdIpc
             socket.options.linger = (onoff, linger);
             return 0;
         }
-        let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
+        let Some(socket) = state.netlink_sockets.get_mut(&request.socket_token) else {
             return libc::EBADF;
         };
         socket.options.linger = (onoff, linger);
@@ -547,7 +520,7 @@ pub(super) fn handle_setsockopt_in_state(state: &mut NetState, request: &NetdIpc
             _ => return libc::ENOPROTOOPT,
         }
     }
-    let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
+    let Some(socket) = state.netlink_sockets.get_mut(&request.socket_token) else {
         return libc::EBADF;
     };
     if request.arg1 != linux_abi::SOL_SOCKET {
@@ -612,7 +585,7 @@ const TCP_INFO_LEN: usize = 104;
 
 fn set_ipv4_multicast_option(state: &mut NetState, request: &NetdIpcRequest) -> i32 {
     let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) else {
-        return if state.sockets.contains_key(&request.socket_token) {
+        return if state.netlink_sockets.contains_key(&request.socket_token) {
             libc::ENOPROTOOPT
         } else {
             libc::EBADF
@@ -677,7 +650,7 @@ fn set_ipv4_multicast_option(state: &mut NetState, request: &NetdIpcRequest) -> 
 
 fn set_ipv6_multicast_membership(state: &mut NetState, request: &NetdIpcRequest) -> i32 {
     let Some(socket) = state.inet_sockets.get(&request.socket_token) else {
-        return if state.sockets.contains_key(&request.socket_token) {
+        return if state.netlink_sockets.contains_key(&request.socket_token) {
             libc::ENOPROTOOPT
         } else {
             libc::EBADF
@@ -795,22 +768,10 @@ pub(super) fn handle_ioctl_in_state(
         };
         return write_i32_opt(response, available.min(i32::MAX as usize) as i32);
     }
-    let Some(socket) = state.sockets.get(&request.socket_token) else {
+    let Some(socket) = state.netlink_sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
-    let available = match &socket.state {
-        UnixSocketState::Connected(connected) => {
-            if socket.kind.preserves_message_boundaries() {
-                connected.incoming.front().map_or(0, |seg| seg.bytes.len())
-            } else {
-                connected.incoming_bytes
-            }
-        }
-        UnixSocketState::Dgram(dgram) => dgram.incoming.front().map_or(0, |seg| seg.bytes.len()),
-        UnixSocketState::Netlink(netlink) => netlink.front_len(),
-        UnixSocketState::Idle | UnixSocketState::Listening { .. } => 0,
-    };
-    write_i32_opt(response, available.min(i32::MAX as usize) as i32)
+    write_i32_opt(response, socket.state.front_len().min(i32::MAX as usize) as i32)
 }
 
 pub(super) fn handle_shutdown(request: &NetdIpcRequest) -> i32 {
@@ -833,174 +794,12 @@ pub(super) fn handle_shutdown(request: &NetdIpcRequest) -> i32 {
         }
         return 0;
     }
-    enum UnixShutdownTarget {
-        StreamPeer(u64),
-        Dgram,
+    // Netlink sockets are unconnected datagram sockets with a kernel peer.
+    if state.netlink_sockets.contains_key(&request.socket_token) {
+        libc::ENOTCONN
+    } else {
+        libc::EBADF
     }
-    let target = {
-        let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
-            return libc::EBADF;
-        };
-        match &mut socket.state {
-            UnixSocketState::Connected(connected) => {
-                match request.arg1 {
-                    linux_abi::SHUT_RD => connected.recv_closed = true,
-                    linux_abi::SHUT_WR => connected.send_closed = true,
-                    linux_abi::SHUT_RDWR => {
-                        connected.recv_closed = true;
-                        connected.send_closed = true;
-                    }
-                    _ => return libc::EINVAL,
-                }
-                UnixShutdownTarget::StreamPeer(connected.peer)
-            }
-            UnixSocketState::Dgram(dgram) => {
-                match request.arg1 {
-                    linux_abi::SHUT_RD => dgram.recv_closed = true,
-                    linux_abi::SHUT_WR => dgram.send_closed = true,
-                    linux_abi::SHUT_RDWR => {
-                        dgram.recv_closed = true;
-                        dgram.send_closed = true;
-                    }
-                    _ => return libc::EINVAL,
-                }
-                UnixShutdownTarget::Dgram
-            }
-            _ => return libc::ENOTCONN,
-        }
-    };
-    if let UnixShutdownTarget::StreamPeer(peer) = target {
-        if let Some(peer_socket) = state.sockets.get_mut(&peer) {
-            if let UnixSocketState::Connected(peer_connected) = &mut peer_socket.state {
-                match request.arg1 {
-                    linux_abi::SHUT_RD => peer_connected.peer_read_closed = true,
-                    linux_abi::SHUT_WR => peer_connected.peer_write_closed = true,
-                    linux_abi::SHUT_RDWR => {
-                        peer_connected.peer_read_closed = true;
-                        peer_connected.peer_write_closed = true;
-                    }
-                    _ => unreachable!(),
-                }
-            }
-        }
-    }
-    drop(state);
-    0
-}
-
-pub(super) fn sockaddr_path_from_payload(request: &NetdIpcRequest) -> Result<UnixAddress, i32> {
-    sockaddr_bind_address_from_payload(request)?.ok_or(libc::EINVAL)
-}
-
-/// Parses an `AF_UNIX` `sockaddr_un` payload for `bind`: `Some(addr)` for
-/// filesystem or abstract names, or `None` when `addrlen == sizeof(sa_family_t)`
-/// (autobind request).
-pub(super) fn sockaddr_bind_address_from_payload(
-    request: &NetdIpcRequest,
-) -> Result<Option<UnixAddress>, i32> {
-    let len = request.payload_len as usize;
-    if len < size_of::<u16>() {
-        return Err(libc::EINVAL);
-    }
-    let family = u16::from_ne_bytes([request.payload[0], request.payload[1]]) as u64;
-    if family != linux_abi::AF_UNIX {
-        return Err(libc::EAFNOSUPPORT);
-    }
-    let path_bytes = &request.payload[size_of::<u16>()..len];
-    if path_bytes.is_empty() {
-        return Ok(None);
-    }
-    if path_bytes.first().copied() == Some(0) {
-        if path_bytes.len() > linux_abi::UNIX_PATH_MAX {
-            return Err(libc::EINVAL);
-        }
-        return Ok(Some(UnixAddress::Abstract(path_bytes.to_vec())));
-    }
-    // Linux accepts a full `sun_path` (108 bytes) without a terminating NUL;
-    // only a longer `addrlen` is invalid.
-    if path_bytes.len() > linux_abi::UNIX_PATH_MAX {
-        return Err(libc::EINVAL);
-    }
-    let end = path_bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(path_bytes.len());
-    if end == 0 {
-        return Err(libc::EINVAL);
-    }
-    String::from_utf8(path_bytes[..end].to_vec())
-        .map(|path| Some(UnixAddress::Filesystem(path)))
-        .map_err(|_| libc::EINVAL)
-}
-
-pub(super) fn sockaddr_payload(
-    address: Option<&UnixAddress>,
-    response: &mut NetdIpcResponse,
-) -> Result<i32, i32> {
-    response.payload[..2].copy_from_slice(&(linux_abi::AF_UNIX as u16).to_ne_bytes());
-    let needed = match address {
-        // An unnamed socket reports only its family (addrlen 2), as Linux does;
-        // a trailing NUL byte would read as an empty abstract name.
-        None => size_of::<u16>(),
-        Some(UnixAddress::Filesystem(path)) => {
-            // A shorter path is reported with its NUL; a full 108-byte
-            // `sun_path` has no room for one and is reported without it.
-            if path.len() > linux_abi::UNIX_PATH_MAX {
-                return Err(libc::EINVAL);
-            }
-            let needed = size_of::<u16>() + path.len() + usize::from(path.len() < linux_abi::UNIX_PATH_MAX);
-            if needed > response.payload.len() {
-                return Err(libc::EINVAL);
-            }
-            response.payload[2..2 + path.len()].copy_from_slice(path.as_bytes());
-            if path.len() < linux_abi::UNIX_PATH_MAX {
-                response.payload[2 + path.len()] = 0;
-            }
-            needed
-        }
-        Some(UnixAddress::Abstract(bytes)) => {
-            if bytes.is_empty() || bytes.len() > linux_abi::UNIX_PATH_MAX {
-                return Err(libc::EINVAL);
-            }
-            let needed = size_of::<u16>()
-                .checked_add(bytes.len())
-                .ok_or(libc::EINVAL)?;
-            if needed > response.payload.len() {
-                return Err(libc::EINVAL);
-            }
-            response.payload[2..2 + bytes.len()].copy_from_slice(bytes);
-            needed
-        }
-    };
-    response.payload_len = needed as u32;
-    response.value = 0;
-    Ok(0)
-}
-
-pub(super) fn peercred_payload_from_socket(socket: &UnixSocket, response: &mut NetdIpcResponse) -> i32 {
-    let creds = match &socket.state {
-        UnixSocketState::Connected(connected) => connected.peer_credentials,
-        UnixSocketState::Dgram(dgram) => match dgram.peer_credentials {
-            Some(c) => c,
-            None => return libc::ENOTCONN,
-        },
-        _ => return libc::ENOTCONN,
-    };
-    let value = linux_abi::LinuxUCred {
-        pid: creds.pid,
-        uid: creds.uid,
-        gid: creds.gid,
-    };
-    let bytes = unsafe {
-        std::slice::from_raw_parts(
-            (&value as *const linux_abi::LinuxUCred).cast::<u8>(),
-            size_of::<linux_abi::LinuxUCred>(),
-        )
-    };
-    response.payload[..bytes.len()].copy_from_slice(bytes);
-    response.payload_len = bytes.len() as u32;
-    response.value = 0;
-    0
 }
 
 pub(super) fn request_i32_payload(request: &NetdIpcRequest) -> Option<i32> {

@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use x86_64::{VirtAddr, instructions::interrupts};
 
-use super::{current_user_process_id, owned_current_user_binding, published_current_identity};
+use super::{owned_current_user_binding, published_current_identity};
 use crate::multitask::{cpu_local, process_table};
 
 /// Anonymous pages admitted by reservation, and the intermediate page-table
@@ -117,16 +117,6 @@ pub fn current_pager_charge_snapshot() -> Option<PagerChargeSnapshot> {
             },
         })
     })
-}
-
-/// Stamp and publish a pager region for the current exact process/MM epoch.
-pub fn publish_current_pager_vma(
-    template: rustos_user_abi::pager::PagerVmRegionWire,
-    ceiling: usize,
-) -> Result<rustos_user_abi::pager::PagerVmRegionWire, crate::multitask::pager_vma::PagerVmaError> {
-    let process_id =
-        current_user_process_id().ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
-    publish_pager_vma_for_process(process_id, None, template, ceiling)
 }
 
 /// Admit a range and publish a VMA for one retained process.
@@ -248,18 +238,6 @@ pub fn current_pager_fault_install_permit(
             return Err(crate::multitask::pager_vma::PagerVmaError::Stale);
         }
         crate::multitask::pager_vma::acquire_fault_install(handle, process, request)
-    })
-}
-
-/// Revoke the exact current-process VMA generation before removing PTEs.
-pub fn revoke_current_pager_vma(
-    start: u64,
-    vma_generation: u64,
-) -> Result<rustos_user_abi::pager::PagerVmRegionWire, crate::multitask::pager_vma::PagerVmaError> {
-    interrupts::without_interrupts(|| {
-        let (_, handle, process) = published_current_pager_binding()
-            .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
-        crate::multitask::pager_vma::revoke(handle, process, start, vma_generation)
     })
 }
 

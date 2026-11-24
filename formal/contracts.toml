@@ -1841,10 +1841,6 @@ path = "services/netd/src/socket_lifecycle.rs"
 models = ["ipc-handle-transfer/IpcHandleTransfer", "netd-deferred-reply/NetdDeferredReply"]
 
 [[source_mappings]]
-path = "services/netd/src/unix_stream.rs"
-models = ["ipc-transfer-authority/IpcTransferAuthority"]
-
-[[source_mappings]]
 path = "services/netd/src/receive_turn.rs"
 models = ["netd-deferred-reply/NetdDeferredReply"]
 

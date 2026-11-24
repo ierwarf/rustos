@@ -234,84 +234,12 @@ impl Framebuffer {
         self.mark_dirty_tile_for_point(x, y);
     }
 
-    pub(crate) fn present_scene(&mut self) -> bool {
-        if !self.use_double_buffer || !self.dirty_any {
-            return true;
-        }
-
-        for tile_row in 0..self.dirty_rows {
-            let mut tile_col = 0;
-            while tile_col < self.dirty_cols {
-                if !self.dirty_tiles[tile_row][tile_col] {
-                    tile_col += 1;
-                    continue;
-                }
-
-                let start_col = tile_col;
-                while tile_col < self.dirty_cols && self.dirty_tiles[tile_row][tile_col] {
-                    tile_col += 1;
-                }
-
-                if !self
-                    .copy_back_to_front_rect(self.dirty_rect_for_run(tile_row, start_col, tile_col))
-                {
-                    self.mark_all_dirty();
-                    return false;
-                }
-                for col in start_col..tile_col {
-                    self.dirty_tiles[tile_row][col] = false;
-                }
-            }
-        }
-
-        self.dirty_any = false;
-        true
-    }
-
     fn active_buffer(&self) -> *mut u8 {
         if self.use_double_buffer {
             self.back_base
         } else {
             self.front_base
         }
-    }
-
-    fn rect_copy_bounds(&self, rect: FramebufferRect) -> Option<(usize, usize)> {
-        if rect.width == 0 || rect.height == 0 {
-            return None;
-        }
-
-        let row_bytes = rect.width.checked_mul(self.bpp)?;
-        let start = rect.y.checked_mul(self.stride_bytes).and_then(|offset| {
-            rect.x
-                .checked_mul(self.bpp)
-                .and_then(|xoff| offset.checked_add(xoff))
-        })?;
-        let last_row_offset = rect
-            .height
-            .checked_sub(1)
-            .and_then(|rows| rows.checked_mul(self.stride_bytes))?;
-        let end = start
-            .checked_add(last_row_offset)
-            .and_then(|offset| offset.checked_add(row_bytes))?;
-        if end > self.size {
-            return None;
-        }
-
-        Some((start, row_bytes))
-    }
-
-    fn mark_all_dirty(&mut self) {
-        if !self.use_double_buffer {
-            return;
-        }
-
-        for row in 0..self.dirty_rows {
-            for col in 0..self.dirty_cols {
-                self.dirty_tiles[row][col] = true;
-            }
-        }
-        self.dirty_any = true;
     }
 
     fn mark_dirty_rect(&mut self, rect: FramebufferRect) {
@@ -341,51 +269,6 @@ impl Framebuffer {
         let tile_row = (y / DIRTY_TILE_HEIGHT).min(self.dirty_rows - 1);
         self.dirty_tiles[tile_row][tile_col] = true;
         self.dirty_any = true;
-    }
-
-    fn dirty_rect_for_run(
-        &self,
-        tile_row: usize,
-        start_col: usize,
-        end_col_exclusive: usize,
-    ) -> FramebufferRect {
-        let x = start_col * DIRTY_TILE_WIDTH;
-        let y = tile_row * DIRTY_TILE_HEIGHT;
-        let width = ((end_col_exclusive - start_col) * DIRTY_TILE_WIDTH).min(self.width - x);
-        let height = DIRTY_TILE_HEIGHT.min(self.height - y);
-        FramebufferRect {
-            x,
-            y,
-            width,
-            height,
-        }
-    }
-
-    fn copy_back_to_front_rect(&self, rect: FramebufferRect) -> bool {
-        let Some((offset, copy_len)) = self.rect_copy_bounds(rect) else {
-            crate::debug::println!(
-                "framebuffer present rejected: dirty rect exceeds bounds x={} y={} width={} height={} stride={} size={}",
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height,
-                self.stride_bytes,
-                self.size
-            );
-            return false;
-        };
-        unsafe {
-            let mut src_row = self.back_base.add(offset);
-            let mut dst_row = self.front_base.add(offset);
-            for _ in 0..rect.height {
-                // The front buffer can behave like device memory under QEMU, so
-                // keep presents on a plain byte-copy path instead of XMM/AVX stores.
-                ptr::copy_nonoverlapping(src_row, dst_row, copy_len);
-                src_row = src_row.add(self.stride_bytes);
-                dst_row = dst_row.add(self.stride_bytes);
-            }
-        }
-        true
     }
 
     fn pixel_index(&self, x: usize, y: usize) -> Option<usize> {

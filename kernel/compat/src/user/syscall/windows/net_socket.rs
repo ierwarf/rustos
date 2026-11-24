@@ -294,6 +294,10 @@ fn afd_create(handle: u64, in_buf: u64, in_len: usize) -> u64 {
     let protocol = i32::from_le_bytes(raw[8..12].try_into().unwrap_or([0; 4]));
     let flags = u32::from_le_bytes(raw[12..16].try_into().unwrap_or([0; 4]));
 
+    if family as u64 == linux_abi::AF_UNIX {
+        return netd_errno_to_ntstatus(97 /* EAFNOSUPPORT */);
+    }
+
     let res = vfs_meta::syscall_linux_net6(
         SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
         family as u64,
@@ -780,7 +784,6 @@ fn afd_poll(
         16
     };
 
-    let mut ready_count = 0_u32;
     let mut out_entries = vec![0_u8; 16 + count * 16];
     out_entries[0..16].copy_from_slice(&hdr);
 
@@ -823,14 +826,10 @@ fn afd_poll(
                 out_flags |= AFD_POLL_RESET;
             }
         }
-        if out_flags != 0 {
-            ready_count += 1;
-        }
         out_entries[off..off + 8].copy_from_slice(&sock_handle.to_le_bytes());
         out_entries[off + 8..off + 12].copy_from_slice(&out_flags.to_le_bytes());
         out_entries[off + 12..off + 16].copy_from_slice(&0_i32.to_le_bytes());
     }
-    let _ = ready_count;
     if usermem::write_current_user_bytes(out_buf, &out_entries).is_err() {
         return STATUS_INVALID_PARAMETER;
     }

@@ -135,7 +135,6 @@ Useful APIs:
   one log per site per default interval.
 - `crate::debug::snapshot_structured_log_bytes()`: snapshot the in-kernel text
   ring for diagnostics.
-- `crate::debug::report_panic(info)`: panic reporting path.
 
 Kernel structured log lines are rendered like:
 
@@ -428,7 +427,6 @@ crate::debug::error_ratelimited!(usb, "xhci event ring stalled");
   default interval당 한 번만 기록합니다.
 - `crate::debug::snapshot_structured_log_bytes()`: in-kernel text ring을
   diagnostic 용도로 snapshot합니다.
-- `crate::debug::report_panic(info)`: panic reporting path입니다.
 
 Kernel structured log line은 다음 형태로 출력됩니다.
 

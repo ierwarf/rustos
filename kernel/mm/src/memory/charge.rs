@@ -374,7 +374,6 @@ mod admission_wiring_tests {
                 "phys::claim_data_leaf(root_phys,virtual_address,frame_phys)",
                 "current-root first touch",
             ),
-            ("phys::claim_private_file_data_leaf(", "private file"),
         ] {
             let at = mapping
                 .find(claim)
@@ -424,8 +423,8 @@ mod admission_wiring_tests {
             .collect();
         assert_eq!(
             sites.len(),
-            4,
-            "first touch, prepared frame, private file and shared alias"
+            3,
+            "first touch, prepared frame and shared alias"
         );
         for (at, _) in sites {
             let body = &mapping[at..at + 140];

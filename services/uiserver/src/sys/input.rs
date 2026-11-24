@@ -234,6 +234,13 @@ pub(super) fn linux_pointer_button_to_rustos(code: u16) -> Option<u32> {
     })
 }
 
+/// Inverse of [`linux_key_code_to_rustos`]: the evdev key code a Wayland client
+/// expects for a RustOS key code. Derived from the forward table so the two can
+/// never disagree.
+pub(crate) fn rustos_key_code_to_linux(code: u32) -> Option<u32> {
+    (1_u32..=0x1ff).find(|&linux| linux_key_code_to_rustos(linux).is_some_and(|key| key as u32 == code))
+}
+
 pub(super) fn linux_key_code_to_rustos(code: u32) -> Option<KeyCode> {
     Some(match code {
         1 => KeyCode::Escape,

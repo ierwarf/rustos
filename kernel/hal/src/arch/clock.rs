@@ -84,7 +84,6 @@ static TSC_SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
 static TSC_SYNC_TARGET_PRESENT: AtomicBool = AtomicBool::new(false);
 static TSC_SYNC_LAST: AtomicU64 = AtomicU64::new(0);
 static TSC_SYNC_MAX_WARP: AtomicU64 = AtomicU64::new(0);
-static TSC_SMP_ADMITTED_SKEW_NANOS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClockSourceInfo {
@@ -255,17 +254,6 @@ pub fn invariant_tsc_frequency_hz() -> Option<u64> {
     Some(TSC_HZ.load(Ordering::Acquire)).filter(|frequency| *frequency != 0)
 }
 
-/// Reports the cross-CPU skew, in nanoseconds, that the multiprocessor TSC
-/// admission actually proved. Zero is the only admitted value; the accessor
-/// exists so boot evidence records a measurement rather than an assumption.
-pub fn admitted_smp_tsc_skew_nanos() -> Option<u64> {
-    // ORDERING: Acquire on the published source observes the measured skew
-    // stored before the one-way promotion; a source that is not the promoted
-    // TSC has no admitted measurement to report.
-    (SOURCE.load(Ordering::Acquire) == SOURCE_INVARIANT_TSC)
-        .then(|| TSC_SMP_ADMITTED_SKEW_NANOS.load(Ordering::Acquire))
-}
-
 /// One lock-free cross-CPU warp observation.
 ///
 /// `TSC_SYNC_LAST` only ever advances, so it holds the largest timestamp any
@@ -397,7 +385,6 @@ pub fn promote_smp_tsc_clocksource(worst_warp_nanos: u64) -> Option<ClockSourceI
         now.saturating_sub(ticks_from_nanos(continuation_nanos, hz)),
         Ordering::Relaxed,
     );
-    TSC_SMP_ADMITTED_SKEW_NANOS.store(worst_warp_nanos, Ordering::Relaxed);
     // ORDERING: Release publishes the new origin before the source switch that
     // makes readers use it.
     SOURCE.store(SOURCE_INVARIANT_TSC, Ordering::Release);
@@ -767,7 +754,6 @@ mod tests {
         // source that is not the HPET fallback still refuses the upgrade, so
         // the host-test build (no clocksource initialized) stays rejected.
         assert!(promote_smp_tsc_clocksource(0).is_none());
-        assert!(admitted_smp_tsc_skew_nanos().is_none());
     }
 
     #[test]

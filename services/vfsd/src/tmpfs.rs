@@ -767,6 +767,7 @@ impl TmpFs {
         self.state.lock().used_bytes
     }
 
+    #[cfg(test)]
     pub fn node_count(&self) -> usize {
         self.state.lock().nodes.len()
     }

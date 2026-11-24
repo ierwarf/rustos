@@ -230,8 +230,6 @@ impl NucleusImageInfo {
     }
 }
 
-pub type KernelImageInfo = NucleusImageInfo;
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BootVolumeIdentity {
@@ -534,11 +532,6 @@ impl BootVolumeIdentity {
 
     pub const fn transport(self) -> BootVolumeTransport {
         BootVolumeTransport::from_raw(self._reserved0)
-    }
-
-    pub const fn with_transport(mut self, transport: BootVolumeTransport) -> Self {
-        self._reserved0 = transport as u32;
-        self
     }
 }
 

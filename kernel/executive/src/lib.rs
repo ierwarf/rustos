@@ -14,8 +14,7 @@ macro_rules! executive_debug_println {
     }};
 }
 
-#[allow(unused_imports, unused_macros)]
-pub mod debug {
+pub(crate) mod debug {
     pub use crate::executive_debug_println as println;
     pub use nucleus_core::debug::*;
 }

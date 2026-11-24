@@ -10,10 +10,11 @@ pub(crate) use kernel_ipc_runtime::api as ipc;
 pub(crate) use kernel_lowlevel as lowlevel;
 pub(crate) use kernel_mm::api as memory;
 
+// Which `println` arm and which re-exports are used depends on the build's
+// log cfgs (`build_log_cfg.rs`); a given profile leaves one of them unused.
 #[allow(unused_imports, unused_macros)]
 pub(crate) mod debug {
     pub(crate) use nucleus_core::debug::*;
-    pub(crate) use trace_loc_macro::trace_loc;
 
     #[cfg(all(rustos_debug_print_enabled, rustos_log_sched_info))]
     macro_rules! println {

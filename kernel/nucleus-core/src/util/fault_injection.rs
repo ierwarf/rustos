@@ -1,10 +1,7 @@
 use alloc::vec::Vec;
 use x86_64::instructions::port::Port;
 
-use rustos_fault_injection::{
-    clear_runtime_rules, configured_runtime_rule_count, install_runtime_rules,
-    runtime_rules_enabled,
-};
+use rustos_fault_injection::{clear_runtime_rules, install_runtime_rules};
 
 const FW_CFG_SIGNATURE: u16 = 0x0000;
 const FW_CFG_FILE_DIR: u16 = 0x0019;
@@ -20,7 +17,6 @@ pub enum FaultInitStatus {
     Loaded,
     InvalidSpec,
     TooLarge,
-    UnsupportedFwCfg,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,16 +66,8 @@ pub fn init_from_qemu_fw_cfg() -> FaultInitReport {
     }
 }
 
-pub fn is_enabled() -> bool {
-    runtime_rules_enabled()
-}
-
 pub fn should_fail(location: &str) -> bool {
     rustos_fault_injection::should_fail(location)
-}
-
-pub fn configured_rule_count() -> usize {
-    configured_runtime_rule_count()
 }
 
 fn clear_rules() {

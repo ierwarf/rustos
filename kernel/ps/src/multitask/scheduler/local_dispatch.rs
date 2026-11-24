@@ -48,24 +48,6 @@ pub(super) enum LocalClass {
 static SHADOW_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 #[cfg(rustos_scheduler_phase_profile)]
 static SHADOW_FALLBACKS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
-#[cfg(rustos_scheduler_phase_profile)]
-static SHADOW_MATCHES: AtomicU64 = AtomicU64::new(0);
-#[cfg(rustos_scheduler_phase_profile)]
-static SHADOW_MISMATCHES: AtomicU64 = AtomicU64::new(0);
-#[cfg(rustos_scheduler_phase_profile)]
-static SHADOW_AUTHORITATIVE_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-// [flags:8 | cpu:8 | current:8 | catalog-pick:8 | local-policy:8 |
-// catalog-pick:8]. Slots are bounded by MAX_TASK=256 (one byte each). The final byte is
-// intentionally repeated for compatibility with the existing diagnostic
-// decoder while divergence becomes policy evidence rather than a safety gate.
-#[cfg(rustos_scheduler_phase_profile)]
-static LAST_SHADOW_MISMATCH: AtomicU64 = AtomicU64::new(0);
-/// Exact fair keys for the last policy difference. They are diagnostic-only:
-/// recording them cannot participate in a selection or repair a publication.
-#[cfg(rustos_scheduler_phase_profile)]
-static LAST_SHADOW_LOCAL_VRUNTIME: AtomicU64 = AtomicU64::new(0);
-#[cfg(rustos_scheduler_phase_profile)]
-static LAST_SHADOW_CATALOG_VRUNTIME: AtomicU64 = AtomicU64::new(0);
 
 fn fallback<T>(reason: LocalFallbackReason) -> Result<T, LocalFallbackReason> {
     #[cfg(rustos_scheduler_phase_profile)]
@@ -732,70 +714,12 @@ pub(super) fn choose_overdue_system(
     Ok(oldest.map(|(slot, _, _, generation)| (slot, generation)))
 }
 
-/// Compare a qualified local observation with the preserved catalog policy.
-/// Excluded arms are observable without receiving dispatch authority; record
-/// the actual selection separately so agreement cannot be manufactured by
-/// simply disabling observations on an unproven arm.
+/// Drains the local-dispatch qualification and fallback counters for runtime evidence.
 #[cfg(rustos_scheduler_phase_profile)]
-pub(super) fn record_policy_choice(
-    cpu: usize,
-    current_slot: usize,
-    catalog_pick: usize,
-    voluntary_yield: bool,
-    local_pick: Option<usize>,
-    authoritative_pick: Option<usize>,
-    catalog_recheck: Option<usize>,
-    catalog_admission: u8,
-) {
-    if authoritative_pick.is_none() {
-        SHADOW_AUTHORITATIVE_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-    }
-    let Some(local_slot) = local_pick else {
-        return;
-    };
-    if local_slot == catalog_pick {
-        SHADOW_MATCHES.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-
-    debug_assert!(cpu < 256 && current_slot < 256 && catalog_pick < 256 && local_slot < 256);
-    let flags = u8::from(voluntary_yield)
-        | (u8::from(user_reservation_due(cpu)) << 1)
-        | (u8::from(class(local_slot) == LocalClass::System) << 2)
-        | (u8::from(class(catalog_pick) == LocalClass::System) << 3)
-        | (u8::from(runqueue::is_idle_slot(local_slot)) << 4)
-        | (u8::from(runqueue::is_idle_slot(catalog_pick)) << 5)
-        | (u8::from(usize::from(runqueue::affinity_payload::last_cpu(local_slot)) == cpu) << 6)
-        | (u8::from(usize::from(runqueue::affinity_payload::last_cpu(catalog_pick)) == cpu) << 7);
-    // Bit 56 marks this extended witness. The upper seven bits encode the
-    // first catalog yield scan's admission stage for the local slot; 127
-    // denotes an arm without a yield-scan observation.
-    let witness = ((u64::from(catalog_admission & 0x7f) << 57) | (1_u64 << 56))
-        | ((catalog_recheck.unwrap_or(255) as u64) << 48)
-        | (u64::from(flags) << 40)
-        | ((cpu as u64) << 32)
-        | ((current_slot as u64) << 24)
-        | ((catalog_pick as u64) << 16)
-        | ((local_slot as u64) << 8)
-        | authoritative_pick.unwrap_or(catalog_pick) as u64;
-    LAST_SHADOW_LOCAL_VRUNTIME.store(runqueue::vruntime(local_slot), Ordering::Relaxed);
-    LAST_SHADOW_CATALOG_VRUNTIME.store(runqueue::vruntime(catalog_pick), Ordering::Relaxed);
-    LAST_SHADOW_MISMATCH.store(witness, Ordering::Relaxed);
-    SHADOW_MISMATCHES.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Drains qualification and policy-comparison counters for runtime evidence.
-#[cfg(rustos_scheduler_phase_profile)]
-pub(super) fn drain_shadow_observations() -> (u64, [u64; 7], u64, u64, u64, u64, u64, u64) {
+pub(super) fn drain_shadow_observations() -> (u64, [u64; 7]) {
     (
         SHADOW_DISPATCHES.swap(0, Ordering::Relaxed),
         core::array::from_fn(|index| SHADOW_FALLBACKS[index].swap(0, Ordering::Relaxed)),
-        SHADOW_MATCHES.swap(0, Ordering::Relaxed),
-        SHADOW_MISMATCHES.swap(0, Ordering::Relaxed),
-        SHADOW_AUTHORITATIVE_FALLBACKS.swap(0, Ordering::Relaxed),
-        LAST_SHADOW_MISMATCH.swap(0, Ordering::Relaxed),
-        LAST_SHADOW_LOCAL_VRUNTIME.swap(0, Ordering::Relaxed),
-        LAST_SHADOW_CATALOG_VRUNTIME.swap(0, Ordering::Relaxed),
     )
 }
 

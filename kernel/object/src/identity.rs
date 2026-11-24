@@ -9,7 +9,6 @@
 pub enum ObjectOwner {
     Ps,
     Ipc,
-    Mm,
     Io,
     ServiceProxy,
 }
@@ -23,11 +22,9 @@ pub enum ObjectKind {
     Endpoint,
     Reply,
     Transfer,
-    VmObject,
     Frame,
     SchedulingContext,
     DvmTransport,
-    FaultToken,
     LifecycleToken,
 }
 

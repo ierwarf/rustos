@@ -1451,6 +1451,7 @@ pub(in crate::multitask) fn note_job_control(
 
 /// Mark a process as exiting before callers tear down resources that it owns.
 /// The object stays available until its tasks retire and its parent reaps it.
+#[cfg(test)]
 pub fn mark_process_exiting(process_id: u64) -> Option<()> {
     mark_process_exiting_inner(process_id, None)
 }

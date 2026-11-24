@@ -398,6 +398,24 @@ pub(super) fn syscall_linux_syscalld_setid(op: u16, id: u64) -> u64 {
     }
 }
 
+/// Current process umask, read through syscalld without changing it.
+pub(super) fn query_umask() -> Result<u32, i64> {
+    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_UMASK);
+    request.flags = rustos_user_abi::syscall::SYSCALL_OFFLOAD_UMASK_QUERY;
+    let response = call_syscalld(request)?;
+    ensure_syscalld_payload(&response, size_of::<u32>())?;
+    let mask = u32::from_le_bytes([
+        response.payload[0],
+        response.payload[1],
+        response.payload[2],
+        response.payload[3],
+    ]);
+    if mask & !0o777 != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(mask)
+}
+
 pub(super) fn syscall_linux_syscalld_umask(new_mask: u64) -> u64 {
     let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_UMASK);
     request.mask = (new_mask & 0o777) as u32;

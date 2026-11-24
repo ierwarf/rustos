@@ -124,28 +124,6 @@ pub fn release_private_file_cache_frame(frame_phys: u64, backing_identity: u64) 
     FRAME_DESCRIPTORS.release_private_file_cache(frame_phys, backing_identity)
 }
 
-pub fn claim_private_file_data_leaf(
-    root_phys: u64,
-    virtual_address: u64,
-    frame_phys: u64,
-    backing_identity: u64,
-) -> DataClaim {
-    FRAME_DESCRIPTORS.claim_private_file_data(
-        root_phys,
-        virtual_address,
-        frame_phys,
-        backing_identity,
-    )
-}
-
-pub fn publish_private_file_data_leaf(root_phys: u64, virtual_address: u64, frame_phys: u64) {
-    FRAME_DESCRIPTORS.publish_private_file_data(root_phys, virtual_address, frame_phys);
-}
-
-pub fn cancel_private_file_data_leaf(root_phys: u64, virtual_address: u64, frame_phys: u64) {
-    FRAME_DESCRIPTORS.cancel_private_file_data(root_phys, virtual_address, frame_phys);
-}
-
 pub fn data_leaf_is_owned(root_phys: u64, virtual_address: u64, frame_phys: u64) -> bool {
     FRAME_DESCRIPTORS.data_is_owned(root_phys, virtual_address, frame_phys)
 }

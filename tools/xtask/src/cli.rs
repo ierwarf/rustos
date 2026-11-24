@@ -205,8 +205,6 @@ enum XtaskCommand {
         corpus: Option<PathBuf>,
     },
     Stage,
-    #[command(name = "build-efi")]
-    BuildEfi,
     #[command(name = "build-kernel")]
     BuildKernel,
     #[command(name = "build-user")]
@@ -363,7 +361,6 @@ pub(crate) fn run() -> Result<()> {
             corpus,
         }) => testinfra::fuzz_host(&config, &target, iterations, corpus.as_deref()),
         Some(XtaskCommand::Stage) => stage::stage(&config),
-        Some(XtaskCommand::BuildEfi) => build::build_efi(&config),
         Some(XtaskCommand::BuildKernel) => build::build_nucleus(&config),
         Some(XtaskCommand::BuildUser) => build::build_user(&config),
         Some(XtaskCommand::BuildDvm) => kvm::build_dvm_command(&config),

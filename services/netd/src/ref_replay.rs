@@ -121,7 +121,7 @@ pub(super) fn handle_dup(request: &NetdIpcRequest) -> i32 {
     if let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) {
         return increment_socket_refs(&mut socket.refs);
     }
-    let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
+    let Some(socket) = state.netlink_sockets.get_mut(&request.socket_token) else {
         return libc::EBADF;
     };
     increment_socket_refs(&mut socket.refs)

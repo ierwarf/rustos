@@ -7,14 +7,14 @@ mod tests {
     };
     use boot_random::{Random, init as init_random};
     use core::mem::size_of;
-    use keyboard_core::{KeyAction, KeyCode, KeyboardDriver, Modifiers, ScanCodeSet};
+    use keyboard_core::{KeyAction, KeyCode, KeyboardDriver, Modifiers};
     use rustos_fault_injection::{FaultAction, parse_rule};
     use rustos_user_abi::{console, device, ui};
 
     #[test]
     fn keyboard_core_decodes_basic_typing() {
         let mut keyboard = KeyboardDriver::new();
-        keyboard.feed_scancode(0x1e);
+        keyboard.inject_key_transition(KeyCode::A, false);
 
         let event = keyboard.pop_event().expect("keyboard event");
         assert_eq!(event.code, KeyCode::A);
@@ -24,11 +24,9 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_core_decodes_set2_extended_key() {
+    fn keyboard_core_navigation_key_has_no_text() {
         let mut keyboard = KeyboardDriver::new();
-        keyboard.set_scan_code_set(ScanCodeSet::Set2);
-        keyboard.feed_scancode(0xe0);
-        keyboard.feed_scancode(0x75);
+        keyboard.inject_key_transition(KeyCode::ArrowUp, false);
 
         let event = keyboard.pop_event().expect("keyboard event");
         assert_eq!(event.code, KeyCode::ArrowUp);

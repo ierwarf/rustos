@@ -6,4 +6,3 @@ publish = false
 
 [dependencies]
 bitflags = { version = "2.11", default-features = false }
-pc-keyboard = { version = "0.8", default-features = false }

@@ -15,6 +15,7 @@
 //!   reach-through.
 //! - **Evidence:** `input-delivery-lifecycle`, DVM ingress flows, and
 //!   `bootstrap-content-admission`.
+pub use crate::storage::boot_volume::BootstrapImageError;
 pub type ConsoleSessionHandle = crate::io::session::ConsoleSessionHandle;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,52 +28,9 @@ pub enum BootstrapPhase {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VfsError {
-    BadFileDescriptor,
     InvalidArgument,
     NotFound,
-    NotDirectory,
-    PermissionDenied,
-    ReadOnlyFilesystem,
     Unsupported,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MountError {
-    Busy,
-    InvalidArgument,
-    InvalidSource,
-    NotDirectory,
-    NotFound,
-    PermissionDenied,
-    ReadOnlyFilesystem,
-    UnsupportedFilesystem,
-    UnsupportedMountFlags,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum VfsNodeKind {
-    File,
-    Directory,
-    Device,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct VfsTimestamp {
-    pub sec: i64,
-    pub nsec: i64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VfsMetadata {
-    pub inode: u64,
-    pub kind: VfsNodeKind,
-    pub len: u64,
-    pub block_size: u64,
-    pub blocks: u64,
-    pub link_count: u64,
-    pub atime: VfsTimestamp,
-    pub mtime: VfsTimestamp,
-    pub ctime: VfsTimestamp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,12 +94,6 @@ pub mod block {
         out: &mut [u8],
     ) -> Result<Option<usize>, crate::storage::boot_volume::BootstrapImageError> {
         crate::storage::boot_volume::read_file_range(path, offset, out)
-    }
-
-    pub fn verified_bootstrap_file_bytes(
-        path: &str,
-    ) -> Result<Option<&'static [u8]>, crate::storage::boot_volume::BootstrapImageError> {
-        crate::storage::boot_volume::verified_file_bytes(path)
     }
 
     pub fn bootstrap_file_len(
@@ -249,7 +201,7 @@ pub mod block {
 }
 
 pub mod boot {
-    use super::{BootstrapPhase, ConsoleSessionHandle, map_bootstrap_phase};
+    use super::{BootstrapPhase, map_bootstrap_phase};
     use boot_protocol::{BootInfo, BootVolumeIdentity, BootVolumeTransport};
 
     pub fn init_gui(boot_info_ptr: *const BootInfo) {
@@ -299,9 +251,6 @@ pub mod boot {
         crate::storage::boot_volume::enter_userspace_runtime();
     }
 
-    pub const fn system_console_session() -> ConsoleSessionHandle {
-        crate::io::session::ConsoleSessionHandle::SYSTEM
-    }
 }
 
 pub mod console {
@@ -322,10 +271,6 @@ pub mod network {
     /// The authorized registrar resets predecessor authority only on commit.
     pub fn begin_dvm_transport_publication() -> DvmTransportPublicationGuard<'static> {
         crate::io::dvm_network::begin_transport_publication()
-    }
-
-    pub fn available() -> bool {
-        crate::network::available()
     }
 
     /// The exact owner/epoch is revalidated while the transport lease is held.
@@ -369,10 +314,6 @@ pub mod input {
 
         pub fn arm_consumer_wake() -> bool {
             crate::input::dvm_ring::arm_consumer_wake()
-        }
-
-        pub fn arm_input_waiter(task_id: u64) -> bool {
-            crate::input::wait_queue::arm_input_waiter(task_id)
         }
 
         pub fn disarm_input_waiter(task_id: u64) -> bool {
@@ -446,40 +387,13 @@ pub mod device {
     pub fn prepare_display_ioctl(request: u64, gpu_atlas_create_slot: Option<u32>) {
         crate::io::device::display::prepare_ioctl(request, gpu_atlas_create_slot);
     }
-
-    pub mod input {
-        pub fn has_pending_events() -> bool {
-            crate::input::dvm_ring::has_pending_records()
-        }
-    }
 }
 
 pub mod tty {
-    pub type LinuxTermios = crate::user::linux::LinuxTermios;
     pub use crate::io::session::ConsoleSessionHandle;
-
-    pub fn has_pending_input_for_session(session: ConsoleSessionHandle) -> bool {
-        crate::io::tty::has_pending_input_for_session(session)
-    }
-
-    pub fn pending_input_len_for_session(session: ConsoleSessionHandle) -> usize {
-        crate::io::tty::pending_input_len_for_session(session)
-    }
 
     pub fn disarm_input_waiter(task_id: u64) -> bool {
         crate::io::tty::disarm_input_waiter(task_id)
-    }
-
-    pub fn termios_for_session(session: ConsoleSessionHandle) -> LinuxTermios {
-        crate::io::tty::termios_for_session(session)
-    }
-
-    pub fn set_termios_for_session(
-        session: ConsoleSessionHandle,
-        termios: LinuxTermios,
-        flush_input: bool,
-    ) {
-        crate::io::tty::set_termios_for_session(session, termios, flush_input);
     }
 
     pub fn write_to_session(session: ConsoleSessionHandle, bytes: &[u8]) -> usize {
@@ -504,10 +418,7 @@ pub mod session {
 
 pub mod io {
     pub mod gui {
-        pub type GuiDisplayInfo = crate::io::gui::GuiDisplayInfo;
-        pub type GuiDamageRect = crate::io::gui::GuiDamageRect;
-        pub type GuiPresentOutcome = crate::io::gui::GuiPresentOutcome;
-        pub type KernelBgraFrame = crate::io::gui::KernelBgraFrame;
+        pub use crate::io::gui::GuiDisplayInfo;
 
         pub fn display_info() -> Option<GuiDisplayInfo> {
             crate::io::gui::display_info()
@@ -516,48 +427,14 @@ pub mod io {
         pub fn is_userspace_display_active() -> bool {
             crate::io::gui::is_userspace_display_active()
         }
-
-        pub fn present_userspace_frame_from_kernel_bgra8888(
-            src_ptr: *const u8,
-            width: usize,
-            height: usize,
-            stride_bytes: usize,
-        ) -> GuiPresentOutcome {
-            crate::io::gui::present_userspace_frame_from_kernel_bgra8888(
-                src_ptr,
-                width,
-                height,
-                stride_bytes,
-            )
-        }
-
-        pub fn present_userspace_frame_rect_from_kernel_bgra8888(
-            frame: KernelBgraFrame,
-            damage: GuiDamageRect,
-        ) -> GuiPresentOutcome {
-            crate::io::gui::present_userspace_frame_rect_from_kernel_bgra8888(frame, damage)
-        }
-
-        pub fn try_present_panic_blackout() -> bool {
-            crate::io::gui::try_present_panic_blackout()
-        }
     }
 }
 
 pub mod vfs {
-    use super::{MountError, VfsError, VfsMetadata};
+    use super::VfsError;
     use alloc::string::ToString;
 
     pub fn init() {}
-
-    pub fn path_inode(path: &[u8]) -> u64 {
-        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        for byte in path {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        hash.max(1)
-    }
 
     pub fn normalize_kernel_path(path: &str) -> Result<alloc::string::String, VfsError> {
         if path.starts_with('/') {
@@ -565,43 +442,6 @@ pub mod vfs {
         } else {
             Err(VfsError::InvalidArgument)
         }
-    }
-
-    pub fn mount_for_current_process(
-        _source_path: &str,
-        _target_path: &str,
-        _filesystem_type: &str,
-        _flags: u64,
-        _options: Option<&str>,
-    ) -> Result<(), MountError> {
-        Err(MountError::UnsupportedFilesystem)
-    }
-
-    pub fn umount_for_current_process(_target_path: &str) -> Result<(), MountError> {
-        Err(MountError::InvalidArgument)
-    }
-
-    pub fn open_path_for_current_process(
-        _absolute_path: &str,
-        _flags: u64,
-        _mode: u64,
-    ) -> Result<u64, VfsError> {
-        Err(VfsError::Unsupported)
-    }
-
-    pub fn metadata_for_current_process_path(
-        _absolute_path: &str,
-    ) -> Result<VfsMetadata, VfsError> {
-        Err(VfsError::Unsupported)
-    }
-
-    pub fn check_access_for_user_process(
-        _absolute_path: &str,
-        _mode: u64,
-        _abi: crate::user::UserAbi,
-        _process_state: &mut crate::user::UserProcessState,
-    ) -> Result<(), VfsError> {
-        Err(VfsError::Unsupported)
     }
 
     fn boot_image_path(path: &str) -> Result<&str, VfsError> {
@@ -636,17 +476,6 @@ pub mod vfs {
     pub fn read_path_to_vec_for_kernel(path: &str) -> Result<alloc::vec::Vec<u8>, VfsError> {
         let path = boot_image_path(path)?;
         crate::storage::boot_volume::read_file_to_vec(path).map_err(map_boot_volume_error)
-    }
-
-    pub fn boot_path_file_len_for_kernel(path: &str) -> Result<u64, VfsError> {
-        let path = boot_image_path(path)?;
-        crate::storage::boot_volume::file_len(path).map_err(map_boot_volume_error)
-    }
-
-    pub fn readlink_for_current_process(
-        _absolute_path: &str,
-    ) -> Result<alloc::string::String, VfsError> {
-        Err(VfsError::Unsupported)
     }
 
     #[cfg(test)]

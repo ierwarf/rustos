@@ -200,6 +200,7 @@ impl Meter {
         Self { class, group: None, charged: 0 }
     }
 
+    #[cfg(test)]
     pub fn is_bound(&self) -> bool {
         self.group.is_some()
     }

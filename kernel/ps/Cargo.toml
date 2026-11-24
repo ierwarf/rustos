@@ -11,7 +11,6 @@ kernel-hal = { path = "../hal" }
 kernel-mm = { path = "../mm" }
 kernel-ipc-runtime = { path = "../ipc-runtime" }
 kernel-object = { path = "../object" }
-trace-loc-macro = { path = "../../libs/trace-loc-macro" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi", features = ["linux-compat-state"] }
 rustos-scheduler-frame-gate = { path = "../../libs/rustos-scheduler-frame-gate" }
 lazy_static = { version = "1.4", features = ["spin_no_std"] }

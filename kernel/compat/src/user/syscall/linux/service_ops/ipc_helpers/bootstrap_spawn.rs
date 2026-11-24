@@ -167,12 +167,8 @@ fn console_host_error_to_linux_errno(error: crate::user::console_host::ConsoleHo
     match error {
         crate::user::console_host::ConsoleHostError::BootstrapBlocked => LINUX_EAGAIN,
         crate::user::console_host::ConsoleHostError::Load { error, .. } => match error {
-            crate::vfs::VfsError::BadFileDescriptor => LINUX_EBADF,
             crate::vfs::VfsError::InvalidArgument => LINUX_EINVAL,
             crate::vfs::VfsError::NotFound => LINUX_ENOENT,
-            crate::vfs::VfsError::NotDirectory => LINUX_ENOTDIR,
-            crate::vfs::VfsError::PermissionDenied => LINUX_EACCES,
-            crate::vfs::VfsError::ReadOnlyFilesystem => LINUX_EROFS,
             crate::vfs::VfsError::Unsupported => LINUX_ENOSYS,
         },
         crate::user::console_host::ConsoleHostError::Spawn { .. } => LINUX_ENOEXEC,

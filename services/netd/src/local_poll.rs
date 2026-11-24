@@ -1,4 +1,4 @@
-//! Deferred AF_UNIX poll waiters and the pending-slot reservation counters shared with the worker pools.
+//! Deferred netlink poll waiters and the pending-slot reservation counters shared with the worker pools.
 //!
 //! - **Owner:** `netd` owns the waiter queue and its global reservation counter.
 //! - **Boundary:** Poll requests and their reply capabilities are untrusted until evaluated.
@@ -18,9 +18,8 @@ use super::*;
 /// that runs only around a received request. With the endpoint idle, a waiter
 /// whose deadline has passed was therefore neither replied to nor timed out -
 /// it simply waited for unrelated traffic to arrive and remind netd it existed.
-/// AF_UNIX is how Wayland clients reach uiserver, so "unrelated traffic" is not
-/// a latency bound anyone should depend on. While any poll is deferred the loop
-/// waits with this budget instead.
+/// Unrelated traffic is not a latency bound anyone should depend on. While any
+/// poll is deferred the loop waits with this budget instead.
 pub(super) fn next_local_poll_budget_ms() -> Option<u64> {
     let waiters = local_poll_waiters().lock().ok()?;
     let earliest = waiters
@@ -81,7 +80,7 @@ pub(super) fn defer_local_poll_request_at(
     Ok(())
 }
 
-/// Local AF_UNIX state is owned by this service loop, so readiness can be
+/// Local netlink state is owned by this service loop, so readiness can be
 /// completed here without creating or waking an unrelated worker task. This
 /// preserves the IPC reply handoff from netd directly to the waiting client.
 ///

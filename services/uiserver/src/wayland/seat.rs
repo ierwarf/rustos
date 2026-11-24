@@ -4,7 +4,7 @@ use super::*;
 
 impl GlobalDispatch<wl_seat::WlSeat, ()> for WaylandState {
     fn bind(
-        _state: &mut Self,
+        state: &mut Self,
         _handle: &DisplayHandle,
         _client: &Client,
         resource: New<wl_seat::WlSeat>,
@@ -12,7 +12,11 @@ impl GlobalDispatch<wl_seat::WlSeat, ()> for WaylandState {
         data_init: &mut DataInit<'_, Self>,
     ) {
         let seat = data_init.init(resource, SeatData);
-        seat.capabilities(wl_seat::Capability::Pointer);
+        let mut capabilities = wl_seat::Capability::Pointer;
+        if state.ensure_keymap() {
+            capabilities |= wl_seat::Capability::Keyboard;
+        }
+        seat.capabilities(capabilities);
         if seat.version() >= 2 {
             seat.name(String::from("seat0"));
         }
@@ -64,6 +68,7 @@ impl Dispatch<wl_seat::WlSeat, SeatData> for WaylandState {
                 }
                 let keyboard = data_init.init(id, KeyboardData);
                 if let Some(client_id) = keyboard.client().map(|client| client.id()) {
+                    state.announce_keyboard(&keyboard, &client_id);
                     state.keyboard_resources.push(KeyboardResource {
                         resource: keyboard,
                         client_id,

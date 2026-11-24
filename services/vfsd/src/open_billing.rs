@@ -164,16 +164,20 @@ impl<T: RootdLink> OpenDescriptionBilling<T> {
             .ok()
             .is_some_and(|(state, _frame)| state == State::Funded)
     }
+    #[cfg(test)]
     pub fn pending_acks(&self) -> usize {
         self.ledger.ack_pending()
     }
+    #[cfg(test)]
     pub fn link(&self) -> &T {
         &self.link
     }
+    #[cfg(test)]
     pub fn link_mut(&mut self) -> &mut T {
         &mut self.link
     }
-    /// Test/diagnostic view of the provider-session ledger.
+    /// Test view of the provider-session ledger.
+    #[cfg(test)]
     pub fn ledger(&self) -> &ProviderClient {
         &self.ledger
     }

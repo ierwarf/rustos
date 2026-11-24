@@ -141,7 +141,6 @@ pub struct SpawnedProcess {
 }
 
 pub struct PreparedProcessImage {
-    pub abi: UserAbi,
     pub entry: VirtAddr,
     pub address_space: ProcessAddressSpace,
     pub bootstrap: multitask::UserTaskBootstrap,
@@ -479,7 +478,6 @@ fn prepare_loaded_process_with_launch(
     )?;
 
     Ok(PreparedProcessImage {
-        abi: loaded.abi,
         entry: loaded.entry,
         address_space: loaded.address_space,
         bootstrap,

@@ -266,7 +266,7 @@ fn collect_poll_readiness(
         usermem::copy_from_current_user_exact(entry_ptr, &mut raw)
             .map_err(user_pointer_error_to_linux_errno)?;
         let (fd, events) = decode_pollfd(&raw)?;
-        let revents = push_poll_entry(
+        push_poll_entry(
             &mut entries,
             &mut netd_slots,
             &mut netd_queries,
@@ -280,7 +280,6 @@ fn collect_poll_readiness(
             deadline_tick,
             &mut state,
         )?;
-        let _ = revents;
     }
     evaluate_poll_entries(
         &mut entries,
@@ -506,9 +505,6 @@ fn route_one_poll_fd(
         return Ok(PollRoute::Done(linux_abi::POLLNVAL as u32));
     };
     match handle {
-        multitask::KernelHandle::Socket(socket) => Ok(PollRoute::Netd {
-            token: socket.token_id(),
-        }),
         multitask::KernelHandle::InetSocket(socket) => Ok(PollRoute::Netd {
             token: socket.token_id(),
         }),
@@ -1710,7 +1706,6 @@ fn epoll_interest_target(fd: u64) -> Result<EpollInterestTarget, i64> {
     .ok_or(LINUX_EBADF)?;
     let handle = entry.handle().clone();
     let (provider, object_id) = match &handle {
-        multitask::KernelHandle::Socket(socket) => (WAITSET_PROVIDER_NETD, socket.token_id()),
         multitask::KernelHandle::InetSocket(socket) => (WAITSET_PROVIDER_NETD, socket.token_id()),
         multitask::KernelHandle::Device(device)
             if entry.rights().allows_read()

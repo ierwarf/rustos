@@ -75,14 +75,14 @@ pub use frame_descriptor_ledger::{
     claim_cow_replacement, cancel_cow_replacement,
     claim_private_file_cache_frame, release_private_file_cache_frame,
     root_admits, cancel_cow_mapping,
-    cancel_data_leaf, cancel_lazy_table_record, cancel_private_file_data_leaf, cancel_shared_alias,
+    cancel_data_leaf, cancel_lazy_table_record, cancel_shared_alias,
     cancel_shared_alias_run,
-    TableClaim, claim_data_leaf, claim_lazy_table_record, claim_private_file_data_leaf, commit_cow_mapping,
+    TableClaim, claim_data_leaf, claim_lazy_table_record, commit_cow_mapping,
     data_leaf_count, data_leaf_cow_identity, data_leaf_is_owned, lazy_table_record_count,
     lazy_table_record_is_owned, pop_lazy_table_record, prepare_shared_alias,
     prepare_shared_alias_run,
     promote_cow_mapping_in_place, publish_data_leaf, publish_lazy_table_record,
-    publish_private_file_data_leaf, publish_shared_alias, publish_shared_alias_run,
+    publish_shared_alias, publish_shared_alias_run,
     register_data_leaf_root,
     register_lazy_table_root, rekey_data_leaf, release_data_leaf, rollback_shared_alias, try_claim_cow_mapping,
     unregister_data_leaf_root,
@@ -91,7 +91,6 @@ use frame_descriptor_ledger::{CowMappingRecord, FRAME_DESCRIPTORS, FrameDescript
 
 mod frame_batch_profile;
 mod frame_cache;
-pub use frame_cache::FrameCacheStats;
 use frame_cache::{FRAME_CACHE_SLOTS, PHYS_POOL, frame_cache_params};
 
 #[inline]
@@ -459,9 +458,10 @@ impl PhysAllocatorState {
         Ok(())
     }
 
-    #[cfg(test)]
     fn alloc_contiguous_locked(&mut self, page_count: usize) -> Option<PhysAddr> {
-        self.alloc_contiguous_bounded_locked(page_count, self.geo.frame_count)
+        let start_frame = self.find_alloc_start_locked(page_count)?;
+        self.commit_alloc_locked(start_frame, page_count);
+        Some(PhysAddr::new(start_frame as u64 * PAGE_SIZE))
     }
 
     /// Fills `out` with up to `out.len()` single frames under one lock hold,
@@ -517,7 +517,7 @@ impl PhysAllocatorState {
                 crate::debug::warn!(memory, "fault injection: alloc.frame failed");
                 break;
             }
-            match self.alloc_contiguous_bounded_locked(1, self.geo.frame_count) {
+            match self.alloc_single_frame_locked() {
                 Some(addr) => {
                     out[filled] = addr;
                     filled += 1;
@@ -528,13 +528,9 @@ impl PhysAllocatorState {
         filled
     }
 
-    fn alloc_contiguous_bounded_locked(
-        &mut self,
-        page_count: usize,
-        max_frame_exclusive: usize,
-    ) -> Option<PhysAddr> {
-        let start_frame = self.find_alloc_start_locked(page_count, max_frame_exclusive)?;
-        self.commit_alloc_locked(start_frame, page_count);
+    fn alloc_single_frame_locked(&mut self) -> Option<PhysAddr> {
+        let start_frame = self.find_alloc_start_locked(1)?;
+        self.commit_alloc_locked(start_frame, 1);
         Some(PhysAddr::new(start_frame as u64 * PAGE_SIZE))
     }
 
@@ -544,31 +540,22 @@ impl PhysAllocatorState {
         self.next_hint = start_frame.saturating_add(page_count);
     }
 
-    fn find_alloc_start_locked(
-        &self,
-        page_count: usize,
-        max_frame_exclusive: usize,
-    ) -> Option<usize> {
+    fn find_alloc_start_locked(&self, page_count: usize) -> Option<usize> {
         if !self.initialized || page_count == 0 || page_count > self.free_frames {
             return None;
         }
-        let bounded_frame_count = self.geo.frame_count.min(max_frame_exclusive);
-        if page_count > bounded_frame_count {
+        let frame_count = self.geo.frame_count;
+        if page_count > frame_count {
             return None;
         }
 
-        let last_start_exclusive = bounded_frame_count
+        let last_start_exclusive = frame_count
             .checked_sub(page_count)?
             .saturating_add(1);
         let start_hint = self.next_hint.min(last_start_exclusive.saturating_sub(1));
 
-        self.find_contiguous_free_range(
-            start_hint,
-            last_start_exclusive,
-            page_count,
-            bounded_frame_count,
-        )
-        .or_else(|| self.find_contiguous_free_range(0, start_hint, page_count, bounded_frame_count))
+        self.find_contiguous_free_range(start_hint, last_start_exclusive, page_count)
+            .or_else(|| self.find_contiguous_free_range(0, start_hint, page_count))
     }
 
     fn find_contiguous_free_range(
@@ -576,7 +563,6 @@ impl PhysAllocatorState {
         start: usize,
         end: usize,
         page_count: usize,
-        max_frame_exclusive: usize,
     ) -> Option<usize> {
         if start >= end || page_count == 0 {
             return None;
@@ -587,8 +573,7 @@ impl PhysAllocatorState {
             let range_start = range.start_frame.max(start);
             let range_end = range
                 .start_frame
-                .saturating_add(range.page_count)
-                .min(max_frame_exclusive);
+                .saturating_add(range.page_count);
             let start_limit_end = end.min(range_end);
             if range_start >= start_limit_end {
                 continue;
@@ -697,7 +682,7 @@ impl PhysAllocatorState {
     /// it is marked used, so no window shows a used, uncached frame that a
     /// duplicate release could mistake for an allocation.
     fn take_frame_for_cache_locked(&mut self) -> Option<usize> {
-        let start = self.find_alloc_start_locked(1, self.geo.frame_count)?;
+        let start = self.find_alloc_start_locked(1)?;
         self.geo.cached.test_and_set(start);
         self.commit_alloc_locked(start, 1);
         Some(start)
@@ -1050,16 +1035,7 @@ fn alloc_frame_with_fault_gate(
 }
 
 pub fn alloc_contiguous(page_count: usize) -> Option<PhysAddr> {
-    irq_safe(|| PHYS_POOL.alloc_contiguous(current_cache_slot(), page_count, usize::MAX))
-}
-
-pub fn alloc_contiguous_below(page_count: usize, max_phys_addr_inclusive: u64) -> Option<PhysAddr> {
-    let max_frame_exclusive = max_phys_addr_inclusive
-        .checked_add(1)
-        .map_or(usize::MAX, |end| {
-            usize::try_from(end / PAGE_SIZE).unwrap_or(usize::MAX)
-        });
-    irq_safe(|| PHYS_POOL.alloc_contiguous(current_cache_slot(), page_count, max_frame_exclusive))
+    irq_safe(|| PHYS_POOL.alloc_contiguous(current_cache_slot(), page_count))
 }
 
 pub fn try_free_frame(phys: PhysAddr) -> Result<(), FreeFrameError> {
@@ -1071,24 +1047,8 @@ pub fn try_free_frame(phys: PhysAddr) -> Result<(), FreeFrameError> {
     }
 }
 
-/// Fills `out` with independent (not necessarily adjacent) frames, for callers
-/// that would otherwise call `alloc_frame` once per page in a loop - a
-/// process's private address-space population is the motivating case. Returns
-/// the number of frames actually filled; a short fill (fewer than `out.len()`)
-/// means the allocator ran out, mirroring what a per-page `alloc_frame()` loop
-/// would have found on its next iteration.
-pub fn alloc_frames_batch(out: &mut [PhysAddr]) -> usize {
-    let filled = irq_safe(|| {
-        PHYS_POOL.alloc_frames(current_cache_slot(), out, false, || {
-            nucleus_core::util::fault_injection::should_fail("alloc.frame")
-        })
-    });
-    frame_batch_profile::record_allocation(out.len(), filled);
-    filled
-}
-
-/// User-class [`alloc_frames_batch`]: fills no more than the frames above the
-/// kernel reserve. A short fill means pressure, not only exhaustion.
+/// Fills `out` with independent (not necessarily adjacent) user-class frames,
+/// no more than the frames above the kernel reserve. A short fill means pressure, not only exhaustion.
 pub fn alloc_frames_batch_user(out: &mut [PhysAddr]) -> usize {
     let filled = irq_safe(|| {
         PHYS_POOL.alloc_frames(current_cache_slot(), out, true, || {
@@ -1105,38 +1065,9 @@ pub fn min_free_bytes() -> u64 {
     PHYS_POOL.min_free.load(Ordering::Relaxed) as u64 * PAGE_SIZE
 }
 
-/// Whether free memory is at or below the user-class watermark. Frames parked
-/// in CPU caches count as free.
-pub fn below_user_watermark() -> bool {
-    // ORDERING: Relaxed; immutable after allocator initialization.
-    PHYS_POOL.free_total() <= PHYS_POOL.min_free.load(Ordering::Relaxed)
-}
-
 /// Count of user-class allocations refused or truncated by the watermark.
 pub fn user_watermark_denials() -> u64 {
     USER_WATERMARK_DENIALS.load(Ordering::Relaxed)
-}
-
-/// Frames parked in per-CPU caches; they are included in [`free_bytes`].
-pub fn cached_frame_count() -> usize {
-    PHYS_POOL.cached_total()
-}
-
-/// Cache slow-path counters, for diagnostics.
-pub fn frame_cache_stats() -> FrameCacheStats {
-    PHYS_POOL.stats()
-}
-
-/// Returns every cached frame to the central set. Safe from any CPU at any time
-/// (slots are locked); a CPU leaving service calls this for its own slot so
-/// its frames rejoin contiguous allocation.
-pub fn drain_cpu_frame_cache(cpu_index: usize) {
-    irq_safe(|| PHYS_POOL.drain_slot(cpu_index));
-}
-
-/// Returns every CPU's cached frames to the central set.
-pub fn drain_all_frame_caches() {
-    irq_safe(|| PHYS_POOL.drain_all());
 }
 
 /// Frees every frame in `frames`. Failures are written into `failures`
@@ -1479,10 +1410,32 @@ mod tests {
         let mut bitmap = [u64::MAX; 1];
         let mut state = test_state(&mut bitmap, 8, 6);
 
-        let allocated = state
-            .alloc_contiguous_bounded_locked(2, 4)
-            .expect("bounded allocation should succeed");
-        assert_eq!(allocated.as_u64(), PAGE_SIZE * 2);
+        // `last_start_exclusive = 5` clamps `start_hint = 6` to `4`, taking `[4..8)`.
+        let first = state
+            .alloc_contiguous_locked(4)
+            .expect("contiguous allocation within pool limit should succeed");
+        assert_eq!(first.as_u64(), PAGE_SIZE * 4);
+        assert_eq!(state.free_frames, 4);
+
+        // Split the remaining [0..4) range into [0] and [2..4) so no 3-frame run fits.
+        assert_eq!(state.claim_fixed_range_locked(PAGE_SIZE, PAGE_SIZE), Ok(()));
+        assert_eq!(state.free_frames, 3);
+        assert_eq!(state.alloc_contiguous_locked(3), None);
+        assert_eq!(state.free_frames, 3);
+
+        let second = state
+            .alloc_contiguous_locked(2)
+            .expect("remaining 2-frame run within limit should succeed");
+        assert_eq!(second.as_u64(), PAGE_SIZE * 2);
+        assert_eq!(state.free_frames, 1);
+        assert_eq!(state.alloc_contiguous_locked(2), None);
+
+        let last = state
+            .alloc_contiguous_locked(1)
+            .expect("final free frame within limit should succeed");
+        assert_eq!(last.as_u64(), 0);
+        assert_eq!(state.free_frames, 0);
+        assert_eq!(state.alloc_contiguous_locked(1), None);
     }
 
     #[test]

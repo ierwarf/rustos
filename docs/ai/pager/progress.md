@@ -255,8 +255,8 @@ the request for a later pass. Neither anonymous resume nor pager wake waits for
 a full refill. The capacity relations in §4 cover pager-backed grants, not all
 anonymous and table consumption.
 
-Observability: `pager_fault_reserve_low_watermark()` records supply pressure.
-Zero is a useful diagnostic, not proof of a failed fault or violated slot bound.
+Observability: the reserve pool's low watermark records supply pressure (host
+tests only; no runtime consumer reads it). Zero is a useful diagnostic, not proof of a failed fault or violated slot bound.
 `pager-ring0-anon-reserve-empty` records anonymous reserve misses, including
 those successfully served by allocator fallback. Distinguish those from actual
 both-source exhaustion and from pager-backed reserve-admission refusal.

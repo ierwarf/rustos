@@ -25,16 +25,8 @@ pub fn load_address_space_phys(root_phys: PhysAddr) {
     crate::memory::kernel_vm::load_address_space_phys(root_phys);
 }
 
-pub fn with_kernel_address_space<R>(f: impl FnOnce() -> R) -> R {
-    crate::memory::kernel_vm::with_kernel_address_space(f)
-}
-
 pub fn higher_half_addr(addr: u64) -> u64 {
     crate::memory::kernel_vm::higher_half_addr(addr)
-}
-
-pub fn lower_half_addr(addr: u64) -> u64 {
-    crate::memory::kernel_vm::lower_half_addr(addr)
 }
 
 pub fn kernel_virtual_to_physical_addr(addr: u64) -> u64 {
@@ -69,10 +61,6 @@ pub fn mark_direct_map_range_writable_noexec(phys_addr: u64, size: usize) -> boo
 
 pub fn mark_direct_map_range_readonly_noexec(phys_addr: u64, size: usize) -> bool {
     crate::memory::kernel_vm::mark_direct_map_range_readonly_noexec(phys_addr, size)
-}
-
-pub fn direct_map_phys_is_executable(phys_addr: u64) -> bool {
-    crate::memory::kernel_vm::direct_map_phys_is_executable(phys_addr)
 }
 
 pub fn map_mmio_range(phys_addr: u64, size: usize) -> Option<u64> {

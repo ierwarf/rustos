@@ -17,8 +17,6 @@
 //! - **Evidence:** `ipc-call`, `endpoint-lifecycle`,
 //!   `ipc-handle-transfer`, `kernel-resource-lifecycle`, `root-authority`, and
 //!   `service-call-authority`.
-#[cfg(test)]
-use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 #[cfg(not(test))]
@@ -27,14 +25,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 mod endpoint_priority;
 mod endpoint_receive;
-#[cfg(test)]
-mod legacy_test_api;
 mod reply_publication;
 mod shared_region_hold;
 mod slab;
-
-#[cfg(test)]
-use legacy_test_api::*;
 
 pub use endpoint_priority::EndpointCallPriority;
 use endpoint_priority::EndpointObject;
@@ -44,11 +37,6 @@ pub use endpoint_receive::{
 };
 pub use shared_region_hold::KernelSharedRegionMappingHold;
 
-use crate::ipc_core::SharedRegionHandle;
-#[cfg(test)]
-use crate::ipc_core::{
-    ChannelHandle, EventHandle, IpcHeader, PORT_NAME_CAPACITY, PortHandle, PortName,
-};
 use kernel_object::api::{
     handle::{HandleRights, HandleToken},
     identity::{ObjectIdentity, ObjectKind, ObjectOwner},
@@ -65,18 +53,6 @@ use crate::memory::{kernel_vm, phys};
 
 #[cfg(not(test))]
 const PAGE_SIZE: usize = 4096;
-#[cfg(test)]
-const INITIAL_PENDING_CHANNEL_CAPACITY: usize = 4;
-#[cfg(test)]
-const INITIAL_CHANNEL_QUEUE_CAPACITY: usize = 8;
-#[cfg(test)]
-const MAX_PENDING_CHANNELS_PER_PORT: usize = 256;
-#[cfg(test)]
-const MAX_CHANNEL_QUEUE_DEPTH: usize = 256;
-#[cfg(test)]
-const MAX_IPC_PAYLOAD_BYTES: usize = 64 * 1024;
-#[cfg(test)]
-const MAX_IPC_ATTACHED_HANDLES: usize = 16;
 const MAX_ENDPOINT_INLINE_MESSAGE_BYTES: usize = rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES;
 const MAX_ENDPOINT_PENDING_MESSAGES: usize = 64;
 const MAX_ENDPOINT_TRANSFER_HANDLES: usize = 16;
@@ -95,72 +71,18 @@ const MAX_SHARED_REGION_TOTAL_BYTES: usize = 512 * 1024 * 1024;
 const MAX_SHARED_REGIONS_PER_PROCESS: usize = 64;
 const MAX_SHARED_REGION_BYTES_PER_PROCESS: usize = 128 * 1024 * 1024;
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConsoleStreamKind {
-    Input,
-    Output,
-    Error,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum KernelHandle {
-    Console(ConsoleStreamKind),
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct KernelPortHandle {
-    raw: PortHandle,
-}
-
-#[cfg(test)]
-impl KernelPortHandle {
-    pub const fn from_raw(raw: u64) -> Self {
-        Self {
-            raw: PortHandle(raw),
-        }
-    }
-
-    pub const fn raw(&self) -> u64 {
-        self.raw.0
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct KernelChannelHandle {
-    raw: ChannelHandle,
-}
-
-#[cfg(test)]
-impl KernelChannelHandle {
-    pub const fn from_raw(raw: u64) -> Self {
-        Self {
-            raw: ChannelHandle(raw),
-        }
-    }
-
-    pub const fn raw(&self) -> u64 {
-        self.raw.0
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KernelSharedRegionHandle {
-    raw: SharedRegionHandle,
+    raw: u64,
 }
 
 impl KernelSharedRegionHandle {
     pub const fn from_raw(raw: u64) -> Self {
-        Self {
-            raw: SharedRegionHandle(raw),
-        }
+        Self { raw }
     }
 
     pub const fn raw(&self) -> u64 {
-        self.raw.0
+        self.raw
     }
 }
 
@@ -377,33 +299,6 @@ impl KernelTransferredHandle {
     }
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct KernelEventHandle {
-    raw: EventHandle,
-}
-
-#[cfg(test)]
-impl KernelEventHandle {
-    pub const fn from_raw(raw: u64) -> Self {
-        Self {
-            raw: EventHandle(raw),
-        }
-    }
-
-    pub const fn raw(&self) -> u64 {
-        self.raw.0
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub(crate) struct IpcMessage {
-    pub header: IpcHeader,
-    pub payload: Vec<u8>,
-    pub attached_handles: Vec<KernelHandle>,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IpcError {
     InvalidHandle,
@@ -557,22 +452,6 @@ impl EndpointWakeSet {
             .copied()
             .flatten()
     }
-}
-
-#[cfg(test)]
-#[derive(Default)]
-struct PortObject {
-    name: Option<PortName>,
-    pending_channels: VecDeque<u64>,
-}
-
-#[cfg(test)]
-#[derive(Default)]
-struct ChannelObject {
-    peer: Option<u64>,
-    recv_queue: VecDeque<IpcMessage>,
-    closed: bool,
-    queued_for_accept: bool,
 }
 
 #[cfg(test)]
@@ -1007,68 +886,6 @@ pub struct PreparedReplyHandleBindError {
     pub handles: Vec<KernelTransferredHandle>,
 }
 
-#[cfg(test)]
-#[derive(Default)]
-struct EventObject {
-    signal_count: u64,
-}
-
-#[cfg(test)]
-#[derive(Default)]
-struct IpcObjectTable {
-    next_id: u64,
-    named_ports: BTreeMap<PortName, u64>,
-    ports: BTreeMap<u64, PortObject>,
-    channels: BTreeMap<u64, ChannelObject>,
-    events: BTreeMap<u64, EventObject>,
-}
-
-#[cfg(test)]
-impl IpcObjectTable {
-    const fn new() -> Self {
-        Self {
-            next_id: 1,
-            named_ports: BTreeMap::new(),
-            ports: BTreeMap::new(),
-            channels: BTreeMap::new(),
-            events: BTreeMap::new(),
-        }
-    }
-
-    fn allocate_id(&mut self) -> Result<u64, IpcError> {
-        let id = self.next_id;
-        let Some(next_id) = self.next_id.checked_add(1) else {
-            return Err(IpcError::NoMemory);
-        };
-        self.next_id = next_id;
-        Ok(id)
-    }
-
-    fn allocate_channel_pair(&mut self) -> Result<(u64, u64), IpcError> {
-        let left_id = self.allocate_id()?;
-        let right_id = self.allocate_id()?;
-        self.channels.insert(
-            left_id,
-            ChannelObject {
-                peer: Some(right_id),
-                recv_queue: VecDeque::with_capacity(INITIAL_CHANNEL_QUEUE_CAPACITY),
-                closed: false,
-                queued_for_accept: false,
-            },
-        );
-        self.channels.insert(
-            right_id,
-            ChannelObject {
-                peer: Some(left_id),
-                recv_queue: VecDeque::with_capacity(INITIAL_CHANNEL_QUEUE_CAPACITY),
-                closed: false,
-                queued_for_accept: false,
-            },
-        );
-        Ok((left_id, right_id))
-    }
-}
-
 static ENDPOINTS: GenerationalSlab<
     EndpointObject,
     MAX_ENDPOINT_OBJECTS,
@@ -1098,9 +915,6 @@ static SHARED_REGION_QUOTAS: TrackedSpinLock<
     SharedRegionQuotaTable,
     { LockClass::IpcRegionQuota as u8 },
 > = TrackedSpinLock::new(SharedRegionQuotaTable::new());
-
-#[cfg(test)]
-static IPC_OBJECTS: Mutex<IpcObjectTable> = Mutex::new(IpcObjectTable::new());
 
 #[cfg(test)]
 static ENDPOINT_ENQUEUE_BINDING_FAULT: Mutex<Option<EndpointEnqueueBindingFault>> =
@@ -1161,207 +975,6 @@ fn inject_endpoint_recv_stale_head_fault(message_id: u64) {
             "faulted queue head must name a live endpoint message"
         );
     }
-}
-
-#[cfg(test)]
-fn with_ipc_objects<R>(f: impl FnOnce(&mut IpcObjectTable) -> R) -> R {
-    let mut objects = IPC_OBJECTS.lock();
-    f(&mut objects)
-}
-
-#[cfg(test)]
-fn with_ipc_objects_ref<R>(f: impl FnOnce(&IpcObjectTable) -> R) -> R {
-    let objects = IPC_OBJECTS.lock();
-    f(&objects)
-}
-
-#[cfg(test)]
-pub fn create_port() -> Result<KernelPortHandle, IpcError> {
-    create_named_port(None)
-}
-
-#[cfg(test)]
-fn normalize_port_name(name: PortName) -> Result<PortName, IpcError> {
-    let len = usize::from(name.len);
-    if len > PORT_NAME_CAPACITY {
-        return Err(IpcError::InvalidArgument);
-    }
-
-    let mut normalized = PortName::empty();
-    normalized.bytes[..len].copy_from_slice(&name.bytes[..len]);
-    normalized.len = name.len;
-    Ok(normalized)
-}
-
-#[cfg(test)]
-fn normalize_header(
-    mut header: IpcHeader,
-    payload_len: usize,
-    handle_count: usize,
-) -> Result<IpcHeader, IpcError> {
-    let Ok(payload_len) = u32::try_from(payload_len) else {
-        return Err(IpcError::InvalidArgument);
-    };
-    let Ok(handle_count) = u16::try_from(handle_count) else {
-        return Err(IpcError::InvalidArgument);
-    };
-    header.payload_len = payload_len;
-    header.handle_count = handle_count;
-    header.reserved = 0;
-    Ok(header)
-}
-
-#[cfg(test)]
-fn queue_server_channel_for_accept(
-    objects: &mut IpcObjectTable,
-    port_id: u64,
-    server_channel_id: u64,
-) -> Result<(), IpcError> {
-    let Some(port_object) = objects.ports.get(&port_id) else {
-        return Err(IpcError::InvalidHandle);
-    };
-    if port_object.pending_channels.len() >= MAX_PENDING_CHANNELS_PER_PORT {
-        return Err(IpcError::NoMemory);
-    }
-
-    {
-        let Some(channel_object) = objects.channels.get_mut(&server_channel_id) else {
-            return Err(IpcError::InvalidHandle);
-        };
-        if channel_object.closed || channel_object.peer.is_none() {
-            return Err(IpcError::PeerClosed);
-        }
-        if channel_object.queued_for_accept {
-            return Err(IpcError::InvalidArgument);
-        }
-        channel_object.queued_for_accept = true;
-    }
-
-    objects
-        .ports
-        .get_mut(&port_id)
-        .expect("ipc: port disappeared while queueing accept")
-        .pending_channels
-        .push_back(server_channel_id);
-    Ok(())
-}
-
-#[cfg(test)]
-fn connect_port_locked(
-    objects: &mut IpcObjectTable,
-    port_id: u64,
-) -> Result<KernelChannelHandle, IpcError> {
-    let Some(port_object) = objects.ports.get(&port_id) else {
-        return Err(IpcError::InvalidHandle);
-    };
-    if port_object.pending_channels.len() >= MAX_PENDING_CHANNELS_PER_PORT {
-        return Err(IpcError::NoMemory);
-    }
-
-    let (client_id, server_id) = objects.allocate_channel_pair()?;
-    queue_server_channel_for_accept(objects, port_id, server_id)?;
-    Ok(KernelChannelHandle::from_raw(client_id))
-}
-
-#[cfg(test)]
-pub fn create_named_port(name: Option<PortName>) -> Result<KernelPortHandle, IpcError> {
-    let normalized_name = match name {
-        Some(name) => Some(normalize_port_name(name)?),
-        None => None,
-    };
-
-    with_ipc_objects(|objects| {
-        if let Some(name) = normalized_name
-            && objects.named_ports.contains_key(&name)
-        {
-            return Err(IpcError::InvalidArgument);
-        }
-
-        let id = objects.allocate_id()?;
-        if let Some(name) = normalized_name {
-            objects.named_ports.insert(name, id);
-        }
-
-        objects.ports.insert(
-            id,
-            PortObject {
-                name: normalized_name,
-                pending_channels: VecDeque::with_capacity(INITIAL_PENDING_CHANNEL_CAPACITY),
-            },
-        );
-        Ok(KernelPortHandle::from_raw(id))
-    })
-}
-
-#[cfg(test)]
-pub fn lookup_named_port(name: PortName) -> Option<KernelPortHandle> {
-    let name = normalize_port_name(name).ok()?;
-    with_ipc_objects_ref(|objects| {
-        objects
-            .named_ports
-            .get(&name)
-            .copied()
-            .map(KernelPortHandle::from_raw)
-    })
-}
-
-#[cfg(test)]
-pub fn create_channel_pair() -> Result<(KernelChannelHandle, KernelChannelHandle), IpcError> {
-    with_ipc_objects(|objects| {
-        let (left_id, right_id) = objects.allocate_channel_pair()?;
-        Ok((
-            KernelChannelHandle::from_raw(left_id),
-            KernelChannelHandle::from_raw(right_id),
-        ))
-    })
-}
-
-#[cfg(test)]
-pub fn queue_channel_for_accept(
-    port: KernelPortHandle,
-    server_channel: KernelChannelHandle,
-) -> Result<(), IpcError> {
-    with_ipc_objects(|objects| {
-        queue_server_channel_for_accept(objects, port.raw(), server_channel.raw())
-    })
-}
-
-#[cfg(test)]
-pub fn accept_channel(port: KernelPortHandle) -> Result<Option<KernelChannelHandle>, IpcError> {
-    with_ipc_objects(|objects| {
-        let Some(port_object) = objects.ports.get_mut(&port.raw()) else {
-            return Err(IpcError::InvalidHandle);
-        };
-
-        while let Some(channel_id) = port_object.pending_channels.pop_front() {
-            let Some(channel_object) = objects.channels.get_mut(&channel_id) else {
-                continue;
-            };
-            channel_object.queued_for_accept = false;
-            if channel_object.closed || channel_object.peer.is_none() {
-                continue;
-            }
-            return Ok(Some(KernelChannelHandle::from_raw(channel_id)));
-        }
-
-        Ok(None)
-    })
-}
-
-#[cfg(test)]
-pub fn connect_port(port: KernelPortHandle) -> Result<KernelChannelHandle, IpcError> {
-    with_ipc_objects(|objects| connect_port_locked(objects, port.raw()))
-}
-
-#[cfg(test)]
-pub fn connect_named_port(name: PortName) -> Result<KernelChannelHandle, IpcError> {
-    let name = normalize_port_name(name)?;
-    with_ipc_objects(|objects| {
-        let Some(port_id) = objects.named_ports.get(&name).copied() else {
-            return Err(IpcError::InvalidHandle);
-        };
-        connect_port_locked(objects, port_id)
-    })
 }
 
 fn reserve_shared_region_admission(
@@ -1426,6 +1039,7 @@ fn release_shared_region_admission(owner_process_id: Option<u64>, byte_len: usiz
     assert!(previous != 0, "shared-region admission count underflow");
 }
 
+#[cfg(test)]
 pub fn create_shared_region(byte_len: usize) -> Result<KernelSharedRegionHandle, IpcError> {
     create_shared_region_with_owner(None, byte_len)
 }
@@ -1567,6 +1181,7 @@ pub fn service_deferred_shared_region_reclaims(max_pages: usize) -> usize {
     reclaimed
 }
 
+#[cfg(test)]
 pub fn create_endpoint() -> Result<KernelEndpointHandle, IpcError> {
     create_endpoint_with_owner(None, None)
 }
@@ -1586,6 +1201,7 @@ pub fn create_endpoint_for_process(
     create_endpoint_with_owner(Some(EndpointOwner::Process(owner_process_id)), None)
 }
 
+#[cfg(test)]
 /// As `create_endpoint_for_process`, additionally billing the endpoint's
 /// reserved queue storage to the owner's Job charge group (lock-free; refunded
 /// when the owner's endpoints are failed at exit). The caller resolves the
@@ -1940,6 +1556,7 @@ fn enqueue_endpoint_call_with_handles_faultable(
     Ok((KernelReplyHandle::from_raw(reply_id), receiver_to_wake))
 }
 
+#[cfg(test)]
 /// Reserves the allocation-free byte-only rendezvous transport. Publication
 /// succeeds only for the exact front waiter on an otherwise idle endpoint;
 /// every failure removes the unpublished reply slot before returning.
@@ -2317,40 +1934,7 @@ fn complete_fast_endpoint_reply(
     result
 }
 
-pub fn reject_fast_endpoint_reply_for_task(
-    reply: KernelReplyHandle,
-    receiver_task_id: u64,
-    error: IpcError,
-) -> Result<FastReplyCompletion, IpcError> {
-    REPLIES
-        .with_mut(reply.raw(), |reply_object| {
-            if reply_object.used || reply_object.consumed {
-                return Err(IpcError::InvalidArgument);
-            }
-            let frame = reply_object
-                .fast_frame
-                .as_mut()
-                .ok_or(IpcError::InvalidHandle)?;
-            if frame.receiver_task_id != receiver_task_id
-                || frame.state != FastCallState::RequestTaken
-            {
-                return Err(IpcError::PermissionDenied);
-            }
-            frame.response_len = 0;
-            frame.terminal_error = Some(error);
-            frame.state = FastCallState::ErrorReady;
-            reply_object.used = true;
-            Ok(FastReplyCompletion {
-                completion: ReplyCompletion {
-                    caller_task_id: frame.caller_task_id,
-                    scheduling_context: reply_object.scheduling_context.take(),
-                },
-                terminal_error: Some(error),
-            })
-        })
-        .ok_or(IpcError::InvalidHandle)?
-}
-
+#[cfg(test)]
 pub fn take_fast_endpoint_response(
     reply: KernelReplyHandle,
     caller_task_id: u64,
@@ -2574,12 +2158,14 @@ pub fn bind_prepared_reply_handles_for_process(
     }
 }
 
+#[cfg(test)]
 pub fn recv_endpoint(
     endpoint: KernelEndpointHandle,
 ) -> Result<Option<(KernelReplyHandle, Vec<u8>)>, IpcError> {
     recv_endpoint_with_limits(endpoint, usize::MAX)
 }
 
+#[cfg(test)]
 pub fn recv_endpoint_with_limits(
     endpoint: KernelEndpointHandle,
     request_capacity: usize,
@@ -2592,6 +2178,7 @@ pub fn recv_endpoint_with_limits(
     Ok(Some((reply, request)))
 }
 
+#[cfg(test)]
 pub fn recv_endpoint_with_limits_and_handles(
     endpoint: KernelEndpointHandle,
     request_capacity: usize,
@@ -2622,6 +2209,7 @@ pub fn recv_endpoint_with_sender_and_limits(
         .ok_or(IpcError::InvalidHandle)?
 }
 
+#[cfg(test)]
 /// Confirms that a task-owned internal endpoint is received only by that task.
 /// User-visible endpoints use `authorize_endpoint_receiver_for_process` so
 /// workers in the owning process are valid receivers.
@@ -2656,6 +2244,7 @@ fn endpoint_owner_allows(owner: Option<EndpointOwner>, receiver: EndpointOwner) 
     owner.is_none_or(|owner| owner == receiver)
 }
 
+#[cfg(test)]
 /// Registers `task_id` as a receiver waiter on `endpoint`. Returns
 /// `Ok(has_pending)` where `has_pending == true` means a message is already
 /// queued on the endpoint at the moment of registration. Callers must use the
@@ -2688,10 +2277,12 @@ pub fn add_endpoint_receiver_waiter_with_capacity(
         .ok_or(IpcError::InvalidHandle)?
 }
 
+#[cfg(test)]
 pub fn complete_endpoint_reply(reply: KernelReplyHandle, response: &[u8]) -> Result<u64, IpcError> {
     complete_endpoint_reply_with_handles(reply, response, &[])
 }
 
+#[cfg(test)]
 pub fn complete_endpoint_reply_with_handles(
     reply: KernelReplyHandle,
     response: &[u8],
@@ -2706,6 +2297,7 @@ pub fn complete_endpoint_reply_with_handles(
     )
 }
 
+#[cfg(test)]
 fn complete_endpoint_reply_with_handles_faultable(
     reply: KernelReplyHandle,
     response: &[u8],
@@ -2728,6 +2320,7 @@ fn complete_endpoint_reply_with_handles_faultable(
     .map(|completion| completion.caller_task_id)
 }
 
+#[cfg(test)]
 /// Completes a reply obtained through a task-owned internal endpoint.
 pub fn complete_endpoint_reply_for_task(
     reply: KernelReplyHandle,
@@ -2742,21 +2335,7 @@ pub fn complete_endpoint_reply_for_task(
     )
 }
 
-pub fn complete_endpoint_reply_with_handles_for_task(
-    reply: KernelReplyHandle,
-    receiver_task_id: u64,
-    response: &[u8],
-    attached_handles: &[KernelTransferredHandle],
-) -> Result<u64, IpcError> {
-    ensure_reply_has_no_scheduling_context(reply)?;
-    complete_endpoint_reply_with_handles_for_owner(
-        reply,
-        EndpointOwner::Task(receiver_task_id),
-        response,
-        attached_handles,
-    )
-}
-
+#[cfg(test)]
 /// Completes a reply obtained through a process-owned user endpoint. The
 /// capability is bound to the destination process, allowing its worker
 /// threads while rejecting unrelated processes.
@@ -2770,21 +2349,6 @@ pub fn complete_endpoint_reply_for_process(
         EndpointOwner::Process(receiver_process_id),
         response,
         &[],
-    )
-}
-
-pub fn complete_endpoint_reply_with_handles_for_process(
-    reply: KernelReplyHandle,
-    receiver_process_id: u64,
-    response: &[u8],
-    attached_handles: &[KernelTransferredHandle],
-) -> Result<u64, IpcError> {
-    ensure_reply_has_no_scheduling_context(reply)?;
-    complete_endpoint_reply_with_handles_for_owner(
-        reply,
-        EndpointOwner::Process(receiver_process_id),
-        response,
-        attached_handles,
     )
 }
 
@@ -2815,6 +2379,7 @@ pub fn complete_endpoint_reply_with_handles_for_process_with_custody(
     )
 }
 
+#[cfg(test)]
 fn ensure_reply_has_no_scheduling_context(reply: KernelReplyHandle) -> Result<(), IpcError> {
     REPLIES
         .with(reply.raw(), |object| object.scheduling_context.is_none())
@@ -2823,6 +2388,7 @@ fn ensure_reply_has_no_scheduling_context(reply: KernelReplyHandle) -> Result<()
         .ok_or(IpcError::InvalidArgument)
 }
 
+#[cfg(test)]
 fn complete_endpoint_reply_with_handles_for_owner(
     reply: KernelReplyHandle,
     receiver_owner: EndpointOwner,
@@ -2859,6 +2425,7 @@ fn complete_endpoint_reply_with_handles_for_owner_with_custody(
     )
 }
 
+#[cfg(test)]
 fn complete_endpoint_reply_with_handles_for_owner_faultable(
     reply: KernelReplyHandle,
     receiver_owner: EndpointOwner,
@@ -3091,6 +2658,7 @@ pub fn take_endpoint_response_detailed(
     Ok(result)
 }
 
+#[cfg(test)]
 pub fn cancel_endpoint_call(reply: KernelReplyHandle, caller_task_id: u64) -> Result<(), IpcError> {
     ensure_reply_has_no_scheduling_context(reply)?;
     cancel_endpoint_call_with_transfers(reply, caller_task_id).map(|_| ())

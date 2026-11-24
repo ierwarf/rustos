@@ -1,5 +1,5 @@
 use super::*;
-use crate::local_socket_poll_tests::connected_socket;
+use crate::netlink_tests::{make_readable, netlink_socket};
 
 fn publications() -> Vec<(u64, u64)> {
     TEST_PUBLICATIONS.with(|entries| std::mem::take(&mut *entries.borrow_mut()))
@@ -9,8 +9,8 @@ fn pair() -> Mutex<NetState> {
     let state = Mutex::new(NetState::new());
     {
         let mut guard = NetStateGuard::new(state.lock().unwrap());
-        guard.sockets.insert(1, connected_socket(2));
-        guard.sockets.insert(2, connected_socket(1));
+        guard.netlink_sockets.insert(1, netlink_socket(libc::SOCK_RAW as u64));
+        guard.netlink_sockets.insert(2, netlink_socket(libc::SOCK_RAW as u64));
     }
     publications();
     state
@@ -22,11 +22,7 @@ fn mutation_and_generation_share_the_lock_even_on_an_error_return() {
     let before = state.lock().unwrap().socket_readiness_generation(1);
     let error = (|| {
         let mut guard = NetStateGuard::new(state.lock().unwrap());
-        let UnixSocketState::Connected(socket) = &mut guard.sockets.get_mut(&1).unwrap().state
-        else {
-            unreachable!()
-        };
-        socket.incoming_bytes = SOCKET_BUFFER_CAPACITY;
+        make_readable(&mut guard, 1);
         // A response that reads readiness inside the transaction must already
         // carry its new generation, before guard drop / broker publication.
         let generation = guard.socket_readiness_generation(1);
@@ -38,13 +34,12 @@ fn mutation_and_generation_share_the_lock_even_on_an_error_return() {
     let published = publications();
     assert_eq!(
         published.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-        vec![1, 2]
+        vec![1]
     );
     let mut guard = state
         .try_lock()
         .expect("publication must leave no state lock held");
     assert_eq!(guard.socket_readiness_generation(1), published[0].1);
-    assert_eq!(guard.socket_readiness_generation(2), published[1].1);
 }
 
 #[test]
@@ -52,22 +47,22 @@ fn no_op_and_duplicate_close_do_not_publish_but_final_close_does() {
     let state = pair();
     {
         let mut guard = NetStateGuard::new(state.lock().unwrap());
-        guard.sockets.get_mut(&1).unwrap().refs += 1;
+        guard.netlink_sockets.get_mut(&1).unwrap().refs += 1;
     }
     assert!(publications().is_empty());
     {
         let mut guard = NetStateGuard::new(state.lock().unwrap());
-        guard.sockets.get_mut(&1).unwrap().refs -= 1;
+        guard.netlink_sockets.get_mut(&1).unwrap().refs -= 1;
     }
     assert!(publications().is_empty());
     {
         let mut guard = NetStateGuard::new(state.lock().unwrap());
-        guard.sockets.remove(&1);
+        guard.netlink_sockets.remove(&1);
     }
     let published = publications();
     assert_eq!(
         published.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-        vec![1, 2]
+        vec![1]
     );
     let guard = state.lock().unwrap();
     assert!(!guard.readiness_observations.contains_key(&1));
@@ -83,11 +78,7 @@ fn a_concurrent_poll_cannot_observe_a_mutation_with_the_old_generation() {
     let writer_state = state.clone();
     let writer = thread::spawn(move || {
         let mut guard = NetStateGuard::new(writer_state.lock().unwrap());
-        let UnixSocketState::Connected(socket) = &mut guard.sockets.get_mut(&1).unwrap().state
-        else {
-            unreachable!()
-        };
-        socket.incoming_bytes = 1;
+        make_readable(&mut guard, 1);
         ready_tx.send(()).unwrap();
         finish_rx.recv().unwrap();
         drop(guard);
@@ -99,7 +90,7 @@ fn a_concurrent_poll_cannot_observe_a_mutation_with_the_old_generation() {
     let published = writer.join().unwrap();
     let mut guard = NetStateGuard::new(state.lock().unwrap());
     assert_ne!(
-        unix_socket_revents(&guard, 1, linux_abi::POLLIN as u32).unwrap(),
+        netlink_socket_revents(&guard, 1, linux_abi::POLLIN as u32).unwrap(),
         0
     );
     let generation = guard.socket_readiness_generation(1);
@@ -170,21 +161,18 @@ fn retiring_an_inet_socket_during_a_stack_advance_publishes_its_final_close() {
 }
 
 #[test]
-fn unix_and_inet_changes_in_one_transaction_publish_in_token_order() {
+fn netlink_and_inet_changes_in_one_transaction_publish_in_token_order() {
     let mut state = bench_state(2, 1);
     state.inet_sockets.get_mut(&1000).unwrap().received =
         Some(inet_datagram::ReceivedPacket::test_packet());
-    let UnixSocketState::Connected(socket) = &mut state.sockets.get_mut(&10).unwrap().state else {
-        unreachable!()
-    };
-    socket.incoming_bytes = SOCKET_BUFFER_CAPACITY;
+    make_readable(&mut state, 10);
     state.record_readiness_changes();
     let tokens: Vec<u64> = state.readiness_publications.iter().map(|p| p.0).collect();
-    assert_eq!(tokens, vec![10, 11, 1000]);
+    assert_eq!(tokens, vec![10, 1000]);
     assert!(state.readiness_publications.windows(2).all(|w| w[0].1 == w[1].1));
 }
 
-fn bench_state(inet: usize, unix_pairs: u64) -> NetState {
+fn bench_state(inet: usize, netlink_sockets: u64) -> NetState {
     let mut device = BrokerDevice::default();
     let config = SmolConfig::new(HardwareAddress::Ethernet(QEMU_USERNET_MAC));
     let mut iface = Interface::new(config, &mut device, SmolInstant::from_millis(0));
@@ -232,9 +220,8 @@ fn bench_state(inet: usize, unix_pairs: u64) -> NetState {
             },
         );
     }
-    for p in 0..unix_pairs {
-        state.sockets.insert(10 + 2 * p, connected_socket(11 + 2 * p));
-        state.sockets.insert(11 + 2 * p, connected_socket(10 + 2 * p));
+    for n in 0..netlink_sockets {
+        state.netlink_sockets.insert(10 + n, netlink_socket(libc::SOCK_RAW as u64));
     }
     state.inet = Some(stack);
     state.record_readiness_changes();
@@ -277,9 +264,9 @@ fn readiness_bench() {
             }),
         );
         time(
-            "unix-only request",
+            "netlink-only request",
             Box::new(|state| {
-                state.sockets.get_mut(&10).unwrap();
+                state.netlink_sockets.get_mut(&10).unwrap();
                 state.record_readiness_changes();
             }),
         );

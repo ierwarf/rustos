@@ -12,26 +12,6 @@
 
 
 
-#[cfg(rustos_scheduler_phase_profile)]
-use super::MAX_TASK;
-
-// Per-CPU diagnostic storage. The scheduler reads the first scan's reason
-// before a diagnostic rescan can overwrite it. Never used for dispatch.
-#[cfg(rustos_scheduler_phase_profile)]
-static YIELD_ADMISSION: [[core::sync::atomic::AtomicU8; MAX_TASK];
-    nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
-    [const { [const { core::sync::atomic::AtomicU8::new(0) }; MAX_TASK] };
-        nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
-
-#[cfg(rustos_scheduler_phase_profile)]
-fn record_yield_admission(cpu: usize, slot: usize, reason: u8) {
-    YIELD_ADMISSION[cpu][slot].store(reason, core::sync::atomic::Ordering::Relaxed);
-}
-
-#[cfg(rustos_scheduler_phase_profile)]
-pub(super) fn yield_admission_reason(cpu: usize, slot: usize) -> u8 {
-    YIELD_ADMISSION[cpu][slot].load(core::sync::atomic::Ordering::Relaxed)
-}
 /// Self-timed cost of the fair-class pick scan.
 ///
 /// The phase marks charge this to `SelectHandoff`, because both pick functions
@@ -112,30 +92,23 @@ pub(in crate::multitask) fn take_sync_handoff_hit_window() -> u64 {
 
 /// The pick hint's `None` outcomes, split by cause. Hits (above) plus these
 /// three are the whole attempt count.
-pub(in crate::multitask) const SYNC_HANDOFF_MISS_REASON_COUNT: usize = 4;
+pub(in crate::multitask) const SYNC_HANDOFF_MISS_REASON_COUNT: usize = 3;
 
 #[cfg(rustos_scheduler_phase_profile)]
 #[derive(Clone, Copy)]
 pub(in crate::multitask) enum SyncHandoffMissReason {
-    /// Nothing was armed for this CPU's queue (or it already drained) —
-    /// caught by the fast `pending()` check before any lock is taken.
-    QueueEmpty = 0,
     /// The queue may hold a ready record, but this CPU's consecutive-hit
     /// execution-chain budget reached `MAX_SYNC_HANDOFF_CHAIN_TICKS` while a
     /// fair competitor was ready.
-    ChainBudgetExhausted = 1,
+    ChainBudgetExhausted = 0,
     /// The consume loop held records and discarded every one of them as
-    /// stale. See `SyncHandoffStaleReason` for which check rejected each.
-    DrainedStale = 2,
+    /// stale.
+    DrainedStale = 1,
     /// The FIFO was already empty when the lock was taken, so nothing was
-    /// discarded and no `SyncHandoffStaleReason` applies: the lock-free
-    /// `pending()` flag said "may hold a record" and did not.
-    ///
-    /// This was folded into `DrainedStale` and measured at 98% of it — 8.2% of
-    /// every attempt — which made the stale sub-reasons look like they
-    /// accounted for a bucket they explained 2% of. Splitting it is what lets
-    /// a stale-hint claim and a stale-flag claim be told apart.
-    StartedEmpty = 3,
+    /// discarded: the lock-free `pending()` flag said "may hold a record" and
+    /// did not. Kept apart from `DrainedStale` (it was 98% of that bucket) so a
+    /// stale-hint claim and a stale-flag claim can be told apart.
+    StartedEmpty = 2,
 }
 
 static SYNC_HANDOFF_MISSES: [core::sync::atomic::AtomicU64; SYNC_HANDOFF_MISS_REASON_COUNT] =
@@ -153,40 +126,6 @@ pub(in crate::multitask) fn take_sync_handoff_miss_window() -> [u64; SYNC_HANDOF
 {
     core::array::from_fn(|reason| {
         SYNC_HANDOFF_MISSES[reason].swap(0, core::sync::atomic::Ordering::Relaxed)
-    })
-}
-
-/// Sub-reasons for `DrainedStale`: which check inside
-/// `synchronous_handoff_record_is_ready` discarded a queued record. One
-/// consume attempt can discard more than one record (dedup only prevents two
-/// records for the *same* task), so these are per-discard counts — a
-/// proportion within `DrainedStale`, not a per-dispatch partition of it.
-pub(in crate::multitask) const SYNC_HANDOFF_STALE_REASON_COUNT: usize = 3;
-
-#[cfg(rustos_scheduler_phase_profile)]
-#[derive(Clone, Copy)]
-pub(in crate::multitask) enum SyncHandoffStaleReason {
-    /// The slot's published start either disappeared or no longer names the
-    /// queued task id — the queued task retired or the slot was reused.
-    Identity = 0,
-    /// The record's dispatch custody no longer matches — a migration or a
-    /// generation change since the record was enqueued.
-    Custody = 1,
-    /// The slot no longer passes `pick_hint_candidate_slot` — armed, but not
-    /// presently schedulable (e.g. already dispatched through another entry
-    /// point).
-    NotCandidate = 2,
-}
-
-static SYNC_HANDOFF_STALE: [core::sync::atomic::AtomicU64; SYNC_HANDOFF_STALE_REASON_COUNT] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; SYNC_HANDOFF_STALE_REASON_COUNT];
-
-/// Takes the window's stale-discard breakdown, clearing it for the next
-/// window. Indexed by `SyncHandoffStaleReason`.
-pub(in crate::multitask) fn take_sync_handoff_stale_window()
--> [u64; SYNC_HANDOFF_STALE_REASON_COUNT] {
-    core::array::from_fn(|reason| {
-        SYNC_HANDOFF_STALE[reason].swap(0, core::sync::atomic::Ordering::Relaxed)
     })
 }
 
@@ -234,8 +173,7 @@ pub(in crate::multitask) fn take_sync_handoff_arm_window()
 
 /// Which condition inside `ReplyWake` custody's ordered check first failed.
 /// `SyncHandoffCustody::Generic` never reaches this — only reply-derived
-/// records carry a real custody check, which `SyncHandoffStaleReason::Custody`
-/// is therefore entirely attributable to.
+/// records carry a real custody check.
 ///
 /// `matches_dispatch_owner` is called from more than the consume path (also
 /// from the arm-time token self-check and the post-enqueue recheck in

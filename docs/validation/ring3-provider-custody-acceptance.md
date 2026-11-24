@@ -49,9 +49,8 @@ named witness is not verified.
 
 - AF_INET socket creation charges once before broker publication and sends
   only one public token after successful funding.
-- AF_UNIX single socket and socketpair use one charge per open description.
-  A failure funding the second side must refund the first and never publish
-  one half of an allegedly successful pair.
+- AF_UNIX sockets are handled kernel-locally in Ring0 (`UnixSocketHandle`) and
+  no longer route through `netd` or rootd session billing.
 - Netd duplicates a socket: only ref count increases; Job session does not.
 - Netd closes one of multiple references: no refund until final close.
 - Listen has queued accepted socket candidates: those remain internal and
@@ -142,7 +141,7 @@ finish closing without wedging.
 | Batched ACK: exact shape, per-frame refusal, foreign frame fails closed, replay idempotent | `provider_control::tests::ack_batch_*` (3) |
 | Deferred ACK batches: calls per open/close, lost batch reply, partial mask | `provider_client::tests::ack_batches_are_deferred_*`, `lost_ack_batch_reply_*`, `ack_batch_done_ignores_*`; `vfsd::open_billing::tests` (5, incl. 66 vs 96 rootd calls per 32 open/close) |
 | Client and provider ledgers: replay, cancel, nonce mismatch | `provider_client::tests` (remaining) |
-| netd UNIX lifecycle matrix (dup, close, accept requeue) | `netd` `unix_socket_lifecycle_tests` |
+| netd socket lifecycle (publication discard, delayed charge, table ceilings) | `netd` `provider_accounting::tests`, `packet_provider_state_tests`, `hardening_tests` |
 | Source ordering of charge/checkpoint/refund call sites | `tools/ring3_provider_source_audit.py` (string-order aid only) |
 | Kernel charge commits then copyout faults | kernel `job_ops` source witnesses; no native copyout fault test |
 

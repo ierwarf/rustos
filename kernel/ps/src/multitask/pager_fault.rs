@@ -295,6 +295,7 @@ impl PagerFaultTable {
         }
     }
 
+    #[cfg(test)]
     fn reserve(
         &self,
         request: PagerFaultRequestWire,
@@ -771,14 +772,6 @@ impl PagerFaultWaiterTable {
 
 static PAGER_FAULTS: PagerFaultTable = PagerFaultTable::new();
 static PAGER_FAULT_WAITERS: PagerFaultWaiterTable = PagerFaultWaiterTable::new();
-
-/// Reserve one fixed, generation-bound pager-fault slot without allocating.
-pub fn reserve_pager_fault(
-    request: PagerFaultRequestWire,
-    endpoint: PagerEndpointCapabilityWire,
-) -> Result<PagerFaultReservation, PagerFaultSlotError> {
-    PAGER_FAULTS.reserve(request, endpoint)
-}
 
 /// Reserve one fault together with the exact pre-zeroed frame grant that its
 /// eventual pager dispatch may return. The grant callback executes before the

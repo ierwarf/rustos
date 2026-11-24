@@ -156,11 +156,7 @@ pub(super) fn dispatch_admitted_request(
             Err(errno) => errno,
         }
     } else {
-        let status = dispatch_request(request, response, reply_cap);
-        if local_socket_reply_requests_latency_handoff(request, response, status) {
-            response.reserved1 |= NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;
-        }
-        status
+        dispatch_request(request, response, reply_cap)
     };
     Some(status)
 }

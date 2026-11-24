@@ -507,24 +507,6 @@ pub fn try_parse_lock_telemetry_toml(source: &str) -> Result<LockTelemetryConfig
     Ok(config)
 }
 
-// GENERATED: Retained for generated-source conformance tests.
-#[allow(dead_code)]
-pub fn parse_bool(source: &str, name: &str) -> bool {
-    let prefix = format!("pub const {name}: bool =");
-    for line in source.lines() {
-        let line = line.trim();
-        if let Some(value) = line.strip_prefix(&prefix) {
-            return match value.trim().trim_end_matches(';') {
-                "true" => true,
-                "false" => false,
-                other => panic!("invalid bool for {name}: {other}"),
-            };
-        }
-    }
-
-    panic!("missing bool constant: {name}");
-}
-
 fn strip_comment(line: &str) -> &str {
     let mut in_string = false;
     for (index, ch) in line.char_indices() {

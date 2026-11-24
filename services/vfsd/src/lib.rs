@@ -532,26 +532,6 @@ pub fn checked_seek_position(
     Ok(next as u64)
 }
 
-/// Validate the original request and returned byte range on a read replay.
-pub fn read_replay_is_valid(
-    version: u16,
-    requested: usize,
-    recorded_requested: usize,
-    replay_len: usize,
-    dest_len: usize,
-    start: u64,
-    file_len: u64,
-) -> bool {
-    matches!(version, VFSD_OPEN_CHECKPOINT_LEGACY_VERSION | VFSD_OPEN_CHECKPOINT_READ_SIZE_VERSION | VFSD_OPEN_CHECKPOINT_VERSION)
-        && requested == recorded_requested
-        && (version != VFSD_OPEN_CHECKPOINT_LEGACY_VERSION || start <= file_len)
-        && replay_len <= requested
-        && replay_len <= dest_len
-        && (replay_len == 0 || u64::try_from(replay_len).ok().is_some_and(|len| {
-            start.checked_add(len).is_some_and(|end| end <= file_len)
-        }))
-}
-
 /// Service-private durable state for one ordinary VFS open description. The
 /// wire is exactly one rootd checkpoint value; path bytes are child records.
 #[repr(C)]
@@ -1515,25 +1495,6 @@ mod tests {
         }
         .valid(256));
         assert_ne!(checkpoint_path_key(7, 0), checkpoint_path_key(7, 1));
-    }
-
-    #[test]
-    fn read_replay_preserves_requested_length_and_allows_eof() {
-        let v2 = VFSD_OPEN_CHECKPOINT_READ_SIZE_VERSION;
-        let v1 = VFSD_OPEN_CHECKPOINT_LEGACY_VERSION;
-        assert!(read_replay_is_valid(VFSD_OPEN_CHECKPOINT_VERSION, 100, 100, 3, 100, 7, 10));
-        assert!(read_replay_is_valid(v2, 100, 100, 3, 100, 7, 10));
-        assert!(read_replay_is_valid(v2, 100, 100, 0, 100, 20, 10));
-        assert!(!read_replay_is_valid(v2, 99, 100, 3, 100, 7, 10));
-        assert!(!read_replay_is_valid(v2, 100, 100, 4, 100, 7, 10));
-        assert!(!read_replay_is_valid(v2, 100, 100, 3, 2, 7, 10));
-        assert!(!read_replay_is_valid(v2, 100, 100, 2, 100, u64::MAX, u64::MAX));
-        // Legacy records stored the clamped count; never reinterpret it as
-        // the original request length or accept a previously refused replay.
-        assert!(read_replay_is_valid(v1, 3, 3, 3, 100, 7, 10));
-        assert!(!read_replay_is_valid(v1, 100, 3, 3, 100, 7, 10));
-        assert!(!read_replay_is_valid(v1, 0, 0, 0, 100, 20, 10));
-        assert!(!read_replay_is_valid(4, 3, 3, 3, 100, 7, 10));
     }
 
     #[test]

@@ -60,7 +60,6 @@ struct Held {
 pub struct Custody {
     held: [Option<Held>; LIBRARY_OBJECT_MAX_OBJECTS],
     count: usize,
-    total_pages: u64,
 }
 
 impl Default for Custody {
@@ -74,7 +73,6 @@ impl Custody {
         Self {
             held: [None; LIBRARY_OBJECT_MAX_OBJECTS],
             count: 0,
-            total_pages: 0,
         }
     }
 
@@ -89,7 +87,6 @@ impl Custody {
             Some(slot) => {
                 *slot = Some(Held { object, pages, rank });
                 self.count += 1;
-                self.total_pages += u64::from(pages);
                 true
             }
             None => false,
@@ -102,7 +99,6 @@ impl Custody {
                 if held.object == object {
                     *slot = None;
                     self.count -= 1;
-                    self.total_pages -= u64::from(held.pages);
                     break;
                 }
             }
@@ -119,10 +115,6 @@ impl Custody {
 
     pub const fn objects(&self) -> usize {
         self.count
-    }
-
-    pub const fn pages(&self) -> u64 {
-        self.total_pages
     }
 
     /// Picks objects to retire for `shortfall` pages, coldest first (largest
@@ -179,18 +171,9 @@ pub struct Reclaimed {
     pub free_pages: u64,
 }
 
-/// One retention pass: sample pressure and, if the cache should shrink, retire
-/// the coldest objects covering the shortfall. `None` when nothing was retired
-/// (no pressure, empty custody, or an unreadable sample).
-pub fn reclaim_step<H: ReclaimHost>(custody: &mut Custody, host: &mut H) -> Option<Reclaimed> {
-    if custody.objects() == 0 {
-        return None;
-    }
-    let pressure = host.pressure().ok()?;
-    reclaim_with_pressure(custody, host, pressure)
-}
-
-/// Same retention pass using an already-sampled pressure reading.
+/// One retention pass: if `pressure` says the cache should shrink, retire the
+/// coldest objects covering the shortfall. `None` when nothing was retired
+/// (no pressure or empty custody).
 pub fn reclaim_with_pressure<H: ReclaimHost>(
     custody: &mut Custody,
     host: &mut H,
@@ -279,7 +262,7 @@ mod tests {
         held.forget(2);
         assert_eq!(plan(&held, 100), (std::vec![1], 8));
         assert!(held.record(3, 4, 2));
-        assert_eq!((held.objects(), held.pages()), (2, 12));
+        assert_eq!(held.objects(), 2);
     }
 
     #[test]
@@ -323,6 +306,12 @@ mod tests {
     }
     fn fake(free: u64, min: u64) -> Fake {
         Fake { pressure: Ok(pressure(free, min)), retired: Vec::new(), refuse: Vec::new() }
+    }
+
+    /// Samples the host once, as the service loop does, then runs one pass.
+    fn reclaim_step<H: ReclaimHost>(custody: &mut Custody, host: &mut H) -> Option<Reclaimed> {
+        let pressure = host.pressure().ok()?;
+        reclaim_with_pressure(custody, host, pressure)
     }
 
     #[test]

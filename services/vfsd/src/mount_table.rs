@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 use storage_core::file_io::{FileReadMap, RangeError, ReadAt};
-use storage_core::fs::{CasePolicy, FsCreateAttrs, FsError, FsNodeKind, FsTimestamp, FsVolume};
+use storage_core::fs::{CasePolicy, FsCreateAttrs, FsError, FsTimestamp, FsVolume};
 use storage_core::{detect_partitions, BlockDevice, BlockSlice, IoResult};
 use storage_fat::{FatError, FatVolume};
 
@@ -259,59 +259,6 @@ impl MountTable {
         infos
     }
 
-    /// Walk components in order, expanding each symlink before interpreting
-    /// subsequent `..` components. Missing final names are left for create.
-    pub fn follow_symlinks(&self, abs_path: &str, follow_last: bool) -> Result<String, i32> {
-        use alloc::collections::VecDeque;
-        use crate::path::check_path_capacity;
-        check_path_capacity(abs_path.len())?;
-        if !abs_path.starts_with('/') || abs_path.bytes().any(|b| b == 0 || b == b'\\')
-        {
-            return Err(crate::EINVAL);
-        }
-        let mut pending: VecDeque<String> = abs_path.split('/').filter(|c| !c.is_empty())
-            .map(String::from).collect();
-        let mut path = String::from("/");
-        let mut expansions = 0;
-        while let Some(component) = pending.pop_front() {
-            if component == "." { continue; }
-            if component == ".." {
-                let end = path.rfind('/').unwrap_or(0);
-                path.truncate(end.max(1));
-                continue;
-            }
-            if path.len() > 1 { path.push('/'); }
-            path.push_str(&component);
-            check_path_capacity(path.len())?;
-            let Some((entry, rel)) = self.resolve(&path) else { continue; };
-            if !entry.volume.capabilities().supports_symlinks { continue; }
-            match entry.volume.metadata(rel) {
-                Ok(meta) if meta.kind == FsNodeKind::Symlink && (follow_last || !pending.is_empty()) => {
-                    expansions += 1;
-                    if expansions > crate::SYMLINK_FOLLOW_MAX { return Err(crate::ELOOP); }
-                    let target = entry.volume.readlink(rel).map_err(crate::map_fs_error)?;
-                    if target.is_empty() || target.bytes().any(|b| b == 0 || b == b'\\') {
-                        return Err(crate::EINVAL);
-                    }
-                    let end = path.rfind('/').unwrap_or(0);
-                    path.truncate(end.max(1));
-                    if target.starts_with('/') { path.truncate(1); }
-                    for part in target.split('/').filter(|c| !c.is_empty()).rev() {
-                        pending.push_front(String::from(part));
-                    }
-                }
-                Ok(meta) if !pending.is_empty() && meta.kind != FsNodeKind::Directory => {
-                    return Err(crate::ENOTDIR);
-                }
-                Ok(_) => {}
-                Err(FsError::NotFound) if pending.is_empty() => {}
-                Err(FsError::NotFound) => return Err(crate::ENOENT),
-                Err(err) => return Err(crate::map_fs_error(err)),
-            }
-        }
-        Ok(path)
-    }
-
     /// Mounts the boot-time memory filesystems and creates their fixed
     /// directories. Idempotent: an already mounted point is left untouched.
     pub fn mount_tmpfs_defaults(
@@ -428,17 +375,6 @@ impl MountTable {
     #[cfg(test)]
     fn submount_names_at(&self, abs_dir: &str) -> Vec<&str> {
         self.submounts_at(abs_dir).into_iter().map(|(_, name)| name).collect()
-    }
-
-    pub fn mount_fat_disk<D: BlockDevice + Send + 'static>(
-        shared_dev: SharedBlockDevice<D>,
-        device_read_only: bool,
-        storage_epoch: u64,
-        wait: fn(),
-    ) -> Result<Self, i32> {
-        let mut table = Self::new();
-        table.mount_fat_disk_into(shared_dev, device_read_only, storage_epoch, wait)?;
-        Ok(table)
     }
 
     /// Mounts the FAT boot disk into this table, keeping every mount already
@@ -723,7 +659,8 @@ mod tests {
     fn multi_partition_disk_mounts_root_ro_and_data_rw() {
         let disk = build_mbr_two_partition_disk(4096, 4096);
         let shared = SharedBlockDevice::new(disk);
-        let table = MountTable::mount_fat_disk(shared, false, 9, || {}).unwrap();
+        let mut table = MountTable::new();
+        table.mount_fat_disk_into(shared, false, 9, || {}).unwrap();
 
         let (root_m, _) = table.resolve("/").unwrap();
         assert!(root_m.volume.is_immutable());
@@ -940,48 +877,6 @@ mod tests {
         for path in ["/", "/tmpfile", "/runtime", "/dev/shmem"] {
             assert!(!is_volatile_mount_path(path));
         }
-    }
-
-    #[test]
-    fn follow_symlinks_resolves_components_and_bounds_loops() {
-        let table = tmpfs_table();
-        let (entry, _) = table.resolve("/tmp/x").unwrap();
-        let v = &entry.volume;
-        v.mkdir("real").unwrap();
-        v.open_prepare("real/file", FsOpenOptions { create: true, write: true, ..FsOpenOptions::default() }).unwrap();
-        v.symlink("real", "dirlink").unwrap();
-        v.symlink("file", "real/rel").unwrap();
-        v.symlink("/tmp/real/file", "abs").unwrap();
-        v.symlink("/dev/shm/there", "cross").unwrap();
-        v.symlink("../real", "real/up").unwrap();
-        v.symlink("loop2", "loop1").unwrap();
-        v.symlink("loop1", "loop2").unwrap();
-        v.symlink("nowhere", "dangling").unwrap();
-        let (shm, _) = table.resolve("/dev/shm").unwrap();
-        shm.volume.mkdir("nested").unwrap();
-        v.symlink("/dev/shm/nested", "crossdir").unwrap();
-        let follow = |p: &str, last| table.follow_symlinks(p, last);
-        assert_eq!(follow("/tmp/dirlink/file", true).unwrap(), "/tmp/real/file");
-        assert_eq!(follow("/tmp/dirlink", true).unwrap(), "/tmp/real");
-        // The last component stays a link when asked not to follow it.
-        assert_eq!(follow("/tmp/dirlink", false).unwrap(), "/tmp/dirlink");
-        assert_eq!(follow("/tmp/dirlink/file", false).unwrap(), "/tmp/real/file");
-        assert_eq!(follow("/tmp/real/rel", true).unwrap(), "/tmp/real/file");
-        assert_eq!(follow("/tmp/abs", true).unwrap(), "/tmp/real/file");
-        assert_eq!(follow("/tmp/real/up/file", true).unwrap(), "/tmp/real/file");
-        // Absolute targets may leave the mount; the new mount decides further.
-        assert_eq!(follow("/tmp/cross", true).unwrap(), "/dev/shm/there");
-        assert_eq!(follow("/tmp/loop1", true), Err(crate::ELOOP));
-        assert_eq!(follow("/tmp/loop1/x", false), Err(crate::ELOOP));
-        // A dangling link and a missing path are left for the operation.
-        assert_eq!(follow("/tmp/dangling", true).unwrap(), "/tmp/nowhere");
-        assert_eq!(follow("/tmp/missing/x", true), Err(crate::ENOENT));
-        assert_eq!(follow("/tmp/dirlink/../abs", true).unwrap(), "/tmp/real/file");
-        assert_eq!(follow("/tmp/dangling/../abs", true), Err(crate::ENOENT));
-        assert_eq!(follow("/tmp/crossdir/../file", true).unwrap(), "/dev/shm/file");
-        assert_eq!(follow("/tmp/real/file/../abs", true), Err(crate::ENOTDIR));
-        // A volume without symlink support is never walked.
-        assert_eq!(follow("/boot/anything", true).unwrap(), "/boot/anything");
     }
 
     #[test]

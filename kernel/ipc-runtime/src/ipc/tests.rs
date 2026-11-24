@@ -8,13 +8,9 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use super::{
-    ConsoleStreamKind, IpcError, IpcHeader, KernelHandle, accept_channel,
-    acquire_shared_region_mapping, connect_named_port, connect_port, create_channel_pair,
-    create_event, create_named_port, create_shared_region, dequeue_message,
-    dequeue_message_with_limits, enqueue_message, event_signal_count, lookup_named_port,
-    map_shared_region, port_name, queue_channel_for_accept, recv_endpoint,
-    recv_endpoint_with_limits, recv_endpoint_with_limits_and_handles, release_shared_region,
-    service_deferred_shared_region_reclaims, shared_region_len, signal_event,
+    IpcError, acquire_shared_region_mapping, create_shared_region, map_shared_region,
+    recv_endpoint, recv_endpoint_with_limits, recv_endpoint_with_limits_and_handles,
+    release_shared_region, service_deferred_shared_region_reclaims, shared_region_len,
 };
 use kernel_object::api::handle::{FileHandleRights, HandleOwner, HandleRights, HandleToken};
 use kernel_object::api::identity::{ObjectKind, ObjectOwner};
@@ -24,7 +20,6 @@ static IPC_TEST_GUARD: Mutex<()> = Mutex::new(());
 
 fn with_isolated_ipc_test(f: impl FnOnce()) {
     let _guard = IPC_TEST_GUARD.lock();
-    super::with_ipc_objects(|objects| *objects = super::IpcObjectTable::new());
     super::ENDPOINTS.clear();
     super::ENDPOINT_QUOTAS.lock().clear();
     super::ENDPOINT_MESSAGES.clear();
@@ -38,7 +33,6 @@ fn with_isolated_ipc_test(f: impl FnOnce()) {
     super::set_endpoint_cancel_reply_binding_fault(false);
     super::set_endpoint_recv_stale_head_fault(false);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    super::with_ipc_objects(|objects| *objects = super::IpcObjectTable::new());
     super::ENDPOINTS.clear();
     super::ENDPOINT_QUOTAS.lock().clear();
     super::ENDPOINT_MESSAGES.clear();
@@ -164,77 +158,8 @@ fn transferred_handle_derivation_only_attenuates_typed_rights() {
 }
 
 #[test]
-fn channel_messages_arrive_in_peer_queue_order() {
+fn shared_regions_track_basic_state() {
     with_isolated_ipc_test(|| {
-        let (left, right) = create_channel_pair().expect("create channel pair");
-        enqueue_message(
-            left,
-            IpcHeader {
-                opcode: 1,
-                ..IpcHeader::default()
-            },
-            b"hello",
-            &[
-                KernelHandle::Console(ConsoleStreamKind::Input),
-                KernelHandle::Console(ConsoleStreamKind::Output),
-            ],
-        )
-        .expect("enqueue first");
-        enqueue_message(
-            left,
-            IpcHeader {
-                opcode: 2,
-                ..IpcHeader::default()
-            },
-            b"world",
-            &[],
-        )
-        .expect("enqueue second");
-
-        let first = dequeue_message(right)
-            .expect("dequeue first")
-            .expect("message present");
-        let second = dequeue_message(right)
-            .expect("dequeue second")
-            .expect("message present");
-
-        assert_eq!(first.header.opcode, 1);
-        assert_eq!(first.payload, b"hello");
-        assert_eq!(first.attached_handles.len(), 2);
-        assert!(matches!(
-            &first.attached_handles[0],
-            KernelHandle::Console(ConsoleStreamKind::Input)
-        ));
-        assert!(matches!(
-            &first.attached_handles[1],
-            KernelHandle::Console(ConsoleStreamKind::Output)
-        ));
-        assert_eq!(second.header.opcode, 2);
-        assert_eq!(second.payload, b"world");
-    });
-}
-
-#[test]
-fn ports_accept_queued_server_channels() {
-    with_isolated_ipc_test(|| {
-        let port = create_named_port(None).expect("create port");
-        let (_client, server) = create_channel_pair().expect("create channel pair");
-        queue_channel_for_accept(port, server).expect("queue server channel");
-        let accepted = accept_channel(port)
-            .expect("accept")
-            .expect("accepted channel");
-        assert_eq!(accepted, server);
-    });
-}
-
-#[test]
-fn events_and_shared_regions_track_basic_state() {
-    with_isolated_ipc_test(|| {
-        let event = create_event().expect("create event");
-        assert_eq!(event_signal_count(event), Some(0));
-        assert_eq!(signal_event(event), Ok(1));
-        assert_eq!(event_signal_count(event), Some(1));
-
         let region = create_shared_region(8192).expect("create region");
         assert_eq!(shared_region_len(region), Some(8192));
         let (ptr, len) = map_shared_region(region).expect("map region");
@@ -309,180 +234,6 @@ fn reclaim_queue_is_fifo_across_head_wraparound() {
         assert_eq!(reclaimed, 2);
         assert_eq!(super::SHARED_REGION_ADMITTED.load(Ordering::Acquire), 0);
         assert_eq!(super::SHARED_REGION_BYTES_ADMITTED.load(Ordering::Acquire), 0);
-    });
-}
-
-#[test]
-fn named_ports_retain_port_name() {
-    with_isolated_ipc_test(|| {
-        let mut name = crate::ipc_core::PortName::empty();
-        name.bytes[..4].copy_from_slice(b"test");
-        name.len = 4;
-        let port = create_named_port(Some(name)).expect("create named port");
-        assert_eq!(port_name(port), Some(name));
-        assert_eq!(lookup_named_port(name), Some(port));
-    });
-}
-
-#[test]
-fn connect_port_queues_server_channel_for_accept() {
-    with_isolated_ipc_test(|| {
-        let port = create_named_port(None).expect("create port");
-        let client = connect_port(port).expect("connect port");
-        let server = accept_channel(port)
-            .expect("accept")
-            .expect("server channel");
-        enqueue_message(
-            client,
-            IpcHeader {
-                opcode: 99,
-                ..IpcHeader::default()
-            },
-            b"ping",
-            &[],
-        )
-        .expect("enqueue");
-        let received = dequeue_message(server).expect("dequeue").expect("message");
-        assert_eq!(received.header.opcode, 99);
-        assert_eq!(received.payload, b"ping");
-    });
-}
-
-#[test]
-fn connect_named_port_finds_registered_port() {
-    with_isolated_ipc_test(|| {
-        let name = crate::ipc_core::PortName::try_from_str("display-host").expect("port name");
-        let port = create_named_port(Some(name)).expect("create named port");
-        let client = connect_named_port(name).expect("connect named port");
-        let server = accept_channel(port)
-            .expect("accept")
-            .expect("server channel");
-        enqueue_message(
-            client,
-            IpcHeader {
-                opcode: 7,
-                ..IpcHeader::default()
-            },
-            b"surface",
-            &[
-                KernelHandle::Console(ConsoleStreamKind::Input),
-                KernelHandle::Console(ConsoleStreamKind::Output),
-                KernelHandle::Console(ConsoleStreamKind::Error),
-            ],
-        )
-        .expect("enqueue");
-        let received = dequeue_message(server).expect("dequeue").expect("message");
-        assert_eq!(received.header.opcode, 7);
-        assert_eq!(received.payload, b"surface");
-        assert_eq!(received.attached_handles.len(), 3);
-    });
-}
-
-#[test]
-fn attached_handles_are_cloned_into_messages() {
-    with_isolated_ipc_test(|| {
-        let (left, right) = create_channel_pair().expect("create channel pair");
-        enqueue_message(
-            left,
-            IpcHeader {
-                opcode: 55,
-                ..IpcHeader::default()
-            },
-            b"",
-            &[
-                KernelHandle::Console(ConsoleStreamKind::Input),
-                KernelHandle::Console(ConsoleStreamKind::Output),
-            ],
-        )
-        .expect("enqueue");
-        let received = dequeue_message(right).expect("dequeue").expect("message");
-        assert_eq!(received.attached_handles.len(), 2);
-        assert!(matches!(
-            &received.attached_handles[0],
-            KernelHandle::Console(ConsoleStreamKind::Input)
-        ));
-        assert!(matches!(
-            &received.attached_handles[1],
-            KernelHandle::Console(ConsoleStreamKind::Output)
-        ));
-    });
-}
-
-#[test]
-fn enqueue_message_normalizes_header_lengths() {
-    with_isolated_ipc_test(|| {
-        let (left, right) = create_channel_pair().expect("create channel pair");
-        enqueue_message(
-            left,
-            IpcHeader {
-                opcode: 9,
-                reserved: u16::MAX,
-                ..IpcHeader::default()
-            },
-            b"hello",
-            &[KernelHandle::Console(ConsoleStreamKind::Input)],
-        )
-        .expect("enqueue");
-
-        let received = dequeue_message(right)
-            .expect("dequeue")
-            .expect("message present");
-        assert_eq!(received.header.payload_len, 5);
-        assert_eq!(received.header.handle_count, 1);
-        assert_eq!(received.header.reserved, 0);
-    });
-}
-
-#[test]
-fn duplicate_named_ports_are_rejected() {
-    with_isolated_ipc_test(|| {
-        let name = crate::ipc_core::PortName::try_from_str("display-host").expect("port name");
-        create_named_port(Some(name)).expect("first named port");
-        assert_eq!(
-            create_named_port(Some(name)),
-            Err(IpcError::InvalidArgument)
-        );
-    });
-}
-
-#[test]
-fn duplicate_pending_channel_is_rejected() {
-    with_isolated_ipc_test(|| {
-        let port = create_named_port(None).expect("create port");
-        let (_client, server) = create_channel_pair().expect("create channel pair");
-        queue_channel_for_accept(port, server).expect("queue once");
-        assert_eq!(
-            queue_channel_for_accept(port, server),
-            Err(IpcError::InvalidArgument)
-        );
-    });
-}
-
-#[test]
-fn buffer_too_small_preserves_front_message() {
-    with_isolated_ipc_test(|| {
-        let (left, right) = create_channel_pair().expect("create channel pair");
-        enqueue_message(
-            left,
-            IpcHeader {
-                opcode: 77,
-                ..IpcHeader::default()
-            },
-            b"hello",
-            &[KernelHandle::Console(ConsoleStreamKind::Input)],
-        )
-        .expect("enqueue");
-
-        assert!(matches!(
-            dequeue_message_with_limits(right, 4, 1),
-            Err(IpcError::BufferTooSmall)
-        ));
-
-        let message = dequeue_message(right)
-            .expect("dequeue")
-            .expect("message present");
-        assert_eq!(message.payload, b"hello");
-        assert_eq!(message.attached_handles.len(), 1);
     });
 }
 

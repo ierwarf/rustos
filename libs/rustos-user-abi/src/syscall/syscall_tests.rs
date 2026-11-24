@@ -589,9 +589,8 @@ fn netd_v9_deadline_wire_keeps_the_fixed_header_layout() {
     assert_eq!(NETD_IPC_ABI_VERSION, 9);
     assert_eq!(NETD_IPC_REQUEST_HEADER_SIZE, 136);
     assert_eq!(NETD_IPC_RESPONSE_HEADER_SIZE, 32);
-    assert_eq!(core::mem::offset_of!(NetdIpcResponse, discarded_tail), 12);
-    assert_eq!(NetdIpcResponse::default().discarded_tail, 0);
-    assert_eq!(super::NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF & super::NETD_IPC_RESPONSE_FLAG_RECORD_PRESENT, 0);
+    assert_eq!(core::mem::offset_of!(NetdIpcResponse, reserved2), 12);
+    assert_eq!(NetdIpcResponse::default().reserved2, 0);
     assert_eq!(core::mem::offset_of!(NetdIpcRequest, deadline_ns), 112);
     assert_eq!(NetdIpcRequest::default().deadline_ns, 0);
     assert_eq!(
@@ -685,88 +684,6 @@ fn prepared_socket_publication_shape_allows_only_nonraw_inet_open_flags() {
 }
 
 #[test]
-fn prepared_unix_publication_requires_exact_operation_tokens_and_channel() {
-    use super::{SYSCALL_OFFLOAD_OP_LINUX_SOCKET,SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,SYSCALL_OFFLOAD_OP_LINUX_ACCEPT};
-    let socket=NetBrokerPrepareSocketPublication {
-        version:NET_BROKER_SOCKET_PUBLICATION_VERSION,operation:SYSCALL_OFFLOAD_OP_LINUX_SOCKET as u64,
-        reply_cap:11,caller_pid:12,socket_token:13,domain:1,socket_type:1,
-        ..NetBrokerPrepareSocketPublication::default()
-    };
-    assert!(net_broker_socket_publication_shape_valid(&socket));
-    let mut pair=NetBrokerPrepareSocketPublication{operation:SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR as u64,
-        second_socket_token:14,..socket};
-    assert!(net_broker_socket_publication_shape_valid(&pair));
-    pair.second_socket_token=13;
-    assert!(!net_broker_socket_publication_shape_valid(&pair));
-    pair.second_socket_token=0;
-    assert!(!net_broker_socket_publication_shape_valid(&pair));
-    let mut accept=NetBrokerPrepareSocketPublication{operation:SYSCALL_OFFLOAD_OP_LINUX_ACCEPT as u64,
-        channel_id:15,..socket};
-    assert!(net_broker_socket_publication_shape_valid(&accept));
-    accept.channel_id=0;
-    assert!(!net_broker_socket_publication_shape_valid(&accept));
-    for malformed in [NetBrokerPrepareSocketPublication{operation:0,..socket},
-        NetBrokerPrepareSocketPublication{channel_id:15,..socket},
-        NetBrokerPrepareSocketPublication{second_socket_token:14,..socket},
-        NetBrokerPrepareSocketPublication{protocol:6,..socket},
-        NetBrokerPrepareSocketPublication{version:1,..socket}] {
-        assert!(!net_broker_socket_publication_shape_valid(&malformed));
-    }
-}
-
-#[test]
-fn unix_socket_shape_admits_only_stream_dgram_and_seqpacket() {
-    use super::{
-        NET_BROKER_PUBLICATION_SOCK_SEQPACKET, SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
-        SYSCALL_OFFLOAD_OP_LINUX_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
-        net_broker_unix_socket_shape_valid as unix,
-    };
-    let flags = NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS;
-    assert!(unix(1, NET_BROKER_PUBLICATION_SOCK_STREAM, 0));
-    assert!(unix(1, 2 | flags, 0));
-    assert!(unix(1, NET_BROKER_PUBLICATION_SOCK_SEQPACKET | flags, 0));
-    // RAW (3), RDM (4), DCCP (6), PACKET (10) are not published.
-    for ty in [0, 3, 4, 6, 10, 15] {
-        assert!(!unix(1, ty, 0), "type {ty}");
-    }
-    assert!(!unix(1, NET_BROKER_PUBLICATION_SOCK_SEQPACKET, 1), "protocol must be 0");
-    assert!(!unix(1, NET_BROKER_PUBLICATION_SOCK_SEQPACKET | 1 << 30, 0), "unknown flag");
-    assert!(!unix(2, NET_BROKER_PUBLICATION_SOCK_SEQPACKET, 0), "wrong domain");
-    // A seqpacket socket, dgram socket, socketpair and accept all publish; the kernel reads
-    // the type from the publication, so it must survive every operation.
-    let base = NetBrokerPrepareSocketPublication {
-        version: NET_BROKER_SOCKET_PUBLICATION_VERSION,
-        reply_cap: 11,
-        caller_pid: 12,
-        socket_token: 13,
-        domain: 1,
-        socket_type: NET_BROKER_PUBLICATION_SOCK_SEQPACKET,
-        ..NetBrokerPrepareSocketPublication::default()
-    };
-    for publication in [
-        NetBrokerPrepareSocketPublication {
-            operation: SYSCALL_OFFLOAD_OP_LINUX_SOCKET as u64,
-            ..base
-        },
-        NetBrokerPrepareSocketPublication {
-            operation: SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR as u64,
-            second_socket_token: 14,
-            ..base
-        },
-        NetBrokerPrepareSocketPublication {
-            operation: SYSCALL_OFFLOAD_OP_LINUX_ACCEPT as u64,
-            channel_id: 15,
-            ..base
-        },
-    ] {
-        assert!(net_broker_socket_publication_shape_valid(&publication));
-        let mut raw = publication;
-        raw.socket_type = 3;
-        assert!(!net_broker_socket_publication_shape_valid(&raw));
-    }
-}
-
-#[test]
 fn netlink_socket_shape_is_route_raw_or_dgram_and_socket_only() {
     use super::{
         NET_BROKER_PUBLICATION_AF_NETLINK, NET_BROKER_PUBLICATION_SOCK_RAW,
@@ -802,12 +719,12 @@ fn netlink_socket_shape_is_route_raw_or_dgram_and_socket_only() {
     // A netlink socket cannot be paired or accepted.
     let pair = NetBrokerPrepareSocketPublication {
         operation: SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR as u64,
-        second_socket_token: 14,
+        reserved4: 14,
         ..socket
     };
     let accept = NetBrokerPrepareSocketPublication {
         operation: SYSCALL_OFFLOAD_OP_LINUX_ACCEPT as u64,
-        channel_id: 15,
+        reserved5: 15,
         ..socket
     };
     assert!(!net_broker_socket_publication_shape_valid(&pair));

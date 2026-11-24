@@ -63,9 +63,7 @@ pub(super) use subject::{
 };
 
 use kernel_ipc_runtime::api::{
-    ChannelIdentity, EndpointCallPriority, KernelEndpointHandle, KernelReplyHandle,
-    KernelTransferTicket, KernelTransferredHandle, ProcessIdentity, ServiceIdentity,
-    TransferContext,
+    EndpointCallPriority, KernelEndpointHandle, KernelReplyHandle, KernelTransferredHandle,
 };
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock, work_budget};
 
@@ -4296,18 +4294,6 @@ fn cancel_received_handle_reservations(reservation_id: u64, slots: &[u64]) {
     });
 }
 
-pub(super) fn transfer_tickets_for_descriptors(
-    descriptors: &[KernelTransferredHandle],
-    context: TransferContext,
-) -> Result<Vec<KernelTransferTicket>, i64> {
-    multitask::bind_ipc_transfer_tickets(descriptors, context)
-        .map_err(ipc_transfer_error_to_linux_errno)
-}
-
-pub(super) fn commit_transfer_tickets_enqueue(tickets: &[KernelTransferTicket]) -> Result<(), i64> {
-    multitask::commit_ipc_transfer_enqueue(tickets).map_err(ipc_transfer_error_to_linux_errno)
-}
-
 pub(super) struct PreparedTransferInstall {
     reservation_id: u64,
     slots: Vec<u64>,
@@ -4323,26 +4309,6 @@ impl PreparedTransferInstall {
             .copied()
             .map(|fd| i32::try_from(fd).map_err(|_| LINUX_EOVERFLOW))
             .collect()
-    }
-
-    /// Sets close-on-exec on every claimed entry before it is committed.
-    /// `recvmsg` descriptors take only the receiver's `MSG_CMSG_CLOEXEC`.
-    pub(super) fn set_close_on_exec(&mut self, cloexec: bool) -> Result<(), i64> {
-        let entries = self.entries.take().ok_or(LINUX_ESTALE)?;
-        let fd_flags = if cloexec { multitask::FD_CLOEXEC } else { 0 };
-        let mut rebuilt = Vec::with_capacity(entries.len());
-        for transferred in entries {
-            let mut entry = transferred.into_entry();
-            entry.set_fd_flags(fd_flags);
-            // The entry already owns its provider reference; re-wrapping it
-            // acquires no second one (`from_initial_entry`).
-            rebuilt.push(
-                multitask::TransferredHandleEntry::from_initial_entry(entry)
-                    .ok_or(LINUX_ESTALE)?,
-            );
-        }
-        self.entries = Some(rebuilt);
-        Ok(())
     }
 
     pub(super) fn commit(mut self) -> Result<(), i64> {
@@ -4379,35 +4345,6 @@ impl Drop for PreparedTransferInstall {
     }
 }
 
-pub(super) fn prepare_transfer_tickets_for_current_process(
-    tickets: &[KernelTransferTicket],
-    receiver: ProcessIdentity,
-    service: ServiceIdentity,
-    channel: ChannelIdentity,
-    stream_pos: u64,
-    receiver_open_description: u64,
-) -> Result<PreparedTransferInstall, i64> {
-    multitask::bind_ipc_transfer_receiver_by_tickets(
-        tickets,
-        receiver,
-        service,
-        channel,
-        stream_pos,
-        receiver_open_description,
-    )
-    .map_err(ipc_transfer_error_to_linux_errno)?;
-    let entries = multitask::claim_ipc_transfer_entries_by_tickets(
-        tickets,
-        receiver,
-        service,
-        channel,
-        stream_pos,
-        receiver_open_description,
-    )
-    .map_err(ipc_transfer_error_to_linux_errno)?;
-    prepare_transfer_entries_for_current_process(entries)
-}
-
 /// Reserve invisible slots for an already-claimed reply batch. Copyout and
 /// deadline checks precede the exact all-or-nothing commit; Drop reconciles
 /// every provider reference on any failure.
@@ -4430,14 +4367,6 @@ pub(super) fn prepare_transfer_entries_for_current_process(
         service_refs,
         committed: false,
     })
-}
-
-pub(super) fn drop_transfer_tickets(tickets: &[KernelTransferTicket]) {
-    if tickets.is_empty() {
-        return;
-    }
-    multitask::drop_ipc_transfer_tickets(tickets);
-    let _ = service_deferred_transfer_releases();
 }
 
 fn take_transfer_entries(

@@ -238,15 +238,6 @@ pub fn kernel_only_delegate(node: ProcNode) -> Option<u64> {
     }
 }
 
-/// `aux` for `open` of a kernel-fact node: the kernel builds the snapshot (or
-/// directory listing) for the calling process. `None` for other nodes.
-pub fn open_delegate(node: ProcNode) -> Option<u64> {
-    match node {
-        ProcNode::Kernel(kernel, number) => Some(abi_procfs::encode_delegate(kernel, number)),
-        _ => None,
-    }
-}
-
 /// Whether `kernel` is a `/proc/<pid>/*` node whose read-only text is formatted
 /// in Ring3 `vfsd` from raw facts pulled via `SYS_RUSTOS_PROC_FACTS_BROKER`.
 pub const fn is_ring3_formatted(kernel: ProcKernelNode) -> bool {
@@ -356,8 +347,7 @@ pub struct CpuInfoSpec {
 
 #[cfg(target_arch = "x86_64")]
 fn query_x86_cpu_spec() -> CpuInfoSpec {
-    #[allow(unused_unsafe)]
-    let leaf0 = unsafe { core::arch::x86_64::__cpuid(0) };
+    let leaf0 = core::arch::x86_64::__cpuid(0);
     let mut vendor = [0_u8; 12];
     vendor[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
     vendor[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
@@ -370,8 +360,7 @@ fn query_x86_cpu_spec() -> CpuInfoSpec {
     let mut clflush_size = 64_u32;
     let mut flags_list: Vec<&'static str> = Vec::new();
     if leaf0.eax >= 1 {
-        #[allow(unused_unsafe)]
-        let leaf1 = unsafe { core::arch::x86_64::__cpuid(1) };
+        let leaf1 = core::arch::x86_64::__cpuid(1);
         stepping = leaf1.eax & 0xf;
         let base_model = (leaf1.eax >> 4) & 0xf;
         let base_family = (leaf1.eax >> 8) & 0xf;
@@ -421,14 +410,12 @@ fn query_x86_cpu_spec() -> CpuInfoSpec {
         }
     }
 
-    #[allow(unused_unsafe)]
-    let max_ext = unsafe { core::arch::x86_64::__cpuid(0x8000_0000) }.eax;
+    let max_ext = core::arch::x86_64::__cpuid(0x8000_0000).eax;
     let mut model_name = String::new();
     if max_ext >= 0x8000_0004 {
         let mut brand = [0_u8; 48];
         for i in 0..3_u32 {
-            #[allow(unused_unsafe)]
-            let l = unsafe { core::arch::x86_64::__cpuid(0x8000_0002 + i) };
+            let l = core::arch::x86_64::__cpuid(0x8000_0002 + i);
             let base = (i as usize) * 16;
             brand[base..base + 4].copy_from_slice(&l.eax.to_le_bytes());
             brand[base + 4..base + 8].copy_from_slice(&l.ebx.to_le_bytes());
@@ -444,16 +431,14 @@ fn query_x86_cpu_spec() -> CpuInfoSpec {
         model_name.push_str("x86_64 CPU");
     }
     if max_ext >= 0x8000_0001 {
-        #[allow(unused_unsafe)]
-        let ext1 = unsafe { core::arch::x86_64::__cpuid(0x8000_0001) };
+        let ext1 = core::arch::x86_64::__cpuid(0x8000_0001);
         if (ext1.edx >> 11) & 1 != 0 { flags_list.push("syscall"); }
         if (ext1.edx >> 20) & 1 != 0 { flags_list.push("nx"); }
         if (ext1.edx >> 29) & 1 != 0 { flags_list.push("lm"); }
     }
     let (mut phys_bits, mut virt_bits) = (40_u32, 48_u32);
     if max_ext >= 0x8000_0008 {
-        #[allow(unused_unsafe)]
-        let ext8 = unsafe { core::arch::x86_64::__cpuid(0x8000_0008) };
+        let ext8 = core::arch::x86_64::__cpuid(0x8000_0008);
         if ext8.eax & 0xff != 0 { phys_bits = ext8.eax & 0xff; }
         if (ext8.eax >> 8) & 0xff != 0 { virt_bits = (ext8.eax >> 8) & 0xff; }
     }
@@ -1002,7 +987,8 @@ mod tests {
         let pid_dir = lookup("/proc/self/fd", 7).unwrap().unwrap();
         assert_eq!(kernel_only_delegate(maps), None);
         assert_eq!(
-            abi_procfs::decode_delegate(open_delegate(maps).unwrap()),
+            // A writable open of a Ring3-formatted node is completed by Ring0.
+            abi_procfs::decode_delegate(open_delegate_for_flags(maps, 1).unwrap()),
             Some((ProcKernelNode::Maps, 0))
         );
         assert_eq!(
@@ -1010,8 +996,8 @@ mod tests {
             Some((ProcKernelNode::FdLink, 4))
         );
         assert!(kernel_only_delegate(pid_dir).is_some());
-        assert_eq!(open_delegate(ProcNode::PidDir), None);
-        assert_eq!(open_delegate(ProcNode::MountsFile), None);
+        assert_eq!(open_delegate_for_flags(ProcNode::PidDir, 1), None);
+        assert_eq!(open_delegate_for_flags(ProcNode::MountsFile, 1), None);
     }
 
     #[test]

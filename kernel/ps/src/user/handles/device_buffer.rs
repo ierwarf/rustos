@@ -148,6 +148,7 @@ impl BufferCapability {
         }
     }
 
+    #[cfg(test)]
     pub fn is_revoked(&self) -> bool {
         self.allocation.mappings.load(Ordering::Acquire) & REVOKED != 0
     }

@@ -29,7 +29,9 @@ pub fn init() {
     });
 }
 
-fn set_irq_enabled(irq: u8, enabled: bool) {
+/// Unmask one legacy PIC line. Only the PIT timer line (IRQ 0) is ever
+/// unmasked; every other line stays masked after `init`.
+pub fn enable_irq(irq: u8) {
     if irq > MAX_IRQ {
         panic!("IRQ must be between 0 and 15");
     }
@@ -39,34 +41,15 @@ fn set_irq_enabled(irq: u8, enabled: bool) {
         let [mut mask1, mut mask2] = pics.read_masks();
 
         if irq < 8 {
-            let bit = 1u8 << irq;
-            if enabled {
-                mask1 &= !bit;
-            } else {
-                mask1 |= bit;
-            }
+            mask1 &= !(1u8 << irq);
         } else {
-            let slave_irq = irq - 8;
-            let bit = 1u8 << slave_irq;
-            if enabled {
-                mask2 &= !bit;
-                // Keep cascade line enabled when using slave PIC IRQs.
-                mask1 &= !(1u8 << CASCADE_IRQ);
-            } else {
-                mask2 |= bit;
-            }
+            mask2 &= !(1u8 << (irq - 8));
+            // Keep cascade line enabled when using slave PIC IRQs.
+            mask1 &= !(1u8 << CASCADE_IRQ);
         }
 
         pics.write_masks(mask1, mask2);
     });
-}
-
-pub fn enable_irq(irq: u8) {
-    set_irq_enabled(irq, true);
-}
-
-pub fn disable_irq(irq: u8) {
-    set_irq_enabled(irq, false);
 }
 
 pub fn send_eoi(interrupt_vector: u8) {

@@ -964,10 +964,7 @@ pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
     }
     if request_number == linux_abi::FIONREAD
         && current_kernel_handle(fd).is_some_and(|handle| {
-            matches!(
-                handle,
-                multitask::KernelHandle::Socket(_) | multitask::KernelHandle::InetSocket(_)
-            )
+            matches!(handle, multitask::KernelHandle::InetSocket(_))
         })
     {
         return match kernel_netd_raw_socket_op(
@@ -1083,7 +1080,7 @@ fn kernel_handle_kind_code(handle: &multitask::KernelHandle) -> u64 {
         multitask::KernelHandle::InetSocket(_) => rustos_user_abi::handle_kind::HANDLE_KIND_INET_SOCKET,
         multitask::KernelHandle::Memfd(_) => rustos_user_abi::handle_kind::HANDLE_KIND_MEMFD,
         multitask::KernelHandle::RemoteVfs(_) => rustos_user_abi::handle_kind::HANDLE_KIND_REMOTE_VFS,
-        multitask::KernelHandle::Socket(_) | multitask::KernelHandle::UnixSocket(_) => {
+        multitask::KernelHandle::UnixSocket(_) => {
             rustos_user_abi::handle_kind::HANDLE_KIND_SOCKET
         }
         multitask::KernelHandle::VfsDirectory(_) => rustos_user_abi::handle_kind::HANDLE_KIND_VFS_DIRECTORY,
@@ -1330,31 +1327,7 @@ pub fn syscall_linux_net6_with_timeout(
             syscall_linux_net6_once(op, arg0, arg1, arg2, arg3, arg4, arg5, None)
         });
     }
-    let io_flags = match op {
-        SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => arg2,
-        SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => arg3,
-        _ => return result,
-    };
-    if io_flags & (linux_abi::MSG_DONTWAIT | libc_msg_errqueue()) != 0 {
-        return result;
-    }
-    // Only sockets whose queue netd owns locally wait here: INET receives
-    // block inside netd's worker pool, so their `EAGAIN` is already final.
-    let blocking_local = snapshot_socket(arg0).is_some_and(|snapshot| {
-        snapshot.status_flags & linux_abi::O_NONBLOCK == 0
-            && matches!(snapshot.handle, multitask::KernelHandle::Socket(_))
-    });
-    if !blocking_local {
-        return result;
-    }
-    wait_and_retry_local_receive(arg0, || {
-        syscall_linux_net6_once(op, arg0, arg1, arg2, arg3, arg4, arg5, None)
-    })
-}
-
-/// `MSG_ERRQUEUE` (0x2000) never waits either; it is not in `linux_abi`.
-const fn libc_msg_errqueue() -> u64 {
-    0x2000
+    result
 }
 
 /// `SO_RCVTIMEO` (`struct timeval`), the only socket option the wait loop
@@ -1483,25 +1456,6 @@ pub(super) fn netd_socket_write_bytes(
         request.payload_len = chunk.len() as u32;
         chunk
     };
-    let stream = match &snapshot.handle {
-        multitask::KernelHandle::Socket(socket) if socket.channel_id() != 0 => loop {
-            if let Some(stream) = socket.begin_stream_send(chunk.len()) {
-                break Some(stream);
-            }
-            if nonblocking {
-                return Err(LINUX_EAGAIN);
-            }
-            if super::poll_epoll::has_unmasked_pending_signal() {
-                return Err(LINUX_EINTR);
-            }
-            match kernel_netd_poll_fd(fd, linux_abi::POLLOUT as u32, LOCAL_RECEIVE_WAIT_SLICE_MS) {
-                Ok(_) => {}
-                Err(errno) if errno == LINUX_ETIMEDOUT => {}
-                Err(errno) => return Err(errno),
-            }
-        },
-        _ => None,
-    };
     let response = if nonblocking {
         call_netd_ipc_request_with_timeout(
             &request,
@@ -1513,11 +1467,6 @@ pub(super) fn netd_socket_write_bytes(
     };
     if response.value > chunk.len() as u64 {
         return Err(LINUX_EIO);
-    }
-    if let Some(stream) = stream
-        && !stream.commit_send(response.value as usize)
-    {
-        return Err(LINUX_ESTALE);
     }
     Ok(response.value as usize)
 }
@@ -1547,7 +1496,6 @@ fn syscall_linux_net6_once(
         arg5,
         ..NetdIpcRequest::default()
     };
-    let mut pending_transfers = PendingNetdTransfers::default();
     if let Some(snapshot) = multitask::current_user_snapshot() {
         request.pid = snapshot.process_id();
         request.tid = snapshot.thread_id();
@@ -1594,14 +1542,7 @@ fn syscall_linux_net6_once(
         super::ipc_helpers::deadline::netd_timeout_class(op)
     });
     request.deadline_ns = netd_deadline_after_class(deadline_class, timeout_ms);
-    if let Err(errno) = populate_netd_request_payload(&mut request, &mut pending_transfers, socket_snapshot.as_ref()) {
-        pending_transfers.drop_pending();
-        return linux_errno(errno);
-    }
-    if !pending_transfers.is_receive()
-        && let Err(errno) = pending_transfers.publish_send()
-    {
-        pending_transfers.drop_pending();
+    if let Err(errno) = populate_netd_request_payload(&mut request, socket_snapshot.as_ref()) {
         return linux_errno(errno);
     }
     let result = match timeout_ms {
@@ -1610,93 +1551,16 @@ fn syscall_linux_net6_once(
     };
     let outcome = match result {
         Ok(response) => {
-            let record_present = response.reserved1 & rustos_user_abi::syscall::NETD_IPC_RESPONSE_FLAG_RECORD_PRESENT != 0;
-            if (response.discarded_tail != 0 || record_present)
-                && !current_unix_socket_handle(socket_snapshot.as_ref()).is_some_and(|handle| {
-                    matches!(
-                        handle.type_(),
-                        rustos_user_abi::syscall::NET_BROKER_PUBLICATION_SOCK_SEQPACKET
-                            | linux_abi::SOCK_DGRAM
-                    )
-                })
-            {
-                pending_transfers.drop_pending();
-                return linux_errno(LINUX_EINVAL);
-            }
-            let consumed = usize::try_from(response.value).ok();
-            // A SEQPACKET receive that discarded a truncated tail returns the
-            // copied length but dequeued the whole message: the stream
-            // position must advance by what the sender's position advanced by.
-            let stream_consumed = if pending_transfers.is_receive() {
-                consumed.and_then(|len| len.checked_add(response.discarded_tail as usize))
-                    .map(|len| if record_present { len.max(1) } else { len })
-            } else {
-                consumed
-            };
-            let result = consume_netd_response_payload(
+            match consume_netd_response_payload(
                 &request,
                 &response,
-                pending_transfers.receive_context(),
                 socket_snapshot.as_ref(),
-            );
-            if pending_transfers.is_receive() && io_flags & linux_abi::MSG_PEEK != 0 {
-                // A peek dequeues nothing: the stream position must not move.
-                pending_transfers.drop_pending();
-            } else if pending_transfers.is_receive() {
-                if !stream_consumed.is_some_and(|len| pending_transfers.commit_receive(len)) {
-                    // netd already dequeued these bytes from the peer's stream;
-                    // no other copy of them exists anywhere in the system.
-                    record_stream_break(
-                        STREAM_BREAK_RECEIVE_UNCOMMITTED,
-                        &request,
-                        consumed.unwrap_or(0),
-                    );
-                    pending_transfers.drop_pending();
-                    return linux_errno(LINUX_EIO);
-                }
-                if let Err(errno) = result.as_ref() {
-                    // The bytes left netd's queue and then failed to reach the
-                    // caller's buffer. The caller sees an error and reads again
-                    // from the byte after the hole.
-                    record_stream_break(
-                        STREAM_BREAK_RECEIVE_COPYOUT,
-                        &request,
-                        errno.unsigned_abs() as usize,
-                    );
-                }
-            } else if result.is_ok() {
-                let Some(accepted) = consumed else {
-                    record_stream_break(STREAM_BREAK_SEND_UNREPORTED, &request, 0);
-                    pending_transfers.drop_pending();
-                    return linux_errno(LINUX_EIO);
-                };
-                if pending_transfers.commit_send(accepted).is_err() {
-                    // netd accepted `accepted` bytes onto the peer's queue, but
-                    // this caller is about to be told the call failed, so a
-                    // stream writer will resend the exact same bytes.
-                    record_stream_break(STREAM_BREAK_SEND_UNCOMMITTED, &request, accepted);
-                    pending_transfers.drop_pending();
-                    return linux_errno(LINUX_ESTALE);
-                }
-            }
-            match result {
+            ) {
                 Ok(()) => response.value,
-                Err(errno) => {
-                    pending_transfers.drop_pending();
-                    linux_errno(errno)
-                }
+                Err(errno) => linux_errno(errno),
             }
         }
-        // A netd status reply is NOT recorded here. `EAGAIN` on an empty
-        // non-blocking receive is the ordinary answer and arrives thousands of
-        // times a second; counting it as a stream break buries the real events
-        // under normal traffic. Only a reply that never arrived is ambiguous,
-        // and only the transport can tell the two apart, so that record is
-        // taken at the transport boundary in `call_netd_ipc_request_impl`.
-        Err(errno) => {
-            pending_transfers.drop_pending();
-            linux_errno(errno)
-        }
+        Err(errno) => linux_errno(errno),
     };
     if nonblocking_bound && outcome == linux_errno(LINUX_ETIMEDOUT) {
         return linux_errno(LINUX_EAGAIN);
@@ -1721,10 +1585,6 @@ pub(super) const fn socket_op_moves_stream_bytes(op: u16) -> bool {
     )
 }
 
-const STREAM_BREAK_RECEIVE_UNCOMMITTED: u64 = 1;
-const STREAM_BREAK_RECEIVE_COPYOUT: u64 = 2;
-const STREAM_BREAK_SEND_UNCOMMITTED: u64 = 3;
-const STREAM_BREAK_SEND_UNREPORTED: u64 = 4;
 pub(super) const STREAM_BREAK_ABANDONED_IN_FLIGHT: u64 = 5;
 
 /// Names a point where this syscall is about to report an outcome that does not
@@ -1834,132 +1694,6 @@ pub(super) const fn netd_deadline_remaining_ms_at(deadline_ns: u64, now_ns: u64)
     Some((deadline_ns - now_ns).div_ceil(NETD_NANOS_PER_MILLI))
 }
 
-struct PendingNetdTransfers {
-    descriptors: Vec<kernel_ipc_runtime::api::KernelTransferredHandle>,
-    tickets: Vec<kernel_ipc_runtime::api::KernelTransferTicket>,
-    stream: Option<multitask::SocketStreamGuard>,
-    channel_id: u64,
-    channel_side: u8,
-    socket_token: u64,
-    receive: bool,
-    seqpacket: bool,
-}
-
-impl Default for PendingNetdTransfers {
-    fn default() -> Self {
-        Self {
-            descriptors: Vec::new(),
-            tickets: Vec::new(),
-            stream: None,
-            channel_id: 0,
-            channel_side: 0,
-            socket_token: 0,
-            receive: false,
-            seqpacket: false,
-        }
-    }
-}
-
-impl PendingNetdTransfers {
-    fn extend(&mut self, descriptors: &[kernel_ipc_runtime::api::KernelTransferredHandle]) {
-        self.descriptors.extend_from_slice(descriptors);
-    }
-
-    fn extend_tickets(&mut self, tickets: &[kernel_ipc_runtime::api::KernelTransferTicket]) {
-        self.tickets.extend_from_slice(tickets);
-    }
-
-    fn begin_send(&mut self, socket: &multitask::SocketHandle, len: usize) -> Result<(), i64> {
-        if socket.channel_id() == 0 {
-            return Ok(());
-        }
-        self.seqpacket = matches!(
-            socket.type_(),
-            rustos_user_abi::syscall::NET_BROKER_PUBLICATION_SOCK_SEQPACKET
-                | linux_abi::SOCK_DGRAM
-        );
-        let stream = socket.begin_stream_send(if self.seqpacket { len.max(1) } else { len }).ok_or(LINUX_EAGAIN)?;
-        self.channel_id = socket.channel_id();
-        self.channel_side = socket.channel_side();
-        self.socket_token = socket.token_id();
-        self.stream = Some(stream);
-        Ok(())
-    }
-
-    fn begin_receive(&mut self, socket: &multitask::SocketHandle) -> Result<(), i64> {
-        if socket.channel_id() == 0 {
-            return Ok(());
-        }
-        self.seqpacket = matches!(
-            socket.type_(),
-            rustos_user_abi::syscall::NET_BROKER_PUBLICATION_SOCK_SEQPACKET
-                | linux_abi::SOCK_DGRAM
-        );
-        let stream = socket.begin_stream_receive().ok_or(LINUX_EAGAIN)?;
-        self.channel_id = socket.channel_id();
-        self.channel_side = socket.channel_side();
-        self.socket_token = socket.token_id();
-        self.receive = true;
-        self.stream = Some(stream);
-        Ok(())
-    }
-
-    fn commit_send(&mut self, accepted: usize) -> Result<(), i64> {
-        let accepted = if self.seqpacket { accepted.max(1) } else { accepted };
-        if let Some(stream) = self.stream.take() {
-            let reserved = stream
-                .end()
-                .checked_sub(stream.start())
-                .and_then(|len| usize::try_from(len).ok())
-                .ok_or(LINUX_ESTALE)?;
-            if (!self.tickets.is_empty() && accepted != reserved) || !stream.commit_send(accepted) {
-                return Err(LINUX_ESTALE);
-            }
-        }
-        self.descriptors.clear();
-        self.tickets.clear();
-        Ok(())
-    }
-
-    fn publish_send(&mut self) -> Result<(), i64> {
-        if self.tickets.is_empty() {
-            return Ok(());
-        }
-        super::super::ipc_ops::commit_transfer_tickets_enqueue(self.tickets.as_slice())
-    }
-
-    fn commit_receive(&mut self, len: usize) -> bool {
-        self.stream
-            .take()
-            .is_some_and(|stream| stream.commit_receive(len))
-    }
-
-    fn is_receive(&self) -> bool {
-        self.receive
-    }
-
-    fn receive_context(&self) -> Option<(u64, u64, u8, u64)> {
-        if !self.receive {
-            return None;
-        }
-        Some((
-            self.stream.as_ref()?.start(),
-            self.channel_id,
-            self.channel_side,
-            self.socket_token,
-        ))
-    }
-
-    fn drop_pending(&mut self) {
-        if !self.descriptors.is_empty() {
-            super::super::ipc_ops::drop_transfer_descriptors(self.descriptors.as_slice());
-        }
-        self.descriptors.clear();
-        self.tickets.clear();
-        self.stream.take();
-    }
-}
-
 pub(super) struct SocketSnapshot {
     pub(super) handle: multitask::KernelHandle,
     pub(super) status_flags: u64,
@@ -1968,7 +1702,6 @@ pub(super) struct SocketSnapshot {
 impl SocketSnapshot {
     pub(super) fn token(&self) -> u64 {
         match &self.handle {
-            multitask::KernelHandle::Socket(s) => s.token_id(),
             multitask::KernelHandle::InetSocket(s) => s.token_id(),
             _ => unreachable!("socket snapshot must contain a socket"),
         }
@@ -1987,19 +1720,15 @@ impl SocketSnapshot {
         matches!(&self.handle, multitask::KernelHandle::InetSocket(s)
             if s.type_() == linux_abi::SOCK_DGRAM && s.domain() == linux_abi::AF_INET6)
     }
-    pub(super) fn is_unix_dgram(&self) -> bool {
-        matches!(&self.handle, multitask::KernelHandle::Socket(s)
-            if s.type_() == linux_abi::SOCK_DGRAM)
-    }
     pub(super) fn uses_netd_message(&self) -> bool {
-        self.is_datagram() || self.is_ipv6_datagram() || self.is_unix_dgram()
+        self.is_datagram() || self.is_ipv6_datagram()
     }
 }
 
 pub(super) fn snapshot_socket(fd: u64) -> Option<SocketSnapshot> {
     multitask::with_current_user_process_state(|_, _, state| {
         let entry = state.handles().get_entry(fd)?;
-        if !matches!(entry.handle(), multitask::KernelHandle::Socket(_) | multitask::KernelHandle::InetSocket(_)) { return None; }
+        if !matches!(entry.handle(), multitask::KernelHandle::InetSocket(_)) { return None; }
         Some(SocketSnapshot { handle: entry.handle().clone(), status_flags: entry.status_flags() })
     }).flatten()
 }
@@ -2026,19 +1755,11 @@ fn populate_netd_socket_token(request: &mut NetdIpcRequest) -> Option<SocketSnap
         _ => return None,
     };
     let snapshot = snapshot_socket(fd)?;
-    if request.op == SYSCALL_OFFLOAD_OP_LINUX_ACCEPT {
-        match &snapshot.handle {
-            multitask::KernelHandle::Socket(listener) => {
-                // The accepted socket has the listener's type; the reply validation
-                // checks the published handle against it.
-                request.arg4 = listener.type_();
-            }
-            multitask::KernelHandle::InetSocket(listener) => {
-                request.arg4 = listener.type_();
-                request.arg5 = listener.domain();
-            }
-            _ => {}
-        }
+    if request.op == SYSCALL_OFFLOAD_OP_LINUX_ACCEPT
+        && let multitask::KernelHandle::InetSocket(listener) = &snapshot.handle
+    {
+        request.arg4 = listener.type_();
+        request.arg5 = listener.domain();
     }
     request.socket_token = snapshot.token();
     request.status_flags = snapshot.status_flags;
@@ -2047,20 +1768,14 @@ fn populate_netd_socket_token(request: &mut NetdIpcRequest) -> Option<SocketSnap
 
 fn populate_netd_request_payload(
     request: &mut NetdIpcRequest,
-    pending_transfers: &mut PendingNetdTransfers,
     socket: Option<&SocketSnapshot>,
 ) -> Result<(), i64> {
-    if socket.is_some_and(|s| s.is_ipv6_datagram() || s.is_unix_dgram()) {
+    if socket.is_some_and(SocketSnapshot::is_ipv6_datagram) {
         match request.op {
             SYSCALL_OFFLOAD_OP_LINUX_SENDTO | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG => {
-                return populate_netd_msg_dgram_send(request, pending_transfers, socket);
+                return populate_netd_msg_dgram_send(request, socket);
             }
-            SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => {
-                if let Some(unix_sock) = current_unix_socket_handle(socket) {
-                    pending_transfers.begin_receive(&unix_sock)?;
-                }
-                return Ok(());
-            }
+            SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => return Ok(()),
             SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => {
                 let header = usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(request.arg1)
                     .map_err(address_space_error_to_linux_errno)?;
@@ -2072,9 +1787,6 @@ fn populate_netd_request_payload(
                 request.payload_len =
                     iovec_payload_total_len(&iovecs)?.min(NETD_IPC_PAYLOAD_CAPACITY) as u32;
                 request.arg4 = header.msg_controllen;
-                if let Some(unix_sock) = current_unix_socket_handle(socket) {
-                    pending_transfers.begin_receive(&unix_sock)?;
-                }
                 return Ok(());
             }
             _ => {}
@@ -2101,43 +1813,15 @@ fn populate_netd_request_payload(
     match request.op {
         SYSCALL_OFFLOAD_OP_LINUX_BIND | SYSCALL_OFFLOAD_OP_LINUX_CONNECT => {
             copy_current_payload(request, request.arg1, request.arg2)?;
-            if request.op == SYSCALL_OFFLOAD_OP_LINUX_BIND
-                && current_unix_socket_handle(socket).is_some()
-                && request.payload_len > 2
-                && u16::from_ne_bytes([request.payload[0], request.payload[1]]) as u64 == linux_abi::AF_UNIX
-                && request.payload[2] != 0
-            {
-                let mut query = super::super::syscalld_ops::new_syscalld_request(rustos_user_abi::syscall::SYSCALL_OFFLOAD_OP_LINUX_UMASK);
-                query.flags = rustos_user_abi::syscall::SYSCALL_OFFLOAD_UMASK_QUERY;
-                let response = super::super::syscalld_ops::call_syscalld(query)?;
-                super::super::syscalld_ops::ensure_syscalld_payload(&response, size_of::<u32>())?;
-                let mask = u32::from_le_bytes(response.payload[..4].try_into().map_err(|_| LINUX_EINVAL)?);
-                if mask & !0o777 != 0 { return Err(LINUX_EINVAL); }
-                request.arg3 = u64::from(mask);
-            }
             Ok(())
         }
         SYSCALL_OFFLOAD_OP_LINUX_SENDTO => {
-            // Stream sockets take a bounded prefix and report it, exactly as
-            // `sendmsg` and `writev` do below; failing a large `write` with
-            // `EINVAL` because one offload payload is smaller than the buffer
-            // is a transport limit leaking into the caller's ABI. Datagram
-            // sockets are never split and took the dedicated branch above.
-            let seqpacket = current_unix_socket_handle(socket)
-                .is_some_and(|handle| handle.type_() == rustos_user_abi::syscall::NET_BROKER_PUBLICATION_SOCK_SEQPACKET);
-            if seqpacket && request.arg2 > NETD_IPC_PAYLOAD_CAPACITY as u64 {
-                // A message is never split: a prefix would redefine its boundary.
-                return Err(LINUX_EMSGSIZE);
-            }
             let prefix_len = request.arg2.min(NETD_IPC_PAYLOAD_CAPACITY as u64);
             copy_current_payload(request, request.arg1, prefix_len)?;
             if current_inet_socket(socket) {
-                // Internet sockets carry no kernel-side stream bookkeeping:
-                // netd owns the whole byte stream.
                 return Ok(());
             }
-            let socket = current_unix_socket_handle(socket).ok_or(LINUX_ENOTSOCK)?;
-            pending_transfers.begin_send(&socket, request.payload_len as usize)
+            Err(LINUX_ENOTSOCK)
         }
         SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT => {
             copy_current_payload(request, request.arg3, request.arg4)
@@ -2147,63 +1831,28 @@ fn populate_netd_request_payload(
                 .map_err(address_space_error_to_linux_errno)?;
             let iovecs = read_current_iovecs_payload(header.msg_iov, header.msg_iovlen)?;
             let total = iovec_payload_total_len(&iovecs)?;
-            let seqpacket = current_unix_socket_handle(socket)
-                .is_some_and(|handle| handle.type_() == rustos_user_abi::syscall::NET_BROKER_PUBLICATION_SOCK_SEQPACKET);
-            if total > NETD_IPC_PAYLOAD_CAPACITY && (seqpacket || header.msg_controllen != 0) {
+            if total > NETD_IPC_PAYLOAD_CAPACITY && header.msg_controllen != 0 {
                 return Err(LINUX_EMSGSIZE);
             }
-            let mut bytes = read_iovec_prefix(&iovecs, total.min(NETD_IPC_PAYLOAD_CAPACITY))?;
-            let control = if current_inet_socket(socket) {
-                // Ancillary data on an internet socket (IP_PKTINFO, ...) has no
-                // transport here; refuse it instead of dropping it silently.
-                if header.msg_controllen != 0 {
-                    return Err(LINUX_EOPNOTSUPP);
-                }
-                EncodedControlPayload::default()
-            } else {
-                let socket = current_unix_socket_handle(socket).ok_or(LINUX_ENOTSOCK)?;
-                pending_transfers.begin_send(&socket, bytes.len())?;
-                let raw_control =
-                    read_current_control_bytes(header.msg_control, header.msg_controllen)?;
-                let context = send_transfer_context(&socket, pending_transfers, bytes.len())?;
-                let control = encode_transfer_control_payload(raw_control.as_slice(), context)?;
-                pending_transfers.extend(control.descriptors.as_slice());
-                pending_transfers.extend_tickets(control.tickets.as_slice());
-                control
-            };
-            // One offload payload is a bounded buffer, but that bound belongs to
-            // this transport and not to the caller's ABI. Linux `sendmsg` on a
-            // stream socket never answers `EINVAL` because a buffer inside the
-            // kernel was smaller than the request; it takes a prefix and returns
-            // how much it took, which is what every stream writer is built to
-            // handle. Returning `EINVAL` made a legal call look like a
-            // programming error to a caller that had done nothing wrong.
-            //
-            // The reservation above only fixes an upper bound, so committing
-            // fewer bytes than were reserved is already the supported partial
-            // path. Descriptors are the exception: they attach to the message,
-            // so a prefix would deliver them against the wrong bytes. That case
-            // is a message this transport cannot carry atomically, which is what
-            // `EMSGSIZE` means.
-            let capacity = sendmsg_data_capacity(control.bytes.len())?;
-            if bytes.len() > capacity {
-                if !control.bytes.is_empty() || seqpacket {
-                    return Err(LINUX_EMSGSIZE);
-                }
-                bytes.truncate(capacity);
+            if !current_inet_socket(socket) {
+                return Err(LINUX_ENOTSOCK);
             }
+            // Ancillary data on an internet socket (IP_PKTINFO, ...) has no
+            // transport here; refuse it instead of dropping it silently.
+            if header.msg_controllen != 0 {
+                return Err(LINUX_EOPNOTSUPP);
+            }
+            let capacity = sendmsg_data_capacity(0)?;
+            let bytes = read_iovec_prefix(&iovecs, total.min(capacity))?;
             let payload_len = NETD_SENDMSG_PAYLOAD_HEADER_SIZE
                 .checked_add(bytes.len())
-                .and_then(|len| len.checked_add(control.bytes.len()))
                 .ok_or(LINUX_EINVAL)?;
             request.payload[0..4].copy_from_slice(&(bytes.len() as u32).to_ne_bytes());
-            request.payload[4..8].copy_from_slice(&(control.bytes.len() as u32).to_ne_bytes());
+            request.payload[4..8].copy_from_slice(&0_u32.to_ne_bytes());
             request.payload[8..12].copy_from_slice(&0_u32.to_ne_bytes());
             request.payload[12..16].copy_from_slice(&0_u32.to_ne_bytes());
             let data_start = NETD_SENDMSG_PAYLOAD_HEADER_SIZE;
-            let control_start = data_start + bytes.len();
-            request.payload[data_start..control_start].copy_from_slice(bytes.as_slice());
-            request.payload[control_start..payload_len].copy_from_slice(control.bytes.as_slice());
+            request.payload[data_start..payload_len].copy_from_slice(bytes.as_slice());
             request.payload_len = payload_len as u32;
             request.arg4 = header.msg_controllen;
             Ok(())
@@ -2218,16 +1867,13 @@ fn populate_netd_request_payload(
             if current_inet_socket(socket) {
                 return Ok(());
             }
-            let socket = current_unix_socket_handle(socket).ok_or(LINUX_ENOTSOCK)?;
-            pending_transfers.begin_receive(&socket)?;
-            Ok(())
+            Err(LINUX_ENOTSOCK)
         }
         SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => {
             if current_inet_socket(socket) {
                 return Ok(());
             }
-            let socket = current_unix_socket_handle(socket).ok_or(LINUX_ENOTSOCK)?;
-            pending_transfers.begin_receive(&socket)
+            Err(LINUX_ENOTSOCK)
         }
         _ => Ok(()),
     }
@@ -2235,52 +1881,6 @@ fn populate_netd_request_payload(
 
 fn current_inet_socket(socket: Option<&SocketSnapshot>) -> bool {
     socket.is_some_and(|s| matches!(&s.handle, multitask::KernelHandle::InetSocket(_)))
-}
-
-fn current_unix_socket_handle(socket: Option<&SocketSnapshot>) -> Option<multitask::SocketHandle> {
-    match &socket?.handle {
-        multitask::KernelHandle::Socket(socket) => Some(socket.clone()),
-        _ => None,
-    }
-}
-
-fn send_transfer_context(
-    socket: &multitask::SocketHandle,
-    pending: &PendingNetdTransfers,
-    len: usize,
-) -> Result<kernel_ipc_runtime::api::TransferContext, i64> {
-    let snapshot = multitask::current_user_snapshot().ok_or(LINUX_ESRCH)?;
-    let stream = pending.stream.as_ref().ok_or(LINUX_ESTALE)?;
-    let len = u64::try_from(len).map_err(|_| LINUX_EOVERFLOW)?;
-    let width = if pending.seqpacket { len.max(1) } else { len };
-    if stream.end() != stream.start().checked_add(width).ok_or(LINUX_EOVERFLOW)? {
-        return Err(LINUX_ESTALE);
-    }
-    let receiver_side = match socket.channel_side() {
-        1 => 2,
-        2 => 1,
-        _ => return Err(LINUX_ENOTSOCK),
-    };
-    Ok(kernel_ipc_runtime::api::TransferContext {
-        source: kernel_ipc_runtime::api::ProcessIdentity {
-            pid: snapshot.process_id(),
-            generation: snapshot.process_generation(),
-        },
-        service: kernel_ipc_runtime::api::ServiceIdentity {
-            service_id: linux_abi::IPC_SERVICE_NETD,
-            epoch: super::super::ipc_ops::service_endpoint_epoch(linux_abi::IPC_SERVICE_NETD)
-                .ok_or(LINUX_ENOSYS)?,
-        },
-        channel: kernel_ipc_runtime::api::ChannelIdentity {
-            channel_id: socket.channel_id(),
-            generation: socket.channel_id(),
-            receiver_side,
-        },
-        stream_start: stream.start(),
-        stream_end: stream.end(),
-        intended_receiver: None,
-        receiver_open_description: 0,
-    })
 }
 
 fn copy_current_payload(request: &mut NetdIpcRequest, ptr: u64, len: u64) -> Result<(), i64> {
@@ -2300,20 +1900,19 @@ fn copy_current_payload(request: &mut NetdIpcRequest, ptr: u64, len: u64) -> Res
 fn consume_netd_response_payload(
     request: &NetdIpcRequest,
     response: &NetdIpcResponse,
-    receive_context: Option<(u64, u64, u8, u64)>,
     socket: Option<&SocketSnapshot>,
 ) -> Result<(), i64> {
     let payload_len = response.payload_len as usize;
     if payload_len > NETD_IPC_PAYLOAD_CAPACITY {
         return Err(LINUX_EINVAL);
     }
-    if socket.is_some_and(|s| s.is_ipv6_datagram() || s.is_unix_dgram())
+    if socket.is_some_and(SocketSnapshot::is_ipv6_datagram)
         && matches!(
             request.op,
             SYSCALL_OFFLOAD_OP_LINUX_RECVFROM | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
         )
     {
-        return consume_netd_msg_dgram_receive(request, response, receive_context);
+        return consume_netd_msg_dgram_receive(request, response);
     }
     if socket.is_some_and(SocketSnapshot::is_datagram)
         && matches!(request.op, SYSCALL_OFFLOAD_OP_LINUX_RECVFROM | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG)
@@ -2373,7 +1972,7 @@ fn consume_netd_response_payload(
             } else {
                 response.value as usize == data_len
             };
-            if end > payload_len || !value_matches {
+            if end > payload_len || !value_matches || control_len != 0 {
                 return Err(LINUX_EINVAL);
             }
             let iovecs = read_current_iovecs_payload(header.msg_iov, header.msg_iovlen)?;
@@ -2389,31 +1988,15 @@ fn consume_netd_response_payload(
             } else {
                 header.msg_namelen = 0;
             }
-            let (control_written, control_flags, prepared) = match receive_context {
-                Some(receive_context) => write_current_control_payload(
-                    header.msg_control,
-                    header.msg_controllen,
-                    &response.payload[control_start..end],
-                    receive_context,
-                    request.arg2 & linux_abi::MSG_CMSG_CLOEXEC != 0,
-                )?,
-                // Internet sockets have no receive stream context and never
-                // carry ancillary data back.
-                None if control_len == 0 => (0, 0, None),
-                None => return Err(LINUX_ESTALE),
-            };
-            header.msg_controllen = control_written as u64;
-            header.msg_flags = msg_flags | control_flags;
+            header.msg_controllen = 0;
+            header.msg_flags = msg_flags;
             usermem::write_current_user_struct(request.arg1, &header)
                 .map_err(address_space_error_to_linux_errno)?;
-            if let Some(prepared) = prepared {
-                prepared.commit()?;
-            }
             Ok(())
         }
-        // Prepared socket publication copied accept/socketpair outputs before
+        // Prepared socket publication copied accept outputs before
         // committing the invisible descriptor reservations. Never copy twice.
-        SYSCALL_OFFLOAD_OP_LINUX_ACCEPT | SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR => Ok(()),
+        SYSCALL_OFFLOAD_OP_LINUX_ACCEPT => Ok(()),
         SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME
         | SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME => write_current_sockaddr_payload(
             request.arg1,
@@ -2443,37 +2026,13 @@ fn read_optional_user_sockaddr(ptr: u64, len: u64) -> Result<Vec<u8>, i64> {
     Ok(addr)
 }
 
-fn control_has_scm_rights(control: &[u8]) -> Result<bool, i64> {
-    let mut offset = 0usize;
-    while offset + core::mem::size_of::<linux_abi::LinuxCmsghdr>() <= control.len() {
-        let header = read_control_header(&control[offset..])?;
-        let cmsg_len = usize::try_from(header.cmsg_len).map_err(|_| LINUX_EINVAL)?;
-        if cmsg_len < core::mem::size_of::<linux_abi::LinuxCmsghdr>()
-            || offset.checked_add(cmsg_len).is_none_or(|end| end > control.len())
-        {
-            return Err(LINUX_EINVAL);
-        }
-        if header.cmsg_level == linux_abi::SOL_SOCKET as u32
-            && header.cmsg_type == linux_abi::SCM_RIGHTS as u32
-        {
-            return Ok(true);
-        }
-        offset = next_control_offset(control.len(), offset, cmsg_len)?;
-    }
-    if offset != control.len() {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(false)
-}
-
 fn populate_netd_msg_dgram_send(
     request: &mut NetdIpcRequest,
-    pending_transfers: &mut PendingNetdTransfers,
     socket: Option<&SocketSnapshot>,
 ) -> Result<(), i64> {
     use rustos_user_abi::syscall::netd_message;
 
-    let (bytes, control, address) = if request.op == SYSCALL_OFFLOAD_OP_LINUX_SENDTO {
+    let (bytes, address) = if request.op == SYSCALL_OFFLOAD_OP_LINUX_SENDTO {
         let addr = read_optional_user_sockaddr(request.arg4, request.arg5)?;
         let total = usize::try_from(request.arg2).map_err(|_| LINUX_EINVAL)?;
         let cap = NETD_IPC_PAYLOAD_CAPACITY
@@ -2488,10 +2047,7 @@ fn populate_netd_msg_dgram_send(
             usermem::copy_from_current_user_exact(request.arg1, &mut bytes)
                 .map_err(address_space_error_to_linux_errno)?;
         }
-        if let Some(unix_sock) = current_unix_socket_handle(socket) {
-            pending_transfers.begin_send(&unix_sock, bytes.len())?;
-        }
-        (bytes, Vec::new(), addr)
+        (bytes, addr)
     } else {
         let header = usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(request.arg1)
             .map_err(address_space_error_to_linux_errno)?;
@@ -2502,38 +2058,16 @@ fn populate_netd_msg_dgram_send(
             return Err(LINUX_EMSGSIZE);
         }
         let bytes = read_iovec_prefix(&iovecs, total)?;
-        let control = if current_inet_socket(socket) {
-            if header.msg_controllen != 0 {
-                return Err(LINUX_EOPNOTSUPP);
-            }
-            Vec::new()
-        } else {
-            let unix_sock = current_unix_socket_handle(socket).ok_or(LINUX_ENOTSOCK)?;
-            if header.msg_controllen == 0 {
-                pending_transfers.begin_send(&unix_sock, bytes.len())?;
-                Vec::new()
-            } else if unix_sock.channel_id() == 0 {
-                let raw_control =
-                    read_current_control_bytes(header.msg_control, header.msg_controllen)?;
-                if control_has_scm_rights(&raw_control)? {
-                    return Err(LINUX_EOPNOTSUPP);
-                }
-                raw_control
-            } else {
-                pending_transfers.begin_send(&unix_sock, bytes.len())?;
-                let raw_control =
-                    read_current_control_bytes(header.msg_control, header.msg_controllen)?;
-                let context = send_transfer_context(&unix_sock, pending_transfers, bytes.len())?;
-                let encoded = encode_transfer_control_payload(&raw_control, context)?;
-                pending_transfers.extend(encoded.descriptors.as_slice());
-                pending_transfers.extend_tickets(encoded.tickets.as_slice());
-                encoded.bytes
-            }
-        };
+        if !current_inet_socket(socket) {
+            return Err(LINUX_ENOTSOCK);
+        }
+        if header.msg_controllen != 0 {
+            return Err(LINUX_EOPNOTSUPP);
+        }
         request.arg4 = header.msg_controllen;
-        (bytes, control, addr)
+        (bytes, addr)
     };
-    let len = netd_message::encode(&mut request.payload, &bytes, &control, 0, &address)
+    let len = netd_message::encode(&mut request.payload, &bytes, &[], 0, &address)
         .ok_or(LINUX_EMSGSIZE)?;
     request.payload_len = len as u32;
     Ok(())
@@ -2542,7 +2076,6 @@ fn populate_netd_msg_dgram_send(
 fn consume_netd_msg_dgram_receive(
     request: &NetdIpcRequest,
     response: &NetdIpcResponse,
-    receive_context: Option<(u64, u64, u8, u64)>,
 ) -> Result<(), i64> {
     let payload_len = response.payload_len as usize;
     let message = rustos_user_abi::syscall::netd_message::decode(&response.payload[..payload_len])
@@ -2579,49 +2112,20 @@ fn consume_netd_msg_dgram_receive(
     } else {
         header.msg_namelen = 0;
     }
-    let (control_written, control_flags, prepared) = if message.control.is_empty() {
-        (0, 0, None)
-    } else if let Some(ctx) = receive_context {
-        write_current_control_payload(
-            header.msg_control,
-            header.msg_controllen,
-            message.control,
-            ctx,
-            request.arg2 & linux_abi::MSG_CMSG_CLOEXEC != 0,
-        )?
-    } else {
-        if control_has_scm_rights(message.control)? {
-            return Err(LINUX_ESTALE);
-        }
-        let cap = usize::try_from(header.msg_controllen).map_err(|_| LINUX_EINVAL)?;
-        if header.msg_control == 0 || cap < message.control.len() {
-            (0, linux_abi::MSG_CTRUNC as u32, None)
-        } else {
-            usermem::write_current_user_bytes(header.msg_control, message.control)
-                .map_err(address_space_error_to_linux_errno)?;
-            (message.control.len(), 0, None)
-        }
-    };
-    header.msg_controllen = control_written as u64;
-    header.msg_flags = message.flags | control_flags;
+    if !message.control.is_empty() {
+        return Err(LINUX_ESTALE);
+    }
+    header.msg_controllen = 0;
+    header.msg_flags = message.flags;
     usermem::write_current_user_struct(request.arg1, &header)
         .map_err(address_space_error_to_linux_errno)?;
-    if let Some(prepared) = prepared {
-        prepared.commit()?;
-    }
     Ok(())
 }
 
 pub(super) fn consume_netd_release_payload(response: &mut NetdIpcResponse) -> Result<(), i64> {
-    let release_len = response.reserved0 as usize;
-    if release_len == 0 {
-        return Ok(());
+    if response.reserved0 != 0 {
+        return Err(LINUX_EINVAL);
     }
-    let payload_len = response.payload_len as usize;
-    let visible_len = payload_len.checked_sub(release_len).ok_or(LINUX_EINVAL)?;
-    drop_encoded_transfer_descriptors(&response.payload[visible_len..payload_len])?;
-    response.payload_len = visible_len as u32;
-    response.reserved0 = 0;
     Ok(())
 }
 
@@ -2640,7 +2144,9 @@ fn sendmsg_data_capacity(control_len: usize) -> Result<usize, i64> {
 fn read_current_iovec_payload(iov_ptr: u64, iov_len: u64) -> Result<Vec<u8>, i64> {
     let iovecs = read_current_iovecs_payload(iov_ptr, iov_len)?;
     let total = iovec_payload_total_len(&iovecs)?;
-    if total > NETD_IPC_PAYLOAD_CAPACITY { return Err(LINUX_EMSGSIZE); }
+    if total > NETD_IPC_PAYLOAD_CAPACITY {
+        return Err(LINUX_EMSGSIZE);
+    }
     read_iovec_prefix(&iovecs, total)
 }
 
@@ -2706,403 +2212,6 @@ fn write_current_iovec_payload(iovecs: &[linux_abi::LinuxIovec], bytes: &[u8]) -
         written += chunk_len;
     }
     Ok(())
-}
-
-fn write_current_control_payload(
-    control_ptr: u64,
-    control_capacity: u64,
-    control: &[u8],
-    receive_context: (u64, u64, u8, u64),
-    cloexec: bool,
-) -> Result<
-    (
-        usize,
-        u32,
-        Option<super::super::ipc_ops::PreparedTransferInstall>,
-    ),
-    i64,
-> {
-    if control.is_empty() {
-        return Ok((0, 0, None));
-    }
-    let decoded_len = decoded_transfer_control_len(control)?;
-    let capacity = usize::try_from(control_capacity).map_err(|_| LINUX_EINVAL)?;
-    if control_ptr == 0 || capacity == 0 {
-        drop_encoded_transfer_descriptors(control)?;
-        return Ok((0, linux_abi::MSG_CTRUNC as u32, None));
-    }
-    if capacity < decoded_len {
-        drop_encoded_transfer_descriptors(control)?;
-        return Ok((0, linux_abi::MSG_CTRUNC as u32, None));
-    }
-    let (control, prepared) = decode_transfer_control_payload(control, receive_context, cloexec)?;
-    usermem::write_current_user_bytes(control_ptr, control.as_slice())
-        .map_err(address_space_error_to_linux_errno)?;
-    Ok((control.len(), 0, prepared))
-}
-
-#[derive(Default)]
-struct EncodedControlPayload {
-    bytes: Vec<u8>,
-    descriptors: Vec<kernel_ipc_runtime::api::KernelTransferredHandle>,
-    tickets: Vec<kernel_ipc_runtime::api::KernelTransferTicket>,
-}
-
-fn read_current_control_bytes(control_ptr: u64, control_len: u64) -> Result<Vec<u8>, i64> {
-    let control_len = usize::try_from(control_len).map_err(|_| LINUX_EINVAL)?;
-    if control_ptr == 0 || control_len == 0 {
-        return Ok(Vec::new());
-    }
-    if control_len > NETD_IPC_PAYLOAD_CAPACITY {
-        return Err(LINUX_EINVAL);
-    }
-    let mut control = alloc::vec![0_u8; control_len];
-    usermem::copy_from_current_user_exact(control_ptr, &mut control)
-        .map_err(address_space_error_to_linux_errno)?;
-    Ok(control)
-}
-
-fn encode_transfer_control_payload(
-    control: &[u8],
-    context: kernel_ipc_runtime::api::TransferContext,
-) -> Result<EncodedControlPayload, i64> {
-    let mut all_descriptors = Vec::new();
-    let skeleton = rewrite_scm_rights_control(control, |fd_bytes| {
-        if fd_bytes.len() % core::mem::size_of::<i32>() != 0 {
-            return Err(LINUX_EINVAL);
-        }
-        let mut fds = Vec::with_capacity(fd_bytes.len() / core::mem::size_of::<i32>());
-        for chunk in fd_bytes.chunks_exact(core::mem::size_of::<i32>()) {
-            fds.push(i32::from_ne_bytes(
-                chunk.try_into().map_err(|_| LINUX_EINVAL)?,
-            ));
-        }
-        let descriptors = super::super::ipc_ops::export_current_fds_for_transfer(fds.as_slice())?;
-        let placeholder = alloc::vec![0_u8; descriptors.len() * TRANSFER_TICKET_WIRE_BYTES];
-        all_descriptors.extend_from_slice(descriptors.as_slice());
-        Ok(placeholder)
-    });
-    let skeleton = match skeleton {
-        Ok(bytes) => bytes,
-        Err(errno) => {
-            super::super::ipc_ops::drop_transfer_descriptors(all_descriptors.as_slice());
-            return Err(errno);
-        }
-    };
-    let tickets = if all_descriptors.is_empty() {
-        Vec::new()
-    } else {
-        match super::super::ipc_ops::transfer_tickets_for_descriptors(
-            all_descriptors.as_slice(),
-            context,
-        ) {
-            Ok(tickets) => tickets,
-            Err(errno) => {
-                super::super::ipc_ops::drop_transfer_descriptors(all_descriptors.as_slice());
-                return Err(errno);
-            }
-        }
-    };
-    let mut cursor = 0usize;
-    let bytes = rewrite_scm_rights_control(skeleton.as_slice(), |placeholder| {
-        let count = placeholder.len() / TRANSFER_TICKET_WIRE_BYTES;
-        let end = cursor.checked_add(count).ok_or(LINUX_EINVAL)?;
-        let encoded = encode_transfer_tickets(tickets.get(cursor..end).ok_or(LINUX_EINVAL)?)?;
-        cursor = end;
-        Ok(encoded)
-    });
-    let bytes = match bytes {
-        Ok(bytes) => bytes,
-        Err(errno) => {
-            super::super::ipc_ops::drop_transfer_descriptors(all_descriptors.as_slice());
-            return Err(errno);
-        }
-    };
-    if cursor != tickets.len() {
-        super::super::ipc_ops::drop_transfer_descriptors(all_descriptors.as_slice());
-        return Err(LINUX_EINVAL);
-    }
-    Ok(EncodedControlPayload {
-        bytes,
-        descriptors: all_descriptors,
-        tickets,
-    })
-}
-
-fn decode_transfer_control_payload(
-    control: &[u8],
-    receive_context: (u64, u64, u8, u64),
-    cloexec: bool,
-) -> Result<
-    (
-        Vec<u8>,
-        Option<super::super::ipc_ops::PreparedTransferInstall>,
-    ),
-    i64,
-> {
-    let mut tickets = Vec::new();
-    let mut counts = Vec::new();
-    rewrite_scm_rights_control(control, |ticket_bytes| {
-        if !ticket_bytes
-            .len()
-            .is_multiple_of(TRANSFER_TICKET_WIRE_BYTES)
-        {
-            return Err(LINUX_EINVAL);
-        }
-        let count = ticket_bytes.len() / TRANSFER_TICKET_WIRE_BYTES;
-        counts.push(count);
-        for chunk in ticket_bytes.chunks_exact(TRANSFER_TICKET_WIRE_BYTES) {
-            tickets.push(read_transfer_ticket(chunk)?);
-        }
-        Ok(alloc::vec![0_u8; count * core::mem::size_of::<i32>()])
-    })?;
-    if tickets.is_empty() {
-        return Ok((control.to_vec(), None));
-    }
-    let snapshot = multitask::current_user_snapshot().ok_or(LINUX_ESRCH)?;
-    let (stream_pos, channel_id, channel_side, receiver_open_description) = receive_context;
-    let prepared = super::super::ipc_ops::prepare_transfer_tickets_for_current_process(
-        tickets.as_slice(),
-        kernel_ipc_runtime::api::ProcessIdentity {
-            pid: snapshot.process_id(),
-            generation: snapshot.process_generation(),
-        },
-        kernel_ipc_runtime::api::ServiceIdentity {
-            service_id: linux_abi::IPC_SERVICE_NETD,
-            epoch: super::super::ipc_ops::service_endpoint_epoch(linux_abi::IPC_SERVICE_NETD)
-                .ok_or(LINUX_ENOSYS)?,
-        },
-        kernel_ipc_runtime::api::ChannelIdentity {
-            channel_id,
-            generation: channel_id,
-            receiver_side: channel_side,
-        },
-        stream_pos,
-        receiver_open_description,
-    )?;
-    // Received descriptors carry exactly the receiver's `MSG_CMSG_CLOEXEC`
-    // choice, never the sender's own close-on-exec state.
-    let mut prepared = prepared;
-    prepared.set_close_on_exec(cloexec)?;
-    let fds = prepared.fds()?;
-    let mut record = 0usize;
-    let mut fd_offset = 0usize;
-    let bytes = rewrite_scm_rights_control(control, |_ticket_bytes| {
-        let count = *counts.get(record).ok_or(LINUX_EINVAL)?;
-        record += 1;
-        let end = fd_offset.checked_add(count).ok_or(LINUX_EINVAL)?;
-        let fd_slice = fds.get(fd_offset..end).ok_or(LINUX_EINVAL)?;
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                fd_slice.as_ptr().cast::<u8>(),
-                fd_slice.len() * core::mem::size_of::<i32>(),
-            )
-        };
-        fd_offset = end;
-        Ok(bytes.to_vec())
-    })?;
-    if record != counts.len() || fd_offset != fds.len() {
-        return Err(LINUX_EINVAL);
-    }
-    Ok((bytes, Some(prepared)))
-}
-
-fn decoded_transfer_control_len(control: &[u8]) -> Result<usize, i64> {
-    let mut total = 0usize;
-    let mut offset = 0usize;
-    while offset + core::mem::size_of::<linux_abi::LinuxCmsghdr>() <= control.len() {
-        let header = read_control_header(&control[offset..])?;
-        let cmsg_len = usize::try_from(header.cmsg_len).map_err(|_| LINUX_EINVAL)?;
-        if cmsg_len < core::mem::size_of::<linux_abi::LinuxCmsghdr>()
-            || offset.checked_add(cmsg_len).is_none_or(|end| end > control.len())
-        {
-            return Err(LINUX_EINVAL);
-        }
-        let next = next_control_offset(control.len(), offset, cmsg_len)?;
-        let data_len = cmsg_len - core::mem::size_of::<linux_abi::LinuxCmsghdr>();
-        let visible_len = if header.cmsg_level == linux_abi::SOL_SOCKET as u32
-            && header.cmsg_type == linux_abi::SCM_RIGHTS as u32
-        {
-            if !data_len.is_multiple_of(TRANSFER_TICKET_WIRE_BYTES) {
-                return Err(LINUX_EINVAL);
-            }
-            let fd_bytes = (data_len / TRANSFER_TICKET_WIRE_BYTES)
-                .checked_mul(core::mem::size_of::<i32>())
-                .ok_or(LINUX_EINVAL)?;
-            core::mem::size_of::<linux_abi::LinuxCmsghdr>()
-                .checked_add(fd_bytes)
-                .ok_or(LINUX_EINVAL)?
-        } else {
-            cmsg_len
-        };
-        total = total
-            .checked_add(cmsg_align(visible_len))
-            .ok_or(LINUX_EINVAL)?;
-        offset = next;
-    }
-    if offset != control.len() {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(total)
-}
-
-fn drop_encoded_transfer_descriptors(control: &[u8]) -> Result<(), i64> {
-    let tickets=decode_transfer_release_tickets(control)?;
-    super::super::ipc_ops::drop_transfer_tickets(tickets.as_slice());
-    Ok(())
-}
-
-pub(in crate::user::syscall::linux) fn decode_transfer_release_tickets(
-    control:&[u8],
-)->Result<Vec<kernel_ipc_runtime::api::KernelTransferTicket>,i64> {
-    let mut tickets = Vec::new();
-    let mut offset = 0usize;
-    while offset + core::mem::size_of::<linux_abi::LinuxCmsghdr>() <= control.len() {
-        let header = read_control_header(&control[offset..])?;
-        let cmsg_len = usize::try_from(header.cmsg_len).map_err(|_| LINUX_EINVAL)?;
-        if cmsg_len < core::mem::size_of::<linux_abi::LinuxCmsghdr>()
-            || offset.checked_add(cmsg_len).is_none_or(|end| end > control.len())
-        {
-            return Err(LINUX_EINVAL);
-        }
-        let next = next_control_offset(control.len(), offset, cmsg_len)?;
-        if header.cmsg_level == linux_abi::SOL_SOCKET as u32
-            && header.cmsg_type == linux_abi::SCM_RIGHTS as u32
-        {
-            let data_start = offset + core::mem::size_of::<linux_abi::LinuxCmsghdr>();
-            let data = &control[data_start..offset + cmsg_len];
-            if !data.len().is_multiple_of(TRANSFER_TICKET_WIRE_BYTES) {
-                return Err(LINUX_EINVAL);
-            }
-            for chunk in data.chunks_exact(TRANSFER_TICKET_WIRE_BYTES) {
-                tickets.push(read_transfer_ticket(chunk)?);
-            }
-        }
-        offset = next;
-    }
-    if offset != control.len() {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(tickets)
-}
-
-fn rewrite_scm_rights_control<F>(control: &[u8], mut rewrite: F) -> Result<Vec<u8>, i64>
-where
-    F: FnMut(&[u8]) -> Result<Vec<u8>, i64>,
-{
-    let mut out = Vec::with_capacity(control.len());
-    let mut offset = 0usize;
-    while offset + core::mem::size_of::<linux_abi::LinuxCmsghdr>() <= control.len() {
-        let header = read_control_header(&control[offset..])?;
-        let cmsg_len = usize::try_from(header.cmsg_len).map_err(|_| LINUX_EINVAL)?;
-        if cmsg_len < core::mem::size_of::<linux_abi::LinuxCmsghdr>()
-            || offset.checked_add(cmsg_len).is_none_or(|end| end > control.len())
-        {
-            return Err(LINUX_EINVAL);
-        }
-        let next = next_control_offset(control.len(), offset, cmsg_len)?;
-        if header.cmsg_level == linux_abi::SOL_SOCKET as u32
-            && header.cmsg_type == linux_abi::SCM_RIGHTS as u32
-        {
-            let data_start = offset + core::mem::size_of::<linux_abi::LinuxCmsghdr>();
-            let rewritten = rewrite(&control[data_start..offset + cmsg_len])?;
-            let new_len = core::mem::size_of::<linux_abi::LinuxCmsghdr>()
-                .checked_add(rewritten.len())
-                .ok_or(LINUX_EINVAL)?;
-            let mut new_header = header;
-            new_header.cmsg_len = new_len as u64;
-            let start = out.len();
-            out.resize(start + cmsg_align(new_len), 0);
-            write_control_header(
-                &mut out[start..start + core::mem::size_of::<linux_abi::LinuxCmsghdr>()],
-                new_header,
-            );
-            out[start + core::mem::size_of::<linux_abi::LinuxCmsghdr>()..start + new_len]
-                .copy_from_slice(rewritten.as_slice());
-        } else {
-            out.extend_from_slice(&control[offset..next]);
-        }
-        offset = next;
-    }
-    if offset != control.len() {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(out)
-}
-
-fn read_control_header(bytes: &[u8]) -> Result<linux_abi::LinuxCmsghdr, i64> {
-    if bytes.len() < core::mem::size_of::<linux_abi::LinuxCmsghdr>() {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(linux_abi::LinuxCmsghdr {
-        cmsg_len: u64::from_ne_bytes(bytes[0..8].try_into().map_err(|_| LINUX_EINVAL)?),
-        cmsg_level: u32::from_ne_bytes(bytes[8..12].try_into().map_err(|_| LINUX_EINVAL)?),
-        cmsg_type: u32::from_ne_bytes(bytes[12..16].try_into().map_err(|_| LINUX_EINVAL)?),
-    })
-}
-
-fn write_control_header(dest: &mut [u8], header: linux_abi::LinuxCmsghdr) {
-    dest[0..8].copy_from_slice(&header.cmsg_len.to_ne_bytes());
-    dest[8..12].copy_from_slice(&header.cmsg_level.to_ne_bytes());
-    dest[12..16].copy_from_slice(&header.cmsg_type.to_ne_bytes());
-}
-
-const TRANSFER_TICKET_WIRE_BYTES: usize = rustos_user_abi::syscall::IPC_TRANSFER_TICKET_WIRE_BYTES;
-
-fn encode_transfer_tickets(
-    tickets: &[kernel_ipc_runtime::api::KernelTransferTicket],
-) -> Result<Vec<u8>, i64> {
-    let byte_len = tickets
-        .len()
-        .checked_mul(TRANSFER_TICKET_WIRE_BYTES)
-        .ok_or(LINUX_EINVAL)?;
-    let mut bytes = Vec::with_capacity(byte_len);
-    for ticket in tickets {
-        let wire = rustos_user_abi::syscall::IpcTransferTicketWire::new(
-            ticket.transfer_id(),
-            ticket.nonce(),
-            ticket.batch_generation(),
-        )
-        .ok_or(LINUX_EINVAL)?;
-        bytes.extend_from_slice(&wire.encode());
-    }
-    Ok(bytes)
-}
-
-fn read_transfer_ticket(
-    bytes: &[u8],
-) -> Result<kernel_ipc_runtime::api::KernelTransferTicket, i64> {
-    let wire =
-        rustos_user_abi::syscall::IpcTransferTicketWire::decode(bytes).ok_or(LINUX_EINVAL)?;
-    kernel_ipc_runtime::api::KernelTransferTicket::new(
-        wire.transfer_id(),
-        wire.nonce(),
-        wire.batch_generation(),
-    )
-    .ok_or(LINUX_EINVAL)
-}
-
-fn next_control_offset(total_len: usize, offset: usize, cmsg_len: usize) -> Result<usize, i64> {
-    let aligned_next = offset
-        .checked_add(cmsg_align(cmsg_len))
-        .ok_or(LINUX_EINVAL)?;
-    let unaligned_next = offset.checked_add(cmsg_len).ok_or(LINUX_EINVAL)?;
-    let next = if aligned_next <= total_len {
-        aligned_next
-    } else if unaligned_next == total_len {
-        unaligned_next
-    } else {
-        return Err(LINUX_EINVAL);
-    };
-    if next <= offset {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(next)
-}
-
-fn cmsg_align(len: usize) -> usize {
-    let align = core::mem::size_of::<usize>();
-    (len + align - 1) & !(align - 1)
 }
 
 // Netlink currently produces only unicast replies from the kernel port.

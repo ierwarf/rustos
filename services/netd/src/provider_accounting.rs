@@ -10,7 +10,7 @@
 //! - **Concurrency:** one bounded custody book behind a mutex that never crosses rootd IPC; charges run only on the lifecycle pool.
 //! - **Failure:** a lost, denied or malformed charge cancels by its original nonce; a failed refund rotates and keeps its slot; a full book denies new charges.
 //! - **Forbidden:** no lock held across rootd IPC, no second charge identity for one token, no refund dropped on error.
-//! - **Evidence:** the accounting cases in `tests/hardening_tests.rs` and `tests/unix_socket_lifecycle_tests.rs`.
+//! - **Evidence:** the accounting cases in `tests/hardening_tests.rs` and this module's tests.
 use rustos_component_model::provider_wire::Frame;
 use rustos_svc_runtime::provider_client::{self, Error, ProviderClient, Receipt, State};
 use rustos_user_abi::syscall::IPC_SERVICE_NETD;
@@ -307,7 +307,7 @@ mod tests {
     }
     #[test]
     fn delayed_charge_and_rejected_reply_never_leave_an_unowned_socket_or_charge() {
-        use crate::{retire_unix_socket, settle_socket_publication_at, NetState, NetdIpcRequest};
+        use crate::{retire_netlink_socket, settle_socket_publication_at, NetState, NetdIpcRequest};
         use rustos_component_model::provider_wire::Phase;
         for (now, bind_error) in [(100, libc::EPIPE), (99, libc::EPIPE), (99, 0)] {
             let mut book = Accounting::new(ProviderClient::new(3, 12, 7).unwrap());
@@ -327,8 +327,8 @@ mod tests {
             .unwrap();
             let mut state = NetState::new();
             state
-                .sockets
-                .insert(token, crate::local_socket_poll_tests::connected_socket(0));
+                .netlink_sockets
+                .insert(token, crate::netlink_tests::netlink_socket(libc::SOCK_RAW as u64));
             let binds = std::cell::Cell::new(0);
             let result = settle_socket_publication_at(
                 &NetdIpcRequest {
@@ -346,7 +346,7 @@ mod tests {
                     }
                 },
                 |token| {
-                    retire_unix_socket(&mut state, token);
+                    retire_netlink_socket(&mut state, token);
                     book.retire(token);
                 },
             );
@@ -355,7 +355,7 @@ mod tests {
                 assert_eq!(result, Ok(()));
                 // Bound reply then abandoned: kernel owns the initial ref and
                 // its deferred transfer-drop CLOSE retires exactly that ref.
-                retire_unix_socket(&mut state, token);
+                retire_netlink_socket(&mut state, token);
                 book.retire(token);
             } else {
                 assert!(result.is_err())

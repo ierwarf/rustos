@@ -1706,19 +1706,6 @@ fn choose_free_region_with_conflicts(
     }
 }
 
-fn find_free_region(state: &MmPolicyState, requested: u64, len: u64) -> Result<u64, i32> {
-    let (lower_bound, hint) = free_region_bounds(state, requested)?;
-    next_fit_with_wrap(
-        &state.vmas,
-        lower_bound,
-        state.user_range_end,
-        hint,
-        len,
-        PAGE_SIZE,
-    )
-    .ok_or(errno::ENOMEM)
-}
-
 fn upsert_heap_vma(state: &mut MmPolicyState) {
     if state.brk_start == 0 || state.brk_mapped_end <= state.brk_start {
         return;
@@ -1761,6 +1748,19 @@ fn set_vma_prot(state: &mut MmPolicyState, start: u64, end: u64, prot: u64) {
 
 #[cfg(test)]
 mod tests {
+    fn find_free_region(state: &MmPolicyState, requested: u64, len: u64) -> Result<u64, i32> {
+        let (lower_bound, hint) = free_region_bounds(state, requested)?;
+        next_fit_with_wrap(
+            &state.vmas,
+            lower_bound,
+            state.user_range_end,
+            hint,
+            len,
+            PAGE_SIZE,
+        )
+        .ok_or(errno::ENOMEM)
+    }
+
     use alloc::vec;
     use alloc::vec::Vec;
 

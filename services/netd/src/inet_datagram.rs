@@ -62,24 +62,6 @@ pub(super) fn add_socket(stack: &mut InetStack, type_: u64, protocol: u64) -> In
     }
 }
 
-/// Pure classifier: reads under the raw mutex so the guard's drop does not run
-/// a readiness sweep for a lookup that mutated nothing (see `inet_socket_exists`).
-// TEST-HARNESS: compiled only for unit tests; not every helper has a caller there.
-#[cfg(test)]
-#[allow(dead_code)]
-pub(super) fn is_datagram(token: u64) -> bool {
-    match net_state().lock() {
-        Ok(state) => state
-            .inet_sockets
-            .get(&token)
-            .is_some_and(|s| s.transport.is_datagram()),
-        Err(_) => {
-            eprintln!("netd: state lock poisoned; exiting");
-            std::process::exit(101)
-        }
-    }
-}
-
 pub(super) struct ReceivedPacket {
     source: IpEndpoint,
     pub(super) bytes: Vec<u8>,
@@ -482,14 +464,6 @@ fn admit_unprivileged_udp_bind(port: u16) -> Result<(), i32> {
     }
 }
 
-// TEST-HARNESS: compiled only for unit tests; not every helper has a caller there.
-#[cfg(test)]
-#[allow(dead_code)]
-pub(super) fn bind(request: &NetdIpcRequest) -> i32 {
-    let mut state = lock_net_state();
-    bind_request_in_state(&mut state, request)
-}
-
 pub(super) fn bind_request_in_state(state: &mut NetState, request: &NetdIpcRequest) -> i32 {
     let Some(socket) = state.inet_sockets.get(&request.socket_token) else {
         return libc::EBADF;
@@ -530,14 +504,6 @@ fn unicast_destination(addr: IpAddress) -> bool {
         }
         IpAddress::Ipv6(addr) => !addr.is_unspecified() && !addr.is_multicast(),
     }
-}
-
-// TEST-HARNESS: compiled only for unit tests; not every helper has a caller there.
-#[cfg(test)]
-#[allow(dead_code)]
-pub(super) fn connect(request: &NetdIpcRequest) -> i32 {
-    let mut state = lock_net_state();
-    connect_in_state(&mut state, request)
 }
 
 pub(super) fn connect_in_state(state: &mut NetState, request: &NetdIpcRequest) -> i32 {
@@ -589,18 +555,6 @@ pub(super) fn connect_in_state(state: &mut NetState, request: &NetdIpcRequest) -
         .unwrap()
         .peer = Some(peer);
     0
-}
-
-// TEST-HARNESS: compiled only for unit tests; not every helper has a caller there.
-#[cfg(test)]
-#[allow(dead_code)]
-pub(super) fn socket_name(
-    request: &NetdIpcRequest,
-    response: &mut NetdIpcResponse,
-    peer: bool,
-) -> i32 {
-    let state = lock_net_state();
-    socket_name_in_state(&state, request, response, peer)
 }
 
 pub(super) fn socket_name_in_state(

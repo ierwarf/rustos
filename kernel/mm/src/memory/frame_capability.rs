@@ -392,6 +392,7 @@ impl FaultFramePool {
         }
     }
 
+    #[cfg(test)]
     fn observed_low_watermark(&self) -> Option<usize> {
         match self.low_watermark.load(Ordering::Relaxed) {
             usize::MAX => None,
@@ -564,21 +565,6 @@ impl FrameGrantTable {
 /// Wired fault frames left after the most recent reservation.
 pub fn pager_fault_reserve_depth() -> Option<usize> {
     FAULT_FRAME_POOL.observed_depth()
-}
-
-/// The lowest reserve depth any fault has observed this boot.
-///
-/// The progress condition for demand paging is that this stays above zero. A
-/// zero means a valid non-present fault was refused for want of a wired frame,
-/// which reaches the surface as an unexplained SIGSEGV several layers away
-/// rather than as pager pressure.
-pub fn pager_fault_reserve_low_watermark() -> Option<usize> {
-    FAULT_FRAME_POOL.observed_low_watermark()
-}
-
-/// Reservations refused because the wired reserve was empty.
-pub fn pager_fault_reserve_exhaustions() -> u64 {
-    FAULT_FRAME_POOL.exhaustions.load(Ordering::Relaxed)
 }
 
 static FRAME_GRANTS: FrameGrantTable = FrameGrantTable::new();
@@ -765,34 +751,10 @@ pub fn allocate_filled_frame(bytes: &[u8]) -> Option<PhysAddr> {
     Some(frame)
 }
 
-pub fn allocate_zeroed_frame_grant(
-    binding: FrameGrantBinding,
-    rights: u64,
-) -> Result<u64, FrameGrantError> {
-    let frame = phys::alloc_frame_user().ok_or(FrameGrantError::OutOfFrames)?;
-    // SAFETY: `alloc_frame` returns one live page below the direct-map ceiling;
-    // no handle is published until this exact page has been fully initialized.
-    unsafe {
-        ptr::write_bytes(
-            kernel_vm::higher_half_addr(frame.as_u64()) as *mut u8,
-            0,
-            FRAME_BYTES,
-        );
-    }
-    match FRAME_GRANTS.publish(frame.as_u64(), binding, rights, false) {
-        Ok(handle) => Ok(handle),
-        Err(error) => {
-            phys::free_frame(frame);
-            Err(error)
-        }
-    }
-}
-
 /// Mints one opaque grant from a pre-zeroed wired fault-frame reserve.
 ///
-/// This is the exception-safe counterpart of
-/// `allocate_zeroed_frame_grant`: it neither invokes the physical allocator
-/// nor takes a raw registry lock. Cancellation returns the frame to the same
+/// This is the exception-safe form of a zeroed grant: it neither invokes the
+/// physical allocator nor takes a raw registry lock. Cancellation returns the frame to the same
 /// bounded reserve; successful PTE adoption consumes it as ordinary process
 /// frame ownership.
 pub fn reserve_preallocated_zeroed_frame_grant(

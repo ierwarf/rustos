@@ -30,7 +30,7 @@ use kernel_ps::api::{
     UnixSocketHandle, UnixSocketType, UNIX_MAX_PATH_LEN, UNIX_MAX_SCM_RIGHTS,
 };
 use rustos_user_abi::syscall::{
-    VFS_IPC_OP_MKNOD, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_UNLINKAT, VFS_MKNOD_S_IFMT,
+    VFS_IPC_OP_ACCESS, VFS_IPC_OP_MKNOD, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_UNLINKAT, VFS_MKNOD_S_IFMT,
     VFS_MKNOD_S_IFSOCK, WAITSET_PROVIDER_KERNEL,
 };
 
@@ -322,9 +322,24 @@ fn vfs_stat_socket_inode(path: &str, follow_symlinks: bool) -> Result<(u64, u64)
     Ok((st_dev, st_ino))
 }
 
+/// `connect(2)` and datagram `sendto(2)` to a pathname socket need write
+/// permission on the socket file for the caller's effective identity; vfsd
+/// owns the permission policy, so ask it instead of deciding here.
+fn vfs_check_socket_write_access(path: &str) -> Result<(), i64> {
+    let mut request = new_vfs_request(VFS_IPC_OP_ACCESS);
+    request.flags = linux_abi::AT_EACCESS as u32;
+    request.arg0 = 0o2;
+    populate_vfs_path_base(&mut request, linux_abi::AT_FDCWD as u64, path)?;
+    let response = call_pinned_remote_vfs_request(&request)?;
+    ensure_vfs_status(&response)
+}
+
 fn vfs_create_socket_node(path: &str) -> Result<(u64, u64), i64> {
+    // The socket file's permission bits are `0777 & ~umask`, as for any other
+    // node `bind(2)` creates; the umask is syscalld policy.
+    let mode = 0o777 & !u64::from(super::super::syscalld_ops::query_umask()?);
     let mut request = new_vfs_request(VFS_IPC_OP_MKNOD);
-    request.arg0 = VFS_MKNOD_S_IFSOCK | 0o777;
+    request.arg0 = VFS_MKNOD_S_IFSOCK | mode;
     request.arg1 = 0;
     populate_vfs_path_base(&mut request, linux_abi::AT_FDCWD as u64, path)?;
     let response = call_pinned_remote_vfs_request(&request)?;
@@ -357,13 +372,8 @@ fn resolve_target_key(addr_ptr: u64, addrlen: u64) -> Result<UnixNamespaceKey, i
         ParsedUnixAddr::Unspec => Err(LINUX_EINVAL),
         ParsedUnixAddr::Abstract(name) => Ok(UnixNamespaceKey::Abstract(name)),
         ParsedUnixAddr::Pathname(path, _) => {
-            let (mount_id, node_id) = vfs_stat_socket_inode(&path, true).map_err(|e| {
-                if e == LINUX_ENOENT {
-                    LINUX_ENOENT
-                } else {
-                    e
-                }
-            })?;
+            let (mount_id, node_id) = vfs_stat_socket_inode(&path, true)?;
+            vfs_check_socket_write_access(&path)?;
             Ok(UnixNamespaceKey::Inode { mount_id, node_id })
         }
     }

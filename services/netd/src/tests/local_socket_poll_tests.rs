@@ -1,4 +1,5 @@
 use super::*;
+use crate::netlink_tests::{make_readable, netlink_socket};
 
 #[test]
 fn pending_slot_reservation_is_global_and_bounded() {
@@ -21,102 +22,51 @@ fn poisoned_deferred_queue_is_drained_for_fail_closed_replies() {
     assert!(queue.lock().unwrap().is_empty());
 }
 
-pub(super) fn connected_socket(peer: u64) -> UnixSocket {
-    UnixSocket {
-        kind: UnixSocketKind::Stream,
-        owner: Credentials::default(),
-        refs: 1,
-        options: SocketOptions::default(),
-        bound_path: None,
-        bound_inode: None,
-        local_path: None,
-        peer_path: None,
-        state: UnixSocketState::Connected(ConnectedState {
-            incoming: VecDeque::new(),
-            incoming_bytes: 0,
-            incoming_control_bytes: 0,
-            pending_listener: None,
-            channel_id: 1,
-            peer,
-            peer_closed: false,
-            peer_read_closed: false,
-            peer_write_closed: false,
-            peer_credentials: Credentials::default(),
-            recv_drain_handoff_armed: false,
-            recv_closed: false,
-            send_closed: false,
-        }),
-    }
-}
-
 #[test]
-fn unix_readiness_publication_targets_only_the_socket_and_its_peer() {
+fn netlink_readiness_publication_targets_only_the_socket_that_changed() {
     let first = 41_u64;
     let second = 42_u64;
     let unrelated = 43_u64;
     let mut state = NetState::new();
-    state.sockets.insert(first, connected_socket(second));
-    state.sockets.insert(second, connected_socket(first));
-    state.sockets.insert(unrelated, connected_socket(u64::MAX));
+    for token in [first, second, unrelated] {
+        state.netlink_sockets.insert(token, netlink_socket(libc::SOCK_RAW as u64));
+    }
     state.record_readiness_changes();
     state.readiness_publications.clear();
-    // Filling first's receive queue changes its own readability and second's
-    // writability, without touching or publishing an unrelated socket.
-    let UnixSocketState::Connected(connected) = &mut state.sockets.get_mut(&first).unwrap().state else { unreachable!() };
-    connected.incoming_bytes = SOCKET_BUFFER_CAPACITY;
+    // Queueing a reply on one socket changes only its own readability.
+    make_readable(&mut state, first);
     state.record_readiness_changes();
-    assert_eq!(state.readiness_publications.iter().map(|(token, _)| *token).collect::<Vec<_>>(), vec![first, second]);
+    assert_eq!(state.readiness_publications.iter().map(|(token, _)| *token).collect::<Vec<_>>(), vec![first]);
 }
 
 #[test]
-fn unix_poll_readiness_tracks_data_space_and_peer_close() {
+fn netlink_poll_readiness_tracks_queued_replies() {
     let mut state = NetState::new();
-    state.sockets.insert(1, connected_socket(2));
-    state.sockets.insert(2, connected_socket(1));
+    state.netlink_sockets.insert(1, netlink_socket(libc::SOCK_RAW as u64));
 
     assert_eq!(
-        unix_socket_revents(&state, 1, linux_abi::POLLIN as u32).unwrap(),
+        netlink_socket_revents(&state, 1, linux_abi::POLLIN as u32).unwrap(),
         0
     );
     assert_eq!(
-        unix_socket_revents(&state, 1, linux_abi::POLLOUT as u32).unwrap(),
+        netlink_socket_revents(&state, 1, linux_abi::POLLOUT as u32).unwrap(),
         linux_abi::POLLOUT as u32
     );
+    assert_eq!(netlink_socket_revents(&state, 2, linux_abi::POLLIN as u32), Err(libc::EBADF));
 
-    let UnixSocketState::Connected(connected) = &mut state.sockets.get_mut(&1).unwrap().state
-    else {
-        unreachable!();
-    };
-    connected.incoming_bytes = 1;
-    connected.incoming.push_back(UnixStreamSegment {
-        bytes: [1].into_iter().collect(),
-        control: Vec::new(),
-        ..Default::default()
-    });
+    make_readable(&mut state, 1);
     assert_eq!(
-        unix_socket_revents(&state, 1, linux_abi::POLLIN as u32).unwrap(),
+        netlink_socket_revents(&state, 1, linux_abi::POLLIN as u32).unwrap(),
         linux_abi::POLLIN as u32
-    );
-
-    let UnixSocketState::Connected(connected) = &mut state.sockets.get_mut(&1).unwrap().state
-    else {
-        unreachable!();
-    };
-    connected.peer_closed = true;
-    assert_ne!(
-        unix_socket_revents(&state, 1, linux_abi::POLLIN as u32).unwrap()
-            & linux_abi::POLLHUP as u32,
-        0
     );
 }
 
 #[test]
 fn single_socket_poll_returns_readiness_and_generation_together() {
-    let (first, second) = (0xba7c_1001_u64, 0xba7c_1002_u64);
+    let first = 0xba7c_1001_u64;
     let generation = {
         let mut state = lock_net_state();
-        state.sockets.insert(first, connected_socket(second));
-        state.sockets.insert(second, connected_socket(first));
+        state.netlink_sockets.insert(first, netlink_socket(libc::SOCK_RAW as u64));
         state.socket_readiness_generation(first)
     };
     let request = NetdIpcRequest {
@@ -130,8 +80,7 @@ fn single_socket_poll_returns_readiness_and_generation_together() {
     assert_eq!(response.payload_len, 8);
     assert_eq!(u64::from_le_bytes(response.payload[..8].try_into().unwrap()), generation);
     let mut state = lock_net_state();
-    state.sockets.remove(&first);
-    state.sockets.remove(&second);
+    state.netlink_sockets.remove(&first);
     state.readiness_generations.remove(&first);
 }
 
@@ -441,142 +390,6 @@ fn authenticated_provider_sleep_uses_the_same_request_end() {
     assert_eq!(sleep_for.get(), Duration::from_nanos(1_000));
 }
 
-fn install_segmented_test_socket(token: u64, segments: Vec<UnixStreamSegment>) {
-    let mut socket = connected_socket(token.wrapping_add(1));
-    let UnixSocketState::Connected(connected) = &mut socket.state else {
-        unreachable!();
-    };
-    connected.incoming_bytes = segments.iter().map(|segment| segment.bytes.len()).sum();
-    connected.incoming_control_bytes = segments.iter().map(|segment| cmsg_align(segment.control.len())).sum();
-    connected.incoming = segments.into_iter().collect();
-    let mut state=net_state().lock().unwrap();
-    state.unix_queued_bytes+=connected.incoming_bytes+connected.incoming_control_bytes;
-    state.sockets.insert(token, socket);
-}
-
-#[test]
-fn buffered_read_handles_wrapped_segments_and_partial_consumption() {
-    let token = u64::MAX - 912;
-    let mut bytes = VecDeque::with_capacity(8);
-    bytes.extend(0..8);
-    bytes.drain(..6);
-    bytes.extend(8..14);
-    assert!(!bytes.as_slices().1.is_empty());
-    install_segmented_test_socket(
-        token,
-        vec![UnixStreamSegment {
-            bytes,
-            control: vec![9, 8, 7, 6],
-            ..Default::default()
-        }],
-    );
-    let request = NetdIpcRequest {
-        socket_token: token,
-        ..NetdIpcRequest::default()
-    };
-    let mut first = [0; 5];
-    let received = recv_socket_bytes(&request, &mut first, true).unwrap();
-    assert_eq!(first, [6, 7, 8, 9, 10]);
-    assert_eq!(received.control, [9, 8, 7, 6]);
-    let mut rest = [0; 3];
-    let received = recv_socket_bytes(&request, &mut rest, true).unwrap();
-    assert_eq!(rest, [11, 12, 13]);
-    assert!(received.control.is_empty());
-    let socket = net_state().lock().unwrap().sockets.remove(&token).unwrap();
-    let UnixSocketState::Connected(connected) = socket.state else {
-        unreachable!();
-    };
-    assert_eq!(connected.incoming_bytes, 0);
-    assert_eq!(connected.incoming_control_bytes, 0);
-    assert!(connected.incoming.is_empty());
-}
-
-#[test]
-fn recvmsg_ancillary_stays_with_its_stream_segment() {
-    let token = u64::MAX - 910;
-    install_segmented_test_socket(
-        token,
-        vec![
-            UnixStreamSegment {
-                bytes: [1, 2].into_iter().collect(),
-                control: Vec::new(),
-                ..Default::default()
-            },
-            UnixStreamSegment {
-                bytes: [3, 4].into_iter().collect(),
-                control: vec![9, 8, 7, 6],
-                ..Default::default()
-            },
-        ],
-    );
-    let request = NetdIpcRequest {
-        socket_token: token,
-        ..NetdIpcRequest::default()
-    };
-    let mut first = [0_u8; 2];
-    let received = recv_socket_bytes(&request, &mut first, true).unwrap();
-    assert_eq!(first, [1, 2]);
-    assert!(received.control.is_empty());
-
-    let mut second = [0_u8; 2];
-    let received = recv_socket_bytes(&request, &mut second, true).unwrap();
-    assert_eq!(second, [3, 4]);
-    assert_eq!(received.control, vec![9, 8, 7, 6]);
-    net_state().lock().unwrap().sockets.remove(&token);
-}
-
-#[test]
-fn ordinary_read_discards_ancillary_exactly_once() {
-    let token = u64::MAX - 911;
-    install_segmented_test_socket(
-        token,
-        vec![UnixStreamSegment {
-            bytes: [5, 6].into_iter().collect(),
-            control: vec![4, 3, 2, 1],
-            ..Default::default()
-        }],
-    );
-    let request = NetdIpcRequest {
-        socket_token: token,
-        ..NetdIpcRequest::default()
-    };
-    let mut bytes = [0_u8; 2];
-    let received = recv_socket_bytes(&request, &mut bytes, false).unwrap();
-    assert_eq!(bytes, [5, 6]);
-    assert!(received.control.is_empty());
-    assert_eq!(received.discarded, vec![4, 3, 2, 1]);
-
-    let connected = net_state().lock().unwrap().sockets.remove(&token).unwrap();
-    let UnixSocketState::Connected(connected) = connected.state else {
-        unreachable!();
-    };
-    assert_eq!(connected.incoming_bytes, 0);
-    assert_eq!(connected.incoming_control_bytes, 0);
-    assert!(connected.incoming.is_empty());
-}
-
-#[test]
-fn unix_rdhup_follows_peer_write_shutdown_and_close() {
-    let mut state = NetState::new();
-    state.sockets.insert(1, connected_socket(2));
-    state.sockets.insert(2, connected_socket(1));
-    let rdhup = linux_abi::POLLRDHUP as u32;
-    assert_eq!(unix_socket_revents(&state, 1, rdhup).unwrap(), 0);
-
-    let UnixSocketState::Connected(connected) = &mut state.sockets.get_mut(&1).unwrap().state
-    else {
-        unreachable!();
-    };
-    connected.peer_write_closed = true;
-    assert_eq!(unix_socket_revents(&state, 1, rdhup).unwrap(), rdhup);
-    // RDHUP is reported only when it was asked for.
-    assert_eq!(
-        unix_socket_revents(&state, 1, linux_abi::POLLOUT as u32).unwrap()
-            & rdhup,
-        0
-    );
-}
-
 fn poll_batch_request(entries: &[(u64, u32)]) -> NetdIpcRequest {
     let mut request = NetdIpcRequest {
         op: NETD_IPC_OP_POLL_BATCH,
@@ -606,8 +419,8 @@ fn poll_batch_answers_every_socket_in_order_and_isolates_failures() {
     let (first, second, missing) = (0xba7c_0001_u64, 0xba7c_0002_u64, 0xba7c_0003_u64);
     {
         let mut state = lock_net_state();
-        state.sockets.insert(first, connected_socket(second));
-        state.sockets.insert(second, connected_socket(first));
+        state.netlink_sockets.insert(first, netlink_socket(libc::SOCK_RAW as u64));
+        state.netlink_sockets.insert(second, netlink_socket(libc::SOCK_RAW as u64));
     }
     let pollout = linux_abi::POLLOUT as u32;
     let request = poll_batch_request(&[(first, pollout), (missing, pollout), (second, pollout)]);
@@ -629,8 +442,7 @@ fn poll_batch_answers_every_socket_in_order_and_isolates_failures() {
     let before = poll_batch_result(&response, 2).0;
     {
         let mut state = lock_net_state();
-        let UnixSocketState::Connected(connected) = &mut state.sockets.get_mut(&first).unwrap().state else { unreachable!() };
-        connected.incoming_bytes = 1;
+        make_readable(&mut state, first);
     }
     let mut after = NetdIpcResponse::default();
     assert_eq!(handle_poll_batch(&request, &mut after), 0);
@@ -638,8 +450,8 @@ fn poll_batch_answers_every_socket_in_order_and_isolates_failures() {
     assert_eq!(poll_batch_result(&after, 2).0, before);
 
     let mut state = lock_net_state();
-    state.sockets.remove(&first);
-    state.sockets.remove(&second);
+    state.netlink_sockets.remove(&first);
+    state.netlink_sockets.remove(&second);
     state.readiness_generations.remove(&first);
     state.readiness_generations.remove(&second);
 }

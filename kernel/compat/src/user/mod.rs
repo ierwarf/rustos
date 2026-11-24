@@ -5,9 +5,6 @@ pub mod abi {
     pub use kernel_ps::api::abi::*;
 }
 pub mod console_host;
-pub mod epoll {
-    pub use kernel_ps::api::epoll::*;
-}
 pub mod handles {
     pub use kernel_ps::api::handles::*;
 }
@@ -20,9 +17,6 @@ pub mod memfd {
 pub mod process;
 pub mod process_state {
     pub use kernel_ps::api::process_state::*;
-}
-pub mod socket {
-    pub use kernel_ps::api::socket::*;
 }
 pub mod syscall;
 pub mod sysops;

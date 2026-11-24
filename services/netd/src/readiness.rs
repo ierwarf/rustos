@@ -81,7 +81,7 @@ impl<T> Deref for SocketTable<T> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Readiness {
-    Unix { events: u32, peer: Option<u64> },
+    Netlink { events: u32 },
     Inet(InetReadiness),
 }
 
@@ -122,8 +122,8 @@ impl NetState {
             .is_some_and(|stack| std::mem::take(&mut stack.readiness_dirty));
         let mut changed = std::mem::take(&mut self.readiness_changed_scratch);
         changed.clear();
-        if self.sockets.has_dirty() {
-            self.observe_unix(&mut changed);
+        if self.netlink_sockets.has_dirty() {
+            self.observe_netlink(&mut changed);
         }
         if stack_advanced || self.inet_sockets.has_dirty() {
             self.observe_inet(stack_advanced, &mut changed);
@@ -159,62 +159,21 @@ impl NetState {
         self.readiness_changed_scratch = changed;
     }
 
-    /// Ordinary Unix traffic visits only dirty Unix identities, never the
-    /// whole table.
-    fn observe_unix(&mut self, changed: &mut Vec<u64>) {
-        let mut dirty = std::mem::take(&mut self.sockets.dirty);
-        if core::mem::take(&mut self.sockets.all_dirty) {
-            dirty.extend(self.sockets.keys().copied());
+    /// Ordinary netlink traffic visits only dirty netlink identities, never
+    /// the whole table.
+    fn observe_netlink(&mut self, changed: &mut Vec<u64>) {
+        let mut dirty = std::mem::take(&mut self.netlink_sockets.dirty);
+        if core::mem::take(&mut self.netlink_sockets.all_dirty) {
+            dirty.extend(self.netlink_sockets.keys().copied());
         }
-        // Unix writability depends on the peer's receive capacity. Recheck
-        // both the old and current peer, including a just-retired endpoint.
-        let mut touched = std::mem::take(&mut self.unix_dirty_scratch);
-        touched.clear();
-        touched.extend(dirty.iter().copied());
-        for &token in &touched {
-            match self.sockets.get(&token) {
-                Some(UnixSocket {
-                    state: UnixSocketState::Connected(connected),
-                    ..
-                }) => {
-                    dirty.insert(connected.peer);
-                }
-                Some(UnixSocket {
-                    state: UnixSocketState::Dgram(dgram),
-                    ..
-                }) => {
-                    if let Some(peer) = dgram.peer {
-                        dirty.insert(peer);
-                    }
-                }
-                _ => {}
-            }
-            if let Some(Readiness::Unix {
-                peer: Some(peer), ..
-            }) = self.readiness_observations.get(&token)
-            {
-                dirty.insert(*peer);
-            }
-        }
-        touched.clear();
-        self.unix_dirty_scratch = touched;
         for token in dirty {
-            let after = if let Some(socket) = self.sockets.get(&token) {
-                const EVENTS: u32 =
-                    (linux_abi::POLLIN | linux_abi::POLLOUT | linux_abi::POLLRDHUP) as u32;
-                let peer = match &socket.state {
-                    UnixSocketState::Connected(connected) => Some(connected.peer),
-                    UnixSocketState::Dgram(dgram) => dgram.peer,
-                    _ => None,
-                };
-                Some(Readiness::Unix {
-                    events: unix_socket_revents_for(self, socket, EVENTS),
-                    peer,
-                })
-            } else {
-                // Retired: the identity is gone from both tables.
-                None
-            };
+            let after = self.netlink_sockets.get(&token).map(|socket| {
+                const EVENTS: u32 = linux_abi::POLLIN as u32 | linux_abi::POLLOUT as u32;
+                Readiness::Netlink {
+                    events: netlink_socket_revents_for(socket, EVENTS),
+                }
+            });
+            // `None`: retired, the identity is gone from both tables.
             if observe(&mut self.readiness_observations, token, after) {
                 changed.push(token);
             }

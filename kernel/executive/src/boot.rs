@@ -140,7 +140,7 @@ fn emergency_debugcon_bytes(bytes: &[u8]) {
 ///
 /// `boot_info_ptr` must name a readable, boot-protocol-validated [`BootInfo`]
 /// that remains valid through early kernel initialization.
-pub unsafe fn initialize_kernel(boot_info_ptr: *const BootInfo) {
+pub(crate) unsafe fn initialize_kernel(boot_info_ptr: *const BootInfo) {
     flow_info(1, "kernel initialize begin");
     // SAFETY: this function's contract requires a readable, validated
     // `BootInfo` that outlives early initialization.
@@ -441,7 +441,6 @@ pub unsafe fn initialize_kernel(boot_info_ptr: *const BootInfo) {
     announce_ready("Syscall", b"Syscall initialized.\r\n");
     initialize_application_processors();
 
-    let _ = boot_info;
     flow_info(2, "kernel initialize complete");
 }
 
@@ -727,18 +726,18 @@ extern "C" fn rustos_ap_entry(
     }
 }
 
-pub fn kernel_initialization_complete() -> bool {
+pub(crate) fn kernel_initialization_complete() -> bool {
     matches!(
         io_services::bootstrap_phase(),
         io_services::BootstrapPhase::KernelVfsReady | io_services::BootstrapPhase::UserspaceReady
     )
 }
 
-pub fn userspace_start_allowed() -> bool {
+pub(crate) fn userspace_start_allowed() -> bool {
     io_services::userspace_ready()
 }
 
-pub fn finalize_kernel_initialization() {
+pub(crate) fn finalize_kernel_initialization() {
     flow_info(10, "kernel finalize begin");
     boot_log!(debug::LogLevel::Info, 130, 0, "kernel finalize begin");
     boot_log!(debug::LogLevel::Debug, 131, 0, "vfs init begin");
@@ -775,7 +774,7 @@ pub fn finalize_kernel_initialization() {
     boot_log!(debug::LogLevel::Info, 136, 0, "init bootstrap task started");
 }
 
-pub fn bootstrap_init_process() {
+pub(crate) fn bootstrap_init_process() {
     debug::record_milestone(debug::LogCategory::Boot, "init-bootstrap-enter", 0, 0);
     if !userspace_start_allowed() {
         debug::record_milestone(debug::LogCategory::Boot, "init-bootstrap-blocked", 0, 0);
@@ -854,7 +853,7 @@ pub fn bootstrap_init_process() {
     io_services::console_write(b"Root process ready.\r\n");
 }
 
-pub fn run_nucleus_loop() -> ! {
+pub(crate) fn run_nucleus_loop() -> ! {
     flow_info(40, "kernel run loop entered");
     boot_log!(
         debug::LogLevel::Info,
@@ -870,7 +869,7 @@ pub fn run_nucleus_loop() -> ! {
     }
 }
 
-pub fn housekeeping_once() -> usize {
+pub(crate) fn housekeeping_once() -> usize {
     let mut work = 0;
 
     trace_service_phase("reap");

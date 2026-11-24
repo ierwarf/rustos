@@ -232,21 +232,6 @@ pub unsafe fn trigger_software_schedule_direct(resume: &DirectResume) -> ! {
     unsafe { ipc_wait_direct_schedule(resume) }
 }
 
-/// Enter the software scheduler while preserving an IF-enabled kernel
-/// continuation. This is the only safe direct-reschedule path from a live
-/// syscall body; callers must have enabled interrupts before entering it.
-pub fn trigger_software_schedule_interruptible() {
-    assert!(
-        interrupts::are_enabled(),
-        "interruptible software schedule requires IF=1"
-    );
-    // SAFETY: IF=1 was asserted above, so the trap preserves an interruptible
-    // kernel continuation; the leaf raises the software vector and returns.
-    unsafe {
-        software_schedule_trap();
-    }
-}
-
 /// Commit and dispatch one register-carried fast IPC call at the software
 /// scheduling boundary. The returned word is decoded by the scheduler owner.
 pub fn trigger_fast_ipc_call_schedule(endpoint: u64, reply: u64, receiver_task_id: u64) -> u64 {

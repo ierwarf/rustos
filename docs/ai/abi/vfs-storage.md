@@ -318,8 +318,9 @@ engine resolves a long name and its 8.3 alias to one entry), so `/BIN/Ls` and
 `/bin/ls` are one file. Vfsd's `path_inode`/checkpoint `content_identity` hash
 the ASCII-lowercased path, and every path-addressed cache (file bytes, read
 maps, sealed executable snapshots, metadata, directory listings) is keyed by
-`fat_cache_key` (the lowercased path) so case spellings share one entry. Both
-live in `vfsd::path` so their tests run. Residual: an 8.3 *alias spelling*
+`mount_table::cache_key_for_mount` (the mount's `CasePolicy` decides whether the
+path is lowercased) so case spellings share one entry. `path_inode` lives in
+`vfsd::path` so its tests run. Residual: an 8.3 *alias spelling*
 (`PROGRA~1`) hashes and caches as its own path, not as its long name; a handle
 opened through it gets a different inode and cache entry than the long name. A
 true alias identity needs the directory-entry slot, which is the persistent-
@@ -344,8 +345,8 @@ the read-only accelerator; TmpFs has it (next section).
   admitted as executable snapshots. TmpFs `mkdir` requires parent search
   permission and reports `EEXIST` for an existing target before checking
   parent write permission. An absent target still requires write permission.
-  Symlinks are followed by
-  `MountTable::follow_symlinks` (40 hops, then ELOOP); `O_NOFOLLOW` gives ELOOP
+  Symlinks are followed component by component in `resolve_path_follow`
+  (`state_storage.rs`, `SYMLINK_FOLLOW_MAX` = 40 hops, then ELOOP); `O_NOFOLLOW` gives ELOOP
   and a socket inode gives ENXIO on open. `/proc/mounts` is generated from the
   live `MountTable` (vfat rows `ro`/`rw`, tmpfs rows `rw,nosuid,nodev`).
 - **New VFS ops** (`VFS_IPC_ABI_VERSION` stays 5): `MKNOD`=34 (dirfd+path,
@@ -472,7 +473,7 @@ the read-only accelerator; TmpFs has it (next section).
   and are never cached.
 - `vfsd::mount_table::MountTable` resolves absolute normalized paths by longest
   mount-point prefix match and injects immediate submount names into directory
-  listings. `MountTable::mount_fat_disk` wraps the DVM block device in
+  listings. `MountTable::mount_fat_disk_into` wraps the DVM block device in
   `SharedBlockDevice` and inspects partitions via `detect_partitions`:
   0 or 1 partition mounts `/` with `device_read_only`; 2+ partitions force
   partition 0 read-only at `/` and mount partition 1 at `/data` with

@@ -115,6 +115,7 @@ impl CacheSlot {
 }
 
 /// Counters for the slow paths; they never sit on the cache-hit path.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameCacheStats {
     pub refills: u64,
@@ -231,6 +232,7 @@ impl PhysPool {
         self.central_free.load(Ordering::Relaxed) + self.cached_total()
     }
 
+    #[cfg(test)]
     pub(super) fn stats(&self) -> FrameCacheStats {
         // ORDERING: Relaxed; monotonic diagnostics.
         FrameCacheStats {
@@ -500,15 +502,14 @@ impl PhysPool {
         &self,
         slot: usize,
         page_count: usize,
-        below: usize,
     ) -> Option<PhysAddr> {
-        if page_count == 1 && below == usize::MAX {
+        if page_count == 1 {
             let mut out = [PhysAddr::new(0)];
             return (self.alloc_frames(slot, &mut out, false, || false) == 1).then_some(out[0]);
         }
         for round in 0..=FRAME_CACHE_DRAIN_ROUNDS {
             if let Some(found) =
-                self.with_central(|state| state.alloc_contiguous_bounded_locked(page_count, below))
+                self.with_central(|state| state.alloc_contiguous_locked(page_count))
             {
                 return Some(found);
             }
@@ -738,7 +739,7 @@ mod tests {
         assert!(pool.cached_total() > 0);
         // 63 contiguous frames exist only if the magazine's frames count.
         let run = pool
-            .alloc_contiguous(0, 63, usize::MAX)
+            .alloc_contiguous(0, 63)
             .expect("cached frames must be reclaimed");
         assert_ne!(run.as_u64(), held.as_u64());
         assert_eq!(pool.free_total(), 0);
@@ -816,7 +817,7 @@ mod tests {
             free_one(pool, 0, PhysAddr::new(0)),
             Err(FreeFrameError::OutsideAllocatorRange)
         );
-        assert_eq!(pool.alloc_contiguous(0, 1, usize::MAX), None);
+        assert_eq!(pool.alloc_contiguous(0, 1), None);
         assert_eq!(pool.free_total(), 0);
     }
 

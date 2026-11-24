@@ -811,26 +811,6 @@ fn enable_tagged_address_spaces(logical_index: usize, root: u64) {
     CPU_PCID[logical_index].store(true, Ordering::Release);
 }
 
-/// Fail closed before kernel-mm releases an address-space page-table tree.
-///
-/// Task/process retirement is responsible for preventing a future activation.
-/// This final HAL check proves that every CPU which can receive a shootdown has
-/// already stopped using the root. A local-only CR3 comparison is insufficient
-/// once another CPU can run the same process.
-pub fn assert_address_space_inactive(root: PhysAddr) {
-    let root_raw = root.as_u64();
-    assert!(
-        root_raw != 0 && root_raw.is_multiple_of(PAGE_SIZE),
-        "TLB invariant: reclaimed address-space root is invalid"
-    );
-    #[cfg(rustos_boot_image)]
-    {
-        let (hold, restore_interrupts) = acquire_global();
-        assert_address_space_inactive_locked(root_raw);
-        release(hold, restore_interrupts);
-    }
-}
-
 #[cfg(rustos_boot_image)]
 fn assert_address_space_inactive_locked(root_raw: u64) {
     for logical_index in 0..MAX_SUPPORTED_CPUS {

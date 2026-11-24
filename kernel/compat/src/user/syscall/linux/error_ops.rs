@@ -22,7 +22,6 @@ pub(super) const LINUX_EMFILE: i64 = 24;
 pub(super) const LINUX_ENOTTY: i64 = 25;
 pub(super) const LINUX_ENOSPC: i64 = 28;
 pub(super) const LINUX_ESPIPE: i64 = 29;
-pub(super) const LINUX_EROFS: i64 = 30;
 pub(super) const LINUX_EPIPE: i64 = 32;
 pub(super) const LINUX_ERANGE: i64 = 34;
 pub(super) const LINUX_ENOSYS: i64 = 38;

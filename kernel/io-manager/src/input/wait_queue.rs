@@ -18,6 +18,9 @@ static INPUT_WAITERS: TrackedSpinLock<
 // untrusted application waiters for a finite shared slot.
 static INPUTD_INGESTION_WAITER: AtomicU64 = AtomicU64::new(0);
 
+// Test-only: no production caller registers an ordinary (non-inputd) waiter any
+// more; only the retire-time `disarm_input_waiter` and the wake sweep remain.
+#[cfg(test)]
 pub(crate) fn arm_input_waiter(task_id: u64) -> bool {
     with_input_waiters(|waiters| {
         if waiters.contains(&Some(task_id)) {

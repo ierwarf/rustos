@@ -240,6 +240,14 @@ impl WaylandState {
             }
             let enter_serial = self.next_configure_serial();
             self.record_input_serial(enter_serial, next.client_id.clone());
+            let (depressed, locked) = self.keyboard_mods;
+            crate::sys::debug_line(&format!(
+                "uiserver: wl_keyboard enter focus_client_keyboards={}",
+                self.keyboard_resources
+                    .iter()
+                    .filter(|keyboard| keyboard.client_id == next.client_id)
+                    .count()
+            ));
             for keyboard in self
                 .keyboard_resources
                 .iter()
@@ -248,7 +256,9 @@ impl WaylandState {
                 keyboard
                     .resource
                     .enter(enter_serial, &next.surface, Vec::<u8>::new());
-                keyboard.resource.modifiers(enter_serial, 0, 0, 0, 0);
+                keyboard
+                    .resource
+                    .modifiers(enter_serial, depressed, 0, locked, 0);
             }
             self.keyboard_focus = Some(next);
         }
@@ -263,21 +273,45 @@ impl WaylandState {
             return false;
         };
         let client_id = focus.client_id.clone();
+        let key_state = match event.action {
+            INPUT_ACTION_PRESSED => wl_keyboard::KeyState::Pressed,
+            INPUT_ACTION_RELEASED => wl_keyboard::KeyState::Released,
+            // Clients repeat held keys from `wl_keyboard.repeat_info`; a
+            // forwarded repeat would type every character twice.
+            INPUT_ACTION_REPEATED => return true,
+            _ => return false,
+        };
+        let masks = super::keyboard::xkb_modifier_masks(event.modifiers);
+        // wl_keyboard.key carries evdev codes, not the RustOS key enumeration.
+        let Some(code) = crate::sys::rustos_key_code_to_linux(event.code) else {
+            self.keyboard_mods = masks;
+            return true;
+        };
         let serial = self.next_configure_serial();
         let time = self.event_time_ms();
         self.record_input_serial(serial, client_id.clone());
-        let key_state = match event.action {
-            INPUT_ACTION_PRESSED | INPUT_ACTION_REPEATED => wl_keyboard::KeyState::Pressed,
-            INPUT_ACTION_RELEASED => wl_keyboard::KeyState::Released,
-            _ => return false,
-        };
+        let modifiers_changed = masks != self.keyboard_mods;
+        self.keyboard_mods = masks;
+        if self.keyboard_diag_budget > 0 {
+            self.keyboard_diag_budget -= 1;
+            let delivered = self
+                .keyboard_resources
+                .iter()
+                .filter(|keyboard| keyboard.client_id == client_id)
+                .count();
+            crate::sys::debug_line(&format!(
+                "uiserver: wl_keyboard key code={code} state={key_state:?} mods={masks:?} delivered_to={delivered}"
+            ));
+        }
         for keyboard in self
             .keyboard_resources
             .iter()
             .filter(|keyboard| keyboard.client_id == client_id)
         {
-            keyboard.resource.key(serial, time, event.code, key_state);
-            keyboard.resource.modifiers(serial, 0, 0, 0, 0);
+            keyboard.resource.key(serial, time, code, key_state);
+            if modifiers_changed {
+                keyboard.resource.modifiers(serial, masks.0, 0, masks.1, 0);
+            }
         }
         true
     }

@@ -235,9 +235,6 @@ static RUNTIME_HOOKS: RwLock<DebugRuntimeHooks> = RwLock::new(DebugRuntimeHooks:
 struct KernelLogSink;
 
 #[cfg(rustos_debug_print_enabled)]
-struct DebugconSink;
-
-#[cfg(rustos_debug_print_enabled)]
 struct SinkWriter<'a, S: ObservatorySink>(&'a S);
 
 #[cfg(rustos_debug_print_enabled)]
@@ -325,16 +322,6 @@ impl ObservatorySink for KernelLogSink {
             print_bytes_unlocked(s.as_bytes());
         }
         written
-    }
-}
-
-#[cfg(rustos_debug_print_enabled)]
-impl ObservatorySink for DebugconSink {
-    fn write_str(&self, s: &str) -> usize {
-        if !s.is_empty() {
-            print_bytes_unlocked(s.as_bytes());
-        }
-        s.len()
     }
 }
 
@@ -925,42 +912,6 @@ pub fn rate_limit_permit(
 }
 
 #[cfg(rustos_debug_print_enabled)]
-pub fn report_panic(info: &core::panic::PanicInfo<'_>) {
-    if should_emit(LogCategory::Panic, LogLevel::Fatal) {
-        if let Some(location) = info.location() {
-            log_args_site(
-                LogCategory::Panic,
-                LogLevel::Fatal,
-                module_path!(),
-                line!(),
-                format_args!(
-                    "panic location={}:{}:{} message={}",
-                    location.file(),
-                    location.line(),
-                    location.column(),
-                    info.message()
-                ),
-            );
-        } else {
-            log_args_site(
-                LogCategory::Panic,
-                LogLevel::Fatal,
-                module_path!(),
-                line!(),
-                format_args!("panic location=<unknown> message={}", info.message()),
-            );
-        }
-    }
-
-    if let Some(_guard) = try_debug_output_lock() {
-        os_observatory::panic::report_panic(&DebugconSink, info);
-    }
-}
-
-#[cfg(not(rustos_debug_print_enabled))]
-pub fn report_panic(_info: &core::panic::PanicInfo<'_>) {}
-
-#[cfg(rustos_debug_print_enabled)]
 pub fn println_newline() {
     write_debugcon_only_line(b"");
 }
@@ -1191,41 +1142,6 @@ const DEBUG_OUTPUT_ACQUIRE_ATTEMPTS: usize = 4096;
 
 #[cfg(rustos_debug_print_enabled)]
 static DEBUG_BYTES_DISCARDED: AtomicU64 = AtomicU64::new(0);
-
-/// Bytes the debug transport discarded because the output lock stayed held.
-#[cfg(rustos_debug_print_enabled)]
-pub fn discarded_debug_bytes() -> u64 {
-    DEBUG_BYTES_DISCARDED.load(Ordering::Relaxed)
-}
-
-#[cfg(not(rustos_debug_print_enabled))]
-pub fn discarded_debug_bytes() -> u64 {
-    0
-}
-
-#[cfg(rustos_debug_print_enabled)]
-pub fn write_debugcon_only(bytes: &[u8]) {
-    if bytes.is_empty() {
-        return;
-    }
-    for _ in 0..DEBUG_OUTPUT_ACQUIRE_ATTEMPTS {
-        if let Some(_guard) = try_debug_output_lock() {
-            drain_deferred_records();
-            print_bytes_unlocked(bytes);
-            return;
-        }
-        core::hint::spin_loop();
-    }
-    if deferred::park(bytes) {
-        return;
-    }
-    // ORDERING: Relaxed. A diagnostic counter with no other state attached,
-    // read only by the once-per-second milestone burst.
-    DEBUG_BYTES_DISCARDED.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-}
-
-#[cfg(not(rustos_debug_print_enabled))]
-pub fn write_debugcon_only(_bytes: &[u8]) {}
 
 #[cfg(rustos_debug_print_enabled)]
 pub fn write_debugcon_only_line(bytes: &[u8]) {

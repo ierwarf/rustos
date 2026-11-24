@@ -43,7 +43,7 @@ pub use ipc::{
     complete_ipc_reply_wake_handoff, complete_ipc_reply_wake_handoff_with_custody,
     complete_pager_fault_wake_handoff, demote_current_user_task_to_user_class,
     inherit_ipc_priority, inherit_pager_fault_priority,
-    release_ipc_priority, release_pager_fault_priority, reserve_ipc_call_donation,
+    release_ipc_priority, reserve_ipc_call_donation,
     reserve_ipc_priority, settle_cancelled_ipc_reply_scheduling_context,
     settle_ipc_reply_scheduling_context, task_has_system_scheduling_class,
     wake_pager_service_waiter_for_process, wake_task,
@@ -51,9 +51,9 @@ pub use ipc::{
 pub(in crate::multitask) use ipc::settle_deferred_fast_ipc_reply_in;
 pub use pager::{
     PagerChargeSnapshot, current_pager_charge_snapshot, current_pager_fault_install_permit,
-    current_pager_vma_snapshot, pager_vma_regions_for_process, publish_current_pager_vma,
+    current_pager_vma_snapshot, pager_vma_regions_for_process,
     publish_inherited_pager_vma_for_process, publish_pager_vma_for_process,
-    revoke_current_pager_vma, revoke_pager_vma_for_process,
+    revoke_pager_vma_for_process,
 };
 
 // Native witnesses model the earlier masked IRQ entry, not privileged CLI/STI.
@@ -182,22 +182,6 @@ pub fn current_user_ipc_entry() -> Option<(u64, process_table::ProcessIdentity, 
             None => owned_current_user_binding(),
         }?;
         ipc_identity_for_binding(task_id, handle).map(|(task, identity)| (task, identity, may_have_signal))
-    })
-}
-
-/// [`current_task_id`] plus the pending-signal hint, as above.
-pub fn current_task_id_with_signal_hint() -> Option<(u64, bool)> {
-    if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
-        return None;
-    }
-    interrupts::without_interrupts(|| {
-        let slot = cpu_local::current_cpu_task_slot()?;
-        let may_have_signal = super::current_identity::signal_pending(slot);
-        let task_id = match super::current_identity::read(slot) {
-            Some(identity) => identity.task_id,
-            None => super::scheduler::stack_resources::context::current_task_start().map(|start| start.id),
-        }?;
-        Some((task_id, may_have_signal))
     })
 }
 
@@ -750,7 +734,7 @@ pub fn with_current_user_process_state<R>(
     process.with_visible_state(|_, process_state| f(thread_id, abi, process_state))
 }
 
-/// Exit-path access that survives `mark_user_process_exiting`; see
+/// Exit-path access that survives `mark_user_process_exiting_once`; see
 /// `process_table::with_process_state_for_teardown_mut`.
 pub fn with_process_state_for_teardown_mut<R>(
     process_id: u64,
@@ -819,12 +803,6 @@ pub fn with_fork_parent_vfork_state<R>(
 
 pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {
     process_table::note_process_exit_status(process_id, status)
-}
-
-/// Prevent new process-owned authority from being published while this process
-/// is draining its final resource teardown.
-pub fn mark_user_process_exiting(process_id: u64) -> bool {
-    process_table::mark_process_exiting(process_id).is_some()
 }
 
 pub fn mark_user_process_exiting_once(process_id: u64) -> Option<bool> {
@@ -932,13 +910,6 @@ pub fn retain_current_user_process_state() -> Option<RetainedCurrentUserProcessS
         abi,
         process,
     })
-}
-
-pub fn with_current_process_state_mut<R>(
-    f: impl FnOnce(u64, &mut UserProcessState) -> R,
-) -> Option<R> {
-    let process = retain_current_process_ref()?;
-    process.with_visible_state_mut(f)
 }
 
 pub fn with_current_process_state<R>(f: impl FnOnce(u64, &UserProcessState) -> R) -> Option<R> {

@@ -621,13 +621,10 @@ pub(super) fn sockaddr_nl_bytes(pid: u32, groups: u32) -> [u8; SOCKADDR_NL_LEN] 
 }
 
 fn portid_in_use(state: &NetState, protocol: u64, portid: u32) -> bool {
-    state.sockets.values().any(|socket| {
-        matches!(
-            &socket.state,
-            UnixSocketState::Netlink(netlink)
-                if netlink.protocol == protocol && netlink.portid == portid
-        )
-    })
+    state
+        .netlink_sockets
+        .values()
+        .any(|socket| socket.state.protocol == protocol && socket.state.portid == portid)
 }
 
 /// Linux uses the process id when free, otherwise a unique generated id
@@ -663,14 +660,11 @@ pub(super) fn handle_bind(request: &NetdIpcRequest) -> i32 {
     // Publish what changed before this socket joins: a new member sees only
     // later changes, never history.
     publish_interface_changes(&mut state);
-    let Some(socket) = state.sockets.get(&request.socket_token) else {
+    let Some(socket) = state.netlink_sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
-    let UnixSocketState::Netlink(netlink) = &socket.state else {
-        return libc::EINVAL;
-    };
-    let current = netlink.portid;
-    let protocol = netlink.protocol;
+    let current = socket.state.portid;
+    let protocol = socket.state.protocol;
     if current != 0 && requested_pid != 0 && requested_pid != current {
         // An already bound netlink socket cannot move to another port id.
         return libc::EINVAL;
@@ -692,13 +686,11 @@ pub(super) fn handle_bind(request: &NetdIpcRequest) -> i32 {
             },
         )
     };
-    let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
+    let Some(socket) = state.netlink_sockets.get_mut(&request.socket_token) else {
         return libc::EBADF;
     };
-    if let UnixSocketState::Netlink(netlink) = &mut socket.state {
-        netlink.portid = portid;
-        netlink.groups = groups;
-    }
+    socket.state.portid = portid;
+    socket.state.groups = groups;
     // Re-baseline for the new member set (a first member records its baseline).
     publish_interface_changes(&mut state);
     0
@@ -882,16 +874,15 @@ pub(super) fn diff_events(old: &InterfaceSnapshot, new: &InterfaceSnapshot) -> V
 
 /// Whether any `NETLINK_ROUTE` socket is subscribed to a group netd generates.
 fn has_observed_members(state: &NetState) -> bool {
-    state.sockets.values().any(|socket| {
-        matches!(&socket.state, UnixSocketState::Netlink(netlink)
-            if netlink.protocol == NETLINK_ROUTE
-                && netlink.groups
-                    & (RTMGRP_LINK
-                        | RTMGRP_IPV4_IFADDR
-                        | RTMGRP_IPV4_ROUTE
-                        | RTMGRP_IPV6_IFADDR
-                        | RTMGRP_IPV6_ROUTE)
-                    != 0)
+    state.netlink_sockets.values().any(|socket| {
+        socket.state.protocol == NETLINK_ROUTE
+            && socket.state.groups
+                & (RTMGRP_LINK
+                    | RTMGRP_IPV4_IFADDR
+                    | RTMGRP_IPV4_ROUTE
+                    | RTMGRP_IPV6_IFADDR
+                    | RTMGRP_IPV6_ROUTE)
+                != 0
     })
 }
 
@@ -914,23 +905,17 @@ pub(super) fn apply_interface_snapshot(state: &mut NetState, current: InterfaceS
     };
     for (group, message) in diff_events(&previous, &current) {
         let members: Vec<u64> = state
-            .sockets
+            .netlink_sockets
             .iter()
-            .filter_map(|(token, socket)| match &socket.state {
-                UnixSocketState::Netlink(netlink)
-                    if netlink.protocol == NETLINK_ROUTE && netlink.groups & group != 0 =>
-                {
-                    Some(*token)
-                }
-                _ => None,
+            .filter_map(|(token, socket)| {
+                (socket.state.protocol == NETLINK_ROUTE && socket.state.groups & group != 0)
+                    .then_some(*token)
             })
             .collect();
         for token in members {
-            if let Some(socket) = state.sockets.get_mut(&token) {
+            if let Some(socket) = state.netlink_sockets.get_mut(&token) {
                 let capacity = socket.options.recv_buffer.max(4096) as usize;
-                if let UnixSocketState::Netlink(netlink) = &mut socket.state {
-                    netlink.enqueue(message.clone(), capacity);
-                }
+                socket.state.enqueue(message.clone(), capacity);
             }
         }
     }
@@ -939,11 +924,10 @@ pub(super) fn apply_interface_snapshot(state: &mut NetState, current: InterfaceS
 /// Poll/receive hook: only a `NETLINK_ROUTE` socket that is itself a group
 /// member can be waiting for an interface event, so only it pays for the comparison.
 pub(super) fn refresh_for_member(state: &mut NetState, token: u64) {
-    let member = matches!(
-        state.sockets.get(&token).map(|socket| &socket.state),
-        Some(UnixSocketState::Netlink(netlink))
-            if netlink.protocol == NETLINK_ROUTE && netlink.groups != 0
-    );
+    let member = state
+        .netlink_sockets
+        .get(&token)
+        .is_some_and(|socket| socket.state.protocol == NETLINK_ROUTE && socket.state.groups != 0);
     if member {
         publish_interface_changes(state);
     }
@@ -952,12 +936,11 @@ pub(super) fn refresh_for_member(state: &mut NetState, token: u64) {
 /// `setsockopt(SOL_NETLINK, ...)`: membership options and `NETLINK_NO_ENOBUFS`.
 pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
     let mut state = lock_net_state();
-    let Some(protocol) = state.sockets.get(&request.socket_token).and_then(|socket| {
-        match &socket.state {
-            UnixSocketState::Netlink(netlink) => Some(netlink.protocol),
-            _ => None,
-        }
-    }) else {
+    let Some(protocol) = state
+        .netlink_sockets
+        .get(&request.socket_token)
+        .map(|socket| socket.state.protocol)
+    else {
         return if state.socket_exists(request.socket_token) {
             libc::ENOPROTOOPT
         } else {
@@ -975,14 +958,10 @@ pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
         return libc::EINVAL;
     };
     if option == NETLINK_NO_ENOBUFS {
-        if let Some(UnixSocket {
-            state: UnixSocketState::Netlink(netlink),
-            ..
-        }) = state.sockets.get_mut(&request.socket_token)
-        {
-            netlink.no_enobufs = value != 0;
-            if netlink.no_enobufs {
-                netlink.overrun = false;
+        if let Some(socket) = state.netlink_sockets.get_mut(&request.socket_token) {
+            socket.state.no_enobufs = value != 0;
+            if socket.state.no_enobufs {
+                socket.state.overrun = false;
             }
         }
         return 0;
@@ -995,15 +974,11 @@ pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
         publish_interface_changes(&mut state);
     }
     let bit = 1_u32 << (group - 1);
-    if let Some(UnixSocket {
-        state: UnixSocketState::Netlink(netlink),
-        ..
-    }) = state.sockets.get_mut(&request.socket_token)
-    {
+    if let Some(socket) = state.netlink_sockets.get_mut(&request.socket_token) {
         if option == NETLINK_ADD_MEMBERSHIP {
-            netlink.groups |= bit;
+            socket.state.groups |= bit;
         } else {
-            netlink.groups &= !bit;
+            socket.state.groups &= !bit;
         }
     }
     if protocol == NETLINK_ROUTE {
@@ -1016,10 +991,7 @@ pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
 /// `getsockopt(SOL_NETLINK, ...)`: group bit mask and `NETLINK_NO_ENOBUFS`.
 pub(super) fn handle_getsockopt(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
     let state = lock_net_state();
-    let Some(UnixSocket {
-        state: UnixSocketState::Netlink(netlink),
-        ..
-    }) = state.sockets.get(&request.socket_token)
+    let Some(NetlinkSocket { state: netlink, .. }) = state.netlink_sockets.get(&request.socket_token)
     else {
         return if state.socket_exists(request.socket_token) {
             libc::ENOPROTOOPT
@@ -1054,12 +1026,8 @@ pub(super) fn send_message(
     if bytes.len() > SOCKET_BUFFER_CAPACITY {
         return Err(libc::EMSGSIZE);
     }
-    let (protocol, needs_portid) = match state.sockets.get(&request.socket_token) {
-        Some(UnixSocket {
-            state: UnixSocketState::Netlink(netlink),
-            ..
-        }) => (netlink.protocol, netlink.portid == 0),
-        Some(_) => return Err(libc::EOPNOTSUPP),
+    let (protocol, needs_portid) = match state.netlink_sockets.get(&request.socket_token) {
+        Some(socket) => (socket.state.protocol, socket.state.portid == 0),
         None => return Err(libc::EBADF),
     };
     if protocol != NETLINK_ROUTE {
@@ -1069,13 +1037,11 @@ pub(super) fn send_message(
     let preferred = request.pid as u32;
     let autobound = needs_portid.then(|| allocate_portid(state, protocol, preferred));
     let socket = state
-        .sockets
+        .netlink_sockets
         .get_mut(&request.socket_token)
         .ok_or(libc::EBADF)?;
     let capacity = socket.options.recv_buffer.max(4096) as usize;
-    let UnixSocketState::Netlink(netlink) = &mut socket.state else {
-        return Err(libc::EOPNOTSUPP);
-    };
+    let netlink = &mut socket.state;
     if let Some(portid) = autobound {
         netlink.portid = portid;
     }
@@ -1093,10 +1059,8 @@ fn take_datagram(
     peek: bool,
 ) -> Result<(usize, usize), i32> {
     refresh_for_member(state, token);
-    let socket = state.sockets.get_mut(&token).ok_or(libc::EBADF)?;
-    let UnixSocketState::Netlink(netlink) = &mut socket.state else {
-        return Err(libc::EOPNOTSUPP);
-    };
+    let socket = state.netlink_sockets.get_mut(&token).ok_or(libc::EBADF)?;
+    let netlink = &mut socket.state;
     if netlink.rx.is_empty() {
         if core::mem::take(&mut netlink.overrun) {
             return Err(libc::ENOBUFS);

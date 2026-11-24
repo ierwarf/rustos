@@ -91,13 +91,6 @@ pub(super) fn identity_of(handle: &multitask::KernelHandle) -> Option<AnonStat> 
             nlink: 1,
             size: 0,
         },
-        multitask::KernelHandle::Socket(socket) => AnonStat {
-            dev: DEV_SOCKFS,
-            ino: socket.token_id(),
-            mode: S_IFSOCK | 0o777,
-            nlink: 1,
-            size: 0,
-        },
         multitask::KernelHandle::UnixSocket(socket) => AnonStat {
             dev: DEV_SOCKFS,
             ino: socket.token_id(),
@@ -290,8 +283,15 @@ mod tests {
 
     #[test]
     fn sockets_report_sock_mode_and_kind_separated_devices() {
-        let unix = id(multitask::KernelHandle::Socket(multitask::SocketHandle::from_token(5, 1, 1, 0)));
-        let inet = id(multitask::KernelHandle::InetSocket(multitask::InetSocketHandle::from_token(5, 2, 1, 0)));
+        let creds = multitask::SocketCredentials::new(1, 0, 0);
+        let unix_handle =
+            multitask::UnixSocketHandle::new(multitask::UnixSocketType::Stream, false, creds)
+                .unwrap();
+        let unix_token = unix_handle.token_id();
+        let unix = id(multitask::KernelHandle::UnixSocket(unix_handle));
+        let inet = id(multitask::KernelHandle::InetSocket(
+            multitask::InetSocketHandle::from_token(unix_token, 2, 1, 0),
+        ));
         assert_eq!(unix.mode, S_IFSOCK | 0o777);
         assert_eq!(inet.mode, S_IFSOCK | 0o777);
         assert_eq!(unix.ino, inet.ino);

@@ -301,14 +301,6 @@ if grep -Eq 'stack_frame\.stack_pointer\.as_u64\(\)[[:space:]]+as[[:space:]]+\*c
     static_failures=$((static_failures + 1))
 fi
 
-if ! grep -Fq 'IpcTransferTicketWire::decode(bytes)' \
-        kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs \
-    || grep -Eq 'MaybeUninit|assume_init' \
-        kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs; then
-    echo 'SCM_RIGHTS service bytes must use the canonical integer-only ticket parser' >&2
-    static_failures=$((static_failures + 1))
-fi
-
 if ! grep -Fq 'cpu_count == 1' kernel/hal/src/arch/clock.rs \
     || ! grep -Fq 'if let Some((base, period_fs, counter)) = hpet' kernel/hal/src/arch/clock.rs; then
     echo 'raw TSC must remain uniprocessor-only and SMP must fail over to validated HPET' >&2
@@ -815,7 +807,7 @@ ap_cache_initialize_body="$(sed -n '/^pub(super) fn initialize_application_proce
 pat_contract_body="$(sed -n '/^const fn pat_with_kernel_cache_contract(/,/^fn read_msr(/p' kernel/mm/src/memory/cache_attributes.rs)"
 ap_trampoline_source="$(cat kernel/nucleus-core/src/multiboot2_entry.S)"
 ap_entry_body="$(sed -n '/^extern "C" fn rustos_ap_entry(/,/^    loop {/p' kernel/executive/src/boot.rs)"
-boot_initialize_body="$(sed -n '/^pub unsafe fn initialize_kernel(/,/^fn initialize_application_processors(/p' kernel/executive/src/boot.rs)"
+boot_initialize_body="$(sed -n '/^pub(crate) unsafe fn initialize_kernel(/,/^fn initialize_application_processors(/p' kernel/executive/src/boot.rs)"
 mmio_conflict_line="$(grep -n -m1 -F 'physical_ranges_overlap(mapping.phys_start, mapping.size, phys_start, size)' <<<"$mmio_mapping_body" | cut -d: -f1)"
 mmio_straddle_guard_line="$(grep -n -m1 -F 'if physical_range_straddles_direct_map_limit(phys_start, phys_end) {' <<<"$mmio_mapping_body" | cut -d: -f1)"
 mmio_registry_reserve_line="$(grep -n -m1 -F 'if registry.mappings.try_reserve(1).is_err() {' <<<"$mmio_mapping_body" | cut -d: -f1)"
@@ -1287,7 +1279,7 @@ fi
 # calls so no internal caller can accidentally discard the token.
 ipc_runtime_source=kernel/ipc-runtime/src/ipc/mod.rs
 if ! rg -Uq 'struct ReplyObject \{[^}]*scheduling_context: Option<ReplySchedulingContextCustody>' "$ipc_runtime_source" \
-    || [ "$(rg -c 'reply_object\.scheduling_context\.take\(\)|reply\.scheduling_context\.take\(\)' "$ipc_runtime_source")" -ne 7 ] \
+    || [ "$(rg -c 'reply_object\.scheduling_context\.take\(\)|reply\.scheduling_context\.take\(\)' "$ipc_runtime_source")" -ne 6 ] \
     || ! rg -Fq 'pub scheduling_context: Option<ReplySchedulingContextCustody>' "$ipc_runtime_source" \
     || ! rg -Fq 'ensure_reply_has_no_scheduling_context(reply)?;' "$ipc_runtime_source" \
     || ! rg -Fq 'enqueue_endpoint_call_with_handles_priority_custody_in_group(' kernel/compat/src/user/syscall/linux/ipc_ops.rs \
@@ -2775,12 +2767,6 @@ netd-deferred-reply/NetdDeferredReply|netd|hardening_tests::lifecycle_pool_has_i
 netd-deferred-reply/NetdDeferredReply|netd|provider_accounting::tests::refund_custody_is_reserved_before_charge_and_survives_failed_retry
 netd-deferred-reply/NetdDeferredReply|netd|provider_accounting::tests::delayed_charge_and_rejected_reply_never_leave_an_unowned_socket_or_charge
 service-mutation-recovery/ServiceMutationRecovery|netd|provider_accounting::tests::lost_charge_ack_is_cancelled_with_original_nonce_before_accept_token_reuse
-ipc-transfer-authority/IpcTransferAuthority|netd|hardening_tests::unix_global_budget_bounds_unrelated_sockets_and_releases_payload_and_control
-ipc-transfer-authority/IpcTransferAuthority|netd|unix_socket_lifecycle_tests::failed_inflight_accept_after_listener_close_releases_control_without_reply
-ipc-transfer-authority/IpcTransferAuthority|kernel-compat|user::syscall::linux::broker_ops::net_broker_ops::tests::retired_accept_control_is_deferred_once_without_any_caller_reply
-ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::tests::prepared_unix_socket_pair_and_accept_abandonment_never_install_unseen_fds
-ipc-handle-transfer/IpcHandleTransfer|kernel-compat|user::syscall::linux::broker_ops::net_broker_ops::tests::initial_unix_publication_entries_are_invisible_exact_channel_sides
-ipc-reply-deadline/IpcReplyDeadline|rustos-user-abi|syscall::syscall_tests::prepared_unix_publication_requires_exact_operation_tokens_and_channel
 netd-deferred-reply/NetdDeferredReply|netd|packet_provider_state_tests::inet_provider_start_deadline_and_token_gate_precede_the_start_closure
 ipc-reply-recv-transaction/IpcReplyRecvTransaction|rustos-user-abi|syscall::ipc_reply_recv::tests::reply_recv_wire_shape_and_error_partition_are_stable
 ipc-reply-recv-transaction/IpcReplyRecvTransaction|rustos-svc-runtime|ipc::tests::reply_recv_phase_tag_cannot_alias_linux_errno

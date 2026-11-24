@@ -80,9 +80,8 @@ pub mod paging {
 pub mod frame_capability {
     pub use crate::memory::frame_capability::{
         FrameGrantBinding, FrameGrantError, MAX_PAGER_FRAME_GRANTS,
-        MAX_PREALLOCATED_PAGER_FAULT_FRAMES, allocate_zeroed_frame, allocate_zeroed_frame_grant,
+        MAX_PREALLOCATED_PAGER_FAULT_FRAMES, allocate_zeroed_frame,
         cancel_frame_grant, pager_fault_frame_refill_requested, pager_fault_reserve_depth,
-        pager_fault_reserve_exhaustions, pager_fault_reserve_low_watermark,
         preallocate_pager_fault_frames, replenish_pager_fault_frames,
         reserve_preallocated_zeroed_frame_grant, return_pager_fault_frame,
         service_pager_fault_frame_refill, take_frame_grant, take_pager_fault_frame,
@@ -141,14 +140,10 @@ pub mod virt {
     pub fn higher_half_addr(addr: u64) -> u64 {
         crate::lowlevel::address::higher_half_addr(addr)
     }
-
-    pub const fn kernel_virt_offset() -> u64 {
-        crate::lowlevel::address::KERNEL_VIRT_OFFSET
-    }
 }
 
 pub use address_space::{PageTableFlags, ProcessAddressSpace, debug_direct_map_flags_for_addr};
 pub use alloc::{KernelAllocator, handle_alloc_error, init_heap};
 pub use boot::{init_paging, init_phys, paging_smoke_test};
 pub use phys::{alloc_frame, free_bytes, free_frame, usable_bytes};
-pub use virt::{higher_half_addr, kernel_image_addr, kernel_virt_offset};
+pub use virt::{higher_half_addr, kernel_image_addr};

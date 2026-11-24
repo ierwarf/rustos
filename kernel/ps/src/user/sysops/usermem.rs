@@ -340,38 +340,6 @@ pub fn with_retained_user_access<R>(
         .ok_or(paging::AddressSpaceError::NotMapped)
 }
 
-pub fn copy_from_retained_user_exact(
-    retained: &multitask::RetainedCurrentUserAddressSpace,
-    user_ptr: u64,
-    dest: &mut [u8],
-) -> Result<(), paging::AddressSpaceError> {
-    if user_access::enabled()
-        && let Ok(start) = user_virt_addr(user_ptr, dest.len())
-        && user_access::copy_from_user(dest, start.as_u64())
-    {
-        return Ok(());
-    }
-    let dest_len = dest.len();
-    let mut attempt = || {
-        retained
-            .try_with_address_space(|address_space| {
-                let start = user_virt_addr(user_ptr, dest.len())?;
-                address_space
-                    .validate_user_read(start, dest.len())?
-                    .copy_into(dest)
-            })
-            .ok_or(paging::AddressSpaceError::NotMapped)?
-    };
-    match attempt() {
-        Err(paging::AddressSpaceError::NotMapped)
-            if populate_anonymous_range(user_ptr, dest_len, false)? =>
-        {
-            attempt()
-        }
-        other => other,
-    }
-}
-
 pub fn read_current_user_struct<T: Copy + Default>(
     user_ptr: u64,
 ) -> Result<T, paging::AddressSpaceError> {
@@ -385,24 +353,6 @@ pub fn read_current_user_struct<T: Copy + Default>(
         )
     };
     copy_from_current_user_exact(user_ptr, bytes)?;
-    Ok(value)
-}
-
-pub fn read_retained_user_struct<T: Copy + Default>(
-    retained: &multitask::RetainedCurrentUserAddressSpace,
-    user_ptr: u64,
-) -> Result<T, paging::AddressSpaceError> {
-    let mut value = T::default();
-    // SAFETY: `value` is live and uniquely borrowed for exactly `size_of::<T>()`
-    // bytes; the exact-length copy below overwrites only that `T` allocation
-    // and fails without returning `value` if the user range is short.
-    let bytes = unsafe {
-        core::slice::from_raw_parts_mut(
-            core::ptr::addr_of_mut!(value).cast::<u8>(),
-            core::mem::size_of::<T>(),
-        )
-    };
-    copy_from_retained_user_exact(retained, user_ptr, bytes)?;
     Ok(value)
 }
 
@@ -701,12 +651,6 @@ pub fn write_current_user_slice<T: rustos_user_abi::wire::UserWire>(
 
 pub fn write_current_user_u32(user_ptr: u64, value: u32) -> Result<(), paging::AddressSpaceError> {
     write_current_user_bytes(user_ptr, &value.to_le_bytes())
-}
-
-pub fn read_current_user_u32(user_ptr: u64) -> Result<u32, paging::AddressSpaceError> {
-    let mut bytes = [0_u8; 4];
-    copy_from_current_user_exact(user_ptr, &mut bytes)?;
-    Ok(u32::from_le_bytes(bytes))
 }
 
 pub fn read_current_user_c_string(

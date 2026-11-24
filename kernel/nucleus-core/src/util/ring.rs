@@ -23,10 +23,6 @@ impl<T: Copy, const CAPACITY: usize> RingBuffer<T, CAPACITY> {
         self.len
     }
 
-    pub fn remaining_capacity(&self) -> usize {
-        CAPACITY - self.len
-    }
-
     pub fn push(&mut self, value: T) -> bool {
         if CAPACITY == 0 {
             return false;
@@ -196,7 +192,6 @@ mod tests {
         assert_eq!(ring.extend_overwrite(&[3, 4]), 2);
         assert_eq!(ring.pop(), None);
         assert_eq!(ring.peek(), None);
-        assert_eq!(ring.remaining_capacity(), 0);
     }
 
     #[test]

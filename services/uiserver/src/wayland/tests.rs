@@ -1997,6 +1997,138 @@ fn cleanup_disconnected_client_retires_surfaces_and_clears_focus_and_resources()
     assert!(state.pointer_grab_serial.is_none());
 }
 
+#[test]
+fn keyboard_is_advertised_gets_a_keymap_and_receives_evdev_keys_with_modifiers() {
+    use crate::sys::{InputEvent, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD};
+    use keyboard_core::{KeyCode, Modifiers};
+    use std::collections::HashMap;
+    use std::os::unix::net::UnixStream;
+
+    let mut display = test_display();
+    let mut state = super::WaylandState::new(800, 600);
+    state.display_handle = Some(display.handle());
+    super::create_wayland_globals(&display.handle());
+    let (server_end, mut sock) = UnixStream::pair().expect("socket pair");
+    sock.set_nonblocking(true).unwrap();
+    let client = display
+        .handle()
+        .insert_client(server_end, Arc::new(super::WaylandClientState::default()))
+        .expect("client");
+    let client_id = client.id();
+
+    wire::send(&mut sock, &wire::message(1, 1, &wire::u32s(&[2])));
+    pump(&mut display, &mut state);
+    let mut names = HashMap::new();
+    for (_, op, p) in wire::events(&mut sock) {
+        if op == 0 {
+            let name = u32::from_ne_bytes(p[0..4].try_into().unwrap());
+            let len = u32::from_ne_bytes(p[4..8].try_into().unwrap()) as usize;
+            names.insert(String::from_utf8(p[8..8 + len - 1].to_vec()).unwrap(), name);
+        }
+    }
+    for (iface, ver, id) in [("wl_seat", 7, 3), ("wl_compositor", 6, 4)] {
+        let mut args = wire::u32s(&[names[iface]]);
+        args.extend(wire::string(iface));
+        args.extend(wire::u32s(&[ver, id]));
+        wire::send(&mut sock, &wire::message(2, 0, &args));
+    }
+    wire::send(&mut sock, &wire::message(4, 0, &wire::u32s(&[5])));
+    pump(&mut display, &mut state);
+    let seat_events = wire::events(&mut sock);
+    let capabilities = seat_events
+        .iter()
+        .find(|(object, opcode, _)| *object == 3 && *opcode == 0)
+        .expect("wl_seat.capabilities");
+    assert_eq!(
+        u32::from_ne_bytes(capabilities.2[..4].try_into().unwrap()),
+        3,
+        "pointer | keyboard"
+    );
+
+    // wl_seat.get_keyboard(id = 6)
+    wire::send(&mut sock, &wire::message(3, 1, &wire::u32s(&[6])));
+    pump(&mut display, &mut state);
+    let setup = wire::events(&mut sock);
+    let keymap = setup
+        .iter()
+        .find(|(object, opcode, _)| *object == 6 && *opcode == 0)
+        .expect("wl_keyboard.keymap");
+    assert_eq!(u32::from_ne_bytes(keymap.2[..4].try_into().unwrap()), 1, "xkb_v1");
+    assert!(u32::from_ne_bytes(keymap.2[4..8].try_into().unwrap()) > 1000);
+    let repeat = setup
+        .iter()
+        .find(|(object, opcode, _)| *object == 6 && *opcode == 5)
+        .expect("wl_keyboard.repeat_info");
+    assert_eq!(repeat.2.len(), 8);
+
+    let surface = state
+        .surfaces
+        .last()
+        .unwrap()
+        .shared
+        .lock()
+        .unwrap()
+        .resource
+        .clone()
+        .unwrap();
+    state.set_keyboard_focus(Some(super::KeyboardFocus {
+        surface,
+        client_id: client_id.clone(),
+    }));
+    pump(&mut display, &mut state);
+    let focus = wire::events(&mut sock);
+    assert!(focus.iter().any(|(o, op, _)| *o == 6 && *op == 1), "wl_keyboard.enter");
+
+    let key = |code: KeyCode, action: u16, modifiers: Modifiers| InputEvent {
+        kind: INPUT_KIND_KEYBOARD,
+        action,
+        code: code as u32,
+        value0: 0,
+        value1: 0,
+        modifiers: u32::from(modifiers.bits()),
+        text: 0,
+    };
+
+    // Q is evdev KEY_Q = 16, not the RustOS enumeration value.
+    assert!(state.keyboard_input(key(KeyCode::Q, INPUT_ACTION_PRESSED, Modifiers::empty())));
+    pump(&mut display, &mut state);
+    let events = wire::events(&mut sock);
+    let sent = events
+        .iter()
+        .find(|(o, op, _)| *o == 6 && *op == 3)
+        .expect("wl_keyboard.key");
+    assert_eq!(u32::from_ne_bytes(sent.2[8..12].try_into().unwrap()), 16);
+    assert_eq!(u32::from_ne_bytes(sent.2[12..16].try_into().unwrap()), 1);
+    assert!(
+        !events.iter().any(|(o, op, _)| *o == 6 && *op == 4),
+        "an unchanged modifier state is not re-announced"
+    );
+
+    // Pressing Shift announces the depressed Shift modifier after the key.
+    assert!(state.keyboard_input(key(KeyCode::LeftShift, INPUT_ACTION_PRESSED, Modifiers::SHIFT)));
+    pump(&mut display, &mut state);
+    let events = wire::events(&mut sock);
+    let modifiers = events
+        .iter()
+        .find(|(o, op, _)| *o == 6 && *op == 4)
+        .expect("wl_keyboard.modifiers");
+    assert_eq!(u32::from_ne_bytes(modifiers.2[4..8].try_into().unwrap()), 1);
+
+    // A server-side repeat is consumed: clients repeat from repeat_info.
+    assert!(state.keyboard_input(key(KeyCode::Q, INPUT_ACTION_REPEATED, Modifiers::SHIFT)));
+    pump(&mut display, &mut state);
+    assert!(!wire::events(&mut sock).iter().any(|(o, op, _)| *o == 6 && *op == 3));
+
+    assert!(state.keyboard_input(key(KeyCode::LeftShift, INPUT_ACTION_RELEASED, Modifiers::empty())));
+    pump(&mut display, &mut state);
+    let events = wire::events(&mut sock);
+    let modifiers = events
+        .iter()
+        .find(|(o, op, _)| *o == 6 && *op == 4)
+        .expect("wl_keyboard.modifiers on release");
+    assert_eq!(u32::from_ne_bytes(modifiers.2[4..8].try_into().unwrap()), 0);
+}
+
 mod arbitration;
 mod dmabuf_import;
 

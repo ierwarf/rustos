@@ -10,7 +10,6 @@ pub(crate) use kernel_mm::api as memory;
 pub(crate) use kernel_ps::api as multitask;
 pub(crate) use kernel_ps::api as user;
 
-#[allow(unused_imports, unused_macros)]
 pub(crate) mod debug {
     pub(crate) use nucleus_core::debug::*;
 
@@ -44,18 +43,18 @@ pub(crate) mod debug {
 pub mod api;
 
 #[path = "driver/mod.rs"]
-pub mod driver;
+pub(crate) mod driver;
 
 #[path = "input/mod.rs"]
-pub mod input;
+pub(crate) mod input;
 
 #[path = "network/mod.rs"]
 pub(crate) mod network;
 
 #[path = "io/mod.rs"]
-pub mod io;
+pub(crate) mod io;
 #[path = "storage/mod.rs"]
-pub mod storage;
+pub(crate) mod storage;
 pub(crate) mod sync;
 pub(crate) mod transport_lifecycle;
 pub(crate) mod transport_types;

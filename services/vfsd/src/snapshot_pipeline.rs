@@ -64,6 +64,7 @@ impl RingGeometry {
         self.len
     }
 
+    #[cfg(test)]
     pub fn window_bytes(&self) -> usize {
         self.window
     }

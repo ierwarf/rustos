@@ -196,7 +196,7 @@ than an eighth of a very small machine).  Allocation has two classes:
   fault-frame reserve producer, copy-on-write, user page-table growth, process
   creation and fork cloning, `memfd` pages, and frame grants are user class.
   A short fill is the pressure signal.
-- **kernel class** - `alloc_frame`, `alloc_frames_batch`, `alloc_contiguous` -
+- **kernel class** - `alloc_frame`, `alloc_contiguous` -
   may use the reserve.  Heap growth, IPC buffers, boot-time reserve wiring, and
   everything that must run to resolve the pressure stay here.
 

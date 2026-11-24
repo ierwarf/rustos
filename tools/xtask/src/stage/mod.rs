@@ -355,7 +355,7 @@ fn stage_nucleus_signature(config: &Config) -> Result<()> {
 
     if !signature.is_file() {
         bail!(
-            "missing nucleus signature for {}; run cargo xtask build-efi or set RUSTOS_GRUB_SIGNING_KEY before cargo xtask build-kernel",
+            "missing nucleus signature for {}; run cargo xtask build or set RUSTOS_GRUB_SIGNING_KEY before cargo xtask build-kernel",
             nucleus.display()
         );
     }
@@ -370,7 +370,7 @@ fn ensure_signature_is_fresh(input: &Path, signature: &Path) -> Result<()> {
     let signature_modified = fs::metadata(signature)?.modified()?;
     if signature_modified < input_modified {
         bail!(
-            "stale nucleus signature: {} is older than {}; run cargo xtask build-kernel or cargo xtask build-efi",
+            "stale nucleus signature: {} is older than {}; run cargo xtask build-kernel or cargo xtask build",
             signature.display(),
             input.display()
         );

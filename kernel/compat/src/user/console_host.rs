@@ -66,12 +66,6 @@ impl<'a> ConsoleProgramSpec<'a> {
         }
     }
 
-    pub const fn with_args(mut self, argv: &'a [&'a str], env: &'a [&'a str]) -> Self {
-        self.argv = argv;
-        self.env = env;
-        self
-    }
-
     pub const fn with_logical_admin(mut self, logical_admin: bool) -> Self {
         self.logical_admin = logical_admin;
         self
@@ -244,10 +238,7 @@ pub fn spawn_program_in_session(
                 );
             }
         })
-        .map_err(|error| {
-            let _ = session;
-            ConsoleHostError::Spawn { error }
-        })
+        .map_err(|error| ConsoleHostError::Spawn { error })
 }
 
 #[cfg(test)]

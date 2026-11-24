@@ -23,7 +23,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
-use crate::memory::paging::{self, AddressSpaceError, ProcessAddressSpace, UserRegion};
+use crate::memory::paging::{self, AddressSpaceError, ProcessAddressSpace};
 use crate::user::handles::{HandleTable, KernelHandle};
 use crate::user::linux::{
     LinuxMemoryMapState, LinuxProcessState, LinuxRuntimeProfile, LinuxSigAction, MAX_SIGNAL_NUMBER,
@@ -36,53 +36,10 @@ use kernel_ipc_runtime::api::KernelSharedRegionMappingHold;
 const PAGE_SIZE: u64 = 4096;
 static NEXT_FUTEX_NAMESPACE_ID: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_MAPPING_GAP: u64 = 16 * 1024 * 1024;
-const ADMIN_REQUEST_PATH_CAPACITY: usize = 96;
 const PROCESS_EXEC_PATH_CAPACITY: usize = 192;
 pub const WINDOWS_TLS_SLOT_COUNT: usize = 64;
 pub const DEFAULT_DESKTOP_UID: u32 = rustos_user_abi::desktop_session::DESKTOP_SESSION_UID;
 pub const DEFAULT_DESKTOP_GID: u32 = rustos_user_abi::desktop_session::DESKTOP_SESSION_GID;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PendingAdminRequestKind {
-    FileSystemAccess,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PendingAdminRequest {
-    kind: PendingAdminRequestKind,
-    path: [u8; ADMIN_REQUEST_PATH_CAPACITY],
-    path_len: usize,
-}
-
-impl PendingAdminRequest {
-    fn for_path(kind: PendingAdminRequestKind, path: &str) -> Self {
-        let mut stored = [0_u8; ADMIN_REQUEST_PATH_CAPACITY];
-        let mut len = 0usize;
-        for byte in path.bytes() {
-            if len == stored.len() {
-                break;
-            }
-            stored[len] = match byte {
-                b' '..=b'~' => byte,
-                _ => b'?',
-            };
-            len += 1;
-        }
-
-        Self {
-            kind,
-            path: stored,
-            path_len: len,
-        }
-    }
-
-    // TEST-HARNESS: Host lifecycle tests inspect the staged request kind;
-    // production consumes the complete request atomically.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn kind(self) -> PendingAdminRequestKind {
-        self.kind
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LinuxCapabilities {
@@ -119,7 +76,6 @@ pub struct ProcessSecurityContext {
     gid: u32,
     euid: u32,
     egid: u32,
-    pending_admin_request: Option<PendingAdminRequest>,
     /// `PR_SET_NO_NEW_PRIVS`: one-way per-process flag. Inherited by fork and
     /// preserved across exec (`for_exec`); RustOS has no setuid/file-capability
     /// exec path, so recording it is the whole truthful behavior today.
@@ -155,7 +111,6 @@ impl ProcessSecurityContext {
             gid,
             euid: uid,
             egid: gid,
-            pending_admin_request: None,
             no_new_privs: false,
             dumpable: true,
             oom_score_adj: 0,
@@ -176,7 +131,6 @@ impl ProcessSecurityContext {
             gid,
             euid,
             egid,
-            pending_admin_request: None,
             no_new_privs: false,
             dumpable: true,
             oom_score_adj: 0,
@@ -186,7 +140,7 @@ impl ProcessSecurityContext {
 
     /// Security context of the same process after a successful exec:
     /// credentials and `no_new_privs` carry over, everything image-specific
-    /// (pending admin request, dumpable) is reset.
+    /// (dumpable) is reset.
     pub const fn for_exec(self) -> Self {
         let mut next = Self::new_with_credentials(
             self.logical_admin,
@@ -237,28 +191,15 @@ impl ProcessSecurityContext {
         self.egid
     }
 
-    // TEST-HARNESS: Recovery tests observe pending authority without consuming
-    // it; production transitions through the mutation methods.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn pending_admin_request(self) -> Option<PendingAdminRequest> {
-        self.pending_admin_request
-    }
-
-    fn queue_admin_request(&mut self, kind: PendingAdminRequestKind, path: &str) {
-        self.pending_admin_request = Some(PendingAdminRequest::for_path(kind, path));
-    }
-
     fn set_uid(&mut self, uid: u32) {
         self.uid = uid;
         self.euid = uid;
-        self.pending_admin_request = None;
         self.logical_admin = self.uid == 0 && self.gid == 0 && self.euid == 0 && self.egid == 0;
     }
 
     fn set_gid(&mut self, gid: u32) {
         self.gid = gid;
         self.egid = gid;
-        self.pending_admin_request = None;
         self.logical_admin = self.uid == 0 && self.gid == 0 && self.euid == 0 && self.egid == 0;
     }
 }
@@ -1346,6 +1287,7 @@ impl UserProcessState {
         })
     }
 
+    #[cfg(test)]
     pub fn mapping_kmem_charged(&self) -> u64 {
         self.mm.mapping_kmem.charged()
     }
@@ -1409,10 +1351,6 @@ impl UserProcessState {
         self.local.windows_runtime
     }
 
-    pub fn windows_runtime_mut(&mut self) -> Option<&mut WindowsProcessRuntimeState> {
-        self.local.windows_runtime.as_mut()
-    }
-
     pub fn win32_objects(&self) -> &Win32ProcessObjects {
         &self.local.win32_objects
     }
@@ -1421,6 +1359,7 @@ impl UserProcessState {
         &mut self.local.win32_objects
     }
 
+    #[cfg(test)]
     pub fn set_linux_signal_action(&mut self, signal: u64, action: LinuxSigAction) -> Option<()> {
         let index = usize::try_from(signal).ok()?;
         *self.local.linux_sigactions.get_mut(index)? = action;
@@ -1438,17 +1377,6 @@ impl UserProcessState {
 
     pub fn exec_path(&self) -> &str {
         self.local.exec_path()
-    }
-
-    pub fn require_logical_admin_for_file_access(&mut self, path: &str) -> bool {
-        if self.local.security.logical_admin {
-            return true;
-        }
-
-        self.local
-            .security
-            .queue_admin_request(PendingAdminRequestKind::FileSystemAccess, path);
-        false
     }
 
     pub fn set_uid(&mut self, uid: u32) {
@@ -1712,68 +1640,6 @@ impl UserProcessState {
         (closed, fresh)
     }
 
-    pub fn map_zeroed_pages_from_mapping_cursor(
-        &mut self,
-        page_count: usize,
-        flags: PageTableFlags,
-    ) -> Result<UserRegion, AddressSpaceError> {
-        if page_count == 0 {
-            return Err(AddressSpaceError::ZeroSizedAllocation);
-        }
-
-        let start = align_up(self.mm.mapping_cursor);
-        let span = (page_count as u64)
-            .checked_mul(PAGE_SIZE)
-            .ok_or(AddressSpaceError::AddressOverflow)?;
-        let end = start
-            .checked_add(span)
-            .ok_or(AddressSpaceError::AddressOverflow)?;
-
-        if let Some(linux_process_state) = self.mm.linux_process_state.as_ref()
-            && (end > linux_process_state.brk_limit() || start < linux_process_state.brk_mapped_end)
-        {
-            return Err(AddressSpaceError::OutOfFrames);
-        }
-
-        let region = self
-            .mm
-            .address_space
-            .map_zeroed_user_pages_at(VirtAddr::new(start), page_count, flags)?;
-        self.set_mapping_cursor(region.end().as_u64());
-        Ok(region)
-    }
-
-    pub fn map_existing_pages_from_mapping_cursor(
-        &mut self,
-        frames: &[u64],
-        flags: PageTableFlags,
-    ) -> Result<UserRegion, AddressSpaceError> {
-        if frames.is_empty() {
-            return Err(AddressSpaceError::ZeroSizedAllocation);
-        }
-
-        let start = align_up(self.mm.mapping_cursor);
-        let span = (frames.len() as u64)
-            .checked_mul(PAGE_SIZE)
-            .ok_or(AddressSpaceError::AddressOverflow)?;
-        let end = start
-            .checked_add(span)
-            .ok_or(AddressSpaceError::AddressOverflow)?;
-
-        if let Some(linux_process_state) = self.mm.linux_process_state.as_ref()
-            && (end > linux_process_state.brk_limit() || start < linux_process_state.brk_mapped_end)
-        {
-            return Err(AddressSpaceError::OutOfFrames);
-        }
-
-        let region = self
-            .mm
-            .address_space
-            .map_existing_user_pages_at(VirtAddr::new(start), frames, flags)?;
-        self.set_mapping_cursor(region.end().as_u64());
-        Ok(region)
-    }
-
     fn sync_linux_mapping_cursor(&mut self) {
         if let Some(linux_process_state) = self.mm.linux_process_state.as_mut() {
             linux_process_state.mmap_next = self.mm.mapping_cursor;
@@ -1798,7 +1664,7 @@ fn allocate_futex_namespace_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_DESKTOP_GID, DEFAULT_DESKTOP_UID, PendingAdminRequestKind, ProcessSecurityContext,
+        DEFAULT_DESKTOP_GID, DEFAULT_DESKTOP_UID, ProcessSecurityContext,
         overlap_segment,
     };
 
@@ -1845,20 +1711,6 @@ mod tests {
         assert_eq!(
             overlap_segment(0x1000, 0x3000, 0x2000, 0x4000),
             Some((0x2000, 0x1000))
-        );
-    }
-
-    #[test]
-    fn non_admin_context_queues_file_access_request() {
-        let mut security = ProcessSecurityContext::new(false);
-        assert!(!security.is_logical_admin());
-
-        security.queue_admin_request(PendingAdminRequestKind::FileSystemAccess, "/etc/config");
-        assert_eq!(
-            security
-                .pending_admin_request()
-                .map(|request| request.kind()),
-            Some(PendingAdminRequestKind::FileSystemAccess)
         );
     }
 

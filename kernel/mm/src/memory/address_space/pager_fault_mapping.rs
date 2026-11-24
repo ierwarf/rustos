@@ -555,61 +555,6 @@ impl ProcessAddressSpace {
         self.map_user_page(start, PhysAddr::new(frame_phys), page_flags)
     }
 
-    /// Publishes the first mapping of one private file/section cache frame.
-    ///
-    /// The backing identity is a stable pager/page-cache identity, not a raw
-    /// capability slot. The leaf starts read-only with the COW tag even when it
-    /// is the sole mapping, so Linux `MAP_PRIVATE` and Windows WRITECOPY use the
-    /// same first-write transition as a later alias.
-    pub fn map_private_file_cow_frame_at(
-        &mut self,
-        start: VirtAddr,
-        frame_phys: u64,
-        flags: PageTableFlags,
-        backing_identity: u64,
-    ) -> Result<(), AddressSpaceError> {
-        validate_user_page_range(start, 1)?;
-        if frame_phys == 0 || !frame_phys.is_multiple_of(PAGE_4KIB_U64) || backing_identity == 0 {
-            return Err(AddressSpaceError::InvalidFrameOwnership);
-        }
-        let page_flags = normalize_user_page_flags(flags)?
-            .difference(PageTableFlags::WRITABLE)
-            .union(ROOT_OWNED_USER_LEAF | COW_USER_LEAF);
-        let root = self.root_phys();
-        let root_phys = root.as_u64();
-        let virtual_address = start.as_u64();
-        if !phys::root_admits(root_phys, 1) {
-            return Err(AddressSpaceError::OutOfFrames);
-        }
-        data_claim_result(phys::claim_private_file_data_leaf(
-            root_phys,
-            virtual_address,
-            frame_phys,
-            backing_identity,
-        ))?;
-        let mutation = begin_address_space_mutation(root);
-        let installed = (|| {
-            let pdpt_phys = ensure_next_table(root_phys, root, p4_index(start))?;
-            let pd_phys = ensure_next_table(root_phys, pdpt_phys, p3_index(start))?;
-            ensure_next_table(root_phys, pd_phys, p2_index(start))?;
-            with_prepared_user_leaf_mut(root, start, |entry| {
-                if !entry.is_unused() {
-                    return Err(AddressSpaceError::AlreadyMapped);
-                }
-                entry.set_addr(PhysAddr::new(frame_phys), page_flags);
-                Ok(())
-            })
-        })();
-        if let Err(error) = installed {
-            phys::cancel_private_file_data_leaf(root_phys, virtual_address, frame_phys);
-            drop(mutation);
-            return Err(error);
-        }
-        phys::publish_private_file_data_leaf(root_phys, virtual_address, frame_phys);
-        drop(mutation);
-        Ok(())
-    }
-
     /// The typed source borrow retains descriptor custody through publication;
     /// afterwards the exact leaf independently retains its frame.
     pub fn map_cached_private_file_cow_at(
@@ -911,42 +856,6 @@ impl ProcessAddressSpace {
         phys::publish_data_leaf(root_phys, virtual_address, frame_phys);
         drop(mutation);
         Ok(())
-    }
-
-    /// Revokes and frees pager-owned leaves while retaining their prepared
-    /// intermediate tables for a later mapping of the same VMA.
-    pub fn unmap_prepared_pager_fault_pages_at(
-        &mut self,
-        start: VirtAddr,
-        page_count: usize,
-    ) -> Result<usize, AddressSpaceError> {
-        if page_count == 0 {
-            return Err(AddressSpaceError::ZeroSizedAllocation);
-        }
-        validate_user_page_range(start, page_count)?;
-        let range_end = pager_fault_range_end(start, page_count)?;
-        let leaves = self.pager_fault_leaves_in_range(start.as_u64(), range_end, page_count)?;
-        if leaves.len() != page_count {
-            return Err(AddressSpaceError::NotMapped);
-        }
-
-        for (page_index, leaf) in leaves.iter().copied().enumerate() {
-            let virt = page_addr(start, page_index)?;
-            if leaf.virtual_address != virt.as_u64() {
-                return Err(AddressSpaceError::NotMapped);
-            }
-            if !phys::data_leaf_is_owned(
-                self.pml4_frame_phys,
-                leaf.virtual_address,
-                leaf.physical_address,
-            ) {
-                return Err(AddressSpaceError::InvalidFrameOwnership);
-            }
-        }
-        // The shared transaction rolls any removed prefix through the reclaim
-        // barrier and descriptor release even when a removal fails midway, so
-        // an early error can never strand a removed PTE's descriptor or frame.
-        self.unmap_preflighted_user_leaves(leaves, &[])
     }
 
     /// Updates protection on the present subset of a prepared pager range.

@@ -156,16 +156,6 @@ pub fn bind_reserved_ipc_priority(reply: u64, donor_task_id: u64, receiver_task_
     scheduler::donation_publication::bind(reply, donor_task_id, receiver_task_id, false)
 }
 
-/// Releases a pager-fault donation from the pager-fault key space.
-pub fn release_pager_fault_priority(fault_token: u64) -> bool {
-    interrupts::without_interrupts(|| {
-        scheduler::release_reply_donation(
-            fault_token,
-            scheduler::ipc_donation::DonationNamespace::PagerFault,
-        )
-    })
-}
-
 pub fn release_ipc_priority(reply: u64) -> bool {
     interrupts::without_interrupts(|| {
         scheduler::release_reply_donation(

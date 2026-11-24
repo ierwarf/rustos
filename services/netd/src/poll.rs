@@ -41,7 +41,7 @@ pub(super) fn handle_poll_batch(request: &NetdIpcRequest, response: &mut NetdIpc
             inet_socket_revents(&mut state, socket_token, events)
         } else {
             netlink::refresh_for_member(&mut state, socket_token);
-            unix_socket_revents(&state, socket_token, events)
+            netlink_socket_revents(&state, socket_token, events)
         };
         let result = match outcome {
             Ok(revents) => NetdPollResultWire {
@@ -75,7 +75,7 @@ pub(super) fn handle_poll_socket(request: &NetdIpcRequest, response: &mut NetdIp
         inet_socket_revents(&mut state, request.socket_token, request.arg1 as u32)
     } else {
         netlink::refresh_for_member(&mut state, request.socket_token);
-        unix_socket_revents(&state, request.socket_token, request.arg1 as u32)
+        netlink_socket_revents(&state, request.socket_token, request.arg1 as u32)
     };
     match outcome {
         Ok(revents) => {
@@ -89,120 +89,18 @@ pub(super) fn handle_poll_socket(request: &NetdIpcRequest, response: &mut NetdIp
     }
 }
 
-pub(super) fn unix_socket_revents(state: &NetState, token: u64, requested: u32) -> Result<u32, i32> {
-    let socket = state.sockets.get(&token).ok_or(libc::EBADF)?;
-    Ok(unix_socket_revents_for(state, socket, requested))
+pub(super) fn netlink_socket_revents(state: &NetState, token: u64, requested: u32) -> Result<u32, i32> {
+    let socket = state.netlink_sockets.get(&token).ok_or(libc::EBADF)?;
+    Ok(netlink_socket_revents_for(socket, requested))
 }
 
-pub(super) fn unix_socket_revents_for(state: &NetState, socket: &UnixSocket, requested: u32) -> u32 {
+pub(super) fn netlink_socket_revents_for(socket: &NetlinkSocket, requested: u32) -> u32 {
     let mut revents = 0_u32;
-    match &socket.state {
-        UnixSocketState::Listening { pending, .. } => {
-            if requested & linux_abi::POLLIN as u32 != 0 && !pending.is_empty() {
-                revents |= linux_abi::POLLIN as u32;
-            }
-        }
-        UnixSocketState::Connected(connected) => {
-            let peer_connected =
-                state
-                    .sockets
-                    .get(&connected.peer)
-                    .and_then(|peer| match &peer.state {
-                        UnixSocketState::Connected(peer_connected) => Some(peer_connected),
-                        _ => None,
-                    });
-            let peer_limit = state.sockets.get(&connected.peer).map_or(SOCKET_BUFFER_CAPACITY, |peer| {
-                if peer.kind.preserves_message_boundaries() { (peer.options.recv_buffer as usize).min(SOCKET_BUFFER_CAPACITY) } else { SOCKET_BUFFER_CAPACITY }
-            });
-            let peer_seqpacket = state
-                .sockets
-                .get(&connected.peer)
-                .is_some_and(|peer| peer.kind.preserves_message_boundaries());
-            if requested & linux_abi::POLLIN as u32 != 0
-                && (connected.incoming_bytes != 0
-                    || !connected.incoming.is_empty()
-                    || connected.peer_write_closed
-                    || connected.recv_closed
-                    || connected.peer_closed)
-            {
-                revents |= linux_abi::POLLIN as u32;
-            }
-            if requested & linux_abi::POLLOUT as u32 != 0 {
-                let writable = state.unix_queued_bytes < UNIX_QUEUED_BYTE_CAPACITY
-                    && !connected.send_closed
-                    && !connected.peer_read_closed
-                    && !connected.peer_closed
-                    && peer_connected.is_some_and(|peer| {
-                        !peer.recv_closed
-                            && peer.incoming_bytes < peer_limit
-                            && !(peer_seqpacket
-                                && peer.incoming.len() >= SEQPACKET_MAX_QUEUED_MESSAGES)
-                            && peer.incoming_control_bytes < SOCKET_CONTROL_BUFFER_CAPACITY
-                    });
-                if writable {
-                    revents |= linux_abi::POLLOUT as u32;
-                }
-            }
-            if requested & linux_abi::POLLRDHUP as u32 != 0
-                && (connected.peer_write_closed || connected.recv_closed || connected.peer_closed)
-            {
-                revents |= linux_abi::POLLRDHUP as u32;
-            }
-            // Linux reports POLLHUP once both directions are shut down, whether
-            // by this end, by the peer, or by one of each.
-            let read_shut = connected.recv_closed || connected.peer_write_closed;
-            let write_shut = connected.send_closed || connected.peer_read_closed;
-            if connected.peer_closed || (read_shut && write_shut) {
-                revents |= linux_abi::POLLHUP as u32;
-            }
-            if peer_connected.is_none() {
-                revents |= linux_abi::POLLERR as u32;
-            }
-        }
-        UnixSocketState::Dgram(dgram) => {
-            if requested & linux_abi::POLLIN as u32 != 0
-                && (!dgram.incoming.is_empty() || dgram.recv_closed)
-            {
-                revents |= linux_abi::POLLIN as u32;
-            }
-            if requested & linux_abi::POLLOUT as u32 != 0 {
-                let peer_ok = match dgram.peer {
-                    Some(peer_token) => state.sockets.get(&peer_token).is_some_and(|peer| {
-                        let peer_limit = (peer.options.recv_buffer as usize).min(SOCKET_BUFFER_CAPACITY);
-                        matches!(&peer.state, UnixSocketState::Dgram(pd)
-                            if !pd.recv_closed
-                                && pd.incoming_bytes < peer_limit
-                                && pd.incoming.len() < UNIX_DGRAM_MAX_QUEUED_MESSAGES
-                                && pd.incoming_control_bytes < SOCKET_CONTROL_BUFFER_CAPACITY)
-                    }),
-                    None => true,
-                };
-                if !dgram.send_closed
-                    && !dgram.peer_closed
-                    && state.unix_queued_bytes < UNIX_QUEUED_BYTE_CAPACITY
-                    && peer_ok
-                {
-                    revents |= linux_abi::POLLOUT as u32;
-                }
-            }
-            if requested & linux_abi::POLLRDHUP as u32 != 0 && dgram.recv_closed {
-                revents |= linux_abi::POLLRDHUP as u32;
-            }
-            if dgram.peer_closed {
-                revents |= linux_abi::POLLERR as u32;
-            }
-        }
-        UnixSocketState::Netlink(netlink) => {
-            if requested & linux_abi::POLLIN as u32 != 0 && netlink.readable() {
-                revents |= linux_abi::POLLIN as u32;
-            }
-            if requested & linux_abi::POLLOUT as u32 != 0 {
-                revents |= linux_abi::POLLOUT as u32;
-            }
-        }
-        UnixSocketState::Idle => {
-            revents |= linux_abi::POLLERR as u32;
-        }
+    if requested & linux_abi::POLLIN as u32 != 0 && socket.state.readable() {
+        revents |= linux_abi::POLLIN as u32;
+    }
+    if requested & linux_abi::POLLOUT as u32 != 0 {
+        revents |= linux_abi::POLLOUT as u32;
     }
     revents
 }

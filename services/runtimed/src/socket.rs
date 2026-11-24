@@ -111,10 +111,34 @@ impl RuntimeConnections {
     }
 }
 
-/// Pause between accept polls and after a failed accept. A failed `accept4`
-/// that returns only after an IPC deadline must not become a hot loop.
-const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Pause after a failed accept or listener wait so a persistent fault cannot
+/// become a hot loop. An idle listener is waited on with `poll`, never probed.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Block until the listener has a connection to accept. Readiness-driven so an
+/// idle control socket costs no wakeups (the previous 10 ms probe issued ~100
+/// `accept4` calls per second for the lifetime of the service).
+fn wait_listener_readable(listener: &UnixListener) -> std::io::Result<()> {
+    let mut pollfd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `pollfd` is a live local and the count passed is exactly one
+        // entry; a negative timeout blocks until readiness or a signal.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, -1) };
+        if ready > 0 {
+            return Ok(());
+        }
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+}
 
 /// Accept until `deliver` reports the broker is gone. Never exits on an
 /// accept error: the control socket must outlive a transient netd stall.
@@ -134,7 +158,15 @@ fn accept_loop(listener: &UnixListener, mut deliver: impl FnMut(AcceptedClient) 
                 }
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                std::thread::sleep(ACCEPT_POLL_INTERVAL);
+                if let Err(err) = wait_listener_readable(listener) {
+                    observability_client::error!(
+                        "runtimed",
+                        service,
+                        "listener wait failed: errno={}",
+                        super::util::io_errno(err)
+                    );
+                    std::thread::sleep(ACCEPT_ERROR_BACKOFF);
+                }
             }
             Err(err) => {
                 // Log the first failure of a run, then every 64th, so a
@@ -863,27 +895,9 @@ fn terminate_request(
                     libc::ETIMEDOUT
                 });
             }
-            let console = super::spawn::ensure_console_fd(state).map_err(|err| {
-                if terminated {
-                    libc::EOWNERDEAD
-                } else {
-                    err
-                }
-            })?;
-            if Instant::now() >= deadline {
-                return Err(if terminated {
-                    libc::EOWNERDEAD
-                } else {
-                    libc::ETIMEDOUT
-                });
-            }
-            if super::spawn::close_console_session(console, request.target_value)
-                .map_err(|_| libc::EOWNERDEAD)?
-            {
-                state.session_runtime.remove_session(request.target_value);
-                super::session::clear_focused_session_if(state, request.target_value);
-                terminated = true;
-            }
+            state.session_runtime.remove_session(request.target_value);
+            super::session::clear_focused_session_if(state, request.target_value);
+            terminated = true;
         }
         _ => return Err(libc::EOPNOTSUPP),
     }
@@ -1646,6 +1660,28 @@ mod tests {
             MAX_PENDING_RUNTIME_CLIENTS,
             "a full pending queue leaves the rest with the acceptor"
         );
+    }
+
+    #[test]
+    fn an_idle_listener_wait_blocks_until_a_client_connects() {
+        let path = std::env::temp_dir().join(format!("rtd-wait-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let connect_path = path.clone();
+        let connector = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            UnixStream::connect(connect_path).expect("connect")
+        });
+        let started = Instant::now();
+        super::wait_listener_readable(&listener).expect("wait");
+        assert!(
+            started.elapsed() >= Duration::from_millis(80),
+            "the wait returned before any client connected"
+        );
+        let _client = connector.join().expect("connector");
+        assert!(super::accept_runtime_client(&listener).is_ok());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

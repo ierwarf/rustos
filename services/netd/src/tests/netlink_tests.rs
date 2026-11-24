@@ -211,21 +211,25 @@ fn sockaddr_nl_is_twelve_bytes() {
     assert_eq!(&bytes[8..12], &5_u32.to_ne_bytes());
 }
 
-fn netlink_socket_with_protocol(sock_type: u64, protocol: u64) -> UnixSocket {
-    UnixSocket {
-        kind: UnixSocketKind::Netlink,
-        owner: Credentials::default(),
+/// Queues one reply on the netlink socket, which makes it readable.
+pub(super) fn make_readable(state: &mut NetState, token: u64) {
+    let request = NetdIpcRequest {
+        socket_token: token,
+        pid: 5,
+        ..NetdIpcRequest::default()
+    };
+    netlink::send_message(state, &request, &dump_request(netlink::RTM_GETLINK, 0, 1), &[]).unwrap();
+}
+
+pub(super) fn netlink_socket_with_protocol(sock_type: u64, protocol: u64) -> NetlinkSocket {
+    NetlinkSocket {
         refs: 1,
         options: SocketOptions::default(),
-        bound_path: None,
-        bound_inode: None,
-        local_path: None,
-        peer_path: None,
-        state: UnixSocketState::Netlink(NetlinkState::new(sock_type, protocol)),
+        state: NetlinkState::new(sock_type, protocol),
     }
 }
 
-fn netlink_socket(sock_type: u64) -> UnixSocket {
+pub(super) fn netlink_socket(sock_type: u64) -> NetlinkSocket {
     netlink_socket_with_protocol(sock_type, NETLINK_ROUTE)
 }
 
@@ -250,24 +254,22 @@ fn recv_request(token: u64, len: u64, flags: u64) -> NetdIpcRequest {
 fn socket_flow_dump_poll_recv_and_getsockname() {
     let mut state = NetState::new();
     state
-        .sockets
+        .netlink_sockets
         .insert(1, netlink_socket(libc::SOCK_RAW as u64));
     // Unbound: nl_pid 0, not readable, always writable.
     let idle =
-        unix_socket_revents(&state, 1, (linux_abi::POLLIN | linux_abi::POLLOUT) as u32).unwrap();
+        netlink_socket_revents(&state, 1, (linux_abi::POLLIN | linux_abi::POLLOUT) as u32).unwrap();
     assert_eq!(idle, linux_abi::POLLOUT as u32);
     let dump = dump_request(RTM_GETLINK, 0, 21);
     assert_eq!(
-        send_socket_message_in_state(&mut state, &request(1, 31337), &dump, &[]),
+        netlink::send_message(&mut state, &request(1, 31337), &dump, &[]),
         Ok(dump.len())
     );
-    let UnixSocketState::Netlink(netlink) = &state.sockets[&1].state else {
-        panic!()
-    };
+    let netlink = &state.netlink_sockets[&1].state;
     // Autobind took the caller's process id.
     assert_eq!(netlink.portid(), 31337);
     assert_eq!(netlink.queued_messages(), 1);
-    let ready = unix_socket_revents(&state, 1, linux_abi::POLLIN as u32).unwrap();
+    let ready = netlink_socket_revents(&state, 1, linux_abi::POLLIN as u32).unwrap();
     assert_eq!(ready, linux_abi::POLLIN as u32);
 
     let mut response = NetdIpcResponse::default();
@@ -292,13 +294,11 @@ fn socket_flow_dump_poll_recv_and_getsockname() {
         libc::EAGAIN
     );
     assert_eq!(
-        unix_socket_revents(&state, 1, linux_abi::POLLIN as u32).unwrap(),
+        netlink_socket_revents(&state, 1, linux_abi::POLLIN as u32).unwrap(),
         0
     );
     // getsockname: sockaddr_nl with the assigned port id.
-    let UnixSocketState::Netlink(netlink) = &state.sockets[&1].state else {
-        panic!()
-    };
+    let netlink = &state.netlink_sockets[&1].state;
     let mut name = NetdIpcResponse::default();
     assert_eq!(netlink.write_sockaddr(&mut name), 0);
     assert_eq!(name.payload_len, 12);
@@ -309,10 +309,10 @@ fn socket_flow_dump_poll_recv_and_getsockname() {
 fn short_recv_buffer_truncates_and_msg_trunc_returns_the_real_length() {
     let mut state = NetState::new();
     state
-        .sockets
+        .netlink_sockets
         .insert(1, netlink_socket(libc::SOCK_DGRAM as u64));
     let dump = dump_request(RTM_GETLINK, 0, 1);
-    send_socket_message_in_state(&mut state, &request(1, 5), &dump, &[]).unwrap();
+    netlink::send_message(&mut state, &request(1, 5), &dump, &[]).unwrap();
     let full = {
         let mut bytes = build_link_message(&loopback_link(), 1, 5);
         bytes.extend_from_slice(&build_done(1, 5));
@@ -340,9 +340,7 @@ fn short_recv_buffer_truncates_and_msg_trunc_returns_the_real_length() {
     let msg_flags = u32::from_ne_bytes(msg.payload[8..12].try_into().unwrap());
     assert_ne!(msg_flags & libc::MSG_TRUNC as u32, 0);
     assert_eq!(msg.value, 8);
-    let UnixSocketState::Netlink(netlink) = &state.sockets[&1].state else {
-        panic!()
-    };
+    let netlink = &state.netlink_sockets[&1].state;
     assert_eq!(netlink.queued_messages(), 0);
 }
 
@@ -351,21 +349,15 @@ fn receive_buffer_overflow_reports_enobufs_once() {
     let mut state = NetState::new();
     let mut socket = netlink_socket(libc::SOCK_RAW as u64);
     socket.options.recv_buffer = 4096;
-    state.sockets.insert(1, socket);
+    state.netlink_sockets.insert(1, socket);
     let dump = dump_request(RTM_GETLINK, 0, 1);
     // Each reply is ~170 bytes: far more than 4096 requests' worth fit never.
     let mut sent = 0;
-    while let UnixSocketState::Netlink(netlink) = &state.sockets[&1].state {
-        if netlink.queued_messages() == sent && sent < 64 {
-            send_socket_message_in_state(&mut state, &request(1, 5), &dump, &[]).unwrap();
-            sent += 1;
-        } else {
-            break;
-        }
+    while state.netlink_sockets[&1].state.queued_messages() == sent && sent < 64 {
+        netlink::send_message(&mut state, &request(1, 5), &dump, &[]).unwrap();
+        sent += 1;
     }
-    let UnixSocketState::Netlink(netlink) = &state.sockets[&1].state else {
-        panic!()
-    };
+    let netlink = &state.netlink_sockets[&1].state;
     assert!(netlink.queued_messages() < sent, "a reply was dropped");
     let mut response = NetdIpcResponse::default();
     let mut errors = 0;
@@ -387,10 +379,10 @@ fn bind_assigns_and_protects_port_ids() {
     {
         let mut state = lock_net_state();
         state
-            .sockets
+            .netlink_sockets
             .insert(a, netlink_socket(libc::SOCK_RAW as u64));
         state
-            .sockets
+            .netlink_sockets
             .insert(b, netlink_socket(libc::SOCK_RAW as u64));
     }
     let bind = |token: u64, pid: u32, groups: u32| {
@@ -400,10 +392,7 @@ fn bind_assigns_and_protects_port_ids() {
         netlink::handle_bind(&req)
     };
     assert_eq!(bind(a, 0xabc0_1111, 0x7), 0);
-    let groups_of = |token: u64| match &lock_net_state().sockets[&token].state {
-        UnixSocketState::Netlink(netlink) => netlink.groups(),
-        _ => unreachable!(),
-    };
+    let groups_of = |token: u64| lock_net_state().netlink_sockets[&token].state.groups();
     assert_eq!(groups_of(a), 0x7);
     // Rebinding keeps the port id and updates groups.
     assert_eq!(bind(a, 0xabc0_1111, 0), 0);
@@ -414,10 +403,7 @@ fn bind_assigns_and_protects_port_ids() {
     assert_eq!(bind(b, 0xabc0_1111, 0), libc::EADDRINUSE);
     // pid 0 assigns a free id: the process id first, then a generated one.
     assert_eq!(bind(b, 0, 0), 0);
-    let portid_of = |token: u64| match &lock_net_state().sockets[&token].state {
-        UnixSocketState::Netlink(netlink) => netlink.portid(),
-        _ => unreachable!(),
-    };
+    let portid_of = |token: u64| lock_net_state().netlink_sockets[&token].state.portid();
     assert_eq!(portid_of(a), 0xabc0_1111);
     assert_eq!(portid_of(b), 777);
     let mut short = request(a, 1);
@@ -428,8 +414,8 @@ fn bind_assigns_and_protects_port_ids() {
     wrong_family.payload_len = 12;
     assert_eq!(netlink::handle_bind(&wrong_family), libc::EINVAL);
     let mut state = lock_net_state();
-    state.sockets.remove(&a);
-    state.sockets.remove(&b);
+    state.netlink_sockets.remove(&a);
+    state.netlink_sockets.remove(&b);
 }
 
 #[test]
@@ -439,7 +425,7 @@ fn netlink_shape_and_so_type() {
     assert!(!shape(16, 1, 0) && !shape(16, 3, 9) && !shape(1, 3, 0) && !shape(16, 3 | 1 << 30, 0));
     let token = 0x9b0_0010_u64;
     lock_net_state()
-        .sockets
+        .netlink_sockets
         .insert(token, netlink_socket(libc::SOCK_DGRAM as u64));
     let query = |option| {
         let req = NetdIpcRequest {
@@ -466,7 +452,7 @@ fn netlink_shape_and_so_type() {
         req.payload[..4].copy_from_slice(&(1_i32 << 20).to_ne_bytes());
         assert_eq!(super::handle_setsockopt(&req), 0);
     }
-    lock_net_state().sockets.remove(&token);
+    lock_net_state().netlink_sockets.remove(&token);
 }
 
 #[test]
@@ -474,8 +460,8 @@ fn sol_netlink_membership_options_and_change_notifications_work() {
     let (a, b) = (0x9b0_0020_u64, 0x9b0_0021_u64);
     {
         let mut state = lock_net_state();
-        state.sockets.insert(a, netlink_socket(libc::SOCK_RAW as u64));
-        state.sockets.insert(b, netlink_socket(libc::SOCK_RAW as u64));
+        state.netlink_sockets.insert(a, netlink_socket(libc::SOCK_RAW as u64));
+        state.netlink_sockets.insert(b, netlink_socket(libc::SOCK_RAW as u64));
     }
 
     let set_membership = |token: u64, option: u64, group: i32| {
@@ -517,9 +503,7 @@ fn sol_netlink_membership_options_and_change_notifications_work() {
     // First subscription recorded the baseline without queuing past history.
     {
         let state = lock_net_state();
-        let UnixSocketState::Netlink(na) = &state.sockets[&a].state else {
-            panic!();
-        };
+        let na = &state.netlink_sockets[&a].state;
         assert_eq!(na.queued_messages(), 0);
     }
 
@@ -534,12 +518,8 @@ fn sol_netlink_membership_options_and_change_notifications_work() {
     {
         let mut state = lock_net_state();
         apply_interface_snapshot(&mut state, updated.clone());
-        let UnixSocketState::Netlink(na) = &state.sockets[&a].state else {
-            panic!();
-        };
-        let UnixSocketState::Netlink(nb) = &state.sockets[&b].state else {
-            panic!();
-        };
+        let na = &state.netlink_sockets[&a].state;
+        let nb = &state.netlink_sockets[&b].state;
         assert_eq!(na.queued_messages(), 2);
         assert_eq!(nb.queued_messages(), 0);
     }
@@ -555,44 +535,49 @@ fn sol_netlink_membership_options_and_change_notifications_work() {
     assert_eq!(route_reply, expected_route);
 
     let mut state = lock_net_state();
-    state.sockets.remove(&a);
-    state.sockets.remove(&b);
+    state.netlink_sockets.remove(&a);
+    state.netlink_sockets.remove(&b);
 }
 
 #[test]
 fn kobject_uevent_socket_admission_bind_options_recv_poll_and_teardown() {
     let flags = linux_abi::SOCK_CLOEXEC | linux_abi::SOCK_NONBLOCK;
     assert_eq!(
-        local_socket_kind(
+        netlink_socket_admission(
             libc::AF_NETLINK as u64,
             libc::SOCK_DGRAM as u64 | flags,
             NETLINK_KOBJECT_UEVENT,
         ),
-        Ok(UnixSocketKind::Netlink)
+        Ok(())
     );
     assert_eq!(
-        local_socket_kind(
+        netlink_socket_admission(
             libc::AF_NETLINK as u64,
             libc::SOCK_RAW as u64 | flags,
             NETLINK_KOBJECT_UEVENT,
         ),
-        Ok(UnixSocketKind::Netlink)
+        Ok(())
     );
     assert_eq!(
-        local_socket_kind(libc::AF_NETLINK as u64, libc::SOCK_STREAM as u64, NETLINK_KOBJECT_UEVENT),
+        netlink_socket_admission(libc::AF_NETLINK as u64, libc::SOCK_STREAM as u64, NETLINK_KOBJECT_UEVENT),
         Err(libc::ESOCKTNOSUPPORT)
     );
     assert_eq!(
-        local_socket_kind(libc::AF_NETLINK as u64, libc::SOCK_DGRAM as u64, 9),
+        netlink_socket_admission(libc::AF_NETLINK as u64, libc::SOCK_DGRAM as u64, 9),
         Err(libc::EPROTONOSUPPORT)
     );
     assert_eq!(
-        local_socket_kind(
+        netlink_socket_admission(
             libc::AF_NETLINK as u64,
             libc::SOCK_DGRAM as u64 | (1 << 30),
             NETLINK_KOBJECT_UEVENT,
         ),
         Err(libc::EINVAL)
+    );
+    // AF_UNIX is kernel-local: netd owns no such family and never mints one.
+    assert_eq!(
+        netlink_socket_admission(linux_abi::AF_UNIX, libc::SOCK_STREAM as u64, 0),
+        Err(libc::EAFNOSUPPORT)
     );
     let pair_req = NetdIpcRequest {
         arg0: libc::AF_NETLINK as u64,
@@ -601,7 +586,7 @@ fn kobject_uevent_socket_admission_bind_options_recv_poll_and_teardown() {
         ..NetdIpcRequest::default()
     };
     assert_eq!(
-        handle_socketpair(&pair_req, &mut NetdIpcResponse::default(), 0),
+        handle_socketpair(&pair_req),
         libc::EOPNOTSUPP
     );
 
@@ -611,9 +596,9 @@ fn kobject_uevent_socket_admission_bind_options_recv_poll_and_teardown() {
     {
         let mut state = lock_net_state();
         state
-            .sockets
+            .netlink_sockets
             .insert(route_tok, netlink_socket_with_protocol(libc::SOCK_RAW as u64, NETLINK_ROUTE));
-        state.sockets.insert(
+        state.netlink_sockets.insert(
             uevent_tok,
             netlink_socket_with_protocol(libc::SOCK_DGRAM as u64, NETLINK_KOBJECT_UEVENT),
         );
@@ -632,9 +617,7 @@ fn kobject_uevent_socket_admission_bind_options_recv_poll_and_teardown() {
         let mut state = lock_net_state();
         // getsockname & getpeername
         let mut name = NetdIpcResponse::default();
-        let UnixSocketState::Netlink(uevent) = &state.sockets[&uevent_tok].state else {
-            panic!();
-        };
+        let uevent = &state.netlink_sockets[&uevent_tok].state;
         assert_eq!(uevent.portid(), 152);
         assert_eq!(uevent.groups(), 0x3);
         assert_eq!(uevent.protocol(), NETLINK_KOBJECT_UEVENT);
@@ -655,13 +638,11 @@ fn kobject_uevent_socket_admission_bind_options_recv_poll_and_teardown() {
         };
         apply_interface_snapshot(&mut state, updated);
         netlink::refresh_for_member(&mut state, uevent_tok);
-        let UnixSocketState::Netlink(uevent) = &state.sockets[&uevent_tok].state else {
-            panic!();
-        };
+        let uevent = &state.netlink_sockets[&uevent_tok].state;
         assert_eq!(uevent.queued_messages(), 0);
 
         // Poll: not readable, writable.
-        let revents = unix_socket_revents(
+        let revents = netlink_socket_revents(
             &state,
             uevent_tok,
             (linux_abi::POLLIN | linux_abi::POLLOUT) as u32,
@@ -687,7 +668,7 @@ fn kobject_uevent_socket_admission_bind_options_recv_poll_and_teardown() {
 
         // send on NETLINK_KOBJECT_UEVENT does not synthesize rtnetlink replies.
         assert_eq!(
-            send_socket_message_in_state(
+            netlink::send_message(
                 &mut state,
                 &request(uevent_tok, 152),
                 &dump_request(RTM_GETLINK, 0, 1),
@@ -753,13 +734,10 @@ fn kobject_uevent_socket_admission_bind_options_recv_poll_and_teardown() {
     // Proper teardown removes socket, readiness state, and returns token.
     let mut state = lock_net_state();
     state.socket_readiness_generation(uevent_tok);
-    let (retired_u, _, tokens_u) = retire_unix_socket(&mut state, uevent_tok);
-    let (retired_r, _, tokens_r) = retire_unix_socket(&mut state, route_tok);
-    assert_eq!(retired_u.len(), 1);
-    assert_eq!(tokens_u, vec![uevent_tok]);
-    assert_eq!(retired_r.len(), 1);
-    assert_eq!(tokens_r, vec![route_tok]);
-    assert!(!state.sockets.contains_key(&uevent_tok));
+    assert!(retire_netlink_socket(&mut state, uevent_tok).is_some());
+    assert!(retire_netlink_socket(&mut state, route_tok).is_some());
+    assert!(retire_netlink_socket(&mut state, route_tok).is_none());
+    assert!(!state.netlink_sockets.contains_key(&uevent_tok));
     assert!(!state.readiness_generations.contains_key(&uevent_tok));
     assert!(!state.readiness_observations.contains_key(&uevent_tok));
 }
@@ -769,15 +747,12 @@ fn netlink_no_enobufs_suppresses_overrun_error() {
     let mut state = NetState::new();
     let mut socket = netlink_socket(libc::SOCK_RAW as u64);
     socket.options.recv_buffer = 4096;
-    state.sockets.insert(1, socket);
+    state.netlink_sockets.insert(1, socket);
     let dump = dump_request(RTM_GETLINK, 0, 1);
     let mut sent = 0;
     while sent < 64 {
         {
-            let UnixSocketState::Netlink(netlink) = &mut state.sockets.get_mut(&1).unwrap().state
-            else {
-                panic!();
-            };
+            let netlink = &mut state.netlink_sockets.get_mut(&1).unwrap().state;
             if sent == 0 {
                 netlink.no_enobufs_for_test(true);
             }
@@ -785,7 +760,7 @@ fn netlink_no_enobufs_suppresses_overrun_error() {
                 break;
             }
         }
-        send_socket_message_in_state(&mut state, &request(1, 5), &dump, &[]).unwrap();
+        netlink::send_message(&mut state, &request(1, 5), &dump, &[]).unwrap();
         sent += 1;
     }
     let mut response = NetdIpcResponse::default();
@@ -796,4 +771,29 @@ fn netlink_no_enobufs_suppresses_overrun_error() {
             other => panic!("unexpected errno {other} with NETLINK_NO_ENOBUFS"),
         }
     }
+}
+
+#[test]
+fn recvmsg_through_the_recv_entry_point_carries_the_msghdr_envelope() {
+    let token = 0x9b0_0030_u64;
+    {
+        let mut state = lock_net_state();
+        state.netlink_sockets.insert(token, netlink_socket(libc::SOCK_RAW as u64));
+        make_readable(&mut state, token);
+    }
+    let recvmsg = NetdIpcRequest {
+        op: SYSCALL_OFFLOAD_OP_LINUX_RECVMSG,
+        socket_token: token,
+        payload_len: 4096,
+        ..NetdIpcRequest::default()
+    };
+    let mut response = NetdIpcResponse::default();
+    assert_eq!(super::socket_io::handle_recv(&recvmsg, &mut response), 0);
+    // The kernel parses `{data_len, control_len, msg_flags, _}` before the data.
+    let data_len = u32::from_ne_bytes(response.payload[0..4].try_into().unwrap()) as usize;
+    assert!(data_len > 0);
+    assert_eq!(response.value as usize, data_len);
+    assert_eq!(response.payload_len as usize, NETD_RECVMSG_PAYLOAD_HEADER_SIZE + data_len);
+    assert_eq!(&response.payload[4..8], &0_u32.to_ne_bytes());
+    lock_net_state().netlink_sockets.remove(&token);
 }

@@ -872,27 +872,8 @@ pub fn load_address_space_phys(root_phys: PhysAddr) {
     kernel_hal::api::arch::tlb::activate_address_space(root_phys);
 }
 
-pub fn with_kernel_address_space<R>(f: impl FnOnce() -> R) -> R {
-    interrupts::without_interrupts(|| {
-        let kernel_root = kernel_root_phys();
-        let current_root = current_root_phys();
-        if current_root == kernel_root {
-            return f();
-        }
-
-        load_address_space_phys(kernel_root);
-        let result = f();
-        load_address_space_phys(current_root);
-        result
-    })
-}
-
 pub fn higher_half_addr(addr: u64) -> u64 {
     crate::lowlevel::address::higher_half_addr(addr)
-}
-
-pub fn lower_half_addr(addr: u64) -> u64 {
-    crate::lowlevel::address::lower_half_addr(addr)
 }
 
 pub fn kernel_virtual_to_physical_addr(addr: u64) -> u64 {
@@ -993,16 +974,8 @@ fn direct_map_update_bounds(phys_addr: u64, size: usize) -> Option<(u64, u64)> {
     (end <= DIRECT_MAP_PHYS_LIMIT && start < end).then_some((start, end))
 }
 
-pub fn direct_map_phys_is_executable(phys_addr: u64) -> bool {
-    interrupts::without_interrupts(|| {
-        let pml4 = KERNEL_PML4.lock();
-        pml4.direct_map_phys_flags(phys_addr)
-            .is_some_and(|flags: PageTableFlags| !flags.contains(PageTableFlags::NO_EXECUTE))
-    })
-}
-
 pub fn debug_direct_map_flags_for_addr(addr: u64) -> Option<PageTableFlags> {
-    let phys_addr = lower_half_addr(addr);
+    let phys_addr = kernel_virtual_to_physical(addr);
     interrupts::without_interrupts(|| {
         let pml4 = KERNEL_PML4.lock();
         pml4.direct_map_phys_flags(phys_addr)

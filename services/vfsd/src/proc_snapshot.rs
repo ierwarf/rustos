@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 
 use rustos_user_abi::procfs::{
-    self as abi_procfs, ProcLimitsWire, ProcMapRegionWire, ProcProcessFactsWire,
+    ProcMapRegionWire, ProcProcessFactsWire,
     ProcThreadFactsWire, PROC_REGION_EXEC, PROC_REGION_READ, PROC_REGION_SHARED,
     PROC_REGION_WRITE,
 };
@@ -146,21 +146,6 @@ pub fn decode_thread_facts(bytes: &[u8]) -> Option<ThreadFacts> {
         blocked_signals: wire.blocked_signals,
         utime_ticks: wire.utime_ticks,
     })
-}
-
-/// Decodes a `PROC_FACTS_OP_LIMITS` payload.
-pub fn decode_limits_facts(bytes: &[u8]) -> Option<[Option<(u64, u64)>; 10]> {
-    ProcLimitsWire::decode(bytes).map(|w| w.limits)
-}
-
-/// Decodes a `PROC_FACTS_OP_FD_LIST` or `PROC_FACTS_OP_TID_LIST` payload.
-pub fn decode_u64_list(bytes: &[u8]) -> Option<Vec<u64>> {
-    let (count, payload) = abi_procfs::decode_u64_list_len(bytes)?;
-    let mut out = Vec::with_capacity(count.min(4096));
-    for chunk in payload.chunks_exact(8) {
-        out.push(u64::from_le_bytes(chunk.try_into().ok()?));
-    }
-    Some(out)
 }
 
 // ---- maps / smaps -----------------------------------------------------------------
@@ -347,53 +332,9 @@ pub fn format_oom_score_adj(process: &ProcessFacts) -> Vec<u8> {
     format!("{}\n", process.oom_score_adj).into_bytes()
 }
 
-pub const LIMIT_ROWS: [(usize, &str, &str); 10] = [
-    (0, "Max cpu time", "seconds"),
-    (1, "Max file size", "bytes"),
-    (2, "Max data size", "bytes"),
-    (3, "Max stack size", "bytes"),
-    (4, "Max core file size", "bytes"),
-    (5, "Max resident set", "bytes"),
-    (6, "Max processes", "processes"),
-    (7, "Max open files", "files"),
-    (8, "Max locked memory", "bytes"),
-    (9, "Max address space", "bytes"),
-];
-
-pub fn format_limits(limits: &[Option<(u64, u64)>; 10]) -> Vec<u8> {
-    let value = |v: u64| {
-        if v == RLIM_INFINITY {
-            String::from("unlimited")
-        } else {
-            format!("{v}")
-        }
-    };
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "{:<25} {:<20} {:<20} {:<10}",
-        "Limit", "Soft Limit", "Hard Limit", "Units"
-    );
-    for (index, label, units) in LIMIT_ROWS {
-        let Some((soft, hard)) = limits[index] else {
-            continue;
-        };
-        let _ = writeln!(
-            out,
-            "{:<25} {:<20} {:<20} {:<10}",
-            label,
-            value(soft),
-            value(hard),
-            units
-        );
-    }
-    out.into_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustos_user_abi::procfs::encode_u64_list;
 
     #[test]
     fn ring3_decodes_and_formats_process_and_thread_facts() {
@@ -462,9 +403,6 @@ mod tests {
 
         let statm = String::from_utf8(format_statm(&process)).unwrap();
         assert_eq!(statm, "2 10 0 2 0 0 0\n");
-
-        let n = encode_u64_list(&[0, 3, 9], &mut buf).unwrap();
-        assert_eq!(decode_u64_list(&buf[..n]), Some(alloc::vec![0, 3, 9]));
     }
 
     #[test]

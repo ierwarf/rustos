@@ -4,6 +4,15 @@ Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
 
+## Dead-code sweep + Phase 2 ABI/formal completion (2026-11-25, uncommitted)
+
+- **Done:** Completed the 3 kernel subagents interrupted by rate limits (`kernel-mm`/`hal`/`core`, `kernel-ps`, `kernel-compat`/`exec`/`ipc-runtime`) plus Phase 2 cleanup after Wave 1 `netd`/`vfsd`/`uiserver`/`runtimed` removals:
+  - Removed retired `netd` `AF_UNIX` & removed `vfsd` procfs wire ops/constants (`PROC_FACTS_OP_{FD_LIST,TID_LIST,LIMITS}`, `NET_BROKER_OP_{UNIX_CONNECT_BIND,RELEASE_SOCKET_CONTROL}`, `NetdIpcResponse::discarded_tail` -> `reserved2`, `ProcLimitsWire`, `encode_u64_list`) in `libs/rustos-user-abi`, and removed ~800 lines of unreachable `KernelHandle::Socket` / `PendingNetdTransfers` / `netd` `AF_UNIX` control paths in `kernel/compat` (`service_ops/`, `ipc_ops.rs`, `net_broker_ops.rs`) and `kernel/ps/src/user/socket.rs` (`SocketHandle`, `SocketError`).
+  - Removed dead `kernel/ps` wrappers (`protect_for_process`, `move_for_process`, `EpollInterestSnapshot`, unused imports/re-exports; gated test-only `PagerFaultTable::reserve` and `mark_process_exiting` with `#[cfg(test)]`), kept `ConsoleHandle::token_is_live` and `set_commit_state_for_process` (`docs/ai/address-space-lifecycle-contract.md`), removed dead `let _ = boot_info;` in `kernel/executive/src/boot.rs`, and added early `AF_UNIX` (`EAFNOSUPPORT`) rejection in `kernel/compat/src/user/syscall/windows/net_socket.rs` `afd_create`.
+  - Restored `memory::phys::tests::bounded_allocator_stays_under_limit` in `kernel/mm/src/memory/phys.rs` for `REQ-PFL-003`/`REQ-PFL-005` (`no-valid-free-run`), aligned `formal/contracts.toml`, `docs/ai/formal-contracts.generated.md`, `formal/smp-source-contracts.toml`, `formal/run-source-conformance.sh`, `formal/implementation-mutations.tsv`, `docs/ai/abi/ipc.md`, and `docs/validation/ring3-provider-custody-acceptance.md`.
+- **Verified (prior to this `session-handoff.md` append):** `cargo xtask check` (0), `cargo check --workspace --tests` (0 errors, 0 warnings), `cargo xtask build` (0), `cargo test --workspace --features rootd/host-test,procd/host-test` (all passed, 0 failed), `python3 formal/run-implementation-mutations.py --only ipc-reply-scheduling-custody-completion-return` (1/1 killed), `formal/verify-all.sh --profile pr` (rc=0, sealed 45 artifacts; `source-conformance` 1572 checks / 160 models), `cargo xtask kvm-smoke --timeout 120 --no-build --gui-dvm-surfaces --dvm-network-shmem` (rc=0, DVM authenticated L0 relay, `interactive-boot` trace conformance passed).
+- **Open / unverified:** `vfsd` `/sys/devices/system/cpu/{online,possible,present}` and `/proc/cpuinfo` still read `SYS_SCHED_GETAFFINITY` (affinity-restricted tasks see subset rather than hardware online CPUs); kernel-local `UnixSocketHandle` (`local_unix.rs`) does not charge sockets/buffers to process Job limits; multi-vCPU (`--rustos-vcpus 8`) gate, `--exercise-input`, `--exercise-network`, Chrome KVM launch, and `--profile nightly` were not run (re-seal with `formal/verify-all.sh --profile pr` / `cargo xtask verify` after this doc edit before push).
+
 ## Ring3 bug-fix fleet + interactive Chrome exits (2026-11-24, uncommitted)
 
 12 owner-disjoint Sonnet agents audited Ring3; 12 fixes landed (host tests only):
@@ -29,15 +38,42 @@ Interactive run (user: about:blank window opened then closed) had two separate c
    object file`. The image closure is DT_NEEDED-only; libnss3 dlopens softoken/freebl. Fixed in
    `tools/xtask/src/stage/runtime_libs.rs` (`NSS_DLOPEN_MODULES` staged as dlopen roots, cache
    use attributed to Chrome); image now holds all three. The harness boot never triggers NSS init,
-   so the fix is **not run-verified**.
+   so the fix is **not run-verified**. Re-run showed softoken now loads; `libnssckbi.so` was the next
+   missing module and was added too. Cause 1 is Chrome committing a 9x16 cursor buffer at scale 2;
+   `map_buffer_for_output` now rounds the logical size up instead of posting a fatal `invalid_size`.
+
+Keyboard (same day): `wl_seat` now advertises Keyboard. New `uiserver/src/wayland/keyboard.rs` +
+`keymap_us.xkb` (fully expanded `xkbcli compile-keymap --layout us --model pc105`, 71 KB, regenerate with
+that command) in one shared memfd sent as `wl_keyboard.keymap`; `repeat_info(25, 600)` (clients repeat,
+server REPEATED events are dropped); `wl_keyboard.key` carries evdev codes via
+`sys::rustos_key_code_to_linux` (inverse of `linux_key_code_to_rustos`); `modifiers` is sent only on change
+from the driver's post-event modifier bits (depressed Shift/Ctrl/Alt=Mod1/Meta=Mod4, locked Caps/Num);
+late `get_keyboard` on the focused client also gets `enter`. US layout only (no Korean/IME). Host
+tests 292 pass incl. a wire-level test; one Chrome boot shows no keymap errors, but typing into Chrome
+was NOT exercised (the harness cannot inject keys into a client).
 
 Open, found by agents, not fixed: Wayland per-client dispatch has no request budget
-(`wayland-backend` loops to WouldBlock); `wl_seat` advertises no keyboard; ICMPv6 (58) rejected
+(`wayland-backend` loops to WouldBlock); ICMPv6 (58) rejected
 and ICMP (1) accepted for AF_INET6 DGRAM in `net_broker_inet_socket_shape_valid`; FAT rename
 deletes the destination before renaming; console ioctls CREATE/CLOSE/BIND/SET_SESSION_STATE return
-fake success (`runtimed session.rs`); `kernel/.../memory_ops.rs bootstrap_brk` shrink keeps pages;
+fake success (`runtimed session.rs`); `kernel/compat/src/user/syscall/linux/memory_ops.rs` `bootstrap_brk` shrink keeps pages;
 netd AF_UNIX paths are dead since the kernel-local AF_UNIX; `DvmGpuTimeline::admit` ignores held
 outputs.
+
+### AF_UNIX policy + accept polling (same day)
+
+- `local_unix.rs`: `connect`/dgram destination now asks vfsd `ACCESS(W_OK, AT_EACCESS)` after the socket-inode
+  stat; `bind` creates the node with `0777 & ~umask` (was hardcoded 0777). New `query_umask()` in
+  `syscalld_ops.rs` (also replaces the duplicated query in `vfs_meta.rs`). Owner contract:
+  `docs/ai/abi/unix-socket.md`.
+- runtimed `accept_loop` waited with a 10 ms sleep + nonblocking `accept4` (~100 calls/s forever); it now
+  blocks in `poll(POLLIN)` on the listener (`wait_listener_readable`, test added). uiserver's acceptor was
+  already epoll-driven.
+- Verified: `cargo xtask check`, `cargo test -p runtimed --bins socket::` (23 pass), one 16-vCPU Chrome
+  `kvm-smoke` (passes, Wayland client accepted, compositor active). NOT verified: non-root connect denial,
+  the new accept call rate in a boot (counters were not re-added), 40-boot flake check.
+- Corrected assessment: Ring0 AF_UNIX "policy" was only the ~50-line name table; the real gaps were the
+  missing permission/mode policy above. Dead netd AF_UNIX files are still in the tree.
 
 ## Chrome launch flake root cause: slot republish revoke window (2026-11-24, uncommitted)
 

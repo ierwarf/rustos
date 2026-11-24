@@ -87,11 +87,6 @@ pub(crate) fn install_driver_framebuffer(info: FramebufferInfo, flags: u32) -> b
     backend.install_framebuffer(info, flags)
 }
 
-pub(crate) fn try_with_framebuffer<R>(f: impl FnOnce(&mut Framebuffer) -> R) -> Option<R> {
-    let mut backend = DISPLAY_BACKEND.try_lock()?;
-    backend.with_framebuffer(f)
-}
-
 /// `Err(())` means the backend lock is contended.  A syscall present must
 /// preserve its damage and retry; it must not wait while the entry path may
 /// have interrupts masked.

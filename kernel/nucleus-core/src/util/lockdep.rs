@@ -137,9 +137,6 @@ pub enum LockClass {
     DeviceIoctlRouteMemo = 44,
     /// Reply-edge ledger: inheritance independent of task-directory state.
     SchedulerDonation = 45,
-    /// One-shot pager frame capability custody. Never nests inside the
-    /// physical allocator or page-table owners.
-    PagerFrameGrant = 46,
     /// Serializes pager VMA writers; exception-time readers never acquire it.
     PagerVmaPublication = 47,
     /// Context budget/refill runtime: catalog/runqueue → context → domain.
@@ -833,67 +830,6 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
             None
         }
     }
-
-    #[track_caller]
-    pub fn lock_scheduler_bounded(
-        &self,
-        mut timed_out: impl FnMut() -> bool,
-    ) -> Option<TrackedSpinGuard<'_, T, CLASS>> {
-        #[cfg(rustos_boot_image)]
-        {
-            if CLASS != LockClass::Scheduler as u8 {
-                panic!("scheduler class required");
-            }
-            let irq_context = irq_context_depth() != 0;
-            if irq_context {
-                if preemption_disabled() {
-                    panic!("bounded IRQ scheduler acquisition entered with raw lock held");
-                }
-                if x86_64::instructions::interrupts::are_enabled() {
-                    panic!("bounded IRQ scheduler acquisition requires local IRQ exclusion");
-                }
-            }
-            let acquire_site = Location::caller();
-            let acquire_cpu = disable_preemption();
-            work_budget::charge_acquire_for_class::<CLASS>(acquire_cpu);
-            let pending =
-                before_acquire_with_irq_tracking(acquire_cpu, CLASS, acquire_site, !irq_context,
-                    x86_64::instructions::interrupts::are_enabled());
-            loop {
-                while self.inner.is_locked() {
-                    if timed_out() {
-                        cancel_pending_acquire_and_enable(CLASS);
-                        return None;
-                    }
-                    spin_loop();
-                }
-                if let Some(guard) = self.inner.try_lock() {
-                    after_acquire(pending);
-                    return Some(TrackedSpinGuard {
-                        guard: Some(guard),
-                        owner_cpu: tracked_guard_owner_cpu(),
-                        owner_apic_id: current_apic_id(),
-                        acquire_site: Some(acquire_site),
-                        acquire_preemption_depth: preemption_depth(),
-                        #[cfg(rustos_boot_image)]
-                        irqs_masked: false,
-                        #[cfg(rustos_boot_image)]
-                        lean: false,
-                    });
-                }
-                if timed_out() {
-                    cancel_pending_acquire_and_enable(CLASS);
-                    return None;
-                }
-                spin_loop();
-            }
-        }
-        #[cfg(not(rustos_boot_image))]
-        {
-            let _ = &mut timed_out;
-            Some(self.lock())
-        }
-    }
 }
 
 #[cfg(rustos_boot_image)]
@@ -994,27 +930,6 @@ pub fn current_lock_class_on(cpu: usize) -> Option<u8> {
 #[inline]
 pub fn current_lock_class_on(_cpu: usize) -> Option<u8> {
     None
-}
-
-#[inline]
-pub fn current_task_sleepable_lock_class() -> Option<u8> {
-    #[cfg(rustos_boot_image)]
-    {
-        // ORDERING: Acquire observes the scheduler's Release publication of
-        // the exact task whose sleepable stack may be inspected.
-        let owner = CPU_LOCK_STATE[current_cpu_index()].current_task_owner.load(Ordering::Acquire);
-        if owner == 0 {
-            return None;
-        }
-        return with_task_stack(owner, false, |stack| {
-            stack.len.checked_sub(1).map(|index| stack.classes[index])
-        })
-        .flatten();
-    }
-    #[cfg(not(rustos_boot_image))]
-    {
-        None
-    }
 }
 
 /// Record an already successful external try-lock as a raw, non-sleeping

@@ -67,7 +67,7 @@ helpers.
 | `boot` | `init_paging`, `init_phys`, `paging_smoke_test` | Early memory bootstrap. |
 | `phys` | `usable_bytes`, `free_bytes`, `alloc_frame`, `free_frame` | Physical frame accounting/allocation. |
 | `address_space` | `ProcessAddressSpace`, `PageTableFlags`, `debug_direct_map_flags_for_addr` | Process address space and debug helpers. |
-| `virt` | `higher_half_addr`, `kernel_virt_offset` | Higher-half address conversion. |
+| `virt` | `higher_half_addr`, `kernel_image_addr` | Higher-half address conversion. |
 
 ### Process/Scheduler API
 
@@ -193,7 +193,7 @@ allocator, paging, physical memory, virtual address helper는 `kernel_mm::api`�
 | `boot` | `init_paging`, `init_phys`, `paging_smoke_test` | early memory bootstrap |
 | `phys` | `usable_bytes`, `free_bytes`, `alloc_frame`, `free_frame` | physical frame accounting/allocation |
 | `address_space` | `ProcessAddressSpace`, `PageTableFlags`, `debug_direct_map_flags_for_addr` | process address space와 debug helper |
-| `virt` | `higher_half_addr`, `kernel_virt_offset` | higher-half address conversion |
+| `virt` | `higher_half_addr`, `kernel_image_addr` | higher-half address conversion |
 
 ### Process/Scheduler API
 

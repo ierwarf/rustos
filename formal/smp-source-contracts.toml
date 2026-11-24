@@ -911,14 +911,6 @@ tokens = [
     "finish_pending_lifecycle();",
 ]
 
-[[required_sequences]]
-path = "kernel/ps/src/user/socket.rs"
-tokens = [
-    "pub fn commit_send(mut self, accepted: usize) -> bool",
-    "self.start.checked_add(accepted)",
-    ".compare_exchange(self.start, end, Ordering::AcqRel, Ordering::Acquire)",
-]
-
 # A caller's scheduling class and its donation reservation are two questions
 # about one scheduler slot, reached through the same `find_task_slot`. Asking
 # them separately took the global scheduler lock twice, and masked interrupts
@@ -985,23 +977,6 @@ tokens = [
     # no other description in a shared receiver set can take it afterwards.
     "receiver_open_description == 0",
     "context.receiver_open_description != receiver_open_description",
-]
-
-[[required_sequences]]
-path = "kernel/compat/src/user/syscall/linux/service_ops/vfs_meta.rs"
-tokens = [
-    "write_current_iovec_payload(&iovecs,",
-    "write_current_control_payload(",
-    "write_current_user_struct(request.arg1, &header)",
-    "prepared.commit()?;",
-]
-
-[[required_sequences]]
-path = "kernel/compat/src/user/syscall/linux/net_broker_ops.rs"
-tokens = [
-    "NET_BROKER_OP_UNIX_CONNECT_BIND => broker_unix_connect_bind(args)",
-    "let channel_id = allocate_unix_channel_id()?;",
-    "socket.token_id() == args.arg1 && socket.bind_channel(channel_id, 1)",
 ]
 
 [[required_sequences]]

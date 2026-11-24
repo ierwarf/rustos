@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use boot_protocol::{
     BootInfo, BootVolumeIdentity, BootVolumeTransport, EARLY_SYSTEM_ENTRY_BYTES,
     EARLY_SYSTEM_HEADER_BYTES, EARLY_SYSTEM_PAYLOAD_ALIGNMENT, EarlySystemEntry, EarlySystemHeader,
-    FramebufferInfo, valid_early_system_path,
+    valid_early_system_path,
 };
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
@@ -68,13 +68,6 @@ pub fn bootstrap_phase() -> BootstrapPhase {
     BootstrapPhase::from_raw(BOOTSTRAP_PHASE.load(Ordering::Acquire))
 }
 
-pub fn kernel_vfs_runtime_active() -> bool {
-    matches!(
-        bootstrap_phase(),
-        BootstrapPhase::KernelVfsReady | BootstrapPhase::UserspaceReady
-    )
-}
-
 pub fn userspace_runtime_active() -> bool {
     bootstrap_phase() == BootstrapPhase::UserspaceReady
 }
@@ -90,10 +83,6 @@ pub fn enter_kernel_vfs_runtime() {
 
 pub fn enter_userspace_runtime() {
     set_bootstrap_phase(BootstrapPhase::UserspaceReady);
-}
-
-pub fn boot_framebuffer_info() -> Option<FramebufferInfo> {
-    boot_info().map(|info| info.framebuffer)
 }
 
 /// Boot-volume identity is diagnostic input only. Ring0 never opens the
@@ -154,18 +143,6 @@ pub fn read_file_range(
     let count = dest.len().min(payload.len() - offset);
     dest[..count].copy_from_slice(&payload[offset..offset + count]);
     Ok(Some(count))
-}
-
-/// Returns one fully admitted immutable early-system payload. The returned
-/// slice remains valid for the bootstrap lifetime and has already passed the
-/// exact entry digest check. Callers that need multiple ranges must retain
-/// this slice for the operation instead of revalidating the complete payload
-/// for every chunk.
-pub fn verified_file_bytes(path: &str) -> Result<Option<&'static [u8]>, BootstrapImageError> {
-    let Some(image) = early_system_image_bytes()? else {
-        return Ok(None);
-    };
-    cached_early_system_payload(image, path)
 }
 
 fn normalized_bootstrap_path(path: &str) -> Option<&str> {

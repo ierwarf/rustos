@@ -175,10 +175,6 @@ pub(in crate::multitask) struct SchedulerRuntimeProfile {
     /// this sum is the attempt count itself.
     pub(in crate::multitask) sync_handoff_misses:
         [u64; super::locality::SYNC_HANDOFF_MISS_REASON_COUNT],
-    /// Sub-reasons for `sync_handoff_misses`'s `DrainedStale` bucket, indexed
-    /// by `locality::SyncHandoffStaleReason`. Per-discard, not per-dispatch.
-    pub(in crate::multitask) sync_handoff_stale:
-        [u64; super::locality::SYNC_HANDOFF_STALE_REASON_COUNT],
     /// Arm-side (accepted, rejected) pairs, indexed by
     /// `locality::SyncHandoffArmSite` — call direction then reply direction.
     pub(in crate::multitask) sync_handoff_arms:
@@ -211,7 +207,7 @@ pub(in crate::multitask) struct SchedulerRuntimeProfile {
     /// exists so removing the global lock is preceded by proof that the owner
     /// word already means what the legacy tables mean.
     pub(in crate::multitask) run_authority_divergence: Option<(u64, u64, u64)>,
-    pub(in crate::multitask) local_dispatch_shadow: (u64, [u64; 7], u64, u64, u64, u64, u64, u64),
+    pub(in crate::multitask) local_dispatch_shadow: (u64, [u64; 7]),
     pub(in crate::multitask) top: [SchedulerRuntimeProfileEntry; PROFILE_TOP_TASKS],
 }
 
@@ -616,43 +612,18 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     for (reason_count, name) in [
         (
             profile.sync_handoff_misses[0],
-            "kernel-scheduler-step-sync-miss-empty",
-        ),
-        (
-            profile.sync_handoff_misses[1],
             "kernel-scheduler-step-sync-miss-streak",
         ),
         (
-            profile.sync_handoff_misses[2],
+            profile.sync_handoff_misses[1],
             "kernel-scheduler-step-sync-miss-stale",
         ),
         (
-            profile.sync_handoff_misses[3],
+            profile.sync_handoff_misses[2],
             "kernel-scheduler-step-sync-miss-flag-stale",
         ),
     ] {
         record_census_row(name, reason_count, sync_handoff_attempts);
-    }
-    // Sub-reasons within the `-miss-stale` bucket: which check inside
-    // `synchronous_handoff_record_is_ready` discarded a queued record.
-    // arg1 repeats the stale total, so each row's share of it is self-evident.
-    // Per-discard, not per-dispatch: one attempt can discard more than one.
-    let drained_stale = profile.sync_handoff_misses[2];
-    for (stale_count, name) in [
-        (
-            profile.sync_handoff_stale[0],
-            "kernel-scheduler-step-sync-stale-identity",
-        ),
-        (
-            profile.sync_handoff_stale[1],
-            "kernel-scheduler-step-sync-stale-custody",
-        ),
-        (
-            profile.sync_handoff_stale[2],
-            "kernel-scheduler-step-sync-stale-not-candidate",
-        ),
-    ] {
-        record_census_row(name, stale_count, drained_stale);
     }
     // Arm-side outcome, split by which direction armed it. arg0=accepted,
     // arg1=rejected. Tests whether a round trip's hint shortfall is one-sided.
@@ -1114,7 +1085,6 @@ mod tests {
             handoff_scan_calls: 0,
             sync_handoff_hits: 0,
             sync_handoff_misses: [0; super::locality::SYNC_HANDOFF_MISS_REASON_COUNT],
-            sync_handoff_stale: [0; super::locality::SYNC_HANDOFF_STALE_REASON_COUNT],
             sync_handoff_arms: [(0, 0); super::locality::SYNC_HANDOFF_ARM_SITE_COUNT],
             sync_handoff_reply_custody_fail: [0;
                 super::locality::SYNC_HANDOFF_REPLY_CUSTODY_FAIL_REASON_COUNT],
@@ -1125,7 +1095,7 @@ mod tests {
             live_ipc_donations: 0,
             divergent_identity_slot: usize::MAX,
             run_authority_divergence: None,
-            local_dispatch_shadow: (0, [0; 7], 0, 0, 0, 0, 0, 0),
+            local_dispatch_shadow: (0, [0; 7]),
             top: [SchedulerRuntimeProfileEntry::default(); PROFILE_TOP_TASKS],
         };
         assert!(pending.publish(profile));

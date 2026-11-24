@@ -269,13 +269,6 @@ pub fn privilege_stack_top_for_current_cpu() -> u64 {
     unsafe { (*TSS_SLOTS[cpu].0.get()).privilege_stack_table[0].as_u64() }
 }
 
-pub fn set_interrupt_stack(index: u16, stack_top: u64) {
-    let cpu = nucleus_core::util::lockdep::current_cpu_index();
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        set_interrupt_stack_for_cpu(cpu, index, stack_top);
-    });
-}
-
 fn set_interrupt_stack_for_cpu(logical_index: usize, index: u16, stack_top: u64) {
     if stack_top == 0 {
         panic!("GDT invariant: interrupt stack top must be non-zero");

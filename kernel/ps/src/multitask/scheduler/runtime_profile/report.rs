@@ -39,7 +39,6 @@ pub(super) fn project_window(
     (report.handoff_scan_ns, report.handoff_scan_calls) = super::super::locality::take_handoff_scan_window();
     report.sync_handoff_hits = super::super::locality::take_sync_handoff_hit_window();
     report.sync_handoff_misses = super::super::locality::take_sync_handoff_miss_window();
-    report.sync_handoff_stale = super::super::locality::take_sync_handoff_stale_window();
     report.sync_handoff_arms = super::super::locality::take_sync_handoff_arm_window();
     report.sync_handoff_reply_custody_fail = super::super::locality::take_sync_handoff_reply_custody_fail_window();
     report.sync_handoff_generation_fail_state = super::super::locality::take_sync_handoff_generation_fail_state_window();

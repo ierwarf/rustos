@@ -16,17 +16,17 @@ fn lifecycle_pool_is_required_for_all_charge_bearing_operations() {
     // Every charge-bearing operation is detached, not only provider waits.
     for op in [
         SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
-        SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
         SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
     ] {
-        assert!(is_accounting_request(&request_for(op, linux_abi::AF_UNIX)));
+        assert!(is_accounting_request(&request_for(op, linux_abi::AF_INET)));
     }
     for op in [
+        SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
         SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
         SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
         SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,
     ] {
-        assert!(!is_accounting_request(&request_for(op, linux_abi::AF_UNIX)));
+        assert!(!is_accounting_request(&request_for(op, linux_abi::AF_INET)));
     }
 }
 
@@ -203,20 +203,17 @@ fn oversize_reply_is_not_mistaken_for_an_abandoned_caller() {
 }
 
 #[test]
-fn unix_socket_table_ceiling_rejects_overflow_without_wrapping() {
+fn netlink_socket_table_ceiling_rejects_overflow() {
     let mut state = NetState::new();
-    assert!(state.unix_capacity_available(MAX_UNIX_SOCKETS));
-    assert!(!state.unix_capacity_available(MAX_UNIX_SOCKETS + 1));
-    assert!(!state.unix_capacity_available(usize::MAX));
-    for token in 1..=MAX_UNIX_SOCKETS as u64 {
+    assert!(state.netlink_capacity_available());
+    for token in 1..=MAX_NETLINK_SOCKETS as u64 {
         state
-            .sockets
-            .insert(token, super::local_socket_poll_tests::connected_socket(0));
+            .netlink_sockets
+            .insert(token, super::netlink_tests::netlink_socket(libc::SOCK_RAW as u64));
     }
-    assert!(!state.unix_capacity_available(1));
-    state.sockets.remove(&1);
-    assert!(state.unix_capacity_available(1));
-    assert!(!state.unix_capacity_available(2));
+    assert!(!state.netlink_capacity_available());
+    state.netlink_sockets.remove(&1);
+    assert!(state.netlink_capacity_available());
 }
 
 #[test]
@@ -236,212 +233,4 @@ fn ref_ack_rejects_an_operand_that_only_aliases_an_op_code_in_its_low_bits() {
     };
     // Unknown operation id: nothing to acknowledge, idempotent success.
     assert_eq!(acknowledge_ref_result(&exact), 0);
-}
-
-fn linked_pair(state: &mut NetState) {
-    let connected = super::local_socket_poll_tests::connected_socket;
-    state.sockets.insert(1, connected(2));
-    state.sockets.insert(2, connected(1));
-}
-
-fn peer_connected(state: &mut NetState) -> &mut ConnectedState {
-    match &mut state.sockets.get_mut(&2).unwrap().state {
-        UnixSocketState::Connected(connected) => connected,
-        _ => unreachable!(),
-    }
-}
-
-#[test]
-fn near_empty_plain_stream_send_never_reports_would_block() {
-    // EAGAIN on an AF_UNIX send is a capacity verdict, never a latency artefact:
-    // data-only sends fail only when the peer queue is full, regardless of how
-    // much ancillary custody other sockets of the same listener hold.
-    let mut state = NetState::new();
-    linked_pair(&mut state);
-    let request = NetdIpcRequest {
-        socket_token: 1,
-        ..NetdIpcRequest::default()
-    };
-    peer_connected(&mut state).pending_listener = Some(99);
-    state.sockets.insert(3, {
-        let mut other = super::local_socket_poll_tests::connected_socket(0);
-        if let UnixSocketState::Connected(connected) = &mut other.state {
-            connected.pending_listener = Some(99);
-            connected.incoming_control_bytes = SOCKET_CONTROL_BUFFER_CAPACITY;
-        }
-        other
-    });
-    assert_eq!(
-        send_socket_message_in_state(&mut state, &request, b"x", &[]),
-        Ok(1)
-    );
-    peer_connected(&mut state).incoming_bytes = SOCKET_BUFFER_CAPACITY - 1;
-    assert_eq!(
-        send_socket_message_in_state(&mut state, &request, b"xy", &[]),
-        Ok(1)
-    );
-    assert_eq!(
-        send_socket_message_in_state(&mut state, &request, b"z", &[]),
-        Err(libc::EAGAIN)
-    );
-}
-
-#[test]
-fn ancillary_send_is_refused_only_by_the_listener_wide_custody_budget() {
-    let mut state = NetState::new();
-    linked_pair(&mut state);
-    let request = NetdIpcRequest {
-        socket_token: 1,
-        ..NetdIpcRequest::default()
-    };
-    let control = [0_u8; 16];
-    peer_connected(&mut state).pending_listener = Some(99);
-    assert_eq!(
-        send_socket_message_in_state(&mut state, &request, b"x", &control),
-        Ok(1)
-    );
-    // A sibling accepted-but-unsettled socket exhausts the shared budget.
-    state.sockets.insert(3, {
-        let mut other = super::local_socket_poll_tests::connected_socket(0);
-        if let UnixSocketState::Connected(connected) = &mut other.state {
-            connected.pending_listener = Some(99);
-            connected.incoming_control_bytes = SOCKET_CONTROL_BUFFER_CAPACITY - 16;
-        }
-        other
-    });
-    assert_eq!(
-        send_socket_message_in_state(&mut state, &request, b"x", &control),
-        Err(libc::EAGAIN)
-    );
-    // Once the listener's accept publishes, the charge no longer applies.
-    peer_connected(&mut state).pending_listener = None;
-    assert_eq!(
-        send_socket_message_in_state(&mut state, &request, b"x", &control),
-        Ok(1)
-    );
-}
-
-#[test]
-fn unix_global_budget_bounds_unrelated_sockets_and_releases_payload_and_control() {
-    let mut state = NetState::new();
-    // Fill one shared budget through distinct queues, not a per-socket limit.
-    let bytes = vec![7; SOCKET_BUFFER_CAPACITY];
-    for pair in 0..UNIX_QUEUED_BYTE_CAPACITY / SOCKET_BUFFER_CAPACITY {
-        let sender = pair as u64 * 2 + 1;
-        let receiver = sender + 1;
-        state.sockets.insert(
-            sender,
-            super::local_socket_poll_tests::connected_socket(receiver),
-        );
-        state.sockets.insert(
-            receiver,
-            super::local_socket_poll_tests::connected_socket(sender),
-        );
-        let request = NetdIpcRequest {
-            socket_token: sender,
-            ..NetdIpcRequest::default()
-        };
-        assert_eq!(
-            send_socket_message_in_state(&mut state, &request, &bytes, &[]),
-            Ok(bytes.len())
-        );
-    }
-    linked_extra_pair(&mut state, 1001, 1002);
-    linked_extra_pair(&mut state, 1003, 1004);
-    state.record_readiness_changes();
-    state.readiness_publications.clear();
-    let send = NetdIpcRequest {
-        socket_token: 1001,
-        ..NetdIpcRequest::default()
-    };
-    assert_eq!(state.unix_queued_bytes, UNIX_QUEUED_BYTE_CAPACITY);
-    assert_eq!(
-        send_socket_message_in_state(&mut state, &send, b"x", &[]),
-        Err(libc::EAGAIN)
-    );
-    assert_eq!(
-        unix_socket_revents(&state, 1003, linux_abi::POLLOUT as u32),
-        Ok(0)
-    );
-    let recv = NetdIpcRequest {
-        socket_token: 2,
-        ..NetdIpcRequest::default()
-    };
-    recv_socket_bytes_in_state(&mut state, &recv, &mut [0; 32], false).unwrap();
-    state.record_readiness_changes();
-    assert!(
-        state
-            .readiness_publications
-            .iter()
-            .any(|entry| entry.0 == 1003),
-        "freeing capacity must wake senders unrelated to the receiving pair"
-    );
-    assert_eq!(
-        unix_socket_revents(&state, 1003, linux_abi::POLLOUT as u32),
-        Ok(linux_abi::POLLOUT as u32)
-    );
-    let before = state.unix_queued_bytes;
-    assert_eq!(
-        send_socket_message_in_state(&mut state, &send, &[0; 25], &[0; 8]),
-        Err(libc::EAGAIN)
-    );
-    assert_eq!(
-        state.unix_queued_bytes, before,
-        "ancillary messages are atomic under global pressure"
-    );
-    assert_eq!(
-        send_socket_message_in_state(&mut state, &send, b"12345678", &[0; 24]),
-        Ok(8)
-    );
-    assert_eq!(state.unix_queued_bytes, UNIX_QUEUED_BYTE_CAPACITY);
-    let recv = NetdIpcRequest {
-        socket_token: 1002,
-        ..NetdIpcRequest::default()
-    };
-    let result = recv_socket_bytes_in_state(&mut state, &recv, &mut [0; 4], false).unwrap();
-    assert_eq!(result.discarded.len(), 24);
-    assert_eq!(state.unix_queued_bytes, UNIX_QUEUED_BYTE_CAPACITY - 28);
-    retire_unix_socket(&mut state, 1002);
-    assert_eq!(state.unix_queued_bytes, UNIX_QUEUED_BYTE_CAPACITY - 32);
-    for token in state.sockets.keys().copied().collect::<Vec<_>>() {
-        retire_unix_socket(&mut state, token);
-    }
-    assert_eq!(state.unix_queued_bytes, 0);
-}
-
-fn linked_extra_pair(state: &mut NetState, left: u64, right: u64) {
-    state.sockets.insert(
-        left,
-        super::local_socket_poll_tests::connected_socket(right),
-    );
-    state.sockets.insert(
-        right,
-        super::local_socket_poll_tests::connected_socket(left),
-    );
-}
-
-#[test]
-fn unix_peek_leaves_queued_bytes_and_flags_ancillary_data() {
-    let mut state = NetState::new();
-    let mut socket = super::local_socket_poll_tests::connected_socket(0);
-    if let UnixSocketState::Connected(connected) = &mut socket.state {
-        connected.incoming.push_back(UnixStreamSegment {
-            bytes: b"ab".iter().copied().collect(),
-            control: Vec::new(),
-            ..Default::default()
-        });
-        connected.incoming.push_back(UnixStreamSegment {
-            bytes: b"cd".iter().copied().collect(),
-            control: vec![0; 8],
-            ..Default::default()
-        });
-        connected.incoming_bytes = 4;
-    }
-    state.sockets.insert(7, socket);
-    let mut dest = [0_u8; 3];
-    assert_eq!(peek_connected_bytes(&state, 7, &mut dest), Ok((3, true)));
-    assert_eq!(&dest, b"abc");
-    let mut dest = [0_u8; 8];
-    assert_eq!(peek_connected_bytes(&state, 7, &mut dest), Ok((4, true)));
-    assert_eq!(peek_connected_bytes(&state, 9, &mut dest), Err(libc::EBADF));
 }

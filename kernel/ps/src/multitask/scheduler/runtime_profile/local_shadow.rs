@@ -3,45 +3,25 @@
 #[cfg(rustos_scheduler_phase_profile)]
 use super::{SchedulerRuntimeProfile, pack_u32_pair};
 
-pub(super) fn take_observations() -> (u64, [u64; 7], u64, u64, u64, u64, u64, u64) {
+pub(super) fn take_observations() -> (u64, [u64; 7]) {
     #[cfg(rustos_scheduler_phase_profile)]
     return super::super::local_dispatch::drain_shadow_observations();
     #[cfg(not(rustos_scheduler_phase_profile))]
-    (0, [0; 7], 0, 0, 0, 0, 0, 0)
+    (0, [0; 7])
 }
 
 #[cfg(rustos_scheduler_phase_profile)]
 pub(super) fn emit_milestones(profile: &SchedulerRuntimeProfile) {
-    let (
-        qualified,
-        reasons,
-        matches,
-        mismatches,
-        catalog_fallbacks,
-        mismatch_witness,
-        local_vruntime,
-        catalog_vruntime,
-    ) = profile.local_dispatch_shadow;
+    let (qualified, reasons) = profile.local_dispatch_shadow;
+    // arg0/arg1 keep the decoder's `qualified | matches` and
+    // `mismatches | catalog_fallbacks` layout; the catalog comparison arm no
+    // longer exists, so only `qualified` is observed.
     crate::debug::record_milestone(
         crate::debug::LogCategory::Sched,
         "kernel-scheduler-local-shadow",
-        pack_u32_pair(qualified, matches),
-        pack_u32_pair(mismatches, catalog_fallbacks),
+        pack_u32_pair(qualified, 0),
+        0,
     );
-    if mismatch_witness != 0 {
-        crate::debug::record_milestone(
-            crate::debug::LogCategory::Sched,
-            "kernel-scheduler-local-shadow-mismatch",
-            mismatch_witness,
-            0,
-        );
-        crate::debug::record_milestone(
-            crate::debug::LogCategory::Sched,
-            "kernel-scheduler-local-shadow-mismatch-vruntime",
-            local_vruntime,
-            catalog_vruntime,
-        );
-    }
     if reasons.iter().any(|count| *count != 0) {
         crate::debug::record_milestone(
             crate::debug::LogCategory::Sched,

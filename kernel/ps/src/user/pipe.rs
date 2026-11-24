@@ -213,28 +213,6 @@ impl PipeState {
         discarded
     }
 
-    /// Moves up to `dest.len()` buffered bytes out, burying drained pages.
-    fn consume(&mut self, dest: &mut [u8], grave: &mut Graveyard) -> usize {
-        let mut copied = 0;
-        while copied < dest.len() {
-            let Some(front) = self.pages.front_mut() else {
-                break;
-            };
-            let take = (front.end - front.start).min(dest.len() - copied);
-            dest[copied..copied + take]
-                .copy_from_slice(&front.data[front.start..front.start + take]);
-            front.start += take;
-            copied += take;
-            if front.start == front.end {
-                let page = self.pages.pop_front().expect("front page exists");
-                grave.bury(page);
-            }
-        }
-        self.len -= copied;
-        self.read_total = self.read_total.wrapping_add(copied as u64);
-        copied
-    }
-
     /// Copies up to `dest.len()` buffered bytes without consuming them.
     fn peek(&self, dest: &mut [u8]) -> usize {
         let mut copied = 0;
@@ -342,33 +320,16 @@ impl PipeShared {
         }
     }
 
-    /// Reads up to `dest.len()` bytes. An empty pipe with no writer is EOF
-    /// (`Ok` with 0 bytes); with a writer it is `WouldBlock`.
+    /// Reads up to `dest.len()` bytes through the production
+    /// [`Self::read_with`] path with a no-op copy-out. An empty pipe with no
+    /// writer is EOF (`Ok` with 0 bytes); with a writer it is `WouldBlock`.
+    #[cfg(test)]
     pub fn try_read(&self, dest: &mut [u8]) -> Result<PipeProgress, PipeError> {
-        let mut grave = Graveyard::new();
-        let mut state = self.state.lock();
-        if dest.is_empty() {
-            return Ok(PipeProgress { bytes: 0, wake: None });
+        match self.read_with(dest, |_| Ok::<(), core::convert::Infallible>(())) {
+            Ok(progress) => Ok(progress),
+            Err(PipeReadError::Pipe(error)) => Err(error),
+            Err(PipeReadError::CopyOut(never)) => match never {},
         }
-        if state.len == 0 {
-            if !state.writer_open {
-                return Ok(PipeProgress { bytes: 0, wake: None });
-            }
-            return Err(PipeError::WouldBlock {
-                generation: state.read_generation,
-            });
-        }
-        let copied = state.consume(dest, &mut grave);
-        let wake = (copied != 0).then(|| {
-            state.write_generation += 1;
-            self.wake(PipeRole::Write, state.write_generation)
-        });
-        drop(state);
-        drop(grave);
-        Ok(PipeProgress {
-            bytes: copied,
-            wake,
-        })
     }
 
     /// Copy-then-commit read. Bytes are peeked, handed to `copy_out` (the
@@ -616,10 +577,6 @@ impl PipeHandle {
 
     pub fn token_id(&self) -> u64 {
         self.end.description.token()
-    }
-
-    pub fn path(&self) -> alloc::string::String {
-        alloc::format!("pipe:[{}]", self.end.shared.read_token)
     }
 
     /// Inode number reported by `fstat`: stable per pipe, shared by both ends.

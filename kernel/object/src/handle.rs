@@ -329,13 +329,6 @@ impl HandleRights {
             _ => false,
         }
     }
-
-    pub const fn allows_device_admin(self) -> bool {
-        match self {
-            Self::Device(rights) => rights.contains(DeviceHandleRights::ADMIN),
-            _ => false,
-        }
-    }
 }
 
 #[cfg(test)]

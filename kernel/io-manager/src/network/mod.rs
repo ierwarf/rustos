@@ -22,10 +22,6 @@ pub enum PacketError {
     Revoked,
 }
 
-pub fn available() -> bool {
-    transport_status(|| true) == Ok(PacketTransportStatus::Active)
-}
-
 pub fn transport_status(authorize: impl FnOnce() -> bool) -> Result<PacketTransportStatus, PacketError> {
     crate::io::dvm_network::transport_status(authorize)
 }

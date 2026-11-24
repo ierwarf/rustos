@@ -34,21 +34,14 @@ const fn config_word_data_port(offset: u8) -> u16 {
 
 const COMMAND_OFFSET: u8 = 0x04;
 const STATUS_OFFSET: u8 = 0x06;
-const REVISION_OFFSET: u8 = 0x08;
 const HEADER_TYPE_OFFSET: u8 = 0x0e;
-const CLASS_CODE_OFFSET: u8 = 0x0b;
-const SUBCLASS_OFFSET: u8 = 0x0a;
-const PROG_IF_OFFSET: u8 = 0x09;
 const SECONDARY_BUS_OFFSET: u8 = 0x19;
-const SUBSYSTEM_VENDOR_OFFSET: u8 = 0x2c;
-const SUBSYSTEM_DEVICE_OFFSET: u8 = 0x2e;
-const INTERRUPT_LINE_OFFSET: u8 = 0x3c;
-const INTERRUPT_PIN_OFFSET: u8 = 0x3d;
 const BAR0_OFFSET: u8 = 0x10;
 const CAPABILITIES_POINTER_OFFSET: u8 = 0x34;
 
 const COMMAND_IO_SPACE: u16 = 1 << 0;
 const COMMAND_MEMORY_SPACE: u16 = 1 << 1;
+#[cfg(test)]
 const COMMAND_BUS_MASTER: u16 = 1 << 2;
 
 const HEADER_TYPE_MASK: u8 = 0x7f;
@@ -169,6 +162,7 @@ impl ConfigState {
         }
     }
 
+    #[cfg(test)]
     fn is_attached(&self, config_key: u32) -> bool {
         self.attached
             .iter()
@@ -265,20 +259,6 @@ impl PciAttach {
     pub fn retain_permanent(self) {
         core::mem::forget(self);
     }
-
-    /// Enable memory decode and bus mastering on the owned function.
-    ///
-    /// Reachable only from an attach because it is a configuration write: an
-    /// unowned caller could otherwise re-enable decode on a function whose
-    /// owner had deliberately quiesced it.
-    pub fn enable_memory_bus_master(&self) {
-        self.device.enable_memory_bus_master();
-    }
-}
-
-/// Whether any driver currently claims this function.
-pub fn function_is_attached(device: PciDevice) -> bool {
-    CONFIG_STATE.lock().is_attached(device.config_key())
 }
 
 impl Drop for PciAttach {
@@ -388,72 +368,8 @@ impl PciDevice {
         self.read_u16(0x02)
     }
 
-    pub fn subsystem_vendor_id(self) -> u16 {
-        if self.header_type() == HEADER_TYPE_NORMAL {
-            self.read_u16(SUBSYSTEM_VENDOR_OFFSET)
-        } else {
-            0
-        }
-    }
-
-    pub fn subsystem_device_id(self) -> u16 {
-        if self.header_type() == HEADER_TYPE_NORMAL {
-            self.read_u16(SUBSYSTEM_DEVICE_OFFSET)
-        } else {
-            0
-        }
-    }
-
-    pub fn class_code(self) -> u8 {
-        self.read_u8(CLASS_CODE_OFFSET)
-    }
-
-    pub fn subclass(self) -> u8 {
-        self.read_u8(SUBCLASS_OFFSET)
-    }
-
-    pub fn prog_if(self) -> u8 {
-        self.read_u8(PROG_IF_OFFSET)
-    }
-
-    pub fn class(self) -> u32 {
-        ((self.class_code() as u32) << 16) | ((self.subclass() as u32) << 8) | self.prog_if() as u32
-    }
-
-    pub fn revision(self) -> u8 {
-        self.read_u8(REVISION_OFFSET)
-    }
-
     pub fn header_type(self) -> u8 {
         self.read_u8(HEADER_TYPE_OFFSET) & HEADER_TYPE_MASK
-    }
-
-    pub fn interrupt_line(self) -> u8 {
-        self.read_u8(INTERRUPT_LINE_OFFSET)
-    }
-
-    pub fn interrupt_pin(self) -> u8 {
-        self.read_u8(INTERRUPT_PIN_OFFSET)
-    }
-
-    pub fn devfn(self) -> u8 {
-        (self.device << 3) | self.function
-    }
-
-    pub fn config_size(self) -> i32 {
-        if crate::arch::acpi::pci_config_address(
-            self.segment,
-            self.bus,
-            self.device,
-            self.function,
-            0x100,
-        )
-        .is_some()
-        {
-            4096
-        } else {
-            256
-        }
     }
 
     pub fn is_present(self) -> bool {
@@ -503,10 +419,6 @@ impl PciDevice {
             offset = next;
         }
         None
-    }
-
-    fn enable_memory_bus_master(self) {
-        self.update_command_bits(COMMAND_MEMORY_SPACE | COMMAND_BUS_MASTER, 0);
     }
 
     pub fn standard_bar_count(self) -> usize {
@@ -631,16 +543,6 @@ impl PciDevice {
     fn write_u16(self, offset: u8, value: u16) {
         let _transaction = CONFIG_STATE.lock();
         self.write_u16_raw(offset, value);
-    }
-
-    /// Read-modify-write the command register as one transaction. A split
-    /// read and write would let a concurrent enumerator restore a stale
-    /// command word and leave the function permanently undecoded.
-    fn update_command_bits(self, set_bits: u16, clear_bits: u16) -> u16 {
-        let _transaction = CONFIG_STATE.lock();
-        let next = (self.read_u16_raw(COMMAND_OFFSET) | set_bits) & !clear_bits;
-        self.write_u16_raw(COMMAND_OFFSET, next);
-        next
     }
 
     fn write_u16_raw(self, offset: u8, value: u16) {

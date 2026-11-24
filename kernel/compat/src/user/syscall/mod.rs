@@ -211,11 +211,6 @@ unsafe fn finish_register_ipc_return(frame: *mut SyscallFrame) {
     boundary.active = 0;
 }
 
-pub use syscall_core::{
-    activate_linux_compat_cpu_local, linux_compat_current_task_offset,
-    linux_compat_stack_guard_offset, prepare_for_context_return, set_kernel_stack_top,
-    set_linux_compat_current_task_ptr, set_linux_compat_stack_guard, with_kernel_gs_base,
-};
 global_asm!(
     r#"
     .global syscall_entry

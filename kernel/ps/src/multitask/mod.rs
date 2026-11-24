@@ -67,7 +67,7 @@ pub use self::current::{
     complete_ipc_reply_wake_handoff_with_custody, complete_pager_fault_wake_handoff,
     complete_retired_task_cleanup, current_console_session, current_linux_thread_state,
     current_pager_charge_snapshot, current_pager_fault_install_permit, current_pager_vma_snapshot,
-    current_scheduling_context_runtime_snapshot, current_thread_cpu_time_ns, current_task_id, current_task_id_with_signal_hint,
+    current_scheduling_context_runtime_snapshot, current_thread_cpu_time_ns, current_task_id,
     current_thread_may_have_pending_signals, current_user_abi, current_user_address_space,
     current_user_id, current_user_ipc_entry, current_user_ipc_identity, current_user_job_charge_group, live_user_thread_ids, current_user_job_policy_allows, current_user_log_ids, current_user_process_id, current_user_process_identity,
     current_user_process_thread_count, current_user_snapshot, current_user_stack_state,
@@ -78,13 +78,13 @@ pub use self::current::{
     is_user_process_exiting, is_user_task_alive, linux_task_affinity, linux_thread_runnable_by_ids, linux_thread_snapshot_by_ids, set_linux_thread_comm_by_ids,
     user_target_abi_if_alive,
     live_user_process_identity_by_pid, live_user_process_identity_with_exact_exec_path,
-    mark_user_process_exiting, mark_user_process_exiting_once, next_retired_task_cleanup,
+    mark_user_process_exiting_once, next_retired_task_cleanup,
     note_process_exit_status, pager_vma_regions_for_process, parent_process_id_of,
-    publish_current_pager_vma, publish_inherited_pager_vma_for_process,
+    publish_inherited_pager_vma_for_process,
     publish_pager_vma_for_process, queue_linux_process_sigchld, queue_linux_process_signal, queue_linux_signal,
-    release_ipc_priority, release_pager_fault_priority, reserve_ipc_call_donation,
+    release_ipc_priority, reserve_ipc_call_donation,
     reserve_ipc_priority, retain_current_user_process_state, retire_current_user_task_due_to_fault,
-    revoke_current_pager_vma, revoke_pager_vma_for_process, service_deferred_work,
+    revoke_pager_vma_for_process, service_deferred_work,
     set_current_linux_tls_fs_base, set_linux_task_affinity, set_next_latency_pick_hint,
     set_next_pick_hint, set_next_process_pick_hint, set_next_spawn_pick_hint,
     set_windows_current_thread_affinity, set_windows_process_affinity,
@@ -94,7 +94,7 @@ pub use self::current::{
     terminate_user_task, user_log_ids_for_task, wait_for_child,
     wake_pager_service_waiter_for_process, wake_task, wake_user_task, windows_process_affinity,
     with_current_mm, with_current_process_credentials, with_current_process_state,
-    with_current_process_state_mut, with_current_user_linux_state_mut,
+    with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_current_user_process_state_mut, with_fork_parent_state, with_fork_parent_vfork_state,
     with_process_state_by_pid,
@@ -104,15 +104,13 @@ pub use self::process_table::{for_each_visible_process_state_mut, live_process_c
 pub use self::pager_fault::{
     cancel_pager_fault, claim_pager_fault_reply_from_pager, consume_pager_fault_reply,
     mark_pager_fault_blocked, pager_fault_snapshot, register_pager_fault_waiter,
-    reserve_pager_fault, reserve_pager_fault_with_dispatch_grant,
+    reserve_pager_fault_with_dispatch_grant,
     take_next_pager_fault_for_rendezvous, take_pager_fault_waiter_for,
     unregister_pager_fault_waiter, PagerFaultReservation, PagerFaultSlotError, PagerFaultState,
 };
 pub use self::pager_vma::{
     first_mapping_conflict as first_user_mapping_conflict,
-    move_for_process as move_pager_vma_range_for_process,
     move_for_process_with_ceiling as move_pager_vma_range_for_process_with_ceiling,
-    protect_for_process as protect_pager_vma_for_process,
     protect_for_process_with_ceiling as protect_pager_vma_for_process_with_ceiling,
     set_commit_state_for_process as set_pager_vma_commit_state_for_process,
     unmap_for_process as unmap_pager_vma_for_process,
@@ -154,7 +152,6 @@ pub use self::task_capacity::{
     CAPACITY as TASK_CAPACITY,
 };
 
-#[allow(unused_imports)]
 pub(crate) use self::irq::{
     claim_interruptible_syscall_reschedule, cond_resched, request_deferred_reschedule,
     request_user_return_reschedule, request_yield_reschedule, reschedule_if_requested,
@@ -285,12 +282,6 @@ impl RetainedCurrentUserProcessState {
             .with_visible_state(|_, state| f(state))
             .expect("retained current process crossed an exec staging boundary")
     }
-
-    pub fn with_address_space<R>(&self, f: impl FnOnce(&ProcessAddressSpace) -> R) -> R {
-        self.process
-            .with_visible_state(|_, state| f(state.address_space()))
-            .expect("retained current address space crossed an exec staging boundary")
-    }
 }
 
 impl RetainedCurrentUserAddressSpace {
@@ -319,12 +310,6 @@ impl RetainedCurrentUserAddressSpace {
     pub fn try_with_process_state<R>(&self, f: impl FnOnce(&UserProcessState) -> R) -> Option<R> {
         self.process
             .with_exact_visible_state(self.identity, |_, state| f(state))
-    }
-
-    pub fn with_address_space<R>(&self, f: impl FnOnce(&ProcessAddressSpace) -> R) -> R {
-        self.process
-            .with_exact_visible_state(self.identity, |_, state| f(state.address_space()))
-            .expect("retained current address space crossed its exact MM generation")
     }
 
     pub fn try_with_address_space<R>(

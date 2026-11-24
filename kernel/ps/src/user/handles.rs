@@ -4,7 +4,6 @@ use crate::user::eventfd::EventFdHandle;
 use crate::user::linux as linux_abi;
 use crate::user::memfd::MemfdHandle;
 use crate::user::pipe::PipeHandle;
-use crate::user::socket::SocketHandle;
 use crate::user::unix_socket::UnixSocketHandle;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -196,7 +195,6 @@ pub enum KernelHandle {
     Memfd(MemfdHandle),
     Pipe(PipeHandle),
     RemoteVfs(RemoteVfsHandle),
-    Socket(SocketHandle),
     UnixSocket(UnixSocketHandle),
     VfsDirectory(VfsDirectoryHandle),
     DisplaySurface(DisplaySurfaceHandle),
@@ -508,7 +506,6 @@ impl KernelHandle {
                 HandleToken::from_nonreusable_open_description(HandleOwner::Io, remote.token_id())
                     .expect("remote VFS open-description token is nonzero and nonreusable")
             }
-            Self::Socket(socket) => HandleToken::new(HandleOwner::Compat, socket.token_id()),
             Self::UnixSocket(socket) => HandleToken::from_nonreusable_open_description(
                 HandleOwner::Ps,
                 socket.token_id(),
@@ -524,35 +521,10 @@ impl KernelHandle {
         }
     }
 
-    pub const fn kind_name(&self) -> &'static str {
-        match self {
-            Self::Job(_) => "job",
-            Self::Console(_) => "console",
-            Self::Device(_) => "device",
-            Self::Epoll(_) => "epoll",
-            Self::EventFd(_) => "eventfd",
-            Self::Pipe(_) => "pipe",
-            Self::InetSocket(_) => "inet-socket",
-            Self::Memfd(_) => "memfd",
-            Self::RemoteVfs(_) => "remote-vfs",
-            Self::Socket(_) => "socket",
-            Self::UnixSocket(_) => "unix-socket",
-            Self::VfsDirectory(_) => "vfs-dir",
-            Self::DisplaySurface(_) => "display-surface",
-            Self::DeviceBuffer(_) => "device-buffer",
-        }
-    }
-
+    #[cfg(test)]
     pub fn console_stream(&self) -> Option<ConsoleStreamKind> {
         match self {
             Self::Console(console) => Some(console.stream()),
-            _ => None,
-        }
-    }
-
-    pub fn console_handle(&self) -> Option<&ConsoleHandle> {
-        match self {
-            Self::Console(handle) => Some(handle),
             _ => None,
         }
     }
@@ -623,7 +595,7 @@ impl KernelHandle {
                     HandleRights::File(FileHandleRights::READ.union(FileHandleRights::TRANSFER))
                 }
             },
-            Self::Socket(_) | Self::UnixSocket(_) => HandleRights::Socket(
+            Self::UnixSocket(_) => HandleRights::Socket(
                 SocketHandleRights::SEND
                     .union(SocketHandleRights::RECV)
                     .union(SocketHandleRights::PASS_FD)
@@ -657,7 +629,6 @@ impl KernelHandle {
         matches!(
             self,
             Self::Job(_)
-                | Self::Socket(_)
                 | Self::UnixSocket(_)
                 | Self::Memfd(_)
                 | Self::Pipe(_)
@@ -666,38 +637,6 @@ impl KernelHandle {
                 | Self::RemoteVfs(_)
                 | Self::DeviceBuffer(_)
         ) && rights.allows_transfer()
-    }
-
-    pub fn socket_handle(&self) -> Option<&SocketHandle> {
-        match self {
-            Self::Socket(handle) => Some(handle),
-            _ => None,
-        }
-    }
-
-    pub fn procfs_link_target(&self, token: HandleToken) -> alloc::string::String {
-        match self {
-            Self::Job(job) => alloc::format!("anon_inode:[rustos-job:{}]", job.to_raw()),
-            Self::Console(_) => alloc::string::String::from("/dev/tty"),
-            Self::Device(device) => alloc::string::String::from(device.device_id().path()),
-            Self::Epoll(epoll) => alloc::string::String::from(epoll.path()),
-            Self::EventFd(eventfd) => eventfd.path(),
-            Self::Pipe(pipe) => pipe.path(),
-            Self::InetSocket(socket) => {
-                alloc::format!("socket:[rustos-inet:{}]", socket.token_id())
-            }
-            Self::Memfd(memfd) => memfd.path(),
-            Self::RemoteVfs(remote) => remote.path(),
-            Self::Socket(socket) => socket.bound_path().unwrap_or_else(|| {
-                alloc::format!("socket:[rustos-unix-stream:{}]", token.object_id())
-            }),
-            Self::UnixSocket(socket) => alloc::format!("socket:[{}]", socket.token_id()),
-            Self::VfsDirectory(directory) => alloc::string::String::from(directory.path()),
-            Self::DisplaySurface(_) => {
-                alloc::format!("anon_inode:[rustos-display-surface:{}]", token.object_id())
-            }
-            Self::DeviceBuffer(_) => alloc::format!("anon_inode:[rustos-device-buffer:{}]", token.object_id()),
-        }
     }
 }
 

@@ -58,8 +58,7 @@ fn frames(args: &RustosLibraryMapProbeArgs) -> u64 {
         true
     };
     // The caller itself must be the probe executable, whatever it inspects.
-    let Some(caller_ok) = multitask::with_current_user_process_state(|pid, _, state| {
-        let _ = pid;
+    let Some(caller_ok) = multitask::with_current_user_process_state(|_, _, state| {
         state.exec_path() == LIBRARY_MAP_PROBE_EXEC_PATH
     }) else {
         return linux_errno(LINUX_ESRCH);

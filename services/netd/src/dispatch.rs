@@ -67,7 +67,7 @@ pub(super) fn dispatch_request(
     }
     let status = match request.op {
         SYSCALL_OFFLOAD_OP_LINUX_SOCKET => handle_socket(request, response, reply_cap),
-        SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR => handle_socketpair(request, response, reply_cap),
+        SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR => handle_socketpair(request),
         SYSCALL_OFFLOAD_OP_LINUX_DUP => handle_dup(request),
         SYSCALL_OFFLOAD_OP_LINUX_CLOSE => handle_close(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_BIND => handle_bind(request),
@@ -224,13 +224,5 @@ pub(super) fn request_msg_flags(request: &NetdIpcRequest) -> u64 {
     match request.op {
         SYSCALL_OFFLOAD_OP_LINUX_SENDMSG | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => request.arg2,
         _ => request.arg3,
-    }
-}
-
-pub(super) fn request_credentials(request: &NetdIpcRequest) -> Credentials {
-    Credentials {
-        pid: request.pid as i32,
-        uid: request.euid,
-        gid: request.egid,
     }
 }

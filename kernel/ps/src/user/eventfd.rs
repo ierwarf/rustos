@@ -131,14 +131,6 @@ impl EventFdHandle {
         self.object.description.token()
     }
 
-    pub fn is_semaphore(&self) -> bool {
-        self.object.semaphore
-    }
-
-    pub fn path(&self) -> alloc::string::String {
-        alloc::string::String::from("anon_inode:[eventfd]")
-    }
-
     pub fn status_flags(&self) -> u64 {
         linux_abi::O_RDWR
             | if self.object.description.nonblocking() {
@@ -178,14 +170,13 @@ impl EventFdHandle {
     /// Commits a previously peeked read after copy-out succeeds, waking writers.
     pub fn commit_read(&self, value: u64) -> Result<LocalWake, EventFdError> {
         let mut state = self.object.state.lock();
-        let consumed = if self.object.semaphore {
+        if self.object.semaphore {
             if state.counter == 0 {
                 return Err(EventFdError::WouldBlock {
                     generation: state.generation,
                 });
             }
             state.counter -= 1;
-            1
         } else {
             if state.counter < value {
                 return Err(EventFdError::WouldBlock {
@@ -193,32 +184,19 @@ impl EventFdHandle {
                 });
             }
             state.counter -= value;
-            value
-        };
-        let _ = consumed;
+        }
         state.generation += 1;
         state.out_generation += 1;
         Ok(self.object.wake(state.generation))
     }
 
-    /// `read`: returns the counter (or 1 in semaphore mode) and zeroes it (or
-    /// decrements it). A zero counter is `WouldBlock`.
+    /// `read` through the production peek-then-commit path: returns the counter
+    /// (or 1 in semaphore mode) and zeroes it (or decrements it). A zero counter
+    /// is `WouldBlock`.
+    #[cfg(test)]
     pub fn try_read(&self) -> Result<(u64, LocalWake), EventFdError> {
-        let mut state = self.object.state.lock();
-        if state.counter == 0 {
-            return Err(EventFdError::WouldBlock {
-                generation: state.generation,
-            });
-        }
-        let value = if self.object.semaphore {
-            state.counter -= 1;
-            1
-        } else {
-            core::mem::take(&mut state.counter)
-        };
-        state.generation += 1;
-        state.out_generation += 1;
-        Ok((value, self.object.wake(state.generation)))
+        let value = self.peek_read()?;
+        Ok((value, self.commit_read(value)?))
     }
 
     /// `write`: adds `value`. `WouldBlock` if the sum would pass

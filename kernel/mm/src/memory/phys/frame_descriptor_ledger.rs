@@ -1275,6 +1275,7 @@ impl FrameDescriptorLedger {
         Some(self.remove_shared_mapping_locked(frame, 0, 0, 0, CowFrameKind::PrivateFileSection, true))
     }
 
+    #[cfg(test)]
     fn claim_private_file_data(
         &self,
         root_phys: u64,
@@ -1320,6 +1321,7 @@ impl FrameDescriptorLedger {
         DataClaim::Claimed
     }
 
+    #[cfg(test)]
     fn publish_private_file_data(&self, root_phys: u64, va: u64, frame_phys: u64) {
         let root = self
             .verify_root(root_phys)
@@ -1338,20 +1340,6 @@ impl FrameDescriptorLedger {
                 .swap(ROLE_SHARED_PRIVATE_FILE_LIVE, DESCRIPTOR_RELEASE),
             ROLE_SHARED_PRIVATE_FILE_LOCKED
         );
-    }
-
-    fn cancel_private_file_data(&self, root_phys: u64, va: u64, frame_phys: u64) {
-        let frame = self
-            .record(frame_phys)
-            .expect("cancelled private-file frame is outside descriptors");
-        assert_eq!(
-            frame.role.load(DESCRIPTOR_ACQUIRE),
-            ROLE_SHARED_PRIVATE_FILE_LOCKED
-        );
-        assert_eq!(frame.owner_or_table_head.load(Ordering::Relaxed), root_phys);
-        assert_eq!(frame.next_or_virtual_address.load(Ordering::Relaxed), va);
-        self.clear_shared_frame(frame);
-        self.uncharge_root(self.verify_root(root_phys).expect("missing private-file root"), 1);
     }
 
     fn data_is_owned(&self, root_phys: u64, va: u64, frame_phys: u64) -> bool {

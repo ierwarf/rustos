@@ -766,7 +766,7 @@ impl VfsStorage {
             Some(read) => Ok(read),
             None => {
                 self.invalidate_caches_if_remounted();
-                let (mount_id, rel_path, key, _parent_key, caps, _is_immutable, volume, read_map_source) =
+                let (_mount_id, rel_path, key, _parent_key, caps, _is_immutable, volume, read_map_source) =
                     self.resolve_mount(path)?;
                 if caps.posix_nodes() {
                     // Mutable memory filesystem: no path-keyed content cache.
@@ -818,7 +818,7 @@ impl VfsStorage {
                 }
 
                 if let Some(rms) = read_map_source {
-                    return self.read_mapped_file_on(mount_id, &rel_path, &key, &*rms, file_len, start, dest);
+                    return self.read_mapped_file_on(&rel_path, &key, &*rms, file_len, start, dest);
                 }
                 volume
                     .read_at(&rel_path, start, dest)
@@ -941,7 +941,6 @@ impl VfsStorage {
 
     fn read_mapped_file_on(
         &mut self,
-        _mount_id: u64,
         rel_path: &str,
         key: &CacheKey,
         read_map_source: &dyn vfsd::mount_table::ReadMapSupport,

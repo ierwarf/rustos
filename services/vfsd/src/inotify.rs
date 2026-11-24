@@ -7,7 +7,8 @@
 //!   records, and enforces `max_user_instances`, `max_user_watches`, and
 //!   `max_queued_events` reported under `/proc/sys/fs/inotify/*`.
 //! - **Lifecycle:** `IN_IGNORED` is emitted on `inotify_rm_watch`, target
-//!   deletion, `IN_ONESHOT` delivery, and unmount (`IN_UNMOUNT` then `IN_IGNORED`).
+//!   deletion, and `IN_ONESHOT` delivery. `vfsd` has no mount/umount operation
+//!   (both answer `EOPNOTSUPP`), so no `IN_UNMOUNT` event is produced.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
@@ -217,10 +218,6 @@ impl InotifyRegistry {
 
     pub fn total_watch_count(&self) -> usize {
         self.instances.values().map(|inst| inst.watches.len()).sum()
-    }
-
-    pub fn contains_instance(&self, remote_id: u64) -> bool {
-        self.instances.contains_key(&remote_id)
     }
 
     pub fn create_instance(&mut self, remote_id: u64) -> Result<(), i32> {
@@ -472,37 +469,6 @@ impl InotifyRegistry {
                 if instance.watches.remove(&wd).is_some()
                     && instance.push_event(wd, linux_abi::IN_IGNORED, 0, &[])
                 {
-                    changed = true;
-                }
-            }
-            if changed {
-                woken.push(remote_id);
-            }
-        }
-        woken
-    }
-
-    pub fn remove_unmounted(&mut self, mount_id: u64, mount_generation: u64) -> Vec<u64> {
-        let mut woken = Vec::new();
-        for (&remote_id, instance) in &mut self.instances {
-            let matching: Vec<i32> = instance
-                .watches
-                .iter()
-                .filter(|(_, w)| {
-                    w.target.mount_id == mount_id && w.target.mount_generation == mount_generation
-                })
-                .map(|(wd, _)| *wd)
-                .collect();
-            if matching.is_empty() {
-                continue;
-            }
-            let mut changed = false;
-            for wd in matching {
-                instance.watches.remove(&wd);
-                if instance.push_event(wd, linux_abi::IN_UNMOUNT, 0, &[]) {
-                    changed = true;
-                }
-                if instance.push_event(wd, linux_abi::IN_IGNORED, 0, &[]) {
                     changed = true;
                 }
             }
@@ -789,9 +755,7 @@ mod tests {
     fn instance_is_independent_of_creating_process_and_removed_on_close() {
         let mut reg = InotifyRegistry::new();
         reg.create_instance(14).unwrap();
-        assert!(reg.contains_instance(14));
         reg.remove_instance(14);
-        assert!(!reg.contains_instance(14));
         assert_eq!(reg.read_events(14, &mut [0_u8; 32]), Err(EBADF));
     }
 

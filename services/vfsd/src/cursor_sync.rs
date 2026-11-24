@@ -7,7 +7,7 @@
 use rustos_user_abi::syscall::{VFS_LSEEK_FLAG_SYNC_CURSOR, VFS_WRITE_FLAG_CURSOR_SYNC};
 
 use crate::{
-    EAGAIN, EINVAL, EIO, EOPNOTSUPP, VFSD_OPEN_MUTATION_GETDENTS, VFSD_OPEN_MUTATION_READ,
+    EINVAL, EIO, EOPNOTSUPP, VFSD_OPEN_MUTATION_GETDENTS, VFSD_OPEN_MUTATION_READ,
     VFSD_OPEN_MUTATION_STABLE,
 };
 
@@ -118,12 +118,6 @@ pub const fn resolve_write_base_cursor(
     } else {
         Ok(handle_cursor)
     }
-}
-
-/// Maps `EAGAIN` check for `vfs_read` if needed by callers; keeps `EAGAIN` used
-/// cleanly across configurations.
-pub const fn input_device_read_errno() -> i32 {
-    EAGAIN
 }
 
 #[cfg(test)]

@@ -63,6 +63,7 @@ mod compositor;
 mod data_device;
 mod dmabuf;
 mod input;
+mod keyboard;
 mod output;
 mod seat;
 mod shm;
@@ -1164,6 +1165,12 @@ struct WaylandState {
     pointer_focus: Option<PointerFocus>,
     pointer_target: Option<u32>,
     keyboard_focus: Option<KeyboardFocus>,
+    /// Shared `wl_keyboard.keymap` file, created on the first seat bind.
+    keymap: Option<keyboard::KeymapFile>,
+    /// `(depressed, locked)` XKB modifier masks last announced to clients.
+    keyboard_mods: (u32, u32),
+    /// Remaining keyboard delivery lines to log (bounded diagnostics).
+    keyboard_diag_budget: u8,
     pointer_x: u32,
     pointer_y: u32,
     pointer_button_down: bool,

@@ -1,13 +1,8 @@
 #![no_std]
 
 use bitflags::bitflags;
-use pc_keyboard::{
-    KeyCode as PcKeyCode, KeyEvent as PcKeyEvent, KeyState as PcKeyState,
-    ScancodeSet as PcScancodeSet, ScancodeSet1, ScancodeSet2,
-};
 
 const EVENT_QUEUE_CAPACITY: usize = 128;
-const TEXT_QUEUE_CAPACITY: usize = 512;
 
 struct RingBuffer<T: Copy, const CAPACITY: usize> {
     data: [Option<T>; CAPACITY],
@@ -24,10 +19,6 @@ impl<T: Copy, const CAPACITY: usize> RingBuffer<T, CAPACITY> {
         }
     }
 
-    fn len(&self) -> usize {
-        self.len
-    }
-
     fn push_overwrite(&mut self, value: T) {
         self.normalize_head();
         if self.len == CAPACITY {
@@ -42,18 +33,6 @@ impl<T: Copy, const CAPACITY: usize> RingBuffer<T, CAPACITY> {
         self.len += 1;
     }
 
-    fn push(&mut self, value: T) -> bool {
-        self.normalize_head();
-        if self.len == CAPACITY {
-            return false;
-        }
-
-        let tail = (self.head + self.len) % CAPACITY;
-        self.data[tail] = Some(value);
-        self.len += 1;
-        true
-    }
-
     fn pop(&mut self) -> Option<T> {
         self.normalize_head();
         if self.len == 0 {
@@ -64,18 +43,6 @@ impl<T: Copy, const CAPACITY: usize> RingBuffer<T, CAPACITY> {
         self.head = (self.head + 1) % CAPACITY;
         self.len -= 1;
         value
-    }
-
-    fn pop_into(&mut self, dest: &mut [T]) -> usize {
-        let mut count = 0;
-        for slot in dest.iter_mut() {
-            let Some(value) = self.pop() else {
-                break;
-            };
-            *slot = value;
-            count += 1;
-        }
-        count
     }
 
     fn normalize_head(&mut self) {
@@ -237,65 +204,23 @@ pub struct KeyboardEvent {
     pub text: Option<u8>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ScanCodeSet {
-    Set1,
-    Set2,
-}
-
-impl ScanCodeSet {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Set1 => "set1",
-            Self::Set2 => "set2",
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum ParsedKey {
-    Direct { code: KeyCode, released: bool },
-}
-
 pub struct KeyboardDriver {
-    parser: ScanCodeParser,
     pressed: [bool; KEY_CODE_COUNT],
     caps_lock: bool,
     num_lock: bool,
     scroll_lock: bool,
     events: RingBuffer<KeyboardEvent, EVENT_QUEUE_CAPACITY>,
-    text: RingBuffer<u8, TEXT_QUEUE_CAPACITY>,
 }
 
 impl KeyboardDriver {
     pub const fn new() -> Self {
         Self {
-            parser: ScanCodeParser::new(),
             pressed: [false; KEY_CODE_COUNT],
             caps_lock: false,
             num_lock: false,
             scroll_lock: false,
             events: RingBuffer::new(),
-            text: RingBuffer::new(),
         }
-    }
-
-    pub fn set_scan_code_set(&mut self, scan_set: ScanCodeSet) {
-        self.parser.set_scan_set(scan_set);
-    }
-
-    pub fn feed_scancode(&mut self, scancode: u8) {
-        if matches!(scancode, KEYBOARD_RESPONSE_ACK | KEYBOARD_RESPONSE_RESEND)
-            || is_non_scancode_response(scancode)
-        {
-            return;
-        }
-
-        let Some(parsed) = self.parser.push(scancode) else {
-            return;
-        };
-        let ParsedKey::Direct { code, released } = parsed;
-        self.inject_key_transition(code, released);
     }
 
     pub fn inject_key_transition(&mut self, code: KeyCode, released: bool) {
@@ -310,9 +235,6 @@ impl KeyboardDriver {
         };
 
         self.events.push_overwrite(event);
-        if let Some(byte) = text {
-            let _ = self.text.push(byte);
-        }
     }
 
     /// End one untrusted input-provider session without leaving its pressed
@@ -320,9 +242,7 @@ impl KeyboardDriver {
     /// events are discarded before the synthetic releases so consumers never
     /// observe stale text or a key press after its provider was revoked.
     pub fn reset_provider_state(&mut self) {
-        self.parser.reset();
         self.events = RingBuffer::new();
-        self.text = RingBuffer::new();
         self.caps_lock = false;
         self.num_lock = false;
         self.scroll_lock = false;
@@ -335,25 +255,8 @@ impl KeyboardDriver {
         }
     }
 
-    pub fn read_text(&mut self, dest: &mut [u8]) -> usize {
-        self.text.pop_into(dest)
-    }
-
-    pub fn pending_text_len(&self) -> usize {
-        self.text.len()
-    }
-
     pub fn pop_event(&mut self) -> Option<KeyboardEvent> {
         self.events.pop()
-    }
-
-    pub fn drain_events(&mut self, mut sink: impl FnMut(KeyboardEvent)) -> usize {
-        let mut flushed = 0;
-        while let Some(event) = self.pop_event() {
-            sink(event);
-            flushed += 1;
-        }
-        flushed
     }
 
     pub fn modifiers(&self) -> Modifiers {
@@ -419,187 +322,6 @@ impl Default for KeyboardDriver {
     fn default() -> Self {
         Self::new()
     }
-}
-
-struct ScanCodeParser {
-    decoder: ScanCodeDecoder,
-    hidden_pause_prefix: bool,
-}
-
-impl ScanCodeParser {
-    const fn new() -> Self {
-        Self {
-            decoder: ScanCodeDecoder::Set1(ScancodeSet1::new()),
-            hidden_pause_prefix: false,
-        }
-    }
-
-    fn set_scan_set(&mut self, scan_set: ScanCodeSet) {
-        self.decoder = match scan_set {
-            ScanCodeSet::Set1 => ScanCodeDecoder::Set1(ScancodeSet1::new()),
-            ScanCodeSet::Set2 => ScanCodeDecoder::Set2(ScancodeSet2::new()),
-        };
-        self.hidden_pause_prefix = false;
-    }
-
-    fn reset(&mut self) {
-        let scan_set = match self.decoder {
-            ScanCodeDecoder::Set1(_) => ScanCodeSet::Set1,
-            ScanCodeDecoder::Set2(_) => ScanCodeSet::Set2,
-        };
-        self.set_scan_set(scan_set);
-    }
-
-    fn push(&mut self, byte: u8) -> Option<ParsedKey> {
-        let event = match &mut self.decoder {
-            ScanCodeDecoder::Set1(decoder) => decoder.advance_state(byte),
-            ScanCodeDecoder::Set2(decoder) => decoder.advance_state(byte),
-        }
-        .ok()
-        .flatten()?;
-        self.translate_event(event)
-    }
-
-    fn translate_event(&mut self, event: PcKeyEvent) -> Option<ParsedKey> {
-        let released = matches!(event.state, PcKeyState::Up);
-        match event.code {
-            PcKeyCode::RControl2 => {
-                self.hidden_pause_prefix = !released;
-                None
-            }
-            PcKeyCode::RAlt2 => None,
-            PcKeyCode::NumpadLock if self.hidden_pause_prefix && !released => {
-                self.hidden_pause_prefix = false;
-                Some(ParsedKey::Direct {
-                    code: KeyCode::Pause,
-                    released: false,
-                })
-            }
-            PcKeyCode::NumpadLock if self.hidden_pause_prefix => {
-                self.hidden_pause_prefix = false;
-                None
-            }
-            other => {
-                self.hidden_pause_prefix = false;
-                map_pc_key_code(other).map(|code| ParsedKey::Direct { code, released })
-            }
-        }
-    }
-}
-
-enum ScanCodeDecoder {
-    Set1(ScancodeSet1),
-    Set2(ScancodeSet2),
-}
-
-fn map_pc_key_code(code: PcKeyCode) -> Option<KeyCode> {
-    Some(match code {
-        PcKeyCode::Escape => KeyCode::Escape,
-        PcKeyCode::Key1 => KeyCode::Digit1,
-        PcKeyCode::Key2 => KeyCode::Digit2,
-        PcKeyCode::Key3 => KeyCode::Digit3,
-        PcKeyCode::Key4 => KeyCode::Digit4,
-        PcKeyCode::Key5 => KeyCode::Digit5,
-        PcKeyCode::Key6 => KeyCode::Digit6,
-        PcKeyCode::Key7 => KeyCode::Digit7,
-        PcKeyCode::Key8 => KeyCode::Digit8,
-        PcKeyCode::Key9 => KeyCode::Digit9,
-        PcKeyCode::Key0 => KeyCode::Digit0,
-        PcKeyCode::OemMinus => KeyCode::Minus,
-        PcKeyCode::OemPlus => KeyCode::Equal,
-        PcKeyCode::Backspace => KeyCode::Backspace,
-        PcKeyCode::Tab => KeyCode::Tab,
-        PcKeyCode::Q => KeyCode::Q,
-        PcKeyCode::W => KeyCode::W,
-        PcKeyCode::E => KeyCode::E,
-        PcKeyCode::R => KeyCode::R,
-        PcKeyCode::T => KeyCode::T,
-        PcKeyCode::Y => KeyCode::Y,
-        PcKeyCode::U => KeyCode::U,
-        PcKeyCode::I => KeyCode::I,
-        PcKeyCode::O => KeyCode::O,
-        PcKeyCode::P => KeyCode::P,
-        PcKeyCode::Oem4 => KeyCode::LeftBracket,
-        PcKeyCode::Oem6 => KeyCode::RightBracket,
-        PcKeyCode::Return => KeyCode::Enter,
-        PcKeyCode::LControl => KeyCode::LeftCtrl,
-        PcKeyCode::A => KeyCode::A,
-        PcKeyCode::S => KeyCode::S,
-        PcKeyCode::D => KeyCode::D,
-        PcKeyCode::F => KeyCode::F,
-        PcKeyCode::G => KeyCode::G,
-        PcKeyCode::H => KeyCode::H,
-        PcKeyCode::J => KeyCode::J,
-        PcKeyCode::K => KeyCode::K,
-        PcKeyCode::L => KeyCode::L,
-        PcKeyCode::Oem1 => KeyCode::Semicolon,
-        PcKeyCode::Oem3 => KeyCode::Apostrophe,
-        PcKeyCode::Oem8 => KeyCode::Grave,
-        PcKeyCode::LShift => KeyCode::LeftShift,
-        PcKeyCode::Oem5 | PcKeyCode::Oem7 => KeyCode::Backslash,
-        PcKeyCode::Z => KeyCode::Z,
-        PcKeyCode::X => KeyCode::X,
-        PcKeyCode::C => KeyCode::C,
-        PcKeyCode::V => KeyCode::V,
-        PcKeyCode::B => KeyCode::B,
-        PcKeyCode::N => KeyCode::N,
-        PcKeyCode::M => KeyCode::M,
-        PcKeyCode::OemComma => KeyCode::Comma,
-        PcKeyCode::OemPeriod => KeyCode::Dot,
-        PcKeyCode::Oem2 => KeyCode::Slash,
-        PcKeyCode::RShift => KeyCode::RightShift,
-        PcKeyCode::NumpadMultiply => KeyCode::NumpadStar,
-        PcKeyCode::LAlt => KeyCode::LeftAlt,
-        PcKeyCode::Spacebar => KeyCode::Space,
-        PcKeyCode::CapsLock => KeyCode::CapsLock,
-        PcKeyCode::F1 => KeyCode::F1,
-        PcKeyCode::F2 => KeyCode::F2,
-        PcKeyCode::F3 => KeyCode::F3,
-        PcKeyCode::F4 => KeyCode::F4,
-        PcKeyCode::F5 => KeyCode::F5,
-        PcKeyCode::F6 => KeyCode::F6,
-        PcKeyCode::F7 => KeyCode::F7,
-        PcKeyCode::F8 => KeyCode::F8,
-        PcKeyCode::F9 => KeyCode::F9,
-        PcKeyCode::F10 => KeyCode::F10,
-        PcKeyCode::NumpadLock => KeyCode::NumLock,
-        PcKeyCode::ScrollLock => KeyCode::ScrollLock,
-        PcKeyCode::Numpad7 => KeyCode::Numpad7,
-        PcKeyCode::Numpad8 => KeyCode::Numpad8,
-        PcKeyCode::Numpad9 => KeyCode::Numpad9,
-        PcKeyCode::NumpadSubtract => KeyCode::NumpadMinus,
-        PcKeyCode::Numpad4 => KeyCode::Numpad4,
-        PcKeyCode::Numpad5 => KeyCode::Numpad5,
-        PcKeyCode::Numpad6 => KeyCode::Numpad6,
-        PcKeyCode::NumpadAdd => KeyCode::NumpadPlus,
-        PcKeyCode::Numpad1 => KeyCode::Numpad1,
-        PcKeyCode::Numpad2 => KeyCode::Numpad2,
-        PcKeyCode::Numpad3 => KeyCode::Numpad3,
-        PcKeyCode::Numpad0 => KeyCode::Numpad0,
-        PcKeyCode::NumpadPeriod => KeyCode::NumpadDot,
-        PcKeyCode::F11 => KeyCode::F11,
-        PcKeyCode::F12 => KeyCode::F12,
-        PcKeyCode::RControl => KeyCode::RightCtrl,
-        PcKeyCode::RAltGr => KeyCode::RightAlt,
-        PcKeyCode::LWin => KeyCode::LeftMeta,
-        PcKeyCode::RWin => KeyCode::RightMeta,
-        PcKeyCode::Apps => KeyCode::Menu,
-        PcKeyCode::NumpadEnter => KeyCode::NumpadEnter,
-        PcKeyCode::NumpadDivide => KeyCode::NumpadSlash,
-        PcKeyCode::Insert => KeyCode::Insert,
-        PcKeyCode::Delete => KeyCode::Delete,
-        PcKeyCode::Home => KeyCode::Home,
-        PcKeyCode::End => KeyCode::End,
-        PcKeyCode::PageUp => KeyCode::PageUp,
-        PcKeyCode::PageDown => KeyCode::PageDown,
-        PcKeyCode::ArrowUp => KeyCode::ArrowUp,
-        PcKeyCode::ArrowDown => KeyCode::ArrowDown,
-        PcKeyCode::ArrowLeft => KeyCode::ArrowLeft,
-        PcKeyCode::ArrowRight => KeyCode::ArrowRight,
-        PcKeyCode::PrintScreen => KeyCode::PrintScreen,
-        PcKeyCode::PauseBreak => KeyCode::Pause,
-        _ => return None,
-    })
 }
 
 fn key_to_text(code: KeyCode, action: KeyAction, modifiers: Modifiers) -> Option<u8> {
@@ -683,19 +405,6 @@ fn key_to_text(code: KeyCode, action: KeyAction, modifiers: Modifiers) -> Option
     })
 }
 
-const KEYBOARD_RESPONSE_ECHO: u8 = 0xEE;
-const KEYBOARD_RESPONSE_ACK: u8 = 0xFA;
-const KEYBOARD_RESPONSE_RESEND: u8 = 0xFE;
-const KEYBOARD_RESPONSE_OVERRUN_0: u8 = 0x00;
-const KEYBOARD_RESPONSE_OVERRUN_FF: u8 = 0xFF;
-
-const fn is_non_scancode_response(byte: u8) -> bool {
-    matches!(
-        byte,
-        KEYBOARD_RESPONSE_ECHO | KEYBOARD_RESPONSE_OVERRUN_0 | KEYBOARD_RESPONSE_OVERRUN_FF
-    )
-}
-
 const fn shifted(shift: bool, normal: u8, shifted: u8) -> u8 {
     if shift { shifted } else { normal }
 }
@@ -710,12 +419,12 @@ const fn letter(lowercase: u8, shift: bool, caps_lock: bool) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyAction, KeyCode, KeyboardDriver, KeyboardEvent, Modifiers, ScanCodeSet};
+    use super::{KeyAction, KeyCode, KeyboardDriver, KeyboardEvent, Modifiers};
 
     #[test]
     fn emits_text_for_basic_typing() {
         let mut keyboard = KeyboardDriver::new();
-        keyboard.feed_scancode(0x1e);
+        keyboard.inject_key_transition(KeyCode::A, false);
         assert_eq!(
             keyboard.pop_event(),
             Some(KeyboardEvent {
@@ -728,11 +437,9 @@ mod tests {
     }
 
     #[test]
-    fn decodes_set2_extended_keys_without_text() {
+    fn navigation_keys_carry_no_text() {
         let mut keyboard = KeyboardDriver::new();
-        keyboard.set_scan_code_set(ScanCodeSet::Set2);
-        keyboard.feed_scancode(0xe0);
-        keyboard.feed_scancode(0x75);
+        keyboard.inject_key_transition(KeyCode::ArrowUp, false);
         assert_eq!(
             keyboard.pop_event(),
             Some(KeyboardEvent {
@@ -747,9 +454,9 @@ mod tests {
     #[test]
     fn updates_modifiers_and_caps_lock() {
         let mut keyboard = KeyboardDriver::new();
-        keyboard.feed_scancode(0x3a);
+        keyboard.inject_key_transition(KeyCode::CapsLock, false);
         assert!(keyboard.modifiers().contains(Modifiers::CAPS_LOCK));
-        keyboard.feed_scancode(0x1e);
+        keyboard.inject_key_transition(KeyCode::A, false);
         assert_eq!(keyboard.pop_event().unwrap().code, KeyCode::CapsLock);
         assert_eq!(keyboard.pop_event().unwrap().text, Some(b'A'));
     }
@@ -761,16 +468,6 @@ mod tests {
         keyboard.inject_key_transition(KeyCode::A, true);
         assert_eq!(keyboard.pop_event().unwrap().action, KeyAction::Pressed);
         assert_eq!(keyboard.pop_event().unwrap().action, KeyAction::Released);
-    }
-
-    #[test]
-    fn provider_reset_preserves_scan_code_set_and_clears_prefix() {
-        let mut keyboard = KeyboardDriver::new();
-        keyboard.set_scan_code_set(ScanCodeSet::Set2);
-        keyboard.feed_scancode(0xe0);
-        keyboard.reset_provider_state();
-        keyboard.feed_scancode(0x1c);
-        assert_eq!(keyboard.pop_event().unwrap().code, KeyCode::A);
     }
 
     #[test]

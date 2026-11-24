@@ -238,7 +238,10 @@ fn bool_name(value: bool) -> &'static str {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ProjectConfigFile {
-    logging: Option<toml::Value>,
+    /// `[logging]` is parsed and validated by `build_log_cfg` on the raw text;
+    /// the section only has to be accepted here.
+    #[serde(rename = "logging")]
+    _logging: Option<toml::Value>,
     kernel: KernelConfigFile,
     fault_injection: FaultInjectionConfigFile,
     fuzzing: FuzzingConfigFile,
@@ -412,7 +415,6 @@ fn parse_project_config_text(text: &str) -> Result<ProjectConfig> {
 
 fn project_from_file(file: ProjectConfigFile) -> ProjectConfig {
     let mut config = ProjectConfig::default();
-    let _ = file.logging;
     let build = file.kernel.build;
     if let Some(value) = build.codegen_units {
         config.kernel.build.codegen_units = value;

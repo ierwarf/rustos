@@ -327,21 +327,6 @@ fn receive_reservations_are_invisible_and_publish_atomically() {
     assert!(table.get_entry(0).is_none());
     assert!(table.get_entry(3).is_none());
     assert!(table.duplicate_exact(1, 3, false).is_none());
-    assert!(
-        table
-            .replace_entry(
-                3,
-                Some(HandleEntry::new(
-                    KernelHandle::VfsDirectory(VfsDirectoryHandle::new(
-                        "/replacement".into(),
-                        vec![],
-                    )),
-                    0,
-                    0,
-                )),
-            )
-            .is_none()
-    );
 
     let mut child = table.clone();
     assert_eq!(
@@ -720,7 +705,6 @@ fn dynamic_install_never_exceeds_descriptor_ceiling() {
     );
     assert_eq!(last, Some(MAX_DYNAMIC_FD));
     assert_eq!(table.entries.len(), max_dynamic_entries());
-    assert!(!table.can_install_additional(1));
 
     let rejected = table.install(KernelHandle::VfsDirectory(VfsDirectoryHandle::new(
         "/overflow".into(),

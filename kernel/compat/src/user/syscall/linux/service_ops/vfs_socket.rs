@@ -1095,7 +1095,6 @@ pub fn syscall_linux_vfs_pwrite64(fd: u64, user_ptr: u64, user_len: u64, offset:
             handle,
             multitask::KernelHandle::Console(_)
                 | multitask::KernelHandle::Epoll(_)
-                | multitask::KernelHandle::Socket(_)
                 | multitask::KernelHandle::UnixSocket(_)
                 | multitask::KernelHandle::InetSocket(_)
         ) {
@@ -1302,7 +1301,6 @@ pub fn syscall_linux_vfs_fsync_mode(fd: u64, datasync: bool) -> u64 {
             multitask::KernelHandle::Pipe(_)
             | multitask::KernelHandle::EventFd(_)
             | multitask::KernelHandle::Epoll(_)
-            | multitask::KernelHandle::Socket(_)
             | multitask::KernelHandle::UnixSocket(_)
             | multitask::KernelHandle::InetSocket(_)
             | multitask::KernelHandle::Console(_) => Err(LINUX_EINVAL),
@@ -1378,7 +1376,6 @@ pub fn syscall_linux_vfs_fadvise64(fd: u64, _offset: u64, len: u64, advice: u64)
                 multitask::KernelHandle::Pipe(_)
                     | multitask::KernelHandle::EventFd(_)
                     | multitask::KernelHandle::Epoll(_)
-                    | multitask::KernelHandle::Socket(_)
                     | multitask::KernelHandle::UnixSocket(_)
                     | multitask::KernelHandle::InetSocket(_)
             )
@@ -1523,9 +1520,6 @@ pub(super) fn proc_fd_link_text(target_fd: u64) -> Result<alloc::string::String,
             }
             multitask::KernelHandle::Epoll(_) => {
                 alloc::string::String::from("anon_inode:[eventpoll]")
-            }
-            multitask::KernelHandle::Socket(socket) => {
-                alloc::format!("socket:[{}]", socket.token_id())
             }
             multitask::KernelHandle::UnixSocket(socket) => {
                 alloc::format!("socket:[{}]", socket.token_id())
@@ -2122,7 +2116,7 @@ fn current_socket_fd(fd: u64) -> bool {
     multitask::with_current_user_process_state(|_, _, process_state| {
         matches!(
             process_state.handles().get(fd),
-            Some(multitask::KernelHandle::Socket(_) | multitask::KernelHandle::InetSocket(_))
+            Some(multitask::KernelHandle::InetSocket(_))
         )
     })
     .unwrap_or(false)
@@ -2591,9 +2585,6 @@ pub fn release_service_handle_refs_bounded(refs: &[ServiceHandleRef]) {
 
 pub fn service_handle_ref_for_handle(handle: &multitask::KernelHandle) -> Option<ServiceHandleRef> {
     match handle {
-        multitask::KernelHandle::Socket(socket) => {
-            Some(ServiceHandleRef::Socket(socket.token_id()))
-        }
         multitask::KernelHandle::InetSocket(socket) => {
             Some(ServiceHandleRef::Socket(socket.token_id()))
         }
@@ -2660,12 +2651,6 @@ fn call_netd_socket_payload(snapshot: &super::vfs_meta::SocketSnapshot, fd: u64,
     request.arg0 = fd;
     request.status_flags = status_flags;
     populate_writev_socket_payload(&mut request, snapshot, payload)?;
-    // Plain Unix-stream writev bytes must advance the same cursor as sendmsg,
-    // or later SCM_RIGHTS tickets become bound to the wrong byte offsets.
-    let stream = match &snapshot.handle {
-        multitask::KernelHandle::Socket(socket) => Some(socket.begin_stream_send(payload.len()).ok_or(LINUX_EAGAIN)?),
-        _ => None,
-    };
     let response = if status_flags & linux_abi::O_NONBLOCK != 0 {
         call_netd_ipc_request_with_timeout(&request, rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS)
             .map_err(|errno| socket_writev_errno(errno, true))?
@@ -2673,9 +2658,6 @@ fn call_netd_socket_payload(snapshot: &super::vfs_meta::SocketSnapshot, fd: u64,
         call_netd_ipc_request(&request)?
     };
     if response.value > payload.len() as u64 { return Err(LINUX_EIO); }
-    if let Some(stream) = stream {
-        if !stream.commit_send(response.value as usize) { return Err(LINUX_ESTALE); }
-    }
     Ok(response.value)
 }
 

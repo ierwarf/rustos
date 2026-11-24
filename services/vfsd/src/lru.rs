@@ -115,6 +115,7 @@ impl<K: Ord, V> LruCache<K, V> {
     }
 
     /// Looks up without changing recency.
+    #[cfg(test)]
     pub fn peek(&self, key: &K) -> Option<&V> {
         let slot = *self.index.get(key)?;
         Some(&self.node(slot).value)

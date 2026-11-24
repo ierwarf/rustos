@@ -71,8 +71,7 @@ fn service_main() {
     }
     ipc::debug_line("pagerd: pager policy endpoint registered");
     // Independent thread: the receive loop (the IPC fast path) is untouched.
-    if let Err(errno) = rustos_svc_runtime::heartbeat::spawn_thread(rustos_user_abi::syscall::IPC_SERVICE_PAGERD) {
-        let _ = errno;
+    if rustos_svc_runtime::heartbeat::spawn_thread(rustos_user_abi::syscall::IPC_SERVICE_PAGERD).is_err() {
         ipc::debug_line("pagerd: heartbeat thread unavailable");
     }
     // An endpoint object may be unregistered and reused. Its publication lease
@@ -226,7 +225,7 @@ fn serve(endpoint: u64, pager: &mut PagerState) {
         let reply = match pager.resolve_anonymous_first_touch(dispatch) {
             Ok(reply) => reply,
             Err(error) => {
-                report_refused_fault(error, dispatch.request.virtual_address);
+                report_refused_fault(error);
                 Default::default()
             }
         };
@@ -327,7 +326,7 @@ fn handle_request(
 /// same refused address would otherwise turn its own diagnosis into the
 /// machine's dominant cost, which is how an earlier per-event log became a
 /// 30-second stall.
-fn report_refused_fault(error: PagerFaultError, address: u64) {
+fn report_refused_fault(error: PagerFaultError) {
     use core::sync::atomic::{AtomicU8, Ordering};
 
     static REPORTED: AtomicU8 = AtomicU8::new(0);
@@ -335,7 +334,6 @@ fn report_refused_fault(error: PagerFaultError, address: u64) {
     if REPORTED.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
         return;
     }
-    let _ = address;
     ipc::debug_line(match error {
         // A managed VMA whose region this pager does not hold is the exact
         // ring0/pagerd divergence the shared range-edit rule exists to prevent.

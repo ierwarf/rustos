@@ -44,7 +44,7 @@ use rustos_user_abi::syscall::{
     NET_BROKER_PACKET_STATUS_ACTIVE, NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL,
     NET_BROKER_PACKET_STATUS_UNAVAILABLE, NET_BROKER_SOCKET_PUBLICATION_VERSION,
     NETD_DVM_SESSION_GRANT, NETD_DVM_SESSION_REVOKE, NETD_IPC_ABI_VERSION, NETD_IPC_OP_DVM_SESSION,
-    NETD_IPC_OP_POLL_BATCH, NETD_IPC_OP_REF_ACK, NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF, NETD_IPC_RESPONSE_FLAG_RECORD_PRESENT,
+    NETD_IPC_OP_POLL_BATCH, NETD_IPC_OP_REF_ACK, NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF,
     NETD_IPC_RESPONSE_HEADER_SIZE, NETD_POLL_MODE_QUERY, NETD_POLL_MODE_WAIT,
     NETD_POLL_BATCH_MAX, NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE,
     NetBrokerPrepareSocketPublication, NetdIpcRequest, NetdIpcResponse, NetdPollQueryWire, NetdPollResultWire, RustosNetBrokerArgs,
@@ -106,13 +106,9 @@ mod socket_lifecycle;
 use socket_lifecycle::*;
 mod sys;
 use sys::*;
-mod unix_stream;
-use unix_stream::*;
+mod socket_io;
+use socket_io::*;
 mod netlink;
-mod path_namespace;
-use path_namespace::{NodeState, PathNamespace};
-mod unix_seqpacket;
-use unix_seqpacket::SEQPACKET_MAX_QUEUED_MESSAGES;
 use commercial_protocol::{dispatch_commercial_request, validate_commercial_request};
 
 const RECV_BACKOFF: Duration = Duration::from_millis(1);
@@ -174,25 +170,17 @@ struct RefReplayEntry {
     admitted: StdInstant,
 }
 
-const MAX_LISTEN_BACKLOG: usize = 128;
 /// Table-wide socket ceilings. Per-process Job billing bounds one client, but
-/// netd's heap is shared by every client: each AF_UNIX socket may queue
+/// netd's heap is shared by every client: each netlink socket may queue
 /// `SOCKET_BUFFER_CAPACITY` bytes and each TCP socket pins two
 /// `INET_TCP_BUFFER_CAPACITY` rings, so an unbounded table lets one service
 /// bug exhaust memory and abort all networking. Exceeding a ceiling reports
 /// `ENFILE`, the system-wide analogue of `EMFILE`.
-const MAX_UNIX_SOCKETS: usize = 8192;
+const MAX_NETLINK_SOCKETS: usize = 8192;
 const MAX_INET_SOCKETS: usize = 1024;
 const SOCKET_BUFFER_CAPACITY: usize = 1024 * 1024;
-/// Shared outstanding AF_UNIX payload plus aligned ancillary custody.
-const UNIX_QUEUED_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
-// Every queued ancillary byte must fit in one kernel-consumed release trailer
-// when read/close discards it. This is a lifecycle bound, not a tuning knob.
-const SOCKET_CONTROL_BUFFER_CAPACITY: usize = rustos_user_abi::syscall::NET_BROKER_SOCKET_CONTROL_CAPACITY;
 const INET_TCP_BUFFER_CAPACITY: usize = 128 * 1024;
 const MAX_INET_TCP_BUFFER_CAPACITY: usize = 512 * 1024;
-const UNIX_DGRAM_DEFAULT_BUFFER: usize = 256 * 1024;
-const UNIX_DGRAM_MAX_QUEUED_MESSAGES: usize = 256;
 const INET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Abort horizon for an established connection whose peer stays silent with
 /// data queued (Linux `tcp_retries2` default, about 15 minutes).
@@ -306,131 +294,14 @@ enum RefReplayAction {
 #[path = "tests/ref_replay_tests.rs"]
 mod ref_replay_tests;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct Credentials {
-    pid: i32,
-    uid: u32,
-    gid: u32,
-}
-
+/// An `AF_NETLINK` socket. It shares the socket-table, charge, reference and
+/// readiness machinery with INET sockets; `AF_UNIX` is kernel-local and never
+/// reaches netd.
 #[derive(Debug)]
-enum UnixSocketState {
-    Idle,
-    Listening {
-        backlog: usize,
-        pending: VecDeque<u64>,
-    },
-    Connected(ConnectedState),
-    /// `AF_UNIX`/`SOCK_DGRAM` socket: unconnected or connected datagram queue.
-    Dgram(UnixDgramState),
-    /// `AF_NETLINK`/`NETLINK_ROUTE` socket: queued whole reply messages.
-    Netlink(netlink::NetlinkState),
-}
-
-/// AF_UNIX socket type owned by netd. `Netlink` is not an AF_UNIX socket; it
-/// shares the socket table, charge, reference and readiness machinery.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UnixSocketKind {
-    Stream,
-    Dgram,
-    SeqPacket,
-    Netlink,
-}
-
-impl UnixSocketKind {
-    /// Linux `SOCK_*` base type for AF_UNIX kinds (netlink reports its own).
-    fn unix_socket_type(self) -> u64 {
-        match self {
-            Self::SeqPacket => libc::SOCK_SEQPACKET as u64,
-            Self::Dgram => linux_abi::SOCK_DGRAM,
-            Self::Stream | Self::Netlink => linux_abi::SOCK_STREAM,
-        }
-    }
-
-    fn from_unix_base_type(base_type: u64) -> Option<Self> {
-        match base_type as i32 {
-            libc::SOCK_STREAM => Some(Self::Stream),
-            libc::SOCK_DGRAM => Some(Self::Dgram),
-            libc::SOCK_SEQPACKET => Some(Self::SeqPacket),
-            _ => None,
-        }
-    }
-
-    fn preserves_message_boundaries(self) -> bool {
-        matches!(self, Self::SeqPacket | Self::Dgram)
-    }
-}
-
-#[derive(Debug, Default)]
-struct UnixDgramState {
-    incoming: VecDeque<UnixStreamSegment>,
-    incoming_bytes: usize,
-    incoming_control_bytes: usize,
-    peer: Option<u64>,
-    peer_closed: bool,
-    peer_credentials: Option<Credentials>,
-    recv_drain_handoff_armed: bool,
-    recv_closed: bool,
-    send_closed: bool,
-}
-
-#[derive(Debug)]
-struct ConnectedState {
-    incoming: VecDeque<UnixStreamSegment>,
-    incoming_bytes: usize,
-    /// Aligned wire charge, including padding needed when controls are joined.
-    incoming_control_bytes: usize,
-    /// Listener custody survives queue removal until accept publication settles.
-    pending_listener: Option<u64>,
-    channel_id: u64,
-    peer: u64,
-    peer_closed: bool,
-    peer_read_closed: bool,
-    peer_write_closed: bool,
-    peer_credentials: Credentials,
-    /// A successful nonblocking read arms exactly one follow-up EAGAIN
-    /// handoff so drain-until-empty event loops can return to userspace
-    /// without granting a boost to an arbitrary empty-read spin loop.
-    recv_drain_handoff_armed: bool,
-    recv_closed: bool,
-    send_closed: bool,
-}
-
-/// One queued send. `sender` is the process identity at `sendmsg`/`write`
-/// time, which is what a receiver with `SO_PASSCRED` observes as
-/// `SCM_CREDENTIALS`; it is distinct from the connection-time identity that
-/// `SO_PEERCRED` reports (`ConnectedState::peer_credentials`).
-#[derive(Debug, Default)]
-struct UnixStreamSegment {
-    bytes: VecDeque<u8>,
-    control: Vec<u8>,
-    sender: Credentials,
-    sender_path: Option<UnixAddress>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-enum UnixAddress {
-    Filesystem(String),
-    Abstract(Vec<u8>),
-}
-
-impl From<&str> for UnixAddress {
-    fn from(path: &str) -> Self {
-        Self::Filesystem(path.to_string())
-    }
-}
-
-#[derive(Debug)]
-struct UnixSocket {
-    kind: UnixSocketKind,
-    owner: Credentials,
+struct NetlinkSocket {
     refs: usize,
     options: SocketOptions,
-    bound_path: Option<UnixAddress>,
-    bound_inode: Option<(u64, u64)>,
-    local_path: Option<UnixAddress>,
-    peer_path: Option<UnixAddress>,
-    state: UnixSocketState,
+    state: netlink::NetlinkState,
 }
 
 #[derive(Debug, Default)]
@@ -585,12 +456,8 @@ impl SocketOptions {
 }
 
 struct NetState {
-    sockets: SocketTable<UnixSocket>,
+    netlink_sockets: SocketTable<NetlinkSocket>,
     inet_sockets: SocketTable<InetSocket>,
-    bindings: BTreeMap<UnixAddress, u64>,
-    inode_bindings: BTreeMap<(u64, u64), u64>,
-    next_autobind_id: u64,
-    unix_queued_bytes: usize,
     inet: Option<InetStack>,
     netlink_view: Option<netlink::InterfaceSnapshot>,
     /// Per-socket readiness generation: the newest value published for that
@@ -600,48 +467,24 @@ struct NetState {
     readiness_observations: BTreeMap<u64, readiness::Readiness>,
     readiness_publications: Vec<(u64, u64)>,
     readiness_changed_scratch: Vec<u64>,
-    unix_dirty_scratch: Vec<u64>,
 }
 
 impl NetState {
     fn new() -> Self {
         Self {
-            sockets: SocketTable::new(),
+            netlink_sockets: SocketTable::new(),
             inet_sockets: SocketTable::new(),
-            bindings: BTreeMap::new(),
-            inode_bindings: BTreeMap::new(),
-            next_autobind_id: 1,
-            unix_queued_bytes: 0,
             inet: None,
             netlink_view: None,
             readiness_generations: BTreeMap::new(),
             readiness_observations: BTreeMap::new(),
             readiness_publications: Vec::new(),
             readiness_changed_scratch: Vec::new(),
-            unix_dirty_scratch: Vec::new(),
         }
     }
 
-    fn set_unix_queued_bytes(&mut self, bytes: usize) {
-        assert!(bytes <= UNIX_QUEUED_BYTE_CAPACITY);
-        if (self.unix_queued_bytes == UNIX_QUEUED_BYTE_CAPACITY)
-            != (bytes == UNIX_QUEUED_BYTE_CAPACITY)
-        {
-            // Global capacity affects every sender, not just the current peer.
-            self.sockets.mark_all_dirty();
-        }
-        self.unix_queued_bytes = bytes;
-    }
-
-    fn release_unix_queued_bytes(&mut self, bytes: usize) {
-        self.set_unix_queued_bytes(
-            self.unix_queued_bytes
-                .checked_sub(bytes)
-                .expect("AF_UNIX queued-byte custody underflow"),
-        );
-    }
     fn socket_exists(&self, token: u64) -> bool {
-        self.sockets.contains_key(&token) || self.inet_sockets.contains_key(&token)
+        self.netlink_sockets.contains_key(&token) || self.inet_sockets.contains_key(&token)
     }
 
     fn socket_readiness_generation(&mut self, token: u64) -> u64 {
@@ -651,12 +494,9 @@ impl NetState {
         self.readiness_generations.get(&token).copied().unwrap_or(1)
     }
 
-    /// Whether `additional` more AF_UNIX identities fit under the table ceiling.
-    fn unix_capacity_available(&self, additional: usize) -> bool {
-        self.sockets
-            .len()
-            .checked_add(additional)
-            .is_some_and(|total| total <= MAX_UNIX_SOCKETS)
+    /// Whether one more netlink identity fits under the table ceiling.
+    fn netlink_capacity_available(&self) -> bool {
+        self.netlink_sockets.len() < MAX_NETLINK_SOCKETS
     }
 
     fn inet_capacity_available(&self) -> bool {
@@ -664,7 +504,7 @@ impl NetState {
     }
 
     fn token_available(&self, token: u64) -> bool {
-        token != 0 && !self.sockets.contains_key(&token) && !self.inet_sockets.contains_key(&token)
+        token != 0 && !self.netlink_sockets.contains_key(&token) && !self.inet_sockets.contains_key(&token)
     }
 
     fn inet_stack(&mut self) -> Result<&mut InetStack, i32> {
@@ -744,23 +584,6 @@ fn notify_state_waiters() {
     }
 }
 
-#[derive(Default)]
-struct SocketReceive {
-    /// Identity of the process whose send produced the first dequeued
-    /// segment. `None` when nothing was dequeued.
-    sender: Option<Credentials>,
-    record_present: bool,
-    read: usize,
-    control: Vec<u8>,
-    discarded: Vec<u8>,
-    /// SEQPACKET only: message bytes dequeued beyond `read` (truncated tail).
-    /// Zero for streams. The kernel advances its stream position by
-    /// `read + extra`, matching what the sender's position advanced.
-    extra: usize,
-    /// SEQPACKET only: the message did not fit the receive buffer.
-    truncated: bool,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PacketProviderState {
     Unavailable,
@@ -781,24 +604,8 @@ mod local_socket_poll_tests;
 mod hardening_tests;
 
 #[cfg(test)]
-#[path = "tests/unix_socket_lifecycle_tests.rs"]
-mod unix_socket_lifecycle_tests;
-
-#[cfg(test)]
-#[path = "tests/seqpacket_tests.rs"]
-mod seqpacket_tests;
-
-#[cfg(test)]
-#[path = "tests/path_namespace_tests.rs"]
-mod path_namespace_tests;
-
-#[cfg(test)]
 #[path = "tests/netlink_tests.rs"]
 mod netlink_tests;
-
-#[cfg(test)]
-#[path = "tests/unix_dgram_tests.rs"]
-mod unix_dgram_tests;
 
 #[cfg(test)]
 #[path = "tests/ipv6_and_options_tests.rs"]
@@ -850,21 +657,6 @@ mod idle_cadence_tests {
         assert_eq!(crate::select_ephemeral_port(&mut next, |_| { visited += 1; true }), None);
         assert_eq!(visited, 16384);
         assert_eq!(next, 49153);
-    }
-
-    #[test]
-    fn sendmsg_control_rejects_overflowing_lengths() {
-        let mut control = vec![0; std::mem::size_of::<rustos_user_abi::linux::LinuxCmsghdr>()];
-        control[..8].copy_from_slice(&u64::MAX.to_ne_bytes());
-        assert_eq!(crate::validate_sendmsg_control(&control), Err(libc::EINVAL));
-
-        let mut two_headers = vec![0; control.len() * 2];
-        let header_len = control.len();
-        two_headers[..8].copy_from_slice(&(header_len as u64).to_ne_bytes());
-        two_headers[8..12].copy_from_slice(&(rustos_user_abi::linux::SOL_SOCKET as u32).to_ne_bytes());
-        two_headers[12..16].copy_from_slice(&(rustos_user_abi::linux::SCM_RIGHTS as u32).to_ne_bytes());
-        two_headers[header_len..header_len + 8].copy_from_slice(&u64::MAX.to_ne_bytes());
-        assert_eq!(crate::validate_sendmsg_control(&two_headers), Err(libc::EINVAL));
     }
 
     #[test]

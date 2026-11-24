@@ -1312,34 +1312,13 @@ where
     )
 }
 
-/// Narrows protection over one exact range and reports the identity whose
-/// regions were rewritten.
+/// Narrows protection over one exact range while enforcing `ceiling` on any
+/// resulting VMA split.
 ///
 /// Returning the stamped `(process_handle, process_generation)` lets the caller
 /// publish the same narrowing to the pager under the identity ring0 actually
 /// edited, rather than re-deriving one that could disagree - the same reason
 /// [`unmap_for_process`] returns it.
-pub fn protect_for_process(
-    process_id: u64,
-    expected: Option<ExpectedMm>,
-    start: u64,
-    end: u64,
-    prot: u32,
-    page_flags: x86_64::structures::paging::PageTableFlags,
-) -> Result<Option<(u64, u64)>, PagerVmaError> {
-    protect_for_process_with_ceiling(
-        process_id,
-        expected,
-        start,
-        end,
-        prot,
-        page_flags,
-        MAX_PAGER_VMAS_PER_PROCESS,
-    )
-}
-
-/// Narrows protection over one exact range while enforcing `ceiling` on any
-/// resulting VMA split.
 pub fn protect_for_process_with_ceiling(
     process_id: u64,
     expected: Option<ExpectedMm>,
@@ -1586,9 +1565,10 @@ pub fn set_commit_state_for_process(
     Ok(rewritten.then(|| (process.slot(), process.generation())))
 }
 
-/// Relocates `[old_start, old_end)` to `new_start`: the VMAs covering it, and
-/// (through `mutate`, run under the same locks) its page-table leaves and
-/// descriptor claims. Returns how many VMAs were moved.
+/// Relocates `[old_start, old_end)` to `new_start` while enforcing `ceiling`
+/// on any resulting VMA growth, and (through `mutate`, run under the same
+/// locks) its page-table leaves and descriptor claims. Returns how many VMAs
+/// were moved.
 ///
 /// **Invariant: concurrent threads see the old mapping or fault into the new
 /// one, never a copy.** Lock order is process state -> per-process VMA writer ->
@@ -1605,27 +1585,6 @@ pub fn set_commit_state_for_process(
 /// The destination must hold no VMA; the source may contain holes (reserved
 /// ranges that have no publication, image or legacy leaves are `mutate`'s
 /// business). Nothing changes on any `Err`.
-pub fn move_for_process(
-    process_id: u64,
-    expected: Option<ExpectedMm>,
-    old_start: u64,
-    old_end: u64,
-    new_start: u64,
-    mutate: impl FnOnce(&mut super::UserProcessState) -> Result<(), PagerVmaError>,
-) -> Result<usize, PagerVmaError> {
-    move_for_process_with_ceiling(
-        process_id,
-        expected,
-        old_start,
-        old_end,
-        new_start,
-        MAX_PAGER_VMAS_PER_PROCESS,
-        mutate,
-    )
-}
-
-/// Relocates `[old_start, old_end)` to `new_start` while enforcing `ceiling`
-/// on any resulting VMA growth.
 pub fn move_for_process_with_ceiling(
     process_id: u64,
     expected: Option<ExpectedMm>,

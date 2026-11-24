@@ -11,7 +11,6 @@ use crate::transport_types::{
     DisplayFramebufferRegistration, DisplayPixelFormat,
 };
 use boot_protocol::{BootInfo, FramebufferInfo};
-use embedded_graphics::pixelcolor::Rgb888;
 
 use crate::user::abi::device::{DISPLAY_INFO_FLAG_DVM_SCANOUT, DISPLAY_INFO_FLAG_PRIMARY_PROVIDER};
 
@@ -56,15 +55,6 @@ pub struct GuiDamageRect {
     pub y: usize,
     pub width: usize,
     pub height: usize,
-}
-
-pub fn try_present_panic_blackout() -> bool {
-    backend::try_with_framebuffer(|framebuffer| {
-        framebuffer.fill(Rgb888::new(0, 0, 0));
-        framebuffer.present_scene();
-        true
-    })
-    .unwrap_or(false)
 }
 
 pub fn init(_boot_info_ptr: *const BootInfo) {

@@ -247,14 +247,17 @@ impl LockTable {
         self.total == 0
     }
 
+    #[cfg(test)]
     pub fn total_locks(&self) -> usize {
         self.total
     }
 
+    #[cfg(test)]
     pub fn locks_for(&self, key: FileKey) -> &[Lock] {
         self.files.get(&key).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    #[cfg(test)]
     pub fn wait_count(&self) -> usize {
         self.waits.len()
     }
@@ -691,7 +694,9 @@ fn run(
 /// Executes one decoded `VFS_IPC_OP_FILE_LOCK` wire. `Ok(Some(reply))` is a
 /// `GETLK` answer to send back; `Err(errno)` is the reply status (`EAGAIN`
 /// means "conflict, retry" for the blocking command). Trusts every owner pid in
-/// the table; [`execute_verified`] is the form vfsd serves requests with.
+/// the table, so only tests use it; vfsd serves requests with
+/// [`execute_verified`].
+#[cfg(test)]
 pub fn execute(
     table: &mut LockTable,
     ctx: &LockContext,

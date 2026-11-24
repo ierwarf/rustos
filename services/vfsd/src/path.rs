@@ -3,7 +3,6 @@
 //! Kept in the library target so its tests execute: the `vfsd` binary has no
 //! test harness.
 
-use alloc::borrow::Cow;
 use alloc::string::String;
 
 use rustos_user_abi::syscall::VFS_IPC_PATH_CAPACITY;
@@ -111,32 +110,13 @@ pub fn path_inode_for_policy(bytes: &[u8], case_policy: storage_core::fs::CasePo
     }
 }
 
-/// Key under which path-addressed storage caches file their entries. The FAT
-/// engine matches names ASCII-case-insensitively, so every case spelling of one
-/// path must reach one entry instead of caching the same bytes, listing or
-/// sealed executable image once per spelling.
-pub fn fat_cache_key(path: &str) -> String {
-    path.to_ascii_lowercase()
-}
-
-/// Borrowing variant of `fat_cache_key` that avoids heap allocation when `path`
-/// already contains no ASCII uppercase letters.
-pub fn fat_cache_key_cow(path: &str) -> Cow<'_, str> {
-    if path.bytes().any(|b| b.is_ascii_uppercase()) {
-        Cow::Owned(path.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(path)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn case_spellings_of_one_fat_path_share_inode_and_cache_key() {
+    fn case_spellings_of_one_fat_path_share_inode() {
         assert_eq!(path_inode(b"/BIN/Ls"), path_inode(b"/bin/ls"));
-        assert_eq!(fat_cache_key("/BIN/Ls"), fat_cache_key("/bin/ls"));
         assert_ne!(path_inode(b"/bin/ls"), path_inode(b"/bin/lt"));
         assert_ne!(path_inode(b""), 0);
     }
@@ -183,9 +163,7 @@ mod tests {
     }
 
     #[test]
-    fn fat_cache_key_cow_borrows_lowercase_and_lowercases_uppercase() {
-        assert!(matches!(fat_cache_key_cow("/bin/ls"), Cow::Borrowed("/bin/ls")));
-        assert!(matches!(fat_cache_key_cow("/BIN/Ls"), Cow::Owned(ref s) if s == "/bin/ls"));
+    fn absolute_path_ignores_the_base_and_keeps_dot_names() {
         assert_eq!(
             normalize_absolute_path("/ignored", "/usr/lib/.hidden").unwrap(),
             "/usr/lib/.hidden"

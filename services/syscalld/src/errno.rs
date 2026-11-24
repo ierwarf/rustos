@@ -19,7 +19,6 @@ pub const RLIMIT_CORE: u64 = 4;
 pub const RLIMIT_NPROC: u64 = 6;
 pub const RLIMIT_NOFILE: u64 = 7;
 pub const RLIMIT_MEMLOCK: u64 = 8;
-pub const RLIMIT_AS: u64 = 9;
 pub const RLIMIT_COUNT: usize = 10;
 pub const RLIM_INFINITY: u64 = u64::MAX;
 

@@ -1,6 +1,6 @@
 use super::{
-    NETD_NANOS_PER_MILLI, encode_transfer_tickets, ioctl_is_display_policy_request,
-    is_console_handle, netd_deadline_after_ms, netd_deadline_remaining_ms_at, read_transfer_ticket,
+    NETD_NANOS_PER_MILLI, ioctl_is_display_policy_request, is_console_handle,
+    netd_deadline_after_ms, netd_deadline_remaining_ms_at,
 };
 use crate::multitask;
 use rustos_user_abi::syscall::NetdIpcRequest;
@@ -62,39 +62,14 @@ fn ui_policy_direct_set_is_limited_to_display_contracts() {
 }
 
 #[test]
-fn transfer_ticket_wire_is_integer_only_exact_and_nonzero() {
-    let ticket = kernel_ipc_runtime::api::KernelTransferTicket::new(7, 11, 13)
-        .expect("valid transfer ticket");
-    let bytes = encode_transfer_tickets(&[ticket]).expect("encode ticket");
-    assert_eq!(read_transfer_ticket(&bytes), Ok(ticket));
-
-    let mut zero_id = bytes.clone();
-    zero_id[..8].fill(0);
-    assert!(read_transfer_ticket(&zero_id).is_err());
-    let mut zero_nonce = bytes.clone();
-    zero_nonce[8..].fill(0);
-    assert!(read_transfer_ticket(&zero_nonce).is_err());
-    assert!(read_transfer_ticket(&bytes[..15]).is_err());
-}
-
-#[test]
 fn an_oversized_stream_sendmsg_takes_a_prefix_rather_than_rejecting_the_call() {
     use super::{LINUX_EMSGSIZE, sendmsg_data_capacity};
     use rustos_user_abi::syscall::{NETD_IPC_PAYLOAD_CAPACITY, NETD_SENDMSG_PAYLOAD_HEADER_SIZE};
 
     let room = NETD_IPC_PAYLOAD_CAPACITY - NETD_SENDMSG_PAYLOAD_HEADER_SIZE;
     assert_eq!(sendmsg_data_capacity(0), Ok(room));
-
-    // A control block takes its space out of the same payload, and what is left
-    // is still a legal short write rather than a rejected call.
     assert_eq!(sendmsg_data_capacity(64), Ok(room - 64));
     assert_eq!(sendmsg_data_capacity(room - 1), Ok(1));
-
-    // No room left is not a prefix anyone can take, and a control block larger
-    // than the whole payload never had one. Both are EMSGSIZE, never EINVAL:
-    // a caller that asked for more than this transport carries has not made a
-    // programming error, and a stream writer retries a short write but not an
-    // argument fault.
     assert_eq!(sendmsg_data_capacity(room), Err(LINUX_EMSGSIZE));
     assert_eq!(
         sendmsg_data_capacity(NETD_IPC_PAYLOAD_CAPACITY * 2),

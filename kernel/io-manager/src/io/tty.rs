@@ -6,7 +6,6 @@ use rustos_user_abi::console::MAX_CONSOLE_SESSIONS;
 
 use crate::io::session::ConsoleSessionHandle;
 use crate::sync::KernelWaitLock;
-use crate::user::linux as linux_abi;
 
 const INPUT_BUFFER_CAPACITY: usize = 1024;
 
@@ -23,43 +22,8 @@ pub fn read_input_for_session(session: ConsoleSessionHandle, dest: &mut [u8]) ->
         .map_or(0, |state| state.input.pop_into(dest))
 }
 
-pub fn has_pending_input_for_session(session: ConsoleSessionHandle) -> bool {
-    TTY.lock()
-        .session_mut(session)
-        .is_some_and(|state| !state.input.is_empty())
-}
-
-pub fn pending_input_len_for_session(session: ConsoleSessionHandle) -> usize {
-    TTY.lock()
-        .session_mut(session)
-        .map_or(0, |state| state.input.len())
-}
-
 pub fn disarm_input_waiter(task_id: u64) -> bool {
     TTY.lock().remove_input_waiter(task_id)
-}
-
-pub fn termios_for_session(session: ConsoleSessionHandle) -> linux_abi::LinuxTermios {
-    TTY.lock()
-        .session_mut(session)
-        .map_or_else(linux_abi::LinuxTermios::default_console, |state| {
-            state.termios
-        })
-}
-
-pub fn set_termios_for_session(
-    session: ConsoleSessionHandle,
-    termios: linux_abi::LinuxTermios,
-    flush_input: bool,
-) {
-    let mut tty = TTY.lock();
-    let Some(session_state) = tty.session_mut(session) else {
-        return;
-    };
-    if flush_input {
-        session_state.input = RingBuffer::new();
-    }
-    session_state.termios = termios;
 }
 
 pub fn read_input_blocking_for_session(session: ConsoleSessionHandle, dest: &mut [u8]) -> usize {
@@ -196,7 +160,6 @@ struct BoundTtySessionState {
 
 struct TtySessionState {
     input: RingBuffer<u8, INPUT_BUFFER_CAPACITY>,
-    termios: linux_abi::LinuxTermios,
     input_waiter: Option<u64>,
 }
 
@@ -204,7 +167,6 @@ impl TtySessionState {
     const fn new() -> Self {
         Self {
             input: RingBuffer::new(),
-            termios: linux_abi::LinuxTermios::default_console(),
             input_waiter: None,
         }
     }

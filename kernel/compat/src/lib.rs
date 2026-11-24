@@ -7,7 +7,6 @@ pub(crate) use kernel_ipc_runtime::api as ipc;
 pub(crate) use kernel_mm::api as memory;
 pub(crate) use kernel_ps::api as multitask;
 
-#[allow(unused_imports, unused_macros)]
 pub(crate) mod debug {
     pub(crate) use nucleus_core::debug::*;
     pub(crate) use trace_loc_macro::trace_loc;
@@ -99,7 +98,7 @@ pub(crate) mod vfs {
     }
 }
 
-pub mod user;
+pub(crate) mod user;
 
 pub(crate) mod oom_watchdog;
 

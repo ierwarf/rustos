@@ -67,15 +67,6 @@ pub fn parse_mmap_sharing(flags: u64) -> Result<MmapSharing, MmapPlanError> {
     }
 }
 
-pub fn plan_mmap(
-    anonymous: bool,
-    sharing: MmapSharing,
-    prot_none: bool,
-    fd_kind: Option<MmapFdKind>,
-) -> Result<MmapPlan, MmapPlanError> {
-    plan_mmap_with_write(anonymous, sharing, prot_none, true, fd_kind)
-}
-
 pub fn plan_mmap_with_write(
     anonymous: bool,
     sharing: MmapSharing,
@@ -123,6 +114,15 @@ pub fn library_demand_candidate(plan: MmapPlan, prot: u64, offset: u64, map_len:
 
 #[cfg(test)]
 mod tests {
+    fn plan_mmap(
+        anonymous: bool,
+        sharing: MmapSharing,
+        prot_none: bool,
+        fd_kind: Option<MmapFdKind>,
+    ) -> Result<MmapPlan, MmapPlanError> {
+        plan_mmap_with_write(anonymous, sharing, prot_none, true, fd_kind)
+    }
+
     use super::*;
 
     #[test]

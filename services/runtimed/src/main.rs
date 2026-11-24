@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::fd::OwnedFd;
 use std::sync::atomic::AtomicU64;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -65,19 +64,12 @@ pub(crate) const MAX_POLICY_LAUNCH_ATTEMPTS_PER_TICK: usize = 1;
 pub(crate) const MAX_EXEC_ARG_COUNT: usize = 32;
 pub(crate) const MAX_EXEC_ENV_COUNT: usize = 64;
 pub(crate) const MAX_EXEC_TEXT_BYTES: usize = 256;
-pub(crate) const SYS_OPENAT: usize = 257;
-pub(crate) const AT_FDCWD: isize = -100;
-pub(crate) const O_RDWR: usize = 2;
 pub(crate) const LINUX_TCGETS: u64 = libc::TCGETS;
 pub(crate) const LINUX_TCSETS: u64 = libc::TCSETS;
 pub(crate) const LINUX_TCSETSW: u64 = libc::TCSETSW;
 pub(crate) const LINUX_TCSETSF: u64 = libc::TCSETSF;
 pub(crate) const LINUX_FIONREAD: u64 = libc::FIONREAD;
-pub(crate) const CONSOLE_SESSION_STATE_LOADING_IMAGE: u16 =
-    console_abi::CONSOLE_SESSION_STATE_LOADING_IMAGE;
-pub(crate) const CONSOLE_SESSION_STATE_SPAWNING: u16 = console_abi::CONSOLE_SESSION_STATE_SPAWNING;
 pub(crate) const CONSOLE_SESSION_STATE_RUNNING: u16 = console_abi::CONSOLE_SESSION_STATE_RUNNING;
-pub(crate) const CONSOLE_PATH: &str = console_abi::CONSOLE_PATH;
 pub(crate) const UI_SERVER_DESKTOP_FILE_ID: &str = "uiserver.desktop";
 pub(crate) const UI_SERVER_DISPLAY_NAME: &str = "UI Server";
 pub(crate) const UI_SERVER_EXEC_PATH: &str = "services/uiserver/uiserver.elf";
@@ -143,7 +135,6 @@ pub(crate) struct ProgramMetadata {
 }
 
 pub(crate) struct BrokerState {
-    pub(crate) console_fd: Option<OwnedFd>,
     pub(crate) next_session_handle: u64,
     pub(crate) focused_session_handle: u64,
     pub(crate) session_runtime: session::SessionRuntime,
@@ -201,7 +192,6 @@ pub(crate) struct BrokerState {
 impl Default for BrokerState {
     fn default() -> Self {
         Self {
-            console_fd: None,
             // Zero is the "no session" handle every caller compares against,
             // so a real session may never be issued it.
             next_session_handle: 1,

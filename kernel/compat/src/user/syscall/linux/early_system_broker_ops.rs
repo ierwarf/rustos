@@ -87,12 +87,12 @@ fn broker_read(args: &EarlySystemBrokerArgs, path: &str) -> u64 {
 }
 
 fn bootstrap_error_to_linux_errno(
-    error: kernel_io_manager::storage::boot_volume::BootstrapImageError,
+    error: kernel_io_manager::api::BootstrapImageError,
 ) -> i64 {
     match error {
-        kernel_io_manager::storage::boot_volume::BootstrapImageError::NotFound => LINUX_ENOENT,
-        kernel_io_manager::storage::boot_volume::BootstrapImageError::Unavailable
-        | kernel_io_manager::storage::boot_volume::BootstrapImageError::Invalid => LINUX_EIO,
+        kernel_io_manager::api::BootstrapImageError::NotFound => LINUX_ENOENT,
+        kernel_io_manager::api::BootstrapImageError::Unavailable
+        | kernel_io_manager::api::BootstrapImageError::Invalid => LINUX_EIO,
     }
 }
 // RING3-MIGRATION-REFERENCE END: immutable early-system bootstrap substrate.

@@ -1475,7 +1475,6 @@ fn record_console_read_wait(empty_polls: u64, waited_from_ns: u64, route_ns: u64
         ((empty_polls & 0xffff_ffff) << 32) | (waited_us & 0xffff_ffff),
         (((route_ns / 1_000) & 0xffff_ffff) << 32) | ((sleep_ns / 1_000) & 0xffff_ffff),
     );
-    let _ = total;
 }
 
 /// Below this much elapsed time, an empty console read plainly did not wait,
@@ -2287,23 +2286,7 @@ fn decode_netd_ipc_response(
                 request.op,
                 SYSCALL_OFFLOAD_OP_LINUX_CLOSE | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
             ))
-        || (decoded.discarded_tail != 0
-            && (decoded.status != 0
-                || decoded.discarded_tail as usize > NETD_IPC_PAYLOAD_CAPACITY
-                || match request.op {
-                    SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => request.arg3 & (linux_abi::MSG_PEEK | linux_abi::MSG_TRUNC) != 0,
-                    SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => request.arg2 & (linux_abi::MSG_PEEK | linux_abi::MSG_TRUNC) != 0,
-                    _ => true,
-                }))
-        || decoded.reserved1 & !(NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF | rustos_user_abi::syscall::NETD_IPC_RESPONSE_FLAG_RECORD_PRESENT) != 0
-        || (decoded.reserved1 & rustos_user_abi::syscall::NETD_IPC_RESPONSE_FLAG_RECORD_PRESENT != 0
-            && (decoded.status != 0 || match request.op {
-                SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => request.arg3 & linux_abi::MSG_PEEK != 0,
-                SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => request.arg2 & linux_abi::MSG_PEEK != 0,
-                _ => true,
-            }))
-        || (decoded.discarded_tail != 0
-            && decoded.reserved1 & rustos_user_abi::syscall::NETD_IPC_RESPONSE_FLAG_RECORD_PRESENT == 0)
+        || decoded.reserved1 & !NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF != 0
     {
         return Err(LINUX_EINVAL);
     }

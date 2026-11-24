@@ -73,7 +73,6 @@ pub struct PagerState {
     /// Highest fault-token generation accepted for each ring0 slot. Index is
     /// the token's one-based slot minus one; zero means the slot is unused.
     accepted_generations: [u64; PAGER_MAX_CONSUMED_TOKENS],
-    page_cache: PageCache,
 }
 
 impl PagerState {
@@ -82,16 +81,7 @@ impl PagerState {
             epoch,
             regions: Vec::new(),
             accepted_generations: [0; PAGER_MAX_CONSUMED_TOKENS],
-            page_cache: PageCache::new(),
         }
-    }
-
-    pub const fn page_cache(&self) -> &PageCache {
-        &self.page_cache
-    }
-
-    pub fn page_cache_mut(&mut self) -> &mut PageCache {
-        &mut self.page_cache
     }
 
     pub const fn epoch(&self) -> u64 {

@@ -507,7 +507,7 @@ fn ensure_targets(config: &Config) -> Result<()> {
     run_command(&mut command)
 }
 
-pub(crate) fn build_efi(config: &Config) -> Result<()> {
+fn build_efi(config: &Config) -> Result<()> {
     let signing = ensure_grub_signing_material(config)?;
 
     sign_nucleus_with(config, &signing)?;

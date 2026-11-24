@@ -50,14 +50,12 @@ impl<V: VmaEntry> VmaMap<V> {
         self.map.len()
     }
 
-    // TEST-HARNESS: used by tests and the lib build; the bin only queries ranges.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 
-    // TEST-HARNESS: used by tests and the lib build; the bin only queries ranges.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = &V> {
         self.map.values()
     }

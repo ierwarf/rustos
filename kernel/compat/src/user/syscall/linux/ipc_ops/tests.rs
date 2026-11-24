@@ -329,46 +329,6 @@ fn commercial_response_envelope_is_bound_to_request_and_bounded() {
     );
 }
 
-#[test]
-fn received_descriptors_take_only_the_receivers_cloexec_choice() {
-    // recvmsg(MSG_CMSG_CLOEXEC) installs FD_CLOEXEC descriptors; without the
-    // flag the sender's own close-on-exec bit must not leak to the receiver.
-    for (sender_flags, cloexec, expected) in [
-        (multitask::FD_CLOEXEC, false, 0),
-        (0, false, 0),
-        (0, true, multitask::FD_CLOEXEC),
-        (multitask::FD_CLOEXEC, true, multitask::FD_CLOEXEC),
-    ] {
-        let entry = multitask::TransferredHandleEntry::from_initial_entry(multitask::HandleEntry::new(
-            multitask::KernelHandle::Socket(multitask::SocketHandle::from_token(
-                0x5eed_c10e,
-                linux_abi::AF_UNIX,
-                linux_abi::SOCK_STREAM,
-                0,
-            )),
-            sender_flags,
-            linux_abi::SOCK_NONBLOCK,
-        ))
-        .unwrap();
-        let mut install = PreparedTransferInstall {
-            reservation_id: 0,
-            slots: Vec::new(),
-            entries: Some(alloc::vec![entry]),
-            service_refs: Vec::new(),
-            committed: true,
-        };
-        install.set_close_on_exec(cloexec).unwrap();
-        let entries = install.entries.take().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].entry().fd_flags(), expected);
-        // Only the descriptor flag changes; the open description stays.
-        assert_eq!(entries[0].entry().status_flags(), linux_abi::SOCK_NONBLOCK);
-        for transferred in entries {
-            drop(transferred.into_entry());
-        }
-    }
-}
-
 /// Every byte-only service wire envelope the kernel originates fits the
 /// rendezvous frame, so the generic service call can use the direct switch
 /// instead of the queued transport (heap request, IPI wake, IPI reply wake).

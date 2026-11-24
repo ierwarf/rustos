@@ -300,7 +300,7 @@ pub(crate) fn ioctl(
                 Some(KernelHandle::DisplaySurface(surface)) => *surface,
                 Some(_) | None => return Err(DeviceError::InvalidArgument),
             };
-            present_surface(process_state.address_space(), surface)?;
+            present_surface(surface)?;
             Ok(0)
         }
         device::DISPLAY_IOCTL_PRESENT_RECT => {
@@ -370,17 +370,13 @@ fn surface_kernel_ptr(surface: DisplaySurfaceHandle) -> Result<(*const u8, usize
     Ok((src_ptr.cast_const(), mapped_len))
 }
 
-pub(crate) fn present_surface(
-    address_space: &paging::ProcessAddressSpace,
-    surface: DisplaySurfaceHandle,
-) -> Result<(), DeviceError> {
+pub(crate) fn present_surface(surface: DisplaySurfaceHandle) -> Result<(), DeviceError> {
     let display = display_info()?;
     validate_surface_for_present(surface, display)?;
     let region = surface
         .mapped_region()
         .ok_or(DeviceError::InvalidArgument)?;
     validate_surface_mapping(surface, region)?;
-    let _ = address_space;
     let (ptr, _) = surface_kernel_ptr(surface)?;
     match gui::present_userspace_frame_from_kernel_bgra8888(
         ptr,

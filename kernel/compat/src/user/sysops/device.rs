@@ -901,10 +901,9 @@ fn drm_ioctl_map_dumb(
     arg: u64,
 ) -> Result<u64, DeviceSysopError> {
     let mut map = read_process_struct::<DrmModeMapDumb>(process_state, arg)?;
-    let surface = process_surface(process_state, map.handle)?;
+    process_surface(process_state, map.handle)?;
     map.offset = u64::from(map.handle);
     map.pad = 0;
-    let _ = surface;
     write_process_struct(process_state, arg, &map)?;
     Ok(0)
 }

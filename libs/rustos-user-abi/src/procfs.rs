@@ -599,78 +599,6 @@ impl ProcThreadFactsWire {
     }
 }
 
-pub const PROC_LIMITS_COUNT: usize = 10;
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ProcLimitsWire {
-    pub limits: [Option<(u64, u64)>; PROC_LIMITS_COUNT],
-}
-
-impl ProcLimitsWire {
-    pub const ENTRY_LEN: usize = 17;
-    pub const ENCODED_LEN: usize = PROC_LIMITS_COUNT * Self::ENTRY_LEN;
-
-    pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
-        if out.len() < Self::ENCODED_LEN {
-            return None;
-        }
-        for (i, slot) in self.limits.iter().enumerate() {
-            let base = i * Self::ENTRY_LEN;
-            match slot {
-                Some((cur, max)) => {
-                    out[base] = 1;
-                    out[base + 1..base + 9].copy_from_slice(&cur.to_le_bytes());
-                    out[base + 9..base + 17].copy_from_slice(&max.to_le_bytes());
-                }
-                None => out[base..base + Self::ENTRY_LEN].fill(0),
-            }
-        }
-        Some(Self::ENCODED_LEN)
-    }
-
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < Self::ENCODED_LEN {
-            return None;
-        }
-        let mut limits = [None; PROC_LIMITS_COUNT];
-        for (i, slot) in limits.iter_mut().enumerate() {
-            let base = i * Self::ENTRY_LEN;
-            if bytes[base] != 0 {
-                let cur = u64::from_le_bytes(bytes[base + 1..base + 9].try_into().ok()?);
-                let max = u64::from_le_bytes(bytes[base + 9..base + 17].try_into().ok()?);
-                *slot = Some((cur, max));
-            }
-        }
-        Some(Self { limits })
-    }
-}
-
-pub fn encode_u64_list(values: &[u64], out: &mut [u8]) -> Option<usize> {
-    let count = u32::try_from(values.len()).ok()?;
-    let total = 4usize.checked_add(values.len().checked_mul(8)?)?;
-    if out.len() < total {
-        return None;
-    }
-    out[0..4].copy_from_slice(&count.to_le_bytes());
-    for (i, &val) in values.iter().enumerate() {
-        let base = 4 + i * 8;
-        out[base..base + 8].copy_from_slice(&val.to_le_bytes());
-    }
-    Some(total)
-}
-
-pub fn decode_u64_list_len(bytes: &[u8]) -> Option<(usize, &[u8])> {
-    if bytes.len() < 4 {
-        return None;
-    }
-    let count = u32::from_le_bytes(bytes[0..4].try_into().ok()?) as usize;
-    let payload_len = count.checked_mul(8)?;
-    if bytes.len() - 4 < payload_len {
-        return None;
-    }
-    Some((count, &bytes[4..4 + payload_len]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -877,16 +805,5 @@ mod tests {
         };
         let tn = thread.encode(&mut buf).unwrap();
         assert_eq!(ProcThreadFactsWire::decode(&buf[..tn]), Some(thread));
-
-        let mut limits = ProcLimitsWire::default();
-        limits.limits[0] = Some((1024, u64::MAX));
-        let ln = limits.encode(&mut buf).unwrap();
-        assert_eq!(ProcLimitsWire::decode(&buf[..ln]), Some(limits));
-
-        let fds = [0_u64, 3, 7];
-        let fn_ = encode_u64_list(&fds, &mut buf).unwrap();
-        let (count, payload) = decode_u64_list_len(&buf[..fn_]).unwrap();
-        assert_eq!(count, 3);
-        assert_eq!(u64::from_le_bytes(payload[8..16].try_into().unwrap()), 3);
     }
 }

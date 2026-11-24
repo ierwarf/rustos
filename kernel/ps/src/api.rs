@@ -33,7 +33,7 @@ pub use crate::multitask::{
     complete_ipc_reply_wake_handoff_with_custody, complete_pager_fault_wake_handoff,
     complete_retired_task_cleanup, consume_pager_fault_reply, current_linux_thread_state,
     current_pager_charge_snapshot, current_pager_fault_install_permit, current_pager_vma_snapshot,
-    current_task_id_with_signal_hint, current_thread_may_have_pending_signals, current_user_address_space,
+    current_thread_may_have_pending_signals, current_user_address_space,
     current_user_ipc_entry, current_user_ipc_identity, current_user_job_charge_group, live_user_thread_ids, current_user_job_policy_allows,
     current_user_process_identity, current_user_process_thread_count, current_user_stack_state,
     current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
@@ -43,14 +43,14 @@ pub use crate::multitask::{
     inherit_pager_fault_priority, is_user_process_exiting, is_user_task_alive, linux_task_affinity,
     user_target_abi_if_alive,
     linux_thread_runnable_by_ids, linux_thread_snapshot_by_ids, set_linux_thread_comm_by_ids, live_user_process_identity_by_pid,
-    live_user_process_identity_with_exact_exec_path, mark_user_process_exiting,
+    live_user_process_identity_with_exact_exec_path,
     mark_user_process_exiting_once, next_retired_task_cleanup, note_process_exit_status,
-    first_user_mapping_conflict, move_pager_vma_range_for_process, move_pager_vma_range_for_process_with_ceiling, pager_fault_snapshot, pager_vma_regions_for_process, protect_pager_vma_for_process, protect_pager_vma_for_process_with_ceiling,
-    publish_current_pager_vma, publish_inherited_pager_vma_for_process,
+    first_user_mapping_conflict, move_pager_vma_range_for_process_with_ceiling, pager_fault_snapshot, pager_vma_regions_for_process, protect_pager_vma_for_process_with_ceiling,
+    publish_inherited_pager_vma_for_process,
     publish_pager_vma_for_process, queue_linux_process_sigchld, queue_linux_process_signal, queue_linux_signal,
-    register_pager_fault_waiter, release_ipc_priority, release_pager_fault_priority,
+    register_pager_fault_waiter, release_ipc_priority,
     reserve_ipc_call_donation, reserve_ipc_priority, reserve_pager_fault_with_dispatch_grant,
-    reserve_process_spawn, reserve_process_spawn_in, revoke_current_pager_vma, revoke_pager_vma_for_process,
+    reserve_process_spawn, reserve_process_spawn_in, revoke_pager_vma_for_process,
     set_current_linux_tls_fs_base, set_linux_task_affinity, set_next_latency_pick_hint,
     set_next_pick_hint, set_next_process_pick_hint, set_next_spawn_pick_hint,
     set_pager_vma_commit_state_for_process, set_windows_current_thread_affinity,
@@ -66,7 +66,7 @@ pub use crate::multitask::{
     terminate_user_task, unmap_pager_vma_for_process, unmap_pager_vma_for_process_with, unmap_pager_vma_for_process_with_ceiling,
     unregister_pager_fault_waiter, validate_fault_request, wake_pager_service_waiter_for_process,
     wake_task, wake_user_task, windows_process_affinity, with_current_mm,
-    with_current_process_state, with_current_process_state_mut, with_current_user_linux_state_mut,
+    with_current_process_state, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_fork_parent_state, with_process_state_by_pid, with_process_state_by_pid_mut,
     with_process_state_for_teardown_mut,
@@ -85,7 +85,7 @@ pub use crate::multitask::{ProcessIdentity, SpawnReservation};
 pub use crate::user::abi::UserAbi;
 pub use crate::user::epoll::{
     epoll_claim, epoll_create, epoll_ctl, epoll_purge_object, epoll_retire, epoll_snapshot,
-    EpollError, EpollHandle, EpollInterestKey, EpollInterestRecord, EpollInterestSnapshot,
+    EpollError, EpollHandle, EpollInterestKey, EpollInterestRecord,
     EpollRegistry, EpollReportState,
 };
 pub use crate::user::handles::{
@@ -120,9 +120,7 @@ pub use crate::user::pipe::{
 pub use crate::user::process_state::{
     LinuxCapabilities, ProcessSecurityContext, SharedFutexBackingKey, UserProcessState,
 };
-pub use crate::user::socket::{
-    PassedHandle, SocketCredentials, SocketError, SocketHandle, SocketStreamGuard,
-};
+pub use crate::user::socket::{PassedHandle, SocketCredentials};
 pub use crate::user::unix_socket::{
     UnixAddress, UnixNamespaceKey, UnixReceivedMessage, UnixSendOutcome, UnixSocketError,
     UnixSocketHandle, UnixSocketType, UNIX_DEFAULT_BACKLOG, UNIX_DEFAULT_BUF_SIZE,
@@ -266,10 +264,7 @@ pub mod fault {
 }
 
 pub mod process {
-    use super::{
-        ProcessSecurityContext, SchedulingContextAdmission, SpawnReservation, SpawnTaskError,
-        UserTaskBootstrap,
-    };
+    use super::{SchedulingContextAdmission, SpawnReservation, SpawnTaskError, UserTaskBootstrap};
 
     pub fn spawn_user_process_with_scheduling_context(
         address_space: crate::memory::paging::ProcessAddressSpace,
@@ -318,8 +313,6 @@ pub mod process {
             spawn_reservation,
         )
     }
-
-    pub type SecurityContext = ProcessSecurityContext;
 }
 
 pub mod snapshot {

@@ -258,6 +258,7 @@ impl HandleTable {
     }
 
     /// Bytes currently billed for dynamic slots (zero when unbound).
+    #[cfg(test)]
     pub fn kmem_charged_bytes(&self) -> u64 {
         self.kmem.map_or(0, |binding| binding.charged)
     }
@@ -420,21 +421,14 @@ impl HandleTable {
         self.reserved.contains_key(&fd)
     }
 
+    #[cfg(test)]
     pub fn duplicate_for_transfer(&self, fd: u64) -> Option<TransferredHandleEntry> {
         TransferredHandleEntry::from_entry(self.get_entry(fd)?.clone())
     }
 
     pub fn install_transferred(&mut self, transferred: TransferredHandleEntry) -> Option<u64> {
-        self.install_transferred_min(transferred, 0)
-    }
-
-    pub fn install_transferred_min(
-        &mut self,
-        transferred: TransferredHandleEntry,
-        min_fd: u64,
-    ) -> Option<u64> {
         let entry = transferred.into_entry();
-        match self.place_entry_min(entry, min_fd) {
+        match self.place_entry_min(entry, 0) {
             Ok(fd) => Some(fd),
             Err(entry) => {
                 // `into_entry` disarmed the wrapper's drop-time withdrawal, so
@@ -444,16 +438,6 @@ impl HandleTable {
                 None
             }
         }
-    }
-
-    pub fn can_install_additional(&self, count: usize) -> bool {
-        let occupied = self.standard.iter().filter(|entry| entry.is_some()).count()
-            + self.entries.iter().filter(|entry| entry.is_some()).count();
-        let total = (FIRST_DYNAMIC_FD as usize).saturating_add(max_dynamic_entries());
-        count
-            <= total
-                .saturating_sub(occupied)
-                .saturating_sub(self.reserved.len())
     }
 
     /// Reserves dynamic descriptor numbers without publishing handles through
@@ -694,25 +678,6 @@ impl HandleTable {
         self.grow_entries(required)
     }
 
-    pub fn replace_entry(&mut self, fd: u64, entry: Option<HandleEntry>) -> Option<()> {
-        if fd > MAX_DYNAMIC_FD {
-            return None;
-        }
-        if self.reserved.contains_key(&fd) {
-            return None;
-        }
-        if let Some(index) = standard_index(fd) {
-            let replaced = core::mem::replace(&mut self.standard[index], entry);
-            release_entry_descriptor_reference(replaced.as_ref());
-            return Some(());
-        }
-        let index = dynamic_index(fd)?;
-        self.ensure_entry_capacity(index)?;
-        let replaced = core::mem::replace(&mut self.entries[index], entry);
-        release_entry_descriptor_reference(replaced.as_ref());
-        Some(())
-    }
-
     pub fn close(&mut self, fd: u64) -> Option<KernelHandle> {
         let entry = if let Some(index) = standard_index(fd) {
             self.standard.get_mut(index)?.take()?
@@ -804,16 +769,6 @@ impl HandleTable {
         self.standard.len() + self.entries.len()
     }
 
-    /// Open descriptors (not reservations) whose entry satisfies `matches`.
-    pub fn count_open_where(&self, mut matches: impl FnMut(&HandleEntry) -> bool) -> usize {
-        self.standard
-            .iter()
-            .chain(self.entries.iter())
-            .filter_map(Option::as_ref)
-            .filter(|entry| matches(entry))
-            .count()
-    }
-
     pub fn duplicate_min(&mut self, fd: u64, min_fd: u64, close_on_exec: bool) -> Option<u64> {
         if min_fd > MAX_DYNAMIC_FD {
             return None;
@@ -833,6 +788,7 @@ impl HandleTable {
         installed
     }
 
+    #[cfg(test)]
     pub fn duplicate_exact(&mut self, fd: u64, new_fd: u64, close_on_exec: bool) -> Option<u64> {
         self.duplicate_exact_with_replaced(fd, new_fd, close_on_exec)
             .map(|(fd, _)| fd)

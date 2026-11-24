@@ -648,16 +648,6 @@ unsafe impl GlobalAlloc for KernelAllocator {
         // SAFETY: forwarded unchanged under `GlobalAlloc::dealloc`'s contract.
         let _ = unsafe { try_dealloc(ptr, layout) };
     }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: forwarded unchanged under `GlobalAlloc::alloc_zeroed`'s contract.
-        let ptr = unsafe { self.alloc(layout) };
-        if !ptr.is_null() {
-            // SAFETY: `ptr` is a fresh allocation of `layout.size()` bytes.
-            unsafe { ptr.write_bytes(0, layout.size()) };
-        }
-        ptr
-    }
 }
 
 #[cfg(not(test))]

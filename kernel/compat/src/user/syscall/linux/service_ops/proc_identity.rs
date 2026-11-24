@@ -839,28 +839,14 @@ fn encode_thread_facts_wire(pid: u64, tid: u64) -> Result<Vec<u8>, i64> {
     Ok(out)
 }
 
-fn encode_u64_list_wire(values: &[u64]) -> Result<Vec<u8>, i64> {
-    let total = 4usize
-        .checked_add(values.len().checked_mul(8).ok_or(LINUX_EOVERFLOW)?)
-        .ok_or(LINUX_EOVERFLOW)?;
-    if total > abi_procfs::PROC_SNAPSHOT_MAX_BYTES {
-        return Err(LINUX_EOVERFLOW);
-    }
-    let mut out = alloc::vec![0_u8; total];
-    let n = abi_procfs::encode_u64_list(values, &mut out).ok_or(LINUX_EOVERFLOW)?;
-    out.truncate(n);
-    Ok(out)
-}
-
 /// `SYS_RUSTOS_PROC_FACTS_BROKER`: `VfsPolicy`-gated bounded pull of attested
 /// raw `/proc/<pid>` facts so `vfsd` formats `/proc` nodes in Ring3.
 pub(in crate::user::syscall::linux) fn syscall_linux_rustos_proc_facts_broker(
     args_ptr: u64,
 ) -> u64 {
     use rustos_user_abi::syscall::{
-        ProcFactsBrokerArgs, PROC_FACTS_BROKER_ABI_VERSION, PROC_FACTS_OP_FD_LIST,
-        PROC_FACTS_OP_LIMITS, PROC_FACTS_OP_PROCESS, PROC_FACTS_OP_THREAD,
-        PROC_FACTS_OP_TID_LIST,
+        ProcFactsBrokerArgs, PROC_FACTS_BROKER_ABI_VERSION, PROC_FACTS_OP_PROCESS,
+        PROC_FACTS_OP_THREAD,
     };
 
     if !crate::user::syscall::linux::ipc_ops::current_process_has_service_capability(
@@ -895,30 +881,6 @@ pub(in crate::user::syscall::linux) fn syscall_linux_rustos_proc_facts_broker(
     let encoded = match args.op {
         PROC_FACTS_OP_PROCESS => encode_process_facts_wire(args.pid),
         PROC_FACTS_OP_THREAD => encode_thread_facts_wire(args.pid, args.tid),
-        PROC_FACTS_OP_FD_LIST => {
-            let fds = multitask::with_process_state_by_pid(args.pid, |s| s.handles().fd_numbers())
-                .ok_or(LINUX_ESRCH);
-            fds.and_then(|list| encode_u64_list_wire(&list))
-        }
-        PROC_FACTS_OP_TID_LIST => {
-            encode_u64_list_wire(&multitask::live_user_thread_ids(args.pid))
-        }
-        PROC_FACTS_OP_LIMITS => {
-            if caller_pid().ok() != Some(args.pid) {
-                Err(LINUX_EOPNOTSUPP)
-            } else {
-                let wire = abi_procfs::ProcLimitsWire {
-                    limits: gather_limits(),
-                };
-                let mut out = alloc::vec![0_u8; abi_procfs::ProcLimitsWire::ENCODED_LEN];
-                wire.encode(&mut out)
-                    .map(|n| {
-                        out.truncate(n);
-                        out
-                    })
-                    .ok_or(LINUX_EOVERFLOW)
-            }
-        }
         _ => Err(LINUX_EINVAL),
     };
     let bytes = match encoded {

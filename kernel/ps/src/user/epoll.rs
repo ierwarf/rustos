@@ -370,12 +370,6 @@ pub struct EpollHandle {
     description: Arc<EpollOpenDescription>,
 }
 
-#[derive(Debug, Clone)]
-pub struct EpollInterestSnapshot {
-    pub events: u32,
-    pub data: u64,
-}
-
 impl EpollHandle {
     pub fn new() -> Self {
         let mut bytes = [0_u8; 8];
@@ -404,10 +398,6 @@ impl EpollHandle {
                 descriptor_refs: AtomicUsize::new(1),
             }),
         }
-    }
-
-    pub fn path(&self) -> &'static str {
-        "anon_inode:[eventpoll]"
     }
 
     pub fn token_id(&self) -> u64 {

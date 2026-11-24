@@ -57,7 +57,6 @@ static DISPATCH_WITNESSES: [AtomicDispatchWitness; WITNESS_COUNT] =
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum SchedulerObservationKind {
-    ReadyWait = 1,
     BlockedWait = 2,
     ExitSnapshot = 3,
 }
@@ -65,7 +64,6 @@ pub enum SchedulerObservationKind {
 impl SchedulerObservationKind {
     fn from_raw(raw: u8) -> Option<Self> {
         match raw {
-            1 => Some(Self::ReadyWait),
             2 => Some(Self::BlockedWait),
             3 => Some(Self::ExitSnapshot),
             _ => None,

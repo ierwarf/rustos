@@ -16,7 +16,6 @@
 //!   `runtime-control-ingress`.
 use std::ffi::CString;
 use std::mem::size_of;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -42,10 +41,8 @@ use super::kvm_smp_qualification::{
     qualification_contract_for_launch, KvmSmpQualificationContract,
 };
 use super::{
-    boot_line, AT_FDCWD, CONSOLE_PATH, CONSOLE_SESSION_STATE_LOADING_IMAGE,
-    CONSOLE_SESSION_STATE_RUNNING, CONSOLE_SESSION_STATE_SPAWNING, DEFAULT_USER_TASK_WEIGHT_MICROS,
-    IDLE_POLL_INTERVAL, LOADER_ENDPOINT_CACHE, MAX_UNTRUSTED_TASK_WEIGHT_MICROS,
-    MIN_EFFECTIVE_TASK_WEIGHT_MICROS, O_RDWR, SYS_OPENAT, UI_SERVER_EXEC_PATH,
+    boot_line, DEFAULT_USER_TASK_WEIGHT_MICROS, IDLE_POLL_INTERVAL, LOADER_ENDPOINT_CACHE,
+    MAX_UNTRUSTED_TASK_WEIGHT_MICROS, MIN_EFFECTIVE_TASK_WEIGHT_MICROS, UI_SERVER_EXEC_PATH,
     UI_SERVER_TASK_WEIGHT_MICROS,
 };
 use super::{BrokerState, LaunchEntry, RunningProcess};
@@ -191,7 +188,6 @@ fn begin_tracked_launch_inner(
         .as_str(),
     );
     let session_handle = if entry.console_hosted {
-        let _ = ensure_console_fd(state)?;
         let session = allocate_console_session(state)?;
         Some(session)
     } else {
@@ -495,9 +491,7 @@ pub(super) fn spawn_tracked_process(
         .as_str(),
     );
     let session_handle = if entry.console_hosted {
-        let _ = ensure_console_fd(state)?;
         let session = allocate_console_session(state)?;
-        let _ = CONSOLE_SESSION_STATE_LOADING_IMAGE;
         Some(session)
     } else {
         None
@@ -523,7 +517,6 @@ pub(super) fn spawn_tracked_process(
         Err(err) => {
             if let Some(session) = session_handle {
                 state.session_runtime.remove_session(session);
-                let _ = close_console_session(ensure_console_fd(state)?, session);
             }
             if is_permanent_launch_failure(err) {
                 observability_client::warn!(
@@ -618,9 +611,6 @@ pub(super) fn spawn_tracked_process(
     state.retry_after.remove(desktop_file_id.as_str());
     state.launch_failure_counts.remove(desktop_file_id.as_str());
     if inserted_session_handle != 0 {
-        let _ = ensure_console_fd(state)?;
-        let _ = CONSOLE_SESSION_STATE_SPAWNING;
-        let _ = CONSOLE_SESSION_STATE_RUNNING;
         super::session::focus_session_after_spawn(state, inserted_session_handle);
     }
     Ok(())
@@ -846,9 +836,6 @@ pub(super) fn release_failed_session(state: &mut BrokerState, session_handle: Op
     }
     state.session_runtime.remove_session(session);
     super::session::clear_focused_session_if(state, session);
-    if let Ok(console_fd) = ensure_console_fd(state) {
-        let _ = close_console_session(console_fd, session);
-    }
 }
 
 fn cleanup_failed_spawn(
@@ -1561,47 +1548,6 @@ mod session_budget_tests {
         let next = allocate_console_session(&mut state).unwrap();
         assert_eq!(next, first + 1);
     }
-}
-
-pub(super) fn close_console_session(_console_fd: RawFd, session_handle: u64) -> Result<bool, i32> {
-    Ok(session_handle != 0)
-}
-
-fn open_device(path: &str, flags: usize) -> Result<OwnedFd, i32> {
-    let path = CString::new(path).map_err(|_| libc::EINVAL)?;
-    // SAFETY: `path` is a live NUL-terminated CString for the duration of the
-    // `openat` call and the remaining arguments are integers.
-    let raw_fd = unsafe {
-        libc::syscall(
-            SYS_OPENAT as libc::c_long,
-            AT_FDCWD,
-            path.as_ptr(),
-            flags,
-            0usize,
-        ) as i32
-    };
-    if raw_fd < 0 {
-        return Err(last_errno());
-    }
-    // SAFETY: `raw_fd` is the descriptor `openat` just returned (checked non-negative
-    // above) and has no other owner, so `OwnedFd` takes unique ownership.
-    Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
-}
-
-pub(super) fn ensure_console_fd(state: &mut BrokerState) -> Result<RawFd, i32> {
-    if state.console_fd.is_none() {
-        debug_line("runtimed: console open begin");
-        boot_line("runtimed: console open begin");
-        let fd = open_device(CONSOLE_PATH, O_RDWR)?;
-        debug_line("runtimed: console open done");
-        boot_line("runtimed: console ready");
-        state.console_fd = Some(fd);
-    }
-    Ok(state
-        .console_fd
-        .as_ref()
-        .map(|fd| fd.as_raw_fd())
-        .unwrap_or(-1))
 }
 
 fn build_exec_argv(exec_path: &str, argv: &[String]) -> Result<Vec<CString>, i32> {

@@ -769,15 +769,6 @@ impl ProcessAddressSpace {
         })
     }
 
-    pub fn unmap_user_bytes(
-        &mut self,
-        start: VirtAddr,
-        byte_len: usize,
-    ) -> Result<usize, AddressSpaceError> {
-        let page_count = byte_len_to_page_count(byte_len)?;
-        self.unmap_user_pages_at(start, page_count)
-    }
-
     pub fn unmap_user_pages_at(
         &mut self,
         start: VirtAddr,
@@ -911,66 +902,6 @@ impl ProcessAddressSpace {
         match self.first_unmapped_user_page(start, page_count)? {
             Some(_) => Err(AddressSpaceError::NotMapped),
             None => Ok(()),
-        }
-    }
-
-    pub fn debug_dump_user_range_state(&self, start: VirtAddr, page_count: usize, reason: &str) {
-        crate::debug::println!(
-            "address space range dump: reason={} start={:#x} pages={}",
-            reason,
-            start.as_u64(),
-            page_count,
-        );
-        let capped = page_count.min(8);
-        for page_index in 0..capped {
-            let Ok(virt) = page_addr(start, page_index) else {
-                break;
-            };
-            self.debug_dump_user_page_state(virt, reason);
-        }
-        if page_count > capped {
-            crate::debug::println!(
-                "address space range dump: truncated remaining_pages={}",
-                page_count - capped
-            );
-        }
-    }
-
-    #[cfg_attr(not(rustos_debug_print_enabled), allow(unused_variables))]
-    pub fn debug_dump_user_page_state(&self, virt: VirtAddr, reason: &str) {
-        match self.lookup_user_page_state(virt) {
-            UserPageLookup::NotUser => crate::debug::println!(
-                "address space page dump: reason={} addr={:#x} state=not-user",
-                reason,
-                virt.as_u64(),
-            ),
-            UserPageLookup::MissingPml4 => crate::debug::println!(
-                "address space page dump: reason={} addr={:#x} state=missing-pml4",
-                reason,
-                virt.as_u64(),
-            ),
-            UserPageLookup::MissingPdpt => crate::debug::println!(
-                "address space page dump: reason={} addr={:#x} state=missing-pdpt",
-                reason,
-                virt.as_u64(),
-            ),
-            UserPageLookup::MissingPd => crate::debug::println!(
-                "address space page dump: reason={} addr={:#x} state=missing-pd",
-                reason,
-                virt.as_u64(),
-            ),
-            UserPageLookup::MissingPt => crate::debug::println!(
-                "address space page dump: reason={} addr={:#x} state=missing-pt",
-                reason,
-                virt.as_u64(),
-            ),
-            UserPageLookup::Present { phys, flags } => crate::debug::println!(
-                "address space page dump: reason={} addr={:#x} state=present phys={:#x} flags={:?}",
-                reason,
-                virt.as_u64(),
-                phys.as_u64(),
-                flags,
-            ),
         }
     }
 
@@ -1556,10 +1487,7 @@ enum UserPageLookup {
     MissingPdpt,
     MissingPd,
     MissingPt,
-    Present {
-        phys: PhysAddr,
-        flags: PageTableFlags,
-    },
+    Present,
 }
 
 impl UserPageLookup {
@@ -1621,11 +1549,7 @@ impl ProcessAddressSpace {
             return UserPageLookup::MissingPt;
         }
 
-        let offset = virt.as_u64() & (PAGE_4KIB_U64 - 1);
-        UserPageLookup::Present {
-            phys: PhysAddr::new(pt_entry.addr().as_u64() + offset),
-            flags: pt_entry.flags(),
-        }
+        UserPageLookup::Present
     }
 }
 

@@ -445,8 +445,8 @@ fn only_supported_inet_socket_creation_requires_a_prepared_reply_entry() {
 
     request.arg0 = linux_abi::AF_UNIX;
     assert!(
-        netd_reply_uses_prepared_socket(&request),
-        "AF_UNIX must never install a descriptor before the timely reply take"
+        !netd_reply_uses_prepared_socket(&request),
+        "AF_UNIX is kernel-local and never uses netd prepared-socket replies"
     );
     request.arg0 = linux_abi::AF_INET;
     request.arg1 = linux_abi::SOCK_DGRAM;
@@ -731,12 +731,12 @@ fn accepted_socket_flags_come_only_from_accept4_not_the_listener() {
                 op: SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
                 status_flags: listener_flags,
                 arg3: accepted_flags,
+                arg5: linux_abi::AF_INET,
                 ..NetdIpcRequest::default()
             };
-            let socket = multitask::SocketHandle::from_token(71, linux_abi::AF_UNIX, linux_abi::SOCK_STREAM, 0);
-            assert!(socket.bind_channel(99, 2));
+            let socket = multitask::InetSocketHandle::from_token(71, linux_abi::AF_INET, linux_abi::SOCK_STREAM, linux_abi::IPPROTO_TCP);
             let entry = multitask::TransferredHandleEntry::from_initial_entry(
-                multitask::HandleEntry::new(multitask::KernelHandle::Socket(socket),
+                multitask::HandleEntry::new(multitask::KernelHandle::InetSocket(socket),
                     if accepted_flags & linux_abi::SOCK_CLOEXEC != 0 { multitask::FD_CLOEXEC } else { 0 },
                     accepted_flags & linux_abi::SOCK_NONBLOCK)
             ).unwrap();
@@ -748,65 +748,7 @@ fn accepted_socket_flags_come_only_from_accept4_not_the_listener() {
 }
 
 #[test]
-fn prepared_unix_socket_pair_and_accept_abandonment_never_install_unseen_fds() {
-    fn entries(op:u16)->Vec<multitask::TransferredHandleEntry> {
-        (0..if op==SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR {2} else {1}).map(|index| {
-            let socket=multitask::SocketHandle::from_token(71+index,linux_abi::AF_UNIX,linux_abi::SOCK_STREAM,0);
-            if op!=SYSCALL_OFFLOAD_OP_LINUX_SOCKET {
-                assert!(socket.bind_channel(99,if op==SYSCALL_OFFLOAD_OP_LINUX_ACCEPT {2} else {index as u8+1}));
-            }
-            multitask::TransferredHandleEntry::from_initial_entry(multitask::HandleEntry::new(
-                multitask::KernelHandle::Socket(socket),multitask::FD_CLOEXEC,linux_abi::SOCK_NONBLOCK)).unwrap()
-        }).collect()
-    }
-    for op in [SYSCALL_OFFLOAD_OP_LINUX_SOCKET,SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,SYSCALL_OFFLOAD_OP_LINUX_ACCEPT] {
-        let request=NetdIpcRequest {op,arg0:linux_abi::AF_UNIX,
-            arg1:linux_abi::SOCK_STREAM | linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC,
-            arg3:linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC,
-            ..NetdIpcRequest::default()};
-        let mut response=NetdIpcResponse{op,value:71,..NetdIpcResponse::default()};
-        let count=if op==SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR {2} else {1};
-        if count==2 {
-            response.payload[..8].copy_from_slice(&72_u64.to_ne_bytes());
-            response.payload_len=8;
-        }
-        assert!(netd_reply_uses_prepared_socket(&request));
-        assert!(prepared_netd_socket_response_matches(&request,&response,&entries(op)));
-        let discarded=core::cell::Cell::new(0);
-        let installed=core::cell::Cell::new(0);
-        assert_eq!(install_prepared_netd_socket_response(&request,response,entries(op),|batch| {
-            discarded.set(discarded.get()+batch.len());
-        },||true,|_| {installed.set(installed.get()+count);Ok(alloc::vec![37;count])}),Err(LINUX_ETIMEDOUT));
-        assert_eq!(installed.get(),0);
-        assert_eq!(discarded.get(),count,"every initial reference must reach deferred close exactly once");
-        // User-copy/slot-commit failure owns and releases the whole claimed batch.
-        assert_eq!(install_prepared_netd_socket_response(&request,response,entries(op),|_|panic!("valid batch"),
-            ||false,|batch| {discarded.set(discarded.get()+batch.len());Err(LINUX_EFAULT)}),Err(LINUX_EFAULT));
-        assert_eq!(discarded.get(),2*count);
-        assert_eq!(installed.get(),0);
-        let result=install_prepared_netd_socket_response(&request,response,entries(op),|_|panic!("valid batch"),
-            ||false,|batch| {installed.set(batch.len());Ok((37..37+count as i32).collect())}).unwrap();
-        assert_eq!(installed.get(),count);
-        assert_eq!(result.value,if count==2 {0} else {37});
-        assert_eq!(result.payload_len,0);
-    }
-}
-
-#[test]
-fn seqpacket_and_netlink_replies_are_prepared_and_typed_exactly() {
-    let unix_entry = |ty: u64, token: u64| {
-        multitask::TransferredHandleEntry::from_initial_entry(multitask::HandleEntry::new(
-            multitask::KernelHandle::Socket(multitask::SocketHandle::from_token(
-                token,
-                linux_abi::AF_UNIX,
-                ty,
-                0,
-            )),
-            0,
-            0,
-        ))
-        .unwrap()
-    };
+fn netlink_replies_are_prepared_and_typed_exactly() {
     let netlink_entry = |ty: u64, token: u64| {
         multitask::TransferredHandleEntry::from_initial_entry(multitask::HandleEntry::new(
             multitask::KernelHandle::InetSocket(multitask::InetSocketHandle::from_token(
@@ -820,14 +762,12 @@ fn seqpacket_and_netlink_replies_are_prepared_and_typed_exactly() {
         ))
         .unwrap()
     };
-    let seqpacket = rustos_user_abi::syscall::NET_BROKER_PUBLICATION_SOCK_SEQPACKET;
     let raw = rustos_user_abi::syscall::NET_BROKER_PUBLICATION_SOCK_RAW;
-    // socket(AF_UNIX, SOCK_SEQPACKET): the published handle carries the type.
     let request = NetdIpcRequest {
         version: NETD_IPC_ABI_VERSION,
         op: SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
         arg0: linux_abi::AF_UNIX,
-        arg1: seqpacket,
+        arg1: linux_abi::SOCK_STREAM,
         ..NetdIpcRequest::default()
     };
     let response = NetdIpcResponse {
@@ -835,20 +775,7 @@ fn seqpacket_and_netlink_replies_are_prepared_and_typed_exactly() {
         value: 61,
         ..NetdIpcResponse::default()
     };
-    assert!(netd_reply_uses_prepared_socket(&request));
-    assert!(prepared_netd_socket_response_matches(&request, &response, &[unix_entry(seqpacket, 61)]));
-    assert!(
-        !prepared_netd_socket_response_matches(
-            &request,
-            &response,
-            &[unix_entry(linux_abi::SOCK_STREAM, 61)]
-        ),
-        "a stream handle must not satisfy a seqpacket request"
-    );
-    // socket(AF_UNIX, SOCK_DGRAM) is a prepared socket handle like the other
-    // AF_UNIX types.
-    let dgram = NetdIpcRequest { arg1: linux_abi::SOCK_DGRAM, ..request };
-    assert!(netd_reply_uses_prepared_socket(&dgram));
+    assert!(!netd_reply_uses_prepared_socket(&request));
     // socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE): a token handle.
     let netlink = NetdIpcRequest {
         arg0: rustos_user_abi::syscall::NET_BROKER_PUBLICATION_AF_NETLINK,

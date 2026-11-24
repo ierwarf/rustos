@@ -36,8 +36,6 @@ const CPU_LOCAL_LIVE: u8 = 2;
 struct SyscallCpuLocal {
     kernel_stack_top: u64,
     user_rsp: u64,
-    linux_compat_current_task: u64,
-    linux_compat_stack_guard: u64,
     // Installed with the same exact-task kernel stack, not a task pointer or
     // authority hint. Only the assembly ABI selector consumes this word.
     register_ipc_abi: u64,
@@ -48,8 +46,6 @@ struct SyscallCpuLocal {
 /// kernel stack. This is bootstrap substrate, not a substitute execution path.
 struct SyscallBootstrapStack([u8; SYSCALL_STACK_SIZE]);
 
-const _: [(); 0x10] = [(); core::mem::offset_of!(SyscallCpuLocal, linux_compat_current_task)];
-const _: [(); 0x18] = [(); core::mem::offset_of!(SyscallCpuLocal, linux_compat_stack_guard)];
 
 struct SyscallCpuLocalMemory(UnsafeCell<SyscallCpuLocal>);
 
@@ -67,8 +63,6 @@ static SYSCALL_CPU_LOCALS: [SyscallCpuLocalMemory; MAX_SUPPORTED_CPUS] = [const 
     SyscallCpuLocalMemory(UnsafeCell::new(SyscallCpuLocal {
         kernel_stack_top: 0,
         user_rsp: 0,
-        linux_compat_current_task: 0,
-        linux_compat_stack_guard: 0,
         register_ipc_abi: 0,
     }))
 }; MAX_SUPPORTED_CPUS];
@@ -114,8 +108,6 @@ pub fn init_cpu_local() {
         local_ptr.write(SyscallCpuLocal {
             kernel_stack_top: stack_base + SYSCALL_STACK_SIZE as u64,
             user_rsp: 0,
-            linux_compat_current_task: 0,
-            linux_compat_stack_guard: 0,
             register_ipc_abi: 0,
         });
     }
@@ -123,45 +115,6 @@ pub fn init_cpu_local() {
     // Acquire load by the CPU-local accessors.
     state.store(CPU_LOCAL_LIVE, Ordering::Release);
     prepare_for_context_return(false, USER_GS_BASE_DEFAULT);
-}
-
-pub fn set_linux_compat_current_task_ptr(current_task_ptr: usize) {
-    with_current_cpu_local_mut(|local| {
-        local.linux_compat_current_task = current_task_ptr as u64;
-    });
-}
-
-pub fn set_linux_compat_stack_guard(stack_guard: u64) {
-    with_current_cpu_local_mut(|local| {
-        local.linux_compat_stack_guard = stack_guard;
-    });
-}
-
-pub fn activate_linux_compat_cpu_local() {
-    prepare_for_context_return(false, USER_GS_BASE_DEFAULT);
-}
-
-pub fn with_kernel_gs_base<T>(f: impl FnOnce() -> T) -> T {
-    interrupts::without_interrupts(|| {
-        let current_gs_base = GsBase::read();
-        let kernel_gs_base = KernelGsBase::read();
-        if current_gs_base == kernel_gs_base {
-            return f();
-        }
-
-        GsBase::write(kernel_gs_base);
-        let result = f();
-        GsBase::write(current_gs_base);
-        result
-    })
-}
-
-pub const fn linux_compat_current_task_offset() -> usize {
-    core::mem::offset_of!(SyscallCpuLocal, linux_compat_current_task)
-}
-
-pub const fn linux_compat_stack_guard_offset() -> usize {
-    core::mem::offset_of!(SyscallCpuLocal, linux_compat_stack_guard)
 }
 
 pub const fn register_ipc_abi_offset() -> usize {
@@ -278,8 +231,6 @@ mod tests {
         let mut local = SyscallCpuLocal {
             kernel_stack_top: 0,
             user_rsp: 0,
-            linux_compat_current_task: 0,
-            linux_compat_stack_guard: 0,
             register_ipc_abi: 0,
         };
         super::install_stack_and_abi(&mut local, 0x1000, true);
@@ -287,7 +238,6 @@ mod tests {
             (local.kernel_stack_top, local.register_ipc_abi),
             (0x1000, 1)
         );
-        assert_eq!(local.linux_compat_current_task, 0); // not the selector
         super::install_stack_and_abi(&mut local, 0x2000, false);
         assert_eq!(
             (local.kernel_stack_top, local.register_ipc_abi),
@@ -299,16 +249,8 @@ mod tests {
     fn cpu_local_records_and_bootstrap_stacks_are_aligned_and_disjoint() {
         assert_eq!(core::mem::offset_of!(SyscallCpuLocal, kernel_stack_top), 0);
         assert_eq!(core::mem::offset_of!(SyscallCpuLocal, user_rsp), 8);
-        assert_eq!(
-            core::mem::offset_of!(SyscallCpuLocal, linux_compat_current_task),
-            0x10
-        );
-        assert_eq!(
-            core::mem::offset_of!(SyscallCpuLocal, linux_compat_stack_guard),
-            0x18
-        );
 
-        assert_eq!(super::register_ipc_abi_offset(), 0x20);
+        assert_eq!(super::register_ipc_abi_offset(), 0x10);
         let mut locals = [0_usize; MAX_SUPPORTED_CPUS];
         let mut stacks = [0_usize; MAX_SUPPORTED_CPUS];
         for cpu in 0..MAX_SUPPORTED_CPUS {

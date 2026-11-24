@@ -1513,7 +1513,7 @@ fn broker_unmap(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64> {
 /// `MREMAP_FIXED` replaces; ring0 proves the destination is still vacant and
 /// refuses, changing nothing, every kind of backing it cannot re-key.
 ///
-/// Invariant (see `kernel_ps::pager_vma::move_for_process`): under the process
+/// Invariant (see `kernel_ps::pager_vma::move_for_process_with_ceiling`): under the process
 /// state lock the source publications are withdrawn, the leaves, their frame
 /// claims and any `mlock` ranges move together, the TLB shootdown completes,
 /// and only then are the destination publications made. A concurrent thread
