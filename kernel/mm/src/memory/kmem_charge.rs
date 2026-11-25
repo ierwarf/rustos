@@ -98,6 +98,16 @@ pub fn usage(class: Class, index: usize) -> u64 {
     group(class, index).map_or(0, |cell| cell.usage.load(Ordering::Relaxed))
 }
 
+/// Bytes charged in `class` across every top-level group (children are already
+/// included in their ancestors). Diagnostic only: a racy sum of relaxed loads.
+pub fn class_total_usage(class: Class) -> u64 {
+    GROUPS[class as usize]
+        .iter()
+        .filter(|cell| cell.parent.load(Ordering::Relaxed) == NO_PARENT)
+        .map(|cell| cell.usage.load(Ordering::Relaxed))
+        .fold(0, u64::saturating_add)
+}
+
 /// Total bytes charged in any class; the job layer reuses a slot only at zero.
 pub fn total_usage(index: usize) -> u64 {
     (0..CLASSES)

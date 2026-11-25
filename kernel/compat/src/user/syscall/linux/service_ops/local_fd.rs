@@ -376,10 +376,11 @@ pub fn syscall_linux_eventfd2(initval: u64, flags: u64) -> u64 {
         if flags & !EFD_ACCEPTED_FLAGS != 0 {
             return Err(LINUX_EINVAL);
         }
-        let eventfd = EventFdHandle::new(
+        let eventfd = EventFdHandle::new_in_group(
             initval,
             flags & linux_abi::EFD_SEMAPHORE != 0,
             flags & linux_abi::EFD_NONBLOCK != 0,
+            multitask::current_user_job_charge_group(),
         )
         .map_err(|err| match err {
             EventFdError::TooManyObjects => LINUX_ENFILE,

@@ -6,6 +6,7 @@
 use linux_raw_sys::general as linux;
 
 pub const SYS_GETTID: u64 = linux::__NR_gettid as u64;
+pub const SYS_PTRACE: u64 = linux::__NR_ptrace as u64;
 pub const SYS_FUTEX: u64 = linux::__NR_futex as u64;
 pub const SYS_EXECVE: u64 = linux::__NR_execve as u64;
 pub const SYS_SCHED_SETAFFINITY: u64 = linux::__NR_sched_setaffinity as u64;

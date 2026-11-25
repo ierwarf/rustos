@@ -687,18 +687,7 @@ impl VfsStorage {
                 }))
             }
             ProcNode::CpuinfoFile => {
-                let mut mask = 0_u64;
-                let status = unsafe {
-                    rustos_svc_runtime::syscall::syscall3(
-                        linux_abi::SYS_SCHED_GETAFFINITY,
-                        0,
-                        core::mem::size_of::<u64>() as u64,
-                        (&mut mask as *mut u64) as u64,
-                    )
-                };
-                if status < 0 || mask == 0 {
-                    mask = 1;
-                }
+                let mask = online_cpu_mask().ok_or(EIO)?;
                 Ok(proc_fs::format_cpuinfo(mask))
             }
             ProcNode::InotifySysctl(kind) => Ok(proc_fs::format_inotify_sysctl(kind)),
@@ -720,18 +709,9 @@ impl VfsStorage {
     }
 
     fn sys_virtual_file_bytes(&self, _file: vfsd::proc_fs::SysFile) -> Result<Vec<u8>, i32> {
-        let mut mask = 0_u64;
-        let status = unsafe {
-            rustos_svc_runtime::syscall::syscall3(
-                linux_abi::SYS_SCHED_GETAFFINITY,
-                0,
-                core::mem::size_of::<u64>() as u64,
-                (&mut mask as *mut u64) as u64,
-            )
-        };
-        if status < 0 || mask == 0 {
-            return Err(EIO);
-        }
+        // online, possible and present are all the admitted hardware CPUs: the
+        // fixed topology has no hotplug-capable-but-offline slots.
+        let mask = online_cpu_mask().ok_or(EIO)?;
         Ok(vfsd::proc_fs::format_cpulist(mask))
     }
 

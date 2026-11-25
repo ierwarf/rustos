@@ -151,7 +151,7 @@ pub use crate::multitask::{
     spawn_user_process_vfork_suspended_with_parent_reservation, take_vfork_done,
     with_fork_parent_vfork_state, LinuxThreadSnapshot,
 };
-pub use crate::multitask::{MemoryCensusEntry, memory_census};
+pub use crate::multitask::{MemoryAccount, MemoryCensusEntry, memory_account, memory_census};
 pub use crate::multitask::{
     task_capacity_snapshot, CapacityLimit, TaskCapacity, TaskCapacitySnapshot, TASK_CAPACITY,
 };

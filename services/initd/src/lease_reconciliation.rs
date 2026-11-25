@@ -4,6 +4,15 @@
 //! that a lease exited: only a fresh authenticated rootd snapshot may change
 //! local service ownership. Failed queries grant nothing and retain one fixed
 //! five-second operation deadline across the ordinary 100 ms polling turns.
+//!
+//! A *slow* rootd is not a *dead* rootd. During startup the five-second
+//! deadline stays fatal (the boot has its own bounded budget). After startup a
+//! query that exhausts its deadline is a degraded-supervision event: initd keeps
+//! every local lease, backs off (100 ms doubling to a 5 s cap) and asks again.
+//! Only evidence that rootd or the lease is really gone (peer death, identity
+//! or authority refusal, a malformed snapshot) escalates to a fatal exit.
+//! Exiting on a slow reply would orphan every service initd reported exactly
+//! when the machine is starved, which is when supervision matters most.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -35,6 +44,32 @@ pub(super) struct RootdLeaseReconciler {
 #[derive(Default)]
 struct LeaseQueryRecovery {
     deadlines: BTreeMap<u64, Instant>,
+    slow: BTreeMap<u64, SlowQuery>,
+}
+
+/// Post-startup bookkeeping for a service whose lease query keeps timing out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SlowQuery {
+    streak: u32,
+    retry_at: Instant,
+}
+
+const SLOW_QUERY_BACKOFF_BASE: Duration = Duration::from_millis(100);
+const SLOW_QUERY_BACKOFF_CAP: Duration = Duration::from_secs(5);
+
+fn slow_query_backoff(streak: u32) -> Duration {
+    let shift = streak.saturating_sub(1).min(16);
+    SLOW_QUERY_BACKOFF_BASE
+        .saturating_mul(1_u32 << shift)
+        .min(SLOW_QUERY_BACKOFF_CAP)
+}
+
+/// Transport-level refusals that mean "no timely answer", not "wrong answer".
+pub(super) fn is_slow_peer_errno(errno: i32) -> bool {
+    matches!(
+        errno,
+        libc::ETIMEDOUT | libc::EAGAIN | libc::EBUSY | libc::ENOSPC | libc::EINTR
+    )
 }
 
 struct QueryAttempt {
@@ -74,6 +109,32 @@ impl LeaseQueryRecovery {
         })
     }
 
+    /// True while a previously timed-out service is still backing off.
+    fn backing_off(&self, service_id: u64, now: Instant) -> bool {
+        self.slow
+            .get(&service_id)
+            .is_some_and(|slow| now < slow.retry_at)
+    }
+
+    /// Records one expired query deadline after startup and returns the new
+    /// consecutive-timeout streak. Never fatal; the next attempt gets a fresh
+    /// five-second deadline once the backoff elapses.
+    fn note_slow(&mut self, service_id: u64, now: Instant) -> u32 {
+        self.deadlines.remove(&service_id);
+        let streak = self
+            .slow
+            .get(&service_id)
+            .map_or(1, |slow| slow.streak.saturating_add(1));
+        self.slow.insert(
+            service_id,
+            SlowQuery {
+                streak,
+                retry_at: now + slow_query_backoff(streak),
+            },
+        );
+        streak
+    }
+
     fn complete(
         &mut self,
         service_id: u64,
@@ -88,6 +149,7 @@ impl LeaseQueryRecovery {
         match result {
             Ok(snapshot) => {
                 self.deadlines.remove(&service_id);
+                self.slow.remove(&service_id);
                 Ok(Some(snapshot))
             }
             Err(errno) if query_refusal_is_transient(errno) && now < attempt.deadline => {
@@ -109,6 +171,24 @@ fn query_refusal_is_transient(errno: i32) -> bool {
         errno,
         libc::ENOSPC | libc::EAGAIN | libc::EBUSY | libc::EINTR | libc::ETIMEDOUT
     )
+}
+
+/// After startup completes a slow peer degrades supervision instead of
+/// ending it; during startup the boot's own bounded budget stays authoritative.
+fn degrade_on_slow_peer(parent_deadline: Option<Instant>, errno: i32) -> bool {
+    parent_deadline.is_none() && is_slow_peer_errno(errno)
+}
+
+/// Logs a slow-rootd episode at streaks 1, 2, 4, 8, ... (allocation only when
+/// logging) and arms the backoff. Never exits.
+fn note_slow_rootd(queries: &mut LeaseQueryRecovery, service_id: u64, exec: &str) {
+    let streak = queries.note_slow(service_id, Instant::now());
+    if streak.is_power_of_two() {
+        boot_line(&format!(
+            "initd: rootd slow service_id={service_id} exec={exec} timeouts={streak} degraded=1 retry_ms={}",
+            slow_query_backoff(streak).as_millis()
+        ));
+    }
 }
 
 impl RootdLeaseReconciler {
@@ -140,15 +220,33 @@ impl RootdLeaseReconciler {
                 "initd: fatal rootd post-init lease query failed service_id={service_id} errno={errno}"
             ))
             };
-            let attempt = self
+            if parent_deadline.is_none() && self.queries.backing_off(service_id, Instant::now()) {
+                continue;
+            }
+            let attempt = match self
                 .queries
                 .begin_parent(service_id, Instant::now(), parent_deadline)
-                .unwrap_or_else(|errno| query_failed(errno));
+            {
+                Ok(attempt) => attempt,
+                Err(errno) if degrade_on_slow_peer(parent_deadline, errno) => {
+                    note_slow_rootd(&mut self.queries, service_id, entry.exec.as_str());
+                    continue;
+                }
+                Err(errno) => query_failed(errno),
+            };
             let result = rootd_post_init_lease_query(service_id, attempt.timeout_ms);
-            let Some((pid, state)) = self
+            let snapshot = match self
                 .queries
                 .complete(service_id, attempt, Instant::now(), result)
-                .unwrap_or_else(|errno| query_failed(errno))
+            {
+                Ok(snapshot) => snapshot,
+                Err(errno) if degrade_on_slow_peer(parent_deadline, errno) => {
+                    note_slow_rootd(&mut self.queries, service_id, entry.exec.as_str());
+                    continue;
+                }
+                Err(errno) => query_failed(errno),
+            };
+            let Some((pid, state)) = snapshot
             else {
                 // Transient refusal: keep every local lease and retry on the next
                 // reconciliation turn within the first query's deadline.
@@ -202,14 +300,18 @@ impl RootdLeaseReconciler {
                     }
                     Err(errno) if errno == libc::ETIMEDOUT && now < state.deadline => {}
                     Err(errno) if errno == libc::ETIMEDOUT || errno == libc::ESRCH => {
-                        reclaim_rootd_post_init_lease(service_id, pid as u64, parent_deadline).unwrap_or_else(
-                            |reclaim_errno| {
-                                fail_closed(&format!(
-                                    "initd: fatal rootd stale lease reclaim failed service_id={service_id} pid={pid} errno={reclaim_errno}"
-                                ))
-                            },
-                        );
-                        recovery.remove(&service_id);
+                        match reclaim_rootd_post_init_lease(service_id, pid as u64, parent_deadline) {
+                            Ok(()) => {
+                                recovery.remove(&service_id);
+                            }
+                            // Slow rootd: keep the recovery entry and retry on the next turn.
+                            Err(errno) if degrade_on_slow_peer(parent_deadline, errno) => {
+                                note_slow_rootd(&mut self.queries, service_id, entry.exec.as_str());
+                            }
+                            Err(reclaim_errno) => fail_closed(&format!(
+                                "initd: fatal rootd stale lease reclaim failed service_id={service_id} pid={pid} errno={reclaim_errno}"
+                            )),
+                        }
                     }
                     Err(errno) => fail_closed(&format!(
                         "initd: fatal rootd lease endpoint probe failed service_id={service_id} pid={pid} errno={errno}"
@@ -229,21 +331,29 @@ impl RootdLeaseReconciler {
                         }
                     }
                     if pid != 0 {
-                        reclaim_rootd_post_init_lease(service_id, pid, parent_deadline).unwrap_or_else(|errno| {
-                        fail_closed(&format!(
-                            "initd: fatal rootd exited lease reclaim failed service_id={service_id} pid={pid} errno={errno}"
-                        ))
-                    });
+                        match reclaim_rootd_post_init_lease(service_id, pid, parent_deadline) {
+                            Ok(()) => {}
+                            Err(errno) if degrade_on_slow_peer(parent_deadline, errno) => {
+                                note_slow_rootd(&mut self.queries, service_id, entry.exec.as_str());
+                            }
+                            Err(errno) => fail_closed(&format!(
+                                "initd: fatal rootd exited lease reclaim failed service_id={service_id} pid={pid} errno={errno}"
+                            )),
+                        }
                     }
                 }
                 _ => {
                     recovery.remove(&service_id);
                     if pid != 0 {
-                        reclaim_rootd_post_init_lease(service_id, pid, parent_deadline).unwrap_or_else(|errno| {
-                        fail_closed(&format!(
-                            "initd: fatal rootd terminal lease reclaim failed service_id={service_id} pid={pid} errno={errno}"
-                        ))
-                    });
+                        match reclaim_rootd_post_init_lease(service_id, pid, parent_deadline) {
+                            Ok(()) => {}
+                            Err(errno) if degrade_on_slow_peer(parent_deadline, errno) => {
+                                note_slow_rootd(&mut self.queries, service_id, entry.exec.as_str());
+                            }
+                            Err(errno) => fail_closed(&format!(
+                                "initd: fatal rootd terminal lease reclaim failed service_id={service_id} pid={pid} errno={errno}"
+                            )),
+                        }
                     }
                 }
             }
@@ -357,5 +467,67 @@ mod tests {
             Ok(Some((74, ROOTD_LEASE_STATE_RUNNING)))
         );
         assert_eq!(recovery.begin(4, now).unwrap().deadline, deadline);
+    }
+
+    #[test]
+    fn slow_backoff_doubles_from_100ms_and_caps_at_five_seconds() {
+        let ms = |streak| slow_query_backoff(streak).as_millis();
+        assert_eq!(
+            [ms(1), ms(2), ms(3), ms(4), ms(6), ms(7), ms(100)],
+            [100, 200, 400, 800, 3200, 5000, 5000]
+        );
+    }
+
+    #[test]
+    fn expired_query_deadline_after_startup_degrades_then_retries_with_a_fresh_deadline() {
+        let now = Instant::now();
+        let mut recovery = LeaseQueryRecovery::default();
+        // The rootd call burns its whole five-second deadline (the evidence's
+        // errno=110): `complete` reports ETIMEDOUT ...
+        let first = recovery.begin(4, now).unwrap();
+        let end = first.deadline;
+        let err = recovery
+            .complete(4, first, end, Err(libc::ETIMEDOUT))
+            .unwrap_err();
+        assert_eq!(err, libc::ETIMEDOUT);
+        // ... which after startup is a degradation, not an exit.
+        assert!(degrade_on_slow_peer(None, err));
+        assert_eq!(recovery.note_slow(4, end), 1);
+        assert!(recovery.backing_off(4, end + Duration::from_millis(50)));
+        assert!(!recovery.backing_off(4, end + Duration::from_millis(100)));
+        // The retry is a brand-new bounded call, not an already-expired one.
+        let retry_at = end + Duration::from_millis(100);
+        let retry = recovery.begin(4, retry_at).unwrap();
+        assert_eq!(retry.timeout_ms, IPC_BOOT_CONTROL_HARD_LIMIT_MS);
+        // A second consecutive timeout backs off longer.
+        assert_eq!(recovery.note_slow(4, retry_at + Duration::from_secs(5)), 2);
+        // A fresh snapshot ends the episode.
+        let again = recovery.begin(4, retry_at + Duration::from_secs(6)).unwrap();
+        assert!(recovery
+            .complete(4, again, retry_at + Duration::from_secs(6), Ok((73, ROOTD_LEASE_STATE_RUNNING)))
+            .unwrap()
+            .is_some());
+        assert!(recovery.slow.is_empty());
+    }
+
+    #[test]
+    fn startup_deadline_and_real_peer_death_stay_fatal() {
+        let startup = Some(Instant::now() + Duration::from_secs(1));
+        assert!(!degrade_on_slow_peer(startup, libc::ETIMEDOUT));
+        for errno in [libc::EPIPE, libc::ESRCH, libc::EPERM, libc::EACCES, libc::EINVAL, libc::EPROTO] {
+            assert!(!degrade_on_slow_peer(None, errno), "errno {errno} is not slowness");
+        }
+        for errno in [libc::ETIMEDOUT, libc::EAGAIN, libc::EBUSY, libc::ENOSPC, libc::EINTR] {
+            assert!(degrade_on_slow_peer(None, errno));
+        }
+    }
+
+    #[test]
+    fn one_slow_service_does_not_back_off_the_others() {
+        let now = Instant::now();
+        let mut recovery = LeaseQueryRecovery::default();
+        recovery.note_slow(4, now);
+        assert!(recovery.backing_off(4, now));
+        assert!(!recovery.backing_off(8, now));
     }
 }

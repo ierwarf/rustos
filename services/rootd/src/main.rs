@@ -45,6 +45,7 @@ mod loader_transaction;
 mod application_limit_probe;
 mod loader_wire;
 mod memory_governor;
+mod pressure_gate;
 mod scheduling_policy;
 mod service_checkpoint;
 mod checkpoint_journal;
@@ -137,6 +138,24 @@ const INITD_SPAWN_MAX_ATTEMPTS: u32 = 64;
 const CORE_READINESS_POLL_INTERVAL_MS: u32 = 250;
 const CORE_READINESS_POLL_MAX: u32 = 20;
 const MEMORY_CENSUS_INTERVAL_NS: u64 = 20_000_000;
+const PRESSURE_THREAD_STACK_BYTES: usize = 32 * 1024;
+
+/// Pressure-pass hand-off (see `pressure_gate`). The governor and the optional
+/// probe are single-writer state, touched only inside `PRESSURE_GATE.run_due`.
+static PRESSURE_GATE: pressure_gate::PressureGate = pressure_gate::PressureGate::new();
+struct PressureState {
+    governor: memory_governor::MemoryGovernor,
+    probe: Option<application_limit_probe::Probe>,
+}
+static PRESSURE_STATE: RootdIpcCell<PressureState> = RootdIpcCell(UnsafeCell::new(PressureState {
+    governor: memory_governor::MemoryGovernor::new(),
+    probe: None,
+}));
+#[repr(align(16))]
+struct PressureThreadStack([u8; PRESSURE_THREAD_STACK_BYTES]);
+#[cfg(not(test))]
+static mut PRESSURE_THREAD_STACK: PressureThreadStack =
+    PressureThreadStack([0; PRESSURE_THREAD_STACK_BYTES]);
 struct RootdIpcCell<T>(UnsafeCell<T>);
 
 unsafe impl<T> Sync for RootdIpcCell<T> {}
@@ -215,9 +234,20 @@ struct PostInitLease {
     exec_path: &'static [u8],
     pid: u64,
     reporter_pid: u64,
+    /// Nonzero while the supervisor (initd) that reported this running lease
+    /// has exited and a replacement has not yet adopted it. The service keeps
+    /// running but is fenced (its declared reporter is not live, so it holds no
+    /// broker authority); the lease is reclaimed at this monotonic deadline.
+    orphan_deadline_ns: u64,
     state: u16,
     exit_status: i32,
 }
+
+/// How long a replacement initd has to adopt a still-running service whose
+/// reporter exited, before rootd retires it. Bounded so a service never keeps
+/// running without any supervisor, but long enough that one slow or restarted
+/// initd does not take the desktop input path down with it.
+const ORPHAN_ADOPTION_GRACE_NS: u64 = 30_000_000_000;
 
 #[cfg(not(test))]
 rustos_svc_runtime::relocation_trampoline!();
@@ -415,10 +445,17 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
 
     debug_line(b"rootd: initd spawned\n");
     yield_now();
-    let mut memory_governor = memory_governor::MemoryGovernor::new();
-    let mut application_limit_probe = application_limit_probe::Probe::default();
-    let mut next_memory_census_ns = 0_u64;
+    let mut last_pass_ns = rustos_svc_runtime::syscall::monotonic_nanos();
     loop {
+        // Memory-pressure policy is owned by a dedicated thread that shares no
+        // blocking dependency with this loop (loaderd/initd IPC, restarts,
+        // allocation-heavy bookkeeping). This loop only publishes the pid
+        // snapshot the thread needs, retries starting the thread until the
+        // kernel allows `clone` (ENOSYS before procd), and runs the pass
+        // inline while the thread is absent or wedged.
+        let census_now_ns = rustos_svc_runtime::syscall::monotonic_nanos();
+        report_supervisor_stall(&mut last_pass_ns, census_now_ns);
+        service_memory_pressure(&leases, &post_init_leases, census_now_ns);
         drain_lifecycle_events(&mut leases, &mut post_init_leases, &mut service_checkpoints);
         // Keep post-init control draining bounded by `control_drain` too.
         let _ = control_drain::drain_rootd_control_requests(|| {
@@ -440,22 +477,10 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
         supervise_core_readiness(&mut leases, &mut next_core_readiness_poll_ns);
         supervise_service_health(&leases, &post_init_leases, &mut service_checkpoints);
         supervise_update_deadlines(&mut service_checkpoints);
+        supervise_orphaned_post_init(&mut post_init_leases, census_now_ns);
         let _ = loader_realm::configure_ready(
             endpoint, &mut leases, &mut post_init_leases, &mut service_checkpoints,
         );
-        // The census is a kernel walk of every process; a busy control queue
-        // would otherwise pay it once per request. Pressure verdicts are
-        // cooldown-gated in milliseconds, so a 20 ms cadence loses nothing.
-        let census_now_ns = rustos_svc_runtime::syscall::monotonic_nanos();
-        if census_now_ns >= next_memory_census_ns {
-            next_memory_census_ns = census_now_ns.saturating_add(MEMORY_CENSUS_INTERVAL_NS);
-            supervise_memory_pressure(
-                &mut memory_governor,
-                &mut application_limit_probe,
-                &leases,
-                &post_init_leases,
-            );
-        }
         // The drain above is deliberately nonblocking. Once all ready
         // messages are consumed, this one wait is the idle boundary: a new
         // control message wakes rootd immediately, while the bounded budget
@@ -496,6 +521,7 @@ fn post_init_lease(spec: PostInitServiceSpec) -> PostInitLease {
         exec_path: spec.exec_path,
         pid: 0,
         reporter_pid: 0,
+        orphan_deadline_ns: 0,
         state: rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY,
         exit_status: 0,
     }
@@ -841,7 +867,20 @@ fn drain_lifecycle_events(
         service_checkpoints.health.forget_pid(event.pid);
         service_checkpoints.updates.on_exit(event.pid);
         service_checkpoints.activation.deactivate_pid(event.pid);
-        revoke_post_init_dependents(post_init_leases, event.pid);
+        if leases
+            .iter()
+            .any(|lease| lease.service_id == INITD_LEASE_ID && lease.pid == event.pid)
+        {
+            // initd is replaceable and re-adopts exact live leases on start.
+            // Its exit fences what it reported; it does not kill it.
+            orphan_post_init_dependents(
+                post_init_leases,
+                event.pid,
+                rustos_svc_runtime::syscall::monotonic_nanos(),
+            );
+        } else {
+            revoke_post_init_dependents(post_init_leases, event.pid);
+        }
     }
     adopt_running_bootstrap_services(leases, service_checkpoints);
 }
@@ -902,6 +941,100 @@ fn supervise_service_health(
                 fail_closed(b"rootd: health session settlement failed\n")
             });
         }
+    }
+}
+
+/// The reporter that exited is initd. Its directly reported services keep
+/// running, fenced from broker authority (`declared_reporter_is_live` fails
+/// for a dead reporter, and so does every descendant chain through them), and
+/// get `ORPHAN_ADOPTION_GRACE_NS` for a replacement initd to adopt them.
+/// Supervisor death must degrade the tree, not cascade through it.
+fn orphan_post_init_dependents(
+    post_init_leases: &mut [PostInitLease],
+    reporter_pid: u64,
+    now_ns: u64,
+) {
+    if reporter_pid == 0 {
+        return;
+    }
+    for lease in post_init_leases.iter_mut() {
+        if lease.state == ROOTD_LEASE_STATE_RUNNING
+            && lease.reporter_pid == reporter_pid
+            && lease.orphan_deadline_ns == 0
+        {
+            lease.orphan_deadline_ns = now_ns.saturating_add(ORPHAN_ADOPTION_GRACE_NS).max(1);
+        }
+    }
+}
+
+/// The current initd (already authenticated by the caller) asks about a lease
+/// whose previous reporter exited: the exact live incarnation is handed to the
+/// new supervisor, which then validates its endpoint and either tracks it or
+/// reclaims it. Returns whether the lease was rebound.
+fn adopt_orphaned_post_init_lease(
+    post_init_leases: &mut [PostInitLease],
+    service_id: u64,
+    new_reporter_pid: u64,
+) -> bool {
+    let Some(lease) = post_init_leases
+        .iter_mut()
+        .find(|lease| lease.service_id == service_id)
+    else {
+        return false;
+    };
+    if lease.state != ROOTD_LEASE_STATE_RUNNING
+        || lease.orphan_deadline_ns == 0
+        || new_reporter_pid == 0
+        || lease.reporter_pid == new_reporter_pid
+    {
+        return false;
+    }
+    lease.reporter_pid = new_reporter_pid;
+    lease.orphan_deadline_ns = 0;
+    true
+}
+
+/// Retires orphaned leases nobody adopted in time, with their whole dependent
+/// closure, exactly like an explicit reclaim.
+fn supervise_orphaned_post_init(post_init_leases: &mut [PostInitLease], now_ns: u64) {
+    supervise_orphaned_post_init_with(
+        post_init_leases,
+        now_ns,
+        |service_id| {
+            revoke_service_endpoint(service_id)
+                .unwrap_or_else(|_| fail_closed(b"rootd: fatal orphan endpoint revoke failed\n"));
+            Ok(())
+        },
+        |pid| {
+            terminate_service_process(pid)
+                .unwrap_or_else(|_| fail_closed(b"rootd: fatal orphan termination failed\n"));
+            Ok(())
+        },
+    );
+}
+
+fn supervise_orphaned_post_init_with(
+    post_init_leases: &mut [PostInitLease],
+    now_ns: u64,
+    mut revoke_endpoint: impl FnMut(u64) -> Result<(), i32>,
+    mut terminate: impl FnMut(u64) -> Result<(), i32>,
+) {
+    for index in 0..post_init_leases.len() {
+        let lease = post_init_leases[index];
+        if lease.state != ROOTD_LEASE_STATE_RUNNING
+            || lease.orphan_deadline_ns == 0
+            || now_ns < lease.orphan_deadline_ns
+        {
+            continue;
+        }
+        debug_line(b"rootd: orphaned service not adopted in time; retiring\n");
+        let _ = reclaim_post_init_lease_with(
+            post_init_leases,
+            lease.service_id,
+            lease.pid,
+            &mut revoke_endpoint,
+            &mut terminate,
+        );
     }
 }
 
@@ -1421,6 +1554,10 @@ fn fill_commercial_max_response(
             let query = rustos_component_model::lease_snapshot::decode_query(
                 &request.payload[..request.payload_len as usize],
             ).map_err(|_| 22)?;
+            query_post_init_lease(leases, post_init_leases, query.service, sender)?;
+            if adopt_orphaned_post_init_lease(post_init_leases, query.service, sender.pid) {
+                debug_line(b"rootd: orphaned service rebound to current initd\n");
+            }
             let lease = query_post_init_lease(
                 leases, post_init_leases, query.service, sender,
             )?;
@@ -2161,6 +2298,7 @@ fn register_post_init_service_lease_with_provenance(
     lease.pid = request.arg1;
     kernel_policy::bind(request.arg1, lease.service_id);
     lease.reporter_pid = sender.pid;
+    lease.orphan_deadline_ns = 0;
     lease.state = ROOTD_LEASE_STATE_RUNNING;
     lease.exit_status = 0;
     Ok(())
@@ -2283,6 +2421,7 @@ fn reclaim_post_init_lease_with(
         if child_index == index || selected[child_index] {
             lease.pid = 0;
             lease.reporter_pid = 0;
+            lease.orphan_deadline_ns = 0;
             lease.state = rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY;
             lease.exit_status = 0;
         }
@@ -2297,8 +2436,9 @@ fn reclaim_post_init_lease_with(
 fn supervise_memory_pressure(
     governor: &mut memory_governor::MemoryGovernor,
     application_limit_probe: &mut application_limit_probe::Probe,
-    leases: &[Lease],
-    post_init_leases: &[PostInitLease],
+    protected: &[u64],
+    protected_overflow: bool,
+    realm: Option<pressure_gate::Realm>,
 ) {
     let mut census = RustosRootdMemoryBrokerArgs {
         abi_version: ROOTD_MEMORY_BROKER_ABI_VERSION,
@@ -2330,32 +2470,6 @@ fn supervise_memory_pressure(
     }
     let now_ms = rustos_svc_runtime::syscall::monotonic_nanos() / 1_000_000;
     let rootd_pid = syscall0(SYS_GETPID) as u64;
-    // Every process a whole-job kill must not reach. A fixed array: this runs
-    // while the user-class allocator is refusing. An overflow disables job
-    // kills (single-process victims remain) instead of risking a miss.
-    let mut protected = [0_u64; PROTECTED_PIDS_MAX];
-    let mut protected_len = 0;
-    let mut protected_overflow = false;
-    let mut note = |pid: u64| {
-        if pid == 0 {
-            return;
-        }
-        if protected_len < protected.len() {
-            protected[protected_len] = pid;
-            protected_len += 1;
-        } else {
-            protected_overflow = true;
-        }
-    };
-    note(rootd_pid);
-    for lease in leases {
-        note(lease.pid);
-    }
-    for lease in post_init_leases {
-        note(lease.pid);
-        note(lease.reporter_pid);
-    }
-    let protected = &protected[..protected_len];
     if option_env!("RUSTOS_ROOTD_APP_LIMIT_PROBE") == Some("1") {
         application_limit_probe.poll(&census, protected, protected_overflow);
     }
@@ -2363,11 +2477,39 @@ fn supervise_memory_pressure(
         now_ms,
         &census,
         rootd_pid,
-        |pid| protected.contains(&pid) || process_inside_memory_min(pid),
-        |job| !protected_overflow && job_kill_is_safe(job, protected),
+        |pid| victim_is_protected(pid, protected, realm),
+        |job| !protected_overflow && job_kill_is_safe(job, protected) && job_below_realm(job, realm),
     );
     match verdict {
         memory_governor::Verdict::Idle | memory_governor::Verdict::Cooldown => {}
+        memory_governor::Verdict::Settling {
+            process_id,
+            victims,
+        } => {
+            let len = memory_governor::format_line(
+                &mut line,
+                b"rootd: oom settling, no further victim until retired pid/victims/free/min:",
+                &[process_id, victims, census.free_pages, census.min_free_pages],
+            );
+            debug_line(&line[..len]);
+        }
+        memory_governor::Verdict::Stuck { job, process_id } => {
+            let result = if job != 0 {
+                kill_job_by_id(job)
+            } else {
+                terminate_service_process(process_id).map_err(i64::from)
+            };
+            let len = memory_governor::format_line(
+                &mut line,
+                if result.is_ok() {
+                    b"rootd: oom victim still listed, terminated again job/pid/free:"
+                } else {
+                    b"rootd: oom victim still listed, re-terminate rejected job/pid/free:"
+                },
+                &[job, process_id, census.free_pages],
+            );
+            debug_line(&line[..len]);
+        }
         memory_governor::Verdict::Recovered { free_pages } => {
             let len = memory_governor::format_line(
                 &mut line,
@@ -2376,7 +2518,16 @@ fn supervise_memory_pressure(
             );
             debug_line(&line[..len]);
         }
+        memory_governor::Verdict::Settled { free_pages } => {
+            let len = memory_governor::format_line(
+                &mut line,
+                b"rootd: oom settled free/min:",
+                &[free_pages, census.min_free_pages],
+            );
+            debug_line(&line[..len]);
+        }
         memory_governor::Verdict::NoVictim => {
+            log_census_head(&census);
             let len = memory_governor::format_line(
                 &mut line,
                 b"rootd: oom no eligible victim free/min/denials:",
@@ -2387,9 +2538,13 @@ fn supervise_memory_pressure(
         memory_governor::Verdict::KillJob {
             job,
             process_id,
-            resident_pages,
+            private_pages,
         } => {
+            log_census_head(&census);
             let result = kill_job_by_id(job);
+            if result.is_err() {
+                governor.kill_failed(now_ms);
+            }
             let len = memory_governor::format_line(
                 &mut line,
                 if result.is_ok() {
@@ -2397,15 +2552,19 @@ fn supervise_memory_pressure(
                 } else {
                     b"rootd: oom job kill rejected job/pid/pages/free:"
                 },
-                &[job, process_id, resident_pages, census.free_pages],
+                &[job, process_id, private_pages, census.free_pages],
             );
             debug_line(&line[..len]);
         }
         memory_governor::Verdict::Kill {
             process_id,
-            resident_pages,
+            private_pages,
         } => {
+            log_census_head(&census);
             let result = terminate_service_process(process_id);
+            if result.is_err() {
+                governor.kill_failed(now_ms);
+            }
             let len = memory_governor::format_line(
                 &mut line,
                 if result.is_ok() {
@@ -2413,15 +2572,173 @@ fn supervise_memory_pressure(
                 } else {
                     b"rootd: oom kill rejected pid/pages/free:"
                 },
-                &[process_id, resident_pages, census.free_pages],
+                &[process_id, private_pages, census.free_pages],
             );
             debug_line(&line[..len]);
         }
     }
 }
 
-/// Upper bound on distinct supervised pids a whole-job kill must avoid.
-const PROTECTED_PIDS_MAX: usize = 64;
+/// Publishes the protected-pid snapshot, makes sure the dedicated pressure
+/// thread exists, and runs the pass inline only while that thread is not
+/// serving. Allocation-free and nonblocking.
+fn service_memory_pressure(leases: &[Lease], post_init_leases: &[PostInitLease], now_ns: u64) {
+    publish_protected_pids(leases, post_init_leases);
+    ensure_pressure_thread(now_ns);
+    PRESSURE_GATE.inline_tick(now_ns, MEMORY_CENSUS_INTERVAL_NS, run_pressure_pass);
+}
+
+fn publish_protected_pids(leases: &[Lease], post_init_leases: &[PostInitLease]) {
+    let rootd_pid = syscall0(SYS_GETPID).max(0) as u64;
+    // The realm id is read from the kernel on every publish, so a descriptor
+    // number that was closed and reused can never carry a stale job id.
+    let realm = leases
+        .iter()
+        .find(|lease| lease.service_id == IPC_SERVICE_LOADERD && lease.application_realm_configured)
+        .and_then(|lease| lease.application_realm)
+        .and_then(|handle| {
+            jobs::info(handle)
+                .ok()
+                .map(|info| pressure_gate::Realm { handle, job: info.id })
+        });
+    PRESSURE_GATE.publish_protected(
+        core::iter::once(rootd_pid)
+            .chain(leases.iter().map(|lease| lease.pid))
+            .chain(
+                post_init_leases
+                    .iter()
+                    .flat_map(|lease| [lease.pid, lease.reporter_pid]),
+            ),
+        realm,
+    );
+}
+
+/// One pressure pass. Only called through `PressureGate::run_due`, which
+/// guarantees a single concurrent caller and therefore exclusive `PRESSURE_STATE`.
+fn run_pressure_pass() {
+    let mut protected = [0_u64; pressure_gate::PROTECTED_PIDS_MAX];
+    let Some(snapshot) = PRESSURE_GATE.read_protected(&mut protected) else {
+        return;
+    };
+    // SAFETY: the gate admits one pass at a time and nothing else touches the state.
+    let state = unsafe { &mut *PRESSURE_STATE.0.get() };
+    let probe = state
+        .probe
+        .get_or_insert_with(application_limit_probe::Probe::default);
+    supervise_memory_pressure(
+        &mut state.governor,
+        probe,
+        &protected[..snapshot.len],
+        snapshot.overflow,
+        snapshot.realm,
+    );
+}
+
+/// Starts the pressure thread, one `clone` attempt per call and at most every
+/// 250 ms until it succeeds (the kernel refuses with ENOSYS before procd and
+/// ENOMEM under pressure; the inline fallback covers that window).
+#[cfg(not(test))]
+fn ensure_pressure_thread(now_ns: u64) {
+    static NEXT_ATTEMPT_NS: AtomicU64 = AtomicU64::new(0);
+    if PRESSURE_GATE.thread_started() || now_ns < NEXT_ATTEMPT_NS.load(Ordering::Relaxed) {
+        return;
+    }
+    NEXT_ATTEMPT_NS.store(now_ns.saturating_add(250_000_000), Ordering::Relaxed);
+    // SAFETY: private 16-aligned static stack used by exactly one thread (the
+    // `thread_started` flag is set only after a successful clone and this
+    // function is only called from the single supervisor context).
+    let stack_top = unsafe {
+        core::ptr::addr_of_mut!(PRESSURE_THREAD_STACK.0)
+            .cast::<u8>()
+            .add(PRESSURE_THREAD_STACK_BYTES) as u64
+    };
+    let flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+    let result: i64;
+    // SAFETY: same clone/stack contract as `spawn_loader_worker_thread`: the
+    // child calls a `-> !` entry on the exclusive stack, only the parent
+    // continues; rcx/r11 are declared clobbered.
+    unsafe {
+        asm!(
+            "syscall",
+            "test rax, rax",
+            "jnz 2f",
+            "call {entry}",
+            "ud2",
+            "2:",
+            entry = sym pressure_thread_entry,
+            inlateout("rax") SYS_CLONE as i64 => result,
+            in("rdi") flags,
+            in("rsi") stack_top,
+            in("rdx") 0_u64,
+            in("r10") 0_u64,
+            in("r8") 0_u64,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    if result > 0 {
+        PRESSURE_GATE.mark_thread_started(now_ns);
+        debug_line(b"rootd: memory pressure thread started\n");
+    }
+}
+
+#[cfg(test)]
+fn ensure_pressure_thread(_now_ns: u64) {}
+
+#[cfg(not(test))]
+extern "C" fn pressure_thread_entry() -> ! {
+    loop {
+        let now_ns = rustos_svc_runtime::syscall::monotonic_nanos();
+        PRESSURE_GATE.thread_step(now_ns, MEMORY_CENSUS_INTERVAL_NS, run_pressure_pass);
+        rustos_svc_runtime::syscall::sleep_millis(MEMORY_CENSUS_INTERVAL_NS / 1_000_000);
+    }
+}
+
+/// A supervisor pass normally takes about the 10 ms idle poll. Anything past
+/// this is the supervisor itself being starved or blocked, which is what turns
+/// a memory shortage into dead core services: initd's five-second lease query
+/// to rootd expires and rootd then retires every service initd reported.
+const SUPERVISOR_STALL_REPORT_NS: u64 = 500_000_000;
+
+/// Logs a pass that started more than `SUPERVISOR_STALL_REPORT_NS` after the
+/// previous one. Allocation-free; the line carries the gap in milliseconds.
+fn report_supervisor_stall(last_pass_ns: &mut u64, now_ns: u64) {
+    let gap_ns = now_ns.saturating_sub(*last_pass_ns);
+    *last_pass_ns = now_ns;
+    if gap_ns < SUPERVISOR_STALL_REPORT_NS {
+        return;
+    }
+    let mut line = [0_u8; 64];
+    let len = memory_governor::format_line(
+        &mut line,
+        b"rootd: supervisor pass stalled gap_ms:",
+        &[gap_ns / 1_000_000],
+    );
+    debug_line(&line[..len]);
+}
+
+/// Names the largest census entries next to a verdict so a wrong victim, or a
+/// charge that cannot be real, is visible in the log: pid, parent, private,
+/// shared and retained pages, job.
+fn log_census_head(census: &RustosRootdMemoryBrokerArgs) {
+    let count = (census.entry_count as usize).min(census.entries.len()).min(4);
+    for entry in &census.entries[..count] {
+        let mut line = [0_u8; 128];
+        let len = memory_governor::format_line(
+            &mut line,
+            b"rootd: oom census pid/parent/private/shared/retained/job:",
+            &[
+                entry.process_id,
+                entry.parent_process_id,
+                entry.private_pages,
+                entry.shared_pages,
+                entry.retained_pages,
+                entry.job,
+            ],
+        );
+        debug_line(&line[..len]);
+    }
+}
 
 /// True only when `job` and everything below it contains none of `protected`.
 /// The kernel answers per pid whether it lies within the opened subtree, so
@@ -2451,6 +2768,72 @@ fn process_inside_memory_min(pid: u64) -> bool {
         }
         if info.parent == 0 {
             break;
+        }
+        id = info.parent;
+    }
+    false
+}
+
+/// Every service id the kernel registry can hold (`MAX_SERVICE_ENDPOINTS` is
+/// 16 and id 0 is not a service). The kernel answers per id whether `pid`
+/// currently owns that endpoint.
+const SERVICE_ID_FIRST: u64 = 1;
+const SERVICE_ID_LAST: u64 = 15;
+
+/// True when the kernel's own registry names `pid` the owner of a live service
+/// endpoint. Kernel-sourced, so a service spawned after the last published
+/// snapshot (the supervisor may be parked on a stalled loaderd) is still seen.
+fn pid_owns_service_endpoint(pid: u64) -> bool {
+    (SERVICE_ID_FIRST..=SERVICE_ID_LAST)
+        .any(|service| rustos_svc_runtime::ipc::validate_service_owner(service, pid) >= 0)
+}
+
+/// Whether `pid` is provably inside the application realm. Anything else
+/// (outside it, realm not published, a descriptor the kernel no longer
+/// confirms, any error) is a service-class process and never a victim:
+/// protection defaults to "critical" only for what is not proven an app.
+fn pid_is_application(pid: u64, realm: Option<pressure_gate::Realm>) -> bool {
+    let Some(realm) = realm else { return false };
+    // The published descriptor number must still name the published job.
+    if !jobs::info(realm.handle).is_ok_and(|info| info.id == realm.job) {
+        return false;
+    }
+    jobs::process_job_in(realm.handle, pid).is_ok()
+}
+
+/// The pressure pass's whole protection decision for one census entry. The
+/// published pid list is only a hint; kernel facts decide.
+fn victim_is_protected(pid: u64, protected: &[u64], realm: Option<pressure_gate::Realm>) -> bool {
+    protected.contains(&pid)
+        || !pid_is_application(pid, realm)
+        || pid_owns_service_endpoint(pid)
+        || process_inside_memory_min(pid)
+}
+
+/// True when `job` is a strict descendant of the application realm, so a whole
+/// job kill can never end the realm itself or a service job.
+fn job_below_realm(job: u64, realm: Option<pressure_gate::Realm>) -> bool {
+    let Some(realm) = realm else { return false };
+    if !jobs::info(realm.handle).is_ok_and(|info| info.id == realm.job) || job == realm.job {
+        return false;
+    }
+    let mut id = job;
+    for _ in 0..=8 {
+        let Ok(handle) = jobs::open_subtree(
+            rustos_user_abi::syscall::JOB_BOOTSTRAP_ROOT_FD,
+            id,
+            rustos_user_abi::syscall::JOB_RIGHT_INSPECT,
+        ) else {
+            return false;
+        };
+        let info = jobs::info(handle);
+        jobs::close(handle);
+        let Ok(info) = info else { return false };
+        if info.parent == realm.job {
+            return true;
+        }
+        if info.parent == 0 {
+            return false;
         }
         id = info.parent;
     }
@@ -3195,6 +3578,13 @@ extern "C" fn loader_supervisor_worker_entry() -> ! {
         // ORDERING: Acquire pairs with complete_loader_worker's AcqRel CAS
         // (RESULT_READY -> COMPLETE), which this worker handles in serve_rootd_once.
         while LOADER_WORKER_STATE.load(Ordering::Acquire) != LOADER_WORKER_COMPLETE {
+            // The supervisor loop is parked in the loaderd call; keep the
+            // pid snapshot fresh and cover the pass if the thread is absent.
+            service_memory_pressure(
+                leases,
+                post_init_leases,
+                rustos_svc_runtime::syscall::monotonic_nanos(),
+            );
             drain_lifecycle_events(leases, post_init_leases, service_checkpoints);
             serve_rootd_once(
                 endpoint,
@@ -3622,6 +4012,97 @@ mod tests {
                 assert_eq!(lease.exit_status, -11);
             }
         }
+    }
+
+    #[test]
+    fn initd_exit_fences_its_services_without_killing_them_and_replacement_adopts() {
+        let old_initd = 41;
+        let new_initd = 42;
+        let mut leases = leases_with_live_initd(old_initd);
+        let mut post_init = [
+            post_init_lease(POST_INIT_MANIFEST[4]),
+            post_init_lease(POST_INIT_MANIFEST[5]),
+        ];
+        post_init[0].pid = 73;
+        post_init[0].reporter_pid = old_initd;
+        post_init[0].state = ROOTD_LEASE_STATE_RUNNING;
+        post_init[1].pid = 74;
+        post_init[1].reporter_pid = 73;
+        post_init[1].state = ROOTD_LEASE_STATE_RUNNING;
+        let sender = |pid| IpcSenderIdentity { pid, tid: 1 };
+
+        leases[INITD_LEASE_INDEX].state = ROOTD_LEASE_STATE_EXITED;
+        orphan_post_init_dependents(&mut post_init, old_initd, 1_000);
+        // Nothing was terminated: both services are still RUNNING.
+        assert_eq!(post_init[0].state, ROOTD_LEASE_STATE_RUNNING);
+        assert_eq!(post_init[1].state, ROOTD_LEASE_STATE_RUNNING);
+        assert_eq!(post_init[0].orphan_deadline_ns, 1_000 + ORPHAN_ADOPTION_GRACE_NS);
+        // Only the direct dependent carries a deadline; the child hangs off it.
+        assert_eq!(post_init[1].orphan_deadline_ns, 0);
+        // Fenced: neither holds broker authority while the supervisor is dead.
+        assert!(current_service_id_for_sender(&leases, &post_init, sender(73)).is_err());
+        assert!(current_service_id_for_sender(&leases, &post_init, sender(74)).is_err());
+
+        // A replacement initd is admitted and queries: the exact live lease is
+        // rebound, authority is restored, the deadline is cleared.
+        leases[INITD_LEASE_INDEX].pid = new_initd;
+        leases[INITD_LEASE_INDEX].state = ROOTD_LEASE_STATE_RUNNING;
+        let netd_like = post_init[0].service_id;
+        assert!(adopt_orphaned_post_init_lease(&mut post_init, netd_like, new_initd));
+        assert_eq!(post_init[0].reporter_pid, new_initd);
+        assert_eq!(post_init[0].orphan_deadline_ns, 0);
+        assert!(current_service_id_for_sender(&leases, &post_init, sender(73)).is_ok());
+        assert!(current_service_id_for_sender(&leases, &post_init, sender(74)).is_ok());
+        // Idempotent and not a rebind primitive for healthy leases.
+        assert!(!adopt_orphaned_post_init_lease(&mut post_init, netd_like, 99));
+    }
+
+    #[test]
+    fn unadopted_orphan_is_retired_with_its_closure_only_after_the_grace() {
+        let old_initd = 41;
+        let mut post_init = [
+            post_init_lease(POST_INIT_MANIFEST[4]),
+            post_init_lease(POST_INIT_MANIFEST[5]),
+        ];
+        post_init[0].pid = 73;
+        post_init[0].reporter_pid = old_initd;
+        post_init[0].state = ROOTD_LEASE_STATE_RUNNING;
+        post_init[1].pid = 74;
+        post_init[1].reporter_pid = 73;
+        post_init[1].state = ROOTD_LEASE_STATE_RUNNING;
+        orphan_post_init_dependents(&mut post_init, old_initd, 5);
+        let deadline = post_init[0].orphan_deadline_ns;
+
+        let mut terminated = std::vec::Vec::new();
+        supervise_orphaned_post_init_with(
+            &mut post_init, deadline - 1, |_| Ok(()), |pid| { terminated.push(pid); Ok(()) },
+        );
+        assert!(terminated.is_empty(), "inside the grace nothing is retired");
+        assert_eq!(post_init[0].state, ROOTD_LEASE_STATE_RUNNING);
+
+        supervise_orphaned_post_init_with(
+            &mut post_init, deadline, |_| Ok(()), |pid| { terminated.push(pid); Ok(()) },
+        );
+        assert_eq!(terminated, [73, 74]);
+        assert_eq!(post_init[0].state, rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY);
+        assert_eq!(post_init[0].orphan_deadline_ns, 0);
+        assert_eq!(post_init[1].state, rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY);
+    }
+
+    #[test]
+    fn non_initd_reporter_exit_still_revokes_dependents_immediately() {
+        // The orphan grace is initd-only: a dead sessiond cannot be re-adopted
+        // by anyone, so uiserver must not outlive it.
+        let src = include_str!("main.rs");
+        let body = src
+            .split("fn drain_lifecycle_events(")
+            .nth(1)
+            .unwrap()
+            .split("fn adopt_running_bootstrap_services")
+            .next()
+            .unwrap();
+        assert!(body.contains("orphan_post_init_dependents("));
+        assert!(body.contains("revoke_post_init_dependents(post_init_leases, event.pid)"));
     }
 
     #[test]

@@ -1367,7 +1367,7 @@ pub fn syscall_linux_epoll_create1(flags: u64) -> u64 {
         if flags & !linux_abi::EPOLL_CLOEXEC != 0 {
             return Err(LINUX_EINVAL);
         }
-        let epoll = multitask::EpollHandle::create().map_err(|err| match err {
+        let epoll = multitask::EpollHandle::create(multitask::current_user_job_charge_group()).map_err(|err| match err {
             multitask::EpollError::Capacity => LINUX_EMFILE,
             other => epoll_error_to_linux_errno(other),
         })?;

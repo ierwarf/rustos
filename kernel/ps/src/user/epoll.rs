@@ -14,6 +14,10 @@
 //!   across `wake_local_fd_object` or provider IPC.
 //! - **Failure:** Provider delay cannot fail ordinary descriptor duplication;
 //!   object and per-epoll interest caps fail explicitly with `EpollError::Capacity`.
+//! - **Accounting:** each instance owns a `PageLease` on the creating Job's charge
+//!   group: 1 object page plus 1 page per 16 interests, resized on ctl ADD/DEL and
+//!   purge, refunded when `retire` drops the instance. A refused charge is
+//!   `Capacity` (`ENOSPC` on ADD, `EMFILE` on create) and changes nothing.
 //! - **Forbidden:** No vfsd call per epoll op, zero resurrection, or token aliasing.
 //! - **Evidence:** `userspace-wait-set`, requirements REQ-VFS-016/017.
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -21,6 +25,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::user::page_lease::PageLease;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::performance::{WAITSET_MAX_EPOLL_OBJECTS, WAITSET_MAX_GLOBAL_INTERESTS};
@@ -69,8 +74,21 @@ pub const fn epoll_event_mask_valid(events: u32) -> bool {
     events & linux_abi::EPOLLEXCLUSIVE == 0 || events & !linux_abi::EPOLLEXCLUSIVE_OK_BITS == 0
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Interests billed per resident page (map node + report slot + reverse-index
+/// entry are about 250 bytes, so 16 fit in 4 KiB).
+const EPOLL_INTERESTS_PER_PAGE: usize = 16;
+
+/// Pages an instance with `interests` registered interests occupies: one for
+/// the object plus the interest sets.
+fn epoll_pages(interests: usize) -> u64 {
+    1 + interests.div_ceil(EPOLL_INTERESTS_PER_PAGE) as u64
+}
+
+#[derive(Debug)]
 struct EpollInstance {
+    /// Object and interest-set pages billed to the creating Job; refunded
+    /// exactly once when the instance is retired (the lease drops with it).
+    lease: PageLease,
     interests: BTreeMap<EpollInterestKey, EpollInterestRecord>,
     /// Entries exist only for interests that reported; removing or modifying
     /// an interest removes its entry, so this map never outgrows `interests`.
@@ -81,7 +99,7 @@ struct EpollInstance {
 
 /// Kernel-local registry of all live epoll instances, their interests, report
 /// state, and `(provider, object_id)` reverse purge index.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Default)]
 pub struct EpollRegistry {
     epolls: BTreeMap<u64, EpollInstance>,
     object_interests: BTreeMap<(u16, u64), BTreeSet<(u64, EpollInterestKey)>>,
@@ -130,16 +148,20 @@ impl EpollRegistry {
         }
     }
 
-    pub fn create(&mut self, token: u64) -> Result<u64, EpollError> {
+    /// Registers a new instance billed to `charge_group` (`None` bills
+    /// nothing); a refused charge is `Capacity` and changes nothing.
+    pub fn create(&mut self, token: u64, charge_group: Option<usize>) -> Result<u64, EpollError> {
         if token == 0 || self.epolls.contains_key(&token) {
             return Err(EpollError::Exists);
         }
         if self.epolls.len() >= WAITSET_MAX_EPOLL_OBJECTS {
             return Err(EpollError::Capacity);
         }
+        let lease = PageLease::acquire(charge_group, epoll_pages(0)).ok_or(EpollError::Capacity)?;
         self.epolls.insert(
             token,
             EpollInstance {
+                lease,
                 interests: BTreeMap::new(),
                 report: BTreeMap::new(),
                 cursor: 0,
@@ -165,6 +187,9 @@ impl EpollRegistry {
                     return Err(EpollError::Exists);
                 }
                 if epoll.interests.len() >= WAITSET_MAX_INTERESTS {
+                    return Err(EpollError::Capacity);
+                }
+                if !epoll.lease.resize(epoll_pages(epoll.interests.len() + 1)) {
                     return Err(EpollError::Capacity);
                 }
                 epoll.interests.insert(record.key, record);
@@ -201,6 +226,8 @@ impl EpollRegistry {
                     .remove(&record.key)
                     .ok_or(EpollError::NotFound)?;
                 epoll.report.remove(&record.key);
+                let shrunk = epoll.lease.resize(epoll_pages(epoll.interests.len()));
+                debug_assert!(shrunk, "shrinking a lease never fails");
                 if epoll.interests.is_empty() {
                     epoll.cursor = 0;
                 } else {
@@ -300,6 +327,8 @@ impl EpollRegistry {
                 "epoll reverse index references a missing interest"
             );
             epoll.report.remove(&key);
+            let shrunk = epoll.lease.resize(epoll_pages(epoll.interests.len()));
+            debug_assert!(shrunk, "shrinking a lease never fails");
             if epoll.interests.is_empty() {
                 epoll.cursor = 0;
             } else {
@@ -324,8 +353,8 @@ impl EpollRegistry {
 static EPOLL_REGISTRY: TrackedSpinLock<EpollRegistry, { LockClass::KernelEpollRegistry as u8 }> =
     TrackedSpinLock::new(EpollRegistry::new());
 
-pub fn epoll_create(token: u64) -> Result<u64, EpollError> {
-    EPOLL_REGISTRY.lock().create(token)
+pub fn epoll_create(token: u64, charge_group: Option<usize>) -> Result<u64, EpollError> {
+    EPOLL_REGISTRY.lock().create(token, charge_group)
 }
 
 pub fn epoll_ctl(
@@ -384,9 +413,9 @@ impl EpollHandle {
 
     /// Allocates a unique kernel-provider token and registers a new epoll
     /// instance in `EPOLL_REGISTRY`.
-    pub fn create() -> Result<Self, EpollError> {
+    pub fn create(charge_group: Option<usize>) -> Result<Self, EpollError> {
         let token = crate::user::local_wait::allocate_token().ok_or(EpollError::Capacity)?;
-        epoll_create(token)?;
+        epoll_create(token, charge_group)?;
         Ok(Self::from_token(token))
     }
 
@@ -504,24 +533,24 @@ mod tests {
     fn epoll_object_cap_boundary_rejects_overflow_and_recovers_after_retire() {
         let mut reg = EpollRegistry::new();
         for i in 1..=(WAITSET_MAX_EPOLL_OBJECTS as u64) {
-            assert_eq!(reg.create(i), Ok(1));
+            assert_eq!(reg.create(i, None), Ok(1));
         }
         assert_eq!(
-            reg.create(WAITSET_MAX_EPOLL_OBJECTS as u64 + 1),
+            reg.create(WAITSET_MAX_EPOLL_OBJECTS as u64 + 1, None),
             Err(EpollError::Capacity)
         );
-        assert_eq!(reg.create(0), Err(EpollError::Exists));
-        assert_eq!(reg.create(1), Err(EpollError::Exists));
+        assert_eq!(reg.create(0, None), Err(EpollError::Exists));
+        assert_eq!(reg.create(1, None), Err(EpollError::Exists));
 
         assert_eq!(reg.retire(1), Some(2));
         assert_eq!(reg.retire(1), None);
-        assert_eq!(reg.create(WAITSET_MAX_EPOLL_OBJECTS as u64 + 1), Ok(1));
+        assert_eq!(reg.create(WAITSET_MAX_EPOLL_OBJECTS as u64 + 1, None), Ok(1));
     }
 
     #[test]
     fn epoll_interest_cap_boundary_rejects_overflow_and_recovers_after_del() {
         let mut reg = EpollRegistry::new();
-        assert_eq!(reg.create(10), Ok(1));
+        assert_eq!(reg.create(10, None), Ok(1));
         for i in 0..(WAITSET_MAX_INTERESTS as u64) {
             let rec = record(i, 1, 100 + i, 1, linux_abi::EPOLLIN, i);
             assert!(reg.ctl(10, linux_abi::EPOLL_CTL_ADD, rec).is_ok());
@@ -547,7 +576,7 @@ mod tests {
     #[test]
     fn snapshot_rotates_round_robin_cursor_across_calls() {
         let mut reg = EpollRegistry::new();
-        assert_eq!(reg.create(20), Ok(1));
+        assert_eq!(reg.create(20, None), Ok(1));
         for fd in [1_u64, 2, 3] {
             let rec = record(fd, 2, 10 + fd, 1, linux_abi::EPOLLIN, fd * 10);
             assert!(reg.ctl(20, linux_abi::EPOLL_CTL_ADD, rec).is_ok());
@@ -568,7 +597,7 @@ mod tests {
     #[test]
     fn provider_restart_epoch_update_replaces_without_duplicating_identity() {
         let mut reg = EpollRegistry::new();
-        assert_eq!(reg.create(30), Ok(1));
+        assert_eq!(reg.create(30, None), Ok(1));
         let initial = record(5, 2, 77, 1, linux_abi::EPOLLIN | linux_abi::EPOLLET, 111);
         assert_eq!(reg.ctl(30, linux_abi::EPOLL_CTL_ADD, initial), Ok(2));
 
@@ -594,9 +623,9 @@ mod tests {
     #[test]
     fn reverse_index_purge_removes_exact_object_and_bumps_affected_generations() {
         let mut reg = EpollRegistry::new();
-        assert_eq!(reg.create(40), Ok(1));
-        assert_eq!(reg.create(41), Ok(1));
-        assert_eq!(reg.create(42), Ok(1));
+        assert_eq!(reg.create(40, None), Ok(1));
+        assert_eq!(reg.create(41, None), Ok(1));
+        assert_eq!(reg.create(42, None), Ok(1));
 
         // Epoll 40 watches (provider=2, obj=99) on two duped fds plus obj=100.
         let r1 = record(3, 2, 99, 1, linux_abi::EPOLLIN, 1);
@@ -636,7 +665,7 @@ mod tests {
     #[test]
     fn claim_enforces_epollet_and_epolloneshot_and_mod_rearms() {
         let mut reg = EpollRegistry::new();
-        assert_eq!(reg.create(50), Ok(1));
+        assert_eq!(reg.create(50, None), Ok(1));
 
         let et = record(1, 2, 10, 1, linux_abi::EPOLLIN | linux_abi::EPOLLET, 1);
         let oneshot = record(2, 2, 11, 1, linux_abi::EPOLLIN | linux_abi::EPOLLONESHOT, 2);
@@ -681,7 +710,7 @@ mod tests {
     #[test]
     fn retire_cleans_up_interests_and_reverse_index() {
         let mut reg = EpollRegistry::new();
-        assert_eq!(reg.create(60), Ok(1));
+        assert_eq!(reg.create(60, None), Ok(1));
         let rec = record(1, 2, 555, 1, linux_abi::EPOLLIN, 1);
         assert_eq!(reg.ctl(60, linux_abi::EPOLL_CTL_ADD, rec), Ok(2));
 
@@ -695,7 +724,7 @@ mod tests {
 
     #[test]
     fn handle_create_registers_in_global_registry_and_retires_cleanly() {
-        let handle = EpollHandle::create().expect("create epoll handle");
+        let handle = EpollHandle::create(None).expect("create epoll handle");
         let token = handle.token_id();
         let rec = record(9, 5, 9999, 1, linux_abi::EPOLLIN, 42);
         assert_eq!(epoll_ctl(token, linux_abi::EPOLL_CTL_ADD, rec), Ok(2));
@@ -704,5 +733,59 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(epoll_retire(token), Some(3));
         assert_eq!(epoll_snapshot(token, 8), Err(EpollError::NotFound));
+    }
+
+    #[test]
+    fn epoll_instance_and_interest_pages_are_charged_and_refunded_exactly_once() {
+        use kernel_mm::api::charge;
+        // Charge group 56 is reserved for this test.
+        let g = 56;
+        charge::init_group(g, None);
+        charge::set_limit(g, 3);
+        let mut reg = EpollRegistry::new();
+        assert_eq!(reg.create(1, Some(g)), Ok(1));
+        assert_eq!(charge::usage(g), 1);
+        assert_eq!(reg.create(2, Some(g)), Ok(1));
+        assert_eq!(charge::usage(g), 2);
+        // 16 interests fit the object's first interest page: 1 + 1 = 2 pages.
+        for fd in 0..16 {
+            reg.ctl(1, linux_abi::EPOLL_CTL_ADD, record(fd, 1, fd + 1, 1, linux_abi::EPOLLIN, 0))
+                .unwrap();
+        }
+        assert_eq!(charge::usage(g), 3);
+        // The 17th needs a second interest page: refused, nothing changes.
+        assert_eq!(
+            reg.ctl(1, linux_abi::EPOLL_CTL_ADD, record(16, 1, 17, 1, linux_abi::EPOLLIN, 0)),
+            Err(EpollError::Capacity)
+        );
+        assert_eq!(charge::usage(g), 3);
+        assert_eq!(reg.create(3, Some(g)), Err(EpollError::Capacity));
+        assert_eq!(charge::usage(g), 3);
+        // DEL shrinks; purge shrinks; retire refunds the rest exactly once.
+        reg.ctl(1, linux_abi::EPOLL_CTL_DEL, record(0, 1, 1, 0, 0, 0)).unwrap();
+        assert_eq!(charge::usage(g), 3);
+        reg.purge_object(1, 2);
+        reg.purge_object(1, 3);
+        reg.purge_object(1, 4);
+        reg.purge_object(1, 5);
+        reg.purge_object(1, 6);
+        reg.purge_object(1, 7);
+        reg.purge_object(1, 8);
+        reg.purge_object(1, 9);
+        reg.purge_object(1, 10);
+        reg.purge_object(1, 11);
+        reg.purge_object(1, 12);
+        reg.purge_object(1, 13);
+        reg.purge_object(1, 14);
+        reg.purge_object(1, 15);
+        reg.purge_object(1, 16);
+        assert_eq!(charge::usage(g), 2, "empty interest set keeps only the object page");
+        assert!(reg.retire(1).is_some());
+        assert_eq!(charge::usage(g), 1);
+        assert!(reg.retire(1).is_none());
+        assert_eq!(charge::usage(g), 1, "double retire refunds nothing");
+        assert!(reg.retire(2).is_some());
+        assert_eq!(charge::usage(g), 0);
+        assert_eq!(charge::retainers(g), 0);
     }
 }

@@ -52,6 +52,29 @@ fn reserve_spawn_after_reclaim(parent_pid: u64) -> Option<multitask::SpawnReserv
     }
 }
 
+/// Longest the COW clone waits for frames before the fork reports ENOMEM.
+const FORK_FRAME_WAIT_MS: u32 = 250;
+const FORK_FRAME_WAIT_STEP_MS: u32 = 5;
+
+/// One bounded backoff step after a frame-exhausted clone. `false` once the
+/// budget is spent (the caller then fails the fork with ENOMEM).
+fn wait_for_fork_frames(waited_steps: &mut u32) -> bool {
+    if *waited_steps * FORK_FRAME_WAIT_STEP_MS >= FORK_FRAME_WAIT_MS {
+        return false;
+    }
+    *waited_steps += 1;
+    multitask::kick_housekeeping();
+    crate::arch::rtc::sleep(u64::from(FORK_FRAME_WAIT_STEP_MS));
+    true
+}
+
+/// `linux-fork-stage` detail for a refused clone: the address-space error in
+/// the low byte and the free page count at refusal above it, so a failed fork
+/// states whether the machine really was out of frames.
+fn fork_failure_detail(error: u64, free_bytes: u64) -> u64 {
+    (error & 0xff) | ((free_bytes / rustos_user_abi::pager::PAGER_PAGE_BYTES) << 8)
+}
+
 pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
     if !current_process_can_policy() {
         return linux_errno(LINUX_EPERM);
@@ -233,6 +256,30 @@ fn build_fork_bootstrap(
     bootstrap
 }
 
+/// Whether `fork` shares this region's resident private pages copy-on-write
+/// instead of copying them into the child eagerly.
+///
+/// Private file and image-section mappings qualify as well as anonymous ones:
+/// once a process has written such a page (a relocated `.data.rel.ro`, a
+/// patched GOT), its leaf is an exclusive private copy that is indistinguishable
+/// from an anonymous page, and Linux shares it with the child like any other
+/// `MAP_PRIVATE` page. Pages that are still unmodified file-cache aliases keep
+/// their COW tag and role and are inherited as such. Copying the dirty ones
+/// eagerly cost Chrome's zygote about 70 MiB per forked child. Shared, device
+/// and memfd regions never qualify, and neither does an uncommitted region.
+fn fork_shares_region_copy_on_write(region: &rustos_user_abi::pager::PagerVmRegionWire) -> bool {
+    use rustos_user_abi::pager::{
+        VM_COMMIT_COMMITTED, VM_OBJECT_ANONYMOUS, VM_OBJECT_FILE_PRIVATE, VM_OBJECT_IMAGE_SECTION,
+        VM_SHARING_PRIVATE,
+    };
+    region.sharing == VM_SHARING_PRIVATE
+        && region.commit_state == VM_COMMIT_COMMITTED
+        && matches!(
+            region.object.object_type,
+            VM_OBJECT_ANONYMOUS | VM_OBJECT_FILE_PRIVATE | VM_OBJECT_IMAGE_SECTION
+        )
+}
+
 fn spawn_cow_fork_child(
     args: &RustosProcForkBrokerArgs,
     thread_snapshot: &multitask::LinuxThreadSnapshot,
@@ -246,7 +293,9 @@ fn spawn_cow_fork_child(
     let fork_started = crate::arch::clock::monotonic_nanos();
     #[cfg(rustos_lifecycle_trace)]
     let mut clone_ns = 0;
-    let forked = multitask::with_fork_parent_state(args.source_pid, |parent, regions| {
+    let mut frame_waits = 0_u32;
+    let forked = loop {
+    let attempt = multitask::with_fork_parent_state(args.source_pid, |parent, regions| {
         let mut eager_private_ranges = Vec::new();
         if args.clone_flags & linux_abi::CLONE_CHILD_SETTID != 0 {
             let byte_len = core::mem::size_of::<u32>();
@@ -278,10 +327,7 @@ fn spawn_cow_fork_child(
             .try_reserve_exact(regions.len())
             .map_err(|_| crate::memory::paging::AddressSpaceError::OutOfFrames)?;
         for region in regions {
-            if region.object.object_type == rustos_user_abi::pager::VM_OBJECT_ANONYMOUS
-                && region.sharing == rustos_user_abi::pager::VM_SHARING_PRIVATE
-                && region.commit_state == rustos_user_abi::pager::VM_COMMIT_COMMITTED
-            {
+            if fork_shares_region_copy_on_write(region) {
                 let bytes = region
                     .end
                     .checked_sub(region.start)
@@ -312,7 +358,20 @@ fn spawn_cow_fork_child(
         let child_state = parent.fork_clone(address_space, None);
         parent.begin_fork_handle_pin();
         Ok::<_, crate::memory::paging::AddressSpaceError>((child_state, inherited_regions))
-    });
+        });
+    // All fork locks are released here. Frame exhaustion is often a transient
+    // overlap with an exiting process or the memory governor's reclaim, so
+    // wait boundedly before reporting ENOMEM (Linux retries small allocations
+    // under pressure instead of failing the clone at the first miss).
+    if matches!(
+        attempt,
+        Ok(Err(crate::memory::paging::AddressSpaceError::OutOfFrames))
+    ) && wait_for_fork_frames(&mut frame_waits)
+    {
+        continue;
+    }
+    break attempt;
+    };
     let (child_state, inherited_regions) =
         match unpack_fork_parent_result(forked, spawn_reservation) {
             Ok(result) => result,
@@ -414,7 +473,7 @@ fn unpack_fork_parent_result<T>(
             Err(fork_stage_failed(
                 1,
                 address_space_error_to_linux_errno(err),
-                err as u64,
+                fork_failure_detail(err as u64, crate::memory::phys::free_bytes()),
             ))
         }
         Err(error) => {
@@ -614,6 +673,40 @@ mod tests {
     use rustos_user_abi::pager::{
         PagerVmRegionWire, VM_COMMIT_COMMITTED, VM_COMMIT_RESERVED, VM_PROT_READ, VM_PROT_WRITE,
     };
+
+    #[test]
+    fn fork_shares_private_committed_anonymous_and_file_regions_only() {
+        use rustos_user_abi::pager::{
+            VM_OBJECT_ANONYMOUS, VM_OBJECT_DEVICE_PINNED, VM_OBJECT_FILE_PRIVATE,
+            VM_OBJECT_FILE_SHARED, VM_OBJECT_IMAGE_SECTION, VM_OBJECT_MEMFD, VM_SHARING_PRIVATE,
+            VM_SHARING_SHARED,
+        };
+        let mut region = region(0x1000, 0x2000, VM_PROT_WRITE, VM_COMMIT_COMMITTED);
+        region.sharing = VM_SHARING_PRIVATE;
+        for (object_type, shared) in [
+            (VM_OBJECT_ANONYMOUS, true),
+            (VM_OBJECT_FILE_PRIVATE, true),
+            (VM_OBJECT_IMAGE_SECTION, true),
+            (VM_OBJECT_FILE_SHARED, false),
+            (VM_OBJECT_MEMFD, false),
+            (VM_OBJECT_DEVICE_PINNED, false),
+        ] {
+            region.object.object_type = object_type;
+            assert_eq!(super::fork_shares_region_copy_on_write(&region), shared);
+        }
+        region.object.object_type = VM_OBJECT_ANONYMOUS;
+        region.sharing = VM_SHARING_SHARED;
+        assert!(!super::fork_shares_region_copy_on_write(&region));
+        region.sharing = VM_SHARING_PRIVATE;
+        region.commit_state = VM_COMMIT_RESERVED;
+        assert!(!super::fork_shares_region_copy_on_write(&region));
+    }
+
+    #[test]
+    fn fork_failure_detail_keeps_error_and_free_pages() {
+        assert_eq!(super::fork_failure_detail(8, 0), 8);
+        assert_eq!(super::fork_failure_detail(8, 4096 * 6381), (6381 << 8) | 8);
+    }
 
     #[test]
     fn valid_process_fork_plan_locally_admits_vfork_and_rejects_half_vfork() {

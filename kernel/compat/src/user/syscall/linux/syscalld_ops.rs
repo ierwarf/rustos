@@ -117,10 +117,12 @@ pub(super) fn syscall_linux_syscalld_sched_getaffinity(
         let task_mask = multitask::linux_task_affinity(pid, online_mask)
             .map_err(affinity_error_to_linux_errno)?;
         if ipc_ops::current_process_has_service_capability(ServiceCapability::VfsPolicy) {
-            // vfsd answers /proc/cpuinfo and /sys CPU lists on its single receive
-            // thread while syscalld can be blocked in the mapping broker waiting for
-            // vfsd (PREAD64). Offloading this call would wait on that blocked
-            // service until the IPC deadline. syscalld's policy is a pure check of
+            // vfsd serves requests on its single receive thread while syscalld can
+            // be blocked in the mapping broker waiting for vfsd (PREAD64).
+            // Offloading a vfsd-issued call would wait on that blocked service
+            // until the IPC deadline. (/proc/cpuinfo and the /sys CPU lists no
+            // longer come through here: they use PROC_FACTS_OP_ONLINE_CPUS.)
+            // syscalld's policy is a pure check of
             // the kernel-stamped task mask against the Online mask, which the kernel
             // has just done, so vfsd's reply is formed here with the same check.
             if task_mask == 0 || task_mask & !online_mask != 0 {

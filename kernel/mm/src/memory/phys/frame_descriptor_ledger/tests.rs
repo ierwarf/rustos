@@ -1035,3 +1035,199 @@ fn shared_alias_run_charges_root_once_and_cancel_refunds_atomically() {
     ledger.unregister_root(child);
     ledger.unregister_root(parent);
 }
+
+fn census(ledger: &FrameDescriptorLedger, root: u64) -> (u64, u64, u64) {
+    let c = ledger.leaf_census(root).unwrap();
+    (c.mapped, c.shared, c.private())
+}
+
+fn publish_exclusive(ledger: &FrameDescriptorLedger, root: u64, va: u64, frame: u64) {
+    assert_eq!(ledger.claim_exclusive_data(root, va, frame, true), DataClaim::Claimed);
+    ledger.publish_exclusive_data(root, va, frame);
+}
+
+#[test]
+fn census_counts_exclusive_leaves_as_private_once() {
+    let (ledger, _records, _mappings) = ledger();
+    let root = PAGE_SIZE;
+    crate::memory::charge::init_group(1, None);
+    ledger.register_root(root);
+    assert!(ledger.bind_charge(root, 1));
+    for index in 0..3_u64 {
+        publish_exclusive(&ledger, root, 0x8000_0000 + index * PAGE_SIZE, PAGE_SIZE * (2 + index));
+    }
+    assert_eq!(census(&ledger, root), (3, 0, 3));
+    for index in 0..3_u64 {
+        assert_eq!(
+            ledger.release_data(root, 0x8000_0000 + index * PAGE_SIZE, PAGE_SIZE * (2 + index)),
+            Some(DataLeafRelease::FrameReusable)
+        );
+    }
+    assert_eq!(census(&ledger, root), (0, 0, 0));
+    ledger.unregister_root(root);
+}
+
+#[test]
+fn census_charges_a_forked_page_to_neither_side_until_a_sibling_leaves() {
+    let (ledger, _records, _mappings) = ledger();
+    let (parent, child, other) = (PAGE_SIZE, PAGE_SIZE * 2, PAGE_SIZE * 3);
+    let (shared, own) = (PAGE_SIZE * 4, PAGE_SIZE * 5);
+    let va = 0x8000_4000;
+    for (group, root) in [(2, parent), (3, child), (4, other)] {
+        crate::memory::charge::init_group(group, None);
+        ledger.register_root(root);
+        assert!(ledger.bind_charge(root, group));
+    }
+    publish_exclusive(&ledger, parent, va, shared);
+    publish_exclusive(&ledger, parent, va + PAGE_SIZE, own);
+    assert_eq!(census(&ledger, parent), (2, 0, 2));
+    // Fork: the shared page converts the parent's leaf and aliases the child's.
+    let t = ledger
+        .prepare_shared_alias(parent, va, child, va, shared, CowFrameKind::AnonymousFork, 0)
+        .unwrap();
+    ledger.publish_shared_alias(t);
+    assert_eq!(census(&ledger, parent), (2, 1, 1), "only the unforked page is private");
+    assert_eq!(census(&ledger, child), (1, 1, 0), "an alias frees nothing");
+    // A second fork adds a mapper without touching the parent's shared count.
+    let t = ledger
+        .prepare_shared_alias(parent, va, other, va, shared, CowFrameKind::AnonymousFork, 0)
+        .unwrap();
+    ledger.publish_shared_alias(t);
+    assert_eq!(census(&ledger, parent), (2, 1, 1));
+    assert_eq!(census(&ledger, other), (1, 1, 0));
+    // The child's exit leaves three-to-two: nobody becomes private yet.
+    assert_eq!(ledger.release_data(child, va, shared), Some(DataLeafRelease::FrameRetained));
+    assert_eq!(census(&ledger, child), (0, 0, 0));
+    assert_eq!(census(&ledger, parent), (2, 1, 1));
+    // The last sibling's exit makes the survivor the frame's sole owner.
+    assert_eq!(ledger.release_data(other, va, shared), Some(DataLeafRelease::FrameRetained));
+    assert_eq!(census(&ledger, parent), (2, 0, 2));
+    // Everything the census calls private is exactly what teardown frees.
+    let freed = [(va, shared), (va + PAGE_SIZE, own)]
+        .into_iter()
+        .filter(|&(v, f)| ledger.release_data(parent, v, f) == Some(DataLeafRelease::FrameReusable))
+        .count() as u64;
+    assert_eq!(freed, 2);
+    for root in [parent, child, other] {
+        ledger.unregister_root(root);
+    }
+}
+
+#[test]
+fn census_kill_frees_exactly_the_private_figure() {
+    let (ledger, _records, _mappings) = ledger();
+    let (parent, child) = (PAGE_SIZE, PAGE_SIZE * 2);
+    let va = 0x8000_0000;
+    for (group, root) in [(5, parent), (6, child)] {
+        crate::memory::charge::init_group(group, None);
+        ledger.register_root(root);
+        assert!(ledger.bind_charge(root, group));
+    }
+    // Parent maps frames 3..=6; frames 3 and 4 are forked to the child, which
+    // then COW-breaks frame 4 into its own frame 7 and adds private frame 8.
+    for index in 0..4_u64 {
+        publish_exclusive(&ledger, parent, va + index * PAGE_SIZE, PAGE_SIZE * (3 + index));
+    }
+    for index in 0..2_u64 {
+        let t = ledger
+            .prepare_shared_alias(
+                parent,
+                va + index * PAGE_SIZE,
+                child,
+                va + index * PAGE_SIZE,
+                PAGE_SIZE * (3 + index),
+                CowFrameKind::AnonymousFork,
+                0,
+            )
+            .unwrap();
+        ledger.publish_shared_alias(t);
+    }
+    let claim = ledger.try_claim_cow_mapping(child, va + PAGE_SIZE, PAGE_SIZE * 4).unwrap();
+    assert_eq!(ledger.claim_exclusive_data(child, va + PAGE_SIZE, PAGE_SIZE * 7, false), DataClaim::Claimed);
+    assert_eq!(ledger.commit_cow_mapping(claim), DataLeafRelease::FrameRetained);
+    ledger.publish_exclusive_data(child, va + PAGE_SIZE, PAGE_SIZE * 7);
+    publish_exclusive(&ledger, child, va + 2 * PAGE_SIZE, PAGE_SIZE * 8);
+
+    let child_leaves = [(va, 3), (va + PAGE_SIZE, 7), (va + 2 * PAGE_SIZE, 8)];
+    let parent_leaves = [(va, 3), (va + PAGE_SIZE, 4), (va + 2 * PAGE_SIZE, 5), (va + 3 * PAGE_SIZE, 6)];
+    // Frame 3: parent+child; frame 4: parent only after the child's break.
+    assert_eq!(census(&ledger, child), (3, 1, 2));
+    assert_eq!(census(&ledger, parent), (4, 1, 3));
+    let predicted_child = census(&ledger, child).2;
+    let freed = child_leaves
+        .iter()
+        .filter(|&&(v, f)| ledger.release_data(child, v, PAGE_SIZE * f) == Some(DataLeafRelease::FrameReusable))
+        .count() as u64;
+    assert_eq!(freed, predicted_child, "the child's kill frees exactly its census figure");
+    // With the child gone the parent is sole owner of frame 3 as well.
+    assert_eq!(census(&ledger, parent), (4, 0, 4));
+    let freed = parent_leaves
+        .iter()
+        .filter(|&&(v, f)| ledger.release_data(parent, v, PAGE_SIZE * f) == Some(DataLeafRelease::FrameReusable))
+        .count() as u64;
+    assert_eq!(freed, 4);
+    ledger.unregister_root(child);
+    ledger.unregister_root(parent);
+}
+
+#[test]
+fn census_never_charges_file_backed_private_leaves() {
+    let (ledger, _records, _mappings) = ledger();
+    let (first, second) = (PAGE_SIZE, PAGE_SIZE * 2);
+    let frame = PAGE_SIZE * 3;
+    let va = 0x8000_0000;
+    for (group, root) in [(7, first), (8, second)] {
+        crate::memory::charge::init_group(group, None);
+        ledger.register_root(root);
+        assert!(ledger.bind_charge(root, group));
+    }
+    assert!(ledger.claim_private_file_cache(frame, 99));
+    for root in [first, second] {
+        let t = ledger
+            .prepare_shared_alias(0, 0, root, va, frame, CowFrameKind::PrivateFileSection, 99)
+            .unwrap();
+        ledger.publish_shared_alias(t);
+        assert_eq!(census(&ledger, root), (1, 1, 0));
+    }
+    // One mapper left plus cache custody still frees nothing on exit.
+    assert_eq!(ledger.release_data(first, va, frame), Some(DataLeafRelease::FrameRetained));
+    assert_eq!(census(&ledger, first), (0, 0, 0));
+    assert_eq!(census(&ledger, second), (1, 1, 0));
+    assert_eq!(ledger.release_data(second, va, frame), Some(DataLeafRelease::FrameRetained));
+    assert_eq!(
+        ledger.release_private_file_cache(frame, 99),
+        Some(DataLeafRelease::FrameReusable)
+    );
+    ledger.unregister_root(first);
+    ledger.unregister_root(second);
+}
+
+#[test]
+fn census_rolls_a_failed_fork_back_to_private() {
+    let (ledger, _records, _mappings) = ledger();
+    let (parent, child) = (PAGE_SIZE, PAGE_SIZE * 2);
+    let frame = PAGE_SIZE * 3;
+    let va = 0x8000_0000;
+    for (group, root) in [(9, parent), (29, child)] {
+        crate::memory::charge::init_group(group, None);
+        ledger.register_root(root);
+        assert!(ledger.bind_charge(root, group));
+    }
+    publish_exclusive(&ledger, parent, va, frame);
+    let t = ledger
+        .prepare_shared_alias(parent, va, child, va, frame, CowFrameKind::AnonymousFork, 0)
+        .unwrap();
+    ledger.cancel_shared_alias(t);
+    assert_eq!(census(&ledger, parent), (1, 0, 1), "a cancelled alias never counted");
+    let t = ledger
+        .prepare_shared_alias(parent, va, child, va, frame, CowFrameKind::AnonymousFork, 0)
+        .unwrap();
+    ledger.publish_shared_alias(t);
+    assert_eq!(census(&ledger, parent), (1, 1, 0));
+    assert!(ledger.rollback_shared_alias(t));
+    assert_eq!(census(&ledger, parent), (1, 0, 1));
+    assert_eq!(census(&ledger, child), (0, 0, 0));
+    ledger.release_data(parent, va, frame).unwrap();
+    ledger.unregister_root(parent);
+    ledger.unregister_root(child);
+}

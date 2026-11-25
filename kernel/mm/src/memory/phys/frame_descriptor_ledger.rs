@@ -130,6 +130,9 @@ pub struct SharedAliasTicket {
     kind: CowFrameKind,
     converted_exclusive: bool,
     owns_frame_lock: bool,
+    /// Root whose leaf this alias turns from privately owned into shared at
+    /// publication (0 when none). See `adjust_shared_leaves`.
+    bump_owner_root: u64,
 }
 
 impl SharedAliasTicket {
@@ -141,6 +144,7 @@ impl SharedAliasTicket {
         kind: CowFrameKind::AnonymousFork,
         converted_exclusive: false,
         owns_frame_lock: false,
+        bump_owner_root: 0,
     };
 }
 
@@ -315,7 +319,11 @@ impl FrameDescriptorLedger {
             0,
             "retired root still owns data leaves"
         );
-        assert_eq!(root.shared_backing_identity.load(Ordering::Relaxed), 0);
+        // The backing word of a root is its shared-leaf count (see
+        // `adjust_shared_leaves`): zero once no leaf is left. It is a census
+        // statistic, so a miscount is a test failure, not a kernel panic.
+        debug_assert_eq!(root.shared_backing_identity.load(Ordering::Relaxed), 0);
+        root.shared_backing_identity.store(0, Ordering::Relaxed);
         // The binding word is free for roots; the count is zero here, so
         // nothing is left charged to the group being released. The root frame
         // itself is the last page-table byte this root still owns.
@@ -665,6 +673,7 @@ impl FrameDescriptorLedger {
             kind,
             converted_exclusive,
             owns_frame_lock: true,
+            bump_owner_root: Self::bump_owner(owner_root, kind, converted_exclusive, count),
         };
         if !self.try_charge_root(new_root, 1) {
             self.cancel_shared_alias_inner(ticket);
@@ -967,6 +976,11 @@ impl FrameDescriptorLedger {
             kind,
             converted_exclusive,
             owns_frame_lock,
+            bump_owner_root: if owns_frame_lock {
+                Self::bump_owner(owner_root, kind, converted_exclusive, count)
+            } else {
+                0
+            },
         })
     }
 
@@ -998,7 +1012,10 @@ impl FrameDescriptorLedger {
         }
         root.data_leaf_count_or_map_head
             .fetch_add(tickets.len() as u64, DESCRIPTOR_ACQ_REL);
+        root.shared_backing_identity
+            .fetch_add(tickets.len() as u64, DESCRIPTOR_ACQ_REL);
         for ticket in tickets {
+            self.adjust_shared_leaves(ticket.bump_owner_root, 1);
             if ticket.owns_frame_lock {
                 let frame = self
                     .record(ticket.frame_phys)
@@ -1129,6 +1146,9 @@ impl FrameDescriptorLedger {
         );
         root.data_leaf_count_or_map_head
             .fetch_add(1, DESCRIPTOR_ACQ_REL);
+        root.shared_backing_identity
+            .fetch_add(1, DESCRIPTOR_ACQ_REL);
+        self.adjust_shared_leaves(ticket.bump_owner_root, 1);
         assert_eq!(
             frame
                 .role
@@ -1227,6 +1247,12 @@ impl FrameDescriptorLedger {
                 shared_count(frame.data_leaf_count_or_map_head.load(Ordering::Relaxed)),
                 1
             );
+            if ticket.kind == CowFrameKind::PrivateFileSection {
+                // File-backed leaves stay shared while mapped, so removing the
+                // alias does not itself return the survivor to private.
+                let survivor = frame.owner_or_table_head.load(Ordering::Relaxed);
+                self.adjust_shared_leaves(survivor, -1);
+            }
             frame
                 .data_leaf_count_or_map_head
                 .store(0, Ordering::Relaxed);
@@ -1333,6 +1359,8 @@ impl FrameDescriptorLedger {
         assert_eq!(frame.next_or_virtual_address.load(Ordering::Relaxed), va);
         assert_ne!(frame.shared_backing_identity.load(Ordering::Relaxed), 0);
         root.data_leaf_count_or_map_head
+            .fetch_add(1, DESCRIPTOR_ACQ_REL);
+        root.shared_backing_identity
             .fetch_add(1, DESCRIPTOR_ACQ_REL);
         assert_eq!(
             frame
@@ -1724,6 +1752,21 @@ impl FrameDescriptorLedger {
         let count = shared_count(packed);
         let head = shared_head(packed);
         assert!(count != 0, "shared mapping count underflow");
+        // Per-root shared-leaf accounting: the removed leaf stops counting, and
+        // an anonymous frame dropping to one mapping makes its survivor private.
+        if kind == CowFrameKind::PrivateFileSection || count >= 2 {
+            self.adjust_shared_leaves(root_phys, -1);
+        }
+        if kind == CowFrameKind::AnonymousFork && count == 2 {
+            let survivor = if mapping_id == 0 {
+                self.mapping(head)
+                    .map(|m| m.root_and_state.load(DESCRIPTOR_ACQUIRE) & !MAPPING_STATE_MASK)
+                    .unwrap_or(0)
+            } else {
+                frame.owner_or_table_head.load(Ordering::Relaxed)
+            };
+            self.adjust_shared_leaves(survivor, -1);
+        }
         if mapping_id == 0 {
             assert_eq!(frame.owner_or_table_head.load(Ordering::Relaxed), root_phys);
             assert_eq!(frame.next_or_virtual_address.load(Ordering::Relaxed), va);
@@ -1998,6 +2041,49 @@ impl FrameDescriptorLedger {
             .verify_root(root_phys)
             .expect("COW mapping root disappeared");
         self.decrement_root_data_count_with(root);
+    }
+
+    fn leaf_census(&self, root_phys: u64) -> Option<DataLeafCensus> {
+        let root = self.verify_root(root_phys)?;
+        // The two words move in separate atomics, so a leaf being published or
+        // removed during the read skews `private` by that in-flight leaf only.
+        let mapped = root.data_leaf_count_or_map_head.load(DESCRIPTOR_ACQUIRE);
+        let shared = root.shared_backing_identity.load(DESCRIPTOR_ACQUIRE);
+        Some(DataLeafCensus { mapped, shared })
+    }
+
+    /// Root that must start counting a leaf as shared when an alias joins its
+    /// frame: the owner of a just-converted exclusive frame, or the sole
+    /// mapper of an anonymous frame that was private at one mapping.
+    fn bump_owner(owner_root: u64, kind: CowFrameKind, converted: bool, count_before: u32) -> u64 {
+        let owner_turns_shared =
+            converted || (kind == CowFrameKind::AnonymousFork && count_before == 1);
+        if owner_turns_shared { owner_root } else { 0 }
+    }
+
+    /// Moves a root's shared-leaf count (kept in the root record's otherwise
+    /// unused backing word). A shared leaf is a mapped data leaf whose frame is
+    /// file-backed private COW or has two or more mappers, so killing the root
+    /// does not free it. Roots that do not exist (cache custody, 0) are ignored.
+    fn adjust_shared_leaves(&self, root_phys: u64, delta: i64) {
+        if root_phys == 0 {
+            return;
+        }
+        let Some(root) = self.verify_root(root_phys) else {
+            return;
+        };
+        if delta >= 0 {
+            root.shared_backing_identity
+                .fetch_add(delta as u64, DESCRIPTOR_ACQ_REL);
+        } else {
+            let sub = delta.unsigned_abs();
+            let result = root.shared_backing_identity.fetch_update(
+                DESCRIPTOR_ACQ_REL,
+                DESCRIPTOR_ACQUIRE,
+                |value| Some(value.saturating_sub(sub)),
+            );
+            debug_assert!(matches!(result, Ok(v) if v >= sub), "shared-leaf count underflow");
+        }
     }
 
     fn decrement_root_data_count_with(&self, root: &FrameDescriptorRecord) {

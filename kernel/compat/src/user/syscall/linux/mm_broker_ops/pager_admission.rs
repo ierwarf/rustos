@@ -504,6 +504,31 @@ pub(super) fn admit_inherited_region(
     })
 }
 
+/// Publishes an anonymous private region over pages that are already resident,
+/// for a process that has not run yet (its exec image). Unlike an `mmap`
+/// admission the range is not vacant, so this uses the inherited publication,
+/// which still rejects overlap, stale identity and the VMA ceiling. Services in
+/// the wired pager control graph keep their unpublished boot mapping.
+pub(super) fn publish_resident_private_region(pid: u64, start: u64, end: u64, prot: u64) -> bool {
+    let policy = crate::pager_policy::anonymous_policy();
+    if policy.demand_enabled == 0 || in_pager_control_graph(pid, policy) {
+        return false;
+    }
+    let (Some(rights), Some(endpoint)) = (pager_rights(prot), fault_endpoint()) else {
+        return false;
+    };
+    let Some(template) = region_template(start, end, rights, RING0_ANONYMOUS_EPOCH, endpoint)
+    else {
+        return false;
+    };
+    multitask::publish_inherited_pager_vma_for_process(
+        pid,
+        template,
+        policy.process_vma_ceiling as usize,
+    )
+    .is_ok()
+}
+
 fn admit_anonymous_rights(
     target: MmTarget,
     start: u64,

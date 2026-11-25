@@ -279,7 +279,7 @@ mod tests {
     fn sockets_report_sock_mode_and_kind_separated_devices() {
         let creds = multitask::SocketCredentials::new(1, 0, 0);
         let unix_handle =
-            multitask::UnixSocketHandle::new(multitask::UnixSocketType::Stream, false, creds)
+            multitask::UnixSocketHandle::new(multitask::UnixSocketType::Stream, false, creds, None)
                 .unwrap();
         let unix_token = unix_handle.token_id();
         let unix = id(multitask::KernelHandle::UnixSocket(unix_handle));

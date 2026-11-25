@@ -54,7 +54,7 @@ use crate::user::process_state::{
 };
 
 pub use self::current::{
-    MemoryCensusEntry, memory_census,
+    MemoryAccount, MemoryCensusEntry, memory_account, memory_census,
     activate_suspended_user_task, activate_suspended_user_tasks,
     activate_suspended_user_tasks_with_commit, arm_block_current_task,
     arm_block_current_task_on_endpoint, arm_block_current_task_on_pager_fault,

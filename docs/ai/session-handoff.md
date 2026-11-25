@@ -4,6 +4,74 @@ Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
 
+## Chrome KVM bug-fix wave + census redesign (2026-11-25, uncommitted)
+
+Trigger: `kvm-smoke --launch-desktop chrome.desktop` (2 GiB guest) failed the 60 s hold: Chrome died at ~7 s,
+the guest ran out of frames, rootd OOM-killed a Chrome child "charged" 848866 pages (> guest size) that freed
+nothing, then rootd/initd retired netd/devmgrd/inputd and uiserver's input watchdog exited.
+
+- **Capacity, not a leak:** 2 GiB is below Chrome's floor (F5 uses `KVM_RUSTOS_MEMORY_MIB=6144`). At 4096 MiB
+  Chrome runs the whole hold: 0 fork refusals, 0 frame-short, 0 user faults, 0 OOM, 2 Wayland windows.
+- **Fixed:** HAL `int3` gate is DPL 3 (user `int3` was #GP, now vector 3 -> SIGTRAP; seen as fault vector 0x3 in
+  the 2 GiB boot). Census now reports `private_pages`/`shared_pages`/`retained_pages` (broker ABI v2, entry 48 B);
+  rootd ranks victims by private pages only (per-root shared-leaf counter in the kernel/mm frame ledger).
+  `fork` retries the COW clone on OutOfFrames for <= 250 ms outside the fork locks (mitigation only).
+  `ptrace` refuses honestly (`linux/ptrace_refusal.rs`; named without `_ops` because it is stateless and maps to
+  no formal model). `/proc/<pid>/task`, hardware CPU lists via `PROC_FACTS_OP_ONLINE_CPUS`. AF_UNIX/eventfd are
+  charged to the Job (`kernel/ps/src/user/page_lease.rs`). netd uevent sockets accept `SO_ATTACH_FILTER`
+  (typed `NetlinkFamily`); the udev warning is gone in the 4 GiB boot. rootd runs the memory pass first each loop
+  and logs `supervisor pass stalled gap_ms`.
+- **Verified:** `cargo xtask check`, `cargo test --workspace --features rootd/host-test,procd/host-test`
+  (4552 pass / 0 fail), `cargo xtask formal-contracts test` (641 tests), and two Chrome boots (4096 MiB and
+  2048 MiB, 1 boot each, both rc=0).
+- **Open / unverified:** at 2 GiB Chrome still cannot fork renderers (fork refused, 2 Chrome int3 faults) and the
+  OOM governor never fired, so the new victim figure is untested on a real kill. Where the first ~1 GiB goes in
+  the first 4 s of Chrome startup is not explained (suspect the Chrome main anon fault stream). Rootd stall root
+  cause at 2 GiB (earlier ~14 s supervisor gap) not reproduced after the fixes. `kernel/ps` `connect` accept-queue
+  orphan race, uncharged epoll/InetSocket/RemoteVfs/VfsDirectory, ptrace on another process's tid (ESRCH vs EPERM).
+  `formal/verify-all.sh --profile pr` and multi-boot flake runs were not run; re-seal before push. Splitting
+  `rootd/src/main.rs` and `driver-domain-host/src/lib.rs` was rejected: formal models, mutation tables and audits
+  reference those paths.
+
+### Round 2 (same day, uncommitted, host-tested only; the integrated tree was NOT rebuilt or booted after it)
+
+- **Landed:** fork shares exec image / file-private regions COW (eager copy per fork 10.8k-18.4k -> 255 pages;
+  this was the main 2 GiB sink); orphan zombies are reaped when the parent is gone (an OOM kill freed nothing
+  before); pager supply Retry 2 s grace; rootd pressure thread (`pressure_gate.rs`) + initd retry/backoff + 30 s
+  orphan-adoption grace (no cascade when initd dies; TLA `post-init-supervisor-recovery` updated, TLC passes);
+  epoll Job charge; AF_UNIX connect orphan fix, `unix_poll` readiness, dgram sender wait token, blocking `connect`
+  to a full backlog; `/proc/<other>/task/<tid>/{stat,status,comm}`; kernel-mm census tests moved to charge groups
+  1-9/29 (they collided with ids 30-38 and hung/flaked `cargo test -p kernel-mm`).
+- **Boots before round 2 landed:** 2048 MiB and 4096 MiB Chrome holds pass, 0 fork refusals; `--oom-hog` at 2048
+  killed only the hog and free rose 3903 -> 200174 pages.
+- **Still in flight / open:** governor can kill a second innocent victim right after the first (1400 MiB run
+  killed Chrome job then wayclick); pid spawned during a loaderd stall is absent from the pressure snapshot;
+  `--oom-hog` + Chrome gives errno=13; `task/<tid>/cmdline`; ptrace `TRACEME` is EPERM (no tracer);
+  SO_SNDTIMEO connect and the blocking sleep/wake/EINTR paths are untested (need a boot).
+- **Paused 2026-11-25 17:35 KST** (usage limit): the governor/second-victim subagent was stopped mid-build; its
+  rootd/xtask edits are in the tree unverified (`cargo check -p rootd --features rootd/host-test` passes). A
+  scheduled task `rustos-chrome-bugfix-resume` resumes the wave at 19:20 KST the same day.
+- **Resume run 2026-11-25 (evening, uncommitted):** fixed one unfinished xtask test initializer
+  (`oom_hog.rs` `settled_free_pages`). Governor settle window / protected pids / in-pass census were already
+  complete in tree. Verified: `cargo xtask check`, workspace host tests, `formal-contracts test`, `cargo xtask
+  build` all pass; Chrome boots 5/5 at 4096 MiB and 3/3 at 2048 MiB clean (all markers 0, wayland_windows=2);
+  `--oom-hog` at 2048 killed only the hog (pid 107), free 3903 -> 273134, no second victim (settling logged),
+  so the 200k-vs-272k difference was a pre-settle sample. Read-only reviewer: no confirmed bugs (minor: unix
+  connect briefly `Connected` before enqueue rollback; pressure `busy` stays set if a kernel call wedges).
+  `--oom-hog` + Chrome now ends `launch-failed errno=11` (EAGAIN, hog already holds memory) rather than 13; treated
+  as expected under exhaustion, not investigated further. Not verified at runtime: blocking AF_UNIX connect
+  SO_SNDTIMEO/EINTR, ptrace_refusal, pager Retry grace, initd backoff. `formal/verify-all.sh --profile pr` was
+  started in the background (log /tmp/claude-1000/ws/pr.log); result not recorded here.
+- **PR gate (2026-11-25 21:xx KST):** the resume run's `--profile pr` FAILED in `implementation-mutations` only:
+  four rootd rows had stale/ambiguous anchors after the census/governor rewrite (`rootd-oom-kills-itself`,
+  `-kills-protected`, `-no-cooldown` -> now anchors `if !settled {` with the settle-window test, and
+  `-trusts-entry-count` -> `1/2` plus new row `-trusts-entry-count-in-kill-record` `2/2`). Rows repaired, each
+  mutant killed 1/1, and `formal/verify-all.sh --profile pr` now passes (sealed, 45 artifacts, rc=0).
+  Any later edit to the tree invalidates that seal.
+- **Next steps:** `cargo xtask check`, `cargo test --workspace --features rootd/host-test,procd/host-test`,
+  `cargo xtask formal-contracts test`, `cargo xtask build`, then Chrome boots (4096 x5, 2048 x3) and
+  `formal/verify-all.sh --profile pr` before any push.
+
 ## Dead-code sweep + Phase 2 ABI/formal completion (2026-11-25, uncommitted)
 
 - **Done:** Completed the 3 kernel subagents interrupted by rate limits (`kernel-mm`/`hal`/`core`, `kernel-ps`, `kernel-compat`/`exec`/`ipc-runtime`) plus Phase 2 cleanup after Wave 1 `netd`/`vfsd`/`uiserver`/`runtimed` removals:
@@ -11,7 +79,7 @@ stable repository prefix; use [task router](task-router.md) for owner contracts.
   - Removed dead `kernel/ps` wrappers (`protect_for_process`, `move_for_process`, `EpollInterestSnapshot`, unused imports/re-exports; gated test-only `PagerFaultTable::reserve` and `mark_process_exiting` with `#[cfg(test)]`), kept `ConsoleHandle::token_is_live` and `set_commit_state_for_process` (`docs/ai/address-space-lifecycle-contract.md`), removed dead `let _ = boot_info;` in `kernel/executive/src/boot.rs`, and added early `AF_UNIX` (`EAFNOSUPPORT`) rejection in `kernel/compat/src/user/syscall/windows/net_socket.rs` `afd_create`.
   - Restored `memory::phys::tests::bounded_allocator_stays_under_limit` in `kernel/mm/src/memory/phys.rs` for `REQ-PFL-003`/`REQ-PFL-005` (`no-valid-free-run`), aligned `formal/contracts.toml`, `docs/ai/formal-contracts.generated.md`, `formal/smp-source-contracts.toml`, `formal/run-source-conformance.sh`, `formal/implementation-mutations.tsv`, `docs/ai/abi/ipc.md`, and `docs/validation/ring3-provider-custody-acceptance.md`.
 - **Verified (prior to this `session-handoff.md` append):** `cargo xtask check` (0), `cargo check --workspace --tests` (0 errors, 0 warnings), `cargo xtask build` (0), `cargo test --workspace --features rootd/host-test,procd/host-test` (all passed, 0 failed), `python3 formal/run-implementation-mutations.py --only ipc-reply-scheduling-custody-completion-return` (1/1 killed), `formal/verify-all.sh --profile pr` (rc=0, sealed 45 artifacts; `source-conformance` 1572 checks / 160 models), `cargo xtask kvm-smoke --timeout 120 --no-build --gui-dvm-surfaces --dvm-network-shmem` (rc=0, DVM authenticated L0 relay, `interactive-boot` trace conformance passed).
-- **Open / unverified:** `vfsd` `/sys/devices/system/cpu/{online,possible,present}` and `/proc/cpuinfo` still read `SYS_SCHED_GETAFFINITY` (affinity-restricted tasks see subset rather than hardware online CPUs); kernel-local `UnixSocketHandle` (`local_unix.rs`) does not charge sockets/buffers to process Job limits; multi-vCPU (`--rustos-vcpus 8`) gate, `--exercise-input`, `--exercise-network`, Chrome KVM launch, and `--profile nightly` were not run (re-seal with `formal/verify-all.sh --profile pr` / `cargo xtask verify` after this doc edit before push).
+- **Open / unverified:** `vfsd` `/sys/devices/system/cpu/{online,possible,present}` and `/proc/cpuinfo` still read `SYS_SCHED_GETAFFINITY` (affinity-restricted tasks see subset rather than hardware online CPUs); multi-vCPU (`--rustos-vcpus 8`) gate, `--exercise-input`, `--exercise-network`, Chrome KVM launch, and `--profile nightly` were not run (re-seal with `formal/verify-all.sh --profile pr` / `cargo xtask verify` after this doc edit before push).
 
 ## Ring3 bug-fix fleet + interactive Chrome exits (2026-11-24, uncommitted)
 
@@ -1949,3 +2017,29 @@ Pressure is back-pressure), `MAX_TASK` beyond 256 (needs 9-bit slot encodings).
   Heap is now RAM/4 clamped 64..1024 MiB (512 MiB at the 2 GiB default).
 - Open: a Chrome child faulted after `mm-broker-refused errno=110` (ETIMEDOUT) under
   heavy storaged DVM read streaming; run-to-run variable, not investigated.
+
+## Supervision chain must degrade, not cascade (rootd/initd)
+
+- rootd pressure pass runs on a dedicated thread (`services/rootd/src/pressure_gate.rs`,
+  32 KiB static stack, 20 ms cadence); the supervisor loop and loader-supervision
+  worker only publish a seqlock pid snapshot and run the pass inline while the
+  thread is absent (clone ENOSYS before procd / ENOMEM) or its beat is >1 s stale.
+  The thread holds no lease tables and no IPC; census lives on its stack.
+- initd exit no longer kills what it reported: rootd marks direct dependents
+  orphaned (fenced: reporter dead => no broker authority) with a 30 s adoption
+  grace (`ORPHAN_ADOPTION_GRACE_NS`); the replacement initd's lease query rebinds
+  the exact live lease, an unadopted one is reclaimed with its closure. A non-initd
+  reporter (sessiond) exit still revokes dependents immediately.
+- initd after startup: a lease query/reclaim that times out (ETIMEDOUT/EAGAIN/EBUSY/
+  ENOSPC/EINTR) backs off 100 ms..5 s per service and retries forever instead of
+  `fatal rootd post-init lease query failed`; a lease-report timeout withdraws that
+  one child and relaunches it without charging the crash budget. Startup-phase
+  deadlines and peer-death/identity errors stay fatal.
+- Unverified (needs a KVM run): clone of the pressure thread from rootd, that
+  initd's own Job exit does not take its children with it, victim selection for a
+  pid spawned during a loaderd stall (not yet in the published snapshot).
+- Model: `formal/post-init-supervisor-recovery` updated (orphan/fence/adopt);
+  TLC passed. Run `bash formal/run-tlc.sh post-init-supervisor-recovery/PostInitSupervisorRecovery`.
+
+## Chrome at 2048 MiB (memory account)
+Fork eager copies were the sink (VMA-less leaves); fixed. Orphan zombie address spaces and shortage grace added. See fork-cow and address-space-lifecycle contracts.

@@ -7,6 +7,9 @@ use super::*;
 /// Handles the syscalls owned by this table; `None` means "not mine".
 pub(super) fn dispatch(frame: &mut SyscallFrame) -> Option<u64> {
     Some(match frame.rax {
+        linux_abi::SYS_PTRACE => {
+            super::ptrace_refusal::syscall_linux_ptrace(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+        }
         linux_abi::SYS_FLOCK => super::file_lock_ops::syscall_linux_flock(frame.rdi, frame.rsi),
         linux_abi::SYS_PWRITE64 => {
             syscall_linux_vfs_pwrite64(frame.rdi, frame.rsi, frame.rdx, frame.r10)

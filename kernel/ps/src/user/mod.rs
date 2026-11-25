@@ -6,6 +6,7 @@ pub mod linux;
 pub mod local_wait;
 pub mod memfd;
 pub mod memlock;
+pub mod page_lease;
 pub mod pipe;
 pub mod process;
 pub mod process_state;

@@ -1,3 +1,6 @@
+//! Directory snapshot handle. No production code constructs it (remote
+//! directories are `RemoteVfsHandle`s whose entries stay in vfsd), so it is not
+//! Job-charged; a producer must bill the entry bytes through `PageLease` first.
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;

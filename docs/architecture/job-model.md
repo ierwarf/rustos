@@ -97,10 +97,11 @@ cannot alias a stale handle**)**. Its capacity is a limit of the root job
 is reserved (`reserve_spawn`) from a job handle that holds `CREATE_PROCESS`.
 The frame-descriptor ledger's root record carries its charge-group binding so a
 data-leaf claim finds its hierarchical charge target without taking the process
-table lock. The memory census combines the root's owned data-leaf count with an
-atomic, execution-pin-retained count of whole immutable backing pages. The
-latter stays visible after unmap while the root still retains those objects;
-these are resident admission costs, not Linux's mapped-only RSS. Census readers
+table lock. The memory census splits the root's data leaves into private
+(exclusively mapped, freed by a kill) and shared (fork aliases, file-backed
+COW) from two ledger counters, and reports separately an atomic,
+execution-pin-retained count of whole immutable backing pages. Only the private
+count is a victim score; the others are never freed by a kill. Census readers
 never inspect a mutable backing list or acquire a process-state lock.
 
 **Moniker.** The kernel stores no path. `rootd` keeps `moniker → JobId`.

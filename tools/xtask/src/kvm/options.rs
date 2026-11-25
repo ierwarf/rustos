@@ -631,12 +631,15 @@ fn run_one_smoke_unarchived(
         } else {
             let evidence = validate_oom_hog_log(&rustos_log)?;
             println!(
-                "xtask: OOM proof: rootd terminated the hog (pid {}, job {:?}, {} resident pages) at {} free pages, free memory recovered to {} pages, and no panic, stall, or relay failure was observed",
+                "xtask: OOM proof: rootd terminated the hog (pid {}, job {:?}, {} resident pages) at {} free pages, free memory recovered to {} pages (settled at {} pages), and no panic, stall, or relay failure was observed",
                 evidence.pid,
                 evidence.job,
                 evidence.resident_pages,
                 evidence.free_pages,
-                evidence.recovered_free_pages
+                evidence.recovered_free_pages,
+                evidence
+                    .settled_free_pages
+                    .map_or_else(|| String::from("not reported"), |pages| pages.to_string()),
             );
         }
     }

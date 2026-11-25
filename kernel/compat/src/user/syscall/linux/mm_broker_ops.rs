@@ -398,6 +398,44 @@ fn broker_map_anon(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64> {
     publish_map_result(args, t, &mapped)
 }
 
+/// Publishes VMAs over the resident private pages of a freshly spawned exec
+/// image (see `proc_broker_ops::exec_image_private_ranges`). Without them a
+/// `fork` of the new process could not share its data segments copy-on-write.
+/// Best effort: a range that cannot be published stays unpublished and is
+/// copied eagerly by `fork`, exactly as before.
+pub(in crate::user::syscall::linux) fn publish_exec_image_regions(
+    pid: u64,
+    ranges: &[(u64, u64, u64)],
+) {
+    for &(start, end, prot) in ranges {
+        let _ = pager_admission::publish_resident_private_region(pid, start, end, prot);
+    }
+}
+
+/// Publishes the VMA of an eagerly copied private file mapping. Returns whether
+/// a region now covers `[start, end)`; `false` leaves the range unpublished.
+fn admit_eager_private_file_region(t: MmTarget, start: u64, end: u64, prot: u64) -> bool {
+    use pager_admission::{AnonymousAdmission, EagerByContract};
+    let published = |admission| match admission {
+        AnonymousAdmission::Demand
+        | AnonymousAdmission::Eager(
+            EagerByContract::PagerControlGraph | EagerByContract::PolicyDisabled,
+        ) => Some(true),
+        AnonymousAdmission::Eager(EagerByContract::StaleRegionOverlap) => None,
+        AnonymousAdmission::Eager(EagerByContract::PagerTransportAbsent)
+        | AnonymousAdmission::Failed(_) => Some(false),
+    };
+    let first = pager_admission::admit_anonymous_region(t, start, end, prot);
+    match published(first) {
+        Some(done) => done,
+        None => {
+            // MAP_FIXED over a stale publication: withdraw and admit once more.
+            let _ = multitask::unmap_pager_vma_for_process(t.pid, Some(t.expected()), start, end);
+            published(pager_admission::admit_anonymous_region(t, start, end, prot)).unwrap_or(false)
+        }
+    }
+}
+
 fn broker_map_file_private(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(), i64> {
     let len = checked_len(args.len)?;
     let start = checked_page_addr(args.addr)?;
@@ -411,6 +449,16 @@ fn broker_map_file_private(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(),
     if let Some(result) = map_library_alias(args, t, start, len, mapping_end, &source)? {
         return publish_map_result(args, t, &result);
     }
+
+    // The eager copy below is a private, fully resident, writable-by-contract
+    // range exactly like an eagerly wired anonymous mapping, so it is published
+    // in the process VMA table the same way. Without a VMA a later `fork` could
+    // not share these pages copy-on-write (a COW write fault resolves only
+    // against a VMA) and had to copy every resident page into each child; that
+    // was ~70 MiB per Chrome zygote child. Publication is best effort: a
+    // process at its VMA ceiling or without a pager transport keeps the old
+    // unpublished eager mapping.
+    let vma_published = admit_eager_private_file_region(t, start, mapping_end, args.prot);
 
     let Some(map_result) =
         multitask::with_process_state_by_generation_mut(t.pid, t.process_generation, t.mm_generation, |process_state| {
@@ -428,9 +476,30 @@ fn broker_map_file_private(args: &RustosMmBrokerArgs, t: MmTarget) -> Result<(),
             })
         })
     else {
+        if vma_published {
+            let _ = multitask::unmap_pager_vma_for_process(
+                t.pid,
+                Some(t.expected()),
+                start,
+                mapping_end,
+            );
+        }
         return Err(LINUX_ESRCH);
     };
-    let map_result = map_result?;
+    let map_result = match map_result {
+        Ok(result) => result,
+        Err(errno) => {
+            if vma_published {
+                let _ = multitask::unmap_pager_vma_for_process(
+                    t.pid,
+                    Some(t.expected()),
+                    start,
+                    mapping_end,
+                );
+            }
+            return Err(errno);
+        }
+    };
 
     if let Err(errno) = copy_file_mapping(t, start, len, args.offset, &source) {
         let _ = broker_unmap(args, t);

@@ -335,7 +335,9 @@ fn build_memory_reply(
         *slot = RootdMemoryCensusEntry {
             process_id: entry.process_id,
             parent_process_id: entry.parent_process_id,
-            resident_pages: entry.resident_pages,
+            private_pages: entry.private_pages,
+            shared_pages: entry.shared_pages,
+            retained_pages: entry.retained_pages,
             job: entry.job,
         };
     }
@@ -514,7 +516,9 @@ mod tests {
             .map(|index| multitask::MemoryCensusEntry {
                 process_id: index as u64 + 1,
                 parent_process_id: 1,
-                resident_pages: 100 - index as u64,
+                private_pages: 100 - index as u64,
+                shared_pages: 7,
+                retained_pages: 9,
                 job: 1,
             })
             .collect();
@@ -531,7 +535,10 @@ mod tests {
         );
         assert_eq!(reply.entry_count as usize, ROOTD_MEMORY_CENSUS_MAX_ENTRIES);
         assert_eq!(reply.entries[0].process_id, 1);
-        assert_eq!(reply.entries[0].resident_pages, 100);
+        assert_eq!(
+            (reply.entries[0].private_pages, reply.entries[0].shared_pages, reply.entries[0].retained_pages),
+            (100, 7, 9)
+        );
         let short = build_memory_reply(&stats, &census[..2]);
         assert_eq!(short.entry_count, 2);
         assert_eq!(short.entries[2].process_id, 0);

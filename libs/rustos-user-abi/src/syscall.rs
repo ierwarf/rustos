@@ -262,6 +262,9 @@ pub const SYS_RUSTOS_PROC_FACTS_BROKER: u64 = 0x5255_0066;
 pub const PROC_FACTS_BROKER_ABI_VERSION: u16 = 1;
 pub const PROC_FACTS_OP_PROCESS: u16 = 1;
 pub const PROC_FACTS_OP_THREAD: u16 = 2;
+/// Hardware CPUs the kernel admitted (not the caller's affinity mask): an
+/// 8-byte little-endian bitmask. `pid` and `tid` must be zero.
+pub const PROC_FACTS_OP_ONLINE_CPUS: u16 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1512,7 +1515,7 @@ pub struct LifecyclePidProbeWire {
 /// process broker operation.
 pub const ROOTD_TERMINATE_BROKER_ABI_VERSION: u16 = 1;
 /// Root-supervisor memory census, versioned independently of termination.
-pub const ROOTD_MEMORY_BROKER_ABI_VERSION: u16 = 1;
+pub const ROOTD_MEMORY_BROKER_ABI_VERSION: u16 = 2;
 /// Fixed size of the census: the live processes with the largest resident sets.
 pub const ROOTD_MEMORY_CENSUS_MAX_ENTRIES: usize = 32;
 /// Job broker wire version, independent of every other broker.
@@ -3934,15 +3937,26 @@ pub struct RustosRootdTerminateBrokerArgs {
     pub target_pid: u64,
 }
 
-/// One process in the memory census. `resident_pages` is the count of mapped
-/// 4 KiB data leaves in its address space, shared copy-on-write aliases
-/// included; page-table frames are not counted.
+/// One process in the memory census, split like Linux's `MM_ANONPAGES` /
+/// `MM_FILEPAGES` / `MM_SHMEMPAGES` so a victim is ranked by what killing it
+/// returns. All counts are 4 KiB pages; page-table frames are not counted.
+///
+/// - `private_pages`: data leaves whose frame only this process maps
+///   (anonymous and private copy-on-write copies). A kill frees exactly these;
+///   it is the victim score.
+/// - `shared_pages`: mapped data leaves whose frame outlives this process
+///   (fork aliases that another process still maps, file-backed private COW
+///   frames). A kill frees none of them.
+/// - `retained_pages`: immutable backing (executable snapshot) pages this
+///   process retains, mapped or not. A kill frees none of them.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RootdMemoryCensusEntry {
     pub process_id: u64,
     pub parent_process_id: u64,
-    pub resident_pages: u64,
+    pub private_pages: u64,
+    pub shared_pages: u64,
+    pub retained_pages: u64,
     /// The job this process belongs to (`JOB_ID_ROOT` unless placed elsewhere).
     pub job: u64,
 }
@@ -4002,7 +4016,7 @@ pub struct RustosJobArgs {
 
 /// Request and reply of `SYS_RUSTOS_ROOTD_MEMORY_BROKER`. The caller sets
 /// `abi_version` and zeroes everything else; ring0 fills the rest in place.
-/// `entries[..entry_count]` are ordered by `resident_pages`, largest first.
+/// `entries[..entry_count]` are ordered by `private_pages`, largest first.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RustosRootdMemoryBrokerArgs {
@@ -4536,7 +4550,7 @@ crate::user_wire!(ProcFactsBrokerArgs { abi_version: u16, op: u16, flags: u32, p
 crate::user_wire!(LifecycleEventWire { event: u16, reserved0: u16, exit_status: i32, pid: u64, parent_pid: u64, tid: u64 });
 crate::user_wire!(LifecycleDrainBrokerArgs { abi_version: u16, mode: u16, reserved1: u32, out_events_ptr: u64, out_capacity: u32, reserved2: u32, out_count_ptr: u64 });
 crate::user_wire!(ServiceCheckpointRecordWire { version: u16, flags: u16, value_len: u32, key_hi: u64, key_lo: u64, parent_hi: u64, parent_lo: u64, operation_hi: u64, operation_lo: u64, revision: u64, value: [u8; SERVICE_CHECKPOINT_VALUE_CAPACITY] });
-crate::user_wire!(RootdMemoryCensusEntry { process_id: u64, parent_process_id: u64, resident_pages: u64, job: u64 });
+crate::user_wire!(RootdMemoryCensusEntry { process_id: u64, parent_process_id: u64, private_pages: u64, shared_pages: u64, retained_pages: u64, job: u64 });
 crate::user_wire!(RustosMmLayoutBrokerResult { brk_start: u64, brk_current: u64, brk_mapped_end: u64, mmap_next: u64, user_range_start: u64, user_range_end: u64 });
 crate::user_wire!(RustosMmFdBrokerResult { kind: u16, reserved0: u16, path_len: u32, rights: u64, len: u64, path: [u8; MM_BROKER_PATH_CAPACITY] });
 crate::user_wire!(RustosMmMapBrokerResult { addr: u64, len: u64 });

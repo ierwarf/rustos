@@ -238,3 +238,20 @@ requirements.
 - <https://www.kernel.org/doc/gorman/pdf/understand.pdf>
 - <https://fuchsia.googlesource.com/fuchsia/+/3bed753925d767cf624088dee2cb421080f439be/zircon/kernel/vm/vm_object_paged.cc>
 - <https://learn.microsoft.com/en-us/windows/win32/memory/memory-protection>
+
+## Frame exhaustion during the clone
+
+`OutOfFrames` from `clone_user_space_cow` (page-table frames, eager-copied
+non-COW leaves, charge or mapping-pool refusal) is retried by the fork broker
+outside every fork lock for at most 250 ms (5 ms steps, housekeeping kicked each
+step) before the fork reports `ENOMEM`. The terminal `linux-fork-stage` record
+(stage 1) carries the `AddressSpaceError` in the low byte of its detail and the
+free page count at refusal above it, so a refusal can be classified as real
+exhaustion versus a quota. Unsupported `CLONE_NEW*` flags are refused with
+`EINVAL` by the plan check before any frame is touched.
+
+## Fork sharing of file-private and image regions
+
+- `fork_shares_region_copy_on_write` shares private, committed ANONYMOUS, FILE_PRIVATE and IMAGE_SECTION regions; everything else is copied eagerly.
+- Regions without a pager VMA used to be copied eagerly on every fork (10-18k pages per Chrome fork). The eager `broker_map_file_private` fallback and the exec image now publish a VMA (`publish_resident_private_region`, `publish_exec_image_regions`).
+- `resolve_cow_write_under_mutation` accepts an `AnonymousFork` descriptor inside a `PrivateFileSection` VMA; the reverse stays refused.

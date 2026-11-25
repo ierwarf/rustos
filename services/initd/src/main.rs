@@ -388,6 +388,20 @@ fn main() {
                     }
                     pending_activations.push(pid);
                     if let Err(err) = report_rootd_service_lease(entry.exec.as_str(), pid, entry_deadline) {
+                        if entry_deadline.is_none()
+                            && lease_reconciliation::is_slow_peer_errno(err)
+                        {
+                            // rootd is slow, not gone. initd stays up; this
+                            // unreported child is withdrawn (it holds no
+                            // authority without a lease) and relaunched after
+                            // a backoff that does not spend the crash budget.
+                            boot_line(&format!(
+                                "initd: rootd lease report timed out exec={} pid={pid} errno={err} degraded=1 action=withdraw-and-retry",
+                                entry.exec
+                            ));
+                            withdraw_unreported_child(pid, entry.exec.as_str(), &mut running, &mut retry_state, &mut pending_activations, &mut spawned_packages);
+                            continue;
+                        }
                         if entry_deadline.is_some() {
                             fail_closed_after_children_cleanup(&pending_activations, &format!("initd: fatal startup failure v=1 phase=lease-report exec={} pid={pid} errno={err}", entry.exec));
                         }
@@ -1100,6 +1114,48 @@ fn record_launch_failure(
         state.failures,
         INITD_LAUNCH_MAX_FAILURES
     );
+}
+
+/// Withdraws a child whose lease could not be reported because rootd was slow.
+/// The child is killed (exact pid) and forgotten; the relaunch is deferred by
+/// the ordinary retry backoff WITHOUT charging the crash-loop budget, because
+/// nothing about the service itself failed. A kill that is refused for any
+/// reason other than "already gone" is still fatal: an untracked live child
+/// would be worse than exiting.
+fn withdraw_unreported_child(
+    pid: i32,
+    exec: &str,
+    running: &mut BTreeMap<i32, RunningService>,
+    retry_state: &mut BTreeMap<String, RetryState>,
+    pending_activations: &mut Vec<i32>,
+    spawned_packages: &mut BTreeSet<String>,
+) {
+    if let Err(errno) = cleanup_spawned_service(pid, terminate_spawned_service) {
+        fail_closed(&format!(
+            "initd: fatal withdraw of unreported child failed exec={exec} pid={pid} errno={errno}"
+        ));
+    }
+    if let Some(service) = running.remove(&pid) {
+        spawned_packages.remove(&service.package_id);
+    }
+    pending_activations.retain(|&pending| pending != pid);
+    defer_launch_without_charge(retry_state, exec, Instant::now());
+}
+
+/// Pushes the next launch attempt out by the retry backoff; `failures` is left
+/// untouched so a slow supervisor peer can never exhaust a service's budget.
+fn defer_launch_without_charge(
+    retry_state: &mut BTreeMap<String, RetryState>,
+    exec: &str,
+    now: Instant,
+) {
+    let state = retry_state.entry(exec.to_string()).or_insert_with(|| RetryState {
+        next_attempt: now,
+        failures: 0,
+        spawned_at: None,
+    });
+    state.next_attempt = now + RETRY_BACKOFF;
+    state.spawned_at = None;
 }
 
 fn fail_closed(message: &str) -> ! {

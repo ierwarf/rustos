@@ -2,7 +2,7 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `7fe29ebd6197d2e9f2faa402b2d6825056dc626903d836137aff31bcea7c693a`
+- Registry SHA-256: `f83409f0dd97f0ad9dfe9bfb886be2c6f24a2507cb22d276a674d2a8dbc73a67`
 - Models: `160`
 - Whole flows: `84`
 - Transitions: `1030`
@@ -15,7 +15,7 @@
 - Cyclic strongly connected components: `59`
 - Supporting model bindings: `138`
 - Explicit critical/high risk surfaces: `265`
-- Additional source mappings: `407`
+- Additional source mappings: `408`
 
 | Flow | Severity | Owners | Models | Requirements | Hazards | Sinks |
 | --- | --- | --- | --- | ---: | ---: | --- |

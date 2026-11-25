@@ -731,6 +731,39 @@ fn kobject_uevent_socket_admission_bind_options_recv_poll_and_teardown() {
     assert_eq!(get_opt_i32(SOL_NETLINK, NETLINK_NO_ENOBUFS), 1);
     assert_eq!(set_opt_i32(SOL_NETLINK, 99, 1, 1000), libc::ENOPROTOOPT);
 
+    // libudev's SO_ATTACH_FILTER (struct sock_fprog) before bind: accepted on a
+    // uevent monitor, which can never receive an event; malformed programs fail.
+    let filter_opt = |option: u64, len: u16, payload_len: u32| {
+        let mut req = NetdIpcRequest {
+            socket_token: uevent_tok,
+            arg1: linux_abi::SOL_SOCKET,
+            arg2: option,
+            payload_len,
+            ..NetdIpcRequest::default()
+        };
+        req.payload[..2].copy_from_slice(&len.to_ne_bytes());
+        super::handle_setsockopt(&req)
+    };
+    assert_eq!(filter_opt(27, 0, 4), libc::ENOENT, "nothing attached yet");
+    assert_eq!(filter_opt(26, 0, 16), libc::EINVAL);
+    assert_eq!(filter_opt(26, 4097, 16), libc::EINVAL);
+    assert_eq!(filter_opt(26, 4, 8), libc::EINVAL, "short sock_fprog");
+    assert_eq!(filter_opt(26, 4, 16), 0);
+    assert_eq!(filter_opt(27, 0, 4), 0);
+    assert_eq!(filter_opt(27, 0, 4), libc::ENOENT);
+    {
+        // A family that delivers messages cannot ignore a filter.
+        let mut req = NetdIpcRequest {
+            socket_token: route_tok,
+            arg1: linux_abi::SOL_SOCKET,
+            arg2: 26,
+            payload_len: 16,
+            ..NetdIpcRequest::default()
+        };
+        req.payload[..2].copy_from_slice(&4_u16.to_ne_bytes());
+        assert_eq!(super::handle_setsockopt(&req), libc::EOPNOTSUPP);
+    }
+
     // Proper teardown removes socket, readiness state, and returns token.
     let mut state = lock_net_state();
     state.socket_readiness_generation(uevent_tok);

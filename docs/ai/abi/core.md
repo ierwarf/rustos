@@ -276,13 +276,19 @@ threads, marks the process exiting, revokes its endpoints, clears loader
 broker state, records one fixed SIGKILL lifecycle exit, and signals its parent.
 It is teardown substrate, not a generic kill syscall or a kernel restart
 policy table.
-`SYS_RUSTOS_ROOTD_MEMORY_BROKER` (ABI v1, also root-supervisor-only) is its
-read-only counterpart for memory pressure: one in-place struct returns usable,
-free and kernel-reserve pages, the monotonic watermark-denial count, and up to
-32 live processes ordered by resident data-leaf count. Ring0 neither retains
-pressure state nor chooses a victim; rootd's `memory_governor` does, then
-terminates through the call above. Each census entry also carries the process's
-`job`.
+`SYS_RUSTOS_ROOTD_MEMORY_BROKER` (ABI v2, also root-supervisor-only) is its
+read-only counterpart for memory pressure: one in-place struct
+(`48 + 32 * 48` bytes) returns usable, free and kernel-reserve pages, the
+monotonic watermark-denial count, and up to 32 live processes ordered by
+`private_pages` (data leaves only this process maps, which a kill frees).
+Each 48-byte `RootdMemoryCensusEntry` is `process_id`, `parent_process_id`,
+`private_pages`, `shared_pages` (mapped leaves that outlive the process: fork
+aliases another process still maps, file-backed private COW),
+`retained_pages` (immutable executable-snapshot backing) and `job`. Only
+`private_pages` is a victim score. v1 (one `resident_pages` field of 32 bytes)
+was withdrawn because it charged shared and retained pages that no kill frees.
+Ring0 neither retains pressure state nor chooses a victim; rootd's
+`memory_governor` does, then terminates through the call above.
 `SYS_RUSTOS_JOB` (`0x5255_0057`, ABI v4) operates the kernel job tree
 through one in-place `RustosJobArgs` and an exact typed Job descriptor with
 operation-specific rights: `GET_INFO`,
@@ -437,9 +443,13 @@ not extension points and must continue to return `ENOSYS`.
   `SharedMemfdMapping::page_flags` across split ranges.
 - `SYS_RUSTOS_PROC_FACTS_BROKER` (`0x5255_0066`, ABI v1, `VfsPolicy`-only):
   bounded pull of kernel-attested raw `/proc/<pid>` facts (`PROC_FACTS_OP_*`
-  `PROCESS`=1, `THREAD`=2, `FD_LIST`=3, `TID_LIST`=4, `LIMITS`=5) so `vfsd`
+  `PROCESS`=1, `THREAD`=2, `ONLINE_CPUS`=3: pid/tid zero, 8-byte LE mask of hardware CPUs admitted by the kernel, independent of any affinity) so `vfsd`
   formats `/proc/<pid>/*` ASCII nodes in Ring3; writable `/proc` nodes (`comm`,
   `task/<tid>/comm`, `oom_score_adj`) route through `proc_identity::write_snapshot`.
+- `ptrace(2)` (101) is an honest refusal (`linux/ptrace_refusal.rs`): no tracer
+  relation exists, so `TRACEME` is `EPERM`, `ATTACH`/`SEIZE` are `EPERM` (or
+  `ESRCH` for a nonexistent pid), and every other request, known or not, is
+  `ESRCH` (the target is never the caller's tracee). Never `ENOSYS`.
 - Local fd identity: `fstat`/`statx` of pipes (`S_IFIFO|0600`, both ends one
   inode), sockets (`S_IFSOCK|0777`), memfd (`S_IFREG|0777`, live size), eventfd/
   epoll (`S_IFREG|0600`) report `st_ino` = object identity (dup shares it) and a

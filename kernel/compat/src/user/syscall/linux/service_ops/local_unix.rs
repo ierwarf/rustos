@@ -44,6 +44,7 @@ use super::vfs_meta::{
 use super::*;
 
 const LINUX_ENFILE: i64 = 23;
+const LINUX_ENOBUFS: i64 = 105;
 const LINUX_ENAMETOOLONG: i64 = 36;
 const LINUX_EDESTADDRREQ: i64 = 89;
 const LINUX_ENOPROTOOPT: i64 = 92;
@@ -102,7 +103,7 @@ fn publish_wake(wake: Option<LocalWake>) {
 
 fn unix_error_errno(err: UnixSocketError) -> i64 {
     match err {
-        UnixSocketError::WouldBlock { .. } => LINUX_EAGAIN,
+        UnixSocketError::WouldBlock { .. } | UnixSocketError::PeerWouldBlock { .. } => LINUX_EAGAIN,
         UnixSocketError::BrokenPipe => LINUX_EPIPE,
         UnixSocketError::ConnectionRefused => LINUX_ECONNREFUSED,
         UnixSocketError::ConnectionReset => LINUX_ECONNRESET,
@@ -115,6 +116,7 @@ fn unix_error_errno(err: UnixSocketError) -> i64 {
         UnixSocketError::MessageTooLong => LINUX_EMSGSIZE,
         UnixSocketError::TooManyObjects => LINUX_ENFILE,
         UnixSocketError::NoMemory => LINUX_ENOMEM,
+        UnixSocketError::NoBufferSpace => LINUX_ENOBUFS,
         UnixSocketError::DestinationRequired => LINUX_EDESTADDRREQ,
     }
 }
@@ -338,7 +340,12 @@ pub(in crate::user::syscall::linux) fn syscall_linux_unix_socket(
     linux_result((|| {
         let (sock_type, nonblocking, cloexec) =
             parse_socket_type_and_flags(type_and_flags, protocol)?;
-        let sock = UnixSocketHandle::new(sock_type, nonblocking, current_credentials())
+        let sock = UnixSocketHandle::new(
+            sock_type,
+            nonblocking,
+            current_credentials(),
+            multitask::current_user_job_charge_group(),
+        )
             .map_err(unix_error_errno)?;
         install_single_unix_socket(sock, cloexec)
     })())
@@ -354,7 +361,12 @@ pub(in crate::user::syscall::linux) fn syscall_linux_unix_socketpair(
             parse_socket_type_and_flags(type_and_flags, protocol)?;
         validate_user_write(sv_ptr, 2 * size_of::<i32>())?;
         let (first, second) =
-            UnixSocketHandle::new_pair(sock_type, nonblocking, current_credentials())
+            UnixSocketHandle::new_pair(
+            sock_type,
+            nonblocking,
+            current_credentials(),
+            multitask::current_user_job_charge_group(),
+        )
                 .map_err(unix_error_errno)?;
         let fd_flags = if cloexec { multitask::FD_CLOEXEC } else { 0 };
         let e0 = multitask::HandleEntry::new(
@@ -471,7 +483,8 @@ pub(in crate::user::syscall::linux) fn try_accept4(
         let deadline = deadline_tick_from_us(sock.0.rcvtimeo_us());
         loop {
             match sock.0.try_accept(child_nonblock) {
-                Ok((accepted, peer_addr)) => {
+                Ok((accepted, peer_addr, wake)) => {
+                    publish_wake(Some(wake));
                     if addr_ptr != 0 {
                         let encoded = encode_unix_addr(&peer_addr);
                         if let Err(errno) = write_sockaddr_payload_with_mode(
@@ -519,12 +532,23 @@ pub(in crate::user::syscall::linux) fn try_connect(
                 UnixNamespaceKey::Inode { mount_id, node_id }
             }
         };
-        let wake = sock
-            .0
-            .connect(&key, current_credentials())
-            .map_err(unix_error_errno)?;
-        publish_wake(wake);
-        Ok(())
+        // Linux: a full listener backlog blocks a blocking connector until
+        // the listener accepts, a signal, SO_SNDTIMEO (EAGAIN) or listener
+        // close (ECONNREFUSED); O_NONBLOCK gets EAGAIN. Each attempt is
+        // all-or-nothing, so a retry never holds a Job charge while asleep.
+        let deadline = deadline_tick_from_us(sock.0.sndtimeo_us());
+        loop {
+            match sock.0.connect(&key, current_credentials()) {
+                Ok(wake) => {
+                    publish_wake(wake);
+                    return Ok(());
+                }
+                Err(UnixSocketError::PeerWouldBlock { token, generation }) => {
+                    wait_local_wouldblock(token, generation, sock.0.nonblocking(), deadline)?;
+                }
+                Err(err) => return Err(unix_error_errno(err)),
+            }
+        }
     })()))
 }
 
@@ -1058,6 +1082,15 @@ fn send_core_bytes(
                     return Err(errno);
                 }
             }
+            Err((UnixSocketError::PeerWouldBlock { token, generation }, returned_rights)) => {
+                rights.0 = returned_rights;
+                if let Err(errno) = wait_local_wouldblock(token, generation, nonblocking, deadline) {
+                    if sent > 0 {
+                        return Ok(sent);
+                    }
+                    return Err(errno);
+                }
+            }
             Err((UnixSocketError::BrokenPipe, returned_rights)) => {
                 rights.0 = returned_rights;
                 if sent > 0 {
@@ -1318,6 +1351,15 @@ pub(in crate::user::syscall::linux) fn try_recvmsg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonblocking_connect_to_full_backlog_is_eagain() {
+        // The listener-full condition reaches the syscall layer as
+        // `PeerWouldBlock`, which maps to EAGAIN for O_NONBLOCK (no sleep).
+        let full = UnixSocketError::PeerWouldBlock { token: 1, generation: 1 };
+        assert_eq!(unix_error_errno(full), LINUX_EAGAIN);
+        assert_eq!(wait_local_wouldblock(1, 1, true, None), Err(LINUX_EAGAIN));
+    }
 
     #[test]
     fn parse_socket_type_and_flags_rejects_unknown_flags_and_types() {

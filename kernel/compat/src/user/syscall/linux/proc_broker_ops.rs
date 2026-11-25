@@ -797,6 +797,14 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         };
         let spawned = spawn_fn(prepared, args.weight_micros, scheduling_policy)
             .map_err(process_load_error_to_linux_errno)?;
+        if state.format == PROC_BROKER_FORMAT_ELF64 {
+            // Best effort: the resident private image pages become ordinary
+            // VMAs so a later `fork` shares them copy-on-write.
+            super::mm_broker_ops::publish_exec_image_regions(
+                spawned.pid,
+                &exec_image_private_ranges(&state.mappings),
+            );
+        }
         if args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0 {
             register_deferred_activation(
                 args.requester_pid,
@@ -1203,6 +1211,14 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         }
         match exec_outcome {
             Ok(closed_handles) => {
+                // The exec'd thread cannot resume until this call returns, so
+                // the new image's VMAs exist before it can touch or fork them.
+                if state.format == PROC_BROKER_FORMAT_ELF64 {
+                    super::mm_broker_ops::publish_exec_image_regions(
+                        args.target_pid,
+                        &exec_image_private_ranges(&state.mappings),
+                    );
+                }
                 offload_ops::record_process_exec(args.target_pid);
                 // The process-table commit has already removed CLOEXEC descriptors.
                 // Derive cleanup from the exact handles retired by that commit, never
@@ -1594,6 +1610,43 @@ fn initial_elf_mappings(
             }),
         ].into_iter().flatten()
     }).collect()
+}
+
+/// `(start, end, linux prot)` of every exec-image range that
+/// `address_space_from_mappings` made private and resident, in image order:
+/// writable segments, bss and any file prefix that could not be aliased to the
+/// immutable snapshot. Immutable aliases are tracked by the address space itself
+/// and are not listed.
+fn exec_image_private_ranges(mappings: &[Box<MappingEntry>]) -> Vec<(u64, u64, u64)> {
+    let prot_of = |flags: u64| {
+        (if flags & PROC_BROKER_MAP_READ != 0 { linux_abi::PROT_READ } else { 0 })
+            | (if flags & PROC_BROKER_MAP_WRITE != 0 { linux_abi::PROT_WRITE } else { 0 })
+            | (if flags & PROC_BROKER_MAP_EXEC != 0 { linux_abi::PROT_EXEC } else { 0 })
+    };
+    let mut ranges = Vec::new();
+    for mapping in mappings {
+        let (start, len, flags) = match mapping.as_ref() {
+            MappingEntry::Zeroed { target_addr, mem_len, flags }
+            | MappingEntry::Data { target_addr, mem_len, flags, .. } => (*target_addr, *mem_len, *flags),
+            MappingEntry::File { backing, file_offset, file_len, target_addr, mem_len, flags } => {
+                let shared = if executable_snapshot_is_immutable(backing) {
+                    immutable_file_prefix(*file_offset, *file_len, *flags, backing.len() as u64)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                (target_addr + shared, mem_len.saturating_sub(shared), *flags)
+            }
+        };
+        let Some(end) = start.checked_add(len) else { continue };
+        if len != 0 && start.is_multiple_of(PAGE_SIZE) && end.is_multiple_of(PAGE_SIZE) {
+            if ranges.try_reserve(1).is_err() {
+                break;
+            }
+            ranges.push((start, end, prot_of(flags)));
+        }
+    }
+    ranges
 }
 
 fn address_space_from_mappings(

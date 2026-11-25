@@ -69,8 +69,46 @@ pub(super) const NETLINK_DROP_MEMBERSHIP: u64 = 2;
 pub(super) const NETLINK_NO_ENOBUFS: u64 = 5;
 pub(super) const NETLINK_LIST_MEMBERSHIPS: u64 = 9;
 
+/// Netlink protocol families netd implements. Every other protocol number is
+/// refused at socket creation with `EPROTONOSUPPORT`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NetlinkFamily {
+    /// `NETLINK_ROUTE`: rtnetlink dumps and interface change notifications.
+    Route,
+    /// `NETLINK_KOBJECT_UEVENT`: monitor-only; netd has no hotplug source, so
+    /// it never receives events and accepts no requests.
+    KobjectUevent,
+}
+
+impl NetlinkFamily {
+    pub(super) const fn from_protocol(protocol: u64) -> Option<Self> {
+        match protocol {
+            NETLINK_ROUTE => Some(Self::Route),
+            NETLINK_KOBJECT_UEVENT => Some(Self::KobjectUevent),
+            _ => None,
+        }
+    }
+
+    pub(super) const fn protocol(self) -> u64 {
+        match self {
+            Self::Route => NETLINK_ROUTE,
+            Self::KobjectUevent => NETLINK_KOBJECT_UEVENT,
+        }
+    }
+
+    /// Whether requests sent on the socket are answered by netd.
+    const fn answers_requests(self) -> bool {
+        matches!(self, Self::Route)
+    }
+
+    /// Whether the family can ever queue a message for a group member.
+    const fn has_event_source(self) -> bool {
+        matches!(self, Self::Route)
+    }
+}
+
 pub(super) const fn is_supported_protocol(protocol: u64) -> bool {
-    matches!(protocol, NETLINK_ROUTE | NETLINK_KOBJECT_UEVENT)
+    NetlinkFamily::from_protocol(protocol).is_some()
 }
 
 pub(super) const RTA_DST: u16 = 1;
@@ -521,8 +559,10 @@ pub(super) fn process_request_snapshot(
 #[derive(Debug)]
 pub(super) struct NetlinkState {
     sock_type: u64,
-    protocol: u64,
+    family: NetlinkFamily,
     portid: u32,
+    /// A classic-BPF receive filter was attached (uevent monitors only).
+    filter_attached: bool,
     groups: u32,
     no_enobufs: bool,
     rx: VecDeque<Vec<u8>>,
@@ -535,8 +575,10 @@ impl NetlinkState {
     pub(super) fn new(sock_type: u64, protocol: u64) -> Self {
         Self {
             sock_type,
-            protocol,
+            family: NetlinkFamily::from_protocol(protocol)
+                .expect("netlink protocol is validated at socket admission"),
             portid: 0,
+            filter_attached: false,
             groups: 0,
             no_enobufs: false,
             rx: VecDeque::new(),
@@ -550,7 +592,11 @@ impl NetlinkState {
     }
 
     pub(super) fn protocol(&self) -> u64 {
-        self.protocol
+        self.family.protocol()
+    }
+
+    pub(super) fn family(&self) -> NetlinkFamily {
+        self.family
     }
 
     pub(super) fn readable(&self) -> bool {
@@ -620,16 +666,16 @@ pub(super) fn sockaddr_nl_bytes(pid: u32, groups: u32) -> [u8; SOCKADDR_NL_LEN] 
     bytes
 }
 
-fn portid_in_use(state: &NetState, protocol: u64, portid: u32) -> bool {
+fn portid_in_use(state: &NetState, protocol: NetlinkFamily, portid: u32) -> bool {
     state
         .netlink_sockets
         .values()
-        .any(|socket| socket.state.protocol == protocol && socket.state.portid == portid)
+        .any(|socket| socket.state.family == protocol && socket.state.portid == portid)
 }
 
 /// Linux uses the process id when free, otherwise a unique generated id
 /// (negative as `i32`, i.e. high bit set).
-fn allocate_portid(state: &NetState, protocol: u64, preferred: u32) -> u32 {
+fn allocate_portid(state: &NetState, protocol: NetlinkFamily, preferred: u32) -> u32 {
     if preferred != 0 && !portid_in_use(state, protocol, preferred) {
         return preferred;
     }
@@ -664,7 +710,7 @@ pub(super) fn handle_bind(request: &NetdIpcRequest) -> i32 {
         return libc::EBADF;
     };
     let current = socket.state.portid;
-    let protocol = socket.state.protocol;
+    let protocol = socket.state.family;
     if current != 0 && requested_pid != 0 && requested_pid != current {
         // An already bound netlink socket cannot move to another port id.
         return libc::EINVAL;
@@ -875,7 +921,7 @@ pub(super) fn diff_events(old: &InterfaceSnapshot, new: &InterfaceSnapshot) -> V
 /// Whether any `NETLINK_ROUTE` socket is subscribed to a group netd generates.
 fn has_observed_members(state: &NetState) -> bool {
     state.netlink_sockets.values().any(|socket| {
-        socket.state.protocol == NETLINK_ROUTE
+        socket.state.family == NetlinkFamily::Route
             && socket.state.groups
                 & (RTMGRP_LINK
                     | RTMGRP_IPV4_IFADDR
@@ -908,7 +954,7 @@ pub(super) fn apply_interface_snapshot(state: &mut NetState, current: InterfaceS
             .netlink_sockets
             .iter()
             .filter_map(|(token, socket)| {
-                (socket.state.protocol == NETLINK_ROUTE && socket.state.groups & group != 0)
+                (socket.state.family == NetlinkFamily::Route && socket.state.groups & group != 0)
                     .then_some(*token)
             })
             .collect();
@@ -927,7 +973,7 @@ pub(super) fn refresh_for_member(state: &mut NetState, token: u64) {
     let member = state
         .netlink_sockets
         .get(&token)
-        .is_some_and(|socket| socket.state.protocol == NETLINK_ROUTE && socket.state.groups != 0);
+        .is_some_and(|socket| socket.state.family == NetlinkFamily::Route && socket.state.groups != 0);
     if member {
         publish_interface_changes(state);
     }
@@ -939,7 +985,7 @@ pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
     let Some(protocol) = state
         .netlink_sockets
         .get(&request.socket_token)
-        .map(|socket| socket.state.protocol)
+        .map(|socket| socket.state.family)
     else {
         return if state.socket_exists(request.socket_token) {
             libc::ENOPROTOOPT
@@ -970,7 +1016,7 @@ pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
     if group == 0 || group > NETLINK_GROUP_NUMBER_MAX {
         return libc::EINVAL;
     }
-    if protocol == NETLINK_ROUTE {
+    if protocol.has_event_source() {
         publish_interface_changes(&mut state);
     }
     let bit = 1_u32 << (group - 1);
@@ -981,11 +1027,54 @@ pub(super) fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
             socket.state.groups &= !bit;
         }
     }
-    if protocol == NETLINK_ROUTE {
+    if protocol.has_event_source() {
         // Re-baseline for the new member set (a first member records its baseline).
         publish_interface_changes(&mut state);
     }
     0
+}
+
+/// `BPF_MAXINSNS`: the longest classic-BPF program `SO_ATTACH_FILTER` accepts.
+const BPF_MAXINSNS: u16 = 4096;
+
+/// `setsockopt(SOL_SOCKET, SO_ATTACH_FILTER / SO_DETACH_FILTER)`.
+///
+/// libudev attaches a subsystem/devtype filter to its monitor socket before
+/// `bind`. A `NETLINK_KOBJECT_UEVENT` socket has no event source, so no filter
+/// can change what it receives (nothing); the program shape (`struct
+/// sock_fprog`) is validated and its presence recorded for `SO_DETACH_FILTER`.
+/// The program is not interpreted. Families that do deliver messages would
+/// need real filtering, so they refuse rather than ignore the filter.
+pub(super) fn handle_socket_filter(state: &mut NetState, request: &NetdIpcRequest) -> i32 {
+    use super::socket_info::{SO_ATTACH_FILTER, SO_DETACH_FILTER};
+    let Some(socket) = state.netlink_sockets.get_mut(&request.socket_token) else {
+        return libc::EBADF;
+    };
+    if socket.state.family.has_event_source() {
+        return libc::EOPNOTSUPP;
+    }
+    match request.arg2 {
+        SO_ATTACH_FILTER => {
+            // struct sock_fprog { u16 len; <pad>; struct sock_filter *filter; }
+            if (request.payload_len as usize) < 16 {
+                return libc::EINVAL;
+            }
+            let len = rd_u16(&request.payload, 0);
+            if len == 0 || len > BPF_MAXINSNS {
+                return libc::EINVAL;
+            }
+            socket.state.filter_attached = true;
+            0
+        }
+        SO_DETACH_FILTER => {
+            if core::mem::take(&mut socket.state.filter_attached) {
+                0
+            } else {
+                libc::ENOENT
+            }
+        }
+        _ => libc::ENOPROTOOPT,
+    }
 }
 
 /// `getsockopt(SOL_NETLINK, ...)`: group bit mask and `NETLINK_NO_ENOBUFS`.
@@ -1027,10 +1116,10 @@ pub(super) fn send_message(
         return Err(libc::EMSGSIZE);
     }
     let (protocol, needs_portid) = match state.netlink_sockets.get(&request.socket_token) {
-        Some(socket) => (socket.state.protocol, socket.state.portid == 0),
+        Some(socket) => (socket.state.family, socket.state.portid == 0),
         None => return Err(libc::EBADF),
     };
-    if protocol != NETLINK_ROUTE {
+    if !protocol.answers_requests() {
         return Err(libc::ECONNREFUSED);
     }
     let snapshot = current_interfaces(state);

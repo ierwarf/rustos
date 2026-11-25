@@ -690,6 +690,16 @@ fn release_mm_borrower_ref(owner_handle: ProcessHandle) {
 }
 
 fn reclaim_slot(table: &mut ProcessTable, index: usize) -> Option<Box<ProcessObject>> {
+    // A child whose parent is gone (or already exiting) can never be waited
+    // for. Holding its object until then would pin the whole address space of
+    // every orphan, so an OOM kill of a job (parent and children together)
+    // would free nothing.
+    let parent_gone = match table.slots.get(index)?.object.as_deref()?.parent_process_id {
+        None => true,
+        Some(parent) => table
+            .find_pid_slot(parent, |o| !o.exiting && o.thread_count != 0)
+            .is_none(),
+    };
     let old_gen = {
         let slot = table.slots.get_mut(index)?;
         let object = slot.object.as_mut()?;
@@ -697,10 +707,10 @@ fn reclaim_slot(table: &mut ProcessTable, index: usize) -> Option<Box<ProcessObj
             object.queued_for_reap = false;
             return None;
         }
-        // A child with a parent cannot be reclaimed before `wait_for_child` consumes
-        // it, even in the window after its last thread detaches and before the
-        // terminator publishes `exit_status`.
-        if !object.waited {
+        // A child with a live parent cannot be reclaimed before `wait_for_child`
+        // consumes it, even in the window after its last thread detaches and
+        // before the terminator publishes `exit_status`.
+        if !object.waited && !parent_gone {
             object.queued_for_reap = false;
             return None;
         }
@@ -833,6 +843,11 @@ pub fn detach_task(handle: ProcessHandle) -> Option<()> {
     if should_queue {
         table.push_reap_handle(handle);
     }
+    if exited_pid.is_some() {
+        // Its children are now orphans that nothing will wait for.
+        table.reap_scan_pending = true;
+        super::kick_housekeeping();
+    }
     drop(table);
     if let Some(pid) = exited_pid {
         super::vfork_wait::complete_vfork(pid);
@@ -859,18 +874,26 @@ pub fn parent_process_id_of(process_id: u64) -> Option<u64> {
 pub struct MemoryCensusEntry {
     pub process_id: u64,
     pub parent_process_id: u64,
-    /// Mapped data leaves in the address space, shared aliases included.
-    pub resident_pages: u64,
+    /// Data leaves whose frames only this process maps (anonymous, and
+    /// private-COW copies): what killing it returns. The victim score.
+    pub private_pages: u64,
+    /// Mapped data leaves whose frames outlive this process: fork-COW aliases
+    /// with another mapper and file-backed private COW frames (`RssFile`/
+    /// `RssShmem` analogues). Never freed by a kill.
+    pub shared_pages: u64,
+    /// Whole immutable backing pages (executable snapshots) this process still
+    /// retains, mapped or not. Held by their provider; never freed by a kill.
+    pub retained_pages: u64,
     /// Raw `JobId` of the process's job.
     pub job: u64,
 }
 
-/// Inserts `entry` into `out[..len]`, kept ordered by `resident_pages`
+/// Inserts `entry` into `out[..len]`, kept ordered by `private_pages`
 /// (largest first, then larger `process_id`), dropping the smallest when full.
 /// Returns the new length.
 fn insert_largest(out: &mut [MemoryCensusEntry], len: usize, entry: MemoryCensusEntry) -> usize {
     let outranks = |a: &MemoryCensusEntry, b: &MemoryCensusEntry| {
-        (a.resident_pages, a.process_id) > (b.resident_pages, b.process_id)
+        (a.private_pages, a.process_id) > (b.private_pages, b.process_id)
     };
     let mut at = len;
     while at > 0 && outranks(&entry, &out[at - 1]) {
@@ -889,14 +912,15 @@ fn insert_largest(out: &mut [MemoryCensusEntry], len: usize, entry: MemoryCensus
     new_len
 }
 
-/// Fills `out` with live, non-exiting processes retaining the most resident
-/// memory, largest first, and returns how many entries were written.
+/// Fills `out` with live, non-exiting processes whose death would free the most
+/// memory, largest `private_pages` first, and returns how many entries were
+/// written.
 ///
-/// This allocates nothing and reads each resident count from the frame
-/// descriptor ledger and pinned-root backing counter without taking any
-/// process-state lock, so it may run while a process is faulting, exiting, or
-/// being retired. Counts include whole immutable objects still retained after
-/// unmap, matching resident admission rather than Linux's mapped-only RSS.
+/// This allocates nothing and reads each count from the frame descriptor ledger
+/// and pinned-root backing counter without taking any process-state lock, so it
+/// may run while a process is faulting, exiting, or being retired. Like Linux
+/// `oom_badness()` it ranks by memory the victim alone holds and reports the
+/// shared and retained parts beside it instead of in the score.
 pub fn memory_census(out: &mut [MemoryCensusEntry]) -> usize {
     let table = PROCESS_TABLE.lock();
     let mut len = 0;
@@ -907,20 +931,62 @@ pub fn memory_census(out: &mut [MemoryCensusEntry]) -> usize {
         if object.exiting || object.exit_pending {
             continue;
         }
-        let resident_pages = kernel_mm::api::phys::data_leaf_count(object.mm_execution.root_phys())
-            .unwrap_or(0).saturating_add(object.mm_execution.retained_backing_pages());
+        let leaves = kernel_mm::api::phys::data_leaf_census(object.mm_execution.root_phys())
+            .unwrap_or_default();
         len = insert_largest(
             out,
             len,
             MemoryCensusEntry {
                 process_id: object.process_id,
                 parent_process_id: object.parent_process_id.unwrap_or(0),
-                resident_pages,
+                private_pages: leaves.private(),
+                shared_pages: leaves.shared,
+                retained_pages: object.mm_execution.retained_backing_pages(),
                 job: object.job.to_raw(),
             },
         );
     }
     len
+}
+
+/// Whole-table totals of a memory census, for diagnostics only.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MemoryAccount {
+    pub processes: u64,
+    pub private_pages: u64,
+    pub shared_pages: u64,
+}
+
+/// Like [`memory_census`] but also totals every live process, so a boot log can
+/// attribute used frames to process-private data, shared aliases and the rest
+/// (page tables, executable snapshots, kernel pools).
+pub fn memory_account(top: &mut [MemoryCensusEntry]) -> (MemoryAccount, usize) {
+    let table = PROCESS_TABLE.lock();
+    let mut len = 0;
+    let mut total = MemoryAccount::default();
+    for slot in table.slots.iter() {
+        let Some(object) = slot.object.as_deref() else {
+            continue;
+        };
+        let leaves = kernel_mm::api::phys::data_leaf_census(object.mm_execution.root_phys())
+            .unwrap_or_default();
+        total.processes += 1;
+        total.private_pages += leaves.private();
+        total.shared_pages += leaves.shared;
+        len = insert_largest(
+            top,
+            len,
+            MemoryCensusEntry {
+                process_id: object.process_id,
+                parent_process_id: object.parent_process_id.unwrap_or(0),
+                private_pages: leaves.private(),
+                shared_pages: leaves.shared,
+                retained_pages: object.mm_execution.retained_backing_pages(),
+                job: object.job.to_raw(),
+            },
+        );
+    }
+    (total, len)
 }
 
 pub enum WaitResult {
@@ -1938,13 +2004,32 @@ pub(crate) mod tests {
     mod census_tests {
         use super::super::{MemoryCensusEntry, insert_largest};
 
-        fn entry(process_id: u64, resident_pages: u64) -> MemoryCensusEntry {
+        fn entry(process_id: u64, private_pages: u64) -> MemoryCensusEntry {
             MemoryCensusEntry {
                 process_id,
                 parent_process_id: 1,
-                resident_pages,
+                private_pages,
+                shared_pages: 0,
+                retained_pages: 0,
                 job: 1,
             }
+        }
+
+        #[test]
+        fn census_ranks_by_private_pages_and_ignores_shared_and_retained() {
+            // A Chrome-like child: huge retained snapshot and shared aliases,
+            // few private pages. It must rank below a plain private hog.
+            let chrome = MemoryCensusEntry {
+                shared_pages: 400_000,
+                retained_pages: 450_000,
+                ..entry(20, 100)
+            };
+            let hog = entry(21, 5_000);
+            let mut out = [MemoryCensusEntry::default(); 2];
+            let mut len = insert_largest(&mut out, 0, chrome);
+            len = insert_largest(&mut out, len, hog);
+            assert_eq!(len, 2);
+            assert_eq!([out[0].process_id, out[1].process_id], [21, 20]);
         }
 
         #[test]
@@ -1996,7 +2081,11 @@ pub(crate) mod tests {
             let mut out = [MemoryCensusEntry::default(); 1];
             assert_eq!(memory_census(&mut out), 1);
             assert_eq!(out[0].process_id, 8_104);
-            assert_eq!(out[0].resident_pages, 1);
+            assert_eq!(
+                (out[0].private_pages, out[0].shared_pages, out[0].retained_pages),
+                (0, 0, 1),
+                "retained immutable backing is reported but is not a private charge"
+            );
             mark_process_exiting(8_104).expect("mark immutable process exiting");
             detach_task(handle).expect("detach modeled task");
             assert_eq!(reap_exited_processes(), 1);

@@ -14,11 +14,15 @@ Concrete owners and source anchors:
 
 The model abstracts ABI bytes and PID allocation. A service has exactly one
 rootd lease slot; `reporter` is the supervisor PID/generation that admitted it.
-The normal observed initd-exit transition revokes every descendant immediately.
-The defensive reconciliation cut separately starts a new initd with imported
-live leases: it may adopt only a live exact-PID endpoint. An endpoint-less
-lease blocks replacement until its deadline, at which point reclaim clears its
-authority and cascades to descendants reported by it.
+Supervisor death degrades the tree instead of cascading through it. An observed
+initd exit does NOT kill what initd reported: those leases stay live, are fenced
+from broker authority (their declared reporter is dead) and get a bounded
+adoption grace (`ORPHAN_ADOPTION_GRACE_NS` in rootd). A replacement initd adopts
+only a live exact-PID endpoint and rebinds the reporter; a lease nobody adopts
+by its deadline is reclaimed and the reclaim cascades to descendants reported
+by it. A slow initd->rootd query never ends initd (services/initd
+lease_reconciliation.rs): the same recovery window simply keeps running.
+A non-initd reporter (sessiond) exiting still revokes its dependents at once.
 *******************************************************************************)
 
 CONSTANT MaxTick
@@ -60,24 +64,23 @@ Init ==
           currentInitd = "old" /\ state[service] = Ready]
     /\ clock = 0
 
-\* Rootd observes initd exit before it starts the replacement. The reporter
-\* closure is revoked in that same turn; no child keeps policy authority while
-\* waiting for its own later lifecycle record.
+\* Rootd observes initd exit before it starts the replacement. Nothing is
+\* killed: every service keeps running but is fenced (reporter "old" is dead
+\* once currentInitd = "new") and an adoption deadline is armed.
 CrashAndReplaceInitd ==
     /\ currentInitd = "old"
     \* Every post-crash adoption/reclaim window must fit inside the finite
     \* TLC clock; otherwise a final-tick replacement would hide the deadline.
     /\ clock <= MaxTick - 2
     /\ currentInitd' = "new"
-    /\ state' = [service \in Services |-> Exited]
-    /\ live' = [service \in Services |-> FALSE]
-    /\ endpoint' = [service \in Services |-> FALSE]
-    /\ recovery' = [service \in Services |-> service \in InitdManaged]
+    /\ recovery' = [service \in Services |->
+          service \in InitdManaged /\ state[service] # Empty]
     /\ deadline' = [service \in Services |->
-          IF service \in InitdManaged THEN clock ELSE deadline[service]]
+          IF service \in InitdManaged /\ state[service] # Empty
+          THEN clock + 2 ELSE deadline[service]]
     /\ tracked' = [service \in Services |->
           IF service \in InitdManaged THEN FALSE ELSE tracked[service]]
-    /\ UNCHANGED <<reporter, clock>>
+    /\ UNCHANGED <<state, live, endpoint, reporter, clock>>
 
 \* A child can still finish endpoint registration after its old supervisor
 \* dies. That is safe only because adoption validates the lease's exact PID.
@@ -99,7 +102,9 @@ AdoptExactReadyLease(service) ==
     /\ endpoint[service]
     /\ recovery' = [recovery EXCEPT ![service] = FALSE]
     /\ tracked' = [tracked EXCEPT ![service] = TRUE]
-    /\ UNCHANGED <<currentInitd, state, live, endpoint, reporter, deadline, clock>>
+    \* rootd rebinds the exact live lease to the querying (current) initd.
+    /\ reporter' = [reporter EXCEPT ![service] = "new"]
+    /\ UNCHANGED <<currentInitd, state, live, endpoint, deadline, clock>>
 
 \* A normally observed service exit is also reconciled through rootd before a
 \* replacement is attempted. sessiond's UI child loses authority immediately.
@@ -114,13 +119,14 @@ ObserveExit(service) ==
     /\ tracked' = [tracked EXCEPT ![service] = FALSE]
     /\ UNCHANGED <<currentInitd, reporter, clock>>
 
-\* Deadline expiry permits rootd's complete teardown. It may never reclaim a
-\* ready exact-PID lease: that lease must be adopted instead.
+\* Deadline expiry permits rootd's complete teardown, including of an orphaned
+\* Ready lease nobody adopted in time (a service must not run unsupervised and
+\* unfenced forever). Before the deadline a Ready lease can only be adopted.
 ReclaimStaleLease(service) ==
     /\ service \in InitdManaged
     /\ recovery[service]
     /\ clock >= deadline[service]
-    /\ state[service] \in {Admitted, Exited}
+    /\ state[service] \in {Admitted, Exited, Ready}
     /\ state' = [x \in Services |-> IF x \in Cascade(service) THEN Empty ELSE state[x]]
     /\ live' = [x \in Services |-> IF x \in Cascade(service) THEN FALSE ELSE live[x]]
     /\ endpoint' = [x \in Services |-> IF x \in Cascade(service) THEN FALSE ELSE endpoint[x]]
@@ -128,6 +134,23 @@ ReclaimStaleLease(service) ==
     /\ recovery' = [recovery EXCEPT ![service] = FALSE]
     /\ tracked' = [tracked EXCEPT ![service] = FALSE]
     /\ UNCHANGED <<currentInitd, deadline, clock>>
+
+\* Orphaned (fenced) services keep running only while an adoption deadline is
+\* armed; tracked ones are bound to the live initd.
+FencedServiceHasDeadline ==
+    \A service \in InitdManaged:
+        (currentInitd = "new" /\ reporter[service] = "old" /\ state[service] # Empty
+         /\ state[service] # Exited)
+            => recovery[service]
+
+TrackedServiceHasLiveReporter ==
+    \A service \in InitdManaged:
+        tracked[service] => reporter[service] = currentInitd
+
+\* Supervisor death alone never kills or de-registers a service.
+InitdExitPreservesServices ==
+    [][ (currentInitd = "old" /\ currentInitd' = "new")
+          => (live' = live /\ endpoint' = endpoint /\ state' = state) ]_vars
 
 SettleRecovery(service) ==
     AdoptExactReadyLease(service) \/ ReclaimStaleLease(service)

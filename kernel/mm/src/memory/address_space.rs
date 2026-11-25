@@ -290,6 +290,11 @@ impl ProcessAddressSpace {
         let mut pending_requests = [phys::SharedAliasRequest::EMPTY; phys::SHARED_ALIAS_RUN_MAX];
         let mut pending_tickets = [phys::SharedAliasTicket::EMPTY; phys::SHARED_ALIAS_RUN_MAX];
         let mut pending_len = 0_usize;
+        // Leaves shared copy-on-write vs copied eagerly, for the per-fork
+        // `fork-clone-leaves` milestone: a fork that pays for many eager
+        // copies shows up in the log instead of as unexplained memory growth.
+        let mut shared_leaves = 0_u64;
+        let mut eager_leaves = 0_u64;
 
         macro_rules! fail {
             ($error:expr) => {{
@@ -405,6 +410,11 @@ impl ProcessAddressSpace {
                     None
                 };
 
+                if shared_mode.is_some() {
+                    shared_leaves += 1;
+                } else if !eager_private {
+                    eager_leaves += 1;
+                }
                 if let Some(mode) = shared_mode {
                     let child_flags = match shared_flags_memo {
                         Some((input, output)) if input == flags => output,
@@ -563,6 +573,12 @@ impl ProcessAddressSpace {
         // that could retain a writable translation before the child can later
         // become runnable.
         drop(mutation);
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Memory,
+            "fork-clone-leaves",
+            shared_leaves,
+            eager_leaves,
+        );
         Ok(cloned)
     }
 

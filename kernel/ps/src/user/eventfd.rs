@@ -2,7 +2,8 @@
 //!
 //! - **Owner:** ring0 owns the 64-bit counter and descriptor lifetime; compat
 //!   owns blocking, user copy and wakeups. No policy is involved (the object
-//!   is anonymous and unnamed) and it holds no allocation, so no charge.
+//!   is anonymous and unnamed). The object is billed as one page to the
+//!   creating Job's charge group, refunded when the object is freed.
 //! - **Boundary:** `initval` and written values are untrusted; `u64::MAX` is
 //!   never a valid value and the counter never exceeds `u64::MAX - 1`.
 //! - **Lifecycle:** one open description per `eventfd2` call; dup and fork
@@ -22,6 +23,7 @@ use alloc::sync::Arc;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 
 use crate::user::linux as linux_abi;
+use crate::user::page_lease::PageLease;
 use crate::user::local_wait::{
     self, LocalDescription, LocalReadiness, LocalRelease, LocalWaitable, LocalWake,
 };
@@ -50,6 +52,7 @@ struct EventFdState {
 struct EventFdObject {
     semaphore: bool,
     description: LocalDescription,
+    _lease: PageLease,
     state: TrackedSpinLock<EventFdState, { LockClass::LocalFdObject as u8 }>,
 }
 
@@ -108,11 +111,25 @@ impl core::fmt::Debug for EventFdHandle {
 }
 
 impl EventFdHandle {
+    /// An eventfd billed to no Job (kernel-internal and host tests).
     pub fn new(initval: u32, semaphore: bool, nonblocking: bool) -> Result<Self, EventFdError> {
+        Self::new_in_group(initval, semaphore, nonblocking, None)
+    }
+
+    /// An eventfd whose object page is billed to `charge_group`; refusal is
+    /// `TooManyObjects`.
+    pub fn new_in_group(
+        initval: u32,
+        semaphore: bool,
+        nonblocking: bool,
+        charge_group: Option<usize>,
+    ) -> Result<Self, EventFdError> {
+        let lease = PageLease::acquire(charge_group, 1).ok_or(EventFdError::TooManyObjects)?;
         let token = local_wait::allocate_token().ok_or(EventFdError::TooManyObjects)?;
         let object = Arc::new(EventFdObject {
             semaphore,
             description: LocalDescription::new(token, nonblocking),
+            _lease: lease,
             state: TrackedSpinLock::new(EventFdState {
                 counter: u64::from(initval),
                 generation: 1,
@@ -366,5 +383,25 @@ mod tests {
         assert_eq!(sem.counter(), 2);
         assert!(sem.commit_read(1).is_ok());
         assert_eq!(sem.counter(), 1);
+    }
+
+    #[test]
+    fn eventfd_page_is_charged_refused_at_limit_and_refunded_once() {
+        use kernel_mm::api::charge;
+        charge::init_group(62, None);
+        charge::set_limit(62, 1);
+        let efd = EventFdHandle::new_in_group(0, false, false, Some(62)).unwrap();
+        assert_eq!(charge::usage(62), 1);
+        assert_eq!(
+            EventFdHandle::new_in_group(0, false, false, Some(62)).err(),
+            Some(EventFdError::TooManyObjects)
+        );
+        assert_eq!(charge::usage(62), 1, "a refused create charges nothing");
+        let dup = efd.clone();
+        assert!(efd.release_descriptor_reference().last);
+        drop(dup);
+        drop(efd);
+        assert_eq!(charge::usage(62), 0);
+        assert_eq!(charge::retainers(62), 0);
     }
 }

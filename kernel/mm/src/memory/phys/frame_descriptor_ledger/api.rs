@@ -175,6 +175,27 @@ pub fn data_leaf_count(root_phys: u64) -> Option<u64> {
     Some(root.data_leaf_count_or_map_head.load(DESCRIPTOR_ACQUIRE))
 }
 
+/// Lock-free split of a root's mapped data leaves, read without any lock.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DataLeafCensus {
+    /// Every mapped 4 KiB data leaf of the root.
+    pub mapped: u64,
+    /// Leaves whose frame outlives the root: file-backed private COW frames
+    /// and frames with two or more mappers. Killing the root frees none.
+    pub shared: u64,
+}
+
+impl DataLeafCensus {
+    /// Leaves whose frames only this root maps: what teardown returns.
+    pub fn private(self) -> u64 {
+        self.mapped.saturating_sub(self.shared)
+    }
+}
+
+pub fn data_leaf_census(root_phys: u64) -> Option<DataLeafCensus> {
+    FRAME_DESCRIPTORS.leaf_census(root_phys)
+}
+
 pub fn unregister_data_leaf_root(root_phys: u64) {
     FRAME_DESCRIPTORS.unregister_root(root_phys);
 }

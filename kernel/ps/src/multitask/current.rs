@@ -819,7 +819,12 @@ pub fn parent_process_id_of(process_id: u64) -> Option<u64> {
     process_table::parent_process_id_of(process_id)
 }
 
-pub use process_table::MemoryCensusEntry;
+pub use process_table::{MemoryAccount, MemoryCensusEntry};
+
+/// See [`process_table::memory_account`].
+pub fn memory_account(top: &mut [MemoryCensusEntry]) -> (MemoryAccount, usize) {
+    process_table::memory_account(top)
+}
 
 /// See [`process_table::memory_census`].
 pub fn memory_census(out: &mut [MemoryCensusEntry]) -> usize {

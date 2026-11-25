@@ -206,18 +206,33 @@ the reserve and the denial count beside `pager-anon-census-supply`.
 
 **OOM policy: implemented in `rootd`; ring0 supplies mechanism only.**
 
-*Charge.*  No new counter exists.  The frame-descriptor ledger already keeps a
-per-root count of mapped data leaves (`data_leaf_count`), incremented on every
-exclusive or shared-alias publication and decremented on release, so it is the
-process's resident set.  It excludes page-table frames, which are well under
-1% of the leaves and are not safely countable from another CPU while the root
-is being retired.  Ring0 reads the count through the process's
-`ExecutionPin::root_phys`, lock-free, under the process-table lock.
+*Charge.*  The victim score is what a kill returns, not what a process maps.
+Modeled on Linux `oom_badness()` (`mm/oom_kill.c`), which scores
+`get_mm_rss()` = `MM_ANONPAGES + MM_FILEPAGES + MM_SHMEMPAGES` plus page
+tables, and on `proc(5)` `RssAnon`/`RssFile`/`RssShmem`: RustOS adopts the
+split (anonymous private memory is the score; file-backed and shared memory is
+reported but not scored) but, with no page cache and no swap, divides by
+*ownership* instead of by mapping kind. The frame-descriptor ledger keeps two
+lock-free per-root counters: mapped data leaves (`data_leaf_count`) and
+**shared leaves**, a leaf whose frame is file-backed private COW or has two or
+more mappers (fork alias, converted parent leaf).  They move with the frame's
+mapper count: an alias raises its root's count (and the owner's, the first time
+its exclusive or sole-mapper frame is shared), a release or COW break lowers
+it, and an anonymous frame falling to one mapper makes the survivor private
+again.  `private = mapped - shared` is exactly the set of frames teardown
+returns (`DataLeafRelease::FrameReusable`); a file-backed private frame never
+counts as private even with one mapper (cache custody), so the figure is a
+lower bound.  Retained immutable backing (the 306 MB `/apps/chrome/chrome`
+snapshot) is a third column, `retained_pages`.  Page-table frames are not added
+(Linux does): they are well under 1% and are not safely countable from another
+CPU while a root is retired.  Ring0 reads all counters lock-free through the
+process's `ExecutionPin::root_phys` under the process-table lock.
 
 *Signal and census.*  `SYS_RUSTOS_ROOTD_MEMORY_BROKER` (root-supervisor
 capability only, ABI v1) returns in one copy-out: usable, free and min-free
 pages, the watermark denial count, and the up-to-32 live, non-exiting
-processes with the largest resident sets.  The bound makes the output fixed
+processes with the largest `private_pages` (ABI v2: `private_pages`,
+`shared_pages`, `retained_pages` per entry).  The bound makes the output fixed
 size; it is a top-N selection, not a victim choice.  Ring0 never decides who
 dies and keeps no pressure state.
 
@@ -231,8 +246,8 @@ machine resting at the watermark is not an event.  The governor then:
 1. skips when a previous victim is still inside its cooldown (200 ms), so a
    victim whose frames are not yet back does not cascade into a second kill;
 2. picks, among entries that are not `rootd`, not any core or post-init lease
-   pid, not any lease's reporter pid, and not below 16 resident pages, the
-   largest resident set (ties go to the larger pid, the younger process);
+   pid, not any lease's reporter pid, and not below 16 private pages, the
+   largest `private_pages` (ties go to the larger pid, the younger process);
 3. terminates it through the existing broker and records the pid, charge and
    free/reserve pages in a milestone. When a job holds the largest eligible
    total and no protected pid lies anywhere in its subtree, the whole job is
@@ -245,6 +260,30 @@ machine resting at the watermark is not an event.  The governor then:
 Leased services are never victims in v1.  A leaking service therefore degrades
 into refused faults instead of a kill; a restart-aware second tier belongs with
 `initd`, which owns post-init restarts.
+
+*Charge is a yield, not an upper bound.*  The previous census charged mapped
+leaves, shared aliases and retained backing; a 2 GiB KVM Chrome run reported a
+victim at 848866 pages on a 522576-page machine and killing it returned no
+frames (free stayed at the 3903-page reserve).  That structural error is fixed
+at the source, so rootd no longer caps charges at `usable_pages` and the
+recovery floor is plain half of the victim's private pages above today's free
+pages.  A job's charge is the sum of its members' private pages; two members
+that share one frame are each charged nothing for it, so a job sum is a lower
+bound.  Host witnesses: `census_kill_frees_exactly_the_private_figure`,
+`census_charges_a_forked_page_to_neither_side_until_a_sibling_leaves`
+(`frame_descriptor_ledger`), `shared_and_retained_pages_never_enter_the_victim_score`
+(`memory_governor`).  Pending a KVM boot at 2048 MiB: the `rootd: oom killed`
+line should show a believable private figure and free memory should rise.
+
+*Pressure policy runs first in the supervisor pass, and stalls are logged.*
+The census/verdict step precedes lifecycle drain, restarts, health, realm and
+control work, so a victim never waits behind bookkeeping that may itself be
+starved. A pass that begins more than 500 ms after the previous one logs
+`rootd: supervisor pass stalled gap_ms:`; every verdict logs the four largest
+census entries (`rootd: oom census pid/parent/private/shared/retained/job:`). A stalled rootd is
+what turns a shortage into dead services: initd's 5 s lease query expires
+(`initd: fatal rootd post-init lease query failed errno=110`) and rootd then
+retires every service initd reported (netd, devmgrd, inputd).
 
 *End-to-end witness.*  `cargo xtask kvm-smoke --oom-hog` writes the private
 contract `/system/registry/system/oomhog-v1.env`.  `apps/oomhog` is a
@@ -485,3 +524,9 @@ event and never per fault.
   <https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc>
 - Windows copy-on-write views use `FILE_MAP_COPY`/write-copy protection:
   <https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-mapviewoffile>
+
+## Orphans and frame shortage
+
+- `reclaim_slot` no longer waits for `wait_for_child` when the parent is gone or exiting; an orphan zombie otherwise pinned its whole address space and an OOM job kill freed nothing. A final-thread detach schedules a full reap scan.
+- Ring0 anonymous/COW faults with an empty frame supply return Retry for a 2 s grace (`frame_shortage_outcome`) so rootd's governor can free memory; only then Refused (feeds the oom watchdog).
+- `mem-account-*` milestones (free < 25%) report used pages, heap, and the six largest private holders.

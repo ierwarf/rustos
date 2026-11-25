@@ -379,8 +379,18 @@ the read-only accelerator; TmpFs has it (next section).
   intentionally not checkpointed (locks die with a `vfsd` restart just as the
   kernel would drop them with the open descriptions, and clients re-take them
   after reopening).
-- **procfs.** `/proc` serves the caller's own pid only (`/proc/self`,
-  `/proc/<own pid>`). Kernel-fact nodes (maps, smaps, status, stat, statm,
+- **procfs.** `/proc` serves the caller's own pid (`/proc/self`,
+  `/proc/<own pid>`); for another pid only `oom_score_adj` (kernel-completed; write
+  needs root or equal euid) and the `task` directory listing (Ring0 delegation with
+  the target pid as number; ENOENT if the pid is not live) and
+  `task/<tid>[/{stat,status,comm}]` exist. The per-tid node `number` is
+  `pid << 28 | tid` (`pack_task_number`; pid 0 = the caller): Ring0 answers
+  stat/access/`task/<tid>` listing with ENOENT unless the tid is a live thread of that
+  pid, and vfsd formats the files read-only from `PROC_FACTS_OP_{PROCESS,THREAD}` facts
+  of that pid; writing another process's `comm` is EACCES. `cmdline` is not a per-tid
+  file (needs a cross-process memory read). `/proc/cpuinfo`
+  and `/sys/devices/system/cpu/{online,possible,present}` report the kernel's
+  admitted hardware CPUs (`PROC_FACTS_OP_ONLINE_CPUS`), not vfsd's affinity mask. Kernel-fact nodes (maps, smaps, status, stat, statm,
   cmdline, environ, auxv, limits, comm, oom_score_adj, `task/`, `fd/`, `ns/*`) are
   exposed through vfsd. For kernel-fact files handled by the Ring3 snapshot
   path, vfsd pulls attested binary facts through `SYS_RUSTOS_PROC_FACTS_BROKER`,

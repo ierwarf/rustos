@@ -199,6 +199,38 @@ impl ProcKernelNode {
     }
 }
 
+/// Bits of a per-tid task node's `number` that hold the tid; the bits above
+/// hold the target pid when it is not the caller (`0` = the caller). Tids are
+/// global, so `(pid, tid)` names one thread and the owner check is
+/// `tid in live_user_thread_ids(pid)`.
+pub const TASK_NUMBER_TID_BITS: u32 = 28;
+const TASK_NUMBER_TID_MASK: u64 = (1 << TASK_NUMBER_TID_BITS) - 1;
+
+/// Whether `node`'s `number` is a (possibly pid-qualified) tid.
+pub const fn is_task_tid_node(node: ProcKernelNode) -> bool {
+    matches!(
+        node,
+        ProcKernelNode::TaskTidDir
+            | ProcKernelNode::TaskStat
+            | ProcKernelNode::TaskComm
+            | ProcKernelNode::TaskStatus
+    )
+}
+
+/// Packs `/proc/<pid>/task/<tid>` for another process; `None` when either
+/// does not fit (the node cannot exist). `pid == 0` is the caller.
+pub const fn pack_task_number(pid: u64, tid: u64) -> Option<u64> {
+    if tid > TASK_NUMBER_TID_MASK || (pid >> (55 - TASK_NUMBER_TID_BITS)) != 0 {
+        return None;
+    }
+    Some((pid << TASK_NUMBER_TID_BITS) | tid)
+}
+
+/// Splits a per-tid task node `number` into `(pid, tid)`; pid `0` = caller.
+pub const fn unpack_task_number(number: u64) -> (u64, u64) {
+    (number >> TASK_NUMBER_TID_BITS, number & TASK_NUMBER_TID_MASK)
+}
+
 /// Packs a delegation into `VfsIpcResponse::aux`.
 pub const fn encode_delegate(node: ProcKernelNode, number: u64) -> u64 {
     PROC_DELEGATE_FLAG | ((number & NUMBER_MASK) << NUMBER_SHIFT) | node.code() as u64
@@ -239,6 +271,16 @@ fn fnv_decimal(hash: u64, mut value: u64) -> u64 {
     fnv_bytes(hash, &digits[at..])
 }
 
+/// `(pid, number)` with a pid-qualified task number resolved to its owner.
+fn resolve_task_number(pid: u64, node: ProcKernelNode, number: u64) -> (u64, u64) {
+    if is_task_tid_node(node) {
+        let (owner, tid) = unpack_task_number(number);
+        (if owner != 0 { owner } else { pid }, tid)
+    } else {
+        (pid, number)
+    }
+}
+
 fn node_name(node: ProcKernelNode) -> &'static str {
     match node {
         ProcKernelNode::FdDir | ProcKernelNode::FdLink => "fd",
@@ -259,6 +301,7 @@ fn node_name(node: ProcKernelNode) -> &'static str {
 /// `path_inode` applies, so `statx(path)` (vfsd) and `fstat(fd)` (kernel)
 /// report one inode for one node.
 pub fn node_inode(pid: u64, node: ProcKernelNode, number: u64) -> u64 {
+    let (pid, number) = resolve_task_number(pid, node, number);
     let mut hash = fnv_bytes(FNV_OFFSET, b"/proc/");
     hash = fnv_decimal(hash, pid);
     hash = fnv_bytes(hash, b"/");
@@ -291,6 +334,7 @@ pub fn write_node_path<W: core::fmt::Write>(
     node: ProcKernelNode,
     number: u64,
 ) -> core::fmt::Result {
+    let (pid, number) = resolve_task_number(pid, node, number);
     write!(out, "/proc/{pid}/")?;
     match node {
         ProcKernelNode::FdLink => write!(out, "fd/{number}"),

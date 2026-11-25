@@ -21,6 +21,7 @@ mod openat_flags_ops;
 pub(crate) mod offload_ops;
 mod pager_fault_ops;
 mod prctl_ops;
+mod ptrace_refusal;
 mod process_ext_ops;
 mod frame_source_ops;
 mod library_map_probe_ops;

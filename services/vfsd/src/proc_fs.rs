@@ -173,16 +173,43 @@ pub fn lookup(path: &str, caller_pid: u64) -> Option<Result<ProcNode, i32>> {
     }
     if first != "self" && parse_pid(first) != Some(caller_pid) {
         if let Some(target_pid) = parse_pid(first) {
-            if &parts[1..count] == ["oom_score_adj"] {
-                return Some(Ok(ProcNode::Kernel(
-                    ProcKernelNode::OomScoreAdj,
-                    target_pid,
-                )));
+            match &parts[1..count] {
+                ["oom_score_adj"] => {
+                    return Some(Ok(ProcNode::Kernel(
+                        ProcKernelNode::OomScoreAdj,
+                        target_pid,
+                    )));
+                }
+                // Listing another process's threads (crashpad enumerates the
+                // crashing process this way); Ring0 answers ENOENT for a pid
+                // that is not live. `task/<tid>[/<file>]` carries the pid in the
+                // node number; Ring0 checks the tid belongs to that live pid.
+                ["task"] if target_pid != 0 => {
+                    return Some(Ok(ProcNode::Kernel(ProcKernelNode::TaskDir, target_pid)));
+                }
+                ["task", tid] if target_pid != 0 => {
+                    return Some(other_pid_task(target_pid, tid, None));
+                }
+                ["task", tid, name] if target_pid != 0 => {
+                    return Some(other_pid_task(target_pid, tid, Some(name)));
+                }
+                _ => {}
             }
         }
         return Some(Err(ENOENT));
     }
     Some(lookup_in_pid_dir(&parts[1..count]))
+}
+
+/// `/proc/<other pid>/task/<tid>[/<file>]`: the pid rides in the node number.
+fn other_pid_task(target_pid: u64, tid: &str, file: Option<&str>) -> Result<ProcNode, i32> {
+    let tid = abi_procfs::parse_decimal(tid).ok_or(ENOENT)?;
+    let node = match file {
+        None => ProcKernelNode::TaskTidDir,
+        Some(name) => ProcKernelNode::from_task_file_name(name).ok_or(ENOENT)?,
+    };
+    let number = abi_procfs::pack_task_number(target_pid, tid).ok_or(ENOENT)?;
+    Ok(ProcNode::Kernel(node, number))
 }
 
 /// Resolves the components below `/proc/<caller pid>`.
@@ -907,6 +934,16 @@ mod tests {
             lookup("/proc/8/oom_score_adj", 7),
             Some(Ok(ProcNode::Kernel(ProcKernelNode::OomScoreAdj, 8)))
         );
+        assert_eq!(
+            lookup("/proc/8/task", 7),
+            Some(Ok(ProcNode::Kernel(ProcKernelNode::TaskDir, 8)))
+        );
+        assert_eq!(
+            lookup("/proc/7/task", 7),
+            Some(Ok(ProcNode::Kernel(ProcKernelNode::TaskDir, 0)))
+        );
+        assert_ne!(kernel_only_delegate(ProcNode::Kernel(ProcKernelNode::TaskDir, 8)), None);
+        assert_ne!(open_delegate_for_flags(ProcNode::Kernel(ProcKernelNode::TaskDir, 8), 0), None);
         assert_ne!(kernel_only_delegate(ProcNode::Kernel(ProcKernelNode::OomScoreAdj, 8)), None);
         assert_ne!(open_delegate_for_flags(ProcNode::Kernel(ProcKernelNode::OomScoreAdj, 8), 0), None);
         assert_eq!(open_delegate_for_flags(ProcNode::Kernel(ProcKernelNode::OomScoreAdj, 0), 0), None);
@@ -942,9 +979,45 @@ mod tests {
         assert_eq!(lookup("/proc/self/ns/bogus", 7), Some(Err(ENOENT)));
         assert_eq!(lookup("/proc/8/maps", 7), Some(Err(ENOENT)));
         assert_eq!(lookup("/proc/8/fd/1", 7), Some(Err(ENOENT)));
-        assert_eq!(lookup("/proc/8/task/8/stat", 7), Some(Err(ENOENT)));
+        assert_eq!(lookup("/proc/8/task/8/maps", 7), Some(Err(ENOENT)));
+        assert_eq!(lookup("/proc/8/task/x/stat", 7), Some(Err(ENOENT)));
+        assert_eq!(lookup("/proc/8/task/08", 7), Some(Err(ENOENT)));
         assert_eq!(lookup("/proc/8/ns/net", 7), Some(Err(ENOENT)));
         assert_eq!(lookup("/proc/self/a/b/c/d/e", 7), Some(Err(ENOENT)));
+    }
+
+    #[test]
+    fn other_pid_task_tid_nodes_resolve_with_the_pid_in_the_number() {
+        let packed = |tid| abi_procfs::pack_task_number(8, tid).unwrap();
+        let k = |node, n| Some(Ok(ProcNode::Kernel(node, n)));
+        assert_eq!(lookup("/proc/8/task/9", 7), k(ProcKernelNode::TaskTidDir, packed(9)));
+        assert_eq!(lookup("/proc/8/task/9/stat", 7), k(ProcKernelNode::TaskStat, packed(9)));
+        assert_eq!(lookup("/proc/8/task/9/comm", 7), k(ProcKernelNode::TaskComm, packed(9)));
+        assert_eq!(lookup("/proc/8/task/9/status", 7), k(ProcKernelNode::TaskStatus, packed(9)));
+        // The caller's own pid spelled numerically keeps the unqualified tid.
+        assert_eq!(lookup("/proc/7/task/9/stat", 7), k(ProcKernelNode::TaskStat, 9));
+        // A pid or tid that cannot be packed cannot name a thread.
+        assert_eq!(lookup("/proc/8/task/268435456/stat", 7), Some(Err(ENOENT)));
+        assert_eq!(lookup("/proc/0/task/9", 7), Some(Err(ENOENT)));
+        // Directory/stat/access go to Ring0 (tid-in-pid check); read-only
+        // opens of the files are formatted in vfsd from raw facts.
+        let stat = ProcNode::Kernel(ProcKernelNode::TaskStat, packed(9));
+        assert_ne!(kernel_only_delegate(stat), None);
+        assert_eq!(open_delegate_for_flags(stat, 0), None);
+        let dir = ProcNode::Kernel(ProcKernelNode::TaskTidDir, packed(9));
+        assert_ne!(open_delegate_for_flags(dir, 0), None);
+        // Writing another process's thread comm is refused by Ring0 (EACCES).
+        let comm = ProcNode::Kernel(ProcKernelNode::TaskComm, packed(9));
+        assert_eq!(abi_procfs::unpack_task_number(packed(9)), (8, 9));
+        // Inodes match what Ring0 reports for `/proc/8/task/9/...`.
+        assert_eq!(
+            abi_procfs::node_inode(7, ProcKernelNode::TaskStat, packed(9)),
+            abi_procfs::node_inode(8, ProcKernelNode::TaskStat, 9)
+        );
+        let mut path = String::new();
+        abi_procfs::write_node_path(&mut path, 7, ProcKernelNode::TaskComm, packed(9)).unwrap();
+        assert_eq!(path, "/proc/8/task/9/comm");
+        let _ = comm;
     }
 
     #[test]

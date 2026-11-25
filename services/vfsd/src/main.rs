@@ -679,8 +679,28 @@ fn demote_after_ui_bootstrap_snapshot_reply() {
     }
 }
 
+/// Hardware CPUs the kernel admitted. Unlike `SYS_SCHED_GETAFFINITY`, which
+/// reports vfsd's own (possibly restricted) task mask, this is what Linux's
+/// `/sys/devices/system/cpu/online` and `/proc/cpuinfo` describe. `None` when
+/// the broker refuses or answers a malformed length; the caller then fails the
+/// read rather than inventing a CPU set.
+pub(crate) fn online_cpu_mask() -> Option<u64> {
+    let bytes = pull_proc_facts_bounded(
+        rustos_user_abi::syscall::PROC_FACTS_OP_ONLINE_CPUS,
+        0,
+        0,
+        size_of::<u64>(),
+    )?;
+    let mask = u64::from_le_bytes(bytes.as_slice().try_into().ok()?);
+    (mask != 0).then_some(mask)
+}
+
 pub(crate) fn pull_proc_facts(op: u16, pid: u64, tid: u64) -> Option<Vec<u8>> {
-    let mut out = alloc::vec![0_u8; rustos_user_abi::procfs::PROC_SNAPSHOT_MAX_BYTES];
+    pull_proc_facts_bounded(op, pid, tid, rustos_user_abi::procfs::PROC_SNAPSHOT_MAX_BYTES)
+}
+
+fn pull_proc_facts_bounded(op: u16, pid: u64, tid: u64, capacity: usize) -> Option<Vec<u8>> {
+    let mut out = alloc::vec![0_u8; capacity];
     let mut out_len = 0_u32;
     let args = ProcFactsBrokerArgs {
         abi_version: PROC_FACTS_BROKER_ABI_VERSION,
@@ -739,6 +759,13 @@ pub(crate) fn format_kernel_proc_snapshot(
     use rustos_user_abi::syscall::{PROC_FACTS_OP_PROCESS, PROC_FACTS_OP_THREAD};
     use vfsd::proc_snapshot as snap;
 
+    // A per-tid task node of another process carries that pid in `number`.
+    let (pid, number) = if rustos_user_abi::procfs::is_task_tid_node(node) {
+        let (owner, tid) = rustos_user_abi::procfs::unpack_task_number(number);
+        (if owner != 0 { owner } else { pid }, tid)
+    } else {
+        (pid, number)
+    };
     let need_process = matches!(
         node,
         Node::Maps

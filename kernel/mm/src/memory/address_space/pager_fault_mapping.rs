@@ -291,7 +291,14 @@ fn resolve_cow_write_under_mutation(
         drop(mutation);
         return Ok(CowWriteResult::Retry);
     };
-    if claim.kind() != expected_kind {
+    // A private file or image-section VMA (`PrivateFileSection`) also holds
+    // anonymous-fork aliases: fork shares a process's modified private copies
+    // there exactly as it does in an anonymous VMA. The reverse never holds, so
+    // an anonymous VMA still refuses a file-cache COW frame.
+    let kind_matches = claim.kind() == expected_kind
+        || (expected_kind == phys::CowFrameKind::PrivateFileSection
+            && claim.kind() == phys::CowFrameKind::AnonymousFork);
+    if !kind_matches {
         phys::cancel_cow_mapping(claim);
         drop(mutation);
         return Ok(CowWriteResult::NotCow);

@@ -327,8 +327,25 @@ fn proc_target_exists(target_pid: u64, caller_pid: u64) -> Result<(), i64> {
     }
 }
 
+/// Target pid and the plain fd/tid/pid `number` of a delegated node. A
+/// per-tid task node of another live process carries that pid in `number`
+/// (`abi_procfs::pack_task_number`); whether the tid belongs to it is checked
+/// by the caller via `tid_is_live`.
+fn resolve_proc_target(node: Node, number: u64, caller_pid: u64) -> Result<(u64, u64), i64> {
+    if abi_procfs::is_task_tid_node(node) {
+        let (owner, tid) = abi_procfs::unpack_task_number(number);
+        if owner != 0 && owner != caller_pid {
+            proc_target_exists(owner, caller_pid)?;
+            return Ok((owner, tid));
+        }
+        return Ok((caller_pid, tid));
+    }
+    Ok((resolve_proc_target_pid(node, number, caller_pid)?, number))
+}
+
 fn resolve_proc_target_pid(node: Node, number: u64, caller_pid: u64) -> Result<u64, i64> {
-    if node == Node::OomScoreAdj && number != 0 && number != caller_pid {
+    // `number` is the target pid for these two nodes (0 = the caller).
+    if matches!(node, Node::OomScoreAdj | Node::TaskDir) && number != 0 && number != caller_pid {
         proc_target_exists(number, caller_pid)?;
         Ok(number)
     } else {
@@ -465,7 +482,12 @@ pub(crate) fn complete_open(aux: u64, flags: u64) -> Option<Result<u64, i64>> {
         if node == Node::FdLink {
             return reopen_fd(number, flags);
         }
-        let target_pid = resolve_proc_target_pid(node, number, pid)?;
+        let (target_pid, number) = resolve_proc_target(node, number, pid)?;
+        // Another process's task files are formatted in vfsd from raw facts;
+        // only the `task/<tid>` directory is built here.
+        if target_pid != pid && node != Node::TaskTidDir {
+            return Err(LINUX_EACCES);
+        }
         let bytes = render(node, number, target_pid)?;
         install_snapshot(
             node_link(target_pid, node, number),
@@ -489,7 +511,7 @@ pub(crate) fn complete_stat(aux: u64, flags: u64, out: StatOut) -> Option<u64> {
 
 fn stat_node(node: Node, number: u64, flags: u64, out: StatOut) -> Result<u64, i64> {
     let pid = caller_pid()?;
-    let target_pid = resolve_proc_target_pid(node, number, pid)?;
+    let (target_pid, number) = resolve_proc_target(node, number, pid)?;
     if node == Node::FdLink {
         if !current_fd_exists(number) {
             return Err(LINUX_ENOENT);
@@ -535,7 +557,7 @@ pub(crate) fn complete_access(aux: u64, mode: u64) -> Option<u64> {
 
 fn access_node(node: Node, number: u64, mode: u64) -> Result<(), i64> {
     let pid = caller_pid()?;
-    let target_pid = resolve_proc_target_pid(node, number, pid)?;
+    let (target_pid, number) = resolve_proc_target(node, number, pid)?;
     match node {
         Node::FdLink => {
             if !current_fd_exists(number) {
@@ -832,7 +854,7 @@ pub(in crate::user::syscall::linux) fn syscall_linux_rustos_proc_facts_broker(
 ) -> u64 {
     use rustos_user_abi::syscall::{
         ProcFactsBrokerArgs, PROC_FACTS_BROKER_ABI_VERSION, PROC_FACTS_OP_PROCESS,
-        PROC_FACTS_OP_THREAD,
+        PROC_FACTS_OP_ONLINE_CPUS, PROC_FACTS_OP_THREAD,
     };
 
     linux_unit_result((|| {
@@ -841,7 +863,8 @@ pub(in crate::user::syscall::linux) fn syscall_linux_rustos_proc_facts_broker(
         if args.abi_version != PROC_FACTS_BROKER_ABI_VERSION
             || args.flags != 0
             || args.reserved0 != 0
-            || args.pid == 0
+            || (args.pid == 0) != (args.op == PROC_FACTS_OP_ONLINE_CPUS)
+            || (args.op == PROC_FACTS_OP_ONLINE_CPUS && args.tid != 0)
             || args.out_ptr == 0
             || args.out_len_ptr == 0
             || args.out_capacity == 0
@@ -855,6 +878,9 @@ pub(in crate::user::syscall::linux) fn syscall_linux_rustos_proc_facts_broker(
         let bytes = match args.op {
             PROC_FACTS_OP_PROCESS => encode_process_facts_wire(args.pid),
             PROC_FACTS_OP_THREAD => encode_thread_facts_wire(args.pid, args.tid),
+            PROC_FACTS_OP_ONLINE_CPUS => {
+                Ok(kernel_hal::api::cpu::admitted_online_mask().to_le_bytes().to_vec())
+            }
             _ => Err(LINUX_EINVAL),
         }?;
         if bytes.len() > args.out_capacity as usize {

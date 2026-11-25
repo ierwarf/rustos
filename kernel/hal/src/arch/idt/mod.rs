@@ -62,6 +62,15 @@ lazy_static! {
                 crate::lowlevel::interrupts::timer_interrupt_handler_addr(),
             ));
         }
+        // `int3` is the user-visible breakpoint instruction (debuggers, Chromium's
+        // `BreakDebugger`). With the default DPL 0 gate a ring 3 `int3` raises #GP
+        // instead of #BP, so it never reaches the SIGTRAP mapping.
+        unsafe {
+            let breakpoint_handler = idt.breakpoint.handler_addr();
+            idt.breakpoint
+                .set_handler_addr(breakpoint_handler)
+                .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+        }
         idt[KEYBOARD_INTERRUPT_VECTOR].set_handler_fn(keyboard_interrupt_eoi_handler);
         idt[MOUSE_INTERRUPT_VECTOR].set_handler_fn(mouse_interrupt_eoi_handler);
         idt[TLB_SHOOTDOWN_IPI_VECTOR].set_handler_fn(tlb_shootdown_interrupt_handler);

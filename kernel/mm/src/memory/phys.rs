@@ -70,7 +70,7 @@ pub(crate) const fn min_free_for(free_frames: usize) -> usize {
 
 mod frame_descriptor_ledger;
 pub use frame_descriptor_ledger::{
-    CowFrameKind, CowMappingClaim, DataClaim, DataLeafRelease, SHARED_ALIAS_RUN_MAX,
+    CowFrameKind, CowMappingClaim, DataClaim, DataLeafCensus, DataLeafRelease, SHARED_ALIAS_RUN_MAX,
     SharedAliasMode, SharedAliasRequest, SharedAliasRunError, SharedAliasTicket, bind_root_charge,
     claim_cow_replacement, cancel_cow_replacement,
     claim_private_file_cache_frame, release_private_file_cache_frame,
@@ -78,7 +78,7 @@ pub use frame_descriptor_ledger::{
     cancel_data_leaf, cancel_lazy_table_record, cancel_shared_alias,
     cancel_shared_alias_run,
     TableClaim, claim_data_leaf, claim_lazy_table_record, commit_cow_mapping,
-    data_leaf_count, data_leaf_cow_identity, data_leaf_is_owned, lazy_table_record_count,
+    data_leaf_census, data_leaf_count, data_leaf_cow_identity, data_leaf_is_owned, lazy_table_record_count,
     lazy_table_record_is_owned, pop_lazy_table_record, prepare_shared_alias,
     prepare_shared_alias_run,
     promote_cow_mapping_in_place, publish_data_leaf, publish_lazy_table_record,

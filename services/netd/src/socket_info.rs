@@ -319,6 +319,12 @@ pub(super) fn handle_setsockopt_in_state(state: &mut NetState, request: &NetdIpc
     {
         return set_ipv6_multicast_membership(state, request);
     }
+    if request.arg1 == linux_abi::SOL_SOCKET
+        && matches!(request.arg2, SO_ATTACH_FILTER | SO_DETACH_FILTER)
+        && state.netlink_sockets.contains_key(&request.socket_token)
+    {
+        return netlink::handle_socket_filter(state, request);
+    }
     let Some(value) = request_i32_payload(request) else {
         return libc::EINVAL;
     };
@@ -556,6 +562,8 @@ pub(super) fn handle_setsockopt_in_state(state: &mut NetState, request: &NetdIpc
 }
 
 const SO_OOBINLINE: u64 = 10;
+pub(super) const SO_ATTACH_FILTER: u64 = 26;
+pub(super) const SO_DETACH_FILTER: u64 = 27;
 const SO_PRIORITY: u64 = 12;
 const SO_RCVTIMEO: u64 = 20;
 const SO_TIMESTAMP: u64 = 29;

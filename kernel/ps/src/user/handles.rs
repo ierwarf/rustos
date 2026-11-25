@@ -288,7 +288,9 @@ pub struct RemoteVfsHandle {
     token: u64,
     remote_id: u64,
     kind: RemoteVfsHandleKind,
-    path: String,
+    /// Shared by every dup/fork/transfer clone of the description, so a
+    /// descriptor copy does not duplicate (up to `PATH_MAX`) the path.
+    path: Arc<str>,
     len: u64,
     device_access: u16,
     library: LibraryBinding,
@@ -348,7 +350,7 @@ impl RemoteVfsHandle {
             token: allocate_nonwrapping_identity(&NEXT_TOKEN)?,
             remote_id,
             kind,
-            path,
+            path: Arc::from(path),
             len,
             device_access,
             library: LibraryBinding::Unknown,
@@ -422,7 +424,7 @@ impl RemoteVfsHandle {
     }
 
     pub fn path(&self) -> String {
-        self.path.clone()
+        String::from(&*self.path)
     }
 
     pub const fn len(&self) -> u64 {

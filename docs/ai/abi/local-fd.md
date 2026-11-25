@@ -53,6 +53,22 @@ in a ring-3 service"; revisit only if pipes need names (FIFOs) or policy.
   group (`kernel_mm::api::charge`), outside the guard; the buffer is freed when the
   reader closes. eventfd allocates nothing beyond the object. Fd count is bounded by
   the per-process fd cap; a global object cap comes from the registry size (`EMFILE`/`ENFILE`).
+- Job charging by kind (`kernel/ps/src/user/page_lease.rs`, refund exactly once on drop): AF_UNIX
+  sockets, eventfds and epoll instances bill 1 object page (epoll adds 1 page per 16 interests, so
+  `EPOLL_CTL_ADD` can fail `ENOSPC`; the lease lives in the registry slot and is refunded by
+  `epoll_retire`). `connect` is all-or-nothing: the client moves Unbound -> Connected first, a failed
+  enqueue rolls it back and releases the accepted-side socket (and its charge), so no orphan
+  accept-queue entry survives. A full listener backlog reports
+  `PeerWouldBlock{listener token}`: a blocking connector sleeps on the listener's token and retries
+  (listener `accept` and close publish the wake; close then yields ECONNREFUSED), `O_NONBLOCK`
+  and an elapsed `SO_SNDTIMEO` give EAGAIN, a signal EINTR; each attempt rolls back its charge. Deliberately uncharged: `InetSocket` (a `Copy` token; the socket lives
+  in netd), `RemoteVfs` (object lives in vfsd; the `path` is an `Arc<str>` shared by dup/fork/transfer
+  clones) and `VfsDirectory` (no production constructor). Their fd-table slots are billed through the
+  handle table's `kmem_charge::Class::HandleTable` binding, the only ring0 cost they add.
+- AF_UNIX readiness follows `unix_poll`: a direction is shut by a local `shutdown` or by the peer's
+  shutdown/close; `EPOLLIN|EPOLLRDHUP` when receive is shut, `EPOLLHUP` when both are, `EPOLLOUT`
+  stays set while send is shut (the write fails at once). A full datagram receiver blocks the sender on
+  the receiver's token (`UnixSocketError::PeerWouldBlock`).
 
 ## Read atomicity
 

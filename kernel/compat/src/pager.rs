@@ -48,6 +48,74 @@ static CONTENDED_COW_WRITES: AtomicU64 = AtomicU64::new(0);
 /// Present-write candidates rejected after exact PTE/ledger validation.
 static REJECTED_COW_WRITES: AtomicU64 = AtomicU64::new(0);
 
+/// How long, in nanoseconds, a fault whose frame supply is empty is resumed to
+/// re-fault instead of being refused.
+///
+/// Refusing at the first empty allocation retires the faulting thread with
+/// SIGSEGV, which makes the *asker* the victim: a renderer that merely needed
+/// one more page dies while the process holding hundreds of megabytes lives.
+/// Linux blocks such an allocation while the OOM killer picks the process
+/// holding the most memory. Here the policy owner is `rootd`'s governor, which
+/// reacts to the same watermark denials this retry keeps generating, so the
+/// fault only has to survive long enough for it to run (its pass is 10 ms, its
+/// cooldown 200 ms). The window is an episode: it starts at the first empty
+/// supply, ends at the first fault that finds a frame, and a gap longer than
+/// `SHORTAGE_EPISODE_GAP_NS` between two empty supplies starts a new one. A
+/// supply that stays empty past the grace is real exhaustion and refuses.
+const FRAME_SHORTAGE_GRACE_NS: u64 = 2_000_000_000;
+const SHORTAGE_EPISODE_GAP_NS: u64 = 250_000_000;
+static SHORTAGE_SINCE_NS: AtomicU64 = AtomicU64::new(0);
+static SHORTAGE_LAST_NS: AtomicU64 = AtomicU64::new(0);
+static SHORTAGE_RETRIES: AtomicU64 = AtomicU64::new(0);
+
+/// Decides one empty-supply fault: returns the episode start to remember and
+/// whether the fault is still inside its grace window.
+fn shortage_window(since: u64, last: u64, now: u64) -> (u64, bool) {
+    let since = if since == 0 || now.saturating_sub(last) > SHORTAGE_EPISODE_GAP_NS {
+        now
+    } else {
+        since
+    };
+    (since, now.saturating_sub(since) < FRAME_SHORTAGE_GRACE_NS)
+}
+
+/// The outcome of a fault that found no frame anywhere.
+fn frame_shortage_outcome() -> AnonymousFaultOutcome {
+    let now = crate::arch::clock::monotonic_nanos().max(1);
+    let (since, within_grace) = shortage_window(
+        SHORTAGE_SINCE_NS.load(Ordering::Relaxed),
+        SHORTAGE_LAST_NS.load(Ordering::Relaxed),
+        now,
+    );
+    SHORTAGE_SINCE_NS.store(since, Ordering::Relaxed);
+    SHORTAGE_LAST_NS.store(now, Ordering::Relaxed);
+    if !within_grace {
+        return AnonymousFaultOutcome::Refused;
+    }
+    // Keep the ring0 watchdog's fallback informed of who is asking, exactly as
+    // an outright refusal would.
+    if let Some(process_id) = ps_api::current_user_process_id() {
+        crate::oom_watchdog::note_refused_fault(process_id, now / 1_000_000);
+    }
+    let retries = SHORTAGE_RETRIES.fetch_add(1, Ordering::Relaxed) + 1;
+    if retries == 1 || retries.is_multiple_of(4096) {
+        nucleus_core::debug::record_milestone(
+            nucleus_core::debug::LogCategory::Compat,
+            "pager-frame-shortage-retry",
+            retries,
+            now.saturating_sub(since) / 1_000_000,
+        );
+    }
+    AnonymousFaultOutcome::Retry
+}
+
+/// A fault found a frame: the episode, if any, is over.
+fn frame_supply_recovered() {
+    if SHORTAGE_SINCE_NS.load(Ordering::Relaxed) != 0 {
+        SHORTAGE_SINCE_NS.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Pages ring0 offers to populate for this fault, including the faulting page.
 ///
 /// Bounded by the VMA's own remaining extent, so a run never crosses into a
@@ -267,9 +335,13 @@ pub fn serve_private_cow_write(
         .or_else(mm_api::frame_capability::allocate_zeroed_frame)
     else {
         drop(permit);
-        REJECTED_COW_WRITES.fetch_add(1, Ordering::Relaxed);
-        return AnonymousFaultOutcome::Refused;
+        let outcome = frame_shortage_outcome();
+        if outcome == AnonymousFaultOutcome::Refused {
+            REJECTED_COW_WRITES.fetch_add(1, Ordering::Relaxed);
+        }
+        return outcome;
     };
+    frame_supply_recovered();
     let outcome = mm_api::paging::resolve_current_cow_write_at(
         VirtAddr::new(request.virtual_address),
         frame.as_u64(),
@@ -422,13 +494,14 @@ fn serve_anonymous_first_touch_enabled(
             }
             match mm_api::frame_capability::allocate_zeroed_frame() {
                 Some(frame) => frame,
-                // Both sources are empty. This is real memory exhaustion, not
-                // a supply dip, so retrying would spin a thread on a fault
-                // nothing is going to satisfy.
-                None => return AnonymousFaultOutcome::Refused,
+                // Both sources are empty: memory exhaustion. The governor gets
+                // a bounded window to free the largest holder before this
+                // thread is the one that dies (see `frame_shortage_outcome`).
+                None => return frame_shortage_outcome(),
             }
         }
     };
+    frame_supply_recovered();
     let installed = mm_api::paging::map_current_prepared_pager_fault_frame_at(
         VirtAddr::new(request.virtual_address),
         frame.as_u64(),
@@ -616,6 +689,9 @@ fn ensure_fault_tables(request: PagerFaultRequestWire) -> Result<(), AnonymousFa
                     );
                 }
             }
+            if exhausted {
+                return Err(frame_shortage_outcome());
+            }
             Err(AnonymousFaultOutcome::Refused)
         }
     }
@@ -787,6 +863,63 @@ pub fn record_anonymous_fault_census() {
         (LAZY_TABLE_CAS_LOST.load(Ordering::Relaxed) << 32)
             | (LAZY_TABLE_SUPPLY_EXHAUSTED.load(Ordering::Relaxed) & u64::from(u32::MAX)),
     );
+    record_memory_account();
+}
+
+/// Where used frames sit, in one bounded group of lines.
+///
+/// `mem-account-total`: arg0 = used pages, arg1 = `private << 32 | shared`
+/// summed over every live process leaf ledger. `mem-account-kernel`: arg0 =
+/// page-table pages charged to jobs, arg1 = pages of the largest private
+/// holder. `mem-account-top-N`: arg0 = pid, arg1 = `private << 32 | shared`.
+/// Emitted only while free memory is under a quarter of usable, so a healthy
+/// boot is not charged for it.
+fn record_memory_account() {
+    use rustos_user_abi::pager::PAGER_PAGE_BYTES;
+    let usable = mm_api::phys::usable_bytes() / PAGER_PAGE_BYTES;
+    let free = mm_api::phys::free_bytes() / PAGER_PAGE_BYTES;
+    if free.saturating_mul(4) > usable {
+        return;
+    }
+    let mut top = [ps_api::MemoryCensusEntry::default(); 6];
+    let (total, count) = ps_api::memory_account(&mut top);
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "mem-account-total",
+        usable.saturating_sub(free),
+        (total.private_pages << 32) | (total.shared_pages & u64::from(u32::MAX)),
+    );
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "mem-account-kernel",
+        mm_api::kmem_charge::class_total_usage(mm_api::kmem_charge::Class::PageTable)
+            / PAGER_PAGE_BYTES,
+        total.processes,
+    );
+    if let Some((heap_total, heap_used)) = mm_api::heap::usage_bytes() {
+        nucleus_core::debug::record_milestone(
+            nucleus_core::debug::LogCategory::Compat,
+            "mem-account-heap",
+            heap_total as u64 / PAGER_PAGE_BYTES,
+            heap_used as u64 / PAGER_PAGE_BYTES,
+        );
+    }
+    for (index, entry) in top[..count].iter().enumerate() {
+        let name = [
+            "mem-account-top-0",
+            "mem-account-top-1",
+            "mem-account-top-2",
+            "mem-account-top-3",
+            "mem-account-top-4",
+            "mem-account-top-5",
+        ][index];
+        nucleus_core::debug::record_milestone(
+            nucleus_core::debug::LogCategory::Compat,
+            name,
+            entry.process_id,
+            (entry.private_pages << 32) | (entry.shared_pages & u64::from(u32::MAX)),
+        );
+    }
 }
 
 /// Completes a reply received through the fixed pagerd rendezvous. The worker
@@ -1006,12 +1139,42 @@ pub fn service_deferred_work() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{crosses_report_boundary, dispatch_wire};
+    use super::{
+        FRAME_SHORTAGE_GRACE_NS, SHORTAGE_EPISODE_GAP_NS, crosses_report_boundary, dispatch_wire,
+        shortage_window,
+    };
     use crate::multitask::{PagerFaultReservation, PagerFaultState};
     use rustos_user_abi::pager::{
         PAGER_FAULT_ABI_VERSION, PagerEndpointCapabilityWire, PagerFaultRequestWire,
         PagerObjectIdentityWire, VM_ACCESS_READ, VM_OBJECT_ANONYMOUS, VM_PROT_READ,
     };
+
+    #[test]
+    fn an_empty_frame_supply_is_retried_for_the_grace_and_then_refused() {
+        let (since, retry) = shortage_window(0, 0, 1_000);
+        assert_eq!((since, retry), (1_000, true));
+        // Same episode: the start is kept and the window runs out.
+        let step = SHORTAGE_EPISODE_GAP_NS / 2;
+        let mut now = 1_000;
+        let mut last = 1_000;
+        while now - since < FRAME_SHORTAGE_GRACE_NS {
+            let (kept, retry) = shortage_window(since, last, now);
+            assert_eq!((kept, retry), (since, true));
+            last = now;
+            now += step;
+        }
+        assert_eq!(shortage_window(since, last, now), (since, false));
+    }
+
+    #[test]
+    fn a_quiet_gap_starts_a_new_shortage_episode() {
+        let since = 5_000;
+        let last = 6_000;
+        let later = last + SHORTAGE_EPISODE_GAP_NS + 1;
+        // Long past the old window, but the supply was found again in between.
+        let now = later + FRAME_SHORTAGE_GRACE_NS * 3;
+        assert_eq!(shortage_window(since, now - SHORTAGE_EPISODE_GAP_NS - 1, now), (now, true));
+    }
 
     fn reservation() -> PagerFaultReservation {
         PagerFaultReservation {

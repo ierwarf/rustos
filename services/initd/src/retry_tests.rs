@@ -74,3 +74,21 @@ fn crash_loop_exhaustion_terminates_initd_with_status_111() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn slow_lease_report_defers_relaunch_without_spending_the_crash_budget() {
+    let now = Instant::now();
+    let mut retry_state = BTreeMap::new();
+    for _ in 0..(INITD_LAUNCH_MAX_FAILURES * 3) {
+        defer_launch_without_charge(&mut retry_state, "/svc/netd", now);
+    }
+    let state = &retry_state["/svc/netd"];
+    assert_eq!(state.failures, 0, "a slow rootd must never exhaust the budget");
+    assert_eq!(state.next_attempt, now + RETRY_BACKOFF);
+    assert!(state.spawned_at.is_none());
+
+    // An existing budget is preserved, not reset or advanced.
+    retry_state.get_mut("/svc/netd").unwrap().failures = 2;
+    defer_launch_without_charge(&mut retry_state, "/svc/netd", now);
+    assert_eq!(retry_state["/svc/netd"].failures, 2);
+}

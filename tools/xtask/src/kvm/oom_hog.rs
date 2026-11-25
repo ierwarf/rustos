@@ -12,6 +12,9 @@ const OOM_HOG_KILLED_MARKER: &str = "rootd: oom killed pid/pages/free:";
 const OOM_HOG_JOB_KILLED_MARKER: &str = "rootd: oom killed job/pid/pages/free:";
 const OOM_HOG_JOB_PLACED_MARKER: &str = "loaderd: application job placed job/pid/limit:";
 const OOM_HOG_RECOVERED_MARKER: &str = "rootd: oom recovered free/min:";
+/// Reported once after `recovered`, when frames stopped arriving: the end state,
+/// not the sample that crossed the recovery threshold.
+const OOM_HOG_SETTLED_MARKER: &str = "rootd: oom settled free/min:";
 /// Milestone names as the debug channel renders them (`name=...`).
 const OOM_HOG_WATCHDOG_KILLED_MARKER: &str = "name=oom-watchdog-kill ";
 const OOM_HOG_WATCHDOG_RECOVERED_MARKER: &str = "name=oom-watchdog-recovered ";
@@ -28,13 +31,21 @@ struct OomHogEvidence {
     resident_pages: u64,
     /// Free pages when the kill was issued, at the kernel reserve.
     free_pages: u64,
-    /// Free pages once the victim's frames had been returned.
+    /// Free pages at the first sample past the recovery threshold; teardown may
+    /// still be returning frames, so this is a floor, not the end state.
     recovered_free_pages: u64,
+    /// Most free pages seen once frames stopped arriving (`oom settled`), when
+    /// the run lasted long enough to report it.
+    settled_free_pages: Option<u64>,
 }
 
 /// The decimal fields that follow `marker` on its log line, in order.
 fn numbers_after(line: &str, marker: &str) -> Option<Vec<u64>> {
     let rest = &line[line.find(marker)? + marker.len()..];
+    // The fields of interest end at the first word: loaderd appends
+    // `granted processes/threads/pages-per-process: 12/48/261288` to the
+    // placement line, and those numbers are not part of `job/pid/limit`.
+    let rest = rest.split(|c: char| c.is_ascii_alphabetic()).next().unwrap_or("");
     Some(
         rest.split(|c: char| !c.is_ascii_digit())
             .filter(|field| !field.is_empty())
@@ -119,6 +130,14 @@ fn validate_oom_hog_log(log: &str) -> Result<OomHogEvidence> {
         );
     }
     let _ = reserve_pages;
+    let settled_free_pages = log
+        .lines()
+        .filter_map(|line| numbers_after(line, OOM_HOG_SETTLED_MARKER))
+        .filter_map(|fields| fields.first().copied())
+        .last();
+    if settled_free_pages.is_some_and(|settled| settled < *recovered_free_pages) {
+        bail!("settled free memory fell below the recovery sample; the victim's frames were not kept");
+    }
     if *resident_pages < OOM_HOG_MIN_KILLED_PAGES {
         bail!(
             "rootd killed the hog at only {resident_pages} resident pages; \
@@ -131,6 +150,7 @@ fn validate_oom_hog_log(log: &str) -> Result<OomHogEvidence> {
         resident_pages: *resident_pages,
         free_pages: *free_pages,
         recovered_free_pages: *recovered_free_pages,
+        settled_free_pages,
     })
 }
 
@@ -202,6 +222,7 @@ fn validate_oom_hog_watchdog_log(log: &str) -> Result<OomHogEvidence> {
         resident_pages: 0,
         free_pages: *free_pages,
         recovered_free_pages: *recovered_free_pages,
+        settled_free_pages: None,
     })
 }
 
@@ -228,7 +249,8 @@ mod oom_hog_tests {
                 job: None,
                 resident_pages: 380_000,
                 free_pages: 3_900,
-                recovered_free_pages: 380_000
+                recovered_free_pages: 380_000,
+                settled_free_pages: None
             }
         );
     }
@@ -241,6 +263,15 @@ mod oom_hog_tests {
         for marker in [OOM_HOG_KILLED_MARKER, OOM_HOG_JOB_KILLED_MARKER] {
             assert!(marker.contains("rootd: oom killed "));
         }
+    }
+
+    #[test]
+    fn placement_fields_stop_at_the_granted_quota_words() {
+        let line = "loaderd: application job placed job/pid/limit: 80 41 524288 granted processes/threads/pages-per-process: 12/48/261288";
+        assert_eq!(
+            numbers_after(line, OOM_HOG_JOB_PLACED_MARKER),
+            Some(vec![80, 41, 524288])
+        );
     }
 
     #[test]
