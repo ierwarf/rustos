@@ -40,16 +40,7 @@ fn deferred_authority_matches_exact_batch_request<I: Eq>(
         && deferred_authority_is_batch_eligible(qualification_required)
 }
 
-pub(in crate::user::syscall::linux) fn syscall_linux_rustos_proc_activate_batch_broker(
-    args_ptr: u64,
-) -> u64 {
-    if !current_process_can_load() {
-        return linux_errno(LINUX_EPERM);
-    }
-    let args: RustosProcActivateBatchBrokerArgs = match read_user_struct_as(args_ptr) {
-        Ok(args) => args,
-        Err(errno) => return linux_errno(errno),
-    };
+fn validate_activation_batch_args(args: &RustosProcActivateBatchBrokerArgs) -> LinuxResult<&[u64]> {
     let target_count = usize::from(args.target_count);
     if args.abi_version != PROC_BROKER_ABI_VERSION
         || args.flags != 0
@@ -60,70 +51,129 @@ pub(in crate::user::syscall::linux) fn syscall_linux_rustos_proc_activate_batch_
             .iter()
             .any(|target_pid| *target_pid != 0)
     {
-        return linux_errno(LINUX_EINVAL);
+        return Err(LINUX_EINVAL);
     }
     let targets = &args.target_pids[..target_count];
     for (index, target_pid) in targets.iter().copied().enumerate() {
         if target_pid == 0 || targets[..index].contains(&target_pid) {
-            return linux_errno(LINUX_EINVAL);
+            return Err(LINUX_EINVAL);
         }
     }
+    Ok(targets)
+}
 
-    let Some(owner) = multitask::live_user_process_identity_by_pid(args.requester_pid) else {
-        return linux_errno(LINUX_ESRCH);
-    };
-    let mut exact_targets = [None; LOADER_ACTIVATE_BATCH_MAX_TARGETS];
-    for (index, target_pid) in targets.iter().copied().enumerate() {
-        let Some(target) = multitask::live_user_process_identity_by_pid(target_pid) else {
-            return linux_errno(LINUX_ESRCH);
-        };
-        exact_targets[index] = Some(target);
-    }
-    let exact_targets = &exact_targets[..target_count];
+pub(in crate::user::syscall::linux) fn syscall_linux_rustos_proc_activate_batch_broker(
+    args_ptr: u64,
+) -> u64 {
+    linux_unit_result((|| {
+        if !current_process_can_load() {
+            return Err(LINUX_EPERM);
+        }
+        let args: RustosProcActivateBatchBrokerArgs = read_user_struct_as(args_ptr)?;
+        let targets = validate_activation_batch_args(&args)?;
 
-    let mut failure = LINUX_ESRCH;
-    if !multitask::activate_suspended_user_tasks_with_commit(targets, || {
-        // PS already owns original Current/Cohort/frame loans. Only permission
-        // transfer holds this raw leaf; no scheduler work or PID lookup does.
-        let mut activations = DEFERRED_ACTIVATIONS.lock();
-        let grant = deferred_activation::take_exact::<LOADER_ACTIVATE_BATCH_MAX_TARGETS, _, MAX_DEFERRED_ACTIVATIONS>(
-            &mut activations, targets, |pid, authority| {
-                let index = targets.iter().position(|target| *target == pid).unwrap();
-                let exact_target = exact_targets[index].expect("validated target identity disappeared");
-                deferred_authority_matches_exact_batch_request(
-                    &authority.owner, &authority.target, authority.qualification_required,
-                    &owner, &exact_target,
-                )
-            },
-        );
-        if grant.is_none() { failure = LINUX_EPERM; }
-        drop(activations);
-        grant
-    }) {
-        return linux_errno(failure);
-    }
-    for target_pid in targets.iter().copied() {
+        let owner =
+            multitask::live_user_process_identity_by_pid(args.requester_pid).ok_or(LINUX_ESRCH)?;
+        let mut exact_targets = [None; LOADER_ACTIVATE_BATCH_MAX_TARGETS];
+        for (slot, target_pid) in exact_targets[..targets.len()]
+            .iter_mut()
+            .zip(targets.iter().copied())
+        {
+            *slot = Some(
+                multitask::live_user_process_identity_by_pid(target_pid).ok_or(LINUX_ESRCH)?,
+            );
+        }
+        let exact_targets = &exact_targets[..targets.len()];
+
+        let mut failure = LINUX_ESRCH;
+        if !multitask::activate_suspended_user_tasks_with_commit(targets, || {
+            // PS already owns original Current/Cohort/frame loans. Only permission
+            // transfer holds this raw leaf; no scheduler work or PID lookup does.
+            let mut activations = DEFERRED_ACTIVATIONS.lock();
+            let grant = deferred_activation::take_exact::<LOADER_ACTIVATE_BATCH_MAX_TARGETS, _, MAX_DEFERRED_ACTIVATIONS>(
+                &mut activations, targets, |pid, authority| {
+                    let index = targets.iter().position(|target| *target == pid).unwrap();
+                    let exact_target = exact_targets[index].expect("validated target identity disappeared");
+                    deferred_authority_matches_exact_batch_request(
+                        &authority.owner, &authority.target, authority.qualification_required,
+                        &owner, &exact_target,
+                    )
+                },
+            );
+            if grant.is_none() { failure = LINUX_EPERM; }
+            drop(activations);
+            grant
+        }) {
+            return Err(failure);
+        }
+        for target_pid in targets.iter().copied() {
+            nucleus_core::debug::record_milestone(
+                nucleus_core::debug::LogCategory::Compat,
+                "proc-activate-batch-member",
+                target_pid,
+                args.requester_pid,
+            );
+        }
         nucleus_core::debug::record_milestone(
             nucleus_core::debug::LogCategory::Compat,
-            "proc-activate-batch-member",
-            target_pid,
+            "proc-activate-batch-committed",
             args.requester_pid,
+            targets.len() as u64,
         );
-    }
-    nucleus_core::debug::record_milestone(
-        nucleus_core::debug::LogCategory::Compat,
-        "proc-activate-batch-committed",
-        args.requester_pid,
-        target_count as u64,
-    );
-    0
+        Ok(())
+    })())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         deferred_authority_is_batch_eligible, deferred_authority_matches_exact_batch_request,
+        validate_activation_batch_args, LINUX_EINVAL, LOADER_ACTIVATE_BATCH_MAX_TARGETS,
+        PROC_BROKER_ABI_VERSION, RustosProcActivateBatchBrokerArgs,
     };
+
+    #[test]
+    fn validate_activation_batch_args_rejects_malformed_shapes_and_admits_unique_cohort() {
+        let mut args = RustosProcActivateBatchBrokerArgs {
+            abi_version: PROC_BROKER_ABI_VERSION,
+            target_count: 2,
+            flags: 0,
+            requester_pid: 7,
+            target_pids: [11, 13, 0, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(validate_activation_batch_args(&args), Ok(&[11_u64, 13][..]));
+
+        args.abi_version = PROC_BROKER_ABI_VERSION - 1;
+        assert_eq!(validate_activation_batch_args(&args), Err(LINUX_EINVAL));
+        args.abi_version = PROC_BROKER_ABI_VERSION;
+
+        args.flags = 1;
+        assert_eq!(validate_activation_batch_args(&args), Err(LINUX_EINVAL));
+        args.flags = 0;
+
+        args.requester_pid = 0;
+        assert_eq!(validate_activation_batch_args(&args), Err(LINUX_EINVAL));
+        args.requester_pid = 7;
+
+        args.target_count = 0;
+        assert_eq!(validate_activation_batch_args(&args), Err(LINUX_EINVAL));
+        args.target_count = (LOADER_ACTIVATE_BATCH_MAX_TARGETS + 1) as u16;
+        assert_eq!(validate_activation_batch_args(&args), Err(LINUX_EINVAL));
+        args.target_count = 2;
+
+        // Nonzero tail outside target_count must be rejected.
+        args.target_pids[2] = 17;
+        assert_eq!(validate_activation_batch_args(&args), Err(LINUX_EINVAL));
+        args.target_pids[2] = 0;
+
+        // Zero PID inside prefix must be rejected.
+        args.target_pids[1] = 0;
+        assert_eq!(validate_activation_batch_args(&args), Err(LINUX_EINVAL));
+
+        // Duplicate PID inside prefix must be rejected.
+        args.target_pids[1] = 11;
+        assert_eq!(validate_activation_batch_args(&args), Err(LINUX_EINVAL));
+    }
 
     #[test]
     fn private_qualification_authority_is_never_batch_eligible() {

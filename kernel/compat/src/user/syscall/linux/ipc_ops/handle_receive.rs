@@ -17,11 +17,18 @@ pub(super) struct HandleOutputs {
 }
 
 impl HandleOutputs {
-    pub(super) fn validate(&self, retained: &multitask::RetainedCurrentUserAddressSpace) -> Result<(), i64> {
-        if self.capacity > rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES {
+    pub(super) fn validate_shape(&self) -> LinuxResult<usize> {
+        if self.capacity > rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES || self.count_ptr == 0 {
             return Err(LINUX_EINVAL);
         }
-        let bytes = self.capacity.checked_mul(size_of::<i32>()).ok_or(LINUX_EINVAL)?;
+        if self.capacity != 0 && self.fds_ptr == 0 {
+            return Err(LINUX_EINVAL);
+        }
+        self.capacity.checked_mul(size_of::<i32>()).ok_or(LINUX_EINVAL)
+    }
+
+    pub(super) fn validate(&self, retained: &multitask::RetainedCurrentUserAddressSpace) -> Result<(), i64> {
+        let bytes = self.validate_shape()?;
         if bytes == 0 {
             usermem::validate_retained_user_write_buffers(retained, &[(self.count_ptr, size_of::<u16>())])
         } else {
@@ -38,10 +45,39 @@ pub(super) struct ReceiveOutputs<'a> {
     pub(super) reply_cap_ptr: u64,
     pub(super) sender_pid_ptr: u64,
     pub(super) sender_tid_ptr: u64,
+    pub(super) include_sender: bool,
+    pub(super) include_handles: bool,
     pub(super) handles: HandleOutputs,
 }
 
-impl ReceiveOutputs<'_> {
+impl<'a> ReceiveOutputs<'a> {
+    pub(super) const fn new(
+        retained_mm: &'a multitask::RetainedCurrentUserAddressSpace,
+        request_ptr: u64,
+        reply_cap_ptr: u64,
+        sender: Option<(u64, u64)>,
+        handles: Option<HandleOutputs>,
+    ) -> Self {
+        let (sender_pid_ptr, sender_tid_ptr, include_sender) = match sender {
+            Some((pid, tid)) => (pid, tid, true),
+            None => (0, 0, false),
+        };
+        let (handles, include_handles) = match handles {
+            Some(handles) => (handles, true),
+            None => (HandleOutputs { fds_ptr: 0, count_ptr: 0, capacity: 0 }, false),
+        };
+        Self {
+            retained_mm,
+            request_ptr,
+            reply_cap_ptr,
+            sender_pid_ptr,
+            sender_tid_ptr,
+            include_sender,
+            include_handles,
+            handles,
+        }
+    }
+
     pub(super) fn write_fast<const N: usize>(
         &self,
         received: kernel_ipc_runtime::api::FastEndpointReceived<N>,
@@ -75,14 +111,30 @@ impl ReceiveOutputs<'_> {
             let (reply, pid, tid, count) = (
                 reply.raw().to_ne_bytes(), pid.to_ne_bytes(), tid.to_ne_bytes(), count.to_ne_bytes(),
             );
+            let mut writes = [
+                (self.request_ptr, request),
+                (self.reply_cap_ptr, &reply),
+                (0, &[]),
+                (0, &[]),
+                (0, &[]),
+                (0, &[]),
+            ];
+            let mut write_count = 2;
+            if self.include_sender {
+                writes[write_count] = (self.sender_pid_ptr, &pid);
+                writes[write_count + 1] = (self.sender_tid_ptr, &tid);
+                write_count += 2;
+            }
+            if self.include_handles {
+                writes[write_count] = (self.handles.fds_ptr, received_fd_bytes(fds));
+                writes[write_count + 1] = (self.handles.count_ptr, &count);
+                write_count += 2;
+            }
             // Request, reply, sender and descriptor outputs precede the shared
             // helper's one exact fd commit. No later sender copy can fail after
             // a descriptor has become visible to another receiver thread.
-            usermem::write_retained_user_bytes_batch(self.retained_mm, &[
-                (self.request_ptr, request), (self.reply_cap_ptr, &reply),
-                (self.sender_pid_ptr, &pid), (self.sender_tid_ptr, &tid),
-                (self.handles.fds_ptr, received_fd_bytes(fds)), (self.handles.count_ptr, &count),
-            ]).map_err(address_space_error_to_linux_errno)
+            usermem::write_retained_user_bytes_batch(self.retained_mm, &writes[..write_count])
+                .map_err(address_space_error_to_linux_errno)
         };
         if descriptors.is_empty() {
             // Byte-only/fast messages need no fd reservation or transfer claim.
@@ -95,17 +147,13 @@ impl ReceiveOutputs<'_> {
 }
 
 pub(super) fn syscall_linux_rustos_ipc_recv_with_handles_and_sender(args_ptr: u64) -> u64 {
-    match receive(args_ptr) {
-        Ok(len) => len as u64,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_result(receive(args_ptr).map(|len| len as u64))
 }
 
 fn receive(args_ptr: u64) -> Result<usize, i64> {
     let retained = usermem::current_user_address_space().map_err(address_space_error_to_linux_errno)?;
-    let args = usermem::with_retained_user_access(&retained, |user| {
-        user.read_struct::<rustos_user_abi::syscall::IpcRecvWithHandlesAndSenderArgs>(args_ptr)
-    }).map_err(address_space_error_to_linux_errno)?.map_err(address_space_error_to_linux_errno)?;
+    let args: rustos_user_abi::syscall::IpcRecvWithHandlesAndSenderArgs =
+        read_retained_user_struct_as(&retained, args_ptr)?;
     if !rustos_user_abi::syscall::ipc_handle_receive_shape_valid(&args) {
         return Err(LINUX_EINVAL);
     }
@@ -117,10 +165,13 @@ fn receive(args_ptr: u64) -> Result<usize, i64> {
         fds_ptr: args.recv_fds_ptr, count_ptr: args.recv_fd_count_ptr, capacity: usize::from(args.recv_fd_capacity),
     };
     handles.validate(&retained)?;
-    let outputs = ReceiveOutputs {
-        retained_mm: &retained, request_ptr: args.request_ptr, reply_cap_ptr: args.reply_cap_ptr,
-        sender_pid_ptr: args.sender_pid_ptr, sender_tid_ptr: args.sender_tid_ptr, handles,
-    };
+    let outputs = ReceiveOutputs::new(
+        &retained,
+        args.request_ptr,
+        args.reply_cap_ptr,
+        Some((args.sender_pid_ptr, args.sender_tid_ptr)),
+        Some(handles),
+    );
     recv_with_sender_blocking_prepared_inner::<{ kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES }>(
         endpoint, task, capacity, None, None, ReceiveDestination::UserWithHandles(outputs),
     ).map(|(len, _)| len).map_err(|(errno, _)| errno)
@@ -166,5 +217,33 @@ mod tests {
             < fused.find("complete_endpoint_reply_for_process_with_custody(").unwrap());
         assert!(fused.contains("ReceiveDestination::UserWithHandles"));
         assert!(fused.contains("fast_reply::DeferredFastReply::new(completed_reply, completion)"));
+    }
+
+    #[test]
+    fn handle_outputs_shape_rejects_excess_capacity_and_null_pointers_pre_dequeue() {
+        assert_eq!(
+            HandleOutputs { fds_ptr: 0, count_ptr: 0x1000, capacity: 0 }.validate_shape(),
+            Ok(0)
+        );
+        assert_eq!(
+            HandleOutputs {
+                fds_ptr: 0x2000,
+                count_ptr: 0x1000,
+                capacity: rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES,
+            }
+            .validate_shape(),
+            Ok(rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES * size_of::<i32>())
+        );
+        for invalid in [
+            HandleOutputs { fds_ptr: 0, count_ptr: 0, capacity: 0 },
+            HandleOutputs { fds_ptr: 0, count_ptr: 0x1000, capacity: 1 },
+            HandleOutputs {
+                fds_ptr: 0x2000,
+                count_ptr: 0x1000,
+                capacity: rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES + 1,
+            },
+        ] {
+            assert_eq!(invalid.validate_shape(), Err(LINUX_EINVAL));
+        }
     }
 }

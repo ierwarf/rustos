@@ -42,7 +42,6 @@ const LOCAL_FD_IO_CHUNK_BYTES: usize = 64 * 1024;
 const PIPE2_ACCEPTED_FLAGS: u64 = linux_abi::O_CLOEXEC | linux_abi::O_NONBLOCK;
 const EFD_ACCEPTED_FLAGS: u64 =
     linux_abi::EFD_SEMAPHORE | linux_abi::EFD_CLOEXEC | linux_abi::EFD_NONBLOCK;
-const FIONREAD_RESULT_BYTES: usize = 4;
 
 /// A kernel-local fd object pinned by an active descriptor reference.
 #[derive(Debug)]
@@ -65,6 +64,14 @@ impl Drop for LocalFd {
 }
 
 impl LocalFd {
+    pub(super) fn token_id(&self) -> u64 {
+        match self {
+            Self::Pipe(pipe) => pipe.token_id(),
+            Self::EventFd(eventfd) => eventfd.token_id(),
+            Self::UnixSocket(sock) => sock.token_id(),
+        }
+    }
+
     fn status_flags(&self) -> u64 {
         match self {
             Self::Pipe(pipe) => pipe.status_flags(),
@@ -141,14 +148,6 @@ pub(super) fn settle_release(
     }
 }
 
-fn release_handle(handle: &multitask::KernelHandle) {
-    match handle {
-        multitask::KernelHandle::Pipe(pipe) => release_pipe(pipe, true),
-        multitask::KernelHandle::EventFd(eventfd) => release_eventfd(eventfd, true),
-        _ => {}
-    }
-}
-
 fn pipe_error_errno(err: PipeError) -> i64 {
     match err {
         PipeError::NoMemory => LINUX_ENOMEM,
@@ -178,8 +177,16 @@ fn raise_sigpipe() {
 }
 
 /// Sleeps until `token`'s generation moves past `generation`, a signal
-/// arrives, or the object closes. `Ok` means "retry the operation".
-fn wait_for_generation(token: u64, generation: u64) -> Result<(), i64> {
+/// arrives, `deadline_tick` elapses, or the object closes. `Ok(())` means
+/// "retry the operation".
+pub(super) fn wait_for_local_generation(
+    token: u64,
+    generation: u64,
+    deadline_tick: Option<u64>,
+) -> Result<(), i64> {
+    if deadline_tick.is_some_and(|d| crate::arch::rtc::ticks() >= d) {
+        return Err(LINUX_EAGAIN);
+    }
     let Some(task_id) = multitask::current_task_id() else {
         return Err(LINUX_EINVAL);
     };
@@ -219,23 +226,59 @@ fn wait_for_generation(token: u64, generation: u64) -> Result<(), i64> {
     // pending bits are consulted. A hit cancels the block and returns to the
     // caller's loop, whose `current_wait_interrupted` classifies the signal
     // (ignored ones are consumed there) before waiting again.
-    if multitask::current_linux_thread_state()
-        .is_some_and(|state| state.pending_signals & !state.signal_mask != 0)
-    {
+    if super::poll_epoll::has_unmasked_pending_signal() {
         remove_waitset_waiters(task_id);
         let _ = multitask::cancel_block_current_task();
         multitask::cond_resched();
         return Ok(());
     }
+    if let Some(deadline) = deadline_tick {
+        if !crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline) {
+            remove_waitset_waiters(task_id);
+            let _ = multitask::cancel_block_current_task();
+            return Err(LINUX_EAGAIN);
+        }
+        if crate::arch::rtc::ticks() >= deadline {
+            remove_waitset_waiters(task_id);
+            crate::arch::rtc::disarm_sleep_waiter(task_id);
+            let _ = multitask::cancel_block_current_task();
+            return Err(LINUX_EAGAIN);
+        }
+    }
     let committed = multitask::commit_block_current_task_and_yield();
     remove_waitset_waiters(task_id);
+    if deadline_tick.is_some() {
+        crate::arch::rtc::disarm_sleep_waiter(task_id);
+    }
     if committed.is_none() {
         return Err(LINUX_EINVAL);
     }
     if current_wait_interrupted() {
         return Err(LINUX_EINTR);
     }
+    if deadline_tick.is_some_and(|d| crate::arch::rtc::ticks() >= d) {
+        return Err(LINUX_EAGAIN);
+    }
     Ok(())
+}
+
+/// Handles a `WouldBlock { generation }` response for a local fd operation:
+/// fails immediately with `EAGAIN` if `nonblocking` or `EINTR` if interrupted
+/// by a deliverable signal, otherwise waits for `generation` to advance or
+/// `deadline_tick` to elapse.
+pub(super) fn wait_local_wouldblock(
+    token: u64,
+    generation: u64,
+    nonblocking: bool,
+    deadline_tick: Option<u64>,
+) -> Result<(), i64> {
+    if nonblocking {
+        return Err(LINUX_EAGAIN);
+    }
+    if current_wait_interrupted() {
+        return Err(LINUX_EINTR);
+    }
+    wait_for_local_generation(token, generation, deadline_tick)
 }
 
 // ---- creation -------------------------------------------------------------
@@ -313,7 +356,7 @@ pub fn syscall_linux_pipe2(pipefd_ptr: u64, flags: u64) -> u64 {
                 (handles.close(read_fd), handles.close(write_fd))
             });
             if let Some((first, second)) = closed {
-                first.iter().chain(second.iter()).for_each(release_handle);
+                release_closed_handles(first.into_iter().chain(second));
             }
             return Err(errno);
         }
@@ -326,44 +369,46 @@ pub fn syscall_linux_pipe(pipefd_ptr: u64) -> u64 {
 }
 
 pub fn syscall_linux_eventfd2(initval: u64, flags: u64) -> u64 {
-    // Both are C `int`/`unsigned int`: ignore the register's upper half.
-    let initval = initval as u32;
-    let flags = u64::from(flags as u32);
-    if flags & !EFD_ACCEPTED_FLAGS != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let eventfd = match EventFdHandle::new(
-        initval,
-        flags & linux_abi::EFD_SEMAPHORE != 0,
-        flags & linux_abi::EFD_NONBLOCK != 0,
-    ) {
-        Ok(eventfd) => eventfd,
-        Err(EventFdError::TooManyObjects) => return linux_errno(LINUX_ENFILE),
-        Err(_) => return linux_errno(LINUX_EINVAL),
-    };
-    let fd_flags = if flags & linux_abi::EFD_CLOEXEC != 0 {
-        multitask::FD_CLOEXEC
-    } else {
-        0
-    };
-    let entry = multitask::HandleEntry::new(
-        multitask::KernelHandle::EventFd(eventfd.clone()),
-        fd_flags,
-        eventfd.status_flags(),
-    );
-    match multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        process_state.handles_mut().install_entry(entry)
-    }) {
-        Some(Some(fd)) => fd,
-        Some(None) => {
-            release_eventfd(&eventfd, true);
-            linux_errno(LINUX_EMFILE)
+    linux_result((|| {
+        // Both are C `int`/`unsigned int`: ignore the register's upper half.
+        let initval = initval as u32;
+        let flags = u64::from(flags as u32);
+        if flags & !EFD_ACCEPTED_FLAGS != 0 {
+            return Err(LINUX_EINVAL);
         }
-        None => {
-            release_eventfd(&eventfd, true);
-            linux_errno(LINUX_ENOSYS)
+        let eventfd = EventFdHandle::new(
+            initval,
+            flags & linux_abi::EFD_SEMAPHORE != 0,
+            flags & linux_abi::EFD_NONBLOCK != 0,
+        )
+        .map_err(|err| match err {
+            EventFdError::TooManyObjects => LINUX_ENFILE,
+            _ => LINUX_EINVAL,
+        })?;
+        let fd_flags = if flags & linux_abi::EFD_CLOEXEC != 0 {
+            multitask::FD_CLOEXEC
+        } else {
+            0
+        };
+        let entry = multitask::HandleEntry::new(
+            multitask::KernelHandle::EventFd(eventfd.clone()),
+            fd_flags,
+            eventfd.status_flags(),
+        );
+        match multitask::with_current_user_process_state_mut(|_, _, process_state| {
+            process_state.handles_mut().install_entry(entry)
+        }) {
+            Some(Some(fd)) => Ok(fd),
+            Some(None) => {
+                release_eventfd(&eventfd, true);
+                Err(LINUX_EMFILE)
+            }
+            None => {
+                release_eventfd(&eventfd, true);
+                Err(LINUX_ENOSYS)
+            }
         }
-    }
+    })())
 }
 
 pub fn syscall_linux_eventfd(initval: u64) -> u64 {
@@ -372,12 +417,17 @@ pub fn syscall_linux_eventfd(initval: u64) -> u64 {
 
 // ---- read / write ---------------------------------------------------------
 
-fn completed_or(progress: usize, errno: i64) -> u64 {
+fn completed_or_result(progress: usize, errno: i64) -> LinuxResult<u64> {
     if progress != 0 {
-        progress as u64
+        Ok(progress as u64)
     } else {
-        linux_errno(errno)
+        Err(errno)
     }
+}
+
+#[cfg(test)]
+fn completed_or(progress: usize, errno: i64) -> u64 {
+    linux_result(completed_or_result(progress, errno))
 }
 
 /// `read(2)` on a local fd; `None` when `fd` is not one.
@@ -403,73 +453,55 @@ pub(in crate::user::syscall::linux) fn write(fd: u64, user_ptr: u64, user_len: u
 const LOCAL_FD_STACK_SCRATCH_BYTES: usize = 4096;
 
 fn pipe_read(pipe: &PipeHandle, user_ptr: u64, user_len: u64) -> u64 {
-    if pipe.role() != PipeRole::Read {
-        return linux_errno(LINUX_EBADF);
-    }
-    let Ok(user_len) = usize::try_from(user_len) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if user_len == 0 {
-        return 0;
-    }
-    let mut stack = [0_u8; LOCAL_FD_STACK_SCRATCH_BYTES];
-    let mut heap = Vec::new();
-    loop {
-        // Size scratch by the queued bytes, sampling again after each wake.
-        // The one-byte minimum lets read_with distinguish EOF from an empty
-        // live pipe and return the wait generation under its own lock.
-        let want = user_len
-            .min(LOCAL_FD_IO_CHUNK_BYTES)
-            .min(pipe.shared().bytes_available().max(1));
-        if let Err(err) = usermem::validate_current_user_write_buffer(
-            user_ptr,
-            want.min(LOCAL_FD_STACK_SCRATCH_BYTES),
-        ) {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
+    linux_result((|| {
+        if pipe.role() != PipeRole::Read {
+            return Err(LINUX_EBADF);
         }
-        let scratch = if want <= LOCAL_FD_STACK_SCRATCH_BYTES {
-            &mut stack[..want]
-        } else {
-            if want > heap.len() {
-                if heap.try_reserve_exact(want - heap.len()).is_err() {
-                    return linux_errno(LINUX_ENOMEM);
-                }
-                heap.resize(want, 0);
-            }
-            &mut heap[..want]
-        };
-        let copied = pipe.shared().read_with(scratch, |bytes| {
-            usermem::write_current_user_bytes(user_ptr, bytes)
-        });
-        match copied {
-            Ok(progress) => {
-                publish(progress.wake);
-                return progress.bytes as u64;
-            }
-            // The user copy faulted; nothing was consumed from the pipe.
-            Err(PipeReadError::CopyOut(err)) => {
-                return linux_errno(user_pointer_error_to_linux_errno(err));
-            }
-            Err(PipeReadError::Pipe(PipeError::WouldBlock { generation })) => {
-                if pipe.nonblocking() {
-                    return linux_errno(LINUX_EAGAIN);
-                }
-                if current_wait_interrupted() {
-                    return linux_errno(LINUX_EINTR);
-                }
-                if let Err(errno) = wait_for_generation(pipe.token_id(), generation) {
-                    return linux_errno(errno);
-                }
-            }
-            Err(PipeReadError::Pipe(err)) => return linux_errno(pipe_error_errno(err)),
+        let user_len = usize::try_from(user_len).map_err(|_| LINUX_EINVAL)?;
+        if user_len == 0 {
+            return Ok(0);
         }
-    }
+        let mut stack = [0_u8; LOCAL_FD_STACK_SCRATCH_BYTES];
+        let mut heap = Vec::new();
+        loop {
+            // Size scratch by the queued bytes, sampling again after each wake.
+            // The one-byte minimum lets read_with distinguish EOF from an empty
+            // live pipe and return the wait generation under its own lock.
+            let want = user_len
+                .min(LOCAL_FD_IO_CHUNK_BYTES)
+                .min(pipe.shared().bytes_available().max(1));
+            validate_user_write(user_ptr, want.min(LOCAL_FD_STACK_SCRATCH_BYTES))?;
+            let scratch = if want <= LOCAL_FD_STACK_SCRATCH_BYTES {
+                &mut stack[..want]
+            } else {
+                if want > heap.len() {
+                    heap.try_reserve_exact(want - heap.len())
+                        .map_err(|_| LINUX_ENOMEM)?;
+                    heap.resize(want, 0);
+                }
+                &mut heap[..want]
+            };
+            let copied = pipe.shared().read_with(scratch, |bytes| write_user_bytes(user_ptr, bytes));
+            match copied {
+                Ok(progress) => {
+                    publish(progress.wake);
+                    return Ok(progress.bytes as u64);
+                }
+                // The user copy faulted; nothing was consumed from the pipe.
+                Err(PipeReadError::CopyOut(errno)) => return Err(errno),
+                Err(PipeReadError::Pipe(PipeError::WouldBlock { generation })) => {
+                    wait_local_wouldblock(pipe.token_id(), generation, pipe.nonblocking(), None)?;
+                }
+                Err(PipeReadError::Pipe(err)) => return Err(pipe_error_errno(err)),
+            }
+        }
+    })())
 }
 
-/// Pushes `chunk` into a pipe, blocking per the descriptor's mode. `done` is
-/// what the caller already delivered in this call. `Err` carries the final
-/// syscall result: the bytes moved so far when any, else the negative errno.
-fn pipe_push_chunk(pipe: &PipeHandle, chunk: &[u8], done: usize) -> Result<(), u64> {
+/// Pushes `chunk` into a pipe, blocking per the descriptor's mode. Returns
+/// `Ok(chunk.len())` when all bytes were queued, or `Err((sent, errno))`
+/// carrying any partial progress before the terminal error.
+fn pipe_push_chunk(pipe: &PipeHandle, chunk: &[u8]) -> Result<usize, (usize, i64)> {
     // A write of at most PIPE_BUF bytes is one atomic chunk; a larger
     // request stays a sequence of partial writes.
     let mut sent = 0_usize;
@@ -480,235 +512,221 @@ fn pipe_push_chunk(pipe: &PipeHandle, chunk: &[u8], done: usize) -> Result<(), u
                 publish(progress.wake);
             }
             Err(PipeError::WouldBlock { generation }) => {
-                if pipe.nonblocking() {
-                    return Err(completed_or(done + sent, LINUX_EAGAIN));
-                }
-                if current_wait_interrupted() {
-                    return Err(completed_or(done + sent, LINUX_EINTR));
-                }
-                if let Err(errno) = wait_for_generation(pipe.token_id(), generation) {
-                    return Err(completed_or(done + sent, errno));
+                if let Err(errno) =
+                    wait_local_wouldblock(pipe.token_id(), generation, pipe.nonblocking(), None)
+                {
+                    return Err((sent, errno));
                 }
             }
             Err(PipeError::BrokenPipe) => {
                 raise_sigpipe();
-                return Err(completed_or(done + sent, LINUX_EPIPE));
+                return Err((sent, LINUX_EPIPE));
             }
-            Err(err) => return Err(completed_or(done + sent, pipe_error_errno(err))),
+            Err(err) => return Err((sent, pipe_error_errno(err))),
         }
     }
-    Ok(())
+    Ok(sent)
 }
 
-/// Checks whether `fd` is a pipe and whether it is writable (`EBADF` if read end).
-pub(in crate::user::syscall::linux) fn check_pipe_write_fd(fd: u64) -> Option<Result<(), i64>> {
-    let local = current_local_fd(fd)?;
-    let LocalFd::Pipe(pipe) = &local else {
-        return None;
-    };
-    Some(if pipe.role() == PipeRole::Write {
-        Ok(())
-    } else {
-        Err(LINUX_EBADF)
-    })
-}
-
-/// Kernel-buffer `write(2)` to a pipe write end, for `sendfile`. `None` when
-/// `fd` is not a pipe; otherwise the bytes delivered, or the errno when none
-/// were. A short count is real progress (nonblocking pipe full, signal).
-pub(in crate::user::syscall::linux) fn pipe_write_bytes(
-    fd: u64,
+/// Kernel-buffer `write(2)` to a pinned pipe or Unix socket description, for
+/// `sendfile`. Returns the bytes delivered, or an errno when none were.
+pub(in crate::user::syscall::linux) fn write_pinned_local(
+    local: &LocalFd,
     data: &[u8],
-) -> Option<Result<usize, i64>> {
-    let local = current_local_fd(fd)?;
-    let LocalFd::Pipe(pipe) = &local else {
-        return None;
-    };
-    if pipe.role() != PipeRole::Write {
-        return Some(Err(LINUX_EBADF));
-    }
+) -> Result<usize, i64> {
     if data.is_empty() {
-        return Some(Ok(0));
+        return Ok(0);
     }
-    Some(match pipe_push_chunk(pipe, data, 0) {
-        Ok(()) => Ok(data.len()),
-        Err(raw) if is_linux_error(raw) => Err(-(raw as i64)),
-        Err(progress) => Ok(progress as usize),
-    })
+    match local {
+        LocalFd::Pipe(pipe) => {
+            if pipe.role() != PipeRole::Write {
+                return Err(LINUX_EBADF);
+            }
+            match pipe_push_chunk(pipe, data) {
+                Ok(n) => Ok(n),
+                Err((sent, errno)) => {
+                    if sent > 0 {
+                        Ok(sent)
+                    } else {
+                        Err(errno)
+                    }
+                }
+            }
+        }
+        LocalFd::UnixSocket(sock) => super::local_unix::unix_socket_write_bytes_handle(sock, data),
+        LocalFd::EventFd(_) => Err(LINUX_EINVAL),
+    }
 }
 
 fn pipe_write(pipe: &PipeHandle, user_ptr: u64, user_len: u64) -> u64 {
-    if pipe.role() != PipeRole::Write {
-        return linux_errno(LINUX_EBADF);
-    }
-    let Ok(user_len) = usize::try_from(user_len) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    // Linux completes an empty write without looking at the readers.
-    if user_len == 0 {
-        return 0;
-    }
-    let mut stack = [0_u8; LOCAL_FD_STACK_SCRATCH_BYTES];
-    let mut heap = Vec::new();
-    if user_len > LOCAL_FD_STACK_SCRATCH_BYTES
-        && heap.try_reserve_exact(user_len.min(LOCAL_FD_IO_CHUNK_BYTES)).is_err()
-    {
-        return linux_errno(LINUX_ENOMEM);
-    }
-    let mut total = 0_usize;
-    while total < user_len {
-        let chunk_len = (user_len - total).min(LOCAL_FD_IO_CHUNK_BYTES);
-        let chunk: &mut [u8] = if chunk_len <= LOCAL_FD_STACK_SCRATCH_BYTES {
-            &mut stack[..chunk_len]
-        } else {
-            heap.resize(chunk_len, 0);
-            &mut heap[..chunk_len]
-        };
-        let Some(source) = user_ptr.checked_add(total as u64) else {
-            return completed_or(total, LINUX_EFAULT);
-        };
-        if let Err(err) = usermem::copy_from_current_user_exact(source, chunk) {
-            return completed_or(total, user_pointer_error_to_linux_errno(err));
+    linux_result((|| {
+        if pipe.role() != PipeRole::Write {
+            return Err(LINUX_EBADF);
         }
-        if let Err(raw) = pipe_push_chunk(pipe, chunk, total) {
-            return raw;
+        let user_len = usize::try_from(user_len)
+            .map_err(|_| LINUX_EINVAL)?
+            .min(isize::MAX as usize);
+        // Linux completes an empty write without looking at the readers.
+        if user_len == 0 {
+            return Ok(0);
         }
-        total += chunk_len;
-    }
-    total as u64
+        let mut stack = [0_u8; LOCAL_FD_STACK_SCRATCH_BYTES];
+        let mut heap = Vec::new();
+        if user_len > LOCAL_FD_STACK_SCRATCH_BYTES {
+            heap.try_reserve_exact(user_len.min(LOCAL_FD_IO_CHUNK_BYTES))
+                .map_err(|_| LINUX_ENOMEM)?;
+        }
+        let mut total = 0_usize;
+        while total < user_len {
+            let chunk_len = (user_len - total).min(LOCAL_FD_IO_CHUNK_BYTES);
+            let chunk: &mut [u8] = if chunk_len <= LOCAL_FD_STACK_SCRATCH_BYTES {
+                &mut stack[..chunk_len]
+            } else {
+                heap.resize(chunk_len, 0);
+                &mut heap[..chunk_len]
+            };
+            let Some(source) = user_ptr.checked_add(total as u64) else {
+                return completed_or_result(total, LINUX_EFAULT);
+            };
+            if let Err(errno) = read_user_bytes(source, chunk) {
+                return completed_or_result(total, errno);
+            }
+            match pipe_push_chunk(pipe, chunk) {
+                Ok(n) => total += n,
+                Err((sent, errno)) => return completed_or_result(total + sent, errno),
+            }
+        }
+        Ok(total as u64)
+    })())
 }
 
 fn eventfd_read(eventfd: &EventFdHandle, user_ptr: u64, user_len: u64) -> u64 {
-    if user_len < size_of::<u64>() as u64 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, size_of::<u64>()) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    loop {
-        let generation = match eventfd.peek_read() {
-            Ok(value) => {
-                if let Err(err) = usermem::write_current_user_bytes(user_ptr, &value.to_ne_bytes()) {
-                    return linux_errno(user_pointer_error_to_linux_errno(err));
-                }
-                match eventfd.commit_read(value) {
-                    Ok(wake) => {
-                        publish(Some(wake));
-                        return size_of::<u64>() as u64;
+    linux_result((|| {
+        if user_len < size_of::<u64>() as u64 {
+            return Err(LINUX_EINVAL);
+        }
+        validate_user_write(user_ptr, size_of::<u64>())?;
+        loop {
+            let generation = match eventfd.peek_read() {
+                Ok(value) => {
+                    write_user_bytes(user_ptr, &value.to_ne_bytes())?;
+                    match eventfd.commit_read(value) {
+                        Ok(wake) => {
+                            publish(Some(wake));
+                            return Ok(size_of::<u64>() as u64);
+                        }
+                        Err(EventFdError::WouldBlock { .. }) => continue,
+                        Err(_) => return Err(LINUX_EINVAL),
                     }
-                    Err(EventFdError::WouldBlock { .. }) => continue,
-                    Err(_) => return linux_errno(LINUX_EINVAL),
                 }
-            }
-            Err(EventFdError::WouldBlock { generation }) => generation,
-            Err(_) => return linux_errno(LINUX_EINVAL),
-        };
-        if eventfd.nonblocking() {
-            return linux_errno(LINUX_EAGAIN);
+                Err(EventFdError::WouldBlock { generation }) => generation,
+                Err(_) => return Err(LINUX_EINVAL),
+            };
+            wait_local_wouldblock(eventfd.token_id(), generation, eventfd.nonblocking(), None)?;
         }
-        if current_wait_interrupted() {
-            return linux_errno(LINUX_EINTR);
-        }
-        if let Err(errno) = wait_for_generation(eventfd.token_id(), generation) {
-            return linux_errno(errno);
-        }
-    }
+    })())
 }
 
 fn eventfd_write(eventfd: &EventFdHandle, user_ptr: u64, user_len: u64) -> u64 {
-    if user_len < size_of::<u64>() as u64 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let mut bytes = [0_u8; size_of::<u64>()];
-    if let Err(err) = usermem::copy_from_current_user_exact(user_ptr, &mut bytes) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    let value = u64::from_ne_bytes(bytes);
-    loop {
-        match eventfd.try_write(value) {
-            Ok(wake) => {
-                publish(Some(wake));
-                return size_of::<u64>() as u64;
-            }
-            Err(EventFdError::InvalidValue) => return linux_errno(LINUX_EINVAL),
-            Err(EventFdError::WouldBlock { generation }) => {
-                if eventfd.nonblocking() {
-                    return linux_errno(LINUX_EAGAIN);
-                }
-                if current_wait_interrupted() {
-                    return linux_errno(LINUX_EINTR);
-                }
-                if let Err(errno) = wait_for_generation(eventfd.token_id(), generation) {
-                    return linux_errno(errno);
-                }
-            }
-            Err(EventFdError::TooManyObjects) => return linux_errno(LINUX_ENFILE),
+    linux_result((|| {
+        if user_len < size_of::<u64>() as u64 {
+            return Err(LINUX_EINVAL);
         }
-    }
+        let mut bytes = [0_u8; size_of::<u64>()];
+        read_user_bytes(user_ptr, &mut bytes)?;
+        let value = u64::from_ne_bytes(bytes);
+        loop {
+            match eventfd.try_write(value) {
+                Ok(wake) => {
+                    publish(Some(wake));
+                    return Ok(size_of::<u64>() as u64);
+                }
+                Err(EventFdError::InvalidValue) => return Err(LINUX_EINVAL),
+                Err(EventFdError::WouldBlock { generation }) => {
+                    wait_local_wouldblock(
+                        eventfd.token_id(),
+                        generation,
+                        eventfd.nonblocking(),
+                        None,
+                    )?;
+                }
+                Err(EventFdError::TooManyObjects) => return Err(LINUX_ENFILE),
+            }
+        }
+    })())
 }
 
 // ---- fcntl / ioctl / stat / seek -----------------------------------------
 
+fn parse_pipe_size_arg(arg: u64) -> Result<usize, i64> {
+    if (arg as i64) < 0 {
+        return Err(LINUX_EINVAL);
+    }
+    if arg <= u64::from(u32::MAX) && (arg as u32 as i32) < 0 {
+        return Err(LINUX_EINVAL);
+    }
+    usize::try_from(arg).map_err(|_| LINUX_EINVAL)
+}
+
 /// `fcntl` commands whose state lives on the open description. `None` leaves
 /// dup/`F_GETFD`/`F_SETFD` (fd-table state) to the generic implementation.
 pub(in crate::user::syscall::linux) fn fcntl(local: &LocalFd, cmd: u64, arg: u64) -> Option<u64> {
-    match cmd {
-        linux_abi::F_DUPFD | linux_abi::F_DUPFD_CLOEXEC | linux_abi::F_GETFD | linux_abi::F_SETFD => {
-            None
-        }
-        linux_abi::F_GETFL => Some(local.status_flags()),
+    if matches!(
+        cmd,
+        linux_abi::F_DUPFD | linux_abi::F_DUPFD_CLOEXEC | linux_abi::F_GETFD | linux_abi::F_SETFD
+    ) {
+        return None;
+    }
+    Some(linux_result((|| match cmd {
+        linux_abi::F_GETFL => Ok(local.status_flags()),
         linux_abi::F_SETFL => {
             // Only O_NONBLOCK is stored. Turning on O_DIRECT would select
             // packet mode, which does not exist here (Linux: EINVAL on a
             // description that has no direct I/O).
             if arg & linux_abi::O_DIRECT != 0 {
-                return Some(linux_errno(LINUX_EINVAL));
+                return Err(LINUX_EINVAL);
             }
             local.set_nonblocking(arg & linux_abi::O_NONBLOCK != 0);
-            Some(0)
+            Ok(0)
         }
-        linux_abi::F_GETPIPE_SZ => Some(match local {
-            LocalFd::Pipe(pipe) => pipe.shared().capacity() as u64,
-            LocalFd::EventFd(_) | LocalFd::UnixSocket(_) => linux_errno(LINUX_EBADF),
-        }),
-        linux_abi::F_SETPIPE_SZ => Some(match local {
+        linux_abi::F_GETPIPE_SZ => match local {
+            LocalFd::Pipe(pipe) => Ok(pipe.shared().capacity() as u64),
+            LocalFd::EventFd(_) | LocalFd::UnixSocket(_) => Err(LINUX_EBADF),
+        },
+        linux_abi::F_SETPIPE_SZ => match local {
             LocalFd::Pipe(pipe) => {
-                // `arg` is a C `int`; a negative size is invalid.
-                let Ok(requested) = usize::try_from(arg as u32 as i32) else {
-                    return Some(linux_errno(LINUX_EINVAL));
-                };
-                match pipe.shared().set_capacity(requested) {
-                    Ok((bytes, wake)) => {
-                        publish(wake);
-                        bytes as u64
-                    }
+                let requested = parse_pipe_size_arg(arg)?;
+                let (bytes, wake) = pipe.shared().set_capacity(requested).map_err(|err| match err {
                     // Above the (64 KiB) system pipe maximum: Linux's EPERM
                     // for an unprivileged caller past pipe-max-size.
-                    Err(PipeCapacityError::TooLarge) => linux_errno(LINUX_EPERM),
-                    Err(PipeCapacityError::Busy) => linux_errno(LINUX_EBUSY),
-                }
+                    PipeCapacityError::TooLarge => LINUX_EPERM,
+                    PipeCapacityError::Busy => LINUX_EBUSY,
+                })?;
+                publish(wake);
+                Ok(bytes as u64)
             }
-            LocalFd::EventFd(_) | LocalFd::UnixSocket(_) => linux_errno(LINUX_EBADF),
-        }),
-        _ => Some(linux_errno(LINUX_EINVAL)),
-    }
+            LocalFd::EventFd(_) | LocalFd::UnixSocket(_) => Err(LINUX_EBADF),
+        },
+        _ => Err(LINUX_EINVAL),
+    })()))
 }
 
 pub(in crate::user::syscall::linux) fn ioctl(local: &LocalFd, request: u64, arg: u64) -> u64 {
     linux_unit_result((|| match request {
         linux_abi::FIONREAD => match local {
-            LocalFd::Pipe(pipe) => {
-                write_user_bytes(arg, &(pipe.shared().bytes_available() as u32).to_ne_bytes())
-            }
-            LocalFd::UnixSocket(sock) => {
-                write_user_bytes(arg, &(sock.bytes_available() as u32).to_ne_bytes())
-            }
+            LocalFd::Pipe(pipe) => write_user_struct(
+                arg,
+                &u32::try_from(pipe.shared().bytes_available()).unwrap_or(u32::MAX),
+            ),
+            LocalFd::UnixSocket(sock) => write_user_struct(
+                arg,
+                &u32::try_from(sock.bytes_available()).unwrap_or(u32::MAX),
+            ),
             LocalFd::EventFd(_) => Err(LINUX_ENOTTY),
         },
         linux_abi::FIONBIO => {
-            let mut bytes = [0_u8; FIONREAD_RESULT_BYTES];
-            read_user_bytes(arg, &mut bytes)?;
-            local.set_nonblocking(i32::from_ne_bytes(bytes) != 0);
+            let value = read_user_struct::<i32>(arg)?;
+            local.set_nonblocking(value != 0);
             Ok(())
         }
         _ => Err(LINUX_ENOTTY),
@@ -807,5 +825,26 @@ mod tests {
     fn completed_bytes_win_over_a_later_error() {
         assert_eq!(completed_or(0, LINUX_EPIPE), linux_errno(LINUX_EPIPE));
         assert_eq!(completed_or(7, LINUX_EPIPE), 7);
+    }
+
+    #[test]
+    fn parse_pipe_size_arg_rejects_negative_and_does_not_truncate_upper_bits() {
+        assert_eq!(parse_pipe_size_arg(0), Ok(0));
+        assert_eq!(parse_pipe_size_arg(4096), Ok(4096));
+        assert_eq!(parse_pipe_size_arg((-1_i64) as u64), Err(LINUX_EINVAL));
+        assert_eq!(parse_pipe_size_arg(0xffff_ffff), Err(LINUX_EINVAL));
+        assert_eq!(parse_pipe_size_arg(0x8000_0000), Err(LINUX_EINVAL));
+        assert_eq!(parse_pipe_size_arg(0x1_0000_0000), Ok(0x1_0000_0000));
+        assert_eq!(parse_pipe_size_arg(0x1_0000_1000), Ok(0x1_0000_1000));
+    }
+
+    #[test]
+    fn pipe_push_chunk_returns_partial_progress_before_wouldblock() {
+        let (_read, write) = PipeHandle::new_pair(None, true).unwrap();
+        let fill = alloc::vec![0x5a_u8; kernel_ps::api::PIPE_MAX_CAPACITY - 8];
+        assert_eq!(pipe_push_chunk(&write, &fill), Ok(fill.len()));
+        // Non-atomic write (> PIPE_BUF) writes the remaining 8 bytes, then hits WouldBlock.
+        let tail = alloc::vec![0x3c_u8; kernel_ps::api::PIPE_BUF + 16];
+        assert_eq!(pipe_push_chunk(&write, &tail), Err((8, LINUX_EAGAIN)));
     }
 }

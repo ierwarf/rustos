@@ -31,12 +31,15 @@ use kernel_ps::api::{
 };
 use rustos_user_abi::syscall::{
     VFS_IPC_OP_ACCESS, VFS_IPC_OP_MKNOD, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_UNLINKAT, VFS_MKNOD_S_IFMT,
-    VFS_MKNOD_S_IFSOCK, WAITSET_PROVIDER_KERNEL,
+    VFS_MKNOD_S_IFSOCK,
 };
 
-use super::super::broker_ops::waitset_broker_ops::{
-    register_waitset_waiters, remove_waitset_waiters, waitset_waiters_match, wake_local_fd_object,
-    ProviderObservation,
+use super::super::broker_ops::waitset_broker_ops::wake_local_fd_object;
+use super::local_fd::wait_local_wouldblock;
+use super::vfs_meta::{
+    UserCopyMode, iovec_payload_total_len, read_current_iovecs_with_mode,
+    read_iovec_prefix_with_mode, write_iovec_payload_with_mode, write_msghdr_name,
+    write_sockaddr_payload_with_mode, write_sockopt_payload,
 };
 use super::*;
 
@@ -57,31 +60,10 @@ const AF_UNSPEC: u16 = 0;
 const SO_RCVTIMEO: u64 = 20;
 const SO_SNDTIMEO: u64 = 21;
 const MSG_WAITALL: u64 = 0x100;
+const SOCK_TYPE_MASK: u64 = 0xf;
+const SOCK_ACCEPTED_FLAGS: u64 = linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC;
 const MAX_UNIX_IO_BYTES: usize = 1024 * 1024;
-const MAX_IOV_COUNT: usize = 1024;
 const MAX_CONTROL_BYTES: usize = 64 * 1024;
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct LinuxIovec {
-    iov_base: u64,
-    iov_len: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct LinuxTimeval {
-    tv_sec: i64,
-    tv_usec: i64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct LinuxUcred {
-    pid: i32,
-    uid: u32,
-    gid: u32,
-}
 
 struct PinnedUnixSocket(UnixSocketHandle);
 
@@ -163,78 +145,6 @@ fn deadline_tick_from_us(timeout_us: Option<u64>) -> Option<u64> {
     Some(crate::arch::rtc::ticks().saturating_add(delta))
 }
 
-fn wait_for_generation(
-    token: u64,
-    generation: u64,
-    deadline_tick: Option<u64>,
-) -> Result<(), i64> {
-    if deadline_tick.is_some_and(|d| crate::arch::rtc::ticks() >= d) {
-        return Err(LINUX_EAGAIN);
-    }
-    let Some(task_id) = multitask::current_task_id() else {
-        return Err(LINUX_EINVAL);
-    };
-    let Some(process_id) = multitask::current_user_process_id() else {
-        return Err(LINUX_EINVAL);
-    };
-    let observation = [ProviderObservation {
-        provider: WAITSET_PROVIDER_KERNEL,
-        object_id: token,
-        generation,
-    }];
-    register_waitset_waiters(task_id, process_id, &observation)?;
-    match kernel_ps::api::local_fd_readiness_of(token) {
-        Some(current) if current.generation == generation => {}
-        _ => {
-            remove_waitset_waiters(task_id);
-            return Ok(());
-        }
-    }
-    if !multitask::arm_block_current_task() {
-        remove_waitset_waiters(task_id);
-        if multitask::current_task_id() != Some(task_id) {
-            return Err(LINUX_EINVAL);
-        }
-        multitask::cond_resched();
-        return Ok(());
-    }
-    if !waitset_waiters_match(task_id, process_id, &observation) {
-        remove_waitset_waiters(task_id);
-        let _ = multitask::cancel_block_current_task();
-        return Ok(());
-    }
-    if multitask::current_linux_thread_state()
-        .is_some_and(|state| state.pending_signals & !state.signal_mask != 0)
-    {
-        remove_waitset_waiters(task_id);
-        let _ = multitask::cancel_block_current_task();
-        multitask::cond_resched();
-        return Ok(());
-    }
-    if let Some(deadline) = deadline_tick
-        && !crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline)
-    {
-        remove_waitset_waiters(task_id);
-        let _ = multitask::cancel_block_current_task();
-        return Err(LINUX_EAGAIN);
-    }
-    let committed = multitask::commit_block_current_task_and_yield();
-    remove_waitset_waiters(task_id);
-    if deadline_tick.is_some() {
-        crate::arch::rtc::disarm_sleep_waiter(task_id);
-    }
-    if committed.is_none() {
-        return Err(LINUX_EINVAL);
-    }
-    if current_wait_interrupted() {
-        return Err(LINUX_EINTR);
-    }
-    if deadline_tick.is_some_and(|d| crate::arch::rtc::ticks() >= d) {
-        return Err(LINUX_EAGAIN);
-    }
-    Ok(())
-}
-
 // ---- Address parsing / encoding & vfsd helpers ----------------------------
 
 enum ParsedUnixAddr {
@@ -244,15 +154,12 @@ enum ParsedUnixAddr {
 }
 
 fn read_user_unix_addr(addr_ptr: u64, addrlen: u64) -> Result<ParsedUnixAddr, i64> {
-    let Ok(len) = usize::try_from(addrlen as u32) else {
-        return Err(LINUX_EINVAL);
-    };
+    let len = usize::try_from(addrlen).map_err(|_| LINUX_EINVAL)?;
     if len < 2 || len > 2 + UNIX_MAX_PATH_LEN {
         return Err(LINUX_EINVAL);
     }
     let mut buf = [0_u8; 2 + UNIX_MAX_PATH_LEN];
-    usermem::copy_from_current_user_exact(addr_ptr, &mut buf[..len])
-        .map_err(user_pointer_error_to_linux_errno)?;
+    read_user_bytes(addr_ptr, &mut buf[..len])?;
     let family = u16::from_ne_bytes([buf[0], buf[1]]);
     if family == AF_UNSPEC {
         return Ok(ParsedUnixAddr::Unspec);
@@ -385,12 +292,12 @@ fn parse_socket_type_and_flags(
     type_and_flags: u64,
     protocol: u64,
 ) -> Result<(UnixSocketType, bool, bool), i64> {
-    let raw = u64::from(type_and_flags as u32);
-    let flags = raw & (linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC);
-    let base_type = raw & !(linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC);
-    let Some(sock_type) = UnixSocketType::from_linux_type(base_type) else {
-        return Err(LINUX_ESOCKTNOSUPPORT);
-    };
+    let flags = type_and_flags & !SOCK_TYPE_MASK;
+    if flags & !SOCK_ACCEPTED_FLAGS != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let base_type = type_and_flags & SOCK_TYPE_MASK;
+    let sock_type = UnixSocketType::from_linux_type(base_type).ok_or(LINUX_ESOCKTNOSUPPORT)?;
     if protocol != 0 {
         return Err(LINUX_EPROTONOSUPPORT);
     }
@@ -428,19 +335,13 @@ pub(in crate::user::syscall::linux) fn syscall_linux_unix_socket(
     type_and_flags: u64,
     protocol: u64,
 ) -> u64 {
-    let (sock_type, nonblocking, cloexec) = match parse_socket_type_and_flags(type_and_flags, protocol)
-    {
-        Ok(parsed) => parsed,
-        Err(errno) => return linux_errno(errno),
-    };
-    let sock = match UnixSocketHandle::new(sock_type, nonblocking, current_credentials()) {
-        Ok(sock) => sock,
-        Err(err) => return linux_errno(unix_error_errno(err)),
-    };
-    match install_single_unix_socket(sock, cloexec) {
-        Ok(fd) => fd,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_result((|| {
+        let (sock_type, nonblocking, cloexec) =
+            parse_socket_type_and_flags(type_and_flags, protocol)?;
+        let sock = UnixSocketHandle::new(sock_type, nonblocking, current_credentials())
+            .map_err(unix_error_errno)?;
+        install_single_unix_socket(sock, cloexec)
+    })())
 }
 
 pub(in crate::user::syscall::linux) fn syscall_linux_unix_socketpair(
@@ -448,70 +349,59 @@ pub(in crate::user::syscall::linux) fn syscall_linux_unix_socketpair(
     protocol: u64,
     sv_ptr: u64,
 ) -> u64 {
-    let (sock_type, nonblocking, cloexec) = match parse_socket_type_and_flags(type_and_flags, protocol)
-    {
-        Ok(parsed) => parsed,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(err) = usermem::validate_current_user_write_buffer(sv_ptr, 2 * size_of::<i32>()) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    let (first, second) =
-        match UnixSocketHandle::new_pair(sock_type, nonblocking, current_credentials()) {
-            Ok(pair) => pair,
-            Err(err) => return linux_errno(unix_error_errno(err)),
-        };
-    let fd_flags = if cloexec { multitask::FD_CLOEXEC } else { 0 };
-    let e0 = multitask::HandleEntry::new(
-        multitask::KernelHandle::UnixSocket(first.clone()),
-        fd_flags,
-        first.status_flags(),
-    );
-    let e1 = multitask::HandleEntry::new(
-        multitask::KernelHandle::UnixSocket(second.clone()),
-        fd_flags,
-        second.status_flags(),
-    );
-    let installed = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-        let handles = process_state.handles_mut();
-        let fd0 = handles.install_entry(e0)?;
-        let Some(fd1) = handles.install_entry(e1) else {
-            let _ = handles.close(fd0);
-            return None;
-        };
-        Some((fd0, fd1))
-    });
-    let (fd0, fd1) = match installed {
-        Some(Some(pair)) => pair,
-        Some(None) => {
-            release_service_handle_refs_bounded(&[
-                ServiceHandleRef::UnixSocket(first),
-                ServiceHandleRef::UnixSocket(second),
-            ]);
-            return linux_errno(LINUX_EMFILE);
-        }
-        None => {
-            release_service_handle_refs_bounded(&[
-                ServiceHandleRef::UnixSocket(first),
-                ServiceHandleRef::UnixSocket(second),
-            ]);
-            return linux_errno(LINUX_ENOSYS);
-        }
-    };
-    let mut out = [0_u8; 2 * size_of::<i32>()];
-    out[..4].copy_from_slice(&(fd0 as i32).to_ne_bytes());
-    out[4..].copy_from_slice(&(fd1 as i32).to_ne_bytes());
-    if let Err(err) = usermem::write_current_user_bytes(sv_ptr, &out) {
-        let closed = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+    linux_unit_result((|| {
+        let (sock_type, nonblocking, cloexec) =
+            parse_socket_type_and_flags(type_and_flags, protocol)?;
+        validate_user_write(sv_ptr, 2 * size_of::<i32>())?;
+        let (first, second) =
+            UnixSocketHandle::new_pair(sock_type, nonblocking, current_credentials())
+                .map_err(unix_error_errno)?;
+        let fd_flags = if cloexec { multitask::FD_CLOEXEC } else { 0 };
+        let e0 = multitask::HandleEntry::new(
+            multitask::KernelHandle::UnixSocket(first.clone()),
+            fd_flags,
+            first.status_flags(),
+        );
+        let e1 = multitask::HandleEntry::new(
+            multitask::KernelHandle::UnixSocket(second.clone()),
+            fd_flags,
+            second.status_flags(),
+        );
+        let installed = multitask::with_current_user_process_state_mut(|_, _, process_state| {
             let handles = process_state.handles_mut();
-            (handles.close(fd0), handles.close(fd1))
+            let fd0 = handles.install_entry(e0)?;
+            let Some(fd1) = handles.install_entry(e1) else {
+                let _ = handles.close(fd0);
+                return None;
+            };
+            Some((fd0, fd1))
         });
-        if let Some((h0, h1)) = closed {
-            release_closed_handles(h0.into_iter().chain(h1));
+        let (fd0, fd1) = match installed {
+            Some(Some(pair)) => pair,
+            Some(None) => {
+                release_service_handle_refs_bounded(&[
+                    ServiceHandleRef::UnixSocket(first),
+                    ServiceHandleRef::UnixSocket(second),
+                ]);
+                return Err(LINUX_EMFILE);
+            }
+            None => {
+                release_service_handle_refs_bounded(&[
+                    ServiceHandleRef::UnixSocket(first),
+                    ServiceHandleRef::UnixSocket(second),
+                ]);
+                return Err(LINUX_ENOSYS);
+            }
+        };
+        let mut out = [0_u8; 2 * size_of::<i32>()];
+        out[..4].copy_from_slice(&(fd0 as i32).to_ne_bytes());
+        out[4..].copy_from_slice(&(fd1 as i32).to_ne_bytes());
+        if let Err(errno) = write_user_bytes(sv_ptr, &out) {
+            rollback_installed_fds(&[fd0 as i32, fd1 as i32]);
+            return Err(errno);
         }
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    0
+        Ok(())
+    })())
 }
 
 // ---- bind / listen / accept / connect -------------------------------------
@@ -522,19 +412,16 @@ pub(in crate::user::syscall::linux) fn try_bind(
     addrlen: u64,
 ) -> Option<u64> {
     let sock = pin_unix_socket(fd)?;
-    let parsed = match read_user_unix_addr(addr_ptr, addrlen) {
-        Ok(p) => p,
-        Err(errno) => return Some(linux_errno(errno)),
-    };
-    let result = match parsed {
-        ParsedUnixAddr::Unspec => Err(LINUX_EINVAL),
-        ParsedUnixAddr::Abstract(name) => {
-            let addr = UnixAddress::Abstract(name.clone());
-            let key = UnixNamespaceKey::Abstract(name);
-            sock.0.bind(addr, key).map_err(unix_error_errno)
-        }
-        ParsedUnixAddr::Pathname(path, raw) => match vfs_create_socket_node(&path) {
-            Ok((mount_id, node_id)) => {
+    Some(linux_unit_result((|| {
+        match read_user_unix_addr(addr_ptr, addrlen)? {
+            ParsedUnixAddr::Unspec => Err(LINUX_EINVAL),
+            ParsedUnixAddr::Abstract(name) => {
+                let addr = UnixAddress::Abstract(name.clone());
+                let key = UnixNamespaceKey::Abstract(name);
+                sock.0.bind(addr, key).map_err(unix_error_errno)
+            }
+            ParsedUnixAddr::Pathname(path, raw) => {
+                let (mount_id, node_id) = vfs_create_socket_node(&path)?;
                 let addr = UnixAddress::Pathname(raw);
                 let key = UnixNamespaceKey::Inode { mount_id, node_id };
                 if let Err(err) = sock.0.bind(addr, key) {
@@ -544,21 +431,15 @@ pub(in crate::user::syscall::linux) fn try_bind(
                     Ok(())
                 }
             }
-            Err(errno) => Err(errno),
-        },
-    };
-    Some(match result {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    })
+        }
+    })()))
 }
 
 pub(in crate::user::syscall::linux) fn try_listen(fd: u64, backlog: u64) -> Option<u64> {
     let sock = pin_unix_socket(fd)?;
-    Some(match sock.0.listen(backlog as i32) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(unix_error_errno(err)),
-    })
+    Some(linux_unit_result(
+        sock.0.listen(backlog as i32).map_err(unix_error_errno),
+    ))
 }
 
 pub(in crate::user::syscall::linux) fn try_accept4(
@@ -568,46 +449,57 @@ pub(in crate::user::syscall::linux) fn try_accept4(
     flags: u64,
 ) -> Option<u64> {
     let sock = pin_unix_socket(fd)?;
-    let flags = u64::from(flags as u32);
-    if flags & !(linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC) != 0 {
-        return Some(linux_errno(LINUX_EINVAL));
-    }
-    let child_nonblock = flags & linux_abi::SOCK_NONBLOCK != 0;
-    let child_cloexec = flags & linux_abi::SOCK_CLOEXEC != 0;
-    let deadline = deadline_tick_from_us(sock.0.rcvtimeo_us());
-    loop {
-        match sock.0.try_accept(child_nonblock) {
-            Ok((accepted, peer_addr)) => {
-                if addr_ptr != 0 {
-                    let encoded = encode_unix_addr(&peer_addr);
-                    if let Err(errno) =
-                        super::vfs_meta::write_current_sockaddr_payload(addr_ptr, addrlen_ptr, &encoded)
-                    {
-                        release_service_handle_refs_bounded(&[ServiceHandleRef::UnixSocket(
-                            accepted,
-                        )]);
-                        return Some(linux_errno(errno));
-                    }
-                }
-                return Some(match install_single_unix_socket(accepted, child_cloexec) {
-                    Ok(new_fd) => new_fd,
-                    Err(errno) => linux_errno(errno),
-                });
-            }
-            Err(UnixSocketError::WouldBlock { generation }) => {
-                if sock.0.nonblocking() {
-                    return Some(linux_errno(LINUX_EAGAIN));
-                }
-                if current_wait_interrupted() {
-                    return Some(linux_errno(LINUX_EINTR));
-                }
-                if let Err(errno) = wait_for_generation(sock.0.token_id(), generation, deadline) {
-                    return Some(linux_errno(errno));
-                }
-            }
-            Err(err) => return Some(linux_errno(unix_error_errno(err))),
+    Some(linux_result((|| {
+        if flags & !SOCK_ACCEPTED_FLAGS != 0 {
+            return Err(LINUX_EINVAL);
         }
-    }
+        if addr_ptr != 0 {
+            if addrlen_ptr == 0 {
+                return Err(LINUX_EFAULT);
+            }
+            let cap = read_user_struct::<i32>(addrlen_ptr)?;
+            if cap < 0 {
+                return Err(LINUX_EINVAL);
+            }
+            if cap > 0 {
+                validate_user_write(addr_ptr, (cap as usize).min(size_of::<u16>()))?;
+            }
+            validate_user_write_struct::<u32>(addrlen_ptr)?;
+        }
+        let child_nonblock = flags & linux_abi::SOCK_NONBLOCK != 0;
+        let child_cloexec = flags & linux_abi::SOCK_CLOEXEC != 0;
+        let deadline = deadline_tick_from_us(sock.0.rcvtimeo_us());
+        loop {
+            match sock.0.try_accept(child_nonblock) {
+                Ok((accepted, peer_addr)) => {
+                    if addr_ptr != 0 {
+                        let encoded = encode_unix_addr(&peer_addr);
+                        if let Err(errno) = write_sockaddr_payload_with_mode(
+                            addr_ptr,
+                            addrlen_ptr,
+                            &encoded,
+                            UserCopyMode::Pointer,
+                        ) {
+                            release_service_handle_refs_bounded(&[ServiceHandleRef::UnixSocket(
+                                accepted,
+                            )]);
+                            return Err(errno);
+                        }
+                    }
+                    return install_single_unix_socket(accepted, child_cloexec);
+                }
+                Err(UnixSocketError::WouldBlock { generation }) => {
+                    wait_local_wouldblock(
+                        sock.0.token_id(),
+                        generation,
+                        sock.0.nonblocking(),
+                        deadline,
+                    )?;
+                }
+                Err(err) => return Err(unix_error_errno(err)),
+            }
+        }
+    })()))
 }
 
 pub(in crate::user::syscall::linux) fn try_connect(
@@ -616,32 +508,24 @@ pub(in crate::user::syscall::linux) fn try_connect(
     addrlen: u64,
 ) -> Option<u64> {
     let sock = pin_unix_socket(fd)?;
-    let parsed = match read_user_unix_addr(addr_ptr, addrlen) {
-        Ok(p) => p,
-        Err(errno) => return Some(linux_errno(errno)),
-    };
-    if matches!(parsed, ParsedUnixAddr::Unspec) {
-        return Some(match sock.0.disconnect_dgram() {
-            Ok(()) => 0,
-            Err(err) => linux_errno(unix_error_errno(err)),
-        });
-    }
-    let key = match parsed {
-        ParsedUnixAddr::Unspec => unreachable!(),
-        ParsedUnixAddr::Abstract(name) => UnixNamespaceKey::Abstract(name),
-        ParsedUnixAddr::Pathname(path, _) => match vfs_stat_socket_inode(&path, true) {
-            Ok((mount_id, node_id)) => UnixNamespaceKey::Inode { mount_id, node_id },
-            Err(errno) => return Some(linux_errno(errno)),
-        },
-    };
-    let creds = current_credentials();
-    Some(match sock.0.connect(&key, creds) {
-        Ok(wake) => {
-            publish_wake(wake);
-            0
-        }
-        Err(err) => linux_errno(unix_error_errno(err)),
-    })
+    Some(linux_unit_result((|| {
+        let key = match read_user_unix_addr(addr_ptr, addrlen)? {
+            ParsedUnixAddr::Unspec => {
+                return sock.0.disconnect_dgram().map_err(unix_error_errno);
+            }
+            ParsedUnixAddr::Abstract(name) => UnixNamespaceKey::Abstract(name),
+            ParsedUnixAddr::Pathname(path, _) => {
+                let (mount_id, node_id) = vfs_stat_socket_inode(&path, true)?;
+                UnixNamespaceKey::Inode { mount_id, node_id }
+            }
+        };
+        let wake = sock
+            .0
+            .connect(&key, current_credentials())
+            .map_err(unix_error_errno)?;
+        publish_wake(wake);
+        Ok(())
+    })()))
 }
 
 // ---- getsockname / getpeername / shutdown / sockopts ----------------------
@@ -652,13 +536,13 @@ pub(in crate::user::syscall::linux) fn try_getsockname(
     addrlen_ptr: u64,
 ) -> Option<u64> {
     let sock = pin_unix_socket(fd)?;
-    let encoded = encode_unix_addr(&sock.0.sock_name());
-    Some(
-        match super::vfs_meta::write_current_sockaddr_payload(addr_ptr, addrlen_ptr, &encoded) {
-            Ok(()) => 0,
-            Err(errno) => linux_errno(errno),
-        },
-    )
+    Some(linux_unit_result((|| {
+        if addr_ptr == 0 || addrlen_ptr == 0 {
+            return Err(LINUX_EFAULT);
+        }
+        let encoded = encode_unix_addr(&sock.0.sock_name());
+        write_sockaddr_payload_with_mode(addr_ptr, addrlen_ptr, &encoded, UserCopyMode::Pointer)
+    })()))
 }
 
 pub(in crate::user::syscall::linux) fn try_getpeername(
@@ -667,67 +551,63 @@ pub(in crate::user::syscall::linux) fn try_getpeername(
     addrlen_ptr: u64,
 ) -> Option<u64> {
     let sock = pin_unix_socket(fd)?;
-    let peer_addr = match sock.0.peer_name() {
-        Ok(addr) => addr,
-        Err(err) => return Some(linux_errno(unix_error_errno(err))),
-    };
-    let encoded = encode_unix_addr(&peer_addr);
-    Some(
-        match super::vfs_meta::write_current_sockaddr_payload(addr_ptr, addrlen_ptr, &encoded) {
-            Ok(()) => 0,
-            Err(errno) => linux_errno(errno),
-        },
-    )
+    Some(linux_unit_result((|| {
+        if addr_ptr == 0 || addrlen_ptr == 0 {
+            return Err(LINUX_EFAULT);
+        }
+        let peer_addr = sock.0.peer_name().map_err(unix_error_errno)?;
+        let encoded = encode_unix_addr(&peer_addr);
+        write_sockaddr_payload_with_mode(addr_ptr, addrlen_ptr, &encoded, UserCopyMode::Pointer)
+    })()))
 }
 
 pub(in crate::user::syscall::linux) fn try_shutdown(fd: u64, how: u64) -> Option<u64> {
     let sock = pin_unix_socket(fd)?;
-    Some(match sock.0.shutdown(u64::from(how as u32)) {
-        Ok(wakes) => {
-            for wake in wakes {
-                publish_wake(wake);
-            }
-            0
+    Some(linux_unit_result((|| {
+        let wakes = sock
+            .0
+            .shutdown(u64::from(how as u32))
+            .map_err(unix_error_errno)?;
+        for wake in wakes {
+            publish_wake(wake);
         }
-        Err(err) => linux_errno(unix_error_errno(err)),
-    })
+        Ok(())
+    })()))
+}
+
+fn validate_sockopt_len(optlen: u64, min_len: usize) -> Result<(), i64> {
+    let len = i32::try_from(optlen).map_err(|_| LINUX_EINVAL)?;
+    if len < 0 || (len as usize) < min_len {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(())
 }
 
 fn read_opt_i32(optval_ptr: u64, optlen: u64) -> Result<i32, i64> {
-    if (optlen as u32 as usize) < size_of::<i32>() {
-        return Err(LINUX_EINVAL);
-    }
-    let mut bytes = [0_u8; 4];
-    read_user_bytes(optval_ptr, &mut bytes)?;
-    Ok(i32::from_ne_bytes(bytes))
+    validate_sockopt_len(optlen, size_of::<i32>())?;
+    read_user_struct::<i32>(optval_ptr)
 }
 
-fn read_opt_timeval_us(optval_ptr: u64, optlen: u64) -> Result<Option<u64>, i64> {
-    if (optlen as u32 as usize) < size_of::<LinuxTimeval>() {
+fn parse_timeval_timeout_us(tv: linux_abi::LinuxTimeval) -> Result<Option<u64>, i64> {
+    if tv.tv_sec < 0 || !(0..1_000_000).contains(&tv.tv_usec) {
         return Err(LINUX_EINVAL);
     }
-    let mut bytes = [0_u8; size_of::<LinuxTimeval>()];
-    read_user_bytes(optval_ptr, &mut bytes)?;
-    let tv_sec = i64::from_ne_bytes(bytes[0..8].try_into().unwrap());
-    let tv_usec = i64::from_ne_bytes(bytes[8..16].try_into().unwrap());
-    if tv_sec < 0 || !(0..1_000_000).contains(&tv_usec) {
-        return Err(LINUX_EINVAL);
-    }
-    let total = (tv_sec as u64)
-        .saturating_mul(1_000_000)
-        .saturating_add(tv_usec as u64);
+    let total = u64::try_from(tv.tv_sec)
+        .ok()
+        .and_then(|s| s.checked_mul(1_000_000))
+        .and_then(|us| us.checked_add(tv.tv_usec as u64))
+        .ok_or(LINUX_EINVAL)?;
     Ok((total > 0).then_some(total))
 }
 
+fn read_opt_timeval_us(optval_ptr: u64, optlen: u64) -> Result<Option<u64>, i64> {
+    validate_sockopt_len(optlen, size_of::<linux_abi::LinuxTimeval>())?;
+    let tv: linux_abi::LinuxTimeval = read_user_struct(optval_ptr)?;
+    parse_timeval_timeout_us(tv)
+}
+
 fn write_opt_bytes(optval_ptr: u64, optlen_ptr: u64, payload: &[u8]) -> Result<(), i64> {
-    if optval_ptr == 0 || optlen_ptr == 0 {
-        return Err(LINUX_EFAULT);
-    }
-    let cap = read_user_struct::<u32>(optlen_ptr)? as usize;
-    let copy_len = cap.min(payload.len());
-    write_user_bytes(optval_ptr, &payload[..copy_len])?;
-    let written = copy_len as u32;
-    write_user_struct(optlen_ptr, &written)
+    write_sockopt_payload(optval_ptr, optlen_ptr, payload, true, UserCopyMode::Pointer)
 }
 
 pub(in crate::user::syscall::linux) fn try_setsockopt(
@@ -738,42 +618,45 @@ pub(in crate::user::syscall::linux) fn try_setsockopt(
     optlen: u64,
 ) -> Option<u64> {
     let sock = pin_unix_socket(fd)?;
-    let level = u64::from(level as u32);
-    let optname = u64::from(optname as u32);
-    if level != linux_abi::SOL_SOCKET {
-        return Some(linux_errno(LINUX_ENOPROTOOPT));
-    }
-    let res = match optname {
-        linux_abi::SO_PASSCRED => read_opt_i32(optval_ptr, optlen).map(|v| {
-            sock.0.set_passcred(v != 0);
-        }),
-        linux_abi::SO_SNDBUF => read_opt_i32(optval_ptr, optlen).map(|v| {
-            sock.0.set_sndbuf(v.max(0) as usize);
-        }),
-        linux_abi::SO_RCVBUF => read_opt_i32(optval_ptr, optlen).map(|v| {
-            sock.0.set_rcvbuf(v.max(0) as usize);
-        }),
-        SO_RCVTIMEO => read_opt_timeval_us(optval_ptr, optlen).map(|us| {
-            sock.0.set_rcvtimeo_us(us);
-        }),
-        SO_SNDTIMEO => read_opt_timeval_us(optval_ptr, optlen).map(|us| {
-            sock.0.set_sndtimeo_us(us);
-        }),
-        linux_abi::SO_KEEPALIVE => read_opt_i32(optval_ptr, optlen).map(|v| {
-            sock.0.set_keepalive(v != 0);
-        }),
-        linux_abi::SO_REUSEADDR => read_opt_i32(optval_ptr, optlen).map(|v| {
-            sock.0.set_reuseaddr(v != 0);
-        }),
-        linux_abi::SO_REUSEPORT => read_opt_i32(optval_ptr, optlen).map(|v| {
-            sock.0.set_reuseport(v != 0);
-        }),
-        _ => Err(LINUX_ENOPROTOOPT),
-    };
-    Some(match res {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    })
+    Some(linux_unit_result((|| {
+        let level = u64::from(level as u32);
+        let optname = u64::from(optname as u32);
+        if level != linux_abi::SOL_SOCKET {
+            return Err(LINUX_ENOPROTOOPT);
+        }
+        match optname {
+            linux_abi::SO_PASSCRED => {
+                sock.0.set_passcred(read_opt_i32(optval_ptr, optlen)? != 0);
+            }
+            linux_abi::SO_SNDBUF => {
+                let v = read_opt_i32(optval_ptr, optlen)?;
+                sock.0.set_sndbuf(v.max(0) as usize);
+            }
+            linux_abi::SO_RCVBUF => {
+                let v = read_opt_i32(optval_ptr, optlen)?;
+                sock.0.set_rcvbuf(v.max(0) as usize);
+            }
+            SO_RCVTIMEO => {
+                sock.0
+                    .set_rcvtimeo_us(read_opt_timeval_us(optval_ptr, optlen)?);
+            }
+            SO_SNDTIMEO => {
+                sock.0
+                    .set_sndtimeo_us(read_opt_timeval_us(optval_ptr, optlen)?);
+            }
+            linux_abi::SO_KEEPALIVE => {
+                sock.0.set_keepalive(read_opt_i32(optval_ptr, optlen)? != 0);
+            }
+            linux_abi::SO_REUSEADDR => {
+                sock.0.set_reuseaddr(read_opt_i32(optval_ptr, optlen)? != 0);
+            }
+            linux_abi::SO_REUSEPORT => {
+                sock.0.set_reuseport(read_opt_i32(optval_ptr, optlen)? != 0);
+            }
+            _ => return Err(LINUX_ENOPROTOOPT),
+        }
+        Ok(())
+    })()))
 }
 
 pub(in crate::user::syscall::linux) fn try_getsockopt(
@@ -784,89 +667,87 @@ pub(in crate::user::syscall::linux) fn try_getsockopt(
     optlen_ptr: u64,
 ) -> Option<u64> {
     let sock = pin_unix_socket(fd)?;
-    let level = u64::from(level as u32);
-    let optname = u64::from(optname as u32);
-    if level != linux_abi::SOL_SOCKET {
-        return Some(linux_errno(LINUX_ENOPROTOOPT));
-    }
-    let res = match optname {
-        linux_abi::SO_TYPE => write_opt_bytes(
-            optval_ptr,
-            optlen_ptr,
-            &(sock.0.socket_type().to_linux_type() as i32).to_ne_bytes(),
-        ),
-        linux_abi::SO_DOMAIN => write_opt_bytes(
-            optval_ptr,
-            optlen_ptr,
-            &(linux_abi::AF_UNIX as i32).to_ne_bytes(),
-        ),
-        linux_abi::SO_PROTOCOL => write_opt_bytes(optval_ptr, optlen_ptr, &0_i32.to_ne_bytes()),
-        linux_abi::SO_ERROR => {
-            write_opt_bytes(optval_ptr, optlen_ptr, &sock.0.take_error().to_ne_bytes())
+    Some(linux_unit_result((|| {
+        let level = u64::from(level as u32);
+        let optname = u64::from(optname as u32);
+        if level != linux_abi::SOL_SOCKET {
+            return Err(LINUX_ENOPROTOOPT);
         }
-        linux_abi::SO_ACCEPTCONN => write_opt_bytes(
-            optval_ptr,
-            optlen_ptr,
-            &(i32::from(sock.0.is_listening())).to_ne_bytes(),
-        ),
-        linux_abi::SO_PEERCRED => {
-            let c = sock.0.peer_credentials();
-            let mut buf = [0_u8; size_of::<LinuxUcred>()];
-            buf[0..4].copy_from_slice(&c.pid().to_ne_bytes());
-            buf[4..8].copy_from_slice(&c.uid().to_ne_bytes());
-            buf[8..12].copy_from_slice(&c.gid().to_ne_bytes());
-            write_opt_bytes(optval_ptr, optlen_ptr, &buf)
+        match optname {
+            linux_abi::SO_TYPE => write_opt_bytes(
+                optval_ptr,
+                optlen_ptr,
+                &(sock.0.socket_type().to_linux_type() as i32).to_ne_bytes(),
+            ),
+            linux_abi::SO_DOMAIN => write_opt_bytes(
+                optval_ptr,
+                optlen_ptr,
+                &(linux_abi::AF_UNIX as i32).to_ne_bytes(),
+            ),
+            linux_abi::SO_PROTOCOL => write_opt_bytes(optval_ptr, optlen_ptr, &0_i32.to_ne_bytes()),
+            linux_abi::SO_ERROR => {
+                write_opt_bytes(optval_ptr, optlen_ptr, &sock.0.take_error().to_ne_bytes())
+            }
+            linux_abi::SO_ACCEPTCONN => write_opt_bytes(
+                optval_ptr,
+                optlen_ptr,
+                &(i32::from(sock.0.is_listening())).to_ne_bytes(),
+            ),
+            linux_abi::SO_PEERCRED => {
+                let c = sock.0.peer_credentials();
+                let mut buf = [0_u8; size_of::<linux_abi::LinuxUCred>()];
+                buf[0..4].copy_from_slice(&c.pid().to_ne_bytes());
+                buf[4..8].copy_from_slice(&c.uid().to_ne_bytes());
+                buf[8..12].copy_from_slice(&c.gid().to_ne_bytes());
+                write_opt_bytes(optval_ptr, optlen_ptr, &buf)
+            }
+            linux_abi::SO_PASSCRED => write_opt_bytes(
+                optval_ptr,
+                optlen_ptr,
+                &(i32::from(sock.0.passcred())).to_ne_bytes(),
+            ),
+            linux_abi::SO_SNDBUF => write_opt_bytes(
+                optval_ptr,
+                optlen_ptr,
+                &(sock.0.sndbuf() as i32).to_ne_bytes(),
+            ),
+            linux_abi::SO_RCVBUF => write_opt_bytes(
+                optval_ptr,
+                optlen_ptr,
+                &(sock.0.rcvbuf() as i32).to_ne_bytes(),
+            ),
+            SO_RCVTIMEO => {
+                let us = sock.0.rcvtimeo_us().unwrap_or(0);
+                let mut buf = [0_u8; size_of::<linux_abi::LinuxTimeval>()];
+                buf[0..8].copy_from_slice(&((us / 1_000_000) as i64).to_ne_bytes());
+                buf[8..16].copy_from_slice(&((us % 1_000_000) as i64).to_ne_bytes());
+                write_opt_bytes(optval_ptr, optlen_ptr, &buf)
+            }
+            SO_SNDTIMEO => {
+                let us = sock.0.sndtimeo_us().unwrap_or(0);
+                let mut buf = [0_u8; size_of::<linux_abi::LinuxTimeval>()];
+                buf[0..8].copy_from_slice(&((us / 1_000_000) as i64).to_ne_bytes());
+                buf[8..16].copy_from_slice(&((us % 1_000_000) as i64).to_ne_bytes());
+                write_opt_bytes(optval_ptr, optlen_ptr, &buf)
+            }
+            linux_abi::SO_KEEPALIVE => write_opt_bytes(
+                optval_ptr,
+                optlen_ptr,
+                &(i32::from(sock.0.keepalive())).to_ne_bytes(),
+            ),
+            linux_abi::SO_REUSEADDR => write_opt_bytes(
+                optval_ptr,
+                optlen_ptr,
+                &(i32::from(sock.0.reuseaddr())).to_ne_bytes(),
+            ),
+            linux_abi::SO_REUSEPORT => write_opt_bytes(
+                optval_ptr,
+                optlen_ptr,
+                &(i32::from(sock.0.reuseport())).to_ne_bytes(),
+            ),
+            _ => Err(LINUX_ENOPROTOOPT),
         }
-        linux_abi::SO_PASSCRED => write_opt_bytes(
-            optval_ptr,
-            optlen_ptr,
-            &(i32::from(sock.0.passcred())).to_ne_bytes(),
-        ),
-        linux_abi::SO_SNDBUF => write_opt_bytes(
-            optval_ptr,
-            optlen_ptr,
-            &(sock.0.sndbuf() as i32).to_ne_bytes(),
-        ),
-        linux_abi::SO_RCVBUF => write_opt_bytes(
-            optval_ptr,
-            optlen_ptr,
-            &(sock.0.rcvbuf() as i32).to_ne_bytes(),
-        ),
-        SO_RCVTIMEO => {
-            let us = sock.0.rcvtimeo_us().unwrap_or(0);
-            let mut buf = [0_u8; 16];
-            buf[0..8].copy_from_slice(&((us / 1_000_000) as i64).to_ne_bytes());
-            buf[8..16].copy_from_slice(&((us % 1_000_000) as i64).to_ne_bytes());
-            write_opt_bytes(optval_ptr, optlen_ptr, &buf)
-        }
-        SO_SNDTIMEO => {
-            let us = sock.0.sndtimeo_us().unwrap_or(0);
-            let mut buf = [0_u8; 16];
-            buf[0..8].copy_from_slice(&((us / 1_000_000) as i64).to_ne_bytes());
-            buf[8..16].copy_from_slice(&((us % 1_000_000) as i64).to_ne_bytes());
-            write_opt_bytes(optval_ptr, optlen_ptr, &buf)
-        }
-        linux_abi::SO_KEEPALIVE => write_opt_bytes(
-            optval_ptr,
-            optlen_ptr,
-            &(i32::from(sock.0.keepalive())).to_ne_bytes(),
-        ),
-        linux_abi::SO_REUSEADDR => write_opt_bytes(
-            optval_ptr,
-            optlen_ptr,
-            &(i32::from(sock.0.reuseaddr())).to_ne_bytes(),
-        ),
-        linux_abi::SO_REUSEPORT => write_opt_bytes(
-            optval_ptr,
-            optlen_ptr,
-            &(i32::from(sock.0.reuseport())).to_ne_bytes(),
-        ),
-        _ => Err(LINUX_ENOPROTOOPT),
-    };
-    Some(match res {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    })
+    })()))
 }
 
 // ---- SCM_RIGHTS / SCM_CREDENTIALS control message helpers -----------------
@@ -883,6 +764,35 @@ fn release_passed_handles(handles: Vec<PassedHandle>) {
         return;
     }
     release_closed_handles(handles.into_iter().map(|p| p.handle().clone()));
+}
+
+struct PassedHandlesGuard(Vec<PassedHandle>);
+
+impl PassedHandlesGuard {
+    fn take(&mut self) -> Vec<PassedHandle> {
+        core::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for PassedHandlesGuard {
+    fn drop(&mut self) {
+        release_passed_handles(core::mem::take(&mut self.0));
+    }
+}
+
+fn rollback_installed_fds(fds: &[i32]) {
+    if fds.is_empty() {
+        return;
+    }
+    let mut closed = Vec::with_capacity(fds.len());
+    let _ = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+        for &fd in fds {
+            if let Some(h) = process_state.handles_mut().close(fd as u64) {
+                closed.push(h);
+            }
+        }
+    });
+    release_closed_handles(closed);
 }
 
 fn acquire_passed_fds(fds: &[i32]) -> Result<Vec<PassedHandle>, i64> {
@@ -914,11 +824,11 @@ fn acquire_passed_fds(fds: &[i32]) -> Result<Vec<PassedHandle>, i64> {
 
     let mut acquired = Vec::with_capacity(snapshots.len());
     for passed in snapshots {
-        if let Some(handle_ref) = service_handle_ref_for_handle(passed.handle()) {
-            if let Err(errno) = acquire_service_handle_ref(&handle_ref) {
-                release_passed_handles(acquired);
-                return Err(errno);
-            }
+        if let Some(handle_ref) = service_handle_ref_for_handle(passed.handle())
+            && let Err(errno) = acquire_service_handle_ref(&handle_ref)
+        {
+            release_passed_handles(acquired);
+            return Err(errno);
         }
         acquired.push(passed);
     }
@@ -933,24 +843,32 @@ fn parse_send_control(
     if control_len == 0 {
         return Ok((Vec::new(), caller_creds));
     }
-    if control_ptr == 0 || control_len > MAX_CONTROL_BYTES {
+    if control_len < CMSG_HDR_LEN || control_len > MAX_CONTROL_BYTES {
         return Err(LINUX_EINVAL);
     }
+    if control_ptr == 0 {
+        return Err(LINUX_EFAULT);
+    }
     let mut buf = vec![0_u8; control_len];
-    usermem::copy_from_current_user_exact(control_ptr, &mut buf)
-        .map_err(user_pointer_error_to_linux_errno)?;
+    read_user_bytes(control_ptr, &mut buf)?;
 
     let mut raw_fds = Vec::new();
     let mut creds = caller_creds;
     let mut offset = 0_usize;
     while offset + CMSG_HDR_LEN <= buf.len() {
-        let cmsg_len = u64::from_ne_bytes(buf[offset..offset + 8].try_into().unwrap()) as usize;
+        let cmsg_len = usize::try_from(u64::from_ne_bytes(
+            buf[offset..offset + 8].try_into().unwrap(),
+        ))
+        .map_err(|_| LINUX_EINVAL)?;
         let cmsg_level = u32::from_ne_bytes(buf[offset + 8..offset + 12].try_into().unwrap());
         let cmsg_type = u32::from_ne_bytes(buf[offset + 12..offset + 16].try_into().unwrap());
-        if cmsg_len < CMSG_HDR_LEN || offset.saturating_add(cmsg_len) > buf.len() {
+        let Some(end) = offset.checked_add(cmsg_len) else {
+            return Err(LINUX_EINVAL);
+        };
+        if cmsg_len < CMSG_HDR_LEN || end > buf.len() {
             return Err(LINUX_EINVAL);
         }
-        let data = &buf[offset + CMSG_HDR_LEN..offset + cmsg_len];
+        let data = &buf[offset + CMSG_HDR_LEN..end];
         if u64::from(cmsg_level) == linux_abi::SOL_SOCKET {
             match u64::from(cmsg_type) {
                 linux_abi::SCM_RIGHTS => {
@@ -965,7 +883,7 @@ fn parse_send_control(
                     }
                 }
                 linux_abi::SCM_CREDENTIALS => {
-                    if data.len() != size_of::<LinuxUcred>() {
+                    if data.len() != size_of::<linux_abi::LinuxUCred>() {
                         return Err(LINUX_EINVAL);
                     }
                     let pid = i32::from_ne_bytes(data[0..4].try_into().unwrap());
@@ -986,10 +904,10 @@ fn parse_send_control(
             return Err(LINUX_EINVAL);
         }
         let step = cmsg_align(cmsg_len);
-        if offset.saturating_add(step) <= buf.len() {
+        if offset.checked_add(step).is_some_and(|next| next <= buf.len()) {
             offset += step;
         } else {
-            offset += cmsg_len;
+            offset = end;
         }
     }
     let rights = if raw_fds.is_empty() {
@@ -1006,18 +924,22 @@ fn write_recv_control(
     rights: Vec<PassedHandle>,
     creds: Option<SocketCredentials>,
     cloexec: bool,
-) -> Result<(usize, u32), i64> {
+) -> Result<(usize, u32, Vec<i32>), i64> {
     if control_ptr == 0 || control_cap == 0 {
         let truncated = !rights.is_empty() || creds.is_some();
         release_passed_handles(rights);
-        return Ok((0, if truncated { linux_abi::MSG_CTRUNC as u32 } else { 0 }));
+        return Ok((
+            0,
+            if truncated { linux_abi::MSG_CTRUNC as u32 } else { 0 },
+            Vec::new(),
+        ));
     }
 
     let mut out = Vec::new();
     let mut msg_flags = 0_u32;
 
     if let Some(c) = creds {
-        let len = CMSG_HDR_LEN + size_of::<LinuxUcred>();
+        let len = CMSG_HDR_LEN + size_of::<linux_abi::LinuxUCred>();
         let aligned = cmsg_align(len);
         if out.len() + len <= control_cap {
             let start = out.len();
@@ -1046,9 +968,8 @@ fn write_recv_control(
         } else {
             let fd_flags = if cloexec { multitask::FD_CLOEXEC } else { 0 };
             let mut leftover = Vec::new();
-            let mut iter = rights.into_iter();
             let _ = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-                for passed in iter.by_ref() {
+                for passed in rights {
                     if installed_fds.len() >= max_fit {
                         leftover.push(passed);
                         continue;
@@ -1089,90 +1010,83 @@ fn write_recv_control(
         }
     }
 
-    if !out.is_empty() {
-        if let Err(err) = usermem::write_current_user_bytes(control_ptr, &out) {
-            if !installed_fds.is_empty() {
-                let mut closed = Vec::new();
-                let _ = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-                    for fd in installed_fds {
-                        if let Some(h) = process_state.handles_mut().close(fd as u64) {
-                            closed.push(h);
-                        }
-                    }
-                });
-                release_closed_handles(closed);
-            }
-            return Err(user_pointer_error_to_linux_errno(err));
-        }
+    if !out.is_empty()
+        && let Err(errno) = write_user_bytes(control_ptr, &out)
+    {
+        rollback_installed_fds(&installed_fds);
+        return Err(errno);
     }
 
-    Ok((out.len(), msg_flags))
+    Ok((out.len(), msg_flags, installed_fds))
 }
 
 // ---- send / recv / read / write -------------------------------------------
 
-fn send_core(
+fn send_core_bytes(
     sock: &UnixSocketHandle,
     data: &[u8],
-    mut rights: Vec<PassedHandle>,
+    rights: Vec<PassedHandle>,
     creds: SocketCredentials,
     flags: u64,
     target_key: Option<&UnixNamespaceKey>,
-) -> u64 {
+) -> Result<usize, i64> {
     let nonblocking = sock.nonblocking() || flags & linux_abi::MSG_DONTWAIT != 0;
     let nosignal = flags & linux_abi::MSG_NOSIGNAL != 0;
     let deadline = deadline_tick_from_us(sock.sndtimeo_us());
+    let mut rights = PassedHandlesGuard(rights);
     let mut sent = 0_usize;
 
     loop {
         let slice = &data[sent..];
-        let to_send_rights = core::mem::take(&mut rights);
+        let to_send_rights = rights.take();
         match sock.try_send(slice, to_send_rights, creds, target_key) {
             Ok(outcome) => {
                 publish_wake(outcome.wake);
                 sent += outcome.bytes;
                 if sock.socket_type() != UnixSocketType::Stream || sent >= data.len() {
-                    return sent as u64;
+                    return Ok(sent);
                 }
             }
             Err((UnixSocketError::WouldBlock { generation }, returned_rights)) => {
-                rights = returned_rights;
-                if sent > 0 {
-                    release_passed_handles(rights);
-                    return sent as u64;
-                }
-                if nonblocking {
-                    release_passed_handles(rights);
-                    return linux_errno(LINUX_EAGAIN);
-                }
-                if current_wait_interrupted() {
-                    release_passed_handles(rights);
-                    return linux_errno(LINUX_EINTR);
-                }
-                if let Err(errno) = wait_for_generation(sock.token_id(), generation, deadline) {
-                    release_passed_handles(rights);
-                    return linux_errno(errno);
+                rights.0 = returned_rights;
+                if let Err(errno) =
+                    wait_local_wouldblock(sock.token_id(), generation, nonblocking, deadline)
+                {
+                    if sent > 0 {
+                        return Ok(sent);
+                    }
+                    return Err(errno);
                 }
             }
             Err((UnixSocketError::BrokenPipe, returned_rights)) => {
-                release_passed_handles(returned_rights);
+                rights.0 = returned_rights;
                 if sent > 0 {
-                    return sent as u64;
+                    return Ok(sent);
                 }
                 if !nosignal {
                     raise_sigpipe();
                 }
-                return linux_errno(LINUX_EPIPE);
+                return Err(LINUX_EPIPE);
             }
             Err((err, returned_rights)) => {
-                release_passed_handles(returned_rights);
+                rights.0 = returned_rights;
                 if sent > 0 {
-                    return sent as u64;
+                    return Ok(sent);
                 }
-                return linux_errno(unix_error_errno(err));
+                return Err(unix_error_errno(err));
             }
         }
     }
+}
+
+pub(super) fn unix_socket_write_bytes_handle(
+    sock: &UnixSocketHandle,
+    data: &[u8],
+) -> Result<usize, i64> {
+    if data.is_empty() {
+        return Ok(0);
+    }
+    send_core_bytes(sock, data, Vec::new(), current_credentials(), 0, None)
 }
 
 fn recv_core(
@@ -1190,13 +1104,7 @@ fn recv_core(
                 return Ok(msg);
             }
             Err(UnixSocketError::WouldBlock { generation }) => {
-                if nonblocking {
-                    return Err(LINUX_EAGAIN);
-                }
-                if current_wait_interrupted() {
-                    return Err(LINUX_EINTR);
-                }
-                wait_for_generation(sock.token_id(), generation, deadline)?;
+                wait_local_wouldblock(sock.token_id(), generation, nonblocking, deadline)?;
             }
             Err(err) => return Err(unix_error_errno(err)),
         }
@@ -1204,45 +1112,35 @@ fn recv_core(
 }
 
 pub(super) fn read_unix_socket(sock: &UnixSocketHandle, user_ptr: u64, user_len: u64) -> u64 {
-    let Ok(len) = usize::try_from(user_len) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if len == 0 {
-        return 0;
-    }
-    let capped = len.min(MAX_UNIX_IO_BYTES);
-    if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, capped.min(4096)) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    let msg = match recv_core(sock, capped, 0) {
-        Ok(msg) => msg,
-        Err(errno) => return linux_errno(errno),
-    };
-    release_passed_handles(msg.rights);
-    if !msg.data.is_empty()
-        && let Err(err) = usermem::write_current_user_bytes(user_ptr, &msg.data)
-    {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    msg.data.len() as u64
+    linux_result((|| {
+        let len = usize::try_from(user_len).map_err(|_| LINUX_EINVAL)?;
+        if len == 0 {
+            return Ok(0);
+        }
+        let capped = len.min(MAX_UNIX_IO_BYTES);
+        validate_user_write(user_ptr, capped.min(4096))?;
+        let msg = recv_core(sock, capped, 0)?;
+        release_passed_handles(msg.rights);
+        if !msg.data.is_empty() {
+            write_user_bytes(user_ptr, &msg.data)?;
+        }
+        Ok(msg.data.len() as u64)
+    })())
 }
 
 pub(super) fn write_unix_socket(sock: &UnixSocketHandle, user_ptr: u64, user_len: u64) -> u64 {
-    let Ok(len) = usize::try_from(user_len) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    let capped = len.min(MAX_UNIX_IO_BYTES);
-    let mut buf = Vec::new();
-    if capped > 0 {
-        if buf.try_reserve_exact(capped).is_err() {
-            return linux_errno(LINUX_ENOMEM);
+    linux_result((|| {
+        let len = usize::try_from(user_len).map_err(|_| LINUX_EINVAL)?;
+        let capped = len.min(MAX_UNIX_IO_BYTES);
+        let mut buf = Vec::new();
+        if capped > 0 {
+            buf.try_reserve_exact(capped).map_err(|_| LINUX_ENOMEM)?;
+            buf.resize(capped, 0);
+            read_user_bytes(user_ptr, &mut buf)?;
         }
-        buf.resize(capped, 0);
-        if let Err(err) = usermem::copy_from_current_user_exact(user_ptr, &mut buf) {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
-        }
-    }
-    send_core(sock, &buf, Vec::new(), current_credentials(), 0, None)
+        let sent = send_core_bytes(sock, &buf, Vec::new(), current_credentials(), 0, None)?;
+        Ok(sent as u64)
+    })())
 }
 
 pub(in crate::user::syscall::linux) fn try_sendto(
@@ -1256,6 +1154,9 @@ pub(in crate::user::syscall::linux) fn try_sendto(
     let sock = pin_unix_socket(fd)?;
     Some(linux_result((|| {
         let len = usize::try_from(len).map_err(|_| LINUX_EINVAL)?;
+        if len > MAX_UNIX_IO_BYTES && sock.0.socket_type() != UnixSocketType::Stream {
+            return Err(LINUX_EMSGSIZE);
+        }
         let capped = len.min(MAX_UNIX_IO_BYTES);
         let mut buf = Vec::new();
         if capped > 0 {
@@ -1263,20 +1164,20 @@ pub(in crate::user::syscall::linux) fn try_sendto(
             buf.resize(capped, 0);
             read_user_bytes(buf_ptr, &mut buf)?;
         }
-        let target_key = if dest_addr != 0 && addrlen != 0 {
+        let target_key = if dest_addr != 0 {
             Some(resolve_target_key(dest_addr, addrlen)?)
         } else {
             None
         };
-        let raw = send_core(
+        let sent = send_core_bytes(
             &sock.0,
             &buf,
             Vec::new(),
             current_credentials(),
             flags,
             target_key.as_ref(),
-        );
-        if is_linux_error(raw) { Err(-(raw as i64)) } else { Ok(raw) }
+        )?;
+        Ok(sent as u64)
     })()))
 }
 
@@ -1300,13 +1201,18 @@ pub(in crate::user::syscall::linux) fn try_recvfrom(
         if !msg.data.is_empty() {
             write_user_bytes(buf_ptr, &msg.data)?;
         }
-        if src_addr != 0 && addrlen_ptr != 0 {
+        if src_addr != 0 {
             let encoded = if msg.sender_addr == UnixAddress::Unnamed {
                 Vec::new()
             } else {
                 encode_unix_addr(&msg.sender_addr)
             };
-            super::vfs_meta::write_current_sockaddr_payload(src_addr, addrlen_ptr, &encoded)?;
+            write_sockaddr_payload_with_mode(
+                src_addr,
+                addrlen_ptr,
+                &encoded,
+                UserCopyMode::Pointer,
+            )?;
         }
         let ret = if flags & linux_abi::MSG_TRUNC != 0 {
             msg.original_len
@@ -1317,103 +1223,40 @@ pub(in crate::user::syscall::linux) fn try_recvfrom(
     })()))
 }
 
-fn read_iovecs(iov_ptr: u64, iovlen: u64) -> Result<Vec<LinuxIovec>, i64> {
-    let Ok(count) = usize::try_from(iovlen) else {
-        return Err(LINUX_EMSGSIZE);
-    };
-    if count > MAX_IOV_COUNT {
-        return Err(LINUX_EMSGSIZE);
-    }
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-    let mut raw = vec![0_u8; count * size_of::<LinuxIovec>()];
-    usermem::copy_from_current_user_exact(iov_ptr, &mut raw)
-        .map_err(user_pointer_error_to_linux_errno)?;
-    let mut iovs = Vec::with_capacity(count);
-    for chunk in raw.chunks_exact(size_of::<LinuxIovec>()) {
-        iovs.push(LinuxIovec {
-            iov_base: u64::from_ne_bytes(chunk[0..8].try_into().unwrap()),
-            iov_len: u64::from_ne_bytes(chunk[8..16].try_into().unwrap()),
-        });
-    }
-    Ok(iovs)
-}
-
 pub(in crate::user::syscall::linux) fn try_sendmsg(
     fd: u64,
     msg_ptr: u64,
     flags: u64,
 ) -> Option<u64> {
     let sock = pin_unix_socket(fd)?;
-    let hdr = match usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(msg_ptr) {
-        Ok(hdr) => hdr,
-        Err(err) => return Some(linux_errno(user_pointer_error_to_linux_errno(err))),
-    };
-    let iovs = match read_iovecs(hdr.msg_iov, hdr.msg_iovlen) {
-        Ok(iovs) => iovs,
-        Err(errno) => return Some(linux_errno(errno)),
-    };
-    let mut total_len = 0_usize;
-    for iov in &iovs {
-        let Ok(n) = usize::try_from(iov.iov_len) else {
-            return Some(linux_errno(LINUX_EINVAL));
+    Some(linux_result((|| {
+        let hdr: linux_abi::LinuxMsghdr = read_user_struct(msg_ptr)?;
+        let iovs =
+            read_current_iovecs_with_mode(hdr.msg_iov, hdr.msg_iovlen, UserCopyMode::Pointer)?;
+        let total_len = iovec_payload_total_len(&iovs)?;
+        if total_len > MAX_UNIX_IO_BYTES {
+            return Err(LINUX_EMSGSIZE);
+        }
+        let payload = read_iovec_prefix_with_mode(&iovs, total_len, UserCopyMode::Pointer)?;
+        let control_len = usize::try_from(hdr.msg_controllen).map_err(|_| LINUX_EINVAL)?;
+        let caller_creds = current_credentials();
+        let (rights, creds) = parse_send_control(hdr.msg_control, control_len, caller_creds)?;
+        let mut rights = PassedHandlesGuard(rights);
+        let target_key = if hdr.msg_name != 0 && hdr.msg_namelen != 0 {
+            Some(resolve_target_key(hdr.msg_name, u64::from(hdr.msg_namelen))?)
+        } else {
+            None
         };
-        total_len = match total_len.checked_add(n) {
-            Some(v) if v <= MAX_UNIX_IO_BYTES => v,
-            _ => return Some(linux_errno(LINUX_EMSGSIZE)),
-        };
-    }
-    let mut payload = Vec::new();
-    if total_len > 0 {
-        if payload.try_reserve_exact(total_len).is_err() {
-            return Some(linux_errno(LINUX_ENOMEM));
-        }
-        payload.resize(total_len, 0);
-        let mut off = 0_usize;
-        for iov in &iovs {
-            let n = iov.iov_len as usize;
-            if n == 0 {
-                continue;
-            }
-            if let Err(err) =
-                usermem::copy_from_current_user_exact(iov.iov_base, &mut payload[off..off + n])
-            {
-                return Some(linux_errno(user_pointer_error_to_linux_errno(err)));
-            }
-            off += n;
-        }
-    }
-
-    let caller_creds = current_credentials();
-    let (rights, creds) = match parse_send_control(
-        hdr.msg_control,
-        hdr.msg_controllen as usize,
-        caller_creds,
-    ) {
-        Ok(parsed) => parsed,
-        Err(errno) => return Some(linux_errno(errno)),
-    };
-    let target_key = if hdr.msg_name != 0 && hdr.msg_namelen != 0 {
-        match resolve_target_key(hdr.msg_name, u64::from(hdr.msg_namelen)) {
-            Ok(key) => Some(key),
-            Err(errno) => {
-                release_passed_handles(rights);
-                return Some(linux_errno(errno));
-            }
-        }
-    } else {
-        None
-    };
-
-    Some(send_core(
-        &sock.0,
-        &payload,
-        rights,
-        creds,
-        flags,
-        target_key.as_ref(),
-    ))
+        let sent = send_core_bytes(
+            &sock.0,
+            &payload,
+            rights.take(),
+            creds,
+            flags,
+            target_key.as_ref(),
+        )?;
+        Ok(sent as u64)
+    })()))
 }
 
 pub(in crate::user::syscall::linux) fn try_recvmsg(
@@ -1424,61 +1267,44 @@ pub(in crate::user::syscall::linux) fn try_recvmsg(
     let sock = pin_unix_socket(fd)?;
     Some(linux_result((|| {
         let mut hdr: linux_abi::LinuxMsghdr = read_user_struct(msg_ptr)?;
-        let iovs = read_iovecs(hdr.msg_iov, hdr.msg_iovlen)?;
-        let mut total_cap = 0_usize;
-        for iov in &iovs {
-            let n = usize::try_from(iov.iov_len).map_err(|_| LINUX_EINVAL)?;
-            total_cap = total_cap.saturating_add(n).min(MAX_UNIX_IO_BYTES);
-        }
+        validate_user_write_struct::<linux_abi::LinuxMsghdr>(msg_ptr)?;
+        let iovs =
+            read_current_iovecs_with_mode(hdr.msg_iov, hdr.msg_iovlen, UserCopyMode::Pointer)?;
+        let total_cap = iovec_payload_total_len(&iovs)?.min(MAX_UNIX_IO_BYTES);
+        let control_cap = usize::try_from(hdr.msg_controllen).map_err(|_| LINUX_EINVAL)?;
 
         let msg = recv_core(&sock.0, total_cap, flags & !MSG_WAITALL)?;
+        let mut rights = PassedHandlesGuard(msg.rights);
 
-        let mut copied = 0_usize;
-        for iov in &iovs {
-            let n = (iov.iov_len as usize).min(msg.data.len().saturating_sub(copied));
-            if n == 0 {
-                continue;
-            }
-            if let Err(errno) = write_user_bytes(iov.iov_base, &msg.data[copied..copied + n]) {
-                release_passed_handles(msg.rights);
-                return Err(errno);
-            }
-            copied += n;
-        }
+        let copied = write_iovec_payload_with_mode(&iovs, &msg.data, UserCopyMode::Pointer)?;
 
         let mut out_flags = 0_u32;
         if msg.original_len > msg.data.len() {
             out_flags |= linux_abi::MSG_TRUNC as u32;
         }
 
-        if hdr.msg_name != 0 && hdr.msg_namelen != 0 {
-            let encoded = if msg.sender_addr == UnixAddress::Unnamed {
-                Vec::new()
-            } else {
-                encode_unix_addr(&msg.sender_addr)
-            };
-            let copy_len = encoded.len().min(hdr.msg_namelen as usize);
-            if copy_len > 0
-                && let Err(errno) = write_user_bytes(hdr.msg_name, &encoded[..copy_len])
-            {
-                release_passed_handles(msg.rights);
-                return Err(errno);
-            }
-            hdr.msg_namelen = encoded.len() as u32;
-        }
+        let encoded = if msg.sender_addr == UnixAddress::Unnamed {
+            Vec::new()
+        } else {
+            encode_unix_addr(&msg.sender_addr)
+        };
+        write_msghdr_name(&mut hdr, &encoded, UserCopyMode::Pointer)?;
 
         let cloexec = flags & linux_abi::MSG_CMSG_CLOEXEC != 0;
-        let (ctrl_written, ctrl_flags) = write_recv_control(
+        let (ctrl_written, ctrl_flags, installed_fds) = write_recv_control(
             hdr.msg_control,
-            hdr.msg_controllen as usize,
-            msg.rights,
+            control_cap,
+            rights.take(),
             msg.creds,
             cloexec,
         )?;
         hdr.msg_controllen = ctrl_written as u64;
         hdr.msg_flags = out_flags | ctrl_flags;
 
-        write_user_struct(msg_ptr, &hdr)?;
+        if let Err(errno) = write_user_struct(msg_ptr, &hdr) {
+            rollback_installed_fds(&installed_fds);
+            return Err(errno);
+        }
 
         let ret = if flags & linux_abi::MSG_TRUNC != 0 {
             msg.original_len
@@ -1487,4 +1313,86 @@ pub(in crate::user::syscall::linux) fn try_recvmsg(
         };
         Ok(ret as u64)
     })()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_socket_type_and_flags_rejects_unknown_flags_and_types() {
+        assert_eq!(
+            parse_socket_type_and_flags(
+                linux_abi::SOCK_STREAM | linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC,
+                0
+            ),
+            Ok((UnixSocketType::Stream, true, true))
+        );
+        assert_eq!(
+            parse_socket_type_and_flags(linux_abi::SOCK_STREAM | 0x1000, 0),
+            Err(LINUX_EINVAL)
+        );
+        assert_eq!(
+            parse_socket_type_and_flags(linux_abi::SOCK_STREAM | (1_u64 << 32), 0),
+            Err(LINUX_EINVAL)
+        );
+        assert_eq!(
+            parse_socket_type_and_flags(
+                rustos_user_abi::syscall::NET_BROKER_PUBLICATION_SOCK_RAW,
+                0
+            ),
+            Err(LINUX_ESOCKTNOSUPPORT)
+        );
+        assert_eq!(
+            parse_socket_type_and_flags(linux_abi::SOCK_DGRAM, 17),
+            Err(LINUX_EPROTONOSUPPORT)
+        );
+    }
+
+    #[test]
+    fn parse_timeval_timeout_us_rejects_negative_and_overflow() {
+        assert_eq!(
+            parse_timeval_timeout_us(linux_abi::LinuxTimeval {
+                tv_sec: 0,
+                tv_usec: 0
+            }),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_timeval_timeout_us(linux_abi::LinuxTimeval {
+                tv_sec: 2,
+                tv_usec: 500_000
+            }),
+            Ok(Some(2_500_000))
+        );
+        assert_eq!(
+            parse_timeval_timeout_us(linux_abi::LinuxTimeval {
+                tv_sec: -1,
+                tv_usec: 0
+            }),
+            Err(LINUX_EINVAL)
+        );
+        assert_eq!(
+            parse_timeval_timeout_us(linux_abi::LinuxTimeval {
+                tv_sec: 0,
+                tv_usec: 1_000_000
+            }),
+            Err(LINUX_EINVAL)
+        );
+        assert_eq!(
+            parse_timeval_timeout_us(linux_abi::LinuxTimeval {
+                tv_sec: i64::MAX,
+                tv_usec: 0
+            }),
+            Err(LINUX_EINVAL)
+        );
+    }
+
+    #[test]
+    fn validate_sockopt_len_rejects_negative_and_short() {
+        assert_eq!(validate_sockopt_len(4, 4), Ok(()));
+        assert_eq!(validate_sockopt_len(3, 4), Err(LINUX_EINVAL));
+        assert_eq!(validate_sockopt_len((-1_i32) as u32 as u64, 4), Err(LINUX_EINVAL));
+        assert_eq!(validate_sockopt_len(0x1_0000_0010, 4), Err(LINUX_EINVAL));
+    }
 }

@@ -96,15 +96,7 @@ pub(super) fn consume_receive(
             read_current_iovecs_payload(header.msg_iov, header.msg_iovlen)?
         };
         write_current_iovec_payload(&iovecs, message.data)?;
-        if header.msg_name != 0 {
-            let len = (header.msg_namelen as usize).min(message.address.len());
-            if len != 0 {
-                write_user_bytes(header.msg_name, &message.address[..len])?;
-            }
-            header.msg_namelen = message.address.len() as u32;
-        } else {
-            header.msg_namelen = 0;
-        }
+        super::write_msghdr_name(&mut header, message.address, super::UserCopyMode::Pointer)?;
         header.msg_flags = message.flags;
         let mut written = 0;
         if !message.control.is_empty() {

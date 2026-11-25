@@ -18,18 +18,30 @@
 use super::*;
 
 pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> u64 {
-    reply_receive::<false>(args_ptr)
+    linux_result(reply_receive::<false>(args_ptr))
 }
 
 pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_handles_and_sender(args_ptr: u64) -> u64 {
-    reply_receive::<true>(args_ptr)
+    linux_result(reply_receive::<true>(args_ptr))
 }
 
-fn reply_receive<const WITH_HANDLES: bool>(args_ptr: u64) -> u64 {
-    let retained_mm = match usermem::current_user_address_space() {
-        Ok(retained) => retained,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
+fn validate_reply_recv_lengths(
+    response_len: u64,
+    request_capacity: u64,
+) -> LinuxResult<(usize, usize)> {
+    let response_len = usize::try_from(response_len).map_err(|_| LINUX_EINVAL)?;
+    let request_capacity = usize::try_from(request_capacity).map_err(|_| LINUX_EINVAL)?;
+    if response_len > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES
+        || request_capacity > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES
+    {
+        return Err(LINUX_EINVAL);
+    }
+    Ok((response_len, request_capacity))
+}
+
+fn reply_receive<const WITH_HANDLES: bool>(args_ptr: u64) -> LinuxResult<u64> {
+    let retained_mm =
+        usermem::current_user_address_space().map_err(address_space_error_to_linux_errno)?;
 
     // CONTRACT: every operation that can reject caller-controlled shape or
     // authority happens before the one-shot reply is consumed. This keeps an
@@ -37,80 +49,76 @@ fn reply_receive<const WITH_HANDLES: bool>(args_ptr: u64) -> u64 {
     // range below the sole retry boundary. The argument block, the response
     // bytes and every output range are admitted under one address-space bind.
     let mut inline_response = [0_u8; kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES];
-    let staged = usermem::with_retained_user_access(&retained_mm, |user| {
-        let (args, handles) = if WITH_HANDLES {
-            let outer = user.read_struct::<rustos_user_abi::syscall::IpcReplyRecvWithHandlesAndSenderArgs>(args_ptr)
-                .map_err(address_space_error_to_linux_errno)?;
-            if !rustos_user_abi::syscall::ipc_handle_reply_recv_shape_valid(&outer) {
-                return Err(LINUX_EINVAL);
+    let (args, response_len, request_capacity, inline, handles) =
+        usermem::with_retained_user_access(&retained_mm, |user| {
+            let (args, handles) = if WITH_HANDLES {
+                let outer = user
+                    .read_struct::<rustos_user_abi::syscall::IpcReplyRecvWithHandlesAndSenderArgs>(
+                        args_ptr,
+                    )
+                    .map_err(address_space_error_to_linux_errno)?;
+                if !rustos_user_abi::syscall::ipc_handle_reply_recv_shape_valid(&outer) {
+                    return Err(LINUX_EINVAL);
+                }
+                (
+                    outer.reply_recv,
+                    Some(handle_receive::HandleOutputs {
+                        fds_ptr: outer.recv_fds_ptr,
+                        count_ptr: outer.recv_fd_count_ptr,
+                        capacity: usize::from(outer.recv_fd_capacity),
+                    }),
+                )
+            } else {
+                let args = user
+                    .read_struct::<rustos_user_abi::syscall::IpcReplyRecvWithSenderArgs>(args_ptr)
+                    .map_err(address_space_error_to_linux_errno)?;
+                if !rustos_user_abi::syscall::ipc_reply_recv_shape_valid(&args) {
+                    return Err(LINUX_EINVAL);
+                }
+                (args, None)
+            };
+            let (response_len, request_capacity) =
+                validate_reply_recv_lengths(args.response_len, args.request_capacity)?;
+            let inline = response_len <= inline_response.len();
+            let output_buffers = [
+                (args.request_ptr, request_capacity),
+                (args.next_reply_cap_ptr, size_of::<u64>()),
+                (args.sender_pid_ptr, size_of::<u64>()),
+                (args.sender_tid_ptr, size_of::<u64>()),
+            ];
+            for (ptr, len) in output_buffers {
+                user.validate_write(ptr, len)
+                    .map_err(address_space_error_to_linux_errno)?;
             }
-            (outer.reply_recv, Some(handle_receive::HandleOutputs {
-                fds_ptr: outer.recv_fds_ptr, count_ptr: outer.recv_fd_count_ptr,
-                capacity: usize::from(outer.recv_fd_capacity),
-            }))
-        } else {
-            let args = user.read_struct::<rustos_user_abi::syscall::IpcReplyRecvWithSenderArgs>(args_ptr)
-                .map_err(address_space_error_to_linux_errno)?;
-            if !rustos_user_abi::syscall::ipc_reply_recv_shape_valid(&args) {
-                return Err(LINUX_EINVAL);
+            if let Some(handles) = handles {
+                if handles.capacity != 0 {
+                    let bytes = handles
+                        .capacity
+                        .checked_mul(size_of::<i32>())
+                        .ok_or(LINUX_EINVAL)?;
+                    user.validate_write(handles.fds_ptr, bytes).map_err(address_space_error_to_linux_errno)?;
+                }
+                user.validate_write(handles.count_ptr, size_of::<u16>()).map_err(address_space_error_to_linux_errno)?;
             }
-            (args, None)
-        };
-        let response_len = usize::try_from(args.response_len).map_err(|_| LINUX_EINVAL)?;
-        let request_capacity = usize::try_from(args.request_capacity).map_err(|_| LINUX_EINVAL)?;
-        if request_capacity > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES {
-            return Err(LINUX_EINVAL);
-        }
-        let inline = response_len <= inline_response.len();
-        let output_buffers = [
-            (args.request_ptr, request_capacity),
-            (args.next_reply_cap_ptr, size_of::<u64>()),
-            (args.sender_pid_ptr, size_of::<u64>()),
-            (args.sender_tid_ptr, size_of::<u64>()),
-        ];
-        for (ptr, len) in output_buffers {
-            user.validate_write(ptr, len)
-                .map_err(|err| address_space_error_to_linux_errno(err))?;
-        }
-        if let Some(handles) = handles {
-            if handles.capacity != 0 {
-                let bytes = handles.capacity.checked_mul(size_of::<i32>()).ok_or(LINUX_EINVAL)?;
-                user.validate_write(handles.fds_ptr, bytes).map_err(address_space_error_to_linux_errno)?;
+            if inline && response_len != 0 {
+                user.read_exact(args.response_ptr, &mut inline_response[..response_len])
+                    .map_err(address_space_error_to_linux_errno)?;
             }
-            user.validate_write(handles.count_ptr, size_of::<u16>()).map_err(address_space_error_to_linux_errno)?;
-        }
-        if inline {
-            user.read_exact(args.response_ptr, &mut inline_response[..response_len])
-                .map_err(|err| address_space_error_to_linux_errno(err))?;
-        }
-        Ok((args, response_len, request_capacity, inline, handles))
-    });
-    let (args, response_len, request_capacity, inline, handles) = match staged {
-        Ok(Ok(staged)) => staged,
-        Ok(Err(errno)) => return linux_errno(errno),
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
+            Ok((args, response_len, request_capacity, inline, handles))
+        })
+        .map_err(address_space_error_to_linux_errno)??;
     // Authority follows the shape and range admission above; it still precedes
     // the one-shot consume, so an ordinary errno remains pre-commit.
-    let (endpoint, receiver_task_id, receiver_process_id) = {
-        let endpoint = KernelEndpointHandle::from_raw(args.endpoint);
-        let process_id = retained_mm.process_id();
-        if let Err(err) =
-            kernel_ipc_runtime::api::authorize_endpoint_receiver_for_process(endpoint, process_id)
-        {
-            return linux_errno(ipc_error_to_linux_errno(err));
-        }
-        (endpoint, retained_mm.thread_id(), process_id)
-    };
-    let retained_mm = retained_mm;
+    let endpoint = KernelEndpointHandle::from_raw(args.endpoint);
+    let receiver_process_id = retained_mm.process_id();
+    kernel_ipc_runtime::api::authorize_endpoint_receiver_for_process(endpoint, receiver_process_id)
+        .map_err(ipc_error_to_linux_errno)?;
+    let receiver_task_id = retained_mm.thread_id();
     // Inline bytes were already snapshotted during preflight; a larger response is
     // copied once and serves both a fast frame's spill and a queued reply object.
     let mut large_response: Vec<u8> = Vec::new();
     if !inline {
-        large_response = match copy_request_from_user(args.response_ptr, args.response_len) {
-            Ok(response) => response,
-            Err(errno) => return linux_errno(errno),
-        };
+        large_response = copy_request_from_user(args.response_ptr, args.response_len)?;
     }
     if response_len <= kernel_ipc_runtime::api::IPC_FAST_MAX_BYTES {
         let reply_handle = KernelReplyHandle::from_raw(args.reply_cap);
@@ -137,9 +145,11 @@ fn reply_receive<const WITH_HANDLES: bool>(args_ptr: u64) -> u64 {
                         args.reply_cap,
                         published.completion,
                     );
-                    return ipc_reply_recv_committed_error(ipc_error_to_linux_errno(error));
+                    return Ok(ipc_reply_recv_committed_error(ipc_error_to_linux_errno(
+                        error,
+                    )));
                 }
-                return finish_committed_reply_receive(
+                return Ok(finish_committed_reply_receive(
                     endpoint,
                     receiver_task_id,
                     &retained_mm,
@@ -151,10 +161,13 @@ fn reply_receive<const WITH_HANDLES: bool>(args_ptr: u64) -> u64 {
                     args.reply_cap,
                     published.completion,
                     handles,
-                );
+                ));
             }
             Err(kernel_ipc_runtime::api::IpcError::InvalidHandle) => {}
-            Err(error) => return linux_errno(ipc_error_to_linux_errno(error)),
+            Err(error) => {
+                record_ipc_reply_rejection(args.reply_cap, receiver_process_id, error);
+                return Err(ipc_error_to_linux_errno(error));
+            }
         }
     }
     let response: &[u8] = if inline {
@@ -166,17 +179,15 @@ fn reply_receive<const WITH_HANDLES: bool>(args_ptr: u64) -> u64 {
     // be slow; only this path pays for the slow-call timing reads.
     let start_ticks = crate::arch::rtc::ticks();
     let copy_ticks = crate::arch::rtc::ticks();
-    let completion = match kernel_ipc_runtime::api::complete_endpoint_reply_for_process_with_custody(
+    let completion = kernel_ipc_runtime::api::complete_endpoint_reply_for_process_with_custody(
         KernelReplyHandle::from_raw(args.reply_cap),
         receiver_process_id,
         response,
-    ) {
-        Ok(completion) => completion,
-        Err(err) => {
-            record_ipc_reply_rejection(args.reply_cap, receiver_process_id, err);
-            return linux_errno(ipc_error_to_linux_errno(err));
-        }
-    };
+    )
+    .map_err(|err| {
+        record_ipc_reply_rejection(args.reply_cap, receiver_process_id, err);
+        ipc_error_to_linux_errno(err)
+    })?;
     let reply_ticks = crate::arch::rtc::ticks();
     log_slow_ipc_reply(
         "reply-recv",
@@ -190,7 +201,7 @@ fn reply_receive<const WITH_HANDLES: bool>(args_ptr: u64) -> u64 {
     // Both representations carry the same reply/context custody into receive.
     // Its block settles and hands back in one boundary; an immediate receive
     // or error drops the deferred reply and wakes the caller exactly once.
-    finish_committed_reply_receive(
+    Ok(finish_committed_reply_receive(
         endpoint,
         receiver_task_id,
         &retained_mm,
@@ -202,7 +213,7 @@ fn reply_receive<const WITH_HANDLES: bool>(args_ptr: u64) -> u64 {
         args.reply_cap,
         completion,
         handles,
-    )
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -223,10 +234,13 @@ fn finish_committed_reply_receive(
         recv_with_sender_blocking_prepared_inner::<{ kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES }>(
             endpoint, receiver_task_id, request_capacity, None,
             Some(fast_reply::DeferredFastReply::new(completed_reply, completion)),
-            ReceiveDestination::UserWithHandles(handle_receive::ReceiveOutputs {
-                retained_mm, request_ptr, reply_cap_ptr: next_reply_cap_ptr,
-                sender_pid_ptr, sender_tid_ptr, handles,
-            }),
+            ReceiveDestination::UserWithHandles(handle_receive::ReceiveOutputs::new(
+                retained_mm,
+                request_ptr,
+                next_reply_cap_ptr,
+                Some((sender_pid_ptr, sender_tid_ptr)),
+                Some(handles),
+            )),
         )
     } else {
         recv_with_sender_blocking_prepared_after_fast_reply(
@@ -281,5 +295,15 @@ mod tests {
                 ..valid
             }
         ));
+    }
+
+    #[test]
+    fn reply_recv_lengths_reject_oversized_response_and_admit_empty_reply() {
+        let max = rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES as u64;
+        assert_eq!(validate_reply_recv_lengths(0, max), Ok((0, max as usize)));
+        assert_eq!(validate_reply_recv_lengths(max, 0), Ok((max as usize, 0)));
+        assert_eq!(validate_reply_recv_lengths(max + 1, 64), Err(LINUX_EINVAL));
+        assert_eq!(validate_reply_recv_lengths(64, max + 1), Err(LINUX_EINVAL));
+        assert_eq!(validate_reply_recv_lengths(u64::MAX, 64), Err(LINUX_EINVAL));
     }
 }

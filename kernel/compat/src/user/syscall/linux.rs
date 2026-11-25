@@ -560,19 +560,7 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
             .unwrap_or_else(|| {
                 syscall_linux_net4(SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN, frame.rdi, frame.rsi, 0, 0)
             }),
-        linux_abi::SYS_SENDMSG => {
-            service_ops::local_unix::try_sendmsg(frame.rdi, frame.rsi, frame.rdx).unwrap_or_else(
-                || {
-                    syscall_linux_net4(
-                        SYSCALL_OFFLOAD_OP_LINUX_SENDMSG,
-                        frame.rdi,
-                        frame.rsi,
-                        frame.rdx,
-                        0,
-                    )
-                },
-            )
-        }
+        linux_abi::SYS_SENDMSG => syscall_linux_sendmsg(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_RECVFROM => service_ops::local_unix::try_recvfrom(
             frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
         )
@@ -587,19 +575,7 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
                 frame.r9,
             )
         }),
-        linux_abi::SYS_RECVMSG => {
-            service_ops::local_unix::try_recvmsg(frame.rdi, frame.rsi, frame.rdx).unwrap_or_else(
-                || {
-                    syscall_linux_net4(
-                        SYSCALL_OFFLOAD_OP_LINUX_RECVMSG,
-                        frame.rdi,
-                        frame.rsi,
-                        frame.rdx,
-                        0,
-                    )
-                },
-            )
-        }
+        linux_abi::SYS_RECVMSG => syscall_linux_recvmsg(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_GETDENTS64 => syscall_linux_vfs_getdents64(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_EXECVEAT => {
             syscall_linux_execveat(frame, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)

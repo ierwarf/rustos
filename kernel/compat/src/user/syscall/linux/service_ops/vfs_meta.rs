@@ -124,43 +124,55 @@ pub fn syscall_linux_vfs_ftruncate(fd: u64, len: u64) -> u64 {
     })())
 }
 
+fn getdents_pinned(
+    fd: u64,
+    remote_id: u64,
+    requested_len: usize,
+    copy_out: impl FnOnce(&[u8]) -> Result<(), i64>,
+) -> Result<usize, i64> {
+    let _pin = super::vfs_socket::RemoteVfsRefGuard::acquire(fd, remote_id)?;
+    let _cursor = acquire_vfs_cursor_gate(remote_id)?;
+    let mut request = new_vfs_request(VFS_IPC_OP_GETDENTS64);
+    request.fd = fd;
+    request.remote_id = remote_id;
+    request.arg1 = requested_len as u64;
+    let response = match call_vfs_ipc_request(&request) {
+        Ok(response) => response,
+        Err(errno) => {
+            let _ = settle_vfs_cursor_mutation(&request, false);
+            return Err(errno);
+        }
+    };
+    vfs_getdents_status(&request, &response)?;
+    let len = response.payload_len as usize;
+    if len > requested_len || len > response.payload.len() {
+        let _ = settle_vfs_cursor_mutation(&request, false);
+        return Err(LINUX_EINVAL);
+    }
+    if let Err(errno) = copy_out(&response.payload[..len]) {
+        let _ = settle_vfs_cursor_mutation(&request, false);
+        return Err(errno);
+    }
+    match settle_vfs_cursor_mutation(&request, true) {
+        Ok(()) => Ok(len),
+        Err(errno) => {
+            // Bytes are already visible; reconciliation retains the
+            // prepared cursor until the exact COMMIT settles.
+            if len > 0 {
+                Ok(len)
+            } else {
+                Err(errno)
+            }
+        }
+    }
+}
+
 pub(crate) fn kernel_vfs_getdents_raw(fd: u64, dest: &mut [u8]) -> Result<usize, i64> {
     let remote = current_remote_vfs_handle(fd).ok_or(LINUX_EBADF)?;
-    let remote_id = remote.remote_id();
-    acquire_current_remote_vfs_ref(fd, remote_id)?;
-    let result = (|| {
-        let _cursor = acquire_vfs_cursor_gate(remote_id)?;
-        let mut request = new_vfs_request(VFS_IPC_OP_GETDENTS64);
-        request.fd = fd;
-        request.remote_id = remote_id;
-        request.arg1 = dest.len() as u64;
-        let response = match call_vfs_ipc_request(&request) {
-            Ok(response) => response,
-            Err(errno) => {
-                let _ = settle_vfs_cursor_mutation(&request, false);
-                return Err(errno);
-            }
-        };
-        vfs_getdents_status(&request, &response)?;
-        let len = response.payload_len as usize;
-        if len > dest.len() || len > response.payload.len() {
-            let _ = settle_vfs_cursor_mutation(&request, false);
-            return Err(LINUX_EINVAL);
-        }
-        dest[..len].copy_from_slice(&response.payload[..len]);
-        match settle_vfs_cursor_mutation(&request, true) {
-            Ok(()) => Ok(len),
-            Err(errno) => {
-                if len > 0 {
-                    Ok(len)
-                } else {
-                    Err(errno)
-                }
-            }
-        }
-    })();
-    release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
-    result
+    getdents_pinned(fd, remote.remote_id(), dest.len(), |bytes| {
+        dest[..bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    })
 }
 
 /// EIO may be a prepared replay whose directory page changed. Exact cancel
@@ -177,64 +189,19 @@ pub fn syscall_linux_vfs_getdents64(fd: u64, user_ptr: u64, user_len: u64) -> u6
     if let Some(result) = proc_identity::getdents_snapshot(fd, user_ptr, user_len) {
         return result;
     }
-    let Some(remote) = current_remote_vfs_handle(fd) else {
-        return linux_errno(LINUX_EBADF);
-    };
-    let Ok(user_len) = usize::try_from(user_len) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
-    let remote_id = remote.remote_id();
-    if let Err(errno) = acquire_current_remote_vfs_ref(fd, remote_id) {
-        return linux_errno(errno);
-    }
-    let result = (|| {
-        let _cursor = match acquire_vfs_cursor_gate(remote_id) {
-            Ok(gate) => gate,
-            Err(errno) => return linux_errno(errno),
-        };
-        let mut request = new_vfs_request(VFS_IPC_OP_GETDENTS64);
-        request.fd = fd;
-        request.remote_id = remote_id;
-        request.arg1 = user_len as u64;
-        let response = match call_vfs_ipc_request(&request) {
-            Ok(response) => response,
-            Err(errno) => {
-                let _ = settle_vfs_cursor_mutation(&request, false);
-                return linux_errno(errno);
-            }
-        };
-        if let Err(errno) = vfs_getdents_status(&request, &response) {
-            return linux_errno(errno);
+    linux_result((|| {
+        let (remote, rights) =
+            current_remote_vfs_handle_with_rights(fd).ok_or(LINUX_EBADF)?;
+        if !rights.allows_read() {
+            return Err(LINUX_EBADF);
         }
-        let len = response.payload_len as usize;
-        if len > user_len || len > response.payload.len() {
-            let _ = settle_vfs_cursor_mutation(&request, false);
-            return linux_errno(LINUX_EINVAL);
-        }
-        match usermem::write_current_user_bytes(user_ptr, &response.payload[..len]) {
-            Ok(()) => match settle_vfs_cursor_mutation(&request, true) {
-                Ok(()) => len as u64,
-                Err(errno) => {
-                    // Bytes are already visible; reconciliation retains the
-                    // prepared cursor until the exact COMMIT settles.
-                    if len > 0 {
-                        len as u64
-                    } else {
-                        linux_errno(errno)
-                    }
-                }
-            },
-            Err(err) => {
-                let _ = settle_vfs_cursor_mutation(&request, false);
-                linux_errno(address_space_error_to_linux_errno(err))
-            }
-        }
-    })();
-    release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote_id)]);
-    result
+        let user_len = usize::try_from(user_len).map_err(|_| LINUX_EINVAL)?;
+        validate_user_write_as(user_ptr, user_len)?;
+        let len = getdents_pinned(fd, remote.remote_id(), user_len, |bytes| {
+            write_user_bytes_as(user_ptr, bytes)
+        })?;
+        Ok(len as u64)
+    })())
 }
 
 pub fn syscall_linux_vfs_statx(
@@ -377,8 +344,12 @@ pub fn syscall_linux_vfs_readlinkat(
             write_user_bytes_as(user_ptr, &bytes[..len])?;
             return Ok(len as u64);
         }
-        let len = (response.payload_len as usize).min(user_len);
-        write_user_bytes_as(user_ptr, &response.payload[..len])?;
+        let payload = response
+            .payload
+            .get(..response.payload_len as usize)
+            .ok_or(LINUX_EINVAL)?;
+        let len = payload.len().min(user_len);
+        write_user_bytes_as(user_ptr, &payload[..len])?;
         Ok(len as u64)
     })())
 }
@@ -517,10 +488,11 @@ pub fn syscall_linux_vfs_getcwd(user_ptr: u64, user_len: u64) -> u64 {
         validate_user_write_as(user_ptr, user_len)?;
         let response = call_vfs_checked(&new_vfs_request(VFS_IPC_OP_GETCWD))?;
         let len = response.payload_len as usize;
+        let cwd = response.payload.get(..len).ok_or(LINUX_EINVAL)?;
         if len.checked_add(1).is_none_or(|needed| needed > user_len) {
             return Err(LINUX_ERANGE);
         }
-        write_user_bytes_as(user_ptr, &response.payload[..len])?;
+        write_user_bytes_as(user_ptr, cwd)?;
         write_user_bytes_as(user_ptr + len as u64, &[0])?;
         Ok((len + 1) as u64)
     })())
@@ -768,25 +740,17 @@ pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
             matches!(handle, multitask::KernelHandle::InetSocket(_))
         })
     {
-        return match kernel_netd_raw_socket_op(
-            rustos_user_abi::syscall::SYSCALL_OFFLOAD_OP_LINUX_IOCTL,
-            fd,
-            [request_number, 0, 0, 0, 0],
-            &[],
-            None,
-        ) {
-            Ok((_, payload)) => {
-                let Some(val_bytes) = payload.get(..core::mem::size_of::<i32>()) else {
-                    return linux_errno(LINUX_EINVAL);
-                };
-                let val = i32::from_ne_bytes(val_bytes.try_into().unwrap_or([0; 4]));
-                match usermem::write_current_user_struct(arg, &val) {
-                    Ok(()) => 0,
-                    Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-                }
-            }
-            Err(errno) => linux_errno(errno),
-        };
+        return linux_unit_result((|| {
+            let (_, payload) = kernel_netd_raw_socket_op(
+                rustos_user_abi::syscall::SYSCALL_OFFLOAD_OP_LINUX_IOCTL,
+                fd,
+                [request_number, 0, 0, 0, 0],
+                &[],
+                None,
+            )?;
+            let val = decode_fixed_response::<i32>(&payload)?;
+            write_user_struct_as(arg, &val)
+        })());
     }
     // A console-graph wait is answered by the console broker holding the reply
     // until the graph moves. Asking devmgrd to authorize and forward it would
@@ -796,58 +760,43 @@ pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
     // rail for the same reason. The console handle is the authority: a caller
     // without one is refused here, before the broker is reached.
     if request_number == rustos_user_abi::console::CONSOLE_IOCTL_WAIT_GRAPH {
-        return match console_graph_wait_authority(fd).and_then(|()| console_wait_graph(arg)) {
-            Ok(value) => value,
-            Err(errno) => linux_errno(errno),
+        return linux_result(
+            console_graph_wait_authority(fd).and_then(|()| console_wait_graph(arg)),
+        );
+    }
+    linux_result((|| {
+        let route = if ioctl_is_direct_display_present(request_number)
+            || ioctl_is_display_policy_request(request_number)
+                && ipc_ops::current_process_has_service_capability(ServiceCapability::UiPolicy)
+        {
+            rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT
+        } else {
+            match ioctl_route_via_devmgrd(fd, request_number) {
+                Ok(route) => route,
+                Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_DEVMGRD) => {
+                    rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT
+                }
+                Err(errno) => return Err(errno),
+            }
         };
-    }
-    let route = if ioctl_is_direct_display_present(request_number)
-        || ioctl_is_display_policy_request(request_number)
-            && ipc_ops::current_process_has_service_capability(
-                ServiceCapability::UiPolicy,
-            ) {
-        rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT
-    } else {
-        match ioctl_route_via_devmgrd(fd, request_number) {
-            Ok(route) => route,
-            Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_DEVMGRD) => {
-                rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT
+        match route {
+            rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY => {
+                if !current_kernel_handle(fd).is_some_and(|handle| is_console_handle(&handle)) {
+                    return Err(LINUX_ENOTTY);
+                }
+                ioctl_tty_via_sessiond(fd, request_number, arg)
             }
-            Err(errno) => return linux_errno(errno),
+            rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DEVMGRD
+            | rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT => {
+                ioctl_device_via_devmgrd(fd, request_number, arg)
+            }
+            rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT => {
+                crate::user::sysops::device::ioctl_current_process_fd(fd, request_number, arg)
+                    .map_err(super::super::broker_ops::device_sysop_error_to_linux_errno)
+            }
+            _ => Err(LINUX_EINVAL),
         }
-    };
-    match route {
-        rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY => {
-            if !current_kernel_handle(fd).is_some_and(|handle| is_console_handle(&handle)) {
-                return linux_errno(LINUX_ENOTTY);
-            }
-            match ioctl_tty_via_sessiond(fd, request_number, arg) {
-                Ok(value) => value,
-                Err(errno) => linux_errno(errno),
-            }
-        }
-        rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DEVMGRD => {
-            match ioctl_device_via_devmgrd(fd, request_number, arg) {
-                Ok(value) => value,
-                Err(errno) => linux_errno(errno),
-            }
-        }
-        rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT => {
-            match ioctl_device_via_devmgrd(fd, request_number, arg) {
-                Ok(value) => value,
-                Err(errno) => linux_errno(errno),
-            }
-        }
-        rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT => {
-            match crate::user::sysops::device::ioctl_current_process_fd(fd, request_number, arg) {
-                Ok(value) => value,
-                Err(err) => linux_errno(
-                    super::super::broker_ops::device_sysop_error_to_linux_errno(err),
-                ),
-            }
-        }
-        _ => linux_errno(LINUX_EINVAL),
-    }
+    })())
 }
 
 fn is_console_handle(handle: &multitask::KernelHandle) -> bool {
@@ -1142,31 +1091,31 @@ fn local_receive_timeout_ms(fd: u64) -> Option<u64> {
 fn wait_and_retry_local_receive(fd: u64, mut receive: impl FnMut() -> u64) -> u64 {
     let start = crate::arch::rtc::ticks();
     let timeout_ms = local_receive_timeout_ms(fd);
-    loop {
+    let wait_res: LinuxResult<u64> = (|| loop {
         if super::poll_epoll::has_unmasked_pending_signal() {
-            return linux_errno(LINUX_EINTR);
+            return Err(LINUX_EINTR);
         }
         let elapsed = crate::arch::rtc::ticks()
             .saturating_sub(start)
             .saturating_mul(1000)
             .saturating_div(crate::arch::rtc::ticks_per_second().max(1));
         let slice = match timeout_ms {
-            Some(limit) if elapsed >= limit => return linux_errno(LINUX_EAGAIN),
+            Some(limit) if elapsed >= limit => return Err(LINUX_EAGAIN),
             Some(limit) => (limit - elapsed).min(LOCAL_RECEIVE_WAIT_SLICE_MS),
             None => LOCAL_RECEIVE_WAIT_SLICE_MS,
         };
         match kernel_netd_poll_fd(fd, linux_abi::POLLIN as u32, slice.max(1)) {
             // Readable, hung up, or the slice lapsed: either way the receive
             // below is the authority.
-            Ok(_) => {}
-            Err(errno) if errno == LINUX_ETIMEDOUT => {}
-            Err(errno) => return linux_errno(errno),
+            Ok(_) | Err(LINUX_ETIMEDOUT) => {}
+            Err(errno) => return Err(errno),
         }
         let result = receive();
         if result != linux_errno(LINUX_EAGAIN) {
-            return result;
+            return Ok(result);
         }
-    }
+    })();
+    linux_result(wait_res)
 }
 
 pub(super) fn current_fd_allows_write(fd: u64) -> bool {
@@ -1301,30 +1250,29 @@ fn syscall_linux_net6_once(
         super::ipc_helpers::deadline::netd_timeout_class(op)
     });
     request.deadline_ns = netd_deadline_after_class(deadline_class, timeout_ms);
-    if let Err(errno) = populate_netd_request_payload(&mut request, socket_snapshot.as_ref()) {
-        return linux_errno(errno);
-    }
-    let result = match timeout_ms {
-        Some(timeout_ms) => call_netd_ipc_request_with_timeout(&request, timeout_ms),
-        None => call_netd_ipc_request(&request),
-    };
-    let outcome = match result {
-        Ok(response) => {
-            match consume_netd_response_payload(
-                &request,
-                &response,
-                socket_snapshot.as_ref(),
-            ) {
-                Ok(()) => response.value,
-                Err(errno) => linux_errno(errno),
-            }
+    linux_result((|| {
+        populate_netd_request_payload(&mut request, socket_snapshot.as_ref())?;
+        let response = match timeout_ms {
+            Some(timeout_ms) => call_netd_ipc_request_with_timeout(&request, timeout_ms),
+            None => call_netd_ipc_request(&request),
         }
-        Err(errno) => linux_errno(errno),
-    };
-    if nonblocking_bound && outcome == linux_errno(LINUX_ETIMEDOUT) {
-        return linux_errno(LINUX_EAGAIN);
-    }
-    outcome
+        .map_err(|errno| {
+            if nonblocking_bound && errno == LINUX_ETIMEDOUT {
+                LINUX_EAGAIN
+            } else {
+                errno
+            }
+        })?;
+        consume_netd_response_payload(&request, &response, socket_snapshot.as_ref())
+            .map_err(|errno| {
+                if nonblocking_bound && errno == LINUX_ETIMEDOUT {
+                    LINUX_EAGAIN
+                } else {
+                    errno
+                }
+            })?;
+        Ok(response.value)
+    })())
 }
 
 /// Operations whose completion moves bytes across a stream boundary.
@@ -1536,13 +1484,8 @@ fn populate_netd_request_payload(
             }
             SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => return Ok(()),
             SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => {
-                let header = usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(request.arg1)
-                    .map_err(address_space_error_to_linux_errno)?;
-                let iovecs = if header.msg_iovlen == 0 {
-                    Vec::new()
-                } else {
-                    read_current_iovecs_payload(header.msg_iov, header.msg_iovlen)?
-                };
+                let header: linux_abi::LinuxMsghdr = read_user_struct_as(request.arg1)?;
+                let iovecs = read_current_iovecs_payload(header.msg_iov, header.msg_iovlen)?;
                 request.payload_len =
                     iovec_payload_total_len(&iovecs)?.min(NETD_IPC_PAYLOAD_CAPACITY) as u32;
                 request.arg4 = header.msg_controllen;
@@ -1558,12 +1501,10 @@ fn populate_netd_request_payload(
             }
             SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => return Ok(()),
             SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => {
-                let header = usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(request.arg1)
-                    .map_err(address_space_error_to_linux_errno)?;
-                let iovecs = if header.msg_iovlen == 0 { Vec::new() } else {
-                    read_current_iovecs_payload(header.msg_iov, header.msg_iovlen)?
-                };
-                request.payload_len = iovec_payload_total_len(&iovecs)?.min(NETD_IPC_PAYLOAD_CAPACITY) as u32;
+                let header: linux_abi::LinuxMsghdr = read_user_struct_as(request.arg1)?;
+                let iovecs = read_current_iovecs_payload(header.msg_iov, header.msg_iovlen)?;
+                request.payload_len =
+                    iovec_payload_total_len(&iovecs)?.min(NETD_IPC_PAYLOAD_CAPACITY) as u32;
                 return Ok(());
             }
             _ => {}
@@ -1586,8 +1527,7 @@ fn populate_netd_request_payload(
             copy_current_payload(request, request.arg3, request.arg4)
         }
         SYSCALL_OFFLOAD_OP_LINUX_SENDMSG => {
-            let header = usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(request.arg1)
-                .map_err(address_space_error_to_linux_errno)?;
+            let header: linux_abi::LinuxMsghdr = read_user_struct_as(request.arg1)?;
             let iovecs = read_current_iovecs_payload(header.msg_iov, header.msg_iovlen)?;
             let total = iovec_payload_total_len(&iovecs)?;
             if total > NETD_IPC_PAYLOAD_CAPACITY && header.msg_controllen != 0 {
@@ -1617,8 +1557,7 @@ fn populate_netd_request_payload(
             Ok(())
         }
         SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => {
-            let header = usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(request.arg1)
-                .map_err(address_space_error_to_linux_errno)?;
+            let header: linux_abi::LinuxMsghdr = read_user_struct_as(request.arg1)?;
             let iovecs = read_current_iovecs_payload(header.msg_iov, header.msg_iovlen)?;
             let total = iovec_payload_total_len(&iovecs)?;
             request.payload_len = total.min(NETD_IPC_PAYLOAD_CAPACITY) as u32;
@@ -1650,8 +1589,7 @@ fn copy_current_payload(request: &mut NetdIpcRequest, ptr: u64, len: u64) -> Res
     if len == 0 {
         return Ok(());
     }
-    usermem::copy_from_current_user_exact(ptr, &mut request.payload[..len])
-        .map_err(address_space_error_to_linux_errno)?;
+    read_user_bytes_as(ptr, &mut request.payload[..len])?;
     request.payload_len = len as u32;
     Ok(())
 }
@@ -1733,16 +1671,16 @@ fn consume_netd_response_payload(
             }
             let iovecs = read_current_iovecs_payload(header.msg_iov, header.msg_iovlen)?;
             write_current_iovec_payload(&iovecs, &response.payload[data_start..control_start])?;
-            if socket.is_some_and(SocketSnapshot::is_netlink) && header.msg_name != 0 {
-                let address = netlink_kernel_address();
-                let len = (header.msg_namelen as usize).min(address.len());
-                if len != 0 {
-                    write_user_bytes_as(header.msg_name, &address[..len])?;
-                }
-                header.msg_namelen = address.len() as u32;
+            let addr = if socket.is_some_and(SocketSnapshot::is_netlink) {
+                Some(netlink_kernel_address())
             } else {
-                header.msg_namelen = 0;
-            }
+                None
+            };
+            write_msghdr_name(
+                &mut header,
+                addr.as_ref().map_or(&[], |a| a.as_slice()),
+                UserCopyMode::AddressSpace,
+            )?;
             header.msg_controllen = 0;
             header.msg_flags = msg_flags;
             write_user_struct_as(request.arg1, &header)
@@ -1850,15 +1788,7 @@ fn consume_netd_msg_dgram_receive(
     let mut header: linux_abi::LinuxMsghdr = read_user_struct_as(request.arg1)?;
     let iovecs = read_current_iovecs_payload(header.msg_iov, header.msg_iovlen)?;
     write_current_iovec_payload(&iovecs, message.data)?;
-    if header.msg_name != 0 {
-        let copy_len = (header.msg_namelen as usize).min(message.address.len());
-        if copy_len != 0 {
-            write_user_bytes_as(header.msg_name, &message.address[..copy_len])?;
-        }
-        header.msg_namelen = message.address.len() as u32;
-    } else {
-        header.msg_namelen = 0;
-    }
+    write_msghdr_name(&mut header, message.address, UserCopyMode::AddressSpace)?;
     if !message.control.is_empty() {
         return Err(LINUX_ESTALE);
     }
@@ -1886,6 +1816,46 @@ fn sendmsg_data_capacity(control_len: usize) -> Result<usize, i64> {
         .ok_or(LINUX_EMSGSIZE)
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum UserCopyMode {
+    Pointer,
+    AddressSpace,
+}
+
+impl UserCopyMode {
+    pub(super) fn read_struct<T: Copy + Default>(self, ptr: u64) -> LinuxResult<T> {
+        match self {
+            Self::Pointer => read_user_struct(ptr),
+            Self::AddressSpace => read_user_struct_as(ptr),
+        }
+    }
+
+    pub(super) fn write_struct<T: rustos_user_abi::wire::UserWire>(
+        self,
+        ptr: u64,
+        value: &T,
+    ) -> LinuxResult<()> {
+        match self {
+            Self::Pointer => write_user_struct(ptr, value),
+            Self::AddressSpace => write_user_struct_as(ptr, value),
+        }
+    }
+
+    pub(super) fn read_bytes(self, ptr: u64, dest: &mut [u8]) -> LinuxResult<()> {
+        match self {
+            Self::Pointer => read_user_bytes(ptr, dest),
+            Self::AddressSpace => read_user_bytes_as(ptr, dest),
+        }
+    }
+
+    pub(super) fn write_bytes(self, ptr: u64, bytes: &[u8]) -> LinuxResult<()> {
+        match self {
+            Self::Pointer => write_user_bytes(ptr, bytes),
+            Self::AddressSpace => write_user_bytes_as(ptr, bytes),
+        }
+    }
+}
+
 fn read_current_iovec_payload(iov_ptr: u64, iov_len: u64) -> Result<Vec<u8>, i64> {
     let iovecs = read_current_iovecs_payload(iov_ptr, iov_len)?;
     let total = iovec_payload_total_len(&iovecs)?;
@@ -1895,55 +1865,90 @@ fn read_current_iovec_payload(iov_ptr: u64, iov_len: u64) -> Result<Vec<u8>, i64
     read_iovec_prefix(&iovecs, total)
 }
 
-fn read_iovec_prefix(iovecs: &[linux_abi::LinuxIovec], total: usize) -> Result<Vec<u8>, i64> {
-    let mut bytes = Vec::with_capacity(total);
+pub(super) fn read_iovec_prefix_with_mode(
+    iovecs: &[linux_abi::LinuxIovec],
+    total: usize,
+    mode: UserCopyMode,
+) -> Result<Vec<u8>, i64> {
+    let mut bytes = Vec::new();
+    if total > 0 {
+        bytes.try_reserve_exact(total).map_err(|_| LINUX_ENOMEM)?;
+    }
     for iov in iovecs {
-        let len = usize::try_from(iov.iov_len).map_err(|_| LINUX_EINVAL)?.min(total - bytes.len());
-        if len == 0 { continue; }
+        if bytes.len() == total {
+            break;
+        }
+        let len = usize::try_from(iov.iov_len)
+            .map_err(|_| LINUX_EINVAL)?
+            .min(total - bytes.len());
+        if len == 0 {
+            continue;
+        }
         let start = bytes.len();
         bytes.resize(start + len, 0);
-        usermem::copy_from_current_user_exact(iov.iov_base, &mut bytes[start..])
-            .map_err(address_space_error_to_linux_errno)?;
+        mode.read_bytes(iov.iov_base, &mut bytes[start..])?;
     }
     Ok(bytes)
 }
 
-pub(super) fn read_current_iovecs_payload(
+fn read_iovec_prefix(iovecs: &[linux_abi::LinuxIovec], total: usize) -> Result<Vec<u8>, i64> {
+    read_iovec_prefix_with_mode(iovecs, total, UserCopyMode::AddressSpace)
+}
+
+pub(super) fn read_current_iovecs_with_mode(
     iov_ptr: u64,
     iov_len: u64,
+    mode: UserCopyMode,
 ) -> Result<Vec<linux_abi::LinuxIovec>, i64> {
     let iov_len = usize::try_from(iov_len).map_err(|_| LINUX_EINVAL)?;
-    if iov_len == 0 { return Ok(Vec::new()); }
+    if iov_len == 0 {
+        return Ok(Vec::new());
+    }
     if iov_len > NETD_MAX_IOVEC_COUNT {
         return Err(LINUX_EINVAL);
     }
     if iov_ptr == 0 {
         return Err(LINUX_EFAULT);
     }
+    let byte_len = iov_len
+        .checked_mul(size_of::<linux_abi::LinuxIovec>())
+        .ok_or(LINUX_EINVAL)?;
+    let mut raw = alloc::vec![0_u8; byte_len];
+    mode.read_bytes(iov_ptr, &mut raw)?;
     let mut iovecs = Vec::with_capacity(iov_len);
-    for index in 0..iov_len {
-        let offset = index
-            .checked_mul(size_of::<linux_abi::LinuxIovec>())
-            .and_then(|value| u64::try_from(value).ok())
-            .ok_or(LINUX_EINVAL)?;
-        let iov = read_user_struct_as::<linux_abi::LinuxIovec>(
-            iov_ptr.checked_add(offset).ok_or(LINUX_EFAULT)?,
-        )?;
-        iovecs.push(iov);
+    for chunk in raw.chunks_exact(size_of::<linux_abi::LinuxIovec>()) {
+        iovecs.push(linux_abi::LinuxIovec {
+            iov_base: u64::from_ne_bytes(chunk[0..8].try_into().unwrap()),
+            iov_len: u64::from_ne_bytes(chunk[8..16].try_into().unwrap()),
+        });
     }
     Ok(iovecs)
 }
 
-fn iovec_payload_total_len(iovecs: &[linux_abi::LinuxIovec]) -> Result<usize, i64> {
+pub(super) fn read_current_iovecs_payload(
+    iov_ptr: u64,
+    iov_len: u64,
+) -> Result<Vec<linux_abi::LinuxIovec>, i64> {
+    read_current_iovecs_with_mode(iov_ptr, iov_len, UserCopyMode::AddressSpace)
+}
+
+pub(super) fn iovec_payload_total_len(iovecs: &[linux_abi::LinuxIovec]) -> Result<usize, i64> {
     let mut total = 0usize;
     for iov in iovecs {
         let len = usize::try_from(iov.iov_len).map_err(|_| LINUX_EINVAL)?;
-        total = total.checked_add(len).ok_or(LINUX_EINVAL)?;
+        total = total
+            .checked_add(len)
+            .filter(|sum| *sum <= isize::MAX as usize)
+            .ok_or(LINUX_EINVAL)?;
     }
     Ok(total)
 }
 
-fn write_current_iovec_payload(iovecs: &[linux_abi::LinuxIovec], bytes: &[u8]) -> Result<(), i64> {
+pub(super) fn write_iovec_payload_with_mode(
+    iovecs: &[linux_abi::LinuxIovec],
+    bytes: &[u8],
+    mode: UserCopyMode,
+) -> Result<usize, i64> {
     let mut written = 0usize;
     for iov in iovecs {
         if written >= bytes.len() {
@@ -1951,8 +1956,32 @@ fn write_current_iovec_payload(iovecs: &[linux_abi::LinuxIovec], bytes: &[u8]) -
         }
         let len = usize::try_from(iov.iov_len).map_err(|_| LINUX_EINVAL)?;
         let chunk_len = len.min(bytes.len() - written);
-        write_user_bytes_as(iov.iov_base, &bytes[written..written + chunk_len])?;
+        if chunk_len == 0 {
+            continue;
+        }
+        mode.write_bytes(iov.iov_base, &bytes[written..written + chunk_len])?;
         written += chunk_len;
+    }
+    Ok(written)
+}
+
+fn write_current_iovec_payload(iovecs: &[linux_abi::LinuxIovec], bytes: &[u8]) -> Result<(), i64> {
+    write_iovec_payload_with_mode(iovecs, bytes, UserCopyMode::AddressSpace).map(|_| ())
+}
+
+pub(super) fn write_msghdr_name(
+    header: &mut linux_abi::LinuxMsghdr,
+    address: &[u8],
+    mode: UserCopyMode,
+) -> Result<(), i64> {
+    if header.msg_name != 0 {
+        let copy_len = (header.msg_namelen as usize).min(address.len());
+        if copy_len != 0 {
+            mode.write_bytes(header.msg_name, &address[..copy_len])?;
+        }
+        header.msg_namelen = u32::try_from(address.len()).map_err(|_| LINUX_EINVAL)?;
+    } else {
+        header.msg_namelen = 0;
     }
     Ok(())
 }
@@ -1964,20 +1993,72 @@ fn netlink_kernel_address() -> [u8; 12] {
     address
 }
 
-pub(super) fn write_current_sockaddr_payload(addr_ptr: u64, len_ptr: u64, payload: &[u8]) -> Result<(), i64> {
+pub(super) fn write_sockaddr_payload_with_mode(
+    addr_ptr: u64,
+    len_ptr: u64,
+    payload: &[u8],
+    mode: UserCopyMode,
+) -> Result<(), i64> {
     if len_ptr == 0 {
-        return if payload.is_empty() {
-            Ok(())
-        } else {
-            Err(LINUX_EINVAL)
+        return match mode {
+            UserCopyMode::Pointer => Err(LINUX_EFAULT),
+            UserCopyMode::AddressSpace => {
+                if payload.is_empty() {
+                    Ok(())
+                } else {
+                    Err(LINUX_EINVAL)
+                }
+            }
         };
     }
-    if addr_ptr != 0 && !payload.is_empty() {
-        let capacity = read_user_struct_as::<u32>(len_ptr)? as usize;
-        write_user_bytes_as(addr_ptr, &payload[..capacity.min(payload.len())])?;
+    if addr_ptr != 0 {
+        let cap = mode.read_struct::<i32>(len_ptr)?;
+        if cap < 0 {
+            return Err(LINUX_EINVAL);
+        }
+        if !payload.is_empty() {
+            mode.write_bytes(addr_ptr, &payload[..(cap as usize).min(payload.len())])?;
+        }
     }
-    let len = payload.len() as u32;
-    write_user_struct_as(len_ptr, &len)
+    let len = u32::try_from(payload.len()).map_err(|_| LINUX_EINVAL)?;
+    mode.write_struct(len_ptr, &len)
+}
+
+pub(super) fn write_current_sockaddr_payload(addr_ptr: u64, len_ptr: u64, payload: &[u8]) -> Result<(), i64> {
+    write_sockaddr_payload_with_mode(addr_ptr, len_ptr, payload, UserCopyMode::AddressSpace)
+}
+
+pub(super) fn write_sockopt_payload(
+    optval_ptr: u64,
+    optlen_ptr: u64,
+    payload: &[u8],
+    allow_struct_truncation: bool,
+    mode: UserCopyMode,
+) -> Result<(), i64> {
+    if optval_ptr == 0 || optlen_ptr == 0 {
+        return Err(match mode {
+            UserCopyMode::Pointer => LINUX_EFAULT,
+            UserCopyMode::AddressSpace => LINUX_EINVAL,
+        });
+    }
+    let cap = mode.read_struct::<i32>(optlen_ptr)?;
+    if cap < 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let capacity = cap as usize;
+    // Linux truncates an int-valued option to the caller's `optlen`
+    // (`SO_ERROR` read through a 1-byte buffer); structured netd options with
+    // a short buffer stay `EINVAL`.
+    let out = if capacity >= payload.len() {
+        payload
+    } else if allow_struct_truncation || (payload.len() == size_of::<i32>() && capacity != 0) {
+        &payload[..capacity]
+    } else {
+        return Err(LINUX_EINVAL);
+    };
+    mode.write_bytes(optval_ptr, out)?;
+    let len = u32::try_from(out.len()).map_err(|_| LINUX_EINVAL)?;
+    mode.write_struct(optlen_ptr, &len)
 }
 
 fn write_current_sockopt_payload(
@@ -1985,23 +2066,13 @@ fn write_current_sockopt_payload(
     optlen_ptr: u64,
     payload: &[u8],
 ) -> Result<(), i64> {
-    if optval_ptr == 0 || optlen_ptr == 0 {
-        return Err(LINUX_EINVAL);
-    }
-    let capacity = read_user_struct_as::<u32>(optlen_ptr)? as usize;
-    // Linux truncates an int-valued option to the caller's `optlen`
-    // (`SO_ERROR` read through a 1-byte buffer); structured options with a
-    // short buffer stay `EINVAL`.
-    let payload = if capacity >= payload.len() {
-        payload
-    } else if payload.len() == size_of::<i32>() && capacity != 0 && capacity <= i32::MAX as usize {
-        &payload[..capacity]
-    } else {
-        return Err(LINUX_EINVAL);
-    };
-    write_user_bytes_as(optval_ptr, payload)?;
-    let len = payload.len() as u32;
-    write_user_struct_as(optlen_ptr, &len)
+    write_sockopt_payload(
+        optval_ptr,
+        optlen_ptr,
+        payload,
+        false,
+        UserCopyMode::AddressSpace,
+    )
 }
 
 #[cfg(test)]
@@ -2016,6 +2087,36 @@ mod netd_receive_shape_tests {
         assert!(read_current_iovecs_payload(0, 0).unwrap().is_empty());
         let iovecs = [linux_abi::LinuxIovec { iov_base: 0, iov_len: (NETD_IPC_PAYLOAD_CAPACITY as u64) * 2 }];
         assert_eq!(iovec_payload_total_len(&iovecs), Ok(NETD_IPC_PAYLOAD_CAPACITY * 2));
+    }
+
+    #[test]
+    fn iovec_payload_total_len_rejects_overflow_and_oversized_sum() {
+        let overflowing = [
+            linux_abi::LinuxIovec { iov_base: 0, iov_len: u64::MAX - 4 },
+            linux_abi::LinuxIovec { iov_base: 0, iov_len: 16 },
+        ];
+        assert_eq!(iovec_payload_total_len(&overflowing), Err(LINUX_EINVAL));
+
+        let too_large = [
+            linux_abi::LinuxIovec { iov_base: 0, iov_len: (isize::MAX as u64) },
+            linux_abi::LinuxIovec { iov_base: 0, iov_len: 1 },
+        ];
+        assert_eq!(iovec_payload_total_len(&too_large), Err(LINUX_EINVAL));
+    }
+
+    #[test]
+    fn write_iovec_payload_skips_zero_len_null_base_iovecs() {
+        let iovecs = [
+            linux_abi::LinuxIovec { iov_base: 0, iov_len: 0 },
+        ];
+        assert_eq!(
+            write_iovec_payload_with_mode(&iovecs, b"abc", UserCopyMode::Pointer),
+            Ok(0)
+        );
+        assert_eq!(
+            write_iovec_payload_with_mode(&iovecs, &[], UserCopyMode::AddressSpace),
+            Ok(0)
+        );
     }
 
     #[test]

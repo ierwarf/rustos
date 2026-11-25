@@ -213,6 +213,18 @@ pub(super) fn mmsg_batch_result(done: u64, error: Option<i64>) -> u64 {
     }
 }
 
+pub(super) fn syscall_linux_sendmsg(fd: u64, msg_ptr: u64, flags: u64) -> u64 {
+    service_ops::local_unix::try_sendmsg(fd, msg_ptr, flags).unwrap_or_else(|| {
+        syscall_linux_net4(SYSCALL_OFFLOAD_OP_LINUX_SENDMSG, fd, msg_ptr, flags, 0)
+    })
+}
+
+pub(super) fn syscall_linux_recvmsg(fd: u64, msg_ptr: u64, flags: u64) -> u64 {
+    service_ops::local_unix::try_recvmsg(fd, msg_ptr, flags).unwrap_or_else(|| {
+        syscall_linux_net4(SYSCALL_OFFLOAD_OP_LINUX_RECVMSG, fd, msg_ptr, flags, 0)
+    })
+}
+
 pub(super) fn syscall_linux_sendmmsg(fd: u64, msgvec: u64, vlen: u64, flags: u64) -> u64 {
     let vlen = vlen.min(linux_abi::UIO_MAXIOV);
     if let Err(errno) = mmsg_vector_ok(fd, msgvec, vlen) {
@@ -222,7 +234,7 @@ pub(super) fn syscall_linux_sendmmsg(fd: u64, msgvec: u64, vlen: u64, flags: u64
     let mut error = None;
     while done < vlen {
         let entry = mmsg_entry(msgvec, done);
-        let sent = syscall_linux_net4(SYSCALL_OFFLOAD_OP_LINUX_SENDMSG, fd, entry, flags, 0);
+        let sent = syscall_linux_sendmsg(fd, entry, flags);
         if is_errno_result(sent) {
             error = Some(-(sent as i64));
             break;
@@ -261,7 +273,7 @@ pub(super) fn syscall_linux_recvmmsg(
     let mut error = None;
     while done < vlen {
         let entry = mmsg_entry(msgvec, done);
-        let received = syscall_linux_net4(SYSCALL_OFFLOAD_OP_LINUX_RECVMSG, fd, entry, flags, 0);
+        let received = syscall_linux_recvmsg(fd, entry, flags);
         if is_errno_result(received) {
             error = Some(-(received as i64));
             break;

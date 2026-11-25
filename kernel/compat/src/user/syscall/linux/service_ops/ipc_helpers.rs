@@ -19,6 +19,8 @@ use nucleus_core::util::{
     lockdep::{LockClass, TrackedSpinLock},
     ring::RingBuffer,
 };
+use rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY;
+use rustos_user_abi::wire::UserWire;
 
 #[path = "ipc_helpers/bootstrap_spawn.rs"]
 mod bootstrap_spawn;
@@ -616,6 +618,152 @@ mod proc_directory_base_tests {
     }
 }
 
+#[cfg(test)]
+mod ipc_helpers_audit_tests {
+    use alloc::boxed::Box;
+    use super::*;
+
+    #[test]
+    fn netd_request_bytes_rejects_oversized_payload_len() {
+        let mut req = Box::new(NetdIpcRequest::default());
+        req.payload_len = 0;
+        assert_eq!(
+            netd_request_bytes(&req).map(<[u8]>::len),
+            Ok(NETD_IPC_REQUEST_HEADER_SIZE)
+        );
+        req.payload_len = 16;
+        assert_eq!(
+            netd_request_bytes(&req).map(<[u8]>::len),
+            Ok(NETD_IPC_REQUEST_HEADER_SIZE + 16)
+        );
+        req.payload_len = u32::MAX;
+        assert_eq!(netd_request_bytes(&req), Err(LINUX_EINVAL));
+    }
+
+    #[test]
+    fn console_readiness_response_rejects_unknown_flags_or_zero_generation() {
+        let mut resp = Box::new(CommercialMaxProtocolResponse::default());
+        resp.value1 = 7;
+        resp.value0 = SESSIOND_CONSOLE_READINESS_READY | SESSIOND_CONSOLE_READINESS_LIVE;
+        assert_eq!(check_console_readiness_response(&resp), Ok(()));
+
+        resp.value1 = 0;
+        assert_eq!(check_console_readiness_response(&resp), Err(LINUX_EINVAL));
+
+        resp.value1 = 7;
+        resp.payload_len = 1;
+        assert_eq!(check_console_readiness_response(&resp), Err(LINUX_EINVAL));
+
+        resp.payload_len = 0;
+        resp.value0 = !SESSIOND_CONSOLE_READINESS_MASK;
+        assert_eq!(check_console_readiness_response(&resp), Err(LINUX_EINVAL));
+    }
+
+    #[test]
+    fn devmgrd_ioctl_response_validates_envelope_and_payload_policy() {
+        let mut resp = Box::new(DevmgrdDeviceIoctlResponse {
+            version: rustos_user_abi::syscall::DEVMGRD_IPC_ABI_VERSION,
+            op: rustos_user_abi::syscall::DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
+            status: -(LINUX_EPERM as i32),
+            value: 0,
+            payload_len: 0,
+            reserved1: 0,
+            reserved0: 0,
+            ..DevmgrdDeviceIoctlResponse::default()
+        });
+        assert_eq!(
+            validate_devmgrd_ioctl_response(
+                rustos_user_abi::syscall::DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
+                false,
+                &resp,
+            ),
+            Ok(-(LINUX_EPERM as i32))
+        );
+
+        resp.payload_len = 4;
+        assert_eq!(
+            validate_devmgrd_ioctl_response(
+                rustos_user_abi::syscall::DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
+                false,
+                &resp,
+            ),
+            Err(LINUX_EINVAL)
+        );
+        assert_eq!(
+            validate_devmgrd_ioctl_response(
+                rustos_user_abi::syscall::DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
+                true,
+                &resp,
+            ),
+            Ok(-(LINUX_EPERM as i32))
+        );
+
+        resp.payload_len = (resp.payload.len() as u32) + 1;
+        assert_eq!(
+            validate_devmgrd_ioctl_response(
+                rustos_user_abi::syscall::DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
+                true,
+                &resp,
+            ),
+            Err(LINUX_EINVAL)
+        );
+
+        resp.payload_len = 0;
+        resp.reserved1 = 1;
+        assert_eq!(
+            validate_devmgrd_ioctl_response(
+                rustos_user_abi::syscall::DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
+                false,
+                &resp,
+            ),
+            Err(LINUX_EINVAL)
+        );
+    }
+
+    #[test]
+    fn inputd_header_requires_matching_version_op_and_zero_flags() {
+        assert_eq!(validate_inputd_header(INPUTD_IPC_ABI_VERSION, 9, 0, 9), Ok(()));
+        assert_eq!(
+            validate_inputd_header(INPUTD_IPC_ABI_VERSION.wrapping_add(1), 9, 0, 9),
+            Err(LINUX_EINVAL)
+        );
+        assert_eq!(validate_inputd_header(INPUTD_IPC_ABI_VERSION, 8, 0, 9), Err(LINUX_EINVAL));
+        assert_eq!(validate_inputd_header(INPUTD_IPC_ABI_VERSION, 9, 1, 9), Err(LINUX_EINVAL));
+    }
+
+    #[test]
+    fn decode_and_check_vfs_reply_validates_size_envelope_and_status() {
+        assert_eq!(decode_and_check_vfs_reply(VFS_IPC_OP_CLOSE, &[0_u8; 4]), Err(LINUX_EINVAL));
+
+        let mut resp = VfsIpcResponse {
+            version: VFS_IPC_ABI_VERSION,
+            op: VFS_IPC_OP_CLOSE,
+            status: 0,
+            handle_kind: 0,
+            reserved0: 0,
+            payload_len: 0,
+            remote_id: 0,
+            value: 0,
+            aux: 0,
+            payload: [0_u8; VFS_IPC_PAYLOAD_CAPACITY],
+        };
+        assert_eq!(decode_and_check_vfs_reply(VFS_IPC_OP_CLOSE, as_bytes(&resp)), Ok(()));
+
+        resp.status = -(LINUX_EBUSY as i32);
+        assert_eq!(
+            decode_and_check_vfs_reply(VFS_IPC_OP_CLOSE, as_bytes(&resp)),
+            Err(LINUX_EBUSY)
+        );
+
+        resp.status = 0;
+        resp.op = VFS_IPC_OP_OPENAT;
+        assert_eq!(
+            decode_and_check_vfs_reply(VFS_IPC_OP_CLOSE, as_bytes(&resp)),
+            Err(LINUX_EINVAL)
+        );
+    }
+}
+
 pub(super) fn is_linux_at_fdcwd_for_vfs(dirfd: u64) -> bool {
     const AT_FDCWD_I64: u64 = (-100_i64) as u64;
     const AT_FDCWD_I32: u64 = 0xffff_ff9c;
@@ -729,6 +877,60 @@ fn vfs_response_needs_reconciliation(request: &VfsIpcRequest, response: &VfsIpcR
     request.op == VFS_IPC_OP_CLOSE && response.status.unsigned_abs() == LINUX_EBUSY as u32
 }
 
+fn call_service_bytes_with_optional_deadline(
+    service_id: u64,
+    request_bytes: &[u8],
+    class: ipc_ops::ServiceIpcClass,
+    timeout_ms: Option<u64>,
+) -> LinuxResult<Vec<u8>> {
+    match timeout_ms {
+        Some(timeout_ms) => ipc_ops::call_service_endpoint_with_class_deadline(
+            service_id,
+            request_bytes,
+            class,
+            timeout_ms,
+        ),
+        None => ipc_ops::call_service_endpoint_with_class(service_id, request_bytes, class),
+    }
+}
+
+fn call_checked_service_rpc<Req, Resp: Copy>(
+    service_name: &'static str,
+    service_id: u64,
+    op: u16,
+    pid: u64,
+    tid: u64,
+    request: &Req,
+    class: ipc_ops::ServiceIpcClass,
+    timeout_ms: Option<u64>,
+    log_slow: bool,
+    detail: Option<&str>,
+    validate: impl FnOnce(&Resp) -> LinuxResult<i32>,
+) -> LinuxResult<Resp> {
+    let start_ticks = log_slow.then(crate::arch::rtc::ticks);
+    let response: Resp = call_fixed_service_rpc(service_id, request, class, timeout_ms)?;
+    if let Some(start) = start_ticks {
+        diagnostics::log_slow_service_call(
+            service_name,
+            op,
+            ticks_elapsed_ms(start, crate::arch::rtc::ticks()),
+            pid,
+            tid,
+            size_of::<Resp>() as i64,
+            detail,
+        );
+    }
+    let status = validate(&response)?;
+    check_ipc_status(status)?;
+    Ok(response)
+}
+
+fn decode_and_check_vfs_reply(op: u16, bytes: &[u8]) -> LinuxResult<()> {
+    let response = decode_fixed_response::<VfsIpcResponse>(bytes)?;
+    validate_vfs_response_envelope(op, &response)?;
+    check_ipc_status(response.status)
+}
+
 fn call_vfs_ipc_request_impl(
     request: &VfsIpcRequest,
     timeout_ms: Option<u64>,
@@ -769,20 +971,12 @@ fn call_vfs_ipc_request_impl(
             }
             None => None,
         };
-        let result = match attempt_timeout_ms {
-            Some(timeout_ms) => ipc_ops::call_service_endpoint_with_class_deadline(
-                IPC_SERVICE_VFSD,
-                as_bytes(request),
-                service_class,
-                timeout_ms,
-            ),
-            None => ipc_ops::call_service_endpoint_with_class(
-                IPC_SERVICE_VFSD,
-                as_bytes(request),
-                service_class,
-            ),
-        };
-        match result {
+        match call_service_bytes_with_optional_deadline(
+            IPC_SERVICE_VFSD,
+            as_bytes(request),
+            service_class,
+            attempt_timeout_ms,
+        ) {
             Ok(bytes) => {
                 response = Some(bytes);
                 break;
@@ -828,19 +1022,20 @@ fn call_vfs_ipc_request_impl(
         response.len() as i64,
         detail.as_deref(),
     );
-    if response.len() != size_of::<VfsIpcResponse>() {
-        if deferred_reconcile {
-            enqueue_pending_vfs_mutation(request)?;
+    let response = match decode_fixed_response::<VfsIpcResponse>(response.as_slice()).and_then(
+        |decoded| {
+            validate_vfs_response_envelope(request.op, &decoded)?;
+            Ok(decoded)
+        },
+    ) {
+        Ok(decoded) => decoded,
+        Err(errno) => {
+            if deferred_reconcile {
+                enqueue_pending_vfs_mutation(request)?;
+            }
+            return Err(errno);
         }
-        return Err(LINUX_EINVAL);
-    }
-    let response = read_unaligned::<VfsIpcResponse>(response.as_slice());
-    if let Err(errno) = validate_vfs_response_envelope(request.op, &response) {
-        if deferred_reconcile {
-            enqueue_pending_vfs_mutation(request)?;
-        }
-        return Err(errno);
-    }
+    };
     if vfs_response_needs_reconciliation(request, &response) {
         enqueue_pending_vfs_mutation(request)?;
     }
@@ -868,28 +1063,20 @@ fn acknowledge_vfs_checkpoint_mutation(original: &VfsIpcRequest) -> Result<(), i
     let ack = vfs_checkpoint_ack_request(original);
     // A visibility ACK mutates checkpoint custody. Give it one complete
     // state-mutation lease, never an interactive or readiness-query rail.
-    let last_errno = match ipc_ops::call_service_endpoint_with_class_deadline(
+    let err = match ipc_ops::call_service_endpoint_with_class_deadline(
         IPC_SERVICE_VFSD,
         as_bytes(&ack),
         vfs_request_service_class(&ack),
         rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
     ) {
-        Ok(bytes) if bytes.len() == size_of::<VfsIpcResponse>() => {
-            let response = read_unaligned::<VfsIpcResponse>(&bytes);
-            if validate_vfs_response_envelope(ack.op, &response).is_ok() && response.status == 0 {
-                return Ok(());
-            }
-            if response.status == 0 {
-                LINUX_EINVAL
-            } else {
-                i64::from(response.status.unsigned_abs())
-            }
-        }
-        Ok(_) => LINUX_EINVAL,
+        Ok(bytes) => match decode_and_check_vfs_reply(ack.op, &bytes) {
+            Ok(()) => return Ok(()),
+            Err(errno) => errno,
+        },
         Err(errno) => errno,
     };
     enqueue_captured_vfs_mutation(PendingVfsMutation::capture_ack(original, &ack)?)?;
-    Err(last_errno)
+    Err(err)
 }
 
 fn vfs_checkpoint_ack_request(original: &VfsIpcRequest) -> VfsIpcRequest {
@@ -1052,20 +1239,14 @@ fn replay_pending_vfs_mutation(lane: Option<VfsMutationLane>) -> Option<bool> {
     let pending = PENDING_VFS_MUTATIONS.lock().pop(lane)?;
     let mut request = new_vfs_request(pending.op);
     pending.restore_into(&mut request);
-    let response = ipc_ops::call_service_endpoint_with_class_deadline(
+    let completed = ipc_ops::call_service_endpoint_with_class_deadline(
         IPC_SERVICE_VFSD,
         as_bytes(&request),
         ipc_ops::ServiceIpcClass::StateMutation,
         rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
     )
     .ok()
-    .and_then(|bytes| {
-        (bytes.len() == size_of::<VfsIpcResponse>())
-            .then(|| read_unaligned::<VfsIpcResponse>(&bytes))
-    });
-    let completed = response.is_some_and(|response| {
-        validate_vfs_response_envelope(request.op, &response).is_ok() && response.status == 0
-    });
+    .is_some_and(|bytes| decode_and_check_vfs_reply(request.op, &bytes).is_ok());
     if !completed {
         retry_vfs_mutation_later(&mut *PENDING_VFS_MUTATIONS.lock(), pending);
         return Some(false);
@@ -1116,10 +1297,6 @@ fn validate_vfs_response_envelope(request_op: u16, response: &VfsIpcResponse) ->
         return Err(LINUX_EINVAL);
     }
     Ok(())
-}
-
-pub fn current_input_device_access(fd: u64) -> Option<(u16, u64)> {
-    current_input_device_description(fd).map(|(_, access, flags)| (access, flags))
 }
 
 pub fn current_input_device_description(fd: u64) -> Option<(u64, u16, u64)> {
@@ -1198,21 +1375,34 @@ pub fn read_input_device_via_inputd(
     })())
 }
 
+fn validate_inputd_header(version: u16, op: u16, flags: u32, expected_op: u16) -> LinuxResult<()> {
+    if version != INPUTD_IPC_ABI_VERSION || op != expected_op || flags != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(())
+}
+
 fn call_inputd_ipc_request_fixed(
     request: &InputdIpcRequest,
     class: ipc_ops::ServiceIpcClass,
     timeout_ms: Option<u64>,
 ) -> LinuxResult<InputdIpcResponse> {
-    let response: InputdIpcResponse =
-        call_fixed_service_rpc(IPC_SERVICE_INPUTD, request, class, timeout_ms)?;
-    if response.version != INPUTD_IPC_ABI_VERSION
-        || response.op != request.op
-        || response.flags != 0
-    {
-        return Err(LINUX_EINVAL);
-    }
-    check_ipc_status(response.status)?;
-    Ok(response)
+    call_checked_service_rpc(
+        "inputd",
+        IPC_SERVICE_INPUTD,
+        request.op,
+        request.pid,
+        request.tid,
+        request,
+        class,
+        timeout_ms,
+        false,
+        None,
+        |response: &InputdIpcResponse| {
+            validate_inputd_header(response.version, response.op, response.flags, request.op)?;
+            Ok(response.status)
+        },
+    )
 }
 
 fn call_inputd_ipc_request(request: &InputdIpcRequest) -> Result<InputdIpcResponse, i64> {
@@ -1256,6 +1446,15 @@ pub fn current_console_session_is_system() -> bool {
         .unwrap_or(false)
 }
 
+fn current_non_system_console_session() -> LinuxResult<u64> {
+    let snapshot = multitask::current_user_snapshot().ok_or(LINUX_EINVAL)?;
+    let session = snapshot.console_session();
+    if session.is_system() {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(session.raw())
+}
+
 fn call_sessiond_commercial(
     op: u16,
     arg0: u64,
@@ -1285,26 +1484,25 @@ fn call_sessiond_commercial(
     request.payload[..payload.len()].copy_from_slice(payload);
     request.payload_len = payload.len() as u32;
 
-    let start_ticks = if log_slow { Some(crate::arch::rtc::ticks()) } else { None };
-    let response: CommercialMaxProtocolResponse =
-        call_fixed_service_rpc(IPC_SERVICE_SESSIOND, &request, class, timeout_ms)?;
-    if let Some(start) = start_ticks {
-        diagnostics::log_slow_service_call(
-            "sessiond",
-            request.header.op,
-            ticks_elapsed_ms(start, crate::arch::rtc::ticks()),
-            request.header.subject_pid,
-            request.header.subject_tid,
-            size_of::<CommercialMaxProtocolResponse>() as i64,
-            None,
-        );
-    }
-    ipc_ops::validate_commercial_response_envelope(&request, &response)?;
-    if response.descriptor_count != 1 {
-        return Err(LINUX_EINVAL);
-    }
-    check_ipc_status(response.status)?;
-    Ok(response)
+    call_checked_service_rpc(
+        "sessiond",
+        IPC_SERVICE_SESSIOND,
+        request.header.op,
+        request.header.subject_pid,
+        request.header.subject_tid,
+        &request,
+        class,
+        timeout_ms,
+        log_slow,
+        None,
+        |response: &CommercialMaxProtocolResponse| {
+            ipc_ops::validate_commercial_response_envelope(&request, response)?;
+            if response.descriptor_count != 1 {
+                return Err(LINUX_EINVAL);
+            }
+            Ok(response.status)
+        },
+    )
 }
 
 fn check_console_readiness_response(response: &CommercialMaxProtocolResponse) -> LinuxResult<()> {
@@ -1329,18 +1527,16 @@ pub fn console_readiness_via_sessiond_with_timeout(
     {
         return Err(LINUX_EPERM);
     }
-    let response = call_sessiond_commercial(
-        COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE,
+    let response = call_sessiond_console_route(
+        session_handle,
         COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS,
         0,
-        session_handle,
         0,
         &[],
         ipc_ops::ServiceIpcClass::ReadinessQuery,
         Some(timeout_ms),
         false,
     )?;
-    check_console_readiness_response(&response)?;
     Ok((
         response.value0 & SESSIOND_CONSOLE_READINESS_READY != 0,
         response.value0 & SESSIOND_CONSOLE_READINESS_LIVE != 0,
@@ -1368,18 +1564,16 @@ pub fn console_graph_readiness_via_sessiond(
     known_generation: u64,
     wait_ms: u64,
 ) -> Result<u64, i64> {
-    let response = call_sessiond_commercial(
-        COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE,
+    let response = call_sessiond_console_route(
+        known_generation,
         COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS,
         wait_ms.min(SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS),
-        known_generation,
         0,
         &[],
         ipc_ops::ServiceIpcClass::InteractiveControl,
         Some(rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS),
         false,
     )?;
-    check_console_readiness_response(&response)?;
     Ok(response.value1)
 }
 
@@ -1391,13 +1585,8 @@ pub fn console_read_via_sessiond(
     if user_len == 0 {
         return Ok(0);
     }
-    usermem::validate_current_user_write_buffer(user_ptr, user_len)
-        .map_err(address_space_error_to_linux_errno)?;
-    let snapshot = multitask::current_user_snapshot().ok_or(LINUX_EINVAL)?;
-    let session = snapshot.console_session();
-    if session.is_system() {
-        return Err(LINUX_EINVAL);
-    }
+    validate_user_write_as(user_ptr, user_len)?;
+    let session = current_non_system_console_session()?;
 
     let mut copied = 0usize;
     // A blocking console read is the shell's own wait for a keystroke. It used
@@ -1415,8 +1604,7 @@ pub fn console_read_via_sessiond(
     let mut sleep_ns = 0u64;
     let waited_from_ns = crate::arch::rtc::monotonic_nanos();
     while copied < user_len {
-        let chunk_len =
-            (user_len - copied).min(CommercialMaxProtocolResponse::default().payload.len());
+        let chunk_len = (user_len - copied).min(COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY);
         // Only a reader that must wait, and has nothing to return yet, asks the
         // broker to hold the read. `empty_console_read_result` already answers
         // every other reader from what it has, so asking to wait would be a
@@ -1427,21 +1615,22 @@ pub fn console_read_via_sessiond(
             SESSIOND_CONSOLE_READ_WAIT_MAX_MS
         };
         let route_started_ns = crate::arch::rtc::monotonic_nanos();
-        let response = call_sessiond_console_route(
-            snapshot.process_id(),
-            snapshot.thread_id(),
-            session.raw(),
+        let response = match call_sessiond_console_route(
+            session,
             COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ,
-            &[],
-            chunk_len,
             wait_ms,
-        )?;
+            chunk_len,
+            &[],
+            ipc_ops::ServiceIpcClass::BulkData,
+            None,
+            true,
+        ) {
+            Ok(response) => response,
+            Err(errno) => return if copied > 0 { Ok(copied as u64) } else { Err(errno) },
+        };
         let route_elapsed_ns = crate::arch::rtc::monotonic_nanos().saturating_sub(route_started_ns);
         route_ns = route_ns.saturating_add(route_elapsed_ns);
         let read = response.payload_len as usize;
-        if read > chunk_len {
-            return Err(LINUX_EINVAL);
-        }
         if read == 0 {
             if let Some(result) = empty_console_read_result(nonblocking, copied) {
                 return result;
@@ -1467,9 +1656,12 @@ pub fn console_read_via_sessiond(
         if empty_polls != 0 {
             record_console_read_wait(empty_polls, waited_from_ns, route_ns, sleep_ns);
         }
-        let dest = user_ptr.checked_add(copied as u64).ok_or(LINUX_EINVAL)?;
-        usermem::write_current_user_bytes(dest, &response.payload[..read])
-            .map_err(address_space_error_to_linux_errno)?;
+        let Some(dest) = user_ptr.checked_add(copied as u64) else {
+            return if copied > 0 { Ok(copied as u64) } else { Err(LINUX_EINVAL) };
+        };
+        if let Err(errno) = write_user_bytes_as(dest, &response.payload[..read]) {
+            return if copied > 0 { Ok(copied as u64) } else { Err(errno) };
+        }
         copied += read;
         multitask::cond_resched();
         if read < chunk_len {
@@ -1534,33 +1726,32 @@ pub fn console_write_via_sessiond(user_ptr: u64, user_len: usize) -> Result<u64,
     if user_len == 0 {
         return Ok(0);
     }
-    let snapshot = multitask::current_user_snapshot().ok_or(LINUX_EINVAL)?;
-    let session = snapshot.console_session();
-    if session.is_system() {
-        return Err(LINUX_EINVAL);
-    }
+    let session = current_non_system_console_session()?;
 
     let mut copied = 0usize;
-    let mut chunk =
-        alloc::vec![0_u8; user_len.min(CommercialMaxProtocolRequest::default().payload.len())];
+    let mut chunk = alloc::vec![0_u8; user_len.min(COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY)];
     while copied < user_len {
         let chunk_len = (user_len - copied).min(chunk.len());
-        let src = user_ptr.checked_add(copied as u64).ok_or(LINUX_EINVAL)?;
-        usermem::copy_from_current_user_exact(src, &mut chunk[..chunk_len])
-            .map_err(address_space_error_to_linux_errno)?;
-        let response = call_sessiond_console_route(
-            snapshot.process_id(),
-            snapshot.thread_id(),
-            session.raw(),
-            COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE,
-            &chunk[..chunk_len],
-            0,
-            0,
-        )?;
-        let written = usize::try_from(response.value0).map_err(|_| LINUX_EINVAL)?;
-        if written > chunk_len {
-            return Err(LINUX_EINVAL);
+        let Some(src) = user_ptr.checked_add(copied as u64) else {
+            return if copied > 0 { Ok(copied as u64) } else { Err(LINUX_EINVAL) };
+        };
+        if let Err(errno) = read_user_bytes_as(src, &mut chunk[..chunk_len]) {
+            return if copied > 0 { Ok(copied as u64) } else { Err(errno) };
         }
+        let response = match call_sessiond_console_route(
+            session,
+            COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE,
+            0,
+            0,
+            &chunk[..chunk_len],
+            ipc_ops::ServiceIpcClass::BulkData,
+            None,
+            true,
+        ) {
+            Ok(response) => response,
+            Err(errno) => return if copied > 0 { Ok(copied as u64) } else { Err(errno) },
+        };
+        let written = response.value0 as usize;
         if written == 0 {
             break;
         }
@@ -1576,14 +1767,16 @@ pub fn console_write_via_sessiond(user_ptr: u64, user_len: usize) -> Result<u64,
 /// `wait_ms` is how long the console broker may hold a read that finds no
 /// bytes. Zero is the immediate snapshot every non-read route uses and every
 /// caller used before reads could be parked.
+#[allow(clippy::too_many_arguments)]
 fn call_sessiond_console_route(
-    _subject_pid: u64,
-    _subject_tid: u64,
     session_handle: u64,
     route_request: u64,
-    payload: &[u8],
-    read_capacity: usize,
     wait_ms: u64,
+    read_capacity: usize,
+    payload: &[u8],
+    class: ipc_ops::ServiceIpcClass,
+    timeout_ms: Option<u64>,
+    log_slow: bool,
 ) -> Result<CommercialMaxProtocolResponse, i64> {
     let response = call_sessiond_commercial(
         COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE,
@@ -1592,9 +1785,9 @@ fn call_sessiond_console_route(
         session_handle,
         read_capacity as u64,
         payload,
-        ipc_ops::ServiceIpcClass::BulkData,
-        None,
-        true,
+        class,
+        timeout_ms,
+        log_slow,
     )?;
     match route_request {
         COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ => {
@@ -1605,16 +1798,47 @@ fn call_sessiond_console_route(
             }
         }
         COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE => {
-            if response.payload_len != 0 || response.value0 as usize > payload.len() {
+            if response.payload_len != 0
+                || usize::try_from(response.value0).map_or(true, |written| written > payload.len())
+            {
                 return Err(LINUX_EINVAL);
             }
         }
-        COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS => {
+        COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS
+        | COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS => {
             check_console_readiness_response(&response)?;
         }
         _ => return Err(LINUX_EINVAL),
     }
     Ok(response)
+}
+
+fn validate_devmgrd_open_reply(
+    response: &[u8],
+    entries: Vec<multitask::TransferredHandleEntry>,
+) -> LinuxResult<multitask::TransferredHandleEntry> {
+    let decoded = match decode_fixed_response::<DevmgrdDeviceOpenResponse>(response) {
+        Ok(resp)
+            if resp.version == rustos_user_abi::syscall::DEVMGRD_IPC_ABI_VERSION
+                && resp.op == rustos_user_abi::syscall::DEVMGRD_IPC_OP_OPEN
+                && resp.reserved0 == 0 =>
+        {
+            resp
+        }
+        _ => {
+            ipc_ops::drop_transfer_entries(entries);
+            return Err(LINUX_EINVAL);
+        }
+    };
+    if let Err(errno) = check_ipc_status(decoded.status) {
+        ipc_ops::drop_transfer_entries(entries);
+        return Err(errno);
+    }
+    if entries.len() != 1 {
+        ipc_ops::drop_transfer_entries(entries);
+        return Err(LINUX_EINVAL);
+    }
+    entries.into_iter().next().ok_or(LINUX_EINVAL)
 }
 
 pub fn open_device_via_devmgrd(path: &str, flags: u64) -> Result<u64, i64> {
@@ -1638,30 +1862,7 @@ pub fn open_device_via_devmgrd(path: &str, flags: u64) -> Result<u64, i64> {
         as_bytes(&request),
         1,
     )?;
-    let response = match decode_fixed_response::<DevmgrdDeviceOpenResponse>(response.as_slice()) {
-        Ok(resp)
-            if resp.version == rustos_user_abi::syscall::DEVMGRD_IPC_ABI_VERSION
-                && resp.op == rustos_user_abi::syscall::DEVMGRD_IPC_OP_OPEN
-                && resp.reserved0 == 0 =>
-        {
-            resp
-        }
-        _ => {
-            ipc_ops::drop_transfer_entries(entries);
-            return Err(LINUX_EINVAL);
-        }
-    };
-    if let Err(errno) = check_ipc_status(response.status) {
-        ipc_ops::drop_transfer_entries(entries);
-        return Err(errno);
-    }
-    if entries.len() != 1 {
-        ipc_ops::drop_transfer_entries(entries);
-        return Err(LINUX_EINVAL);
-    }
-    let Some(entry) = entries.into_iter().next() else {
-        return Err(LINUX_EINVAL);
-    };
+    let entry = validate_devmgrd_open_reply(response.as_slice(), entries)?;
     let input_token = match entry.entry().handle() {
         multitask::KernelHandle::Device(device)
             if device.device_id() == kernel_object::api::device::DeviceId::Input =>
@@ -1733,6 +1934,28 @@ pub fn ioctl_tty_via_sessiond(fd: u64, request_number: u64, arg: u64) -> Result<
     }
 }
 
+fn validate_devmgrd_ioctl_response(
+    op: u16,
+    allow_payload: bool,
+    response: &DevmgrdDeviceIoctlResponse,
+) -> LinuxResult<i32> {
+    let payload_ok = if allow_payload {
+        response.payload_len as usize <= response.payload.len()
+    } else {
+        response.payload_len == 0
+    };
+    if response.version != rustos_user_abi::syscall::DEVMGRD_IPC_ABI_VERSION
+        || response.op != op
+        || !payload_ok
+        || response.reserved1 != 0
+        || response.reserved0 != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(response.status)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(in crate::user::syscall::linux) fn call_devmgrd_ioctl(
     fd: u64,
     op: u16,
@@ -1748,39 +1971,19 @@ pub(in crate::user::syscall::linux) fn call_devmgrd_ioctl(
         return Err(LINUX_EINVAL);
     }
     configure(&mut request)?;
-    let start_ticks = if log_slow { Some(crate::arch::rtc::ticks()) } else { None };
-    let response: DevmgrdDeviceIoctlResponse = call_fixed_service_rpc(
+    call_checked_service_rpc(
+        "devmgrd",
         IPC_SERVICE_DEVMGRD,
+        request.op,
+        request.pid,
+        request.tid,
         &request,
         ipc_ops::ServiceIpcClass::InteractiveControl,
         None,
-    )?;
-    if let Some(start) = start_ticks {
-        diagnostics::log_slow_service_call(
-            "devmgrd",
-            request.op,
-            ticks_elapsed_ms(start, crate::arch::rtc::ticks()),
-            request.pid,
-            request.tid,
-            size_of::<DevmgrdDeviceIoctlResponse>() as i64,
-            None,
-        );
-    }
-    let payload_ok = if allow_payload {
-        response.payload_len as usize <= response.payload.len()
-    } else {
-        response.payload_len == 0
-    };
-    if response.version != rustos_user_abi::syscall::DEVMGRD_IPC_ABI_VERSION
-        || response.op != op
-        || !payload_ok
-        || response.reserved1 != 0
-        || response.reserved0 != 0
-    {
-        return Err(LINUX_EINVAL);
-    }
-    check_ipc_status(response.status)?;
-    Ok(response)
+        log_slow,
+        None,
+        |response| validate_devmgrd_ioctl_response(op, allow_payload, response),
+    )
 }
 
 pub fn ioctl_device_via_devmgrd(fd: u64, request_number: u64, arg: u64) -> Result<u64, i64> {
@@ -1908,53 +2111,64 @@ pub fn ioctl_route_via_devmgrd(fd: u64, request_number: u64) -> Result<u64, i64>
     }
 }
 
+fn copy_user_struct_to_devmgrd_payload<T: Copy + Default>(
+    request: &mut DevmgrdDeviceIoctlRequest,
+    arg: u64,
+) -> LinuxResult<()> {
+    let value = read_user_struct_as::<T>(arg)?;
+    copy_struct_into_payload(&mut request.payload, &mut request.payload_len, &value)
+}
+
 fn populate_devmgrd_ioctl_payload(
     request: &mut DevmgrdDeviceIoctlRequest,
     arg: u64,
 ) -> Result<(), i64> {
     match request.request {
         rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSIONS => {
-            let snapshot = usermem::read_current_user_struct::<
+            copy_user_struct_to_devmgrd_payload::<
                 rustos_user_abi::console::ConsoleSnapshotSessionsRequest,
-            >(arg)
-            .map_err(address_space_error_to_linux_errno)?;
-            copy_devmgrd_ioctl_request_payload(request, as_bytes(&snapshot))
+            >(request, arg)
         }
         rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT => {
-            let snapshot = usermem::read_current_user_struct::<
+            copy_user_struct_to_devmgrd_payload::<
                 rustos_user_abi::console::ConsoleSnapshotSessionOutputRequest,
-            >(arg)
-            .map_err(address_space_error_to_linux_errno)?;
-            copy_devmgrd_ioctl_request_payload(request, as_bytes(&snapshot))
+            >(request, arg)
         }
         rustos_user_abi::console::CONSOLE_IOCTL_SEND_INPUT_EVENT => {
-            let input = usermem::read_current_user_struct::<
+            copy_user_struct_to_devmgrd_payload::<
                 rustos_user_abi::console::ConsoleSendInputEventRequest,
-            >(arg)
-            .map_err(address_space_error_to_linux_errno)?;
-            copy_devmgrd_ioctl_request_payload(request, as_bytes(&input))
+            >(request, arg)
         }
         rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS => {
-            let focus = usermem::read_current_user_struct::<
+            copy_user_struct_to_devmgrd_payload::<
                 rustos_user_abi::console::ConsoleSetFocusRequest,
-            >(arg)
-            .map_err(address_space_error_to_linux_errno)?;
-            copy_devmgrd_ioctl_request_payload(request, as_bytes(&focus))
+            >(request, arg)
         }
         _ => Ok(()),
     }
 }
 
-fn copy_devmgrd_ioctl_request_payload(
-    request: &mut DevmgrdDeviceIoctlRequest,
-    bytes: &[u8],
-) -> Result<(), i64> {
-    if bytes.len() > request.payload.len() {
+fn copy_devmgrd_snapshot_payload<H: Copy + UserWire, Item>(
+    arg: u64,
+    payload: &[u8],
+    inspect: impl FnOnce(&H) -> LinuxResult<(u64, u64)>,
+) -> LinuxResult<()> {
+    let header_len = size_of::<H>();
+    if payload.len() < header_len {
         return Err(LINUX_EINVAL);
     }
-    request.payload[..bytes.len()].copy_from_slice(bytes);
-    request.payload_len = bytes.len() as u32;
-    Ok(())
+    let snapshot = read_unaligned::<H>(payload);
+    let (out_ptr, count) = inspect(&snapshot)?;
+    let count = usize::try_from(count).map_err(|_| LINUX_EINVAL)?;
+    let data_len = count.checked_mul(size_of::<Item>()).ok_or(LINUX_EINVAL)?;
+    if payload.len() != header_len + data_len {
+        return Err(LINUX_EINVAL);
+    }
+    write_user_struct_as(arg, &snapshot)?;
+    if data_len == 0 {
+        return Ok(());
+    }
+    write_user_bytes_as(out_ptr, &payload[header_len..])
 }
 
 fn apply_devmgrd_ioctl_payload(
@@ -1966,80 +2180,42 @@ fn apply_devmgrd_ioctl_payload(
     if payload_len == 0 {
         return Ok(());
     }
+    let payload = response.payload.get(..payload_len).ok_or(LINUX_EINVAL)?;
     match request_number {
         rustos_user_abi::console::CONSOLE_IOCTL_GET_STATE => {
-            if payload_len != size_of::<rustos_user_abi::console::ConsoleStateInfo>() {
-                return Err(LINUX_EINVAL);
-            }
-            let info =
-                read_unaligned::<rustos_user_abi::console::ConsoleStateInfo>(&response.payload);
-            usermem::write_current_user_struct(arg, &info)
-                .map_err(address_space_error_to_linux_errno)
+            let info: rustos_user_abi::console::ConsoleStateInfo =
+                decode_exact_payload(&response.payload, response.payload_len)?;
+            write_user_struct_as(arg, &info)
         }
         rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSIONS => {
-            let header_len = size_of::<rustos_user_abi::console::ConsoleSnapshotSessionsRequest>();
-            if payload_len < header_len {
-                return Err(LINUX_EINVAL);
-            }
-            let snapshot = read_unaligned::<rustos_user_abi::console::ConsoleSnapshotSessionsRequest>(
-                &response.payload,
-            );
-            if snapshot.count > snapshot.capacity
-                || snapshot.count > rustos_user_abi::console::MAX_CONSOLE_SESSIONS as u64
-            {
-                return Err(LINUX_EINVAL);
-            }
-            let count = usize::try_from(snapshot.count).map_err(|_| LINUX_EINVAL)?;
-            let sessions_len = count
-                .checked_mul(size_of::<rustos_user_abi::console::ConsoleSessionInfo>())
-                .ok_or(LINUX_EINVAL)?;
-            if payload_len != header_len + sessions_len {
-                return Err(LINUX_EINVAL);
-            }
-            usermem::write_current_user_struct(arg, &snapshot)
-                .map_err(address_space_error_to_linux_errno)?;
-            if sessions_len == 0 {
-                return Ok(());
-            }
-            usermem::write_current_user_bytes(
-                snapshot.sessions_ptr,
-                &response.payload[header_len..payload_len],
-            )
-            .map_err(address_space_error_to_linux_errno)
+            copy_devmgrd_snapshot_payload::<
+                rustos_user_abi::console::ConsoleSnapshotSessionsRequest,
+                rustos_user_abi::console::ConsoleSessionInfo,
+            >(arg, payload, |snapshot| {
+                if snapshot.count > snapshot.capacity
+                    || snapshot.count > rustos_user_abi::console::MAX_CONSOLE_SESSIONS as u64
+                {
+                    return Err(LINUX_EINVAL);
+                }
+                Ok((snapshot.sessions_ptr, snapshot.count))
+            })
         }
         rustos_user_abi::console::CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT => {
-            let header_len =
-                size_of::<rustos_user_abi::console::ConsoleSnapshotSessionOutputRequest>();
-            if payload_len < header_len {
-                return Err(LINUX_EINVAL);
-            }
-            let snapshot = read_unaligned::<
+            copy_devmgrd_snapshot_payload::<
                 rustos_user_abi::console::ConsoleSnapshotSessionOutputRequest,
-            >(&response.payload);
-            if snapshot.count > snapshot.capacity {
-                return Err(LINUX_EINVAL);
-            }
-            let bytes_len = usize::try_from(snapshot.count).map_err(|_| LINUX_EINVAL)?;
-            if payload_len != header_len + bytes_len {
-                return Err(LINUX_EINVAL);
-            }
-            usermem::write_current_user_struct(arg, &snapshot)
-                .map_err(address_space_error_to_linux_errno)?;
-            if bytes_len == 0 {
-                return Ok(());
-            }
-            usermem::write_current_user_bytes(
-                snapshot.bytes_ptr,
-                &response.payload[header_len..payload_len],
-            )
-            .map_err(address_space_error_to_linux_errno)
+                u8,
+            >(arg, payload, |snapshot| {
+                if snapshot.count > snapshot.capacity {
+                    return Err(LINUX_EINVAL);
+                }
+                Ok((snapshot.bytes_ptr, snapshot.count))
+            })
         }
         _ => Err(LINUX_EINVAL),
     }
 }
 
 pub fn call_inputd_read_request(request: &InputdIpcRequest) -> Result<InputdReadResponse, i64> {
-    let start_ticks = crate::arch::rtc::ticks();
     // A nonblocking read cannot legitimately need the bulk-data rail. Its
     // contract is to answer now or report that there is nothing, so a caller
     // that waits 30 seconds for one is not waiting on data - it is waiting on a
@@ -2055,37 +2231,33 @@ pub fn call_inputd_read_request(request: &InputdIpcRequest) -> Result<InputdRead
     // A blocking read keeps the bulk rail. Its completion wait is genuinely
     // open-ended, and cancelling one mid-authorization is what the cancellable
     // authorization lease this file already notes has to land first.
-    let class = if request.flags & INPUTD_READ_FLAG_NONBLOCK != 0 {
-        ipc_ops::ServiceIpcClass::InteractiveControl
+    let nonblocking = request.flags & INPUTD_READ_FLAG_NONBLOCK != 0;
+    let (class, detail) = if nonblocking {
+        (ipc_ops::ServiceIpcClass::InteractiveControl, Some("nonblock"))
     } else {
-        ipc_ops::ServiceIpcClass::BulkData
+        (ipc_ops::ServiceIpcClass::BulkData, Some("blocking"))
     };
-    let response: InputdReadResponse =
-        call_fixed_service_rpc(IPC_SERVICE_INPUTD, request, class, None)?;
-    let detail = if request.flags & INPUTD_READ_FLAG_NONBLOCK != 0 {
-        Some("nonblock")
-    } else {
-        Some("blocking")
-    };
-    diagnostics::log_slow_service_call(
+    call_checked_service_rpc(
         "inputd",
+        IPC_SERVICE_INPUTD,
         request.op,
-        ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()),
         request.pid,
         request.tid,
-        size_of::<InputdReadResponse>() as i64,
+        request,
+        class,
+        None,
+        true,
         detail,
-    );
-    if response.version != INPUTD_IPC_ABI_VERSION
-        || response.op != request.op
-        || response.flags != 0
-        || response.reserved0 != 0
-        || response.payload_len as usize > INPUTD_READ_PAYLOAD_CAPACITY
-    {
-        return Err(LINUX_EINVAL);
-    }
-    check_ipc_status(response.status)?;
-    Ok(response)
+        |response: &InputdReadResponse| {
+            validate_inputd_header(response.version, response.op, response.flags, request.op)?;
+            if response.reserved0 != 0
+                || response.payload_len as usize > INPUTD_READ_PAYLOAD_CAPACITY
+            {
+                return Err(LINUX_EINVAL);
+            }
+            Ok(response.status)
+        },
+    )
 }
 
 pub fn call_netd_ipc_request(request: &NetdIpcRequest) -> Result<NetdIpcResponse, i64> {
@@ -2099,6 +2271,14 @@ pub fn call_netd_ipc_request_with_timeout(
     call_netd_ipc_request_impl(request, Some(timeout_ms.max(1)))
 }
 
+pub(super) fn netd_request_bytes(request: &NetdIpcRequest) -> LinuxResult<&[u8]> {
+    let request_len = NETD_IPC_REQUEST_HEADER_SIZE
+        .checked_add(request.payload_len as usize)
+        .filter(|len| *len <= size_of::<NetdIpcRequest>())
+        .ok_or(LINUX_EINVAL)?;
+    Ok(&as_bytes(request)[..request_len])
+}
+
 fn call_netd_ipc_request_impl(
     request: &NetdIpcRequest,
     timeout_ms: Option<u64>,
@@ -2107,31 +2287,22 @@ fn call_netd_ipc_request_impl(
         return call_netd_socket_ipc_request_impl(request, timeout_ms);
     }
     let start_ticks = crate::arch::rtc::ticks();
-    let request_len = NETD_IPC_REQUEST_HEADER_SIZE
-        .checked_add(request.payload_len as usize)
-        .filter(|len| *len <= size_of::<NetdIpcRequest>())
-        .ok_or(LINUX_EINVAL)?;
-    let request_bytes = &as_bytes(request)[..request_len];
+    let request_bytes = netd_request_bytes(request)?;
+    let class = timeout_ms.map_or(ipc_ops::ServiceIpcClass::BulkData, |_| {
+        deadline::netd_timeout_class(request.op)
+    });
     // TRANSPORT BOUNDARY. Everything below this point means netd answered.
     // A failure *here* means the reply never arrived, and that is the only
     // case where the caller cannot tell whether the byte movement happened -
     // the request is already on netd's endpoint queue and netd still runs it.
     // Recording it further out would also catch netd's own status replies,
     // where `EAGAIN` on an empty non-blocking receive is the ordinary answer.
-    let response = match timeout_ms {
-        Some(timeout_ms) => ipc_ops::call_service_endpoint_with_class_deadline(
-            IPC_SERVICE_NETD,
-            request_bytes,
-            deadline::netd_timeout_class(request.op),
-            timeout_ms,
-        ),
-        None => ipc_ops::call_service_endpoint_with_class(
-            IPC_SERVICE_NETD,
-            request_bytes,
-            ipc_ops::ServiceIpcClass::BulkData,
-        ),
-    };
-    let response = match response {
+    let response = match call_service_bytes_with_optional_deadline(
+        IPC_SERVICE_NETD,
+        request_bytes,
+        class,
+        timeout_ms,
+    ) {
         Ok(response) => response,
         Err(errno) => {
             if super::vfs_meta::socket_op_moves_stream_bytes(request.op) {
@@ -2165,9 +2336,7 @@ fn finish_netd_ipc_response(
     // A reference mutation may carry cleanup even on an error; validate and
     // settle its custody before exposing the operation status.
     release(&mut decoded)?;
-    if decoded.status != 0 {
-        return Err(decoded.status.unsigned_abs() as i64);
-    }
+    check_ipc_status(decoded.status)?;
     // The scheduling hint is consumed at the kernel IPC boundary and is not
     // part of the Linux socket result exposed to compatibility callers.
     decoded.reserved1 &= !NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;

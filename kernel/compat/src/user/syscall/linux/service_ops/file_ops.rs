@@ -312,44 +312,42 @@ fn set_vfs_times(
     flags: u64,
     atime: TimeSpec,
     mtime: TimeSpec,
-) -> u64 {
-    linux_unit_result((|| {
-        // Linux specifies that two OMITs succeed without checking the target.
-        if atime == TimeSpec::Omit && mtime == TimeSpec::Omit {
-            return Ok(());
+) -> LinuxResult<()> {
+    // Linux specifies that two OMITs succeed without checking the target.
+    if atime == TimeSpec::Omit && mtime == TimeSpec::Omit {
+        return Ok(());
+    }
+    let (mask, atime_secs, mtime_secs, nanos) = utime_attrs(atime, mtime);
+    let mut request = new_vfs_request(VFS_IPC_OP_SET_ATTRS);
+    request.arg0 = mask;
+    request.arg1 = atime_secs as u64;
+    request.arg2 = mtime_secs as u64;
+    request.arg3 = nanos;
+    request.flags = (flags & linux_abi::AT_SYMLINK_NOFOLLOW) as u32;
+    let by_descriptor = match path {
+        None => true,
+        Some(path) => path.is_empty() && flags & linux_abi::AT_EMPTY_PATH != 0,
+    };
+    if by_descriptor {
+        // `futimens`: vfsd addresses the open description's node, which still
+        // exists after the name was unlinked.
+        let (remote, rights) = require_remote_vfs_with_rights(dirfd, LINUX_EOPNOTSUPP)?;
+        if !rights.allows_read() && !rights.allows_write() {
+            return Err(LINUX_EBADF);
         }
-        let (mask, atime_secs, mtime_secs, nanos) = utime_attrs(atime, mtime);
-        let mut request = new_vfs_request(VFS_IPC_OP_SET_ATTRS);
-        request.arg0 = mask;
-        request.arg1 = atime_secs as u64;
-        request.arg2 = mtime_secs as u64;
-        request.arg3 = nanos;
-        request.flags = (flags & linux_abi::AT_SYMLINK_NOFOLLOW) as u32;
-        let by_descriptor = match path {
-            None => true,
-            Some(path) => path.is_empty() && flags & linux_abi::AT_EMPTY_PATH != 0,
-        };
-        if by_descriptor {
-            // `futimens`: vfsd addresses the open description's node, which still
-            // exists after the name was unlinked.
-            let (remote, rights) = require_remote_vfs_with_rights(dirfd, LINUX_EOPNOTSUPP)?;
-            if !rights.allows_read() && !rights.allows_write() {
-                return Err(LINUX_EBADF);
-            }
-            request.fd = dirfd;
-            request.remote_id = remote.remote_id();
-        } else if let Some(path) = path {
-            if path.is_empty() {
-                return Err(LINUX_ENOENT);
-            }
-            populate_vfs_path_base(&mut request, dirfd, path)?;
+        request.fd = dirfd;
+        request.remote_id = remote.remote_id();
+    } else if let Some(path) = path {
+        if path.is_empty() {
+            return Err(LINUX_ENOENT);
         }
-        call_vfs_status(&request)
-    })())
+        populate_vfs_path_base(&mut request, dirfd, path)?;
+    }
+    call_vfs_status(&request)
 }
 
 pub fn syscall_linux_vfs_utimensat(dirfd: u64, path_ptr: u64, times_ptr: u64, flags: u64) -> u64 {
-    linux_result((|| {
+    linux_unit_result((|| {
         let known = linux_abi::AT_SYMLINK_NOFOLLOW | linux_abi::AT_EMPTY_PATH;
         if flags & !known != 0 {
             return Err(LINUX_EINVAL);
@@ -368,12 +366,12 @@ pub fn syscall_linux_vfs_utimensat(dirfd: u64, path_ptr: u64, times_ptr: u64, fl
         } else {
             Some(copy_current_user_path_allow_empty(path_ptr, VFS_IPC_PATH_CAPACITY)?)
         };
-        Ok(set_vfs_times(dirfd, path.as_deref(), flags, atime, mtime))
+        set_vfs_times(dirfd, path.as_deref(), flags, atime, mtime)
     })())
 }
 
 pub fn syscall_linux_vfs_utime(path_ptr: u64, times_ptr: u64) -> u64 {
-    linux_result((|| {
+    linux_unit_result((|| {
         let path = copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY)?;
         let (atime, mtime) = if times_ptr == 0 {
             (TimeSpec::Now, TimeSpec::Now)
@@ -381,12 +379,12 @@ pub fn syscall_linux_vfs_utime(path_ptr: u64, times_ptr: u64) -> u64 {
             let times = read_user_struct_as::<[i64; 2]>(times_ptr)?;
             (TimeSpec::Set(times[0], 0), TimeSpec::Set(times[1], 0))
         };
-        Ok(set_vfs_times(linux_abi::AT_FDCWD as u64, Some(&path), 0, atime, mtime))
+        set_vfs_times(linux_abi::AT_FDCWD as u64, Some(&path), 0, atime, mtime)
     })())
 }
 
 pub fn syscall_linux_vfs_futimesat(dirfd: u64, path_ptr: u64, times_ptr: u64) -> u64 {
-    linux_result((|| {
+    linux_unit_result((|| {
         let path = if path_ptr == 0 {
             None
         } else {
@@ -401,7 +399,7 @@ pub fn syscall_linux_vfs_futimesat(dirfd: u64, path_ptr: u64, times_ptr: u64) ->
                 decode_utime_timeval(times[1].tv_sec, times[1].tv_usec)?,
             )
         };
-        Ok(set_vfs_times(dirfd, path.as_deref(), 0, atime, mtime))
+        set_vfs_times(dirfd, path.as_deref(), 0, atime, mtime)
     })())
 }
 
@@ -410,11 +408,11 @@ pub fn syscall_linux_vfs_futimesat(dirfd: u64, path_ptr: u64, times_ptr: u64) ->
 // ---------------------------------------------------------------------------
 
 /// One end of a bulk copy: a regular VFS file, memfd, or (for `sendfile`
-/// output) a pipe or socket.
+/// output) a pinned local pipe/socket or netd socket.
 enum CopyEnd {
     Remote { fd: u64, remote: multitask::RemoteVfsHandle },
     Memfd(multitask::MemfdHandle),
-    Pipe(u64),
+    Local(super::local_fd::LocalFd),
     Socket { fd: u64, snapshot: SocketSnapshot },
 }
 
@@ -426,7 +424,7 @@ impl CopyEnd {
         match self {
             CopyEnd::Remote { remote, .. } => (0, remote.remote_id()),
             CopyEnd::Memfd(memfd) => (1, memfd.object_id()),
-            CopyEnd::Pipe(fd) => (2, *fd),
+            CopyEnd::Local(local) => (2, local.token_id()),
             CopyEnd::Socket { snapshot, .. } => (3, snapshot.token()),
         }
     }
@@ -436,7 +434,7 @@ impl CopyEnd {
         match self {
             CopyEnd::Remote { remote, .. } => (0, remote.remote_id()),
             CopyEnd::Memfd(memfd) => (1, memfd.token_id()),
-            CopyEnd::Pipe(fd) => (2, *fd),
+            CopyEnd::Local(local) => (2, local.token_id()),
             CopyEnd::Socket { snapshot, .. } => (3, snapshot.token()),
         }
     }
@@ -450,7 +448,7 @@ impl CopyEnd {
                 let offset = usize::try_from(offset).map_err(|_| LINUX_EINVAL)?;
                 Ok(memfd.read_at(offset, dest))
             }
-            CopyEnd::Pipe(_) | CopyEnd::Socket { .. } => Err(LINUX_EINVAL),
+            CopyEnd::Local(_) | CopyEnd::Socket { .. } => Err(LINUX_EINVAL),
         }
     }
 
@@ -494,7 +492,7 @@ impl CopyEnd {
                 let offset = usize::try_from(offset).map_err(|_| LINUX_EINVAL)?;
                 memfd.write_at(offset, data).map_err(memfd_error_to_linux_errno)
             }
-            CopyEnd::Pipe(_) | CopyEnd::Socket { .. } => Err(LINUX_EINVAL),
+            CopyEnd::Local(_) | CopyEnd::Socket { .. } => Err(LINUX_EINVAL),
         }
     }
 
@@ -504,7 +502,7 @@ impl CopyEnd {
             CopyEnd::Memfd(memfd) => memfd
                 .seek(0, multitask::FileHandleSeekWhence::Current)
                 .map_err(|_| LINUX_EINVAL),
-            CopyEnd::Pipe(_) | CopyEnd::Socket { .. } => Err(LINUX_ESPIPE),
+            CopyEnd::Local(_) | CopyEnd::Socket { .. } => Err(LINUX_ESPIPE),
         }
     }
 
@@ -515,14 +513,17 @@ impl CopyEnd {
                 remote.advance_cursor(delta);
                 Ok(())
             }
-            CopyEnd::Memfd(memfd) => memfd
-                .seek(
-                    (start + copied) as i64,
-                    multitask::FileHandleSeekWhence::Start,
-                )
-                .map(|_| ())
-                .map_err(|_| LINUX_EINVAL),
-            CopyEnd::Pipe(_) | CopyEnd::Socket { .. } => Err(LINUX_ESPIPE),
+            CopyEnd::Memfd(memfd) => {
+                let end = start
+                    .checked_add(copied)
+                    .and_then(|value| i64::try_from(value).ok())
+                    .ok_or(LINUX_EOVERFLOW)?;
+                memfd
+                    .seek(end, multitask::FileHandleSeekWhence::Start)
+                    .map(|_| ())
+                    .map_err(|_| LINUX_EINVAL)
+            }
+            CopyEnd::Local(_) | CopyEnd::Socket { .. } => Err(LINUX_ESPIPE),
         }
     }
 
@@ -549,9 +550,7 @@ impl CopyEnd {
                 Ok(response.value as usize)
             }
             CopyEnd::Memfd(memfd) => memfd.write_from(data).map_err(memfd_error_to_linux_errno),
-            CopyEnd::Pipe(fd) => {
-                super::local_fd::pipe_write_bytes(*fd, data).ok_or(LINUX_EBADF)?
-            }
+            CopyEnd::Local(local) => super::local_fd::write_pinned_local(local, data),
             CopyEnd::Socket { fd, snapshot } => netd_socket_write_bytes(snapshot, *fd, data),
         }
     }
@@ -622,7 +621,12 @@ fn copy_file_range_args(
 
 /// `true` when `[a, a+len)` and `[b, b+len)` intersect.
 fn ranges_overlap(a: u64, b: u64, len: u64) -> bool {
-    len != 0 && a < b.saturating_add(len) && b < a.saturating_add(len)
+    if len == 0 {
+        return false;
+    }
+    let a_end = u128::from(a) + u128::from(len);
+    let b_end = u128::from(b) + u128::from(len);
+    u128::from(a) < b_end && u128::from(b) < a_end
 }
 
 /// Where a copy end reads/writes: an explicit offset or its cursor.
@@ -641,6 +645,7 @@ fn copy_bytes(
     dst: &mut CopyEnd,
     dst_pos: &CopyPos,
     len: u64,
+    reject_same_desc_overlap: bool,
 ) -> Result<(u64, u64, u64), i64> {
     let mut gates = [None, None];
     let mut want: [Option<u64>; 2] = [None, None];
@@ -674,6 +679,21 @@ fn copy_bytes(
         CopyPos::Cursor => 0,
     };
     let dst_start = dst_at;
+    if reject_same_desc_overlap && src.description_identity() == dst.description_identity() {
+        match (src_pos, dst_pos) {
+            (CopyPos::Cursor, CopyPos::At(b)) if ranges_overlap(src_at, *b, len) => {
+                return Err(LINUX_EINVAL);
+            }
+            (CopyPos::At(a), CopyPos::Cursor) => {
+                let dst_cursor = dst.cursor().map_err(|_| LINUX_EINVAL)?;
+                if ranges_overlap(*a, dst_cursor, len) {
+                    return Err(LINUX_EINVAL);
+                }
+            }
+            (CopyPos::Cursor, CopyPos::Cursor) => return Err(LINUX_EINVAL),
+            _ => {}
+        }
+    }
     let mut buffer = vec![0_u8; COPY_CHUNK.min(len.max(1) as usize)];
     let mut copied = 0_u64;
     let mut failure = None;
@@ -711,8 +731,16 @@ fn copy_bytes(
             }
             flushed += accepted;
             copied += accepted as u64;
-            src_at += accepted as u64;
-            dst_at += accepted as u64;
+            let Some(next_src) = src_at.checked_add(accepted as u64) else {
+                failure.get_or_insert(LINUX_EOVERFLOW);
+                break 'copy;
+            };
+            let Some(next_dst) = dst_at.checked_add(accepted as u64) else {
+                failure.get_or_insert(LINUX_EOVERFLOW);
+                break 'copy;
+            };
+            src_at = next_src;
+            dst_at = next_dst;
         }
         if flushed < read {
             break 'copy;
@@ -730,7 +758,11 @@ fn copy_bytes(
     drop(gates);
     match failure {
         Some(errno) if copied == 0 => Err(errno),
-        _ => Ok((copied, src_start + copied, dst_start + copied)),
+        _ => {
+            let src_end = src_start.checked_add(copied).ok_or(LINUX_EOVERFLOW)?;
+            let dst_end = dst_start.checked_add(copied).ok_or(LINUX_EOVERFLOW)?;
+            Ok((copied, src_end, dst_end))
+        }
     }
 }
 
@@ -759,31 +791,22 @@ pub fn syscall_linux_vfs_copy_file_range(
         if len == 0 {
             return Ok(0);
         }
-        // Same file: the effective positions decide overlap; a cursor position is
-        // read under the same gate the copy then holds, so resolve it here only
-        // when both ends share a description (otherwise a cursor cannot overlap an
-        // explicit offset we can see). Same description with two cursors is the
-        // same range by construction.
+        // Same file: explicit/explicit and cursor/cursor overlap are fixed
+        // upfront; cursor/explicit overlap is rechecked under the cursor gate in
+        // `copy_bytes` once that gate is held.
         if src.file_identity() == dst.file_identity() {
             let same_description = src.description_identity() == dst.description_identity();
             match (off_in, off_out) {
                 (Some(a), Some(b)) if ranges_overlap(a, b, len) => return Err(LINUX_EINVAL),
                 (None, None) if same_description => return Err(LINUX_EINVAL),
-                (None, Some(b)) | (Some(b), None) if same_description => {
-                    let cursor = src.cursor().map_err(|_| LINUX_EINVAL)?;
-                    if ranges_overlap(cursor, b, len) {
-                        return Err(LINUX_EINVAL);
-                    }
-                }
                 _ => {}
             }
         }
         let src_pos = off_in.map_or(CopyPos::Cursor, CopyPos::At);
         let dst_pos = off_out.map_or(CopyPos::Cursor, CopyPos::At);
-        pin_ends(&[&src, &dst])?;
-        let result = copy_bytes(&mut src, &src_pos, &mut dst, &dst_pos, len);
-        unpin_ends(&[&src, &dst]);
-        let (copied, src_end, dst_end) = result?;
+        let _pins = pin_ends(&src, &dst)?;
+        let (copied, src_end, dst_end) =
+            copy_bytes(&mut src, &src_pos, &mut dst, &dst_pos, len, true)?;
         // Pointers were validated writable above; a late fault after progress
         // still reports the bytes copied.
         if off_in_ptr != 0 {
@@ -800,8 +823,24 @@ fn resolve_sendfile_out_end(fd: u64) -> Result<CopyEnd, i64> {
     match resolve_copy_end(fd, false) {
         Ok((end, _)) => Ok(end),
         Err(LINUX_EINVAL) => {
-            if let Some(pipe_check) = super::local_fd::check_pipe_write_fd(fd) {
-                pipe_check.map(|()| CopyEnd::Pipe(fd))
+            if let Some(local) = super::local_fd::current_local_fd(fd) {
+                match &local {
+                    super::local_fd::LocalFd::Pipe(pipe) => {
+                        if pipe.role() == kernel_ps::api::PipeRole::Write {
+                            Ok(CopyEnd::Local(local))
+                        } else {
+                            Err(LINUX_EBADF)
+                        }
+                    }
+                    super::local_fd::LocalFd::UnixSocket(_) => {
+                        if current_fd_allows_write(fd) {
+                            Ok(CopyEnd::Local(local))
+                        } else {
+                            Err(LINUX_EBADF)
+                        }
+                    }
+                    super::local_fd::LocalFd::EventFd(_) => Err(LINUX_EINVAL),
+                }
             } else if let Some(snapshot) = snapshot_socket(fd) {
                 if current_fd_allows_write(fd) {
                     Ok(CopyEnd::Socket { fd, snapshot })
@@ -845,10 +884,9 @@ pub fn syscall_linux_vfs_sendfile(out_fd: u64, in_fd: u64, offset_ptr: u64, coun
             return Err(LINUX_EINVAL);
         }
         let src_pos = offset.map_or(CopyPos::Cursor, CopyPos::At);
-        pin_ends(&[&src, &dst])?;
-        let result = copy_bytes(&mut src, &src_pos, &mut dst, &CopyPos::Cursor, count);
-        unpin_ends(&[&src, &dst]);
-        let (copied, src_end, _) = result?;
+        let _pins = pin_ends(&src, &dst)?;
+        let (copied, src_end, _) =
+            copy_bytes(&mut src, &src_pos, &mut dst, &CopyPos::Cursor, count, false)?;
         if offset_ptr != 0 {
             let _ = write_user_bytes_as(offset_ptr, &src_end.to_le_bytes());
         }
@@ -859,31 +897,16 @@ pub fn syscall_linux_vfs_sendfile(out_fd: u64, in_fd: u64, offset_ptr: u64, coun
 /// Pins every remote end for the whole copy so a concurrent `close` cannot
 /// retire the open description between two bounce chunks. On failure nothing
 /// stays pinned.
-fn pin_ends(ends: &[&CopyEnd]) -> Result<(), i64> {
-    for (index, end) in ends.iter().enumerate() {
-        if let CopyEnd::Remote { fd, remote } = end
-            && let Err(errno) = acquire_current_remote_vfs_ref(*fd, remote.remote_id())
-        {
-            for earlier in &ends[..index] {
-                if let CopyEnd::Remote { remote, .. } = earlier {
-                    release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(
-                        remote.remote_id(),
-                    )]);
-                }
+fn pin_ends(src: &CopyEnd, dst: &CopyEnd) -> LinuxResult<[Option<super::vfs_socket::RemoteVfsRefGuard>; 2]> {
+    let pin_one = |end: &CopyEnd| -> LinuxResult<Option<super::vfs_socket::RemoteVfsRefGuard>> {
+        match end {
+            CopyEnd::Remote { fd, remote } => {
+                super::vfs_socket::RemoteVfsRefGuard::acquire(*fd, remote.remote_id()).map(Some)
             }
-            return Err(errno);
+            _ => Ok(None),
         }
-    }
-    Ok(())
-}
-
-/// Releases the pins [`pin_ends`] took. Only called after a successful pin.
-fn unpin_ends(ends: &[&CopyEnd]) {
-    for end in ends {
-        if let CopyEnd::Remote { remote, .. } = end {
-            release_service_handle_refs_bounded(&[ServiceHandleRef::RemoteVfs(remote.remote_id())]);
-        }
-    }
+    };
+    Ok([pin_one(src)?, pin_one(dst)?])
 }
 
 #[cfg(test)]
@@ -1021,5 +1044,26 @@ mod tests {
         assert_eq!(remote.cursor(), 612);
         assert_eq!(remote.durable_cursor(), 100);
         assert!(remote.is_dirty(7));
+    }
+
+    #[test]
+    fn ranges_overlap_handles_extreme_u64_boundaries() {
+        assert!(ranges_overlap(u64::MAX, u64::MAX, 1));
+        assert!(!ranges_overlap(u64::MAX - 1, u64::MAX, 1));
+        assert!(ranges_overlap(u64::MAX - 2, u64::MAX - 1, 4));
+    }
+
+    #[test]
+    fn memfd_advance_cursor_rejects_overflow() {
+        let memfd = multitask::MemfdHandle::new(
+            alloc::string::String::from("copy-overflow"),
+            false,
+            None,
+        );
+        let mut end = CopyEnd::Memfd(memfd);
+        assert_eq!(end.advance_cursor(i64::MAX as u64, 1), Err(LINUX_EOVERFLOW));
+        assert_eq!(end.advance_cursor(u64::MAX, 1), Err(LINUX_EOVERFLOW));
+        assert_eq!(end.advance_cursor(10, 5), Ok(()));
+        assert_eq!(end.cursor(), Ok(15));
     }
 }

@@ -165,10 +165,81 @@ pub(super) fn resolve_spawn_job_descriptor(owner: u64, descriptor: u64) -> Resul
     job_placement::resolve_descriptor(owner, descriptor)
 }
 
+fn current_loader_and_args<T: Copy + Default>(args_ptr: u64) -> LinuxResult<(u64, T)> {
+    let loader_pid = current_loader_process_id().ok_or(LINUX_EPERM)?;
+    let args = read_user_struct_as(args_ptr)?;
+    Ok((loader_pid, args))
+}
+
+fn with_owned_prepare_mut<R>(
+    prepare_handle: u64,
+    loader_pid: u64,
+    f: impl FnOnce(&mut ProcPrepareState) -> LinuxResult<R>,
+) -> LinuxResult<R> {
+    let mut prepares = PROC_PREPARES.lock();
+    let state = prepares.get_mut(&prepare_handle).ok_or(LINUX_EINVAL)?;
+    if !prepare_owned_by(state, loader_pid) {
+        return Err(LINUX_EPERM);
+    }
+    f(state)
+}
+
+fn push_prepare_mappings(
+    state: &mut ProcPrepareState,
+    mappings: &mut [Option<Box<MappingEntry>>],
+) -> LinuxResult<()> {
+    if state
+        .mappings
+        .len()
+        .checked_add(mappings.len())
+        .is_none_or(|total| total > MAX_MAPPINGS_PER_PREPARE)
+    {
+        return Err(LINUX_EINVAL);
+    }
+    for mapping in mappings {
+        state
+            .mappings
+            .push(mapping.take().expect("validated broker batch entry"));
+    }
+    Ok(())
+}
+
+fn push_prepare_mapping(
+    state: &mut ProcPrepareState,
+    mapping: &mut Option<Box<MappingEntry>>,
+) -> LinuxResult<()> {
+    push_prepare_mappings(state, core::slice::from_mut(mapping))
+}
+
+fn build_file_mapping_entry(
+    fd: u64,
+    file_offset: u64,
+    target_addr: u64,
+    file_len: u64,
+    mem_len: u64,
+    flags: u64,
+    reserved0: u64,
+) -> LinuxResult<Box<MappingEntry>> {
+    if reserved0 != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    validate_mapping_region(target_addr, mem_len, flags)?;
+    validate_file_mapping_len(mem_len, file_len)?;
+    let backing = pinned_file_backing_from_current(fd)?;
+    Ok(Box::new(MappingEntry::File {
+        backing,
+        file_offset,
+        file_len,
+        target_addr,
+        mem_len,
+        flags,
+    }))
+}
+
 pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
     linux_result((|| {
-        let loader_pid = current_loader_process_id().ok_or(LINUX_EPERM)?;
-        let args: RustosProcPrepareBrokerArgs = read_user_struct_as(args_ptr)?;
+        let (loader_pid, args): (u64, RustosProcPrepareBrokerArgs) =
+            current_loader_and_args(args_ptr)?;
         if !job_placement::prepare_shape_valid(&args) {
             return Err(LINUX_EINVAL);
         }
@@ -195,13 +266,17 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
         // Allocate all pointer slots before publication. Mapping payloads are
         // individually allocated before taking the registry lock, so subsequent
         // append operations cannot enter the allocator while holding it.
+        let mut mappings = Vec::new();
+        mappings
+            .try_reserve_exact(MAX_MAPPINGS_PER_PREPARE)
+            .map_err(|_| LINUX_ENOMEM)?;
         let state = ProcPrepareState {
             owner_pid,
             format: args.format,
             stack_top: args.stack_top,
             exec_ticket,
             job,
-            mappings: Vec::with_capacity(MAX_MAPPINGS_PER_PREPARE),
+            mappings,
             windows_runtime: None,
             linux_runtime: None,
         };
@@ -237,32 +312,20 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
 
 pub(super) fn syscall_linux_rustos_proc_map_file_broker(args_ptr: u64) -> u64 {
     linux_unit_result((|| {
-        let loader_pid = current_loader_process_id().ok_or(LINUX_EPERM)?;
-        let args: RustosProcMapFileBrokerArgs = read_user_struct_as(args_ptr)?;
-        if args.reserved0 != 0 {
-            return Err(LINUX_EINVAL);
-        }
-        let backing = pinned_file_backing_from_current(args.fd)?;
-        validate_mapping_region(args.target_addr, args.mem_len, args.flags)?;
-        validate_file_mapping_len(args.mem_len, args.file_len)?;
-        let mapping = Box::new(MappingEntry::File {
-            backing,
-            file_offset: args.file_offset,
-            file_len: args.file_len,
-            target_addr: args.target_addr,
-            mem_len: args.mem_len,
-            flags: args.flags,
-        });
-        let mut prepares = PROC_PREPARES.lock();
-        let state = prepares.get_mut(&args.prepare_handle).ok_or(LINUX_EINVAL)?;
-        if !prepare_owned_by(state, loader_pid) {
-            return Err(LINUX_EPERM);
-        }
-        if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
-            return Err(LINUX_EINVAL);
-        }
-        state.mappings.push(mapping);
-        Ok(())
+        let (loader_pid, args): (u64, RustosProcMapFileBrokerArgs) =
+            current_loader_and_args(args_ptr)?;
+        let mut mapping = Some(build_file_mapping_entry(
+            args.fd,
+            args.file_offset,
+            args.target_addr,
+            args.file_len,
+            args.mem_len,
+            args.flags,
+            args.reserved0,
+        )?);
+        with_owned_prepare_mut(args.prepare_handle, loader_pid, |state| {
+            push_prepare_mapping(state, &mut mapping)
+        })
     })())
 }
 
@@ -284,42 +347,28 @@ pub(super) fn syscall_linux_rustos_proc_map_file_batch_broker(args_ptr: u64) -> 
         // Resolve and allocate the entire batch before locking the registry.
         let mut mappings: [Option<Box<MappingEntry>>; PROC_BROKER_BATCH_CAPACITY] =
             [const { None }; PROC_BROKER_BATCH_CAPACITY];
-        for (index, entry) in args.entries[..count].iter().enumerate() {
-            if entry.reserved0 != 0 {
-                return Err(LINUX_EINVAL);
+        for (slot, entry) in mappings[..count].iter_mut().zip(&args.entries[..count]) {
+            *slot = Some(build_file_mapping_entry(
+                entry.fd,
+                entry.file_offset,
+                entry.target_addr,
+                entry.file_len,
+                entry.mem_len,
+                entry.flags,
+                entry.reserved0,
+            )?);
+        }
+        with_owned_prepare_mut(args.prepare_handle, current_pid, |state| {
+            push_prepare_mappings(state, &mut mappings[..count])
+        })
+        .inspect_err(|&errno| {
+            if errno == LINUX_EPERM {
+                nucleus_core::debug::println_serialized(format_args!(
+                    "proc-map-file-batch denied stage=owner handle={} current_pid={}",
+                    args.prepare_handle, current_pid
+                ));
             }
-            validate_mapping_region(entry.target_addr, entry.mem_len, entry.flags)?;
-            validate_file_mapping_len(entry.mem_len, entry.file_len)?;
-            let backing = pinned_file_backing_from_current(entry.fd)?;
-            mappings[index] = Some(Box::new(MappingEntry::File {
-                backing,
-                file_offset: entry.file_offset,
-                file_len: entry.file_len,
-                target_addr: entry.target_addr,
-                mem_len: entry.mem_len,
-                flags: entry.flags,
-            }));
-        }
-        let mut prepares = PROC_PREPARES.lock();
-        let state = prepares.get_mut(&args.prepare_handle).ok_or(LINUX_EINVAL)?;
-        if current_pid != state.owner_pid {
-            let owner_pid = state.owner_pid;
-            drop(prepares);
-            nucleus_core::debug::println_serialized(format_args!(
-                "proc-map-file-batch denied stage=owner handle={} owner_pid={} current_pid={}",
-                args.prepare_handle, owner_pid, current_pid
-            ));
-            return Err(LINUX_EPERM);
-        }
-        if state.mappings.len() + count > MAX_MAPPINGS_PER_PREPARE {
-            return Err(LINUX_EINVAL);
-        }
-        for mapping in &mut mappings[..count] {
-            state
-                .mappings
-                .push(mapping.take().expect("validated broker batch entry"));
-        }
-        drop(prepares);
+        })?;
         nucleus_core::debug::record_milestone(
             nucleus_core::debug::LogCategory::Compat,
             "proc-map-file-batch",
@@ -332,8 +381,8 @@ pub(super) fn syscall_linux_rustos_proc_map_file_batch_broker(args_ptr: u64) -> 
 
 pub(super) fn syscall_linux_rustos_proc_set_linux_runtime_broker(args_ptr: u64) -> u64 {
     linux_unit_result((|| {
-        let loader_pid = current_loader_process_id().ok_or(LINUX_EPERM)?;
-        let args: RustosProcSetLinuxRuntimeBrokerArgs = read_user_struct_as(args_ptr)?;
+        let (loader_pid, args): (u64, RustosProcSetLinuxRuntimeBrokerArgs) =
+            current_loader_and_args(args_ptr)?;
         if args.abi_version != PROC_BROKER_ABI_VERSION || args.reserved0 != 0 {
             return Err(LINUX_EINVAL);
         }
@@ -347,22 +396,18 @@ pub(super) fn syscall_linux_rustos_proc_set_linux_runtime_broker(args_ptr: u64) 
         if !user_span_in_window(args.actual_entry, 1) || !linux_tls_fields_valid(&args) {
             return Err(LINUX_EINVAL);
         }
-        let initial_tls = if args.has_tls != 0 {
-            Some(crate::user::linux::LinuxInitialTlsInfo {
-                template_addr: args.tls_template_addr,
-                template_size: args.tls_template_size,
-                mem_size: args.tls_mem_size,
-                align: args.tls_align,
-                mapping_base: args.tls_mapping_base,
-                mapping_size: args.tls_mapping_size,
-                tls_block_base: args.tls_block_base,
-                thread_pointer: args.tls_thread_pointer,
-                tcb_base: args.tls_tcb_base,
-                dtv_base: args.tls_dtv_base,
-            })
-        } else {
-            None
-        };
+        let initial_tls = (args.has_tls != 0).then_some(crate::user::linux::LinuxInitialTlsInfo {
+            template_addr: args.tls_template_addr,
+            template_size: args.tls_template_size,
+            mem_size: args.tls_mem_size,
+            align: args.tls_align,
+            mapping_base: args.tls_mapping_base,
+            mapping_size: args.tls_mapping_size,
+            tls_block_base: args.tls_block_base,
+            thread_pointer: args.tls_thread_pointer,
+            tcb_base: args.tls_tcb_base,
+            dtv_base: args.tls_dtv_base,
+        });
         let interpreter_path = if interp_path_len > 0 {
             Some(String::from(
                 core::str::from_utf8(&args.interp_path[..interp_path_len])
@@ -371,7 +416,7 @@ pub(super) fn syscall_linux_rustos_proc_set_linux_runtime_broker(args_ptr: u64) 
         } else {
             None
         };
-        let info = crate::user::linux::LinuxProcessImageInfo {
+        let mut info = Some(crate::user::linux::LinuxProcessImageInfo {
             entry: args.entry,
             interpreter_base: args.interpreter_base,
             interpreter_path,
@@ -384,17 +429,14 @@ pub(super) fn syscall_linux_rustos_proc_set_linux_runtime_broker(args_ptr: u64) 
             initial_tls,
             image_mappings: Vec::new(),
             runtime_search_paths: Vec::new(),
-        };
-        let mut prepares = PROC_PREPARES.lock();
-        let state = prepares.get_mut(&args.prepare_handle).ok_or(LINUX_EINVAL)?;
-        if !prepare_owned_by(state, loader_pid) {
-            return Err(LINUX_EPERM);
-        }
-        if state.format != PROC_BROKER_FORMAT_ELF64 || state.linux_runtime.is_some() {
-            return Err(LINUX_EINVAL);
-        }
-        state.linux_runtime = Some((info, args.actual_entry));
-        drop(prepares);
+        });
+        with_owned_prepare_mut(args.prepare_handle, loader_pid, |state| {
+            if state.format != PROC_BROKER_FORMAT_ELF64 || state.linux_runtime.is_some() {
+                return Err(LINUX_EINVAL);
+            }
+            state.linux_runtime = Some((info.take().expect("validated linux runtime"), args.actual_entry));
+            Ok(())
+        })?;
         nucleus_core::debug::record_milestone(
             nucleus_core::debug::LogCategory::Compat,
             "proc-linux-runtime-published",
@@ -407,91 +449,68 @@ pub(super) fn syscall_linux_rustos_proc_set_linux_runtime_broker(args_ptr: u64) 
 
 pub(super) fn syscall_linux_rustos_proc_map_zeroed_broker(args_ptr: u64) -> u64 {
     linux_unit_result((|| {
-        let loader_pid = current_loader_process_id().ok_or(LINUX_EPERM)?;
-        let args: RustosProcMapZeroedBrokerArgs = read_user_struct_as(args_ptr)?;
+        let (loader_pid, args): (u64, RustosProcMapZeroedBrokerArgs) =
+            current_loader_and_args(args_ptr)?;
         if args.reserved0 != 0 {
             return Err(LINUX_EINVAL);
         }
         validate_mapping_region(args.target_addr, args.mem_len, args.flags)?;
-        let mapping = Box::new(MappingEntry::Zeroed {
+        let mut mapping = Some(Box::new(MappingEntry::Zeroed {
             target_addr: args.target_addr,
             mem_len: args.mem_len,
             flags: args.flags,
-        });
-        let mut prepares = PROC_PREPARES.lock();
-        let state = prepares.get_mut(&args.prepare_handle).ok_or(LINUX_EINVAL)?;
-        if !prepare_owned_by(state, loader_pid) {
-            return Err(LINUX_EPERM);
-        }
-        if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
-            return Err(LINUX_EINVAL);
-        }
-        state.mappings.push(mapping);
-        Ok(())
+        }));
+        with_owned_prepare_mut(args.prepare_handle, loader_pid, |state| {
+            push_prepare_mapping(state, &mut mapping)
+        })
     })())
 }
 
 pub(super) fn syscall_linux_rustos_proc_map_data_broker(args_ptr: u64) -> u64 {
     linux_unit_result((|| {
-        let loader_pid = current_loader_process_id().ok_or(LINUX_EPERM)?;
-        let args: RustosProcMapDataBrokerArgs = read_user_struct_as(args_ptr)?;
+        let (loader_pid, args): (u64, RustosProcMapDataBrokerArgs) =
+            current_loader_and_args(args_ptr)?;
         let data_len = args.data_len as usize;
         if args.reserved0 != 0
             || data_len > args.data.len()
-            || args.data_offset.checked_add(args.data_len as u64).is_none()
-            || args.data_offset + args.data_len as u64 > args.mem_len
+            || args
+                .data_offset
+                .checked_add(u64::from(args.data_len))
+                .is_none_or(|end| end > args.mem_len)
         {
             return Err(LINUX_EINVAL);
         }
         validate_mapping_region(args.target_addr, args.mem_len, args.flags)?;
-        let mapping = Box::new(MappingEntry::Data {
+        let mut data = Vec::new();
+        data.try_reserve_exact(data_len).map_err(|_| LINUX_ENOMEM)?;
+        data.extend_from_slice(&args.data[..data_len]);
+        let mut mapping = Some(Box::new(MappingEntry::Data {
             target_addr: args.target_addr,
             mem_len: args.mem_len,
             flags: args.flags,
             data_offset: args.data_offset,
-            data: args.data[..data_len].to_vec(),
-        });
-        let mut prepares = PROC_PREPARES.lock();
-        let state = prepares.get_mut(&args.prepare_handle).ok_or(LINUX_EINVAL)?;
-        if !prepare_owned_by(state, loader_pid) {
-            return Err(LINUX_EPERM);
-        }
-        if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
-            return Err(LINUX_EINVAL);
-        }
-        state.mappings.push(mapping);
-        Ok(())
+            data,
+        }));
+        with_owned_prepare_mut(args.prepare_handle, loader_pid, |state| {
+            push_prepare_mapping(state, &mut mapping)
+        })
     })())
 }
 
-pub(super) fn syscall_linux_rustos_proc_set_windows_runtime_broker(args_ptr: u64) -> u64 {
-    let Some(loader_pid) = current_loader_process_id() else {
-        return linux_errno(LINUX_EPERM);
-    };
-    let args: RustosProcSetWindowsRuntimeBrokerArgs = match read_user_struct_as(args_ptr) {
-        Ok(args) => args,
-        Err(errno) => return linux_errno(errno),
-    };
+fn validate_windows_runtime_args(args: &RustosProcSetWindowsRuntimeBrokerArgs) -> LinuxResult<()> {
     if args.abi_version != PROC_BROKER_ABI_VERSION
         || args.reserved0 != 0
         || args.reserved1 != 0
         || args.reserved2 != 0
         || args.loader_module_count == 0
     {
-        return linux_errno(LINUX_EINVAL);
+        return Err(LINUX_EINVAL);
     }
     let runtime_base = args.runtime_base;
     let runtime_size = args.runtime_size;
-    if let Err(errno) = validate_user_range(runtime_base, runtime_size) {
-        return linux_errno(errno);
-    }
-    if validate_user_range(args.image_base, args.image_size).is_err() {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if args.image_size == 0
-        || args.image_base % PAGE_SIZE != 0
-        || args.image_size % PAGE_SIZE != 0
-        || !range_contains(args.image_base, args.image_size, args.entry_point, 1)
+    validate_user_range(runtime_base, runtime_size)?;
+    validate_user_range(args.image_base, args.image_size)?;
+    if !range_contains(args.image_base, args.image_size, args.entry_point, 1)
         || (args.bootstrap_entry_point != 0
             && !user_span_in_window(args.bootstrap_entry_point, 1))
         || (args.kuser_shared_data_address != 0
@@ -515,270 +534,278 @@ pub(super) fn syscall_linux_rustos_proc_set_windows_runtime_broker(args_ptr: u64
         || !range_contains(runtime_base, runtime_size, args.teb_process_id_ptr, 8)
         || !range_contains(runtime_base, runtime_size, args.teb_thread_id_ptr, 8)
     {
-        return linux_errno(LINUX_EINVAL);
+        return Err(LINUX_EINVAL);
     }
-    let mut prepares = PROC_PREPARES.lock();
-    let Some(state) = prepares.get_mut(&args.prepare_handle) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if !prepare_owned_by(state, loader_pid) {
-        return linux_errno(LINUX_EPERM);
-    }
-    if state.format != PROC_BROKER_FORMAT_PE64 || state.windows_runtime.is_some() {
-        return linux_errno(LINUX_EINVAL);
-    }
-    state.windows_runtime = Some(crate::user::process::WindowsProcessLoaderRuntime {
-        entry_point: args.entry_point,
-        runtime: crate::user::process_state::WindowsProcessRuntimeState {
-            image_base: args.image_base,
-            image_size: args.image_size,
-            allocation_base_hint: runtime_base.saturating_add(runtime_size),
-            public_runtime_address: args.public_runtime_address,
-            peb_address: args.peb_address,
-            teb_address: args.teb_address,
-            process_parameters_address: args.process_parameters_address,
-            loader_data_address: args.loader_data_address,
-            loader_module_array_address: args.loader_module_array_address,
-            loader_module_count: args.loader_module_count,
-            loader_reserved: 0,
-            main_module_entry_address: args.main_module_entry_address,
-            bootstrap_entry_point: args.bootstrap_entry_point,
-            kuser_shared_data_address: args.kuser_shared_data_address,
-            command_line_w_ptr: args.command_line_w_ptr,
-            command_line_a_ptr: args.command_line_a_ptr,
-            environment_w_ptr: args.environment_w_ptr,
-            environment_a_ptr: args.environment_a_ptr,
-            module_path_w_ptr: args.module_path_w_ptr,
-            module_path_a_ptr: args.module_path_a_ptr,
-            module_directory_w_ptr: args.module_directory_w_ptr,
-            module_directory_a_ptr: args.module_directory_a_ptr,
-            main_module_base_name_w_ptr: args.main_module_base_name_w_ptr,
-            main_module_base_name_a_ptr: args.main_module_base_name_a_ptr,
-            argc: args.argc,
-            argc_ptr: args.argc_ptr,
-            argv_ptr_ptr: args.argv_ptr_ptr,
-            environ_ptr_ptr: args.environ_ptr_ptr,
-            argv_ptr: args.argv_ptr,
-            environ_ptr: args.environ_ptr,
-            initial_narrow_environment_ptr: args.initial_narrow_environment_ptr,
-            initenv_ptr: args.initenv_ptr,
-            errno_ptr: args.errno_ptr,
-            last_error_ptr: args.last_error_ptr,
-            commode_ptr: args.commode_ptr,
-            fmode_ptr: args.fmode_ptr,
-            iob_array_ptr: args.iob_array_ptr,
-            stdin_file_ptr: args.stdin_file_ptr,
-            stdout_file_ptr: args.stdout_file_ptr,
-            stderr_file_ptr: args.stderr_file_ptr,
-            localeconv_ptr: args.localeconv_ptr,
-            strerror_einval_ptr: args.strerror_einval_ptr,
-            strerror_enomem_ptr: args.strerror_enomem_ptr,
-            strerror_eio_ptr: args.strerror_eio_ptr,
-            strerror_erange_ptr: args.strerror_erange_ptr,
-            strerror_unknown_ptr: args.strerror_unknown_ptr,
-        },
-    });
-    0
+    Ok(())
+}
+
+pub(super) fn syscall_linux_rustos_proc_set_windows_runtime_broker(args_ptr: u64) -> u64 {
+    linux_unit_result((|| {
+        let (loader_pid, args): (u64, RustosProcSetWindowsRuntimeBrokerArgs) =
+            current_loader_and_args(args_ptr)?;
+        validate_windows_runtime_args(&args)?;
+        let allocation_base_hint = args
+            .runtime_base
+            .checked_add(args.runtime_size)
+            .ok_or(LINUX_EINVAL)?;
+        with_owned_prepare_mut(args.prepare_handle, loader_pid, |state| {
+            if state.format != PROC_BROKER_FORMAT_PE64 || state.windows_runtime.is_some() {
+                return Err(LINUX_EINVAL);
+            }
+            state.windows_runtime = Some(crate::user::process::WindowsProcessLoaderRuntime {
+                entry_point: args.entry_point,
+                runtime: crate::user::process_state::WindowsProcessRuntimeState {
+                    image_base: args.image_base,
+                    image_size: args.image_size,
+                    allocation_base_hint,
+                    public_runtime_address: args.public_runtime_address,
+                    peb_address: args.peb_address,
+                    teb_address: args.teb_address,
+                    process_parameters_address: args.process_parameters_address,
+                    loader_data_address: args.loader_data_address,
+                    loader_module_array_address: args.loader_module_array_address,
+                    loader_module_count: args.loader_module_count,
+                    loader_reserved: 0,
+                    main_module_entry_address: args.main_module_entry_address,
+                    bootstrap_entry_point: args.bootstrap_entry_point,
+                    kuser_shared_data_address: args.kuser_shared_data_address,
+                    command_line_w_ptr: args.command_line_w_ptr,
+                    command_line_a_ptr: args.command_line_a_ptr,
+                    environment_w_ptr: args.environment_w_ptr,
+                    environment_a_ptr: args.environment_a_ptr,
+                    module_path_w_ptr: args.module_path_w_ptr,
+                    module_path_a_ptr: args.module_path_a_ptr,
+                    module_directory_w_ptr: args.module_directory_w_ptr,
+                    module_directory_a_ptr: args.module_directory_a_ptr,
+                    main_module_base_name_w_ptr: args.main_module_base_name_w_ptr,
+                    main_module_base_name_a_ptr: args.main_module_base_name_a_ptr,
+                    argc: args.argc,
+                    argc_ptr: args.argc_ptr,
+                    argv_ptr_ptr: args.argv_ptr_ptr,
+                    environ_ptr_ptr: args.environ_ptr_ptr,
+                    argv_ptr: args.argv_ptr,
+                    environ_ptr: args.environ_ptr,
+                    initial_narrow_environment_ptr: args.initial_narrow_environment_ptr,
+                    initenv_ptr: args.initenv_ptr,
+                    errno_ptr: args.errno_ptr,
+                    last_error_ptr: args.last_error_ptr,
+                    commode_ptr: args.commode_ptr,
+                    fmode_ptr: args.fmode_ptr,
+                    iob_array_ptr: args.iob_array_ptr,
+                    stdin_file_ptr: args.stdin_file_ptr,
+                    stdout_file_ptr: args.stdout_file_ptr,
+                    stderr_file_ptr: args.stderr_file_ptr,
+                    localeconv_ptr: args.localeconv_ptr,
+                    strerror_einval_ptr: args.strerror_einval_ptr,
+                    strerror_enomem_ptr: args.strerror_enomem_ptr,
+                    strerror_eio_ptr: args.strerror_eio_ptr,
+                    strerror_erange_ptr: args.strerror_erange_ptr,
+                    strerror_unknown_ptr: args.strerror_unknown_ptr,
+                },
+            });
+            Ok(())
+        })
+    })())
+}
+
+struct ExecVectors {
+    exec_path: String,
+    argv: Vec<String>,
+    env: Vec<String>,
+}
+
+fn read_exec_vectors(
+    exec_path_ptr: u64,
+    exec_path_len: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+) -> LinuxResult<ExecVectors> {
+    let exec_path = read_user_text(exec_path_ptr, exec_path_len)?;
+    let argv = read_user_string_vector(
+        argv_ptr,
+        LOADER_SPAWN_MAX_ARG_COUNT,
+        LOADER_SPAWN_ARG_BYTES,
+    )?;
+    let env = read_user_string_vector(
+        envp_ptr,
+        LOADER_SPAWN_MAX_ENV_COUNT,
+        LOADER_SPAWN_ENV_BYTES,
+    )?;
+    Ok(ExecVectors {
+        exec_path,
+        argv,
+        env,
+    })
+}
+
+fn prepare_linux_process_from_state(
+    mappings: &[Box<MappingEntry>],
+    linux_runtime: Option<(crate::user::linux::LinuxProcessImageInfo, u64)>,
+    stack_top: u64,
+    address_space: crate::memory::paging::ProcessAddressSpace,
+    launch: crate::user::process::ProcessLaunchOptions<'_>,
+) -> LinuxResult<crate::user::process::PreparedProcessImage> {
+    // loaderd always populates `linux_runtime` before issuing commit/exec;
+    // the bytes-image fallback that used to call into ring0 ELF parsing
+    // was retired with the PE bytes path on 2026-05-20.
+    let (mut info, actual_entry) = linux_runtime.ok_or(LINUX_EINVAL)?;
+    info.image_mappings = initial_elf_mappings(mappings, &info, actual_entry);
+    crate::user::process::prepare_linux_process_with_metadata(
+        info,
+        actual_entry,
+        address_space,
+        launch,
+        stack_top,
+    )
+    .map_err(process_load_error_to_linux_errno)
 }
 
 pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
-    let Some(loader_pid) = current_loader_process_id() else {
-        return linux_errno(LINUX_EPERM);
-    };
-    let args: RustosProcCommitBrokerArgs = match read_user_struct_as(args_ptr) {
-        Ok(args) => args,
-        Err(errno) => return linux_errno(errno),
-    };
-    const KNOWN_SPAWN_FLAGS: u64 = SPAWN_FLAG_LOGICAL_ADMIN
-        | LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64
-        | LOADER_SPAWN_FLAG_DEFER_START as u64;
-    if args.requester_pid == 0
-        || args.prepare_handle == 0
-        || args.flags & !KNOWN_SPAWN_FLAGS != 0
-        || args.flags & LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64 != 0
-            && args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if multitask::is_user_process_exiting(args.requester_pid) {
-        return linux_errno(LINUX_ESRCH);
-    }
-    if !requester_owns_live_spawn_role(args.requester_pid) {
-        return linux_errno(LINUX_EPERM);
-    }
-    let state = {
-        let mut prepares = PROC_PREPARES.lock();
-        match prepares.get(&args.prepare_handle) {
-            None => return linux_errno(LINUX_EINVAL),
-            Some(s) if !prepare_owned_by(s, loader_pid) => return linux_errno(LINUX_EPERM),
-            Some(s) if s.exec_ticket.is_some() => return linux_errno(LINUX_EPERM),
-            _ => {}
+    linux_result((|| {
+        let (loader_pid, args): (u64, RustosProcCommitBrokerArgs) =
+            current_loader_and_args(args_ptr)?;
+        const KNOWN_SPAWN_FLAGS: u64 = SPAWN_FLAG_LOGICAL_ADMIN
+            | LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64
+            | LOADER_SPAWN_FLAG_DEFER_START as u64;
+        if args.requester_pid == 0
+            || args.prepare_handle == 0
+            || args.flags & !KNOWN_SPAWN_FLAGS != 0
+            || args.flags & LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64 != 0
+                && args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0
+        {
+            return Err(LINUX_EINVAL);
         }
-        prepares.remove(&args.prepare_handle).unwrap()
-    };
-    if !matches!(
-        state.format,
-        PROC_BROKER_FORMAT_ELF64 | PROC_BROKER_FORMAT_PE64
-    ) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let exec_path = match read_user_text(args.exec_path_ptr, args.exec_path_len) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    let scheduling_policy = match scheduling_context_grants::consume(
-        args.scheduling_context,
-        args.requester_pid,
-        exec_path.as_str(),
-    ) {
-        Ok(policy) => policy,
-        Err(errno) => return linux_errno(errno),
-    };
-    let qualification_required =
-        super::smp_qualification_ops::smp_qualification_exec_path_matches(exec_path.as_str());
-    let argv_storage = match read_user_string_vector(
-        args.argv_ptr,
-        LOADER_SPAWN_MAX_ARG_COUNT,
-        LOADER_SPAWN_ARG_BYTES,
-    ) {
-        Ok(values) => values,
-        Err(errno) => return linux_errno(errno),
-    };
-    let env_storage = match read_user_string_vector(
-        args.envp_ptr,
-        LOADER_SPAWN_MAX_ENV_COUNT,
-        LOADER_SPAWN_ENV_BYTES,
-    ) {
-        Ok(values) => values,
-        Err(errno) => return linux_errno(errno),
-    };
-    let argv_refs = argv_storage.iter().map(String::as_str).collect::<Vec<_>>();
-    let env_refs = env_storage.iter().map(String::as_str).collect::<Vec<_>>();
-    let linux_launch = crate::user::linux::LinuxProcessLaunch {
-        exec_path: &exec_path,
-        argv: argv_refs.as_slice(),
-        env: env_refs.as_slice(),
-    };
-    let job = match job_placement::spawn_job(state.job, args.requester_pid) {
-        Ok(job) => job,
-        Err(errno) => return linux_errno(errno),
-    };
-    let spawn_transaction = match crate::user::process::reserve_process_spawn_transaction_in(Some(job)) {
-        Ok(transaction) => transaction,
-        Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
-    };
-    nucleus_core::debug::record_milestone(
-        nucleus_core::debug::LogCategory::Compat,
-        "proc-commit-address-space-begin",
-        args.prepare_handle,
-        state.mappings.len() as u64,
-    );
-    let address_space = match address_space_from_mappings(&state.mappings) {
-        Ok(address_space) => address_space,
-        Err(errno) => return linux_errno(errno),
-    };
-    nucleus_core::debug::record_milestone(
-        nucleus_core::debug::LogCategory::Compat,
-        "proc-commit-address-space-done",
-        args.prepare_handle,
-        state.mappings.len() as u64,
-    );
-    let session = if args.console_session == 0 {
-        match multitask::current_user_snapshot() {
-            Some(snapshot) => snapshot.console_session(),
-            None => return linux_errno(LINUX_EINVAL),
+        if multitask::is_user_process_exiting(args.requester_pid) {
+            return Err(LINUX_ESRCH);
         }
-    } else {
-        crate::io::session::ConsoleSessionHandle::from_raw(args.console_session)
-    };
-    let logical_admin = args.flags & SPAWN_FLAG_LOGICAL_ADMIN != 0;
-    let launch = crate::user::process::ProcessLaunchOptions {
-        registers: crate::user::process::ProcessStartRegisters::new(),
-        linux: linux_launch,
-        console_session: session,
-        logical_admin,
-        root_job_authority: false,
-    };
-    let prepared = match state.format {
-        PROC_BROKER_FORMAT_ELF64 => {
-            // loaderd always populates `linux_runtime` before issuing commit;
-            // the bytes-image fallback that used to call into ring0 ELF parsing
-            // was retired with the PE bytes path on 2026-05-20.
-            let Some((mut info, actual_entry)) = state.linux_runtime else {
-                return linux_errno(LINUX_EINVAL);
-            };
-            info.image_mappings = initial_elf_mappings(&state.mappings, &info, actual_entry);
-            match crate::user::process::prepare_linux_process_with_metadata(
-                info,
-                actual_entry,
-                address_space,
-                crate::user::process::ProcessLaunchOptions {
-                    linux: linux_launch,
-                    ..launch
-                },
-                state.stack_top,
-            ) {
-                Ok(prepared) => prepared,
-                Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
+        if !requester_owns_live_spawn_role(args.requester_pid) {
+            return Err(LINUX_EPERM);
+        }
+        let state = {
+            let mut prepares = PROC_PREPARES.lock();
+            match prepares.get(&args.prepare_handle) {
+                None => return Err(LINUX_EINVAL),
+                Some(s) if !prepare_owned_by(s, loader_pid) => return Err(LINUX_EPERM),
+                Some(s) if s.exec_ticket.is_some() => return Err(LINUX_EPERM),
+                _ => {}
             }
+            prepares.remove(&args.prepare_handle).unwrap()
+        };
+        if !matches!(
+            (
+                state.format,
+                state.linux_runtime.is_some(),
+                state.windows_runtime.is_some(),
+            ),
+            (PROC_BROKER_FORMAT_ELF64, true, false) | (PROC_BROKER_FORMAT_PE64, false, true)
+        ) {
+            return Err(LINUX_EINVAL);
         }
-        PROC_BROKER_FORMAT_PE64 => {
-            let Some(metadata) = state.windows_runtime else {
-                return linux_errno(LINUX_EINVAL);
-            };
-            match crate::user::process::prepare_windows_process_with_address_space(
-                metadata,
+        let vectors = read_exec_vectors(
+            args.exec_path_ptr,
+            args.exec_path_len,
+            args.argv_ptr,
+            args.envp_ptr,
+        )?;
+        let exec_path = vectors.exec_path;
+        let scheduling_policy = scheduling_context_grants::consume(
+            args.scheduling_context,
+            args.requester_pid,
+            exec_path.as_str(),
+        )?;
+        let qualification_required =
+            super::smp_qualification_ops::smp_qualification_exec_path_matches(exec_path.as_str());
+        let argv_refs = vectors.argv.iter().map(String::as_str).collect::<Vec<_>>();
+        let env_refs = vectors.env.iter().map(String::as_str).collect::<Vec<_>>();
+        let linux_launch = crate::user::linux::LinuxProcessLaunch {
+            exec_path: &exec_path,
+            argv: argv_refs.as_slice(),
+            env: env_refs.as_slice(),
+        };
+        let job = job_placement::spawn_job(state.job, args.requester_pid)?;
+        let spawn_transaction =
+            crate::user::process::reserve_process_spawn_transaction_in(Some(job))
+                .map_err(process_load_error_to_linux_errno)?;
+        nucleus_core::debug::record_milestone(
+            nucleus_core::debug::LogCategory::Compat,
+            "proc-commit-address-space-begin",
+            args.prepare_handle,
+            state.mappings.len() as u64,
+        );
+        let address_space = address_space_from_mappings(&state.mappings)?;
+        nucleus_core::debug::record_milestone(
+            nucleus_core::debug::LogCategory::Compat,
+            "proc-commit-address-space-done",
+            args.prepare_handle,
+            state.mappings.len() as u64,
+        );
+        let session = if args.console_session == 0 {
+            multitask::current_user_snapshot()
+                .ok_or(LINUX_EINVAL)?
+                .console_session()
+        } else {
+            crate::io::session::ConsoleSessionHandle::from_raw(args.console_session)
+        };
+        let logical_admin = args.flags & SPAWN_FLAG_LOGICAL_ADMIN != 0;
+        let launch = crate::user::process::ProcessLaunchOptions {
+            registers: crate::user::process::ProcessStartRegisters::new(),
+            linux: linux_launch,
+            console_session: session,
+            logical_admin,
+            root_job_authority: false,
+        };
+        let prepared = match state.format {
+            PROC_BROKER_FORMAT_ELF64 => prepare_linux_process_from_state(
+                &state.mappings,
+                state.linux_runtime,
+                state.stack_top,
                 address_space,
                 launch,
-                state.stack_top,
-            ) {
-                Ok(prepared) => prepared,
-                Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
+            )?,
+            PROC_BROKER_FORMAT_PE64 => {
+                let metadata = state.windows_runtime.ok_or(LINUX_EINVAL)?;
+                crate::user::process::prepare_windows_process_with_address_space(
+                    metadata,
+                    address_space,
+                    launch,
+                    state.stack_top,
+                )
+                .map_err(process_load_error_to_linux_errno)?
             }
+            _ => return Err(LINUX_EINVAL),
+        };
+        nucleus_core::debug::record_milestone(
+            nucleus_core::debug::LogCategory::Compat,
+            "proc-commit-prepare-done",
+            args.prepare_handle,
+            state.format as u64,
+        );
+        let prepared = crate::user::process::bind_prepared_spawn(prepared, spawn_transaction);
+        let spawn_fn: fn(
+            crate::user::process::PreparedSpawnImage,
+            u64,
+            rustos_user_abi::syscall::RustosSchedulingContextPolicy,
+        ) -> Result<
+            crate::user::process::SpawnedProcess,
+            crate::user::process::ProcessLoadError,
+        > = if args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0 {
+            crate::user::process::spawn_prepared_process_suspended_with_scheduling_context
+        } else if args.flags & LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64 != 0 {
+            crate::user::process::spawn_prepared_process_with_scheduling_context
+        } else {
+            crate::user::process::spawn_prepared_process_for_loader_reply_with_scheduling_context
+        };
+        let spawned = spawn_fn(prepared, args.weight_micros, scheduling_policy)
+            .map_err(process_load_error_to_linux_errno)?;
+        if args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0 {
+            register_deferred_activation(
+                args.requester_pid,
+                spawned.pid,
+                qualification_required,
+            )?;
         }
-        _ => return linux_errno(LINUX_EINVAL),
-    };
-    nucleus_core::debug::record_milestone(
-        nucleus_core::debug::LogCategory::Compat,
-        "proc-commit-prepare-done",
-        args.prepare_handle,
-        state.format as u64,
-    );
-    let prepared = crate::user::process::bind_prepared_spawn(prepared, spawn_transaction);
-    let spawned = if args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0 {
-        crate::user::process::spawn_prepared_process_suspended_with_scheduling_context(
-            prepared,
-            args.weight_micros,
-            scheduling_policy,
-        )
-    } else if args.flags & LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64 != 0 {
-        crate::user::process::spawn_prepared_process_with_scheduling_context(
-            prepared,
-            args.weight_micros,
-            scheduling_policy,
-        )
-    } else {
-        crate::user::process::spawn_prepared_process_for_loader_reply_with_scheduling_context(
-            prepared,
-            args.weight_micros,
-            scheduling_policy,
-        )
-    };
-    match spawned {
-        Ok(spawned) => {
-            if args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0 {
-                if let Err(errno) = register_deferred_activation(
-                    args.requester_pid,
-                    spawned.pid,
-                    qualification_required,
-                ) {
-                    return linux_errno(errno);
-                }
-            }
-            spawned.pid
-        }
-        Err(err) => linux_errno(process_load_error_to_linux_errno(err)),
-    }
+        Ok(spawned.pid)
+    })())
 }
 
 /// Records the one authority that may later start a process created suspended:
@@ -1051,204 +1078,161 @@ pub(super) fn syscall_linux_rustos_proc_cancel_exec_broker(args_ptr: u64) -> u64
 }
 
 pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64 {
-    let Some(loader_pid) = current_loader_process_id() else {
-        return linux_errno(LINUX_EPERM);
-    };
-    let args = match usermem::read_current_user_struct::<RustosProcExecTargetBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
-    if args.abi_version != PROC_BROKER_ABI_VERSION
-        || args.reserved0 != 0
-        || args.requester_pid == 0
-        || args.target_pid == 0
-        || args.target_tid == 0
-        || args.exec_ticket == 0
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if multitask::is_user_process_exiting(args.requester_pid) {
-        return linux_errno(LINUX_ESRCH);
-    }
-    if !ipc_ops::process_owns_live_service_endpoint(args.requester_pid, IPC_SERVICE_PROCD) {
-        return linux_errno(LINUX_EPERM);
-    }
-    {
-        let mut tickets = EXEC_TICKETS.lock();
-        let Some(ticket) = tickets.get(&args.exec_ticket).copied() else {
-            return linux_errno(LINUX_EINVAL);
+    linux_result((|| {
+        let (loader_pid, args): (u64, RustosProcExecTargetBrokerArgs) =
+            current_loader_and_args(args_ptr)?;
+        if args.abi_version != PROC_BROKER_ABI_VERSION
+            || args.reserved0 != 0
+            || args.requester_pid == 0
+            || args.target_pid == 0
+            || args.target_tid == 0
+            || args.exec_ticket == 0
+            || args.prepare_handle == 0
+        {
+            return Err(LINUX_EINVAL);
+        }
+        if multitask::is_user_process_exiting(args.requester_pid) {
+            return Err(LINUX_ESRCH);
+        }
+        if !ipc_ops::process_owns_live_service_endpoint(args.requester_pid, IPC_SERVICE_PROCD) {
+            return Err(LINUX_EPERM);
+        }
+        {
+            let mut tickets = EXEC_TICKETS.lock();
+            let ticket = tickets.get(&args.exec_ticket).copied().ok_or(LINUX_EINVAL)?;
+            if ticket.target_pid != args.target_pid || ticket.target_tid != args.target_tid {
+                return Err(LINUX_EPERM);
+            }
+            tickets.remove(&args.exec_ticket);
+        }
+        let state = {
+            let mut prepares = PROC_PREPARES.lock();
+            match prepares.get(&args.prepare_handle) {
+                None => return Err(LINUX_EINVAL),
+                Some(s) if !prepare_owned_by(s, loader_pid) => return Err(LINUX_EPERM),
+                _ => {}
+            }
+            prepares.remove(&args.prepare_handle).unwrap()
         };
-        if ticket.target_pid != args.target_pid || ticket.target_tid != args.target_tid {
-            return linux_errno(LINUX_EPERM);
+        if !exec_prepare_ticket_matches(state.exec_ticket, args.exec_ticket)
+            || state.format != PROC_BROKER_FORMAT_ELF64
+            || state.windows_runtime.is_some()
+            || state.linux_runtime.is_none()
+        {
+            return Err(LINUX_EINVAL);
         }
-        tickets.remove(&args.exec_ticket);
-    }
-    let state = {
-        let mut prepares = PROC_PREPARES.lock();
-        match prepares.get(&args.prepare_handle) {
-            None => return linux_errno(LINUX_EINVAL),
-            Some(s) if !prepare_owned_by(s, loader_pid) => return linux_errno(LINUX_EPERM),
-            _ => {}
-        }
-        prepares.remove(&args.prepare_handle).unwrap()
-    };
-    if !exec_prepare_ticket_matches(state.exec_ticket, args.exec_ticket)
-        || state.format != PROC_BROKER_FORMAT_ELF64
-        || state.windows_runtime.is_some()
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let exec_path = match read_user_text(args.exec_path_ptr, args.exec_path_len) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    let argv_storage = match read_user_string_vector(
-        args.argv_ptr,
-        LOADER_SPAWN_MAX_ARG_COUNT,
-        LOADER_SPAWN_ARG_BYTES,
-    ) {
-        Ok(values) => values,
-        Err(errno) => return linux_errno(errno),
-    };
-    let env_storage = match read_user_string_vector(
-        args.envp_ptr,
-        LOADER_SPAWN_MAX_ENV_COUNT,
-        LOADER_SPAWN_ENV_BYTES,
-    ) {
-        Ok(values) => values,
-        Err(errno) => return linux_errno(errno),
-    };
-    let argv_refs = argv_storage.iter().map(String::as_str).collect::<Vec<_>>();
-    let env_refs = env_storage.iter().map(String::as_str).collect::<Vec<_>>();
-    let linux_launch = crate::user::linux::LinuxProcessLaunch {
-        exec_path: &exec_path,
-        argv: argv_refs.as_slice(),
-        env: env_refs.as_slice(),
-    };
-    #[cfg(rustos_lifecycle_trace)]
-    let exec_started = crate::arch::clock::monotonic_nanos();
-    let address_space = match address_space_from_mappings(&state.mappings) {
-        Ok(address_space) => address_space,
-        Err(errno) => return linux_errno(errno),
-    };
-    #[cfg(rustos_lifecycle_trace)]
-    let mapped_at = crate::arch::clock::monotonic_nanos();
-    let session = if args.console_session == 0 {
-        match multitask::linux_thread_snapshot_by_ids(args.target_pid, args.target_tid) {
-            Some(snapshot) => snapshot.console_session,
-            None => return linux_errno(LINUX_EINVAL),
-        }
-    } else {
-        crate::io::session::ConsoleSessionHandle::from_raw(args.console_session)
-    };
-    let logical_admin = multitask::with_process_state_by_pid(args.target_pid, |state| {
-        state.security().is_logical_admin()
-    })
-    .unwrap_or(false);
-    let launch = crate::user::process::ProcessLaunchOptions {
-        registers: crate::user::process::ProcessStartRegisters::new(),
-        linux: linux_launch,
-        console_session: session,
-        logical_admin,
-        root_job_authority: false,
-    };
-    // Same loaderd contract as prepare: linux_runtime must be populated; the
-    // bytes-image fallback into ring0 ELF parsing was retired.
-    let Some((mut info, actual_entry)) = state.linux_runtime else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    info.image_mappings = initial_elf_mappings(&state.mappings, &info, actual_entry);
-    let prepared = match crate::user::process::prepare_linux_process_with_metadata(
-        info,
-        actual_entry,
-        address_space,
-        crate::user::process::ProcessLaunchOptions {
+        let vectors = read_exec_vectors(
+            args.exec_path_ptr,
+            args.exec_path_len,
+            args.argv_ptr,
+            args.envp_ptr,
+        )?;
+        let exec_path = vectors.exec_path;
+        let argv_refs = vectors.argv.iter().map(String::as_str).collect::<Vec<_>>();
+        let env_refs = vectors.env.iter().map(String::as_str).collect::<Vec<_>>();
+        let linux_launch = crate::user::linux::LinuxProcessLaunch {
+            exec_path: &exec_path,
+            argv: argv_refs.as_slice(),
+            env: env_refs.as_slice(),
+        };
+        #[cfg(rustos_lifecycle_trace)]
+        let exec_started = crate::arch::clock::monotonic_nanos();
+        let address_space = address_space_from_mappings(&state.mappings)?;
+        #[cfg(rustos_lifecycle_trace)]
+        let mapped_at = crate::arch::clock::monotonic_nanos();
+        let session = if args.console_session == 0 {
+            multitask::linux_thread_snapshot_by_ids(args.target_pid, args.target_tid)
+                .ok_or(LINUX_EINVAL)?
+                .console_session
+        } else {
+            crate::io::session::ConsoleSessionHandle::from_raw(args.console_session)
+        };
+        let logical_admin = multitask::with_process_state_by_pid(args.target_pid, |state| {
+            state.security().is_logical_admin()
+        })
+        .unwrap_or(false);
+        let launch = crate::user::process::ProcessLaunchOptions {
+            registers: crate::user::process::ProcessStartRegisters::new(),
             linux: linux_launch,
-            ..launch
-        },
-        state.stack_top,
-    ) {
-        Ok(prepared) => prepared,
-        Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
-    };
-    #[cfg(rustos_lifecycle_trace)]
-    let prepared_at = crate::arch::clock::monotonic_nanos();
-    let transition = exec_transition_from_prepared(args.target_pid, args.target_tid, &prepared);
-    {
-        let mut transitions = EXEC_TRANSITIONS.lock();
-        // Publishing the transition before replacing the target address space
-        // closes the scheduler-visible window where a new image has no saved
-        // user-register handoff. A second concurrent exec for the same thread
-        // must not overwrite that handoff.
-        if transitions.contains_key(&args.target_tid) {
-            return linux_errno(LINUX_EBUSY);
+            console_session: session,
+            logical_admin,
+            root_job_authority: false,
+        };
+        let prepared = prepare_linux_process_from_state(
+            &state.mappings,
+            state.linux_runtime,
+            state.stack_top,
+            address_space,
+            launch,
+        )?;
+        #[cfg(rustos_lifecycle_trace)]
+        let prepared_at = crate::arch::clock::monotonic_nanos();
+        let transition = exec_transition_from_prepared(args.target_pid, args.target_tid, &prepared);
+        {
+            let mut transitions = EXEC_TRANSITIONS.lock();
+            // Publishing the transition before replacing the target address space
+            // closes the scheduler-visible window where a new image has no saved
+            // user-register handoff. A second concurrent exec for the same thread
+            // must not overwrite that handoff.
+            if transitions.contains_key(&args.target_tid) {
+                return Err(LINUX_EBUSY);
+            }
+            if transitions.insert(args.target_tid, transition).is_err() {
+                return Err(LINUX_EAGAIN);
+            }
         }
-        if transitions.insert(args.target_tid, transition).is_err() {
-            return linux_errno(LINUX_EAGAIN);
-        }
-    }
-    let exec_outcome = multitask::exec_user_process_by_pid_checked(
-        args.target_pid,
-        args.target_tid,
-        prepared.address_space,
-        prepared.bootstrap,
-    );
-    #[cfg(rustos_lifecycle_trace)]
-    {
-        // No prepare/transition/process guard spans diagnostic output. Capture
-        // all durations first so console transport is not charged to a phase.
-        let committed_at = crate::arch::clock::monotonic_nanos();
-        nucleus_core::debug::println_serialized(format_args!(
-            "proc-exec-work pid={} map_ns={} prepare_ns={} commit_ns={} ok={}",
+        let exec_outcome = multitask::exec_user_process_by_pid_checked(
             args.target_pid,
-            mapped_at.saturating_sub(exec_started),
-            prepared_at.saturating_sub(mapped_at),
-            committed_at.saturating_sub(prepared_at),
-            exec_outcome.is_ok(),
-        ));
-    }
-    if let Err(refusal) = &exec_outcome {
-        // Names the refusing stage without collapsing quota into a missing target.
-        nucleus_core::debug::record_milestone(
-            nucleus_core::debug::LogCategory::Compat,
-            "proc-exec-refused",
-            args.target_pid,
-            refusal.code(),
+            args.target_tid,
+            prepared.address_space,
+            prepared.bootstrap,
         );
-    }
-    if let Ok(closed_handles) = exec_outcome {
-        offload_ops::record_process_exec(args.target_pid);
-        // The process-table commit has already removed CLOEXEC descriptors.
-        // Derive cleanup from the exact handles retired by that commit, never
-        // from an earlier fd snapshot that a sibling can close/reuse before
-        // replacement. A provider restart independently revokes any call that
-        // cannot complete this bounded cleanup.
-        // POSIX locks die with a close of any fd of the file, including this
-        // one; the descriptions are still referenced here, so vfsd still knows
-        // them. Runs in the loader's context, hence the explicit pid.
-        file_lock_ops::note_exec_cloexec_closed(args.target_pid, &closed_handles);
-        let cloexec_service_refs: Vec<_> = closed_handles
-            .iter()
-            .filter_map(service_handle_ref_for_handle)
-            .collect();
-        let cloexec_console_handles: Vec<_> = closed_handles
-            .into_iter()
-            .filter_map(|handle| match handle {
-                multitask::KernelHandle::Console(console) => Some(console),
-                _ => None,
-            })
-            .collect();
-        release_service_handle_refs_bounded(&cloexec_service_refs);
-        purge_closed_console_handles(cloexec_console_handles, true);
-        // Linux exec retires every sibling thread. Their exact tickets and
-        // handoffs can no longer become valid after the scheduler clears those
-        // slots, so release them with the same target identity boundary.
-        cleanup_proc_broker_exec_state_for_siblings(args.target_pid, args.target_tid);
-        args.target_pid
-    } else {
-        EXEC_TRANSITIONS.lock().remove(&args.target_tid);
-        linux_errno(exec_refusal_errno(exec_outcome.unwrap_err()))
-    }
+        #[cfg(rustos_lifecycle_trace)]
+        {
+            // No prepare/transition/process guard spans diagnostic output. Capture
+            // all durations first so console transport is not charged to a phase.
+            let committed_at = crate::arch::clock::monotonic_nanos();
+            nucleus_core::debug::println_serialized(format_args!(
+                "proc-exec-work pid={} map_ns={} prepare_ns={} commit_ns={} ok={}",
+                args.target_pid,
+                mapped_at.saturating_sub(exec_started),
+                prepared_at.saturating_sub(mapped_at),
+                committed_at.saturating_sub(prepared_at),
+                exec_outcome.is_ok(),
+            ));
+        }
+        match exec_outcome {
+            Ok(closed_handles) => {
+                offload_ops::record_process_exec(args.target_pid);
+                // The process-table commit has already removed CLOEXEC descriptors.
+                // Derive cleanup from the exact handles retired by that commit, never
+                // from an earlier fd snapshot that a sibling can close/reuse before
+                // replacement. A provider restart independently revokes any call that
+                // cannot complete this bounded cleanup.
+                // POSIX locks die with a close of any fd of the file, including this
+                // one; the descriptions are still referenced here, so vfsd still knows
+                // them. Runs in the loader's context, hence the explicit pid.
+                file_lock_ops::note_exec_cloexec_closed(args.target_pid, &closed_handles);
+                release_closed_handles(closed_handles);
+                // Linux exec retires every sibling thread. Their exact tickets and
+                // handoffs can no longer become valid after the scheduler clears those
+                // slots, so release them with the same target identity boundary.
+                cleanup_proc_broker_exec_state_for_siblings(args.target_pid, args.target_tid);
+                Ok(args.target_pid)
+            }
+            Err(refusal) => {
+                // Names the refusing stage without collapsing quota into a missing target.
+                nucleus_core::debug::record_milestone(
+                    nucleus_core::debug::LogCategory::Compat,
+                    "proc-exec-refused",
+                    args.target_pid,
+                    refusal.code(),
+                );
+                EXEC_TRANSITIONS.lock().remove(&args.target_tid);
+                Err(exec_refusal_errno(refusal))
+            }
+        }
+    })())
 }
 
 fn exec_refusal_errno(refusal: multitask::ExecRefusal) -> i64 {
@@ -1360,8 +1344,8 @@ pub(super) fn syscall_linux_rustos_proc_signal_queue_broker(args_ptr: u64) -> u6
 
 pub(super) fn syscall_linux_rustos_proc_abort_broker(args_ptr: u64) -> u64 {
     linux_unit_result((|| {
-        let loader_pid = current_loader_process_id().ok_or(LINUX_EPERM)?;
-        let args: RustosProcAbortBrokerArgs = read_user_struct_as(args_ptr)?;
+        let (loader_pid, args): (u64, RustosProcAbortBrokerArgs) =
+            current_loader_and_args(args_ptr)?;
         if args.reserved0 != 0 {
             return Err(LINUX_EINVAL);
         }
@@ -1655,20 +1639,22 @@ fn address_space_from_mappings(
                         );
                     },
                 )?;
-                let write_addr = target_addr
-                    .checked_add(*data_offset)
-                    .ok_or_else(|| {
-                        nucleus_core::debug::write_debugcon_only_line(
-                            alloc::format!(
-                                "proc-commit: mapping rejected stage=data-address index={index} target={target_addr:#x} data_offset={data_offset:#x}"
-                            )
-                            .as_bytes(),
-                        );
-                        LINUX_EOVERFLOW
-                    })?;
-                address_space
-                    .initialize_user_bytes(VirtAddr::new(write_addr), data)
-                    .map_err(address_space_error_to_linux_errno)?;
+                if !data.is_empty() {
+                    let write_addr = target_addr
+                        .checked_add(*data_offset)
+                        .ok_or_else(|| {
+                            nucleus_core::debug::write_debugcon_only_line(
+                                alloc::format!(
+                                    "proc-commit: mapping rejected stage=data-address index={index} target={target_addr:#x} data_offset={data_offset:#x}"
+                                )
+                                .as_bytes(),
+                            );
+                            LINUX_EOVERFLOW
+                        })?;
+                    address_space
+                        .initialize_user_bytes(VirtAddr::new(write_addr), data)
+                        .map_err(address_space_error_to_linux_errno)?;
+                }
             }
             MappingEntry::File {
                 backing,
@@ -1954,16 +1940,7 @@ fn allocate_nonwrapping_broker_identity(counter: &AtomicU64) -> Option<u64> {
 }
 
 fn validate_mapping_region(target_addr: u64, mem_len: u64, flags: u64) -> Result<(), i64> {
-    if mem_len == 0
-        || !target_addr.is_multiple_of(PAGE_SIZE)
-        || !mem_len.is_multiple_of(PAGE_SIZE)
-        || target_addr < PROC_BROKER_USER_SPACE_BASE
-        || target_addr
-            .checked_add(mem_len)
-            .is_none_or(|end| end > PROC_BROKER_USER_SPACE_END_EXCLUSIVE)
-    {
-        return Err(LINUX_EINVAL);
-    }
+    validate_user_range(target_addr, mem_len)?;
     let supported = PROC_BROKER_MAP_READ
         | PROC_BROKER_MAP_WRITE
         | PROC_BROKER_MAP_EXEC
@@ -2013,10 +1990,12 @@ fn linux_tls_fields_valid(args: &RustosProcSetLinuxRuntimeBrokerArgs) -> bool {
 }
 
 fn range_contains(base: u64, len: u64, ptr: u64, access_len: u64) -> bool {
-    ptr >= base
-        && ptr
-            .checked_add(access_len)
-            .is_some_and(|end| end <= base.saturating_add(len))
+    base.checked_add(len).is_some_and(|range_end| {
+        ptr >= base
+            && ptr
+                .checked_add(access_len)
+                .is_some_and(|end| end <= range_end)
+    })
 }
 
 fn process_load_error_to_linux_errno(error: crate::user::process::ProcessLoadError) -> i64 {
@@ -2111,3 +2090,139 @@ fn read_user_string_vector(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod refactor_tests {
+    use super::*;
+
+    fn empty_prepare_state() -> ProcPrepareState {
+        ProcPrepareState {
+            owner_pid: 1,
+            format: PROC_BROKER_FORMAT_ELF64,
+            stack_top: PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
+            exec_ticket: None,
+            job: None,
+            mappings: Vec::new(),
+            windows_runtime: None,
+            linux_runtime: None,
+        }
+    }
+
+    fn zeroed_mapping(offset_pages: u64) -> Box<MappingEntry> {
+        Box::new(MappingEntry::Zeroed {
+            target_addr: PROC_BROKER_USER_SPACE_BASE + offset_pages * PAGE_SIZE,
+            mem_len: PAGE_SIZE,
+            flags: PROC_BROKER_MAP_READ | PROC_BROKER_MAP_PRIVATE,
+        })
+    }
+
+    #[test]
+    fn range_contains_rejects_range_overflow_and_out_of_bounds_pointers() {
+        assert!(range_contains(0x1000, 0x1000, 0x1000, 8));
+        assert!(range_contains(0x1000, 0x1000, 0x1ff8, 8));
+        assert!(!range_contains(0x1000, 0x1000, 0x1ff9, 8));
+        assert!(!range_contains(u64::MAX - 15, 32, u64::MAX - 8, 4));
+        assert!(!range_contains(0x1000, 0x1000, u64::MAX - 3, 8));
+    }
+
+    #[test]
+    fn validate_mapping_region_enforces_window_alignment_and_wx_exclusion() {
+        let base = PROC_BROKER_USER_SPACE_BASE;
+        assert_eq!(
+            validate_mapping_region(base, PAGE_SIZE, PROC_BROKER_MAP_READ | PROC_BROKER_MAP_PRIVATE),
+            Ok(())
+        );
+        assert_eq!(
+            validate_mapping_region(base, PAGE_SIZE, PROC_BROKER_MAP_READ),
+            Err(LINUX_EINVAL)
+        );
+        assert_eq!(
+            validate_mapping_region(
+                base,
+                PAGE_SIZE,
+                PROC_BROKER_MAP_PRIVATE | PROC_BROKER_MAP_WRITE | PROC_BROKER_MAP_EXEC
+            ),
+            Err(LINUX_EINVAL)
+        );
+        assert_eq!(
+            validate_mapping_region(base + 1, PAGE_SIZE, PROC_BROKER_MAP_PRIVATE),
+            Err(LINUX_EINVAL)
+        );
+        assert_eq!(
+            validate_mapping_region(
+                PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
+                PAGE_SIZE,
+                PROC_BROKER_MAP_PRIVATE
+            ),
+            Err(LINUX_EINVAL)
+        );
+    }
+
+    #[test]
+    fn push_prepare_mapping_and_batch_enforce_capacity_without_consuming_rejected_entries() {
+        let mut state = empty_prepare_state();
+        let mut single = Some(zeroed_mapping(0));
+        assert_eq!(push_prepare_mapping(&mut state, &mut single), Ok(()));
+        assert!(single.is_none());
+        assert_eq!(state.mappings.len(), 1);
+
+        while state.mappings.len() < MAX_MAPPINGS_PER_PREPARE - 1 {
+            state.mappings.push(zeroed_mapping(1));
+        }
+
+        let mut batch = [Some(zeroed_mapping(2)), Some(zeroed_mapping(3))];
+        assert_eq!(push_prepare_mappings(&mut state, &mut batch), Err(LINUX_EINVAL));
+        assert_eq!(state.mappings.len(), MAX_MAPPINGS_PER_PREPARE - 1);
+        assert!(batch[0].is_some() && batch[1].is_some());
+
+        let mut last = Some(zeroed_mapping(4));
+        assert_eq!(push_prepare_mapping(&mut state, &mut last), Ok(()));
+        assert!(last.is_none());
+        assert_eq!(state.mappings.len(), MAX_MAPPINGS_PER_PREPARE);
+
+        let mut extra = Some(zeroed_mapping(5));
+        assert_eq!(push_prepare_mapping(&mut state, &mut extra), Err(LINUX_EINVAL));
+        assert!(extra.is_some());
+    }
+
+    #[test]
+    fn validate_windows_runtime_args_checks_abi_ranges_and_optional_pointers() {
+        let image_base = PROC_BROKER_USER_SPACE_BASE + 0x10_0000;
+        let runtime_base = PROC_BROKER_USER_SPACE_BASE + 0x40_0000;
+        let valid = RustosProcSetWindowsRuntimeBrokerArgs {
+            abi_version: PROC_BROKER_ABI_VERSION,
+            loader_module_count: 1,
+            image_base,
+            image_size: 0x10_000,
+            entry_point: image_base + 0x1000,
+            runtime_base,
+            runtime_size: 0x10_000,
+            public_runtime_address: runtime_base,
+            peb_address: runtime_base + 0x100,
+            teb_address: runtime_base + 0x200,
+            process_parameters_address: runtime_base + 0x300,
+            loader_data_address: runtime_base + 0x400,
+            loader_module_array_address: runtime_base + 0x500,
+            teb_process_id_ptr: runtime_base + 0x240,
+            teb_thread_id_ptr: runtime_base + 0x248,
+            ..RustosProcSetWindowsRuntimeBrokerArgs::default()
+        };
+        assert_eq!(validate_windows_runtime_args(&valid), Ok(()));
+
+        let mut bad = valid;
+        bad.abi_version = PROC_BROKER_ABI_VERSION - 1;
+        assert_eq!(validate_windows_runtime_args(&bad), Err(LINUX_EINVAL));
+
+        bad = valid;
+        bad.reserved2 = 1;
+        assert_eq!(validate_windows_runtime_args(&bad), Err(LINUX_EINVAL));
+
+        bad = valid;
+        bad.teb_thread_id_ptr = runtime_base + valid.runtime_size - 4;
+        assert_eq!(validate_windows_runtime_args(&bad), Err(LINUX_EINVAL));
+
+        bad = valid;
+        bad.kuser_shared_data_address = runtime_base + valid.runtime_size - 2048;
+        assert_eq!(validate_windows_runtime_args(&bad), Err(LINUX_EINVAL));
+    }
+}
