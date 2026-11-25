@@ -114,6 +114,10 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
         SYS_GETPGID | SYS_GETSID => [S, W, W, W, W, W],
         SYS_GET_ROBUST_LIST => [S, W, W, W, W, W],
         SYS_SETUID | SYS_SETGID => [U, W, W, W, W, W],
+        // uid_t ruid, uid_t euid (-1 = unchanged) and the gid twin
+        SYS_SETREUID | SYS_SETREGID => [U, U, W, W, W, W],
+        // uid_t ruid, uid_t euid, uid_t suid and the gid twin
+        SYS_SETRESUID | SYS_SETRESGID => [U, U, U, W, W, W],
         SYS_UMASK => [U, W, W, W, W, W],
         SYS_GETRANDOM => [W, W, U, W, W, W],
         // int clockid, int flags, ts*, ts*
@@ -164,8 +168,12 @@ fn arg_kinds(nr: u64) -> [Kind; 6] {
         // dirfd, path*, buf*, int bufsiz
         SYS_READLINKAT => [S, W, W, S, W, W],
         SYS_READLINK => [W, W, S, W, W, W],
+        // dirfd, path*, int mode (faccessat has no flags register)
+        SYS_FACCESSAT => [S, W, U, W, W, W],
         // dirfd, path*, int mode, int flags
-        SYS_FACCESSAT => [S, W, U, U, W, W],
+        SYS_FACCESSAT2 => [S, W, U, U, W, W],
+        // int size
+        SYS_EPOLL_CREATE => [S, W, W, W, W, W],
         SYS_ACCESS => [W, U, W, W, W, W],
         SYS_MKDIR => [W, U, W, W, W, W],
         SYS_MKDIRAT => [S, W, U, W, W, W],
@@ -361,6 +369,14 @@ mod tests {
     }
 
     #[test]
+    fn set_res_id_family_zero_extends_minus_one() {
+        let out = run(SYS_SETRESUID, [0xFFFF_FFFF | GARBAGE, 0xFFFF_FFFF, 7 | GARBAGE, 0, 0, 0]);
+        assert_eq!(out[..3], [u64::from(u32::MAX), u64::from(u32::MAX), 7]);
+        let out = run(SYS_SETREGID, [0xFFFF_FFFF | GARBAGE, 5 | GARBAGE, 0x1_0000_0001, 0, 0, 0]);
+        assert_eq!(out[..3], [u64::from(u32::MAX), 5, 0x1_0000_0001]);
+    }
+
+    #[test]
     fn futex_clock_and_prctl() {
         let out = run(SYS_FUTEX, [0x7000, GARBAGE | 0x89, GARBAGE | 1, 0x10, 0x20, GARBAGE | 2]);
         assert_eq!(out, [0x7000, 0x89, 1, 0x10, 0x20, 2]);
@@ -513,6 +529,14 @@ mod tests {
         assert_eq!(out, [0xFFFF_FFFF_FFFF_FF9C, 0x1000, 0o644, 0, 0, 0]);
         let out = run(SYS_FCHMODAT2, [GARBAGE | 4, 0x1000, GARBAGE | 0o600, GARBAGE | 0x100, 0, 0]);
         assert_eq!(out, [4, 0x1000, 0o600, 0x100, 0, 0]);
+        // faccessat has three arguments: the fourth register is not canonicalized
+        // as a flag word. faccessat2 carries the flags.
+        let out = run(SYS_FACCESSAT, [0xFFFF_FF9C, 0x1000, GARBAGE | 4, GARBAGE, 0, 0]);
+        assert_eq!(out, [0xFFFF_FFFF_FFFF_FF9C, 0x1000, 4, GARBAGE, 0, 0]);
+        let out = run(SYS_FACCESSAT2, [0xFFFF_FF9C, 0x1000, GARBAGE | 4, GARBAGE | 0x200, 0, 0]);
+        assert_eq!(out, [0xFFFF_FFFF_FFFF_FF9C, 0x1000, 4, 0x200, 0, 0]);
+        let out = run(SYS_EPOLL_CREATE, [GARBAGE | 0xFFFF_FFFF, 0, 0, 0, 0, 0]);
+        assert_eq!(out, [0xFFFF_FFFF_FFFF_FFFF, 0, 0, 0, 0, 0]);
         let out = run(SYS_FCHMOD, [GARBAGE | 5, GARBAGE | 0o700, 0, 0, 0, 0]);
         assert_eq!(out, [5, 0o700, 0, 0, 0, 0]);
         let out = run(SYS_UTIMENSAT, [0xFFFF_FF9C, 0x1000, 0x2000, GARBAGE | 0x100, 0, 0]);

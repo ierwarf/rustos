@@ -214,6 +214,10 @@ struct Lease {
     application_realm_configured: bool,
     restart_budget: u32,
     backoff_ms: u32,
+    /// Monotonic instant (ns, never 0 once set) from which this lease has been
+    /// continuously `RUNNING` with a partly spent budget, or 0 when not being
+    /// timed. After `SERVICE_HEALTHY_FORGIVENESS_MS` the budget is replenished.
+    healthy_since_ns: u64,
     /// Monotonic deadline before which a `RESTART_PENDING` lease must not be
     /// respawned. Deadline-driven so one crashing service never parks the
     /// whole supervisor (and its IPC service) for its backoff.
@@ -501,8 +505,9 @@ fn lease(spec: BootstrapServiceSpec) -> Lease {
         service_id: spec.service_id,
         exec_path: spec.exec_path,
         pid: 0,
-        restart_budget: 3,
+        restart_budget: RESTART_BUDGET_MAX,
         backoff_ms: 250,
+        healthy_since_ns: 0,
         restart_not_before_ns: 0,
         retire_retries: 0,
         state: rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY,
@@ -3176,6 +3181,14 @@ fn restart_failed_leases(
     let mut now_ns = None;
     for index in 0..leases.len() {
         let lease = &mut leases[index];
+        if lease.state == ROOTD_LEASE_STATE_RUNNING && lease.restart_budget < RESTART_BUDGET_MAX {
+            let now = *now_ns.get_or_insert_with(rustos_svc_runtime::syscall::monotonic_nanos);
+            if replenish_healthy_budget(lease, now) {
+                debug_line(b"rootd: restart budget replenished after healthy uptime\n");
+            }
+        } else if lease.state != ROOTD_LEASE_STATE_RUNNING {
+            lease.healthy_since_ns = 0;
+        }
         if !matches!(
             lease.state,
             ROOTD_LEASE_STATE_EXITED | ROOTD_LEASE_STATE_RESTART_PENDING
@@ -3221,6 +3234,7 @@ fn restart_failed_leases(
                 lease.pid = pid;
                 kernel_policy::bind(pid, lease.service_id);
                 lease.restart_budget -= 1;
+                lease.healthy_since_ns = 0;
                 lease.retire_retries = 0;
                 lease.state = ROOTD_LEASE_STATE_RUNNING;
                 lease.exit_status = 0;
@@ -3241,6 +3255,34 @@ fn restart_failed_leases(
             }
         }
     }
+}
+
+/// Restart intensity: a lease may be respawned at most this many times between
+/// two healthy-uptime windows (Erlang/OTP `intensity`; the window is the shared
+/// `SERVICE_HEALTHY_FORGIVENESS_MS`, the OTP `period`).
+const RESTART_BUDGET_MAX: u32 = 3;
+
+/// Credit rule for the restart budget. A lease that stays `RUNNING` for
+/// `SERVICE_HEALTHY_FORGIVENESS_MS` since it was first observed running with a
+/// partly spent budget gets the full budget back; any other state restarts the
+/// observation, so a crash loop (short incarnations) still exhausts and a
+/// terminal `FAILED` lease is never revived. Returns whether it replenished.
+fn replenish_healthy_budget(lease: &mut Lease, now_ns: u64) -> bool {
+    if lease.state != ROOTD_LEASE_STATE_RUNNING || lease.restart_budget >= RESTART_BUDGET_MAX {
+        lease.healthy_since_ns = 0;
+        return false;
+    }
+    if lease.healthy_since_ns == 0 {
+        lease.healthy_since_ns = now_ns.max(1);
+        return false;
+    }
+    let window_ns = rustos_user_abi::performance::SERVICE_HEALTHY_FORGIVENESS_MS * 1_000_000;
+    if now_ns.saturating_sub(lease.healthy_since_ns) < window_ns {
+        return false;
+    }
+    lease.restart_budget = RESTART_BUDGET_MAX;
+    lease.healthy_since_ns = 0;
+    true
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3988,6 +4030,76 @@ mod tests {
     fn refused_mutate_batch_reports_zero_committed_records() {
         assert_eq!(reply_preamble_value0(COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE_BATCH, 6), 0);
         assert_eq!(reply_preamble_value0(COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE, 6), 6);
+    }
+
+    #[test]
+    fn restart_budget_replenishes_only_after_a_full_healthy_window() {
+        const WINDOW_NS: u64 =
+            rustos_user_abi::performance::SERVICE_HEALTHY_FORGIVENESS_MS * 1_000_000;
+        let t0 = 5_000_000_000;
+        let mut lease = lease(BOOTSTRAP_MANIFEST[0]);
+        lease.state = ROOTD_LEASE_STATE_RUNNING;
+        // A full budget is never timed.
+        assert!(!replenish_healthy_budget(&mut lease, t0));
+        assert_eq!(lease.healthy_since_ns, 0);
+
+        // Spend two restarts; the observation starts at the first pass.
+        lease.restart_budget = RESTART_BUDGET_MAX - 2;
+        assert!(!replenish_healthy_budget(&mut lease, t0));
+        assert_eq!(lease.healthy_since_ns, t0);
+        assert!(!replenish_healthy_budget(&mut lease, t0 + WINDOW_NS - 1));
+        assert_eq!(lease.restart_budget, RESTART_BUDGET_MAX - 2);
+        assert!(replenish_healthy_budget(&mut lease, t0 + WINDOW_NS));
+        assert_eq!(lease.restart_budget, RESTART_BUDGET_MAX);
+        assert_eq!(lease.healthy_since_ns, 0);
+
+        // Leaving RUNNING restarts the window: no credit for time spent dead.
+        lease.restart_budget = 1;
+        assert!(!replenish_healthy_budget(&mut lease, t0));
+        lease.state = ROOTD_LEASE_STATE_RESTART_PENDING;
+        assert!(!replenish_healthy_budget(&mut lease, t0 + WINDOW_NS / 2));
+        assert_eq!(lease.healthy_since_ns, 0);
+        lease.state = ROOTD_LEASE_STATE_RUNNING;
+        assert!(!replenish_healthy_budget(&mut lease, t0 + WINDOW_NS));
+        assert!(!replenish_healthy_budget(&mut lease, t0 + WINDOW_NS + WINDOW_NS - 1));
+        assert_eq!(lease.restart_budget, 1);
+
+        // A terminal lease is never revived, whatever its clock says.
+        lease.state = ROOTD_LEASE_STATE_FAILED;
+        lease.restart_budget = 0;
+        assert!(!replenish_healthy_budget(&mut lease, t0 + 10 * WINDOW_NS));
+        assert_eq!(lease.restart_budget, 0);
+    }
+
+    #[test]
+    fn crash_loop_exhausts_but_a_long_lived_service_survives_many_crashes() {
+        const WINDOW_NS: u64 =
+            rustos_user_abi::performance::SERVICE_HEALTHY_FORGIVENESS_MS * 1_000_000;
+        let mut lease = lease(BOOTSTRAP_MANIFEST[0]);
+        let mut now = 1_000_000_000u64;
+        // Ten crashes, each after a healthy window: never FAILED.
+        for _ in 0..10 {
+            lease.state = ROOTD_LEASE_STATE_RUNNING;
+            replenish_healthy_budget(&mut lease, now);
+            now += WINDOW_NS;
+            replenish_healthy_budget(&mut lease, now);
+            assert_eq!(lease.restart_budget, RESTART_BUDGET_MAX);
+            // Restart consumes one budget unit as in restart_failed_leases.
+            lease.restart_budget -= 1;
+            lease.healthy_since_ns = 0;
+            lease.state = ROOTD_LEASE_STATE_RESTART_PENDING;
+        }
+        // A crash loop (short incarnations) exhausts the same lease.
+        lease.restart_budget = RESTART_BUDGET_MAX;
+        for _ in 0..RESTART_BUDGET_MAX {
+            lease.state = ROOTD_LEASE_STATE_RUNNING;
+            replenish_healthy_budget(&mut lease, now);
+            now += WINDOW_NS / 4;
+            replenish_healthy_budget(&mut lease, now);
+            lease.restart_budget -= 1;
+            lease.healthy_since_ns = 0;
+        }
+        assert_eq!(lease.restart_budget, 0);
     }
 
     #[test]

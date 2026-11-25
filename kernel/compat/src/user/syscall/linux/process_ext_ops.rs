@@ -129,18 +129,44 @@ pub(super) fn syscall_linux_sched_get_priority(policy: i64, max: bool) -> u64 {
     }
 }
 
-fn sched_target_is_self(pid: i64) -> Result<(), i64> {
+/// Resolves a scheduling-call target. `Ok(false)` is the caller's own process
+/// or one of its threads, `Ok(true)` another live process, and a target that
+/// does not exist is `ESRCH`. Every task has the same fixed policy, so reading
+/// another process's scheduling attributes needs no more than its existence.
+pub(super) fn sched_target(pid: i64) -> Result<bool, i64> {
     if pid < 0 {
         return Err(LINUX_EINVAL);
     }
-    if pid != 0
-        && multitask::current_user_process_id() != Some(pid as u64)
-        && multitask::current_user_thread_id() != Some(pid as u64)
+    if pid == 0 {
+        return Ok(false);
+    }
+    let target = pid as u64;
+    let own_process = multitask::current_user_process_id();
+    if own_process == Some(target)
+        || multitask::current_user_thread_id() == Some(target)
+        || own_process
+            .is_some_and(|process| multitask::linux_thread_snapshot_by_ids(process, target).is_some())
     {
-        return Err(LINUX_ESRCH);
+        return Ok(false);
+    }
+    if multitask::with_process_state_by_pid(target, |_| ()).is_some() {
+        return Ok(true);
+    }
+    Err(LINUX_ESRCH)
+}
+
+/// A scheduling-attribute write may name another process only when the caller
+/// is privileged: unprivileged callers may change their own tasks only.
+fn sched_write_target(pid: i64) -> Result<(), i64> {
+    if sched_target(pid)? && multitask::with_current_process_credentials(|s| s.euid()) != Some(0) {
+        return Err(LINUX_EPERM);
     }
     Ok(())
 }
+
+/// `SCHED_RESET_ON_FORK` rides in the policy word; it changes only what a
+/// fork child inherits, and every task has the same fixed policy anyway.
+const SCHED_RESET_ON_FORK: i64 = 0x4000_0000;
 
 /// The result of `sched_setscheduler(policy, priority)` for this kernel.
 pub(super) fn sched_set_outcome(policy: i64, priority: i32) -> Result<(), i64> {
@@ -157,21 +183,39 @@ pub(super) fn sched_set_outcome(policy: i64, priority: i32) -> Result<(), i64> {
     }
 }
 
+/// The policy of a `policy` argument (a C `int`) with `SCHED_RESET_ON_FORK`
+/// stripped; a negative word is `EINVAL`.
+fn sched_policy_without_flags(word: i64) -> Result<i64, i64> {
+    let word = word as i32 as i64;
+    if word < 0 {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(word & !SCHED_RESET_ON_FORK)
+}
+
+/// The order Linux checks `sched_setscheduler`/`sched_setparam` arguments in:
+/// a negative pid or a NULL `param` is `EINVAL` (not `EFAULT`), then the
+/// `param` copy, then the target, then the policy.
+fn read_sched_param(pid: i64, param_ptr: u64) -> Result<linux_abi::LinuxSchedParam, i64> {
+    if param_ptr == 0 || pid < 0 {
+        return Err(LINUX_EINVAL);
+    }
+    read_user_struct(param_ptr)
+}
+
 pub(super) fn syscall_linux_sched_setscheduler(pid: i64, policy: i64, param_ptr: u64) -> u64 {
     linux_unit_result((|| {
-        sched_target_is_self(pid)?;
-        let param: linux_abi::LinuxSchedParam = read_user_struct(param_ptr)?;
-        if policy < 0 {
-            return Err(LINUX_EINVAL);
-        }
+        let policy = sched_policy_without_flags(policy)?;
+        let param = read_sched_param(pid, param_ptr)?;
+        sched_write_target(pid)?;
         sched_set_outcome(policy, param.sched_priority)
     })())
 }
 
 pub(super) fn syscall_linux_sched_setparam(pid: i64, param_ptr: u64) -> u64 {
     linux_unit_result((|| {
-        sched_target_is_self(pid)?;
-        let param: linux_abi::LinuxSchedParam = read_user_struct(param_ptr)?;
+        let param = read_sched_param(pid, param_ptr)?;
+        sched_write_target(pid)?;
         // The task's policy is always SCHED_OTHER, whose only priority is 0.
         sched_set_outcome(linux_abi::SCHED_OTHER, param.sched_priority)
     })())
@@ -343,6 +387,20 @@ mod tests {
         assert_eq!(sched_set_outcome(linux_abi::SCHED_RR, 1), Err(LINUX_EPERM));
         assert_eq!(sched_set_outcome(linux_abi::SCHED_BATCH, 0), Err(LINUX_EPERM));
         assert_eq!(sched_set_outcome(6, 0), Err(LINUX_EINVAL));
+    }
+
+    #[test]
+    fn setscheduler_policy_word_strips_reset_on_fork_and_rejects_negatives() {
+        assert_eq!(sched_policy_without_flags(0), Ok(0));
+        assert_eq!(sched_policy_without_flags(SCHED_RESET_ON_FORK), Ok(0));
+        assert_eq!(sched_policy_without_flags(SCHED_RESET_ON_FORK | 2), Ok(2));
+        assert_eq!(sched_policy_without_flags(-1), Err(LINUX_EINVAL));
+        // The upper register half of a C `int` is not ABI.
+        assert_eq!(sched_policy_without_flags(0xFFFF_FFFF), Err(LINUX_EINVAL));
+        assert_eq!(sched_policy_without_flags(0x5_0000_0001), Ok(1));
+        // A NULL param or negative pid is EINVAL before anything is read.
+        assert_eq!(read_sched_param(0, 0).err(), Some(LINUX_EINVAL));
+        assert_eq!(read_sched_param(-1, 0x1000).err(), Some(LINUX_EINVAL));
     }
 
     #[test]

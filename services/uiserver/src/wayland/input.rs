@@ -16,7 +16,7 @@ impl WaylandState {
             let Ok(surface) = surface.shared.lock() else {
                 continue;
             };
-            if surface.drag_icon_role {
+            if surface.drag_icon_role || surface.cursor_role {
                 continue;
             }
             let grabbed = !dragging
@@ -200,8 +200,24 @@ impl WaylandState {
         self.next_pointer_motion_flush = now + WAYLAND_POINTER_FRAME_INTERVAL;
     }
 
+    /// A surface may take keyboard focus only while it is a live window: not
+    /// destroyed, retired, or holding the cursor / drag-icon role. Clients map
+    /// `wl_surface` to a window object and would be handed a surface that is
+    /// not one.
+    fn focusable(focus: &KeyboardFocus) -> bool {
+        if !focus.surface.is_alive() {
+            return false;
+        }
+        focus.surface.data::<SurfaceData>().is_some_and(|data| {
+            data.shared.lock().is_ok_and(|surface| {
+                surface.alive && !surface.cursor_role && !surface.drag_icon_role
+            })
+        })
+    }
+
     pub(super) fn set_keyboard_focus(&mut self, next: Option<KeyboardFocus>) {
         self.prune_keyboard_resources();
+        let next = next.filter(Self::focusable);
 
         let previous_surface = self
             .keyboard_focus

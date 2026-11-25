@@ -16,33 +16,26 @@
   ticket only after exact-length and nonzero checks; malformed bytes return a
   bounded ABI error without constructing or consuming authority.
 - The registry matches ID, nonce, and batch generation and consumes the whole
-  batch exactly once. Before netd sees it, the kernel binds the batch to the
-  source process generation, intended receiver generation, netd service epoch,
-  socket channel generation/direction, and exact byte-stream interval. Netd
-  IPC ABI v7 carries only these opaque tickets; it cannot redirect authority by
-  editing a PID, epoch, channel, or stream position.
-  A forged, stale, zero, or replayed ticket cannot remove the live entry. The
-  Kani harnesses cover the 192-bit ticket input partition and canonical
-  round-trip; `ipc-handle-transfer` separately models typed registry lifetime.
-  Harness coverage is not itself evidence that a verification run passed.
+  batch exactly once. A forged, stale, zero, or replayed ticket cannot remove
+  the live entry. The Kani harnesses cover the 192-bit ticket input partition
+  and canonical round-trip; `ipc-handle-transfer` separately models typed
+  registry lifetime. Harness coverage is not itself evidence that a
+  verification run passed.
 - Pending transferred-handle entries are owned by the process-handle substrate,
   not an isolated compat cache. An endpoint message that is cancelled,
   peer-closed before receive, rejected after receive-output validation, or
   abandoned by caller task exit must return every opaque descriptor for exactly
   one substrate drop. Successful receive installs the whole validated batch;
   duplicate/stale descriptors and partial installation must fail closed.
-  AF_UNIX queues retain byte and ancillary control as one ordered stream
-  segment. `recvmsg` may collect rights only from a segment whose bytes it
-  consumes; ordinary `read` consumes and returns that segment's rights to the
-  kernel release trailer instead of reattaching them to later bytes. Close,
-  queue discard, peer exit, and service-epoch replacement release every queued
-  batch. Destination FD numbers remain invisible reservations until data,
-  control, and message-header copyout all succeed, then publish atomically.
-  A stream segment records the sending request's credentials (pid/uid/gid at
-  send time). One receive never spans two senders, merges plain sends only
-  when their sender matches, and reports the first segment's sender as
-  `SCM_CREDENTIALS` (never the connection creator's, which only `SO_PEERCRED`
-- `AF_UNIX` sockets are handled in Ring0 by `UnixSocketHandle` (see [Unix Socket ABI](unix-socket.md)). Initial netd `AF_INET`/`AF_NETLINK` socket references use version-2 reply-bound publication, never direct target-process fd installation. The exact timely reply take owns a validated one-entry batch; invisible slot reservation and the final deadline check precede atomic fd commit. Failed binding leaves discard with netd; successful binding transfers abandonment cleanup to the kernel transfer-drop owner. See [Network Surface](policy-display.md#network-surface-netd).
+- `AF_UNIX` sockets (including `SCM_RIGHTS` descriptor passing and
+  `SCM_CREDENTIALS`/`SO_PEERCRED` peer credentials) are handled in Ring0 by
+  `UnixSocketHandle` (see [Unix Socket ABI](unix-socket.md)). Initial netd
+  `AF_INET`/`AF_INET6`/`AF_NETLINK` socket references use version-2 reply-bound
+  publication, never direct target-process fd installation. The exact timely
+  reply take owns a validated one-entry batch; invisible slot reservation and
+  the final deadline check precede atomic fd commit. Failed binding leaves
+  discard with netd; successful binding transfers abandonment cleanup to the
+  kernel transfer-drop owner. See [Network Surface](policy-display.md#network-surface-netd).
 - Supervisor services draining independent brokers must use `SYS_RUSTOS_IPC_TRY_RECV`, not blocking `SYS_RUSTOS_IPC_RECV`. Their *idle* wait is `SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED`, not a timer; see the IPC Wait Discipline section.
 - FD-table transfer goes through `kernel_ps::api::TransferredHandleEntry::from_entry` + `HandleTable::install_transferred`. Source class + rights must permit descriptor transfer; directory FDs are file capabilities and transferable for VFS migration.
 - Userspace handle-aware IPC: `SYS_RUSTOS_IPC_{CALL,RECV,REPLY}_WITH_HANDLES` with `Ipc*WithHandlesArgs`. Send handles = Linux fd arrays; received handles install into receiver fd table and return as `i32` fd arrays + `u16` count. `recv_fd_count_ptr` mandatory even when no handles returned. Counts bounded by `IPC_MAX_TRANSFER_HANDLES`.
@@ -454,15 +447,19 @@ no cell/epoch state to refine.
   and every query uses the shorter of the remaining application deadline and
   16 ms. A timeout cannot restart the whole scan or hide readiness already
   found elsewhere.
-- Deferred VFS checkpoint/replay maintenance runs only in the nucleus
-  housekeeping task and consumes at most one bounded 100 ms control
-  transaction per yielded turn. It cannot drain a backlog in an eight-request
-  burst or synchronously chain a second checkpoint ACK; successful replay
-  enqueues that idempotent ACK for a later turn. No recovery wait is charged
-  to foreground I/O, and the deadline must exceed a normal SMP IPC round trip
-  so cancellation cannot amplify retries into revoked-reply queue pressure.
+- Deferred VFS checkpoint/replay maintenance and Ring3 provider cleanup run
+  only in the dedicated `nucleus_service_cleanup_task` (separate from
+  `nucleus_housekeeping_task`, which runs only pure non-blocking kernel
+  materialization/reaping so Ring3 service IPC can never deadlock thread
+  spawning or slot reclamation). Deferred replay consumes at most one bounded
+  100 ms control transaction per yielded turn. It cannot drain a backlog in an
+  eight-request burst or synchronously chain a second checkpoint ACK;
+  successful replay enqueues that idempotent ACK for a later turn. No recovery
+  wait is charged to foreground I/O, and the deadline must exceed a normal SMP
+  IPC round trip so cancellation cannot amplify retries into revoked-reply
+  queue pressure.
 - Deferred netd reference reconciliation follows the same one-attempt,
-  housekeeping-owned 100 ms control bound. A foreground netd DUP/final CLOSE
+  service-cleanup-owned 100 ms control bound. A foreground netd DUP/final CLOSE
   owns one complete 100 ms interactive-control deadline; only early transport
   failures may retry within its remaining time, never a real timeout. It
   defers the acknowledgement; exact operation replay and acknowledgement are

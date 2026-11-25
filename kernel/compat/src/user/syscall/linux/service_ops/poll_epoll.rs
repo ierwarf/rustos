@@ -942,18 +942,20 @@ fn remaining_timeval_from_ticks(
 }
 
 pub fn syscall_linux_ppoll(
+    frame: &mut SyscallFrame,
     fds_ptr: u64,
     nfds: u64,
     timeout_ptr: u64,
     sigmask_ptr: u64,
     sigset_size: u64,
 ) -> u64 {
-    linux_result((|| {
-        let timeout_ms = read_timespec_timeout_ms(timeout_ptr)?;
-        with_wait_signal_mask_result(sigmask_ptr, sigset_size, || {
-            poll_fds_timeout(fds_ptr, nfds, timeout_ms)
-        })
-    })())
+    let timeout_ms = match read_timespec_timeout_ms(timeout_ptr) {
+        Ok(timeout_ms) => timeout_ms,
+        Err(errno) => return complete_syscall_with_signals(frame, linux_errno(errno), None).0,
+    };
+    wait_under_signal_mask(frame, sigmask_ptr, sigset_size, || {
+        poll_fds_timeout(fds_ptr, nfds, timeout_ms)
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -999,6 +1001,7 @@ pub fn syscall_linux_select(
 
 /// Linux `pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask_arg)`.
 pub fn syscall_linux_pselect6(
+    frame: &mut SyscallFrame,
     nfds: u64,
     readfds_ptr: u64,
     writefds_ptr: u64,
@@ -1006,21 +1009,26 @@ pub fn syscall_linux_pselect6(
     timeout_ptr: u64,
     sigmask_arg_ptr: u64,
 ) -> u64 {
-    linux_result((|| {
+    let prepared = (|| {
         let (immediate, deadline_tick) = read_pselect6_timeout(timeout_ptr)?;
         let [ss_ptr, ss_len] =
             read_user_optional_struct::<[u64; 2]>(sigmask_arg_ptr)?.unwrap_or([0, 0]);
-        with_wait_signal_mask_result(ss_ptr, ss_len, || {
-            execute_select(
-                nfds,
-                readfds_ptr,
-                writefds_ptr,
-                exceptfds_ptr,
-                immediate,
-                deadline_tick,
-            )
-        })
-    })())
+        Ok::<_, i64>((immediate, deadline_tick, ss_ptr, ss_len))
+    })();
+    let (immediate, deadline_tick, ss_ptr, ss_len) = match prepared {
+        Ok(prepared) => prepared,
+        Err(errno) => return complete_syscall_with_signals(frame, linux_errno(errno), None).0,
+    };
+    wait_under_signal_mask(frame, ss_ptr, ss_len, || {
+        execute_select(
+            nfds,
+            readfds_ptr,
+            writefds_ptr,
+            exceptfds_ptr,
+            immediate,
+            deadline_tick,
+        )
+    })
 }
 
 fn execute_select(
@@ -1235,6 +1243,7 @@ fn collect_select_readiness(
 }
 
 pub fn syscall_linux_epoll_pwait(
+    frame: &mut SyscallFrame,
     epfd: u64,
     events_ptr: u64,
     maxevents: u64,
@@ -1242,14 +1251,20 @@ pub fn syscall_linux_epoll_pwait(
     sigmask_ptr: u64,
     sigset_size: u64,
 ) -> u64 {
-    with_temporary_wait_signal_mask(sigmask_ptr, sigset_size, || {
-        syscall_linux_epoll_wait(epfd, events_ptr, maxevents, timeout_ms)
+    wait_under_signal_mask(frame, sigmask_ptr, sigset_size, || {
+        let result = syscall_linux_epoll_wait(epfd, events_ptr, maxevents, timeout_ms);
+        if (result as i64) < 0 && (result as i64) >= -4095 {
+            Err(-(result as i64))
+        } else {
+            Ok(result)
+        }
     })
 }
 
 /// `epoll_pwait2`: `epoll_pwait` with a `timespec` timeout (`NULL` blocks).
 /// The timeout is rounded up to whole milliseconds, the resolution of the wait.
 pub fn syscall_linux_epoll_pwait2(
+    frame: &mut SyscallFrame,
     epfd: u64,
     events_ptr: u64,
     maxevents: u64,
@@ -1259,92 +1274,57 @@ pub fn syscall_linux_epoll_pwait2(
 ) -> u64 {
     let timeout_ms = match read_timespec_timeout_ms(timeout_ptr) {
         Ok(timeout_ms) => timeout_ms,
-        Err(errno) => return linux_errno(errno),
+        Err(errno) => return complete_syscall_with_signals(frame, linux_errno(errno), None).0,
     };
-    syscall_linux_epoll_pwait(epfd, events_ptr, maxevents, timeout_ms, sigmask_ptr, sigset_size)
+    syscall_linux_epoll_pwait(frame, epfd, events_ptr, maxevents, timeout_ms, sigmask_ptr, sigset_size)
 }
 
-struct WaitSignalMaskGuard {
-    previous: Option<u64>,
-}
-
-impl WaitSignalMaskGuard {
-    fn arm(sigmask_ptr: u64, sigset_size: u64) -> LinuxResult<Self> {
-        if sigmask_ptr == 0 {
-            return Ok(Self { previous: None });
-        }
-        if sigset_size != size_of::<u64>() as u64 {
-            return Err(LINUX_EINVAL);
-        }
-        let requested = sanitize_wait_signal_mask(read_user_struct::<u64>(sigmask_ptr)?);
-        let previous = multitask::with_current_user_process_and_linux_thread_state_mut(
-            |_, _, _, _, thread_state| {
-                thread_state.as_mut().map(|state| {
-                    let previous = state.signal_mask;
-                    state.signal_mask = requested;
-                    previous
-                })
-            },
-        )
-        .flatten()
-        .ok_or(LINUX_EINVAL)?;
-        Ok(Self {
-            previous: Some(previous),
-        })
-    }
-
-    fn restore(&mut self) -> LinuxResult<()> {
-        let Some(previous) = self.previous.take() else {
-            return Ok(());
-        };
-        let restored = multitask::with_current_user_process_and_linux_thread_state_mut(
-            |_, _, _, _, thread_state| {
-                thread_state
-                    .as_mut()
-                    .map(|state| state.signal_mask = previous)
-            },
-        )
-        .flatten()
-        .is_some();
-        if restored {
-            Ok(())
-        } else {
-            Err(LINUX_EINVAL)
-        }
-    }
-}
-
-impl Drop for WaitSignalMaskGuard {
-    fn drop(&mut self) {
-        let _ = self.restore();
-    }
-}
-
-fn with_wait_signal_mask_result(
+/// Runs `wait` as Linux's `ppoll`/`pselect6`/`epoll_pwait*` do: the temporary
+/// mask replaces the thread's mask for the wait only, in procd's policy copy
+/// as well as the ring0 one (procd selects the deliverable signal from its own
+/// mask, so changing only the ring0 copy would never wake the wait for a
+/// signal the temporary mask unblocks). A wait that ends with `EINTR` delivers
+/// its signal while the temporary mask is still in force and saves the
+/// original mask in the signal frame, so the handler's return restores it;
+/// every other outcome restores the original mask first.
+fn wait_under_signal_mask(
+    frame: &mut SyscallFrame,
     sigmask_ptr: u64,
     sigset_size: u64,
     wait: impl FnOnce() -> LinuxResult<u64>,
-) -> LinuxResult<u64> {
-    let mut guard = WaitSignalMaskGuard::arm(sigmask_ptr, sigset_size)?;
-    let result = wait();
-    guard.restore()?;
-    result
+) -> u64 {
+    let original = match arm_wait_signal_mask(sigmask_ptr, sigset_size) {
+        Ok(original) => original,
+        Err(errno) => return complete_syscall_with_signals(frame, linux_errno(errno), None).0,
+    };
+    let result = linux_result(wait());
+    let Some(original) = original else {
+        return complete_syscall_with_signals(frame, result, None).0;
+    };
+    if result != linux_errno(LINUX_EINTR) {
+        restore_wait_signal_mask(original, false);
+        return complete_syscall_with_signals(frame, result, None).0;
+    }
+    let (returned, delivered) = complete_syscall_with_signals(frame, result, Some(original));
+    restore_wait_signal_mask(original, delivered);
+    returned
 }
 
-fn with_temporary_wait_signal_mask(
-    sigmask_ptr: u64,
-    sigset_size: u64,
-    wait: impl FnOnce() -> u64,
-) -> u64 {
-    let mut guard = match WaitSignalMaskGuard::arm(sigmask_ptr, sigset_size) {
-        Ok(guard) => guard,
-        Err(errno) => return linux_errno(errno),
-    };
-    let result = wait();
-    match guard.restore() {
-        Ok(()) => result,
-        Err(errno) => linux_errno(errno),
+/// Installs the temporary mask; returns the mask to restore, or `None` when
+/// the caller passed no mask.
+fn arm_wait_signal_mask(sigmask_ptr: u64, sigset_size: u64) -> LinuxResult<Option<u64>> {
+    if sigmask_ptr == 0 {
+        return Ok(None);
     }
+    if sigset_size != size_of::<u64>() as u64 {
+        return Err(LINUX_EINVAL);
+    }
+    let requested = sanitize_wait_signal_mask(read_user_struct::<u64>(sigmask_ptr)?);
+    process_time::swap_signal_mask(requested).map(Some)
+}
+
+fn restore_wait_signal_mask(original: u64, handler_installed: bool) {
+    process_time::restore_signal_mask_after_wait(original, handler_installed);
 }
 
 fn sanitize_wait_signal_mask(mask: u64) -> u64 {

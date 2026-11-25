@@ -128,6 +128,10 @@ raw_u64! {
     SYS_GETEGID = linux::__NR_getegid;
     SYS_SETUID = linux::__NR_setuid;
     SYS_SETGID = linux::__NR_setgid;
+    SYS_SETREUID = linux::__NR_setreuid;
+    SYS_SETREGID = linux::__NR_setregid;
+    SYS_SETRESUID = linux::__NR_setresuid;
+    SYS_SETRESGID = linux::__NR_setresgid;
     SYS_SIGALTSTACK = linux::__NR_sigaltstack;
     SYS_ARCH_PRCTL = linux::__NR_arch_prctl;
     SYS_PRCTL = linux::__NR_prctl;
@@ -195,6 +199,9 @@ raw_u64! {
     SYS_UMOUNT2 = linux::__NR_umount2;
     SYS_READLINKAT = linux::__NR_readlinkat;
     SYS_FACCESSAT = linux::__NR_faccessat;
+    SYS_FACCESSAT2 = linux::__NR_faccessat2;
+    SYS_EPOLL_CREATE = linux::__NR_epoll_create;
+    SYS_GETPGRP = linux::__NR_getpgrp;
     SYS_SET_ROBUST_LIST = linux::__NR_set_robust_list;
     SYS_GET_ROBUST_LIST = linux::__NR_get_robust_list;
     SYS_DUP3 = linux::__NR_dup3;
@@ -498,6 +505,7 @@ raw_u32! {
     FUTEX_BITSET_MATCH_ANY = linux::FUTEX_BITSET_MATCH_ANY;
     SS_ONSTACK = linux::SS_ONSTACK;
     SS_DISABLE = linux::SS_DISABLE;
+    SS_AUTODISARM = linux::SS_AUTODISARM;
     S_IFCHR = linux::S_IFCHR;
     S_IFDIR = linux::S_IFDIR;
     S_IFREG = linux::S_IFREG;

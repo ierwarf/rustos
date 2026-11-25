@@ -1,6 +1,6 @@
 # Google Chrome — local import
 
-[English](#english) | [한국어](#korean)
+[English](#english) | [한국어](#한국어)
 
 ## English
 

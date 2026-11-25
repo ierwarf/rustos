@@ -20,23 +20,11 @@ registry observation, never a service call. This is mechanical
 authority/lifetime coupling, not Ring0 network policy. Runtime
 session grant/revoke remains inputd/netd policy and keeps its capability gate.
 
-Routed Linux ops after bootstrap: `socket`, `socketpair`, socket `dup`/`dup2`/`dup3`, socket `close`, socket `read`/`write`/`writev`, `bind`, `listen`, `accept`/`accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt`, `shutdown`.
+Routed Linux ops after bootstrap (for `AF_INET`, `AF_INET6`, and `AF_NETLINK` sockets; `AF_UNIX` and `socketpair(AF_UNIX, ...)` are kernel-local `UnixSocketHandle` objects — see [local-fd.md](local-fd.md)): `socket`, socket `dup`/`dup2`/`dup3`, socket `close`, socket `read`/`write`/`writev`, `bind`, `listen`, `accept`/`accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt`, `shutdown`.
 
-netd invokes gated `SYS_RUSTOS_NET_BROKER` with target pid. Net broker arg struct carries six 64-bit syscall arg slots. Kernel performs handle install and target user-memory validation/copy; AF_UNIX socket lifecycle, binding/listen queues, byte queues, and socket option policy belong to netd. Version-8 `NetdIpcRequest`/`Response` frames copy an exact 136/32-byte header plus only the actual bounded payload, rather than a fixed maximum-size buffer. Request offset 112 carries a mandatory nonzero absolute `CLOCK_MONOTONIC` deadline; the frames also carry `socket_token`, fd `status_flags`, and a bounded inline payload for this service-owned socket path.
+netd invokes gated `SYS_RUSTOS_NET_BROKER` with target pid. Net broker arg struct carries six 64-bit syscall arg slots. Kernel performs handle install and target user-memory validation/copy; `AF_INET`/`AF_INET6` TCP/UDP/ICMP and `AF_NETLINK` (`NETLINK_ROUTE`, `NETLINK_KOBJECT_UEVENT` including `SO_ATTACH_FILTER`) lifecycle, queues, and socket option policy belong to netd. `netd` rejects `AF_UNIX` and `socketpair`. Version-8 `NetdIpcRequest`/`Response` frames copy an exact 136/32-byte header plus only the actual bounded payload, rather than a fixed maximum-size buffer. Request offset 112 carries a mandatory nonzero absolute `CLOCK_MONOTONIC` deadline; the frames also carry `socket_token`, fd `status_flags`, and a bounded inline payload for this service-owned socket path.
 
-For AF_UNIX stream sends, even a zero-byte send validates both socket
-identities and their connection/shutdown state before returning success.
-A missing sender returns EBADF and a closed peer is not silently accepted;
-a valid empty stream send queues no segment or ancillary custody.
-SOCK_SEQPACKET empty messages retain their message boundaries and are queued.
-
-Pathname AF_UNIX bind/connect delegates the kernel-attested effective uid/gid
-and caller pid to vfsd for traversal and cwd resolution. Bind creates a socket
-inode with the caller's umask; connect checks write permission against the
-returned socket owner, group and mode (root bypasses write checks), then uses
-mount/inode identity to locate the listener. Failed publication rolls back only
-the created inode using the same credentials. Abstract names bypass vfsd.
-Supplementary groups are not represented by the current credential ABI.
+Note: `AF_UNIX` stream, seqpacket, and datagram sockets (including `SCM_RIGHTS` and pathname bindings) now live in Ring0 (`kernel/ps/src/user/unix_socket.rs`, billed to the client Job via `page_lease.rs`); see [local-fd.md](local-fd.md) and [ipc.md](ipc.md). Pathname `AF_UNIX` bind/connect delegates traversal/inode creation to `vfsd` with caller credentials (`VFS_IPC_OP_MKNOD` / `STAT` / `UNLINKAT`); abstract names stay kernel-local.
 
 The producer fixes that transaction end before payload preparation and reuses
 it for every foreground retry. The kernel reply wait floors the same monotonic
@@ -64,20 +52,20 @@ timeout cannot bound service-side resource ownership. See the official
 [QNX message-passing documentation](https://qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.sys_arch/topic/ipc.html).
 
 Four fixed netd request receivers prevent an unrelated caller from serializing
-all local AF_UNIX work. Blocking INET connect/send/recv waits run in a separate
+all local netd work. Blocking INET connect/send/recv waits run in a separate
 fixed eight-worker pool that releases the shared network-state lock between
 polls (retry delay doubles 1/2/4 ms per attempt); there is no thread-per-request
-fallback. Every `socket`, `socketpair`, and `accept` request travels with its
+fallback. Every `socket` and `accept` request travels with its
 reply capability to a dedicated two-worker lifecycle pool (16 pending,
-including executing work). This includes AF_UNIX and active/unavailable INET
+including executing work) for active/unavailable INET/NETLINK
 providers: rootd CHARGE can block independently of packet-provider readiness.
 The same pool owns the authenticated DVM-provider wait; bulk receives cannot
 consume its workers. Full/unavailable admission returns `EAGAIN` before charge;
 expired queued work replies once without entering the provider. Lifecycle work
 is dispatched once, never retried as a new socket on `EAGAIN`. Netd
 sources are split by responsibility (`service_loop`, `dispatch`, `blocking`,
-`local_poll`, `ref_replay`, `socket_lifecycle`, `unix_stream`, `inet_tcp`,
-`inet_stack`, `poll`, `socket_info`, `packet_provider`, `readiness`); shared
+`local_poll`, `ref_replay`, `socket_lifecycle`, `inet_tcp`,
+`inet_stack`, `netlink`, `poll`, `socket_info`, `packet_provider`, `readiness`); shared
 state types live in `main.rs`.
 
 Every pending-request pool (blocking INET, lifecycle, deferred local poll) also
@@ -165,23 +153,17 @@ unlock; strictly-newer generation matching tolerates out-of-order signals
 from concurrent publishers. This lets new external packets wake an already
 sleeping generic wait without moving network policy into ring0.
 
-This removes avoidable copies and waits, but standard AF_UNIX data still makes
-a synchronous compat-to-netd service round trip for every send/receive. The
-current WayClick KVM gate nevertheless proves this standard path sustains the
-55 FPS contract without a client-specific route. Its first accepted three
-windows matched 57, 65, and 68 commit/callback/release cycles over 3.060
-seconds (62.092 FPS aggregate) with a 45 ms maximum callback gap. The generic
-wait-set gives ordinary Linux applications a bounded aggregate wait over
-vfsd-owned interests backed by netd/inputd readiness generations, exact
-provider epochs, and monotonic
-deadlines. It deliberately leaves socket data and namespace/options policy in
-netd and does not add a WayClick-specific route. Wayland-server's existing
-backend epoll fd aggregates the changing client set; uiserver duplicates that
-open description into a demoted readiness worker, merges its single-capacity
-wake with the input reader's wake, and rearms only after main-loop dispatch. A
-client commit can therefore wake the main loop before its runtime deadline.
-Runtime/QEMU evidence remains a release gate; source/model completion alone
-does not satisfy the 55 FPS gate.
+The generic wait-set gives ordinary Linux applications a bounded aggregate wait
+over Ring0-owned `EpollHandle` interests (backed by local-fd readiness tokens
+plus netd/inputd/sessiond/vfsd readiness generations, exact provider epochs,
+and monotonic deadlines). It deliberately leaves INET/NETLINK socket data and
+namespace/options policy in netd and does not add a WayClick-specific route.
+Wayland-server's existing backend epoll fd aggregates the changing client set;
+uiserver duplicates that open description into a demoted readiness worker,
+merges its single-capacity wake with the input reader's wake, and rearms only
+after main-loop dispatch. A client commit can therefore wake the main loop
+before its runtime deadline. Runtime/QEMU evidence remains a release gate;
+source/model completion alone does not satisfy the 55 FPS gate.
 
 ### TCP connect and pending errors
 
@@ -268,7 +250,7 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
 
 ## Syscalld Residual Surface
 
-- Per-process credentials + `RLIMIT_STACK` policy DB: source of truth for Linux-visible `get*id`, `set*id`, `prlimit64`. Kernel process credentials = gated bootstrap/security primitive; **must not** be mutated by Linux `set*id`.
+- Per-process credentials + 10-resource `prlimit64` policy DB (`RLIMIT_STACK`, `RLIMIT_NOFILE`, `RLIMIT_AS`, `RLIMIT_DATA`, `RLIMIT_CORE`, `RLIMIT_NPROC`, `RLIMIT_MEMLOCK`, `RLIMIT_FSIZE`, `RLIMIT_CPU`, `RLIMIT_LOCKS`): source of truth for Linux-visible `get*id`, `set*id` (including `setres[ug]id` / `setre[ug]id`), `prlimit64`. Kernel process credentials = gated bootstrap/security primitive; **must not** be mutated by Linux `set*id`.
 - Linux `nanosleep`, `clock_gettime`, and `clock_nanosleep` use local
   fixed-envelope validation in compat's timer substrate, not syscalld policy
   IPC or per-process cached grants. Clock IDs, timespec bounds, and

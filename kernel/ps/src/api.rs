@@ -142,8 +142,9 @@ pub fn request_deferred_reschedule() {
 }
 
 pub use crate::multitask::{
-    housekeeping_kicked, kick_housekeeping, register_housekeeping_task, take_housekeeping_kick,
-    task_slot_available,
+    housekeeping_kicked, kick_housekeeping, register_housekeeping_task,
+    register_service_cleanup_task, service_cleanup_kicked, take_housekeeping_kick,
+    take_service_cleanup_kick, task_slot_available,
 };
 pub use crate::multitask::{register_child_waiter, unregister_child_waiter, wake_child_waiters};
 pub use crate::multitask::{

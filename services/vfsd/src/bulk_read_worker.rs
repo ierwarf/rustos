@@ -1,26 +1,30 @@
-//! Transient bulk-read workers for `VFS_IPC_OP_BULK_READ`.
+//! Cached idle-retiring bulk-read workers for `VFS_IPC_OP_BULK_READ`.
 //!
 //! - **Owner:** `vfsd` owns the worker slots, static stacks, and private memfd
 //!   creation/sealing; the caller (`mm_broker_ops`) receives ownership of the
 //!   sealed memfd through handle-transfer reply.
 //! - **Boundary:** Requests are validated and planned on the receive owner
-//!   before a transient worker is spawned; workers never touch `VfsState`
-//!   descriptor tables and never call `syscalld`.
-//! - **Lifecycle:** One worker thread is cloned onto a claimed static stack for
-//!   one bulk read, streams file bytes into a sealed memfd, replies directly to
-//!   `reply_cap`, drops all heap state, and atomically releases its stack slot
-//!   before `SYS_EXIT`. Zero resident threads are kept when idle.
-//! - **Concurrency:** At most `BULK_READ_WORKERS` (2) transient workers run at
-//!   once. Mapped DVM/FAT reads release `VFS_STORAGE` before every device read
-//!   so `open`/`stat` never wait behind multi-megabyte transfers.
+//!   before dispatch; workers never touch `VfsState` descriptor tables and
+//!   never call `syscalld`.
+//! - **Lifecycle:** At most `BULK_READ_WORKERS` (2) workers are cloned lazily
+//!   onto static stacks. After completing a job and dropping all heap state, a
+//!   worker parks in `STATE_IDLE` on a private futex for up to
+//!   `WORKER_IDLE_RETIRE_NS` (2 s) so bursty library/file mappings reuse warm
+//!   threads with zero `SYS_CLONE` churn. When idle past the grace window, the
+//!   worker claims `STATE_IDLE -> STATE_EXITING` and atomically releases its
+//!   stack slot to `STATE_EMPTY` before `SYS_EXIT`, keeping zero resident
+//!   threads at rest (preserving application launch task-slot headroom).
+//! - **Concurrency:** At most `BULK_READ_WORKERS` (2) workers run at once.
+//!   Mapped DVM/FAT reads release `VFS_STORAGE` before every device read so
+//!   `open`/`stat` never wait behind multi-megabyte transfers.
 //! - **Failure:** Slot saturation or `clone` failure returns `EAGAIN` on the
 //!   receive thread so callers fall back to `PREAD64`. Mid-transfer remounts,
 //!   OOM, or I/O errors close the private memfd and reply with the exact errno.
-//! - **Forbidden:** No resident threads, no `syscalld` IPC, no holding
-//!   `VFS_STORAGE` across device I/O, and no stack use after releasing the
-//!   stack slot.
-//! - **Evidence:** `vfsd` unit tests for request bounds/proxy admission and
-//!   `mm_broker_ops` bulk-read integration.
+//! - **Forbidden:** No permanent resident threads at idle, no `syscalld` IPC,
+//!   no holding `VFS_STORAGE` across device I/O, and no stack use after
+//!   releasing the stack slot.
+//! - **Evidence:** `vfsd` unit tests for slot state-machine transitions and
+//!   request bounds/proxy admission, plus `mm_broker_ops` bulk-read integration.
 
 use alloc::boxed::Box;
 use alloc::ffi::CString;
@@ -44,7 +48,7 @@ use super::{
     ENOMEM, EOVERFLOW,
 };
 
-/// Maximum concurrent transient bulk-read workers (zero resident when idle).
+/// Maximum concurrent bulk-read workers (zero resident once idle past grace).
 const BULK_READ_WORKERS: usize = 2;
 const BULK_READ_STACK_BYTES: usize = 128 * 1024;
 /// Transfer window for detached DVM/FAT and early-system reads (512 KiB so
@@ -52,23 +56,112 @@ const BULK_READ_STACK_BYTES: usize = 128 * 1024;
 const BULK_READ_WINDOW_BYTES: usize = 512 * 1024;
 /// Bounded per-lock chunk for sources that briefly acquire `VFS_STORAGE`.
 const BULK_READ_LOCKED_CHUNK_BYTES: usize = 128 * 1024;
+/// How long an idle worker stays parked for warm reuse before exiting cleanly.
+#[cfg(not(test))]
+const WORKER_IDLE_RETIRE_NS: u64 = 2_000_000_000;
+/// Bounded futex wait slice so the idle timer stays responsive.
+#[cfg(not(test))]
+const IDLE_FUTEX_STEP_NS: u64 = 250_000_000;
 
-const STACK_FREE: u32 = 0;
-const STACK_BUSY: u32 = 1;
+const STATE_EMPTY: u32 = 0;
+const STATE_STARTING: u32 = 1;
+const STATE_READY: u32 = 2;
+const STATE_RUNNING: u32 = 3;
+const STATE_IDLE: u32 = 4;
+const STATE_WRITING: u32 = 5;
+const STATE_EXITING: u32 = 6;
+
+/// Lock-free ownership gate for one bulk-read worker slot and its static stack.
+struct BulkReadSlotState(AtomicU32);
+
+impl BulkReadSlotState {
+    const fn new() -> Self {
+        Self(AtomicU32::new(STATE_EMPTY))
+    }
+
+    fn try_claim_idle(&self) -> bool {
+        // ORDERING: AcqRel acquires the worker's completed job drop before the
+        // producer writes the next job into the slot.
+        self.0
+            .compare_exchange(
+                STATE_IDLE,
+                STATE_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn publish_ready(&self) {
+        // ORDERING: Release publishes the initialized job to the parked worker.
+        self.0.store(STATE_READY, Ordering::Release);
+    }
+
+    fn try_claim_empty(&self) -> bool {
+        // ORDERING: AcqRel pairs with `exit_releasing_stack`'s store of
+        // `STATE_EMPTY` so the stack is completely unused before cloning.
+        self.0
+            .compare_exchange(
+                STATE_EMPTY,
+                STATE_STARTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn abort_starting(&self) {
+        // ORDERING: Release returns the unused stack slot after clone failure.
+        self.0.store(STATE_EMPTY, Ordering::Release);
+    }
+
+    fn mark_running(&self) {
+        // ORDERING: Release marks the job claimed and running.
+        self.0.store(STATE_RUNNING, Ordering::Release);
+    }
+
+    fn park_idle(&self) {
+        // ORDERING: Release publishes completion/drop of the prior job before
+        // allowing a producer to claim `STATE_IDLE -> STATE_WRITING`.
+        self.0.store(STATE_IDLE, Ordering::Release);
+    }
+
+    fn load(&self) -> u32 {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn try_begin_exit(&self) -> bool {
+        // ORDERING: AcqRel arbitrates exclusively against `try_claim_idle`.
+        self.0
+            .compare_exchange(
+                STATE_IDLE,
+                STATE_EXITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[cfg(not(test))]
+    fn as_atomic(&self) -> &AtomicU32 {
+        &self.0
+    }
+}
 
 #[repr(C, align(16))]
 struct BulkReadStack([u8; BULK_READ_STACK_BYTES]);
 
 struct BulkReadJobSlot(UnsafeCell<MaybeUninit<BulkReadJob>>);
 
-// SAFETY: `BULK_READ_STACK_STATE[i]` is the sole ownership gate for slot `i`.
-// The receive owner writes the job only after winning `STACK_FREE -> STACK_BUSY`
-// and before cloning the worker; the sole worker takes the job, drops it before
-// releasing the stack back to `STACK_FREE`.
+// SAFETY: `BULK_READ_SLOT_STATE[i]` is the sole ownership gate for slot `i`.
+// The receive owner writes `BULK_READ_JOBS[i]` only while holding exclusive
+// `STATE_STARTING` or `STATE_WRITING` ownership, and the sole worker on stack
+// `i` reads it only from `STATE_STARTING`/`STATE_READY` and drops it before
+// publishing `STATE_IDLE` or releasing to `STATE_EMPTY`.
 unsafe impl Sync for BulkReadJobSlot {}
 
-static BULK_READ_STACK_STATE: [AtomicU32; BULK_READ_WORKERS] =
-    [const { AtomicU32::new(STACK_FREE) }; BULK_READ_WORKERS];
+static BULK_READ_SLOT_STATE: [BulkReadSlotState; BULK_READ_WORKERS] =
+    [const { BulkReadSlotState::new() }; BULK_READ_WORKERS];
 static BULK_READ_JOBS: [BulkReadJobSlot; BULK_READ_WORKERS] =
     [const { BulkReadJobSlot(UnsafeCell::new(MaybeUninit::uninit())) }; BULK_READ_WORKERS];
 #[cfg(not(test))]
@@ -164,25 +257,39 @@ fn reply_bulk_read_memfd(reply_cap: u64, fd: i32, bytes_read: u64, file_len: u64
     }
 }
 
-/// Offloads a planned bulk read to a transient worker thread.
+/// Offloads a planned bulk read to a cached idle worker, or lazily clones a
+/// worker onto an empty slot if none are currently parked.
 ///
-/// If all worker slots are busy or the kernel task table cannot admit a
-/// transient thread right now, replies immediately with `EAGAIN` on the
-/// receive thread so the caller falls back cleanly to `PREAD64`.
+/// If all worker slots are busy or the kernel task table cannot admit a new
+/// worker right now, replies immediately with `EAGAIN` on the receive thread
+/// so the caller falls back cleanly to `PREAD64`.
 #[cfg(not(test))]
 pub(super) fn enqueue_bulk_read(job: BulkReadJob) -> i64 {
     let reply_cap = job.reply_cap;
-    let Some(index) = BULK_READ_STACK_STATE.iter().position(|state| {
-        // ORDERING: AcqRel claims exclusive ownership of slot `index` and its
-        // static stack, pairing with the exiting worker's release store.
-        state
-            .compare_exchange(STACK_FREE, STACK_BUSY, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }) else {
+    // Fast path: reuse an already-running parked worker with zero `SYS_CLONE`.
+    if let Some(index) = BULK_READ_SLOT_STATE
+        .iter()
+        .position(BulkReadSlotState::try_claim_idle)
+    {
+        // SAFETY: winning `STATE_IDLE -> STATE_WRITING` makes this thread the
+        // sole owner of `BULK_READ_JOBS[index]` until `publish_ready()`.
+        unsafe {
+            (*BULK_READ_JOBS[index].0.get()).write(job);
+        }
+        BULK_READ_SLOT_STATE[index].publish_ready();
+        futex_wake_slot(BULK_READ_SLOT_STATE[index].as_atomic());
+        return 0;
+    }
+
+    // Cold path: claim an empty stack slot and clone one worker.
+    let Some(index) = BULK_READ_SLOT_STATE
+        .iter()
+        .position(BulkReadSlotState::try_claim_empty)
+    else {
         return reply_bulk_read_status(reply_cap, EAGAIN, 0, 0);
     };
-    // SAFETY: winning `STACK_FREE -> STACK_BUSY` makes this thread the sole
-    // owner of `BULK_READ_JOBS[index]` until the cloned worker starts.
+    // SAFETY: winning `STATE_EMPTY -> STATE_STARTING` makes this thread the
+    // sole owner of `BULK_READ_JOBS[index]` until the cloned worker starts.
     unsafe {
         (*BULK_READ_JOBS[index].0.get()).write(job);
     }
@@ -198,11 +305,47 @@ pub(super) fn enqueue_bulk_read(job: BulkReadJob) -> i64 {
         // exclusively owns the initialized job in `BULK_READ_JOBS[index]`.
         let dropped = unsafe { (*BULK_READ_JOBS[index].0.get()).assume_init_read() };
         drop(dropped);
-        // ORDERING: Release returns the unused stack slot to future callers.
-        BULK_READ_STACK_STATE[index].store(STACK_FREE, Ordering::Release);
+        BULK_READ_SLOT_STATE[index].abort_starting();
         return reply_bulk_read_status(reply_cap, EAGAIN, 0, 0);
     }
     0
+}
+
+#[cfg(not(test))]
+fn futex_wait_slot(state: &AtomicU32, expected: u32, timeout_ns: u64) -> i64 {
+    let timeout = linux_abi::LinuxTimespec {
+        tv_sec: (timeout_ns / 1_000_000_000) as i64,
+        tv_nsec: (timeout_ns % 1_000_000_000) as i64,
+    };
+    // SAFETY: `state` is static shared process memory and `timeout` stays live
+    // for the synchronous kernel futex wait.
+    unsafe {
+        rustos_svc_runtime::syscall::syscall6(
+            linux_abi::SYS_FUTEX,
+            state.as_ptr() as u64,
+            (linux_abi::FUTEX_WAIT | linux_abi::FUTEX_PRIVATE_FLAG) as u64,
+            u64::from(expected),
+            (&timeout as *const linux_abi::LinuxTimespec) as u64,
+            0,
+            0,
+        )
+    }
+}
+
+#[cfg(not(test))]
+fn futex_wake_slot(state: &AtomicU32) {
+    // SAFETY: `state` is static shared process memory.
+    let _ = unsafe {
+        rustos_svc_runtime::syscall::syscall6(
+            linux_abi::SYS_FUTEX,
+            state.as_ptr() as u64,
+            (linux_abi::FUTEX_WAKE | linux_abi::FUTEX_PRIVATE_FLAG) as u64,
+            1,
+            0,
+            0,
+            0,
+        )
+    };
 }
 
 #[cfg(test)]
@@ -540,8 +683,8 @@ fn current_bulk_read_index() -> usize {
     (sp - base - 1) / BULK_READ_STACK_BYTES
 }
 
-/// Releases the static stack slot and terminates this transient worker in one
-/// asm block with no stack access in between, matching `bulk_lanes::exit_releasing_stack`.
+/// Releases the static stack slot and terminates this worker in one asm block
+/// with no stack access in between, matching `bulk_lanes::exit_releasing_stack`.
 #[cfg(not(test))]
 fn exit_releasing_stack(state: &AtomicU32) -> ! {
     // SAFETY: `state` is a static `AtomicU32`; on x86-64 a 32-bit store has
@@ -552,7 +695,7 @@ fn exit_releasing_stack(state: &AtomicU32) -> ! {
             "mov dword ptr [{state}], {free}",
             "syscall",
             state = in(reg) state.as_ptr(),
-            free = const STACK_FREE,
+            free = const STATE_EMPTY,
             in("rax") linux_abi::SYS_EXIT,
             in("rdi") 0_u64,
             options(noreturn),
@@ -563,12 +706,107 @@ fn exit_releasing_stack(state: &AtomicU32) -> ! {
 #[cfg(not(test))]
 extern "C" fn bulk_read_worker_entry() -> ! {
     let index = current_bulk_read_index();
-    {
-        // SAFETY: the receive owner wrote `BULK_READ_JOBS[index]` before
-        // cloning this thread onto stack `index`, so this worker is the sole
-        // consumer of the initialized job.
-        let job = unsafe { (*BULK_READ_JOBS[index].0.get()).assume_init_read() };
-        run_bulk_read_job(job);
+    let slot = &BULK_READ_SLOT_STATE[index];
+    slot.mark_running();
+    loop {
+        {
+            // SAFETY: either the initial `STATE_STARTING` clone or a warm
+            // `STATE_WRITING -> STATE_READY` publish handed exclusive ownership
+            // of the initialized job in `BULK_READ_JOBS[index]` to this worker.
+            let job = unsafe { (*BULK_READ_JOBS[index].0.get()).assume_init_read() };
+            run_bulk_read_job(job);
+        }
+        slot.park_idle();
+        let idle_deadline =
+            rustos_svc_runtime::syscall::monotonic_nanos().saturating_add(WORKER_IDLE_RETIRE_NS);
+        loop {
+            match slot.load() {
+                STATE_READY => {
+                    slot.mark_running();
+                    break;
+                }
+                STATE_WRITING => {
+                    // Producer won `STATE_IDLE -> STATE_WRITING` and is copying
+                    // the next `BulkReadJob` into the slot.
+                    core::hint::spin_loop();
+                }
+                STATE_IDLE => {
+                    let now = rustos_svc_runtime::syscall::monotonic_nanos();
+                    if now >= idle_deadline {
+                        if slot.try_begin_exit() {
+                            exit_releasing_stack(slot.as_atomic());
+                        }
+                        continue;
+                    }
+                    let wait_ns = (idle_deadline - now).min(IDLE_FUTEX_STEP_NS);
+                    let status = futex_wait_slot(slot.as_atomic(), STATE_IDLE, wait_ns);
+                    // 0 (woken), -11 (EAGAIN), -4 (EINTR), -110 (ETIMEDOUT) are
+                    // normal; any unsupported futex failure retires cleanly.
+                    if !matches!(status, 0 | -11 | -4 | -110) && slot.try_begin_exit() {
+                        exit_releasing_stack(slot.as_atomic());
+                    }
+                }
+                _ => {
+                    // Unexpected state: never spin forever; retire if idle.
+                    if slot.try_begin_exit() {
+                        exit_releasing_stack(slot.as_atomic());
+                    }
+                    core::hint::spin_loop();
+                }
+            }
+        }
     }
-    exit_releasing_stack(&BULK_READ_STACK_STATE[index])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BulkReadSlotState, STATE_EMPTY, STATE_EXITING, STATE_IDLE, STATE_READY, STATE_RUNNING,
+        STATE_STARTING, STATE_WRITING,
+    };
+
+    #[test]
+    fn slot_state_supports_cold_start_warm_reuse_and_idle_retirement() {
+        let slot = BulkReadSlotState::new();
+        assert_eq!(slot.load(), STATE_EMPTY);
+
+        // Cold start: EMPTY -> STARTING -> RUNNING -> IDLE.
+        assert!(!slot.try_claim_idle());
+        assert!(slot.try_claim_empty());
+        assert_eq!(slot.load(), STATE_STARTING);
+        assert!(!slot.try_claim_empty());
+        slot.mark_running();
+        assert_eq!(slot.load(), STATE_RUNNING);
+        slot.park_idle();
+        assert_eq!(slot.load(), STATE_IDLE);
+
+        // Warm reuse: IDLE -> WRITING -> READY -> RUNNING -> IDLE.
+        assert!(slot.try_claim_idle());
+        assert_eq!(slot.load(), STATE_WRITING);
+        assert!(!slot.try_begin_exit());
+        assert!(!slot.try_claim_idle());
+        slot.publish_ready();
+        assert_eq!(slot.load(), STATE_READY);
+        assert!(!slot.try_begin_exit());
+        slot.mark_running();
+        assert_eq!(slot.load(), STATE_RUNNING);
+        slot.park_idle();
+        assert_eq!(slot.load(), STATE_IDLE);
+
+        // Idle retirement: IDLE -> EXITING blocks concurrent producer claim.
+        assert!(slot.try_begin_exit());
+        assert_eq!(slot.load(), STATE_EXITING);
+        assert!(!slot.try_claim_idle());
+        assert!(!slot.try_claim_empty());
+    }
+
+    #[test]
+    fn slot_state_clone_abort_returns_to_empty() {
+        let slot = BulkReadSlotState::new();
+        assert!(slot.try_claim_empty());
+        assert_eq!(slot.load(), STATE_STARTING);
+        slot.abort_starting();
+        assert_eq!(slot.load(), STATE_EMPTY);
+        assert!(slot.try_claim_empty());
+    }
 }

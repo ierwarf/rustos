@@ -113,6 +113,8 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_SCHED_SETAFFINITY, SYSCALL_OFFLOAD_OP_LINUX_SENDMSG,
     SYSCALL_OFFLOAD_OP_LINUX_SENDTO, SYSCALL_OFFLOAD_OP_LINUX_SETGID,
     SYSCALL_OFFLOAD_OP_LINUX_SETPGID, SYSCALL_OFFLOAD_OP_LINUX_SETPRIORITY,
+    SYSCALL_OFFLOAD_OP_LINUX_SETREGID, SYSCALL_OFFLOAD_OP_LINUX_SETREUID,
+    SYSCALL_OFFLOAD_OP_LINUX_SETRESGID, SYSCALL_OFFLOAD_OP_LINUX_SETRESUID,
     SYSCALL_OFFLOAD_OP_LINUX_SETSID,
     SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT, SYSCALL_OFFLOAD_OP_LINUX_SETUID,
     SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN,
@@ -177,11 +179,12 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
     int_args::normalize_linux_int_fd_args(frame);
     debug_log_secondary_linux_syscall(frame);
 
-    if frame.rax != linux_abi::SYS_RT_SIGRETURN && deliver_pending_signals_if_needed(frame) {
+    let syscall_nr = frame.rax;
+    if syscall_nr != linux_abi::SYS_RT_SIGRETURN && deliver_pending_signals_if_needed(frame) {
         return frame.rax;
     }
 
-    let result = match frame.rax {
+    let result = match syscall_nr {
         linux_abi::SYS_READ => syscall_linux_vfs_read(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_WRITE => syscall_linux_vfs_write(frame.rdi, frame.rsi, frame.rdx),
         linux_abi::SYS_UNLINK => {
@@ -315,25 +318,27 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         ),
         linux_abi::SYS_POLL => syscall_linux_poll(frame.rdi, frame.rsi, frame.rdx as i32 as i64),
         linux_abi::SYS_PPOLL => {
-            syscall_linux_ppoll(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
+            let (fds, nfds, timeout, mask, size) =
+                (frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
+            syscall_linux_ppoll(frame, fds, nfds, timeout, mask, size)
         }
         linux_abi::SYS_SELECT => {
             syscall_linux_select(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
         }
-        linux_abi::SYS_PSELECT6 => syscall_linux_pselect6(
-            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
-        ),
+        linux_abi::SYS_PSELECT6 => {
+            let (nfds, rd, wr, ex, timeout, mask) =
+                (frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9);
+            syscall_linux_pselect6(frame, nfds, rd, wr, ex, timeout, mask)
+        }
         linux_abi::SYS_EPOLL_WAIT => {
             syscall_linux_epoll_wait(frame.rdi, frame.rsi, frame.rdx, frame.r10 as i32 as i64)
         }
-        linux_abi::SYS_EPOLL_PWAIT => syscall_linux_epoll_pwait(
-            frame.rdi,
-            frame.rsi,
-            frame.rdx,
-            frame.r10 as i32 as i64,
-            frame.r8,
-            frame.r9,
-        ),
+        linux_abi::SYS_EPOLL_PWAIT => {
+            let (epfd, events, max, mask, size) =
+                (frame.rdi, frame.rsi, frame.rdx, frame.r8, frame.r9);
+            let timeout_ms = frame.r10 as i32 as i64;
+            syscall_linux_epoll_pwait(frame, epfd, events, max, timeout_ms, mask, size)
+        }
         linux_abi::SYS_EPOLL_CTL => {
             syscall_linux_epoll_ctl(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }
@@ -588,8 +593,10 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_READLINKAT => {
             syscall_linux_vfs_readlinkat(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }
+        // `faccessat` takes three arguments; its fourth register is not a flag
+        // word (glibc's flag-carrying form is `faccessat2`).
         linux_abi::SYS_FACCESSAT => {
-            syscall_linux_vfs_access(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+            syscall_linux_vfs_access(frame.rdi, frame.rsi, frame.rdx, 0)
         }
         linux_abi::SYS_SET_ROBUST_LIST => syscall_linux_set_robust_list(frame.rdi, frame.rsi),
         linux_abi::SYS_GET_ROBUST_LIST => {
@@ -599,6 +606,14 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
             syscall_linux_vfs_dup(frame.rdi, frame.rsi, frame.rdx, VfsDupMode::Dup3)
         }
         linux_abi::SYS_EPOLL_CREATE1 => syscall_linux_epoll_create1(frame.rdi),
+        // `size` is only a historical hint, but must be positive.
+        linux_abi::SYS_EPOLL_CREATE => {
+            if (frame.rdi as u32 as i32) <= 0 {
+                linux_errno(LINUX_EINVAL)
+            } else {
+                syscall_linux_epoll_create1(0)
+            }
+        }
         linux_abi::SYS_UMASK => syscall_linux_syscalld_umask(frame.rdi),
         linux_abi::SYS_GETRANDOM => {
             syscall_linux_syscalld_getrandom(frame.rdi, frame.rsi, frame.rdx)
@@ -614,21 +629,23 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         _ => dispatch_ext::dispatch(frame)
             .unwrap_or_else(|| error_ops::unimplemented_linux_syscall(frame)),
     };
-    if result == linux_errno(LINUX_EBUSY) && frame.rax < 512 {
+    if result == linux_errno(LINUX_EBUSY) && syscall_nr < 512 {
         error_ops::record_busy_linux_syscall(frame);
     }
 
+    // `rt_sigsuspend` and the `p*` waits run under a temporary signal mask and
+    // complete their own signal delivery, so the frame saves the mask they
+    // were entered with; every other syscall completes here.
     if !matches!(
-        frame.rax,
-        linux_abi::SYS_RT_SIGRETURN | linux_abi::SYS_RT_SIGSUSPEND
+        syscall_nr,
+        linux_abi::SYS_RT_SIGRETURN
+            | linux_abi::SYS_RT_SIGSUSPEND
+            | linux_abi::SYS_PPOLL
+            | linux_abi::SYS_PSELECT6
+            | linux_abi::SYS_EPOLL_PWAIT
+            | linux_abi::SYS_EPOLL_PWAIT2
     ) {
-        // The signal frame saves `frame.rax`: it must hold this syscall's
-        // result, not its number, or sigreturn resumes with the wrong value.
-        let number = core::mem::replace(&mut frame.rax, result);
-        if deliver_pending_signals_if_needed(frame) {
-            return frame.rax;
-        }
-        frame.rax = number;
+        return complete_syscall_with_signals(frame, result, None).0;
     }
     result
 }

@@ -2330,6 +2330,80 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn exited_child_of_a_dead_parent_is_reaped_without_a_wait() {
+        let _isolation = isolate_process_table();
+        let parent = create_process(5_064, new_state()).expect("parent");
+        let child = create_process_with_parent(5_065, Some(5_064), new_state()).expect("child");
+        note_process_exit_status(5_065, 0).expect("child exit status");
+        detach_task(child).expect("child detach");
+        // The parent is alive: the zombie waits for its `wait4`.
+        assert_eq!(reap_exited_processes(), 0);
+        // The parent exits: nothing can ever wait for the zombie, so the next
+        // reap pass (one scan, no queue entry exists for the child) frees both.
+        detach_task(parent).expect("parent detach");
+        assert_eq!(reap_exited_processes(), 2);
+        assert_eq!(thread_count_by_pid(5_065), None, "the orphan object is gone");
+    }
+
+    #[test]
+    fn orphan_is_reaped_while_its_exited_parent_is_still_an_unwaited_zombie() {
+        let _isolation = isolate_process_table();
+        let grandparent = create_process(5_066, new_state()).expect("grandparent");
+        let parent =
+            create_process_with_parent(5_067, Some(5_066), new_state()).expect("parent");
+        let child = create_process_with_parent(5_068, Some(5_067), new_state()).expect("child");
+        note_process_exit_status(5_068, 0).expect("child exit status");
+        detach_task(child).expect("child detach");
+        assert_eq!(reap_exited_processes(), 0);
+        note_process_exit_status(5_067, 0).expect("parent exit status");
+        detach_task(parent).expect("parent detach");
+        // The parent stays as a zombie for the grandparent; the child does not.
+        assert_eq!(reap_exited_processes(), 1);
+        assert_eq!(thread_count_by_pid(5_068), None);
+        assert_eq!(thread_count_by_pid(5_067), Some(0));
+        assert!(matches!(
+            wait_for_child(5_066, 5_067, false, false),
+            WaitResult::Exited { pid: 5_067, status: 0 }
+        ));
+        assert_eq!(reap_exited_processes(), 1);
+        detach_task(grandparent).expect("grandparent detach");
+        assert_eq!(reap_exited_processes(), 1);
+    }
+
+    #[test]
+    fn child_exiting_after_its_parent_died_is_reaped_on_its_own_exit() {
+        let _isolation = isolate_process_table();
+        let parent = create_process(5_069, new_state()).expect("parent");
+        let child = create_process_with_parent(5_070, Some(5_069), new_state()).expect("child");
+        detach_task(parent).expect("parent detach");
+        assert_eq!(reap_exited_processes(), 1);
+        detach_task(child).expect("child detach");
+        assert_eq!(reap_exited_processes(), 1);
+        assert_eq!(thread_count_by_pid(5_070), None);
+    }
+
+    #[test]
+    fn a_child_of_a_live_parent_survives_scans_until_it_is_waited() {
+        let _isolation = isolate_process_table();
+        let parent = create_process(5_071, new_state()).expect("parent");
+        let child = create_process_with_parent(5_072, Some(5_071), new_state()).expect("child");
+        note_process_exit_status(5_072, 3).expect("child exit status");
+        detach_task(child).expect("child detach");
+        // An unrelated exit forces a full scan; the live parent's zombie stays.
+        let other = create_process(5_073, new_state()).expect("other");
+        detach_task(other).expect("other detach");
+        assert_eq!(reap_exited_processes(), 1);
+        assert_eq!(thread_count_by_pid(5_072), Some(0));
+        assert!(matches!(
+            wait_for_child(5_071, 5_072, false, false),
+            WaitResult::Exited { pid: 5_072, status: 3 }
+        ));
+        assert_eq!(reap_exited_processes(), 1);
+        detach_task(parent).expect("parent detach");
+        assert_eq!(reap_exited_processes(), 1);
+    }
+
+    #[test]
     fn retained_ref_delays_reclaim_until_drop() {
         let _guard = lock_process_table_for_tests();
         let handle = create_process(42, new_state()).expect("process handle");

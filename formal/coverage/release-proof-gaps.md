@@ -35,17 +35,16 @@ service PID or a difficult-to-guess token alone is not accepted as authority.
 The entropy source itself is a capability-gated boot-CSPRNG broker; the retired
 PID/TID/counter generator is not a security fallback.
 
-Vfsd commits live epoll identities and complete interest records to rootd's
-authenticated, versioned opaque checkpoint before local publication. Ring0 is
-the sole descriptor-reference authority, so dup/fork/transfer do not issue
-provider mutations; vfsd sees only create and the idempotent final-retire
-tombstone. A
-replacement vfsd scans and validates the checkpoint, reconstructs its registry,
-and only then creates/publishes the endpoint; malformed or partial replay fails
-closed. The `service-mutation-recovery` model covers unique commit revisions,
-crash, replay-before-publication, and reconciliation. Live crash-injection/QEMU
-evidence for the replacement-service path remains an acceptance gate; passing
-source/model checks alone does not claim that runtime evidence.
+Persistent `epoll` interest sets now live in Ring0 (`EpollHandle`, billed to
+the client Job; `vfsd` rejects legacy `VFS_POLL_QUERY_EPOLL_*` with
+`EOPNOTSUPP`), while `vfsd` continues to commit ordinary open descriptions to
+rootd's authenticated, versioned opaque checkpoint before local publication and
+reconstructs them on restart before publishing its endpoint. Malformed or
+partial replay fails closed. The `service-mutation-recovery` model covers
+unique commit revisions, crash, replay-before-publication, and reconciliation.
+Live crash-injection/QEMU evidence for the replacement-service path remains an
+acceptance gate; passing source/model checks alone does not claim that runtime
+evidence.
 
 Ordinary vfsd open descriptions now retain their normalized path, kind,
 cursor, length/content identity, and mutable status flags in rootd. OPEN uses a
@@ -235,9 +234,9 @@ separate steady-state WayClick proof now passes as described above; the
 five-second boot gate remains independent and cannot substitute for it.
 
 The generic userspace wait-set implementation now replaces the single-snapshot
-`epoll_wait`: vfsd owns bounded interest sets, netd/inputd/sessiond publish monotonic
-readiness generations, and compat uses atomic check-arm-recheck with monotonic
-deadlines. The same bounded broker now covers transient multi-fd `poll` sets,
+`epoll_wait`: Ring0 `EpollHandle` owns bounded persistent interest sets,
+local-fd tokens and netd/inputd/sessiond/vfsd publish monotonic readiness
+generations, and compat uses atomic check-arm-recheck with monotonic deadlines. The same bounded broker now covers transient multi-fd `poll` sets,
 polling an epoll descriptor, unmasked-signal cancellation, and the temporary
 signal masks of `ppoll`/`epoll_pwait`. Interests bind the target fd plus stable
 provider object identity, so fd reuse cannot retarget an old open description;

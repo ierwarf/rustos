@@ -758,6 +758,20 @@ pub(crate) fn finalize_kernel_initialization() {
     flow_info(21, "kernel finalize: housekeeping task started");
     boot_log!(debug::LogLevel::Info, 135, 0, "housekeeping task started");
 
+    // Blocking Ring3 service cleanup/reconciliation runs in its own kernel
+    // task so a stalled service (e.g. vfsd/netd) can never block the pure
+    // kernel housekeeping executor that materializes user threads and
+    // completes retirement fences.
+    let service_cleanup_thread = ps_api::Thread::new(tasks::nucleus_service_cleanup_task, 100);
+    service_cleanup_thread.start();
+    flow_info(212, "kernel finalize: service cleanup task started");
+    boot_log!(
+        debug::LogLevel::Info,
+        138,
+        0,
+        "service cleanup task started"
+    );
+
     let pager_refill_thread = ps_api::Thread::new(tasks::nucleus_pager_fault_refill_task, 50);
     pager_refill_thread.start();
     flow_info(211, "kernel finalize: pager fault refill task started");
@@ -869,20 +883,19 @@ pub(crate) fn run_nucleus_loop() -> ! {
     }
 }
 
+/// Pure non-blocking kernel housekeeping pass.
+///
+/// Must NEVER issue blocking IPC to a Ring3 service: user thread creation
+/// (`spawn.rs`) and retirement fences (`current.rs`) wait on this executor to
+/// run `ps_api::service_deferred_work()`. Any blocking service call here would
+/// form a circular deadlock whenever that service spawns a thread or waits on
+/// retirement.
 pub(crate) fn housekeeping_once() -> usize {
     let mut work = 0;
 
     trace_service_phase("reap");
-    // Retirement can include bounded service reconciliation. Bound the number
-    // of complete lifecycle transactions per scheduler turn so a process-exit
-    // storm cannot concatenate individually bounded waits into an unbounded UI
-    // or input stall. Unacknowledged records remain owned by the scheduler.
-    work += compat_api::syscall::service_retired_task_runtime_cleanup(
-        compat_api::syscall::RETIRED_TASK_CLEANUP_BUDGET,
-    );
     work += ps_api::service_deferred_work();
     work += compat_api::pager::service_deferred_work();
-    work += compat_api::syscall::service_deferred_transfer_releases();
     // Shared display mappings may own large contiguous frame sets. Reclaim a
     // bounded page quantum outside process/handle locks so close, exec, and
     // exit cannot turn into a multi-megabyte allocator critical section.
@@ -908,6 +921,29 @@ pub(crate) fn housekeeping_once() -> usize {
     // format + debugcon write happens here so a 700-byte log line full of
     // single-byte outb VMExits doesn't drop frames inside the IRQ handler.
     work += hal_api::arch::rtc::drain_pending_heartbeat();
+
+    work
+}
+
+/// Dedicated Ring3 service cleanup and deferred reconciliation pass.
+///
+/// Runs on its own kernel task (`nucleus_service_cleanup_task`) so bounded
+/// blocking IPC to `vfsd`/`netd`/`procd` (handle close, pending VFS/netd
+/// mutation replay, deferred transfer drops) never stalls pure kernel
+/// housekeeping (`ps_api::service_deferred_work()`, thread materialization,
+/// scheduler profiles, or heartbeats).
+pub(crate) fn service_cleanup_once() -> usize {
+    let mut work = 0;
+
+    trace_service_phase("service-reap");
+    // Retirement can include bounded service reconciliation. Bound the number
+    // of complete lifecycle transactions per scheduler turn so a process-exit
+    // storm cannot concatenate individually bounded waits into an unbounded UI
+    // or input stall. Unacknowledged records remain owned by the scheduler.
+    work += compat_api::syscall::service_retired_task_runtime_cleanup(
+        compat_api::syscall::RETIRED_TASK_CLEANUP_BUDGET,
+    );
+    work += compat_api::syscall::service_deferred_transfer_releases();
 
     work
 }
@@ -999,5 +1035,42 @@ mod tests {
         assert!(root_job < publication);
         assert!(source.contains("const ROOTD_BOOTSTRAP_BUDGET_NS: u64 = 4_000_000"));
         assert!(source.contains("const ROOTD_BOOTSTRAP_PERIOD_NS: u64 = 10_000_000"));
+    }
+
+    #[test]
+    fn housekeeping_once_never_blocks_on_ring3_service_cleanup() {
+        let production = include_str!("boot.rs")
+            .split_once("#[cfg(test)]")
+            .expect("boot tests must remain below production")
+            .0;
+        let housekeeping_body = production
+            .split_once("pub(crate) fn housekeeping_once() -> usize {")
+            .expect("housekeeping_once must exist")
+            .1
+            .split_once("pub(crate) fn service_cleanup_once() -> usize {")
+            .expect("service_cleanup_once must be separated from housekeeping_once")
+            .0;
+        assert!(
+            housekeeping_body.contains("ps_api::service_deferred_work()"),
+            "housekeeping_once must drive pure kernel deferred work"
+        );
+        assert!(
+            !housekeeping_body.contains("service_retired_task_runtime_cleanup"),
+            "housekeeping_once must not block on Ring3 retired-task service cleanup"
+        );
+        assert!(
+            !housekeeping_body.contains("service_deferred_transfer_releases"),
+            "housekeeping_once must not block on Ring3 deferred VFS/netd IPC replay"
+        );
+        let cleanup_body = production
+            .split_once("pub(crate) fn service_cleanup_once() -> usize {")
+            .expect("service_cleanup_once must exist")
+            .1
+            .split_once("pub unsafe fn kernel_main_bootstrap(")
+            .expect("kernel_main_bootstrap follows service_cleanup_once")
+            .0;
+        assert!(cleanup_body.contains("service_retired_task_runtime_cleanup"));
+        assert!(cleanup_body.contains("service_deferred_transfer_releases"));
+        assert!(production.contains("tasks::nucleus_service_cleanup_task"));
     }
 }

@@ -32,6 +32,10 @@ fn futex_return_advances_retired_thread_cleanup_before_userspace_join_resumes() 
         .expect("userspace result publication");
     assert!(runtime_cleanup < scheduler_reap);
     assert!(scheduler_reap < userspace_return);
+    assert!(
+        dispatch.contains("process_owns_any_published_service_endpoint"),
+        "published service owners must skip blocking retirement cleanup inside futex"
+    );
 }
 
 #[test]
@@ -340,4 +344,21 @@ fn thread_start_metadata_syscalls_need_no_service_round_trip() {
     assert!(!valid_arch_prctl_locally(0x1234, 0));
     // A bad robust-list length is refused before any state is touched.
     assert_eq!(syscall_linux_set_robust_list(0, 8), linux_errno(LINUX_EINVAL));
+}
+
+#[test]
+fn tkill_and_tgkill_reject_nonpositive_thread_and_group_ids() {
+    assert_eq!(thread_directed_target_error(5, None), None);
+    assert_eq!(thread_directed_target_error(5, Some(5)), None);
+    assert_eq!(thread_directed_target_error(0, None), Some(LINUX_EINVAL));
+    assert_eq!(thread_directed_target_error(-1, Some(5)), Some(LINUX_EINVAL));
+    assert_eq!(thread_directed_target_error(5, Some(0)), Some(LINUX_EINVAL));
+    assert_eq!(thread_directed_target_error(5, Some(-1)), Some(LINUX_EINVAL));
+}
+
+#[test]
+fn kill_refuses_group_and_broadcast_targets_instead_of_signalling_the_caller() {
+    for pid in [0_u64, (-1_i32) as u32 as u64, (-7_i32) as u32 as u64, 0x5_0000_0000] {
+        assert_eq!(syscall_linux_kill(pid, 0), linux_errno(LINUX_ENOSYS), "pid {pid:#x}");
+    }
 }

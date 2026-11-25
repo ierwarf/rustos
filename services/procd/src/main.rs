@@ -49,7 +49,9 @@ const AT_FDCWD: u64 = -100_i64 as u64;
 const WNOHANG: u64 = 1;
 const WUNTRACED: u64 = 2;
 const WCONTINUED: u64 = 8;
+const SS_ONSTACK: u32 = 1;
 const SS_DISABLE: u32 = 2;
+const SS_AUTODISARM: u32 = 1 << 31;
 const MINSIGSTKSZ: u64 = 2048;
 const SIG_BLOCK: u64 = 0;
 const SIG_UNBLOCK: u64 = 1;
@@ -1093,11 +1095,18 @@ fn handle_sigaltstack(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse
     }
     let extra = read_unaligned::<SigaltstackRequest>(&request.payload);
     if extra.has_new != 0 {
-        if extra.new_ss_flags & !SS_DISABLE != 0 {
+        // Linux `do_sigaltstack`: the mode (flags without SS_AUTODISARM) must be
+        // 0, SS_ONSTACK or SS_DISABLE; SS_ONSTACK is accepted as an input
+        // and means "enable" (sanitizers and libsigsegv pass it back verbatim).
+        // SS_AUTODISARM may only be combined with an enabled stack, never SS_DISABLE.
+        let mode = extra.new_ss_flags & !SS_AUTODISARM;
+        if !matches!(mode, 0 | SS_ONSTACK | SS_DISABLE)
+            || (mode == SS_DISABLE && extra.new_ss_flags & SS_AUTODISARM != 0)
+        {
             response.status = EINVAL;
             return;
         }
-        if extra.new_ss_flags & SS_DISABLE == 0 && extra.new_ss_size < MINSIGSTKSZ {
+        if mode != SS_DISABLE && extra.new_ss_size < MINSIGSTKSZ {
             response.status = ENOMEM;
             return;
         }
@@ -1125,7 +1134,8 @@ fn handle_sigaltstack(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse
         } else {
             state.sigaltstack_sp = extra.new_ss_sp;
             state.sigaltstack_size = extra.new_ss_size;
-            state.sigaltstack_flags = extra.new_ss_flags;
+            // SS_ONSTACK is a report-only bit that only the kernel knows.
+            state.sigaltstack_flags = extra.new_ss_flags & SS_AUTODISARM;
         }
     }
     if wants_old {
@@ -1430,6 +1440,59 @@ fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
 mod tests {
     use super::*;
 
+    fn sigaltstack_request(pid: u64, flags: u32, size: u64) -> (ProcdIpcRequest, ProcdIpcResponse) {
+        let mut request = ProcdIpcRequest::default();
+        request.pid = pid;
+        request.tid = pid;
+        request.flags = 0x1;
+        request.payload_len = size_of::<SigaltstackRequest>() as u32;
+        let extra = SigaltstackRequest {
+            has_new: 1,
+            new_ss_sp: 0x1000,
+            new_ss_size: size,
+            new_ss_flags: flags,
+            ..SigaltstackRequest::default()
+        };
+        copy_request_payload(&mut request, &extra);
+        (request, ProcdIpcResponse::default())
+    }
+
+    fn copy_request_payload<T>(request: &mut ProcdIpcRequest, value: &T) {
+        let bytes = unsafe {
+            core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>())
+        };
+        request.payload[..bytes.len()].copy_from_slice(bytes);
+    }
+
+    #[test]
+    fn sigaltstack_accepts_linux_mode_and_autodisarm_flags_only() {
+        let pid = u64::MAX - 77;
+        // SS_ONSTACK as input means enable; SS_AUTODISARM is a modifier.
+        for flags in [0, SS_ONSTACK, SS_AUTODISARM, SS_AUTODISARM | SS_ONSTACK] {
+            let (request, mut response) = sigaltstack_request(pid, flags, 16 * 1024);
+            handle_sigaltstack(&request, &mut response);
+            assert_eq!(response.status, 0, "flags {flags:#x}");
+            let state = THREAD_SIGNAL_POLICY.lock()[&(pid, pid)];
+            assert_eq!(state.sigaltstack_flags, flags & SS_AUTODISARM);
+            assert_eq!(state.sigaltstack_size, 16 * 1024);
+        }
+        // Unknown mode bits and mode 3 are EINVAL; too small is ENOMEM.
+        for flags in [4, 3, SS_DISABLE | SS_ONSTACK, 0x4000_0000] {
+            let (request, mut response) = sigaltstack_request(pid, flags, 16 * 1024);
+            handle_sigaltstack(&request, &mut response);
+            assert_eq!(response.status, EINVAL, "flags {flags:#x}");
+        }
+        let (request, mut response) = sigaltstack_request(pid, SS_ONSTACK, MINSIGSTKSZ - 1);
+        handle_sigaltstack(&request, &mut response);
+        assert_eq!(response.status, ENOMEM);
+        // SS_DISABLE ignores the stale size and clears the record.
+        let (request, mut response) = sigaltstack_request(pid, SS_DISABLE, 0);
+        handle_sigaltstack(&request, &mut response);
+        assert_eq!(response.status, 0);
+        assert_eq!(THREAD_SIGNAL_POLICY.lock()[&(pid, pid)].sigaltstack_size, 0);
+        THREAD_SIGNAL_POLICY.lock().remove(&(pid, pid));
+    }
+
     #[test]
     fn tgkill_rejects_signal_before_narrowing() {
         let mut request = ProcdIpcRequest::default();
@@ -1705,5 +1768,30 @@ mod tests {
         assert_eq!(state.signal_mask, 0x55);
         assert_eq!(state.sigaltstack_sp, 0);
         assert!(!threads.contains_key(&(pid, pid)));
+    }
+
+    #[test]
+    fn sigaltstack_rejects_disable_combined_with_autodisarm() {
+        let mut req = ProcdIpcRequest::default();
+        req.pid = u64::MAX - 61;
+        req.tid = req.pid;
+        let extra = SigaltstackRequest {
+            has_new: 1,
+            new_ss_flags: SS_DISABLE | SS_AUTODISARM,
+            new_ss_sp: 0,
+            new_ss_size: 0,
+            ..SigaltstackRequest::default()
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&extra as *const SigaltstackRequest).cast::<u8>(),
+                size_of::<SigaltstackRequest>(),
+            )
+        };
+        req.payload[..bytes.len()].copy_from_slice(bytes);
+        req.payload_len = bytes.len() as u32;
+        let mut resp = ProcdIpcResponse::default();
+        handle_sigaltstack(&req, &mut resp);
+        assert_eq!(resp.status, EINVAL);
     }
 }

@@ -14,9 +14,11 @@
   capability possession, and token obscurity never substitutes for the rootd
   dependency graph.
 - Kernel fd tables mirror service-owned objects as `KernelHandle::RemoteVfs`.
-- `/proc` is a vfsd-owned caller-only namespace (`proc_fs.rs`). `self`
-  links to the kernel-stamped caller PID; another PID is always `ENOENT`.
-  Vfsd admits maps/smaps, status/stat/statm, cmdline/environ, auxv, limits,
+- `/proc` is a vfsd-owned namespace (`proc_fs.rs`). `self` links to the
+  kernel-stamped caller PID; for another PID only `oom_score_adj` and
+  `task[/<tid>[/{stat,status,comm}]]` are exposed (all other foreign-PID nodes
+  return `ENOENT`).
+  Vfsd admits maps/smaps/smaps_rollup, status/stat/statm, cmdline/environ, auxv, limits,
   fd and task directories, then returns a typed delegation code. Ring0
   supplies only the caller's actual VMAs, credentials, threads, argv/env,
   auxiliary vector or fd snapshot; vfsd does not guess or retain them.
@@ -125,11 +127,14 @@
 - `mount`/`umount2` route to vfsd and currently return `EOPNOTSUPP` when
   no actual dynamic mount operation is available. Do not return false success
   by changing only cache epochs, or reintroduce generic-app ring0 mount policy.
-- `poll`/`ppoll`/`epoll_*` route generic fd readiness policy and epoll
-  interest state through `VFS_IPC_OP_POLL_QUERY`; socket readiness is `netd`
-  policy, input readiness is `inputd` policy plus the narrow native-input
-  wait/completion substrate, and non-system console-input readiness is
-  `sessiond` policy. sessiond advances its generation only on an empty-to-ready
+- `poll`/`ppoll`/`epoll_*`: persistent `epoll` interest sets live in Ring0
+  (`EpollHandle`, billed to the client Job; `vfsd` rejects legacy
+  `VFS_POLL_QUERY_EPOLL_*` requests with `EOPNOTSUPP`). Remote-VFS readiness
+  for `poll`/`ppoll`/`epoll_wait` still routes through `VFS_IPC_OP_POLL_QUERY`
+  (`VFS_POLL_QUERY_POLL`); socket readiness is local (`UnixSocketHandle`) or
+  `netd` policy (`AF_INET`/`AF_INET6`/`AF_NETLINK`), input readiness is `inputd`
+  policy plus the narrow native-input wait/completion substrate, and non-system
+  console-input readiness is `sessiond` policy. sessiond advances its generation only on an empty-to-ready
   line-discipline transition; the readiness query is non-consuming and bounded
   by the application's remaining deadline. Live console output/error are
   immediately writable, but they observe the same session generation so close
@@ -233,7 +238,18 @@
 - User-task retirement is a two-phase runtime boundary. The scheduler first
   revokes runnable, deadline, and IPC authority, stamps the exact task/process
   identity plus whether this was the process's last live thread, and keeps the
-  slot unreapable. Executive housekeeping then removes every task-scoped
+  slot unreapable. Kernel housekeeping is split into two independent tasks to
+  prevent circular wait between thread materialization/reaping and Ring3
+  service IPC: `nucleus_housekeeping_task` performs only pure non-blocking
+  kernel work (`service_deferred_work`, pager/shared-region reclaim, profiles,
+  heartbeat), while `nucleus_service_cleanup_task` owns Ring3 provider cleanup
+  (`service_retired_task_runtime_cleanup` and `service_deferred_transfer_releases`)
+  and wakes `nucleus_housekeeping_task` once cleanup completes. Similarly,
+  `vfsd`'s `bulk_read_worker` reuses a lock-free cached worker pool with a 2 s
+  idle retirement (0 resident threads at rest) instead of spawning a fresh
+  thread via `SYS_CLONE` per bulk-read request, and published Ring3 service
+  owners never run synchronous provider cleanup inside `FUTEX_WAKE`. The
+  cleanup pass removes every task-scoped
   futex, wait-set, service-discovery, input, block, bootstrap-TTY, and proc
   broker record; terminal-process cleanup also closes provider references and
   revokes service publications. The directory publishes the immutable cleanup
@@ -390,7 +406,17 @@ the read-only accelerator; TmpFs has it (next section).
   of that pid; writing another process's `comm` is EACCES. `cmdline` is not a per-tid
   file (needs a cross-process memory read). `/proc/cpuinfo`
   and `/sys/devices/system/cpu/{online,possible,present}` report the kernel's
-  admitted hardware CPUs (`PROC_FACTS_OP_ONLINE_CPUS`), not vfsd's affinity mask. Kernel-fact nodes (maps, smaps, status, stat, statm,
+  admitted hardware CPUs (`PROC_FACTS_OP_ONLINE_CPUS`), not vfsd's affinity mask.
+  Vfsd-generated virtual files (no kernel facts): `/proc/<pid>/mountinfo` (the
+  mount table in mountinfo syntax), `/proc/<pid>/cgroup` (membership of the single
+  cgroup namespace, no hierarchy mounted), and constant
+  `/proc/sys/kernel/{ostype,osrelease,hostname}` mirroring the `uname(2)` fields.
+  `/proc/<pid>/smaps_rollup` (`ProcKernelNode::SmapsRollup`, wire code 12) is
+  formatted by vfsd (and by Ring0 for the caller's own pid, like `smaps`) from
+  the same facts as `smaps`: the `[rollup]` header plus only counters Ring0 can
+  attest process-wide (`Rss` when known, `Locked`); `Pss`, `Shared_*`, `Private_*`,
+  `Anonymous`, `Referenced` and `Swap` are omitted, never reported as zero.
+  Kernel-fact nodes (maps, smaps, smaps_rollup, status, stat, statm,
   cmdline, environ, auxv, limits, comm, oom_score_adj, `task/`, `fd/`, `ns/*`) are
   exposed through vfsd. For kernel-fact files handled by the Ring3 snapshot
   path, vfsd pulls attested binary facts through `SYS_RUSTOS_PROC_FACTS_BROKER`,
@@ -402,16 +428,12 @@ the read-only accelerator; TmpFs has it (next section).
   path-backed files (recorded path) and proc snapshots, `ENXIO` for sockets, pipes
   and anonymous inodes. Unavailable Linux fields are omitted rather than
   fabricated.
-- **netd path sockets.** `bind(AF_UNIX, abs path)` creates an `S_IFSOCK` inode
-  through vfsd `MKNOD` carrying `VFS_REQUEST_FLAG_NETD_SOCKET_NODE`; vfsd
-  accepts the flag only from the netd service owner and only for `S_IFSOCK`
-  MKNOD, stat (`AT_SYMLINK_NOFOLLOW` only) and socket-only UNLINKAT. The inode is
+- **Pathname `AF_UNIX` socket nodes.** `bind(AF_UNIX, path)` (executed by Ring0
+  `UnixSocketHandle`) creates an `S_IFSOCK` inode through vfsd `MKNOD`; `vfsd`
+  also exposes `stat` (`AT_SYMLINK_NOFOLLOW`) and socket-only `UNLINKAT`. The inode is
   visible to `stat`/`access`/`unlink` and is not freed on socket close; a second
   bind gives EADDRINUSE until `unlink`, connect to a gone node gives ENOENT.
-  Relative paths, abstract names and the Wayland path stay private netd
-  bindings (the kernel does not absolutize against cwd; Wayland waits for
-  `/run/user/1000` ownership by the compositor uid). netd needs the rootd route
-  NETD -> VFSD (17 directed lookup offers).
+  Abstract names remain kernel-local without a vfsd inode.
 
 ### TmpFs writable `MAP_SHARED` (shared-frame backing)
 
@@ -1094,3 +1116,20 @@ for concurrent writes, truncate, unlink and pinned orphans, plus durable
 ownership across cross-Job access and provider restart. Existing vfsd provider
 billing only charges open descriptions, and cannot safely stand in for that
 byte lifecycle.
+
+## VFS errno and flag rules added by audits
+
+- `renameat2`: unknown flag bits, or `RENAME_NOREPLACE|RENAME_EXCHANGE`
+  together, are `EINVAL`; `RENAME_EXCHANGE` alone is `EOPNOTSUPP` (backend has
+  no atomic swap). The rule is `permissions::renameat2_flags_errno`.
+- `lseek` `SEEK_DATA`/`SEEK_HOLE` (whence 3/4) use the dense-file model: the
+  offset is absolute, `SEEK_DATA` returns it and `SEEK_HOLE` returns EOF; an
+  offset at or past EOF is `ENXIO`, a negative one `EINVAL`.
+- `utimensat`: `(UTIME_NOW, UTIME_OMIT)` combinations count as a touch
+  (`permissions::utimes_touch_only`): the owner or any writer may do it
+  (`EACCES` otherwise); an explicit time needs the owner (`EPERM`). Both times
+  `UTIME_OMIT` succeeds before the target is looked at and emits no `IN_ATTRIB`.
+- `inotify_add_watch` requires read permission on the target (`EACCES`). The
+  queue holds at most one `IN_Q_OVERFLOW` event until that event is read.
+- FAT `write_at`/`truncate` that extend the file are all-or-nothing when no
+  byte lands: the zero-filled gap is cut back and the length is unchanged.

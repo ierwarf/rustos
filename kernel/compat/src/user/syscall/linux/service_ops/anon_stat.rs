@@ -193,6 +193,12 @@ fn current_identity(fd: u64) -> Option<AnonStat> {
     .flatten()
 }
 
+/// Owner permission bits (`rwx`, 0..=7) of a kernel-owned descriptor object,
+/// or `None` when `fd` is not one. Used by `faccessat2(..., "", ..., AT_EMPTY_PATH)`.
+pub(super) fn current_owner_mode_bits(fd: u64) -> Option<u32> {
+    current_identity(fd).map(|stat| (stat.mode >> 6) & 7)
+}
+
 /// `fstat` on a kernel-owned object; `None` if `fd` is not one.
 pub(in crate::user::syscall::linux) fn fstat(fd: u64, stat_ptr: u64) -> Option<u64> {
     let stat = current_identity(fd)?;

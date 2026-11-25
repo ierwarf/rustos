@@ -1153,7 +1153,14 @@ pub fn next_retired_task_cleanup() -> Option<super::RetiredTaskCleanup> {
 }
 
 pub fn complete_retired_task_cleanup(cleanup: super::RetiredTaskCleanup) -> bool {
-    interrupts::without_interrupts(|| super::scheduler::retirement_cleanup::complete(cleanup))
+    let completed =
+        interrupts::without_interrupts(|| super::scheduler::retirement_cleanup::complete(cleanup));
+    if completed {
+        // Wake the pure kernel housekeeping executor immediately so the reaper
+        // reclaims the retired slot and process without waiting a full tick.
+        super::kick_housekeeping_executor();
+    }
+    completed
 }
 
 #[cfg(test)]

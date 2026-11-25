@@ -103,14 +103,17 @@ complete 2048x2048 atlas on every motion.
 
 The OS userspace event/readiness boundary is now implemented as a general
 cross-provider wait set rather than a WayClick-specific route. uiserver waits
-the Wayland server's aggregate epoll fd together with its input notification;
+the Wayland server's aggregate Ring0 `EpollHandle` fd (with Ring0 `UnixSocketHandle`
+Wayland client sockets) together with its input notification;
 compat honors finite/infinite application deadlines and performs atomic
-check-register-recheck-arm-presence-check against service-owned generations.
+check-register-recheck-arm-presence-check against local readiness tokens and
+service-owned generations.
 Open-description lifetime, provider epoch revoke, per-interest `ERR|HUP`, and
-bounded close/dup/fork/exec cleanup are source/model covered. State mutations
-now use exact operation IDs with replay/reconciliation, vfsd restores its
-rootd-retained authenticated epoll checkpoint before endpoint publication, and
-service objects use boot-entropy capabilities plus sender/dependency checks.
+bounded close/dup/fork/exec cleanup are source/model covered. Remote state
+mutations use exact operation IDs with replay/reconciliation, vfsd restores its
+rootd-retained authenticated open-description checkpoint before endpoint
+publication, and service objects use boot-entropy capabilities plus
+sender/dependency checks.
 This does not replace focused runtime crash-injection evidence. The
 [batch validation](../validation/ring3-reliability-batch.md) records the
 separate KVM boot and input evidence and its timing limits. Fuchsia's
@@ -138,16 +141,18 @@ not an ABI to copy verbatim:
 - **Toplevel recreation.** Destroying a toplevel clears focus and abandons
   outstanding commits. Recreating it on the same `wl_surface` preserves
   identity and placement, but resets title, decoration and maximize state.
-- **GPU atlas capacity.** The desktop texture occupies 2560x1440 of the
-  2688x2560 atlas, leaving a 2688x1118 strip for windows, so a maximized
-  window cannot be placed. Windows are packed in reverse draw order (focused
+- **GPU atlas capacity.** Occlusion fragment packing (`render/fragments.rs`)
+  and dynamic atlas geometry fit maximized windows alongside the desktop and
+  dock (verified up to 2560x1440 in a 2688x2560 atlas and 2880x1800 in a
+  3008x2944 atlas). Windows are packed in reverse draw order (focused
   first, then topmost) and appended in draw order, so a full atlas costs the
   window furthest down the stack its texture. Dropped windows are logged
   (bounded, once per change of the dropped set) as `gpu atlas ... full`.
-- **Stall budget.** Wayland socket calls on the UI thread are nonblocking but
-  netd gives byte-moving operations a 5 s lease. A UI phase blocked inside such
-  a call (`WAYLAND_STEP != none`) is judged against lease plus slack (7 s)
-  instead of the 3 s phase budget; every other phase keeps 3 s.
+- **Stall budget & focus.** Newly mapped Wayland toplevel windows receive
+  automatic keyboard/window focus (`app/mod.rs`). Wayland socket calls on the
+  UI thread are nonblocking (`UnixSocketHandle`), and `WAYLAND_STEP != none`
+  retains a 7 s watchdog budget while every other UI phase (with granular
+  `PRESENT_STEP` diagnostics in `main.rs`/`gpu_runtime.rs`) keeps 3 s.
 - **Module layout.** `wayland.rs` owns constants, shared types,
   `WaylandCompositor`, listener-socket binding, buffer-argument validation,
   row conversion and `pointer_button`: `formal/zero-trust-subsystems.tsv` and
@@ -317,13 +322,14 @@ atlas 전체를 할당, rasterize, 비교, 복사하던 경로는 허용되지 �
 
 OS userspace event/readiness 경계는 이제 WayClick 전용 경로가 아니라 범용
 cross-provider wait set으로 구현되어 있습니다. uiserver는 Wayland server의
-aggregate epoll fd와 input notification을 함께 기다리고, compat는 유한/무한
-application deadline과 service-owned generation에 대한
+Ring0 `EpollHandle` aggregate epoll fd(및 Ring0 `UnixSocketHandle` 소켓)와
+input notification을 함께 기다리고, compat는 유한/무한
+application deadline과 로컬/service-owned generation에 대한
 check-register-recheck-arm-presence-check를 수행합니다. open-description
 lifetime, provider epoch revoke, interest별 `ERR|HUP`, bounded
 close/dup/fork/exec cleanup은 source/model 검증 범위입니다. 원격 상태변경은
 동일 operation ID replay/reconciliation을 사용하고, vfsd는 endpoint 공개 전
-rootd의 인증된 epoll checkpoint를 복구하며, service object는 boot entropy
+rootd의 인증된 open-description checkpoint를 복구하며, service object는 boot entropy
 capability와 sender/dependency 검사를 함께 사용합니다. 이 검사는 별도의 runtime crash injection을 대체하지 않습니다.
 [KVM 부팅과 입력 검증 기록](../validation/ring3-reliability-batch.md#korean)은
 확인한 범위와 시간 제한을 따로 설명합니다.
@@ -338,11 +344,13 @@ capability와 sender/dependency 검사를 함께 사용합니다. 이 검사는 
   완전히 읽지 못한 프레임은 게시하지 않습니다.
 - 같은 `wl_surface`에서 창을 다시 만들면 배치와 식별자는 유지하지만 제목,
   장식 설정, 최대화 이력은 초기화합니다.
-- GPU atlas가 가득 차면 focused window를 먼저 packing하고 draw order는 유지하며,
-  빠진 window는 bounded log로 남깁니다. 최대화 window는 아직 atlas에 들어가지
-  않습니다(desktop texture 2560x1440 점유).
-- Wayland socket 호출 중 UI phase는 netd 5 s lease + 여유(7 s)로, 그 외 phase는
-  3 s로 watchdog이 판정합니다.
+- occlusion fragment packing과 동적 GPU atlas로 최대화 window도 desktop/dock과
+  함께 배치됩니다(2560x1440 / 2880x1800 검증). atlas가 가득 차면 focused
+  window를 먼저 packing하고 draw order는 유지하며, 빠진 window는 bounded log로
+  남깁니다.
+- 새로 매핑된 Wayland toplevel 창은 자동으로 포커스를 받으며, Wayland socket
+  호출 중 UI phase는 7 s, 그 외 phase(`PRESENT_STEP` 진단 포함)는 3 s로
+  watchdog이 판정합니다.
 
 ### Console hosting
 

@@ -377,12 +377,17 @@ pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, 
     // A successful pthread join resumes through FUTEX_WAIT after the exiting
     // child cleared its TID. Advance the same bounded retirement owner used by
     // wait4 before returning to the joining thread without running cleanup on
-    // uncontended FUTEX_WAKE(0) or validation-error fast paths.
-    let should_service_cleanup = matches!(
+    // uncontended FUTEX_WAKE(0), validation-error fast paths, or inside a
+    // published Ring3 service owner (whose receive thread waking an internal
+    // worker via FUTEX_WAKE would otherwise self-IPC-deadlock on VFS/netd
+    // close).
+    let should_service_cleanup = (matches!(
         cmd,
         c if c == linux_abi::FUTEX_WAIT || c == linux_abi::FUTEX_WAIT_BITSET
     ) && matches!(result, Ok(_) | Err(LINUX_EAGAIN))
-        || matches!(result, Ok(woken) if woken > 0);
+        || matches!(result, Ok(woken) if woken > 0))
+        && !multitask::current_user_process_id()
+            .map_or(true, ipc_ops::process_owns_any_published_service_endpoint);
     if should_service_cleanup {
         let _ = service_retired_task_runtime_cleanup(RETIRED_TASK_CLEANUP_BUDGET);
         multitask::service_deferred_work();
@@ -1622,31 +1627,41 @@ fn valid_arch_prctl_locally(code: u64, arg: u64) -> bool {
 pub fn syscall_linux_kill(pid: u64, signal: u64) -> u64 {
     // `pid` is a C `int`; the register's upper half is not ABI.
     let pid_i64 = pid as u32 as i32 as i64;
-    if pid_i64 == 0 || pid_i64 < -1 {
+    // Process-group (`0`, `< -1`) and broadcast (`-1`) targets need the group
+    // table, which lives in syscalld; naming them is not the same as signalling
+    // only the caller, so they stay unsupported rather than mis-delivered.
+    if pid_i64 <= 0 {
         return linux_errno(LINUX_ENOSYS);
     }
-    let target_pid = if pid_i64 == -1 {
-        match multitask::current_user_process_id() {
-            Some(id) => id,
-            None => return linux_errno(LINUX_ENOSYS),
-        }
-    } else {
-        pid_i64 as u64
-    };
     // tid 0: process-directed, so a retired leader cannot make kill() ESRCH.
-    procd_tgkill(target_pid, 0, signal)
+    procd_tgkill(pid_i64 as u64, 0, signal)
 }
 
 pub fn syscall_linux_tkill(tid: u64, signal: u64) -> u64 {
+    let tid_i64 = tid as u32 as i32 as i64;
+    if let Some(errno) = thread_directed_target_error(tid_i64, None) {
+        return linux_errno(errno);
+    }
     let pid = match multitask::current_user_process_id() {
         Some(id) => id,
         None => return linux_errno(LINUX_ENOSYS),
     };
-    procd_tgkill(pid, tid, signal)
+    procd_tgkill(pid, tid_i64 as u64, signal)
 }
 
 pub fn syscall_linux_tgkill(tgid: u64, tid: u64, signal: u64) -> u64 {
-    procd_tgkill(tgid, tid, signal)
+    let tid_i64 = tid as u32 as i32 as i64;
+    let tgid_i64 = tgid as u32 as i32 as i64;
+    if let Some(errno) = thread_directed_target_error(tid_i64, Some(tgid_i64)) {
+        return linux_errno(errno);
+    }
+    procd_tgkill(tgid_i64 as u64, tid_i64 as u64, signal)
+}
+
+/// `tkill`/`tgkill` name one thread: a non-positive tid (or thread-group id)
+/// is `EINVAL`. Only the internal `kill` path uses tid 0 for "the process".
+fn thread_directed_target_error(tid: i64, tgid: Option<i64>) -> Option<i64> {
+    (tid <= 0 || tgid.is_some_and(|tgid| tgid <= 0)).then_some(LINUX_EINVAL)
 }
 
 fn procd_tgkill(tgid: u64, tid: u64, signal: u64) -> u64 {

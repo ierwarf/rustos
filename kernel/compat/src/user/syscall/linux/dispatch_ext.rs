@@ -160,9 +160,11 @@ pub(super) fn dispatch(frame: &mut SyscallFrame) -> Option<u64> {
         linux_abi::SYS_RT_SIGTIMEDWAIT => {
             syscall_linux_rt_sigtimedwait(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }
-        linux_abi::SYS_EPOLL_PWAIT2 => syscall_linux_epoll_pwait2(
-            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
-        ),
+        linux_abi::SYS_EPOLL_PWAIT2 => {
+            let (epfd, events, max, timeout, mask, size) =
+                (frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9);
+            syscall_linux_epoll_pwait2(frame, epfd, events, max, timeout, mask, size)
+        }
         linux_abi::SYS_SENDMMSG => {
             syscall_linux_sendmmsg(frame.rdi, frame.rsi, frame.rdx, frame.r10)
         }
@@ -182,6 +184,20 @@ pub(super) fn dispatch(frame: &mut SyscallFrame) -> Option<u64> {
         linux_abi::SYS_MEMBARRIER => syscall_linux_membarrier(frame.rdi, frame.rsi),
         linux_abi::SYS_SCHED_RR_GET_INTERVAL => {
             syscall_linux_sched_rr_get_interval(frame.rdi as i64, frame.rsi)
+        }
+        linux_abi::SYS_SETRESUID => syscall_linux_syscalld_set_ids(
+            SYSCALL_OFFLOAD_OP_LINUX_SETRESUID,
+            [frame.rdi, frame.rsi, frame.rdx],
+        ),
+        linux_abi::SYS_SETRESGID => syscall_linux_syscalld_set_ids(
+            SYSCALL_OFFLOAD_OP_LINUX_SETRESGID,
+            [frame.rdi, frame.rsi, frame.rdx],
+        ),
+        linux_abi::SYS_SETREUID => {
+            syscall_linux_syscalld_set_ids(SYSCALL_OFFLOAD_OP_LINUX_SETREUID, [frame.rdi, frame.rsi, 0])
+        }
+        linux_abi::SYS_SETREGID => {
+            syscall_linux_syscalld_set_ids(SYSCALL_OFFLOAD_OP_LINUX_SETREGID, [frame.rdi, frame.rsi, 0])
         }
         linux_abi::SYS_GETGROUPS => {
             syscall_linux_syscalld_getgroups(frame.rdi as i64, frame.rsi)
@@ -208,6 +224,19 @@ pub(super) fn dispatch(frame: &mut SyscallFrame) -> Option<u64> {
         linux_abi::SYS_EVENTFD2 => syscall_linux_eventfd2(frame.rdi, frame.rsi),
         linux_abi::SYS_GETPPID => {
             syscall_linux_syscalld_u64_getter(SYSCALL_OFFLOAD_OP_LINUX_GETPPID, 0)
+        }
+        linux_abi::SYS_GETPGRP => {
+            syscall_linux_syscalld_u64_getter(SYSCALL_OFFLOAD_OP_LINUX_GETPGID, 0)
+        }
+        linux_abi::SYS_FACCESSAT2 => {
+            const KNOWN: u64 = linux_abi::AT_EACCESS as u64
+                | linux_abi::AT_SYMLINK_NOFOLLOW as u64
+                | linux_abi::AT_EMPTY_PATH as u64;
+            if frame.r10 & !KNOWN != 0 {
+                linux_errno(LINUX_EINVAL)
+            } else {
+                syscall_linux_vfs_access(frame.rdi, frame.rsi, frame.rdx, frame.r10)
+            }
         }
         linux_abi::SYS_GETPGID => {
             syscall_linux_syscalld_u64_getter(SYSCALL_OFFLOAD_OP_LINUX_GETPGID, frame.rdi)

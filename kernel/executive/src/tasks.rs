@@ -75,6 +75,29 @@ fn finish_background_turn(work: usize, yield_now: impl FnOnce(), idle_wait: impl
     }
 }
 
+/// Dedicated kernel worker for Ring3 service cleanup and deferred IPC
+/// reconciliation (`service_retired_task_runtime_cleanup`,
+/// `service_deferred_transfer_releases`).
+///
+/// Kept strictly separate from `nucleus_housekeeping_task` so blocking service
+/// IPC can never deadlock against user thread creation or retirement fences
+/// that wait on `ps_api::service_deferred_work()`.
+pub(super) fn nucleus_service_cleanup_task(_id: u64) {
+    flow_debug(62, "service cleanup task entered");
+    ps_api::register_service_cleanup_task();
+    loop {
+        x86_64::instructions::interrupts::enable();
+        // Clear before scanning: retirements published after this point re-arm it.
+        ps_api::take_service_cleanup_kick();
+        let work = boot::service_cleanup_once();
+        finish_background_turn(work, ps_api::yield_now, service_cleanup_idle_wait);
+    }
+}
+
+fn service_cleanup_idle_wait() {
+    kernel_hal::api::arch::rtc::sleep_unless(1, ps_api::service_cleanup_kicked);
+}
+
 #[cfg(test)]
 mod tests {
     use super::finish_background_turn;

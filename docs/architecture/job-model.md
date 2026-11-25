@@ -385,8 +385,9 @@ the final form:
   TLB/IRQ diagnostic milestone. These limited functional markers do not establish
   full smoke acceptance or a regression rate. Work stopped at the operator's
   commit checkpoint.
-- **`rootd`'s memory governor now prefers a whole job (2026-10-29).** It groups
-  the census by job, sums the eligible members' resident pages, and probes jobs
+- **`rootd`'s memory governor now prefers a whole job (2026-10-29; updated to ABI v2 private-page scoring & `PressureGate` in 2026-11-25).** It groups
+  the census by job, sums the eligible members' `private_pages` (excluding
+  shared aliases and retained immutable backing), and probes jobs
   largest first. A job is killable only if no protected pid (rootd, every core
   and post-init lease, every reporter) lies anywhere in its subtree. The kernel
   answers that per pid through `JOB_OP_OPEN_SUBTREE` (a rights-attenuated handle
@@ -398,10 +399,10 @@ the final form:
   counts as a rootd termination for the ring0 watchdog, which therefore defers.
   Limits: the census lists the 32 largest processes, so a job's sum is a lower
   bound; the ring0 watchdog still ends a single process, not a job, because the
-  lease set that protects services lives in `rootd`; and no unprotected
-  application job exists at boot yet (applications inherit `initd`'s protected
-  job), so the job path is covered by unit tests, source guards and mutants but
-  has not run in a live OOM episode.
+  lease set that protects services lives in `rootd`. Runtime applications are
+  now placed inside `loaderd`'s rootd-provisioned application realm and the
+  governor/settle path has been exercised in live 2048 MiB `--oom-hog` and
+  `--oom-hog-job-limit` KVM runs.
 
 Initial verification: the `job-lifecycle` TLA+ model (two spec mutants killed),
 seven kernel-ps unit tests, four compat tests, three implementation mutants

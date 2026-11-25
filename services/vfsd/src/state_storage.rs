@@ -335,6 +335,7 @@ impl VfsState {
                     | vfsd::proc_fs::ProcNode::NsDir
                     | vfsd::proc_fs::ProcNode::SysDir
                     | vfsd::proc_fs::ProcNode::SysFsDir
+                    | vfsd::proc_fs::ProcNode::SysKernelDir
                     | vfsd::proc_fs::ProcNode::SysFsInotifyDir => {
                         if writable || create || truncate {
                             return Err(EACCES);
@@ -693,6 +694,9 @@ impl VfsStorage {
             ProcNode::InotifySysctl(kind) => Ok(proc_fs::format_inotify_sysctl(kind)),
             ProcNode::FilesystemsFile => Ok(proc_fs::format_filesystems().to_vec()),
             ProcNode::MountsFile => Ok(proc_fs::format_mounts(&self.mounts.mount_infos())),
+            ProcNode::MountInfoFile => Ok(proc_fs::format_mountinfo(&self.mounts.mount_infos())),
+            ProcNode::CgroupFile => Ok(proc_fs::format_cgroup()),
+            ProcNode::SysKernelFile(kind) => Ok(proc_fs::format_sys_kernel(kind)),
             ProcNode::UptimeFile => {
                 Ok(proc_fs::format_uptime(rustos_svc_runtime::syscall::monotonic_nanos()))
             }
@@ -702,6 +706,7 @@ impl VfsStorage {
             | ProcNode::SysDir
             | ProcNode::SysFsDir
             | ProcNode::SysFsInotifyDir
+            | ProcNode::SysKernelDir
             | ProcNode::NsDir
             | ProcNode::NsLink(_)
             | ProcNode::Kernel(..) => Err(EINVAL),

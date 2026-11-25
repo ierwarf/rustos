@@ -72,6 +72,10 @@ def parse(path):
         opcode = integer(iface["opcode"], 1, 65535, where + ".opcode")
         if name in used_names or opcode in used_opcodes:
             raise ValueError(where + ": duplicate interface name or opcode")
+        # Each interface emits `<NAME>` and `<NAME>_FIELDS` constants, so one
+        # interface named `x_fields` would collide with the descriptor array of `x`.
+        if any(name == other + "_fields" or other == name + "_fields" for other in used_names):
+            raise ValueError(where + ": interface name collides with a generated *_fields constant")
         used_names.add(name)
         used_opcodes.add(opcode)
         fields = iface["fields"]
@@ -96,7 +100,8 @@ def parse(path):
                 raise ValueError(place + ": required must be boolean")
             rust_kind, fixed = TYPES[kind]
             if fixed is not None:
-                if "max_len" in field and field["max_len"] != fixed:
+                if "max_len" in field and (type(field["max_len"]) is not int
+                                           or field["max_len"] != fixed):
                     raise ValueError(place + ": fixed field width mismatch")
                 max_len = fixed
             else:

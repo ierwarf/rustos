@@ -40,6 +40,8 @@ pub const DT_LNK: u8 = 10;
 pub enum ProcKernelNode {
     Maps,
     Smaps,
+    /// `/proc/<pid>/smaps_rollup`: whole-process sums of the per-region facts.
+    SmapsRollup,
     Status,
     Stat,
     Statm,
@@ -66,7 +68,7 @@ pub enum ProcKernelNode {
 }
 
 /// The per-process regular files directly under `/proc/<pid>`, in listing order.
-pub const SELF_FILE_NODES: [(&str, ProcKernelNode); 11] = [
+pub const SELF_FILE_NODES: [(&str, ProcKernelNode); 12] = [
     ("auxv", ProcKernelNode::Auxv),
     ("cmdline", ProcKernelNode::Cmdline),
     ("comm", ProcKernelNode::Comm),
@@ -75,6 +77,7 @@ pub const SELF_FILE_NODES: [(&str, ProcKernelNode); 11] = [
     ("maps", ProcKernelNode::Maps),
     ("oom_score_adj", ProcKernelNode::OomScoreAdj),
     ("smaps", ProcKernelNode::Smaps),
+    ("smaps_rollup", ProcKernelNode::SmapsRollup),
     ("stat", ProcKernelNode::Stat),
     ("statm", ProcKernelNode::Statm),
     ("status", ProcKernelNode::Status),
@@ -116,6 +119,7 @@ impl ProcKernelNode {
             Self::Limits => 9,
             Self::Comm => 10,
             Self::OomScoreAdj => 11,
+            Self::SmapsRollup => 12,
             Self::FdDir => 32,
             Self::FdLink => 33,
             Self::TaskDir => 34,
@@ -139,6 +143,7 @@ impl ProcKernelNode {
             9 => Self::Limits,
             10 => Self::Comm,
             11 => Self::OomScoreAdj,
+            12 => Self::SmapsRollup,
             32 => Self::FdDir,
             33 => Self::FdLink,
             34 => Self::TaskDir,
@@ -695,7 +700,7 @@ mod tests {
 
     #[test]
     fn names_resolve_in_listing_order() {
-        let names: [&str; 11] = core::array::from_fn(|i| SELF_FILE_NODES[i].0);
+        let names: [&str; 12] = core::array::from_fn(|i| SELF_FILE_NODES[i].0);
         let mut sorted = names;
         sorted.sort_unstable();
         assert_eq!(names, sorted);

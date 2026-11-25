@@ -145,11 +145,12 @@ DWORD_PTR RtlRustosSetThreadAffinity(void *thread, DWORD_PTR thread_mask)
         NTDLL_API_RtlRustosSetThreadAffinity,
         (ULONGLONG)thread,
         thread_mask);
-    return result > 0u && result <= 0xffu ? (DWORD_PTR)result : 0u;
+    return result > 0u && result < (1ULL << RUSTOS_MAX_LOGICAL_CPUS)
+        ? (DWORD_PTR)result : 0u;
 }
 
 DWORD RtlRustosGetCurrentProcessorNumber(void)
 {
     ULONGLONG result = ntdll_syscall0(NTDLL_API_RtlRustosGetCurrentProcessorNumber);
-    return result <= 7u ? (DWORD)result : 0u;
+    return result < RUSTOS_MAX_LOGICAL_CPUS ? (DWORD)result : 0u;
 }

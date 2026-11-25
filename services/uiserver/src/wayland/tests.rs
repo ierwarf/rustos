@@ -2347,3 +2347,138 @@ fn surface_damage_scales_by_buffer_scale_while_damage_buffer_stays_in_buffer_pix
     );
     assert_eq!(surf.pixels[buf_w + 1], 0xff11_aa33);
 }
+
+/// Bind `wl_seat` (id 3) and `wl_compositor` (id 4), create `wl_surface` 5 and
+/// a keyboard (6) and pointer (7). Returns the display pieces and the surface.
+fn seat_client() -> (
+    wayland_server::Display<super::WaylandState>,
+    super::WaylandState,
+    std::os::unix::net::UnixStream,
+    wayland_server::backend::ClientId,
+    wayland_server::protocol::wl_surface::WlSurface,
+) {
+    use std::collections::HashMap;
+    let mut display = test_display();
+    let mut state = super::WaylandState::new(800, 600);
+    state.display_handle = Some(display.handle());
+    super::create_wayland_globals(&display.handle());
+    let (server_end, mut sock) = std::os::unix::net::UnixStream::pair().unwrap();
+    sock.set_nonblocking(true).unwrap();
+    let client_id = display
+        .handle()
+        .insert_client(server_end, Arc::new(super::WaylandClientState::default()))
+        .unwrap()
+        .id();
+    wire::send(&mut sock, &wire::message(1, 1, &wire::u32s(&[2])));
+    pump(&mut display, &mut state);
+    let mut names = HashMap::new();
+    for (_, op, p) in wire::events(&mut sock) {
+        if op == 0 {
+            let len = u32::from_ne_bytes(p[4..8].try_into().unwrap()) as usize;
+            names.insert(
+                String::from_utf8(p[8..8 + len - 1].to_vec()).unwrap(),
+                u32::from_ne_bytes(p[..4].try_into().unwrap()),
+            );
+        }
+    }
+    for (iface, ver, id) in [("wl_seat", 7, 3), ("wl_compositor", 6, 4)] {
+        let mut args = wire::u32s(&[names[iface]]);
+        args.extend(wire::string(iface));
+        args.extend(wire::u32s(&[ver, id]));
+        wire::send(&mut sock, &wire::message(2, 0, &args));
+    }
+    wire::send(&mut sock, &wire::message(4, 0, &wire::u32s(&[5])));
+    wire::send(&mut sock, &wire::message(3, 1, &wire::u32s(&[6])));
+    pump(&mut display, &mut state);
+    wire::events(&mut sock);
+    let surface = state
+        .surfaces
+        .last()
+        .unwrap()
+        .shared
+        .lock()
+        .unwrap()
+        .resource
+        .clone()
+        .unwrap();
+    (display, state, sock, client_id, surface)
+}
+
+#[test]
+fn keyboard_events_arrive_keymap_first_and_modifiers_follow_enter() {
+    let (mut display, mut state, mut sock, client_id, surface) = seat_client();
+    state.set_keyboard_focus(Some(super::KeyboardFocus {
+        surface,
+        client_id,
+    }));
+    pump(&mut display, &mut state);
+    let events = wire::events(&mut sock);
+    let order: Vec<u16> = events.iter().filter(|e| e.0 == 6).map(|e| e.1).collect();
+    assert_eq!(order, vec![1, 4], "enter then modifiers with one serial: {events:?}");
+    let enter = events.iter().find(|e| e.0 == 6 && e.1 == 1).unwrap();
+    let modifiers = events.iter().find(|e| e.0 == 6 && e.1 == 4).unwrap();
+    assert_eq!(enter.2[..4], modifiers.2[..4]);
+    assert_ne!(u32::from_ne_bytes(enter.2[..4].try_into().unwrap()), 0);
+}
+
+#[test]
+fn cursor_surface_takes_the_cursor_role_and_is_never_a_window_or_focus_target() {
+    let (mut display, mut state, mut sock, client_id, surface) = seat_client();
+    // wl_seat.get_pointer(7), wl_pointer.set_cursor(serial 1, surface 5, 0, 0)
+    wire::send(&mut sock, &wire::message(3, 0, &wire::u32s(&[7])));
+    wire::send(&mut sock, &wire::message(7, 0, &wire::u32s(&[1, 5, 0, 0])));
+    pump(&mut display, &mut state);
+    assert!(!wire::events(&mut sock).iter().any(|e| e.0 == 1 && e.1 == 0), "no wl_display.error");
+    {
+        let data = state.surfaces.last().unwrap().shared.clone();
+        let mut shared = data.lock().unwrap();
+        assert!(shared.cursor_role && shared.role_assigned);
+        // A 9x16 cursor buffer committed at scale 2.
+        shared.width = 18;
+        shared.height = 32;
+        shared.stride_pixels = 18;
+        shared.pixels = Arc::new(vec![0; 18 * 32]);
+    }
+    assert!(state.window_snapshots().is_empty(), "cursor surface must not be a window");
+    state.pointer_target = Some(state.surfaces.last().unwrap().shared.lock().unwrap().surface_id);
+    assert!(state.hit_test_pointer(0, 0).is_none());
+    state.set_keyboard_focus(Some(super::KeyboardFocus {
+        surface,
+        client_id,
+    }));
+    pump(&mut display, &mut state);
+    assert!(state.keyboard_focus.is_none());
+    assert!(!wire::events(&mut sock).iter().any(|e| e.0 == 6 && e.1 == 1), "no wl_keyboard.enter");
+}
+
+#[test]
+fn pointer_created_after_focus_receives_enter_and_frame_first() {
+    let (mut display, mut state, mut sock, client_id, surface) = seat_client();
+    state.pointer_focus = Some(super::PointerFocus {
+        surface,
+        client_id,
+        surface_x: 3.0,
+        surface_y: 4.0,
+    });
+    wire::send(&mut sock, &wire::message(3, 0, &wire::u32s(&[7])));
+    pump(&mut display, &mut state);
+    let order: Vec<u16> = wire::events(&mut sock)
+        .iter()
+        .filter(|e| e.0 == 7)
+        .map(|e| e.1)
+        .collect();
+    assert_eq!(order, vec![0, 5], "enter then frame");
+}
+
+#[test]
+fn keyboard_focus_on_a_destroyed_surface_is_refused() {
+    let (mut display, mut state, mut sock, client_id, surface) = seat_client();
+    state.surfaces.last().unwrap().shared.lock().unwrap().alive = false;
+    state.set_keyboard_focus(Some(super::KeyboardFocus {
+        surface,
+        client_id,
+    }));
+    pump(&mut display, &mut state);
+    assert!(state.keyboard_focus.is_none());
+    assert!(!wire::events(&mut sock).iter().any(|e| e.0 == 6 && e.1 == 1));
+}

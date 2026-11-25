@@ -105,15 +105,17 @@ def review_service(path: str, findings: list[Finding]) -> None:
     text = source(path)
     if path.endswith("/netd/src/socket_lifecycle.rs"):
         sock = lexical_block(text, "fn handle_socket(")
-        pair = lexical_block(text, "fn handle_socketpair(")
         close = lexical_block(text, "fn handle_close(")
         accept = lexical_block(text, "fn handle_accept(")
         for label, body, markers in [
             ("inet-charge", sock, ("provider_accounting::charge_before_publish(", "state.inet_sockets.insert(")),
-            ("unix-charge", sock, ("provider_accounting::charge_before_publish(", "state.sockets.insert(")),
-            ("socketpair-charge", pair, ("provider_accounting::charge_before_publish(left", "provider_accounting::charge_before_publish(right", "state.sockets.insert(")),
-            ("close-refund", close[close.find("retire_unix_socket("):], ("retire_unix_socket(", "provider_accounting::retire_final(")),
+            # AF_UNIX is kernel-local and socketpair is refused by netd, so the
+            # remaining non-inet identity netd publishes is the netlink socket.
+            ("netlink-charge", sock[sock.find("netlink_socket_admission("):],
+             ("provider_accounting::charge_before_publish(", "state.netlink_sockets.insert(")),
             ("inet-close-refund", close, ("state.inet_sockets.remove(", "drop(state)", "provider_accounting::retire_final(")),
+            ("netlink-close-refund", close[close.find("retire_netlink_socket("):],
+             ("retire_netlink_socket(", "drop(state)", "provider_accounting::retire_final(")),
             ("accept-charge", accept, ("provider_accounting::charge_before_publish(accepted", "prepare_socket_publication(")),
         ]:
             check(ordered(body, *markers), path, label,

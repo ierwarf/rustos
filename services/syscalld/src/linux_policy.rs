@@ -250,16 +250,20 @@ pub fn handle_prlimit64(
     let resource = request.flags;
     let has_new_limit = request.mask & 0x1 != 0;
     let wants_old_limit = request.mask & 0x2 != 0;
-    if target_pid != 0 && target_pid != request.pid {
-        response.status = errno::EACCES;
-        return;
-    }
+    // `resource` is validated before the target, as in Linux's `do_prlimit`.
     let Ok(resource_idx) = usize::try_from(resource) else {
         response.status = errno::EINVAL;
         return;
     };
     if resource_idx >= errno::RLIMIT_COUNT {
         response.status = errno::EINVAL;
+        return;
+    }
+    // Another process's limits are not tracked here (a process's state is
+    // created on its own first call), so naming one cannot be honoured. Linux
+    // reports a refused target as EPERM, never EACCES.
+    if target_pid != 0 && target_pid != request.pid {
+        response.status = errno::EPERM;
         return;
     }
     if has_new_limit && request.path_len as usize != LINUX_RLIMIT_SIZE {
@@ -444,6 +448,139 @@ pub fn handle_setgid(
     }
     response.status = 0;
     response.payload_len = 0;
+}
+
+/// `-1` ("leave unchanged") in the 32-bit id arguments of the `set*id` family.
+const ID_UNCHANGED: u64 = u32::MAX as u64;
+
+/// Decodes one optional id argument; values outside `u32` are malformed.
+fn optional_id(raw: u64) -> Result<Option<u32>, i32> {
+    if raw == ID_UNCHANGED {
+        Ok(None)
+    } else {
+        u32::try_from(raw).map(Some).map_err(|_| errno::EINVAL)
+    }
+}
+
+/// Real/effective/saved triple a `set*id` call edits, in uid or gid flavour.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IdTriple {
+    real: u32,
+    effective: u32,
+    saved: u32,
+}
+
+/// `setresuid(2)`/`setresgid(2)`: a privileged caller (`euid == 0`, the model
+/// `setuid` already uses for `CAP_SETUID`/`CAP_SETGID`) may set any value;
+/// others may only pick a value already held as real, effective or saved.
+fn apply_setres(
+    old: IdTriple,
+    privileged: bool,
+    real: Option<u32>,
+    effective: Option<u32>,
+    saved: Option<u32>,
+) -> Result<IdTriple, i32> {
+    let held = |id: u32| id == old.real || id == old.effective || id == old.saved;
+    if !privileged && [real, effective, saved].into_iter().flatten().any(|id| !held(id)) {
+        return Err(errno::EPERM);
+    }
+    Ok(IdTriple {
+        real: real.unwrap_or(old.real),
+        effective: effective.unwrap_or(old.effective),
+        saved: saved.unwrap_or(old.saved),
+    })
+}
+
+/// `setreuid(2)`/`setregid(2)`. An unprivileged caller may set the real id
+/// only to the current real or effective id, and the effective id to the
+/// current real, effective or saved id. The saved id follows the new effective
+/// id whenever the real id is set or the effective id changes from the old
+/// real id.
+fn apply_setre(
+    old: IdTriple,
+    privileged: bool,
+    real: Option<u32>,
+    effective: Option<u32>,
+) -> Result<IdTriple, i32> {
+    if !privileged {
+        if real.is_some_and(|id| id != old.real && id != old.effective) {
+            return Err(errno::EPERM);
+        }
+        if effective.is_some_and(|id| id != old.real && id != old.effective && id != old.saved) {
+            return Err(errno::EPERM);
+        }
+    }
+    let mut new = IdTriple {
+        real: real.unwrap_or(old.real),
+        effective: effective.unwrap_or(old.effective),
+        saved: old.saved,
+    };
+    if real.is_some() || effective.is_some_and(|id| id != old.real) {
+        new.saved = new.effective;
+    }
+    Ok(new)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetIdForm {
+    /// `setres[ug]id(real, effective, saved)`: `arg0..arg2`.
+    Res,
+    /// `setre[ug]id(real, effective)`: `arg0..arg1`.
+    Re,
+}
+
+pub fn handle_set_ids(
+    request: &LinuxSyscallOffloadRequest,
+    is_gid: bool,
+    form: SetIdForm,
+    response: &mut LinuxSyscallOffloadResponse,
+) {
+    let decoded = (|| {
+        let real = optional_id(request.arg0)?;
+        let effective = optional_id(request.arg1)?;
+        let saved = match form {
+            SetIdForm::Res => optional_id(request.arg2)?,
+            SetIdForm::Re if request.arg2 == 0 => None,
+            SetIdForm::Re => return Err(errno::EINVAL),
+        };
+        Ok((real, effective, saved))
+    })();
+    let (real, effective, saved) = match decoded {
+        Ok(ids) => ids,
+        Err(status) => {
+            response.status = status;
+            return;
+        }
+    };
+    let mut policy = policy_db().lock();
+    let state = ensure_state_with_inheritance(&mut policy, request);
+    let credentials = &mut state.credentials;
+    let privileged = credentials.euid == 0;
+    let old = if is_gid {
+        IdTriple { real: credentials.gid, effective: credentials.egid, saved: credentials.sgid }
+    } else {
+        IdTriple { real: credentials.uid, effective: credentials.euid, saved: credentials.suid }
+    };
+    let result = match form {
+        SetIdForm::Res => apply_setres(old, privileged, real, effective, saved),
+        SetIdForm::Re => apply_setre(old, privileged, real, effective),
+    };
+    match result {
+        Ok(new) => {
+            // The filesystem identity is derived from the effective id on
+            // every request, so it follows the change implicitly.
+            if is_gid {
+                (credentials.gid, credentials.egid, credentials.sgid) =
+                    (new.real, new.effective, new.saved);
+            } else {
+                (credentials.uid, credentials.euid, credentials.suid) =
+                    (new.real, new.effective, new.saved);
+            }
+            response.status = 0;
+            response.payload_len = 0;
+        }
+        Err(status) => response.status = status,
+    }
 }
 
 pub fn handle_memfd_create(
@@ -1215,6 +1352,17 @@ pub fn handle_mprotect(
         response.status = errno::EACCES;
         return;
     }
+    // A MAP_PRIVATE memfd view is admitted read-only and aliases the memfd
+    // frames: adding PROT_WRITE would write through to the memfd, not copy.
+    if prot & PROT_WRITE != 0
+        && state
+            .vmas
+            .overlapping(start, end)
+            .any(|vma| vma.kind == MmVmaKind::MemfdShared && (vma.mmap_flags & MAP_TYPE) == MAP_PRIVATE)
+    {
+        response.status = errno::EACCES;
+        return;
+    }
     if prot != 0 {
         for vma in state
             .vmas
@@ -1880,6 +2028,115 @@ mod tests {
         assert_eq!((credentials.gid, credentials.egid), (100, 200));
     }
 
+    fn ids_request(pid: u64, uid: u32, euid: u32, args: [u64; 3]) -> LinuxSyscallOffloadRequest {
+        LinuxSyscallOffloadRequest {
+            pid,
+            uid,
+            euid,
+            gid: uid,
+            egid: euid,
+            arg0: args[0],
+            arg1: args[1],
+            arg2: args[2],
+            ..LinuxSyscallOffloadRequest::default()
+        }
+    }
+
+    fn creds(pid: u64) -> Credentials {
+        policy_db().lock().get(&pid).unwrap().credentials
+    }
+
+    #[test]
+    fn setresuid_unprivileged_may_only_pick_held_ids() {
+        let pid = u64::MAX - 61;
+        let none = u32::MAX as u64;
+        let mut r = LinuxSyscallOffloadResponse::default();
+        // real=1000 effective=2000 saved=3000 (suid starts as euid, so set it first).
+        handle_set_ids(&ids_request(pid, 1000, 2000, [none, none, 1000]), false, SetIdForm::Res, &mut r);
+        assert_eq!(r.status, 0);
+        let mut r = LinuxSyscallOffloadResponse::default();
+        handle_set_ids(&ids_request(pid, 1000, 2000, [none, none, 4242]), false, SetIdForm::Res, &mut r);
+        assert_eq!(r.status, errno::EPERM);
+        let mut r = LinuxSyscallOffloadResponse::default();
+        handle_set_ids(&ids_request(pid, 1000, 2000, [2000, 1000, none]), false, SetIdForm::Res, &mut r);
+        assert_eq!(r.status, 0);
+        let c = creds(pid);
+        assert_eq!((c.uid, c.euid, c.suid), (2000, 1000, 1000));
+        // All -1 changes nothing.
+        let mut r = LinuxSyscallOffloadResponse::default();
+        handle_set_ids(&ids_request(pid, 1000, 2000, [none, none, none]), false, SetIdForm::Res, &mut r);
+        assert_eq!(r.status, 0);
+        assert_eq!((creds(pid).uid, creds(pid).euid), (2000, 1000));
+    }
+
+    #[test]
+    fn setresuid_privileged_sets_any_and_drops_irrevocably() {
+        let pid = u64::MAX - 62;
+        let mut r = LinuxSyscallOffloadResponse::default();
+        handle_set_ids(&ids_request(pid, 0, 0, [1000, 1001, 1002]), false, SetIdForm::Res, &mut r);
+        assert_eq!(r.status, 0);
+        let c = creds(pid);
+        assert_eq!((c.uid, c.euid, c.suid), (1000, 1001, 1002));
+        // Now unprivileged: cannot return to root.
+        let mut r = LinuxSyscallOffloadResponse::default();
+        handle_set_ids(&ids_request(pid, 0, 0, [0, 0, 0]), false, SetIdForm::Res, &mut r);
+        assert_eq!(r.status, errno::EPERM);
+        // Group ids are an independent triple and gid needs euid == 0 as well.
+        let mut r = LinuxSyscallOffloadResponse::default();
+        handle_set_ids(&ids_request(pid, 0, 0, [7, 7, 7]), true, SetIdForm::Res, &mut r);
+        assert_eq!(r.status, errno::EPERM);
+    }
+
+    #[test]
+    fn setres_rejects_out_of_range_ids() {
+        let mut r = LinuxSyscallOffloadResponse::default();
+        handle_set_ids(&ids_request(u64::MAX - 63, 0, 0, [1 << 32, 0, 0]), false, SetIdForm::Res, &mut r);
+        assert_eq!(r.status, errno::EINVAL);
+        let mut r = LinuxSyscallOffloadResponse::default();
+        handle_set_ids(&ids_request(u64::MAX - 63, 0, 0, [1, 2, 3]), false, SetIdForm::Re, &mut r);
+        assert_eq!(r.status, errno::EINVAL);
+    }
+
+    #[test]
+    fn setreuid_saved_id_rules_match_linux() {
+        let none = u32::MAX as u64;
+        // Privileged root swaps real and effective: saved follows the new euid.
+        let pid = u64::MAX - 64;
+        let mut r = LinuxSyscallOffloadResponse::default();
+        handle_set_ids(&ids_request(pid, 0, 0, [1000, none, 0]), false, SetIdForm::Re, &mut r);
+        assert_eq!(r.status, 0);
+        let c = creds(pid);
+        assert_eq!((c.uid, c.euid, c.suid), (1000, 0, 0));
+        // Setting only euid to the old real id leaves saved alone.
+        let pid = u64::MAX - 65;
+        let mut r = LinuxSyscallOffloadResponse::default();
+        handle_set_ids(&ids_request(pid, 1000, 2000, [none, 1000, 0]), false, SetIdForm::Re, &mut r);
+        assert_eq!(r.status, 0);
+        let c = creds(pid);
+        assert_eq!((c.uid, c.euid, c.suid), (1000, 1000, 2000));
+        // Setting euid to another id saves it.
+        let pid = u64::MAX - 66;
+        let mut r = LinuxSyscallOffloadResponse::default();
+        handle_set_ids(&ids_request(pid, 1000, 2000, [none, 2000, 0]), false, SetIdForm::Re, &mut r);
+        assert_eq!(r.status, 0);
+        assert_eq!(creds(pid).suid, 2000);
+        // Unprivileged real id must be the old real or effective id.
+        let pid = u64::MAX - 67;
+        let mut r = LinuxSyscallOffloadResponse::default();
+        handle_set_ids(&ids_request(pid, 1000, 2000, [3000, none, 0]), false, SetIdForm::Re, &mut r);
+        assert_eq!(r.status, errno::EPERM);
+        let mut r = LinuxSyscallOffloadResponse::default();
+        handle_set_ids(&ids_request(pid, 1000, 2000, [none, 3000, 0]), false, SetIdForm::Re, &mut r);
+        assert_eq!(r.status, errno::EPERM);
+        // Group flavour uses the gid triple.
+        let pid = u64::MAX - 68;
+        let mut r = LinuxSyscallOffloadResponse::default();
+        handle_set_ids(&ids_request(pid, 0, 0, [5, 6, 0]), true, SetIdForm::Re, &mut r);
+        assert_eq!(r.status, 0);
+        let c = creds(pid);
+        assert_eq!((c.gid, c.egid, c.sgid), (5, 6, 6));
+    }
+
     #[test]
     fn setpgid_refuses_an_unrelated_tracked_process() {
         let (victim, attacker, child) = (u64::MAX - 41, u64::MAX - 42, u64::MAX - 43);
@@ -2143,6 +2400,29 @@ mod tests {
     }
 
     #[test]
+    fn prlimit_refuses_a_foreign_target_with_eperm_after_validating_the_resource() {
+        let pid = u64::MAX - 33;
+        let base = LinuxSyscallOffloadRequest {
+            pid,
+            dirfd: pid + 1,
+            mask: 0x2,
+            ..LinuxSyscallOffloadRequest::default()
+        };
+        let mut response = LinuxSyscallOffloadResponse::default();
+        handle_prlimit64(
+            &LinuxSyscallOffloadRequest { flags: errno::RLIMIT_NOFILE, ..base },
+            &mut response,
+        );
+        assert_eq!(response.status, errno::EPERM);
+        handle_prlimit64(
+            &LinuxSyscallOffloadRequest { flags: 9999, ..base },
+            &mut response,
+        );
+        assert_eq!(response.status, errno::EINVAL);
+        handle_process_exit_pid(pid);
+    }
+
+    #[test]
     fn handle_id_inherits_parent_umask_and_pgid() {
         let parent_pid = 9901;
         let child_pid = 9902;
@@ -2330,6 +2610,52 @@ mod tests {
             "LIFECYCLE_EVENT_FORK {\n            linux_policy::handle_process_fork_pid(event.pid, event.parent_pid)"
         ));
 
+        handle_process_exit_pid(child_pid);
+    }
+
+    #[test]
+    fn mprotect_refuses_write_on_private_memfd_view_and_across_fork() {
+        let parent_pid = u64::MAX - 53;
+        let child_pid = u64::MAX - 54;
+        handle_process_exit_pid(parent_pid);
+        handle_process_exit_pid(child_pid);
+
+        let mut parent_state = MmPolicyState {
+            brk_start: 0x20_0000,
+            brk_current: 0x20_2000,
+            brk_mapped_end: 0x20_2000,
+            mmap_next: 0x50_0000,
+            user_range_start: LINUX_USER_SPACE_BASE,
+            user_range_end: LINUX_USER_SPACE_END,
+            vmas: VmaMap::new(),
+        };
+        insert_vma(
+            &mut parent_state,
+            MmVma {
+                start: 0x34_0000,
+                end: 0x34_4000,
+                prot: PROT_READ,
+                mmap_flags: MAP_PRIVATE,
+                kind: MmVmaKind::MemfdShared,
+            },
+        );
+        save_mm_state(parent_pid, parent_state);
+        handle_process_fork_pid(child_pid, parent_pid);
+
+        for pid in [parent_pid, child_pid] {
+            let req = LinuxSyscallOffloadRequest {
+                pid,
+                arg0: 0x34_0000,
+                arg1: PAGE_SIZE,
+                mask: (PROT_READ | PROT_WRITE) as u32,
+                ..LinuxSyscallOffloadRequest::default()
+            };
+            let mut resp = LinuxSyscallOffloadResponse::default();
+            handle_mprotect(&req, &mut resp);
+            assert_eq!(resp.status, errno::EACCES, "pid {pid}");
+        }
+
+        handle_process_exit_pid(parent_pid);
         handle_process_exit_pid(child_pid);
     }
 

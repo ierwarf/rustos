@@ -649,8 +649,16 @@ impl AppState {
         }
 
         if !order_unchanged {
+            // A newly mapped toplevel Wayland window takes focus and rises to
+            // the front, matching newly opened console windows and standard
+            // desktop behavior.
+            let newly_mapped = newly_mapped_focus_target(&previous_windows, &windows);
             self.wayland_windows = windows;
-            self.reconcile_window_stack();
+            if let Some(surface_id) = newly_mapped {
+                self.focus_wayland_window(surface_id);
+            } else {
+                self.reconcile_window_stack();
+            }
             return before_dirty
                 .union(self.wayland_stack_dirty_rect())
                 .union(self.wayland_taskbar_dirty_rect());
@@ -840,6 +848,50 @@ mod visual_update_tests {
         assert!(update.is_empty());
         assert!(!update.scene_dirty());
     }
+
+    #[test]
+    fn newly_mapped_toplevel_wayland_window_becomes_focus_target() {
+        use crate::wayland::WaylandWindowSnapshot;
+        use std::sync::Arc;
+        let win = |id, drag_icon, minimized| WaylandWindowSnapshot {
+            surface_id: id,
+            title: format!("win-{id}"),
+            frame: Rect { x: 0, y: 0, width: 100, height: 100 },
+            width: 100,
+            height: 100,
+            stride_pixels: 100,
+            pixels: Arc::new(Vec::new()),
+            content_version: 1,
+            damage: Rect::empty(),
+            minimized,
+            server_decoration: true,
+            drag_icon,
+        };
+        let w1 = win(1, false, false);
+        let w2 = win(2, false, false);
+        let drag = win(3, true, false);
+        let hidden = win(4, false, true);
+        assert_eq!(super::newly_mapped_focus_target(&[], &[w1.clone()]), Some(1));
+        assert_eq!(super::newly_mapped_focus_target(&[w1.clone()], &[w1.clone(), w2.clone()]), Some(2));
+        assert_eq!(super::newly_mapped_focus_target(&[w1.clone(), w2.clone()], &[w2.clone(), w1.clone()]), None);
+        assert_eq!(super::newly_mapped_focus_target(&[w1.clone()], &[w1.clone(), drag, hidden]), None);
+    }
+}
+
+/// Returns the newest newly mapped, visible, non-drag-icon Wayland window so
+/// opening an application raises and focuses it automatically.
+fn newly_mapped_focus_target(
+    previous: &[WaylandWindowSnapshot],
+    next: &[WaylandWindowSnapshot],
+) -> Option<u32> {
+    next.iter().rev().find_map(|window| {
+        (!window.drag_icon
+            && !window.minimized
+            && !previous
+                .iter()
+                .any(|old| old.surface_id == window.surface_id))
+        .then_some(window.surface_id)
+    })
 }
 
 #[cfg(test)]

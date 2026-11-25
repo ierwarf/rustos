@@ -1559,7 +1559,18 @@ impl<K: Ord + Clone> SharedPathStore<K> {
                 return Some(Err(err));
             }
         };
-        entry.len = entry.len.max(offset + written as u64);
+        let landed = entry.len.max(offset + written as u64);
+        if landed < end && end > entry.len {
+            // A short frame write must not leave the frames longer than the
+            // file (the tmpfs path shrinks back the same way).
+            if entry.frames.set_len(landed).is_err() {
+                // Frames stay longer than the file; publish their length so
+                // the two never disagree.
+                entry.len = end;
+                return Some(Ok((written, entry.len)));
+            }
+        }
+        entry.len = landed;
         Some(Ok((written, entry.len)))
     }
 
@@ -2700,6 +2711,19 @@ mod tests {
         let key = (1, String::from("file"));
         let backing = store.ensure_shared(key, "file", &*vol, short_frame_write_factory, true, 1).unwrap();
         assert_eq!(fake(backing.object).lock().data, b"0123456789abcdef".to_vec());
+    }
+
+    #[test]
+    fn shared_path_store_short_write_keeps_frames_as_long_as_the_file() {
+        let vol = alloc::sync::Arc::new(fs());
+        put(&vol, "file", b"hello");
+        let mut store: SharedPathStore<(u64, String)> = SharedPathStore::new();
+        let key = (1, String::from("file"));
+        let backing = store.ensure_shared(key.clone(), "file", &*vol, short_frame_write_factory, true, 1).unwrap();
+        // The frame writer lands two bytes of the ten requested at EOF.
+        assert_eq!(store.write_at(&key, 5, b"0123456789"), Some(Ok((2, 7))));
+        assert_eq!(store.len_of(&key), Some(7));
+        assert_eq!(fake(backing.object).lock().data.len(), 7);
     }
 
     #[test]

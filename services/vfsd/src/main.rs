@@ -770,6 +770,7 @@ pub(crate) fn format_kernel_proc_snapshot(
         node,
         Node::Maps
             | Node::Smaps
+            | Node::SmapsRollup
             | Node::Status
             | Node::Stat
             | Node::Statm
@@ -805,6 +806,7 @@ pub(crate) fn format_kernel_proc_snapshot(
     let bytes = match node {
         Node::Maps => snap::format_maps(&process.as_ref().ok_or(EIO)?.regions),
         Node::Smaps => snap::format_smaps(&process.as_ref().ok_or(EIO)?.regions),
+        Node::SmapsRollup => snap::format_smaps_rollup(process.as_ref().ok_or(EIO)?),
         Node::Status | Node::TaskStatus => {
             snap::format_status(process.as_ref().ok_or(EIO)?, thread.as_ref().ok_or(EIO)?)
         }

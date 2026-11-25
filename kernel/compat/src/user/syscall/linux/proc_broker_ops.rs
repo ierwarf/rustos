@@ -788,7 +788,7 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         ) -> Result<
             crate::user::process::SpawnedProcess,
             crate::user::process::ProcessLoadError,
-        > = if args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0 {
+        > = if spawn_starts_suspended(state.format, args.flags) {
             crate::user::process::spawn_prepared_process_suspended_with_scheduling_context
         } else if args.flags & LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64 != 0 {
             crate::user::process::spawn_prepared_process_with_scheduling_context
@@ -811,9 +811,51 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
                 spawned.pid,
                 qualification_required,
             )?;
+        } else if spawn_publishes_before_running(state.format) {
+            // Regions are published above; only now may the child run, so its
+            // own mprotect/munmap (ld.so RELRO) cannot precede the VMAs.
+            activate_published_spawn(
+                spawned.pid,
+                args.flags & LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64 != 0,
+                multitask::activate_suspended_user_task,
+                multitask::set_next_spawn_pick_hint,
+                |pid| {
+                    let _ = multitask::terminate_user_process(pid);
+                },
+            )?;
         }
         Ok(spawned.pid)
     })())
+}
+
+/// ELF64 images publish their exec image VMAs after the spawn, so the task must
+/// not be runnable until that publication is done.
+fn spawn_publishes_before_running(format: u16) -> bool {
+    format == PROC_BROKER_FORMAT_ELF64
+}
+
+fn spawn_starts_suspended(format: u16, flags: u64) -> bool {
+    flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0 || spawn_publishes_before_running(format)
+}
+
+/// Starts a spawn that was created suspended and whose image regions are
+/// published. A vanished target (killed meanwhile) is torn down exactly once
+/// and reported as ESRCH.
+fn activate_published_spawn(
+    pid: u64,
+    immediate_handoff: bool,
+    activate: impl FnOnce(u64) -> bool,
+    hint: impl FnOnce(u64),
+    terminate: impl FnOnce(u64),
+) -> Result<(), i64> {
+    if !activate(pid) {
+        terminate(pid);
+        return Err(LINUX_ESRCH);
+    }
+    if immediate_handoff {
+        hint(pid);
+    }
+    Ok(())
 }
 
 /// Records the one authority that may later start a process created suspended:

@@ -182,6 +182,7 @@ impl WaylandState {
                 continue;
             };
             if !surface.alive
+                || surface.cursor_role
                 || (surface.drag_icon_role && !surface.drag_icon_active)
                 || surface.pixels.is_empty()
                 || surface.width == 0
@@ -733,8 +734,8 @@ impl WaylandState {
         self.output_resources
             .retain(|output| output.resource.is_alive());
         for output in &self.output_resources {
-            output.resource.scale(next_scale);
             if output.resource.version() >= 2 {
+                output.resource.scale(next_scale);
                 output.resource.done();
             }
         }

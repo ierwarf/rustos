@@ -428,9 +428,13 @@ pub(super) fn handle_inet_recv_in_state(
     stack.poll_budget(8);
     let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
     if socket.can_recv() {
+        let flags = request_msg_flags(request);
+        if tcp_waitall_must_wait(flags, request.status_flags, socket, limit) {
+            return libc::EAGAIN;
+        }
         // MSG_PEEK must leave the bytes queued; consuming them would corrupt
         // the stream for liveness probes such as `recv(fd, &b, 1, MSG_PEEK)`.
-        let peek = request_msg_flags(request) & libc::MSG_PEEK as u64 != 0;
+        let peek = flags & libc::MSG_PEEK as u64 != 0;
         let dest = &mut response.payload[data_start..data_start + limit];
         let outcome = if peek { socket.peek_slice(dest) } else { socket.recv_slice(dest) };
         match outcome {
@@ -458,6 +462,32 @@ pub(super) fn handle_inet_recv_in_state(
     } else {
         libc::EAGAIN
     }
+}
+
+/// Linux `tcp_recvmsg` with `MSG_WAITALL` on a blocking socket does not return
+/// until `len` bytes are copied (or EOF, error, shutdown, signal). A short read
+/// here would hand a protocol that relies on it a truncated header. The
+/// request is retried by the blocking worker until the queue holds the whole
+/// request (capped at what the receive buffer can ever hold); a peer FIN
+/// (CloseWait and later) releases whatever is queued, like Linux's EOF.
+/// `MSG_DONTWAIT` and `O_NONBLOCK` keep the immediate partial-read behaviour.
+pub(super) fn tcp_waitall_must_wait(
+    msg_flags: u64,
+    status_flags: u64,
+    socket: &tcp::Socket,
+    limit: usize,
+) -> bool {
+    if msg_flags & libc::MSG_WAITALL as u64 == 0
+        || msg_flags & libc::MSG_DONTWAIT as u64 != 0
+        || status_flags & linux_abi::O_NONBLOCK != 0
+        // `may_recv` stays true while bytes are queued after the FIN, so the
+        // end of the stream is read from the connection state instead.
+        || tcp_receive_closed(socket)
+        || socket.state() == tcp::State::Closed
+    {
+        return false;
+    }
+    socket.recv_queue() < limit.min(socket.recv_capacity())
 }
 
 /// The peer's FIN has been received: reads return EOF, so the socket is both
@@ -1066,6 +1096,38 @@ mod tests {
         // A fresh connection on the recycled handle starts clean.
         forget_tcp_termination(client);
         assert!(!tcp_reset_pending(sockets.get::<tcp::Socket>(client), client));
+    }
+
+    #[test]
+    fn msg_waitall_holds_a_blocking_recv_until_the_whole_request_is_queued() {
+        let (mut iface, mut device, mut sockets, mut clock, client, server) = established();
+        sockets.get_mut::<tcp::Socket>(server).send_slice(b"abc").unwrap();
+        poll_loopback(&mut iface, &mut device, &mut sockets, &mut clock);
+        let waitall = libc::MSG_WAITALL as u64;
+        let socket = sockets.get::<tcp::Socket>(client);
+        assert_eq!(socket.recv_queue(), 3);
+        // Blocking + WAITALL for 5 bytes with 3 queued: wait.
+        assert!(tcp_waitall_must_wait(waitall, 0, socket, 5));
+        // Exactly satisfied, plain recv, DONTWAIT and O_NONBLOCK never wait.
+        assert!(!tcp_waitall_must_wait(waitall, 0, socket, 3));
+        assert!(!tcp_waitall_must_wait(0, 0, socket, 5));
+        assert!(!tcp_waitall_must_wait(waitall | libc::MSG_DONTWAIT as u64, 0, socket, 5));
+        assert!(!tcp_waitall_must_wait(waitall, linux_abi::O_NONBLOCK, socket, 5));
+        // A request larger than the receive buffer waits only for a full buffer.
+        sockets.get_mut::<tcp::Socket>(server).send_slice(&[7; 4093]).unwrap();
+        poll_loopback(&mut iface, &mut device, &mut sockets, &mut clock);
+        let socket = sockets.get::<tcp::Socket>(client);
+        assert_eq!(socket.recv_queue(), 4096);
+        assert!(!tcp_waitall_must_wait(waitall, 0, socket, 1 << 20));
+        // Peer FIN releases a short queue (EOF) instead of waiting forever.
+        let (mut iface, mut device, mut sockets, mut clock, client, server) = established();
+        sockets.get_mut::<tcp::Socket>(server).send_slice(b"ab").unwrap();
+        sockets.get_mut::<tcp::Socket>(server).close();
+        poll_loopback(&mut iface, &mut device, &mut sockets, &mut clock);
+        let socket = sockets.get::<tcp::Socket>(client);
+        assert!(tcp_receive_closed(socket));
+        assert_eq!(socket.recv_queue(), 2);
+        assert!(!tcp_waitall_must_wait(waitall, 0, socket, 100));
     }
 
     #[test]

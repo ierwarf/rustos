@@ -2669,6 +2669,7 @@ path = "services/rootd/src/main.rs"
 models = [
     "post-init-bootstrap-barrier/PostInitBootstrapBarrier",
     "post-init-supervisor-recovery/PostInitSupervisorRecovery",
+    "rootd-restart-backoff/RootdRestartBackoff",
     "scheduling-context-budget/SchedulingContextBudget",
     "service-heap-lifecycle/ServiceHeapLifecycle",
 ]

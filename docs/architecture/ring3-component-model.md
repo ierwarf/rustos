@@ -192,8 +192,9 @@ canonical generated IDL schema 520 (`provider_session_accounting`, exact
 172-byte frame; the earlier fixed 112-byte frame is rejected). The kernel
 stamps the sender; rootd checks the live lease, the positive service grant and
 the effective JobPolicy, then discovers the client Job by PID. netd charges
-before publishing an AF_INET/AF_UNIX socket or socketpair end and funds queued
-accepts only when they become public; vfsd charges each new open description
+before publishing an `AF_INET`/`AF_INET6`/`AF_NETLINK` socket and funds queued
+accepts only when they become public (`AF_UNIX` sockets are kernel-local and
+charged directly to the client Job via `page_lease.rs`); vfsd charges each new open description
 before its OPEN checkpoint and refunds at the final close tombstone. Duplicated
 fds share one charge. A lost reply keeps the exact token; an ambiguous CHARGE
 is fenced with CANCEL; terminal RELEASE/CANCEL receipts stay in a bounded

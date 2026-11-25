@@ -10,14 +10,18 @@ host, formal and KVM smoke evidence; that batch did not rerun Chrome.
 ## Privilege and launch boundary
 
 - Ring3 `vfsd` owns filesystem names, mounts, access policy, inode/open-description
-  lifetime, quotas and advisory-lock policy. `netd` owns sockets, message queues,
-  route-dump policy and filesystem-socket binding associations.
+  lifetime, quotas and advisory-lock policy. `netd` owns `AF_INET`/`AF_INET6`/`AF_NETLINK`
+  sockets and route/uevent policy, while `AF_UNIX` (stream/seqpacket/dgram + `SCM_RIGHTS`)
+  and persistent `epoll` live in Ring0 (`UnixSocketHandle` / `EpollHandle`, billed to the
+  client Job).
 - Ring0 owns the fd table, attested caller identity, bounded user copy, page
   tables, process/MM generations, capability/reference lifetime and transport.
   It does not invent another process's proc data or a private filesystem.
-- `vfsd` authorizes an own-process proc node before the kernel supplies its
-  facts. Other PIDs remain `ENOENT`; service proxy/replay authority must be
-  separately authenticated, never inferred from a payload PID.
+- `vfsd` authorizes proc nodes before the kernel supplies facts: `/proc/self`
+  and `/proc/<own pid>` expose full caller nodes (including `smaps_rollup`),
+  while foreign PIDs expose only `oom_score_adj` and `task[/<tid>[/{stat,status,comm}]]`
+  (all other foreign-PID nodes remain `ENOENT`). Service proxy/replay authority
+  must be separately authenticated, never inferred from a payload PID.
 - Chrome remains an opt-in desktop launch of
   `/apps/chrome/chrome --ozone-platform=wayland`. As of 2026-11-21 the manifest
   also carries the user-approved interim `--no-sandbox` (see
@@ -200,9 +204,9 @@ short trace does not waive their requested compatibility tests.
    ```
 
    A missing/corrupt second-boot marker is failure, not another first-boot pass.
-   The separate [378-check integration follow-up](session-handoff.md#chrome-filesystemnetwork-integration-2026-11-18)
-   passed persistence and still reported three failing cases in its last recorded
-   configuration. Do not equate the two probe profiles.
+   As of 2026-11-25, `--chrome-compat-probe` passes all **505 checks / 0 failures**
+   (including `memfd.keymap-scm-mmap`), and desktop Chrome holds pass across
+   2048/4096/6144 MiB KVM runs (see [Session Handoff](session-handoff.md)).
    Bugs found and fixed by the final runs: vfsd `memfd_create` offloaded to
    syscalld while syscalld waited for vfsd inside the `MAP_FILE_SHARED` broker op
    (self-deadlock, ETIMEDOUT; vfsd now applies the stateless memfd policy

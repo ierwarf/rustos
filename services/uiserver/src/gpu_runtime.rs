@@ -636,6 +636,7 @@ impl GpuCompositor {
         scene_dirty: bool,
     ) -> Result<Option<GpuPresentStats>, i32> {
         let total_started = Instant::now();
+        crate::note_present_step(crate::PRESENT_STEP_RETIRE);
         while self.retire_oldest(false)? {}
         if !self.active && !self.pending.is_empty() {
             // The activation frame is in flight; submitting another full
@@ -743,6 +744,7 @@ impl GpuCompositor {
             }
         }
         if full_rebuild {
+            crate::note_present_step(crate::PRESENT_STEP_SCENE);
             let allocate_started = Instant::now();
             let clear_len = self
                 .scratch_used_height
@@ -812,6 +814,7 @@ impl GpuCompositor {
             };
             self.capacity_pressure_logged_at = None;
             rebuild_scene_elapsed = scene_started.elapsed();
+            crate::note_present_step(crate::PRESENT_STEP_DIFF);
             let difference_started = Instant::now();
             let scan_height = if cropped {
                 self.info.atlas_height as usize
@@ -949,6 +952,7 @@ impl GpuCompositor {
         };
         let prepare_elapsed = prepare_started.elapsed();
         let surface_handle = self.slots[slot_index].surface.handle;
+        crate::note_present_step(crate::PRESENT_STEP_COPY);
         let copy_started = Instant::now();
         if let Err(err) = copy_atlas_damage_to_slot(
             self.slots[slot_index].mapping.pixels_mut(),
@@ -963,6 +967,7 @@ impl GpuCompositor {
             return Err(err);
         }
         let copy_elapsed = copy_started.elapsed();
+        crate::note_present_step(crate::PRESENT_STEP_SUBMIT);
         let submit_started = Instant::now();
         if let Err(err) = display_gpu_submit(
             self.display_fd,

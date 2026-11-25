@@ -101,6 +101,24 @@ pub(super) fn xkb_modifier_masks(bits: u32) -> (u32, u32) {
 }
 
 impl WaylandState {
+    /// A `wl_pointer` created while its client already owns the pointer focus
+    /// must still see `enter` before any motion or button event.
+    pub(super) fn announce_pointer(&mut self, pointer: &wl_pointer::WlPointer, client_id: &ClientId) {
+        let Some(focus) = self
+            .pointer_focus
+            .as_ref()
+            .filter(|focus| &focus.client_id == client_id && focus.surface.is_alive())
+        else {
+            return;
+        };
+        let (surface, x, y) = (focus.surface.clone(), focus.surface_x, focus.surface_y);
+        let serial = self.next_configure_serial();
+        pointer.enter(serial, &surface, x, y);
+        if pointer.version() >= 5 {
+            pointer.frame();
+        }
+    }
+
     /// Build the shared keymap once. `false` means no keyboard can be offered.
     pub(super) fn ensure_keymap(&mut self) -> bool {
         if self.keymap.is_some() {

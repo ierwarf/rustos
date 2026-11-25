@@ -330,6 +330,16 @@ pub(super) fn syscall_linux_syscalld_setid(op: u16, id: u64) -> u64 {
     })())
 }
 
+/// `setre[ug]id`/`setres[ug]id`: unmodified ids go to syscalld, which owns the
+/// credential triples. `ids` are the register values after 32-bit canonicalization.
+pub(super) fn syscall_linux_syscalld_set_ids(op: u16, ids: [u64; 3]) -> u64 {
+    let mut request = new_syscalld_request(op);
+    request.arg0 = ids[0];
+    request.arg1 = ids[1];
+    request.arg2 = ids[2];
+    linux_unit_result(call_syscalld_empty(request))
+}
+
 /// Current process umask, read through syscalld without changing it.
 pub(super) fn query_umask() -> Result<u32, i64> {
     let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_UMASK);

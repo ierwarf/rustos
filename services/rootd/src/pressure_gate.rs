@@ -176,6 +176,12 @@ impl PressureGate {
         {
             return false;
         }
+        // Re-check under the gate: a context that read the stale deadline
+        // before another pass finished must not run a second back-to-back pass.
+        if now_ns < self.next_pass_ns.load(Ordering::Acquire) {
+            self.busy.store(false, Ordering::Release);
+            return false;
+        }
         self.next_pass_ns
             .store(now_ns.saturating_add(interval_ns), Ordering::Release);
         pass();

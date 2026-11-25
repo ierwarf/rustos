@@ -24,14 +24,15 @@ launch = "new-session"
 # docs/architecture/job-model.md). A browser is a process tree: browser, GPU or
 # software compositor, network and storage utilities and one renderer per site,
 # so 24 processes. The browser process alone runs tens of threads (IO, UI,
-# thread-pool workers, compositor) and each renderer 10-20. 144 threads is what
-# a 256-slot task table leaves of its 192-thread application budget beside the
-# UI server's default share (192 - 48): the most Chrome can be granted while
-# the session UI is up. On a wider table the same request is a smaller fraction
-# and leaves room for other applications. Pages per process are left to the
-# loader's derived default (half of physical memory). UNMEASURED: both numbers
-# are reasoned headroom, not an observed need; take the real peak from a KVM run
-# and set them from that.
+# thread-pool workers, compositor) and each renderer 10-20. 144 threads fits
+# the 192-thread application budget a 256-slot task table leaves beside the
+# UI server's explicit request (`services/uiserver/RUSTOS.package.toml` asks for
+# 24 threads, so 192 - 24 = 168 remain for applications): 144 leaves 24 threads
+# of slack for other desktop applications while the session UI is up. On a wider
+# table the same request is a smaller fraction and leaves more room. Pages per
+# process are left to the loader's derived default (half of physical memory).
+# UNMEASURED: both numbers are reasoned headroom, not an observed need; take the
+# real peak from a KVM run and set them from that.
 request_processes = 24
 request_threads = 144
 # Interim: RustOS has no user namespaces or setuid sandbox yet, and /data may be

@@ -1,6 +1,15 @@
 # Chrome gap audit: memory, threads, processes, signals, time
 
-Read-only audit, 2026-11-14, against the dirty tree at `7a269bfc`. Target:
+Read-only historical audit (2026-11-14, against `7a269bfc`). **Status note (2026-11-25):**
+many items catalogued below have since landed (including `madvise` `DONTNEED`/`FREE`/`POPULATE_*`,
+10-resource `prlimit64`, `mremap` (`MM_BROKER_OP_MOVE`), `mlock`/`mlock2`/`mincore`/`msync`,
+`sysinfo`/`getrusage`/`getres[ug]id`/`setres[ug]id`/`setre[ug]id`/`sched_*`, `SIGBUS` on
+truncated file mappings, and `wl_keyboard.keymap` read-only memfd alias), and desktop
+Chrome (`--no-sandbox`) now runs cleanly through 60 s KVM holds (see [Session Handoff](session-handoff.md)).
+Sandbox items (M1 namespaces, M2 seccomp-bpf) and several SHOULD-FIX syscalls (`timerfd`/`signalfd`/`pidfd`,
+process-group `kill(pid <= 0)`, PI futex) remain open.
+
+Original scope note — target:
 `/apps/chrome/chrome --ozone-platform=wayland` (Chrome 157 amd64, software
 rendering over wl_shm), launched WITHOUT `--no-sandbox` (docs/ai/large-file-io-plan.md:240
 forbids adding it as a workaround). Dated evidence, not a proof of the current
@@ -9,7 +18,7 @@ checkout. Chrome behavior is from knowledge of the Chromium sources
 this session; items marked (unverified) depend on that.
 
 Out of scope and NOT listed as gaps: GPU acceleration, libgbm/DRM, >4 vCPU,
-`app_buffer` dmabuf (docs/ai/session-handoff.md:205,253). Networking, VFS,
+`app_buffer` dmabuf (see [Session Handoff](session-handoff.md)). Networking, VFS,
 epoll/eventfd/pipe and Wayland protocol gaps belong to other audits.
 
 ## 0. How dispatch works (evidence)
@@ -139,7 +148,7 @@ SET/GET_NAME, NO_NEW_PRIVS, DUMPABLE (`prctl_ops.rs:122`), rseq -> ENOSYS
   network/GPU process: a single window easily needs 150-250 live threads across 6-8 processes.
 - RustOS: `MAX_TASK = 256` for the whole machine (`kernel/ps/src/multitask/scheduler.rs:188`),
   128 threads/process, 64 processes, ~2 MiB kernel stack per thread, memory-bound at ~100-120
-  threads on a 2048M VM (docs/ai/session-handoff.md:19). The futex waiter table is a global
+  threads on a 2048M VM (2026-11-14 measurement). The futex waiter table is a global
   256-slot array whose overflow returns `EBUSY` (`futex_thread.rs:25,58,787-794`), an errno
   Linux futex never returns; glibc treats it as fatal in pthread_cond/mutex slow paths.
 - Sketch: measure real kernel stack depth first (handoff says to) and shrink; raise MAX_TASK
@@ -211,7 +220,7 @@ SET/GET_NAME, NO_NEW_PRIVS, DUMPABLE (`prctl_ops.rs:122`), rseq -> ENOSYS
 ## 4. OUT-OF-SCOPE or intentionally deferred
 
 - GPU acceleration, libgbm, DRM, dmabuf, vsync via KMS: stated out of scope
-  (docs/ai/session-handoff.md:205,253). `--ozone-platform=wayland` software path uses wl_shm
+  (see [Session Handoff](session-handoff.md)). `--ozone-platform=wayland` software path uses wl_shm
   and memfd, both present.
 - Crashpad/breakpad handler: Chrome continues without it; needs `ptrace`, `PR_SET_PTRACER`,
   `SO_PASSCRED`. Recommend launching with `--disable-breakpad` in the package

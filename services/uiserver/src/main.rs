@@ -129,6 +129,32 @@ pub(crate) fn note_wayland_step(step: usize) {
     WAYLAND_STEP.store(step, Ordering::Release);
 }
 
+static PRESENT_STEP: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) const PRESENT_STEP_NONE: usize = 0;
+pub(crate) const PRESENT_STEP_RETIRE: usize = 1;
+pub(crate) const PRESENT_STEP_SCENE: usize = 2;
+pub(crate) const PRESENT_STEP_DIFF: usize = 3;
+pub(crate) const PRESENT_STEP_COPY: usize = 4;
+pub(crate) const PRESENT_STEP_SUBMIT: usize = 5;
+pub(crate) const PRESENT_STEP_COMMIT: usize = 6;
+
+pub(crate) fn note_present_step(step: usize) {
+    PRESENT_STEP.store(step, Ordering::Release);
+}
+
+fn present_step_name(step: usize) -> &'static str {
+    match step {
+        PRESENT_STEP_RETIRE => "retire",
+        PRESENT_STEP_SCENE => "scene",
+        PRESENT_STEP_DIFF => "diff",
+        PRESENT_STEP_COPY => "copy",
+        PRESENT_STEP_SUBMIT => "submit",
+        PRESENT_STEP_COMMIT => "commit",
+        _ => "none",
+    }
+}
+
 fn wayland_step_name(step: usize) -> &'static str {
     match step {
         WAYLAND_STEP_ACCEPT => "accept",
@@ -185,10 +211,15 @@ impl UiLoopWatchdog {
             if elapsed_ms < ui_phase_panic_threshold_ms(phase_id, wayland_step) {
                 continue;
             }
+            let step_name = if phase_id == UI_PHASE_MAIN_PRESENT {
+                present_step_name(PRESENT_STEP.load(Ordering::Acquire))
+            } else {
+                wayland_step_name(wayland_step)
+            };
             diag_line(format!(
                 "uiserver watchdog panic: phase={} step={} elapsed_ms={} loop_seq={}",
                 ui_phase_name(phase_id),
-                wayland_step_name(wayland_step),
+                step_name,
                 elapsed_ms,
                 loop_seq.load(Ordering::Acquire),
             ));
@@ -717,6 +748,7 @@ fn run() -> Result<(), i32> {
                 &input_events,
             ),
         )?;
+        note_present_step(PRESENT_STEP_NONE);
         watchdog.leave();
         if input.input_events > 0 {
             let now = Instant::now();
@@ -813,6 +845,7 @@ fn run() -> Result<(), i32> {
             wayland.flush_clients();
             note_wayland_step(WAYLAND_STEP_NONE);
         }
+        note_present_step(PRESENT_STEP_NONE);
         watchdog.leave();
         phase_timings.wayland = wayland_started.elapsed();
 
@@ -835,6 +868,7 @@ fn run() -> Result<(), i32> {
             next_runtime_poll = now + RUNTIME_POLL_SLEEP;
             pending_update.absorb(apply_update);
         }
+        note_present_step(PRESENT_STEP_NONE);
         watchdog.leave();
         phase_timings.runtime = runtime_phase_started.elapsed();
 
@@ -859,6 +893,7 @@ fn run() -> Result<(), i32> {
             }
             next_console_poll = now + CONSOLE_POLL_SLEEP;
         }
+        note_present_step(PRESENT_STEP_NONE);
         watchdog.leave();
         phase_timings.console = console_phase_started.elapsed();
 
@@ -913,6 +948,7 @@ fn run() -> Result<(), i32> {
             present_drawable_update(&mut state, &drawable_update),
         )? {
             PresentUpdateResult::Rendered { deferred_update } => {
+                note_present_step(PRESENT_STEP_COMMIT);
                 commit_rendered_update(
                     "main-present",
                     &state,
@@ -927,7 +963,8 @@ fn run() -> Result<(), i32> {
                 true
             }
             PresentUpdateResult::StaleSurface => {
-                watchdog.leave();
+                note_present_step(PRESENT_STEP_NONE);
+        watchdog.leave();
                 pending_update.request_full();
                 continue 'main_loop;
             }
@@ -949,7 +986,8 @@ fn run() -> Result<(), i32> {
                 // separating the submission owner from the protocol owner is
                 // the general one.
                 wayland_frame_permit = true;
-                watchdog.leave();
+                note_present_step(PRESENT_STEP_NONE);
+        watchdog.leave();
                 profile::record_backpressure_retry();
                 profile::maybe_emit();
                 thread::sleep(DISPLAY_BACKPRESSURE_RETRY_DELAY);
@@ -977,6 +1015,7 @@ fn run() -> Result<(), i32> {
                 false
             }
         };
+        note_present_step(PRESENT_STEP_NONE);
         watchdog.leave();
 
         phase_timings.main_present = main_present_started.elapsed();
@@ -1154,7 +1193,8 @@ fn run() -> Result<(), i32> {
                     input_loop::InputWaitPhase::Returned => UI_PHASE_WAIT_RETURNED,
                 });
             });
-            watchdog.leave();
+            note_present_step(PRESENT_STEP_NONE);
+        watchdog.leave();
         }
         phase_timings.sleep = sleep_started.elapsed();
 

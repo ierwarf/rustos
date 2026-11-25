@@ -40,6 +40,8 @@ fn write_timeval_opt(response: &mut NetdIpcResponse, tv: (i64, i64)) -> i32 {
     0
 }
 
+// Linux `sock_getsockopt`/`sock_setsockopt` answer an unknown SOL_SOCKET option
+// with `ENOPROTOOPT` (never `EOPNOTSUPP`); callers probe with that errno.
 pub(super) fn handle_getsockopt(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
     if request.arg1 == netlink::SOL_NETLINK {
         return netlink::handle_getsockopt(request, response);
@@ -116,7 +118,7 @@ pub(super) fn handle_getsockopt_in_state(
                             }
                         }
                     }
-                    _ => return libc::EOPNOTSUPP,
+                    _ => return libc::ENOPROTOOPT,
                 };
                 return write_i32_opt(response, value);
             }
@@ -215,7 +217,7 @@ pub(super) fn handle_getsockopt_in_state(
         linux_abi::SO_PEERCRED => return libc::ENOTCONN,
         SO_RCVTIMEO => return write_timeval_opt(response, socket.options.recv_timeout),
         linux_abi::SO_SNDTIMEO => return write_timeval_opt(response, socket.options.snd_timeout),
-        _ => return libc::EOPNOTSUPP,
+        _ => return libc::ENOPROTOOPT,
     };
     write_i32_opt(response, value)
 }
@@ -386,7 +388,7 @@ pub(super) fn handle_setsockopt_in_state(state: &mut NetState, request: &NetdIpc
                             }
                         }
                     }
-                    _ => return libc::EOPNOTSUPP,
+                    _ => return libc::ENOPROTOOPT,
                 }
                 return 0;
             }
@@ -556,7 +558,7 @@ pub(super) fn handle_setsockopt_in_state(state: &mut NetState, request: &NetdIpc
             }
             socket.options.recv_buffer = clamp_socket_buffer(value);
         }
-        _ => return libc::EOPNOTSUPP,
+        _ => return libc::ENOPROTOOPT,
     }
     0
 }

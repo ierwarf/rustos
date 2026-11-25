@@ -34,6 +34,14 @@ typedef const WCHAR *PCWSTR;
 #define FALSE 0
 #define NULL ((void *)0)
 
+/*
+ * Must equal `CPU_TOPOLOGY_MAX_LOGICAL_CPUS` in libs/rustos-user-abi (and
+ * `MAX_SUPPORTED_CPUS` in kernel/hal): the kernel publishes a dense mask of up to
+ * this many online CPUs to Windows callers, so every bound derived from it here
+ * must track that constant or SYSTEM_INFO/affinity calls fail on large guests.
+ */
+#define RUSTOS_MAX_LOGICAL_CPUS 16u
+
 typedef struct _RUSTOS_SYSTEM_BASIC_INFORMATION {
     BYTE reserved1[24];
     PVOID reserved2[4];

@@ -471,3 +471,58 @@ fn thread_spawn_memory_failures_are_enomem_and_limits_are_eagain() {
         );
     }
 }
+
+#[test]
+fn elf_spawn_without_defer_publishes_regions_before_activation() {
+    assert!(spawn_starts_suspended(PROC_BROKER_FORMAT_ELF64, 0));
+    assert!(spawn_starts_suspended(
+        PROC_BROKER_FORMAT_ELF64,
+        LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64
+    ));
+    assert!(!spawn_starts_suspended(PROC_BROKER_FORMAT_PE64, 0));
+    assert!(spawn_starts_suspended(
+        PROC_BROKER_FORMAT_PE64,
+        LOADER_SPAWN_FLAG_DEFER_START as u64
+    ));
+    let source = include_str!("../proc_broker_ops.rs");
+    let commit = source
+        .split("pub(super) fn syscall_linux_rustos_proc_commit_broker")
+        .nth(1)
+        .and_then(|rest| rest.split("fn spawn_publishes_before_running").next())
+        .expect("commit broker");
+    let spawn = commit.find("spawn_fn(prepared").expect("spawn");
+    let publish = commit.find("publish_exec_image_regions").expect("publish");
+    let activate = commit.find("activate_published_spawn(").expect("activate");
+    assert!(spawn < publish && publish < activate);
+}
+
+#[test]
+fn published_spawn_activation_tears_down_once_on_failure() {
+    use core::cell::RefCell;
+    let log = RefCell::new(Vec::new());
+    let r = activate_published_spawn(
+        7,
+        true,
+        |p| {
+            log.borrow_mut().push(("activate", p));
+            false
+        },
+        |p| log.borrow_mut().push(("hint", p)),
+        |p| log.borrow_mut().push(("terminate", p)),
+    );
+    assert_eq!(r, Err(LINUX_ESRCH));
+    assert_eq!(*log.borrow(), [("activate", 7), ("terminate", 7)]);
+    log.borrow_mut().clear();
+    let r = activate_published_spawn(
+        8,
+        true,
+        |p| {
+            log.borrow_mut().push(("activate", p));
+            true
+        },
+        |p| log.borrow_mut().push(("hint", p)),
+        |p| log.borrow_mut().push(("terminate", p)),
+    );
+    assert_eq!(r, Ok(()));
+    assert_eq!(*log.borrow(), [("activate", 8), ("hint", 8)]);
+}

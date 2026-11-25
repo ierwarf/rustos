@@ -700,6 +700,14 @@ pub const SYSCALL_OFFLOAD_OP_LINUX_GETRESGID: u16 = 71;
 pub const SYSCALL_OFFLOAD_OP_LINUX_GETGROUPS: u16 = 72;
 pub const SYSCALL_OFFLOAD_OP_LINUX_GETPRIORITY: u16 = 73;
 pub const SYSCALL_OFFLOAD_OP_LINUX_SETPRIORITY: u16 = 74;
+/// `setresuid(2)`: `arg0..arg2` = real, effective, saved (`u32::MAX` = -1).
+pub const SYSCALL_OFFLOAD_OP_LINUX_SETRESUID: u16 = 76;
+/// `setresgid(2)`: same layout as [`SYSCALL_OFFLOAD_OP_LINUX_SETRESUID`].
+pub const SYSCALL_OFFLOAD_OP_LINUX_SETRESGID: u16 = 77;
+/// `setreuid(2)`: `arg0..arg1` = real, effective (`u32::MAX` = -1); `arg2` = 0.
+pub const SYSCALL_OFFLOAD_OP_LINUX_SETREUID: u16 = 78;
+/// `setregid(2)`: same layout as [`SYSCALL_OFFLOAD_OP_LINUX_SETREUID`].
+pub const SYSCALL_OFFLOAD_OP_LINUX_SETREGID: u16 = 79;
 /// `mremap(2)` mapping policy. Rides the compact address-space frame:
 /// `addr` = old address, `len` = old length, `offset` = new length,
 /// `flags` = `MREMAP_*`, `fd` = `MREMAP_FIXED` destination, `prot` = the

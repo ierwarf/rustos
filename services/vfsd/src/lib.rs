@@ -506,6 +506,8 @@ pub enum SeekPositionError {
     InvalidWhence,
     Negative,
     Overflow,
+    /// `SEEK_DATA`/`SEEK_HOLE` at or past EOF: `ENXIO`.
+    NoSuchPosition,
 }
 
 pub fn checked_seek_position(
@@ -514,6 +516,21 @@ pub fn checked_seek_position(
     offset: i64,
     whence: u64,
 ) -> Result<u64, SeekPositionError> {
+    // lseek(2) `SEEK_DATA`/`SEEK_HOLE`: vfsd tracks no per-file hole map, and
+    // the man page allows the minimal implementation (every file is one data
+    // run with the implicit hole at EOF), so tools such as `cp --sparse` see a
+    // dense file instead of `EINVAL`. `offset` is absolute; at or past EOF it
+    // is `ENXIO`.
+    if matches!(whence, 3 | 4) {
+        if offset < 0 {
+            return Err(SeekPositionError::Negative);
+        }
+        let offset = offset as u64;
+        if offset >= len {
+            return Err(SeekPositionError::NoSuchPosition);
+        }
+        return Ok(if whence == 3 { offset } else { len });
+    }
     let base = match whence {
         0 => 0_i128,
         1 => i128::from(cursor),
@@ -1512,6 +1529,22 @@ mod tests {
             checked_seek_position(0, 0, 0, 99),
             Err(SeekPositionError::InvalidWhence)
         );
+    }
+
+    #[test]
+    fn seek_data_and_hole_use_the_dense_file_model() {
+        // SEEK_DATA/SEEK_HOLE ignore the cursor; offset is absolute.
+        assert_eq!(checked_seek_position(500, 100, 10, 3), Ok(10));
+        assert_eq!(checked_seek_position(500, 100, 10, 4), Ok(100));
+        assert_eq!(checked_seek_position(0, 100, 99, 4), Ok(100));
+        // At or past EOF both are ENXIO (including an empty file).
+        for whence in [3, 4] {
+            assert_eq!(checked_seek_position(0, 100, 100, whence), Err(SeekPositionError::NoSuchPosition));
+            assert_eq!(checked_seek_position(0, 0, 0, whence), Err(SeekPositionError::NoSuchPosition));
+            assert_eq!(checked_seek_position(0, 100, i64::MAX, whence), Err(SeekPositionError::NoSuchPosition));
+            assert_eq!(checked_seek_position(0, 100, -1, whence), Err(SeekPositionError::Negative));
+        }
+        assert_eq!(checked_seek_position(0, 0, 0, 5), Err(SeekPositionError::InvalidWhence));
     }
 
     #[test]

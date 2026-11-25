@@ -31,7 +31,7 @@ const CHROME_PROBE_PERSIST_MARKERS: [&str; 2] = [
 ];
 /// One `chromeprobe: <case> ok` record per case, all required. Must match the
 /// case names in `apps/chromeprobe/chrome_probe.c`.
-const CHROME_PROBE_CASES: [&str; 47] = [
+const CHROME_PROBE_CASES: [&str; 48] = [
     "tmpfs.tmp",
     "tmpfs.devshm",
     "tmpfs.run",
@@ -76,6 +76,7 @@ const CHROME_PROBE_CASES: [&str; 47] = [
     "proc.mounts",
     "fdkind.fstat",
     "fdkind.memfd-ino",
+    "memfd.keymap-scm-mmap",
     "fdkind.opath-tmpfile",
     "fdkind.sendfile-copyrange",
     "fileops.extended",

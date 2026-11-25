@@ -306,7 +306,7 @@ static BOOL rustos_query_basic_system_information(
         &returned) == 0
         && returned == sizeof(*basic)
         && basic->number_of_processors > 0
-        && (BYTE)basic->number_of_processors <= 8u;
+        && (BYTE)basic->number_of_processors <= RUSTOS_MAX_LOGICAL_CPUS;
 }
 
 void GetSystemInfo(RUSTOS_SYSTEM_INFO *info)
@@ -329,9 +329,10 @@ void GetSystemInfo(RUSTOS_SYSTEM_INFO *info)
     info->lpMaximumApplicationAddress = (PVOID)0x000000ffffffffffULL;
     info->dwNumberOfProcessors = (DWORD)(BYTE)basic.number_of_processors;
     /*
-     * RustOS admits one dense fixed processor group of at most eight logical
-     * CPUs. SYSTEM_BASIC_INFORMATION exposes only the count; its other fields
-     * are reserved by Microsoft and must stay zero. Derive the documented
+     * RustOS admits one dense fixed processor group of at most
+     * RUSTOS_MAX_LOGICAL_CPUS (16) logical CPUs. SYSTEM_BASIC_INFORMATION
+     * exposes only the count; its other fields are reserved by Microsoft and
+     * must stay zero. Derive the documented
      * SYSTEM_INFO mask from that admitted dense topology instead of exporting
      * a private value through a reserved field.
      */

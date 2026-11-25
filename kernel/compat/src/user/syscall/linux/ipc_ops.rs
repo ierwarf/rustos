@@ -499,6 +499,29 @@ pub(super) fn current_process_service_capability_snapshot() -> Option<(u64, u64)
     Some((process_id, capabilities))
 }
 
+/// Lockless advisory check for whether `process_id` owns any currently
+/// published Ring3 service endpoint.
+///
+/// Used on syscall return paths (such as `futex`) that opportunistically pump
+/// retired-task runtime cleanup: a service process (e.g. `vfsd`, `netd`) must
+/// never synchronously issue blocking cross-service close IPC inside its own
+/// `FUTEX_WAKE`, which would self-deadlock its receive thread.
+pub(super) fn process_owns_any_published_service_endpoint(process_id: u64) -> bool {
+    if process_id == 0 {
+        return false;
+    }
+    for index in 0..MAX_SERVICE_ENDPOINTS {
+        // ORDERING: Acquire pairs with the Release store of `SERVICE_ENDPOINTS`
+        // after `SERVICE_ENDPOINT_OWNERS` is published.
+        if SERVICE_ENDPOINTS[index].load(Ordering::Acquire) != 0
+            && SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire) == process_id
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn syscall_linux_rustos_ipc_validate_service_owner(args_ptr: u64) -> u64 {
     linux_unit_result((|| {
         let args: RustosIpcValidateServiceOwnerArgs = read_user_struct_as(args_ptr)?;

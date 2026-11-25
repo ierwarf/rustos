@@ -1273,7 +1273,10 @@ impl ShmBuffer {
                     .and_then(|height| width.checked_mul(height))
             })
             .and_then(|pixels| pixels.checked_mul(4))
-            .filter(|len| *len != 0)
+            // `wl_shm.create_pool` takes the size as a signed 32-bit value and
+            // `create_buffer` the stride the same way; refuse what cannot be
+            // expressed instead of truncating it on the wire.
+            .filter(|len| *len != 0 && i32::try_from(*len).is_ok())
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
         let fd = create_memfd("wayclick-buffer")?;
         let rc = unsafe { libc::ftruncate(fd.as_raw_fd(), len_bytes as libc::off_t) };
@@ -1303,6 +1306,9 @@ impl ShmBuffer {
             qh,
             buffer_index,
         );
+        // The buffer keeps the backing alive; without this request the pool
+        // object and its fd stay pinned in the compositor for the connection.
+        pool.destroy();
         Ok(Self {
             wl_buffer: Some(wl_buffer),
             fd,

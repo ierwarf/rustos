@@ -251,6 +251,17 @@ impl<D: BlockDevice> FatVolume<D> {
         Ok((dir, canonical))
     }
 
+    /// Cuts a file back to `len` after a failed extension (best effort: the
+    /// error being reported is the original one).
+    fn rollback_growth(
+        file: &mut fatfs::File<'_, crate::FatDisk<D>, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
+        len: u64,
+    ) {
+        if file.seek(SeekFrom::Start(len)).is_ok() {
+            let _ = file.truncate();
+        }
+    }
+
     fn zero_fill(
         file: &mut fatfs::File<'_, crate::FatDisk<D>, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
         mut remaining: u64,
@@ -485,7 +496,10 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
         let mut file = entry.to_file();
         if offset > current_len {
             file.seek(SeekFrom::Start(current_len)).map_err(map_fat_error)?;
-            Self::zero_fill(&mut file, offset - current_len)?;
+            if let Err(error) = Self::zero_fill(&mut file, offset - current_len) {
+                Self::rollback_growth(&mut file, current_len);
+                return Err(error);
+            }
         } else {
             file.seek(SeekFrom::Start(offset)).map_err(map_fat_error)?;
         }
@@ -507,13 +521,19 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
         // fatfs writes one cluster at a time, so running out of space midway
         // has already grown the file. Persist that prefix and report it as a
         // short write instead of an error that hides the new length.
-        let flushed = file.flush().map_err(map_fat_error);
         if let Some(error) = failure {
             if written == 0 {
+                // A write that landed nothing must not leave the zero-filled
+                // gap behind: the caller sees an error, so the length it
+                // observes has to stay what it was.
+                if offset > current_len {
+                    Self::rollback_growth(&mut file, current_len);
+                }
+                let _ = file.flush();
                 return Err(error);
             }
         }
-        flushed?;
+        file.flush().map_err(map_fat_error)?;
         let new_len = current_len.max(offset + written as u64);
         Ok((written, new_len))
     }
@@ -547,7 +567,12 @@ impl<D: BlockDevice + Send + 'static> FsVolume for FatVolume<D> {
             file.truncate().map_err(map_fat_error)?;
         } else if new_len > current_len {
             file.seek(SeekFrom::Start(current_len)).map_err(map_fat_error)?;
-            Self::zero_fill(&mut file, new_len - current_len)?;
+            if let Err(error) = Self::zero_fill(&mut file, new_len - current_len) {
+                // Out of space midway: the extension is all-or-nothing.
+                Self::rollback_growth(&mut file, current_len);
+                let _ = file.flush();
+                return Err(error);
+            }
         }
         file.flush().map_err(map_fat_error)?;
         Ok(new_len)
@@ -1155,6 +1180,34 @@ mod tests {
         assert!(back.iter().all(|byte| *byte == 0x5a));
         // With nothing left, the failure is reported rather than hidden.
         assert_eq!(fs.write_at("big.bin", written as u64, &data[..1024]), Err(FsError::NoSpace));
+    }
+
+    #[test]
+    fn failed_extension_by_write_or_truncate_leaves_the_length_unchanged() {
+        let vol = FatVolume::new(format_disk(512, 4096, 0x0bad_f222)).unwrap();
+        let fs: &dyn FsVolume = &vol;
+        let create = FsOpenOptions { create: true, write: true, ..Default::default() };
+        fs.open_prepare("fill.bin", create).unwrap();
+        fs.open_prepare("small.bin", create).unwrap();
+        fs.write_at("small.bin", 0, b"abc").unwrap();
+        let free = fs.statfs().unwrap();
+        let capacity = (free.free_blocks * free.block_size) as usize;
+        // Leave less than one cluster free, then try to grow `small.bin` far
+        // past what is left: the zero-filled gap runs out of space.
+        let data = alloc::vec![1_u8; capacity];
+        let (filled, _) = fs.write_at("fill.bin", 0, &data).unwrap();
+        assert!(filled > 0);
+        let far = (capacity as u64) * 2;
+        assert_eq!(fs.write_at("small.bin", far, b"x"), Err(FsError::NoSpace));
+        assert_eq!(fs.metadata("small.bin").unwrap().len, 3);
+        assert_eq!(fs.truncate("small.bin", far), Err(FsError::NoSpace));
+        assert_eq!(fs.metadata("small.bin").unwrap().len, 3);
+        let mut back = [0_u8; 8];
+        assert_eq!(fs.read_at("small.bin", 0, &mut back), Ok(3));
+        assert_eq!(&back[..3], b"abc");
+        // The space the failed attempts grabbed is free again.
+        assert_eq!(fs.truncate("fill.bin", 0), Ok(0));
+        assert_eq!(fs.write_at("small.bin", 1024, b"ok"), Ok((2, 1026)));
     }
 
     #[test]

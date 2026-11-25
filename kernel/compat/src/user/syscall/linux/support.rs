@@ -96,6 +96,26 @@ pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> boo
     deliver_pending_signals_if_needed_with_saved_mask(frame, None)
 }
 
+/// Finishes a syscall whose result is `result`: delivers any pending signal
+/// with the result saved in the signal frame, exactly as the dispatcher's tail
+/// does. `saved_mask` is the mask `sigreturn` must restore (a syscall that
+/// ran under a temporary mask passes its original one). Returns the value the
+/// syscall returns and whether a signal frame was installed.
+pub(super) fn complete_syscall_with_signals(
+    frame: &mut SyscallFrame,
+    result: u64,
+    saved_mask: Option<u64>,
+) -> (u64, bool) {
+    // The signal frame saves `frame.rax`: it must hold this syscall's result,
+    // not its number, or sigreturn resumes with the wrong value.
+    let number = core::mem::replace(&mut frame.rax, result);
+    if deliver_pending_signals_if_needed_with_saved_mask(frame, saved_mask) {
+        return (frame.rax, true);
+    }
+    frame.rax = number;
+    (result, false)
+}
+
 pub(super) fn deliver_pending_signals_if_needed_with_saved_mask(
     frame: &mut SyscallFrame,
     saved_mask_override: Option<u64>,
@@ -383,7 +403,16 @@ fn install_rt_signal_frame(
             if let Some(state) = linux_thread_state.as_mut() {
                 state.signal_mask = sanitize_signal_mask(saved_mask | action.mask | signal_bit);
                 if using_altstack {
-                    state.signal_stack.flags |= linux_abi::SS_ONSTACK;
+                    if saved_stack.flags & linux_abi::SS_AUTODISARM != 0 {
+                        state.signal_stack = linux_abi::LinuxSignalStack {
+                            sp: 0,
+                            flags: linux_abi::SS_DISABLE,
+                            _pad: 0,
+                            size: 0,
+                        };
+                    } else {
+                        state.signal_stack.flags |= linux_abi::SS_ONSTACK;
+                    }
                 }
             }
         },

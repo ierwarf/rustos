@@ -19,7 +19,7 @@
 
 mod update_control;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::CString;
 use std::io::Write;
 use std::mem::size_of;
@@ -82,14 +82,23 @@ const INPUTD_EXEC_PATH: &str = "services/inputd/inputd.elf";
 // supervisor's nonblocking sources on one bounded timer. A 2 ms cadence left
 // an otherwise idle User-class task runnable often enough to crowd the UI.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// First relaunch delay; doubles per recent failure up to `RETRY_BACKOFF_MAX`.
 const RETRY_BACKOFF: Duration = Duration::from_millis(50);
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const ROOTD_LEASE_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(100);
 const ROOTD_LEASE_RECOVERY_TIMEOUT: Duration =
     Duration::from_millis(IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS);
-const INITD_LAUNCH_MAX_FAILURES: u32 = 32;
-/// Uptime after which a replacement counts as sustained health and the next
-/// exit starts a fresh failure budget.
-const INITD_LAUNCH_HEALTHY_RESET: Duration = Duration::from_secs(60);
+/// Restart intensity: this many launch failures inside one
+/// `INITD_LAUNCH_FAILURE_WINDOW` is a crash loop and fails closed. With the
+/// capped exponential backoff a service that dies instantly reaches it only
+/// after ~51 s of continuous looping (the former flat 50 ms x 32 took 1.6 s);
+/// one that stays up more than a few seconds per incarnation never does.
+const INITD_LAUNCH_MAX_FAILURES: u32 = 16;
+/// Sliding window over which failures are counted. Failures older than this
+/// are forgotten, so sustained health decays both the count and the backoff.
+/// Same period rootd uses to forgive its restart budget.
+const INITD_LAUNCH_FAILURE_WINDOW: Duration =
+    Duration::from_millis(rustos_user_abi::performance::SERVICE_HEALTHY_FORGIVENESS_MS);
 const ROOTD_LEASE_REPORT_MAX_ATTEMPTS: u32 = 16;
 const DEFAULT_INIT_TASK_WEIGHT_MICROS: u64 = 1_000;
 const EARLY_POLICY_TASK_WEIGHT_MICROS: u64 = 4_000;
@@ -127,33 +136,51 @@ struct RunningService {
 #[derive(Clone, Debug)]
 struct RetryState {
     next_attempt: Instant,
+    /// Failures inside the sliding window as of the last `note_failure`.
     failures: u32,
-    /// Start of the replacement currently being supervised; consumed by the
-    /// next failure so a launch error that never ran cannot claim its uptime.
-    spawned_at: Option<Instant>,
+    /// Instants of the failures still inside `INITD_LAUNCH_FAILURE_WINDOW`
+    /// (bounded by `INITD_LAUNCH_MAX_FAILURES`).
+    recent: VecDeque<Instant>,
+}
+
+/// Delay before relaunch after `failures` recent failures: 50 ms doubling to
+/// `RETRY_BACKOFF_MAX`.
+fn retry_backoff(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(16);
+    RETRY_BACKOFF
+        .saturating_mul(1u32 << shift)
+        .min(RETRY_BACKOFF_MAX)
 }
 
 impl RetryState {
-    fn note_spawned(&mut self, now: Instant) {
-        // Creation/endpoint publication is not evidence of sustained health.
-        // The failure budget survives replacements and is only forgiven by a
-        // replacement that then stays up for `INITD_LAUNCH_HEALTHY_RESET`.
-        self.next_attempt = now;
-        self.spawned_at = Some(now);
+    fn new(now: Instant) -> Self {
+        Self {
+            next_attempt: now,
+            failures: 0,
+            recent: VecDeque::new(),
+        }
     }
 
+    fn note_spawned(&mut self, now: Instant) {
+        // Creation/endpoint publication is not evidence of sustained health.
+        // Failures are forgiven only by the passage of the failure window.
+        self.next_attempt = now;
+    }
+
+    /// Records a failed incarnation and schedules the relaunch. Returns true
+    /// when the sliding-window crash-loop limit is reached.
     fn note_failure(&mut self, now: Instant) -> bool {
-        if let Some(spawned_at) = self.spawned_at.take() {
-            // Crash-loop exhaustion must mean consecutive short-lived
-            // incarnations. A service that ran healthily for this long and
-            // then died starts a new budget instead of consuming one that
-            // accumulated over the whole uptime of initd.
-            if now.saturating_duration_since(spawned_at) >= INITD_LAUNCH_HEALTHY_RESET {
-                self.failures = 0;
-            }
+        while self.recent.front().is_some_and(|&at| {
+            now.saturating_duration_since(at) >= INITD_LAUNCH_FAILURE_WINDOW
+        }) {
+            self.recent.pop_front();
         }
-        self.failures = self.failures.saturating_add(1);
-        self.next_attempt = now + RETRY_BACKOFF;
+        if self.recent.len() >= INITD_LAUNCH_MAX_FAILURES as usize {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(now);
+        self.failures = self.recent.len() as u32;
+        self.next_attempt = now + retry_backoff(self.failures);
         self.failures >= INITD_LAUNCH_MAX_FAILURES
     }
 }
@@ -1093,11 +1120,7 @@ fn record_launch_failure(
 ) {
     let state = retry_state
         .entry(exec_path.to_string())
-        .or_insert_with(|| RetryState {
-            next_attempt: Instant::now(),
-            failures: 0,
-            spawned_at: None,
-        });
+        .or_insert_with(|| RetryState::new(Instant::now()));
     if state.note_failure(Instant::now()) {
         fail_closed(&format!(
             "initd: fatal launch failure exec={exec_path} reason={reason} status={status} failures={}",
@@ -1149,13 +1172,10 @@ fn defer_launch_without_charge(
     exec: &str,
     now: Instant,
 ) {
-    let state = retry_state.entry(exec.to_string()).or_insert_with(|| RetryState {
-        next_attempt: now,
-        failures: 0,
-        spawned_at: None,
-    });
+    let state = retry_state
+        .entry(exec.to_string())
+        .or_insert_with(|| RetryState::new(now));
     state.next_attempt = now + RETRY_BACKOFF;
-    state.spawned_at = None;
 }
 
 fn fail_closed(message: &str) -> ! {

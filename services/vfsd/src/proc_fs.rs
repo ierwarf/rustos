@@ -71,6 +71,15 @@ pub enum InotifySysctlKind {
     MaxQueuedEvents,
 }
 
+/// Constant `/proc/sys/kernel/*` strings; they mirror the `uname(2)` fields
+/// reported by the kernel (`local_utsname`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SysKernelKind {
+    OsType,
+    OsRelease,
+    Hostname,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcNode {
     /// `/proc/self`: symlink to the caller's pid.
@@ -91,6 +100,14 @@ pub enum ProcNode {
     UptimeFile,
     /// `/proc/sys`
     SysDir,
+    /// `/proc/sys/kernel`
+    SysKernelDir,
+    /// `/proc/sys/kernel/{ostype,osrelease,hostname}`
+    SysKernelFile(SysKernelKind),
+    /// `/proc/<caller pid>/mountinfo`: mount table in mountinfo syntax.
+    MountInfoFile,
+    /// `/proc/<caller pid>/cgroup`: cgroup membership (no hierarchy mounted).
+    CgroupFile,
     /// `/proc/sys/fs`
     SysFsDir,
     /// `/proc/sys/fs/inotify`
@@ -168,6 +185,10 @@ pub fn lookup(path: &str, caller_pid: u64) -> Option<Result<ProcNode, i32>> {
             ["fs", "inotify", "max_queued_events"] => {
                 Ok(ProcNode::InotifySysctl(InotifySysctlKind::MaxQueuedEvents))
             }
+            ["kernel"] => Ok(ProcNode::SysKernelDir),
+            ["kernel", "ostype"] => Ok(ProcNode::SysKernelFile(SysKernelKind::OsType)),
+            ["kernel", "osrelease"] => Ok(ProcNode::SysKernelFile(SysKernelKind::OsRelease)),
+            ["kernel", "hostname"] => Ok(ProcNode::SysKernelFile(SysKernelKind::Hostname)),
             _ => Err(ENOENT),
         });
     }
@@ -219,6 +240,8 @@ fn lookup_in_pid_dir(parts: &[&str]) -> Result<ProcNode, i32> {
         [] => Ok(ProcNode::PidDir),
         ["exe"] => Ok(ProcNode::ExeLink),
         ["mounts"] => Ok(ProcNode::MountsFile),
+        ["mountinfo"] => Ok(ProcNode::MountInfoFile),
+        ["cgroup"] => Ok(ProcNode::CgroupFile),
         ["fd"] => kernel(ProcKernelNode::FdDir, 0),
         ["fd", fd] => match abi_procfs::parse_decimal(fd) {
             Some(fd) => kernel(ProcKernelNode::FdLink, fd),
@@ -272,6 +295,7 @@ pub const fn is_ring3_formatted(kernel: ProcKernelNode) -> bool {
         kernel,
         ProcKernelNode::Maps
             | ProcKernelNode::Smaps
+            | ProcKernelNode::SmapsRollup
             | ProcKernelNode::Status
             | ProcKernelNode::Stat
             | ProcKernelNode::Statm
@@ -333,6 +357,8 @@ pub fn pid_dir_entries() -> Vec<(&'static str, u8)> {
     entries.push(("exe", DT_LNK));
     entries.push(("fd", DT_DIR));
     entries.push(("mounts", DT_REG));
+    entries.push(("mountinfo", DT_REG));
+    entries.push(("cgroup", DT_REG));
     entries.push(("ns", DT_DIR));
     entries.push(("task", DT_DIR));
     for (name, _) in SELF_FILE_NODES {
@@ -354,6 +380,9 @@ pub fn is_virtual_file(node: ProcNode) -> bool {
             | ProcNode::MeminfoFile
             | ProcNode::FilesystemsFile
             | ProcNode::MountsFile
+            | ProcNode::MountInfoFile
+            | ProcNode::CgroupFile
+            | ProcNode::SysKernelFile(_)
             | ProcNode::UptimeFile
             | ProcNode::InotifySysctl(_)
     )
@@ -554,7 +583,12 @@ pub fn format_inotify_sysctl(kind: InotifySysctlKind) -> Vec<u8> {
 
 pub fn proc_sys_dir_children(path: &str) -> Option<&'static [(&'static str, u8)]> {
     Some(match path {
-        "/proc/sys" => &[("fs", DT_DIR)],
+        "/proc/sys" => &[("fs", DT_DIR), ("kernel", DT_DIR)],
+        "/proc/sys/kernel" => &[
+            ("hostname", DT_REG),
+            ("osrelease", DT_REG),
+            ("ostype", DT_REG),
+        ],
         "/proc/sys/fs" => &[("inotify", DT_DIR)],
         "/proc/sys/fs/inotify" => &[
             ("max_queued_events", DT_REG),
@@ -594,7 +628,25 @@ pub fn format_filesystems() -> &'static [u8] {
 /// the fixed virtual filesystems, then the memory-filesystem mounts.
 pub fn format_mounts(mounts: &[crate::mount_table::MountInfo<'_>]) -> Vec<u8> {
     let mut out = String::new();
-    let row = |out: &mut String, info: &crate::mount_table::MountInfo<'_>| {
+    for row in mount_rows(mounts) {
+        out.push_str(&format!(
+            "{} {} {} {} 0 0\n",
+            row.source, row.mount_point, row.fs_type, row.options
+        ));
+    }
+    out.into_bytes()
+}
+
+struct MountRow<'a> {
+    source: &'a str,
+    mount_point: &'a str,
+    fs_type: &'a str,
+    options: &'static str,
+    read_only: bool,
+}
+
+fn mount_rows<'a>(mounts: &'a [crate::mount_table::MountInfo<'a>]) -> Vec<MountRow<'a>> {
+    let row = |info: &'a crate::mount_table::MountInfo<'a>| {
         let source = match (info.fs_type, info.mount_point) {
             ("vfat", "/") => "boot",
             ("vfat", _) => "data",
@@ -606,21 +658,63 @@ pub fn format_mounts(mounts: &[crate::mount_table::MountInfo<'_>]) -> Vec<u8> {
             (_, true) => "ro,nosuid,nodev",
             (_, false) => "rw,nosuid,nodev",
         };
-        out.push_str(&format!(
-            "{source} {} {} {options} 0 0\n",
-            info.mount_point, info.fs_type
-        ));
+        MountRow {
+            source,
+            mount_point: info.mount_point,
+            fs_type: info.fs_type,
+            options,
+            read_only: info.read_only,
+        }
     };
-    for info in mounts.iter().filter(|info| info.fs_type == "vfat") {
-        row(&mut out, info);
-    }
-    out.push_str("devtmpfs /dev devtmpfs rw,nosuid 0 0\n");
-    out.push_str("proc /proc proc ro,nosuid,nodev,noexec 0 0\n");
-    out.push_str("sysfs /sys sysfs ro,nosuid,nodev,noexec 0 0\n");
-    for info in mounts.iter().filter(|info| info.fs_type != "vfat") {
-        row(&mut out, info);
+    let fixed = |source, mount_point, fs_type, options, read_only| MountRow {
+        source,
+        mount_point,
+        fs_type,
+        options,
+        read_only,
+    };
+    let mut rows = Vec::new();
+    rows.extend(mounts.iter().filter(|info| info.fs_type == "vfat").map(row));
+    rows.push(fixed("devtmpfs", "/dev", "devtmpfs", "rw,nosuid", false));
+    rows.push(fixed("proc", "/proc", "proc", "ro,nosuid,nodev,noexec", true));
+    rows.push(fixed("sysfs", "/sys", "sysfs", "ro,nosuid,nodev,noexec", true));
+    rows.extend(mounts.iter().filter(|info| info.fs_type != "vfat").map(row));
+    rows
+}
+
+/// `/proc/<pid>/mountinfo` (proc(5)): `id parent major:minor root mount-point
+/// options - fstype source super-options`. Ids are the row index plus one; every
+/// mount is a child of the first (root) row, which is its own parent. The
+/// minor number is the mount id (distinct anonymous devices).
+pub fn format_mountinfo(mounts: &[crate::mount_table::MountInfo<'_>]) -> Vec<u8> {
+    let mut out = String::new();
+    for (index, row) in mount_rows(mounts).iter().enumerate() {
+        let id = index + 1;
+        let parent = if row.mount_point == "/" { id } else { 1 };
+        let super_opts = if row.read_only { "ro" } else { "rw" };
+        let per_mount = row.options.split(',').next().unwrap_or("rw");
+        let rest = row.options.strip_prefix(per_mount).unwrap_or("");
+        out.push_str(&format!(
+            "{id} {parent} 0:{id} / {} {per_mount}{rest} - {} {} {super_opts}\n",
+            row.mount_point, row.fs_type, row.source
+        ));
     }
     out.into_bytes()
+}
+
+/// `/proc/<pid>/cgroup`: only the default (v2) hierarchy exists and every task
+/// is in its root, which is the Linux output when no controller is mounted.
+pub fn format_cgroup() -> Vec<u8> {
+    b"0::/\n".to_vec()
+}
+
+pub fn format_sys_kernel(kind: SysKernelKind) -> Vec<u8> {
+    let text: &[u8] = match kind {
+        SysKernelKind::OsType => b"RustOS\n",
+        SysKernelKind::OsRelease => b"6.6.0-rustos\n",
+        SysKernelKind::Hostname => b"rustos\n",
+    };
+    text.to_vec()
 }
 
 /// Formats kernel monotonic uptime in `/proc/uptime` centisecond precision.
@@ -711,6 +805,10 @@ pub fn link_target(node: ProcNode, caller_pid: u64, exec_path: &[u8]) -> Result<
         | ProcNode::SysDir
         | ProcNode::SysFsDir
         | ProcNode::SysFsInotifyDir
+        | ProcNode::SysKernelDir
+        | ProcNode::SysKernelFile(_)
+        | ProcNode::MountInfoFile
+        | ProcNode::CgroupFile
         | ProcNode::Kernel(..)
         | ProcNode::CpuinfoFile
         | ProcNode::MeminfoFile
@@ -766,6 +864,18 @@ fn node_inode(node: ProcNode, caller_pid: u64) -> u64 {
         ProcNode::UptimeFile => name.push_str("uptime"),
         ProcNode::SysDir => name.push_str("sys"),
         ProcNode::SysFsDir => name.push_str("sys/fs"),
+        ProcNode::SysKernelDir => name.push_str("sys/kernel"),
+        ProcNode::SysKernelFile(SysKernelKind::OsType) => name.push_str("sys/kernel/ostype"),
+        ProcNode::SysKernelFile(SysKernelKind::OsRelease) => name.push_str("sys/kernel/osrelease"),
+        ProcNode::SysKernelFile(SysKernelKind::Hostname) => name.push_str("sys/kernel/hostname"),
+        ProcNode::MountInfoFile => {
+            name.push_str(core::str::from_utf8(&pid).unwrap_or(""));
+            name.push_str("/mountinfo");
+        }
+        ProcNode::CgroupFile => {
+            name.push_str(core::str::from_utf8(&pid).unwrap_or(""));
+            name.push_str("/cgroup");
+        }
         ProcNode::SysFsInotifyDir => name.push_str("sys/fs/inotify"),
         ProcNode::InotifySysctl(InotifySysctlKind::MaxUserWatches) => {
             name.push_str("sys/fs/inotify/max_user_watches")
@@ -796,6 +906,7 @@ fn node_mode(node: ProcNode) -> u32 {
         | ProcNode::NsDir
         | ProcNode::SysDir
         | ProcNode::SysFsDir
+        | ProcNode::SysKernelDir
         | ProcNode::SysFsInotifyDir => PID_DIR_MODE,
         ProcNode::Kernel(kernel, _) => kernel.mode(),
         ProcNode::SelfLink | ProcNode::ExeLink | ProcNode::NsLink(_) => SYMLINK_MODE,
@@ -803,6 +914,9 @@ fn node_mode(node: ProcNode) -> u32 {
         | ProcNode::MeminfoFile
         | ProcNode::FilesystemsFile
         | ProcNode::MountsFile
+        | ProcNode::MountInfoFile
+        | ProcNode::CgroupFile
+        | ProcNode::SysKernelFile(_)
         | ProcNode::UptimeFile
         | ProcNode::InotifySysctl(_) => REG_READONLY_MODE,
     }
@@ -815,6 +929,7 @@ fn node_nlink(node: ProcNode) -> u32 {
         ProcNode::NsDir
         | ProcNode::SysDir
         | ProcNode::SysFsDir
+        | ProcNode::SysKernelDir
         | ProcNode::SysFsInotifyDir => 2,
         ProcNode::Kernel(ProcKernelNode::TaskDir, _) => 3,
         ProcNode::Kernel(kernel, _) if kernel.is_directory() => 2,
@@ -1119,10 +1234,38 @@ mod tests {
         assert_eq!(kind("exe"), Some(DT_LNK));
         assert_eq!(kind("mounts"), Some(DT_REG));
         assert_eq!(kind("oom_score_adj"), Some(DT_REG));
-        assert_eq!(entries.len(), 5 + SELF_FILE_NODES.len());
+        assert_eq!(kind("mountinfo"), Some(DT_REG));
+        assert_eq!(kind("cgroup"), Some(DT_REG));
+        assert_eq!(entries.len(), 7 + SELF_FILE_NODES.len());
         let ns = ns_dir_entries();
         assert_eq!(ns.len(), NS_LINKS.len());
         assert!(ns.iter().all(|(_, t)| *t == DT_LNK));
+    }
+
+    #[test]
+    fn mountinfo_cgroup_and_sys_kernel_nodes() {
+        assert_eq!(lookup("/proc/self/mountinfo", 7), Some(Ok(ProcNode::MountInfoFile)));
+        assert_eq!(lookup("/proc/7/cgroup", 7), Some(Ok(ProcNode::CgroupFile)));
+        assert_eq!(lookup("/proc/8/cgroup", 7), Some(Err(ENOENT)));
+        assert_eq!(lookup("/proc/sys/kernel", 7), Some(Ok(ProcNode::SysKernelDir)));
+        assert_eq!(
+            lookup("/proc/sys/kernel/osrelease", 7),
+            Some(Ok(ProcNode::SysKernelFile(SysKernelKind::OsRelease)))
+        );
+        assert_eq!(lookup("/proc/sys/kernel/pid_max", 7), Some(Err(ENOENT)));
+        assert!(is_virtual_file(ProcNode::MountInfoFile));
+        assert_eq!(format_cgroup(), b"0::/\n");
+        assert_eq!(format_sys_kernel(SysKernelKind::OsType), b"RustOS\n");
+        assert!(proc_sys_dir_children("/proc/sys/kernel").is_some());
+        let mounts = [crate::mount_table::MountInfo { mount_point: "/", fs_type: "vfat", read_only: false }];
+        let text = String::from_utf8(format_mountinfo(&mounts)).unwrap();
+        let first = text.lines().next().unwrap();
+        assert_eq!(first, "1 1 0:1 / / rw - vfat boot rw");
+        assert!(text.contains("2 1 0:2 / /dev rw,nosuid - devtmpfs devtmpfs rw\n"));
+        assert!(text.contains(" /proc ro,nosuid,nodev,noexec - proc proc ro\n"));
+        for line in text.lines() {
+            assert!(line.split(' ').count() >= 10, "{line}");
+        }
     }
 
     #[test]

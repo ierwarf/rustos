@@ -336,9 +336,11 @@ impl InotifyRegistry {
             let encoded = ev.encode_into(&mut out[written..]).ok_or(EINVAL)?;
             instance.queued_bytes = instance.queued_bytes.saturating_sub(encoded);
             written += encoded;
-        }
-        if instance.queue.len() < MAX_QUEUED_EVENTS {
-            instance.overflow_emitted = false;
+            // Linux queues the overflow event only while it is not already
+            // queued: the flag follows the event itself, not the queue depth.
+            if ev.mask == linux_abi::IN_Q_OVERFLOW {
+                instance.overflow_emitted = false;
+            }
         }
         Ok(written)
     }
@@ -706,6 +708,35 @@ mod tests {
             MAX_QUEUED_EVENTS + 1
         );
         assert_eq!(wd_fill > 0, true);
+    }
+
+    #[test]
+    fn overflow_event_is_queued_once_until_it_is_read() {
+        let mut inst = InotifyInstance::new();
+        for i in 0..MAX_QUEUED_EVENTS {
+            assert!(inst.push_event(1, linux_abi::IN_CREATE, 0, alloc::format!("f{i}").as_bytes()));
+        }
+        assert!(inst.push_event(1, linux_abi::IN_CREATE, 0, b"over"));
+        assert_eq!(inst.queue.len(), MAX_QUEUED_EVENTS + 1);
+        let overflows = |inst: &InotifyInstance| {
+            inst.queue.iter().filter(|e| e.mask == linux_abi::IN_Q_OVERFLOW).count()
+        };
+        assert_eq!(overflows(&inst), 1);
+        // Drain a few events from the front (the overflow event stays queued),
+        // let new events in below the cap, then hit the cap again.
+        let mut reg = InotifyRegistry::new();
+        reg.instances.insert(5, inst);
+        let mut buf = [0_u8; 16 * 64];
+        reg.read_events(5, &mut buf).unwrap();
+        let inst = reg.instances.get_mut(&5).unwrap();
+        while inst.queue.len() < MAX_QUEUED_EVENTS {
+            inst.push_event(1, linux_abi::IN_DELETE, 0, b"x");
+            inst.push_event(1, linux_abi::IN_MODIFY, 0, b"y");
+        }
+        for i in 0..8 {
+            inst.push_event(1, linux_abi::IN_CREATE, 0, alloc::format!("g{i}").as_bytes());
+        }
+        assert_eq!(overflows(inst), 1, "a second overflow event while the first is unread");
     }
 
     #[test]

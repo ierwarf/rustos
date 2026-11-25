@@ -18,7 +18,7 @@ back to stderr for the remaining suffix. Retriable refusal is not counted as a
 dropped record until its owner abandons it. Admission is not durable delivery.
 
 - Shared ABI crate: `libs/rustos-user-abi`.
-- Kernel re-export: `kernel/ps/src/user/{abi,handles,sysops}.rs`. `kernel/compat` re-exports through `kernel_ps::api`; no shadow ABI/handle/user-memory sysop files.
+- Kernel re-export: `kernel/ps/src/user/{abi.rs,handles.rs,sysops/}`. `kernel/compat` re-exports through `kernel_ps::api`; no shadow ABI/handle/user-memory sysop files.
 - Device/console/UI `repr(C)` structs and ioctl numbers must live in `rustos-user-abi`. Services (`uiserver`, `runtimed`) consume that crate — never duplicate request structs or ioctl encoding.
 - Every native `SYS_RUSTOS_*` number is one literal in
   `libs/rustos-user-abi/src/syscall.rs` or its direct syscall modules, remains
@@ -173,6 +173,17 @@ before arming a finite deadline. A future mutable time policy must be admitted
 once through an immutable scheduler-local lease, never through each clock read
 or sleep.
 
+`nanosleep`/`clock_nanosleep` sleep in the timer substrate but end early with
+`EINTR` when a signal that will be delivered arrives; a relative sleep stores
+the unslept time in `rem` (an absolute sleep stores none, as Linux).
+`ppoll`, `pselect6`, `epoll_pwait` and `epoll_pwait2` install their temporary
+mask in procd's policy copy and the ring0 copy together (procd selects the
+deliverable signal from its own copy). A wait that ends `EINTR` delivers the
+signal while the temporary mask is still in force and saves the original mask
+in the signal frame, so the handler's `sigreturn` restores it; every other
+outcome restores the original mask before returning (`rt_sigsuspend` shares
+the restore helper).
+
 Ring3 authority deadlines use the same kernel-wide `CLOCK_MONOTONIC`
 nanosecond domain. `try_monotonic_nanos` distinguishes syscall failure,
 malformed timespec and arithmetic overflow from a valid zero timestamp.
@@ -198,7 +209,7 @@ endpoint lifecycle transitions: `ipc-service-register`,
 `ipc-service-exit-revoke`. These are diagnostic state only; rootd remains the
 service admission and capability policy owner. Endpoint revoke is owner-only
 unless the caller holds `ROOT_SUPERVISOR`.
-`SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT` is service/supervisor discovery: root-supervisor callers may use the kernel table directly; other callers are admitted through rootd `COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP`. Core services and post-init services are admitted only by matching a running rootd lease. Generic apps use Linux/Win32 ABI routes and kernel compat helpers, not raw policy-service endpoint lookup.
+`SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT` is service/supervisor discovery: root-supervisor callers may use the kernel table directly; other callers are admitted from the rootd-installed `SYS_RUSTOS_SERVICE_POLICY` table (`INSTALL` + `BIND_PRINCIPAL`), without an online rootd round trip. Core services and post-init services are admitted only after rootd binds their live lease principal. Generic apps use Linux/Win32 ABI routes and kernel compat helpers, not raw policy-service endpoint lookup.
 Service capability assignment is rootd policy, delegated to the kernel ahead of time: after self-registration rootd installs the typed routing policy with `SYS_RUSTOS_SERVICE_POLICY` (`INSTALL`: directed lookup routes plus each service's `ServiceCapability` list as discriminants; no mask) and binds each live process to its authenticated service identity (`BIND_PRINCIPAL`) when its lease becomes live, before the child is activated. The kernel then decides every service lookup and every endpoint registration from that table with no rootd round trip; a caller with no binding is refused. `COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY` / `_SERVICE_LOOKUP` (6, 7) are retired and never reused. Do not reintroduce a full `service_id -> capability` table in ring0 policy: the table is installed data, authored by rootd.
 Rootd self-registration is a boot-only trust transition, not a permanent
 fallback. The first successful rootd publication seals its non-reusable process
@@ -218,13 +229,13 @@ removes it. Endpoints outside the live service registry are callable only by
 their owner process. Raw endpoint values are not inherited/transferable
 capabilities; future cross-process endpoint transfer must use an explicit
 typed-handle grant and lifecycle contract.
-An exact current-epoch grant also satisfies repeated lookup without another
-rootd request. The lookup still rechecks the live endpoint, owner-exit marker,
-and publication epoch under the registry lock; a miss, revoke, or republish
-returns to rootd admission. Caching an endpoint without those checks is
+An exact current-epoch grant also satisfies repeated lookup directly from the
+kernel service policy table without re-entering admission. The lookup still
+rechecks the live endpoint, owner-exit marker, and publication epoch under the
+registry lock; a miss, revoke, or republish re-evaluates the installed
+`SYS_RUSTOS_SERVICE_POLICY` binding. Caching an endpoint without those checks is
 forbidden, but re-authorizing an unchanged grant is a performance-contract
-violation because it converts a local table read into an avoidable synchronous
-boot/runtime dependency.
+violation.
 Successful call authorization also returns the matched service identity as
 part of that same publication snapshot. Reply-deadline classification must use
 this captured identity; it must not translate the numeric endpoint through a
@@ -371,14 +382,18 @@ jobs fail closed; direct spawn and deferred checkpointing are not permitted
 substitutes. A core restart deferred because a required service (including
 loaderd) is not ready reschedules with backoff without spending the dependent
 lease's restart budget. A real restart failure, including an EAGAIN returned
-by the restart operation, still spends a retry. A partially retired Job can
-also defer on EBUSY without charge, up to the 64-attempt retirement cap.
+by the restart operation, still spends a retry. A continuously healthy running
+lease replenishes its restart budget back to 0 after 60 s
+(`HEALTHY_BUDGET_REPLENISH_NS`), and `initd` applies capped exponential launch
+retry backoff (50 ms doubling to 5 s) with a 60 s failure-window reset. A
+partially retired Job can also defer on EBUSY without charge, up to the
+64-attempt retirement cap.
 
 | ID | Service | Capability (`ServiceCapability`) | Owns |
 |----|---------|----------------------------------|------|
-| 1 | `syscalld` | `LINUX_SYSCALL_POLICY` | Linux cold validation, credentials, rlimits, clock/random/MM policy, Win32 syscalls |
+| 1 | `syscalld` | `LINUX_SYSCALL_POLICY` | Linux cold validation, credentials, rlimits, clock/MM policy, Win32 syscalls (`getrandom`/`uname` are kernel-local) |
 | 2 | `vfsd` | `VFS_POLICY` | File namespace, cwd, dir/file cursors, mount/umount, metadata |
-| 3 | `netd` | `NET_POLICY` | Socket namespace + all socket syscalls (AF_UNIX too) |
+| 3 | `netd` | `NET_POLICY` | `AF_INET`/`AF_INET6`/`AF_NETLINK` sockets + DVM Ethernet networking (`AF_UNIX` is kernel-local `UnixSocketHandle`) |
 | 4 | `devmgrd` | `DEVICE_POLICY` | `/dev` registry, device open, ioctl auth |
 | 6 | `loaderd` | `PROCESS_LOADER` | ELF/PE image policy, mapping, launch |
 | 7 | `storaged` | `STORAGE_POLICY` | Block inventory after registration |
@@ -424,11 +439,19 @@ not extension points and must continue to return `ENOSYS`.
 - `mincore` (real leaf residency, ENOMEM for unmapped), `msync` (flag/alignment
   checks; `VFS_SHARED_BACKING_FLAG_SYNC` flushes writable FAT `MAP_SHARED`
   frames back to FAT while TmpFs shares frames directly),
-  `membarrier` (QUERY returns 0, other commands EINVAL), `rt_sigtimedwait`
+  `membarrier` (QUERY returns 0, other commands EINVAL), `faccessat`
+  (3 arguments, no flags) vs `faccessat2` (flags `AT_EACCESS`/
+  `AT_SYMLINK_NOFOLLOW`/`AT_EMPTY_PATH`; unknown bits EINVAL), `epoll_create` (size > 0),
+  `getpgrp`, `setresuid`/`setresgid`/`setreuid`/`setregid` (syscalld ops
+  76..79, Linux privilege and saved-id rules, `u32::MAX` = unchanged), `clone3` (size < 64 EINVAL, > 4096 E2BIG, a larger struct needs a
+  zero tail), `kill` of a process group / broadcast (`pid <= 0`: ENOSYS, no
+  group table in ring0), `tkill`/`tgkill` (non-positive ids EINVAL), `rt_sigtimedwait`
   (1 ms polling of pending bits, siginfo has only `si_signo`), `getrlimit`/
   `setrlimit` (prlimit64 storage), `epoll_pwait2` (ms rounding), `sendmmsg`/
   `recvmmsg` (loops over sendmsg/recvmsg, vlen cap 1024), `sched_set*` (only
-  SCHED_OTHER/0; other classes EPERM), `fallocate`, `chown`/`fchown`/`lchown`/
+  SCHED_OTHER/0 plus `SCHED_RESET_ON_FORK`; other classes EPERM; NULL `param`
+  EINVAL; another live process or sibling thread is a valid target, writes to a
+  foreign process need euid 0; `sched_get*` answer for any live target), `fallocate`, `chown`/`fchown`/`lchown`/
   `fchownat` (`VFS_IPC_OP_CHOWN`=40, `VFS_IPC_OP_FCHOWN`=41), `mknod`/`mknodat`
   (`VFS_IPC_OP_MKNOD`), `link`/`linkat` (`VFS_IPC_OP_LINKAT`=42), `chmod`/
   `fchmod`/`fchmodat(2)` (no umask, `AT_SYMLINK_NOFOLLOW` EOPNOTSUPP),
@@ -440,12 +463,26 @@ not extension points and must continue to return `ENOSYS`.
   mappings past the new EOF with an EOF guard leaf
   (`map_external_user_pages_with_eof_guard` / `current_user_leaf_is_eof_guard`),
   delivering `SIGBUS` on user `#PF` past EOF; `mprotect` updates
-  `SharedMemfdMapping::page_flags` across split ranges.
+  `SharedMemfdMapping::page_flags` across split ranges. Read-only `MAP_PRIVATE`
+  mappings of a memfd (e.g. `wl_keyboard.keymap` under `wl_seat` v7+) are
+  admitted as read-only `MmapPlan::MemfdShared` aliases; `mprotect` refuses to
+  add `PROT_WRITE` (`EACCES`) so a private view can never write through.
 - `SYS_RUSTOS_PROC_FACTS_BROKER` (`0x5255_0066`, ABI v1, `VfsPolicy`-only):
   bounded pull of kernel-attested raw `/proc/<pid>` facts (`PROC_FACTS_OP_*`
   `PROCESS`=1, `THREAD`=2, `ONLINE_CPUS`=3: pid/tid zero, 8-byte LE mask of hardware CPUs admitted by the kernel, independent of any affinity) so `vfsd`
   formats `/proc/<pid>/*` ASCII nodes in Ring3; writable `/proc` nodes (`comm`,
   `task/<tid>/comm`, `oom_score_adj`) route through `proc_identity::write_snapshot`.
+  `/proc/self/smaps_rollup` (`ProcKernelNode::SmapsRollup`, node code 12,
+  `SELF_FILE_NODES` has 12 entries) is caller-only (matching `maps`/`smaps`,
+  which require `pid == caller_pid` in `vfsd`; Ring0 `proc_identity::render`
+  also serves caller-only `/proc/self/smaps_rollup`), carrying only attested
+  counters (`Rss`, `Locked`). Writable `/proc/<pid>/oom_score_adj` and
+  `/proc/<pid>/task/` also resolve for other live PIDs. vfsd also serves `/proc/<pid>/mountinfo`,
+  `/proc/<pid>/cgroup` and `/proc/sys/kernel/{ostype,osrelease,hostname}` itself
+  (no kernel facts). `renameat2` rejects unknown flags and
+  `RENAME_NOREPLACE|RENAME_EXCHANGE` with `EINVAL`; `RENAME_EXCHANGE` alone is
+  `EOPNOTSUPP`. `lseek` `SEEK_DATA`/`SEEK_HOLE` follow the dense-file model in vfsd
+  (`ENXIO` at/after EOF).
 - `ptrace(2)` (101) is an honest refusal (`linux/ptrace_refusal.rs`): no tracer
   relation exists, so `TRACEME` is `EPERM`, `ATTACH`/`SEIZE` are `EPERM` (or
   `ESRCH` for a nonexistent pid), and every other request, known or not, is
@@ -483,8 +520,10 @@ and process-loader capabilities and returns at most one inline-IPC payload of by
 boot-seeded ChaCha20 substrate. Initialization is one-shot and rejects an
 absent/all-zero seed. A private master stream derives every child seed from
 master output; consumers never clone the master or form related keys by
-combining the boot seed with public PID/TID/counter state. Syscalld still owns
-Linux `getrandom` flag, length, and error policy; netd still owns token
+combining the boot seed with public PID/TID/counter state. Kernel-local
+`getrandom(2)` draws directly from the same boot-seeded ChaCha20 substrate
+(validating flags/length in Ring0, while syscalld retains `SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM`
+only for legacy/offload clients); netd still owns token
 collision/admission policy; loaderd owns image and initial-stack ASLR policy. PID/TID/counter-derived pseudo-random output is
 forbidden for credentials, object capabilities, ASLR material, and Linux
 `getrandom`.

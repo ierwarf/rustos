@@ -184,11 +184,19 @@ impl ControlSecret {
                 path.display()
             );
         }
-        let mut encoded = String::new();
-        source
-            .read_to_string(&mut encoded)
-            .with_context(|| format!("read DVM control secret {}", path.display()))?;
-        Self::from_hex(encoded.trim_end_matches(['\n', '\r']))
+        // The file holds the secret in the clear: read it as bytes so the buffer can be
+        // wiped on every path instead of lingering in a freed `String` allocation.
+        let mut encoded = Vec::new();
+        let read = (&mut source).take(4096).read_to_end(&mut encoded);
+        let parsed = read
+            .with_context(|| format!("read DVM control secret {}", path.display()))
+            .and_then(|_| {
+                let text = std::str::from_utf8(&encoded)
+                    .context("DVM control secret is not valid UTF-8 hexadecimal")?;
+                Self::from_hex(text.trim_end_matches(['\n', '\r']))
+            });
+        encoded.fill(0);
+        parsed
     }
 
     pub fn from_bytes(bytes: [u8; CONTROL_SECRET_BYTES]) -> Result<Self> {

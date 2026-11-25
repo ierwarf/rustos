@@ -523,6 +523,10 @@ mod tests {
                     resp.status = EOVERFLOW;
                     return resp;
                 }
+                Err(SeekPositionError::NoSuchPosition) => {
+                    resp.status = 6;
+                    return resp;
+                }
             };
             let mut candidate = handle;
             candidate.cursor = next;

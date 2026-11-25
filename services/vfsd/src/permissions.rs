@@ -13,6 +13,18 @@ pub fn permits(fs: FsMetadata, cred: Credentials, requested: u32) -> bool {
     bits & requested == requested
 }
 
+/// `utimensat(2)` mask that only touches times to "now": every time that is
+/// set is `UTIME_NOW` (the other may be `UTIME_OMIT`), and no creation time or
+/// DOS attribute is requested. Linux treats this as `ATTR_TOUCH`, so a writer
+/// who is not the owner is allowed; any explicit timestamp needs ownership.
+/// Bits: 1 atime, 2 mtime, 4 crtime, 8 DOS attrs, 16 atime NOW, 32 mtime NOW.
+pub const fn utimes_touch_only(mask: u64) -> bool {
+    mask & 0b1100 == 0
+        && mask & 0b0011 != 0
+        && (mask & 1 == 0 || mask & 16 != 0)
+        && (mask & 2 == 0 || mask & 32 != 0)
+}
+
 pub fn owner(fs: FsMetadata, cred: Credentials) -> bool { cred.uid == 0 || cred.uid == fs.uid }
 /// Both NOW permits a writable non-owner; any explicit or mixed request does not.
 pub fn set_times_allowed(fs: FsMetadata, cred: Credentials, both_now: bool) -> bool {
@@ -96,6 +108,22 @@ mod tests {
         assert!(set_times_allowed(fs, root, false));
     }
     #[test]
+    fn touch_only_covers_now_with_omit_but_not_explicit_times() {
+        // (NOW, NOW), (NOW, OMIT), (OMIT, NOW) are touches; any explicit time,
+        // creation time or DOS attribute needs the owner.
+        assert!(utimes_touch_only(1 | 2 | 16 | 32));
+        assert!(utimes_touch_only(1 | 16));
+        assert!(utimes_touch_only(2 | 32));
+        assert!(!utimes_touch_only(0));
+        assert!(!utimes_touch_only(1));
+        assert!(!utimes_touch_only(1 | 2 | 16));
+        assert!(!utimes_touch_only(1 | 16 | 4));
+        assert!(!utimes_touch_only(2 | 32 | 8));
+        let fs = meta(0o622, 1000, FsNodeKind::File);
+        let writer = Credentials { uid: 1001, gid: 1001 };
+        assert!(set_times_allowed(fs, writer, utimes_touch_only(1 | 16)));
+    }
+    #[test]
     fn runtime_directory_accepts_delegated_socket_owner() {
         let runtime = meta(0o700, 1000, FsNodeKind::Directory);
         let delegated = Credentials { uid: 1000, gid: 1000 };
@@ -139,5 +167,34 @@ mod tests {
         assert!(!hardlink_source_allowed(meta(0o4777, 0, FsNodeKind::File), user));
         assert!(!hardlink_source_allowed(meta(0o2777, 0, FsNodeKind::File), user));
         assert!(!hardlink_source_allowed(meta(0o777, 0, FsNodeKind::Symlink), user));
+    }
+}
+
+/// renameat2(2): unknown bits and `RENAME_NOREPLACE|RENAME_EXCHANGE` together
+/// are `EINVAL`; `RENAME_EXCHANGE` alone is unsupported by this backend.
+pub fn renameat2_flags_errno(flags: u64) -> Option<i32> {
+    let noreplace = 1;
+    let exchange = 2;
+    if flags & !(noreplace | exchange) != 0 || flags & (noreplace | exchange) == (noreplace | exchange) {
+        return Some(22);
+    }
+    if flags & exchange != 0 {
+        return Some(95);
+    }
+    None
+}
+
+#[cfg(test)]
+mod renameat2_flag_tests {
+    use super::*;
+
+    #[test]
+    fn exchange_with_noreplace_is_einval_not_eopnotsupp() {
+        let (n, x) = (1_u64, 2_u64);
+        assert_eq!(renameat2_flags_errno(0), None);
+        assert_eq!(renameat2_flags_errno(n), None);
+        assert_eq!(renameat2_flags_errno(x), Some(95));
+        assert_eq!(renameat2_flags_errno(n | x), Some(22));
+        assert_eq!(renameat2_flags_errno(1 << 2), Some(22));
     }
 }

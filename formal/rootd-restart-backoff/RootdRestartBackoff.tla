@@ -6,9 +6,16 @@ Models rootd core-service restart backoff and authority lifecycle.
 
 Concrete owners and source anchors:
   * restart state, budget, and policy-selected delay:
-      services/rootd/src/main.rs (restart_failed_leases)
+      services/rootd/src/main.rs (restart_failed_leases, replenish_healthy_budget)
+  * healthy-uptime window shared with initd's failure window:
+      libs/rustos-user-abi/src/performance.rs (SERVICE_HEALTHY_FORGIVENESS_MS)
   * rootd-only bounded timer substrate:
       kernel/compat/src/user/syscall/linux/lifecycle_broker_ops.rs
+
+The restart budget is a credit rule (Erlang/OTP restart intensity over a
+period): each respawn spends one unit, and a lease that stays Running for
+HealthyWindow ticks since its last successful restart gets the full budget
+back. Crash loops (short incarnations) still exhaust and Failed is terminal.
 
 The kernel never selects a retry delay or restarts a process. It merely offers
 one rootd-capability-gated bounded wait. The model includes an observed exit,
@@ -22,7 +29,7 @@ authority before rebasing. It abstracts loader protocol bytes, individual
 queue order, and scheduler time granularity.
 *******************************************************************************)
 
-CONSTANTS Services, MaxRestarts, Backoff, MaxTick, LifecycleEvents
+CONSTANTS Services, MaxRestarts, Backoff, MaxTick, HealthyWindow, LifecycleEvents
 
 Running == "running"
 Exited == "exited"
@@ -36,13 +43,13 @@ DrainEventsCopied == "events-copied"
 DrainCountCopied == "count-copied"
 DrainStates == {DrainIdle, DrainSnapshotted, DrainEventsCopied, DrainCountCopied}
 
-VARIABLES state, budget, published, retryAfter, clock, attempts,
+VARIABLES state, budget, healthySince, published, retryAfter, clock, attempts,
           failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
           lifecycleQueue, drainSnapshot, drainStage, policyLifecycleQueue,
           policyCacheAuthoritative, syscallLifecycleQueue,
           syscallCacheAuthoritative, recordedLifecycleEvidence, rootConsumedEvidence
 
-vars == <<state, budget, published, retryAfter, clock, attempts,
+vars == <<state, budget, healthySince, published, retryAfter, clock, attempts,
           failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
           lifecycleQueue, drainSnapshot, drainStage, policyLifecycleQueue,
           policyCacheAuthoritative, syscallLifecycleQueue,
@@ -55,6 +62,7 @@ rootEvidenceHistoryVars == <<recordedLifecycleEvidence, rootConsumedEvidence>>
 Init ==
     /\ state = [service \in Services |-> Running]
     /\ budget = [service \in Services |-> MaxRestarts]
+    /\ healthySince = [service \in Services |-> 0]
     /\ published = [service \in Services |-> TRUE]
     /\ retryAfter = [service \in Services |-> 0]
     /\ clock = 0
@@ -80,7 +88,7 @@ ObserveExit(service) ==
     /\ state[service] = Running
     /\ state' = [state EXCEPT ![service] = Exited]
     /\ published' = [published EXCEPT ![service] = FALSE]
-    /\ UNCHANGED <<budget, retryAfter, clock, attempts,
+    /\ UNCHANGED <<budget, healthySince, retryAfter, clock, attempts,
                   failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
                   lifecycleQueue, drainSnapshot, drainStage>>
     /\ UNCHANGED policyEvidenceVars
@@ -97,7 +105,7 @@ DeferExitedService(service) ==
     /\ clock <= MaxTick - Backoff
     /\ state' = [state EXCEPT ![service] = Pending]
     /\ retryAfter' = [retryAfter EXCEPT ![service] = clock + Backoff]
-    /\ UNCHANGED <<budget, published, clock, attempts,
+    /\ UNCHANGED <<budget, healthySince, published, clock, attempts,
                   failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
                   lifecycleQueue, drainSnapshot, drainStage>>
     /\ UNCHANGED policyEvidenceVars
@@ -111,7 +119,7 @@ ExhaustLease(service) ==
     /\ budget[service] = 0
     /\ state' = [state EXCEPT ![service] = Failed]
     /\ published' = [published EXCEPT ![service] = FALSE]
-    /\ UNCHANGED <<budget, retryAfter, clock, attempts,
+    /\ UNCHANGED <<budget, healthySince, retryAfter, clock, attempts,
                   failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
                   lifecycleQueue, drainSnapshot, drainStage>>
     /\ UNCHANGED policyEvidenceVars
@@ -126,7 +134,7 @@ AdvanceClock ==
     /\ \A service \in Services:
           state[service] = Pending => clock + 1 <= retryAfter[service]
     /\ clock' = clock + 1
-    /\ UNCHANGED <<state, budget, published, retryAfter, attempts,
+    /\ UNCHANGED <<state, budget, healthySince, published, retryAfter, attempts,
                   failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
                   lifecycleQueue, drainSnapshot, drainStage>>
     /\ UNCHANGED policyEvidenceVars
@@ -146,6 +154,7 @@ RestartSucceeds(service) ==
     /\ budget' = [budget EXCEPT ![service] = @ - 1]
     /\ published' = [published EXCEPT ![service] = TRUE]
     /\ attempts' = [attempts EXCEPT ![service] = @ + 1]
+    /\ healthySince' = [healthySince EXCEPT ![service] = clock]
     /\ UNCHANGED <<retryAfter, clock, failedActivationChild, supervisorHealthy,
                   lifecycleEvidenceComplete, lifecycleQueue, drainSnapshot, drainStage>>
     /\ UNCHANGED policyEvidenceVars
@@ -165,7 +174,7 @@ RestartFails(service) ==
     /\ published' = [published EXCEPT ![service] = FALSE]
     /\ retryAfter' = [retryAfter EXCEPT ![service] = clock + Backoff]
     /\ attempts' = [attempts EXCEPT ![service] = @ + 1]
-    /\ UNCHANGED <<clock, failedActivationChild, supervisorHealthy,
+    /\ UNCHANGED <<clock, healthySince, failedActivationChild, supervisorHealthy,
                   lifecycleEvidenceComplete, lifecycleQueue, drainSnapshot, drainStage>>
     /\ UNCHANGED policyEvidenceVars
     /\ UNCHANGED rootEvidenceHistoryVars
@@ -185,7 +194,25 @@ ActivationFailsAndCleans(service) ==
     /\ retryAfter' = [retryAfter EXCEPT ![service] = clock + Backoff]
     /\ attempts' = [attempts EXCEPT ![service] = @ + 1]
     /\ failedActivationChild' = failedActivationChild \ {service}
-    /\ UNCHANGED <<clock, supervisorHealthy, lifecycleEvidenceComplete,
+    /\ UNCHANGED <<clock, healthySince, supervisorHealthy, lifecycleEvidenceComplete,
+                  lifecycleQueue, drainSnapshot, drainStage>>
+    /\ UNCHANGED policyEvidenceVars
+    /\ UNCHANGED rootEvidenceHistoryVars
+
+\* Credit rule: a lease that has stayed Running for a full healthy window
+\* since its last successful restart (rootd: replenish_healthy_budget) gets its
+\* whole budget back. Only Running leases qualify, so a crash loop of short
+\* incarnations and a terminal Failed lease never gain credit.
+ReplenishBudget(service) ==
+    /\ supervisorHealthy
+    /\ service \in Services
+    /\ state[service] = Running
+    /\ budget[service] < MaxRestarts
+    /\ clock - healthySince[service] >= HealthyWindow
+    /\ budget' = [budget EXCEPT ![service] = MaxRestarts]
+    /\ attempts' = [attempts EXCEPT ![service] = 0]
+    /\ UNCHANGED <<state, healthySince, published, retryAfter, clock,
+                  failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
                   lifecycleQueue, drainSnapshot, drainStage>>
     /\ UNCHANGED policyEvidenceVars
     /\ UNCHANGED rootEvidenceHistoryVars
@@ -204,7 +231,7 @@ ActivationCleanupFails(service) ==
     /\ attempts' = [attempts EXCEPT ![service] = @ + 1]
     /\ failedActivationChild' = failedActivationChild \cup {service}
     /\ supervisorHealthy' = FALSE
-    /\ UNCHANGED <<retryAfter, clock, lifecycleEvidenceComplete,
+    /\ UNCHANGED <<retryAfter, healthySince, clock, lifecycleEvidenceComplete,
                   lifecycleQueue, drainSnapshot, drainStage>>
     /\ UNCHANGED policyEvidenceVars
     /\ UNCHANGED rootEvidenceHistoryVars
@@ -227,7 +254,7 @@ RecordLifecycleEvidence(event) ==
     /\ policyLifecycleQueue' = policyLifecycleQueue \cup {event}
     /\ syscallLifecycleQueue' = syscallLifecycleQueue \cup {event}
     /\ recordedLifecycleEvidence' = recordedLifecycleEvidence \cup {event}
-    /\ UNCHANGED <<state, budget, published, retryAfter, clock, attempts,
+    /\ UNCHANGED <<state, budget, healthySince, published, retryAfter, clock, attempts,
                   failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
                   drainSnapshot, drainStage, policyCacheAuthoritative,
                   syscallCacheAuthoritative,
@@ -240,7 +267,7 @@ BeginLifecycleDrain ==
     /\ lifecycleQueue # {}
     /\ drainSnapshot' = lifecycleQueue
     /\ drainStage' = DrainSnapshotted
-    /\ UNCHANGED <<state, budget, published, retryAfter, clock, attempts,
+    /\ UNCHANGED <<state, budget, healthySince, published, retryAfter, clock, attempts,
                   failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
                   lifecycleQueue>>
     /\ UNCHANGED policyEvidenceVars
@@ -249,7 +276,7 @@ BeginLifecycleDrain ==
 CopyLifecycleEvents ==
     /\ drainStage = DrainSnapshotted
     /\ drainStage' = DrainEventsCopied
-    /\ UNCHANGED <<state, budget, published, retryAfter, clock, attempts,
+    /\ UNCHANGED <<state, budget, healthySince, published, retryAfter, clock, attempts,
                   failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
                   lifecycleQueue, drainSnapshot>>
     /\ UNCHANGED policyEvidenceVars
@@ -258,7 +285,7 @@ CopyLifecycleEvents ==
 CopyLifecycleCount ==
     /\ drainStage = DrainEventsCopied
     /\ drainStage' = DrainCountCopied
-    /\ UNCHANGED <<state, budget, published, retryAfter, clock, attempts,
+    /\ UNCHANGED <<state, budget, healthySince, published, retryAfter, clock, attempts,
                   failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
                   lifecycleQueue, drainSnapshot>>
     /\ UNCHANGED policyEvidenceVars
@@ -269,7 +296,7 @@ LifecycleCopyoutFails ==
     /\ drainSnapshot' = {}
     /\ drainStage' = DrainIdle
     /\ supervisorHealthy' = FALSE
-    /\ UNCHANGED <<state, budget, published, retryAfter, clock, attempts,
+    /\ UNCHANGED <<state, budget, healthySince, published, retryAfter, clock, attempts,
                   failedActivationChild, lifecycleEvidenceComplete,
                   lifecycleQueue>>
     /\ UNCHANGED policyEvidenceVars
@@ -281,7 +308,7 @@ CommitLifecycleDrain ==
     /\ rootConsumedEvidence' = rootConsumedEvidence \cup drainSnapshot
     /\ drainSnapshot' = {}
     /\ drainStage' = DrainIdle
-    /\ UNCHANGED <<state, budget, published, retryAfter, clock, attempts,
+    /\ UNCHANGED <<state, budget, healthySince, published, retryAfter, clock, attempts,
                   failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
                   recordedLifecycleEvidence>>
     /\ UNCHANGED policyEvidenceVars
@@ -298,7 +325,7 @@ LifecycleEvidenceOverflows ==
     /\ lifecycleQueue = LifecycleEvents
     /\ lifecycleEvidenceComplete' = FALSE
     /\ supervisorHealthy' = FALSE
-    /\ UNCHANGED <<state, budget, published, retryAfter, clock, attempts,
+    /\ UNCHANGED <<state, budget, healthySince, published, retryAfter, clock, attempts,
                   failedActivationChild, lifecycleQueue, drainSnapshot, drainStage>>
     /\ UNCHANGED policyEvidenceVars
     /\ UNCHANGED rootEvidenceHistoryVars
@@ -309,7 +336,7 @@ LifecycleEvidenceOverflows ==
 CommitPolicyLifecycleDrain ==
     /\ policyLifecycleQueue # {}
     /\ policyLifecycleQueue' = {}
-    /\ UNCHANGED <<state, budget, published, retryAfter, clock, attempts,
+    /\ UNCHANGED <<state, budget, healthySince, published, retryAfter, clock, attempts,
                   failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
                   lifecycleQueue, drainSnapshot, drainStage, policyCacheAuthoritative,
                   syscallLifecycleQueue, syscallCacheAuthoritative>>
@@ -319,7 +346,7 @@ PolicyLifecycleOverflowRebases ==
     /\ policyLifecycleQueue = LifecycleEvents
     /\ policyLifecycleQueue' = {}
     /\ policyCacheAuthoritative' = FALSE
-    /\ UNCHANGED <<state, budget, published, retryAfter, clock, attempts,
+    /\ UNCHANGED <<state, budget, healthySince, published, retryAfter, clock, attempts,
                   failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
                   lifecycleQueue, drainSnapshot, drainStage,
                   syscallLifecycleQueue, syscallCacheAuthoritative>>
@@ -331,7 +358,7 @@ PolicyLifecycleOverflowRebases ==
 CommitSyscallLifecycleDrain ==
     /\ syscallLifecycleQueue # {}
     /\ syscallLifecycleQueue' = {}
-    /\ UNCHANGED <<state, budget, published, retryAfter, clock, attempts,
+    /\ UNCHANGED <<state, budget, healthySince, published, retryAfter, clock, attempts,
                   failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
                   lifecycleQueue, drainSnapshot, drainStage, policyLifecycleQueue,
                   policyCacheAuthoritative, syscallCacheAuthoritative>>
@@ -341,7 +368,7 @@ SyscallLifecycleOverflowRebases ==
     /\ syscallLifecycleQueue = LifecycleEvents
     /\ syscallLifecycleQueue' = {}
     /\ syscallCacheAuthoritative' = FALSE
-    /\ UNCHANGED <<state, budget, published, retryAfter, clock, attempts,
+    /\ UNCHANGED <<state, budget, healthySince, published, retryAfter, clock, attempts,
                   failedActivationChild, supervisorHealthy, lifecycleEvidenceComplete,
                   lifecycleQueue, drainSnapshot, drainStage, policyLifecycleQueue,
                   policyCacheAuthoritative>>
@@ -353,6 +380,7 @@ Next ==
     \/ \E service \in Services: ExhaustLease(service)
     \/ AdvanceClock
     \/ \E service \in Services: RestartSucceeds(service)
+    \/ \E service \in Services: ReplenishBudget(service)
     \/ \E service \in Services: RestartFails(service)
     \/ \E service \in Services: ActivationFailsAndCleans(service)
     \/ \E service \in Services: ActivationCleanupFails(service)
@@ -371,6 +399,7 @@ Next ==
 TypeOK ==
     /\ state \in [Services -> LeaseStates]
     /\ budget \in [Services -> 0..MaxRestarts]
+    /\ healthySince \in [Services -> 0..MaxTick]
     /\ published \in [Services -> BOOLEAN]
     /\ retryAfter \in [Services -> 0..MaxTick]
     /\ clock \in 0..MaxTick
@@ -403,8 +432,28 @@ PendingRestartDoesNotOutliveDeadline ==
     \A service \in Services:
         state[service] = Pending => clock <= retryAfter[service]
 
+\* attempts counts restarts charged since the last credit, so spent + remaining
+\* is exactly the budget and the budget never exceeds MaxRestarts.
 RestartBudgetIsFiniteAndMonotonic ==
     \A service \in Services: attempts[service] + budget[service] = MaxRestarts
+
+HealthyClockNeverRunsAhead ==
+    \A service \in Services: healthySince[service] <= clock
+
+\* Budget can only grow through ReplenishBudget: from a Running lease that
+\* has been healthy for the whole window, back to exactly MaxRestarts. A
+\* Failed lease is terminal and never regains budget or state.
+BudgetReplenishedOnlyAfterHealthyWindow ==
+    [][\A service \in Services:
+          budget'[service] > budget[service] =>
+              /\ state[service] = Running
+              /\ state'[service] = Running
+              /\ clock - healthySince[service] >= HealthyWindow
+              /\ budget'[service] = MaxRestarts]_vars
+
+FailedLeaseIsTerminal ==
+    [][\A service \in Services:
+          state[service] = Failed => state'[service] = Failed]_vars
 
 HealthySupervisorHasNoFailedActivationChild ==
     supervisorHealthy => failedActivationChild = {}

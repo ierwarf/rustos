@@ -35,7 +35,9 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_MREMAP,
     SYSCALL_OFFLOAD_OP_LINUX_MUNMAP, SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64, SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY, SYSCALL_OFFLOAD_OP_LINUX_SCHED_SETAFFINITY,
     SYSCALL_OFFLOAD_OP_LINUX_SETGID, SYSCALL_OFFLOAD_OP_LINUX_SETPGID,
-    SYSCALL_OFFLOAD_OP_LINUX_SETPRIORITY, SYSCALL_OFFLOAD_OP_LINUX_SETSID,
+    SYSCALL_OFFLOAD_OP_LINUX_SETPRIORITY, SYSCALL_OFFLOAD_OP_LINUX_SETREGID,
+    SYSCALL_OFFLOAD_OP_LINUX_SETREUID, SYSCALL_OFFLOAD_OP_LINUX_SETRESGID,
+    SYSCALL_OFFLOAD_OP_LINUX_SETRESUID, SYSCALL_OFFLOAD_OP_LINUX_SETSID,
     SYSCALL_OFFLOAD_OP_LINUX_SETUID,
     SYSCALL_OFFLOAD_OP_LINUX_UMASK,
     SYSCALL_OFFLOAD_OP_LINUX_UNAME, SYSCALL_OFFLOAD_OP_WIN32_ALLOC_VIRTUAL_MEMORY,
@@ -462,6 +464,10 @@ fn handle_commercial_request(
                     ("setuid", SYSCALL_OFFLOAD_OP_LINUX_SETUID),
                     ("getgid", SYSCALL_OFFLOAD_OP_LINUX_GETGID),
                     ("setgid", SYSCALL_OFFLOAD_OP_LINUX_SETGID),
+                    ("setresuid", SYSCALL_OFFLOAD_OP_LINUX_SETRESUID),
+                    ("setresgid", SYSCALL_OFFLOAD_OP_LINUX_SETRESGID),
+                    ("setreuid", SYSCALL_OFFLOAD_OP_LINUX_SETREUID),
+                    ("setregid", SYSCALL_OFFLOAD_OP_LINUX_SETREGID),
                     ("getresuid", SYSCALL_OFFLOAD_OP_LINUX_GETRESUID),
                     ("getresgid", SYSCALL_OFFLOAD_OP_LINUX_GETRESGID),
                     ("getgroups", SYSCALL_OFFLOAD_OP_LINUX_GETGROUPS),
@@ -547,6 +553,18 @@ fn handle_linux_request(
         }
         SYSCALL_OFFLOAD_OP_LINUX_SETUID => linux_policy::handle_setuid(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_SETGID => linux_policy::handle_setgid(request, response),
+        SYSCALL_OFFLOAD_OP_LINUX_SETRESUID => {
+            linux_policy::handle_set_ids(request, false, linux_policy::SetIdForm::Res, response)
+        }
+        SYSCALL_OFFLOAD_OP_LINUX_SETRESGID => {
+            linux_policy::handle_set_ids(request, true, linux_policy::SetIdForm::Res, response)
+        }
+        SYSCALL_OFFLOAD_OP_LINUX_SETREUID => {
+            linux_policy::handle_set_ids(request, false, linux_policy::SetIdForm::Re, response)
+        }
+        SYSCALL_OFFLOAD_OP_LINUX_SETREGID => {
+            linux_policy::handle_set_ids(request, true, linux_policy::SetIdForm::Re, response)
+        }
         SYSCALL_OFFLOAD_OP_LINUX_GETRESUID => {
             linux_policy::handle_getres_id(request, false, response)
         }
@@ -622,6 +640,10 @@ fn validate_request(received: usize, request: &LinuxSyscallOffloadRequest) -> Re
         | SYSCALL_OFFLOAD_OP_LINUX_GETEGID
         | SYSCALL_OFFLOAD_OP_LINUX_SETUID
         | SYSCALL_OFFLOAD_OP_LINUX_SETGID
+        | SYSCALL_OFFLOAD_OP_LINUX_SETRESUID
+        | SYSCALL_OFFLOAD_OP_LINUX_SETRESGID
+        | SYSCALL_OFFLOAD_OP_LINUX_SETREUID
+        | SYSCALL_OFFLOAD_OP_LINUX_SETREGID
         | SYSCALL_OFFLOAD_OP_LINUX_GETRESUID
         | SYSCALL_OFFLOAD_OP_LINUX_GETRESGID
         | SYSCALL_OFFLOAD_OP_LINUX_GETGROUPS

@@ -706,6 +706,17 @@ pub fn sleep(milliseconds: u64) {
 /// sleeping task makes the loop re-evaluate `abort`, so an event producer can
 /// cut the nap short instead of waiting for the next tick.
 pub fn sleep_unless(milliseconds: u64, abort: impl Fn() -> bool) {
+    sleep_unless_with_post_arm(milliseconds, abort, || false);
+}
+
+/// Like [`sleep_unless`], plus a lockless `post_arm_abort` check evaluated
+/// after the scheduler block arm and timer waiter are both published, closing
+/// the lost-wakeup window between `abort()` and `arm_block_current_task()`.
+pub fn sleep_unless_with_post_arm(
+    milliseconds: u64,
+    abort: impl Fn() -> bool,
+    post_arm_abort: impl Fn() -> bool,
+) {
     if milliseconds == 0 {
         return;
     }
@@ -714,7 +725,7 @@ pub fn sleep_unless(milliseconds: u64, abort: impl Fn() -> bool) {
 
     let restore_disabled = !interrupts::are_enabled();
     while ticks() < target && !abort() {
-        if !restore_disabled && block_current_user_until(target) {
+        if !restore_disabled && block_current_user_until(target, &post_arm_abort) {
             continue;
         }
         if restore_disabled {
@@ -744,7 +755,7 @@ fn sleep_deadline_from_ticks(now: u64, milliseconds: u64) -> u64 {
     now.saturating_add(ticks_needed)
 }
 
-fn block_current_user_until(target: u64) -> bool {
+fn block_current_user_until(target: u64, post_arm_abort: &impl Fn() -> bool) -> bool {
     if !crate::hooks::is_scheduler_initialized() {
         return false;
     }
@@ -758,7 +769,7 @@ fn block_current_user_until(target: u64) -> bool {
         return false;
     };
 
-    if ticks() >= target {
+    if ticks() >= target || post_arm_abort() {
         return true;
     }
     if !crate::hooks::arm_block_current_task() {
@@ -769,9 +780,9 @@ fn block_current_user_until(target: u64) -> bool {
         return false;
     }
     // Recheck after both the scheduler arm and deadline registration. A PIT
-    // edge or unrelated wake in either gap clears the arm; the commit then
-    // refuses to sleep instead of consuming the only wakeup.
-    if ticks() >= target {
+    // edge, signal arrival, or unrelated wake in either gap cancels the sleep
+    // instead of missing the wakeup.
+    if ticks() >= target || post_arm_abort() {
         disarm_sleep_waiter(task_id);
         let _ = crate::hooks::cancel_block_current_task();
         return true;

@@ -84,7 +84,7 @@ subsequent read to one byte.
 
 - (resolved) pipe reads are copy-then-commit: a copy-out fault consumes nothing.
 - (resolved) eventfd keeps separate IN/OUT edge generations.
-- Multi-iovec `writev` is not atomic. `readv` (19) is unsupported (`ENOSYS`) for every fd kind: a correct one must deliver the first iovec with blocking semantics and continue only with immediately available data, which the existing vectored helper (`writev_via_write`, a plain per-chunk loop) cannot express.
+- Multi-iovec `writev` is not atomic. `readv` (19), `preadv`, and `preadv2` are dispatched (`dispatch_ext.rs` / `vfs_socket.rs`), though vectored multi-chunk reads still execute per-iovec rather than as a single scatter-gather provider RPC.
 - No `splice`/`tee`, packet mode (`O_DIRECT`), or named FIFOs. See Mechanism above for pipe endpoint passing; eventfd passing is unsupported.
 - Wake path scans the generic waiter slab while any KERNEL waiter exists.
 

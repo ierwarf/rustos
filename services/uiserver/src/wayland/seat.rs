@@ -48,6 +48,7 @@ impl Dispatch<wl_seat::WlSeat, SeatData> for WaylandState {
                 }
                 let pointer = data_init.init(id, PointerData);
                 if let Some(client_id) = pointer.client().map(|client| client.id()) {
+                    state.announce_pointer(&pointer, &client_id);
                     state.pointer_resources.push(PointerResource {
                         resource: pointer,
                         client_id,
@@ -85,11 +86,36 @@ impl Dispatch<wl_pointer::WlPointer, PointerData> for WaylandState {
         state: &mut Self,
         _client: &Client,
         resource: &wl_pointer::WlPointer,
-        _request: wl_pointer::Request,
+        request: wl_pointer::Request,
         _data: &PointerData,
         _handle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
+        if let wl_pointer::Request::SetCursor {
+            surface: Some(surface),
+            ..
+        } = request
+        {
+            // The compositor draws its own cursor, but the surface still takes
+            // the cursor role: a role-less surface would be shown, hit-tested
+            // and given keyboard focus as if it were a window.
+            if let Some(data) = surface.data::<SurfaceData>() {
+                if let Ok(mut surface_state) = data.shared.lock() {
+                    if surface_state.role_assigned && !surface_state.cursor_role {
+                        drop(surface_state);
+                        resource.post_error(
+                            wl_pointer::Error::Role,
+                            "wl_pointer.set_cursor: surface already has another role".to_string(),
+                        );
+                        return;
+                    }
+                    surface_state.role_assigned = true;
+                    surface_state.cursor_role = true;
+                }
+                state.clear_focus_for_surface(&surface.id());
+                state.mark_dirty();
+            }
+        }
         state.pointer_resources.retain(|pointer| {
             pointer.resource.id() != resource.id() || pointer.resource.is_alive()
         });

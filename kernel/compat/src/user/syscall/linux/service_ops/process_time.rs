@@ -133,6 +133,28 @@ pub fn syscall_linux_rt_sigaction(
     }
 }
 
+/// Replaces the calling thread's signal mask with `mask` in procd's policy
+/// copy and the ring0 copy, returning the mask that was in force.
+pub(super) fn swap_signal_mask(mask: u64) -> Result<u64, i64> {
+    update_procd_signal_mask(linux_abi::SIG_SETMASK, Some(mask), true)?.ok_or(LINUX_EINVAL)
+}
+
+/// Puts `original` back after a wait that ran under a temporary mask.
+///
+/// When the wait delivered a handler, the signal frame already carries
+/// `original` for `sigreturn` and the ring0 mask is the handler's (`original`
+/// plus `sa_mask` plus the signal), which must survive; only procd's policy
+/// copy still holds the temporary mask.
+pub(super) fn restore_signal_mask_after_wait(original: u64, handler_installed: bool) {
+    let handler_mask = handler_installed
+        .then(|| multitask::current_linux_thread_state().map(|state| state.signal_mask))
+        .flatten();
+    let _ = update_procd_signal_mask(linux_abi::SIG_SETMASK, Some(original), false);
+    if let Some(mask) = handler_mask {
+        sync_current_linux_signal_mask(linux_abi::SIG_SETMASK, mask);
+    }
+}
+
 fn update_procd_signal_mask(
     how: u64,
     requested_mask: Option<u64>,
@@ -265,11 +287,10 @@ pub(in crate::user::syscall::linux) fn syscall_linux_rt_sigsuspend(frame: &mut S
     let err = wait_for_interruptible_signal().unwrap_err();
     frame.rax = linux_errno(err);
     let delivered = deliver_pending_signals_if_needed_with_saved_mask(frame, Some(old_mask));
-    let _ = update_procd_signal_mask(linux_abi::SIG_SETMASK, Some(old_mask), false);
+    restore_signal_mask_after_wait(old_mask, delivered);
     if delivered {
         frame.rax
     } else {
-        sync_current_linux_signal_mask(linux_abi::SIG_SETMASK, old_mask);
         linux_errno(err)
     }
 }
@@ -384,12 +405,67 @@ pub(super) fn validate_relative_sleep_timespec_locally(
     validate_time_hot_path_locally(TimeHotPath::Nanosleep, 0, 0, Some(timespec))
 }
 
-pub fn syscall_linux_nanosleep(request_ptr: u64, _remaining_ptr: u64) -> u64 {
+/// Nanoseconds a `timespec` spans, saturating at `u64::MAX`.
+fn timespec_total_nanos(ts: LinuxTimespecWire) -> u64 {
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
+}
+
+/// The monotonic instant an absolute `target` on a clock reading `clock_now`
+/// corresponds to when the monotonic clock reads `mono_now`.
+fn absolute_deadline_on_monotonic(mono_now: u64, clock_now: u64, target: u64) -> u64 {
+    mono_now.saturating_add(target.saturating_sub(clock_now))
+}
+
+/// Sleeps until the monotonic instant `deadline_ns` or until a signal that
+/// will be delivered arrives. `Some(remaining_ns)` reports the interruption,
+/// `None` a completed sleep. The wait itself has the millisecond resolution
+/// of the timer substrate, so a short wake re-arms for the remainder.
+fn sleep_until_monotonic_or_signal(deadline_ns: u64) -> Option<u64> {
+    loop {
+        let now = crate::arch::rtc::monotonic_nanos();
+        if now >= deadline_ns {
+            return None;
+        }
+        let millis = (deadline_ns - now).saturating_add(999_999) / 1_000_000;
+        crate::arch::rtc::sleep_unless_with_post_arm(
+            millis.max(1),
+            current_wait_interrupted,
+            || {
+                multitask::current_linux_thread_state()
+                    .is_some_and(|state| state.pending_signals & !state.signal_mask != 0)
+            },
+        );
+        let now = crate::arch::rtc::monotonic_nanos();
+        if now >= deadline_ns {
+            return None;
+        }
+        if current_wait_interrupted() {
+            return Some(deadline_ns - now);
+        }
+    }
+}
+
+/// Finishes an interruptible sleep: `EINTR`, with the unslept time stored in
+/// `remaining_ptr` when the caller asked for it (relative sleeps only).
+fn sleep_interruption_result(remaining_ns: u64, remaining_ptr: u64) -> Result<(), i64> {
+    if remaining_ptr != 0 {
+        write_user_bytes(remaining_ptr, as_bytes(&timespec_from_nanos(remaining_ns)))?;
+    }
+    Err(LINUX_EINTR)
+}
+
+pub fn syscall_linux_nanosleep(request_ptr: u64, remaining_ptr: u64) -> u64 {
     linux_unit_result((|| {
         let ts: LinuxTimespecWire = read_user_struct(request_ptr)?;
         validate_time_hot_path_locally(TimeHotPath::Nanosleep, 0, 0, Some(ts))?;
-        sleep_relative_timespec_substrate(ts);
-        Ok(())
+        let deadline =
+            crate::arch::rtc::monotonic_nanos().saturating_add(timespec_total_nanos(ts));
+        match sleep_until_monotonic_or_signal(deadline) {
+            None => Ok(()),
+            Some(remaining) => sleep_interruption_result(remaining, remaining_ptr),
+        }
     })())
 }
 
@@ -533,27 +609,19 @@ pub fn syscall_linux_getcpu(cpu_ptr: u64, node_ptr: u64) -> u64 {
 }
 
 pub fn syscall_linux_sched_getscheduler(pid: i64) -> u64 {
-    if pid < 0 {
-        return linux_errno(LINUX_EINVAL);
+    match super::super::process_ext_ops::sched_target(pid) {
+        Ok(_) => 0,
+        Err(errno) => linux_errno(errno),
     }
-    if pid != 0 && multitask::current_user_process_id() != Some(pid as u64)
-        && multitask::current_user_thread_id() != Some(pid as u64)
-    {
-        return linux_errno(LINUX_ESRCH);
-    }
-    0
 }
 
 pub fn syscall_linux_sched_getparam(pid: i64, param_ptr: u64) -> u64 {
     linux_unit_result((|| {
-        if pid < 0 {
+        // Linux reports a NULL `param` as EINVAL, before it looks at the target.
+        if param_ptr == 0 || pid < 0 {
             return Err(LINUX_EINVAL);
         }
-        if pid != 0 && multitask::current_user_process_id() != Some(pid as u64)
-            && multitask::current_user_thread_id() != Some(pid as u64)
-        {
-            return Err(LINUX_ESRCH);
-        }
+        super::super::process_ext_ops::sched_target(pid)?;
         let param = linux_abi::LinuxSchedParam { sched_priority: 0 };
         write_user_struct(param_ptr, &param)
     })())
@@ -561,15 +629,7 @@ pub fn syscall_linux_sched_getparam(pid: i64, param_ptr: u64) -> u64 {
 
 pub fn syscall_linux_sched_rr_get_interval(pid: i64, ts_ptr: u64) -> u64 {
     linux_unit_result((|| {
-        if pid < 0 {
-            return Err(LINUX_EINVAL);
-        }
-        if pid != 0
-            && multitask::current_user_process_id() != Some(pid as u64)
-            && multitask::current_user_thread_id() != Some(pid as u64)
-        {
-            return Err(LINUX_ESRCH);
-        }
+        super::super::process_ext_ops::sched_target(pid)?;
         let ts = LinuxTimespecWire {
             tv_sec: 0,
             tv_nsec: 0,
@@ -594,24 +654,6 @@ pub fn current_clock_timespec_substrate(clock_id: u64) -> LinuxTimespecWire {
     } else {
         monotonic_timespec()
     }
-}
-
-fn timespec_lte(lhs: LinuxTimespecWire, rhs: LinuxTimespecWire) -> bool {
-    lhs.tv_sec < rhs.tv_sec || lhs.tv_sec == rhs.tv_sec && lhs.tv_nsec <= rhs.tv_nsec
-}
-
-pub fn sleep_until_timespec_substrate(clock_id: u64, deadline: LinuxTimespecWire) {
-    let now = current_clock_timespec_substrate(clock_id);
-    if timespec_lte(deadline, now) {
-        return;
-    }
-    let mut tv_sec = deadline.tv_sec.saturating_sub(now.tv_sec);
-    let mut tv_nsec = deadline.tv_nsec - now.tv_nsec;
-    if tv_nsec < 0 {
-        tv_sec = tv_sec.saturating_sub(1);
-        tv_nsec += 1_000_000_000;
-    }
-    sleep_relative_timespec_substrate(LinuxTimespecWire { tv_sec, tv_nsec });
 }
 
 /// Reports the validated clocksource directly, in its own resolution.
@@ -767,23 +809,28 @@ pub fn syscall_linux_clock_nanosleep(
     clock_id: u64,
     flags: u64,
     request_ptr: u64,
-    _remaining_ptr: u64,
+    remaining_ptr: u64,
 ) -> u64 {
     linux_unit_result((|| {
         let ts: LinuxTimespecWire = read_user_struct(request_ptr)?;
         validate_time_hot_path_locally(TimeHotPath::ClockNanosleep, clock_id, flags, Some(ts))?;
-        let _ = sleep_clock_nanosleep_substrate(clock_id, flags, ts);
-        Ok(())
+        let mono_now = crate::arch::rtc::monotonic_nanos();
+        let absolute = flags & linux_abi::TIMER_ABSTIME != 0;
+        let deadline = if absolute {
+            let clock_now = timespec_total_nanos(current_clock_timespec_substrate(clock_id));
+            absolute_deadline_on_monotonic(mono_now, clock_now, timespec_total_nanos(ts))
+        } else {
+            mono_now.saturating_add(timespec_total_nanos(ts))
+        };
+        match sleep_until_monotonic_or_signal(deadline) {
+            None => Ok(()),
+            // An absolute sleep is restarted by the caller with the same
+            // deadline, so Linux reports no remaining time for it.
+            Some(remaining) => {
+                sleep_interruption_result(remaining, if absolute { 0 } else { remaining_ptr })
+            }
+        }
     })())
-}
-
-fn sleep_clock_nanosleep_substrate(clock_id: u64, flags: u64, ts: LinuxTimespecWire) -> u64 {
-    if flags & linux_abi::TIMER_ABSTIME != 0 {
-        sleep_until_timespec_substrate(clock_id, ts);
-    } else {
-        sleep_relative_timespec_substrate(ts);
-    }
-    0
 }
 
 // RING3-MIGRATION-REFERENCE START: scheduler-thread substrate exception:
@@ -823,11 +870,11 @@ pub fn syscall_linux_clone3(frame: &SyscallFrame) -> u64 {
     let expected_size = size_of::<linux_abi::LinuxCloneArgs>();
     // CLONE_ARGS_SIZE_VER0: anything smaller cannot carry the mandatory fields
     // (flags through tls) and is EINVAL, not a zero-padded request.
-    const CLONE_ARGS_SIZE_VER0: usize = 64;
-    let provided_size = match usize::try_from(frame.rsi) {
-        Ok(size) if (CLONE_ARGS_SIZE_VER0..=expected_size).contains(&size) => size,
-        _ => return linux_errno(LINUX_EINVAL),
+    let requested_size = match clone3_args_size(frame.rsi) {
+        Ok(size) => size,
+        Err(errno) => return linux_errno(errno),
     };
+    let provided_size = requested_size.min(expected_size);
     let mut args = linux_abi::LinuxCloneArgs::default();
     // SAFETY: `args` is a live, zero-initialized `#[repr(C)]` LinuxCloneArgs of u64
     // fields (no padding, any byte pattern valid) and `provided_size` was checked
@@ -838,6 +885,22 @@ pub fn syscall_linux_clone3(frame: &SyscallFrame) -> u64 {
     };
     if let Err(errno) = read_user_bytes(frame.rdi, args_bytes) {
         return linux_errno(errno);
+    }
+    // A newer, larger struct is accepted while every field this kernel does not
+    // know is zero; a set unknown field is E2BIG, never silently ignored.
+    if requested_size > expected_size {
+        let mut offset = expected_size;
+        while offset < requested_size {
+            let mut tail = [0_u8; 64];
+            let len = (requested_size - offset).min(tail.len());
+            if let Err(errno) = read_user_bytes(frame.rdi + offset as u64, &mut tail[..len]) {
+                return linux_errno(errno);
+            }
+            if tail[..len].iter().any(|&byte| byte != 0) {
+                return linux_errno(LINUX_E2BIG);
+            }
+            offset += len;
+        }
     }
     if let Err(errno) = validate_clone3_args(&args) {
         return linux_errno(errno);
@@ -861,6 +924,21 @@ pub fn syscall_linux_clone3(frame: &SyscallFrame) -> u64 {
             args.tls,
         ),
     )
+}
+
+/// `copy_struct_from_user` admission of the `clone3` size: below
+/// `CLONE_ARGS_SIZE_VER0` is `EINVAL`, above a page `E2BIG`; anything between
+/// is admitted (a size beyond this kernel's struct is checked for zero fields).
+fn clone3_args_size(size: u64) -> Result<usize, i64> {
+    const CLONE_ARGS_SIZE_VER0: u64 = 64;
+    const CLONE_ARGS_SIZE_MAX: u64 = 4096;
+    if size < CLONE_ARGS_SIZE_VER0 {
+        return Err(LINUX_EINVAL);
+    }
+    if size > CLONE_ARGS_SIZE_MAX {
+        return Err(LINUX_E2BIG);
+    }
+    Ok(size as usize)
 }
 
 fn validate_clone3_args(args: &linux_abi::LinuxCloneArgs) -> Result<(), i64> {
@@ -922,6 +1000,35 @@ mod tests {
                 tv_nsec: 12_345,
             }
         );
+    }
+
+    #[test]
+    fn sleep_deadlines_and_unslept_time_are_exact() {
+        let ts = |tv_sec, tv_nsec| LinuxTimespecWire { tv_sec, tv_nsec };
+        assert_eq!(timespec_total_nanos(ts(2, 5)), 2_000_000_005);
+        assert_eq!(timespec_total_nanos(ts(i64::MAX, 0)), u64::MAX);
+        // An absolute realtime deadline 5 s ahead of the realtime clock lies
+        // 5 s ahead of the monotonic clock; one already passed is due now.
+        assert_eq!(absolute_deadline_on_monotonic(100, 1_000, 6_000), 5_100);
+        assert_eq!(absolute_deadline_on_monotonic(100, 1_000, 1_000), 100);
+        assert_eq!(absolute_deadline_on_monotonic(100, 1_000, 10), 100);
+        assert_eq!(absolute_deadline_on_monotonic(u64::MAX - 1, 0, 9), u64::MAX);
+        // An interrupted sleep is EINTR, and a caller that passed no
+        // remaining-time pointer gets exactly that and nothing else.
+        assert_eq!(sleep_interruption_result(1_500_000_000, 0), Err(LINUX_EINTR));
+    }
+
+    #[test]
+    fn clone3_size_admission_follows_copy_struct_from_user() {
+        let known = size_of::<linux_abi::LinuxCloneArgs>();
+        assert_eq!(clone3_args_size(63), Err(LINUX_EINVAL));
+        assert_eq!(clone3_args_size(0), Err(LINUX_EINVAL));
+        assert_eq!(clone3_args_size(64), Ok(64));
+        assert_eq!(clone3_args_size(known as u64), Ok(known));
+        // A larger (newer) struct is admitted for the zero-tail check, up to a page.
+        assert_eq!(clone3_args_size(known as u64 + 8), Ok(known + 8));
+        assert_eq!(clone3_args_size(4096), Ok(4096));
+        assert_eq!(clone3_args_size(4097), Err(LINUX_E2BIG));
     }
 
     #[test]

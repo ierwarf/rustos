@@ -2371,6 +2371,8 @@ ipc-handle-transfer/IpcHandleTransfer|kernel-ps|multitask::scheduler::tests::ret
 proc-broker-session/ProcBrokerSession|kernel-compat|user::syscall::linux::proc_broker_ops::tests::exited_prepare_owner_cannot_republish_after_cleanup
 rootd-restart-backoff/RootdRestartBackoff|rootd|tests::failed_restart_activation_retires_exact_suspended_child|host-test
 rootd-restart-backoff/RootdRestartBackoff|rootd|tests::core_readiness_budget_is_bounded_and_resets_only_on_readiness|host-test
+rootd-restart-backoff/RootdRestartBackoff|rootd|tests::restart_budget_replenishes_only_after_a_full_healthy_window|host-test
+rootd-restart-backoff/RootdRestartBackoff|rootd|tests::crash_loop_exhausts_but_a_long_lived_service_survives_many_crashes|host-test
 rootd-restart-backoff/RootdRestartBackoff|kernel-compat|user::syscall::linux::offload_ops::tests::full_lifecycle_queue_rejects_loss_instead_of_dropping_oldest_exit
 rootd-restart-backoff/RootdRestartBackoff|kernel-compat|user::syscall::linux::offload_ops::tests::lifecycle_drain_snapshot_preserves_events_appended_during_copyout
 rootd-restart-backoff/RootdRestartBackoff|kernel-compat|user::syscall::linux::offload_ops::tests::lifecycle_fanout_consumers_drain_independently

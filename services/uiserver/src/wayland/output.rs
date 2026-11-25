@@ -29,7 +29,9 @@ impl GlobalDispatch<wl_output::WlOutput, ()> for WaylandState {
             i32::try_from(state.display_height).unwrap_or(1080),
             60_000,
         );
-        output.scale(state.output_scale);
+        if output.version() >= 2 {
+            output.scale(state.output_scale);
+        }
         if output.version() >= 4 {
             output.name(String::from("RustOS-0"));
             output.description(format!(

@@ -678,3 +678,23 @@ fn simultaneous_connects_within_backlog_are_all_queued_without_a_listener_poll()
     }
     assert_eq!(refused, 0, "{refused} of 5 connects within backlog 8 were refused");
 }
+
+#[test]
+fn unknown_sol_socket_option_is_enoprotoopt_like_linux() {
+    let mut state = loopback_test_state();
+    insert_inet_sock(&mut state, 71, linux_abi::AF_INET, libc::SOCK_DGRAM as u64);
+    let mut request = NetdIpcRequest {
+        socket_token: 71,
+        arg1: linux_abi::SOL_SOCKET,
+        arg2: 0x7fff,
+        payload_len: 4,
+        ..NetdIpcRequest::default()
+    };
+    request.payload[..4].copy_from_slice(&1_i32.to_ne_bytes());
+    assert_eq!(handle_setsockopt_in_state(&mut state, &request), libc::ENOPROTOOPT);
+    let mut response = NetdIpcResponse::default();
+    assert_eq!(
+        handle_getsockopt_in_state(&mut state, &request, &mut response),
+        libc::ENOPROTOOPT
+    );
+}

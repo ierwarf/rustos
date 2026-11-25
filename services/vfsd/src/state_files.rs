@@ -122,6 +122,16 @@ impl VfsState {
                 return;
             }
         };
+        // inotify_add_watch(2): read access to the target is required.
+        {
+            let mut storage = lock_vfs_storage();
+            if let Ok(meta) = storage.metadata(resolved.as_str()) {
+                if let Err(errno) = check_metadata_permission(meta, request, 4, false) {
+                    response.status = errno;
+                    return;
+                }
+            }
+        }
         let target = match lock_vfs_storage()
             .inotify_target_for_path(resolved.as_str(), (mask & linux_abi::IN_ONLYDIR) != 0)
         {
@@ -514,6 +524,10 @@ impl VfsState {
             }
             Err(SeekPositionError::Overflow) => {
                 response.status = EOVERFLOW;
+                return;
+            }
+            Err(SeekPositionError::NoSuchPosition) => {
+                response.status = ENXIO;
                 return;
             }
         };
@@ -1201,12 +1215,31 @@ impl VfsState {
 
     fn vfs_access(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
         let Some(path) = vfs_request_path(request) else { response.status = EINVAL; return; };
-        if request.arg0 & !7 != 0 || request.flags & !(0x200 | 0x100) != 0 { response.status = EINVAL; return; }
+        const AT_EMPTY_PATH: u32 = 0x1000;
+        if request.arg0 & !7 != 0 || request.flags & !(0x200 | 0x100 | AT_EMPTY_PATH) != 0 { response.status = EINVAL; return; }
         let real = request.flags & 0x200 == 0;
         let mut traversal_request = *request;
         if real { traversal_request.euid = request.uid; traversal_request.egid = request.gid; }
-        let path = match self.resolve_path_follow(&traversal_request, request.dirfd, path, request.flags & 0x100 == 0) {
-            Ok(path) => path, Err(errno) => { response.status = errno; return; }
+        let path = if path.is_empty() {
+            if request.flags & AT_EMPTY_PATH == 0 {
+                response.status = ENOENT;
+                return;
+            }
+            if request.remote_id != 0 {
+                match self.handles.get(&request.remote_id) {
+                    Some(handle) => handle.path.clone(),
+                    None => { response.status = EBADF; return; }
+                }
+            } else if request.dirfd == linux_abi::AT_FDCWD as u64 {
+                self.cwd.get(&request.pid).cloned().unwrap_or_else(|| "/".to_string())
+            } else {
+                response.status = EBADF;
+                return;
+            }
+        } else {
+            match self.resolve_path_follow(&traversal_request, request.dirfd, path, request.flags & 0x100 == 0) {
+                Ok(path) => path, Err(errno) => { response.status = errno; return; }
+            }
         };
         match vfsd::proc_fs::lookup(&path, request.pid) {
             Some(Ok(vfsd::proc_fs::ProcNode::ExeLink)) => {
@@ -1754,13 +1787,8 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        let known_flags = linux_abi::RENAME_NOREPLACE as u64 | linux_abi::RENAME_EXCHANGE as u64;
-        if request.arg1 & !known_flags != 0 {
-            response.status = EINVAL;
-            return;
-        }
-        if request.arg1 & linux_abi::RENAME_EXCHANGE as u64 != 0 {
-            response.status = EOPNOTSUPP;
+        if let Some(errno) = vfsd::permissions::renameat2_flags_errno(request.arg1) {
+            response.status = errno;
             return;
         }
         let no_replace = (request.arg1 & linux_abi::RENAME_NOREPLACE as u64) != 0;
@@ -1893,6 +1921,11 @@ impl VfsState {
             response.status = EINVAL;
             return;
         }
+        // Both times `UTIME_OMIT`: utimensat(2) returns success before it
+        // looks at the target, and nothing changed, so no `IN_ATTRIB` either.
+        if mask == 0 {
+            return;
+        }
         let path;
         // A path request carries its directory base in `remote_id` too, so the
         // open-description form (futimens) is the one with no path at all.
@@ -1932,7 +1965,7 @@ impl VfsState {
         };
         match metadata {
             Ok(metadata) if mask != 0 && {
-                let both_now = mask == VFS_ATTR_ATIME | VFS_ATTR_MTIME | VFS_ATTR_ATIME_NOW | VFS_ATTR_MTIME_NOW;
+                let both_now = vfsd::permissions::utimes_touch_only(mask);
                 match metadata.fs {
                     Some(fs) => !vfsd::permissions::set_times_allowed(fs, credentials(request, false), both_now),
                     // Plain metadata is reported as uid/gid 0 with the mode
@@ -1940,7 +1973,7 @@ impl VfsState {
                     None => request.euid != 0 && !(both_now && util::mode_bits(metadata.kind) & if request.egid == 0 { 0o020 } else { 0o002 } != 0),
                 }
             } => {
-                let both_now = mask == VFS_ATTR_ATIME | VFS_ATTR_MTIME | VFS_ATTR_ATIME_NOW | VFS_ATTR_MTIME_NOW;
+                let both_now = vfsd::permissions::utimes_touch_only(mask);
                 response.status = if both_now { EACCES } else { EPERM };
             }
             Ok(meta) => {

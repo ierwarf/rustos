@@ -353,12 +353,27 @@ fn resolve_proc_target_pid(node: Node, number: u64, caller_pid: u64) -> Result<u
     }
 }
 
+/// `/proc/<pid>/smaps_rollup`: only counters Ring0 attests for the whole
+/// process (`Rss`, `Locked`); per-mapping sharing facts do not exist, so the
+/// `Pss`/`Shared_*`/`Private_*`/`Anonymous`/`Swap` keys are omitted.
+fn format_smaps_rollup(process: &snap::ProcessFacts) -> Vec<u8> {
+    let mut out = String::from(
+        "00400000-ffffffff ---p 00000000 00:00 0                          [rollup]\n",
+    );
+    if let Some(pages) = process.rss_pages {
+        out.push_str(&alloc::format!("Rss:            {:>8} kB\n", pages.saturating_mul(4)));
+    }
+    out.push_str(&alloc::format!("Locked:         {:>8} kB\n", process.locked_bytes / 1024));
+    out.into_bytes()
+}
+
 /// Content of the node as of now; oversized snapshots fail rather than truncate.
 fn render(node: Node, number: u64, pid: u64) -> Result<Vec<u8>, i64> {
     let caller_tid = multitask::current_user_thread_id().ok_or(LINUX_ESRCH)?;
     let bytes = match node {
         Node::Maps => snap::format_maps(&gather_process(pid)?.regions),
         Node::Smaps => snap::format_smaps(&gather_process(pid)?.regions),
+        Node::SmapsRollup => format_smaps_rollup(&gather_process(pid)?),
         Node::Status => snap::format_status(&gather_process(pid)?, &caller_thread(caller_tid)),
         Node::Stat => snap::format_stat(&gather_process(pid)?, &caller_thread(caller_tid)),
         Node::Statm => snap::format_statm(&gather_process(pid)?),
@@ -474,6 +489,13 @@ fn snapshot_rights(node: Node, flags: u64) -> FileHandleRights {
 
 // ---- completion of delegated operations ---------------------------------------------------
 
+/// Nodes the kernel itself builds for a pid other than the caller's.
+/// `oom_score_adj` must be among them: Chromium's browser writes its
+/// renderers' scores, and only the kernel can write another process's state.
+fn kernel_builds_other_pid_node(node: Node) -> bool {
+    matches!(node, Node::TaskTidDir | Node::OomScoreAdj)
+}
+
 /// `open` of a delegated node: `Some` when `aux` is a delegation.
 pub(crate) fn complete_open(aux: u64, flags: u64) -> Option<Result<u64, i64>> {
     let (node, number) = abi_procfs::decode_delegate(aux)?;
@@ -484,8 +506,9 @@ pub(crate) fn complete_open(aux: u64, flags: u64) -> Option<Result<u64, i64>> {
         }
         let (target_pid, number) = resolve_proc_target(node, number, pid)?;
         // Another process's task files are formatted in vfsd from raw facts;
-        // only the `task/<tid>` directory is built here.
-        if target_pid != pid && node != Node::TaskTidDir {
+        // only the `task/<tid>` directory and `oom_score_adj` (whose write
+        // path needs the kernel's process state) are built here.
+        if target_pid != pid && !kernel_builds_other_pid_node(node) {
             return Err(LINUX_EACCES);
         }
         let bytes = render(node, number, target_pid)?;
@@ -1090,6 +1113,32 @@ mod tests {
         assert_eq!(parse_oom_score_adj(b"   "), Err(LINUX_EINVAL));
         assert_eq!(validate_proc_write_len(PROC_WRITE_MAX_BYTES as u64), Ok(PROC_WRITE_MAX_BYTES));
         assert_eq!(validate_proc_write_len(PROC_WRITE_MAX_BYTES as u64 + 1), Err(LINUX_EINVAL));
+    }
+
+    #[test]
+    fn smaps_rollup_node_is_a_read_only_self_file_and_formats_attested_counters() {
+        assert_eq!(Node::from_self_file_name("smaps_rollup"), Some(Node::SmapsRollup));
+        assert_eq!(Node::SmapsRollup.mode(), abi_procfs::S_IFREG | 0o444);
+        assert!(!Node::SmapsRollup.is_writable());
+        let process = snap::ProcessFacts {
+            pid: 1, ppid: 0, uid: 0, gid: 0, euid: 0, egid: 0, threads: 1, start_ticks: 0,
+            rss_pages: Some(5), locked_bytes: 4096, fd_slots: None, oom_score_adj: 0,
+            regions: Vec::new(), brk_start: 0, arg_start: 0, arg_end: 0, env_start: 0,
+            env_end: 0, sig_ignored: 0, sig_caught: 0, no_new_privs: false,
+        };
+        let text = String::from_utf8(format_smaps_rollup(&process)).unwrap();
+        assert!(text.starts_with("00400000-ffffffff ---p 00000000 00:00 0 "));
+        assert!(text.contains("[rollup]\n"));
+        assert!(text.lines().any(|l| l.split_whitespace().eq(["Rss:", "20", "kB"])));
+        assert!(text.lines().any(|l| l.split_whitespace().eq(["Locked:", "4", "kB"])));
+    }
+
+    #[test]
+    fn other_pid_open_is_kernel_built_only_for_oom_score_adj_and_task_tid_dirs() {
+        assert!(kernel_builds_other_pid_node(Node::OomScoreAdj));
+        assert!(kernel_builds_other_pid_node(Node::TaskTidDir));
+        assert!(!kernel_builds_other_pid_node(Node::Status));
+        assert!(!kernel_builds_other_pid_node(Node::Comm));
     }
 
     #[test]

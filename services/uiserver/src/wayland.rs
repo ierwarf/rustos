@@ -1289,6 +1289,8 @@ struct WaylandSurfaceState {
     content_version: u64,
     role_assigned: bool,
     drag_icon_role: bool,
+    /// `wl_pointer.set_cursor` surface: never a window, never focusable.
+    cursor_role: bool,
     drag_icon_active: bool,
     drag_icon_offset_x: i64,
     drag_icon_offset_y: i64,

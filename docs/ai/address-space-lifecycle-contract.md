@@ -229,22 +229,25 @@ CPU while a root is retired.  Ring0 reads all counters lock-free through the
 process's `ExecutionPin::root_phys` under the process-table lock.
 
 *Signal and census.*  `SYS_RUSTOS_ROOTD_MEMORY_BROKER` (root-supervisor
-capability only, ABI v1) returns in one copy-out: usable, free and min-free
+capability only, ABI v2) returns in one copy-out: usable, free and min-free
 pages, the watermark denial count, and the up-to-32 live, non-exiting
 processes with the largest `private_pages` (ABI v2: `private_pages`,
 `shared_pages`, `retained_pages` per entry).  The bound makes the output fixed
 size; it is a top-N selection, not a victim choice.  Ring0 never decides who
 dies and keeps no pressure state.
 
-*Policy.*  `rootd` already supervises every core and post-init lease, wakes
-every 10 ms, and owns `SYS_RUSTOS_ROOTD_TERMINATE_BROKER`, which performs a
-complete teardown in one non-yielding syscall turn.  Each supervisor pass asks
-for the census.  A pass is *pressure* when free pages are at or below the
-reserve **and** the denial count has risen since the last pass: a quiet
-machine resting at the watermark is not an event.  The governor then:
+*Policy.*  `rootd` supervises every core and post-init lease, owns
+`SYS_RUSTOS_ROOTD_TERMINATE_BROKER` (complete teardown in one non-yielding
+syscall turn), and runs memory governance both at the start of its supervisor
+pass and via a dedicated `PressureGate` thread (`pressure_gate.rs`) so OOM
+decisions cannot wait behind lifecycle bookkeeping or restart work. A pass is
+*pressure* when free pages are at or below the reserve **and** the denial count
+has risen since the last pass: a quiet machine resting at the watermark is not
+an event.  The governor then:
 
-1. skips when a previous victim is still inside its cooldown (200 ms), so a
-   victim whose frames are not yet back does not cascade into a second kill;
+1. skips while a previous victim is still settling (200 ms cooldown + settle
+   window), so a victim whose frames are not yet back does not cascade into a
+   second kill;
 2. picks, among entries that are not `rootd`, not any core or post-init lease
    pid, not any lease's reporter pid, and not below 16 private pages, the
    largest `private_pages` (ties go to the larger pid, the younger process);
@@ -272,8 +275,9 @@ that share one frame are each charged nothing for it, so a job sum is a lower
 bound.  Host witnesses: `census_kill_frees_exactly_the_private_figure`,
 `census_charges_a_forked_page_to_neither_side_until_a_sibling_leaves`
 (`frame_descriptor_ledger`), `shared_and_retained_pages_never_enter_the_victim_score`
-(`memory_governor`).  Pending a KVM boot at 2048 MiB: the `rootd: oom killed`
-line should show a believable private figure and free memory should rise.
+(`memory_governor`). Verified on 2048 MiB KVM `--oom-hog` and Chrome boots:
+`--oom-hog` kills only the hog once and recovers free pages cleanly without a
+second victim.
 
 *Pressure policy runs first in the supervisor pass, and stalls are logged.*
 The census/verdict step precedes lifecycle drain, restarts, health, realm and

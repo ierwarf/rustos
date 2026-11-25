@@ -47,7 +47,6 @@ cheap_targets=(
     "build/formal/sanitizers/target-address-buildstd-v1"
     "build/formal/sanitizers/target-thread"
     "build/formal/sanitizers/target-thread-buildstd-v1"
-    "build/formal/abi-differential/wine-prefix"
     "build/formal/abi-differential"
     "build/formal/shuttle"
     "formal/loom-proof-kernel/target"
@@ -75,6 +74,15 @@ remove() {
     if [[ "$path" == build/formal/* ]] \
         && pgrep -f 'formal/run-.*\.(py|sh)' >/dev/null 2>&1; then
         printf 'skipping active formal lane cache: %s\n' "$path" >&2
+        return 0
+    fi
+    # KVM scratch belongs to a live run while QEMU is up (its logs, snapshots and
+    # perf captures are still being written).
+    if [[ "$path" == build/kvm/* ]] && pgrep -f 'qemu-system' >/dev/null 2>&1; then
+        if [[ "${kvm_skip_reported:-0}" -eq 0 ]]; then
+            printf 'skipping build/kvm scratch while QEMU is running (first: %s)\n' "$path" >&2
+            kvm_skip_reported=1
+        fi
         return 0
     fi
     # Refuse anything under the protected tree even if a future edit adds it.

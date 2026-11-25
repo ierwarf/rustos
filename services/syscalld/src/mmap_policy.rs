@@ -71,7 +71,7 @@ pub fn plan_mmap_with_write(
     anonymous: bool,
     sharing: MmapSharing,
     prot_none: bool,
-    _writable: bool,
+    writable: bool,
     fd_kind: Option<MmapFdKind>,
 ) -> Result<MmapPlan, MmapPlanError> {
     match (anonymous, sharing, fd_kind) {
@@ -79,6 +79,15 @@ pub fn plan_mmap_with_write(
         (true, MmapSharing::Private, None) => Ok(MmapPlan::Anonymous),
         (false, MmapSharing::Private, Some(MmapFdKind::File)) => Ok(MmapPlan::FilePrivate),
         (false, MmapSharing::Shared, Some(MmapFdKind::File)) => Ok(MmapPlan::FileShared),
+        // A read-only private view of a memfd (wl_keyboard.keymap, wl_shm
+        // pools of wl_seat v7+ clients map MAP_PRIVATE) aliases the memfd
+        // frames exactly like a shared one: with no write permission there is
+        // nothing to copy on write. A writable private view needs a COW copy
+        // the memfd backing cannot provide, so it stays refused, and
+        // `mprotect` refuses to add PROT_WRITE to such a mapping later.
+        (false, MmapSharing::Private, Some(MmapFdKind::Memfd)) if !writable => {
+            Ok(MmapPlan::MemfdShared)
+        }
         (false, MmapSharing::Private, Some(_)) => Err(MmapPlanError::InvalidBacking),
         (false, MmapSharing::Shared, Some(MmapFdKind::Memfd)) => Ok(MmapPlan::MemfdShared),
         (false, MmapSharing::Shared, Some(MmapFdKind::DisplaySurface | MmapFdKind::Device | MmapFdKind::DeviceBuffer)) => {
@@ -212,6 +221,14 @@ mod tests {
         assert_eq!(
             plan_mmap(false, MmapSharing::Shared, false, Some(MmapFdKind::Memfd)),
             Ok(MmapPlan::MemfdShared)
+        );
+        assert_eq!(
+            plan_mmap_with_write(false, MmapSharing::Private, false, false, Some(MmapFdKind::Memfd)),
+            Ok(MmapPlan::MemfdShared)
+        );
+        assert_eq!(
+            plan_mmap_with_write(false, MmapSharing::Private, false, true, Some(MmapFdKind::Memfd)),
+            Err(MmapPlanError::InvalidBacking)
         );
     }
 

@@ -46,6 +46,12 @@ pub const IPC_CONTROL_DRAIN_BUDGET: usize = 32;
 /// this at or below the readiness rail prevents an idle root supervisor from
 /// remaining runnable while still bounding admission latency.
 pub const ROOTD_SUPERVISOR_IDLE_POLL_MS: u64 = 10;
+/// Uptime after which a supervised service counts as healthy again and its
+/// crash/restart intensity is forgiven. Shared by rootd (core-service restart
+/// budget) and initd (post-init launch failure budget) so both supervisors
+/// agree on one restart-intensity period (cf. Erlang/OTP `period`, systemd
+/// `StartLimitIntervalSec`).
+pub const SERVICE_HEALTHY_FORGIVENESS_MS: u64 = 60_000;
 /// Boot/control work that may hash, validate, or commit service state.
 pub const IPC_BOOT_CONTROL_HARD_LIMIT_MS: u64 = 5_000;
 /// One immutable executable snapshot on an interactive launch path. The
@@ -197,6 +203,7 @@ const _: () = assert!(UI_FRAME_CPU_TARGET_US < UI_FRAME_HARD_LIMIT_US);
 const _: () = assert!(UI_BOOT_GPU_ACTIVATION_BUDGET_MS < BOOT_TO_UI_HARD_LIMIT_MS);
 const _: () = assert!(IPC_READINESS_QUERY_HARD_LIMIT_MS < IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS);
 const _: () = assert!(IPC_CONTROL_DRAIN_BUDGET > 0);
+const _: () = assert!(SERVICE_HEALTHY_FORGIVENESS_MS > 0);
 const _: () = assert!(
     ROOTD_SUPERVISOR_IDLE_POLL_MS > 0
         && ROOTD_SUPERVISOR_IDLE_POLL_MS <= IPC_READINESS_QUERY_HARD_LIMIT_MS

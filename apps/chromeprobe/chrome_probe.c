@@ -1437,6 +1437,92 @@ static void fdkind_memfd_ino(void) {
     case_end();
 }
 
+/* The wl_keyboard.keymap contract of the compositor: a memfd written with
+ * write(2) (size not page aligned, MFD_CLOEXEC), passed by SCM_RIGHTS, then
+ * mapped read-only by the client with MAP_PRIVATE (wl_seat v7+) or MAP_SHARED.
+ * Chrome truncates at the first NUL; a zero-filled mapping means no xkb state
+ * and a NULL dereference in xkb_state_update_mask on the first modifiers event. */
+static void memfd_keymap_scm_mmap(void) {
+    case_begin("memfd.keymap-scm-mmap");
+    enum { KEYMAP_BYTES = 71250 };
+    static char want[KEYMAP_BYTES];
+    for (int i = 0; i < KEYMAP_BYTES - 1; i++) {
+        want[i] = (char)('a' + (i * 7 + i / 61) % 26);
+    }
+    want[KEYMAP_BYTES - 1] = 0;
+    int mfd = (int)syscall(SYS_memfd_create, "chromeprobe-keymap", 1U /* MFD_CLOEXEC */);
+    CHECK(mfd >= 0);
+    size_t done = 0;
+    while (mfd >= 0 && done < KEYMAP_BYTES) {
+        ssize_t n = write(mfd, want + done, KEYMAP_BYTES - done);
+        if (n <= 0) {
+            break;
+        }
+        done += (size_t)n;
+    }
+    CHECK(done == KEYMAP_BYTES);
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    char cbuf[CMSG_SPACE(sizeof(int))];
+    memset(cbuf, 0, sizeof(cbuf));
+    char byte = 'k';
+    struct iovec iov = {&byte, 1};
+    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = cbuf, .msg_controllen = sizeof(cbuf)};
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+    cm->cmsg_level = SOL_SOCKET;
+    cm->cmsg_type = SCM_RIGHTS;
+    cm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cm), &mfd, sizeof(int));
+    CHECK(sendmsg(sv[0], &msg, 0) == 1);
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        /* Exit codes: 1 recvmsg, 2 no fd, 3 mmap private, 4 private bytes,
+         * 5 mmap shared, 6 shared bytes, 7 mprotect(W) accepted. */
+        char rb[CMSG_SPACE(sizeof(int))], data[2];
+        struct iovec riov = {data, sizeof(data)};
+        struct msghdr rmsg = {.msg_iov = &riov, .msg_iovlen = 1, .msg_control = rb, .msg_controllen = sizeof(rb)};
+        if (recvmsg(sv[1], &rmsg, MSG_CMSG_CLOEXEC) != 1) {
+            _exit(1);
+        }
+        struct cmsghdr *rc = CMSG_FIRSTHDR(&rmsg);
+        int got = -1;
+        if (rc && rc->cmsg_type == SCM_RIGHTS) {
+            memcpy(&got, CMSG_DATA(rc), sizeof(int));
+        }
+        if (got < 0) {
+            _exit(2);
+        }
+        int flags[2] = {MAP_PRIVATE, MAP_SHARED};
+        for (int i = 0; i < 2; i++) {
+            void *map = mmap(NULL, KEYMAP_BYTES, PROT_READ, flags[i], got, 0);
+            if (map == MAP_FAILED) {
+                _exit(i == 0 ? 3 : 5);
+            }
+            if (memcmp(map, want, KEYMAP_BYTES) != 0) {
+                _exit(i == 0 ? 4 : 6);
+            }
+            if (i == 0 && mprotect(map, 4096, PROT_READ | PROT_WRITE) == 0) {
+                _exit(7); /* a private view must not become a write-through one */
+            }
+            munmap(map, KEYMAP_BYTES);
+        }
+        _exit(0);
+    }
+    int status = -1;
+    CHECK(child > 0 && waitpid(child, &status, 0) == child);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
+        say("chromeprobe: memfd.keymap-scm-mmap child status=0x%x", status);
+    }
+    close(sv[0]);
+    close(sv[1]);
+    if (mfd >= 0) {
+        close(mfd);
+    }
+    case_end();
+}
+
 static void fdkind_opath_tmpfile(void) {
     case_begin("fdkind.opath-tmpfile");
     int fd = open("/tmp", O_PATH | O_DIRECTORY);
@@ -1729,6 +1815,7 @@ int main(int argc, char **argv) {
     proc_mounts();
     fdkind_fstat();
     fdkind_memfd_ino();
+    memfd_keymap_scm_mmap();
     fdkind_opath_tmpfile();
     fdkind_sendfile_copy();
     fileops_extended();

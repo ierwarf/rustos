@@ -356,7 +356,21 @@ pub fn syscall_linux_vfs_readlinkat(
 
 pub fn syscall_linux_vfs_access(dirfd: u64, path_ptr: u64, mode: u64, flags: u64) -> u64 {
     linux_result((|| {
-        let path = copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY)?;
+        let path = copy_current_user_path_allow_empty(path_ptr, VFS_IPC_PATH_CAPACITY)?;
+        if path.is_empty() {
+            if flags & linux_abi::AT_EMPTY_PATH == 0 {
+                return Err(LINUX_ENOENT);
+            }
+            if mode & !7 != 0 {
+                return Err(LINUX_EINVAL);
+            }
+            if let Some(owner_bits) = super::anon_stat::current_owner_mode_bits(dirfd) {
+                if (mode & u64::from(owner_bits)) != mode {
+                    return Err(LINUX_EACCES);
+                }
+                return Ok(0);
+            }
+        }
         let mut request = new_vfs_request(VFS_IPC_OP_ACCESS);
         request.flags = flags as u32;
         request.arg0 = mode;

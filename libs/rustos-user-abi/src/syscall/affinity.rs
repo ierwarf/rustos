@@ -34,6 +34,26 @@ mod tests {
     use super::SYSCALL_OFFLOAD_OP_LINUX_SCHED_SETAFFINITY;
     use crate::syscall::SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET;
 
+    /// The Windows system DLLs bound `GetSystemInfo`, affinity masks and the current
+    /// processor number by their own copy of the topology limit. A stale copy made
+    /// those calls fail on any guest with more CPUs than the copy admitted.
+    #[test]
+    fn winsys_cpu_limit_matches_the_kernel_topology_limit() {
+        let header = include_str!(
+            "../../../../compat/windows/services/winsys/common/win_types.h"
+        );
+        let value = header
+            .lines()
+            .find_map(|line| line.strip_prefix("#define RUSTOS_MAX_LOGICAL_CPUS "))
+            .expect("win_types.h defines RUSTOS_MAX_LOGICAL_CPUS")
+            .trim()
+            .trim_end_matches('u');
+        assert_eq!(
+            value.parse::<u64>().expect("numeric limit"),
+            super::CPU_TOPOLOGY_MAX_LOGICAL_CPUS
+        );
+    }
+
     #[test]
     fn affinity_mutation_owns_the_next_unique_policy_operation() {
         assert_eq!(

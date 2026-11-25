@@ -219,6 +219,21 @@ pub fn format_smaps(regions: &[MapRegion]) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// `/proc/<pid>/smaps_rollup`: the `[rollup]` header plus only the counters
+/// Ring0 can attest for the whole process. Per-mapping `Pss`, `Shared_*`,
+/// `Private_*`, `Anonymous`, `Referenced` and `Swap` are not tracked per
+/// region, so they are omitted rather than reported as zero; consumers parse
+/// the file key by key. `Rss` is the process-wide resident leaf count.
+pub fn format_smaps_rollup(process: &ProcessFacts) -> Vec<u8> {
+    let mut out = String::new();
+    out.push_str("00400000-ffffffff ---p 00000000 00:00 0                          [rollup]\n");
+    if let Some(pages) = process.rss_pages {
+        let _ = writeln!(out, "Rss:            {:>8} kB", pages.saturating_mul(PAGE_BYTES / 1024));
+    }
+    let _ = writeln!(out, "Locked:         {:>8} kB", process.locked_bytes / 1024);
+    out.into_bytes()
+}
+
 // ---- status / stat / statm / comm / oom_score_adj ----------------------------------
 
 fn state_name(state: u8) -> &'static str {
@@ -403,6 +418,27 @@ mod tests {
 
         let statm = String::from_utf8(format_statm(&process)).unwrap();
         assert_eq!(statm, "2 10 0 2 0 0 0\n");
+    }
+
+    #[test]
+    fn smaps_rollup_has_rollup_header_and_only_attested_counters() {
+        let mut process = ProcessFacts {
+            pid: 1, ppid: 0, uid: 0, gid: 0, euid: 0, egid: 0, threads: 1, start_ticks: 0,
+            rss_pages: Some(3), locked_bytes: 8192, fd_slots: None, oom_score_adj: 0,
+            regions: Vec::new(), brk_start: 0, arg_start: 0, arg_end: 0, env_start: 0,
+            env_end: 0, sig_ignored: 0, sig_caught: 0, no_new_privs: false,
+        };
+        let text = String::from_utf8(format_smaps_rollup(&process)).unwrap();
+        let first = text.lines().next().unwrap();
+        assert!(first.starts_with("00400000-ffffffff ---p 00000000 00:00 0 "));
+        assert!(first.ends_with("[rollup]"));
+        assert!(text.lines().any(|l| l.split_whitespace().eq(["Rss:", "12", "kB"])));
+        assert!(text.lines().any(|l| l.split_whitespace().eq(["Locked:", "8", "kB"])));
+        assert!(!text.contains("Pss") && !text.contains("Swap") && !text.contains("Anonymous"));
+        process.rss_pages = None;
+        assert!(!String::from_utf8(format_smaps_rollup(&process)).unwrap().contains("Rss:"));
+        process.rss_pages = Some(u64::MAX);
+        assert!(String::from_utf8(format_smaps_rollup(&process)).unwrap().contains("Rss:"));
     }
 
     #[test]

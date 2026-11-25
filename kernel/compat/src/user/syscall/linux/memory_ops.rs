@@ -122,7 +122,8 @@ pub(super) fn syscall_linux_sigaltstack(stack_ptr: u64, old_stack_ptr: u64) -> u
                     } else {
                         linux_abi::LinuxSignalStack {
                             sp: extra.new_ss_sp,
-                            flags: extra.new_ss_flags,
+                            // SS_ONSTACK is a kernel-reported status bit, never stored from input.
+                            flags: extra.new_ss_flags & !linux_abi::SS_ONSTACK,
                             _pad: 0,
                             size: extra.new_ss_size,
                         }

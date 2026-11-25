@@ -1,6 +1,6 @@
 # Chrome 소프트웨어 렌더링 구현 계획
 
-기준: `b554cdb5`, Chrome 157. [게스트 진단](session-handoff.md#chrome-157-non-sandbox-launch-diagnosis-2026-11-19-b554cdb5)에서 기본 FAT 프로필은 `SingletonLock` 생성 실패로, TmpFs 프로필은 Qt Wayland 플러그인 누락으로 종료했다. Crashpad의 `posix_spawn` 실패는 두 실행에서 별도로 관찰됐다.
+기준: `b554cdb5`, Chrome 157 (초기 게스트 진단 기준; 최신 진행 상태는 [Session Handoff](session-handoff.md) 참조). 초기 게스트 진단에서 기본 FAT 프로필은 `SingletonLock` 생성 실패로, TmpFs 프로필은 Qt Wayland 플러그인 누락으로 종료했다. Crashpad의 `posix_spawn` 실패는 두 실행에서 별도로 관찰됐다.
 
 ## 범위와 성공 기준
 
@@ -38,4 +38,4 @@
 
 1. **Qt와 실제 첫 프레임이 먼저.** 영구 저장소와 spawn은 독립 작업으로 진행할 수 있지만 Qt를 고치기 전에는 추가 UI 실패를 추측하지 않는다.
 2. 각 구현 배치에서 `cargo xtask dev-plan`, `cargo xtask check`, 해당 패키지 테스트, 1 vCPU Chrome 게스트 시험을 실행한다. [기존 `chromeprobe`](chrome-gap-fs-net.md#acceptance-not-yet-complete)는 호환성 회귀로 유지하되 실제 Chrome 성공 표식과 분리한다.
-3. 합친 뒤에는 1·8 vCPU에서 같은 로컬 페이지를 시험한다. 영구 프로필은 두 번 부팅한 증거를 남기고, `vfork`/파일시스템 변경은 실패·복구 사례와 formal PR 게이트를 함께 검증한다. 이 계획에는 아직 구현·검증 완료된 단계가 없다.
+3. 합친 뒤에는 1·8 vCPU에서 같은 로컬 페이지를 시험한다. 영구 프로필은 두 번 부팅한 증거를 남기고, `vfork`/파일시스템 변경은 실패·복구 사례와 formal PR 게이트를 함께 검증한다. (2026-11-25 기준: 1단계 Chrome 창 표시·입력 60초 유지와 `chromeprobe` 505/505 통과가 검증되었으며, 2단계 ext4 RW 데이터 볼륨과 3단계 공유 주소공간 `vfork` 및 영구 프로필 재부팅 검증은 미완료 상태다.)

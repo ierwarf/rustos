@@ -8,8 +8,9 @@ pub use self::vfork_wait::{
 };
 mod housekeeping_kick;
 pub use self::housekeeping_kick::{
-    housekeeping_kicked, kick_housekeeping, prioritize_housekeeping, register_housekeeping_task,
-    take_housekeeping_kick, task_slot_available,
+    housekeeping_kicked, kick_housekeeping, kick_housekeeping_executor, prioritize_housekeeping,
+    register_housekeeping_task, register_service_cleanup_task, service_cleanup_kicked,
+    take_housekeeping_kick, take_service_cleanup_kick, task_slot_available,
 };
 mod cpu_local;
 mod current;

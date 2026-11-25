@@ -29,8 +29,12 @@ After the worker joins, configuration rechecks the loader incarnation and lease.
 the loader's service job. Partial/denied retirement retains custody.
 
 Every spawn from the live SESSIOND owner (`runtimed`) receives a new child in
-that realm, with limits of 32 processes, 128 threads and 524288 resident data
-pages (2 GiB), before prepare. A runtime-supplied placement descriptor is
+that realm with limits granted dynamically by `services/loaderd/src/application_grant.rs`
+against the observed `SYS_RUSTOS_TASK_CAPACITY` and `sysinfo` memory before prepare.
+An undeclared `ApplicationRequest` dimension takes the derived default (a quarter
+of the application process/thread budgets and half of physical memory per process),
+while an explicit catalog request (such as Chrome's declared counts) is granted
+exactly or refused. A runtime-supplied placement descriptor is
 refused. An unconfigured replacement returns `EAGAIN`, not a permanent launch
 denial. `services/loaderd/src/application_jobs.rs` retains child authority
 before fallible limit-setting, verifies the committed PID's exact JobId, and

@@ -156,33 +156,34 @@
   with live transfers, reserves that complete capacity before its spin lock is
   published, and preallocates drain output before locking. Task exit therefore
   cannot enter the allocator while holding the global deferred-drop lock.
-  Housekeeping releases at most one entry per turn through bounded provider
-  cleanup. Executive retirement likewise completes at most four exact cleanup
-  records per turn. Individually bounded provider calls therefore cannot
-  concatenate into an unbounded scheduler stall, while unacknowledged cleanup
-  remains scheduler-owned and unreapable.
+  The dedicated `nucleus_service_cleanup_task` (separate from pure kernel
+  `nucleus_housekeeping_task`) releases at most one deferred-transfer entry per
+  turn through bounded provider cleanup and completes at most four exact
+  retired-task cleanup records per turn. Individually bounded provider calls
+  therefore cannot concatenate into an unbounded scheduler stall or block
+  kernel thread materialization/reaping, while unacknowledged cleanup remains
+  scheduler-owned and unreapable.
   Every remaining provider-side reference mutation carries a kernel-minted
   128-bit operation ID. Netd reserves a bounded replay slot before applying a
   mutation, replays the exact result, rejects operation-ID aliases, and retains
   completion until the kernel ACK. Compat retries the same operation ID and
   keeps unresolved mutation/ACK work in a bounded fail-closed reconciliation
-  queue. Vfsd epoll mutations are committed to rootd's authenticated service
-  checkpoint before local publication and exact retries cannot advance a
-  revision twice. Queue exhaustion is `ENOSPC`, never fabricated success or
-  silent eviction.
+  queue. Persistent `epoll` interest sets now live in Ring0 (`EpollHandle`,
+  billed to the client Job; `vfsd` rejects legacy `VFS_POLL_QUERY_EPOLL_*`
+  requests with `EOPNOTSUPP`); queue exhaustion is `ENOSPC`, never fabricated
+  success or silent eviction.
   A provider restart advances endpoint authority, wakes matching waiters, and
   reports the affected interest as `ERR|HUP` instead of failing the aggregate
   wait or accepting a reused token. The stale epoch remains revoked until an
   explicit MOD rebinds it or DEL removes it; DEL validates only the stable
   fd/open-description key and remains available while the provider is down.
-  Unsupported
-  edge-trigger and one-shot flags are rejected until their service-owned
-  rearm contracts exist; they are never silently approximated.
+  `EPOLLET` and `EPOLLONESHOT` are supported on `EpollHandle`; unsupported
+  flags are rejected rather than silently approximated.
   On vfsd restart, rootd returns the versioned opaque vfsd checkpoint only to
-  the current authenticated vfsd lease. The replacement reconstructs epoll
-  refcounts and every provider/object/epoch/events/data interest before it
-  creates or publishes its endpoint; malformed, duplicate, stale, or partial
-  replay fails closed. Ring0 does not mirror service policy as a fallback.
+  the current authenticated vfsd lease. The replacement reconstructs its open
+  descriptions before it creates or publishes its endpoint; malformed,
+  duplicate, stale, or partial replay fails closed. Ring0 does not mirror
+  service policy as a fallback.
   Crash-injection runtime evidence is still required before release acceptance.
   Ordinary remote VFS open descriptions now use the same restart boundary.
   Vfsd durably stages the parent and every normalized-path chunk before the
