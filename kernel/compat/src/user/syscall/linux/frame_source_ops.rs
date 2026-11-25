@@ -36,35 +36,24 @@ pub(super) fn source_errno(error: FrameSourceError) -> i64 {
 }
 
 pub(super) fn control(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(ServiceCapability::PagerPolicy) {
-        return linux_errno(LINUX_EPERM);
-    }
-    let Some(pid) = multitask::current_user_process_id() else {
-        return linux_errno(LINUX_ESRCH);
-    };
-    let args = match usermem::read_current_user_struct::<RustosFrameSourceArgs>(args_ptr) {
-        Ok(args) if args.is_canonical() => args,
-        Ok(_) => return linux_errno(LINUX_EINVAL),
-        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
-    };
-    if args.op == FRAME_SOURCE_OP_SUPPLY {
-        let Some(group) = multitask::current_user_job_charge_group() else {
-            return linux_errno(LINUX_ESRCH);
-        };
-        let mut payload = [0_u8; 4096];
-        let len = args.payload_len as usize; // canonicality bounds it by one page
-        if len != 0 {
-            if let Err(error) =
-                usermem::copy_from_current_user_exact(args.payload_ptr, &mut payload[..len])
-            {
-                return linux_errno(user_pointer_error_to_linux_errno(error));
-            }
+    linux_result((|| {
+        require_service_capability(ServiceCapability::PagerPolicy)?;
+        let pid = current_user_pid()?;
+        let args = read_user_struct::<RustosFrameSourceArgs>(args_ptr)?;
+        if !args.is_canonical() {
+            return Err(LINUX_EINVAL);
         }
-        // Never reclaim under the registry lock: a concurrent PTE/COW change
-        // may retain a descriptor role until its TLB acknowledgements arrive.
-        frame_source::reclaim_frame_sources(16);
-        let result =
-            ipc_ops::with_owned_service_lease(pid, IPC_SERVICE_PAGERD, |slot, generation| {
+        if args.op == FRAME_SOURCE_OP_SUPPLY {
+            let group = multitask::current_user_job_charge_group().ok_or(LINUX_ESRCH)?;
+            let mut payload = [0_u8; 4096];
+            let len = args.payload_len as usize; // canonicality bounds it by one page
+            if len != 0 {
+                read_user_bytes(args.payload_ptr, &mut payload[..len])?;
+            }
+            // Never reclaim under the registry lock: a concurrent PTE/COW change
+            // may retain a descriptor role until its TLB acknowledgements arrive.
+            frame_source::reclaim_frame_sources(16);
+            return ipc_ops::with_owned_service_lease(pid, IPC_SERVICE_PAGERD, |slot, generation| {
                 frame_source::supply_frame_source(
                     FrameSourceOwner {
                         service_slot: slot,
@@ -81,40 +70,34 @@ pub(super) fn control(args_ptr: u64) -> u64 {
                     group,
                     &payload[..len],
                 )
-            });
-        return match result {
-            Some(Ok(token)) => token,
-            Some(Err(error)) => linux_errno(source_errno(error)),
-            None => linux_errno(LINUX_EPERM),
-        };
-    }
-    let Some(owner) =
-        ipc_ops::with_owned_service_lease(pid, IPC_SERVICE_PAGERD, |slot, generation| {
-            FrameSourceOwner {
-                service_slot: slot,
-                service_generation: generation,
-            }
-        })
-    else {
-        return linux_errno(LINUX_EPERM);
-    };
-    match args.op {
-        FRAME_SOURCE_OP_RETIRE => match frame_source::retire_frame_source(args.token, owner) {
-            Ok(()) => {
-                frame_source::reclaim_frame_sources(16);
-                0
-            }
-            Err(error) => linux_errno(source_errno(error)),
-        },
-        FRAME_SOURCE_OP_OWNER_EPOCH => {
-            if owner.service_generation > i64::MAX as u64 {
-                linux_errno(LINUX_EOVERFLOW)
-            } else {
-                owner.service_generation
-            }
+            })
+            .ok_or(LINUX_EPERM)?
+            .map_err(source_errno);
         }
-        _ => linux_errno(LINUX_EINVAL),
-    }
+        let owner =
+            ipc_ops::with_owned_service_lease(pid, IPC_SERVICE_PAGERD, |slot, generation| {
+                FrameSourceOwner {
+                    service_slot: slot,
+                    service_generation: generation,
+                }
+            })
+            .ok_or(LINUX_EPERM)?;
+        match args.op {
+            FRAME_SOURCE_OP_RETIRE => {
+                frame_source::retire_frame_source(args.token, owner).map_err(source_errno)?;
+                frame_source::reclaim_frame_sources(16);
+                Ok(0)
+            }
+            FRAME_SOURCE_OP_OWNER_EPOCH => {
+                if owner.service_generation > i64::MAX as u64 {
+                    Err(LINUX_EOVERFLOW)
+                } else {
+                    Ok(owner.service_generation)
+                }
+            }
+            _ => Err(LINUX_EINVAL),
+        }
+    })())
 }
 
 #[cfg(test)]

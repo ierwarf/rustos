@@ -169,96 +169,89 @@ fn probe_lifecycle_pids(args: &LifecycleDrainBrokerArgs) -> Result<u64, i64> {
             .out_events_ptr
             .checked_add(index as u64 * stride)
             .ok_or(LINUX_EINVAL)?;
-        *slot = usermem::read_current_user_struct::<LifecyclePidProbeWire>(ptr)
-            .map_err(user_pointer_error_to_linux_errno)?;
+        *slot = read_user_struct(ptr)?;
     }
     let live = fill_probe_incarnations(&mut entries[..count], process_incarnation);
     usermem::write_current_user_slice(args.out_events_ptr, &entries[..count])
         .map_err(user_pointer_error_to_linux_errno)?;
-    usermem::write_current_user_bytes(args.out_count_ptr, &live.to_le_bytes())
-        .map_err(user_pointer_error_to_linux_errno)?;
+    write_user_bytes(args.out_count_ptr, &live.to_le_bytes())?;
     Ok(u64::from(live))
 }
 // END lifecycle-pid-probe
 
 pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 {
-    let is_process_policy =
-        ipc_ops::current_process_has_service_capability(ServiceCapability::ProcessPolicy);
-    let is_root_supervisor =
-        ipc_ops::current_process_has_service_capability(ServiceCapability::RootSupervisor);
-    let is_linux_syscall_policy =
-        ipc_ops::current_process_has_service_capability(ServiceCapability::LinuxSyscallPolicy);
-    let is_vfs_policy = ipc_ops::current_process_has_service_capability(ServiceCapability::VfsPolicy);
-    if !is_process_policy && !is_root_supervisor && !is_linux_syscall_policy && !is_vfs_policy {
-        return linux_errno(LINUX_EPERM);
-    }
-    let args = match usermem::read_current_user_struct::<LifecycleDrainBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    if !lifecycle_drain_args_are_valid(&args) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if args.mode == LIFECYCLE_BROKER_MODE_PROBE_PIDS {
-        // Liveness is vfsd's lock-owner evidence; no other consumer has a use
-        // for it, so a capability held only for a drain gets nothing here.
-        if !is_vfs_policy {
-            return linux_errno(LINUX_EPERM);
+    linux_result((|| {
+        let is_process_policy =
+            ipc_ops::current_process_has_service_capability(ServiceCapability::ProcessPolicy);
+        let is_root_supervisor =
+            ipc_ops::current_process_has_service_capability(ServiceCapability::RootSupervisor);
+        let is_linux_syscall_policy =
+            ipc_ops::current_process_has_service_capability(ServiceCapability::LinuxSyscallPolicy);
+        let is_vfs_policy =
+            ipc_ops::current_process_has_service_capability(ServiceCapability::VfsPolicy);
+        if !is_process_policy
+            && !is_root_supervisor
+            && !is_linux_syscall_policy
+            && !is_vfs_policy
+        {
+            return Err(LINUX_EPERM);
         }
-        return match probe_lifecycle_pids(&args) {
-            Ok(live) => live,
-            Err(errno) => linux_errno(errno),
+        let args: LifecycleDrainBrokerArgs = read_user_struct(args_ptr)?;
+        if !lifecycle_drain_args_are_valid(&args) {
+            return Err(LINUX_EINVAL);
+        }
+        if args.mode == LIFECYCLE_BROKER_MODE_PROBE_PIDS {
+            // Liveness is vfsd's lock-owner evidence; no other consumer has a use
+            // for it, so a capability held only for a drain gets nothing here.
+            if !is_vfs_policy {
+                return Err(LINUX_EPERM);
+            }
+            return probe_lifecycle_pids(&args);
+        }
+        let consumer = if is_root_supervisor {
+            offload_ops::LifecycleConsumer::RootSupervisor
+        } else if is_linux_syscall_policy {
+            offload_ops::LifecycleConsumer::LinuxSyscallPolicy
+        } else if is_process_policy {
+            offload_ops::LifecycleConsumer::ProcessPolicy
+        } else {
+            offload_ops::LifecycleConsumer::VfsPolicy
         };
-    }
-    let consumer = if is_root_supervisor {
-        offload_ops::LifecycleConsumer::RootSupervisor
-    } else if is_linux_syscall_policy {
-        offload_ops::LifecycleConsumer::LinuxSyscallPolicy
-    } else if is_process_policy {
-        offload_ops::LifecycleConsumer::ProcessPolicy
-    } else {
-        offload_ops::LifecycleConsumer::VfsPolicy
-    };
-    match offload_ops::drain_lifecycle_events(&args, consumer) {
-        Ok(count) => count,
-        Err(errno) => linux_errno(errno),
-    }
+        offload_ops::drain_lifecycle_events(&args, consumer)
+    })())
 }
 
 /// Finalize one rootd-selected service process.  Rootd decides whether a
 /// lease is stale; this substrate only verifies root-supervisor authority and
 /// performs the complete process teardown in one non-yielding syscall turn.
 pub(super) fn syscall_linux_rustos_rootd_terminate_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(ServiceCapability::RootSupervisor) {
-        return linux_errno(LINUX_EPERM);
-    }
-    let args = match usermem::read_current_user_struct::<RustosRootdTerminateBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    if !rootd_terminate_args_are_valid(&args) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if multitask::current_user_process_id() == Some(args.target_pid) {
-        return linux_errno(LINUX_EPERM);
-    }
-    let parent_pid = multitask::parent_process_id_of(args.target_pid).unwrap_or(0);
-    // The scheduler marks the process exiting before retiring any sibling, so
-    // no new thread or process-scoped authority can enter during teardown.
-    match multitask::terminate_user_process_once(args.target_pid) {
-        multitask::TerminateOutcome::Absent => return linux_errno(LINUX_ESRCH),
-        // Another terminator (the memory-pressure watchdog) published this
-        // termination first and owns its once-per-process follow-up. Running it
-        // again would record a second exit and signal the parent twice.
-        multitask::TerminateOutcome::AlreadyQueued => {
-            crate::oom_watchdog::note_rootd_termination();
-            return 0;
+    linux_unit_result((|| {
+        let args: RustosRootdTerminateBrokerArgs =
+            require_capability_and_read_args(ServiceCapability::RootSupervisor, args_ptr)?;
+        if !rootd_terminate_args_are_valid(&args) {
+            return Err(LINUX_EINVAL);
         }
-        multitask::TerminateOutcome::Started => {}
-    }
-    crate::oom_watchdog::note_rootd_termination();
-    finalize_terminated_process(args.target_pid, parent_pid);
-    0
+        if multitask::current_user_process_id() == Some(args.target_pid) {
+            return Err(LINUX_EPERM);
+        }
+        let parent_pid = multitask::parent_process_id_of(args.target_pid).unwrap_or(0);
+        // The scheduler marks the process exiting before retiring any sibling, so
+        // no new thread or process-scoped authority can enter during teardown.
+        match multitask::terminate_user_process_once(args.target_pid) {
+            multitask::TerminateOutcome::Absent => return Err(LINUX_ESRCH),
+            // Another terminator (the memory-pressure watchdog) published this
+            // termination first and owns its once-per-process follow-up. Running it
+            // again would record a second exit and signal the parent twice.
+            multitask::TerminateOutcome::AlreadyQueued => {
+                crate::oom_watchdog::note_rootd_termination();
+                return Ok(());
+            }
+            multitask::TerminateOutcome::Started => {}
+        }
+        crate::oom_watchdog::note_rootd_termination();
+        finalize_terminated_process(args.target_pid, parent_pid);
+        Ok(())
+    })())
 }
 
 /// Everything that follows `terminate_user_process` succeeding: the revocation
@@ -354,35 +347,27 @@ fn build_memory_reply(
 /// supervisor. Ring0 only measures: which process, if any, to terminate is
 /// rootd policy, enacted through `SYS_RUSTOS_ROOTD_TERMINATE_BROKER`.
 pub(super) fn syscall_linux_rustos_rootd_memory_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(ServiceCapability::RootSupervisor) {
-        return linux_errno(LINUX_EPERM);
-    }
-    if let Err(errno) = memory_census_fault_gate(
-        nucleus_core::util::fault_injection::should_fail("rootd.memory.census"),
-    ) {
-        return linux_errno(errno);
-    }
-    let args = match usermem::read_current_user_struct::<RustosRootdMemoryBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    if !rootd_memory_args_are_valid(&args) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let page_bytes = rustos_user_abi::pager::PAGER_PAGE_BYTES;
-    let stats = MemoryPressureStats {
-        usable_pages: crate::memory::phys::usable_bytes() / page_bytes,
-        free_pages: crate::memory::phys::free_bytes() / page_bytes,
-        min_free_pages: crate::memory::phys::min_free_bytes() / page_bytes,
-        watermark_denials: crate::memory::phys::user_watermark_denials(),
-    };
-    let mut census = [multitask::MemoryCensusEntry::default(); ROOTD_MEMORY_CENSUS_MAX_ENTRIES];
-    let count = multitask::memory_census(&mut census);
-    let reply = build_memory_reply(&stats, &census[..count]);
-    match usermem::write_current_user_struct(args_ptr, &reply) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    }
+    linux_unit_result((|| {
+        require_service_capability(ServiceCapability::RootSupervisor)?;
+        memory_census_fault_gate(
+            nucleus_core::util::fault_injection::should_fail("rootd.memory.census"),
+        )?;
+        let args: RustosRootdMemoryBrokerArgs = read_user_struct(args_ptr)?;
+        if !rootd_memory_args_are_valid(&args) {
+            return Err(LINUX_EINVAL);
+        }
+        let page_bytes = rustos_user_abi::pager::PAGER_PAGE_BYTES;
+        let stats = MemoryPressureStats {
+            usable_pages: crate::memory::phys::usable_bytes() / page_bytes,
+            free_pages: crate::memory::phys::free_bytes() / page_bytes,
+            min_free_pages: crate::memory::phys::min_free_bytes() / page_bytes,
+            watermark_denials: crate::memory::phys::user_watermark_denials(),
+        };
+        let mut census = [multitask::MemoryCensusEntry::default(); ROOTD_MEMORY_CENSUS_MAX_ENTRIES];
+        let count = multitask::memory_census(&mut census);
+        let reply = build_memory_reply(&stats, &census[..count]);
+        write_user_struct(args_ptr, &reply)
+    })())
 }
 
 #[cfg(test)]

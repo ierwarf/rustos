@@ -70,50 +70,50 @@ fn log_block_broker_rejection(stage: &str, args: &RustosBlockBrokerArgs) {
 }
 
 pub(super) fn syscall_linux_rustos_block_broker(args_ptr: u64) -> u64 {
-    let args = match usermem::read_current_user_struct::<RustosBlockBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
-    if args.abi_version != BLOCK_BROKER_ABI_VERSION
-        || !submission_generation_shape_valid(args.op, args.expected_generation)
-        || args.flags & !BLOCK_BROKER_KNOWN_FLAGS != 0
-    {
-        log_block_broker_rejection("envelope", &args);
-        return linux_errno(LINUX_EINVAL);
-    }
-
-    match args.op {
-        BLOCK_BROKER_OP_DVM_INFO
-        | BLOCK_BROKER_OP_DVM_SUBMIT_READ
-        | BLOCK_BROKER_OP_DVM_SUBMIT_WRITE
-        | BLOCK_BROKER_OP_DVM_SUBMIT_FLUSH
-        | BLOCK_BROKER_OP_DVM_COLLECT
-        | BLOCK_BROKER_OP_DVM_CANCEL
-        | BLOCK_BROKER_OP_DVM_WAIT => {
-            if !ipc_ops::current_process_has_service_capability(ServiceCapability::StoragePolicy) {
-                if let Some((process_id, capabilities)) =
-                    ipc_ops::current_process_service_capability_snapshot()
-                {
-                    nucleus_core::debug::write_debugcon_only_line(
-                        alloc::format!(
-                            "dvm-block: broker denied pid={} capabilities={:#x} required={:#x}",
-                            process_id,
-                            capabilities,
-                            ServiceCapability::StoragePolicy.bit(),
-                        )
-                        .as_bytes(),
-                    );
-                } else {
-                    nucleus_core::debug::write_debugcon_only_line(
-                        b"dvm-block: broker denied pid=none capabilities=none",
-                    );
-                }
-                return linux_errno(LINUX_EPERM);
-            }
-            broker_dvm(&args)
+    linux_result((|| {
+        let args: RustosBlockBrokerArgs = read_user_struct_as(args_ptr)?;
+        if args.abi_version != BLOCK_BROKER_ABI_VERSION
+            || !submission_generation_shape_valid(args.op, args.expected_generation)
+            || args.flags & !BLOCK_BROKER_KNOWN_FLAGS != 0
+        {
+            log_block_broker_rejection("envelope", &args);
+            return Err(LINUX_EINVAL);
         }
-        _ => linux_errno(LINUX_EINVAL),
-    }
+
+        match args.op {
+            BLOCK_BROKER_OP_DVM_INFO
+            | BLOCK_BROKER_OP_DVM_SUBMIT_READ
+            | BLOCK_BROKER_OP_DVM_SUBMIT_WRITE
+            | BLOCK_BROKER_OP_DVM_SUBMIT_FLUSH
+            | BLOCK_BROKER_OP_DVM_COLLECT
+            | BLOCK_BROKER_OP_DVM_CANCEL
+            | BLOCK_BROKER_OP_DVM_WAIT => {
+                if !ipc_ops::current_process_has_service_capability(ServiceCapability::StoragePolicy)
+                {
+                    if let Some((process_id, capabilities)) =
+                        ipc_ops::current_process_service_capability_snapshot()
+                    {
+                        nucleus_core::debug::write_debugcon_only_line(
+                            alloc::format!(
+                                "dvm-block: broker denied pid={} capabilities={:#x} required={:#x}",
+                                process_id,
+                                capabilities,
+                                ServiceCapability::StoragePolicy.bit(),
+                            )
+                            .as_bytes(),
+                        );
+                    } else {
+                        nucleus_core::debug::write_debugcon_only_line(
+                            b"dvm-block: broker denied pid=none capabilities=none",
+                        );
+                    }
+                    return Err(LINUX_EPERM);
+                }
+                broker_dvm(&args)
+            }
+            _ => Err(LINUX_EINVAL),
+        }
+    })())
 }
 
 fn submission_generation_shape_valid(op: u16, expected_generation: u64) -> bool {
@@ -126,7 +126,7 @@ fn submission_generation_shape_valid(op: u16, expected_generation: u64) -> bool 
     }
 }
 
-fn broker_dvm(args: &RustosBlockBrokerArgs) -> u64 {
+fn broker_dvm(args: &RustosBlockBrokerArgs) -> LinuxResult<u64> {
     let result = match args.op {
         BLOCK_BROKER_OP_DVM_INFO => broker_dvm_info(args),
         BLOCK_BROKER_OP_DVM_SUBMIT_READ => broker_dvm_submit(args, false),
@@ -142,15 +142,10 @@ fn broker_dvm(args: &RustosBlockBrokerArgs) -> u64 {
             Err(LINUX_EINVAL)
         }
     };
-    match result {
-        Ok(value) => value,
-        Err(errno) => {
-            if errno == LINUX_EINVAL {
-                log_block_broker_rejection("operation", args);
-            }
-            linux_errno(errno)
-        }
+    if let Err(LINUX_EINVAL) = result {
+        log_block_broker_rejection("operation", args);
     }
+    result
 }
 
 fn broker_dvm_info(args: &RustosBlockBrokerArgs) -> Result<u64, i64> {
@@ -180,8 +175,7 @@ fn broker_dvm_info(args: &RustosBlockBrokerArgs) -> Result<u64, i64> {
         },
         reserved0: 0,
     };
-    usermem::write_current_user_struct(args.out_info_ptr, &wire)
-        .map_err(address_space_error_to_linux_errno)?;
+    write_user_struct_as(args.out_info_ptr, &wire)?;
     Ok(0)
 }
 
@@ -208,8 +202,7 @@ fn broker_dvm_submit(args: &RustosBlockBrokerArgs, write: bool) -> Result<u64, i
             .try_reserve_exact(byte_len)
             .map_err(|_| LINUX_ENOMEM)?;
         bytes.resize(byte_len, 0);
-        usermem::copy_from_current_user_exact(args.buffer_ptr, &mut bytes)
-            .map_err(address_space_error_to_linux_errno)?;
+        read_user_bytes_as(args.buffer_ptr, &mut bytes)?;
         block_api::submit_dvm_write(args.expected_generation, sector, &bytes, args.flags & BLOCK_BROKER_FLAG_FUA != 0)
     } else {
         block_api::submit_dvm_read(args.expected_generation, sector, u32::try_from(byte_len).map_err(|_| LINUX_EINVAL)?)
@@ -261,13 +254,11 @@ fn broker_dvm_collect(args: &RustosBlockBrokerArgs) -> Result<u64, i64> {
     })?;
     let byte_len = usize::try_from(args.buffer_len).map_err(|_| LINUX_EINVAL)?;
     if byte_len != 0 {
-        usermem::validate_current_user_write_buffer(args.buffer_ptr, byte_len)
-            .map_err(address_space_error_to_linux_errno)
-            .inspect_err(|_| {
-                nucleus_core::debug::write_debugcon_only_line(
-                    b"dvm-block: collect rejected stage=user-buffer",
-                );
-            })?;
+        validate_user_write_as(args.buffer_ptr, byte_len).inspect_err(|_| {
+            nucleus_core::debug::write_debugcon_only_line(
+                b"dvm-block: collect rejected stage=user-buffer",
+            );
+        })?;
     }
     let mut bytes = Vec::new();
     bytes
@@ -297,8 +288,7 @@ fn broker_dvm_collect(args: &RustosBlockBrokerArgs) -> Result<u64, i64> {
                     let _ = block_api::finish_dvm(ticket);
                     return Err(LINUX_EIO);
                 };
-                usermem::write_current_user_bytes(args.buffer_ptr, filled)
-                    .map_err(address_space_error_to_linux_errno)?;
+                write_user_bytes_as(args.buffer_ptr, filled)?;
             }
             block_api::finish_dvm(ticket)
                 .map_err(dvm_error_to_linux_errno)
@@ -428,7 +418,7 @@ fn checked_dvm_range(
 }
 
 fn write_dvm_ticket(out_ptr: u64, ticket: DvmBlockTicket) -> Result<(), i64> {
-    usermem::write_current_user_struct(
+    write_user_struct_as(
         out_ptr,
         &DvmBlockTicketWire {
             generation: ticket.generation,
@@ -437,7 +427,6 @@ fn write_dvm_ticket(out_ptr: u64, ticket: DvmBlockTicket) -> Result<(), i64> {
             reserved0: 0,
         },
     )
-    .map_err(address_space_error_to_linux_errno)
 }
 
 fn read_dvm_ticket(ticket: DvmBlockTicketWire) -> Result<DvmBlockTicket, i64> {

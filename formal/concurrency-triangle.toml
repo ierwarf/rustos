@@ -628,7 +628,7 @@ model = "smp-ring3-qualification/SmpRing3Qualification"
 source = "kernel/compat/src/user/syscall/linux/debug_ops.rs"
 source_symbol = "syscall_linux_rustos_product_milestone"
 source_anchors = [
-  "match admit_smp_qualification_milestone(milestone, arg0, arg1, current_cpu)",
+  "admit_smp_qualification_milestone(milestone, arg0, arg1, current_cpu)?",
   "debug::record_milestone(debug::LogCategory::Compat, name, arg0, recorded_arg1);",
 ]
 invariant = "after phase admission, evidence may publish only if the post-admission compound SESSIOND owner identity and endpoint epoch still match; revoke or re-register terminalizes the binding and emits no evidence"

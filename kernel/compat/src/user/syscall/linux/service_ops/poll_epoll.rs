@@ -871,19 +871,17 @@ pub fn syscall_linux_ppoll(
     sigmask_ptr: u64,
     sigset_size: u64,
 ) -> u64 {
-    let timeout_ms = if timeout_ptr == 0 {
-        -1
-    } else {
-        let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(timeout_ptr) {
-            Ok(ts) => ts,
-            Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-        };
-        if let Err(errno) = process_time::validate_relative_sleep_timespec_locally(ts) {
-            return linux_errno(errno);
+    let timeout_ms = match read_user_optional_struct::<LinuxTimespecWire>(timeout_ptr) {
+        Ok(None) => -1,
+        Ok(Some(ts)) => {
+            if let Err(errno) = process_time::validate_relative_sleep_timespec_locally(ts) {
+                return linux_errno(errno);
+            }
+            ts.tv_sec
+                .saturating_mul(1000)
+                .saturating_add((ts.tv_nsec + 999_999) / 1_000_000)
         }
-        ts.tv_sec
-            .saturating_mul(1000)
-            .saturating_add((ts.tv_nsec + 999_999) / 1_000_000)
+        Err(errno) => return linux_errno(errno),
     };
     with_temporary_wait_signal_mask(sigmask_ptr, sigset_size, || {
         syscall_linux_poll(fds_ptr, nfds, timeout_ms)
@@ -911,8 +909,8 @@ pub fn syscall_linux_select(
         (false, None)
     } else {
         let mut raw = [0_u8; 16];
-        if let Err(err) = usermem::copy_from_current_user_exact(timeout_ptr, &mut raw) {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
+        if let Err(errno) = read_user_bytes(timeout_ptr, &mut raw) {
+            return linux_errno(errno);
         }
         let tv_sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
         let tv_usec = i64::from_le_bytes(raw[8..16].try_into().unwrap());
@@ -950,8 +948,8 @@ pub fn syscall_linux_select(
         let mut out = [0_u8; 16];
         out[0..8].copy_from_slice(&rem_sec.to_le_bytes());
         out[8..16].copy_from_slice(&rem_usec.to_le_bytes());
-        if let Err(err) = usermem::write_current_user_bytes(timeout_ptr, &out) {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
+        if let Err(errno) = write_user_bytes(timeout_ptr, &out) {
+            return linux_errno(errno);
         }
     }
     result
@@ -966,32 +964,31 @@ pub fn syscall_linux_pselect6(
     timeout_ptr: u64,
     sigmask_arg_ptr: u64,
 ) -> u64 {
-    let (immediate, deadline_tick) = if timeout_ptr == 0 {
-        (false, None)
-    } else {
-        let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(timeout_ptr) {
-            Ok(ts) => ts,
-            Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-        };
-        if let Err(errno) = process_time::validate_relative_sleep_timespec_locally(ts) {
-            return linux_errno(errno);
+    let (immediate, deadline_tick) = match read_user_optional_struct::<LinuxTimespecWire>(timeout_ptr)
+    {
+        Ok(None) => (false, None),
+        Ok(Some(ts)) => {
+            if let Err(errno) = process_time::validate_relative_sleep_timespec_locally(ts) {
+                return linux_errno(errno);
+            }
+            let total_nanos = (ts.tv_sec as u128)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(ts.tv_nsec as u128);
+            if total_nanos == 0 {
+                (true, Some(crate::arch::rtc::ticks()))
+            } else {
+                (false, Some(deadline_tick_from_nanos(total_nanos)))
+            }
         }
-        let total_nanos = (ts.tv_sec as u128)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(ts.tv_nsec as u128);
-        if total_nanos == 0 {
-            (true, Some(crate::arch::rtc::ticks()))
-        } else {
-            (false, Some(deadline_tick_from_nanos(total_nanos)))
-        }
+        Err(errno) => return linux_errno(errno),
     };
 
     let (ss_ptr, ss_len) = if sigmask_arg_ptr == 0 {
         (0, 0)
     } else {
         let mut raw = [0_u8; 16];
-        if let Err(err) = usermem::copy_from_current_user_exact(sigmask_arg_ptr, &mut raw) {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
+        if let Err(errno) = read_user_bytes(sigmask_arg_ptr, &mut raw) {
+            return linux_errno(errno);
         }
         (
             u64::from_le_bytes(raw[0..8].try_into().unwrap()),
@@ -1085,8 +1082,7 @@ fn read_select_fd_set(ptr: u64, word_count: usize) -> Result<Vec<u64>, i64> {
         .checked_mul(size_of::<u64>())
         .ok_or(LINUX_EINVAL)?;
     let mut raw = vec![0_u8; byte_len];
-    usermem::copy_from_current_user_exact(ptr, &mut raw)
-        .map_err(user_pointer_error_to_linux_errno)?;
+    read_user_bytes(ptr, &mut raw)?;
     Ok(raw
         .chunks_exact(8)
         .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
@@ -1101,7 +1097,7 @@ fn write_select_fd_set(ptr: u64, words: &[u64]) -> Result<(), i64> {
     for word in words {
         raw.extend_from_slice(&word.to_le_bytes());
     }
-    usermem::write_current_user_bytes(ptr, &raw).map_err(user_pointer_error_to_linux_errno)
+    write_user_bytes(ptr, &raw)
 }
 
 fn decode_select_queries(
@@ -1265,19 +1261,17 @@ pub fn syscall_linux_epoll_pwait2(
     sigmask_ptr: u64,
     sigset_size: u64,
 ) -> u64 {
-    let timeout_ms = if timeout_ptr == 0 {
-        -1
-    } else {
-        let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(timeout_ptr) {
-            Ok(ts) => ts,
-            Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-        };
-        if let Err(errno) = process_time::validate_relative_sleep_timespec_locally(ts) {
-            return linux_errno(errno);
+    let timeout_ms = match read_user_optional_struct::<LinuxTimespecWire>(timeout_ptr) {
+        Ok(None) => -1,
+        Ok(Some(ts)) => {
+            if let Err(errno) = process_time::validate_relative_sleep_timespec_locally(ts) {
+                return linux_errno(errno);
+            }
+            ts.tv_sec
+                .saturating_mul(1000)
+                .saturating_add((ts.tv_nsec + 999_999) / 1_000_000)
         }
-        ts.tv_sec
-            .saturating_mul(1000)
-            .saturating_add((ts.tv_nsec + 999_999) / 1_000_000)
+        Err(errno) => return linux_errno(errno),
     };
     syscall_linux_epoll_pwait(epfd, events_ptr, maxevents, timeout_ms, sigmask_ptr, sigset_size)
 }
@@ -1293,9 +1287,9 @@ fn with_temporary_wait_signal_mask(
     if sigset_size != size_of::<u64>() as u64 {
         return linux_errno(LINUX_EINVAL);
     }
-    let requested = match usermem::read_current_user_struct::<u64>(sigmask_ptr) {
+    let requested = match read_user_struct::<u64>(sigmask_ptr) {
         Ok(mask) => sanitize_wait_signal_mask(mask),
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
+        Err(errno) => return linux_errno(errno),
     };
     let previous = multitask::with_current_user_process_and_linux_thread_state_mut(
         |_, _, _, _, thread_state| {
@@ -1379,98 +1373,83 @@ pub fn syscall_linux_epoll_create1(flags: u64) -> u64 {
 }
 
 pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
-    if epfd == fd {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let epoll = match epoll_handle_or_errno(epfd) {
-        Ok(epoll) => epoll,
-        Err(errno) => return linux_errno(errno),
-    };
-
-    if !matches!(
-        op,
-        linux_abi::EPOLL_CTL_ADD | linux_abi::EPOLL_CTL_MOD | linux_abi::EPOLL_CTL_DEL
-    ) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let target = match epoll_interest_target(fd) {
-        Ok(target) => target,
-        Err(errno) => return linux_errno(errno),
-    };
-    let provider_epoch = if epoll_ctl_requires_live_provider_epoch(op) {
-        match waitset_provider_epoch(target.provider) {
-            Ok(epoch) => epoch,
-            Err(errno) => return linux_errno(errno),
+    linux_unit_result((|| {
+        if epfd == fd {
+            return Err(LINUX_EINVAL);
         }
-    } else {
-        // DEL is keyed only by target fd plus open-description identity. Keep
-        // the record structurally valid without making cleanup depend on a live
-        // provider or its replacement epoch.
-        1
-    };
+        let epoll = epoll_handle_or_errno(epfd)?;
 
-    let (events, data) = match op {
-        linux_abi::EPOLL_CTL_ADD | linux_abi::EPOLL_CTL_MOD => {
-            if event_ptr == 0 {
-                return linux_errno(LINUX_EINVAL);
+        if !matches!(
+            op,
+            linux_abi::EPOLL_CTL_ADD | linux_abi::EPOLL_CTL_MOD | linux_abi::EPOLL_CTL_DEL
+        ) {
+            return Err(LINUX_EINVAL);
+        }
+        let target = epoll_interest_target(fd)?;
+        let provider_epoch = if epoll_ctl_requires_live_provider_epoch(op) {
+            waitset_provider_epoch(target.provider)?
+        } else {
+            // DEL is keyed only by target fd plus open-description identity. Keep
+            // the record structurally valid without making cleanup depend on a live
+            // provider or its replacement epoch.
+            1
+        };
+
+        let (events, data) = match op {
+            linux_abi::EPOLL_CTL_ADD | linux_abi::EPOLL_CTL_MOD => {
+                if event_ptr == 0 {
+                    return Err(LINUX_EINVAL);
+                }
+                let (events, data) =
+                    read_linux_epoll_event(event_ptr).map_err(user_pointer_error_to_linux_errno)?;
+                // Linux: EPOLLEXCLUSIVE is ADD-only and combines only with the
+                // bits that make a wake-one hint meaningful. An interest added
+                // that way is later immutable (the kernel registry rejects MOD too).
+                if events & linux_abi::EPOLLEXCLUSIVE != 0
+                    && (op == linux_abi::EPOLL_CTL_MOD
+                        || events & !linux_abi::EPOLLEXCLUSIVE_OK_BITS != 0)
+                {
+                    return Err(LINUX_EINVAL);
+                }
+                // EPOLLWAKEUP needs CAP_BLOCK_SUSPEND; RustOS has no suspend
+                // blockers, so it is dropped exactly as for an unprivileged caller.
+                (events & !linux_abi::EPOLLWAKEUP, data)
             }
-            let (events, data) = match read_linux_epoll_event(event_ptr) {
-                Ok(event) => event,
-                Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-            };
-            // Linux: EPOLLEXCLUSIVE is ADD-only and combines only with the
-            // bits that make a wake-one hint meaningful. An interest added
-            // that way is later immutable (the kernel registry rejects MOD too).
-            if events & linux_abi::EPOLLEXCLUSIVE != 0
-                && (op == linux_abi::EPOLL_CTL_MOD
-                    || events & !linux_abi::EPOLLEXCLUSIVE_OK_BITS != 0)
-            {
-                return linux_errno(LINUX_EINVAL);
-            }
-            // EPOLLWAKEUP needs CAP_BLOCK_SUSPEND; RustOS has no suspend
-            // blockers, so it is dropped exactly as for an unprivileged caller.
-            (events & !linux_abi::EPOLLWAKEUP, data)
-        }
-        linux_abi::EPOLL_CTL_DEL => (0, 0),
-        _ => unreachable!(),
-    };
+            linux_abi::EPOLL_CTL_DEL => (0, 0),
+            _ => unreachable!(),
+        };
 
-    let record = multitask::EpollInterestRecord {
-        key: multitask::EpollInterestKey {
-            target_fd: fd,
-            provider: target.provider,
-            object_id: target.object_id,
-        },
-        provider_epoch,
-        events,
-        data,
-    };
+        let record = multitask::EpollInterestRecord {
+            key: multitask::EpollInterestKey {
+                target_fd: fd,
+                provider: target.provider,
+                object_id: target.object_id,
+            },
+            provider_epoch,
+            events,
+            data,
+        };
 
-    let guard = if epoll_ctl_requires_live_provider_epoch(op) {
-        match acquire_epoll_target_guard(&target.handle) {
-            Ok(guard) => Some(guard),
-            Err(errno) => return linux_errno(errno),
+        let guard = if epoll_ctl_requires_live_provider_epoch(op) {
+            Some(acquire_epoll_target_guard(&target.handle)?)
+        } else {
+            None
+        };
+        let result = multitask::epoll_ctl(epoll.token_id(), op, record);
+        if result.is_ok() && op != linux_abi::EPOLL_CTL_DEL {
+            super::local_fd::note_epoll_registered(&target.handle);
         }
-    } else {
-        None
-    };
-    let result = multitask::epoll_ctl(epoll.token_id(), op, record);
-    if result.is_ok() && op != linux_abi::EPOLL_CTL_DEL {
-        super::local_fd::note_epoll_registered(&target.handle);
-    }
-    if let Ok(new_gen) = result {
-        super::super::broker_ops::waitset_broker_ops::wake_local_fd_object(
-            epoll.token_id(),
-            new_gen,
-        );
-    }
-    if let Some(guard) = guard {
-        release_epoll_target_guard(guard);
-    }
-    match result {
-        Ok(_) => 0,
-        Err(err) => linux_errno(epoll_error_to_linux_errno(err)),
-    }
+        if let Ok(new_gen) = result {
+            super::super::broker_ops::waitset_broker_ops::wake_local_fd_object(
+                epoll.token_id(),
+                new_gen,
+            );
+        }
+        if let Some(guard) = guard {
+            release_epoll_target_guard(guard);
+        }
+        result.map(|_| ()).map_err(epoll_error_to_linux_errno)
+    })())
 }
 
 /// Linux reports a descriptor that is not open as EBADF and one that is open
@@ -1510,10 +1489,8 @@ pub fn syscall_linux_epoll_wait(
         return linux_errno(LINUX_EINVAL);
     }
     let maxevents = maxevents.min(MAX_POLL_FDS);
-    if let Err(err) =
-        usermem::validate_current_user_write_buffer(events_ptr, maxevents * EPOLL_EVENT_SIZE)
-    {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
+    if let Err(errno) = validate_user_write(events_ptr, maxevents * EPOLL_EVENT_SIZE) {
+        return linux_errno(errno);
     }
     let epoll = match epoll_handle_or_errno(epfd) {
         Ok(epoll) => epoll,

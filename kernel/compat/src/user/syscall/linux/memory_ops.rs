@@ -64,110 +64,88 @@ pub(super) fn syscall_linux_madvise(start: u64, user_len: u64, advice: u64) -> u
     request.arg0 = start;
     request.arg1 = user_len;
     request.flags = advice;
-    match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response)) {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_unit_result(call_syscalld_empty(request))
 }
 
 pub(super) fn syscall_linux_sigaltstack(stack_ptr: u64, old_stack_ptr: u64) -> u64 {
     const SIGALTSTACK_WIRE_SIZE: usize = 24; // ss_sp + ss_flags + (pad) + ss_size
-    let mut request = new_procd_request(rustos_user_abi::syscall::PROCD_OP_SIGALTSTACK);
-    let mut extra = SigaltstackRequestExtra::default();
-    let Some(old_stack) = multitask::current_linux_thread_state().map(|state| state.signal_stack)
-    else {
-        // sigaltstack is per Linux thread.  Treating a missing thread state as
+    linux_unit_result((|| {
+        let mut request = new_procd_request(rustos_user_abi::syscall::PROCD_OP_SIGALTSTACK);
+        let mut extra = SigaltstackRequestExtra::default();
+        // sigaltstack is per Linux thread. Treating a missing thread state as
         // a disabled stack would manufacture a valid-looking ABI response.
-        return linux_errno(LINUX_EINVAL);
-    };
-    if stack_ptr != 0 {
-        if old_stack.flags & linux_abi::SS_ONSTACK != 0 {
-            return linux_errno(LINUX_EPERM);
+        let old_stack = multitask::current_linux_thread_state()
+            .map(|state| state.signal_stack)
+            .ok_or(LINUX_EINVAL)?;
+        if stack_ptr != 0 {
+            if old_stack.flags & linux_abi::SS_ONSTACK != 0 {
+                return Err(LINUX_EPERM);
+            }
+            let mut buf = [0_u8; SIGALTSTACK_WIRE_SIZE];
+            read_user_bytes(stack_ptr, &mut buf)?;
+            let ss_sp = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let ss_flags = i32::from_le_bytes(buf[8..12].try_into().unwrap());
+            let ss_size = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+            extra.has_new = 1;
+            extra.new_ss_sp = ss_sp;
+            extra.new_ss_flags = ss_flags as u32;
+            extra.new_ss_size = ss_size;
         }
-        let mut buf = [0_u8; SIGALTSTACK_WIRE_SIZE];
-        if let Err(err) = usermem::copy_from_current_user_exact(stack_ptr, &mut buf) {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
+        if old_stack_ptr != 0 {
+            validate_user_write(old_stack_ptr, SIGALTSTACK_WIRE_SIZE)?;
+            request.flags |= 0x1;
         }
-        let ss_sp = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        let ss_flags = i32::from_le_bytes(buf[8..12].try_into().unwrap());
-        let ss_size = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-        extra.has_new = 1;
-        extra.new_ss_sp = ss_sp;
-        extra.new_ss_flags = ss_flags as u32;
-        extra.new_ss_size = ss_size;
-    }
-    if old_stack_ptr != 0 {
-        if let Err(err) =
-            usermem::validate_current_user_write_buffer(old_stack_ptr, SIGALTSTACK_WIRE_SIZE)
-        {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
-        }
-        request.flags |= 0x1;
-    }
-    // SAFETY: `SigaltstackRequestExtra` is `repr(C)` and spells out both of its
-    // padding runs as `_pad` fields, so every byte in `size_of` is a named
-    // field that `Default` and the assignments above initialized. The slice
-    // borrows `extra`, which outlives the copy into `request.payload` below.
-    let extra_bytes = unsafe {
-        core::slice::from_raw_parts(
-            (&extra as *const SigaltstackRequestExtra).cast::<u8>(),
-            size_of::<SigaltstackRequestExtra>(),
-        )
-    };
-    if extra_bytes.len() > request.payload.len() {
-        return linux_errno(LINUX_EINVAL);
-    }
-    request.payload_len = extra_bytes.len() as u32;
-    request.payload[..extra_bytes.len()].copy_from_slice(extra_bytes);
+        // SAFETY: `SigaltstackRequestExtra` is `repr(C)` and spells out both of its
+        // padding runs as `_pad` fields, so every byte in `size_of` is a named
+        // field that `Default` and the assignments above initialized. The slice
+        // borrows `extra`, which outlives `copy_struct_into_payload` below.
+        let _ = core::mem::size_of::<SigaltstackRequestExtra>();
+        copy_struct_into_payload(&mut request.payload, &mut request.payload_len, &extra)?;
 
-    let response = match call_procd(&request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if response.status != 0 {
-        return linux_errno(response.status.unsigned_abs() as i64);
-    }
-    if extra.has_new != 0 {
-        let _ = multitask::with_current_user_process_and_linux_thread_state_mut(
-            |_, _, _, _, linux_thread_state| {
-                let Some(state) = linux_thread_state.as_mut() else {
-                    return;
-                };
-                state.signal_stack = if extra.new_ss_flags & linux_abi::SS_DISABLE != 0 {
-                    linux_abi::LinuxSignalStack {
-                        sp: 0,
-                        flags: linux_abi::SS_DISABLE,
-                        _pad: 0,
-                        size: 0,
-                    }
-                } else {
-                    linux_abi::LinuxSignalStack {
-                        sp: extra.new_ss_sp,
-                        flags: extra.new_ss_flags,
-                        _pad: 0,
-                        size: extra.new_ss_size,
-                    }
-                };
-            },
-        );
-    }
-    if old_stack_ptr != 0 {
-        let mut out = [0_u8; SIGALTSTACK_WIRE_SIZE];
-        let old_flags = if old_stack.size == 0 {
-            linux_abi::SS_DISABLE
-        } else {
-            old_stack.flags
-        };
-        out[0..8].copy_from_slice(&old_stack.sp.to_le_bytes());
-        out[8..12].copy_from_slice(&old_flags.to_le_bytes());
-        out[16..24].copy_from_slice(&old_stack.size.to_le_bytes());
-        if let Err(err) = usermem::write_current_user_bytes(old_stack_ptr, &out) {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
+        let response = call_procd(&request)?;
+        if response.status != 0 {
+            return Err(response.status.unsigned_abs() as i64);
         }
-    } else if response.payload_len != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    0
+        if extra.has_new != 0 {
+            let _ = multitask::with_current_user_process_and_linux_thread_state_mut(
+                |_, _, _, _, linux_thread_state| {
+                    let Some(state) = linux_thread_state.as_mut() else {
+                        return;
+                    };
+                    state.signal_stack = if extra.new_ss_flags & linux_abi::SS_DISABLE != 0 {
+                        linux_abi::LinuxSignalStack {
+                            sp: 0,
+                            flags: linux_abi::SS_DISABLE,
+                            _pad: 0,
+                            size: 0,
+                        }
+                    } else {
+                        linux_abi::LinuxSignalStack {
+                            sp: extra.new_ss_sp,
+                            flags: extra.new_ss_flags,
+                            _pad: 0,
+                            size: extra.new_ss_size,
+                        }
+                    };
+                },
+            );
+        }
+        if old_stack_ptr != 0 {
+            let mut out = [0_u8; SIGALTSTACK_WIRE_SIZE];
+            let old_flags = if old_stack.size == 0 {
+                linux_abi::SS_DISABLE
+            } else {
+                old_stack.flags
+            };
+            out[0..8].copy_from_slice(&old_stack.sp.to_le_bytes());
+            out[8..12].copy_from_slice(&old_flags.to_le_bytes());
+            out[16..24].copy_from_slice(&old_stack.size.to_le_bytes());
+            write_user_bytes(old_stack_ptr, &out)?;
+        } else if response.payload_len != 0 {
+            return Err(LINUX_EINVAL);
+        }
+        Ok(())
+    })())
 }
 
 pub(super) fn syscall_linux_brk(addr: u64) -> u64 {
@@ -194,82 +172,71 @@ pub(super) fn syscall_linux_mmap(
     fd: u64,
     offset: u64,
 ) -> u64 {
-    if is_plain_anonymous_heap_growth(requested_addr, prot, flags, fd, offset)
-        && ipc_ops::current_process_has_service_capability(ServiceCapability::VfsPolicy)
-    {
-        // vfsd's single receive thread grows its heap while serving a request,
-        // and syscalld's single receive thread can be inside a vfsd call (the
-        // mapping broker's FILE_IDENTITY / PREAD64) at that moment. Routing this
-        // `mmap` through syscalld would leave each waiting on the other forever,
-        // so vfsd's plain anonymous heap growth is mapped by the kernel
-        // directly; every other mapping vfsd makes still goes to syscalld.
-        return match bootstrap_mmap(requested_addr, user_len, prot, flags, fd, offset) {
-            Ok(addr) => addr,
-            Err(errno) => linux_errno(errno),
-        };
-    }
-    let response = match call_syscalld_fast_mem(
-        SYSCALL_OFFLOAD_OP_LINUX_MMAP,
-        requested_addr,
-        user_len,
-        prot as u32,
-        flags,
-        fd,
-        offset,
-    ) {
-        Ok(response) => response,
-        Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) => {
-            return match bootstrap_mmap(requested_addr, user_len, prot, flags, fd, offset) {
-                Ok(addr) => addr,
-                Err(errno) => linux_errno(errno),
-            };
+    linux_result((|| {
+        if is_plain_anonymous_heap_growth(requested_addr, prot, flags, fd, offset)
+            && ipc_ops::current_process_has_service_capability(ServiceCapability::VfsPolicy)
+        {
+            // vfsd's single receive thread grows its heap while serving a request,
+            // and syscalld's single receive thread can be inside a vfsd call (the
+            // mapping broker's FILE_IDENTITY / PREAD64) at that moment. Routing this
+            // `mmap` through syscalld would leave each waiting on the other forever,
+            // so vfsd's plain anonymous heap growth is mapped by the kernel
+            // directly; every other mapping vfsd makes still goes to syscalld.
+            return bootstrap_mmap(requested_addr, user_len, prot, flags, fd, offset);
         }
-        Err(errno) => return linux_errno(errno),
-    };
-    if response.payload_len as usize != size_of::<u64>() {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let mut bytes = [0_u8; size_of::<u64>()];
-    bytes.copy_from_slice(&response.payload[..size_of::<u64>()]);
-    u64::from_le_bytes(bytes)
+        let response = match call_syscalld_fast_mem(
+            SYSCALL_OFFLOAD_OP_LINUX_MMAP,
+            requested_addr,
+            user_len,
+            prot as u32,
+            flags,
+            fd,
+            offset,
+        ) {
+            Ok(response) => response,
+            Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) => {
+                return bootstrap_mmap(requested_addr, user_len, prot, flags, fd, offset);
+            }
+            Err(errno) => return Err(errno),
+        };
+        decode_exact_payload::<u64>(&response.payload, response.payload_len)
+    })())
 }
 
 pub(super) fn syscall_linux_mprotect(start: u64, user_len: u64, prot: u64) -> u64 {
-    match call_syscalld_fast_mem(
-        SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
-        start,
-        user_len,
-        prot as u32,
-        0,
-        0,
-        0,
-    )
-    .and_then(ensure_empty_fast_response)
-    {
-        Ok(()) => 0,
-        Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) => {
-            match bootstrap_mprotect(start, user_len, prot) {
-                Ok(()) => 0,
-                Err(errno) => linux_errno(errno),
+    linux_unit_result(
+        match call_syscalld_fast_mem(
+            SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
+            start,
+            user_len,
+            prot as u32,
+            0,
+            0,
+            0,
+        )
+        .and_then(ensure_empty_fast_response)
+        {
+            Ok(()) => Ok(()),
+            Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) => {
+                bootstrap_mprotect(start, user_len, prot)
             }
-        }
-        Err(errno) => linux_errno(errno),
-    }
+            Err(errno) => Err(errno),
+        },
+    )
 }
 
 pub(super) fn syscall_linux_munmap(start: u64, user_len: u64) -> u64 {
-    match call_syscalld_fast_mem(SYSCALL_OFFLOAD_OP_LINUX_MUNMAP, start, user_len, 0, 0, 0, 0)
-        .and_then(ensure_empty_fast_response)
-    {
-        Ok(()) => 0,
-        Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) => {
-            match bootstrap_munmap(start, user_len) {
-                Ok(()) => 0,
-                Err(errno) => linux_errno(errno),
+    linux_unit_result(
+        match call_syscalld_fast_mem(SYSCALL_OFFLOAD_OP_LINUX_MUNMAP, start, user_len, 0, 0, 0, 0)
+            .and_then(ensure_empty_fast_response)
+        {
+            Ok(()) => Ok(()),
+            Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) => {
+                bootstrap_munmap(start, user_len)
             }
-        }
-        Err(errno) => linux_errno(errno),
-    }
+            Err(errno) => Err(errno),
+        },
+    )
 }
 
 // RING3-MIGRATION-REFERENCE START: syscalld/pagerd should own bootstrap Linux

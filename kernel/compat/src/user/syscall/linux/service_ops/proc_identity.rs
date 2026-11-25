@@ -520,11 +520,8 @@ fn stat_node(node: Node, number: u64, flags: u64, out: StatOut) -> Result<u64, i
         StatOut::Stat { ptr } => (ptr, anon_stat::encode_stat(stat, uid, gid).to_vec()),
         StatOut::Statx { ptr, .. } => (ptr, anon_stat::encode_statx(stat, uid, gid).to_vec()),
     };
-    usermem::validate_current_user_write_buffer(ptr, bytes.len())
-        .map_err(user_pointer_error_to_linux_errno)?;
-    usermem::write_current_user_bytes(ptr, &bytes)
-        .map(|()| 0)
-        .map_err(user_pointer_error_to_linux_errno)
+    validate_user_write(ptr, bytes.len())?;
+    write_user_bytes(ptr, &bytes).map(|()| 0)
 }
 
 /// `access` of a delegated node, `None` when not delegated.
@@ -657,31 +654,20 @@ pub(crate) fn write_snapshot(
     user_len: u64,
 ) -> Option<u64> {
     let info = memfd.proc_snapshot()?;
-    let Some(node) = abi_procfs::ProcKernelNode::from_code(info.node) else {
-        return Some(linux_errno(LINUX_EACCES));
-    };
-    if !node.is_writable() {
-        return Some(linux_errno(LINUX_EACCES));
-    }
-    if user_len == 0 {
-        return Some(0);
-    }
-    let len = match validate_proc_write_len(user_len) {
-        Ok(len) => len,
-        Err(errno) => return Some(linux_errno(errno)),
-    };
-    let mut buf = alloc::vec![0_u8; len];
-    if let Err(err) = usermem::copy_from_current_user_exact(user_ptr, &mut buf) {
-        return Some(linux_errno(user_pointer_error_to_linux_errno(err)));
-    }
-    let pid = match caller_pid() {
-        Ok(pid) => pid,
-        Err(errno) => return Some(linux_errno(errno)),
-    };
-    Some(match apply_proc_write(node, info.number, pid, &buf) {
-        Ok(written) => written as u64,
-        Err(errno) => linux_errno(errno),
-    })
+    Some(linux_result((|| {
+        let node = abi_procfs::ProcKernelNode::from_code(info.node).ok_or(LINUX_EACCES)?;
+        if !node.is_writable() {
+            return Err(LINUX_EACCES);
+        }
+        if user_len == 0 {
+            return Ok(0);
+        }
+        let len = validate_proc_write_len(user_len)?;
+        let mut buf = alloc::vec![0_u8; len];
+        read_user_bytes(user_ptr, &mut buf)?;
+        let pid = caller_pid()?;
+        apply_proc_write(node, info.number, pid, &buf).map(|written| written as u64)
+    })()))
 }
 
 // ---- Ring3 vfsd attested raw-facts pull broker --------------------------------------------
@@ -849,55 +835,35 @@ pub(in crate::user::syscall::linux) fn syscall_linux_rustos_proc_facts_broker(
         PROC_FACTS_OP_THREAD,
     };
 
-    if !crate::user::syscall::linux::ipc_ops::current_process_has_service_capability(
-        ServiceCapability::VfsPolicy,
-    ) {
-        return linux_errno(LINUX_EPERM);
-    }
-    let args = match usermem::read_current_user_struct::<ProcFactsBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    if args.abi_version != PROC_FACTS_BROKER_ABI_VERSION
-        || args.flags != 0
-        || args.reserved0 != 0
-        || args.pid == 0
-        || args.out_ptr == 0
-        || args.out_len_ptr == 0
-        || args.out_capacity == 0
-        || args.out_capacity as usize > abi_procfs::PROC_SNAPSHOT_MAX_BYTES
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if let Err(err) =
-        usermem::validate_current_user_write_buffer(args.out_ptr, args.out_capacity as usize)
-    {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    if let Err(err) = usermem::validate_current_user_write_buffer(args.out_len_ptr, 4) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
+    linux_unit_result((|| {
+        let args: ProcFactsBrokerArgs =
+            require_capability_and_read_args(ServiceCapability::VfsPolicy, args_ptr)?;
+        if args.abi_version != PROC_FACTS_BROKER_ABI_VERSION
+            || args.flags != 0
+            || args.reserved0 != 0
+            || args.pid == 0
+            || args.out_ptr == 0
+            || args.out_len_ptr == 0
+            || args.out_capacity == 0
+            || args.out_capacity as usize > abi_procfs::PROC_SNAPSHOT_MAX_BYTES
+        {
+            return Err(LINUX_EINVAL);
+        }
+        validate_user_write(args.out_ptr, args.out_capacity as usize)?;
+        validate_user_write(args.out_len_ptr, 4)?;
 
-    let encoded = match args.op {
-        PROC_FACTS_OP_PROCESS => encode_process_facts_wire(args.pid),
-        PROC_FACTS_OP_THREAD => encode_thread_facts_wire(args.pid, args.tid),
-        _ => Err(LINUX_EINVAL),
-    };
-    let bytes = match encoded {
-        Ok(bytes) => bytes,
-        Err(errno) => return linux_errno(errno),
-    };
-    if bytes.len() > args.out_capacity as usize {
-        return linux_errno(LINUX_EOVERFLOW);
-    }
-    if let Err(err) = usermem::write_current_user_bytes(args.out_ptr, &bytes) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    let len_bytes = (bytes.len() as u32).to_le_bytes();
-    if let Err(err) = usermem::write_current_user_bytes(args.out_len_ptr, &len_bytes) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    0
+        let bytes = match args.op {
+            PROC_FACTS_OP_PROCESS => encode_process_facts_wire(args.pid),
+            PROC_FACTS_OP_THREAD => encode_thread_facts_wire(args.pid, args.tid),
+            _ => Err(LINUX_EINVAL),
+        }?;
+        if bytes.len() > args.out_capacity as usize {
+            return Err(LINUX_EOVERFLOW);
+        }
+        write_user_bytes(args.out_ptr, &bytes)?;
+        let len_bytes = (bytes.len() as u32).to_le_bytes();
+        write_user_bytes(args.out_len_ptr, &len_bytes)
+    })())
 }
 
 /// `getdents64` on a generated directory snapshot; `None` when `fd` is not one

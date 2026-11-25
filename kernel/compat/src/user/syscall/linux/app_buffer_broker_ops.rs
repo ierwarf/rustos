@@ -251,19 +251,17 @@ fn reap(owner: u64, epoch: u64) -> Result<u64, i64> {
     }
 }
 pub(super) fn syscall_linux_rustos_app_buffer_broker(ptr: u64) -> u64 {
-    let args = match usermem::read_current_user_struct::<RustosAppBufferBrokerArgs>(ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    let (owner, epoch) = match live_owner() { Ok(subject) => subject, Err(e) => return linux_errno(e) };
-    let result = match args.op {
-        APP_BUFFER_BROKER_BEGIN => begin(&args, owner, epoch),
-        APP_BUFFER_BROKER_TAKE => progress(owner, epoch, Some(args.sequence), false),
-        APP_BUFFER_BROKER_CANCEL => progress(owner, epoch, Some(args.sequence), true),
-        APP_BUFFER_BROKER_REAP => reap(owner, epoch),
-        _ => Err(LINUX_EINVAL),
-    };
-    result.unwrap_or_else(linux_errno)
+    linux_result((|| {
+        let args: RustosAppBufferBrokerArgs = read_user_struct(ptr)?;
+        let (owner, epoch) = live_owner()?;
+        match args.op {
+            APP_BUFFER_BROKER_BEGIN => begin(&args, owner, epoch),
+            APP_BUFFER_BROKER_TAKE => progress(owner, epoch, Some(args.sequence), false),
+            APP_BUFFER_BROKER_CANCEL => progress(owner, epoch, Some(args.sequence), true),
+            APP_BUFFER_BROKER_REAP => reap(owner, epoch),
+            _ => Err(LINUX_EINVAL),
+        }
+    })())
 }
 
 /// Client entry: forwards one allocation to devmgrd, which owns policy and the
@@ -274,115 +272,113 @@ pub(super) fn syscall_linux_rustos_app_buffer_alloc(ptr: u64) -> u64 {
         DevmgrdAppBufferRequest, DevmgrdAppBufferResponse, RustosAppBufferAllocArgs,
         APP_BUFFER_IPC_ALLOCATE, APP_BUFFER_IPC_VERSION,
     };
-    let args = match usermem::read_current_user_struct::<RustosAppBufferAllocArgs>(ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    if args.reserved != [0; 2] { return linux_errno(LINUX_EINVAL); }
-    // Early refusal only; the authoritative check runs atomically with the
-    // install below because other threads may allocate while devmgrd works.
-    let requested = u64::from(args.stride).saturating_mul(u64::from(args.height));
-    match multitask::with_current_user_process_state_mut(|_, _, process| {
-        process.handles().device_buffer_held_bytes()
-    }) {
-        Some(held) if !client_quota_admits(held, requested) => return linux_errno(LINUX_ENOMEM),
-        Some(_) => {}
-        None => return linux_errno(LINUX_ESRCH),
-    }
-    let Some(snapshot) = multitask::current_user_snapshot() else { return linux_errno(LINUX_ESRCH); };
-    let request = DevmgrdAppBufferRequest {
-        version: APP_BUFFER_IPC_VERSION,
-        op: APP_BUFFER_IPC_ALLOCATE,
-        pid: snapshot.process_id(),
-        tid: snapshot.thread_id(),
-        width: args.width,
-        height: args.height,
-        stride: args.stride,
-        format: args.format,
-        reserved: [0; 2],
-    };
-    let (response, entries) = match ipc_ops::call_service_endpoint_with_received_entries(
-        IPC_SERVICE_DEVMGRD, as_bytes(&request), 1) {
-        Ok(reply) => reply,
-        Err(errno) => return linux_errno(errno),
-    };
-    if response.len() != core::mem::size_of::<DevmgrdAppBufferResponse>() {
-        ipc_ops::drop_transfer_entries(entries);
-        return linux_errno(LINUX_EINVAL);
-    }
-    let response = read_unaligned::<DevmgrdAppBufferResponse>(response.as_slice());
-    if response.version != APP_BUFFER_IPC_VERSION || response.status < 0 {
-        ipc_ops::drop_transfer_entries(entries);
-        return linux_errno(LINUX_EINVAL);
-    }
-    if response.status != 0 {
-        ipc_ops::drop_transfer_entries(entries);
-        return linux_errno(i64::from(response.status));
-    }
-    let mut entries = entries.into_iter();
-    let (Some(entry), None) = (entries.next(), entries.next()) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if !matches!(entry.entry().handle(), multitask::KernelHandle::DeviceBuffer(_)) {
-        ipc_ops::drop_transfer_entries(alloc::vec![entry]);
-        return linux_errno(LINUX_EINVAL);
-    }
-    let length = match entry.entry().handle() {
-        multitask::KernelHandle::DeviceBuffer(capability) => capability.len(),
-        _ => 0,
-    };
-    // Quota, Job charge and install are one critical section on the caller's
-    // table. The charge group is read first (lock-free published-identity
-    // path); `None` (kernel/unpublished caller) bills nothing, as elsewhere.
-    let group = multitask::current_user_job_charge_group();
-    let installed = multitask::with_current_user_process_state_mut(|_, _, process| {
-        if !client_quota_admits(process.handles().device_buffer_held_bytes(), length) {
-            return Err((LINUX_ENOMEM, Some(entry)));
+    linux_result((|| {
+        let args: RustosAppBufferAllocArgs = read_user_struct(ptr)?;
+        if args.reserved != [0; 2] {
+            return Err(LINUX_EINVAL);
         }
-        let capability = match entry.entry().handle() {
-            multitask::KernelHandle::DeviceBuffer(capability) => capability.clone(),
-            _ => return Err((LINUX_EINVAL, Some(entry))),
+        // Early refusal only; the authoritative check runs atomically with the
+        // install below because other threads may allocate while devmgrd works.
+        let requested = u64::from(args.stride).saturating_mul(u64::from(args.height));
+        let held = multitask::with_current_user_process_state_mut(|_, _, process| {
+            process.handles().device_buffer_held_bytes()
+        })
+        .ok_or(LINUX_ESRCH)?;
+        if !client_quota_admits(held, requested) {
+            return Err(LINUX_ENOMEM);
+        }
+        let caller = CallerStamp::try_current_ids_only()?;
+        let request = DevmgrdAppBufferRequest {
+            version: APP_BUFFER_IPC_VERSION,
+            op: APP_BUFFER_IPC_ALLOCATE,
+            pid: caller.pid,
+            tid: caller.tid,
+            width: args.width,
+            height: args.height,
+            stride: args.stride,
+            format: args.format,
+            reserved: [0; 2],
         };
-        let billed = match group {
-            Some(group) => {
-                if capability.bill(group).is_err() {
-                    return Err((LINUX_ENOMEM, Some(entry)));
-                }
-                true
+        let (raw_response, entries) = ipc_ops::call_service_endpoint_with_received_entries(
+            IPC_SERVICE_DEVMGRD,
+            as_bytes(&request),
+            1,
+        )?;
+        let response = match decode_fixed_response::<DevmgrdAppBufferResponse>(&raw_response) {
+            Ok(response) if response.version == APP_BUFFER_IPC_VERSION => {
+                check_ipc_status(response.status).map(|()| response)
             }
-            None => false,
+            _ => Err(LINUX_EINVAL),
         };
-        match process.handles_mut().install_transferred(entry) {
-            Some(fd) => {
-                drop(capability);
+        if let Err(errno) = response {
+            ipc_ops::drop_transfer_entries(entries);
+            return Err(errno);
+        }
+        let mut entries = entries.into_iter();
+        let (Some(entry), None) = (entries.next(), entries.next()) else {
+            return Err(LINUX_EINVAL);
+        };
+        if !matches!(entry.entry().handle(), multitask::KernelHandle::DeviceBuffer(_)) {
+            ipc_ops::drop_transfer_entries(alloc::vec![entry]);
+            return Err(LINUX_EINVAL);
+        }
+        let length = match entry.entry().handle() {
+            multitask::KernelHandle::DeviceBuffer(capability) => capability.len(),
+            _ => 0,
+        };
+        // Quota, Job charge and install are one critical section on the caller's
+        // table. The charge group is read first (lock-free published-identity
+        // path); `None` (kernel/unpublished caller) bills nothing, as elsewhere.
+        let group = multitask::current_user_job_charge_group();
+        let installed = multitask::with_current_user_process_state_mut(|_, _, process| {
+            if !client_quota_admits(process.handles().device_buffer_held_bytes(), length) {
+                return Err((LINUX_ENOMEM, Some(entry)));
+            }
+            let capability = match entry.entry().handle() {
+                multitask::KernelHandle::DeviceBuffer(capability) => capability.clone(),
+                _ => return Err((LINUX_EINVAL, Some(entry))),
+            };
+            let billed = match group {
+                Some(group) => {
+                    if capability.bill(group).is_err() {
+                        return Err((LINUX_ENOMEM, Some(entry)));
+                    }
+                    true
+                }
+                None => false,
+            };
+            match process.handles_mut().install_transferred(entry) {
+                Some(fd) => {
+                    drop(capability);
+                    Ok(fd)
+                }
+                None => {
+                    if billed {
+                        capability.unbill();
+                    }
+                    Err((LINUX_EMFILE, None))
+                }
+            }
+        });
+        match installed {
+            Some(Ok(fd)) => {
+                crate::debug::record_milestone(
+                    crate::debug::LogCategory::Compat,
+                    "app-dmabuf-allocation-granted",
+                    fd as u64,
+                    length as u64,
+                );
                 Ok(fd)
             }
-            None => {
-                if billed {
-                    capability.unbill();
+            Some(Err((errno, refused))) => {
+                if let Some(entry) = refused {
+                    ipc_ops::drop_transfer_entries(alloc::vec![entry]);
                 }
-                Err((LINUX_EMFILE, None))
+                Err(errno)
             }
+            None => Err(LINUX_ESRCH),
         }
-    });
-    match installed {
-        Some(Ok(fd)) => {
-            crate::debug::record_milestone(
-                crate::debug::LogCategory::Compat,
-                "app-dmabuf-allocation-granted",
-                fd as u64,
-                length as u64,
-            );
-            fd
-        }
-        Some(Err((errno, refused))) => {
-            if let Some(entry) = refused {
-                ipc_ops::drop_transfer_entries(alloc::vec![entry]);
-            }
-            linux_errno(errno)
-        }
-        None => linux_errno(LINUX_ESRCH),
-    }
+    })())
 }
 
 /// Per-holder admission: the caller's table may hold at most

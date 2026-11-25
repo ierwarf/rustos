@@ -120,8 +120,7 @@ fn read_user_name(ptr: u64) -> Result<[u8; COMM_LEN], i64> {
         let at = ptr
             .checked_add(filled as u64)
             .ok_or(LINUX_EFAULT)?;
-        usermem::copy_from_current_user_exact(at, &mut buf[filled..filled + len])
-            .map_err(user_pointer_error_to_linux_errno)?;
+        read_user_bytes(at, &mut buf[filled..filled + len])?;
         if buf[filled..filled + len].contains(&0) {
             break;
         }
@@ -131,12 +130,9 @@ fn read_user_name(ptr: u64) -> Result<[u8; COMM_LEN], i64> {
 }
 
 pub(super) fn syscall_linux_prctl(option: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
-    match decide(option, a2, a3, a4, a5) {
-        PrctlAction::SetName(ptr) => {
-            let comm = match read_user_name(ptr) {
-                Ok(comm) => comm,
-                Err(errno) => return linux_errno(errno),
-            };
+    linux_result(match decide(option, a2, a3, a4, a5) {
+        PrctlAction::SetName(ptr) => (|| {
+            let comm = read_user_name(ptr)?;
             let stored = multitask::with_current_user_linux_state_mut(
                 |_, _, abi, _, _, thread_state| {
                     if abi != crate::user::abi::UserAbi::Linux {
@@ -152,66 +148,55 @@ pub(super) fn syscall_linux_prctl(option: u64, a2: u64, a3: u64, a4: u64, a5: u6
                 },
             );
             if stored == Some(true) {
-                0
+                Ok(0)
             } else {
-                linux_errno(LINUX_EINVAL)
+                Err(LINUX_EINVAL)
             }
-        }
-        PrctlAction::GetName(ptr) => {
+        })(),
+        PrctlAction::GetName(ptr) => (|| {
             let comm = multitask::with_current_user_linux_state_mut(
                 |_, _, _, _, _, thread_state| thread_state.as_ref().map(|state| state.comm),
             )
-            .flatten();
-            let Some(comm) = comm else {
-                return linux_errno(LINUX_EINVAL);
-            };
+            .flatten()
+            .ok_or(LINUX_EINVAL)?;
             let exec_path = multitask::with_current_user_process_state(|_, _, state| {
                 String::from(state.exec_path())
             })
             .unwrap_or_default();
             let name = effective_name(&comm, &exec_path);
-            match usermem::write_current_user_bytes(ptr, &name) {
-                Ok(()) => 0,
-                Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-            }
-        }
-        PrctlAction::SetNoNewPrivs => {
-            match multitask::with_current_user_process_state_mut(|_, _, state| {
-                state.set_no_new_privs()
-            }) {
-                Some(()) => 0,
-                None => linux_errno(LINUX_EINVAL),
-            }
-        }
+            write_user_bytes(ptr, &name)?;
+            Ok(0)
+        })(),
+        PrctlAction::SetNoNewPrivs => multitask::with_current_user_process_state_mut(|_, _, state| {
+            state.set_no_new_privs()
+        })
+        .map(|()| 0)
+        .ok_or(LINUX_EINVAL),
         PrctlAction::GetNoNewPrivs => multitask::with_current_process_credentials(|security| {
             u64::from(security.no_new_privs())
         })
-        .unwrap_or_else(|| linux_errno(LINUX_EINVAL)),
+        .ok_or(LINUX_EINVAL),
         PrctlAction::GetTidAddress(ptr) => {
             let tid_addr = multitask::with_current_user_linux_state_mut(
                 |_, _, _, _, _, thread_state| thread_state.as_ref().map(|s| s.clear_child_tid),
             )
             .flatten()
             .unwrap_or(0);
-            match usermem::write_current_user_struct(ptr, &tid_addr) {
-                Ok(()) => 0,
-                Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-            }
+            write_user_struct(ptr, &tid_addr).map(|()| 0)
         }
         PrctlAction::SetDumpable(dumpable) => {
-            match multitask::with_current_user_process_state_mut(|_, _, state| {
+            multitask::with_current_user_process_state_mut(|_, _, state| {
                 state.set_dumpable(dumpable)
-            }) {
-                Some(()) => 0,
-                None => linux_errno(LINUX_EINVAL),
-            }
+            })
+            .map(|()| 0)
+            .ok_or(LINUX_EINVAL)
         }
         PrctlAction::GetDumpable => multitask::with_current_process_credentials(|security| {
             u64::from(security.dumpable())
         })
-        .unwrap_or_else(|| linux_errno(LINUX_EINVAL)),
-        PrctlAction::Invalid => linux_errno(LINUX_EINVAL),
-    }
+        .ok_or(LINUX_EINVAL),
+        PrctlAction::Invalid => Err(LINUX_EINVAL),
+    })
 }
 
 const CAP_WORDS_V1: usize = 1;
@@ -278,8 +263,7 @@ fn read_cap_header(hdr_ptr: u64) -> Result<linux_abi::LinuxCapUserHeader, i64> {
     if hdr_ptr == 0 {
         return Err(LINUX_EFAULT);
     }
-    usermem::read_current_user_struct::<linux_abi::LinuxCapUserHeader>(hdr_ptr)
-        .map_err(user_pointer_error_to_linux_errno)
+    read_user_struct(hdr_ptr)
 }
 
 fn write_preferred_cap_version(hdr_ptr: u64, mut hdr: linux_abi::LinuxCapUserHeader) -> Result<(), i64> {
@@ -287,97 +271,70 @@ fn write_preferred_cap_version(hdr_ptr: u64, mut hdr: linux_abi::LinuxCapUserHea
     let mut bytes = [0_u8; 8];
     bytes[0..4].copy_from_slice(&hdr.version.to_ne_bytes());
     bytes[4..8].copy_from_slice(&hdr.pid.to_ne_bytes());
-    usermem::validate_current_user_write_buffer(hdr_ptr, bytes.len())
-        .map_err(user_pointer_error_to_linux_errno)?;
-    usermem::write_current_user_bytes(hdr_ptr, &bytes).map_err(user_pointer_error_to_linux_errno)
+    validate_user_write(hdr_ptr, bytes.len())?;
+    write_user_bytes(hdr_ptr, &bytes)
 }
 
 pub(super) fn syscall_linux_capget(hdr_ptr: u64, data_ptr: u64) -> u64 {
-    let hdr = match read_cap_header(hdr_ptr) {
-        Ok(hdr) => hdr,
-        Err(errno) => return linux_errno(errno),
-    };
-    let Some(words) = cap_version_words(hdr.version) else {
-        if let Err(errno) = write_preferred_cap_version(hdr_ptr, hdr) {
-            return linux_errno(errno);
-        }
-        return if data_ptr == 0 {
-            0
-        } else {
-            linux_errno(LINUX_EINVAL)
+    linux_unit_result((|| {
+        let hdr = read_cap_header(hdr_ptr)?;
+        let Some(words) = cap_version_words(hdr.version) else {
+            write_preferred_cap_version(hdr_ptr, hdr)?;
+            return if data_ptr == 0 { Ok(()) } else { Err(LINUX_EINVAL) };
         };
-    };
-    if data_ptr == 0 {
-        return 0;
-    }
-    let is_self = match target_matches_caller(hdr.pid) {
-        Ok(value) => value,
-        Err(errno) => return linux_errno(errno),
-    };
-    let caps = if is_self {
-        multitask::with_current_process_credentials(|security| security.capabilities())
-    } else {
-        multitask::with_process_state_by_pid(hdr.pid as u64, |state| state.security().capabilities())
-    };
-    let Some(caps) = caps else {
-        return linux_errno(LINUX_ESRCH);
-    };
-    let encoded = encode_cap_data(caps, words);
-    let mut raw = [0_u8; 24];
-    for (idx, word) in encoded[..words].iter().enumerate() {
-        let base = idx * 12;
-        raw[base..base + 4].copy_from_slice(&word.effective.to_ne_bytes());
-        raw[base + 4..base + 8].copy_from_slice(&word.permitted.to_ne_bytes());
-        raw[base + 8..base + 12].copy_from_slice(&word.inheritable.to_ne_bytes());
-    }
-    let byte_len = words * 12;
-    if let Err(err) = usermem::validate_current_user_write_buffer(data_ptr, byte_len) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    match usermem::write_current_user_bytes(data_ptr, &raw[..byte_len]) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    }
+        if data_ptr == 0 {
+            return Ok(());
+        }
+        let is_self = target_matches_caller(hdr.pid)?;
+        let caps = if is_self {
+            multitask::with_current_process_credentials(|security| security.capabilities())
+        } else {
+            multitask::with_process_state_by_pid(hdr.pid as u64, |state| {
+                state.security().capabilities()
+            })
+        }
+        .ok_or(LINUX_ESRCH)?;
+        let encoded = encode_cap_data(caps, words);
+        let mut raw = [0_u8; 24];
+        for (idx, word) in encoded[..words].iter().enumerate() {
+            let base = idx * 12;
+            raw[base..base + 4].copy_from_slice(&word.effective.to_ne_bytes());
+            raw[base + 4..base + 8].copy_from_slice(&word.permitted.to_ne_bytes());
+            raw[base + 8..base + 12].copy_from_slice(&word.inheritable.to_ne_bytes());
+        }
+        let byte_len = words * 12;
+        validate_user_write(data_ptr, byte_len)?;
+        write_user_bytes(data_ptr, &raw[..byte_len])
+    })())
 }
 
 pub(super) fn syscall_linux_capset(hdr_ptr: u64, data_ptr: u64) -> u64 {
-    let hdr = match read_cap_header(hdr_ptr) {
-        Ok(hdr) => hdr,
-        Err(errno) => return linux_errno(errno),
-    };
-    let Some(words) = cap_version_words(hdr.version) else {
-        let _ = write_preferred_cap_version(hdr_ptr, hdr);
-        return linux_errno(LINUX_EINVAL);
-    };
-    if data_ptr == 0 {
-        return linux_errno(LINUX_EFAULT);
-    }
-    let mut raw = [linux_abi::LinuxCapUserData::default(); 2];
-    for (index, slot) in raw[..words].iter_mut().enumerate() {
-        let item_ptr = match data_ptr.checked_add((index * size_of::<linux_abi::LinuxCapUserData>()) as u64) {
-            Some(ptr) => ptr,
-            None => return linux_errno(LINUX_EFAULT),
+    linux_unit_result((|| {
+        let hdr = read_cap_header(hdr_ptr)?;
+        let Some(words) = cap_version_words(hdr.version) else {
+            let _ = write_preferred_cap_version(hdr_ptr, hdr);
+            return Err(LINUX_EINVAL);
         };
-        *slot = match usermem::read_current_user_struct::<linux_abi::LinuxCapUserData>(item_ptr) {
-            Ok(data) => data,
-            Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-        };
-    }
-    match target_matches_caller(hdr.pid) {
-        Ok(true) => {}
-        Ok(false) => return linux_errno(LINUX_EPERM),
-        Err(_) => return linux_errno(LINUX_EPERM),
-    }
-    let requested = decode_cap_data(&raw, words);
-    let updated = multitask::with_current_user_process_state_mut(|_, _, state| {
-        state.set_capabilities(requested)
-    })
-    .unwrap_or(false);
-    if updated {
-        0
-    } else {
-        linux_errno(LINUX_EPERM)
-    }
+        if data_ptr == 0 {
+            return Err(LINUX_EFAULT);
+        }
+        let mut raw = [linux_abi::LinuxCapUserData::default(); 2];
+        for (index, slot) in raw[..words].iter_mut().enumerate() {
+            let item_ptr = data_ptr
+                .checked_add((index * size_of::<linux_abi::LinuxCapUserData>()) as u64)
+                .ok_or(LINUX_EFAULT)?;
+            *slot = read_user_struct(item_ptr)?;
+        }
+        if !matches!(target_matches_caller(hdr.pid), Ok(true)) {
+            return Err(LINUX_EPERM);
+        }
+        let requested = decode_cap_data(&raw, words);
+        let updated = multitask::with_current_user_process_state_mut(|_, _, state| {
+            state.set_capabilities(requested)
+        })
+        .unwrap_or(false);
+        if updated { Ok(()) } else { Err(LINUX_EPERM) }
+    })())
 }
 
 #[cfg(test)]

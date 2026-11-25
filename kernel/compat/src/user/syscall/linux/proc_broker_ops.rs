@@ -166,368 +166,311 @@ pub(super) fn resolve_spawn_job_descriptor(owner: u64, descriptor: u64) -> Resul
 }
 
 pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
-    let Some(loader_pid) = current_loader_process_id() else {
-        return linux_errno(LINUX_EPERM);
-    };
-    let args = match usermem::read_current_user_struct::<RustosProcPrepareBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
-    if !job_placement::prepare_shape_valid(&args) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let job = match job_placement::resolve_prepare_job(loader_pid, &args) {
-        Ok(job) => job,
-        Err(errno) => return linux_errno(errno),
-    };
-    let exec_ticket =
-        (args.flags & PROC_BROKER_PREPARE_FLAG_EXEC_TICKET != 0).then_some(args.reserved0);
-    if let Some(ticket) = exec_ticket
-        && !EXEC_TICKETS.lock().contains_key(&ticket)
-    {
-        return linux_errno(LINUX_EPERM);
-    }
-    // The PROCESS_LOADER capability is the prepare authority. Loaderd already
-    // completed image-format admission in ring3; a loaderd -> procd policy
-    // call here can close a synchronous procd -> loaderd -> procd cycle when
-    // an exec races an ordinary spawn.
-    let owner_pid = loader_pid;
-    {
-        let prepares = PROC_PREPARES.lock();
-        if let Err(errno) = proc_prepare_publication_status(
+    linux_result((|| {
+        let loader_pid = current_loader_process_id().ok_or(LINUX_EPERM)?;
+        let args: RustosProcPrepareBrokerArgs = read_user_struct_as(args_ptr)?;
+        if !job_placement::prepare_shape_valid(&args) {
+            return Err(LINUX_EINVAL);
+        }
+        let job = job_placement::resolve_prepare_job(loader_pid, &args)?;
+        let exec_ticket =
+            (args.flags & PROC_BROKER_PREPARE_FLAG_EXEC_TICKET != 0).then_some(args.reserved0);
+        if let Some(ticket) = exec_ticket
+            && !EXEC_TICKETS.lock().contains_key(&ticket)
+        {
+            return Err(LINUX_EPERM);
+        }
+        // The PROCESS_LOADER capability is the prepare authority. Loaderd already
+        // completed image-format admission in ring3; a loaderd -> procd policy
+        // call here can close a synchronous procd -> loaderd -> procd cycle when
+        // an exec races an ordinary spawn.
+        let owner_pid = loader_pid;
+        {
+            let prepares = PROC_PREPARES.lock();
+            proc_prepare_publication_status(
+                multitask::is_user_process_exiting(owner_pid),
+                prepares.len(),
+            )?;
+        }
+        // Allocate all pointer slots before publication. Mapping payloads are
+        // individually allocated before taking the registry lock, so subsequent
+        // append operations cannot enter the allocator while holding it.
+        let state = ProcPrepareState {
+            owner_pid,
+            format: args.format,
+            stack_top: args.stack_top,
+            exec_ticket,
+            job,
+            mappings: Vec::with_capacity(MAX_MAPPINGS_PER_PREPARE),
+            windows_runtime: None,
+            linux_runtime: None,
+        };
+        let mut prepares = PROC_PREPARES.lock();
+        proc_prepare_publication_status(
             multitask::is_user_process_exiting(owner_pid),
             prepares.len(),
-        ) {
-            return linux_errno(errno);
+        )?;
+        let handle = allocate_prepare_handle(&prepares).ok_or(LINUX_EAGAIN)?;
+        match prepares.insert(handle, state) {
+            Ok(None) => {}
+            Ok(Some(replaced)) => {
+                drop(prepares);
+                drop(replaced);
+                return Err(LINUX_EAGAIN);
+            }
+            Err((_handle, rejected)) => {
+                drop(prepares);
+                drop(rejected);
+                return Err(LINUX_EAGAIN);
+            }
         }
-    }
-    // Allocate all pointer slots before publication. Mapping payloads are
-    // individually allocated before taking the registry lock, so subsequent
-    // append operations cannot enter the allocator while holding it.
-    let state = ProcPrepareState {
-        owner_pid,
-        format: args.format,
-        stack_top: args.stack_top,
-        exec_ticket,
-        job,
-        mappings: Vec::with_capacity(MAX_MAPPINGS_PER_PREPARE),
-        windows_runtime: None,
-        linux_runtime: None,
-    };
-    let mut prepares = PROC_PREPARES.lock();
-    if let Err(errno) = proc_prepare_publication_status(
-        multitask::is_user_process_exiting(owner_pid),
-        prepares.len(),
-    ) {
-        return linux_errno(errno);
-    }
-    let Some(handle) = allocate_prepare_handle(&prepares) else {
-        return linux_errno(LINUX_EAGAIN);
-    };
-    match prepares.insert(handle, state) {
-        Ok(None) => {}
-        Ok(Some(replaced)) => {
-            drop(prepares);
-            drop(replaced);
-            return linux_errno(LINUX_EAGAIN);
-        }
-        Err((_handle, rejected)) => {
-            drop(prepares);
-            drop(rejected);
-            return linux_errno(LINUX_EAGAIN);
-        }
-    }
-    drop(prepares);
-    nucleus_core::debug::record_milestone(
-        nucleus_core::debug::LogCategory::Compat,
-        "proc-prepare-published",
-        handle,
-        u64::from(args.format),
-    );
-    handle
+        drop(prepares);
+        nucleus_core::debug::record_milestone(
+            nucleus_core::debug::LogCategory::Compat,
+            "proc-prepare-published",
+            handle,
+            u64::from(args.format),
+        );
+        Ok(handle)
+    })())
 }
 
 pub(super) fn syscall_linux_rustos_proc_map_file_broker(args_ptr: u64) -> u64 {
-    let Some(loader_pid) = current_loader_process_id() else {
-        return linux_errno(LINUX_EPERM);
-    };
-    let args = match usermem::read_current_user_struct::<RustosProcMapFileBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
-    if args.reserved0 != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let backing = match pinned_file_backing_from_current(args.fd) {
-        Ok(b) => b,
-        Err(e) => return linux_errno(e),
-    };
-    if let Err(errno) = validate_mapping_region(args.target_addr, args.mem_len, args.flags) {
-        return linux_errno(errno);
-    }
-    if let Err(errno) = validate_file_mapping_len(args.mem_len, args.file_len) {
-        return linux_errno(errno);
-    }
-    let mapping = Box::new(MappingEntry::File {
-        backing,
-        file_offset: args.file_offset,
-        file_len: args.file_len,
-        target_addr: args.target_addr,
-        mem_len: args.mem_len,
-        flags: args.flags,
-    });
-    let mut prepares = PROC_PREPARES.lock();
-    let Some(state) = prepares.get_mut(&args.prepare_handle) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if !prepare_owned_by(state, loader_pid) {
-        return linux_errno(LINUX_EPERM);
-    }
-    if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
-        return linux_errno(LINUX_EINVAL);
-    }
-    state.mappings.push(mapping);
-    0
+    linux_unit_result((|| {
+        let loader_pid = current_loader_process_id().ok_or(LINUX_EPERM)?;
+        let args: RustosProcMapFileBrokerArgs = read_user_struct_as(args_ptr)?;
+        if args.reserved0 != 0 {
+            return Err(LINUX_EINVAL);
+        }
+        let backing = pinned_file_backing_from_current(args.fd)?;
+        validate_mapping_region(args.target_addr, args.mem_len, args.flags)?;
+        validate_file_mapping_len(args.mem_len, args.file_len)?;
+        let mapping = Box::new(MappingEntry::File {
+            backing,
+            file_offset: args.file_offset,
+            file_len: args.file_len,
+            target_addr: args.target_addr,
+            mem_len: args.mem_len,
+            flags: args.flags,
+        });
+        let mut prepares = PROC_PREPARES.lock();
+        let state = prepares.get_mut(&args.prepare_handle).ok_or(LINUX_EINVAL)?;
+        if !prepare_owned_by(state, loader_pid) {
+            return Err(LINUX_EPERM);
+        }
+        if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
+            return Err(LINUX_EINVAL);
+        }
+        state.mappings.push(mapping);
+        Ok(())
+    })())
 }
 
 pub(super) fn syscall_linux_rustos_proc_map_file_batch_broker(args_ptr: u64) -> u64 {
-    let Some(current_pid) = current_loader_process_id() else {
-        nucleus_core::debug::println_serialized(format_args!(
-            "proc-map-file-batch denied stage=capability pid={:?} preempt_depth={}",
-            multitask::current_user_process_id(),
-            nucleus_core::util::lockdep::preemption_depth()
-        ));
-        return linux_errno(LINUX_EPERM);
-    };
-    let args = match usermem::read_current_user_struct::<RustosProcMapFileBatchBrokerArgs>(args_ptr)
-    {
-        Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
-    let count = args.count as usize;
-    if args.reserved0 != 0 || count == 0 || count > PROC_BROKER_BATCH_CAPACITY {
-        return linux_errno(LINUX_EINVAL);
-    }
-    // Resolve and allocate the entire batch before locking the registry.
-    let mut mappings: [Option<Box<MappingEntry>>; PROC_BROKER_BATCH_CAPACITY] =
-        [const { None }; PROC_BROKER_BATCH_CAPACITY];
-    for (index, entry) in args.entries[..count].iter().enumerate() {
-        if entry.reserved0 != 0 {
-            return linux_errno(LINUX_EINVAL);
-        }
-        if let Err(errno) = validate_mapping_region(entry.target_addr, entry.mem_len, entry.flags) {
-            return linux_errno(errno);
-        }
-        if let Err(errno) = validate_file_mapping_len(entry.mem_len, entry.file_len) {
-            return linux_errno(errno);
-        }
-        let backing = match pinned_file_backing_from_current(entry.fd) {
-            Ok(backing) => backing,
-            Err(errno) => return linux_errno(errno),
+    linux_unit_result((|| {
+        let Some(current_pid) = current_loader_process_id() else {
+            nucleus_core::debug::println_serialized(format_args!(
+                "proc-map-file-batch denied stage=capability pid={:?} preempt_depth={}",
+                multitask::current_user_process_id(),
+                nucleus_core::util::lockdep::preemption_depth()
+            ));
+            return Err(LINUX_EPERM);
         };
-        mappings[index] = Some(Box::new(MappingEntry::File {
-            backing,
-            file_offset: entry.file_offset,
-            file_len: entry.file_len,
-            target_addr: entry.target_addr,
-            mem_len: entry.mem_len,
-            flags: entry.flags,
-        }));
-    }
-    let mut prepares = PROC_PREPARES.lock();
-    let Some(state) = prepares.get_mut(&args.prepare_handle) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if current_pid != state.owner_pid {
-        let owner_pid = state.owner_pid;
+        let args: RustosProcMapFileBatchBrokerArgs = read_user_struct_as(args_ptr)?;
+        let count = args.count as usize;
+        if args.reserved0 != 0 || count == 0 || count > PROC_BROKER_BATCH_CAPACITY {
+            return Err(LINUX_EINVAL);
+        }
+        // Resolve and allocate the entire batch before locking the registry.
+        let mut mappings: [Option<Box<MappingEntry>>; PROC_BROKER_BATCH_CAPACITY] =
+            [const { None }; PROC_BROKER_BATCH_CAPACITY];
+        for (index, entry) in args.entries[..count].iter().enumerate() {
+            if entry.reserved0 != 0 {
+                return Err(LINUX_EINVAL);
+            }
+            validate_mapping_region(entry.target_addr, entry.mem_len, entry.flags)?;
+            validate_file_mapping_len(entry.mem_len, entry.file_len)?;
+            let backing = pinned_file_backing_from_current(entry.fd)?;
+            mappings[index] = Some(Box::new(MappingEntry::File {
+                backing,
+                file_offset: entry.file_offset,
+                file_len: entry.file_len,
+                target_addr: entry.target_addr,
+                mem_len: entry.mem_len,
+                flags: entry.flags,
+            }));
+        }
+        let mut prepares = PROC_PREPARES.lock();
+        let state = prepares.get_mut(&args.prepare_handle).ok_or(LINUX_EINVAL)?;
+        if current_pid != state.owner_pid {
+            let owner_pid = state.owner_pid;
+            drop(prepares);
+            nucleus_core::debug::println_serialized(format_args!(
+                "proc-map-file-batch denied stage=owner handle={} owner_pid={} current_pid={}",
+                args.prepare_handle, owner_pid, current_pid
+            ));
+            return Err(LINUX_EPERM);
+        }
+        if state.mappings.len() + count > MAX_MAPPINGS_PER_PREPARE {
+            return Err(LINUX_EINVAL);
+        }
+        for mapping in &mut mappings[..count] {
+            state
+                .mappings
+                .push(mapping.take().expect("validated broker batch entry"));
+        }
         drop(prepares);
-        nucleus_core::debug::println_serialized(format_args!(
-            "proc-map-file-batch denied stage=owner handle={} owner_pid={} current_pid={}",
-            args.prepare_handle, owner_pid, current_pid
-        ));
-        return linux_errno(LINUX_EPERM);
-    }
-    if state.mappings.len() + count > MAX_MAPPINGS_PER_PREPARE {
-        return linux_errno(LINUX_EINVAL);
-    }
-    for mapping in &mut mappings[..count] {
-        state
-            .mappings
-            .push(mapping.take().expect("validated broker batch entry"));
-    }
-    drop(prepares);
-    nucleus_core::debug::record_milestone(
-        nucleus_core::debug::LogCategory::Compat,
-        "proc-map-file-batch",
-        args.prepare_handle,
-        count as u64,
-    );
-    0
+        nucleus_core::debug::record_milestone(
+            nucleus_core::debug::LogCategory::Compat,
+            "proc-map-file-batch",
+            args.prepare_handle,
+            count as u64,
+        );
+        Ok(())
+    })())
 }
 
 pub(super) fn syscall_linux_rustos_proc_set_linux_runtime_broker(args_ptr: u64) -> u64 {
-    let Some(loader_pid) = current_loader_process_id() else {
-        return linux_errno(LINUX_EPERM);
-    };
-    let args =
-        match usermem::read_current_user_struct::<RustosProcSetLinuxRuntimeBrokerArgs>(args_ptr) {
-            Ok(args) => args,
-            Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-        };
-    if args.abi_version != PROC_BROKER_ABI_VERSION || args.reserved0 != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let interp_path_len = args.interp_path_len as usize;
-    if interp_path_len > PROC_BROKER_LINUX_INTERP_PATH_CAPACITY {
-        return linux_errno(LINUX_EINVAL);
-    }
-    // `actual_entry` becomes the first user RIP and the TLS fields become
-    // `VirtAddr::new` operands during commit, which panics on a non-canonical
-    // address. Reject anything outside the loader's user window here.
-    if !user_span_in_window(args.actual_entry, 1) || !linux_tls_fields_valid(&args) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let initial_tls = if args.has_tls != 0 {
-        Some(crate::user::linux::LinuxInitialTlsInfo {
-            template_addr: args.tls_template_addr,
-            template_size: args.tls_template_size,
-            mem_size: args.tls_mem_size,
-            align: args.tls_align,
-            mapping_base: args.tls_mapping_base,
-            mapping_size: args.tls_mapping_size,
-            tls_block_base: args.tls_block_base,
-            thread_pointer: args.tls_thread_pointer,
-            tcb_base: args.tls_tcb_base,
-            dtv_base: args.tls_dtv_base,
-        })
-    } else {
-        None
-    };
-    let interpreter_path = if interp_path_len > 0 {
-        match core::str::from_utf8(&args.interp_path[..interp_path_len]) {
-            Ok(s) => Some(String::from(s)),
-            Err(_) => return linux_errno(LINUX_EINVAL),
+    linux_unit_result((|| {
+        let loader_pid = current_loader_process_id().ok_or(LINUX_EPERM)?;
+        let args: RustosProcSetLinuxRuntimeBrokerArgs = read_user_struct_as(args_ptr)?;
+        if args.abi_version != PROC_BROKER_ABI_VERSION || args.reserved0 != 0 {
+            return Err(LINUX_EINVAL);
         }
-    } else {
-        None
-    };
-    let info = crate::user::linux::LinuxProcessImageInfo {
-        entry: args.entry,
-        interpreter_base: args.interpreter_base,
-        interpreter_path,
-        program_headers: args.phdr_addr,
-        program_header_entry_size: args.phent,
-        program_header_count: args.phnum,
-        brk_start: args.brk_start,
-        bootstrap_heap_base: 0,
-        bootstrap_heap_len: 0,
-        initial_tls,
-        image_mappings: Vec::new(),
-        runtime_search_paths: Vec::new(),
-    };
-    let mut prepares = PROC_PREPARES.lock();
-    let Some(state) = prepares.get_mut(&args.prepare_handle) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if !prepare_owned_by(state, loader_pid) {
-        return linux_errno(LINUX_EPERM);
-    }
-    if state.format != PROC_BROKER_FORMAT_ELF64 || state.linux_runtime.is_some() {
-        return linux_errno(LINUX_EINVAL);
-    }
-    state.linux_runtime = Some((info, args.actual_entry));
-    drop(prepares);
-    nucleus_core::debug::record_milestone(
-        nucleus_core::debug::LogCategory::Compat,
-        "proc-linux-runtime-published",
-        args.prepare_handle,
-        args.phnum,
-    );
-    0
+        let interp_path_len = args.interp_path_len as usize;
+        if interp_path_len > PROC_BROKER_LINUX_INTERP_PATH_CAPACITY {
+            return Err(LINUX_EINVAL);
+        }
+        // `actual_entry` becomes the first user RIP and the TLS fields become
+        // `VirtAddr::new` operands during commit, which panics on a non-canonical
+        // address. Reject anything outside the loader's user window here.
+        if !user_span_in_window(args.actual_entry, 1) || !linux_tls_fields_valid(&args) {
+            return Err(LINUX_EINVAL);
+        }
+        let initial_tls = if args.has_tls != 0 {
+            Some(crate::user::linux::LinuxInitialTlsInfo {
+                template_addr: args.tls_template_addr,
+                template_size: args.tls_template_size,
+                mem_size: args.tls_mem_size,
+                align: args.tls_align,
+                mapping_base: args.tls_mapping_base,
+                mapping_size: args.tls_mapping_size,
+                tls_block_base: args.tls_block_base,
+                thread_pointer: args.tls_thread_pointer,
+                tcb_base: args.tls_tcb_base,
+                dtv_base: args.tls_dtv_base,
+            })
+        } else {
+            None
+        };
+        let interpreter_path = if interp_path_len > 0 {
+            Some(String::from(
+                core::str::from_utf8(&args.interp_path[..interp_path_len])
+                    .map_err(|_| LINUX_EINVAL)?,
+            ))
+        } else {
+            None
+        };
+        let info = crate::user::linux::LinuxProcessImageInfo {
+            entry: args.entry,
+            interpreter_base: args.interpreter_base,
+            interpreter_path,
+            program_headers: args.phdr_addr,
+            program_header_entry_size: args.phent,
+            program_header_count: args.phnum,
+            brk_start: args.brk_start,
+            bootstrap_heap_base: 0,
+            bootstrap_heap_len: 0,
+            initial_tls,
+            image_mappings: Vec::new(),
+            runtime_search_paths: Vec::new(),
+        };
+        let mut prepares = PROC_PREPARES.lock();
+        let state = prepares.get_mut(&args.prepare_handle).ok_or(LINUX_EINVAL)?;
+        if !prepare_owned_by(state, loader_pid) {
+            return Err(LINUX_EPERM);
+        }
+        if state.format != PROC_BROKER_FORMAT_ELF64 || state.linux_runtime.is_some() {
+            return Err(LINUX_EINVAL);
+        }
+        state.linux_runtime = Some((info, args.actual_entry));
+        drop(prepares);
+        nucleus_core::debug::record_milestone(
+            nucleus_core::debug::LogCategory::Compat,
+            "proc-linux-runtime-published",
+            args.prepare_handle,
+            args.phnum,
+        );
+        Ok(())
+    })())
 }
 
 pub(super) fn syscall_linux_rustos_proc_map_zeroed_broker(args_ptr: u64) -> u64 {
-    let Some(loader_pid) = current_loader_process_id() else {
-        return linux_errno(LINUX_EPERM);
-    };
-    let args = match usermem::read_current_user_struct::<RustosProcMapZeroedBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
-    if args.reserved0 != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if let Err(errno) = validate_mapping_region(args.target_addr, args.mem_len, args.flags) {
-        return linux_errno(errno);
-    }
-    let mapping = Box::new(MappingEntry::Zeroed {
-        target_addr: args.target_addr,
-        mem_len: args.mem_len,
-        flags: args.flags,
-    });
-    let mut prepares = PROC_PREPARES.lock();
-    let Some(state) = prepares.get_mut(&args.prepare_handle) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if !prepare_owned_by(state, loader_pid) {
-        return linux_errno(LINUX_EPERM);
-    }
-    if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
-        return linux_errno(LINUX_EINVAL);
-    }
-    state.mappings.push(mapping);
-    0
+    linux_unit_result((|| {
+        let loader_pid = current_loader_process_id().ok_or(LINUX_EPERM)?;
+        let args: RustosProcMapZeroedBrokerArgs = read_user_struct_as(args_ptr)?;
+        if args.reserved0 != 0 {
+            return Err(LINUX_EINVAL);
+        }
+        validate_mapping_region(args.target_addr, args.mem_len, args.flags)?;
+        let mapping = Box::new(MappingEntry::Zeroed {
+            target_addr: args.target_addr,
+            mem_len: args.mem_len,
+            flags: args.flags,
+        });
+        let mut prepares = PROC_PREPARES.lock();
+        let state = prepares.get_mut(&args.prepare_handle).ok_or(LINUX_EINVAL)?;
+        if !prepare_owned_by(state, loader_pid) {
+            return Err(LINUX_EPERM);
+        }
+        if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
+            return Err(LINUX_EINVAL);
+        }
+        state.mappings.push(mapping);
+        Ok(())
+    })())
 }
 
 pub(super) fn syscall_linux_rustos_proc_map_data_broker(args_ptr: u64) -> u64 {
-    let Some(loader_pid) = current_loader_process_id() else {
-        return linux_errno(LINUX_EPERM);
-    };
-    let args = match usermem::read_current_user_struct::<RustosProcMapDataBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
-    let data_len = args.data_len as usize;
-    if args.reserved0 != 0
-        || data_len > args.data.len()
-        || args.data_offset.checked_add(args.data_len as u64).is_none()
-        || args.data_offset + args.data_len as u64 > args.mem_len
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if let Err(errno) = validate_mapping_region(args.target_addr, args.mem_len, args.flags) {
-        return linux_errno(errno);
-    }
-    let mapping = Box::new(MappingEntry::Data {
-        target_addr: args.target_addr,
-        mem_len: args.mem_len,
-        flags: args.flags,
-        data_offset: args.data_offset,
-        data: args.data[..data_len].to_vec(),
-    });
-    let mut prepares = PROC_PREPARES.lock();
-    let Some(state) = prepares.get_mut(&args.prepare_handle) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if !prepare_owned_by(state, loader_pid) {
-        return linux_errno(LINUX_EPERM);
-    }
-    if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
-        return linux_errno(LINUX_EINVAL);
-    }
-    state.mappings.push(mapping);
-    0
+    linux_unit_result((|| {
+        let loader_pid = current_loader_process_id().ok_or(LINUX_EPERM)?;
+        let args: RustosProcMapDataBrokerArgs = read_user_struct_as(args_ptr)?;
+        let data_len = args.data_len as usize;
+        if args.reserved0 != 0
+            || data_len > args.data.len()
+            || args.data_offset.checked_add(args.data_len as u64).is_none()
+            || args.data_offset + args.data_len as u64 > args.mem_len
+        {
+            return Err(LINUX_EINVAL);
+        }
+        validate_mapping_region(args.target_addr, args.mem_len, args.flags)?;
+        let mapping = Box::new(MappingEntry::Data {
+            target_addr: args.target_addr,
+            mem_len: args.mem_len,
+            flags: args.flags,
+            data_offset: args.data_offset,
+            data: args.data[..data_len].to_vec(),
+        });
+        let mut prepares = PROC_PREPARES.lock();
+        let state = prepares.get_mut(&args.prepare_handle).ok_or(LINUX_EINVAL)?;
+        if !prepare_owned_by(state, loader_pid) {
+            return Err(LINUX_EPERM);
+        }
+        if state.mappings.len() >= MAX_MAPPINGS_PER_PREPARE {
+            return Err(LINUX_EINVAL);
+        }
+        state.mappings.push(mapping);
+        Ok(())
+    })())
 }
 
 pub(super) fn syscall_linux_rustos_proc_set_windows_runtime_broker(args_ptr: u64) -> u64 {
     let Some(loader_pid) = current_loader_process_id() else {
         return linux_errno(LINUX_EPERM);
     };
-    let args = match usermem::read_current_user_struct::<RustosProcSetWindowsRuntimeBrokerArgs>(
-        args_ptr,
-    ) {
+    let args: RustosProcSetWindowsRuntimeBrokerArgs = match read_user_struct_as(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(errno) => return linux_errno(errno),
     };
     if args.abi_version != PROC_BROKER_ABI_VERSION
         || args.reserved0 != 0
@@ -642,9 +585,9 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
     let Some(loader_pid) = current_loader_process_id() else {
         return linux_errno(LINUX_EPERM);
     };
-    let args = match usermem::read_current_user_struct::<RustosProcCommitBrokerArgs>(args_ptr) {
+    let args: RustosProcCommitBrokerArgs = match read_user_struct_as(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(errno) => return linux_errno(errno),
     };
     const KNOWN_SPAWN_FLAGS: u64 = SPAWN_FLAG_LOGICAL_ADMIN
         | LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF as u64
@@ -888,9 +831,9 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
     if !current_process_can_load() {
         return linux_errno(LINUX_EPERM);
     }
-    let args = match usermem::read_current_user_struct::<RustosProcActivateBrokerArgs>(args_ptr) {
+    let args: RustosProcActivateBrokerArgs = match read_user_struct_as(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(errno) => return linux_errno(errno),
     };
     if args.abi_version != PROC_BROKER_ABI_VERSION
         || args.reserved0 != 0
@@ -1006,122 +949,105 @@ pub(in crate::user::syscall::linux) fn activate_deferred(
 }
 
 pub(super) fn syscall_linux_rustos_proc_validate_deferred_spawn_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(ServiceCapability::RootSupervisor) {
-        return linux_errno(LINUX_EPERM);
-    }
-    let args = match usermem::read_current_user_struct::<RustosProcValidateDeferredSpawnBrokerArgs>(
-        args_ptr,
-    ) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
-    if args.abi_version != PROC_BROKER_ABI_VERSION
-        || args.reserved0 != 0
-        || args.flags != 0
-        || args.target_pid == 0
-        || args.requester_pid == 0
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let Some(owner) = multitask::live_user_process_identity_by_pid(args.requester_pid) else {
-        return linux_errno(LINUX_ESRCH);
-    };
-    let Some(target) = multitask::live_user_process_identity_by_pid(args.target_pid) else {
-        return linux_errno(LINUX_ESRCH);
-    };
-    if !deferred_spawn_authority_matches(
-        &DEFERRED_ACTIVATIONS.lock(),
-        args.target_pid,
-        owner,
-        target,
-    ) {
-        return linux_errno(LINUX_EPERM);
-    }
-    0
+    linux_unit_result((|| {
+        let args: RustosProcValidateDeferredSpawnBrokerArgs =
+            require_capability_and_read_args_as(ServiceCapability::RootSupervisor, args_ptr)?;
+        if args.abi_version != PROC_BROKER_ABI_VERSION
+            || args.reserved0 != 0
+            || args.flags != 0
+            || args.target_pid == 0
+            || args.requester_pid == 0
+        {
+            return Err(LINUX_EINVAL);
+        }
+        let owner =
+            multitask::live_user_process_identity_by_pid(args.requester_pid).ok_or(LINUX_ESRCH)?;
+        let target =
+            multitask::live_user_process_identity_by_pid(args.target_pid).ok_or(LINUX_ESRCH)?;
+        if !deferred_spawn_authority_matches(
+            &DEFERRED_ACTIVATIONS.lock(),
+            args.target_pid,
+            owner,
+            target,
+        ) {
+            return Err(LINUX_EPERM);
+        }
+        Ok(())
+    })())
 }
 
 pub(super) fn syscall_linux_rustos_proc_authorize_exec_broker(args_ptr: u64) -> u64 {
-    if !current_process_can_policy() {
-        return linux_errno(LINUX_EPERM);
-    }
-    let args =
-        match usermem::read_current_user_struct::<RustosProcAuthorizeExecBrokerArgs>(args_ptr) {
-            Ok(args) => args,
-            Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-        };
-    if args.abi_version != PROC_BROKER_ABI_VERSION
-        || args.reserved0 != 0
-        || args.reserved1 != 0
-        || args.target_pid == 0
-        || args.target_tid == 0
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if multitask::linux_thread_snapshot_by_ids(args.target_pid, args.target_tid).is_none()
-        || multitask::is_user_process_exiting(args.target_pid)
-    {
-        return linux_errno(LINUX_ESRCH);
-    }
-    let ticket = {
-        let mut tickets = EXEC_TICKETS.lock();
-        if tickets.len() >= MAX_EXEC_TICKETS {
-            return linux_errno(LINUX_EAGAIN);
+    linux_result((|| {
+        if !current_process_can_policy() {
+            return Err(LINUX_EPERM);
         }
-        let Some(ticket) = allocate_exec_ticket(&tickets) else {
-            return linux_errno(LINUX_EAGAIN);
-        };
-        if tickets
-            .insert(
-                ticket,
-                ExecTicketState {
-                    target_pid: args.target_pid,
-                    target_tid: args.target_tid,
-                },
-            )
-            .is_err()
+        let args: RustosProcAuthorizeExecBrokerArgs = read_user_struct_as(args_ptr)?;
+        if args.abi_version != PROC_BROKER_ABI_VERSION
+            || args.reserved0 != 0
+            || args.reserved1 != 0
+            || args.target_pid == 0
+            || args.target_tid == 0
         {
-            return linux_errno(LINUX_EAGAIN);
+            return Err(LINUX_EINVAL);
         }
-        ticket
-    };
-    // Process teardown runs independently of procd authorization. Recheck
-    // after publication so an exit between the first snapshot and insertion
-    // cannot retain one of the bounded ticket slots.
-    if multitask::linux_thread_snapshot_by_ids(args.target_pid, args.target_tid).is_none()
-        || multitask::is_user_process_exiting(args.target_pid)
-    {
-        EXEC_TICKETS.lock().remove(&ticket);
-        return linux_errno(LINUX_ESRCH);
-    }
-    ticket
+        if multitask::linux_thread_snapshot_by_ids(args.target_pid, args.target_tid).is_none()
+            || multitask::is_user_process_exiting(args.target_pid)
+        {
+            return Err(LINUX_ESRCH);
+        }
+        let ticket = {
+            let mut tickets = EXEC_TICKETS.lock();
+            if tickets.len() >= MAX_EXEC_TICKETS {
+                return Err(LINUX_EAGAIN);
+            }
+            let ticket = allocate_exec_ticket(&tickets).ok_or(LINUX_EAGAIN)?;
+            tickets
+                .insert(
+                    ticket,
+                    ExecTicketState {
+                        target_pid: args.target_pid,
+                        target_tid: args.target_tid,
+                    },
+                )
+                .map_err(|_| LINUX_EAGAIN)?;
+            ticket
+        };
+        // Process teardown runs independently of procd authorization. Recheck
+        // after publication so an exit between the first snapshot and insertion
+        // cannot retain one of the bounded ticket slots.
+        if multitask::linux_thread_snapshot_by_ids(args.target_pid, args.target_tid).is_none()
+            || multitask::is_user_process_exiting(args.target_pid)
+        {
+            EXEC_TICKETS.lock().remove(&ticket);
+            return Err(LINUX_ESRCH);
+        }
+        Ok(ticket)
+    })())
 }
 
 pub(super) fn syscall_linux_rustos_proc_cancel_exec_broker(args_ptr: u64) -> u64 {
-    if !current_process_can_policy() {
-        return linux_errno(LINUX_EPERM);
-    }
-    let args = match usermem::read_current_user_struct::<RustosProcCancelExecBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
-    if args.abi_version != PROC_BROKER_ABI_VERSION
-        || args.reserved0 != 0
-        || args.reserved1 != 0
-        || args.exec_ticket == 0
-        || args.target_pid == 0
-        || args.target_tid == 0
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let mut tickets = EXEC_TICKETS.lock();
-    let Some(ticket) = tickets.get(&args.exec_ticket).copied() else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if ticket.target_pid != args.target_pid || ticket.target_tid != args.target_tid {
-        return linux_errno(LINUX_EPERM);
-    }
-    tickets.remove(&args.exec_ticket);
-    0
+    linux_unit_result((|| {
+        if !current_process_can_policy() {
+            return Err(LINUX_EPERM);
+        }
+        let args: RustosProcCancelExecBrokerArgs = read_user_struct_as(args_ptr)?;
+        if args.abi_version != PROC_BROKER_ABI_VERSION
+            || args.reserved0 != 0
+            || args.reserved1 != 0
+            || args.exec_ticket == 0
+            || args.target_pid == 0
+            || args.target_tid == 0
+        {
+            return Err(LINUX_EINVAL);
+        }
+        let mut tickets = EXEC_TICKETS.lock();
+        let ticket = tickets.get(&args.exec_ticket).copied().ok_or(LINUX_EINVAL)?;
+        if ticket.target_pid != args.target_pid || ticket.target_tid != args.target_tid {
+            return Err(LINUX_EPERM);
+        }
+        tickets.remove(&args.exec_ticket);
+        Ok(())
+    })())
 }
 
 pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64 {
@@ -1377,84 +1303,79 @@ fn valid_process_fork_plan_locally(args: &RustosProcForkBrokerArgs) -> bool {
 }
 
 pub(super) fn syscall_linux_rustos_proc_signal_queue_broker(args_ptr: u64) -> u64 {
-    if !current_process_can_policy() {
-        return linux_errno(LINUX_EPERM);
-    }
-    let args = match usermem::read_current_user_struct::<RustosProcSignalQueueBrokerArgs>(args_ptr)
-    {
-        Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
-    if args.abi_version != PROC_BROKER_ABI_VERSION
-        || args.reserved0 != 0
-        || args.signal > crate::user::linux::MAX_SIGNAL_NUMBER as u32
-        || args.target_pid == 0
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    // `target_tid == 0` is process-directed (`kill`): any live member of the
-    // thread group, so a retired leader does not hide its siblings.
-    let queued = if args.target_tid == 0 {
-        multitask::queue_linux_process_signal(args.target_pid, args.signal as u64)
-    } else {
-        multitask::queue_linux_signal(args.target_pid, args.target_tid, args.signal as u64)
-    };
-    // SIGKILL cannot wait for a recipient syscall boundary: a thread spinning
-    // in user mode never reaches signal delivery. A process-directed SIGKILL
-    // from another process ends the whole group through the same terminal path
-    // rootd terminate uses, which also publishes the SIGKILL wait status.
-    if matches!(queued, Ok(true))
-        && args.target_tid == 0
-        && args.signal == linux_abi::SIGKILL as u32
-        && args.sender_pid != args.target_pid
-    {
-        terminate_process_once_and_finalize(args.target_pid);
-        return 0;
-    }
-    match queued {
-        Ok(true) => 0,
-        Ok(false) => {
-            if let Some(target_abi) =
-                multitask::user_target_abi_if_alive(args.target_pid, args.target_tid)
-            {
-                if args.signal == 0 {
-                    return 0;
-                }
-                if target_abi == multitask::UserAbi::Windows
-                    && args.sender_pid != args.target_pid
-                    && args.signal == linux_abi::SIGKILL as u32
-                {
-                    terminate_process_once_and_finalize(args.target_pid);
-                    return 0;
-                }
-            }
-            linux_errno(LINUX_ESRCH)
+    linux_unit_result((|| {
+        if !current_process_can_policy() {
+            return Err(LINUX_EPERM);
         }
-        Err(()) => linux_errno(LINUX_EAGAIN),
-    }
+        let args: RustosProcSignalQueueBrokerArgs = read_user_struct_as(args_ptr)?;
+        if args.abi_version != PROC_BROKER_ABI_VERSION
+            || args.reserved0 != 0
+            || args.signal > crate::user::linux::MAX_SIGNAL_NUMBER as u32
+            || args.target_pid == 0
+        {
+            return Err(LINUX_EINVAL);
+        }
+        // `target_tid == 0` is process-directed (`kill`): any live member of the
+        // thread group, so a retired leader does not hide its siblings.
+        let queued = if args.target_tid == 0 {
+            multitask::queue_linux_process_signal(args.target_pid, args.signal as u64)
+        } else {
+            multitask::queue_linux_signal(args.target_pid, args.target_tid, args.signal as u64)
+        };
+        // SIGKILL cannot wait for a recipient syscall boundary: a thread spinning
+        // in user mode never reaches signal delivery. A process-directed SIGKILL
+        // from another process ends the whole group through the same terminal path
+        // rootd terminate uses, which also publishes the SIGKILL wait status.
+        if matches!(queued, Ok(true))
+            && args.target_tid == 0
+            && args.signal == linux_abi::SIGKILL as u32
+            && args.sender_pid != args.target_pid
+        {
+            terminate_process_once_and_finalize(args.target_pid);
+            return Ok(());
+        }
+        match queued {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                if let Some(target_abi) =
+                    multitask::user_target_abi_if_alive(args.target_pid, args.target_tid)
+                {
+                    if args.signal == 0 {
+                        return Ok(());
+                    }
+                    if target_abi == multitask::UserAbi::Windows
+                        && args.sender_pid != args.target_pid
+                        && args.signal == linux_abi::SIGKILL as u32
+                    {
+                        terminate_process_once_and_finalize(args.target_pid);
+                        return Ok(());
+                    }
+                }
+                Err(LINUX_ESRCH)
+            }
+            Err(()) => Err(LINUX_EAGAIN),
+        }
+    })())
 }
 
 pub(super) fn syscall_linux_rustos_proc_abort_broker(args_ptr: u64) -> u64 {
-    let Some(loader_pid) = current_loader_process_id() else {
-        return linux_errno(LINUX_EPERM);
-    };
-    let args = match usermem::read_current_user_struct::<RustosProcAbortBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
-    if args.reserved0 != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let mut prepares = PROC_PREPARES.lock();
-    if let Some(state) = prepares.get(&args.prepare_handle)
-        && !prepare_owned_by(state, loader_pid)
-    {
-        return linux_errno(LINUX_EPERM);
-    }
-    let removed = prepares.remove(&args.prepare_handle);
-    drop(prepares);
-    drop(removed);
-    0
+    linux_unit_result((|| {
+        let loader_pid = current_loader_process_id().ok_or(LINUX_EPERM)?;
+        let args: RustosProcAbortBrokerArgs = read_user_struct_as(args_ptr)?;
+        if args.reserved0 != 0 {
+            return Err(LINUX_EINVAL);
+        }
+        let mut prepares = PROC_PREPARES.lock();
+        if let Some(state) = prepares.get(&args.prepare_handle)
+            && !prepare_owned_by(state, loader_pid)
+        {
+            return Err(LINUX_EPERM);
+        }
+        let removed = prepares.remove(&args.prepare_handle);
+        drop(prepares);
+        drop(removed);
+        Ok(())
+    })())
 }
 
 /// Process-broker state is bounded and process-scoped. A loader that exits
@@ -2147,8 +2068,7 @@ fn read_user_text(ptr: u64, len: u64) -> Result<String, i64> {
         return Err(LINUX_EINVAL);
     }
     let mut bytes = alloc::vec![0_u8; len];
-    usermem::copy_from_current_user_exact(ptr, &mut bytes)
-        .map_err(address_space_error_to_linux_errno)?;
+    read_user_bytes_as(ptr, &mut bytes)?;
     if bytes.contains(&0) {
         return Err(LINUX_EINVAL);
     }

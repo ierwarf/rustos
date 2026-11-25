@@ -1586,10 +1586,7 @@ pub fn syscall_linux_arch_prctl(_code: u64, _arg: u64) -> u64 {
         }
         linux_abi::ARCH_GET_FS => {
             let fs = x86_64::registers::model_specific::FsBase::read().as_u64();
-            match usermem::write_current_user_bytes(_arg, &fs.to_le_bytes()) {
-                Ok(()) => 0,
-                Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-            }
+            linux_unit_result(write_user_bytes(_arg, &fs.to_le_bytes()))
         }
         _ => linux_errno(LINUX_EINVAL),
     }
@@ -1698,27 +1695,17 @@ pub fn syscall_linux_set_robust_list(head_ptr: u64, len: u64) -> u64 {
 }
 
 pub fn syscall_linux_get_robust_list(pid: u64, head_ptr_ptr: u64, len_ptr: u64) -> u64 {
-    let Some(current_process_id) = multitask::current_user_process_id() else {
-        return linux_errno(LINUX_ENOSYS);
-    };
-    let Some(current_task_id) = multitask::current_user_thread_id() else {
-        return linux_errno(LINUX_ENOSYS);
-    };
-    let target_task_id = if pid == 0 { current_task_id } else { pid };
-    let Some(snapshot) =
-        multitask::linux_thread_snapshot_by_ids(current_process_id, target_task_id)
-    else {
-        return linux_errno(LINUX_ESRCH);
-    };
-    let head = snapshot.thread_state.robust_list_head.to_le_bytes();
-    let len = snapshot.thread_state.robust_list_len.to_le_bytes();
-    if let Err(err) = usermem::write_current_user_bytes(head_ptr_ptr, &head) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    if let Err(err) = usermem::write_current_user_bytes(len_ptr, &len) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    0
+    linux_unit_result((|| {
+        let current_process_id = multitask::current_user_process_id().ok_or(LINUX_ENOSYS)?;
+        let current_task_id = multitask::current_user_thread_id().ok_or(LINUX_ENOSYS)?;
+        let target_task_id = if pid == 0 { current_task_id } else { pid };
+        let snapshot = multitask::linux_thread_snapshot_by_ids(current_process_id, target_task_id)
+            .ok_or(LINUX_ESRCH)?;
+        let head = snapshot.thread_state.robust_list_head.to_le_bytes();
+        let len = snapshot.thread_state.robust_list_len.to_le_bytes();
+        write_user_bytes(head_ptr_ptr, &head)?;
+        write_user_bytes(len_ptr, &len)
+    })())
 }
 
 /// rseq is not implemented: `ENOSYS` is the documented "unsupported" answer and

@@ -5,7 +5,6 @@
 //! It survives rootd process death but NOT reboot/power loss. The journal
 //! adds no work to syscalls other than this explicit slow management call.
 use super::*;
-use core::mem::size_of;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use rustos_user_abi::syscall::{ServiceCapability,
     RustosCheckpointJournalArgs, ServiceCheckpointRecordWire,
@@ -108,61 +107,42 @@ fn valid_request(args: &RustosCheckpointJournalArgs) -> bool {
 }
 
 pub(super) fn syscall_linux_rustos_checkpoint_journal(ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(ServiceCapability::RootSupervisor) {
-        return linux_errno(LINUX_EPERM);
-    }
-    let mut args = match usermem::read_current_user_struct::<RustosCheckpointJournalArgs>(ptr) {
-        Ok(args) => args,
-        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
-    };
-    if !valid_request(&args) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    // Preflight copyout before any irreversible append. A subsequent copyout
-    // failure can be resolved through the exact operation-ID duplicate lookup.
-    if let Err(error) = usermem::validate_current_user_write_buffer(
-        ptr, size_of::<RustosCheckpointJournalArgs>(),
-    ) {
-        return linux_errno(user_pointer_error_to_linux_errno(error));
-    }
-    let outcome = {
-        let mut journal = JOURNAL.lock();
-        match args.op {
-            CHECKPOINT_JOURNAL_OP_APPEND => {
-                let next = journal.append(args.service_id, args.record_kind, args.record);
-                next.map(|next_cursor| {
+    linux_unit_result((|| {
+        let mut args: RustosCheckpointJournalArgs =
+            require_capability_and_read_args(ServiceCapability::RootSupervisor, ptr)?;
+        if !valid_request(&args) {
+            return Err(LINUX_EINVAL);
+        }
+        // Preflight copyout before any irreversible append. A subsequent copyout
+        // failure can be resolved through the exact operation-ID duplicate lookup.
+        validate_user_write_struct::<RustosCheckpointJournalArgs>(ptr)?;
+        {
+            let mut journal = JOURNAL.lock();
+            match args.op {
+                CHECKPOINT_JOURNAL_OP_APPEND => {
+                    let next_cursor =
+                        journal.append(args.service_id, args.record_kind, args.record)?;
                     args.next_cursor = next_cursor;
                     args.done = 0;
-                })
-            }
-            CHECKPOINT_JOURNAL_OP_READ => {
-                match journal.read(args.cursor) {
-                    Ok(Some((next_cursor, record))) => {
+                }
+                CHECKPOINT_JOURNAL_OP_READ => match journal.read(args.cursor)? {
+                    Some((next_cursor, record)) => {
                         args.next_cursor = next_cursor;
                         args.service_id = record.service;
                         args.record_kind = record.kind;
                         args.record = record.record;
                         args.done = 0;
-                        Ok(())
                     }
-                    Ok(None) => {
+                    None => {
                         args.next_cursor = args.cursor;
                         args.done = 1;
-                        Ok(())
                     }
-                    Err(errno) => Err(errno),
-                }
+                },
+                _ => return Err(LINUX_EINVAL),
             }
-            _ => Err(LINUX_EINVAL),
         }
-    };
-    if let Err(errno) = outcome {
-        return linux_errno(errno);
-    }
-    match usermem::write_current_user_struct(ptr, &args) {
-        Ok(()) => 0,
-        Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
-    }
+        write_user_struct(ptr, &args)
+    })())
 }
 
 #[cfg(test)]

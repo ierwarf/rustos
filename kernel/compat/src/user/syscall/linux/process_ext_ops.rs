@@ -57,54 +57,38 @@ pub(super) fn syscall_linux_rt_sigtimedwait(
     timeout_ptr: u64,
     sigset_size: u64,
 ) -> u64 {
-    if sigset_size != size_of::<u64>() as u64 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let wanted = match usermem::read_current_user_struct::<u64>(set_ptr) {
-        Ok(set) => waitable_signal_set(set),
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    let timeout_ns = if timeout_ptr == 0 {
-        None
-    } else {
-        let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(timeout_ptr) {
-            Ok(ts) => ts,
-            Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-        };
-        match timespec_nanos(ts) {
-            Ok(ns) => Some(ns),
-            Err(errno) => return linux_errno(errno),
+    linux_result((|| {
+        if sigset_size != size_of::<u64>() as u64 {
+            return Err(LINUX_EINVAL);
         }
-    };
-    if info_ptr != 0
-        && let Err(err) = usermem::validate_current_user_write_buffer(info_ptr, SIGINFO_SIZE)
-    {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    let deadline = timeout_ns.map(|ns| crate::arch::rtc::monotonic_nanos().saturating_add(ns));
-    loop {
-        let Some(state) = multitask::current_linux_thread_state() else {
-            return linux_errno(LINUX_EINVAL);
-        };
-        if let Some(signal) = first_wanted_signal(state.pending_signals, wanted) {
-            clear_current_pending_signal(signal, state.pending_sigchld_events);
-            if info_ptr != 0 {
-                let mut info = [0_u8; SIGINFO_SIZE];
-                info[0..4].copy_from_slice(&(signal as i32).to_le_bytes());
-                if let Err(err) = usermem::write_current_user_bytes(info_ptr, &info) {
-                    return linux_errno(user_pointer_error_to_linux_errno(err));
+        let wanted = waitable_signal_set(read_user_struct::<u64>(set_ptr)?);
+        let timeout_ns = read_user_optional_struct::<LinuxTimespecWire>(timeout_ptr)?
+            .map(timespec_nanos)
+            .transpose()?;
+        if info_ptr != 0 {
+            validate_user_write(info_ptr, SIGINFO_SIZE)?;
+        }
+        let deadline = timeout_ns.map(|ns| crate::arch::rtc::monotonic_nanos().saturating_add(ns));
+        loop {
+            let state = multitask::current_linux_thread_state().ok_or(LINUX_EINVAL)?;
+            if let Some(signal) = first_wanted_signal(state.pending_signals, wanted) {
+                clear_current_pending_signal(signal, state.pending_sigchld_events);
+                if info_ptr != 0 {
+                    let mut info = [0_u8; SIGINFO_SIZE];
+                    info[0..4].copy_from_slice(&(signal as i32).to_le_bytes());
+                    write_user_bytes(info_ptr, &info)?;
                 }
+                return Ok(signal);
             }
-            return signal;
+            if current_wait_interrupted() {
+                return Err(LINUX_EINTR);
+            }
+            if deadline.is_some_and(|deadline| crate::arch::rtc::monotonic_nanos() >= deadline) {
+                return Err(LINUX_EAGAIN);
+            }
+            crate::arch::rtc::sleep(1);
         }
-        if current_wait_interrupted() {
-            return linux_errno(LINUX_EINTR);
-        }
-        if deadline.is_some_and(|deadline| crate::arch::rtc::monotonic_nanos() >= deadline) {
-            return linux_errno(LINUX_EAGAIN);
-        }
-        crate::arch::rtc::sleep(1);
-    }
+    })())
 }
 
 // ---- getrlimit / setrlimit -------------------------------------------------------
@@ -174,35 +158,23 @@ pub(super) fn sched_set_outcome(policy: i64, priority: i32) -> Result<(), i64> {
 }
 
 pub(super) fn syscall_linux_sched_setscheduler(pid: i64, policy: i64, param_ptr: u64) -> u64 {
-    if let Err(errno) = sched_target_is_self(pid) {
-        return linux_errno(errno);
-    }
-    let param = match usermem::read_current_user_struct::<linux_abi::LinuxSchedParam>(param_ptr) {
-        Ok(param) => param,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    if policy < 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    match sched_set_outcome(policy, param.sched_priority) {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_unit_result((|| {
+        sched_target_is_self(pid)?;
+        let param: linux_abi::LinuxSchedParam = read_user_struct(param_ptr)?;
+        if policy < 0 {
+            return Err(LINUX_EINVAL);
+        }
+        sched_set_outcome(policy, param.sched_priority)
+    })())
 }
 
 pub(super) fn syscall_linux_sched_setparam(pid: i64, param_ptr: u64) -> u64 {
-    if let Err(errno) = sched_target_is_self(pid) {
-        return linux_errno(errno);
-    }
-    let param = match usermem::read_current_user_struct::<linux_abi::LinuxSchedParam>(param_ptr) {
-        Ok(param) => param,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    // The task's policy is always SCHED_OTHER, whose only priority is 0.
-    match sched_set_outcome(linux_abi::SCHED_OTHER, param.sched_priority) {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_unit_result((|| {
+        sched_target_is_self(pid)?;
+        let param: linux_abi::LinuxSchedParam = read_user_struct(param_ptr)?;
+        // The task's policy is always SCHED_OTHER, whose only priority is 0.
+        sched_set_outcome(linux_abi::SCHED_OTHER, param.sched_priority)
+    })())
 }
 
 // ---- sendmmsg / recvmmsg ---------------------------------------------------------
@@ -216,11 +188,10 @@ fn is_errno_result(value: u64) -> bool {
 }
 
 fn write_msg_len(entry: u64, len: u64) -> Result<(), i64> {
-    usermem::write_current_user_bytes(
+    write_user_bytes(
         entry + linux_abi::MMSGHDR_MSG_LEN_OFFSET as u64,
         &(len as u32).to_le_bytes(),
     )
-    .map_err(user_pointer_error_to_linux_errno)
 }
 
 fn mmsg_vector_ok(fd: u64, msgvec: u64, vlen: u64) -> Result<(), i64> {
@@ -231,8 +202,7 @@ fn mmsg_vector_ok(fd: u64, msgvec: u64, vlen: u64) -> Result<(), i64> {
         .unwrap_or(false);
         return if exists { Ok(()) } else { Err(LINUX_EBADF) };
     }
-    usermem::validate_current_user_write_buffer(msgvec, vlen as usize * linux_abi::MMSGHDR_SIZE)
-        .map_err(user_pointer_error_to_linux_errno)
+    validate_user_write(msgvec, vlen as usize * linux_abi::MMSGHDR_SIZE)
 }
 
 /// A batch's outcome: the count if any message moved, else the first error.
@@ -277,17 +247,13 @@ pub(super) fn syscall_linux_recvmmsg(
     if let Err(errno) = mmsg_vector_ok(fd, msgvec, vlen) {
         return linux_errno(errno);
     }
-    let deadline = if timeout_ptr == 0 {
-        None
-    } else {
-        let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(timeout_ptr) {
-            Ok(ts) => ts,
-            Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-        };
-        match timespec_nanos(ts) {
+    let deadline = match read_user_optional_struct::<LinuxTimespecWire>(timeout_ptr) {
+        Ok(None) => None,
+        Ok(Some(ts)) => match timespec_nanos(ts) {
             Ok(ns) => Some(crate::arch::rtc::monotonic_nanos().saturating_add(ns)),
             Err(errno) => return linux_errno(errno),
-        }
+        },
+        Err(errno) => return linux_errno(errno),
     };
     let wait_for_one = flags & linux_abi::MSG_WAITFORONE != 0;
     let mut flags = flags & !linux_abi::MSG_WAITFORONE;

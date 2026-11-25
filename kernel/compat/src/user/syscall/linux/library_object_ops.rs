@@ -37,51 +37,39 @@ pub(super) fn library_errno(error: LibraryError) -> i64 {
 }
 
 pub(super) fn control(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(ServiceCapability::PagerPolicy) {
-        return linux_errno(LINUX_EPERM);
-    }
-    let Some(pid) = multitask::current_user_process_id() else {
-        return linux_errno(LINUX_ESRCH);
-    };
-    let args = match usermem::read_current_user_struct::<RustosLibraryObjectArgs>(args_ptr) {
-        Ok(args) if args.is_canonical() => args,
-        Ok(_) => return linux_errno(LINUX_EINVAL),
-        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
-    };
-    if args.op == LIBRARY_OBJECT_OP_PRESSURE {
-        // Read-only counters for the pager's retention policy; no registry
-        // mutation and no lease closure, so nothing to unwind.
-        let wire = LibraryPressureWire {
-            free_pages: crate::memory::phys::free_bytes() / PAGE_BYTES,
-            min_free_pages: crate::memory::phys::min_free_bytes() / PAGE_BYTES,
-            watermark_denials: crate::memory::phys::user_watermark_denials(),
-            reserved_pages: REGISTRY.lock().census().1,
-        };
-        return match usermem::write_current_user_struct(args.payload_ptr, &wire) {
-            Ok(()) => 0,
-            Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
-        };
-    }
-    if args.op == LIBRARY_OBJECT_OP_SUPPLY_PAGE {
-        let mut payload = [0_u8; 4096];
-        let len = args.payload_len as usize; // canonicality bounds it by one page
-        if let Err(error) =
-            usermem::copy_from_current_user_exact(args.payload_ptr, &mut payload[..len])
-        {
-            return linux_errno(user_pointer_error_to_linux_errno(error));
+    linux_result((|| {
+        require_service_capability(ServiceCapability::PagerPolicy)?;
+        let pid = current_user_pid()?;
+        let args = read_user_struct::<RustosLibraryObjectArgs>(args_ptr)?;
+        if !args.is_canonical() {
+            return Err(LINUX_EINVAL);
         }
-        return control_op(pid, &args, &payload[..len]);
-    }
-    control_op(pid, &args, &[])
+        if args.op == LIBRARY_OBJECT_OP_PRESSURE {
+            // Read-only counters for the pager's retention policy; no registry
+            // mutation and no lease closure, so nothing to unwind.
+            let wire = LibraryPressureWire {
+                free_pages: crate::memory::phys::free_bytes() / PAGE_BYTES,
+                min_free_pages: crate::memory::phys::min_free_bytes() / PAGE_BYTES,
+                watermark_denials: crate::memory::phys::user_watermark_denials(),
+                reserved_pages: REGISTRY.lock().census().1,
+            };
+            write_user_struct(args.payload_ptr, &wire)?;
+            return Ok(0);
+        }
+        if args.op == LIBRARY_OBJECT_OP_SUPPLY_PAGE {
+            let mut payload = [0_u8; 4096];
+            let len = args.payload_len as usize; // canonicality bounds it by one page
+            read_user_bytes(args.payload_ptr, &mut payload[..len])?;
+            return control_op(pid, &args, &payload[..len]);
+        }
+        control_op(pid, &args, &[])
+    })())
 }
 
-fn control_op(pid: u64, args: &RustosLibraryObjectArgs, payload: &[u8]) -> u64 {
+fn control_op(pid: u64, args: &RustosLibraryObjectArgs, payload: &[u8]) -> LinuxResult<u64> {
     let group = match args.op {
         LIBRARY_OBJECT_OP_CREATE | LIBRARY_OBJECT_OP_SUPPLY_PAGE => {
-            match multitask::current_user_job_charge_group() {
-                Some(group) => group,
-                None => return linux_errno(LINUX_ESRCH),
-            }
+            multitask::current_user_job_charge_group().ok_or(LINUX_ESRCH)?
         }
         _ => 0,
     };
@@ -90,7 +78,7 @@ fn control_op(pid: u64, args: &RustosLibraryObjectArgs, payload: &[u8]) -> u64 {
         frame_source::reclaim_frame_sources(16);
     }
     // The lease closure is bounded: no IPC, user copy, or process-state lock.
-    let outcome = ipc_ops::with_owned_service_lease(pid, IPC_SERVICE_PAGERD, |slot, generation| {
+    let value = ipc_ops::with_owned_service_lease(pid, IPC_SERVICE_PAGERD, |slot, generation| {
         let owner = FrameSourceOwner { service_slot: slot, service_generation: generation };
         let mut registry = REGISTRY.lock();
         match args.op {
@@ -109,17 +97,13 @@ fn control_op(pid: u64, args: &RustosLibraryObjectArgs, payload: &[u8]) -> u64 {
             }
             _ => Err(LibraryError::Invalid),
         }
-    });
-    match outcome {
-        Some(Ok(value)) => {
-            if args.op == LIBRARY_OBJECT_OP_RETIRE {
-                frame_source::reclaim_frame_sources(64);
-            }
-            value
-        }
-        Some(Err(error)) => linux_errno(library_errno(error)),
-        None => linux_errno(LINUX_EPERM),
+    })
+    .ok_or(LINUX_EPERM)?
+    .map_err(library_errno)?;
+    if args.op == LIBRARY_OBJECT_OP_RETIRE {
+        frame_source::reclaim_frame_sources(64);
     }
+    Ok(value)
 }
 
 #[cfg(test)]

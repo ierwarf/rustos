@@ -500,24 +500,22 @@ pub(super) fn current_process_service_capability_snapshot() -> Option<(u64, u64)
 }
 
 fn syscall_linux_rustos_ipc_validate_service_owner(args_ptr: u64) -> u64 {
-    let args =
-        match usermem::read_current_user_struct::<RustosIpcValidateServiceOwnerArgs>(args_ptr) {
-            Ok(args) => args,
-            Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-        };
-    if args.abi_version != IPC_ABI_VERSION
-        || args.reserved0 != 0
-        || args.flags != 0
-        || args.process_id == 0
-        || args.reserved1 != 0
-        || service_index(args.service_id).is_none()
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if !process_owns_stable_live_service_endpoint(args.process_id, args.service_id) {
-        return linux_errno(LINUX_EPERM);
-    }
-    0
+    linux_unit_result((|| {
+        let args: RustosIpcValidateServiceOwnerArgs = read_user_struct_as(args_ptr)?;
+        if args.abi_version != IPC_ABI_VERSION
+            || args.reserved0 != 0
+            || args.flags != 0
+            || args.process_id == 0
+            || args.reserved1 != 0
+            || service_index(args.service_id).is_none()
+        {
+            return Err(LINUX_EINVAL);
+        }
+        if !process_owns_stable_live_service_endpoint(args.process_id, args.service_id) {
+            return Err(LINUX_EPERM);
+        }
+        Ok(())
+    })())
 }
 
 /// Executes a bounded, nonblocking source-publication step under the exact
@@ -1256,10 +1254,9 @@ pub(super) fn syscall_linux_rustos_ipc_lookup_service_endpoint(service_id: u64) 
 }
 
 pub(super) fn syscall_linux_rustos_ipc_wait_service_endpoint(args_ptr: u64) -> u64 {
-    let args = match usermem::read_current_user_struct::<RustosIpcWaitServiceEndpointArgs>(args_ptr)
-    {
+    let args: RustosIpcWaitServiceEndpointArgs = match read_user_struct_as(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(errno) => return linux_errno(errno),
     };
     if args.abi_version != IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION
         || args.reserved0 != 0
@@ -2329,12 +2326,10 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_sender_bounded(
     if !bounded_ipc_call_timeout_is_valid(timeout_ms) {
         return linux_errno(LINUX_EINVAL);
     }
-    let args = match usermem::read_current_user_struct::<
-        rustos_user_abi::syscall::IpcRecvWithSenderArgs,
-    >(args_ptr)
+    let args: rustos_user_abi::syscall::IpcRecvWithSenderArgs = match read_user_struct_as(args_ptr)
     {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(errno) => return linux_errno(errno),
     };
     let (endpoint, task_id, _process_id, request_capacity, retained_mm) =
         match prepare_recv_with_sender(
@@ -2950,12 +2945,10 @@ pub(super) fn syscall_linux_rustos_ipc_call_with_handles_bounded(
 }
 
 fn syscall_linux_rustos_ipc_call_with_handles_timeout(args_ptr: u64, timeout_ms: u64) -> u64 {
-    let args = match usermem::read_current_user_struct::<
-        rustos_user_abi::syscall::IpcCallWithHandlesArgs,
-    >(args_ptr)
+    let args: rustos_user_abi::syscall::IpcCallWithHandlesArgs = match read_user_struct_as(args_ptr)
     {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(errno) => return linux_errno(errno),
     };
     if args.reserved0 != 0 {
         return linux_errno(LINUX_EINVAL);
@@ -3084,12 +3077,10 @@ fn syscall_linux_rustos_ipc_call_with_handles_timeout(args_ptr: u64, timeout_ms:
 }
 
 pub(super) fn syscall_linux_rustos_ipc_recv_with_handles(args_ptr: u64) -> u64 {
-    let args = match usermem::read_current_user_struct::<
-        rustos_user_abi::syscall::IpcRecvWithHandlesArgs,
-    >(args_ptr)
+    let args: rustos_user_abi::syscall::IpcRecvWithHandlesArgs = match read_user_struct_as(args_ptr)
     {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(errno) => return linux_errno(errno),
     };
     if args.reserved0 != 0 || args.reserved1 != 0 {
         return linux_errno(LINUX_EINVAL);
@@ -3224,13 +3215,11 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_handles(args_ptr: u64) -> u64 {
 }
 
 pub(super) fn syscall_linux_rustos_ipc_reply_with_handles(args_ptr: u64) -> u64 {
-    let args = match usermem::read_current_user_struct::<
-        rustos_user_abi::syscall::IpcReplyWithHandlesArgs,
-    >(args_ptr)
-    {
-        Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
+    let args: rustos_user_abi::syscall::IpcReplyWithHandlesArgs =
+        match read_user_struct_as(args_ptr) {
+            Ok(args) => args,
+            Err(errno) => return linux_errno(errno),
+        };
     if args.reserved0 != 0 || args.reserved1 != 0 {
         return linux_errno(LINUX_EINVAL);
     }

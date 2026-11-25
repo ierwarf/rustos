@@ -539,34 +539,29 @@ pub(crate) fn revoke_waitset_provider(service_id: u64) {
 }
 
 pub(super) fn syscall_linux_rustos_waitset_signal_broker(args_ptr: u64) -> u64 {
-    let args = match usermem::read_current_user_struct::<WaitSetSignalBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    // Published readiness packs `generation << 1 | ready` into one word, so the
-    // top generation bit would be silently dropped and could regress the
-    // monotonic state.
-    if !waitset_signal_shape_valid(&args) || args.generation >> 63 != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let Some(service_id) = service_for_provider(args.provider) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    let Some(process_id) = multitask::current_user_process_id() else {
-        return linux_errno(LINUX_EPERM);
-    };
-    if !ipc_ops::process_owns_live_service_endpoint(process_id, service_id) {
-        return linux_errno(LINUX_EPERM);
-    }
-    publish_provider_readiness(
-        args.provider,
-        args.object_id,
-        args.generation,
-        args.flags & WAITSET_SIGNAL_FLAG_READY != 0,
-    );
-    bump_signal_epoch();
-    wake_matching(args.provider, Some(args.object_id), Some(args.generation));
-    0
+    linux_unit_result((|| {
+        let args: WaitSetSignalBrokerArgs = read_user_struct(args_ptr)?;
+        // Published readiness packs `generation << 1 | ready` into one word, so the
+        // top generation bit would be silently dropped and could regress the
+        // monotonic state.
+        if !waitset_signal_shape_valid(&args) || args.generation >> 63 != 0 {
+            return Err(LINUX_EINVAL);
+        }
+        let service_id = service_for_provider(args.provider).ok_or(LINUX_EINVAL)?;
+        let process_id = multitask::current_user_process_id().ok_or(LINUX_EPERM)?;
+        if !ipc_ops::process_owns_live_service_endpoint(process_id, service_id) {
+            return Err(LINUX_EPERM);
+        }
+        publish_provider_readiness(
+            args.provider,
+            args.object_id,
+            args.generation,
+            args.flags & WAITSET_SIGNAL_FLAG_READY != 0,
+        );
+        bump_signal_epoch();
+        wake_matching(args.provider, Some(args.object_id), Some(args.generation));
+        Ok(())
+    })())
 }
 
 /// Wakes every waiter armed on kernel-local fd object `token` at a generation

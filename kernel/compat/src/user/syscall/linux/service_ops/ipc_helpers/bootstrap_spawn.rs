@@ -3,50 +3,40 @@
 use super::*;
 
 pub fn syscall_linux_loader_spawn_exec(args_ptr: u64) -> u64 {
-    if !current_process_can_bootstrap_spawn() {
-        return linux_errno(LINUX_EACCES);
-    }
-    let args = match usermem::read_current_user_struct::<rustos_user_abi::syscall::RustosBootstrapSpawnArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-    };
-    if !rustos_user_abi::syscall::bootstrap_spawn_shape_valid(&args) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let exec_path = match copy_current_user_path(args.path_ptr, LOADER_SPAWN_EXEC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    let logical_admin = args.flags & rustos_user_abi::syscall::BOOTSTRAP_SPAWN_FLAG_LOGICAL_ADMIN != 0;
-    if !can_bootstrap_spawn_direct(exec_path.as_str(), logical_admin) {
-        return linux_errno(LINUX_EACCES);
-    }
-    let Some(requester_pid) = multitask::current_user_process_id() else {
-        return linux_errno(LINUX_EPERM);
-    };
-    let job = match proc_broker_ops::resolve_spawn_job_descriptor(requester_pid, args.job_handle) {
-        Ok(job) => job,
-        Err(errno) => return linux_errno(errno),
-    };
-    let scheduling_policy = match proc_broker_ops::consume_direct_bootstrap_scheduling_context(
-        requester_pid,
-        exec_path.as_str(),
-    ) {
-        Ok(policy) => policy,
-        Err(errno) => return linux_errno(errno),
-    };
-    match spawn_bootstrap_exec_direct(
-        exec_path.as_str(),
-        u64::from(args.flags),
-        args.console_session,
-        args.weight_micros,
-        scheduling_policy,
-        job,
-        args.principal_service,
-    ) {
-        Ok(pid) => pid,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_result((|| {
+        if !current_process_can_bootstrap_spawn() {
+            return Err(LINUX_EACCES);
+        }
+        let args: rustos_user_abi::syscall::RustosBootstrapSpawnArgs =
+            read_user_struct_as(args_ptr)?;
+        if !rustos_user_abi::syscall::bootstrap_spawn_shape_valid(&args) {
+            return Err(LINUX_EINVAL);
+        }
+        let exec_path = copy_current_user_path(args.path_ptr, LOADER_SPAWN_EXEC_PATH_CAPACITY)?;
+        let logical_admin =
+            args.flags & rustos_user_abi::syscall::BOOTSTRAP_SPAWN_FLAG_LOGICAL_ADMIN != 0;
+        if !can_bootstrap_spawn_direct(exec_path.as_str(), logical_admin) {
+            return Err(LINUX_EACCES);
+        }
+        let requester_pid = multitask::current_user_process_id().ok_or(LINUX_EPERM)?;
+        let job = proc_broker_ops::resolve_spawn_job_descriptor(requester_pid, args.job_handle)?;
+        let scheduling_policy = proc_broker_ops::consume_direct_bootstrap_scheduling_context(
+            requester_pid,
+            exec_path.as_str(),
+        )?;
+        match spawn_bootstrap_exec_direct(
+            exec_path.as_str(),
+            u64::from(args.flags),
+            args.console_session,
+            args.weight_micros,
+            scheduling_policy,
+            job,
+            args.principal_service,
+        ) {
+            Ok(pid) => Ok(pid),
+            Err(errno) => Err(errno),
+        }
+    })())
 }
 
 fn current_process_can_bootstrap_spawn() -> bool {

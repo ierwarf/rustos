@@ -56,9 +56,9 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
     if !current_process_can_policy() {
         return linux_errno(LINUX_EPERM);
     }
-    let args = match usermem::read_current_user_struct::<RustosProcForkBrokerArgs>(args_ptr) {
+    let args: RustosProcForkBrokerArgs = match read_user_struct_as(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(errno) => return linux_errno(errno),
     };
     if args.abi_version != PROC_BROKER_ABI_VERSION
         || args.reserved0 != 0

@@ -300,32 +300,21 @@ fn run_job_op(args: &mut RustosJobArgs, caller: u64) -> Result<Option<PendingJob
 }
 
 pub(super) fn syscall_linux_rustos_job(args_ptr: u64) -> u64 {
-    let mut args = match usermem::read_current_user_struct::<RustosJobArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    if !job_args_are_valid(&args) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let Some(caller) = multitask::current_user_process_id() else {
-        return linux_errno(LINUX_ESRCH);
-    };
-    if let Err(err) = usermem::validate_current_user_write_buffer(args_ptr, size_of::<RustosJobArgs>()) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    let mut pending = match run_job_op(&mut args, caller) {
-        Ok(pending) => pending,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(err) = usermem::write_current_user_struct(args_ptr, &args) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    if let Some(pending) = pending.as_mut()
-        && let Err(errno) = pending.commit()
-    {
-        return linux_errno(errno);
-    }
-    0
+    linux_unit_result((|| {
+        let mut args: RustosJobArgs = read_user_struct(args_ptr)?;
+        if !job_args_are_valid(&args) {
+            return Err(LINUX_EINVAL);
+        }
+        let caller = current_user_pid()?;
+        validate_user_write_struct::<RustosJobArgs>(args_ptr)?;
+        let mut pending = run_job_op(&mut args, caller)?;
+        usermem::write_current_user_struct(args_ptr, &args)
+            .map_err(user_pointer_error_to_linux_errno)?;
+        if let Some(pending) = pending.as_mut() {
+            pending.commit()?;
+        }
+        Ok(())
+    })())
 }
 
 
@@ -428,28 +417,18 @@ fn execute_job_session(
 
 pub(super) fn syscall_linux_rustos_job_session(args_ptr: u64) -> u64 {
     use rustos_user_abi::syscall::RustosJobSessionArgs;
-    let mut args = match usermem::read_current_user_struct::<RustosJobSessionArgs>(args_ptr) {
-        Ok(value) => value,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    if !job_session_args_valid(&args) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let Some(caller) = multitask::current_user_process_id() else {
-        return linux_errno(LINUX_ESRCH);
-    };
-    if let Err(err) = usermem::validate_current_user_write_buffer(args_ptr, size_of::<RustosJobSessionArgs>()) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    if let Err(err) = execute_job_session(&mut args, caller) {
-        return linux_errno(err);
-    }
-    if let Err(err) = usermem::write_current_user_struct(args_ptr, &args) {
+    linux_unit_result((|| {
+        let mut args: RustosJobSessionArgs = read_user_struct(args_ptr)?;
+        if !job_session_args_valid(&args) {
+            return Err(LINUX_EINVAL);
+        }
+        let caller = current_user_pid()?;
+        validate_user_write_struct::<RustosJobSessionArgs>(args_ptr)?;
+        execute_job_session(&mut args, caller)?;
         // The kernel owns tokens and watermarks: repeating the same request
         // after ambiguous user copyout never doubles the charge or refund.
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    0
+        write_user_struct(args_ptr, &args)
+    })())
 }
 
 
@@ -476,91 +455,66 @@ fn kmem_class_from_abi(id: u32) -> Option<kernel_mm::api::kmem_charge::Class> {
 /// The publication gate is within ProcessTable's Job lock, never IPC/TLB.
 pub(super) fn syscall_linux_rustos_job_kmem(ptr: u64) -> u64 {
     use rustos_user_abi::syscall::*;
-    let mut args = match usermem::read_current_user_struct::<RustosJobKmemArgs>(ptr) {
-        Ok(args) => args,
-        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
-    };
-    let class_op = matches!(args.op, JOB_KMEM_OP_INSPECT_CLASS | JOB_KMEM_OP_SET_CLASS_LIMIT);
-    let flags_ok = if class_op {
-        kmem_class_from_abi(args.flags).is_some()
-    } else {
-        args.flags == 0
-    };
-    if args.abi_version != JOB_KMEM_ABI_VERSION
-        || args.job_handle == 0 || !flags_ok || args.reserved != 0
-        || args.usage_process_object_bytes != 0 || args.object_size_bytes != 0
-        || args.job != 0
-        || !matches!(
-            args.op,
-            JOB_KMEM_OP_INSPECT | JOB_KMEM_OP_SET_LIMIT
-                | JOB_KMEM_OP_INSPECT_CLASS | JOB_KMEM_OP_SET_CLASS_LIMIT
-        )
-        || (matches!(args.op, JOB_KMEM_OP_INSPECT | JOB_KMEM_OP_INSPECT_CLASS)
-            && args.process_object_max_bytes != 0)
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if let Err(error) =
-        usermem::validate_current_user_write_buffer(ptr, size_of::<RustosJobKmemArgs>())
-    {
-        return linux_errno(user_pointer_error_to_linux_errno(error));
-    }
-    let Some(caller) = multitask::current_user_process_id() else {
-        return linux_errno(LINUX_ESRCH);
-    };
-    let right = if matches!(args.op, JOB_KMEM_OP_INSPECT | JOB_KMEM_OP_INSPECT_CLASS) {
-        JobHandleRights::INSPECT
-    } else {
-        JobHandleRights::SET_LIMITS
-    };
-    let handle = multitask::with_process_state_by_pid(caller, |state| {
-        state.handles().get_entry(args.job_handle).ok_or(LINUX_EBADF)
-            .and_then(|entry| job_authority_with_right(entry, right))
-    });
-    let (job, _) = match handle {
-        Some(Ok(value)) => value,
-        Some(Err(error)) => return linux_errno(error),
-        None => return linux_errno(LINUX_ESRCH),
-    };
-    if class_op {
-        // `flags` was validated against the known class ids above.
-        let Some(class) = kmem_class_from_abi(args.flags) else {
-            return linux_errno(LINUX_EINVAL);
-        };
-        let result = if args.op == JOB_KMEM_OP_INSPECT_CLASS {
-            multitask::job_kmem_class_info(job, class)
+    linux_unit_result((|| {
+        let mut args: RustosJobKmemArgs = read_user_struct(ptr)?;
+        let class_op = matches!(args.op, JOB_KMEM_OP_INSPECT_CLASS | JOB_KMEM_OP_SET_CLASS_LIMIT);
+        let flags_ok = if class_op {
+            kmem_class_from_abi(args.flags).is_some()
         } else {
-            multitask::job_set_kmem_class_limit(job, class, args.process_object_max_bytes)
+            args.flags == 0
         };
-        let (limit, usage) = match result {
-            Ok(value) => value,
-            Err(error) => return linux_errno(job_error_errno(error)),
+        if args.abi_version != JOB_KMEM_ABI_VERSION
+            || args.job_handle == 0 || !flags_ok || args.reserved != 0
+            || args.usage_process_object_bytes != 0 || args.object_size_bytes != 0
+            || args.job != 0
+            || !matches!(
+                args.op,
+                JOB_KMEM_OP_INSPECT | JOB_KMEM_OP_SET_LIMIT
+                    | JOB_KMEM_OP_INSPECT_CLASS | JOB_KMEM_OP_SET_CLASS_LIMIT
+            )
+            || (matches!(args.op, JOB_KMEM_OP_INSPECT | JOB_KMEM_OP_INSPECT_CLASS)
+                && args.process_object_max_bytes != 0)
+        {
+            return Err(LINUX_EINVAL);
+        }
+        validate_user_write_struct::<RustosJobKmemArgs>(ptr)?;
+        let caller = current_user_pid()?;
+        let right = if matches!(args.op, JOB_KMEM_OP_INSPECT | JOB_KMEM_OP_INSPECT_CLASS) {
+            JobHandleRights::INSPECT
+        } else {
+            JobHandleRights::SET_LIMITS
         };
-        args.job = job.to_raw();
-        args.process_object_max_bytes = limit;
-        args.usage_process_object_bytes = usage;
-        return match usermem::write_current_user_struct(ptr, &args) {
-            Ok(()) => 0,
-            Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
-        };
-    }
-    let result = if args.op == JOB_KMEM_OP_INSPECT {
-        multitask::job_kmem_info(job)
-    } else {
-        multitask::job_set_kmem_process_limit(job, args.process_object_max_bytes)
-    };
-    let info = match result {
-        Ok(info) => info,
-        Err(error) => return linux_errno(job_error_errno(error)),
-    };
-    args.job = info.job.to_raw();
-    args.process_object_max_bytes = info.process_object_limit_bytes;
-    args.usage_process_object_bytes = info.usage_process_object_bytes;
-    args.object_size_bytes = info.process_object_size;
-    match usermem::write_current_user_struct(ptr, &args) {
-        Ok(()) => 0,
-        Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
-    }
+        let (job, _) = multitask::with_process_state_by_pid(caller, |state| {
+            state.handles().get_entry(args.job_handle).ok_or(LINUX_EBADF)
+                .and_then(|entry| job_authority_with_right(entry, right))
+        })
+        .ok_or(LINUX_ESRCH)??;
+        if class_op {
+            // `flags` was validated against the known class ids above.
+            let class = kmem_class_from_abi(args.flags).ok_or(LINUX_EINVAL)?;
+            let (limit, usage) = if args.op == JOB_KMEM_OP_INSPECT_CLASS {
+                multitask::job_kmem_class_info(job, class)
+            } else {
+                multitask::job_set_kmem_class_limit(job, class, args.process_object_max_bytes)
+            }
+            .map_err(job_error_errno)?;
+            args.job = job.to_raw();
+            args.process_object_max_bytes = limit;
+            args.usage_process_object_bytes = usage;
+            return write_user_struct(ptr, &args);
+        }
+        let info = if args.op == JOB_KMEM_OP_INSPECT {
+            multitask::job_kmem_info(job)
+        } else {
+            multitask::job_set_kmem_process_limit(job, args.process_object_max_bytes)
+        }
+        .map_err(job_error_errno)?;
+        args.job = info.job.to_raw();
+        args.process_object_max_bytes = info.process_object_limit_bytes;
+        args.usage_process_object_bytes = info.usage_process_object_bytes;
+        args.object_size_bytes = info.process_object_size;
+        write_user_struct(ptr, &args)
+    })())
 }
 
 /// Memory pressure policy is configured in the Job control path. Hard page
@@ -587,54 +541,37 @@ fn job_memory_qos_args_valid(args: &rustos_user_abi::syscall::RustosJobMemoryQos
 
 pub(super) fn syscall_linux_rustos_job_memory_qos(ptr: u64) -> u64 {
     use rustos_user_abi::syscall::*;
-    let mut args = match usermem::read_current_user_struct::<RustosJobMemoryQosArgs>(ptr) {
-        Ok(value) => value,
-        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
-    };
-    if !job_memory_qos_args_valid(&args) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let Some(caller) = multitask::current_user_process_id() else {
-        return linux_errno(LINUX_ESRCH);
-    };
-    if let Err(error) =
-        usermem::validate_current_user_write_buffer(ptr, size_of::<RustosJobMemoryQosArgs>())
-    {
-        return linux_errno(user_pointer_error_to_linux_errno(error));
-    }
-    let right = if args.op == JOB_MEMORY_QOS_OP_INSPECT {
-        JobHandleRights::INSPECT
-    } else {
-        JobHandleRights::SET_LIMITS
-    };
-    let authority = multitask::with_process_state_by_pid(caller, |state| {
-        state.handles().get_entry(args.job_handle)
-            .ok_or(LINUX_EBADF)
-            .and_then(|entry| job_authority_with_right(entry, right))
-    });
-    let (job, _) = match authority {
-        Some(Ok(value)) => value,
-        Some(Err(errno)) => return linux_errno(errno),
-        None => return linux_errno(LINUX_ESRCH),
-    };
-    let reply = if args.op == JOB_MEMORY_QOS_OP_INSPECT {
-        multitask::job_memory_qos(job)
-    } else {
-        multitask::job_set_memory_qos(job, args.high_pages, args.min_pages)
-    };
-    let info = match reply {
-        Ok(info) => info,
-        Err(error) => return linux_errno(job_error_errno(error)),
-    };
-    args.high_pages = info.high;
-    args.min_pages = info.min;
-    args.effective_high_pages = info.effective_high;
-    args.usage_pages = info.usage;
-    args.high_crossings = info.high_events;
-    match usermem::write_current_user_struct(ptr, &args) {
-        Ok(()) => 0,
-        Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
-    }
+    linux_unit_result((|| {
+        let mut args: RustosJobMemoryQosArgs = read_user_struct(ptr)?;
+        if !job_memory_qos_args_valid(&args) {
+            return Err(LINUX_EINVAL);
+        }
+        let caller = current_user_pid()?;
+        validate_user_write_struct::<RustosJobMemoryQosArgs>(ptr)?;
+        let right = if args.op == JOB_MEMORY_QOS_OP_INSPECT {
+            JobHandleRights::INSPECT
+        } else {
+            JobHandleRights::SET_LIMITS
+        };
+        let (job, _) = multitask::with_process_state_by_pid(caller, |state| {
+            state.handles().get_entry(args.job_handle)
+                .ok_or(LINUX_EBADF)
+                .and_then(|entry| job_authority_with_right(entry, right))
+        })
+        .ok_or(LINUX_ESRCH)??;
+        let info = if args.op == JOB_MEMORY_QOS_OP_INSPECT {
+            multitask::job_memory_qos(job)
+        } else {
+            multitask::job_set_memory_qos(job, args.high_pages, args.min_pages)
+        }
+        .map_err(job_error_errno)?;
+        args.high_pages = info.high;
+        args.min_pages = info.min;
+        args.effective_high_pages = info.effective_high;
+        args.usage_pages = info.usage;
+        args.high_crossings = info.high_events;
+        write_user_struct(ptr, &args)
+    })())
 }
 
 #[cfg(test)]

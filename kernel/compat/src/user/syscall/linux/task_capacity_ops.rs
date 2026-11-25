@@ -28,30 +28,19 @@ fn capacity_reply(snapshot: &multitask::TaskCapacitySnapshot) -> RustosTaskCapac
 }
 
 pub(super) fn syscall_linux_rustos_task_capacity(args_ptr: u64) -> u64 {
-    let authorized =
-        ipc_ops::current_process_has_service_capability(ServiceCapability::ProcessLoader)
-            || ipc_ops::current_process_has_service_capability(ServiceCapability::RootSupervisor);
-    if !authorized {
-        return linux_errno(LINUX_EPERM);
-    }
-    let request = match usermem::read_current_user_struct::<RustosTaskCapacityArgs>(args_ptr) {
-        Ok(request) => request,
-        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
-    };
-    if !request.is_request() {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if let Err(error) = usermem::validate_current_user_write_buffer(
-        args_ptr,
-        size_of::<RustosTaskCapacityArgs>(),
-    ) {
-        return linux_errno(user_pointer_error_to_linux_errno(error));
-    }
-    let reply = capacity_reply(&multitask::task_capacity_snapshot());
-    match usermem::write_current_user_struct(args_ptr, &reply) {
-        Ok(()) => 0,
-        Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
-    }
+    linux_unit_result((|| {
+        require_any_service_capability(&[
+            ServiceCapability::ProcessLoader,
+            ServiceCapability::RootSupervisor,
+        ])?;
+        let request = read_user_struct::<RustosTaskCapacityArgs>(args_ptr)?;
+        if !request.is_request() {
+            return Err(LINUX_EINVAL);
+        }
+        validate_user_write_struct::<RustosTaskCapacityArgs>(args_ptr)?;
+        let reply = capacity_reply(&multitask::task_capacity_snapshot());
+        write_user_struct(args_ptr, &reply)
+    })())
 }
 
 #[cfg(test)]
@@ -87,7 +76,7 @@ mod tests {
             .unwrap()
             .0;
         let gate = handler.find("ServiceCapability::ProcessLoader").unwrap();
-        let read = handler.find("read_current_user_struct").unwrap();
+        let read = handler.find("read_user_struct").unwrap();
         assert!(gate < read);
         assert!(handler.contains("ServiceCapability::RootSupervisor"));
     }

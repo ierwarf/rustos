@@ -188,17 +188,12 @@ pub(in crate::user::syscall::linux) fn registration_decision(pid: u64, service: 
 }
 
 pub(super) fn syscall_linux_rustos_service_policy(ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(ServiceCapability::RootSupervisor) {
-        return linux_errno(LINUX_EPERM);
-    }
-    let args = match usermem::read_current_user_struct::<RustosServicePolicyArgs>(ptr) {
-        Ok(args) => args,
-        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
-    };
-    if args.abi_version != SERVICE_POLICY_ABI_VERSION {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let result = {
+    linux_unit_result((|| {
+        let args: RustosServicePolicyArgs =
+            require_capability_and_read_args(ServiceCapability::RootSupervisor, ptr)?;
+        if args.abi_version != SERVICE_POLICY_ABI_VERSION {
+            return Err(LINUX_EINVAL);
+        }
         let mut policy = POLICY.lock();
         match args.op {
             SERVICE_POLICY_OP_INSTALL => policy.install(&args),
@@ -210,11 +205,7 @@ pub(super) fn syscall_linux_rustos_service_policy(ptr: u64) -> u64 {
             ),
             _ => Err(LINUX_EINVAL),
         }
-    };
-    match result {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    })())
 }
 
 #[cfg(test)]

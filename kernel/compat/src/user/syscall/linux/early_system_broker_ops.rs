@@ -10,80 +10,58 @@ use rustos_user_abi::syscall::{ServiceCapability,
     EARLY_SYSTEM_BROKER_OP_READ, EarlySystemBrokerArgs, };
 
 pub(super) fn syscall_linux_rustos_early_system_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(ServiceCapability::VfsPolicy) {
-        return linux_errno(LINUX_EPERM);
-    }
-    let args = match usermem::read_current_user_struct::<EarlySystemBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
-    };
-    let path_len = usize::try_from(args.path_len).unwrap_or(usize::MAX);
-    if args.abi_version != EARLY_SYSTEM_BROKER_ABI_VERSION
-        || args.reserved0 != 0
-        || path_len == 0
-        || path_len > args.path.len()
-        || args.path[path_len..].iter().any(|byte| *byte != 0)
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let path = match core::str::from_utf8(&args.path[..path_len]) {
-        Ok(path) => path,
-        Err(_) => return linux_errno(LINUX_EINVAL),
-    };
-    match args.op {
-        EARLY_SYSTEM_BROKER_OP_INFO => broker_info(&args, path),
-        EARLY_SYSTEM_BROKER_OP_READ => broker_read(&args, path),
-        _ => linux_errno(LINUX_EINVAL),
-    }
+    linux_result((|| {
+        let args: EarlySystemBrokerArgs =
+            require_capability_and_read_args(ServiceCapability::VfsPolicy, args_ptr)?;
+        let path_len = usize::try_from(args.path_len).unwrap_or(usize::MAX);
+        if args.abi_version != EARLY_SYSTEM_BROKER_ABI_VERSION
+            || args.reserved0 != 0
+            || path_len == 0
+            || path_len > args.path.len()
+            || args.path[path_len..].iter().any(|byte| *byte != 0)
+        {
+            return Err(LINUX_EINVAL);
+        }
+        let path = core::str::from_utf8(&args.path[..path_len]).map_err(|_| LINUX_EINVAL)?;
+        match args.op {
+            EARLY_SYSTEM_BROKER_OP_INFO => broker_info(&args, path),
+            EARLY_SYSTEM_BROKER_OP_READ => broker_read(&args, path),
+            _ => Err(LINUX_EINVAL),
+        }
+    })())
 }
 
-fn broker_info(args: &EarlySystemBrokerArgs, path: &str) -> u64 {
+fn broker_info(args: &EarlySystemBrokerArgs, path: &str) -> LinuxResult<u64> {
     if args.offset != 0
         || args.buffer_ptr != 0
         || args.buffer_len != 0
         || args.out_file_len_ptr == 0
     {
-        return linux_errno(LINUX_EINVAL);
+        return Err(LINUX_EINVAL);
     }
-    let len = match block_api::bootstrap_file_len(path) {
-        Ok(len) => len,
-        Err(error) => return linux_errno(bootstrap_error_to_linux_errno(error)),
-    };
-    match usermem::write_current_user_bytes(args.out_file_len_ptr, &len.to_ne_bytes()) {
-        Ok(()) => 0,
-        Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
-    }
+    let len = block_api::bootstrap_file_len(path).map_err(bootstrap_error_to_linux_errno)?;
+    write_user_bytes(args.out_file_len_ptr, &len.to_ne_bytes())?;
+    Ok(0)
 }
 
-fn broker_read(args: &EarlySystemBrokerArgs, path: &str) -> u64 {
+fn broker_read(args: &EarlySystemBrokerArgs, path: &str) -> LinuxResult<u64> {
     if args.out_file_len_ptr != 0
         || args.buffer_ptr == 0
         || args.buffer_len == 0
         || args.buffer_len > EARLY_SYSTEM_BROKER_MAX_IO_BYTES as u64
     {
-        return linux_errno(LINUX_EINVAL);
+        return Err(LINUX_EINVAL);
     }
-    let len = match usize::try_from(args.buffer_len) {
-        Ok(len) => len,
-        Err(_) => return linux_errno(LINUX_EINVAL),
-    };
-    if let Err(error) = usermem::validate_current_user_write_buffer(args.buffer_ptr, len) {
-        return linux_errno(user_pointer_error_to_linux_errno(error));
-    }
+    let len = usize::try_from(args.buffer_len).map_err(|_| LINUX_EINVAL)?;
+    validate_user_write(args.buffer_ptr, len)?;
     let mut bytes = Vec::new();
-    if bytes.try_reserve_exact(len).is_err() {
-        return linux_errno(LINUX_ENOMEM);
-    }
+    bytes.try_reserve_exact(len).map_err(|_| LINUX_ENOMEM)?;
     bytes.resize(len, 0);
-    let read = match block_api::read_bootstrap_file_range(path, args.offset, &mut bytes) {
-        Ok(Some(read)) => read,
-        Ok(None) => return linux_errno(LINUX_ENOENT),
-        Err(error) => return linux_errno(bootstrap_error_to_linux_errno(error)),
-    };
-    match usermem::write_current_user_bytes(args.buffer_ptr, &bytes[..read]) {
-        Ok(()) => read as u64,
-        Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
-    }
+    let read = block_api::read_bootstrap_file_range(path, args.offset, &mut bytes)
+        .map_err(bootstrap_error_to_linux_errno)?
+        .ok_or(LINUX_ENOENT)?;
+    write_user_bytes(args.buffer_ptr, &bytes[..read])?;
+    Ok(read as u64)
 }
 
 fn bootstrap_error_to_linux_errno(

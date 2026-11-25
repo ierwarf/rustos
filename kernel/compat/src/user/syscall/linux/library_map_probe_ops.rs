@@ -16,24 +16,23 @@ use rustos_user_abi::syscall::{
 const PAGE: u64 = 4096;
 
 pub(super) fn control(args_ptr: u64) -> u64 {
-    let args = match usermem::read_current_user_struct::<RustosLibraryMapProbeArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
-    };
-    match args.op {
-        LIBRARY_MAP_PROBE_OP_FRAMES => frames(&args),
-        LIBRARY_MAP_PROBE_OP_STATS => stats(&args),
-        _ => linux_errno(LINUX_EINVAL),
-    }
+    linux_unit_result((|| {
+        let args = read_user_struct::<RustosLibraryMapProbeArgs>(args_ptr)?;
+        match args.op {
+            LIBRARY_MAP_PROBE_OP_FRAMES => frames(&args),
+            LIBRARY_MAP_PROBE_OP_STATS => stats(&args),
+            _ => Err(LINUX_EINVAL),
+        }
+    })())
 }
 
-fn frames(args: &RustosLibraryMapProbeArgs) -> u64 {
+fn frames(args: &RustosLibraryMapProbeArgs) -> LinuxResult<()> {
     if args.count == 0
         || args.count > LIBRARY_MAP_PROBE_MAX_PAGES
         || args.addr % PAGE != 0
         || args.out_ptr == 0
     {
-        return linux_errno(LINUX_EINVAL);
+        return Err(LINUX_EINVAL);
     }
     let mut out = [LibraryMapProbeFrame::default(); LIBRARY_MAP_PROBE_MAX_PAGES as usize];
     let mut read = |state: &kernel_ps::api::process_state::UserProcessState| {
@@ -58,50 +57,40 @@ fn frames(args: &RustosLibraryMapProbeArgs) -> u64 {
         true
     };
     // The caller itself must be the probe executable, whatever it inspects.
-    let Some(caller_ok) = multitask::with_current_user_process_state(|_, _, state| {
+    let caller_ok = multitask::with_current_user_process_state(|_, _, state| {
         state.exec_path() == LIBRARY_MAP_PROBE_EXEC_PATH
-    }) else {
-        return linux_errno(LINUX_ESRCH);
-    };
+    })
+    .ok_or(LINUX_ESRCH)?;
     if !caller_ok {
-        return linux_errno(LINUX_EPERM);
+        return Err(LINUX_EPERM);
     }
     let permitted = if args.pid == 0 {
         multitask::with_current_user_process_state(|_, _, state| read(state))
     } else {
         multitask::with_process_state_by_pid(args.pid, |state| read(state))
-    };
-    let Some(permitted) = permitted else {
-        return linux_errno(LINUX_ESRCH);
-    };
+    }
+    .ok_or(LINUX_ESRCH)?;
     if !permitted {
-        return linux_errno(LINUX_EPERM);
+        return Err(LINUX_EPERM);
     }
     for (index, frame) in out.iter().take(args.count as usize).enumerate() {
-        if let Err(error) =
-            usermem::write_current_user_struct(args.out_ptr + index as u64 * 16, frame)
-        {
-            return linux_errno(user_pointer_error_to_linux_errno(error));
-        }
+        write_user_struct(args.out_ptr + index as u64 * 16, frame)?;
     }
-    0
+    Ok(())
 }
 
-fn stats(args: &RustosLibraryMapProbeArgs) -> u64 {
+fn stats(args: &RustosLibraryMapProbeArgs) -> LinuxResult<()> {
     if args.out_ptr == 0 {
-        return linux_errno(LINUX_EINVAL);
+        return Err(LINUX_EINVAL);
     }
-    let Some(leaves) = multitask::with_current_user_process_state(|_, _, state| {
+    let own_data_leaves = multitask::with_current_user_process_state(|_, _, state| {
         (state.exec_path() == LIBRARY_MAP_PROBE_EXEC_PATH).then(|| {
             crate::memory::phys::data_leaf_count(state.address_space().root_phys().as_u64())
                 .unwrap_or(0)
         })
-    }) else {
-        return linux_errno(LINUX_ESRCH);
-    };
-    let Some(own_data_leaves) = leaves else {
-        return linux_errno(LINUX_EPERM);
-    };
+    })
+    .ok_or(LINUX_ESRCH)?
+    .ok_or(LINUX_EPERM)?;
     let (sealed_objects, reserved_pages) = crate::library_cache::REGISTRY.lock().census();
     let (alias_maps, alias_pages) = crate::library_cache::alias_counters();
     let (decline_counts, decline_details) = crate::library_cache::decline_counters();
@@ -115,8 +104,5 @@ fn stats(args: &RustosLibraryMapProbeArgs) -> u64 {
         decline_counts,
         decline_details,
     };
-    match usermem::write_current_user_struct(args.out_ptr, &stats) {
-        Ok(()) => 0,
-        Err(error) => linux_errno(user_pointer_error_to_linux_errno(error)),
-    }
+    write_user_struct(args.out_ptr, &stats)
 }

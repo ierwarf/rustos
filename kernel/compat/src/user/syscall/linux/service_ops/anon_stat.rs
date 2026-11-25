@@ -196,27 +196,21 @@ fn current_identity(fd: u64) -> Option<AnonStat> {
 /// `fstat` on a kernel-owned object; `None` if `fd` is not one.
 pub(in crate::user::syscall::linux) fn fstat(fd: u64, stat_ptr: u64) -> Option<u64> {
     let stat = current_identity(fd)?;
-    if let Err(err) = usermem::validate_current_user_write_buffer(stat_ptr, LINUX_STAT_SIZE) {
-        return Some(linux_errno(user_pointer_error_to_linux_errno(err)));
-    }
     let (uid, gid) = owner_ids();
-    Some(match usermem::write_current_user_bytes(stat_ptr, &encode_stat(stat, uid, gid)) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    })
+    Some(linux_unit_result((|| {
+        validate_user_write(stat_ptr, LINUX_STAT_SIZE)?;
+        write_user_bytes(stat_ptr, &encode_stat(stat, uid, gid))
+    })()))
 }
 
 /// `statx(fd, "", AT_EMPTY_PATH, ...)` on a kernel-owned object.
 pub(in crate::user::syscall::linux) fn statx(fd: u64, statx_ptr: u64) -> Option<u64> {
     let stat = current_identity(fd)?;
-    if let Err(err) = usermem::validate_current_user_write_buffer(statx_ptr, LINUX_STATX_SIZE) {
-        return Some(linux_errno(user_pointer_error_to_linux_errno(err)));
-    }
     let (uid, gid) = owner_ids();
-    Some(match usermem::write_current_user_bytes(statx_ptr, &encode_statx(stat, uid, gid)) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    })
+    Some(linux_unit_result((|| {
+        validate_user_write(statx_ptr, LINUX_STATX_SIZE)?;
+        write_user_bytes(statx_ptr, &encode_statx(stat, uid, gid))
+    })()))
 }
 
 /// The identity of a memfd for kernel-internal callers.

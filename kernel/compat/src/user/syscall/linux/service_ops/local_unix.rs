@@ -698,8 +698,7 @@ fn read_opt_i32(optval_ptr: u64, optlen: u64) -> Result<i32, i64> {
         return Err(LINUX_EINVAL);
     }
     let mut bytes = [0_u8; 4];
-    usermem::copy_from_current_user_exact(optval_ptr, &mut bytes)
-        .map_err(user_pointer_error_to_linux_errno)?;
+    read_user_bytes(optval_ptr, &mut bytes)?;
     Ok(i32::from_ne_bytes(bytes))
 }
 
@@ -708,8 +707,7 @@ fn read_opt_timeval_us(optval_ptr: u64, optlen: u64) -> Result<Option<u64>, i64>
         return Err(LINUX_EINVAL);
     }
     let mut bytes = [0_u8; size_of::<LinuxTimeval>()];
-    usermem::copy_from_current_user_exact(optval_ptr, &mut bytes)
-        .map_err(user_pointer_error_to_linux_errno)?;
+    read_user_bytes(optval_ptr, &mut bytes)?;
     let tv_sec = i64::from_ne_bytes(bytes[0..8].try_into().unwrap());
     let tv_usec = i64::from_ne_bytes(bytes[8..16].try_into().unwrap());
     if tv_sec < 0 || !(0..1_000_000).contains(&tv_usec) {
@@ -725,14 +723,11 @@ fn write_opt_bytes(optval_ptr: u64, optlen_ptr: u64, payload: &[u8]) -> Result<(
     if optval_ptr == 0 || optlen_ptr == 0 {
         return Err(LINUX_EFAULT);
     }
-    let cap = usermem::read_current_user_struct::<u32>(optlen_ptr)
-        .map_err(user_pointer_error_to_linux_errno)? as usize;
+    let cap = read_user_struct::<u32>(optlen_ptr)? as usize;
     let copy_len = cap.min(payload.len());
-    usermem::write_current_user_bytes(optval_ptr, &payload[..copy_len])
-        .map_err(user_pointer_error_to_linux_errno)?;
+    write_user_bytes(optval_ptr, &payload[..copy_len])?;
     let written = copy_len as u32;
-    usermem::write_current_user_struct(optlen_ptr, &written)
-        .map_err(user_pointer_error_to_linux_errno)
+    write_user_struct(optlen_ptr, &written)
 }
 
 pub(in crate::user::syscall::linux) fn try_setsockopt(
@@ -1259,36 +1254,30 @@ pub(in crate::user::syscall::linux) fn try_sendto(
     addrlen: u64,
 ) -> Option<u64> {
     let sock = pin_unix_socket(fd)?;
-    let Ok(len) = usize::try_from(len) else {
-        return Some(linux_errno(LINUX_EINVAL));
-    };
-    let capped = len.min(MAX_UNIX_IO_BYTES);
-    let mut buf = Vec::new();
-    if capped > 0 {
-        if buf.try_reserve_exact(capped).is_err() {
-            return Some(linux_errno(LINUX_ENOMEM));
+    Some(linux_result((|| {
+        let len = usize::try_from(len).map_err(|_| LINUX_EINVAL)?;
+        let capped = len.min(MAX_UNIX_IO_BYTES);
+        let mut buf = Vec::new();
+        if capped > 0 {
+            buf.try_reserve_exact(capped).map_err(|_| LINUX_ENOMEM)?;
+            buf.resize(capped, 0);
+            read_user_bytes(buf_ptr, &mut buf)?;
         }
-        buf.resize(capped, 0);
-        if let Err(err) = usermem::copy_from_current_user_exact(buf_ptr, &mut buf) {
-            return Some(linux_errno(user_pointer_error_to_linux_errno(err)));
-        }
-    }
-    let target_key = if dest_addr != 0 && addrlen != 0 {
-        match resolve_target_key(dest_addr, addrlen) {
-            Ok(key) => Some(key),
-            Err(errno) => return Some(linux_errno(errno)),
-        }
-    } else {
-        None
-    };
-    Some(send_core(
-        &sock.0,
-        &buf,
-        Vec::new(),
-        current_credentials(),
-        flags,
-        target_key.as_ref(),
-    ))
+        let target_key = if dest_addr != 0 && addrlen != 0 {
+            Some(resolve_target_key(dest_addr, addrlen)?)
+        } else {
+            None
+        };
+        let raw = send_core(
+            &sock.0,
+            &buf,
+            Vec::new(),
+            current_credentials(),
+            flags,
+            target_key.as_ref(),
+        );
+        if is_linux_error(raw) { Err(-(raw as i64)) } else { Ok(raw) }
+    })()))
 }
 
 pub(in crate::user::syscall::linux) fn try_recvfrom(
@@ -1300,43 +1289,32 @@ pub(in crate::user::syscall::linux) fn try_recvfrom(
     addrlen_ptr: u64,
 ) -> Option<u64> {
     let sock = pin_unix_socket(fd)?;
-    let Ok(len) = usize::try_from(len) else {
-        return Some(linux_errno(LINUX_EINVAL));
-    };
-    let capped = len.min(MAX_UNIX_IO_BYTES);
-    if capped > 0
-        && let Err(err) = usermem::validate_current_user_write_buffer(buf_ptr, capped.min(4096))
-    {
-        return Some(linux_errno(user_pointer_error_to_linux_errno(err)));
-    }
-    let msg = match recv_core(&sock.0, capped, flags) {
-        Ok(msg) => msg,
-        Err(errno) => return Some(linux_errno(errno)),
-    };
-    release_passed_handles(msg.rights);
-    if !msg.data.is_empty()
-        && let Err(err) = usermem::write_current_user_bytes(buf_ptr, &msg.data)
-    {
-        return Some(linux_errno(user_pointer_error_to_linux_errno(err)));
-    }
-    if src_addr != 0 && addrlen_ptr != 0 {
-        let encoded = if msg.sender_addr == UnixAddress::Unnamed {
-            Vec::new()
-        } else {
-            encode_unix_addr(&msg.sender_addr)
-        };
-        if let Err(errno) =
-            super::vfs_meta::write_current_sockaddr_payload(src_addr, addrlen_ptr, &encoded)
-        {
-            return Some(linux_errno(errno));
+    Some(linux_result((|| {
+        let len = usize::try_from(len).map_err(|_| LINUX_EINVAL)?;
+        let capped = len.min(MAX_UNIX_IO_BYTES);
+        if capped > 0 {
+            validate_user_write(buf_ptr, capped.min(4096))?;
         }
-    }
-    let ret = if flags & linux_abi::MSG_TRUNC != 0 {
-        msg.original_len
-    } else {
-        msg.data.len()
-    };
-    Some(ret as u64)
+        let msg = recv_core(&sock.0, capped, flags)?;
+        release_passed_handles(msg.rights);
+        if !msg.data.is_empty() {
+            write_user_bytes(buf_ptr, &msg.data)?;
+        }
+        if src_addr != 0 && addrlen_ptr != 0 {
+            let encoded = if msg.sender_addr == UnixAddress::Unnamed {
+                Vec::new()
+            } else {
+                encode_unix_addr(&msg.sender_addr)
+            };
+            super::vfs_meta::write_current_sockaddr_payload(src_addr, addrlen_ptr, &encoded)?;
+        }
+        let ret = if flags & linux_abi::MSG_TRUNC != 0 {
+            msg.original_len
+        } else {
+            msg.data.len()
+        };
+        Ok(ret as u64)
+    })()))
 }
 
 fn read_iovecs(iov_ptr: u64, iovlen: u64) -> Result<Vec<LinuxIovec>, i64> {
@@ -1444,85 +1422,69 @@ pub(in crate::user::syscall::linux) fn try_recvmsg(
     flags: u64,
 ) -> Option<u64> {
     let sock = pin_unix_socket(fd)?;
-    let mut hdr = match usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(msg_ptr) {
-        Ok(hdr) => hdr,
-        Err(err) => return Some(linux_errno(user_pointer_error_to_linux_errno(err))),
-    };
-    let iovs = match read_iovecs(hdr.msg_iov, hdr.msg_iovlen) {
-        Ok(iovs) => iovs,
-        Err(errno) => return Some(linux_errno(errno)),
-    };
-    let mut total_cap = 0_usize;
-    for iov in &iovs {
-        let Ok(n) = usize::try_from(iov.iov_len) else {
-            return Some(linux_errno(LINUX_EINVAL));
-        };
-        total_cap = total_cap.saturating_add(n).min(MAX_UNIX_IO_BYTES);
-    }
-
-    let msg = match recv_core(&sock.0, total_cap, flags & !MSG_WAITALL) {
-        Ok(msg) => msg,
-        Err(errno) => return Some(linux_errno(errno)),
-    };
-
-    let mut copied = 0_usize;
-    for iov in &iovs {
-        let n = (iov.iov_len as usize).min(msg.data.len().saturating_sub(copied));
-        if n == 0 {
-            continue;
+    Some(linux_result((|| {
+        let mut hdr: linux_abi::LinuxMsghdr = read_user_struct(msg_ptr)?;
+        let iovs = read_iovecs(hdr.msg_iov, hdr.msg_iovlen)?;
+        let mut total_cap = 0_usize;
+        for iov in &iovs {
+            let n = usize::try_from(iov.iov_len).map_err(|_| LINUX_EINVAL)?;
+            total_cap = total_cap.saturating_add(n).min(MAX_UNIX_IO_BYTES);
         }
-        if let Err(err) =
-            usermem::write_current_user_bytes(iov.iov_base, &msg.data[copied..copied + n])
-        {
-            release_passed_handles(msg.rights);
-            return Some(linux_errno(user_pointer_error_to_linux_errno(err)));
+
+        let msg = recv_core(&sock.0, total_cap, flags & !MSG_WAITALL)?;
+
+        let mut copied = 0_usize;
+        for iov in &iovs {
+            let n = (iov.iov_len as usize).min(msg.data.len().saturating_sub(copied));
+            if n == 0 {
+                continue;
+            }
+            if let Err(errno) = write_user_bytes(iov.iov_base, &msg.data[copied..copied + n]) {
+                release_passed_handles(msg.rights);
+                return Err(errno);
+            }
+            copied += n;
         }
-        copied += n;
-    }
 
-    let mut out_flags = 0_u32;
-    if msg.original_len > msg.data.len() {
-        out_flags |= linux_abi::MSG_TRUNC as u32;
-    }
+        let mut out_flags = 0_u32;
+        if msg.original_len > msg.data.len() {
+            out_flags |= linux_abi::MSG_TRUNC as u32;
+        }
 
-    if hdr.msg_name != 0 && hdr.msg_namelen != 0 {
-        let encoded = if msg.sender_addr == UnixAddress::Unnamed {
-            Vec::new()
+        if hdr.msg_name != 0 && hdr.msg_namelen != 0 {
+            let encoded = if msg.sender_addr == UnixAddress::Unnamed {
+                Vec::new()
+            } else {
+                encode_unix_addr(&msg.sender_addr)
+            };
+            let copy_len = encoded.len().min(hdr.msg_namelen as usize);
+            if copy_len > 0
+                && let Err(errno) = write_user_bytes(hdr.msg_name, &encoded[..copy_len])
+            {
+                release_passed_handles(msg.rights);
+                return Err(errno);
+            }
+            hdr.msg_namelen = encoded.len() as u32;
+        }
+
+        let cloexec = flags & linux_abi::MSG_CMSG_CLOEXEC != 0;
+        let (ctrl_written, ctrl_flags) = write_recv_control(
+            hdr.msg_control,
+            hdr.msg_controllen as usize,
+            msg.rights,
+            msg.creds,
+            cloexec,
+        )?;
+        hdr.msg_controllen = ctrl_written as u64;
+        hdr.msg_flags = out_flags | ctrl_flags;
+
+        write_user_struct(msg_ptr, &hdr)?;
+
+        let ret = if flags & linux_abi::MSG_TRUNC != 0 {
+            msg.original_len
         } else {
-            encode_unix_addr(&msg.sender_addr)
+            copied
         };
-        let copy_len = encoded.len().min(hdr.msg_namelen as usize);
-        if copy_len > 0
-            && let Err(err) = usermem::write_current_user_bytes(hdr.msg_name, &encoded[..copy_len])
-        {
-            release_passed_handles(msg.rights);
-            return Some(linux_errno(user_pointer_error_to_linux_errno(err)));
-        }
-        hdr.msg_namelen = encoded.len() as u32;
-    }
-
-    let cloexec = flags & linux_abi::MSG_CMSG_CLOEXEC != 0;
-    let (ctrl_written, ctrl_flags) = match write_recv_control(
-        hdr.msg_control,
-        hdr.msg_controllen as usize,
-        msg.rights,
-        msg.creds,
-        cloexec,
-    ) {
-        Ok(v) => v,
-        Err(errno) => return Some(linux_errno(errno)),
-    };
-    hdr.msg_controllen = ctrl_written as u64;
-    hdr.msg_flags = out_flags | ctrl_flags;
-
-    if let Err(err) = usermem::write_current_user_struct(msg_ptr, &hdr) {
-        return Some(linux_errno(user_pointer_error_to_linux_errno(err)));
-    }
-
-    let ret = if flags & linux_abi::MSG_TRUNC != 0 {
-        msg.original_len
-    } else {
-        copied
-    };
-    Some(ret as u64)
+        Ok(ret as u64)
+    })()))
 }

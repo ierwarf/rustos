@@ -76,9 +76,9 @@ pub(super) fn syscall_linux_rustos_mm_broker(args_ptr: u64) -> u64 {
         return linux_errno(LINUX_EPERM);
     }
 
-    let args = match usermem::read_current_user_struct::<RustosMmBrokerArgs>(args_ptr) {
+    let args = match read_user_struct_as::<RustosMmBrokerArgs>(args_ptr) {
         Ok(args) => args,
-        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+        Err(errno) => return linux_errno(errno),
     };
     if args.abi_version != MM_BROKER_ABI_VERSION {
         return linux_errno(LINUX_EINVAL);
@@ -261,10 +261,8 @@ fn broker_set_anon_policy(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     if args.addr == 0 {
         return Err(LINUX_EINVAL);
     }
-    let policy = usermem::read_current_user_struct::<
-        rustos_user_abi::pager::PagerAnonymousPolicyWire,
-    >(args.addr)
-    .map_err(address_space_error_to_linux_errno)?;
+    let policy =
+        read_user_struct_as::<rustos_user_abi::pager::PagerAnonymousPolicyWire>(args.addr)?;
     if !crate::pager_policy::publish_anonymous_policy(policy) {
         // Malformed, or a policy is already in force. Both are refusals, not
         // partial applications: the policy that was in force still is.
@@ -1947,8 +1945,7 @@ fn write_out<T: rustos_user_abi::wire::UserWire>(args: &RustosMmBrokerArgs, valu
     if args.out_len < core::mem::size_of::<T>() as u64 {
         return Err(LINUX_EINVAL);
     }
-    usermem::write_current_user_struct(args.out_ptr, value)
-        .map_err(address_space_error_to_linux_errno)
+    write_user_struct_as(args.out_ptr, value)
 }
 
 fn broker_rights(rights: kernel_object::api::handle::HandleRights) -> u64 {

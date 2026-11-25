@@ -198,8 +198,8 @@ where
     if user_len == 0 {
         return 0;
     }
-    if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
+    if let Err(errno) = validate_user_write(user_ptr, user_len) {
+        return linux_errno(errno);
     }
     let mut chunk = match bounded_buffer(user_len) {
         Ok(chunk) => chunk,
@@ -215,8 +215,8 @@ where
         let Some(dest) = user_ptr.checked_add(copied as u64) else {
             return completed_or_error(copied, LINUX_EFAULT);
         };
-        if let Err(err) = usermem::write_current_user_bytes(dest, &chunk[..read_len]) {
-            return completed_or_error(copied, user_pointer_error_to_linux_errno(err));
+        if let Err(errno) = write_user_bytes(dest, &chunk[..read_len]) {
+            return completed_or_error(copied, errno);
         }
         copied += read_len;
         multitask::cond_resched();

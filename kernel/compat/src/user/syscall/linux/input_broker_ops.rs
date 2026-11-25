@@ -37,99 +37,82 @@ fn input_broker_abi_is_current(abi_version: u16) -> bool {
 }
 
 pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(ServiceCapability::InputPolicy) {
-        return linux_errno(LINUX_EPERM);
-    }
+    linux_unit_result((|| {
+        let args: InputStatsBrokerArgs =
+            require_capability_and_read_args(ServiceCapability::InputPolicy, args_ptr)?;
+        if !input_broker_abi_is_current(args.abi_version)
+            || args.reserved0 != 0
+            || args.reserved1 != 0
+            || args.out_stats_ptr == 0
+        {
+            return Err(LINUX_EINVAL);
+        }
 
-    let args = match usermem::read_current_user_struct::<InputStatsBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    if !input_broker_abi_is_current(args.abi_version)
-        || args.reserved0 != 0
-        || args.reserved1 != 0
-        || args.out_stats_ptr == 0
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-
-    let snapshot = kernel_io_manager::api::input::transport::debug_snapshot();
-    let stats = InputStatsWire {
-        pointer_packet_submits: snapshot.records_copied,
-        read_calls: snapshot.broker_calls,
-        read_events: snapshot.records_copied,
-        lock_active: 0,
-        lock_last_seq: 0,
-        queued: snapshot.queued as u64,
-        dropped_discrete: 0,
-        dropped_lossy: snapshot.revoke_count,
-        flags: 0,
-        reserved0: 0,
-        readiness_generation: 0,
-    };
-
-    match usermem::write_current_user_struct(args.out_stats_ptr, &stats) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    }
+        let snapshot = kernel_io_manager::api::input::transport::debug_snapshot();
+        let stats = InputStatsWire {
+            pointer_packet_submits: snapshot.records_copied,
+            read_calls: snapshot.broker_calls,
+            read_events: snapshot.records_copied,
+            lock_active: 0,
+            lock_last_seq: 0,
+            queued: snapshot.queued as u64,
+            dropped_discrete: 0,
+            dropped_lossy: snapshot.revoke_count,
+            flags: 0,
+            reserved0: 0,
+            readiness_generation: 0,
+        };
+        write_user_struct(args.out_stats_ptr, &stats)
+    })())
 }
 // RING3-MIGRATION-REFERENCE END: inputd-owned input broker policy.
 
 pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(ServiceCapability::InputPolicy) {
-        return linux_errno(LINUX_EPERM);
-    }
-
-    let args = match usermem::read_current_user_struct::<InputIngestBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    if !input_broker_abi_is_current(args.abi_version)
-        || args.reserved0 != 0
-        || args.reserved1 != 0
-        || args.reserved2 != 0
-        || args.out_records_ptr == 0
-        || args.out_count_ptr == 0
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-
-    let capacity = usize::try_from(args.out_capacity).unwrap_or(usize::MAX);
-    if capacity > INPUTD_INGEST_MAX_EVENTS {
-        return linux_errno(LINUX_EINVAL);
-    }
-    // The MSI-X leaf only wakes waiters. This capability-gated broker copies
-    // fixed records; inputd performs every semantic and lifecycle check.
-    // The drain below consumes ring records irreversibly, so a bad output
-    // buffer must be refused before it, not after the batch is already lost.
-    let Some(records_byte_cap) = capacity.checked_mul(core::mem::size_of::<InputDvmRecordWire>())
-    else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if let Err(err) = usermem::validate_current_user_write_buffers(&[
-        (args.out_records_ptr, records_byte_cap),
-        (args.out_count_ptr, 4),
-    ]) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    let mut records = alloc::vec![InputDvmRecordWire::default(); capacity];
-    let count = kernel_io_manager::api::input::service_dvm_input_pending(&mut records);
-    let byte_len = match count.checked_mul(core::mem::size_of::<InputDvmRecordWire>()) {
-        Some(len) => len,
-        None => return linux_errno(LINUX_EINVAL),
-    };
-    if byte_len != 0 {
-        // Copy the admitted batch through usermem once: per-record page-table
-        // validation made ingress cost proportional to event count and could
-        // not sustain the already-bounded DVM producer.
-        if let Err(err) = usermem::write_current_user_slice(args.out_records_ptr, &records[..count]) {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
+    linux_result((|| {
+        let args: InputIngestBrokerArgs =
+            require_capability_and_read_args(ServiceCapability::InputPolicy, args_ptr)?;
+        if !input_broker_abi_is_current(args.abi_version)
+            || args.reserved0 != 0
+            || args.reserved1 != 0
+            || args.reserved2 != 0
+            || args.out_records_ptr == 0
+            || args.out_count_ptr == 0
+        {
+            return Err(LINUX_EINVAL);
         }
-    }
-    match usermem::write_current_user_u32(args.out_count_ptr, count as u32) {
-        Ok(()) => count as u64,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    }
+
+        let capacity = usize::try_from(args.out_capacity).unwrap_or(usize::MAX);
+        if capacity > INPUTD_INGEST_MAX_EVENTS {
+            return Err(LINUX_EINVAL);
+        }
+        // The MSI-X leaf only wakes waiters. This capability-gated broker copies
+        // fixed records; inputd performs every semantic and lifecycle check.
+        // The drain below consumes ring records irreversibly, so a bad output
+        // buffer must be refused before it, not after the batch is already lost.
+        let records_byte_cap = capacity
+            .checked_mul(core::mem::size_of::<InputDvmRecordWire>())
+            .ok_or(LINUX_EINVAL)?;
+        usermem::validate_current_user_write_buffers(&[
+            (args.out_records_ptr, records_byte_cap),
+            (args.out_count_ptr, 4),
+        ])
+        .map_err(user_pointer_error_to_linux_errno)?;
+        let mut records = alloc::vec![InputDvmRecordWire::default(); capacity];
+        let count = kernel_io_manager::api::input::service_dvm_input_pending(&mut records);
+        let byte_len = count
+            .checked_mul(core::mem::size_of::<InputDvmRecordWire>())
+            .ok_or(LINUX_EINVAL)?;
+        if byte_len != 0 {
+            // Copy the admitted batch through usermem once: per-record page-table
+            // validation made ingress cost proportional to event count and could
+            // not sustain the already-bounded DVM producer.
+            usermem::write_current_user_slice(args.out_records_ptr, &records[..count])
+                .map_err(user_pointer_error_to_linux_errno)?;
+        }
+        usermem::write_current_user_u32(args.out_count_ptr, count as u32)
+            .map_err(user_pointer_error_to_linux_errno)?;
+        Ok(count as u64)
+    })())
 }
 
 /// Sleep the inputd-owned ingestion worker until either a decoded ingress

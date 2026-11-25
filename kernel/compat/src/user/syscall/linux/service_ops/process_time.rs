@@ -206,19 +206,16 @@ pub fn syscall_linux_rt_sigprocmask(
 }
 
 pub fn syscall_linux_rt_sigpending(set_ptr: u64, sigset_size: u64) -> u64 {
-    if sigset_size != size_of::<u64>() as u64 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if let Err(err) = usermem::validate_current_user_write_buffer(set_ptr, 8) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    let pending = multitask::current_linux_thread_state()
-        .map(|state| state.pending_signals & state.signal_mask)
-        .unwrap_or(0);
-    match usermem::write_current_user_bytes(set_ptr, &pending.to_ne_bytes()) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    }
+    linux_unit_result((|| {
+        if sigset_size != size_of::<u64>() as u64 {
+            return Err(LINUX_EINVAL);
+        }
+        validate_user_write(set_ptr, 8)?;
+        let pending = multitask::current_linux_thread_state()
+            .map(|state| state.pending_signals & state.signal_mask)
+            .unwrap_or(0);
+        write_user_bytes(set_ptr, &pending.to_ne_bytes())
+    })())
 }
 
 fn wait_for_interruptible_signal() -> Result<(), i64> {
@@ -256,8 +253,8 @@ pub(in crate::user::syscall::linux) fn syscall_linux_rt_sigsuspend(frame: &mut S
         return linux_errno(LINUX_EINVAL);
     }
     let mut set = [0_u8; 8];
-    if let Err(err) = usermem::copy_from_current_user_exact(mask_ptr, &mut set) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
+    if let Err(errno) = read_user_bytes(mask_ptr, &mut set) {
+        return linux_errno(errno);
     }
     let temp_mask = u64::from_ne_bytes(set);
     let old_mask = match update_procd_signal_mask(linux_abi::SIG_SETMASK, Some(temp_mask), true) {
@@ -388,134 +385,116 @@ pub(super) fn validate_relative_sleep_timespec_locally(
 }
 
 pub fn syscall_linux_nanosleep(request_ptr: u64, _remaining_ptr: u64) -> u64 {
-    let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(request_ptr) {
-        Ok(ts) => ts,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    if let Err(errno) = validate_time_hot_path_locally(TimeHotPath::Nanosleep, 0, 0, Some(ts)) {
-        return linux_errno(errno);
-    }
-    sleep_relative_timespec_substrate(ts);
-    0
+    linux_unit_result((|| {
+        let ts: LinuxTimespecWire = read_user_struct(request_ptr)?;
+        validate_time_hot_path_locally(TimeHotPath::Nanosleep, 0, 0, Some(ts))?;
+        sleep_relative_timespec_substrate(ts);
+        Ok(())
+    })())
 }
 
 pub fn syscall_linux_clock_gettime(clock_id: u64, timespec_ptr: u64) -> u64 {
-    if let Err(err) = usermem::validate_current_user_write_buffer(timespec_ptr, LINUX_TIMESPEC_SIZE)
-    {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    if let Err(errno) = validate_time_hot_path_locally(TimeHotPath::ClockGettime, clock_id, 0, None)
-    {
-        return linux_errno(errno);
-    }
-    write_clock_timespec(clock_id, timespec_ptr)
+    linux_unit_result((|| {
+        validate_user_write(timespec_ptr, LINUX_TIMESPEC_SIZE)?;
+        validate_time_hot_path_locally(TimeHotPath::ClockGettime, clock_id, 0, None)?;
+        write_clock_timespec_result(clock_id, timespec_ptr)
+    })())
 }
 
 /// Linux `time(tloc)`: returns wall-clock seconds since the Unix epoch and
 /// stores them into `tloc` when non-null.
 pub fn syscall_linux_time(tloc_ptr: u64) -> u64 {
-    let sec = realtime_timespec().tv_sec;
-    if tloc_ptr != 0
-        && let Err(err) = usermem::write_current_user_bytes(tloc_ptr, &sec.to_le_bytes())
-    {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    sec as u64
+    linux_result((|| {
+        let sec = realtime_timespec().tv_sec;
+        if tloc_ptr != 0 {
+            write_user_bytes(tloc_ptr, &sec.to_le_bytes())?;
+        }
+        Ok(sec as u64)
+    })())
 }
 
-fn write_clock_timespec(clock_id: u64, timespec_ptr: u64) -> u64 {
+fn write_clock_timespec_result(clock_id: u64, timespec_ptr: u64) -> LinuxResult<()> {
     let ts = if clock_id == CLOCK_THREAD_CPUTIME_ID || clock_id == CLOCK_PROCESS_CPUTIME_ID {
-        match multitask::current_thread_cpu_time_ns() {
-            Some(nanos) => timespec_from_nanos(nanos),
-            None => return linux_errno(LINUX_EINVAL),
-        }
+        timespec_from_nanos(multitask::current_thread_cpu_time_ns().ok_or(LINUX_EINVAL)?)
     } else {
         current_clock_timespec_substrate(clock_id)
     };
-    match usermem::write_current_user_bytes(timespec_ptr, as_bytes(&ts)) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    }
+    write_user_bytes(timespec_ptr, as_bytes(&ts))
 }
 
 pub fn syscall_linux_clock_getres(clock_id: u64, res_ptr: u64) -> u64 {
-    if !is_readable_clock_id(clock_id) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if res_ptr == 0 {
-        return 0;
-    }
-    let res = LinuxTimespecWire {
-        tv_sec: 0,
-        tv_nsec: 1,
-    };
-    match usermem::write_current_user_bytes(res_ptr, as_bytes(&res)) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    }
+    linux_unit_result((|| {
+        if !is_readable_clock_id(clock_id) {
+            return Err(LINUX_EINVAL);
+        }
+        if res_ptr == 0 {
+            return Ok(());
+        }
+        let res = LinuxTimespecWire {
+            tv_sec: 0,
+            tv_nsec: 1,
+        };
+        write_user_bytes(res_ptr, as_bytes(&res))
+    })())
 }
 
 pub fn syscall_linux_gettimeofday(tv_ptr: u64, tz_ptr: u64) -> u64 {
-    if tv_ptr != 0 {
-        let now = realtime_timespec();
-        let tv = linux_abi::LinuxTimeval {
-            tv_sec: now.tv_sec,
-            tv_usec: now.tv_nsec / 1000,
-        };
-        if let Err(err) = usermem::write_current_user_struct(tv_ptr, &tv) {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
+    linux_unit_result((|| {
+        if tv_ptr != 0 {
+            let now = realtime_timespec();
+            let tv = linux_abi::LinuxTimeval {
+                tv_sec: now.tv_sec,
+                tv_usec: now.tv_nsec / 1000,
+            };
+            write_user_struct(tv_ptr, &tv)?;
         }
-    }
-    if tz_ptr != 0 {
-        let tz = [0_u8; 8];
-        if let Err(err) = usermem::write_current_user_bytes(tz_ptr, &tz) {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
+        if tz_ptr != 0 {
+            write_user_bytes(tz_ptr, &[0_u8; 8])?;
         }
-    }
-    0
+        Ok(())
+    })())
 }
 
 pub fn syscall_linux_getrusage(who: i64, rusage_ptr: u64) -> u64 {
     const RUSAGE_SELF: i64 = 0;
     const RUSAGE_CHILDREN: i64 = -1;
     const RUSAGE_THREAD: i64 = 1;
-    if !matches!(who, RUSAGE_SELF | RUSAGE_CHILDREN | RUSAGE_THREAD) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let mut usage = linux_abi::LinuxRusage::default();
-    if matches!(who, RUSAGE_SELF | RUSAGE_THREAD) {
-        if let Some(snapshot) = multitask::current_scheduling_context_runtime_snapshot() {
-            let consumed_us = snapshot.context_consumed_ns / 1000;
-            usage.ru_utime = linux_abi::LinuxTimeval {
-                tv_sec: (consumed_us / 1_000_000) as i64,
-                tv_usec: (consumed_us % 1_000_000) as i64,
-            };
+    linux_unit_result((|| {
+        if !matches!(who, RUSAGE_SELF | RUSAGE_CHILDREN | RUSAGE_THREAD) {
+            return Err(LINUX_EINVAL);
         }
-    }
-    match usermem::write_current_user_struct(rusage_ptr, &usage) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    }
+        let mut usage = linux_abi::LinuxRusage::default();
+        if matches!(who, RUSAGE_SELF | RUSAGE_THREAD) {
+            if let Some(snapshot) = multitask::current_scheduling_context_runtime_snapshot() {
+                let consumed_us = snapshot.context_consumed_ns / 1000;
+                usage.ru_utime = linux_abi::LinuxTimeval {
+                    tv_sec: (consumed_us / 1_000_000) as i64,
+                    tv_usec: (consumed_us % 1_000_000) as i64,
+                };
+            }
+        }
+        write_user_struct(rusage_ptr, &usage)
+    })())
 }
 
 pub fn syscall_linux_times(tms_ptr: u64) -> u64 {
     const USER_HZ: u64 = 100;
     const NS_PER_TICK: u64 = 1_000_000_000 / USER_HZ;
-    if tms_ptr != 0 {
-        let utime = multitask::current_scheduling_context_runtime_snapshot()
-            .map(|s| (s.context_consumed_ns / NS_PER_TICK) as i64)
-            .unwrap_or(0);
-        let tms = linux_abi::LinuxTms {
-            tms_utime: utime,
-            tms_stime: 0,
-            tms_cutime: 0,
-            tms_cstime: 0,
-        };
-        if let Err(err) = usermem::write_current_user_struct(tms_ptr, &tms) {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
+    linux_result((|| {
+        if tms_ptr != 0 {
+            let utime = multitask::current_scheduling_context_runtime_snapshot()
+                .map(|s| (s.context_consumed_ns / NS_PER_TICK) as i64)
+                .unwrap_or(0);
+            let tms = linux_abi::LinuxTms {
+                tms_utime: utime,
+                tms_stime: 0,
+                tms_cutime: 0,
+                tms_cstime: 0,
+            };
+            write_user_struct(tms_ptr, &tms)?;
         }
-    }
-    crate::arch::rtc::monotonic_nanos() / NS_PER_TICK
+        Ok(crate::arch::rtc::monotonic_nanos() / NS_PER_TICK)
+    })())
 }
 
 pub fn syscall_linux_sysinfo(info_ptr: u64) -> u64 {
@@ -536,26 +515,21 @@ pub fn syscall_linux_sysinfo(info_ptr: u64) -> u64 {
         mem_unit: 1,
         _pad3: 0,
     };
-    match usermem::write_current_user_struct(info_ptr, &info) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    }
+    linux_unit_result(write_user_struct(info_ptr, &info))
 }
 
 pub fn syscall_linux_getcpu(cpu_ptr: u64, node_ptr: u64) -> u64 {
-    if cpu_ptr != 0 {
-        let cpu = nucleus_core::util::lockdep::current_cpu_index() as u32;
-        if let Err(err) = usermem::write_current_user_struct(cpu_ptr, &cpu) {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
+    linux_unit_result((|| {
+        if cpu_ptr != 0 {
+            let cpu = nucleus_core::util::lockdep::current_cpu_index() as u32;
+            write_user_struct(cpu_ptr, &cpu)?;
         }
-    }
-    if node_ptr != 0 {
-        let node = 0_u32;
-        if let Err(err) = usermem::write_current_user_struct(node_ptr, &node) {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
+        if node_ptr != 0 {
+            let node = 0_u32;
+            write_user_struct(node_ptr, &node)?;
         }
-    }
-    0
+        Ok(())
+    })())
 }
 
 pub fn syscall_linux_sched_getscheduler(pid: i64) -> u64 {
@@ -571,39 +545,37 @@ pub fn syscall_linux_sched_getscheduler(pid: i64) -> u64 {
 }
 
 pub fn syscall_linux_sched_getparam(pid: i64, param_ptr: u64) -> u64 {
-    if pid < 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if pid != 0 && multitask::current_user_process_id() != Some(pid as u64)
-        && multitask::current_user_thread_id() != Some(pid as u64)
-    {
-        return linux_errno(LINUX_ESRCH);
-    }
-    let param = linux_abi::LinuxSchedParam { sched_priority: 0 };
-    match usermem::write_current_user_struct(param_ptr, &param) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    }
+    linux_unit_result((|| {
+        if pid < 0 {
+            return Err(LINUX_EINVAL);
+        }
+        if pid != 0 && multitask::current_user_process_id() != Some(pid as u64)
+            && multitask::current_user_thread_id() != Some(pid as u64)
+        {
+            return Err(LINUX_ESRCH);
+        }
+        let param = linux_abi::LinuxSchedParam { sched_priority: 0 };
+        write_user_struct(param_ptr, &param)
+    })())
 }
 
 pub fn syscall_linux_sched_rr_get_interval(pid: i64, ts_ptr: u64) -> u64 {
-    if pid < 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if pid != 0
-        && multitask::current_user_process_id() != Some(pid as u64)
-        && multitask::current_user_thread_id() != Some(pid as u64)
-    {
-        return linux_errno(LINUX_ESRCH);
-    }
-    let ts = LinuxTimespecWire {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    match usermem::write_current_user_bytes(ts_ptr, as_bytes(&ts)) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    }
+    linux_unit_result((|| {
+        if pid < 0 {
+            return Err(LINUX_EINVAL);
+        }
+        if pid != 0
+            && multitask::current_user_process_id() != Some(pid as u64)
+            && multitask::current_user_thread_id() != Some(pid as u64)
+        {
+            return Err(LINUX_ESRCH);
+        }
+        let ts = LinuxTimespecWire {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        write_user_bytes(ts_ptr, as_bytes(&ts))
+    })())
 }
 
 pub fn sleep_relative_timespec_substrate(ts: LinuxTimespecWire) {
@@ -797,16 +769,12 @@ pub fn syscall_linux_clock_nanosleep(
     request_ptr: u64,
     _remaining_ptr: u64,
 ) -> u64 {
-    let ts = match usermem::read_current_user_struct::<LinuxTimespecWire>(request_ptr) {
-        Ok(ts) => ts,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    if let Err(errno) =
-        validate_time_hot_path_locally(TimeHotPath::ClockNanosleep, clock_id, flags, Some(ts))
-    {
-        return linux_errno(errno);
-    }
-    sleep_clock_nanosleep_substrate(clock_id, flags, ts)
+    linux_unit_result((|| {
+        let ts: LinuxTimespecWire = read_user_struct(request_ptr)?;
+        validate_time_hot_path_locally(TimeHotPath::ClockNanosleep, clock_id, flags, Some(ts))?;
+        let _ = sleep_clock_nanosleep_substrate(clock_id, flags, ts);
+        Ok(())
+    })())
 }
 
 fn sleep_clock_nanosleep_substrate(clock_id: u64, flags: u64, ts: LinuxTimespecWire) -> u64 {
@@ -868,8 +836,8 @@ pub fn syscall_linux_clone3(frame: &SyscallFrame) -> u64 {
     let args_bytes = unsafe {
         slice::from_raw_parts_mut(core::ptr::addr_of_mut!(args).cast::<u8>(), provided_size)
     };
-    if let Err(err) = usermem::copy_from_current_user_exact(frame.rdi, args_bytes) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
+    if let Err(errno) = read_user_bytes(frame.rdi, args_bytes) {
+        return linux_errno(errno);
     }
     if let Err(errno) = validate_clone3_args(&args) {
         return linux_errno(errno);

@@ -287,42 +287,38 @@ pub(crate) fn kernel_create_pipe_pair(nonblocking: bool, cloexec: bool) -> Resul
 }
 
 pub fn syscall_linux_pipe2(pipefd_ptr: u64, flags: u64) -> u64 {
-    // `flags` is a C `int`: the register's upper half is not ABI.
-    let flags = u64::from(flags as u32);
-    if flags & !(PIPE2_ACCEPTED_FLAGS | linux_abi::O_DIRECT) != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if flags & linux_abi::O_DIRECT != 0 {
-        // Packet mode is not implemented; accepting the flag would silently
-        // return stream semantics to a caller that depends on message bounds.
-        return linux_errno(LINUX_EINVAL);
-    }
-    if let Err(err) = usermem::validate_current_user_write_buffer(pipefd_ptr, 2 * size_of::<i32>())
-    {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    let nonblocking = flags & linux_abi::O_NONBLOCK != 0;
-    let cloexec = flags & linux_abi::O_CLOEXEC != 0;
-    let (read_fd, write_fd) = match kernel_create_pipe_pair(nonblocking, cloexec) {
-        Ok(fds) => fds,
-        Err(errno) => return linux_errno(errno),
-    };
-    let mut pair = [0_u8; 2 * size_of::<i32>()];
-    pair[..4].copy_from_slice(&(read_fd as i32).to_ne_bytes());
-    pair[4..].copy_from_slice(&(write_fd as i32).to_ne_bytes());
-    if let Err(err) = usermem::write_current_user_bytes(pipefd_ptr, &pair) {
-        // The buffer was validated, so this is a racing unmap: Linux closes
-        // both descriptors and reports EFAULT.
-        let closed = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-            let handles = process_state.handles_mut();
-            (handles.close(read_fd), handles.close(write_fd))
-        });
-        if let Some((first, second)) = closed {
-            first.iter().chain(second.iter()).for_each(release_handle);
+    linux_unit_result((|| {
+        // `flags` is a C `int`: the register's upper half is not ABI.
+        let flags = u64::from(flags as u32);
+        if flags & !(PIPE2_ACCEPTED_FLAGS | linux_abi::O_DIRECT) != 0 {
+            return Err(LINUX_EINVAL);
         }
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    0
+        if flags & linux_abi::O_DIRECT != 0 {
+            // Packet mode is not implemented; accepting the flag would silently
+            // return stream semantics to a caller that depends on message bounds.
+            return Err(LINUX_EINVAL);
+        }
+        validate_user_write(pipefd_ptr, 2 * size_of::<i32>())?;
+        let nonblocking = flags & linux_abi::O_NONBLOCK != 0;
+        let cloexec = flags & linux_abi::O_CLOEXEC != 0;
+        let (read_fd, write_fd) = kernel_create_pipe_pair(nonblocking, cloexec)?;
+        let mut pair = [0_u8; 2 * size_of::<i32>()];
+        pair[..4].copy_from_slice(&(read_fd as i32).to_ne_bytes());
+        pair[4..].copy_from_slice(&(write_fd as i32).to_ne_bytes());
+        if let Err(errno) = write_user_bytes(pipefd_ptr, &pair) {
+            // The buffer was validated, so this is a racing unmap: Linux closes
+            // both descriptors and reports EFAULT.
+            let closed = multitask::with_current_user_process_state_mut(|_, _, process_state| {
+                let handles = process_state.handles_mut();
+                (handles.close(read_fd), handles.close(write_fd))
+            });
+            if let Some((first, second)) = closed {
+                first.iter().chain(second.iter()).for_each(release_handle);
+            }
+            return Err(errno);
+        }
+        Ok(())
+    })())
 }
 
 pub fn syscall_linux_pipe(pipefd_ptr: u64) -> u64 {
@@ -699,34 +695,24 @@ pub(in crate::user::syscall::linux) fn fcntl(local: &LocalFd, cmd: u64, arg: u64
 }
 
 pub(in crate::user::syscall::linux) fn ioctl(local: &LocalFd, request: u64, arg: u64) -> u64 {
-    match request {
+    linux_unit_result((|| match request {
         linux_abi::FIONREAD => match local {
             LocalFd::Pipe(pipe) => {
-                let available = pipe.shared().bytes_available() as u32;
-                match usermem::write_current_user_bytes(arg, &available.to_ne_bytes()) {
-                    Ok(()) => 0,
-                    Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-                }
+                write_user_bytes(arg, &(pipe.shared().bytes_available() as u32).to_ne_bytes())
             }
             LocalFd::UnixSocket(sock) => {
-                let available = sock.bytes_available() as u32;
-                match usermem::write_current_user_bytes(arg, &available.to_ne_bytes()) {
-                    Ok(()) => 0,
-                    Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-                }
+                write_user_bytes(arg, &(sock.bytes_available() as u32).to_ne_bytes())
             }
-            LocalFd::EventFd(_) => linux_errno(LINUX_ENOTTY),
+            LocalFd::EventFd(_) => Err(LINUX_ENOTTY),
         },
         linux_abi::FIONBIO => {
             let mut bytes = [0_u8; FIONREAD_RESULT_BYTES];
-            if let Err(err) = usermem::copy_from_current_user_exact(arg, &mut bytes) {
-                return linux_errno(user_pointer_error_to_linux_errno(err));
-            }
+            read_user_bytes(arg, &mut bytes)?;
             local.set_nonblocking(i32::from_ne_bytes(bytes) != 0);
-            0
+            Ok(())
         }
-        _ => linux_errno(LINUX_ENOTTY),
-    }
+        _ => Err(LINUX_ENOTTY),
+    })())
 }
 
 /// `lseek`/`pread`/`pwrite` on a pipe or eventfd: not seekable.

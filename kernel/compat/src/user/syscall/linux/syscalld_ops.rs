@@ -44,22 +44,13 @@ fn local_utsname() -> rustos_user_abi::syscall::LinuxUtsName {
 }
 
 pub(super) fn syscall_linux_syscalld_uname(buf_ptr: u64) -> u64 {
-    if let Err(err) = usermem::validate_current_user_write_buffer(buf_ptr, LINUX_UTSNAME_SIZE) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    let uts = local_utsname();
-    // SAFETY: `LinuxUtsName` is `#[repr(C)]` plain byte arrays of exact size
-    // `LINUX_UTSNAME_SIZE` with no padding or uninitialized bytes.
-    let bytes = unsafe {
-        core::slice::from_raw_parts(
-            (&uts as *const rustos_user_abi::syscall::LinuxUtsName).cast::<u8>(),
-            LINUX_UTSNAME_SIZE,
-        )
-    };
-    match usermem::write_current_user_bytes(buf_ptr, bytes) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    }
+    linux_unit_result((|| {
+        validate_user_write(buf_ptr, LINUX_UTSNAME_SIZE)?;
+        let uts = local_utsname();
+        // SAFETY: `LinuxUtsName` is `#[repr(C)]` plain byte arrays of exact size
+        // `LINUX_UTSNAME_SIZE` with no padding or uninitialized bytes.
+        write_user_bytes(buf_ptr, wire_as_bytes(&uts))
+    })())
 }
 
 pub(super) fn syscall_linux_syscalld_prlimit64(
@@ -68,46 +59,33 @@ pub(super) fn syscall_linux_syscalld_prlimit64(
     new_limit_ptr: u64,
     old_limit_ptr: u64,
 ) -> u64 {
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64);
-    request.dirfd = pid;
-    request.flags = resource;
-    if new_limit_ptr != 0 {
-        let mut new_limit = [0_u8; LINUX_RLIMIT_SIZE];
-        if let Err(err) = usermem::copy_from_current_user_exact(new_limit_ptr, &mut new_limit) {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
+    linux_unit_result((|| {
+        let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64);
+        request.dirfd = pid;
+        request.flags = resource;
+        if new_limit_ptr != 0 {
+            let mut new_limit = [0_u8; LINUX_RLIMIT_SIZE];
+            read_user_bytes(new_limit_ptr, &mut new_limit)?;
+            request.mask |= 0x1;
+            request.path_len = LINUX_RLIMIT_SIZE as u32;
+            request.path[..LINUX_RLIMIT_SIZE].copy_from_slice(&new_limit);
         }
-        request.mask |= 0x1;
-        request.path_len = LINUX_RLIMIT_SIZE as u32;
-        request.path[..LINUX_RLIMIT_SIZE].copy_from_slice(&new_limit);
-    }
-    if old_limit_ptr != 0 {
-        if let Err(err) =
-            usermem::validate_current_user_write_buffer(old_limit_ptr, LINUX_RLIMIT_SIZE)
-        {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
+        if old_limit_ptr != 0 {
+            validate_user_write(old_limit_ptr, LINUX_RLIMIT_SIZE)?;
+            request.mask |= 0x2;
         }
-        request.mask |= 0x2;
-    }
-    let response = match call_syscalld(request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_syscalld_status(&response) {
-        return linux_errno(errno);
-    }
-    if old_limit_ptr != 0 {
-        if response.payload_len as usize != LINUX_RLIMIT_SIZE {
-            return linux_errno(LINUX_EINVAL);
+        let response = call_syscalld(request)?;
+        if old_limit_ptr != 0 {
+            copy_exact_payload_to_user(
+                old_limit_ptr,
+                &response.payload,
+                response.payload_len,
+                LINUX_RLIMIT_SIZE,
+            )
+        } else {
+            ensure_empty_syscalld_response(&response)
         }
-        if let Err(err) =
-            usermem::write_current_user_bytes(old_limit_ptr, &response.payload[..LINUX_RLIMIT_SIZE])
-        {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
-        }
-    } else if response.payload_len != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    0
+    })())
 }
 
 /// `(soft, hard)` of `resource` for the calling process, read from the
@@ -118,13 +96,9 @@ pub(super) fn current_rlimit(resource: u64) -> Result<(u64, u64), i64> {
     request.dirfd = 0;
     request.flags = resource;
     request.mask |= 0x2;
-    let response = call_syscalld(request)?;
-    ensure_syscalld_status(&response)?;
-    if response.payload_len as usize != LINUX_RLIMIT_SIZE {
-        return Err(LINUX_EINVAL);
-    }
-    let soft = u64::from_ne_bytes(response.payload[0..8].try_into().map_err(|_| LINUX_EINVAL)?);
-    let hard = u64::from_ne_bytes(response.payload[8..16].try_into().map_err(|_| LINUX_EINVAL)?);
+    let payload = call_syscalld_payload(request, LINUX_RLIMIT_SIZE)?;
+    let soft = u64::from_ne_bytes(payload[0..8].try_into().map_err(|_| LINUX_EINVAL)?);
+    let hard = u64::from_ne_bytes(payload[8..16].try_into().map_err(|_| LINUX_EINVAL)?);
     Ok((soft, hard))
 }
 
@@ -133,59 +107,47 @@ pub(super) fn syscall_linux_syscalld_sched_getaffinity(
     user_len: u64,
     mask_ptr: u64,
 ) -> u64 {
-    let Ok(user_len) = usize::try_from(user_len) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if user_len < LINUX_CPUSET_BYTES {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if let Err(err) = usermem::validate_current_user_write_buffer(mask_ptr, LINUX_CPUSET_BYTES) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    let online_mask = kernel_hal::api::cpu::admitted_online_mask();
-    let task_mask = match multitask::linux_task_affinity(pid, online_mask) {
-        Ok(mask) => mask,
-        Err(error) => return linux_errno(affinity_error_to_linux_errno(error)),
-    };
-    if ipc_ops::current_process_has_service_capability(ServiceCapability::VfsPolicy) {
-        // vfsd answers /proc/cpuinfo and /sys CPU lists on its single receive
-        // thread while syscalld can be blocked in the mapping broker waiting for
-        // vfsd (PREAD64). Offloading this call would wait on that blocked
-        // service until the IPC deadline. syscalld's policy is a pure check of
-        // the kernel-stamped task mask against the Online mask, which the kernel
-        // has just done, so vfsd's reply is formed here with the same check.
-        if task_mask == 0 || task_mask & !online_mask != 0 {
-            return linux_errno(LINUX_EINVAL);
+    linux_result((|| {
+        let user_len = usize::try_from(user_len).map_err(|_| LINUX_EINVAL)?;
+        if user_len < LINUX_CPUSET_BYTES {
+            return Err(LINUX_EINVAL);
         }
-        let mut payload = [0_u8; LINUX_CPUSET_BYTES];
-        payload[..8].copy_from_slice(&task_mask.to_le_bytes());
-        return match usermem::write_current_user_bytes(mask_ptr, &payload) {
-            Ok(()) => LINUX_CPUSET_BYTES as u64,
-            Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-        };
-    }
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY);
-    request.dirfd = pid;
-    request.flags = user_len as u64;
-    request.mask = u32::try_from(task_mask)
-        .expect("SMP invariant: Linux task affinity exceeds fixed commercial envelope");
-    let target_process_id = request.pid;
-    stamp_affinity_topology(&mut request, online_mask, target_process_id);
-    let response = match call_syscalld(request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_syscalld_status(&response) {
-        return linux_errno(errno);
-    }
-    let payload_len = response.payload_len as usize;
-    if payload_len != LINUX_CPUSET_BYTES {
-        return linux_errno(LINUX_EINVAL);
-    }
-    match usermem::write_current_user_bytes(mask_ptr, &response.payload[..payload_len]) {
-        Ok(()) => payload_len as u64,
-        Err(err) => linux_errno(user_pointer_error_to_linux_errno(err)),
-    }
+        validate_user_write(mask_ptr, LINUX_CPUSET_BYTES)?;
+        let online_mask = kernel_hal::api::cpu::admitted_online_mask();
+        let task_mask = multitask::linux_task_affinity(pid, online_mask)
+            .map_err(affinity_error_to_linux_errno)?;
+        if ipc_ops::current_process_has_service_capability(ServiceCapability::VfsPolicy) {
+            // vfsd answers /proc/cpuinfo and /sys CPU lists on its single receive
+            // thread while syscalld can be blocked in the mapping broker waiting for
+            // vfsd (PREAD64). Offloading this call would wait on that blocked
+            // service until the IPC deadline. syscalld's policy is a pure check of
+            // the kernel-stamped task mask against the Online mask, which the kernel
+            // has just done, so vfsd's reply is formed here with the same check.
+            if task_mask == 0 || task_mask & !online_mask != 0 {
+                return Err(LINUX_EINVAL);
+            }
+            let mut payload = [0_u8; LINUX_CPUSET_BYTES];
+            payload[..8].copy_from_slice(&task_mask.to_le_bytes());
+            write_user_bytes(mask_ptr, &payload)?;
+            return Ok(LINUX_CPUSET_BYTES as u64);
+        }
+        let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_SCHED_GETAFFINITY);
+        request.dirfd = pid;
+        request.flags = user_len as u64;
+        request.mask = u32::try_from(task_mask)
+            .expect("SMP invariant: Linux task affinity exceeds fixed commercial envelope");
+        let target_process_id = request.pid;
+        stamp_affinity_topology(&mut request, online_mask, target_process_id);
+        let response = call_syscalld(request)?;
+        ensure_syscalld_status(&response)?;
+        copy_exact_payload_to_user(
+            mask_ptr,
+            &response.payload,
+            response.payload_len,
+            LINUX_CPUSET_BYTES,
+        )?;
+        Ok(LINUX_CPUSET_BYTES as u64)
+    })())
 }
 
 pub(super) fn syscall_linux_syscalld_sched_setaffinity(
@@ -193,50 +155,37 @@ pub(super) fn syscall_linux_syscalld_sched_setaffinity(
     user_len: u64,
     mask_ptr: u64,
 ) -> u64 {
-    let Ok(user_len) = usize::try_from(user_len) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if user_len < LINUX_CPUSET_BYTES {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let mut mask_bytes = [0_u8; LINUX_CPUSET_BYTES];
-    if let Err(err) = usermem::copy_from_current_user_exact(mask_ptr, &mut mask_bytes) {
-        return linux_errno(user_pointer_error_to_linux_errno(err));
-    }
-    let online_mask = kernel_hal::api::cpu::admitted_online_mask();
-    let requested_mask = u64::from_le_bytes(mask_bytes);
-    // Linux silently intersects a requested mask with CPUs physically present
-    // and permitted by the kernel. The fixed commercial topology has no
-    // separate cpuset/cgroup restriction, so Online is the complete container.
-    let effective_mask = requested_mask & online_mask;
-    if effective_mask == 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if let Err(error) = multitask::linux_task_affinity(pid, online_mask) {
-        return linux_errno(affinity_error_to_linux_errno(error));
-    }
+    linux_unit_result((|| {
+        let user_len = usize::try_from(user_len).map_err(|_| LINUX_EINVAL)?;
+        if user_len < LINUX_CPUSET_BYTES {
+            return Err(LINUX_EINVAL);
+        }
+        let mut mask_bytes = [0_u8; LINUX_CPUSET_BYTES];
+        read_user_bytes(mask_ptr, &mut mask_bytes)?;
+        let online_mask = kernel_hal::api::cpu::admitted_online_mask();
+        let requested_mask = u64::from_le_bytes(mask_bytes);
+        // Linux silently intersects a requested mask with CPUs physically present
+        // and permitted by the kernel. The fixed commercial topology has no
+        // separate cpuset/cgroup restriction, so Online is the complete container.
+        let effective_mask = requested_mask & online_mask;
+        if effective_mask == 0 {
+            return Err(LINUX_EINVAL);
+        }
+        multitask::linux_task_affinity(pid, online_mask)
+            .map_err(affinity_error_to_linux_errno)?;
 
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_SCHED_SETAFFINITY);
-    request.dirfd = pid;
-    request.flags = user_len as u64;
-    request.mask = u32::try_from(effective_mask)
-        .expect("SMP invariant: Linux task affinity exceeds fixed commercial envelope");
-    let target_process_id = request.pid;
-    stamp_affinity_topology(&mut request, online_mask, target_process_id);
-    let response = match call_syscalld(request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_syscalld_status(&response) {
-        return linux_errno(errno);
-    }
-    if response.payload_len != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    match multitask::set_linux_task_affinity(pid, effective_mask, online_mask) {
-        Ok(_) => 0,
-        Err(error) => linux_errno(affinity_error_to_linux_errno(error)),
-    }
+        let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_SCHED_SETAFFINITY);
+        request.dirfd = pid;
+        request.flags = user_len as u64;
+        request.mask = u32::try_from(effective_mask)
+            .expect("SMP invariant: Linux task affinity exceeds fixed commercial envelope");
+        let target_process_id = request.pid;
+        stamp_affinity_topology(&mut request, online_mask, target_process_id);
+        call_syscalld_empty(request)?;
+        multitask::set_linux_task_affinity(pid, effective_mask, online_mask)
+            .map(|_| ())
+            .map_err(affinity_error_to_linux_errno)
+    })())
 }
 
 fn affinity_error_to_linux_errno(error: multitask::AffinityError) -> i64 {
@@ -283,6 +232,26 @@ pub(super) fn syscall_linux_syscalld_id_getter(op: u16) -> u64 {
     ]) as u64
 }
 
+fn call_syscalld_fast_rpc<Req>(
+    op: u16,
+    request: &Req,
+) -> Result<LinuxSyscallOffloadFastResponse, i64> {
+    let (received, bytes) = ipc_ops::call_linux_syscall_fast_endpoint(
+        as_bytes(request),
+        size_of::<LinuxSyscallOffloadFastResponse>(),
+    )?;
+    let response = decode_fixed_response::<LinuxSyscallOffloadFastResponse>(&bytes[..received])?;
+    if response.version != SYSCALL_OFFLOAD_ABI_VERSION
+        || response.op != op
+        || response.reserved0 != 0
+        || response.payload_len as usize > response.payload.len()
+    {
+        return Err(LINUX_EINVAL);
+    }
+    check_ipc_status(response.status)?;
+    Ok(response)
+}
+
 /// Address-space operations over the compact frame (see
 /// `LinuxSyscallOffloadFastMemRequest`). Returns the validated response; a
 /// non-zero status from syscalld is returned as its errno, so callers keep the
@@ -320,25 +289,7 @@ pub(super) fn call_syscalld_fast_mem(
         offset,
         ticket: lease.ticket(),
     };
-    let (received, bytes) = ipc_ops::call_linux_syscall_fast_endpoint(
-        as_bytes(&request),
-        size_of::<LinuxSyscallOffloadFastResponse>(),
-    )?;
-    if received != size_of::<LinuxSyscallOffloadFastResponse>() {
-        return Err(LINUX_EINVAL);
-    }
-    let response = read_unaligned::<LinuxSyscallOffloadFastResponse>(&bytes[..received]);
-    if response.version != SYSCALL_OFFLOAD_ABI_VERSION
-        || response.op != op
-        || response.reserved0 != 0
-        || response.payload_len as usize > response.payload.len()
-    {
-        return Err(LINUX_EINVAL);
-    }
-    if response.status != 0 {
-        return Err(response.status.unsigned_abs() as i64);
-    }
-    Ok(response)
+    call_syscalld_fast_rpc(op, &request)
 }
 
 fn call_syscalld_fast_id(op: u16) -> Result<LinuxSyscallOffloadFastResponse, i64> {
@@ -363,53 +314,25 @@ fn call_syscalld_fast_id(op: u16) -> Result<LinuxSyscallOffloadFastResponse, i64
         euid: full.euid,
         egid: full.egid,
     };
-    let (received, bytes) = ipc_ops::call_linux_syscall_fast_endpoint(
-        as_bytes(&request),
-        size_of::<LinuxSyscallOffloadFastResponse>(),
-    )?;
-    if received != size_of::<LinuxSyscallOffloadFastResponse>() {
-        return Err(LINUX_EINVAL);
-    }
-    let response = read_unaligned::<LinuxSyscallOffloadFastResponse>(&bytes[..received]);
-    if response.version != SYSCALL_OFFLOAD_ABI_VERSION
-        || response.op != op
-        || response.reserved0 != 0
-        || response.status != 0
-        || response.payload_len as usize != size_of::<u32>()
-    {
-        return Err(if response.status != 0 {
-            response.status.unsigned_abs() as i64
-        } else {
-            LINUX_EINVAL
-        });
-    }
+    let response = call_syscalld_fast_rpc(op, &request)?;
+    exact_payload(&response.payload, response.payload_len, size_of::<u32>())?;
     Ok(response)
 }
 
 pub(super) fn syscall_linux_syscalld_setid(op: u16, id: u64) -> u64 {
-    let Ok(id) = u32::try_from(id) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    let mut request = new_syscalld_request(op);
-    request.mask = id;
-    match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response)) {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_unit_result((|| {
+        let id = u32::try_from(id).map_err(|_| LINUX_EINVAL)?;
+        let mut request = new_syscalld_request(op);
+        request.mask = id;
+        call_syscalld_empty(request)
+    })())
 }
 
 /// Current process umask, read through syscalld without changing it.
 pub(super) fn query_umask() -> Result<u32, i64> {
     let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_UMASK);
     request.flags = rustos_user_abi::syscall::SYSCALL_OFFLOAD_UMASK_QUERY;
-    let response = call_syscalld(request)?;
-    ensure_syscalld_payload(&response, size_of::<u32>())?;
-    let mask = u32::from_le_bytes([
-        response.payload[0],
-        response.payload[1],
-        response.payload[2],
-        response.payload[3],
-    ]);
+    let mask = call_syscalld_value::<u32>(request)?;
     if mask & !0o777 != 0 {
         return Err(LINUX_EINVAL);
     }
@@ -419,44 +342,20 @@ pub(super) fn query_umask() -> Result<u32, i64> {
 pub(super) fn syscall_linux_syscalld_umask(new_mask: u64) -> u64 {
     let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_UMASK);
     request.mask = (new_mask & 0o777) as u32;
-    let response = match call_syscalld(request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_syscalld_payload(&response, size_of::<u32>()) {
-        return linux_errno(errno);
-    }
-    u32::from_le_bytes([
-        response.payload[0],
-        response.payload[1],
-        response.payload[2],
-        response.payload[3],
-    ]) as u64
+    linux_result(call_syscalld_value::<u32>(request).map(u64::from))
 }
 
 pub(super) fn syscall_linux_syscalld_u64_getter(op: u16, target_pid: u64) -> u64 {
     let mut request = new_syscalld_request(op);
     request.dirfd = target_pid;
-    let response = match call_syscalld(request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_syscalld_payload(&response, size_of::<u64>()) {
-        return linux_errno(errno);
-    }
-    let mut bytes = [0_u8; size_of::<u64>()];
-    bytes.copy_from_slice(&response.payload[..size_of::<u64>()]);
-    u64::from_le_bytes(bytes)
+    linux_result(call_syscalld_value::<u64>(request))
 }
 
 pub(super) fn syscall_linux_syscalld_setpgid(target_pid: u64, pgid: u64) -> u64 {
     let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_SETPGID);
     request.dirfd = target_pid;
     request.arg0 = pgid;
-    match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response)) {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_unit_result(call_syscalld_empty(request))
 }
 
 pub(super) fn syscall_linux_syscalld_getres_id(
@@ -465,64 +364,36 @@ pub(super) fn syscall_linux_syscalld_getres_id(
     euid_ptr: u64,
     suid_ptr: u64,
 ) -> u64 {
-    let response = match call_syscalld(new_syscalld_request(op)) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_syscalld_payload(&response, 12) {
-        return linux_errno(errno);
-    }
-    let ids = [
-        u32::from_le_bytes(response.payload[0..4].try_into().unwrap()),
-        u32::from_le_bytes(response.payload[4..8].try_into().unwrap()),
-        u32::from_le_bytes(response.payload[8..12].try_into().unwrap()),
-    ];
-    for (ptr, val) in [(ruid_ptr, ids[0]), (euid_ptr, ids[1]), (suid_ptr, ids[2])] {
-        if ptr != 0 {
-            if let Err(err) = usermem::write_current_user_struct(ptr, &val) {
-                return linux_errno(user_pointer_error_to_linux_errno(err));
+    linux_unit_result((|| {
+        let ids = call_syscalld_value::<[u32; 3]>(new_syscalld_request(op))?;
+        for (ptr, val) in [(ruid_ptr, ids[0]), (euid_ptr, ids[1]), (suid_ptr, ids[2])] {
+            if ptr != 0 {
+                write_user_struct(ptr, &val)?;
             }
         }
-    }
-    0
+        Ok(())
+    })())
 }
 
 pub(super) fn syscall_linux_syscalld_getgroups(size: i64, list_ptr: u64) -> u64 {
-    if size < 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_GETGROUPS);
-    request.arg0 = size as u64;
-    if size > 0 {
-        if let Err(err) = usermem::validate_current_user_write_buffer(
-            list_ptr,
-            (size as usize).saturating_mul(size_of::<u32>()),
-        ) {
-            return linux_errno(user_pointer_error_to_linux_errno(err));
+    linux_result((|| {
+        if size < 0 {
+            return Err(LINUX_EINVAL);
         }
-    }
-    let response = match call_syscalld(request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_syscalld_payload(&response, size_of::<u32>()) {
-        return linux_errno(errno);
-    }
-    u32::from_le_bytes(response.payload[..4].try_into().unwrap()) as u64
+        let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_GETGROUPS);
+        request.arg0 = size as u64;
+        if size > 0 {
+            validate_user_write(list_ptr, (size as usize).saturating_mul(size_of::<u32>()))?;
+        }
+        call_syscalld_value::<u32>(request).map(u64::from)
+    })())
 }
 
 pub(super) fn syscall_linux_syscalld_getpriority(which: u64, who: u64) -> u64 {
     let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_GETPRIORITY);
     request.flags = which;
     request.dirfd = who;
-    let response = match call_syscalld(request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_syscalld_payload(&response, size_of::<u64>()) {
-        return linux_errno(errno);
-    }
-    u64::from_le_bytes(response.payload[..8].try_into().unwrap())
+    linux_result(call_syscalld_value::<u64>(request))
 }
 
 pub(super) fn syscall_linux_syscalld_setpriority(which: u64, who: u64, prio: i64) -> u64 {
@@ -530,10 +401,7 @@ pub(super) fn syscall_linux_syscalld_setpriority(which: u64, who: u64, prio: i64
     request.flags = which;
     request.dirfd = who;
     request.arg0 = prio as i32 as u64;
-    match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response)) {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_unit_result(call_syscalld_empty(request))
 }
 
 fn validate_getrandom_flags(flags: u64) -> Result<(), i64> {
@@ -792,21 +660,20 @@ pub(super) fn syscall_linux_memfd_create(name_ptr: u64, flags: u64) -> u64 {
 }
 
 pub(super) fn new_syscalld_request(op: u16) -> LinuxSyscallOffloadRequest {
+    let stamp = CallerStamp::current();
     let mut request = LinuxSyscallOffloadRequest {
         op,
+        pid: stamp.pid,
+        tid: stamp.tid,
+        session_handle: stamp.session_handle,
+        uid: stamp.uid,
+        gid: stamp.gid,
+        euid: stamp.euid,
+        egid: stamp.egid,
         ..LinuxSyscallOffloadRequest::default()
     };
-    if let Some(snapshot) = multitask::current_user_snapshot() {
-        request.pid = snapshot.process_id();
-        request.tid = snapshot.thread_id();
-        request.session_handle = snapshot.console_session().raw();
-        request.parent_pid = multitask::parent_process_id_of(snapshot.process_id()).unwrap_or(0);
-    }
-    if let Some(security) = multitask::with_current_process_credentials(|security| security) {
-        request.uid = security.uid();
-        request.gid = security.gid();
-        request.euid = security.euid();
-        request.egid = security.egid();
+    if stamp.pid != 0 {
+        request.parent_pid = multitask::parent_process_id_of(stamp.pid).unwrap_or(0);
     }
     request
 }
@@ -814,13 +681,30 @@ pub(super) fn new_syscalld_request(op: u16) -> LinuxSyscallOffloadRequest {
 pub(super) fn call_syscalld(
     request: LinuxSyscallOffloadRequest,
 ) -> Result<LinuxSyscallOffloadResponse, i64> {
-    let response = ipc_ops::call_linux_syscall_endpoint(as_bytes(&request))?;
-    if response.len() != size_of::<LinuxSyscallOffloadResponse>() {
-        return Err(LINUX_EINVAL);
-    }
-    let response = read_unaligned::<LinuxSyscallOffloadResponse>(response.as_slice());
+    let bytes = ipc_ops::call_linux_syscall_endpoint(as_bytes(&request))?;
+    let response = decode_fixed_response::<LinuxSyscallOffloadResponse>(bytes.as_slice())?;
     validate_syscalld_response_envelope(request.op, &response)?;
     Ok(response)
+}
+
+pub(super) fn call_syscalld_empty(request: LinuxSyscallOffloadRequest) -> LinuxResult<()> {
+    let response = call_syscalld(request)?;
+    ensure_empty_syscalld_response(&response)
+}
+
+pub(super) fn call_syscalld_payload(
+    request: LinuxSyscallOffloadRequest,
+    expected_len: usize,
+) -> LinuxResult<[u8; SYSCALL_OFFLOAD_PAYLOAD_CAPACITY]> {
+    let response = call_syscalld(request)?;
+    ensure_syscalld_payload(&response, expected_len)?;
+    Ok(response.payload)
+}
+
+pub(super) fn call_syscalld_value<T: Copy>(request: LinuxSyscallOffloadRequest) -> LinuxResult<T> {
+    let response = call_syscalld(request)?;
+    ensure_syscalld_status(&response)?;
+    decode_exact_payload::<T>(&response.payload, response.payload_len)
 }
 
 fn validate_syscalld_response_envelope(
@@ -842,20 +726,14 @@ fn validate_syscalld_response_envelope(
 pub(super) fn ensure_empty_fast_response(
     response: LinuxSyscallOffloadFastResponse,
 ) -> Result<(), i64> {
-    if response.payload_len != 0 {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(())
+    exact_payload(&response.payload, response.payload_len, 0).map(|_| ())
 }
 
 pub(super) fn ensure_empty_syscalld_response(
     response: &LinuxSyscallOffloadResponse,
 ) -> Result<(), i64> {
     ensure_syscalld_status(response)?;
-    if response.payload_len != 0 {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(())
+    exact_payload(&response.payload, response.payload_len, 0).map(|_| ())
 }
 
 pub(super) fn ensure_syscalld_payload(
@@ -863,30 +741,11 @@ pub(super) fn ensure_syscalld_payload(
     expected_len: usize,
 ) -> Result<(), i64> {
     ensure_syscalld_status(response)?;
-    if response.payload_len as usize != expected_len {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(())
+    exact_payload(&response.payload, response.payload_len, expected_len).map(|_| ())
 }
 
 pub(super) fn ensure_syscalld_status(response: &LinuxSyscallOffloadResponse) -> Result<(), i64> {
-    if response.status != 0 {
-        return Err(response.status.unsigned_abs() as i64);
-    }
-    Ok(())
-}
-
-pub(super) fn as_bytes<T>(value: &T) -> &[u8] {
-    // SAFETY: `value` is live and immutably borrowed for the returned slice;
-    // the exact object representation is copied before the borrow ends.
-    unsafe { slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
-}
-
-pub(super) fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
-    assert!(bytes.len() >= size_of::<T>());
-    // SAFETY: the assertion proves a complete `T` representation is readable;
-    // unaligned reads have no pointer alignment requirement.
-    unsafe { bytes.as_ptr().cast::<T>().read_unaligned() }
+    check_ipc_status(response.status)
 }
 
 #[cfg(test)]

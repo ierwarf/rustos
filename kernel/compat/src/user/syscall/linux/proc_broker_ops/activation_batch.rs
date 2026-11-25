@@ -46,11 +46,10 @@ pub(in crate::user::syscall::linux) fn syscall_linux_rustos_proc_activate_batch_
     if !current_process_can_load() {
         return linux_errno(LINUX_EPERM);
     }
-    let args =
-        match usermem::read_current_user_struct::<RustosProcActivateBatchBrokerArgs>(args_ptr) {
-            Ok(args) => args,
-            Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
-        };
+    let args: RustosProcActivateBatchBrokerArgs = match read_user_struct_as(args_ptr) {
+        Ok(args) => args,
+        Err(errno) => return linux_errno(errno),
+    };
     let target_count = usize::from(args.target_count);
     if args.abi_version != PROC_BROKER_ABI_VERSION
         || args.flags != 0

@@ -81,33 +81,19 @@ fn check_current_cache_if_enabled(args: &RustosJobPolicyArgs, caller: u64) -> Re
 }
 
 pub(super) fn syscall_linux_rustos_job_policy(args_ptr: u64) -> u64 {
-    let mut args = match usermem::read_current_user_struct::<RustosJobPolicyArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
-    };
-    if !policy_args_are_valid(&args) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let Some(caller) = multitask::current_user_process_id() else {
-        return linux_errno(LINUX_ESRCH);
-    };
-    if let Err(error) = usermem::validate_current_user_write_buffer(
-        args_ptr, size_of::<RustosJobPolicyArgs>(),
-    ) {
-        return linux_errno(user_pointer_error_to_linux_errno(error));
-    }
-    if let Err(errno) = run_policy_op(&mut args, caller) {
-        return linux_errno(errno);
-    }
-    if let Err(errno) = check_current_cache_if_enabled(&args, caller) {
-        return linux_errno(errno);
-    }
-    // SET commits scalar ceiling state, not new descriptor authority. A later
-    // copyout fault is reported but does not roll back the completed mutation.
-    if let Err(error) = usermem::write_current_user_struct(args_ptr, &args) {
-        return linux_errno(user_pointer_error_to_linux_errno(error));
-    }
-    0
+    linux_unit_result((|| {
+        let mut args: RustosJobPolicyArgs = read_user_struct(args_ptr)?;
+        if !policy_args_are_valid(&args) {
+            return Err(LINUX_EINVAL);
+        }
+        let caller = current_user_pid()?;
+        validate_user_write_struct::<RustosJobPolicyArgs>(args_ptr)?;
+        run_policy_op(&mut args, caller)?;
+        check_current_cache_if_enabled(&args, caller)?;
+        // SET commits scalar ceiling state, not new descriptor authority. A later
+        // copyout fault is reported but does not roll back the completed mutation.
+        write_user_struct(args_ptr, &args)
+    })())
 }
 
 #[cfg(test)]

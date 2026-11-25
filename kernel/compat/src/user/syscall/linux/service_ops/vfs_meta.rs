@@ -8,52 +8,39 @@ pub fn syscall_linux_vfs_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
     if let Some(result) = super::local_fd::not_seekable(fd) {
         return result;
     }
-    if let Some(mut memfd) = current_memfd_handle(fd) {
-        let whence = match whence {
-            value if value == linux_abi::SEEK_SET => multitask::FileHandleSeekWhence::Start,
-            value if value == linux_abi::SEEK_CUR => multitask::FileHandleSeekWhence::Current,
-            value if value == linux_abi::SEEK_END => multitask::FileHandleSeekWhence::End,
-            _ => return linux_errno(LINUX_EINVAL),
-        };
-        return match memfd.seek(offset, whence) {
-            Ok(pos) => pos,
-            Err(_) => linux_errno(LINUX_EINVAL),
-        };
-    }
-    let Some(remote) = current_remote_vfs_handle(fd) else {
-        return linux_errno(LINUX_EBADF);
-    };
-    let _cursor = match acquire_vfs_cursor_gate(remote.remote_id()) {
-        Ok(gate) => gate,
-        Err(errno) => return linux_errno(errno),
-    };
-    let is_file = remote.kind() == multitask::RemoteVfsHandleKind::File;
-    let observed_epoch = if is_file {
-        ipc_ops::service_endpoint_epoch(IPC_SERVICE_VFSD).unwrap_or(0)
-    } else {
-        0
-    };
-    let mut request = new_vfs_request(VFS_IPC_OP_LSEEK);
-    request.fd = fd;
-    request.remote_id = remote.remote_id();
-    request.arg0 = offset as u64;
-    request.arg1 = whence;
-    if is_file {
-        request.flags |= VFS_LSEEK_FLAG_SYNC_CURSOR;
-        request.arg2 = remote.cursor();
-    }
-    match call_pinned_remote_vfs_request(&request).and_then(|response| {
-        ensure_vfs_status(&response)?;
-        Ok(response.value)
-    }) {
-        Ok(value) => {
-            if is_file {
-                remote.set_synced_cursor(value, observed_epoch);
-            }
-            value
+    linux_result((|| {
+        if let Some(mut memfd) = current_memfd_handle(fd) {
+            let whence = match whence {
+                value if value == linux_abi::SEEK_SET => multitask::FileHandleSeekWhence::Start,
+                value if value == linux_abi::SEEK_CUR => multitask::FileHandleSeekWhence::Current,
+                value if value == linux_abi::SEEK_END => multitask::FileHandleSeekWhence::End,
+                _ => return Err(LINUX_EINVAL),
+            };
+            return memfd.seek(offset, whence).map_err(|_| LINUX_EINVAL);
         }
-        Err(errno) => linux_errno(errno),
-    }
+        let remote = current_remote_vfs_handle(fd).ok_or(LINUX_EBADF)?;
+        let _cursor = acquire_vfs_cursor_gate(remote.remote_id())?;
+        let is_file = remote.kind() == multitask::RemoteVfsHandleKind::File;
+        let observed_epoch = if is_file {
+            ipc_ops::service_endpoint_epoch(IPC_SERVICE_VFSD).unwrap_or(0)
+        } else {
+            0
+        };
+        let mut request = new_vfs_request(VFS_IPC_OP_LSEEK);
+        request.fd = fd;
+        request.remote_id = remote.remote_id();
+        request.arg0 = offset as u64;
+        request.arg1 = whence;
+        if is_file {
+            request.flags |= VFS_LSEEK_FLAG_SYNC_CURSOR;
+            request.arg2 = remote.cursor();
+        }
+        let value = call_vfs_checked(&request)?.value;
+        if is_file {
+            remote.set_synced_cursor(value, observed_epoch);
+        }
+        Ok(value)
+    })())
 }
 
 pub fn kernel_vfs_fstat(fd: u64) -> Result<linux_abi::LinuxStat, i64> {
@@ -64,12 +51,8 @@ pub fn kernel_vfs_fstat(fd: u64) -> Result<linux_abi::LinuxStat, i64> {
     let mut request = new_vfs_request(VFS_IPC_OP_FSTAT);
     request.fd = fd;
     request.remote_id = remote.remote_id();
-    let response = call_pinned_remote_vfs_request(&request)?;
-    ensure_vfs_status(&response)?;
-    if response.payload_len as usize != LINUX_STAT_SIZE {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(read_unaligned::<linux_abi::LinuxStat>(&response.payload[..LINUX_STAT_SIZE]))
+    let response = call_vfs_checked(&request)?;
+    decode_exact_payload::<linux_abi::LinuxStat>(&response.payload, response.payload_len)
 }
 
 pub fn kernel_vfs_statx_path(path: &str) -> Result<linux_abi::LinuxStatx, i64> {
@@ -77,12 +60,8 @@ pub fn kernel_vfs_statx_path(path: &str) -> Result<linux_abi::LinuxStatx, i64> {
     proc_identity::attach_caller_exec_path(&mut request);
     request.arg1 = 0x7ff;
     populate_vfs_path_base(&mut request, linux_abi::AT_FDCWD as u64, path)?;
-    let response = call_pinned_remote_vfs_request(&request)?;
-    ensure_vfs_status(&response)?;
-    if response.payload_len as usize != LINUX_STATX_SIZE {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(read_unaligned::<linux_abi::LinuxStatx>(&response.payload[..LINUX_STATX_SIZE]))
+    let response = call_vfs_checked(&request)?;
+    decode_exact_payload::<linux_abi::LinuxStatx>(&response.payload, response.payload_len)
 }
 
 pub fn syscall_linux_vfs_fstat(fd: u64, stat_ptr: u64) -> u64 {
@@ -95,29 +74,20 @@ pub fn syscall_linux_vfs_fstat(fd: u64, stat_ptr: u64) -> u64 {
     if let Some(multitask::KernelHandle::DeviceBuffer(buffer)) = current_kernel_handle(fd) {
         return write_device_buffer_stat(stat_ptr, &buffer);
     }
-    let Some(remote) = current_remote_vfs_handle(fd) else {
-        return linux_errno(LINUX_EBADF);
-    };
-    if let Err(err) = usermem::validate_current_user_write_buffer(stat_ptr, LINUX_STAT_SIZE) {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
-    let mut request = new_vfs_request(VFS_IPC_OP_FSTAT);
-    request.fd = fd;
-    request.remote_id = remote.remote_id();
-    let response = match call_pinned_remote_vfs_request(&request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_vfs_status(&response) {
-        return linux_errno(errno);
-    }
-    if response.payload_len as usize != LINUX_STAT_SIZE {
-        return linux_errno(LINUX_EINVAL);
-    }
-    match usermem::write_current_user_bytes(stat_ptr, &response.payload[..LINUX_STAT_SIZE]) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-    }
+    linux_unit_result((|| {
+        let remote = current_remote_vfs_handle(fd).ok_or(LINUX_EBADF)?;
+        validate_user_write_as(stat_ptr, LINUX_STAT_SIZE)?;
+        let mut request = new_vfs_request(VFS_IPC_OP_FSTAT);
+        request.fd = fd;
+        request.remote_id = remote.remote_id();
+        let response = call_vfs_checked(&request)?;
+        copy_exact_payload_to_user_as(
+            stat_ptr,
+            &response.payload,
+            response.payload_len,
+            LINUX_STAT_SIZE,
+        )
+    })())
 }
 
 /// `ftruncate` on a descriptor without write access: `EINVAL` for a readable
@@ -131,37 +101,27 @@ fn ftruncate_unwritable_errno(rights: kernel_object::api::HandleRights) -> i64 {
 }
 
 pub fn syscall_linux_vfs_ftruncate(fd: u64, len: u64) -> u64 {
-    // Linux rejects a negative `off_t` before it looks at the descriptor.
-    if len > i64::MAX as u64 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if let Some((memfd, rights)) = current_memfd_handle_with_rights(fd) {
-        if !rights.allows_write() {
-            return linux_errno(ftruncate_unwritable_errno(rights));
+    linux_unit_result((|| {
+        // Linux rejects a negative `off_t` before it looks at the descriptor.
+        if len > i64::MAX as u64 {
+            return Err(LINUX_EINVAL);
         }
-        let Ok(len) = usize::try_from(len) else {
-            return linux_errno(LINUX_EINVAL);
-        };
-        return match memfd.truncate(len) {
-            Ok(()) => 0,
-            Err(err) => linux_errno(memfd_error_to_linux_errno(err)),
-        };
-    }
-    let Some((remote, rights)) = current_remote_vfs_handle_with_rights(fd) else {
-        return linux_errno(LINUX_EBADF);
-    };
-    if !rights.allows_write() {
-        return linux_errno(ftruncate_unwritable_errno(rights));
-    }
-    let mut request = new_vfs_request(VFS_IPC_OP_FTRUNCATE);
-    request.fd = fd;
-    request.remote_id = remote.remote_id();
-    request.arg0 = len;
-    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
-    {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+        if let Some((memfd, rights)) = current_memfd_handle_with_rights(fd) {
+            if !rights.allows_write() {
+                return Err(ftruncate_unwritable_errno(rights));
+            }
+            let len = usize::try_from(len).map_err(|_| LINUX_EINVAL)?;
+            return memfd.truncate(len).map_err(memfd_error_to_linux_errno);
+        }
+        let (remote, rights) =
+            current_remote_vfs_handle_with_rights(fd).ok_or(LINUX_EBADF)?;
+        if !rights.allows_write() {
+            return Err(ftruncate_unwritable_errno(rights));
+        }
+        call_vfs_fd_status(VFS_IPC_OP_FTRUNCATE, fd, remote.remote_id(), |request| {
+            request.arg0 = len;
+        })
+    })())
 }
 
 pub(crate) fn kernel_vfs_getdents_raw(fd: u64, dest: &mut [u8]) -> Result<usize, i64> {
@@ -284,11 +244,10 @@ pub fn syscall_linux_vfs_statx(
     mask: u64,
     statx_ptr: u64,
 ) -> u64 {
-    let path = match copy_current_user_path_allow_empty(path_ptr, VFS_IPC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    syscall_linux_vfs_statx_str(dirfd, &path, flags, mask, statx_ptr)
+    linux_result((|| {
+        let path = copy_current_user_path_allow_empty(path_ptr, VFS_IPC_PATH_CAPACITY)?;
+        Ok(syscall_linux_vfs_statx_str(dirfd, &path, flags, mask, statx_ptr))
+    })())
 }
 
 pub fn syscall_linux_vfs_statx_str(
@@ -310,40 +269,31 @@ pub fn syscall_linux_vfs_statx_str(
     if let Some(result) = super::local_fd::statx_at_empty_path(dirfd, &path, flags, statx_ptr) {
         return result;
     }
-    if path.is_empty() && flags & linux_abi::AT_EMPTY_PATH == 0 {
-        return linux_errno(LINUX_ENOENT);
-    }
-    if let Err(err) = usermem::validate_current_user_write_buffer(statx_ptr, LINUX_STATX_SIZE) {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
-    let mut request = new_vfs_request(VFS_IPC_OP_STATX);
-    proc_identity::attach_caller_exec_path(&mut request);
-    request.flags = flags as u32;
-    request.arg1 = mask;
-    if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
-        return linux_errno(errno);
-    }
-    let response = match call_pinned_remote_vfs_request(&request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_vfs_status(&response) {
-        return linux_errno(errno);
-    }
-    if let Some(result) = proc_identity::complete_stat(
-        response.aux,
-        flags,
-        proc_identity::StatOut::Statx { ptr: statx_ptr, mask },
-    ) {
-        return result;
-    }
-    if response.payload_len as usize != LINUX_STATX_SIZE {
-        return linux_errno(LINUX_EINVAL);
-    }
-    match usermem::write_current_user_bytes(statx_ptr, &response.payload[..LINUX_STATX_SIZE]) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-    }
+    linux_unit_result((|| {
+        if path.is_empty() && flags & linux_abi::AT_EMPTY_PATH == 0 {
+            return Err(LINUX_ENOENT);
+        }
+        validate_user_write_as(statx_ptr, LINUX_STATX_SIZE)?;
+        let mut request = new_vfs_request(VFS_IPC_OP_STATX);
+        proc_identity::attach_caller_exec_path(&mut request);
+        request.flags = flags as u32;
+        request.arg1 = mask;
+        populate_vfs_path_base(&mut request, dirfd, &path)?;
+        let response = call_vfs_checked(&request)?;
+        if let Some(result) = proc_identity::complete_stat(
+            response.aux,
+            flags,
+            proc_identity::StatOut::Statx { ptr: statx_ptr, mask },
+        ) {
+            return super::vfs_socket::kernel_vfs_result(result).map(|_| ());
+        }
+        copy_exact_payload_to_user_as(
+            statx_ptr,
+            &response.payload,
+            response.payload_len,
+            LINUX_STATX_SIZE,
+        )
+    })())
 }
 
 pub fn syscall_linux_vfs_newfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, flags: u64) -> u64 {
@@ -377,36 +327,27 @@ pub fn syscall_linux_vfs_newfstatat(dirfd: u64, path_ptr: u64, stat_ptr: u64, fl
     {
         return syscall_linux_vfs_fstat(dirfd, stat_ptr);
     }
-    if let Err(err) = usermem::validate_current_user_write_buffer(stat_ptr, LINUX_STAT_SIZE) {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
-    let mut request = new_vfs_request(VFS_IPC_OP_NEWFSTATAT);
-    proc_identity::attach_caller_exec_path(&mut request);
-    request.flags = flags as u32;
-    if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
-        return linux_errno(errno);
-    }
-    let response = match call_pinned_remote_vfs_request(&request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_vfs_status(&response) {
-        return linux_errno(errno);
-    }
-    if let Some(result) = proc_identity::complete_stat(
-        response.aux,
-        flags,
-        proc_identity::StatOut::Stat { ptr: stat_ptr },
-    ) {
-        return result;
-    }
-    if response.payload_len as usize != LINUX_STAT_SIZE {
-        return linux_errno(LINUX_EINVAL);
-    }
-    match usermem::write_current_user_bytes(stat_ptr, &response.payload[..LINUX_STAT_SIZE]) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-    }
+    linux_unit_result((|| {
+        validate_user_write_as(stat_ptr, LINUX_STAT_SIZE)?;
+        let mut request = new_vfs_request(VFS_IPC_OP_NEWFSTATAT);
+        proc_identity::attach_caller_exec_path(&mut request);
+        request.flags = flags as u32;
+        populate_vfs_path_base(&mut request, dirfd, &path)?;
+        let response = call_vfs_checked(&request)?;
+        if let Some(result) = proc_identity::complete_stat(
+            response.aux,
+            flags,
+            proc_identity::StatOut::Stat { ptr: stat_ptr },
+        ) {
+            return super::vfs_socket::kernel_vfs_result(result).map(|_| ());
+        }
+        copy_exact_payload_to_user_as(
+            stat_ptr,
+            &response.payload,
+            response.payload_len,
+            LINUX_STAT_SIZE,
+        )
+    })())
 }
 
 pub fn syscall_linux_vfs_readlinkat(
@@ -415,76 +356,46 @@ pub fn syscall_linux_vfs_readlinkat(
     user_ptr: u64,
     user_len: u64,
 ) -> u64 {
-    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    // `bufsiz` is a C `int` (sign-extended by `int_args`): zero or negative is
-    // EINVAL, not an empty success and not a huge buffer that faults.
-    if (user_len as i64) <= 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let Ok(user_len) = usize::try_from(user_len) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
-    let mut request = new_vfs_request(VFS_IPC_OP_READLINKAT);
-    proc_identity::attach_caller_exec_path(&mut request);
-    request.arg0 = user_len as u64;
-    if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
-        return linux_errno(errno);
-    }
-    let response = match call_pinned_remote_vfs_request(&request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_vfs_status(&response) {
-        return linux_errno(errno);
-    }
-    if let Some(resolved) = proc_identity::complete_readlink(response.aux) {
-        return match resolved {
-            Ok(target) => {
-                let bytes = target.as_bytes();
-                let len = bytes.len().min(user_len);
-                match usermem::write_current_user_bytes(user_ptr, &bytes[..len]) {
-                    Ok(()) => len as u64,
-                    Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-                }
-            }
-            Err(errno) => linux_errno(errno),
-        };
-    }
-    let len = (response.payload_len as usize).min(user_len);
-    match usermem::write_current_user_bytes(user_ptr, &response.payload[..len]) {
-        Ok(()) => len as u64,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-    }
+    linux_result((|| {
+        let path = copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY)?;
+        // `bufsiz` is a C `int` (sign-extended by `int_args`): zero or negative is
+        // EINVAL, not an empty success and not a huge buffer that faults.
+        if (user_len as i64) <= 0 {
+            return Err(LINUX_EINVAL);
+        }
+        let user_len = usize::try_from(user_len).map_err(|_| LINUX_EINVAL)?;
+        validate_user_write_as(user_ptr, user_len)?;
+        let mut request = new_vfs_request(VFS_IPC_OP_READLINKAT);
+        proc_identity::attach_caller_exec_path(&mut request);
+        request.arg0 = user_len as u64;
+        populate_vfs_path_base(&mut request, dirfd, &path)?;
+        let response = call_vfs_checked(&request)?;
+        if let Some(resolved) = proc_identity::complete_readlink(response.aux) {
+            let target = resolved?;
+            let bytes = target.as_bytes();
+            let len = bytes.len().min(user_len);
+            write_user_bytes_as(user_ptr, &bytes[..len])?;
+            return Ok(len as u64);
+        }
+        let len = (response.payload_len as usize).min(user_len);
+        write_user_bytes_as(user_ptr, &response.payload[..len])?;
+        Ok(len as u64)
+    })())
 }
 
 pub fn syscall_linux_vfs_access(dirfd: u64, path_ptr: u64, mode: u64, flags: u64) -> u64 {
-    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    let mut request = new_vfs_request(VFS_IPC_OP_ACCESS);
-    request.flags = flags as u32;
-    request.arg0 = mode;
-    if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
-        return linux_errno(errno);
-    }
-    let response = match call_pinned_remote_vfs_request(&request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_vfs_status(&response) {
-        return linux_errno(errno);
-    }
-    if let Some(result) = proc_identity::complete_access(response.aux, mode) {
-        return result;
-    }
-    0
+    linux_result((|| {
+        let path = copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY)?;
+        let mut request = new_vfs_request(VFS_IPC_OP_ACCESS);
+        request.flags = flags as u32;
+        request.arg0 = mode;
+        populate_vfs_path_base(&mut request, dirfd, &path)?;
+        let response = call_vfs_checked(&request)?;
+        if let Some(result) = proc_identity::complete_access(response.aux, mode) {
+            return super::vfs_socket::kernel_vfs_result(result);
+        }
+        Ok(0)
+    })())
 }
 
 pub fn current_memfd_handle(fd: u64) -> Option<multitask::MemfdHandle> {
@@ -564,10 +475,14 @@ pub fn memfd_error_to_linux_errno(err: multitask::MemfdError) -> i64 {
 /// character device `rdev` = `APP_BUFFER_STAT_RDEV`, `st_dev` = provider
 /// generation, `st_ino` = allocation id, `st_size` = capability length. These
 /// are kernel-synthesised from the held capability, never from a descriptor.
+fn write_stat_bytes_checked(user_ptr: u64, out: &[u8; LINUX_STAT_SIZE]) -> u64 {
+    linux_unit_result((|| {
+        validate_user_write_as(user_ptr, LINUX_STAT_SIZE)?;
+        write_user_bytes_as(user_ptr, out)
+    })())
+}
+
 fn write_device_buffer_stat(user_ptr: u64, buffer: &kernel_ps::api::handles::BufferCapability) -> u64 {
-    if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, LINUX_STAT_SIZE) {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
     let id = buffer.identity();
     let mut out = [0_u8; LINUX_STAT_SIZE];
     out[0..8].copy_from_slice(&id.owner.generation.to_ne_bytes());
@@ -577,16 +492,10 @@ fn write_device_buffer_stat(user_ptr: u64, buffer: &kernel_ps::api::handles::Buf
     out[40..48].copy_from_slice(&rustos_user_abi::syscall::APP_BUFFER_STAT_RDEV.to_ne_bytes());
     out[48..56].copy_from_slice(&(buffer.len() as i64).to_ne_bytes());
     out[56..64].copy_from_slice(&4096_i64.to_ne_bytes());
-    match usermem::write_current_user_bytes(user_ptr, &out) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-    }
+    write_stat_bytes_checked(user_ptr, &out)
 }
 
 fn write_bootstrap_stat(user_ptr: u64, inode: u64, len: u64) -> u64 {
-    if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, LINUX_STAT_SIZE) {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
     let mut out = [0_u8; LINUX_STAT_SIZE];
     out[8..16].copy_from_slice(&inode.max(1).to_ne_bytes());
     out[16..24].copy_from_slice(&1_u64.to_ne_bytes());
@@ -594,143 +503,85 @@ fn write_bootstrap_stat(user_ptr: u64, inode: u64, len: u64) -> u64 {
     out[48..56].copy_from_slice(&(len as i64).to_ne_bytes());
     out[56..64].copy_from_slice(&4096_i64.to_ne_bytes());
     out[64..72].copy_from_slice(&(len.div_ceil(512) as i64).to_ne_bytes());
-    match usermem::write_current_user_bytes(user_ptr, &out) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-    }
+    write_stat_bytes_checked(user_ptr, &out)
 }
 
 // RING3-MIGRATION-REFERENCE END: kernel-owned handle stat substrate.
 
 pub fn syscall_linux_vfs_getcwd(user_ptr: u64, user_len: u64) -> u64 {
-    let Ok(user_len) = usize::try_from(user_len) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if user_len == 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
-    let request = new_vfs_request(VFS_IPC_OP_GETCWD);
-    let response = match call_pinned_remote_vfs_request(&request) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
-    };
-    if let Err(errno) = ensure_vfs_status(&response) {
-        return linux_errno(errno);
-    }
-    let len = response.payload_len as usize;
-    if len.checked_add(1).is_none_or(|needed| needed > user_len) {
-        return linux_errno(LINUX_ERANGE);
-    }
-    if let Err(err) = usermem::write_current_user_bytes(user_ptr, &response.payload[..len]) {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
-    if let Err(err) = usermem::write_current_user_bytes(user_ptr + len as u64, &[0]) {
-        return linux_errno(address_space_error_to_linux_errno(err));
-    }
-    (len + 1) as u64
+    linux_result((|| {
+        let user_len = usize::try_from(user_len).map_err(|_| LINUX_EINVAL)?;
+        if user_len == 0 {
+            return Err(LINUX_EINVAL);
+        }
+        validate_user_write_as(user_ptr, user_len)?;
+        let response = call_vfs_checked(&new_vfs_request(VFS_IPC_OP_GETCWD))?;
+        let len = response.payload_len as usize;
+        if len.checked_add(1).is_none_or(|needed| needed > user_len) {
+            return Err(LINUX_ERANGE);
+        }
+        write_user_bytes_as(user_ptr, &response.payload[..len])?;
+        write_user_bytes_as(user_ptr + len as u64, &[0])?;
+        Ok((len + 1) as u64)
+    })())
 }
 
 pub fn syscall_linux_vfs_chdir(dirfd: u64, path_ptr: u64) -> u64 {
-    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    let mut request = new_vfs_request(VFS_IPC_OP_CHDIR);
-    if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
-        return linux_errno(errno);
-    }
-    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
-    {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_unit_result(call_vfs_path_status(VFS_IPC_OP_CHDIR, dirfd, path_ptr, |_| {}))
 }
 
 pub fn syscall_linux_vfs_mkdir(dirfd: u64, path_ptr: u64, mode: u64) -> u64 {
-    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    let mut request = new_vfs_request(VFS_IPC_OP_MKDIR);
-    request.arg0 = mode;
-    if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
-        return linux_errno(errno);
-    }
-    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
-    {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_unit_result(call_vfs_path_status(VFS_IPC_OP_MKDIR, dirfd, path_ptr, |request| {
+        request.arg0 = mode;
+    }))
 }
 
 pub fn syscall_linux_vfs_unlinkat(dirfd: u64, path_ptr: u64, flags: u64) -> u64 {
-    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    let mut request = new_vfs_request(VFS_IPC_OP_UNLINKAT);
-    request.flags = flags as u32;
-    if let Err(errno) = populate_vfs_path_base(&mut request, dirfd, &path) {
-        return linux_errno(errno);
-    }
-    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
-    {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_unit_result(call_vfs_path_status(VFS_IPC_OP_UNLINKAT, dirfd, path_ptr, |request| {
+        request.flags = flags as u32;
+    }))
 }
 
 pub(crate) fn kernel_vfs_unlink_path(path: &str, flags: u64) -> Result<(), i64> {
     let mut request = new_vfs_request(VFS_IPC_OP_UNLINKAT);
     request.flags = flags as u32;
     populate_vfs_path_base(&mut request, linux_abi::AT_FDCWD as u64, path)?;
-    let response = call_pinned_remote_vfs_request(&request)?;
-    ensure_vfs_status(&response)
+    call_vfs_status(&request)
 }
 
 pub fn syscall_linux_vfs_truncate(path_ptr: u64, len: u64) -> u64 {
-    if len > i64::MAX as u64 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    let mut open_req = new_vfs_request(VFS_IPC_OP_OPENAT);
-    open_req.arg0 = linux_abi::O_WRONLY as u64;
-    open_req.arg1 = 0;
-    open_req.arg3 = mint_service_object_id();
-    if let Err(errno) = populate_vfs_path_base(&mut open_req, linux_abi::AT_FDCWD as u64, &path) {
-        return linux_errno(errno);
-    }
-    let open_resp = match call_vfs_ipc_request(&open_req) {
-        Ok(resp) => resp,
-        Err(errno) => {
-            let _ = call_vfs_remote_close_bounded(open_req.arg3);
-            return linux_errno(errno);
+    linux_unit_result((|| {
+        if len > i64::MAX as u64 {
+            return Err(LINUX_EINVAL);
         }
-    };
-    if let Err(errno) = ensure_vfs_status(&open_resp) {
-        let _ = call_vfs_remote_close_bounded(open_req.arg3);
-        return linux_errno(errno);
-    }
-    let remote_id = open_resp.remote_id;
-    if remote_id == 0 || remote_id != open_req.arg3 {
-        let _ = call_vfs_remote_close_bounded(open_req.arg3);
-        return linux_errno(LINUX_EINVAL);
-    }
-    let mut trunc_req = new_vfs_request(VFS_IPC_OP_FTRUNCATE);
-    trunc_req.remote_id = remote_id;
-    trunc_req.arg0 = len;
-    let res = call_vfs_ipc_request(&trunc_req).and_then(|resp| ensure_vfs_status(&resp));
-    let _ = call_vfs_remote_close_bounded(remote_id);
-    match res {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+        let path = copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY)?;
+        let mut open_req = new_vfs_request(VFS_IPC_OP_OPENAT);
+        open_req.arg0 = linux_abi::O_WRONLY as u64;
+        open_req.arg1 = 0;
+        open_req.arg3 = mint_service_object_id();
+        populate_vfs_path_base(&mut open_req, linux_abi::AT_FDCWD as u64, &path)?;
+        let open_resp = match call_vfs_ipc_request(&open_req).and_then(|resp| {
+            ensure_vfs_status(&resp)?;
+            Ok(resp)
+        }) {
+            Ok(resp) => resp,
+            Err(errno) => {
+                let _ = call_vfs_remote_close_bounded(open_req.arg3);
+                return Err(errno);
+            }
+        };
+        let remote_id = open_resp.remote_id;
+        if remote_id == 0 || remote_id != open_req.arg3 {
+            let _ = call_vfs_remote_close_bounded(open_req.arg3);
+            return Err(LINUX_EINVAL);
+        }
+        let mut trunc_req = new_vfs_request(VFS_IPC_OP_FTRUNCATE);
+        trunc_req.remote_id = remote_id;
+        trunc_req.arg0 = len;
+        let res = call_vfs_ipc_request(&trunc_req).and_then(|resp| ensure_vfs_status(&resp));
+        let _ = call_vfs_remote_close_bounded(remote_id);
+        res
+    })())
 }
 
 pub(crate) fn kernel_vfs_renameat2(
@@ -778,18 +629,11 @@ pub fn syscall_linux_vfs_renameat2(
     newpath_ptr: u64,
     flags: u64,
 ) -> u64 {
-    let old_path = match copy_current_user_path(oldpath_ptr, VFS_IPC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    let new_path = match copy_current_user_path(newpath_ptr, VFS_IPC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    match kernel_vfs_renameat2(olddirfd, &old_path, newdirfd, &new_path, flags) {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_unit_result((|| {
+        let old_path = copy_current_user_path(oldpath_ptr, VFS_IPC_PATH_CAPACITY)?;
+        let new_path = copy_current_user_path(newpath_ptr, VFS_IPC_PATH_CAPACITY)?;
+        kernel_vfs_renameat2(olddirfd, &old_path, newdirfd, &new_path, flags)
+    })())
 }
 
 pub fn syscall_linux_vfs_symlinkat(
@@ -797,33 +641,29 @@ pub fn syscall_linux_vfs_symlinkat(
     newdirfd: u64,
     linkpath_ptr: u64,
 ) -> u64 {
-    let target = match copy_current_user_path(target_ptr, VFS_IPC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    let linkpath = match copy_current_user_path(linkpath_ptr, VFS_IPC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    let mut request = new_vfs_request(VFS_IPC_OP_SYMLINKAT);
-    request.dirfd = newdirfd;
-    request.remote_id = match resolve_vfs_dirfd_remote_id(newdirfd, &linkpath) {
-        Ok(id) => id,
-        Err(errno) => return linux_errno(errno),
-    };
-    let Some(encoded_len) = rustos_user_abi::syscall::encode_two_path_payload(
-        target.as_bytes(),
-        linkpath.as_bytes(),
-        &mut request.payload,
-    ) else {
-        return linux_errno(36 /* ENAMETOOLONG */);
-    };
-    request.payload_len = encoded_len as u32;
-    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
-    {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_unit_result((|| {
+        let target = copy_current_user_path(target_ptr, VFS_IPC_PATH_CAPACITY)?;
+        let linkpath = copy_current_user_path(linkpath_ptr, VFS_IPC_PATH_CAPACITY)?;
+        let mut request = new_vfs_request(VFS_IPC_OP_SYMLINKAT);
+        request.dirfd = newdirfd;
+        request.remote_id = resolve_vfs_dirfd_remote_id(newdirfd, &linkpath)?;
+        let encoded_len = rustos_user_abi::syscall::encode_two_path_payload(
+            target.as_bytes(),
+            linkpath.as_bytes(),
+            &mut request.payload,
+        )
+        .ok_or(36_i64 /* ENAMETOOLONG */)?;
+        request.payload_len = encoded_len as u32;
+        call_vfs_status(&request)
+    })())
+}
+
+fn decode_vfs_statfs_response(response: &VfsIpcResponse) -> Result<rustos_user_abi::syscall::VfsStatFsWire, i64> {
+    let bytes = response
+        .payload
+        .get(..response.payload_len as usize)
+        .ok_or(LINUX_EINVAL)?;
+    rustos_user_abi::syscall::VfsStatFsWire::from_bytes(bytes).ok_or(LINUX_EINVAL)
 }
 
 pub(crate) fn kernel_vfs_statfs_path(
@@ -832,13 +672,7 @@ pub(crate) fn kernel_vfs_statfs_path(
     let mut request = new_vfs_request(VFS_IPC_OP_STATFS);
     request.arg0 = 0;
     populate_vfs_path_base(&mut request, linux_abi::AT_FDCWD as u64, path)?;
-    let response = call_pinned_remote_vfs_request(&request)?;
-    ensure_vfs_status(&response)?;
-    let bytes = response
-        .payload
-        .get(..response.payload_len as usize)
-        .ok_or(LINUX_EINVAL)?;
-    rustos_user_abi::syscall::VfsStatFsWire::from_bytes(bytes).ok_or(LINUX_EINVAL)
+    decode_vfs_statfs_response(&call_vfs_checked(&request)?)
 }
 
 pub(crate) fn kernel_vfs_fstatfs(
@@ -849,13 +683,7 @@ pub(crate) fn kernel_vfs_fstatfs(
         request.arg0 = 1;
         request.fd = fd;
         request.remote_id = remote.remote_id();
-        let response = call_pinned_remote_vfs_request(&request)?;
-        ensure_vfs_status(&response)?;
-        let bytes = response
-            .payload
-            .get(..response.payload_len as usize)
-            .ok_or(LINUX_EINVAL)?;
-        return rustos_user_abi::syscall::VfsStatFsWire::from_bytes(bytes).ok_or(LINUX_EINVAL);
+        return decode_vfs_statfs_response(&call_vfs_checked(&request)?);
     }
     if current_fd_exists(fd) {
         return Ok(rustos_user_abi::syscall::VfsStatFsWire {
@@ -870,29 +698,18 @@ pub(crate) fn kernel_vfs_fstatfs(
 }
 
 pub fn syscall_linux_vfs_statfs(path_ptr: u64, buf_ptr: u64) -> u64 {
-    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    let wire = match kernel_vfs_statfs_path(&path) {
-        Ok(wire) => wire,
-        Err(errno) => return linux_errno(errno),
-    };
-    match usermem::write_current_user_bytes(buf_ptr, &wire.to_bytes()) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-    }
+    linux_unit_result((|| {
+        let path = copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY)?;
+        let wire = kernel_vfs_statfs_path(&path)?;
+        write_user_bytes_as(buf_ptr, &wire.to_bytes())
+    })())
 }
 
 pub fn syscall_linux_vfs_fstatfs(fd: u64, buf_ptr: u64) -> u64 {
-    let wire = match kernel_vfs_fstatfs(fd) {
-        Ok(wire) => wire,
-        Err(errno) => return linux_errno(errno),
-    };
-    match usermem::write_current_user_bytes(buf_ptr, &wire.to_bytes()) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-    }
+    linux_unit_result((|| {
+        let wire = kernel_vfs_fstatfs(fd)?;
+        write_user_bytes_as(buf_ptr, &wire.to_bytes())
+    })())
 }
 
 pub fn syscall_linux_vfs_mount(
@@ -901,28 +718,20 @@ pub fn syscall_linux_vfs_mount(
     _fstype_ptr: u64,
     flags: u64,
 ) -> u64 {
-    let path = match copy_current_user_path(target_ptr, VFS_IPC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    let mut request = new_vfs_request(VFS_IPC_OP_MOUNT);
-    request.flags = flags as u32;
-    if let Err(errno) = populate_vfs_path(&mut request, &path) {
-        return linux_errno(errno);
-    }
-    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
-    {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_unit_result((|| {
+        let path = copy_current_user_path(target_ptr, VFS_IPC_PATH_CAPACITY)?;
+        let mut request = new_vfs_request(VFS_IPC_OP_MOUNT);
+        request.flags = flags as u32;
+        populate_vfs_path(&mut request, &path)?;
+        call_vfs_status(&request)
+    })())
 }
 
 /// Copy the caller's wait request in, hold it in the console broker until the
 /// graph moves past the generation it presented, and copy the answer back.
 fn console_wait_graph(arg: u64) -> Result<u64, i64> {
     let mut request =
-        usermem::read_current_user_struct::<rustos_user_abi::console::ConsoleWaitGraphRequest>(arg)
-            .map_err(super::super::address_space_error_to_linux_errno)?;
+        read_user_struct_as::<rustos_user_abi::console::ConsoleWaitGraphRequest>(arg)?;
     if request.reserved != 0 {
         return Err(LINUX_EINVAL);
     }
@@ -930,26 +739,18 @@ fn console_wait_graph(arg: u64) -> Result<u64, i64> {
         request.generation,
         u64::from(request.wait_ms),
     )?;
-    usermem::write_current_user_struct(arg, &request)
-        .map_err(super::super::address_space_error_to_linux_errno)?;
+    write_user_struct_as(arg, &request)?;
     Ok(0)
 }
 
 pub fn syscall_linux_vfs_umount2(target_ptr: u64, flags: u64) -> u64 {
-    let path = match copy_current_user_path(target_ptr, VFS_IPC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    let mut request = new_vfs_request(VFS_IPC_OP_UMOUNT2);
-    request.flags = flags as u32;
-    if let Err(errno) = populate_vfs_path(&mut request, &path) {
-        return linux_errno(errno);
-    }
-    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response))
-    {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_unit_result((|| {
+        let path = copy_current_user_path(target_ptr, VFS_IPC_PATH_CAPACITY)?;
+        let mut request = new_vfs_request(VFS_IPC_OP_UMOUNT2);
+        request.flags = flags as u32;
+        populate_vfs_path(&mut request, &path)?;
+        call_vfs_status(&request)
+    })())
 }
 
 pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
@@ -1212,27 +1013,13 @@ pub(crate) fn kernel_netd_raw_socket_op(
     in_payload: &[u8],
     timeout_ms: Option<u64>,
 ) -> Result<(i64, Vec<u8>), i64> {
-    let mut request = NetdIpcRequest {
-        version: NETD_IPC_ABI_VERSION,
-        op,
-        arg0: fd,
-        arg1: args[0],
-        arg2: args[1],
-        arg3: args[2],
-        arg4: args[3],
-        arg5: args[4],
-        ..NetdIpcRequest::default()
-    };
-    if let Some(snapshot) = multitask::current_user_snapshot() {
-        request.pid = snapshot.process_id();
-        request.tid = snapshot.thread_id();
-    }
-    if let Some(security) = multitask::with_current_process_credentials(|security| security) {
-        request.uid = security.uid();
-        request.gid = security.gid();
-        request.euid = security.euid();
-        request.egid = security.egid();
-    }
+    let mut request = new_netd_request(op);
+    request.arg0 = fd;
+    request.arg1 = args[0];
+    request.arg2 = args[1];
+    request.arg3 = args[2];
+    request.arg4 = args[3];
+    request.arg5 = args[4];
     let _socket = populate_netd_socket_token(&mut request).ok_or(LINUX_ENOTSOCK)?;
     if in_payload.len() > NETD_IPC_PAYLOAD_CAPACITY {
         return Err(LINUX_EINVAL);
@@ -1413,29 +1200,15 @@ pub(super) fn netd_socket_write_bytes(
     });
     let mut operation = [0_u8; 16];
     nucleus_core::util::random::Random::new().fill_bytes(&mut operation);
-    let mut request = NetdIpcRequest {
-        version: NETD_IPC_ABI_VERSION,
-        op: SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
-        socket_token: snapshot.token(),
-        deadline_ns: netd_deadline_after_class(class, timeout),
-        operation_hi: u64::from_le_bytes(operation[..8].try_into().unwrap()),
-        operation_lo: u64::from_le_bytes(operation[8..].try_into().unwrap()),
-        arg0: fd,
-        status_flags: snapshot.status_flags,
-        ..NetdIpcRequest::default()
-    };
+    let mut request = new_netd_request(SYSCALL_OFFLOAD_OP_LINUX_SENDTO);
+    request.socket_token = snapshot.token();
+    request.deadline_ns = netd_deadline_after_class(class, timeout);
+    request.operation_hi = u64::from_le_bytes(operation[..8].try_into().unwrap());
+    request.operation_lo = u64::from_le_bytes(operation[8..].try_into().unwrap());
+    request.arg0 = fd;
+    request.status_flags = snapshot.status_flags;
     if request.operation_hi == 0 && request.operation_lo == 0 {
         request.operation_lo = 1;
-    }
-    if let Some(user) = multitask::current_user_snapshot() {
-        request.pid = user.process_id();
-        request.tid = user.thread_id();
-    }
-    if let Some(security) = multitask::with_current_process_credentials(|security| security) {
-        request.uid = security.uid();
-        request.gid = security.gid();
-        request.euid = security.euid();
-        request.egid = security.egid();
     }
     let chunk = if snapshot.uses_netd_message() {
         let max_dgram = NETD_IPC_PAYLOAD_CAPACITY
@@ -1485,27 +1258,13 @@ fn syscall_linux_net6_once(
     arg5: u64,
     timeout_ms: Option<u64>,
 ) -> u64 {
-    let mut request = NetdIpcRequest {
-        version: NETD_IPC_ABI_VERSION,
-        op,
-        arg0,
-        arg1,
-        arg2,
-        arg3,
-        arg4,
-        arg5,
-        ..NetdIpcRequest::default()
-    };
-    if let Some(snapshot) = multitask::current_user_snapshot() {
-        request.pid = snapshot.process_id();
-        request.tid = snapshot.thread_id();
-    }
-    if let Some(security) = multitask::with_current_process_credentials(|security| security) {
-        request.uid = security.uid();
-        request.gid = security.gid();
-        request.euid = security.euid();
-        request.egid = security.egid();
-    }
+    let mut request = new_netd_request(op);
+    request.arg0 = arg0;
+    request.arg1 = arg1;
+    request.arg2 = arg2;
+    request.arg3 = arg3;
+    request.arg4 = arg4;
+    request.arg5 = arg5;
     let socket_snapshot = populate_netd_socket_token(&mut request);
     let io_flags = match op {
         SYSCALL_OFFLOAD_OP_LINUX_SENDMSG | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => arg2,
@@ -1926,8 +1685,7 @@ fn consume_netd_response_payload(
                 return Err(LINUX_EINVAL);
             }
             if payload_len != 0 {
-                usermem::write_current_user_bytes(request.arg1, &response.payload[..payload_len])
-                    .map_err(address_space_error_to_linux_errno)?;
+                write_user_bytes_as(request.arg1, &response.payload[..payload_len])?;
             }
             if socket.is_some_and(SocketSnapshot::is_netlink) && request.arg4 != 0 {
                 write_current_sockaddr_payload(request.arg4, request.arg5, &netlink_kernel_address())?;
@@ -1936,14 +1694,12 @@ fn consume_netd_response_payload(
                 // (`addrlen = 0`, as Linux does for connected stream sockets)
                 // instead of leaving the caller's stale length in place. The
                 // bytes were already dequeued, so a bad pointer is not an error.
-                let _ = usermem::write_current_user_struct(request.arg5, &0_u32);
+                let _ = write_user_struct_as(request.arg5, &0_u32);
             }
             Ok(())
         }
         SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => {
-            let mut header =
-                usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(request.arg1)
-                    .map_err(address_space_error_to_linux_errno)?;
+            let mut header: linux_abi::LinuxMsghdr = read_user_struct_as(request.arg1)?;
             if payload_len < NETD_RECVMSG_PAYLOAD_HEADER_SIZE {
                 return Err(LINUX_EINVAL);
             }
@@ -1981,8 +1737,7 @@ fn consume_netd_response_payload(
                 let address = netlink_kernel_address();
                 let len = (header.msg_namelen as usize).min(address.len());
                 if len != 0 {
-                    usermem::write_current_user_bytes(header.msg_name, &address[..len])
-                        .map_err(address_space_error_to_linux_errno)?;
+                    write_user_bytes_as(header.msg_name, &address[..len])?;
                 }
                 header.msg_namelen = address.len() as u32;
             } else {
@@ -1990,9 +1745,7 @@ fn consume_netd_response_payload(
             }
             header.msg_controllen = 0;
             header.msg_flags = msg_flags;
-            usermem::write_current_user_struct(request.arg1, &header)
-                .map_err(address_space_error_to_linux_errno)?;
-            Ok(())
+            write_user_struct_as(request.arg1, &header)
         }
         // Prepared socket publication copied accept outputs before
         // committing the invisible descriptor reservations. Never copy twice.
@@ -2021,8 +1774,7 @@ fn read_optional_user_sockaddr(ptr: u64, len: u64) -> Result<Vec<u8>, i64> {
         return Err(LINUX_EINVAL);
     }
     let mut addr = alloc::vec![0_u8; len];
-    usermem::copy_from_current_user_exact(ptr, &mut addr)
-        .map_err(address_space_error_to_linux_errno)?;
+    read_user_bytes_as(ptr, &mut addr)?;
     Ok(addr)
 }
 
@@ -2044,13 +1796,11 @@ fn populate_netd_msg_dgram_send(
         }
         let mut bytes = alloc::vec![0_u8; total];
         if total != 0 {
-            usermem::copy_from_current_user_exact(request.arg1, &mut bytes)
-                .map_err(address_space_error_to_linux_errno)?;
+            read_user_bytes_as(request.arg1, &mut bytes)?;
         }
         (bytes, addr)
     } else {
-        let header = usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(request.arg1)
-            .map_err(address_space_error_to_linux_errno)?;
+        let header: linux_abi::LinuxMsghdr = read_user_struct_as(request.arg1)?;
         let addr = read_optional_user_sockaddr(header.msg_name, u64::from(header.msg_namelen))?;
         let iovecs = read_current_iovecs_payload(header.msg_iov, header.msg_iovlen)?;
         let total = iovec_payload_total_len(&iovecs)?;
@@ -2086,27 +1836,24 @@ fn consume_netd_msg_dgram_receive(
             return Err(LINUX_EINVAL);
         }
         if !message.data.is_empty() {
-            usermem::write_current_user_bytes(request.arg1, message.data)
-                .map_err(address_space_error_to_linux_errno)?;
+            write_user_bytes_as(request.arg1, message.data)?;
         }
         if request.arg4 != 0 && request.arg5 != 0 {
             if message.address.is_empty() {
-                let _ = usermem::write_current_user_struct(request.arg5, &0_u32);
+                let _ = write_user_struct_as(request.arg5, &0_u32);
             } else {
                 write_current_sockaddr_payload(request.arg4, request.arg5, message.address)?;
             }
         }
         return Ok(());
     }
-    let mut header = usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(request.arg1)
-        .map_err(address_space_error_to_linux_errno)?;
+    let mut header: linux_abi::LinuxMsghdr = read_user_struct_as(request.arg1)?;
     let iovecs = read_current_iovecs_payload(header.msg_iov, header.msg_iovlen)?;
     write_current_iovec_payload(&iovecs, message.data)?;
     if header.msg_name != 0 {
         let copy_len = (header.msg_namelen as usize).min(message.address.len());
         if copy_len != 0 {
-            usermem::write_current_user_bytes(header.msg_name, &message.address[..copy_len])
-                .map_err(address_space_error_to_linux_errno)?;
+            write_user_bytes_as(header.msg_name, &message.address[..copy_len])?;
         }
         header.msg_namelen = message.address.len() as u32;
     } else {
@@ -2117,9 +1864,7 @@ fn consume_netd_msg_dgram_receive(
     }
     header.msg_controllen = 0;
     header.msg_flags = message.flags;
-    usermem::write_current_user_struct(request.arg1, &header)
-        .map_err(address_space_error_to_linux_errno)?;
-    Ok(())
+    write_user_struct_as(request.arg1, &header)
 }
 
 pub(super) fn consume_netd_release_payload(response: &mut NetdIpcResponse) -> Result<(), i64> {
@@ -2181,10 +1926,9 @@ pub(super) fn read_current_iovecs_payload(
             .checked_mul(size_of::<linux_abi::LinuxIovec>())
             .and_then(|value| u64::try_from(value).ok())
             .ok_or(LINUX_EINVAL)?;
-        let iov = usermem::read_current_user_struct::<linux_abi::LinuxIovec>(
+        let iov = read_user_struct_as::<linux_abi::LinuxIovec>(
             iov_ptr.checked_add(offset).ok_or(LINUX_EFAULT)?,
-        )
-            .map_err(address_space_error_to_linux_errno)?;
+        )?;
         iovecs.push(iov);
     }
     Ok(iovecs)
@@ -2207,8 +1951,7 @@ fn write_current_iovec_payload(iovecs: &[linux_abi::LinuxIovec], bytes: &[u8]) -
         }
         let len = usize::try_from(iov.iov_len).map_err(|_| LINUX_EINVAL)?;
         let chunk_len = len.min(bytes.len() - written);
-        usermem::write_current_user_bytes(iov.iov_base, &bytes[written..written + chunk_len])
-            .map_err(address_space_error_to_linux_errno)?;
+        write_user_bytes_as(iov.iov_base, &bytes[written..written + chunk_len])?;
         written += chunk_len;
     }
     Ok(())
@@ -2230,13 +1973,11 @@ pub(super) fn write_current_sockaddr_payload(addr_ptr: u64, len_ptr: u64, payloa
         };
     }
     if addr_ptr != 0 && !payload.is_empty() {
-        let capacity = usermem::read_current_user_struct::<u32>(len_ptr)
-            .map_err(address_space_error_to_linux_errno)? as usize;
-        usermem::write_current_user_bytes(addr_ptr, &payload[..capacity.min(payload.len())])
-            .map_err(address_space_error_to_linux_errno)?;
+        let capacity = read_user_struct_as::<u32>(len_ptr)? as usize;
+        write_user_bytes_as(addr_ptr, &payload[..capacity.min(payload.len())])?;
     }
     let len = payload.len() as u32;
-    usermem::write_current_user_struct(len_ptr, &len).map_err(address_space_error_to_linux_errno)
+    write_user_struct_as(len_ptr, &len)
 }
 
 fn write_current_sockopt_payload(
@@ -2247,8 +1988,7 @@ fn write_current_sockopt_payload(
     if optval_ptr == 0 || optlen_ptr == 0 {
         return Err(LINUX_EINVAL);
     }
-    let capacity = usermem::read_current_user_struct::<u32>(optlen_ptr)
-        .map_err(address_space_error_to_linux_errno)? as usize;
+    let capacity = read_user_struct_as::<u32>(optlen_ptr)? as usize;
     // Linux truncates an int-valued option to the caller's `optlen`
     // (`SO_ERROR` read through a 1-byte buffer); structured options with a
     // short buffer stay `EINVAL`.
@@ -2259,10 +1999,9 @@ fn write_current_sockopt_payload(
     } else {
         return Err(LINUX_EINVAL);
     };
-    usermem::write_current_user_bytes(optval_ptr, payload)
-        .map_err(address_space_error_to_linux_errno)?;
+    write_user_bytes_as(optval_ptr, payload)?;
     let len = payload.len() as u32;
-    usermem::write_current_user_struct(optlen_ptr, &len).map_err(address_space_error_to_linux_errno)
+    write_user_struct_as(optlen_ptr, &len)
 }
 
 #[cfg(test)]

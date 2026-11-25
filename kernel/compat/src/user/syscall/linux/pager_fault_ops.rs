@@ -149,55 +149,39 @@ fn wait_for_dispatch(
 /// a bounded atomic table only after its scheduler wait is armed; exception
 /// ingress can therefore wake or hand off to it without generic IPC state.
 pub(super) fn syscall_linux_rustos_pager_fault_wait(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(ServiceCapability::PagerPolicy) {
-        return linux_errno(LINUX_EPERM);
-    }
-    let args = match usermem::read_current_user_struct::<RustosPagerFaultWaitArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
-    };
-    if args.abi_version != PAGER_FAULT_RENDEZVOUS_ABI_VERSION
-        || args.flags != 0
-        || args.reserved0 != 0
-        || args.dispatch_out == 0
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let Some(pager_task_id) = ps_api::current_task_id() else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    let Some(endpoint) = current_pager_endpoint() else {
-        return linux_errno(LINUX_ENODEV);
-    };
-    wait_for_dispatch(pager_task_id, endpoint, args.dispatch_out)
+    linux_result((|| {
+        let args: RustosPagerFaultWaitArgs =
+            require_capability_and_read_args(ServiceCapability::PagerPolicy, args_ptr)?;
+        if args.abi_version != PAGER_FAULT_RENDEZVOUS_ABI_VERSION
+            || args.flags != 0
+            || args.reserved0 != 0
+            || args.dispatch_out == 0
+        {
+            return Err(LINUX_EINVAL);
+        }
+        let pager_task_id = ps_api::current_task_id().ok_or(LINUX_EINVAL)?;
+        let endpoint = current_pager_endpoint().ok_or(LINUX_ENODEV)?;
+        Ok(wait_for_dispatch(pager_task_id, endpoint, args.dispatch_out))
+    })())
 }
 
 /// Complete one worker-bound pager-fault dispatch. Mapping remains in the
 /// kernel's opaque-frame primitive, while VMA and access policy have already
 /// been decided by pagerd when it formed this reply.
 pub(super) fn syscall_linux_rustos_pager_fault_reply(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(ServiceCapability::PagerPolicy) {
-        return linux_errno(LINUX_EPERM);
-    }
-    let args = match usermem::read_current_user_struct::<RustosPagerFaultReplyArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(error) => return linux_errno(user_pointer_error_to_linux_errno(error)),
-    };
-    if args.abi_version != PAGER_FAULT_RENDEZVOUS_ABI_VERSION
-        || args.flags != 0
-        || args.reserved0 != 0
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let Some(pager_task_id) = ps_api::current_task_id() else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    let reservation = match ps_api::pager_fault_snapshot(args.reply.fault_token) {
-        Ok(reservation) => reservation,
-        Err(error) => return pager_rendezvous_errno(error),
-    };
-    match crate::pager::adopt_rendezvous_reply(reservation, args.reply, pager_task_id) {
-        Ok(()) => 0,
-        Err(error) => pager_rendezvous_errno(error),
-    }
+    linux_unit_result((|| {
+        let args: RustosPagerFaultReplyArgs =
+            require_capability_and_read_args(ServiceCapability::PagerPolicy, args_ptr)?;
+        if args.abi_version != PAGER_FAULT_RENDEZVOUS_ABI_VERSION
+            || args.flags != 0
+            || args.reserved0 != 0
+        {
+            return Err(LINUX_EINVAL);
+        }
+        let pager_task_id = ps_api::current_task_id().ok_or(LINUX_EINVAL)?;
+        let reservation = ps_api::pager_fault_snapshot(args.reply.fault_token)
+            .map_err(|error| -(pager_rendezvous_errno(error) as i64))?;
+        crate::pager::adopt_rendezvous_reply(reservation, args.reply, pager_task_id)
+            .map_err(|error| -(pager_rendezvous_errno(error) as i64))
+    })())
 }

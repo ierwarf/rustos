@@ -32,56 +32,41 @@ static SCHEDULING_CONTEXT_GRANTS: TrackedSpinLock<
 > = TrackedSpinLock::new(FnvIndexMap::new());
 
 pub(super) fn grant(args_ptr: u64) -> u64 {
-    let Some(rootd) = multitask::current_user_process_identity() else {
-        return linux_errno(LINUX_EPERM);
-    };
-    let Some((rootd_owner, rootd_epoch)) =
-        ipc_ops::live_service_endpoint_owner_and_epoch(IPC_SERVICE_ROOTD)
-    else {
-        return linux_errno(LINUX_EPERM);
-    };
-    if rootd.process_id() != rootd_owner {
-        return linux_errno(LINUX_EPERM);
-    }
-    let args =
-        match usermem::read_current_user_struct::<RustosSchedulingContextGrantBrokerArgs>(args_ptr)
+    linux_result((|| {
+        let rootd = multitask::current_user_process_identity().ok_or(LINUX_EPERM)?;
+        let (rootd_owner, rootd_epoch) =
+            ipc_ops::live_service_endpoint_owner_and_epoch(IPC_SERVICE_ROOTD)
+                .ok_or(LINUX_EPERM)?;
+        if rootd.process_id() != rootd_owner {
+            return Err(LINUX_EPERM);
+        }
+        let args: RustosSchedulingContextGrantBrokerArgs = read_user_struct_as(args_ptr)?;
+        if args.abi_version != SCHEDULING_CONTEXT_POLICY_ABI_VERSION
+            || args.reserved0 != 0
+            || args.flags != 0
+            || args.requester_pid == 0
+            || !args.policy.is_canonical()
         {
-            Ok(args) => args,
-            Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+            return Err(LINUX_EINVAL);
+        }
+        let requester =
+            multitask::live_user_process_identity_by_pid(args.requester_pid).ok_or(LINUX_ESRCH)?;
+        let exec_path = read_user_text(args.exec_path_ptr, args.exec_path_len)?;
+        let mut grants = SCHEDULING_CONTEXT_GRANTS.lock();
+        if grants.len() >= MAX_SCHEDULING_CONTEXT_GRANTS {
+            return Err(LINUX_EAGAIN);
+        }
+        let token = allocate_token(&grants).ok_or(LINUX_EOVERFLOW)?;
+        let grant = SchedulingContextGrant {
+            rootd,
+            rootd_epoch,
+            requester,
+            exec_path,
+            policy: args.policy,
         };
-    if args.abi_version != SCHEDULING_CONTEXT_POLICY_ABI_VERSION
-        || args.reserved0 != 0
-        || args.flags != 0
-        || args.requester_pid == 0
-        || !args.policy.is_canonical()
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let Some(requester) = multitask::live_user_process_identity_by_pid(args.requester_pid) else {
-        return linux_errno(LINUX_ESRCH);
-    };
-    let exec_path = match read_user_text(args.exec_path_ptr, args.exec_path_len) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    let mut grants = SCHEDULING_CONTEXT_GRANTS.lock();
-    if grants.len() >= MAX_SCHEDULING_CONTEXT_GRANTS {
-        return linux_errno(LINUX_EAGAIN);
-    }
-    let Some(token) = allocate_token(&grants) else {
-        return linux_errno(LINUX_EOVERFLOW);
-    };
-    let grant = SchedulingContextGrant {
-        rootd,
-        rootd_epoch,
-        requester,
-        exec_path,
-        policy: args.policy,
-    };
-    if grants.insert(token, grant).is_err() {
-        return linux_errno(LINUX_EAGAIN);
-    }
-    token
+        grants.insert(token, grant).map_err(|_| LINUX_EAGAIN)?;
+        Ok(token)
+    })())
 }
 
 pub(super) fn consume(

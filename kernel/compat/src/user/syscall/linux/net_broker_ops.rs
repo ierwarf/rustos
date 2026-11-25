@@ -9,22 +9,14 @@ use rustos_user_abi::syscall::{
 };
 
 pub(super) fn syscall_linux_rustos_net_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(ServiceCapability::NetPolicy) {
-        return linux_errno(LINUX_EPERM);
-    }
-
-    let args = match usermem::read_current_user_struct::<RustosNetBrokerArgs>(args_ptr) {
-        Ok(args) => args,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    if args.process_id == 0 || args.reserved0 != 0 || args.reserved1 != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-
-    match dispatch_net_broker(&args) {
-        Ok(value) => value,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_result((|| {
+        let args: RustosNetBrokerArgs =
+            require_capability_and_read_args(ServiceCapability::NetPolicy, args_ptr)?;
+        if args.process_id == 0 || args.reserved0 != 0 || args.reserved1 != 0 {
+            return Err(LINUX_EINVAL);
+        }
+        dispatch_net_broker(&args)
+    })())
 }
 
 fn dispatch_net_broker(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
@@ -166,8 +158,7 @@ fn broker_packet_tx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
         return Ok(0);
     }
     let mut frame = [0_u8; kernel_io_manager::api::network::PACKET_MTU];
-    usermem::copy_from_current_user_exact(args.arg0, &mut frame[..len])
-        .map_err(user_pointer_error_to_linux_errno)?;
+    read_user_bytes(args.arg0, &mut frame[..len])?;
     kernel_io_manager::api::network::transmit_frame(&frame[..len], packet_authority()?)
         .map(|count| count as u64)
         .map_err(packet_error_to_linux_errno)
@@ -179,14 +170,12 @@ fn broker_packet_rx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
         return Err(LINUX_EINVAL);
     }
     // receive_frame dequeues; refuse a bad destination before the frame is lost.
-    usermem::validate_current_user_write_buffer(args.arg0, cap)
-        .map_err(user_pointer_error_to_linux_errno)?;
+    validate_user_write(args.arg0, cap)?;
     let mut frame = [0_u8; kernel_io_manager::api::network::PACKET_MTU];
     let count = kernel_io_manager::api::network::receive_frame(&mut frame[..cap], packet_authority()?)
         .map_err(packet_error_to_linux_errno)?;
     let received = frame.get(..count).ok_or(LINUX_EIO)?;
-    usermem::write_current_user_bytes(args.arg0, received)
-        .map_err(user_pointer_error_to_linux_errno)?;
+    write_user_bytes(args.arg0, received)?;
     Ok(count as u64)
 }
 

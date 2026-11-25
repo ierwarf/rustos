@@ -109,71 +109,62 @@ fn product_milestone_name(milestone: u64) -> Option<(&'static str, bool)> {
 }
 
 pub(super) fn syscall_linux_rustos_product_milestone(milestone: u64, arg0: u64, arg1: u64) -> u64 {
-    let Some((name, requires_nonzero_arg0)) = product_milestone_name(milestone) else {
-        return linux_errno(LINUX_EINVAL);
-    };
-    if requires_nonzero_arg0 && arg0 == 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
-    let qualification_phase = matches!(
-        milestone,
-        linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_READY
-            | linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_START
-            | linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_FINISH
-            | linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_COMPLETE
-            | linux_abi::PRODUCT_MILESTONE_HECS_REGISTERS
-    );
-    let recorded_arg1 = if qualification_phase {
-        match admit_smp_qualification_milestone(milestone, arg0, arg1, current_cpu) {
-            Ok(encoded_work) => encoded_work,
-            Err(errno) => return linux_errno(errno),
+    linux_unit_result((|| {
+        let (name, requires_nonzero_arg0) = product_milestone_name(milestone).ok_or(LINUX_EINVAL)?;
+        if requires_nonzero_arg0 && arg0 == 0 {
+            return Err(LINUX_EINVAL);
         }
-    } else {
-        arg1
-    };
-    // The binding lock was released by admission before emitting debug output.
-    // Ring3 supplies the naked work word; only ring0 emits the binding-stamped
-    // evidence word consumed by the host qualification validator.
-    debug::record_milestone(debug::LogCategory::Compat, name, arg0, recorded_arg1);
-    0
+        let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
+        let qualification_phase = matches!(
+            milestone,
+            linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_READY
+                | linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_START
+                | linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_FINISH
+                | linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_COMPLETE
+                | linux_abi::PRODUCT_MILESTONE_HECS_REGISTERS
+        );
+        let recorded_arg1 = if qualification_phase {
+            admit_smp_qualification_milestone(milestone, arg0, arg1, current_cpu)?
+        } else {
+            arg1
+        };
+        // The binding lock was released by admission before emitting debug output.
+        // Ring3 supplies the naked work word; only ring0 emits the binding-stamped
+        // evidence word consumed by the host qualification validator.
+        debug::record_milestone(debug::LogCategory::Compat, name, arg0, recorded_arg1);
+        Ok(())
+    })())
 }
 
 /// Accept the product executable witness only from the live Vfsd endpoint.
 /// The service cannot supply its identity or endpoint generation: ring0 binds
 /// both at publication time, so a restarted Vfsd cannot forge continuity.
 pub(super) fn syscall_linux_rustos_product_executable_snapshot_evidence(args_ptr: u64) -> u64 {
-    let evidence = match usermem::read_current_user_struct::<ProductSnapshotEvidenceWire>(args_ptr)
-    {
-        Ok(evidence) => evidence,
-        Err(err) => return linux_errno(user_pointer_error_to_linux_errno(err)),
-    };
-    if !product_executable_snapshot_evidence_shape_valid(&evidence) {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let Some(process_id) = multitask::current_user_process_id() else {
-        return linux_errno(LINUX_EPERM);
-    };
-    let Some((owner_process_id, provider_generation)) =
-        ipc_ops::live_service_endpoint_owner_and_epoch(linux_abi::IPC_SERVICE_VFSD)
-    else {
-        return linux_errno(LINUX_EPERM);
-    };
-    if owner_process_id != process_id {
-        return linux_errno(LINUX_EPERM);
-    }
-    debug::record_product_executable_snapshot_evidence(
-        evidence.file_bytes,
-        debug::product_snapshot_evidence::ProductExecutableSnapshotEvidence {
-            provider_service_id: linux_abi::IPC_SERVICE_VFSD,
-            provider_generation,
-            storage_epoch: evidence.storage_epoch,
-            mount_generation: evidence.mount_generation,
-            request_id: evidence.request_id,
-            digest: evidence.digest,
-        },
-    );
-    0
+    linux_unit_result((|| {
+        let evidence: ProductSnapshotEvidenceWire = read_user_struct(args_ptr)?;
+        if !product_executable_snapshot_evidence_shape_valid(&evidence) {
+            return Err(LINUX_EINVAL);
+        }
+        let process_id = multitask::current_user_process_id().ok_or(LINUX_EPERM)?;
+        let (owner_process_id, provider_generation) =
+            ipc_ops::live_service_endpoint_owner_and_epoch(linux_abi::IPC_SERVICE_VFSD)
+                .ok_or(LINUX_EPERM)?;
+        if owner_process_id != process_id {
+            return Err(LINUX_EPERM);
+        }
+        debug::record_product_executable_snapshot_evidence(
+            evidence.file_bytes,
+            debug::product_snapshot_evidence::ProductExecutableSnapshotEvidence {
+                provider_service_id: linux_abi::IPC_SERVICE_VFSD,
+                provider_generation,
+                storage_epoch: evidence.storage_epoch,
+                mount_generation: evidence.mount_generation,
+                request_id: evidence.request_id,
+                digest: evidence.digest,
+            },
+        );
+        Ok(())
+    })())
 }
 
 /// Flushes the IPC-call and user-copy phase profiles immediately instead of

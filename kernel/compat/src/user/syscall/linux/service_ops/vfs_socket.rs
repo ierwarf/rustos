@@ -224,14 +224,10 @@ fn release_remote_vfs_descriptor_ref(remote_id: u64) -> Result<bool, i64> {
 }
 
 pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64) -> u64 {
-    let path = match copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    match syscall_linux_vfs_openat_str(dirfd, path.as_str(), flags, mode) {
-        Ok(fd) => fd,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_result((|| {
+        let path = copy_current_user_path(path_ptr, VFS_IPC_PATH_CAPACITY)?;
+        syscall_linux_vfs_openat_str(dirfd, path.as_str(), flags, mode)
+    })())
 }
 
 pub fn syscall_linux_vfs_openat_str(
@@ -2001,10 +1997,8 @@ fn write_remote_vfs(
             request.flags |= VFS_WRITE_FLAG_CURSOR_SYNC;
             request.arg0 = remote.cursor();
         }
-        if let Err(err) =
-            usermem::copy_from_current_user_exact(user_ptr, &mut request.payload[..chunk_len])
-        {
-            return linux_errno(address_space_error_to_linux_errno(err));
+        if let Err(errno) = read_user_bytes_as(user_ptr, &mut request.payload[..chunk_len]) {
+            return linux_errno(errno);
         }
         match call_vfs_ipc_request(&request).and_then(|response| {
             ensure_vfs_status(&response)?;
@@ -2053,11 +2047,11 @@ fn vectored_io_at(
                 total
             };
         };
-        let iov = match usermem::read_current_user_struct::<linux_abi::LinuxIovec>(entry_ptr) {
+        let iov = match read_user_struct_as::<linux_abi::LinuxIovec>(entry_ptr) {
             Ok(iov) => iov,
-            Err(err) => {
+            Err(errno) => {
                 return if total == 0 {
-                    linux_errno(address_space_error_to_linux_errno(err))
+                    linux_errno(errno)
                 } else {
                     total
                 };
@@ -2125,27 +2119,13 @@ fn current_socket_fd(fd: u64) -> bool {
 fn new_netd_socket_request(op: u16, socket_token: u64, deadline_ns: u64) -> NetdIpcRequest {
     let mut operation = [0_u8; 16];
     nucleus_core::util::random::Random::new().fill_bytes(&mut operation);
-    let mut request = NetdIpcRequest {
-        version: NETD_IPC_ABI_VERSION,
-        op,
-        socket_token,
-        deadline_ns,
-        operation_hi: u64::from_le_bytes(operation[..8].try_into().unwrap()),
-        operation_lo: u64::from_le_bytes(operation[8..].try_into().unwrap()),
-        ..NetdIpcRequest::default()
-    };
+    let mut request = new_netd_request(op);
+    request.socket_token = socket_token;
+    request.deadline_ns = deadline_ns;
+    request.operation_hi = u64::from_le_bytes(operation[..8].try_into().unwrap());
+    request.operation_lo = u64::from_le_bytes(operation[8..].try_into().unwrap());
     if request.operation_hi == 0 && request.operation_lo == 0 {
         request.operation_lo = 1;
-    }
-    if let Some(snapshot) = multitask::current_user_snapshot() {
-        request.pid = snapshot.process_id();
-        request.tid = snapshot.thread_id();
-    }
-    if let Some(security) = multitask::with_current_process_credentials(|security| security) {
-        request.uid = security.uid();
-        request.gid = security.gid();
-        request.euid = security.euid();
-        request.egid = security.egid();
     }
     request
 }
@@ -2674,104 +2654,79 @@ pub fn syscall_linux_inotify_init() -> u64 {
 }
 
 pub fn syscall_linux_inotify_init1(flags: u64) -> u64 {
-    if flags & !(linux_abi::IN_NONBLOCK | linux_abi::IN_CLOEXEC) != 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let mut request = new_vfs_request(VFS_IPC_OP_INOTIFY_INIT);
-    request.arg0 = flags;
-    request.arg3 = mint_service_object_id();
-    let response = match call_pinned_remote_vfs_request(&request) {
-        Ok(response) => response,
-        Err(errno) => {
-            let _ = call_vfs_remote_close_bounded(request.arg3);
-            return linux_errno(errno);
+    linux_result((|| {
+        if flags & !(linux_abi::IN_NONBLOCK | linux_abi::IN_CLOEXEC) != 0 {
+            return Err(LINUX_EINVAL);
         }
+        let mut request = new_vfs_request(VFS_IPC_OP_INOTIFY_INIT);
+        request.arg0 = flags;
+        request.arg3 = mint_service_object_id();
+        let response = match call_vfs_checked(&request) {
+            Ok(response) => response,
+            Err(errno) => {
+                let _ = call_vfs_remote_close_bounded(request.arg3);
+                return Err(errno);
+            }
+        };
+        let open_flags = linux_abi::O_RDONLY | (flags & (linux_abi::O_NONBLOCK | linux_abi::O_CLOEXEC));
+        install_remote_vfs_response(response, request.arg3, open_flags, false)
+    })())
+}
+
+fn current_inotify_handle(fd: u64) -> LinuxResult<multitask::RemoteVfsHandle> {
+    let Some(remote) = current_remote_vfs_handle(fd) else {
+        return Err(if current_fd_exists(fd) { LINUX_EINVAL } else { LINUX_EBADF });
     };
-    if let Err(errno) = ensure_vfs_status(&response) {
-        let _ = call_vfs_remote_close_bounded(request.arg3);
-        return linux_errno(errno);
+    if remote.kind() != multitask::RemoteVfsHandleKind::Inotify {
+        return Err(LINUX_EINVAL);
     }
-    let open_flags = linux_abi::O_RDONLY | (flags & (linux_abi::O_NONBLOCK | linux_abi::O_CLOEXEC));
-    match install_remote_vfs_response(response, request.arg3, open_flags, false) {
-        Ok(fd) => fd,
-        Err(errno) => linux_errno(errno),
-    }
+    Ok(remote)
 }
 
 pub fn syscall_linux_inotify_add_watch(fd: u64, pathname: u64, mask: u64) -> u64 {
-    let Some(remote) = current_remote_vfs_handle(fd) else {
-        let exists = multitask::with_current_user_process_state(|_, _, process_state| {
-            process_state.handles().get(fd).is_some()
-        })
-        .unwrap_or(false);
-        return linux_errno(if exists { LINUX_EINVAL } else { LINUX_EBADF });
-    };
-    if remote.kind() != multitask::RemoteVfsHandleKind::Inotify {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let mask_u32 = mask as u32;
-    if (mask_u32 & (linux_abi::IN_MASK_ADD | linux_abi::IN_MASK_CREATE))
-        == (linux_abi::IN_MASK_ADD | linux_abi::IN_MASK_CREATE)
-    {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let allowed = linux_abi::IN_ALL_EVENTS
-        | linux_abi::IN_UNMOUNT
-        | linux_abi::IN_Q_OVERFLOW
-        | linux_abi::IN_IGNORED
-        | linux_abi::IN_ONLYDIR
-        | linux_abi::IN_DONT_FOLLOW
-        | linux_abi::IN_EXCL_UNLINK
-        | linux_abi::IN_MASK_CREATE
-        | linux_abi::IN_MASK_ADD
-        | linux_abi::IN_ISDIR
-        | linux_abi::IN_ONESHOT;
-    if mask_u32 & !allowed != 0 || mask_u32 & linux_abi::IN_ALL_EVENTS == 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let path = match copy_current_user_path(pathname, VFS_IPC_PATH_CAPACITY) {
-        Ok(path) => path,
-        Err(errno) => return linux_errno(errno),
-    };
-    let mut request = new_vfs_request(VFS_IPC_OP_INOTIFY_ADD_WATCH);
-    request.fd = fd;
-    request.remote_id = remote.remote_id();
-    request.arg0 = u64::from(mask_u32);
-    if let Err(errno) = populate_vfs_path_base(&mut request, linux_abi::AT_FDCWD as u64, &path) {
-        return linux_errno(errno);
-    }
-    match call_pinned_remote_vfs_request(&request).and_then(|response| {
-        ensure_vfs_status(&response)?;
-        Ok(response.value)
-    }) {
-        Ok(wd) => wd,
-        Err(errno) => linux_errno(errno),
-    }
+    linux_result((|| {
+        let remote = current_inotify_handle(fd)?;
+        let mask_u32 = mask as u32;
+        if (mask_u32 & (linux_abi::IN_MASK_ADD | linux_abi::IN_MASK_CREATE))
+            == (linux_abi::IN_MASK_ADD | linux_abi::IN_MASK_CREATE)
+        {
+            return Err(LINUX_EINVAL);
+        }
+        let allowed = linux_abi::IN_ALL_EVENTS
+            | linux_abi::IN_UNMOUNT
+            | linux_abi::IN_Q_OVERFLOW
+            | linux_abi::IN_IGNORED
+            | linux_abi::IN_ONLYDIR
+            | linux_abi::IN_DONT_FOLLOW
+            | linux_abi::IN_EXCL_UNLINK
+            | linux_abi::IN_MASK_CREATE
+            | linux_abi::IN_MASK_ADD
+            | linux_abi::IN_ISDIR
+            | linux_abi::IN_ONESHOT;
+        if mask_u32 & !allowed != 0 || mask_u32 & linux_abi::IN_ALL_EVENTS == 0 {
+            return Err(LINUX_EINVAL);
+        }
+        let path = copy_current_user_path(pathname, VFS_IPC_PATH_CAPACITY)?;
+        let mut request = new_vfs_request(VFS_IPC_OP_INOTIFY_ADD_WATCH);
+        request.fd = fd;
+        request.remote_id = remote.remote_id();
+        request.arg0 = u64::from(mask_u32);
+        populate_vfs_path_base(&mut request, linux_abi::AT_FDCWD as u64, &path)?;
+        Ok(call_vfs_checked(&request)?.value)
+    })())
 }
 
 pub fn syscall_linux_inotify_rm_watch(fd: u64, wd: u64) -> u64 {
-    let Some(remote) = current_remote_vfs_handle(fd) else {
-        let exists = multitask::with_current_user_process_state(|_, _, process_state| {
-            process_state.handles().get(fd).is_some()
+    linux_unit_result((|| {
+        let remote = current_inotify_handle(fd)?;
+        let wd_i32 = wd as u32 as i32;
+        if wd_i32 <= 0 {
+            return Err(LINUX_EINVAL);
+        }
+        call_vfs_fd_status(VFS_IPC_OP_INOTIFY_RM_WATCH, fd, remote.remote_id(), |request| {
+            request.arg0 = u64::from(wd_i32 as u32);
         })
-        .unwrap_or(false);
-        return linux_errno(if exists { LINUX_EINVAL } else { LINUX_EBADF });
-    };
-    if remote.kind() != multitask::RemoteVfsHandleKind::Inotify {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let wd_i32 = wd as u32 as i32;
-    if wd_i32 <= 0 {
-        return linux_errno(LINUX_EINVAL);
-    }
-    let mut request = new_vfs_request(VFS_IPC_OP_INOTIFY_RM_WATCH);
-    request.fd = fd;
-    request.remote_id = remote.remote_id();
-    request.arg0 = u64::from(wd_i32 as u32);
-    match call_pinned_remote_vfs_request(&request).and_then(|response| ensure_vfs_status(&response)) {
-        Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
-    }
+    })())
 }
 
 pub(super) fn try_inotify_fionread(fd: u64, arg: u64) -> Option<u64> {
@@ -2779,21 +2734,14 @@ pub(super) fn try_inotify_fionread(fd: u64, arg: u64) -> Option<u64> {
     if remote.kind() != multitask::RemoteVfsHandleKind::Inotify {
         return None;
     }
-    let mut request = new_vfs_request(VFS_IPC_OP_FCNTL);
-    request.fd = fd;
-    request.remote_id = remote.remote_id();
-    request.arg0 = linux_abi::FIONREAD;
-    let bytes = match call_pinned_remote_vfs_request(&request).and_then(|response| {
-        ensure_vfs_status(&response)?;
-        Ok(response.value.min(i32::MAX as u64) as i32)
-    }) {
-        Ok(bytes) => bytes,
-        Err(errno) => return Some(linux_errno(errno)),
-    };
-    Some(match usermem::write_current_user_bytes(arg, &bytes.to_le_bytes()) {
-        Ok(()) => 0,
-        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-    })
+    Some(linux_unit_result((|| {
+        let mut request = new_vfs_request(VFS_IPC_OP_FCNTL);
+        request.fd = fd;
+        request.remote_id = remote.remote_id();
+        request.arg0 = linux_abi::FIONREAD;
+        let bytes = call_vfs_checked(&request)?.value.min(i32::MAX as u64) as i32;
+        write_user_bytes_as(arg, &bytes.to_le_bytes())
+    })()))
 }
 
 fn read_inotify_vfs(fd: u64, remote_id: u64, user_ptr: u64, user_len: u64) -> u64 {
@@ -2812,8 +2760,8 @@ fn read_inotify_vfs_pinned(fd: u64, remote_id: u64, user_ptr: u64, user_len: u64
     if user_len < core::mem::size_of::<linux_abi::LinuxInotifyEventHeader>() {
         return linux_errno(LINUX_EINVAL);
     }
-    if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
-        return linux_errno(address_space_error_to_linux_errno(err));
+    if let Err(errno) = validate_user_write_as(user_ptr, user_len) {
+        return linux_errno(errno);
     }
     let chunk_len = user_len.min(VFS_IPC_PAYLOAD_CAPACITY);
     let issue_read = || -> Result<VfsIpcResponse, i64> {
@@ -2828,10 +2776,7 @@ fn read_inotify_vfs_pinned(fd: u64, remote_id: u64, user_ptr: u64, user_len: u64
         if count == 0 || count > chunk_len || count > response.payload.len() {
             return linux_errno(LINUX_EINVAL);
         }
-        match usermem::write_current_user_bytes(user_ptr, &response.payload[..count]) {
-            Ok(()) => count as u64,
-            Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
-        }
+        linux_result(write_user_bytes_as(user_ptr, &response.payload[..count]).map(|()| count as u64))
     };
     loop {
         let response = match issue_read() {
@@ -2997,8 +2942,7 @@ fn read_socket_writev_payload(iov_ptr: u64, iovcnt: u64, datagram: bool) -> Resu
         if len != 0 {
             let start = payload.len();
             payload.resize(start + len, 0);
-            usermem::copy_from_current_user_exact(iov.iov_base, &mut payload[start..])
-                .map_err(address_space_error_to_linux_errno)?;
+            read_user_bytes_as(iov.iov_base, &mut payload[start..])?;
         }
         if payload.len() == capacity { break; }
     }

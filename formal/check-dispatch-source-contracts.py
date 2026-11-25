@@ -945,7 +945,7 @@ ordered(stop_case, ['let Some(changed) = multitask::stop_current_linux_process(s
     'return false', 'clear_current_pending_signal(signal, response.reserved0)',
     'if changed', 'multitask::yield_now()'], 'untouched busy Current stop never consumes the pending cause')
 broker_signal = Path('kernel/compat/src/user/syscall/linux/proc_broker_ops.rs').read_text()
-if 'Err(()) => linux_errno(LINUX_EAGAIN)' not in broker_signal:
+if 'Err(()) => Err(LINUX_EAGAIN)' not in broker_signal:
     raise SystemExit('signal group contention falsely reports missing task instead of retry')
 observation = (base / 'current_observation.rs').read_text()
 for name in ('current_scheduling_context_runtime_snapshot', 'set_current_tls_fs_base',
