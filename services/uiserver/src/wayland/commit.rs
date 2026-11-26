@@ -521,7 +521,6 @@ impl WaylandState {
             release: flight.release,
             ..Outcome::default()
         };
-        let elapsed = flight.started.elapsed();
         match completion.result {
             Ok(SnapshotPixels::Damage { damage, rows }) => {
                 let applied = shared.lock().is_ok_and(|mut surface| {
@@ -559,7 +558,9 @@ impl WaylandState {
                     .saturating_mul(flight.damage.height)
                     .saturating_mul(std::mem::size_of::<u32>());
                 super::dmabuf::note_snapshot(&flight.source, bytes);
-                self.record_buffer_copy(elapsed, bytes);
+                // Include the UI-side application of the completed read;
+                // measuring before blit hid copy-on-write and patch costs.
+                self.record_buffer_copy(flight.started.elapsed(), bytes);
             }
             Ok(SnapshotPixels::Full {
                 pixels,
@@ -581,7 +582,7 @@ impl WaylandState {
                     surface.current_buffer = Some(flight.source.clone());
                 }
                 super::dmabuf::note_snapshot(&flight.source, bytes);
-                self.record_buffer_copy(elapsed, bytes);
+                self.record_buffer_copy(flight.started.elapsed(), bytes);
             }
             Err(_) => {
                 // A bad backing file is a client failure, not a successful
@@ -862,9 +863,15 @@ impl WaylandState {
     }
 
     /// One UI-thread turn of snapshot bookkeeping: apply finished reads and
-    /// fail the commits whose read outlived its budget.
-    pub(super) fn pump_snapshots(&mut self) {
+    /// fail the commits whose read outlived its budget. True means the caller
+    /// must restore its window snapshots before rendering, including on an
+    /// error that leaves the compositor's previous complete pixels intact.
+    pub(super) fn pump_snapshots(&mut self, windows: &mut [WaylandWindowSnapshot]) -> bool {
         let mut completions = self.snapshots.take_completions();
+        let pixels_released = !completions.is_empty();
+        if pixels_released {
+            release_window_snapshot_pixels(windows);
+        }
         for completion in completions.drain(..) {
             self.complete_commit(completion);
         }
@@ -878,6 +885,7 @@ impl WaylandState {
                 "wl_surface.commit: shm snapshot exceeded its time budget".to_string(),
             );
         }
+        pixels_released
     }
 
     pub(super) fn snapshots_need_service(&self) -> bool {

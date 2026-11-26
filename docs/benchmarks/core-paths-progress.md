@@ -127,7 +127,9 @@ broker transaction을 포함한다. native MM 80 / PS 977 / compat 184 / ipcbenc
   다르다. 아직 exec errno/commit refusal 원인은 분해하지 않았다.
 - GUI 기존 `input-to-present`는 `services/uiserver/src/main.rs`에서 느린
   rendered turn만 출력한다. 전체 p50/p99나 실제 DVM completion latency로
-  인용할 수 없다. 0단계의 all-sample/fence-paired 측정은 여전히 미완료다.
+  인용할 수 없다. 2026-11-26 후속 소스 변경은 같은 제출 수락 경계를
+  `input-to-submit`으로 정정했으며, 과거 로그를 실제 present 완료 측정으로
+  바꾸는 것은 아니다. 0단계의 all-sample/fence-paired 측정은 여전히 미완료다.
 - read-only service 조사: storaged와 uiserver policy worker는 단순 융합 후보.
   rootd/netd는 bounded maintenance receive, devmgrd는 worker 소유 reply 및
   handle-transfer reply가 있어 무조건적인 fused blocking receive로 바꾸면 안 된다.

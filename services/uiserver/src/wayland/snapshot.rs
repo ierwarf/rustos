@@ -279,6 +279,22 @@ pub(super) enum SnapshotPixels {
 /// Largest staging buffer a snapshot worker keeps between jobs.
 const MAX_RETAINED_SCRATCH_BYTES: usize = 32 * 1024 * 1024;
 
+/// Sparse patches should not read many full-width rows just to extract a few
+/// pixels. Keep the extra positioned-read count bounded, and only choose it
+/// when the avoided padding is substantial; tall/dense buffers keep one read.
+const MAX_SPARSE_ROW_READS: usize = 8;
+const MIN_SPARSE_PADDING_BYTES: usize = 64 * 1024;
+
+fn read_sparse_rows(width_bytes: usize, height: usize, stride: usize, read_len: usize) -> bool {
+    height > 1
+        && height <= MAX_SPARSE_ROW_READS
+        && stride > width_bytes
+        && width_bytes.checked_mul(height).is_some_and(|tight| {
+            tight.checked_mul(4).is_some_and(|four| read_len >= four)
+                && read_len.saturating_sub(tight) >= MIN_SPARSE_PADDING_BYTES
+        })
+}
+
 impl SnapshotSpec {
     /// Read and convert. Pure with respect to compositor state: nothing here
     /// touches a surface, so a failure or a cancellation leaves no trace.
@@ -339,10 +355,12 @@ impl SnapshotSpec {
         pixels
             .try_reserve_exact(count)
             .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
-        if self.read_len == tight_len && (stride == width_bytes || height == 1) {
+        let sparse_rows = read_sparse_rows(width_bytes, height, stride, self.read_len);
+        if (self.read_len == tight_len && (stride == width_bytes || height == 1)) || sparse_rows {
             // Tight damage and single-row patches have the same native pixel
-            // layout as a full tight buffer. Read directly into the final
-            // allocation, with no staging copy or preliminary zero fill.
+            // layout as a full tight buffer. Sparse patches read each short
+            // row into that same final allocation. Neither needs a staging
+            // copy or a preliminary zero fill.
             // SAFETY: capacity is at least `count` u32s, and MaybeUninit<u8>
             // permits pread to initialize the allocation before publication.
             let spare_bytes = unsafe {
@@ -351,11 +369,20 @@ impl SnapshotSpec {
                     tight_len,
                 )
             };
-            super::shm::read_shm_snapshot_into_uninit(
-                self.fd.as_raw_fd(),
-                self.read_start,
-                spare_bytes,
-            )?;
+            if sparse_rows {
+                for (row, dst) in spare_bytes.chunks_exact_mut(width_bytes).enumerate() {
+                    let offset = row.checked_mul(stride)
+                        .and_then(|offset| self.read_start.checked_add(offset))
+                        .ok_or_else(bad)?;
+                    super::shm::read_shm_snapshot_into_uninit(self.fd.as_raw_fd(), offset, dst)?;
+                }
+            } else {
+                super::shm::read_shm_snapshot_into_uninit(
+                    self.fd.as_raw_fd(),
+                    self.read_start,
+                    spare_bytes,
+                )?;
+            }
             // SAFETY: pread initialized every byte, and all u32 bit patterns
             // are valid. No partially read allocation is ever published.
             unsafe {
@@ -840,6 +867,50 @@ mod tests {
             layout: SnapshotLayout::Full { width: 2, height: 2, stride: 8, has_alpha: true },
         };
         assert!(spec.run().is_err());
+    }
+
+    #[test]
+    fn sparse_row_policy_bounds_calls_and_requires_substantial_padding() {
+        assert!(read_sparse_rows(8, 8, 16384, 7 * 16384 + 8));
+        assert!(!read_sparse_rows(8, 9, 16384, 8 * 16384 + 8));
+        assert!(!read_sparse_rows(8, 1, 16384, 8));
+        assert!(!read_sparse_rows(8, 8, 16, 7 * 16 + 8));
+        assert!(!read_sparse_rows(8192, 8, 16384, 7 * 16384 + 8192));
+        assert!(!read_sparse_rows(usize::MAX, 8, usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn sparse_rows_read_only_pixel_spans_and_publish_nothing_after_a_short_row() {
+        const STRIDE: usize = 16384;
+        const HEIGHT: usize = 8;
+        const START: usize = 12;
+        const READ_LEN: usize = (HEIGHT - 1) * STRIDE + 8;
+        let mut contents = vec![0xee; START + READ_LEN];
+        for row in 0..HEIGHT {
+            for column in 0..2 {
+                let value = (row * 2 + column) as u32;
+                let offset = START + row * STRIDE + column * 4;
+                contents[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        let spec = |fd| SnapshotSpec {
+            fd: Arc::new(fd),
+            read_start: START,
+            read_len: READ_LEN,
+            layout: SnapshotLayout::Damage {
+                damage: Rect { x: 5, y: 7, width: 2, height: HEIGHT },
+                stride: STRIDE,
+                has_alpha: false,
+            },
+        };
+        let mut scratch = vec![0x5a; 32];
+        let SnapshotPixels::Damage { damage, rows } =
+            spec(tempfile_with(&contents)).run_with_scratch(&mut scratch).unwrap()
+        else { panic!("damage remains damage") };
+        assert_eq!((damage.x, damage.y), (5, 7));
+        assert_eq!(rows, (0..16_u32).map(|value| value | 0xff00_0000).collect::<Vec<_>>());
+        assert_eq!(scratch, vec![0x5a; 32], "sparse reads never stage full padded rows");
+        assert!(spec(tempfile_with(&contents[..contents.len() - 1])).run().is_err());
     }
 
     fn limits_big() -> Limits {

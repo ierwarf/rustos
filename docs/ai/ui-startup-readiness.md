@@ -127,8 +127,24 @@ thread. `commit_surface` builds a `PendingCommit`; `plan_pixels` yields a
 submitted to `SnapshotService`, a fair queue (`FairQueue<K,T>`) run by up to 4
 on-demand worker threads (role Background). Each worker `pread`s through an
 `Arc<OwnedFd>` and converts BGRA to `u32`. Completions are drained by
-`pump_snapshots()` at the start of `tick()` and applied with a transactional
+`pump_snapshots(windows)` at the start of `tick(windows)` and applied with a transactional
 `blit_damage`; the service wakes the UI through the existing wake sender.
+
+Before applying a nonempty completion batch, the UI returns the pixel Arcs in
+its retained window snapshots. The compositor drops its original-image alias
+before an eligible partial blit, allowing the normal unique allocation to be
+patched in place. No renderer runs during this transfer. `tick` requests fresh
+snapshots even if every completion failed, and `sync_wayland_windows` installs
+their complete pixels even when metadata equality takes the unchanged path.
+Independent readers still hold their own Arcs and retain copy-on-write safety.
+Source regressions cover unique allocation reuse, independent-reader isolation,
+and a turn with no completions; this follow-up has not been run or compiled.
+
+Sparse strided reads use at most eight row reads only when the padding costs
+at least 64 KiB and the span is at least four times the useful pixel bytes.
+Long or dense updates retain the single-read path. Failed/short reads never
+publish a partially initialized pixel vector. Copy elapsed time is recorded
+after UI-side application; its byte count remains useful pixel bytes.
 
 Budgets: 16 jobs and 128 MiB per client, 256 MiB total, one running job per
 client, FIFO across clients, job deadline `SNAPSHOT_JOB_BUDGET` = 12 s. Over
@@ -224,12 +240,13 @@ Not verified:
   records are parsed or logged but not folded into one cross-service readiness
   record; that needs a rootd-owned aggregate and is a product decision.
 - runtimed still performs reads of already-admitted control clients and all
-  reply writes on the broker loop. Each is a netd IPC with its own reply
-  deadline (lane0 #28: a parked-watch write took 5.005 s). The sound
-  replacement is a control-socket I/O thread that parses and authenticates
-  requests and hands typed work to the broker, and a reply writer. That
-  rewrites most of `socket.rs` (about 1100 lines) and cannot be verified
-  without a KVM boot, so only the accept side (the per-pass exposure) moved.
+  reply writes on the broker loop. **Current routing correction (2026-11-26):**
+  AF_UNIX I/O now uses `service_ops/local_fd.rs` and `local_unix.rs`; it is not
+  a netd RPC. The lane0 #28 parked-watch 5.005 s write below is historical
+  evidence from the earlier transport. A socket reactor remains a possible
+  architectural change, but that old netd wait is not proof it is needed for
+  the current checkout. The current follow-up coalesces each watch/snapshot
+  header and payload into one bounded frame without changing socket custody.
 - Kernel IPC reply-wake-loss stalls (lane0 #19, #29) and the pager/thread-create
   stall that held devmgrd in lane0 #45: scheduler/memory owners.
 - Assets failure errno precision.
@@ -307,6 +324,10 @@ move together (`libs/runtime-control`, `services/runtimed`,
 `services/uiserver`); `docs/api/runtime-control.md` documents the exchange.
 
 ### 10.4 runtimed broker stalls
+
+This section records the older netd-backed AF_UNIX implementation. The current
+kernel-local AF_UNIX path described in section 9 must be used when diagnosing
+new logs; these historical round trips are not current routing evidence.
 
 Lane0 #28 shows three 5 s broker passes: two with `listener_us ~ 5.0e6` (the
 log line `accept failed: errno=110`) and one with `watchers_us = 5005006`, all

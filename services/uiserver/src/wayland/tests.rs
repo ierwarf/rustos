@@ -153,6 +153,68 @@ fn wayland_snapshot_equality_uses_content_version_not_pixels() {
     assert_ne!(first, second);
 }
 
+fn pixel_snapshot(pixels: Arc<Vec<u32>>) -> WaylandWindowSnapshot {
+    WaylandWindowSnapshot {
+        surface_id: 1,
+        title: String::from("pixel-custody"),
+        frame: Rect { x: 0, y: 0, width: 4, height: 4 },
+        minimized: false,
+        server_decoration: false,
+        drag_icon: false,
+        popup: false,
+        content_version: 1,
+        damage: Rect::empty(),
+        pixels,
+        width: 4,
+        height: 4,
+        stride_pixels: 4,
+    }
+}
+
+#[test]
+fn returning_ui_pixel_custody_keeps_partial_commit_in_the_same_allocation() {
+    let mut retained = Arc::new((0..16).collect::<Vec<u32>>());
+    let original = Arc::clone(&retained);
+    let mut windows = vec![pixel_snapshot(Arc::clone(&retained))];
+    let allocation = retained.as_ptr();
+    super::release_window_snapshot_pixels(&mut windows);
+    // complete_commit also returns its original-image alias before a 1:1 patch.
+    drop(original);
+    let damage = Rect { x: 1, y: 2, width: 2, height: 1 };
+    assert!(super::snapshot::blit_damage(&mut retained, 4, 4, damage, &[90, 91]));
+    assert_eq!(retained.as_ptr(), allocation, "ordinary UI custody must not force a frame clone");
+    assert_eq!(&retained[8..12], &[8, 90, 91, 11]);
+    assert!(windows[0].pixels.is_empty());
+    // Metadata equality deliberately ignores pixels: the owner must install
+    // these fresh snapshots even when the released metadata compares equal.
+    let restored = pixel_snapshot(Arc::clone(&retained));
+    assert_eq!(windows[0], restored);
+    windows[0] = restored;
+    assert_eq!(&windows[0].pixels[9..11], &[90, 91]);
+}
+
+#[test]
+fn returning_ui_pixels_does_not_mutate_an_independent_retained_reader() {
+    let mut retained = Arc::new(vec![7; 16]);
+    let independent_reader = Arc::clone(&retained);
+    let mut windows = vec![pixel_snapshot(Arc::clone(&retained))];
+    super::release_window_snapshot_pixels(&mut windows);
+    let damage = Rect { x: 0, y: 0, width: 1, height: 1 };
+    assert!(super::snapshot::blit_damage(&mut retained, 4, 4, damage, &[9]));
+    assert_eq!(independent_reader.as_slice(), &[7; 16]);
+    assert_eq!(retained[0], 9);
+    assert!(!Arc::ptr_eq(&retained, &independent_reader));
+}
+
+#[test]
+fn a_tick_without_completed_snapshots_keeps_the_ui_pixels() {
+    let mut state = super::WaylandState::new(1024, 768);
+    let pixels = Arc::new(vec![7; 16]);
+    let mut windows = vec![pixel_snapshot(Arc::clone(&pixels))];
+    assert!(!state.pump_snapshots(&mut windows));
+    assert!(Arc::ptr_eq(&windows[0].pixels, &pixels));
+}
+
 fn test_ticket() -> super::LiveObjectTicket {
     let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     super::LiveObjectTicket::admit(&counter, usize::MAX, None).expect("ticket")
@@ -1613,7 +1675,7 @@ fn wait_for_snapshot(state: &mut super::WaylandState) {
         .any(|surface| surface.shared.lock().unwrap().commit.is_busy())
     {
         assert!(std::time::Instant::now() < deadline, "snapshot timed out");
-        state.pump_snapshots();
+        state.pump_snapshots(&mut []);
         std::thread::yield_now();
     }
 }

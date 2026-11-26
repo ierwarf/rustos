@@ -306,6 +306,13 @@ References for these mechanisms and their contracts:
 
 ### Profile Trace
 
+The ordinary slow-input line is `uiserver: input-to-submit ... submit_us=...`.
+It ends when the UI returns from an accepted display submission, not at a GPU
+present receipt and not at Chrome's rendered key echo. Old logs called the same
+boundary `input-to-present`; those samples must not be relabelled as measured
+scanout completion. The opt-in `input_completion` path separately pairs its
+cursor cohort with exact render and present receipts.
+
 Set `RUSTOS_UI_PROFILE=1` when profiling is needed to enable
 `profile::record_*` paths. The summary lines tagged
 `uiserver profile: ...` pass through a dedicated bounded asynchronous
@@ -489,6 +496,45 @@ Wayland 전체 damage는 새 owned snapshot을 그대로 게시하여 이전 프
 덮어쓰기를 없앱니다. 연속된 부분 읽기와 viewport 행 재사용도 적용하지만, 클라이언트
 SHM 직접 매핑 금지, 완전 초기화 후 게시, bounded worker와 release/callback 순서는
 유지합니다. 상세 소유권·복구 규칙과 근거 자료는 위 영문 절에 함께 기록했습니다.
+
+### Chrome 입력 지연 후속 변경: UI 소유권과 대기 경계
+
+2026-11-26 후속 변경 역시 소스 검토만 했으며 빌드, 테스트, KVM, 성능 측정은
+실행하지 않았습니다. 사용자 제공 로그 요약의 빠른 GPU render/pageflip 평균과
+긴 입력 tail은 서로 다른 구간의 측정입니다. 이 변경으로 새로운 FPS나 tail
+개선 수치를 주장하지 않습니다.
+
+부분 SHM completion을 적용할 때 UI가 들고 있던 `Arc<Vec<u32>>`를 같은 UI
+thread에서 잠시 반환합니다. 렌더링은 이 구간에 실행하지 않으며, Wayland turn이
+끝나면 geometry/content version이 같아도 완전한 snapshot을 반드시 다시 받습니다.
+따라서 일반적인 부분 갱신은 기존 pixel allocation에서 처리할 수 있습니다.
+외부 reader가 별도 Arc를 보관한 경우에는 기존 copy-on-write 격리를 유지합니다.
+실패한 completion도 UI snapshot 복원을 요구하고, 완료 작업이 없으면 alias를
+반환하지 않습니다.
+
+좁은 padded SHM 읽기는 최대 8행, padded span이 실제 pixel의 4배 이상이고
+padding 64 KiB 이상을 절약할 때만 행별 positioned read를 사용합니다. 각 행을
+최종 pixel 저장소에 직접 읽고 모든 읽기가 성공한 뒤 길이를 게시합니다. 더 큰
+행 수나 밀집된 갱신은 기존 한 번의 padded read를 유지합니다. 이 상한은 remote
+VFS fd에서 syscall/IPC 수가 폭증하지 않게 하는 보수적인 정책이며 측정으로
+최적값을 확인한 것은 아닙니다.
+
+console graph wait는 원래 background refresh worker에서 실행했습니다.
+40 ms park deadline의 unchanged 성공은 정상 idle keepalive입니다. 이제 이때
+state/session snapshot을 다시 요청하지 않고 같은 generation으로 wait를 다시
+겁니다. 실제 generation 변경과 실패 복구만 수집을 유발하고, 이전 수집 실패의
+미소비 edge는 그대로 유지합니다. focus 변경과 console running-record 삽입/제거도
+generation을 올리고, output이 없는 metadata 변경도 UI를 깨웁니다. TTY 생성과
+PID 공개, TTY 종료와 reaping은 별도 변경이므로 각각 edge를 냅니다. 초기 token은
+내부와 wire 모두 1로 맞춰 빈 console의 재대기와 첫 변경이 충돌하지 않게 했습니다.
+이 snapshot의 title은 running record에 고정되고, PID/desktop metadata는 별도
+runtime watch가, 창 크기와 배치는 UI 로컬 이벤트가 갱신합니다. GPU 슬롯 수,
+FIFO 순서와 exact receipt 수명은 변경하지 않았습니다.
+
+기존 `input-to-present` 로그는 `input-to-submit`으로 정정했습니다. 이것은
+입력 소비부터 다음 display 제출 수락까지이며 Chrome key echo나 실제 scanout을
+증명하지 않습니다. snapshot 경과 시간은 UI의 blit/transform 적용을 마친 뒤에
+기록하고, bytes는 여전히 적용한 pixel 양으로서 padded I/O 전체 양과 구분합니다.
 
 ### Profile Trace
 

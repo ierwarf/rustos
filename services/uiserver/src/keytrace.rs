@@ -1,10 +1,11 @@
 //! One keystroke's round trip, stamped at every hand-off it crosses.
 //!
-//! The `input-to-present` figure reports how long a keystroke waited, and the
-//! per-phase breakdown beside it accounts for well under one percent of that
-//! wait. That is not a contradiction: every phase the UI loop can time runs on
-//! this side of an IPC boundary, so the whole of the missing time is spent in
-//! hand-offs the loop never sees.
+//! The `input-to-submit` figure ends when the UI accepts a frame submission.
+//! Its phase breakdown times the current loop turn; elapsed time can also
+//! include earlier turns, queueing, provider calls and scheduling. It does not
+//! establish scanout completion or prove which stage caused an unexplained
+//! gap. Exact GPU present-receipt observation has its own `input_completion`
+//! path, and the console hand-off stamps here narrow the remaining interval.
 //!
 //! This records the same keystroke at each of those hand-offs instead:
 //!
@@ -20,7 +21,7 @@
 //!   exists
 //! * `e` the refresh worker getting scheduled and entering its next collect
 //! * `f` the three snapshot ioctls that fetch it
-//! * `g` the main loop waking and presenting
+//! * `g` the main loop waking and submitting a frame (not a scanout receipt)
 //!
 //! Every stamp is taken in this process from one `Instant` epoch, so the
 //! differences are transport and scheduling, never clock skew. Only the first

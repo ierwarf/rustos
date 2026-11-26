@@ -327,6 +327,7 @@ pub(crate) fn start_console_refresh_worker(wake: UiWakeSender) -> Receiver<Conso
                             }
                             Err(TrySendError::Disconnected(_)) => return,
                         };
+                        let graph_changed = announced_graph != observed_graph;
                         if collect_accounted_for_its_edge(failed_session, delivered) {
                             // The payload announced by this generation is in
                             // hand, so the subscription may now move past it.
@@ -334,11 +335,10 @@ pub(crate) fn start_console_refresh_worker(wake: UiWakeSender) -> Receiver<Conso
                         } else if consecutive_collect_failures >= MAX_UNPACED_COLLECT_RETRIES {
                             thread::sleep(CONSOLE_POLL_SLEEP);
                         }
-                        if delivered && produced_output {
-                            // Only new session output can change a pixel.
-                            // Waking the main loop for an unchanged snapshot
-                            // would trade this thread's fixed cadence for a
-                            // busy render loop.
+                        if refresh_needs_ui_wake(delivered, produced_output, graph_changed) {
+                            // Focus and membership also change pixels, even
+                            // when no session has produced a byte. An unchanged
+                            // follow-up collect still leaves the main loop idle.
                             wake.signal();
                         }
                     }
@@ -371,49 +371,59 @@ pub(crate) fn start_console_refresh_worker(wake: UiWakeSender) -> Receiver<Conso
                 // had produced anything and then left the real output waiting
                 // out the interval. The broker now holds this call until the
                 // graph actually moves.
-                crate::keytrace::mark_graph_wait();
-                let wait_started = Instant::now();
-                let waited =
-                    console_wait_graph(console_fd.as_raw_fd(), observed_graph, CONSOLE_GRAPH_WAIT);
-                crate::keytrace::add_parked(wait_started.elapsed());
-                match waited {
-                    Ok(generation) => {
-                        crate::keytrace::mark_graph();
-                        if generation == observed_graph {
-                            // The park ran out its budget without the graph
-                            // moving. Nothing to fetch, and nothing to stage.
-                            crate::keytrace::count_graph_stall();
+                loop {
+                    crate::keytrace::mark_graph_wait();
+                    let wait_started = Instant::now();
+                    let waited =
+                        console_wait_graph(console_fd.as_raw_fd(), observed_graph, CONSOLE_GRAPH_WAIT);
+                    crate::keytrace::add_parked(wait_started.elapsed());
+                    match waited {
+                        Ok(generation) => {
+                            if generation == observed_graph {
+                                // An unchanged deadline is an idle keepalive, not
+                                // new output. Re-arm directly: re-collecting state
+                                // and every session here added synchronous broker
+                                // traffic on every 40 ms park expiration.
+                                crate::keytrace::count_graph_stall();
+                                continue;
+                            }
+                            crate::keytrace::mark_graph();
+                            // Staged, not stored: this is only what the broker says
+                            // exists. It becomes `observed_graph` once the collect
+                            // that fetches it has succeeded.
+                            announced_graph = generation;
+                            break;
                         }
-                        // Staged, not stored: this is only what the broker says
-                        // exists. It becomes `observed_graph` once the collect
-                        // that fetches it has succeeded.
-                        announced_graph = generation;
-                    }
-                    Err(errno) => {
-                        crate::keytrace::count_graph_wait_error(errno);
-                        // A refusal means this caller may never use the rail,
-                        // so every later call fails identically and the
-                        // compositor silently becomes a `CONSOLE_POLL_SLEEP`
-                        // poller. That is exactly what happened for three
-                        // releases: a guard admitted only a handle the
-                        // compositor cannot hold, every wait returned
-                        // `ENOTTY`, and the fallback made a dead readiness
-                        // edge look like an idle console.
-                        //
-                        // Startup is the one time a refusal is not final: the
-                        // authority this rail requires is published when the
-                        // service registers, and this worker can outrun that.
-                        // Same budget and reasoning as the input wait set.
-                        let refused_for_good = !console_graph_wait_is_retryable(errno)
-                            && started.elapsed() >= CONSOLE_GRAPH_WAIT_STARTUP_BUDGET;
-                        if refused_for_good && !reported_permanent_failure {
-                            reported_permanent_failure = true;
-                            crate::sys::debug_line(&format!(
-                                "uiserver: console graph wait refused errno={errno}; \
-                                 polling instead and losing keystroke echo latency"
-                            ));
+                        Err(errno) => {
+                            crate::keytrace::count_graph_wait_error(errno);
+                            // A refusal means this caller may never use the rail,
+                            // so every later call fails identically and the
+                            // compositor silently becomes a `CONSOLE_POLL_SLEEP`
+                            // poller. That is exactly what happened for three
+                            // releases: a guard admitted only a handle the
+                            // compositor cannot hold, every wait returned
+                            // `ENOTTY`, and the fallback made a dead readiness
+                            // edge look like an idle console.
+                            //
+                            // Startup is the one time a refusal is not final: the
+                            // authority this rail requires is published when the
+                            // service registers, and this worker can outrun that.
+                            // Same budget and reasoning as the input wait set.
+                            let refused_for_good = !console_graph_wait_is_retryable(errno)
+                                && started.elapsed() >= CONSOLE_GRAPH_WAIT_STARTUP_BUDGET;
+                            if refused_for_good && !reported_permanent_failure {
+                                reported_permanent_failure = true;
+                                crate::sys::debug_line(&format!(
+                                    "uiserver: console graph wait refused errno={errno}; \
+                                     polling instead and losing keystroke echo latency"
+                                ));
+                            }
+                            thread::sleep(CONSOLE_POLL_SLEEP);
+                            // Preserve the existing recovery poll for a failed
+                            // readiness provider, without polling a healthy idle
+                            // provider after a successful unchanged response.
+                            break;
                         }
-                        thread::sleep(CONSOLE_POLL_SLEEP);
                     }
                 }
             }
@@ -458,6 +468,10 @@ fn console_graph_wait_is_retryable(errno: i32) -> bool {
 /// bursts rather than as uniformly slower echo.
 fn collect_accounted_for_its_edge(failed_session: Option<i32>, delivered: bool) -> bool {
     failed_session.is_none() && delivered
+}
+
+fn refresh_needs_ui_wake(delivered: bool, produced_output: bool, graph_changed: bool) -> bool {
+    delivered && (produced_output || graph_changed)
 }
 
 /// Reports what one collect saw, against what it already had.
@@ -535,12 +549,9 @@ fn collect_console_refresh(
     });
     let mut outputs = Vec::new();
     let mut failed_session = None;
-    // The last link with no measurement on it: what the broker reports as each
-    // session's generation, against what this worker already holds. A collect
-    // that is woken by an edge and then finds these equal is being told about a
-    // change it cannot see, and that is the only remaining way `snapshot_us`
-    // can span several park rounds while every ioctl inside it costs about a
-    // millisecond.
+    // Compare the graph generation carried by each session with the output
+    // snapshot held here. The graph also moves for focus and membership, so a
+    // changed token does not by itself prove that output bytes have changed.
     report_collect_generations(&sessions, output_generations);
     for session in &sessions {
         let previous_generation = output_generations

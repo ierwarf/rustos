@@ -42,6 +42,17 @@ fn only_a_collect_that_fetched_and_delivered_may_consume_the_graph_edge() {
     ));
 }
 
+#[test]
+fn a_delivered_metadata_edge_wakes_the_ui_without_session_output() {
+    assert!(super::refresh_needs_ui_wake(true, false, true),
+        "focus and removal must redraw even if no output snapshot was produced");
+    assert!(super::refresh_needs_ui_wake(true, true, false));
+    assert!(!super::refresh_needs_ui_wake(true, false, false),
+        "an unchanged follow-up collect must leave the UI idle");
+    assert!(!super::refresh_needs_ui_wake(false, false, true),
+        "a rejected refresh has no payload for the UI to drain");
+}
+
 /// The retry that a withheld token produces must be paced.
 ///
 /// Not consuming the edge is what makes the next wait return immediately,

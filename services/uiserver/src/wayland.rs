@@ -267,6 +267,18 @@ impl PartialEq for WaylandWindowSnapshot {
 
 impl Eq for WaylandWindowSnapshot {}
 
+/// The UI owner does not render while dispatching a Wayland turn. Return its
+/// pixel aliases before applying completed patches, then replace every window
+/// snapshot from the compositor before rendering again. Other readers retain
+/// their own Arcs and still get ordinary copy-on-write isolation.
+pub(crate) fn release_window_snapshot_pixels(windows: &mut [WaylandWindowSnapshot]) {
+    static EMPTY: std::sync::OnceLock<Arc<Vec<u32>>> = std::sync::OnceLock::new();
+    let empty = EMPTY.get_or_init(|| Arc::new(Vec::new()));
+    for window in windows {
+        window.pixels = Arc::clone(empty);
+    }
+}
+
 pub(crate) struct WaylandCompositor {
     display: Display<WaylandState>,
     acceptor: WaylandAcceptor,
@@ -433,8 +445,8 @@ impl WaylandCompositor {
 
     /// Whether an external edge authorizes a potentially consuming protocol
     /// turn. `wayland-server` documents `poll_fd()` as the dispatch authority;
-    /// probing every UI turn would turn an empty nonblocking socket read into
-    /// cross-service VFS/NETD traffic and scheduler churn.
+    /// probing every UI turn would add empty nonblocking AF_UNIX reads and
+    /// scheduler churn to the kernel-local socket path.
     pub(crate) fn has_pending_protocol_input(&self) -> bool {
         self.acceptor.has_pending()
             || self.state.snapshots_need_service()
@@ -446,7 +458,7 @@ impl WaylandCompositor {
                 .is_some_and(|readiness| readiness.needs_rearm.load(Ordering::Acquire))
     }
 
-    pub(crate) fn tick(&mut self) -> bool {
+    pub(crate) fn tick(&mut self, windows: &mut [WaylandWindowSnapshot]) -> bool {
         let tick_started = Instant::now();
         let accept_started = tick_started;
         crate::note_wayland_step(crate::WAYLAND_STEP_ACCEPT);
@@ -485,7 +497,7 @@ impl WaylandCompositor {
         // Apply finished client-buffer reads and fail the overdue ones before
         // dispatching new requests, so a completed commit's release and
         // configure precede the next request from the same client.
-        self.state.pump_snapshots();
+        let pixels_released = self.state.pump_snapshots(windows);
 
         let dispatch_started = Instant::now();
         crate::note_wayland_step(crate::WAYLAND_STEP_DISPATCH);
@@ -569,7 +581,9 @@ impl WaylandCompositor {
                 self.clients.len(),
             ));
         }
-        self.state.take_dirty()
+        // Returning pixel custody also requires refreshing AppState even if
+        // a failed completion left the protocol metadata unchanged.
+        self.state.take_dirty() || pixels_released
     }
 
     /// Consume one compositor-issued frame permit by sending the pending

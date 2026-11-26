@@ -80,11 +80,9 @@ const WAYLAND_FRAME_CALLBACK_INTERVAL: Duration = Duration::from_millis(15);
 const PARTIAL_RENDER_BUDGET: Duration = Duration::from_millis(8);
 const DISPLAY_BACKPRESSURE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const SLOW_LOOP_THRESHOLD: Duration = Duration::from_millis(50);
-/// Report an input event that took longer than one 16 ms poll boundary to
-/// reach the screen. Below that the loop is already doing the best its poll
-/// structure allows and the line would only be noise; above it, the count of
-/// boundaries crossed is exactly the quantity worth acting on.
-const INPUT_TO_PRESENT_REPORT_THRESHOLD: Duration = Duration::from_millis(20);
+/// Input consumption to accepted display submission. GPU scanout completion
+/// is a later exact receipt, so this must not be labelled input-to-present.
+const INPUT_TO_SUBMIT_REPORT_THRESHOLD: Duration = Duration::from_millis(20);
 /// How long a keystroke trace waits for its echo before reporting what it did
 /// see. A key whose echo never lands - a modifier, or one the shell discards -
 /// must not silence the trace for every key after it.
@@ -770,11 +768,9 @@ fn run() -> Result<(), i32> {
             input_backlog_window = input_backlog_window.saturating_add(1);
         }
         pending_update.absorb(input.visual_update);
-        // MEASUREMENT: the wall time from an input event being processed to the
-        // frame that carries its consequence to the screen. The per-frame phase
-        // breakdown already shows that the work itself is tens of microseconds,
-        // so what matters for perceived responsiveness is how many 16 ms poll
-        // boundaries a keystroke has to sit through before it is presented.
+        // MEASUREMENT: input consumption to the next accepted display submit.
+        // This is neither application key-echo nor scanout completion; the GPU
+        // owner records exact completion separately after both receipts arrive.
         // Only the first input-bearing iteration since the last present arms
         // this, so a burst of typing reports the age of its oldest unpresented
         // event rather than resetting the clock on every key.
@@ -799,7 +795,10 @@ fn run() -> Result<(), i32> {
             && wayland_service_required(protocol_input, input.input_events, callback_due)
         {
             wayland.set_window_cascade_base(state.console_windows.len());
-            let wayland_changed = wayland.tick();
+            // Tick may return our pixel aliases while applying completed
+            // patches. Its result then requires complete snapshot restoration
+            // before any renderer can borrow them again.
+            let wayland_changed = wayland.tick(&mut state.wayland_windows);
             wayland.rearm_readiness();
             if wayland_changed {
                 let wayland_dirty = state.sync_wayland_windows(wayland.window_snapshots());
@@ -1020,11 +1019,11 @@ fn run() -> Result<(), i32> {
             None
         };
         if let Some(armed) = armed_input {
-            let input_to_present = armed.elapsed();
-            if input_to_present >= INPUT_TO_PRESENT_REPORT_THRESHOLD {
+            let input_to_submit = armed.elapsed();
+            if input_to_submit >= INPUT_TO_SUBMIT_REPORT_THRESHOLD {
                 diag_line(format!(
-                    "uiserver: input-to-present us={} input_us={} wayland_us={} console_us={} present_us={}",
-                    input_to_present.as_micros(),
+                    "uiserver: input-to-submit us={} input_us={} wayland_us={} console_us={} submit_us={}",
+                    input_to_submit.as_micros(),
                     phase_timings.input.as_micros(),
                     phase_timings.wayland.as_micros(),
                     phase_timings.console.as_micros(),

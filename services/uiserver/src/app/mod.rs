@@ -657,7 +657,10 @@ impl AppState {
             && previous_focus == self.focused_wayland_surface_id
             && !has_damage
         {
-            self.wayland_windows = previous_windows;
+            // A Wayland turn may have returned our pixel aliases so a partial
+            // commit can update its uniquely owned storage. Even unchanged
+            // geometry must restore the current complete pixel snapshots.
+            self.wayland_windows = windows;
             return canvas::Rect::empty();
         }
 
