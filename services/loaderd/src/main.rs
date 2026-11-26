@@ -23,7 +23,6 @@
 extern crate alloc;
 
 
-use alloc::borrow::ToOwned;
 use alloc::ffi::CString;
 use alloc::format;
 use alloc::string::{String, ToString};

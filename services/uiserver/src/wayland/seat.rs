@@ -100,6 +100,7 @@ impl Dispatch<wl_pointer::WlPointer, PointerData> for WaylandState {
             // the cursor role: a role-less surface would be shown, hit-tested
             // and given keyboard focus as if it were a window.
             if let Some(data) = surface.data::<SurfaceData>() {
+                let mut role_changed = false;
                 if let Ok(mut surface_state) = data.shared.lock() {
                     if surface_state.role_assigned && !surface_state.cursor_role {
                         drop(surface_state);
@@ -109,11 +110,14 @@ impl Dispatch<wl_pointer::WlPointer, PointerData> for WaylandState {
                         );
                         return;
                     }
+                    role_changed = !surface_state.cursor_role;
                     surface_state.role_assigned = true;
                     surface_state.cursor_role = true;
                 }
                 state.clear_focus_for_surface(&surface.id());
-                state.mark_dirty();
+                if role_changed {
+                    state.mark_dirty();
+                }
             }
         }
         state.pointer_resources.retain(|pointer| {

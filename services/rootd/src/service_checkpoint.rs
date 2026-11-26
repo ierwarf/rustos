@@ -31,7 +31,7 @@ struct StoredRecord {
 pub(crate) struct ServiceCheckpointStore {
     records: Vec<StoredRecord>,
     /// Index from `(service_id, key_hi, key_lo)` to index in `records`.
-    /// Maintained on every insert and rebuilt on compaction so `find`,
+    /// Maintained on every insert and remapped in place on compaction so `find`,
     /// `find_key`, and `descendant_mask` avoid O(n) linear scans.
     key_index: BTreeMap<(u64, u64, u64), usize>,
     /// Per-service record counts, matching `records.iter().filter(|r| r.service_id == id).count()`.
@@ -94,7 +94,8 @@ impl ServiceCheckpointStore {
     /// Kernel journal append follows only a successful dry-run, so ENOSPC
     /// cannot mutate the rootd DAG without a corresponding log entry. The
     /// dry-run is the exact planning half of `mutate` (no ledger copy), and
-    /// reserves the slot a new record needs so the commit cannot hit OOM.
+    /// reserves record-vector capacity before commit. Index insertion still
+    /// follows BTreeMap's allocator-failure semantics.
     pub(crate) fn preflight_mutate(
         &mut self,
         service_id: u64,
@@ -170,7 +171,8 @@ impl ServiceCheckpointStore {
         })
     }
 
-    pub(crate) fn preflight_compact(
+    #[cfg(test)]
+    fn preflight_compact(
         &self,
         service_id: u64,
         proof: ServiceCheckpointRecordWire,
@@ -201,8 +203,9 @@ impl ServiceCheckpointStore {
         match existing_index {
             Some(index) => self.records[index].wire = incoming,
             None => {
-                // Reserve before changing any state (including dependent
-                // tombstones); OOM must not partially publish a checkpoint.
+                // A fallible vector reservation must precede any mutation,
+                // including dependent tombstones. Index insertion below uses
+                // BTreeMap's ordinary allocator-failure behavior.
                 self.records.try_reserve(1).map_err(|_| ENOMEM)?;
                 let new_index = self.records.len();
                 self.records.push(StoredRecord {
@@ -326,20 +329,20 @@ impl ServiceCheckpointStore {
         if max == 0 {
             return Err(EINVAL);
         }
-        // Two bounded passes avoid infallible `collect` in the supervisor.
-        // Reserve only the actual result count, never the untrusted `max`.
-        let matching = || {
-            self.records
-                .iter()
-                .filter(|record| record.service_id == service_id)
-                .skip(cursor)
-                .take(max)
-                .map(|record| record.wire)
-        };
-        let count = matching().count();
+        // The maintained namespace count gives the exact page size without
+        // walking the skipped prefix twice. Never reserve the untrusted `max`.
+        let count = self.service_counts.get(&service_id).copied().unwrap_or(0)
+            .saturating_sub(cursor)
+            .min(max);
         let mut records = Vec::new();
         records.try_reserve_exact(count).map_err(|_| ENOMEM)?;
-        records.extend(matching());
+        if count != 0 {
+            records.extend(self.records.iter()
+                .filter(|record| record.service_id == service_id)
+                .skip(cursor)
+                .take(count)
+                .map(|record| record.wire));
+        }
         let next = cursor.saturating_add(records.len());
         Ok((records, next))
     }
@@ -351,29 +354,54 @@ impl ServiceCheckpointStore {
         service_id: u64,
         proof: ServiceCheckpointRecordWire,
     ) -> Result<bool, i32> {
-        let Some(remove) = self.plan_compact(service_id, proof)? else {
-            return Ok(true);
+        self.compact_journaled(service_id, proof, || Ok(()))
+    }
+
+    /// Plan every fallible validation/allocation before the journal append,
+    /// then apply that exact mask without allocating another one. The callback
+    /// cannot mutate this serialized store between planning and publication.
+    pub(crate) fn compact_journaled(
+        &mut self,
+        service_id: u64,
+        proof: ServiceCheckpointRecordWire,
+        journal: impl FnOnce() -> Result<(), i32>,
+    ) -> Result<bool, i32> {
+        let remove = self.plan_compact(service_id, proof)?;
+        journal()?;
+        Ok(self.apply_compact(service_id, remove))
+    }
+
+    fn apply_compact(&mut self, service_id: u64, remove: Option<Vec<bool>>) -> bool {
+        let Some(remove) = remove else {
+            return true;
         };
+        let key_index = &mut self.key_index;
+        let old_len = self.records.len();
         let mut cursor = 0;
-        self.records.retain(|_| {
+        let mut retained = 0;
+        self.records.retain(|record| {
             let keep = !remove[cursor];
+            let key = (record.service_id, record.wire.key_hi, record.wire.key_lo);
+            if keep {
+                if retained != cursor {
+                    *key_index.get_mut(&key).expect("checkpoint index") = retained;
+                }
+                retained += 1;
+            } else {
+                key_index.remove(&key);
+            }
             cursor += 1;
             keep
         });
-        self.rebuild_indices();
-        Ok(false)
-    }
-
-    fn rebuild_indices(&mut self) {
-        self.key_index.clear();
-        self.service_counts.clear();
-        for (index, record) in self.records.iter().enumerate() {
-            self.key_index.insert(
-                (record.service_id, record.wire.key_hi, record.wire.key_lo),
-                index,
-            );
-            *self.service_counts.entry(record.service_id).or_insert(0) += 1;
+        // The plan only selects this namespace. Stable retention preserves
+        // parent-before-child order; updating existing nodes avoids allocating
+        // a second index after the compaction has already been journaled.
+        let count = self.service_counts.get_mut(&service_id).expect("checkpoint count");
+        *count -= old_len - retained;
+        if *count == 0 {
+            self.service_counts.remove(&service_id);
         }
+        false
     }
 
     /// Read-only validation of one compaction. `None` means the key is
@@ -583,6 +611,73 @@ mod tests {
         assert_eq!(store.compact(3, tombstone), Ok(false));
         assert_eq!(store.scan(3, 0, 8).unwrap().0.len(), 0);
         assert_eq!(store.compact(3, tombstone), Ok(true));
+    }
+
+    #[test]
+    fn compaction_preserves_interleaved_namespaces_and_reused_keys() {
+        let mut store = ServiceCheckpointStore::new();
+        let parent = record((7, 1), (0, 0), 1, 40);
+        let child = record((7, 2), (7, 1), 1, 41);
+        let survivor = record((8, 1), (0, 0), 1, 42);
+        store.mutate(3, parent).unwrap();
+        store.mutate(4, parent).unwrap();
+        store.mutate(3, child).unwrap();
+        store.mutate(3, survivor).unwrap();
+        store.mutate(4, child).unwrap();
+        let mut tombstone = parent;
+        tombstone.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
+        tombstone.value_len = 0;
+        tombstone.value.fill(0);
+        tombstone.revision = 2;
+        tombstone.operation_lo = 43;
+        store.mutate(3, tombstone).unwrap();
+        store.compact(3, tombstone).unwrap();
+        assert_eq!(store.scan(3, 0, usize::MAX), Ok((vec![survivor], 1)));
+        assert_eq!(store.scan(4, 0, usize::MAX), Ok((vec![parent, child], 2)));
+
+        let revised = record((8, 1), (0, 0), 2, 44);
+        store.mutate(3, revised).unwrap();
+        store.mutate(3, parent).unwrap();
+        store.mutate(3, child).unwrap();
+        // Removing the foreign tree must use its remapped indices and leave
+        // the new incarnation of the same keys in service 3 intact.
+        store.mutate(4, tombstone).unwrap();
+        store.compact(4, tombstone).unwrap();
+        assert_eq!(store.scan(4, 0, usize::MAX), Ok((vec![], 0)));
+        assert_eq!(store.scan(3, 1, usize::MAX), Ok((vec![parent, child], 3)));
+        assert_eq!(store.mutate(3, revised), Ok(true));
+        assert_eq!(store.mutate(3, child), Ok(true));
+    }
+
+    #[test]
+    fn journaled_compaction_refusal_leaves_the_validated_subtree_intact() {
+        let mut store = ServiceCheckpointStore::new();
+        let parent = record((3, 1), (0, 0), 1, 50);
+        let child = record((3, 2), (3, 1), 1, 51);
+        store.mutate(9, parent).unwrap();
+        store.mutate(9, child).unwrap();
+        let mut tombstone = parent;
+        tombstone.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
+        tombstone.value_len = 0;
+        tombstone.value.fill(0);
+        tombstone.revision = 2;
+        tombstone.operation_lo = 52;
+        assert_eq!(store.compact_journaled(9, tombstone, || panic!("invalid proof")), Err(ESTALE));
+        store.mutate(9, tombstone).unwrap();
+        let before = store.scan(9, 0, usize::MAX).unwrap();
+        assert_eq!(store.compact_journaled(9, tombstone, || Err(ENOSPC)), Err(ENOSPC));
+        assert_eq!(store.scan(9, 0, usize::MAX).unwrap(), before);
+        let mut journaled = 0;
+        assert_eq!(store.compact_journaled(9, tombstone, || {
+            journaled += 1;
+            Ok(())
+        }), Ok(false));
+        assert_eq!(store.compact_journaled(9, tombstone, || {
+            journaled += 1;
+            Ok(())
+        }), Ok(true));
+        assert_eq!(journaled, 2, "lost replies retain journaled retry semantics");
+        assert!(store.scan(9, 0, usize::MAX).unwrap().0.is_empty());
     }
 
     #[test]

@@ -23,6 +23,22 @@ fn poisoned_deferred_queue_is_drained_for_fail_closed_replies() {
 }
 
 #[test]
+fn idle_deferred_pass_retains_queue_storage_for_the_next_batch() {
+    let queue = Mutex::new(VecDeque::<u8>::with_capacity(8));
+    let capacity = queue.lock().unwrap().capacity();
+    let (drained, poisoned) = take_deferred_queue(queue.lock());
+    assert!(!poisoned);
+    assert!(drained.is_empty());
+    assert_eq!(queue.lock().unwrap().capacity(), capacity);
+    queue.lock().unwrap().extend([1, 2, 3]);
+    let (drained, poisoned) = take_deferred_queue(queue.lock());
+    assert!(!poisoned);
+    assert_eq!(drained, VecDeque::from([1, 2, 3]));
+    assert_eq!(drained.capacity(), capacity);
+    assert!(queue.lock().unwrap().is_empty());
+}
+
+#[test]
 fn netlink_readiness_publication_targets_only_the_socket_that_changed() {
     let first = 41_u64;
     let second = 42_u64;

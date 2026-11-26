@@ -123,8 +123,9 @@ impl VfsState {
         {
             return Err(EINVAL);
         }
+        use alloc::borrow::Cow;
         let raw = if path.starts_with('/') {
-            path.to_string()
+            Cow::Borrowed(path)
         } else {
             // Only the authenticated netd socket-namespace shape may delegate
             // cwd selection; normal requests always use their stamped PID.
@@ -133,16 +134,16 @@ impl VfsState {
                 request.arg3
             } else { request.pid };
             let base = self.resolve_path_with_base(pid, dirfd, request.remote_id, ".")?;
-            if base == "/" { format!("/{path}") } else { format!("{base}/{path}") }
+            Cow::Owned(if base == "/" { format!("/{path}") } else { format!("{base}/{path}") })
         };
         // Check search at every step, including before `..` and on each
         // symlink target, rather than only on the normalized final path.
-        use alloc::collections::VecDeque;
-        let mut pending: VecDeque<String> = raw.split('/').filter(|c| !c.is_empty()).map(String::from).collect();
-        let mut current = String::from("/");
+        let mut pending = vfsd::path::SymlinkComponents::new(&raw);
+        let mut current = String::with_capacity(raw.len().max(1).min(VFS_IPC_PATH_CAPACITY));
+        current.push('/');
         let mut storage = lock_vfs_storage();
         let mut expansions = 0;
-        while let Some(component) = pending.pop_front() {
+        while let Some(component) = pending.next_component() {
             if storage.tmpfs_owns(&current) {
                 let dir = storage.metadata(&current)?;
                 if dir.kind != RemoteKind::Directory { return Err(ENOTDIR); }
@@ -153,7 +154,7 @@ impl VfsState {
                 let end = current.rfind('/').unwrap_or(0); current.truncate(end.max(1)); continue;
             }
             if current.len() > 1 { current.push('/'); }
-            current.push_str(&component);
+            current.push_str(component);
             vfsd::path::check_path_capacity(current.len())?;
             let Some((entry, rel)) = storage.mounts.resolve(&current) else { continue; };
             if !entry.volume.capabilities().supports_symlinks { continue; }
@@ -165,7 +166,7 @@ impl VfsState {
                     if target.is_empty() || target.bytes().any(|b| b == 0 || b == b'\\') { return Err(EINVAL); }
                     let end = current.rfind('/').unwrap_or(0); current.truncate(end.max(1));
                     if target.starts_with('/') { current.truncate(1); }
-                    for part in target.split('/').filter(|c| !c.is_empty()).rev() { pending.push_front(String::from(part)); }
+                    pending.prepend_target(target);
                 }
                 Ok(meta) if !pending.is_empty() && meta.kind != FsNodeKind::Directory => return Err(ENOTDIR),
                 Ok(_) => {},
@@ -568,7 +569,7 @@ impl VfsState {
     }
 
     fn read_remote_into(
-        &mut self,
+        &self,
         request: &VfsIpcRequest,
         offset: Option<u64>,
         len: usize,
@@ -603,7 +604,7 @@ impl VfsState {
                 storage.live_len_for_path(handle.path.as_str(), handle.len)
             };
             (
-                handle.path.clone(),
+                handle.path.as_str(),
                 start,
                 file_len,
                 (handle.mount_id, handle.node),
@@ -618,7 +619,7 @@ impl VfsState {
         } else {
             Self::read_slice_for_handle(
                 node,
-                path.as_str(),
+                path,
                 request.pid,
                 file_len,
                 start,
@@ -1285,9 +1286,16 @@ impl VfsStorage {
             .ok_or(ESTALE)
     }
 
+    /// Synchronous node operations finish under this storage hold. Borrow the
+    /// mount's existing volume instead of incrementing/decrementing its Arc on
+    /// every metadata lookup and data chunk. node_volume serves owned leases.
+    fn node_volume_ref(&self, mount_id: u64) -> Result<&dyn storage_core::fs::FsVolume, i32> {
+        self.mounts.by_id(mount_id).map(|entry| entry.volume.as_ref()).ok_or(ESTALE)
+    }
+
     fn node_metadata(&self, mount_id: u64, node: u64) -> Result<Metadata, i32> {
         let meta = self
-            .node_volume(mount_id)?
+            .node_volume_ref(mount_id)?
             .metadata_node(node)
             .map_err(vfsd::map_fs_error)?;
         Ok(Self::posix_metadata(mount_id, meta))
@@ -1316,7 +1324,7 @@ impl VfsStorage {
     }
 
     fn read_node(&self, mount_id: u64, node: u64, start: u64, dest: &mut [u8]) -> Result<usize, i32> {
-        self.node_volume(mount_id)?
+        self.node_volume_ref(mount_id)?
             .read_node_at(node, start, dest)
             .map_err(vfsd::map_fs_error)
     }
@@ -1328,7 +1336,7 @@ impl VfsStorage {
         offset: Option<u64>,
         data: &[u8],
     ) -> Result<(u64, usize, u64), i32> {
-        let volume = self.node_volume(mount_id)?;
+        let volume = self.node_volume_ref(mount_id)?;
         // `None` appends: length and write are one storage hold, so two
         // O_APPEND writers can never pick the same offset.
         let start = match offset {
@@ -1342,7 +1350,7 @@ impl VfsStorage {
     }
 
     fn unpin_node(&self, mount_id: u64, node: u64) {
-        if let Ok(volume) = self.node_volume(mount_id) {
+        if let Ok(volume) = self.node_volume_ref(mount_id) {
             volume.release_node(node);
         }
     }
@@ -2428,10 +2436,16 @@ impl VfsStorage {
         }
         if owned {
             // Memory filesystem: authoritative and mutable, so never cached.
-            let (mid, rel_path, _key, _pk, _caps, _imm, volume, _rms) = self.resolve_mount(path)?;
-            return volume
-                .metadata(&rel_path)
-                .map(|meta| Self::posix_metadata(mid, meta))
+            // tmpfs_owns already admitted this mount. No path-keyed cache is
+            // used here, so avoid constructing relative/parent/cache Strings
+            // and cloning the volume for every search-permission check.
+            if let Some(errno) = self.mounts.data_mount_error(path) {
+                return Err(errno);
+            }
+            let (mount, rel_path) = self.mounts.resolve(path).ok_or(ENOENT)?;
+            return mount.volume
+                .metadata(rel_path)
+                .map(|meta| Self::posix_metadata(mount.id, meta))
                 .map_err(vfsd::map_fs_error);
         }
         if path == "/sys" || path.starts_with("/sys/") {

@@ -206,7 +206,8 @@ impl RootdLeaseReconciler {
         now: Instant,
         parent_deadline: Option<Instant>,
         initially_admitted: &mut BTreeSet<String>,
-    ) {
+    ) -> bool {
+        let mut running_changed = false;
         let recovery = &mut self.leases;
         for entry in startup_entries {
             let Some(service_id) = rootd_service_id_for_exec(entry.exec.as_str()) else {
@@ -289,6 +290,7 @@ impl RootdLeaseReconciler {
                                 endpoint_ready: true,
                             },
                         );
+                        running_changed = true;
                         if !entry.restart {
                             launched_once_packages.insert(entry.package_id.clone());
                         }
@@ -321,6 +323,7 @@ impl RootdLeaseReconciler {
                 ROOTD_LEASE_STATE_EXITED => {
                     recovery.remove(&service_id);
                     if let Some(service) = running.remove(&i32::try_from(pid).unwrap_or(-1)) {
+                        running_changed = true;
                         if service.restart {
                             record_launch_failure(
                                 retry_state,
@@ -358,6 +361,7 @@ impl RootdLeaseReconciler {
                 }
             }
         }
+        running_changed
     }
 }
 

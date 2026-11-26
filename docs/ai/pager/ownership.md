@@ -384,6 +384,14 @@ pager-tracked. Ring0 now tracks every anonymous range, and one
 `mprotect(PROT_NONE)` guard page splits a region into three, so a process with
 a dozen threads exhausted it — which is what produced the `ENOMEM` above.
 
+Range edits validate all affected regions and reserve the complete positive
+split growth before mutation. The sorted region vector then opens one gap,
+compacts fragments forward, and moves the untouched tail once; it must not
+shift that tail separately for every edited region. The reserved growth bounds
+every output prefix, so compaction cannot overwrite unread source rows.
+Foreign process generations, unaffected neighbors and backing-object offsets
+remain exact, and a preflight refusal publishes no partial edit.
+
 Raising it required removing the reason it could not grow.
 `rewrite_attenuated_range` held `[PagerVmRegionWire; N]`-shaped arrays on a
 64 KiB syscall stack — ~22 KiB at N=64, ~88 KiB at N=256. Those are now exact

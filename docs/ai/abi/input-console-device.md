@@ -28,6 +28,16 @@
   replaced, but a unique key/button release is retained rather than evicted
   for a lower-priority event. An event without an evdev representation does
   not hide a later readable event in the queue.
+- Native reads copy the deque's two ordered slices directly into the response;
+  evdev reads translate those slices into retained initialized scratch. One
+  bounded batch drain updates the empty-queue generation once, without an
+  intermediate native-event vector. Wire padding and event order remain exact.
+- After framing, CRC, epoch and sequence admission, an invalid event payload
+  still consumes its transport sequence. Zero key codes and unsupported
+  button bits are dropped without permanently rejecting subsequent valid
+  records. An authenticated absolute report outside a resized surface does
+  not move the pointer, but still delivers valid wheel and button-state
+  changes, including the release that ends a drag.
 - inputd owns a single System-class `inputd-dvm-ingress` worker. It waits in
   `SYS_RUSTOS_INPUT_WAIT_BROKER`, which arms before sleeping and rechecks raw
   producer/consumer cursors after registration; the MSI-X leaf only wakes that
@@ -259,6 +269,11 @@
 - `runtimed` interprets key meanings through `keyboard-core::KeyCode`, not
   duplicated numeric constants. `InputEvent.text` is the source of printable
   bytes; Enter/backspace/arrows use `KeyCode`.
+- Session input/output rings copy their ordered slices in bounded batches.
+  Output overflow retains the visible suffix while accounting for every input
+  byte in the output generation. CRLF translation preserves existing CRLF and
+  per-write boundaries; committing a canonical line or switching to raw mode
+  retains the edit allocation without changing line discipline.
 - Kernel TTY substrate remains a bootstrap/user-copy fallback only. Do not add
   new canonical editing or focus policy to ring0.
 - The bootstrap TTY substrate uses the ABI's fixed

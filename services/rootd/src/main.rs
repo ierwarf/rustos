@@ -1948,14 +1948,13 @@ fn fill_commercial_max_response(
                 &request.payload[..request.payload_len as usize],
             )
             .map_err(|_| 22)?;
-            service_checkpoints.preflight_compact(request.arg0, proof)?;
-            checkpoint_journal::append(
-                request.arg0,
-                rustos_user_abi::syscall::CHECKPOINT_JOURNAL_RECORD_COMPACT,
-                proof,
-            )?;
-            let already_compacted = service_checkpoints.compact(request.arg0, proof)
-                .unwrap_or_else(|_| fail_closed(b"rootd: fatal journaled checkpoint compact failed\n"));
+            let already_compacted = service_checkpoints.compact_journaled(request.arg0, proof, || {
+                checkpoint_journal::append(
+                    request.arg0,
+                    rustos_user_abi::syscall::CHECKPOINT_JOURNAL_RECORD_COMPACT,
+                    proof,
+                ).map(|_| ())
+            })?;
             response.value0 = proof.revision;
             response.value1 = u64::from(already_compacted);
             Ok(())

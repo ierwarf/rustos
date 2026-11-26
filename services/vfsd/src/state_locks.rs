@@ -41,7 +41,7 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        let Some(handle) = self.handles.get(&request.remote_id).cloned() else {
+        let Some(handle) = self.handles.get(&request.remote_id) else {
             // A cancel names a thread, not a file; everything else needs one.
             if wire.cmd == VFS_FILE_LOCK_CMD_CANCEL_WAIT && request.pid != 0 {
                 self.locks.cancel_wait(request.tid);
@@ -54,7 +54,7 @@ impl VfsState {
             response.status = EINVAL;
             return;
         }
-        let key = match self.lock_file_key(&handle) {
+        let key = match self.lock_file_key(handle) {
             Ok(key) => key,
             Err(errno) => {
                 response.status = errno;
@@ -71,7 +71,7 @@ impl VfsState {
             remote_id: request.remote_id,
             key,
             cursor: handle.cursor,
-            file_len: if needs_len { self.lock_file_len(&handle) } else { 0 },
+            file_len: if needs_len { self.lock_file_len(handle) } else { 0 },
             now_ns: monotonic_nanos(),
         };
         match vfsd::locks::execute_verified(&mut self.locks, &ctx, &wire, &mut probe_lifecycle_pids) {

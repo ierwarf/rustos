@@ -595,3 +595,104 @@ fn cropped_client_commit_patches_only_damaged_fragment_pixels() {
         .unwrap()
     );
 }
+
+#[test]
+fn cropped_console_binding_skips_unchanged_and_patches_incremental_updates() {
+    let outer = rect(40, 40, 240, 180);
+    let mut console = crate::app::ConsoleWindow::new(7, "sh".into(), outer, 1);
+    crate::render::chrome::rebuild_console_window_surface(&mut console, false);
+    assert!(console.surface_cache.valid);
+
+    let mut windows = [console];
+    let stride = 300;
+    let mut atlas_pixels = vec![0xdead_beef_u32; stride * 240];
+    let frag_src = rect(0, 0, 120, outer.height);
+    let frag_dst = rect(10, 10, 120, outer.height);
+    let mut bindings = [super::super::CroppedConsoleBinding {
+        session_handle: 7,
+        content_version: windows[0].surface_cache.content_version,
+        outer,
+        focused: false,
+        fragments: vec![(frag_src, frag_dst)],
+    }];
+
+    let unchanged = super::super::update_cropped_console_windows_textures(
+        &mut windows,
+        0,
+        Some(1),
+        &mut atlas_pixels,
+        stride,
+        &mut bindings,
+    )
+    .expect("unchanged console")
+    .expect("reusable");
+    assert!(unchanged.is_empty(), "unchanged console must copy zero pixels");
+    assert!(
+        atlas_pixels.iter().all(|&p| p == 0xdead_beef),
+        "unchanged console must not touch atlas memory"
+    );
+
+    windows[0].output_cache.extend_from_slice(b"hello\n");
+    windows[0].terminal_dirty = true;
+    let updated = super::super::update_cropped_console_windows_textures(
+        &mut windows,
+        0,
+        Some(1),
+        &mut atlas_pixels,
+        stride,
+        &mut bindings,
+    )
+    .expect("updated console")
+    .expect("reusable after output");
+    assert_eq!(updated, vec![frag_dst]);
+    assert_eq!(
+        bindings[0].content_version,
+        windows[0].surface_cache.content_version
+    );
+    let mut expected = windows[0].surface_cache.pixels.clone();
+    chrome::apply_window_texture_alpha(
+        &mut expected, outer.width, outer.width, outer.height, false,
+    );
+    for row in 0..frag_src.height {
+        let source_start = (frag_src.y + row) * outer.width + frag_src.x;
+        let target_start = (frag_dst.y + row) * stride + frag_dst.x;
+        assert_eq!(
+            &atlas_pixels[target_start..target_start + frag_src.width],
+            &expected[source_start..source_start + frag_src.width],
+        );
+    }
+}
+
+#[test]
+fn cropped_translucent_ssd_damage_recomposites_chrome_and_only_changes_damaged_pixels() {
+    let outer = rect(10, 20, 200, 160);
+    let mut win = window(outer, 255);
+    Arc::make_mut(&mut win.pixels)[0] = 0x7f20_3040;
+    let binding = CroppedWaylandBinding {
+        surface_id: 1,
+        content_version: 1,
+        outer,
+        focused: true,
+        pixels_opaque: false,
+        fragments: vec![(rect(0, 0, 200, 160), rect(0, 0, 200, 160))],
+    };
+    let mut atlas = vec![0xdead_beef; 256 * 200];
+    let mut damage = Vec::new();
+    assert!(super::super::copy_wayland_damage_to_fragments(
+        &mut atlas, 256, &binding, &win, rect(0, 0, 1, 1), &mut damage,
+    ).unwrap());
+    let client = wayland_window_client_rect_for(&win, rect(0, 0, outer.width, outer.height));
+    assert_eq!(damage, vec![rect(client.x, client.y, 1, 1)]);
+    let mut expected = render_wayland_gpu_texture(&win, true).unwrap();
+    chrome::apply_window_texture_alpha(
+        &mut expected, outer.width, outer.width, outer.height, true,
+    );
+    for (index, &pixel) in atlas.iter().enumerate() {
+        if index == client.y * 256 + client.x {
+            assert_eq!(pixel, expected[client.y * outer.width + client.x]);
+            assert_ne!(pixel, 0x7f20_3040, "SSD must include the chrome beneath the client");
+        } else {
+            assert_eq!(pixel, 0xdead_beef);
+        }
+    }
+}

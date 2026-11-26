@@ -57,7 +57,13 @@ fn no_op_and_duplicate_close_do_not_publish_but_final_close_does() {
     assert!(publications().is_empty());
     {
         let mut guard = NetStateGuard::new(state.lock().unwrap());
-        guard.netlink_sockets.remove(&1);
+        assert!(retire_netlink_socket(&mut guard, 1).is_some());
+        // The production close helper must leave the old observation for
+        // the publisher to consume, without publishing under the lock.
+        assert!(guard.readiness_observations.contains_key(&1));
+        assert!(guard.readiness_generations.contains_key(&1));
+        assert!(publications().is_empty());
+        assert!(retire_netlink_socket(&mut guard, 1).is_none());
     }
     let published = publications();
     assert_eq!(
@@ -67,6 +73,43 @@ fn no_op_and_duplicate_close_do_not_publish_but_final_close_does() {
     let guard = state.lock().unwrap();
     assert!(!guard.readiness_observations.contains_key(&1));
     assert!(!guard.readiness_generations.contains_key(&1));
+    drop(guard);
+    {
+        let mut guard = NetStateGuard::new(state.lock().unwrap());
+        assert!(retire_netlink_socket(&mut guard, 1).is_none());
+    }
+    assert!(publications().is_empty());
+}
+
+#[test]
+fn full_netlink_sweep_includes_retired_tokens_once_and_retains_unchanged_generations() {
+    let state = pair();
+    let unchanged_generation = state.lock().unwrap().socket_readiness_generation(2);
+    {
+        let mut guard = NetStateGuard::new(state.lock().unwrap());
+        guard.netlink_sockets.remove(&1);
+        // A group observation must not lose the retired identity or publish
+        // an unchanged live socket just because it was included in the sweep.
+        guard.netlink_sockets.mark_all_dirty();
+    }
+    let published = publications();
+    assert_eq!(published.iter().map(|entry| entry.0).collect::<Vec<_>>(), [1]);
+    let mut guard = state.lock().unwrap();
+    assert_eq!(guard.socket_readiness_generation(2), unchanged_generation);
+    assert!(!guard.readiness_observations.contains_key(&1));
+}
+
+#[test]
+fn selected_table_mutation_preserves_exact_dirty_identities() {
+    let mut table = SocketTable::new();
+    table.insert(1, 10);
+    table.insert(2, 20);
+    table.insert(3, 30);
+    table.dirty.clear();
+    table.for_each_matching_mut(|value| *value >= 20, |value| *value += 1);
+    assert_eq!(table.dirty.iter().copied().collect::<Vec<_>>(), [2, 3]);
+    assert_eq!(table.entries.values().copied().collect::<Vec<_>>(), [10, 21, 31]);
+    assert!(!table.all_dirty);
 }
 
 #[test]

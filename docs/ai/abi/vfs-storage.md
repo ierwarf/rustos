@@ -365,6 +365,22 @@ the read-only accelerator; TmpFs has it (next section).
   (`state_storage.rs`, `SYMLINK_FOLLOW_MAX` = 40 hops, then ELOOP); `O_NOFOLLOW` gives ELOOP
   and a socket inode gives ENXIO on open. `/proc/mounts` is generated from the
   live `MountTable` (vfat rows `ro`/`rw`, tmpfs rows `rw,nosuid,nodev`).
+- **Namespace and sparse I/O work.** TmpFs validates a borrowed path before
+  acquiring its state lock and walks components without a temporary vector.
+  Symlink traversal borrows the ordinary path and stacks only unresolved
+  suffixes; search permission is still checked before interpreting `.`/`..`
+  and after every symlink expansion. Sparse reads traverse only allocated
+  B-tree chunks in the requested range and zero the intervening holes; a new
+  full-page write initializes its allocation directly from the supplied bytes.
+  Directory-cookie admission precedes symlink quota charging, so exhaustion
+  cannot leave an unreachable charge. Inotify maintains an exact total watch
+  count, including one-shot/deletion/instance retirement, making no-watch
+  event admission constant-time without weakening event or readiness rules.
+- **Ordinary bulk reads.** `bulk_read_worker` selects a 128-KiB window for
+  TmpFs/path sources that hold storage and a 512-KiB window for mapped or
+  early-system sources. A source's full admitted chunk must not be mistaken
+  for EOF merely because a larger outer buffer was offered. The storage-hold
+  bound, exact returned prefix, cancellation and reply ownership are unchanged.
 - **New VFS ops** (`VFS_IPC_ABI_VERSION` stays 5): `MKNOD`=34 (dirfd+path,
   `arg0`=st_mode; regular, socket and FIFO kinds are admitted where the volume supports them; device nodes are refused; used by Linux `mknod`/`mknodat` and netd bind), `CHMOD`=35,
   `FCHMOD`=36, `FALLOCATE`=37 (mode 0 and KEEP_SIZE), `FILE_LOCK`=38,
@@ -894,6 +910,13 @@ the read-only accelerator; TmpFs has it (next section).
   window a stream has fully consumed is evicted first. Every read still
   revalidates live DVM geometry and the exact caller generation, and a cached
   window never outlives a quarantine, revoke, restart or generation change.
+  Recycled windows remain initialized; they need not be zeroed again, but
+  cannot become `Ready` until collection succeeds for the entire requested
+  window. A short/error/stale completion never exposes its previous contents.
+  Common reads pin up to two windows inline and retain an owned-vector fallback
+  for larger reads. The pins keep every copied allocation alive outside the
+  engine lock. The single pump retains its worklists between passes, and stream
+  refill uses the existing eight-stream bound without a temporary vector.
   - Streams: a read that starts at most two windows past, or four windows
     before, the previous read's last window continues that stream (the
     backward slack absorbs parallel readers whose adjacent chunks arrive out of
@@ -909,6 +932,10 @@ the read-only accelerator; TmpFs has it (next section).
     wait on the transport themselves. If the pump cannot start, storaged exits
     rather than let every read time out. A ticket older than the 15-second
     deadline quarantines the generation, is cancelled and its window dropped.
+    Quarantine advances monotonically: a delayed timeout from an older request
+    cannot lower a newer quarantine, and admission rejects every generation at
+    or below that watermark. Only a confirmed newer live generation may clear
+    the observed watermark, with a compare-and-exchange that preserves races.
   - Concurrency: storaged serves its endpoint from four receive threads, each
     with its own bulk reply slot, so several vfsd lanes are in flight at once.
   - Invalidation: every write first drops overlapping cached windows and flags
@@ -945,6 +972,11 @@ the read-only accelerator; TmpFs has it (next section).
   a plan that skipped it cannot publish product evidence. A write to the volume
   during the transfer cannot publish stale bytes: each window read revalidates
   its read-map source and `commit_executable_snapshot` re-checks the map.
+  Stage-slot reuse requires both acknowledgements: the worker has released its
+  stack and the previous parent's join has cleared the task pointer to IDLE.
+  The IDLE observation occurs after successfully claiming the free stack, so
+  a stale observation cannot cross an intervening generation. DONE alone does
+  not authorize reuse, and stack release alone does not replace join.
 - Bulk reply and request wire shape: a `READ_BULK` reply is the 80-byte response
   header plus exactly `payload_len` bytes, a `WRITE_BULK` request is the header
   plus exactly `payload_len` bytes, and the receiver validates the exact length

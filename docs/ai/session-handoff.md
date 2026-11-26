@@ -6,17 +6,104 @@ stable repository prefix; use [task router](task-router.md) for owner contracts.
 Historical entries prior to 2026-11-25 live in `git log` (e.g.
 `git show HEAD:docs/ai/session-handoff.md`).
 
-## Non-core Ring0 audit continuation
+## Ring3 service performance batch (2026-11-26, static review only)
 
-- The integration branch `fix/non-core-ring0-audit` covers MM, IPC runtime,
-  I/O manager, process management and Linux compatibility. The prior UI
-  working changes are separate and are not part of this branch.
-- The integration pass completed the AF_UNIX address-buffer conversion,
-  kept futex requeue and wake-op queue selection atomic across buffer growth,
-  and preserved elapsed periods when arming an absolute realtime timerfd.
-- Refresh evidence on the exact branch before publication: focused kernel
-  tests, KVM Chrome compatibility and IPC benchmark, and the PR formal gate.
-  The earlier `bench-after.log` and `chrome-after.log` predate these changes.
+User requested all 13 Ring3 services except `uiserver`, prioritizing net gains,
+bug fixes, and clear small/medium refactors informed by primary web references.
+Base: `1dc0a1409e4ad486282a5ede8d092064aaa98dd6` (`master`). The user requested
+static review only and one final commit/publication after integration. No
+compilation, tests, benchmarks, KVM, or formal scripts were run for this batch.
+
+- All 13 non-UI services received scoped changes. `services/uiserver/**` is
+  unchanged. The service-by-service inventory and primary references are in
+  `docs/architecture/services.md`; owner ABI contracts were updated too.
+- VFS: borrowed namespace components and mount/handle views, range sparse
+  reads, direct full-page initialization, in-place lock merging, exact watch
+  count, keyed checkpoint retirement and retained framing scratch. Fixed
+  capped 128-KiB sources being mistaken for EOF by a 512-KiB outer read,
+  symlink quota leakage on cookie exhaustion, and stage stack reuse before
+  the old join acknowledged completion.
+- Storage/network/input/device: retain initialized buffers and pump/queue
+  scratch, inline common read pins, move owned loopback packets, walk selected
+  socket identities directly and drain input ring slices in batches. Fixed
+  backwards quarantine publication, final socket-close notification loss,
+  invalid semantic input wedging the sequence, and resized-surface position
+  rejection dropping valid button releases.
+- Root/init/runtime: single-plan journaled checkpoint COMPACT and in-place
+  survivor indices, one-pass SCAN, retained startup sets and socket scratch,
+  receipt ring, batched TTY copies and offset-based D-Bus consumption. Fixed
+  D-Bus missing/embedded string NUL admission. Synchronous UI bootstrap stays.
+- Loader/session/process/MM/pager: borrowed PE strings and direct Windows
+  environment encoding (including empty double-NUL blocks); single-owner FD
+  vector moves; exact running-ID membership reuse; allocation-free signal
+  queries and preserved uncached exec masks; cached MM lease index retention;
+  in-place covered VMA updates; single-gap pager range compaction.
+- Shared IDL gained additive `Builder::append_to`; checkpoint frames encode
+  into retained destination storage. Relative limits and exact prefix rollback
+  preserve standalone wire bytes and error semantics.
+- Independent static cross-review covered changed ownership, borrow/type
+  boundaries, indexing, partial errors and generation publication. It caught
+  and corrected the remaining Wine call to the moved command-line helper.
+  Source-conformance watch anchors were updated for retained snapshot scratch;
+  implementation-mutation literal counts were inspected without running gates.
+- Regression source cases accompany the changes, but no execution result is
+  claimed. Three new VFS helper cases live in existing `test=false` binary
+  source and are not an executable host-test claim. Runtime performance,
+  interactive behavior and compilation remain unverified by request.
+- Existing limits retained: first-time MM leases still rely on the single
+  receive owner; rootd MUTATE B-tree inserts keep normal infallible allocator
+  behavior. The allocation-free post-journal claim applies to COMPACT, not all
+  checkpoint operations. Worker counts, admission limits and TCP observation
+  cadence were not speculatively expanded.
+
+## UI performance batch (2026-11-26, static review only)
+
+User requested aggressive `uiserver` optimization informed by web references,
+static review without compilation/tests/KVM/formal runs, then one final commit
+and push. Base: `1d489bbd848044ef30f188202c6f2dbe8245b32a` (`master`).
+
+- Implemented retained GPU submission/encoding/damage storage; cursor-only
+  signature reuse; allocation-free mixed-order visitation; CPU-only damage
+  strip preparation; actual cropped-atlas extent tracking; bounded differential
+  damage bands; contiguous atlas copies and explicit WC publication fencing.
+- Fixed recovery damage loss: partial-patch-to-rebuild fallback and rejected
+  submissions require full transfer **and full accepted history** before older
+  slots can be reconstructed. Exact-predecessor damage is overlap/count
+  normalized too. Reusable command buffers cannot encode a failed compilation.
+- Removed full-window staging where direct atlas/fragment painting suffices;
+  preserved original rounded-window coordinates and translucent client
+  recomposition. Cursor caches and strided atlas writes retain allocations;
+  glass blur uses row-major sums with unchanged integer semantics.
+- Added exact runtime-gated AVX2 alpha-mask/source-over rows; corrected existing
+  solid-blend high-byte disagreement. Terminal parsing is batched, scrollback
+  allocations recycle, bulk scrolls move once, and clipped painting pins one
+  font atlas per paint.
+- Wayland full damage replaces owned snapshots instead of copying over old
+  frames. Tight reads target final storage; padded conversion initializes spare
+  capacity; viewport sampling reuses row/column work. Completion/callback
+  storage recycles, oldest-job readiness is cached, and scratch caps now apply
+  after clearing live length. Hostile-SHM and worker admission contracts remain.
+- Owner documentation: `docs/architecture/ui-server.md`. Formal source anchors
+  track production conversion/differencing and the new single expiry predicate.
+- Review: independent cross-review of rendering, SIMD/terminal, Wayland worker
+  ownership, GPU rollback/damage history, and stack ordering; source-only
+  regression cases accompany the substantive changes. No compile, test,
+  benchmark, KVM, or formal-run result is claimed. Performance magnitude and
+  live Chrome/window-resize/transparent-composition behavior remain unmeasured.
+
+## Non-core Ring0 audit (2026-11-26, PR #10)
+
+- Covers MM, IPC runtime, I/O manager, process management and Linux
+  compatibility. The UI and Ring3 batches above are separate changes from
+  `master`, not part of the Ring0 patch.
+- Bounded the IRQ-off pager frame scan, excluded physical page zero from
+  allocation, and fixed IPC retirement and DVM lifecycle races. Completed the
+  AF_UNIX address-buffer conversion, preserved futex selection across wake
+  buffer growth, and kept elapsed periods for absolute realtime timerfd.
+- On the original Ring0 commit (`cbce01a4`), the focused kernel tests and
+  formal PR gate passed; KVM Chrome compatibility passed 505 checks at both
+  1 and 8 vCPUs. The IPC benchmark was not a controlled A/B and does not
+  establish a speedup. These results do not cover later `master` changes.
 
 ## Historical snapshot (2026-11-25, then uncommitted on `master`)
 

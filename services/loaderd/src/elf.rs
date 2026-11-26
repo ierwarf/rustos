@@ -68,8 +68,8 @@ fn map_executable_segments(
                 *load_bias,
                 deadline,
             )
-            .map(|result| {
-                let mut cleanup_fds = result.backing_fds.clone();
+            .map(|mut result| {
+                let mut cleanup_fds = core::mem::take(&mut result.backing_fds);
                 cleanup_fds.push(fd);
                 PreparedExecutable {
                     windows_runtime: None,
@@ -79,10 +79,8 @@ fn map_executable_segments(
             })
         }
         ExecutableAdmission::Pe64 => {
-            // The PE runtime builder still owns its string representation.
-            // Materialize only on this path, not for every ELF spawn/exec.
-            let argv: Vec<CString> = argv.iter().map(|value| value.to_owned()).collect();
-            let env: Vec<CString> = env.iter().map(|value| value.to_owned()).collect();
+            let argv = argv.utf8()?;
+            let env = env.utf8()?;
             map_pe_segments_fd(fd, prepare_handle, exec_path, &argv, &env, deadline)
                 .map(|runtime| PreparedExecutable {
                     windows_runtime: Some(runtime),
@@ -527,7 +525,7 @@ fn map_admitted_elf_segments_fd(
                 return Err(ENOEXEC);
             }
             let end = interp.max_loaded_end.max(max_loaded_end);
-            backing_fds.extend(interp.backing_fds);
+            backing_fds = interp.backing_fds;
             (interp.load_bias, interp.entry, Some(String::from(path)), end)
         } else {
             (0, entry, None, max_loaded_end)

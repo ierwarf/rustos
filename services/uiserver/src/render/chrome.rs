@@ -26,11 +26,13 @@ use super::colors::{
     COLOR_TEXT_PRIMARY,
 };
 use super::glass::{
-    Backdrop, GlassStyle, WindowAlpha, apply_window_alpha, corner_inset, draw_glass_chip,
+    Backdrop, GlassStyle, WindowAlpha, apply_window_alpha_region, corner_inset, draw_glass_chip,
     draw_glass_panel, mix,
 };
 use super::icons::{draw_app_icon, stroke_line};
 use super::{wayland_window_client_rect_for, wayland_window_outer_rect};
+#[cfg(test)]
+use super::glass::apply_window_alpha;
 
 // ---- top-level rails (topbar / dock) ----
 
@@ -526,6 +528,7 @@ pub(super) fn window_texture_alpha(width: usize, height: usize, focused: bool) -
 
 /// Make a freshly written window texture region translucent where it should be.
 /// Call once per full write of the region, on opaque pixels.
+#[cfg(test)]
 pub(super) fn apply_window_texture_alpha(
     pixels: &mut [u32],
     stride: usize,
@@ -540,6 +543,26 @@ pub(super) fn apply_window_texture_alpha(
         height,
         window_texture_alpha(width, height, focused),
     );
+}
+
+pub(super) fn apply_window_texture_alpha_region(
+    pixels: &mut [u32],
+    stride: usize,
+    width: usize,
+    height: usize,
+    region: Rect,
+    focused: bool,
+    alpha_is_opaque: bool,
+) -> bool {
+    apply_window_alpha_region(
+        pixels,
+        stride,
+        width,
+        height,
+        region,
+        window_texture_alpha(width, height, focused),
+        alpha_is_opaque,
+    )
 }
 
 /// A soft white edge down both sides and along the bottom of the window.

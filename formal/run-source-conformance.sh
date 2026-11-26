@@ -710,8 +710,15 @@ watch_service_body="$(
     sed -n '/^pub(super) fn service_running_program_watchers(/,/^}/p' \
         services/runtimed/src/socket.rs
 )"
-if ! grep -Fq 'let programs = running_program_snapshot(state);' <<<"$watch_service_body" \
-    || ! grep -Fq 'let digest = running_programs_digest(&programs);' <<<"$watch_service_body" \
+watch_snapshot_body="$(
+    sed -n '/^fn fill_running_program_snapshot(/,/^}/p' \
+        services/runtimed/src/socket.rs
+)"
+if ! grep -Fq 'fill_running_program_snapshot(state, &mut connections.watch_programs);' <<<"$watch_service_body" \
+    || ! grep -Fq 'let programs = &connections.watch_programs;' <<<"$watch_service_body" \
+    || ! grep -Fq 'let digest = running_programs_digest(programs);' <<<"$watch_service_body" \
+    || ! grep -Fq 'programs.clear();' <<<"$watch_snapshot_body" \
+    || ! grep -Fq 'state.running.values().take(MAX_RUNTIME_PROGRAMS)' <<<"$watch_snapshot_body" \
     || ! grep -Fq 'now < watcher.deadline' <<<"$watch_service_body"; then
     echo 'a parked watch must be judged by the digest of the reply itself and re-armed at its deadline' >&2
     static_failures=$((static_failures + 1))

@@ -37,6 +37,12 @@ impl WaylandState {
             pointer_button_down: false,
             pointer_motion_pending: false,
             next_pointer_motion_flush: Instant::now(),
+            last_input_activity: Instant::now(),
+            cursor_shape: 1,
+            next_activation_token_seq: 1,
+            activation_tokens: VecDeque::new(),
+            idle_notifications: Vec::new(),
+            idle_inhibitors: Vec::new(),
             dirty: false,
             callback_profile_started: Instant::now(),
             callback_profile_count: 0,
@@ -325,7 +331,7 @@ impl WaylandState {
     pub(crate) fn flush_buffer_releases(&mut self) -> u64 {
         let mut released = 0_u64;
         for surface in &self.surfaces {
-            let releases = {
+            let mut releases = {
                 let Ok(mut surface) = surface.shared.lock() else {
                     continue;
                 };
@@ -334,16 +340,24 @@ impl WaylandState {
                 }
                 core::mem::take(&mut surface.pending_buffer_releases)
             };
-            for buffer in releases {
+            for buffer in releases.drain(..) {
                 released = released.saturating_add(1);
                 super::dmabuf::note_release(&buffer);
                 buffer.release();
+            }
+            if let Ok(mut state) = surface.shared.lock() {
+                if state.pending_buffer_releases.is_empty()
+                    && state.pending_buffer_releases.capacity() < releases.capacity()
+                {
+                    state.pending_buffer_releases = releases;
+                }
             }
         }
         released
     }
 
     pub(super) fn send_frame_callbacks(&mut self) {
+        let completed_at = Instant::now();
         let time = self.event_time_ms();
         // `V5-UI-PIPELINE-011`: both completions carry the frame identity that
         // produced them. Release may precede presentation, so they are counted
@@ -352,7 +366,7 @@ impl WaylandState {
         let mut completed = 0_u64;
         let mut max_wait_micros = 0_u64;
         for surface in &self.surfaces {
-            let callbacks = {
+            let mut callbacks = {
                 let Ok(mut surface) = surface.shared.lock() else {
                     continue;
                 };
@@ -377,9 +391,10 @@ impl WaylandState {
                     continue;
                 }
             };
-            for pending in callbacks {
+            for pending in callbacks.drain(..) {
                 let wait_micros =
-                    u64::try_from(pending.requested_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    u64::try_from(completed_at.duration_since(pending.requested_at).as_micros())
+                        .unwrap_or(u64::MAX);
                 self.callback_profile_count = self.callback_profile_count.saturating_add(1);
                 self.callback_profile_wait_micros = self
                     .callback_profile_wait_micros
@@ -397,6 +412,13 @@ impl WaylandState {
                     ));
                 }
                 pending.callback.done(time);
+            }
+            if let Ok(mut state) = surface.shared.lock() {
+                if state.pending_callbacks.is_empty()
+                    && state.pending_callbacks.capacity() < callbacks.capacity()
+                {
+                    state.pending_callbacks = callbacks;
+                }
             }
         }
         if completed != 0 && crate::loop_timing::frame_seq_is_sampled(frame_seq) {

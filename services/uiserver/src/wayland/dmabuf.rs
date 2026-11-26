@@ -305,11 +305,12 @@ fn admit_import(
     Ok(Imported {
         data: BufferData {
             shared: Arc::new(WaylandBufferState {
-                pool: Arc::new(Mutex::new(WaylandShmPoolState {
+                pool: Some(Arc::new(Mutex::new(WaylandShmPoolState {
                     len: layout.len,
                     fd: Arc::new(plane.fd),
                     _ticket: pool_ticket,
-                })),
+                }))),
+                solid_pixel: None,
                 offset: layout.offset,
                 width: layout.width,
                 height: layout.height,

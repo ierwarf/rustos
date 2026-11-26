@@ -265,43 +265,33 @@ fn ui_phase_name(phase: usize) -> &'static str {
     }
 }
 
-fn cursor_move_update(
-    state: &AppState,
-    presented_cursor_x: u32,
-    presented_cursor_y: u32,
-) -> VisualUpdate {
-    if presented_cursor_x == state.cursor_x && presented_cursor_y == state.cursor_y {
-        return VisualUpdate::default();
-    }
-
-    let mut update = VisualUpdate::cursor(canvas::cursor_dirty_rect(
-        presented_cursor_x,
-        presented_cursor_y,
-        state.surface.width,
-        state.surface.height,
-    ));
-    update.absorb(VisualUpdate::cursor(
-        state.cursor_visual_dirty_rect(state.surface.width, state.surface.height),
-    ));
-    update
-}
-
 fn prepare_drawable_update(
     state: &AppState,
     pending_update: &VisualUpdate,
     presented_cursor_x: u32,
     presented_cursor_y: u32,
-) -> VisualUpdate {
-    let mut drawable_update = pending_update.clone();
-    drawable_update.absorb(cursor_move_update(
-        state,
-        presented_cursor_x,
-        presented_cursor_y,
-    ));
-    drawable_update.coalesce_tight_partials();
-    drawable_update.promote_large_partial(state.surface.width, state.surface.height);
-    drawable_update.split_large_partials();
-    drawable_update
+    drawable_update: &mut VisualUpdate,
+    split_scratch: &mut Vec<canvas::Rect>,
+) {
+    drawable_update.copy_from(pending_update);
+    if presented_cursor_x != state.cursor_x || presented_cursor_y != state.cursor_y {
+        drawable_update.add_cursor_rect(canvas::cursor_dirty_rect(
+            presented_cursor_x,
+            presented_cursor_y,
+            state.surface.width,
+            state.surface.height,
+        ));
+        drawable_update.add_cursor_rect(
+            state.cursor_visual_dirty_rect(state.surface.width, state.surface.height),
+        );
+    }
+    // GPU presentation derives its own atlas-space damage from retained
+    // bindings. Screen-space strip allocation/coalescing is CPU-only work.
+    if state.gpu_admits_cpu_present() {
+        drawable_update.coalesce_tight_partials();
+        drawable_update.promote_large_partial(state.surface.width, state.surface.height);
+        drawable_update.split_large_partials(split_scratch);
+    }
 }
 
 fn install_desktop_background(state: &mut AppState, background: render::DesktopBackground) -> bool {
@@ -416,7 +406,7 @@ fn present_drawable_update(
         });
     }
 
-    let render_rects = drawable_update.partial_rects().to_vec();
+    let render_rects = drawable_update.partial_rects();
     let mut render_elapsed = Duration::ZERO;
     let mut present_elapsed = Duration::ZERO;
     let mut present_union = canvas::Rect::empty();
@@ -616,6 +606,8 @@ fn run() -> Result<(), i32> {
 
     diag_line("uiserver: post-present init begin");
     let mut pending_update = VisualUpdate::default();
+    let mut drawable_update = VisualUpdate::default();
+    let mut split_scratch = Vec::new();
     let mut presented_cursor_x = state.cursor_x;
     let mut presented_cursor_y = state.cursor_y;
     // The runtime link (ready notification and running-set watch) runs on its
@@ -923,11 +915,13 @@ fn run() -> Result<(), i32> {
             pending_update.absorb(VisualUpdate::cursor(cursor_dirty_rect));
             next_cursor_motion_settle = now + CURSOR_MOTION_SETTLE_INTERVAL;
         }
-        let drawable_update = prepare_drawable_update(
+        prepare_drawable_update(
             &state,
             &pending_update,
             presented_cursor_x,
             presented_cursor_y,
+            &mut drawable_update,
+            &mut split_scratch,
         );
         phase_timings.cursor = cursor_phase_started.elapsed();
 

@@ -666,21 +666,10 @@ fn require_request_generation(
 }
 
 fn selected_root_descriptor(info: block::BlockInfo) -> Result<StorageBlockDescriptorWire, i32> {
-    let descriptors = list_descriptors(info)?;
-    descriptors
-        .iter()
-        .copied()
-        .min_by_key(root_selection_rank)
-        .ok_or(libc::ENODEV)
+    list_descriptors(info).map(|[descriptor]| descriptor)
 }
 
-fn root_selection_rank(descriptor: &StorageBlockDescriptorWire) -> (u8, u8, u32) {
-    let partition_rank = u8::from(descriptor.start_block == 0);
-    let readonly_rank = u8::from((descriptor.flags & STORAGE_FLAG_READONLY) != 0);
-    (partition_rank, readonly_rank, descriptor.id)
-}
-
-fn list_descriptors(info: block::BlockInfo) -> Result<Vec<StorageBlockDescriptorWire>, i32> {
+fn list_descriptors(info: block::BlockInfo) -> Result<[StorageBlockDescriptorWire; 1], i32> {
     let sectors_per_block = u64::from(info.logical_block_size / 512);
     if sectors_per_block == 0 || !info.capacity_sectors.is_multiple_of(sectors_per_block) {
         return Err(libc::EIO);
@@ -702,7 +691,7 @@ fn list_descriptors(info: block::BlockInfo) -> Result<Vec<StorageBlockDescriptor
         ..StorageBlockDescriptorWire::default()
     };
     descriptor.path[..path.len()].copy_from_slice(path);
-    Ok(vec![descriptor])
+    Ok([descriptor])
 }
 
 fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result<(), i32> {

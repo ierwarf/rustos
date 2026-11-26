@@ -4,8 +4,8 @@ use super::{
     AtlasDamageEpoch, DvmGpuAtlasDamage, GPU_COMPLETION_TIMEOUT, GPU_FIRST_FRAME_TIMEOUT,
     GPU_FRAME_INTERVAL, GPU_INITIALIZATION_RETAINS_BOOT_CLASS, GPU_PROVIDER_HEALTH_INTERVAL,
     GpuCompositorRuntime, GpuProviderAdmission, Rect, completion_wait_origin,
-    copy_atlas_damage_to_slot, difference_bounds, gpu_completion_timed_out, gpu_provider_admission,
-    gpu_ready_retry_backoff, next_frame_deadline, reconstruction_damage_within_budget,
+    copy_atlas_damage_to_slot, difference_bounds, difference_damage_into, gpu_completion_timed_out,
+    gpu_provider_admission, gpu_ready_retry_backoff, next_frame_deadline, reconstruction_damage_within_budget,
     snapshot_damage_for_slot,
 };
 use crate::sys::DisplayInfo;
@@ -115,6 +115,83 @@ fn difference_bounds_rejects_incompatible_geometry() {
 }
 
 #[test]
+fn difference_damage_keeps_distant_bands_and_merges_only_identical_adjacent_spans() {
+    let (width, height, stride) = (12, 12, 14);
+    let previous = vec![0; stride * height];
+    let mut next = previous.clone();
+    next[stride + 2..stride + 5].fill(1);
+    next[2 * stride + 2..2 * stride + 5].fill(2);
+    next[3 * stride + 3..3 * stride + 6].fill(3);
+    next[8 * stride + 9] = 4;
+    let mut damage = Vec::new();
+    difference_damage_into(&previous, &next, width, height, stride, &mut damage).unwrap();
+    assert_eq!(damage, vec![
+        DvmGpuAtlasDamage { x: 2, y: 1, width: 3, height: 2 },
+        DvmGpuAtlasDamage { x: 3, y: 3, width: 3, height: 1 },
+        DvmGpuAtlasDamage { x: 9, y: 8, width: 1, height: 1 },
+    ]);
+    assert!(driver_domain_protocol::dvm_gpu_atlas_damage_is_valid(
+        &damage, width as u32, height as u32, false,
+    ));
+}
+
+#[test]
+fn difference_damage_collapses_at_the_wire_cap_and_keeps_later_changes() {
+    let limit = driver_domain_protocol::DVM_GPU_ATLAS_MAX_DAMAGE_RECTS as usize;
+    let (width, height, stride) = (3, limit * 2 + 3, 5);
+    let previous = vec![0; stride * height];
+    let mut next = previous.clone();
+    for band in 0..limit {
+        next[band * 2 * stride + band % width] = 1;
+    }
+    let mut damage = Vec::new();
+    difference_damage_into(&previous, &next, width, height, stride, &mut damage).unwrap();
+    assert_eq!(damage.len(), limit, "the exact wire cap is still representable");
+    let capacity = damage.capacity();
+    next[limit * 2 * stride + 2] = 2;
+    next[(height - 1) * stride] = 3;
+    difference_damage_into(&previous, &next, width, height, stride, &mut damage).unwrap();
+    assert_eq!(damage, vec![DvmGpuAtlasDamage {
+        x: 0,
+        y: 0,
+        width: width as u32,
+        height: height as u32,
+    }]);
+    assert_eq!(damage.capacity(), capacity, "the reusable buffer is retained");
+    let mut reconstructed = previous;
+    copy_atlas_damage_to_slot(
+        &mut reconstructed, &next, stride, &damage, width as u32, height as u32,
+    ).unwrap();
+    assert_eq!(reconstructed, next);
+}
+
+#[test]
+fn difference_damage_ignores_stride_padding_and_handles_a_short_final_row() {
+    let (width, height, stride) = (5, 4, 8);
+    let previous = vec![0; 2 * stride + 3];
+    let mut next = previous.clone();
+    next[6] = 99; // padding, never sampled by the atlas image
+    next[1] = 1;
+    next[stride + 4] = 2;
+    next[2 * stride + 2] = 3; // final present texel in the truncated third row
+    let mut damage = Vec::new();
+    difference_damage_into(&previous, &next, width, height, stride, &mut damage).unwrap();
+    assert_eq!(damage, vec![
+        DvmGpuAtlasDamage { x: 1, y: 0, width: 1, height: 1 },
+        DvmGpuAtlasDamage { x: 4, y: 1, width: 1, height: 1 },
+        DvmGpuAtlasDamage { x: 2, y: 2, width: 1, height: 1 },
+    ]);
+    let capacity = damage.capacity();
+    difference_damage_into(&next, &next, width, height, stride, &mut damage).unwrap();
+    assert!(damage.is_empty(), "a reused output cannot retain old damage");
+    assert_eq!(damage.capacity(), capacity);
+    assert!(difference_damage_into(
+        &previous, &next[..next.len() - 1], width, height, stride, &mut damage,
+    ).is_err());
+    assert!(damage.is_empty());
+}
+
+#[test]
 fn frame_deadline_is_spacing_from_submission_not_a_phase_grid() {
     let origin = Instant::now();
     assert_eq!(next_frame_deadline(origin), origin + GPU_FRAME_INTERVAL);
@@ -165,6 +242,57 @@ fn snapshot_damage_keeps_partial_patch_for_exact_slot_predecessor() {
         snapshot_damage_for_slot(8, 9, &requested, &VecDeque::new(), 1600, 900),
         Ok(requested.to_vec())
     );
+}
+
+#[test]
+fn exact_predecessor_damage_is_normalized_for_the_wire_contract() {
+    let requested = [
+        DvmGpuAtlasDamage { x: 2, y: 3, width: 8, height: 9 },
+        DvmGpuAtlasDamage { x: 5, y: 7, width: 8, height: 9 },
+        DvmGpuAtlasDamage { x: 50, y: 60, width: 1, height: 1 },
+    ];
+    let damage = snapshot_damage_for_slot(8, 9, &requested, &VecDeque::new(), 128, 128)
+        .unwrap();
+    assert!(driver_domain_protocol::dvm_gpu_atlas_damage_is_valid(
+        &damage, 128, 128, false,
+    ));
+    assert_eq!(damage.len(), 2);
+    let source: Vec<u32> = (0..128 * 128).collect();
+    let mut destination = vec![u32::MAX; source.len()];
+    copy_atlas_damage_to_slot(&mut destination, &source, 128, &damage, 128, 128).unwrap();
+    for rect in requested {
+        for y in rect.y..rect.y + rect.height {
+            let start = (y * 128 + rect.x) as usize;
+            let end = start + rect.width as usize;
+            assert_eq!(&destination[start..end], &source[start..end]);
+        }
+    }
+
+    let fragmented: Vec<_> = (0..65).map(|index| DvmGpuAtlasDamage {
+        x: index * 2,
+        y: 0,
+        width: 1,
+        height: 1,
+    }).collect();
+    let damage = snapshot_damage_for_slot(8, 9, &fragmented, &VecDeque::new(), 256, 4)
+        .unwrap();
+    assert_eq!(damage.len(), 1);
+    assert!(damage[0].is_full_atlas(256, 4));
+}
+
+#[test]
+fn rejected_overlap_never_partially_writes_a_slot() {
+    let source = vec![1; 256];
+    let mut destination = vec![0; 256];
+    let damage = [
+        DvmGpuAtlasDamage { x: 0, y: 0, width: 16, height: 8 },
+        DvmGpuAtlasDamage { x: 0, y: 4, width: 16, height: 8 },
+    ];
+    assert_eq!(
+        copy_atlas_damage_to_slot(&mut destination, &source, 16, &damage, 16, 16),
+        Err(super::EINVAL),
+    );
+    assert!(destination.iter().all(|&pixel| pixel == 0));
 }
 
 #[test]
@@ -403,19 +531,20 @@ fn repacked_fragment_damage_reconstructs_every_rotated_slot_pixel() {
     intermediate[5 * width + 1..5 * width + 6].fill(0xff123456);
     let mut desired = intermediate.clone();
     desired[10 * width + 11] = 0xff654321;
-    let first = difference_bounds(&old, &intermediate, width, height, width).unwrap();
-    let second = difference_bounds(&intermediate, &desired, width, height, width).unwrap();
+    let mut first = Vec::new();
+    difference_damage_into(&old, &intermediate, width, height, width, &mut first).unwrap();
+    let mut requested = Vec::new();
+    difference_damage_into(&intermediate, &desired, width, height, width, &mut requested).unwrap();
     let history = VecDeque::from([AtlasDamageEpoch {
         epoch: 2,
-        damage: vec![super::damage_from_rect(first)],
+        damage: first,
     }]);
-    let requested = [super::damage_from_rect(second)];
     let damage =
         snapshot_damage_for_slot(1, 3, &requested, &history, width as u32, height as u32).unwrap();
     assert_eq!(
         damage.len(),
-        2,
-        "distant cursor damage must not inflate repack damage"
+        3,
+        "old clear, repacked content, and distant cursor stay separate"
     );
     copy_atlas_damage_to_slot(
         &mut old,

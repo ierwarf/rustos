@@ -87,6 +87,9 @@ pub(super) struct FairQueue<K, T> {
     live: HashMap<JobId, Live<K>>,
     clients: HashMap<K, Load>,
     total_bytes: usize,
+    /// Earliest non-cancelled submission. Readiness checks are much more
+    /// frequent than job retirement, so keep their deadline query O(1).
+    oldest_submitted_at: Option<Duration>,
     next_id: JobId,
     limits: Limits,
 }
@@ -98,6 +101,7 @@ impl<K: Clone + Eq + Hash, T> FairQueue<K, T> {
             live: HashMap::new(),
             clients: HashMap::new(),
             total_bytes: 0,
+            oldest_submitted_at: None,
             next_id: 1,
             limits,
         }
@@ -127,6 +131,7 @@ impl<K: Clone + Eq + Hash, T> FairQueue<K, T> {
         load.jobs += 1;
         load.bytes += bytes;
         self.total_bytes += bytes;
+        self.oldest_submitted_at = Some(self.oldest_submitted_at.map_or(now, |old| old.min(now)));
         self.live.insert(
             id,
             Live {
@@ -160,6 +165,9 @@ impl<K: Clone + Eq + Hash, T> FairQueue<K, T> {
 
     fn release(&mut self, id: JobId) -> Option<Live<K>> {
         let live = self.live.remove(&id)?;
+        if self.oldest_submitted_at == Some(live.submitted_at) {
+            self.refresh_oldest_submission();
+        }
         self.total_bytes = self.total_bytes.saturating_sub(live.bytes);
         if let Some(load) = self.clients.get_mut(&live.key) {
             load.jobs = load.jobs.saturating_sub(1);
@@ -174,6 +182,13 @@ impl<K: Clone + Eq + Hash, T> FairQueue<K, T> {
         Some(live)
     }
 
+    fn refresh_oldest_submission(&mut self) {
+        self.oldest_submitted_at = self.live.values()
+            .filter(|live| !live.cancelled)
+            .map(|live| live.submitted_at)
+            .min();
+    }
+
     /// A running job returned. True when its result is still wanted.
     pub(super) fn finish(&mut self, id: JobId) -> bool {
         self.release(id).is_some_and(|live| !live.cancelled)
@@ -186,6 +201,10 @@ impl<K: Clone + Eq + Hash, T> FairQueue<K, T> {
         let running = match self.live.get_mut(&id) {
             Some(live) if live.running => {
                 live.cancelled = true;
+                let submitted_at = live.submitted_at;
+                if self.oldest_submitted_at == Some(submitted_at) {
+                    self.refresh_oldest_submission();
+                }
                 return;
             }
             Some(_) => false,
@@ -198,6 +217,9 @@ impl<K: Clone + Eq + Hash, T> FairQueue<K, T> {
 
     /// Jobs older than `budget` that nobody has cancelled yet.
     pub(super) fn expired(&self, now: Duration, budget: Duration) -> Vec<JobId> {
+        if !self.has_expired(now, budget) {
+            return Vec::new();
+        }
         self.live
             .iter()
             .filter(|(_, live)| !live.cancelled && now.saturating_sub(live.submitted_at) >= budget)
@@ -206,9 +228,8 @@ impl<K: Clone + Eq + Hash, T> FairQueue<K, T> {
     }
 
     pub(super) fn has_expired(&self, now: Duration, budget: Duration) -> bool {
-        self.live
-            .values()
-            .any(|live| !live.cancelled && now.saturating_sub(live.submitted_at) >= budget)
+        self.oldest_submitted_at
+            .is_some_and(|oldest| now.saturating_sub(oldest) >= budget)
     }
 
     pub(super) fn has_queued(&self) -> bool {
@@ -268,108 +289,105 @@ impl SnapshotSpec {
     }
 
     fn run_with_scratch(self, scratch: &mut Vec<u8>) -> io::Result<SnapshotPixels> {
-        let bad = || io::Error::from(io::ErrorKind::InvalidData);
-        match self.layout {
+        let (width, height, stride, has_alpha) = match self.layout {
             SnapshotLayout::Full {
                 width,
                 height,
                 stride,
                 has_alpha,
-            } => {
-                let width_bytes = width.checked_mul(4).ok_or_else(bad)?;
-                let count = checked_wayland_pixel_count(width, height).ok_or_else(bad)?;
-                let expected_tight = width_bytes.checked_mul(height).ok_or_else(bad)?;
-                if stride == width_bytes && self.read_len == expected_tight {
-                    let mut pixels: Vec<u32> = Vec::new();
-                    pixels
-                        .try_reserve_exact(count)
-                        .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
-                    let spare_bytes: &mut [std::mem::MaybeUninit<u8>] = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            pixels.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(),
-                            expected_tight,
-                        )
-                    };
-                    super::shm::read_shm_snapshot_into_uninit(
-                        self.fd.as_raw_fd(),
-                        self.read_start,
-                        spare_bytes,
-                    )?;
-                    // SAFETY: `read_shm_snapshot_into_uninit` initialized all
-                    // `count * 4` bytes, and every bit pattern of `u32` is valid.
-                    unsafe {
-                        pixels.set_len(count);
-                    }
-                    if !has_alpha {
-                        for pixel in &mut pixels {
-                            *pixel |= 0xff00_0000;
-                        }
-                    }
-                    return Ok(SnapshotPixels::Full {
-                        pixels,
-                        width,
-                        height,
-                    });
-                }
-                super::shm::read_shm_snapshot_into(
-                    self.fd.as_raw_fd(),
-                    self.read_start,
-                    self.read_len,
-                    scratch,
-                )?;
-                let mut pixels: Vec<u32> = Vec::new();
-                pixels
-                    .try_reserve_exact(count)
-                    .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
-                pixels.resize(count, 0);
-                for row in 0..height {
-                    let src_start = row.checked_mul(stride).ok_or_else(bad)?;
-                    let src_end = src_start.checked_add(width_bytes).ok_or_else(bad)?;
-                    let dst_start = row.checked_mul(width).ok_or_else(bad)?;
-                    let src = scratch.get(src_start..src_end).ok_or_else(bad)?;
-                    let dst = pixels.get_mut(dst_start..dst_start + width).ok_or_else(bad)?;
-                    if !copy_wayland_bgra_row(src, dst, has_alpha) {
-                        return Err(bad());
-                    }
-                }
-                Ok(SnapshotPixels::Full {
-                    pixels,
-                    width,
-                    height,
-                })
-            }
+            } => (width, height, stride, has_alpha),
             SnapshotLayout::Damage {
                 damage,
                 stride,
                 has_alpha,
-            } => {
-                super::shm::read_shm_snapshot_into(
-                    self.fd.as_raw_fd(),
-                    self.read_start,
-                    self.read_len,
-                    scratch,
-                )?;
-                let width_bytes = damage.width.checked_mul(4).ok_or_else(bad)?;
-                let count = damage.width.checked_mul(damage.height).ok_or_else(bad)?;
-                let mut rows: Vec<u32> = Vec::new();
-                rows.try_reserve_exact(count)
-                    .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
-                rows.resize(count, 0);
-                for row in 0..damage.height {
-                    let src_start = row.checked_mul(stride).ok_or_else(bad)?;
-                    let src_end = src_start.checked_add(width_bytes).ok_or_else(bad)?;
-                    let dst_start = row * damage.width;
-                    let src = scratch.get(src_start..src_end).ok_or_else(bad)?;
-                    let dst = rows
-                        .get_mut(dst_start..dst_start + damage.width)
-                        .ok_or_else(bad)?;
-                    if !copy_wayland_bgra_row(src, dst, has_alpha) {
-                        return Err(bad());
-                    }
+            } => (damage.width, damage.height, stride, has_alpha),
+        };
+        let pixels = self.read_pixels(width, height, stride, has_alpha, scratch)?;
+        Ok(match self.layout {
+            SnapshotLayout::Full { .. } => SnapshotPixels::Full {
+                pixels,
+                width,
+                height,
+            },
+            SnapshotLayout::Damage { damage, .. } => SnapshotPixels::Damage {
+                damage,
+                rows: pixels,
+            },
+        })
+    }
+
+    fn read_pixels(
+        &self,
+        width: usize,
+        height: usize,
+        stride: usize,
+        has_alpha: bool,
+        scratch: &mut Vec<u8>,
+    ) -> io::Result<Vec<u32>> {
+        let bad = || io::Error::from(io::ErrorKind::InvalidData);
+        let width_bytes = width.checked_mul(4).ok_or_else(bad)?;
+        let count = checked_wayland_pixel_count(width, height).ok_or_else(bad)?;
+        let tight_len = count.checked_mul(4).ok_or_else(bad)?;
+        let needed = (height - 1)
+            .checked_mul(stride)
+            .and_then(|prefix| prefix.checked_add(width_bytes))
+            .ok_or_else(bad)?;
+        if stride < width_bytes || needed > self.read_len {
+            return Err(bad());
+        }
+        let mut pixels: Vec<u32> = Vec::new();
+        pixels
+            .try_reserve_exact(count)
+            .map_err(|_| io::Error::from_raw_os_error(libc::ENOMEM))?;
+        if self.read_len == tight_len && (stride == width_bytes || height == 1) {
+            // Tight damage and single-row patches have the same native pixel
+            // layout as a full tight buffer. Read directly into the final
+            // allocation, with no staging copy or preliminary zero fill.
+            // SAFETY: capacity is at least `count` u32s, and MaybeUninit<u8>
+            // permits pread to initialize the allocation before publication.
+            let spare_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    pixels.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(),
+                    tight_len,
+                )
+            };
+            super::shm::read_shm_snapshot_into_uninit(
+                self.fd.as_raw_fd(),
+                self.read_start,
+                spare_bytes,
+            )?;
+            // SAFETY: pread initialized every byte, and all u32 bit patterns
+            // are valid. No partially read allocation is ever published.
+            unsafe {
+                pixels.set_len(count);
+            }
+            if !has_alpha {
+                for pixel in &mut pixels {
+                    *pixel |= 0xff00_0000;
                 }
-                Ok(SnapshotPixels::Damage { damage, rows })
+            }
+        } else {
+            super::shm::read_shm_snapshot_into(
+                self.fd.as_raw_fd(),
+                self.read_start,
+                self.read_len,
+                scratch,
+            )?;
+            let spare = &mut pixels.spare_capacity_mut()[..count];
+            for (row, dst) in spare.chunks_exact_mut(width).enumerate() {
+                let start = row * stride;
+                let src = &scratch[start..start + width_bytes];
+                if !copy_wayland_bgra_row_uninit(src, dst, has_alpha) {
+                    return Err(bad());
+                }
+            }
+            // SAFETY: the row helper initialized all `width * height` slots;
+            // no u32 reference was formed while any slot was uninitialized.
+            unsafe {
+                pixels.set_len(count);
             }
         }
+        Ok(pixels)
     }
 }
 
@@ -389,7 +407,15 @@ pub(super) fn blit_damage(
     {
         return false;
     }
+    if damage.is_empty() {
+        return true;
+    }
     let pixels = Arc::make_mut(dst);
+    if damage.x == 0 && damage.width == dst_width {
+        let start = damage.y * dst_width;
+        pixels[start..start + rows.len()].copy_from_slice(rows);
+        return true;
+    }
     for row in 0..damage.height {
         let dst_start = (damage.y + row) * dst_width + damage.x;
         pixels[dst_start..dst_start + damage.width]
@@ -478,6 +504,7 @@ impl SnapshotService {
                         let result = spec.run_with_scratch(&mut scratch);
                         // Keep the staging buffer across frames, but never pin
                         // a one-off huge pool read for the thread's lifetime.
+                        scratch.clear();
                         scratch.shrink_to(MAX_RETAINED_SCRATCH_BYTES);
                         result
                     });
@@ -502,8 +529,18 @@ impl SnapshotService {
         std::mem::take(&mut self.shared.lock().done)
     }
 
-    pub(super) fn has_completions(&self) -> bool {
-        !self.shared.lock().done.is_empty()
+    /// Return the drained allocation after applying completions without
+    /// holding the worker lock. A worker may already have queued another
+    /// batch; in that case its live entries and allocation take precedence.
+    pub(super) fn recycle_completions(&self, completions: Vec<Completion>) {
+        debug_assert!(completions.is_empty());
+        if completions.capacity() == 0 {
+            return;
+        }
+        let mut state = self.shared.lock();
+        if state.done.is_empty() && state.done.capacity() < completions.capacity() {
+            state.done = completions;
+        }
     }
 
     /// Cancel and return every job past its age budget.
@@ -516,13 +553,12 @@ impl SnapshotService {
         expired
     }
 
-    /// Whether some job may already be past its budget, so the UI loop knows a
-    /// protocol turn is owed even with no socket edge.
-    pub(super) fn expiry_due(&self) -> bool {
+    /// Completion and expiry readiness share one lock. A cached oldest live
+    /// submission makes the common no-completion path independent of job count.
+    pub(super) fn needs_service(&self) -> bool {
         let state = self.shared.lock();
-        state
-            .queue
-            .has_expired(self.shared.now(), SNAPSHOT_JOB_BUDGET)
+        !state.done.is_empty()
+            || state.queue.has_expired(self.shared.now(), SNAPSHOT_JOB_BUDGET)
     }
 }
 
@@ -555,8 +591,9 @@ fn worker(shared: Arc<Shared>, mut run: impl FnMut(SnapshotSpec) -> io::Result<S
         drop(state);
         if more {
             // Finishing frees this client's running slot; its next job (or
-            // another client's) may now be runnable.
-            shared.work.notify_all();
+            // another client's) may now be runnable. Only one client slot
+            // was freed, so waking the entire pool adds no parallel work.
+            shared.work.notify_one();
         }
         if let Some(waker) = waker {
             waker.signal();

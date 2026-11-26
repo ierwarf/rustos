@@ -1,8 +1,9 @@
 //! Validated, borrowed argument/environment strings for a synchronous request.
 //!
 //! The request stays borrowed through broker commit. No CString allocation or
-//! payload copy is needed on the ELF path; the broker copies user strings before
+//! payload copy is needed on either image path; the broker copies user strings before
 //! returning, and no pointer is retained across the next receive.
+use alloc::vec::Vec;
 use core::ffi::CStr;
 
 const EINVAL: i32 = 22;
@@ -39,6 +40,12 @@ impl<'a> RequestStrings<'a> {
             // is immutable for the lifetime of this view.
             unsafe { CStr::from_bytes_with_nul_unchecked(item) }
         })
+    }
+
+    /// PE runtime strings require UTF-8; retain only borrowed views instead
+    /// of allocating a CString and copying every argument before conversion.
+    pub fn utf8(&self) -> Result<Vec<&'a str>, i32> {
+        self.iter().map(|value| value.to_str().map_err(|_| EINVAL)).collect()
     }
 }
 
@@ -115,5 +122,17 @@ mod tests {
             RequestStrings::parse(&bytes, bytes.len(), usize::MAX).unwrap_err(),
             EINVAL
         );
+    }
+
+    #[test]
+    fn pe_utf8_views_borrow_and_do_not_restrict_elf_byte_strings() {
+        let bytes = b"app\0NAME=value\0";
+        let strings = RequestStrings::parse(bytes, bytes.len(), 2).unwrap();
+        let views = strings.utf8().unwrap();
+        assert_eq!(views, ["app", "NAME=value"]);
+        assert_eq!(views[1].as_ptr(), bytes[4..].as_ptr());
+        let raw = RequestStrings::parse(b"\xff\0", 2, 1).unwrap();
+        assert_eq!(raw.iter().next().unwrap().to_bytes(), b"\xff");
+        assert_eq!(raw.utf8(), Err(EINVAL));
     }
 }

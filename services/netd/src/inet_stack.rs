@@ -252,8 +252,11 @@ impl Default for BrokerDevice {
     }
 }
 
-pub(super) struct BrokerRxToken<'a> {
-    frame: &'a [u8],
+pub(super) enum BrokerRxToken<'a> {
+    Borrowed(&'a [u8]),
+    /// Loopback already owns this frame. Hand that ownership to the receive
+    /// token instead of copying it into the external-provider scratch area.
+    Owned(Vec<u8>),
 }
 
 pub(super) struct BrokerTxToken<'a> {
@@ -268,14 +271,11 @@ impl Device for BrokerDevice {
         &mut self,
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if let Some(frame) = self.loopback_rx.pop_front() {
-            let len = frame.len().min(self.rx.len());
-            self.rx[..len].copy_from_slice(&frame[..len]);
-            self.errors.record(&self.rx[..len]);
+        if let Some(mut frame) = self.loopback_rx.pop_front() {
+            frame.truncate(self.rx.len());
+            self.errors.record(&frame);
             return Some((
-                BrokerRxToken {
-                    frame: &self.rx[..len],
-                },
+                BrokerRxToken::Owned(frame),
                 BrokerTxToken {
                     loopback_rx: &mut self.loopback_rx,
                 },
@@ -285,9 +285,7 @@ impl Device for BrokerDevice {
             Ok(len) if len > 0 && len <= self.rx.len() => {
                 self.errors.record(&self.rx[..len]);
                 Some((
-                    BrokerRxToken {
-                        frame: &self.rx[..len],
-                    },
+                    BrokerRxToken::Borrowed(&self.rx[..len]),
                     BrokerTxToken {
                         loopback_rx: &mut self.loopback_rx,
                     },
@@ -316,7 +314,10 @@ impl RxToken for BrokerRxToken<'_> {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(self.frame)
+        match self {
+            Self::Borrowed(frame) => f(frame),
+            Self::Owned(frame) => f(&frame),
+        }
     }
 }
 
@@ -525,4 +526,27 @@ pub(super) fn smol_now() -> SmolInstant {
     static START: OnceLock<StdInstant> = OnceLock::new();
     let start = START.get_or_init(StdInstant::now);
     SmolInstant::from_millis(start.elapsed().as_millis().min(i64::MAX as u128) as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_receive_keeps_owned_bytes_and_external_scratch_untouched() {
+        let mut device = BrokerDevice::default();
+        device.rx.fill(0xa5);
+        let frame = vec![0x3c; 64];
+        let original = frame.as_ptr();
+        device.loopback_rx.push_back(frame);
+        {
+            let (rx, _tx) = device.receive(SmolInstant::from_millis(0)).unwrap();
+            rx.consume(|bytes| {
+                assert_eq!(bytes.as_ptr(), original);
+                assert_eq!(bytes, &[0x3c; 64]);
+            });
+        }
+        assert!(device.rx.iter().all(|&byte| byte == 0xa5));
+        assert!(device.loopback_rx.is_empty());
+    }
 }

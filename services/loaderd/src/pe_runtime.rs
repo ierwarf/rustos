@@ -210,22 +210,18 @@ fn build_windows_runtime_blob(
     main: &LoadedPeModule,
     modules: &[LoadedPeModule],
     exec_path: &str,
-    argv: &[CString],
-    env: &[CString],
+    argv: &[&str],
+    env: &[&str],
     runtime_base_hint: u64,
     wine_bootstrap_entry: Option<u64>,
 ) -> Result<RustosProcSetWindowsRuntimeBrokerArgs, i32> {
-    let argv_strings = cstrings_to_strs(argv)?;
-    let env_strings = cstrings_to_strs(env)?;
     let default_argv = [exec_path];
-    let argv_view = if argv_strings.is_empty() {
+    let argv_view = if argv.is_empty() {
         &default_argv[..]
     } else {
-        argv_strings.as_slice()
+        argv
     };
-    let command_line = build_windows_command_line(argv_view);
-    let environment_a = build_environment_block_ascii(env_strings.as_slice())?;
-    let environment_w = build_environment_block_utf16(env_strings.as_slice())?;
+    let command_line = loaderd::windows_strings::command_line(argv_view);
     let base_module_name = file_name_from_path(exec_path);
     let module_directory = directory_name_from_path(exec_path);
 
@@ -254,8 +250,12 @@ fn build_windows_runtime_blob(
     let base_name_w_offset = builder.push_utf16_z(base_module_name);
     let command_line_a_offset = builder.push_ascii_z(command_line.as_str());
     let command_line_w_offset = builder.push_utf16_z(command_line.as_str());
-    let environment_a_offset = builder.push_bytes(environment_a.as_slice(), 1);
-    let environment_w_offset = builder.push_bytes(environment_w.as_slice(), 2);
+    let environment_a_offset =
+        loaderd::windows_strings::append_environment_ascii(&mut builder.bytes, env).start;
+    builder.align(2);
+    let environment_w =
+        loaderd::windows_strings::append_environment_utf16(&mut builder.bytes, env);
+    let environment_w_offset = environment_w.start;
     let decimal_point_a_offset = builder.push_ascii_z(".");
     let empty_a_offset = builder.push_ascii_z("");
     let decimal_point_w_offset = builder.push_utf16_z(".");
@@ -293,13 +293,13 @@ fn build_windows_runtime_blob(
     }
     builder.push_u64(0);
 
-    let mut env_string_offsets = Vec::with_capacity(env_strings.len());
-    for item in &env_strings {
+    let mut env_string_offsets = Vec::with_capacity(env.len());
+    for item in env {
         env_string_offsets.push(builder.push_ascii_z(item));
     }
     builder.align(8);
     let environ_table_offset = builder.bytes.len();
-    for _ in &env_strings {
+    for _ in env {
         builder.push_u64(0);
     }
     builder.push_u64(0);
@@ -537,7 +537,7 @@ fn build_windows_runtime_blob(
         let wine_params_addr = cursor;
 
         let wine_dos_exec_path = windows_dos_path_for_exec(exec_path);
-        let wine_dos_cmd = build_windows_command_line(
+        let wine_dos_cmd = loaderd::windows_strings::command_line(
             &argv_view
                 .iter()
                 .enumerate()
@@ -549,7 +549,7 @@ fn build_windows_runtime_blob(
             wine_params_addr,
             &wine_dos_exec_path,
             &wine_dos_cmd,
-            environment_w.as_slice(),
+            &builder.bytes[environment_w],
         )?;
         let total_end = wine_params_addr.checked_add(params_size).ok_or(EOVERFLOW)?;
         build_and_map_wine_peb_teb_kusd(
@@ -838,87 +838,6 @@ fn open_readonly(path: &str, deadline: AbsoluteDeadline) -> Result<i32, i32> {
     open_immutable_file_snapshot_until(path, 0, 0, deadline).map(|snapshot| snapshot.into_fd())
 }
 
-fn cstrings_to_strs(values: &[CString]) -> Result<Vec<&str>, i32> {
-    values
-        .iter()
-        .map(|value| core::str::from_utf8(value.as_bytes()).map_err(|_| EINVAL))
-        .collect()
-}
-
-fn build_windows_command_line(argv: &[&str]) -> String {
-    let mut command_line = String::new();
-    for (index, arg) in argv.iter().enumerate() {
-        if index != 0 {
-            command_line.push(' ');
-        }
-        command_line.push_str(quote_command_line_arg(arg).as_str());
-    }
-    command_line
-}
-
-fn quote_command_line_arg(arg: &str) -> String {
-    if arg.is_empty() {
-        return String::from("\"\"");
-    }
-    if !arg.bytes().any(|byte| matches!(byte, b' ' | b'\t' | b'"')) {
-        return String::from(arg);
-    }
-    let mut quoted = String::from("\"");
-    let mut backslashes = 0usize;
-    for ch in arg.chars() {
-        match ch {
-            '\\' => backslashes += 1,
-            '"' => {
-                for _ in 0..(backslashes * 2 + 1) {
-                    quoted.push('\\');
-                }
-                quoted.push('"');
-                backslashes = 0;
-            }
-            _ => {
-                for _ in 0..backslashes {
-                    quoted.push('\\');
-                }
-                backslashes = 0;
-                quoted.push(ch);
-            }
-        }
-    }
-    for _ in 0..(backslashes * 2) {
-        quoted.push('\\');
-    }
-    quoted.push('"');
-    quoted
-}
-
-fn build_environment_block_ascii(env: &[&str]) -> Result<Vec<u8>, i32> {
-    let mut bytes = Vec::new();
-    for item in env {
-        bytes.extend_from_slice(item.as_bytes());
-        bytes.push(0);
-    }
-    bytes.push(0);
-    if bytes.len() > WINDOWS_RUNTIME_STRING_LIMIT {
-        return Err(ENOEXEC);
-    }
-    Ok(bytes)
-}
-
-fn build_environment_block_utf16(env: &[&str]) -> Result<Vec<u8>, i32> {
-    let mut bytes = Vec::new();
-    for item in env {
-        for code_unit in item.encode_utf16() {
-            bytes.extend_from_slice(&code_unit.to_le_bytes());
-        }
-        bytes.extend_from_slice(&0_u16.to_le_bytes());
-    }
-    bytes.extend_from_slice(&0_u16.to_le_bytes());
-    if bytes.len() > WINDOWS_RUNTIME_STRING_LIMIT {
-        return Err(ENOEXEC);
-    }
-    Ok(bytes)
-}
-
 fn as_bytes<T>(value: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
 }
@@ -1088,14 +1007,4 @@ fn pe_map_flags(characteristics: u32) -> Result<u64, i32> {
         flags |= PROC_BROKER_MAP_EXEC;
     }
     Ok(flags)
-}
-
-#[cfg(test)]
-mod command_line_tests {
-    use super::quote_command_line_arg;
-
-    #[test]
-    fn quotes_double_backslashes_before_embedded_quote() {
-        assert_eq!(quote_command_line_arg("a\\\"b"), "\"a\\\\\\\"b\"");
-    }
 }

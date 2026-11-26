@@ -104,8 +104,20 @@ impl VisualUpdate {
 
     pub(crate) fn cursor(rect: canvas::Rect) -> Self {
         let mut update = Self::default();
-        update.merge_partial_rect(rect);
+        update.add_cursor_rect(rect);
         update
+    }
+
+    pub(crate) fn copy_from(&mut self, other: &Self) {
+        self.needs_full_redraw = other.needs_full_redraw;
+        self.scene_dirty = other.scene_dirty;
+        self.partial_rects.clone_from(&other.partial_rects);
+    }
+
+    pub(crate) fn add_cursor_rect(&mut self, rect: canvas::Rect) {
+        if !self.needs_full_redraw {
+            self.merge_partial_rect(rect);
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -165,12 +177,13 @@ impl VisualUpdate {
         }
     }
 
-    pub(crate) fn split_large_partials(&mut self) {
+    pub(crate) fn split_large_partials(&mut self, split: &mut Vec<canvas::Rect>) {
         if self.needs_full_redraw || self.partial_rects.is_empty() {
             return;
         }
 
-        let mut split = Vec::with_capacity(self.partial_rects.len());
+        split.clear();
+        split.reserve(self.partial_rects.len());
         for rect in self.partial_rects.drain(..) {
             let area = rect_area(rect);
             if area <= MAX_PARTIAL_RECT_PIXELS || rect.width == 0 {
@@ -194,7 +207,7 @@ impl VisualUpdate {
                 y = y.saturating_add(height);
             }
         }
-        self.partial_rects = split;
+        core::mem::swap(&mut self.partial_rects, split);
     }
 
     pub(crate) fn coalesce_tight_partials(&mut self) {

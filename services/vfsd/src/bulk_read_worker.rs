@@ -194,6 +194,15 @@ pub(super) enum BulkReadSource {
     },
 }
 
+impl BulkReadSource {
+    fn window_bytes(&self) -> usize {
+        match self {
+            Self::TmpfsNode { .. } | Self::PathChunked { .. } => BULK_READ_LOCKED_CHUNK_BYTES,
+            Self::Mapped { .. } | Self::EarlySystem { .. } => BULK_READ_WINDOW_BYTES,
+        }
+    }
+}
+
 pub(super) struct BulkReadJob {
     pub(super) reply_cap: u64,
     pub(super) offset: u64,
@@ -498,7 +507,10 @@ fn read_source_chunk(source: &mut BulkReadSource, pos: u64, out: &mut [u8]) -> R
 
 fn fill_bulk_memfd(job: &mut BulkReadJob) -> Result<(OwnedBulkMemfd, usize), i32> {
     let mut memfd = OwnedBulkMemfd::create()?;
-    let window = job.count.min(BULK_READ_WINDOW_BYTES);
+    // The requested window must match the source's admission bound. Asking a
+    // locked source for 512 KiB while it deliberately returns at most 128 KiB
+    // makes that full chunk look like EOF and truncates every larger job.
+    let window = job.count.min(job.source.window_bytes());
     let mut buf = Vec::new();
     buf.try_reserve_exact(window).map_err(|_| ENOMEM)?;
     buf.resize(window, 0);
@@ -761,9 +773,26 @@ extern "C" fn bulk_read_worker_entry() -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        BulkReadSlotState, STATE_EMPTY, STATE_EXITING, STATE_IDLE, STATE_READY, STATE_RUNNING,
+        BulkReadSlotState, BulkReadSource, BULK_READ_LOCKED_CHUNK_BYTES, BULK_READ_WINDOW_BYTES,
+        STATE_EMPTY, STATE_EXITING, STATE_IDLE, STATE_READY, STATE_RUNNING,
         STATE_STARTING, STATE_WRITING,
     };
+
+    #[test]
+    fn transfer_window_matches_the_sources_lock_bound() {
+        let tmpfs = BulkReadSource::TmpfsNode { mount_id: 1, node: 2 };
+        let path = BulkReadSource::PathChunked {
+            path: alloc::string::String::from("/data/f"),
+            pid: 1,
+            file_len: 1024 * 1024,
+            mount_generation: 1,
+        };
+        let early = BulkReadSource::EarlySystem { path: alloc::string::String::from("/init") };
+        assert_eq!(tmpfs.window_bytes(), BULK_READ_LOCKED_CHUNK_BYTES);
+        assert_eq!(path.window_bytes(), BULK_READ_LOCKED_CHUNK_BYTES);
+        assert_eq!(early.window_bytes(), BULK_READ_WINDOW_BYTES);
+        assert!(tmpfs.window_bytes() < early.window_bytes());
+    }
 
     #[test]
     fn slot_state_supports_cold_start_warm_reuse_and_idle_retirement() {

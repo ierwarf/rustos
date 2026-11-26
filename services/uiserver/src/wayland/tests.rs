@@ -321,7 +321,8 @@ fn shm_buffer(
 ) -> super::BufferData {
     super::BufferData {
         shared: Arc::new(super::WaylandBufferState {
-            pool,
+            pool: Some(pool),
+            solid_pixel: None,
             offset,
             width,
             height,
@@ -3035,4 +3036,112 @@ fn keyboard_focus_updates_activated_state_in_toplevel_configure() {
         .expect("Unactivated configure on focus clear");
     assert!(!states.contains(&(xdg_toplevel::State::Activated as u32)));
     let _ = (res, client_id);
+}
+
+#[test]
+fn chrome_wayland_extensions_bind_and_execute() {
+    let mut display = test_display();
+    let mut state = super::WaylandState::new(1024, 768);
+    let (mut peer, _file, names) = client_with_mapped_toplevel(&mut display, &mut state);
+    let _ = wire::events(&mut peer);
+    assert!(names.contains_key("wp_content_type_manager_v1"));
+    assert!(names.contains_key("wp_fractional_scale_manager_v1"));
+    assert!(names.contains_key("wp_cursor_shape_manager_v1"));
+    assert!(names.contains_key("wp_single_pixel_buffer_manager_v1"));
+    assert!(names.contains_key("xdg_activation_v1"));
+    assert!(names.contains_key("zwp_idle_inhibit_manager_v1"));
+    assert!(names.contains_key("ext_idle_notifier_v1"));
+
+    // Bind extension globals to high object IDs cleanly separated from client_with_mapped_toplevel IDs (1..=20).
+    let bind = |peer: &mut std::os::unix::net::UnixStream, iface: &str, ver: u32, id: u32| {
+        let mut args = wire::u32s(&[names[iface]]);
+        args.extend(wire::string(iface));
+        args.extend(wire::u32s(&[ver, id]));
+        wire::send(peer, &wire::message(2, 0, &args));
+    };
+    bind(&mut peer, "wl_seat", 7, 11);
+    bind(&mut peer, "wp_content_type_manager_v1", 1, 12);
+    bind(&mut peer, "wp_fractional_scale_manager_v1", 1, 13);
+    bind(&mut peer, "wp_cursor_shape_manager_v1", 2, 14);
+    bind(&mut peer, "wp_single_pixel_buffer_manager_v1", 1, 15);
+    bind(&mut peer, "xdg_activation_v1", 1, 16);
+    bind(&mut peer, "zwp_idle_inhibit_manager_v1", 1, 17);
+    bind(&mut peer, "ext_idle_notifier_v1", 2, 18);
+
+    // wl_seat.get_pointer(19) -> wp_cursor_shape_manager_v1.get_pointer(20, 19) -> set_shape(1, 4=pointer)
+    wire::send(&mut peer, &wire::message(11, 0, &wire::u32s(&[19])));
+    wire::send(&mut peer, &wire::message(14, 1, &wire::u32s(&[20, 19])));
+    wire::send(&mut peer, &wire::message(20, 1, &wire::u32s(&[1, 4])));
+
+    // wp_content_type_manager_v1.get_surface_content_type(21, surface=6) -> set_content_type(2=video)
+    wire::send(&mut peer, &wire::message(12, 1, &wire::u32s(&[21, 6])));
+    wire::send(&mut peer, &wire::message(21, 1, &wire::u32s(&[2])));
+
+    // wp_fractional_scale_manager_v1.get_fractional_scale(22, surface=6)
+    wire::send(&mut peer, &wire::message(13, 1, &wire::u32s(&[22, 6])));
+
+    // xdg_activation_v1.get_activation_token(23) -> commit()
+    wire::send(&mut peer, &wire::message(16, 1, &wire::u32s(&[23])));
+    wire::send(&mut peer, &wire::message(23, 3, &[]));
+
+    // wp_single_pixel_buffer_manager_v1.create_u32_rgba_buffer(24, r, g, b, a)
+    wire::send(
+        &mut peer,
+        &wire::message(15, 1, &wire::u32s(&[24, u32::MAX, 0, 0, u32::MAX])),
+    );
+
+    // zwp_idle_inhibit_manager_v1.create_inhibitor(25, surface=6)
+    // ext_idle_notifier_v1.get_idle_notification(26, timeout=0, seat=11)
+    // ext_idle_notifier_v1.get_input_idle_notification(27, timeout=0, seat=11)
+    wire::send(&mut peer, &wire::message(17, 1, &wire::u32s(&[25, 6])));
+    wire::send(&mut peer, &wire::message(18, 1, &wire::u32s(&[26, 0, 11])));
+    wire::send(&mut peer, &wire::message(18, 2, &wire::u32s(&[27, 0, 11])));
+
+    pump(&mut display, &mut state);
+    let events = wire::events(&mut peer);
+    assert!(!events.iter().any(|e| e.0 == 1 && e.1 == 0), "no wl_display.error: {events:?}");
+
+    // wp_fractional_scale_v1.preferred_scale(120 * output_scale)
+    let scale_ev = events.iter().find(|e| e.0 == 22 && e.1 == 0).expect("preferred_scale");
+    let expected_scale = (state.output_scale.max(1) as u32) * 120;
+    assert_eq!(
+        u32::from_ne_bytes(scale_ev.2[..4].try_into().unwrap()),
+        expected_scale
+    );
+
+    // xdg_activation_token_v1.done(token)
+    let token_ev = events.iter().find(|e| e.0 == 23 && e.1 == 0).expect("activation done");
+    let token_len = u32::from_ne_bytes(token_ev.2[..4].try_into().unwrap()) as usize;
+    let token = String::from_utf8(token_ev.2[4..4 + token_len - 1].to_vec()).unwrap();
+
+    // Activate clears keyboard focus first, then xdg_activation_v1.activate(token, surface=6) restores it.
+    state.set_keyboard_focus(None);
+    let mut act_args = wire::string(&token);
+    act_args.extend(wire::u32s(&[6]));
+    wire::send(&mut peer, &wire::message(16, 2, &act_args));
+    pump(&mut display, &mut state);
+    assert!(state.keyboard_focus.is_some(), "xdg_activation must focus surface");
+    assert!(state.cursor_shape == 4);
+    assert_eq!(state.surfaces[0].shared.lock().unwrap().content_type, 2);
+
+    // Input idle notification idles immediately at timeout=0, whereas general notification stays inhibited!
+    assert!(events.iter().any(|e| e.0 == 27 && e.1 == 0), "input idle fires when timeout=0");
+    assert!(!events.iter().any(|e| e.0 == 26 && e.1 == 0), "general idle inhibited while zwp_idle_inhibitor active");
+
+    // Destroying inhibitor lets general idle notification fire.
+    wire::send(&mut peer, &wire::message(25, 0, &[]));
+    pump(&mut display, &mut state);
+    state.update_idle_notifications(std::time::Instant::now() + std::time::Duration::from_millis(1));
+    pump(&mut display, &mut state);
+    let events2 = wire::events(&mut peer);
+    assert!(events2.iter().any(|e| e.0 == 26 && e.1 == 0), "idle fires once inhibitor destroyed");
+
+    // Commit single-pixel buffer (24) on surface 6 and verify scaled solid red pixels.
+    wire::send(&mut peer, &wire::message(6, 1, &wire::u32s(&[24, 0, 0])));
+    wire::send(&mut peer, &wire::message(6, 6, &[]));
+    pump(&mut display, &mut state);
+    let surface = state.surfaces[0].shared.lock().unwrap();
+    let expected_dim = state.output_scale.max(1) as usize;
+    assert_eq!((surface.width, surface.height), (expected_dim, expected_dim));
+    assert_eq!(*surface.pixels, vec![0xffff_0000; expected_dim * expected_dim]);
 }

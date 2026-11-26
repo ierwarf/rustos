@@ -271,9 +271,15 @@ impl InputQueue {
         let incoming = overflow_class(event);
         let mut victims: [Option<usize>; 5] = [None; 5];
         for (index, queued) in self.events.iter().enumerate() {
-            let slot = &mut victims[overflow_class(*queued) as usize];
+            let class = overflow_class(*queued);
+            let slot = &mut victims[class as usize];
             if slot.is_none() {
                 *slot = Some(index);
+            }
+            if class == OverflowClass::Position {
+                // Nothing is cheaper to evict; this is already the oldest
+                // sample of the globally first eviction class.
+                break;
             }
         }
         // Only evict something strictly cheaper than, or as cheap as, the
@@ -338,12 +344,23 @@ impl InputQueue {
         oldest
     }
 
+    #[cfg(test)]
     fn pop_front(&mut self) -> Option<input_evdev::InputEvent> {
         let event = self.events.pop_front();
         if event.is_some() && self.events.is_empty() {
             self.advance_readiness_generation();
         }
         event
+    }
+
+    fn consume_prefix(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        drop(self.events.drain(..count));
+        if self.events.is_empty() {
+            self.advance_readiness_generation();
+        }
     }
 
     /// Publish every readiness transition, in both directions.
@@ -449,14 +466,14 @@ impl InputQueue {
         if position.x < 0 || position.y < 0 {
             return;
         }
-        if self.pointer_surface.configured()
-            && (position.x as u32 >= self.pointer_surface.width
-                || position.y as u32 >= self.pointer_surface.height)
-        {
-            return;
-        }
+        let on_surface = !self.pointer_surface.configured()
+            || ((position.x as u32) < self.pointer_surface.width
+                && (position.y as u32) < self.pointer_surface.height);
         let coordinates = (position.x, position.y);
-        let changed = self.dvm_pointer_position != Some(coordinates);
+        // A resize can make a still-valid device report fall outside the new
+        // surface. Reject its position, but retain wheel/button transitions:
+        // dropping the whole report here could lose the sole button release.
+        let changed = on_surface && self.dvm_pointer_position != Some(coordinates);
         if changed {
             self.push(input_evdev::InputEvent {
                 kind: input_evdev::INPUT_KIND_POINTER_POSITION,
@@ -860,6 +877,30 @@ mod tests {
     }
 
     #[test]
+    fn surface_resize_does_not_hide_an_outside_pointer_button_release() {
+        let mut queue = InputQueue::default();
+        queue.set_pointer_surface(1600, 900, 1).unwrap();
+        let position = InputPointerPositionWire {
+            x: 800,
+            y: 450,
+            buttons: input_evdev::POINTER_BUTTON_LEFT as u8,
+            ..InputPointerPositionWire::default()
+        };
+        queue.push_dvm_pointer_position(position);
+        while queue.pop_front().is_some() {}
+        queue.set_pointer_surface(640, 480, 2).unwrap();
+        queue.push_dvm_pointer_position(InputPointerPositionWire { buttons: 0, ..position });
+        assert_eq!(queue.len(), 1);
+        let event = queue.pop_front().unwrap();
+        assert_eq!(event.kind, input_evdev::INPUT_KIND_POINTER_BUTTON);
+        assert_eq!(event.action, input_evdev::INPUT_ACTION_RELEASED);
+        assert_eq!(event.code, input_evdev::POINTER_BUTTON_LEFT);
+        assert_eq!(queue.dvm_pointer_buttons, 0);
+        assert_eq!(queue.published_pointer_buttons, 0);
+        assert_eq!(queue.dvm_pointer_position, Some((800, 450)));
+    }
+
+    #[test]
     fn inputd_queue_preserves_pointer_button_edges_between_positions() {
         let mut queue = InputQueue::default();
         queue.push(pointer_position(10, 20));
@@ -992,6 +1033,86 @@ mod tests {
         let n = super::fill_evdev_payload(&mut queue, &mut payload, want).unwrap();
         assert_eq!(n, 2 * std::mem::size_of::<LinuxInputEvent>());
         assert!(queue.is_empty());
+    }
+
+    fn wrapped_read_queue() -> InputQueue {
+        use input_evdev::*;
+        let mut queue = InputQueue::default();
+        queue.events = std::collections::VecDeque::with_capacity(8);
+        for index in 0..queue.events.capacity() {
+            let event = match index % 4 {
+                0 => pointer_position(index as i32, 17),
+                _ => InputEvent {
+                    kind: INPUT_KIND_KEYBOARD,
+                    action: if index % 4 == 1 { INPUT_ACTION_PRESSED } else { INPUT_ACTION_RELEASED },
+                    code: if index % 4 == 2 { u32::MAX } else { KeyCode::A as u32 },
+                    value0: 0,
+                    value1: 0,
+                    modifiers: index as u32,
+                    text: 0,
+                },
+            };
+            queue.events.push_back(event);
+        }
+        // Move the physical head without making the logical data contiguous.
+        for _ in 0..3 {
+            let event = queue.events.pop_front().unwrap();
+            queue.events.push_back(event);
+        }
+        assert!(!queue.events.as_slices().1.is_empty());
+        queue
+    }
+
+    #[test]
+    fn native_bulk_read_preserves_wrapped_order_partial_drain_and_padding() {
+        let mut queue = wrapped_read_queue();
+        let mut expected = Vec::new();
+        for event in &queue.events {
+            expected.extend_from_slice(&event.kind.to_ne_bytes());
+            expected.extend_from_slice(&event.action.to_ne_bytes());
+            expected.extend_from_slice(&event.code.to_ne_bytes());
+            expected.extend_from_slice(&event.value0.to_ne_bytes());
+            expected.extend_from_slice(&event.value1.to_ne_bytes());
+            expected.extend_from_slice(&event.modifiers.to_ne_bytes());
+            expected.extend_from_slice(&event.text.to_ne_bytes());
+        }
+        let event_size = std::mem::size_of::<input_evdev::InputEvent>();
+        let first_bytes = (queue.events.as_slices().0.len() + 1) * event_size;
+        let mut payload = [0xa5; super::INPUTD_READ_PAYLOAD_CAPACITY];
+        let generation = queue.readiness_generation;
+        assert_eq!(super::fill_native_payload(&mut queue, &mut payload, first_bytes + 1), Ok(first_bytes));
+        assert_eq!(&payload[..first_bytes], &expected[..first_bytes]);
+        assert!(payload[first_bytes..].iter().all(|&byte| byte == 0xa5));
+        assert_eq!(queue.readiness_generation, generation);
+        payload.fill(0xa5);
+        let rest = expected.len() - first_bytes;
+        assert_eq!(super::fill_native_payload(&mut queue, &mut payload, usize::MAX), Ok(rest));
+        assert_eq!(&payload[..rest], &expected[first_bytes..]);
+        assert!(payload[rest..].iter().all(|&byte| byte == 0xa5));
+        assert!(queue.is_empty());
+        assert_eq!(queue.readiness_generation, generation + 1);
+    }
+
+    #[test]
+    fn evdev_bulk_read_matches_contiguous_translation_across_deque_wrap() {
+        use input_evdev::*;
+        let mut queue = wrapped_read_queue();
+        let input: Vec<_> = queue.events.iter().copied().collect();
+        let capacity = input.len() * MAX_EVDEV_EVENTS_PER_INPUT_EVENT;
+        let mut expected = vec![LinuxInputEvent::default(); capacity];
+        let count = translate_input_events_to_evdev(&input, &mut expected).unwrap();
+        let event_size = std::mem::size_of::<LinuxInputEvent>();
+        let mut payload = [0xa5; super::INPUTD_READ_PAYLOAD_CAPACITY];
+        let generation = queue.readiness_generation;
+        let written = super::fill_evdev_payload(&mut queue, &mut payload, capacity * event_size).unwrap();
+        assert_eq!(written, count * event_size);
+        for (index, expected) in expected[..count].iter().enumerate() {
+            let offset = index * event_size;
+            assert_eq!(super::read_unaligned::<LinuxInputEvent>(&payload[offset..]), *expected);
+        }
+        assert!(payload[written..].iter().all(|&byte| byte == 0xa5));
+        assert!(queue.is_empty());
+        assert_eq!(queue.readiness_generation, generation + 1);
     }
 
     #[test]
@@ -1798,27 +1919,23 @@ fn fill_native_payload(
     requested: usize,
 ) -> Result<usize, i32> {
     let event_size = size_of::<input_evdev::InputEvent>();
-    let capacity = (requested / event_size).min(queue.len());
+    let capacity = (requested.min(payload.len()) / event_size).min(queue.len());
     if capacity == 0 {
         return Ok(0);
     }
-    let mut written = 0usize;
-    for _ in 0..capacity {
-        let Some(event) = queue.pop_front() else {
-            break;
-        };
-        // SAFETY: `event` is a live local UiInputEvent (`repr(C)`, six 32-bit-or-smaller
-        // fields, 24 bytes, no padding), so its `event_size` bytes are initialized;
-        // the view is read-only and copied before `event` is dropped.
-        let bytes = unsafe {
-            slice::from_raw_parts(
-                (&event as *const input_evdev::InputEvent).cast::<u8>(),
-                event_size,
-            )
-        };
-        payload[written..written + event_size].copy_from_slice(bytes);
-        written += event_size;
+    let (front, back) = queue.events.as_slices();
+    let front_count = capacity.min(front.len());
+    let mut written = 0;
+    for events in [&front[..front_count], &back[..capacity - front_count]] {
+        let bytes_len = std::mem::size_of_val(events);
+        // SAFETY: UiInputEvent is an initialized, padding-free repr(C) wire
+        // record. Both borrowed deque slices remain live until after copying;
+        // capacity is bounded by the destination's whole-event byte capacity.
+        let bytes = unsafe { slice::from_raw_parts(events.as_ptr().cast::<u8>(), bytes_len) };
+        payload[written..written + bytes_len].copy_from_slice(bytes);
+        written += bytes_len;
     }
+    queue.consume_prefix(capacity);
     Ok(written)
 }
 
@@ -1828,20 +1945,22 @@ fn fill_evdev_payload(
     requested: usize,
 ) -> Result<usize, i32> {
     thread_local! {
-        static EVDEV_SCRATCH: std::cell::RefCell<(
-            Vec<input_evdev::InputEvent>,
-            Vec<input_evdev::LinuxInputEvent>,
-        )> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+        static EVDEV_SCRATCH: std::cell::RefCell<Vec<input_evdev::LinuxInputEvent>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
     let event_size = size_of::<input_evdev::LinuxInputEvent>();
-    let output_capacity = requested / event_size;
+    let output_capacity = requested.min(payload.len()) / event_size;
     if output_capacity < input_evdev::MAX_EVDEV_EVENTS_PER_INPUT_EVENT || queue.is_empty() {
         return Ok(0);
     }
     EVDEV_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
-        let (input, output) = &mut *scratch;
-        output.resize(output_capacity, input_evdev::LinuxInputEvent::default());
+        // Keep the high-water initialized length. Alternating small and large
+        // reads must not repeatedly zero a previously initialized output tail.
+        if scratch.len() < output_capacity {
+            scratch.resize(output_capacity, input_evdev::LinuxInputEvent::default());
+        }
+        let output = &mut scratch[..output_capacity];
         // Events with no evdev representation translate to nothing. An empty
         // result for a non-empty queue must not look like "no data" (EOF or
         // would-block) to the reader, so keep draining until something maps or
@@ -1851,16 +1970,19 @@ fn fill_evdev_payload(
             let max_input = (output_capacity / input_evdev::MAX_EVDEV_EVENTS_PER_INPUT_EVENT)
                 .min(queue.len())
                 .min(input_evdev::MAX_INPUT_EVENTS_PER_READ);
-            input.clear();
-            input.reserve(max_input.saturating_sub(input.capacity()));
-            for _ in 0..max_input {
-                let Some(event) = queue.pop_front() else {
-                    break;
-                };
-                input.push(event);
-            }
-            written_events = input_evdev::translate_input_events_to_evdev(input, output)
-                .map_err(|_| libc::EINVAL)?;
+            let (front, back) = queue.events.as_slices();
+            let front_count = max_input.min(front.len());
+            written_events = input_evdev::translate_input_events_to_evdev(
+                &front[..front_count],
+                output,
+            )
+            .map_err(|_| libc::EINVAL)?;
+            written_events += input_evdev::translate_input_events_to_evdev(
+                &back[..max_input - front_count],
+                &mut output[written_events..],
+            )
+            .map_err(|_| libc::EINVAL)?;
+            queue.consume_prefix(max_input);
         }
         let bytes_len = written_events * event_size;
         // SAFETY: `output[..written_events]` is initialized `repr(C)` LinuxInputEvent data

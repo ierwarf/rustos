@@ -168,7 +168,19 @@ description. Segment mapping reuses it; it must not repeat the header/table
 `pread` and validation cycle after prepare. Interpreter admission remains
 independent because it owns a different open description and load bias.
 
+Interpreter backing descriptors move into the final cleanup list rather than
+being copied into a second owner. Metadata registration does not consume that
+list; success and every error path retain the same one-time descriptor cleanup.
+
 **PE64:** the main image's load base is independently randomized in the main-image band; rebased DLLs/runtime mappings follow it. Missing or stripped required relocations fail closed rather than reverting to a fixed base. PE validation, section materialization, base relocation, import/export resolution, staged system-DLL registry lookup, PEB/TEB/runtime blob construction all happen in loaderd before commit. The bounded section-header table is fetched with one `pread64`, not one policy/VFS roundtrip per section. PE64 commit includes `SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER` after all `MAP_DATA_BROKER` ops and before `COMMIT_BROKER`. Kernel validates metadata + spawns the materialized address space but **must not** reintroduce PE import/export/system-DLL policy.
+
+PE argument/environment views borrow the validated request strings for the
+synchronous image build; this does not impose UTF-8 on ELF argument bytes.
+Windows command-line quoting appends directly to one string. ANSI and UTF-16
+environment blocks append directly to the final runtime blob, retain its
+aggregate string-size bound, and always end with two NUL characters, including
+an empty environment. UTF-16 range offsets survive later blob growth and are
+also used by the Wine process-parameters path.
 
 A prepared remote file mapping may use a larger internal copy buffer, but each
 fallback read from vfsd is capped to the versioned VFS IPC payload.

@@ -70,15 +70,32 @@ impl BufferData {
                 .checked_sub(1)?
                 .checked_mul(self.shared.stride)?
                 .checked_add(width_bytes)?;
+            // A fully damaged buffer replaces every retained pixel. Publish
+            // the new owned allocation directly instead of cloning the old
+            // Arc-backed frame and then overwriting the clone with a patch.
+            let layout = if damage.x == 0
+                && damage.y == 0
+                && damage.width == self.shared.width
+                && damage.height == self.shared.height
+            {
+                SnapshotLayout::Full {
+                    width: damage.width,
+                    height: damage.height,
+                    stride: self.shared.stride,
+                    has_alpha: self.shared.has_alpha,
+                }
+            } else {
+                SnapshotLayout::Damage {
+                    damage,
+                    stride: self.shared.stride,
+                    has_alpha: self.shared.has_alpha,
+                }
+            };
             Some(SnapshotSpec {
                 fd,
                 read_start,
                 read_len,
-                layout: SnapshotLayout::Damage {
-                    damage,
-                    stride: self.shared.stride,
-                    has_alpha: self.shared.has_alpha,
-                },
+                layout,
             })
         })();
         spec.map_or(DamagePlan::NeedsFull, DamagePlan::Read)
@@ -113,7 +130,7 @@ impl BufferData {
     }
 
     fn pool_handle(&self) -> Option<(Arc<OwnedFd>, usize)> {
-        let pool = self.shared.pool.lock().ok()?;
+        let pool = self.shared.pool.as_ref()?.lock().ok()?;
         Some((Arc::clone(&pool.fd), pool.len))
     }
 }

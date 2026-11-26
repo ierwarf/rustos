@@ -423,20 +423,34 @@ static STAGE_STACK_STATE: [AtomicU32; STAGE_THREADS] =
 /// needed for the ~0.5 s of one snapshot must not stay resident.
 pub(super) struct StageThreads;
 
+/// A worker's exit and its parent's join are independent acknowledgements.
+/// FREE proves the old thread no longer uses the stack; IDLE proves join has
+/// cleared its task pointer and can no longer reset the next generation.
+fn try_claim_stage_stack(stack: &AtomicU32, stage: &AtomicU32) -> bool {
+    if stack.compare_exchange(STACK_FREE, STACK_BUSY, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return false;
+    }
+    // Check after claiming the stack: an IDLE observation before the CAS could
+    // precede an entire competing task generation and become stale.
+    if stage.load(Ordering::Acquire) == STAGE_IDLE {
+        true
+    } else {
+        stack.store(STACK_FREE, Ordering::Release);
+        false
+    }
+}
+
 // SAFETY: `start` stores the task pointer in a slot that exactly one stage
 // thread runs once; `join` returns only after that run reached DONE and the
 // thread no longer touches the task, and the pipeline joins before the borrowed
 // task is dropped (the `StageHost` contract).
 unsafe impl StageHost for StageThreads {
     unsafe fn start(&self, task: &(dyn Fn() + Sync)) -> Option<StageToken> {
-        let index = STAGE_STACK_STATE.iter().position(|state| {
-            state
-                .compare_exchange(STACK_FREE, STACK_BUSY, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+        let index = STAGE_STACK_STATE.iter().enumerate().position(|(index, stack)| {
+            try_claim_stage_stack(stack, &STAGE_SLOTS[index].state)
         })?;
         // SAFETY: the stack claim above makes this thread the slot's only
-        // writer; the slot is IDLE because `join` resets it before the thread
-        // releases the stack.
+        // writer; the subsequent IDLE check acquired the prior join's reset.
         unsafe {
             *STAGE_SLOTS[index].task.get() = Some(TaskPtr(core::mem::transmute::<
                 &(dyn Fn() + Sync),
@@ -469,9 +483,9 @@ unsafe impl StageHost for StageThreads {
             }
             futex_wait(&slot.state, state, PARK_NS);
         }
-        // SAFETY: DONE means the stage thread is finished with the slot. It
-        // still owns the stack until it releases it itself, so the next
-        // `start` on this index cannot begin before the thread is gone.
+        // SAFETY: DONE means the stage thread is finished with the task. The
+        // next start requires both this IDLE reset and the thread's FREE
+        // publication, regardless of which acknowledgement happens first.
         unsafe { *slot.task.get() = None };
         slot.state.store(STAGE_IDLE, Ordering::Release);
     }
@@ -575,5 +589,31 @@ fn futex_wake(word: &AtomicU32, count: usize) {
     // SAFETY: `word` is a live aligned `u32`; FUTEX_WAKE never writes it.
     unsafe {
         rustos_svc_runtime::syscall::futex_wake_private(word.as_ptr(), count as u32);
+    }
+}
+
+#[cfg(test)]
+mod stage_reuse_tests {
+    use super::*;
+
+    #[test]
+    fn exited_stack_cannot_be_reused_before_the_previous_join() {
+        let stack = AtomicU32::new(STACK_FREE);
+        let stage = AtomicU32::new(STAGE_DONE);
+        assert!(!try_claim_stage_stack(&stack, &stage));
+        assert_eq!(stack.load(Ordering::Acquire), STACK_FREE);
+        stage.store(STAGE_IDLE, Ordering::Release);
+        assert!(try_claim_stage_stack(&stack, &stage));
+        assert_eq!(stack.load(Ordering::Acquire), STACK_BUSY);
+        assert!(!try_claim_stage_stack(&stack, &stage));
+    }
+
+    #[test]
+    fn joined_stage_cannot_reuse_its_stack_until_the_thread_exits() {
+        let stack = AtomicU32::new(STACK_BUSY);
+        let stage = AtomicU32::new(STAGE_IDLE);
+        assert!(!try_claim_stage_stack(&stack, &stage));
+        stack.store(STACK_FREE, Ordering::Release);
+        assert!(try_claim_stage_stack(&stack, &stage));
     }
 }

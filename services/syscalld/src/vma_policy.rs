@@ -114,6 +114,25 @@ impl<V: VmaEntry> VmaMap<V> {
             let Some(key) = self.overlapping(cursor, end).next().map(AddressRange::start) else {
                 break;
             };
+            if let Some(update) = update.as_mut() {
+                let vma = self.map.get_mut(&key).expect("overlapping record");
+                if vma.start() >= start && vma.end() <= end {
+                    // Most mprotect records are wholly inside the range.
+                    // Keep their tree nodes and update metadata in place;
+                    // only the two boundary records may need splitting.
+                    let vma_end = vma.end();
+                    update(vma);
+                    let new_key = vma.start();
+                    if new_key != key {
+                        // Preserve the generic callback contract as well as
+                        // the common metadata-only protection update.
+                        let vma = self.map.remove(&key).expect("updated record");
+                        self.map.insert(new_key, vma);
+                    }
+                    cursor = vma_end;
+                    continue;
+                }
+            }
             let Some(vma) = self.map.remove(&key) else {
                 break;
             };

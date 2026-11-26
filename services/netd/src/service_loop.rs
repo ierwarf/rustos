@@ -114,9 +114,14 @@ pub(super) fn inet_readiness_worker_loop() {
 }
 
 pub(super) fn serve_request_loop(endpoint: u64) {
+    let mut request = NetdIpcRequest::default();
     loop {
         service_local_poll_waiters();
-        let mut request = NetdIpcRequest::default();
+        // Admission requires the complete header plus exactly payload_len
+        // bytes. Keep the unused payload tail initialized but untouched across
+        // receives; deferred work owns its full copy. Clear op so a malformed
+        // frame shorter than that field retains the original zero-op reply.
+        request.op = 0;
         let mut reply_cap = 0_u64;
         let mut sender_pid = 0_u64;
         let mut sender_tid = 0_u64;

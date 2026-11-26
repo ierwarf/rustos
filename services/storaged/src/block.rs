@@ -19,7 +19,7 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::read_engine::{Engine, Geometry, Transport, COMPLETION_TIMEOUT};
+use crate::read_engine::{Engine, Geometry, PumpScratch, Transport, COMPLETION_TIMEOUT};
 use rustos_user_abi::syscall::{
     DvmBlockInfoWire, DvmBlockTicketWire, RustosBlockBrokerArgs, BLOCK_BROKER_ABI_VERSION,
     BLOCK_BROKER_FLAG_FUA, BLOCK_BROKER_INFO_FLAG_READ_ONLY, BLOCK_BROKER_OP_DVM_CANCEL,
@@ -38,10 +38,10 @@ static ENGINE: Engine = Engine::new();
 static QUARANTINED_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn require_unquarantined_for(quarantined_gen: &AtomicU64, generation: u64) -> Result<(), i32> {
-    // ORDERING: Acquire pairs with the Release store in `quarantine_provider`,
+    // ORDERING: Acquire pairs with the Release publication in `latch_quarantine`,
     // so a request admitted after the quarantine sees it.
     let q = quarantined_gen.load(Ordering::Acquire);
-    if q != 0 && (generation == 0 || q == generation) {
+    if q != 0 && generation <= q {
         Err(libc::EIO)
     } else {
         Ok(())
@@ -60,13 +60,19 @@ pub(super) fn clear_quarantine_for_new_generation(new_generation: u64) {
 }
 
 fn quarantine_provider(ticket: DvmBlockTicketWire, cause: &str) {
-    // ORDERING: Release latches quarantine before cache invalidation.
-    QUARANTINED_GENERATION.store(ticket.generation.max(1), Ordering::Release);
+    latch_quarantine(&QUARANTINED_GENERATION, ticket.generation);
     clear_read_cache();
     eprintln!(
         "storaged: dvm provider quarantined generation={} request_id={} slot={} cause={cause} quiescence=unproven",
         ticket.generation, ticket.request_id, ticket.data_slot
     );
+}
+
+fn latch_quarantine(quarantined: &AtomicU64, generation: u64) {
+    // ORDERING: Release publishes quarantine before cache invalidation. An
+    // older completion timeout must never overwrite a newer quarantine and
+    // accidentally readmit that newer, still-uncertain provider generation.
+    quarantined.fetch_max(generation.max(1), Ordering::AcqRel);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -255,8 +261,9 @@ pub(super) fn service_read_ahead() {
 
 pub(super) fn run_read_pump() -> ! {
     let mut idle_wakes = 0_u32;
+    let mut scratch = PumpScratch::default();
     loop {
-        let status = ENGINE.pump_once(&DvmTransport);
+        let status = ENGINE.pump_once(&DvmTransport, &mut scratch);
         if status.in_flight == 0 {
             idle_wakes = 0;
             ENGINE.park_until_work(Duration::from_millis(WAIT_SLICE_MILLIS));
@@ -270,7 +277,7 @@ pub(super) fn run_read_pump() -> ! {
             wait_for_transport_event(Instant::now() + Duration::from_millis(WAIT_SLICE_MILLIS));
         // A transport in a terminal state reports an event forever; do not spin.
         idle_wakes = if woke.is_ok() {
-            idle_wakes + 1
+            idle_wakes.saturating_add(1)
         } else {
             idle_wakes
         };
@@ -583,6 +590,18 @@ mod tests {
         // ORDERING: Release pairs with Acquire in `require_unquarantined_for`.
         quarantined.store(7, Ordering::Release);
         assert_eq!(require_unquarantined_for(&quarantined, 7), Err(libc::EIO));
+    }
+
+    #[test]
+    fn late_old_timeout_cannot_lower_a_newer_provider_quarantine() {
+        let quarantined = AtomicU64::new(0);
+        latch_quarantine(&quarantined, 9);
+        latch_quarantine(&quarantined, 7);
+        assert_eq!(quarantined.load(Ordering::Acquire), 9);
+        for generation in [0, 7, 8, 9] {
+            assert_eq!(require_unquarantined_for(&quarantined, generation), Err(libc::EIO));
+        }
+        assert_eq!(require_unquarantined_for(&quarantined, 10), Ok(()));
     }
 
     fn info() -> BlockInfo {

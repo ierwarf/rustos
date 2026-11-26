@@ -182,8 +182,9 @@ pub(super) fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcRespo
         let Some(mut socket) = state.inet_sockets.remove(&request.socket_token) else {
             return libc::EBADF;
         };
-        state.readiness_generations.remove(&request.socket_token);
-        state.readiness_observations.remove(&request.socket_token);
+        // Keep the last observation until guard drop records the removal.
+        // Erasing it here turns the final close into an invisible None→None
+        // transition and strands clients waiting on the previous generation.
         if let Some(stack) = state.inet.as_mut() {
             let immediate_abort = socket.options.linger.0 && socket.options.linger.1 == 0;
             if let Some(mut listener) = socket.tcp_listener.take() {
@@ -216,12 +217,10 @@ pub(super) fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcRespo
         .unwrap_or(0)
 }
 
-/// Withdraws a netlink identity from the table and its readiness bookkeeping.
+/// Withdraws a netlink identity. The readiness publisher consumes the previous
+/// observation and clears its generation when it stamps the final close.
 pub(super) fn retire_netlink_socket(state: &mut NetState, token: u64) -> Option<NetlinkSocket> {
-    let socket = state.netlink_sockets.remove(&token)?;
-    state.readiness_generations.remove(&token);
-    state.readiness_observations.remove(&token);
-    Some(socket)
+    state.netlink_sockets.remove(&token)
 }
 
 /// Performs the final under-lock admission immediately before smoltcp gains a

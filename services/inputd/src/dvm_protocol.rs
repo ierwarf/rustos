@@ -82,7 +82,6 @@ impl DvmDecoder {
                 if epoch != 0
                     && epoch == self.epoch
                     && self.sequence.checked_add(1) == Some(sequence)
-                    && bytes[16..18] != [0, 0]
                     && bytes[19..28].iter().all(|&byte| byte == 0) =>
             {
                 // The frame is authentic and in sequence; a semantically invalid
@@ -90,7 +89,7 @@ impl DvmDecoder {
                 // every later valid frame would be rejected as out of order.
                 self.sequence = sequence;
                 let code = u16::from_be_bytes(bytes[16..18].try_into().expect("key code"));
-                if code > LINUX_EVDEV_KEY_MAX {
+                if code == 0 || code > LINUX_EVDEV_KEY_MAX {
                     return DvmOutcome::default();
                 }
                 let action = match bytes[18] {
@@ -120,10 +119,12 @@ impl DvmDecoder {
                 if epoch != 0
                     && epoch == self.epoch
                     && self.sequence.checked_add(1) == Some(sequence)
-                    && bytes[25..28].iter().all(|&byte| byte == 0)
-                    && bytes[24] & !POINTER_BUTTON_MASK == 0 =>
+                    && bytes[25..28].iter().all(|&byte| byte == 0) =>
             {
                 self.sequence = sequence;
+                if bytes[24] & !POINTER_BUTTON_MASK != 0 {
+                    return DvmOutcome::default();
+                }
                 DvmOutcome {
                     event: Some(InputIngressWire {
                         kind: INPUTD_INGRESS_KIND_POINTER_PACKET,
@@ -150,10 +151,12 @@ impl DvmDecoder {
                 if epoch != 0
                     && epoch == self.epoch
                     && self.sequence.checked_add(1) == Some(sequence)
-                    && bytes[25..28].iter().all(|&byte| byte == 0)
-                    && bytes[24] & !POINTER_BUTTON_MASK == 0 =>
+                    && bytes[25..28].iter().all(|&byte| byte == 0) =>
             {
                 self.sequence = sequence;
+                if bytes[24] & !POINTER_BUTTON_MASK != 0 {
+                    return DvmOutcome::default();
+                }
                 let x = u16::from_be_bytes(bytes[16..18].try_into().expect("pointer x"));
                 let y = u16::from_be_bytes(bytes[18..20].try_into().expect("pointer y"));
                 if x > POINTER_POSITION_MAX_X || y > POINTER_POSITION_MAX_Y {
@@ -333,6 +336,33 @@ mod tests {
         let checksum = crc32(&good.bytes[..28]).to_be_bytes();
         good.bytes[28..32].copy_from_slice(&checksum);
         assert!(decoder.consume(&good).event.is_some());
+    }
+
+    #[test]
+    fn invalid_zero_key_and_pointer_buttons_consume_only_their_sequence() {
+        for kind in [KIND_KEY, KIND_POINTER, KIND_POINTER_POSITION] {
+            let mut decoder = DvmDecoder::default();
+            decoder.consume(&record(KIND_SESSION_START, 9, 0));
+            let mut bad = record(kind, 9, 1);
+            if kind == KIND_KEY {
+                bad.bytes[18] = 1; // code zero is not a key
+            } else {
+                bad.bytes[24] = 0x80; // outside the five supported buttons
+            }
+            let checksum = crc32(&bad.bytes[..28]).to_be_bytes();
+            bad.bytes[28..32].copy_from_slice(&checksum);
+            assert_eq!(decoder.consume(&bad), DvmOutcome::default());
+            assert_eq!(decoder.sequence, 1);
+            assert_eq!(decoder.epoch, 9);
+
+            let mut good = record(KIND_KEY, 9, 2);
+            good.bytes[16..18].copy_from_slice(&30_u16.to_be_bytes());
+            good.bytes[18] = 1;
+            let checksum = crc32(&good.bytes[..28]).to_be_bytes();
+            good.bytes[28..32].copy_from_slice(&checksum);
+            assert!(decoder.consume(&good).event.is_some(), "kind={kind}");
+            assert_eq!(decoder.sequence, 2);
+        }
     }
 
     #[test]

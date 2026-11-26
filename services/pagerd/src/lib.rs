@@ -210,29 +210,35 @@ impl PagerState {
             }
         }
 
-        let mut i = start_idx;
-        let mut remaining = end_idx - start_idx;
-        while remaining > 0 {
-            remaining -= 1;
-            let region = self.regions[i];
+        // Open all split space once, then compact the edited run in place.
+        // The sum of positive fragment growth bounds every prefix, so writes
+        // cannot overtake an unread region. Repeated Vec::remove/insert here
+        // used to move the entire remaining table once per affected region.
+        let old_len = self.regions.len();
+        if additional != 0 {
+            let placeholder = self.regions[start_idx];
+            self.regions.resize(old_len + additional, placeholder);
+            self.regions
+                .copy_within(start_idx..old_len, start_idx + additional);
+        }
+        let mut write = start_idx;
+        for read in start_idx + additional..end_idx + additional {
+            let region = self.regions[read];
             if region.process_generation != process_generation {
-                i += 1;
+                self.regions[write] = region;
+                write += 1;
                 continue;
             }
             let (fragments, len) = apply_region_edit(region, edit).pager_fragments();
-            match len {
-                0 => {
-                    self.regions.remove(i);
-                }
-                _ => {
-                    self.regions[i] = fragments[0];
-                    for (offset, fragment) in fragments[1..len].iter().copied().enumerate() {
-                        self.regions.insert(i + 1 + offset, fragment);
-                    }
-                    i += len;
-                }
-            }
+            self.regions[write..write + len].copy_from_slice(&fragments[..len]);
+            write += len;
         }
+        let tail_start = end_idx + additional;
+        if write != tail_start {
+            self.regions
+                .copy_within(tail_start..old_len + additional, write);
+        }
+        self.regions.truncate(write + old_len - end_idx);
         Ok(edited)
     }
 
@@ -1073,6 +1079,46 @@ mod tests {
             .unwrap();
         assert_eq!(granted.action, PAGER_ACTION_MAP_ZEROED);
         assert_eq!(granted.frame_rights, region.prot);
+    }
+
+    #[test]
+    fn range_compaction_preserves_foreign_generations_and_neighboring_processes() {
+        let base = region(2);
+        for prot in [VM_PROT_READ, 0] {
+            let mut pager = PagerState::new(2);
+            pager.admit_region(PagerVmRegionWire { process_handle: 12, ..base }).unwrap();
+            for index in 0..4_u64 {
+                let start = 0x10_000 + index * 0x4000;
+                pager.admit_region(PagerVmRegionWire {
+                    start,
+                    end: start + 0x4000,
+                    process_generation: if index == 1 { 18 } else { base.process_generation },
+                    ..base
+                }).unwrap();
+            }
+            pager.admit_region(PagerVmRegionWire { process_handle: 14, ..base }).unwrap();
+            let capacity = pager.region_capacity();
+            assert_eq!(pager.protect_range(protect_of(base, 0x12_000, 0x1e_000, prot)), Ok(3));
+            let actual: Vec<_> = pager.regions.iter().map(|r| {
+                (r.process_handle, r.process_generation, r.start, r.end, r.prot, r.object_offset)
+            }).collect();
+            let mut expected = alloc::vec![
+                (12, 17, 0x4000, 0x8000, base.prot, 0),
+                (13, 17, 0x10_000, 0x12_000, base.prot, 0),
+            ];
+            if prot != 0 {
+                expected.push((13, 17, 0x12_000, 0x14_000, prot, 0x2000));
+            }
+            expected.push((13, 18, 0x14_000, 0x18_000, base.prot, 0));
+            if prot != 0 {
+                expected.push((13, 17, 0x18_000, 0x1c_000, prot, 0));
+                expected.push((13, 17, 0x1c_000, 0x1e_000, prot, 0));
+            }
+            expected.push((13, 17, 0x1e_000, 0x20_000, base.prot, 0x2000));
+            expected.push((14, 17, 0x4000, 0x8000, base.prot, 0));
+            assert_eq!(actual, expected);
+            assert_eq!(pager.region_capacity(), capacity);
+        }
     }
 
     #[test]

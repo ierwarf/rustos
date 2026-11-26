@@ -153,6 +153,16 @@ unlock; strictly-newer generation matching tolerates out-of-order signals
 from concurrent publishers. This lets new external packets wake an already
 sleeping generic wait without moving network policy into ring0.
 
+Final INET and netlink retirement leaves the previous readiness observation
+intact until the state guard records the live-to-absent transition. That
+publisher removes the observation/live generation and emits the final wake
+exactly once; pre-clearing the observation would suppress close notification.
+Full netlink sweeps walk the live table directly and separately visit retired
+dirty tokens. Deferred poll passes rotate and retain their existing deque,
+preserving FIFO order and the existing rerun handshake. Loopback reception
+moves the already-owned packet buffer into the smoltcp RxToken; external
+transport receives continue to borrow their bounded initialized scratch.
+
 The generic wait-set gives ordinary Linux applications a bounded aggregate wait
 over Ring0-owned `EpollHandle` interests (backed by local-fd readiness tokens
 plus netd/inputd/sessiond/vfsd readiness generations, exact provider epochs,
@@ -241,6 +251,12 @@ procd owns Linux `execve`, `fork`/`clone`, `wait4`, `rt_sigaction`, `rt_sigprocm
 
 Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pending-signal wakeup, Linux x86_64 `rt_sigframe`/`rt_sigreturn`.
 
+Pure signal selection and alternate-stack queries do not create policy-cache
+entries. When thread policy is absent, selection uses the current kernel-stamped
+mask in the request. Exec preserves an existing cached mask while clearing
+alternate-stack state; with no cached thread state it leaves the cache absent,
+so a fabricated zero mask cannot shadow the mask that the kernel preserved.
+
 - **Service process lifecycle:** runtimed's reap probe uses process-directed
   `kill(pid, 0)`, not leader-thread-directed `tgkill(pid, pid, 0)`.
   A retired leader with live sibling threads must not make an application
@@ -250,6 +266,14 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
 
 ## Syscalld Residual Surface
 
+- A cached MM policy lease takes the value while retaining its PID B-tree
+  slot. The empty occupied slot denotes an outstanding lease and returns
+  EAGAIN to a second acquisition; lease drop restores the value even on an
+  error return. First-time layout query failures leave no placeholder.
+  This remains a single-receive-owner design, not concurrent MM admission.
+  Fully covered VMA protection updates change values in place; boundary
+  splits, address-key changes, fork copies and exec invalidation retain their
+  existing ownership rules.
 - Per-process credentials + 10-resource `prlimit64` policy DB (`RLIMIT_STACK`, `RLIMIT_NOFILE`, `RLIMIT_AS`, `RLIMIT_DATA`, `RLIMIT_CORE`, `RLIMIT_NPROC`, `RLIMIT_MEMLOCK`, `RLIMIT_FSIZE`, `RLIMIT_CPU`, `RLIMIT_LOCKS`): source of truth for Linux-visible `get*id`, `set*id` (including `setres[ug]id` / `setre[ug]id`), `prlimit64`. Kernel process credentials = gated bootstrap/security primitive; **must not** be mutated by Linux `set*id`.
 - Linux `nanosleep`, `clock_gettime`, and `clock_nanosleep` use local
   fixed-envelope validation in compat's timer substrate, not syscalld policy

@@ -13,6 +13,7 @@ pub(crate) enum WindowId {
 pub(crate) struct WindowStack(Vec<WindowId>);
 
 impl WindowStack {
+    #[cfg(test)]
     fn reconcile(&mut self, live: &[WindowId]) {
         self.0.retain(|id| live.contains(id));
         for id in live {
@@ -29,6 +30,74 @@ impl WindowStack {
         self.0.retain(|entry| *entry != id);
         self.0.push(id);
         true
+    }
+
+    fn visit_draw_order(
+        &self,
+        consoles: &[super::ConsoleWindow],
+        wayland: &[crate::wayland::WaylandWindowSnapshot],
+        focused_console: ConsoleSessionHandle,
+        focused_wayland: Option<u32>,
+        mut visit: impl FnMut(WindowId),
+    ) {
+        let focused = if let Some(id) = focused_wayland {
+            wayland
+                .iter()
+                .any(|w| w.surface_id == id && !w.minimized)
+                .then_some(WindowId::Wayland(id))
+        } else if consoles
+            .iter()
+            .any(|w| w.session_handle == focused_console && !w.minimized)
+        {
+            Some(WindowId::Console(focused_console))
+        } else {
+            None
+        };
+        let is_overlay = |id| match id {
+            WindowId::Console(_) => false,
+            WindowId::Wayland(id) => wayland
+                .iter()
+                .any(|window| window.surface_id == id && (window.popup || window.drag_icon)),
+        };
+        let is_live = |id| match id {
+            WindowId::Console(id) => consoles.iter().any(|w| w.session_handle == id),
+            WindowId::Wayland(id) => wayland.iter().any(|w| w.surface_id == id),
+        };
+        for &id in &self.0 {
+            if is_live(id) && Some(id) != focused && !is_overlay(id) {
+                visit(id);
+            }
+        }
+        // Newly announced identities follow the same console-then-Wayland
+        // append order as WindowStack::reconcile before any raising occurs.
+        for id in consoles
+            .iter()
+            .map(|window| WindowId::Console(window.session_handle))
+            .chain(
+                wayland
+                    .iter()
+                    .map(|window| WindowId::Wayland(window.surface_id)),
+            )
+        {
+            if !self.0.contains(&id) && Some(id) != focused && !is_overlay(id) {
+                visit(id);
+            }
+        }
+        if let Some(id) = focused.filter(|id| !is_overlay(*id)) {
+            visit(id);
+        }
+        for popup in wayland
+            .iter()
+            .filter(|window| window.popup && !window.drag_icon)
+        {
+            visit(WindowId::Wayland(popup.surface_id));
+        }
+        for icon in wayland
+            .iter()
+            .filter(|window| window.drag_icon)
+        {
+            visit(WindowId::Wayland(icon.surface_id));
+        }
     }
 }
 
@@ -219,18 +288,6 @@ impl AppState {
         &self.pending_wayland_placements
     }
 
-    fn live_window_ids(&self) -> Vec<WindowId> {
-        self.console_windows
-            .iter()
-            .map(|w| WindowId::Console(w.session_handle))
-            .chain(
-                self.wayland_windows
-                    .iter()
-                    .map(|w| WindowId::Wayland(w.surface_id)),
-            )
-            .collect()
-    }
-
     pub(super) fn reconcile_window_stack(&mut self) {
         self.window_stack = WindowStack(self.window_draw_order());
     }
@@ -254,34 +311,22 @@ impl AppState {
     /// are omitted by consumers. Reconcile also tolerates a fresh snapshot
     /// before its lifecycle reconciliation turn.
     pub(crate) fn window_draw_order(&self) -> Vec<WindowId> {
-        let mut order = WindowStack(self.window_stack.0.clone());
-        order.reconcile(&self.live_window_ids());
-        if let Some(id) = self.focused_wayland_surface_id {
-            if self
-                .wayland_windows
-                .iter()
-                .any(|w| w.surface_id == id && !w.minimized)
-            {
-                order.raise(WindowId::Wayland(id));
-            }
-        } else if self
-            .console_windows
-            .iter()
-            .any(|w| w.session_handle == self.focused_session_handle && !w.minimized)
-        {
-            order.raise(WindowId::Console(self.focused_session_handle));
-        }
-        for popup in self.wayland_windows.iter().filter(|window| window.popup) {
-            order.raise(WindowId::Wayland(popup.surface_id));
-        }
-        for icon in self
-            .wayland_windows
-            .iter()
-            .filter(|window| window.drag_icon)
-        {
-            order.raise(WindowId::Wayland(icon.surface_id));
-        }
-        order.0
+        let mut order = Vec::with_capacity(self.console_windows.len() + self.wayland_windows.len());
+        self.visit_window_draw_order(|id| order.push(id));
+        order
+    }
+
+    /// Visit the same reconciled order without allocating a temporary stack
+    /// or live-identity list. Focus is raised before popups, then drag icons;
+    /// identities in those groups are omitted from the ordinary stack pass.
+    pub(crate) fn visit_window_draw_order(&self, visit: impl FnMut(WindowId)) {
+        self.window_stack.visit_draw_order(
+            &self.console_windows,
+            &self.wayland_windows,
+            self.focused_session_handle,
+            self.focused_wayland_surface_id,
+            visit,
+        );
     }
 
     pub(super) fn top_visible_window(&self) -> Option<WindowId> {
@@ -304,9 +349,162 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::{
+        WindowId,
         WindowId::{Console, Wayland},
         WindowStack,
     };
+    use crate::app::ConsoleWindow;
+    use crate::canvas::Rect;
+    use crate::sys::ConsoleSessionHandle;
+    use crate::wayland::WaylandWindowSnapshot;
+    use std::sync::Arc;
+
+    // Keep the original clone/reconcile/raise algorithm as an independent
+    // ordering oracle for the allocation-free visitor.
+    fn reference_draw_order(
+        stack: &WindowStack,
+        consoles: &[ConsoleWindow],
+        wayland: &[WaylandWindowSnapshot],
+        focused_console: ConsoleSessionHandle,
+        focused_wayland: Option<u32>,
+    ) -> Vec<WindowId> {
+        let live: Vec<_> = consoles
+            .iter()
+            .map(|window| Console(window.session_handle))
+            .chain(wayland.iter().map(|window| Wayland(window.surface_id)))
+            .collect();
+        let mut order = WindowStack(stack.0.clone());
+        order.reconcile(&live);
+        if let Some(id) = focused_wayland {
+            if wayland
+                .iter()
+                .any(|window| window.surface_id == id && !window.minimized)
+            {
+                order.raise(Wayland(id));
+            }
+        } else if consoles
+            .iter()
+            .any(|window| window.session_handle == focused_console && !window.minimized)
+        {
+            order.raise(Console(focused_console));
+        }
+        for window in wayland.iter().filter(|window| window.popup) {
+            order.raise(Wayland(window.surface_id));
+        }
+        for window in wayland.iter().filter(|window| window.drag_icon) {
+            order.raise(Wayland(window.surface_id));
+        }
+        order.0
+    }
+
+    fn ordering_window(id: u32, popup: bool, drag_icon: bool) -> WaylandWindowSnapshot {
+        WaylandWindowSnapshot {
+            surface_id: id,
+            title: format!("window-{id}"),
+            frame: Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            width: 1,
+            height: 1,
+            stride_pixels: 1,
+            pixels: Arc::new(vec![0xff12_3456]),
+            content_version: 1,
+            damage: Rect::empty(),
+            minimized: false,
+            server_decoration: true,
+            drag_icon,
+            popup,
+        }
+    }
+
+    #[test]
+    fn draw_order_visitor_matches_reconciliation_focus_and_overlay_reference() {
+        let mut consoles: Vec<_> = (1..=3)
+            .map(|id| ConsoleWindow::new(id, format!("console-{id}"), Rect::empty(), 1))
+            .collect();
+        let mut wayland = vec![
+            ordering_window(1, false, false),
+            ordering_window(2, true, false),
+            ordering_window(3, false, true),
+            ordering_window(4, true, true),
+            ordering_window(5, false, false),
+        ];
+        let stacks = [
+            vec![],
+            vec![Console(99), Wayland(99)],
+            vec![
+                Wayland(4),
+                Console(2),
+                Wayland(1),
+                Console(1),
+                Wayland(3),
+                Wayland(5),
+            ],
+            vec![
+                Console(3),
+                Wayland(2),
+                Console(2),
+                Wayland(5),
+                Wayland(1),
+                Console(1),
+                Wayland(3),
+                Wayland(4),
+            ],
+            vec![
+                Wayland(5),
+                Wayland(4),
+                Wayland(3),
+                Wayland(2),
+                Wayland(1),
+                Console(3),
+                Console(2),
+                Console(1),
+            ],
+        ];
+        for rotation in 0..wayland.len() {
+            for minimized in [0_u32, 0b10101, 0b11111] {
+                for window in &mut wayland {
+                    window.minimized = minimized & (1 << (window.surface_id - 1)) != 0;
+                }
+                for window in &mut consoles {
+                    window.minimized = minimized & (1 << (window.session_handle - 1)) != 0;
+                }
+                for entries in &stacks {
+                    let stack = WindowStack(entries.clone());
+                    for focused_console in [0, 1, 2, 3, 99] {
+                        for focused_wayland in
+                            [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(99)]
+                        {
+                            let expected = reference_draw_order(
+                                &stack,
+                                &consoles,
+                                &wayland,
+                                focused_console,
+                                focused_wayland,
+                            );
+                            let mut actual = Vec::new();
+                            stack.visit_draw_order(
+                                &consoles,
+                                &wayland,
+                                focused_console,
+                                focused_wayland,
+                                |id| actual.push(id),
+                            );
+                            assert_eq!(
+                                actual, expected,
+                                "rotation={rotation} minimized={minimized:b} console={focused_console} wayland={focused_wayland:?} stack={entries:?}",
+                            );
+                            assert_eq!(&stack.0, entries, "visiting must not change raise history");
+                        }
+                    }
+                }
+            }
+            wayland.rotate_left(1);
+        }
+    }
 
     #[test]
     fn mixed_stack_preserves_raise_history_across_focus_changes() {

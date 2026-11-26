@@ -222,6 +222,7 @@ pub(super) struct WindowAlpha {
 /// the color channels are read as opaque and premultiplied by the computed
 /// alpha. Apply it exactly once after the whole region has been written, never
 /// to already-premultiplied pixels.
+#[cfg(test)]
 pub(super) fn apply_window_alpha(
     pixels: &mut [u32],
     stride: usize,
@@ -229,28 +230,84 @@ pub(super) fn apply_window_alpha(
     height: usize,
     spec: WindowAlpha,
 ) {
-    if width == 0 || height == 0 || stride < width {
-        return;
+    let _ = apply_window_alpha_region(
+        pixels,
+        stride,
+        width,
+        height,
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        },
+        spec,
+        false,
+    );
+}
+
+/// Apply the same window-local alpha profile to one retained fragment. The
+/// slice begins at the fragment's first pixel; `region` locates that fragment
+/// in the original window, not in the atlas. Hidden texels never need a
+/// temporary full-window copy or an alpha pass. `alpha_is_opaque` requires
+/// that the caller proved every input alpha byte is 255 before copying it.
+pub(super) fn apply_window_alpha_region(
+    pixels: &mut [u32],
+    stride: usize,
+    width: usize,
+    height: usize,
+    region: Rect,
+    spec: WindowAlpha,
+    alpha_is_opaque: bool,
+) -> bool {
+    if region.is_empty() {
+        return true;
+    }
+    if stride < region.width
+        || region
+            .x
+            .checked_add(region.width)
+            .is_none_or(|right| right > width)
+        || region
+            .y
+            .checked_add(region.height)
+            .is_none_or(|bottom| bottom > height)
+    {
+        return false;
+    }
+    let Some(required) = (region.height - 1)
+        .checked_mul(stride)
+        .and_then(|prefix| prefix.checked_add(region.width))
+    else {
+        return false;
+    };
+    if required > pixels.len() {
+        return false;
     }
     let radius = spec.radius.min(width / 2).min(height / 2);
     let title_height = spec.title_height.min(height);
-    for y in 0..height {
-        let Some(row) = pixels.get_mut(y * stride..y * stride + width) else {
-            return;
-        };
+    for row_index in 0..region.height {
+        let y = region.y + row_index;
+        let start = row_index * stride;
+        let row = &mut pixels[start..start + region.width];
         let row_alpha = title_row_alpha(&spec, y, title_height);
         // Straight edges are fully covered; only the corner squares need the
         // rounded-rectangle distance.
-        let corner_row = y <= radius || y + radius + 1 >= height;
+        let corner_row = y <= radius || y >= height.saturating_sub(radius + 1);
         if row_alpha == 255 && !corner_row {
             // The opaque body: premultiplying by 255 only sets the alpha byte.
-            for pixel in row.iter_mut() {
-                *pixel = 0xff00_0000 | (*pixel & 0x00ff_ffff);
+            // Authenticated opaque Wayland damage already has that byte, so
+            // skip touching those cache lines a second time after the blit.
+            if !alpha_is_opaque {
+                for pixel in row.iter_mut() {
+                    *pixel |= 0xff00_0000;
+                }
             }
             continue;
         }
-        for (x, pixel) in row.iter_mut().enumerate() {
-            let coverage = if corner_row && (x <= radius || x + radius + 1 >= width) {
+        for (offset, pixel) in row.iter_mut().enumerate() {
+            let x = region.x + offset;
+            let coverage = if corner_row && (x <= radius || x >= width.saturating_sub(radius + 1)) {
                 edge_coverage(x, y, width, height, radius).0
             } else {
                 255
@@ -269,12 +326,15 @@ pub(super) fn apply_window_alpha(
                 div255_floor(alpha * coverage)
             };
             if final_alpha == 255 {
-                *pixel = 0xff00_0000 | (*pixel & 0x00ff_ffff);
+                if !alpha_is_opaque {
+                    *pixel |= 0xff00_0000;
+                }
             } else {
                 *pixel = premultiply(*pixel & 0x00ff_ffff, final_alpha);
             }
         }
     }
+    true
 }
 
 fn title_row_alpha(spec: &WindowAlpha, y: usize, title_height: usize) -> u32 {
@@ -430,8 +490,16 @@ fn blurred_rect(backdrop: Backdrop<'_>, rect: Rect) -> Vec<u32> {
         buffer.extend_from_slice(&backdrop.pixels[start..start + width]);
     }
     let mut scratch = vec![0_u32; buffer.len()];
+    let mut columns = vec![[0_u32; 3]; width];
     for _ in 0..BLUR_PASSES {
-        box_blur(&mut buffer, &mut scratch, width, height, BLUR_RADIUS);
+        box_blur(
+            &mut buffer,
+            &mut scratch,
+            &mut columns,
+            width,
+            height,
+            BLUR_RADIUS,
+        );
     }
 
     let mut out = Vec::with_capacity(rect.width * rect.height);
@@ -442,7 +510,17 @@ fn blurred_rect(backdrop: Backdrop<'_>, rect: Rect) -> Vec<u32> {
     out
 }
 
-fn box_blur(buffer: &mut [u32], scratch: &mut [u32], width: usize, height: usize, radius: usize) {
+fn box_blur(
+    buffer: &mut [u32],
+    scratch: &mut [u32],
+    columns: &mut [[u32; 3]],
+    width: usize,
+    height: usize,
+    radius: usize,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
     for y in 0..height {
         let row = y * width;
         blur_line(
@@ -452,13 +530,45 @@ fn box_blur(buffer: &mut [u32], scratch: &mut [u32], width: usize, height: usize
             |x, v| scratch[row + x] = v,
         );
     }
-    for x in 0..width {
-        blur_line(
-            height,
-            radius,
-            |y| scratch[y * width + x],
-            |y, v| buffer[y * width + x] = v,
-        );
+    // Keep vertical sums per column, then visit whole contiguous rows. The
+    // previous column-at-a-time pass touched one pixel per cache line on a
+    // wide panel and revisited those same lines for every neighbouring column.
+    // Edge replication and integer division remain identical to blur_line.
+    columns.fill([0; 3]);
+    let window = (radius * 2 + 1) as u32;
+    let first_weight = (radius + 1) as u32;
+    for (sum, &pixel) in columns.iter_mut().zip(&scratch[..width]) {
+        *sum = [
+            ((pixel >> 16) & 0xff) * first_weight,
+            ((pixel >> 8) & 0xff) * first_weight,
+            (pixel & 0xff) * first_weight,
+        ];
+    }
+    for y in 1..=radius {
+        let start = y.min(height - 1) * width;
+        for (sum, &pixel) in columns.iter_mut().zip(&scratch[start..start + width]) {
+            sum[0] += (pixel >> 16) & 0xff;
+            sum[1] += (pixel >> 8) & 0xff;
+            sum[2] += pixel & 0xff;
+        }
+    }
+    for y in 0..height {
+        let row_start = y * width;
+        let incoming_start = (y + radius + 1).min(height - 1) * width;
+        let outgoing_start = y.saturating_sub(radius) * width;
+        let incoming = &scratch[incoming_start..incoming_start + width];
+        let outgoing = &scratch[outgoing_start..outgoing_start + width];
+        for (((pixel, sum), &add), &remove) in buffer[row_start..row_start + width]
+            .iter_mut()
+            .zip(columns.iter_mut())
+            .zip(incoming)
+            .zip(outgoing)
+        {
+            *pixel = ((sum[0] / window) << 16) | ((sum[1] / window) << 8) | (sum[2] / window);
+            sum[0] = sum[0] + ((add >> 16) & 0xff) - ((remove >> 16) & 0xff);
+            sum[1] = sum[1] + ((add >> 8) & 0xff) - ((remove >> 8) & 0xff);
+            sum[2] = sum[2] + (add & 0xff) - (remove & 0xff);
+        }
     }
 }
 
@@ -618,6 +728,49 @@ mod tests {
     }
 
     #[test]
+    fn fragment_alpha_matches_the_original_window_coordinates_and_preserves_padding() {
+        let (width, height) = (64, 40);
+        let source: Vec<u32> = (0..width * height)
+            .map(|index| (index as u32).wrapping_mul(2_654_435_761))
+            .collect();
+        let mut expected = source.clone();
+        reference_window_alpha(&mut expected, width, width, height, &spec());
+        for region in [
+            Rect { x: 0, y: 0, width: 7, height: 10 },
+            Rect { x: 40, y: 2, width: 12, height: 9 },
+            Rect { x: 8, y: 16, width: 20, height: 12 },
+            Rect { x: 57, y: 32, width: 7, height: 8 },
+        ] {
+            let stride = region.width + 5;
+            let mut fragment = vec![0xfeed_beef; stride * region.height];
+            for y in 0..region.height {
+                let start = (region.y + y) * width + region.x;
+                fragment[y * stride..y * stride + region.width]
+                    .copy_from_slice(&source[start..start + region.width]);
+            }
+            assert!(apply_window_alpha_region(
+                &mut fragment, stride, width, height, region, spec(), false,
+            ));
+            for y in 0..region.height {
+                let start = (region.y + y) * width + region.x;
+                assert_eq!(
+                    &fragment[y * stride..y * stride + region.width],
+                    &expected[start..start + region.width],
+                    "fragment {region:?}, row {y}",
+                );
+                assert!(fragment[y * stride + region.width..(y + 1) * stride]
+                    .iter().all(|&pixel| pixel == 0xfeed_beef));
+            }
+        }
+        let mut invalid = vec![0x1234_5678; 10];
+        assert!(!apply_window_alpha_region(
+            &mut invalid, 4, width, height,
+            Rect { x: 60, y: 39, width: 4, height: 2 }, spec(), false,
+        ));
+        assert!(invalid.iter().all(|&pixel| pixel == 0x1234_5678));
+    }
+
+    #[test]
     fn corner_inset_follows_the_arc_and_vanishes_below_it() {
         assert_eq!(corner_inset(0, 0), 0);
         assert_eq!(corner_inset(12, 12), 0);
@@ -647,6 +800,32 @@ mod tests {
         );
         assert_eq!(blurred.len(), 32 * 16);
         assert!(blurred.iter().all(|pixel| *pixel == WALLPAPER));
+    }
+
+    #[test]
+    fn row_major_blur_matches_column_sliding_windows_at_all_edges() {
+        for (width, height, radius) in [(1, 1, 10), (7, 3, 10), (13, 17, 0), (97, 61, 10)] {
+            let source: Vec<u32> = (0..width * height)
+                .map(|index| (index as u32).wrapping_mul(2_654_435_761) & 0x00ff_ffff)
+                .collect();
+            let mut reference = source.clone();
+            let mut horizontal = vec![0; source.len()];
+            for y in 0..height {
+                blur_line(width, radius, |x| source[y * width + x], |x, value| {
+                    horizontal[y * width + x] = value;
+                });
+            }
+            for x in 0..width {
+                blur_line(height, radius, |y| horizontal[y * width + x], |y, value| {
+                    reference[y * width + x] = value;
+                });
+            }
+            let mut actual = source;
+            let mut scratch = vec![0; actual.len()];
+            let mut columns = vec![[0; 3]; width];
+            box_blur(&mut actual, &mut scratch, &mut columns, width, height, radius);
+            assert_eq!(actual, reference, "{width}x{height}, radius {radius}");
+        }
     }
 
     #[test]
