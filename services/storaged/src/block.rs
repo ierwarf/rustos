@@ -597,6 +597,8 @@ mod tests {
         let quarantined = AtomicU64::new(0);
         latch_quarantine(&quarantined, 9);
         latch_quarantine(&quarantined, 7);
+        // ORDERING: Observe the final latch value as production readers do.
+        // This single-threaded assertion does not require synchronization.
         assert_eq!(quarantined.load(Ordering::Acquire), 9);
         for generation in [0, 7, 8, 9] {
             assert_eq!(require_unquarantined_for(&quarantined, generation), Err(libc::EIO));
