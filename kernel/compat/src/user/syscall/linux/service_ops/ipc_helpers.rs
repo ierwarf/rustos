@@ -538,7 +538,7 @@ pub fn populate_vfs_identity(request: &mut VfsIpcRequest) {
     // remains available after the process is sealed for exit. The visible
     // process snapshot deliberately disappears at that point, but final
     // CLOSE and its checkpoint ACK must still identify their actual sender.
-    set_vfs_sender_identity(request, multitask::current_user_log_ids());
+    set_vfs_sender_identity(request, current_ipc_sender_ids());
     let stamp = CallerStamp::current();
     request.session_handle = stamp.session_handle;
     request.uid = stamp.uid;
@@ -2291,6 +2291,31 @@ pub fn call_netd_ipc_request_with_timeout(
     timeout_ms: u64,
 ) -> Result<alloc::boxed::Box<NetdIpcResponse>, i64> {
     call_netd_ipc_request_impl(request, Some(timeout_ms.max(1)))
+}
+
+/// Deferred reference custody is bound to the provider incarnation captured
+/// before the initial socket publication. Keep provider status separate from
+/// transport failure so an admitted error cannot be mistaken for a lost reply.
+pub(super) fn call_netd_ref_maintenance(
+    request: &NetdIpcRequest,
+    epoch: u64,
+    timeout_ms: u64,
+) -> Result<alloc::boxed::Box<NetdIpcResponse>, i64> {
+    if !matches!(request.op, SYSCALL_OFFLOAD_OP_LINUX_CLOSE
+        | rustos_user_abi::syscall::NETD_IPC_OP_REF_ACK_BATCH)
+    {
+        return Err(LINUX_EINVAL);
+    }
+    let bytes = ipc_ops::call_service_endpoint_at_epoch_with_deadline(
+        IPC_SERVICE_NETD,
+        epoch,
+        netd_request_bytes(request)?,
+        ipc_ops::ServiceIpcClass::StateMutation,
+        timeout_ms,
+    )?;
+    let mut response = decode_netd_ipc_response(request, bytes.as_slice())?;
+    super::vfs_meta::consume_netd_release_payload(&mut response)?;
+    Ok(response)
 }
 
 pub(super) fn netd_request_bytes(request: &NetdIpcRequest) -> LinuxResult<&[u8]> {

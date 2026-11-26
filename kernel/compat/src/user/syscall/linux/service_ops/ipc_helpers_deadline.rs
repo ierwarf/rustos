@@ -20,6 +20,7 @@ use super::{
     SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
 };
 use alloc::string::String;
+use rustos_user_abi::syscall::NETD_IPC_OP_REF_ACK_BATCH;
 
 pub(in crate::user::syscall::linux::service_ops) fn remaining_service_timeout_ms(
     total: u64,
@@ -45,6 +46,7 @@ pub(in crate::user::syscall::linux::service_ops) fn netd_timeout_class(
         || matches!(
             op,
             SYSCALL_OFFLOAD_OP_LINUX_DUP | SYSCALL_OFFLOAD_OP_LINUX_CLOSE | NETD_IPC_OP_REF_ACK
+                | NETD_IPC_OP_REF_ACK_BATCH
                 | SYSCALL_OFFLOAD_OP_LINUX_SOCKET | SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR | SYSCALL_OFFLOAD_OP_LINUX_ACCEPT
         )
     {
@@ -103,6 +105,7 @@ mod tests {
             SYSCALL_OFFLOAD_OP_LINUX_DUP,
             SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
             NETD_IPC_OP_REF_ACK,
+            NETD_IPC_OP_REF_ACK_BATCH,
         ] {
             assert!(matches!(
                 netd_timeout_class(op),

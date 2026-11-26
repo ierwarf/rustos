@@ -36,6 +36,8 @@ fn vfs_sender_identity_survives_process_visibility_revocation() {
         let mut request = VfsIpcRequest { op, ..VfsIpcRequest::default() };
         set_vfs_sender_identity(&mut request, Some((42, 43)));
         assert_eq!((request.pid, request.tid), (42, 43));
+        set_vfs_sender_identity(&mut request, Some((0, 43)));
+        assert_eq!((request.pid, request.tid), (0, 43), "kernel maintenance keeps its attested task ID");
         set_vfs_sender_identity(&mut request, None);
         assert_eq!((request.pid, request.tid), (0, 0));
     }

@@ -20,7 +20,6 @@ use super::*;
 use alloc::collections::BTreeMap;
 use nucleus_core::util::{
     lockdep::{LockClass, TrackedSpinLock},
-    ring::RingBuffer,
 };
 use rustos_user_abi::syscall::{
     VFS_DEVICE_ACCESS_DRM_COMPAT, VFS_IPC_HANDLE_KIND_INOTIFY, VFS_IPC_OP_CHMOD,
@@ -35,40 +34,13 @@ const VFS_DEVICE_ACCESS_URANDOM: u16 = VFS_DEVICE_ACCESS_DRM_COMPAT + 2;
 const VFS_DEVICE_ACCESS_ZERO: u16 = VFS_DEVICE_ACCESS_DRM_COMPAT + 3;
 const VFS_DEVICE_ACCESS_FULL: u16 = VFS_DEVICE_ACCESS_DRM_COMPAT + 4;
 
-const PENDING_NETD_REF_CAPACITY: usize = 4096;
-const PENDING_NETD_REF_STORAGE_CAPACITY: usize = PENDING_NETD_REF_CAPACITY + 1;
 const REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY: usize = 32 * 1024;
-// DUP/CLOSE/ACK change a service-owned open-description reference. They are
-// persistent control mutations, not non-consuming readiness observations.
-// One attempt therefore owns the complete state-mutation lease; fragmenting
-// this into 5-6 ms calls lets netd commit after each reply capability is revoked.
-const NETD_REF_OPERATION_TIMEOUT_MS: u64 =
-    rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS;
-// A final CLOSE is the exception: the local descriptor is already gone and
-// nobody consumes the result, so a wedged provider must not hold close()/exec
-// for the whole lease. Its uncertain outcome is replayed by housekeeping,
-// which does use the lease.
-const NETD_REF_CLOSE_FOREGROUND_TIMEOUT_MS: u64 =
-    rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS;
 
-const fn netd_ref_foreground_timeout_ms(op: u16) -> u64 {
-    if op == SYSCALL_OFFLOAD_OP_LINUX_CLOSE {
-        NETD_REF_CLOSE_FOREGROUND_TIMEOUT_MS
-    } else {
-        NETD_REF_OPERATION_TIMEOUT_MS
-    }
-}
-const NETD_REF_OPERATION_ATTEMPTS: usize = 3;
-const NETD_MAINTENANCE_ATTEMPTS_PER_CALL: usize = 1;
-
-#[derive(Clone, Copy)]
-struct PendingNetdRef {
-    op: u16,
-    socket_token: u64,
-    operation_hi: u64,
-    operation_lo: u64,
-    acknowledge_only: bool,
-}
+mod netd_refs;
+pub(in crate::user::syscall::linux) use netd_refs::{
+    cancel_initial as cancel_initial_netd_socket_ref,
+    reserve_initial as reserve_initial_netd_socket_ref,
+};
 
 #[derive(Clone, Copy)]
 struct RemoteVfsRefSlot {
@@ -197,11 +169,6 @@ impl RemoteVfsRefRegistry {
         Ok(true)
     }
 }
-
-static PENDING_NETD_REFS: TrackedSpinLock<
-    RingBuffer<PendingNetdRef, PENDING_NETD_REF_STORAGE_CAPACITY>,
-    { LockClass::NetdDeferredRef as u8 },
-> = TrackedSpinLock::new(RingBuffer::new());
 
 /// Kernel fd tables are authoritative for descriptor references. vfsd owns
 /// open-file state, but sees only initial open and final release.
@@ -2207,227 +2174,16 @@ fn new_netd_socket_request(
     socket_token: u64,
     deadline_ns: u64,
 ) -> alloc::boxed::Box<NetdIpcRequest> {
-    let mut operation = [0_u8; 16];
-    nucleus_core::util::random::Random::new().fill_bytes(&mut operation);
     let mut request = new_netd_request(op);
     request.socket_token = socket_token;
     request.deadline_ns = deadline_ns;
-    request.operation_hi = u64::from_le_bytes(operation[..8].try_into().unwrap());
-    request.operation_lo = u64::from_le_bytes(operation[8..].try_into().unwrap());
-    if request.operation_hi == 0 && request.operation_lo == 0 {
-        request.operation_lo = 1;
-    }
+    // Only reference mutations use operation identities. Poll/writev do not
+    // replay, so generating 128 bits of entropy per I/O proved no ownership.
     request
 }
 
-pub fn call_netd_socket_token_op(op: u16, socket_token: u64) -> Result<u64, i64> {
-    call_netd_socket_token_op_bounded(op, socket_token)
-}
-
-fn call_netd_socket_token_op_bounded(op: u16, socket_token: u64) -> Result<u64, i64> {
-    let deadline_ns = super::vfs_meta::netd_deadline_after_class(
-        ipc_ops::ServiceIpcClass::StateMutation,
-        Some(netd_ref_foreground_timeout_ms(op)),
-    );
-    let request = new_netd_socket_request(op, socket_token, deadline_ns);
-    let mut last = LINUX_ETIMEDOUT;
-    for attempt in 0..NETD_REF_OPERATION_ATTEMPTS {
-        let Some(timeout_ms) = super::vfs_meta::netd_deadline_remaining_ms(deadline_ns) else {
-            break;
-        };
-        match call_netd_ipc_request_with_timeout(&request, timeout_ms) {
-            Ok(response) => {
-                // The provider operation is already committed. Acknowledgement
-                // is maintenance and must not add another full IPC deadline to
-                // close/dup latency; preserve it as an exact replayable item.
-                // The provider operation is committed and the local descriptor
-                // is already released, so a full replay queue is a maintenance
-                // backlog and not the caller's failure. Propagating `ENOSPC`
-                // here makes `close` fail, which POSIX does not allow to leave
-                // the descriptor open and which callers treat as fatal:
-                // `wayland-server` dropped a live client on exactly this,
-                // retiring WayClick's surface mid-session.
-                if enqueue_pending_netd_ref(PendingNetdRef {
-                    op,
-                    socket_token,
-                    operation_hi: request.operation_hi,
-                    operation_lo: request.operation_lo,
-                    acknowledge_only: true,
-                })
-                .is_err()
-                {
-                    crate::debug::record_milestone(
-                        crate::debug::LogCategory::Service,
-                        "netd-ref-ack-dropped",
-                        socket_token,
-                        u64::from(op),
-                    );
-                }
-                return Ok(response.value);
-            }
-            Err(errno)
-                if attempt + 1 < NETD_REF_OPERATION_ATTEMPTS
-                    && super::ipc_helpers::deadline::retryable_early_service_transport_error(
-                        errno,
-                    ) =>
-            {
-                last = errno;
-                multitask::cond_resched();
-            }
-            Err(errno) => return Err(errno),
-        }
-    }
-    // A full replay queue must not replace the transport error that actually
-    // ended the retries. `last` is what the caller can act on; `ENOSPC` from
-    // the queue is an internal capacity fact the caller cannot distinguish
-    // from a terminal condition.
-    if enqueue_pending_netd_ref(PendingNetdRef {
-        op,
-        socket_token,
-        operation_hi: request.operation_hi,
-        operation_lo: request.operation_lo,
-        acknowledge_only: false,
-    })
-    .is_err()
-    {
-        crate::debug::record_milestone(
-            crate::debug::LogCategory::Service,
-            "netd-ref-replay-dropped",
-            socket_token,
-            u64::from(op),
-        );
-    }
-    Err(last)
-}
-
-fn enqueue_pending_netd_ref(pending: PendingNetdRef) -> Result<(), i64> {
-    let mut queue = PENDING_NETD_REFS.lock();
-    if queue.any(|entry| {
-        entry.operation_hi == pending.operation_hi && entry.operation_lo == pending.operation_lo
-    }) {
-        return Ok(());
-    }
-    if queue.len() >= PENDING_NETD_REF_CAPACITY || !queue.push(pending) {
-        return Err(LINUX_ENOSPC);
-    }
-    Ok(())
-}
-
 pub(super) fn service_deferred_netd_refs() -> usize {
-    drain_pending_netd_refs()
-}
-
-/// Releases the single-drainer claim on every exit path.
-struct NetdRefDrainClaim;
-
-impl Drop for NetdRefDrainClaim {
-    fn drop(&mut self) {
-        // ORDERING: release publishes the drainer's queue mutations to the
-        // next claimant, which acquires the flag before touching the queue.
-        NETD_REF_DRAINING.store(false, core::sync::atomic::Ordering::Release);
-    }
-}
-
-/// At most one drainer owns a popped replay item at a time. The ring keeps one
-/// spare slot beyond the enqueue cap precisely so a single popped item can be
-/// pushed back to the front after producers refilled the queue; a second
-/// concurrent drainer would break that bound and the push-back assertions.
-static NETD_REF_DRAINING: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-fn drain_pending_netd_refs() -> usize {
-    // ORDERING: acquire pairs with the claim release above, so the next
-    // drainer observes the queue exactly as the previous one left it.
-    if NETD_REF_DRAINING
-        .compare_exchange(
-            false,
-            true,
-            // ORDERING: acquire pairs with the drop-time release above.
-            core::sync::atomic::Ordering::Acquire,
-            // ORDERING: a lost claim touches nothing the winner published and
-            // returns immediately, so the failure load needs no ordering.
-            core::sync::atomic::Ordering::Relaxed,
-        )
-        .is_err()
-    {
-        return 0;
-    }
-    let _claim = NetdRefDrainClaim;
-    let mut attempted = 0usize;
-    for _ in 0..NETD_MAINTENANCE_ATTEMPTS_PER_CALL {
-        let Some(pending) = PENDING_NETD_REFS.lock().pop() else {
-            return attempted;
-        };
-        let mut request = new_netd_socket_request(
-            pending.op,
-            pending.socket_token,
-            super::vfs_meta::netd_deadline_after_class(
-                ipc_ops::ServiceIpcClass::StateMutation,
-                Some(rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS),
-            ),
-        );
-        request.operation_hi = pending.operation_hi;
-        request.operation_lo = pending.operation_lo;
-        let completed = if pending.acknowledge_only {
-            match send_netd_ref_ack_with_timeout(
-                &request,
-                rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
-            ) {
-                Ok(()) => true,
-                Err(errno) if errno == LINUX_EBADF => true,
-                Err(_) => false,
-            }
-        } else {
-            match call_netd_ipc_request_with_timeout(
-                &request,
-                rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
-            ) {
-                Ok(_) => {
-                    // Split operation replay and its acknowledgement across
-                    // yielded housekeeping turns. This is not charged to a
-                    // foreground syscall and must outlive a normal SMP IPC
-                    // round trip rather than cancel/retry it every 1 ms.
-                    let mut acknowledge = pending;
-                    acknowledge.acknowledge_only = true;
-                    assert!(
-                        PENDING_NETD_REFS.lock().push_front(acknowledge),
-                        "popped deferred netd reference must have retry capacity"
-                    );
-                    return attempted + 1;
-                }
-                Err(errno) if errno == LINUX_EBADF => true,
-                Err(_) => false,
-            }
-        };
-        if !completed {
-            assert!(
-                PENDING_NETD_REFS.lock().push_front(pending),
-                "popped deferred netd reference must have retry capacity"
-            );
-            return attempted;
-        }
-        attempted += 1;
-    }
-    attempted
-}
-
-fn send_netd_ref_ack_with_timeout(request: &NetdIpcRequest, timeout_ms: u64) -> Result<(), i64> {
-    let mut ack = new_netd_socket_request(
-        NETD_IPC_OP_REF_ACK,
-        request.socket_token,
-        super::vfs_meta::netd_deadline_after_class(
-            ipc_ops::ServiceIpcClass::StateMutation,
-            Some(timeout_ms),
-        ),
-    );
-    ack.arg0 = request.op as u64;
-    ack.operation_hi = request.operation_hi;
-    ack.operation_lo = request.operation_lo;
-    let response = call_netd_ipc_request_with_timeout(&ack, timeout_ms)?;
-    if response.value != 0 || response.payload_len != 0 {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(())
+    netd_refs::service()
 }
 
 /// One socket's answer inside a batched netd readiness query.
@@ -2592,14 +2348,7 @@ fn release_service_handle_refs_inner(refs: &[ServiceHandleRef], bounded: bool) {
     while let Some(handle_ref) = worklist.pop() {
         match handle_ref {
             ServiceHandleRef::Socket(token) => {
-                let closed = if bounded {
-                    call_netd_socket_token_op_bounded(SYSCALL_OFFLOAD_OP_LINUX_CLOSE, token)
-                } else {
-                    call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_CLOSE, token)
-                };
-                if closed == Ok(0) {
-                    purge_kernel_epoll_object(WAITSET_PROVIDER_NETD, token);
-                }
+                netd_refs::release(token);
             }
             ServiceHandleRef::RemoteVfs(remote_id) => {
                 if release_remote_vfs_descriptor_ref(remote_id) == Ok(true) {
@@ -2688,7 +2437,7 @@ pub fn service_handle_ref_for_handle(handle: &multitask::KernelHandle) -> Option
 pub fn acquire_service_handle_ref(handle_ref: &ServiceHandleRef) -> Result<(), i64> {
     match handle_ref {
         ServiceHandleRef::Socket(token) => {
-            call_netd_socket_token_op(SYSCALL_OFFLOAD_OP_LINUX_DUP, *token).map(|_| ())
+            netd_refs::acquire(*token)
         }
         ServiceHandleRef::RemoteVfs(remote_id) => acquire_remote_vfs_descriptor_ref(*remote_id),
         ServiceHandleRef::Epoll(epoll) => epoll

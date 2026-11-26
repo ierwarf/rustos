@@ -54,15 +54,22 @@ fn broker_prepare_socket_publication(args: &RustosNetBrokerArgs) -> Result<u64, 
         return Err(LINUX_EINVAL);
     }
     let netd_process_id = multitask::current_user_process_id().ok_or(LINUX_EPERM)?;
-    let descriptors = alloc::vec![
-        multitask::register_new_inet_socket_transfer(
+    let (_, epoch) = ipc_ops::live_service_endpoint_owner_and_epoch(IPC_SERVICE_NETD)
+        .filter(|(owner, _)| *owner == netd_process_id).ok_or(LINUX_EPERM)?;
+    service_ops::vfs_socket::reserve_initial_netd_socket_ref(publication.socket_token, epoch)?;
+    let descriptor = match multitask::register_new_inet_socket_transfer(
             publication.socket_token,
             publication.domain,
             publication.socket_type,
             publication.protocol,
-        )
-        .map_err(transfer_registry_error_to_linux_errno)?
-    ];
+        ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            service_ops::vfs_socket::cancel_initial_netd_socket_ref(publication.socket_token, epoch);
+            return Err(transfer_registry_error_to_linux_errno(error));
+        }
+    };
+    let descriptors = alloc::vec![descriptor];
     let reply = kernel_ipc_runtime::api::KernelReplyHandle::from_raw(publication.reply_cap);
     if let Err(error) = kernel_ipc_runtime::api::endpoint::bind_prepared_reply_handles_for_process(
         reply,
@@ -73,6 +80,7 @@ fn broker_prepare_socket_publication(args: &RustosNetBrokerArgs) -> Result<u64, 
         // still owns the provider's initial reference and performs the sole
         // unpublished-token discard after this broker call fails.
         multitask::reclaim_unbound_socket_transfers(&error.handles);
+        service_ops::vfs_socket::cancel_initial_netd_socket_ref(publication.socket_token, epoch);
         return Err(ipc_error_to_linux_errno(error.error));
     }
     Ok(0)

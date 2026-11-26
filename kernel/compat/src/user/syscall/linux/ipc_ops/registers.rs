@@ -82,7 +82,7 @@ impl ReceiveDestination<'_> {
         request: &[u8],
         caller: u64,
     ) -> Result<usize, i64> {
-        let (pid, tid) = multitask::user_log_ids_for_task(caller).unwrap_or((0, 0));
+        let (pid, tid) = kernel_ps::api::snapshot::ipc_sender_ids_for_task(caller).unwrap_or((0, 0));
         match self {
             Self::UserWithHandles(outputs) => outputs.write_queued(reply, request, &[], caller),
             Self::Registers(frame) => write_register_result(frame, request, reply.raw(), pid, tid),

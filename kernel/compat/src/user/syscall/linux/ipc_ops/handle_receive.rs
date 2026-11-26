@@ -92,7 +92,7 @@ impl<'a> ReceiveOutputs<'a> {
         handles: &[KernelTransferredHandle],
         caller: u64,
     ) -> Result<usize, i64> {
-        let (pid, tid) = multitask::user_log_ids_for_task(caller).unwrap_or((0, 0));
+        let (pid, tid) = kernel_ps::api::snapshot::ipc_sender_ids_for_task(caller).unwrap_or((0, 0));
         self.write(reply, request, pid, tid, handles)
     }
 
@@ -195,7 +195,12 @@ mod tests {
         // Source witness, not production user-copy fault injection.
         let output = include_str!("handle_receive.rs").split("#[cfg(test)]").next().unwrap();
         assert!(output.contains("received.caller_process_id, received.caller_task_id"));
-        assert!(output.contains("user_log_ids_for_task(caller)"));
+        assert!(output.contains("ipc_sender_ids_for_task(caller)"));
+        let ordinary = include_str!("registers.rs").split("#[cfg(test)]").next().unwrap();
+        let queued = ordinary.split_once("pub(super) fn write_queued(").unwrap().1;
+        assert!(queued.contains("ipc_sender_ids_for_task(caller)"),
+            "ordinary, bounded and register receives must attest kernel senders too");
+        assert!(!queued.contains("user_log_ids_for_task(caller)"));
         for field in ["(self.sender_pid_ptr, &pid)", "(self.sender_tid_ptr, &tid)",
             "(self.handles.fds_ptr, received_fd_bytes(fds))", "(self.handles.count_ptr, &count)"] {
             assert!(output.contains(field), "missing output in the retained copyout bundle: {field}");

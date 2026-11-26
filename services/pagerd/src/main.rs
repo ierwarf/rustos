@@ -419,7 +419,7 @@ mod warm_worker {
     use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use rustos_user_abi::syscall::{
         LibraryIdentityWire, VfsFileIdentityWire, VfsIpcRequest, VfsIpcResponse,
-        VFS_IPC_OP_LIBRARY_READ, VFS_LIBRARY_READ_MAX_BYTES,
+        VFS_IPC_ABI_VERSION, VFS_IPC_OP_LIBRARY_READ, VFS_LIBRARY_READ_MAX_BYTES,
     };
 
     const SYS_GETPID: u64 = 39;
@@ -740,7 +740,7 @@ mod warm_worker {
                 return Err(22);
             }
             self.serial += 1;
-            self.request.version = 0;
+            self.request.version = VFS_IPC_ABI_VERSION;
             self.request.op = VFS_IPC_OP_LIBRARY_READ;
             self.request.flags = 0;
             self.request.pid = self.pid;

@@ -260,7 +260,7 @@ fn linux_response_for_op(op: u16) -> LinuxSyscallOffloadResponse {
 /// sender thread must match, the sender must be the live syscalld owner, and
 /// vfsd still requires the named pid to own a funded description of that id.
 fn vfs_request_identity_admitted(request: &VfsIpcRequest, sender_pid: u64, sender_tid: u64) -> bool {
-    if request.pid == sender_pid && request.tid == sender_tid {
+    if sender_tid != 0 && request.pid == sender_pid && request.tid == sender_tid {
         return true;
     }
     // loaderd's exec broker releases the exec'ing process's POSIX locks when a

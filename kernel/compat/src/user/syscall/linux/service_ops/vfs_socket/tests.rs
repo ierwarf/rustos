@@ -25,67 +25,6 @@ fn missing_socket_snapshot_distinguishes_open_non_socket_from_bad_fd() {
 }
 
 #[test]
-fn netd_reference_mutation_owns_the_complete_state_mutation_lease() {
-    assert_eq!(
-        NETD_REF_OPERATION_TIMEOUT_MS,
-        rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS
-    );
-    assert_eq!(
-        super::ipc_helpers::deadline::remaining_service_timeout_ms(
-            NETD_REF_OPERATION_TIMEOUT_MS,
-            0,
-        ),
-        Some(5_000)
-    );
-    assert!(
-        !super::ipc_helpers::deadline::retryable_early_service_transport_error(LINUX_ETIMEDOUT)
-    );
-}
-
-#[test]
-fn foreground_final_close_stays_on_the_short_rail_while_dup_owns_the_lease() {
-    assert_eq!(
-        netd_ref_foreground_timeout_ms(SYSCALL_OFFLOAD_OP_LINUX_CLOSE),
-        rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
-    );
-    assert_eq!(
-        netd_ref_foreground_timeout_ms(SYSCALL_OFFLOAD_OP_LINUX_DUP),
-        rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS
-    );
-}
-
-#[test]
-fn netd_reference_retry_keeps_the_original_wire_deadline() {
-    let start_ns = 17 * super::vfs_meta::NETD_NANOS_PER_MILLI;
-    let deadline_ns =
-        super::vfs_meta::netd_deadline_after_ms(start_ns, NETD_REF_OPERATION_TIMEOUT_MS);
-    // The production builder also randomizes an idempotency token through
-    // the kernel entropy source, which is intentionally unavailable to
-    // host unit tests. The invariant under test is the copied wire end.
-    let request = NetdIpcRequest {
-        op: SYSCALL_OFFLOAD_OP_LINUX_DUP,
-        socket_token: 0xfeed_beef,
-        deadline_ns,
-        ..NetdIpcRequest::default()
-    };
-    let retry = request;
-
-    assert_eq!(request.deadline_ns, deadline_ns);
-    assert_eq!(retry.deadline_ns, request.deadline_ns);
-    assert_eq!(
-        super::vfs_meta::netd_deadline_remaining_ms_at(
-            retry.deadline_ns,
-            start_ns + 4_999 * super::vfs_meta::NETD_NANOS_PER_MILLI,
-        ),
-        Some(1)
-    );
-    assert_eq!(
-        super::vfs_meta::netd_deadline_remaining_ms_at(retry.deadline_ns, deadline_ns),
-        None
-    );
-}
-
-#[test]
 fn transferred_input_description_keeps_the_waitset_service_reference() {
     let device = kernel_object::api::device::DeviceHandle::from_parts_with_token(
         kernel_object::api::device::DeviceId::Input,

@@ -164,6 +164,16 @@ pub(super) fn current_user_pid() -> LinuxResult<u64> {
     multitask::current_user_process_id().ok_or(LINUX_ESRCH)
 }
 
+/// The same identity the queued IPC receiver attests. User log identity can
+/// outlive visible process state during exit; a kernel fallback requires an
+/// exact live task and never treats a missing user snapshot as authority.
+pub(super) fn current_ipc_sender_ids() -> Option<(u64, u64)> {
+    multitask::current_user_log_ids().filter(|(pid, tid)| *pid != 0 && *tid != 0).or_else(|| {
+        multitask::current_task_id()
+            .and_then(kernel_ps::api::snapshot::ipc_sender_ids_for_task)
+    })
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct CallerStamp {
     pub pid: u64,
@@ -188,9 +198,13 @@ impl CallerStamp {
         stamp
     }
 
-    /// Captures only `(pid, tid, session_handle)` without taking process credentials.
+    /// Captures `(pid, tid, session_handle)` without process credentials.
+    /// Kernel maintenance uses PID zero and its exact live nonzero task ID.
     pub(super) fn current_ids_only() -> Self {
-        Self::try_current_ids_only().unwrap_or_default()
+        Self::try_current_ids_only().unwrap_or_else(|_| {
+            current_ipc_sender_ids().map(|(pid, tid)| Self { pid, tid, ..Self::default() })
+                .unwrap_or_default()
+        })
     }
 
     /// Captures `(pid, tid, session_handle)` or returns `LINUX_ESRCH` if no

@@ -488,29 +488,6 @@ pub(super) fn current_process_service_capability_snapshot() -> Option<(u64, u64)
     Some((process_id, capabilities))
 }
 
-/// Lockless advisory check for whether `process_id` owns any currently
-/// published Ring3 service endpoint.
-///
-/// Used on syscall return paths (such as `futex`) that opportunistically pump
-/// retired-task runtime cleanup: a service process (e.g. `vfsd`, `netd`) must
-/// never synchronously issue blocking cross-service close IPC inside its own
-/// `FUTEX_WAKE`, which would self-deadlock its receive thread.
-pub(super) fn process_owns_any_published_service_endpoint(process_id: u64) -> bool {
-    if process_id == 0 {
-        return false;
-    }
-    for index in 0..MAX_SERVICE_ENDPOINTS {
-        // ORDERING: Acquire pairs with the Release store of `SERVICE_ENDPOINTS`
-        // after `SERVICE_ENDPOINT_OWNERS` is published.
-        if SERVICE_ENDPOINTS[index].load(Ordering::Acquire) != 0
-            && SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire) == process_id
-        {
-            return true;
-        }
-    }
-    false
-}
-
 fn syscall_linux_rustos_ipc_validate_service_owner(args_ptr: u64) -> u64 {
     linux_unit_result((|| {
         let args: RustosIpcValidateServiceOwnerArgs = read_user_struct_as(args_ptr)?;
@@ -3150,6 +3127,42 @@ fn call_service_endpoint_with_timeout(
     timeout_ms: u64,
 ) -> Result<Vec<u8>, i64> {
     let endpoint = service_endpoint(service_id).ok_or(LINUX_ENOSYS)?;
+    call_bound_service_endpoint_with_timeout(service_id, endpoint, request, timeout_ms)
+}
+
+/// Reconcile an object only with the exact provider incarnation that owned it.
+/// The endpoint is captured with its epoch under the publication lock, then
+/// the lock is released before IPC. A replacement cannot redirect this call.
+pub(super) fn call_service_endpoint_at_epoch_with_deadline(
+    service_id: u64,
+    epoch: u64,
+    request: &[u8],
+    class: ServiceIpcClass,
+    timeout_ms: u64,
+) -> Result<Vec<u8>, i64> {
+    let index = service_index(service_id).ok_or(LINUX_EINVAL)?;
+    let endpoint = {
+        let _publication = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+        // ORDERING: the writer lock serializes the epoch/endpoint pair;
+        // Acquire reads match their Release publication.
+        let published_epoch = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
+        let raw = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
+        if epoch == 0 || epoch != published_epoch || raw == 0 {
+            return Err(LINUX_ESTALE);
+        }
+        KernelEndpointHandle::from_raw(raw)
+    };
+    call_bound_service_endpoint_with_timeout(
+        service_id, endpoint, request, class.cap_timeout_ms(timeout_ms),
+    )
+}
+
+fn call_bound_service_endpoint_with_timeout(
+    service_id: u64,
+    endpoint: KernelEndpointHandle,
+    request: &[u8],
+    timeout_ms: u64,
+) -> Result<Vec<u8>, i64> {
     let start_ticks = crate::arch::rtc::ticks();
     // One absolute end for the whole call, fixed before transport selection so
     // neither the rendezvous attempt nor its queued fallback renews it.

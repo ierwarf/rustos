@@ -440,9 +440,13 @@ const fn access_is_allowed(access: u16, prot: u32) -> bool {
 /// Fault resolution and every region-table edit (backing, release, protect) are
 /// ring0 operations: ring0 owns the VMA table and the pager's region table is
 /// only its replica, so a user process must never be able to admit, drop or
-/// re-protect a region for itself or for a pid it names in the payload. Ring0's
-/// receive-side identity is exactly `(0, 0)`. Every other operation retains the
-/// ordinary, nonzero exact-subject rule.
+/// re-protect a region for itself or for a pid it names in the payload. A live
+/// kernel task is stamped `(0, exact_nonzero_tid)`; `(0, 0)` is an unavailable
+/// sender, never kernel authority. The wire subject must name that same task.
+/// The region's target process remains in its separate typed payload. Generic
+/// fault resolution still has no transport authority: main rejects it in favor
+/// of the worker-bound fixed rendezvous. Every other operation retains the
+/// ordinary, nonzero exact-user-subject rule.
 pub fn request_sender_is_authorized(
     request: &rustos_user_abi::syscall::CommercialMaxProtocolRequest,
     sender_pid: u64,
@@ -459,7 +463,7 @@ pub fn request_sender_is_authorized(
             | COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT
             | COMMERCIAL_MAX_PAGERD_OP_PROTECT_OBJECT
     ) {
-        sender_pid == 0 && sender_tid == 0
+        sender_pid == 0 && sender_tid != 0 && (request.header.subject_pid, request.header.subject_tid) == (0, sender_tid)
     } else {
         request.subject_is_exact_sender(sender_pid, sender_tid)
     }
@@ -500,8 +504,9 @@ mod sender_auth_tests {
 
     #[test]
     fn fault_resolve_requires_kernel_sender_identity() {
-        let request = request(COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE, 0, 0);
-        assert!(request_sender_is_authorized(&request, 0, 0));
+        let request = request(COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE, 0, 67);
+        assert!(request_sender_is_authorized(&request, 0, 67));
+        assert!(!request_sender_is_authorized(&request, 0, 0));
     }
 
     #[test]
@@ -519,8 +524,32 @@ mod sender_auth_tests {
         ] {
             let user = request(op, 47, 53);
             assert!(!request_sender_is_authorized(&user, 47, 53));
-            let kernel = request(op, 0, 0);
-            assert!(request_sender_is_authorized(&kernel, 0, 0));
+            let kernel = request(op, 0, 67);
+            assert!(request_sender_is_authorized(&kernel, 0, 67));
+            assert!(!request_sender_is_authorized(&kernel, 47, 53));
+        }
+    }
+
+    #[test]
+    fn kernel_pager_requests_reject_stale_or_mismatched_transport_and_wire_subjects() {
+        for op in [
+            COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE,
+            COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT,
+            COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT,
+            COMMERCIAL_MAX_PAGERD_OP_PROTECT_OBJECT,
+        ] {
+            let kernel = request(op, 0, 67);
+            for (sender_pid, sender_tid) in [(0, 0), (0, 68), (47, 67), (47, 0)] {
+                assert!(!request_sender_is_authorized(&kernel, sender_pid, sender_tid),
+                    "op {op} cannot turn an unavailable or different sender into its kernel subject");
+            }
+            for (subject_pid, subject_tid) in [(0, 0), (0, 68), (47, 67), (47, 53)] {
+                assert!(!request_sender_is_authorized(&request(op, subject_pid, subject_tid), 0, 67),
+                    "op {op} must bind the wire subject to the attested kernel task");
+            }
+            let absent = request(op, 0, 0);
+            assert!(!request_sender_is_authorized(&absent, 0, 0),
+                "matching zero placeholders are not an authenticated kernel sender");
         }
     }
 
@@ -529,6 +558,8 @@ mod sender_auth_tests {
         let request = request(COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY, 47, 53);
         assert!(request_sender_is_authorized(&request, 47, 53));
         assert!(!request_sender_is_authorized(&request, 0, 0));
+        assert!(!request_sender_is_authorized(&request, 0, 67));
+        assert!(!request_sender_is_authorized(&request, 47, 54));
     }
 }
 #[cfg(test)]
