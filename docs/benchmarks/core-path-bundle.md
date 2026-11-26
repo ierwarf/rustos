@@ -72,6 +72,10 @@ DVM rootfs나 서비스를 수정하지 않으며 새 도구를 설치하지 않
   wake→첫 계측 사용자 turn, 8-worker 동시 깨우기. wake 결과가 정확히 1이
   아니면 전체 프로브를 실패시키며 빠른 early wake를 샘플로 바꾸지 않는다.
   CPUID APIC 관찰은 end stamp **이후**여서 latency에 VM exit를 추가하지 않는다.
+  별도 진단 `--isolate-probe smp_balance_futex_trace`는 같은 8-worker 케이스에서
+  `FUTEX_WAKE` 반환 시각도 찍어 호출 구간과 반환 이후 구간을 구분한다. 반환 전
+  실행된 worker의 반환 이후 대기는 0으로 표시한다. 이 추가 타임스탬프가 있는
+  실행은 기존 latency gate의 대체가 아니다.
   관찰 직전 migration은 가능하므로 stamp와 CPU가 원자적으로 짝지어졌다고
   주장하지 않는다. histogram 합은 전체 timed sample 수와 반드시 일치한다.
 - `core_state`: before 및 fork/exec/exit/signal/mmap/thread 후 null+실제 fused IPC.

@@ -156,10 +156,13 @@ ordered(body(dispatch, 'fair'), ['local_dispatch::choose_local_next_with(',
 ordered(body(dispatch, 'retry_fair'), ['local_dispatch::retry_incomplete_policy(|unresolved| fair('],
     'shared bounded fair retry')
 ordered(body(dispatch, 'dispatch'), ['turn.begin_priority_choice()',
-    'prologue(outgoing, rsp, voluntary)', 'match choose(', 'Decision::Selected(candidate)',
+    'prologue(outgoing, rsp, voluntary)', 'const MAX_ATTEMPTS: usize = 4;',
+    'for _ in 0..MAX_ATTEMPTS', 'class_sequence = donation_ledger::class_publication_sequence()',
+    'match choose(', 'Decision::Selected(candidate)',
     'if claim(outgoing, candidate, class_sequence)', 'Decision::Claimed(urgency)',
-    'Decision::Empty | Decision::Incomplete', 'smp::idle_slot_for_cpu(cpu)',
-    'dispatch_claim::claim_fallback(turn, idle, class_sequence)'], 'original choice and incomplete fallback')
+    'Decision::Empty => break', 'Decision::Incomplete => {}',
+    'if !runqueue::local_dispatch_work_pending(cpu) { break; }', 'smp::idle_slot_for_cpu(cpu)',
+    'dispatch_claim::claim_fallback(turn, idle, class_sequence)'], 'original choice and bounded incomplete retry')
 if any(forbidden in dispatch for forbidden in ['scheduler_mut(', 'scheduler_ref(',
         'catalog_fair_fallback(', 'dispatch_schedule(']):
     raise SystemExit('independent dispatch regained legacy authority')
@@ -335,8 +338,8 @@ ordered(body(maintenance, 'mobile'), ['slot != ROOT_TASK_SLOT',
     'runqueue::is_local_dispatchable(slot, source)',
     'runqueue::weight::observe(slot).is_some()', 'p.lifecycle_dispatchable()'],
     'migration excludes every published execution owner')
-ordered(body(dispatch, 'choose'), ['class_sequence & 1 != 0',
-    'runqueue::drain_remote_wakes(cpu)', 'dispatch_policy::atomic_activation_pending(cpu)',
+ordered(body(dispatch, 'choose'), ['runqueue::drain_remote_wakes(cpu)',
+    'class_sequence & 1 != 0', 'dispatch_policy::atomic_activation_pending(cpu)',
     'first_turn(turn, cpu, true, class_sequence)', 'match synchronous(cpu)',
     'maintenance::service(turn, cpu, current, voluntary)'],
     'remote mailbox admission precedes every priority early return, not deferred balance')
@@ -513,9 +516,9 @@ if 'outgoing_image::frozen(slot)' not in body((base / 'terminal_publication.rs')
 # Joint final admission is not the earlier independent funding observation.
 # Each leaf borrows the SAME non-Copy grant; all leaves end before CPU banks.
 ordered(body(dispatch, 'dispatch'), ['prologue(outgoing, rsp, voluntary)',
-    'let class_sequence = donation_ledger::class_publication_sequence()',
+    'for _ in 0..MAX_ATTEMPTS', 'class_sequence = donation_ledger::class_publication_sequence()',
     'match choose(', 'class_sequence)', 'claim(outgoing, candidate, class_sequence)'],
-    'original preselection class through claim')
+    'each attempt preserves its preselection class through claim')
 ordered(body(dispatch, 'first_turn'), ['DispatchFrame::from_selection(turn, candidate.frame, class_sequence)',
     'funded.claim()',
     'policy.atomic_activation_pick_hints.pop()'], 'first-turn original class before FIFO pop')

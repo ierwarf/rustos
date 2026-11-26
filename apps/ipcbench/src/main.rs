@@ -1227,6 +1227,7 @@ fn run_single_probe(name: &str, tsc_khz: u64) {
         // anchor and safety preflight; never substitute a syscall for a frame.
         core_contract::GUI => {}
         core_contract::SCHEDULER => scheduler_probes::run(tsc_khz),
+        "smp_balance_futex_trace" => scheduler_probes::trace_balance(tsc_khz),
         core_contract::LIFECYCLE => state_probes::lifecycle(tsc_khz),
         suite if core_contract::probes(suite).is_some() => core_paths::run(suite, tsc_khz),
         "tsc_overhead" => probe_tsc_overhead(tsc_khz),

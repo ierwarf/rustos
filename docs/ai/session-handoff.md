@@ -6,6 +6,42 @@ stable repository prefix; use [task router](task-router.md) for owner contracts.
 Historical entries prior to 2026-11-25 live in `git log` (e.g.
 `git show HEAD:docs/ai/session-handoff.md`).
 
+## SMP futex wake tail trace (2026-11-27)
+
+- Follow-up: `build/smp-followup/detail2-join.log` joins slow user wakes by
+  Linux TID and TSC to exact guest mailbox adoption and scheduler claim.
+  Some wakes took about 4 ms to reach Local custody, others were adopted
+  within µs and took ms to dispatch. The worst matched wake waited 14.97 ms
+  after adoption. The sampled IPI is the most recent on that CPU at adoption,
+  not a per-wake delivery acknowledgement. Temporary kernel stamps were removed.
+- `dispatcher` now drains remote ingress even on an odd class epoch and
+  retries an incomplete selection or refused claim up to four times on the
+  original turn with fresh epochs. Added a native regression for odd-epoch
+  mailbox adoption without a physical claim. `cargo xtask check`, 1,293 native
+  tests (kernel-ps + ipcbench), and all 23 static preflight checks passed.
+- Kernel-tracing-off KVM: the standard 8-vCPU `smp_balance_futex` p99 moved
+  from 1.497 ms to 0.126 ms, p50 from 21.3 to 19.8 µs, and the tail ratio
+  from 70.227 to 6.363 (still above the 1.5 gate; all eight APICs observed).
+  In the separate diagnostic, 8 vCPUs measured 0.283–0.471 ms p99 (two runs;
+  baseline 1.876 ms), 8 vCPUs at 50% host CPU pressure 0.475 ms (earlier
+  2.331 ms), 1 vCPU 0.118 ms, and 16 vCPUs 0.174 ms. These are same-host
+  probe results, not a Chrome or commercial SMP qualification. The 8-vCPU
+  max remains about 4 ms in repeated eight-worker diagnostics. Next: join
+  the residual mailbox edge/request/consumption sequence and admitted vs
+  refused dispatch decisions; do not shorten the quantum speculatively.
+- `smp_balance_futex_trace` is an opt-in ipcbench diagnostic. It timestamps
+  wake return without changing the normal `core_scheduler` measurement.
+- Eight workers, 2,048 wakes per arm: wake-to-worker p99 was 0.129 ms at
+  1 vCPU, 1.700 ms at 8 vCPUs, and 2.331 ms at 8 vCPUs with 50% host CPU
+  pressure. At 8 vCPUs without pressure, p99 through the waker return was
+  26.8 µs and p99 after it was 1.696 ms; the largest total was 7.204 ms.
+- Host `perf --switch-events` in the no-pressure 8-vCPU run captured no
+  RustOS-vCPU involuntary preemption gap of 1 ms or longer. That rules out
+  a single such host preemption as the whole longest delay, not all host
+  effects. Guest mailbox arrival, runnable eligibility and dispatch have
+  not yet been joined by exact task/time; no IPI loss or Chrome latency
+  attribution is claimed. Evidence: `build/smp-wake-trace/`.
+
 ## Anonymous 64 KiB mTHP (working tree)
 
 - Eligible write first touches can allocate a contiguous 16-frame folio and

@@ -131,6 +131,12 @@ is the universal backstop for a coalesced or deferred IPI and for an
   request without publishing its wake;
 - a stashed fast IPC reply (`pending_reply`) defeats the periodic fast return,
   so a replier that returns to compute cannot hold its caller's wake;
+- receive the generation-bound remote mailbox before declining an odd class
+  epoch. On an incomplete priority decision or failed physical claim, retry
+  with a fresh epoch while retaining the original turn and accounting the
+  outgoing interval only once. At most four attempts are made, and a stable
+  empty choice or absence of local work does not retry. The timer remains the
+  backstop if all attempts fail;
 - a dispatch turn makes progress whenever some candidate is resolvable: the
   first-turn FIFO consumes records for tasks not queued here (7.3), and the
   fair and overdue scans omit, on their final observation only, a candidate

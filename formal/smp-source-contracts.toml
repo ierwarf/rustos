@@ -1280,7 +1280,7 @@ tokens = [
 # The fallback's own fresh claim is a separate guard, not refined here.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn claim(", "DispatchFrame::from_selection(outgoing.original_turn(), candidate.frame, class_sequence)", "FrameCapture::Ready(frame) => frame.prepare().is_some_and(|funded| funded.claim())", "if !success && matches!(candidate.custody, FrameCustody::Direct)", "Some(candidate.generation)", "pub(in crate::multitask) fn dispatch(", "if claim(outgoing, candidate, class_sequence) { return complete(outgoing, urgency); }", "Decision::Claimed(urgency) => return complete", "Decision::Empty | Decision::Incomplete", "dispatch_claim::claim_fallback(turn, idle, class_sequence)", "complete(outgoing, Urgency::Fair)"]
+tokens = ["fn claim(", "DispatchFrame::from_selection(outgoing.original_turn(), candidate.frame, class_sequence)", "FrameCapture::Ready(frame) => frame.prepare().is_some_and(|funded| funded.claim())", "if !success && matches!(candidate.custody, FrameCustody::Direct)", "Some(candidate.generation)", "pub(in crate::multitask) fn dispatch(", "if claim(outgoing, candidate, class_sequence) { return complete(outgoing, urgency); }", "Decision::Claimed(urgency) => return complete", "Decision::Empty => break", "Decision::Incomplete => {}", "dispatch_claim::claim_fallback(turn, idle, class_sequence)", "complete(outgoing, Urgency::Fair)"]
 
 [[forbidden_patterns]]
 scope = "kernel/ps/src/multitask/scheduler/handoffs.rs"
@@ -1551,7 +1551,7 @@ tokens = ["fn synchronous(", "p.task_id == Some(record.task_id()) && p.lifecycle
 # current/idle owner (or marks an unavailable idle frame stale).
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn choose(", "runqueue::drain_remote_wakes(cpu)", "dispatch_policy::atomic_activation_pending(cpu)", "first_turn(turn, cpu, true, class_sequence)", "match synchronous(cpu)", "let overdue = local_dispatch::retry_incomplete_policy(|unresolved| local_dispatch::choose_overdue_system(", "runqueue::local_runnable_sequence(cpu), donation_ledger::class_publication_sequence()", "Err(_) => return Decision::Incomplete", "first_turn(turn, cpu, false, class_sequence)", "match latency(cpu)", "local_dispatch::user_reservation_due(cpu)", "class_sequence & 1 != 0", "match retry_fair(", "donation_ledger::class_publication_sequence() != class_sequence", "Ok(local_dispatch::LocalClass::User) => return Decision::Selected(candidate)", "Err(_) => return Decision::Incomplete", "match hint(cpu, current)", "match retry_fair("]
+tokens = ["fn choose(", "runqueue::drain_remote_wakes(cpu)", "if class_sequence & 1 != 0 { return Decision::Incomplete; }", "dispatch_policy::atomic_activation_pending(cpu)", "first_turn(turn, cpu, true, class_sequence)", "match synchronous(cpu)", "let overdue = local_dispatch::retry_incomplete_policy(|unresolved| local_dispatch::choose_overdue_system(", "runqueue::local_runnable_sequence(cpu), donation_ledger::class_publication_sequence()", "Err(_) => return Decision::Incomplete", "first_turn(turn, cpu, false, class_sequence)", "match latency(cpu)", "local_dispatch::user_reservation_due(cpu)", "class_sequence & 1 != 0", "match retry_fair(", "donation_ledger::class_publication_sequence() != class_sequence", "Ok(local_dispatch::LocalClass::User) => return Decision::Selected(candidate)", "Err(_) => return Decision::Incomplete", "match hint(cpu, current)", "match retry_fair("]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/local_dispatch/fair_retry.rs"
@@ -1567,7 +1567,7 @@ tokens = [
 # only a generation-bound Local candidate or the guarded idle/current fallback.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn fair(", "local_dispatch::choose_local_next_with(", "runqueue::local_runnable_sequence(cpu)", "donation_ledger::class_publication_sequence()", "Ok((slot, generation))", "FrameCustody::Current", "FrameCustody::Local", "fn retry_fair(", "local_dispatch::retry_incomplete_policy(|unresolved| fair(", "pub(in crate::multitask) fn dispatch(", "Decision::Empty | Decision::Incomplete", "dispatch_claim::claim_fallback(turn, idle, class_sequence)"]
+tokens = ["fn fair(", "local_dispatch::choose_local_next_with(", "runqueue::local_runnable_sequence(cpu)", "donation_ledger::class_publication_sequence()", "Ok((slot, generation))", "FrameCustody::Current", "FrameCustody::Local", "fn retry_fair(", "local_dispatch::retry_incomplete_policy(|unresolved| fair(", "pub(in crate::multitask) fn dispatch(", "for _ in 0..MAX_ATTEMPTS", "class_sequence = donation_ledger::class_publication_sequence()", "Decision::Empty => break", "Decision::Incomplete => {}", "dispatch_claim::claim_fallback(turn, idle, class_sequence)"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/local_dispatch/fair_retry.rs"

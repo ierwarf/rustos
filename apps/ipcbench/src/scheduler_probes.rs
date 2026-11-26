@@ -22,6 +22,7 @@ struct Gate {
     failed: AtomicBool,
     end: AtomicU64,
     apic: AtomicU32,
+    tid: AtomicU64,
 }
 
 fn futex(word: &AtomicU32, operation: i32, value: u32) -> i64 {
@@ -82,16 +83,28 @@ fn worker(gate: &Gate) -> bool {
     }
 }
 
-fn collect(
-    workers: usize,
-    rounds: usize,
-    warmup: usize,
-) -> Option<(Vec<u64>, BTreeMap<u32, usize>)> {
+#[derive(Clone, Copy)]
+struct WakeSample {
+    elapsed: u64,
+    syscall: u64,
+    after_return: u64,
+    apic: u32,
+    tid: u64,
+    start: u64,
+    end: u64,
+}
+
+type WakeCollection = (Vec<u64>, BTreeMap<u32, usize>, Option<Vec<WakeSample>>);
+
+fn collect<const TRACE: bool>(workers: usize, rounds: usize, warmup: usize) -> Option<WakeCollection> {
     let gates: Vec<_> = (0..workers).map(|_| Arc::new(Gate::default())).collect();
     let mut threads = Vec::with_capacity(workers);
     for gate in &gates {
         let gate = Arc::clone(gate);
         match std::thread::Builder::new().spawn(move || {
+            if TRACE {
+                gate.tid.store(unsafe { crate::syscall0(libc::SYS_gettid as u64) } as u64, Ordering::Relaxed);
+            }
             let valid = worker(&gate);
             if !valid {
                 gate.failed.store(true, Ordering::Release);
@@ -118,6 +131,8 @@ fn collect(
     let mut samples = Vec::with_capacity(workers * rounds);
     let mut placement = BTreeMap::new();
     let mut starts = vec![0u64; workers];
+    let mut returns = TRACE.then(|| vec![0u64; workers]);
+    let mut trace = TRACE.then(|| Vec::with_capacity(workers * rounds));
     let mut valid = true;
     'rounds: for round in 0..rounds + warmup {
         for gate in &gates {
@@ -133,15 +148,19 @@ fn collect(
         // Untimed park opportunity. Actual wake count, not this sleep, proves
         // each sample had a real waiter; the sleep is not part of wake latency.
         std::thread::sleep(Duration::from_micros(200));
-        for (gate, start) in gates.iter().zip(&mut starts) {
+        for (index, (gate, start)) in gates.iter().zip(&mut starts).enumerate() {
             *start = tsc();
             gate.command.store(1, Ordering::Release);
-            if futex(&gate.command, libc::FUTEX_WAKE, 1) != 1 {
+            let result = futex(&gate.command, libc::FUTEX_WAKE, 1);
+            if let Some(returns) = returns.as_mut() {
+                returns[index] = tsc();
+            }
+            if result != 1 {
                 valid = false;
                 break 'rounds;
             }
         }
-        for (gate, start) in gates.iter().zip(&starts) {
+        for (index, (gate, start)) in gates.iter().zip(&starts).enumerate() {
             while gate.done.load(Ordering::Acquire) == 0 {
                 if !wait(&gate.done, 0) {
                     valid = false;
@@ -158,10 +177,21 @@ fn collect(
                 break 'rounds;
             }
             if round >= warmup {
+                let apic = gate.apic.load(Ordering::Relaxed);
                 samples.push(end - start);
-                *placement
-                    .entry(gate.apic.load(Ordering::Relaxed))
-                    .or_insert(0) += 1;
+                *placement.entry(apic).or_insert(0) += 1;
+                if let (Some(trace), Some(returns)) = (trace.as_mut(), returns.as_ref()) {
+                    let returned = returns[index];
+                    trace.push(WakeSample {
+                        elapsed: end - start,
+                        syscall: returned - start,
+                        after_return: end.saturating_sub(returned),
+                        apic,
+                        tid: gate.tid.load(Ordering::Relaxed),
+                        start: *start,
+                        end,
+                    });
+                }
             }
             gate.done.store(0, Ordering::Release);
         }
@@ -174,7 +204,7 @@ fn collect(
     for thread in threads {
         valid &= thread.join().unwrap_or(false);
     }
-    (valid && samples.len() == workers * rounds).then_some((samples, placement))
+    (valid && samples.len() == workers * rounds).then_some((samples, placement, trace))
 }
 
 #[cfg(test)]
@@ -198,14 +228,43 @@ mod tests {
     }
 }
 
+/// Diagnostic sibling of `smp_balance_futex`. A worker may run in parallel
+/// before the waker returns; after_return is then zero, not a negative wait.
+pub fn trace_balance(khz: u64) {
+    const NAME: &str = "smp_balance_futex_trace";
+    let Some((mut elapsed, _, Some(mut trace))) = collect::<true>(8, 256, 8) else {
+        skip(NAME, "futex-wake-not-parked-or-transcript-failed");
+        return;
+    };
+    report(NAME, &summarize(&mut elapsed), khz);
+    let mut syscalls: Vec<_> = trace.iter().map(|sample| sample.syscall).collect();
+    let mut after: Vec<_> = trace.iter().map(|sample| sample.after_return).collect();
+    let syscall = summarize(&mut syscalls);
+    let post = summarize(&mut after);
+    let before_or_at_return = trace.iter().filter(|sample| sample.after_return == 0).count();
+    debug_line(&format!(
+        "ipcbench: wake trace n={} before_or_at_return={before_or_at_return} \
+         syscall_p50={} syscall_p99={} after_p50={} after_p99={}",
+        trace.len(), syscall.p50, syscall.p99, post.p50, post.p99,
+    ));
+    trace.sort_unstable_by_key(|sample| std::cmp::Reverse(sample.elapsed));
+    for (rank, sample) in trace.iter().take(32).enumerate() {
+        debug_line(&format!(
+            "ipcbench: wake trace rank={} total={} syscall={} after_return={} apic={} tid={} start={} end={}",
+            rank + 1, sample.elapsed, sample.syscall, sample.after_return, sample.apic,
+            sample.tid, sample.start, sample.end,
+        ));
+    }
+}
+
 pub fn run(khz: u64) {
     crate::probe_sched_yield(khz);
     for (name, workers, rounds, warmup) in [
         ("wake_to_run_futex", 1, contract::ITERS, contract::WARMUP),
         ("smp_balance_futex", 8, 256, 8),
     ] {
-        match collect(workers, rounds, warmup) {
-            Some((mut samples, placement)) => {
+        match collect::<false>(workers, rounds, warmup) {
+            Some((mut samples, placement, _)) => {
                 report(name, &summarize(&mut samples), khz);
                 for (apic, samples) in placement {
                     debug_line(&format!(

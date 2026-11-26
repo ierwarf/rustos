@@ -340,12 +340,12 @@ impl Drop for SelectionTurn {
 }
 
 fn choose(turn: &crate::multitask::cpu_local::dispatch_turn::CpuDispatchTurn<'static>, cpu: usize, current: usize, voluntary: bool, runtime: u64, ticks: u64, class_sequence: u64) -> Decision {
+    // Mailbox custody is independent of the class epoch. In particular, an
+    // IPI may be the only notification for this mailbox batch. Receive it
+    // even when an odd class epoch prevents this turn from selecting work.
+    let _ = runqueue::drain_remote_wakes(cpu);
     if class_sequence & 1 != 0 { return Decision::Incomplete; }
     let _turn_clock = SelectionTurn::begin(cpu);
-    // Receive the original generation-bound mailbox before any priority arm
-    // can return Incomplete. A remote activation prefix is not a Local frame
-    // yet; putting this behind that prefix strands its own admission forever.
-    let _ = runqueue::drain_remote_wakes(cpu);
     if dispatch_policy::atomic_activation_pending(cpu) {
         match first_turn(turn, cpu, true, class_sequence) { Decision::Empty => {}, result => return result }
     }
@@ -480,16 +480,29 @@ pub(in crate::multitask) fn dispatch(outgoing: &mut CurrentReturn<'_>, rsp: usiz
     if !turn.owns_priority_choice() { turn.begin_priority_choice(); }
     let runtime = prologue(outgoing, rsp, voluntary);
     let cpu = turn.original_current().expect("dispatcher lost original turn").0;
-    // Capture BEFORE any policy arm, and carry this SAME observation into the
-    // original physical claim; later class publication invalidates the choice.
-    let class_sequence = donation_ledger::class_publication_sequence();
-    match choose(turn, cpu, outgoing.slot(), voluntary, runtime, crate::arch::rtc::ticks(), class_sequence) {
-        Decision::Selected(candidate) => {
-            let urgency = candidate.urgency;
-            if claim(outgoing, candidate, class_sequence) { return complete(outgoing, urgency); }
+    let ticks = crate::arch::rtc::ticks();
+    // A torn class/custody snapshot or a lost physical claim is not proof of
+    // an empty queue. Retry the whole priority chain with a fresh epoch, but
+    // retain the original CPU turn and the already published outgoing frame.
+    // The bound is independent of task count and never waits for a publisher
+    // that may itself be descheduled. A stable empty pick does not retry.
+    const MAX_ATTEMPTS: usize = 4;
+    let mut class_sequence = 0;
+    for _ in 0..MAX_ATTEMPTS {
+        // Capture BEFORE any policy arm, and carry the SAME observation into
+        // its physical claim. Never use a new epoch to validate an old choice.
+        class_sequence = donation_ledger::class_publication_sequence();
+        match choose(turn, cpu, outgoing.slot(), voluntary, runtime, ticks, class_sequence) {
+            Decision::Selected(candidate) => {
+                let urgency = candidate.urgency;
+                if claim(outgoing, candidate, class_sequence) { return complete(outgoing, urgency); }
+            }
+            Decision::Claimed(urgency) => return complete(outgoing, urgency),
+            Decision::Empty => break,
+            Decision::Incomplete => {},
         }
-        Decision::Claimed(urgency) => return complete(outgoing, urgency),
-        Decision::Empty | Decision::Incomplete => {},
+        if !runqueue::local_dispatch_work_pending(cpu) { break; }
+        core::hint::spin_loop();
     }
     let idle = smp::idle_slot_for_cpu(cpu).expect("dispatcher lacks fixed CPU idle");
     dispatch_claim::claim_fallback(turn, idle, class_sequence);

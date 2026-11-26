@@ -35,10 +35,16 @@ fn actual_remote_activation_mailbox_is_admitted_before_atomic_first_turn_qualifi
         assert_eq!(runqueue::owner(slot).state, runqueue::RunOwnerState::RemoteQueued);
         assert!(frame_publication::local_frame_token(slot, 0).is_none());
         enqueue(slot, ID, true);
-        // Do NOT manually drain the mailbox as the old remote activation
-        // component witness did: the real production priority chain must do it.
-        let decision = choose(turn, 0, 121, false, 0, crate::arch::rtc::ticks(),
-            donation_ledger::class_publication_sequence());
+        // The observed odd class epoch refuses any physical claim, but must
+        // not consume the sole IPI without receiving its mailbox work.
+        let even = donation_ledger::class_publication_sequence();
+        assert_eq!(even & 1, 0);
+        let ticks = crate::arch::rtc::ticks();
+        assert!(matches!(choose(turn, 0, 121, false, 0, ticks, even | 1), Decision::Incomplete));
+        assert_eq!(runqueue::owner(slot).state, runqueue::RunOwnerState::Local);
+        assert!(turn.claimed_return().is_none());
+        assert!(dispatch_policy::atomic_activation_pending(0));
+        let decision = choose(turn, 0, 121, false, 0, ticks, even);
         assert!(matches!(decision, Decision::Claimed(Urgency::Atomic)),
             "atomic prefix must not starve its own remote mailbox behind Incomplete");
         assert_eq!(turn.claimed_return().unwrap().id, ID);
