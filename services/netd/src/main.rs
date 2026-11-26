@@ -44,7 +44,8 @@ use rustos_user_abi::syscall::{
     NET_BROKER_PACKET_STATUS_ACTIVE, NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL,
     NET_BROKER_PACKET_STATUS_UNAVAILABLE, NET_BROKER_SOCKET_PUBLICATION_VERSION,
     NETD_DVM_SESSION_GRANT, NETD_DVM_SESSION_REVOKE, NETD_IPC_ABI_VERSION, NETD_IPC_OP_DVM_SESSION,
-    NETD_IPC_OP_POLL_BATCH, NETD_IPC_OP_REF_ACK, NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF,
+    NETD_IPC_OP_POLL_BATCH, NETD_IPC_OP_REF_ACK, NETD_IPC_OP_REF_ACK_BATCH, NETD_REF_ACK_BATCH_MAX,
+    NetdRefAckWire, NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF,
     NETD_IPC_RESPONSE_HEADER_SIZE, NETD_POLL_MODE_QUERY, NETD_POLL_MODE_WAIT,
     NETD_POLL_BATCH_MAX, NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE,
     NetBrokerPrepareSocketPublication, NetdIpcRequest, NetdIpcResponse, NetdPollQueryWire, NetdPollResultWire, RustosNetBrokerArgs,
@@ -135,13 +136,13 @@ const MAX_PENDING_LIFECYCLE_REQUESTS: usize = 16;
 static PENDING_LIFECYCLE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_LIFECYCLE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 const REF_REPLAY_CAPACITY: usize = 4096;
-/// A completed reference result is kept for replay at least this long even
-/// when the log is full. It is far above the caller's 5 s state-mutation lease
-/// plus its bounded retries, so only results nobody can still retry (the
-/// caller crashed or abandoned the operation without sending `REF_ACK`) are
-/// ever reclaimed. Without reclamation those leak until every later dup/close
-/// fails with `ENOSPC`.
-const REF_REPLAY_MIN_RETENTION: Duration = Duration::from_secs(60);
+// Raw service clients must not fill the entire log and prevent the kernel
+// from releasing its last descriptor. Existing entries remain replayable at
+// either bound; this reserve affects new non-kernel mutations only.
+const REF_REPLAY_KERNEL_RESERVE: usize = NETD_REF_ACK_BATCH_MAX * 2;
+// Completed results survive until exact ACK. A kernel-owned final release
+// outlives the user's process and may retry after a long provider stall; age
+// alone is not evidence that nobody can still replay that mutation.
 static PENDING_BLOCKING_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static PENDING_LOCAL_POLLS: AtomicUsize = AtomicUsize::new(0);
 static LOCAL_POLL_CLIENTS: ClientSlots = ClientSlots::new();
@@ -165,9 +166,6 @@ struct RefReplayEntry {
     value: u64,
     release: Vec<u8>,
     complete: bool,
-    /// Admission time, used only to decide when a never-acknowledged result may
-    /// be reclaimed.
-    admitted: StdInstant,
 }
 
 /// Table-wide socket ceilings. Per-process Job billing bounds one client, but

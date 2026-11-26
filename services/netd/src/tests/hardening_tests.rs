@@ -116,7 +116,7 @@ fn blocking_retry_backoff_doubles_to_a_fixed_cap() {
     assert_eq!(blocking_retry_backoff(usize::MAX).as_millis(), 4);
 }
 
-fn replay_entry(operation_lo: u64, complete: bool, admitted: StdInstant) -> RefReplayEntry {
+fn replay_entry(operation_lo: u64, complete: bool) -> RefReplayEntry {
     RefReplayEntry {
         operation_hi: 1,
         operation_lo,
@@ -126,29 +126,28 @@ fn replay_entry(operation_lo: u64, complete: bool, admitted: StdInstant) -> RefR
         value: 0,
         release: Vec::new(),
         complete,
-        admitted,
     }
 }
 
 #[test]
-fn full_replay_log_reclaims_only_old_completed_results() {
-    let base = StdInstant::now();
-    let later = base + REF_REPLAY_MIN_RETENTION + Duration::from_secs(1);
-    let mut log: HashMap<(u64, u64), RefReplayEntry> = [
-        // Old and acknowledged-by-nobody: reclaimable.
-        replay_entry(1, true, base),
-        // Old but still executing: its request owns the slot.
-        replay_entry(2, false, base),
-        // Recent completed result: a retry may still need it.
-        replay_entry(3, true, later - Duration::from_secs(1)),
-    ]
-    .into_iter()
-    .map(|entry| ((entry.operation_hi, entry.operation_lo), entry))
+fn full_replay_log_keeps_unacknowledged_results_and_refuses_new_mutation() {
+    let mut log: HashMap<(u64, u64, u64), RefReplayEntry> = (1..=REF_REPLAY_CAPACITY as u64)
+    .map(|operation| replay_entry(operation, true))
+    .map(|entry| ((0, entry.operation_hi, entry.operation_lo), entry))
     .collect();
-    reclaim_stale_ref_results(&mut log, later);
-    let mut kept: Vec<u64> = log.values().map(|entry| entry.operation_lo).collect();
-    kept.sort_unstable();
-    assert_eq!(kept, [2, 3]);
+    let request = NetdIpcRequest {
+        op: SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
+        socket_token: 9,
+        operation_hi: 1,
+        operation_lo: REF_REPLAY_CAPACITY as u64 + 1,
+        ..NetdIpcRequest::default()
+    };
+    assert!(matches!(ref_replay::begin_ref_result_in(
+        &mut log, &request, &mut NetdIpcResponse::default()), Err(libc::ENOSPC)));
+    assert_eq!(log.len(), REF_REPLAY_CAPACITY);
+    let replay = NetdIpcRequest { operation_lo: 1, ..request };
+    assert!(matches!(ref_replay::begin_ref_result_in(
+        &mut log, &replay, &mut NetdIpcResponse::default()), Ok(RefReplayAction::Replay(0))));
 }
 
 #[test]

@@ -13,6 +13,37 @@ fn request(now: u64) -> NetdIpcRequest {
 }
 
 #[test]
+fn maintenance_requires_exact_live_kernel_sender_and_cannot_create_or_duplicate_sockets() {
+    let now = 1_000_000_000;
+    for (sender_pid, sender_tid, op, expected) in [
+        (0, 42, SYSCALL_OFFLOAD_OP_LINUX_CLOSE, 0),
+        (7, 42, SYSCALL_OFFLOAD_OP_LINUX_CLOSE, libc::EACCES),
+        (0, 0, SYSCALL_OFFLOAD_OP_LINUX_CLOSE, libc::EACCES),
+        (0, 42, SYSCALL_OFFLOAD_OP_LINUX_SOCKET, libc::EINVAL),
+        (0, 42, SYSCALL_OFFLOAD_OP_LINUX_DUP, libc::EINVAL),
+    ] {
+        let mut request = NetdIpcRequest {
+            pid: 0, tid: 42, op, socket_token: 9,
+            operation_hi: 7, operation_lo: 1, ..request(now)
+        };
+        let called = Cell::new(false);
+        let mut status = -1;
+        let result = service_received_request_with(
+            ReceivedNetdRequest {
+                result: NETD_IPC_REQUEST_HEADER_SIZE as i64,
+                request: &mut request, reply_cap: 11, sender_pid, sender_tid,
+            },
+            || now,
+            |_, _, _| { called.set(true); Some(0) },
+            |_, response| { status = response.status; 0 },
+        );
+        assert_eq!(result, ReceiveTurn::Replied { status: 0, poll_after_reply: true });
+        assert_eq!(status, expected);
+        assert_eq!(called.get(), expected == 0);
+    }
+}
+
+#[test]
 fn empty_request_gets_one_terminal_reply_then_the_next_live_request_is_admitted() {
     let now = 1_000_000_000;
     let dispatches = Cell::new(0);

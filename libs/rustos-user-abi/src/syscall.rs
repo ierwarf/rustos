@@ -1295,11 +1295,12 @@ pub const ROOTD_LEASE_STATE_RUNNING: u16 = 1;
 pub const ROOTD_LEASE_STATE_EXITED: u16 = 2;
 pub const ROOTD_LEASE_STATE_RESTART_PENDING: u16 = 3;
 pub const ROOTD_LEASE_STATE_FAILED: u16 = 4;
-pub const NETD_IPC_ABI_VERSION: u16 = 9;
+pub const NETD_IPC_ABI_VERSION: u16 = 10;
 pub mod netd_message;
 pub const NETD_IPC_PAYLOAD_CAPACITY: usize = 32 * 1024;
-/// Netd v9 separates truncated-record accounting from the latency hint and retains copied IPv4 addresses
-/// to datagram message envelopes. Only the header plus `payload_len` is sent; the unused tail of
+/// Netd v10 adds exact batched reference acknowledgements and authenticated
+/// kernel maintenance identities `(pid = 0, tid = live kernel task ID)`.
+/// Only the header plus `payload_len` is sent; the unused tail of
 /// the in-memory transport buffer is not copied through the kernel IPC path.
 pub const NETD_IPC_REQUEST_HEADER_SIZE: usize =
     core::mem::size_of::<NetdIpcRequest>() - NETD_IPC_PAYLOAD_CAPACITY;
@@ -1365,6 +1366,25 @@ pub const NETD_IPC_OP_DVM_SESSION: u16 = 0x8005;
 /// example `EBADF`) is reported in that entry's `status`, not as the reply's.
 pub const NETD_IPC_OP_POLL_BATCH: u16 = 0x8006;
 pub const NETD_POLL_BATCH_MAX: usize = WAITSET_MAX_INTERESTS;
+/// Retire up to 32 exact completed reference operations in one IPC. `arg0`
+/// equals the number of `NetdRefAckWire` payload entries; the reply has one
+/// positive errno (or zero) as a little-endian i32 per entry in the same order.
+/// Unknown identities acknowledge successfully; an alias or incomplete result
+/// affects only that entry and does not prevent progress of its neighbours.
+pub const NETD_IPC_OP_REF_ACK_BATCH: u16 = 0x8007;
+pub const NETD_REF_ACK_BATCH_MAX: usize = 32;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NetdRefAckWire {
+    pub operation_hi: u64,
+    pub operation_lo: u64,
+    pub socket_token: u64,
+    pub op: u16,
+    pub reserved0: u16,
+    pub reserved1: u32,
+}
+const _: () = assert!(size_of::<NetdRefAckWire>() == 32);
 const _: () = assert!(size_of::<NetdPollQueryWire>() == 16 && size_of::<NetdPollResultWire>() == 16);
 const _: () = assert!(size_of::<WaitSetClaimWire>() == 32 && size_of::<WaitSetSnapshotWire>() == 64);
 pub const NETD_DVM_SESSION_GRANT: u64 = 1;

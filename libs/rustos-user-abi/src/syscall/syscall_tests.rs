@@ -585,8 +585,13 @@ fn socket_poll_owns_a_unique_offload_operation() {
 }
 
 #[test]
-fn netd_v9_deadline_wire_keeps_the_fixed_header_layout() {
-    assert_eq!(NETD_IPC_ABI_VERSION, 9);
+fn netd_v10_reference_ack_batch_keeps_the_fixed_header_layout() {
+    assert_eq!(NETD_IPC_ABI_VERSION, 10);
+    assert_eq!(NETD_IPC_OP_REF_ACK_BATCH, 0x8007);
+    assert_eq!(NETD_REF_ACK_BATCH_MAX, 32);
+    assert_eq!(size_of::<NetdRefAckWire>(), 32);
+    assert_eq!(core::mem::offset_of!(NetdRefAckWire, socket_token), 16);
+    assert_eq!(core::mem::offset_of!(NetdRefAckWire, op), 24);
     assert_eq!(NETD_IPC_REQUEST_HEADER_SIZE, 136);
     assert_eq!(NETD_IPC_RESPONSE_HEADER_SIZE, 32);
     assert_eq!(core::mem::offset_of!(NetdIpcResponse, reserved2), 12);

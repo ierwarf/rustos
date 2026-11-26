@@ -74,6 +74,9 @@ pub(super) fn service_received_request_with(
     };
     response.status = match validate_request(received, request) {
         Err(errno) => errno,
+        // Kernel maintenance uses (0, live kernel task ID), as attested by
+        // IPC_RECV. Unknown/retired senders remain (0,0) and cannot claim it;
+        // a user's fabricated header still disagrees with its stamped PID.
         Ok(()) if request.pid != turn.sender_pid || request.tid != turn.sender_tid => libc::EACCES,
         Ok(()) => {
             // Admission stamps the immutable caller deadline once; retries

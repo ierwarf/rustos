@@ -22,7 +22,7 @@ session grant/revoke remains inputd/netd policy and keeps its capability gate.
 
 Routed Linux ops after bootstrap (for `AF_INET`, `AF_INET6`, and `AF_NETLINK` sockets; `AF_UNIX` and `socketpair(AF_UNIX, ...)` are kernel-local `UnixSocketHandle` objects — see [local-fd.md](local-fd.md)): `socket`, socket `dup`/`dup2`/`dup3`, socket `close`, socket `read`/`write`/`writev`, `bind`, `listen`, `accept`/`accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt`, `shutdown`.
 
-netd invokes gated `SYS_RUSTOS_NET_BROKER` with target pid. Net broker arg struct carries six 64-bit syscall arg slots. Kernel performs handle install and target user-memory validation/copy; `AF_INET`/`AF_INET6` TCP/UDP/ICMP and `AF_NETLINK` (`NETLINK_ROUTE`, `NETLINK_KOBJECT_UEVENT` including `SO_ATTACH_FILTER`) lifecycle, queues, and socket option policy belong to netd. `netd` rejects `AF_UNIX` and `socketpair`. Version-8 `NetdIpcRequest`/`Response` frames copy an exact 136/32-byte header plus only the actual bounded payload, rather than a fixed maximum-size buffer. Request offset 112 carries a mandatory nonzero absolute `CLOCK_MONOTONIC` deadline; the frames also carry `socket_token`, fd `status_flags`, and a bounded inline payload for this service-owned socket path.
+netd invokes gated `SYS_RUSTOS_NET_BROKER` with target pid. Net broker arg struct carries six 64-bit syscall arg slots. Kernel performs handle install and target user-memory validation/copy; `AF_INET`/`AF_INET6` TCP/UDP/ICMP and `AF_NETLINK` (`NETLINK_ROUTE`, `NETLINK_KOBJECT_UEVENT` including `SO_ATTACH_FILTER`) lifecycle, queues, and socket option policy belong to netd. `netd` rejects `AF_UNIX` and `socketpair`. Version-10 `NetdIpcRequest`/`Response` frames copy an exact 136/32-byte header plus only the actual bounded payload, rather than a fixed maximum-size buffer. Request offset 112 carries a mandatory nonzero absolute `CLOCK_MONOTONIC` deadline; the frames also carry `socket_token`, fd `status_flags`, and a bounded inline payload for this service-owned socket path.
 
 Note: `AF_UNIX` stream, seqpacket, and datagram sockets (including `SCM_RIGHTS` and pathname bindings) now live in Ring0 (`kernel/ps/src/user/unix_socket.rs`, billed to the client Job via `page_lease.rs`); see [local-fd.md](local-fd.md) and [ipc.md](ipc.md). Pathname `AF_UNIX` bind/connect delegates traversal/inode creation to `vfsd` with caller credentials (`VFS_IPC_OP_MKNOD` / `STAT` / `UNLINKAT`); abstract names stay kernel-local.
 
@@ -31,12 +31,35 @@ it for every foreground retry. The kernel reply wait floors the same monotonic
 nanosecond value into its RTC tick domain and takes the earlier of the wire end
 and its already-admitted service-class end. Netd then tightens the request once
 at admission to 16 ms for readiness, 100 ms for DVM session control, a 5 s
-state-mutation lease for SOCKET/SOCKETPAIR/ACCEPT and reference DUP/CLOSE/ACK,
+state-mutation lease for SOCKET/SOCKETPAIR/ACCEPT and explicit reference
+DUP/CLOSE/ACK/ACK_BATCH,
 or 30 s for bulk work. Queueing, worker dequeue, provider polling, and
 retry may consume the stamped remainder but cannot mint another class budget.
 An expired detached poll makes one terminal `ETIMEDOUT` reply attempt and
 releases its slot; a reply consumed after the caller deadline is discarded,
 including transferred descriptors, instead of reviving the completed call.
+
+Normal descriptor DUP/fork/SCM_RIGHTS and epoll pins now share one locally
+counted provider reference. Before initial reply binding, the broker reserves
+one of 16384 fixed socket-custody slots; failure leaves the unpublished socket
+owned by netd. Final release marks that slot for deferred CLOSE, then exact
+ACK, without a second allocation or queue admission. A single kernel executor
+uses one shared 100 ms turn end, at most eight closes, and batches of at most
+32 ACK entries. Uncertain attempts retain the same operation identity, rotate
+behind other ready work, and back off from 8 ms to 1024 ms. ACKs have their own
+lane, so one failed close cannot prevent reclaiming completed mutations.
+The endpoint is captured under its publication epoch before IPC; replacement
+netd instances never receive old close tokens. This transport bookkeeping
+does not move socket/network policy out of netd.
+
+Version 10 admits kernel maintenance only as kernel-attested `(pid=0,
+tid=exact_live_kernel_task_id)` and only for CLOSE/ACK/ACK_BATCH. Ordinary,
+register and handle-bearing queued receive paths use the same exact task
+identity. Missing, stale and incomplete identities stay `(0,0)` and are
+rejected. The replay key includes the authenticated PID namespace together
+with the operation pair, preventing user requests from colliding with or
+acknowledging kernel cleanup. Kernel maintenance retains normal scheduling
+context donation; it has no IPC admission bypass.
 
 This deliberately combines three established microkernel properties without
 copying their ABI: L4Re exposes absolute IPC timeouts and warns that a finite
@@ -126,10 +149,15 @@ exact queue custody under the state mutex. Read shutdown retains unread queues
 and their budget until consumption/retirement. Exhaustion returns `EAGAIN` and
 removes POLLOUT; entering/leaving exhaustion re-observes every Unix sender and
 publishes changed generations, so unrelated consumers can wake blocked senders.
-Dup/close replay results are reclaimed only when the 4096-entry log is full and
-the completed result is older than 60 s (far above the 5 s caller lease); a
-never-acknowledged result can therefore no longer exhaust the log and turn every
-later reference mutation into `ENOSPC`. A kernel-rejected reply (`EINVAL` from a
+Dup/close replay results remain until an exact ACK or provider-incarnation
+retirement. Age alone cannot prove that an uncertain mutation will not be
+retried. Of the bounded 4096 replay entries, 64 are reserved from user
+admission so a user backlog cannot consume all kernel-release capacity. A
+32-byte `NetdRefAckWire` carries the operation pair, token and original op;
+ACK_BATCH validates its entire bounded envelope before applying entries and
+returns an independent status for each. An unknown exact ACK is idempotent;
+an incomplete or mismatching entry cannot prevent its valid neighbors from
+retiring. A kernel-rejected reply (`EINVAL` from a
 length-checked response) means the caller abandoned the call; it is counted
 separately from real reply faults and the operation's effect is not rolled back.
 The full INET readiness sweep is requested when a poll turn changed socket
@@ -193,7 +221,7 @@ end-to-end test of these TCP edge cases; they have focused host regressions.
   initial provider reference to the exact timely reply; it does not parse DNS
   or generate IP/UDP/ICMP packets. Stack randomness, like socket capabilities,
   is seeded from the admitted entropy broker without a deterministic fallback.
-- Netd v8 retains the 136/32-byte fixed request/response headers and the v7
+- Netd v10 retains the 136/32-byte fixed request/response headers and the v7
   absolute-deadline discipline. Datagram `sendto`/`recvfrom` and
   `sendmsg`/`recvmsg` use a 16-byte envelope: four native-endian u32 fields
   (data length, control length, output flags, address length), followed by data,

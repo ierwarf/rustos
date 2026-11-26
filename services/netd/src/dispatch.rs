@@ -54,6 +54,9 @@ pub(super) fn dispatch_request(
     if request.op == NETD_IPC_OP_REF_ACK {
         return acknowledge_ref_result(request);
     }
+    if request.op == NETD_IPC_OP_REF_ACK_BATCH {
+        return acknowledge_ref_batch(request, response);
+    }
     let replay_safe_ref = matches!(
         request.op,
         SYSCALL_OFFLOAD_OP_LINUX_DUP | SYSCALL_OFFLOAD_OP_LINUX_CLOSE
@@ -174,8 +177,9 @@ pub(super) fn validate_request(received: usize, request: &NetdIpcRequest) -> Res
         || request.flags != 0
         || request.reserved1 != 0
         || request.deadline_ns == 0
-        || request.pid == 0
         || request.tid == 0
+        || request.pid == 0 && !matches!(request.op,
+            SYSCALL_OFFLOAD_OP_LINUX_CLOSE | NETD_IPC_OP_REF_ACK | NETD_IPC_OP_REF_ACK_BATCH)
         || request.payload_len as usize > request.payload.len()
     {
         return Err(libc::EINVAL);
@@ -215,7 +219,8 @@ pub(super) fn validate_request(received: usize, request: &NetdIpcRequest) -> Res
         | SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET
         | NETD_IPC_OP_POLL_BATCH
         | NETD_IPC_OP_DVM_SESSION
-        | NETD_IPC_OP_REF_ACK => Ok(()),
+        | NETD_IPC_OP_REF_ACK
+        | NETD_IPC_OP_REF_ACK_BATCH => Ok(()),
         _ => Err(libc::EINVAL),
     }
 }
