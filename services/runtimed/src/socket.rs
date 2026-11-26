@@ -8,10 +8,9 @@
 //! - **Concurrency:** Connection work is bounded; no global runtime-state lock
 //!   is held across blocking I/O or process-control IPC. `accept4` and
 //!   `SO_PEERCRED` run on a dedicated acceptor thread and reach the broker
-//!   through a bounded queue: each AF_UNIX syscall is a netd IPC with its own
-//!   reply deadline, and the broker loop also serves the session endpoint, so it
-//!   must not issue them. Reads of already-admitted clients and reply writes
-//!   still run on the broker (see `docs/ai/ui-startup-readiness.md`, deferred).
+//!   through a bounded queue. AF_UNIX data I/O is kernel-local in the current
+//!   implementation. Admitted-client nonblocking reads and reply writes remain
+//!   on the broker; they are not netd service RPCs.
 //! - **Failure:** Partial/malformed frame, unauthorized peer, timeout, queue
 //!   pressure, command failure, and owner exit close without state confusion.
 //! - **Forbidden:** No path/name authorization, unbounded allocation, implicit
@@ -84,9 +83,9 @@ pub(super) struct RuntimeConnections {
     /// capacity must never turn an old snapshot into a readiness observation.
     watch_programs: Vec<RuntimeRunningProgram>,
     /// Connections handed over by the acceptor thread. The broker thread never
-    /// calls `accept4`/`SO_PEERCRED` itself: on RustOS every AF_UNIX syscall is
-    /// an IPC to netd with its own reply deadline, so a stalled netd would
-    /// freeze the one loop that also drains the session endpoint.
+    /// calls `accept4`/`SO_PEERCRED` itself. The bounded hand-off separates
+    /// listener admission from the loop that also drains the session endpoint;
+    /// accepted AF_UNIX streams use the kernel-local transport.
     accepted: Receiver<AcceptedClient>,
     acceptor_stop_reported: bool,
 }
@@ -145,7 +144,7 @@ fn wait_listener_readable(listener: &UnixListener) -> std::io::Result<()> {
 }
 
 /// Accept until `deliver` reports the broker is gone. Never exits on an
-/// accept error: the control socket must outlive a transient netd stall.
+/// accept error: the control socket must outlive transient listener failures.
 fn accept_loop(listener: &UnixListener, mut deliver: impl FnMut(AcceptedClient) -> bool) {
     let mut consecutive_errors = 0_u32;
     loop {
@@ -695,34 +694,33 @@ fn fill_running_program_snapshot(state: &BrokerState, programs: &mut Vec<Runtime
 }
 
 fn write_running_programs(
-    stream: &mut UnixStream,
+    stream: &mut impl Write,
     op: u16,
     programs: &[RuntimeRunningProgram],
 ) -> Result<(), i32> {
     debug_assert!(op_carries_program_payload(op));
-    super::util::write_response(
-        stream,
-        RuntimeResponse {
-            version: PROTOCOL_VERSION,
-            op,
-            status: 0,
-            count: u32::try_from(programs.len()).unwrap_or(u32::MAX),
-        },
-    )?;
-    if !programs.is_empty() {
-        stream
-            // SAFETY: `programs` is a live slice of `repr(C)` RuntimeRunningProgram, whose
-            // size is const-asserted to 184 bytes with no padding, so all
-            // size_of_val bytes are initialized; the view is read-only for this write.
-            .write_all(unsafe {
-                std::slice::from_raw_parts(
-                    programs.as_ptr().cast::<u8>(),
-                    std::mem::size_of_val(programs),
-                )
-            })
-            .map_err(super::util::io_errno)?;
-    }
-    Ok(())
+    let response = RuntimeResponse {
+        version: PROTOCOL_VERSION,
+        op,
+        status: 0,
+        count: u32::try_from(programs.len()).map_err(|_| libc::EOVERFLOW)?,
+    };
+    let header = super::util::as_bytes(&response);
+    // SAFETY: RuntimeRunningProgram is repr(C), has a const-asserted size of
+    // 184 bytes and no padding, and every element is fully initialized.
+    let payload = unsafe {
+        std::slice::from_raw_parts(programs.as_ptr().cast::<u8>(), std::mem::size_of_val(programs))
+    };
+    let frame_len = header.len().checked_add(payload.len()).ok_or(libc::EOVERFLOW)?;
+    let mut frame = Vec::new();
+    frame.try_reserve_exact(frame_len).map_err(|_| libc::ENOMEM)?;
+    frame.extend_from_slice(header);
+    frame.extend_from_slice(payload);
+    // AF_UNIX is kernel-local. Hand it one complete bounded frame instead of
+    // separate header/payload writes, reducing syscall and copy-setup work
+    // when the whole frame fits. A short write may still require retries;
+    // errors remain terminal and must never append a second error envelope.
+    stream.write_all(&frame).map_err(super::util::io_errno)
 }
 
 /// Record admission before invoking any side-effect, and retain the result even
@@ -887,7 +885,7 @@ fn terminate_request(
                 match super::spawn::terminate_pid(pid) {
                     Ok(()) => terminated = true,
                     Err(err) if err == libc::ESRCH => {
-                        if let Some(process) = state.running.remove(&pid) {
+                        if let Some(process) = super::session::remove_running_process(state, pid) {
                             // Removing the record prevents the reaper from
                             // refunding it later; settle its session now.
                             super::spawn::release_failed_session(
@@ -1158,6 +1156,38 @@ mod tests {
     };
 
     #[test]
+    fn a_running_program_response_coalesces_header_and_payload_into_one_write() {
+        #[derive(Default)]
+        struct Capture {
+            calls: usize,
+            bytes: Vec<u8>,
+        }
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let mut program = runtime_control::RuntimeRunningProgram::default();
+        program.pid = 41;
+        program.session_handle = 7;
+        let mut output = Capture::default();
+        super::write_running_programs(&mut output, OP_WATCH_RUNNING_PROGRAMS, &[program]).unwrap();
+        let header = RuntimeResponse {
+            version: PROTOCOL_VERSION,
+            op: OP_WATCH_RUNNING_PROGRAMS,
+            status: 0,
+            count: 1,
+        };
+        let header_bytes = crate::util::as_bytes(&header);
+        assert_eq!(output.calls, 1);
+        assert_eq!(&output.bytes[..header_bytes.len()], header_bytes);
+        assert_eq!(&output.bytes[header_bytes.len()..], crate::util::as_bytes(&program));
+    }
+
+    #[test]
     fn failed_mutation_reply_keeps_the_terminal_outcome_for_query() {
         let mut state = BrokerState::default();
         let now = runtime_control::monotonic_nanos().unwrap();
@@ -1206,6 +1236,7 @@ mod tests {
                     );
                     Err(libc::ENOENT)
                 },
+                charge_session: |_, _| Ok(()),
                 report_lease: |_, _, _| Ok(()),
                 bind_and_activate: |_, _, _| Ok(()),
                 await_endpoint: |_, _| Ok(()),
@@ -1316,7 +1347,7 @@ mod tests {
             .unwrap()
             .1;
         let compact: String = missing.chars().filter(|ch| !ch.is_whitespace()).collect();
-        let removed = compact.find("state.running.remove(&pid)").unwrap();
+        let removed = compact.find("remove_running_process(state,pid)").unwrap();
         let refunded = compact
             .find("release_failed_session(state,Some(process.session_handle),)")
             .unwrap();

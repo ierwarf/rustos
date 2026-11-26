@@ -95,6 +95,7 @@ pub(crate) struct InFlightLaunch {
 /// The calls the launch worker makes, bound to the real services.
 pub(super) fn launch_calls() -> crate::launch_worker::LaunchCalls {
     crate::launch_worker::LaunchCalls {
+        charge_session: session_accounting::charge,
         spawn: |entry, session_handle, deadline_ns| {
             // Applied here rather than on the loop. It reads a policy file from
             // the DVM volume, and it deliberately does not cache a failure - the
@@ -292,7 +293,8 @@ pub(super) fn service_launch_worker(state: &mut BrokerState) -> bool {
                 state.launch_worker_retry_at = Some(Instant::now() + LAUNCH_WORKER_RETRY_BACKOFF);
                 debug_line("runtimed: launch worker disconnected; retiring in-flight launch");
                 if let Some(pid) = recorded {
-                    retire_failed_spawn_or_abort(pid, "launch-worker-disconnected");
+                    // Keep procd cleanup off the sole session receiver too.
+                    record_unretired_pid(pid);
                 }
                 if state.launch_in_flight.is_some() {
                     finish_tracked_launch(state, recorded, Err(libc::EOWNERDEAD));
@@ -340,15 +342,9 @@ fn record_spawned_launch(
         return;
     }
     if let Some(token) = in_flight.session_handle {
-        if let Err(errno) = session_accounting::charge(token, pid) {
-            boot_line(format!(
-                "runtimed: client Job session admission refused token={token} pid={pid} errno={errno}"
-            ).as_str());
-            // The worker has not activated this child yet. Refuse the
-            // acknowledgement so it retires the still-suspended process.
-            let _ = record_ack.try_send(crate::launch_worker::RecordAck::Duplicate);
-            return;
-        }
+        // Retain cancellation custody before letting the worker ask rootd
+        // for admission. An idempotent release writes a tombstone even when
+        // no charge reached rootd, so a late/missing ACK cannot leak a charge.
         state.charged_sessions.insert(token);
     }
     let record = RunningProcess {
@@ -361,7 +357,7 @@ fn record_spawned_launch(
         restart: in_flight.restart,
         logical_admin: in_flight.logical_admin,
     };
-    state.running.insert(pid, record);
+    super::session::insert_running_process(state, record);
     if let Some(in_flight) = state.launch_in_flight.as_mut() {
         in_flight.recorded_pid = Some(pid);
     }
@@ -428,7 +424,7 @@ fn finish_tracked_launch(state: &mut BrokerState, pid: Option<i32>, result: Resu
                 .recorded_pid
                 .filter(|recorded| Some(*recorded) == pid)
             {
-                state.running.remove(&recorded);
+                super::session::remove_running_process(state, recorded);
             }
             release_failed_session(state, in_flight.session_handle);
             if in_flight.rpc_transaction.is_some() {
@@ -569,8 +565,8 @@ pub(super) fn spawn_tracked_process(
         }
         state.charged_sessions.insert(token);
     }
-    state.running.insert(
-        pid,
+    super::session::insert_running_process(
+        state,
         RunningProcess {
             pid,
             package_id: entry.package_id,
@@ -594,14 +590,14 @@ pub(super) fn spawn_tracked_process(
         bind_smp_qualification,
         activate_spawned_process,
     ) {
-        state.running.remove(&pid);
+        super::session::remove_running_process(state, pid);
         retire_failed_spawn_or_abort(pid, stage.cleanup_stage());
         release_failed_session(state, session_handle);
         return Err(err);
     }
     if is_ui_server {
         if let Err(err) = wait_for_service_endpoint(IPC_SERVICE_UISERVER, pid, None) {
-            state.running.remove(&pid);
+            super::session::remove_running_process(state, pid);
             retire_failed_spawn_or_abort(pid, "endpoint-wait");
             release_failed_session(state, session_handle);
             return Err(err);
@@ -830,8 +826,8 @@ pub(super) fn release_failed_session(state: &mut BrokerState, session_handle: Op
         return;
     };
     if state.charged_sessions.remove(&session) {
-        // An unconfirmed refund is retried from the loop (`retry_deferred_cleanup`);
-        // the session is otherwise torn down exactly as for a confirmed one.
+        // The reaper worker confirms the refund (`retry_deferred_cleanup`);
+        // the owner can finish local teardown without waiting on rootd.
         session_accounting::release_or_defer(session);
     }
     state.session_runtime.remove_session(session);
@@ -851,7 +847,7 @@ fn cleanup_failed_spawn(
     }
 }
 
-/// Children whose kill was refused. Retried from the loop until the kernel
+/// Children whose kill was refused. Retried by the reaper until the kernel
 /// confirms the kill or reports the pid gone. Keyed by pid, so bounded by the
 /// pid space and idempotent.
 static UNRETIRED_PIDS: std::sync::Mutex<std::collections::BTreeSet<i32>> =
@@ -866,8 +862,11 @@ fn unretired_pids() -> std::sync::MutexGuard<'static, std::collections::BTreeSet
 }
 
 fn record_unretired_pid(pid: i32) {
-    unretired_pids().insert(pid);
+    let mut guard = unretired_pids();
+    guard.insert(pid);
     // ORDERING: Release publishes non-empty unretired-pid state after mutex insertion.
+    // Keep the guard until publication so cleanup cannot clear the set and
+    // publish false before this insertion publishes a stale true.
     HAS_UNRETIRED_PIDS.store(true, Ordering::Release);
 }
 
@@ -886,16 +885,18 @@ fn retire_failed_spawn_or_abort(pid: i32, stage: &str) {
     }
 }
 
-/// Retry deferred child kills and Job-session refunds. Cheap when idle.
+/// Retry deferred child kills and Job-session refunds on the reaper worker.
 fn retry_deferred_cleanup() {
     let pids: Vec<i32> = unretired_pids().iter().copied().collect();
     if !pids.is_empty() {
-        let mut guard = unretired_pids();
         for pid in pids {
+            // The receiver may enqueue another cleanup while procd is slow.
+            // Never retain the publication mutex across that provider call.
             if cleanup_failed_spawn(pid, terminate_pid).is_ok() {
-                guard.remove(&pid);
+                unretired_pids().remove(&pid);
             }
         }
+        let guard = unretired_pids();
         // ORDERING: Release pairs with Acquire in `reap_children` once remaining pids are updated.
         HAS_UNRETIRED_PIDS.store(!guard.is_empty(), Ordering::Release);
     }
@@ -932,9 +933,10 @@ fn snapshot_tracked_running_pids() -> Vec<i32> {
 }
 
 /// Reap every child that has already exited and report `(pid, status)` for
-/// each. Runs on the reaper thread (or inline when none could be created); it
+/// each. Runs only on the reaper thread; it
 /// is the only place the procd ownership round trip of `wait4` happens.
 pub(super) fn collect_exited_children() -> Vec<(i32, i32)> {
+    retry_deferred_cleanup();
     let mut exited = Vec::new();
     loop {
         let mut status = 0_i32;
@@ -1050,15 +1052,11 @@ mod wait_status_tests {
 }
 
 pub(super) fn reap_children(state: &mut BrokerState) -> bool {
-    // Deferred cleanup talks to rootd/procd, so it shares the reap cadence
-    // instead of running on every idle pass.
+    // Deferred cleanup talks to rootd/procd. The reaper owns those waits;
+    // this receiver only publishes work and consumes completed results.
     // ORDERING: Acquire pairs with Release stores in `record_unretired_pid`/`retry_deferred_cleanup`.
     let cleanup_pending =
         HAS_UNRETIRED_PIDS.load(Ordering::Acquire) || session_accounting::has_deferred();
-    if cleanup_pending && state.reap_due.is_none_or(|due| Instant::now() >= due) {
-        retry_deferred_cleanup();
-        state.reap_due = Some(Instant::now() + REAP_INTERVAL);
-    }
     // A child is activated only after the loop records it in `running`, so an
     // empty owner set proves that there is nothing this process may reap.
     if state.running.is_empty()
@@ -1077,14 +1075,16 @@ pub(super) fn reap_children(state: &mut BrokerState) -> bool {
                 // Disconnected like an empty poll used to leave outstanding
                 // stuck and skip every future wait4, leaking exited clients
                 // and the Job/session charges bound to their PIDs. Start a
-                // fresh reaper; a failed thread start takes the existing
-                // synchronous fallback on the next pass.
+                // fresh reaper; failed thread creation is retried without
+                // doing its blocking provider calls on this receiver.
                 debug_line("runtimed: child reaper worker disconnected; recreating");
                 state.child_reaper =
                     super::offload::Offload::start("runtimed-reap", collect_exited_children);
+                state.reap_due = state.child_reaper.is_none()
+                    .then(|| Instant::now() + LAUNCH_WORKER_RETRY_BACKOFF);
             } else {
                 let due = state.reap_due.is_none_or(|due| Instant::now() >= due);
-                if due && !reaper.busy() && !state.running.is_empty() {
+                if due && !reaper.busy() && (!state.running.is_empty() || cleanup_pending) {
                     sync_tracked_running_pids(state);
                     if reaper.request() {
                         state.reap_due = Some(Instant::now() + REAP_INTERVAL);
@@ -1094,14 +1094,19 @@ pub(super) fn reap_children(state: &mut BrokerState) -> bool {
             answer.unwrap_or_default()
         }
         None => {
-            sync_tracked_running_pids(state);
-            collect_exited_children()
+            if state.reap_due.is_none_or(|due| Instant::now() >= due) {
+                state.child_reaper =
+                    super::offload::Offload::start("runtimed-reap", collect_exited_children);
+                state.reap_due = state.child_reaper.is_none()
+                    .then(|| Instant::now() + LAUNCH_WORKER_RETRY_BACKOFF);
+            }
+            Vec::new()
         }
     };
     let mut reaped_any = false;
     for (pid, status) in exited {
         reaped_any = true;
-        if let Some(process) = state.running.remove(&pid) {
+        if let Some(process) = super::session::remove_running_process(state, pid) {
             debug_line(
                 format!(
                     "runtimed: reaped child pid={pid} status={status:#x} ({}) desktop_id={} exec={}",

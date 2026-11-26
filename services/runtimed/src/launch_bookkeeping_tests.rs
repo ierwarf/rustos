@@ -24,6 +24,7 @@ fn state_with_worker() -> BrokerState {
     BrokerState {
         launch_worker: crate::launch_worker::start(LaunchCalls {
             spawn: |_, _, _| Ok(41),
+            charge_session: |_, _| Ok(()),
             report_lease: |_, _, _| Ok(()),
             bind_and_activate: |_, _, _| panic!("a timed-out or duplicate child cannot activate"),
             await_endpoint: |_, _| panic!("an unactivated child has no endpoint"),
@@ -130,6 +131,7 @@ fn rpc_launch_is_not_committed_until_worker_finishes_and_is_replayable() {
         let mut state = BrokerState {
             launch_worker: crate::launch_worker::start(LaunchCalls {
                 spawn: |_, _, _| Ok(41),
+                charge_session: |_, _| Ok(()),
                 report_lease: |_, _, _| Ok(()),
                 bind_and_activate: |_, _, _| Ok(()),
                 await_endpoint: |_, _| Ok(()),

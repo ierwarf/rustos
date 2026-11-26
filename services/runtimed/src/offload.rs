@@ -5,8 +5,9 @@
 //! - **Boundary:** The worker is handed a plain function and returns a plain
 //!   value. It never sees `BrokerState`.
 //! - **Lifecycle:** Request, wait, answer; one request outstanding at a time.
-//! - **Failure:** A worker that cannot be created is reported as absent, which
-//!   leaves the caller free to do the work inline instead of not at all.
+//! - **Failure:** A worker that cannot be created is reported as absent. Each
+//!   owner chooses an explicit retry policy; latency-sensitive receivers must
+//!   not turn a failed worker into a blocking inline provider call.
 //!
 //! # Why a broker read cannot run on the broker loop
 //! Reads that reach storage are not fast and are not bounded by anything the
@@ -96,7 +97,7 @@ impl<T: Send + 'static> Offload<T> {
     }
 
     /// Returns true after the worker's result channel closes. A caller must
-    /// replace this worker or use its existing synchronous failure fallback.
+    /// replace this worker or apply its explicit failure policy.
     pub(crate) fn disconnected(&self) -> bool {
         self.disconnected.get()
     }

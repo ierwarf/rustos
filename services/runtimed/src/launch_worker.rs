@@ -5,7 +5,7 @@
 //! - **Boundary:** The worker never sees `BrokerState`. Everything it needs is
 //!   copied into the job, and everything it learns comes back as a message.
 //! - **Lifecycle:** One launch is in flight at a time: submit, spawn, record,
-//!   activate, finish.
+//!   admit the session charge, activate, finish.
 //! - **Concurrency:** The worker blocks on the loop's acknowledgement before it
 //!   may activate a child, so the ordering the supervisor depends on is a
 //!   property of the protocol rather than of who happens to run first.
@@ -79,7 +79,8 @@ pub(crate) enum LaunchProgress {
 /// The loop's answer to `Spawned`.
 #[derive(Debug)]
 pub(crate) enum RecordAck {
-    /// Recorded. The worker may activate.
+    /// Recorded, including cancellation custody. The worker may charge the
+    /// session and activate only after that admission succeeds.
     Recorded,
     /// Refused - the loop already has this pid. The worker retires the child.
     Duplicate,
@@ -89,6 +90,7 @@ pub(crate) enum RecordAck {
 /// without a loader, a console, or ring0.
 pub(crate) struct LaunchCalls {
     pub(crate) spawn: fn(&LaunchEntry, u64, Option<u64>) -> Result<i32, i32>,
+    pub(crate) charge_session: fn(u64, i32) -> Result<(), i32>,
     pub(crate) report_lease: fn(&LaunchEntry, i32, Option<u64>) -> Result<(), i32>,
     pub(crate) bind_and_activate: fn(
         i32,
@@ -273,6 +275,25 @@ fn execute(
             result: Err(libc::ETIMEDOUT),
         };
     }
+    if let Some(token) = job.session_handle {
+        // The loop already owns the suspended PID and the obligation to
+        // release this token. Rootd admission can take a whole IPC deadline;
+        // it must not stop that same loop from answering console requests.
+        if let Err(errno) = (calls.charge_session)(token, pid) {
+            (calls.retire)(pid, "session-admission");
+            return LaunchProgress::Finished {
+                pid: Some(pid),
+                result: Err(errno),
+            };
+        }
+    }
+    if job.deadline.is_some_and(|end| Instant::now() >= end) {
+        (calls.retire)(pid, "rpc-deadline");
+        return LaunchProgress::Finished {
+            pid: Some(pid),
+            result: Err(libc::ETIMEDOUT),
+        };
+    }
     if let Err((stage, errno)) =
         (calls.bind_and_activate)(pid, job.qualification_contract, job.deadline_ns)
     {
@@ -334,6 +355,7 @@ mod tests {
     fn calls() -> LaunchCalls {
         LaunchCalls {
             spawn: |_, _, _| Ok(41),
+            charge_session: |_, _| Ok(()),
             report_lease: |_, _, _| Ok(()),
             bind_and_activate: |_, _, _| Ok(()),
             await_endpoint: |_, _| Ok(()),
@@ -406,9 +428,16 @@ mod tests {
     /// that has never heard of it.
     #[test]
     fn a_child_is_never_activated_before_the_loop_has_recorded_it() {
+        static CHARGED_AT: AtomicI32 = AtomicI32::new(-1);
         ORDER.store(0, Ordering::SeqCst);
         ACTIVATED_AT.store(-1, Ordering::SeqCst);
+        CHARGED_AT.store(-1, Ordering::SeqCst);
         let mut calls = calls();
+        calls.charge_session = |token, pid| {
+            assert_eq!((token, pid), (88, 41));
+            CHARGED_AT.store(ORDER.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+            Ok(())
+        };
         calls.bind_and_activate = |_, _, _| {
             ACTIVATED_AT.store(ORDER.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
             Ok(())
@@ -418,7 +447,7 @@ mod tests {
             .submit(LaunchJob {
                 entry: entry(),
                 qualification_contract: None,
-                session_handle: None,
+                session_handle: Some(88),
                 is_ui_server: false,
                 deadline: None,
                 deadline_ns: None,
@@ -431,6 +460,8 @@ mod tests {
             panic!("the worker reports the child before activating it");
         };
         assert_eq!(pid, 41);
+        assert_eq!(CHARGED_AT.load(Ordering::SeqCst), -1,
+            "rootd admission cannot precede the owner's cancellation record");
         assert_eq!(
             ACTIVATED_AT.load(Ordering::SeqCst),
             -1,
@@ -449,10 +480,47 @@ mod tests {
         };
         assert_eq!(pid, Some(41));
         assert_eq!(result, Ok(()));
+        assert!(recorded_at < CHARGED_AT.load(Ordering::SeqCst));
         assert!(
-            recorded_at < ACTIVATED_AT.load(Ordering::SeqCst),
-            "the record has to be ordered before the activation, not merely near it"
+            CHARGED_AT.load(Ordering::SeqCst) < ACTIVATED_AT.load(Ordering::SeqCst),
+            "the charge has to be admitted before activation, after the record"
         );
+    }
+
+    #[test]
+    fn refused_session_admission_retires_the_recorded_child_without_activation() {
+        static RETIRED: AtomicI32 = AtomicI32::new(0);
+        RETIRED.store(0, Ordering::SeqCst);
+        let mut calls = calls();
+        calls.charge_session = |token, pid| {
+            assert_eq!((token, pid), (99, 41));
+            Err(libc::ENOSPC)
+        };
+        calls.bind_and_activate = |_, _, _| panic!("an uncharged child cannot activate");
+        calls.retire = |pid, stage| {
+            assert_eq!(stage, "session-admission");
+            RETIRED.store(pid, Ordering::SeqCst);
+        };
+        let worker = super::start(calls).expect("worker starts");
+        worker.submit(LaunchJob {
+            entry: entry(),
+            qualification_contract: None,
+            session_handle: Some(99),
+            is_ui_server: false,
+            deadline: None,
+            deadline_ns: None,
+            report_started: false,
+        }).expect("job accepted");
+        let LaunchProgress::Spawned { record_ack, .. } = wait_for_progress(&worker) else {
+            panic!("the owner records the suspended child first")
+        };
+        record_ack.try_send(RecordAck::Recorded).expect("record acknowledged");
+        let LaunchProgress::Finished { pid, result } = wait_for_progress(&worker) else {
+            panic!("refused admission terminates the launch")
+        };
+        assert_eq!(pid, Some(41));
+        assert_eq!(result, Err(libc::ENOSPC));
+        assert_eq!(RETIRED.load(Ordering::SeqCst), 41);
     }
 
     /// A pid the loop already owns is retired rather than activated.

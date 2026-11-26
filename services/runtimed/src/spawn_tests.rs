@@ -45,11 +45,26 @@
             !reap.contains("SYS_wait4"),
             "the wait4 round trip belongs to the reaper, not the broker loop"
         );
+        assert!(!reap.contains("collect_exited_children()"),
+            "worker absence must not turn into inline reaping");
+        assert!(!reap.contains("retry_deferred_cleanup()"),
+            "deferred rootd/procd calls also belong to the worker");
         let empty_guard = reap
             .find("if state.running.is_empty()")
             .expect("empty owner-set guard");
         let request = reap.find("reaper.request()").expect("reap request");
-        assert!(empty_guard < request, "an empty owner set must not ask the reaper");
+        assert!(empty_guard < request, "an empty owner set without cleanup must not ask the reaper");
+    }
+
+    #[test]
+    fn recording_a_child_retains_cancellation_without_waiting_for_rootd() {
+        let source = include_str!("spawn.rs");
+        let record = source.split_once("fn record_spawned_launch(").unwrap().1
+            .split_once("fn finish_tracked_launch(").unwrap().0;
+        assert!(!record.contains("session_accounting::charge("));
+        let custody = record.find("state.charged_sessions.insert(token)").unwrap();
+        let acknowledged = record.find("RecordAck::Recorded").unwrap();
+        assert!(custody < acknowledged, "rootd may see admission only after cancellation custody exists");
     }
 
     #[test]

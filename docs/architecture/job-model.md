@@ -974,15 +974,20 @@ Application placement / Job qualitative ceilings as built** 항목을
 
 Rootd owns one bounded (256-token) supervisor ledger per live sessiond
 reporter generation. A suspended/live client PID is resolved to its exact
-kernel `JobId` when runtimed records a new console session, *before* that
-child is activated. A new `SYS_RUSTOS_JOB_SESSION` slow Job syscall requires
+kernel `JobId` after runtimed records a new console session and its cancellation
+obligation, *before* that child is activated. The launch worker owns the rootd
+admission wait after the receiver acknowledges the record. A new
+`SYS_RUSTOS_JOB_SESSION` slow Job syscall requires
 rootd's boot-root `ACCOUNT_SESSIONS` descriptor right for admission and
 refund. The process-table lock verifies PID/Job membership, checks every
 ancestor's session ceiling, then atomically increments the subtree counters.
 A stale expected JobId, a Killing Job or a full ancestor refuses admission.
 
-Runtimed maintains a charged-token set; reap/failed-launch paths issue an
-exact refund to rootd. Rootd refunds the originally captured JobId even if
+Runtimed's token set includes admissions that may still be in flight, so an
+ambiguous acknowledgement cannot lose cancellation custody. Reap/failed-launch
+paths queue an exact refund; the cleanup worker retains it until rootd confirms
+the idempotent release/tombstone, without blocking the console receiver.
+Rootd refunds the originally captured JobId even if
 the client has since exited, and rejects duplicate or stale tokens without
 double charging. The kernel prevents recycling a Job slot while its session
 charges are outstanding. When a newly authenticated sessiond PID replaces

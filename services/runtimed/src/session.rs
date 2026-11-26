@@ -34,7 +34,7 @@ use super::{
     LINUX_TCSETSF, LINUX_TCSETSW, UI_SERVER_BOOTSTRAP_ENV, UI_SERVER_DESKTOP_FILE_ID,
     UI_SERVER_DISPLAY_NAME, UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS,
 };
-use super::{BrokerState, LaunchEntry};
+use super::{BrokerState, LaunchEntry, RunningProcess};
 
 const INPUT_BUFFER_CAPACITY: usize = 1024;
 const EDIT_BUFFER_CAPACITY: usize = 256;
@@ -140,7 +140,10 @@ impl Default for SessionRuntime {
     fn default() -> Self {
         Self {
             sessions: BTreeMap::new(),
-            output_generation: 0,
+            // The wire rejects a zero token. Keep the stored token identical
+            // to the wire even before the first session exists, so an idle
+            // waiter does not compare wire 1 with stored 0 forever.
+            output_generation: 1,
             input_readiness_generation: 1,
             console_read_waiters: VecDeque::new(),
             console_graph_waiters: VecDeque::new(),
@@ -1034,9 +1037,8 @@ pub(super) fn service_console_graph_waiters(state: &mut BrokerState) -> bool {
             still_parked.push_back(waiter);
             continue;
         }
-        // A wait released by its deadline and one released by the edge it was
-        // waiting for cost the caller entirely different latencies, and only
-        // one of them is the design working. Say which.
+        // Distinguish an actual graph edge from an ordinary unchanged
+        // keepalive deadline. The latter is not evidence of late UI input.
         report_console_graph_wait_release(&waiter, generation, now, last_advance);
         answer_parked_console_graph_wait(waiter, state);
         answered = true;
@@ -1053,8 +1055,8 @@ pub(super) fn service_console_graph_waiters(state: &mut BrokerState) -> bool {
 }
 
 /// Reports how a parked graph wait ended: on the console graph moving, which
-/// is the design, or on its own deadline, which means the compositor paid the
-/// whole park budget for an edge that had already happened.
+/// is a real change, or on its own unchanged keepalive deadline. A deadline
+/// release alone does not mean a missed edge or a stalled UI main thread.
 ///
 /// Rate limited to the first samples plus a sparse tail, because this fires
 /// once per compositor refresh for as long as the system is running.
@@ -1490,14 +1492,12 @@ fn handle_console_route_request(
             // has ever produced anything to draw.
             let generation = state.session_runtime.graph_generation();
             response.value0 = SESSIOND_CONSOLE_READINESS_LIVE
-                | if generation != 0 {
+                | if generation > 1 {
                     SESSIOND_CONSOLE_READINESS_READY
                 } else {
                     0
                 };
-            // Zero would read as "no generation" to the caller's envelope
-            // check, and an untouched console legitimately sits at zero.
-            response.value1 = generation.max(1);
+            response.value1 = generation;
             0
         }
         console_abi::CONSOLE_IOCTL_SNAPSHOT_SESSION_OUTPUT => {
@@ -1686,6 +1686,26 @@ fn handle_session_graph_request(
     }
 }
 
+/// Publish running-set membership separately from TTY buffer creation. The
+/// launch worker may spend time between those operations, and a termination
+/// may remove the TTY before its process record is reaped. Both changes must
+/// remain visible to a compositor that no longer polls unchanged graph waits.
+pub(super) fn insert_running_process(state: &mut BrokerState, process: RunningProcess) {
+    let console_visible = process.session_handle != 0;
+    let previous = state.running.insert(process.pid, process);
+    if console_visible || previous.is_some_and(|process| process.session_handle != 0) {
+        state.session_runtime.advance_graph_generation();
+    }
+}
+
+pub(super) fn remove_running_process(state: &mut BrokerState, pid: i32) -> Option<RunningProcess> {
+    let process = state.running.remove(&pid)?;
+    if process.session_handle != 0 {
+        state.session_runtime.advance_graph_generation();
+    }
+    Some(process)
+}
+
 fn focused_session_handle(state: &BrokerState) -> u64 {
     if state.focused_session_handle != 0 && session_exists(state, state.focused_session_handle) {
         return state.focused_session_handle;
@@ -1697,20 +1717,27 @@ fn set_focused_session_handle(state: &mut BrokerState, session_handle: u64) -> i
     if session_handle == 0 || !session_exists(state, session_handle) {
         return libc::EINVAL;
     }
-    state.focused_session_handle = session_handle;
+    publish_focused_session_handle(state, session_handle);
     0
 }
 
 pub(super) fn focus_session_after_spawn(state: &mut BrokerState, session_handle: u64) {
     if session_handle != 0 {
-        state.focused_session_handle = session_handle;
+        publish_focused_session_handle(state, session_handle);
     }
 }
 
 pub(super) fn clear_focused_session_if(state: &mut BrokerState, session_handle: u64) {
     if session_handle != 0 && state.focused_session_handle == session_handle {
-        state.focused_session_handle =
-            fallback_focused_session_handle_excluding(state, session_handle);
+        let fallback = fallback_focused_session_handle_excluding(state, session_handle);
+        publish_focused_session_handle(state, fallback);
+    }
+}
+
+fn publish_focused_session_handle(state: &mut BrokerState, session_handle: u64) {
+    if state.focused_session_handle != session_handle {
+        state.focused_session_handle = session_handle;
+        state.session_runtime.advance_graph_generation();
     }
 }
 
@@ -2115,6 +2142,91 @@ mod tests {
             after_key,
             "a closed session removes a window"
         );
+    }
+
+    fn console_process(pid: i32, session_handle: u64) -> RunningProcess {
+        RunningProcess {
+            pid,
+            package_id: String::from("shell"),
+            desktop_file_id: String::from("shell.desktop"),
+            display_name: String::from("Shell"),
+            exec: String::from("apps/shell/shell.elf"),
+            session_handle,
+            restart: false,
+            logical_admin: false,
+        }
+    }
+
+    #[test]
+    fn an_empty_graph_uses_the_same_token_on_the_wire_and_in_parked_waiters() {
+        let mut state = BrokerState::default();
+        let mut request = CommercialMaxProtocolRequest {
+            arg0: COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS,
+            arg1: 1_000,
+            ..CommercialMaxProtocolRequest::default()
+        };
+        request.header.op = COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE;
+        let mut response = CommercialMaxProtocolResponse::default();
+        assert_eq!(super::handle_console_route_request(&request, &mut state, &mut response), 0);
+        let empty_token = response.value1;
+        assert_ne!(empty_token, 0);
+        assert_eq!(empty_token, state.session_runtime.graph_generation());
+        request.arg2 = empty_token;
+        assert!(super::console_graph_wait_park_budget(&request, &response).is_some());
+
+        state.session_runtime.create_session(7).unwrap();
+        assert_eq!(super::handle_console_route_request(&request, &mut state, &mut response), 0);
+        assert_eq!(response.value1, state.session_runtime.graph_generation());
+        assert_ne!(response.value1, empty_token, "the first change must not alias the idle token");
+        assert!(super::console_graph_wait_park_budget(&request, &response).is_none());
+    }
+
+    #[test]
+    fn running_membership_has_an_edge_even_when_tty_lifetime_has_already_moved() {
+        let mut state = BrokerState::default();
+        state.session_runtime.create_session(7).unwrap();
+        let created_tty = state.session_runtime.graph_generation();
+        super::insert_running_process(&mut state, console_process(41, 7));
+        assert_ne!(state.session_runtime.graph_generation(), created_tty);
+
+        // Termination can remove the TTY before the reaper learns the exit.
+        state.session_runtime.remove_session(7);
+        let removed_tty = state.session_runtime.graph_generation();
+        assert!(super::remove_running_process(&mut state, 41).is_some());
+        let removed_process = state.session_runtime.graph_generation();
+        assert_ne!(removed_process, removed_tty, "the window must disappear without later output");
+        assert!(super::remove_running_process(&mut state, 41).is_none());
+        assert_eq!(state.session_runtime.graph_generation(), removed_process);
+
+        super::insert_running_process(&mut state, console_process(42, 0));
+        assert!(super::remove_running_process(&mut state, 42).is_some());
+        assert_eq!(state.session_runtime.graph_generation(), removed_process,
+            "non-console process changes use the separate runtime watch");
+    }
+
+    #[test]
+    fn focus_changes_publish_an_edge_without_inventing_output_or_noop_edges() {
+        let mut state = BrokerState::default();
+        super::insert_running_process(&mut state, console_process(41, 7));
+        super::insert_running_process(&mut state, console_process(42, 9));
+        let before = state.session_runtime.graph_generation();
+        assert_eq!(super::set_focused_session_handle(&mut state, 7), 0);
+        let focused = state.session_runtime.graph_generation();
+        assert_ne!(focused, before);
+        assert_eq!(super::set_focused_session_handle(&mut state, 7), 0);
+        assert_eq!(super::set_focused_session_handle(&mut state, 99), libc::EINVAL);
+        assert_eq!(state.session_runtime.graph_generation(), focused);
+
+        super::focus_session_after_spawn(&mut state, 9);
+        let spawned = state.session_runtime.graph_generation();
+        assert_ne!(spawned, focused);
+        super::clear_focused_session_if(&mut state, 9);
+        let cleared = state.session_runtime.graph_generation();
+        assert_ne!(cleared, spawned);
+        assert_eq!(state.focused_session_handle, 7);
+        super::clear_focused_session_if(&mut state, 9);
+        assert_eq!(state.session_runtime.graph_generation(), cleared);
+        assert!(state.session_runtime.sessions_is_empty_for_test());
     }
 
     /// A wait is held only while its answer would repeat what the caller

@@ -122,7 +122,7 @@ pub(super) fn charge(token: u64, pid: i32) -> Result<(), i32> {
             // Canonical release writes a tombstone even if the request did
             // not reach rootd. Activation is forbidden until cancellation.
             // A refund that cannot be confirmed now is deferred and retried by
-            // the broker loop; it must never take the whole service down.
+            // the cleanup worker; it must never take the whole service down.
             release_or_defer(token);
             Err(error)
         }
@@ -141,16 +141,10 @@ fn deferred_releases() -> std::sync::MutexGuard<'static, std::collections::BTree
     DEFERRED_RELEASES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Release `token` now; if rootd cannot confirm, keep it for `retry_deferred`.
+/// Queue canonical release without waiting on rootd. The broker retains this
+/// obligation until its cleanup worker confirms the idempotent tombstone.
 pub(super) fn release_or_defer(token: u64) {
-    if let Err(errno) = release(token) {
-        observability_client::error!(
-            "runtimed",
-            service,
-            "client Job release deferred token={token} errno={errno}"
-        );
-        deferred_releases().insert(token);
-    }
+    deferred_releases().insert(token);
 }
 
 pub(super) fn has_deferred() -> bool {

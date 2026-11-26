@@ -850,14 +850,7 @@ fn acquire_passed_fds(fds: &[i32]) -> Result<Vec<PassedHandle>, i64> {
             let Some(entry) = process_state.handles().get_entry(raw_fd as u64) else {
                 return Err(LINUX_EBADF);
             };
-            if !entry.handle().supports_descriptor_transfer(entry.rights()) {
-                return Err(LINUX_EBADF);
-            }
-            snapshots.push(PassedHandle::new_with_rights(
-                entry.handle().clone(),
-                entry.status_flags(),
-                entry.rights(),
-            ));
+            snapshots.push(snapshot_passed_entry(entry)?);
         }
         Ok(())
     });
@@ -878,6 +871,18 @@ fn acquire_passed_fds(fds: &[i32]) -> Result<Vec<PassedHandle>, i64> {
         acquired.push(passed);
     }
     Ok(acquired)
+}
+
+fn snapshot_passed_entry(entry: &multitask::HandleEntry) -> Result<PassedHandle, i64> {
+    // Use the same entry-level capability gate as prepared socket publication
+    // and generic IPC transfers; it includes netd-owned InetSocket handles
+    // while still requiring the actual attenuated TRANSFER right.
+    if !entry.supports_transfer() {
+        return Err(LINUX_EBADF);
+    }
+    Ok(PassedHandle::new_with_rights(
+        entry.handle().clone(), entry.status_flags(), entry.rights(),
+    ))
 }
 
 fn parse_send_control(
@@ -1019,9 +1024,13 @@ fn write_recv_control(
             release_passed_handles(rights);
         } else {
             let fd_flags = if cloexec { multitask::FD_CLOEXEC } else { 0 };
+            // The process can exit before the accessor invokes its closure.
+            // Keep ancillary service references in an outer guard and move
+            // them only after a live destination table is actually retained.
+            let mut rights = PassedHandlesGuard(rights);
             let mut leftover = Vec::new();
-            let _ = multitask::with_current_user_process_state_mut(|_, _, process_state| {
-                for passed in rights {
+            multitask::with_current_user_process_state_mut(|_, _, process_state| {
+                for passed in rights.take() {
                     if installed_fds.len() >= max_fit {
                         leftover.push(passed);
                         continue;
@@ -1038,7 +1047,7 @@ fn write_recv_control(
                         leftover.push(passed);
                     }
                 }
-            });
+            }).ok_or(LINUX_ESRCH)?;
             if !leftover.is_empty() {
                 msg_flags |= linux_abi::MSG_CTRUNC as u32;
                 release_passed_handles(leftover);
@@ -1385,6 +1394,39 @@ pub(in crate::user::syscall::linux) fn try_recvmsg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scm_rights_accepts_netd_sockets_only_with_the_descriptor_transfer_right() {
+        use kernel_object::api::handle::{HandleRights, SocketHandleRights};
+        let handle = multitask::KernelHandle::InetSocket(multitask::InetSocketHandle::from_token(
+            77, linux_abi::AF_INET, linux_abi::SOCK_STREAM, linux_abi::IPPROTO_TCP,
+        ));
+        let rights = HandleRights::Socket(SocketHandleRights::RECV.union(SocketHandleRights::TRANSFER));
+        let allowed = multitask::HandleEntry::new_with_rights(handle.clone(), rights, 0, linux_abi::O_NONBLOCK);
+        let passed = snapshot_passed_entry(&allowed).expect("Inet descriptor is transferable");
+        assert_eq!(passed.rights(), rights);
+        assert!(matches!(passed.handle(), multitask::KernelHandle::InetSocket(socket) if socket.token_id() == 77));
+        let denied = multitask::HandleEntry::new_with_rights(
+            handle, HandleRights::Socket(SocketHandleRights::RECV), 0, 0,
+        );
+        assert!(matches!(snapshot_passed_entry(&denied), Err(LINUX_EBADF)),
+            "copying a socket must not widen an attenuated descriptor right");
+    }
+
+    #[test]
+    fn scm_rights_receive_keeps_service_custody_until_a_live_destination_is_retained() {
+        let source = include_str!("local_unix.rs");
+        let receive = source.split_once("fn write_recv_control(").unwrap().1
+            .split_once("fn send_core_bytes(").unwrap().0;
+        let guard = receive.find("let mut rights = PassedHandlesGuard(rights);").unwrap();
+        let retain = receive.find("multitask::with_current_user_process_state_mut(").unwrap();
+        let transfer = receive.find("for passed in rights.take()").unwrap();
+        assert!(guard < retain && retain < transfer,
+            "concurrent exit must drop the outer service-reference guard without consuming its Vec");
+        assert!(!receive.contains("for passed in rights {"));
+        assert!(receive[retain..].contains("}).ok_or(LINUX_ESRCH)?;"),
+            "a missing destination must not report a successful empty rights transfer");
+    }
 
     #[test]
     fn nonblocking_connect_to_full_backlog_is_eagain() {

@@ -138,9 +138,12 @@ pub(crate) struct BrokerState {
     pub(crate) next_session_handle: u64,
     pub(crate) focused_session_handle: u64,
     pub(crate) session_runtime: session::SessionRuntime,
+    /// Production mutations use session's insert/remove helpers so console
+    /// membership and its readiness generation are published together.
     pub(crate) running: BTreeMap<i32, RunningProcess>,
-    /// Tokens already charged to actual client Jobs through rootd.
-    /// Distinct from the local console slot capacity.
+    /// Tokens whose admission may reach rootd. Recording precedes the worker's
+    /// charge; every failed/retired launch owes an idempotent release even if
+    /// its charge acknowledgement is lost. Separate from local console slots.
     pub(crate) charged_sessions: BTreeSet<u64>,
     pub(crate) launched_once: BTreeSet<String>,
     pub(crate) retry_after: BTreeMap<String, Instant>,
@@ -178,8 +181,9 @@ pub(crate) struct BrokerState {
     /// procd ownership round trip, and one pass of that round trip has been seen
     /// to consume its whole five-second control budget under SMP service
     /// pressure: for that long the loop answered no console caller and sent no
-    /// health pulse, so rootd timed the whole service out. Absent only when the
-    /// thread cannot be created; reaping then runs inline.
+    /// health pulse, so rootd timed the whole service out. Deferred child kills
+    /// and session refunds share this worker. If it is absent, creation is
+    /// retried with backoff; those provider calls never run on the receiver.
     pub(crate) child_reaper: Option<offload::Offload<Vec<(i32, i32)>>>,
     /// Earliest time the next reap request may be made, so an idle broker does
     /// not ask procd back to back.
@@ -282,8 +286,8 @@ fn main() {
     };
 
     let mut state = BrokerState::default();
-    // The listener moves to its own thread: its syscalls can take a whole IPC
-    // deadline when netd stalls, and this loop also serves the session endpoint.
+    // Listener admission has its own bounded worker hand-off while this loop
+    // also serves the session endpoint. AF_UNIX data I/O is kernel-local.
     let mut runtime_connections = match socket::RuntimeConnections::with_acceptor(listener) {
         Ok(connections) => connections,
         Err(errno) => {

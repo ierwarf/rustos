@@ -46,6 +46,37 @@ mistaken for the other. In rootd's recovery path, waiting for loaderd or
 another required service does not consume the dependent service's restart
 budget; actual failed restart attempts still count.
 
+### Runtime receiver and blocking lifecycle calls
+
+The runtimed receiver records a suspended PID and its session-cancellation
+obligation before acknowledging the launch worker. The worker then asks rootd
+to admit the client-funded session; only an admitted charge and an unexpired
+launch may reach activation. Failures retire the child and retain an exact,
+idempotent release obligation, including ambiguous/lost rootd acknowledgements.
+The normal receiver never waits for that admission or refund.
+
+Child reaping, deferred procd kills and rootd refunds run on the reaper worker.
+Deferred sets are copied under their mutexes and provider calls run after the
+guards are released. Worker loss/creation failure uses bounded restart backoff;
+it does not fall back to blocking provider calls on the console receiver. Early
+uiserver manifest loading and its bootstrap transaction remain synchronous.
+
+Console graph waits use the same nonzero generation internally and on the
+wire, including the empty initial graph. Focus and console running-record
+insert/remove operations publish changes independently of TTY buffer lifetime;
+removing a process after its TTY was already closed still wakes the compositor.
+The UI refresh worker can therefore re-arm an unchanged idle wait without
+re-reading every session, and metadata-only refreshes also wake the UI.
+
+Runtime watch/snapshot responses serialize their existing header and payload
+into one bounded frame before `write_all`, reducing separate syscall/copy setup
+for the header and payload when the whole frame fits. Partial writes still
+obey the existing terminal-failure rule; a
+failed response never receives a second error envelope. Admitted-client socket
+reads and response writes remain on the receiver, but current AF_UNIX I/O is
+kernel-local, not a netd IPC. This is not an offloaded socket reactor. These changes
+were reviewed statically only; source regressions were added but not executed.
+
 ### Linux Driver Domain
 
 Linux modules execute only in the isolated DVM. RustOS receives keyboard and
@@ -137,6 +168,17 @@ main loop가 catalog를 구성하며 desktop metadata와 runtime-launch policy�
 cache를 사용하므로 서로 다른 registry가 뒤섞이지 않습니다. rootd가 복구 중
 loaderd 등 의존 서비스의 준비를 기다릴 때는 재시작 예산을 차감하지 않고,
 실제 재시작 시도가 실패할 때만 차감합니다.
+
+### Runtime receiver와 lifecycle 대기
+
+정상 runtimed launch는 suspended PID와 session 취소 의무를 owner에 기록한
+뒤 worker가 rootd 과금을 승인받고 활성화합니다. 환불과 지연된 kill/reap은
+별도 reaper에서 수행하며, worker 생성 실패가 console receiver의 동기 대기로
+바뀌지 않습니다. bootstrap uiserver manifest의 동기 읽기는 유지합니다.
+runtime watch 응답은 header/payload를 한 frame으로 보내 syscall/copy 준비를
+줄입니다. 기존 socket read/write는 owner에 남지만 현재 AF_UNIX는 kernel-local
+경로이므로 netd IPC 대기로 설명해서는 안 됩니다. 이 후속
+변경은 정적 검토만 수행했으며 성능 향상률이나 테스트 통과를 주장하지 않습니다.
 
 ### Linux Driver Domain
 
