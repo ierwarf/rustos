@@ -556,12 +556,18 @@ fn retired_task_disarm_releases_block_waiter_exactly_once() {
 }
 
 #[test]
-#[allow(
-    clippy::assertions_on_constants,
-    reason = "the mutation witness must compile a reduced capacity and fail at runtime"
-)]
-fn block_waiter_capacity_covers_every_scheduler_task() {
-    assert!(WAITERS_CAPACITY >= crate::multitask::MAX_SCHEDULER_TASKS);
+fn block_waiter_chunks_grow_past_legacy_limits() {
+    let table = WaiterTable::new();
+    for i in 0..1500_u64 {
+        assert!(table.arm(20_000 + i, |_| true));
+    }
+    for i in 0..1500_u64 {
+        assert!(table.disarm(20_000 + i));
+    }
+    assert!(table.arm(20_000, |_| true));
+    assert!(table.arm(20_001, |id| id != 20_000));
+    assert!(!table.disarm(20_000));
+    assert!(table.disarm(20_001));
 }
 
 #[test]

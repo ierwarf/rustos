@@ -11,7 +11,7 @@ fn isolated(f: impl FnOnce()) {
 #[test]
 fn each_mask_uid_and_cpu_bound_refuses_before_callback_including_root_uid_zero() {
     isolated(|| {
-        let a = &AFFINITIES[SLOT];
+        let a = &crate::multitask::task_table::get(SLOT).affinity;
         *a.binding.lock() = Some(0);
         a.initialized.store(true, Ordering::Relaxed);
         store(a, 1, 1, false);
@@ -44,7 +44,7 @@ fn concurrent_affinity_writer_waits_until_admitted_cas_callback_has_left_leaf() 
                 with_admission(SLOT, None, 0, || {
                     entered.send(()).unwrap();
                     wait_release.recv().unwrap();
-                    assert_eq!(AFFINITIES[SLOT].task_mask.load(Ordering::Relaxed), u64::MAX);
+                    assert_eq!(crate::multitask::task_table::get(SLOT).affinity.task_mask.load(Ordering::Relaxed), u64::MAX);
                     13
                 })
             });
@@ -92,14 +92,14 @@ fn overlapping_writers_publish_only_complete_commits_and_unwind_releases_admissi
         assert_eq!(task, process);
         assert_eq!(pending, task == 2);
         assert!(with_admission(SLOT, None, task.trailing_zeros() as usize, || true).unwrap());
-        assert_eq!(AFFINITIES[SLOT].version.load(Ordering::Acquire) & 1, 0);
+        assert_eq!(crate::multitask::task_table::get(SLOT).affinity.version.load(Ordering::Acquire) & 1, 0);
     });
 }
 
 #[test]
 fn reset_is_empty_authority_not_unrestricted_permission_and_old_uid_cannot_rebind() {
     isolated(|| {
-        let a = &AFFINITIES[SLOT];
+        let a = &crate::multitask::task_table::get(SLOT).affinity;
         *a.binding.lock() = Some(0);
         a.initialized.store(true, Ordering::Relaxed);
         store(a, 1, 1, false);
@@ -121,7 +121,7 @@ fn reset_is_empty_authority_not_unrestricted_permission_and_old_uid_cannot_rebin
 fn invalid_mask_writer_cannot_modify_binding_version_or_previous_commit() {
     isolated(|| {
         set_affinity(SLOT, 1, 3, false);
-        let a = &AFFINITIES[SLOT];
+        let a = &crate::multitask::task_table::get(SLOT).affinity;
         let version = a.version.load(Ordering::Acquire);
         for (task, process) in [(0, 3), (1, 0), (4, 3)] {
             assert!(std::panic::catch_unwind(|| set_affinity(SLOT, task, process, true)).is_err());
@@ -134,7 +134,7 @@ fn invalid_mask_writer_cannot_modify_binding_version_or_previous_commit() {
 #[test]
 fn exhausted_affinity_epoch_refuses_before_any_mask_or_migration_effect() {
     isolated(|| {
-        let affinity = &AFFINITIES[SLOT];
+        let affinity = &crate::multitask::task_table::get(SLOT).affinity;
         let saved = affinity.version.load(Ordering::Relaxed);
         let before = affinity_snapshot(SLOT);
         affinity.version.store(u64::MAX - 1, Ordering::Release);

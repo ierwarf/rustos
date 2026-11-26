@@ -45,8 +45,10 @@ pub(in crate::multitask::scheduler) fn transitive() {
 
 pub(in crate::multitask::scheduler) fn bounded_capacity() {
     born(|slots| {
+        let cap = donation_ledger::capacity();
+        assert!(cap > 0);
         let scope = masked();
-        for reply in 1..=MAX_TASK as u64 {
+        for reply in 1..=cap as u64 {
             assert!(reserve_call_with(&scope, ID).donation_reserved);
             assert!(bind_with(&scope, reply, ID, ID + 1, false));
             assert_eq!(donation_ledger::live_len(), reply as usize);
@@ -54,7 +56,7 @@ pub(in crate::multitask::scheduler) fn bounded_capacity() {
         let queue = runqueue::owner(slots[1]);
         assert!(!reserve_call_with(&scope, ID).donation_reserved);
         assert!(!pager_with(&scope, 0x10000, ID, ID + 2));
-        assert_eq!(donation_ledger::live_len(), MAX_TASK);
+        assert_eq!(donation_ledger::live_len(), cap);
         assert_eq!(donation_ledger::borrowed_context_owner_slot(slots[2]), None);
         assert_eq!(runqueue::owner(slots[1]), queue);
         // A released exact record restores one capacity, not a fabricated len.

@@ -2126,7 +2126,6 @@ pub(super) fn process_spawn_error_to_linux_errno(error: multitask::SpawnTaskErro
         E::MemoryQuota | E::ThreadStackAllocation | E::JobThreadMemory => LINUX_ENOMEM,
         E::NoFreeTaskSlot
         | E::ProcessLimit
-        | E::ProcessThreadLimit
         | E::JobThreadLimit
         | E::ProcessExiting
         | E::ProcessExecInProgress

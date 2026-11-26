@@ -42,11 +42,11 @@ fn owned_peer_image_retains_gate_through_real_receipt_finalization_and_writer_re
     assert!(process::authorize_exec(reservation));
     assert!(!stack_resources::close_for_reclaim(SLOT));
     // Close was requested to witness refusal; restore only isolated fixture metadata.
-    RESOURCES[SLOT].with(|r| r.closing = false);
+    crate::multitask::scheduler::stack_resources::resource(SLOT).with(|r| r.closing = false);
     let finalized =
         exec_transaction::with_intent_image(&intent, reservation, 0x3000, false, |lease| {
             assert!(identity::lifecycle(SLOT).exec_quiesced);
-            assert!(RESOURCES[SLOT].with(|r| r.frame_writing));
+            assert!(crate::multitask::scheduler::stack_resources::resource(SLOT).with(|r| r.frame_writing));
             let staged = process::stage_exec_state(
                 reservation,
                 ProcessAddressSpace::modeled_root_for_host(0x3000),
@@ -66,7 +66,7 @@ fn owned_peer_image_retains_gate_through_real_receipt_finalization_and_writer_re
             finalized
         })
         .unwrap();
-    assert!(!RESOURCES[SLOT].with(|r| r.frame_writing));
+    assert!(!crate::multitask::scheduler::stack_resources::resource(SLOT).with(|r| r.frame_writing));
     assert!(identity::lifecycle(SLOT).exec_quiesced);
     intent.complete(&finalized);
     assert!(!exec_intent::busy(SLOT));
@@ -123,7 +123,7 @@ fn failed_image_admission_can_cancel_exact_process_but_old_credential_cannot_ent
     let intent = exec_intent::begin(SLOT, PID, first, false).unwrap();
     let old = intent.credential();
     // ORDERING: native fixture models reader custody on the real counter.
-    RESOURCES[SLOT].readers.store(1, Ordering::Release);
+    crate::multitask::scheduler::stack_resources::resource(SLOT).readers.store(1, Ordering::Release);
     assert!(
         exec_transaction::with_intent_image(&intent, first, 0x3000, false, |_| panic!(
             "reader admitted image"
@@ -131,7 +131,7 @@ fn failed_image_admission_can_cancel_exact_process_but_old_credential_cannot_ent
         .is_none()
     );
     // ORDERING: native fixture models reader custody on the real counter.
-    RESOURCES[SLOT].readers.store(0, Ordering::Release);
+    crate::multitask::scheduler::stack_resources::resource(SLOT).readers.store(0, Ordering::Release);
     intent.prepare_cancel();
     intent.cancel(process::cancel_exec_owned(first).unwrap());
     let next = process::begin_exec(handle).unwrap();
@@ -341,7 +341,7 @@ fn completed_self_image_opens_only_after_writer_drop_inside_completion_scope() {
         )
         .unwrap()
         .unwrap();
-        assert!(!RESOURCES[SLOT].with(|r| r.frame_writing));
+        assert!(!crate::multitask::scheduler::stack_resources::resource(SLOT).with(|r| r.frame_writing));
         assert!(!exec_intent::busy(SLOT));
         assert!(!identity::lifecycle(SLOT).exec_quiesced);
         result
@@ -483,7 +483,7 @@ fn terminal_producer_binding_retains_hidden_exact_uid_and_independently_denies_w
         Some(PID + 1)
     ));
     for writer in [true, false] {
-        RESOURCES[SLOT].with(|r| {
+        crate::multitask::scheduler::stack_resources::resource(SLOT).with(|r| {
             if writer {
                 r.frame_writing = true;
             } else {
@@ -491,18 +491,18 @@ fn terminal_producer_binding_retains_hidden_exact_uid_and_independently_denies_w
             }
         });
         assert!(!stack_resources::terminal_binding_matches(SLOT, Some(PID)));
-        RESOURCES[SLOT].with(|r| {
+        crate::multitask::scheduler::stack_resources::resource(SLOT).with(|r| {
             r.frame_writing = false;
             r.closing = false;
         });
     }
     let reclaim = stack_resources::reuse::begin(SLOT, Some(PID)).unwrap();
-    RESOURCES[SLOT].with(|r| r.closing = false);
+    crate::multitask::scheduler::stack_resources::resource(SLOT).with(|r| r.closing = false);
     assert!(!stack_resources::terminal_binding_matches(SLOT, Some(PID)));
-    RESOURCES[SLOT].with(|r| r.closing = true);
+    crate::multitask::scheduler::stack_resources::resource(SLOT).with(|r| r.closing = true);
     drop(reclaim);
     // Native recovery of injected close/poison, never production reopening.
-    RESOURCES[SLOT].with(|r| {
+    crate::multitask::scheduler::stack_resources::resource(SLOT).with(|r| {
         r.reclaim = None;
         r.closing = false;
     });

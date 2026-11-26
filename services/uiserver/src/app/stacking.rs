@@ -153,7 +153,7 @@ impl AppState {
     pub(super) fn wayland_placement_frames(&self) -> Vec<crate::canvas::Rect> {
         self.wayland_windows
             .iter()
-            .filter(|w| !w.drag_icon)
+            .filter(|w| !w.drag_icon && !w.popup)
             .map(|w| w.frame)
             .chain(
                 self.pending_wayland_placements
@@ -188,7 +188,7 @@ impl AppState {
         });
         let mut occupied = self.occupied_window_frames();
         for window in windows {
-            if window.drag_icon {
+            if window.drag_icon || window.popup {
                 continue;
             }
             if self
@@ -271,6 +271,9 @@ impl AppState {
         {
             order.raise(WindowId::Console(self.focused_session_handle));
         }
+        for popup in self.wayland_windows.iter().filter(|window| window.popup) {
+            order.raise(WindowId::Wayland(popup.surface_id));
+        }
         for icon in self
             .wayland_windows
             .iter()
@@ -293,7 +296,7 @@ impl AppState {
                 WindowId::Wayland(id) => self
                     .wayland_windows
                     .iter()
-                    .any(|w| w.surface_id == *id && !w.minimized && !w.drag_icon),
+                    .any(|w| w.surface_id == *id && !w.minimized && !w.drag_icon && !w.popup),
             })
     }
 }

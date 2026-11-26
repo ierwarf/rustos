@@ -5,7 +5,8 @@
 //! Failure: untouched acquisition refuses; losing ownership after effects fails closed.
 //! Forbidden: PID scans as lifetime, affinity credentials for job control, fresh wake pin after CONT.
 //! Evidence: actual born descriptors, group/recipient regressions and source-refining cold models.
-use super::{LINUX_THREAD_STATES, UserAbi, MAX_TASK, process_table, stack_resources};
+use alloc::vec::Vec;
+use super::{UserAbi, process_table, stack_resources};
 use super::super::{current_terminal::OriginalCurrent,
     runqueue_policy, task_directory, wake_publication, TaskContext};
 use crate::multitask::{current_identity as identity, process_placement};
@@ -41,7 +42,7 @@ impl Recipient {
         }
         let slot = self.pin.slot();
         let wake = {
-            let mut cell = LINUX_THREAD_STATES[slot].lock();
+            let mut cell = crate::multitask::task_table::get(slot).linux_thread_state.lock();
             if cell.owner_tid != Some(self.pin.id()) { return Ok(false); }
             let Some(state) = cell.state.as_mut() else { return Ok(false); };
             if signal == rustos_user_abi::linux::SIGCHLD { state.pending_sigchld_events |= events; }
@@ -68,7 +69,7 @@ impl Recipient {
 struct Group {
     change: process_placement::Change,
     cohort: identity::cohort::Cohort,
-    members: [(usize, u64); MAX_TASK],
+    members: Vec<(usize, u64)>,
     len: usize,
     pid: u64,
 }
@@ -77,9 +78,8 @@ impl Group {
         let handle = target.context.process_handle?;
         let change = process_placement::Change::begin(handle, target.member())?;
         change.process_pin()?;
-        let mut members = [(0, 0); MAX_TASK];
-        let mut len = 0;
-        for member in change.live_members() { members[len] = member; len += 1; }
+        let members: Vec<(usize, u64)> = change.live_members().collect();
+        let len = members.len();
         let cohort = identity::cohort::Cohort::begin_job_control(&members[..len])?;
         let pid = target.context.process_id?;
         for &(slot, id) in &members[..len] {
@@ -145,15 +145,7 @@ fn queue_in(scope: &DispatchPreemption<'_>, pid: u64, id: u64, signal: u64,
 pub(in crate::multitask) fn queue_process(pid: u64, signal: u64) -> Result<bool, ()> {
     let mut scope = DispatchPreemption::enter(); scope.mask_irqs();
     check_scope(&scope);
-    let mut candidates = [(usize::MAX, 0_u64); MAX_TASK];
-    let mut len = 0;
-    for slot in 0..MAX_TASK {
-        if let Some(start) = stack_resources::task_start::read(slot) {
-            candidates[len] = (slot, start.id); len += 1;
-        }
-    }
-    candidates[..len].sort_unstable_by_key(|&(slot, id)| (id != pid, slot));
-    for &(slot, id) in &candidates[..len] {
+    for (slot, id) in super::super::task_directory::pid_ordered_candidates(pid, None) {
         if let Some(target) = Recipient::capture(slot, id, pid) {
             return target.queue(&scope, signal, 0, &runqueue_policy::online_affinity_mask);
         }
@@ -170,15 +162,7 @@ fn process_sigchld_in(scope: &DispatchPreemption<'_>, pid: u64, events: u32,
     if events == 0 || events & !rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_MASK != 0 { return false; }
     // Candidate IDs are discovery hints only. Every candidate must acquire an
     // original recipient unit and qualify its exact process before any effect.
-    let mut candidates = [(usize::MAX, 0_u64); MAX_TASK];
-    let mut len = 0;
-    for slot in 0..MAX_TASK {
-        if let Some(start) = stack_resources::task_start::read(slot) {
-            candidates[len] = (slot, start.id); len += 1;
-        }
-    }
-    candidates[..len].sort_unstable_by_key(|&(slot, id)| (id != pid, slot));
-    for &(slot, id) in &candidates[..len] {
+    for (slot, id) in super::super::task_directory::pid_ordered_candidates(pid, None) {
         if let Some(target) = Recipient::capture(slot, id, pid) {
             return target.queue(scope, rustos_user_abi::linux::SIGCHLD, events, eligible_cpus) == Ok(true);
         }

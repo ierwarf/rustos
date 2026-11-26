@@ -49,14 +49,14 @@ fn initial_execution_and_physical_pins_refuse_every_constructor_phase_independen
             assert!(identity::execution::initial(SLOT, ID).is_none());
             assert_eq!(identity::execution::count(SLOT), 0);
             assert!(cpu_leases::pin_initial(SLOT, ID).is_none());
-            assert_eq!(RESOURCES[SLOT].pins.load(Ordering::Acquire), 0);
+            assert_eq!(resource(SLOT).pins.load(Ordering::Acquire), 0);
         }
         admission::set_phase_for_test(SLOT, ID, None);
         let execution = identity::execution::initial(SLOT, ID).unwrap();
         assert_eq!(identity::execution::count(SLOT), 1);
         drop(execution);
         let pin = cpu_leases::pin_initial(SLOT, ID).unwrap();
-        assert_eq!(RESOURCES[SLOT].pins.load(Ordering::Acquire), 1);
+        assert_eq!(resource(SLOT).pins.load(Ordering::Acquire), 1);
         drop(pin);
     });
 }
@@ -66,16 +66,16 @@ fn initial_execution_and_physical_pins_refuse_writer_and_close_separately_withou
  {
     fixture(|| {
         for (writing, closing) in [(true, false), (false, true)] {
-            RESOURCES[SLOT].with(|resources| {
+            resource(SLOT).with(|resources| {
                 resources.frame_writing = writing;
                 resources.closing = closing;
             });
             assert!(identity::execution::initial(SLOT, ID).is_none());
             assert_eq!(identity::execution::count(SLOT), 0);
             assert!(cpu_leases::pin_initial(SLOT, ID).is_none());
-            assert_eq!(RESOURCES[SLOT].pins.load(Ordering::Acquire), 0);
+            assert_eq!(resource(SLOT).pins.load(Ordering::Acquire), 0);
         }
-        RESOURCES[SLOT].with(|resources| {
+        resource(SLOT).with(|resources| {
             resources.frame_writing = false;
             resources.closing = false;
         });
@@ -145,7 +145,7 @@ fn direct_handoff_refusal_preserves_exact_owner_and_failed_resource_admission_re
         ));
         assert_eq!(runqueue::owner(SLOT), owner);
         identity::update_live_lifecycle(SLOT, ID, identity::LifecycleGate::JobStopped, false);
-        RESOURCES[SLOT].with(|r| r.frame_writing = true);
+        resource(SLOT).with(|r| r.frame_writing = true);
         assert!(!runqueue::claim_dispatch_with_owner_generation(
             SLOT,
             CPU,
@@ -154,7 +154,7 @@ fn direct_handoff_refusal_preserves_exact_owner_and_failed_resource_admission_re
         ));
         assert_eq!(identity::execution::count(SLOT), 0);
         assert_eq!(runqueue::owner(SLOT), owner);
-        RESOURCES[SLOT].with(|r| r.frame_writing = false);
+        resource(SLOT).with(|r| r.frame_writing = false);
         assert!(runqueue::claim_dispatch_with_owner_generation(
             SLOT,
             CPU,
@@ -319,21 +319,21 @@ fn reserved_slot_refuses_real_local_and_direct_cas_in_every_phase_without_spendi
 #[test]
 fn cold_binding_pin_refuses_active_writer_closing_and_foreign_resource_uid_before_any_seal() {
     fixture(|| {
-        RESOURCES[SLOT].with(|resources| resources.frame_writing = true);
+        resource(SLOT).with(|resources| resources.frame_writing = true);
         assert!(identity::cohort::Cohort::begin(&[(SLOT, ID)]).is_none());
-        RESOURCES[SLOT].with(|resources| {
+        resource(SLOT).with(|resources| {
             resources.frame_writing = false;
             resources.closing = true;
         });
         assert!(identity::cohort::Cohort::begin(&[(SLOT, ID)]).is_none());
-        RESOURCES[SLOT].with(|resources| {
+        resource(SLOT).with(|resources| {
             resources.closing = false;
             resources.start.as_mut().unwrap().id = ID + 1;
         });
         assert!(identity::cohort::Cohort::begin(&[(SLOT, ID)]).is_none());
         assert!(!identity::cohort::busy(SLOT));
         assert_eq!(identity::execution::count(SLOT), 0);
-        RESOURCES[SLOT].with(|resources| resources.start.as_mut().unwrap().id = ID);
+        resource(SLOT).with(|resources| resources.start.as_mut().unwrap().id = ID);
     });
 }
 #[test]

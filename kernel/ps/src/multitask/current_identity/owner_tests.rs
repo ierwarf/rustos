@@ -18,7 +18,7 @@ fn identity(task_id: u64) -> TaskIdentity {
 #[test]
 fn metadata_republication_cannot_erase_newer_lifecycle_intent() {
     let _namespace = crate::multitask::scheduler::execution_test_serial_guard();
-    let slot = MAX_SCHEDULER_TASKS - 11;
+    let slot = 4085;
     clear(slot);
     let original = identity(80_001);
     publish_metadata(slot, Some(original));
@@ -41,7 +41,7 @@ fn metadata_republication_cannot_erase_newer_lifecycle_intent() {
 #[test]
 fn absent_partial_metadata_preserves_pending_start_and_stop_intent() {
     let _namespace = crate::multitask::scheduler::execution_test_serial_guard();
-    let slot = MAX_SCHEDULER_TASKS - 12;
+    let slot = 4084;
     clear(slot);
     publish_lifecycle_change(slot, None, LifecycleGate::Suspended, true);
     publish_lifecycle_change(slot, None, LifecycleGate::JobStopped, true);
@@ -58,7 +58,7 @@ fn absent_partial_metadata_preserves_pending_start_and_stop_intent() {
 #[test]
 fn stale_live_command_cannot_stop_or_resume_a_recycled_identity() {
     let _namespace = crate::multitask::scheduler::execution_test_serial_guard();
-    let slot = MAX_SCHEDULER_TASKS - 13;
+    let slot = 4083;
     clear(slot);
     publish_metadata(slot, Some(identity(80_003)));
     assert!(update_live_lifecycle(
@@ -81,7 +81,7 @@ fn stale_live_command_cannot_stop_or_resume_a_recycled_identity() {
         assert_eq!(read_state(slot), before);
     }
     assert!(!update_live_lifecycle(
-        MAX_SCHEDULER_TASKS,
+        task_table::MAX_TASK_SLOTS,
         80_004,
         LifecycleGate::Retired,
         true
@@ -99,7 +99,7 @@ fn stale_live_command_cannot_stop_or_resume_a_recycled_identity() {
 #[test]
 fn concurrent_metadata_and_gate_writers_do_not_lose_each_others_fields() {
     let _namespace = crate::multitask::scheduler::execution_test_serial_guard();
-    let slot = MAX_SCHEDULER_TASKS - 14;
+    let slot = 4082;
     clear(slot);
     publish_metadata(slot, Some(identity(80_005)));
     std::thread::scope(|scope| {
@@ -134,7 +134,6 @@ fn concurrent_metadata_and_gate_writers_do_not_lose_each_others_fields() {
 
 #[test]
 fn published_identity_tables_cover_the_whole_task_table() {
-    assert_eq!(IDENTITIES.len(), MAX_SCHEDULER_TASKS);
-    assert_eq!(SIGNAL_PENDING.len(), MAX_SCHEDULER_TASKS);
-    assert_eq!(execution::REFS.len(), MAX_SCHEDULER_TASKS);
+    assert!(task_table::try_get(0).is_some());
+    assert!(task_table::try_get(task_table::MAX_TASK_SLOTS).is_none());
 }

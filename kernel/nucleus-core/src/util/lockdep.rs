@@ -164,6 +164,9 @@ pub enum LockClass {
     /// never acquired while holding `LocalFdObject` or `ProcessState`, and
     /// never calls `wake_local_fd_object` or provider IPC while held.
     KernelEpollRegistry = 62,
+    /// Virtual kernel-stack window allocator (`PML4[259]`); never nested across
+    /// frame allocation, heap allocation, or TLB shootdown.
+    KernelStackVm = 63,
 }
 #[cfg(rustos_boot_image)]
 #[derive(Clone, Copy)]
@@ -788,12 +791,23 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
             after_acquire(pending);
             Some(TrackedSpinGuard {
                 guard: Some(guard),
+                #[cfg(rustos_boot_image)]
+                owner_cpu: acquire_cpu,
+                #[cfg(not(rustos_boot_image))]
                 owner_cpu: tracked_guard_owner_cpu(),
+                #[cfg(rustos_boot_image)]
+                owner_apic_id: acquire_apic_id,
+                #[cfg(not(rustos_boot_image))]
                 owner_apic_id: current_apic_id(),
                 #[cfg(rustos_boot_image)]
                 acquire_site: Some(acquire_site),
+                // ORDERING: Acquire observes completed guard/pending transitions
+                // before the raw depth this guard must match on release is recorded.
+                // Effective depth adds DispatchPreemption and would mismatch drop_full.
                 #[cfg(rustos_boot_image)]
-                acquire_preemption_depth: preemption_depth(),
+                acquire_preemption_depth: CPU_LOCK_STATE[acquire_cpu]
+                    .preempt_disable_depth
+                    .load(Ordering::Acquire),
                 #[cfg(rustos_boot_image)]
                 irqs_masked: false,
                 #[cfg(rustos_boot_image)]
@@ -804,7 +818,11 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
             {
                 let release_cpu = current_cpu_index();
                 let release_apic_id = current_apic_id();
-                let depth = preemption_depth();
+                // ORDERING: Acquire observes completed guard/pending transitions
+                // before checking raw preemption ownership.
+                let depth = CPU_LOCK_STATE[release_cpu]
+                    .preempt_disable_depth
+                    .load(Ordering::Acquire);
                 assert!(
                     guard_release_is_admissible(
                         acquire_cpu,
@@ -872,16 +890,10 @@ const fn guard_release_is_admissible(
     owner_cpu == release_cpu && owner_apic_id == release_apic_id && preemption_depth != 0
 }
 
+#[cfg(not(rustos_boot_image))]
 #[inline]
 fn tracked_guard_owner_cpu() -> usize {
-    #[cfg(rustos_boot_image)]
-    {
-        current_cpu_index()
-    }
-    #[cfg(not(rustos_boot_image))]
-    {
-        0
-    }
+    0
 }
 
 /// The outermost tracked raw-spin class this CPU holds that is not `except`.

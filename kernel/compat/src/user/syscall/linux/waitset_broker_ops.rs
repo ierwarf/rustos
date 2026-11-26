@@ -30,15 +30,10 @@ use rustos_user_abi::syscall::{
 // the remaining capacity admits ordinary multi-provider waits concurrently.
 // Exhaustion is explicit EBUSY and never collapses identities or allocates in
 // the raw registry critical section.
-// 8 per task over the 256-slot task table keeps the slab at the 2,048 entries it
-// had at 16 per task over 128 slots: the table is built by value before it is
-// published (`lazy_static`), so doubling it to ~196 KiB overflowed a 2 MiB
-// thread stack in unoptimized builds, and no task arms more than a few providers.
-const WAITSET_OBSERVATIONS_PER_TASK_BUDGET: usize = 8;
-const WAITSET_WAITER_CAPACITY: usize =
-    multitask::MAX_SCHEDULER_TASKS * WAITSET_OBSERVATIONS_PER_TASK_BUDGET;
+// The slab is a fixed 2,048 entries, independent of the task table: it is a
+// policy bound on concurrently armed provider observations, not a per-slot
+// table. The table is built by value before it is published (`lazy_static`), so
 pub(crate) const WAITSET_MAX_OBSERVATIONS: usize = WAITSET_MAX_INTERESTS + 1;
-const _: () = assert!(WAITSET_WAITER_CAPACITY >= WAITSET_MAX_OBSERVATIONS);
 const INPUT_OPEN_DESCRIPTION_CAPACITY: usize = 256;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -88,9 +83,8 @@ fn bump_signal_epoch() {
     WAITSET_SIGNAL_EPOCH.fetch_add(1, Ordering::SeqCst);
 }
 
-const WAITSET_NO_SLOT: u16 = u16::MAX;
+const WAITSET_NO_SLOT: u32 = u32::MAX;
 const WAITSET_INDEX_BUCKETS: usize = 256;
-const _: () = assert!(WAITSET_WAITER_CAPACITY < WAITSET_NO_SLOT as usize);
 
 fn object_bucket(provider: u16, object_id: u64) -> usize {
     let mixed = object_id
@@ -105,40 +99,55 @@ fn task_bucket(task_id: u64) -> usize {
 }
 
 struct WaiterTable {
-    slots: [Option<WaitSetWaiter>; WAITSET_WAITER_CAPACITY],
+    slots: alloc::vec::Vec<Option<WaitSetWaiter>>,
     active_count: usize,
-    free_head: u16,
-    next_free: [u16; WAITSET_WAITER_CAPACITY],
-    object_heads: [u16; WAITSET_INDEX_BUCKETS],
-    object_prev: [u16; WAITSET_WAITER_CAPACITY],
-    object_next: [u16; WAITSET_WAITER_CAPACITY],
-    task_heads: [u16; WAITSET_INDEX_BUCKETS],
-    task_prev: [u16; WAITSET_WAITER_CAPACITY],
-    task_next: [u16; WAITSET_WAITER_CAPACITY],
+    free_head: u32,
+    next_free: alloc::vec::Vec<u32>,
+    object_heads: [u32; WAITSET_INDEX_BUCKETS],
+    object_prev: alloc::vec::Vec<u32>,
+    object_next: alloc::vec::Vec<u32>,
+    task_heads: [u32; WAITSET_INDEX_BUCKETS],
+    task_prev: alloc::vec::Vec<u32>,
+    task_next: alloc::vec::Vec<u32>,
 }
 
 impl WaiterTable {
     fn boxed() -> alloc::boxed::Box<Self> {
-        let mut table = alloc::boxed::Box::new(Self {
-            slots: [None; WAITSET_WAITER_CAPACITY],
+        alloc::boxed::Box::new(Self {
+            slots: alloc::vec::Vec::new(),
             active_count: 0,
-            free_head: 0,
-            next_free: [WAITSET_NO_SLOT; WAITSET_WAITER_CAPACITY],
+            free_head: WAITSET_NO_SLOT,
+            next_free: alloc::vec::Vec::new(),
             object_heads: [WAITSET_NO_SLOT; WAITSET_INDEX_BUCKETS],
-            object_prev: [WAITSET_NO_SLOT; WAITSET_WAITER_CAPACITY],
-            object_next: [WAITSET_NO_SLOT; WAITSET_WAITER_CAPACITY],
+            object_prev: alloc::vec::Vec::new(),
+            object_next: alloc::vec::Vec::new(),
             task_heads: [WAITSET_NO_SLOT; WAITSET_INDEX_BUCKETS],
-            task_prev: [WAITSET_NO_SLOT; WAITSET_WAITER_CAPACITY],
-            task_next: [WAITSET_NO_SLOT; WAITSET_WAITER_CAPACITY],
-        });
-        for idx in 0..WAITSET_WAITER_CAPACITY - 1 {
-            table.next_free[idx] = (idx + 1) as u16;
-        }
-        table
+            task_prev: alloc::vec::Vec::new(),
+            task_next: alloc::vec::Vec::new(),
+        })
     }
 
     fn free_count(&self) -> usize {
-        WAITSET_WAITER_CAPACITY - self.active_count
+        self.slots.len() - self.active_count
+    }
+
+    fn try_reserve_slots(&mut self, additional: usize) -> Result<(), i64> {
+        if additional == 0 {
+            return Ok(());
+        }
+        let Some(new_total) = self.slots.len().checked_add(additional) else {
+            return Err(LINUX_ENOMEM);
+        };
+        if u32::try_from(new_total).is_err() || new_total >= WAITSET_NO_SLOT as usize {
+            return Err(LINUX_ENOMEM);
+        }
+        self.slots.try_reserve(additional).map_err(|_| LINUX_ENOMEM)?;
+        self.next_free.try_reserve(additional).map_err(|_| LINUX_ENOMEM)?;
+        self.object_prev.try_reserve(additional).map_err(|_| LINUX_ENOMEM)?;
+        self.object_next.try_reserve(additional).map_err(|_| LINUX_ENOMEM)?;
+        self.task_prev.try_reserve(additional).map_err(|_| LINUX_ENOMEM)?;
+        self.task_next.try_reserve(additional).map_err(|_| LINUX_ENOMEM)?;
+        Ok(())
     }
 
     fn count_for_task(&self, task_id: u64) -> usize {
@@ -157,10 +166,22 @@ impl WaiterTable {
     }
 
     fn install(&mut self, waiter: WaitSetWaiter) {
-        let idx = self.free_head as usize;
-        debug_assert!(self.free_head != WAITSET_NO_SLOT && self.slots[idx].is_none());
-        self.free_head = self.next_free[idx];
-        self.next_free[idx] = WAITSET_NO_SLOT;
+        let idx = if self.free_head != WAITSET_NO_SLOT {
+            let idx = self.free_head as usize;
+            self.free_head = self.next_free[idx];
+            self.next_free[idx] = WAITSET_NO_SLOT;
+            idx
+        } else {
+            let idx = self.slots.len();
+            self.slots.push(None);
+            self.next_free.push(WAITSET_NO_SLOT);
+            self.object_prev.push(WAITSET_NO_SLOT);
+            self.object_next.push(WAITSET_NO_SLOT);
+            self.task_prev.push(WAITSET_NO_SLOT);
+            self.task_next.push(WAITSET_NO_SLOT);
+            idx
+        };
+        debug_assert!(self.slots[idx].is_none());
         self.slots[idx] = Some(waiter);
         self.active_count += 1;
         if waiter.observation.provider == WAITSET_PROVIDER_KERNEL {
@@ -172,18 +193,18 @@ impl WaiterTable {
         self.object_prev[idx] = WAITSET_NO_SLOT;
         self.object_next[idx] = old_ob;
         if old_ob != WAITSET_NO_SLOT {
-            self.object_prev[old_ob as usize] = idx as u16;
+            self.object_prev[old_ob as usize] = idx as u32;
         }
-        self.object_heads[ob] = idx as u16;
+        self.object_heads[ob] = idx as u32;
 
         let tb = task_bucket(waiter.task_id);
         let old_tb = self.task_heads[tb];
         self.task_prev[idx] = WAITSET_NO_SLOT;
         self.task_next[idx] = old_tb;
         if old_tb != WAITSET_NO_SLOT {
-            self.task_prev[old_tb as usize] = idx as u16;
+            self.task_prev[old_tb as usize] = idx as u32;
         }
-        self.task_heads[tb] = idx as u16;
+        self.task_heads[tb] = idx as u32;
     }
 
     fn remove_slot(&mut self, idx: usize) {
@@ -224,7 +245,7 @@ impl WaiterTable {
         self.task_next[idx] = WAITSET_NO_SLOT;
 
         self.next_free[idx] = self.free_head;
-        self.free_head = idx as u16;
+        self.free_head = idx as u32;
     }
 
     fn remove_for_task(&mut self, task_id: u64) -> usize {
@@ -243,7 +264,7 @@ impl WaiterTable {
     }
 
     fn remove_for_process(&mut self, process_id: u64) {
-        for idx in 0..WAITSET_WAITER_CAPACITY {
+        for idx in 0..self.slots.len() {
             if self.slots[idx].is_some_and(|waiter| waiter.process_id == process_id) {
                 self.remove_slot(idx);
             }
@@ -470,12 +491,11 @@ fn register_waitset_waiters_faultable(
     let mut waiters = WAITSET_WAITERS.lock();
     let existing = waiters.count_for_task(task_id);
     let free = waiters.free_count();
-    if free.saturating_add(existing) < observations.len() {
-        return Err(LINUX_EBUSY);
-    }
-    // Replacement is one bounded transaction: capacity is proved first, the
-    // prior set is removed, then the complete new set is installed without an
-    // allocator or fallible operation under the registry lock.
+    let needed = observations.len().saturating_sub(free.saturating_add(existing));
+    waiters.try_reserve_slots(needed)?;
+    // Replacement is one bounded transaction: storage is reserved first, the
+    // prior set is removed, then the complete new set is installed without any
+    // fallible step mid-update.
     waiters.remove_for_task(task_id);
     for observation in observations.iter().copied() {
         waiters.install(WaitSetWaiter {
@@ -624,9 +644,8 @@ fn take_local_waiters(token: u64, generation: u64, task_ids: &mut [u64]) -> (usi
 }
 
 fn wake_matching(provider: u16, object_id: Option<u64>, generation: Option<u64>) {
-    let mut task_ids = [0_u64; WAITSET_WAITER_CAPACITY];
-    let count = take_matching_waiters(provider, object_id, generation, &mut task_ids);
-    for task_id in task_ids.into_iter().take(count) {
+    let task_ids = take_matching_waiters(provider, object_id, generation);
+    for task_id in task_ids {
         let _ = multitask::wake_task(task_id);
     }
 }
@@ -635,48 +654,66 @@ fn take_matching_waiters(
     provider: u16,
     object_id: Option<u64>,
     generation: Option<u64>,
-    task_ids: &mut [u64; WAITSET_WAITER_CAPACITY],
-) -> usize {
-    let mut count = 0usize;
-    {
-        let mut waiters = WAITSET_WAITERS.lock();
-        if let Some(object) = object_id {
-            let mut cur = waiters.object_heads[object_bucket(provider, object)];
-            while cur != WAITSET_NO_SLOT {
-                let idx = cur as usize;
-                let next = waiters.object_next[idx];
-                if let Some(waiter) = waiters.slots[idx] {
+) -> alloc::vec::Vec<u64> {
+    let mut task_ids = alloc::vec::Vec::new();
+    let batch_cap = 32usize;
+    loop {
+        let mut batch = [0_u64; 32];
+        let mut count = 0usize;
+        let mut has_more = false;
+        {
+            let mut waiters = WAITSET_WAITERS.lock();
+            if let Some(object) = object_id {
+                let mut cur = waiters.object_heads[object_bucket(provider, object)];
+                while cur != WAITSET_NO_SLOT {
+                    let idx = cur as usize;
+                    let next = waiters.object_next[idx];
+                    if let Some(waiter) = waiters.slots[idx] {
+                        let observation = waiter.observation;
+                        if observation.provider == provider
+                            && observation.object_id == object
+                            && generation.is_none_or(|value| {
+                                generation_advances(observation.generation, value)
+                            })
+                            && !batch[..count].contains(&waiter.task_id)
+                        {
+                            if count == batch_cap {
+                                has_more = true;
+                                break;
+                            }
+                            batch[count] = waiter.task_id;
+                            count += 1;
+                        }
+                    }
+                    cur = next;
+                }
+            } else {
+                for waiter in waiters.slots.iter().flatten() {
                     let observation = waiter.observation;
                     if observation.provider == provider
-                        && observation.object_id == object
                         && generation
                             .is_none_or(|value| generation_advances(observation.generation, value))
-                        && !task_ids[..count].contains(&waiter.task_id)
+                        && !batch[..count].contains(&waiter.task_id)
                     {
-                        task_ids[count] = waiter.task_id;
+                        if count == batch_cap {
+                            has_more = true;
+                            break;
+                        }
+                        batch[count] = waiter.task_id;
                         count += 1;
                     }
                 }
-                cur = next;
             }
-        } else {
-            for waiter in waiters.slots.iter().flatten() {
-                let observation = waiter.observation;
-                if observation.provider == provider
-                    && generation
-                        .is_none_or(|value| generation_advances(observation.generation, value))
-                    && !task_ids[..count].contains(&waiter.task_id)
-                {
-                    task_ids[count] = waiter.task_id;
-                    count += 1;
-                }
+            for &task_id in &batch[..count] {
+                waiters.remove_for_task(task_id);
             }
         }
-        for &task_id in &task_ids[..count] {
-            waiters.remove_for_task(task_id);
+        task_ids.extend_from_slice(&batch[..count]);
+        if !has_more {
+            break;
         }
     }
-    count
+    task_ids
 }
 
 fn generation_advances(observed: u64, published: u64) -> bool {
@@ -706,7 +743,7 @@ fn provider_for_service(service_id: u64) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderObservation, WAITSET_WAITER_CAPACITY, acquire_input_open_description,
+        ProviderObservation, acquire_input_open_description,
         generation_advances, input_open_description_access, provider_for_service,
         register_input_open_description, register_waitset_waiters,
         register_waitset_waiters_faultable, release_input_open_description, remove_waitset_waiters,
@@ -794,14 +831,12 @@ mod tests {
         assert!(waitset_waiters_match(task_a, process_a, &first));
         assert!(waitset_waiters_match(task_b, process_b, &second));
 
-        let mut wake_tasks = [0_u64; WAITSET_WAITER_CAPACITY];
-        let count = take_matching_waiters(
+        let wake_tasks = take_matching_waiters(
             WAITSET_PROVIDER_NETD,
             Some(first[0].object_id),
             Some(9),
-            &mut wake_tasks,
         );
-        assert_eq!(&wake_tasks[..count], &[task_a]);
+        assert_eq!(wake_tasks.as_slice(), &[task_a]);
         assert!(!waitset_waiters_match(task_a, process_a, &first));
         assert!(waitset_waiters_match(task_b, process_b, &second));
     }
@@ -818,9 +853,10 @@ mod tests {
             }
         }
 
+        const TEST_WAITERS: usize = 3072;
         let _guard = WAITSET_TEST_GUARD.lock();
         let mut cleanup = WaitsetCleanup(alloc::vec::Vec::new());
-        let mut remaining = WAITSET_WAITER_CAPACITY;
+        let mut remaining = TEST_WAITERS;
         let mut first = None;
         while remaining != 0 {
             let count = remaining.min(super::WAITSET_MAX_OBSERVATIONS);
@@ -834,7 +870,7 @@ mod tests {
                 })
                 .collect::<alloc::vec::Vec<_>>();
             register_waitset_waiters(task_id, process_id, &observations)
-                .expect("fill exact waiter capacity");
+                .expect("grow waiter table past legacy ceiling");
             if first.is_none() {
                 first = Some((task_id, process_id, observations.clone()));
             }
@@ -843,7 +879,7 @@ mod tests {
         }
         assert_eq!(
             super::WAITSET_WAITERS.lock().active_count,
-            WAITSET_WAITER_CAPACITY
+            TEST_WAITERS
         );
 
         let (task_id, process_id, observations) = first.expect("one exact-capacity waiter set");
@@ -944,10 +980,9 @@ mod tests {
 
         // Only a matching commit may consume the waiter and nominate its task
         // for scheduler wakeup. The two cross-pairs leave it installed.
-        let mut wake_tasks = [0_u64; super::WAITSET_WAITER_CAPACITY];
-        let count =
-            take_matching_waiters(WAITSET_PROVIDER_NETD, Some(43), Some(10), &mut wake_tasks);
-        assert_eq!(&wake_tasks[..count], &[task_a]);
+        let wake_tasks =
+            take_matching_waiters(WAITSET_PROVIDER_NETD, Some(43), Some(10));
+        assert_eq!(wake_tasks.as_slice(), &[task_a]);
         assert!(!waitset_waiters_match(task_a, process_a, &observations));
     }
 
@@ -1001,10 +1036,9 @@ mod tests {
         register_waitset_waiters(first_task, process_id, &first).expect("first exact waiter");
         register_waitset_waiters(second_task, process_id, &second).expect("second exact waiter");
 
-        let mut task_ids = [0_u64; super::WAITSET_WAITER_CAPACITY];
-        let count = take_matching_waiters(WAITSET_PROVIDER_NETD, Some(41), Some(8), &mut task_ids);
+        let task_ids = take_matching_waiters(WAITSET_PROVIDER_NETD, Some(41), Some(8));
 
-        assert_eq!(&task_ids[..count], &[first_task]);
+        assert_eq!(task_ids.as_slice(), &[first_task]);
         assert!(!waitset_waiters_match(first_task, process_id, &first));
         assert!(waitset_waiters_match(second_task, process_id, &second));
         remove_waitset_waiters(second_task);

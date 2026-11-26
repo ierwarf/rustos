@@ -208,8 +208,7 @@ ordered(body(policy, 'discharge_claimed_first_turn'), ['turn.original_current()'
     'policy.atomic_activation_pick_hints.is_empty()', 'clear_atomic_activation_pending(cpu)'],
     'exact first-turn completion retains original physical claim and prefix accounting')
 ordered(body((base / 'handoff_queue.rs').read_text(), 'remove_exact'),
-    ['== Some(entry)', 'else { return false; }', 'for next in offset + 1..self.len',
-     'self.slots[to] = self.slots[from]', 'self.len -= 1'],
+    ['let pool = T::slab_pool();', 'self.queue.pop_first_matching(pool, |candidate| *candidate == entry).is_some()'],
     'exact incarnation withdrawal preserves FIFO suffix without capacity-sized scratch')
 ordered(body(dispatch, 'complete'), ['turn.claimed_return()', 'dispatch_policy::record_completed_choice(cpu,'],
     'actual claim before independent completed-choice counters')
@@ -257,10 +256,10 @@ ordered(body(dispatch, 'claim'), ['candidate.frame.saved_rsp()',
 sync = (base / 'sync_handoff.rs').read_text()
 sync_consumer = body(sync[sync.index("/// Consumes this CPU's FIFO"):], 'take_next_ready_with')
 ordered(sync_consumer, ['SYNC_HANDOFF_BUDGET[cpu].streak', '>= MAX_SYNC_HANDOFF_CHAIN_TICKS',
-    '&& fair_competitor_ready()', 'for attempt in 0..MAX_TASK',
-    'let taken = {', 'state_for_cpu(cpu).lock()',
+    '&& fair_competitor_ready()', 'let budget = crate::multitask::task_table::active_task_count().max(64);',
+    'for attempt in 0..budget', 'let taken = {', 'state_for_cpu(cpu).lock()',
     'take_next_ready_record(|_| true)',
-    'if state.len == 0', 'pending.store(false,', 'taken\n        };',
+    'if state.records.is_empty()', 'pending.store(false,', 'taken\n        };',
     'let Some(record) = taken', 'if ready(record)', 'return Some(record)'],
     'bounded exact FIFO pop ends raw leaf before original frame qualification')
 ordered(body(sync, 'enqueue_and_publish'), ['state.enqueue_with_direct_owner(record, Some((owner, target_cpu)))'],
@@ -559,7 +558,7 @@ ordered(body(ledger, 'publish_base_class'), ['DONATION_LEDGER.lock()',
     'begin_class_publication()', 'effect()', 'end_class_publication()'],
     'live base-class producer join')
 for class_producer in ('increment_receiver', 'decrement_receiver'):
-    ordered(body(ledger, class_producer), ['begin_class_publication()', 'INHERITED_SYSTEM[slot]',
+    ordered(body(ledger, class_producer), ['begin_class_publication()', 'task_table::get(slot).inherited_system',
         'end_class_publication()'], 'inherited-class producer join')
 runtime = (base / 'scheduling_runtime.rs').read_text()
 ordered(body(runtime, 'with_dispatch_admission'), ['with_published_budget_pair(self.stamp, cpu,',
@@ -589,7 +588,7 @@ ordered(frame_readers, ['struct PinnedFrameReader', 'registration: ReaderRegistr
     'pin: StackPin', 'fn into_pin(self)', 'drop(registration)', 'pin\n'],
     'owned reader drops exclusion before backing or retains exact backing')
 ordered(body(frame_readers, 'with_claim_activation_for_reader'), [
-    'execution::with_claim', 'RESOURCES.get(slot)?', 'activation::capture',
+    'execution::with_claim', 'try_resource(slot)?', 'activation::capture',
     'affinity_payload::with_placement_admission', 'Some((claimed, activation))',
     'Some((None, activation)) => Some(ClaimAttempt::Refused { activation, permit })',
     'None => Some(ClaimAttempt::Refused { activation: None, permit })'],
@@ -634,7 +633,7 @@ ordered(body(producer, 'call_before_arm_observing'), ['!scoped(scope)',
 if 'sender.arm(' in body(producer, 'call_before_arm_observing') or 'sender.commit(' in body(producer, 'call_before_arm_observing'):
     raise SystemExit('cold producer armed/committed sender before wait_for_reply')
 ordered(body((base / 'stack_resources/context.rs').read_text(), 'retained_scheduling_context'), [
-    'BindingPin', 'RESOURCES.get(pin.slot())?.with', 'resources.start?.id != pin.id()',
+    'BindingPin', 'try_resource(pin.slot())?.with', 'resources.start?.id != pin.id()',
     'resources.context?', '!context.scheduling_context.is_bound_to(pin.id())',
     'Some(context.scheduling_context.identity())'],
     'one original participant resource leaf qualifies start and context without scalar lifetime replacement')
@@ -913,7 +912,7 @@ ordered(body(recipient_signal, 'capture'), ['pin_donation(slot, id)', 'context::
     'context.process_id != Some(pid)', 'Some(Self'], 'original signal recipient before metadata effects')
 ordered(body(recipient_signal, 'queue'), ['check_scope(scope)', 'signal == 0',
     'linux_signal_bit(signal)', 'Group::capture(&self)', 'group.finish(scope, None',
-    'LINUX_THREAD_STATES[slot].lock()', 'cell.owner_tid != Some(self.pin.id())',
+    'linux_thread_state.lock()', 'cell.owner_tid != Some(self.pin.id())',
     'state.pending_signals |= bit', 'raise_signal_pending(slot)',
     'state.signal_mask & bit == 0', 'Binding::from_original(self.pin)',
     'guarded_owned(binding, eligible_cpus)'], 'same original recipient spans group, Linux and final wake')
@@ -969,8 +968,8 @@ for query in (body(signals[:signals.index('struct Group')], 'resolve'),
     if 'task_directory::candidates(id).find_map(' not in query:
         raise SystemExit('exact target lookup treats accelerator miss as authoritative absence')
 ordered(body((base / 'task_directory.rs').read_text(), 'candidates'), [
-    'let first = hint(task_id)', 'first.into_iter().chain((0..MAX_TASK)',
-    'Some(*slot) != first'], 'bounded candidate fallback after missing or stale hint')
+    'let first = hint(task_id)', 'first.into_iter().chain(', 'crate::multitask::task_table::active_slots().filter(move |slot| Some(*slot) != first)'],
+    'bounded candidate fallback after missing or stale hint')
 if 'Target::capture' in body(observation, 'alive_in'):
     raise SystemExit('transient metadata pin refusal falsely reports task death')
 ordered(body(observation, 'alive_in'), ['task_directory::candidates(id)',
@@ -1142,18 +1141,18 @@ ordered(architecture, ['stack_resources::context::retained_architecture(',
     'if incoming.process', 'turn.claimed_mm_root(token.slot, receipt.id)',
     '!= incoming.root'],
     'original process activation versus exact pure-kernel image')
-bitmap = body((base / 'runqueue.rs').read_text(), 'local_runnable_snapshot')
+bitmap = body((base / 'runqueue.rs').read_text(), 'local_runnable_slots')
 if 'cfg(' in bitmap or '[u64::MAX;' in bitmap:
     raise SystemExit('native dispatch replaced actual published runnable bitmap')
-ordered(bitmap, ['core::array::from_fn', 'published[word].load(Ordering::Acquire)'],
-    'one actual runnable bitmap in native and production dispatch')
+ordered(bitmap, ['let (seq, count) = snapshot_published_range(cpu);', 'LocalRunnableSlots'],
+    'one actual runnable directory in native and production dispatch')
 # Frozen shared-MM census reaches the same original executor's external work,
 # real process detach and exact row ACK in native and production paths.
 cleanup = (base / 'retirement_cleanup.rs').read_text()
 ordered(body(cleanup, 'complete_with'), ['self.executor.assert_current()',
     'external(self.effects)', 'self.executor.assert_current()',
     'DispatchPreemption::enter()', 'preemption.mask_irqs()',
-    'CELLS[self.slot].complete_kernel(self.generation, self.effects)',
+    'cell(self.slot).complete_kernel(self.generation, self.effects)',
     'mark_reap_pending()'], 'original kernel executor through last ACK')
 ordered(body(cleanup, 'complete_modeled_external'), ['self.complete_with(',
     'effects.complete_external_with(external)'], 'native external input shares actual claim engine')

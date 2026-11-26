@@ -5,7 +5,7 @@
 //! Failure: partial images/pins remain quarantined; no implicit teardown or retry.
 //! Forbidden: no global scheduler guard, live reset, generation alias or ready prefix.
 //! Evidence: bounded native authority witnesses and compiler/source routing; no target proof.
-use super::{MAX_TASK, ROOT_TASK_SLOT, runqueue};
+use super::{ROOT_TASK_SLOT, runqueue};
 mod initial_tasks;
 use core::{
     cell::Cell,
@@ -116,11 +116,7 @@ impl<'a> ImageKey<'a> {
         {
             return None;
         }
-        let slot = if cpu == 0 {
-            ROOT_TASK_SLOT
-        } else {
-            MAX_TASK.checked_sub(cpu)?
-        };
+        let slot = if cpu == 0 { ROOT_TASK_SLOT } else { cpu };
         // The physical CPU ledger must not alias an already captured task UID.
         if self.cell.cpus.iter().enumerate().any(|(other, c)| {
             other != cpu
@@ -449,6 +445,11 @@ impl Bootstrap {
             assert_eq!(snapshot.state, CpuLifecycleState::OnlineParked);
             *generation = snapshot.generation;
         }
+        assert!(
+            crate::multitask::task_table::bootstrap_initial_slots()
+                && super::dispatch_policy::initialize_activation_limits(),
+            "scheduler slot tables could not be provisioned"
+        );
         let key = IMAGE
             .claim(&generations[..count])
             .expect("bootstrap image already claimed or poisoned");

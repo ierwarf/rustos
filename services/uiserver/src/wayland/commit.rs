@@ -631,7 +631,7 @@ impl WaylandState {
                 self.display_width,
                 self.display_height,
             );
-            if surface.drag_icon_role {
+            if surface.drag_icon_role || surface.is_child() {
                 surface.frame.width = width;
                 surface.frame.height = height;
             } else {

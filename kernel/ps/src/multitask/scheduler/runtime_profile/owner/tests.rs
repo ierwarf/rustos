@@ -11,8 +11,8 @@ static REPORTERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[test]
 fn cpu_cells_drain_independently_and_merge_saturates_without_spending_next_window() {
     let _fixture = crate::multitask::scheduler::tests::boxed_scheduler();
-    let a = Cell::new();
-    let b = Cell::new();
+    let a = Cell::sized();
+    let b = Cell::sized();
     a.with(|row| {
         row.account(7, u64::MAX);
         row.dispatch(7);
@@ -24,7 +24,7 @@ fn cpu_cells_drain_independently_and_merge_saturates_without_spending_next_windo
         row.wait(40);
     });
     let mut window = a.with(Counters::take);
-    window.merge(b.with(Counters::take));
+    window.merge(&b.with(Counters::take));
     assert_eq!(window.runtime_profile_ns[7], u64::MAX);
     assert_eq!(window.runtime_profile_dispatches[7], 2);
     assert_eq!(window.runtime_profile_lock_wait_ns, 60);
@@ -82,7 +82,7 @@ fn lane_rows_batch_per_cpu_and_fold_exactly_once_into_the_diagnostic_leaf() {
 #[test]
 fn remote_window_drain_preserves_open_turn_phase_baseline_and_new_window_segments() {
     let _fixture = crate::multitask::scheduler::tests::boxed_scheduler();
-    let cell = Cell::new();
+    let cell = Cell::sized();
     cell.with(|row| row.phase(SchedulerPhase::Prologue, 100));
     let baseline = cell.with(|row| row.phase_lifetime_ns);
     let old = cell.with(Counters::take);
@@ -106,14 +106,14 @@ fn remote_window_drain_preserves_open_turn_phase_baseline_and_new_window_segment
 #[test]
 fn worst_turn_merge_keeps_caller_and_attribution_with_exact_maximum_not_other_cpu() {
     let _fixture = crate::multitask::scheduler::tests::boxed_scheduler();
-    let a = Cell::new();
-    let b = Cell::new();
+    let a = Cell::sized();
+    let b = Cell::sized();
     let site_a = Location::caller();
     a.with(|row| row.hold(300, 51, site_a));
     let site_b = Location::caller();
     b.with(|row| row.hold(200, 99, site_b));
     let mut window = b.with(Counters::take);
-    window.merge(a.with(Counters::take));
+    window.merge(&a.with(Counters::take));
     assert_eq!(window.runtime_profile_lock_hold_ns, 500);
     assert_eq!(window.runtime_profile_lock_hold_max_ns, 300);
     assert_eq!(window.runtime_profile_lock_hold_max_attributed_ns, 51);
@@ -129,7 +129,7 @@ fn worst_turn_merge_keeps_caller_and_attribution_with_exact_maximum_not_other_cp
 fn per_slot_migration_history_distinguishes_root_uid_zero_reuse_and_cpus() {
     let _fixture = crate::multitask::scheduler::tests::boxed_scheduler();
     // Dedicated synthetic slot; no Scheduler/fixture table or CPU grant.
-    let slot = MAX_TASK - 1;
+    let slot = 4095;
     clear_history(slot);
     assert!(!migration(slot, 0, 0));
     assert!(migration(slot, 0, 1));
@@ -151,7 +151,7 @@ fn busy_reporter_refuses_without_consuming_cpu_counters_or_reopening_custody() {
             .is_ok()
     );
     let drain = Drain;
-    let cell = Cell::new();
+    let cell = Cell::sized();
     cell.with(|row| row.dispatch(8));
     // ORDERING: busy refusal must preserve the previously published epoch.
     let started = STARTED.load(Ordering::Acquire);
@@ -171,7 +171,10 @@ fn report_epoch_admits_one_due_consumer_and_preserves_partial_period_on_every_cp
     // ORDERING: fixture reset precedes the first admitted epoch.
     STARTED.store(0, Ordering::Release);
     for cell in &CELLS {
-        cell.with(|row| *row = Counters::new());
+        cell.with(Counters::clear_all);
+        // Production sizes a row on its first account; size it explicitly so the
+        // witness does not depend on another test having grown the shared cells.
+        cell.with(|row| row.size(64));
     }
     assert!(take(1, 100).is_none());
     CELLS[0].with(|row| row.account(7, 10));
@@ -180,15 +183,20 @@ fn report_epoch_admits_one_due_consumer_and_preserves_partial_period_on_every_cp
     // ORDERING: not-due refusal retains the published timestamp.
     assert_eq!(STARTED.load(Ordering::Acquire), 1);
     assert_eq!(CELLS[1].with(|row| row.runtime_profile_ns[7]), 20);
-    let first = take(101, 100).unwrap();
-    assert_eq!(first.runtime_profile_started_ticks, 1);
-    assert_eq!(first.runtime_profile_ns[7], 30);
+    {
+        // The window keeps the collector custody until it is consumed.
+        let first = take(101, 100).unwrap();
+        assert_eq!(first.runtime_profile_started_ticks, 1);
+        assert_eq!(first.runtime_profile_ns[7], 30);
+    }
     CELLS[1].with(|row| row.account(7, 9));
     assert!(take(101, 100).is_none());
     assert_eq!(CELLS[1].with(|row| row.runtime_profile_ns[7]), 9);
-    let second = take(201, 100).unwrap();
-    assert_eq!(second.runtime_profile_started_ticks, 101);
-    assert_eq!(second.runtime_profile_ns[7], 9);
+    {
+        let second = take(201, 100).unwrap();
+        assert_eq!(second.runtime_profile_started_ticks, 101);
+        assert_eq!(second.runtime_profile_ns[7], 9);
+    }
     assert_eq!(CELLS[1].with(|row| row.runtime_profile_ns[7]), 0);
     assert!(take(200, 100).is_none());
     // ORDERING: isolated fixture resets only after the final collection completed.

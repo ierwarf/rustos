@@ -6,7 +6,7 @@
 //! Forbidden: user-stack external loans or constructor rollback as retired authority.
 //! Evidence: actual terminal/resource seals remain held through external detach.
 use super::{
-    FIRST_DYNAMIC_TASK_SLOT, MAX_TASK, TaskContext, TaskRetireReason, current_identity,
+    FIRST_DYNAMIC_TASK_SLOT, TaskContext, TaskRetireReason, current_identity,
     dispatch_policy, donation_ledger, frame_publication, linux_thread_state,
     reclaim::RetiredSlotReclaim, retirement_cleanup, runqueue, runtime_profile, scheduling_runtime,
     stack_resources,
@@ -24,7 +24,7 @@ struct Grant {
 }
 impl Grant {
     fn capture(slot: usize, active_root: Option<u64>) -> Option<Self> {
-        if !(FIRST_DYNAMIC_TASK_SLOT..MAX_TASK).contains(&slot) {
+        if slot < FIRST_DYNAMIC_TASK_SLOT || crate::multitask::task_table::try_get(slot).is_none() {
             return None;
         }
         let id = stack_resources::task_start::read(slot)?.id;
@@ -91,7 +91,8 @@ impl Grant {
         frame_publication::clear(self.slot);
         current_identity::publish_metadata(self.slot, None);
         runtime_profile::owner::clear_history(self.slot);
-        let stack = self.reuse.take_storage();
+        let stack = self.reuse.take_stack();
+        super::stack_watermark::record_retired(self.id, self.context.user_mode, stack.as_ref());
         let reclaim = RetiredSlotReclaim::new(
             self.context.process_handle,
             stack,
@@ -145,7 +146,7 @@ pub(in crate::multitask) fn claim_next(executor: &Executor) -> Option<Reap<'_>> 
     let active_root =
         stack_resources::context::read(current).map(|_| runqueue::address_space::root(current));
     let mut pending = false;
-    for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
+    for slot in crate::multitask::task_table::active_dynamic_slots() {
         let Some(start) = stack_resources::task_start::read(slot) else {
             continue;
         };

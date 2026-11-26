@@ -258,7 +258,7 @@ fn cancelled_captured_join_leaves_no_phantom_child_and_waiting_rollback_preserve
         assert!(
             cell(h)
                 .unwrap()
-                .with(|s| s.members.contains(&Some((SLOT, ID))))
+                .with(|s| s.rows.iter().any(|row| row.member == (SLOT, ID)))
         );
     });
 }
@@ -295,7 +295,7 @@ fn reserved_exit_committed_detach_retains_exact_negative_through_reuse_until_own
         assert!(
             !cell(h)
                 .unwrap()
-                .with(|s| s.members.contains(&Some((PEER, ID + 1))))
+                .with(|s| s.rows.iter().any(|row| row.member == (PEER, ID + 1)))
         );
         assert_eq!(identity::read(PEER).unwrap().task_id, Some(ID + 2));
     });
@@ -325,7 +325,7 @@ fn waiting_exit_retains_committed_detached_uid_through_binding_clear_and_recycle
         assert!(
             !cell(h)
                 .unwrap()
-                .with(|s| s.members.contains(&Some((PEER, ID + 1))))
+                .with(|s| s.rows.iter().any(|row| row.member == (PEER, ID + 1)))
         );
         assert_eq!(identity::read(PEER).unwrap().task_id, Some(ID + 2));
     });
@@ -352,10 +352,11 @@ fn waiting_rollback_prunes_only_committed_detached_tombstones_not_live_or_stoppe
         attached.finish(publication);
         drop(pending);
         assert!(
-            cell(h)
-                .unwrap()
-                .with(|s| s.members.contains(&Some((SLOT, ID)))
-                    && !s.members.contains(&Some((PEER, ID + 1))))
+            cell(h).unwrap().with(|s| s
+                .rows
+                .iter()
+                .any(|row| row.member == (SLOT, ID))
+                && !s.rows.iter().any(|row| row.member == (PEER, ID + 1)))
         );
     });
 }

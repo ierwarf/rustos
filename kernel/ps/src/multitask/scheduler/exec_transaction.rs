@@ -14,7 +14,9 @@ pub(in crate::multitask) fn peer_exec_candidate(
     if pid == 0 || pid != tid {
         return None;
     }
-    (1..MAX_TASK).find_map(|slot| {
+    crate::multitask::task_table::active_slots()
+        .filter(|&slot| slot >= 1)
+        .find_map(|slot| {
         let context = stack_resources::context::read(slot)?;
         if !context.user_mode
             || context.user_abi != Some(UserAbi::Linux)

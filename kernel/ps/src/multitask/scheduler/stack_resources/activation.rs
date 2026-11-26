@@ -35,7 +35,7 @@ impl ActivationCredential {
         self.owner = owner;
     }
     pub(in crate::multitask) fn is_current(&self) -> bool {
-        RESOURCES[self.slot].with(|resources| {
+        resource(self.slot).with(|resources| {
             if crate::multitask::scheduler::runqueue::owner(self.slot) != self.owner {
                 return false;
             }
@@ -94,7 +94,7 @@ pub(in crate::multitask::scheduler) fn bind_exec(
     task_id: u64,
     mm: MmActivationPin,
 ) -> Option<ActivationCredential> {
-    let owner = RESOURCES.get(slot)?.with(|r| {
+    let owner = try_resource(slot)?.with(|r| {
         let context = r.context?;
         if r.closing
             || !r.frame_writing

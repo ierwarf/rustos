@@ -69,7 +69,7 @@ fn simd_replacement_requires_exclusive_current_or_terminal_custody() {
     assert_eq!(simd_reset_custody(slot), None);
     // Counterfactual incomplete count evidence cannot override the independent
     // prepared-bank refusal. Restore it before any reference destruction.
-    let pins = &super::super::RESOURCES[slot].pins;
+    let pins = &super::super::resource(slot).pins;
     let complete_count = pins.swap(1, Ordering::AcqRel);
     let incomplete = simd_reset_custody(slot);
     pins.store(complete_count, Ordering::Release);
@@ -118,11 +118,11 @@ fn retained_current_refresh_never_releases_its_final_reference() {
     bank.publish(slot, slot); // non-dispatch directory access
     bank.prepare(pin_view(slot, 94201, view).unwrap());
     bank.publish(slot, slot); // same-task validated continuation
-    assert_eq!(RESOURCES[slot].pins.load(Ordering::Acquire), 1);
+    assert_eq!(super::resource(slot).pins.load(Ordering::Acquire), 1);
     assert_eq!(bank.outgoing.load(Ordering::Acquire), 0);
     assert!(!close_for_reclaim(slot));
     bank.commit();
-    assert_eq!(RESOURCES[slot].pins.load(Ordering::Acquire), 1);
+    assert_eq!(super::resource(slot).pins.load(Ordering::Acquire), 1);
     release(&bank, &[slot]);
 }
 

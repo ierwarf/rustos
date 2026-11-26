@@ -8,7 +8,7 @@
 use super::*;
 
 pub(super) fn project_window(
-    window: owner::Counters, now: u64, period: u64,
+    window: &owner::Counters, now: u64, period: u64,
     attribution: &dyn Fn(usize) -> (u64, u64), donations: u64, divergent: Option<usize>,
 ) -> SchedulerRuntimeProfile {
     let mut report = SchedulerRuntimeProfile::default();
@@ -46,10 +46,11 @@ pub(super) fn project_window(
     report.divergent_identity_slot = divergent.unwrap_or(usize::MAX);
     report.local_dispatch_shadow = local_shadow::take_observations();
     report.run_authority_divergence = super::super::super::run_authority::take_window().map(|(first, count)| {
-        let slot = ((first >> 32) & 0xFFFF) as usize;
+        let slot = ((first >> 16) & 0xffff_ffff) as usize;
         (first, count, attribution(slot).0)
     });
-    for slot in 0..MAX_TASK {
+    let slot_count = window.runtime_profile_ns.len().min(window.runtime_profile_dispatches.len());
+    for slot in 0..slot_count {
         let runtime_ns = window.runtime_profile_ns[slot];
         let dispatches = window.runtime_profile_dispatches[slot];
         report.total_runtime_ns = report.total_runtime_ns.saturating_add(runtime_ns);

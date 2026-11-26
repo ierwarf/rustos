@@ -3,8 +3,9 @@
 //! Cold construction/exec still uses the enclosing directory transaction;
 //! these leaf operations never hold a lock across construction or entry calls.
 
-use super::super::{MAX_TASK, TaskStart};
-use super::RESOURCES;
+use crate::multitask::task_table;
+use super::super::TaskStart;
+use super::resource;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 
 /// Lock-free mirror of `Resources::start`, one seqlock per slot.
@@ -16,24 +17,27 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 /// source of `TaskStackResources` acquisitions. Writers are serialized by that
 /// leaf with IRQs masked, so the sequence is never odd across a preemption and
 /// a reader's retry is bounded by one store pair. An empty slot is entry 0.
-struct StartMirror {
+pub(in crate::multitask) struct StartMirror {
     seq: AtomicU32,
     id: AtomicU64,
     entry: AtomicUsize,
 }
-static START_MIRROR: [StartMirror; MAX_TASK] = [const {
-    StartMirror {
-        seq: AtomicU32::new(0),
-        id: AtomicU64::new(0),
-        entry: AtomicUsize::new(0),
+
+impl StartMirror {
+    pub(in crate::multitask) const fn new() -> Self {
+        Self {
+            seq: AtomicU32::new(0),
+            id: AtomicU64::new(0),
+            entry: AtomicUsize::new(0),
+        }
     }
-}; MAX_TASK];
+}
 
 /// Publishes `start` into the mirror.
 ///
 /// The caller holds `slot`'s resource leaf, which is the sole writer exclusion.
 pub(super) fn mirror_store(slot: usize, start: Option<TaskStart>) {
-    let mirror = &START_MIRROR[slot];
+    let mirror = &task_table::get(slot).start_mirror;
     let sequence = mirror.seq.load(Ordering::Relaxed);
     mirror.seq.store(sequence.wrapping_add(1), Ordering::Relaxed);
     // ORDERING: the odd sequence is visible before either data word changes.
@@ -59,13 +63,13 @@ pub(in crate::multitask::scheduler) fn test_mismatched_start<R>(
     struct Restore(usize, TaskStart);
     impl Drop for Restore {
         fn drop(&mut self) {
-            RESOURCES[self.0].with(|resources| {
+            resource(self.0).with(|resources| {
                 resources.start = Some(self.1);
                 mirror_store(self.0, resources.start);
             });
         }
     }
-    let original = RESOURCES[slot].with(|resources| {
+    let original = resource(slot).with(|resources| {
         let original = resources.start.expect("negative probe needs original start");
         resources.start = Some(TaskStart { id, ..original });
         mirror_store(slot, resources.start);
@@ -77,7 +81,7 @@ pub(in crate::multitask::scheduler) fn test_mismatched_start<R>(
 }
 
 pub(in crate::multitask::scheduler) fn read(slot: usize) -> Option<TaskStart> {
-    let mirror = START_MIRROR.get(slot)?;
+    let mirror = &task_table::try_get(slot)?.start_mirror;
     loop {
         // ORDERING: Acquire pairs with the writer's closing Release store.
         let before = mirror.seq.load(Ordering::Acquire);
@@ -109,7 +113,7 @@ pub(super) fn publish_with_reservation(
     start: TaskStart,
     reservation: Option<super::admission::Reservation>,
 ) {
-    RESOURCES[slot].with(|resources| {
+    resource(slot).with(|resources| {
         assert_eq!(
             resources.reservation, reservation,
             "foreign slot descriptor installation"
@@ -165,7 +169,8 @@ fn qualified_running_start(
 }
 
 pub(in crate::multitask::scheduler) fn clear(slot: usize) {
-    RESOURCES[slot].with(|resources| {
+    let cell = resource(slot);
+    cell.with(|resources| {
         assert!(
             !crate::multitask::current_identity::exec_intent::busy(slot),
             "descriptor reset with cold exec intent custody"
@@ -180,7 +185,7 @@ pub(in crate::multitask::scheduler) fn clear(slot: usize) {
             "task descriptor reset with frame writer custody"
         );
         assert_eq!(
-            RESOURCES[slot].pins.load(Ordering::Acquire),
+            cell.pins.load(Ordering::Acquire),
             0,
             "task descriptor reset with execution/frame custody"
         );

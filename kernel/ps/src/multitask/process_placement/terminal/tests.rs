@@ -158,11 +158,11 @@ fn exact_lifecycle_stop_is_required_before_committed_vote_and_before_real_produc
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| turn.mark_stopped())).is_err()
         );
-        assert!(!cell(h).unwrap().with(|s| s.stopped.iter().any(|&b| b)));
+        assert!(!cell(h).unwrap().with(|s| s.rows.iter().any(|row| row.stopped)));
         let key = turn.credential();
         assert!(!key.admits_publication());
         assert!(std::panic::catch_unwind(|| publish_process_turn_fixture(SLOT, ID, key)).is_err());
-        assert!(!cell(h).unwrap().with(|s| s.stopped.iter().any(|&b| b)));
+        assert!(!cell(h).unwrap().with(|s| s.rows.iter().any(|row| row.stopped)));
         drop(turn);
     });
 }
@@ -321,7 +321,7 @@ fn committed_stop_cannot_admit_creation_or_mask_replacement_even_if_other_metada
         assert!(
             cell(h)
                 .unwrap()
-                .with(|s| s.terminal.is_none() && s.stopped.iter().any(|&b| b))
+                .with(|s| s.terminal.is_none() && s.rows.iter().any(|row| row.stopped))
         );
     });
 }

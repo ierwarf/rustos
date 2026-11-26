@@ -414,6 +414,70 @@ pub fn register() {
         snapshot: Some(heartbeat_snapshot),
     });
     hal_api::register_populate_anonymous_page_hook(Some(populate_current_anonymous_page_hook));
+    hal_api::register_kernel_stack_fault_hooks(
+        Some(try_handle_kernel_page_fault_hook),
+        Some(describe_kernel_stack_fault_hook),
+    );
+}
+
+fn try_handle_kernel_page_fault_hook(
+    error_code: Option<u64>,
+    cr2: u64,
+    rip: u64,
+    rsp: u64,
+) -> bool {
+    match mm_api::kernel_stack::handle_page_fault(error_code, cr2) {
+        mm_api::kernel_stack::KernelStackFaultOutcome::Resumed => true,
+        mm_api::kernel_stack::KernelStackFaultOutcome::NotKernelStack => false,
+        mm_api::kernel_stack::KernelStackFaultOutcome::GuardOrInvalid(diag) => {
+            nucleus_core::debug::record_milestone(
+                nucleus_core::debug::LogCategory::Memory,
+                "kernel-stack-guard-fault",
+                ((diag.task_id & 0xffff_ffff) << 32) | u64::from(diag.task_slot),
+                (u64::from(diag.vslot) << 16)
+                    | (u64::from(diag.committed_pages & 0x3fff) << 2)
+                    | (u64::from(diag.is_guard_page) << 1)
+                    | u64::from(diag.active),
+            );
+            panic!(
+                "Kernel stack guard/page fault: task_id={} task_slot={} vslot={} active={} guard_page={} cr2={:#x} rip={:#x} rsp={:#x} err={:?} guard=[{:#x}, {:#x}) stack=[{:#x}, {:#x}) committed_pages={}",
+                diag.task_id,
+                diag.task_slot,
+                diag.vslot,
+                diag.active,
+                diag.is_guard_page,
+                cr2,
+                rip,
+                rsp,
+                error_code,
+                diag.guard_base,
+                diag.usable_base,
+                diag.usable_base,
+                diag.usable_top,
+                diag.committed_pages,
+            );
+        }
+    }
+}
+
+fn describe_kernel_stack_fault_hook(cr2: u64, rsp: u64) {
+    for (label, addr) in [("cr2", cr2), ("rsp", rsp)] {
+        if let Some(diag) = mm_api::kernel_stack::describe_fault_address(addr) {
+            nucleus_core::debug::println_serialized(format_args!(
+                "!KERNEL-STACK-FAULT {label}={addr:#x} task_id={} task_slot={} vslot={} active={} guard_page={} guard=[{:#x}, {:#x}) stack=[{:#x}, {:#x}) committed_pages={}",
+                diag.task_id,
+                diag.task_slot,
+                diag.vslot,
+                diag.active,
+                diag.is_guard_page,
+                diag.guard_base,
+                diag.usable_base,
+                diag.usable_base,
+                diag.usable_top,
+                diag.committed_pages,
+            ));
+        }
+    }
 }
 
 #[cfg(test)]

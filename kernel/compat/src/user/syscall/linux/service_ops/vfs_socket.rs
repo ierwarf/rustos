@@ -228,7 +228,7 @@ fn release_remote_vfs_descriptor_ref(remote_id: u64) -> Result<bool, i64> {
 fn call_remote_vfs_open_and_check(
     request: &VfsIpcRequest,
     minted_id: u64,
-) -> LinuxResult<VfsIpcResponse> {
+) -> LinuxResult<alloc::boxed::Box<VfsIpcResponse>> {
     match call_vfs_checked(request) {
         Ok(response) => Ok(response),
         Err(errno) => {
@@ -277,7 +277,7 @@ pub fn syscall_linux_vfs_openat_str(
 }
 
 fn install_remote_vfs_response(
-    response: VfsIpcResponse,
+    response: alloc::boxed::Box<VfsIpcResponse>,
     expected_id: u64,
     flags: u64,
     allow_device_handoff: bool,
@@ -449,7 +449,12 @@ fn validate_fcntl_dupfd_min(arg: u64) -> LinuxResult<u64> {
     Ok(arg)
 }
 
-fn new_vfs_fcntl_request(fd: u64, remote_id: u64, cmd: u64, arg: u64) -> VfsIpcRequest {
+fn new_vfs_fcntl_request(
+    fd: u64,
+    remote_id: u64,
+    cmd: u64,
+    arg: u64,
+) -> alloc::boxed::Box<VfsIpcRequest> {
     let mut request = new_vfs_request(VFS_IPC_OP_FCNTL);
     request.fd = fd;
     request.remote_id = remote_id;
@@ -625,7 +630,9 @@ fn pinned_remote_vfs_fd(request: &VfsIpcRequest) -> u64 {
     }
 }
 
-pub fn call_pinned_remote_vfs_request(request: &VfsIpcRequest) -> Result<VfsIpcResponse, i64> {
+pub fn call_pinned_remote_vfs_request(
+    request: &VfsIpcRequest,
+) -> Result<alloc::boxed::Box<VfsIpcResponse>, i64> {
     if request.remote_id == 0 {
         return call_vfs_ipc_request(request);
     }
@@ -1783,7 +1790,7 @@ impl RegularFileReadTransport for VfsRemoteFileReadTransport {
         request.arg1 = want as u64;
         let (response_bytes, entries) = ipc_ops::call_service_endpoint_with_received_entries(
             IPC_SERVICE_VFSD,
-            as_bytes(&request),
+            as_bytes(request.as_ref()),
             1,
         )?;
         let Some(response) = VfsBulkReadResponse::from_bytes(&response_bytes) else {
@@ -2089,7 +2096,11 @@ fn vectored_io_at(
     Ok(total as u64)
 }
 
-fn new_netd_socket_request(op: u16, socket_token: u64, deadline_ns: u64) -> NetdIpcRequest {
+fn new_netd_socket_request(
+    op: u16,
+    socket_token: u64,
+    deadline_ns: u64,
+) -> alloc::boxed::Box<NetdIpcRequest> {
     let mut operation = [0_u8; 16];
     nucleus_core::util::random::Random::new().fill_bytes(&mut operation);
     let mut request = new_netd_request(op);
@@ -2736,7 +2747,7 @@ fn read_inotify_vfs_pinned(
     }
     validate_user_write_as(user_ptr, user_len)?;
     let chunk_len = user_len.min(VFS_IPC_PAYLOAD_CAPACITY);
-    let issue_read = || -> LinuxResult<VfsIpcResponse> {
+    let issue_read = || -> LinuxResult<alloc::boxed::Box<VfsIpcResponse>> {
         let mut request = new_vfs_request(VFS_IPC_OP_READ);
         request.fd = fd;
         request.remote_id = remote_id;

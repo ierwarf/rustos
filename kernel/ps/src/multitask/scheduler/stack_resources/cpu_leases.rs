@@ -2,7 +2,7 @@
 //! Only the IRQ-excluded owning CPU mutates its bank. Assembly commits by
 //! releasing a parked pin, without allocation or an owner lock.
 
-use super::{RESOURCES, StackPin};
+use super::{StackPin, resource, try_resource};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use nucleus_core::util::lockdep::MAX_TRACKED_CPUS;
 
@@ -123,7 +123,7 @@ impl<'scope, 'irq> CurrentAllocation<'scope, 'irq> {
         }
         let bank = CPU_LEASES.get(scope.cpu())?;
         let slot = bank.current.load(Ordering::Acquire).checked_sub(1)?;
-        let cell = RESOURCES.get(slot)?;
+        let cell = try_resource(slot)?;
         let (id, context) = cell.with(|r| {
             let id = r.start?.id;
             let context = r.context?;
@@ -156,7 +156,7 @@ impl<'scope, 'irq> CurrentAllocation<'scope, 'irq> {
 
 /// Independent physical pin qualifier; no CPU bank effects on refusal.
 pub(in crate::multitask::scheduler) fn pin_initial(slot: usize, task_id: u64) -> Option<StackPin> {
-    let cell = RESOURCES.get(slot)?;
+    let cell = try_resource(slot)?;
     let acquired = cell.with(|resources| {
         if resources.closing
             || resources.reservation.is_some()
@@ -182,7 +182,7 @@ pub(in crate::multitask) fn initialize(image: &super::super::bootstrap::InitialC
     let cpu = image.cpu();
     let slot = image.slot();
     let task_id = image.id();
-    RESOURCES[slot].with(|resources| {
+    resource(slot).with(|resources| {
         assert!(
             resources.context.is_some_and(|context| !context.user_mode
                 && context.user_abi.is_none()

@@ -58,14 +58,12 @@ const MAX_ENDPOINT_PENDING_MESSAGES: usize = 64;
 const MAX_ENDPOINT_TRANSFER_HANDLES: usize = 16;
 const MAX_ENDPOINT_WAITERS: usize = 64;
 const MAX_ENDPOINT_OBJECTS: usize = 512;
-const MAX_ENDPOINT_MESSAGE_OBJECTS: usize = 128;
+const MAX_ENDPOINT_MESSAGE_OBJECTS: usize = 512;
 const MAX_REPLY_OBJECTS: usize = MAX_ENDPOINT_MESSAGE_OBJECTS;
 const MAX_SHARED_REGION_OBJECTS: usize = 1024;
 const MAX_OWNED_ENDPOINT_OBJECTS: usize = MAX_ENDPOINT_OBJECTS - 64;
 const MAX_ENDPOINTS_PER_PROCESS: usize = 32;
 const MAX_ENDPOINTS_PER_TASK: usize = 8;
-/// Must cover the scheduler task table (`kernel-ps` `MAX_TASK`, asserted there).
-pub const MAX_ENDPOINT_WAKE_TASKS: usize = 256;
 const MAX_SHARED_REGION_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SHARED_REGION_TOTAL_BYTES: usize = 512 * 1024 * 1024;
 const MAX_SHARED_REGIONS_PER_PROCESS: usize = 64;
@@ -376,52 +374,31 @@ pub struct ReplySchedulingContextReturn {
     pub custody: ReplySchedulingContextCustody,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EndpointWakeSet {
-    callers: [u64; MAX_ENDPOINT_WAKE_TASKS],
-    caller_count: usize,
-    receivers: [u64; MAX_ENDPOINT_WAKE_TASKS],
-    receiver_count: usize,
-    scheduling_contexts: [Option<ReplySchedulingContextReturn>; MAX_ENDPOINT_WAKE_TASKS],
-    scheduling_context_count: usize,
-}
-
-impl Default for EndpointWakeSet {
-    fn default() -> Self {
-        Self {
-            callers: [0; MAX_ENDPOINT_WAKE_TASKS],
-            caller_count: 0,
-            receivers: [0; MAX_ENDPOINT_WAKE_TASKS],
-            receiver_count: 0,
-            scheduling_contexts: [None; MAX_ENDPOINT_WAKE_TASKS],
-            scheduling_context_count: 0,
-        }
-    }
+    callers: Vec<u64>,
+    receivers: Vec<u64>,
+    scheduling_contexts: Vec<ReplySchedulingContextReturn>,
 }
 
 impl EndpointWakeSet {
+    fn reserve_for_endpoint_teardown(&mut self, receiver_count: usize) {
+        self.receivers.reserve(receiver_count);
+        // Callers and reply scheduling contexts are bounded by live reply objects.
+        self.callers.reserve(MAX_REPLY_OBJECTS);
+        self.scheduling_contexts.reserve(MAX_REPLY_OBJECTS);
+    }
+
     fn push_caller(&mut self, task_id: u64) {
-        if self.callers[..self.caller_count].contains(&task_id) {
-            return;
+        if !self.callers.contains(&task_id) {
+            self.callers.push(task_id);
         }
-        assert!(
-            self.caller_count < self.callers.len(),
-            "endpoint caller wake set exceeds scheduler task capacity"
-        );
-        self.callers[self.caller_count] = task_id;
-        self.caller_count += 1;
     }
 
     fn push_receiver(&mut self, task_id: u64) {
-        if self.receivers[..self.receiver_count].contains(&task_id) {
-            return;
+        if !self.receivers.contains(&task_id) {
+            self.receivers.push(task_id);
         }
-        assert!(
-            self.receiver_count < self.receivers.len(),
-            "endpoint receiver wake set exceeds scheduler task capacity"
-        );
-        self.receivers[self.receiver_count] = task_id;
-        self.receiver_count += 1;
     }
 
     fn push_scheduling_context(
@@ -429,28 +406,20 @@ impl EndpointWakeSet {
         reply: KernelReplyHandle,
         custody: ReplySchedulingContextCustody,
     ) {
-        assert!(
-            self.scheduling_context_count < self.scheduling_contexts.len(),
-            "endpoint scheduling-context settlement exceeds message capacity"
-        );
-        self.scheduling_contexts[self.scheduling_context_count] =
-            Some(ReplySchedulingContextReturn { reply, custody });
-        self.scheduling_context_count += 1;
+        self.scheduling_contexts
+            .push(ReplySchedulingContextReturn { reply, custody });
     }
 
     pub fn callers(&self) -> &[u64] {
-        &self.callers[..self.caller_count]
+        &self.callers
     }
 
     pub fn receivers(&self) -> &[u64] {
-        &self.receivers[..self.receiver_count]
+        &self.receivers
     }
 
     pub fn scheduling_contexts(&self) -> impl Iterator<Item = ReplySchedulingContextReturn> + '_ {
-        self.scheduling_contexts[..self.scheduling_context_count]
-            .iter()
-            .copied()
-            .flatten()
+        self.scheduling_contexts.iter().copied()
     }
 }
 
@@ -1518,6 +1487,7 @@ fn enqueue_endpoint_call_with_handles_faultable(
 
     let receiver_to_wake = ENDPOINTS.with_mut(endpoint.raw(), |endpoint_object| {
         if endpoint_object.pending_len() >= MAX_ENDPOINT_PENDING_MESSAGES {
+            endpoint_object.queue_full_hits = endpoint_object.queue_full_hits.wrapping_add(1);
             return None;
         }
         let published = ENDPOINT_MESSAGES.with_mut(message_id, |message| {
@@ -1554,6 +1524,21 @@ fn enqueue_endpoint_call_with_handles_faultable(
     };
 
     Ok((KernelReplyHandle::from_raw(reply_id), receiver_to_wake))
+}
+
+/// Reports whether a live endpoint's queued request backlog has reached
+/// `MAX_ENDPOINT_PENDING_MESSAGES`, distinguishing transient queue saturation
+/// from quota/allocator exhaustion on synchronous IPC wait paths.
+pub fn endpoint_pending_queue_full(endpoint: KernelEndpointHandle) -> bool {
+    ENDPOINTS.with(endpoint.raw(), |endpoint_object| {
+        endpoint_object.pending_len() >= MAX_ENDPOINT_PENDING_MESSAGES
+    }) == Some(true)
+}
+
+/// Returns the monotonic count of queue-full rejections observed on a live
+/// endpoint, closing the TOCTOU window between `NoMemory` return and inspection.
+pub fn endpoint_queue_full_hits(endpoint: KernelEndpointHandle) -> Option<u64> {
+    ENDPOINTS.with(endpoint.raw(), |endpoint_object| endpoint_object.queue_full_hits)
 }
 
 #[cfg(test)]
@@ -3007,6 +2992,7 @@ fn fail_endpoints_owned_by(owner: EndpointOwner, err: IpcError) -> EndpointWakeS
     {
         ENDPOINT_QUOTAS.lock().release(owner);
         endpoint.refund_kmem();
+        wake_set.reserve_for_endpoint_teardown(endpoint.waiting_receivers.len());
         for receiver in endpoint.waiting_receivers {
             wake_set.push_receiver(receiver.task_id);
         }

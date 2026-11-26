@@ -49,11 +49,11 @@ fn candidate_has_foreign_execution_owner(
 }
 
 
-pub(super) const fn idle_slot_for_cpu(cpu: usize) -> Option<usize> {
+pub(super) fn idle_slot_for_cpu(cpu: usize) -> Option<usize> {
     if cpu >= nucleus_core::util::lockdep::MAX_TRACKED_CPUS {
         return None;
     }
-    if cpu == 0 { Some(ROOT_TASK_SLOT) } else { MAX_TASK.checked_sub(cpu) }
+    if cpu == 0 { Some(ROOT_TASK_SLOT) } else { Some(cpu) }
 }
 
 #[cfg(test)]
@@ -75,11 +75,10 @@ mod tests {
     #[test]
     fn secondary_idle_slot_layout_is_cpu_exact_and_outside_the_root() {
         let capacity = nucleus_core::util::lockdep::MAX_TRACKED_CPUS;
-        assert!(capacity <= super::MAX_TASK);
         assert_eq!(idle_slot_for_cpu(0), Some(super::ROOT_TASK_SLOT));
         for cpu in 1..capacity {
             let slot = idle_slot_for_cpu(cpu).expect("supported AP has a reserved idle slot");
-            assert_eq!(slot, super::MAX_TASK - cpu);
+            assert_eq!(slot, cpu);
             assert!(slot > super::ROOT_TASK_SLOT);
             for other_cpu in 1..cpu {
                 assert_ne!(slot, idle_slot_for_cpu(other_cpu).unwrap());

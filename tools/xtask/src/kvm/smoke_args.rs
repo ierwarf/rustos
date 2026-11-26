@@ -83,6 +83,9 @@ struct SmokeOptions {
     chrome_probe_persist: Option<String>,
     /// Arm `apps/faultprobe` (process-group fault semantics; `fault_probe.rs`).
     fault_probe: bool,
+    /// Opt-in negative proof: arm `kernel.stack.guard_fault=fail` and require a
+    /// hardware `#PF` guard-page diagnostic on IST2 without `#DF` escalation.
+    kernel_stack_guard_fault_probe: bool,
     /// Arm `apps/libmapprobe` and require its runtime proof markers.
     library_map_probe: bool,
     /// Arm the `apps/wayclick` app DMA-BUF probe (`app_dmabuf_probe.rs`).
@@ -173,6 +176,7 @@ where
         chrome_compat_probe: false,
         chrome_probe_persist: None,
         fault_probe: false,
+        kernel_stack_guard_fault_probe: false,
         library_map_probe: false,
         app_dmabuf_probe: false,
         mmap_cost_probe: false,
@@ -306,6 +310,7 @@ where
                 if options.chrome_probe_persist.replace(phase).is_some() { bail!("--chrome-probe-persist supplied more than once"); }
             },
             "--fault-probe" => options.fault_probe = true,
+            "--kernel-stack-guard-fault-probe" => options.kernel_stack_guard_fault_probe = true,
             "--library-map-probe" => options.library_map_probe = true,
             "--app-dmabuf-probe" => options.app_dmabuf_probe = true,
             "--mmap-cost-probe" => options.mmap_cost_probe = true,
@@ -666,6 +671,18 @@ where
     }
     if options.expect_block_flush_fault && !options.storage_only {
         bail!("--storage-dvm-expect-flush-fault requires --storage-dvm-only");
+    }
+    if options.kernel_stack_guard_fault_probe
+        && (options.gui_dvm_surfaces
+            || options.dvm_block_shmem
+            || options.dvm_network_shmem
+            || options.storage_only
+            || options.expect_block_flush_fault
+            || options.launch_desktop.is_some()
+            || options.hold_seconds.is_some()
+            || options.recovery_probe != RecoveryProbe::None)
+    {
+        bail!("--kernel-stack-guard-fault-probe is a dedicated negative fault proof and cannot combine with positive session/storage/UI modes");
     }
     if options.data_disk.is_some() {
         // A persistent data disk only exists in the writable GPT topology.

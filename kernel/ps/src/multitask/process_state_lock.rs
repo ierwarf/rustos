@@ -24,7 +24,13 @@ const UNLOCKED: usize = 0;
 const LOCKED: usize = 1;
 const PRE_BLOCK_SPINS: usize = 256;
 const IRQ_OFF_SPIN_LIMIT: usize = 100_000;
-const MAX_WAITERS: usize = super::MAX_SCHEDULER_TASKS;
+use crate::multitask::irq_pool::{SlabPool, SlabQueue};
+
+static WAIT_POOL: SlabPool<u64> = SlabPool::new();
+
+pub(in crate::multitask) fn preallocate_pool(min_free: usize) {
+    SlabQueue::<u64>::preallocate_for_pool(&WAIT_POOL, min_free);
+}
 
 pub(super) struct ProcessStateLock<T: ?Sized> {
     state: AtomicUsize,
@@ -53,55 +59,29 @@ impl Drop for WaitingGuard<'_> {
 }
 
 struct WaitQueue {
-    tasks: [u64; MAX_WAITERS],
-    len: usize,
+    tasks: SlabQueue<u64>,
 }
 
 impl WaitQueue {
     const fn new() -> Self {
         Self {
-            tasks: [0; MAX_WAITERS],
-            len: 0,
+            tasks: SlabQueue::new(),
         }
     }
 
     fn push_unique(&mut self, task_id: u64) -> bool {
-        if self.tasks[..self.len].contains(&task_id) {
+        if self.tasks.any(&WAIT_POOL, |&queued| queued == task_id) {
             return true;
         }
-        if self.len == self.tasks.len() {
-            return false;
-        }
-        self.tasks[self.len] = task_id;
-        self.len += 1;
-        true
+        self.tasks.push_back(&WAIT_POOL, task_id)
     }
 
     fn remove(&mut self, task_id: u64) {
-        let Some(index) = self.tasks[..self.len]
-            .iter()
-            .position(|queued| *queued == task_id)
-        else {
-            return;
-        };
-        for next in index + 1..self.len {
-            self.tasks[next - 1] = self.tasks[next];
-        }
-        self.len -= 1;
-        self.tasks[self.len] = 0;
+        self.tasks.retain(&WAIT_POOL, |&mut queued| queued != task_id);
     }
 
     fn pop_front(&mut self) -> Option<u64> {
-        if self.len == 0 {
-            return None;
-        }
-        let task_id = self.tasks[0];
-        for next in 1..self.len {
-            self.tasks[next - 1] = self.tasks[next];
-        }
-        self.len -= 1;
-        self.tasks[self.len] = 0;
-        Some(task_id)
+        self.tasks.pop_front(&WAIT_POOL)
     }
 }
 
@@ -484,7 +464,13 @@ mod tests {
     }
 
     #[test]
-    fn waiter_capacity_covers_scheduler_tasks() {
-        assert!(super::MAX_WAITERS >= super::super::MAX_SCHEDULER_TASKS);
+    fn waiter_capacity_grows_with_dynamic_tasks() {
+        let waiters = RawSpinMutex::new(WaitQueue::new());
+        for tid in 1..=128 {
+            assert!(waiters.lock().push_unique(tid));
+        }
+        for tid in 1..=128 {
+            assert_eq!(waiters.lock().pop_front(), Some(tid));
+        }
     }
 }

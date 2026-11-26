@@ -302,7 +302,8 @@ pub mod time {
 pub use crate::hooks::{
     AnonymousPopulateStatus, HeartbeatHooks, HeartbeatSnapshot, InputEventQueueDebugSnapshot,
     InterruptHooks, PopulateCurrentAnonymousPageHook, TaskHooks, UserFaultDisposition,
-    populate_current_anonymous_page, register_populate_anonymous_page_hook,
+    populate_current_anonymous_page, register_kernel_stack_fault_hooks,
+    register_populate_anonymous_page_hook,
 };
 pub use boot::{
     call_with_stack, enter_higher_half, init_acpi, init_clocksource, init_gdt, init_idt,

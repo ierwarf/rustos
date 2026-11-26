@@ -366,9 +366,9 @@ for field in ready_since_ticks blocked blocked_since_ticks; do
     fi
 done
 for witness in \
-    'static READY_SINCE_TICKS: [AtomicU64; MAX_TASK]' \
-    'static BLOCKED_SINCE_TICKS: [AtomicU64; MAX_TASK]'; do
-    rg -Fq "$witness" kernel/ps/src/multitask/scheduler/runqueue/wait.rs || {
+    'wait_ready_since: AtomicU64' \
+    'wait_blocked_since: AtomicU64'; do
+    rg -Fq "$witness" kernel/ps/src/multitask/task_table.rs || {
         echo "scheduler owner-generation-bound wait payload witness missing: $witness" >&2
         exit 1
     }
@@ -730,11 +730,11 @@ scheduler_profile_report=kernel/ps/src/multitask/scheduler/runtime_profile/repor
 rg -Fq 'const PROFILE_TOP_TASKS: usize = 4;' "$scheduler_profile" \
     && rg -Fq 'let window = owner::take(now, period)?;' "$scheduler_profile" \
     && rg -Fq 'observe_original_current(turn);' "$scheduler_profile" \
-    && rg -Fq 'window: owner::Counters' "$scheduler_profile_report" \
+    && rg -Fq 'window: &owner::Counters' "$scheduler_profile_report" \
     && rg -Fq 'report.top[index..].rotate_right(1);' "$scheduler_profile_report" \
-    && rg -Fq 'core::mem::replace(self, Self::new())' "$scheduler_profile_owner" \
-    && rg -Fq 'window.merge(cell.with(Counters::take));' "$scheduler_profile_owner" \
-    && rg -Fq 'self.phase_lifetime_ns = window.phase_lifetime_ns;' "$scheduler_profile_owner" \
+    && rg -Fq 'fn clear_window(&mut self)' "$scheduler_profile_owner" \
+    && rg -Fq 'cell.with(|row| row.drain_into(counters));' "$scheduler_profile_owner" \
+    && rg -Fq 'self.phase_lifetime_ns = phase_lifetime_ns;' "$scheduler_profile_owner" \
     && rg -Fq 'kernel-scheduler-entry' "$scheduler_profile" \
     && rg -Fq 'runtime_profile_is_windowed_ranked_and_destructive' "$scheduler_profile" || {
         echo "scheduler runtime attribution lost its bounded destructive snapshot" >&2

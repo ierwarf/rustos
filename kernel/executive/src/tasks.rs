@@ -13,6 +13,16 @@ pub(super) fn init_bootstrap_task(_id: u64) {
 pub(super) fn nucleus_housekeeping_task(_id: u64) {
     flow_debug(60, "housekeeping task entered");
     ps_api::register_housekeeping_task();
+    if nucleus_core::util::fault_injection::should_fail("kernel.stack.guard_fault")
+        && let Some(guard_probe_addr) = ps_api::snapshot::current_kernel_stack_guard_probe_address()
+    {
+        // SAFETY: opt-in fault-injection probe intentionally reads an unmapped
+        // guard page below the current kernel task's usable stack so KVM can
+        // verify hardware #PF -> IST2 -> GuardOrInvalid diagnostics.
+        unsafe {
+            core::ptr::read_volatile(guard_probe_addr as *const u64);
+        }
+    }
     loop {
         x86_64::instructions::interrupts::enable();
         // Clear before scanning: work published after this point re-arms it.
@@ -127,5 +137,12 @@ mod tests {
             1,
             "a productive worker yields instead of sleeping"
         );
+    }
+
+    #[test]
+    fn kernel_stack_guard_fault_probe_stays_off_unless_armed() {
+        assert!(!nucleus_core::util::fault_injection::should_fail(
+            "kernel.stack.guard_fault"
+        ));
     }
 }

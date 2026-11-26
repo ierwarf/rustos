@@ -53,7 +53,7 @@ The complete catalog IPC donation/class-recursion/charge family and native
 ledger/hint mirrors are physically deleted. Scalar reserve/bind/upsert ledger
 entry points are also deleted, not cfg-hidden: original participant/root loans
 are the only remaining insertion path. Historical IDs now drive actual owned
-edges, exact namespace/worker binding, bounded MAX_TASK capacity, terminal
+edges, exact namespace/worker binding, boot-sized slot capacity, terminal
 withdrawal and previous-reply restoration. The independent root-compressed
 source permits chains beyond four without recursive dispatch stack growth;
 original source revocation still independently refuses reserved nested binds.

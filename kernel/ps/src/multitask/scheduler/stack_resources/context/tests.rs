@@ -102,7 +102,7 @@ fn exec_patch_requires_exact_identity_and_preserves_non_exec_fields() {
     // ORDERING: acquire observes the retained physical loan before checking
     // that context replacement cannot make its backing appear drained.
     assert_eq!(
-        super::super::RESOURCES[slot].pins.load(Ordering::Acquire),
+        crate::multitask::scheduler::stack_resources::resource(slot).pins.load(Ordering::Acquire),
         1
     );
     assert!(!close_for_reclaim(slot));
@@ -166,7 +166,7 @@ fn frame_and_descriptor_custody_keep_process_backing_after_terminal_detach() {
     crate::multitask::process_table::detach_task(handle).unwrap();
     assert_eq!(crate::multitask::process_table::reap_exited_processes(), 0);
     assert!(std::panic::catch_unwind(|| clear(slot)).is_err());
-    assert!(super::super::RESOURCES[slot].with(|resources| resources.process_pin.is_some()));
+    assert!(crate::multitask::scheduler::stack_resources::resource(slot).with(|resources| resources.process_pin.is_some()));
     drop(frame);
     release(slot);
     assert_eq!(crate::multitask::process_table::reap_exited_processes(), 1);
@@ -262,9 +262,9 @@ fn current_scalar_snapshot_requires_joined_descriptor_and_current_custody() {
     );
     let replacement = metadata(slot, 96702);
     // Counterfactual mixed writer state must never become scalar authority.
-    super::super::RESOURCES[slot].with(|resources| resources.context = Some(replacement));
+    crate::multitask::scheduler::stack_resources::resource(slot).with(|resources| resources.context = Some(replacement));
     assert!(joined_current(slot, true).is_none());
-    super::super::RESOURCES[slot].with(|resources| resources.context = Some(context));
+    crate::multitask::scheduler::stack_resources::resource(slot).with(|resources| resources.context = Some(context));
     assert!(close_for_reclaim(slot));
     task_start::clear(slot);
     assert!(joined_current(slot, true).is_none());

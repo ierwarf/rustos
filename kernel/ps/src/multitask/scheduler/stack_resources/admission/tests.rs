@@ -31,6 +31,7 @@ fn cancellation_retains_slot_through_external_release_and_stale_generation_canno
         task_id: ID,
         generation,
         live: true,
+        dynamic_claim: false,
     };
     assert!(!stale.is_current(SLOT, ID));
     assert!(!stale.begin_cancel());
@@ -41,6 +42,7 @@ fn cancellation_retains_slot_through_external_release_and_stale_generation_canno
         task_id: ID + 1,
         generation: next.generation,
         live: true,
+        dynamic_claim: false,
     };
     assert!(!foreign.is_current(SLOT, ID + 1));
     assert!(!foreign.begin_cancel());
@@ -76,7 +78,7 @@ fn cancellation_ack_cannot_reopen_before_storage_release() {
     assert!(super::super::allocated(SLOT));
     assert!(reserve(SLOT, ID + 1).is_none());
     // Fixture-only recovery after proving production quarantine.
-    RESOURCES[SLOT].with(|resources| resources.reservation = None);
+    super::resource(SLOT).with(|resources| resources.reservation = None);
     drop(super::super::take_storage(SLOT));
 }
 #[test]
@@ -100,11 +102,11 @@ fn abandoned_reservation_poison_is_not_implicit_rollback_or_slot_reopening() {
     assert!(reserve(SLOT, ID + 1).is_none());
     assert!(catch_unwind(AssertUnwindSafe(|| super::super::take_storage(SLOT))).is_err());
     assert_eq!(
-        RESOURCES[SLOT].with(|resources| resources.reservation.unwrap().phase),
+        super::resource(SLOT).with(|resources| resources.reservation.unwrap().phase),
         Phase::Poisoned
     );
     // Fixture recovery only, never a production poison-reset permission.
-    RESOURCES[SLOT].with(|resources| resources.reservation = None);
+    super::resource(SLOT).with(|resources| resources.reservation = None);
 }
 fn publish(ticket: &Ticket) {
     ticket.install_storage(vec![0; scheduler::TASK_STACK_SIZE]);
@@ -171,6 +173,7 @@ fn context_and_descriptor_installation_require_the_exact_committing_ticket() {
         task_id: ID,
         generation: ticket.generation + 1,
         live: true,
+        dynamic_claim: false,
     };
     assert!(
         catch_unwind(AssertUnwindSafe(
@@ -197,7 +200,7 @@ fn context_and_descriptor_installation_require_the_exact_committing_ticket() {
     ticket.publish_start(start);
     drop(ticket);
     // Fixture recovery does not authorize production rollback of partial birth.
-    RESOURCES[SLOT].with(|resources| resources.reservation = None);
+    super::resource(SLOT).with(|resources| resources.reservation = None);
     cleanup_published_fixture();
 }
 #[test]
@@ -218,7 +221,7 @@ fn publication_ack_refuses_a_foreign_published_identity_even_after_blocked_admis
     assert!(catch_unwind(AssertUnwindSafe(|| ticket.finish_commit())).is_err());
     assert!(is_reserved(SLOT));
     assert!(reserve(SLOT, ID + 1).is_none());
-    RESOURCES[SLOT].with(|resources| resources.reservation = None);
+    super::resource(SLOT).with(|resources| resources.reservation = None);
     cleanup_published_fixture();
 }
 #[test]
@@ -261,10 +264,10 @@ fn partial_commit_cannot_ack_or_reopen_before_runqueue_publication() {
     assert!(is_reserved(SLOT));
     assert!(reserve(SLOT, ID + 1).is_none());
     assert_eq!(
-        RESOURCES[SLOT].with(|resources| resources.reservation.unwrap().phase),
+        super::resource(SLOT).with(|resources| resources.reservation.unwrap().phase),
         Phase::Poisoned
     );
-    RESOURCES[SLOT].with(|resources| resources.reservation = None);
+    super::resource(SLOT).with(|resources| resources.reservation = None);
 }
 
 #[test]
@@ -290,11 +293,11 @@ fn reservation_blocks_cold_binding_in_every_phase_even_when_descriptor_and_ident
         Phase::Canceling,
         Phase::Poisoned,
     ] {
-        RESOURCES[SLOT].with(|resources| resources.reservation.as_mut().unwrap().phase = phase);
+        super::resource(SLOT).with(|resources| resources.reservation.as_mut().unwrap().phase = phase);
         assert!(identity::cohort::Cohort::begin_activation(&[(SLOT, ID)]).is_none());
         assert_eq!(identity::execution::count(SLOT), 0);
     }
-    RESOURCES[SLOT]
+    super::resource(SLOT)
         .with(|resources| resources.reservation.as_mut().unwrap().phase = Phase::Committing);
     runqueue::admit_blocked(SLOT);
     ticket.finish_commit();
@@ -317,10 +320,10 @@ fn borrowed_binding_and_exec_intent_refuse_reservation_before_any_nonce_or_stora
         }),
     );
     let cohort = identity::cohort::Cohort::begin(&[(SLOT, ID)]).unwrap();
-    let before = RESOURCES[SLOT].with(|resources| resources.reservation_generation);
+    let before = super::resource(SLOT).with(|resources| resources.reservation_generation);
     assert!(reserve(SLOT, ID + 1).is_none());
     assert_eq!(
-        RESOURCES[SLOT].with(|resources| resources.reservation_generation),
+        super::resource(SLOT).with(|resources| resources.reservation_generation),
         before
     );
     drop(cohort);
@@ -339,7 +342,7 @@ fn borrowed_binding_and_exec_intent_refuse_reservation_before_any_nonce_or_stora
     let intent = identity::exec_intent::begin(SLOT, ID, stamp, false).unwrap();
     assert!(reserve(SLOT, ID + 1).is_none());
     assert_eq!(
-        RESOURCES[SLOT].with(|resources| resources.reservation_generation),
+        super::resource(SLOT).with(|resources| resources.reservation_generation),
         before
     );
     intent.prepare_cancel();
@@ -371,6 +374,7 @@ fn reserved_frame_bytes_require_exact_live_ticket_and_cannot_reenter_or_replay_g
         task_id: ID,
         generation: first.generation,
         live: true,
+        dynamic_claim: false,
     };
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
@@ -384,6 +388,7 @@ fn reserved_frame_bytes_require_exact_live_ticket_and_cannot_reenter_or_replay_g
         task_id: ID + 1,
         generation: first.generation,
         live: true,
+        dynamic_claim: false,
     };
     assert!(catch_unwind(AssertUnwindSafe(|| foreign.initialize_storage(|_| ()))).is_err());
     drop(foreign);
@@ -400,6 +405,7 @@ fn reserved_frame_bytes_require_exact_live_ticket_and_cannot_reenter_or_replay_g
         task_id: ID,
         generation,
         live: true,
+        dynamic_claim: false,
     };
     assert!(catch_unwind(AssertUnwindSafe(|| stale.initialize_storage(|_| ()))).is_err());
     drop(stale);
@@ -412,7 +418,7 @@ fn reserved_frame_bytes_require_exact_live_ticket_and_cannot_reenter_or_replay_g
     assert!(catch_unwind(AssertUnwindSafe(|| next.with_image(|_| ()))).is_err());
     drop(next);
     assert!(!super::super::close_for_reclaim(SLOT));
-    RESOURCES[SLOT].with(|resources| {
+    super::resource(SLOT).with(|resources| {
         assert_eq!(resources.reservation.unwrap().phase, Phase::Poisoned);
         resources.reservation = None; // isolated partial-constructor recovery only
     });

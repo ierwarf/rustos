@@ -50,9 +50,8 @@ pub(in crate::multitask) struct Turn {
     member: Member,
     nonce: u64,
     last: bool,
-    members: [Member; MAX],
-    stopped: [bool; MAX],
-    len: usize,
+    members: Vec<Member>,
+    stopped: Vec<bool>,
     effects: bool,
     live: bool,
     _process: process_table::pin_owner::ProcessObjectPin,
@@ -60,31 +59,34 @@ pub(in crate::multitask) struct Turn {
 impl Turn {
     pub(in crate::multitask) fn begin(handle: ProcessHandle, member: Member) -> Option<Self> {
         let process = process_table::pin_owner::pin(handle)?;
-        let (nonce, last, members, stopped, len) = cell(handle)?.with(|state| {
+        let (nonce, last, members, stopped) = cell(handle)?.with(|state| {
             if state.handle != Some(handle) || state.terminal.is_some() || state.joins != 0
-                || state.reclaiming.iter().any(Option::is_some)
+                || state.rows.iter().any(|row| row.reclaiming.is_some())
             {
                 return None;
             }
-            let index = state.members.iter().position(|&row| row == Some(member))?;
-            if state.stopped[index] {
+            let index = state.rows.iter().position(|row| row.member == member)?;
+            if state.rows[index].stopped {
                 return None;
             }
             let nonce = state.terminal_nonce.checked_add(1)?;
             let last = state
-                .members
+                .rows
                 .iter()
-                .zip(state.stopped)
-                .all(|(&row, stopped)| row.is_none() || row == Some(member) || stopped);
-            let mut members = [(0, 0); MAX];
-            let mut stopped = [false; MAX];
-            let mut len = 0;
-            for (row, stop) in state.members.iter().zip(state.stopped) {
-                if let Some(row) = row {
-                    members[len] = *row;
-                    stopped[len] = stop;
-                    len += 1;
-                }
+                .all(|row| row.member == member || row.stopped);
+            let (mut members, mut stopped) = state
+                .spare_terminal
+                .take()
+                .expect("terminal snapshot buffer must be reserved at join");
+            members.clear();
+            stopped.clear();
+            assert!(
+                members.capacity() >= state.rows.len() && stopped.capacity() >= state.rows.len(),
+                "terminal snapshot buffer smaller than live rows"
+            );
+            for row in &state.rows {
+                members.push(row.member);
+                stopped.push(row.stopped);
             }
             state.terminal_nonce = nonce;
             state.terminal = Some(Record {
@@ -93,7 +95,7 @@ impl Turn {
                 last,
                 phase: Phase::Reserved,
             });
-            Some((nonce, last, members, stopped, len))
+            Some((nonce, last, members, stopped))
         })?;
         Some(Self {
             handle,
@@ -102,7 +104,6 @@ impl Turn {
             last,
             members,
             stopped,
-            len,
             effects: false,
             live: true,
             _process: process,
@@ -137,10 +138,10 @@ impl Turn {
             cell(self.handle).unwrap().with(|s| self.exact(s)),
             "terminal desired census lost membership turn"
         );
-        self.members[..self.len]
+        self.members
             .iter()
-            .zip(&self.stopped[..self.len])
-            .all(|(&m, &stopped)| {
+            .zip(self.stopped.iter().copied())
+            .all(|(&m, stopped)| {
                 m == self.member || stopped || current_identity::terminal_retired_matches(m.0, m.1)
             })
     }
@@ -157,12 +158,12 @@ impl Turn {
                 "terminal election lost exact turn"
             );
             let index = state
-                .members
+                .rows
                 .iter()
-                .position(|&row| row == Some(self.member))
+                .position(|row| row.member == self.member)
                 .expect("terminal election lost member");
-            assert!(!state.stopped[index], "terminal member stopped twice");
-            state.stopped[index] = true;
+            assert!(!state.rows[index].stopped, "terminal member stopped twice");
+            state.rows[index].stopped = true;
             state.terminal.as_mut().unwrap().phase = Phase::Stopped;
         });
         self.effects = true;
@@ -176,19 +177,24 @@ impl Turn {
             assert!(self.exact(state) && state.terminal.unwrap().phase == Phase::Stopped,
                 "process donation withdrawal lost original terminal epoch");
         });
-        &self.members[..self.len]
+        &self.members
     }
     pub(in crate::multitask) fn finish(mut self, publication: Publication) {
         assert!(
             self.effects && publication.matches_turn(self.credential()),
             "terminal membership ACK lacks actual producer publication"
         );
+        let mut members = core::mem::take(&mut self.members);
+        let mut stopped = core::mem::take(&mut self.stopped);
         cell(self.handle).unwrap().with(|state| {
             assert!(
                 self.exact(state) && state.terminal.unwrap().phase == Phase::Stopped,
                 "terminal membership ACK lost exact turn"
             );
             state.terminal = None;
+            members.clear();
+            stopped.clear();
+            state.spare_terminal = Some((members, stopped));
             state.prune_terminal_detached();
             state.release_empty();
         });
@@ -200,6 +206,8 @@ impl Drop for Turn {
         if !self.live {
             return;
         }
+        let mut members = core::mem::take(&mut self.members);
+        let mut stopped = core::mem::take(&mut self.stopped);
         cell(self.handle).unwrap().with(|state| {
             assert!(
                 self.exact(state),
@@ -207,8 +215,16 @@ impl Drop for Turn {
             );
             if self.effects {
                 state.terminal.as_mut().unwrap().phase = Phase::Poisoned;
+                // Wait: poisoned state never permits another Turn, so return spare anyway
+                // rather than dropping/deallocating under Class55 or masked IRQs.
+                members.clear();
+                stopped.clear();
+                state.spare_terminal = Some((members, stopped));
             } else {
                 state.terminal = None;
+                members.clear();
+                stopped.clear();
+                state.spare_terminal = Some((members, stopped));
                 state.prune_terminal_detached();
                 state.release_empty();
             }

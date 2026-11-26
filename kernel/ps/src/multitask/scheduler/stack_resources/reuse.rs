@@ -39,7 +39,8 @@ pub(in crate::multitask::scheduler) fn begin_retired(slot: usize, id: u64) -> Op
 /// Never authorizes external completion or serves as a production reopen route.
 #[cfg(test)]
 pub(in crate::multitask::scheduler) fn recover_detached_fixture(slot: usize, id: u64) {
-    let key = RESOURCES[slot].with(|r| {
+    let cell = super::resource(slot);
+    let key = cell.with(|r| {
         let mut key = r.reclaim.expect("fixture lost poisoned resource seal");
         assert_eq!(key.id, Some(id));
         assert_eq!(key.phase, Phase::Poisoned);
@@ -53,7 +54,7 @@ pub(in crate::multitask::scheduler) fn recover_detached_fixture(slot: usize, id:
                 && r.reservation.is_none()
                 && !r.frame_writing
                 // ORDERING: Acquire pairs with lock-free reader release.
-                && RESOURCES[slot].readers.load(Ordering::Acquire) == 0
+                && cell.readers.load(Ordering::Acquire) == 0
         );
         key.phase = Phase::Detached;
         r.reclaim = Some(key);
@@ -68,7 +69,7 @@ pub(in crate::multitask::scheduler) fn recover_detached_fixture(slot: usize, id:
 }
 
 fn begin_qualified(slot: usize, id: Option<u64>, retired: bool) -> Option<Reuse> {
-    let cell = RESOURCES.get(slot)?;
+    let cell = super::try_resource(slot)?;
     let key = crate::multitask::current_identity::with_reclaim_binding_qualified(
         slot,
         id,
@@ -124,26 +125,32 @@ fn begin_qualified(slot: usize, id: Option<u64>, retired: bool) -> Option<Reuse>
     })
 }
 impl Reuse {
-    pub(in crate::multitask::scheduler) fn take_storage(&mut self) -> Option<Vec<u8>> {
+    pub(in crate::multitask::scheduler) fn take_stack(&mut self) -> Option<super::KernelStack> {
         assert!(
             self.live && self.key.phase == Phase::Closing,
             "reclaim detachment lost exact producer"
         );
-        let stack = super::take_storage_with_reservation(self.slot, None, Some(self.key));
-        RESOURCES[self.slot].with(|r| {
+        let stack = super::take_stack_with_reservation(self.slot, None, Some(self.key));
+        super::resource(self.slot).with(|r| {
             assert_eq!(r.reclaim, Some(self.key));
             self.key.phase = Phase::Detached;
             r.reclaim = Some(self.key);
         });
         stack
     }
+
+    #[cfg(test)]
+    pub(in crate::multitask::scheduler) fn take_storage(&mut self) -> Option<Vec<u8>> {
+        self.take_stack().map(super::KernelStack::into_host_vec)
+    }
     pub(in crate::multitask::scheduler) fn finish(mut self) {
         assert!(
             self.live && self.key.phase == Phase::Detached,
             "reclaim ACK preceded owned detachment"
         );
+        let cell = super::resource(self.slot);
         crate::multitask::current_identity::clear_reclaimed(self.slot, self.key.id, || {
-            RESOURCES[self.slot].with(|r| {
+            cell.with(|r| {
                 r.reclaim == Some(self.key)
                     && r.context.is_none()
                     && r.start.is_none()
@@ -154,12 +161,12 @@ impl Reuse {
                     && r.reservation.is_none()
                     && !r.frame_writing
                     // ORDERING: Acquire pairs with lock-free reader release.
-                    && RESOURCES[self.slot].readers.load(Ordering::Acquire) == 0
+                    && cell.readers.load(Ordering::Acquire) == 0
             })
         })
         .expect("reclaim identity clear lacks exact drain receipt");
         crate::multitask::current_identity::with_reclaim_binding(self.slot, None, || {
-            RESOURCES[self.slot].with(|r| {
+            cell.with(|r| {
                 assert_eq!(r.reclaim, Some(self.key), "foreign reclaim ACK");
                 assert!(
                     r.context.is_none()
@@ -171,34 +178,32 @@ impl Reuse {
                         && r.reservation.is_none()
                         && !r.frame_writing
                         // ORDERING: Acquire pairs with lock-free reader release.
-                        && RESOURCES[self.slot].readers.load(Ordering::Acquire) == 0
+                        && cell.readers.load(Ordering::Acquire) == 0
                         // ORDERING: acquire observes pin release under the exact resource/identity admission turn.
-                        && RESOURCES[self.slot].pins.load(Ordering::Acquire) == 0,
+                        && cell.pins.load(Ordering::Acquire) == 0,
                     "reclaim ACK preceded complete metadata drain"
                 );
                 r.reclaim = None;
                 r.closing = false;
                 // ORDERING: release reopen only after all exact metadata/binding reset effects.
-                RESOURCES[self.slot]
-                    .closing_notice
-                    .store(false, Ordering::Release);
+                cell.closing_notice.store(false, Ordering::Release);
             })
         })
         .expect("reclaim ACK preceded exact identity drain");
         self.live = false;
+        crate::multitask::task_table::release_dynamic_slot(self.slot);
     }
 }
 impl Drop for Reuse {
     fn drop(&mut self) {
         if self.live {
-            RESOURCES[self.slot].with(|r| {
+            let cell = super::resource(self.slot);
+            cell.with(|r| {
                 if r.reclaim == Some(self.key) {
                     r.reclaim.as_mut().unwrap().phase = Phase::Poisoned;
                     r.closing = true;
                     // ORDERING: poisoned occupancy retains close observation for abandoned effects.
-                    RESOURCES[self.slot]
-                        .closing_notice
-                        .store(true, Ordering::Release);
+                    cell.closing_notice.store(true, Ordering::Release);
                 }
             });
         }

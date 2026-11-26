@@ -62,6 +62,10 @@ options:
                        stays killable, fault vs exit_group reports one outcome);
                        fails fast on `fault-probe: FAIL`, requires
                        `fault-probe: all passed` (implies --gui-dvm-surfaces)
+  --kernel-stack-guard-fault-probe
+                       negative fault proof: require an IST2 hardware `#PF`
+                       guard-page diagnostic without `#DF` escalation; run as
+                       RUSTOS_FAULTS='kernel.stack.guard_fault=fail'
   --library-map-probe  arm the `libmapprobe` session program: two processes map a
                        pagerd-warmed library, share its physical frames, isolate a
                        private write, and release on exit; needs the storage-backed

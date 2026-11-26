@@ -35,11 +35,14 @@ use wayland_protocols::wp::viewporter::server::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::decoration::zv1::server::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
-use wayland_protocols::xdg::shell::server::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols::xdg::shell::server::{
+    xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+};
 use wayland_server::backend::{ClientData, ClientId, ObjectId};
 use wayland_server::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_data_device_manager, wl_keyboard, wl_output,
-    wl_pointer, wl_region, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_pointer, wl_region, wl_seat, wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface,
+    wl_surface,
 };
 use wayland_server::{
     Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
@@ -65,10 +68,12 @@ mod dmabuf;
 mod input;
 mod keyboard;
 mod output;
+mod popup;
 mod seat;
 mod shm;
 mod snapshot;
 mod state;
+mod subsurface;
 mod surface;
 #[cfg(test)]
 mod tests;
@@ -79,6 +84,8 @@ mod xdg;
 use self::buffer::*;
 use self::commit::CommitSlot;
 use self::data_device::{DataDeviceResource, DragState, Selection};
+use self::popup::PopupState;
+use self::subsurface::SubsurfaceState;
 use self::snapshot::{SnapshotLayout, SnapshotPixels, SnapshotService, SnapshotSpec};
 use self::viewport::{map_buffer_for_output, ViewportState};
 
@@ -113,6 +120,7 @@ const MAX_WAYLAND_BUFFERS_PER_CLIENT: usize = 256;
 const MAX_WAYLAND_REGIONS_PER_CLIENT: usize = 64;
 const MAX_WAYLAND_DECORATIONS_PER_CLIENT: usize = 16;
 const MAX_WAYLAND_VIEWPORTS_PER_CLIENT: usize = 64;
+const MAX_WAYLAND_POSITIONERS_PER_CLIENT: usize = 64;
 const MAX_WAYLAND_OUTSTANDING_CONFIGURES: usize = 16;
 const MAX_WAYLAND_TITLE_BYTES: usize = 256;
 /// Tracked output, pointer or keyboard objects one client may hold at once.
@@ -167,6 +175,7 @@ fn create_wayland_globals(handle: &DisplayHandle) {
         1,
         (),
     );
+    handle.create_global::<WaylandState, wl_subcompositor::WlSubcompositor, _>(1, ());
     handle.create_global::<WaylandState, wp_viewporter::WpViewporter, _>(1, ());
     handle.create_global::<WaylandState, wl_data_device_manager::WlDataDeviceManager, _>(3, ());
     // Version 3: format/modifier events only, no feedback objects. No
@@ -193,6 +202,8 @@ pub(crate) struct WaylandWindowSnapshot {
     pub(crate) minimized: bool,
     pub(crate) server_decoration: bool,
     pub(crate) drag_icon: bool,
+    /// `xdg_popup`: borderless, painted above its parent, never focused by click.
+    pub(crate) popup: bool,
     pub(crate) content_version: u64,
     pub(crate) damage: Rect,
     pub(crate) pixels: Arc<Vec<u32>>,
@@ -209,6 +220,7 @@ impl PartialEq for WaylandWindowSnapshot {
             && self.minimized == other.minimized
             && self.server_decoration == other.server_decoration
             && self.drag_icon == other.drag_icon
+            && self.popup == other.popup
             && self.content_version == other.content_version
             && self.width == other.width
             && self.height == other.height
@@ -951,14 +963,23 @@ impl WaylandState {
         let is_left = button == crate::sys::POINTER_BUTTON_LEFT;
 
         if pressed {
-            let Some(hit) = self.hit_test_pointer(self.pointer_x, self.pointer_y) else {
+            let hit = self.hit_test_pointer(self.pointer_x, self.pointer_y);
+            self.dismiss_popup_grabs_for_press(hit.as_ref().map(|hit| &hit.client_id));
+            let Some(hit) = hit else {
                 return false;
             };
-            self.bring_surface_to_front(hit.surface.id().clone());
-            self.set_keyboard_focus(Some(KeyboardFocus {
-                surface: hit.surface.clone(),
-                client_id: hit.client_id.clone(),
-            }));
+            // A popup keeps keyboard focus with its parent unless it grabbed it.
+            let hit_popup = hit
+                .surface
+                .data::<SurfaceData>()
+                .is_some_and(|data| Self::is_popup(&data.shared));
+            if !hit_popup {
+                self.bring_surface_to_front(hit.surface.id().clone());
+                self.set_keyboard_focus(Some(KeyboardFocus {
+                    surface: hit.surface.clone(),
+                    client_id: hit.client_id.clone(),
+                }));
+            }
             self.update_pointer_focus(Some(hit));
             if is_left {
                 self.pointer_button_down = true;
@@ -1078,6 +1099,7 @@ struct WaylandClientState {
     regions: Arc<AtomicUsize>,
     decorations: Arc<AtomicUsize>,
     viewports: Arc<AtomicUsize>,
+    positioners: Arc<AtomicUsize>,
     data_sources: Arc<AtomicUsize>,
     data_devices: Arc<AtomicUsize>,
     data_offers: Arc<AtomicUsize>,
@@ -1260,6 +1282,8 @@ struct WaylandSurfaceState {
     client_id: Option<ClientId>,
     xdg_surface: Option<xdg_surface::XdgSurface>,
     toplevel: Option<xdg_toplevel::XdgToplevel>,
+    popup: Option<PopupState>,
+    subsurface: Option<SubsurfaceState>,
     decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     decoration_requested_server: bool,
     decoration_ack_server: bool,
@@ -1288,6 +1312,9 @@ struct WaylandSurfaceState {
     stride_pixels: usize,
     content_version: u64,
     role_assigned: bool,
+    /// The surface was once a `wl_subsurface`. Destroying the role object keeps
+    /// the role, so the same surface may be made a subsurface again.
+    subsurface_role: bool,
     drag_icon_role: bool,
     /// `wl_pointer.set_cursor` surface: never a window, never focusable.
     cursor_role: bool,

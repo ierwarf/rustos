@@ -14,8 +14,7 @@ pub(in crate::multitask) struct ExecMembership {
     target: Member,
     key: current_identity::exec_intent::Credential,
     nonce: u64,
-    members: [Member; MAX],
-    len: usize,
+    members: Vec<Member>,
     staged: core::cell::Cell<bool>,
     live: bool,
     _process: process_table::pin_owner::ProcessObjectPin,
@@ -29,32 +28,45 @@ impl ExecMembership {
         }
         let handle = reservation.process_handle();
         let process = process_table::pin_owner::pin(handle)?;
-        let (nonce, members, len) = cell(handle)?.with(|state| {
-            if state.handle != Some(handle)
-                || state.phase != 0
-                || state.terminal.is_some()
-                || state.exit.is_some()
-                || state.joins != 0
-                || state.reclaiming.iter().any(Option::is_some)
-                || !state
-                    .members
-                    .iter()
-                    .zip(state.stopped)
-                    .any(|(&row, stopped)| row == Some(target) && !stopped)
-            {
-                return None;
+        let cell = cell(handle)?;
+        let mut cap = 8usize;
+        let (nonce, members) = loop {
+            let mut members_buf = Vec::with_capacity(cap);
+            let attempt = cell.with(|state| {
+                if state.handle != Some(handle)
+                    || state.phase != 0
+                    || state.terminal.is_some()
+                    || state.exit.is_some()
+                    || state.joins != 0
+                    || state.rows.iter().any(|row| row.reclaiming.is_some())
+                    || !state
+                        .rows
+                        .iter()
+                        .any(|row| row.member == target && !row.stopped)
+                {
+                    return Ok(None);
+                }
+                if state.rows.len() > members_buf.capacity() {
+                    return Err((state.rows.len(), members_buf));
+                }
+                let Some(nonce) = state.nonce.checked_add(1) else {
+                    return Ok(None);
+                };
+                for row in &state.rows {
+                    members_buf.push(row.member);
+                }
+                state.nonce = nonce;
+                state.phase = EXEC;
+                Ok(Some((nonce, members_buf)))
+            });
+            match attempt {
+                Ok(res) => break res?,
+                Err((need, buf)) => {
+                    drop(buf);
+                    cap = need.next_power_of_two();
+                }
             }
-            let nonce = state.nonce.checked_add(1)?;
-            let mut members = [(0, 0); MAX];
-            let mut len = 0;
-            for &member in state.members.iter().flatten() {
-                members[len] = member;
-                len += 1;
-            }
-            state.nonce = nonce;
-            state.phase = EXEC;
-            Some((nonce, members, len))
-        })?;
+        };
         let owner = Self {
             handle,
             reservation,
@@ -62,7 +74,6 @@ impl ExecMembership {
             key: intent.credential(),
             nonce,
             members,
-            len,
             staged: core::cell::Cell::new(false),
             live: true,
             _process: process,
@@ -73,7 +84,7 @@ impl ExecMembership {
         Some(owner)
     }
     pub(in crate::multitask) fn members(&self) -> &[Member] {
-        &self.members[..self.len]
+        &self.members
     }
     pub(in crate::multitask) fn assert_matches(&self, intent: &Intent) {
         assert!(
@@ -94,10 +105,9 @@ impl ExecMembership {
                 );
                 assert!(
                     state
-                        .members
+                        .rows
                         .iter()
-                        .flatten()
-                        .all(|member| self.members().contains(member)),
+                        .all(|row| self.members().contains(&row.member)),
                     "exec census admitted unpublished member"
                 );
             });
@@ -159,17 +169,22 @@ impl ExecMembership {
                     "exec census release lost exact epoch"
                 );
                 state.phase = if poison { 3 } else { 0 };
-                for index in 0..MAX {
-                    if state.exec_detached[index] {
+                let mut index = 0;
+                while index < state.rows.len() {
+                    if state.rows[index].exec_detached {
                         if state.exit.is_some() {
-                            state.exit_detached[index] = true;
-                            state.exec_detached[index] = false;
+                            state.rows[index].exit_detached = true;
+                            state.rows[index].exec_detached = false;
+                            index += 1;
                         } else if state.terminal.is_some() {
-                            state.terminal_detached[index] = true;
-                            state.exec_detached[index] = false;
+                            state.rows[index].terminal_detached = true;
+                            state.rows[index].exec_detached = false;
+                            index += 1;
                         } else {
                             state.remove_member(index);
                         }
+                    } else {
+                        index += 1;
                     }
                 }
                 state.release_empty();

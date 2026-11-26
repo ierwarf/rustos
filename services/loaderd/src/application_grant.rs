@@ -1,48 +1,30 @@
 //! Application Job grants: Ring3 policy that turns an application's *request*
-//! (`ApplicationRequest`) into a *grant* against the capacity observed at launch.
+//! (`ApplicationRequest`) into a *grant* against the capacity and memory
+//! observed at launch.
 //!
-//! - **Owner:** `loaderd`. The kernel owns capacity (`kernel-ps`
-//!   `multitask::task_capacity`, observed through `SYS_RUSTOS_TASK_CAPACITY`) and
-//!   enforces whatever Job limits Ring3 installs; it does not choose them.
-//! - **Boundary:** no number here guesses the machine. Every bound is either an
-//!   observed value (`Machine`) or a named ratio/unit cost of one. The ratios and
-//!   unit costs are policy and are listed below with their meaning.
-//! - **Observed inputs** (`Machine`): `total_slots`, `application_thread_budget`,
-//!   `process_thread_ceiling`, `root_process_ceiling`, `kernel_stack_bytes`,
-//!   `reservable_slots` (all from `SYS_RUSTOS_TASK_CAPACITY`) and physical
-//!   memory (`sysinfo`).
-//! - **Request semantics: exact.** A requested dimension is the amount the
-//!   application needs and is granted exactly or the launch is refused. A grant
-//!   is never rounded, clamped or partially honoured, and a request is never
-//!   "a minimum" that is silently raised: granting more than asked would take
-//!   budget from other applications for nothing. An absent dimension takes the
-//!   derived default below.
-//! - **Defaults** (undeclared dimension; `B` = `application_thread_budget`,
-//!   `P` = `process_budget`, `R` = physical pages):
-//!   threads `max(1, B / DEFAULT_THREAD_SHARE_DIVISOR)`, raised to one thread per
-//!   requested process; processes `max(1, P / DEFAULT_PROCESS_SHARE_DIVISOR)`,
-//!   never more than the granted threads; pages per process
-//!   `max(1, R / DEFAULT_PROCESS_MEMORY_DIVISOR)`.
-//! - **Process budget:** applications own the same fraction of the root Job's
-//!   process slots as of task slots: `P = root_process_ceiling *
-//!   application_thread_budget / total_slots`; boot services own the rest.
-//! - **Sum-of-grants invariant:** every thread a Job may run occupies one
-//!   scheduler task slot, so the threads granted to all *live* application Jobs
-//!   (including ones still being retired) never exceed `B`: a new grant is
-//!   admitted only if `committed_threads + threads <= B`, where `committed` is
-//!   summed by `ApplicationJobs` from the grants it still holds. Processes are
-//!   tracked against `P` the same way. Memory is different by design: page limits
-//!   are ceilings over one shared pool that the kernel frame ledger enforces
-//!   (over-commit is intended), so they are checked against physical memory
-//!   only, never summed.
-//! - **Refusal:** structural refusals (the request can never fit this kernel)
-//!   are `EINVAL`; transient ones (other applications hold the budget, or the
-//!   slots are not free right now) are `EAGAIN`. Every refusal names the limit
-//!   (`Limit::name`), the requested and the available amount.
-//! - **Per-Job byte budgets** (`budget_plan`) are documented unit costs times the
-//!   granted counts, so a budget can never disagree with the grant it serves.
-//! - **Forbidden:** a literal capacity, a clamp, a fake success for a request
-//!   that cannot be granted in full.
+//! - **Owner:** `loaderd`. The kernel owns mechanism, memory accounting, and
+//!   observed counts (`SYS_RUSTOS_TASK_CAPACITY`); `loaderd` derives policy
+//!   budgets from observed hardware memory and per-thread costs instead of
+//!   hardcoded kernel table ratios (`1/4`, `1/2`).
+//! - **Boundary:** no number here guesses the machine. Every bound comes from
+//!   observed kernel sizes/RAM (`Machine`) and documented policy ratios.
+//! - **Observed inputs** (`Machine`): `max_task_slots`, `max_process_slots`,
+//!   `live_tasks`, `live_processes`, `task_object_bytes`, `kernel_stack_bytes`,
+//!   `usable_ram_bytes`, `free_ram_bytes` (all from `SYS_RUSTOS_TASK_CAPACITY`)
+//!   and physical memory (`sysinfo`).
+//! - **Request semantics: exact.** A requested dimension is granted in full or
+//!   refused with the binding [`Limit`]. No rounding, clamping, or partial grant.
+//! - **Budgets:** total application thread kernel footprint (`task_object_bytes
+//!   + kernel_stack_bytes`) is bounded at half of physical RAM (`ram_bytes / 2`)
+//!   and capped below the directory ceiling; application process budget is a
+//!   quarter of that thread budget (`max_process_slots` upper-bounded); default
+//!   thread/process shares take `1/4` of those budgets and `1/2` of physical RAM
+//!   per process. No artificial 512-thread per-process ceiling exists.
+//! - **Sum-of-grants invariant:** committed threads across live application
+//!   Jobs never exceed `application_thread_budget()`, nor `reservable_slots()`
+//!   backed by free RAM and free directory slots.
+//! - **Forbidden:** a fixed thread cap, a clamp, a fake success for an
+//!   unsatisfiable request.
 
 use core::fmt;
 
@@ -107,54 +89,76 @@ pub const MEMORY_HIGH_DENOMINATOR: u64 = 5;
 /// What loaderd observes of the running machine at one launch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Machine {
-    pub total_slots: u64,
-    pub application_thread_budget: u64,
-    pub process_thread_ceiling: u64,
-    pub root_process_ceiling: u64,
+    pub max_task_slots: u64,
+    pub max_process_slots: u64,
+    pub live_tasks: u64,
+    pub live_processes: u64,
+    pub task_object_bytes: u64,
     pub kernel_stack_bytes: u64,
-    /// Slots a new thread could reserve at the instant of observation.
-    pub reservable_slots: u64,
+    pub usable_ram_bytes: u64,
+    pub free_ram_bytes: u64,
     /// Physical memory in pages (from `sysinfo`).
     pub ram_pages: u64,
 }
 
 impl Machine {
     /// Validates a `SYS_RUSTOS_TASK_CAPACITY` reply plus physical memory. A
-    /// reply that cannot describe a usable capacity is `EIO` (the kernel broke
-    /// its own contract), never silently "unlimited".
+    /// reply that cannot describe a usable capacity is `EIO`.
     pub fn observe(reply: &RustosTaskCapacityArgs, ram_bytes: u64) -> Result<Self, i32> {
         let usable = reply.abi_version == TASK_CAPACITY_ABI_VERSION
             && reply.flags == 0
-            && reply.total_slots != 0
-            && reply.application_thread_budget != 0
-            && reply.application_thread_budget <= reply.total_slots
-            && reply.process_thread_ceiling != 0
-            && reply.root_process_ceiling != 0
+            && reply.max_task_slots >= 2
+            && reply.max_process_slots >= 1
+            && reply.live_tasks <= reply.max_task_slots
+            && reply.live_processes <= reply.max_process_slots
+            && reply.task_object_bytes != 0
             && reply.kernel_stack_bytes != 0
-            && reply.reservable_slots <= reply.total_slots
+            && reply.usable_ram_bytes >= PAGE_BYTES
+            && reply.free_ram_bytes <= reply.usable_ram_bytes
             && ram_bytes >= PAGE_BYTES;
         if !usable {
             return Err(EIO);
         }
         Ok(Self {
-            total_slots: reply.total_slots,
-            application_thread_budget: reply.application_thread_budget,
-            process_thread_ceiling: reply.process_thread_ceiling,
-            root_process_ceiling: reply.root_process_ceiling,
+            max_task_slots: reply.max_task_slots,
+            max_process_slots: reply.max_process_slots,
+            live_tasks: reply.live_tasks,
+            live_processes: reply.live_processes,
+            task_object_bytes: reply.task_object_bytes,
             kernel_stack_bytes: reply.kernel_stack_bytes,
-            reservable_slots: reply.reservable_slots,
+            usable_ram_bytes: reply.usable_ram_bytes,
+            free_ram_bytes: reply.free_ram_bytes,
             ram_pages: ram_bytes / PAGE_BYTES,
         })
     }
 
-    /// Process slots applications may hold between them: the same fraction of
-    /// the root Job's process slots as of task slots.
+    /// Total kernel bytes charged/needed per thread (`Task` + kernel stack).
+    pub fn thread_footprint_bytes(&self) -> u64 {
+        self.kernel_stack_bytes
+            .saturating_add(self.task_object_bytes)
+            .max(1)
+    }
+
+    /// Application-wide thread budget derived by Ring3 policy from observed
+    /// physical RAM and per-thread kernel footprint, bounded below `max_task_slots`.
+    pub fn application_thread_budget(&self) -> u64 {
+        let ram_half = self.ram_pages.saturating_mul(PAGE_BYTES) / 2;
+        let by_memory = ram_half / self.thread_footprint_bytes();
+        by_memory.min(self.max_task_slots.saturating_sub(1)).max(1)
+    }
+
+    /// Thread capacity currently backed by both free directory slots and free RAM.
+    pub fn reservable_slots(&self) -> u64 {
+        let dir_free = self.max_task_slots.saturating_sub(self.live_tasks);
+        let mem_free = self.free_ram_bytes / self.thread_footprint_bytes();
+        dir_free.min(mem_free)
+    }
+
+    /// Process slots applications may hold between them.
     pub fn process_budget(&self) -> u64 {
-        let product = u128::from(self.root_process_ceiling)
-            * u128::from(self.application_thread_budget)
-            / u128::from(self.total_slots);
-        // `application_thread_budget <= total_slots`, so this fits.
-        (product as u64).max(1)
+        (self.application_thread_budget() / DEFAULT_THREAD_SHARE_DIVISOR)
+            .min(self.max_process_slots)
+            .max(1)
     }
 }
 
@@ -192,19 +196,16 @@ impl Grant {
 /// The limit that refused a request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Limit {
-    /// Processes above the root Job's process ceiling.
+    /// Processes above the process directory ceiling.
     RootProcessCeiling,
-    /// Processes above the application share of the root Job's slots, or what
+    /// Processes above the application process budget, or what
     /// other live applications leave of it.
     ApplicationProcessBudget,
     /// Threads above the application thread budget, or what other live
     /// applications leave of it.
     ApplicationThreadBudget,
-    /// Slots that are free right now, net of those promised to live Jobs.
+    /// Slots/memory available right now, net of those promised to live Jobs.
     ReservableTaskSlots,
-    /// More threads than the granted processes can hold at the per-process
-    /// structural ceiling.
-    ProcessThreadCeiling,
     /// More processes than threads: a process needs at least one thread.
     ProcessesExceedThreads,
     /// Pages per process above physical memory.
@@ -222,7 +223,6 @@ impl Limit {
             Self::ApplicationProcessBudget => "application-process-budget",
             Self::ApplicationThreadBudget => "application-thread-budget",
             Self::ReservableTaskSlots => "reservable-task-slots",
-            Self::ProcessThreadCeiling => "process-thread-ceiling",
             Self::ProcessesExceedThreads => "processes-exceed-threads",
             Self::PhysicalMemory => "physical-memory-pages",
             Self::JobMemoryOverflow => "job-memory-pages-overflow",
@@ -270,8 +270,9 @@ fn transient(limit: Limit, requested: u64, available: u64) -> Refusal {
 pub fn grant(
     machine: &Machine, committed: &Committed, request: &ApplicationRequest,
 ) -> Result<Grant, Refusal> {
+    let thread_budget = machine.application_thread_budget();
     let process_budget = machine.process_budget();
-    let default_threads = (machine.application_thread_budget / DEFAULT_THREAD_SHARE_DIVISOR).max(1);
+    let default_threads = (thread_budget / DEFAULT_THREAD_SHARE_DIVISOR).max(1);
     let default_processes = (process_budget / DEFAULT_PROCESS_SHARE_DIVISOR).max(1);
 
     let (processes, threads) = match (request.processes, request.threads) {
@@ -287,23 +288,19 @@ pub fn grant(
     };
 
     // Structural: the request can never be granted on this kernel.
-    if processes > machine.root_process_ceiling {
-        return Err(structural(Limit::RootProcessCeiling, processes, machine.root_process_ceiling));
+    if processes > machine.max_process_slots {
+        return Err(structural(Limit::RootProcessCeiling, processes, machine.max_process_slots));
     }
     if processes > process_budget {
         return Err(structural(Limit::ApplicationProcessBudget, processes, process_budget));
     }
-    if threads > machine.application_thread_budget {
+    if threads > thread_budget {
         return Err(structural(
-            Limit::ApplicationThreadBudget, threads, machine.application_thread_budget,
+            Limit::ApplicationThreadBudget, threads, thread_budget,
         ));
     }
     if processes > threads {
         return Err(structural(Limit::ProcessesExceedThreads, processes, threads));
-    }
-    let thread_capacity = processes.saturating_mul(machine.process_thread_ceiling);
-    if threads > thread_capacity {
-        return Err(structural(Limit::ProcessThreadCeiling, threads, thread_capacity));
     }
     if memory_pages_per_process > machine.ram_pages {
         return Err(structural(Limit::PhysicalMemory, memory_pages_per_process, machine.ram_pages));
@@ -317,16 +314,16 @@ pub fn grant(
         });
     }
 
-    // Transient: other applications hold the budget, or the slots are not free.
+    // Transient: other applications hold the budget, or slots/RAM are not free.
     let processes_left = process_budget.saturating_sub(committed.processes);
     if processes > processes_left {
         return Err(transient(Limit::ApplicationProcessBudget, processes, processes_left));
     }
-    let threads_left = machine.application_thread_budget.saturating_sub(committed.threads);
+    let threads_left = thread_budget.saturating_sub(committed.threads);
     if threads > threads_left {
         return Err(transient(Limit::ApplicationThreadBudget, threads, threads_left));
     }
-    let slots_left = machine.reservable_slots.saturating_sub(committed.unused_threads);
+    let slots_left = machine.reservable_slots().saturating_sub(committed.unused_threads);
     if threads > slots_left {
         return Err(transient(Limit::ReservableTaskSlots, threads, slots_left));
     }
@@ -393,26 +390,29 @@ mod tests {
     extern crate std;
     use super::*;
 
-    const MIB: u64 = 1024 * 1024;
-    const GIB_PAGES: u64 = 1024 * 1024 * 1024 / PAGE_BYTES;
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB_PAGES: u64 = 1024 * MIB / PAGE_BYTES;
 
-    /// Capacity the kernel derives for a table of `total` slots (the kernel's
-    /// formulas: a quarter held back, half per process, a quarter of the table
-    /// as root processes), with `used` slots live and `ram_gib` of memory.
-    fn machine(total: u64, used: u64, ram_gib: u64) -> Machine {
+    /// Builds an observed machine with 16 KiB `Task` + 240 KiB stack (256 KiB
+    /// footprint per thread for crisp power-of-2 budget math) unless overridden.
+    fn machine(max_slots: u64, used_tasks: u64, ram_mib: u64) -> Machine {
+        let usable = ram_mib * MIB;
+        let footprint = 256 * KIB;
+        let used_bytes = used_tasks.saturating_mul(footprint).min(usable);
         let reply = RustosTaskCapacityArgs {
             abi_version: TASK_CAPACITY_ABI_VERSION,
-            total_slots: total,
-            kernel_reserved_slots: total / 4,
-            application_thread_budget: total - total / 4,
-            live_tasks: used,
-            reservable_slots: total - used,
-            kernel_stack_bytes: 2 * MIB,
-            process_thread_ceiling: total / 2,
-            root_process_ceiling: total / 4,
+            max_task_slots: max_slots,
+            max_process_slots: max_slots,
+            live_tasks: used_tasks,
+            live_processes: 10.min(max_slots),
+            task_object_bytes: 16 * KIB,
+            kernel_stack_bytes: 240 * KIB,
+            usable_ram_bytes: usable,
+            free_ram_bytes: usable - used_bytes,
             ..RustosTaskCapacityArgs::default()
         };
-        Machine::observe(&reply, ram_gib * 1024 * MIB).unwrap()
+        Machine::observe(&reply, ram_mib * MIB).unwrap()
     }
 
     const NOTHING: Committed = Committed { processes: 0, threads: 0, unused_threads: 0 };
@@ -425,25 +425,28 @@ mod tests {
     fn observation_rejects_a_reply_that_cannot_describe_a_capacity() {
         let good = RustosTaskCapacityArgs {
             abi_version: TASK_CAPACITY_ABI_VERSION,
-            total_slots: 256,
-            application_thread_budget: 192,
-            reservable_slots: 100,
-            kernel_stack_bytes: 2 * MIB,
-            process_thread_ceiling: 128,
-            root_process_ceiling: 64,
+            max_task_slots: 16384,
+            max_process_slots: 16384,
+            live_tasks: 56,
+            live_processes: 12,
+            task_object_bytes: 16 * KIB,
+            kernel_stack_bytes: 256 * KIB,
+            usable_ram_bytes: 4096 * MIB,
+            free_ram_bytes: 3072 * MIB,
             ..RustosTaskCapacityArgs::default()
         };
         assert!(Machine::observe(&good, 4096 * MIB).is_ok());
         let bad = [
             RustosTaskCapacityArgs { abi_version: TASK_CAPACITY_ABI_VERSION + 1, ..good },
             RustosTaskCapacityArgs { flags: 1, ..good },
-            RustosTaskCapacityArgs { total_slots: 0, ..good },
-            RustosTaskCapacityArgs { application_thread_budget: 0, ..good },
-            RustosTaskCapacityArgs { application_thread_budget: 257, ..good },
-            RustosTaskCapacityArgs { process_thread_ceiling: 0, ..good },
-            RustosTaskCapacityArgs { root_process_ceiling: 0, ..good },
+            RustosTaskCapacityArgs { max_task_slots: 1, ..good },
+            RustosTaskCapacityArgs { max_process_slots: 0, ..good },
+            RustosTaskCapacityArgs { live_tasks: 16385, ..good },
+            RustosTaskCapacityArgs { live_processes: 16385, ..good },
+            RustosTaskCapacityArgs { task_object_bytes: 0, ..good },
             RustosTaskCapacityArgs { kernel_stack_bytes: 0, ..good },
-            RustosTaskCapacityArgs { reservable_slots: 257, ..good },
+            RustosTaskCapacityArgs { usable_ram_bytes: 0, ..good },
+            RustosTaskCapacityArgs { free_ram_bytes: 4096 * MIB + 1, ..good },
         ];
         for reply in bad {
             assert_eq!(Machine::observe(&reply, 4096 * MIB), Err(EIO), "{reply:?}");
@@ -452,112 +455,116 @@ mod tests {
     }
 
     #[test]
-    fn the_process_budget_is_the_application_fraction_of_the_root_job() {
-        assert_eq!(machine(256, 0, 4).process_budget(), 48);
-        assert_eq!(machine(1024, 0, 4).process_budget(), 192);
-        assert_eq!(machine(64, 0, 4).process_budget(), 12);
-        assert_eq!(machine(4, 0, 4).process_budget(), 1, "never zero");
+    fn ring3_policy_budgets_scale_with_memory_and_footprint_not_fixed_ratios() {
+        // 128 MiB RAM, 256 KiB/thread -> half RAM = 64 MiB -> 256 threads, 64 processes.
+        let small = machine(16384, 0, 128);
+        assert_eq!(small.application_thread_budget(), 256);
+        assert_eq!(small.process_budget(), 64);
+        // 512 MiB RAM -> 1024 threads, 256 processes.
+        let med = machine(16384, 0, 512);
+        assert_eq!(med.application_thread_budget(), 1024);
+        assert_eq!(med.process_budget(), 256);
+        // Bounded below max_task_slots - 1 when directory ceiling is tighter.
+        let tight_dir = machine(129, 0, 4096);
+        assert_eq!(tight_dir.application_thread_budget(), 128);
+        assert_eq!(tight_dir.process_budget(), 32);
     }
 
     #[test]
-    fn defaults_are_ratios_of_the_observed_capacity() {
-        // T = 256: budget 192, process budget 48, 4 GiB.
-        let narrow = grant(&machine(256, 0, 4), &NOTHING, &ApplicationRequest::NONE).unwrap();
+    fn defaults_derive_from_ring3_policy_and_observed_ram() {
+        // 128 MiB -> thread budget 256, process budget 64. Default is 1/4 each.
+        let narrow = grant(&machine(16384, 0, 128), &NOTHING, &ApplicationRequest::NONE).unwrap();
         assert_eq!(
             narrow,
-            Grant { processes: 12, threads: 48, memory_pages_per_process: 2 * GIB_PAGES }
+            Grant { processes: 16, threads: 64, memory_pages_per_process: 64 * MIB / PAGE_BYTES }
         );
-        // The same formulas on a wider table and more memory move together.
-        let wide = grant(&machine(1024, 0, 16), &NOTHING, &ApplicationRequest::NONE).unwrap();
+        // 512 MiB -> thread budget 1024, process budget 256.
+        let wide = grant(&machine(16384, 0, 512), &NOTHING, &ApplicationRequest::NONE).unwrap();
         assert_eq!(
             wide,
-            Grant { processes: 48, threads: 192, memory_pages_per_process: 8 * GIB_PAGES }
+            Grant { processes: 64, threads: 256, memory_pages_per_process: 256 * MIB / PAGE_BYTES }
         );
-        // A tiny table still yields a usable, non-zero default.
-        let tiny = grant(&machine(8, 0, 1), &NOTHING, &ApplicationRequest::NONE).unwrap();
+        // Tiny machine still yields usable non-zero defaults.
+        let tiny = grant(&machine(8, 0, 4), &NOTHING, &ApplicationRequest::NONE).unwrap();
         assert_eq!((tiny.processes, tiny.threads), (1, 1));
     }
 
     #[test]
-    fn a_request_is_granted_exactly_per_dimension() {
-        let m = machine(256, 0, 4);
+    fn a_request_is_granted_exactly_per_dimension_including_above_512_per_process() {
+        let m = machine(16384, 0, 512);
         let only_threads = grant(&m, &NOTHING, &req(0, 96, 0)).unwrap();
-        assert_eq!((only_threads.processes, only_threads.threads), (12, 96));
+        assert_eq!((only_threads.processes, only_threads.threads), (64, 96));
         let only_processes = grant(&m, &NOTHING, &req(30, 0, 0)).unwrap();
-        // The default thread share is raised to one thread per requested process.
-        assert_eq!((only_processes.processes, only_processes.threads), (30, 48));
-        let more_processes = grant(&m, &NOTHING, &req(48, 0, 0)).unwrap();
-        assert_eq!((more_processes.processes, more_processes.threads), (48, 48));
-        let exact = grant(&m, &NOTHING, &req(16, 128, 4096)).unwrap();
-        assert_eq!(exact, Grant { processes: 16, threads: 128, memory_pages_per_process: 4096 });
+        assert_eq!((only_processes.processes, only_processes.threads), (30, 256));
+        // A single process may exceed the retired 512 per-process ceiling.
+        let single_proc_many = grant(&m, &NOTHING, &req(1, 768, 4096)).unwrap();
+        assert_eq!(single_proc_many, Grant { processes: 1, threads: 768, memory_pages_per_process: 4096 });
         // Default processes never exceed granted threads.
         assert_eq!(grant(&m, &NOTHING, &req(0, 3, 0)).unwrap().processes, 3);
     }
 
     #[test]
     fn a_request_that_can_never_fit_names_the_structural_limit_as_einval() {
-        let m = machine(256, 0, 4);
+        // 128 MiB -> thread budget 256, process budget 64. Directory ceiling 48 < 64.
+        let m_dir = machine(48, 0, 128);
+        let error = grant(&m_dir, &NOTHING, &req(49, 49, 0)).unwrap_err();
+        assert_eq!((error.errno, error.limit, error.requested, error.available),
+            (EINVAL, Limit::RootProcessCeiling, 49, 48));
+
+        let m = machine(16384, 0, 128);
         let refused = |request| grant(&m, &NOTHING, &request).unwrap_err();
-        // Above the root Job's process ceiling (64).
-        let error = refused(req(65, 0, 0));
-        assert_eq!((error.errno, error.limit, error.requested, error.available),
-            (EINVAL, Limit::RootProcessCeiling, 65, 64));
-        // Within the root ceiling but above the application share (48).
-        let error = refused(req(49, 0, 0));
+        // Above the application process budget (64).
+        let error = refused(req(65, 65, 0));
         assert_eq!((error.errno, error.limit, error.available),
-            (EINVAL, Limit::ApplicationProcessBudget, 48));
-        // Above the application thread budget (192): never silently clamped.
-        let error = refused(req(0, 193, 0));
+            (EINVAL, Limit::ApplicationProcessBudget, 64));
+        // Above the application thread budget (256): never silently clamped.
+        let error = refused(req(0, 257, 0));
         assert_eq!((error.errno, error.limit, error.requested, error.available),
-            (EINVAL, Limit::ApplicationThreadBudget, 193, 192));
+            (EINVAL, Limit::ApplicationThreadBudget, 257, 256));
         // More processes than threads.
         let error = refused(req(10, 4, 0));
         assert_eq!((error.errno, error.limit), (EINVAL, Limit::ProcessesExceedThreads));
-        // More threads than the processes can hold (one process: 128).
-        let error = refused(req(1, 129, 0));
-        assert_eq!((error.errno, error.limit, error.available),
-            (EINVAL, Limit::ProcessThreadCeiling, 128));
-        assert!(grant(&m, &NOTHING, &req(1, 128, 0)).is_ok(), "the ceiling itself is grantable");
         // Pages per process above physical memory.
-        let error = refused(req(0, 0, 4 * GIB_PAGES + 1));
+        let pages_128m = 128 * MIB / PAGE_BYTES;
+        let error = refused(req(0, 0, pages_128m + 1));
         assert_eq!((error.errno, error.limit), (EINVAL, Limit::PhysicalMemory));
-        assert!(grant(&m, &NOTHING, &req(0, 0, 4 * GIB_PAGES)).is_ok());
+        assert!(grant(&m, &NOTHING, &req(0, 0, pages_128m)).is_ok());
     }
 
     #[test]
     fn a_structurally_impossible_request_is_einval_even_when_the_budget_is_taken() {
-        let m = machine(256, 0, 4);
-        let busy = Committed { processes: 48, threads: 192, unused_threads: 192 };
-        assert_eq!(grant(&m, &busy, &req(0, 193, 0)).unwrap_err().errno, EINVAL);
+        let m = machine(16384, 0, 128);
+        let busy = Committed { processes: 64, threads: 256, unused_threads: 256 };
+        assert_eq!(grant(&m, &busy, &req(0, 257, 0)).unwrap_err().errno, EINVAL);
     }
 
     #[test]
     fn a_request_other_applications_leave_no_room_for_is_eagain_naming_the_binding_limit() {
-        let m = machine(256, 0, 4);
-        let held = Committed { processes: 10, threads: 150, unused_threads: 10 };
-        // 192 - 150 = 42 threads left.
-        let error = grant(&m, &held, &req(0, 43, 0)).unwrap_err();
+        let m = machine(16384, 0, 128);
+        let held = Committed { processes: 10, threads: 200, unused_threads: 10 };
+        // 256 - 200 = 56 threads left.
+        let error = grant(&m, &held, &req(0, 57, 0)).unwrap_err();
         assert_eq!((error.errno, error.limit, error.requested, error.available),
-            (EAGAIN, Limit::ApplicationThreadBudget, 43, 42));
-        assert!(grant(&m, &held, &req(0, 42, 0)).is_ok(), "exactly what is left is grantable");
-        // 48 - 10 = 38 processes left.
-        let error = grant(&m, &held, &req(39, 40, 0)).unwrap_err();
+            (EAGAIN, Limit::ApplicationThreadBudget, 57, 56));
+        assert!(grant(&m, &held, &req(0, 56, 0)).is_ok(), "exactly what is left is grantable");
+        // 64 - 10 = 54 processes left.
+        let error = grant(&m, &held, &req(55, 55, 0)).unwrap_err();
         assert_eq!((error.errno, error.limit, error.available),
-            (EAGAIN, Limit::ApplicationProcessBudget, 38));
-        assert!(grant(&m, &held, &req(38, 40, 0)).is_ok());
-        // The default is judged the same way: it is refused, never shrunk.
-        let nearly = Committed { processes: 0, threads: 180, unused_threads: 0 };
+            (EAGAIN, Limit::ApplicationProcessBudget, 54));
+        assert!(grant(&m, &held, &req(54, 54, 0)).is_ok());
+        // The default (64 threads) is refused, never shrunk.
+        let nearly = Committed { processes: 0, threads: 240, unused_threads: 0 };
         let error = grant(&m, &nearly, &ApplicationRequest::NONE).unwrap_err();
         assert_eq!((error.errno, error.limit, error.requested, error.available),
-            (EAGAIN, Limit::ApplicationThreadBudget, 48, 12));
+            (EAGAIN, Limit::ApplicationThreadBudget, 64, 16));
     }
 
     #[test]
-    fn slots_that_are_not_free_now_refuse_even_inside_the_budget() {
-        // Boot services hold more slots than the kernel headroom: only 40 free,
+    fn slots_or_memory_not_free_now_refuse_even_inside_the_budget() {
+        // 128 MiB = 512 footprints total, 472 used => only 40 free footprints now,
         // and live Jobs have already been promised 25 of them.
-        let m = machine(256, 216, 4);
-        assert_eq!(m.reservable_slots, 40);
+        let m = machine(16384, 472, 128);
+        assert_eq!(m.reservable_slots(), 40);
         let promised = Committed { processes: 4, threads: 40, unused_threads: 25 };
         let error = grant(&m, &promised, &req(0, 16, 0)).unwrap_err();
         assert_eq!((error.errno, error.limit, error.requested, error.available),
@@ -567,46 +574,47 @@ mod tests {
 
     #[test]
     fn the_sum_of_grants_never_exceeds_the_application_thread_budget() {
-        for total in [64, 256, 1024] {
-            let m = machine(total, 0, 4);
+        for ram_mib in [64, 128, 512] {
+            let m = machine(16384, 0, ram_mib);
+            let budget = m.application_thread_budget();
             let mut committed = NOTHING;
             let mut admitted = 0;
-            // A deterministic mix of defaults and explicit requests until the
-            // budget is exhausted; every admitted grant is added to `committed`
-            // exactly as ApplicationJobs does.
             for step in 0..4096_u64 {
                 let request = match step % 5 {
                     0 => ApplicationRequest::NONE,
-                    1 => req(0, 1 + (step * 7) % total, 0),
+                    1 => req(0, 1 + (step * 7) % budget, 0),
                     2 => req(1 + step % 8, 0, 0),
-                    3 => req(2, 1 + (step * 13) % (total / 2), 0),
+                    3 => req(2, 1 + (step * 13) % (budget / 2).max(1), 0),
                     _ => req(0, 1, 0),
                 };
                 if let Ok(granted) = grant(&m, &committed, &request) {
                     committed.threads += granted.threads;
                     committed.processes += granted.processes;
                     admitted += 1;
-                    assert!(committed.threads <= m.application_thread_budget, "total={total}");
-                    assert!(committed.processes <= m.process_budget(), "total={total}");
+                    assert!(committed.threads <= budget, "ram_mib={ram_mib}");
+                    assert!(committed.processes <= m.process_budget(), "ram_mib={ram_mib}");
                 }
             }
-            assert!(admitted > 1, "total={total}: the mix admits several Jobs");
-            // Whatever is left is exactly what a further request may still take.
-            let left = m.application_thread_budget - committed.threads;
+            assert!(admitted > 1, "ram_mib={ram_mib}: the mix admits several Jobs");
+            let left = budget - committed.threads;
             assert!(grant(&m, &committed, &req(0, left + 1, 0)).is_err());
         }
     }
 
     #[test]
     fn a_job_memory_total_that_overflows_is_refused_not_wrapped() {
-        let m = Machine { ram_pages: u64::MAX, ..machine(256, 0, 4) };
+        let m = Machine { ram_pages: u64::MAX, usable_ram_bytes: u64::MAX, free_ram_bytes: u64::MAX, ..machine(16384, 0, 128) };
         let error = grant(&m, &NOTHING, &req(48, 48, u64::MAX / 2)).unwrap_err();
         assert_eq!((error.errno, error.limit), (EOVERFLOW, Limit::JobMemoryOverflow));
     }
 
     #[test]
     fn budgets_are_unit_costs_times_the_granted_counts() {
-        let m = machine(256, 0, 4);
+        let m = Machine {
+            task_object_bytes: 16 * KIB,
+            kernel_stack_bytes: 2 * MIB,
+            ..machine(16384, 0, 4096)
+        };
         let granted = grant(&m, &NOTHING, &req(16, 128, 0)).unwrap();
         let plan = budget_plan(granted.processes, granted.threads, granted.job_memory_pages(), &m);
         let class = |id: u32| plan.classes.iter().find(|(c, _)| *c == id).unwrap().1;
@@ -616,7 +624,6 @@ mod tests {
         assert_eq!(class(JOB_KMEM_CLASS_VMA), 16 * VMA_BYTES_PER_PROCESS);
         assert_eq!(class(JOB_KMEM_CLASS_IPC_MESSAGE), 16 * IPC_MESSAGE_BYTES_PER_PROCESS);
         assert_eq!(class(JOB_KMEM_CLASS_DEVICE_BUFFER), 2 * APP_BUFFER_CLIENT_QUOTA_BYTES);
-        // 4 GiB of physical pages: dense frames x 4 KiB x sparsity.
         assert_eq!(
             class(JOB_KMEM_CLASS_PAGE_TABLE),
             (4 * GIB_PAGES / PAGES_PER_TABLE_FRAME) * PAGE_TABLE_FRAME_BYTES * PAGE_TABLE_SPARSITY_FACTOR
@@ -628,20 +635,18 @@ mod tests {
 
     #[test]
     fn budgets_follow_the_grant_and_the_observed_stack_not_a_fixed_table() {
-        let m = machine(256, 0, 4);
+        let m = machine(16384, 0, 4096);
         let small = budget_plan(2, 4, 2048, &m);
         let large = budget_plan(8, 16, 2048, &m);
         let class = |plan: &BudgetPlan, id: u32| plan.classes.iter().find(|(c, _)| *c == id).unwrap().1;
         assert_eq!(class(&large, JOB_KMEM_CLASS_HANDLE_TABLE), 4 * class(&small, JOB_KMEM_CLASS_HANDLE_TABLE));
         assert_eq!(class(&large, JOB_KMEM_CLASS_THREAD), 4 * class(&small, JOB_KMEM_CLASS_THREAD));
         // A different kernel stack size moves only the thread class.
-        let fat = Machine { kernel_stack_bytes: 4 * MIB, ..m };
+        let fat = Machine { kernel_stack_bytes: 512 * KIB, ..m };
         let plan = budget_plan(2, 4, 2048, &fat);
-        assert_eq!(class(&plan, JOB_KMEM_CLASS_THREAD), 4 * 4 * MIB);
+        assert_eq!(class(&plan, JOB_KMEM_CLASS_THREAD), 4 * 512 * KIB);
         assert_eq!(class(&plan, JOB_KMEM_CLASS_HANDLE_TABLE), class(&small, JOB_KMEM_CLASS_HANDLE_TABLE));
-        // A Job whose limit is tighter than physical memory needs fewer table frames.
         assert!(class(&small, JOB_KMEM_CLASS_PAGE_TABLE) < class(&budget_plan(2, 4, 4 * GIB_PAGES, &m), JOB_KMEM_CLASS_PAGE_TABLE));
-        // Never a zero budget, whatever the counts.
         for (_, bytes) in budget_plan(1, 1, 1, &m).classes {
             assert!(bytes > 0);
         }
@@ -649,8 +654,8 @@ mod tests {
 
     #[test]
     fn refusals_render_the_limit_the_requested_and_the_available_amount() {
-        let error = grant(&machine(256, 0, 4), &NOTHING, &req(0, 193, 0)).unwrap_err();
+        let error = grant(&machine(16384, 0, 128), &NOTHING, &req(0, 257, 0)).unwrap_err();
         let text = std::format!("{error}");
-        assert_eq!(text, "limit=application-thread-budget requested=193 available=192 errno=22");
+        assert_eq!(text, "limit=application-thread-budget requested=257 available=256 errno=22");
     }
 }

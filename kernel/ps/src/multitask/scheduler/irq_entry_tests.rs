@@ -336,7 +336,7 @@ fn actual_irq_diagnostic_compares_original_physical_bank_and_uid_permit() {
             let (first, count) = run_authority::take_window().unwrap();
             assert_eq!(count, 1);
             assert_eq!(first & 0xffff, Mismatch::CurrentPermitMissing as u64);
-            assert_eq!((first >> 32) & 0xffff, slot as u64);
+            assert_eq!((first >> 16) & 0xffff_ffff, slot as u64);
         }
         drop(entry);
     });

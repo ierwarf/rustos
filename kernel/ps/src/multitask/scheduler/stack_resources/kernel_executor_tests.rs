@@ -199,17 +199,17 @@ fn kernel_executor_refuses_user_metadata_user_context_foreign_uid_and_unpublishe
         identity::publish_metadata(SLOT, Some(abi));
         assert!(capture(ID).is_none());
         identity::publish_metadata(SLOT, Some(metadata(ID)));
-        RESOURCES[SLOT].with(|r| {
+        resource(SLOT).with(|r| {
             r.context.as_mut().unwrap().user_abi = Some(crate::user::abi::UserAbi::Linux)
         });
         assert!(capture(ID).is_none());
-        RESOURCES[SLOT].with(|r| r.context.as_mut().unwrap().user_abi = None);
-        RESOURCES[SLOT].with(|r| r.context.as_mut().unwrap().user_mode = true);
+        resource(SLOT).with(|r| r.context.as_mut().unwrap().user_abi = None);
+        resource(SLOT).with(|r| r.context.as_mut().unwrap().user_mode = true);
         assert!(capture(ID).is_none());
-        RESOURCES[SLOT].with(|r| r.context.as_mut().unwrap().user_mode = false);
-        let context = RESOURCES[SLOT].with(|r| r.context.take());
+        resource(SLOT).with(|r| r.context.as_mut().unwrap().user_mode = false);
+        let context = resource(SLOT).with(|r| r.context.take());
         assert!(capture(ID).is_none());
-        RESOURCES[SLOT].with(|r| r.context = context);
+        resource(SLOT).with(|r| r.context = context);
         assert_eq!(identity::execution::count(SLOT), 0);
         drop(capture(ID).unwrap());
     });
@@ -221,7 +221,7 @@ fn kernel_executor_refuses_constructor_writer_and_closing_without_spending_a_bac
             if busy == 0 {
                 admission::set_phase_for_test(SLOT, ID, Some(admission::Phase::Committing));
             } else {
-                RESOURCES[SLOT].with(|r| {
+                resource(SLOT).with(|r| {
                     if busy == 1 {
                         r.frame_writing = true;
                     } else {
@@ -231,7 +231,7 @@ fn kernel_executor_refuses_constructor_writer_and_closing_without_spending_a_bac
             }
             assert!(capture(ID).is_none());
             assert_eq!(identity::execution::count(SLOT), 0);
-            RESOURCES[SLOT].with(|r| {
+            resource(SLOT).with(|r| {
                 r.reservation = None;
                 r.frame_writing = false;
                 r.closing = false;

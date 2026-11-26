@@ -14,12 +14,11 @@
 //! - **Evidence:** `cross-cpu-task-retirement`, `endpoint-lifecycle`, and
 //!   `process-address-space-lifecycle`.
 
-use alloc::vec::Vec;
-
 use crate::debug;
 use crate::multitask::process_table::{self, ProcessHandle};
 
 use super::TaskRetireReason;
+use super::stack_resources::KernelStack;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::multitask) struct RetirementSideEffect {
@@ -135,7 +134,7 @@ fn wake_tasks(task_ids: &[u64], wake_task: &mut impl FnMut(u64)) {
 /// producer custody. Destruction occurs outside raw owners and IRQ exclusion.
 pub(in crate::multitask) struct RetiredSlotReclaim {
     process_handle: Option<ProcessHandle>,
-    stack: Option<Vec<u8>>,
+    stack: Option<KernelStack>,
     task_id: u64,
     slot: usize,
     user_mode: bool,
@@ -148,7 +147,7 @@ impl RetiredSlotReclaim {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         process_handle: Option<ProcessHandle>,
-        stack: Option<Vec<u8>>,
+        stack: Option<KernelStack>,
         task_id: u64,
         slot: usize,
         user_mode: bool,

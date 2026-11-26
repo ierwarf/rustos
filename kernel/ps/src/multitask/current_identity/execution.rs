@@ -5,7 +5,17 @@ use super::*;
 use crate::multitask::scheduler;
 use core::sync::atomic::AtomicU32;
 pub(in crate::multitask) mod kernel_executor;
-pub(super) static REFS: [AtomicU32; MAX_SCHEDULER_TASKS] = [const { AtomicU32::new(0) }; MAX_SCHEDULER_TASKS];
+
+#[inline]
+fn try_ref_cell(slot: usize) -> Option<&'static AtomicU32> {
+    crate::multitask::task_table::try_get(slot).map(|task| &task.exec_refs)
+}
+
+#[inline]
+fn ref_cell(slot: usize) -> &'static AtomicU32 {
+    &crate::multitask::task_table::get(slot).exec_refs
+}
+
 #[derive(Debug)]
 pub(in crate::multitask) struct ExecutionPermit {
     slot: usize,
@@ -26,7 +36,8 @@ impl ExecutionPermit {
 }
 impl Drop for ExecutionPermit {
     fn drop(&mut self) {
-        let previous = REFS[self.slot]
+        // ORDERING: AcqRel release pairs with zero-ref teardown checks.
+        let previous = ref_cell(self.slot)
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 count.checked_sub(1)
             })
@@ -40,7 +51,7 @@ pub(in crate::multitask) fn count(slot: usize) -> u32 {
     // A resident Blocked task parks its permit in the scheduler's cell. That
     // unit is not execution: observers asking whether the slot is quiescent
     // must not count it, and anyone about to mutate evicts it first.
-    REFS.get(slot).map_or(u32::MAX, |cell| {
+    try_ref_cell(slot).map_or(u32::MAX, |cell| {
         cell.load(Ordering::Acquire)
             .saturating_sub(scheduler::resident_permit_units(slot))
     })
@@ -221,7 +232,7 @@ pub(super) fn recover_binding_pin_for_test(slot: usize) {
 }
 
 fn acquire(slot: usize) -> Option<ExecutionPermit> {
-    REFS.get(slot)?
+    try_ref_cell(slot)?
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
             count.checked_add(1)
         })

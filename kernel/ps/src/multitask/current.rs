@@ -217,6 +217,18 @@ pub fn current_task_id() -> Option<u64> {
     })
 }
 
+/// Returns an unmapped page address inside the current task's kernel-stack guard zone.
+pub fn current_kernel_stack_guard_probe_address() -> Option<u64> {
+    if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
+        return None;
+    }
+    interrupts::without_interrupts(|| {
+        let slot = cpu_local::current_cpu_task_slot()?;
+        let (usable_base, _) = super::scheduler::stack_resources::stack_bounds(slot);
+        usable_base.checked_sub(4096)
+    })
+}
+
 /// The identity published for the task this CPU is running, if any.
 ///
 /// Callers must already have interrupts masked. A `None` result means the
@@ -1130,7 +1142,8 @@ fn complete_retirement_side_effects() {
     }
     // A retired user caller may never resume. It carries only observations,
     // while the independent kernel executor owns every external effect loan.
-    let fence = interrupts::without_interrupts(executor::Fence::capture);
+    let mut fence = executor::Fence::with_room();
+    interrupts::without_interrupts(|| fence.fill());
     let mut yield_turn = true;
     while !interrupts::without_interrupts(|| fence.complete()) {
         // Yield once so the executor can drain immediately on this CPU; if the

@@ -866,6 +866,7 @@ mod visual_update_tests {
             minimized,
             server_decoration: true,
             drag_icon,
+            popup: false,
         };
         let w1 = win(1, false, false);
         let w2 = win(2, false, false);
@@ -875,6 +876,10 @@ mod visual_update_tests {
         assert_eq!(super::newly_mapped_focus_target(&[w1.clone()], &[w1.clone(), w2.clone()]), Some(2));
         assert_eq!(super::newly_mapped_focus_target(&[w1.clone(), w2.clone()], &[w2.clone(), w1.clone()]), None);
         assert_eq!(super::newly_mapped_focus_target(&[w1.clone()], &[w1.clone(), drag, hidden]), None);
+        // A popup mapping over its parent never steals focus from it.
+        let mut popup = win(5, false, false);
+        popup.popup = true;
+        assert_eq!(super::newly_mapped_focus_target(&[w1.clone()], &[w1.clone(), popup]), None);
     }
 }
 
@@ -886,6 +891,7 @@ fn newly_mapped_focus_target(
 ) -> Option<u32> {
     next.iter().rev().find_map(|window| {
         (!window.drag_icon
+            && !window.popup
             && !window.minimized
             && !previous
                 .iter()

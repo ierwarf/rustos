@@ -85,9 +85,9 @@ fn detached_metadata_prefix_keeps_new_creator_closed_until_exact_reuse_ack_and_c
     assert!(admission::reserve(SLOT, ID + 1).is_none());
     assert!(context::read(SLOT).is_none());
     // Fault projection proves the reuse seal independently of close observation.
-    RESOURCES[SLOT].with(|r| r.closing = false);
+    super::resource(SLOT).with(|r| r.closing = false);
     assert!(admission::reserve(SLOT, ID + 1).is_none());
-    RESOURCES[SLOT].with(|r| r.closing = true);
+    super::resource(SLOT).with(|r| r.closing = true);
     reuse.finish();
     let next = scheduler::root_slots::reserve(SLOT, ID + 1).unwrap();
     identity::publish_metadata(
@@ -107,13 +107,13 @@ fn foreign_pristine_or_old_uid_cannot_close_live_slot_and_epoch_exhaustion_has_n
     prepare();
     assert!(begin(SLOT, None).is_none());
     assert!(begin(SLOT, Some(ID + 1)).is_none());
-    let old = RESOURCES[SLOT].with(|r| {
+    let old = super::resource(SLOT).with(|r| {
         let old = r.reservation_generation;
         r.reservation_generation = u64::MAX;
         old
     });
     assert!(begin(SLOT, Some(ID)).is_none());
-    RESOURCES[SLOT].with(|r| {
+    super::resource(SLOT).with(|r| {
         assert!(r.reclaim.is_none());
         assert!(!r.closing);
         r.reservation_generation = old;
@@ -131,7 +131,7 @@ fn unowned_storage_detach_and_early_ack_cannot_spend_owned_reclaim_or_reopen_con
     assert!(catch_unwind(AssertUnwindSafe(|| reuse.finish())).is_err());
     assert!(admission::reserve(SLOT, ID + 1).is_none());
     // Native recovery of deliberately poisoned ownership, not a production ACK.
-    RESOURCES[SLOT].with(|r| r.reclaim = None);
+    super::resource(SLOT).with(|r| r.reclaim = None);
     let mut recovered = begin(SLOT, Some(ID)).unwrap();
     drop(detach(&mut recovered));
     recovered.finish();
@@ -146,9 +146,9 @@ fn abandoned_detached_reclaim_quarantines_even_empty_storage_and_next_nonce_cann
     drop(detach(&mut reuse));
     drop(reuse);
     assert!(admission::reserve(SLOT, ID + 1).is_none());
-    RESOURCES[SLOT].with(|r| assert_eq!(r.reclaim.unwrap().phase, Phase::Poisoned));
+    super::resource(SLOT).with(|r| assert_eq!(r.reclaim.unwrap().phase, Phase::Poisoned));
     // Restore this exact old native receipt, then prove old nonce differs from next occupancy.
-    RESOURCES[SLOT].with(|r| {
+    super::resource(SLOT).with(|r| {
         r.reclaim = Some(Key {
             phase: Phase::Detached,
             ..old_key
@@ -164,9 +164,9 @@ fn abandoned_detached_reclaim_quarantines_even_empty_storage_and_next_nonce_cann
     }
     .finish();
     let next = admission::reserve(SLOT, ID + 1).unwrap();
-    RESOURCES[SLOT].with(|r| assert!(r.reservation_generation > old_key.nonce));
+    super::resource(SLOT).with(|r| assert!(r.reservation_generation > old_key.nonce));
     drop(next);
-    RESOURCES[SLOT].with(|r| r.reservation = None);
+    super::resource(SLOT).with(|r| r.reservation = None);
 }
 #[test]
 fn close_refuses_all_constructor_phases_without_partial_close_or_spending_creator() {
@@ -180,7 +180,7 @@ fn close_refuses_all_constructor_phases_without_partial_close_or_spending_creato
     ] {
         ticket.set_phase_for_test(phase);
         assert!(!close_for_reclaim(SLOT));
-        RESOURCES[SLOT].with(|r| assert!(!r.closing));
+        super::resource(SLOT).with(|r| assert!(!r.closing));
     }
     ticket.set_phase_for_test(admission::Phase::Reserved);
     scheduler::root_slots::cancel_unpublished(ticket);
@@ -189,20 +189,20 @@ fn close_refuses_all_constructor_phases_without_partial_close_or_spending_creato
 #[test]
 fn pristine_descriptor_absence_cannot_discard_unowned_close_or_reader_custody_on_reservation() {
     let _fixture = scheduler::tests::boxed_scheduler();
-    let old = RESOURCES[SLOT].with(|r| r.reservation_generation);
+    let old = super::resource(SLOT).with(|r| r.reservation_generation);
     for (closing, readers) in [(true, 0), (false, 1)] {
-        RESOURCES[SLOT].with(|r| r.closing = closing);
+        super::resource(SLOT).with(|r| r.closing = closing);
         // ORDERING: native fixture models reader custody on the real counter.
-        RESOURCES[SLOT].readers.store(readers, Ordering::Release);
+        super::resource(SLOT).readers.store(readers, Ordering::Release);
         assert!(admission::reserve(SLOT, ID).is_none());
-        RESOURCES[SLOT].with(|r| {
+        super::resource(SLOT).with(|r| {
             assert_eq!(r.reservation_generation, old);
             assert!(r.reservation.is_none());
         });
     }
-    RESOURCES[SLOT].with(|r| r.closing = false);
+    super::resource(SLOT).with(|r| r.closing = false);
     // ORDERING: native fixture models reader custody on the real counter.
-    RESOURCES[SLOT].readers.store(0, Ordering::Release);
+    super::resource(SLOT).readers.store(0, Ordering::Release);
     let ticket = admission::reserve(SLOT, ID).unwrap();
     assert!(ticket.begin_cancel());
     ticket.finish_cancel();

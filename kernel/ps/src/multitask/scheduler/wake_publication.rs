@@ -18,7 +18,7 @@ impl Binding {
         let candidate = task_directory::hint(task_id)
             .filter(|&slot| stack_resources::task_start::read(slot).map(|s| s.id) == Some(task_id))
             .or_else(|| {
-                (0..MAX_TASK).find(|&slot| {
+                crate::multitask::task_table::active_slots().find(|&slot| {
                     stack_resources::task_start::read(slot).map(|s| s.id) == Some(task_id)
                 })
             });
@@ -293,7 +293,7 @@ pub(super) fn pager_service_with(
     // window would leave pagerd parked with the control request unserved.
     let mut refused = [0_u64; 4];
     let mut refused_len = 0;
-    for slot in 0..MAX_TASK {
+    for slot in crate::multitask::task_table::active_slots() {
         // Advisory pre-filter: pinning a binding for every slot just to read
         // its process id dominated this search. The captured binding's exact
         // process id below remains the authority.

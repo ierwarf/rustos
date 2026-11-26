@@ -204,6 +204,22 @@ fn require_rootd_blinding_fault(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn require_kernel_stack_guard_fault(config: &Config) -> Result<()> {
+    let armed = config.project.fault_injection.enabled
+        && config
+            .project
+            .fault_injection
+            .rules
+            .iter()
+            .any(|rule| rule.as_str() == "kernel.stack.guard_fault=fail");
+    if !armed {
+        bail!(
+            "--kernel-stack-guard-fault-probe needs the kernel fault point armed: run it as RUSTOS_FAULTS='kernel.stack.guard_fault=fail' cargo xtask kvm-smoke --kernel-stack-guard-fault-probe"
+        );
+    }
+    Ok(())
+}
+
 fn kvm_smoke_command_with_runtime_trace<I>(
     config: &Config,
     args: I,
@@ -229,6 +245,9 @@ where
     options.smp_formal_profile_override = smp_formal_profile_override;
     if options.oom_hog_watchdog {
         require_rootd_blinding_fault(config)?;
+    }
+    if options.kernel_stack_guard_fault_probe {
+        require_kernel_stack_guard_fault(config)?;
     }
     let _launch_lock = acquire_kvm_launch_lock(&config.build_dir.join("kvm"))?;
     // A stale boot image is the most expensive mistake available here: the run
@@ -539,6 +558,14 @@ fn run_one_smoke_unarchived(
     stop_guest(&mut dvm);
     phase("smoke-guests-stopped");
     let probe = result?;
+    if options.kernel_stack_guard_fault_probe {
+        let rustos_log = read_log_lossy(&layout.debugcon_log)
+            .with_context(|| format!("read {}", layout.debugcon_log.display()))?;
+        let line = validate_kernel_stack_guard_fault_log(&rustos_log)?
+            .context("kernel stack guard-fault probe exited without diagnostic line")?;
+        println!("xtask: kernel stack guard-fault proof: {line}");
+        return Ok(());
+    }
     if options.chrome_web_probe {
         let log = rejoin_user_debug_records(&read_runtime_log_if_present(&layout.debugcon_log)?);
         let verdict = verify_chrome_pixels(&log)
@@ -832,6 +859,7 @@ pub(crate) fn kvm_run_command(
         chrome_compat_probe: false,
         chrome_probe_persist: None,
         fault_probe: false,
+        kernel_stack_guard_fault_probe: false,
         library_map_probe: false,
         app_dmabuf_probe: false,
         mmap_cost_probe: false,

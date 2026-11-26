@@ -11,10 +11,10 @@ fn static_thread_binding_rejects_recycled_owner_before_any_callback() {
         tid: 0xb301,
         abi: UserAbi::Linux,
         slot,
-        linux_thread_state: NonNull::from(&LINUX_THREAD_STATES[slot]),
+        linux_thread_state: NonNull::from(&crate::multitask::task_table::get(slot).linux_thread_state),
     };
     {
-        let mut cell = LINUX_THREAD_STATES[slot].lock();
+        let mut cell = crate::multitask::task_table::get(slot).linux_thread_state.lock();
         cell.owner_tid = Some(0xb301);
         cell.state = Some(LinuxThreadState::default());
     }
@@ -24,7 +24,7 @@ fn static_thread_binding_rejects_recycled_owner_before_any_callback() {
             .is_some()
     );
     {
-        let mut cell = LINUX_THREAD_STATES[slot].lock();
+        let mut cell = crate::multitask::task_table::get(slot).linux_thread_state.lock();
         assert_eq!(cell.state.unwrap().fs_base, 77);
         cell.owner_tid = Some(0xb302);
         cell.state = Some(LinuxThreadState::default());
@@ -34,7 +34,7 @@ fn static_thread_binding_rejects_recycled_owner_before_any_callback() {
             .with_thread_state_mut(|_| panic!("foreign callback invoked"))
             .is_none()
     );
-    let mut cell = LINUX_THREAD_STATES[slot].lock();
+    let mut cell = crate::multitask::task_table::get(slot).linux_thread_state.lock();
     assert_eq!(cell.state.unwrap().fs_base, 0);
     cell.owner_tid = None;
     cell.state = None;
@@ -51,10 +51,10 @@ fn pending_hint_tracks_bounded_mutation_under_the_same_thread_leaf() {
         tid: 0xb302,
         abi: UserAbi::Linux,
         slot,
-        linux_thread_state: NonNull::from(&LINUX_THREAD_STATES[slot]),
+        linux_thread_state: NonNull::from(&crate::multitask::task_table::get(slot).linux_thread_state),
     };
     {
-        let mut cell = LINUX_THREAD_STATES[slot].lock();
+        let mut cell = crate::multitask::task_table::get(slot).linux_thread_state.lock();
         cell.owner_tid = Some(binding.tid);
         cell.state = Some(LinuxThreadState::default());
     }
@@ -74,5 +74,5 @@ fn pending_hint_tracks_bounded_mutation_under_the_same_thread_leaf() {
         .with_thread_state_mut(|state| *state = None)
         .unwrap();
     assert!(!super::super::super::current_identity::signal_pending(slot));
-    LINUX_THREAD_STATES[slot].lock().owner_tid = None;
+    crate::multitask::task_table::get(slot).linux_thread_state.lock().owner_tid = None;
 }

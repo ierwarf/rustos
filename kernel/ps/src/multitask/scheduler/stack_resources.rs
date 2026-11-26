@@ -1,9 +1,12 @@
 //! Allocation custody independent of Scheduler. Publication is not a lifetime
 //! grant: exact identity/geometry pins must precede saved-frame byte reads.
 //! CPU execution/transition custody is still required separately.
-use super::{MAX_TASK, context_validation::PublishedFrameView};
+use crate::multitask::task_table;
+use super::context_validation::PublishedFrameView;
+#[cfg(test)]
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+pub(super) use kernel_mm::api::kernel_stack::KernelStack;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,8 +35,7 @@ pub(in crate::multitask) fn terminal_binding_matches(slot: usize, id: Option<u64
         return false;
     };
     crate::multitask::current_identity::with_terminal_binding(slot, id, || {
-        RESOURCES
-            .get(slot)?
+        try_resource(slot)?
             .with(|r| {
                 !r.closing
                     && r.reclaim.is_none()
@@ -56,7 +58,7 @@ pub(in crate::multitask) fn with_cold_binding<R>(
     id: u64,
     f: impl FnOnce() -> R,
 ) -> Option<R> {
-    RESOURCES.get(slot)?.with(|resources| {
+    try_resource(slot)?.with(|resources| {
         #[cfg(test)]
         let fixture_empty =
             resources.start.is_none() && resources.context.is_none() && resources.stack.is_none();
@@ -89,7 +91,7 @@ pub(in crate::multitask) fn with_kernel_executor_binding<R>(
     id: u64,
     f: impl FnOnce() -> R,
 ) -> Option<R> {
-    RESOURCES.get(slot)?.with(|r| {
+    try_resource(slot)?.with(|r| {
         if r.closing
             || r.reservation.is_some()
             || r.reclaim.is_some()
@@ -113,7 +115,7 @@ struct Resources {
     mm_pin: Option<crate::multitask::process_table::MmExecutionPin>,
     process_pin: Option<crate::multitask::process_table::pin_owner::ProcessObjectPin>,
     start: Option<super::TaskStart>,
-    stack: Option<Vec<u8>>,
+    stack: Option<KernelStack>,
     binding: Option<(u64, Geometry)>,
     closing: bool,
     frame_writing: bool,
@@ -147,7 +149,7 @@ impl ReclaimAdmission<'_> {
     pub(in crate::multitask) fn nonce(&self) -> u64 { self.nonce }
 }
 
-struct ResourceCell {
+pub(in crate::multitask) struct ResourceCell {
     inner: TrackedSpinLock<Resources, { LockClass::TaskStackResources as u8 }>,
     pins: AtomicU32,
     /// Registered saved-frame readers. Like `pins`: every increment happens
@@ -159,7 +161,7 @@ struct ResourceCell {
 }
 
 impl ResourceCell {
-    const fn new() -> Self {
+    pub(in crate::multitask) const fn new() -> Self {
         Self {
             inner: TrackedSpinLock::new(Resources {
                 context: None,
@@ -227,7 +229,15 @@ impl ResourceCell {
     }
 }
 
-static RESOURCES: [ResourceCell; MAX_TASK] = [const { ResourceCell::new() }; MAX_TASK];
+#[inline]
+pub(super) fn resource(slot: usize) -> &'static ResourceCell {
+    &task_table::get(slot).resources
+}
+
+#[inline]
+pub(super) fn try_resource(slot: usize) -> Option<&'static ResourceCell> {
+    task_table::try_get(slot).map(|task| &task.resources)
+}
 
 /// Non-Copy allocation pin. Drop is lock-free/allocation-free so a future
 /// architectural switch-release edge can carry it without a leaf lock.
@@ -237,7 +247,7 @@ pub(super) struct StackPin {
 }
 impl Drop for StackPin {
     fn drop(&mut self) {
-        RESOURCES[self.slot].unpin();
+        resource(self.slot).unpin();
     }
 }
 impl StackPin {
@@ -259,14 +269,13 @@ impl StackPin {
 }
 
 pub(super) fn pin_view(slot: usize, task_id: u64, view: PublishedFrameView) -> Option<StackPin> {
-    RESOURCES
-        .get(slot)?
+    try_resource(slot)?
         .pin(task_id, view)
         .then(|| StackPin { slot })
 }
 
 pub(super) fn allocated(slot: usize) -> bool {
-    RESOURCES[slot].with(|resources| resources.stack.is_some())
+    resource(slot).with(|resources| resources.stack.is_some())
 }
 
 /// Copied lifecycle/refcount evidence for an IRQ-excluded architecture command.
@@ -274,9 +283,10 @@ pub(super) fn allocated(slot: usize) -> bool {
 pub(in crate::multitask::scheduler) fn simd_resource_state(
     slot: usize,
 ) -> Option<(u32, bool, bool)> {
-    RESOURCES.get(slot)?.with(|resources| {
+    let cell = try_resource(slot)?;
+    cell.with(|resources| {
         Some((
-            RESOURCES[slot].pins.load(Ordering::Acquire),
+            cell.pins.load(Ordering::Acquire),
             resources.closing,
             resources.start.is_some(),
         ))
@@ -286,15 +296,16 @@ pub(in crate::multitask::scheduler) fn simd_resource_state(
 /// Allocation is performed by the cold constructor before taking this leaf.
 #[cfg(test)]
 pub(super) fn install_storage(slot: usize, stack: Vec<u8>) {
-    install_storage_with_reservation(slot, stack, None)
+    install_stack_with_reservation(slot, KernelStack::from_host_vec(stack), None)
 }
-fn install_storage_with_reservation(
+fn install_stack_with_reservation(
     slot: usize,
-    stack: Vec<u8>,
+    stack: KernelStack,
     reservation: Option<admission::Reservation>,
 ) {
     let mut incoming = Some(stack);
-    RESOURCES[slot].with(|resources| {
+    let cell = resource(slot);
+    cell.with(|resources| {
         assert_eq!(
             resources.reservation, reservation,
             "foreign slot storage installation"
@@ -307,11 +318,9 @@ fn install_storage_with_reservation(
                 && resources.context.is_none()
                 && resources.mm_pin.is_none()
         );
-        assert_eq!(RESOURCES[slot].pins.load(Ordering::Acquire), 0);
+        assert_eq!(cell.pins.load(Ordering::Acquire), 0);
         resources.closing = false;
-        RESOURCES[slot]
-            .closing_notice
-            .store(false, Ordering::Release);
+        cell.closing_notice.store(false, Ordering::Release);
         resources.stack = incoming.take();
     });
 }
@@ -321,25 +330,60 @@ pub(super) fn initialize_storage(slot: usize, f: impl FnOnce(&mut [u8])) {
     frame_access::initialize_storage(slot, f);
 }
 
+#[cfg(test)]
 pub(super) fn storage_base(slot: usize) -> usize {
-    RESOURCES[slot].with(|resources| {
+    resource(slot).with(|resources| {
         resources
             .stack
             .as_ref()
             .expect("task stack is allocated")
-            .as_ptr() as usize
+            .usable_base() as usize
     })
 }
 
-pub(super) fn owned_canary_intact(slot: usize) -> Option<bool> {
-    RESOURCES[slot].with(|resources| {
-        let storage = resources.stack.as_ref()?;
-        let guard = storage.get(..super::TASK_STACK_GUARD_BYTES)?;
-        Some(guard.chunks_exact(core::mem::size_of::<u64>()).all(|word| {
-            u64::from_ne_bytes(word.try_into().expect("exact canary word"))
-                == super::STACK_CANARY_WORD
-        }))
+pub(in crate::multitask) fn stack_bounds(slot: usize) -> (u64, u64) {
+    resource(slot).with(|resources| {
+        let stack = resources.stack.as_ref().expect("task stack is allocated");
+        stack_published_bounds(stack)
     })
+}
+
+fn stack_published_bounds(stack: &KernelStack) -> (u64, u64) {
+    #[cfg(rustos_boot_image)]
+    {
+        (
+            stack.usable_base(),
+            super::align_kernel_stack_top(stack.usable_top() as usize) as u64,
+        )
+    }
+    #[cfg(not(rustos_boot_image))]
+    {
+        let base = stack.usable_base() as usize;
+        (
+            (base + super::TASK_STACK_GUARD_BYTES) as u64,
+            super::align_kernel_stack_top(base + stack.usable_len()) as u64,
+        )
+    }
+}
+
+pub(super) fn owned_canary_intact(slot: usize) -> Option<bool> {
+    #[cfg(rustos_boot_image)]
+    let usable_base = resource(slot).with(|resources| Some(resources.stack.as_ref()?.usable_base()));
+    #[cfg(rustos_boot_image)]
+    {
+        usable_base.map(kernel_mm::api::kernel_stack::guard_page_unmapped)
+    }
+    #[cfg(not(rustos_boot_image))]
+    {
+        resource(slot).with(|resources| {
+            let storage = resources.stack.as_ref()?.as_host_slice();
+            let guard = storage.get(..super::TASK_STACK_GUARD_BYTES)?;
+            Some(guard.chunks_exact(core::mem::size_of::<u64>()).all(|word| {
+                u64::from_ne_bytes(word.try_into().expect("exact canary word"))
+                    == super::STACK_CANARY_WORD
+            }))
+        })
+    }
 }
 
 /// Borrow the binding already retained by the original physical Current bank.
@@ -354,7 +398,7 @@ pub(super) fn current_return_binding(
     if !cpu_leases::owns_current(cpu, slot) {
         return None;
     }
-    let cell = RESOURCES.get(slot)?;
+    let cell = try_resource(slot)?;
     cell.with(|resources| {
         let id = resources.start?.id;
         let context = resources.context?;
@@ -375,21 +419,30 @@ pub(super) fn current_return_binding(
 /// One joined post-producer qualification. No raw leaf spans guard/header reads.
 pub(super) fn capture_outgoing_image(
     cpu: usize, slot: usize, view: PublishedFrameView,
-) -> Option<(u64, super::return_architecture::ArchitectureState, Option<core::ptr::NonNull<u8>>)> {
+) -> Option<(u64, super::return_architecture::ArchitectureState, bool, Option<core::ptr::NonNull<u8>>)> {
     if !cpu_leases::owns_current(cpu, slot) { return None; }
-    let cell = RESOURCES.get(slot)?;
+    let cell = try_resource(slot)?;
     cell.with(|resources| {
         let id = resources.start?.id;
         let architecture = context::architecture_locked(cell, resources, slot, id, view)?;
-        let guard = resources.stack.as_ref().and_then(|stack|
-            stack.get(..super::TASK_STACK_GUARD_BYTES))
-            .and_then(|guard| core::ptr::NonNull::new(guard.as_ptr() as *mut u8));
-        Some((id, architecture, guard))
+        #[cfg(rustos_boot_image)]
+        let (virtual_guard, guard) = (resources.stack.is_some(), None);
+        #[cfg(not(rustos_boot_image))]
+        let (virtual_guard, guard) = (
+            false,
+            resources.stack.as_ref().and_then(|stack| {
+                stack
+                    .as_host_slice()
+                    .get(..super::TASK_STACK_GUARD_BYTES)
+                    .and_then(|guard| core::ptr::NonNull::new(guard.as_ptr() as *mut u8))
+            }),
+        );
+        Some((id, architecture, virtual_guard, guard))
     })
 }
 
 pub(super) fn publish_binding(slot: usize, task_id: u64, view: PublishedFrameView) {
-    RESOURCES[slot].with(|resources| {
+    resource(slot).with(|resources| {
         super::outgoing_image::assert_mutable(slot);
         assert!(
             resources.start.is_some_and(|start| start.id == task_id),
@@ -397,15 +450,15 @@ pub(super) fn publish_binding(slot: usize, task_id: u64, view: PublishedFrameVie
         );
         let binding = (task_id, Geometry::from_view(view));
         if let Some(stack) = resources.stack.as_ref() {
-            let base = stack.as_ptr() as usize;
+            let (expected_base, expected_top) = stack_published_bounds(stack);
             assert_eq!(
                 view.kernel_stack_base,
-                (base + super::TASK_STACK_GUARD_BYTES) as u64,
+                expected_base,
                 "published stack does not name its allocation"
             );
             assert_eq!(
                 view.kernel_stack_top,
-                super::align_kernel_stack_top(base + stack.len()) as u64,
+                expected_top,
                 "published stack top does not name its allocation"
             );
         }
@@ -432,17 +485,16 @@ pub(super) fn publish_binding(slot: usize, task_id: u64, view: PublishedFrameVie
 /// scheduler tests use this close + drainability probe instead.
 #[cfg(test)]
 pub(super) fn close_for_reclaim(slot: usize) -> bool {
-    RESOURCES[slot].with(|resources| {
+    let cell = resource(slot);
+    cell.with(|resources| {
         if resources.reservation.is_some() || resources.reclaim.is_some()
             || crate::multitask::process_placement::reclaim::busy(&Membership { resources, slot })
         {
             return false;
         }
         resources.closing = true;
-        RESOURCES[slot]
-            .closing_notice
-            .store(true, Ordering::Release);
-        RESOURCES[slot].pins.load(Ordering::Acquire) == 0
+        cell.closing_notice.store(true, Ordering::Release);
+        cell.pins.load(Ordering::Acquire) == 0
             && !resources.frame_writing
             && super::super::current_identity::execution::count(slot) == 0
             && !super::super::current_identity::exec_intent::busy(slot)
@@ -452,7 +504,8 @@ pub(super) fn close_for_reclaim(slot: usize) -> bool {
 /// One-shot boot may initialize owners only before ANY physical lifetime exists.
 /// This is refusal, not a teardown/reset operation on earlier backing.
 pub(in crate::multitask::scheduler) fn assert_boot_vacant() {
-    for (slot, cell) in RESOURCES.iter().enumerate() {
+    for slot in task_table::allocated_slots() {
+        let cell = resource(slot);
         cell.with(|r| {
             assert!(r.context.is_none() && r.start.is_none() && r.stack.is_none()
                 && r.binding.is_none() && r.process_pin.is_none() && r.mm_pin.is_none()
@@ -471,7 +524,7 @@ pub(in crate::multitask) fn with_initial_execution<R>(
     slot: usize,
     acquire: impl FnOnce() -> R,
 ) -> Option<R> {
-    RESOURCES.get(slot)?.with(|resources| {
+    try_resource(slot)?.with(|resources| {
         if resources.reservation.is_some() || resources.frame_writing || resources.closing {
             return None;
         }
@@ -481,8 +534,7 @@ pub(in crate::multitask) fn with_initial_execution<R>(
 
 /// Writer51 may join this higher-ranked leaf before opening an exec gate.
 pub(in crate::multitask) fn image_writing(slot: usize) -> bool {
-    RESOURCES
-        .get(slot)
+    try_resource(slot)
         .is_none_or(|cell| cell.with(|resources| resources.frame_writing))
 }
 
@@ -490,14 +542,15 @@ pub(in crate::multitask) fn image_writing(slot: usize) -> bool {
 /// dropping directory/leaf locks, along with process/TLB reclamation work.
 #[cfg(test)]
 pub(super) fn take_storage(slot: usize) -> Option<Vec<u8>> {
-    take_storage_with_reservation(slot, None, None)
+    take_stack_with_reservation(slot, None, None).map(KernelStack::into_host_vec)
 }
-fn take_storage_with_reservation(
+fn take_stack_with_reservation(
     slot: usize,
     reservation: Option<admission::Reservation>,
     reclaim: Option<reuse::Key>,
-) -> Option<Vec<u8>> {
-    RESOURCES[slot].with(|resources| {
+) -> Option<KernelStack> {
+    let cell = resource(slot);
+    cell.with(|resources| {
         assert_eq!(
             resources.reclaim, reclaim,
             "unowned reclaim storage detachment"
@@ -520,7 +573,7 @@ fn take_storage_with_reservation(
             "allocation detached with frame writer custody"
         );
         assert_eq!(
-            RESOURCES[slot].pins.load(Ordering::Acquire),
+            cell.pins.load(Ordering::Acquire),
             0,
             "pinned stack allocation released"
         );
@@ -536,9 +589,7 @@ fn take_storage_with_reservation(
         task_start::mirror_store(slot, None);
         resources.binding = None;
         resources.closing = resources.reclaim.is_some();
-        RESOURCES[slot]
-            .closing_notice
-            .store(resources.closing, Ordering::Release);
+        cell.closing_notice.store(resources.closing, Ordering::Release);
         resources.stack.take()
     })
 }
@@ -560,7 +611,7 @@ pub(in crate::multitask::scheduler) fn install_exec_context_fixture(
     let mut context = context::tests::metadata(slot, task_start::read(slot).unwrap().id);
     context.process_handle = Some(handle);
     // Synthetic receipt fixture only: no physical process-table authority.
-    RESOURCES[slot].with(|resources| {
+    resource(slot).with(|resources| {
         assert!(resources.context.is_none());
         resources.context = Some(context);
     });

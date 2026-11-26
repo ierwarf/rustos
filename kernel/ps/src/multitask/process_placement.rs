@@ -5,20 +5,41 @@ use crate::user::abi::UserAbi;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use process_table::ProcessHandle;
 use crate::multitask::slot_dir::AtomicDir;
-const MAX: usize = super::task_capacity::CAPACITY.process_thread_ceiling();
+use alloc::vec::Vec;
 type Member = (usize, u64);
+
+#[derive(Clone, Copy)]
+struct MemberRow {
+    member: Member,
+    stopped: bool,
+    exit_detached: bool,
+    exec_detached: bool,
+    terminal_detached: bool,
+    reclaiming: Option<u64>,
+}
+
+impl MemberRow {
+    const fn new(member: Member) -> Self {
+        Self {
+            member,
+            stopped: false,
+            exit_detached: false,
+            exec_detached: false,
+            terminal_detached: false,
+            reclaiming: None,
+        }
+    }
+}
+
 struct State {
     handle: Option<ProcessHandle>,
     mask: u64,
     nonce: u64,
     phase: u8, // 0 open, 1 metadata sealed, 2 published, 3 poisoned, 4 exec census
     joins: u32,
-    members: [Option<Member>; MAX],
-    stopped: [bool; MAX],
-    exit_detached: [bool; MAX],
-    exec_detached: [bool; MAX],
-    terminal_detached: [bool; MAX],
-    reclaiming: [Option<u64>; MAX],
+    rows: Vec<MemberRow>,
+    spare_terminal: Option<(Vec<Member>, Vec<bool>)>,
+    spare_exit: Option<Vec<Member>>,
     terminal: Option<terminal::Record>,
     terminal_nonce: u64,
     exit: Option<exit_membership::Record>,
@@ -37,12 +58,9 @@ impl State {
             nonce: 0,
             phase: 0,
             joins: 0,
-            members: [None; MAX],
-            stopped: [false; MAX],
-            exit_detached: [false; MAX],
-            exec_detached: [false; MAX],
-            terminal_detached: [false; MAX],
-            reclaiming: [None; MAX],
+            rows: Vec::new(),
+            spare_terminal: None,
+            spare_exit: None,
             terminal: None,
             terminal_nonce: 0,
             exit: None,
@@ -55,24 +73,17 @@ impl State {
         }
     }
     fn insert(&mut self, member: Member) -> Option<()> {
-        if member.0 >= super::MAX_SCHEDULER_TASKS {
-            return None;
-        }
         if self
-            .members
+            .rows
             .iter()
-            .flatten()
-            .any(|&(slot, id)| slot == member.0 || id == member.1)
+            .any(|row| row.member.0 == member.0 || row.member.1 == member.1)
         {
             return None;
         }
-        let index = self.members.iter().position(Option::is_none)?;
-        self.members[index] = Some(member);
-        self.stopped[index] = false;
-        self.exit_detached[index] = false;
-        self.exec_detached[index] = false;
-        self.terminal_detached[index] = false;
-        self.reclaiming[index] = None;
+        if self.rows.len() == self.rows.capacity() {
+            return None;
+        }
+        self.rows.push(MemberRow::new(member));
         Some(())
     }
     fn prune_exit_detached(&mut self) {
@@ -80,60 +91,67 @@ impl State {
             self.exit.is_none(),
             "detached exit rows pruned before exact release"
         );
-        for i in 0..MAX {
-            if self.exit_detached[i] {
-                assert!(self.stopped[i], "exit tombstone lacks committed stop");
+        let mut index = 0;
+        while index < self.rows.len() {
+            if self.rows[index].exit_detached {
+                assert!(
+                    self.rows[index].stopped,
+                    "exit tombstone lacks committed stop"
+                );
                 if self.phase == 4 {
-                    self.exec_detached[i] = true;
-                    self.exit_detached[i] = false;
+                    self.rows[index].exec_detached = true;
+                    self.rows[index].exit_detached = false;
+                    index += 1;
                 } else if self.terminal.is_some() {
-                    self.terminal_detached[i] = true;
-                    self.exit_detached[i] = false;
+                    self.rows[index].terminal_detached = true;
+                    self.rows[index].exit_detached = false;
+                    index += 1;
                 } else {
-                    self.remove_member(i);
+                    self.remove_member(index);
                 }
+            } else {
+                index += 1;
             }
         }
     }
     fn remove_member(&mut self, index: usize) {
-        self.members[index] = None;
-        self.stopped[index] = false;
-        self.exit_detached[index] = false;
-        self.exec_detached[index] = false;
-        self.terminal_detached[index] = false;
-        self.reclaiming[index] = None;
+        self.rows.remove(index);
     }
     fn unregister_member(&mut self, index: usize) {
-        let state = self;
         assert!(
-            state.root.is_none()
-                && ((state.terminal.is_none() && state.exit.is_none()) || state.stopped[index]),
+            self.root.is_none()
+                && ((self.terminal.is_none() && self.exit.is_none()) || self.rows[index].stopped),
             "live process member detached across terminal turn"
         );
-        if state.exit.is_some() {
-            state.exit_detached[index] = true;
-        } else if state.phase == 4 {
+        if self.exit.is_some() {
+            self.rows[index].exit_detached = true;
+        } else if self.phase == 4 {
             // Keep the exact frozen UID as a reclaim fence even after logical detach.
-            state.exec_detached[index] = true;
-        } else if state.terminal.is_some() {
-            state.terminal_detached[index] = true;
+            self.rows[index].exec_detached = true;
+        } else if self.terminal.is_some() {
+            self.rows[index].terminal_detached = true;
         } else {
-            state.remove_member(index);
+            self.remove_member(index);
         }
     }
     fn prune_terminal_detached(&mut self) {
         assert!(self.terminal.is_none(), "terminal census pruned before original release");
-        for index in 0..MAX {
-            if self.terminal_detached[index] {
+        let mut index = 0;
+        while index < self.rows.len() {
+            if self.rows[index].terminal_detached {
                 if self.exit.is_some() {
-                    self.exit_detached[index] = true;
-                    self.terminal_detached[index] = false;
+                    self.rows[index].exit_detached = true;
+                    self.rows[index].terminal_detached = false;
+                    index += 1;
                 } else if self.phase == 4 {
-                    self.exec_detached[index] = true;
-                    self.terminal_detached[index] = false;
+                    self.rows[index].exec_detached = true;
+                    self.rows[index].terminal_detached = false;
+                    index += 1;
                 } else {
                     self.remove_member(index);
                 }
+            } else {
+                index += 1;
             }
         }
     }
@@ -145,7 +163,7 @@ impl State {
             && self.exit_work.is_none()
             && self.phase == 0
             && self.joins == 0
-            && self.members.iter().all(Option::is_none)
+            && self.rows.is_empty()
         {
             self.handle = None;
             self.mask = 0;
@@ -173,6 +191,55 @@ impl Cell {
             protected()
         }
     }
+    /// Pre-reserves member rows and IRQ-masked scratch capacity outside Class55
+    /// so `Turn` / `ExitMembership` never allocate inside Class55 or masked IRQs.
+    fn ensure_spare(&self, extra_rows: usize) {
+        loop {
+            let need = self.with(|s| {
+                let target = s.rows.len().saturating_add(extra_rows);
+                let term_ok = s.spare_terminal.as_ref().is_some_and(|(m, st)| {
+                    m.capacity() >= target && st.capacity() >= target
+                });
+                let exit_ok = s.spare_exit.as_ref().is_some_and(|m| m.capacity() >= target);
+                if s.rows.capacity() >= target && term_ok && exit_ok {
+                    None
+                } else {
+                    Some(target.next_power_of_two().max(8))
+                }
+            });
+            let Some(cap) = need else {
+                break;
+            };
+            let mut new_rows = Vec::with_capacity(cap);
+            let new_t_members = Vec::with_capacity(cap);
+            let new_t_stopped = Vec::with_capacity(cap);
+            let new_exit = Vec::with_capacity(cap);
+            let (old_rows, old_term, old_exit) = self.with(|s| {
+                let old_rows = if s.rows.capacity() < new_rows.capacity() {
+                    new_rows.extend_from_slice(&s.rows);
+                    core::mem::replace(&mut s.rows, new_rows)
+                } else {
+                    new_rows
+                };
+                let old_term = if s
+                    .spare_terminal
+                    .as_ref()
+                    .is_none_or(|(m, st)| m.capacity() < cap || st.capacity() < cap)
+                {
+                    s.spare_terminal.replace((new_t_members, new_t_stopped))
+                } else {
+                    Some((new_t_members, new_t_stopped))
+                };
+                let old_exit = if s.spare_exit.as_ref().is_none_or(|m| m.capacity() < cap) {
+                    s.spare_exit.replace(new_exit)
+                } else {
+                    Some(new_exit)
+                };
+                (old_rows, old_term, old_exit)
+            });
+            drop((old_rows, old_term, old_exit));
+        }
+    }
 }
 static CELLS: AtomicDir<Cell> = AtomicDir::new();
 
@@ -190,7 +257,9 @@ fn cell(handle: ProcessHandle) -> Option<&'static Cell> {
 /// Native already-published catalog projection; production holds RootJoin through Ticket ACK.
 #[cfg(test)]
 pub(super) fn register_root(handle: ProcessHandle, slot: usize, id: u64, mask: u64) -> Option<()> {
-    cell(handle)?.with(|state| {
+    let cell = cell(handle)?;
+    cell.ensure_spare(1);
+    cell.with(|state| {
         if mask == 0
             || state.phase != 0
             || state.joins != 0
@@ -203,7 +272,7 @@ pub(super) fn register_root(handle: ProcessHandle, slot: usize, id: u64, mask: u
             return None;
         }
         #[cfg(not(test))]
-        if state.members.iter().any(Option::is_some) {
+        if !state.rows.is_empty() {
             return None;
         }
         if state.handle == Some(handle) && state.mask != mask {
@@ -224,11 +293,7 @@ pub(super) fn unregister(handle: ProcessHandle, slot: usize, id: u64) {
         if state.handle != Some(handle) {
             return;
         }
-        if let Some(index) = state
-            .members
-            .iter()
-            .position(|&row| row == Some((slot, id)))
-        {
+        if let Some(index) = state.rows.iter().position(|row| row.member == (slot, id)) {
             state.unregister_member(index);
         }
         state.release_empty();
@@ -244,9 +309,8 @@ pub(super) struct Change {
     handle: ProcessHandle,
     caller: Member,
     nonce: u64,
-    members: [Member; MAX],
-    stopped: [bool; MAX],
-    len: usize,
+    members: Vec<Member>,
+    stopped: Vec<bool>,
     previous: u64,
     effects: bool,
     live: bool,
@@ -259,42 +323,52 @@ impl Change {
         if process.is_none() {
             return None;
         }
-        let (nonce, members, stopped, len, previous) = cell(handle)?.with(|state| {
-            if state.handle != Some(handle)
-                || state.phase != 0
-                || state.terminal.is_some()
-                || state.exit.is_some()
-                || state.joins != 0
-                || !state
-                    .members
-                    .iter()
-                    .zip(state.stopped)
-                    .any(|(&row, stopped)| row == Some(caller) && !stopped)
-            {
-                return None;
-            }
-            let nonce = state.nonce.checked_add(1)?;
-            let mut members = [(0, 0); MAX];
-            let mut stopped = [false; MAX];
-            let mut len = 0;
-            for (&member, is_stopped) in state.members.iter().zip(state.stopped) {
-                if let Some(member) = member {
-                    members[len] = member;
-                    stopped[len] = is_stopped;
-                    len += 1;
+        let cell = cell(handle)?;
+        let mut cap = 8usize;
+        let (nonce, members, stopped, previous) = loop {
+            let mut members_buf = Vec::with_capacity(cap);
+            let mut stopped_buf = Vec::with_capacity(cap);
+            let attempt = cell.with(|state| {
+                if state.handle != Some(handle)
+                    || state.phase != 0
+                    || state.terminal.is_some()
+                    || state.exit.is_some()
+                    || state.joins != 0
+                    || !state
+                        .rows
+                        .iter()
+                        .any(|row| row.member == caller && !row.stopped)
+                {
+                    return Ok(None);
+                }
+                if state.rows.len() > members_buf.capacity() {
+                    return Err((state.rows.len(), members_buf, stopped_buf));
+                }
+                let Some(nonce) = state.nonce.checked_add(1) else {
+                    return Ok(None);
+                };
+                for row in &state.rows {
+                    members_buf.push(row.member);
+                    stopped_buf.push(row.stopped);
+                }
+                state.nonce = nonce;
+                state.phase = 1;
+                Ok(Some((nonce, members_buf, stopped_buf, state.mask)))
+            });
+            match attempt {
+                Ok(result) => break result?,
+                Err((need, m, s)) => {
+                    drop((m, s));
+                    cap = need.next_power_of_two();
                 }
             }
-            state.nonce = nonce;
-            state.phase = 1;
-            Some((nonce, members, stopped, len, state.mask))
-        })?;
+        };
         Some(Self {
             handle,
             caller,
             nonce,
             members,
             stopped,
-            len,
             previous,
             effects: false,
             live: true,
@@ -303,15 +377,15 @@ impl Change {
     }
     #[cfg(test)]
     pub(super) fn members(&self) -> &[Member] {
-        &self.members[..self.len]
+        &self.members
     }
     /// Exact terminal ACK captured in the same Class55 turn as membership.
     /// A missing descriptor or a replacement UID is never negative evidence.
     pub(super) fn live_members(&self) -> impl Iterator<Item = Member> + '_ {
-        self.members[..self.len]
+        self.members
             .iter()
             .copied()
-            .zip(self.stopped)
+            .zip(self.stopped.iter().copied())
             .filter_map(|(member, stopped)| (!stopped).then_some(member))
     }
     pub(super) fn previous(&self) -> u64 {
@@ -391,17 +465,18 @@ pub(super) struct Join {
 impl Join {
     pub(super) fn begin(handle: ProcessHandle, parent: Member, abi: UserAbi) -> Option<Self> {
         let pin = current_identity::execution::pin_creation(parent.0, parent.1, handle, abi)?;
-        let mask = cell(handle)?.with(|state| {
+        let cell = cell(handle)?;
+        cell.ensure_spare(1);
+        let mask = cell.with(|state| {
             if state.handle != Some(handle)
                 || state.phase != 0
                 || state.terminal.is_some()
                 || state.exit.is_some()
                 || state.root.is_some()
                 || !state
-                    .members
+                    .rows
                     .iter()
-                    .zip(state.stopped)
-                    .any(|(&row, stopped)| row == Some(parent) && !stopped)
+                    .any(|row| row.member == parent && !row.stopped)
             {
                 return None;
             }
@@ -418,7 +493,9 @@ impl Join {
         self.mask
     }
     pub(super) fn register(&self, slot: usize, id: u64) -> Option<()> {
-        cell(self.handle)?.with(|state| {
+        let cell = cell(self.handle)?;
+        cell.ensure_spare(1);
+        cell.with(|state| {
             if state.handle != Some(self.handle)
                 || state.phase != 0
                 || state.terminal.is_some()
@@ -444,7 +521,7 @@ impl Drop for Join {
 #[cfg(test)]
 pub(super) fn reset_for_tests() {
     for cell in CELLS.iter() {
-        cell.with(|state| {
+        let retired = cell.with(|state| {
             assert_eq!(state.phase, 0);
             assert_eq!(state.joins, 0);
             assert!(state.terminal.is_none() && state.exit.is_none() && state.exit_work.is_none());
@@ -454,13 +531,15 @@ pub(super) fn reset_for_tests() {
             let exit_done_nonce = state.exit_done_nonce;
             let nonce = state.nonce;
             let terminal_nonce = state.terminal_nonce;
-            *state = State::new();
+            let old = core::mem::replace(state, State::new());
             state.nonce = nonce;
             state.root_nonce = root_nonce;
             state.terminal_nonce = terminal_nonce;
             state.exit_nonce = exit_nonce;
             state.exit_done_nonce = exit_done_nonce;
+            old
         });
+        drop(retired);
     }
 }
 pub(in crate::multitask) mod reclaim;

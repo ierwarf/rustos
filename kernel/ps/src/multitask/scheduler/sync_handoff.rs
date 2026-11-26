@@ -26,7 +26,7 @@ use nucleus_core::util::cache_padded::CachePadded;
 use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS};
 use crate::multitask::irq_leaf::IrqLeaf;
 
-use super::{MAX_SYNC_HANDOFF_CHAIN_TICKS, MAX_TASK, runqueue};
+use super::{MAX_SYNC_HANDOFF_CHAIN_TICKS, runqueue};
 pub(super) mod chain;
 
 pub(super) type SyncHandoffLock =
@@ -323,19 +323,41 @@ impl ReplyWakeHandoff {
 /// The bounded-chain fairness budget is NOT here: it is the CPU-owned
 /// `SYNC_HANDOFF_BUDGET`, charged by `record_dispatch` and consulted by
 /// `take_next_ready_with` before this leaf is taken.
+static SYNC_HANDOFF_POOL: crate::multitask::irq_pool::SlabPool<SyncHandoffRecord> =
+    crate::multitask::irq_pool::SlabPool::new();
+
+pub(super) fn preallocate_pool(min_free: usize) {
+    crate::multitask::irq_pool::SlabQueue::<SyncHandoffRecord>::preallocate_for_pool(
+        &SYNC_HANDOFF_POOL,
+        min_free,
+    );
+}
+
 pub(super) struct SyncHandoffState {
-    records: [Option<SyncHandoffRecord>; MAX_TASK],
-    head: usize,
-    len: usize,
+    records: crate::multitask::irq_pool::SlabQueue<SyncHandoffRecord>,
+    capacity: usize,
 }
 
 impl SyncHandoffState {
     pub(super) const fn new() -> Self {
         Self {
-            records: [None; MAX_TASK],
-            head: 0,
-            len: 0,
+            records: crate::multitask::irq_pool::SlabQueue::new(),
+            capacity: usize::MAX,
         }
+    }
+
+    /// A FIFO capped to `slots` records for test fixtures.
+    #[cfg(test)]
+    pub(super) fn with_capacity(slots: usize) -> Self {
+        Self {
+            records: crate::multitask::irq_pool::SlabQueue::new(),
+            capacity: slots,
+        }
+    }
+
+    /// Empties the FIFO and releases slab blocks back to the pool.
+    fn clear(&mut self) {
+        self.records.clear(&SYNC_HANDOFF_POOL);
     }
 
     #[cfg(test)]
@@ -354,14 +376,11 @@ impl SyncHandoffState {
         let record = direct_owner
             .map(|(owner, cpu)| record.bind_direct_owner(owner, cpu))
             .unwrap_or(record);
-        if let Some(index) = (0..self.len).find_map(|offset| {
-            let index = (self.head + offset) % MAX_TASK;
-            self.records[index]
-                .is_some_and(|queued| queued.task_id == record.task_id)
-                .then_some(index)
-        }) {
-            let existing = self.records[index]
-                .expect("scheduler synchronous handoff prefix contains an empty entry");
+        if let Some(slot_ref) = self
+            .records
+            .find_mut(&SYNC_HANDOFF_POOL, |queued| queued.task_id == record.task_id)
+        {
+            let existing = *slot_ref;
             let supersedes_stale_reply =
                 matches!(record.custody, SyncHandoffCustody::Direct { .. })
                     && matches!(existing.custody, SyncHandoffCustody::ReplyWake { .. })
@@ -373,16 +392,13 @@ impl SyncHandoffState {
                                 || !existing.matches_dispatch_owner(owner))
                     });
             if record.refreshes(existing) || supersedes_stale_reply {
-                self.records[index] = Some(record);
+                *slot_ref = record;
             }
             return true;
         }
-        if self.len >= MAX_TASK {
+        if self.records.len() >= self.capacity || !self.records.push_back(&SYNC_HANDOFF_POOL, record) {
             panic!("scheduler synchronous IPC handoff queue overflow");
         }
-        let tail = (self.head + self.len) % MAX_TASK;
-        self.records[tail] = Some(record);
-        self.len += 1;
         true
     }
 
@@ -400,20 +416,14 @@ impl SyncHandoffState {
         &mut self,
         mut ready: impl FnMut(SyncHandoffRecord) -> bool,
     ) -> Option<SyncHandoffRecord> {
-        if self.len == 0 {
+        if self.records.is_empty() {
             #[cfg(rustos_scheduler_phase_profile)]
             super::locality::record_sync_handoff_miss(
                 super::locality::SyncHandoffMissReason::StartedEmpty,
             );
             return None;
         }
-        while self.len != 0 {
-            let index = self.head;
-            let record = self.records[index]
-                .take()
-                .expect("scheduler synchronous handoff prefix contains an empty entry");
-            self.head = (index + 1) % MAX_TASK;
-            self.len -= 1;
+        while let Some(record) = self.records.pop_front(&SYNC_HANDOFF_POOL) {
             if ready(record) {
                 return Some(record);
             }
@@ -428,41 +438,22 @@ impl SyncHandoffState {
     /// Whether a record that carries this exact owner generation as custody
     /// (Direct or ReplyWake) is queued for `slot`.
     fn holds_generation(&self, slot: usize, owner_generation: u64) -> bool {
-        (0..self.len).any(|offset| {
-            self.records[(self.head + offset) % MAX_TASK].is_some_and(|record| {
-                record.slot == slot
-                    && matches!(record.custody,
-                        SyncHandoffCustody::Direct { owner_generation: queued, .. }
-                        | SyncHandoffCustody::ReplyWake { owner_generation: queued, .. }
-                        if queued == owner_generation)
-            })
+        self.records.any(&SYNC_HANDOFF_POOL, |record| {
+            record.slot == slot
+                && matches!(record.custody,
+                    SyncHandoffCustody::Direct { owner_generation: queued, .. }
+                    | SyncHandoffCustody::ReplyWake { owner_generation: queued, .. }
+                    if queued == owner_generation)
         })
     }
 
     pub(super) fn remove_slot(&mut self, slot: usize) {
-        // Compact in place, preserving FIFO order. The write cursor never
-        // passes the read cursor (`retained <= offset`), so no unread record is
-        // overwritten, and this avoids two MAX_TASK-record stack images on the
-        // terminal-withdrawal path while the FIFO leaf is held.
-        let mut retained = 0_usize;
-        for offset in 0..self.len {
-            let index = (self.head + offset) % MAX_TASK;
-            if let Some(record) = self.records[index]
-                && record.slot != slot
-            {
-                self.records[(self.head + retained) % MAX_TASK] = Some(record);
-                retained += 1;
-            }
-        }
-        for offset in retained..self.len {
-            self.records[(self.head + offset) % MAX_TASK] = None;
-        }
-        self.len = retained;
+        self.records.retain(&SYNC_HANDOFF_POOL, |record| record.slot != slot);
     }
 
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.len
+        self.records.len()
     }
 }
 
@@ -555,11 +546,10 @@ pub(super) fn publish_original(
     commit: impl FnOnce() -> Option<(runqueue::RunOwnerSnapshot, Option<runqueue::EnqueueDuty>)>,
 ) -> Option<(runqueue::RunOwnerSnapshot, Option<runqueue::EnqueueDuty>)> {
     let mut state = state_for_cpu(target_cpu).lock();
-    let duplicate = (0..state.len).any(|offset| {
-        state.records[(state.head + offset) % MAX_TASK]
-            .is_some_and(|queued| queued.task_id == record.task_id)
-    });
-    if !duplicate && state.len == MAX_TASK {
+    let duplicate = state
+        .records
+        .any(&SYNC_HANDOFF_POOL, |queued| queued.task_id == record.task_id);
+    if !duplicate && state.records.len() >= state.capacity {
         return None;
     }
     let (owner, duty) = commit()?;
@@ -580,8 +570,8 @@ pub(super) fn publish_original(
 /// funding or execution permission; the actual caller still owns real loans.
 #[cfg(test)]
 pub(super) fn with_full_fifo_model<R>(cpu: usize, f: impl FnOnce() -> R) -> R {
-    let mut full = SyncHandoffState::new();
-    for slot in 0..MAX_TASK {
+    let mut full = SyncHandoffState::with_capacity(64);
+    for slot in 0..64 {
         full.enqueue(SyncHandoffRecord::new(slot, 900000 + slot as u64));
     }
     let saved = core::mem::replace(&mut *state_for_cpu(cpu).lock(), full);
@@ -695,17 +685,18 @@ pub(super) fn take_next_ready_with(
     // leaf. Consume one exact record, release the leaf, then qualify it; the
     // dispatcher still owns the physical turn and final generation claim.
     // Bound work even if concurrent producers continuously replenish the FIFO.
-    for attempt in 0..MAX_TASK {
+    let budget = crate::multitask::task_table::active_task_count().max(64);
+    for attempt in 0..budget {
         let taken = {
             let mut state = state_for_cpu(cpu).lock();
-            let taken = if state.len != 0 {
+            let taken = if !state.records.is_empty() {
                 state.take_next_ready_record(|_| true)
             } else {
                 None
             };
             // Enqueue publishes true under this same leaf. Clear only after
             // observing empty there, never after running external qualification.
-            if state.len == 0 {
+            if state.records.is_empty() {
                 if let Some(pending) = SYNC_HANDOFF_PENDING.get(cpu) {
                     // ORDERING: release pairs with the locked empty observation.
                     pending.store(false, core::sync::atomic::Ordering::Release);
@@ -774,7 +765,7 @@ pub(super) fn model_len(cpu: usize) -> usize {
 
 pub(super) fn reset_all_cpus() {
     for (cpu, state) in SYNC_HANDOFFS.iter().enumerate() {
-        *state.lock() = SyncHandoffState::new();
+        state.lock().clear();
         // ORDERING: the advertisement is cleared after the FIFO it describes is
         // empty, under no producer: a reset that left it set would report work
         // for a queue that no longer holds any.
@@ -813,7 +804,7 @@ mod tests {
     }
     #[test]
     fn sync_handoff_state_is_fifo_deduplicated_identity_keyed_and_fairness_bounded() {
-        let mut state = SyncHandoffState::new();
+        let mut state = SyncHandoffState::with_capacity(64);
         let first = SyncHandoffRecord::new(4, 40);
         let second = SyncHandoffRecord::new(5, 50);
         assert!(state.enqueue(first));
@@ -857,7 +848,7 @@ mod tests {
         let reply = ReplyWakeHandoff::new(6, 60, 9, cpu).record;
         {
             let mut state = super::state_for_cpu(cpu).lock();
-            *state = SyncHandoffState::new();
+            *state = SyncHandoffState::with_capacity(64);
             assert!(state.enqueue(SyncHandoffRecord::new(7, 70)));
             assert!(state.enqueue(reply));
         }
@@ -865,7 +856,7 @@ mod tests {
         assert!(!super::holds_direct_record(cpu, 6, 8), "another generation is not this word's record");
         assert!(!super::holds_direct_record(cpu, 7, 0), "a Generic hint carries no custody");
         assert!(!super::holds_direct_record(MAX_TRACKED_CPUS, 6, 9));
-        *super::state_for_cpu(cpu).lock() = SyncHandoffState::new();
+        *super::state_for_cpu(cpu).lock() = SyncHandoffState::with_capacity(64);
         // The consumer withdraws the advertisement after observing the empty FIFO.
         assert!(super::take_next_ready_with(cpu, || false, |_| false).is_none());
         assert!(!super::pending(cpu));
@@ -873,7 +864,7 @@ mod tests {
 
     #[test]
     fn slot_reuse_record_is_rejected_by_exact_task_identity() {
-        let mut state = SyncHandoffState::new();
+        let mut state = SyncHandoffState::with_capacity(64);
         assert!(state.enqueue(SyncHandoffRecord::new(7, 71)));
         assert_eq!(
             state.take_next_ready(|record| record.task_id() == 72),
@@ -889,7 +880,7 @@ mod tests {
 
     #[test]
     fn stale_or_migrated_records_only_lose_urgency_without_double_custody() {
-        let mut state = SyncHandoffState::new();
+        let mut state = SyncHandoffState::with_capacity(64);
         let stale = SyncHandoffRecord::new(9, 91);
         let live = SyncHandoffRecord::new(10, 101);
         assert!(state.enqueue(stale));
@@ -958,7 +949,7 @@ mod tests {
 
     #[test]
     fn reply_generation_refresh_replaces_in_place_and_stale_generation_loses_urgency() {
-        let mut state = SyncHandoffState::new();
+        let mut state = SyncHandoffState::with_capacity(64);
         let old = SyncHandoffRecord::reply_wake(12, 121, 7, 2);
         let fresh = SyncHandoffRecord::reply_wake(12, 121, 8, 2);
         let owner_at_eight = runqueue::RunOwnerSnapshot {
@@ -1022,7 +1013,7 @@ mod tests {
 
     #[test]
     fn generic_handoff_cannot_downgrade_reply_generation_custody() {
-        let mut state = SyncHandoffState::new();
+        let mut state = SyncHandoffState::with_capacity(64);
         let reply = SyncHandoffRecord::reply_wake(12, 121, 7, 2);
         let generic = SyncHandoffRecord::new(12, 121);
         let changed_owner = runqueue::RunOwnerSnapshot {
@@ -1056,11 +1047,11 @@ mod tests {
             wait_reason_kind: 0,
             wait_armed: false,
         };
-        let mut state = SyncHandoffState::new();
+        let mut state = SyncHandoffState::with_capacity(64);
         assert!(state.enqueue(reply));
         assert!(state.enqueue_with_direct_owner(generic, Some((owner, 2))));
         assert_eq!(
-            state.records[state.head],
+            state.records.front(&super::SYNC_HANDOFF_POOL),
             Some(reply),
             "live exact reply cannot be downgraded"
         );
@@ -1070,14 +1061,14 @@ mod tests {
         };
         assert!(state.enqueue_with_direct_owner(generic, Some((newer, 1))));
         assert_eq!(
-            state.records[state.head],
+            state.records.front(&super::SYNC_HANDOFF_POOL),
             Some(reply),
             "wrong-CPU proof is not authority"
         );
         assert!(state.enqueue_with_direct_owner(generic, Some((newer, 2))));
         assert_eq!(state.len(), 1, "replacement retains one FIFO position");
         assert_eq!(
-            state.records[state.head],
+            state.records.front(&super::SYNC_HANDOFF_POOL),
             Some(generic.bind_direct_owner(newer, 2))
         );
         assert_eq!(
@@ -1091,7 +1082,7 @@ mod tests {
 
     #[test]
     fn consumed_fifo_record_retains_exact_generation_for_final_claim() {
-        let mut state = SyncHandoffState::new();
+        let mut state = SyncHandoffState::with_capacity(64);
         let direct = runqueue::RunOwnerSnapshot {
             state: runqueue::RunOwnerState::DirectHandoff,
             cpu: Some(2),
@@ -1121,7 +1112,7 @@ mod tests {
 
     #[test]
     fn consumed_generic_fifo_binds_only_the_exact_local_owner() {
-        let mut state = SyncHandoffState::new();
+        let mut state = SyncHandoffState::with_capacity(64);
         let local = runqueue::RunOwnerSnapshot {
             state: runqueue::RunOwnerState::Local,
             cpu: Some(2),
@@ -1178,7 +1169,7 @@ mod tests {
 
     #[test]
     fn direct_handoff_record_cannot_reclaim_a_republished_owner_generation() {
-        let mut state = SyncHandoffState::new();
+        let mut state = SyncHandoffState::with_capacity(64);
         let owner = runqueue::RunOwnerSnapshot {
             state: runqueue::RunOwnerState::DirectHandoff,
             cpu: Some(2),
@@ -1283,12 +1274,12 @@ mod tests {
         // `taken.is_none()`, every emptying hit left the flag set and the next
         // dispatch took this lock only to read `len == 0` -- the acquisition
         // `pending()` exists to avoid, and the one misreported as `DrainedStale`.
-        let mut state = SyncHandoffState::new();
+        let mut state = SyncHandoffState::with_capacity(64);
         assert!(state.enqueue(SyncHandoffRecord::new(1, 7)));
 
         assert_eq!(state.take_next_ready(|_| true), Some(1));
         assert_eq!(
-            state.len, 0,
+            state.len(), 0,
             "an emptying take must leave the queue clearable"
         );
     }
@@ -1298,7 +1289,7 @@ mod tests {
         // `StartedEmpty` exists because this path charged `DrainedStale`, which
         // names a discard that never happened: the readiness predicate is not
         // consulted at all.
-        let mut state = SyncHandoffState::new();
+        let mut state = SyncHandoffState::with_capacity(64);
         let mut consulted = 0_usize;
 
         assert_eq!(
@@ -1309,6 +1300,6 @@ mod tests {
             None
         );
         assert_eq!(consulted, 0, "an empty queue must reject no record");
-        assert_eq!(state.len, 0);
+        assert_eq!(state.len(), 0);
     }
 }

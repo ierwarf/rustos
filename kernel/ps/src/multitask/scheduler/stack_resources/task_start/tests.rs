@@ -55,7 +55,7 @@ fn same_identity_exec_changes_entry_without_spending_a_reference() {
     let start = read(slot).unwrap();
     // The callback itself reads its owner: no owner lock crosses entry code.
     (start.entry)(start.id);
-    assert_eq!(RESOURCES[slot].pins.load(Ordering::Acquire), 1);
+    assert_eq!(super::resource(slot).pins.load(Ordering::Acquire), 1);
     assert!(!close_for_reclaim(slot));
     assert!(std::panic::catch_unwind(|| publish(slot, start)).is_err());
     assert_eq!(read(slot).unwrap().id, 95101);

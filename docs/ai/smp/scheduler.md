@@ -268,7 +268,7 @@ leases, so its executable refinement is
 Activation is a scheduler transaction, not a replaceable optimization hint:
 
 - every exact supervisor-committed child activation appends one task slot to
-  an allocation-free FIFO bounded by `MAX_TASK`;
+  an allocation-free (boot-provisioned) FIFO bounded by the boot slot count (`slot_table::capacity()`);
 - the scheduler-slot bound proves capacity for one deduplicated pending
   handoff per live task; reaching the bound with another distinct live task is
   an internal accounting contradiction and panics;
@@ -352,7 +352,7 @@ custody for the exact peer needed to advance it:
   an older reply generation or a generic hint cannot weaken that record, and a
   migration away and back cannot revive the prior generation;
 - all call and reply publications share one allocation-free FIFO bounded by
-  `MAX_TASK`, so concurrent CPUs cannot overwrite an older transaction;
+  the boot slot count, so concurrent CPUs cannot overwrite an older transaction;
 - duplicate publication consumes no capacity, retirement removes only the
   exact stale slot, and overflow is an accounting contradiction that panics;
 - the FIFO head runs before unrelated overdue work because the peer is already

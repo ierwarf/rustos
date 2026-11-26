@@ -117,7 +117,7 @@ fn complete_release_opens_every_member_before_slow_per_slot_unseal_without_a_glo
             wait_entered.recv().unwrap();
             let finish = scope.spawn(move || owner.complete());
             let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while BATCHES[A].load(Ordering::Acquire) & 3 != COMPLETE
+            while batch_word(A).load(Ordering::Acquire) & 3 != COMPLETE
                 && std::time::Instant::now() < until
             {
                 std::thread::yield_now();
@@ -143,12 +143,12 @@ fn complete_release_opens_every_member_before_slow_per_slot_unseal_without_a_glo
 fn failed_member_and_duplicate_preflight_roll_back_only_exact_binding_pins_and_epoch_never_replays()
 {
     isolated(|| {
-        let before = BATCHES[A].load(Ordering::Acquire);
+        let before = task_table::get(A).cohort_batch.load(Ordering::Acquire);
         assert!(Cohort::begin(&[(A, 126001), (B, 999)]).is_none());
         assert!(!busy(A));
         assert!(!busy(B));
         assert_eq!(execution::count(A), 0);
-        assert!(BATCHES[A].load(Ordering::Acquire) > before);
+        assert!(task_table::get(A).cohort_batch.load(Ordering::Acquire) > before);
         assert!(Cohort::begin(&[(A, 126001), (A, 126001)]).is_none());
         let owner = Cohort::begin(&[(A, 126001), (B, 127001)]).unwrap();
         let cookie = owner.cookie;
@@ -184,12 +184,12 @@ fn callback_failure_before_effects_can_abort_but_partial_effects_quarantine_bind
         assert!(Cohort::begin(&[(A, 126001)]).is_none());
         assert!(std::panic::catch_unwind(|| identity::clear(A)).is_err());
         // Explicit isolated host recovery; never production rollback/ACK.
-        let cookie = MEMBERS[A].load(Ordering::Acquire);
+        let cookie = try_member_word(A).unwrap().load(Ordering::Acquire);
         for slot in [A, B] {
-            assert_eq!(MEMBERS[slot].swap(0, Ordering::AcqRel), cookie);
+            assert_eq!(try_member_word(slot).unwrap().swap(0, Ordering::AcqRel), cookie);
             execution::recover_binding_pin_for_test(slot);
         }
-        BATCHES[A].fetch_and(!3, Ordering::Release);
+        batch_word(A).fetch_and(!3, Ordering::Release);
     });
 }
 
@@ -199,19 +199,19 @@ fn callback_failure_before_effects_can_abort_but_partial_effects_quarantine_bind
 #[test]
 fn the_highest_slot_is_a_distinct_cohort_root_and_does_not_alias_its_epoch() {
     let _serial = crate::multitask::scheduler::execution_test_serial_guard();
-    let top = MAX - 1;
+    let top = 4095;
     let (id_top, id_low) = (255_001_u64, 255_002_u64);
     identity::clear(top);
     identity::clear(A);
     identity::publish_metadata(top, Some(metadata(id_top)));
     identity::publish_metadata(A, Some(metadata(id_low)));
-    assert!(MAX as u64 <= COOKIE_ROOT_MASK);
+    assert!(task_table::MAX_TASK_SLOTS as u64 <= COOKIE_ROOT_MASK);
     for _ in 0..3 {
         let mut owner = Cohort::begin(&[(top, id_top), (A, id_low)]).unwrap();
         assert_eq!(owner.root, top);
         assert_eq!(owner.cookie & COOKIE_ROOT_MASK, top as u64 + 1);
         assert_eq!(owner.cookie >> COOKIE_ROOT_BITS, owner.epoch);
-        assert_eq!(MEMBERS[A].load(Ordering::Acquire), owner.cookie);
+        assert_eq!(try_member_word(A).unwrap().load(Ordering::Acquire), owner.cookie);
         assert!(!admission_ready(A) && !admission_ready(top));
         owner.begin_effects();
         owner.complete();

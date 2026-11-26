@@ -39,6 +39,7 @@ rules = [
     "handle.reserve=off",
     "ipc.endpoint.enqueue=off",
     "ipc.endpoint.reply=off",
+    "kernel.stack.guard_fault=off",
     "process.spawn=off",
     "rootd.memory.census=off",
     "waitset.register=off",

@@ -1,4 +1,6 @@
 pub(crate) mod slot_dir;
+pub(in crate::multitask) mod irq_pool;
+pub(in crate::multitask) mod task_table;
 mod child_wait;
 mod context;
 pub use self::child_wait::{register_child_waiter, unregister_child_waiter, wake_child_waiters};
@@ -68,7 +70,8 @@ pub use self::current::{
     complete_ipc_reply_wake_handoff_with_custody, complete_pager_fault_wake_handoff,
     complete_retired_task_cleanup, current_console_session, current_linux_thread_state,
     current_pager_charge_snapshot, current_pager_fault_install_permit, current_pager_vma_snapshot,
-    current_scheduling_context_runtime_snapshot, current_thread_cpu_time_ns, current_task_id,
+    current_scheduling_context_runtime_snapshot, current_thread_cpu_time_ns,
+    current_kernel_stack_guard_probe_address, current_task_id,
     current_thread_may_have_pending_signals, current_user_abi, current_user_address_space,
     current_user_id, current_user_ipc_entry, current_user_ipc_identity, current_user_job_charge_group, live_user_thread_ids, current_user_job_policy_allows, current_user_log_ids, current_user_process_id, current_user_process_identity,
     current_user_process_thread_count, current_user_snapshot, current_user_stack_state,
@@ -146,11 +149,9 @@ pub use self::scheduler::{
 };
 pub use self::scheduling_api::{SchedulingContextAdmission, SchedulingContextRuntimeSnapshot};
 
-/// Upper bound for schedulable task identities and cross-crate bounded registries.
-pub const MAX_SCHEDULER_TASKS: usize = task_capacity::CAPACITY.total_slots();
 pub use self::task_capacity::{
-    task_capacity_snapshot, CapacityLimit, TaskCapacity, TaskCapacitySnapshot,
-    CAPACITY as TASK_CAPACITY,
+    capacity as task_capacity, task_capacity_snapshot, CapacityLimit, TaskCapacity,
+    TaskCapacitySnapshot,
 };
 
 pub(crate) use self::irq::{
@@ -207,14 +208,10 @@ pub enum SpawnTaskError {
     NoFreeTaskSlot,
     MemoryQuota,
     /// A new process would exceed the `processes.max` of its Job or of an
-    /// ancestor (the root Job's boot default is the capacity authority's
-    /// `root_process_ceiling`).
+    /// ancestor (or the root process directory ceiling).
     ProcessLimit,
     /// The kernel stack backing for the new thread could not be allocated.
     ThreadStackAllocation,
-    /// The process already holds the capacity authority's
-    /// `process_thread_ceiling` threads (structural per-process ceiling).
-    ProcessThreadLimit,
     /// The process's Job, or an ancestor Job, is at its `threads.max` limit.
     JobThreadLimit,
     /// The process's Job is at its thread kernel-memory budget, so the new
@@ -329,9 +326,8 @@ impl SpawnTaskError {
     /// caller reports the value through `TaskCapacity::limit_value`.
     pub const fn rejecting_limit(self) -> Option<CapacityLimit> {
         match self {
-            Self::NoFreeTaskSlot => Some(CapacityLimit::TaskTable),
-            Self::ProcessThreadLimit => Some(CapacityLimit::ProcessThreads),
-            Self::ProcessLimit => Some(CapacityLimit::RootProcesses),
+            Self::NoFreeTaskSlot => Some(CapacityLimit::TaskDirectory),
+            Self::ProcessLimit => Some(CapacityLimit::ProcessDirectory),
             Self::ThreadStackAllocation => Some(CapacityLimit::KernelStack),
             Self::InvalidWeightMicros
             | Self::MemoryQuota
@@ -352,7 +348,6 @@ impl SpawnTaskError {
             Self::MemoryQuota => "process memory or kernel memory quota exceeded",
             Self::ProcessLimit => "job process limit reached",
             Self::ThreadStackAllocation => "kernel stack allocation for the thread failed",
-            Self::ProcessThreadLimit => "process thread ceiling reached",
             Self::JobThreadLimit => "job threads limit reached",
             Self::JobThreadMemory => "job thread kernel-memory budget exhausted",
             Self::ProcessExiting => "process is exiting",

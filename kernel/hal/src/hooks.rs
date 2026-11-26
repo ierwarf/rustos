@@ -146,6 +146,9 @@ static TASK_HOOKS: TaskHookSlots = TaskHookSlots {
 static DISPATCH_PIC_IRQ_HOOK: HookSlot<Option<fn(u8) -> bool>> = HookSlot::new();
 static HEARTBEAT_SNAPSHOT_HOOK: HookSlot<Option<fn() -> HeartbeatSnapshot>> = HookSlot::new();
 static POPULATE_ANON_PAGE_HOOK: HookSlot<Option<PopulateCurrentAnonymousPageHook>> = HookSlot::new();
+static KERNEL_PAGE_FAULT_HOOK: HookSlot<Option<fn(Option<u64>, u64, u64, u64) -> bool>> =
+    HookSlot::new();
+static DESCRIBE_KERNEL_STACK_FAULT_HOOK: HookSlot<Option<fn(u64, u64)>> = HookSlot::new();
 
 /// Registration is a boot-time operation; callers install each hook group once
 /// before the paths that read it can run, so per-slot publication is enough.
@@ -187,6 +190,26 @@ pub fn register_heartbeat_hooks(hooks: HeartbeatHooks) {
 
 pub fn register_populate_anonymous_page_hook(hook: Option<PopulateCurrentAnonymousPageHook>) {
     POPULATE_ANON_PAGE_HOOK.store(hook);
+}
+
+pub fn register_kernel_stack_fault_hooks(
+    page_fault: Option<fn(Option<u64>, u64, u64, u64) -> bool>,
+    describe_fault: Option<fn(u64, u64)>,
+) {
+    KERNEL_PAGE_FAULT_HOOK.store(page_fault);
+    DESCRIBE_KERNEL_STACK_FAULT_HOOK.store(describe_fault);
+}
+
+pub fn try_handle_kernel_page_fault(error_code: Option<u64>, cr2: u64, rip: u64, rsp: u64) -> bool {
+    KERNEL_PAGE_FAULT_HOOK
+        .load()
+        .is_some_and(|hook| hook(error_code, cr2, rip, rsp))
+}
+
+pub fn describe_kernel_stack_fault(cr2: u64, rsp: u64) {
+    if let Some(hook) = DESCRIBE_KERNEL_STACK_FAULT_HOOK.load() {
+        hook(cr2, rsp);
+    }
 }
 
 pub fn populate_current_anonymous_page(page: u64, write: bool) -> AnonymousPopulateStatus {

@@ -1,7 +1,9 @@
+use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::ops::{Deref, DerefMut};
 use core::panic::Location;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use spin::Mutex as RawSpinMutex;
@@ -12,7 +14,6 @@ const LOCKED: usize = 1;
 const PRE_BLOCK_SPINS: usize = 256;
 const IRQ_OFF_SPIN_LIMIT: usize = 100_000;
 const SCHED_SPIN_LIMIT: usize = 1_000_000;
-const MAX_WAITERS: usize = crate::multitask::MAX_SCHEDULER_TASKS;
 
 #[cfg(test)]
 static NEXT_TEST_LOCK_OWNER: AtomicUsize = AtomicUsize::new(1);
@@ -45,56 +46,175 @@ pub(crate) struct KernelWaitGuard<'a, T: ?Sized, const CLASS: u8> {
     acquire_tsc: u64,
 }
 
+struct WaitNode {
+    task_id: u64,
+    next: Option<NonNull<WaitNode>>,
+    prev: Option<NonNull<WaitNode>>,
+}
+
+impl WaitNode {
+    fn new(task_id: u64) -> Self {
+        Self {
+            task_id,
+            next: None,
+            prev: None,
+        }
+    }
+}
+
 struct WaitQueue {
-    tasks: [u64; MAX_WAITERS],
+    head: Option<NonNull<WaitNode>>,
+    tail: Option<NonNull<WaitNode>>,
+    free_head: Option<NonNull<WaitNode>>,
     len: usize,
 }
+
+// SAFETY: `WaitQueue` is guarded by `RawSpinMutex` and owns every linked `WaitNode`.
+unsafe impl Send for WaitQueue {}
 
 impl WaitQueue {
     const fn new() -> Self {
         Self {
-            tasks: [0; MAX_WAITERS],
+            head: None,
+            tail: None,
+            free_head: None,
             len: 0,
         }
     }
 
-    fn push_unique(&mut self, task_id: u64) -> bool {
-        if self.tasks[..self.len].contains(&task_id) {
-            return true;
+    fn contains(&self, task_id: u64) -> bool {
+        let mut cursor = self.head;
+        while let Some(node) = cursor {
+            // SAFETY: `node` is owned by this `WaitQueue` while linked.
+            let n = unsafe { node.as_ref() };
+            if n.task_id == task_id {
+                return true;
+            }
+            cursor = n.next;
         }
-        if self.len == self.tasks.len() {
-            return false;
+        false
+    }
+
+    fn push_unique_with_spare(&mut self, task_id: u64, spare: Box<WaitNode>) -> Option<Box<WaitNode>> {
+        if self.contains(task_id) {
+            return Some(spare);
         }
-        self.tasks[self.len] = task_id;
+        let raw = Box::into_raw(spare);
+        // SAFETY: `raw` was produced by `Box::into_raw` and is non-null.
+        let mut node_ptr = unsafe { NonNull::new_unchecked(raw) };
+        {
+            // SAFETY: exclusive ownership of fresh `node_ptr`.
+            let node = unsafe { node_ptr.as_mut() };
+            node.task_id = task_id;
+            node.prev = self.tail;
+            node.next = None;
+        }
+        if let Some(mut tail) = self.tail {
+            // SAFETY: `tail` is a live linked node in this `WaitQueue`.
+            unsafe { tail.as_mut() }.next = Some(node_ptr);
+        } else {
+            self.head = Some(node_ptr);
+        }
+        self.tail = Some(node_ptr);
         self.len += 1;
+        None
+    }
+
+    fn unlink_node(&mut self, mut node_ptr: NonNull<WaitNode>) -> Box<WaitNode> {
+        // SAFETY: `node_ptr` is linked in this `WaitQueue`.
+        let node = unsafe { node_ptr.as_ref() };
+        let prev = node.prev;
+        let next = node.next;
+        if let Some(mut p) = prev {
+            // SAFETY: `p` is a live linked node in this `WaitQueue`.
+            unsafe { p.as_mut() }.next = next;
+        } else {
+            self.head = next;
+        }
+        if let Some(mut n) = next {
+            // SAFETY: `n` is a live linked node in this `WaitQueue`.
+            unsafe { n.as_mut() }.prev = prev;
+        } else {
+            self.tail = prev;
+        }
+        self.len -= 1;
+        // SAFETY: `node_ptr` is unlinked and was originally created with `Box::into_raw`.
+        unsafe {
+            node_ptr.as_mut().prev = None;
+            node_ptr.as_mut().next = None;
+            Box::from_raw(node_ptr.as_ptr())
+        }
+    }
+
+    fn remove(&mut self, task_id: u64) -> Option<Box<WaitNode>> {
+        let mut cursor = self.head;
+        while let Some(node_ptr) = cursor {
+            // SAFETY: `node_ptr` is a live linked node in this `WaitQueue`.
+            let node = unsafe { node_ptr.as_ref() };
+            if node.task_id == task_id {
+                return Some(self.unlink_node(node_ptr));
+            }
+            cursor = node.next;
+        }
+        None
+    }
+
+    fn take_retired_spare(&mut self) -> Option<Box<WaitNode>> {
+        let mut head = self.free_head?;
+        // SAFETY: `free_head` nodes remain owned `WaitNode` allocations until reclaimed here.
+        let next = unsafe { head.as_ref().next };
+        self.free_head = next;
+        // SAFETY: `head` was originally allocated with `Box::into_raw` and is now detached.
+        Some(unsafe {
+            head.as_mut().next = None;
+            head.as_mut().prev = None;
+            Box::from_raw(head.as_ptr())
+        })
+    }
+
+    fn pop_front_to_freelist(&mut self) -> Option<u64> {
+        let mut head_ptr = self.head?;
+        // SAFETY: `head_ptr` is linked in this `WaitQueue`.
+        let task_id = unsafe { head_ptr.as_ref().task_id };
+        let next = unsafe { head_ptr.as_ref().next };
+        if let Some(mut n) = next {
+            // SAFETY: `n` is the successor in this `WaitQueue`.
+            unsafe { n.as_mut() }.prev = None;
+        } else {
+            self.tail = None;
+        }
+        self.head = next;
+        self.len -= 1;
+        // Park the popped node on the lock-local freelist so IRQ-context unlocks
+        // never call into the kernel heap allocator.
+        // SAFETY: `head_ptr` was unlinked above and stays owned by `self.free_head`.
+        unsafe {
+            head_ptr.as_mut().prev = None;
+            head_ptr.as_mut().next = self.free_head;
+        }
+        self.free_head = Some(head_ptr);
+        Some(task_id)
+    }
+
+    #[cfg(test)]
+    fn push_unique(&mut self, task_id: u64) -> bool {
+        let spare = self
+            .take_retired_spare()
+            .unwrap_or_else(|| Box::new(WaitNode::new(task_id)));
+        let _unused = self.push_unique_with_spare(task_id, spare);
         true
     }
+}
 
-    fn remove(&mut self, task_id: u64) {
-        let Some(index) = self.tasks[..self.len]
-            .iter()
-            .position(|queued| *queued == task_id)
-        else {
-            return;
-        };
-        for next in index + 1..self.len {
-            self.tasks[next - 1] = self.tasks[next];
+#[cfg(test)]
+impl Drop for WaitQueue {
+    fn drop(&mut self) {
+        while let Some(head) = self.head {
+            drop(self.unlink_node(head));
         }
-        self.len -= 1;
-        self.tasks[self.len] = 0;
-    }
-
-    fn pop_front(&mut self) -> Option<u64> {
-        if self.len == 0 {
-            return None;
+        while let Some(spare) = self.take_retired_spare() {
+            drop(spare);
         }
-        let task_id = self.tasks[0];
-        for next in 1..self.len {
-            self.tasks[next - 1] = self.tasks[next];
-        }
-        self.len -= 1;
-        self.tasks[self.len] = 0;
-        Some(task_id)
     }
 }
 
@@ -114,6 +234,21 @@ impl<T, const CLASS: u8> KernelWaitLock<T, CLASS> {
             waiters: RawSpinMutex::new(WaitQueue::new()),
             value: UnsafeCell::new(value),
         }
+    }
+}
+
+#[inline]
+fn without_interrupts<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    #[cfg(all(rustos_boot_image, not(test)))]
+    {
+        interrupts::without_interrupts(f)
+    }
+    #[cfg(any(not(rustos_boot_image), test))]
+    {
+        f()
     }
 }
 
@@ -251,10 +386,15 @@ impl<T: ?Sized, const CLASS: u8> KernelWaitLock<T, CLASS> {
         acquire_site: &'static Location<'static>,
     ) -> Option<u64> {
         let task_id = crate::multitask::current_task_id()?;
+        // Preallocate the waiter node in preemptible context so the IRQ-masked
+        // wait-queue insertion never invokes the heap allocator.
+        let preallocated = Box::new(WaitNode::new(task_id));
 
         let mut acquired_tsc = None;
         let mut waiter_published = false;
-        interrupts::without_interrupts(|| {
+        let mut unused_node = Some(preallocated);
+        let mut removed_node = None;
+        without_interrupts(|| {
             // Arm the scheduler state before publishing the waiter. Another
             // CPU may unlock at any point below; wake_task() must then cancel
             // the armed block instead of observing a still-running task and
@@ -264,26 +404,23 @@ impl<T: ?Sized, const CLASS: u8> KernelWaitLock<T, CLASS> {
             }
             {
                 let mut waiters = self.waiters.lock();
-                if !waiters.push_unique(task_id) {
-                    let _ = crate::multitask::cancel_block_current_task();
-                    panic!(
-                        "KernelWaitLock waiter queue full: type={} task_id={} wait_at={}:{}",
-                        core::any::type_name::<T>(),
-                        task_id,
-                        acquire_site.file(),
-                        acquire_site.line()
-                    );
+                unused_node = waiters.push_unique_with_spare(task_id, unused_node.take().unwrap());
+                if unused_node.is_none() {
+                    // Reclaim at most one parked node outside the masked section.
+                    unused_node = waiters.take_retired_spare();
                 }
             }
 
             if let Some(tsc) = self.try_acquire_at(owner, acquire_site) {
-                self.waiters.lock().remove(task_id);
+                removed_node = self.waiters.lock().remove(task_id);
                 let _ = crate::multitask::cancel_block_current_task();
                 acquired_tsc = Some(tsc);
                 return;
             }
             waiter_published = true;
         });
+        drop(unused_node);
+        drop(removed_node);
 
         if acquired_tsc.is_some() {
             return acquired_tsc;
@@ -295,7 +432,15 @@ impl<T: ?Sized, const CLASS: u8> KernelWaitLock<T, CLASS> {
             // A task can also be woken for a reason unrelated to this lock.
             // Do not leave that wake as a stale queue entry which later steals
             // an unlock from a live waiter.
-            interrupts::without_interrupts(|| self.waiters.lock().remove(task_id));
+            let mut drained = None;
+            let mut spare = None;
+            without_interrupts(|| {
+                let mut waiters = self.waiters.lock();
+                drained = waiters.remove(task_id);
+                spare = waiters.take_retired_spare();
+            });
+            drop(drained);
+            drop(spare);
         }
         None
     }
@@ -400,7 +545,7 @@ fn wake_first_live_waiter(
 ) -> usize {
     let mut stale = 0usize;
     loop {
-        let Some(task_id) = waiters.lock().pop_front() else {
+        let Some(task_id) = waiters.lock().pop_front_to_freelist() else {
             return stale;
         };
         if wake(task_id) {
@@ -618,11 +763,15 @@ mod tests {
     }
 
     #[test]
-    #[allow(
-        clippy::assertions_on_constants,
-        reason = "the mutation witness must compile a reduced capacity and fail at runtime"
-    )]
-    fn wait_lock_capacity_covers_every_scheduler_task() {
-        assert!(super::MAX_WAITERS >= crate::multitask::MAX_SCHEDULER_TASKS);
+    fn wait_lock_queue_scales_past_legacy_task_ceilings() {
+        let waiters = RawSpinMutex::new(WaitQueue::new());
+        for i in 1..=1500_u64 {
+            assert!(waiters.lock().push_unique(i));
+        }
+        assert_eq!(waiters.lock().len, 1500);
+        for i in 1..=1500_u64 {
+            assert_eq!(waiters.lock().pop_front_to_freelist(), Some(i));
+        }
+        assert_eq!(waiters.lock().len, 0);
     }
 }

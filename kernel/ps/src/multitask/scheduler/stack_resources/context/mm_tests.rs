@@ -3,6 +3,7 @@ use super::tests::metadata;
 use super::*;
 pub(super) fn release(slot: usize) {
     assert!(super::super::close_for_reclaim(slot));
+    crate::multitask::task_table::set_slot_active(slot, false);
     clear(slot);
     super::super::task_start::clear(slot);
     drop(super::super::take_storage(slot));
@@ -97,7 +98,7 @@ fn staged_mm_closes_old_selection_but_cpu_bank_retains_old_root_until_context_re
         );
         let (_, _, _, old) = finalized.into_parts();
         old.retire_execution_state(); // old owner gone; the real resource MM pin still retains root
-        assert!(RESOURCES[SLOT].with(|resources| {
+        assert!(crate::multitask::scheduler::stack_resources::resource(SLOT).with(|resources| {
             resources
                 .mm_pin
                 .as_ref()
@@ -143,14 +144,18 @@ fn exec_receipt_moves_mm_generation_after_root_publication_and_before_old_state_
         )
         .unwrap();
         lease.bind_staged_mm(&staged);
-        assert!(RESOURCES[SLOT].with(|resources| !resources.mm_pin.as_ref().unwrap().is_open()));
+        assert!(crate::multitask::scheduler::stack_resources::resource(SLOT).with(|resources| !resources.mm_pin.as_ref().unwrap().is_open()));
         runqueue::address_space::replace(SLOT, 0x3000);
         let receipt = lease.publication_for_mm_test(handle);
-        assert!(RESOURCES[SLOT].with(|resources| {
+        assert!(crate::multitask::scheduler::stack_resources::resource(SLOT).with(|resources| {
             resources
                 .mm_pin
                 .as_ref()
-                .is_some_and(|pin| pin.matches_exec(reservation, 0x3000))
+                .is_some_and(|pin| {
+                    pin.matches_exec(reservation, 0x3000)
+                        && !pin.matches_exec(reservation, 0x2000)
+                        && !pin.matches_exec(reservation, 0)
+                })
         }));
         process::finalize_exec_state(staged, receipt)
     })
@@ -162,9 +167,9 @@ fn exec_receipt_moves_mm_generation_after_root_publication_and_before_old_state_
         assert_eq!(current_root(3), Some(0x3000));
         // A user context that lost its process binding has no kernel-root
         // exception: the production capture refuses it outright.
-        RESOURCES[SLOT].with(|resources| resources.context.as_mut().unwrap().process_handle = None);
+        crate::multitask::scheduler::stack_resources::resource(SLOT).with(|resources| resources.context.as_mut().unwrap().process_handle = None);
         assert!(in_turn(3, || test_capture_activation(SLOT, 3).is_none()));
-        RESOURCES[SLOT]
+        crate::multitask::scheduler::stack_resources::resource(SLOT)
             .with(|resources| resources.context.as_mut().unwrap().process_handle = Some(handle));
     });
     drop(old_mm);

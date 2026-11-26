@@ -57,6 +57,8 @@ pub(super) fn milestone_output_class(name: &str) -> MilestoneOutputClass {
             || name == "task-context-corrupted"
             || name == "linux-user-fault"
             || name == "linux-user-page-fault-address"
+            || name == "kernel-stack-highwater"
+            || name == "kernel-stack-guard-fault"
             || name == "pager-user-fault-vma-rejected"
             || name == "pager-user-anon-fault-refused"
             || name == "linux-thread-clone-rejected"

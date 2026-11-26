@@ -1757,6 +1757,9 @@ mod tests {
         ).unwrap();
         // A session-startup entry is the one the runtime-launch registry keeps.
         manifest.startup = super::StartupMode::Session;
+        // The example documents the request as optional; declare one explicitly.
+        manifest.desktop.entries[0].request_processes = Some(24);
+        manifest.desktop.entries[0].request_threads = Some(144);
         let artifact = manifest.artifact_path(&config);
         std::fs::create_dir_all(&artifact).unwrap();
         std::fs::write(artifact.join("chrome"), b"browser fixture").unwrap();

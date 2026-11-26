@@ -94,7 +94,7 @@ where
     for (i, &id) in ids.iter().enumerate() {
         // The directory accelerator is not authority: scan exact published
         // user identities, then retain the original physical binding and member.
-        let Some(slot) = (super::FIRST_DYNAMIC_TASK_SLOT..super::MAX_TASK).find(|&slot| {
+        let Some(slot) = crate::multitask::task_table::active_dynamic_slots().find(|&slot| {
             crate::multitask::current_identity::read(slot)
                 .is_some_and(|v| v.user_mode && v.task_id == Some(id))
         }) else {

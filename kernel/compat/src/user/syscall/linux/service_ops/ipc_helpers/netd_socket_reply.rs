@@ -25,7 +25,7 @@ pub(super) fn netd_reply_uses_prepared_socket(request: &NetdIpcRequest) -> bool 
 pub(super) fn call_netd_socket_ipc_request_impl(
     request: &NetdIpcRequest,
     timeout_ms: Option<u64>,
-) -> Result<NetdIpcResponse, i64> {
+) -> Result<alloc::boxed::Box<NetdIpcResponse>, i64> {
     let start_ticks = crate::arch::rtc::ticks();
     let request_len = NETD_IPC_REQUEST_HEADER_SIZE
         .checked_add(request.payload_len as usize)
@@ -72,6 +72,8 @@ pub(super) fn call_netd_socket_ipc_request_impl(
             super::super::vfs_meta::consume_netd_release_payload,
         );
     }
+    let accept_payload = (request.op == SYSCALL_OFFLOAD_OP_LINUX_ACCEPT && request.arg1 != 0)
+        .then(|| decoded.payload[..decoded.payload_len as usize].to_vec());
     install_prepared_netd_socket_response(
         request,
         decoded,
@@ -81,11 +83,11 @@ pub(super) fn call_netd_socket_ipc_request_impl(
         |entries| {
             let prepared = ipc_ops::prepare_transfer_entries_for_current_process(entries)?;
             let fds = prepared.fds()?;
-            if request.op == SYSCALL_OFFLOAD_OP_LINUX_ACCEPT && request.arg1 != 0 {
+            if let Some(payload) = accept_payload.as_deref() {
                 super::super::vfs_meta::write_current_sockaddr_payload(
                     request.arg1,
                     request.arg2,
-                    &decoded.payload[..decoded.payload_len as usize],
+                    payload,
                 )?;
             }
             if ipc_ops::reply_deadline_expired(reply_deadline) {
@@ -103,12 +105,12 @@ pub(super) fn call_netd_socket_ipc_request_impl(
 /// the same one-entry decision boundary without a live scheduler context.
 pub(super) fn install_prepared_netd_socket_response(
     request: &NetdIpcRequest,
-    mut decoded: NetdIpcResponse,
+    mut decoded: alloc::boxed::Box<NetdIpcResponse>,
     entries: Vec<multitask::TransferredHandleEntry>,
     discard: impl FnOnce(Vec<multitask::TransferredHandleEntry>),
     deadline_expired: impl FnOnce() -> bool,
     install: impl FnOnce(Vec<multitask::TransferredHandleEntry>) -> Result<Vec<i32>, i64>,
-) -> Result<NetdIpcResponse, i64> {
+) -> Result<alloc::boxed::Box<NetdIpcResponse>, i64> {
     if !prepared_netd_socket_response_matches(request, &decoded, entries.as_slice()) {
         discard(entries);
         return Err(LINUX_EINVAL);

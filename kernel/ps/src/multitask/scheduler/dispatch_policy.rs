@@ -11,8 +11,8 @@ use core::sync::atomic::AtomicU8;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::{
-    MAX_ATOMIC_ACTIVATION_HANDOFFS, MAX_LATENCY_HANDOFF_HINTS, MAX_TASK, SlotHandoffQueue,
-    handoff_queue::FirstTurnHandoff,
+    handoff_queue::{FirstTurnHandoff, SlotHandoffQueue},
+    MAX_ATOMIC_ACTIVATION_HANDOFFS, MAX_LATENCY_HANDOFF_HINTS,
 };
 use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS};
 use crate::multitask::irq_leaf::{Guard, IrqLeaf};
@@ -206,7 +206,7 @@ pub(super) fn lock(cpu: usize) -> PolicyGuard<'static> {
 
 pub(super) fn reset() {
     for cpu in 0..MAX_TRACKED_CPUS {
-        *lock(cpu) = CpuDispatchPolicy::new();
+        lock(cpu).clear();
         READY_VALIDATION_TURN[cpu].store(0, Ordering::Relaxed);
     }
 }
@@ -265,9 +265,9 @@ pub(super) struct CpuDispatchPolicy {
     pub(super) latency_pick_hints: [Option<LatencyPickHint>; MAX_LATENCY_HANDOFF_HINTS],
     pub(super) latency_pick_hint_head: usize,
     pub(super) latency_pick_hint_len: usize,
-    pub(super) spawn_pick_hints: SlotHandoffQueue<MAX_TASK, FirstTurnHandoff>,
+    pub(super) spawn_pick_hints: SlotHandoffQueue<FirstTurnHandoff>,
     pub(super) atomic_activation_pick_hints:
-        SlotHandoffQueue<MAX_ATOMIC_ACTIVATION_HANDOFFS, FirstTurnHandoff>,
+        SlotHandoffQueue<FirstTurnHandoff>,
     pub(super) atomic_activation_handoff_remaining: usize,
 }
 
@@ -283,6 +283,34 @@ impl CpuDispatchPolicy {
             atomic_activation_handoff_remaining: 0,
         }
     }
+
+    /// A policy with provisioned queues, for fixtures that own a private copy.
+    #[cfg(test)]
+    pub(super) fn sized() -> Self {
+        let mut policy = Self::new();
+        policy.atomic_activation_pick_hints.resize(MAX_ATOMIC_ACTIVATION_HANDOFFS);
+        policy
+    }
+
+    /// Forgets every pending hint and keeps the provisioned queue storage.
+    fn clear(&mut self) {
+        self.next_pick_hint = None;
+        self.latency_pick_hints = [None; MAX_LATENCY_HANDOFF_HINTS];
+        self.latency_pick_hint_head = 0;
+        self.latency_pick_hint_len = 0;
+        self.spawn_pick_hints.clear();
+        self.atomic_activation_pick_hints.clear();
+        self.atomic_activation_handoff_remaining = 0;
+    }
+}
+
+/// Sizes every CPU's activation queue to its fixed bound.
+pub(super) fn initialize_activation_limits() -> bool {
+    for cpu in 0..MAX_TRACKED_CPUS {
+        let mut policy = CPU_DISPATCH_POLICY[cpu].lock();
+        policy.atomic_activation_pick_hints.resize(MAX_ATOMIC_ACTIVATION_HANDOFFS);
+    }
+    true
 }
 
 #[cfg(test)]

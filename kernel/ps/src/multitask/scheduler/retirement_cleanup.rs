@@ -11,7 +11,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use nucleus_core::util::lockdep::LockClass;
 
-use super::{FIRST_DYNAMIC_TASK_SLOT, MAX_TASK, TaskRetireReason, reclaim::RetirementSideEffect};
+use super::{FIRST_DYNAMIC_TASK_SLOT, TaskRetireReason, reclaim::RetirementSideEffect};
 use crate::multitask::RetiredTaskCleanup;
 
 mod busy;
@@ -78,13 +78,13 @@ pub(in crate::multitask::scheduler) fn test_with_pending_kernel<R>(
     struct Restore(usize, u64);
     impl Drop for Restore {
         fn drop(&mut self) {
-            let mut state = CELLS[self.0].state.lock();
+            let mut state = cell(self.0).state.lock();
             assert_eq!(state.kernel, KernelState::Pending(RetirementSideEffect::new(Some(self.1), None)));
             state.kernel = KernelState::Vacant;
         }
     }
     {
-        let mut state = CELLS[slot].state.lock();
+        let mut state = cell(slot).state.lock();
         assert_eq!(state.kernel, KernelState::Vacant);
         assert_eq!(state.cleanup, CleanupState::Vacant);
         assert!(state.reason.is_none() && state.deferred.is_none() && state.producer.is_none());
@@ -101,7 +101,7 @@ pub(in crate::multitask) fn with_wake_binding<R>(
     slot: usize,
     capture: impl FnOnce() -> R,
 ) -> Option<R> {
-    let row = CELLS.get(slot)?.state.lock();
+    let row = try_cell(slot)?.state.lock();
     if row.reset_seal.is_some()
         || row.producer.is_some()
         || row.producing
@@ -115,14 +115,21 @@ pub(in crate::multitask) fn with_wake_binding<R>(
     Some(capture())
 }
 
-struct CleanupCell {
+pub(in crate::multitask) struct CleanupCell {
     state: busy::StateLeaf<{ LockClass::SchedulerRetirementCleanup as u8 }>,
 }
 
 impl CleanupCell {
+    #[cfg(test)]
     const fn new() -> Self {
         Self {
             state: busy::StateLeaf::new(),
+        }
+    }
+
+    pub(in crate::multitask) const fn new_for_slot(slot: u32) -> Self {
+        Self {
+            state: busy::StateLeaf::new_for_slot(slot),
         }
     }
 
@@ -338,7 +345,16 @@ impl CleanupCell {
     }
 }
 
-static CELLS: [CleanupCell; MAX_TASK] = [const { CleanupCell::new() }; MAX_TASK];
+#[inline]
+pub(super) fn cell(slot: usize) -> &'static CleanupCell {
+    &crate::multitask::task_table::get(slot).retirement
+}
+
+#[inline]
+pub(super) fn try_cell(slot: usize) -> Option<&'static CleanupCell> {
+    crate::multitask::task_table::try_get(slot).map(|task| &task.retirement)
+}
+
 static REAP_PENDING: AtomicBool = AtomicBool::new(false);
 
 #[cfg(test)]
@@ -349,25 +365,28 @@ pub(super) fn publish_terminal(
     cleanup: Option<RetiredTaskCleanup>,
     effects: RetirementSideEffect,
 ) {
-    assert!((FIRST_DYNAMIC_TASK_SLOT..MAX_TASK).contains(&slot));
-    CELLS[slot].publish_terminal(task_id, reason, cleanup, effects);
+    assert!(
+        (FIRST_DYNAMIC_TASK_SLOT..crate::multitask::task_table::MAX_TASK_SLOTS).contains(&slot)
+            && crate::multitask::task_table::try_get(slot).is_some()
+    );
+    cell(slot).publish_terminal(task_id, reason, cleanup, effects);
     mark_reap_pending();
 }
 
 
 pub(super) fn deferred(slot: usize) -> Option<TaskRetireReason> {
-    CELLS[slot].state.lock().deferred
+    cell(slot).state.lock().deferred
 }
 
 
 
 pub(super) fn reason(slot: usize) -> Option<TaskRetireReason> {
-    CELLS[slot].state.lock().reason
+    cell(slot).state.lock().reason
 }
 
 #[cfg(test)]
 pub(super) fn test_kernel_detach_payload(slot: usize) -> Option<Option<super::ProcessHandle>> {
-    match CELLS[slot].state.lock().kernel {
+    match cell(slot).state.lock().kernel {
         KernelState::Pending(payload) | KernelState::Claimed(payload) => Some(payload.test_detach_payload()),
         _ => None,
     }
@@ -375,26 +394,31 @@ pub(super) fn test_kernel_detach_payload(slot: usize) -> Option<Option<super::Pr
 
 #[cfg(test)]
 pub(super) fn test_cleanup_payload(slot: usize) -> Option<RetiredTaskCleanup> {
-    match CELLS[slot].state.lock().cleanup {
+    match cell(slot).state.lock().cleanup {
         CleanupState::Pending(payload) | CleanupState::Claimed(payload) => Some(payload),
         _ => None,
     }
 }
 
 pub(in crate::multitask) fn claim_next() -> Option<RetiredTaskCleanup> {
-    busy_slots().find_map(|slot| CELLS[slot].claim())
+    busy_slots().find_map(|slot| cell(slot).claim())
+}
+
+#[cfg(test)]
+pub(super) fn claim_slot(slot: usize) -> Option<RetiredTaskCleanup> {
+    cell(slot).claim()
 }
 
 /// Dynamic slots whose retirement row is not idle: the only rows any
 /// retirement scanner can claim. An observation; claims re-check under the leaf.
 pub(super) fn busy_slots() -> impl Iterator<Item = usize> {
-    busy::slots().filter(|&slot| (FIRST_DYNAMIC_TASK_SLOT..MAX_TASK).contains(&slot))
+    busy::slots().filter(|&slot| slot >= FIRST_DYNAMIC_TASK_SLOT)
 }
 
 pub(in crate::multitask) fn complete(cleanup: RetiredTaskCleanup) -> bool {
     // A Claimed cleanup row is never idle, so the busy index reaches it without
     // walking every row leaf.
-    let complete = busy_slots().any(|slot| CELLS[slot].complete(cleanup));
+    let complete = busy_slots().any(|slot| cell(slot).complete(cleanup));
     if complete {
         mark_reap_pending();
     }
@@ -404,8 +428,8 @@ pub(in crate::multitask) fn complete(cleanup: RetiredTaskCleanup) -> bool {
 /// Native row ACK only; this does not authorize or simulate external effects.
 #[cfg(test)]
 pub(super) fn ack_kernel_fixture(slot: usize) {
-    let (generation, effects) = CELLS[slot].claim_kernel().unwrap();
-    assert!(CELLS[slot].complete_kernel(generation, effects));
+    let (generation, effects) = cell(slot).claim_kernel().unwrap();
+    assert!(cell(slot).complete_kernel(generation, effects));
 }
 
 /// Private non-Copy claim; kernel ACK cannot precede external revocation.
@@ -429,7 +453,7 @@ impl KernelClaim<'_> {
         let mut preemption = nucleus_core::util::lockdep::DispatchPreemption::enter();
         preemption.mask_irqs();
         assert!(
-            CELLS[self.slot].complete_kernel(self.generation, self.effects),
+            cell(self.slot).complete_kernel(self.generation, self.effects),
             "kernel retirement lost its exact claim"
         );
         mark_reap_pending();
@@ -449,7 +473,7 @@ pub(in crate::multitask) fn claim_next_kernel(
 ) -> Option<KernelClaim<'_>> {
     executor.assert_current();
     busy_slots().find_map(|slot| {
-        CELLS[slot]
+        cell(slot)
             .claim_kernel()
             .map(|(generation, effects)| KernelClaim {
                 executor,
@@ -461,24 +485,26 @@ pub(in crate::multitask) fn claim_next_kernel(
 }
 
 pub(super) fn pending(slot: usize) -> bool {
-    CELLS[slot].pending()
+    cell(slot).pending()
 }
 pub(super) fn kernel_pending(slot: usize) -> bool {
-    CELLS[slot].kernel_pending()
+    cell(slot).kernel_pending()
 }
 
 /// Consume work before scanning; never overwrite a concurrent producer/ACK.
 pub(super) fn take_reap_pending() -> bool {
+    // ORDERING: AcqRel consumes the pending flag cleanly without dropping concurrent signals.
     REAP_PENDING.swap(false, Ordering::AcqRel)
 }
 pub(in crate::multitask) fn mark_reap_pending() {
+    // ORDERING: Release publishes pending retirement work to reaper/housekeeping.
     REAP_PENDING.store(true, Ordering::Release);
 }
 
 /// Read-only actual publication diagnostics, never a consumer claim or ACK.
 #[cfg(test)]
 pub(super) fn test_consumer_publication(slot: usize) -> (bool, bool) {
-    let row = CELLS[slot].state.lock();
+    let row = cell(slot).state.lock();
     (
         matches!(row.cleanup, CleanupState::Pending(_) | CleanupState::Claimed(_)),
         matches!(row.kernel, KernelState::Pending(_) | KernelState::Claimed(_)),
@@ -488,7 +514,7 @@ pub(super) fn test_consumer_publication(slot: usize) -> (bool, bool) {
 /// Directory/reaper only, before any runtime, frame or slot identity teardown.
 #[cfg(test)]
 pub(super) fn reset(slot: usize) {
-    CELLS[slot].reset();
+    cell(slot).reset();
 }
 
 pub(in crate::multitask) mod producer;

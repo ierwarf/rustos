@@ -138,6 +138,7 @@ fn wayland_snapshot_equality_uses_content_version_not_pixels() {
         minimized: false,
         server_decoration: true,
         drag_icon: false,
+        popup: false,
         content_version: 7,
         damage: Rect::empty(),
         pixels: Arc::new(vec![1, 2, 3]),
@@ -1605,7 +1606,11 @@ fn data_device_modern_winner_excludes_legacy_and_incompatible_offers() {
 
 fn wait_for_snapshot(state: &mut super::WaylandState) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while state.surfaces[0].shared.lock().unwrap().commit.is_busy() {
+    while state
+        .surfaces
+        .iter()
+        .any(|surface| surface.shared.lock().unwrap().commit.is_busy())
+    {
         assert!(std::time::Instant::now() < deadline, "snapshot timed out");
         state.pump_snapshots();
         std::thread::yield_now();
@@ -2203,6 +2208,329 @@ fn a_destroyed_toplevel_surface_can_be_given_a_new_toplevel_and_shown() {
     wait_for_snapshot(&mut state);
     assert_eq!(state.window_snapshots().len(), 1);
     assert!(!wire::events(&mut peer)
+        .iter()
+        .any(|(obj, op, _)| *obj == 1 && *op == 0));
+}
+
+/// Connects one client, binds compositor/shm/xdg_wm_base as objects 3/4/5 and
+/// maps a toplevel (wl_surface 6, xdg_surface 7, xdg_toplevel 8, shm pool 11,
+/// buffer 12) so popup tests start from a visible parent.
+fn client_with_mapped_toplevel(
+    display: &mut wayland_server::Display<super::WaylandState>,
+    state: &mut super::WaylandState,
+) -> (
+    std::os::unix::net::UnixStream,
+    std::fs::File,
+    std::collections::HashMap<String, u32>,
+) {
+    use std::os::fd::AsRawFd;
+    super::create_wayland_globals(&display.handle());
+    let (server, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server, Arc::new(super::WaylandClientState::default()))
+        .unwrap();
+    wire::send(&mut peer, &wire::message(1, 1, &wire::u32s(&[2])));
+    pump(display, state);
+    let mut names = std::collections::HashMap::new();
+    for (obj, op, p) in wire::events(&mut peer) {
+        if obj == 2 && op == 0 {
+            let len = u32::from_ne_bytes(p[4..8].try_into().unwrap()) as usize;
+            names.insert(
+                String::from_utf8(p[8..8 + len - 1].to_vec()).unwrap(),
+                u32::from_ne_bytes(p[..4].try_into().unwrap()),
+            );
+        }
+    }
+    for (iface, ver, id) in [
+        ("wl_compositor", 6, 3),
+        ("wl_shm", 1, 4),
+        ("xdg_wm_base", 6, 5),
+    ] {
+        let mut args = wire::u32s(&[names[iface]]);
+        args.extend(wire::string(iface));
+        args.extend(wire::u32s(&[ver, id]));
+        wire::send(&mut peer, &wire::message(2, 0, &args));
+    }
+    wire::send(&mut peer, &wire::message(3, 0, &wire::u32s(&[6])));
+    wire::send(&mut peer, &wire::message(5, 2, &wire::u32s(&[7, 6])));
+    wire::send(&mut peer, &wire::message(7, 1, &wire::u32s(&[8])));
+    pump(display, state);
+    let serial = wire::events(&mut peer)
+        .iter()
+        .find(|(obj, op, _)| *obj == 7 && *op == 0)
+        .map(|(_, _, p)| u32::from_ne_bytes(p[..4].try_into().unwrap()))
+        .expect("toplevel initial configure");
+    wire::send(&mut peer, &wire::message(7, 4, &wire::u32s(&[serial])));
+    let file = shm_file(&[0x33; 16]);
+    wire::send_fd(
+        &peer,
+        &wire::message(4, 0, &wire::u32s(&[9, 16])),
+        file.as_raw_fd(),
+    );
+    wire::send(
+        &mut peer,
+        &wire::message(9, 0, &wire::u32s(&[10, 0, 2, 2, 8, 1])),
+    );
+    wire::send(&mut peer, &wire::message(6, 1, &wire::u32s(&[10, 0, 0])));
+    wire::send(&mut peer, &wire::message(6, 6, &[]));
+    pump(display, state);
+    wire::events(&mut peer);
+    wait_for_snapshot(state);
+    (peer, file, names)
+}
+
+#[test]
+fn xdg_popup_is_placed_relative_to_its_parent_and_never_decorated() {
+    let mut display = test_display();
+    let mut state = super::WaylandState::new(1024, 768);
+    let (mut peer, _file, _names) = client_with_mapped_toplevel(&mut display, &mut state);
+    let parent = state.window_snapshots().remove(0);
+    // Test clients bind no decoration manager, so the content area is the frame.
+    assert!(!parent.server_decoration);
+    let (content_x, content_y) = (parent.frame.x, parent.frame.y);
+    let scale = state.output_scale.max(1) as usize;
+
+    // positioner 12: 100x40 below the bottom-left corner of (10,20,50,30).
+    wire::send(&mut peer, &wire::message(5, 1, &wire::u32s(&[11])));
+    wire::send(&mut peer, &wire::message(11, 1, &wire::u32s(&[100, 40])));
+    wire::send(&mut peer, &wire::message(11, 2, &wire::u32s(&[10, 20, 50, 30])));
+    wire::send(&mut peer, &wire::message(11, 3, &wire::u32s(&[6])));
+    wire::send(&mut peer, &wire::message(11, 4, &wire::u32s(&[8])));
+    wire::send(&mut peer, &wire::message(3, 0, &wire::u32s(&[12])));
+    wire::send(&mut peer, &wire::message(5, 2, &wire::u32s(&[13, 12])));
+    wire::send(&mut peer, &wire::message(13, 2, &wire::u32s(&[14, 7, 11])));
+    pump(&mut display, &mut state);
+    let events = wire::events(&mut peer);
+    assert!(
+        !events.iter().any(|(obj, op, _)| *obj == 1 && *op == 0),
+        "get_popup must not raise a protocol error: {events:?}"
+    );
+    let configure = events
+        .iter()
+        .find(|(obj, op, _)| *obj == 14 && *op == 0)
+        .expect("xdg_popup.configure");
+    let ints: Vec<i32> = configure
+        .2
+        .chunks(4)
+        .map(|word| i32::from_ne_bytes(word.try_into().unwrap()))
+        .collect();
+    assert_eq!(ints, [10, 50, 100, 40]);
+    let serial = events
+        .iter()
+        .find(|(obj, op, _)| *obj == 13 && *op == 0)
+        .map(|(_, _, p)| u32::from_ne_bytes(p[..4].try_into().unwrap()))
+        .expect("popup xdg_surface.configure");
+
+    wire::send(&mut peer, &wire::message(13, 4, &wire::u32s(&[serial])));
+    wire::send(
+        &mut peer,
+        &wire::message(9, 0, &wire::u32s(&[15, 0, 2, 2, 8, 1])),
+    );
+    wire::send(&mut peer, &wire::message(12, 1, &wire::u32s(&[15, 0, 0])));
+    wire::send(&mut peer, &wire::message(12, 6, &[]));
+    pump(&mut display, &mut state);
+    wait_for_snapshot(&mut state);
+
+    let snapshots = state.window_snapshots();
+    assert_eq!(snapshots.len(), 2);
+    let popup = snapshots.iter().find(|w| w.popup).expect("popup snapshot");
+    assert!(!popup.server_decoration && !popup.drag_icon);
+    assert_eq!(
+        (popup.frame.x, popup.frame.y),
+        (content_x + 10 * scale, content_y + 50 * scale)
+    );
+    assert!(!parent.popup);
+
+    // The popup follows its parent when the parent moves.
+    assert!(state.move_surface(parent.surface_id, parent.frame.x + 40, parent.frame.y + 30));
+    let moved = state.window_snapshots();
+    let popup = moved.iter().find(|w| w.popup).unwrap();
+    assert_eq!(
+        (popup.frame.x, popup.frame.y),
+        (content_x + 40 + 10 * scale, content_y + 30 + 50 * scale)
+    );
+
+    // Pointer events inside the popup reach the popup, above its parent.
+    // The app layer names the window under the cursor; that is the popup.
+    state.pointer_target = Some(popup.surface_id);
+    let hit = state
+        .hit_test_pointer(popup.frame.x as u32 + 1, popup.frame.y as u32 + 1)
+        .expect("popup hit");
+    assert_eq!(wayland_server::Resource::id(&hit.surface).protocol_id(), 12);
+
+    // Destroying the popup hides it and leaves the parent mapped.
+    wire::send(&mut peer, &wire::message(14, 0, &[]));
+    pump(&mut display, &mut state);
+    let remaining = state.window_snapshots();
+    assert_eq!(remaining.len(), 1);
+    assert!(!remaining[0].popup);
+}
+
+#[test]
+fn xdg_popup_dismissal_sends_popup_done_and_hides_it() {
+    let mut display = test_display();
+    let mut state = super::WaylandState::new(1024, 768);
+    let (mut peer, _file, names) = client_with_mapped_toplevel(&mut display, &mut state);
+    wire::send(&mut peer, &wire::message(5, 1, &wire::u32s(&[11])));
+    wire::send(&mut peer, &wire::message(11, 1, &wire::u32s(&[20, 20])));
+    wire::send(&mut peer, &wire::message(11, 2, &wire::u32s(&[0, 0, 4, 4])));
+    wire::send(&mut peer, &wire::message(3, 0, &wire::u32s(&[12])));
+    wire::send(&mut peer, &wire::message(5, 2, &wire::u32s(&[13, 12])));
+    wire::send(&mut peer, &wire::message(13, 2, &wire::u32s(&[14, 7, 11])));
+    pump(&mut display, &mut state);
+    wire::events(&mut peer);
+    let mut args = wire::u32s(&[names["wl_seat"]]);
+    args.extend(wire::string("wl_seat"));
+    args.extend(wire::u32s(&[7, 15]));
+    wire::send(&mut peer, &wire::message(2, 0, &args));
+    // A grab that is not backed by a serial the client was given is dismissed.
+    wire::send(&mut peer, &wire::message(14, 1, &wire::u32s(&[15, 0xdead])));
+    pump(&mut display, &mut state);
+    let events = wire::events(&mut peer);
+    assert!(
+        events.iter().any(|(obj, op, _)| *obj == 14 && *op == 1),
+        "expected xdg_popup.popup_done, got {events:?}"
+    );
+    assert!(!events.iter().any(|(obj, op, _)| *obj == 1 && *op == 0));
+}
+
+#[test]
+fn xdg_popup_with_an_incomplete_positioner_is_a_protocol_error_not_a_hang() {
+    let mut display = test_display();
+    let mut state = super::WaylandState::new(1024, 768);
+    let (mut peer, _file, _names) = client_with_mapped_toplevel(&mut display, &mut state);
+    wire::send(&mut peer, &wire::message(5, 1, &wire::u32s(&[11])));
+    wire::send(&mut peer, &wire::message(3, 0, &wire::u32s(&[12])));
+    wire::send(&mut peer, &wire::message(5, 2, &wire::u32s(&[13, 12])));
+    wire::send(&mut peer, &wire::message(13, 2, &wire::u32s(&[14, 7, 11])));
+    pump(&mut display, &mut state);
+    assert!(wire::events(&mut peer)
+        .iter()
+        .any(|(obj, op, _)| *obj == 1 && *op == 0));
+}
+
+fn bind_global(
+    peer: &mut std::os::unix::net::UnixStream,
+    names: &std::collections::HashMap<String, u32>,
+    iface: &str,
+    version: u32,
+    id: u32,
+) {
+    let mut args = wire::u32s(&[names[iface]]);
+    args.extend(wire::string(iface));
+    args.extend(wire::u32s(&[version, id]));
+    wire::send(peer, &wire::message(2, 0, &args));
+}
+
+#[test]
+fn wl_subsurface_is_advertised_and_painted_above_its_parent() {
+    let mut display = test_display();
+    let mut state = super::WaylandState::new(1024, 768);
+    let (mut peer, _file, names) = client_with_mapped_toplevel(&mut display, &mut state);
+    let parent = state.window_snapshots().remove(0);
+    let scale = state.output_scale.max(1) as usize;
+
+    // Chrome dereferences a missing wl_subcompositor, so it must be advertised.
+    bind_global(&mut peer, &names, "wl_subcompositor", 1, 11);
+    wire::send(&mut peer, &wire::message(3, 0, &wire::u32s(&[12])));
+    wire::send(&mut peer, &wire::message(11, 1, &wire::u32s(&[13, 12, 6])));
+    wire::send(&mut peer, &wire::message(13, 1, &wire::u32s(&[5, 7])));
+    wire::send(
+        &mut peer,
+        &wire::message(9, 0, &wire::u32s(&[14, 0, 2, 2, 8, 1])),
+    );
+    wire::send(&mut peer, &wire::message(12, 1, &wire::u32s(&[14, 0, 0])));
+    wire::send(&mut peer, &wire::message(12, 6, &[]));
+    pump(&mut display, &mut state);
+    wait_for_snapshot(&mut state);
+    let events = wire::events(&mut peer);
+    assert!(
+        !events.iter().any(|(obj, op, _)| *obj == 1 && *op == 0),
+        "get_subsurface must not raise a protocol error: {events:?}"
+    );
+
+    let snapshots = state.window_snapshots();
+    assert_eq!(snapshots.len(), 2);
+    let child = snapshots.iter().find(|w| w.popup).expect("subsurface snapshot");
+    assert!(!child.server_decoration);
+    assert_eq!(
+        (child.frame.x, child.frame.y),
+        (parent.frame.x + 5 * scale, parent.frame.y + 7 * scale)
+    );
+
+    // Below its parent it is hidden by the opaque parent, not painted over it.
+    wire::send(&mut peer, &wire::message(13, 3, &wire::u32s(&[6])));
+    pump(&mut display, &mut state);
+    assert_eq!(state.window_snapshots().len(), 1);
+
+    // Destroying the subsurface leaves the parent mapped.
+    wire::send(&mut peer, &wire::message(13, 0, &[]));
+    pump(&mut display, &mut state);
+    let remaining = state.window_snapshots();
+    assert_eq!(remaining.len(), 1);
+    assert!(!remaining[0].popup);
+}
+
+#[test]
+fn a_destroyed_wl_subsurface_can_be_given_again_to_the_same_wl_surface() {
+    // Chrome re-parents a wl_surface this way when its omnibox popup reopens
+    // (a key press); a protocol error here kills the whole browser.
+    let mut display = test_display();
+    let mut state = super::WaylandState::new(1024, 768);
+    let (mut peer, _file, names) = client_with_mapped_toplevel(&mut display, &mut state);
+    bind_global(&mut peer, &names, "wl_subcompositor", 1, 11);
+    wire::send(&mut peer, &wire::message(3, 0, &wire::u32s(&[12])));
+    wire::send(&mut peer, &wire::message(11, 1, &wire::u32s(&[13, 12, 6])));
+    wire::send(&mut peer, &wire::message(13, 0, &[]));
+    pump(&mut display, &mut state);
+
+    wire::send(&mut peer, &wire::message(11, 1, &wire::u32s(&[14, 12, 6])));
+    wire::send(&mut peer, &wire::message(14, 1, &wire::u32s(&[5, 7])));
+    wire::send(
+        &mut peer,
+        &wire::message(9, 0, &wire::u32s(&[15, 0, 2, 2, 8, 1])),
+    );
+    wire::send(&mut peer, &wire::message(12, 1, &wire::u32s(&[15, 0, 0])));
+    wire::send(&mut peer, &wire::message(12, 6, &[]));
+    pump(&mut display, &mut state);
+    wait_for_snapshot(&mut state);
+    let events = wire::events(&mut peer);
+    assert!(
+        !events.iter().any(|(obj, op, _)| *obj == 1 && *op == 0),
+        "re-assigning the subsurface role must not be a protocol error: {events:?}"
+    );
+    assert!(state.window_snapshots().iter().any(|w| w.popup));
+
+    // Only the same role may be reused: a live wl_subsurface still conflicts.
+    wire::send(&mut peer, &wire::message(11, 1, &wire::u32s(&[16, 12, 6])));
+    pump(&mut display, &mut state);
+    assert!(wire::events(&mut peer)
+        .iter()
+        .any(|(obj, op, _)| *obj == 1 && *op == 0));
+}
+
+#[test]
+fn wl_subsurface_rejects_self_parent_and_double_role() {
+    let mut display = test_display();
+    let mut state = super::WaylandState::new(1024, 768);
+    let (mut peer, _file, names) = client_with_mapped_toplevel(&mut display, &mut state);
+    bind_global(&mut peer, &names, "wl_subcompositor", 1, 11);
+    wire::send(&mut peer, &wire::message(11, 1, &wire::u32s(&[12, 6, 6])));
+    pump(&mut display, &mut state);
+    assert!(wire::events(&mut peer)
+        .iter()
+        .any(|(obj, op, _)| *obj == 1 && *op == 0));
+
+    // A surface that already is a toplevel cannot become a subsurface.
+    let mut display = test_display();
+    let mut state = super::WaylandState::new(1024, 768);
+    let (mut peer, _file, names) = client_with_mapped_toplevel(&mut display, &mut state);
+    bind_global(&mut peer, &names, "wl_subcompositor", 1, 11);
+    wire::send(&mut peer, &wire::message(3, 0, &wire::u32s(&[12])));
+    wire::send(&mut peer, &wire::message(11, 1, &wire::u32s(&[13, 6, 12])));
+    pump(&mut display, &mut state);
+    assert!(wire::events(&mut peer)
         .iter()
         .any(|(obj, op, _)| *obj == 1 && *op == 0));
 }

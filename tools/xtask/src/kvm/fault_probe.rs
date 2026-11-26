@@ -14,11 +14,12 @@ const FAULT_PROBE_CONTRACT_BODY: &[u8] = b"contract=rustos-fault-probe-v1\n";
 const FAULT_PROBE_FAIL_MARKER: &str = "fault-probe: FAIL";
 const FAULT_PROBE_PASSED_MARKER: &str = "fault-probe: all passed";
 /// One `fault-probe: <case> ok` record per case, all required, in this order.
-const FAULT_PROBE_CASES: [&str; 4] = [
+const FAULT_PROBE_CASES: [&str; 5] = [
     "single-thread-segv",
     "mt-nonleader-fault",
     "leader-exit-sigkill",
     "fault-vs-exit-group",
+    "thread-storm",
 ];
 
 fn fault_probe_markers() -> Vec<String> {

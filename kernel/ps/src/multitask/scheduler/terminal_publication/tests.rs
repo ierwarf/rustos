@@ -22,7 +22,7 @@ fn release_with_ack(slot: usize, id: u64, handle: process_table::ProcessHandle, 
         retirement_cleanup::test_consumer_publication(slot),
         (true, !kernel_done)
     );
-    let cleanup = retirement_cleanup::claim_next().unwrap();
+    let cleanup = retirement_cleanup::claim_slot(slot).unwrap();
     assert_eq!(cleanup.task_id, id);
     assert!(retirement_cleanup::complete(cleanup));
     if !kernel_done { retirement_cleanup::ack_kernel_fixture(slot); }
@@ -59,7 +59,7 @@ fn root(current: bool, f: impl FnOnce(usize, process_table::ProcessHandle)) {
 #[test]
 pub(in crate::multitask::scheduler) fn actual_terminal_process_donations_retire_by_original_members_without_catalog_rescan() {
     use super::super::{donation_publication, thread_creation};
-    let siblings = core::cell::Cell::new([MAX_TASK; 3]);
+    let siblings = core::cell::Cell::new([usize::MAX; 3]);
     let mut boot = root_creation::tests::bootstrap(UserAbi::Linux);
     boot.linux_thread_state = Some(LinuxThreadState::default());
     root_creation::tests::exec_root_with_release(ID, true, boot, |leader, _| {

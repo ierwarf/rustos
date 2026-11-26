@@ -43,12 +43,12 @@ fn vfs_sender_identity_survives_process_visibility_revocation() {
 
 #[test]
 fn netd_failed_mutation_settles_cleanup_before_returning_the_error() {
-    let response = NetdIpcResponse {
+    let response = alloc::boxed::Box::new(NetdIpcResponse {
         status: LINUX_EAGAIN as i32,
         payload_len: 16,
         reserved0: 16,
         ..NetdIpcResponse::default()
-    };
+    });
     let mut releases = 0;
     let result = finish_netd_ipc_response(response, |decoded| {
         releases += 1;
@@ -95,10 +95,10 @@ fn netd_accept_never_relies_on_an_error_reply_for_ancillary_release() {
 
 #[test]
 fn netd_invalid_cleanup_cannot_be_hidden_by_an_operation_error() {
-    let response = NetdIpcResponse {
+    let response = alloc::boxed::Box::new(NetdIpcResponse {
         status: LINUX_EAGAIN as i32,
         ..NetdIpcResponse::default()
-    };
+    });
     assert!(matches!(finish_netd_ipc_response(response, |_| Err(LINUX_EINVAL)), Err(LINUX_EINVAL)));
 }
 
@@ -481,17 +481,17 @@ fn timely_netd_socket_decode_installs_one_exact_entry_and_returns_that_fd() {
         linux_abi::SOCK_NONBLOCK,
     ))
     .expect("initial Inet socket entry is transferable");
-    let decoded = NetdIpcResponse {
+    let decoded = alloc::boxed::Box::new(NetdIpcResponse {
         version: NETD_IPC_ABI_VERSION,
         op: SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
         value: token,
         ..NetdIpcResponse::default()
-    };
+    });
     let installs = core::cell::Cell::new(0_u8);
 
     let response = install_prepared_netd_socket_response(
         &request,
-        decoded,
+        decoded.clone(),
         alloc::vec![entry],
         |entries| panic!("valid reply unexpectedly discarded {} entry", entries.len()),
         || false,
@@ -526,7 +526,7 @@ fn timely_netd_socket_decode_installs_one_exact_entry_and_returns_that_fd() {
     assert_eq!(
         install_prepared_netd_socket_response(
             &request,
-            decoded,
+            decoded.clone(),
             alloc::vec![expired_entry],
             |entries| {
                 assert_eq!(entries.len(), 1);

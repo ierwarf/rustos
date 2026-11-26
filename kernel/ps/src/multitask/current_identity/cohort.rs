@@ -1,25 +1,32 @@
 //! Exact binding custody and one release point for multi-slot cold publication.
 //! No owner leaf spans callbacks, queues, allocation, hardware or destruction.
 use super::{execution, with_writer};
-use crate::multitask::MAX_SCHEDULER_TASKS as MAX;
+use crate::multitask::task_table;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 const PENDING: u64 = 1;
 const COMPLETE: u64 = 2;
 const POISON: u64 = 3;
-// The cookie keeps `root + 1` (1..=MAX) in its low 9 bits, so a 256-slot table
-// still leaves the epoch above bit 9 and root slot 255 cannot alias the epoch.
-const COOKIE_ROOT_BITS: u32 = 9;
+// The cookie keeps `root + 1` (1..=u32::MAX) in its low 32 bits, allowing
+// 32-bit root slot indices without aliasing the cohort epoch.
+const COOKIE_ROOT_BITS: u32 = 32;
 const COOKIE_ROOT_MASK: u64 = (1 << COOKIE_ROOT_BITS) - 1;
-const _: () = assert!(MAX as u64 <= COOKIE_ROOT_MASK);
-static BATCHES: [AtomicU64; MAX] = [const { AtomicU64::new(0) }; MAX];
-static MEMBERS: [AtomicU64; MAX] = [const { AtomicU64::new(0) }; MAX];
+
+#[inline]
+fn batch_word(slot: usize) -> &'static AtomicU64 {
+    &task_table::get(slot).cohort_batch
+}
+
+#[inline]
+fn try_member_word(slot: usize) -> Option<&'static AtomicU64> {
+    task_table::try_get(slot).map(|task| &task.cohort_member)
+}
 
 pub(in crate::multitask) struct Cohort {
     root: usize,
     epoch: u64,
     cookie: u64,
-    pins: [Option<execution::BindingPin>; MAX],
-    len: usize,
+    pins: Vec<Option<execution::BindingPin>>,
     effects: bool,
     activation: bool,
     job_control: bool,
@@ -27,8 +34,7 @@ pub(in crate::multitask) struct Cohort {
 }
 /// Busy for mutation/lifetime, including the brief complete-but-not-unsealed phase.
 pub(in crate::multitask) fn busy(slot: usize) -> bool {
-    MEMBERS
-        .get(slot)
+    try_member_word(slot)
         .is_some_and(|word| word.load(Ordering::Acquire) != 0)
 }
 pub(super) fn check_unowned_gate(slot: usize, gate: super::LifecycleGate) {
@@ -39,7 +45,7 @@ pub(super) fn check_unowned_gate(slot: usize, gate: super::LifecycleGate) {
 }
 
 pub(super) fn admission_ready(slot: usize) -> bool {
-    let Some(member) = MEMBERS.get(slot) else {
+    let Some(member) = try_member_word(slot) else {
         return false;
     };
     let cookie = member.load(Ordering::Acquire);
@@ -47,9 +53,8 @@ pub(super) fn admission_ready(slot: usize) -> bool {
         return true;
     }
     let root = ((cookie & COOKIE_ROOT_MASK) - 1) as usize;
-    BATCHES
-        .get(root)
-        .is_some_and(|word| word.load(Ordering::Acquire) == ((cookie >> COOKIE_ROOT_BITS) << 2) | COMPLETE)
+    task_table::try_get(root)
+        .is_some_and(|task| task.cohort_batch.load(Ordering::Acquire) == ((cookie >> COOKIE_ROOT_BITS) << 2) | COMPLETE)
 }
 impl Cohort {
     pub(in crate::multitask) fn begin(members: &[(usize, u64)]) -> Option<Self> {
@@ -57,15 +62,15 @@ impl Cohort {
     }
     fn begin_kind(members: &[(usize, u64)], activation: bool) -> Option<Self> {
         let &(root, _) = members.first()?;
-        if members.len() > MAX || root >= MAX {
+        if task_table::try_get(root).is_none() || (root as u64 + 1) > COOKIE_ROOT_MASK {
             return None;
         }
         for (i, &(slot, _)) in members.iter().enumerate() {
-            if slot >= MAX || members[..i].iter().any(|&(old, _)| old == slot) {
+            if task_table::try_get(slot).is_none() || members[..i].iter().any(|&(old, _)| old == slot) {
                 return None;
             }
         }
-        let ledger = &BATCHES[root];
+        let ledger = batch_word(root);
         let old = ledger.load(Ordering::Acquire);
         if old & 3 != 0 {
             return None;
@@ -86,8 +91,7 @@ impl Cohort {
             root,
             epoch,
             cookie,
-            pins: [const { None }; MAX],
-            len: 0,
+            pins: Vec::with_capacity(members.len()),
             effects: false,
             activation,
             job_control: false,
@@ -105,11 +109,11 @@ impl Cohort {
                     return None;
                 }
                 let pin = execution::pin_binding(slot, writer, id)?;
-                MEMBERS[slot].store(cookie, Ordering::Release);
+                // ORDERING: Release publishes cohort cookie membership under writer lock.
+                task_table::get(slot).cohort_member.store(cookie, Ordering::Release);
                 Some(pin)
             })??;
-            owner.pins[owner.len] = Some(pin);
-            owner.len += 1;
+            owner.pins.push(Some(pin));
         }
         Some(owner)
     }
@@ -170,11 +174,10 @@ impl Cohort {
     pub(in crate::multitask) fn owns_member(&self, slot: usize, id: u64) -> bool {
         self.live
             && self.effects
-            && MEMBERS
-                .get(slot)
+            && try_member_word(slot)
                 .is_some_and(|word| word.load(Ordering::Acquire) == self.cookie)
-            && BATCHES[self.root].load(Ordering::Acquire) == (self.epoch << 2 | PENDING)
-            && self.pins[..self.len]
+            && batch_word(self.root).load(Ordering::Acquire) == (self.epoch << 2 | PENDING)
+            && self.pins
                 .iter()
                 .flatten()
                 .any(|pin| pin.slot() == slot && pin.id() == id)
@@ -191,7 +194,7 @@ impl Cohort {
     /// Pure atomic release; may join a higher-ranked process publication leaf.
     pub(in crate::multitask) fn publish_admission(&mut self) {
         assert!(self.effects, "cohort completed without owned publication");
-        BATCHES[self.root]
+        batch_word(self.root)
             .compare_exchange(
                 self.epoch << 2 | PENDING,
                 self.epoch << 2 | COMPLETE,
@@ -202,25 +205,26 @@ impl Cohort {
     }
     pub(in crate::multitask) fn finish_published(mut self) {
         assert_eq!(
-            BATCHES[self.root].load(Ordering::Acquire),
+            batch_word(self.root).load(Ordering::Acquire),
             self.epoch << 2 | COMPLETE
         );
         self.unseal();
     }
     fn unseal(&mut self) {
-        for pin in self.pins[..self.len].iter_mut() {
+        for pin in self.pins.iter_mut() {
             let pin = pin.take().expect("cohort lost binding pin");
             with_writer(pin.slot(), |_| {
-                MEMBERS[pin.slot()]
+                task_table::get(pin.slot())
+                    .cohort_member
                     .compare_exchange(self.cookie, 0, Ordering::AcqRel, Ordering::Acquire)
                     .expect("cohort unsealed a foreign slot epoch");
             })
             .expect("cohort lost slot");
             drop(pin); // outside Identity51; last release may notify reaper
         }
-        let phase = BATCHES[self.root].load(Ordering::Acquire);
+        let phase = batch_word(self.root).load(Ordering::Acquire);
         assert!(phase == (self.epoch << 2 | PENDING) || phase == (self.epoch << 2 | COMPLETE));
-        BATCHES[self.root]
+        batch_word(self.root)
             .compare_exchange(phase, self.epoch << 2, Ordering::AcqRel, Ordering::Acquire)
             .expect("cohort release lost producer");
         self.live = false;
@@ -235,9 +239,9 @@ impl Drop for Cohort {
             self.unseal();
             return;
         }
-        let phase = BATCHES[self.root].load(Ordering::Acquire);
+        let phase = batch_word(self.root).load(Ordering::Acquire);
         assert!(phase == (self.epoch << 2 | PENDING) || phase == (self.epoch << 2 | COMPLETE));
-        BATCHES[self.root]
+        batch_word(self.root)
             .compare_exchange(
                 phase,
                 self.epoch << 2 | POISON,
@@ -245,7 +249,7 @@ impl Drop for Cohort {
                 Ordering::Acquire,
             )
             .expect("cohort poison lost producer");
-        for pin in self.pins[..self.len].iter_mut() {
+        for pin in self.pins.iter_mut() {
             core::mem::forget(pin.take());
         }
         // Quarantine exact UID refs and member words. Partial effects cannot reopen.

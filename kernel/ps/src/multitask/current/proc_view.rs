@@ -14,12 +14,12 @@
 
 use alloc::vec::Vec;
 
-use super::super::{current_identity, scheduler::MAX_TASK};
+use super::super::current_identity;
 
 /// Linux thread ids of the live, non-retired user threads of `pid`, ascending.
 pub fn live_user_thread_ids(pid: u64) -> Vec<u64> {
     let mut ids = Vec::new();
-    for slot in 0..MAX_TASK {
+    for slot in super::super::task_table::active_slots() {
         if current_identity::observe_user_process_task_abi(slot, pid, 0).is_none() {
             continue;
         }

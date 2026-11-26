@@ -1318,7 +1318,7 @@ fn render_dock_gpu_texture(state: &AppState) -> Result<(Rect, Vec<u32>), GpuScen
         for (index, window) in state
             .wayland_windows
             .iter()
-            .filter(|window| !window.drag_icon)
+            .filter(|window| !window.drag_icon && !window.popup)
             .enumerate()
         {
             let rect = taskbar_slot_rect(
@@ -1695,7 +1695,7 @@ fn render_scene(
     }
     for (index, window) in wayland_windows
         .iter()
-        .filter(|window| !window.drag_icon)
+        .filter(|window| !window.drag_icon && !window.popup)
         .enumerate()
     {
         let rect = taskbar_slot_rect(width, height, console_windows.len().saturating_add(index));

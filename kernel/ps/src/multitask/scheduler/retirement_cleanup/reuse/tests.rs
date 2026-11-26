@@ -11,7 +11,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 const SLOT: usize = 105;
 const ID: u64 = 105001;
 fn initialize() -> u64 {
-    let mut row = CELLS[SLOT].state.lock();
+    let mut row = cell(SLOT).state.lock();
     assert!(row.reset_seal.is_none());
     row.cleanup = CleanupState::Complete;
     row.kernel = KernelState::Complete;
@@ -29,10 +29,10 @@ fn sealed_terminal_row_denies_foreign_unowned_reset_and_deferred_producer_until_
     assert!(begin(SLOT, Some(ID + 1)).is_none());
     let mut seal = begin(SLOT, Some(ID)).unwrap();
     assert!(begin(SLOT, Some(ID)).is_none());
-    assert!(catch_unwind(AssertUnwindSafe(|| CELLS[SLOT].reset())).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| cell(SLOT).reset())).is_err());
     assert!(
         catch_unwind(AssertUnwindSafe(
-            || CELLS[SLOT].defer(Some(ID), TaskRetireReason::Exited)
+            || cell(SLOT).defer(Some(ID), TaskRetireReason::Exited)
         ))
         .is_err()
     );
@@ -41,7 +41,7 @@ fn sealed_terminal_row_denies_foreign_unowned_reset_and_deferred_producer_until_
     // Vacant post-reset row removes the independent kernel/cleanup guards.
     assert!(
         catch_unwind(AssertUnwindSafe(
-            || CELLS[SLOT].defer(Some(ID), TaskRetireReason::Exited)
+            || cell(SLOT).defer(Some(ID), TaskRetireReason::Exited)
         ))
         .is_err()
     );
@@ -54,10 +54,10 @@ fn sealed_terminal_row_denies_foreign_unowned_reset_and_deferred_producer_until_
 fn each_terminal_custody_independently_refuses_seal_without_spending_nonce() {
     let _fixture = scheduler::tests::boxed_scheduler();
     initialize();
-    let nonce = CELLS[SLOT].state.lock().reset_nonce;
+    let nonce = cell(SLOT).state.lock().reset_nonce;
     for mode in 0..4 {
         {
-            let mut row = CELLS[SLOT].state.lock();
+            let mut row = cell(SLOT).state.lock();
             match mode {
                 0 => row.producing = true,
                 1 => row.deferred = Some(TaskRetireReason::Exited),
@@ -77,7 +77,7 @@ fn each_terminal_custody_independently_refuses_seal_without_spending_nonce() {
         }
         assert!(begin(SLOT, Some(ID)).is_none());
         {
-            let mut row = CELLS[SLOT].state.lock();
+            let mut row = cell(SLOT).state.lock();
             assert_eq!(row.reset_nonce, nonce);
             row.producing = false;
             row.deferred = None;
@@ -95,14 +95,14 @@ fn abandoned_effects_keep_terminal_row_quarantined_and_nonce_exhaustion_never_wr
     let _fixture = scheduler::tests::boxed_scheduler();
     initialize();
     let old = {
-        let mut row = CELLS[SLOT].state.lock();
+        let mut row = cell(SLOT).state.lock();
         let old = row.reset_nonce;
         row.reset_nonce = u64::MAX;
         old
     };
     assert!(begin(SLOT, Some(ID)).is_none());
     {
-        let mut row = CELLS[SLOT].state.lock();
+        let mut row = cell(SLOT).state.lock();
         assert!(row.reset_seal.is_none());
         row.reset_nonce = old;
     }
@@ -111,8 +111,8 @@ fn abandoned_effects_keep_terminal_row_quarantined_and_nonce_exhaustion_never_wr
     seal.reset();
     drop(seal);
     assert!(begin(SLOT, None).is_none());
-    assert!(CELLS[SLOT].state.lock().reset_seal.is_some());
-    CELLS[SLOT].state.lock().reset_seal = None;
+    assert!(cell(SLOT).state.lock().reset_seal.is_some());
+    cell(SLOT).state.lock().reset_seal = None;
 }
 #[test]
 fn before_effect_rollback_is_exact_and_old_seal_cannot_release_next_producer_nonce() {
@@ -131,7 +131,7 @@ fn before_effect_rollback_is_exact_and_old_seal_cannot_release_next_producer_non
         reset: false,
         live: true,
     });
-    assert_eq!(CELLS[SLOT].state.lock().reset_seal, Some(next.nonce));
+    assert_eq!(cell(SLOT).state.lock().reset_seal, Some(next.nonce));
     next.mark_effects();
     next.reset();
     next.finish();

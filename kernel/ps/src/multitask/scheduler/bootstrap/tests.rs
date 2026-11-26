@@ -74,7 +74,7 @@ fn initial_producer_binds_cpu_slot_uid_generation_and_wrong_alias_refuses_before
     root.begin_publication(7).unwrap();
     root.complete_publication();
     let ap = key.cpu(1, 11).unwrap();
-    assert_eq!((ap.slot(), ap.generation()), (MAX_TASK - 1, 9));
+    assert_eq!((ap.slot(), ap.generation()), (1, 9));
 }
 #[test]
 fn duplicate_publication_cannot_spend_bank_or_ack_and_abandonment_retains_poisoned_image() {
@@ -122,7 +122,7 @@ fn ap_entry_is_generation_exact_unique_and_poisoned_entry_never_reuses_next_cpu(
     assert_eq!(cell.cpus[1].phase.load(Ordering::Acquire), CPU_POISON);
     let entry = cell.entry(2, 8).unwrap();
     assert_eq!(entry.cpu(), 2);
-    assert_eq!(entry.slot(), MAX_TASK - 2);
+    assert_eq!(entry.slot(), 2);
 }
 #[test]
 fn concurrent_bsp_claims_have_one_winner_without_global_directory_or_callback_lock() {

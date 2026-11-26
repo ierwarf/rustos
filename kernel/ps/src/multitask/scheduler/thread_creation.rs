@@ -53,10 +53,12 @@ impl Drop for Reservation {
 /// Number of dynamic task slots a new thread could reserve right now. A
 /// non-binding observation (each slot is read under its own admission leaf, one
 /// at a time) for the capacity snapshot; `reserve` still decides.
+/// Remaining dynamic task-slot headroom.
+#[cfg(test)]
 pub(in crate::multitask) fn reservable_slots() -> usize {
-    (FIRST_DYNAMIC_TASK_SLOT..MAX_TASK)
-        .filter(|slot| stack_resources::admission::reservable(*slot))
-        .count()
+    let total = crate::multitask::task_table::MAX_TASK_SLOTS
+        .saturating_sub(FIRST_DYNAMIC_TASK_SLOT);
+    total.saturating_sub(crate::multitask::task_table::active_task_count())
 }
 
 pub(in crate::multitask::scheduler) fn capture_creator(
@@ -87,40 +89,35 @@ fn reserve_with(
     let root = runqueue::address_space::root(parent.0);
     let mm = stack_resources::context::pin_thread_reservation_mm(parent.0, parent.1, handle, root)
         .ok_or(Refusal::ThreadCreatorUnavailable)?;
-    for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
-        let Some(ticket) = stack_resources::admission::reserve(slot, id) else {
-            continue;
-        };
-        if root_slots::prepare_storage(&ticket).is_none() {
-            assert!(ticket.begin_cancel());
-            drop(ticket.take_storage());
-            ticket.finish_cancel();
-            return Err(Refusal::ThreadStackAllocation);
-        }
-        if let Err(refusal) = process_table::attach_task(handle) {
-            assert!(ticket.begin_cancel());
-            drop(ticket.take_storage());
-            ticket.finish_cancel();
-            return Err(refusal);
-        }
-        return Ok(Reservation {
-            ticket: Some(ticket),
-            mm: Some(mm),
-            parent,
-            handle,
-            pid,
-            root,
-            weight: runqueue::weight::value(parent.0),
-            vruntime: runqueue::vruntime(parent.0)
-                .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS),
-            policy: context.scheduling_context.policy(),
-            domain: context.scheduling_context.domain_slot(),
-            domain_generation: context.scheduling_context.domain_generation(),
-            live: true,
-        });
+    let ticket = stack_resources::admission::reserve_dynamic(id)
+        .ok_or(Refusal::NoFreeTaskSlot)?;
+    if root_slots::prepare_storage(&ticket).is_none() {
+        assert!(ticket.begin_cancel());
+        drop(ticket.take_stack());
+        ticket.finish_cancel();
+        return Err(Refusal::ThreadStackAllocation);
     }
-    // Only reached when no dynamic slot could be reserved at all.
-    Err(Refusal::NoFreeTaskSlot)
+    if let Err(refusal) = process_table::attach_task(handle) {
+        assert!(ticket.begin_cancel());
+        drop(ticket.take_stack());
+        ticket.finish_cancel();
+        return Err(refusal);
+    }
+    Ok(Reservation {
+        ticket: Some(ticket),
+        mm: Some(mm),
+        parent,
+        handle,
+        pid,
+        root,
+        weight: runqueue::weight::value(parent.0),
+        vruntime: runqueue::vruntime(parent.0)
+            .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS),
+        policy: context.scheduling_context.policy(),
+        domain: context.scheduling_context.domain_slot(),
+        domain_generation: context.scheduling_context.domain_generation(),
+        live: true,
+    })
 }
 
 pub(in crate::multitask) fn cancel(reservation: Reservation) {
@@ -141,7 +138,7 @@ fn cancel_owned(
     // Ticket and original MM remain occupied until both effects return.
     process_table::detach_task(reservation.handle)
         .expect("thread producer lost process attachment");
-    drop(reservation.ticket().take_storage());
+    drop(reservation.ticket().take_stack());
     reservation.ticket.take().unwrap().finish_cancel();
     reservation.live = false;
 }
@@ -224,9 +221,7 @@ fn publish(
     publication.parent.begin_effects();
     let saved_rsp = execution_image::reserved_user_entry(r.ticket(), &bootstrap, cs, ss, flags);
     r.ticket().begin_commit();
-    let base = stack_resources::storage_base(slot);
-    let kernel_base = (base + TASK_STACK_GUARD_BYTES) as u64;
-    let kernel_top = align_kernel_stack_top(base + TASK_STACK_SIZE) as u64;
+    let (kernel_base, kernel_top) = stack_resources::stack_bounds(slot);
     let context = TaskContext {
         scheduling_context,
         #[cfg(test)]

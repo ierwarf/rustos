@@ -10,9 +10,11 @@
 //! - **Concurrency:** Lock-free fixed table matching scheduler capacity with
 //!   `SeqCst` fences pairing producer completion against consumer arm/recheck.
 
-use core::sync::atomic::{fence, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
+use super::slot_dir::AtomicDir;
 
-const CAPACITY: usize = super::MAX_SCHEDULER_TASKS;
+const CHUNK_LEN: usize = 64;
+const MAX_CHUNKS: usize = 4096;
 const RESERVED_SLOT: u64 = u64::MAX;
 
 struct Slot {
@@ -31,26 +33,16 @@ impl Slot {
     }
 }
 
-static COMPLETIONS: [Slot; CAPACITY] = [const { Slot::new() }; CAPACITY];
-
-/// Registers a `vfork` completion record for `(child_pid, parent_tid)` before
-/// the child task is activated so an immediate `exec` or `_exit` cannot lose
-/// the completion signal.
-pub fn begin_vfork_wait(child_pid: u64, parent_tid: u64) -> bool {
-    if child_pid == 0 || child_pid == RESERVED_SLOT || parent_tid == 0 {
-        return false;
-    }
-    if try_claim_slot(child_pid, parent_tid) {
-        return true;
-    }
-    // Table full: a parent killed while suspended never runs `take_vfork_done`,
-    // so its completed record would stay forever. Reclaim those and retry.
-    reclaim_orphaned();
-    try_claim_slot(child_pid, parent_tid)
-}
+static COMPLETIONS: AtomicDir<Slot, CHUNK_LEN, MAX_CHUNKS> = AtomicDir::new();
+static NEXT_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
 
 fn try_claim_slot(child_pid: u64, parent_tid: u64) -> bool {
-    for slot in &COMPLETIONS {
+    // ORDERING: Acquire observes allocated slots published prior to scan.
+    let len = NEXT_HIGH_WATER.load(Ordering::Acquire);
+    for idx in 0..len {
+        let Some(slot) = COMPLETIONS.get(idx) else {
+            continue;
+        };
         if slot
             .child_pid
             .compare_exchange(0, RESERVED_SLOT, Ordering::Acquire, Ordering::Relaxed)
@@ -63,14 +55,52 @@ fn try_claim_slot(child_pid: u64, parent_tid: u64) -> bool {
             return true;
         }
     }
+    // Grow by one entry in `AtomicDir` cleanly outside any IRQ or lock.
+    let idx = NEXT_HIGH_WATER
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            (cur < CHUNK_LEN * MAX_CHUNKS).then_some(cur + 1)
+        })
+        .ok();
+    let Some(idx) = idx else {
+        return false;
+    };
+    if !COMPLETIONS.ensure(idx, Slot::new) {
+        return false;
+    }
+    let Some(slot) = COMPLETIONS.get(idx) else {
+        return false;
+    };
+    if slot
+        .child_pid
+        .compare_exchange(0, RESERVED_SLOT, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+    {
+        slot.parent_tid.store(parent_tid, Ordering::Release);
+        slot.done.store(0, Ordering::Release);
+        slot.child_pid.store(child_pid, Ordering::Release);
+        fence(Ordering::SeqCst);
+        return true;
+    }
     false
+}
+
+/// Reserves a `vfork` completion record before child activation.
+pub fn begin_vfork_wait(child_pid: u64, parent_tid: u64) -> bool {
+    if child_pid == 0 || child_pid == RESERVED_SLOT || parent_tid == 0 {
+        return false;
+    }
+    if try_claim_slot(child_pid, parent_tid) {
+        return true;
+    }
+    reclaim_orphaned();
+    try_claim_slot(child_pid, parent_tid)
 }
 
 /// Frees records whose waiting parent task no longer exists (only the parent
 /// consumes a record, so a dead parent can never free it). Records still
 /// awaiting the child stay: `complete_vfork` must be able to find them.
 fn reclaim_orphaned() {
-    for slot in &COMPLETIONS {
+    for slot in COMPLETIONS.iter() {
         let child_pid = slot.child_pid.load(Ordering::Acquire);
         if child_pid == 0 || child_pid == RESERVED_SLOT {
             continue;
@@ -108,7 +138,7 @@ pub fn complete_vfork(child_pid: u64) {
         return;
     }
     fence(Ordering::SeqCst);
-    for slot in &COMPLETIONS {
+    for slot in COMPLETIONS.iter() {
         let current = slot.child_pid.load(Ordering::Acquire);
         if current == child_pid {
             slot.done.store(1, Ordering::Release);
@@ -134,7 +164,7 @@ pub fn take_vfork_done(child_pid: u64, parent_tid: u64) -> bool {
     }
     fence(Ordering::SeqCst);
     let mut found = false;
-    for slot in &COMPLETIONS {
+    for slot in COMPLETIONS.iter() {
         if slot.child_pid.load(Ordering::Acquire) == child_pid
             && slot.parent_tid.load(Ordering::Acquire) == parent_tid
         {
@@ -156,7 +186,7 @@ pub fn cancel_vfork_wait(child_pid: u64, parent_tid: u64) {
     if child_pid == 0 || child_pid == RESERVED_SLOT {
         return;
     }
-    for slot in &COMPLETIONS {
+    for slot in COMPLETIONS.iter() {
         if slot.child_pid.load(Ordering::Acquire) == child_pid
             && (parent_tid == 0 || slot.parent_tid.load(Ordering::Acquire) == parent_tid)
         {
@@ -188,17 +218,13 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap();
         assert!(begin_vfork_wait(9003, 8_999));
         complete_vfork(9003);
-        // Dead parent never consumes; fill the rest of the table to force the sweep.
         let mut filled = std::vec::Vec::new();
-        let mut pid = 70_000;
-        while begin_vfork_wait(pid, 8004) {
+        for i in 0..128 {
+            let pid = 70_000 + i;
+            assert!(begin_vfork_wait(pid, 8004));
             filled.push(pid);
-            pid += 1;
-            if filled.len() > CAPACITY {
-                break;
-            }
         }
-        assert!(filled.len() <= CAPACITY);
+        reclaim_orphaned();
         for pid in &filled {
             cancel_vfork_wait(*pid, 8004);
         }

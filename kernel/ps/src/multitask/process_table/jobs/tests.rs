@@ -268,24 +268,19 @@ fn a_thread_limit_refuses_the_next_thread_across_the_subtree() {
 }
 
 #[test]
-fn a_thread_limit_above_the_per_process_ceiling_is_still_charged_and_enforced() {
-    const CEILING: usize = crate::multitask::task_capacity::CAPACITY.process_thread_ceiling();
+fn a_job_thread_limit_is_shared_and_enforced_across_processes_without_per_process_ceiling() {
     let _isolation = isolate_process_table();
     let job = job_create_child(ROOT_JOB).unwrap();
-    // Two processes may together exceed one process's ceiling, up to the job limit.
-    let limit = (CEILING + 4) as u64;
+    // Single processes can exceed legacy 512-thread ceilings up to the Job limit.
+    let a_threads = 600_u64;
+    let limit = a_threads + 4;
     job_set_limits(job, LimitMask::THREADS, limits(LIMIT_UNSET, limit)).unwrap();
     let a = spawn_in(140, None, Some(job)).unwrap();
     let b = spawn_in(141, None, Some(job)).unwrap();
-    for _ in 1..CEILING {
-        attach_task(a).expect("within the process ceiling and the job limit");
+    for _ in 1..a_threads {
+        attach_task(a).expect("within the job limit past legacy 512 ceiling");
     }
-    assert_eq!(
-        attach_task(a),
-        Err(SpawnTaskError::ProcessThreadLimit),
-        "the per-process ceiling still binds"
-    );
-    assert_eq!(job_info(job).unwrap().usage_threads, (CEILING + 1) as u64);
+    assert_eq!(job_info(job).unwrap().usage_threads, a_threads + 1);
     for _ in 0..3 {
         attach_task(b).expect("within the job limit");
     }
@@ -293,7 +288,7 @@ fn a_thread_limit_above_the_per_process_ceiling_is_still_charged_and_enforced() 
     assert_eq!(
         attach_task(b),
         Err(SpawnTaskError::JobThreadLimit),
-        "the job threads.max binds before b's ceiling"
+        "the job threads.max binds across processes"
     );
     detach_task(a).unwrap();
     assert_eq!(job_info(job).unwrap().usage_threads, limit - 1);
@@ -326,9 +321,7 @@ fn the_root_jobs_process_limit_is_the_system_slot_limit() {
     assert!(spawn_in(155, None, None).is_none());
     job_set_limits(ROOT_JOB, LimitMask::PROCESSES, limits(LIMIT_UNSET, LIMIT_UNSET)).unwrap();
     assert_eq!(process_limit(), crate::multitask::slot_dir::SLOT_CEILING, "unset clamps to the ceiling");
-    super::super::set_process_limit(
-        crate::multitask::task_capacity::CAPACITY.root_process_ceiling(),
-    );
+    super::super::set_process_limit(crate::multitask::slot_dir::SLOT_CEILING);
 }
 
 #[test]

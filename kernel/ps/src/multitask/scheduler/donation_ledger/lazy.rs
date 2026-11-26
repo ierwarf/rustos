@@ -14,14 +14,13 @@
 //! - **Forbidden:** a class or priority edge (never lazy), a receiver that already
 //!   carries a borrowed context, reading or writing the ledger without `settle`.
 //! - **Evidence:** `tests::lazy_edge_settles_to_the_eager_entries`.
+use crate::multitask::task_table;
 use super::{
+    publish_charge_token, reserve_locked, namespace_tag,
     DonationLedger, DonationNamespace, FundingBasis, IpcDonationTarget, IpcPriorityDonation,
-    LedgerEntry, MAX_TASK, borrowed_context_charge_token, publish_charge_token,
-    reserve_locked, BORROWED_CONTEXT_NAMESPACE, BORROWED_CONTEXT_OWNER, BORROWED_CONTEXT_REPLY,
-    NO_BORROWED_CONTEXT, namespace_tag,
+    LedgerEntry,
 };
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
-use nucleus_core::util::cache_padded::CachePadded;
 
 const IDLE: u64 = 0;
 const RESERVED: u64 = 1;
@@ -29,7 +28,7 @@ const BOUND: u64 = 2;
 /// Held only by `settle` under the ledger leaf; lock-free steps treat it as a loss.
 const SETTLING: u64 = 3;
 
-struct Edge {
+pub(in crate::multitask) struct Edge {
     state: AtomicU64,
     donor_id: AtomicU64,
     reply: AtomicU64,
@@ -37,7 +36,7 @@ struct Edge {
     receiver_id: AtomicU64,
 }
 impl Edge {
-    const fn new() -> Self {
+    pub(in crate::multitask) const fn new() -> Self {
         Self {
             state: AtomicU64::new(IDLE),
             donor_id: AtomicU64::new(0),
@@ -48,7 +47,10 @@ impl Edge {
     }
 }
 
-static EDGES: [CachePadded<Edge>; MAX_TASK] = [const { CachePadded::new(Edge::new()) }; MAX_TASK];
+#[inline]
+fn edge_for(slot: usize) -> Option<&'static Edge> {
+    task_table::try_get(slot).map(|task| &*task.lazy_edge)
+}
 /// True while some slot may be non-idle. Set after the slot word, cleared only by
 /// `settle`, which then re-scans, so a reader that sees it clear linearizes before the
 /// reserve that raced it.
@@ -62,7 +64,7 @@ fn own_basis(slot: usize, id: u64) -> FundingBasis {
 /// the decision to `reserve_own`.
 #[cfg(any(rustos_boot_image, test))]
 pub(in super::super) fn reserve(slot: usize, id: u64) -> bool {
-    let Some(edge) = EDGES.get(slot) else { return false };
+    let Some(edge) = edge_for(slot) else { return false };
     if edge.state.load(Ordering::Relaxed) != IDLE {
         return false;
     }
@@ -85,11 +87,11 @@ pub(in super::super) fn bind(
     receiver_slot: usize,
     receiver_id: u64,
 ) -> Option<bool> {
-    let edge = EDGES.get(donor_slot)?;
+    let edge = edge_for(donor_slot)?;
     if edge.state.load(Ordering::Acquire) != RESERVED
         || edge.donor_id.load(Ordering::Relaxed) != donor_id
-        || receiver_slot >= MAX_TASK
-        || borrowed_context_charge_token(receiver_slot).is_some()
+        || task_table::try_get(receiver_slot).is_none()
+        || super::borrowed_context_charge_token(receiver_slot).is_some()
     {
         return None;
     }
@@ -109,7 +111,7 @@ pub(in super::super) fn bind(
 /// Release the donor's bound edge for `reply`. `false`: not lazily bound (or already
 /// settled); the caller releases through the ledger.
 pub(in super::super) fn release(donor_slot: usize, donor_id: u64, reply: u64) -> bool {
-    let Some(edge) = EDGES.get(donor_slot) else { return false };
+    let Some(edge) = edge_for(donor_slot) else { return false };
     if edge.state.load(Ordering::Acquire) != BOUND
         || edge.reply.load(Ordering::Relaxed) != reply
         || edge.donor_id.load(Ordering::Relaxed) != donor_id
@@ -128,15 +130,21 @@ pub(in super::super) fn release(donor_slot: usize, donor_id: u64, reply: u64) ->
 /// no-replacement case of `restore_context_owner_after_release` (a lazy bind requires
 /// the receiver to carry no other context, and any other writer settles us first).
 fn clear_token(receiver_slot: usize, owner_slot: usize, reply: u64) {
-    let encoded = u16::try_from(owner_slot).expect("context owner slot exceeds u16");
-    if BORROWED_CONTEXT_OWNER[receiver_slot].load(Ordering::Relaxed) == encoded
-        && BORROWED_CONTEXT_NAMESPACE[receiver_slot].load(Ordering::Relaxed)
+    let encoded = u32::try_from(owner_slot).expect("context owner slot exceeds u32");
+    let Some(receiver) = task_table::try_get(receiver_slot) else {
+        return;
+    };
+    if receiver.borrowed_ctx_owner.load(Ordering::Relaxed) == encoded
+        && receiver.borrowed_ctx_namespace.load(Ordering::Relaxed)
             == namespace_tag(DonationNamespace::IpcReply)
-        && BORROWED_CONTEXT_REPLY[receiver_slot].load(Ordering::Relaxed) == reply
+        && receiver.borrowed_ctx_reply.load(Ordering::Relaxed) == reply
     {
-        BORROWED_CONTEXT_OWNER[receiver_slot].store(NO_BORROWED_CONTEXT, Ordering::Relaxed);
-        BORROWED_CONTEXT_NAMESPACE[receiver_slot].store(0, Ordering::Relaxed);
-        BORROWED_CONTEXT_REPLY[receiver_slot].store(0, Ordering::Release);
+        receiver
+            .borrowed_ctx_owner
+            .store(task_table::NO_BORROWED_OWNER, Ordering::Relaxed);
+        receiver.borrowed_ctx_namespace.store(0, Ordering::Relaxed);
+        // ORDERING: Release clears borrowed-context reply word after owner/namespace clear.
+        receiver.borrowed_ctx_reply.store(0, Ordering::Release);
     }
 }
 
@@ -144,6 +152,7 @@ fn clear_token(receiver_slot: usize, owner_slot: usize, reply: u64) {
 /// ledger operation, so the operation sees exactly the entries the eager protocol
 /// would have produced up to now.
 pub(super) fn settle(ledger: &mut DonationLedger) {
+    // ORDERING: Acquire checks whether any lazy edge was published since last settle.
     if !PENDING.load(Ordering::Acquire) {
         return;
     }
@@ -151,7 +160,8 @@ pub(super) fn settle(ledger: &mut DonationLedger) {
     // ORDERING: SeqCst separates the hint clear from the slot scan (Dekker with `reserve`).
     fence(Ordering::SeqCst);
     let mut busy = false;
-    for (slot, edge) in EDGES.iter().enumerate() {
+    for slot in task_table::allocated_slots() {
+        let Some(edge) = edge_for(slot) else { continue; };
         for _ in 0..4 {
             match edge.state.load(Ordering::Acquire) {
                 IDLE => break,
@@ -214,16 +224,21 @@ pub(super) fn settle(ledger: &mut DonationLedger) {
 
 /// Forget every lazy edge (ledger reset).
 pub(super) fn reset() {
-    for edge in &EDGES {
-        edge.state.store(IDLE, Ordering::Release);
+    for slot in task_table::allocated_slots() {
+        if let Some(edge) = edge_for(slot) {
+            // ORDERING: Release resets edge state before re-enabling ledger tests.
+            edge.state.store(IDLE, Ordering::Release);
+        }
     }
+    // ORDERING: Release clears pending hint after resetting all allocated edges.
     PENDING.store(false, Ordering::Release);
 }
 
 /// Whether `slot` currently holds a lazy edge (native witnesses).
 #[cfg(test)]
 pub(in super::super) fn state(slot: usize) -> u64 {
-    EDGES[slot].state.load(Ordering::Acquire)
+    // ORDERING: Acquire pairs with edge publication/settle Release stores.
+    edge_for(slot).map_or(IDLE, |edge| edge.state.load(Ordering::Acquire))
 }
 
 #[cfg(test)]

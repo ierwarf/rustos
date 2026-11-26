@@ -12,7 +12,10 @@ mod fair_retry;
 #[cfg(test)]
 pub(super) mod policy_witnesses;
 mod hint_priority;
-pub(super) use fair_retry::{UnresolvedCandidates, retry_incomplete_policy, take_omitted_candidate_window};
+pub(super) use fair_retry::{
+    UnresolvedCandidates, preallocate_pool as preallocate_retry_pool, retry_incomplete_policy,
+    take_omitted_candidate_window,
+};
 pub(super) use hint_priority::{
     refuse_unproven_hint_priority, stable_user_hint_class, user_hint_blocked_by_system,
 };
@@ -489,7 +492,8 @@ pub(super) fn choose_local_next_with(
         // through ordinary CFS. Its voluntary arm excludes current and uses
         // circular distance regardless of whether reservation was due.
         let distance = if voluntary_yield {
-            (slot + super::MAX_TASK - current_slot) % super::MAX_TASK
+            (slot + crate::multitask::task_table::MAX_TASK_SLOTS - current_slot)
+                % crate::multitask::task_table::MAX_TASK_SLOTS
         } else {
             slot
         };

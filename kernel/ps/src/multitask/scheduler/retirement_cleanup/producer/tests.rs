@@ -10,9 +10,9 @@ const SLOT: usize = 107;
 const ID: u64 = 107001;
 fn fixture(f: impl FnOnce()) {
     let _serial = crate::multitask::scheduler::execution_test_serial_guard();
-    *CELLS[SLOT].state.lock() = SlotState::new();
+    *cell(SLOT).state.lock() = SlotState::new();
     f();
-    *CELLS[SLOT].state.lock() = SlotState::new();
+    *cell(SLOT).state.lock() = SlotState::new();
 }
 fn begin() -> Producer {
     Producer::begin(SLOT, Some(ID), TaskRetireReason::Exited, true).unwrap()
@@ -38,10 +38,10 @@ fn producer_reserves_before_effects_excludes_duplicates_consumers_and_reset_with
         let owner = begin();
         assert!(Producer::begin(SLOT, Some(ID), TaskRetireReason::Exited, false).is_none());
         assert!(Producer::claim(SLOT, Some(ID)).is_none());
-        assert!(CELLS[SLOT].claim().is_none());
-        assert!(CELLS[SLOT].claim_kernel().is_none());
+        assert!(cell(SLOT).claim().is_none());
+        assert!(cell(SLOT).claim_kernel().is_none());
         assert!(reuse::begin(SLOT, Some(ID)).is_none());
-        assert!(CELLS[SLOT].kernel_pending());
+        assert!(cell(SLOT).kernel_pending());
         drop(owner);
         assert!(Producer::begin(SLOT, Some(ID), TaskRetireReason::Exited, false).is_some());
     });
@@ -51,15 +51,15 @@ fn payload_visibility_is_one_last_producer_operation_and_both_exact_consumer_ack
     fixture(|| {
         let mut owner = begin();
         owner.begin_effects();
-        assert!(CELLS[SLOT].claim().is_none());
-        assert!(CELLS[SLOT].claim_kernel().is_none());
+        assert!(cell(SLOT).claim().is_none());
+        assert!(cell(SLOT).claim_kernel().is_none());
         owner.publish(Some(payload()), effects());
-        let external = CELLS[SLOT].claim().unwrap();
-        let (generation, kernel) = CELLS[SLOT].claim_kernel().unwrap();
+        let external = cell(SLOT).claim().unwrap();
+        let (generation, kernel) = cell(SLOT).claim_kernel().unwrap();
         assert!(reuse::begin(SLOT, Some(ID)).is_none());
-        assert!(CELLS[SLOT].complete(external));
+        assert!(cell(SLOT).complete(external));
         assert!(reuse::begin(SLOT, Some(ID)).is_none());
-        CELLS[SLOT].complete_kernel(generation, kernel);
+        cell(SLOT).complete_kernel(generation, kernel);
         let mut seal = reuse::begin(SLOT, Some(ID)).unwrap();
         seal.mark_effects();
         seal.reset();
@@ -91,27 +91,27 @@ fn deferred_loan_keeps_original_reason_detach_and_uid_and_two_claimants_cannot_s
 fn checked_reserve_generation_and_nonce_and_deferred_claim_nonce_exhaust_independently_without_effects()
  {
     fixture(|| {
-        CELLS[SLOT].state.lock().generation = u64::MAX;
+        cell(SLOT).state.lock().generation = u64::MAX;
         assert!(Producer::begin(SLOT, Some(ID), TaskRetireReason::Exited, false).is_none());
         {
-            let mut row = CELLS[SLOT].state.lock();
+            let mut row = cell(SLOT).state.lock();
             assert!(row.producer.is_none());
             row.generation = 0;
             row.producer_nonce = u64::MAX;
         }
         assert!(Producer::begin(SLOT, Some(ID), TaskRetireReason::Exited, false).is_none());
-        CELLS[SLOT].state.lock().producer_nonce = 0;
+        cell(SLOT).state.lock().producer_nonce = 0;
         let mut owner = begin();
         owner.begin_effects();
         owner.defer();
         {
-            let mut row = CELLS[SLOT].state.lock();
+            let mut row = cell(SLOT).state.lock();
             row.producer_nonce = u64::MAX;
             row.producer.as_mut().unwrap().key.nonce = u64::MAX;
         }
         assert!(Producer::claim(SLOT, Some(ID)).is_none());
         assert_eq!(
-            CELLS[SLOT].state.lock().deferred,
+            cell(SLOT).state.lock().deferred,
             Some(TaskRetireReason::Exited)
         );
     });
@@ -122,12 +122,12 @@ fn abandoned_effects_quarantine_even_with_empty_deferred_queue_and_no_consumer_p
         let mut owner = begin();
         owner.begin_effects();
         drop(owner);
-        assert!(CELLS[SLOT].kernel_pending());
+        assert!(cell(SLOT).kernel_pending());
         assert!(reuse::begin(SLOT, Some(ID)).is_none());
         assert!(Producer::claim(SLOT, Some(ID)).is_none());
         assert!(Producer::begin(SLOT, Some(ID), TaskRetireReason::Exited, false).is_none());
         assert!(
-            CELLS[SLOT]
+            cell(SLOT)
                 .state
                 .lock()
                 .producer
@@ -161,7 +161,7 @@ fn stale_claim_rollback_cannot_begin_effects_or_erase_next_claim_nonce_despite_s
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stale.begin_effects()));
         stale.live = false;
         assert!(rejected.is_err());
-        assert!(next.exact(&CELLS[SLOT].state.lock()));
+        assert!(next.exact(&cell(SLOT).state.lock()));
         drop(next);
         assert!(Producer::claim(SLOT, Some(ID)).is_some());
     });
@@ -172,20 +172,20 @@ fn producer_key_independently_blocks_reuse_pending_and_consumers_when_compatibil
     fixture(|| {
         let owner = begin();
         {
-            let mut row = CELLS[SLOT].state.lock();
+            let mut row = cell(SLOT).state.lock();
             row.producing = false;
         }
         assert!(reuse::begin(SLOT, Some(ID)).is_none());
-        assert!(CELLS[SLOT].kernel_pending());
+        assert!(cell(SLOT).kernel_pending());
         {
-            let mut row = CELLS[SLOT].state.lock();
+            let mut row = cell(SLOT).state.lock();
             row.cleanup = CleanupState::Pending(payload());
             row.kernel = KernelState::Pending(effects());
         }
-        assert!(CELLS[SLOT].claim().is_none());
-        assert!(CELLS[SLOT].claim_kernel().is_none());
+        assert!(cell(SLOT).claim().is_none());
+        assert!(cell(SLOT).claim_kernel().is_none());
         {
-            let mut row = CELLS[SLOT].state.lock();
+            let mut row = cell(SLOT).state.lock();
             row.cleanup = CleanupState::Vacant;
             row.kernel = KernelState::Vacant;
             row.producing = true;
@@ -200,23 +200,23 @@ fn unowned_terminal_deferred_take_reset_and_abort_cannot_spend_real_producer() {
         for operation in [0, 1, 2, 3, 4] {
             assert!(
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match operation {
-                    0 => CELLS[SLOT].publish_terminal(
+                    0 => cell(SLOT).publish_terminal(
                         Some(ID),
                         TaskRetireReason::Exited,
                         Some(payload()),
                         effects()
                     ),
-                    1 => CELLS[SLOT].defer(Some(ID), TaskRetireReason::Exited),
+                    1 => cell(SLOT).defer(Some(ID), TaskRetireReason::Exited),
                     2 => {
-                        CELLS[SLOT].take_deferred();
+                        cell(SLOT).take_deferred();
                     }
-                    3 => CELLS[SLOT].abort_empty_producer(),
-                    _ => CELLS[SLOT].reset(),
+                    3 => cell(SLOT).abort_empty_producer(),
+                    _ => cell(SLOT).reset(),
                 }))
                 .is_err()
             );
         }
-        assert!(owner.exact(&CELLS[SLOT].state.lock()));
+        assert!(owner.exact(&cell(SLOT).state.lock()));
         drop(owner);
     });
 }
@@ -231,7 +231,7 @@ fn unqualified_publication_rolls_back_but_foreign_payload_quarantines_effects_be
             ))
             .is_err()
         );
-        assert!(CELLS[SLOT].state.lock().producer.is_none());
+        assert!(cell(SLOT).state.lock().producer.is_none());
         let mut owner = begin();
         owner.begin_effects();
         let mut wrong = payload();
@@ -242,10 +242,10 @@ fn unqualified_publication_rolls_back_but_foreign_payload_quarantines_effects_be
             ))
             .is_err()
         );
-        assert!(CELLS[SLOT].claim().is_none());
-        assert!(CELLS[SLOT].claim_kernel().is_none());
+        assert!(cell(SLOT).claim().is_none());
+        assert!(cell(SLOT).claim_kernel().is_none());
         assert!(
-            CELLS[SLOT]
+            cell(SLOT)
                 .state
                 .lock()
                 .producer
@@ -260,8 +260,8 @@ fn kernel_uid_zero_is_an_exact_producer_not_absence_and_reset_never_rewinds_next
         let epoch = owner.key.nonce;
         owner.begin_effects();
         owner.publish(None, RetirementSideEffect::new(Some(0), None));
-        let (generation, kernel) = CELLS[SLOT].claim_kernel().unwrap();
-        CELLS[SLOT].complete_kernel(generation, kernel);
+        let (generation, kernel) = cell(SLOT).claim_kernel().unwrap();
+        cell(SLOT).complete_kernel(generation, kernel);
         let mut seal = reuse::begin(SLOT, Some(0)).unwrap();
         seal.mark_effects();
         seal.reset();
@@ -279,12 +279,12 @@ fn kernel_uid_zero_is_an_exact_producer_not_absence_and_reset_never_rewinds_next
 fn claimed_producer_rolls_back_to_its_exact_origin_and_a_withdrawal_overrides_it() {
     fixture(|| {
         begin().park_unwithdrawn();
-        assert_eq!(CELLS[SLOT].state.lock().producer.unwrap().phase, Phase::Parked);
+        assert_eq!(cell(SLOT).state.lock().producer.unwrap().phase, Phase::Parked);
         let parked = Producer::claim(SLOT, Some(ID)).unwrap();
         assert_eq!(parked.origin(), Some(Origin::Parked));
         assert!(!parked.waited_for_executor());
         drop(parked);
-        assert_eq!(CELLS[SLOT].state.lock().producer.unwrap().phase, Phase::Parked);
+        assert_eq!(cell(SLOT).state.lock().producer.unwrap().phase, Phase::Parked);
 
         let mut resumed = Producer::claim(SLOT, Some(ID)).unwrap();
         assert_eq!(resumed.origin(), Some(Origin::Parked));
@@ -292,7 +292,7 @@ fn claimed_producer_rolls_back_to_its_exact_origin_and_a_withdrawal_overrides_it
         let retained = resumed.retain_stopped();
         assert_eq!(retained.origin(), Some(Origin::Withdrawn));
         drop(retained);
-        assert_eq!(CELLS[SLOT].state.lock().producer.unwrap().phase, Phase::Deferred);
+        assert_eq!(cell(SLOT).state.lock().producer.unwrap().phase, Phase::Deferred);
 
         let withdrawn = Producer::claim(SLOT, Some(ID)).unwrap();
         assert_eq!(withdrawn.origin(), Some(Origin::Withdrawn));
@@ -300,6 +300,6 @@ fn claimed_producer_rolls_back_to_its_exact_origin_and_a_withdrawal_overrides_it
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| withdrawn.park_unwithdrawn()));
         assert!(refused.is_err(), "a withdrawn stop cannot be parked as untouched");
         // The refused park unwound through Drop with the claim untouched.
-        assert_eq!(CELLS[SLOT].state.lock().producer.unwrap().phase, Phase::Deferred);
+        assert_eq!(cell(SLOT).state.lock().producer.unwrap().phase, Phase::Deferred);
     });
 }

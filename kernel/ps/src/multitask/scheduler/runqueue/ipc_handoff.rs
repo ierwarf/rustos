@@ -240,23 +240,25 @@ pub(in crate::multitask::scheduler) fn drain_remote_wakes(cpu: usize) -> usize {
     if MAILBOX_PENDING[cpu].load(Ordering::Acquire) == 0 {
         return 0;
     }
-    let mut records = [RunTransfer::EMPTY; MAILBOX_CAPACITY];
+    // One record at a time, so no staging array scales with the slot count. The
+    // pending edge is cleared only by the pop that finds the mailbox empty, so a
+    // record popped but not yet adopted stays advertised.
     let mut count = 0;
-    {
-        let mut mailbox = REMOTE_WAKE_MAILBOXES[cpu].lock();
-        while let Some(record) = mailbox.pop() {
-            records[count] = record;
-            count += 1;
-        }
-        // ORDERING: clearing under the mailbox owner closes the race with a
-        // producer that publishes the next 0-to-1 notification edge.
-        MAILBOX_PENDING[cpu].store(0, Ordering::Release);
-    }
-    if count == 0 {
-        return 0;
-    }
-    let mut rq = RUN_QUEUES[cpu].inner.lock();
-    for record in &records[..count] {
+    loop {
+        let Some(record) = (|| {
+            let mut mailbox = REMOTE_WAKE_MAILBOXES[cpu].lock();
+            let popped = mailbox.pop();
+            if popped.is_none() {
+                // ORDERING: clearing under the mailbox owner closes the race with
+                // a producer that publishes the next 0-to-1 notification edge.
+                MAILBOX_PENDING[cpu].store(0, Ordering::Release);
+            }
+            popped
+        })() else {
+            break;
+        };
+        count += 1;
+        let mut rq = RUN_QUEUES[cpu].inner.lock();
         let observed = owner(record.slot);
         if observed.state != RunOwnerState::RemoteQueued
             || observed.cpu != Some(cpu)
@@ -312,8 +314,8 @@ pub(in crate::multitask::scheduler) fn drain_remote_wakes(cpu: usize) -> usize {
         if let Some(next) = adopted {
             frame_publication::bind_local_owner_generation(record.slot, next.generation);
         }
+        RUN_QUEUES[cpu].publish_load(&rq);
     }
-    RUN_QUEUES[cpu].publish_load(&rq);
     count
 }
 

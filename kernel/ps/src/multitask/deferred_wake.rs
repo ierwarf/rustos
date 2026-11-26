@@ -10,30 +10,46 @@ use core::cell::UnsafeCell;
 
 use x86_64::instructions::interrupts;
 
-use super::MAX_SCHEDULER_TASKS;
+use super::irq_pool::{SlabPool, SlabQueue};
 
 const CPU_COUNT: usize = nucleus_core::util::lockdep::MAX_TRACKED_CPUS;
 
-#[derive(Clone, Copy)]
+static DEFERRED_WAKE_POOL: SlabPool<u64> = SlabPool::new();
+
+pub(in crate::multitask) fn preallocate_pool(min_free: usize) {
+    SlabQueue::<u64>::preallocate_for_pool(&DEFERRED_WAKE_POOL, min_free);
+}
+
 pub(super) struct DeferredWakeBatch {
-    tasks: [u64; MAX_SCHEDULER_TASKS],
-    len: usize,
+    tasks: SlabQueue<u64>,
 }
 
 impl DeferredWakeBatch {
     const fn new() -> Self {
         Self {
-            tasks: [0; MAX_SCHEDULER_TASKS],
-            len: 0,
+            tasks: SlabQueue::new(),
         }
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = u64> + '_ {
-        self.tasks[..self.len].iter().copied()
+        let mut out = alloc::vec::Vec::with_capacity(self.tasks.len());
+        self.tasks.for_each(&DEFERRED_WAKE_POOL, |&id| out.push(id));
+        out.into_iter()
     }
 
     pub(super) fn len(&self) -> usize {
-        self.len
+        self.tasks.len()
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.tasks.clear(&DEFERRED_WAKE_POOL);
+    }
+}
+
+impl Drop for DeferredWakeBatch {
+    fn drop(&mut self) {
+        self.tasks.clear(&DEFERRED_WAKE_POOL);
     }
 }
 
@@ -76,17 +92,15 @@ fn defer_and_request(queue: &mut DeferredWakeBatch, cpu: usize, task_id: u64) ->
 
 fn defer_into_queue(queue: &mut DeferredWakeBatch, cpu: usize, task_id: u64) -> bool {
     assert_ne!(task_id, 0, "deferred scheduler wake requires task identity");
-    if queue.tasks[..queue.len].contains(&task_id) {
+    if queue.tasks.any(&DEFERRED_WAKE_POOL, |&queued| queued == task_id) {
         return true;
     }
     assert!(
-        queue.len < queue.tasks.len(),
+        queue.tasks.push_back(&DEFERRED_WAKE_POOL, task_id),
         "deferred scheduler wake queue exhausted cpu={} task_id={}",
         cpu,
         task_id
     );
-    queue.tasks[queue.len] = task_id;
-    queue.len += 1;
     true
 }
 
@@ -116,7 +130,7 @@ pub(super) fn take_masked(
     assert!(cpu < CPU_COUNT, "deferred wake take CPU exceeds capacity");
     // SAFETY: original same-CPU masked custody excludes local queue writers.
     let queue = unsafe { &mut *DEFERRED_WAKES.0[cpu].get() };
-    (queue.len != 0).then(|| take_queue(queue))
+    (queue.tasks.len() != 0).then(|| take_queue(queue))
 }
 
 /// Whether this original masked CPU's batch holds a deferral the entry has not
@@ -127,7 +141,7 @@ pub(super) fn queued_masked(scope: &nucleus_core::util::lockdep::DispatchPreempt
     assert!(cpu < CPU_COUNT, "deferred wake probe CPU exceeds capacity");
     // SAFETY: original same-CPU masked custody excludes local queue writers;
     // this reads one word of the CPU-owned batch.
-    unsafe { (*DEFERRED_WAKES.0[cpu].get()).len != 0 }
+    unsafe { (*DEFERRED_WAKES.0[cpu].get()).tasks.len() != 0 }
 }
 
 #[cfg(test)]
@@ -151,13 +165,8 @@ impl TestDeferredWakeQueuesRestore {
         let saved = core::array::from_fn(|cpu| {
             // SAFETY: the test-only serial guard excludes every fixture user,
             // and host test code never enters the production IRQ path.
-            unsafe { *DEFERRED_WAKES.0[cpu].get() }
+            unsafe { take_queue(&mut *DEFERRED_WAKES.0[cpu].get()) }
         });
-        for cpu in 0..CPU_COUNT {
-            // SAFETY: identical to the save above; the original value is
-            // restored by this fixture's Drop implementation.
-            unsafe { *DEFERRED_WAKES.0[cpu].get() = DeferredWakeBatch::new() };
-        }
         Self {
             _serial: serial,
             saved,
@@ -179,11 +188,10 @@ impl TestDeferredWakeQueuesRestore {
         take_queue(queue)
     }
 
-    fn batch(&self, cpu: usize) -> DeferredWakeBatch {
+    fn batch(&self, cpu: usize) -> &DeferredWakeBatch {
         assert!(cpu < CPU_COUNT, "test deferred wake CPU exceeds capacity");
-        // SAFETY: the fixture has exclusive access and only returns a Copy
-        // snapshot, so the queue cannot escape mutable ownership.
-        unsafe { *DEFERRED_WAKES.0[cpu].get() }
+        // SAFETY: the fixture has exclusive access while `_serial` is held.
+        unsafe { &*DEFERRED_WAKES.0[cpu].get() }
     }
 }
 
@@ -193,7 +201,11 @@ impl Drop for TestDeferredWakeQueuesRestore {
         for cpu in 0..CPU_COUNT {
             // SAFETY: this fixture still owns the serial guard while restoring
             // the exact pre-test static queue image.
-            unsafe { *DEFERRED_WAKES.0[cpu].get() = self.saved[cpu] };
+            unsafe {
+                let target = &mut *DEFERRED_WAKES.0[cpu].get();
+                target.clear();
+                *target = core::mem::replace(&mut self.saved[cpu], DeferredWakeBatch::new());
+            }
         }
     }
 }
@@ -205,9 +217,8 @@ mod tests {
     #[test]
     fn deferred_wake_batch_preserves_bounded_fifo_order() {
         let mut batch = DeferredWakeBatch::new();
-        batch.tasks[0] = 11;
-        batch.tasks[1] = 17;
-        batch.len = 2;
+        assert!(defer_into_queue(&mut batch, 0, 11));
+        assert!(defer_into_queue(&mut batch, 0, 17));
         assert_eq!(batch.iter().collect::<std::vec::Vec<_>>(), [11, 17]);
     }
 

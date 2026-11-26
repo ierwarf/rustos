@@ -173,7 +173,11 @@ pub(in crate::multitask::scheduler) fn actual_fifo_qualification_releases_orderi
             assert!(sync_handoff::enqueue(0, record));
             false
         }).is_none());
-        assert_eq!(callbacks, MAX_TASK, "continuous producers cannot make one dispatch drain unbounded");
+        assert_eq!(
+            callbacks,
+            crate::multitask::task_table::active_task_count().max(64),
+            "continuous producers cannot make one dispatch drain unbounded"
+        );
         assert!(sync_handoff::pending(0));
         assert_eq!(sync_handoff::take_next_ready(0, false, |_| true), Some(taken));
         assert!(!sync_handoff::pending(0));

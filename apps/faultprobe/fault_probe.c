@@ -28,6 +28,9 @@
 #define CHILD_ALARM_S 40 /* a stuck child dies on its own */
 #define MAX_TIDS 8
 #define FAULT_ITERATIONS 6
+#define STORM_THREADS 1100 /* above the old 1024-slot ceiling */
+#define STORM_STACK_BYTES (64 * 1024)
+#define STORM_WAIT_MS 100000
 
 static int failures;
 
@@ -474,6 +477,86 @@ static void case_fault_vs_exit_group(void) {
     }
 }
 
+/* Thread storm: one process holds more simultaneous threads than the retired
+ * 1024-slot table allowed, all parked on a futex, then releases and joins them.
+ * Proves slots, kernel stacks and the heap grow on demand instead of failing at
+ * a fixed ceiling. Runs in a forked child so a refusal cannot hurt the parent. */
+static volatile uint32_t storm_gate;
+static pthread_t storm_threads[STORM_THREADS];
+
+static void *storm_thread(void *arg) {
+    (void)arg;
+    __sync_fetch_and_add(&ready_count, 1);
+    while (storm_gate == 0) {
+        syscall(SYS_futex, &storm_gate, FUTEX_WAIT, 0, NULL, NULL, 0);
+    }
+    return NULL;
+}
+
+static void storm_child(int rfd) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, STORM_STACK_BYTES);
+    int created = 0;
+    int err = 0;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    alarm(120);
+    for (; created < STORM_THREADS; created++) {
+        err = pthread_create(&storm_threads[created], &attr, storm_thread, NULL);
+        if (err != 0) {
+            break;
+        }
+        if ((created + 1) % 100 == 0) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            say("fault-probe: thread-storm progress created=%d ms=%ld", created + 1,
+                (now.tv_sec - t0.tv_sec) * 1000L + (now.tv_nsec - t0.tv_nsec) / 1000000L);
+        }
+    }
+    long waited = 0;
+    while (ready_count < created && waited < STORM_WAIT_MS) {
+        msleep(10);
+        waited += 10;
+    }
+    int ready = ready_count;
+    say("fault-probe: thread-storm created=%d ready=%d err=%d", created, ready, err);
+    storm_gate = 1;
+    syscall(SYS_futex, &storm_gate, FUTEX_WAKE, 0x7fffffff, NULL, NULL, 0);
+    for (int i = 0; i < created; i++) {
+        pthread_join(storm_threads[i], NULL);
+    }
+    int ok = created == STORM_THREADS && ready == STORM_THREADS;
+    (void)write(rfd, &ok, sizeof(ok));
+    _exit(ok ? 0 : 91);
+}
+
+static void case_thread_storm(void) {
+    const char *name = "thread-storm";
+    int before = failures;
+    int rfd;
+    pid_t pid = spawn(&rfd);
+    if (pid < 0) {
+        fail(name, "fork errno=%d", errno);
+        return;
+    }
+    if (pid == 0) {
+        storm_child(rfd);
+    }
+    int status = 0;
+    pid_t got = wait_bounded(pid, &status, STORM_WAIT_MS + 15000);
+    if (got != pid) {
+        fail(name, "child did not finish (got=%d errno=%d)", (int)got, errno);
+        reap_hung(pid);
+    } else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail(name, "child status 0x%x (see thread-storm record)", status);
+    }
+    close(rfd);
+    if (failures == before) {
+        say("fault-probe: %s ok (%d threads)", name, STORM_THREADS);
+    }
+}
+
 int main(int argc, char **argv) {
     (void)argv;
     /* Session-startup programs run in every boot that reaches ui-ready, so the
@@ -492,6 +575,7 @@ int main(int argc, char **argv) {
     case_multi_nonleader();
     case_leader_exit_kill();
     case_fault_vs_exit_group();
+    case_thread_storm();
     if (failures == 0) {
         say("fault-probe: all passed");
         return 0;

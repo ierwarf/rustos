@@ -525,7 +525,7 @@ pub(super) fn begin(
     from: usize,
 ) -> CpuDispatchTurn<'static> {
     let cpu = preemption.cpu();
-    assert!(cpu < TURNS.len() && from < MAX_SCHEDULER_TASKS);
+    assert!(cpu < TURNS.len() && from < crate::multitask::task_table::MAX_TASK_SLOTS);
     assert!(
         !TRANSITION_ACTIVE[cpu].load(Ordering::Acquire),
         "CPU turn opened before prior RSP handoff committed"

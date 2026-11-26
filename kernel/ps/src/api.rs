@@ -79,7 +79,7 @@ pub use crate::multitask::{
     ExpectedMm, PagerVmaError, PagerVmaSnapshot, ProcessAffinitySnapshot, RetainedCurrentUserAddressSpace,
     RetainedCurrentUserProcessState, RetiredTaskCleanup, SchedulingContextAdmission,
     SpawnTaskError, Thread, UserFaultDisposition, UserStackState, UserTaskBootstrap,
-    UserTaskRegisters, WaitChildResult, DEFAULT_USER_TASK_WEIGHT_MICROS, MAX_SCHEDULER_TASKS,
+    UserTaskRegisters, WaitChildResult, DEFAULT_USER_TASK_WEIGHT_MICROS,
 };
 pub use crate::multitask::{ProcessIdentity, SpawnReservation};
 pub use crate::user::abi::UserAbi;
@@ -154,7 +154,7 @@ pub use crate::multitask::{
 };
 pub use crate::multitask::{MemoryAccount, MemoryCensusEntry, memory_account, memory_census};
 pub use crate::multitask::{
-    task_capacity_snapshot, CapacityLimit, TaskCapacity, TaskCapacitySnapshot, TASK_CAPACITY,
+    task_capacity_snapshot, CapacityLimit, TaskCapacity, TaskCapacitySnapshot, task_capacity,
 };
 pub use crate::multitask::{
     job_admits_process, job_collect_members, job_create_child, job_info, job_is_within,
@@ -338,6 +338,10 @@ pub mod snapshot {
 
     pub fn current_task_id() -> Option<u64> {
         crate::multitask::current_task_id()
+    }
+
+    pub fn current_kernel_stack_guard_probe_address() -> Option<u64> {
+        crate::multitask::current_kernel_stack_guard_probe_address()
     }
 
     pub fn current_scheduling_context_runtime_snapshot()

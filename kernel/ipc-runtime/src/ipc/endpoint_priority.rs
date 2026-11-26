@@ -62,6 +62,8 @@ pub(super) struct EndpointObject {
     pub(super) fast_reply: Option<u64>,
     /// Job charge group and bytes billed for the reserved queues, if any.
     pub(super) kmem: Option<(usize, u64)>,
+    /// Monotonic count of enqueue rejections due to `MAX_ENDPOINT_PENDING_MESSAGES`.
+    pub(super) queue_full_hits: u64,
 }
 
 impl EndpointObject {
@@ -81,6 +83,7 @@ impl EndpointObject {
             waiting_receivers,
             fast_reply: None,
             kmem: None,
+            queue_full_hits: 0,
         }
     }
 

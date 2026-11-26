@@ -15,7 +15,7 @@ fn fixture(f: impl FnOnce(&StackPin)) {
     f(&pin);
     drop(pin);
     // ORDERING: native fixture models reader custody on the real counter.
-    assert_eq!(RESOURCES[SLOT].readers.load(Ordering::Acquire), 0);
+    assert_eq!(resource(SLOT).readers.load(Ordering::Acquire), 0);
     assert!(close_for_reclaim(SLOT));
     task_start::clear(SLOT);
     drop(take_storage(SLOT));
@@ -107,7 +107,7 @@ fn running_reader_requires_own_current_or_prepared_bank_not_merely_a_running_own
         runqueue::publish_local(SLOT, CPU, WEIGHT);
         assert!(claim(runqueue::owner(SLOT).generation));
         assert!(unsafe { acquire(pin, CPU) }.is_none());
-        let view = RESOURCES[SLOT].with(|r| r.binding.unwrap().1);
+        let view = resource(SLOT).with(|r| r.binding.unwrap().1);
         let bank_pin = pin_view(
             SLOT,
             ID,
@@ -135,17 +135,17 @@ fn reader_saturation_and_writer_conflict_refuse_without_spending_any_custody() {
     fixture(|pin| {
         let owner = runqueue::owner(SLOT);
         // ORDERING: native fixture models reader custody on the real counter.
-        RESOURCES[SLOT].readers.store(u32::MAX, Ordering::Release);
+        resource(SLOT).readers.store(u32::MAX, Ordering::Release);
         assert!(unsafe { acquire(pin, CPU) }.is_none());
         assert!(
             with_claim_exclusion(SLOT, || panic!("saturated readers admitted claim")).is_none()
         );
         // ORDERING: native fixture models reader custody on the real counter.
-        RESOURCES[SLOT].readers.store(0, Ordering::Release);
-        RESOURCES[SLOT].with(|r| r.frame_writing = true);
+        resource(SLOT).readers.store(0, Ordering::Release);
+        resource(SLOT).with(|r| r.frame_writing = true);
         assert!(unsafe { acquire(pin, CPU) }.is_none());
         assert!(with_claim_exclusion(SLOT, || panic!("writer admitted CPU claim")).is_none());
-        RESOURCES[SLOT].with(|r| r.frame_writing = false);
+        resource(SLOT).with(|r| r.frame_writing = false);
         assert_eq!(runqueue::owner(SLOT), owner);
     });
 }
@@ -163,7 +163,7 @@ fn reader_unwind_releases_only_its_borrow_and_reopens_exact_claim_admission() {
             .is_err()
         );
         // ORDERING: native fixture models reader custody on the real counter.
-        assert_eq!(RESOURCES[SLOT].readers.load(Ordering::Acquire), 0);
+        assert_eq!(resource(SLOT).readers.load(Ordering::Acquire), 0);
         assert!(claim(generation));
     });
 }
@@ -182,7 +182,7 @@ fn reserved_descriptor_never_becomes_frame_observation_authority_before_publicat
             admission::set_phase_for_test(SLOT, ID, Some(phase));
             assert!(unsafe { acquire(pin, CPU) }.is_none());
             // ORDERING: native fixture models reader custody on the real counter.
-            assert_eq!(RESOURCES[SLOT].readers.load(Ordering::Acquire), 0);
+            assert_eq!(resource(SLOT).readers.load(Ordering::Acquire), 0);
         }
         admission::set_phase_for_test(SLOT, ID, None); // isolated release, no production ACK
         assert!(unsafe { acquire(pin, CPU) }.is_some());
@@ -191,7 +191,7 @@ fn reserved_descriptor_never_becomes_frame_observation_authority_before_publicat
 
 fn owned_fixture(f: impl FnOnce(PublishedFrameView)) {
     fixture(|_| {
-        let geometry = RESOURCES[SLOT].with(|r| r.binding.unwrap().1);
+        let geometry = resource(SLOT).with(|r| r.binding.unwrap().1);
         f(PublishedFrameView {
             user_mode_task: true, kernel_process_task: false,
             kernel_stack_base: geometry.primary_base, kernel_stack_top: geometry.primary_top,
@@ -216,19 +216,19 @@ fn owned_reader_uses_one_leaf_and_release_or_pin_transfer_use_none() {
         }
         let budget = work_budget::declare(LockClass::TaskStackResources, FRAME_READ_MAX_RESOURCE_ACQUISITIONS);
         let reader = unsafe { pin_and_acquire(SLOT, ID, view, CPU) }.unwrap();
-        assert_eq!(RESOURCES[SLOT].pins.load(Ordering::Acquire), 2);
+        assert_eq!(resource(SLOT).pins.load(Ordering::Acquire), 2);
         assert_eq!(test_count(SLOT), 1);
         let pin = reader.into_pin();
         assert_eq!(test_count(SLOT), 0);
-        assert_eq!(RESOURCES[SLOT].pins.load(Ordering::Acquire), 2);
+        assert_eq!(resource(SLOT).pins.load(Ordering::Acquire), 2);
         drop(pin);
-        assert_eq!(RESOURCES[SLOT].pins.load(Ordering::Acquire), 1);
+        assert_eq!(resource(SLOT).pins.load(Ordering::Acquire), 1);
         assert_eq!(budget.used(), Some(1), "pin + reader + release is one resource leaf");
         drop(budget);
         let budget = work_budget::declare(LockClass::TaskStackResources, FRAME_READ_MAX_RESOURCE_ACQUISITIONS);
         drop(unsafe { pin_and_acquire(SLOT, ID, view, CPU) }.unwrap());
         assert_eq!(test_count(SLOT), 0);
-        assert_eq!(RESOURCES[SLOT].pins.load(Ordering::Acquire), 1);
+        assert_eq!(resource(SLOT).pins.load(Ordering::Acquire), 1);
         assert_eq!(budget.used(), Some(1));
     });
 }
@@ -246,11 +246,11 @@ fn owned_reader_rechecks_frame_epoch_without_leaking_combined_custody() {
         drop(unsafe { frame_publication::read_for_identity(old, ID, CPU) }.unwrap());
         publish();
         assert!(unsafe { frame_publication::read_for_identity(old, ID, CPU) }.is_none());
-        assert_eq!(RESOURCES[SLOT].pins.load(Ordering::Acquire), 1);
+        assert_eq!(resource(SLOT).pins.load(Ordering::Acquire), 1);
         assert_eq!(test_count(SLOT), 0);
         let new = frame_publication::test_read(SLOT).unwrap();
         drop(unsafe { frame_publication::read_for_identity(new, ID, CPU) }.unwrap());
-        assert_eq!(RESOURCES[SLOT].pins.load(Ordering::Acquire), 1);
+        assert_eq!(resource(SLOT).pins.load(Ordering::Acquire), 1);
         assert_eq!(test_count(SLOT), 0);
         frame_publication::clear(SLOT);
     });
@@ -262,17 +262,17 @@ fn owned_reader_refusals_do_not_leak_pin_reader_or_owner_custody() {
         let owner = runqueue::owner(SLOT);
         let refused = |id, view| {
             assert!(unsafe { pin_and_acquire(SLOT, id, view, CPU) }.is_none());
-            assert_eq!(RESOURCES[SLOT].pins.load(Ordering::Acquire), 1);
+            assert_eq!(resource(SLOT).pins.load(Ordering::Acquire), 1);
             assert_eq!(test_count(SLOT), 0);
             assert_eq!(runqueue::owner(SLOT), owner);
         };
         refused(ID + 1, view);
         refused(ID, PublishedFrameView { kernel_stack_base: view.kernel_stack_base + 8, ..view });
-        RESOURCES[SLOT].with(|r| r.closing = true);
+        resource(SLOT).with(|r| r.closing = true);
         refused(ID, view);
-        RESOURCES[SLOT].with(|r| { r.closing = false; r.frame_writing = true; });
+        resource(SLOT).with(|r| { r.closing = false; r.frame_writing = true; });
         refused(ID, view);
-        RESOURCES[SLOT].with(|r| r.frame_writing = false);
+        resource(SLOT).with(|r| r.frame_writing = false);
         use super::super::admission::{self, Phase};
         for phase in [Phase::Reserved, Phase::Committing, Phase::Canceling, Phase::Poisoned] {
             admission::set_phase_for_test(SLOT, ID, Some(phase));
@@ -280,16 +280,16 @@ fn owned_reader_refusals_do_not_leak_pin_reader_or_owner_custody() {
         }
         admission::set_phase_for_test(SLOT, ID, None);
         // ORDERING: native fixture models saturated reader custody on the real counter.
-        RESOURCES[SLOT].readers.store(u32::MAX, Ordering::Release);
+        resource(SLOT).readers.store(u32::MAX, Ordering::Release);
         assert!(unsafe { pin_and_acquire(SLOT, ID, view, CPU) }.is_none());
-        assert_eq!(RESOURCES[SLOT].pins.load(Ordering::Acquire), 1);
+        assert_eq!(resource(SLOT).pins.load(Ordering::Acquire), 1);
         assert_eq!(test_count(SLOT), u32::MAX);
         // ORDERING: fixture removes only its synthetic reader saturation.
-        RESOURCES[SLOT].readers.store(0, Ordering::Release);
+        resource(SLOT).readers.store(0, Ordering::Release);
         runqueue::publish_local(SLOT, CPU, WEIGHT);
         assert!(claim(runqueue::owner(SLOT).generation));
         assert!(unsafe { pin_and_acquire(SLOT, ID, view, CPU) }.is_none());
-        assert_eq!(RESOURCES[SLOT].pins.load(Ordering::Acquire), 1);
+        assert_eq!(resource(SLOT).pins.load(Ordering::Acquire), 1);
         assert_eq!(test_count(SLOT), 0);
     });
 }
@@ -321,7 +321,7 @@ fn owned_reader_claim_race_and_unwind_keep_backing_and_exclusion_together() {
                 dispatch.join().unwrap();
             });
             assert_eq!(test_count(SLOT), 0);
-            assert_eq!(RESOURCES[SLOT].pins.load(Ordering::Acquire), 1);
+            assert_eq!(resource(SLOT).pins.load(Ordering::Acquire), 1);
         }
         runqueue::reset_before_publication();
         runqueue::admit_blocked(SLOT);
@@ -333,7 +333,7 @@ fn owned_reader_claim_race_and_unwind_keep_backing_and_exclusion_together() {
             panic!("combined reader callback failed");
         }).is_err());
         assert_eq!(test_count(SLOT), 0);
-        assert_eq!(RESOURCES[SLOT].pins.load(Ordering::Acquire), 1);
+        assert_eq!(resource(SLOT).pins.load(Ordering::Acquire), 1);
         assert!(claim(generation));
     });
 }

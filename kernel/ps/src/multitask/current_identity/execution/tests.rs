@@ -90,10 +90,10 @@ fn saturation_refuses_callback_and_unwind_leaves_no_unparked_permit() {
     let _serial = scheduler::execution_test_serial_guard();
     clear(SLOT);
     publish_metadata(SLOT, Some(identity(ID)));
-    REFS[SLOT].store(u32::MAX, Ordering::Release);
+    ref_cell(SLOT).store(u32::MAX, Ordering::Release);
     assert!(with_claim(SLOT, |_| panic!("saturated execution count admitted")).is_none());
     assert_eq!(count(SLOT), u32::MAX);
-    REFS[SLOT].store(0, Ordering::Release);
+    ref_cell(SLOT).store(0, Ordering::Release);
     assert!(
         std::panic::catch_unwind(|| with_claim(SLOT, |_| panic!("modeled claim unwind"))).is_err()
     );

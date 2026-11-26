@@ -2235,7 +2235,7 @@ futex-waiter-lifecycle/FutexWaiterLifecycle|kernel-compat|user::syscall::linux::
 futex-waiter-lifecycle/FutexWaiterLifecycle|kernel-ps|multitask::scheduler::tests::retired_user_slot_waits_for_exact_runtime_cleanup_ack
 kernel-resource-accounting/KernelResourceAccounting|kernel-ipc-runtime|ipc::tests::process_endpoint_quota_is_bounded_and_returned_on_exit
 kernel-resource-accounting/KernelResourceAccounting|kernel-ipc-runtime|ipc::tests::process_shared_region_quota_is_bounded_until_reclaim_completes
-kernel-resource-accounting/KernelResourceAccounting|kernel-ps|multitask::process_table::tests::one_process_cannot_consume_the_global_task_table
+kernel-resource-accounting/KernelResourceAccounting|kernel-ps|multitask::process_table::jobs::tests::a_job_thread_limit_is_shared_and_enforced_across_processes_without_per_process_ceiling
 input-ingestion-worker/InputIngestionWorker|inputd|tests::ingestion_handoff_prevents_hot_reader_mutex_barging
 input-ingestion-worker/InputIngestionWorker|inputd|tests::full_dvm_ingest_batch_retries_without_requiring_another_irq
 input-ingestion-worker/InputIngestionWorker|inputd|tests::readiness_generation_closes_empty_queue_lost_wake_window

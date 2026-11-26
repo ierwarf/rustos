@@ -663,6 +663,41 @@ fn wait_for_parallel_boot(
         );
         let dvm_log = read_log_lossy(&layout.dvm_serial_log)
             .with_context(|| format!("read {}", layout.dvm_serial_log.display()))?;
+        if options.kernel_stack_guard_fault_probe {
+            if let Some(_line) = validate_kernel_stack_guard_fault_log(&rustos_log)? {
+                return Ok(ProbeResult {
+                    peer_cid: 0,
+                    inventory_count: 0,
+                    driver_inventory: rustos_driver_domain_host::DvmDriverInventory {
+                        virtio_net_bound: false,
+                        virtio_gpu_bound: false,
+                        display_driver_bound: false,
+                        display_relay_ready: false,
+                    },
+                    display_evidence: None,
+                    block_evidence: None,
+                });
+            }
+            if Instant::now() >= deadline {
+                let reason = "kernel stack guard-fault probe did not emit diagnostic within timeout";
+                let evidence = write_kvm_failure_summary(
+                    layout,
+                    reason,
+                    boot_started.elapsed(),
+                    &rustos_log,
+                    &dvm_log,
+                    &[],
+                    &[],
+                )
+                .map_or_else(
+                    |error| format!("unavailable ({error:#})"),
+                    |path| path.display().to_string(),
+                );
+                bail!("{reason}; evidence={evidence}");
+            }
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
         if let Some(failure) = startup_failure_detail(&rustos_log) {
             bail!(
                 "RustOS startup failed before readiness: {}",
@@ -1373,6 +1408,54 @@ fn wait_for_dvm_restart_recovery(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn validate_kernel_stack_guard_fault_log(log: &str) -> Result<Option<String>> {
+    if log.contains("Double fault:") {
+        bail!("kernel stack guard fault escalated to #DF instead of reporting IST2 #PF diagnostic");
+    }
+    if let Some(line) = log
+        .lines()
+        .find(|line| line.contains("name=kernel-stack-guard-fault "))
+    {
+        let arg0 = line
+            .split_whitespace()
+            .find_map(|field| parse_hex_field(field, "arg0="))
+            .with_context(|| format!("missing arg0 in milestone: {line}"))?;
+        let arg1 = line
+            .split_whitespace()
+            .find_map(|field| parse_hex_field(field, "arg1="))
+            .with_context(|| format!("missing arg1 in milestone: {line}"))?;
+        let task_id = arg0 >> 32;
+        let task_slot = arg0 & 0xffff_ffff;
+        let active = (arg1 & 1) != 0;
+        let guard_page = (arg1 & 2) != 0;
+        let committed_pages = (arg1 >> 2) & 0x3fff;
+        let vslot = arg1 >> 16;
+        if !active || !guard_page || task_id == 0 || task_slot == 0 {
+            bail!(
+                "kernel stack guard-fault milestone invalid: task_id={task_id} task_slot={task_slot} vslot={vslot} active={active} guard_page={guard_page} committed_pages={committed_pages}"
+            );
+        }
+        return Ok(Some(format!(
+            "task_id={task_id} task_slot={task_slot} vslot={vslot} active={active} guard_page={guard_page} committed_pages={committed_pages}"
+        )));
+    }
+    let Some(line) = log
+        .lines()
+        .find(|line| line.contains("Kernel stack guard/page fault:"))
+    else {
+        return Ok(None);
+    };
+    for required in ["active=true", "guard_page=true", "task_id=", "task_slot=", "vslot="] {
+        if !line.contains(required) {
+            bail!("kernel stack guard-fault diagnostic missing {required}: {line}");
+        }
+    }
+    if line.contains("task_id=0 ") || line.contains("task_slot=0 ") {
+        bail!("kernel stack guard-fault diagnostic did not identify a dynamic task: {line}");
+    }
+    Ok(Some(line.trim().to_owned()))
 }
 
 #[cfg(test)]

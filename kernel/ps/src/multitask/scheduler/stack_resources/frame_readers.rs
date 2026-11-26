@@ -1,9 +1,11 @@
 //! Saved-header readers and the Local/Direct -> Running CAS share one leaf.
 //! Allocation refs retain bytes; this separate admission excludes CPU claims.
 use super::super::runqueue;
-use super::{PublishedFrameView, RESOURCES, ResourceCell, Resources, StackPin};
+use super::{PublishedFrameView, ResourceCell, Resources, StackPin, resource, try_resource};
 use crate::multitask::cpu_local;
-use core::{marker::PhantomData, ptr::NonNull, sync::atomic::Ordering};
+#[cfg(not(rustos_boot_image))]
+use core::ptr::NonNull;
+use core::{marker::PhantomData, sync::atomic::Ordering};
 
 pub(in crate::multitask::scheduler) struct FrameReader<'a> {
     _registration: ReaderRegistration,
@@ -15,20 +17,31 @@ pub(in crate::multitask::scheduler) struct FrameReader<'a> {
 pub(in crate::multitask::scheduler) struct PinnedFrameReader {
     registration: ReaderRegistration,
     pin: StackPin,
+    #[cfg(rustos_boot_image)]
+    virtual_usable_base: Option<u64>,
+    #[cfg(not(rustos_boot_image))]
     canary: Option<NonNull<u8>>,
 }
 impl PinnedFrameReader {
     /// Read the ORIGINAL allocated guard, never the publication's old bool or
-    /// a slot re-resolution. Admission bounded this pointer; backing and reader
-    /// exclusion retain it through this byte read outside the leaf.
+    /// a slot re-resolution. Admission bounded this pointer/slot; backing and
+    /// reader exclusion retain it through this check outside the leaf.
     pub(in crate::multitask::scheduler) fn owned_canary_intact(&self) -> Option<bool> {
-        let pointer = self.canary?;
-        // SAFETY: admission checked this complete guard in the pinned Vec;
-        // writers/claims cannot mutate it while this registration is retained.
-        let guard = unsafe { core::slice::from_raw_parts(pointer.as_ptr(), super::super::TASK_STACK_GUARD_BYTES) };
-        Some(guard.chunks_exact(core::mem::size_of::<u64>()).all(|word| {
-            u64::from_ne_bytes(word.try_into().expect("exact canary word")) == super::super::STACK_CANARY_WORD
-        }))
+        #[cfg(rustos_boot_image)]
+        {
+            self.virtual_usable_base
+                .map(kernel_mm::api::kernel_stack::guard_page_unmapped)
+        }
+        #[cfg(not(rustos_boot_image))]
+        {
+            let pointer = self.canary?;
+            // SAFETY: admission checked this complete guard in the pinned Vec;
+            // writers/claims cannot mutate it while this registration is retained.
+            let guard = unsafe { core::slice::from_raw_parts(pointer.as_ptr(), super::super::TASK_STACK_GUARD_BYTES) };
+            Some(guard.chunks_exact(core::mem::size_of::<u64>()).all(|word| {
+                u64::from_ne_bytes(word.try_into().expect("exact canary word")) == super::super::STACK_CANARY_WORD
+            }))
+        }
     }
 
     pub(in crate::multitask::scheduler) fn into_pin(self) -> StackPin {
@@ -51,7 +64,7 @@ pub(in crate::multitask::scheduler) unsafe fn acquire<'a>(
     cpu: usize,
 ) -> Option<FrameReader<'a>> {
     let caller_irq_disabled = caller_irq_state(cpu)?;
-    let cell = RESOURCES.get(pin.slot)?;
+    let cell = try_resource(pin.slot)?;
     cell.with(|resources| {
         if cell.pins.load(Ordering::Acquire) == 0 { return None; }
         let registration = register(cell, resources, pin.slot, cpu, caller_irq_disabled)?;
@@ -65,20 +78,37 @@ pub(in crate::multitask::scheduler) unsafe fn pin_and_acquire(
     slot: usize, task_id: u64, view: PublishedFrameView, cpu: usize,
 ) -> Option<PinnedFrameReader> {
     let caller_irq_disabled = caller_irq_state(cpu)?;
-    let cell = RESOURCES.get(slot)?;
+    let cell = try_resource(slot)?;
     let mut pin = None;
+    #[cfg(rustos_boot_image)]
+    let mut virtual_usable_base = None;
+    #[cfg(not(rustos_boot_image))]
     let mut canary = None;
     let registration = cell.with(|resources| {
         if !cell.pin_locked(resources, task_id, view) { return None; }
         pin = Some(StackPin { slot });
         let registration = register(cell, resources, slot, cpu, caller_irq_disabled)?;
-        canary = resources.stack.as_ref()
-            .and_then(|storage| storage.get(..super::super::TASK_STACK_GUARD_BYTES))
-            .and_then(|guard| NonNull::new(guard.as_ptr() as *mut u8));
+        #[cfg(rustos_boot_image)]
+        {
+            virtual_usable_base = resources.stack.as_ref().map(|storage| storage.usable_base());
+        }
+        #[cfg(not(rustos_boot_image))]
+        {
+            canary = resources.stack.as_ref()
+                .and_then(|storage| storage.as_host_slice().get(..super::super::TASK_STACK_GUARD_BYTES))
+                .and_then(|guard| NonNull::new(guard.as_ptr() as *mut u8));
+        }
         Some(registration)
     })?;
     // A refused registration releases its provisional pin AFTER the leaf ends.
-    Some(PinnedFrameReader { registration, pin: pin?, canary })
+    Some(PinnedFrameReader {
+        registration,
+        pin: pin?,
+        #[cfg(rustos_boot_image)]
+        virtual_usable_base,
+        #[cfg(not(rustos_boot_image))]
+        canary,
+    })
 }
 
 fn caller_irq_state(cpu: usize) -> Option<bool> {
@@ -138,7 +168,7 @@ impl Drop for ReaderRegistration {
     fn drop(&mut self) {
         // ORDERING: Release publishes every byte this reader observed before a
         // claim's Acquire read of zero under the leaf can activate the frame.
-        RESOURCES[self.slot]
+        resource(self.slot)
             .readers
             .fetch_update(Ordering::Release, Ordering::Relaxed, |count| count.checked_sub(1))
             .expect("frame reader released twice");
@@ -150,8 +180,9 @@ pub(in crate::multitask::scheduler) fn with_claim_exclusion<R>(
     slot: usize,
     claim: impl FnOnce() -> R,
 ) -> Option<R> {
-    RESOURCES.get(slot)?.with(|resources| {
-        if !claim_eligible(&RESOURCES[slot], resources, None) {
+    let cell = try_resource(slot)?;
+    cell.with(|resources| {
+        if !claim_eligible(cell, resources, None) {
             return None;
         }
         Some(claim())
@@ -166,7 +197,7 @@ fn claim_eligible(
     // any independent observer still refuses without spending queue custody.
     let readers = cell.readers.load(Ordering::Acquire);
     let allowed = u32::from(original.is_some());
-    if original.is_some_and(|reader| !core::ptr::eq(cell, &RESOURCES[reader.pin.slot])) {
+    if original.is_some_and(|reader| !core::ptr::eq(cell, resource(reader.pin.slot))) {
         return false;
     }
     if resources.reservation.is_some() || readers != allowed || resources.frame_writing {
@@ -227,8 +258,9 @@ pub(in crate::multitask::scheduler) fn with_claim_activation_for_reader<R>(
 ) -> Option<ClaimAttempt<R>> {
     let (outcome, permit) =
         crate::multitask::current_identity::execution::with_claim(slot, |identity| {
-            RESOURCES.get(slot)?.with(|resources| {
-                if !claim_eligible(&RESOURCES[slot], resources, original) {
+            let cell = try_resource(slot)?;
+            cell.with(|resources| {
+                if !claim_eligible(cell, resources, original) {
                     return None;
                 }
                 if let Some(identity) = identity {
@@ -273,8 +305,7 @@ pub(in crate::multitask::scheduler) fn with_claim_activation_for_reader<R>(
 /// Native observation of the real resource counter, never a read/claim grant.
 #[cfg(test)]
 pub(in crate::multitask::scheduler) fn test_count(slot: usize) -> u32 {
-    RESOURCES
-        .get(slot)
+    try_resource(slot)
         .map_or(0, |cell| cell.readers.load(Ordering::Acquire))
 }
 

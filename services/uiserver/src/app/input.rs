@@ -254,7 +254,7 @@ impl AppState {
 
         self.wayland_windows
             .iter()
-            .filter(|window| !window.drag_icon)
+            .filter(|window| !window.drag_icon && !window.popup)
             .enumerate()
             .find(|(index, _)| {
                 taskbar_slot_rect(
@@ -412,6 +412,20 @@ impl AppState {
                     }
                     WindowChromeHit::Client => {
                         let before_dirty = self.wayland_visual_dirty_rect();
+                        // A popup receives the click but leaves focus where the
+                        // client's grab (or its parent) already put it.
+                        let is_popup = self
+                            .wayland_windows
+                            .iter()
+                            .any(|w| w.surface_id == surface_id && w.popup);
+                        if is_popup {
+                            self.sync_wayland_pointer_target(wayland);
+                            wayland.pointer_motion(self.cursor_x, self.cursor_y);
+                            if wayland.pointer_button(POINTER_BUTTON_LEFT, true) {
+                                return Ok(VisualUpdate::partial(before_dirty));
+                            }
+                            return Ok(VisualUpdate::default());
+                        }
                         wayland.focus_surface(surface_id);
                         let wayland_dirty = self.sync_wayland_windows(wayland.window_snapshots());
                         self.focus_wayland_window(surface_id);

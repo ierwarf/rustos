@@ -15,14 +15,14 @@ use rustos_user_abi::syscall::RustosTaskCapacityArgs;
 
 fn capacity_reply(snapshot: &multitask::TaskCapacitySnapshot) -> RustosTaskCapacityArgs {
     RustosTaskCapacityArgs {
-        total_slots: snapshot.total_slots,
-        kernel_reserved_slots: snapshot.kernel_reserved_slots,
-        application_thread_budget: snapshot.application_thread_budget,
+        max_task_slots: snapshot.max_task_slots,
+        max_process_slots: snapshot.max_process_slots,
         live_tasks: snapshot.live_tasks,
-        reservable_slots: snapshot.reservable_slots,
+        live_processes: snapshot.live_processes,
+        task_object_bytes: snapshot.task_object_bytes,
         kernel_stack_bytes: snapshot.kernel_stack_bytes,
-        process_thread_ceiling: snapshot.process_thread_ceiling,
-        root_process_ceiling: snapshot.root_process_ceiling,
+        usable_ram_bytes: snapshot.usable_ram_bytes,
+        free_ram_bytes: snapshot.free_ram_bytes,
         ..RustosTaskCapacityArgs::request()
     }
 }
@@ -49,19 +49,25 @@ mod tests {
 
     #[test]
     fn the_reply_carries_every_authority_value_and_is_not_a_request() {
-        let capacity = multitask::TaskCapacity::new(256, 2 * 1024 * 1024);
-        let snapshot = multitask::TaskCapacitySnapshot::from_authority(&capacity, 200);
+        let capacity = multitask::TaskCapacity::new(16384, 16384, 16 * 1024, 256 * 1024);
+        let snapshot = multitask::TaskCapacitySnapshot::from_observations(
+            &capacity,
+            56,
+            12,
+            4096 * 1024 * 1024,
+            3072 * 1024 * 1024,
+        );
         let reply = capacity_reply(&snapshot);
         assert_eq!(reply.abi_version, rustos_user_abi::syscall::TASK_CAPACITY_ABI_VERSION);
         assert_eq!(reply.flags, 0);
-        assert_eq!(reply.total_slots, 256);
-        assert_eq!(reply.kernel_reserved_slots, 64);
-        assert_eq!(reply.application_thread_budget, 192);
+        assert_eq!(reply.max_task_slots, 16384);
+        assert_eq!(reply.max_process_slots, 16384);
         assert_eq!(reply.live_tasks, 56);
-        assert_eq!(reply.reservable_slots, 200);
-        assert_eq!(reply.kernel_stack_bytes, 2 * 1024 * 1024);
-        assert_eq!(reply.process_thread_ceiling, 128);
-        assert_eq!(reply.root_process_ceiling, 64);
+        assert_eq!(reply.live_processes, 12);
+        assert_eq!(reply.task_object_bytes, 16 * 1024);
+        assert_eq!(reply.kernel_stack_bytes, 256 * 1024);
+        assert_eq!(reply.usable_ram_bytes, 4096 * 1024 * 1024);
+        assert_eq!(reply.free_ram_bytes, 3072 * 1024 * 1024);
         assert!(!reply.is_request(), "a filled reply is not a valid request");
     }
 

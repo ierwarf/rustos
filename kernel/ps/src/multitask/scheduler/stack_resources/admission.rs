@@ -1,6 +1,6 @@
 //! Exact prepublication thread-slot custody, independent of Scheduler storage.
 //! No resource leaf crosses allocation, process attachment or initialization.
-use super::{Geometry, RESOURCES, Resources, StackPin};
+use super::{Geometry, Resources, StackPin, resource, try_resource};
 use crate::multitask::scheduler::PublishedFrameView;
 use core::sync::atomic::Ordering;
 
@@ -35,6 +35,7 @@ pub(in crate::multitask::scheduler) struct Ticket {
     task_id: u64,
     generation: u64,
     live: bool,
+    dynamic_claim: bool,
 }
 fn matches(resources: &Resources, ticket: &Ticket, phase: Phase) -> bool {
     resources.reservation
@@ -47,7 +48,7 @@ fn matches(resources: &Resources, ticket: &Ticket, phase: Phase) -> bool {
 /// Isolated Local/Direct descriptor witness only, never a production ACK.
 #[cfg(test)]
 pub(super) fn set_phase_for_test(slot: usize, id: u64, phase: Option<Phase>) {
-    RESOURCES[slot].with(|resources| {
+    resource(slot).with(|resources| {
         assert!(
             resources
                 .reservation
@@ -62,9 +63,13 @@ pub(super) fn set_phase_for_test(slot: usize, id: u64, phase: Option<Phase>) {
 }
 
 pub(in crate::multitask::scheduler) fn is_reserved(slot: usize) -> bool {
-    RESOURCES
-        .get(slot)
+    try_resource(slot)
         .is_none_or(|cell| cell.with(|resources| resources.reservation.is_some()))
+}
+
+pub(in crate::multitask::scheduler) fn reservable(slot: usize) -> bool {
+    try_resource(slot)
+        .is_some_and(|cell| cell.with(|resources| !unavailable(cell, resources, slot)))
 }
 
 pub(in crate::multitask) fn wake_allowed(slot: usize) -> bool {
@@ -101,16 +106,26 @@ fn unavailable(
         || cell.pins.load(Ordering::Acquire) != 0
 }
 
-/// A non-binding observation that `slot` could be reserved at this instant.
-pub(in crate::multitask::scheduler) fn reservable(slot: usize) -> bool {
-    RESOURCES
-        .get(slot)
-        .is_some_and(|cell| cell.with(|resources| !unavailable(cell, resources, slot)))
+/// Allocates a dynamic slot (`>= FIRST_DYNAMIC_TASK_SLOT`) in unmasked normal
+/// context and reserves it for `task_id`.
+pub(in crate::multitask::scheduler) fn reserve_dynamic(task_id: u64) -> Option<Ticket> {
+    let slot = crate::multitask::task_table::claim_dynamic_slot()?;
+    match reserve_with_claim(slot, task_id, true) {
+        Some(ticket) => Some(ticket),
+        None => {
+            crate::multitask::task_table::release_dynamic_slot(slot);
+            None
+        }
+    }
 }
 
 pub(in crate::multitask::scheduler) fn reserve(slot: usize, task_id: u64) -> Option<Ticket> {
-    let cell = RESOURCES.get(slot)?;
-    cell.with(|resources| {
+    reserve_with_claim(slot, task_id, false)
+}
+
+fn reserve_with_claim(slot: usize, task_id: u64, dynamic_claim: bool) -> Option<Ticket> {
+    let cell = try_resource(slot)?;
+    let reserved = cell.with(|resources| {
         if unavailable(cell, resources, slot) {
             return None;
         }
@@ -126,8 +141,13 @@ pub(in crate::multitask::scheduler) fn reserve(slot: usize, task_id: u64) -> Opt
             task_id,
             generation,
             live: true,
+            dynamic_claim,
         })
-    })
+    })?;
+    if !dynamic_claim {
+        crate::multitask::task_table::set_slot_active(slot, true);
+    }
+    Some(reserved)
 }
 impl Ticket {
     pub(in crate::multitask::scheduler) fn slot(&self) -> usize {
@@ -135,11 +155,11 @@ impl Ticket {
     }
     pub(in crate::multitask::scheduler) fn is_committing(&self) -> bool {
         self.live
-            && RESOURCES[self.slot].with(|resources| matches(resources, self, Phase::Committing))
+            && resource(self.slot).with(|resources| matches(resources, self, Phase::Committing))
     }
 
     pub(in crate::multitask::scheduler) fn is_reserved_current(&self) -> bool {
-        self.live && RESOURCES[self.slot].with(|r| matches(r, self, Phase::Reserved))
+        self.live && resource(self.slot).with(|r| matches(r, self, Phase::Reserved))
     }
 
     pub(in crate::multitask::scheduler) fn task_id(&self) -> u64 {
@@ -154,12 +174,12 @@ impl Ticket {
         self.live
             && self.slot == slot
             && self.task_id == task_id
-            && RESOURCES[self.slot].with(|resources| matches(resources, self, Phase::Reserved))
+            && resource(self.slot).with(|resources| matches(resources, self, Phase::Reserved))
     }
 
     #[cfg(test)]
     pub(super) fn set_phase_for_test(&self, phase: Phase) {
-        RESOURCES[self.slot].with(|r| {
+        resource(self.slot).with(|r| {
             let reservation = r
                 .reservation
                 .as_mut()
@@ -179,6 +199,7 @@ impl Ticket {
                 || matches(resources, self, Phase::Committing))
     }
 
+    #[cfg(not(rustos_boot_image))]
     pub(in crate::multitask::scheduler) fn initialize_storage(&self, f: impl FnOnce(&mut [u8])) {
         super::frame_access::initialize_reserved_storage(self.slot, self, f);
     }
@@ -189,16 +210,22 @@ impl Ticket {
     ) -> R {
         super::frame_access::with_reserved_image(self.slot, self, f)
     }
-    pub(in crate::multitask::scheduler) fn install_storage(&self, storage: alloc::vec::Vec<u8>) {
-        super::install_storage_with_reservation(
+
+    pub(in crate::multitask::scheduler) fn install_stack(&self, stack: super::KernelStack) {
+        super::install_stack_with_reservation(
             self.slot,
-            storage,
+            stack,
             Some(Reservation {
                 task_id: self.task_id,
                 generation: self.generation,
                 phase: Phase::Reserved,
             }),
         );
+    }
+
+    #[cfg(test)]
+    pub(in crate::multitask::scheduler) fn install_storage(&self, storage: alloc::vec::Vec<u8>) {
+        self.install_stack(super::KernelStack::from_host_vec(storage));
     }
     pub(in crate::multitask::scheduler) fn install_context(
         &self,
@@ -235,7 +262,7 @@ impl Ticket {
     }
 
     fn transition(&self, from: Phase, to: Phase) -> bool {
-        RESOURCES[self.slot].with(|resources| {
+        resource(self.slot).with(|resources| {
             if !self.live || !matches(resources, self, from) {
                 return false;
             }
@@ -252,8 +279,8 @@ impl Ticket {
     pub(in crate::multitask::scheduler) fn begin_cancel(&self) -> bool {
         self.transition(Phase::Reserved, Phase::Canceling)
     }
-    pub(in crate::multitask::scheduler) fn take_storage(&self) -> Option<alloc::vec::Vec<u8>> {
-        super::take_storage_with_reservation(
+    pub(in crate::multitask::scheduler) fn take_stack(&self) -> Option<super::KernelStack> {
+        super::take_stack_with_reservation(
             self.slot,
             Some(Reservation {
                 task_id: self.task_id,
@@ -263,6 +290,11 @@ impl Ticket {
             None,
         )
     }
+
+    #[cfg(test)]
+    pub(in crate::multitask::scheduler) fn take_storage(&self) -> Option<alloc::vec::Vec<u8>> {
+        self.take_stack().map(super::KernelStack::into_host_vec)
+    }
     /// Transfer physical backing before Slot ACK. This is not continuation,
     /// dispatch, membership or retirement permission; consumers still qualify
     /// the exact published UID and queue state while this loan prevents reuse.
@@ -270,7 +302,8 @@ impl Ticket {
         &self,
         view: PublishedFrameView,
     ) -> StackPin {
-        RESOURCES[self.slot].with(|resources| {
+        let cell = resource(self.slot);
+        cell.with(|resources| {
             assert!(
                 self.live && matches(resources, self, Phase::Committing),
                 "publication backing lacks exact committing producer"
@@ -290,7 +323,7 @@ impl Ticket {
             );
             // ORDERING: the exact producer/resource leaf serializes increments;
             // acquire/release retains backing before reservation removal admits readers.
-            RESOURCES[self.slot]
+            cell
                 .pins
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                     count.checked_add(1)
@@ -309,7 +342,7 @@ impl Ticket {
         // Identity51 -> Resources53 joins the exact UID to the one release.
         // Actual claims and cold binding acquisition share these owners.
         crate::multitask::current_identity::with_exact_publication(self.slot, self.task_id, || {
-            RESOURCES[self.slot].with(|resources| {
+            resource(self.slot).with(|resources| {
                 assert!(
                     matches(resources, &self, Phase::Committing),
                     "foreign thread reservation publication"
@@ -338,7 +371,8 @@ impl Ticket {
         }
     }
     pub(in crate::multitask::scheduler) fn finish_cancel(mut self) {
-        RESOURCES[self.slot].with(|resources| {
+        let cell = resource(self.slot);
+        cell.with(|resources| {
             assert!(
                 matches(resources, &self, Phase::Canceling),
                 "foreign thread reservation cancellation"
@@ -350,12 +384,15 @@ impl Ticket {
                     && resources.binding.is_none()
                     && resources.stack.is_none()
                     && !resources.frame_writing
-                    && RESOURCES[self.slot].pins.load(Ordering::Acquire) == 0,
+                    && cell.pins.load(Ordering::Acquire) == 0,
                 "thread reservation canceled before release"
             );
             resources.reservation = None;
         });
         self.live = false;
+        if self.dynamic_claim {
+            crate::multitask::task_table::release_dynamic_slot(self.slot);
+        }
     }
 }
 impl Drop for Ticket {
@@ -363,7 +400,7 @@ impl Drop for Ticket {
         if !self.live {
             return;
         }
-        RESOURCES[self.slot].with(|resources| {
+        resource(self.slot).with(|resources| {
             // Abandonment is not rollback. Never reopen a partially initialized
             // slot; a stale ticket also cannot poison its replacement owner.
             if let Some(reservation) = resources.reservation.as_mut() {

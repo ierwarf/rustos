@@ -71,7 +71,7 @@ pub(in crate::multitask::scheduler) fn first_turn_fifo() {
             }
             // Explicit later unknown member input: only the complete front may
             // claim; the incomplete tail must survive the same physical claim.
-            enqueue(MAX_TASK - 1, ID + 2, atomic);
+            enqueue(4095, ID + 2, atomic);
             assert!(sync_handoff::enqueue(0, sync_handoff::SyncHandoffRecord::new(slot, ID)));
             let decision = if atomic {
                 // SAME production priority chain, not a parallel test ordering.
@@ -90,7 +90,7 @@ pub(in crate::multitask::scheduler) fn first_turn_fifo() {
                 assert_eq!(dispatch_policy::lock(0).atomic_activation_handoff_remaining, 1);
             }
             dispatch_claim::tests::finish_modeled_preparation(slot, 121);
-            dispatch_policy::remove_reclaimed_slot(MAX_TASK - 1);
+            dispatch_policy::remove_reclaimed_slot(4095);
             sync_handoff::remove_slot_all_cpus(slot);
         });
     }
@@ -106,7 +106,7 @@ pub(in crate::multitask::scheduler) fn incomplete_first_turn() {
     for atomic in [true, false] {
         dispatch_claim::tests::fixture(false, |_slot, turn| {
             turn.begin_priority_choice();
-            let unknown = MAX_TASK - 1;
+            let unknown = 4095;
             assert!(current_identity::read_dispatch(unknown).is_none());
             assert!(matches!(local_candidate(unknown, 0, Urgency::Spawn), Decision::Incomplete));
             enqueue(unknown, ID + 2, atomic);

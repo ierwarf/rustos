@@ -115,3 +115,29 @@ fn the_raw_acquire_path_never_rederives_the_cpu_index() {
         "the dependency graph must take a derived index, not derive one"
     );
 }
+
+#[test]
+fn try_lock_tracks_raw_preemption_depth_independent_of_dispatch_preemption() {
+    let source = include_str!("../lockdep.rs");
+    let start = source
+        .find("pub fn try_lock(&self)")
+        .expect("try_lock must exist in lockdep.rs");
+    let end = source[start..]
+        .find("\n    }\n}\n")
+        .map(|offset| start + offset)
+        .expect("try_lock body must terminate cleanly");
+    let body = &source[start..end];
+    let code_only: alloc::string::String = body
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<alloc::vec::Vec<_>>()
+        .join("\n");
+    assert!(
+        !code_only.contains("preemption_depth()"),
+        "try_lock must record raw preempt_disable_depth, not effective preemption_depth():\n{body}"
+    );
+    assert!(
+        code_only.contains("preempt_disable_depth"),
+        "try_lock must read CPU_LOCK_STATE preempt_disable_depth to match drop_full():\n{body}"
+    );
+}

@@ -69,7 +69,7 @@ pub(in crate::multitask::scheduler) fn diagnostic_foreign_input() {
         runtime_profile::observe_original_current(turn);
         let (first, count) = crate::multitask::run_authority::take_window().unwrap();
         assert_eq!(count, 1);
-        assert_eq!(first & 0xffff_ffff,
+        assert_eq!(first & 0xFF,
             crate::multitask::run_authority::Mismatch::LegacyRunningQueueNot as u64);
         assert!(matches!(runqueue::publish_local_wake(slot, 0, weight),
             runqueue::RemoteWakeOutcome::Published { .. }));
@@ -109,7 +109,7 @@ fn actual_dispatch_owns_choice_frame_funding_interval_and_return_without_catalog
 fn actual_earlier_claim_discharges_only_its_exact_spawn_first_turn() {
     current(|slot, turn| {
         let record = FirstTurnHandoff { slot, task_id: ID };
-        let tail = FirstTurnHandoff { slot: MAX_TASK - 1, task_id: ID + 1 };
+        let tail = FirstTurnHandoff { slot: 4095, task_id: ID + 1 };
         {
             let mut policy = dispatch_policy::lock(0);
             policy.spawn_pick_hints.enqueue(record).unwrap();

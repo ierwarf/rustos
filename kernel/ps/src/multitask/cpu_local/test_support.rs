@@ -119,7 +119,7 @@ pub(super) fn install_test_transition_owner_with_admission(
 ) -> TestCpuPublicationRestore {
     let restore = preserve_test_cpu_publication(logical_index);
     assert!(
-        incoming_slot < MAX_SCHEDULER_TASKS && outgoing_slot < MAX_SCHEDULER_TASKS,
+        incoming_slot < super::MAX_TASK_SLOTS && outgoing_slot < super::MAX_TASK_SLOTS,
         "test scheduler transition slot exceeds capacity"
     );
     CURRENT_TASK_SLOTS[logical_index].store(incoming_slot, Ordering::Release);
@@ -142,7 +142,7 @@ pub(in super::super) fn install_test_current_owner(
 ) -> TestCpuPublicationRestore {
     let restore = preserve_test_cpu_publication(logical_index);
     assert!(
-        slot < MAX_SCHEDULER_TASKS,
+        slot < super::MAX_TASK_SLOTS,
         "test scheduler slot exceeds capacity"
     );
     CURRENT_TASK_SLOTS[logical_index].store(slot, Ordering::Release);

@@ -12,13 +12,28 @@ impl WaylandState {
     }
 
     fn hit_test_pointer_impl(&self, x: u32, y: u32, dragging: bool) -> Option<PointerHit> {
-        for surface in self.surfaces.iter().rev() {
+        // Popups sit above every toplevel, whatever the toplevel stacking is.
+        let popups = self
+            .surfaces
+            .iter()
+            .rev()
+            .filter(|surface| Self::is_popup(&surface.shared));
+        let others = self
+            .surfaces
+            .iter()
+            .rev()
+            .filter(|surface| !Self::is_popup(&surface.shared));
+        for surface in popups.chain(others) {
             let Ok(surface) = surface.shared.lock() else {
                 continue;
             };
             if surface.drag_icon_role || surface.cursor_role {
                 continue;
             }
+            // Popups are placed relative to their parent; a hidden one is not hit.
+            let Some(frame) = self.surface_frame(&surface, 0) else {
+                continue;
+            };
             let grabbed = !dragging
                 && self.pointer_button_down
                 && self.pointer_focus.as_ref().is_some_and(|focus| {
@@ -49,17 +64,17 @@ impl WaylandState {
             // area is actually rendered. Hit-test against that visible area so
             // clicks outside the painted chrome can't fake-hit invisible
             // pixels.
-            let visible_w = surface.width.min(surface.frame.width);
-            let visible_h = surface.height.min(surface.frame.height);
+            let visible_w = surface.width.min(frame.width);
+            let visible_h = surface.height.min(frame.height);
             let border = window_border();
             let client_rect = Rect {
-                x: surface.frame.x
+                x: frame.x
                     + if surface.decoration_server {
                         border
                     } else {
                         0
                     },
-                y: surface.frame.y
+                y: frame.y
                     + if surface.decoration_server {
                         window_title_height() + border
                     } else {

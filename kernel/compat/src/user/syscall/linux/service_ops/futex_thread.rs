@@ -18,10 +18,6 @@ use super::*;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use x86_64::VirtAddr;
 
-/// A task owns at most one futex wait, so one slot per scheduler task can
-/// never be exhausted; tying the size to the scheduler keeps that true if the
-/// task limit grows.
-const FUTEX_WAITERS_CAPACITY: usize = multitask::MAX_SCHEDULER_TASKS;
 const ROBUST_LIST_HEAD_SIZE: u64 = 24;
 const ROBUST_LIST_LIMIT: usize = 2_048;
 const ROBUST_CMPXCHG_RETRY_LIMIT: usize = 64;
@@ -53,19 +49,17 @@ struct FutexWaiter {
 
 const FUTEX_KEY_BUCKETS: usize = 128;
 const FUTEX_TASK_BUCKETS: usize = 64;
-const FUTEX_EMPTY: u16 = u16::MAX;
-// Slot links are `u16`; the sentinel must stay outside the slot index range.
-const _: () = assert!(FUTEX_WAITERS_CAPACITY < FUTEX_EMPTY as usize);
+const FUTEX_EMPTY: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 struct FutexSlot {
     waiter: FutexWaiter,
-    key_prev: u16,
-    key_next: u16,
-    task_prev: u16,
-    task_next: u16,
+    key_prev: u32,
+    key_next: u32,
+    task_prev: u32,
+    task_next: u32,
     occupied: bool,
-    free_next: u16,
+    free_next: u32,
 }
 
 impl FutexSlot {
@@ -89,44 +83,20 @@ impl FutexSlot {
 }
 
 struct FutexWaiterTable {
-    slots: [FutexSlot; FUTEX_WAITERS_CAPACITY],
-    key_buckets: [u16; FUTEX_KEY_BUCKETS],
-    task_buckets: [u16; FUTEX_TASK_BUCKETS],
-    free_head: u16,
-    initialized: bool,
+    slots: alloc::vec::Vec<FutexSlot>,
+    key_buckets: [u32; FUTEX_KEY_BUCKETS],
+    task_buckets: [u32; FUTEX_TASK_BUCKETS],
+    free_head: u32,
 }
 
 impl FutexWaiterTable {
     const fn new() -> Self {
         Self {
-            slots: [FutexSlot::EMPTY; FUTEX_WAITERS_CAPACITY],
+            slots: alloc::vec::Vec::new(),
             key_buckets: [FUTEX_EMPTY; FUTEX_KEY_BUCKETS],
             task_buckets: [FUTEX_EMPTY; FUTEX_TASK_BUCKETS],
-            free_head: 0,
-            initialized: false,
+            free_head: FUTEX_EMPTY,
         }
-    }
-
-    #[inline]
-    fn ensure_init(&mut self) {
-        if self.initialized {
-            return;
-        }
-        let mut i = 0;
-        while i < FUTEX_WAITERS_CAPACITY {
-            self.slots[i].free_next = if i + 1 < FUTEX_WAITERS_CAPACITY {
-                (i + 1) as u16
-            } else {
-                FUTEX_EMPTY
-            };
-            i += 1;
-        }
-        self.free_head = if FUTEX_WAITERS_CAPACITY == 0 {
-            FUTEX_EMPTY
-        } else {
-            0
-        };
-        self.initialized = true;
     }
 
     #[inline]
@@ -161,7 +131,7 @@ impl FutexWaiterTable {
         (task_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - 6)) as usize
     }
 
-    fn link_key(&mut self, slot: u16, key: FutexKey) {
+    fn link_key(&mut self, slot: u32, key: FutexKey) {
         let b = Self::key_bucket(key);
         let head = self.key_buckets[b];
         self.slots[slot as usize].key_prev = FUTEX_EMPTY;
@@ -172,7 +142,7 @@ impl FutexWaiterTable {
         self.key_buckets[b] = slot;
     }
 
-    fn unlink_key(&mut self, slot: u16, key: FutexKey) {
+    fn unlink_key(&mut self, slot: u32, key: FutexKey) {
         let b = Self::key_bucket(key);
         let prev = self.slots[slot as usize].key_prev;
         let next = self.slots[slot as usize].key_next;
@@ -188,7 +158,7 @@ impl FutexWaiterTable {
         self.slots[slot as usize].key_next = FUTEX_EMPTY;
     }
 
-    fn link_task(&mut self, slot: u16, task_id: u64) {
+    fn link_task(&mut self, slot: u32, task_id: u64) {
         let b = Self::task_bucket(task_id);
         let head = self.task_buckets[b];
         self.slots[slot as usize].task_prev = FUTEX_EMPTY;
@@ -199,7 +169,7 @@ impl FutexWaiterTable {
         self.task_buckets[b] = slot;
     }
 
-    fn unlink_task(&mut self, slot: u16, task_id: u64) {
+    fn unlink_task(&mut self, slot: u32, task_id: u64) {
         let b = Self::task_bucket(task_id);
         let prev = self.slots[slot as usize].task_prev;
         let next = self.slots[slot as usize].task_next;
@@ -215,7 +185,7 @@ impl FutexWaiterTable {
         self.slots[slot as usize].task_next = FUTEX_EMPTY;
     }
 
-    fn remove_slot(&mut self, slot: u16) {
+    fn remove_slot(&mut self, slot: u32) {
         let waiter = self.slots[slot as usize].waiter;
         self.unlink_key(slot, waiter.key);
         self.unlink_task(slot, waiter.task_id);
@@ -225,13 +195,21 @@ impl FutexWaiterTable {
     }
 
     fn insert(&mut self, waiter: FutexWaiter) -> Result<(), i64> {
-        self.ensure_init();
         let _ = self.take_task(waiter.task_id);
-        let slot = self.free_head;
-        if slot == FUTEX_EMPTY {
-            return Err(LINUX_ENOMEM);
-        }
-        self.free_head = self.slots[slot as usize].free_next;
+        let slot = if self.free_head != FUTEX_EMPTY {
+            let slot = self.free_head;
+            self.free_head = self.slots[slot as usize].free_next;
+            slot
+        } else {
+            let Ok(slot) = u32::try_from(self.slots.len()) else {
+                return Err(LINUX_ENOMEM);
+            };
+            if slot == FUTEX_EMPTY || self.slots.try_reserve(1).is_err() {
+                return Err(LINUX_ENOMEM);
+            }
+            self.slots.push(FutexSlot::EMPTY);
+            slot
+        };
         self.slots[slot as usize].waiter = waiter;
         self.slots[slot as usize].occupied = true;
         self.slots[slot as usize].free_next = FUTEX_EMPTY;
@@ -241,9 +219,6 @@ impl FutexWaiterTable {
     }
 
     fn take_task(&mut self, task_id: u64) -> bool {
-        if !self.initialized {
-            return false;
-        }
         let mut cursor = self.task_buckets[Self::task_bucket(task_id)];
         let mut removed = false;
         while cursor != FUTEX_EMPTY {
@@ -266,7 +241,7 @@ impl FutexWaiterTable {
         bitset: u32,
         task_ids: &mut [u64],
     ) -> (usize, usize) {
-        if !self.initialized || (max_wake == 0 && max_requeue == 0) {
+        if max_wake == 0 && max_requeue == 0 {
             return (0, 0);
         }
         let mut wake_count = 0usize;
@@ -295,6 +270,48 @@ impl FutexWaiterTable {
             cursor = next;
         }
         (wake_count, requeue_count)
+    }
+
+    fn select_requeue_vec(
+        &mut self,
+        from_key: FutexKey,
+        to_key: FutexKey,
+        max_wake: usize,
+        max_requeue: usize,
+        bitset: u32,
+        woken_tasks: &mut alloc::vec::Vec<u64>,
+    ) -> usize {
+        if max_wake == 0 && max_requeue == 0 {
+            return 0;
+        }
+        let mut wake_count = 0usize;
+        let mut requeue_count = 0usize;
+        let mut cursor = self.key_buckets[Self::key_bucket(from_key)];
+        while cursor != FUTEX_EMPTY {
+            let next = self.slots[cursor as usize].key_next;
+            let waiter = self.slots[cursor as usize].waiter;
+            if waiter.key == from_key && (waiter.bitset & bitset) != 0 {
+                if wake_count < max_wake {
+                    if woken_tasks.try_reserve(1).is_err() {
+                        break;
+                    }
+                    woken_tasks.push(waiter.task_id);
+                    self.remove_slot(cursor);
+                    wake_count += 1;
+                } else if requeue_count < max_requeue {
+                    if from_key != to_key {
+                        self.unlink_key(cursor, from_key);
+                        self.slots[cursor as usize].waiter.key = to_key;
+                        self.link_key(cursor, to_key);
+                    }
+                    requeue_count += 1;
+                } else {
+                    break;
+                }
+            }
+            cursor = next;
+        }
+        requeue_count
     }
 }
 
@@ -486,7 +503,6 @@ const fn clone_spawn_refusal_stage(error: multitask::SpawnTaskError) -> u64 {
         E::NoFreeTaskSlot => 11,
         E::MemoryQuota => 13,
         E::ThreadStackAllocation => 14,
-        E::ProcessThreadLimit => 15,
         E::JobThreadLimit => 16,
         E::JobThreadMemory => 17,
         E::ProcessExiting => 18,
@@ -516,10 +532,11 @@ fn record_stack_exhaustion() {
     let snapshot = multitask::task_capacity_snapshot();
     let (total, allocated) = kernel_mm::api::heap::usage_bytes().unwrap_or((0, 0));
     const MIB: u64 = 1024 * 1024;
+    let free_mib = snapshot.free_ram_bytes / MIB;
     nucleus_core::debug::record_milestone(
         nucleus_core::debug::LogCategory::Compat,
         "linux-thread-stack-exhausted",
-        (snapshot.live_tasks << 32) | snapshot.reservable_slots,
+        (snapshot.live_tasks << 32) | (free_mib & 0xffff_ffff),
         ((allocated as u64 / MIB) << 32) | (total as u64 / MIB),
     );
 }
@@ -535,7 +552,7 @@ fn clone_spawn_refused(error: multitask::SpawnTaskError, flags: u64) -> u64 {
     }
     let detail = error
         .rejecting_limit()
-        .map_or(flags, |limit| multitask::TASK_CAPACITY.limit_value(limit));
+        .map_or(flags, |limit| multitask::task_capacity().limit_value(limit));
     clone_stage_failed(
         clone_spawn_refusal_stage(error),
         process_spawn_error_to_linux_errno(error),
@@ -956,14 +973,14 @@ fn futex_cmp_requeue(
     let max_wake = futex_int_count(max_wake)?;
     let max_requeue = futex_int_count(max_requeue)?;
     let (_, address_space_root, retained) = current_futex_binding()?;
-    let mut task_ids = [0_u64; FUTEX_WAITERS_CAPACITY];
+    let mut task_ids = alloc::vec::Vec::new();
 
     // Linearization point: retain the exact page-table generation, then hold
     // the futex bucket while performing one atomic word load and the complete
     // queue mutation. A user atomic store may race, but it is ordered either
     // before or after this load; no FUTEX_WAIT/WAKE/REQUEUE operation can slip
     // between the comparison and requeue commit.
-    let (wake_count, requeued) = retained
+    let requeued = retained
         .try_with_process_state(|process_state| {
             let from_key =
                 futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
@@ -979,7 +996,7 @@ fn futex_cmp_requeue(
             if actual != expected as u32 {
                 return Err(LINUX_EAGAIN);
             }
-            Ok::<(usize, usize), i64>(waiters.select_requeue(
+            Ok::<usize, i64>(waiters.select_requeue_vec(
                 from_key,
                 to_key,
                 max_wake,
@@ -989,7 +1006,7 @@ fn futex_cmp_requeue(
             ))
         })
         .ok_or(LINUX_EINTR)??;
-    let woken = wake_selected_futex_tasks(&task_ids, wake_count);
+    let woken = wake_selected_futex_tasks(&task_ids, task_ids.len());
     Ok((woken + requeued) as u64)
 }
 
@@ -1008,9 +1025,9 @@ fn futex_wake_op(
     let max_wake1 = futex_wake_limit(max_wake1);
     let max_wake2 = futex_wake_limit(max_wake2);
     let (_, address_space_root, retained) = current_futex_binding()?;
-    let mut task_ids1 = [0_u64; FUTEX_WAITERS_CAPACITY];
-    let mut task_ids2 = [0_u64; FUTEX_WAITERS_CAPACITY];
-    let (count1, count2) = retained
+    let mut task_ids1 = alloc::vec::Vec::new();
+    let mut task_ids2 = alloc::vec::Vec::new();
+    retained
         .try_with_process_state(|process_state| {
             let key1 = futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
             let key2 = futex_key_for_process_state(process_state, address_space_root, uaddr2, op)?;
@@ -1044,35 +1061,29 @@ fn futex_wake_op(
                 4 => (oldval as i32) > decoded.cmparg,
                 _ => (oldval as i32) >= decoded.cmparg,
             };
-            let count1 = waiters
-                .select_requeue(
-                    key1,
-                    key1,
-                    max_wake1,
+            waiters.select_requeue_vec(
+                key1,
+                key1,
+                max_wake1,
+                0,
+                linux_abi::FUTEX_BITSET_MATCH_ANY,
+                &mut task_ids1,
+            );
+            if cond {
+                waiters.select_requeue_vec(
+                    key2,
+                    key2,
+                    max_wake2,
                     0,
                     linux_abi::FUTEX_BITSET_MATCH_ANY,
-                    &mut task_ids1,
-                )
-                .0;
-            let count2 = if cond {
-                waiters
-                    .select_requeue(
-                        key2,
-                        key2,
-                        max_wake2,
-                        0,
-                        linux_abi::FUTEX_BITSET_MATCH_ANY,
-                        &mut task_ids2,
-                    )
-                    .0
-            } else {
-                0
-            };
-            Ok::<(usize, usize), i64>((count1, count2))
+                    &mut task_ids2,
+                );
+            }
+            Ok::<(), i64>(())
         })
         .ok_or(LINUX_EINTR)??;
-    let woken1 = wake_selected_futex_tasks(&task_ids1, count1);
-    let woken2 = wake_selected_futex_tasks(&task_ids2, count2);
+    let woken1 = wake_selected_futex_tasks(&task_ids1, task_ids1.len());
+    let woken2 = wake_selected_futex_tasks(&task_ids2, task_ids2.len());
     Ok((woken1 + woken2) as u64)
 }
 
@@ -1089,15 +1100,15 @@ fn futex_requeue_inner(
     let max_wake = futex_int_count(max_wake)?;
     let max_requeue = futex_int_count(max_requeue)?;
     let (_, address_space_root, retained) = current_futex_binding()?;
-    let mut task_ids = [0_u64; FUTEX_WAITERS_CAPACITY];
-    let (wake_count, requeued) = retained
+    let mut task_ids = alloc::vec::Vec::new();
+    let requeued = retained
         .try_with_process_state(|process_state| {
             let from_key =
                 futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;
             let to_key =
                 futex_key_for_process_state(process_state, address_space_root, uaddr2, op)?;
             let mut waiters = FUTEX_WAITERS.lock();
-            Ok::<(usize, usize), i64>(waiters.select_requeue(
+            Ok::<usize, i64>(waiters.select_requeue_vec(
                 from_key,
                 to_key,
                 max_wake,
@@ -1107,7 +1118,7 @@ fn futex_requeue_inner(
             ))
         })
         .ok_or(LINUX_EINTR)??;
-    let woken = wake_selected_futex_tasks(&task_ids, wake_count);
+    let woken = wake_selected_futex_tasks(&task_ids, task_ids.len());
     Ok((woken + requeued) as u64)
 }
 
@@ -1292,19 +1303,30 @@ fn wake_futex_waiters(key: FutexKey, max_wake: usize, bitset: u32) -> usize {
 
 #[cold]
 fn wake_futex_waiters_many(key: FutexKey, max_wake: usize, bitset: u32) -> usize {
-    let mut task_ids = [0_u64; FUTEX_WAITERS_CAPACITY];
-    let wake_count = {
-        let mut waiters = FUTEX_WAITERS.lock();
-        waiters
-            .select_requeue(key, key, max_wake, 0, bitset, &mut task_ids)
-            .0
-    };
+    let mut remaining = max_wake;
     let mut woken = 0usize;
-    for task_id in task_ids.into_iter().take(wake_count) {
-        if multitask::wake_user_task(task_id) {
-            woken += 1;
-        } else {
-            crate::debug::println!("futex: selected waiter had no live task task={task_id}");
+    while remaining != 0 {
+        let mut task_ids = [0_u64; 64];
+        let take = remaining.min(task_ids.len());
+        let wake_count = {
+            let mut waiters = FUTEX_WAITERS.lock();
+            waiters
+                .select_requeue(key, key, take, 0, bitset, &mut task_ids)
+                .0
+        };
+        if wake_count == 0 {
+            break;
+        }
+        remaining -= wake_count;
+        for task_id in task_ids.into_iter().take(wake_count) {
+            if multitask::wake_user_task(task_id) {
+                woken += 1;
+            } else {
+                crate::debug::println!("futex: selected waiter had no live task task={task_id}");
+            }
+        }
+        if wake_count < take {
+            break;
         }
     }
     woken

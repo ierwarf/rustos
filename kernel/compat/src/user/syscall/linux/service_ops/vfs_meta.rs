@@ -658,7 +658,7 @@ pub(crate) fn kernel_vfs_statfs_path(
     let mut request = new_vfs_request(VFS_IPC_OP_STATFS);
     request.arg0 = 0;
     populate_vfs_path_base(&mut request, linux_abi::AT_FDCWD as u64, path)?;
-    decode_vfs_statfs_response(&call_vfs_checked(&request)?)
+    decode_vfs_statfs_response(&*call_vfs_checked(&request)?)
 }
 
 pub(crate) fn kernel_vfs_fstatfs(
@@ -669,7 +669,7 @@ pub(crate) fn kernel_vfs_fstatfs(
         request.arg0 = 1;
         request.fd = fd;
         request.remote_id = remote.remote_id();
-        return decode_vfs_statfs_response(&call_vfs_checked(&request)?);
+        return decode_vfs_statfs_response(&*call_vfs_checked(&request)?);
     }
     if current_fd_exists(fd) {
         return Ok(rustos_user_abi::syscall::VfsStatFsWire {

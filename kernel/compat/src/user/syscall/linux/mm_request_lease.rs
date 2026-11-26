@@ -25,22 +25,19 @@
 //! - **Evidence:** the tests below; a timed-out request's effects are *not*
 //!   rolled back (the outcome of a timed-out call is unknown, as for any IPC).
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use alloc::boxed::Box;
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-/// Concurrent in-flight address-space requests. A request exists only while its
-/// caller is blocked on `syscalld`, so this bounds blocked callers, and a full
-/// table is reported to the caller as `EAGAIN` rather than served unbound.
-const LEASE_SLOTS: usize = 256;
-/// Most leases one pid may hold at once. A process has at most
-/// per-process-thread-ceiling (`task_capacity`, 128 of 256 slots) threads, each holding one lease for one
-/// syscall, so without a cap a few processes with a slow `syscalld` could fill
-/// the whole table and turn every other process's request into `EAGAIN`. Over
-/// the cap, `open` refuses exactly like a full table; 32 lets a thread-heavy
-/// process keep many mm requests in flight while eight such processes still
-/// fit the table. This bound is admission
-/// policy outside the verified lease protocol (`formal/mm-request-lease` models
-/// one slot and does not model exhaustion); it never affects a granted ticket.
-const MAX_LEASES_PER_PID: usize = 32;
+/// Slots per dynamically allocated lease chunk.
+const LEASE_CHUNK_LEN: usize = 64;
+/// Maximum number of lease chunks (262,144 concurrent in-flight requests).
+const MAX_LEASE_CHUNKS: usize = 4096;
+const LEASE_INDEX_BITS: u32 = 20;
+const LEASE_INDEX_MASK: u64 = (1_u64 << LEASE_INDEX_BITS) - 1;
+/// Fairness throttle: most concurrent in-flight mm requests one pid may hold so
+/// a single runaway process cannot exhaust all chunks before reclaiming others.
+const MAX_LEASES_PER_PID: usize = 256;
 const FREE: u64 = 0;
 /// A slot being filled or drained. Never equals a real ticket.
 const BUSY_SENTINEL: u64 = u64::MAX;
@@ -84,24 +81,61 @@ impl Slot {
     }
 }
 
-static SLOTS: [Slot; LEASE_SLOTS] = [const { Slot::new() }; LEASE_SLOTS];
-static CLAIMED_MASK: [AtomicU64; LEASE_SLOTS / 64] = [const { AtomicU64::new(0) }; LEASE_SLOTS / 64];
+struct LeaseChunk {
+    slots: [Slot; LEASE_CHUNK_LEN],
+    claimed_mask: AtomicU64,
+}
+
+impl LeaseChunk {
+    const fn new() -> Self {
+        Self {
+            slots: [const { Slot::new() }; LEASE_CHUNK_LEN],
+            claimed_mask: AtomicU64::new(0),
+        }
+    }
+}
+
+static LEASE_CHUNKS: [AtomicPtr<LeaseChunk>; MAX_LEASE_CHUNKS] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; MAX_LEASE_CHUNKS];
+static LEASE_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
 
-const _: () = assert!(LEASE_SLOTS == 256 && BUSY_SENTINEL == u64::MAX);
+const _: () = assert!(
+    MAX_LEASE_CHUNKS * LEASE_CHUNK_LEN <= (1 << LEASE_INDEX_BITS)
+        && LEASE_CHUNK_LEN == 64
+        && BUSY_SENTINEL == u64::MAX
+);
 
-fn claim_mask_set(index: usize) {
+#[inline]
+fn lease_chunk_ref(chunk_idx: usize) -> Option<&'static LeaseChunk> {
+    // ORDERING: Acquire pairs with AcqRel CAS chunk publication in `try_open_in`.
+    let ptr = LEASE_CHUNKS.get(chunk_idx)?.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: published lease chunks remain allocated for `'static`.
+    Some(unsafe { &*ptr })
+}
+
+#[inline]
+fn lease_slot_ref(index: usize) -> Option<(&'static LeaseChunk, &'static Slot, usize)> {
+    let chunk = lease_chunk_ref(index >> 6)?;
+    let offset = index & 63;
+    Some((chunk, &chunk.slots[offset], offset))
+}
+
+fn claim_mask_set(chunk: &LeaseChunk, offset: usize) {
     // ORDERING: SeqCst so the claim bit is in the single total order with the SeqCst
     // pid store and the holders_of_pid scan (store-then-scan, Dekker style): of two
     // same-pid openers at least one observes the other's claim.
-    CLAIMED_MASK[index >> 6].fetch_or(1_u64 << (index & 63), Ordering::SeqCst);
+    chunk.claimed_mask.fetch_or(1_u64 << offset, Ordering::SeqCst);
 }
 
-fn claim_mask_clear(index: usize) {
+fn claim_mask_clear(chunk: &LeaseChunk, offset: usize) {
     // ORDERING: Release only needs to order this slot's earlier accesses before the
     // bit drops; a stale-set bit is harmless because holders_of_pid also requires a
     // non-FREE ticket, and the slot is freed only after this clear.
-    CLAIMED_MASK[index >> 6].fetch_and(!(1_u64 << (index & 63)), Ordering::Release);
+    chunk.claimed_mask.fetch_and(!(1_u64 << offset), Ordering::Release);
 }
 
 enum OpenRefusal {
@@ -139,58 +173,119 @@ impl RequestLease {
     }
 
     fn open_with(target: MmTarget, is_live: impl Fn(MmTarget) -> bool) -> Option<Self> {
-        match Self::try_open(target) {
+        Self::open_with_chunks(target, is_live, MAX_LEASE_CHUNKS)
+    }
+
+    fn open_with_chunks(
+        target: MmTarget,
+        is_live: impl Fn(MmTarget) -> bool,
+        max_chunks: usize,
+    ) -> Option<Self> {
+        match Self::try_open_in(target, max_chunks) {
             Ok(lease) => Some(lease),
             Err(OpenRefusal::PerPidLimit) => {
-                reclaim_dead(&is_live, Some(target.pid));
-                Self::try_open(target).ok()
+                reclaim_dead(&is_live, Some(target.pid), max_chunks);
+                Self::try_open_in(target, max_chunks).ok()
             }
             Err(OpenRefusal::TableFull) => {
-                reclaim_dead(&is_live, None);
-                Self::try_open(target).ok()
+                reclaim_dead(&is_live, None, max_chunks);
+                Self::try_open_in(target, max_chunks).ok()
             }
         }
     }
 
-    fn try_open(target: MmTarget) -> Result<Self, OpenRefusal> {
-        for (index, slot) in SLOTS.iter().enumerate() {
-            if slot
-                .ticket
-                // ORDERING: Acquire on the winning CAS pairs with the Release FREE store of the
-                // previous owner (drain_and_free), so its slot writes cannot overlap ours; a
-                // failed CAS reads nothing, hence Relaxed.
-                .compare_exchange(FREE, BUSY_SENTINEL, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                continue;
+    fn claim_opened_slot(
+        target: MmTarget,
+        chunk: &LeaseChunk,
+        slot: &Slot,
+        offset: usize,
+        index: usize,
+        max_chunks: usize,
+    ) -> Result<Self, OpenRefusal> {
+        let ticket = loop {
+            // Encode `index` in the low bits so `begin_apply` is O(1).
+            let seq = NEXT_TICKET.fetch_add(1, Ordering::Relaxed);
+            let candidate = (seq << LEASE_INDEX_BITS) | (index as u64);
+            if candidate != FREE && candidate != BUSY_SENTINEL {
+                break candidate;
             }
-            let ticket = loop {
-                // Encode `index` in the low 8 bits so `begin_apply` is O(1).
-                let seq = NEXT_TICKET.fetch_add(1, Ordering::Relaxed);
-                let candidate = (seq << 8) | (index as u64);
-                if candidate != FREE && candidate != BUSY_SENTINEL {
-                    break candidate;
+        };
+        // ORDERING: mark bit and announce pid (SeqCst) while the slot is
+        // held by the sentinel, then scan claimed slots. Two same-pid
+        // openers each store then scan, so at least one sees the other.
+        claim_mask_set(chunk, offset);
+        slot.pid.store(target.pid, Ordering::SeqCst);
+        if holders_of_pid(target.pid, index, max_chunks) >= MAX_LEASES_PER_PID {
+            claim_mask_clear(chunk, offset);
+            // ORDERING: Release returns the slot to FREE after the claim bit was cleared;
+            // pairs with the Acquire CAS in try_open_in.
+            slot.ticket.store(FREE, Ordering::Release);
+            return Err(OpenRefusal::PerPidLimit);
+        }
+        slot.generations.store(
+            pack(target.process_generation, target.mm_generation),
+            Ordering::Relaxed,
+        );
+        // ORDERING: Release publishes pid/generations with the ticket.
+        slot.ticket.store(ticket, Ordering::Release);
+        Ok(Self { index, ticket })
+    }
+
+    fn try_open_in(target: MmTarget, max_chunks: usize) -> Result<Self, OpenRefusal> {
+        let limit = max_chunks.min(MAX_LEASE_CHUNKS);
+        let mut chunk_idx = 0usize;
+        while chunk_idx < limit {
+            let Some(chunk) = lease_chunk_ref(chunk_idx) else {
+                let mut fresh = Box::new(LeaseChunk::new());
+                // Reserve slot 0 while unshared before publishing the chunk pointer.
+                fresh.slots[0].ticket = AtomicU64::new(BUSY_SENTINEL);
+                let raw = Box::into_raw(fresh);
+                // ORDERING: AcqRel publishes initialized chunk; Acquire reads concurrent winner.
+                match LEASE_CHUNKS[chunk_idx].compare_exchange(
+                    ptr::null_mut(),
+                    raw,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        // ORDERING: SeqCst publishes chunk count into total order before pid check.
+                        LEASE_CHUNK_COUNT.fetch_max(chunk_idx + 1, Ordering::SeqCst);
+                        // SAFETY: published chunk remains live for `'static`.
+                        let chunk = unsafe { &*raw };
+                        let index = chunk_idx << 6;
+                        return Self::claim_opened_slot(
+                            target,
+                            chunk,
+                            &chunk.slots[0],
+                            0,
+                            index,
+                            limit,
+                        );
+                    }
+                    Err(_) => {
+                        // SAFETY: lost publication race before anyone could observe `raw`.
+                        drop(unsafe { Box::from_raw(raw) });
+                        // ORDERING: SeqCst matches winning publisher bound update.
+                        LEASE_CHUNK_COUNT.fetch_max(chunk_idx + 1, Ordering::SeqCst);
+                        continue;
+                    }
                 }
             };
-            // ORDERING: mark bit and announce pid (SeqCst) while the slot is
-            // held by the sentinel, then scan claimed slots. Two same-pid
-            // openers each store then scan, so at least one sees the other.
-            claim_mask_set(index);
-            slot.pid.store(target.pid, Ordering::SeqCst);
-            if holders_of_pid(target.pid, index) >= MAX_LEASES_PER_PID {
-                claim_mask_clear(index);
-                // ORDERING: Release returns the slot to FREE after the claim bit was cleared;
-                // pairs with the Acquire CAS in try_open.
-                slot.ticket.store(FREE, Ordering::Release);
-                return Err(OpenRefusal::PerPidLimit);
+            for (offset, slot) in chunk.slots.iter().enumerate() {
+                if slot
+                    .ticket
+                    // ORDERING: Acquire on the winning CAS pairs with the Release FREE store of the
+                    // previous owner (drain_and_free), so its slot writes cannot overlap ours; a
+                    // failed CAS reads nothing, hence Relaxed.
+                    .compare_exchange(FREE, BUSY_SENTINEL, Ordering::Acquire, Ordering::Relaxed)
+                    .is_err()
+                {
+                    continue;
+                }
+                let index = (chunk_idx << 6) | offset;
+                return Self::claim_opened_slot(target, chunk, slot, offset, index, limit);
             }
-            slot.generations.store(
-                pack(target.process_generation, target.mm_generation),
-                Ordering::Relaxed,
-            );
-            // ORDERING: Release publishes pid/generations with the ticket.
-            slot.ticket.store(ticket, Ordering::Release);
-            return Ok(Self { index, ticket });
+            chunk_idx += 1;
         }
         Err(OpenRefusal::TableFull)
     }
@@ -203,23 +298,28 @@ impl RequestLease {
 /// Slots other than `skip` that are claimed (live, filling or draining) and
 /// name `pid`. The pid is read before the ticket so a slot whose claimant has
 /// already announced `pid` is seen as claimed.
-fn holders_of_pid(pid: u64, skip: usize) -> usize {
+fn holders_of_pid(pid: u64, skip: usize, max_chunks: usize) -> usize {
     let mut count = 0_usize;
-    for (word_idx, word_atom) in CLAIMED_MASK.iter().enumerate() {
+    // ORDERING: Acquire reads published chunk count paired with SeqCst publication.
+    let chunks = LEASE_CHUNK_COUNT.load(Ordering::Acquire).min(max_chunks);
+    for chunk_idx in 0..chunks {
+        let Some(chunk) = lease_chunk_ref(chunk_idx) else {
+            continue;
+        };
         // ORDERING: SeqCst load of the claim mask completes the store-then-scan pattern
-        // documented in try_open: the opener's SeqCst bit/pid stores precede this scan.
-        let mut bits = word_atom.load(Ordering::SeqCst);
+        // documented in claim_opened_slot: the opener's SeqCst bit/pid stores precede this scan.
+        let mut bits = chunk.claimed_mask.load(Ordering::SeqCst);
         while bits != 0 {
-            let bit = bits.trailing_zeros() as usize;
+            let offset = bits.trailing_zeros() as usize;
             bits &= bits - 1;
-            let index = (word_idx << 6) | bit;
+            let index = (chunk_idx << 6) | offset;
             if index != skip
                 // ORDERING: SeqCst pid load is the second half of the store-then-scan in
-                // try_open; it must be ordered after the claim-bit load above.
-                && SLOTS[index].pid.load(Ordering::SeqCst) == pid
+                // claim_opened_slot; it must be ordered after the claim-bit load above.
+                && chunk.slots[offset].pid.load(Ordering::SeqCst) == pid
                 // ORDERING: SeqCst so a slot whose claimant already announced its pid is seen
-                // as claimed in the same total order (see try_open).
-                && SLOTS[index].ticket.load(Ordering::SeqCst) != FREE
+                // as claimed in the same total order (see claim_opened_slot).
+                && chunk.slots[offset].ticket.load(Ordering::SeqCst) != FREE
             {
                 count += 1;
             }
@@ -233,14 +333,16 @@ impl RequestLease {
     /// Step one of close: no apply may begin after this returns. False when
     /// the lease was already reclaimed (its incarnation died first).
     fn retire(&self) -> bool {
-        retire(&SLOTS[self.index], self.ticket)
+        let (_, slot, _) = lease_slot_ref(self.index).expect("live lease chunk");
+        retire(slot, self.ticket)
     }
 
     /// Appliers that validated before retirement and have not finished.
     fn active_appliers(&self) -> u32 {
+        let (_, slot, _) = lease_slot_ref(self.index).expect("live lease chunk");
         // ORDERING: test-only observation of the applier count; SeqCst matches the
         // protocol's own accesses to this counter.
-        SLOTS[self.index].appliers.load(Ordering::SeqCst)
+        slot.appliers.load(Ordering::SeqCst)
     }
 }
 
@@ -263,7 +365,7 @@ fn retire(slot: &Slot, ticket: u64) -> bool {
 /// the wait terminates. Callers must hold no IPC or process-state lock: an
 /// applier may need either to finish. `yield_cpu` lets the applier's CPU make
 /// progress in normal syscall context instead of burning this one.
-fn drain_and_free(index: usize, slot: &Slot, yield_cpu: bool) {
+fn drain_and_free(chunk: &LeaseChunk, offset: usize, slot: &Slot, yield_cpu: bool) {
     // ORDERING: SeqCst load of appliers after retire's SeqCst CAS: it cannot miss an
     // applier whose fetch_add preceded that applier's ticket re-read (Dekker).
     while slot.appliers.load(Ordering::SeqCst) != 0 {
@@ -276,19 +378,25 @@ fn drain_and_free(index: usize, slot: &Slot, yield_cpu: bool) {
             core::hint::spin_loop();
         }
     }
-    claim_mask_clear(index);
+    claim_mask_clear(chunk, offset);
     // ORDERING: Release publishes the drained, unclaimed slot as FREE; pairs with
-    // the Acquire CAS in try_open, and orders the preceding claim_mask_clear.
+    // the Acquire CAS in try_open_in, and orders the preceding claim_mask_clear.
     slot.ticket.store(FREE, Ordering::Release);
 }
 
 /// Retire `ticket` and, if this call won the retirement, drain and free the
 /// slot. Returns false (touching nothing) when the slot was not ours to retire.
-fn retire_and_drain(index: usize, slot: &Slot, ticket: u64, yield_cpu: bool) -> bool {
+fn retire_and_drain(
+    chunk: &LeaseChunk,
+    offset: usize,
+    slot: &Slot,
+    ticket: u64,
+    yield_cpu: bool,
+) -> bool {
     if !retire(slot, ticket) {
         return false;
     }
-    drain_and_free(index, slot, yield_cpu);
+    drain_and_free(chunk, offset, slot, yield_cpu);
     true
 }
 
@@ -298,22 +406,27 @@ impl Drop for RequestLease {
         // drain those that validated earlier. A false result means the lease
         // was reclaimed after this owner's incarnation died; the slot belongs
         // to someone else now and is not ours to retire or free.
-        retire_and_drain(self.index, &SLOTS[self.index], self.ticket, true);
+        let (chunk, slot, offset) = lease_slot_ref(self.index).expect("live lease chunk");
+        retire_and_drain(chunk, offset, slot, self.ticket, true);
     }
 }
 
 /// Frees leases whose owner can no longer run (its incarnation is gone).
-fn reclaim_dead(is_live: &impl Fn(MmTarget) -> bool, pid_filter: Option<u64>) {
-    for (word_idx, word_atom) in CLAIMED_MASK.iter().enumerate() {
+fn reclaim_dead(is_live: &impl Fn(MmTarget) -> bool, pid_filter: Option<u64>, max_chunks: usize) {
+    // ORDERING: Acquire reads published chunk count paired with SeqCst publication.
+    let chunks = LEASE_CHUNK_COUNT.load(Ordering::Acquire).min(max_chunks);
+    for chunk_idx in 0..chunks {
+        let Some(chunk) = lease_chunk_ref(chunk_idx) else {
+            continue;
+        };
         // ORDERING: Acquire pairs with the SeqCst/Release claim-bit updates, so the slot's
         // ticket we examine below is at least as new as the bit we observed.
-        let mut bits = word_atom.load(Ordering::Acquire);
+        let mut bits = chunk.claimed_mask.load(Ordering::Acquire);
         while bits != 0 {
-            let bit = bits.trailing_zeros() as usize;
+            let offset = bits.trailing_zeros() as usize;
             bits &= bits - 1;
-            let index = (word_idx << 6) | bit;
-            let slot = &SLOTS[index];
-            // ORDERING: Acquire pairs with the Release ticket store in try_open, making the
+            let slot = &chunk.slots[offset];
+            // ORDERING: Acquire pairs with the Release ticket store in claim_opened_slot, making the
             // slot's pid/generations (Relaxed reads below) visible. A slot recycled
             // meanwhile has another ticket, so retire_and_drain's exact-ticket CAS fails.
             let ticket = slot.ticket.load(Ordering::Acquire);
@@ -337,7 +450,7 @@ fn reclaim_dead(is_live: &impl Fn(MmTarget) -> bool, pid_filter: Option<u64>) {
             }
             // Retire only the lease observed above: a slot recycled meanwhile
             // carries a different ticket and is left alone.
-            retire_and_drain(index, slot, ticket, false);
+            retire_and_drain(chunk, offset, slot, ticket, false);
         }
     }
 }
@@ -357,9 +470,10 @@ impl ApplyGuard {
 
 impl Drop for ApplyGuard {
     fn drop(&mut self) {
+        let (_, slot, _) = lease_slot_ref(self.index).expect("live lease chunk");
         // ORDERING: SeqCst decrement pairs with drain_and_free's SeqCst load; it also
         // releases the effect's memory writes to the closer that frees the slot.
-        SLOTS[self.index].appliers.fetch_sub(1, Ordering::SeqCst);
+        slot.appliers.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -377,8 +491,10 @@ pub(super) fn begin_apply(ticket: u64, target_pid: u64) -> Result<ApplyGuard, Le
     if ticket == FREE || ticket == BUSY_SENTINEL {
         return Err(LeaseRefusal::NoRequest);
     }
-    let index = (ticket as usize) & (LEASE_SLOTS - 1);
-    let slot = &SLOTS[index];
+    let index = (ticket & LEASE_INDEX_MASK) as usize;
+    let Some((_, slot, _)) = lease_slot_ref(index) else {
+        return Err(LeaseRefusal::NoRequest);
+    };
     // ORDERING: Acquire pairs with try_open's Release ticket store, so pid and
     // generations are visible; a retired or recycled ticket fails the compare.
     if slot.ticket.load(Ordering::Acquire) != ticket {
@@ -482,12 +598,15 @@ mod tests {
         // Finish the close by hand: `retire` already ran, so Drop must not.
         // ORDERING: test-only manual completion of close (retire already ran); Release
         // matches drain_and_free.
-        SLOTS[lease.index].ticket.store(FREE, Ordering::Release);
+        let (_, slot, _) = lease_slot_ref(lease.index).expect("live lease chunk");
+        slot.ticket.store(FREE, Ordering::Release);
         core::mem::forget(lease);
     }
 
     #[test]
     fn slots_are_reused_with_fresh_tickets_and_full_table_is_reported() {
+        const TEST_CHUNKS: usize = 4;
+        const TEST_SLOTS: usize = TEST_CHUNKS * LEASE_CHUNK_LEN;
         let _table = TABLE_GUARD.lock();
         let first = RequestLease::open(target(9_006)).unwrap();
         let first_ticket = first.ticket();
@@ -499,26 +618,37 @@ mod tests {
             Some(LeaseRefusal::NoRequest)
         );
         drop(second);
-        // Exhaustion refuses; it never yields an unbound ticket.
+        // Growth past the legacy 256-slot limit succeeds dynamically across chunks.
+        let mut wide = alloc::vec::Vec::new();
+        for idx in 0..400_usize {
+            wide.push(
+                RequestLease::open_with(target(8_000 + (idx / MAX_LEASES_PER_PID) as u64), |_| true)
+                    .expect("chunk table grows past 256 concurrent leases"),
+            );
+        }
+        drop(wide);
+        // Bounded chunk exhaustion refuses; it never yields an unbound ticket.
         let mut held = alloc::vec::Vec::new();
         // Spread over pids so the per-pid cap does not end the fill early.
-        while let Some(lease) = RequestLease::open_with(
+        while let Some(lease) = RequestLease::open_with_chunks(
             target(9_300 + (held.len() / MAX_LEASES_PER_PID) as u64),
             |_| true,
+            TEST_CHUNKS,
         ) {
             held.push(lease);
-            assert!(held.len() <= LEASE_SLOTS);
+            assert!(held.len() <= TEST_SLOTS);
         }
-        assert_eq!(held.len(), LEASE_SLOTS);
-        assert!(RequestLease::open_with(target(9_999), |_| true).is_none());
+        assert_eq!(held.len(), TEST_SLOTS);
+        assert!(RequestLease::open_with_chunks(target(9_999), |_| true, TEST_CHUNKS).is_none());
     }
 
     #[test]
     fn a_full_table_reclaims_only_leases_of_dead_incarnations() {
+        const TEST_CHUNKS: usize = 4;
         let _table = TABLE_GUARD.lock();
         let mut held = alloc::vec::Vec::new();
         let mut pid = 9_100;
-        while let Some(lease) = RequestLease::open_with(target(pid), |_| true) {
+        while let Some(lease) = RequestLease::open_with_chunks(target(pid), |_| true, TEST_CHUNKS) {
             held.push((pid, lease));
             pid += 1;
         }
@@ -527,8 +657,12 @@ mod tests {
         // The victim's task died blocked: its Drop never ran (modelled by
         // leaking it; the slot is reclaimed through the liveness predicate).
         core::mem::forget(victim);
-        let fresh = RequestLease::open_with(target(9_999), |t| t.pid != victim_pid)
-            .expect("a dead owner's slot is reclaimed instead of leaking forever");
+        let fresh = RequestLease::open_with_chunks(
+            target(9_999),
+            |t| t.pid != victim_pid,
+            TEST_CHUNKS,
+        )
+        .expect("a dead owner's slot is reclaimed instead of leaking forever");
         assert_ne!(fresh.ticket(), victim_ticket);
         assert_eq!(
             begin_apply(victim_ticket, victim_pid).err(),

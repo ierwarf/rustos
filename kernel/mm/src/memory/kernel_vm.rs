@@ -50,6 +50,10 @@ const SPLIT_BLOCK_UNMAPPED: u64 = u64::MAX;
 const KERNEL_LOAD_BIAS_MIN: u64 = crate::lowlevel::address::KERNEL_IMAGE_PHYS_BASE;
 const MAX_KERNEL_PHYSICAL_KASLR_SLIDE: u64 = 0x0020_0000;
 const KERNEL_IMAGE_PML4_INDEX: usize = 258;
+pub const KERNEL_STACK_PML4_INDEX: usize = 259;
+pub const KERNEL_STACK_WINDOW_BASE: u64 =
+    KERNEL_VIRT_OFFSET + ((KERNEL_STACK_PML4_INDEX - KERNEL_HIGHER_HALF_PML4_INDEX) as u64) * (1_u64 << 39);
+pub const KERNEL_STACK_WINDOW_END: u64 = KERNEL_STACK_WINDOW_BASE + (1_u64 << 39);
 const KERNEL_IMAGE_PT_COUNT: usize = 128;
 const MAX_KERNEL_IMAGE_SIZE: u64 = KERNEL_IMAGE_PT_COUNT as u64 * HUGE_2MIB;
 const ELF64_HEADER_SIZE: usize = 64;
@@ -111,6 +115,14 @@ impl MmioWindowSlot {
     }
 }
 
+static STACK_PDP_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn stack_pdp_phys() -> Option<PhysAddr> {
+    // ORDERING: Acquire pairs with the Release store once PML4[KERNEL_STACK_PML4_INDEX] is initialized.
+    let raw = STACK_PDP_PHYS.load(core::sync::atomic::Ordering::Acquire);
+    (raw != 0).then(|| PhysAddr::new(raw))
+}
+
 pub static KERNEL_PML4: TrackedSpinLock<
     PML4<KERNEL_PML4_SIZE_GB>,
     { LockClass::KernelPageTable as u8 },
@@ -121,6 +133,7 @@ pub static KERNEL_PML4: TrackedSpinLock<
     image_pdp: PageTable::new(),
     image_pd: [const { PageTable::new() }; 2],
     image_pt: [const { PageTable::new() }; KERNEL_IMAGE_PT_COUNT],
+    stack_pdp: PageTable::new(),
     mmio_pdp: PageTable::new(),
     mmio_pd: PageTable::new(),
     mmio_blocks: [MmioWindowSlot::unmapped(); MMIO_WINDOW_SLOTS],
@@ -138,6 +151,7 @@ pub struct PML4<const SIZE_GB: usize> {
     image_pdp: PageTable,
     image_pd: [PageTable; 2],
     image_pt: [PageTable; KERNEL_IMAGE_PT_COUNT],
+    stack_pdp: PageTable,
     mmio_pdp: PageTable,
     mmio_pd: PageTable,
     mmio_blocks: [MmioWindowSlot; MMIO_WINDOW_SLOTS],
@@ -157,6 +171,7 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
         for table in &mut self.image_pt {
             table.zero();
         }
+        self.stack_pdp.zero();
         self.mmio_pdp = PageTable::new();
         self.mmio_pd = PageTable::new();
         self.mmio_blocks = [MmioWindowSlot::unmapped(); MMIO_WINDOW_SLOTS];
@@ -177,6 +192,12 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
         let pdp_phys = PhysAddr::new(kernel_virtual_to_physical(addr_of_mut!(self.pdp) as u64));
         self.pml4[0].set_addr(pdp_phys, table_flags);
         self.pml4[KERNEL_HIGHER_HALF_PML4_INDEX].set_addr(pdp_phys, table_flags);
+        let stack_pdp_phys = PhysAddr::new(kernel_virtual_to_physical(
+            addr_of_mut!(self.stack_pdp) as u64
+        ));
+        self.pml4[KERNEL_STACK_PML4_INDEX].set_addr(stack_pdp_phys, table_flags);
+        // ORDERING: Release publishes initialized kernel-stack PDP frame before `stack_pdp_phys()` reads it.
+        STACK_PDP_PHYS.store(stack_pdp_phys.as_u64(), core::sync::atomic::Ordering::Release);
         let mmio_pdp_phys = PhysAddr::new(kernel_virtual_to_physical(
             addr_of_mut!(self.mmio_pdp) as u64
         ));

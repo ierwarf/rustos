@@ -7,33 +7,63 @@
 //! Forbidden: allocation/byte initialization/destruction inside resource leaves.
 //! Evidence: real ticket/native witnesses, not complete creation or return proof.
 use super::{
-    STACK_CANARY_WORD, TASK_STACK_GUARD_BYTES, TASK_STACK_SIZE, runqueue,
+    TASK_STACK_SIZE, runqueue,
     stack_resources::admission::{self, Ticket},
 };
+#[cfg(not(rustos_boot_image))]
+use super::{STACK_CANARY_WORD, TASK_STACK_GUARD_BYTES};
+#[cfg(not(rustos_boot_image))]
 use alloc::vec::Vec;
+#[cfg(not(rustos_boot_image))]
 use core::mem;
+
 pub(super) fn prepare_storage(ticket: &Ticket) -> Option<()> {
     assert!(
         ticket.is_current(ticket.slot(), ticket.task_id()),
         "foreign user storage reservation"
     );
-    let mut storage = Vec::new();
-    storage.try_reserve_exact(TASK_STACK_SIZE).ok()?;
-    storage.resize(TASK_STACK_SIZE, 0);
-    ticket.install_storage(storage);
-    ticket.initialize_storage(|storage| {
-        storage.fill(0);
-        for word in storage[..TASK_STACK_GUARD_BYTES].chunks_exact_mut(mem::size_of::<u64>()) {
-            word.copy_from_slice(&STACK_CANARY_WORD.to_ne_bytes());
-        }
-    });
-    Some(())
+    #[cfg(rustos_boot_image)]
+    {
+        let stack = super::stack_resources::KernelStack::allocate(
+            ticket.task_id(),
+            ticket.slot() as u32,
+            TASK_STACK_SIZE,
+        )?;
+        ticket.install_stack(stack);
+        Some(())
+    }
+    #[cfg(not(rustos_boot_image))]
+    {
+        let mut storage = Vec::new();
+        storage.try_reserve_exact(TASK_STACK_SIZE).ok()?;
+        storage.resize(TASK_STACK_SIZE, 0);
+        ticket.install_stack(super::stack_resources::KernelStack::from_host_vec(storage));
+        ticket.initialize_storage(|storage| {
+            storage.fill(0);
+            for word in storage[..TASK_STACK_GUARD_BYTES].chunks_exact_mut(mem::size_of::<u64>()) {
+                word.copy_from_slice(&STACK_CANARY_WORD.to_ne_bytes());
+            }
+        });
+        Some(())
+    }
 }
 /// Whether some dynamic slot could be reserved now. A hint for callers that can
 /// wait out the asynchronous retirement of an exited task; the reservation
 /// itself is still taken, or refused, by `reserve`.
 pub(in crate::multitask) fn any_reservable() -> bool {
-    (super::FIRST_DYNAMIC_TASK_SLOT..super::MAX_TASK).any(admission::reservable)
+    crate::multitask::task_table::any_dynamic_available()
+        || crate::multitask::task_table::allocated_slots()
+            .filter(|&slot| slot >= super::FIRST_DYNAMIC_TASK_SLOT)
+            .any(admission::reservable)
+}
+
+pub(super) fn reserve_dynamic(id: u64) -> Option<Ticket> {
+    let ticket = admission::reserve_dynamic(id)?;
+    if prepare_storage(&ticket).is_none() {
+        cancel_unpublished(ticket);
+        return None;
+    }
+    Some(ticket)
 }
 
 pub(super) fn reserve(slot: usize, id: u64) -> Option<Ticket> {
@@ -49,7 +79,7 @@ pub(super) fn cancel_unpublished(ticket: Ticket) {
         ticket.begin_cancel(),
         "root cancellation lacks unpublished producer"
     );
-    let storage = ticket.take_storage();
+    let storage = ticket.take_stack();
     drop(storage); // detach under Resources53, cross-owner destruction outside it
     ticket.finish_cancel();
 }

@@ -33,11 +33,16 @@ lazy_static! {
         #[cfg(rustos_boot_image)]
         unsafe {
             // Kernel-mode faults inside the direct user-copy routines resume at
-            // their fixups; everything else reaches the handler installed above.
+            // their fixups; demand-committed kernel stack pages commit on the
+            // dedicated #PF IST stack so pushing the fault frame on an
+            // uncommitted page never escalates to #DF; all other faults pivot
+            // off IST2 before entering the original handler.
             let original = idt.page_fault.handler_addr().as_u64();
-            idt.page_fault.set_handler_addr(VirtAddr::new(
-                crate::arch::user_access::page_fault_entry_addr(original),
-            ));
+            idt.page_fault
+                .set_handler_addr(VirtAddr::new(
+                    crate::arch::user_access::page_fault_entry_addr(original),
+                ))
+                .set_stack_index(crate::arch::gdt::PAGE_FAULT_IST_INDEX);
         }
         unsafe {
             idt.non_maskable_interrupt

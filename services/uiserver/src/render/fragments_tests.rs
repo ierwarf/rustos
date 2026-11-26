@@ -23,6 +23,7 @@ fn window(outer: Rect, alpha: u32) -> WaylandWindowSnapshot {
         minimized: false,
         server_decoration: true,
         drag_icon: false,
+        popup: false,
         content_version: 1,
         damage: Rect::empty(),
         pixels: Arc::new(vec![(alpha << 24) | 0x123456; width * height]),

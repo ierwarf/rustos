@@ -50,7 +50,7 @@ const MISMATCH_PRESENT: u64 = 1 << 63;
 /// first, and the first is the one whose cause is still nearby.
 pub(super) fn record(slot: usize, kind: Mismatch) {
     MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed);
-    let packed = MISMATCH_PRESENT | ((slot as u64 & 0xFFFF) << 32) | (kind as u64);
+    let packed = MISMATCH_PRESENT | ((slot as u64 & 0xffff_ffff) << 16) | (kind as u64 & 0xff);
     // ORDERING: Relaxed diagnostic scalar only; neither field grants authority.
     // The count and first code may straddle drains on another CPU.
     let _ = FIRST_MISMATCH.compare_exchange(0, packed, Ordering::Relaxed, Ordering::Relaxed);
@@ -73,7 +73,7 @@ mod tests {
         record(9, Mismatch::LegacyRunningQueueNot);
         record(11, Mismatch::RunningOnDifferentCpus);
         let (first, count) = take_window().expect("window recorded");
-        assert_eq!((first >> 32) & 0xFFFF, 9);
+        assert_eq!((first >> 16) & 0xffff_ffff, 9);
         assert_eq!(first & 0xFF, Mismatch::LegacyRunningQueueNot as u64);
         assert_eq!(count, 2);
         assert_eq!(take_window(), None);

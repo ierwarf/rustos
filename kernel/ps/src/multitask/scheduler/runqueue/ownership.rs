@@ -21,9 +21,9 @@
 //! - **Evidence:** `ownership::tests` (exhaustive table walk, duty, I2/I3
 //!   regressions); design in `docs/ai/smp/scheduler.md` "Owner transition table".
 
+use crate::multitask::task_table;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::MAX_TASK;
 
 const OWNER_STATE_BITS: u64 = 4;
 const OWNER_CPU_BITS: u64 = 8;
@@ -557,7 +557,7 @@ impl FlightEntry {
 /// One cache line per task: the word plus its flight ring. Owner CASes from
 /// different CPUs on neighbouring slots do not invalidate each other.
 #[repr(C, align(64))]
-struct RunOwnerWord {
+pub(in crate::multitask) struct RunOwnerWord {
     word: AtomicU64,
     ring: [AtomicU64; FLIGHT_DEPTH],
 }
@@ -565,7 +565,7 @@ struct RunOwnerWord {
 const _: () = assert!(core::mem::size_of::<RunOwnerWord>() == 64);
 
 impl RunOwnerWord {
-    const fn new() -> Self {
+    pub(in crate::multitask) const fn new() -> Self {
         // Generation one makes the all-zero BSS value invalid as a live
         // publication while still permitting const initialization.
         Self {
@@ -669,17 +669,13 @@ impl RunOwnerWord {
     }
 }
 
-static OWNER_WORDS: [RunOwnerWord; MAX_TASK] = [const { RunOwnerWord::new() }; MAX_TASK];
-
 fn word(slot: usize) -> &'static RunOwnerWord {
-    OWNER_WORDS
-        .get(slot)
-        .expect("scheduler owner slot exceeds capacity")
+    &task_table::get(slot).owner
 }
 
 pub(super) fn reset_before_publication() {
-    for owner in &OWNER_WORDS {
-        owner.reset();
+    for slot in task_table::allocated_slots() {
+        task_table::get(slot).owner.reset();
     }
 }
 
@@ -834,7 +830,7 @@ pub(in crate::multitask::scheduler) fn set_runnable(slot: usize, runnable: bool)
 /// Result of atomically converting the current running task's wait arm into a
 /// non-runnable continuation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::multitask::scheduler) enum WaitCommitOutcome {
+pub(in crate::multitask) enum WaitCommitOutcome {
     Committed,
     WakeWon,
     InvalidOwner,

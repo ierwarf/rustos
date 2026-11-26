@@ -42,13 +42,13 @@ mod context_validation;
 mod dispatch_policy;
 pub(in crate::multitask) mod dispatcher;
 pub(in crate::multitask) mod dispatch_priority;
-mod donation_ledger;
+pub(in crate::multitask) mod donation_ledger;
 pub(super) mod donation_publication;
 pub(in crate::multitask) mod ipc_publication;
 pub(in crate::multitask) mod ipc_lane;
 pub(in crate::multitask) mod pending_reply;
 mod frame_observation;
-mod frame_publication;
+pub(in crate::multitask) mod frame_publication;
 pub(in crate::multitask) mod rsp_handoff;
 mod handoff_queue;
 mod handoffs;
@@ -63,8 +63,8 @@ pub(in crate::multitask) mod execution_interval;
 pub(in crate::multitask) mod group_exit;
 pub(super) mod reaper;
 mod reclaim;
-pub(super) mod retirement_cleanup;
-mod runqueue;
+pub(in crate::multitask) mod retirement_cleanup;
+pub(in crate::multitask) mod runqueue;
 pub(in crate::multitask) mod resident;
 mod terminal_quarantine;
 pub(super) mod wake_publication;
@@ -77,8 +77,9 @@ pub(in crate::multitask) use runqueue::affinity_payload::PlacementGrant;
 pub(in crate::multitask) mod runqueue_policy;
 pub(in crate::multitask) mod runtime_profile;
 mod scheduling_context;
-mod scheduling_runtime;
-pub(super) mod stack_resources;
+pub(in crate::multitask) mod scheduling_runtime;
+pub(in crate::multitask) mod stack_resources;
+mod stack_watermark;
 pub(super) use stack_resources::admission::Publication;
 mod sync_handoff;
 mod task_directory;
@@ -165,29 +166,13 @@ use super::{UserStackState, UserTaskBootstrap, initial_task_rflags};
 use context_validation::{
     PublishedFrameView, context_validation_reason_code,
 };
-use handoff_queue::SlotHandoffQueue;
 pub(super) use linux_thread_state::CurrentLinuxThreadBinding;
 #[cfg(test)]
 use reclaim::RetirementSideEffect;
 use runtime_profile::SchedulerPhase;
 use sync_handoff::ReplyWakeHandoff;
 
-// The enabled product topology boots roughly twenty policy/service processes
-// before the UI creates its bounded input, display, diagnostics, console, and
-// Wayland workers. A 32-slot table therefore exhausted during normal shell
-// launch and turned a recoverable capacity error into uiserver thread-spawn
-// panic. Keep the scheduler allocation-free and explicitly bounded, but size
-// the product contract for service growth and application headroom.
-//
-// 256 slots = 512 MiB of kernel heap (`kernel_mm` heap is RAM/4, clamped to
-// 64..1024 MiB) over
-// one 2 MiB kernel stack per task. The slot-indexed statics cost a few hundred
-// bytes per slot, so the table itself is cheap; what bounds live tasks on a
-// smaller machine is the heap (about RAM/4, clamped to 64..1024 MiB), and a stack
-// allocation failure is refused as EAGAIN rather than panicking. 256 is also the
-// widest table the 8-bit slot encodings (`task_directory` hint word, the
-// shadow-dispatch diagnostic bytes, the cohort cookie) can name.
-pub(super) const MAX_TASK: usize = 256;
+// Task slots grow dynamically above `FIRST_DYNAMIC_TASK_SLOT` via `TaskTable`.
 
 /// Releases reply-owned scheduling urgency without acquiring the scheduler
 /// catalog. The donation ledger's exact reply identity is the terminal owner;
@@ -233,21 +218,19 @@ pub(in crate::multitask) fn cancel_reply_donation_reservation(donor_task_id: u64
 
 
 
-const _: () = assert!(MAX_TASK.is_power_of_two() && MAX_TASK <= u8::MAX as usize + 1);
-const _: () = assert!(kernel_ipc_runtime::api::MAX_ENDPOINT_WAKE_TASKS >= MAX_TASK);
+const _: () = assert!(crate::multitask::task_table::MAX_TASK_SLOTS >= FIRST_DYNAMIC_TASK_SLOT);
 const ROOT_TASK_SLOT: usize = 0;
 const FIRST_DYNAMIC_TASK_SLOT: usize = 1;
 const NO_IDLE_CPU: u8 = u8::MAX;
 
 // Kernel worker threads run fairly deep Rust call chains during process/module
-// bring-up, so smaller stacks can corrupt adjacent task stacks.
-// Kernel-side Rust paths during syscall, process load, and service orchestration are deep in
-// no-opt/debug builds. Keep a generous per-task kernel stack so corrupted return frames do not
-// silently spill into adjacent scheduler storage.
+// bring-up; per-task kernel stacks live in virtual memory (`PML4[259]`) with an
+// unmapped 256 KiB hardware guard zone below and demand-committed physical pages
+// above the pre-committed top 32 KiB.
 // Ring3 (`loaderd`) does not restate this size: it observes it as
 // `kernel_stack_bytes` through `SYS_RUSTOS_TASK_CAPACITY` and bills Job thread
 // budgets from the observed value, so this is the only definition.
-pub(super) const TASK_STACK_SIZE: usize = 2 * 1024 * 1024;
+pub(super) const TASK_STACK_SIZE: usize = kernel_mm::api::kernel_stack::KERNEL_STACK_DEFAULT_USABLE_BYTES;
 const TASK_STACK_GUARD_BYTES: usize = 256;
 const STACK_CANARY_WORD: u64 = 0x5343_4844_554c_4552;
 const TASK_ENTRY_STACK_RESERVE_QWORDS: usize = 3;
@@ -594,3 +577,15 @@ const fn align_kernel_stack_top(raw_top: usize) -> usize {
 
 #[cfg(test)]
 mod tests;
+
+/// Pre-allocates lock-free slab blocks when `TaskTable` grows in unmasked context.
+pub(in crate::multitask) fn irq_pool_preallocate(slots: usize) {
+    let nodes = (slots / 8).max(64);
+    runqueue::preallocate_mailbox_pool(nodes);
+    handoff_queue::preallocate_first_turn_pool(nodes);
+    sync_handoff::preallocate_pool(nodes);
+    wake_retry::preallocate_pool(nodes);
+    local_dispatch::preallocate_retry_pool(nodes);
+    crate::multitask::deferred_wake::preallocate_pool(nodes);
+    crate::multitask::process_state_lock::preallocate_pool(nodes);
+}

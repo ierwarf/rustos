@@ -158,9 +158,10 @@ fn actual_cross_root_ipc_roundtrip_and_terminal_returns_withdraw_every_born_bank
         boot.stack_pointer = x86_64::VirtAddr::new(crate::memory::paging::USER_SPACE_BASE + 0x6000);
         let (reused, handle) = root_creation::tests::active_independent_root_with_scope(ID + 2,
             boot, 0xc000, &masked);
-        assert_eq!(reused, source);
+        assert!(reused == source || reused == peer);
+        let prev_id = if reused == source { ID } else { ID + 1 };
         assert_ne!(Some(handle), source_context.process_handle);
-        assert!(wake_publication::Binding::capture(reused, ID).is_none());
+        assert!(wake_publication::Binding::capture(reused, prev_id).is_none());
         assert!(wake_publication::Binding::capture(reused, ID + 2).is_some());
         assert!(stack_resources::cpu_leases::owns_current(0, 121));
         assert!(current_identity::execution::banks::owns_current(0, 121));

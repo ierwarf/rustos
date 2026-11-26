@@ -8,25 +8,48 @@
 //! exact owner generation.  It must validate the returned view before it can
 //! dereference `saved_rsp`.
 
+use crate::multitask::task_table;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 use super::super::cpu_local;
 use super::{
-    MAX_TASK,
     context_validation::PublishedFrameView,
     runqueue::{self, RunOwnerState},
 };
 
-static VERSION: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-static OWNER_GENERATION: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-static SAVED_RSP: [AtomicUsize; MAX_TASK] = [const { AtomicUsize::new(0) }; MAX_TASK];
-static KERNEL_STACK_BASE: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-static KERNEL_STACK_TOP: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-static ALTERNATE_STACK_BASE: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-static ALTERNATE_STACK_TOP: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-static FLAGS: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-static SCHEDULER_STORAGE_BASE: [AtomicUsize; MAX_TASK] = [const { AtomicUsize::new(0) }; MAX_TASK];
-static SCHEDULER_STORAGE_END: [AtomicUsize; MAX_TASK] = [const { AtomicUsize::new(0) }; MAX_TASK];
+pub(in crate::multitask) struct FramePubSlot {
+    version: AtomicU64,
+    owner_generation: AtomicU64,
+    saved_rsp: AtomicUsize,
+    kernel_stack_base: AtomicU64,
+    kernel_stack_top: AtomicU64,
+    alternate_stack_base: AtomicU64,
+    alternate_stack_top: AtomicU64,
+    flags: AtomicU64,
+    scheduler_storage_base: AtomicUsize,
+    scheduler_storage_end: AtomicUsize,
+}
+
+impl FramePubSlot {
+    /// Byte offset of `saved_rsp`, exported to post-failure diagnostics.
+    pub(in crate::multitask) const SAVED_RSP_OFFSET: usize =
+        core::mem::offset_of!(FramePubSlot, saved_rsp);
+
+    pub(in crate::multitask) const fn new() -> Self {
+        Self {
+            version: AtomicU64::new(0),
+            owner_generation: AtomicU64::new(0),
+            saved_rsp: AtomicUsize::new(0),
+            kernel_stack_base: AtomicU64::new(0),
+            kernel_stack_top: AtomicU64::new(0),
+            alternate_stack_base: AtomicU64::new(0),
+            alternate_stack_top: AtomicU64::new(0),
+            flags: AtomicU64::new(0),
+            scheduler_storage_base: AtomicUsize::new(0),
+            scheduler_storage_end: AtomicUsize::new(0),
+        }
+    }
+}
 
 const FLAG_PUBLISHED: u64 = 1 << 0;
 const FLAG_USER_MODE: u64 = 1 << 1;
@@ -60,11 +83,14 @@ pub(super) fn pin_for_identity(
     Some(pin)
 }
 
-/// Same own-CPU IRQ/preemption contract as frame_readers::acquire. The owned
-/// reader retains backing and byte exclusion after this helper returns.
+/// Same own-CPU IRQ/preemption contract as `frame_readers::pin_and_acquire`. The
+/// owned reader retains backing and byte exclusion after this helper returns.
 pub(super) unsafe fn read_for_identity(
-    token: StableFrameToken, task_id: u64, cpu: usize,
+    token: StableFrameToken,
+    task_id: u64,
+    cpu: usize,
 ) -> Option<super::stack_resources::frame_readers::PinnedFrameReader> {
+    // SAFETY: forwarded from caller's masked own-CPU dispatch exclusion.
     let reader = unsafe {
         super::stack_resources::frame_readers::pin_and_acquire(token.slot, task_id, token.view, cpu)
     }?;
@@ -73,21 +99,23 @@ pub(super) unsafe fn read_for_identity(
 }
 
 pub(super) unsafe fn read_allocation(
-    token: StableFrameToken, cpu: usize,
+    token: StableFrameToken,
+    cpu: usize,
 ) -> Option<super::stack_resources::frame_readers::PinnedFrameReader> {
     let task_id = super::current_identity::read_dispatch(token.slot)?.task_id?;
+    // SAFETY: forwarded from caller's masked own-CPU dispatch exclusion.
     unsafe { read_for_identity(token, task_id, cpu) }
 }
 
 fn recheck_pin_epoch(token: StableFrameToken) -> Option<()> {
-    if read(token.slot)?.frame_epoch != token.frame_epoch { return None; }
+    if read(token.slot)?.frame_epoch != token.frame_epoch {
+        return None;
+    }
     Some(())
 }
 
 fn begin_write(slot: usize) -> u64 {
-    let cell = VERSION
-        .get(slot)
-        .expect("scheduler frame publication slot exceeds capacity");
+    let cell = &task_table::get(slot).frame.version;
     let version = cell.load(Ordering::Relaxed);
     assert_eq!(
         version & 1,
@@ -102,7 +130,10 @@ fn begin_write(slot: usize) -> u64 {
 
 fn finish_write(slot: usize, version: u64) {
     // Release publishes every payload field to readers that accept this epoch.
-    VERSION[slot].store(version.wrapping_add(2), Ordering::Release);
+    task_table::get(slot)
+        .frame
+        .version
+        .store(version.wrapping_add(2), Ordering::Release);
 }
 
 /// Revoke observations of the old image before its first byte mutation. The
@@ -133,14 +164,15 @@ pub(super) fn publish(
     scheduler_storage_base: usize,
     scheduler_storage_end: usize,
 ) {
+    let frame = &task_table::get(slot).frame;
     let version = begin_write(slot);
-    SAVED_RSP[slot].store(saved_rsp, Ordering::Relaxed);
-    KERNEL_STACK_BASE[slot].store(kernel_stack_base, Ordering::Relaxed);
-    KERNEL_STACK_TOP[slot].store(kernel_stack_top, Ordering::Relaxed);
-    ALTERNATE_STACK_BASE[slot].store(alternate_stack_base, Ordering::Relaxed);
-    ALTERNATE_STACK_TOP[slot].store(alternate_stack_top, Ordering::Relaxed);
-    SCHEDULER_STORAGE_BASE[slot].store(scheduler_storage_base, Ordering::Relaxed);
-    SCHEDULER_STORAGE_END[slot].store(scheduler_storage_end, Ordering::Relaxed);
+    frame.saved_rsp.store(saved_rsp, Ordering::Relaxed);
+    frame.kernel_stack_base.store(kernel_stack_base, Ordering::Relaxed);
+    frame.kernel_stack_top.store(kernel_stack_top, Ordering::Relaxed);
+    frame.alternate_stack_base.store(alternate_stack_base, Ordering::Relaxed);
+    frame.alternate_stack_top.store(alternate_stack_top, Ordering::Relaxed);
+    frame.scheduler_storage_base.store(scheduler_storage_base, Ordering::Relaxed);
+    frame.scheduler_storage_end.store(scheduler_storage_end, Ordering::Relaxed);
     let mut flags = FLAG_PUBLISHED;
     if user_mode_task {
         flags |= FLAG_USER_MODE;
@@ -151,7 +183,7 @@ pub(super) fn publish(
     if stack_canary_intact {
         flags |= FLAG_STACK_CANARY_INTACT;
     }
-    FLAGS[slot].store(flags, Ordering::Relaxed);
+    frame.flags.store(flags, Ordering::Relaxed);
     finish_write(slot, version);
 }
 
@@ -165,42 +197,44 @@ pub(super) fn bind_local_owner_generation(slot: usize, generation: u64) {
         "scheduler frame publication has zero generation"
     );
     let version = begin_write(slot);
-    OWNER_GENERATION[slot].store(generation, Ordering::Relaxed);
+    task_table::get(slot).frame.owner_generation.store(generation, Ordering::Relaxed);
     finish_write(slot, version);
 }
 
 /// Clears frame authority before a retired slot becomes reusable.
 pub(super) fn clear(slot: usize) {
+    let frame = &task_table::get(slot).frame;
     let version = begin_write(slot);
-    OWNER_GENERATION[slot].store(0, Ordering::Relaxed);
-    SAVED_RSP[slot].store(0, Ordering::Relaxed);
-    KERNEL_STACK_BASE[slot].store(0, Ordering::Relaxed);
-    KERNEL_STACK_TOP[slot].store(0, Ordering::Relaxed);
-    ALTERNATE_STACK_BASE[slot].store(0, Ordering::Relaxed);
-    ALTERNATE_STACK_TOP[slot].store(0, Ordering::Relaxed);
-    FLAGS[slot].store(0, Ordering::Relaxed);
-    SCHEDULER_STORAGE_BASE[slot].store(0, Ordering::Relaxed);
-    SCHEDULER_STORAGE_END[slot].store(0, Ordering::Relaxed);
+    frame.owner_generation.store(0, Ordering::Relaxed);
+    frame.saved_rsp.store(0, Ordering::Relaxed);
+    frame.kernel_stack_base.store(0, Ordering::Relaxed);
+    frame.kernel_stack_top.store(0, Ordering::Relaxed);
+    frame.alternate_stack_base.store(0, Ordering::Relaxed);
+    frame.alternate_stack_top.store(0, Ordering::Relaxed);
+    frame.flags.store(0, Ordering::Relaxed);
+    frame.scheduler_storage_base.store(0, Ordering::Relaxed);
+    frame.scheduler_storage_end.store(0, Ordering::Relaxed);
     finish_write(slot, version);
 }
 
 fn read(slot: usize) -> Option<StableFrameToken> {
-    let version = VERSION.get(slot)?.load(Ordering::Acquire);
+    let frame = &task_table::try_get(slot)?.frame;
+    let version = frame.version.load(Ordering::Acquire);
     if version & 1 != 0 {
         return None;
     }
-    let owner_generation = OWNER_GENERATION[slot].load(Ordering::Relaxed);
-    let saved_rsp = SAVED_RSP[slot].load(Ordering::Relaxed);
-    let kernel_stack_base = KERNEL_STACK_BASE[slot].load(Ordering::Relaxed);
-    let kernel_stack_top = KERNEL_STACK_TOP[slot].load(Ordering::Relaxed);
-    let alternate_stack_base = ALTERNATE_STACK_BASE[slot].load(Ordering::Relaxed);
-    let alternate_stack_top = ALTERNATE_STACK_TOP[slot].load(Ordering::Relaxed);
-    let flags = FLAGS[slot].load(Ordering::Relaxed);
-    let scheduler_storage_base = SCHEDULER_STORAGE_BASE[slot].load(Ordering::Relaxed);
-    let scheduler_storage_end = SCHEDULER_STORAGE_END[slot].load(Ordering::Relaxed);
+    let owner_generation = frame.owner_generation.load(Ordering::Relaxed);
+    let saved_rsp = frame.saved_rsp.load(Ordering::Relaxed);
+    let kernel_stack_base = frame.kernel_stack_base.load(Ordering::Relaxed);
+    let kernel_stack_top = frame.kernel_stack_top.load(Ordering::Relaxed);
+    let alternate_stack_base = frame.alternate_stack_base.load(Ordering::Relaxed);
+    let alternate_stack_top = frame.alternate_stack_top.load(Ordering::Relaxed);
+    let flags = frame.flags.load(Ordering::Relaxed);
+    let scheduler_storage_base = frame.scheduler_storage_base.load(Ordering::Relaxed);
+    let scheduler_storage_end = frame.scheduler_storage_end.load(Ordering::Relaxed);
     // Neither payload load may move below this validation point.
     fence(Ordering::Acquire);
-    if VERSION[slot].load(Ordering::Relaxed) != version || flags & FLAG_PUBLISHED == 0 {
+    if frame.version.load(Ordering::Relaxed) != version || flags & FLAG_PUBLISHED == 0 {
         return None;
     }
     Some(StableFrameToken {
@@ -315,9 +349,10 @@ pub(super) fn running_frame_view(slot: usize, cpu: usize) -> Option<PublishedFra
     ) {
         return None;
     }
+    let frame = &task_table::get(slot).frame;
     if runqueue::owner(slot) != owner
-        || VERSION[slot].load(Ordering::Acquire) != token.frame_epoch << 1
-        || OWNER_GENERATION[slot].load(Ordering::Acquire) != token.owner_generation
+        || frame.version.load(Ordering::Acquire) != token.frame_epoch << 1
+        || frame.owner_generation.load(Ordering::Acquire) != token.owner_generation
     {
         return None;
     }
@@ -362,9 +397,10 @@ pub(super) fn observed_frame_token(
             return None;
         }
     }
+    let frame = &task_table::get(slot).frame;
     if runqueue::owner(slot) != owner
-        || VERSION[slot].load(Ordering::Acquire) != token.frame_epoch << 1
-        || OWNER_GENERATION[slot].load(Ordering::Acquire) != token.owner_generation
+        || frame.version.load(Ordering::Acquire) != token.frame_epoch << 1
+        || frame.owner_generation.load(Ordering::Acquire) != token.owner_generation
     {
         return None;
     }
@@ -381,6 +417,7 @@ pub(super) fn current_local_frame_token(slot: usize, cpu: usize) -> Option<Stabl
 
 pub(super) fn current_local_token_is_current(token: StableFrameToken, cpu: usize) -> bool {
     let owner = runqueue::owner(token.slot);
+    let frame = &task_table::get(token.slot).frame;
     rustos_scheduler_frame_gate::retained_current_frame_custody(
         token.owner_generation,
         owner.generation,
@@ -388,8 +425,8 @@ pub(super) fn current_local_token_is_current(token: StableFrameToken, cpu: usize
         owner.runnable,
         cpu_local::task_execution_owner(token.slot)
             == Some(cpu_local::TaskExecutionOwner::Current(cpu)),
-    ) && VERSION[token.slot].load(Ordering::Acquire) == token.frame_epoch << 1
-        && OWNER_GENERATION[token.slot].load(Ordering::Acquire) == token.owner_generation
+    ) && frame.version.load(Ordering::Acquire) == token.frame_epoch << 1
+        && frame.owner_generation.load(Ordering::Acquire) == token.owner_generation
         && runqueue::owner(token.slot) == owner
         && cpu_local::task_execution_owner(token.slot)
             == Some(cpu_local::TaskExecutionOwner::Current(cpu))
@@ -401,8 +438,9 @@ pub(super) fn current_local_token_is_current(token: StableFrameToken, cpu: usize
 fn token_is_current_for_state(token: StableFrameToken, cpu: usize, state: RunOwnerState) -> bool {
     let owner = runqueue::owner(token.slot);
     let expected_version = token.frame_epoch << 1;
-    VERSION[token.slot].load(Ordering::Acquire) == expected_version
-        && OWNER_GENERATION[token.slot].load(Ordering::Acquire) == token.owner_generation
+    let frame = &task_table::get(token.slot).frame;
+    frame.version.load(Ordering::Acquire) == expected_version
+        && frame.owner_generation.load(Ordering::Acquire) == token.owner_generation
         && frame_custody_matches(token.owner_generation, owner, state, cpu, token.slot)
 }
 
@@ -417,23 +455,25 @@ pub(super) fn direct_handoff_token_is_current(token: StableFrameToken, cpu: usiz
 /// Original successful claim retains the physical bank; this is an epoch
 /// check, not new Local/Direct admission or permission to read frame bytes.
 pub(super) fn claimed_frame_is_current(token: StableFrameToken) -> bool {
-    VERSION[token.slot].load(Ordering::Acquire) == token.frame_epoch << 1
-        && OWNER_GENERATION[token.slot].load(Ordering::Acquire) == token.owner_generation
-        && SAVED_RSP[token.slot].load(Ordering::Acquire) == token.saved_rsp
+    let frame = &task_table::get(token.slot).frame;
+    frame.version.load(Ordering::Acquire) == token.frame_epoch << 1
+        && frame.owner_generation.load(Ordering::Acquire) == token.owner_generation
+        && frame.saved_rsp.load(Ordering::Acquire) == token.saved_rsp
 }
 
 pub(super) fn reset_before_publication() {
-    for slot in 0..MAX_TASK {
-        VERSION[slot].store(0, Ordering::Relaxed);
-        OWNER_GENERATION[slot].store(0, Ordering::Relaxed);
-        SAVED_RSP[slot].store(0, Ordering::Relaxed);
-        KERNEL_STACK_BASE[slot].store(0, Ordering::Relaxed);
-        KERNEL_STACK_TOP[slot].store(0, Ordering::Relaxed);
-        ALTERNATE_STACK_BASE[slot].store(0, Ordering::Relaxed);
-        ALTERNATE_STACK_TOP[slot].store(0, Ordering::Relaxed);
-        FLAGS[slot].store(0, Ordering::Relaxed);
-        SCHEDULER_STORAGE_BASE[slot].store(0, Ordering::Relaxed);
-        SCHEDULER_STORAGE_END[slot].store(0, Ordering::Relaxed);
+    for slot in task_table::allocated_slots() {
+        let frame = &task_table::get(slot).frame;
+        frame.version.store(0, Ordering::Relaxed);
+        frame.owner_generation.store(0, Ordering::Relaxed);
+        frame.saved_rsp.store(0, Ordering::Relaxed);
+        frame.kernel_stack_base.store(0, Ordering::Relaxed);
+        frame.kernel_stack_top.store(0, Ordering::Relaxed);
+        frame.alternate_stack_base.store(0, Ordering::Relaxed);
+        frame.alternate_stack_top.store(0, Ordering::Relaxed);
+        frame.flags.store(0, Ordering::Relaxed);
+        frame.scheduler_storage_base.store(0, Ordering::Relaxed);
+        frame.scheduler_storage_end.store(0, Ordering::Relaxed);
     }
 }
 
@@ -540,7 +580,7 @@ mod tests {
         drop(current);
         assert!(running_frame_view(slot, cpu).is_none());
         let current = cpu_local::install_test_current_owner(cpu, slot);
-        OWNER_GENERATION[slot].store(runqueue::owner(slot).generation - 2, Ordering::Release);
+        task_table::get(slot).frame.owner_generation.store(runqueue::owner(slot).generation - 2, Ordering::Release);
         assert!(running_frame_view(slot, cpu).is_none());
         drop(current);
     }

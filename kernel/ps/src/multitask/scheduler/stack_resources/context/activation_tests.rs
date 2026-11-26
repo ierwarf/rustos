@@ -53,7 +53,7 @@ fn local_and_direct_mm_grant_block_real_staging_through_publication_until_rsp_ac
                 let old = process::pin_process_mm(handle, PID).unwrap();
                 assert!(old.is_open());
                 assert_eq!(old.root(), 0x2000);
-                assert!(RESOURCES[SLOT].with(|r| r.mm_pin.as_ref().unwrap().is_open()));
+                assert!(crate::multitask::scheduler::stack_resources::resource(SLOT).with(|r| r.mm_pin.as_ref().unwrap().is_open()));
             } else {
                 staged = attempt(reservation);
                 assert!(staged.is_some());
@@ -235,13 +235,13 @@ fn replaced_uid_cannot_spend_unchanged_owner_and_mm_activation_identity() {
             ));
             // Corrupt only the fixture descriptor: the production writer forbids
             // rebinding. This independently exercises the return UID qualifier.
-            RESOURCES[SLOT].with(|r| r.start.as_mut().unwrap().id += 1);
+            crate::multitask::scheduler::stack_resources::resource(SLOT).with(|r| r.start.as_mut().unwrap().id += 1);
         },
         || {
             assert!(attempt(reservation).is_none());
         },
     );
-    RESOURCES[SLOT].with(|r| r.start.as_mut().unwrap().id = PID);
+    crate::multitask::scheduler::stack_resources::resource(SLOT).with(|r| r.start.as_mut().unwrap().id = PID);
     let staged = attempt(reservation).unwrap();
     let result = process::finalize_exec_state(
         staged,

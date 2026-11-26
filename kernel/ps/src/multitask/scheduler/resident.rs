@@ -17,8 +17,8 @@
 //! ordering is argued here, not modeled in TLA+.
 use super::{return_architecture::ArchitectureState, runqueue, stack_resources::StackPin};
 use crate::multitask::current_identity::execution::ExecutionPermit;
+use crate::multitask::task_table;
 use core::{cell::UnsafeCell, sync::atomic::{AtomicU64, AtomicUsize, Ordering}};
-use nucleus_core::util::cache_padded::CachePadded;
 
 /// Everything a parked task needs to resume without re-admission.
 pub(super) struct Loans {
@@ -29,7 +29,7 @@ pub(super) struct Loans {
     pub(super) cpu: usize,
 }
 
-struct Cell {
+pub(in crate::multitask) struct Cell {
     /// Owner generation this cell is valid for; zero means empty. Owner
     /// generations start at one, so zero is never a live generation.
     generation: AtomicU64,
@@ -44,7 +44,7 @@ struct Cell {
 // SAFETY: `arch` is accessed only while the accessor owns the generation word (`BUSY`).
 unsafe impl Sync for Cell {}
 impl Cell {
-    const fn new() -> Self {
+    pub(in crate::multitask) const fn new() -> Self {
         Self {
             generation: AtomicU64::new(0),
             pin: AtomicUsize::new(0),
@@ -78,14 +78,8 @@ impl Cell {
 /// 2^64 >> shift), so it never equals a live generation.
 const BUSY: u64 = u64::MAX;
 
-static CELLS: [CachePadded<Cell>; super::MAX_TASK] =
-    [const { CachePadded::new(Cell::new()) }; super::MAX_TASK];
-
-/// Park `loans` for `generation`. The loans are consumed either way: when the
-/// owner already left that generation, or the cell is not available, they are
-/// released here, outside any leaf. Returns whether the cell is still parked.
 pub(super) fn park(slot: usize, generation: u64, loans: Loans) -> bool {
-    let cell = &CELLS[slot];
+    let cell = &*task_table::get(slot).resident;
     if !claim_empty(cell, generation) {
         return false;
     }
@@ -116,7 +110,7 @@ pub(super) fn park(slot: usize, generation: u64, loans: Loans) -> bool {
 /// Win the cell for `generation`, or `None` if it is empty or evicted.
 pub(super) fn take(slot: usize, generation: u64) -> Option<Loans> {
     assert!(generation != 0 && generation != BUSY, "resident take of a non-generation");
-    let cell = &CELLS[slot];
+    let cell = &*task_table::get(slot).resident;
     cell.generation
         .compare_exchange(generation, BUSY, Ordering::AcqRel, Ordering::Acquire)
         .ok()?;
@@ -161,30 +155,34 @@ fn claim_empty(cell: &Cell, generation: u64) -> bool {
 /// Observation for admission decisions; grants nothing.
 #[cfg(test)]
 pub(super) fn is_resident(slot: usize, generation: u64) -> bool {
-    CELLS[slot].generation.load(Ordering::Acquire) == generation
+    task_table::get(slot).resident.generation.load(Ordering::Acquire) == generation
 }
 
 /// Raw cell word, for witnesses of the claim protocol.
 #[cfg(test)]
 pub(super) fn test_word(slot: usize) -> u64 {
-    CELLS[slot].generation.load(Ordering::Acquire)
+    task_table::get(slot).resident.generation.load(Ordering::Acquire)
 }
 
 /// Marks an empty cell `BUSY` as a delayed taker or parker would hold it.
 #[cfg(test)]
 pub(super) fn test_hold_busy(slot: usize) -> bool {
-    CELLS[slot].generation.compare_exchange(0, BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    task_table::get(slot)
+        .resident
+        .generation
+        .compare_exchange(0, BUSY, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
 }
 
 /// Ends [`test_hold_busy`].
 #[cfg(test)]
 pub(super) fn test_release_busy(slot: usize) {
-    assert_eq!(CELLS[slot].generation.swap(0, Ordering::AcqRel), BUSY);
+    assert_eq!(task_table::get(slot).resident.generation.swap(0, Ordering::AcqRel), BUSY);
 }
 
 /// Whether `slot`'s cell holds, or is moving, any loans.
 pub(super) fn occupied(slot: usize) -> bool {
-    CELLS[slot].generation.load(Ordering::Acquire) != 0
+    task_table::get(slot).resident.generation.load(Ordering::Acquire) != 0
 }
 
 /// Owner-word CAS hook: the transition from `previous_generation` succeeded, so
@@ -192,14 +190,14 @@ pub(super) fn occupied(slot: usize) -> bool {
 #[inline]
 pub(super) fn on_owner_transition(slot: usize, previous_generation: u64) {
     // ORDERING: SeqCst pairs with the parker's SeqCst publication swap (see `park`).
-    if CELLS[slot].generation.load(Ordering::SeqCst) == previous_generation {
+    if task_table::get(slot).resident.generation.load(Ordering::SeqCst) == previous_generation {
         drop(take(slot, previous_generation));
     }
 }
 
 /// CPU a parked cell was parked on (valid only for the caller's generation).
 pub(super) fn parked_cpu(slot: usize, generation: u64) -> Option<usize> {
-    let cell = &CELLS[slot];
+    let cell = &*task_table::get(slot).resident;
     if cell.generation.load(Ordering::Acquire) != generation {
         return None;
     }
@@ -214,8 +212,8 @@ pub(super) fn parked_cpu(slot: usize, generation: u64) -> Option<usize> {
 /// taker has already claimed the unit, so quiescence observers count it as live.
 #[inline]
 pub(in crate::multitask) fn permit_units(slot: usize) -> u32 {
-    u32::from(CELLS.get(slot).is_some_and(|cell| {
-        let word = cell.generation.load(Ordering::Acquire);
+    u32::from(task_table::try_get(slot).is_some_and(|task| {
+        let word = task.resident.generation.load(Ordering::Acquire);
         word != 0 && word != BUSY
     }))
 }
@@ -284,4 +282,3 @@ fn kernel_frame_rsp(cpu: usize, slot: usize, generation: u64) -> Option<usize> {
     let cs = unsafe { (*(token.saved_rsp as *const super::SavedContext)).cs };
     (cs != crate::arch::gdt::user_code_selector().0 as u64).then_some(token.saved_rsp)
 }
-

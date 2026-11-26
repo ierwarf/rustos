@@ -24,80 +24,132 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::runqueue;
-use super::{MAX_TASK, current_identity};
+use super::{current_identity, stack_resources};
+use core::sync::atomic::AtomicU32;
 use kernel_object::api::identity::ObjectIdentity;
 
-/// Four-way set-associative `(task id, slot)` pairs, each packed in one word
-/// as `(id + 1) << 8 | slot` so a reader can never pair one task's id with
-/// another's slot; zero is an empty way. The previous direct-mapped byte per
-/// `id % MAX_TASK` silently aliased two live tasks with the same residue, and
-/// every lookup of the evicted one became a full resource-leaf walk.
+/// Four-way set-associative `(task id, slot)` pairs. Each way holds a small
+/// sequence lock (`seq`), full 64-bit `task_id`, and full 32-bit `slot`, so no
+/// fixed slot width ceiling aliases tasks or slots.
 const WAYS: usize = 4;
-const SETS: usize = MAX_TASK;
-const _: () = assert!(SETS.is_power_of_two());
-// A slot is stored in the low byte, so the highest slot index must be 255.
-const _: () = assert!(MAX_TASK <= u8::MAX as usize + 1);
+const HINT_SETS: usize = 1024;
+const HINT_LEN: usize = HINT_SETS * WAYS;
 
-static HINTS: [AtomicU64; SETS * WAYS] = [const { AtomicU64::new(0) }; SETS * WAYS];
-
-#[inline]
-fn set(task_id: u64) -> &'static [AtomicU64] {
-    let index = (task_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & (SETS - 1);
-    &HINTS[index * WAYS..(index + 1) * WAYS]
+struct HintWay {
+    seq: AtomicU32,
+    slot: AtomicU32,
+    task_id: AtomicU64,
 }
 
+impl HintWay {
+    const fn new() -> Self {
+        Self {
+            seq: AtomicU32::new(0),
+            slot: AtomicU32::new(0),
+            task_id: AtomicU64::new(0),
+        }
+    }
+
+    fn load(&self) -> Option<(u64, usize)> {
+        // ORDERING: Acquire pairs with Release even sequence after publishing payload.
+        let s1 = self.seq.load(Ordering::Acquire);
+        if s1 == 0 || s1 & 1 != 0 {
+            return None;
+        }
+        let id = self.task_id.load(Ordering::Relaxed);
+        let slot = self.slot.load(Ordering::Relaxed);
+        // ORDERING: Acquire ensures payload loads precede validating sequence check.
+        core::sync::atomic::fence(Ordering::Acquire);
+        // ORDERING: Acquire pairs with odd-seq write on concurrent overwrite.
+        if self.seq.load(Ordering::Acquire) != s1 {
+            return None;
+        }
+        Some((id, slot as usize))
+    }
+
+    fn store(&self, task_id: u64, slot: u32) {
+        let s = self.seq.load(Ordering::Relaxed);
+        // ORDERING: Release marks way odd before rewriting task_id/slot.
+        self.seq.store(s.wrapping_add(1), Ordering::Release);
+        self.task_id.store(task_id, Ordering::Relaxed);
+        self.slot.store(slot, Ordering::Relaxed);
+        let next = {
+            let candidate = s.wrapping_add(2);
+            if candidate == 0 { 2 } else { candidate }
+        };
+        // ORDERING: Release publishes coherent (task_id, slot) under even non-zero seq.
+        self.seq.store(next, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn clear_if(&self, task_id: u64) {
+        let s1 = self.seq.load(Ordering::Relaxed);
+        if s1 == 0 || s1 & 1 != 0 {
+            return;
+        }
+        if self.task_id.load(Ordering::Relaxed) == task_id {
+            // ORDERING: Release clears empty way (seq = 0).
+            let _ = self.seq.compare_exchange(s1, 0, Ordering::Release, Ordering::Relaxed);
+        }
+    }
+
+    fn clear(&self) {
+        // ORDERING: Release clears way on boot reset.
+        self.seq.store(0, Ordering::Release);
+        self.task_id.store(0, Ordering::Relaxed);
+        self.slot.store(0, Ordering::Relaxed);
+    }
+}
+
+static HINTS: [HintWay; HINT_LEN] = [const { HintWay::new() }; HINT_LEN];
+
 #[inline]
-fn tag(task_id: u64) -> u64 {
-    task_id.wrapping_add(1) << 8
+fn set(task_id: u64) -> &'static [HintWay] {
+    let index = (task_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & (HINT_SETS - 1);
+    &HINTS[index * WAYS..(index + 1) * WAYS]
 }
 
 /// The slot last observed to hold `task_id`, if any. Callers must revalidate.
 #[inline]
 pub(super) fn hint(task_id: u64) -> Option<usize> {
-    let tag = tag(task_id);
-    // ORDERING: Relaxed is exact. The value is a hint that every caller
-    // revalidates against authoritative identity before use, so no other
-    // memory is published through it; the packed word cannot tear.
-    set(task_id).iter().map(|way| way.load(Ordering::Relaxed))
-        .find(|&entry| entry != 0 && entry & !0xff == tag)
-        .map(|entry| (entry & 0xff) as usize)
-        .filter(|&slot| slot < MAX_TASK)
+    set(task_id)
+        .iter()
+        .filter_map(HintWay::load)
+        .find(|&(id, _)| id == task_id)
+        .map(|(_, slot)| slot)
+        .filter(|&slot| slot < crate::multitask::task_table::MAX_TASK_SLOTS)
 }
 
 /// Records `slot` as the accelerator for `task_id`.
 #[inline]
 pub(super) fn record(task_id: u64, slot: usize) {
-    let slot = u8::try_from(slot).expect("scheduler slot exceeds task hint capacity");
-    let tag = tag(task_id);
-    let entry = tag | u64::from(slot);
+    let slot = u32::try_from(slot).expect("scheduler slot exceeds u32 task hint capacity");
     let ways = set(task_id);
-    // ORDERING: see `hint`; repair is equally non-authoritative. Prefer this
-    // task's own way, then an empty one, then a way chosen by the id.
-    let way = ways.iter().find(|way| way.load(Ordering::Relaxed) & !0xff == tag)
-        .or_else(|| ways.iter().find(|way| way.load(Ordering::Relaxed) == 0))
+    let way = ways
+        .iter()
+        .find(|way| way.load().is_some_and(|(id, _)| id == task_id))
+        .or_else(|| {
+            ways.iter()
+                // ORDERING: Relaxed probe for an empty hint way.
+                .find(|way| way.seq.load(Ordering::Relaxed) == 0)
+        })
         .unwrap_or(&ways[task_id as usize % WAYS]);
-    way.store(entry, Ordering::Relaxed);
+    way.store(task_id, slot);
 }
 
 /// Forgets the accelerator for `task_id` after an authoritative miss.
 #[inline]
 #[cfg(test)]
 pub(super) fn forget(task_id: u64) {
-    let tag = tag(task_id);
     for way in set(task_id) {
-        let entry = way.load(Ordering::Relaxed);
-        if entry != 0 && entry & !0xff == tag {
-            // ORDERING: see `hint`. Only this exact entry is cleared; a racing
-            // record of another task keeps its own word.
-            let _ = way.compare_exchange(entry, 0, Ordering::Relaxed, Ordering::Relaxed);
-        }
+        way.clear_if(task_id);
     }
 }
 
 /// Clears every hint. Boot-time scheduler reset only.
 pub(super) fn reset() {
     for hint in &HINTS {
-        hint.store(0, Ordering::Relaxed);
+        hint.clear();
     }
 }
 
@@ -105,7 +157,9 @@ pub(super) fn reset() {
 /// authoritative miss; EACH consumer qualifies its own original lifetime.
 pub(super) fn candidates(task_id: u64) -> impl Iterator<Item = usize> {
     let first = hint(task_id);
-    first.into_iter().chain((0..MAX_TASK).filter(move |slot| Some(*slot) != first))
+    first.into_iter().chain(
+        crate::multitask::task_table::active_slots().filter(move |slot| Some(*slot) != first),
+    )
 }
 
 /// Resolves `task_id` to a live slot without the catalog guard.
@@ -189,7 +243,7 @@ fn reply_context_custody_locked(
     if let Some(result) = hint(task_id).and_then(inspect) {
         return result;
     }
-    (0..MAX_TASK).find_map(inspect).unwrap_or((false, false))
+    crate::multitask::task_table::active_slots().find_map(inspect).unwrap_or((false, false))
 }
 
 #[cfg(test)]
@@ -290,17 +344,17 @@ mod tests {
         assert_eq!(hint(task_id), None);
     }
 
-    /// Every slot, including the last of the widest table, fits the hint word's
-    /// low byte, and the slot-indexed tables are sized from the same constant.
+    /// Every slot, including arbitrary high 32-bit dynamic slots, round-trips
+    /// through the 4-way hint table.
     #[test]
     fn the_highest_slot_round_trips_and_per_slot_tables_match_the_task_table() {
         let _serial = serialized();
         let task_id = 8_191;
         forget(task_id);
-        record(task_id, MAX_TASK - 1);
-        assert_eq!(hint(task_id), Some(MAX_TASK - 1));
+        let high_slot = 0x0003_fffe;
+        record(task_id, high_slot);
+        assert_eq!(hint(task_id), Some(high_slot));
         forget(task_id);
-        assert_eq!(HINTS.len(), MAX_TASK * WAYS);
     }
 
     /// The unlocked readers accept a hint only when the slot it names still
@@ -312,7 +366,7 @@ mod tests {
         let _serial = serialized();
         let slot = 21;
         let resident = 0x6101;
-        let stranger = resident + MAX_TASK as u64;
+        let stranger = resident + HINTS.len() as u64 / WAYS as u64;
         crate::multitask::current_identity::clear(slot);
         crate::multitask::current_identity::publish_test_identity(
             slot,
@@ -351,7 +405,7 @@ mod tests {
         let _serial = serialized();
         // Ids that shared the old direct-mapped residue each keep their own way.
         let first = 4_098;
-        let second = first + MAX_TASK as u64;
+        let second = first + HINTS.len() as u64 / WAYS as u64;
         record(first, 3);
         record(second, 11);
         assert_eq!(hint(first), Some(3));
@@ -374,4 +428,28 @@ mod tests {
             forget(*id);
         }
     }
+}
+
+/// Live tasks in the order a process-directed signal tries them: the task whose
+/// id is `pid` (the leader) first, then every other live task by ascending
+/// slot, skipping `skip`. Observation only: each candidate still has to win an
+/// exact capture, so a task that exits mid-scan is simply refused there.
+pub(super) fn pid_ordered_candidates(
+    pid: u64,
+    skip: Option<usize>,
+) -> impl Iterator<Item = (usize, u64)> {
+    let live = move |slot: usize| {
+        if Some(slot) == skip {
+            return None;
+        }
+        stack_resources::task_start::read(slot).map(|start| (slot, start.id))
+    };
+    let leader = crate::multitask::task_table::active_slots()
+        .filter_map(live)
+        .find(|&(_, id)| id == pid);
+    leader.into_iter().chain(
+        crate::multitask::task_table::active_slots()
+            .filter_map(live)
+            .filter(move |&(_, id)| id != pid),
+    )
 }

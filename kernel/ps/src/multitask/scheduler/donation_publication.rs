@@ -7,7 +7,7 @@
 //! Evidence: actual born resources and original ledger source; CPU/IRQ native entry is modeled.
 use super::{
     current_identity as identity, donation_ledger, runqueue, stack_resources, task_directory,
-    IpcCallAdmission, MAX_TASK, SYSTEM_CLASS_WEIGHT_FLAG,
+    IpcCallAdmission, SYSTEM_CLASS_WEIGHT_FLAG,
 };
 use nucleus_core::util::lockdep::DispatchPreemption;
 
@@ -67,7 +67,7 @@ pub(super) fn participant(id: u64) -> Option<identity::execution::BindingPin> {
     let inspect = |slot| identity::execution::pin_donation(slot, id);
     task_directory::hint(id)
         .and_then(inspect)
-        .or_else(|| (0..MAX_TASK).find_map(inspect))
+        .or_else(|| crate::multitask::task_table::active_slots().find_map(inspect))
 }
 fn participant_system_class(pin: &identity::execution::BindingPin) -> bool {
     slot_system_class(pin.slot())

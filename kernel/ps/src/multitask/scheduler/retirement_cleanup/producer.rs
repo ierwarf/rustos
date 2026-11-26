@@ -102,7 +102,7 @@ impl Producer {
         detach: bool,
     ) -> Option<Self> {
         let key = {
-            let mut row = CELLS.get(slot)?.state.lock();
+            let mut row = try_cell(slot)?.state.lock();
             if row.reset_seal.is_some()
                 || row.producer.is_some()
                 || row.producing
@@ -151,7 +151,7 @@ impl Producer {
         task_id: Option<u64>,
     ) -> Option<Self> {
         let record = {
-            let mut row = CELLS.get(slot)?.state.lock();
+            let mut row = try_cell(slot)?.state.lock();
             let record = row.producer?;
             let origin = Origin::of(record.phase)?;
             if row.reset_seal.is_some()
@@ -196,7 +196,7 @@ impl Producer {
     /// Preserve the first exact stop request without denying this kernel caller's
     /// resume. Only existing executor scopes may extend the loan until it drains.
     pub(in crate::multitask::scheduler) fn wait_for_executor(mut self) {
-        let mut row = CELLS[self.slot].state.lock();
+        let mut row = cell(self.slot).state.lock();
         if self.exact(&row)
             && !self.effects
             && self.origin.is_none()
@@ -233,7 +233,7 @@ impl Producer {
     /// Acknowledgement of the retained ORIGINAL first producer, not admission
     /// or a replacement lifetime. Caller still owns its original Current loan.
     pub(in crate::multitask::scheduler) fn waiting_for_original(slot: usize, id: u64) -> bool {
-        let Some(cell) = CELLS.get(slot) else {
+        let Some(cell) = try_cell(slot) else {
             return false;
         };
         let row = cell.state.lock();
@@ -281,7 +281,7 @@ impl Producer {
             turn.matches_member(self.slot, self.key.task_id),
             "terminal process turn changed slot UID"
         );
-        let mut row = CELLS[self.slot].state.lock();
+        let mut row = cell(self.slot).state.lock();
         assert!(
             self.exact(&row)
                 && !self.effects
@@ -296,7 +296,7 @@ impl Producer {
     }
 
     pub(in crate::multitask::scheduler) fn begin_effects(&mut self) {
-        let mut row = CELLS[self.slot].state.lock();
+        let mut row = cell(self.slot).state.lock();
         assert!(
             self.exact(&row)
                 && !self.effects
@@ -314,7 +314,7 @@ impl Producer {
     /// ACK: untouched abandonment restores the original deferred stop.
     pub(in crate::multitask::scheduler) fn retain_stopped(mut self) -> Self {
         {
-            let mut row = CELLS[self.slot].state.lock();
+            let mut row = cell(self.slot).state.lock();
             assert!(
                 self.exact(&row)
                     && self.effects
@@ -345,7 +345,7 @@ impl Producer {
     pub(in crate::multitask::scheduler) fn park_unwithdrawn(mut self) {
         let parked = Some(self.reason);
         {
-            let mut cell = CELLS[self.slot].state.lock();
+            let mut cell = cell(self.slot).state.lock();
             assert!(
                 self.exact(&cell)
                     && !self.effects
@@ -369,7 +369,7 @@ impl Producer {
 
     pub(in crate::multitask::scheduler) fn defer(mut self) {
         {
-            let mut row = CELLS[self.slot].state.lock();
+            let mut row = cell(self.slot).state.lock();
             assert!(
                 self.exact(&row) && self.effects && row.producer.unwrap().phase == Phase::Effects,
                 "terminal deferral lacks exact effects owner"
@@ -392,7 +392,7 @@ impl Producer {
             "terminal publication lacks exact stopped process turn"
         );
         {
-            let mut row = CELLS[self.slot].state.lock();
+            let mut row = cell(self.slot).state.lock();
             assert!(
                 self.exact(&row)
                     && self.effects
@@ -427,7 +427,7 @@ impl Drop for Producer {
         if !self.live {
             return;
         }
-        let mut row = CELLS[self.slot].state.lock();
+        let mut row = cell(self.slot).state.lock();
         assert!(self.exact(&row), "terminal rollback lost exact producer");
         if self.effects {
             row.producer.as_mut().unwrap().phase = Phase::Poisoned;
@@ -454,15 +454,15 @@ pub(in crate::multitask) fn publish_process_turn_fixture(
     owner.bind_process_turn(turn);
     owner.begin_effects();
     let publication = owner.publish(None, RetirementSideEffect::new(Some(id), None));
-    let (generation, effects) = CELLS[slot].claim_kernel().unwrap();
-    CELLS[slot].complete_kernel(generation, effects);
-    CELLS[slot].reset();
+    let (generation, effects) = cell(slot).claim_kernel().unwrap();
+    cell(slot).complete_kernel(generation, effects);
+    cell(slot).reset();
     publication
 }
 /// Fixture isolation/poison recovery only, never production reopening.
 #[cfg(test)]
 pub(in crate::multitask) fn reset_process_turn_fixture(slot: usize) {
-    let mut row = CELLS[slot].state.lock();
+    let mut row = cell(slot).state.lock();
     let generation = row.generation;
     let nonce = row.producer_nonce;
     *row = SlotState::new();

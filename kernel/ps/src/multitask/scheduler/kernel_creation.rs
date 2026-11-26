@@ -94,9 +94,7 @@ pub(super) fn publish_reserved(
         "kernel creator lost original producer"
     );
     assert_ne!(root, 0, "kernel creator lacks physical root namespace");
-    let base = stack_resources::storage_base(slot);
-    let kernel_base = (base + TASK_STACK_GUARD_BYTES) as u64;
-    let kernel_top = align_kernel_stack_top(base + TASK_STACK_SIZE) as u64;
+    let (kernel_base, kernel_top) = stack_resources::stack_bounds(slot);
     let weight = task_weight::weight_from_pit_divisor(pit);
     let rsp = execution_image::reserved_kernel_entry(&ticket, cs, ss, flags, rip, 0);
     let view = PublishedFrameView {
@@ -235,30 +233,25 @@ pub(in crate::multitask) fn allocate(
         crate::multitask::cpu_local::scheduler_initialized(),
         "kernel creation preceded complete image"
     );
+    let ticket = root_slots::reserve_dynamic(id)?;
     let mut preemption = nucleus_core::util::lockdep::DispatchPreemption::enter();
     preemption.mask_irqs();
     let vruntime = creation_floor(preemption.cpu());
-    for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
-        let Some(ticket) = root_slots::reserve(slot, id) else {
-            continue;
-        };
-        let slot = publish_reserved(
-            ticket,
-            entry,
-            pit,
-            cs,
-            ss,
-            flags,
-            rip,
-            crate::memory::paging::kernel_root_phys().as_u64(),
-            vruntime,
-            |_, _| {},
-            runqueue_policy::online_affinity_mask,
-        );
-        super::super::irq::flush_deferred_target_reschedules();
-        return Some(slot);
-    }
-    None
+    let slot = publish_reserved(
+        ticket,
+        entry,
+        pit,
+        cs,
+        ss,
+        flags,
+        rip,
+        crate::memory::paging::kernel_root_phys().as_u64(),
+        vruntime,
+        |_, _| {},
+        runqueue_policy::online_affinity_mask,
+    );
+    super::super::irq::flush_deferred_target_reschedules();
+    Some(slot)
 }
 impl super::super::Thread {
     pub fn start(&self) {

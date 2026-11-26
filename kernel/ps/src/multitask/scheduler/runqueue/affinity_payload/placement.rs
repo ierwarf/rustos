@@ -88,7 +88,7 @@ impl PlacementGrant {
     /// A newer desired mask cannot revoke this admitted return, nor may its
     /// migration intent be acknowledged by this older captured version.
     pub(in crate::multitask) fn acknowledge(&self) {
-        let affinity = &AFFINITIES[self.slot];
+        let affinity = &crate::multitask::task_table::get(self.slot).affinity;
         // Nothing to acknowledge unless a migration is pending. Every replacement that
         // sets the flag also advances the version, so a pending flag raised after this
         // load belongs to a version newer than the one this grant captured and would

@@ -80,15 +80,19 @@ RUSTOS_USER_EXTABLE:
 RUSTOS_USER_EXTABLE_END:
 
     .text
-    // Vector 14. Kernel-mode faults whose RIP is a registered copy instruction
-    // resume at its fixup; every other fault enters the original handler with
-    // all registers intact.
+    // Vector 14 (#PF, running on IST2 so faults on uncommitted/guard stack
+    // pages never escalate to #DF while vectoring).
+    // 1) Kernel-mode direct user-copy faults resume at their fixups immediately.
+    // 2) Kernel-mode demand-committed stack faults commit on IST2 and `iretq`.
+    // 3) User faults and all other kernel faults pivot off IST2 onto `TSS.RSP0`
+    //    or `(old_rsp & -16) - 48` before entering `{original}` so IST2 stays
+    //    free across blocking user page faults.
     .global rustos_page_fault_entry
     .type rustos_page_fault_entry, @function
 rustos_page_fault_entry:
     endbr64
     test byte ptr [rsp + 16], 3
-    jnz 9f
+    jnz 20f
     push rax
     push rcx
     push rdx
@@ -113,15 +117,101 @@ rustos_page_fault_entry:
     pop rax
     add rsp, 8
     iretq
-8:  pop rsi
+8:  push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    sub rsp, 8
+    mov rdi, [rsp + 80]
+    mov rsi, cr2
+    mov rdx, [rsp + 88]
+    mov rcx, [rsp + 112]
+    call {try_kernel_pf}
+    test al, al
+    jz 21f
+    add rsp, 8
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
     pop rdx
     pop rcx
     pop rax
-9:  jmp qword ptr [rip + {original}]
+    add rsp, 8
+    iretq
+21: mov rax, [rsp + 112]
+    jmp 22f
+20: push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    sub rsp, 8
+    call {priv_stack_top}
+22: mov rcx, rax
+    and rcx, -16
+    sub rcx, 48
+    mov rdx, [rsp + 80]
+    mov [rcx + 0], rdx
+    mov rdx, [rsp + 88]
+    mov [rcx + 8], rdx
+    mov rdx, [rsp + 96]
+    mov [rcx + 16], rdx
+    mov rdx, [rsp + 104]
+    mov [rcx + 24], rdx
+    mov rdx, [rsp + 112]
+    mov [rcx + 32], rdx
+    mov rdx, [rsp + 120]
+    mov [rcx + 40], rdx
+    mov [rsp + 80], rcx
+    add rsp, 8
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    mov rsp, [rsp]
+    jmp qword ptr [rip + {original}]
     .size rustos_page_fault_entry, . - rustos_page_fault_entry
 "#,
     original = sym PF_ORIGINAL,
+    try_kernel_pf = sym rustos_try_kernel_stack_page_fault,
+    priv_stack_top = sym rustos_hal_pf_privilege_stack_top,
 );
+
+/// Handles kernel-stack demand commit or guard diagnostics directly on IST2.
+/// Returns `1` if the page fault was resolved by demand commit (resume via `iretq`),
+/// or `0` after ensuring the target pivot frame on `old_rsp` is backed.
+#[cfg(rustos_boot_image)]
+extern "C" fn rustos_try_kernel_stack_page_fault(
+    error_code: u64,
+    cr2: u64,
+    rip: u64,
+    old_rsp: u64,
+) -> u64 {
+    if crate::hooks::try_handle_kernel_page_fault(Some(error_code), cr2, rip, old_rsp) {
+        return 1;
+    }
+    let target_low = (old_rsp & !0xf).wrapping_sub(48);
+    let _ = crate::hooks::try_handle_kernel_page_fault(None, target_low, rip, old_rsp);
+    0
+}
+
+#[cfg(rustos_boot_image)]
+extern "C" fn rustos_hal_pf_privilege_stack_top() -> u64 {
+    crate::arch::gdt::privilege_stack_top_for_current_cpu()
+}
 
 /// The handler installed for vector 14 before the recovery entry replaced it.
 /// Written once while the IDT is built, before any CPU can take the fault.

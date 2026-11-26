@@ -90,7 +90,7 @@ impl Admission {
                         slot, id, context, ..
                     } if context.process_id == Some(pid) => parent_inputs(*slot, *id, pid)?,
                     _ => {
-                        let (pin, cohort, captured) = (FIRST_DYNAMIC_TASK_SLOT..MAX_TASK)
+                        let (pin, cohort, captured) = crate::multitask::task_table::active_dynamic_slots()
                             .find_map(|slot| {
                                 let context = stack_resources::context::read(slot)?;
                                 if context.process_id != Some(pid) {
@@ -234,11 +234,22 @@ pub(in crate::multitask) fn allocate(
         crate::multitask::cpu_local::scheduler_initialized(),
         "root creation preceded complete image"
     );
+    // Reserve the task object and guarded kernel stack before masking local IRQs.
+    let ticket = root_slots::reserve_dynamic(id)
+        .or_else(|| refused(3))
+        .ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot)?;
     let mut turn = nucleus_core::util::lockdep::DispatchPreemption::enter();
     turn.mask_irqs();
-    let actor = Actor::capture(turn.cpu()).or_else(|| refused(1)).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot)?;
-    let admission = Admission::capture(&actor, parent, supplied).or_else(|| refused(2)).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot)?;
-    let result = construct(
+    let Some(actor) = Actor::capture(turn.cpu()) else {
+        root_slots::cancel_unpublished(ticket);
+        return refused(1).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot);
+    };
+    let Some(admission) = Admission::capture(&actor, parent, supplied) else {
+        root_slots::cancel_unpublished(ticket);
+        return refused(2).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot);
+    };
+    let result = construct_with_ticket(
+        ticket,
         id,
         input,
         bootstrap,
@@ -280,8 +291,51 @@ fn refused<T>(site: u64) -> Option<T> {
     None
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn construct(
+    id: u64,
+    input: Input,
+    bootstrap: UserTaskBootstrap,
+    parent: Option<u64>,
+    pit: u16,
+    cs: u64,
+    ss: u64,
+    flags: u64,
+    suspended: bool,
+    reservation: process_table::SpawnReservation,
+    actor: &Actor,
+    admission: &Admission,
+    turn: &nucleus_core::util::lockdep::DispatchPreemption,
+    eligible_cpus: impl FnOnce(usize) -> u64,
+    before_wake: impl FnOnce(usize, u64),
+) -> Result<(bool, usize), crate::multitask::SpawnTaskError> {
+    let ticket = root_slots::reserve_dynamic(id)
+        .or_else(|| refused(3))
+        .ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot)?;
+    construct_with_ticket(
+        ticket,
+        id,
+        input,
+        bootstrap,
+        parent,
+        pit,
+        cs,
+        ss,
+        flags,
+        suspended,
+        reservation,
+        actor,
+        admission,
+        turn,
+        eligible_cpus,
+        before_wake,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn construct_with_ticket(
+    ticket: super::stack_resources::admission::Ticket,
     id: u64,
     input: Input,
     mut bootstrap: UserTaskBootstrap,
@@ -313,9 +367,6 @@ fn construct(
         }
     }
     let vruntime = kernel_creation::creation_floor(turn.cpu());
-    let ticket = (FIRST_DYNAMIC_TASK_SLOT..MAX_TASK)
-        .find_map(|slot| root_slots::reserve(slot, id))
-        .or_else(|| refused(3)).ok_or(crate::multitask::SpawnTaskError::NoFreeTaskSlot)?;
     let mut root =
         match root_slots::RootPublication::prepare(reservation, ticket, admission.process_mask) {
             Ok(root) => root,
@@ -451,9 +502,7 @@ fn publish(
     let id = root.ticket().task_id();
     // The exact Reserved writer's returned fixed ABI RSP was retained through
     // pinned PID publication; no pointer is recomputed from unowned metadata.
-    let base = stack_resources::storage_base(slot);
-    let kernel_base = (base + TASK_STACK_GUARD_BYTES) as u64;
-    let kernel_top = align_kernel_stack_top(base + TASK_STACK_SIZE) as u64;
+    let (kernel_base, kernel_top) = stack_resources::stack_bounds(slot);
     let weight = task_weight::weight_from_pit_divisor(pit);
     root.begin_commit();
     let context = TaskContext {

@@ -15,7 +15,7 @@ pub(in crate::multitask::scheduler) struct ResetSeal {
     live: bool,
 }
 pub(in crate::multitask::scheduler) fn begin(slot: usize, id: Option<u64>) -> Option<ResetSeal> {
-    let cell = CELLS.get(slot)?;
+    let cell = try_cell(slot)?;
     let result = {
         let mut row = cell.state.lock();
         if row.reset_seal.is_some()
@@ -46,7 +46,7 @@ pub(in crate::multitask::scheduler) fn begin(slot: usize, id: Option<u64>) -> Op
 /// Native fixture recovery only: no external-effect ACK or production reopen.
 #[cfg(test)]
 pub(in crate::multitask::scheduler) fn recover_detached_fixture(slot: usize) {
-    let mut row = CELLS[slot].state.lock();
+    let mut row = cell(slot).state.lock();
     assert!(row.reset_seal.is_some() && row.task_id.is_none());
     assert!(row.producer.is_none() && !row.producing && row.deferred.is_none());
     assert!(matches!(row.cleanup, CleanupState::Vacant));
@@ -62,7 +62,7 @@ impl ResetSeal {
             self.live && self.effects && !self.reset,
             "terminal reset lacks sole producer"
         );
-        let mut row = CELLS[self.slot].state.lock();
+        let mut row = cell(self.slot).state.lock();
         assert_eq!(
             row.reset_seal,
             Some(self.nonce),
@@ -91,7 +91,7 @@ impl ResetSeal {
             self.live && self.reset,
             "terminal seal released before owned reset"
         );
-        let mut row = CELLS[self.slot].state.lock();
+        let mut row = cell(self.slot).state.lock();
         assert_eq!(
             row.reset_seal,
             Some(self.nonce),
@@ -108,7 +108,7 @@ impl ResetSeal {
 impl Drop for ResetSeal {
     fn drop(&mut self) {
         if self.live && !self.effects {
-            let mut row = CELLS[self.slot].state.lock();
+            let mut row = cell(self.slot).state.lock();
             if row.reset_seal == Some(self.nonce) && row.generation == self.generation {
                 row.reset_seal = None;
             }

@@ -18,14 +18,15 @@
 //!   candidate snapshots are never execution/interval grants.
 //! - **Evidence:** `ipc-priority-inheritance` and the focused ledger tests.
 
-use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use alloc::vec::Vec;
+use crate::multitask::task_table;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use nucleus_core::util::cache_padded::CachePadded;
 use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS};
 use crate::multitask::irq_leaf::IrqLeaf;
 
 use super::{
-    MAX_TASK,
     ipc_donation::{DonationNamespace, IpcDonationTarget, IpcPriorityDonation},
 };
 
@@ -61,20 +62,33 @@ impl FundingBasis {
 }
 
 struct DonationLedger {
-    entries: [Option<LedgerEntry>; MAX_TASK],
+    /// One donation per task slot; sized once by `provision`, empty before.
+    entries: Vec<Option<LedgerEntry>>,
     len: usize,
 }
 
 impl DonationLedger {
     const fn new() -> Self {
         Self {
-            entries: [None; MAX_TASK],
+            entries: Vec::new(),
             len: 0,
         }
     }
 
+    /// Drops every donation and keeps the provisioned storage.
+    fn clear(&mut self) {
+        self.entries.fill(None);
+        self.len = 0;
+    }
+
+    fn ensure_capacity(&mut self, slots: usize) {
+        if self.entries.len() < slots {
+            self.entries.resize(slots, None);
+        }
+    }
+
     fn insert(&mut self, entry: LedgerEntry) -> bool {
-        if self.len == MAX_TASK {
+        if self.len == self.entries.len() {
             return false;
         }
         self.entries[self.len] = Some(entry);
@@ -115,6 +129,7 @@ static DONATION_LEDGER: IrqLeaf<DonationLedger, { LockClass::SchedulerDonation a
     IrqLeaf::new(DonationLedger::new());
 
 mod lazy;
+pub(in crate::multitask) use lazy::Edge as LazyDonationEdge;
 
 /// The ledger leaf with every lazily published own-funded edge already inserted,
 /// so a reader never observes less than the eager protocol would have produced.
@@ -155,7 +170,6 @@ pub(super) fn release_reply_lane(donor_slot: usize, donor_id: u64, reply: u64) -
     lazy::release(donor_slot, donor_id, reply)
         || release_reply(reply, DonationNamespace::IpcReply)
 }
-static INHERITED_SYSTEM: [AtomicU8; MAX_TASK] = [const { AtomicU8::new(0) }; MAX_TASK];
 static CLASS_PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Read side of the class exclusion: claims in progress on each CPU. A count
 /// rather than a flag only so native fixtures, which run many test threads as
@@ -165,11 +179,6 @@ static CLASS_CLAIMS: [CachePadded<AtomicU32>; MAX_TRACKED_CPUS] =
 /// A claim is a bounded critical section; a publisher that waits longer than
 /// this on one is a deadlock, not contention.
 const CLASS_CLAIM_WAIT_SPINS: u64 = 1 << 28;
-const NO_BORROWED_CONTEXT: u16 = u16::MAX;
-static BORROWED_CONTEXT_OWNER: [AtomicU16; MAX_TASK] =
-    [const { AtomicU16::new(NO_BORROWED_CONTEXT) }; MAX_TASK];
-static BORROWED_CONTEXT_NAMESPACE: [AtomicU8; MAX_TASK] = [const { AtomicU8::new(0) }; MAX_TASK];
-static BORROWED_CONTEXT_REPLY: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
 
 const fn namespace_tag(namespace: DonationNamespace) -> u8 {
     match namespace {
@@ -197,18 +206,17 @@ pub(super) fn reset() {
     let mut ledger = DONATION_LEDGER.lock();
     lazy::reset();
     begin_class_publication();
-    *ledger = DonationLedger::new();
-    for inherited in &INHERITED_SYSTEM {
-        inherited.store(0, Ordering::Release);
-    }
-    for owner in &BORROWED_CONTEXT_OWNER {
-        owner.store(NO_BORROWED_CONTEXT, Ordering::Release);
-    }
-    for namespace in &BORROWED_CONTEXT_NAMESPACE {
-        namespace.store(0, Ordering::Release);
-    }
-    for reply in &BORROWED_CONTEXT_REPLY {
-        reply.store(0, Ordering::Release);
+    ledger.clear();
+    for slot in task_table::allocated_slots() {
+        let Some(task) = task_table::try_get(slot) else { continue; };
+        // ORDERING: Release resets class/context metadata before test runs resume.
+        task.inherited_system.store(0, Ordering::Release);
+        // ORDERING: Release resets borrowed context owner slot.
+        task.borrowed_ctx_owner.store(task_table::NO_BORROWED_OWNER, Ordering::Release);
+        // ORDERING: Release resets borrowed context namespace tag.
+        task.borrowed_ctx_namespace.store(0, Ordering::Release);
+        // ORDERING: Release resets borrowed context reply word.
+        task.borrowed_ctx_reply.store(0, Ordering::Release);
     }
     end_class_publication();
 }
@@ -229,7 +237,8 @@ fn basis_locked(ledger: &DonationLedger, slot: usize, id: u64) -> Option<Funding
         return Some(FundingBasis { donor_slot: slot, donor_id: id,
             root_slot: slot, root_id: id, source: None });
     };
-    let tag = BORROWED_CONTEXT_NAMESPACE.get(slot)?.load(Ordering::Acquire);
+    // ORDERING: Acquire pairs with Release context token stores.
+    let tag = task_table::try_get(slot)?.borrowed_ctx_namespace.load(Ordering::Acquire);
     let namespace = match tag { 1 => DonationNamespace::IpcReply,
         2 => DonationNamespace::PagerFault, _ => return None };
     let entry = ledger.entries[ledger.find_reply(reply, namespace)?]?;
@@ -280,7 +289,7 @@ fn reserve_locked(
     priority_donated: bool,
     funding: Option<FundingBasis>,
 ) -> bool {
-    if context_owner_slot >= MAX_TASK {
+    if task_table::try_get(context_owner_slot).is_none() {
         return false;
     }
     if ledger.find_reservation(donor_task_id).is_some() {
@@ -480,7 +489,7 @@ fn bind_reserved_locked(
     receiver_task_id: u64,
     receiver_slot: usize,
 ) -> bool {
-    if reply == 0 || donor_task_id == receiver_task_id || receiver_slot >= MAX_TASK {
+    if reply == 0 || donor_task_id == receiver_task_id || task_table::try_get(receiver_slot).is_none() {
         return false;
     }
     if let Some(index) = ledger.find_reply(reply, namespace) {
@@ -529,8 +538,8 @@ fn upsert_locked(
 ) -> bool {
     if reply == 0
         || donor_task_id == receiver_task_id
-        || receiver_slot >= MAX_TASK
-        || context_owner_slot >= MAX_TASK
+        || task_table::try_get(receiver_slot).is_none()
+        || task_table::try_get(context_owner_slot).is_none()
     {
         return false;
     }
@@ -657,9 +666,9 @@ pub(super) fn release_task(task_id: u64) {
 
 #[inline]
 pub(super) fn inherited_system(slot: usize) -> bool {
-    INHERITED_SYSTEM
-        .get(slot)
-        .is_some_and(|inherited| inherited.load(Ordering::Acquire) != 0)
+    task_table::try_get(slot)
+        // ORDERING: Acquire pairs with increment/decrement Release under class exclusion.
+        .is_some_and(|task| task.inherited_system.load(Ordering::Acquire) != 0)
 }
 
 pub(super) fn class_publication_sequence() -> u64 {
@@ -751,27 +760,37 @@ pub(super) fn publish_base_class(effect: impl FnOnce()) {
 #[inline]
 #[cfg(test)]
 pub(super) fn borrowed_context_owner_slot(slot: usize) -> Option<usize> {
-    let encoded = BORROWED_CONTEXT_OWNER.get(slot)?.load(Ordering::Acquire);
-    (encoded != NO_BORROWED_CONTEXT).then_some(usize::from(encoded))
+    // ORDERING: Acquire observes Release publication of borrowed context owner/reply.
+    let encoded = task_table::try_get(slot)?.borrowed_ctx_owner.load(Ordering::Acquire);
+    (encoded != task_table::NO_BORROWED_OWNER).then_some(encoded as usize)
 }
 
 #[inline]
 pub(super) fn borrowed_context_charge_token(slot: usize) -> Option<(usize, u64)> {
-    let reply = BORROWED_CONTEXT_REPLY.get(slot)?.load(Ordering::Acquire);
+    let task = task_table::try_get(slot)?;
+    // ORDERING: Acquire observes Release store of reply word before owner load.
+    let reply = task.borrowed_ctx_reply.load(Ordering::Acquire);
     if reply == 0 {
         return None;
     }
-    let encoded = BORROWED_CONTEXT_OWNER.get(slot)?.load(Ordering::Acquire);
-    (encoded != NO_BORROWED_CONTEXT).then_some((usize::from(encoded), reply))
+    // ORDERING: Acquire observes owner slot written prior to reply publication.
+    let encoded = task.borrowed_ctx_owner.load(Ordering::Acquire);
+    (encoded != task_table::NO_BORROWED_OWNER).then_some((encoded as usize, reply))
 }
 
 pub(super) fn live_len() -> usize {
     locked().len
 }
 
+#[cfg(test)]
+pub(super) fn capacity() -> usize {
+    locked().entries.len()
+}
+
 fn increment_receiver(slot: usize) {
     begin_class_publication();
-    let previous = INHERITED_SYSTEM[slot].fetch_add(1, Ordering::Release);
+    // ORDERING: Release publishes increased inherited_system count after class exclusion.
+    let previous = task_table::get(slot).inherited_system.fetch_add(1, Ordering::Release);
     assert!(
         previous != u8::MAX,
         "scheduler donation receiver count overflow"
@@ -781,7 +800,8 @@ fn increment_receiver(slot: usize) {
 
 fn decrement_receiver(slot: usize) {
     begin_class_publication();
-    let previous = INHERITED_SYSTEM[slot].fetch_sub(1, Ordering::Release);
+    // ORDERING: Release publishes decreased inherited_system count after class exclusion.
+    let previous = task_table::get(slot).inherited_system.fetch_sub(1, Ordering::Release);
     assert!(previous != 0, "scheduler donation receiver count underflow");
     end_class_publication();
 }
@@ -813,10 +833,12 @@ fn publish_charge_token(
         reply != 0,
         "borrowed scheduling context requires a live reply"
     );
-    let encoded = u16::try_from(context_owner_slot).expect("context owner slot exceeds u16");
-    BORROWED_CONTEXT_OWNER[receiver_slot].store(encoded, Ordering::Relaxed);
-    BORROWED_CONTEXT_NAMESPACE[receiver_slot].store(namespace_tag(namespace), Ordering::Relaxed);
-    BORROWED_CONTEXT_REPLY[receiver_slot].store(reply, Ordering::Release);
+    let encoded = u32::try_from(context_owner_slot).expect("context owner slot exceeds u32");
+    let task = task_table::get(receiver_slot);
+    task.borrowed_ctx_owner.store(encoded, Ordering::Relaxed);
+    task.borrowed_ctx_namespace.store(namespace_tag(namespace), Ordering::Relaxed);
+    // ORDERING: Release publishes owner/namespace words together with non-zero reply.
+    task.borrowed_ctx_reply.store(reply, Ordering::Release);
 }
 
 fn restore_context_owner_after_release(
@@ -826,7 +848,7 @@ fn restore_context_owner_after_release(
     reply: u64,
     namespace: DonationNamespace,
 ) {
-    let encoded = u16::try_from(context_owner_slot).expect("context owner slot exceeds u16");
+    let encoded = u32::try_from(context_owner_slot).expect("context owner slot exceeds u32");
     let replacement = ledger.entries[..ledger.len]
         .iter()
         .rev()
@@ -839,19 +861,21 @@ fn restore_context_owner_after_release(
                 entry.donation.namespace,
             )
         });
-    if BORROWED_CONTEXT_OWNER[receiver_slot].load(Ordering::Relaxed) != encoded
-        || BORROWED_CONTEXT_NAMESPACE[receiver_slot].load(Ordering::Relaxed)
+    let task = task_table::get(receiver_slot);
+    if task.borrowed_ctx_owner.load(Ordering::Relaxed) != encoded
+        || task.borrowed_ctx_namespace.load(Ordering::Relaxed)
             != namespace_tag(namespace)
-        || BORROWED_CONTEXT_REPLY[receiver_slot].load(Ordering::Relaxed) != reply
+        || task.borrowed_ctx_reply.load(Ordering::Relaxed) != reply
     {
         return;
     }
     if let Some((owner_slot, reply, namespace)) = replacement {
         publish_charge_token(receiver_slot, owner_slot, reply, namespace);
     } else {
-        BORROWED_CONTEXT_OWNER[receiver_slot].store(NO_BORROWED_CONTEXT, Ordering::Relaxed);
-        BORROWED_CONTEXT_NAMESPACE[receiver_slot].store(0, Ordering::Relaxed);
-        BORROWED_CONTEXT_REPLY[receiver_slot].store(0, Ordering::Release);
+        task.borrowed_ctx_owner.store(task_table::NO_BORROWED_OWNER, Ordering::Relaxed);
+        task.borrowed_ctx_namespace.store(0, Ordering::Relaxed);
+        // ORDERING: Release clears borrowed reply after owner/namespace cleared.
+        task.borrowed_ctx_reply.store(0, Ordering::Release);
     }
 }
 
@@ -860,9 +884,15 @@ fn restore_context_owner_after_release(
 #[cfg(test)]
 pub(super) fn test_charge_publication_is_empty(slot: usize) -> bool {
     let _ledger = DONATION_LEDGER.lock();
-    BORROWED_CONTEXT_OWNER[slot].load(Ordering::Acquire) == NO_BORROWED_CONTEXT
-        && BORROWED_CONTEXT_NAMESPACE[slot].load(Ordering::Acquire) == 0
-        && BORROWED_CONTEXT_REPLY[slot].load(Ordering::Acquire) == 0
+    let Some(task) = task_table::try_get(slot) else {
+        return true;
+    };
+    // ORDERING: Acquire reads observed context words under ledger lock.
+    task.borrowed_ctx_owner.load(Ordering::Acquire) == task_table::NO_BORROWED_OWNER
+        // ORDERING: Acquire reads observed namespace word under ledger lock.
+        && task.borrowed_ctx_namespace.load(Ordering::Acquire) == 0
+        // ORDERING: Acquire reads observed reply word under ledger lock.
+        && task.borrowed_ctx_reply.load(Ordering::Acquire) == 0
 }
 
 #[cfg(test)]
@@ -955,4 +985,10 @@ mod tests {
     fn multithreaded_server_charge_tokens_restore_the_previous_live_reply() {
         owned::restore_previous();
     }
+}
+
+/// Pre-sizes the donation ledger vector when `TaskTable` grows in unmasked context.
+pub(in crate::multitask) fn ensure_capacity(slots: usize) {
+    let mut ledger = DONATION_LEDGER.lock();
+    ledger.ensure_capacity(slots);
 }

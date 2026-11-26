@@ -60,7 +60,7 @@ fn actual_publication_borrows_original_masked_scope_through_release() {
 #[test]
 fn incomplete_fifo_observation_retains_exact_prefix_and_capacity() {
     use super::super::handoff_queue::{FirstTurnHandoff, SlotHandoffQueue};
-    let mut queue: SlotHandoffQueue<2, FirstTurnHandoff> = SlotHandoffQueue::new();
+    let mut queue: SlotHandoffQueue<FirstTurnHandoff> = SlotHandoffQueue::with_capacity(2);
     let first = FirstTurnHandoff { slot: 20, task_id: 120 };
     let second = FirstTurnHandoff { slot: 21, task_id: 121 };
     assert_eq!(queue.enqueue(first), Ok(true));

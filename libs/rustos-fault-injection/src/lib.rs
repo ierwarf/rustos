@@ -23,6 +23,7 @@ pub const REGISTERED_FAULT_POINTS: &[&str] = &[
     "handle.reserve",
     "ipc.endpoint.enqueue",
     "ipc.endpoint.reply",
+    "kernel.stack.guard_fault",
     "process.spawn",
     "rootd.memory.census",
     "waitset.register",

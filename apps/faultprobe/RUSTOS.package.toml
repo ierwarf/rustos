@@ -23,3 +23,4 @@ weight_micros = 100
 logical_admin = false
 console_hosted = false
 no_display = true
+request_threads = 1200

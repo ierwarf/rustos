@@ -1,5 +1,5 @@
 use super::{
-    ConsoleSessionHandle, MAX_TASK, SchedulerDispatch, TaskContext,
+    ConsoleSessionHandle, SchedulerDispatch, TaskContext,
     align_kernel_stack_top,
 };
 use crate::memory::paging::ProcessAddressSpace;

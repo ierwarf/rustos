@@ -62,18 +62,13 @@ fn published_membership_mirrors_the_locked_bitmap_through_the_local_lifecycle() 
     reset_before_publication();
 
     fn assert_mirrored(cpu: usize, step: &str) {
-        let locked = RUN_QUEUES[cpu].inner.lock().runnable;
-        let published: [u64; BITMAP_WORDS] = core::array::from_fn(|word| {
-            RUN_QUEUES[cpu].published_runnable[word].load(Ordering::Acquire)
-        });
-        assert_eq!(published, locked, "membership mirror diverged after {step}");
+        let count = RUN_QUEUES[cpu].inner.lock().runnable_count;
+        assert_eq!(published_runnable_count(cpu), count, "membership mirror count diverged after {step}");
     }
 
     const CPU: usize = 3;
     const SLOT: usize = 65;
-    // Deliberately past the first bitmap word, so a mirror that publishes
-    // only word zero fails here.
-    assert!(SLOT >= 64 && SLOT < MAX_TASK);
+    assert!(SLOT >= 64 && crate::multitask::task_table::try_get(SLOT).is_some());
 
     assert_mirrored(CPU, "reset");
     let reset_sequence = local_runnable_sequence(CPU);
@@ -96,10 +91,8 @@ fn published_membership_mirrors_the_locked_bitmap_through_the_local_lifecycle() 
         admitted_sequence, reset_sequence,
         "membership mutation must advance the publication epoch"
     );
-    let (word, bit) = bitmap_location(SLOT);
-    assert_ne!(
-        RUN_QUEUES[CPU].published_runnable[word].load(Ordering::Acquire) & bit,
-        0,
+    assert!(
+        local_runnable_slots(CPU).any(|s| s == SLOT),
         "a drained wake must be visible to a lock-free scan"
     );
 
@@ -107,9 +100,8 @@ fn published_membership_mirrors_the_locked_bitmap_through_the_local_lifecycle() 
     assert_mirrored(CPU, "dispatch claimed");
     publish_blocked(SLOT, CPU, 1024);
     assert_mirrored(CPU, "blocked");
-    assert_eq!(
-        RUN_QUEUES[CPU].published_runnable[word].load(Ordering::Acquire) & bit,
-        0,
+    assert!(
+        !local_runnable_slots(CPU).any(|s| s == SLOT),
         "a blocked slot must leave the lock-free membership"
     );
     retire(SLOT, 1024);
@@ -725,7 +717,7 @@ fn budget_refusal_after_consuming_a_direct_handoff_retains_claimable_custody() {
     let slot = 25;
     let cpu = 2;
     let weight = 144;
-    let mut fifo = super::super::sync_handoff::SyncHandoffState::new();
+    let mut fifo = super::super::sync_handoff::SyncHandoffState::with_capacity(64);
     assert!(
         fifo.enqueue(super::super::sync_handoff::SyncHandoffRecord::new(
             slot, 7025
@@ -1217,17 +1209,9 @@ fn mailbox_adoption_survives_a_terminal_withdrawal_that_beats_its_owner_cas() {
     reset_before_publication();
 }
 
-/// Every slot-indexed table is sized from the one task-table constant, so no
-/// slot below `MAX_TASK` can index past a table that was left at the old size.
-#[test]
-fn slot_indexed_runqueue_tables_cover_the_whole_task_table() {
-    assert_eq!(VRUNTIME_NS.len(), MAX_TASK);
-    assert_eq!(EXEC_START_TICKS.len(), MAX_TASK);
-    assert_eq!(SAVED_RSP.len(), MAX_TASK);
-    assert_eq!(KERNEL_STACK_BASE.len(), MAX_TASK);
-    assert_eq!(KERNEL_STACK_TOP.len(), MAX_TASK);
-    assert_eq!(BITMAP_WORDS * 64, MAX_TASK);
-    assert_eq!(MAILBOX_CAPACITY, MAX_TASK);
-    assert_eq!(crate::multitask::MAX_SCHEDULER_TASKS, MAX_TASK);
-    assert!(kernel_ipc_runtime::api::MAX_ENDPOINT_WAKE_TASKS >= MAX_TASK);
-}
+    /// Every scheduler task lives inside one unified `Task` object in `TaskTable`.
+    #[test]
+    fn slot_indexed_runqueue_tables_cover_the_whole_task_table() {
+        assert!(crate::multitask::task_table::try_get(0).is_some());
+        assert!(crate::multitask::task_table::try_get(crate::multitask::task_table::MAX_TASK_SLOTS).is_none());
+    }

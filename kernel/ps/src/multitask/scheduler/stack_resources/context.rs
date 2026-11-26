@@ -3,11 +3,11 @@
 //! process reference transfers still require their enclosing transaction.
 
 use super::super::{ConsoleSessionHandle, ProcessHandle, TaskContext, UserAbi, UserStackState};
-use super::RESOURCES;
+use super::{resource, try_resource};
 use core::sync::atomic::Ordering;
 
 pub(in crate::multitask::scheduler) fn read(slot: usize) -> Option<TaskContext> {
-    RESOURCES.get(slot)?.with(|resources| resources.context)
+    try_resource(slot)?.with(|resources| resources.context)
 }
 
 /// Qualifies the original participant's start and funding in ONE resource leaf.
@@ -16,7 +16,7 @@ pub(in crate::multitask::scheduler) fn read(slot: usize) -> Option<TaskContext> 
 pub(in crate::multitask::scheduler) fn retained_scheduling_context(
     pin: &crate::multitask::current_identity::execution::BindingPin,
 ) -> Option<kernel_object::api::identity::ObjectIdentity> {
-    RESOURCES.get(pin.slot())?.with(|resources| {
+    try_resource(pin.slot())?.with(|resources| {
         if resources.start?.id != pin.id() { return None; }
         let context = resources.context?;
         if !context.scheduling_context.is_bound_to(pin.id()) { return None; }
@@ -30,7 +30,7 @@ pub(in crate::multitask::scheduler) fn retained_scheduling_context(
 pub(in crate::multitask::scheduler) fn retained_scheduling_context_for(
     slot: usize, id: u64,
 ) -> Option<kernel_object::api::identity::ObjectIdentity> {
-    RESOURCES.get(slot)?.with(|resources| {
+    try_resource(slot)?.with(|resources| {
         if resources.start?.id != id { return None; }
         let context = resources.context?;
         if !context.scheduling_context.is_bound_to(id) { return None; }
@@ -47,7 +47,7 @@ pub(in crate::multitask::scheduler) fn reply_custody(
     expected: kernel_object::api::identity::ObjectIdentity,
     identity_live: bool,
 ) -> Option<(bool, bool)> {
-    RESOURCES.get(slot)?.with(|r| {
+    try_resource(slot)?.with(|r| {
         if r.binding.map(|(uid, _)| uid) != Some(id) || r.start.map(|s| s.id) != Some(id) {
             return None;
         }
@@ -69,7 +69,7 @@ pub(in crate::multitask::scheduler) fn retained_architecture(
     if !(super::cpu_leases::owns_current(cpu, slot) || super::cpu_leases::owns_prepared(cpu, slot)) {
         return None;
     }
-    let cell = RESOURCES.get(slot)?;
+    let cell = try_resource(slot)?;
     cell.with(|r| architecture_locked(cell, r, slot, id, view))
 }
 
@@ -109,7 +109,7 @@ pub(in crate::multitask::scheduler) fn pin_thread_reservation_mm(
     handle: ProcessHandle,
     root: u64,
 ) -> Option<crate::multitask::process_table::MmExecutionPin> {
-    RESOURCES.get(slot)?.with(|resources| {
+    try_resource(slot)?.with(|resources| {
         if resources.closing || resources.start.map(|start| start.id) != Some(task_id) {
             return None;
         }
@@ -197,7 +197,7 @@ fn joined_current(slot: usize, current: bool) -> Option<(super::super::TaskStart
     if !current {
         return None;
     }
-    RESOURCES.get(slot)?.with(|resources| {
+    try_resource(slot)?.with(|resources| {
         let start = resources.start?;
         let context = resources.context?;
         context
@@ -217,13 +217,13 @@ pub(in crate::multitask::scheduler) fn test_mismatched_context<R>(
     struct Restore(usize, super::super::scheduling_context::SchedulingContext);
     impl Drop for Restore {
         fn drop(&mut self) {
-            RESOURCES[self.0].with(|resources| {
+            resource(self.0).with(|resources| {
                 resources.context.as_mut().unwrap().scheduling_context = self.1;
             });
         }
     }
     assert_eq!(super::super::current_identity::execution::count(slot), 0);
-    let original = RESOURCES[slot].with(|resources| {
+    let original = resource(slot).with(|resources| {
         let context = resources.context.as_mut().unwrap();
         let original = context.scheduling_context;
         context.scheduling_context = super::super::scheduling_context::SchedulingContext::bind(slot, foreign_id);
@@ -256,7 +256,8 @@ pub(super) fn install_with_reservation(
         )
         .expect("task context missing exact MM execution custody")
     });
-    RESOURCES[slot].with(|resources| {
+    let cell = resource(slot);
+    cell.with(|resources| {
         assert_eq!(
             resources.reservation, reservation,
             "foreign slot context installation"
@@ -275,7 +276,7 @@ pub(super) fn install_with_reservation(
             "task context replaced without teardown"
         );
         assert_eq!(
-            RESOURCES[slot].pins.load(Ordering::Acquire),
+            cell.pins.load(Ordering::Acquire),
             0,
             "task context installed over execution/frame custody"
         );
@@ -302,7 +303,7 @@ pub(in crate::multitask::scheduler) fn replace_exec_mm(
         "foreign exec MM execution pin"
     );
     let mut incoming = Some(incoming);
-    let old = RESOURCES[slot].with(|resources| {
+    let old = resource(slot).with(|resources| {
         super::super::outgoing_image::assert_mutable(slot);
         assert!(
             resources.frame_writing
@@ -327,11 +328,12 @@ pub(in crate::multitask::scheduler) fn test_capture_activation(
     slot: usize,
     cpu: usize,
 ) -> Option<Option<super::activation::ActivationCredential>> {
-    RESOURCES.get(slot)?.with(|resources| super::activation::capture(resources, slot, cpu))
+    try_resource(slot)?.with(|resources| super::activation::capture(resources, slot, cpu))
 }
 
 pub(in crate::multitask::scheduler) fn clear(slot: usize) {
-    let (process_pin, mm_pin) = RESOURCES[slot].with(|resources| {
+    let cell = resource(slot);
+    let (process_pin, mm_pin) = cell.with(|resources| {
         assert!(
             !crate::multitask::current_identity::exec_intent::busy(slot),
             "context reset with cold exec intent custody"
@@ -346,7 +348,7 @@ pub(in crate::multitask::scheduler) fn clear(slot: usize) {
             "task context reset with frame writer custody"
         );
         assert_eq!(
-            RESOURCES[slot].pins.load(Ordering::Acquire),
+            cell.pins.load(Ordering::Acquire),
             0,
             "task context reset with execution/frame custody"
         );
@@ -369,7 +371,7 @@ pub(in crate::multitask::scheduler) fn replace_exec(
     console: ConsoleSessionHandle,
     stack: Option<UserStackState>,
 ) -> Option<()> {
-    RESOURCES[slot].with(|resources| {
+    resource(slot).with(|resources| {
         if super::super::outgoing_image::frozen(slot) { return None; }
         if resources.closing || resources.start.is_none_or(|start| start.id != task_id) {
             return None;
@@ -392,7 +394,7 @@ pub(in crate::multitask::scheduler) fn detach_process(
     task_id: u64,
     expected: ProcessHandle,
 ) -> Option<()> {
-    RESOURCES[slot].with(|resources| {
+    resource(slot).with(|resources| {
         if super::super::outgoing_image::frozen(slot) { return None; }
         if resources.closing || resources.start.is_none_or(|start| start.id != task_id) {
             return None;

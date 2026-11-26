@@ -577,7 +577,7 @@ pub(super) struct SchedulingContext {
     identity: ObjectIdentity,
     bound_task: u64,
     policy: Option<SchedulingContextPolicy>,
-    domain_slot: Option<u8>,
+    domain_slot: Option<u16>,
     domain_generation: Option<u32>,
 }
 
@@ -619,7 +619,7 @@ impl SchedulingContext {
         domain_slot: usize,
         domain_generation: u32,
     ) -> bool {
-        let Ok(domain_slot) = u8::try_from(domain_slot) else {
+        let Ok(domain_slot) = u16::try_from(domain_slot) else {
             return false;
         };
         let Some(slot) = self

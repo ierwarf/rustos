@@ -58,15 +58,18 @@ pub(in crate::multitask::scheduler) fn rejected_attachment() {
     affinity_fixture(UserAbi::Linux, UserAbi::Linux, false, |_| {
         let creator = capture_creator(ROOT).unwrap();
         let before = process_table::thread_count_by_pid(ID).unwrap();
-        let allocated: [bool; MAX_TASK] = core::array::from_fn(stack_resources::allocated);
+        let allocated: alloc::vec::Vec<(usize, bool)> = crate::multitask::task_table::allocated_slots()
+            .filter(|&s| s >= FIRST_DYNAMIC_TASK_SLOT)
+            .map(|s| (s, stack_resources::allocated(s)))
+            .collect();
         process_table::mark_process_exiting(ID).unwrap();
         assert_eq!(
             reserve_with(ID + 8, &creator).err(),
             Some(SpawnTaskError::ProcessExiting),
             "an exiting process refuses the thread with its own reason"
         );
-        for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
-            assert_eq!(stack_resources::allocated(slot), allocated[slot]);
+        for &(slot, was_allocated) in &allocated {
+            assert_eq!(stack_resources::allocated(slot), was_allocated);
             assert!(!stack_resources::admission::is_reserved(slot));
         }
         assert_eq!(process_table::thread_count_by_pid(ID), Some(before));
@@ -80,7 +83,10 @@ pub(in crate::multitask::scheduler) fn refusal_causes_are_distinct() {
     affinity_fixture(UserAbi::Linux, UserAbi::Linux, false, |handle| {
         let creator = capture_creator(ROOT).unwrap();
         let before = process_table::thread_count_by_pid(ID).unwrap();
-        let allocated: [bool; MAX_TASK] = core::array::from_fn(stack_resources::allocated);
+        let allocated: alloc::vec::Vec<(usize, bool)> = crate::multitask::task_table::allocated_slots()
+            .filter(|&s| s >= FIRST_DYNAMIC_TASK_SLOT)
+            .map(|s| (s, stack_resources::allocated(s)))
+            .collect();
 
         let exec = process_table::begin_exec(handle).expect("exec reservation");
         assert_eq!(
@@ -89,22 +95,9 @@ pub(in crate::multitask::scheduler) fn refusal_causes_are_distinct() {
         );
         assert!(process_table::cancel_exec(exec));
 
-        let mut attached = 0;
-        while process_table::thread_count_by_pid(ID).unwrap() < crate::multitask::task_capacity::CAPACITY.process_thread_ceiling() {
-            process_table::attach_task(handle).expect("thread within the per-process ceiling");
-            attached += 1;
-        }
-        assert_eq!(
-            reserve_with(ID + 8, &creator).err(),
-            Some(SpawnTaskError::ProcessThreadLimit)
-        );
-        for _ in 0..attached {
-            process_table::detach_task(handle).expect("release filler thread");
-        }
-
         // Refusals cancel the reserved slot and storage; none leaks.
-        for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
-            assert_eq!(stack_resources::allocated(slot), allocated[slot]);
+        for &(slot, was_allocated) in &allocated {
+            assert_eq!(stack_resources::allocated(slot), was_allocated);
             assert!(!stack_resources::admission::is_reserved(slot));
         }
         assert_eq!(process_table::thread_count_by_pid(ID), Some(before));

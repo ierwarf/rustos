@@ -34,16 +34,12 @@ pub fn live_process_count() -> usize {
     OCCUPIED_PROCESS_COUNT.load(Ordering::Relaxed)
 }
 
-/// Process slots the system admits until policy says otherwise. This is the
-/// boot default of the root job's `processes.max`, not a structural limit: the
-/// slot storage is chunked and grows on demand up to `slot_dir::SLOT_CEILING`.
-/// Derived from the task table by
-/// `task_capacity::TaskCapacity::root_process_ceiling` (a quarter of it), which
-/// is the only definition. Each process also owns one kernel stack per thread,
-/// so the kernel heap, not this number, bounds how many can be live on a small
-/// machine.
-static PROCESS_LIMIT: AtomicUsize =
-    AtomicUsize::new(super::task_capacity::CAPACITY.root_process_ceiling());
+/// Process slots the system admits until policy says otherwise: the directory
+/// ceiling `slot_dir::SLOT_CEILING` unless narrowed by the root Job's
+/// `processes.max`. Each process also owns per-thread kernel memory (`Task` +
+/// demand-committed kernel stack), so physical/virtual memory and Job limits
+/// bound total processes and threads rather than an arbitrary table ratio.
+static PROCESS_LIMIT: AtomicUsize = AtomicUsize::new(0);
 /// Deferred reap handles held before the reaper falls back to a full scan.
 const REAP_QUEUE_CAPACITY: usize = 64;
 /// Processes reclaimed per table-lock hold by the reaper.
@@ -53,7 +49,11 @@ const REAP_SCAN_STRIDE: usize = 256;
 
 /// The admitted number of process slots (the root job's `processes.max`).
 pub fn process_limit() -> usize {
-    PROCESS_LIMIT.load(Ordering::Relaxed)
+    match PROCESS_LIMIT.load(Ordering::Relaxed) {
+        // Never narrowed by policy: the structural process directory ceiling.
+        0 => SLOT_CEILING,
+        limit => limit,
+    }
 }
 
 /// Sets the admitted number of process slots, clamped to what the slot storage
@@ -773,19 +773,16 @@ pub fn attach_task(handle: ProcessHandle) -> Result<(), super::SpawnTaskError> {
         if object.exec_in_progress {
             return Err(Refusal::ProcessExecInProgress);
         }
-        if object.thread_count >= super::task_capacity::CAPACITY.process_thread_ceiling() {
-            return Err(Refusal::ProcessThreadLimit);
-        }
         object.job.index()
     };
-    // The per-process ceiling above is structural; this is the job's threads
-    // limit, checked against every ancestor under the same lock as the count.
+    // Admission checks only Job policy (`threads.max`) across every ancestor
+    // and `Class::Thread` kernel memory below; no fixed per-process thread cap.
     if !table.admits_thread(job_index) {
         return Err(Refusal::JobThreadLimit);
     }
     let object = table.lookup_object_mut(handle).ok_or(Refusal::ProcessExiting)?;
-    let ref_count = object.ref_count.checked_add(1).ok_or(Refusal::ProcessThreadLimit)?;
-    let thread_count = object.thread_count.checked_add(1).ok_or(Refusal::ProcessThreadLimit)?;
+    let ref_count = object.ref_count.checked_add(1).ok_or(Refusal::JobThreadLimit)?;
+    let thread_count = object.thread_count.checked_add(1).ok_or(Refusal::JobThreadLimit)?;
     // Bill the stack to the process's Job; a Job at its thread-memory budget
     // refuses the thread with its own reason (a memory, not a count, limit).
     // Lock-free.
@@ -1991,9 +1988,10 @@ pub(crate) mod tests {
         wait_for_child, ExecReservation, LockClass, ProcessHandle, ProcessObject, ProcessTable,
         WaitResult, live_process_identity, pin_owner, process_limit, set_process_limit,
     };
-    /// The task-capacity authority's values, read here rather than restated.
-    const ROOT_PROCESS_LIMIT: usize = super::super::task_capacity::CAPACITY.root_process_ceiling();
-    const THREAD_CEILING: usize = super::super::task_capacity::CAPACITY.process_thread_ceiling();
+    /// Structural process directory ceiling for test fixture resets.
+    fn root_process_limit() -> usize {
+        SLOT_CEILING
+    }
     use crate::multitask::slot_dir::{SLOT_CEILING, SLOT_CHUNK};
     use crate::memory::paging::ProcessAddressSpace;
     use crate::user::process_state::UserProcessState;
@@ -2424,19 +2422,21 @@ pub(crate) mod tests {
     }
     impl Drop for ProcessLimitGuard {
         fn drop(&mut self) {
-            set_process_limit(ROOT_PROCESS_LIMIT);
+            set_process_limit(root_process_limit());
         }
     }
 
     #[test]
-    fn the_default_limit_still_admits_exactly_the_boot_default_of_processes() {
+    fn process_limit_defaults_to_directory_ceiling_and_enforces_narrowed_limit() {
         let _isolation = isolate_process_table();
-        for pid in 0..ROOT_PROCESS_LIMIT as u64 {
+        assert_eq!(process_limit(), SLOT_CEILING);
+        let _limit = ProcessLimitGuard::raise(16);
+        for pid in 0..16_u64 {
             create_process(10_000 + pid, new_state()).expect("a slot below the limit");
         }
         assert!(
             create_process(99_999, new_state()).is_none(),
-            "the 33rd process is refused at the default limit"
+            "the 17th process is refused at the configured limit"
         );
     }
 
@@ -2505,7 +2505,7 @@ pub(crate) mod tests {
     #[test]
     fn the_limit_is_clamped_to_the_storage_ceiling_and_never_zero() {
         let _isolation = isolate_process_table();
-        let _limit = ProcessLimitGuard::raise(ROOT_PROCESS_LIMIT);
+        let _limit = ProcessLimitGuard::raise(root_process_limit());
         assert_eq!(set_process_limit(usize::MAX), SLOT_CEILING);
         assert_eq!(set_process_limit(0), 1);
         assert_eq!(process_limit(), 1);
@@ -2722,42 +2722,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn one_process_cannot_consume_the_global_task_table() {
+    fn one_process_is_not_capped_by_a_fixed_per_process_thread_ceiling() {
         let _guard = lock_process_table_for_tests();
         let handle = create_process(45, new_state()).expect("process handle");
-        for _ in 1..THREAD_CEILING {
-            attach_task(handle).expect("thread within per-process ceiling");
+        // Previously fixed at PROCESS_THREAD_LIMIT=512; attaching >600 threads
+        // to one process succeeds when Job/memory budgets allow it.
+        let target_threads = 640_usize;
+        for _ in 1..target_threads {
+            attach_task(handle).expect("thread without fixed per-process ceiling");
         }
-        assert_eq!(
-            thread_count_by_pid(45),
-            Some(THREAD_CEILING)
-        );
-        assert_eq!(attach_task(handle), Err(SpawnTaskError::ProcessThreadLimit));
-        // An exiting thread frees exactly one slot, and only one.
+        assert_eq!(thread_count_by_pid(45), Some(target_threads));
         detach_task(handle).expect("a thread exits");
-        assert_eq!(
-            thread_count_by_pid(45),
-            Some(THREAD_CEILING - 1)
-        );
-        attach_task(handle).expect("the freed slot is reusable");
-        assert_eq!(attach_task(handle), Err(SpawnTaskError::ProcessThreadLimit));
-
-        for _ in 0..THREAD_CEILING {
+        assert_eq!(thread_count_by_pid(45), Some(target_threads - 1));
+        attach_task(handle).expect("the freed ref is reusable");
+        for _ in 0..target_threads {
             detach_task(handle).expect("detach admitted thread");
         }
         assert_eq!(reap_exited_processes(), 1);
-    }
-
-    #[test]
-    fn the_thread_ceiling_covers_a_browser_and_never_exceeds_half_the_task_table() {
-        // A multi-process browser's main process runs tens of threads plus worker
-        // pools; the ceiling must leave service and helper slots for the rest.
-        let capacity = super::super::task_capacity::CAPACITY;
-        assert!(THREAD_CEILING >= 128);
-        assert!(THREAD_CEILING * 2 <= capacity.total_slots());
-        // The root job admits a browser's process tree beside the boot services.
-        assert!(ROOT_PROCESS_LIMIT >= 64);
-        assert!(ROOT_PROCESS_LIMIT <= capacity.total_slots());
     }
 
     #[test]

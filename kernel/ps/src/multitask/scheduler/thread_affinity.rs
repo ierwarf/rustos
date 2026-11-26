@@ -5,7 +5,7 @@
 //! Failure: untouched refusal releases pins; effects retain existing cohort poison custody.
 //! Forbidden: directory fallback, copied identity as a lifetime grant or affinity as a blocked wake.
 //! Evidence: shared physical Ticket/binding/MM/queue witnesses; no cold or hardware equivalence.
-use super::{AffinityCommit, AffinityError, MAX_TASK, runqueue, stack_resources};
+use super::{AffinityCommit, AffinityError, runqueue, stack_resources};
 use crate::multitask::{current_identity as identity, process_table::ProcessHandle};
 use crate::user::abi::UserAbi;
 use core::marker::PhantomData;
@@ -44,7 +44,7 @@ impl Grant {
         } else {
             // Copies discover a candidate only. The exact physical cohort below
             // joins descriptor UID/resource binding before any context/mask use.
-            (0..MAX_TASK)
+            crate::multitask::task_table::active_slots()
                 .find(|&slot| {
                     stack_resources::task_start::read(slot).is_some_and(|start| start.id == id)
                         && stack_resources::context::read(slot)

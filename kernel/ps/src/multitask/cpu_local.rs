@@ -30,7 +30,7 @@ type CpuFlag = CachePadded<AtomicBool>;
 const fn slot_word(value: usize) -> CpuSlot { CachePadded::new(AtomicUsize::new(value)) }
 const fn flag_word(value: bool) -> CpuFlag { CachePadded::new(AtomicBool::new(value)) }
 
-use super::MAX_SCHEDULER_TASKS;
+use super::task_table::MAX_TASK_SLOTS;
 // ORDERING: This is a one-way scheduler publication. Interrupt leaves need
 // only know whether the fully initialized scheduler may be entered; taking the
 // global lock merely to read its root slot doubled every SMP timer/IPI
@@ -114,11 +114,11 @@ impl CpuSwitchPublication {
             "scheduler CPU exceeds publication capacity"
         );
         assert!(
-            from < MAX_SCHEDULER_TASKS,
+            from < MAX_TASK_SLOTS,
             "outgoing scheduler slot exceeds capacity"
         );
         assert!(
-            to < MAX_SCHEDULER_TASKS,
+            to < MAX_TASK_SLOTS,
             "incoming scheduler slot exceeds capacity"
         );
         Self {
@@ -223,7 +223,7 @@ pub(super) fn publish_cpu_current_task(image: &super::scheduler::bootstrap::Init
     let logical_index = image.cpu();
     let slot = image.slot();
     assert!(
-        logical_index < CURRENT_TASK_SLOTS.len() && slot < MAX_SCHEDULER_TASKS,
+        logical_index < CURRENT_TASK_SLOTS.len() && slot < MAX_TASK_SLOTS,
         "scheduler invariant: invalid per-CPU current-task publication"
     );
     // ORDERING: Acquire rejects duplicate publication of an active CPU slot.
@@ -330,7 +330,7 @@ fn scheduler_current_task_scratch_for_cpu(logical_index: usize) -> usize {
 #[inline]
 pub(in crate::multitask) fn set_scheduler_current_task_scratch_for_cpu(logical_index: usize, slot: usize) {
     assert!(
-        logical_index < SCHEDULER_CURRENT_TASK_SCRATCH.len() && slot < MAX_SCHEDULER_TASKS,
+        logical_index < SCHEDULER_CURRENT_TASK_SCRATCH.len() && slot < MAX_TASK_SLOTS,
         "scheduler invariant: invalid CPU-local dispatch scratch publication"
     );
     // ORDERING: see `scheduler_current_task_scratch_for_cpu`; this local
@@ -786,7 +786,7 @@ mod tests {
         let _serial = test_publication_lock();
         let inactive_cpu = nucleus_core::util::lockdep::MAX_TRACKED_CPUS - 2;
         let active_cpu = nucleus_core::util::lockdep::MAX_TRACKED_CPUS - 1;
-        let retained_slot = super::MAX_SCHEDULER_TASKS - 3;
+        let retained_slot = super::MAX_TASK_SLOTS - 3;
         let _inactive = install_test_transition_owner_with_admission(
             inactive_cpu,
             retained_slot - 1,
@@ -860,8 +860,8 @@ mod tests {
     fn guard_switch_publishes_outgoing_transition_before_current_slot() {
         let _serial = test_publication_lock();
         let logical_index = nucleus_core::util::lockdep::MAX_TRACKED_CPUS - 1;
-        let outgoing_slot = super::MAX_SCHEDULER_TASKS - 7;
-        let incoming_slot = super::MAX_SCHEDULER_TASKS - 6;
+        let outgoing_slot = super::MAX_TASK_SLOTS - 7;
+        let incoming_slot = super::MAX_TASK_SLOTS - 6;
         let publication = install_test_current_owner(logical_index, outgoing_slot);
 
         CpuSwitchPublication {

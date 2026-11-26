@@ -239,7 +239,7 @@ fn memlock_limit() -> Result<u64, i64> {
     let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_PRLIMIT64);
     request.flags = linux_abi::RLIMIT_MEMLOCK;
     request.mask = 0x2;
-    let payload = call_syscalld_payload(request, LINUX_RLIMIT_SIZE)?;
+    let payload = call_syscalld_payload(&request, LINUX_RLIMIT_SIZE)?;
     Ok(u64::from_le_bytes(payload[..8].try_into().unwrap()))
 }
 
@@ -544,7 +544,7 @@ fn syscalld_vma_covers_range(start: u64, len: u64) -> bool {
     request.arg0 = start;
     request.arg1 = len;
     request.flags = linux_abi::MADV_DONTNEED | (1_u64 << 63);
-    call_syscalld(request)
+    call_syscalld(&request)
         .and_then(|response| ensure_empty_syscalld_response(&response))
         .is_ok()
 }

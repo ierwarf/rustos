@@ -209,12 +209,25 @@ fn futex_wake_count_follows_linux_int_semantics() {
 
 #[test]
 fn futex_waiter_table_covers_every_scheduler_task_and_never_reports_ebusy() {
-    assert!(FUTEX_WAITERS_CAPACITY >= multitask::MAX_SCHEDULER_TASKS);
     let key = FutexKey::Private {
         mm_generation: 1,
         address_space_root: 0x1000,
         uaddr: 0x2000,
     };
+    let mut dynamic = FutexWaiterTable::new();
+    for id in 10_000..11_500_u64 {
+        assert_eq!(
+            dynamic.insert(FutexWaiter {
+                key,
+                task_id: id,
+                bitset: linux_abi::FUTEX_BITSET_MATCH_ANY,
+            }),
+            Ok(())
+        );
+    }
+    for id in 10_000..11_500_u64 {
+        assert!(dynamic.take_task(id));
+    }
     let waiter = |task_id| FutexWaiter {
         key,
         task_id,
@@ -268,7 +281,6 @@ fn thread_spawn_refusals_have_distinct_stages_and_faithful_errnos() {
         (E::NoFreeTaskSlot, 11, LINUX_EAGAIN),
         (E::MemoryQuota, 13, LINUX_ENOMEM),
         (E::ThreadStackAllocation, 14, LINUX_ENOMEM),
-        (E::ProcessThreadLimit, 15, LINUX_EAGAIN),
         (E::JobThreadLimit, 16, LINUX_EAGAIN),
         (E::JobThreadMemory, 17, LINUX_ENOMEM),
         (E::ProcessExiting, 18, LINUX_EAGAIN),
@@ -278,21 +290,21 @@ fn thread_spawn_refusals_have_distinct_stages_and_faithful_errnos() {
         (E::ThreadMaterializationFailed, 22, LINUX_EAGAIN),
         (E::ProcessLimit, 23, LINUX_EAGAIN),
     ];
+    let capacity = multitask::TaskCapacity::new(16384, 16384, 16 * 1024, 256 * 1024);
     for (index, (reason, stage, errno)) in table.iter().copied().enumerate() {
         assert_eq!(clone_spawn_refusal_stage(reason), stage, "{reason:?}");
         assert_eq!(process_spawn_error_to_linux_errno(reason), errno, "{reason:?}");
         for (other, other_stage, _) in table.iter().copied().skip(index + 1) {
             assert_ne!(stage, other_stage, "{reason:?} and {other:?} share a stage");
         }
-        // The log's detail word names the authority limit that rejected.
+        // The log's detail word names the structural limit that rejected.
         match reason.rejecting_limit() {
             Some(limit) => assert_eq!(
-                multitask::TASK_CAPACITY.limit_value(limit),
+                capacity.limit_value(limit),
                 match limit {
-                    multitask::CapacityLimit::TaskTable => multitask::TASK_CAPACITY.total_slots() as u64,
-                    multitask::CapacityLimit::ProcessThreads => multitask::TASK_CAPACITY.process_thread_ceiling() as u64,
-                    multitask::CapacityLimit::RootProcesses => multitask::TASK_CAPACITY.root_process_ceiling() as u64,
-                    multitask::CapacityLimit::KernelStack => multitask::TASK_CAPACITY.kernel_stack_bytes() as u64,
+                    multitask::CapacityLimit::TaskDirectory => capacity.max_task_slots() as u64,
+                    multitask::CapacityLimit::ProcessDirectory => capacity.max_process_slots() as u64,
+                    multitask::CapacityLimit::KernelStack => capacity.kernel_stack_bytes() as u64,
                 }
             ),
             None => {}

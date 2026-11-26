@@ -1,8 +1,10 @@
 //! Exclusive frame byte mutation, distinct from allocation lifetime and frame
 //! publication currency. Byte authority is independent of directory borrowing;
 //! no resource leaf lock spans byte access. Exec/MM transactions remain guarded.
-use super::super::{SAVED_CONTEXT_BYTES, TASK_STACK_GUARD_BYTES, frame_publication};
-use super::{RESOURCES, cpu_leases};
+use super::super::{SAVED_CONTEXT_BYTES, frame_publication};
+#[cfg(not(rustos_boot_image))]
+use super::super::TASK_STACK_GUARD_BYTES;
+use super::{cpu_leases, resource, try_resource};
 use core::{ptr::NonNull, sync::atomic::Ordering};
 
 pub(in crate::multitask::scheduler) struct FrameWriter {
@@ -19,7 +21,7 @@ impl FrameWriter {
         intent: Option<crate::multitask::current_identity::exec_intent::Credential>,
         ticket: Option<&super::admission::Ticket>,
     ) -> Option<Self> {
-        let cell = RESOURCES.get(slot)?;
+        let cell = try_resource(slot)?;
         let cpu = current.then(nucleus_core::util::lockdep::current_cpu_index);
         // Exec refusal telemetry: only the sealed exec transaction passes an intent.
         let fail = |reason| {
@@ -78,12 +80,24 @@ impl FrameWriter {
                 _ => return fail(Why::WriterBinding),
             }
             let stack = resources.stack.as_mut()?;
-            assert!(
-                stack.len() >= TASK_STACK_GUARD_BYTES + SAVED_CONTEXT_BYTES + 64,
-                "frame writer allocation is too small"
-            );
-            let base = NonNull::new(stack.as_mut_ptr())?;
-            let len = stack.len();
+            #[cfg(rustos_boot_image)]
+            let (base_ptr, len) = {
+                assert!(
+                    stack.usable_len() >= SAVED_CONTEXT_BYTES + 64,
+                    "frame writer allocation is too small"
+                );
+                (stack.usable_base() as *mut u8, stack.usable_len())
+            };
+            #[cfg(not(rustos_boot_image))]
+            let (base_ptr, len) = {
+                let slice = stack.as_host_mut_slice();
+                assert!(
+                    slice.len() >= TASK_STACK_GUARD_BYTES + SAVED_CONTEXT_BYTES + 64,
+                    "frame writer allocation is too small"
+                );
+                (slice.as_mut_ptr(), slice.len())
+            };
+            let base = NonNull::new(base_ptr)?;
             resources.frame_writing = true;
             Some(Self {
                 slot,
@@ -108,6 +122,7 @@ impl FrameWriter {
         );
         self.stack_top()
     }
+    #[cfg(any(test, not(rustos_boot_image)))]
     fn initialize(&mut self, f: impl FnOnce(&mut [u8])) {
         // SAFETY: the exclusive writer prevents every new allocation reader,
         // replacement and teardown; acquisition checked no existing readers.
@@ -116,7 +131,7 @@ impl FrameWriter {
 }
 impl Drop for FrameWriter {
     fn drop(&mut self) {
-        let closing = RESOURCES[self.slot].with(|resources| {
+        let closing = resource(self.slot).with(|resources| {
             assert!(
                 resources.frame_writing,
                 "frame writer released without custody"
@@ -152,6 +167,7 @@ pub(super) fn with_reserved_image<R>(
     })
 }
 
+#[cfg(not(rustos_boot_image))]
 pub(super) fn initialize_reserved_storage(
     slot: usize,
     ticket: &super::admission::Ticket,

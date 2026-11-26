@@ -38,7 +38,7 @@ use rustos_user_abi::syscall::{ServiceCapability,
 use rustos_user_abi::pager::MM_BROKER_OP_SET_ANON_POLICY;
 use rustos_user_abi::syscall::{
     IPC_SERVICE_PAGERD, IPC_SERVICE_VFSD, MM_BROKER_BIND_FLAG_DEMAND, VfsBulkReadResponse,
-    VfsIpcRequest, VFS_BULK_READ_MAX_BYTES, VFS_BULK_READ_MIN_BYTES, VFS_IPC_ABI_VERSION,
+    VFS_BULK_READ_MAX_BYTES, VFS_BULK_READ_MIN_BYTES, VFS_IPC_ABI_VERSION,
     VFS_IPC_OP_BULK_READ,
 };
 use kernel_mm::api::frame_source::FrameSourceOwner;
@@ -1826,14 +1826,7 @@ fn call_remote_vfs_bulk_read(
     request.pid = client_pid;
     request.arg0 = offset;
     request.arg1 = want as u64;
-    // SAFETY: `VfsIpcRequest` is an initialized all-integer `repr(C)` wire
-    // struct; viewing it as an immutable byte slice is valid for the call.
-    let request_bytes = unsafe {
-        core::slice::from_raw_parts(
-            (&request as *const VfsIpcRequest).cast::<u8>(),
-            core::mem::size_of::<VfsIpcRequest>(),
-        )
-    };
+    let request_bytes = as_bytes(request.as_ref());
     let (response_bytes, entries) =
         ipc_ops::call_service_endpoint_with_received_entries(IPC_SERVICE_VFSD, request_bytes, 1)?;
     let Some(response) = VfsBulkReadResponse::from_bytes(&response_bytes) else {

@@ -15,8 +15,11 @@
 //!   polling fallback, or callback under the registry lock.
 //! - **Evidence:** `monotonic-deadline-lifecycle`, `scheduler-lifecycle`, and
 //!   `ui-main-loop-wakeup`.
+#[cfg(test)]
+use alloc::vec;
+use alloc::vec::Vec;
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use x86_64::instructions::{hlt, interrupts, port::Port};
 
@@ -38,7 +41,8 @@ const RTC_REG_YEAR: u8 = 0x09;
 const RTC_UPDATE_IN_PROGRESS: u8 = 1 << 7;
 const RTC_PERIODIC_INTERRUPT_ENABLE: u8 = 1 << 6;
 const RTC_TICKS_PER_SEC: u64 = 1024;
-const RTC_SLEEP_WAITER_CAPACITY: usize = 256;
+const RTC_SLEEP_INITIAL_CAPACITY: usize = 256;
+const RTC_SLEEP_READY_BATCH: usize = 64;
 const RTC_SLEEP_RENOTIFY_TICKS: u64 = 8;
 const RTC_SLEEP_UNNOTIFIED_TICK: u64 = u64::MAX;
 
@@ -79,61 +83,144 @@ struct SleepWakeNotification {
     notification_count: u32,
 }
 
+/// Published mirror of `SleepWaiterTable` occupancy/capacity so
+/// `register_sleep_waiter` preallocates backing before disabling interrupts.
+static RTC_SLEEP_CAPACITY_HINT: AtomicUsize = AtomicUsize::new(0);
+static RTC_SLEEP_COUNT_HINT: AtomicUsize = AtomicUsize::new(0);
+
 struct SleepWaiterTable {
-    slots: [Option<SleepWaiter>; RTC_SLEEP_WAITER_CAPACITY],
+    slots: Vec<Option<SleepWaiter>>,
+    len: usize,
     /// Earliest tick at which any waiter needs a (re)notification; never later
     /// than the true value. `u64::MAX` when nothing is armed.
     next_due: u64,
 }
 
 impl SleepWaiterTable {
-    const SLOT_MASK: usize = RTC_SLEEP_WAITER_CAPACITY - 1;
-
     const fn new() -> Self {
-        assert!(RTC_SLEEP_WAITER_CAPACITY.is_power_of_two());
         Self {
-            slots: [None; RTC_SLEEP_WAITER_CAPACITY],
+            slots: Vec::new(),
+            len: 0,
             next_due: u64::MAX,
         }
     }
 
     #[inline]
-    fn home_slot(task_id: u64) -> usize {
+    fn needs_grow(&self) -> bool {
+        self.slots.is_empty() || (self.len + 1) * 4 >= self.slots.len() * 3
+    }
+
+    #[inline]
+    fn slot_mask(&self) -> usize {
+        debug_assert!(self.slots.len().is_power_of_two());
+        self.slots.len() - 1
+    }
+
+    #[inline]
+    fn home_slot_for(task_id: u64, capacity: usize) -> usize {
         // Fibonacci hashing keeps sequential task IDs and IDs sharing low bits
-        // spread across the fixed-size table without storing hash metadata.
-        let shift = u64::BITS - RTC_SLEEP_WAITER_CAPACITY.ilog2();
+        // spread across the power-of-two table without storing hash metadata.
+        let shift = u64::BITS - capacity.ilog2();
         (task_id.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> shift) as usize
     }
 
-    fn insert_or_update(&mut self, waiter: SleepWaiter) -> bool {
-        self.next_due = self.next_due.min(waiter.wake_tick);
-        let home = Self::home_slot(waiter.task_id);
-        for probe in 0..RTC_SLEEP_WAITER_CAPACITY {
-            let index = (home + probe) & Self::SLOT_MASK;
-            match self.slots[index].as_mut() {
-                Some(existing) if existing.task_id == waiter.task_id => {
-                    existing.wake_tick = waiter.wake_tick;
-                    existing.last_notify_tick = RTC_SLEEP_UNNOTIFIED_TICK;
-                    existing.notification_count = 0;
-                    return true;
-                }
-                None => {
-                    self.slots[index] = Some(waiter);
-                    return true;
-                }
-                _ => {}
+    fn install_rehashed(slots: &mut [Option<SleepWaiter>], waiter: SleepWaiter) {
+        let cap = slots.len();
+        let mask = cap - 1;
+        let home = Self::home_slot_for(waiter.task_id, cap);
+        for probe in 0..cap {
+            let index = (home + probe) & mask;
+            if slots[index].is_none() {
+                slots[index] = Some(waiter);
+                return;
             }
         }
-        false
+        unreachable!("rehashed SleepWaiterTable exceeded load bound");
     }
 
-    fn snapshot_ready(
+    fn rehash_with(&mut self, mut next: Vec<Option<SleepWaiter>>) -> Vec<Option<SleepWaiter>> {
+        for waiter in self.slots.iter_mut().filter_map(Option::take) {
+            Self::install_rehashed(&mut next, waiter);
+        }
+        core::mem::replace(&mut self.slots, next)
+    }
+
+    fn insert_with_backing(
         &mut self,
-        now: u64,
-        ready: &mut [SleepWakeNotification; RTC_SLEEP_WAITER_CAPACITY],
-    ) -> usize {
+        waiter: SleepWaiter,
+        backing: &mut Option<Vec<Option<SleepWaiter>>>,
+    ) -> Result<Option<Vec<Option<SleepWaiter>>>, ()> {
+        let mut evicted = None;
+        if let Some(existing) = self.find_mut(waiter.task_id) {
+            existing.wake_tick = waiter.wake_tick;
+            existing.last_notify_tick = RTC_SLEEP_UNNOTIFIED_TICK;
+            existing.notification_count = 0;
+            self.next_due = self.next_due.min(waiter.wake_tick);
+            return Ok(None);
+        }
+        if self.needs_grow() {
+            let next = backing.take().ok_or(())?;
+            if (self.len + 1) * 4 >= next.len() * 3 {
+                *backing = Some(next);
+                return Err(());
+            }
+            evicted = Some(self.rehash_with(next));
+        }
+        let cap = self.slots.len();
+        let mask = cap - 1;
+        let home = Self::home_slot_for(waiter.task_id, cap);
+        for probe in 0..cap {
+            let index = (home + probe) & mask;
+            if self.slots[index].is_none() {
+                self.slots[index] = Some(waiter);
+                self.len += 1;
+                self.next_due = self.next_due.min(waiter.wake_tick);
+                return Ok(evicted);
+            }
+        }
+        Err(())
+    }
+
+    #[cfg(test)]
+    fn insert_or_update(&mut self, waiter: SleepWaiter) -> bool {
+        let mut backing = if self.needs_grow() {
+            let next_cap = if self.slots.is_empty() {
+                RTC_SLEEP_INITIAL_CAPACITY
+            } else {
+                self.slots.len() * 2
+            };
+            Some(vec![None; next_cap])
+        } else {
+            None
+        };
+        let _ = self.insert_with_backing(waiter, &mut backing);
+        true
+    }
+
+    fn find_mut(&mut self, task_id: u64) -> Option<&mut SleepWaiter> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let cap = self.slots.len();
+        let mask = cap - 1;
+        let home = Self::home_slot_for(task_id, cap);
+        for probe in 0..cap {
+            let index = (home + probe) & mask;
+            match self.slots[index] {
+                Some(ref existing) if existing.task_id == task_id => {
+                    return self.slots[index].as_mut();
+                }
+                None => return None,
+                Some(_) => {}
+            }
+        }
+        None
+    }
+
+    fn snapshot_ready(&mut self, now: u64, ready: &mut [SleepWakeNotification]) -> usize {
         let mut ready_len = 0;
         let mut next_due = u64::MAX;
+        let mut saturated = false;
         for slot in self.slots.iter_mut() {
             let Some(waiter) = slot.as_mut() else {
                 continue;
@@ -141,13 +228,17 @@ impl SleepWaiterTable {
             let first_notification = waiter.last_notify_tick == RTC_SLEEP_UNNOTIFIED_TICK;
             let retry_due = now.saturating_sub(waiter.last_notify_tick) >= RTC_SLEEP_RENOTIFY_TICKS;
             if waiter.wake_tick <= now && (first_notification || retry_due) {
-                waiter.notification_count = waiter.notification_count.saturating_add(1);
-                ready[ready_len] = SleepWakeNotification {
-                    task_id: waiter.task_id,
-                    notification_count: waiter.notification_count,
-                };
-                ready_len += 1;
-                waiter.last_notify_tick = now;
+                if ready_len < ready.len() {
+                    waiter.notification_count = waiter.notification_count.saturating_add(1);
+                    ready[ready_len] = SleepWakeNotification {
+                        task_id: waiter.task_id,
+                        notification_count: waiter.notification_count,
+                    };
+                    ready_len += 1;
+                    waiter.last_notify_tick = now;
+                } else {
+                    saturated = true;
+                }
             }
             let due = if waiter.last_notify_tick == RTC_SLEEP_UNNOTIFIED_TICK {
                 waiter.wake_tick
@@ -156,37 +247,36 @@ impl SleepWaiterTable {
             };
             next_due = next_due.min(due);
         }
-        self.next_due = next_due;
+        self.next_due = if saturated { next_due.min(now) } else { next_due };
         ready_len
     }
 
     /// Pulls an existing waiter's deadline forward to `now` without creating
     /// one. False when the task has no armed deadline.
     fn expedite(&mut self, task_id: u64, now: u64) -> bool {
-        let home = Self::home_slot(task_id);
-        for probe in 0..RTC_SLEEP_WAITER_CAPACITY {
-            let index = (home + probe) & Self::SLOT_MASK;
-            match self.slots[index].as_mut() {
-                Some(waiter) if waiter.task_id == task_id => {
-                    waiter.wake_tick = waiter.wake_tick.min(now);
-                    waiter.last_notify_tick = RTC_SLEEP_UNNOTIFIED_TICK;
-                    self.next_due = self.next_due.min(waiter.wake_tick);
-                    return true;
-                }
-                None => return false,
-                Some(_) => {}
-            }
-        }
-        false
+        let Some(waiter) = self.find_mut(task_id) else {
+            return false;
+        };
+        waiter.wake_tick = waiter.wake_tick.min(now);
+        waiter.last_notify_tick = RTC_SLEEP_UNNOTIFIED_TICK;
+        let wake_tick = waiter.wake_tick;
+        self.next_due = self.next_due.min(wake_tick);
+        true
     }
 
     fn remove_task(&mut self, task_id: u64) -> bool {
-        let home = Self::home_slot(task_id);
-        for probe in 0..RTC_SLEEP_WAITER_CAPACITY {
-            let index = (home + probe) & Self::SLOT_MASK;
+        if self.slots.is_empty() {
+            return false;
+        }
+        let cap = self.slots.len();
+        let mask = cap - 1;
+        let home = Self::home_slot_for(task_id, cap);
+        for probe in 0..cap {
+            let index = (home + probe) & mask;
             match self.slots[index] {
                 Some(waiter) if waiter.task_id == task_id => {
                     self.close_deletion_hole(index);
+                    self.len -= 1;
                     return true;
                 }
                 None => return false,
@@ -198,17 +288,19 @@ impl SleepWaiterTable {
 
     fn close_deletion_hole(&mut self, mut hole: usize) {
         self.slots[hole] = None;
-        let mut scan = (hole + 1) & Self::SLOT_MASK;
+        let cap = self.slots.len();
+        let mask = self.slot_mask();
+        let mut scan = (hole + 1) & mask;
         while let Some(waiter) = self.slots[scan] {
-            let home = Self::home_slot(waiter.task_id);
-            let scan_distance = scan.wrapping_sub(home) & Self::SLOT_MASK;
-            let hole_distance = hole.wrapping_sub(home) & Self::SLOT_MASK;
+            let home = Self::home_slot_for(waiter.task_id, cap);
+            let scan_distance = scan.wrapping_sub(home) & mask;
+            let hole_distance = hole.wrapping_sub(home) & mask;
             if hole_distance < scan_distance {
                 self.slots[hole] = Some(waiter);
                 self.slots[scan] = None;
                 hole = scan;
             }
-            scan = (scan + 1) & Self::SLOT_MASK;
+            scan = (scan + 1) & mask;
         }
     }
 }
@@ -810,36 +902,70 @@ fn register_sleep_waiter(task_id: u64, wake_tick: u64) -> bool {
     // RTC_SLEEP_WAITERS is consumed directly by the RTC interrupt handler.
     // Process context must therefore exclude that interrupt while holding the
     // spin lock; otherwise the IRQ can preempt this CPU and deadlock trying to
-    // acquire the same non-reentrant lock.
+    // acquire the same non-reentrant lock. Heap allocation happens outside the
+    // interrupt-disabled critical section.
     let waiter = SleepWaiter {
         task_id,
         wake_tick,
         last_notify_tick: RTC_SLEEP_UNNOTIFIED_TICK,
         notification_count: 0,
     };
-    #[cfg(rustos_boot_image)]
-    let inserted = interrupts::without_interrupts(|| {
-        let mut table = RTC_SLEEP_WAITERS.lock();
-        let inserted = table.insert_or_update(waiter);
-        // ORDERING: Release under the table lock; the clockevent's Acquire
-        // load either sees this deadline or scans on a later edge.
-        RTC_SLEEP_NEXT_DUE.store(table.next_due, Ordering::Release);
-        inserted
-    });
-    // Host tests have no RTC interrupt consumer, and executing CLI/STI outside
-    // ring0 is invalid. Keep the same single-lock transaction without issuing
-    // privileged instructions in a non-boot build.
-    #[cfg(not(rustos_boot_image))]
-    let inserted = RTC_SLEEP_WAITERS.lock().insert_or_update(waiter);
-    if inserted {
-        true
-    } else {
-        crate::debug::println!(
-            "rtc sleep waiter table full: task={} wake_tick={}",
-            task_id,
-            wake_tick
-        );
-        false
+    let mut backing: Option<Vec<Option<SleepWaiter>>> = None;
+    loop {
+        // ORDERING: Relaxed capacity/count hints size the preallocation outside lock.
+        let cap = RTC_SLEEP_CAPACITY_HINT.load(Ordering::Relaxed);
+        let cnt = RTC_SLEEP_COUNT_HINT.load(Ordering::Relaxed);
+        let need_cap = if cap == 0 || (cnt + 1) * 4 >= cap * 3 {
+            let mut next = cap.max(RTC_SLEEP_INITIAL_CAPACITY / 2);
+            while (cnt + 1) * 4 >= next * 3 {
+                next = match next.checked_mul(2) {
+                    Some(v) => v,
+                    None => return false,
+                };
+            }
+            next
+        } else {
+            cap
+        };
+        if backing.as_ref().is_none_or(|v| v.len() < need_cap) {
+            let mut candidate = Vec::new();
+            if candidate.try_reserve_exact(need_cap).is_err() {
+                return false;
+            }
+            candidate.resize(need_cap, None);
+            backing = Some(candidate);
+        }
+
+        #[allow(unused_mut)]
+        let mut attempt = || {
+            let mut table = RTC_SLEEP_WAITERS.lock();
+            match table.insert_with_backing(waiter, &mut backing) {
+                Ok(evicted) => {
+                    // ORDERING: Release under table lock; clockevent's Acquire sees this deadline.
+                    RTC_SLEEP_NEXT_DUE.store(table.next_due, Ordering::Release);
+                    RTC_SLEEP_CAPACITY_HINT.store(table.slots.len(), Ordering::Relaxed);
+                    RTC_SLEEP_COUNT_HINT.store(table.len, Ordering::Relaxed);
+                    Ok(evicted)
+                }
+                Err(()) => {
+                    RTC_SLEEP_CAPACITY_HINT.store(table.slots.len(), Ordering::Relaxed);
+                    RTC_SLEEP_COUNT_HINT.store(table.len, Ordering::Relaxed);
+                    Err(())
+                }
+            }
+        };
+        #[cfg(rustos_boot_image)]
+        let res = interrupts::without_interrupts(attempt);
+        #[cfg(not(rustos_boot_image))]
+        let res = attempt();
+        match res {
+            Ok(evicted) => {
+                drop(evicted);
+                drop(backing);
+                return true;
+            }
+            Err(()) => continue,
+        }
     }
 }
 
@@ -875,13 +1001,19 @@ pub fn expedite_sleep_waiter(task_id: u64) -> bool {
 /// one. A wait transaction can use the result to prove that completion did not
 /// leave stale timer authority behind for a later reuse of the same task.
 pub fn disarm_sleep_waiter(task_id: u64) -> bool {
+    let disarm = || {
+        let mut table = RTC_SLEEP_WAITERS.lock();
+        let removed = table.remove_task(task_id);
+        RTC_SLEEP_COUNT_HINT.store(table.len, Ordering::Relaxed);
+        removed
+    };
     #[cfg(rustos_boot_image)]
     {
-        interrupts::without_interrupts(|| RTC_SLEEP_WAITERS.lock().remove_task(task_id))
+        interrupts::without_interrupts(disarm)
     }
     #[cfg(not(rustos_boot_image))]
     {
-        RTC_SLEEP_WAITERS.lock().remove_task(task_id)
+        disarm()
     }
 }
 
@@ -910,41 +1042,38 @@ fn notify_ready_sleepers(
     mut wake: impl FnMut(u64) -> bool,
 ) -> bool {
     // Clockevent handlers must never spin on state owned by the interrupted
-    // context. Registration/cancellation mask interrupts while mutating the
-    // table, so a transient collision is safely retried by the next PIT/RTC
-    // edge. Expiry is only a notification: the waiter remains owned until the
-    // resumed task acknowledges it through `disarm_sleep_waiter`. Reissuing
-    // the wake on later ticks preserves the deadline as independent recovery
-    // authority if a scheduler transition is delayed or coalesced.
+    // context, and must neither allocate in IRQ context nor blow the stack.
+    // Snapshots drain in bounded 64-entry batches.
     let mut ready_tasks = [SleepWakeNotification {
         task_id: 0,
         notification_count: 0,
-    }; RTC_SLEEP_WAITER_CAPACITY];
-    let Some(ready_len) = try_snapshot_ready_sleep_waiters(waiters, now, &mut ready_tasks) else {
-        return false;
-    };
-    for notification in ready_tasks.into_iter().take(ready_len) {
-        let task_id = notification.task_id;
-        if notification.notification_count >= 128
-            && notification.notification_count.is_power_of_two()
-        {
-            crate::debug::println!(
-                "rtc: sleep waiter remains unacknowledged task={} now={} notifications={}",
-                task_id,
-                now,
-                notification.notification_count
-            );
+    }; RTC_SLEEP_READY_BATCH];
+    loop {
+        let Some(ready_len) = try_snapshot_ready_sleep_waiters(waiters, now, &mut ready_tasks)
+        else {
+            return false;
+        };
+        for notification in ready_tasks.into_iter().take(ready_len) {
+            let task_id = notification.task_id;
+            if notification.notification_count >= 128
+                && notification.notification_count.is_power_of_two()
+            {
+                crate::debug::println!(
+                    "rtc: sleep waiter remains unacknowledged task={} now={} notifications={}",
+                    task_id,
+                    now,
+                    notification.notification_count
+                );
+            }
+            let admitted = wake(task_id);
+            if !admitted && notification.notification_count.is_power_of_two() {
+                crate::debug::println!("rtc: sleep wake deferred task={task_id} now={now}");
+            }
         }
-        // Refusal is not a death certificate: original frame/CPU publication
-        // may temporarily exclude a wake. Neither refusal nor notification
-        // relinquishes this exact task's deadline; resume/cancel/retirement
-        // disarms it. In particular, no new lock is taken after the callback.
-        let admitted = wake(task_id);
-        if !admitted && notification.notification_count.is_power_of_two() {
-            crate::debug::println!("rtc: sleep wake deferred task={task_id} now={now}");
+        if ready_len < RTC_SLEEP_READY_BATCH {
+            return true;
         }
     }
-    true
 }
 
 /// `None` means the table is transiently owned by process context and the
@@ -953,7 +1082,7 @@ fn notify_ready_sleepers(
 fn try_snapshot_ready_sleep_waiters(
     waiters: &RtcSleepWaiterLock,
     now: u64,
-    ready: &mut [SleepWakeNotification; RTC_SLEEP_WAITER_CAPACITY],
+    ready: &mut [SleepWakeNotification],
 ) -> Option<usize> {
     waiters
         .try_lock()
@@ -1056,7 +1185,7 @@ mod tests {
         let mut ready = [SleepWakeNotification {
             task_id: 0,
             notification_count: 0,
-        }; RTC_SLEEP_WAITER_CAPACITY];
+        }; RTC_SLEEP_READY_BATCH];
         assert!(waiters.insert_or_update(SleepWaiter {
             task_id: 41,
             wake_tick: 10,
@@ -1098,11 +1227,11 @@ mod tests {
     #[test]
     fn sleep_waiter_hash_chain_survives_middle_and_wrapped_deletions() {
         let first = 1_u64;
-        let home = SleepWaiterTable::home_slot(first);
+        let home = SleepWaiterTable::home_slot_for(first, RTC_SLEEP_INITIAL_CAPACITY);
         let mut colliders = [first, 0, 0];
         let mut found = 1;
         for candidate in 2_u64..10_000 {
-            if SleepWaiterTable::home_slot(candidate) == home {
+            if SleepWaiterTable::home_slot_for(candidate, RTC_SLEEP_INITIAL_CAPACITY) == home {
                 colliders[found] = candidate;
                 found += 1;
                 if found == colliders.len() {
@@ -1128,9 +1257,10 @@ mod tests {
     }
 
     #[test]
-    fn sleep_waiter_full_table_can_delete_and_reuse_every_slot() {
+    fn sleep_waiter_table_grows_past_initial_capacity_and_reuses_deleted_slots() {
+        let count = 1500_u64;
         let mut waiters = SleepWaiterTable::new();
-        for task_id in 0..RTC_SLEEP_WAITER_CAPACITY as u64 {
+        for task_id in 0..count {
             assert!(waiters.insert_or_update(SleepWaiter {
                 task_id,
                 wake_tick: task_id,
@@ -1138,23 +1268,16 @@ mod tests {
                 notification_count: 0,
             }));
         }
-        assert!(!waiters.insert_or_update(SleepWaiter {
-            task_id: u64::MAX,
-            wake_tick: 0,
-            last_notify_tick: RTC_SLEEP_UNNOTIFIED_TICK,
-            notification_count: 0,
-        }));
-
-        for task_id in 0..RTC_SLEEP_WAITER_CAPACITY as u64 {
+        for task_id in 0..count {
             assert!(waiters.remove_task(task_id));
             assert!(waiters.insert_or_update(SleepWaiter {
-                task_id: task_id + RTC_SLEEP_WAITER_CAPACITY as u64,
+                task_id: task_id + count,
                 wake_tick: task_id,
                 last_notify_tick: RTC_SLEEP_UNNOTIFIED_TICK,
                 notification_count: 0,
             }));
         }
-        for task_id in RTC_SLEEP_WAITER_CAPACITY as u64..(RTC_SLEEP_WAITER_CAPACITY as u64 * 2) {
+        for task_id in count..(count * 2) {
             assert!(waiters.remove_task(task_id));
         }
     }
@@ -1206,7 +1329,7 @@ mod tests {
         let mut ready = [SleepWakeNotification {
             task_id: 0,
             notification_count: 0,
-        }; RTC_SLEEP_WAITER_CAPACITY];
+        }; RTC_SLEEP_READY_BATCH];
         {
             let mut owner = waiters.lock();
             assert!(owner.insert_or_update(SleepWaiter {
@@ -1266,7 +1389,7 @@ mod tests {
         let mut ready = [SleepWakeNotification {
             task_id: 0,
             notification_count: 0,
-        }; RTC_SLEEP_WAITER_CAPACITY];
+        }; RTC_SLEEP_READY_BATCH];
         assert!(!waiters.expedite(9, 5));
         assert!(waiters.insert_or_update(SleepWaiter {
             task_id: 9,
@@ -1289,7 +1412,7 @@ mod tests {
         let mut ready = [SleepWakeNotification {
             task_id: 0,
             notification_count: 0,
-        }; RTC_SLEEP_WAITER_CAPACITY];
+        }; RTC_SLEEP_READY_BATCH];
         assert_eq!(waiters.next_due, u64::MAX);
         for (task_id, wake_tick) in [(1, 40), (2, 10)] {
             assert!(waiters.insert_or_update(SleepWaiter {

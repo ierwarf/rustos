@@ -18,23 +18,12 @@ exec = "/apps/chrome/chrome"
 weight_micros = 1000
 console_hosted = false
 launch = "new-session"
-# Job request: what Chrome says it needs, not a machine capacity. loaderd grants
-# it exactly against the capacity it observes at launch, or refuses the launch
-# naming the limit (see "Application Job request and grant" in
-# docs/architecture/job-model.md). A browser is a process tree: browser, GPU or
-# software compositor, network and storage utilities and one renderer per site,
-# so 24 processes. The browser process alone runs tens of threads (IO, UI,
-# thread-pool workers, compositor) and each renderer 10-20. 144 threads fits
-# the 192-thread application budget a 256-slot task table leaves beside the
-# UI server's explicit request (`services/uiserver/RUSTOS.package.toml` asks for
-# 24 threads, so 192 - 24 = 168 remain for applications): 144 leaves 24 threads
-# of slack for other desktop applications while the session UI is up. On a wider
-# table the same request is a smaller fraction and leaves more room. Pages per
-# process are left to the loader's derived default (half of physical memory).
-# UNMEASURED: both numbers are reasoned headroom, not an observed need; take the
-# real peak from a KVM run and set them from that.
-request_processes = 24
-request_threads = 144
+# Job request: optional. Left out, loaderd grants its default (a quarter of the
+# thread and process budgets it derives from physical memory and the per-thread
+# kernel cost; web browsing worked with it on 2026-11-26. A declared request is
+# granted exactly or the launch is refused naming the limit (see "Application
+# Job request and grant" in docs/architecture/job-model.md); set one only to cap
+# the browser deliberately. Peak thread/process counts have not been measured.
 # Interim: RustOS has no user namespaces or setuid sandbox yet, and /data may be
 # absent, so Chrome runs unsandboxed with its profile on tmpfs.
 args = ["/apps/chrome/chrome", "--ozone-platform=wayland", "--no-sandbox", "--disable-gpu", "--js-flags=--jitless", "--disable-background-networking", "--user-data-dir=/tmp/chrome-profile", "--no-first-run", "--no-default-browser-check", "--password-store=basic", "--disable-component-update", "--disable-sync", "--disable-default-apps", "--disable-component-extensions-with-background-pages", "--disable-domain-reliability", "--metrics-recording-only", "--disable-breakpad", "--disable-features=Translate,MediaRouter,OptimizationHints", "about:blank"]

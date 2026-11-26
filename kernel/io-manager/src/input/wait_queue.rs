@@ -2,18 +2,15 @@
 // Ring0 owns only task wait registration and wake delivery. It never queues,
 // decodes, coalesces, or interprets DVM input records; inputd owns those
 // policies and their lifecycle.
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 #[cfg(all(rustos_boot_image, not(test)))]
 use x86_64::instructions::interrupts;
 
-const INPUT_WAITERS_CAPACITY: usize = crate::multitask::MAX_SCHEDULER_TASKS;
-
-static INPUT_WAITERS: TrackedSpinLock<
-    [Option<u64>; INPUT_WAITERS_CAPACITY],
-    { LockClass::InputWaiter as u8 },
-> = TrackedSpinLock::new([None; INPUT_WAITERS_CAPACITY]);
+static INPUT_WAITERS: TrackedSpinLock<Vec<u64>, { LockClass::InputWaiter as u8 }> =
+    TrackedSpinLock::new(Vec::new());
 // The capability-gated inputd ingestion worker must never compete with
 // untrusted application waiters for a finite shared slot.
 static INPUTD_INGESTION_WAITER: AtomicU64 = AtomicU64::new(0);
@@ -22,30 +19,22 @@ static INPUTD_INGESTION_WAITER: AtomicU64 = AtomicU64::new(0);
 // more; only the retire-time `disarm_input_waiter` and the wake sweep remain.
 #[cfg(test)]
 pub(crate) fn arm_input_waiter(task_id: u64) -> bool {
+    if task_id == 0 {
+        return false;
+    }
     with_input_waiters(|waiters| {
-        if waiters.contains(&Some(task_id)) {
-            return true;
+        if !waiters.contains(&task_id) {
+            waiters.push(task_id);
         }
-        for waiter in waiters.iter_mut() {
-            if waiter.is_none() {
-                *waiter = Some(task_id);
-                return true;
-            }
-        }
-        false
+        true
     })
 }
 
 pub(crate) fn disarm_input_waiter(task_id: u64) -> bool {
     with_input_waiters(|waiters| {
-        let mut removed = false;
-        for waiter in waiters.iter_mut() {
-            if *waiter == Some(task_id) {
-                *waiter = None;
-                removed = true;
-            }
-        }
-        removed
+        let before = waiters.len();
+        waiters.retain(|&id| id != task_id);
+        waiters.len() != before
     })
 }
 
@@ -85,26 +74,32 @@ pub(crate) fn disarm_inputd_ingestion_waiter(task_id: u64) -> bool {
 /// inspected and no device policy runs in interrupt context.
 pub(crate) fn wake_input_waiters() {
     let inputd_waiter = INPUTD_INGESTION_WAITER.swap(0, Ordering::AcqRel);
-    let mut task_ids = [0_u64; INPUT_WAITERS_CAPACITY];
-    let count = with_input_waiters(|waiters| {
-        let mut count = 0;
-        for waiter in waiters.iter_mut() {
-            if let Some(task_id) = waiter.take() {
-                task_ids[count] = task_id;
+    loop {
+        let mut batch = [0_u64; 64];
+        let count = with_input_waiters(|waiters| {
+            let mut count = 0;
+            while count < batch.len() {
+                let Some(task_id) = waiters.pop() else {
+                    break;
+                };
+                batch[count] = task_id;
                 count += 1;
             }
+            count
+        });
+        if count == 0 {
+            break;
         }
-        count
-    });
-    for task_id in task_ids.iter().take(count).copied() {
-        let _ = crate::multitask::wake_task(task_id);
+        for task_id in batch.iter().take(count).copied() {
+            let _ = crate::multitask::wake_task(task_id);
+        }
     }
     if inputd_waiter != 0 {
         let _ = crate::multitask::wake_task(inputd_waiter);
     }
 }
 
-fn with_input_waiters<R>(f: impl FnOnce(&mut [Option<u64>; INPUT_WAITERS_CAPACITY]) -> R) -> R {
+fn with_input_waiters<R>(f: impl FnOnce(&mut Vec<u64>) -> R) -> R {
     // A dependent crate's test binary links this with `cfg(test)` false, so
     // guarding `cli`/`sti` on `cfg(test)` would run them in a host process.
     // `rustos_boot_image` is the fact that decides whether we own the CPU.
@@ -135,12 +130,13 @@ mod tests {
     }
 
     #[test]
-    #[allow(
-        clippy::assertions_on_constants,
-        reason = "the mutation witness must compile a reduced capacity and fail at runtime"
-    )]
-    fn input_waiter_capacity_covers_every_scheduler_task() {
-        assert!(INPUT_WAITERS_CAPACITY >= crate::multitask::MAX_SCHEDULER_TASKS);
+    fn input_waiter_queue_scales_past_legacy_slot_limits() {
+        for i in 0..1500_u64 {
+            assert!(arm_input_waiter(10_000 + i));
+        }
+        for i in 0..1500_u64 {
+            assert!(disarm_input_waiter(10_000 + i));
+        }
     }
 }
 // RING3-MIGRATION-REFERENCE END: DVM input wake substrate.

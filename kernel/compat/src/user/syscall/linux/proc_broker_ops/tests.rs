@@ -462,7 +462,7 @@ fn thread_spawn_memory_failures_are_enomem_and_limits_are_eagain() {
     for memory in [E::ThreadStackAllocation, E::JobThreadMemory] {
         assert_eq!(process_spawn_error_to_linux_errno(memory), LINUX_ENOMEM, "{memory:?}");
     }
-    for limit in [E::ProcessLimit, E::ProcessThreadLimit, E::JobThreadLimit, E::ProcessExiting, E::ProcessExecInProgress] {
+    for limit in [E::ProcessLimit, E::JobThreadLimit, E::ProcessExiting, E::ProcessExecInProgress] {
         assert_eq!(process_spawn_error_to_linux_errno(limit), LINUX_EAGAIN, "{limit:?}");
         assert_eq!(
             process_load_error_to_linux_errno(crate::user::process::ProcessLoadError::Spawn(limit)),

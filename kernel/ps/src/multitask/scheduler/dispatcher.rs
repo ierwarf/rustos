@@ -19,7 +19,7 @@ use super::{
     dispatch_claim::{self, DispatchFrame, FrameCapture, FrameCustody, FrameSelection, FrameSelectionError}, dispatch_policy,
     donation_ledger, frame_publication, handoff_queue::FirstTurnHandoff, local_dispatch,
     runqueue, runqueue_policy, runtime_profile, smp, sync_handoff, terminal_quarantine,
-    SchedulerDispatch, TaskRetireReason, ROOT_TASK_SLOT, MAX_TASK, MAX_LATENCY_HANDOFF_HINTS,
+    SchedulerDispatch, TaskRetireReason, ROOT_TASK_SLOT, MAX_LATENCY_HANDOFF_HINTS,
     MAX_CONSECUTIVE_LATENCY_HANDOFFS,
 };
 #[cfg(test)]
@@ -84,7 +84,7 @@ fn admitted_local_candidate(slot: usize, cpu: usize, urgency: Urgency) -> Decisi
 /// partially completed Cohort retains its original FIFO place and pending bit.
 fn first_turn(turn: &crate::multitask::cpu_local::dispatch_turn::CpuDispatchTurn<'static>, cpu: usize, atomic: bool, class_sequence: u64) -> Decision {
     if !atomic && !dispatch_policy::spawn_hints_present(cpu) { return Decision::Empty; }
-    for _ in 0..MAX_TASK {
+    for _ in 0..crate::multitask::task_table::active_task_count().max(64) {
         let front = {
             let policy = dispatch_policy::lock(cpu);
             if atomic { policy.atomic_activation_pick_hints.front() } else { policy.spawn_pick_hints.front() }

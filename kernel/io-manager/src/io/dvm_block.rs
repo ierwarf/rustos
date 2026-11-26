@@ -19,7 +19,9 @@
 // Ring0 owns only the fixed address-free queue, immutable transfer-slot
 // geometry, and launch-generation revocation. Controller policy, filesystem
 // policy, retry, timeout, and recovery remain in storaged/hostd.
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use alloc::boxed::Box;
+use core::ptr;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use driver_domain_protocol::{
     DVM_BLOCK_APERTURE_BYTES, DVM_BLOCK_COMPLETION_RING_OFFSET, DVM_BLOCK_DATA_OFFSET,
@@ -54,7 +56,9 @@ const MSIX_ENTRY_ADDRESS_HIGH_OFFSET: usize = 4;
 const MSIX_ENTRY_DATA_OFFSET: usize = 8;
 const MSIX_ENTRY_VECTOR_CONTROL_OFFSET: usize = 12;
 const MSIX_ENTRY_VECTOR_MASKED: u32 = 1;
-const WAITERS_CAPACITY: usize = crate::multitask::MAX_SCHEDULER_TASKS;
+const WAITER_CHUNK_LEN: usize = 64;
+const MAX_WAITER_CHUNKS: usize = 4096;
+type WaiterChunk = [AtomicU64; WAITER_CHUNK_LEN];
 const REGION_BYTES_OFFSET: usize = 16;
 const QUEUE_DEPTH_OFFSET: usize = 24;
 const DATA_SLOT_BYTES_OFFSET: usize = 28;
@@ -83,11 +87,152 @@ static IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static IRQ_VECTOR: AtomicU8 = AtomicU8::new(0);
 static FIRST_COMPLETION_REPORTED: AtomicBool = AtomicBool::new(false);
+struct WaiterTable {
+    chunks: [AtomicPtr<WaiterChunk>; MAX_WAITER_CHUNKS],
+    chunk_count: AtomicUsize,
+}
+
+impl WaiterTable {
+    const fn new() -> Self {
+        Self {
+            chunks: [const { AtomicPtr::new(ptr::null_mut()) }; MAX_WAITER_CHUNKS],
+            chunk_count: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline]
+    fn chunk_count(&self) -> usize {
+        // ORDERING: Acquire pairs with AcqRel CAS chunk publication in `arm_waiter_with`.
+        self.chunk_count.load(Ordering::Acquire).min(MAX_WAITER_CHUNKS)
+    }
+
+    #[inline]
+    fn chunk(&self, idx: usize) -> Option<&WaiterChunk> {
+        // ORDERING: Acquire pairs with AcqRel chunk pointer publication in `arm_waiter_with`.
+        let ptr = self.chunks.get(idx)?.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: chunks remain live for at least the lifetime of `&self`.
+        Some(unsafe { &*ptr })
+    }
+
+    fn arm(&self, task_id: u64, is_alive: impl Fn(u64) -> bool) -> bool {
+        if task_id == 0 {
+            return false;
+        }
+        loop {
+            let chunks = self.chunk_count();
+            for idx in 0..chunks {
+                let Some(chunk) = self.chunk(idx) else {
+                    continue;
+                };
+                for slot in chunk.iter() {
+                    // ORDERING: Acquire/AcqRel on waiter slots. A slot holds only a task id;
+                    // arm's CAS precedes the caller's recheck of the ring, and
+                    // block_ring_interrupt stores IRQ_PENDING (Release) before swapping slots.
+                    let existing = slot.load(Ordering::Acquire);
+                    if existing == task_id {
+                        return true;
+                    }
+                    if existing != 0 && !is_alive(existing) {
+                        // ORDERING: AcqRel CAS frees a slot whose task died.
+                        let _ = slot.compare_exchange(
+                            existing,
+                            0,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                    }
+                }
+            }
+            for idx in 0..chunks {
+                let Some(chunk) = self.chunk(idx) else {
+                    continue;
+                };
+                for slot in chunk.iter() {
+                    // ORDERING: AcqRel CAS claims a free waiter slot before ring recheck.
+                    if slot
+                        .compare_exchange(0, task_id, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+            }
+            if chunks >= MAX_WAITER_CHUNKS {
+                return false;
+            }
+            let fresh: Box<WaiterChunk> =
+                Box::new([const { AtomicU64::new(0) }; WAITER_CHUNK_LEN]);
+            // ORDERING: Relaxed initialization inside uniquely owned chunk before publication.
+            fresh[0].store(task_id, Ordering::Relaxed);
+            let raw = Box::into_raw(fresh);
+            // ORDERING: AcqRel publishes initialized chunk pointer; Acquire reads concurrent winner.
+            if self.chunks[chunks]
+                .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // ORDERING: AcqRel raises published chunk bound so scanners/wakers see this chunk.
+                self.chunk_count.fetch_max(chunks + 1, Ordering::AcqRel);
+                return true;
+            }
+            // SAFETY: lost chunk-publication race before publishing `raw`; reclaim unique allocation.
+            drop(unsafe { Box::from_raw(raw) });
+        }
+    }
+
+    fn disarm(&self, task_id: u64) -> bool {
+        let mut removed = false;
+        for idx in 0..self.chunk_count() {
+            let Some(chunk) = self.chunk(idx) else {
+                continue;
+            };
+            for slot in chunk.iter() {
+                removed |= slot
+                    // ORDERING: AcqRel CAS removes this task's registration.
+                    .compare_exchange(task_id, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok();
+            }
+        }
+        removed
+    }
+
+    fn wake_all(&self) {
+        for idx in 0..self.chunk_count() {
+            let Some(chunk) = self.chunk(idx) else {
+                continue;
+            };
+            for slot in chunk.iter() {
+                // ORDERING: AcqRel swap takes each waiter registration once.
+                let task_id = slot.swap(0, Ordering::AcqRel);
+                if task_id != 0 {
+                    let _ = crate::multitask::wake_task(task_id);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for WaiterTable {
+    fn drop(&mut self) {
+        let count = (*self.chunk_count.get_mut()).min(MAX_WAITER_CHUNKS);
+        for idx in 0..count {
+            let ptr = *self.chunks[idx].get_mut();
+            if !ptr.is_null() {
+                // SAFETY: `&mut self` owns all chunks allocated into this local table.
+                drop(unsafe { Box::from_raw(ptr) });
+            }
+        }
+    }
+}
+
 static STATE: KernelWaitLock<
     Option<DvmBlockState>,
     { nucleus_core::util::lockdep::LockClass::DvmBlockWait as u8 },
 > = KernelWaitLock::new(None);
-static WAITERS: [AtomicU64; WAITERS_CAPACITY] = [const { AtomicU64::new(0) }; WAITERS_CAPACITY];
+static WAITERS: WaiterTable = WaiterTable::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DvmBlockTicket {
@@ -1045,48 +1190,15 @@ pub(crate) fn completion_or_fault_pending() -> bool {
 }
 
 pub(crate) fn arm_waiter(task_id: u64) -> bool {
-    if task_id == 0 {
-        return false;
-    }
-    for slot in &WAITERS {
-        // ORDERING: Acquire/AcqRel on waiter slots. A slot holds only a task id; arm_waiter's CAS precedes the caller's
-        // recheck of the ring, and block_ring_interrupt stores IRQ_PENDING (Release) before swapping the slots. The no-lost-wakeup
-        // argument for that store->load pattern rests on x86 locked RMWs being full barriers (x86_64-only transport).
-        let existing = slot.load(Ordering::Acquire);
-        if existing == task_id {
-            return true;
-        }
-        if existing != 0 && !crate::multitask::is_user_task_alive(existing) {
-            // ORDERING: AcqRel CAS frees a slot whose task died; only this slot's task id changes, the id publishes no other data.
-            let _ = slot.compare_exchange(existing, 0, Ordering::AcqRel, Ordering::Acquire);
-        }
-    }
-    WAITERS.iter().any(|slot| {
-        // ORDERING: AcqRel CAS claims a free waiter slot so the interrupt's swap sees this task; the registration precedes the caller's ring recheck.
-        slot.compare_exchange(0, task_id, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    })
+    WAITERS.arm(task_id, crate::multitask::is_user_task_alive)
 }
 
 pub(crate) fn disarm_waiter(task_id: u64) -> bool {
-    let mut removed = false;
-    for slot in &WAITERS {
-        removed |= slot
-            // ORDERING: AcqRel CAS removes exactly this task's registration; no other data depends on it.
-            .compare_exchange(task_id, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-    }
-    removed
+    WAITERS.disarm(task_id)
 }
 
 fn wake_waiters() {
-    for slot in &WAITERS {
-        // ORDERING: AcqRel swap takes each waiter registration once, so one wake is delivered per registration.
-        let task_id = slot.swap(0, Ordering::AcqRel);
-        if task_id != 0 {
-            let _ = crate::multitask::wake_task(task_id);
-        }
-    }
+    WAITERS.wake_all();
 }
 
 fn block_ring_interrupt(_vector: u8) {

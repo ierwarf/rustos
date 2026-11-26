@@ -17,7 +17,7 @@ const READ_BUDGET: Duration = Duration::from_secs(4);
 /// Added per guest CPU: each costs two monitor round trips, so a fixed budget
 /// would run out on a large guest before the tables behind the registers.
 const READ_BUDGET_PER_CPU: Duration = Duration::from_millis(250);
-const MAX_TRANSCRIPT_BYTES: usize = 512 * 1024;
+const MAX_TRANSCRIPT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SYMBOL_BYTES: u64 = 32 * 1024;
 // Diagnostic adapters for the current 64-bit, cache-aligned IPC slabs. Exact
 // linked symbol sizes must agree before any handle-derived row is read.
@@ -28,29 +28,40 @@ const IPC_SLABS: &[(&str, u64, u64)] = &[
 ];
 const MAX_IPC_ROWS: usize = 64;
 const MAX_STACK_ROWS: usize = 24;
-const DIRECT_MAP_BASE: u64 = 0xffff_8000_0000_0000;
+/// First address of the kernel half. Heap chunks, `Task` objects and guarded
+/// kernel stacks all live above it and are read through the monitor's virtual
+/// `x` command (kernel mappings are shared by every address space).
+const KERNEL_HALF_BASE: u64 = 0xffff_8000_0000_0000;
+/// Newest task slots examined per snapshot; each costs one monitor round trip.
+const MAX_TASK_SCAN: usize = 256;
+const TASK_LAYOUT_VERSION: u64 = 1;
+const TASK_CHUNKS: &str = "kernel_ps::multitask::task_table::TASK_CHUNKS";
+const TASK_LAYOUT: &str = "kernel_ps::multitask::task_table::TASK_DIAGNOSTIC_LAYOUT";
 const SYMBOLS: &[&str] = &[
-    "kernel_ps::multitask::cpu_local::CURRENT_TASK_SLOTS",
-    "kernel_ps::multitask::cpu_local::TRANSITION_ACTIVE",
-    "kernel_ps::multitask::current_identity::IDENTITIES",
-    "kernel_ps::multitask::scheduler::runqueue::ownership::OWNER_WORDS",
-    "kernel_ps::multitask::scheduler::runqueue::KERNEL_STACK_BASE",
-    "kernel_ps::multitask::scheduler::runqueue::KERNEL_STACK_TOP",
-    "kernel_ps::multitask::scheduler::runqueue::wait::REASON_ID",
-    "kernel_ps::multitask::scheduler::runqueue::wait::BLOCKED_SINCE_TICKS",
-    "kernel_ps::multitask::scheduler::runqueue::wait::epoch::EPOCHS",
-    "kernel_ps::multitask::scheduler::frame_publication::OWNER_GENERATION",
-    "kernel_ps::multitask::scheduler::frame_publication::SAVED_RSP",
-    "kernel_ps::multitask::scheduler::frame_publication::FLAGS",
-    "kernel_ps::multitask::scheduler::frame_publication::VERSION",
-    "kernel_ps::multitask::scheduler::runqueue::affinity_payload::AFFINITIES",
-    "kernel_ps::multitask::scheduler::donation_ledger::CLASS_PUBLICATION_SEQUENCE",
-    "kernel_ps::multitask::scheduler::dispatch_policy::ATOMIC_ACTIVATION_PENDING",
+    TASK_CHUNKS,
+    TASK_LAYOUT,
     "kernel_hal::arch::rtc::RTC_TICKS",
     "kernel_hal::arch::rtc::RTC_TICKS_COMPLETED",
     "kernel_hal::arch::rtc::RTC_SLEEP_LOCK_MISSES",
     "kernel_hal::arch::rtc::RTC_SLEEP_WAITERS",
 ];
+
+/// Byte offsets inside a heap-allocated `Task`, exported by the kernel as
+/// `TASK_DIAGNOSTIC_LAYOUT` so this tool never guesses struct layout.
+struct TaskLayout {
+    size: u64,
+    owner: u64,
+    saved_rsp: u64,
+    stack_base: u64,
+    stack_top: u64,
+    reason_id: u64,
+}
+
+struct TaskRow {
+    slot: usize,
+    address: u64,
+    owner: u64,
+}
 
 /// Keep the original result even if the guest makes later progress. In
 /// particular, diagnostics must not re-enter readiness or publish success.
@@ -155,61 +166,128 @@ impl Monitor {
         Ok(words)
     }
 
-    /// The task-slot owner words. Each lives alone on a cache line (`RunOwnerWord`
-    /// is 64-byte aligned), so the symbol dump holds eight words per slot with the
-    /// owner first; a dump of one word per slot is already dense.
-    fn owner_words(&self) -> Result<Vec<u64>> {
-        const SLOTS: usize = 256;
-        const WORDS_PER_LINE: usize = 8;
-        let words =
-            self.words("kernel_ps::multitask::scheduler::runqueue::ownership::OWNER_WORDS")?;
-        match words.len() {
-            SLOTS | 128 => Ok(words),
-            len if len == SLOTS * WORDS_PER_LINE || len == 128 * WORDS_PER_LINE => {
-                Ok(words.into_iter().step_by(WORDS_PER_LINE).collect())
-            }
-            _ => Ok(words),
-        }
+    fn layout(&self) -> Result<TaskLayout> {
+        let words = self.words(TASK_LAYOUT)?;
+        ensure!(
+            words.len() == 9 && words[0] == TASK_LAYOUT_VERSION && words[1] == 64,
+            "task diagnostic layout changed: {words:x?}"
+        );
+        let layout = TaskLayout {
+            size: words[2],
+            owner: words[3],
+            saved_rsp: words[4],
+            stack_base: words[5],
+            stack_top: words[6],
+            reason_id: words[7],
+        };
+        ensure!(
+            [
+                layout.owner,
+                layout.saved_rsp,
+                layout.stack_base,
+                layout.stack_top,
+                layout.reason_id
+            ]
+            .iter()
+            .all(|offset| offset + 8 <= layout.size),
+            "task diagnostic offsets exceed the task size"
+        );
+        Ok(layout)
     }
 
-    fn published_stacks(&mut self) -> Result<()> {
-        let owners = self.owner_words()?;
-        let rsps = self.words("kernel_ps::multitask::scheduler::frame_publication::SAVED_RSP")?;
-        let bases = self.words("kernel_ps::multitask::scheduler::runqueue::KERNEL_STACK_BASE")?;
-        let tops = self.words("kernel_ps::multitask::scheduler::runqueue::KERNEL_STACK_TOP")?;
-        let slots = owners.len();
+    /// Reads `bytes` of kernel-half memory through the guest's own page tables.
+    fn virtual_words(&mut self, name: &str, address: u64, bytes: u64) -> Result<()> {
         ensure!(
-            (slots == 256 || slots == 128)
-                && [owners.len(), rsps.len(), bases.len(), tops.len()] == [slots; 4],
-            "incomplete kernel-stack census"
+            bytes > 0 && bytes <= MAX_SYMBOL_BYTES && address >= KERNEL_HALF_BASE,
+            "invalid snapshot virtual read"
         );
+        ensure!(
+            address.checked_add(bytes).is_some(),
+            "snapshot virtual read overflows"
+        );
+        self.transcript
+            .extend_from_slice(format!("\nSYMBOL {name}\n").as_bytes());
+        self.command(&format!("x /{}gx 0x{address:x}", bytes.div_ceil(8)))
+    }
+
+    fn word_at(&mut self, name: &str, address: u64) -> Result<u64> {
+        self.virtual_words(name, address, 8)?;
+        self.words(name)?
+            .first()
+            .copied()
+            .with_context(|| format!("monitor returned no word for {name}"))
+    }
+
+    /// Owner words of the newest `MAX_TASK_SCAN` allocated slots, newest first
+    /// (later slots are the short-lived workers). The `Task` objects are heap
+    /// allocations reached only through the published chunk directory.
+    fn task_rows(&mut self, layout: &TaskLayout) -> Result<Vec<TaskRow>> {
+        let chunks = self.words(TASK_CHUNKS)?;
+        let mut rows = Vec::new();
+        let mut skipped = 0;
+        for (chunk_idx, &chunk) in chunks.iter().enumerate().rev() {
+            if chunk == 0 {
+                continue;
+            }
+            if rows.len() >= MAX_TASK_SCAN {
+                skipped += 64;
+                continue;
+            }
+            let label = format!("TASK_CHUNK_{chunk_idx}");
+            self.virtual_words(&label, chunk, 64 * 8)?;
+            let tasks = self.words(&label)?;
+            ensure!(tasks.len() >= 64, "incomplete task chunk {chunk_idx}");
+            for (offset, &task) in tasks[..64].iter().enumerate().rev() {
+                if task == 0 {
+                    continue;
+                }
+                if rows.len() >= MAX_TASK_SCAN {
+                    skipped += 1;
+                    continue;
+                }
+                let slot = chunk_idx * 64 + offset;
+                let owner = self.word_at(&format!("TASK_{slot}_owner"), task + layout.owner)?;
+                rows.push(TaskRow {
+                    slot,
+                    address: task,
+                    owner,
+                });
+            }
+        }
+        if skipped != 0 {
+            self.transcript.extend_from_slice(
+                format!("\ntask_census=truncated scanned={} older_slots_skipped={skipped}\n", rows.len())
+                    .as_bytes(),
+            );
+        }
+        Ok(rows)
+    }
+
+    fn published_stacks(&mut self, layout: &TaskLayout, rows: &[TaskRow]) -> Result<()> {
         // Only original published usable stack bounds, never a guessed user or
         // heap address. Local frames expose retrying ready continuations that
         // the blocked-only census missed. Current needs the actual CPU RSP, not
-        // its stale saved frame. Later slots first retain short-lived workers.
-        // No unwinder follows pointers; both states share the same row budget.
-        let mut rows = 0;
-        for slot in (0..owners.len()).rev() {
-            let owner = owners[slot];
-            let label = match owner & 15 {
+        // its stale saved frame. No unwinder follows pointers; both states share
+        // the same row budget.
+        let mut emitted = 0;
+        for row in rows {
+            let label = match row.owner & 15 {
                 1 => "READY_STACK",
-                5 if (owner >> 13) & 7 != 2 => "BLOCKED_STACK",
+                5 if (row.owner >> 13) & 7 != 2 => "BLOCKED_STACK",
                 _ => continue,
             };
-            let Some((physical, size)) =
-                diagnostic_stack_range(rsps[slot], bases[slot], tops[slot])
-            else {
+            let slot = row.slot;
+            let rsp = self.word_at(&format!("TASK_{slot}_rsp"), row.address + layout.saved_rsp)?;
+            let base = self.word_at(&format!("TASK_{slot}_base"), row.address + layout.stack_base)?;
+            let top = self.word_at(&format!("TASK_{slot}_top"), row.address + layout.stack_top)?;
+            let Some((address, size)) = diagnostic_stack_range(rsp, base, top) else {
                 continue;
             };
-            if rows == MAX_STACK_ROWS {
+            if emitted == MAX_STACK_ROWS {
                 break;
             }
-            self.symbol(
-                &format!("{label}_slot_{slot}_rsp_{:x}", rsps[slot]),
-                physical,
-                size,
-            )?;
-            rows += 1;
+            self.virtual_words(&format!("{label}_slot_{slot}_rsp_{rsp:x}"), address, size)?;
+            emitted += 1;
         }
         Ok(())
     }
@@ -251,40 +329,43 @@ impl Monitor {
         Ok(Some(words))
     }
 
-    fn ipc_waits(&mut self, tables: &BTreeMap<String, (u64, u64)>) -> Result<()> {
-        let owners = self.owner_words()?;
-        let reasons = self.words("kernel_ps::multitask::scheduler::runqueue::wait::REASON_ID")?;
-        ensure!(
-            (owners.len() == 256 || owners.len() == 128) && reasons.len() == owners.len(),
-            "incomplete wait census"
-        );
+    fn ipc_waits(
+        &mut self,
+        tables: &BTreeMap<String, (u64, u64)>,
+        layout: &TaskLayout,
+        rows: &[TaskRow],
+    ) -> Result<()> {
         let mut seen = BTreeSet::new();
         // Never follow guest/heap pointers. A closed handle's low index selects
         // only a row inside an exact-size linked slab. Payload words that look
         // like message/endpoint handles are labelled raw candidates, not live
         // identities or permission to access any other guest memory.
-        for (owner, handle) in owners.into_iter().zip(reasons) {
-            if owner & 15 != 5 {
+        for row in rows {
+            if row.owner & 15 != 5 {
                 continue;
             }
-            match (owner >> 13) & 7 {
-                2 => {
-                    let _ = self.ipc_row(tables, 0, handle, &mut seen)?;
+            let kind = (row.owner >> 13) & 7;
+            if kind != 2 && kind != 3 {
+                continue;
+            }
+            let handle = self.word_at(
+                &format!("TASK_{}_reason", row.slot),
+                row.address + layout.reason_id,
+            )?;
+            if kind == 2 {
+                let _ = self.ipc_row(tables, 0, handle, &mut seen)?;
+                continue;
+            }
+            let Some(reply) = self.ipc_row(tables, 1, handle, &mut seen)? else {
+                continue;
+            };
+            for candidate in reply {
+                let Some(message) = self.ipc_row(tables, 2, candidate, &mut seen)? else {
+                    continue;
+                };
+                for endpoint_candidate in message {
+                    let _ = self.ipc_row(tables, 0, endpoint_candidate, &mut seen)?;
                 }
-                3 => {
-                    let Some(reply) = self.ipc_row(tables, 1, handle, &mut seen)? else {
-                        continue;
-                    };
-                    for candidate in reply {
-                        let Some(message) = self.ipc_row(tables, 2, candidate, &mut seen)? else {
-                            continue;
-                        };
-                        for endpoint_candidate in message {
-                            let _ = self.ipc_row(tables, 0, endpoint_candidate, &mut seen)?;
-                        }
-                    }
-                }
-                _ => {}
             }
         }
         Ok(())
@@ -362,7 +443,7 @@ pub(super) fn capture(
                         ),
                     );
                 }
-                if SYMBOLS.contains(&name) && ["B", "b", "D", "d"].contains(&kind) {
+                if SYMBOLS.contains(&name) && ["B", "b", "D", "d", "R", "r"].contains(&kind) {
                     monitor.symbol(
                         name,
                         u64::from_str_radix(address, 16)?,
@@ -376,8 +457,10 @@ pub(super) fn capture(
                 "only {captured}/{} kernel tables captured",
                 SYMBOLS.len()
             );
-            monitor.ipc_waits(&tables)?;
-            monitor.published_stacks()?;
+            let layout = monitor.layout()?;
+            let rows = monitor.task_rows(&layout)?;
+            monitor.ipc_waits(&tables, &layout, &rows)?;
+            monitor.published_stacks(&layout, &rows)?;
             Ok(())
         })();
         text.push_str(&String::from_utf8_lossy(&monitor.transcript));
@@ -403,18 +486,15 @@ fn write_capture(run_dir: &Path, mut text: String, collection: Result<()>) -> Re
 }
 
 /// A post-failure read window inside the original usable kernel-stack bounds.
-/// Never read the guard page, a user stack, or an arbitrary pointer from a frame.
+/// Stacks are guarded virtual mappings, so the window is a virtual address read
+/// through the guest's page tables. Never read the guard page, a user stack, or
+/// an arbitrary pointer from a frame.
 fn diagnostic_stack_range(rsp: u64, base: u64, top: u64) -> Option<(u64, u64)> {
-    if base < DIRECT_MAP_BASE || rsp < base || rsp >= top || rsp & 7 != 0 {
-        return None;
-    }
-    let physical = rsp.checked_sub(DIRECT_MAP_BASE)?;
-    let physical_top = top.checked_sub(DIRECT_MAP_BASE)?;
-    if physical_top > 0x1_0000_0000 {
+    if base < KERNEL_HALF_BASE || rsp < base || rsp >= top || rsp & 7 != 0 {
         return None;
     }
     let size = (top - rsp).min(1024) & !7;
-    (size != 0).then_some((physical, size))
+    (size != 0).then_some((rsp, size))
 }
 
 #[cfg(test)]
@@ -463,29 +543,51 @@ mod tests {
 
     #[test]
     fn blocked_stack_diagnostic_stays_within_original_usable_kernel_range() {
-        let base = DIRECT_MAP_BASE + 0x2000;
+        let base = KERNEL_HALF_BASE + 0x2000;
         let top = base + 0x4000;
-        assert_eq!(
-            diagnostic_stack_range(base, base, top),
-            Some((0x2000, 1024))
-        );
+        assert_eq!(diagnostic_stack_range(base, base, top), Some((base, 1024)));
         assert_eq!(
             diagnostic_stack_range(top - 8, base, top),
-            Some((0x5ff8, 8))
+            Some((top - 8, 8))
         );
         for rsp in [base - 8, base + 1, top, top + 8, 0x2000, u64::MAX] {
             assert_eq!(diagnostic_stack_range(rsp, base, top), None);
         }
+        // A stack below the kernel half is never read, whatever its saved RSP.
         assert_eq!(diagnostic_stack_range(0x2000, 0x2000, 0x6000), None);
-        assert_eq!(
-            diagnostic_stack_range(base, base, DIRECT_MAP_BASE + 0x1_0000_0008),
-            None
-        );
         assert_eq!(diagnostic_stack_range(top - 8, base, top - 1), None);
+    }
+
+    fn preload(monitor: &mut Monitor, name: &str, words: &[u64]) {
+        monitor
+            .transcript
+            .extend_from_slice(format!("\nSYMBOL {name}\n0000000000001000:").as_bytes());
+        for value in words {
+            monitor
+                .transcript
+                .extend_from_slice(format!(" 0x{value:016x}").as_bytes());
+        }
+        monitor.transcript.push(b'\n');
     }
 
     #[test]
     fn failed_probe_reads_ready_and_blocked_frames_but_not_current_or_endpoint_waiters() {
+        const CHUNK: u64 = KERNEL_HALF_BASE + 0x10_0000;
+        const TASKS: u64 = KERNEL_HALF_BASE + 0x20_0000;
+        const STACKS: u64 = KERNEL_HALF_BASE + 0x40_0000;
+        // owner, saved_rsp, stack_base, stack_top, wait_reason_id (distinct 8-byte fields).
+        const LAYOUT: [u64; 9] = [1, 64, 0x400, 0, 0x40, 0x48, 0x50, 0x58, 0x60];
+        let task = |slot: u64| TASKS + slot * 0x400;
+        let base = |slot: u64| STACKS + slot * 0x10000;
+        let mut memory = BTreeMap::new();
+        for (slot, owner) in [(0, 1), (1, 3), (2, 5 | (2 << 13)), (3, 5), (4, 7)] {
+            memory.insert(CHUNK + slot * 8, task(slot));
+            memory.insert(task(slot), owner);
+            memory.insert(task(slot) + 0x40, base(slot) + 0x1000);
+            memory.insert(task(slot) + 0x48, base(slot));
+            memory.insert(task(slot) + 0x50, base(slot) + 0x4000);
+            memory.insert(task(slot) + 0x58, 0);
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("monitor.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -502,58 +604,65 @@ mod tests {
                 if reader.read_line(&mut line).unwrap() == 0 {
                     break;
                 }
-                commands.push(line.trim().to_owned());
-                stream
-                    .write_all(b"0000000000004000: 0x0000000000000000\n(qemu) ")
+                let line = line.trim().to_owned();
+                // `x /<n>gx 0x<address>`: answer from the fake guest memory.
+                let (count, address) = line
+                    .strip_prefix("x /")
+                    .and_then(|rest| rest.split_once("gx 0x"))
+                    .map(|(count, address)| {
+                        (
+                            count.parse::<u64>().unwrap(),
+                            u64::from_str_radix(address, 16).unwrap(),
+                        )
+                    })
                     .unwrap();
+                let mut reply = String::new();
+                for word in 0..count {
+                    let address = address + word * 8;
+                    let value = memory.get(&address).copied().unwrap_or(0);
+                    reply.push_str(&format!("{address:016x}: 0x{value:016x}\n"));
+                }
+                commands.push(line);
+                stream.write_all(reply.as_bytes()).unwrap();
+                stream.write_all(b"(qemu) ").unwrap();
             }
             commands
         });
         let mut monitor = Monitor::connect(&path, 1).unwrap();
-        let base = DIRECT_MAP_BASE + 0x4000;
-        let mut owners = [0_u64; 128];
-        owners[127] = 1; // Local: a published continuation, not a live CPU RSP.
-        owners[126] = 3; // Current: its saved frame is not the actual CPU frame.
-        owners[125] = 5 | (2 << 13); // Idle endpoint wait: omit as before.
-        owners[124] = 5; // Blocked kernel continuation.
-        owners[123] = 7; // Retired/invalid ownership cannot authorize a read.
-        let mut rsps = [base; 128];
-        rsps[127] = base + 0x1000;
-        // These are explicit earlier HMP table inputs, not guest authority.
-        for (name, words) in [
-            (
-                "kernel_ps::multitask::scheduler::runqueue::ownership::OWNER_WORDS",
-                owners,
-            ),
-            (
-                "kernel_ps::multitask::scheduler::frame_publication::SAVED_RSP",
-                rsps,
-            ),
-            (
-                "kernel_ps::multitask::scheduler::runqueue::KERNEL_STACK_BASE",
-                [base; 128],
-            ),
-            (
-                "kernel_ps::multitask::scheduler::runqueue::KERNEL_STACK_TOP",
-                [base + 0x4000; 128],
-            ),
-        ] {
-            monitor
-                .transcript
-                .extend_from_slice(format!("\nSYMBOL {name}\n0000000000001000:").as_bytes());
-            for value in words {
-                monitor
-                    .transcript
-                    .extend_from_slice(format!(" 0x{value:016x}").as_bytes());
-            }
-            monitor.transcript.push(b'\n');
-        }
-        monitor.published_stacks().unwrap();
-        drop(monitor);
+        // Earlier static-symbol dumps, not guest authority.
+        preload(&mut monitor, TASK_LAYOUT, &LAYOUT);
+        let mut directory = vec![0; 4096];
+        directory[0] = CHUNK;
+        preload(&mut monitor, TASK_CHUNKS, &directory);
+        let layout = monitor.layout().unwrap();
+        let rows = monitor.task_rows(&layout).unwrap();
         assert_eq!(
-            server.join().unwrap(),
-            ["xp /128gx 0x5000", "xp /128gx 0x4000"]
+            rows.iter().map(|row| row.slot).collect::<Vec<_>>(),
+            [4, 3, 2, 1, 0]
         );
+        monitor.published_stacks(&layout, &rows).unwrap();
+        drop(monitor);
+        let commands = server.join().unwrap();
+        let stack_reads: Vec<_> = commands
+            .iter()
+            .filter(|command| command.starts_with("x /128gx"))
+            .collect();
+        assert_eq!(
+            stack_reads,
+            [
+                &format!("x /128gx 0x{:x}", base(3) + 0x1000),
+                &format!("x /128gx 0x{:x}", base(0) + 0x1000),
+            ]
+        );
+        // Current, endpoint-wait and retired slots never had a frame field read.
+        for slot in [1, 2, 4] {
+            assert!(
+                !commands
+                    .iter()
+                    .any(|command| command.ends_with(&format!("{:x}", task(slot) + 0x40))),
+                "slot {slot}"
+            );
+        }
     }
 
     #[test]
@@ -698,32 +807,5 @@ mod wide_guest_tests {
         assert!(monitor.registers(0).is_err());
         drop(monitor);
         guest.join().unwrap();
-    }
-
-    #[test]
-    fn owner_words_dumped_one_per_cache_line_are_reduced_to_one_word_per_slot() {
-        let (client, mut server) = UnixStream::pair().unwrap();
-        server.write_all(b"(qemu) ").unwrap();
-        let mut monitor = Monitor::over(client, 1).unwrap();
-        let mut dump = String::from(
-            "\nSYMBOL kernel_ps::multitask::scheduler::runqueue::ownership::OWNER_WORDS\n",
-        );
-        for line in 0..128 {
-            // The owner leads each 64-byte line; the other seven words are padding.
-            dump.push_str(&format!("{:016x}: 0x{:016x}", line * 64, line + 1));
-            for _ in 0..7 {
-                dump.push_str(" 0x0000000000000000");
-            }
-            dump.push('\n');
-        }
-        monitor.transcript.extend_from_slice(dump.as_bytes());
-        let owners = monitor.owner_words().unwrap();
-        assert_eq!(owners.len(), 128);
-        assert!(
-            owners
-                .iter()
-                .enumerate()
-                .all(|(slot, owner)| *owner == slot as u64 + 1)
-        );
     }
 }

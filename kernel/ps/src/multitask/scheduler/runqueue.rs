@@ -20,21 +20,24 @@
 //! - **Evidence:** `per-cpu-runqueue-ownership`, `scheduler-dispatch`, and
 //!   `smp-reschedule-ipi-lifecycle`.
 
-use core::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::multitask::irq_leaf::IrqLeaf;
+use crate::multitask::irq_pool::{SlabPool, SlabQueue};
+use crate::multitask::slot_dir::AtomicDir;
+use crate::multitask::task_table::{self, NO_SLOT};
 use nucleus_core::util::cache_padded::CachePadded;
 use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS};
 
-use super::{frame_publication, MAX_TASK};
-use validation::{bitmap_location, validate_cpu};
+use super::frame_publication;
+use validation::{validate_cpu, validate_slot};
 
 mod admission;
 pub(super) use admission::{admit_blocked, admit_initial};
 #[cfg(test)]
 pub(super) use admission::{admit_running};
 pub(super) mod address_space;
-pub(super) mod affinity_payload;
+pub(in crate::multitask) mod affinity_payload;
 pub(super) mod claim;
 mod return_publication;
 pub(super) use claim::{claim_validated_dispatch};
@@ -49,9 +52,9 @@ pub(super) use execution_time::{charge as charge_cpu_time, consumed as consumed_
 mod idle;
 pub(super) use idle::{is_idle as is_idle_slot, set as set_idle_slot};
 mod ipc_handoff;
-pub(super) mod simd_tls;
+pub(in crate::multitask) mod simd_tls;
 mod validation;
-pub(super) mod wait;
+pub(in crate::multitask) mod wait;
 pub(super) mod weight;
 
 #[cfg(test)]
@@ -63,7 +66,7 @@ pub(super) use ipc_handoff::{materialize_direct_handoff, publish_direct_handoff,
 mod lane;
 pub(super) use lane::lane_claim;
 
-pub(super) mod ownership;
+pub(in crate::multitask) mod ownership;
 pub(super) use ownership::{
     commit_wait, owner, owner_sequenced, set_runnable, transition, DutyKind, EnqueueDuty,
     OwnerEvent, RunOwnerSnapshot, RunOwnerState, Transition, WaitCommitOutcome,
@@ -71,80 +74,102 @@ pub(super) use ownership::{
 use ownership::{clear_wait_arm, publish_wait_arm, set_wait_armed, set_wait_reason, wake_wait_locked};
 pub(super) mod conservation;
 
-const BITMAP_WORDS: usize = MAX_TASK.div_ceil(64);
-const MAILBOX_CAPACITY: usize = MAX_TASK;
-
-/// Per-slot CFS accounting payload.
-///
-/// Queue custody and virtual-runtime accounting have different ownership
-/// lifetimes: the owner word decides where a continuation may execute, while
-/// this table survives queue migration and is read by the CPU that owns the
-/// selected local queue.  Keeping it out of `Scheduler::contexts` means a
-/// dispatch or wake does not need the monolithic scheduler payload merely to
-/// compare fair-share keys.  Slot admission initializes it before publishing
-/// any runnable owner; terminal release clears it before the slot is reused.
-///
-/// Release stores pair with Acquire readers so a CPU that observes a newly
-/// published queue owner also sees the initial key for that generation.  The
-/// compare-and-exchange updates preserve donation and accounting changes if a
-/// remote scheduling action races a local fair-share update.
-static VRUNTIME_NS: [CachePadded<AtomicU64>; MAX_TASK] =
-    [const { CachePadded::new(AtomicU64::new(0)) }; MAX_TASK];
-
-/// Per-slot execution-accounting baseline. Zero means that the slot is not
-/// currently charging a running interval.
-static EXEC_START_TICKS: [CachePadded<AtomicU64>; MAX_TASK] =
-    [const { CachePadded::new(AtomicU64::new(0)) }; MAX_TASK];
+// Per-slot CFS accounting, RSP, and kernel-stack fields live in `task_table::Task`.
 /// Per-slot saved execution-frame pointer. The owner-word generation bounds
 /// its lifetime: admission installs it before publication, only the execution
 /// owner replaces it at a trap boundary, and terminal release clears it.
-static SAVED_RSP: [CachePadded<AtomicUsize>; MAX_TASK] =
-    [const { CachePadded::new(AtomicUsize::new(0)) }; MAX_TASK];
-
-/// Immutable-for-one-generation usable kernel-stack bounds. They are written
-/// before owner publication and cleared only after terminal owner release, so
-/// frame validation and the execution owner need not consult the scheduler
-/// catalog for primary stack geometry.
-static KERNEL_STACK_BASE: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-static KERNEL_STACK_TOP: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-
-/// Per-slot temporary execution-stack bounds. Unlike the primary stack, an
-/// alternate stack may be installed and removed while its owner is running.
-/// The version makes the base/top pair an indivisible observation: odd means
-/// a writer is between the two values, and readers reject that transient range
-/// rather than accepting a mixed pair.
-static ALTERNATE_KERNEL_STACK_VERSION: [AtomicU64; MAX_TASK] =
-    [const { AtomicU64::new(0) }; MAX_TASK];
-static ALTERNATE_KERNEL_STACK_BASE: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-static ALTERNATE_KERNEL_STACK_TOP: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-
-#[derive(Clone, Copy)]
 struct RunQueueInner {
-    runnable: [u64; BITMAP_WORDS],
+    cpu: u32,
+    head: u32,
+    tail: u32,
     runnable_count: usize,
     runnable_weight: u64,
     queue_sequence: u64,
+    dirty_slots: [AtomicU32; 4],
+    dirty_len: AtomicU8,
+    full_resync: AtomicBool,
 }
 
 impl RunQueueInner {
-    const fn new() -> Self {
+    const fn new(cpu: usize) -> Self {
         Self {
-            runnable: [0; BITMAP_WORDS],
+            cpu: cpu as u32,
+            head: NO_SLOT,
+            tail: NO_SLOT,
             runnable_count: 0,
             runnable_weight: 0,
             queue_sequence: 0,
+            dirty_slots: [const { AtomicU32::new(NO_SLOT) }; 4],
+            dirty_len: AtomicU8::new(0),
+            full_resync: AtomicBool::new(false),
         }
     }
 
+    fn mark_dirty(&self, slot: u32) {
+        let len = self.dirty_len.load(Ordering::Relaxed);
+        if (len as usize) < 4 {
+            self.dirty_slots[len as usize].store(slot, Ordering::Relaxed);
+            self.dirty_len.store(len + 1, Ordering::Relaxed);
+        } else {
+            self.full_resync.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Empties the queue and clears intrusive runqueue links on queued tasks.
+    fn clear(&mut self) {
+        let mut cur = self.head;
+        while cur != NO_SLOT {
+            let task = task_table::get(cur as usize);
+            // SAFETY: exclusive `RunQueueInner` lock protects `rq_prev/next/cpu` of queued tasks.
+            let next = unsafe { *task.rq_next.get() };
+            // SAFETY: exclusive `RunQueueInner` lock owns queued links before clearing.
+            unsafe {
+                *task.rq_prev.get() = NO_SLOT;
+                *task.rq_next.get() = NO_SLOT;
+                *task.rq_cpu.get() = NO_SLOT;
+            }
+            cur = next;
+        }
+        self.head = NO_SLOT;
+        self.tail = NO_SLOT;
+        self.runnable_count = 0;
+        self.runnable_weight = 0;
+        self.queue_sequence = 0;
+        self.dirty_len.store(0, Ordering::Relaxed);
+        self.full_resync.store(true, Ordering::Relaxed);
+    }
+
     fn contains(&self, slot: usize) -> bool {
-        let (word, bit) = bitmap_location(slot);
-        self.runnable[word] & bit != 0
+        let Some(task) = task_table::try_get(slot) else {
+            return false;
+        };
+        // SAFETY: `rq_cpu` transitions between `NO_SLOT` and `self.cpu` only under `RUN_QUEUES[self.cpu].inner`.
+        unsafe { *task.rq_cpu.get() == self.cpu }
     }
 
     fn insert(&mut self, slot: usize, weight: u32) {
+        validate_slot(slot);
         assert!(!self.contains(slot), "scheduler rq duplicate slot={slot}");
-        let (word, bit) = bitmap_location(slot);
-        self.runnable[word] |= bit;
+        let task = task_table::get(slot);
+        let slot_u32 = slot as u32;
+        let tail = self.tail;
+        // SAFETY: exclusive `RunQueueInner` lock protects intrusive DLL links for tasks owned by this queue.
+        unsafe {
+            assert_eq!(
+                *task.rq_cpu.get(),
+                NO_SLOT,
+                "scheduler rq slot={slot} still linked on foreign cpu"
+            );
+            *task.rq_prev.get() = tail;
+            *task.rq_next.get() = NO_SLOT;
+            *task.rq_cpu.get() = self.cpu;
+            if tail != NO_SLOT {
+                *task_table::get(tail as usize).rq_next.get() = slot_u32;
+            } else {
+                self.head = slot_u32;
+            }
+        }
+        self.tail = slot_u32;
         self.runnable_count = self
             .runnable_count
             .checked_add(1)
@@ -156,12 +181,30 @@ impl RunQueueInner {
             .queue_sequence
             .checked_add(1)
             .expect("scheduler rq sequence exhausted");
+        self.mark_dirty(slot_u32);
     }
 
     fn remove(&mut self, slot: usize, weight: u32) {
         assert!(self.contains(slot), "scheduler rq missing slot={slot}");
-        let (word, bit) = bitmap_location(slot);
-        self.runnable[word] &= !bit;
+        let task = task_table::get(slot);
+        // SAFETY: exclusive `RunQueueInner` lock owns all DLL links on this CPU queue.
+        unsafe {
+            let prev = *task.rq_prev.get();
+            let next = *task.rq_next.get();
+            if prev != NO_SLOT {
+                *task_table::get(prev as usize).rq_next.get() = next;
+            } else {
+                self.head = next;
+            }
+            if next != NO_SLOT {
+                *task_table::get(next as usize).rq_prev.get() = prev;
+            } else {
+                self.tail = prev;
+            }
+            *task.rq_prev.get() = NO_SLOT;
+            *task.rq_next.get() = NO_SLOT;
+            *task.rq_cpu.get() = NO_SLOT;
+        }
         self.runnable_count = self
             .runnable_count
             .checked_sub(1)
@@ -173,62 +216,137 @@ impl RunQueueInner {
             .queue_sequence
             .checked_add(1)
             .expect("scheduler rq sequence exhausted");
+        self.mark_dirty(slot as u32);
     }
 }
 
 #[repr(C, align(64))]
-#[repr(align(64))]
 struct PerCpuRunQueue {
     inner: IrqLeaf<RunQueueInner, { LockClass::SchedulerRunQueue as u8 }>,
     published_load: AtomicU64,
-    /// Even/odd publication epoch bracketing the multiword runnable bitmap.
+    published_count: AtomicUsize,
+    /// Even/odd publication epoch bracketing the dense published runnable slice.
     published_sequence: AtomicU64,
-    /// Read-only mirror of `inner.runnable`, published with the load beside it.
-    ///
-    /// Every candidate scan wants the membership bitmap and nothing else, and
-    /// taking the queue lock for that copy cost a full tracked acquisition —
-    /// about 235ns — twice per dispatch, on a queue whose contents each scan
-    /// re-validates against the owner word anyway.
-    published_runnable: [AtomicU64; BITMAP_WORDS],
+    published_slots: AtomicDir<AtomicU32, 64, 4096>,
 }
 
 impl PerCpuRunQueue {
-    const fn new() -> Self {
+    const fn new(cpu: usize) -> Self {
         Self {
-            inner: IrqLeaf::new(RunQueueInner::new()),
+            inner: IrqLeaf::new(RunQueueInner::new(cpu)),
             published_load: AtomicU64::new(0),
+            published_count: AtomicUsize::new(0),
             published_sequence: AtomicU64::new(0),
-            published_runnable: [const { AtomicU64::new(0) }; BITMAP_WORDS],
+            published_slots: AtomicDir::new(),
         }
     }
 
     fn publish_load(&self, inner: &RunQueueInner) {
-        // A local-authority scan must not silently combine membership words
-        // from opposite sides of a wake/removal. Writers are serialized by
-        // `inner`; odd means publication is in progress and the following even
-        // value commits the bitmap and load as one observation epoch.
+        // ORDERING: AcqRel marks publication odd before updating dense published_slots.
         self.published_sequence.fetch_add(1, Ordering::AcqRel);
+        if inner.full_resync.swap(false, Ordering::Relaxed) {
+            inner.dirty_len.store(0, Ordering::Relaxed);
+            let old_pub = self.published_count.load(Ordering::Relaxed);
+            for i in 0..old_pub {
+                if let Some(cell) = self.published_slots.get(i) {
+                    let old = cell.swap(NO_SLOT, Ordering::Relaxed);
+                    if old != NO_SLOT {
+                        // SAFETY: `rq_pub_idx` is exclusively owned by this queue lock.
+                        unsafe {
+                            *task_table::get(old as usize).rq_pub_idx.get() = NO_SLOT;
+                        }
+                    }
+                }
+            }
+            let mut idx = 0_usize;
+            let mut cur = inner.head;
+            while cur != NO_SLOT {
+                let task = task_table::get(cur as usize);
+                if self
+                    .published_slots
+                    .get(idx)
+                    .is_none()
+                {
+                    let _ = ensure_pub_slots_for_count(idx + 1);
+                }
+                if let Some(cell) = self.published_slots.get(idx) {
+                    // ORDERING: Release publishes slot entry before raising published_count/seq.
+                    cell.store(cur, Ordering::Release);
+                }
+                // SAFETY: `rq_pub_idx` and `rq_next` are protected by `inner`.
+                unsafe {
+                    *task.rq_pub_idx.get() = idx as u32;
+                    cur = *task.rq_next.get();
+                }
+                idx += 1;
+            }
+            // ORDERING: Release publishes updated dense slice length.
+            self.published_count.store(idx, Ordering::Release);
+        } else {
+            let mut pub_len = self.published_count.load(Ordering::Relaxed);
+            let dlen = inner.dirty_len.swap(0, Ordering::Relaxed) as usize;
+            for i in 0..dlen {
+                let s = inner.dirty_slots[i].load(Ordering::Relaxed);
+                let task = task_table::get(s as usize);
+                let in_rq = inner.contains(s as usize);
+                // SAFETY: `rq_pub_idx` is protected by `inner`.
+                let cur_idx = unsafe { *task.rq_pub_idx.get() };
+                if in_rq && cur_idx == NO_SLOT {
+                    if self.published_slots.get(pub_len).is_none() {
+                        ensure_pub_slots_for_count(pub_len + 1);
+                    }
+                    if let Some(cell) = self.published_slots.get(pub_len) {
+                        // ORDERING: Release publishes new dense slot before updating count/seq.
+                        cell.store(s, Ordering::Release);
+                    }
+                    // SAFETY: `rq_pub_idx` is protected by `inner`.
+                    unsafe {
+                        *task.rq_pub_idx.get() = pub_len as u32;
+                    }
+                    pub_len += 1;
+                } else if !in_rq && cur_idx != NO_SLOT {
+                    let idx = cur_idx as usize;
+                    pub_len -= 1;
+                    if idx != pub_len {
+                        let last = self
+                            .published_slots
+                            .get(pub_len)
+                            .map_or(NO_SLOT, |c| c.load(Ordering::Relaxed));
+                        if let Some(cell) = self.published_slots.get(idx) {
+                            // ORDERING: Release moves last entry into freed dense slot.
+                            cell.store(last, Ordering::Release);
+                        }
+                        if last != NO_SLOT {
+                            // SAFETY: `rq_pub_idx` is protected by `inner`.
+                            unsafe {
+                                *task_table::get(last as usize).rq_pub_idx.get() = idx as u32;
+                            }
+                        }
+                    }
+                    if let Some(cell) = self.published_slots.get(pub_len) {
+                        // ORDERING: Release clears vacated tail slot.
+                        cell.store(NO_SLOT, Ordering::Release);
+                    }
+                    // SAFETY: `rq_pub_idx` is protected by `inner`.
+                    unsafe {
+                        *task.rq_pub_idx.get() = NO_SLOT;
+                    }
+                }
+            }
+            // ORDERING: Release publishes updated dense slice length.
+            self.published_count.store(pub_len, Ordering::Release);
+        }
         let count = u64::try_from(inner.runnable_count).unwrap_or(u64::MAX) & 0xffff;
         let weight = inner.runnable_weight.min((1_u64 << 48) - 1);
-        for (published, word) in self
-            .published_runnable
-            .iter()
-            .zip(inner.runnable.iter().copied())
-        {
-            // ORDERING: Release publishes each membership word before the load
-            // that summarizes it. A reader may observe one word from before an
-            // update and one from after; both are memberships this queue held,
-            // and a candidate from either is validated against the owner word
-            // before it can be dispatched.
-            published.store(word, Ordering::Release);
-        }
-        // ORDERING: Release publishes a read-only placement snapshot after
-        // exact rq membership and weight accounting are complete.
+        // ORDERING: Release publishes read-only placement snapshot after exact rq updates.
         self.published_load
             .store((weight << 16) | count, Ordering::Release);
+        // ORDERING: AcqRel finishes even publication epoch after all dense updates.
         self.published_sequence.fetch_add(1, Ordering::AcqRel);
     }
 }
+
+static MAILBOX_POOL: SlabPool<RunTransfer> = SlabPool::new();
 
 /// Fixed, allocation-free cross-CPU execution-custody transfer. The owner
 /// generation is the exact linearization identity for `RemoteQueued`; a stale
@@ -241,70 +359,44 @@ struct RunTransfer {
     weight: u32,
 }
 
-impl RunTransfer {
-    const EMPTY: Self = Self {
-        slot: 0,
-        generation: 0,
-        weight: 0,
-    };
-}
-
 struct RemoteWakeMailbox {
-    records: [RunTransfer; MAILBOX_CAPACITY],
-    head: usize,
-    len: usize,
+    records: SlabQueue<RunTransfer>,
 }
 
 impl RemoteWakeMailbox {
     const fn new() -> Self {
         Self {
-            records: [RunTransfer::EMPTY; MAILBOX_CAPACITY],
-            head: 0,
-            len: 0,
+            records: SlabQueue::new(),
         }
+    }
+
+    /// Empties the mailbox and returns slab blocks to the pool.
+    fn clear(&mut self) {
+        self.records.clear(&MAILBOX_POOL);
     }
 
     fn publish(&mut self, record: RunTransfer) {
-        // Rehoming invalidates an earlier generation without synchronously
-        // deleting its record from the old target. If the task later returns
-        // to this CPU before a drain, replace that stale record in place. One
-        // target therefore holds at most one record per scheduler slot and the
-        // MAX_TASK mailbox cannot be exhausted by affinity churn.
-        for offset in 0..self.len {
-            let index = (self.head + offset) % self.records.len();
-            if self.records[index].slot == record.slot {
-                self.records[index] = record;
-                return;
-            }
+        if let Some(existing) = self
+            .records
+            .find_mut(&MAILBOX_POOL, |queued| queued.slot == record.slot)
+        {
+            *existing = record;
+            return;
         }
         assert!(
-            self.len < self.records.len(),
-            "scheduler remote wake mailbox lost unique-slot bound"
+            self.records.push_back(&MAILBOX_POOL, record),
+            "scheduler remote wake mailbox slab pool exhausted"
         );
-        let tail = (self.head + self.len) % self.records.len();
-        self.records[tail] = record;
-        self.len += 1;
     }
 
     fn pop(&mut self) -> Option<RunTransfer> {
-        if self.len == 0 {
-            return None;
-        }
-        let record = self.records[self.head];
-        self.records[self.head] = RunTransfer::EMPTY;
-        self.head = (self.head + 1) % self.records.len();
-        self.len -= 1;
-        Some(record)
+        self.records.pop_front(&MAILBOX_POOL)
     }
 
     /// Exact mailbox receipt for the slow, aged custody-conservation probe.
-    /// The global pending edge is not a per-task proof: another queued task
-    /// can keep it raised while this task's record is missing.
     fn holds_generation(&self, slot: usize, generation: u64) -> bool {
-        (0..self.len).any(|offset| {
-            let record = self.records[(self.head + offset) % self.records.len()];
-            record.slot == slot && record.generation == generation
-        })
+        self.records
+            .any(&MAILBOX_POOL, |record| record.slot == slot && record.generation == generation)
     }
 }
 
@@ -347,8 +439,15 @@ fn publish_mailbox_record(cpu: usize, slot: usize, generation: u64, weight: u32)
         .is_ok()
 }
 
-static RUN_QUEUES: [PerCpuRunQueue; MAX_TRACKED_CPUS] =
-    [const { PerCpuRunQueue::new() }; MAX_TRACKED_CPUS];
+static RUN_QUEUES: [PerCpuRunQueue; MAX_TRACKED_CPUS] = const {
+    let mut queues = [const { PerCpuRunQueue::new(0) }; MAX_TRACKED_CPUS];
+    let mut cpu = 0;
+    while cpu < MAX_TRACKED_CPUS {
+        queues[cpu] = PerCpuRunQueue::new(cpu);
+        cpu += 1;
+    }
+    queues
+};
 static REMOTE_WAKE_MAILBOXES: [IrqLeaf<RemoteWakeMailbox, { LockClass::SchedulerMailbox as u8 }>;
     MAX_TRACKED_CPUS] = [const { IrqLeaf::new(RemoteWakeMailbox::new()) }; MAX_TRACKED_CPUS];
 static MAILBOX_PENDING: [CachePadded<AtomicU64>; MAX_TRACKED_CPUS] =
@@ -385,32 +484,27 @@ pub(super) fn reset_before_publication() {
     frame_publication::reset_before_publication();
     ownership::reset_before_publication();
     conservation::reset_before_publication();
-    for (
-        ((((vruntime, exec_start), saved_rsp), stack_base), alternate_version),
-        alternate_base,
-    ) in VRUNTIME_NS
-        .iter()
-        .zip(EXEC_START_TICKS.iter())
-        .zip(SAVED_RSP.iter())
-        .zip(KERNEL_STACK_BASE.iter())
-        .zip(ALTERNATE_KERNEL_STACK_VERSION.iter())
-        .zip(ALTERNATE_KERNEL_STACK_BASE.iter())
-    {
-        vruntime.store(0, Ordering::Release);
-        exec_start.store(0, Ordering::Release);
-        saved_rsp.store(0, Ordering::Release);
-        stack_base.store(0, Ordering::Release);
-        alternate_version.store(0, Ordering::Release);
-        alternate_base.store(0, Ordering::Release);
+    for slot in task_table::allocated_slots() {
+        let task = task_table::get(slot);
+        // ORDERING: Release resets per-slot runqueue/stack state under boot fixture isolation.
+        task.vruntime_ns.store(0, Ordering::Release);
+        task.exec_start_ticks.store(0, Ordering::Release);
+        task.rq_saved_rsp.store(0, Ordering::Release);
+        task.rq_stack_base.store(0, Ordering::Release);
+        task.rq_stack_top.store(0, Ordering::Release);
+        task.rq_alt_version.store(0, Ordering::Release);
+        task.rq_alt_base.store(0, Ordering::Release);
+        task.rq_alt_top.store(0, Ordering::Release);
+        // SAFETY: `reset_before_publication` runs before CPU scheduling starts or under `TEST_GUARD`.
+        unsafe {
+            *task.rq_prev.get() = NO_SLOT;
+            *task.rq_next.get() = NO_SLOT;
+            *task.rq_cpu.get() = NO_SLOT;
+            *task.rq_pub_idx.get() = NO_SLOT;
+        }
     }
     execution_time::reset_before_publication();
     idle::reset_before_publication();
-    for stack_top in &KERNEL_STACK_TOP {
-        stack_top.store(0, Ordering::Release);
-    }
-    for alternate_top in &ALTERNATE_KERNEL_STACK_TOP {
-        alternate_top.store(0, Ordering::Release);
-    }
     address_space::reset_before_publication();
     simd_tls::reset_before_publication();
     affinity_payload::reset_before_publication();
@@ -418,23 +512,24 @@ pub(super) fn reset_before_publication() {
     weight::reset_before_publication();
     for cpu in 0..MAX_TRACKED_CPUS {
         let mut rq = RUN_QUEUES[cpu].inner.lock();
-        *rq = RunQueueInner::new();
+        rq.clear();
         RUN_QUEUES[cpu]
             .published_sequence
             .store(0, Ordering::Release);
         RUN_QUEUES[cpu].publish_load(&rq);
         drop(rq);
         let mut mailbox = REMOTE_WAKE_MAILBOXES[cpu].lock();
-        *mailbox = RemoteWakeMailbox::new();
+        mailbox.clear();
         MAILBOX_PENDING[cpu].store(0, Ordering::Release);
     }
 }
 
 #[inline]
 pub(super) fn vruntime(slot: usize) -> u64 {
-    VRUNTIME_NS
-        .get(slot)
+    // ORDERING: Acquire pairs with initializing/updating Release stores.
+    task_table::try_get(slot)
         .expect("scheduler vruntime slot exceeds capacity")
+        .vruntime_ns
         .load(Ordering::Acquire)
 }
 
@@ -445,7 +540,8 @@ pub(super) fn initialize_vruntime(slot: usize, value: u64) {
         RunOwnerState::Dormant,
         "scheduler vruntime initialized after owner publication"
     );
-    VRUNTIME_NS[slot].store(value, Ordering::Release);
+    // ORDERING: Release pairs with Acquire vruntime reads.
+    task_table::get(slot).vruntime_ns.store(value, Ordering::Release);
 }
 
 /// Installs the initial execution-accounting baseline before owner admission.
@@ -455,15 +551,17 @@ pub(super) fn initialize_exec_start_ticks(slot: usize, value: u64) {
         RunOwnerState::Dormant,
         "scheduler execution baseline initialized after owner publication"
     );
-    EXEC_START_TICKS[slot].store(value, Ordering::Release);
+    // ORDERING: Release pairs with Acquire exec_start_ticks readers.
+    task_table::get(slot).exec_start_ticks.store(value, Ordering::Release);
     execution_time::clear(slot);
 }
 
 #[inline]
 pub(super) fn exec_start_ticks(slot: usize) -> u64 {
-    EXEC_START_TICKS
-        .get(slot)
+    // ORDERING: Acquire pairs with Release stores.
+    task_table::try_get(slot)
         .expect("scheduler execution baseline slot exceeds capacity")
+        .exec_start_ticks
         .load(Ordering::Acquire)
 }
 
@@ -471,9 +569,10 @@ pub(super) fn exec_start_ticks(slot: usize) -> u64 {
 /// this value; AtomicU64 keeps readers from requiring the global task catalog.
 #[inline]
 pub(super) fn set_exec_start_ticks(slot: usize, value: u64) {
-    EXEC_START_TICKS
-        .get(slot)
+    // ORDERING: Release pairs with Acquire readers.
+    task_table::try_get(slot)
         .expect("scheduler execution baseline slot exceeds capacity")
+        .exec_start_ticks
         .store(value, Ordering::Release);
 }
 
@@ -483,22 +582,25 @@ pub(super) fn initialize_saved_rsp(slot: usize, value: usize) {
         RunOwnerState::Dormant,
         "scheduler saved context initialized after owner publication"
     );
-    SAVED_RSP[slot].store(value, Ordering::Release);
+    // ORDERING: Release pairs with Acquire saved_rsp readers.
+    task_table::get(slot).rq_saved_rsp.store(value, Ordering::Release);
 }
 
 #[inline]
 pub(super) fn saved_rsp(slot: usize) -> usize {
-    SAVED_RSP
-        .get(slot)
+    // ORDERING: Acquire pairs with Release stores.
+    task_table::try_get(slot)
         .expect("scheduler saved context slot exceeds capacity")
+        .rq_saved_rsp
         .load(Ordering::Acquire)
 }
 
 #[inline]
 pub(super) fn set_saved_rsp(slot: usize, value: usize) {
-    SAVED_RSP
-        .get(slot)
+    // ORDERING: Release pairs with Acquire readers.
+    task_table::try_get(slot)
         .expect("scheduler saved context slot exceeds capacity")
+        .rq_saved_rsp
         .store(value, Ordering::Release);
 }
 
@@ -512,20 +614,19 @@ pub(super) fn initialize_kernel_stack_bounds(slot: usize, base: u64, top: u64) {
         base != 0 && top > base,
         "scheduler stack bounds are invalid"
     );
-    KERNEL_STACK_BASE[slot].store(base, Ordering::Release);
-    KERNEL_STACK_TOP[slot].store(top, Ordering::Release);
+    let task = task_table::get(slot);
+    // ORDERING: Release publishes stack bounds prior to task owner publication.
+    task.rq_stack_base.store(base, Ordering::Release);
+    task.rq_stack_top.store(top, Ordering::Release);
 }
 
 #[inline]
 pub(super) fn kernel_stack_bounds(slot: usize) -> (u64, u64) {
-    let base = KERNEL_STACK_BASE
-        .get(slot)
-        .expect("scheduler stack base slot exceeds capacity")
-        .load(Ordering::Acquire);
-    let top = KERNEL_STACK_TOP
-        .get(slot)
-        .expect("scheduler stack top slot exceeds capacity")
-        .load(Ordering::Acquire);
+    let task = task_table::try_get(slot).expect("scheduler stack bounds slot exceeds capacity");
+    // ORDERING: Acquire pairs with initializing Release stores.
+    let base = task.rq_stack_base.load(Ordering::Acquire);
+    // ORDERING: Acquire pairs with initializing Release stores.
+    let top = task.rq_stack_top.load(Ordering::Acquire);
     (base, top)
 }
 
@@ -549,37 +650,37 @@ pub(super) fn replace_alternate_kernel_stack_bounds(slot: usize, base: u64, top:
         (base == 0 && top == 0) || (base != 0 && top > base),
         "scheduler alternate stack bounds are invalid"
     );
-    let version = ALTERNATE_KERNEL_STACK_VERSION[slot].load(Ordering::Relaxed);
+    let task = task_table::get(slot);
+    let version = task.rq_alt_version.load(Ordering::Relaxed);
     assert_eq!(
         version & 1,
         0,
         "scheduler alternate stack replacement raced for slot {slot}"
     );
     // ORDERING: the odd version is visible before either payload half changes.
-    ALTERNATE_KERNEL_STACK_VERSION[slot].store(version.wrapping_add(1), Ordering::Relaxed);
+    task.rq_alt_version.store(version.wrapping_add(1), Ordering::Relaxed);
     fence(Ordering::Release);
-    ALTERNATE_KERNEL_STACK_BASE[slot].store(base, Ordering::Relaxed);
-    ALTERNATE_KERNEL_STACK_TOP[slot].store(top, Ordering::Relaxed);
+    task.rq_alt_base.store(base, Ordering::Relaxed);
+    task.rq_alt_top.store(top, Ordering::Relaxed);
     // ORDERING: this Release commits a matched base/top pair to Acquire readers.
-    ALTERNATE_KERNEL_STACK_VERSION[slot].store(version.wrapping_add(2), Ordering::Release);
+    task.rq_alt_version.store(version.wrapping_add(2), Ordering::Release);
 }
 
 /// Reads one coherent alternate-stack pair. An observation that overlaps a
 /// writer has no valid range, which causes frame validation to reject it.
 #[inline]
 pub(super) fn alternate_kernel_stack_bounds(slot: usize) -> (u64, u64) {
-    let version = ALTERNATE_KERNEL_STACK_VERSION
-        .get(slot)
-        .expect("scheduler alternate stack version slot exceeds capacity")
-        .load(Ordering::Acquire);
+    let task = task_table::try_get(slot).expect("scheduler alternate stack version slot exceeds capacity");
+    // ORDERING: Acquire pairs with Release commit below.
+    let version = task.rq_alt_version.load(Ordering::Acquire);
     if version & 1 != 0 {
         return (0, 0);
     }
-    let base = ALTERNATE_KERNEL_STACK_BASE[slot].load(Ordering::Relaxed);
-    let top = ALTERNATE_KERNEL_STACK_TOP[slot].load(Ordering::Relaxed);
+    let base = task.rq_alt_base.load(Ordering::Relaxed);
+    let top = task.rq_alt_top.load(Ordering::Relaxed);
     // ORDERING: neither payload read may move after the validating version.
     fence(Ordering::Acquire);
-    if ALTERNATE_KERNEL_STACK_VERSION[slot].load(Ordering::Relaxed) != version {
+    if task.rq_alt_version.load(Ordering::Relaxed) != version {
         return (0, 0);
     }
     (base, top)
@@ -590,10 +691,12 @@ fn clear_alternate_kernel_stack_bounds(slot: usize) {
 }
 
 pub(super) fn add_vruntime(slot: usize, delta: u64) -> u64 {
-    let cell = &VRUNTIME_NS[slot];
+    let cell = &task_table::get(slot).vruntime_ns;
+    // ORDERING: Acquire pairs with concurrent CAS updates on vruntime_ns.
     let mut observed = cell.load(Ordering::Acquire);
     loop {
         let next = observed.saturating_add(delta);
+        // ORDERING: AcqRel serializes fair-share vruntime increments.
         match cell.compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return next,
             Err(current) => observed = current,
@@ -603,13 +706,15 @@ pub(super) fn add_vruntime(slot: usize, delta: u64) -> u64 {
 
 /// Raises the fair-share key only when a sleeper floor is ahead of it.
 pub(super) fn raise_vruntime_floor(slot: usize, floor: u64) -> u64 {
-    let cell = &VRUNTIME_NS[slot];
+    let cell = &task_table::get(slot).vruntime_ns;
+    // ORDERING: Acquire pairs with concurrent CAS updates on vruntime_ns.
     let mut observed = cell.load(Ordering::Acquire);
     loop {
         let next = observed.max(floor);
         if next == observed {
             return observed;
         }
+        // ORDERING: AcqRel advances vruntime_ns monotonically.
         match cell.compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return next,
             Err(current) => observed = current,
@@ -619,13 +724,15 @@ pub(super) fn raise_vruntime_floor(slot: usize, floor: u64) -> u64 {
 
 /// Lowers the fair-share key only for an authenticated IPC donation.
 pub(super) fn lower_vruntime_ceiling(slot: usize, ceiling: u64) -> u64 {
-    let cell = &VRUNTIME_NS[slot];
+    let cell = &task_table::get(slot).vruntime_ns;
+    // ORDERING: Acquire pairs with concurrent CAS updates on vruntime_ns.
     let mut observed = cell.load(Ordering::Acquire);
     loop {
         let next = observed.min(ceiling);
         if next == observed {
             return observed;
         }
+        // ORDERING: AcqRel lowers vruntime_ns under donation.
         match cell.compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return next,
             Err(current) => observed = current,
@@ -728,72 +835,112 @@ pub(super) fn local_runnable_sequence(cpu: usize) -> u64 {
 /// owner or claim grant (the conservation scan and native witnesses read it).
 pub(super) fn published_local_membership(slot: usize, cpu: usize) -> bool {
     validate_cpu(cpu);
-    assert!(slot < MAX_TASK);
-    RUN_QUEUES[cpu].published_runnable[slot / 64].load(Ordering::Acquire)
-        & (1_u64 << (slot % 64)) != 0
+    validate_slot(slot);
+    local_runnable_slots(cpu).any(|candidate| candidate == slot)
 }
 
-fn local_runnable_snapshot(cpu: usize) -> [u64; BITMAP_WORDS] {
-    validate_cpu(cpu);
-    let published = &RUN_QUEUES[cpu].published_runnable;
-    // ORDERING: Acquire observes each word's publication and orders the
-    // caller's later reads of the slots it names after it.
-    core::array::from_fn(|word| published[word].load(Ordering::Acquire))
+fn snapshot_published_range(cpu: usize) -> (u64, usize) {
+    let rq = &RUN_QUEUES[cpu];
+    for _ in 0..64 {
+        // ORDERING: Acquire pairs with publish_load's AcqRel sequence bump.
+        let s1 = rq.published_sequence.load(Ordering::Acquire);
+        if s1 & 1 != 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        // ORDERING: Acquire pairs with Release published_count store.
+        let count = rq.published_count.load(Ordering::Acquire);
+        // ORDERING: Acquire orders count load before checking sequence unchanged.
+        fence(Ordering::Acquire);
+        // ORDERING: Acquire observes concurrent publish_load start.
+        if rq.published_sequence.load(Ordering::Acquire) == s1 {
+            return (s1, count);
+        }
+    }
+    // ORDERING: Acquire observes current epoch if writer continuously contended.
+    let s = rq.published_sequence.load(Ordering::Acquire);
+    // ORDERING: Acquire observes current published_count.
+    let count = if s & 1 != 0 { 0 } else { rq.published_count.load(Ordering::Acquire) };
+    (s, count)
 }
 
+/// Lazily walks one CPU's dense published runnable slots, O(runnable on `cpu`).
 pub(super) struct LocalRunnableSlots {
-    bitmap: [u64; BITMAP_WORDS],
-    word: usize,
+    cpu: usize,
+    seq: u64,
+    idx: usize,
+    count: usize,
+    restarts: u8,
 }
 
 impl Iterator for LocalRunnableSlots {
     type Item = usize;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.word < self.bitmap.len() {
-            let bits = self.bitmap[self.word];
-            if bits == 0 {
-                self.word += 1;
-                continue;
-            }
-            let bit = bits.trailing_zeros() as usize;
-            self.bitmap[self.word] &= !(1_u64 << bit);
-            return Some(self.word * 64 + bit);
+        if self.seq & 1 != 0 {
+            return None;
         }
-        None
+        let rq = &RUN_QUEUES[self.cpu];
+        loop {
+            if self.idx >= self.count {
+                return None;
+            }
+            let idx = self.idx;
+            self.idx += 1;
+            let Some(cell) = rq.published_slots.get(idx) else {
+                return None;
+            };
+            // ORDERING: Acquire observes Release slot write in publish_load.
+            let slot = cell.load(Ordering::Acquire);
+            // ORDERING: Acquire checks whether publish_load interleaved and swapped entries.
+            if rq.published_sequence.load(Ordering::Acquire) != self.seq {
+                if self.restarts < 2 {
+                    self.restarts += 1;
+                    let (seq, count) = snapshot_published_range(self.cpu);
+                    self.seq = seq;
+                    self.count = count;
+                    self.idx = 0;
+                    if self.seq & 1 != 0 {
+                        return None;
+                    }
+                    continue;
+                }
+                return None;
+            }
+            if slot != NO_SLOT {
+                return Some(slot as usize);
+            }
+        }
     }
 }
 
 pub(super) fn local_runnable_slots(cpu: usize) -> LocalRunnableSlots {
+    validate_cpu(cpu);
+    let (seq, count) = snapshot_published_range(cpu);
     LocalRunnableSlots {
-        bitmap: local_runnable_snapshot(cpu),
-        word: 0,
+        cpu,
+        seq,
+        idx: 0,
+        count,
+        restarts: 0,
     }
 }
 
 pub(super) fn published_runnable_count(cpu: usize) -> usize {
     validate_cpu(cpu);
     // ORDERING: Acquire observes the exact queue membership published with
-    // the corresponding count. This is only a bounded steal-search hint; the
-    // owner CAS remains the transfer authority.
-    (RUN_QUEUES[cpu].published_load.load(Ordering::Acquire) & 0xffff) as usize
+    // the corresponding count.
+    RUN_QUEUES[cpu].published_count.load(Ordering::Acquire)
 }
 
 /// Reports whether the CPU-local dispatch owner has work beyond the task that
 /// is already running on this CPU.
-///
-/// Running tasks are deliberately absent from the runnable bitmap. Therefore a
-/// zero published count plus an empty remote mailbox means a periodic
-/// clockevent cannot select a different task and may retain the current user
-/// continuation without entering lifecycle-global scheduler state.
 pub(super) fn local_dispatch_work_pending(cpu: usize) -> bool {
     validate_cpu(cpu);
     // ORDERING: Acquire observes either a complete rq insertion published by
-    // `publish_load` or a remote mailbox record published before its pending
-    // edge. False is safe only when both independently authoritative sources
-    // are empty.
-    let load = RUN_QUEUES[cpu].published_load.load(Ordering::Acquire);
-    let runnable_count = load & 0xffff;
+    // `publish_load` or a remote mailbox record published before its pending edge.
+    let runnable_count = RUN_QUEUES[cpu].published_count.load(Ordering::Acquire);
+    // ORDERING: Acquire pairs with remote wake pending publication.
     runnable_count != 0 || MAILBOX_PENDING[cpu].load(Ordering::Acquire) != 0
 }
 
@@ -1000,18 +1147,24 @@ pub(super) fn release_retired(slot: usize) {
             panic!("scheduler retired slot release raced observed={observed:?}")
         })
         .settled();
-    VRUNTIME_NS[slot].store(0, Ordering::Release);
-    EXEC_START_TICKS[slot].store(0, Ordering::Release);
+    let task = task_table::get(slot);
+    // ORDERING: Release clears released slot accounting/stack state before slot reuse.
+    task.vruntime_ns.store(0, Ordering::Release);
+    // ORDERING: Release clears exec_start_ticks before slot reuse.
+    task.exec_start_ticks.store(0, Ordering::Release);
     execution_time::clear(slot);
     idle::clear(slot);
     weight::clear(slot);
     address_space::clear(slot);
     wait::clear(slot);
-    SAVED_RSP[slot].store(0, Ordering::Release);
+    // ORDERING: Release clears saved_rsp before slot reuse.
+    task.rq_saved_rsp.store(0, Ordering::Release);
     simd_tls::clear_tls_fs_base(slot);
     affinity_payload::reset_affinity(slot);
-    KERNEL_STACK_BASE[slot].store(0, Ordering::Release);
-    KERNEL_STACK_TOP[slot].store(0, Ordering::Release);
+    // ORDERING: Release clears stack_base before slot reuse.
+    task.rq_stack_base.store(0, Ordering::Release);
+    // ORDERING: Release clears stack_top before slot reuse.
+    task.rq_stack_top.store(0, Ordering::Release);
     clear_alternate_kernel_stack_bounds(slot);
     frame_publication::clear(slot);
 }
@@ -1049,3 +1202,16 @@ pub(super) fn least_loaded_cpu(eligible_mask: u64, fallback_cpu: usize) -> usize
 mod tests;
 #[cfg(test)]
 pub(super) use tests::test_serial_guard;
+
+pub(in crate::multitask) fn ensure_pub_slots_for_count(slots: usize) {
+    let needed = slots.max(1);
+    for cpu in 0..MAX_TRACKED_CPUS {
+        for idx in 0..needed {
+            let _ = RUN_QUEUES[cpu].published_slots.ensure(idx, || AtomicU32::new(NO_SLOT));
+        }
+    }
+}
+
+pub(in crate::multitask) fn preallocate_mailbox_pool(min_free: usize) {
+    SlabQueue::<RunTransfer>::preallocate_for_pool(&MAILBOX_POOL, min_free);
+}

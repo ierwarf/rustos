@@ -206,7 +206,13 @@ fn call(
     if reply_deadline_expired(deadline) {
         return Err(LINUX_ETIMEDOUT);
     }
-    let reply = enqueue_call_and_wake(endpoint, request)?;
+    let reply = enqueue_call_and_wake_or_wait_queue(
+        enqueue_call_and_wake(endpoint, request),
+        endpoint,
+        request,
+        &[],
+        deadline,
+    )?;
     let response = collect_inline_reply::<IPC_REGISTER_BYTES>(
         reply, task_id, deadline, IPC_REGISTER_BYTES, phase_mark(),
         InlineReplyTransport::Queued, Some(core::ptr::from_mut(frame)),

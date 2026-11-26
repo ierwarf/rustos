@@ -130,7 +130,7 @@ fn exhausted_durable_nonce_cannot_transfer_or_drop_actual_reserved_ticket() {
         };
         let mut row = Row::new();
         row.nonce = u64::MAX;
-        let mut refused = enqueue_into(&mut row, work)
+        let mut refused = enqueue_into(0, &mut row, work)
             .err()
             .expect("exhausted nonce wrapped");
         assert_eq!(row.nonce, u64::MAX);
@@ -155,7 +155,7 @@ fn abandoned_actual_kernel_claim_quarantines_capsule_without_reopen_or_implied_a
             drop(claim_next(executor).unwrap());
             assert!(claim_next(executor).is_none());
             assert_eq!(poll(receipt), Some(Err(SpawnTaskError::ThreadPublicationRefused)));
-            let row = ROWS[receipt.slot].lock();
+            let row = task_table::get(receipt.slot).creation_work.lock();
             assert_eq!(row.phase, Phase::Poisoned);
             assert!(
                 row.work
@@ -171,9 +171,9 @@ fn abandoned_actual_kernel_claim_quarantines_capsule_without_reopen_or_implied_a
         });
         // Native injected abandonment recovery only, never a production reopening:
         // perform the real cancellation ACK before restoring this test row phase.
-        let mut work = ROWS[receipt.slot].lock().work.take().unwrap();
+        let mut work = task_table::get(receipt.slot).creation_work.lock().work.take().unwrap();
         cancel(work.reservation.take().unwrap());
-        let mut row = ROWS[receipt.slot].lock();
+        let mut row = task_table::get(receipt.slot).creation_work.lock();
         assert_eq!(row.nonce, receipt.nonce);
         row.phase = Phase::Complete;
         row.outcome = Err(SpawnTaskError::ThreadPublicationRefused);
@@ -226,7 +226,8 @@ fn same_uid_slot_reuse_spends_new_ticket_and_durable_nonce_and_old_receipt_canno
 {
     affinity_fixture(UserAbi::Linux, UserAbi::Linux, false, |handle| {
         let old = pending();
-        let epoch = ROWS[old.slot]
+        let epoch = task_table::get(old.slot)
+            .creation_work
             .lock()
             .work
             .as_ref()
@@ -245,7 +246,8 @@ fn same_uid_slot_reuse_spends_new_ticket_and_durable_nonce_and_old_receipt_canno
         assert_eq!((next.slot, next.id), (old.slot, old.id));
         assert!(next.nonce > old.nonce);
         assert!(
-            ROWS[next.slot]
+            task_table::get(next.slot)
+                .creation_work
                 .lock()
                 .work
                 .as_ref()

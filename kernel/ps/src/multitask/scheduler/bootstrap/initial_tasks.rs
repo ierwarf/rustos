@@ -7,10 +7,11 @@
 //! Forbidden: copied legacy reset, scalar UID as backing or an AP local-clock start.
 //! Evidence: shared kernel descriptor commit; native earlier HAL inputs are models.
 use super::super::{
-    NICE_0_LOAD, PublishedFrameView, STACK_CANARY_WORD, TASK_STACK_GUARD_BYTES, TASK_STACK_SIZE,
-    align_kernel_stack_top, execution_image, frame_publication, kernel_creation, root_slots,
-    stack_resources, task_weight,
+    NICE_0_LOAD, PublishedFrameView, STACK_CANARY_WORD, TASK_STACK_GUARD_BYTES, execution_image,
+    frame_publication, kernel_creation, root_slots, stack_resources, task_weight,
 };
+#[cfg(test)]
+use super::super::{TASK_STACK_SIZE, align_kernel_stack_top};
 use super::*;
 
 impl InitialCpu<'_> {
@@ -69,7 +70,7 @@ pub(super) fn initialize_owners(image: &InitialCpu<'_>, pit: u16) {
     assert_eq!(image.cpu(), 0);
     stack_resources::assert_boot_vacant();
     runqueue::reset_before_publication();
-    for slot in 0..MAX_TASK {
+    for slot in crate::multitask::task_table::allocated_slots() {
         crate::multitask::current_identity::clear(slot);
     }
     super::super::task_directory::reset();
@@ -95,11 +96,11 @@ pub(super) fn root(
     assert_eq!((image.cpu(), image.slot(), image.id()), (0, 0, 0));
     let ticket = root_slots::reserve(image.slot(), image.id())
         .expect("initial root producer allocation failed");
-    let base = stack_resources::storage_base(image.slot());
+    let (kernel_base, kernel_top) = stack_resources::stack_bounds(image.slot());
     let rsp = execution_image::reserved_kernel_entry(&ticket, cs, ss, flags, rip, 0);
     let view = PublishedFrameView {
-        kernel_stack_base: (base + TASK_STACK_GUARD_BYTES) as u64,
-        kernel_stack_top: align_kernel_stack_top(base + TASK_STACK_SIZE) as u64,
+        kernel_stack_base: kernel_base,
+        kernel_stack_top: kernel_top,
         stack_canary_intact: stack_resources::owned_canary_intact(image.slot())
             .expect("initial root lost original guard"),
         user_mode_task: false,

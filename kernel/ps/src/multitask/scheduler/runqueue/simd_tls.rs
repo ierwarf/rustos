@@ -2,21 +2,20 @@
 //! SIMD bytes have an exact immutable task binding and a consume-once exclusive
 //! access guard. Current/Prepared allocation custody qualifies live access;
 //! cold construction/exec/terminal commands retain their enclosing transaction.
+use crate::multitask::task_table;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::super::stack_resources::{cpu_leases, task_start};
-use super::{MAX_TASK, RunOwnerState, owner};
+use super::{RunOwnerState, owner};
 use crate::arch::simd::{SimdState, restore_state, save_state};
-
-static TLS_FS_BASE: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
 
 struct SimdImage {
     task_id: Option<u64>,
     register_ipc: bool,
     state: SimdState,
 }
-struct SlotSimdState {
+pub(in crate::multitask) struct SlotSimdState {
     busy: AtomicBool,
     image: UnsafeCell<SimdImage>,
 }
@@ -37,7 +36,8 @@ impl Drop for SimdAccess<'_> {
     }
 }
 impl SlotSimdState {
-    const fn new() -> Self {
+    #[cfg(test)]
+    pub(in crate::multitask) const fn new() -> Self {
         Self {
             busy: AtomicBool::new(false),
             image: UnsafeCell::new(SimdImage {
@@ -45,6 +45,23 @@ impl SlotSimdState {
                 register_ipc: false,
                 state: SimdState::new(),
             }),
+        }
+    }
+
+    /// Initializes a freshly allocated `SlotSimdState` in place without putting
+    /// a multi-kilobyte `SimdState` temporary on the caller's stack.
+    ///
+    /// # Safety
+    /// `dst` must point to valid, aligned, writable storage for `Self`.
+    pub(in crate::multitask) unsafe fn init_in_place(dst: *mut Self) {
+        // SAFETY: `SimdState` and atomics/bool/Option<u64> inside `SlotSimdState`
+        // have no non-zero invariants except setting `None` explicitly below.
+        unsafe {
+            core::ptr::write_bytes(dst.cast::<u8>(), 0, core::mem::size_of::<Self>());
+            core::ptr::addr_of_mut!((*dst).busy).write(AtomicBool::new(false));
+            let image = (*dst).image.get();
+            core::ptr::addr_of_mut!((*image).task_id).write(None);
+            core::ptr::addr_of_mut!((*image).register_ipc).write(false);
         }
     }
     fn claim(&self) -> SimdAccess<'_> {
@@ -105,7 +122,6 @@ impl SlotSimdState {
         });
     }
 }
-static SIMD_STATES: [SlotSimdState; MAX_TASK] = [const { SlotSimdState::new() }; MAX_TASK];
 
 /// Exact-task, non-transferable custody of a register-IPC syscall continuation.
 /// This is not a CPU-local flag: migration carries the original slot binding.
@@ -133,7 +149,7 @@ impl Drop for IpcRegisterSimdGuard {
     fn drop(&mut self) {
         irq_excluded(|| {
             assert_eq!(live_identity(self.slot, false), self.task_id);
-            SIMD_STATES[self.slot].with(|image| set_register_ipc(image, self.task_id, false));
+            task_table::get(self.slot).simd.with(|image| set_register_ipc(image, self.task_id, false));
         });
     }
 }
@@ -149,7 +165,7 @@ pub unsafe fn begin_ipc_register_simd() -> IpcRegisterSimdGuard {
         let slot = crate::multitask::cpu_local::current_cpu_task_slot()
             .expect("register IPC SIMD entry lacks current task");
         let task_id = live_identity(slot, false);
-        SIMD_STATES[slot].with(|image| set_register_ipc(image, task_id, true));
+        task_table::get(slot).simd.with(|image| set_register_ipc(image, task_id, true));
         IpcRegisterSimdGuard {
             slot,
             task_id,
@@ -170,7 +186,7 @@ pub unsafe fn adopt_ipc_register_simd() -> IpcRegisterSimdGuard {
         let slot = crate::multitask::cpu_local::current_cpu_task_slot()
             .expect("parked register IPC resume lacks current task");
         let task_id = live_identity(slot, false);
-        SIMD_STATES[slot].with(|image| {
+        task_table::get(slot).simd.with(|image| {
             assert_eq!(image.task_id, Some(task_id), "foreign parked register IPC SIMD identity");
             assert!(image.register_ipc, "parked register IPC lost its SIMD marker");
         });
@@ -194,11 +210,10 @@ fn irq_excluded<R>(f: impl FnOnce() -> R) -> R {
 }
 
 pub(crate) fn reset_before_publication() {
-    for tls in &TLS_FS_BASE {
-        tls.store(0, Ordering::Release);
-    }
-    for state in &SIMD_STATES {
-        state.with(|image| {
+    for slot in task_table::allocated_slots() {
+        let task = task_table::get(slot);
+        task.tls_fs_base.store(0, Ordering::Release);
+        task.simd.with(|image| {
             image.state = SimdState::new();
             image.register_ipc = false;
             image.task_id = None;
@@ -207,22 +222,16 @@ pub(crate) fn reset_before_publication() {
 }
 #[inline]
 pub(crate) fn tls_fs_base(slot: usize) -> u64 {
-    TLS_FS_BASE
-        .get(slot)
-        .expect("scheduler TLS FS base slot exceeds capacity")
-        .load(Ordering::Acquire)
+    task_table::get(slot).tls_fs_base.load(Ordering::Acquire)
 }
 #[inline]
 pub(crate) fn set_tls_fs_base(slot: usize, value: u64) {
     super::super::outgoing_image::assert_mutable(slot);
-    TLS_FS_BASE
-        .get(slot)
-        .expect("scheduler TLS FS base slot exceeds capacity")
-        .store(value, Ordering::Release);
+    task_table::get(slot).tls_fs_base.store(value, Ordering::Release);
 }
 pub(crate) fn clear_tls_fs_base(slot: usize) {
     super::super::outgoing_image::assert_mutable(slot);
-    TLS_FS_BASE[slot].store(0, Ordering::Release);
+    task_table::get(slot).tls_fs_base.store(0, Ordering::Release);
 }
 
 pub(crate) fn initialize_simd_state(slot: usize, task_id: u64) {
@@ -236,7 +245,7 @@ pub(crate) fn initialize_simd_state(slot: usize, task_id: u64) {
             cpu_leases::simd_unpublished_custody(slot),
             "SIMD construction has live CPU references"
         );
-        SIMD_STATES[slot].initialize(task_id);
+        task_table::get(slot).simd.initialize(task_id);
     });
 }
 
@@ -247,7 +256,7 @@ pub(crate) fn reset_simd_state(slot: usize) {
             .id;
         let terminal = cpu_leases::simd_reset_custody(slot)
             .expect("SIMD reset lacks exclusive lifecycle custody");
-        SIMD_STATES[slot].replace(task_id, terminal);
+        task_table::get(slot).simd.replace(task_id, terminal);
     });
 }
 
@@ -271,14 +280,14 @@ fn live_identity(slot: usize, restoring: bool) -> u64 {
 pub(crate) fn save_simd_state(slot: usize) {
     irq_excluded(|| {
         let task_id = live_identity(slot, false);
-        SIMD_STATES[slot].bound(task_id, |state| unsafe { save_state(state) });
+        task_table::get(slot).simd.bound(task_id, |state| unsafe { save_state(state) });
     });
 }
 #[inline]
 pub(crate) fn restore_simd_state(slot: usize) {
     irq_excluded(|| {
         let task_id = live_identity(slot, true);
-        SIMD_STATES[slot].bound(task_id, |state| unsafe { restore_state(state) });
+        task_table::get(slot).simd.bound(task_id, |state| unsafe { restore_state(state) });
     });
 }
 /// Lane variants of the two accessors above for a caller that already holds
@@ -293,7 +302,7 @@ pub(crate) fn restore_simd_state(slot: usize) {
 #[inline]
 pub(crate) unsafe fn save_simd_state_lane(slot: usize, task_id: u64) {
     // SAFETY: caller contract; the bank excludes every other accessor.
-    let image = unsafe { &mut *SIMD_STATES[slot].image.get() };
+    let image = unsafe { &mut *task_table::get(slot).simd.image.get() };
     debug_assert!(
         image.task_id == Some(task_id),
         "lane SIMD image names another task"
@@ -310,7 +319,7 @@ pub(crate) unsafe fn save_simd_state_lane(slot: usize, task_id: u64) {
 #[cfg(not(test))]
 pub(crate) unsafe fn restore_simd_state_lane(slot: usize, task_id: u64) {
     // SAFETY: caller contract; the bank excludes every other accessor.
-    let image = unsafe { &mut *SIMD_STATES[slot].image.get() };
+    let image = unsafe { &mut *task_table::get(slot).simd.image.get() };
     debug_assert!(
         image.task_id == Some(task_id),
         "lane SIMD image names another task"

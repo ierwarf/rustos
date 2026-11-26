@@ -22,10 +22,10 @@
 //! custody stabilizes metadata. This detects missed publication; it does not
 //! confer frame/process lifetime or license removing the directory guard.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
-use super::MAX_SCHEDULER_TASKS;
 use super::process_table::ProcessHandle;
+use super::task_table;
 use crate::io::session::ConsoleSessionHandle;
 use crate::user::abi::UserAbi;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
@@ -171,13 +171,20 @@ impl TaskIdentity {
 
 /// Serialized identity/lifecycle writer custody. Atomic cells below are a
 /// read-only publication, not a second lifecycle authority.
-struct IdentityWriter {
+pub(in crate::multitask) struct IdentityWriter {
     bound_task_id: Option<u64>,
     exec_generation: u64,
     kernel_executors: usize,
     exec_intent: Option<exec_intent::Record>,
     identity: Option<TaskIdentity>,
     lifecycle: DispatchLifecycle,
+}
+
+pub(in crate::multitask) type IdentityWriterCell =
+    TrackedSpinLock<IdentityWriter, { LockClass::TaskIdentityLifecycle as u8 }>;
+
+pub(in crate::multitask) const fn new_identity_writer_cell() -> IdentityWriterCell {
+    TrackedSpinLock::new(IdentityWriter::empty())
 }
 
 impl IdentityWriter {
@@ -217,12 +224,8 @@ impl DispatchLifecycle {
     }
 }
 
-static WRITERS: [TrackedSpinLock<IdentityWriter, { LockClass::TaskIdentityLifecycle as u8 }>;
-    MAX_SCHEDULER_TASKS] =
-    [const { TrackedSpinLock::new(IdentityWriter::empty()) }; MAX_SCHEDULER_TASKS];
-
 fn with_writer<R>(slot: usize, f: impl FnOnce(&mut IdentityWriter) -> R) -> Option<R> {
-    let cell = WRITERS.get(slot)?;
+    let cell = task_table::try_get(slot).map(|task| &task.identity_writer)?;
     #[cfg(not(test))]
     {
         x86_64::instructions::interrupts::without_interrupts(|| {
@@ -531,7 +534,7 @@ fn commit_writer(slot: usize, writer: &mut IdentityWriter) {
     }
 }
 
-struct PublishedIdentity {
+pub(in crate::multitask) struct PublishedIdentity {
     /// Even when stable, odd while a writer is between the two halves of an
     /// update. Readers that observe an odd or changed value take the lock.
     version: AtomicU64,
@@ -552,7 +555,7 @@ struct PublishedIdentity {
 }
 
 impl PublishedIdentity {
-    const fn empty() -> Self {
+    pub(in crate::multitask) const fn empty() -> Self {
         Self {
             version: AtomicU64::new(0),
             task_id: AtomicU64::new(0),
@@ -575,10 +578,6 @@ impl PublishedIdentity {
     clippy::declare_interior_mutable_const,
     reason = "array initializer for per-slot atomics"
 )]
-const EMPTY_IDENTITY: PublishedIdentity = PublishedIdentity::empty();
-
-static IDENTITIES: [PublishedIdentity; MAX_SCHEDULER_TASKS] = [EMPTY_IDENTITY; MAX_SCHEDULER_TASKS];
-
 /// Conservative per-slot "this thread may have a pending signal" hint, the
 /// same role `TIF_SIGPENDING` plays in Linux: syscall return checks it on every
 /// exit and must not pay for the run-queue lock to learn that nothing is
@@ -589,13 +588,11 @@ static IDENTITIES: [PublishedIdentity; MAX_SCHEDULER_TASKS] = [EMPTY_IDENTITY; M
 /// only site that raises a pending signal and the only site that lowers this
 /// hint both run under the scheduler lock, so they are serialized against each
 /// other, and the raise stores the hint after the state it describes.
-static SIGNAL_PENDING: [AtomicBool; MAX_SCHEDULER_TASKS] =
-    [const { AtomicBool::new(false) }; MAX_SCHEDULER_TASKS];
 
 /// Raises the hint for `slot`. Callers must hold the scheduler lock and must
 /// already have written the pending state this advertises.
 pub(super) fn raise_signal_pending(slot: usize) {
-    if let Some(flag) = SIGNAL_PENDING.get(slot) {
+    if let Some(flag) = task_table::try_get(slot).map(|task| &task.signal_pending) {
         // ORDERING: Release publishes the pending-signal state written before
         // this call to any reader that observes the raised hint.
         flag.store(true, Ordering::Release);
@@ -606,7 +603,8 @@ pub(super) fn raise_signal_pending(slot: usize) {
 /// callers hold the Linux-thread leaf through mutation/snapshot and this
 /// store, which serializes every raise without the Scheduler guard.
 pub(super) fn sync_signal_pending(slot: usize, pending: bool) {
-    if let Some(flag) = SIGNAL_PENDING.get(slot) {
+    if let Some(flag) = task_table::try_get(slot).map(|task| &task.signal_pending) {
+        // ORDERING: Release publishes recomputed pending-signal state under leaf lock.
         flag.store(pending, Ordering::Release);
     }
 }
@@ -614,8 +612,8 @@ pub(super) fn sync_signal_pending(slot: usize, pending: bool) {
 /// Reads the hint for `slot`. An unknown slot reports `true` so the caller
 /// falls back to the authoritative locked query.
 pub(super) fn signal_pending(slot: usize) -> bool {
-    SIGNAL_PENDING
-        .get(slot)
+    task_table::try_get(slot)
+        .map(|task| &task.signal_pending)
         // ORDERING: Acquire pairs with the raising Release store.
         .is_none_or(|flag| flag.load(Ordering::Acquire))
 }
@@ -683,7 +681,7 @@ pub(super) fn publish_state(slot: usize, identity: TaskIdentity, lifecycle: Disp
 
 /// Called only with the matching per-slot writer lock held.
 fn commit_identity(slot: usize, identity: TaskIdentity, lifecycle: DispatchLifecycle) {
-    let Some(cell) = IDENTITIES.get(slot) else {
+    let Some(cell) = task_table::try_get(slot).map(|t| &*t.identity_pub) else {
         return;
     };
     // ORDERING: the per-slot writer owner excludes every other writer; the
@@ -764,7 +762,7 @@ pub(super) fn clear(slot: usize) {
 }
 
 fn clear_publication(slot: usize) {
-    let Some(cell) = IDENTITIES.get(slot) else {
+    let Some(cell) = task_table::try_get(slot).map(|t| &*t.identity_pub) else {
         return;
     };
     let version = cell.version.load(Ordering::Relaxed);
@@ -806,7 +804,7 @@ pub(super) fn read(slot: usize) -> Option<TaskIdentity> {
 /// and return validation ask only this, and a full `read` loads twelve fields
 /// and rebuilds the whole `TaskIdentity` to answer it.
 pub(super) fn read_user_abi(slot: usize) -> Option<Option<UserAbi>> {
-    let cell = IDENTITIES.get(slot)?;
+    let cell = task_table::try_get(slot).map(|t| &*t.identity_pub)?;
     // ORDERING: as in `read_state`; the flag load sits between two version
     // observations and is discarded unless both name the same stable commit.
     let before = cell.version.load(Ordering::Acquire);
@@ -826,7 +824,7 @@ pub(super) fn read_user_abi(slot: usize) -> Option<Option<UserAbi>> {
 
 /// Reads the immutable identity and lifecycle state from one stable commit.
 fn read_state(slot: usize) -> Option<(TaskIdentity, u32)> {
-    let cell = IDENTITIES.get(slot)?;
+    let cell = task_table::try_get(slot).map(|t| &*t.identity_pub)?;
     // ORDERING: Acquire pairs with the publishing Release store and orders the
     // field loads below after this version observation.
     let before = cell.version.load(Ordering::Acquire);
@@ -899,7 +897,7 @@ pub(super) struct TaskDispatch {
 /// trip. `None` is exactly `read_dispatch`'s `None`.
 #[inline]
 pub(super) fn read_task_dispatch(slot: usize) -> Option<TaskDispatch> {
-    let cell = IDENTITIES.get(slot)?;
+    let cell = task_table::try_get(slot).map(|t| &*t.identity_pub)?;
     // ORDERING: as `read_state`; the loads sit between two version observations
     // and are discarded unless both name the same stable commit.
     let before = cell.version.load(Ordering::Acquire);
@@ -995,7 +993,7 @@ mod tests {
         );
         clear(slot);
         assert_eq!(read(slot), None);
-        let cleared = &IDENTITIES[slot];
+        let cleared = &*task_table::get(slot).identity_pub;
         assert_eq!(cleared.task_id.load(Ordering::Relaxed), 0);
         assert_eq!(cleared.process_id.load(Ordering::Relaxed), 0);
     }
@@ -1099,7 +1097,7 @@ mod tests {
                 };
                 let region = super::super::pager_vma::publish(handle, process, template, 1).unwrap();
                 assert!(super::super::pager_vma::lookup(handle, process, start, VM_ACCESS_WRITE).is_ok());
-                let cell = &IDENTITIES[slot];
+                let cell = &*task_table::get(slot).identity_pub;
                 let before = cell.version.load(Ordering::Relaxed);
                 // Native input models the earlier metadata writer interval;
                 // the actual born Current bank, process/MM and VMA stay owned.
@@ -1146,7 +1144,7 @@ mod tests {
             ..incomplete
         };
         publish_test_identity(slot, complete);
-        let cell = &IDENTITIES[slot];
+        let cell = &*task_table::get(slot).identity_pub;
         let stable_version = cell.version.load(Ordering::Relaxed);
         cell.version
             .store(stable_version.wrapping_add(1), Ordering::Relaxed);
@@ -1184,14 +1182,14 @@ mod tests {
         }
         // A writer mid-update is absent on both reads.
         publish_state(slot, identity, DispatchLifecycle::default());
-        let cell = &IDENTITIES[slot];
+        let cell = &*task_table::get(slot).identity_pub;
         let stable = cell.version.load(Ordering::Relaxed);
         cell.version.store(stable.wrapping_add(1), Ordering::Relaxed);
         assert_eq!(read_task_dispatch(slot), None);
         cell.version.store(stable, Ordering::Relaxed);
         clear(slot);
         assert_eq!(read_task_dispatch(slot), None);
-        assert_eq!(read_task_dispatch(MAX_SCHEDULER_TASKS), None);
+        assert_eq!(read_task_dispatch(task_table::MAX_TASK_SLOTS), None);
     }
 
     #[test]
@@ -1226,7 +1224,7 @@ mod tests {
             );
         }
         // A writer mid-update (odd version) is absent, never a stale answer.
-        let cell = &IDENTITIES[slot];
+        let cell = &*task_table::get(slot).identity_pub;
         let stable_version = cell.version.load(Ordering::Relaxed);
         cell.version
             .store(stable_version.wrapping_add(1), Ordering::Relaxed);
@@ -1234,7 +1232,7 @@ mod tests {
         cell.version.store(stable_version, Ordering::Relaxed);
         clear(slot);
         assert_eq!(read_user_abi(slot), None);
-        assert_eq!(read_user_abi(MAX_SCHEDULER_TASKS), None);
+        assert_eq!(read_user_abi(task_table::MAX_TASK_SLOTS), None);
     }
 
     #[test]
@@ -1242,8 +1240,8 @@ mod tests {
         let _process = crate::multitask::process_table::tests::isolate_process_table();
         let _cpu = crate::multitask::cpu_local::test_publication_lock();
         let _runtime = crate::multitask::scheduler::execution_test_serial_guard();
-        clear(MAX_SCHEDULER_TASKS - 1);
-        assert_eq!(read(MAX_SCHEDULER_TASKS - 1), None);
-        assert_eq!(read(MAX_SCHEDULER_TASKS), None);
+        clear(4095);
+        assert_eq!(read(4095), None);
+        assert_eq!(read(task_table::MAX_TASK_SLOTS), None);
     }
 }

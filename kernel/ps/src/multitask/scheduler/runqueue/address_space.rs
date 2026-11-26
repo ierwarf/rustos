@@ -4,15 +4,16 @@
 //! replace it only after its existing exact target-quiescence transaction, and
 //! terminal release clears it before the slot can be reused.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
-use super::{MAX_TASK, RunOwnerState, owner};
-
-static ROOTS: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
+use super::{RunOwnerState, owner};
+use crate::multitask::task_table;
 
 pub(in crate::multitask) fn reset_before_publication() {
-    for root in &ROOTS {
-        root.store(0, Ordering::Release);
+    for slot in task_table::allocated_slots() {
+        task_table::get(slot)
+            .address_space_root
+            .store(0, Ordering::Release);
     }
 }
 
@@ -23,14 +24,15 @@ pub(in crate::multitask) fn initialize(slot: usize, value: u64) {
         "scheduler address-space root initialized after owner publication"
     );
     assert_ne!(value, 0, "scheduler address-space root is zero");
-    ROOTS[slot].store(value, Ordering::Release);
+    task_table::get(slot)
+        .address_space_root
+        .store(value, Ordering::Release);
 }
 
 #[inline]
 pub(in crate::multitask) fn root(slot: usize) -> u64 {
-    ROOTS
-        .get(slot)
-        .expect("scheduler address-space root slot exceeds capacity")
+    task_table::get(slot)
+        .address_space_root
         .load(Ordering::Acquire)
 }
 
@@ -38,13 +40,14 @@ pub(in crate::multitask) fn root(slot: usize) -> u64 {
 pub(in crate::multitask) fn replace(slot: usize, value: u64) {
     super::super::outgoing_image::assert_mutable(slot);
     assert_ne!(value, 0, "scheduler address-space root is zero");
-    ROOTS
-        .get(slot)
-        .expect("scheduler address-space root slot exceeds capacity")
+    task_table::get(slot)
+        .address_space_root
         .store(value, Ordering::Release);
 }
 
 pub(in crate::multitask) fn clear(slot: usize) {
     super::super::outgoing_image::assert_mutable(slot);
-    ROOTS[slot].store(0, Ordering::Release);
+    task_table::get(slot)
+        .address_space_root
+        .store(0, Ordering::Release);
 }

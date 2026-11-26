@@ -5,7 +5,7 @@ pub use crate::ipc::{
     FastEndpointRollback, FastReplyCompletion, IPC_FAST_INLINE_BYTES, IPC_FAST_MAX_BYTES, IpcError,
     KernelEndpointHandle, KernelReplyHandle, KernelSharedRegionHandle,
     KernelSharedRegionMappingHold, KernelTransferTicket, KernelTransferredHandle,
-    MAX_ENDPOINT_WAKE_TASKS, PreparedReplyHandleBindError, ProcessIdentity, ReplyCompletion,
+    PreparedReplyHandleBindError, ProcessIdentity, ReplyCompletion,
     ReplySchedulingContextCustody, ReplySchedulingContextReturn, ServiceIdentity, TransferContext,
 };
 
@@ -37,6 +37,14 @@ pub mod endpoint {
 
     pub fn validate_request_shape(endpoint: KernelEndpointHandle, request_len: usize, count: usize) -> Result<(), IpcError> {
         crate::ipc::validate_endpoint_request_shape(endpoint, request_len, count)
+    }
+
+    pub fn pending_queue_full(endpoint: KernelEndpointHandle) -> bool {
+        crate::ipc::endpoint_pending_queue_full(endpoint)
+    }
+
+    pub fn queue_full_hits(endpoint: KernelEndpointHandle) -> Option<u64> {
+        crate::ipc::endpoint_queue_full_hits(endpoint)
     }
 
     pub fn enqueue_call(

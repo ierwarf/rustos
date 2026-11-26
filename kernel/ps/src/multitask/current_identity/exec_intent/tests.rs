@@ -25,7 +25,7 @@ fn recover() {
     with_writer(SLOT, |w| {
         w.exec_intent = None;
         w.lifecycle.exec_quiesced = false;
-        WORDS[SLOT].store(0, Ordering::Release);
+        word_cell(SLOT).store(0, Ordering::Release);
     });
     clear(SLOT);
 }
@@ -38,7 +38,7 @@ fn exact_cancel_then_new_reservation_rejects_old_image_cancel_and_drop_without_r
     old.prepare_cancel();
     old.cancel(process_table::test_exec_cancellation(stamp(1)));
     let next = begin(SLOT, ID, stamp(2), false).unwrap();
-    let word = WORDS[SLOT].load(Ordering::Acquire);
+    let word = word_cell(SLOT).load(Ordering::Acquire);
     assert!(!key.admits_image(SLOT, ID));
     let stale = Intent {
         key,
@@ -50,13 +50,13 @@ fn exact_cancel_then_new_reservation_rejects_old_image_cancel_and_drop_without_r
         std::panic::catch_unwind(|| stale.cancel(process_table::test_exec_cancellation(stamp(1))))
             .is_err()
     );
-    assert_eq!(WORDS[SLOT].load(Ordering::Acquire), word);
+    assert_eq!(word_cell(SLOT).load(Ordering::Acquire), word);
     assert!(lifecycle(SLOT).exec_quiesced);
     drop(Intent {
         key,
         live: Cell::new(true),
     });
-    assert_eq!(WORDS[SLOT].load(Ordering::Acquire), word);
+    assert_eq!(word_cell(SLOT).load(Ordering::Acquire), word);
     next.prepare_cancel();
     next.cancel(process_table::test_exec_cancellation(stamp(2)));
     clear(SLOT);
@@ -107,7 +107,7 @@ fn image_refusal_returns_to_same_sealed_owner_but_abandonment_and_publication_ne
     seed();
     let intent = begin(SLOT, ID, stamp(2), false).unwrap();
     drop(intent.image(stamp(2)).unwrap());
-    assert_eq!(WORDS[SLOT].load(Ordering::Acquire) & 7, POISONED);
+    assert_eq!(word_cell(SLOT).load(Ordering::Acquire) & 7, POISONED);
     drop(intent);
     recover();
 }

@@ -71,8 +71,7 @@ pub(super) struct Work {
 /// The original census payload travels with its original process pin. Never
 /// recollect live members after a terminal competitor forced a suspension.
 struct Captured {
-    members: [Member; MAX],
-    len: usize,
+    members: Vec<Member>,
     effects: bool,
 }
 
@@ -133,12 +132,11 @@ pub(in crate::multitask) fn target_by_pid(pid: u64) -> Option<(ProcessHandle, Me
     for cell in CELLS.iter() {
         if let Some(target) = cell.with(|s| {
             let h = s.handle?;
-            let (&m, _) = s
-                .members
+            let row = s
+                .rows
                 .iter()
-                .zip(s.stopped)
-                .find(|(m, stopped)| m.is_some_and(|(_, id)| id == pid) && !stopped)?;
-            Some((h, m.unwrap()))
+                .find(|row| row.member.1 == pid && !row.stopped)?;
+            Some((h, row.member))
         }) {
             return Some(target);
         }
@@ -154,13 +152,9 @@ fn live_member_of(handle: ProcessHandle) -> Option<Member> {
         if s.handle != Some(handle) {
             return None;
         }
-        (0..MAX).find_map(|i| {
-            let m = s.members[i]?;
-            (!s.stopped[i]
-                && !s.exit_detached[i]
-                && !s.exec_detached[i]
-                && !s.terminal_detached[i])
-                .then_some(m)
+        s.rows.iter().find_map(|row| {
+            (!row.stopped && !row.exit_detached && !row.exec_detached && !row.terminal_detached)
+                .then_some(row.member)
         })
     })
 }
@@ -210,15 +204,21 @@ pub(in crate::multitask) fn claim_next() -> Option<(ExitMembership, Reason)> {
                 captured,
                 ..
             } = s.exit_work.take().unwrap();
-            let Captured { members, len, effects } = captured.unwrap_or_else(|| {
-                let mut members = [(0, 0); MAX];
-                let mut len = 0;
-                for &m in s.members.iter().flatten() {
-                    members[len] = m;
-                    len += 1;
+            let Captured { members, effects } = captured.unwrap_or_else(|| {
+                let mut members = s
+                    .spare_exit
+                    .take()
+                    .expect("exit snapshot buffer must be reserved at join");
+                members.clear();
+                assert!(
+                    members.capacity() >= s.rows.len(),
+                    "exit snapshot buffer smaller than live rows"
+                );
+                for row in &s.rows {
+                    members.push(row.member);
                 }
-                assert!(len != 0, "queued exit lost complete stopped membership");
-                Captured { members, len, effects: false }
+                assert!(!members.is_empty(), "queued exit lost complete stopped membership");
+                Captured { members, effects: false }
             });
             s.exit.as_mut().unwrap().phase = if effects { Phase::Effects } else { Phase::Reserved };
             Some((
@@ -226,7 +226,6 @@ pub(in crate::multitask) fn claim_next() -> Option<(ExitMembership, Reason)> {
                     handle,
                     nonce,
                     members,
-                    len,
                     effects,
                     live: true,
                     _process: Some(process),
@@ -245,7 +244,10 @@ impl PendingExit {
     pub(in crate::multitask) fn begin(handle: ProcessHandle, target: Member) -> Option<Self> {
         let process = process_table::pin_owner::pin(handle)?;
         let nonce = cell(handle)?.with(|s| {
-            if s.handle != Some(handle) || s.exit.is_some() || !s.members.contains(&Some(target)) {
+            if s.handle != Some(handle)
+                || s.exit.is_some()
+                || !s.rows.iter().any(|row| row.member == target)
+            {
                 return None;
             }
             let nonce = s.exit_nonce.checked_add(1)?;
@@ -310,16 +312,22 @@ impl PendingExit {
             if s.joins != 0 || s.terminal.is_some() {
                 return None;
             }
-            let mut members = [(0, 0); MAX];
-            let mut len = 0;
-            for &m in s.members.iter().flatten() {
-                members[len] = m;
-                len += 1;
+            let mut members = s
+                .spare_exit
+                .take()
+                .expect("exit snapshot buffer must be reserved at join");
+            members.clear();
+            assert!(
+                members.capacity() >= s.rows.len(),
+                "exit snapshot buffer smaller than live rows"
+            );
+            for row in &s.rows {
+                members.push(row.member);
             }
             s.exit.as_mut().unwrap().phase = Phase::Reserved;
-            Some((members, len))
+            Some(members)
         });
-        let Some((members, len)) = captured else {
+        let Some(members) = captured else {
             return Err(self);
         };
         let process = self.process.take().expect("pending exit lost process pin");
@@ -328,7 +336,6 @@ impl PendingExit {
             handle: self.handle,
             nonce: self.nonce,
             members,
-            len,
             effects: false,
             live: true,
             _process: Some(process),
@@ -352,8 +359,7 @@ impl Drop for PendingExit {
 pub(in crate::multitask) struct ExitMembership {
     handle: ProcessHandle,
     nonce: u64,
-    members: [Member; MAX],
-    len: usize,
+    members: Vec<Member>,
     effects: bool,
     live: bool,
     _process: Option<ProcessObjectPin>,
@@ -363,21 +369,28 @@ impl ExitMembership {
     #[cfg(test)]
     pub(in crate::multitask) fn begin(handle: ProcessHandle, target: Member) -> Option<Self> {
         let process = process_table::pin_owner::pin(handle)?;
-        let (nonce, members, len) = cell(handle)?.with(|s| {
+        let cell = cell(handle)?;
+        let (nonce, members) = cell.with(|s| {
             if s.handle != Some(handle)
                 || s.exit.is_some()
                 || s.terminal.is_some()
                 || s.joins != 0
-                || !s.members.contains(&Some(target))
+                || !s.rows.iter().any(|row| row.member == target)
             {
                 return None;
             }
             let nonce = s.exit_nonce.checked_add(1)?;
-            let mut members = [(0, 0); MAX];
-            let mut len = 0;
-            for &m in s.members.iter().flatten() {
-                members[len] = m;
-                len += 1;
+            let mut members = s
+                .spare_exit
+                .take()
+                .expect("exit snapshot buffer must be reserved at join");
+            members.clear();
+            assert!(
+                members.capacity() >= s.rows.len(),
+                "exit snapshot buffer smaller than live rows"
+            );
+            for row in &s.rows {
+                members.push(row.member);
             }
             s.exit_nonce = nonce;
             s.exit = Some(Record {
@@ -385,13 +398,12 @@ impl ExitMembership {
                 phase: Phase::Reserved,
                 queued: false,
             });
-            Some((nonce, members, len))
+            Some((nonce, members))
         })?;
         Some(Self {
             handle,
             nonce,
             members,
-            len,
             effects: false,
             live: true,
             _process: Some(process),
@@ -406,7 +418,7 @@ impl ExitMembership {
                 .is_some_and(|r| r.nonce == self.nonce && r.queued == self.queued_reason.is_some())
     }
     pub(in crate::multitask) fn members(&self) -> &[Member] {
-        &self.members[..self.len]
+        &self.members
     }
 
     pub(in crate::multitask) fn handle(&self) -> ProcessHandle {
@@ -419,10 +431,9 @@ impl ExitMembership {
                 self.exact(s),
                 "group exit stopped observation lost exact census"
             );
-            s.members
+            s.rows
                 .iter()
-                .zip(s.stopped)
-                .any(|(&m, stopped)| m == Some(member) && stopped)
+                .any(|row| row.member == member && row.stopped)
         })
     }
     pub(in crate::multitask) fn effects_started(&self) -> bool {
@@ -439,8 +450,7 @@ impl ExitMembership {
             process: self._process.take().expect("exit suspension lost original process pin"),
             reason,
             captured: Some(Captured {
-                members: self.members,
-                len: self.len,
+                members: core::mem::take(&mut self.members),
                 effects: self.effects,
             }),
         };
@@ -472,6 +482,7 @@ impl ExitMembership {
                     || current_identity::terminal_retired_matches(slot, id)),
             "group exit ACK lacks exact desired terminal bindings"
         );
+        let mut members = core::mem::take(&mut self.members);
         cell(self.handle).unwrap().with(|s| {
             assert!(
                 self.exact(s) && s.exit.unwrap().phase == Phase::Effects,
@@ -482,6 +493,8 @@ impl ExitMembership {
                 s.exit_done_nonce = self.nonce;
             }
             s.exit = None;
+            members.clear();
+            s.spare_exit = Some(members);
             s.prune_exit_detached();
             s.release_empty();
         });
@@ -502,11 +515,12 @@ impl Drop for ExitMembership {
                 .expect("queued exit abandonment lost process pin"),
             reason,
             captured: Some(Captured {
-                members: self.members,
-                len: self.len,
+                members: core::mem::take(&mut self.members),
                 effects: self.effects,
             }),
         });
+        let mut spare = (retained.is_none() && !self.effects)
+            .then(|| core::mem::take(&mut self.members));
         cell(self.handle).unwrap().with(|s| {
             assert!(self.exact(s), "group exit rollback lost exact census");
             if self.effects || retained.is_some() {
@@ -517,9 +531,17 @@ impl Drop for ExitMembership {
                         "abandoned exit duplicated row custody"
                     );
                     s.exit_work = Some(work);
+                } else {
+                    let mut members = core::mem::take(&mut self.members);
+                    members.clear();
+                    s.spare_exit = Some(members);
                 }
             } else {
                 s.exit = None;
+                if let Some(mut members) = spare.take() {
+                    members.clear();
+                    s.spare_exit = Some(members);
+                }
                 s.prune_exit_detached();
                 s.release_empty();
             }

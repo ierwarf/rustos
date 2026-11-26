@@ -5,10 +5,12 @@
 //! Failure: busy reporter refuses without consuming; counters saturate.
 //! Forbidden: no dispatch/billing/lifetime grants, allocation or lower owners.
 //! Evidence: independent cell/epoch/tuple/UID witnesses, not hardware proof.
+use crate::multitask::task_table;
 use super::{
     SCHEDULER_ENTRY_CAUSE_COUNT, SCHEDULER_PHASE_COUNT, SchedulerEntryCause, SchedulerPhase,
 };
-use crate::multitask::scheduler::{MAX_TASK, NO_IDLE_CPU};
+use crate::multitask::scheduler::NO_IDLE_CPU;
+use alloc::vec::Vec;
 use core::{
     panic::Location,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -18,17 +20,19 @@ use crate::multitask::irq_leaf::IrqLeaf;
 
 pub(in crate::multitask) struct Counters {
     pub runtime_profile_started_ticks: u64,
-    pub runtime_profile_ns: [u64; MAX_TASK],
-    pub runtime_profile_dispatches: [u64; MAX_TASK],
+    /// Per-slot totals; sized once by `size` at boot, empty before. Never
+    /// resized afterwards, so the IRQ-side accounting does not allocate.
+    pub runtime_profile_ns: Vec<u64>,
+    pub runtime_profile_dispatches: Vec<u64>,
     pub runtime_profile_entry_counts: [u64; SCHEDULER_ENTRY_CAUSE_COUNT],
     pub runtime_profile_same_task_dispatches: u64,
     pub runtime_profile_task_switches: u64,
     pub runtime_profile_address_space_switches: u64,
     pub runtime_profile_cross_cpu_migrations: u64,
     #[cfg(test)]
-    pub runtime_profile_last_cpu: [u8; MAX_TASK],
+    pub runtime_profile_last_cpu: Vec<u8>,
     #[cfg(test)]
-    pub runtime_profile_last_task_id: [u64; MAX_TASK],
+    pub runtime_profile_last_task_id: Vec<u64>,
     pub runtime_profile_lock_acquisitions: u64,
     pub runtime_profile_lock_wait_ns: u64,
     pub runtime_profile_lock_hold_ns: u64,
@@ -47,17 +51,17 @@ impl Counters {
     pub const fn new() -> Self {
         Self {
             runtime_profile_started_ticks: 0,
-            runtime_profile_ns: [0; MAX_TASK],
-            runtime_profile_dispatches: [0; MAX_TASK],
+            runtime_profile_ns: Vec::new(),
+            runtime_profile_dispatches: Vec::new(),
             runtime_profile_entry_counts: [0; SCHEDULER_ENTRY_CAUSE_COUNT],
             runtime_profile_same_task_dispatches: 0,
             runtime_profile_task_switches: 0,
             runtime_profile_address_space_switches: 0,
             runtime_profile_cross_cpu_migrations: 0,
             #[cfg(test)]
-            runtime_profile_last_cpu: [NO_IDLE_CPU; MAX_TASK],
+            runtime_profile_last_cpu: Vec::new(),
             #[cfg(test)]
-            runtime_profile_last_task_id: [0; MAX_TASK],
+            runtime_profile_last_task_id: Vec::new(),
             runtime_profile_lock_acquisitions: 0,
             runtime_profile_lock_wait_ns: 0,
             runtime_profile_lock_hold_ns: 0,
@@ -69,6 +73,16 @@ impl Counters {
             runtime_profile_phase_ns: [0; SCHEDULER_PHASE_COUNT],
             runtime_profile_runnable_samples: 0,
             phase_lifetime_ns: 0,
+        }
+    }
+    /// Gives the per-slot totals room for `slots` slots (boot or test fixture).
+    pub fn size(&mut self, slots: usize) {
+        self.runtime_profile_ns.resize(slots, 0);
+        self.runtime_profile_dispatches.resize(slots, 0);
+        #[cfg(test)]
+        {
+            self.runtime_profile_last_cpu.resize(slots, NO_IDLE_CPU);
+            self.runtime_profile_last_task_id.resize(slots, 0);
         }
     }
     pub fn account(&mut self, slot: usize, ns: u64) {
@@ -105,28 +119,65 @@ impl Counters {
             self.runtime_profile_lock_hold_max_attributed_ns = attributed;
         }
     }
-    pub(super) fn take(&mut self) -> Self {
-        #[cfg_attr(not(test), allow(unused_mut))]
-        let mut window = core::mem::replace(self, Self::new());
-        self.phase_lifetime_ns = window.phase_lifetime_ns;
+    /// Zeroes the window and keeps the provisioned storage and the monotonic
+    /// open-turn phase baseline. Moves the vectors instead of reallocating.
+    fn clear_window(&mut self) {
+        let mut ns = core::mem::take(&mut self.runtime_profile_ns);
+        let mut dispatches = core::mem::take(&mut self.runtime_profile_dispatches);
+        ns.fill(0);
+        dispatches.fill(0);
+        #[cfg(test)]
+        let (last_cpu, last_task_id) = (
+            core::mem::take(&mut self.runtime_profile_last_cpu),
+            core::mem::take(&mut self.runtime_profile_last_task_id),
+        );
+        let phase_lifetime_ns = self.phase_lifetime_ns;
+        *self = Self::new();
+        self.runtime_profile_ns = ns;
+        self.runtime_profile_dispatches = dispatches;
+        self.phase_lifetime_ns = phase_lifetime_ns;
         #[cfg(test)]
         {
-            core::mem::swap(
-                &mut self.runtime_profile_last_cpu,
-                &mut window.runtime_profile_last_cpu,
-            );
-            core::mem::swap(
-                &mut self.runtime_profile_last_task_id,
-                &mut window.runtime_profile_last_task_id,
-            );
+            self.runtime_profile_last_cpu = last_cpu;
+            self.runtime_profile_last_task_id = last_task_id;
         }
+    }
+    /// Zeroes everything, including the phase baseline (boot or fixture reset).
+    pub(in crate::multitask) fn clear_all(&mut self) {
+        self.clear_window();
+        self.phase_lifetime_ns = 0;
+        #[cfg(test)]
+        {
+            self.runtime_profile_last_cpu.fill(NO_IDLE_CPU);
+            self.runtime_profile_last_task_id.fill(0);
+        }
+    }
+    /// Adds this cell into `window` and starts the cell's next window.
+    fn drain_into(&mut self, window: &mut Counters) {
+        window.merge(self);
+        self.clear_window();
+    }
+    /// An owned copy of this cell's window; the cell starts a new one.
+    #[cfg(test)]
+    pub(super) fn take(&mut self) -> Self {
+        let mut window = Counters::new();
+        window.size(self.runtime_profile_ns.len());
+        window.runtime_profile_started_ticks = self.runtime_profile_started_ticks;
+        window.phase_lifetime_ns = self.phase_lifetime_ns;
+        window.merge(self);
+        self.clear_window();
         window
     }
-    fn merge(&mut self, other: Self) {
-        for slot in 0..MAX_TASK {
-            self.account(slot, other.runtime_profile_ns[slot]);
-            self.runtime_profile_dispatches[slot] = self.runtime_profile_dispatches[slot]
-                .saturating_add(other.runtime_profile_dispatches[slot]);
+    fn merge(&mut self, other: &Counters) {
+        for (n, v) in self.runtime_profile_ns.iter_mut().zip(&other.runtime_profile_ns) {
+            *n = n.saturating_add(*v);
+        }
+        for (n, v) in self
+            .runtime_profile_dispatches
+            .iter_mut()
+            .zip(&other.runtime_profile_dispatches)
+        {
+            *n = n.saturating_add(*v);
         }
         for (n, v) in self
             .runtime_profile_entry_counts
@@ -171,6 +222,13 @@ impl Cell {
     const fn new() -> Self {
         Self(Leaf::new(Counters::new()))
     }
+    /// A standalone cell with per-slot storage, for fixtures.
+    #[cfg(test)]
+    fn sized() -> Self {
+        let cell = Self::new();
+        cell.with(|row| row.size(task_table::allocated_slot_bound().max(64)));
+        cell
+    }
     fn with<R>(&self, f: impl FnOnce(&mut Counters) -> R) -> R {
         #[cfg(not(test))]
         {
@@ -187,6 +245,23 @@ static CELLS: [Cell; CPUS] = [const { Cell::new() }; CPUS];
 static STARTED: AtomicU64 = AtomicU64::new(0);
 static DRAINING: AtomicBool = AtomicBool::new(false);
 struct Drain;
+/// The collector's accumulator. Its only user holds `DRAINING`, through `Window`.
+struct WindowCell(core::cell::UnsafeCell<Counters>);
+// SAFETY: access is exclusive under the `DRAINING` flag, as documented on `Window`.
+unsafe impl Sync for WindowCell {}
+static WINDOW: WindowCell = WindowCell(core::cell::UnsafeCell::new(Counters::new()));
+/// A consumed counter window, borrowed from the collector accumulator. Holding
+/// it keeps the collector custody, so the next drain waits for its projection.
+pub(super) struct Window {
+    _drain: Drain,
+}
+impl core::ops::Deref for Window {
+    type Target = Counters;
+    fn deref(&self) -> &Counters {
+        // SAFETY: `_drain` holds the exclusive `DRAINING` custody of `WINDOW`.
+        unsafe { &*WINDOW.0.get() }
+    }
+}
 impl Drop for Drain {
     fn drop(&mut self) {
         // ORDERING: finish every cell drain before another reporter may begin.
@@ -265,8 +340,10 @@ fn lane_fold(cpu: usize, pending: &mut LanePending) {
     *pending = LanePending::new();
     CELLS[cpu].with(|row| {
         for entry in &entries[..used] {
-            row.runtime_profile_dispatches[entry.slot] =
-                row.runtime_profile_dispatches[entry.slot].saturating_add(entry.dispatches);
+            if entry.slot < row.runtime_profile_dispatches.len() {
+                row.runtime_profile_dispatches[entry.slot] =
+                    row.runtime_profile_dispatches[entry.slot].saturating_add(entry.dispatches);
+            }
             row.account(entry.slot, entry.ns);
         }
         row.runtime_profile_task_switches =
@@ -357,22 +434,23 @@ impl History {
         }
     }
 }
-static HISTORY: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
 pub(in crate::multitask::scheduler) fn migration(slot: usize, id: u64, cpu: u8) -> bool {
     let next = History { id: Some(id), cpu }.encode();
     // ORDERING: Relaxed; a diagnostic tuple published and consumed as one word.
-    let row = History::decode(HISTORY[slot].swap(next, Ordering::Relaxed));
+    let row = History::decode(task_table::get(slot).profile_history.swap(next, Ordering::Relaxed));
     row.id == Some(id) && row.cpu != NO_IDLE_CPU && row.cpu != cpu
 }
 pub(in crate::multitask::scheduler) fn clear_history(slot: usize) {
     // ORDERING: Relaxed; see `migration`.
-    HISTORY[slot].store(0, Ordering::Relaxed);
+    if let Some(task) = task_table::try_get(slot) {
+        task.profile_history.store(0, Ordering::Relaxed);
+    }
 }
 fn due(now: u64, started: u64, period: u64) -> bool {
     now.saturating_sub(started) >= period
 }
 
-pub(super) fn take(now: u64, period: u64) -> Option<Counters> {
+pub(super) fn take(now: u64, period: u64) -> Option<Window> {
     // Ordinary IRQ turns only read the epoch: no global hot CAS/guard.
     // ORDERING: read the latest report epoch without writing a hot global line.
     let observed = STARTED.load(Ordering::Acquire);
@@ -386,7 +464,7 @@ pub(super) fn take(now: u64, period: u64) -> Option<Counters> {
     {
         return None;
     }
-    let _drain = Drain;
+    let drain = Drain;
     // ORDERING: recheck epoch after collector admission, not a copied precheck.
     let old = STARTED.load(Ordering::Acquire);
     if old == 0 {
@@ -402,10 +480,17 @@ pub(super) fn take(now: u64, period: u64) -> Option<Counters> {
     {
         return None;
     }
-    let mut window = Counters::new();
-    window.runtime_profile_started_ticks = old;
+    let window = Window { _drain: drain };
+    // SAFETY: the `DRAINING` custody held by `window` excludes every other user.
+    let counters = unsafe { &mut *WINDOW.0.get() };
+    let needed = task_table::allocated_slot_bound().max(64);
+    if counters.runtime_profile_ns.len() < needed {
+        counters.size(needed);
+    }
+    counters.clear_all();
+    counters.runtime_profile_started_ticks = old;
     for cell in &CELLS {
-        window.merge(cell.with(Counters::take));
+        cell.with(|row| row.drain_into(counters));
     }
     Some(window)
 }
@@ -413,14 +498,26 @@ pub(in crate::multitask::scheduler) fn reset_before_boot() {
     // ORDERING: boot reset precedes any CPU diagnostic publication.
     STARTED.store(0, Ordering::Release);
     for cell in &CELLS {
-        cell.with(|row| *row = Counters::new());
+        cell.with(Counters::clear_all);
     }
     for cpu in 0..CPUS {
         *lane_pending(cpu) = LanePending::new();
     }
-    for slot in 0..MAX_TASK {
+    for slot in task_table::allocated_slots() {
         clear_history(slot);
     }
 }
 #[cfg(test)]
 mod tests;
+
+/// Grows each CPU's diagnostic slot vectors when `TaskTable` expands in unmasked context.
+pub(in crate::multitask) fn ensure_slots(slots: usize) {
+    let target = slots.max(64);
+    for cell in &CELLS {
+        cell.with(|row| {
+            if row.runtime_profile_ns.len() < target {
+                row.size(target);
+            }
+        });
+    }
+}

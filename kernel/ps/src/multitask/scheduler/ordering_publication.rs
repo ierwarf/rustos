@@ -133,10 +133,10 @@ fn process_in(scope: &DispatchPreemption<'_>, pid: u64) -> Option<u64> {
     // pinned candidate copied a full task context twice, on every call. When
     // the winner cannot be pinned, fall back to pinning every candidate.
     let key = |slot: usize| (runqueue::vruntime(slot), slot);
-    let target = match (0..MAX_TASK).filter(|&slot| published(slot)).min_by_key(|&slot| key(slot)) {
+    let target = match crate::multitask::task_table::active_slots().filter(|&slot| published(slot)).min_by_key(|&slot| key(slot)) {
         Some(slot) => match capture(slot) {
             Some(target) => target,
-            None => (0..MAX_TASK).filter(|&slot| published(slot)).filter_map(capture)
+            None => crate::multitask::task_table::active_slots().filter(|&slot| published(slot)).filter_map(capture)
                 .min_by_key(|target| key(target.binding.slot()))?,
         },
         None => return None,

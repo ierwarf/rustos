@@ -49,10 +49,12 @@ const PAGE_SIZE: usize = 4096;
 #[cfg(not(test))]
 const MIN_HEAP_SIZE: usize = 64 * 1024 * 1024;
 #[cfg(not(test))]
-/// Every task owns a 2 MiB heap-backed kernel stack and the table holds 256
-/// tasks, so the heap must reach 512 MiB of stacks plus the ordinary kernel
-/// allocations before a full task table is reachable.
-const MAX_HEAP_SIZE: usize = 1024 * 1024 * 1024;
+/// Initial boot heap ceiling; additional physical chunks are added on demand by
+/// `BuddyBackend::grow` when task objects, page tables, or IPC state outgrow
+/// the initial pool.
+const INITIAL_BOOT_HEAP_BYTES: usize = 256 * 1024 * 1024;
+#[cfg(not(test))]
+const MIN_GROW_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// Independent tracker shards; a pointer always hashes to the same shard.
 const TRACKER_SHARD_BITS: u32 = 4;
 const TRACKER_SHARDS: usize = 1 << TRACKER_SHARD_BITS;
@@ -86,9 +88,14 @@ const DEBUGCON_PORT: u16 = 0x00e9;
 
 #[cfg(not(test))]
 static HEAP_INIT: Once<()> = Once::new();
+/// Bytes donated to the heap by `init_heap`; zero before it ran (and in host
+/// tests, which never initialize the production heap).
+static HEAP_PROVISIONED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(not(test))]
 static HEAP: LockedHeap<HEAP_ORDER> = LockedHeap::<HEAP_ORDER>::new();
+#[cfg(not(test))]
+static HEAP_GROW_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(not(test))]
 static HEAP_CORE: HeapCore<BuddyBackend> = HeapCore::new(BuddyBackend);
 
@@ -351,6 +358,11 @@ trait BlockBackend {
     /// Up to `out.len()` blocks under one backend critical section; returns
     /// the number written.
     fn alloc_batch(&self, layout: Layout, out: &mut [usize]) -> usize;
+    /// Expands backing memory for at least `min_bytes` when current storage is
+    /// exhausted.
+    fn grow(&self, _min_bytes: usize) -> bool {
+        false
+    }
     /// # Safety
     /// `ptr` came from this backend with exactly `layout` and is not in use.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout);
@@ -384,6 +396,44 @@ impl BlockBackend for BuddyBackend {
             }
         }
         filled
+    }
+
+    fn grow(&self, min_bytes: usize) -> bool {
+        let _grow_guard = HEAP_GROW_LOCK.lock();
+        let min_pages = min_bytes.max(PAGE_SIZE).div_ceil(PAGE_SIZE);
+        let desired_pages = min_bytes
+            .next_power_of_two()
+            .max(MIN_GROW_CHUNK_BYTES)
+            .div_ceil(PAGE_SIZE)
+            .max(min_pages);
+        let mut chunk_pages = desired_pages;
+        while chunk_pages >= min_pages {
+            if let Some(chunk_phys) = phys::alloc_contiguous(chunk_pages) {
+                let chunk_bytes = chunk_pages * PAGE_SIZE;
+                let end_phys = chunk_phys.as_u64().saturating_add(chunk_bytes as u64);
+                if end_phys > kernel_vm::DIRECT_MAP_PHYS_LIMIT {
+                    for page in 0..chunk_pages {
+                        let _ = phys::try_free_frame(chunk_phys + (page as u64) * (PAGE_SIZE as u64));
+                    }
+                    return false;
+                }
+                let chunk_start = kernel_vm::higher_half_addr(chunk_phys.as_u64()) as usize;
+                let chunk_end = chunk_start + chunk_bytes;
+                let mut heap = HEAP.lock();
+                // SAFETY: `chunk_phys..chunk_phys + chunk_bytes` was uniquely allocated from
+                // `phys::alloc_contiguous` inside `DIRECT_MAP_PHYS_LIMIT`, is direct-mapped RW,
+                // and has not yet been exposed to the buddy allocator.
+                unsafe { heap.add_to_heap(chunk_start, chunk_end) };
+                drop(heap);
+                HEAP_PROVISIONED.fetch_add(chunk_bytes, core::sync::atomic::Ordering::Relaxed);
+                return true;
+            }
+            if chunk_pages == min_pages {
+                break;
+            }
+            chunk_pages = (chunk_pages / 2).max(min_pages);
+        }
+        false
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -517,9 +567,16 @@ impl<B: BlockBackend> HeapCore<B> {
             return ptr;
         }
         // Idle cached blocks keep the buddy from coalescing; reclaim them
-        // before reporting exhaustion.
+        // before growing or reporting exhaustion.
         self.drain_all();
-        self.backend.alloc(layout)
+        let ptr = self.backend.alloc(layout);
+        if !ptr.is_null() {
+            return ptr;
+        }
+        if self.backend.grow(layout.size().max(layout.align())) {
+            return self.backend.alloc(layout);
+        }
+        ptr::null_mut()
     }
 
     fn alloc_small(&self, cpu: usize, class: usize, bytes: usize) -> *mut u8 {
@@ -550,7 +607,14 @@ impl<B: BlockBackend> HeapCore<B> {
             }
         }
         self.drain_all();
-        self.backend.alloc(block_layout)
+        let ptr = self.backend.alloc(block_layout);
+        if !ptr.is_null() {
+            return ptr;
+        }
+        if self.backend.grow(bytes) {
+            return self.backend.alloc(block_layout);
+        }
+        ptr::null_mut()
     }
 
     /// Validates `layout` against provenance, then returns the span.
@@ -769,8 +833,8 @@ pub fn init_heap() {
     HEAP_INIT.call_once(|| unsafe {
         let usable_bytes = phys::usable_bytes() as usize;
         let target_bytes = usable_bytes
-            .saturating_div(4)
-            .clamp(MIN_HEAP_SIZE, MAX_HEAP_SIZE);
+            .saturating_div(16)
+            .clamp(MIN_HEAP_SIZE, INITIAL_BOOT_HEAP_BYTES);
         let mut remaining_pages = target_bytes.div_ceil(PAGE_SIZE);
         let mut heap = HEAP.lock();
         let mut initialized = false;
@@ -802,7 +866,17 @@ pub fn init_heap() {
                 target_bytes, added_bytes
             );
         }
+        // ORDERING: Release publishes the final size with the completed heap.
+        HEAP_PROVISIONED.store(added_bytes, core::sync::atomic::Ordering::Release);
     });
+}
+
+/// Bytes the kernel heap was provisioned with at boot (stable for the life of
+/// the kernel). Zero until `init_heap` completes. Sizing input for boot-time
+/// tables that scale with the heap, such as the scheduler task table.
+pub fn provisioned_bytes() -> usize {
+    // ORDERING: Acquire pairs with the Release store in `init_heap`.
+    HEAP_PROVISIONED.load(core::sync::atomic::Ordering::Acquire)
 }
 
 #[cfg(test)]

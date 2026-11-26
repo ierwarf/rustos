@@ -7,15 +7,16 @@
 //! Evidence: actual shared wait CAS and original physical Binding; native entry is modeled.
 use super::*;
 use crate::multitask::scheduler::wake_publication::Binding;
+use crate::multitask::task_table;
 use nucleus_core::util::lockdep::LockClass;
 use crate::multitask::irq_leaf::IrqLeaf;
 
-pub(super) struct State {
+pub(in crate::multitask) struct State {
     serial: u64,
     pending: Option<u64>,
 }
 impl State {
-    const fn new() -> Self {
+    pub(in crate::multitask) const fn new() -> Self {
         Self {
             serial: 0,
             pending: None,
@@ -32,11 +33,15 @@ impl State {
         self.pending.is_none()
     }
 }
-static EPOCHS: [IrqLeaf<State, { LockClass::TaskWaitEpoch as u8 }>; MAX_TASK] =
-    [const { IrqLeaf::new(State::new()) }; MAX_TASK];
+pub(in crate::multitask) type WaitEpochLeaf =
+    IrqLeaf<State, { LockClass::TaskWaitEpoch as u8 }>;
+
+pub(in crate::multitask) const fn new_wait_epoch_leaf() -> WaitEpochLeaf {
+    IrqLeaf::new(State::new())
+}
 
 pub(super) fn with<R>(slot: usize, f: impl FnOnce(&mut State) -> R) -> R {
-    f(&mut EPOCHS[slot].lock())
+    f(&mut task_table::get(slot).wait_epoch.lock())
 }
 
 /// What a refused wake observed about the target's wait, for a later retry.

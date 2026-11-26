@@ -37,11 +37,7 @@ fn neighbour() {
     );
 }
 fn contains(slot: usize) -> bool {
-    let word = slot / 64;
-    let bit = slot % 64;
-    // ORDERING: inspect the exact published queue membership after its Release,
-    // not the native all-slots candidate scan or any execution permission.
-    RUN_QUEUES[CPU].published_runnable[word].load(Ordering::Acquire) & (1_u64 << bit) != 0
+    local_runnable_slots(CPU).any(|candidate| candidate == slot)
 }
 
 #[test]

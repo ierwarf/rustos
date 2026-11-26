@@ -34,7 +34,7 @@ fn assert_binding(id: u64, slot: usize) {
 
 pub(super) fn hint_collision() {
     root_creation::tests::exec_root(5, false, boot(), |root, handle| {
-        let tid = 5 + MAX_TASK as u64;
+        let tid = 5 + 1024;
         let peer = s::thread_creation::tests::active_sibling(root, tid, boot());
         // Real physical publications intentionally share the directory bucket.
         assert_binding(5, root);

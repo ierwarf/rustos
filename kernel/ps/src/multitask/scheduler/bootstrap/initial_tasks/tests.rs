@@ -102,7 +102,7 @@ fn actual_initial_image_ack_joins_hidden_descriptor_running_interval_and_origina
 fn actual_ap_initial_image_owns_only_its_cpu_and_never_reads_a_synthetic_saved_rsp() {
     born_initial(1, |image, backing| {
         let slot = image.slot();
-        assert_eq!(slot, MAX_TASK - 1);
+        assert_eq!(slot, 1);
         assert_eq!(runqueue::owner(slot).cpu, Some(1));
         assert!(runqueue::is_idle_slot(slot));
         assert_eq!(runqueue::saved_rsp(slot), 0);

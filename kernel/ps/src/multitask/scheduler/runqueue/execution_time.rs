@@ -1,20 +1,13 @@
 //! CPU-local execution-time baseline publication.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
-use super::MAX_TASK;
-
-static EXEC_START_LOCAL_NS: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-
-/// CPU time the slot's task has already been charged for settled execution
-/// intervals. The interval still open is added by the reader, so a thread asking
-/// about itself sees the time it is spending right now.
-static SETTLED_CPU_NS: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
+use crate::multitask::task_table;
 
 pub(super) fn clear(slot: usize) {
     set(slot, 0);
-    if let Some(settled) = SETTLED_CPU_NS.get(slot) {
-        settled.store(0, Ordering::Release);
+    if let Some(task) = task_table::try_get(slot) {
+        task.settled_cpu_ns.store(0, Ordering::Release);
     }
 }
 
@@ -23,20 +16,19 @@ pub(super) fn clear(slot: usize) {
 /// Only the execution owner settles an interval, so there is one writer per
 /// slot; the reader is that same task, so a plain add is exact.
 pub(in crate::multitask) fn charge(slot: usize, elapsed_ns: u64) {
-    if let Some(settled) = SETTLED_CPU_NS.get(slot) {
-        settled.fetch_add(elapsed_ns, Ordering::AcqRel);
+    if let Some(task) = task_table::try_get(slot) {
+        task.settled_cpu_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
     }
 }
 
 /// Settled CPU time plus the part of the open interval measured on the same
 /// CPU-local clock the interval itself is charged with.
 pub(in crate::multitask) fn consumed(slot: usize, now_local_ns: Option<u64>) -> u64 {
-    let settled = SETTLED_CPU_NS
-        .get(slot)
-        .map_or(0, |settled| settled.load(Ordering::Acquire));
-    let start = EXEC_START_LOCAL_NS
-        .get(slot)
-        .map_or(0, |start| start.load(Ordering::Acquire));
+    let Some(task) = task_table::try_get(slot) else {
+        return 0;
+    };
+    let settled = task.settled_cpu_ns.load(Ordering::Acquire);
+    let start = task.exec_start_local_ns.load(Ordering::Acquire);
     let open = now_local_ns
         .filter(|now| start != 0 && *now >= start)
         .map_or(0, |now| now - start);
@@ -44,18 +36,16 @@ pub(in crate::multitask) fn consumed(slot: usize, now_local_ns: Option<u64>) -> 
 }
 
 pub(in crate::multitask) fn set(slot: usize, value: u64) {
-    EXEC_START_LOCAL_NS
-        .get(slot)
-        .expect("scheduler local execution baseline slot exceeds capacity")
+    task_table::get(slot)
+        .exec_start_local_ns
         .store(value, Ordering::Release);
 }
 
 pub(super) fn reset_before_publication() {
-    for baseline in &EXEC_START_LOCAL_NS {
-        baseline.store(0, Ordering::Release);
-    }
-    for settled in &SETTLED_CPU_NS {
-        settled.store(0, Ordering::Release);
+    for slot in task_table::allocated_slots() {
+        let task = task_table::get(slot);
+        task.exec_start_local_ns.store(0, Ordering::Release);
+        task.settled_cpu_ns.store(0, Ordering::Release);
     }
 }
 
@@ -65,7 +55,7 @@ mod tests {
 
     #[test]
     fn consumed_is_settled_time_plus_the_open_interval_and_clear_resets_it() {
-        let slot = MAX_TASK - 1;
+        let slot = 41;
         clear(slot);
         assert_eq!(consumed(slot, Some(500)), 0);
 

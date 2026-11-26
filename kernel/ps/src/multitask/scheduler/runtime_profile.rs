@@ -324,22 +324,12 @@ const LONG_BLOCKED_REPORT_LIMIT: usize = 8;
 /// Owner generation each slot had when this drain last saw it blocked, and
 /// the tick of that first sighting. The generation advances on every owner
 /// transition, so an unchanged one means the same wait never completed.
-static LONG_BLOCKED_GENERATION: [core::sync::atomic::AtomicU64; super::MAX_TASK] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; super::MAX_TASK];
-static LONG_BLOCKED_SINCE: [core::sync::atomic::AtomicU64; super::MAX_TASK] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; super::MAX_TASK];
-
-/// Names tasks whose reply or pager wait has not moved for seconds, with the
-/// wait object (reply or pager token). A lost wakeup otherwise shows up only as
-/// an idle machine and a service-level timeout far from the wait that was
-/// never completed. Receive waits are idle servers and generic waits are
-/// sleeps; neither is reported.
-/// Read-only over published owner words and wait payloads; grants nothing.
 fn report_long_blocked_tasks() {
     use core::sync::atomic::Ordering::Relaxed;
     let now = crate::arch::rtc::ticks();
     let mut reported = 0;
-    for slot in 0..super::MAX_TASK {
+    for slot in crate::multitask::task_table::active_slots() {
+        let task = crate::multitask::task_table::get(slot);
         let owner = super::runqueue::owner(slot);
         let (kind, object) = super::runqueue::wait::reason(slot);
         let watched = owner.state == super::runqueue::RunOwnerState::Blocked
@@ -349,14 +339,14 @@ fn report_long_blocked_tasks() {
                     | super::runqueue::wait::REASON_PAGER_FAULT
             );
         if !watched {
-            LONG_BLOCKED_GENERATION[slot].store(0, Relaxed);
+            task.long_blocked_gen.store(0, Relaxed);
             continue;
         }
-        if LONG_BLOCKED_GENERATION[slot].swap(owner.generation, Relaxed) != owner.generation {
-            LONG_BLOCKED_SINCE[slot].store(now, Relaxed);
+        if task.long_blocked_gen.swap(owner.generation, Relaxed) != owner.generation {
+            task.long_blocked_since.store(now, Relaxed);
             continue;
         }
-        let age = now.saturating_sub(LONG_BLOCKED_SINCE[slot].load(Relaxed));
+        let age = now.saturating_sub(task.long_blocked_since.load(Relaxed));
         if age < LONG_BLOCKED_REPORT_TICKS || reported == LONG_BLOCKED_REPORT_LIMIT {
             continue;
         }
@@ -366,7 +356,7 @@ fn report_long_blocked_tasks() {
         crate::debug::record_milestone(
             crate::debug::LogCategory::Sched,
             "kernel-scheduler-long-blocked",
-            ((slot as u64) << 48) | (task_id & 0xffff_ffff_ffff),
+            ((slot as u64) << 32) | (task_id & 0xffff_ffff),
             (u64::from(kind) << 56) | (object & 0x00ff_ffff_ffff_ffff),
         );
         if kind == super::runqueue::wait::REASON_ENDPOINT_REPLY
@@ -403,7 +393,7 @@ fn report_long_blocked_tasks() {
 
 /// Every task blocked in a receive on `endpoint`, with its owner state.
 fn report_endpoint_receivers(endpoint: u64) {
-    for slot in 0..super::MAX_TASK {
+    for slot in crate::multitask::task_table::active_slots() {
         let (kind, object) = super::runqueue::wait::reason(slot);
         if kind != super::runqueue::wait::REASON_ENDPOINT_RECEIVE || object != endpoint {
             continue;
@@ -943,8 +933,9 @@ pub(in crate::multitask) fn take_owned(
     let period = crate::arch::rtc::ticks_per_second();
     observe_original_current(turn);
     let window = owner::take(now, period)?;
-    let divergent = (0..MAX_TASK).find(|&slot| current_identity::binding_publication_diverges(slot));
-    Some(project_window(window, now, period, &|slot| {
+    let divergent = crate::multitask::task_table::active_slots()
+        .find(|&slot| current_identity::binding_publication_diverges(slot));
+    Some(project_window(&window, now, period, &|slot| {
         let p = current_identity::read_dispatch(slot);
         (p.and_then(|p| p.task_id).unwrap_or(0), p.and_then(|p| p.process_id).unwrap_or(0))
     }, super::donation_ledger::live_len() as u64, divergent))
@@ -1025,14 +1016,16 @@ mod tests {
         let mut window = counters.take();
         window.runtime_profile_started_ticks = started;
         counters.runtime_profile_started_ticks = now;
-        Some(super::project_window(window, now, period, &|_| (0, 0), 0, None))
+        Some(super::project_window(&window, now, period, &|_| (0, 0), 0, None))
     }
     use alloc::boxed::Box;
 
     use super::*;
 
     fn boxed_counters() -> Box<owner::Counters> {
-        Box::new(owner::Counters::new())
+        let mut counters = Box::new(owner::Counters::new());
+        counters.size(crate::multitask::task_table::allocated_slot_bound().max(64));
+        counters
     }
 
     #[test]
@@ -1197,7 +1190,7 @@ mod tests {
     #[test]
     fn acquisition_prologue_is_a_disjoint_segment_with_its_wake_count() {
         let _namespace = crate::multitask::scheduler::tests::boxed_scheduler();
-        owner::local(|row| *row = owner::Counters::new());
+        owner::local(owner::Counters::clear_all);
         record_prologue(0, 40);
         record_prologue(3, 260);
         let mut window = owner::local(|row| {

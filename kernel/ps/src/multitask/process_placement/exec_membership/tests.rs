@@ -149,8 +149,7 @@ fn before_image_drop_releases_only_exact_census_and_old_epoch_cannot_spend_next_
                     target: (SLOT, PID),
                     key: intent.credential(),
                     nonce,
-                    members: [(0, 0); MAX],
-                    len: 0,
+                    members: alloc::vec::Vec::new(),
                     staged: core::cell::Cell::new(false),
                     live: false,
                     _process: process_table::pin_owner::pin(h).unwrap(),
@@ -235,15 +234,19 @@ fn committed_terminal_target_refuses_exec_census_independently_of_live_metadata_
     fixture(|h| {
         let intent = intent(h);
         cell(h).unwrap().with(|s| {
-            let index = s
-                .members
-                .iter()
-                .position(|&m| m == Some((SLOT, PID)))
+            let row = s
+                .rows
+                .iter_mut()
+                .find(|row| row.member == (SLOT, PID))
                 .unwrap();
-            s.stopped[index] = true;
+            row.stopped = true;
         });
         assert!(ExecMembership::begin(&intent).is_none());
-        cell(h).unwrap().with(|s| s.stopped.fill(false));
+        cell(h).unwrap().with(|s| {
+            for row in &mut s.rows {
+                row.stopped = false;
+            }
+        });
         cancel(intent);
     });
 }

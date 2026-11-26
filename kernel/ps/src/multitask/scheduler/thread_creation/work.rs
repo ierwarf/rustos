@@ -7,6 +7,7 @@
 //! Evidence: actual shared reservation, MM activation, frame and membership owners.
 use super::super::retirement_cleanup::executor::Executor;
 use super::*;
+use crate::multitask::task_table;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use nucleus_core::util::lockdep::LockClass;
 use crate::multitask::irq_leaf::IrqLeaf;
@@ -24,7 +25,7 @@ enum Phase {
     Complete,
     Poisoned,
 }
-struct Row {
+pub(in crate::multitask) struct Row {
     nonce: u64,
     id: u64,
     phase: Phase,
@@ -33,7 +34,7 @@ struct Row {
     outcome: Result<(), SpawnTaskError>,
 }
 impl Row {
-    const fn new() -> Self {
+    pub(in crate::multitask) const fn new() -> Self {
         Self {
             nonce: 0,
             id: 0,
@@ -43,10 +44,14 @@ impl Row {
         }
     }
 }
+pub(in crate::multitask) type CreationRowLeaf =
+    IrqLeaf<Row, { LockClass::SchedulerRetirementCleanup as u8 }>;
+
+pub(in crate::multitask) const fn new_creation_row_leaf() -> CreationRowLeaf {
+    IrqLeaf::new(Row::new())
+}
 // Same cold-producer Class50 rank as terminal receipts; distinct per-slot rows.
 // No operation nests these leaves with cleanup, identity, resource or MM leaves.
-static ROWS: [IrqLeaf<Row, { LockClass::SchedulerRetirementCleanup as u8 }>; MAX_TASK] =
-    [const { IrqLeaf::new(Row::new()) }; MAX_TASK];
 /// Rows in `Pending`, changed only under the row leaf that makes or consumes
 /// that phase. An observation, never a claim: a zero lets housekeeping skip a
 /// leaf acquisition on every row, which every futex call and housekeeping
@@ -61,16 +66,15 @@ pub(in crate::multitask) struct Receipt {
 
 fn enqueue(work: Work) -> Result<Receipt, Work> {
     let slot = work.reservation.as_ref().unwrap().ticket().slot();
-    let receipt = enqueue_into(&mut ROWS[slot].lock(), work)?;
+    let receipt = enqueue_into(slot, &mut task_table::get(slot).creation_work.lock(), work)?;
     // A user creator can only yield and poll; the housekeeping Executor is what
     // materializes the row. Wake it now (after the row leaf is released)
     // instead of leaving the new thread to the next housekeeping nap.
     crate::multitask::kick_housekeeping();
     Ok(receipt)
 }
-fn enqueue_into(row: &mut Row, work: Work) -> Result<Receipt, Work> {
+fn enqueue_into(slot: usize, row: &mut Row, work: Work) -> Result<Receipt, Work> {
     let r = work.reservation.as_ref().unwrap();
-    let slot = r.ticket().slot();
     let id = r.ticket().task_id();
     if !matches!(row.phase, Phase::Vacant | Phase::Complete) || row.work.is_some() {
         return Err(work);
@@ -84,6 +88,7 @@ fn enqueue_into(row: &mut Row, work: Work) -> Result<Receipt, Work> {
     row.outcome = Err(SpawnTaskError::ThreadPublicationRefused);
     row.work = Some(work);
     row.phase = Phase::Pending;
+    task_table::set_pending_work(slot, true);
     // ORDERING: Release, under the row leaf, after the row became Pending; a
     // scanner that observes the count then takes the same leaf.
     PENDING_ROWS.fetch_add(1, Ordering::Release);
@@ -97,7 +102,6 @@ pub(in crate::multitask) fn submit(
     selectors: (u64, u64, u64),
 ) -> Result<Receipt, SpawnTaskError> {
     let mut preemption = nucleus_core::util::lockdep::DispatchPreemption::enter();
-    preemption.mask_irqs();
     #[cfg(not(test))]
     assert!(
         super::super::super::cpu_local::scheduler_initialized(),
@@ -110,6 +114,7 @@ pub(in crate::multitask) fn submit(
         .ok_or(SpawnTaskError::ThreadCreatorUnavailable)?;
     let creator = capture_creator(slot).ok_or(SpawnTaskError::ThreadCreatorUnavailable)?;
     let reservation = reserve_with(id, &creator)?;
+    preemption.mask_irqs();
     let work = Work {
         reservation: Some(reservation),
         bootstrap,
@@ -127,7 +132,7 @@ pub(in crate::multitask) fn submit(
 }
 /// Observation only: neither consumption nor caller death releases ownership.
 pub(in crate::multitask) fn poll(receipt: Receipt) -> Option<Result<(), SpawnTaskError>> {
-    let row = ROWS[receipt.slot].lock();
+    let row = task_table::get(receipt.slot).creation_work.lock();
     if row.nonce != receipt.nonce || row.id != receipt.id {
         return Some(Err(SpawnTaskError::ThreadPublicationRefused));
     }
@@ -148,7 +153,7 @@ impl Drop for Claim<'_> {
         if !self.live {
             return;
         }
-        let mut row = ROWS[self.receipt.slot].lock();
+        let mut row = task_table::get(self.receipt.slot).creation_work.lock();
         assert!(
             row.nonce == self.receipt.nonce
                 && row.id == self.receipt.id
@@ -168,11 +173,16 @@ fn claim_next(executor: &Executor) -> Option<Claim<'_>> {
     if PENDING_ROWS.load(Ordering::Acquire) == 0 {
         return None;
     }
-    for (slot, cell) in ROWS.iter().enumerate().skip(FIRST_DYNAMIC_TASK_SLOT) {
-        let mut row = cell.lock();
-        if row.phase != Phase::Pending {
+    for slot in task_table::pending_work_slots() {
+        if slot < FIRST_DYNAMIC_TASK_SLOT {
             continue;
         }
+        let mut row = task_table::get(slot).creation_work.lock();
+        if row.phase != Phase::Pending {
+            task_table::set_pending_work(slot, false);
+            continue;
+        }
+        task_table::set_pending_work(slot, false);
         PENDING_ROWS.fetch_sub(1, Ordering::Relaxed);
         let receipt = Receipt {
             slot,
@@ -239,7 +249,7 @@ impl Claim<'_> {
         };
         self.executor.assert_current();
         // No successful/failed receipt escapes before the real producer ACK.
-        let mut row = ROWS[self.receipt.slot].lock();
+        let mut row = task_table::get(self.receipt.slot).creation_work.lock();
         assert!(
             row.nonce == self.receipt.nonce
                 && row.id == self.receipt.id

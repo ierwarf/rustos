@@ -11,15 +11,15 @@ const OTHER: usize = 125;
 const ID: u64 = 124011;
 fn fixture(f: impl FnOnce()) {
     let _serial = super::super::super::scheduling_runtime::test_serial_guard();
-    CELLS[SLOT].reset();
-    CELLS[OTHER].reset();
+    cell(SLOT).reset();
+    cell(OTHER).reset();
     f();
-    CELLS[SLOT].reset();
-    CELLS[OTHER].reset();
+    cell(SLOT).reset();
+    cell(OTHER).reset();
 }
 fn publish(slot: usize) -> RetirementSideEffect {
     let effects = RetirementSideEffect::new(Some(ID), None);
-    CELLS[slot].publish_terminal(Some(ID), TaskRetireReason::Exited, None, effects);
+    cell(slot).publish_terminal(Some(ID), TaskRetireReason::Exited, None, effects);
     effects
 }
 #[test]
@@ -28,11 +28,11 @@ fn captured_kernel_fence_waits_for_exact_ack_not_claim_or_empty_payload() {
         publish(SLOT);
         let fence = Fence::capture();
         assert!(!fence.complete());
-        let (generation, effects) = CELLS[SLOT].claim_kernel().unwrap();
+        let (generation, effects) = cell(SLOT).claim_kernel().unwrap();
         assert!(!fence.complete());
-        assert!(!CELLS[SLOT].complete_kernel(generation - 1, effects));
+        assert!(!cell(SLOT).complete_kernel(generation - 1, effects));
         assert!(!fence.complete());
-        assert!(CELLS[SLOT].complete_kernel(generation, effects));
+        assert!(cell(SLOT).complete_kernel(generation, effects));
         assert!(fence.complete());
     });
 }
@@ -41,19 +41,19 @@ fn kernel_fence_completion_persists_through_reset_but_identical_reuse_needs_a_ne
     fixture(|| {
         publish(SLOT);
         let old = Fence::capture();
-        let (generation, effects) = CELLS[SLOT].claim_kernel().unwrap();
-        assert!(CELLS[SLOT].complete_kernel(generation, effects));
-        CELLS[SLOT].reset();
+        let (generation, effects) = cell(SLOT).claim_kernel().unwrap();
+        assert!(cell(SLOT).complete_kernel(generation, effects));
+        cell(SLOT).reset();
         assert!(old.complete());
         publish(SLOT);
         let next = Fence::capture();
         assert!(old.complete());
         assert!(!next.complete());
-        let (next_generation, next_effects) = CELLS[SLOT].claim_kernel().unwrap();
+        let (next_generation, next_effects) = cell(SLOT).claim_kernel().unwrap();
         assert!(next_generation > generation);
-        assert!(!CELLS[SLOT].complete_kernel(generation, effects));
+        assert!(!cell(SLOT).complete_kernel(generation, effects));
         assert!(!next.complete());
-        assert!(CELLS[SLOT].complete_kernel(next_generation, next_effects));
+        assert!(cell(SLOT).complete_kernel(next_generation, next_effects));
         assert!(old.complete() && next.complete());
     });
 }
@@ -63,14 +63,14 @@ fn copied_fence_drop_cannot_abandon_claim_and_foreign_slot_ack_cannot_complete_i
         publish(SLOT);
         let fence = Fence::capture();
         let duplicate = fence;
-        let (generation, effects) = CELLS[SLOT].claim_kernel().unwrap();
+        let (generation, effects) = cell(SLOT).claim_kernel().unwrap();
         let _ = fence;
         assert!(!duplicate.complete());
         publish(OTHER);
-        let (other_generation, other_effects) = CELLS[OTHER].claim_kernel().unwrap();
-        assert!(CELLS[OTHER].complete_kernel(other_generation, other_effects));
+        let (other_generation, other_effects) = cell(OTHER).claim_kernel().unwrap();
+        assert!(cell(OTHER).complete_kernel(other_generation, other_effects));
         assert!(!duplicate.complete());
-        assert!(CELLS[SLOT].complete_kernel(generation, effects));
+        assert!(cell(SLOT).complete_kernel(generation, effects));
         assert!(duplicate.complete());
     });
 }

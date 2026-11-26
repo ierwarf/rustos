@@ -256,12 +256,16 @@ impl WaylandState {
                     )
                 }
             } else {
+                // A popup follows its parent and is hidden with it.
+                let Some(frame) = self.surface_frame(&surface, 0) else {
+                    continue;
+                };
                 (
                     surface.pixels.clone(),
                     surface.width,
                     surface.height,
                     surface.stride_pixels,
-                    surface.frame,
+                    frame,
                     surface.last_damage,
                 )
             };
@@ -272,6 +276,7 @@ impl WaylandState {
                 minimized: surface.minimized,
                 server_decoration: surface.decoration_server,
                 drag_icon: surface.drag_icon_active,
+                popup: surface.is_child(),
                 content_version: surface.content_version,
                 damage,
                 pixels,
@@ -780,7 +785,10 @@ impl WaylandState {
                         state.height = h;
                         state.stride_pixels = w;
                         state.content_version = next_content_version(state.content_version);
-                        if !state.drag_icon_role {
+                        if state.is_child() {
+                            state.frame.width = w;
+                            state.frame.height = h;
+                        } else if !state.drag_icon_role {
                             let (vis_w, vis_h) = wayland_client_size_for_buffer(
                                 w,
                                 h,

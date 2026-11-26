@@ -83,7 +83,7 @@ fn concurrent_task_affinity_refuses_under_same_identity_seal_without_spending_ma
 }
 #[test]
 fn hint_capacity_duplicate_and_counter_exhaustion_refuse_before_spending_queue_or_remaining() {
-    let mut policy = super::super::dispatch_policy::CpuDispatchPolicy::new();
+    let mut policy = super::super::dispatch_policy::CpuDispatchPolicy::sized();
     for slot in 0..CAP {
         assert!(enqueue_priority(
             &mut policy,
@@ -110,7 +110,7 @@ fn hint_capacity_duplicate_and_counter_exhaustion_refuse_before_spending_queue_o
     ));
     assert_eq!(policy.atomic_activation_pick_hints.len(), CAP);
     assert_eq!(policy.atomic_activation_handoff_remaining, CAP);
-    let mut policy = super::super::dispatch_policy::CpuDispatchPolicy::new();
+    let mut policy = super::super::dispatch_policy::CpuDispatchPolicy::sized();
     policy.atomic_activation_handoff_remaining = usize::MAX;
     assert!(!enqueue_priority(
         &mut policy,
@@ -130,7 +130,7 @@ fn competing_disjoint_cohorts_cannot_overflow_one_cpu_priority_queue_after_same_
         _,
         { nucleus_core::util::lockdep::LockClass::SchedulerPolicy as u8 },
     >::new(
-        super::super::dispatch_policy::CpuDispatchPolicy::new()
+        super::super::dispatch_policy::CpuDispatchPolicy::sized()
     ));
     let mut workers = std::vec::Vec::new();
     for group in 0..2 {

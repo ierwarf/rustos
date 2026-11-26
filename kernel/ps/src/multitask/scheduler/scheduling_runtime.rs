@@ -20,6 +20,7 @@
 //! Forbidden: allocation, hardware, resource leaves and callbacks inside leaves.
 //! Evidence: native/source budget witnesses, not complete lifecycle/hardware proof.
 
+use crate::multitask::task_table;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use kernel_object::api::identity::ObjectIdentity;
@@ -29,17 +30,16 @@ use crate::multitask::irq_leaf::IrqLeaf;
 use super::super::current_identity::PagerChargeStamp;
 #[cfg(test)]
 use super::scheduling_context::BudgetSnapshot;
-use super::MAX_TASK;
 use super::scheduling_context::MAX_SCHEDULING_DOMAINS;
 use super::scheduling_context::{
     BudgetCounterScope, BudgetState, ChargeOutcome, SchedulingContextPolicy,
 };
 
 #[derive(Clone, Copy)]
-struct ContextBudgetRuntime {
+pub(in crate::multitask) struct ContextBudgetRuntime {
     live_identity: Option<ObjectIdentity>,
     policy: Option<SchedulingContextPolicy>,
-    domain_slot: Option<u8>,
+    domain_slot: Option<u16>,
     domain_generation: Option<u32>,
     budget: Option<BudgetState>,
     active_intervals: u32,
@@ -47,7 +47,7 @@ struct ContextBudgetRuntime {
 }
 
 impl ContextBudgetRuntime {
-    const fn empty() -> Self {
+    pub(in crate::multitask) const fn empty() -> Self {
         Self {
             live_identity: None,
             policy: None,
@@ -60,21 +60,22 @@ impl ContextBudgetRuntime {
     }
 }
 
-type ContextBudgetLock =
+pub(in crate::multitask) type ContextBudgetLock =
     IrqLeaf<ContextBudgetRuntime, { LockClass::SchedulerContextBudget as u8 }>;
 
-static CONTEXT_BUDGETS: [ContextBudgetLock; MAX_TASK] =
-    [const { ContextBudgetLock::new(ContextBudgetRuntime::empty()) }; MAX_TASK];
+pub(in crate::multitask) const fn new_context_budget_lock() -> ContextBudgetLock {
+    IrqLeaf::new(ContextBudgetRuntime::empty())
+}
 
 fn cell(slot: usize) -> Option<&'static ContextBudgetLock> {
-    CONTEXT_BUDGETS.get(slot)
+    task_table::try_get(slot).map(|task| &task.context_budget)
 }
 
 pub(super) fn initialize(
     slot: usize,
     identity: ObjectIdentity,
     policy: SchedulingContextPolicy,
-    domain_slot: u8,
+    domain_slot: u16,
     domain_generation: u32,
 ) -> bool {
     let Some(budget) = BudgetState::admitted(policy, BudgetCounterScope::Context) else {
@@ -258,8 +259,10 @@ pub(super) fn test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
 /// the generation counters, so a test cannot hide a slot-reuse ABA mistake.
 #[cfg(test)]
 pub(super) fn reset_for_test() {
-    for cell in &CONTEXT_BUDGETS {
-        *cell.lock() = ContextBudgetRuntime::empty();
+    for slot in task_table::allocated_slots() {
+        if let Some(cell) = cell(slot) {
+            *cell.lock() = ContextBudgetRuntime::empty();
+        }
     }
     for cell in &DOMAIN_BUDGETS {
         *cell.lock() = DomainBudgetRuntime::empty();

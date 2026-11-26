@@ -64,7 +64,7 @@ pub(super) fn syscall_linux_madvise(start: u64, user_len: u64, advice: u64) -> u
     request.arg0 = start;
     request.arg1 = user_len;
     request.flags = advice;
-    linux_unit_result(call_syscalld_empty(request))
+    linux_unit_result(call_syscalld_empty(&request))
 }
 
 pub(super) fn syscall_linux_sigaltstack(stack_ptr: u64, old_stack_ptr: u64) -> u64 {

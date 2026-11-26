@@ -2413,6 +2413,10 @@ path = "kernel/compat/src/user/syscall/linux/broker_ops.rs"
 models = ["futex-waiter-lifecycle/FutexWaiterLifecycle"]
 
 [[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/task_capacity_ops.rs"
+models = ["kernel-resource-accounting/KernelResourceAccounting"]
+
+[[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/lifecycle_broker_ops.rs"
 models = ["futex-waiter-lifecycle/FutexWaiterLifecycle"]
 

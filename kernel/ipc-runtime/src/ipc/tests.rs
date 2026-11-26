@@ -113,7 +113,7 @@ fn endpoint_and_reply_handles_decode_only_in_range_generational_identities() {
             .is_none()
     );
     assert!(
-        super::KernelReplyHandle::from_raw((1_u64 << 16) | 129)
+        super::KernelReplyHandle::from_raw((1_u64 << 16) | (super::MAX_REPLY_OBJECTS as u64 + 1))
             .identity()
             .is_none()
     );
@@ -827,14 +827,23 @@ fn endpoint_queue_limit_is_bounded() {
     with_isolated_ipc_test(|| {
         let endpoint = super::create_endpoint().expect("create endpoint");
         for index in 0..super::MAX_ENDPOINT_PENDING_MESSAGES {
+            assert!(!super::endpoint_pending_queue_full(endpoint));
             let request = [index as u8 + 1];
             super::enqueue_endpoint_call(endpoint, index as u64, &request)
                 .expect("enqueue within limit");
         }
+        assert!(super::endpoint_pending_queue_full(endpoint));
+        let hits_before = super::endpoint_queue_full_hits(endpoint).expect("hits before");
         assert_eq!(
             super::enqueue_endpoint_call(endpoint, 1000, b"x"),
             Err(IpcError::NoMemory)
         );
+        assert_eq!(
+            super::endpoint_queue_full_hits(endpoint),
+            Some(hits_before + 1)
+        );
+        let _ = recv_endpoint(endpoint).expect("recv endpoint").expect("message queued");
+        assert!(!super::endpoint_pending_queue_full(endpoint));
     });
 }
 
@@ -999,13 +1008,16 @@ fn retiring_caller_returns_all_outstanding_transfer_batches() {
 #[test]
 fn retiring_caller_may_consume_the_exact_global_message_capacity() {
     with_isolated_ipc_test(|| {
-        let first = super::create_endpoint().expect("create first endpoint");
-        let second = super::create_endpoint().expect("create second endpoint");
-        for endpoint in [first, second] {
+        let endpoint_count =
+            super::MAX_ENDPOINT_MESSAGE_OBJECTS / super::MAX_ENDPOINT_PENDING_MESSAGES;
+        let mut endpoints = alloc::vec::Vec::with_capacity(endpoint_count);
+        for _ in 0..endpoint_count {
+            let endpoint = super::create_endpoint().expect("create endpoint");
             for sequence in 0..super::MAX_ENDPOINT_PENDING_MESSAGES {
                 super::enqueue_endpoint_call(endpoint, 22, &[(sequence + 1) as u8])
                     .expect("enqueue within endpoint and global capacity");
             }
+            endpoints.push(endpoint);
         }
 
         assert_eq!(
@@ -1018,8 +1030,9 @@ fn retiring_caller_may_consume_the_exact_global_message_capacity() {
             ),
             super::MAX_ENDPOINT_MESSAGE_OBJECTS
         );
-        assert_eq!(recv_endpoint(first), Ok(None));
-        assert_eq!(recv_endpoint(second), Ok(None));
+        for endpoint in endpoints {
+            assert_eq!(recv_endpoint(endpoint), Ok(None));
+        }
     });
 }
 

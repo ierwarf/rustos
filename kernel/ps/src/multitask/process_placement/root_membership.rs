@@ -37,7 +37,7 @@ impl RootJoin {
         generation: u64,
         mask: u64,
     ) -> Option<Self> {
-        if member.0 >= super::super::MAX_SCHEDULER_TASKS || generation == 0 || mask == 0 {
+        if member.0 >= super::super::task_table::MAX_TASK_SLOTS || generation == 0 || mask == 0 {
             return None;
         }
         let process = process_table::pin_owner::pin(handle)?;
@@ -51,7 +51,7 @@ impl RootJoin {
         generation: u64,
         mask: u64,
     ) -> Option<Self> {
-        if member.0 >= super::super::MAX_SCHEDULER_TASKS || generation == 0 || mask == 0 {
+        if member.0 >= super::super::task_table::MAX_TASK_SLOTS || generation == 0 || mask == 0 {
             return None;
         }
         let mut join = Self::claim(reservation.process_handle(), member, generation, mask, None)?;
@@ -70,14 +70,16 @@ impl RootJoin {
         mask: u64,
         process: Option<process_table::pin_owner::ProcessObjectPin>,
     ) -> Option<Self> {
-        let key = cell(handle)?.with(|s| {
+        let cell = cell(handle)?;
+        cell.ensure_spare(1);
+        let key = cell.with(|s| {
             if s.handle.is_some_and(|h| h != handle)
                 || s.phase != 0
                 || s.joins != 0
                 || s.root.is_some()
                 || s.terminal.is_some()
                 || s.exit.is_some()
-                || s.members.iter().any(Option::is_some)
+                || !s.rows.is_empty()
             {
                 return None;
             }
@@ -202,7 +204,9 @@ impl RootJoin {
         );
         cell(self.handle).expect("root process row lost").with(|s| {
             assert!(
-                self.exact(s) && self.key.registered && s.members.contains(&Some(self.key.member)),
+                self.exact(s)
+                    && self.key.registered
+                    && s.rows.iter().any(|row| row.member == self.key.member),
                 "root Join ACK lost exact registered constructor"
             );
             s.root = None;
@@ -254,9 +258,7 @@ pub(in crate::multitask) fn recover_fixture(handle: ProcessHandle) {
         s.root = None;
         s.joins = 0;
         s.phase = 0;
-        s.members = [None; MAX];
-        s.stopped = [false; MAX];
-        s.exit_detached = [false; MAX];
+        s.rows.clear();
         let pin = s
             .root_process
             .take()
@@ -272,7 +274,7 @@ pub(in crate::multitask) fn recover_fixture(handle: ProcessHandle) {
 pub(in crate::multitask) fn set_nonce_fixture(handle: ProcessHandle, nonce: u64) -> u64 {
     cell(handle).unwrap().with(|s| {
         assert!(s.root.is_none() && s.root_process.is_none() && s.joins == 0 && s.phase == 0);
-        assert!(s.members.iter().all(Option::is_none) && s.exit.is_none() && s.terminal.is_none());
+        assert!(s.rows.is_empty() && s.exit.is_none() && s.terminal.is_none());
         core::mem::replace(&mut s.root_nonce, nonce)
     })
 }

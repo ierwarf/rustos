@@ -167,7 +167,7 @@ fn prolonged_refusal_preserves_exact_wait_and_reports_once() {
 
 #[test]
 fn a_late_old_epoch_refusal_cannot_displace_a_new_wake_retry() {
-    let mut queue = Queue::new();
+    let mut queue = Queue::sized();
     let original = Token {
         task_id: ID,
         slot: 7,
@@ -179,13 +179,13 @@ fn a_late_old_epoch_refusal_cannot_displace_a_new_wake_retry() {
     let newer = Token { serial: 19, id: TOKEN + 1, expires_tick: 5_000, ..original };
     assert!(queue.insert(newer));
     assert!(queue.insert(original), "a stale duplicate is absorbed, not enqueued");
-    assert_eq!(queue.len, 1);
-    assert_eq!(queue.tokens[0], Some(newer), "the later wait keeps its sole wake token");
+    assert_eq!(queue.tokens.len(), 1);
+    assert_eq!(queue.tokens.front(&WAKE_RETRY_POOL), Some(newer), "the later wait keeps its sole wake token");
 }
 
 #[test]
 fn repeated_same_epoch_refusals_do_not_refresh_the_diagnostic_deadline() {
-    let mut queue = Queue::new();
+    let mut queue = Queue::sized();
     let original = Token {
         task_id: ID,
         slot: 7,
@@ -196,20 +196,20 @@ fn repeated_same_epoch_refusals_do_not_refresh_the_diagnostic_deadline() {
     };
     assert!(queue.insert(original));
     assert!(queue.insert(Token { expires_tick: 8_000, ..original }));
-    assert_eq!(queue.tokens[0], Some(original));
+    assert_eq!(queue.tokens.front(&WAKE_RETRY_POOL), Some(original));
     let (prolonged, once) = retain_prolonged_retry(original, 4_000);
     assert!(once);
     // The retry service takes the old batch before attempting wakes, then
     // reinserts a prolonged token into the now-empty queue.
     let drained = queue.take();
-    assert_eq!(drained.tokens[0], Some(original));
+    assert_eq!(drained.tokens.front(&WAKE_RETRY_POOL), Some(original));
     assert!(queue.insert(prolonged));
     assert!(queue.insert(Token { expires_tick: 12_000, ..original }));
-    assert_eq!(queue.tokens[0], Some(prolonged));
-    assert!(!retain_prolonged_retry(queue.tokens[0].unwrap(), 20_000).1);
+    assert_eq!(queue.tokens.front(&WAKE_RETRY_POOL), Some(prolonged));
+    assert!(!retain_prolonged_retry(queue.tokens.front(&WAKE_RETRY_POOL).unwrap(), 20_000).1);
     let newer = Token { serial: 18, expires_tick: 22_000, ..original };
     assert!(queue.insert(newer));
-    assert_eq!(queue.tokens[0], Some(newer), "new waits get their own report window");
+    assert_eq!(queue.tokens.front(&WAKE_RETRY_POOL), Some(newer), "new waits get their own report window");
 }
 
 #[test]

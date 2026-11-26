@@ -25,7 +25,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use nucleus_core::util::lockdep::{DispatchPreemption, MAX_TRACKED_CPUS};
 
 use super::runqueue::wait::{WaitInstance, wait_instance};
-use super::{MAX_TASK, runqueue_policy, stack_resources, task_directory, wake_publication};
+use super::{runqueue_policy, stack_resources, task_directory, wake_publication};
+use crate::multitask::irq_pool::{SlabPool, SlabQueue};
 
 /// Age at which a refused exact wake is reported. The deadline is for
 /// diagnostics, not permission to discard a still-live waiter.
@@ -41,15 +42,21 @@ struct Token {
     expires_tick: u64,
 }
 
-#[derive(Clone, Copy)]
+/// One retry token per task, backed by a lock-free chunked slab pool preallocated
+/// outside IRQ/masked paths so enqueue never allocates inside IRQ context.
+static WAKE_RETRY_POOL: SlabPool<Token> = SlabPool::new();
+
+pub(super) fn preallocate_pool(min_free: usize) {
+    SlabQueue::<Token>::preallocate_for_pool(&WAKE_RETRY_POOL, min_free);
+}
+
 struct Queue {
-    tokens: [Option<Token>; MAX_TASK],
-    len: usize,
+    tokens: SlabQueue<Token>,
 }
 
 impl Queue {
     const fn new() -> Self {
-        Self { tokens: [None; MAX_TASK], len: 0 }
+        Self { tokens: SlabQueue::new() }
     }
 
     /// One token per task, but ordering is by the *wait epoch*, not by the
@@ -62,10 +69,8 @@ impl Queue {
     /// producer cannot indefinitely postpone or repeat the prolonged-wait
     /// diagnostic by refreshing the timer on every retry.
     fn insert(&mut self, mut token: Token) -> bool {
-        if let Some(existing) = self.tokens[..self.len]
-            .iter_mut()
-            .flatten()
-            .find(|existing| existing.task_id == token.task_id)
+        if let Some(existing) =
+            self.tokens.find_mut(&WAKE_RETRY_POOL, |existing| existing.task_id == token.task_id)
         {
             if existing.slot == token.slot {
                 if existing.serial > token.serial {
@@ -83,16 +88,27 @@ impl Queue {
             *existing = token;
             return true;
         }
-        if self.len == MAX_TASK {
-            return false;
-        }
-        self.tokens[self.len] = Some(token);
-        self.len += 1;
-        true
+        self.tokens.push_back(&WAKE_RETRY_POOL, token)
     }
 
+    #[cfg(test)]
+    fn sized() -> Self {
+        preallocate_pool(64);
+        Self::new()
+    }
+
+    #[cfg(test)]
     fn take(&mut self) -> Self {
-        core::mem::replace(self, Self::new())
+        let mut taken = Self::new();
+        while let Some(token) = self.pop_front() {
+            assert!(taken.insert(token));
+        }
+        taken
+    }
+
+    /// Removes the oldest token, preserving the order of the rest.
+    fn pop_front(&mut self) -> Option<Token> {
+        self.tokens.pop_front(&WAKE_RETRY_POOL)
     }
 }
 
@@ -140,7 +156,7 @@ unsafe fn with_cpu_queue<R>(cpu: usize, f: impl FnOnce(&mut Queue) -> R) -> R {
     let result = f(queue);
     // ORDERING: publish the resulting durable-work observation after queue
     // mutation. This CPU cannot take a periodic IRQ until the mask is released.
-    cell.pending.store(queue.len != 0, Ordering::Release);
+    cell.pending.store(!queue.tokens.is_empty(), Ordering::Release);
     result
 }
 
@@ -300,13 +316,18 @@ pub(super) fn service_with(
     scope: &DispatchPreemption<'_>,
     eligible_cpus: &dyn Fn(usize) -> u64,
 ) -> usize {
-    if !scoped(scope) || with_queue(scope, |queue| queue.len == 0) {
+    if !scoped(scope) || with_queue(scope, |queue| queue.tokens.is_empty()) {
         return 0;
     }
-    let batch = with_queue(scope, Queue::take);
+    // Only the tokens present now belong to this pass: a refusal inside it
+    // appends behind them and waits for the next one.
+    let pass = with_queue(scope, |queue| queue.tokens.len());
     let now = crate::arch::rtc::ticks();
     let mut resolved = 0;
-    for token in batch.tokens[..batch.len].iter().flatten().copied() {
+    for _ in 0..pass {
+        let Some(token) = with_queue(scope, Queue::pop_front) else {
+            break;
+        };
         match retry(scope, token, eligible_cpus) {
             Retry::Done => resolved += 1,
             Retry::Keep => {
@@ -323,11 +344,7 @@ pub(super) fn service_with(
                 // newer observation of the same task; keep the newer one.
                 // Time alone never withdraws one-shot reply/receive custody.
                 with_queue(scope, |queue| {
-                    if !queue.tokens[..queue.len]
-                        .iter()
-                        .flatten()
-                        .any(|newer| newer.task_id == token.task_id)
-                    {
+                    if !queue.tokens.any(&WAKE_RETRY_POOL, |newer| newer.task_id == token.task_id) {
                         assert!(
                             queue.insert(token),
                             "scheduler exact wake retry silently lost token task={} slot={} epoch={}",
@@ -345,7 +362,7 @@ pub(super) fn service_with(
 
 #[cfg(test)]
 pub(super) fn pending_on(scope: &DispatchPreemption<'_>) -> usize {
-    with_queue(scope, |queue| queue.len)
+    with_queue(scope, |queue| queue.tokens.len())
 }
 
 #[cfg(test)]

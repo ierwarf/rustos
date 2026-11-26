@@ -7,31 +7,75 @@
 //! idle/current fallback.
 
 use super::LocalFallbackReason;
+use crate::multitask::irq_pool::{SlabPool, SlabQueue};
 
 const MAX_LOCAL_FAIR_OBSERVATIONS: usize = 4;
+const INLINE_UNRESOLVED_CAP: usize = 16;
 
-const SLOT_WORDS: usize = super::super::MAX_TASK.div_ceil(64);
+static OVERFLOW_POOL: SlabPool<usize> = SlabPool::new();
+
+pub(in crate::multitask::scheduler) fn preallocate_pool(min_free: usize) {
+    OVERFLOW_POOL.preallocate_reserve(min_free);
+}
+
+struct SlotSet {
+    inline: [usize; INLINE_UNRESOLVED_CAP],
+    inline_len: usize,
+    overflow: SlabQueue<usize>,
+    overflowed: bool,
+}
+
+impl SlotSet {
+    const fn new() -> Self {
+        Self {
+            inline: [0; INLINE_UNRESOLVED_CAP],
+            inline_len: 0,
+            overflow: SlabQueue::new(),
+            overflowed: false,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.inline_len = 0;
+        self.overflow.clear(&OVERFLOW_POOL);
+        self.overflowed = false;
+    }
+
+    fn contains(&self, slot: usize) -> bool {
+        if self.inline[..self.inline_len].contains(&slot) {
+            return true;
+        }
+        if !self.overflow.is_empty() && self.overflow.any(&OVERFLOW_POOL, |&s| s == slot) {
+            return true;
+        }
+        self.overflowed
+    }
+
+    fn insert(&mut self, slot: usize) {
+        if self.contains(slot) {
+            return;
+        }
+        if self.inline_len < INLINE_UNRESOLVED_CAP {
+            self.inline[self.inline_len] = slot;
+            self.inline_len += 1;
+        } else if !self.overflow.push_back(&OVERFLOW_POOL, slot) {
+            self.overflowed = true;
+        }
+    }
+}
+
+impl Drop for SlotSet {
+    fn drop(&mut self) {
+        self.overflow.clear(&OVERFLOW_POOL);
+    }
+}
 
 /// Candidates whose own admission stayed unresolved through every strict
 /// observation of one dispatch turn.
-///
-/// A scan treats a candidate it cannot resolve (missing identity or class
-/// publication, transitioning affinity, stale budget stamp, absent frame
-/// token) as making the whole candidate set non-authoritative, because that
-/// candidate might be the class or vruntime winner. That is right for a torn
-/// observation and wrong for a candidate that stays unresolved: every turn of
-/// the CPU then ends `Incomplete`, the CPU runs idle or the outgoing task, and
-/// every other task queued there starves for as long as the one candidate
-/// stays stuck. So the first `MAX_LOCAL_FAIR_OBSERVATIONS - 1` observations
-/// stay strict, and the last one omits exactly the slots that were unresolved
-/// in ALL earlier observations, as if they were not admitted this turn. An
-/// epoch tear is not attributed to a slot and stays strict; an omitted slot is
-/// re-observed from scratch on the next turn; the owner CAS, not scan
-/// completeness, is what makes the eventual claim safe.
 pub(in crate::multitask::scheduler) struct UnresolvedCandidates {
     observation: usize,
-    current: [u64; SLOT_WORDS],
-    persistent: [u64; SLOT_WORDS],
+    current: SlotSet,
+    persistent: SlotSet,
     last_reason: Option<LocalFallbackReason>,
     omitted: Option<(usize, LocalFallbackReason)>,
 }
@@ -40,24 +84,38 @@ impl UnresolvedCandidates {
     /// One strict observation that never omits a candidate.
     pub(in crate::multitask::scheduler) const fn strict() -> Self {
         Self {
-            observation: 0, current: [0; SLOT_WORDS], persistent: [!0; SLOT_WORDS],
-            last_reason: None, omitted: None,
+            observation: 0,
+            current: SlotSet::new(),
+            persistent: SlotSet::new(),
+            last_reason: None,
+            omitted: None,
         }
     }
 
     fn begin_observation(&mut self) {
-        if self.observation != 0 {
-            for (persistent, current) in self.persistent.iter_mut().zip(self.current) {
-                *persistent &= current;
+        if self.observation == 1 {
+            core::mem::swap(&mut self.persistent, &mut self.current);
+        } else if self.observation > 1 {
+            let mut next = SlotSet::new();
+            for &slot in &self.persistent.inline[..self.persistent.inline_len] {
+                if self.current.contains(slot) {
+                    next.insert(slot);
+                }
             }
+            self.persistent.overflow.for_each(&OVERFLOW_POOL, |&slot| {
+                if self.current.contains(slot) {
+                    next.insert(slot);
+                }
+            });
+            self.persistent = next;
         }
-        self.current = [0; SLOT_WORDS];
+        self.current.clear();
         self.observation += 1;
     }
 
     /// `slot` could not be resolved in this observation for `reason`.
     pub(in crate::multitask::scheduler) fn record(&mut self, slot: usize, reason: LocalFallbackReason) {
-        self.current[slot / 64] |= 1_u64 << (slot % 64);
+        self.current.insert(slot);
         self.last_reason = Some(reason);
     }
 
@@ -67,10 +125,10 @@ impl UnresolvedCandidates {
     /// is left out as well.
     pub(in crate::multitask::scheduler) fn excludes(&mut self, slot: usize) -> bool {
         let exclude = self.observation == MAX_LOCAL_FAIR_OBSERVATIONS
-            && self.persistent[slot / 64] & (1_u64 << (slot % 64)) != 0;
+            && self.persistent.contains(slot);
         if exclude {
             // Keep the CPU's evidence for the omitted slot's own liveness.
-            self.current[slot / 64] |= 1_u64 << (slot % 64);
+            self.current.insert(slot);
             if self.omitted.is_none() {
                 self.omitted = Some((slot, self.last_reason.unwrap_or(LocalFallbackReason::CustodyUnavailable)));
             }
@@ -122,11 +180,13 @@ fn record_omitted_candidate(slot: usize, reason: LocalFallbackReason) {
     let cpu = nucleus_core::util::lockdep::current_cpu_index() as u64;
     // ORDERING: Relaxed; a diagnostic window drained by the runtime profile.
     OMITTED_CANDIDATES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    LAST_OMITTED_CANDIDATE.store((cpu << 32) | ((reason as u64) << 16) | slot as u64,
-        core::sync::atomic::Ordering::Relaxed);
+    LAST_OMITTED_CANDIDATE.store(
+        (cpu << 40) | ((reason as u64 & 0xff) << 32) | (slot as u64 & 0xffff_ffff),
+        core::sync::atomic::Ordering::Relaxed,
+    );
 }
 
-/// `(omitted turns, (cpu << 32) | (reason << 16) | slot)` for this window.
+/// `(omitted turns, (cpu << 40) | (reason << 32) | slot)` for this window.
 pub(in crate::multitask::scheduler) fn take_omitted_candidate_window() -> Option<(u64, u64)> {
     let count = OMITTED_CANDIDATES.swap(0, core::sync::atomic::Ordering::Relaxed);
     (count != 0).then(|| (count, LAST_OMITTED_CANDIDATE.load(core::sync::atomic::Ordering::Relaxed)))

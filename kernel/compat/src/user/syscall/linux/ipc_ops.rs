@@ -80,9 +80,8 @@ const MAX_SERVICE_ENDPOINTS: usize = 16;
 // The process table admits at most 32 live process objects. One exact grant per
 // process/service pair therefore bounds the complete service-call grant set.
 const MAX_SERVICE_CALL_GRANTS: usize = 32 * MAX_SERVICE_ENDPOINTS;
-// Admission is per task, not per process. Every schedulable task may wait for
-// one service publication without an artificial half-capacity failure.
-const MAX_SERVICE_ENDPOINT_WAITERS: usize = multitask::MAX_SCHEDULER_TASKS;
+// Admission is per task, not per process. Every task waiting on service
+// registration allocates its waiter entry on registration, with no fixed global cap.
 const SLOW_IPC_THRESHOLD_MS: u64 = 10;
 // Debugcon is a synchronous, globally contended device. One representative
 // slow sample per second preserves observability without letting a degraded
@@ -152,60 +151,50 @@ struct ServiceEndpointWaiter {
 }
 
 struct ServiceEndpointWaiterTable {
-    slots: [Option<ServiceEndpointWaiter>; MAX_SERVICE_ENDPOINT_WAITERS],
+    slots: Vec<ServiceEndpointWaiter>,
 }
 
 impl ServiceEndpointWaiterTable {
     const fn new() -> Self {
-        Self {
-            slots: [None; MAX_SERVICE_ENDPOINT_WAITERS],
-        }
+        Self { slots: Vec::new() }
     }
 
     fn register(&mut self, waiter: ServiceEndpointWaiter) -> bool {
         if let Some(slot) = self
             .slots
             .iter_mut()
-            .find(|slot| slot.is_some_and(|current| current.task_id == waiter.task_id))
+            .find(|current| current.task_id == waiter.task_id)
         {
-            *slot = Some(waiter);
+            *slot = waiter;
             return true;
         }
-        let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_none()) else {
+        if self.slots.try_reserve(1).is_err() {
             return false;
-        };
-        *slot = Some(waiter);
+        }
+        self.slots.push(waiter);
         true
     }
 
     fn remove_task(&mut self, task_id: u64) -> usize {
-        let mut removed = 0usize;
-        for slot in &mut self.slots {
-            if slot.is_some_and(|waiter| waiter.task_id == task_id) {
-                *slot = None;
-                removed += 1;
-            }
-        }
-        removed
+        let before = self.slots.len();
+        self.slots.retain(|waiter| waiter.task_id != task_id);
+        before - self.slots.len()
     }
 
     fn take_matching(
         &mut self,
         mut predicate: impl FnMut(ServiceEndpointWaiter) -> bool,
-    ) -> ([u64; MAX_SERVICE_ENDPOINT_WAITERS], usize) {
-        let mut tasks = [0_u64; MAX_SERVICE_ENDPOINT_WAITERS];
-        let mut count = 0usize;
-        for slot in &mut self.slots {
-            let Some(waiter) = *slot else {
-                continue;
-            };
-            if predicate(waiter) {
-                tasks[count] = waiter.task_id;
-                count += 1;
-                *slot = None;
+    ) -> Vec<u64> {
+        let mut tasks = Vec::new();
+        let mut idx = 0usize;
+        while idx < self.slots.len() {
+            if predicate(self.slots[idx]) {
+                tasks.push(self.slots.swap_remove(idx).task_id);
+            } else {
+                idx += 1;
             }
         }
-        (tasks, count)
+        tasks
     }
 }
 
@@ -907,10 +896,10 @@ pub(super) fn remove_service_endpoint_waiter(task_id: u64) -> usize {
 }
 
 fn wake_registered_service_endpoint_waiters(service_id: u64, owner_pid: u64) {
-    let (tasks, count) = SERVICE_ENDPOINT_WAITERS.lock().take_matching(|waiter| {
+    let tasks = SERVICE_ENDPOINT_WAITERS.lock().take_matching(|waiter| {
         waiter.service_id == service_id && waiter.expected_pid == owner_pid
     });
-    for task_id in tasks.into_iter().take(count) {
+    for task_id in tasks {
         if multitask::wake_task(task_id) {
             multitask::set_next_pick_hint(task_id);
         }
@@ -918,11 +907,11 @@ fn wake_registered_service_endpoint_waiters(service_id: u64, owner_pid: u64) {
 }
 
 fn wake_exited_service_endpoint_waiters(process_id: u64) {
-    let (tasks, count) = SERVICE_ENDPOINT_WAITERS
+    let tasks = SERVICE_ENDPOINT_WAITERS
         .lock()
         .take_matching(|waiter| waiter.expected_pid == process_id);
     let mut woke = false;
-    for task_id in tasks.into_iter().take(count) {
+    for task_id in tasks {
         if multitask::wake_task(task_id) {
             multitask::set_next_pick_hint(task_id);
             woke = true;
@@ -1573,7 +1562,13 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
             return Err(LINUX_ETIMEDOUT);
         }
         cycle_mark = charge_phase(IpcCallPhase::EnqueueDeadline, cycle_mark);
-        let reply = enqueue_call_and_wake(endpoint, request.as_slice())?;
+        let reply = enqueue_call_and_wake_or_wait_queue(
+            enqueue_call_and_wake(endpoint, request.as_slice()),
+            endpoint,
+            request.as_slice(),
+            &[],
+            reply_deadline,
+        )?;
         ipc_trace!(
             "ipc call enqueued: endpoint={} request_len={} reply_cap={}",
             endpoint.raw(),
@@ -2841,10 +2836,12 @@ fn syscall_linux_rustos_ipc_call_with_handles_timeout(args_ptr: u64, timeout_ms:
         }
         let send_handles = export_current_fds_for_ipc(args.send_fds_ptr, args.send_fd_count)?;
         let export_ticks = crate::arch::rtc::ticks();
-        let reply = match enqueue_call_and_wake_with_handles(
+        let reply = match enqueue_call_and_wake_or_wait_queue(
+            enqueue_call_and_wake_with_handles(endpoint, request.as_slice(), send_handles.as_slice()),
             endpoint,
             request.as_slice(),
             send_handles.as_slice(),
+            reply_deadline,
         ) {
             Ok(reply) => reply,
             Err(errno) => {
@@ -3014,9 +3011,17 @@ pub(super) fn call_linux_syscall_endpoint(request: &[u8]) -> Result<Vec<u8>, i64
     let endpoint = linux_syscall_endpoint().ok_or(LINUX_ENOSYS)?;
     note_syscalld_call_from_vfsd(request);
     let start_ticks = crate::arch::rtc::ticks();
-    let reply = enqueue_call_and_wake(endpoint, request)?;
+    let reply_deadline = service_ipc_deadline_tick_after(SERVICE_IPC_TIMEOUT_MS);
+    let reply = enqueue_call_and_wake_or_wait_queue(
+        enqueue_call_and_wake(endpoint, request),
+        endpoint,
+        request,
+        &[],
+        reply_deadline,
+    )?;
     let send_ticks = crate::arch::rtc::ticks();
-    let response = wait_for_service_reply(reply)?;
+    let response =
+        wait_for_service_reply_with_deadline_tick(reply, reply_deadline, SERVICE_IPC_TIMEOUT_MS)?;
     let reply_ticks = crate::arch::rtc::ticks();
     log_slow_ipc_call(
         "linux-syscall",
@@ -3167,7 +3172,13 @@ fn call_service_endpoint_with_timeout(
         );
         return Ok(response);
     }
-    let reply = enqueue_call_and_wake(endpoint, request)?;
+    let reply = enqueue_call_and_wake_or_wait_queue(
+        enqueue_call_and_wake(endpoint, request),
+        endpoint,
+        request,
+        &[],
+        reply_deadline,
+    )?;
     let send_ticks = crate::arch::rtc::ticks();
     let response = wait_for_service_reply_with_deadline_tick(reply, reply_deadline, timeout_ms)?;
     let reply_ticks = crate::arch::rtc::ticks();
@@ -3333,7 +3344,13 @@ pub(super) fn call_service_endpoint_with_received_entries_until(
 ) -> Result<(Vec<u8>, Vec<multitask::TransferredHandleEntry>), i64> {
     let endpoint = service_endpoint(service_id).ok_or(LINUX_ENOSYS)?;
     let start_ticks = crate::arch::rtc::ticks();
-    let reply = enqueue_call_and_wake(endpoint, request)?;
+    let reply = enqueue_call_and_wake_or_wait_queue(
+        enqueue_call_and_wake(endpoint, request),
+        endpoint,
+        request,
+        &[],
+        reply_deadline,
+    )?;
     let (response, descriptors) =
         wait_for_reply_with_deadline(reply, handle_capacity, reply_deadline)?;
     let reply_ticks = crate::arch::rtc::ticks();
@@ -3391,6 +3408,60 @@ pub(crate) fn enqueue_call_and_wake(
     request: &[u8],
 ) -> Result<KernelReplyHandle, i64> {
     enqueue_call_and_wake_with_handles(endpoint, request, &[])
+}
+
+/// Retries an endpoint call that failed with `ENOMEM` when the target
+/// endpoint's pending queue is transiently saturated, sleeping briefly until
+/// either queue space opens or `deadline_tick` expires. Permanent `ENOMEM`
+/// failures (e.g. sender Job quota exhaustion) return `ENOMEM` immediately.
+pub(super) fn enqueue_call_and_wake_or_wait_queue(
+    first_attempt: Result<KernelReplyHandle, i64>,
+    endpoint: KernelEndpointHandle,
+    request: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+    deadline_tick: u64,
+) -> Result<KernelReplyHandle, i64> {
+    let mut result = first_attempt;
+    let mut prior_hits: Option<u64> = None;
+    loop {
+        match result {
+            Ok(reply) => return Ok(reply),
+            Err(LINUX_ENOMEM) => {
+                if reply_deadline_expired(deadline_tick) {
+                    return Err(LINUX_ETIMEDOUT);
+                }
+                let Some(current_hits) = kernel_ipc_runtime::api::endpoint::queue_full_hits(endpoint)
+                else {
+                    return Err(LINUX_EINVAL);
+                };
+                match prior_hits {
+                    None => {
+                        // First failure came from `first_attempt` before we
+                        // sampled `queue_full_hits`; yield once and confirm.
+                        multitask::yield_now();
+                    }
+                    Some(prev) if current_hits != prev => {
+                        // Confirmed under the endpoint lock that this failure
+                        // (or concurrent contention) hit the pending queue cap.
+                        crate::arch::rtc::sleep_unless(1, || {
+                            reply_deadline_expired(deadline_tick)
+                                || !kernel_ipc_runtime::api::endpoint::pending_queue_full(endpoint)
+                        });
+                    }
+                    Some(_) => {
+                        // Confirmed `NoMemory` did not observe queue saturation.
+                        return Err(LINUX_ENOMEM);
+                    }
+                }
+                if reply_deadline_expired(deadline_tick) {
+                    return Err(LINUX_ETIMEDOUT);
+                }
+                prior_hits = kernel_ipc_runtime::api::endpoint::queue_full_hits(endpoint);
+                result = enqueue_call_and_wake_with_handles(endpoint, request, attached_handles);
+            }
+            Err(errno) => return Err(errno),
+        }
+    }
 }
 
 fn enqueue_call_and_wake_with_handles(
@@ -3655,14 +3726,6 @@ fn recover_unwoken_receiver(endpoint: KernelEndpointHandle, receiver: u64) {
             receiver,
         );
     }
-}
-
-fn wait_for_service_reply(reply: KernelReplyHandle) -> Result<Vec<u8>, i64> {
-    wait_for_service_reply_with_deadline_tick(
-        reply,
-        service_ipc_deadline_tick_after(SERVICE_IPC_TIMEOUT_MS),
-        SERVICE_IPC_TIMEOUT_MS,
-    )
 }
 
 fn wait_for_service_reply_with_deadline_tick(

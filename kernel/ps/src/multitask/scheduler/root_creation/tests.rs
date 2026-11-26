@@ -99,7 +99,7 @@ fn fixture(f: impl FnOnce()) {
     // Catalog-only witnesses leave modeled Identity rows without physical
     // Resources. This fixture owns the canonical native namespace locks; clear
     // only those empty projections, never a real context, stack or live loan.
-    for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
+    for slot in crate::multitask::task_table::allocated_slots().filter(|&s| s >= FIRST_DYNAMIC_TASK_SLOT) {
         if stack_resources::context::read(slot).is_none()
             && stack_resources::task_start::read(slot).is_none()
             && !stack_resources::allocated(slot)
@@ -285,7 +285,7 @@ pub(in crate::multitask::scheduler) fn suspended_roots(
         // Only CPUs 0/1 participate in these owned queue fixtures. Other tests
         // deliberately own independent pending-flag cells 3/5.
         for cpu in [0, 1] {
-            *dispatch_policy::lock(cpu) = dispatch_policy::CpuDispatchPolicy::new();
+            *dispatch_policy::lock(cpu) = dispatch_policy::CpuDispatchPolicy::sized();
             dispatch_policy::clear_atomic_activation_pending(cpu);
         }
         let mut supplied = policy();
@@ -323,7 +323,7 @@ pub(in crate::multitask::scheduler) fn suspended_roots(
             release(slot, id, handle);
         }
         for cpu in [0, 1] {
-            *dispatch_policy::lock(cpu) = dispatch_policy::CpuDispatchPolicy::new();
+            *dispatch_policy::lock(cpu) = dispatch_policy::CpuDispatchPolicy::sized();
             dispatch_policy::clear_atomic_activation_pending(cpu);
         }
     });
@@ -765,7 +765,9 @@ fn original_user_actor_fork_retains_two_real_parent_loans_without_double_cohort_
 fn actual_orphan_runtime_refusal_does_not_publish_pid_or_release_foreign_funding() {
     kernel(|actor, turn| {
         let admission = Admission::capture(actor, None, Some(policy())).unwrap();
-        let mut foreign = scheduling_context::SchedulingContext::bind(1, ID + 90);
+        let ticket = root_slots::reserve_dynamic(ID).unwrap();
+        let slot = ticket.slot();
+        let mut foreign = scheduling_context::SchedulingContext::bind(slot, ID + 90);
         assert!(foreign.admit(
             admission.policy,
             admission.domain.slot(),
@@ -773,7 +775,8 @@ fn actual_orphan_runtime_refusal_does_not_publish_pid_or_release_foreign_funding
         ));
         let reservation = process_table::reserve_spawn().unwrap();
         assert!(
-            construct(
+            construct_with_ticket(
+                ticket,
                 ID,
                 Input::State(state()),
                 bootstrap(UserAbi::Linux),
@@ -794,10 +797,10 @@ fn actual_orphan_runtime_refusal_does_not_publish_pid_or_release_foreign_funding
         );
         assert_eq!(process_table::live_process_identity_by_pid(ID), None);
         assert!(foreign.runtime_snapshot().is_some());
-        assert!(!stack_resources::allocated(1));
+        assert!(!stack_resources::allocated(slot));
         assert!(!process_table::cancel_spawn(reservation));
-        assert!(scheduling_runtime::close_for_reclaim(1, foreign.identity()));
-        scheduling_runtime::release(1, foreign.identity());
+        assert!(scheduling_runtime::close_for_reclaim(slot, foreign.identity()));
+        scheduling_runtime::release(slot, foreign.identity());
     });
 }
 

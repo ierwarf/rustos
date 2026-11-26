@@ -361,9 +361,17 @@ fn target_resolution_is_absent_when_every_member_is_gone_or_stopped() {
         join.register(PEER, ID + 1).unwrap();
         identity::publish_metadata(PEER, Some(meta(h, ID + 1)));
         drop(join);
-        cell(h).unwrap().with(|s| s.stopped = [true; MAX]);
+        cell(h).unwrap().with(|s| {
+            for row in &mut s.rows {
+                row.stopped = true;
+            }
+        });
         assert!(target_by_pid(ID).is_none());
-        cell(h).unwrap().with(|s| s.stopped = [false; MAX]);
+        cell(h).unwrap().with(|s| {
+            for row in &mut s.rows {
+                row.stopped = false;
+            }
+        });
     });
 }
 

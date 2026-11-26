@@ -5,14 +5,15 @@
 //! Failure: untouched refusal rolls back; effects abandon to existing retained poison custody.
 //! Forbidden: directory/substitute global loan, absence as drain or affinity as a blocked-peer wake.
 //! Evidence: real Ticket/process/MM/binding/queue native witnesses; no HAL/CR3/RSP equivalence.
-use super::{AffinityCommit, AffinityError, MAX_TASK, runqueue, stack_resources};
+use super::{AffinityCommit, AffinityError, runqueue, stack_resources};
 use crate::multitask::{current_identity, process_placement, process_table::ProcessHandle};
 use crate::user::abi::UserAbi;
+use alloc::vec::Vec;
 
 struct Grant {
     change: process_placement::Change,
     cohort: current_identity::cohort::Cohort,
-    members: [(usize, u64); MAX_TASK],
+    members: Vec<(usize, u64)>,
     len: usize,
     requested: u64,
     previous: u64,
@@ -34,14 +35,11 @@ impl Grant {
         if previous == 0 {
             return Err(AffinityError::InvalidMask);
         }
-        let mut members = [(0, 0); MAX_TASK];
-        let mut len = 0;
+        let mut members = Vec::new();
         // Only captured terminal ACKs exclude old members. Never slot absence,
         // a new UID or a desired-stop observation without the terminal ledger.
-        for member in change.live_members() {
-            members[len] = member;
-            len += 1;
-        }
+        members.extend(change.live_members());
+        let len = members.len();
         let cohort = current_identity::cohort::Cohort::begin(&members[..len])
             .ok_or(AffinityError::MissingTask)?;
         // Post-pin physical qualification: exec/reuse cannot replace this tuple

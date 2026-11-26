@@ -1,14 +1,23 @@
 //! Exact cold exec transaction custody, separate from CPU execution references.
 //! Writer51 owns commands; the atomic word only authenticates resource access.
 use super::*;
-use crate::multitask::process_table::ExecReservation;
+use crate::multitask::{process_table::ExecReservation, task_table};
 use core::{cell::Cell, sync::atomic::AtomicU64};
 const SEALED: u64 = 1;
 const IMAGE: u64 = 2;
 const PUBLISHED: u64 = 3;
 const POISONED: u64 = 4;
 const CANCELLING: u64 = 5;
-static WORDS: [AtomicU64; MAX_SCHEDULER_TASKS] = [const { AtomicU64::new(0) }; MAX_SCHEDULER_TASKS];
+
+#[inline]
+pub(super) fn word_cell(slot: usize) -> &'static AtomicU64 {
+    &task_table::get(slot).exec_intent_word
+}
+
+#[inline]
+fn try_word_cell(slot: usize) -> Option<&'static AtomicU64> {
+    task_table::try_get(slot).map(|task| &task.exec_intent_word)
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::multitask) struct Credential {
     slot: usize,
@@ -37,11 +46,15 @@ impl Credential {
     pub(in crate::multitask) fn admits_image(self, slot: usize, task_id: u64) -> bool {
         self.slot == slot
             && self.task_id == task_id
-            && matches!(WORDS[slot].load(Ordering::Acquire), word if word == self.word(SEALED) || word == self.word(IMAGE))
+            && try_word_cell(slot).is_some_and(|w| {
+                // ORDERING: Acquire observes sealed/image publication before write admission checks.
+                matches!(w.load(Ordering::Acquire), word if word == self.word(SEALED) || word == self.word(IMAGE))
+            })
     }
     pub(in crate::multitask) fn published(self, reservation: ExecReservation) -> bool {
         self.reservation == reservation
-            && WORDS[self.slot].load(Ordering::Acquire) == self.word(PUBLISHED)
+            // ORDERING: Acquire pairs with PUBLISHED store on exec publication commit.
+            && word_cell(self.slot).load(Ordering::Acquire) == self.word(PUBLISHED)
     }
 }
 #[must_use]
@@ -56,8 +69,7 @@ pub(in crate::multitask) struct Image<'a> {
     published: bool,
 }
 pub(in crate::multitask) fn busy(slot: usize) -> bool {
-    WORDS
-        .get(slot)
+    try_word_cell(slot)
         .is_none_or(|word| word.load(Ordering::Acquire) != 0)
 }
 fn exact(writer: &IdentityWriter, key: Credential) -> bool {
@@ -68,7 +80,8 @@ fn publish(slot: usize, writer: &mut IdentityWriter) {
     let word = writer
         .exec_intent
         .map_or(0, |record| record.key.word(record.phase));
-    WORDS[slot].store(word, Ordering::Release);
+    // ORDERING: Release publishes intent word transitions for lock-free admission checks.
+    word_cell(slot).store(word, Ordering::Release);
     commit_writer(slot, writer);
 }
 pub(in crate::multitask) fn begin(

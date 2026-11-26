@@ -41,13 +41,14 @@ pub(super) fn admit_context(
         },
     );
     publish_binding(slot, task_id, view);
+    crate::multitask::task_table::set_slot_active(slot, true);
     view
 }
 
 #[test]
 fn allocation_pin_prevents_reset_release_and_identity_reuse() {
     let _serial = super::super::scheduling_runtime::test_serial_guard();
-    let slot = MAX_TASK - 1;
+    let slot = 127;
     let view = admit(slot, 92001);
     let pin = pin_view(slot, 92001, view).unwrap();
     assert!(!close_for_reclaim(slot));
@@ -69,7 +70,7 @@ fn allocation_pin_prevents_reset_release_and_identity_reuse() {
 #[test]
 fn exact_geometry_and_owned_canary_do_not_follow_foreign_publications() {
     let _serial = super::super::scheduling_runtime::test_serial_guard();
-    let slot = MAX_TASK - 2;
+    let slot = 126;
     let view = admit(slot, 92003);
     assert!(pin_view(slot, 92004, view).is_none());
     let foreign = PublishedFrameView {
@@ -86,7 +87,7 @@ fn exact_geometry_and_owned_canary_do_not_follow_foreign_publications() {
 #[test]
 fn concurrent_readers_keep_allocation_until_the_last_pin_is_released() {
     let _serial = super::super::scheduling_runtime::test_serial_guard();
-    let slot = MAX_TASK - 3;
+    let slot = 125;
     let view = admit(slot, 92005);
     let barrier = std::sync::Barrier::new(9);
     std::thread::scope(|scope| {
@@ -100,7 +101,7 @@ fn concurrent_readers_keep_allocation_until_the_last_pin_is_released() {
             });
         }
         barrier.wait();
-        assert_eq!(RESOURCES[slot].pins.load(Ordering::Acquire), 8);
+        assert_eq!(resource(slot).pins.load(Ordering::Acquire), 8);
         assert!(!close_for_reclaim(slot));
         barrier.wait();
     });
@@ -111,7 +112,7 @@ fn concurrent_readers_keep_allocation_until_the_last_pin_is_released() {
 #[test]
 fn closing_cannot_be_undone_by_metadata_republication() {
     let _serial = super::super::scheduling_runtime::test_serial_guard();
-    let slot = MAX_TASK - 4;
+    let slot = 124;
     let view = admit(slot, 92006);
     assert!(close_for_reclaim(slot));
     publish_binding(slot, 92006, view);
@@ -121,5 +122,6 @@ fn closing_cannot_be_undone_by_metadata_republication() {
 
 #[test]
 fn per_slot_resource_cells_cover_the_whole_task_table() {
-    assert_eq!(RESOURCES.len(), super::MAX_TASK);
+    assert!(try_resource(0).is_some());
+    assert!(try_resource(crate::multitask::task_table::MAX_TASK_SLOTS).is_none());
 }

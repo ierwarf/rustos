@@ -18,7 +18,7 @@ impl GlobalDispatch<xdg_wm_base::XdgWmBase, ()> for WaylandState {
 impl Dispatch<xdg_wm_base::XdgWmBase, ()> for WaylandState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &xdg_wm_base::XdgWmBase,
         request: xdg_wm_base::Request,
         _data: &(),
@@ -56,6 +56,9 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for WaylandState {
                     wl_surface_state.xdg_surface = Some(xdg_surface);
                 }
                 state.mark_dirty();
+            }
+            xdg_wm_base::Request::CreatePositioner { id } => {
+                state.create_positioner(client, resource, id, data_init);
             }
             xdg_wm_base::Request::Pong { .. } => {}
             _ => {}
@@ -112,6 +115,13 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceData> for WaylandState {
                 state.send_toplevel_configure(&data.shared);
                 state.mark_dirty();
             }
+            xdg_surface::Request::GetPopup {
+                id,
+                parent,
+                positioner,
+            } => {
+                state.get_popup(resource, data, id, parent, &positioner, data_init);
+            }
             xdg_surface::Request::AckConfigure { serial } => {
                 let ack_result: Result<(), String> = {
                     if let Ok(mut surface) = data.shared.lock() {
@@ -148,7 +158,7 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceData> for WaylandState {
             xdg_surface::Request::Destroy => {
                 if let Ok(mut surface) = data.shared.lock() {
                     surface.xdg_surface = None;
-                    if surface.toplevel.is_none() {
+                    if surface.toplevel.is_none() && surface.popup.is_none() {
                         surface.role_assigned = false;
                     }
                 }

@@ -97,11 +97,26 @@ impl Target {
     }
 }
 
+#[inline]
+fn without_interrupts<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    #[cfg(all(rustos_boot_image, not(test)))]
+    {
+        x86_64::instructions::interrupts::without_interrupts(f)
+    }
+    #[cfg(any(not(rustos_boot_image), test))]
+    {
+        f()
+    }
+}
+
 /// Whether thread `id` of process `pid` still wants to run (`R`) rather than
 /// being blocked or parked (`S`). `None` when no such live Linux user thread
 /// exists. One atomic owner-word read under the target pin.
 pub(in crate::multitask) fn thread_runnable(pid: u64, id: u64) -> Option<bool> {
-    x86_64::instructions::interrupts::without_interrupts(|| {
+    without_interrupts(|| {
         let target = Target::capture(id)?;
         if target.context.process_id != Some(pid)
             || target.context.user_abi != Some(crate::user::abi::UserAbi::Linux)
@@ -118,7 +133,7 @@ pub(in crate::multitask) fn set_thread_comm(
     id: u64,
     comm: [u8; rustos_user_abi::linux::LINUX_TASK_COMM_LEN],
 ) -> bool {
-    x86_64::instructions::interrupts::without_interrupts(|| {
+    without_interrupts(|| {
         let Some(target) = Target::capture(id) else {
             return false;
         };
@@ -132,7 +147,7 @@ pub(in crate::multitask) fn set_thread_comm(
 }
 
 pub(in crate::multitask) fn alive(id: u64) -> bool {
-    x86_64::instructions::interrupts::without_interrupts(|| alive_in(id))
+    without_interrupts(|| alive_in(id))
 }
 fn alive_in(id: u64) -> bool {
     task_directory::candidates(id).any(|slot| identity::observe_user_liveness(slot, id))
@@ -141,7 +156,7 @@ pub(in crate::multitask) fn user_target_abi_if_alive(
     pid: u64,
     id: u64,
 ) -> Option<crate::user::abi::UserAbi> {
-    x86_64::instructions::interrupts::without_interrupts(|| user_target_abi_if_alive_in(pid, id))
+    without_interrupts(|| user_target_abi_if_alive_in(pid, id))
 }
 fn user_target_abi_if_alive_in(pid: u64, id: u64) -> Option<crate::user::abi::UserAbi> {
     if pid == 0 {
@@ -151,16 +166,17 @@ fn user_target_abi_if_alive_in(pid: u64, id: u64) -> Option<crate::user::abi::Us
         return task_directory::candidates(id)
             .find_map(|slot| identity::observe_user_process_task_abi(slot, pid, id));
     }
-    (0..super::MAX_TASK).find_map(|slot| identity::observe_user_process_task_abi(slot, pid, 0))
+    crate::multitask::task_table::active_slots()
+        .find_map(|slot| identity::observe_user_process_task_abi(slot, pid, 0))
 }
 pub(in crate::multitask) fn log_ids(id: u64) -> Option<(u64, u64)> {
-    x86_64::instructions::interrupts::without_interrupts(|| {
+    without_interrupts(|| {
         let target = Target::capture(id)?;
         Some((target.context.process_id?, target.pin.id()))
     })
 }
 pub(in crate::multitask) fn linux(pid: u64, id: u64) -> Option<crate::multitask::LinuxThreadSnapshot> {
-    x86_64::instructions::interrupts::without_interrupts(|| Target::capture(id)?.linux(pid))
+    without_interrupts(|| Target::capture(id)?.linux(pid))
 }
 
 #[cfg(test)]

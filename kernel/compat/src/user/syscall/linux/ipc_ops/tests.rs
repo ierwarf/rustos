@@ -138,20 +138,24 @@ fn service_endpoint_waiter_rearm_replaces_without_allocating_another_slot() {
         service_id: linux_abi::IPC_SERVICE_NETD,
         expected_pid: 61,
     }));
-    let (_, old_count) = table.take_matching(|waiter| waiter.expected_pid == 51);
-    assert_eq!(old_count, 0);
-    let (tasks, new_count) = table.take_matching(|waiter| waiter.expected_pid == 61);
-    assert_eq!(new_count, 1);
-    assert_eq!(tasks[0], 41);
+    let old_tasks = table.take_matching(|waiter| waiter.expected_pid == 51);
+    assert!(old_tasks.is_empty());
+    let new_tasks = table.take_matching(|waiter| waiter.expected_pid == 61);
+    assert_eq!(new_tasks, [41]);
 }
 
 #[test]
-#[allow(
-    clippy::assertions_on_constants,
-    reason = "the mutation witness must compile a reduced capacity and fail at runtime"
-)]
-fn service_endpoint_waiter_capacity_covers_every_scheduler_task() {
-    assert!(MAX_SERVICE_ENDPOINT_WAITERS >= multitask::MAX_SCHEDULER_TASKS);
+fn service_endpoint_waiter_table_scales_dynamically_past_legacy_slot_limits() {
+    let mut table = ServiceEndpointWaiterTable::new();
+    for i in 0..1500_u64 {
+        assert!(table.register(ServiceEndpointWaiter {
+            task_id: 1000 + i,
+            service_id: linux_abi::IPC_SERVICE_NETD,
+            expected_pid: 77,
+        }));
+    }
+    let taken = table.take_matching(|waiter| waiter.expected_pid == 77);
+    assert_eq!(taken.len(), 1500);
 }
 
 #[test]

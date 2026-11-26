@@ -2,12 +2,13 @@
 
 use nucleus_core::util::lockdep::MAX_TRACKED_CPUS;
 
-use super::MAX_TASK;
 
 #[inline]
-pub(super) fn bitmap_location(slot: usize) -> (usize, u64) {
-    assert!(slot < MAX_TASK, "scheduler rq slot exceeds capacity");
-    (slot / 64, 1_u64 << (slot % 64))
+pub(super) fn validate_slot(slot: usize) {
+    assert!(
+        crate::multitask::task_table::try_get(slot).is_some(),
+        "scheduler rq slot is not allocated in TaskTable"
+    );
 }
 
 #[inline]

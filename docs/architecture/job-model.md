@@ -32,7 +32,7 @@ and owners must not be confused with that historical design input:
 | Resource | Current shape | Source |
 | --- | --- | --- |
 | Process slots | Default admission 32; chunked storage up to 4,096 slots (internal ceiling), with a runtime/root-job policy limit | [process_table.rs](../../kernel/ps/src/multitask/process_table.rs), [slot_dir.rs](../../kernel/ps/src/multitask/slot_dir.rs) |
-| Threads | Job-level counted limit granted by loaderd from observed capacity ([request and grant](#application-job-request-and-grant)); per-process structural ceiling and the root-Job process default are derived from the task table by the `task_capacity` authority (ceiling `total/2`, root processes `total/4`, kernel headroom `total/4`; 128 / 64 / 64 of 256 slots today) and observable through `SYS_RUSTOS_TASK_CAPACITY` | [task_capacity.rs](../../kernel/ps/src/multitask/task_capacity.rs), [process_table.rs](../../kernel/ps/src/multitask/process_table.rs) |
+| Threads | Job-level counted limit granted by loaderd from observed capacity ([request and grant](#application-job-request-and-grant)): thread budget = half of physical RAM divided by (guarded kernel stack + heap `Task` bytes), bounded by the kernel's structural directory ceiling; the default grant is a quarter of that budget. The kernel keeps no slot-ratio quotas; capacity is observable through `SYS_RUSTOS_TASK_CAPACITY` (ABI v2) | [task_capacity.rs](../../kernel/ps/src/multitask/task_capacity.rs), [task_table.rs](../../kernel/ps/src/multitask/task_table.rs) |
 | Jobs | Generation-bound tree, 64 internal slots | [jobs.rs](../../kernel/ps/src/multitask/process_table/jobs.rs) |
 | Resident user memory | Per-job hierarchical page charging and admission | [Phase 2b-ii](#phase-2b-ii-memory-limit-as-built) |
 | Service identity | Static numeric IDs and legacy capability bits remain | [Ring3 process model](ring3-process-model.md) |
@@ -444,7 +444,7 @@ full, grows the same way (128-entry chunks).
 Decisions and limits, so they are not read as the final form:
 
 - **The limit is a runtime variable, not yet job policy.** `process_limit()`
-  defaults to 64 (the `task_capacity` authority's `root_process_ceiling`; it was 32 until a multi-process browser needed more than the dozen slots left beside ~20 services), `set_process_limit` clamps to the
+  defaults to 64 (a quarter of loaderd's process budget; it was 32 until a multi-process browser needed more than the dozen slots left beside ~20 services), `set_process_limit` clamps to the
   directory ceiling of 4096 slots, and lowering it never evicts a live process.
   Nothing sets it yet: wiring it to the root job's `processes.max` needs
   `SET_LIMITS`, which is phase 2b. Boot behaviour is therefore unchanged.

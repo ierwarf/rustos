@@ -67,7 +67,7 @@ fn actual_post_producer_image_bad_mm_refuses_without_leaking_freeze_or_custody()
 }
 #[test]
 fn actual_post_producer_image_refuses_real_mutators_until_original_turn_drops() {
-    let used = core::cell::Cell::new(super::super::MAX_TASK);
+    let used = core::cell::Cell::new(usize::MAX);
     root(true, true, |slot, turn| {
         used.set(slot);
         let context = stack_resources::context::read(slot).unwrap();

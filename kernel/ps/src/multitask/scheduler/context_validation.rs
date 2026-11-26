@@ -91,7 +91,7 @@ pub(super) fn validate_published_saved_context(
     if saved_rsp == 0 || (saved_rsp & (mem::align_of::<SavedContext>() - 1)) != 0 {
         return Err("saved context pointer is outside the task stack");
     }
-    if slot >= MAX_TASK {
+    if crate::multitask::task_table::try_get(slot).is_none() {
         return Err("saved context pointer is outside the task stack");
     }
     let Some(frame_end) = saved_rsp.checked_add(SAVED_CONTEXT_BYTES) else {

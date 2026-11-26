@@ -134,6 +134,10 @@ pub mod kernel_vm {
     pub use crate::memory::kernel_vm::*;
 }
 
+pub mod kernel_stack {
+    pub use crate::memory::kernel_stack::*;
+}
+
 pub mod virt {
     pub use crate::lowlevel::address::kernel_image_addr;
 

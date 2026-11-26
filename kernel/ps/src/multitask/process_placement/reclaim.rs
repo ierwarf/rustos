@@ -17,18 +17,14 @@ pub(in crate::multitask) fn reserve(admission: &ReclaimAdmission<'_>) -> Option<
         if state.handle != Some(handle) {
             return Some(());
         }
-        let Some(index) = state
-            .members
-            .iter()
-            .position(|&row| row == Some((slot, id)))
-        else {
+        let Some(index) = state.rows.iter().position(|row| row.member == (slot, id)) else {
             // Logical removal outside EXEC already excluded this UID from every new census.
             return Some(());
         };
-        if state.phase == 4 || state.terminal.is_some() || state.reclaiming[index].is_some() {
+        if state.phase == 4 || state.terminal.is_some() || state.rows[index].reclaiming.is_some() {
             return None;
         }
-        state.reclaiming[index] = Some(admission.nonce());
+        state.rows[index].reclaiming = Some(admission.nonce());
         Some(())
     })
 }
@@ -43,7 +39,7 @@ pub(in crate::multitask) fn busy(member: &Membership<'_>) -> bool {
         cell.with(|state| {
             state.handle == Some(handle)
                 && (state.phase == 4 || state.terminal.is_some())
-                && state.members.contains(&Some((slot, id)))
+                && state.rows.iter().any(|row| row.member == (slot, id))
         })
     })
 }
@@ -61,17 +57,13 @@ pub(in crate::multitask) fn unregister(member: &Membership<'_>) {
         if state.handle != Some(handle) {
             return;
         }
-        if let Some(index) = state
-            .members
-            .iter()
-            .position(|&row| row == Some((slot, id)))
-        {
+        if let Some(index) = state.rows.iter().position(|row| row.member == (slot, id)) {
             assert!(
                 state.phase != 4 && state.terminal.is_none(),
                 "physical detach with frozen exec/terminal census custody"
             );
             assert_eq!(
-                state.reclaiming[index],
+                state.rows[index].reclaiming,
                 member.reclaim_nonce(),
                 "physical detach lacks original resource reclaim nonce"
             );

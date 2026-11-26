@@ -29,12 +29,12 @@ fn unpublished_writer_owns_bytes_outside_leaf_and_blocks_detach_and_reentry() {
     initialize_storage(SLOT, |storage| {
         // A leaf callback would deadlock here. Byte initialization no longer
         // holds the resource lock, yet zero refcount cannot detach the buffer.
-        RESOURCES[SLOT].with(|resources| assert!(resources.frame_writing));
+        super::resource(SLOT).with(|resources| assert!(resources.frame_writing));
         assert!(catch_unwind(AssertUnwindSafe(|| take_storage(SLOT))).is_err());
         assert!(catch_unwind(AssertUnwindSafe(|| with_unpublished(SLOT, |_| ()))).is_err());
         storage[64] = 0x71;
     });
-    assert!(!RESOURCES[SLOT].with(|resources| resources.frame_writing));
+    assert!(!super::resource(SLOT).with(|resources| resources.frame_writing));
     finish();
 }
 

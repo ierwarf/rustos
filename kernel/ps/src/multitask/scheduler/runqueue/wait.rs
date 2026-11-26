@@ -21,11 +21,13 @@
 //! Forbidden: RunOwner generation as wait lifetime, raw leaves through frame/work.
 //! Evidence: actual typed wake/arm CAS, physical resource and queue/FIFO witnesses.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
-use super::{MAX_TASK, RunOwnerState, owner};
+use super::{RunOwnerState, owner};
+use crate::multitask::task_table;
 
 mod epoch;
+pub(in crate::multitask) use epoch::{WaitEpochLeaf, new_wait_epoch_leaf};
 pub(in crate::multitask::scheduler) use epoch::{TypedWake, WaitInstance, lane_wake_clear, wait_instance};
 
 pub(in crate::multitask) const REASON_NONE: u8 = 0;
@@ -35,12 +37,8 @@ pub(in crate::multitask) const REASON_ENDPOINT_REPLY: u8 = 3;
 pub(in crate::multitask) const REASON_PAGER_FAULT: u8 = 4;
 pub(in crate::multitask) const REASON_PAGER_SERVICE: u8 = 5;
 
-static READY_SINCE_TICKS: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-static BLOCKED_SINCE_TICKS: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-static REASON_ID: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-
 pub(in crate::multitask) fn reset_before_publication() {
-    for slot in 0..MAX_TASK {
+    for slot in task_table::allocated_slots() {
         clear(slot);
     }
 }
@@ -55,6 +53,7 @@ pub(in crate::multitask) fn initialize(slot: usize) {
 }
 
 pub(in crate::multitask) fn clear(slot: usize) {
+    let task = task_table::get(slot);
     epoch::with(slot, |state| {
         assert!(
             state.can_arm(),
@@ -62,9 +61,9 @@ pub(in crate::multitask) fn clear(slot: usize) {
         );
         assert!(state.advance(), "scheduler wait reset epoch exhausted");
         // ORDERING: withdraw all scalar payload before slot reuse publication.
-        REASON_ID[slot].store(0, Ordering::Release);
-        BLOCKED_SINCE_TICKS[slot].store(0, Ordering::Release);
-        READY_SINCE_TICKS[slot].store(0, Ordering::Release);
+        task.wait_reason_id.store(0, Ordering::Release);
+        task.wait_blocked_since.store(0, Ordering::Release);
+        task.wait_ready_since.store(0, Ordering::Release);
         super::clear_wait_arm(slot);
     });
 }
@@ -86,25 +85,25 @@ pub(in crate::multitask) fn set_blocked(slot: usize, blocked: bool) {
 #[inline]
 pub(in crate::multitask) fn ready_since_ticks(slot: usize) -> u64 {
     // ORDERING: pair with producer timing publication; timing grants no custody.
-    READY_SINCE_TICKS[slot].load(Ordering::Acquire)
+    task_table::get(slot).wait_ready_since.load(Ordering::Acquire)
 }
 
 #[inline]
 pub(in crate::multitask) fn set_ready_since_ticks(slot: usize, ticks: u64) {
     // ORDERING: publish advisory ready timing after admitted producer effects.
-    READY_SINCE_TICKS[slot].store(ticks, Ordering::Release);
+    task_table::get(slot).wait_ready_since.store(ticks, Ordering::Release);
 }
 
 #[inline]
 pub(in crate::multitask) fn blocked_since_ticks(slot: usize) -> u64 {
     // ORDERING: pair with wait-arm timing publication, never identity admission.
-    BLOCKED_SINCE_TICKS[slot].load(Ordering::Acquire)
+    task_table::get(slot).wait_blocked_since.load(Ordering::Acquire)
 }
 
 #[inline]
 pub(in crate::multitask) fn set_blocked_since_ticks(slot: usize, ticks: u64) {
     // ORDERING: publish wait timing before packed owner/arm CAS.
-    BLOCKED_SINCE_TICKS[slot].store(ticks, Ordering::Release);
+    task_table::get(slot).wait_blocked_since.store(ticks, Ordering::Release);
 }
 
 #[inline]
@@ -139,7 +138,7 @@ fn reason_locked(slot: usize) -> (u8, u64) {
     let kind = owner(slot).wait_reason_kind;
     // ORDERING: Acquire, ordered after the packed load, observes the identity
     // its publisher stored before publishing the kind.
-    let id = REASON_ID[slot].load(Ordering::Acquire);
+    let id = task_table::get(slot).wait_reason_id.load(Ordering::Acquire);
     (kind, id)
 }
 
@@ -174,7 +173,7 @@ pub(in crate::multitask) fn set_reason(slot: usize, kind: u8, id: u64) {
         );
         assert!(state.advance(), "scheduler wait epoch exhausted");
         // ORDERING: same leaf owns ID before packed reason publication.
-        REASON_ID[slot].store(id, Ordering::Release);
+        task_table::get(slot).wait_reason_id.store(id, Ordering::Release);
         super::set_wait_reason(slot, kind);
     });
 }
@@ -196,20 +195,21 @@ pub(in crate::multitask) fn publish_arm(slot: usize, kind: u8, id: u64) {
 /// is meaningful only with its successfully published reason kind.
 pub(in crate::multitask) fn try_publish_arm(slot: usize, kind: u8, id: u64) -> bool {
     validate_reason(kind, id);
+    let task = task_table::get(slot);
     epoch::with(slot, |state| {
         if !state.can_arm() || !state.advance() {
             return false;
         }
         // ORDERING: same epoch leaf owns payload through the arm/reason CAS.
         // A pending typed wake cannot be overtaken by any later arm.
-        let previous_id = REASON_ID[slot].swap(id, Ordering::AcqRel);
+        let previous_id = task.wait_reason_id.swap(id, Ordering::AcqRel);
         if super::publish_wait_arm(slot, kind) {
             return true;
         }
         // ORDERING: refused Running admission must not rewrite a blocked wait.
         // Every exact payload reader borrows this same leaf, so rollback is
         // invisible; terminal/return CAS never treats the scalar ID as custody.
-        REASON_ID[slot].store(previous_id, Ordering::Release);
+        task.wait_reason_id.store(previous_id, Ordering::Release);
         false
     })
 }
@@ -236,10 +236,11 @@ pub(super) fn wake(slot: usize) {
 }
 
 fn clear_wake_locked(slot: usize) {
+    let task = task_table::get(slot);
     super::wake_wait_locked(slot);
     // ORDERING: all scalar payload withdrawal remains inside this SAME leaf.
-    BLOCKED_SINCE_TICKS[slot].store(0, Ordering::Release);
-    REASON_ID[slot].store(0, Ordering::Release);
+    task.wait_blocked_since.store(0, Ordering::Release);
+    task.wait_reason_id.store(0, Ordering::Release);
 }
 pub(in crate::multitask::scheduler) fn clear_wake(slot: usize) {
     epoch::with(slot, |state| {

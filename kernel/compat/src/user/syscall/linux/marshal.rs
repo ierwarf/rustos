@@ -236,6 +236,20 @@ pub(super) fn check_ipc_status(status: i32) -> LinuxResult<()> {
 }
 
 #[inline]
+pub(super) fn alloc_box_zeroed<T>() -> alloc::boxed::Box<T> {
+    let layout = alloc::alloc::Layout::new::<T>();
+    assert!(layout.size() > 0);
+    // SAFETY: Caller uses POD / all-zero-valid storage and initializes required
+    // non-zero header fields before exposing the value.
+    let raw = unsafe { alloc::alloc::alloc_zeroed(layout) }.cast::<T>();
+    if raw.is_null() {
+        alloc::alloc::handle_alloc_error(layout);
+    }
+    // SAFETY: `raw` is non-null, aligned for `T`, zero-initialized, and uniquely owned.
+    unsafe { alloc::boxed::Box::from_raw(raw) }
+}
+
+#[inline]
 pub(super) fn decode_fixed_response<R: Copy>(bytes: &[u8]) -> LinuxResult<R> {
     if bytes.len() != size_of::<R>() {
         return Err(LINUX_EINVAL);
@@ -243,6 +257,26 @@ pub(super) fn decode_fixed_response<R: Copy>(bytes: &[u8]) -> LinuxResult<R> {
     // SAFETY: The length check above proves a complete `R` representation is
     // readable, and `read_unaligned` has no alignment requirement.
     Ok(unsafe { bytes.as_ptr().cast::<R>().read_unaligned() })
+}
+
+#[inline]
+pub(super) fn decode_fixed_response_boxed<R>(bytes: &[u8]) -> LinuxResult<alloc::boxed::Box<R>> {
+    if bytes.len() != size_of::<R>() {
+        return Err(LINUX_EINVAL);
+    }
+    let layout = alloc::alloc::Layout::new::<R>();
+    assert!(layout.size() > 0);
+    // SAFETY: `R` is a plain-old-data wire envelope matching `bytes.len()`.
+    let raw = unsafe { alloc::alloc::alloc(layout) }.cast::<u8>();
+    if raw.is_null() {
+        alloc::alloc::handle_alloc_error(layout);
+    }
+    // SAFETY: `raw` points to a fresh unaliased allocation of `size_of::<R>()` bytes,
+    // all initialized immediately from `bytes`.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), raw, size_of::<R>());
+        Ok(alloc::boxed::Box::from_raw(raw.cast::<R>()))
+    }
 }
 
 #[inline]
@@ -303,12 +337,12 @@ pub(super) fn copy_struct_into_payload<T>(
     Ok(())
 }
 
-pub(super) fn call_fixed_service_rpc<Req, Resp: Copy>(
+pub(super) fn call_fixed_service_rpc_boxed<Req, Resp>(
     service_id: u64,
     request: &Req,
     class: ipc_ops::ServiceIpcClass,
     timeout_ms: Option<u64>,
-) -> LinuxResult<Resp> {
+) -> LinuxResult<alloc::boxed::Box<Resp>> {
     let bytes = match timeout_ms {
         Some(timeout_ms) => ipc_ops::call_service_endpoint_with_class_deadline(
             service_id,
@@ -320,22 +354,21 @@ pub(super) fn call_fixed_service_rpc<Req, Resp: Copy>(
             ipc_ops::call_service_endpoint_with_class(service_id, wire_as_bytes(request), class)?
         }
     };
-    decode_fixed_response::<Resp>(bytes.as_slice())
+    decode_fixed_response_boxed::<Resp>(bytes.as_slice())
 }
 
-pub(super) fn new_netd_request(op: u16) -> NetdIpcRequest {
+pub(super) fn new_netd_request(op: u16) -> alloc::boxed::Box<NetdIpcRequest> {
     let stamp = CallerStamp::current();
-    NetdIpcRequest {
-        version: NETD_IPC_ABI_VERSION,
-        op,
-        pid: stamp.pid,
-        tid: stamp.tid,
-        uid: stamp.uid,
-        gid: stamp.gid,
-        euid: stamp.euid,
-        egid: stamp.egid,
-        ..NetdIpcRequest::default()
-    }
+    let mut request = alloc_box_zeroed::<NetdIpcRequest>();
+    request.version = NETD_IPC_ABI_VERSION;
+    request.op = op;
+    request.pid = stamp.pid;
+    request.tid = stamp.tid;
+    request.uid = stamp.uid;
+    request.gid = stamp.gid;
+    request.euid = stamp.euid;
+    request.egid = stamp.egid;
+    request
 }
 
 pub(super) fn new_devmgrd_ioctl_request(
@@ -343,23 +376,22 @@ pub(super) fn new_devmgrd_ioctl_request(
     fd: u64,
     request_number: u64,
     arg: u64,
-) -> DevmgrdDeviceIoctlRequest {
+) -> alloc::boxed::Box<DevmgrdDeviceIoctlRequest> {
     let stamp = CallerStamp::current();
-    DevmgrdDeviceIoctlRequest {
-        version: DEVMGRD_IPC_ABI_VERSION,
-        op,
-        fd,
-        request: request_number,
-        arg,
-        pid: stamp.pid,
-        tid: stamp.tid,
-        session_handle: stamp.session_handle,
-        uid: stamp.uid,
-        gid: stamp.gid,
-        euid: stamp.euid,
-        egid: stamp.egid,
-        ..DevmgrdDeviceIoctlRequest::default()
-    }
+    let mut request = alloc_box_zeroed::<DevmgrdDeviceIoctlRequest>();
+    request.version = DEVMGRD_IPC_ABI_VERSION;
+    request.op = op;
+    request.fd = fd;
+    request.request = request_number;
+    request.arg = arg;
+    request.pid = stamp.pid;
+    request.tid = stamp.tid;
+    request.session_handle = stamp.session_handle;
+    request.uid = stamp.uid;
+    request.gid = stamp.gid;
+    request.euid = stamp.euid;
+    request.egid = stamp.egid;
+    request
 }
 
 pub(super) fn new_inputd_request(op: u16, access: u16) -> InputdIpcRequest {

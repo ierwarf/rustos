@@ -146,14 +146,14 @@ SET/GET_NAME, NO_NEW_PRIVS, DUMPABLE (`prctl_ops.rs:122`), rseq -> ENOSYS
 ### M7. Task-count and waiter-table ceilings
 - Chrome (software mode) runs about 40-70 threads in the browser, 15-25 per renderer/utility/
   network/GPU process: a single window easily needs 150-250 live threads across 6-8 processes.
-- RustOS: `MAX_TASK = 256` for the whole machine (`kernel/ps/src/multitask/scheduler.rs:188`),
+- RustOS (before 2026-11-26: `MAX_TASK = 256`; now `Task` objects are allocated per slot in a growable chunk directory with guarded virtual kernel stacks; only memory accounting and the Job `threads.max` bound thread count),
   128 threads/process, 64 processes, ~2 MiB kernel stack per thread, memory-bound at ~100-120
   threads on a 2048M VM (2026-11-14 measurement). The futex waiter table is a global
   256-slot array whose overflow returns `EBUSY` (`futex_thread.rs:25,58,787-794`), an errno
   Linux futex never returns; glibc treats it as fatal in pthread_cond/mutex slow paths.
-- Sketch: measure real kernel stack depth first (handoff says to) and shrink; raise MAX_TASK
-  together with the kernel-stack allocation; make the futex table a hashed bucket array sized
-  from MAX_TASK with per-bucket locks (keep the compare+publish linearization point at
+- Sketch: measure real kernel stack depth first (handoff says to) and shrink; the task table now follows
+  the heap/stack ratio automatically; make the futex table a hashed bucket array sized
+  from the boot slot count with per-bucket locks (keep the compare+publish linearization point at
   `futex_thread.rs:420-440`) and return ENOMEM on exhaustion. Add a kvm-smoke case that spawns
   200 blocked threads.
 

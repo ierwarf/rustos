@@ -16,10 +16,11 @@
 //! - **Evidence:** `conservation::tests`; xtask classifies the milestone as its
 //!   own failure kind (`tools/xtask/src/kvm/evidence.rs`).
 
+use crate::multitask::task_table;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::ownership::{self, FLIGHT_DEPTH};
-use super::{RunOwnerState, MAX_TASK};
+use super::RunOwnerState;
 
 /// 2 s at the 1024 Hz scheduler tick: three orders of magnitude above
 /// scheduling latency and above the ~13 ms 8-vCPU stalls in the IPC notes.
@@ -53,19 +54,15 @@ pub(in crate::multitask::scheduler) struct CustodyReport {
 static NEXT_SCAN: AtomicU64 = AtomicU64::new(0);
 static SCANNING: AtomicBool = AtomicBool::new(false);
 static REPORTS: AtomicUsize = AtomicUsize::new(0);
-/// Scanner-owned (under `SCANNING`): the exact suspect word, when it was first
-/// seen, and the last word reported for the slot.
-static SUSPECT_WORD: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-static SUSPECT_SINCE: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-static REPORTED_WORD: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
 
 pub(super) fn reset_before_publication() {
     NEXT_SCAN.store(0, Ordering::Relaxed);
     REPORTS.store(0, Ordering::Relaxed);
-    for slot in 0..MAX_TASK {
-        SUSPECT_WORD[slot].store(0, Ordering::Relaxed);
-        SUSPECT_SINCE[slot].store(0, Ordering::Relaxed);
-        REPORTED_WORD[slot].store(0, Ordering::Relaxed);
+    for slot in task_table::allocated_slots() {
+        let task = task_table::get(slot);
+        task.conservation_suspect_word.store(0, Ordering::Relaxed);
+        task.conservation_suspect_since.store(0, Ordering::Relaxed);
+        task.conservation_reported_word.store(0, Ordering::Relaxed);
     }
 }
 
@@ -108,36 +105,41 @@ fn reserve_report_slot(emitted_this_scan: usize) -> bool {
 /// The classification pass, separated from rate limiting for witnesses. The
 /// caller holds `SCANNING` (or is a single-threaded witness).
 pub(super) fn scan_slots(now_ticks: u64, mut report: impl FnMut(CustodyReport)) {
-    for slot in 0..MAX_TASK {
+    #[cfg(not(test))]
+    let slots = task_table::active_slots();
+    #[cfg(test)]
+    let slots = task_table::allocated_slots();
+    for slot in slots {
+        let task = task_table::get(slot);
         let word = ownership::owner_raw(slot);
         let Some(gap) = classify(slot, word) else {
-            SUSPECT_WORD[slot].store(0, Ordering::Relaxed);
+            task.conservation_suspect_word.store(0, Ordering::Relaxed);
             continue;
         };
-        if SUSPECT_WORD[slot].load(Ordering::Relaxed) != word {
-            SUSPECT_WORD[slot].store(word, Ordering::Relaxed);
-            SUSPECT_SINCE[slot].store(now_ticks, Ordering::Relaxed);
+        if task.conservation_suspect_word.load(Ordering::Relaxed) != word {
+            task.conservation_suspect_word.store(word, Ordering::Relaxed);
+            task.conservation_suspect_since.store(now_ticks, Ordering::Relaxed);
             continue;
         }
-        let age_ticks = now_ticks.saturating_sub(SUSPECT_SINCE[slot].load(Ordering::Relaxed));
+        let age_ticks = now_ticks.saturating_sub(task.conservation_suspect_since.load(Ordering::Relaxed));
         if age_ticks < THRESHOLD_TICKS
-            || REPORTED_WORD[slot].load(Ordering::Relaxed) == word
+            || task.conservation_reported_word.load(Ordering::Relaxed) == word
         {
             continue;
         }
         if !confirm(slot, word, gap) {
             // A valid FIFO/mailbox receipt resets the *missing* age. A later
             // loss must persist for its own threshold, not inherit this age.
-            SUSPECT_WORD[slot].store(0, Ordering::Relaxed);
+            task.conservation_suspect_word.store(0, Ordering::Relaxed);
             continue;
         }
         // Ownership may have changed while the slow mailbox/FIFO check took
         // its leaf. Never report a missing record for a newer incarnation.
         if ownership::owner_raw(slot) != word {
-            SUSPECT_WORD[slot].store(0, Ordering::Relaxed);
+            task.conservation_suspect_word.store(0, Ordering::Relaxed);
             continue;
         }
-        REPORTED_WORD[slot].store(word, Ordering::Relaxed);
+        task.conservation_reported_word.store(word, Ordering::Relaxed);
         report(CustodyReport { slot, gap, word, age_ticks });
     }
 }

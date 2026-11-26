@@ -74,6 +74,7 @@ fn snapshot(pixels: Vec<u32>, damage: Rect) -> WaylandWindowSnapshot {
         minimized: false,
         server_decoration: true,
         drag_icon: false,
+        popup: false,
         content_version: 2,
         damage,
         pixels: Arc::new(pixels),

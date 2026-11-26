@@ -440,18 +440,17 @@ fn frame_to_user_registers(frame: &SyscallFrame) -> RustosUserRegisters {
     }
 }
 
-pub fn new_procd_request(op: u16) -> ProcdIpcRequest {
+pub fn new_procd_request(op: u16) -> alloc::boxed::Box<ProcdIpcRequest> {
     let stamp = CallerStamp::current_ids_only();
-    let mut request = ProcdIpcRequest {
-        op,
-        pid: stamp.pid,
-        tid: stamp.tid,
-        parent_pid: if stamp.pid != 0 {
-            multitask::parent_process_id_of(stamp.pid).unwrap_or(0)
-        } else {
-            0
-        },
-        ..ProcdIpcRequest::default()
+    let mut request = alloc_box_zeroed::<ProcdIpcRequest>();
+    request.version = rustos_user_abi::syscall::PROCD_IPC_ABI_VERSION;
+    request.op = op;
+    request.pid = stamp.pid;
+    request.tid = stamp.tid;
+    request.parent_pid = if stamp.pid != 0 {
+        multitask::parent_process_id_of(stamp.pid).unwrap_or(0)
+    } else {
+        0
     };
     if let Some(thread_state) = multitask::current_linux_thread_state() {
         request.arg5 = thread_state.signal_mask;
@@ -459,9 +458,9 @@ pub fn new_procd_request(op: u16) -> ProcdIpcRequest {
     request
 }
 
-pub fn call_procd(request: &ProcdIpcRequest) -> Result<ProcdIpcResponse, i64> {
+pub fn call_procd(request: &ProcdIpcRequest) -> Result<alloc::boxed::Box<ProcdIpcResponse>, i64> {
     let start_ticks = crate::arch::rtc::ticks();
-    let response: ProcdIpcResponse = call_fixed_service_rpc(
+    let response: alloc::boxed::Box<ProcdIpcResponse> = call_fixed_service_rpc_boxed(
         IPC_SERVICE_PROCD,
         request,
         ipc_ops::ServiceIpcClass::BootControl,
@@ -513,11 +512,10 @@ pub fn ensure_empty_procd_response(response: &ProcdIpcResponse) -> Result<(), i6
     check_ipc_status(response.status)
 }
 
-pub fn new_vfs_request(op: u16) -> VfsIpcRequest {
-    let mut request = VfsIpcRequest {
-        op,
-        ..VfsIpcRequest::default()
-    };
+pub fn new_vfs_request(op: u16) -> alloc::boxed::Box<VfsIpcRequest> {
+    let mut request = alloc_box_zeroed::<VfsIpcRequest>();
+    request.version = VFS_IPC_ABI_VERSION;
+    request.op = op;
     let mut operation = [0_u8; 16];
     nucleus_core::util::random::Random::new().fill_bytes(&mut operation);
     request.operation_hi = u64::from_le_bytes(operation[..8].try_into().unwrap());
@@ -735,30 +733,21 @@ mod ipc_helpers_audit_tests {
     fn decode_and_check_vfs_reply_validates_size_envelope_and_status() {
         assert_eq!(decode_and_check_vfs_reply(VFS_IPC_OP_CLOSE, &[0_u8; 4]), Err(LINUX_EINVAL));
 
-        let mut resp = VfsIpcResponse {
-            version: VFS_IPC_ABI_VERSION,
-            op: VFS_IPC_OP_CLOSE,
-            status: 0,
-            handle_kind: 0,
-            reserved0: 0,
-            payload_len: 0,
-            remote_id: 0,
-            value: 0,
-            aux: 0,
-            payload: [0_u8; VFS_IPC_PAYLOAD_CAPACITY],
-        };
-        assert_eq!(decode_and_check_vfs_reply(VFS_IPC_OP_CLOSE, as_bytes(&resp)), Ok(()));
+        let mut resp = alloc_box_zeroed::<VfsIpcResponse>();
+        resp.version = VFS_IPC_ABI_VERSION;
+        resp.op = VFS_IPC_OP_CLOSE;
+        assert_eq!(decode_and_check_vfs_reply(VFS_IPC_OP_CLOSE, as_bytes(&*resp)), Ok(()));
 
         resp.status = -(LINUX_EBUSY as i32);
         assert_eq!(
-            decode_and_check_vfs_reply(VFS_IPC_OP_CLOSE, as_bytes(&resp)),
+            decode_and_check_vfs_reply(VFS_IPC_OP_CLOSE, as_bytes(&*resp)),
             Err(LINUX_EBUSY)
         );
 
         resp.status = 0;
         resp.op = VFS_IPC_OP_OPENAT;
         assert_eq!(
-            decode_and_check_vfs_reply(VFS_IPC_OP_CLOSE, as_bytes(&resp)),
+            decode_and_check_vfs_reply(VFS_IPC_OP_CLOSE, as_bytes(&*resp)),
             Err(LINUX_EINVAL)
         );
     }
@@ -770,18 +759,18 @@ pub(super) fn is_linux_at_fdcwd_for_vfs(dirfd: u64) -> bool {
     dirfd == AT_FDCWD_I64 || dirfd == AT_FDCWD_I32 || dirfd == linux_abi::AT_FDCWD as u64
 }
 
-pub fn call_vfs_ipc_request(request: &VfsIpcRequest) -> Result<VfsIpcResponse, i64> {
+pub fn call_vfs_ipc_request(request: &VfsIpcRequest) -> Result<alloc::boxed::Box<VfsIpcResponse>, i64> {
     call_vfs_ipc_request_impl(request, None)
 }
 
 pub fn call_vfs_ipc_request_with_timeout(
     request: &VfsIpcRequest,
     timeout_ms: u64,
-) -> Result<VfsIpcResponse, i64> {
+) -> Result<alloc::boxed::Box<VfsIpcResponse>, i64> {
     call_vfs_ipc_request_impl(request, Some(timeout_ms.max(1)))
 }
 
-pub fn call_vfs_checked(request: &VfsIpcRequest) -> LinuxResult<VfsIpcResponse> {
+pub fn call_vfs_checked(request: &VfsIpcRequest) -> LinuxResult<alloc::boxed::Box<VfsIpcResponse>> {
     let response = call_pinned_remote_vfs_request(request)?;
     ensure_vfs_status(&response)?;
     Ok(response)
@@ -894,7 +883,7 @@ fn call_service_bytes_with_optional_deadline(
     }
 }
 
-fn call_checked_service_rpc<Req, Resp: Copy>(
+fn call_checked_service_rpc_boxed<Req, Resp>(
     service_name: &'static str,
     service_id: u64,
     op: u16,
@@ -906,9 +895,10 @@ fn call_checked_service_rpc<Req, Resp: Copy>(
     log_slow: bool,
     detail: Option<&str>,
     validate: impl FnOnce(&Resp) -> LinuxResult<i32>,
-) -> LinuxResult<Resp> {
+) -> LinuxResult<alloc::boxed::Box<Resp>> {
     let start_ticks = log_slow.then(crate::arch::rtc::ticks);
-    let response: Resp = call_fixed_service_rpc(service_id, request, class, timeout_ms)?;
+    let response: alloc::boxed::Box<Resp> =
+        call_fixed_service_rpc_boxed(service_id, request, class, timeout_ms)?;
     if let Some(start) = start_ticks {
         diagnostics::log_slow_service_call(
             service_name,
@@ -926,7 +916,7 @@ fn call_checked_service_rpc<Req, Resp: Copy>(
 }
 
 fn decode_and_check_vfs_reply(op: u16, bytes: &[u8]) -> LinuxResult<()> {
-    let response = decode_fixed_response::<VfsIpcResponse>(bytes)?;
+    let response = decode_fixed_response_boxed::<VfsIpcResponse>(bytes)?;
     validate_vfs_response_envelope(op, &response)?;
     check_ipc_status(response.status)
 }
@@ -934,7 +924,7 @@ fn decode_and_check_vfs_reply(op: u16, bytes: &[u8]) -> LinuxResult<()> {
 fn call_vfs_ipc_request_impl(
     request: &VfsIpcRequest,
     timeout_ms: Option<u64>,
-) -> Result<VfsIpcResponse, i64> {
+) -> Result<alloc::boxed::Box<VfsIpcResponse>, i64> {
     let start_ticks = crate::arch::rtc::ticks();
     let replay_safe_request = vfs_request_is_replay_safe(request);
     let deferred_reconcile = matches!(
@@ -1022,12 +1012,11 @@ fn call_vfs_ipc_request_impl(
         response.len() as i64,
         detail.as_deref(),
     );
-    let response = match decode_fixed_response::<VfsIpcResponse>(response.as_slice()).and_then(
-        |decoded| {
+    let response = match decode_fixed_response_boxed::<VfsIpcResponse>(response.as_slice())
+        .and_then(|decoded| {
             validate_vfs_response_envelope(request.op, &decoded)?;
             Ok(decoded)
-        },
-    ) {
+        }) {
         Ok(decoded) => decoded,
         Err(errno) => {
             if deferred_reconcile {
@@ -1065,7 +1054,7 @@ fn acknowledge_vfs_checkpoint_mutation(original: &VfsIpcRequest) -> Result<(), i
     // state-mutation lease, never an interactive or readiness-query rail.
     let err = match ipc_ops::call_service_endpoint_with_class_deadline(
         IPC_SERVICE_VFSD,
-        as_bytes(&ack),
+        as_bytes(ack.as_ref()),
         vfs_request_service_class(&ack),
         rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
     ) {
@@ -1079,7 +1068,7 @@ fn acknowledge_vfs_checkpoint_mutation(original: &VfsIpcRequest) -> Result<(), i
     Err(err)
 }
 
-fn vfs_checkpoint_ack_request(original: &VfsIpcRequest) -> VfsIpcRequest {
+fn vfs_checkpoint_ack_request(original: &VfsIpcRequest) -> alloc::boxed::Box<VfsIpcRequest> {
     let mut ack = new_vfs_request(VFS_IPC_OP_CHECKPOINT_ACK);
     ack.remote_id = original.remote_id;
     ack.arg0 = original.operation_hi;
@@ -1241,7 +1230,7 @@ fn replay_pending_vfs_mutation(lane: Option<VfsMutationLane>) -> Option<bool> {
     pending.restore_into(&mut request);
     let completed = ipc_ops::call_service_endpoint_with_class_deadline(
         IPC_SERVICE_VFSD,
-        as_bytes(&request),
+        as_bytes(request.as_ref()),
         ipc_ops::ServiceIpcClass::StateMutation,
         rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
     )
@@ -1387,7 +1376,7 @@ fn call_inputd_ipc_request_fixed(
     class: ipc_ops::ServiceIpcClass,
     timeout_ms: Option<u64>,
 ) -> LinuxResult<InputdIpcResponse> {
-    call_checked_service_rpc(
+    call_checked_service_rpc_boxed::<InputdIpcRequest, InputdIpcResponse>(
         "inputd",
         IPC_SERVICE_INPUTD,
         request.op,
@@ -1403,6 +1392,7 @@ fn call_inputd_ipc_request_fixed(
             Ok(response.status)
         },
     )
+    .map(|boxed| *boxed)
 }
 
 fn call_inputd_ipc_request(request: &InputdIpcRequest) -> Result<InputdIpcResponse, i64> {
@@ -1465,9 +1455,9 @@ fn call_sessiond_commercial(
     class: ipc_ops::ServiceIpcClass,
     timeout_ms: Option<u64>,
     log_slow: bool,
-) -> LinuxResult<CommercialMaxProtocolResponse> {
+) -> LinuxResult<alloc::boxed::Box<CommercialMaxProtocolResponse>> {
     let snapshot = multitask::current_user_snapshot().ok_or(LINUX_EINVAL)?;
-    let mut request = CommercialMaxProtocolRequest::default();
+    let mut request = alloc_box_zeroed::<CommercialMaxProtocolRequest>();
     if payload.len() > request.payload.len() {
         return Err(LINUX_EINVAL);
     }
@@ -1484,13 +1474,13 @@ fn call_sessiond_commercial(
     request.payload[..payload.len()].copy_from_slice(payload);
     request.payload_len = payload.len() as u32;
 
-    call_checked_service_rpc(
+    call_checked_service_rpc_boxed::<CommercialMaxProtocolRequest, CommercialMaxProtocolResponse>(
         "sessiond",
         IPC_SERVICE_SESSIOND,
         request.header.op,
         request.header.subject_pid,
         request.header.subject_tid,
-        &request,
+        request.as_ref(),
         class,
         timeout_ms,
         log_slow,
@@ -1777,7 +1767,7 @@ fn call_sessiond_console_route(
     class: ipc_ops::ServiceIpcClass,
     timeout_ms: Option<u64>,
     log_slow: bool,
-) -> Result<CommercialMaxProtocolResponse, i64> {
+) -> Result<alloc::boxed::Box<CommercialMaxProtocolResponse>, i64> {
     let response = call_sessiond_commercial(
         COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE,
         route_request,
@@ -1847,19 +1837,17 @@ pub fn open_device_via_devmgrd(path: &str, flags: u64) -> Result<u64, i64> {
         return Err(LINUX_EINVAL);
     }
     let stamp = CallerStamp::current_ids_only();
-    let mut request = DevmgrdDeviceOpenRequest {
-        version: rustos_user_abi::syscall::DEVMGRD_IPC_ABI_VERSION,
-        op: rustos_user_abi::syscall::DEVMGRD_IPC_OP_OPEN,
-        open_flags: flags,
-        path_len: bytes.len() as u32,
-        pid: stamp.pid,
-        tid: stamp.tid,
-        ..DevmgrdDeviceOpenRequest::default()
-    };
+    let mut request = alloc_box_zeroed::<DevmgrdDeviceOpenRequest>();
+    request.version = rustos_user_abi::syscall::DEVMGRD_IPC_ABI_VERSION;
+    request.op = rustos_user_abi::syscall::DEVMGRD_IPC_OP_OPEN;
+    request.open_flags = flags;
+    request.path_len = bytes.len() as u32;
+    request.pid = stamp.pid;
+    request.tid = stamp.tid;
     request.path[..bytes.len()].copy_from_slice(bytes);
     let (response, entries) = ipc_ops::call_service_endpoint_with_received_entries(
         IPC_SERVICE_DEVMGRD,
-        as_bytes(&request),
+        as_bytes(request.as_ref()),
         1,
     )?;
     let entry = validate_devmgrd_open_reply(response.as_slice(), entries)?;
@@ -1965,19 +1953,19 @@ pub(in crate::user::syscall::linux) fn call_devmgrd_ioctl(
     allow_payload: bool,
     log_slow: bool,
     configure: impl FnOnce(&mut DevmgrdDeviceIoctlRequest) -> LinuxResult<()>,
-) -> LinuxResult<DevmgrdDeviceIoctlResponse> {
+) -> LinuxResult<alloc::boxed::Box<DevmgrdDeviceIoctlResponse>> {
     let mut request = new_devmgrd_ioctl_request(op, fd, request_number, arg);
     if require_ids && (request.pid == 0 || request.tid == 0) {
         return Err(LINUX_EINVAL);
     }
     configure(&mut request)?;
-    call_checked_service_rpc(
+    call_checked_service_rpc_boxed::<DevmgrdDeviceIoctlRequest, DevmgrdDeviceIoctlResponse>(
         "devmgrd",
         IPC_SERVICE_DEVMGRD,
         request.op,
         request.pid,
         request.tid,
-        &request,
+        request.as_ref(),
         ipc_ops::ServiceIpcClass::InteractiveControl,
         None,
         log_slow,
@@ -2215,7 +2203,9 @@ fn apply_devmgrd_ioctl_payload(
     }
 }
 
-pub fn call_inputd_read_request(request: &InputdIpcRequest) -> Result<InputdReadResponse, i64> {
+pub fn call_inputd_read_request(
+    request: &InputdIpcRequest,
+) -> Result<alloc::boxed::Box<InputdReadResponse>, i64> {
     // A nonblocking read cannot legitimately need the bulk-data rail. Its
     // contract is to answer now or report that there is nothing, so a caller
     // that waits 30 seconds for one is not waiting on data - it is waiting on a
@@ -2237,7 +2227,7 @@ pub fn call_inputd_read_request(request: &InputdIpcRequest) -> Result<InputdRead
     } else {
         (ipc_ops::ServiceIpcClass::BulkData, Some("blocking"))
     };
-    call_checked_service_rpc(
+    call_checked_service_rpc_boxed::<InputdIpcRequest, InputdReadResponse>(
         "inputd",
         IPC_SERVICE_INPUTD,
         request.op,
@@ -2260,14 +2250,16 @@ pub fn call_inputd_read_request(request: &InputdIpcRequest) -> Result<InputdRead
     )
 }
 
-pub fn call_netd_ipc_request(request: &NetdIpcRequest) -> Result<NetdIpcResponse, i64> {
+pub fn call_netd_ipc_request(
+    request: &NetdIpcRequest,
+) -> Result<alloc::boxed::Box<NetdIpcResponse>, i64> {
     call_netd_ipc_request_impl(request, None)
 }
 
 pub fn call_netd_ipc_request_with_timeout(
     request: &NetdIpcRequest,
     timeout_ms: u64,
-) -> Result<NetdIpcResponse, i64> {
+) -> Result<alloc::boxed::Box<NetdIpcResponse>, i64> {
     call_netd_ipc_request_impl(request, Some(timeout_ms.max(1)))
 }
 
@@ -2282,7 +2274,7 @@ pub(super) fn netd_request_bytes(request: &NetdIpcRequest) -> LinuxResult<&[u8]>
 fn call_netd_ipc_request_impl(
     request: &NetdIpcRequest,
     timeout_ms: Option<u64>,
-) -> Result<NetdIpcResponse, i64> {
+) -> Result<alloc::boxed::Box<NetdIpcResponse>, i64> {
     if netd_reply_uses_prepared_socket(request) {
         return call_netd_socket_ipc_request_impl(request, timeout_ms);
     }
@@ -2330,9 +2322,9 @@ fn call_netd_ipc_request_impl(
 }
 
 fn finish_netd_ipc_response(
-    mut decoded: NetdIpcResponse,
+    mut decoded: alloc::boxed::Box<NetdIpcResponse>,
     release: impl FnOnce(&mut NetdIpcResponse) -> Result<(), i64>,
-) -> Result<NetdIpcResponse, i64> {
+) -> Result<alloc::boxed::Box<NetdIpcResponse>, i64> {
     // A reference mutation may carry cleanup even on an error; validate and
     // settle its custody before exposing the operation status.
     release(&mut decoded)?;
@@ -2346,20 +2338,20 @@ fn finish_netd_ipc_response(
 fn decode_netd_ipc_response(
     request: &NetdIpcRequest,
     response: &[u8],
-) -> Result<NetdIpcResponse, i64> {
+) -> Result<alloc::boxed::Box<NetdIpcResponse>, i64> {
     if response.len() < NETD_IPC_RESPONSE_HEADER_SIZE
         || response.len() > size_of::<NetdIpcResponse>()
     {
         return Err(LINUX_EINVAL);
     }
-    let mut decoded = NetdIpcResponse::default();
+    let mut decoded = alloc_box_zeroed::<NetdIpcResponse>();
     // SAFETY: The byte slice was bounded to the concrete response object
     // layout above, and `NetdIpcResponse` is a C wire record copied without
     // dereferencing any pointer embedded in its bytes.
     unsafe {
         core::ptr::copy_nonoverlapping(
             response.as_ptr(),
-            (&mut decoded as *mut NetdIpcResponse).cast::<u8>(),
+            (&mut *decoded as *mut NetdIpcResponse).cast::<u8>(),
             response.len(),
         );
     }

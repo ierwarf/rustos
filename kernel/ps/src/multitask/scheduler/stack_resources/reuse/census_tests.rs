@@ -58,7 +58,7 @@ fn stop(slot: usize, handle: ProcessHandle) {
     turn.finish(receipt);
     assert_eq!(identity::execution::count(slot), 0);
     // ORDERING: acquire observes the real last allocation loan release before reclaim.
-    assert_eq!(RESOURCES[slot].pins.load(Ordering::Acquire), 0);
+    assert_eq!(super::resource(slot).pins.load(Ordering::Acquire), 0);
 }
 fn complete(mut reuse: Reuse, handle: ProcessHandle) {
     let slot = reuse.slot;
@@ -93,20 +93,20 @@ fn actual_frozen_census_refuses_zero_borrower_reclaim_without_partial_close_or_n
         let intent = intent(target, handle);
         let census = ExecMembership::begin(&intent).unwrap();
         stop(sibling, handle);
-        let before = RESOURCES[sibling].with(|r| (r.reservation_generation, r.closing));
+        let before = super::resource(sibling).with(|r| (r.reservation_generation, r.closing));
         assert!(begin_retired(sibling, ID + 1).is_none());
         assert!(!close_for_reclaim(sibling));
         assert_eq!(
-            RESOURCES[sibling].with(|r| (r.reservation_generation, r.closing)),
+            super::resource(sibling).with(|r| (r.reservation_generation, r.closing)),
             before
         );
         // Explicit negative input permits reaching the physical-clear gate; not an admission.
-        RESOURCES[sibling].with(|r| r.closing = true);
+        super::resource(sibling).with(|r| r.closing = true);
         assert!(std::panic::catch_unwind(|| context::clear(sibling)).is_err());
         assert!(std::panic::catch_unwind(|| task_start::clear(sibling)).is_err());
         assert!(task_start::read(sibling).is_some());
         assert!(context::read(sibling).is_some());
-        RESOURCES[sibling].with(|r| r.closing = before.1);
+        super::resource(sibling).with(|r| r.closing = before.1);
         census.assert_matches(&intent);
         cancel(intent, Some(census));
         complete(begin_retired(sibling, ID + 1).unwrap(), handle);
@@ -130,7 +130,7 @@ fn actual_reclaim_first_refuses_census_until_physical_unregistration_while_origi
         let census = ExecMembership::begin(&intent).unwrap();
         assert!(!census.members().contains(&(sibling, ID + 1)));
         assert!(admission::reserve(sibling, ID + 2).is_none());
-        assert!(RESOURCES[sibling].with(|r| r.reclaim == Some(reuse.key)));
+        assert!(super::resource(sibling).with(|r| r.reclaim == Some(reuse.key)));
         cancel(intent, Some(census));
         complete(reuse, handle);
     });
@@ -161,11 +161,11 @@ fn actual_abandoned_reclaim_keeps_census_closed_without_new_execution_refs() {
         assert!(ExecMembership::begin(&intent).is_none());
         assert_eq!(identity::execution::count(sibling), 0);
         // ORDERING: no additional allocation borrower was created by the census fence.
-        assert_eq!(RESOURCES[sibling].pins.load(Ordering::Acquire), 0);
+        assert_eq!(super::resource(sibling).pins.load(Ordering::Acquire), 0);
         assert!(begin_retired(sibling, ID + 1).is_none());
         cancel(intent, None);
         // Native owner recovery ONLY for fixture cleanup, never production reopen.
-        RESOURCES[sibling].with(|r| {
+        super::resource(sibling).with(|r| {
             assert_eq!(r.reclaim.unwrap().phase, Phase::Poisoned);
             r.reclaim = Some(key);
         });
@@ -196,10 +196,10 @@ fn actual_terminal_census_refuses_stopped_member_reclaim_and_logical_detach_unti
         assert!(!close_for_reclaim(sibling));
         placement::unregister(handle, sibling, ID + 1);
         assert!(begin_retired(sibling, ID + 1).is_none());
-        RESOURCES[sibling].with(|r| r.closing = true);
+        super::resource(sibling).with(|r| r.closing = true);
         assert!(std::panic::catch_unwind(|| context::clear(sibling)).is_err());
         assert!(context::read(sibling).is_some());
-        RESOURCES[sibling].with(|r| r.closing = false);
+        super::resource(sibling).with(|r| r.closing = false);
         drop(turn); // Original untouched election rollback, not an external stop ACK.
         complete(begin_retired(sibling, ID + 1).unwrap(), handle);
     });
@@ -332,7 +332,7 @@ fn actual_concurrent_census_and_reclaim_admission_have_exactly_one_winner() {
 fn actual_exhausted_resource_nonce_does_not_install_a_process_reclaim_reservation() {
     fixture(|target, sibling, handle| {
         stop(sibling, handle);
-        let original = RESOURCES[sibling].with(|r| {
+        let original = super::resource(sibling).with(|r| {
             let original = r.reservation_generation;
             r.reservation_generation = u64::MAX;
             original
@@ -342,7 +342,7 @@ fn actual_exhausted_resource_nonce_does_not_install_a_process_reclaim_reservatio
         let census = ExecMembership::begin(&intent).unwrap();
         assert!(census.members().contains(&(sibling, ID + 1)));
         cancel(intent, Some(census));
-        RESOURCES[sibling].with(|r| r.reservation_generation = original);
+        super::resource(sibling).with(|r| r.reservation_generation = original);
         complete(begin_retired(sibling, ID + 1).unwrap(), handle);
     });
 }
@@ -351,10 +351,10 @@ fn actual_physical_clear_requires_original_reclaim_nonce_before_releasing_proces
     fixture(|target, sibling, handle| {
         stop(sibling, handle);
         let reuse = begin_retired(sibling, ID + 1).unwrap();
-        RESOURCES[sibling].with(|r| r.reclaim.as_mut().unwrap().nonce += 1);
+        super::resource(sibling).with(|r| r.reclaim.as_mut().unwrap().nonce += 1);
         assert!(std::panic::catch_unwind(|| context::clear(sibling)).is_err());
         assert!(context::read(sibling).is_some());
-        RESOURCES[sibling].with(|r| r.reclaim = Some(reuse.key));
+        super::resource(sibling).with(|r| r.reclaim = Some(reuse.key));
         let intent = intent(target, handle);
         assert!(ExecMembership::begin(&intent).is_none());
         cancel(intent, None);

@@ -40,8 +40,8 @@ Historical entries prior to 2026-11-25 live in `git log` (e.g.
      `nucleus_service_cleanup_task` with dual-slot `KickSlot` wakeups.
    - **`vfsd` pooled bulk-read workers** (`services/vfsd/src/bulk_read_worker.rs`):
      replaced per-request `SYS_CLONE` with a lock-free 7-state cached worker pool
-     with 2 s idle retirement (0 resident threads at rest, preserving Chrome's
-     144-thread budget on the 256-slot table).
+     with 2 s idle retirement (0 resident threads at rest, keeping the
+     resident thread count low).
    - **`futex` service-owner guard** (`kernel/compat/src/user/syscall/linux/{ipc_ops.rs,service_ops/futex_thread.rs}`):
      published Ring3 service owners skip synchronous provider cleanup inside
      `FUTEX_WAKE` (short-circuited after the local `cmd`/`result` check) so
@@ -54,6 +54,136 @@ Historical entries prior to 2026-11-25 live in `git log` (e.g.
      `docs/architecture/{job-model,ring3-component-model,ui-server}.md`,
      `formal/{CONFORMANCE,COVERAGE,models}.md`, `formal/coverage/release-proof-gaps.md`,
      `apps/chrome/README.md`) to match current code ownership.
+
+5. **Chrome keypress crash (`wl_subcompositor` missing) and `xdg_popup`**
+   - Evidence: Chrome main process SIGSEGV at `wl_proxy_get_version(NULL)`
+     (cr2=0x40) right after a key press. A temporary fault-stack milestone put
+     the return address at Chrome `0x84ba16b`: an inline
+     `wl_subcompositor_get_subsurface` wrapper whose subcompositor proxy is
+     NULL, because `uiserver` never advertised `wl_subcompositor` and Chrome
+     does not null-check it. The unmapped `wl_surface` created just before the
+     crash was that subsurface's surface. `text-input-v3 not available` is
+     benign (intentional non-goal).
+   - Fix: `wayland/subsurface.rs` implements `wl_subcompositor` (v1) and
+     `wl_subsurface` (set_position, place_above/below, destroy; sync/desync
+     accepted). A subsurface is painted as a borderless child window at the
+     parent's content origin plus its offset, above the parent; below-parent
+     subsurfaces are not painted; commits apply immediately (no synchronized
+     deferral). Cycles and double roles are protocol errors.
+   - Also added (a latent crash for the same client): `wayland/popup.rs`
+     implements `xdg_positioner` (anchor/gravity/offset, flip then slide) and
+     `xdg_popup` (get_popup, grab, reposition, destroy, `popup_done`);
+     previously ignored with `_ => {}`. Popups and subsurfaces share
+     `WaylandState::surface_frame`, the `popup` snapshot flag (no
+     taskbar/placement/click-focus, drawn above toplevels, hit-tested first),
+     and are hidden with their parent.
+   - Not honoured: `xdg_surface.set_window_geometry`, constraint
+     `resize_x/y`, subsurface sync deferral and sibling ordering.
+   - Second crash (2026-11-26 KVM run, non-Backspace key): the first subsurface
+     build killed Chrome with `wl_subcompositor.get_subsurface: surface already
+     has a role`. Destroying a `wl_subsurface` keeps the wl_surface's role and
+     the same role may be assigned again, so `WaylandSurfaceState.subsurface_role`
+     now allows re-assignment (a live subsurface or another role still errors)
+     and the retired surface is revived. Test:
+     `a_destroyed_wl_subsurface_can_be_given_again_to_the_same_wl_surface`.
+   - Unverified: no KVM boot after the re-assignment fix; host tests
+     (`cargo test -p uiserver`, 310 passed) cover the wire protocol, placement,
+     hit testing and dismissal.
+
+6. **Task-table overhaul (dynamically allocated Task objects + guarded virtual stacks; 2026-11-26)**
+   - **Implemented:**
+     - Removed `MAX_TASK`, `SLOT_LIMIT = 1024`, `PROCESS_THREAD_LIMIT = 512`, `boot_slot_count`,
+       and ratio-derived task/process/thread ceilings (`task_capacity` / `process_table`); kernel now
+       enforces only memory accounting (`Class::Thread`), `SlabPool` / `TaskTable` bounds (`32-bit` slots),
+       and Ring3 Job limits (`threads.max`).
+     - Consolidated per-slot arrays (`BootTable<T>`) into chunked `'static` `Task` objects (`task_table::TaskTable`,
+       `slot_dir::AtomicDir`), replaced `published_runnable` scans/bitmaps with dense `published_slots` /
+       intrusive `RunQueueInner` links / `SlabQueue` FIFOs (`irq_pool.rs`), removed per-process `512` inline
+       arrays (`process_placement`, `Cohort`), and converted waiter tables (`futex_thread`, `waitset_broker_ops`,
+       `ipc_ops`, `dvm_block`, `input/wait_queue`, `sync`, `mm_request_lease`) to growable/chunked structures.
+     - Guarded virtual kernel stacks (`PML4[259]`, `256 KiB` unmapped guard + `256 KiB` usable, demand-committed
+       on `#PF`, IST2 `#PF` diagnostic path) and dynamically growing `kernel/mm` heap (`BuddyBackend::grow`
+       without the old `RAM/4` or `2 GiB` cap). Upgraded `SYS_RUSTOS_TASK_CAPACITY` to ABI v2 (`72` bytes) and
+       updated `services/loaderd/src/application_grant.rs`.
+     - Updated formal source/contract artifacts (`smp-source-contracts.toml`, `check-dispatch-source-contracts.py`,
+       `check-performance-contracts.sh`, `implementation-mutations.tsv` [1875 rows], `contracts.toml`,
+       `system-flows.tsv`, `run-source-conformance.sh`, `zero-trust-subsystems.tsv`, `models.md`, `CONFORMANCE.md`).
+     - Fixed KVM boot panic (`irq_pool::preallocate_reserve` was skipping preallocation whenever `IF=0` during
+       `Bootstrap::begin()` / `Thread::start()`, exhausting `MAILBOX_POOL` on 16-vCPU wakeups; split
+       `can_preallocate()` from `can_allocate_from_heap()` and raised initial reserve to `(slots / 8).max(64)`).
+   - **Verified after code & formal edits:**
+     - `cargo xtask check`, `cargo xtask dev-plan`, `bash tools/agent/formal-preflight.sh` (23/23 checks passed, `0` failed).
+     - Host unit tests: `kernel-ps` (1263), `kernel-compat` (535), `kernel-mm` (184), `kernel-hal` (104, 1 ignored),
+       `kernel-ipc-runtime` (90), `kernel-io-manager` (68), `loaderd` (62), `rustos-user-abi` (137); 0 failures.
+     - Focused mutation spot-check (`implementation-mutations.py`): 10/10 updated rows killed (`return-cycle-native-real-bitmap`,
+       `process-thread-owner-quota`, `handoff-qualification-bounded-replenishment`, all 7 `handoff-queue-*`).
+     - Multi-vCPU KVM (16 vCPUs):
+       - `cargo xtask kvm-smoke --gui-dvm-surfaces --dvm-block-shmem --timeout 90 --expect "ipcbench: end"`: PASS (`terminal_ms=2316`, `ipc_rt_intra_process` `min=8280 p50=8600 p99=12040 mean=9181`).
+       - `cargo xtask kvm-smoke --gui-dvm-surfaces --dvm-block-shmem --proc-stress --timeout 90`: PASS (`terminal_ms=2715`, `procstress: done maps forks fork_failures 1461 45 6`).
+     - 1-vCPU `cargo xtask bench --rustos-vcpus 1`: PASS (`tsc_khz=3991379`, `null_syscall_getpid` `min=400 p50=440 mean=476`,
+       `ipc_rt_intra_process` `min=8280 p50=8600 mean=9181`, `ipc_rt_intra_process_reply_recv` `min=7520 p50=7840 mean=10012`,
+       `ipc_rt_cross_process_syscalld_getuid` `min=14280 p50=14960 mean=20467`); `kernel-stack-highwater` observed at
+       `0x7040` (~28 KiB kernel) / `0x7850` (~30 KiB user).
+   - **Done after the overhaul (2026-11-26, later):**
+     - `tools/xtask/src/kvm/failure_snapshot.rs` now reads the chunk directory (`task_table::TASK_CHUNKS`) and the
+       kernel-exported `TASK_DIAGNOSTIC_LAYOUT` (version, chunk size, task size, field offsets) through the monitor's
+       virtual `x` command; stacks are guarded virtual mappings, so they are read by virtual address. KVM-confirmed
+       `collection=complete`, 256 newest slots scanned, older slots reported as `task_census=truncated`.
+       Transcript cap raised to 2 MiB (HMP echo costs ~2 KiB per command).
+     - `apps/faultprobe` gained a `thread-storm` case (1100 parked threads in one process, then release and join);
+       `apps/faultprobe/RUSTOS.package.toml` sets `request_threads = 1200` so `default_threads` does not cap it,
+       and `fault_probe.c` logs `errno` on `wait_bounded` failure. `kvm-smoke --fault-probe` requires it.
+     - Chrome's `request_threads`/`request_processes` are removed from both `apps/chrome/RUSTOS.package.toml`
+       (gitignored) and `apps/chrome/RUSTOS.package.toml.example`; loaderd's default grant (budget/4) applies.
+     - **Fixed 16-vCPU `thread-storm` lockdep panic & >1024-thread IPC saturation:**
+       - `tlb_shootdown.rs:483` lockdep panic (`acquire_depth=2 release_depth=1`): root cause was
+         `TrackedSpinLock::try_lock()` (`kernel/nucleus-core/src/util/lockdep.rs`) recording `preemption_depth()`
+         (including `DispatchPreemption`'s `dispatch::depth_on(cpu)`), whereas `lock_with()` and
+         `TrackedSpinGuard::drop_full()` read raw `CPU_LOCK_STATE[cpu].preempt_disable_depth`. Fixed `try_lock()`
+         to track raw `preempt_disable_depth` and added
+         `try_lock_tracks_raw_preemption_depth_independent_of_dispatch_preemption` (8/8 `util::lockdep::tests` passed).
+       - Synchronous IPC burst (`errno=12` in `wait4` / `initd` post-init lease query across 1100 exiting threads):
+         raised `MAX_ENDPOINT_MESSAGE_OBJECTS` / `MAX_REPLY_OBJECTS` from `128` to `512`
+         (`kernel/ipc-runtime/src/ipc/mod.rs`), added lock-protected monotonic `EndpointObject::queue_full_hits` /
+         `endpoint_pending_queue_full`, and added `enqueue_call_and_wake_or_wait_queue`
+         (`kernel/compat/src/user/syscall/linux/ipc_ops.rs` + `ipc_ops/registers.rs`) so deadline-bounded
+         synchronous calls back off with `sleep_unless(1, ...)` until queue space opens or `deadline_tick` expires
+         instead of failing immediately with `ENOMEM`.
+       - **Verified:** `cargo test -p kernel-ipc-runtime --lib` (90 passed), `cargo test -p kernel-compat --lib`
+         (535 passed), `python3 formal/check-dispatch-source-contracts.py`, and
+         `cargo xtask kvm-smoke --fault-probe --dvm-block-shmem --timeout 90 --repeat 5` (`passed=5/5 vcpus=16`,
+         1100-thread `thread-storm` >1024 proof passing 5/5).
+     - **Hardware guard-page `#PF` KVM probe added & proved:**
+       - Registered `kernel.stack.guard_fault` (`rustos-fault-injection`, `config/rustos.toml`, `formal/fault-scenarios.tsv`),
+         exposed `ps_api::snapshot::current_kernel_stack_guard_probe_address()`, triggered only when armed in
+         `nucleus_housekeeping_task` (`kernel/executive/src/tasks.rs`), promoted `kernel-stack-guard-fault`
+         milestone to `MilestoneOutputClass::Required` (`milestone_class.rs`), and added
+         `--kernel-stack-guard-fault-probe` to `xtask`.
+       - **Verified:** `RUSTOS_FAULTS='kernel.stack.guard_fault=fail' cargo xtask kvm-smoke --kernel-stack-guard-fault-probe --timeout 30`
+         passed (`xtask: kernel stack guard-fault proof: task_id=16 task_slot=16 vslot=1 active=true guard_page=true committed_pages=8`).
+     - **Formal mutation lane warnings resolved (4/4 -> 0 warnings):**
+       - Retargeted `exec-resource-logical-tombstone` (`2/2 -> 1/2`), `return-foreign-kernel-ack-before-external`,
+         and `task-linux-state-pending-hint-foreign-slot` in `formal/implementation-mutations.tsv`; added
+         `!pin.matches_exec` assertions in `kernel/ps/src/multitask/scheduler/stack_resources/context/mm_tests.rs`
+         for `mm-execution-root-identity-bypass`. Spot-check passed `killed=4/4 warnings=0`.
+   - **Remaining / Unverified:**
+     - Chrome interactive KVM run (`--launch-desktop chrome.desktop --exercise-input`): peak thread/process measurement
+       and `uiserver` `wl_subcompositor` re-assignment KVM verification left for manual QEMU launch by user.
+     - Full-tree verification & PR gate seal after the IPC/guard-probe/mutation edits (`cargo xtask check`,
+       full crate unit tests including `xtask`, `nucleus-core`, `kernel-ps`, `kernel-executive`, and
+       `bash formal/verify-all.sh --profile pr`) need a fresh run to re-seal the tree (current PR seal is
+       stale/mismatched after these edits).
+     - The old "16 vCPU ~3% boot flake" note is retired (fixed, not current baseline); any boot failure is treated as a real bug.
+     - ipcbench: no A/B was run by request; latest single-arm numbers are recorded below.
+   - **Latest single-arm ipcbench (2026-11-26, no A/B by request; earlier snapshot prior to the IPC pool/retry edits above):**
+     - 1 vCPU `cargo xtask bench --rustos-vcpus 1` (cycles, tsc 3.991 GHz): `null_syscall_getpid` min 400 / p50 440 / mean 448;
+       `ipc_rt_intra_process` min 8600 / p50 9200 / p99 9720 / mean 11664; `ipc_rt_intra_process_reply_recv`
+       min 8240 / p50 8840 / mean 9592; `ipc_rt_cross_process_syscalld_getuid` min 14280 / p50 14920 / mean 16194;
+       cross-process minus local syscall: min 13880 / p50 14480 cycles.
+     - 16 vCPU `kvm-smoke --gui-dvm-surfaces --dvm-block-shmem --expect "ipcbench: end"`: PASS;
+       `ipc_rt_intra_process` min 7960 / p50 8400 / p99 12320 / mean 8874 (max 209600, 15 samples over 80k);
+       `ipc_rt_intra_process_reply_recv` min 7520 / p50 7880 / mean 8047.
+     - Single runs: run-to-run mean spread applies (former 3% boot flake note retired: fixed, not current baseline).
 
 ### Verified evidence (2026-11-25)
 

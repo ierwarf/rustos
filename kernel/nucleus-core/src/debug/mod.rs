@@ -153,15 +153,23 @@ impl MilestoneRing {
         self.len = self.len.saturating_add(1).min(MILESTONE_CAPACITY);
     }
 
-    fn snapshot(&self, out: &mut [MilestoneRecord; MILESTONE_CAPACITY]) -> usize {
-        let count = self.len.min(MILESTONE_CAPACITY);
+    fn snapshot_len(&self) -> usize {
+        self.len.min(MILESTONE_CAPACITY)
+    }
+
+    fn snapshot_chunk(&self, offset: usize, out: &mut [MilestoneRecord]) -> usize {
+        let total = self.snapshot_len();
+        if offset >= total || out.is_empty() {
+            return 0;
+        }
         let start = if self.len == MILESTONE_CAPACITY {
             self.next
         } else {
             0
         };
+        let count = (total - offset).min(out.len());
         for (index, slot) in out.iter_mut().enumerate().take(count) {
-            *slot = self.records[(start + index) % MILESTONE_CAPACITY];
+            *slot = self.records[(start + offset + index) % MILESTONE_CAPACITY];
         }
         count
     }
@@ -852,10 +860,9 @@ fn milestone_debugcon_visible(name: &str) -> bool {
 
 #[cfg(rustos_debug_print_enabled)]
 pub fn dump_recent_milestones(reason: &str) {
-    let mut records = [MilestoneRecord::EMPTY; MILESTONE_CAPACITY];
     let count = MILESTONES
         .try_lock()
-        .map(|milestones| milestones.snapshot(&mut records))
+        .map(|milestones| milestones.snapshot_len())
         .unwrap_or(0);
 
     log_args_site(
@@ -866,23 +873,36 @@ pub fn dump_recent_milestones(reason: &str) {
         format_args!("milestone dump requested: {} count={}", reason, count),
     );
 
-    for record in records.iter().take(count) {
-        log_args_site(
-            record.category,
-            LogLevel::Warn,
-            module_path!(),
-            line!(),
-            format_args!(
-                "milestone seq={} ts_us={} tick={} cat={} name={} arg0={:#x} arg1={:#x}",
-                record.seq,
-                record.ts_us,
-                record.tick,
-                record.category.as_str(),
-                record.name,
-                record.arg0,
-                record.arg1,
-            ),
-        );
+    const CHUNK_LEN: usize = 16;
+    let mut records = [MilestoneRecord::EMPTY; CHUNK_LEN];
+    let mut offset = 0;
+    while offset < count {
+        let copied = MILESTONES
+            .try_lock()
+            .map(|milestones| milestones.snapshot_chunk(offset, &mut records))
+            .unwrap_or(0);
+        if copied == 0 {
+            break;
+        }
+        for record in records.iter().take(copied) {
+            log_args_site(
+                record.category,
+                LogLevel::Warn,
+                module_path!(),
+                line!(),
+                format_args!(
+                    "milestone seq={} ts_us={} tick={} cat={} name={} arg0={:#x} arg1={:#x}",
+                    record.seq,
+                    record.ts_us,
+                    record.tick,
+                    record.category.as_str(),
+                    record.name,
+                    record.arg0,
+                    record.arg1,
+                ),
+            );
+        }
+        offset += copied;
     }
 }
 

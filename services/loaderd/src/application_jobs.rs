@@ -446,13 +446,21 @@ mod tests {
         }
     }
     fn machine(total: u64, used: u64) -> Machine {
+        // Match the legacy test arithmetic cleanly (thread budget = total - total / 4
+        // when max_task_slots = total - total / 4 + 1) while preserving 4 GiB RAM
+        // and 256 KiB kernel stack costs.
+        let budget = total - total / 4;
+        let max_slots = budget + 1;
+        let live = used.min(max_slots);
         Machine {
-            total_slots: total,
-            application_thread_budget: total - total / 4,
-            process_thread_ceiling: total / 2,
-            root_process_ceiling: total / 4,
-            kernel_stack_bytes: 2 * MIB,
-            reservable_slots: total - used,
+            max_task_slots: max_slots,
+            max_process_slots: max_slots,
+            live_tasks: live,
+            live_processes: 10.min(max_slots),
+            task_object_bytes: 16 * 1024,
+            kernel_stack_bytes: 256 * 1024,
+            usable_ram_bytes: 4 * 1024 * MIB,
+            free_ram_bytes: 4 * 1024 * MIB,
             ram_pages: 4 * GIB_PAGES,
         }
     }
@@ -472,7 +480,7 @@ mod tests {
         }
     }
     const NONE: ApplicationRequest = ApplicationRequest::NONE;
-    /// What an application that declares nothing is granted at T = 256, 4 GiB.
+    /// Default grant at T_budget = 192 (process budget = 48, 4 GiB RAM).
     const DEFAULT_LIMITS: Limits = Limits { processes: 12, threads: 48, memory_pages: 12 * 2 * GIB_PAGES };
 
     #[test]
@@ -570,9 +578,9 @@ mod tests {
     #[test]
     fn the_sum_of_live_grants_is_bounded_by_the_application_budget() {
         let mut state = installed();
-        // A first Job takes 150 of the 192 budget threads and has created 30.
+        // A first Job takes 150 of the 192 budget threads and has created 130.
         state.children.push(child(8, 80, 10, 150));
-        let mut jobs = fake(vec![(JOB_OP_GET_INFO, Ok(usage(80, 30)))]);
+        let mut jobs = fake(vec![(JOB_OP_GET_INFO, Ok(usage(80, 130)))]);
         let failure = state
             .prepare(&ApplicationRequest { threads: 43, ..NONE }, None, &mut jobs)
             .unwrap_err();
@@ -582,7 +590,7 @@ mod tests {
         assert_eq!(state.children.len(), 1);
         // Exactly what is left is grantable; the sum then equals the budget.
         let mut jobs = fake(vec![
-            (JOB_OP_GET_INFO, Ok(usage(80, 30))),
+            (JOB_OP_GET_INFO, Ok(usage(80, 130))),
             (JOB_OP_CREATE_CHILD, Ok(info(81, 9))),
             (JOB_OP_SET_LIMITS, Ok(in_force(Limits { processes: 12, threads: 42, memory_pages: 12 * 2 * GIB_PAGES }))),
         ]);
@@ -598,8 +606,8 @@ mod tests {
         let mut state = installed();
         state.children.push(child(8, 80, 10, 150));
         let mut jobs = fake(vec![(JOB_OP_GET_INFO, Ok(usage(80, 100)))]);
-        jobs.machine = machine(256, 196);
-        // 192 - 150 = 42 within the budget, but only 60 - 50 = 10 free slots.
+        // budget = 192, max_slots = 193, live_tasks = 133 => 60 free, 50 promised => 10 left.
+        jobs.machine = machine(256, 133);
         let failure = state
             .prepare(&ApplicationRequest { threads: 20, ..NONE }, None, &mut jobs)
             .unwrap_err();
@@ -616,6 +624,7 @@ mod tests {
             (JOB_OP_CREATE_CHILD, Ok(info(81, 9))),
             (JOB_OP_SET_LIMITS, Ok(in_force(Limits { processes: 12, threads: 192, memory_pages: 12 * 2 * GIB_PAGES }))),
         ]);
+        jobs.machine = machine(256, 1);
         assert!(state.prepare(&ApplicationRequest { threads: 192, ..NONE }, None, &mut jobs).is_ok());
         let mut state = installed();
         state.children.push(child(8, 80, 10, 150));
