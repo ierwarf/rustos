@@ -108,7 +108,7 @@ impl ProviderBilling {
         }
         // All fallible memory and token-overflow checks precede the kernel
         // charge; watermark advancement is conservatively irreversible.
-        self.funded.try_reserve(1).map_err(|_|12)?;
+        if evict.is_none(){self.funded.try_reserve(1).map_err(|_|12)?;}
         let kernel_token=self.next_kernel_token.checked_add(1).ok_or(75)?;
         self.admit_owner_nonce(ticket.provider,ticket.token.nonce)?;
         // A kernel charge may commit even if the copyout fails. The callback
@@ -117,6 +117,7 @@ impl ProviderBilling {
         // commit the kernel charge. Error leaves ChargeUnknown in custody.
         self.next_kernel_token=kernel_token;
         if let Some(settled)=evict{self.funded.swap_remove(settled);}
+        let slot=self.funded.len();
         self.funded.push(Funded{
             provider:ticket.provider,client:ticket.client,
             kind:ticket.kind,session:ticket.session,token:ticket.token,
@@ -124,7 +125,8 @@ impl ProviderBilling {
         });
         match charge(ticket.client,ticket.provider.pid,kernel_token) {
             Ok(charge_id) if charge_id!=0 => {
-                let slot=self.find(ticket.provider,ticket.token).ok_or(ESTALE)?;
+                // The callback cannot borrow this serialized ledger; the
+                // just-appended intent stays at this exact index throughout.
                 self.funded[slot].charge_id=charge_id;
                 self.funded[slot].state=State::Charged;
                 Ok(charge_id)
@@ -450,8 +452,10 @@ mod tests{
         assert_eq!(b.count(),MAX_PROVIDER_TICKETS);
         // Every ACK was lost; the next charge still succeeds.
         let next=MAX_PROVIDER_TICKETS as u64+1;
+        let capacity=b.funded.capacity();
         b.charge(mk(next),90,true,|_,_,k|Ok(k)).unwrap();
         assert_eq!(b.count(),MAX_PROVIDER_TICKETS);
+        assert_eq!(b.funded.capacity(),capacity,"settled replacement needs no extra slot");
         // Retried release / cancel / ack of a reclaimed token stays final.
         let evicted=(1..=MAX_PROVIDER_TICKETS as u64)
             .find(|n|b.find_ticket(owner,mk(*n).token).is_none()).unwrap();

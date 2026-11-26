@@ -3,11 +3,62 @@
 //! Kept in the library target so its tests execute: the `vfsd` binary has no
 //! test harness.
 
+use alloc::borrow::Cow;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use rustos_user_abi::syscall::VFS_IPC_PATH_CAPACITY;
 
 use crate::EINVAL;
+
+/// Raw components for permission-checked symlink traversal. The ordinary path
+/// is borrowed, and each symlink retains one owned target instead of allocating
+/// one String per component. Only unresolved suffixes need a stack entry.
+/// Dot components are deliberately returned unchanged: the namespace owner
+/// checks directory search permission before interpreting them.
+pub struct SymlinkComponents<'a> {
+    current: Cow<'a, str>,
+    offset: usize,
+    suffixes: Vec<(Cow<'a, str>, usize)>,
+}
+
+impl<'a> SymlinkComponents<'a> {
+    pub fn new(path: &'a str) -> Self {
+        Self {
+            current: Cow::Borrowed(path),
+            offset: path.len() - path.trim_start_matches('/').len(),
+            suffixes: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.offset == self.current.len() && self.suffixes.is_empty()
+    }
+
+    pub fn next_component(&mut self) -> Option<&str> {
+        while self.offset == self.current.len() {
+            let (path, offset) = self.suffixes.pop()?;
+            self.current = path;
+            self.offset = offset;
+        }
+        let start = self.offset;
+        let end = self.current[start..].find('/').map_or(self.current.len(), |n| start + n);
+        let remaining = &self.current[end..];
+        self.offset = end + remaining.len() - remaining.trim_start_matches('/').len();
+        Some(&self.current[start..end])
+    }
+
+    /// Substitute a symlink target before the still-unresolved suffix. The
+    /// caller owns absolute-target root selection and the expansion limit.
+    pub fn prepend_target(&mut self, target: String) {
+        let offset = target.len() - target.trim_start_matches('/').len();
+        let previous = core::mem::replace(&mut self.current, Cow::Owned(target));
+        if self.offset != previous.len() {
+            self.suffixes.push((previous, self.offset));
+        }
+        self.offset = offset;
+    }
+}
 
 /// Resolves `path` against `base_path` into a canonical absolute path with no
 /// `.`/`..`/empty components. Refuses NUL and `\` and any result longer than
@@ -113,6 +164,45 @@ pub fn path_inode_for_policy(bytes: &[u8], case_policy: storage_core::fs::CasePo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symlink_components_borrow_plain_paths_and_preserve_dot_order() {
+        let mut components = SymlinkComponents::new("//a/./../한글///");
+        assert!(matches!(components.current, Cow::Borrowed(_)));
+        for expected in ["a", ".", "..", "한글"] {
+            assert_eq!(components.next_component(), Some(expected));
+        }
+        assert!(components.is_empty());
+        assert_eq!(components.next_component(), None);
+        assert_eq!(components.suffixes.capacity(), 0);
+    }
+
+    #[test]
+    fn nested_symlink_targets_resume_suffixes_in_order() {
+        let mut components = SymlinkComponents::new("/link/tail");
+        assert_eq!(components.next_component(), Some("link"));
+        components.prepend_target(String::from("../other/end"));
+        assert_eq!(components.next_component(), Some(".."));
+        assert_eq!(components.next_component(), Some("other"));
+        components.prepend_target(String::from("//root///"));
+        assert_eq!(components.next_component(), Some("root"));
+        assert!(!components.is_empty());
+        assert_eq!(components.next_component(), Some("end"));
+        assert_eq!(components.next_component(), Some("tail"));
+        components.prepend_target(String::from("///"));
+        assert!(components.is_empty());
+        assert_eq!(components.next_component(), None);
+    }
+
+    #[test]
+    fn slash_only_target_keeps_the_original_suffix_pending() {
+        let mut components = SymlinkComponents::new("link/child");
+        assert_eq!(components.next_component(), Some("link"));
+        components.prepend_target(String::from("/"));
+        assert!(!components.is_empty());
+        assert_eq!(components.next_component(), Some("child"));
+        assert!(components.is_empty());
+    }
 
     #[test]
     fn case_spellings_of_one_fat_path_share_inode() {

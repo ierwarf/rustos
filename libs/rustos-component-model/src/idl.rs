@@ -264,6 +264,7 @@ impl<'a> Message<'a> {
 pub struct Builder<'a> {
     schema: Schema<'a>,
     body: Vec<u8>,
+    start: usize,
     last_tag: u16,
     present: u64,
 }
@@ -278,9 +279,39 @@ impl<'a> Builder<'a> {
         Ok(Self {
             schema,
             body,
+            start: 0,
             last_tag: 0,
             present: 0,
         })
+    }
+
+    /// Append one canonical message to an existing allocation. An error
+    /// restores the original byte prefix and length, retaining any capacity
+    /// already obtained. Limits apply to this message, not to earlier frames.
+    pub fn append_to(
+        out: &mut Vec<u8>,
+        schema: Schema<'a>,
+        request_id: u64,
+        fields: &[(u16, &[u8])],
+    ) -> Result<(), IdlError> {
+        let schema = schema.validate()?;
+        out.try_reserve(HEADER_SIZE).map_err(|_| IdlError::OutOfMemory)?;
+        let start = out.len();
+        out.resize(start + HEADER_SIZE, 0);
+        let mut builder = Self {
+            schema,
+            body: core::mem::take(out),
+            start,
+            last_tag: 0,
+            present: 0,
+        };
+        let result = fields.iter().try_for_each(|&(tag, value)| builder.field(tag, value))
+            .and_then(|()| builder.finish_header(request_id));
+        if result.is_err() {
+            builder.body.truncate(start);
+        }
+        *out = builder.body;
+        result
     }
 
     pub fn field(&mut self, tag: u16, value: &[u8]) -> Result<(), IdlError> {
@@ -300,7 +331,7 @@ impl<'a> Builder<'a> {
         let added = FIELD_HEADER_LEN
             .checked_add(value.len())
             .ok_or(IdlError::TooLong)?;
-        let body_len = self.body.len() - HEADER_SIZE;
+        let body_len = self.body.len() - self.start - HEADER_SIZE;
         let total = body_len
             .checked_add(added)
             .ok_or(IdlError::TooLong)?;
@@ -319,19 +350,25 @@ impl<'a> Builder<'a> {
     }
 
     pub fn finish(mut self, request_id: u64) -> Result<Vec<u8>, IdlError> {
+        self.finish_header(request_id)?;
+        Ok(self.body)
+    }
+
+    fn finish_header(&mut self, request_id: u64) -> Result<(), IdlError> {
         for (index, spec) in self.schema.fields.iter().enumerate() {
             if spec.required && (self.present & (1u64 << index)) == 0 {
                 return Err(IdlError::Missing);
             }
         }
-        let body_len = (self.body.len() - HEADER_SIZE) as u32;
-        self.body[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        self.body[4..6].copy_from_slice(&CURRENT_VERSION.to_le_bytes());
-        self.body[6..8].copy_from_slice(&self.schema.opcode.to_le_bytes());
-        self.body[8..12].copy_from_slice(&body_len.to_le_bytes());
-        // Bytes 12..16 (reserved) are already zeroed by `resize(HEADER_SIZE, 0)`.
-        self.body[16..24].copy_from_slice(&request_id.to_le_bytes());
-        Ok(self.body)
+        let body = &mut self.body[self.start..];
+        let body_len = (body.len() - HEADER_SIZE) as u32;
+        body[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        body[4..6].copy_from_slice(&CURRENT_VERSION.to_le_bytes());
+        body[6..8].copy_from_slice(&self.schema.opcode.to_le_bytes());
+        body[8..12].copy_from_slice(&body_len.to_le_bytes());
+        // The header reservation already zeroed bytes 12..16 (reserved).
+        body[16..24].copy_from_slice(&request_id.to_le_bytes());
+        Ok(())
     }
 }
 
@@ -394,6 +431,64 @@ mod tests {
         let mut b = Builder::new(S).unwrap();
         b.field(2, b"x").unwrap();
         assert_eq!(b.field(1, &1u64.to_le_bytes()), Err(IdlError::Order));
+    }
+
+    #[test]
+    fn append_reuses_the_destination_and_matches_standalone_wire_bytes() {
+        let number = 12u64.to_le_bytes();
+        let fields: [(u16, &[u8]); 3] = [(1, &number), (2, b"hello"), (3, &[1])];
+        let mut standalone = Builder::new(S).unwrap();
+        for &(tag, value) in &fields {
+            standalone.field(tag, value).unwrap();
+        }
+        let expected = standalone.finish(98).unwrap();
+        // An earlier frame's bytes cannot count against this message's limit.
+        let mut out = alloc::vec![0xa5; MAX_BODY_BYTES + 7];
+        out.reserve(expected.len());
+        let capacity = out.capacity();
+        let start = out.len();
+        Builder::append_to(&mut out, S, 98, &fields).unwrap();
+        assert!(out[..start].iter().all(|byte| *byte == 0xa5));
+        assert_eq!(&out[start..], expected.as_slice());
+        assert_eq!(out.capacity(), capacity);
+        assert_eq!(Message::decode(S, &out[start..]).unwrap().header().request_id, 98);
+    }
+
+    #[test]
+    fn failed_append_restores_the_complete_original_prefix() {
+        let prefix = alloc::vec![1, 2, 3, 4, 5];
+        let number = 7u64.to_le_bytes();
+        let check = |fields: &[(u16, &[u8])], expected| {
+            let mut out = prefix.clone();
+            assert_eq!(Builder::append_to(&mut out, S, 9, fields), Err(expected));
+            assert_eq!(out, prefix);
+        };
+        check(&[(1, &number)], IdlError::Missing);
+        check(&[(1, &number), (1, &number)], IdlError::Duplicate);
+        check(&[(2, b"ok"), (1, &number)], IdlError::Order);
+        check(&[(1, &number), (2, b"ok"), (3, &[2])], IdlError::Malformed);
+        check(&[(1, &number), (2, &[b'x'; 33])], IdlError::TooLong);
+        check(&[(1, &number), (4, b"unknown")], IdlError::UnknownField);
+        check(&[(1, &number[..7])], IdlError::WrongType);
+        let invalid_fields = [FieldSpec { tag: 0, kind: FieldKind::Bytes, required: false, max_len: 1 }];
+        let invalid = Schema { opcode: 1, fields: &invalid_fields };
+        let mut out = prefix.clone();
+        assert_eq!(Builder::append_to(&mut out, invalid, 9, &[]), Err(IdlError::Schema));
+        assert_eq!(out, prefix);
+    }
+
+    #[test]
+    fn aggregate_body_overflow_rolls_back_already_appended_fields() {
+        const LARGE_FIELDS: [FieldSpec; 2] = [
+            FieldSpec { tag: 1, kind: FieldKind::Bytes, required: true, max_len: 40_000 },
+            FieldSpec { tag: 2, kind: FieldKind::Bytes, required: true, max_len: 40_000 },
+        ];
+        let schema = Schema { opcode: 8, fields: &LARGE_FIELDS };
+        let bytes = alloc::vec![0; 40_000];
+        let mut out = alloc::vec![8, 7, 6];
+        assert_eq!(Builder::append_to(&mut out, schema, 1, &[(1, &bytes), (2, &bytes)]),
+            Err(IdlError::TooLong));
+        assert_eq!(out, alloc::vec![8, 7, 6]);
     }
 
     #[test]

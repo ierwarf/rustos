@@ -25,6 +25,13 @@ impl From<IdlError> for Error {
 }
 
 pub fn encode(record: &ServiceCheckpointRecordWire) -> Result<Vec<u8>, Error> {
+    let value_len = checked_value_len(record)?;
+    let mut out = Vec::new();
+    append_record(&mut out, record, value_len)?;
+    Ok(out)
+}
+
+fn checked_value_len(record: &ServiceCheckpointRecordWire) -> Result<usize, Error> {
     if record.version != SERVICE_CHECKPOINT_ABI_VERSION {
         return Err(Error::Version);
     }
@@ -32,20 +39,31 @@ pub fn encode(record: &ServiceCheckpointRecordWire) -> Result<Vec<u8>, Error> {
     if value_len > SERVICE_CHECKPOINT_VALUE_CAPACITY {
         return Err(Error::Length);
     }
-    let mut b = Builder::new(SERVICE_CHECKPOINT_RECORD)?;
-    b.field(1, &record.version.to_le_bytes())?;
-    b.field(2, &record.flags.to_le_bytes())?;
-    b.field(3, &record.key_hi.to_le_bytes())?;
-    b.field(4, &record.key_lo.to_le_bytes())?;
-    b.field(5, &record.parent_hi.to_le_bytes())?;
-    b.field(6, &record.parent_lo.to_le_bytes())?;
-    b.field(7, &record.operation_hi.to_le_bytes())?;
-    b.field(8, &record.operation_lo.to_le_bytes())?;
-    b.field(9, &record.revision.to_le_bytes())?;
-    if value_len != 0 {
-        b.field(10, &record.value[..value_len])?;
-    }
-    Ok(b.finish(record.revision)?)
+    Ok(value_len)
+}
+
+fn append_record(
+    out: &mut Vec<u8>,
+    record: &ServiceCheckpointRecordWire,
+    value_len: usize,
+) -> Result<(), Error> {
+    let version = record.version.to_le_bytes();
+    let flags = record.flags.to_le_bytes();
+    let key_hi = record.key_hi.to_le_bytes();
+    let key_lo = record.key_lo.to_le_bytes();
+    let parent_hi = record.parent_hi.to_le_bytes();
+    let parent_lo = record.parent_lo.to_le_bytes();
+    let operation_hi = record.operation_hi.to_le_bytes();
+    let operation_lo = record.operation_lo.to_le_bytes();
+    let revision = record.revision.to_le_bytes();
+    let fields: [(u16, &[u8]); 10] = [
+        (1, &version), (2, &flags), (3, &key_hi), (4, &key_lo),
+        (5, &parent_hi), (6, &parent_lo), (7, &operation_hi),
+        (8, &operation_lo), (9, &revision), (10, &record.value[..value_len]),
+    ];
+    Builder::append_to(out, SERVICE_CHECKPOINT_RECORD, record.revision,
+        &fields[..9 + usize::from(value_len != 0)])?;
+    Ok(())
 }
 
 pub fn decode(bytes: &[u8]) -> Result<ServiceCheckpointRecordWire, Error> {
@@ -88,11 +106,19 @@ pub fn decode(bytes: &[u8]) -> Result<ServiceCheckpointRecordWire, Error> {
 
 /// Append one length-prefixed record to a SCAN payload buffer.
 pub fn append_framed(out: &mut Vec<u8>, record: &ServiceCheckpointRecordWire) -> Result<(), Error> {
-    let body = encode(record)?;
-    let len = u16::try_from(body.len()).map_err(|_| Error::Length)?;
-    out.try_reserve(2 + body.len()).map_err(|_| Error::Idl(IdlError::OutOfMemory))?;
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(&body);
+    let value_len = checked_value_len(record)?;
+    out.try_reserve(2).map_err(|_| Error::Idl(IdlError::OutOfMemory))?;
+    let start = out.len();
+    out.extend_from_slice(&[0; 2]);
+    if let Err(error) = append_record(out, record, value_len) {
+        out.truncate(start);
+        return Err(error);
+    }
+    let Ok(len) = u16::try_from(out.len() - start - 2) else {
+        out.truncate(start);
+        return Err(Error::Length);
+    };
+    out[start..start + 2].copy_from_slice(&len.to_le_bytes());
     Ok(())
 }
 
@@ -160,5 +186,50 @@ mod tests {
         assert!(decode_framed(&payload[..payload.len() - 1]).is_err());
         assert!(decode_framed(&[1]).is_err());
         assert!(decode_framed(&[0, 0]).is_err());
+    }
+
+    #[test]
+    fn direct_frame_append_matches_the_original_owned_builder_encoding() {
+        let mut payload = alloc::vec![0xa5, 0x5a, 0xcc];
+        for len in [0, 1, SERVICE_CHECKPOINT_VALUE_CAPACITY] {
+            let record = sample(len);
+            let mut legacy = Builder::new(SERVICE_CHECKPOINT_RECORD).unwrap();
+            legacy.field(1, &record.version.to_le_bytes()).unwrap();
+            legacy.field(2, &record.flags.to_le_bytes()).unwrap();
+            legacy.field(3, &record.key_hi.to_le_bytes()).unwrap();
+            legacy.field(4, &record.key_lo.to_le_bytes()).unwrap();
+            legacy.field(5, &record.parent_hi.to_le_bytes()).unwrap();
+            legacy.field(6, &record.parent_lo.to_le_bytes()).unwrap();
+            legacy.field(7, &record.operation_hi.to_le_bytes()).unwrap();
+            legacy.field(8, &record.operation_lo.to_le_bytes()).unwrap();
+            legacy.field(9, &record.revision.to_le_bytes()).unwrap();
+            if len != 0 {
+                legacy.field(10, &record.value[..len]).unwrap();
+            }
+            let expected = legacy.finish(record.revision).unwrap();
+            assert_eq!(encode(&record).unwrap(), expected);
+            let start = payload.len();
+            append_framed(&mut payload, &record).unwrap();
+            assert_eq!(&payload[start..start + 2], &(expected.len() as u16).to_le_bytes());
+            assert_eq!(&payload[start + 2..], expected.as_slice());
+        }
+        assert_eq!(&payload[..3], &[0xa5, 0x5a, 0xcc]);
+        assert_eq!(decode_framed(&payload[3..]).unwrap(),
+            alloc::vec![sample(0), sample(1), sample(SERVICE_CHECKPOINT_VALUE_CAPACITY)]);
+    }
+
+    #[test]
+    fn invalid_frame_append_preserves_prior_committed_frames() {
+        let mut out = Vec::new();
+        append_framed(&mut out, &sample(1)).unwrap();
+        let prior = out.clone();
+        let mut invalid = sample(0);
+        invalid.version = SERVICE_CHECKPOINT_ABI_VERSION + 1;
+        assert_eq!(append_framed(&mut out, &invalid), Err(Error::Version));
+        assert_eq!(out, prior);
+        invalid.version = SERVICE_CHECKPOINT_ABI_VERSION;
+        invalid.value_len = SERVICE_CHECKPOINT_VALUE_CAPACITY as u32 + 1;
+        assert_eq!(append_framed(&mut out, &invalid), Err(Error::Length));
+        assert_eq!(out, prior);
     }
 }

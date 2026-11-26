@@ -946,24 +946,20 @@ pub(super) fn publish_interface_changes(state: &mut NetState) {
 }
 
 pub(super) fn apply_interface_snapshot(state: &mut NetState, current: InterfaceSnapshot) {
-    let Some(previous) = state.netlink_view.replace(current.clone()) else {
-        return;
-    };
-    for (group, message) in diff_events(&previous, &current) {
-        let members: Vec<u64> = state
-            .netlink_sockets
-            .iter()
-            .filter_map(|(token, socket)| {
-                (socket.state.family == NetlinkFamily::Route && socket.state.groups & group != 0)
-                    .then_some(*token)
-            })
-            .collect();
-        for token in members {
-            if let Some(socket) = state.netlink_sockets.get_mut(&token) {
+    let events = state
+        .netlink_view
+        .as_ref()
+        .map(|previous| diff_events(previous, &current))
+        .unwrap_or_default();
+    state.netlink_view = Some(current);
+    for (group, message) in events {
+        state.netlink_sockets.for_each_matching_mut(
+            |socket| socket.state.family == NetlinkFamily::Route && socket.state.groups & group != 0,
+            |socket| {
                 let capacity = socket.options.recv_buffer.max(4096) as usize;
                 socket.state.enqueue(message.clone(), capacity);
-            }
-        }
+            },
+        );
     }
 }
 

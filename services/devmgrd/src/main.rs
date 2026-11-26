@@ -190,8 +190,11 @@ fn sessiond_ioctl_worker(receiver: Receiver<SessiondIoctlWork>) {
 }
 
 fn serve(endpoint: u64, sessiond_workers: &SessiondIoctlWorkers, app_buffers: &app_buffer::Worker) {
+    // Every accepted request shape is checked against the exact received size
+    // before decoding. Reuse the initialized receive area; bytes outside that
+    // size are never part of a request, and queued work owns its copied value.
+    let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
     loop {
-        let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
         let mut reply_cap = 0_u64;
         let mut sender_pid = 0_u64;
         let mut sender_tid = 0_u64;

@@ -6,6 +6,56 @@ stable repository prefix; use [task router](task-router.md) for owner contracts.
 Historical entries prior to 2026-11-25 live in `git log` (e.g.
 `git show HEAD:docs/ai/session-handoff.md`).
 
+## Ring3 service performance batch (2026-11-26, static review only)
+
+User requested all 13 Ring3 services except `uiserver`, prioritizing net gains,
+bug fixes, and clear small/medium refactors informed by primary web references.
+Base: `1dc0a1409e4ad486282a5ede8d092064aaa98dd6` (`master`). The user requested
+static review only and one final commit/publication after integration. No
+compilation, tests, benchmarks, KVM, or formal scripts were run for this batch.
+
+- All 13 non-UI services received scoped changes. `services/uiserver/**` is
+  unchanged. The service-by-service inventory and primary references are in
+  `docs/architecture/services.md`; owner ABI contracts were updated too.
+- VFS: borrowed namespace components and mount/handle views, range sparse
+  reads, direct full-page initialization, in-place lock merging, exact watch
+  count, keyed checkpoint retirement and retained framing scratch. Fixed
+  capped 128-KiB sources being mistaken for EOF by a 512-KiB outer read,
+  symlink quota leakage on cookie exhaustion, and stage stack reuse before
+  the old join acknowledged completion.
+- Storage/network/input/device: retain initialized buffers and pump/queue
+  scratch, inline common read pins, move owned loopback packets, walk selected
+  socket identities directly and drain input ring slices in batches. Fixed
+  backwards quarantine publication, final socket-close notification loss,
+  invalid semantic input wedging the sequence, and resized-surface position
+  rejection dropping valid button releases.
+- Root/init/runtime: single-plan journaled checkpoint COMPACT and in-place
+  survivor indices, one-pass SCAN, retained startup sets and socket scratch,
+  receipt ring, batched TTY copies and offset-based D-Bus consumption. Fixed
+  D-Bus missing/embedded string NUL admission. Synchronous UI bootstrap stays.
+- Loader/session/process/MM/pager: borrowed PE strings and direct Windows
+  environment encoding (including empty double-NUL blocks); single-owner FD
+  vector moves; exact running-ID membership reuse; allocation-free signal
+  queries and preserved uncached exec masks; cached MM lease index retention;
+  in-place covered VMA updates; single-gap pager range compaction.
+- Shared IDL gained additive `Builder::append_to`; checkpoint frames encode
+  into retained destination storage. Relative limits and exact prefix rollback
+  preserve standalone wire bytes and error semantics.
+- Independent static cross-review covered changed ownership, borrow/type
+  boundaries, indexing, partial errors and generation publication. It caught
+  and corrected the remaining Wine call to the moved command-line helper.
+  Source-conformance watch anchors were updated for retained snapshot scratch;
+  implementation-mutation literal counts were inspected without running gates.
+- Regression source cases accompany the changes, but no execution result is
+  claimed. Three new VFS helper cases live in existing `test=false` binary
+  source and are not an executable host-test claim. Runtime performance,
+  interactive behavior and compilation remain unverified by request.
+- Existing limits retained: first-time MM leases still rely on the single
+  receive owner; rootd MUTATE B-tree inserts keep normal infallible allocator
+  behavior. The allocation-free post-journal claim applies to COMPACT, not all
+  checkpoint operations. Worker counts, admission limits and TCP observation
+  cadence were not speculatively expanded.
+
 ## UI performance batch (2026-11-26, static review only)
 
 User requested aggressive `uiserver` optimization informed by web references,

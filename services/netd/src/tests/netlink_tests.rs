@@ -764,13 +764,15 @@ fn kobject_uevent_socket_admission_bind_options_recv_poll_and_teardown() {
         assert_eq!(super::handle_setsockopt(&req), libc::EOPNOTSUPP);
     }
 
-    // Proper teardown removes socket, readiness state, and returns token.
+    // Teardown withdraws the socket; observation then stamps the final close
+    // and removes its readiness state before publication after unlock.
     let mut state = lock_net_state();
     state.socket_readiness_generation(uevent_tok);
     assert!(retire_netlink_socket(&mut state, uevent_tok).is_some());
     assert!(retire_netlink_socket(&mut state, route_tok).is_some());
     assert!(retire_netlink_socket(&mut state, route_tok).is_none());
     assert!(!state.netlink_sockets.contains_key(&uevent_tok));
+    state.record_readiness_changes();
     assert!(!state.readiness_generations.contains_key(&uevent_tok));
     assert!(!state.readiness_observations.contains_key(&uevent_tok));
 }

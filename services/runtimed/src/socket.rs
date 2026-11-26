@@ -80,6 +80,9 @@ struct AcceptedClient {
 pub(super) struct RuntimeConnections {
     pending: VecDeque<PendingRuntimeClient>,
     watchers: VecDeque<RuntimeWatchClient>,
+    /// Scratch only: rebuilt from live state before each watched pass. Keeping
+    /// capacity must never turn an old snapshot into a readiness observation.
+    watch_programs: Vec<RuntimeRunningProgram>,
     /// Connections handed over by the acceptor thread. The broker thread never
     /// calls `accept4`/`SO_PEERCRED` itself: on RustOS every AF_UNIX syscall is
     /// an IPC to netd with its own reply deadline, so a stalled netd would
@@ -105,6 +108,7 @@ impl RuntimeConnections {
         Self {
             pending: VecDeque::with_capacity(MAX_PENDING_RUNTIME_CLIENTS),
             watchers: VecDeque::with_capacity(MAX_RUNTIME_WATCHERS),
+            watch_programs: Vec::new(),
             accepted,
             acceptor_stop_reported: false,
         }
@@ -476,8 +480,9 @@ pub(super) fn service_running_program_watchers(
         return false;
     }
 
-    let programs = running_program_snapshot(state);
-    let digest = running_programs_digest(&programs);
+    fill_running_program_snapshot(state, &mut connections.watch_programs);
+    let programs = &connections.watch_programs;
+    let digest = running_programs_digest(programs);
     let now = Instant::now();
     let mut answered = false;
     for _ in 0..connections.watchers.len() {
@@ -491,7 +496,7 @@ pub(super) fn service_running_program_watchers(
         answered = true;
         // The watcher owns exactly one terminal frame. A partial failed
         // write is terminal for this socket; never append an error frame.
-        let _ = write_running_programs(&mut watcher.stream, OP_WATCH_RUNNING_PROGRAMS, &programs);
+        let _ = write_running_programs(&mut watcher.stream, OP_WATCH_RUNNING_PROGRAMS, programs);
     }
     answered
 }
@@ -668,7 +673,14 @@ fn dispatch_request(
 /// would carry it. Both the snapshot reply and the watch change edge read this,
 /// so a watcher's digest is taken over the same bytes the caller will hash.
 fn running_program_snapshot(state: &BrokerState) -> Vec<RuntimeRunningProgram> {
-    let mut programs = Vec::with_capacity(state.running.len().min(MAX_RUNTIME_PROGRAMS));
+    let mut programs = Vec::new();
+    fill_running_program_snapshot(state, &mut programs);
+    programs
+}
+
+fn fill_running_program_snapshot(state: &BrokerState, programs: &mut Vec<RuntimeRunningProgram>) {
+    programs.clear();
+    programs.reserve(state.running.len().min(MAX_RUNTIME_PROGRAMS));
     for program in state.running.values().take(MAX_RUNTIME_PROGRAMS) {
         let mut snapshot = RuntimeRunningProgram::default();
         snapshot.pid = program.pid as u64;
@@ -680,7 +692,6 @@ fn running_program_snapshot(state: &BrokerState) -> Vec<RuntimeRunningProgram> {
         programs.push(snapshot);
     }
     programs.sort_by_key(|program| program.pid);
-    programs
 }
 
 fn write_running_programs(
@@ -1430,6 +1441,27 @@ mod tests {
             );
         }
         state
+    }
+
+    #[test]
+    fn reused_watch_snapshot_drops_exited_processes_and_refreshes_live_fields() {
+        let mut state = state_running(&[12, 11]);
+        let mut programs = Vec::new();
+        super::fill_running_program_snapshot(&state, &mut programs);
+        assert_eq!(programs.iter().map(|program| program.pid).collect::<Vec<_>>(), vec![11, 12]);
+        let capacity = programs.capacity();
+        let original = super::running_programs_digest(&programs);
+        state.running.remove(&11);
+        state.running.get_mut(&12).unwrap().display_name = String::from("Renamed");
+        super::fill_running_program_snapshot(&state, &mut programs);
+        assert_eq!(programs.len(), 1);
+        assert_eq!(programs[0].pid, 12);
+        assert_eq!(&programs[0].display_name[..7], b"Renamed");
+        assert_ne!(super::running_programs_digest(&programs), original);
+        assert_eq!(programs.capacity(), capacity);
+        state.running.clear();
+        super::fill_running_program_snapshot(&state, &mut programs);
+        assert!(programs.is_empty());
     }
 
     fn peer_has_reply(stream: &UnixStream) -> bool {

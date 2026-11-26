@@ -109,8 +109,10 @@ impl<K: Ord, V> LruCache<K, V> {
     /// Promotes `key` to most recently used and returns its value.
     pub fn get(&mut self, key: &K) -> Option<&V> {
         let slot = *self.index.get(key)?;
-        self.unlink(slot);
-        self.push_front(slot);
+        if slot != self.head {
+            self.unlink(slot);
+            self.push_front(slot);
+        }
         Some(&self.node(slot).value)
     }
 

@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use runtime_control::protocol::RUNTIME_WATCH_MAX_WAIT_MS;
+use runtime_control::protocol::{DESKTOP_FILE_ID_CAPACITY, RUNTIME_WATCH_MAX_WAIT_MS};
 use runtime_control::{
     decode_c_string, load_autostart_program_entries, load_startup_entries, DesktopProgramEntry,
-    MutationOutcome, RuntimeClient, RuntimeTransaction, StartupMode, DEFAULT_APPLICATIONS_DIR,
+    MutationOutcome, RuntimeClient, RuntimeRunningProgram, RuntimeTransaction, StartupMode, DEFAULT_APPLICATIONS_DIR,
     DEFAULT_AUTOSTART_DIR, RUNNING_PROGRAMS_DIGEST_UNKNOWN,
 };
 /// Cadence while a launch is in flight. Settling and timeout are both judged
@@ -97,6 +97,41 @@ impl PendingLaunch {
     }
 }
 
+#[derive(Default)]
+struct RunningMembership {
+    wire_ids: Vec<[u8; DESKTOP_FILE_ID_CAPACITY]>,
+    desktop_ids: BTreeSet<String>,
+    packages: BTreeSet<String>,
+}
+
+impl RunningMembership {
+    fn refresh(
+        &mut self,
+        running: &[RuntimeRunningProgram],
+        package_by_desktop_id: &BTreeMap<String, String>,
+    ) {
+        // A watch timeout or launch-settling poll usually returns the same
+        // identities. Compare exact bytes instead of decoding/reallocating
+        // both String sets or trusting a potentially colliding digest.
+        if self.wire_ids.iter().eq(running.iter().map(|program| &program.desktop_file_id)) {
+            return;
+        }
+        self.wire_ids.clear();
+        self.wire_ids.extend(running.iter().map(|program| program.desktop_file_id));
+        self.desktop_ids.clear();
+        self.desktop_ids.extend(
+            self.wire_ids.iter().map(|id| decode_c_string(id)),
+        );
+        self.packages.clear();
+        self.packages.extend(self.desktop_ids.iter().map(|desktop_id| {
+            package_by_desktop_id
+                .get(desktop_id)
+                .cloned()
+                .unwrap_or_else(|| package_id_from_desktop_id(desktop_id))
+        }));
+    }
+}
+
 fn main() {
     let runtime = match RuntimeClient::open_default() {
         Ok(client) => client,
@@ -134,8 +169,7 @@ fn main() {
     // Consecutive refused or unpreparable launch submissions per desktop id.
     let mut rejections = BTreeMap::<String, u32>::new();
     let mut observed_digest = RUNNING_PROGRAMS_DIGEST_UNKNOWN;
-    let mut running_desktop_ids = BTreeSet::<String>::new();
-    let mut running_packages = BTreeSet::<String>::new();
+    let mut running_membership = RunningMembership::default();
 
     loop {
         if let Some(mut pending) = pending_rpc.take() {
@@ -220,22 +254,10 @@ fn main() {
             }
         };
 
-        running_desktop_ids.clear();
-        running_desktop_ids.extend(
-            running
-                .iter()
-                .map(|program| decode_c_string(&program.desktop_file_id)),
-        );
-        running_packages.clear();
-        running_packages.extend(running_desktop_ids.iter().map(|desktop_id| {
-            package_by_desktop_id
-                .get(desktop_id)
-                .cloned()
-                .unwrap_or_else(|| package_id_from_desktop_id(desktop_id))
-        }));
+        running_membership.refresh(&running, &package_by_desktop_id);
 
         if let Some(pending) = pending_launch.as_mut() {
-            if running_desktop_ids.contains(pending.desktop_file_id.as_str()) {
+            if running_membership.desktop_ids.contains(pending.desktop_file_id.as_str()) {
                 let settled = pending.observe_running(Instant::now());
                 retry_after.remove(pending.desktop_file_id.as_str());
                 if settled {
@@ -324,7 +346,7 @@ fn main() {
             }
             if !runtime_deps_satisfied(
                 &entry.runtime_deps,
-                &running_packages,
+                &running_membership.packages,
                 &launched_once_packages,
             ) {
                 continue;
@@ -333,7 +355,7 @@ fn main() {
                 continue;
             }
             if entry.restart {
-                if running_packages.contains(entry.package_id.as_str()) {
+                if running_membership.packages.contains(entry.package_id.as_str()) {
                     continue;
                 }
                 observability_client::info!(
@@ -563,6 +585,32 @@ fn package_id_from_desktop_id(desktop_id: &str) -> String {
 mod tests {
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn running_membership_reuses_unchanged_ids_and_refreshes_real_membership() {
+        use super::{RunningMembership, RuntimeRunningProgram};
+        let mut app = RuntimeRunningProgram::default();
+        app.desktop_file_id[..11].copy_from_slice(b"app.desktop");
+        let mut helper = RuntimeRunningProgram::default();
+        helper.desktop_file_id[..14].copy_from_slice(b"helper.desktop");
+        let packages = BTreeMap::from([("app.desktop".to_string(), "package.app".to_string())]);
+        let mut membership = RunningMembership::default();
+        membership.refresh(&[app, helper], &packages);
+        assert!(membership.packages.contains("package.app"));
+        assert!(membership.packages.contains("helper"));
+        let id_ptr = membership.desktop_ids.get("app.desktop").unwrap().as_ptr();
+        app.pid = 999;
+        app.display_name[0] = b'A';
+        membership.refresh(&[app, helper], &packages);
+        assert_eq!(membership.desktop_ids.get("app.desktop").unwrap().as_ptr(), id_ptr);
+        membership.refresh(&[helper, helper], &packages);
+        assert_eq!(membership.desktop_ids.len(), 1);
+        assert_eq!(membership.packages.len(), 1);
+        assert!(!membership.packages.contains("package.app"));
+        membership.refresh(&[], &packages);
+        assert!(membership.desktop_ids.is_empty());
+        assert!(membership.packages.is_empty());
+    }
 
     use super::{
         idle_watch_wait, may_auto_launch, rpc_decision, LaunchEntry, PendingLaunch, PendingRpc,

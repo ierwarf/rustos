@@ -126,7 +126,9 @@ pub(crate) trait Transport {
         block_count: u64,
         byte_len: usize,
     ) -> Result<DvmBlockTicketWire, i32>;
-    /// One non-blocking collect: `Ok(true)` once `buf` holds the data.
+    /// One non-blocking collect: `Ok(true)` only after this exact ticket has
+    /// overwritten the entire supplied slice. Recycled buffers may retain
+    /// prior contents; pending or failed collects must never publish them.
     fn try_collect(&self, ticket: DvmBlockTicketWire, buf: &mut [u8]) -> Result<bool, i32>;
     fn cancel(&self, ticket: DvmBlockTicketWire);
     /// A ticket outlived `COMPLETION_TIMEOUT`. Runs without the engine lock; may
@@ -155,6 +157,57 @@ struct Segment {
     src: usize,
     dst: usize,
     len: usize,
+}
+
+/// A broker read is at most one window in bytes and therefore intersects at
+/// most two cache windows. Keep those pins on the reader's stack; retain a
+/// general overflow path for larger internal reads and the engine tests.
+struct PinnedSegments {
+    inline: [Option<Segment>; 2],
+    overflow: Vec<Segment>,
+    len: usize,
+}
+
+impl PinnedSegments {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inline: [None, None],
+            overflow: Vec::with_capacity(capacity.saturating_sub(2)),
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, segment: Segment) {
+        if self.len < self.inline.len() {
+            self.inline[self.len] = Some(segment);
+        } else {
+            self.overflow.push(segment);
+        }
+        self.len += 1;
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Segment> {
+        self.inline.iter().filter_map(Option::as_ref).chain(&self.overflow)
+    }
+}
+
+struct Collection {
+    index: u64,
+    ticket: DvmBlockTicketWire,
+    buf: Vec<u8>,
+    result: Result<bool, i32>,
+}
+
+/// Owned by the single completion pump, outside the engine mutex. Reusing the
+/// lists also avoids a second allocation to turn submissions into results.
+#[derive(Default)]
+pub(crate) struct PumpScratch {
+    batch: Vec<Collection>,
+    expired: Vec<(u64, DvmBlockTicketWire)>,
 }
 
 struct Window {
@@ -262,9 +315,11 @@ impl Inner {
         }
     }
 
-    fn recycle(&mut self, mut buf: Vec<u8>) {
+    fn recycle(&mut self, buf: Vec<u8>) {
         if self.free_buffers.len() < FREE_BUFFER_LIMIT && buf.capacity() > 0 {
-            buf.clear();
+            // The whole slice is overwritten before a successful collect can
+            // publish it. Retain initialized bytes so take_buffer's resize is
+            // a no-op for the usual full window, instead of zeroing 64 KiB.
             self.free_buffers.push(buf);
         }
     }
@@ -595,7 +650,7 @@ impl Engine {
         // buffer, so eviction, invalidation or a write racing this read only
         // drops the cache's reference. The read observes either side of such a
         // write, as a read concurrent with it always could.
-        for segment in &segments {
+        for segment in segments.iter() {
             out[segment.dst..segment.dst + segment.len]
                 .copy_from_slice(&segment.bytes[segment.src..segment.src + segment.len]);
         }
@@ -625,7 +680,7 @@ impl Engine {
         end: u64,
         first: u64,
         last: u64,
-    ) -> Option<Vec<Segment>> {
+    ) -> Option<PinnedSegments> {
         let streaming = inner
             .streams
             .iter()
@@ -641,7 +696,7 @@ impl Engine {
             self.topup_hint.store(true, Ordering::Relaxed);
         }
         let expected = (last - first + 1) as usize;
-        let mut segments = Vec::with_capacity(expected);
+        let mut segments = PinnedSegments::with_capacity(expected);
         let mut used = 0;
         for index in first..=last {
             let (start, blocks) = geometry.window_extent(index);
@@ -685,8 +740,12 @@ impl Engine {
             return;
         }
         let mut inner = self.lock();
-        let ids: Vec<u64> = inner.streams.iter().map(|s| s.id).collect();
-        for id in ids {
+        let mut ids = [0_u64; STREAM_LIMIT];
+        let count = inner.streams.len();
+        for (slot, stream) in ids.iter_mut().zip(&inner.streams) {
+            *slot = stream.id;
+        }
+        for &id in &ids[..count] {
             self.read_ahead(&mut inner, transport, id, true);
         }
     }
@@ -764,40 +823,48 @@ impl Engine {
     }
 
     /// Collects every completed in-flight window and wakes its readers.
-    pub(crate) fn pump_once<T: Transport + ?Sized>(&self, transport: &T) -> PumpStatus {
-        let mut batch: Vec<(u64, DvmBlockTicketWire, Vec<u8>)> = Vec::new();
-        let mut expired: Vec<(u64, DvmBlockTicketWire)> = Vec::new();
+    pub(crate) fn pump_once<T: Transport + ?Sized>(
+        &self,
+        transport: &T,
+        scratch: &mut PumpScratch,
+    ) -> PumpStatus {
+        debug_assert!(scratch.batch.is_empty() && scratch.expired.is_empty());
         {
             let mut inner = self.lock();
+            if inner.in_flight == 0 {
+                return PumpStatus { in_flight: 0, progressed: 0 };
+            }
+            let now = Instant::now();
             for (index, window) in inner.windows.iter_mut() {
                 let State::InFlight { ticket, buf, .. } = &mut window.state else {
                     continue;
                 };
-                if window.submitted.elapsed() > COMPLETION_TIMEOUT {
-                    expired.push((*index, *ticket));
+                if now.saturating_duration_since(window.submitted) > COMPLETION_TIMEOUT {
+                    scratch.expired.push((*index, *ticket));
                 } else if let Some(buf) = buf.take() {
-                    batch.push((*index, *ticket, buf));
+                    scratch.batch.push(Collection {
+                        index: *index,
+                        ticket: *ticket,
+                        buf,
+                        result: Ok(false),
+                    });
                 }
             }
         }
-        for (_, ticket) in &expired {
+        for (_, ticket) in &scratch.expired {
             transport.timed_out(*ticket);
         }
-        let results: Vec<_> = batch
-            .into_iter()
-            .map(|(index, ticket, mut buf)| {
-                let result = transport.try_collect(ticket, &mut buf);
-                (index, ticket, buf, result)
-            })
-            .collect();
+        for collection in &mut scratch.batch {
+            collection.result = transport.try_collect(collection.ticket, &mut collection.buf);
+        }
 
         let mut progressed = 0;
         let mut inner = self.lock();
-        for (index, _) in &expired {
+        for (index, _) in scratch.expired.drain(..) {
             if let Some(Window {
                 state: State::InFlight { buf, .. },
                 ..
-            }) = inner.windows.remove(index)
+            }) = inner.windows.remove(&index)
             {
                 inner.in_flight = inner.in_flight.saturating_sub(1);
                 if let Some(buf) = buf {
@@ -806,7 +873,7 @@ impl Engine {
                 progressed += 1;
             }
         }
-        for (index, ticket, buf, result) in results {
+        for Collection { index, ticket, buf, result } in scratch.batch.drain(..) {
             let stamp = inner.next_stamp();
             let Some(window) = inner.windows.get_mut(&index) else {
                 // Removed while the pump held the buffer: no reader owns it.
@@ -996,8 +1063,9 @@ mod tests {
         let stop = AtomicBool::new(false);
         std::thread::scope(|scope| {
             scope.spawn(|| {
+                let mut scratch = PumpScratch::default();
                 while !stop.load(Ordering::Relaxed) {
-                    let status = engine.pump_once(fake);
+                    let status = engine.pump_once(fake, &mut scratch);
                     if status.in_flight == 0 {
                         engine.park_until_work(Duration::from_millis(2));
                     } else if status.progressed == 0 {
@@ -1036,6 +1104,70 @@ mod tests {
             expect_data(&out[..BLOCK], 6, 1);
         });
         assert_eq!(fake.submitted(), vec![(0, WINDOW_BLOCKS)]);
+    }
+
+    #[test]
+    fn recycled_buffer_is_not_published_until_its_complete_successful_collect() {
+        let engine = Engine::new();
+        let fake = Fake::default();
+        let geo = geometry(4 * WINDOW_BLOCKS);
+        {
+            let mut inner = engine.lock();
+            inner.bind(geo);
+            inner.recycle(vec![0xcc; WINDOW_BYTES]);
+            engine.submit(&mut inner, &fake, 0, true).unwrap();
+        }
+        fake.hold.store(true, Ordering::Relaxed);
+        let mut scratch = PumpScratch::default();
+        assert_eq!(engine.pump_once(&fake, &mut scratch).progressed, 0);
+        assert!(!engine.has_ready(0));
+        assert!(scratch.batch.is_empty() && scratch.expired.is_empty());
+        let capacity = scratch.batch.capacity();
+        fake.hold.store(false, Ordering::Relaxed);
+        assert_eq!(engine.pump_once(&fake, &mut scratch).progressed, 1);
+        let mut out = vec![0xff; BLOCK];
+        assert_eq!(engine.read(&fake, geo, 3, 1, &mut out), Ok(BLOCK));
+        expect_data(&out, 3, 1);
+
+        engine.invalidate_range(geo.generation, 0, 1);
+        {
+            let mut inner = engine.lock();
+            engine.submit(&mut inner, &fake, 1, true).unwrap();
+        }
+        fake.state.lock().unwrap().fail_collect = Some(libc::EIO);
+        assert_eq!(engine.pump_once(&fake, &mut scratch).progressed, 1);
+        out.fill(0xa5);
+        assert_eq!(engine.read(&fake, geo, WINDOW_BLOCKS, 1, &mut out), Err(libc::EIO));
+        assert!(out.iter().all(|&byte| byte == 0xa5));
+        assert!(scratch.batch.is_empty() && scratch.expired.is_empty());
+        assert_eq!(scratch.batch.capacity(), capacity);
+    }
+
+    #[test]
+    fn read_pins_two_windows_inline_and_preserves_larger_read_order() {
+        let engine = Engine::new();
+        let geo = geometry(4 * WINDOW_BLOCKS);
+        for index in 0..3 {
+            engine.seed_ready(geo, index, vec![index as u8; WINDOW_BYTES]);
+        }
+        let mut inner = engine.lock();
+        let two = engine.pin_segments(
+            &mut inner, geo, 0, WINDOW_BLOCKS - 1, WINDOW_BLOCKS + 1, 0, 1,
+        ).unwrap();
+        assert_eq!(two.len(), 2);
+        assert_eq!(two.overflow.capacity(), 0);
+        let parts: Vec<_> = two.iter().map(|segment| (segment.src, segment.dst, segment.len)).collect();
+        assert_eq!(parts, [(WINDOW_BYTES - BLOCK, 0, BLOCK), (0, BLOCK, BLOCK)]);
+        let three = engine.pin_segments(
+            &mut inner, geo, 0, 0, 3 * WINDOW_BLOCKS, 0, 2,
+        ).unwrap();
+        assert_eq!(three.len(), 3);
+        assert_eq!(three.overflow.len(), 1);
+        for (index, segment) in three.iter().enumerate() {
+            assert_eq!(segment.dst, index * WINDOW_BYTES);
+            assert_eq!(segment.len, WINDOW_BYTES);
+            assert!(segment.bytes.iter().all(|&byte| byte == index as u8));
+        }
     }
 
     #[test]
@@ -1307,7 +1439,7 @@ mod tests {
             fresh.fill(0xff);
         }
         assert_eq!(segments.len(), 1);
-        assert!(segments[0].bytes[..2 * BLOCK].iter().all(|b| *b == 0x5a));
+        assert!(segments.iter().next().unwrap().bytes[..2 * BLOCK].iter().all(|b| *b == 0x5a));
         // Once the last reader lets go the buffer is recyclable again.
         drop(segments);
         engine.seed_ready(geo, 1, vec![1; WINDOW_BYTES]);
@@ -1336,7 +1468,7 @@ mod tests {
             assert!(!inner.windows.contains_key(&0));
             assert!(inner.free_buffers.is_empty());
         }
-        assert!(segments[0].bytes.iter().all(|b| *b == 0x77));
+        assert!(segments.iter().next().unwrap().bytes.iter().all(|b| *b == 0x77));
     }
 
     #[test]
@@ -1443,7 +1575,7 @@ mod tests {
             let window = inner.windows.get_mut(&0).unwrap();
             window.submitted = Instant::now() - COMPLETION_TIMEOUT - Duration::from_secs(1);
         }
-        let status = engine.pump_once(&fake);
+        let status = engine.pump_once(&fake, &mut PumpScratch::default());
         assert_eq!(status.in_flight, 0);
         assert_eq!(fake.state.lock().unwrap().timed_out.len(), 1);
         assert!(engine.lock().windows.is_empty());

@@ -188,15 +188,23 @@ impl VfsState {
 
     fn forget_compacted_record(&mut self, proof: ServiceCheckpointRecordWire) {
         let parent_key = checkpoint_revision_key(&proof);
-        self.checkpoint_revisions.retain(|key, _| {
-            !(*key == parent_key || (key.0, key.1) == (proof.key_hi, proof.key_lo))
-        });
-        self.checkpoint_operations.retain(|key, _| {
-            !(*key == parent_key || (key.0, key.1) == (proof.key_hi, proof.key_lo))
-        });
-        self.checkpoint_records.retain(|key, _| {
-            !(*key == parent_key || (key.0, key.1) == (proof.key_hi, proof.key_lo))
-        });
+        self.forget_checkpoint_key(parent_key);
+        // The three mirrors publish and retire the same keys. Restrict lookup
+        // to this parent's contiguous child range, without scanning unrelated
+        // descriptions or allocating a temporary list of their keys.
+        let first = (proof.key_hi, proof.key_lo, 0, 0);
+        let last = (proof.key_hi, proof.key_lo, u64::MAX, u64::MAX);
+        loop {
+            let key = self.checkpoint_records.range(first..=last).next().map(|(key, _)| *key);
+            let Some(key) = key else { break };
+            self.forget_checkpoint_key(key);
+        }
+    }
+
+    fn forget_checkpoint_key(&mut self, key: CheckpointRevisionKey) {
+        self.checkpoint_revisions.remove(&key);
+        self.checkpoint_operations.remove(&key);
+        self.checkpoint_records.remove(&key);
     }
 
     fn checkpoint_mutate(

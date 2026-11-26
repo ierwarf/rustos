@@ -264,9 +264,12 @@ fn main() {
     let mut next_rootd_lease_reconciliation = Instant::now();
     let mut initial_lease_reconciliation = true;
     let mut startup_complete = false;
+    let mut spawned_packages = BTreeSet::new();
+    let mut ready_packages = BTreeSet::new();
+    let mut pending_activations = Vec::<i32>::with_capacity(LOADER_ACTIVATE_BATCH_MAX_TARGETS);
 
     loop {
-        reap_children(&mut running, &mut retry_state);
+        let mut packages_changed = reap_children(&mut running, &mut retry_state);
         if !startup_complete && startup_unadmitted(&startup_entries, &initially_admitted).is_none() {
             startup_complete = true;
             boot_line("initd: startup admission complete");
@@ -284,7 +287,7 @@ fn main() {
             if initial_lease_reconciliation {
                 boot_line("initd: initial lease reconciliation begin");
             }
-            rootd_lease_recovery.reconcile(
+            packages_changed |= rootd_lease_recovery.reconcile(
                 &startup_entries,
                 &mut running,
                 &mut launched_once_packages,
@@ -304,18 +307,14 @@ fn main() {
             next_rootd_lease_reconciliation = now + ROOTD_LEASE_RECONCILIATION_INTERVAL;
         }
 
-        let mut spawned_packages = running
-            .values()
-            .map(|service| service.package_id.clone())
-            .collect::<BTreeSet<_>>();
-        let mut ready_packages = running
-            .values()
-            .filter(|service| service.endpoint_ready)
-            .map(|service| service.package_id.clone())
-            .collect::<BTreeSet<_>>();
+        // Spawn, withdrawal and endpoint admission update these sets in the
+        // launch pass below. Only reaping or lease adoption/removal can change
+        // them between passes; an idle 10 ms turn needs no String/tree rebuild.
+        if packages_changed {
+            refresh_package_sets(&running, &mut spawned_packages, &mut ready_packages);
+        }
         let now = Instant::now();
         let mut launched_this_round = false;
-        let mut pending_activations = Vec::<i32>::with_capacity(LOADER_ACTIVATE_BATCH_MAX_TARGETS);
         for entry in startup_entries.iter() {
             if !runtime_deps_satisfied(
                 &entry.runtime_deps,
@@ -1071,10 +1070,26 @@ fn runtime_deps_satisfied(
         .all(|dep| running_packages.contains(dep) || launched_once_packages.contains(dep))
 }
 
+fn refresh_package_sets(
+    running: &BTreeMap<i32, RunningService>,
+    spawned: &mut BTreeSet<String>,
+    ready: &mut BTreeSet<String>,
+) {
+    spawned.clear();
+    ready.clear();
+    for service in running.values() {
+        spawned.insert(service.package_id.clone());
+        if service.endpoint_ready {
+            ready.insert(service.package_id.clone());
+        }
+    }
+}
+
 fn reap_children(
     running: &mut BTreeMap<i32, RunningService>,
     retry_state: &mut BTreeMap<String, RetryState>,
-) {
+) -> bool {
+    let mut changed = false;
     loop {
         let mut status = 0_i32;
         // SAFETY: `status` is writable for the syscall duration, WNOHANG makes
@@ -1090,6 +1105,7 @@ fn reap_children(
         };
         if pid > 0 {
             if let Some(service) = running.remove(&pid) {
+                changed = true;
                 observability_client::warn!(
                     "initd",
                     service,
@@ -1110,6 +1126,7 @@ fn reap_children(
         }
         break;
     }
+    changed
 }
 
 fn record_launch_failure(
@@ -1402,6 +1419,38 @@ mod tests {
         classify_service_ready_status, cleanup_spawned_service, endpoint_wait_args,
         exec_weight_micros,
     };
+
+    #[test]
+    fn package_snapshots_remove_exited_readiness_and_admit_replacements() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut running = BTreeMap::new();
+        let mut spawned = BTreeSet::new();
+        let mut ready = BTreeSet::new();
+        let once = BTreeSet::new();
+        let deps = vec![String::from("netd")];
+        running.insert(41, super::RunningService {
+            package_id: "netd".into(), exec: super::NETD_EXEC_PATH.into(),
+            restart: true, endpoint_ready: true,
+        });
+        super::refresh_package_sets(&running, &mut spawned, &mut ready);
+        assert!(super::runtime_deps_satisfied(&deps, &ready, &once));
+
+        running.remove(&41);
+        running.insert(42, super::RunningService {
+            package_id: "netd".into(), exec: super::NETD_EXEC_PATH.into(),
+            restart: true, endpoint_ready: false,
+        });
+        super::refresh_package_sets(&running, &mut spawned, &mut ready);
+        assert!(spawned.contains("netd"));
+        assert!(!super::runtime_deps_satisfied(&deps, &ready, &once));
+        running.get_mut(&42).unwrap().endpoint_ready = true;
+        super::refresh_package_sets(&running, &mut spawned, &mut ready);
+        assert!(super::runtime_deps_satisfied(&deps, &ready, &once));
+        running.clear();
+        super::refresh_package_sets(&running, &mut spawned, &mut ready);
+        assert!(spawned.is_empty());
+        assert!(ready.is_empty());
+    }
 
     #[test]
     fn startup_deadline_clips_operations_and_detects_unlaunched_dependency() {

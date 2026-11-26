@@ -114,9 +114,9 @@ impl QueuedEvent {
         out[8..12].copy_from_slice(&header.cookie.to_le_bytes());
         out[12..16].copy_from_slice(&header.len.to_le_bytes());
         if name_field_len > 0 {
-            out[EVENT_HEADER_SIZE..total].fill(0);
             out[EVENT_HEADER_SIZE..EVENT_HEADER_SIZE + self.name.len()]
                 .copy_from_slice(&self.name);
+            out[EVENT_HEADER_SIZE + self.name.len()..total].fill(0);
         }
         Some(total)
     }
@@ -202,6 +202,10 @@ impl InotifyInstance {
 pub struct InotifyRegistry {
     instances: BTreeMap<u64, InotifyInstance>,
     next_cookie: u32,
+    // Every VFS read/write/open/close consults this before collecting event
+    // metadata. Keep the no-watch fast path constant-time even with many
+    // empty inotify instances.
+    total_watches: usize,
 }
 
 impl InotifyRegistry {
@@ -209,6 +213,7 @@ impl InotifyRegistry {
         Self {
             instances: BTreeMap::new(),
             next_cookie: 1,
+            total_watches: 0,
         }
     }
 
@@ -217,7 +222,7 @@ impl InotifyRegistry {
     }
 
     pub fn total_watch_count(&self) -> usize {
-        self.instances.values().map(|inst| inst.watches.len()).sum()
+        self.total_watches
     }
 
     pub fn create_instance(&mut self, remote_id: u64) -> Result<(), i32> {
@@ -232,7 +237,9 @@ impl InotifyRegistry {
     }
 
     pub fn remove_instance(&mut self, remote_id: u64) {
-        self.instances.remove(&remote_id);
+        if let Some(instance) = self.instances.remove(&remote_id) {
+            self.total_watches -= instance.watches.len();
+        }
     }
 
     pub fn add_watch(
@@ -283,6 +290,7 @@ impl InotifyRegistry {
                 target,
             },
         );
+        self.total_watches += 1;
         Ok(wd)
     }
 
@@ -294,6 +302,7 @@ impl InotifyRegistry {
         if instance.watches.remove(&wd).is_none() {
             return Err(EINVAL);
         }
+        self.total_watches -= 1;
         Ok(instance.push_event(wd, linux_abi::IN_IGNORED, 0, &[]))
     }
 
@@ -468,10 +477,11 @@ impl InotifyRegistry {
                 }
             }
             for wd in remove_wds {
-                if instance.watches.remove(&wd).is_some()
-                    && instance.push_event(wd, linux_abi::IN_IGNORED, 0, &[])
-                {
-                    changed = true;
+                if instance.watches.remove(&wd).is_some() {
+                    self.total_watches -= 1;
+                    if instance.push_event(wd, linux_abi::IN_IGNORED, 0, &[]) {
+                        changed = true;
+                    }
                 }
             }
             if changed {
@@ -525,6 +535,45 @@ mod tests {
             },
             name,
         )
+    }
+
+    #[test]
+    fn watch_accounting_tracks_updates_duplicate_retirement_and_instance_close() {
+        let mut reg = InotifyRegistry::new();
+        reg.create_instance(1).unwrap();
+        reg.create_instance(2).unwrap();
+        let one = reg.add_watch(1, file_target("/a", 7),
+            linux_abi::IN_DELETE_SELF | linux_abi::IN_ONESHOT).unwrap();
+        let two = reg.add_watch(2, file_target("/b", 8), linux_abi::IN_MODIFY).unwrap();
+        assert_eq!(reg.total_watch_count(), 2);
+        assert_eq!(reg.add_watch(2, file_target("/renamed-b", 8),
+            linux_abi::IN_ATTRIB | linux_abi::IN_MASK_ADD), Ok(two));
+        assert_eq!(reg.total_watch_count(), 2);
+        // Both ONESHOT and DELETE_SELF request retirement of the same wd.
+        reg.emit_path_event(2, 1, 7, "/a", 0, None, None,
+            linux_abi::IN_DELETE, false, 0, None);
+        assert_eq!(reg.total_watch_count(), 1);
+        assert_eq!(reg.rm_watch(1, one), Err(EINVAL));
+        assert_eq!(reg.total_watch_count(), 1);
+        reg.remove_instance(1);
+        assert_eq!(reg.total_watch_count(), 1);
+        reg.remove_instance(2);
+        reg.remove_instance(2);
+        assert_eq!(reg.total_watch_count(), 0);
+        reg.create_instance(3).unwrap();
+        let wd = reg.add_watch(3, dir_target("/tmp"), linux_abi::IN_CREATE).unwrap();
+        reg.rm_watch(3, wd).unwrap();
+        assert_eq!(reg.total_watch_count(), 0);
+    }
+
+    #[test]
+    fn encoded_name_padding_is_zero_without_overwriting_the_following_record() {
+        let event = QueuedEvent { wd: 1, mask: linux_abi::IN_CREATE, cookie: 0, name: b"name".to_vec() };
+        let mut output = [0xa5; 48];
+        assert_eq!(event.encode_into(&mut output), Some(32));
+        assert_eq!(&output[16..20], b"name");
+        assert!(output[20..32].iter().all(|&byte| byte == 0));
+        assert!(output[32..].iter().all(|&byte| byte == 0xa5));
     }
 
     #[test]

@@ -128,13 +128,17 @@ pub(super) fn run_serialized_passes(requested: &AtomicBool, running: &AtomicBool
 }
 
 pub(super) fn service_local_poll_waiters_pass() {
-    let (pending, queue_poisoned) = take_deferred_queue(local_poll_waiters().lock());
+    let (mut pending, queue_poisoned) = take_deferred_queue(local_poll_waiters().lock());
     if pending.is_empty() {
         return;
     }
 
-    let mut still_waiting = VecDeque::new();
-    for waiter in pending {
+    // Visit exactly the detached batch once. Requeue live entries into its
+    // existing allocation; appending behind the unvisited prefix preserves
+    // FIFO without allocating a second deque on every readiness pass.
+    let batch_len = pending.len();
+    for _ in 0..batch_len {
+        let waiter = pending.pop_front().unwrap();
         if let Some(waiter) = service_one_local_poll_waiter(
             waiter,
             queue_poisoned,
@@ -144,26 +148,32 @@ pub(super) fn service_local_poll_waiters_pass() {
             },
             |pid| release_local_poll_slot(pid),
         ) {
-            still_waiting.push_back(waiter);
+            pending.push_back(waiter);
         }
     }
-    if !still_waiting.is_empty() {
-        match local_poll_waiters().lock() {
-            Ok(mut waiters) => waiters.extend(still_waiting),
-            Err(_) => {
-                // The queue is no longer usable. Resolve every detached
-                // request and release its reservation rather than leaking
-                // reply capabilities or permanently exhausting admission.
-                for waiter in still_waiting {
-                    let response = NetdIpcResponse {
-                        version: NETD_IPC_ABI_VERSION,
-                        op: waiter.request.op,
-                        status: libc::EIO,
-                        ..NetdIpcResponse::default()
-                    };
-                    let _ = publish_reply(waiter.reply_cap, &response);
-                    release_local_poll_slot(waiter.request.pid);
-                }
+    match local_poll_waiters().lock() {
+        Ok(mut waiters) => {
+            if waiters.is_empty() {
+                // Retain the high-water allocation even when all entries
+                // completed. New arrivals, if any, stay ahead as before.
+                *waiters = pending;
+            } else {
+                waiters.extend(pending);
+            }
+        }
+        Err(_) => {
+            // The queue is no longer usable. Resolve every detached
+            // request and release its reservation rather than leaking
+            // reply capabilities or permanently exhausting admission.
+            for waiter in pending {
+                let response = NetdIpcResponse {
+                    version: NETD_IPC_ABI_VERSION,
+                    op: waiter.request.op,
+                    status: libc::EIO,
+                    ..NetdIpcResponse::default()
+                };
+                let _ = publish_reply(waiter.reply_cap, &response);
+                release_local_poll_slot(waiter.request.pid);
             }
         }
     }
@@ -207,16 +217,22 @@ where
 }
 
 pub(super) fn take_deferred_queue<T>(locked: LockResult<MutexGuard<'_, VecDeque<T>>>) -> (VecDeque<T>, bool) {
-    match locked {
-        Ok(mut waiters) => (std::mem::take(&mut *waiters), false),
+    let (mut waiters, poisoned) = match locked {
+        Ok(waiters) => (waiters, false),
         Err(poisoned) => {
             // Rust poisoning reports that a previous owner unwound, not that
             // VecDeque memory is invalid. Drain the structurally valid queue
             // and fail every reserved request instead of leaking the global
             // bound and reply capabilities forever.
-            let mut waiters = poisoned.into_inner();
-            (std::mem::take(&mut *waiters), true)
+            (poisoned.into_inner(), true)
         }
+    };
+    if waiters.is_empty() {
+        // Idle passes must not discard the allocation retained by the last
+        // completed batch; no elements need to be detached in this case.
+        (VecDeque::new(), poisoned)
+    } else {
+        (std::mem::take(&mut *waiters), poisoned)
     }
 }
 

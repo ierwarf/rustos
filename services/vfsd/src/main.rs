@@ -240,11 +240,11 @@ struct ExecutableSnapshot {
 fn linux_response_for_op(op: u16) -> LinuxSyscallOffloadResponse {
     let mut response = MaybeUninit::<LinuxSyscallOffloadResponse>::uninit();
     let ptr = response.as_mut_ptr().cast::<u8>();
-    for offset in 0..size_of::<LinuxSyscallOffloadResponse>() {
-        // SAFETY: `ptr` addresses byte `offset < size_of::<LinuxSyscallOffloadResponse>()` of
-        // the local `MaybeUninit`, so the write is in bounds and aligned (u8).
-        unsafe { core::ptr::write_volatile(ptr.add(offset), 0) };
-    }
+    // This is private response memory, not MMIO. A bulk initialization keeps
+    // the entire wire (including padding and unused payload) canonical without
+    // forcing one externally observable volatile store for every byte.
+    // SAFETY: the pointer covers the complete live local MaybeUninit object.
+    unsafe { core::ptr::write_bytes(ptr, 0, size_of::<LinuxSyscallOffloadResponse>()) };
     // SAFETY: every byte of `response` was zeroed above, and the response is an
     // all-integer `repr(C)` wire struct for which the zero pattern is valid.
     let mut response = unsafe { response.assume_init() };

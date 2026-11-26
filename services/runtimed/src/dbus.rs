@@ -410,6 +410,10 @@ fn write_u32(endian: u8, out: &mut Vec<u8>, val: u32) {
 }
 
 fn read_dbus_string(endian: u8, buf: &[u8], pos: &mut usize) -> Result<String, &'static str> {
+    read_dbus_str(endian, buf, pos).map(str::to_owned)
+}
+
+fn read_dbus_str<'a>(endian: u8, buf: &'a [u8], pos: &mut usize) -> Result<&'a str, &'static str> {
     *pos = align_up(*pos, 4);
     if *pos + 4 > buf.len() {
         return Err("truncated string length");
@@ -419,9 +423,11 @@ fn read_dbus_string(endian: u8, buf: &[u8], pos: &mut usize) -> Result<String, &
     if *pos + len + 1 > buf.len() {
         return Err("truncated string bytes");
     }
-    let s = std::str::from_utf8(&buf[*pos..*pos + len])
-        .map_err(|_| "invalid utf8")?
-        .to_owned();
+    let bytes = &buf[*pos..*pos + len];
+    if buf[*pos + len] != 0 || bytes.contains(&0) {
+        return Err("invalid string termination");
+    }
+    let s = std::str::from_utf8(bytes).map_err(|_| "invalid utf8")?;
     *pos += len + 1;
     Ok(s)
 }
@@ -443,6 +449,10 @@ impl<'a> BodyReader<'a> {
 
     fn read_str(&mut self) -> Result<String, &'static str> {
         read_dbus_string(self.endian, self.bytes, &mut self.pos)
+    }
+
+    fn read_str_ref(&mut self) -> Result<&'a str, &'static str> {
+        read_dbus_str(self.endian, self.bytes, &mut self.pos)
     }
 
     fn read_u32(&mut self) -> Result<u32, &'static str> {
@@ -652,7 +662,8 @@ impl BusState {
                 if client.in_buf.len() >= MAX_CLIENT_IN_BYTES {
                     return false;
                 }
-                client.stream.read(&mut chunk)
+                let room = chunk.len().min(MAX_CLIENT_IN_BYTES - client.in_buf.len());
+                client.stream.read(&mut chunk[..room])
             };
             match res {
                 Ok(0) => return false,
@@ -675,7 +686,7 @@ impl BusState {
     }
 
     fn advance_sasl(&mut self, client_id: u64) -> bool {
-        let uuid = self.bus_uuid.clone();
+        let uuid = &self.bus_uuid;
         loop {
             let Some(client) = self.clients.get_mut(&client_id) else {
                 return false;
@@ -771,6 +782,7 @@ impl BusState {
     }
 
     fn advance_messages(&mut self, client_id: u64) -> bool {
+        let mut offset = 0;
         loop {
             let decoded = {
                 let Some(client) = self.clients.get_mut(&client_id) else {
@@ -779,12 +791,18 @@ impl BusState {
                 if client.auth != ClientAuthState::Authenticated {
                     return true;
                 }
-                match DbusMessage::decode(&client.in_buf) {
+                match DbusMessage::decode(&client.in_buf[offset..]) {
                     Ok(Some((msg, consumed))) => {
-                        client.in_buf.drain(..consumed);
+                        offset += consumed;
                         Some(msg)
                     }
-                    Ok(None) => None,
+                    Ok(None) => {
+                        // Dispatch in wire order, then move the incomplete
+                        // suffix only once. Draining each complete frame made
+                        // a batch of small messages move its tail repeatedly.
+                        client.in_buf.drain(..offset);
+                        None
+                    }
                     Err(_) => return false,
                 }
             };
@@ -885,15 +903,14 @@ impl BusState {
         }
 
         let scope = Self::bus_scope(bus);
-        let mut sender_names: Vec<String> = vec![unique];
+        let mut sender_refs = vec![unique.as_str()];
         for ((s, name), owner) in &self.names {
             if *s == scope && *owner == sender_id {
-                sender_names.push(name.clone());
+                sender_refs.push(name.as_str());
             }
         }
-        let sender_refs: Vec<&str> = sender_names.iter().map(String::as_str).collect();
         let arg0 = if msg.signature.starts_with('s') {
-            BodyReader::new(msg.endian, &msg.body).read_str().ok()
+            BodyReader::new(msg.endian, &msg.body).read_str_ref().ok()
         } else {
             None
         };
@@ -904,7 +921,7 @@ impl BusState {
             if client
                 .matches
                 .iter()
-                .any(|rule| rule.matches(&msg, &sender_refs, arg0.as_deref()))
+                .any(|rule| rule.matches(&msg, &sender_refs, arg0))
             {
                 let _ = client.queue_bytes(&encoded);
             }
@@ -1566,6 +1583,8 @@ fn run_broker_loop(wake_read: OwnedFd, registry: &'static Mutex<BrokerRegistry>)
     let mut state = BusState::new();
     let mut pollfds: Vec<libc::pollfd> = Vec::new();
     let mut tags: Vec<(bool, u64)> = Vec::new(); // (is_listener, listener_idx or client_id)
+    let mut accepted = Vec::new();
+    let mut to_drop = Vec::new();
 
     loop {
         pollfds.clear();
@@ -1621,7 +1640,6 @@ fn run_broker_loop(wake_read: OwnedFd, registry: &'static Mutex<BrokerRegistry>)
                 continue;
             }
             if is_listener {
-                let mut accepted = Vec::new();
                 {
                     let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(entry) = reg.listeners.get(id as usize) {
@@ -1634,7 +1652,7 @@ fn run_broker_loop(wake_read: OwnedFd, registry: &'static Mutex<BrokerRegistry>)
                         }
                     }
                 }
-                for (bus, stream, creds) in accepted {
+                for (bus, stream, creds) in accepted.drain(..) {
                     if state.clients.len() >= MAX_BUS_CLIENTS || !peer_allowed(bus, creds) {
                         continue;
                     }
@@ -1680,13 +1698,12 @@ fn run_broker_loop(wake_read: OwnedFd, registry: &'static Mutex<BrokerRegistry>)
             }
         }
         // Flush freshly queued replies immediately without waiting for another poll turn.
-        let mut to_drop = Vec::new();
         for (&cid, client) in &mut state.clients {
             if client.overflowed || (!client.out_buf.is_empty() && !flush_client_writes(client)) {
                 to_drop.push(cid);
             }
         }
-        for cid in to_drop {
+        for cid in to_drop.drain(..) {
             state.disconnect_client(cid);
         }
     }
@@ -2056,6 +2073,52 @@ mod tests {
             last = Some(msg);
         }
         last.expect("a queued reply")
+    }
+
+    #[test]
+    fn coalesced_messages_dispatch_in_order_and_preserve_one_partial_suffix() {
+        let mut state = BusState::new();
+        let (mut client, _peer) = test_client(BusKind::System, ":1.1");
+        let first = driver_call("Hello", 71, "").encode();
+        let second = driver_call("Hello", 72, "").encode();
+        let third = driver_call("Hello", 73, "").encode();
+        client.in_buf.extend_from_slice(&first);
+        client.in_buf.extend_from_slice(&second);
+        client.in_buf.extend_from_slice(&third[..13]);
+        state.clients.insert(1, client);
+        assert!(state.advance_messages(1));
+        let client = state.clients.get_mut(&1).unwrap();
+        assert_eq!(client.in_buf, third[..13]);
+        let replies: Vec<u8> = client.out_buf.drain(..).collect();
+        let (reply, used) = DbusMessage::decode(&replies).unwrap().unwrap();
+        assert_eq!(reply.reply_serial, Some(71));
+        let (reply, used_second) = DbusMessage::decode(&replies[used..]).unwrap().unwrap();
+        assert_eq!(reply.reply_serial, Some(72));
+        assert_eq!(used + used_second, replies.len());
+        client.in_buf.extend_from_slice(&third[13..]);
+        assert!(state.advance_messages(1));
+        let client = state.clients.get_mut(&1).unwrap();
+        assert!(client.in_buf.is_empty());
+        assert_eq!(last_queued(client).reply_serial, Some(73));
+    }
+
+    #[test]
+    fn dbus_strings_require_one_terminating_nul_and_no_embedded_nul() {
+        for endian in [b'l', b'B'] {
+            let mut bytes = Vec::new();
+            write_u32(endian, &mut bytes, 3);
+            bytes.extend_from_slice(b"abc\0");
+            let mut pos = 0;
+            assert_eq!(read_dbus_str(endian, &bytes, &mut pos), Ok("abc"));
+            assert_eq!(pos, bytes.len());
+            bytes[7] = b'x';
+            assert!(read_dbus_string(endian, &bytes, &mut 0).is_err());
+            bytes[7] = 0;
+            bytes[5] = 0;
+            assert!(read_dbus_string(endian, &bytes, &mut 0).is_err());
+            bytes.truncate(4);
+            assert!(read_dbus_str(endian, &bytes, &mut 0).is_err());
+        }
     }
 
     #[test]

@@ -4,8 +4,8 @@ fn map_pe_segments_fd(
     fd: i32,
     prepare_handle: u64,
     exec_path: &str,
-    argv: &[CString],
-    env: &[CString],
+    argv: &[&str],
+    env: &[&str],
     deadline: AbsoluteDeadline,
 ) -> Result<RustosProcSetWindowsRuntimeBrokerArgs, i32> {
     let mut main = load_pe_image_fd(fd, exec_path, pe_default_load_base()?, false)

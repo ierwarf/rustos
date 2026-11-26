@@ -337,7 +337,7 @@ impl VfsState {
             Ok(read) => {
                 response.payload_len = read as u32;
                 response.value = read as u64;
-                if read > 0 {
+                if read > 0 && self.inotify.total_watch_count() != 0 {
                     if let Some(path) = self
                         .handles
                         .get(&request.remote_id)
@@ -1113,9 +1113,12 @@ impl VfsState {
             response.status = EINVAL;
             return;
         }
-        let proofs = self
+        // Parent records are unique by (parent, key). A close ACK names that
+        // exact key; scanning and collecting every live checkpoint is needless
+        // work on each descriptor close.
+        let proof = self
             .checkpoint_records
-            .values()
+            .get(&checkpoint_handle_key(request.remote_id))
             .copied()
             .filter(|record| {
                 record.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE != 0
@@ -1124,9 +1127,8 @@ impl VfsState {
                     && record.parent_lo == 0
                     && record.key_hi == request.remote_id
                     && record.key_lo == VFSD_CHECKPOINT_HANDLE_TAG
-            })
-            .collect::<Vec<_>>();
-        for proof in proofs {
+            });
+        if let Some(proof) = proof {
             if let Err(errno) = self.compact_checkpoint_proof(proof) {
                 response.status = errno;
                 return;
@@ -1655,17 +1657,18 @@ impl VfsState {
             response.status = errno;
             return;
         }
-        let event_path = candidate.path.clone();
+        let event_path = (written > 0 && self.inotify.total_watch_count() != 0)
+            .then(|| candidate.path.clone());
         response.value = written as u64;
         response.aux = candidate.cursor;
         self.handles.insert(request.remote_id, candidate);
-        if written > 0 {
+        if let Some(event_path) = event_path {
             self.emit_inotify(event_path.as_str(), linux_abi::IN_MODIFY, false);
         }
     }
 
     fn vfs_pwrite64(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(handle) = self.handles.get(&request.remote_id).cloned() else {
+        let Some(handle) = self.handles.get(&request.remote_id) else {
             response.status = EBADF;
             return;
         };
@@ -1703,7 +1706,7 @@ impl VfsState {
             .min(request.payload_len as usize)
             .min(request.payload.len());
         let data = &request.payload[..len];
-        let event_path = handle.path.clone();
+        let event_path = (self.inotify.total_watch_count() != 0).then(|| handle.path.clone());
         let result = if handle.node != 0 {
             lock_vfs_storage()
                 .write_node(handle.mount_id, handle.node, Some(request.arg0), data)
@@ -1718,7 +1721,9 @@ impl VfsState {
                 }
                 response.value = written as u64;
                 if written > 0 {
-                    self.emit_inotify(event_path.as_str(), linux_abi::IN_MODIFY, false);
+                    if let Some(event_path) = event_path {
+                        self.emit_inotify(event_path.as_str(), linux_abi::IN_MODIFY, false);
+                    }
                 }
             }
             Err(errno) => response.status = errno,
@@ -1726,7 +1731,7 @@ impl VfsState {
     }
 
     fn vfs_ftruncate(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
-        let Some(handle) = self.handles.get(&request.remote_id).cloned() else {
+        let Some(handle) = self.handles.get(&request.remote_id) else {
             response.status = EBADF;
             return;
         };
@@ -1739,7 +1744,7 @@ impl VfsState {
             response.status = EINVAL;
             return;
         }
-        let event_path = handle.path.clone();
+        let event_path = (self.inotify.total_watch_count() != 0).then(|| handle.path.clone());
         let result = if handle.node != 0 {
             lock_vfs_storage().truncate_node(handle.mount_id, handle.node, request.arg0)
         } else {
@@ -1751,7 +1756,9 @@ impl VfsState {
                     entry.len = actual_len;
                 }
                 response.value = 0;
-                self.emit_inotify(event_path.as_str(), linux_abi::IN_MODIFY, false);
+                if let Some(event_path) = event_path {
+                    self.emit_inotify(event_path.as_str(), linux_abi::IN_MODIFY, false);
+                }
             }
             Err(errno) => response.status = errno,
         }

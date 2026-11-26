@@ -62,6 +62,22 @@ impl<T> SocketTable<T> {
         self.entries.values_mut()
     }
 
+    /// Visit selected entries in one map traversal while preserving the exact
+    /// dirty identities, without allocating a token list and looking them up
+    /// again. Nonmatching sockets retain their previous readiness observation.
+    pub(super) fn for_each_matching_mut(
+        &mut self,
+        mut matches: impl FnMut(&T) -> bool,
+        mut visit: impl FnMut(&mut T),
+    ) {
+        for (&token, socket) in &mut self.entries {
+            if matches(socket) {
+                self.dirty.insert(token);
+                visit(socket);
+            }
+        }
+    }
+
     pub(super) fn mark_all_dirty(&mut self) {
         self.all_dirty = true;
     }
@@ -162,12 +178,10 @@ impl NetState {
     /// Ordinary netlink traffic visits only dirty netlink identities, never
     /// the whole table.
     fn observe_netlink(&mut self, changed: &mut Vec<u64>) {
-        let mut dirty = std::mem::take(&mut self.netlink_sockets.dirty);
-        if core::mem::take(&mut self.netlink_sockets.all_dirty) {
-            dirty.extend(self.netlink_sockets.keys().copied());
-        }
-        for token in dirty {
-            let after = self.netlink_sockets.get(&token).map(|socket| {
+        let table = &mut self.netlink_sockets;
+        let dirty = std::mem::take(&mut table.dirty);
+        let mut visit = |token, socket: Option<&NetlinkSocket>| {
+            let after = socket.map(|socket| {
                 const EVENTS: u32 = linux_abi::POLLIN as u32 | linux_abi::POLLOUT as u32;
                 Readiness::Netlink {
                     events: netlink_socket_revents_for(socket, EVENTS),
@@ -176,6 +190,22 @@ impl NetState {
             // `None`: retired, the identity is gone from both tables.
             if observe(&mut self.readiness_observations, token, after) {
                 changed.push(token);
+            }
+        };
+        if std::mem::take(&mut table.all_dirty) {
+            // Like the INET sweep, walk the already sorted entries directly.
+            // Building a BTreeSet of every live token only duplicated the map.
+            for (&token, socket) in &table.entries {
+                visit(token, Some(socket));
+            }
+            for token in dirty {
+                if !table.entries.contains_key(&token) {
+                    visit(token, None);
+                }
+            }
+        } else {
+            for token in dirty {
+                visit(token, table.entries.get(&token));
             }
         }
     }

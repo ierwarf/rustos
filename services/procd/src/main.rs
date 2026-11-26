@@ -1112,9 +1112,13 @@ fn handle_sigaltstack(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse
         }
     }
     let mut policy = THREAD_SIGNAL_POLICY.lock();
-    let state = policy
-        .entry((request.pid, request.tid))
-        .or_insert_with(|| ThreadSignalPolicy::initial_from_request(request));
+    let mut initial = ThreadSignalPolicy::initial_from_request(request);
+    let state = if extra.has_new != 0 {
+        policy.entry((request.pid, request.tid)).or_insert(initial)
+    } else {
+        // Querying the default alternate stack needs no persistent record.
+        policy.get_mut(&(request.pid, request.tid)).unwrap_or(&mut initial)
+    };
     let old = SigaltstackResponse {
         has_old: 1,
         old_ss_sp: state.sigaltstack_sp,
@@ -1175,13 +1179,11 @@ fn handle_select_signal(request: &ProcdIpcRequest, response: &mut ProcdIpcRespon
         response.action = PROCD_SELECT_SIGNAL_NONE;
         return;
     }
-    let mask = {
-        let mut threads = THREAD_SIGNAL_POLICY.lock();
-        threads
-            .entry((request.pid, request.tid))
-            .or_insert_with(|| ThreadSignalPolicy::initial_from_request(request))
-            .signal_mask
-    };
+    let mask = THREAD_SIGNAL_POLICY
+        .lock()
+        .get(&(request.pid, request.tid))
+        .map(|state| state.signal_mask)
+        .unwrap_or_else(|| ThreadSignalPolicy::initial_from_request(request).signal_mask);
     let deliverable = pending & !mask;
     if deliverable == 0 {
         response.action = PROCD_SELECT_SIGNAL_NONE;
@@ -1350,16 +1352,19 @@ fn reset_signal_policy_after_exec(pid: u64, tid: u64) {
     let mut threads = THREAD_SIGNAL_POLICY.lock();
     let mask = threads
         .get(&(pid, tid))
-        .map(|state| state.signal_mask)
-        .unwrap_or(0);
+        .map(|state| state.signal_mask);
     remove_process_threads(&mut threads, pid);
-    threads.insert(
-        (pid, tid),
-        ThreadSignalPolicy {
-            signal_mask: mask,
-            ..ThreadSignalPolicy::default()
-        },
-    );
+    // An absent record means the kernel remains the mask authority. Inserting
+    // a zero mask here would shadow its preserved exec mask on the next query.
+    if let Some(signal_mask) = mask {
+        threads.insert(
+            (pid, tid),
+            ThreadSignalPolicy {
+                signal_mask,
+                ..ThreadSignalPolicy::default()
+            },
+        );
+    }
 }
 
 #[repr(C)]
@@ -1678,6 +1683,53 @@ mod tests {
         handle_rt_sigprocmask(&mask, &mut mresp);
         assert_eq!(mresp.payload_len, 8);
         assert_eq!(read_u64(&mresp.payload[..8], 0), 0b100);
+        assert!(!THREAD_SIGNAL_POLICY.lock().contains_key(&(pid, pid)));
+
+        let mut stack = ProcdIpcRequest::default();
+        stack.pid = pid;
+        stack.tid = pid;
+        stack.flags = 1;
+        copy_request_payload(&mut stack, &SigaltstackRequest::default());
+        let mut sresp = ProcdIpcResponse::default();
+        handle_sigaltstack(&stack, &mut sresp);
+        assert_eq!(sresp.status, 0);
+        let old = read_unaligned::<SigaltstackResponse>(&sresp.payload);
+        assert_eq!(old.old_ss_flags, SS_DISABLE);
+        assert_eq!(old.old_ss_size, 0);
+        assert!(!THREAD_SIGNAL_POLICY.lock().contains_key(&(pid, pid)));
+    }
+
+    #[test]
+    fn signal_selection_uses_the_current_seed_without_creating_a_cache_entry() {
+        let pid = u64::MAX - 70;
+        let mut request = ProcdIpcRequest {
+            pid, tid: pid, arg0: 0b100, arg5: 0b100,
+            ..ProcdIpcRequest::default()
+        };
+        let mut response = ProcdIpcResponse::default();
+        handle_select_signal(&request, &mut response);
+        assert_eq!(response.action, PROCD_SELECT_SIGNAL_NONE);
+        request.arg5 = 0;
+        handle_select_signal(&request, &mut response);
+        assert_eq!(response.signal, 3);
+        assert_eq!(response.action, PROCD_SELECT_SIGNAL_TERMINATE);
+        request.arg1 = 1;
+        handle_select_signal(&request, &mut response);
+        assert_eq!(response.status, EINVAL);
+        assert!(!THREAD_SIGNAL_POLICY.lock().contains_key(&(pid, pid)));
+    }
+
+    #[test]
+    fn exec_without_cached_thread_state_does_not_shadow_the_kernel_mask() {
+        let pid = u64::MAX - 72;
+        reset_signal_policy_after_exec(pid, pid);
+        let request = ProcdIpcRequest {
+            pid, tid: pid, flags: 0x2, arg5: 0b100,
+            ..ProcdIpcRequest::default()
+        };
+        let mut response = ProcdIpcResponse::default();
+        handle_rt_sigprocmask(&request, &mut response);
+        assert_eq!(read_u64(&response.payload, 0), 0b100);
         assert!(!THREAD_SIGNAL_POLICY.lock().contains_key(&(pid, pid)));
     }
 

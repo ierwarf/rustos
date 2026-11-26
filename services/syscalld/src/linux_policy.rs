@@ -126,7 +126,9 @@ pub enum IdKind {
 }
 
 static PROCESS_POLICY: Mutex<BTreeMap<u64, LinuxPolicyState>> = Mutex::new(BTreeMap::new());
-static MM_POLICY: Mutex<BTreeMap<u64, MmPolicyState>> = Mutex::new(BTreeMap::new());
+// A borrowed state leaves its tree slot allocated. Repeated MM requests must
+// not remove/reallocate a B-tree node just to transfer exclusive ownership.
+static MM_POLICY: Mutex<BTreeMap<u64, Option<MmPolicyState>>> = Mutex::new(BTreeMap::new());
 
 #[derive(Clone, Debug)]
 struct MmPolicyState {
@@ -181,11 +183,12 @@ impl VmaEntry for MmVma {
 /// Exclusive ownership of one process's policy state for the span of a request.
 ///
 /// The state is moved out of `MM_POLICY` (no copy of the VMA table) and moved
-/// back when the lease drops, on success and error paths alike. Handlers only
+/// back into its retained slot when the lease drops, on success and error paths
+/// alike. An occupied slot containing None is already borrowed. Handlers only
 /// mutate the state after the kernel broker accepted the change, so the stored
 /// state is always consistent with the live address space. The receive loop is
-/// single threaded; a second concurrent lease for the same pid would rebuild
-/// from the kernel layout, which is why no handler yields while holding one.
+/// single threaded; an accidental second lease for an already borrowed slot
+/// is refused rather than rebuilding competing state from the kernel layout.
 /// The process a request mutates plus the kernel-issued ticket proving that
 /// request is still live. Every MM broker call echoes the ticket; the kernel
 /// refuses operations whose ticket is absent, stale, or another process's.
@@ -608,7 +611,7 @@ fn policy_db() -> &'static Mutex<BTreeMap<u64, LinuxPolicyState>> {
     &PROCESS_POLICY
 }
 
-fn mm_db() -> &'static Mutex<BTreeMap<u64, MmPolicyState>> {
+fn mm_db() -> &'static Mutex<BTreeMap<u64, Option<MmPolicyState>>> {
     &MM_POLICY
 }
 
@@ -1485,7 +1488,13 @@ pub fn handle_munmap(
 
 fn mm_state_for(target: MmTarget) -> Result<MmLease, i32> {
     let pid = target.pid;
-    let stored = mm_db().lock().remove(&pid);
+    let stored = {
+        let mut states = mm_db().lock();
+        match states.get_mut(&pid) {
+            Some(slot) => Some(slot.take().ok_or(errno::EAGAIN)?),
+            None => None,
+        }
+    };
     if let Some(state) = stored {
         return Ok(MmLease { pid, state: Some(state) });
     }
@@ -1541,7 +1550,7 @@ fn mmap_range_below_ceiling(state: &MmPolicyState, addr: u64, len: u64) -> bool 
 }
 
 fn save_mm_state(pid: u64, state: MmPolicyState) {
-    mm_db().lock().insert(pid, state);
+    mm_db().lock().insert(pid, Some(state));
 }
 
 /// `demand_len` is the length of the large private mapping about to be made, or
@@ -1712,8 +1721,8 @@ pub fn handle_process_fork_pid(child_pid: u64, parent_pid: u64) {
     }
     {
         let mut mm = MM_POLICY.lock();
-        if let Some(parent_mm) = mm.get(&parent_pid).cloned() {
-            mm.insert(child_pid, parent_mm);
+        if let Some(parent_mm) = mm.get(&parent_pid).and_then(Option::as_ref).cloned() {
+            mm.insert(child_pid, Some(parent_mm));
         } else {
             mm.remove(&child_pid);
         }
@@ -1960,7 +1969,7 @@ mod tests {
         };
         save_mm_state(pid, mm_state_from_layout(layout(old_guard)));
         assert!(mmap_range_below_ceiling(
-            &mm_db().lock()[&pid],
+            mm_db().lock()[&pid].as_ref().unwrap(),
             new_guard,
             PAGE_SIZE
         ));
@@ -2291,7 +2300,14 @@ mod tests {
         save_mm_state(pid, seed);
         {
             let mut lease = mm_state_for(MmTarget { pid, ticket: 1 }).unwrap();
-            assert!(mm_db().lock().get(&pid).is_none(), "state moves, not copies");
+            assert!(
+                mm_db().lock().get(&pid).is_some_and(Option::is_none),
+                "state moves while its index slot stays allocated"
+            );
+            assert!(matches!(
+                mm_state_for(MmTarget { pid, ticket: 1 }),
+                Err(errno::EAGAIN)
+            ));
             // A fixed unmap completed, then the replacement map was refused.
             let result: Result<(), i32> =
                 unmap_range_with(&mut lease, 0x4000, 0x6000, |_, _| Ok(()));
@@ -2577,7 +2593,7 @@ mod tests {
         // Parent mutates and exits; child retains its exact fork snapshot.
         {
             let mut db = mm_db().lock();
-            let parent = db.get_mut(&parent_pid).unwrap();
+            let parent = db.get_mut(&parent_pid).unwrap().as_mut().unwrap();
             remove_vma_range(parent, 0x30_0000, 0x30_4000);
         }
         handle_process_exit_pid(parent_pid);
@@ -2585,6 +2601,7 @@ mod tests {
         let child_vmas: Vec<MmVma> = mm_db()
             .lock()
             .get(&child_pid)
+            .and_then(Option::as_ref)
             .expect("child should inherit parent MM policy on fork")
             .vmas
             .iter()

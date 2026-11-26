@@ -220,22 +220,22 @@ fn apply(locks: &[Lock], owner: Owner, op: LockOp, start: u64, end: u64) -> Vec<
 }
 
 fn coalesce(locks: &mut Vec<Lock>) {
-    locks.sort_by_key(|l| (l.owner, l.kind, l.start, l.end));
-    let mut merged: Vec<Lock> = Vec::with_capacity(locks.len());
-    for l in locks.drain(..) {
-        match merged.last_mut() {
-            Some(last)
-                if last.owner == l.owner
-                    && last.kind == l.kind
-                    && l.start <= last.end.saturating_add(1) =>
-            {
-                last.end = last.end.max(l.end);
-            }
-            _ => merged.push(l),
+    locks.sort_unstable_by_key(|l| (l.owner, l.kind, l.start, l.end));
+    // Vec::dedup_by supplies the later element first and keeps the earlier
+    // one. Merge into that retained slot without a second allocation or copy
+    // of the entire lock table. Equal sort keys have identical semantics.
+    locks.dedup_by(|next, previous| {
+        if previous.owner == next.owner
+            && previous.kind == next.kind
+            && next.start <= previous.end.saturating_add(1)
+        {
+            previous.end = previous.end.max(next.end);
+            true
+        } else {
+            false
         }
-    }
-    merged.sort_by_key(|l| (l.start, l.end, l.owner, l.kind));
-    *locks = merged;
+    });
+    locks.sort_unstable_by_key(|l| (l.start, l.end, l.owner, l.kind));
 }
 
 impl LockTable {
@@ -267,6 +267,7 @@ impl LockTable {
         self.files
             .get(&key)?
             .iter()
+            .take_while(|l| l.start <= end)
             .find(|l| conflicts(l, owner, kind, start, end))
             .copied()
     }
@@ -402,18 +403,13 @@ impl LockTable {
     }
 
     fn retain_locks(&mut self, mut keep: impl FnMut(&FileKey, &Lock) -> bool) {
-        let mut emptied = Vec::new();
-        for (key, locks) in self.files.iter_mut() {
+        let total = &mut self.total;
+        self.files.retain(|key, locks| {
             let before = locks.len();
             locks.retain(|l| keep(key, l));
-            self.total -= before - locks.len();
-            if locks.is_empty() {
-                emptied.push(*key);
-            }
-        }
-        for key in emptied {
-            self.files.remove(&key);
-        }
+            *total -= before - locks.len();
+            !locks.is_empty()
+        });
     }
 
     /// POSIX: the process closed some fd of `key`, so all of its record locks
@@ -459,8 +455,11 @@ impl LockTable {
     fn blocking_pids(&self, key: FileKey, owner: Owner, kind: LockKind, start: u64, end: u64) -> Vec<u64> {
         let mut pids: Vec<u64> = Vec::new();
         for l in self.files.get(&key).into_iter().flatten() {
+            if l.start > end || pids.len() == MAX_VERIFY_PIDS {
+                break;
+            }
             if let Owner::Process(pid) = l.owner {
-                if conflicts(l, owner, kind, start, end) && !pids.contains(&pid) && pids.len() < MAX_VERIFY_PIDS {
+                if conflicts(l, owner, kind, start, end) && !pids.contains(&pid) {
                     pids.push(pid);
                 }
             }
@@ -783,6 +782,27 @@ mod tests {
             .filter(|l| l.owner == owner)
             .map(|l| (l.kind, l.start, l.end))
             .collect()
+    }
+
+    #[test]
+    fn coalescing_preserves_owner_kind_and_infinite_end_with_canonical_order() {
+        let mut locks = alloc::vec![
+            Lock { owner: A, kind: LockKind::Read, start: 20, end: u64::MAX },
+            Lock { owner: B, kind: LockKind::Read, start: 0, end: 9 },
+            Lock { owner: A, kind: LockKind::Write, start: 4, end: 8 },
+            Lock { owner: A, kind: LockKind::Read, start: 10, end: 19 },
+            Lock { owner: A, kind: LockKind::Read, start: 12, end: 15 },
+            Lock { owner: A, kind: LockKind::Read, start: 0, end: 9 },
+        ];
+        coalesce(&mut locks);
+        assert_eq!(locks, [
+            Lock { owner: B, kind: LockKind::Read, start: 0, end: 9 },
+            Lock { owner: A, kind: LockKind::Read, start: 0, end: u64::MAX },
+            Lock { owner: A, kind: LockKind::Write, start: 4, end: 8 },
+        ]);
+        let once = locks.clone();
+        coalesce(&mut locks);
+        assert_eq!(locks, once);
     }
 
     #[test]

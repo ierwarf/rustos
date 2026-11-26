@@ -30,6 +30,7 @@ pub mod release_bundle;
 pub mod trust_anchor;
 pub mod snapshot_protocol;
 pub mod launch_leases;
+pub mod windows_strings;
 pub use request_strings::RequestStrings;
 
 use core::mem::size_of;

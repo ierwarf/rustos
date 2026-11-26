@@ -8,6 +8,7 @@
 //! refunds. It lives as part of rootd's single-threaded supervisor control
 //! state, and all mutations pass through the same message receiver.
 use alloc::vec::Vec;
+use alloc::collections::VecDeque;
 
 const MAX_SESSIONS: usize = 256;
 const EINVAL: i32 = 22;
@@ -34,7 +35,7 @@ struct Retired {
 
 pub(crate) struct SessionLedger {
     entries: Vec<Accounted>,
-    retired: Vec<Retired>,
+    retired: VecDeque<Retired>,
     last_token: u64,
     /// Live authenticated sessiond generation, named by exact reporter PID.
     owner_pid: u64,
@@ -44,7 +45,7 @@ impl SessionLedger {
     pub(crate) fn new() -> Self {
         Self {
             entries: Vec::new(),
-            retired: Vec::new(),
+            retired: VecDeque::new(),
             last_token: 0,
             owner_pid: 0,
         }
@@ -140,9 +141,9 @@ impl SessionLedger {
     /// the refund has committed.
     fn push_receipt(&mut self, receipt: Retired) {
         if self.retired.len() >= MAX_SESSIONS {
-            self.retired.remove(0);
+            self.retired.pop_front();
         }
-        self.retired.push(receipt);
+        self.retired.push_back(receipt);
     }
 
     /// The JobId was captured at admission. Never rediscover the Job by a PID
@@ -353,5 +354,22 @@ mod tests {
             Err(ENOSPC)
         );
         assert_eq!(book.release_all(|_, _, _| Ok(())), Ok(MAX_SESSIONS));
+    }
+
+    #[test]
+    fn full_receipt_ring_evicts_oldest_only_after_a_successful_refund() {
+        let mut book = SessionLedger::new();
+        for token in 1..=MAX_SESSIONS as u64 {
+            book.charge(token, token, |pid| Ok(pid), |_, _| Ok(())).unwrap();
+            book.release(token, token, |_, _, _| Ok(())).unwrap();
+        }
+        let next = MAX_SESSIONS as u64 + 1;
+        book.charge(next, next, |pid| Ok(pid), |_, _| Ok(())).unwrap();
+        assert_eq!(book.release(next, next, |_, _, _| Err(11)), Err(11));
+        assert_eq!(book.release(1, 1, |_, _, _| panic!("duplicate refund")), Ok(1));
+        assert_eq!(book.release(next, next, |_, _, _| Ok(())), Ok(next));
+        assert_eq!(book.release(1, 1, |_, _, _| panic!("evicted receipt")), Err(ESTALE));
+        assert_eq!(book.release(2, 2, |_, _, _| panic!("duplicate refund")), Ok(2));
+        assert_eq!(book.release(next, 1, |_, _, _| panic!("foreign refund")), Err(EACCES));
     }
 }

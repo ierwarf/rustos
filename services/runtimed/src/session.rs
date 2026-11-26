@@ -386,27 +386,22 @@ impl Default for TtySessionState {
 
 impl TtySessionState {
     fn read_input(&mut self, dest: &mut [u8]) -> usize {
-        let mut read = 0usize;
-        while read < dest.len() {
-            let Some(byte) = self.input.pop_front() else {
-                break;
-            };
-            dest[read] = byte;
-            read += 1;
-        }
+        let read = copy_ring_bytes(&self.input, 0, dest);
+        self.input.drain(..read);
         read
     }
 
     fn write(&mut self, bytes: &[u8]) -> usize {
         if self.termios.maps_output_newline_to_crlf() {
-            let mut previous = None;
-            for &byte in bytes {
-                if byte == b'\n' && previous != Some(b'\r') {
+            let mut start = 0;
+            for (index, &byte) in bytes.iter().enumerate() {
+                if byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r') {
+                    self.push_output_bytes(&bytes[start..index]);
                     self.push_output(b'\r');
+                    start = index;
                 }
-                self.push_output(byte);
-                previous = Some(byte);
             }
+            self.push_output_bytes(&bytes[start..]);
         } else {
             self.push_output_bytes(bytes);
         }
@@ -416,10 +411,7 @@ impl TtySessionState {
     fn snapshot_output(&self, dest: &mut [u8]) -> usize {
         let count = dest.len().min(self.output.len());
         let skip = self.output.len().saturating_sub(count);
-        for (idx, byte) in self.output.iter().skip(skip).take(count).enumerate() {
-            dest[idx] = *byte;
-        }
-        count
+        copy_ring_bytes(&self.output, skip, dest)
     }
 
     /// Apply one keystroke, reporting whether it changed what the console shows.
@@ -533,9 +525,9 @@ impl TtySessionState {
         if self.should_echo_canonical_input() {
             self.push_output_bytes(b"\r\n");
         }
-        let edit = core::mem::take(&mut self.edit);
-        self.push_input_bytes(&edit);
-        self.push_input_bytes(b"\n");
+        self.input.extend(self.edit.iter().copied());
+        self.input.push_back(b'\n');
+        self.edit.clear();
         self.edit_cursor = 0;
     }
 
@@ -545,8 +537,9 @@ impl TtySessionState {
             self.edit.clear();
             self.edit_cursor = 0;
         } else if self.termios.is_canonical() && !termios.is_canonical() {
-            let edit = core::mem::take(&mut self.edit);
-            self.push_input_bytes(&edit);
+            let room = INPUT_BUFFER_CAPACITY.saturating_sub(self.input.len());
+            self.input.extend(self.edit.iter().copied().take(room));
+            self.edit.clear();
             self.edit_cursor = 0;
         }
         self.termios = termios;
@@ -605,15 +598,21 @@ impl TtySessionState {
 
     fn push_input_bytes(&mut self, bytes: &[u8]) {
         let room = INPUT_BUFFER_CAPACITY.saturating_sub(self.input.len());
-        for &byte in bytes.iter().take(room) {
-            self.input.push_back(byte);
-        }
+        self.input.extend(&bytes[..bytes.len().min(room)]);
     }
 
     fn push_output_bytes(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.push_output(byte);
+        // Keep only the visible suffix, evicting the old prefix once instead
+        // of rotating the ring for every byte of a large write. Even bytes
+        // immediately evicted by this write count toward the change token.
+        let retained = bytes.len().min(OUTPUT_BUFFER_CAPACITY);
+        let evicted = self.output.len().saturating_add(retained)
+            .saturating_sub(OUTPUT_BUFFER_CAPACITY);
+        if evicted != 0 {
+            self.output.drain(..evicted);
         }
+        self.output.extend(&bytes[bytes.len() - retained..]);
+        self.output_writes = self.output_writes.wrapping_add(bytes.len() as u64);
     }
 
     fn push_output(&mut self, byte: u8) {
@@ -621,12 +620,26 @@ impl TtySessionState {
             let _ = self.output.pop_front();
         }
         self.output.push_back(byte);
-        // Counted here rather than at the call sites, for the same reason the
-        // graph edge is published inside `advance_graph_generation`: every
-        // write to the visible buffer goes through this one method, so the
-        // record of it cannot be forgotten by a new caller.
+        // Both byte and slice append paths advance the counter themselves;
+        // callers do not have to reconstruct it from the ring's bounded size.
         self.output_writes = self.output_writes.wrapping_add(1);
     }
+}
+
+/// Copy a logical ring range with at most two contiguous copies. Neither a
+/// read nor an output snapshot needs to rotate or allocate the source ring.
+fn copy_ring_bytes(ring: &VecDeque<u8>, start: usize, dest: &mut [u8]) -> usize {
+    let count = dest.len().min(ring.len().saturating_sub(start));
+    if count == 0 {
+        return 0;
+    }
+    let (head, tail) = ring.as_slices();
+    let head_start = start.min(head.len());
+    let head_count = count.min(head.len() - head_start);
+    dest[..head_count].copy_from_slice(&head[head_start..head_start + head_count]);
+    let tail_start = start.saturating_sub(head.len());
+    dest[head_count..count].copy_from_slice(&tail[tail_start..tail_start + count - head_count]);
+    count
 }
 
 fn input_event_text_byte(event: InputEvent) -> Result<u8, i32> {
@@ -2326,5 +2339,92 @@ mod tests {
         let mut out = [0_u8; 16];
         let count = tty.snapshot_output(&mut out);
         assert_eq!(&out[..count], b"\x1b[D\x1b[12C");
+    }
+
+    #[test]
+    fn ring_reads_and_snapshots_preserve_wrapped_order_and_destination_tail() {
+        let mut ring = std::collections::VecDeque::with_capacity(8);
+        ring.extend(b"abcdefgh");
+        ring.drain(..5);
+        ring.extend(b"ijklm");
+        for start in 0..=ring.len() + 1 {
+            for capacity in 0..=ring.len() + 2 {
+                let expected: Vec<u8> = ring.iter().skip(start).take(capacity).copied().collect();
+                let mut dest = vec![0xa5; capacity];
+                let count = super::copy_ring_bytes(&ring, start, &mut dest);
+                assert_eq!(count, expected.len());
+                assert_eq!(&dest[..count], expected.as_slice());
+                assert!(dest[count..].iter().all(|byte| *byte == 0xa5));
+            }
+        }
+        let mut tty = super::TtySessionState::default();
+        tty.input = ring.clone();
+        tty.output = ring;
+        let mut dest = [0_u8; 4];
+        assert_eq!(tty.read_input(&mut dest), 4);
+        assert_eq!(&dest, b"fghi");
+        assert_eq!(tty.read_input(&mut dest), 4);
+        assert_eq!(&dest, b"jklm");
+        assert_eq!(tty.read_input(&mut dest), 0);
+        assert_eq!(tty.snapshot_output(&mut dest), 4);
+        assert_eq!(&dest, b"jklm");
+    }
+
+    #[test]
+    fn bulk_output_keeps_the_visible_suffix_and_counts_every_written_byte() {
+        let mut tty = super::TtySessionState::default();
+        tty.push_output_bytes(b"old output");
+        tty.output_writes = u64::MAX - 1;
+        let bytes: Vec<u8> = (0..OUTPUT_BUFFER_CAPACITY * 2 + 3)
+            .map(|index| (index % 251) as u8).collect();
+        tty.push_output_bytes(&bytes);
+        let mut snapshot = vec![0; OUTPUT_BUFFER_CAPACITY];
+        assert_eq!(tty.snapshot_output(&mut snapshot), OUTPUT_BUFFER_CAPACITY);
+        assert_eq!(snapshot, bytes[bytes.len() - OUTPUT_BUFFER_CAPACITY..]);
+        assert_eq!(tty.output_writes, (u64::MAX - 1).wrapping_add(bytes.len() as u64));
+        tty.push_output_bytes(b"tail");
+        tty.snapshot_output(&mut snapshot);
+        assert_eq!(&snapshot[OUTPUT_BUFFER_CAPACITY - 4..], b"tail");
+        assert_eq!(&snapshot[..OUTPUT_BUFFER_CAPACITY - 4],
+            &bytes[bytes.len() - OUTPUT_BUFFER_CAPACITY + 4..]);
+    }
+
+    #[test]
+    fn bulk_newline_mapping_preserves_crlf_and_per_write_boundaries() {
+        let mut tty = super::TtySessionState::default();
+        assert_eq!(tty.write(b"a\nb\r\nc\n\n"), 8);
+        tty.write(b"\r");
+        tty.write(b"\n");
+        let mut dest = [0_u8; 32];
+        let count = tty.snapshot_output(&mut dest);
+        assert_eq!(&dest[..count], b"a\r\nb\r\nc\r\n\r\n\r\r\n");
+        assert_eq!(tty.output_writes, count as u64);
+    }
+
+    #[test]
+    fn canonical_commits_reuse_edit_storage_and_raw_transition_stays_bounded() {
+        let mut tty = super::TtySessionState::default();
+        tty.edit.extend_from_slice(b"command");
+        tty.edit_cursor = tty.edit.len();
+        let capacity = tty.edit.capacity();
+        tty.commit_line();
+        assert_eq!(tty.edit.capacity(), capacity);
+        assert!(tty.edit.is_empty());
+        let mut line = [0_u8; 8];
+        assert_eq!(tty.read_input(&mut line), 8);
+        assert_eq!(&line, b"command\n");
+
+        tty.input.resize(super::INPUT_BUFFER_CAPACITY - 2, b'x');
+        tty.edit.extend_from_slice(b"abcd");
+        tty.edit_cursor = 4;
+        let mut raw = tty.termios;
+        raw.c_lflag &= !rustos_user_abi::linux::ICANON;
+        tty.set_termios(raw, false);
+        assert_eq!(tty.input.len(), super::INPUT_BUFFER_CAPACITY);
+        assert_eq!(tty.input.pop_back(), Some(b'b'));
+        assert_eq!(tty.input.pop_back(), Some(b'a'));
+        assert!(tty.edit.is_empty());
+        assert_eq!(tty.edit.capacity(), capacity);
+        assert_eq!(tty.edit_cursor, 0);
     }
 }

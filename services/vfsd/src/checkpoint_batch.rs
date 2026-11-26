@@ -174,8 +174,9 @@ pub fn commit_ordered<M: CheckpointMirror, T: CheckpointTransport>(
     }
 
     let mut rest = pending.as_slice();
+    let mut framed = Vec::new();
     while !rest.is_empty() {
-        let mut framed = Vec::new();
+        framed.clear();
         let mut count = 0;
         for record in rest.iter().take(SERVICE_CHECKPOINT_BATCH_MAX_RECORDS) {
             let before = framed.len();

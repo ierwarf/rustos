@@ -33,8 +33,9 @@ library as replacing the existing rootd/Job/IPC authorities.
   A conflicting live lease is denied, including when an old exit report is
   delayed. Existing kernel-stamped sender identity is still authoritative.
 - `rootd::ServiceCheckpointStore` grows records on demand rather than
-  reserving all 32,768 slots during bootstrap; failed checkpoint or scan
-  allocations return ENOMEM instead of panicking. This is still an
+  reserving all 32,768 slots during bootstrap; fallible record-vector and scan
+  reservations return ENOMEM. B-tree index insertion retains the standard
+  allocator-failure behavior. This is still an
   **in-memory** restart checkpoint, not durable crash storage.
 - Ring3 IDL schemas are authored in `schemas/ring3/control.json` and
   converted deterministically to no_std Rust field definitions by
@@ -59,10 +60,20 @@ library as replacing the existing rootd/Job/IPC authorities.
   checkpoint trees. Exact per-service keys cannot be silently reparented,
   ancestor tombstones mark their **entire descendant closure** atomically,
   and compaction removes only an exact, already-tombstoned subtree.
-  Per-service storage has a 4096-record cap below the unchanged global
+  Per-service storage has a 16384-record cap below the unchanged global
   32768-record ABI limit. A fallible, bounded bitmap keeps descendant
   selection independent of nesting depth; the control plane is still
   in-memory and is not persistent crash storage.
+- Journaled COMPACT computes its exact descendant selection once before the
+  journal append and applies that same selection afterward. Its commit phase
+  compacts the record vector and rewrites survivor index values in place;
+  it does not allocate a second selection bitmap after journaling. SCAN
+  traverses each selected record once and retains canonical record order.
+- `Builder::append_to` and checkpoint `append_framed` encode directly into a
+  caller-owned buffer. All message limits and header offsets are relative to
+  the new record, not earlier frames. Any returned error restores the exact
+  prior prefix and length; already acquired capacity may remain for reuse.
+  The existing standalone builder and checkpoint wire schemas are unchanged.
 - The production `runtimed` console-session owner now limits live
   console sessions to 256, returns ENOSPC on resource saturation, refuses
   zero handles, and never wraps the externally visible u64 session identity.

@@ -137,8 +137,9 @@ struct Node {
 }
 
 fn read_dir_locked(st: &State, ino: u64) -> Result<Vec<FsDirEntry>, FsError> {
-    let mut out = Vec::new();
-    for (name, link) in st.dir(ino)? {
+    let entries = st.dir(ino)?;
+    let mut out = Vec::with_capacity(entries.len());
+    for (name, link) in entries {
         let meta = st.metadata_of(link.node)?;
         out.push(FsDirEntry {
             cookie: link.cookie,
@@ -197,16 +198,32 @@ fn pages(len: u64) -> u64 {
     len.div_ceil(CHUNK as u64)
 }
 
-fn split_path(path: &str) -> Result<Vec<&str>, FsError> {
-    let mut out = Vec::new();
+/// A fully validated path view. Keep validation before namespace lookup (and
+/// before taking the state lock), without allocating a component vector for
+/// every metadata, open or I/O request.
+struct PathComponents<'a> {
+    path: &'a str,
+}
+
+impl<'a> PathComponents<'a> {
+    fn is_empty(&self) -> bool {
+        self.path.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &'a str> {
+        self.path.split('/').filter(|part| !part.is_empty())
+    }
+}
+
+fn split_path(path: &str) -> Result<PathComponents<'_>, FsError> {
+    let path = path.trim_matches('/');
     for part in path.split('/') {
         if part.is_empty() {
             continue;
         }
         check_name(part)?;
-        out.push(part);
     }
-    Ok(out)
+    Ok(PathComponents { path })
 }
 
 fn check_name(name: &str) -> Result<(), FsError> {
@@ -245,18 +262,21 @@ impl State {
 
     /// Resolves `comps` without following symlinks (a symlink in a non-final
     /// position is `NotADirectory`; the caller resolves links beforehand).
-    fn walk(&self, comps: &[&str]) -> Result<u64, FsError> {
+    fn walk(&self, comps: &PathComponents<'_>) -> Result<u64, FsError> {
         let mut cur = ROOT_NODE;
-        for name in comps {
-            cur = self.dir(cur)?.get(*name).ok_or(FsError::NotFound)?.node;
+        for name in comps.iter() {
+            cur = self.dir(cur)?.get(name).ok_or(FsError::NotFound)?.node;
         }
         Ok(cur)
     }
 
     /// Splits off the final component: `(parent_dir_node, name)`.
-    fn parent_of<'a>(&self, comps: &[&'a str]) -> Result<(u64, &'a str), FsError> {
-        let (name, dirs) = comps.split_last().ok_or(FsError::InvalidInput)?;
-        let parent = self.walk(dirs)?;
+    fn parent_of<'a>(&self, comps: &PathComponents<'a>) -> Result<(u64, &'a str), FsError> {
+        if comps.is_empty() {
+            return Err(FsError::InvalidInput);
+        }
+        let (dirs, name) = comps.path.rsplit_once('/').unwrap_or(("", comps.path));
+        let parent = self.walk(&PathComponents { path: dirs })?;
         self.dir(parent)?;
         Ok((parent, name))
     }
@@ -315,10 +335,11 @@ impl State {
             return Err(FsError::NoSpace);
         }
         let is_dir = matches!(body, Body::Dir(_));
+        let cookie = self.next_dir_cookie()?;
         if let Body::Symlink(target) = &body {
+            // Cookie exhaustion must not leak a symlink's quota charge.
             self.charge(target.len() as u64)?;
         }
-        let cookie = self.next_dir_cookie()?;
         let ino = self.next_node;
         self.next_node += 1;
         self.nodes.insert(
@@ -398,18 +419,26 @@ impl State {
             return Ok(0);
         }
         let count = (len - offset).min(out.len() as u64) as usize;
-        let mut done = 0usize;
-        while done < count {
-            let pos = offset + done as u64;
-            let idx = pos / CHUNK as u64;
-            let within = (pos % CHUNK as u64) as usize;
-            let n = (CHUNK - within).min(count - done);
-            match chunks.get(&idx) {
-                Some(chunk) => out[done..done + n].copy_from_slice(&chunk[within..within + n]),
-                None => out[done..done + n].fill(0),
-            }
-            done += n;
+        if count == 0 {
+            return Ok(0);
         }
+        let end = offset + count as u64;
+        let mut done = 0usize;
+        // Visit only allocated pages in the requested range. Missing runs are
+        // zeroed together, while dense runs advance one B-tree iterator rather
+        // than repeating a root-to-leaf lookup for every page.
+        for (&idx, chunk) in chunks.range(offset / CHUNK as u64..=(end - 1) / CHUNK as u64) {
+            let page_start = idx * CHUNK as u64;
+            let copy_start = page_start.max(offset);
+            let copy_end = (page_start + CHUNK as u64).min(end);
+            let out_start = (copy_start - offset) as usize;
+            let out_end = (copy_end - offset) as usize;
+            let within = (copy_start - page_start) as usize;
+            out[done..out_start].fill(0);
+            out[out_start..out_end].copy_from_slice(&chunk[within..within + out_end - out_start]);
+            done = out_end;
+        }
+        out[done..count].fill(0);
         Ok(count)
     }
 
@@ -448,17 +477,27 @@ impl State {
             let idx = pos / CHUNK as u64;
             let within = (pos % CHUNK as u64) as usize;
             let n = (CHUNK - within).min(data.len() - done);
-            let chunk = match chunks.entry(idx) {
-                Entry::Occupied(slot) => slot.into_mut(),
+            match chunks.entry(idx) {
+                Entry::Occupied(slot) => {
+                    slot.into_mut()[within..within + n].copy_from_slice(&data[done..done + n]);
+                }
                 Entry::Vacant(slot) => {
                     if used_bytes.saturating_add(CHUNK as u64) > *quota_bytes {
                         break;
                     }
                     *used_bytes += CHUNK as u64;
-                    slot.insert(vec![0u8; CHUNK].into_boxed_slice())
+                    let chunk = if within == 0 && n == CHUNK {
+                        // All bytes are supplied: do not zero a page that is
+                        // immediately overwritten by the incoming data.
+                        data[done..done + n].to_vec().into_boxed_slice()
+                    } else {
+                        let mut chunk = vec![0u8; CHUNK].into_boxed_slice();
+                        chunk[within..within + n].copy_from_slice(&data[done..done + n]);
+                        chunk
+                    };
+                    slot.insert(chunk);
                 }
-            };
-            chunk[within..within + n].copy_from_slice(&data[done..done + n]);
+            }
             done += n;
         }
         if done == 0 {
@@ -607,7 +646,7 @@ impl State {
         Ok(out)
     }
 
-    fn remove_entry(&mut self, path: &[&str], want_dir: bool, now: FsTimestamp) -> Result<(), FsError> {
+    fn remove_entry(&mut self, path: &PathComponents<'_>, want_dir: bool, now: FsTimestamp) -> Result<(), FsError> {
         let (parent, name) = self.parent_of(path)?;
         let child = self.dir(parent)?.get(name).ok_or(FsError::NotFound)?.node;
         let is_dir = matches!(self.nodes.get(&child).ok_or(FsError::NotFound)?.body, Body::Dir(_));
@@ -638,8 +677,8 @@ impl State {
 
     fn rename(
         &mut self,
-        src: &[&str],
-        dst: &[&str],
+        src: &PathComponents<'_>,
+        dst: &PathComponents<'_>,
         replace_existing: bool,
         no_replace: bool,
         now: FsTimestamp,
@@ -807,7 +846,14 @@ impl FsVolume for TmpFs {
 
     fn canonical_key(&self, path: &str) -> Result<String, FsError> {
         let comps = split_path(path)?;
-        Ok(comps.join("/"))
+        let mut key = String::with_capacity(comps.path.len());
+        for part in comps.iter() {
+            if !key.is_empty() {
+                key.push('/');
+            }
+            key.push_str(part);
+        }
+        Ok(key)
     }
 
     fn metadata(&self, path: &str) -> Result<FsMetadata, FsError> {
@@ -1386,7 +1432,7 @@ fn chown_locked(
 fn link_node_locked(
     st: &mut State,
     ino: u64,
-    to: &[&str],
+    to: &PathComponents<'_>,
     now: FsTimestamp,
 ) -> Result<(), FsError> {
     let (parent, name) = st.parent_of(to)?;
@@ -1808,6 +1854,70 @@ mod tests {
         fs.mkdir(&"y".repeat(255)).unwrap();
         assert_eq!(fs.mkdir(""), Err(FsError::AlreadyExists));
         assert_eq!(fs.unlink(""), Err(FsError::IsADirectory));
+    }
+
+    #[test]
+    fn borrowed_path_walk_preserves_separators_names_and_validation_order() {
+        let fs = fs();
+        fs.mkdir("///한글///").unwrap();
+        let ino = put(&fs, "//한글///file///", b"bytes");
+        assert_eq!(fs.metadata("한글/file").unwrap().node_id, ino);
+        assert_eq!(fs.canonical_key("//한글///file///").unwrap(), "한글/file");
+        fs.rename("/한글//file/", "한글///renamed//", true, false).unwrap();
+        fs.link("//한글/renamed", "한글//alias/").unwrap();
+        assert_eq!(read_all(&fs, "한글///alias"), b"bytes");
+        assert_eq!(fs.metadata("missing/../file"), Err(FsError::InvalidInput));
+        assert_eq!(fs.metadata(&alloc::format!("missing/{}", "x".repeat(256))), Err(FsError::NameTooLong));
+        assert_eq!(fs.canonical_key("////").unwrap(), "");
+    }
+
+    #[test]
+    fn cookie_exhaustion_does_not_charge_or_publish_a_symlink() {
+        let fs = fs();
+        fs.state.lock().next_dir_cookie = crate::directory::FILE_COOKIE_BASE;
+        let before = fs.used_bytes();
+        assert_eq!(fs.symlink("target", "link"), Err(FsError::NoSpace));
+        assert_eq!(fs.used_bytes(), before);
+        assert_eq!(fs.node_count(), 1);
+        assert_eq!(fs.metadata("link"), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn sparse_read_covers_partial_pages_hole_runs_and_eof_without_touching_tail() {
+        let fs = fs();
+        put(&fs, "sparse", &vec![0x31; CHUNK]);
+        fs.write_at("sparse", (CHUNK * 4 + 19) as u64, b"tail").unwrap();
+        fs.truncate("sparse", (CHUNK * 7 + 13) as u64).unwrap();
+        let mut expected = vec![0; CHUNK * 7 + 13];
+        expected[..CHUNK].fill(0x31);
+        expected[CHUNK * 4 + 19..CHUNK * 4 + 23].copy_from_slice(b"tail");
+        for (start, capacity) in [
+            (17, CHUNK * 8),
+            (CHUNK + 7, CHUNK * 4 + 21),
+            (CHUNK * 4 + 20, 2),
+            (CHUNK * 7 + 13, 23),
+            (0, 0),
+        ] {
+            let mut output = vec![0xa5; capacity];
+            let count = fs.read_at("sparse", start as u64, &mut output).unwrap();
+            let wanted = (expected.len() - start).min(capacity);
+            assert_eq!(count, wanted);
+            assert_eq!(&output[..count], &expected[start..start + count]);
+            assert!(output[count..].iter().all(|&byte| byte == 0xa5));
+        }
+    }
+
+    #[test]
+    fn aligned_and_partial_page_writes_preserve_short_write_quota() {
+        let fs = fs_with((CHUNK * 2) as u64, 10);
+        put(&fs, "f", &vec![0x17; CHUNK]);
+        let input = vec![0x29; CHUNK * 2 + 6];
+        assert_eq!(fs.write_at("f", (CHUNK - 3) as u64, &input).unwrap(),
+            (CHUNK + 3, (CHUNK * 2) as u64));
+        let bytes = read_all(&fs, "f");
+        assert!(bytes[..CHUNK - 3].iter().all(|&byte| byte == 0x17));
+        assert!(bytes[CHUNK - 3..].iter().all(|&byte| byte == 0x29));
+        assert_eq!(fs.used_bytes(), (CHUNK * 2) as u64);
     }
 
     #[test]
