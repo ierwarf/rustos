@@ -6,30 +6,78 @@
 
 Every address space owns:
 
-- a monotonically increasing TLB generation;
+- a monotonically increasing TLB generation (the implementation shares a
+  counter between roots on one mutation stripe; a collision may add a flush,
+  never suppress one);
 - scheduler/process-generation references that keep the unique
   `ProcessAddressSpace` alive;
-- an acquire/release per-CPU active-root publication;
+- a per-CPU active-root publication, ordered against the generation read for
+  tagged CR3 activation;
 - a bounded shootdown token containing address-space identity, generation,
   range/full mode, target mask, and acknowledgement mask;
 - deferred physical-frame reclamation tied to the acknowledged generation.
 
-The required mutation/retirement sequence is:
+The required invalidating mutation/retirement sequence is:
 
 1. validate the entire mapping operation and reserve fallible bookkeeping;
 2. mutate PTEs and advance the address-space generation under its mutation
    lock;
 3. for retirement, first prove every task/slot/process reference has been
    detached and no CPU can publish that root again;
-4. after the page-table edit, snapshot CPUs whose release-published active root
-   matches an address-space mutation; a changed activation writes CR3 before
-   publishing, while global mappings and retirement still target every
-   shootdown-eligible CPU;
-5. publish the token, release the mutation/raw lock, and send typed IPIs;
+4. after the page-table edit, snapshot CPUs whose published active root
+   matches an address-space mutation; global mappings and retirement still
+   target every shootdown-eligible CPU;
+5. publish the token and send typed IPIs while retaining mutation serialization;
 6. invalidate locally and on every target;
-7. wait outside raw locks for generation-matched acknowledgements;
+7. wait for generation-matched acknowledgements, servicing this CPU's incoming
+   requests without acquiring another mutation lock;
 8. reclaim page-table or mapped frames only after all required CPUs
    acknowledge.
+
+Untagged activation writes CR3 before publishing its root. Tagged activation
+publishes the new root, executes its full ordering barrier, then samples the
+stripe generation before deciding whether CR3 may retain that PCID's entries.
+The sender advances the generation and executes the matching barrier before
+sampling roots. These are sequentially consistent operations: an activation
+racing a mutation either sees the advanced generation and flushes or becomes
+an explicit target. Acquire/release publication alone does not establish this
+store/load ordering. Same-root activation, global invalidation, retirement and
+online admission retain their separate obligations.
+
+An additive transaction may consume its guard with the unsafe
+`finish_without_flush` API only when it changed nothing or every changed entry
+was non-present and becomes present. All backing and descendant tables must
+be initialized before publication; any prior present incarnation must already
+have completed its invalidation. This completion cannot change permissions of
+a present ancestor, replace a present leaf, split/collapse a page size, change
+cache attributes, or reclaim formerly reachable memory. It preserves existing
+PCID translations without increasing the generation or broadcasting IPIs.
+The ordinary destructor and `flush_for_reclaim` remain invalidating paths;
+the latter retains serialization until frame ownership and backing are freed.
+
+The request service pins its own CPU with interrupts masked from pending-bit
+claim through local invalidation and release acknowledgement. This applies to
+polling during lock acquisition as well as IPI entry: acquisition waiters may
+have re-enabled interrupts, so an unguarded software poll could otherwise
+overlap a context switch or another TLB handler. Each CPU alone updates its
+PCID applied generations inside that bracket. Empty polls use an acquire read
+before exchanging the pending word. Per-CPU roots, PCID binding rows and
+pending words, and independent mutation locks/generation stripes occupy
+separate cache lines. Target APIC identities come from the published lifecycle
+registry rather than the ACPI discovery mutex; shootdown eligibility is still
+the existing independent admission bit.
+
+The 2026-11-27 paging/SMP batch has source review only. The revised protocol,
+source-contract anchors and regression source cases have not been compiled,
+executed under a formal runner, or qualified on hardware/KVM in that batch;
+there is no measured speedup claim.
+
+Primary references for these two distinct ordering rules are
+[Intel SDM Volume 3A, section 5.10.4.3](https://cdrdv2-public.intel.com/843856/253668-sdm-vol-3a-dec-24.pdf)
+(non-present-to-present updates and the previous-incarnation footnote) and
+[Linux's switch-mm ordering correction](https://kernel.googlesource.com/pub/scm/linux/kernel/git/stable/stable-queue/+/9861e7d404e2a620d1b97b528304892e331d2879/releases/6.17.5/x86-mm-fix-smp-ordering-in-switch_mm_irqs_off.patch)
+(the loaded-root publication must be fully ordered before reading the TLB
+generation).
 
 Range invalidation may be selected only by a measured threshold. Correctness
 never depends on that threshold. A missing acknowledgement triggers a 100 ms

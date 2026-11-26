@@ -22,6 +22,9 @@
 //! from private-file/section COW and carries an opaque backing identity for the
 //! latter, so Linux `MAP_PRIVATE` and Windows write-copy sections do not need a
 //! second physical-ownership design.
+//! An exclusive 2 MiB head may hold a root-owned split-table deposit in its
+//! otherwise-unused backing word. Demotion detaches it before ordinary 4 KiB
+//! sharing, rekeying or release can repurpose that descriptor.
 //!
 //! The shared-record pool contains one record per physical frame. Keeping the
 //! first mapping inline means that budget admits a complete two-way fork of
@@ -36,6 +39,7 @@ use super::PAGE_SIZE;
 use crate::memory::{charge, kmem_charge};
 
 mod api;
+mod anon_run;
 mod encoding;
 pub use api::*;
 use encoding::*;
@@ -174,6 +178,8 @@ pub struct FrameDescriptorRecord {
     owner_or_table_head: AtomicU64,
     next_or_virtual_address: AtomicU64,
     data_leaf_count_or_map_head: AtomicU64,
+    /// Root shared-leaf census, shared backing identity, or exclusive huge
+    /// head's deposited split-table frame. Zero for ordinary exclusive leaves.
     shared_backing_identity: AtomicU64,
 }
 
@@ -549,6 +555,11 @@ impl FrameDescriptorLedger {
             .expect("cancelled data leaf is outside frame descriptors");
         assert_eq!(frame.owner_or_table_head.load(Ordering::Relaxed), root_phys);
         assert_eq!(frame.next_or_virtual_address.load(Ordering::Relaxed), va);
+        assert_eq!(
+            frame.shared_backing_identity.load(Ordering::Relaxed),
+            0,
+            "cancelled anonymous huge leaf retained its split-table deposit"
+        );
         frame.owner_or_table_head.store(0, Ordering::Relaxed);
         frame.next_or_virtual_address.store(0, Ordering::Relaxed);
         assert_eq!(
@@ -612,6 +623,13 @@ impl FrameDescriptorLedger {
                 }
             }
             if !acquired {
+                self.release_mapping_record(mapping_id);
+                return None;
+            }
+            // A huge leaf must be demoted before a 4 KiB COW alias can replace
+            // its descriptor's split-table deposit with a backing identity.
+            if frame.shared_backing_identity.load(Ordering::Relaxed) != 0 {
+                frame.role.store(ROLE_EXCLUSIVE_DATA_LIVE, DESCRIPTOR_RELEASE);
                 self.release_mapping_record(mapping_id);
                 return None;
             }
@@ -902,6 +920,11 @@ impl FrameDescriptorLedger {
                                 }
                             }
                             if !acquired {
+                                self.release_mapping_record(mapping_id);
+                                return Err(SharedAliasRunError::InvalidFrameOwnership);
+                            }
+                            if frame.shared_backing_identity.load(Ordering::Relaxed) != 0 {
+                                frame.role.store(ROLE_EXCLUSIVE_DATA_LIVE, DESCRIPTOR_RELEASE);
                                 self.release_mapping_record(mapping_id);
                                 return Err(SharedAliasRunError::InvalidFrameOwnership);
                             }
@@ -1582,6 +1605,10 @@ impl FrameDescriptorLedger {
                     {
                         continue;
                     }
+                    if frame.shared_backing_identity.load(Ordering::Relaxed) != 0 {
+                        frame.role.store(ROLE_EXCLUSIVE_DATA_LIVE, DESCRIPTOR_RELEASE);
+                        return None;
+                    }
                     self.decrement_root_data_count_with(root);
                     frame.owner_or_table_head.store(0, Ordering::Relaxed);
                     frame.next_or_virtual_address.store(0, Ordering::Relaxed);
@@ -1657,6 +1684,10 @@ impl FrameDescriptorLedger {
                         .is_err()
                     {
                         continue;
+                    }
+                    if frame.shared_backing_identity.load(Ordering::Relaxed) != 0 {
+                        frame.role.store(ROLE_EXCLUSIVE_DATA_LIVE, DESCRIPTOR_RELEASE);
+                        return false;
                     }
                     frame
                         .next_or_virtual_address

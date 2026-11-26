@@ -9,7 +9,7 @@ path = "kernel/ps/src/multitask/scheduler/ipc_publication.rs"
 tokens = ["fn publish_with(", "frame_publication::read_for_identity(token, binding.id(), cpu)", "Publication::begin(scope, target)", "sync_handoff::publish_original(", "typed.publish_and_clear(", "claim_blocked_handoff_duty(slot, expected, target, local)", "bind_local_owner_generation(slot, original.generation)", "duty.publish_mailbox(runqueue::weight::value(slot))", "last_effect()", "drop(publication)", "drop(reader)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/return_architecture.rs"
-tokens = ["struct CurrentArchitecture<'a>", "current: &'a super::CurrentWait", "scope: &'a", "!super::ipc_publication::scoped(scope)", "current.original_pin()", "return_view(pin.slot())", "!view.user_mode_task", "retained_architecture(", "pin.slot(), pin.id(), view", "Some(Self { current, scope, state })", "fn install(self)", "self.current.cpu()", "self.scope.is_masked()", "load_address_space_phys(PhysAddr::new(self.state.root))", "set_privilege_stack(self.state.stack_top)", "set_kernel_stack_top(self.state.stack_top, self.state.register_ipc)", "install_segments(self.state, true)", "fn install_segments(", "DS::set_reg(selector)", "FsBase::write(VirtAddr::new(state.fs))", "prepare_for_context_return(user, state.gs)"]
+tokens = ["struct CurrentArchitecture<'a>", "current: &'a super::CurrentWait", "scope: &'a", "!super::ipc_publication::scoped(scope)", "current.original_pin()", "return_view(pin.slot())", "!view.user_mode_task", "retained_architecture(", "pin.slot(), pin.id(), view", "Some(Self { current, scope, state })", "fn install(self)", "self.current.cpu()", "self.scope.is_masked()", "load_address_space_phys(PhysAddr::new(self.state.root))", "set_privilege_stack_masked(cpu, self.state.stack_top)", "set_kernel_stack_top_masked(cpu, self.state.stack_top, self.state.register_ipc)", "install_segments(cpu, self.state, true)", "fn install_segments(", "DS::set_reg(selector)", "FsBase::write(VirtAddr::new(state.fs))", "prepare_for_context_return_masked(cpu, user, state.gs)"]
 [[forbidden_patterns]]
 scope = "kernel/ps/src/multitask/irq.rs"
 regex = 'scheduler_(mut|ref)\('
@@ -83,7 +83,7 @@ reason = "Class55 accepts ORIGINAL resource-borrowed admission, never a replacem
 # frame/MM/placement/banks through register/SIMD install and CPU publication.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/return_architecture.rs"
-tokens = ["struct ClaimedReturn", "token: frame_publication::StableFrameToken", "running_generation: u64", "struct ReturnArchitecture<'a>", "turn: &'a CpuDispatchTurn<'static>", "receipt: &'a ClaimedReturn", "fn capture(", "turn.original_current().ok_or(1_u8)?", "turn.claimed_return().ok_or(2_u8)?", "!turn.architecture_pending()", "!super::execution_interval::original_claim_is_active(turn)", "dispatch.previous_slot != original", "dispatch.next_rsp != token.saved_rsp", "!frame_publication::claimed_frame_is_current(token)", "owner.generation != receipt.running_generation", "owns_prepared(cpu, token.slot)", "owns_execution(cpu, token.slot)", "turn.has_claimed_placement(token.slot)", "retained_architecture(", "turn.claimed_mm_root(token.slot, receipt.id).ok_or(16_u8)?", "root != incoming.root", "fn install(", "self.install_with(fast_ipc, hardware_effect)", "fn install_with(", "self.turn.begin_architecture()", "previous.root != next.root", "effect(ArchitectureEffect::AddressSpace(next.root))", "effect(ArchitectureEffect::PrivilegeStack(next.stack_top))", "effect(ArchitectureEffect::SyscallStack(next.stack_top, next.register_ipc))", "fast_ipc && previous.root == next.root && !self.receipt.return_to_user", "effect(ArchitectureEffect::KernelGsBase(next.gs))", "effect(ArchitectureEffect::Segments(next, self.receipt.return_to_user))", "effect(ArchitectureEffect::Simd(self.receipt.token.slot))", "self.turn.mark_architecture_ready()", "fn hardware_effect(", "load_address_space_phys(", "set_privilege_stack(top)", "KernelGsBase::write", "install_segments(state, user)", "restore_simd_state(slot)"]
+tokens = ["struct ClaimedReturn", "token: frame_publication::StableFrameToken", "running_generation: u64", "struct ReturnArchitecture<'a>", "turn: &'a CpuDispatchTurn<'static>", "receipt: &'a ClaimedReturn", "fn capture(", "turn.original_current().ok_or(1_u8)?", "turn.claimed_return().ok_or(2_u8)?", "!turn.architecture_pending()", "!super::execution_interval::original_claim_is_active(turn)", "dispatch.previous_slot != original", "dispatch.next_rsp != token.saved_rsp", "!frame_publication::claimed_frame_is_current(token)", "owner.generation != receipt.running_generation", "owns_prepared(cpu, token.slot)", "owns_execution(cpu, token.slot)", "turn.has_claimed_placement(token.slot)", "retained_architecture(", "turn.claimed_mm_root(token.slot, receipt.id).ok_or(16_u8)?", "root != incoming.root", "fn install(", "self.install_with(fast_ipc, |effect| hardware_effect(cpu, effect))", "fn install_with(", "self.turn.begin_architecture()", "previous.root != next.root", "effect(ArchitectureEffect::AddressSpace(next.root))", "effect(ArchitectureEffect::PrivilegeStack(next.stack_top))", "effect(ArchitectureEffect::SyscallStack(next.stack_top, next.register_ipc))", "fast_ipc && previous.root == next.root && !self.receipt.return_to_user", "effect(ArchitectureEffect::KernelGsBase(next.gs))", "effect(ArchitectureEffect::Segments(next, self.receipt.return_to_user))", "effect(ArchitectureEffect::Simd(self.receipt.token.slot))", "self.turn.mark_architecture_ready()", "fn hardware_effect(", "load_address_space_phys(", "set_privilege_stack_masked(cpu, top)", "KernelGsBase::write", "install_segments(cpu, state, user)", "restore_simd_state(slot)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/cpu_local/dispatch_turn.rs"
 tokens = ["fn retain_claimed_return(", "self.original_current().is_some()", "self.claimed_return.get()", "bank.is_none()", "*bank = Some(receipt)", "fn claimed_return(", "self.original_current()?", "fn begin_architecture(", "self.architecture_pending()", "self.architecture_phase.set(1)", "fn mark_architecture_ready(", "self.architecture_phase.get(), 1", "self.architecture_phase.set(2)", "fn publish_return(", "self.architecture_phase.get() == 2 && receipt.slot() == to", "self.seal()", "publish_before_return()"]
@@ -125,7 +125,7 @@ path = "kernel/ps/src/multitask/scheduler/dispatcher/maintenance.rs"
 tokens = ["struct MigrationFrame<'a>", "turn: &'a CpuDispatchTurn", "token: frame_publication::StableFrameToken", "_reader: stack_resources::frame_readers::FrameReader<'a>", "fn transfer(", "frame_publication::pin_for_identity(token, id)", "frame_readers::acquire(&pin, cpu)", "context_validation::validate_published_saved_context", "MigrationFrame { turn, token, id, source, _reader: reader }", "runqueue::rehome_queued_frame(&frame", "drop(frame)", "drop(pin)", "request_target_reschedule(cpu)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/ipc_handoff.rs"
-tokens = ["fn rehome_queued_frame(", "frame: &super::super::dispatcher::maintenance::MigrationFrame", "owner.generation != frame.token.owner_generation", "RUN_QUEUES[source_cpu].inner.lock()", "!source.contains(slot) || !frame.is_current()", "with_rehome_admission(slot, target_cpu, None", "if !frame.is_current()", "transition(slot, owner, OwnerEvent::Rehome, Some(target_cpu))", "source.remove(slot, weight)", "publish_load(&source)", "drop(source)", "publish_migration(committed, weight)"]
+tokens = ["fn rehome_queued_frame(", "frame: &super::super::dispatcher::maintenance::MigrationFrame", "owner.generation != frame.token.owner_generation", "RUN_QUEUES[source_cpu].inner.lock()", "!source.contains(slot) || !frame.is_current()", "with_rehome_admission(slot, target_cpu, None", "if !frame.is_current()", "transition(slot, owner, OwnerEvent::Rehome, Some(target_cpu))", "source.remove(slot, weight)", "publish_load(&mut source)", "drop(source)", "publish_migration(committed, weight)"]
 
 # Actual selected transaction retains UID/frame/funding, with final epoch
 # qualification inside BOTH resource-excluded owner CAS branches. These are
@@ -1144,6 +1144,29 @@ tokens = [
     "debug::record_milestone(debug::LogCategory::Compat, name, arg0, recorded_arg1);",
 ]
 
+[[required_sequences]]
+path = "kernel/hal/src/arch/tlb_shootdown.rs"
+tokens = [
+    "pub unsafe fn finish_without_flush(mut self)",
+    ".hold",
+    ".take()",
+    "let restore_interrupts = self.restore_interrupts;",
+    "core::mem::forget(self);",
+    "release(hold, restore_interrupts);",
+]
+
+[[required_sequences]]
+path = "kernel/hal/src/arch/tlb_shootdown.rs"
+tokens = [
+    "fn service_requests()",
+    "interrupts::without_interrupts(||",
+    "let logical_index = current_cpu_index();",
+    "PENDING[logical_index].load(Ordering::Acquire)",
+    "PENDING[logical_index].swap(0, Ordering::Acquire)",
+    "invalidate_local(logical_index, request_root, space_generation);",
+    "ACK_GENERATION[sender][logical_index].store(generation, Ordering::Release);",
+]
+
 # Each named authority must remain a bounded dense logical-CPU array. This
 # rejects accidental regression to a scalar singleton even when the scalar is
 # atomic and therefore invisible to a data-race detector.
@@ -1925,7 +1948,7 @@ tokens = ["if let Ok(committed) = transition(slot, owner, OwnerEvent::HandoffDir
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue.rs"
-tokens = ["let next = transition.next;", "frame_publication::bind_local_owner_generation(slot, next.generation);", "RUN_QUEUES[cpu].publish_load(&rq);", "frame_publication::clear(slot);"]
+tokens = ["let next = transition.next;", "frame_publication::bind_local_owner_generation(slot, next.generation);", "RUN_QUEUES[cpu].publish_load(&mut rq);", "frame_publication::clear(slot);"]
 
 # Only the exact locked runtime pair can report a stable budget denial;
 # missing/stale context/domain identity or a disallowed CPU stays unknown.
@@ -2902,8 +2925,8 @@ tokens = [
     "Some(Self { image, turn, state })", "fn install(self)",
     "self.image.assert_current(cpu)", "original_initial_is_active(self.turn)",
     "load_address_space_phys(PhysAddr::new(self.state.root))",
-    "set_privilege_stack(self.state.stack_top)", "set_kernel_stack_top(self.state.stack_top, self.state.register_ipc)",
-    "install_segments(self.state, false)", "fn install_segments(", "FsBase::write(",
+    "set_privilege_stack_masked(cpu, self.state.stack_top)", "set_kernel_stack_top_masked(cpu, self.state.stack_top, self.state.register_ipc)",
+    "install_segments(cpu, self.state, false)", "fn install_segments(", "FsBase::write(",
 ]
 
 # MM admission/close is independent of physical refs and raw directory custody.

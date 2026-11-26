@@ -148,7 +148,8 @@ impl<'a> ReturnArchitecture<'a> {
     }
 
     pub(in crate::multitask) fn install(self, fast_ipc: bool) {
-        self.install_with(fast_ipc, hardware_effect);
+        let (cpu, _) = self.turn.original_current().expect("claimed architecture lost its CPU");
+        self.install_with(fast_ipc, |effect| hardware_effect(cpu, effect));
     }
 
     /// Only privileged effects are modeled. Claim admission, original loans,
@@ -242,7 +243,7 @@ pub(in crate::multitask::scheduler) fn lane_install(
         ArchitectureEffect::SyscallStack(top, register_ipc) => {
             crate::user::syscall::set_kernel_stack_top_masked(cpu, top, register_ipc)
         }
-        other => hardware_effect(other),
+        other => hardware_effect(cpu, other),
     });
     #[cfg(test)]
     let _ = (cpu, to_id);
@@ -270,14 +271,14 @@ pub(in crate::multitask) enum ArchitectureEffect {
     Segments(ArchitectureState, bool),
     Simd(usize),
 }
-fn hardware_effect(effect: ArchitectureEffect) {
+fn hardware_effect(cpu: usize, effect: ArchitectureEffect) {
     match effect {
         ArchitectureEffect::AddressSpace(root) => crate::memory::paging::load_address_space_phys(PhysAddr::new(root)),
-        ArchitectureEffect::PrivilegeStack(top) => crate::arch::gdt::set_privilege_stack(top),
-        ArchitectureEffect::SyscallStack(top, register_ipc) => crate::user::syscall::set_kernel_stack_top(top, register_ipc),
+        ArchitectureEffect::PrivilegeStack(top) => crate::arch::gdt::set_privilege_stack_masked(cpu, top),
+        ArchitectureEffect::SyscallStack(top, register_ipc) => crate::user::syscall::set_kernel_stack_top_masked(cpu, top, register_ipc),
         ArchitectureEffect::FsBase(base) => FsBase::write(VirtAddr::new(base)),
         ArchitectureEffect::KernelGsBase(base) => KernelGsBase::write(VirtAddr::new(base)),
-        ArchitectureEffect::Segments(state, user) => install_segments(state, user),
+        ArchitectureEffect::Segments(state, user) => install_segments(cpu, state, user),
         ArchitectureEffect::Simd(slot) => runqueue::simd_tls::restore_simd_state(slot),
     }
 }
@@ -318,9 +319,9 @@ impl<'a> InitialArchitecture<'a> {
         phase(SchedulerPhase::ArchValidate, &mut marker);
         crate::memory::paging::load_address_space_phys(PhysAddr::new(self.state.root));
         phase(SchedulerPhase::ArchAddressSpace, &mut marker);
-        crate::arch::gdt::set_privilege_stack(self.state.stack_top);
-        crate::user::syscall::set_kernel_stack_top(self.state.stack_top, self.state.register_ipc);
-        install_segments(self.state, false);
+        crate::arch::gdt::set_privilege_stack_masked(cpu, self.state.stack_top);
+        crate::user::syscall::set_kernel_stack_top_masked(cpu, self.state.stack_top, self.state.register_ipc);
+        install_segments(cpu, self.state, false);
         phase(SchedulerPhase::ArchSegments, &mut marker);
     }
 }
@@ -358,16 +359,17 @@ impl<'a> CurrentArchitecture<'a> {
         let mut marker = phase_start();
         crate::memory::paging::load_address_space_phys(PhysAddr::new(self.state.root));
         phase(SchedulerPhase::ArchAddressSpace, &mut marker);
-        crate::arch::gdt::set_privilege_stack(self.state.stack_top);
-        crate::user::syscall::set_kernel_stack_top(self.state.stack_top, self.state.register_ipc);
-        install_segments(self.state, true);
+        let cpu = self.scope.cpu();
+        crate::arch::gdt::set_privilege_stack_masked(cpu, self.state.stack_top);
+        crate::user::syscall::set_kernel_stack_top_masked(cpu, self.state.stack_top, self.state.register_ipc);
+        install_segments(cpu, self.state, true);
         phase(SchedulerPhase::ArchSegments, &mut marker);
     }
 }
 
 /// Hardware effect only. Callers retain their ORIGINAL claimed or executing
 /// Current custody; this immutable state alone is not an admission API.
-fn install_segments(state: ArchitectureState, user: bool) {
+fn install_segments(cpu: usize, state: ArchitectureState, user: bool) {
     let selector = if user { SegmentSelector(0) } else { crate::arch::gdt::kernel_data_selector() };
     if DS::get_reg() != selector || ES::get_reg() != selector
         || FS::get_reg() != selector || GS::get_reg() != selector {
@@ -381,7 +383,7 @@ fn install_segments(state: ArchitectureState, user: bool) {
         }
     }
     FsBase::write(VirtAddr::new(state.fs));
-    crate::user::syscall::prepare_for_context_return(user, state.gs);
+    crate::user::syscall::prepare_for_context_return_masked(cpu, user, state.gs);
 }
 
 #[cfg(test)]

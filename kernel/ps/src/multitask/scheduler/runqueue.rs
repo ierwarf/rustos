@@ -20,7 +20,7 @@
 //! - **Evidence:** `per-cpu-runqueue-ownership`, `scheduler-dispatch`, and
 //!   `smp-reschedule-ipi-lifecycle`.
 
-use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::multitask::irq_leaf::IrqLeaf;
 use crate::multitask::irq_pool::{SlabPool, SlabQueue};
@@ -85,9 +85,12 @@ struct RunQueueInner {
     runnable_count: usize,
     runnable_weight: u64,
     queue_sequence: u64,
-    dirty_slots: [AtomicU32; 4],
-    dirty_len: AtomicU8,
-    full_resync: AtomicBool,
+    // Mutation scratch belongs exclusively to `inner`'s queue lock; only the
+    // published mirror below is read by other CPUs. Plain fields avoid locked
+    // swaps merely to drain data whose sole writer already holds the lock.
+    dirty_slots: [u32; 4],
+    dirty_len: u8,
+    full_resync: bool,
 }
 
 impl RunQueueInner {
@@ -99,19 +102,19 @@ impl RunQueueInner {
             runnable_count: 0,
             runnable_weight: 0,
             queue_sequence: 0,
-            dirty_slots: [const { AtomicU32::new(NO_SLOT) }; 4],
-            dirty_len: AtomicU8::new(0),
-            full_resync: AtomicBool::new(false),
+            dirty_slots: [NO_SLOT; 4],
+            dirty_len: 0,
+            full_resync: false,
         }
     }
 
-    fn mark_dirty(&self, slot: u32) {
-        let len = self.dirty_len.load(Ordering::Relaxed);
+    fn mark_dirty(&mut self, slot: u32) {
+        let len = self.dirty_len;
         if (len as usize) < 4 {
-            self.dirty_slots[len as usize].store(slot, Ordering::Relaxed);
-            self.dirty_len.store(len + 1, Ordering::Relaxed);
+            self.dirty_slots[len as usize] = slot;
+            self.dirty_len = len + 1;
         } else {
-            self.full_resync.store(true, Ordering::Relaxed);
+            self.full_resync = true;
         }
     }
 
@@ -135,8 +138,8 @@ impl RunQueueInner {
         self.runnable_count = 0;
         self.runnable_weight = 0;
         self.queue_sequence = 0;
-        self.dirty_len.store(0, Ordering::Relaxed);
-        self.full_resync.store(true, Ordering::Relaxed);
+        self.dirty_len = 0;
+        self.full_resync = true;
     }
 
     fn contains(&self, slot: usize) -> bool {
@@ -241,15 +244,19 @@ impl PerCpuRunQueue {
         }
     }
 
-    fn publish_load(&self, inner: &RunQueueInner) {
+    fn publish_load(&self, inner: &mut RunQueueInner) {
         // ORDERING: AcqRel marks publication odd before updating dense published_slots.
-        self.published_sequence.fetch_add(1, Ordering::AcqRel);
-        if inner.full_resync.swap(false, Ordering::Relaxed) {
-            inner.dirty_len.store(0, Ordering::Relaxed);
+        let sequence = self.published_sequence.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(sequence & 1, 0, "scheduler rq publication overlapped a writer");
+        let committed_sequence = sequence.checked_add(2)
+            .expect("scheduler rq publication sequence exhausted");
+        if core::mem::take(&mut inner.full_resync) {
+            inner.dirty_len = 0;
             let old_pub = self.published_count.load(Ordering::Relaxed);
             for i in 0..old_pub {
                 if let Some(cell) = self.published_slots.get(i) {
-                    let old = cell.swap(NO_SLOT, Ordering::Relaxed);
+                    let old = cell.load(Ordering::Relaxed);
+                    cell.store(NO_SLOT, Ordering::Relaxed);
                     if old != NO_SLOT {
                         // SAFETY: `rq_pub_idx` is exclusively owned by this queue lock.
                         unsafe {
@@ -284,9 +291,9 @@ impl PerCpuRunQueue {
             self.published_count.store(idx, Ordering::Release);
         } else {
             let mut pub_len = self.published_count.load(Ordering::Relaxed);
-            let dlen = inner.dirty_len.swap(0, Ordering::Relaxed) as usize;
+            let dlen = usize::from(core::mem::take(&mut inner.dirty_len));
             for i in 0..dlen {
-                let s = inner.dirty_slots[i].load(Ordering::Relaxed);
+                let s = inner.dirty_slots[i];
                 let task = task_table::get(s as usize);
                 let in_rq = inner.contains(s as usize);
                 // SAFETY: `rq_pub_idx` is protected by `inner`.
@@ -341,8 +348,10 @@ impl PerCpuRunQueue {
         // ORDERING: Release publishes read-only placement snapshot after exact rq updates.
         self.published_load
             .store((weight << 16) | count, Ordering::Release);
-        // ORDERING: AcqRel finishes even publication epoch after all dense updates.
-        self.published_sequence.fetch_add(1, Ordering::AcqRel);
+        // ORDERING: Release commits all dense updates to readers' Acquire
+        // sequence checks. The queue lock excludes another writer, so the
+        // closing publication needs no second locked read-modify-write.
+        self.published_sequence.store(committed_sequence, Ordering::Release);
     }
 }
 
@@ -516,7 +525,7 @@ pub(super) fn reset_before_publication() {
         RUN_QUEUES[cpu]
             .published_sequence
             .store(0, Ordering::Release);
-        RUN_QUEUES[cpu].publish_load(&rq);
+        RUN_QUEUES[cpu].publish_load(&mut rq);
         drop(rq);
         let mut mailbox = REMOTE_WAKE_MAILBOXES[cpu].lock();
         mailbox.clear();
@@ -773,7 +782,7 @@ pub(super) fn publish_local(slot: usize, cpu: usize, weight: u32) {
         Ok(transition) => transition,
         Err(observed) => {
             rq.remove(slot, weight);
-            RUN_QUEUES[cpu].publish_load(&rq);
+            RUN_QUEUES[cpu].publish_load(&mut rq);
             panic!("scheduler local publication lost owner race observed={observed:?}");
         }
     };
@@ -783,7 +792,7 @@ pub(super) fn publish_local(slot: usize, cpu: usize, weight: u32) {
     // complete frame only afterwards, so a local reader can never accept a
     // frame for the preceding owner generation.
     frame_publication::bind_local_owner_generation(slot, next.generation);
-    RUN_QUEUES[cpu].publish_load(&rq);
+    RUN_QUEUES[cpu].publish_load(&mut rq);
 }
 
 #[cfg(test)]
@@ -820,10 +829,10 @@ pub(super) fn publish_blocked(slot: usize, cpu: usize, weight: u32) {
     rq.remove(slot, weight);
     if let Err(observed) = ownership::test_force_word(slot, owner, blocked) {
         rq.insert(slot, weight);
-        RUN_QUEUES[cpu].publish_load(&rq);
+        RUN_QUEUES[cpu].publish_load(&mut rq);
         panic!("scheduler local block lost owner race observed={observed:?}");
     }
-    RUN_QUEUES[cpu].publish_load(&rq);
+    RUN_QUEUES[cpu].publish_load(&mut rq);
 }
 
 pub(super) fn local_runnable_sequence(cpu: usize) -> u64 {
@@ -1090,7 +1099,7 @@ fn retire_slot(slot: usize, weight: u32, wait_for_claim: bool) -> RetireOutcome 
                 rq.remove(slot, weight);
             }
             complete_retire(slot, retiring);
-            RUN_QUEUES[cpu].publish_load(&rq);
+            RUN_QUEUES[cpu].publish_load(&mut rq);
             return RetireOutcome::Retired;
         }
         // A dispatch that re-selects the task its CPU was running claims it again

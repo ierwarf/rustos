@@ -17,20 +17,17 @@ pub use region_edit::{
 };
 
 pub const PAGER_FAULT_ABI_VERSION: u16 = 3;
+/// Anonymous policy evolves independently of the fault/reply rendezvous.
+/// Version 4 consumes reserved policy storage for the explicit 2 MiB THP opt-in.
+pub const PAGER_ANONYMOUS_POLICY_ABI_VERSION: u16 = 4;
 pub const PAGER_PAGE_BYTES: u64 = 4096;
 
-/// Upper bound on pages one fault may populate, including the faulting page.
+/// Upper bound on a 4 KiB fault-around run, including the faulting page.
 ///
-/// Anonymous first touch costs a full rendezvous round trip per fault, and a
-/// process that touches a fresh mapping linearly pays that per 4 KiB. Populating
-/// a short run around the faulting page amortizes the round trip the way Linux's
-/// `fault_around_bytes` does for file pages (64 KiB by default) and its
-/// multi-size THP does for anonymous ones - Linux deliberately batches at
-/// 16 KiB-512 KiB rather than jumping to a 2 MiB huge page, because the memory
-/// each fault has to *zero* is what sets the latency spike.
-///
-/// 16 pages is 64 KiB, matching that default. It is a cap, not a promise: ring0
-/// offers at most this many and never fewer than one.
+/// The 64 KiB fallback bounds speculative zeroing when a huge page is disabled
+/// or unavailable. Hardware 2 MiB anonymous pages have their own explicit
+/// `PagerAnonymousPolicyWire::huge_page_enabled` policy; this limit continues
+/// to bound the fault/reply wire and never encodes a huge-page request.
 pub const PAGER_FAULT_RUN_PAGES_MAX: u32 = 16;
 
 /// Fixed number of ring0 fault slots a token may name.
@@ -100,8 +97,8 @@ pub const MM_BROKER_OP_SET_ANON_POLICY: u16 = 9;
 pub struct PagerAnonymousPolicyWire {
     pub version: u16,
     pub reserved0: u16,
-    /// Pages one anonymous fault may populate, counting the faulting page.
-    /// `1` disables fault-around.
+    /// Pages a 4 KiB anonymous fallback may populate, counting the faulting
+    /// page. `1` disables fault-around independently of `huge_page_enabled`.
     ///
     /// A power of two, because ring0 tiles the region with blocks aligned to
     /// their own size the way Linux picks an mTHP folio. That alignment is
@@ -118,16 +115,23 @@ pub struct PagerAnonymousPolicyWire {
     pub demand_enabled: u32,
     /// Service ids whose processes stay wired, packed from the front.
     pub wired_services: [u64; PAGER_MAX_WIRED_SERVICES],
-    pub reserved1: [u64; 2],
+    /// `1` permits a 2 MiB leaf for a write first touch in a fully covered,
+    /// committed private anonymous block. Allocation failure falls back to
+    /// `fault_run_pages`; read faults, shared/file memory and VMA fringes do not
+    /// receive a speculative huge allocation. `0` disables this attempt.
+    pub huge_page_enabled: u32,
+    pub reserved1: u32,
+    pub reserved2: u64,
 }
 
 impl PagerAnonymousPolicyWire {
     pub const fn is_canonical(self) -> bool {
-        if self.version != PAGER_FAULT_ABI_VERSION
+        if self.version != PAGER_ANONYMOUS_POLICY_ABI_VERSION
             || self.reserved0 != 0
-            || self.reserved1[0] != 0
-            || self.reserved1[1] != 0
+            || self.reserved1 != 0
+            || self.reserved2 != 0
             || self.demand_enabled > 1
+            || self.huge_page_enabled > 1
             || self.fault_run_pages == 0
             || self.fault_run_pages > PAGER_FAULT_RUN_PAGES_MAX
             || !self.fault_run_pages.is_power_of_two()
@@ -619,10 +623,43 @@ impl PagerFaultReplyWire {
 const _: () = assert!(core::mem::size_of::<PagerFaultRequestWire>() <= 256);
 const _: () = assert!(core::mem::size_of::<PagerFaultDispatchWire>() <= 256);
 const _: () = assert!(core::mem::size_of::<PagerFaultReplyWire>() <= 256);
+const _: () = assert!(core::mem::size_of::<PagerAnonymousPolicyWire>() == 96);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anonymous_policy_versions_huge_pages_without_widening_fault_runs() {
+        let policy = PagerAnonymousPolicyWire {
+            version: PAGER_ANONYMOUS_POLICY_ABI_VERSION,
+            fault_run_pages: PAGER_FAULT_RUN_PAGES_MAX,
+            process_vma_ceiling: PAGER_MAX_VMAS_PER_PROCESS as u32,
+            demand_enabled: 1,
+            huge_page_enabled: 1,
+            ..Default::default()
+        };
+        assert!(policy.is_canonical());
+        assert_eq!(core::mem::size_of::<PagerAnonymousPolicyWire>(), 96);
+        assert_eq!(core::mem::offset_of!(PagerAnonymousPolicyWire, wired_services), 16);
+        assert_eq!(core::mem::offset_of!(PagerAnonymousPolicyWire, huge_page_enabled), 80);
+        assert!(PagerAnonymousPolicyWire { huge_page_enabled: 0, ..policy }.is_canonical());
+        assert!(PagerAnonymousPolicyWire { fault_run_pages: 1, ..policy }.is_canonical());
+        for invalid in [
+            PagerAnonymousPolicyWire { version: PAGER_FAULT_ABI_VERSION, ..policy },
+            PagerAnonymousPolicyWire { huge_page_enabled: 2, ..policy },
+            PagerAnonymousPolicyWire { demand_enabled: 2, ..policy },
+            PagerAnonymousPolicyWire { reserved0: 1, ..policy },
+            PagerAnonymousPolicyWire { reserved1: 1, ..policy },
+            PagerAnonymousPolicyWire { reserved2: 1, ..policy },
+            PagerAnonymousPolicyWire { fault_run_pages: 512, ..policy },
+        ] {
+            assert!(!invalid.is_canonical());
+        }
+        // Fault requests retain their existing version and wire contract.
+        assert_eq!(request().version, PAGER_FAULT_ABI_VERSION);
+        assert!(request().is_canonical());
+    }
 
     fn request() -> PagerFaultRequestWire {
         PagerFaultRequestWire {
@@ -901,6 +938,17 @@ mod tests {
 }
 
 // Copy-out safety: no padding bytes (see `wire`).
+crate::user_wire!(PagerAnonymousPolicyWire {
+    version: u16,
+    reserved0: u16,
+    fault_run_pages: u32,
+    process_vma_ceiling: u32,
+    demand_enabled: u32,
+    wired_services: [u64; PAGER_MAX_WIRED_SERVICES],
+    huge_page_enabled: u32,
+    reserved1: u32,
+    reserved2: u64
+});
 crate::user_wire!(PagerFaultDispatchWire {
     request: PagerFaultRequestWire,
     zeroed_frame_capability: u64,

@@ -559,6 +559,26 @@ flows = ["memory-map", "physical-frame-lifecycle", "process-lifecycle-transactio
 reason = "The narrow descriptor API must preserve exact root, virtual-address, frame, and sharing-kind identity across every claim, publication, cancellation, release, and retirement call."
 
 [[risk_surfaces]]
+path = "kernel/mm/src/memory/phys/frame_descriptor_ledger/anon_run.rs"
+severity = "critical"
+flows = ["memory-map", "physical-frame-lifecycle", "cow-frame-lifecycle"]
+reason = "Batched anonymous claims must cancel the exact prefix and charge; a deposited huge split table remains root-owned until demotion or retirement detaches its head association."
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/phys/frame_descriptor_ledger/anon_run.rs"
+models = ["page-table-map-transaction/PageTableMapTransaction", "physical-frame-lifecycle/PhysicalFrameLifecycle", "cow-frame-lifecycle/CowFrameLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/mm/src/memory/address_space/huge.rs"
+severity = "critical"
+flows = ["memory-map", "physical-frame-lifecycle", "tlb-shootdown-lifecycle", "cow-frame-lifecycle"]
+reason = "A huge PDE must publish only fully initialized and claimed frames; allocation-free demotion must preserve identities/PAT/rights and invalidate all old huge translations before 4 KiB lifetime changes."
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/address_space/huge.rs"
+models = ["page-table-map-transaction/PageTableMapTransaction", "physical-frame-lifecycle/PhysicalFrameLifecycle", "tlb-shootdown-lifecycle/TlbShootdownLifecycle", "cow-frame-lifecycle/CowFrameLifecycle"]
+
+[[risk_surfaces]]
 path = "kernel/mm/src/memory/phys/frame_descriptor_ledger/encoding.rs"
 severity = "critical"
 flows = ["physical-frame-lifecycle", "cow-frame-lifecycle"]

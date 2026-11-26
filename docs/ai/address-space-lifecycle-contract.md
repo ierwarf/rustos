@@ -94,9 +94,33 @@ writer. A failed preflight preserves both leaves and published VMA authority.
 
 
 `map_zeroed_user_pages_at` opens one `AddressSpaceMutationGuard` per operation.
+Successful strictly additive mappings consume it through
+`finish_without_flush`: x86 caches no non-present translation, and a previous
+present incarnation must already have completed its removal barrier. A failed
+transaction that removes published leaves still performs the normal reclaim
+shootdown. Eager owned/external mapping reuses one prepared PT for each 2 MiB
+chunk and publishes leaves with atomic zero-to-present CAS instead of
+re-walking from the root for every leaf. Protection and unmap use their final
+batched shootdown without redundant per-leaf local `INVLPG` operations.
 `clone_user_space_cow` likewise batches every parent write-protection change
 under one guard and drops it once, after the last downgrade. The unpublished
 child root needs no shootdown.
+
+Anonymous 2 MiB THP adds a structural preparation phase when a 4 KiB mutation
+encounters a huge leaf. Its deposited split PT is already allocated, charged
+and owned. Demotion preserves all 512 frame identities and completes a full
+root shootdown before the existing 4 KiB transaction starts; a mixed-size
+operation can therefore have this additional demotion barrier. Fork performs
+the same preparation while its complete VMA hold excludes fault installers.
+THP retirement visits the deposited table plus every constituent data claim,
+detaches the head deposit before releasing data, then frees the table via the
+normal table list. Translation/user-copy recognizes the 21-bit huge offset;
+ordinary memory ownership remains 4 KiB granular. See
+[pager THP contract](pager/progress.md#451-anonymous-2-mib-thp-2026-11-27-static-review-only).
+
+These 2026-11-27 changes were reviewed statically only. They have no new build,
+test, formal, boot or timing evidence; the historical measurements below apply
+to their original source revisions.
 
 The former second cost is gone. `owned_frames` performed linear membership,
 insert, and removal and made N-page mapping O(N²). Exact

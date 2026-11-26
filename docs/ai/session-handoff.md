@@ -42,7 +42,40 @@ Historical entries prior to 2026-11-25 live in `git log` (e.g.
   not yet been joined by exact task/time; no IPI loss or Chrome latency
   attribution is claimed. Evidence: `build/smp-wake-trace/`.
 
-## Anonymous 64 KiB mTHP (working tree)
+## Paging allocation, 2 MiB THP and SMP switching (2026-11-27, static review only)
+
+- User authorized static review only and one final commit/push of the complete
+  batch. Initial base `5cbc767c` on `master`; rebased onto `01600339` before
+  publication, preserving its dispatcher retries and wake diagnostics. No
+  compilation, tests, formal runs, KVM or performance measurements were
+  performed for this batch.
+- Implemented demand-time anonymous 2 MiB PMD publication with pagerd policy,
+  bounded aligned allocation, batched 4 KiB ownership claims and a deposited
+  split PT. Allocation-free demotion covers protection, partial unmap, remap
+  and fork/COW; translation and retirement recognize huge leaves. Eligible
+  private writable non-executable anonymous write faults fall back to the
+  existing 64 KiB/4 KiB paths when the complete 2 MiB region is unavailable.
+- Physical allocation now enumerates free bits per bitmap word, batches run
+  ownership claims and avoids unnecessary remote-cache scans. Eager mapping
+  reuses a prepared PT per 2 MiB region and publishes leaves with CAS. Pure
+  absent-to-present mapping releases its mutation gate without a shootdown;
+  replacement, demotion and reclamation retain their invalidation barriers.
+- SMP hot paths avoid topology copies and empty-mailbox locked operations,
+  reduce runqueue publication RMWs, isolate hot per-CPU state and reuse the
+  IRQ-pinned CPU identity during return preparation. Request service now
+  masks IRQs across CPU selection, invalidation and acknowledgement; the
+  active-root/generation ordering handshake remains unchanged.
+- Independent static cross-review covered ownership, failure rollback,
+  huge-to-small conversion, PAT/permissions, fork/COW, retirement, IRQ/CPU
+  ownership and source-contract anchors. `git diff --check`, Python syntax
+  parsing and both changed TOML parses passed. New regression cases are
+  source only; Rust compilation and all execution remain unverified.
+- Updated pager, address-space and SMP owner contracts and registered the
+  two new MM source files with the formal source map. No proof or measured
+  speedup is claimed. First-touch 2 MiB zeroing and memory-use tradeoffs remain
+  unmeasured; background collapse, compaction and huge COW are not implemented.
+
+## Anonymous 64 KiB mTHP (prior committed batch)
 
 - Eligible write first touches can allocate a contiguous 16-frame folio and
   publish it through a single prepared page table; the VMA permit and 4 KiB

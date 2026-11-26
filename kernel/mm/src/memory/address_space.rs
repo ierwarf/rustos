@@ -19,7 +19,7 @@ use core::ptr;
 
 use x86_64::PhysAddr;
 use x86_64::VirtAddr;
-use x86_64::instructions::{interrupts, tlb};
+use x86_64::instructions::interrupts;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{PageTable, PageTableFlags};
 
@@ -30,6 +30,8 @@ mod eof_guard;
 pub use eof_guard::current_user_leaf_is_eof_guard;
 mod execution_lifetime;
 mod frame_release;
+mod huge;
+pub use huge::{ANON_HUGE_BYTES, try_map_current_anon_huge_at};
 mod immutable;
 pub use immutable::ImmutableBacking;
 mod pager_fault_mapping;
@@ -49,7 +51,7 @@ use pager_fault_mapping::{
     read_user_table_entry, without_root_owned_user_leaf_tag,
 };
 pub use pager_fault_mapping::{
-    ANON_FOLIO_BYTES, CowWriteResult, ensure_current_fault_tables_at, map_current_prepared_pager_fault_frame_at,
+    ANON_FOLIO_BYTES, CowWriteResult, ensure_current_fault_directory_at, ensure_current_fault_tables_at, map_current_prepared_pager_fault_frame_at,
     resolve_current_cow_write_at, try_map_current_prepared_anon_folio,
 };
 use rollback::{rollback_external_user_pages, rollback_user_pages};
@@ -263,6 +265,13 @@ impl ProcessAddressSpace {
         cow_ranges: &[UserRegion],
         eager_private_ranges: &[UserRegion],
     ) -> Result<Self, AddressSpaceError> {
+        // Shared descriptors and COW permissions remain 4 KiB granular. A
+        // deposited PT makes this split allocation-free, and the complete
+        // huge-translation shootdown precedes sharing any constituent frame.
+        self.demote_user_huge_pages(
+            VirtAddr::new(USER_SPACE_BASE),
+            ((USER_SPACE_END_EXCLUSIVE - USER_SPACE_BASE) / PAGE_4KIB_U64) as usize,
+        )?;
         let mut cloned = Self::new()?;
         cloned.next_user_addr = self.next_user_addr;
         // Only page-table pages are recorded here; the leaves themselves are
@@ -650,10 +659,25 @@ impl ProcessAddressSpace {
         let mut frame_buffer = [PhysAddr::new(0); FRAME_BATCH_CHUNK];
         let mut frame_buffer_len = 0usize;
         let mut frame_buffer_pos = 0usize;
+        let mut leaf_table: Option<(u64, PhysAddr)> = None;
 
         for page_index in 0..page_count {
             let virt = page_addr(start, page_index)?;
-            if self.translate_user(virt).is_some() {
+            let block = virt.as_u64() / ANON_HUGE_BYTES;
+            let pt_phys = match leaf_table {
+                Some((previous, table)) if previous == block => table,
+                _ => match self.ensure_leaf_table(virt.as_u64()) {
+                    Ok(table) => { leaf_table = Some((block, table)); table }
+                    Err(error) => {
+                        free_frame_buffer_tail(&frame_buffer[frame_buffer_pos..frame_buffer_len]);
+                        rollback_user_pages(self, &mapped_pages, mutation);
+                        return Err(if error == AddressSpaceError::HugePageConflict {
+                            AddressSpaceError::AlreadyMapped
+                        } else { error });
+                    }
+                },
+            };
+            if pager_fault_mapping::read_user_directory_entry(pt_phys, p1_index(virt)) != 0 {
                 free_frame_buffer_tail(&frame_buffer[frame_buffer_pos..frame_buffer_len]);
                 rollback_user_pages(self, &mapped_pages, mutation);
                 return Err(AddressSpaceError::AlreadyMapped);
@@ -691,7 +715,7 @@ impl ProcessAddressSpace {
                 rollback_user_pages(self, &mapped_pages, mutation);
                 return Err(error);
             }
-            if let Err(err) = self.map_user_page(virt, frame_phys, page_flags) {
+            if let Err(err) = map_user_leaf_in_table(pt_phys, virt, frame_phys, page_flags) {
                 phys::cancel_data_leaf(self.pml4_frame_phys, virtual_address, frame_phys.as_u64());
                 phys::free_frame(frame_phys);
                 free_frame_buffer_tail(&frame_buffer[frame_buffer_pos..frame_buffer_len]);
@@ -702,6 +726,9 @@ impl ProcessAddressSpace {
             mapped_pages.push((virt, frame_phys.as_u64()));
         }
 
+        // SAFETY: this successful transaction only installed zero-to-present
+        // leaves and directories. Rollback paths retain the reclaim barrier.
+        unsafe { mutation.finish_without_flush(); }
         Ok(UserRegion { start, page_count })
     }
 
@@ -765,20 +792,33 @@ impl ProcessAddressSpace {
             .try_reserve_exact(frames.len())
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
         let mutation = begin_address_space_mutation(self.root_phys());
+        let mut leaf_table: Option<(u64, PhysAddr)> = None;
 
         for (page_index, frame_phys) in frames.iter().copied().enumerate() {
             let virt = page_addr(start, page_index)?;
-            if self.translate_user(virt).is_some() {
-                rollback_external_user_pages(self, &mapped_pages, mutation);
-                return Err(AddressSpaceError::AlreadyMapped);
-            }
-            if let Err(err) = self.map_user_page(virt, PhysAddr::new(frame_phys), page_flags) {
+            let block = virt.as_u64() / ANON_HUGE_BYTES;
+            let pt_phys = match leaf_table {
+                Some((previous, table)) if previous == block => table,
+                _ => match self.ensure_leaf_table(virt.as_u64()) {
+                    Ok(table) => { leaf_table = Some((block, table)); table }
+                    Err(error) => {
+                        rollback_external_user_pages(self, &mapped_pages, mutation);
+                        return Err(if error == AddressSpaceError::HugePageConflict {
+                            AddressSpaceError::AlreadyMapped
+                        } else { error });
+                    }
+                },
+            };
+            if let Err(err) = map_user_leaf_in_table(pt_phys, virt, PhysAddr::new(frame_phys), page_flags) {
                 rollback_external_user_pages(self, &mapped_pages, mutation);
                 return Err(err);
             }
             mapped_pages.push(virt);
         }
 
+        // SAFETY: only absent leaves/directories were published; borrowed
+        // backing remains held by the caller. Failure uses rollback's flush.
+        unsafe { mutation.finish_without_flush(); }
         Ok(UserRegion {
             start,
             page_count: frames.len(),
@@ -790,6 +830,7 @@ impl ProcessAddressSpace {
         start: VirtAddr,
         page_count: usize,
     ) -> Result<usize, AddressSpaceError> {
+        self.demote_user_huge_pages(start, page_count)?;
         let frames = plan_user_page_unmap(start, page_count, |virt| {
             let phys = self
                 .translate_user(virt)
@@ -873,13 +914,14 @@ impl ProcessAddressSpace {
             return Err(AddressSpaceError::NotMapped);
         }
 
+        self.demote_user_huge_pages(start, page_count)?;
+
         // Private immutable aliases must become owned copies before a write
         // upgrade. Complete-span validation above precedes all allocation/PTEs.
         if page_flags.contains(PageTableFlags::WRITABLE) {
             self.privatize_immutable_pages(start, page_count)?;
         }
         let _mutation = begin_address_space_mutation(self.root_phys());
-        let is_active = Cr3::read().0.start_address() == self.root_phys();
         let mut done = 0_usize;
         while done < page_count {
             let chunk_start = page_addr(start, done)?;
@@ -898,11 +940,6 @@ impl ProcessAddressSpace {
                 }
                 let updated = preserve_4k_leaf_pat(entry.flags(), page_flags);
                 entry.set_addr(entry.addr(), updated);
-                if is_active {
-                    tlb::flush(VirtAddr::new(
-                        chunk_start.as_u64() + (offset as u64) * PAGE_4KIB_U64,
-                    ));
-                }
             }
             done += chunk;
         }
@@ -934,48 +971,33 @@ impl ProcessAddressSpace {
         if !is_user_addr(virt.as_u64()) {
             return None;
         }
-
-        let p4 = p4_index(virt);
-        let root = self.root_table_ref();
-        let pml4_entry = &root[p4];
-        if pml4_entry.is_unused() || pml4_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        use pager_fault_mapping::{classify_user_table_entry, read_user_directory_entry};
+        const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+        let pdpt = read_user_table_entry(self.root_phys(), p4_index(virt)).ok()??;
+        let pd = read_user_table_entry(pdpt, p3_index(virt)).ok()??;
+        // One atomic snapshot decides whether this is a PT or a 2 MiB leaf.
+        // An exception may publish an absent directory without taking the
+        // process-state lock, so flags and address must come from one load.
+        let directory = read_user_directory_entry(pd, p2_index(virt));
+        if directory == 0 {
             return None;
         }
-
-        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
-        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
-        // only at address-space retirement, which cannot overlap this `&self` borrow;
-        // a racing exception-time installer only CASes unused -> table, never frees.
-        let pdpt = unsafe { kernel_vm::phys_to_table_ref(pml4_entry.addr()) };
-        let pdpt_entry = &pdpt[p3_index(virt)];
-        if pdpt_entry.is_unused() || pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        if directory & PageTableFlags::HUGE_PAGE.bits() != 0 {
+            let leaf = huge::decode_huge_leaf(directory).ok()?;
+            return Some((
+                PhysAddr::new(leaf.head + (virt.as_u64() & (ANON_HUGE_BYTES - 1))),
+                leaf.page_flags,
+            ));
+        }
+        let table = classify_user_table_entry(directory).ok()?;
+        let leaf = read_user_directory_entry(table, p1_index(virt));
+        if leaf == 0 {
             return None;
         }
-
-        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
-        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
-        // only at address-space retirement, which cannot overlap this `&self` borrow;
-        // a racing exception-time installer only CASes unused -> table, never frees.
-        let pd = unsafe { kernel_vm::phys_to_table_ref(pdpt_entry.addr()) };
-        let pd_entry = &pd[p2_index(virt)];
-        if pd_entry.is_unused() || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            return None;
-        }
-
-        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
-        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
-        // only at address-space retirement, which cannot overlap this `&self` borrow;
-        // a racing exception-time installer only CASes unused -> table, never frees.
-        let pt = unsafe { kernel_vm::phys_to_table_ref(pd_entry.addr()) };
-        let pt_entry = &pt[p1_index(virt)];
-        if pt_entry.is_unused() {
-            return None;
-        }
-
         let offset = virt.as_u64() & (PAGE_4KIB_U64 - 1);
         Some((
-            PhysAddr::new(pt_entry.addr().as_u64() + offset),
-            pt_entry.flags(),
+            PhysAddr::new((leaf & ADDR_MASK) + offset),
+            PageTableFlags::from_bits_truncate(leaf),
         ))
     }
 
@@ -983,13 +1005,6 @@ impl ProcessAddressSpace {
         // SAFETY: `root_phys` is this address space's own PML4 frame, allocated in `new`
         // and live until retirement, so the direct-map alias is a valid 4 KiB table.
         unsafe { kernel_vm::phys_to_table_ref(self.root_phys()) }
-    }
-
-    fn flush_if_active(&self, virt: VirtAddr) {
-        let (current_frame, _) = Cr3::read();
-        if current_frame.start_address() == self.root_phys() {
-            tlb::flush(virt);
-        }
     }
 
     fn map_user_page(
@@ -1005,72 +1020,11 @@ impl ProcessAddressSpace {
         let pdpt_phys = ensure_next_table(root_phys, pml4_phys, p4_index(virt))?;
         let pd_phys = ensure_next_table(root_phys, pdpt_phys, p3_index(virt))?;
         let pt_phys = ensure_next_table(root_phys, pd_phys, p2_index(virt))?;
-        // SAFETY: `pt_phys` came from `ensure_next_table`, which returned the PT frame this
-        // walk already published (or found) under the mutation guard; `&mut self`
-        // excludes other normal-time writers, so the direct-map `&mut` is the sole one.
-        let pt = unsafe { kernel_vm::phys_to_table_mut(pt_phys) };
-
-        let entry = &mut pt[p1_index(virt)];
-        if !entry.is_unused() {
-            return Err(AddressSpaceError::AlreadyMapped);
-        }
-
-        entry.set_addr(phys, flags);
-        self.flush_if_active(virt);
-        Ok(())
+        map_user_leaf_in_table(pt_phys, virt, phys, flags)
     }
 
     fn all_user_pages_present(&self, start: VirtAddr, page_count: usize) -> bool {
-        let mut done = 0_usize;
-        while done < page_count {
-            let Ok(chunk_start) = page_addr(start, done) else {
-                return false;
-            };
-            let p1 = p1_index(chunk_start);
-            let chunk = (512 - p1).min(page_count - done);
-            let Some(pt) = self.leaf_pt_ref(chunk_start) else {
-                return false;
-            };
-            if (p1..p1 + chunk).any(|idx| pt[idx].is_unused()) {
-                return false;
-            }
-            done += chunk;
-        }
-        true
-    }
-
-    fn leaf_pt_ref(&self, virt: VirtAddr) -> Option<&PageTable> {
-        if !is_user_addr(virt.as_u64()) {
-            return None;
-        }
-        let root = self.root_table_ref();
-        let pml4_entry = &root[p4_index(virt)];
-        if pml4_entry.is_unused() || pml4_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            return None;
-        }
-        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
-        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
-        // only at address-space retirement, which cannot overlap this `&self` borrow;
-        // a racing exception-time installer only CASes unused -> table, never frees.
-        let pdpt = unsafe { kernel_vm::phys_to_table_ref(pml4_entry.addr()) };
-        let pdpt_entry = &pdpt[p3_index(virt)];
-        if pdpt_entry.is_unused() || pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            return None;
-        }
-        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
-        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
-        // only at address-space retirement, which cannot overlap this `&self` borrow;
-        // a racing exception-time installer only CASes unused -> table, never frees.
-        let pd = unsafe { kernel_vm::phys_to_table_ref(pdpt_entry.addr()) };
-        let pd_entry = &pd[p2_index(virt)];
-        if pd_entry.is_unused() || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            return None;
-        }
-        // SAFETY: the entry above was checked present and non-huge, so `addr()` names a
-        // kernel-allocated 4 KiB page-table frame in the direct map. Tables are freed
-        // only at address-space retirement, which cannot overlap this `&self` borrow;
-        // a racing exception-time installer only CASes unused -> table, never frees.
-        Some(unsafe { kernel_vm::phys_to_table_ref(pd_entry.addr()) })
+        self.first_unmapped_user_page(start, page_count) == Ok(None)
     }
 
     fn leaf_pt_mut(&mut self, virt: VirtAddr) -> Result<&mut PageTable, AddressSpaceError> {
@@ -1169,9 +1123,29 @@ impl ProcessAddressSpace {
 
         let frame_phys = pt_entry.addr();
         pt_entry.set_unused();
-        self.flush_if_active(virt);
+        // The caller holds the mutation guard until its batched shootdown;
+        // no backing frame can be released before that acknowledgement.
         Some(frame_phys)
     }
+}
+
+/// The caller retains a prepared PT and mutation ownership for this address.
+/// Reusing it for an entire 2 MiB chunk avoids two root-to-leaf walks per page.
+/// The zero-to-present CAS also arbitrates with exception-time installers.
+fn map_user_leaf_in_table(
+    table: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PageTableFlags,
+) -> Result<(), AddressSpaceError> {
+    use core::sync::atomic::Ordering;
+    pager_fault_mapping::with_user_table_entry_atomic(table, p1_index(virt), |entry| {
+        // ORDERING: release publishes initialized data before the present PTE;
+        // acquire on failure observes a competing fault's complete leaf.
+        entry.compare_exchange(0, phys.as_u64() | flags.bits(), Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| AddressSpaceError::AlreadyMapped)
+    })
 }
 
 /// Membership test over sorted, disjoint regions for queries issued in

@@ -98,7 +98,7 @@ fn publish_return_inner(
             // The queue leaf excludes a concurrent wake's later rebind here.
             frame_publication::bind_local_owner_generation(slot, next.generation);
             if local {
-                RUN_QUEUES[cpu].publish_load(&rq);
+                RUN_QUEUES[cpu].publish_load(&mut rq);
             }
             return if local {
                 ReturnPublication::Local
@@ -113,7 +113,7 @@ fn publish_return_inner(
         // wins. No provisional queue entry survives a failed owner CAS.
         if local {
             rq.remove(slot, weight);
-            RUN_QUEUES[cpu].publish_load(&rq);
+            RUN_QUEUES[cpu].publish_load(&mut rq);
         }
     }
 }
@@ -150,11 +150,11 @@ fn publish_blocked_wake_inner(
             let next = committed.next;
             committed.into_duty().run_queue_inserted(&rq);
             frame_publication::bind_local_owner_generation(slot, next.generation);
-            RUN_QUEUES[cpu].publish_load(&rq);
+            RUN_QUEUES[cpu].publish_load(&mut rq);
             return RemoteWakeOutcome::Published { cpu, notify: false };
         }
         rq.remove(slot, weight);
-        RUN_QUEUES[cpu].publish_load(&rq);
+        RUN_QUEUES[cpu].publish_load(&mut rq);
     }
 }
 
@@ -170,7 +170,7 @@ pub(in crate::multitask::scheduler) fn test_running_claim(slot: usize, cpu: usiz
         .unwrap()
         .settled();
     rq.remove(slot, weight);
-    RUN_QUEUES[cpu].publish_load(&rq);
+    RUN_QUEUES[cpu].publish_load(&mut rq);
 }
 
 /// Native earlier claim input followed by actual queue return, not MM/CPU grant.

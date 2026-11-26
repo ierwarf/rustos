@@ -53,6 +53,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize
 use core::sync::atomic::Ordering;
 
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinGuard, TrackedSpinLock};
+use nucleus_core::util::cache_padded::CachePadded;
 use x86_64::PhysAddr;
 #[cfg(rustos_boot_image)]
 use x86_64::instructions::interrupts;
@@ -90,21 +91,26 @@ type ProtocolGuard = TrackedSpinGuard<'static, (), { LockClass::TlbShootdown as 
 /// Serializes global, retirement and admission mutations among themselves.
 static GLOBAL_LOCK: ProtocolLock = TrackedSpinLock::new(());
 /// Serializes mutations of the spaces that hash to one stripe.
-static SPACE_LOCKS: [ProtocolLock; STRIPES] = [const { TrackedSpinLock::new(()) }; STRIPES];
+/// Independent stripes and CPU-owned hot words occupy separate cache lines:
+/// an unrelated switch or allocation must not invalidate their neighbours.
+static SPACE_LOCKS: [CachePadded<ProtocolLock>; STRIPES] =
+    [const { CachePadded::new(TrackedSpinLock::new(())) }; STRIPES];
 /// Per-space mutations hold this shared; a global mutation holds it exclusive.
 #[cfg(rustos_boot_image)]
 static GATE: AtomicU64 = AtomicU64::new(0);
 /// `tlb_gen` of each stripe: the number of mutations whose flush is owed.
 #[cfg(rustos_boot_image)]
-static SPACE_GEN: [AtomicU64; STRIPES] = [const { AtomicU64::new(0) }; STRIPES];
+static SPACE_GEN: [CachePadded<AtomicU64>; STRIPES] =
+    [const { CachePadded::new(AtomicU64::new(0)) }; STRIPES];
 /// Each sender's own monotonic request generation; only the sender writes it.
 #[cfg(rustos_boot_image)]
-static SENDER_GEN: [AtomicU64; MAX_SUPPORTED_CPUS] =
-    [const { AtomicU64::new(0) }; MAX_SUPPORTED_CPUS];
+static SENDER_GEN: [CachePadded<AtomicU64>; MAX_SUPPORTED_CPUS] =
+    [const { CachePadded::new(AtomicU64::new(0)) }; MAX_SUPPORTED_CPUS];
 /// Bit `s` of `PENDING[t]` is set while sender `s` has an unserviced request
 /// for target `t`.
 #[cfg(rustos_boot_image)]
-static PENDING: [AtomicU64; MAX_SUPPORTED_CPUS] = [const { AtomicU64::new(0) }; MAX_SUPPORTED_CPUS];
+static PENDING: [CachePadded<AtomicU64>; MAX_SUPPORTED_CPUS] =
+    [const { CachePadded::new(AtomicU64::new(0)) }; MAX_SUPPORTED_CPUS];
 #[cfg(rustos_boot_image)]
 type Mailbox = [[AtomicU64; MAX_SUPPORTED_CPUS]; MAX_SUPPORTED_CPUS];
 #[cfg(rustos_boot_image)]
@@ -123,8 +129,8 @@ static REQUEST_GENERATION: Mailbox = mailbox();
 static ACK_GENERATION: Mailbox = mailbox();
 
 #[cfg(rustos_boot_image)]
-static ACTIVE_ROOT: [AtomicU64; MAX_SUPPORTED_CPUS] =
-    [const { AtomicU64::new(0) }; MAX_SUPPORTED_CPUS];
+static ACTIVE_ROOT: [CachePadded<AtomicU64>; MAX_SUPPORTED_CPUS] =
+    [const { CachePadded::new(AtomicU64::new(0)) }; MAX_SUPPORTED_CPUS];
 #[cfg(rustos_boot_image)]
 static SHOOTDOWN_ELIGIBLE: [AtomicBool; MAX_SUPPORTED_CPUS] =
     [const { AtomicBool::new(false) }; MAX_SUPPORTED_CPUS];
@@ -148,15 +154,15 @@ const CR3_NOFLUSH: u64 = 1 << 63;
 static CPU_PCID: [AtomicBool; MAX_SUPPORTED_CPUS] =
     [const { AtomicBool::new(false) }; MAX_SUPPORTED_CPUS];
 #[cfg(rustos_boot_image)]
-static ASID_ROOT: [[AtomicU64; ASID_SLOTS]; MAX_SUPPORTED_CPUS] =
-    [const { [const { AtomicU64::new(0) }; ASID_SLOTS] }; MAX_SUPPORTED_CPUS];
+static ASID_ROOT: [CachePadded<[AtomicU64; ASID_SLOTS]>; MAX_SUPPORTED_CPUS] =
+    [const { CachePadded::new([const { AtomicU64::new(0) }; ASID_SLOTS]) }; MAX_SUPPORTED_CPUS];
 /// Space generation this CPU's tagged translations are known to include.
 #[cfg(rustos_boot_image)]
-static ASID_APPLIED: [[AtomicU64; ASID_SLOTS]; MAX_SUPPORTED_CPUS] =
-    [const { [const { AtomicU64::new(0) }; ASID_SLOTS] }; MAX_SUPPORTED_CPUS];
+static ASID_APPLIED: [CachePadded<[AtomicU64; ASID_SLOTS]>; MAX_SUPPORTED_CPUS] =
+    [const { CachePadded::new([const { AtomicU64::new(0) }; ASID_SLOTS]) }; MAX_SUPPORTED_CPUS];
 #[cfg(rustos_boot_image)]
-static ASID_NEXT_VICTIM: [AtomicUsize; MAX_SUPPORTED_CPUS] =
-    [const { AtomicUsize::new(0) }; MAX_SUPPORTED_CPUS];
+static ASID_NEXT_VICTIM: [CachePadded<AtomicUsize>; MAX_SUPPORTED_CPUS] =
+    [const { CachePadded::new(AtomicUsize::new(0)) }; MAX_SUPPORTED_CPUS];
 
 // ---------------------------------------------------------------------------
 // KVM paravirtual TLB flush.
@@ -238,6 +244,34 @@ pub struct FlushedAddressSpaceMutationGuard {
 }
 
 impl AddressSpaceMutationGuard {
+    /// Publish an additive mapping transaction and release its serialization
+    /// without advancing the TLB generation or sending a shootdown.
+    ///
+    /// x86 does not retain a translation for a non-present entry. Publishing
+    /// freshly initialized child tables and non-present-to-present leaves can
+    /// therefore retain every existing translation, including inactive PCIDs.
+    /// This is also the completion path for a transaction that changed nothing.
+    ///
+    /// # Safety
+    /// Every changed entry must have been non-present throughout this
+    /// transaction, and any older present incarnation must already have had
+    /// its required invalidation completed. No present translation, permission,
+    /// page size, cache attribute or ancestor permission may change. The caller
+    /// must not reclaim a frame or table reachable through an old translation.
+    /// Child tables and backing contents must be initialized before publishing
+    /// the entry that makes them present.
+    pub unsafe fn finish_without_flush(mut self) {
+        let hold = self
+            .hold
+            .take()
+            .expect("TLB invariant: additive mutation guard completed twice");
+        let restore_interrupts = self.restore_interrupts;
+        // The consumed guard no longer owes a flush. Move its one protocol
+        // hold to `release`; the dirty-state destructor must not run as well.
+        core::mem::forget(self);
+        release(hold, restore_interrupts);
+    }
+
     /// Complete a shootdown while retaining mutation serialization.
     ///
     /// Call this after removing a mapping and before releasing or reassigning
@@ -713,6 +747,7 @@ fn invpcid(kind: Invpcid) {
 /// the space is applied. Runs on the target (IPI or polling) and on the sender.
 #[cfg(rustos_boot_image)]
 fn invalidate_local(logical_index: usize, root: u64, space_generation: u64) {
+    debug_assert!(!interrupts::are_enabled());
     // ORDERING: Acquire pairs with the Release that published tagged mode after its CR3 load.
     if !CPU_PCID[logical_index].load(Ordering::Acquire) {
         tlb::flush_all();
@@ -733,16 +768,25 @@ fn invalidate_local(logical_index: usize, root: u64, space_generation: u64) {
         }
         invpcid(Invpcid::AllContexts);
         for (slot, value) in seen.iter().enumerate() {
-            ASID_APPLIED[logical_index][slot].fetch_max(*value, Ordering::Relaxed);
+            record_applied_generation(logical_index, slot, *value);
         }
         return;
     }
     for slot in 0..ASID_SLOTS {
         if ASID_ROOT[logical_index][slot].load(Ordering::Relaxed) == root {
             invpcid(Invpcid::SingleContext(slot as u64 + 1));
-            ASID_APPLIED[logical_index][slot].fetch_max(space_generation, Ordering::Relaxed);
+            record_applied_generation(logical_index, slot, space_generation);
         }
     }
+}
+
+#[cfg(rustos_boot_image)]
+fn record_applied_generation(logical_index: usize, slot: usize, generation: u64) {
+    // ORDERING: Relaxed; only this CPU accesses its PCID binding, with local
+    // interrupts masked by activation, admission, or the request-service
+    // bracket. Preserve monotonicity without a locked read-modify-write.
+    let applied = &ASID_APPLIED[logical_index][slot];
+    applied.store(applied.load(Ordering::Relaxed).max(generation), Ordering::Relaxed);
 }
 
 /// Complete the pre-dispatch admission barrier for the current CPU.
@@ -933,16 +977,25 @@ fn finish_shootdown(scope: MutationScope, caller_had_interrupts: bool) {
         MutationScope::AddressSpace(root) => {
             // ORDERING: SeqCst pairs with the activation's published root and
             // generation read; see `activate_address_space`.
-            SPACE_GEN[stripe(root)].fetch_add(1, Ordering::SeqCst) + 1
+            SPACE_GEN[stripe(root)]
+                .fetch_add(1, Ordering::SeqCst)
+                .checked_add(1)
+                .expect("TLB invariant: address-space generation wrapped")
         }
         MutationScope::Global => 0,
     };
     // ORDERING: SeqCst fence between the generation bump and the root samples.
     core::sync::atomic::fence(Ordering::SeqCst);
-    let Some(topology) = super::acpi::cpu_topology() else {
+    // A shootdown-eligible CPU necessarily passed lifecycle publication and
+    // TLB admission (which precedes the final Online state). Before that
+    // registry exists there is only the local
+    // boot CPU. Read its immutable count directly instead of taking the ACPI
+    // mutex and copying the full topology on every address-space mutation.
+    let cpu_count = super::smp::cpu_count();
+    if cpu_count == 0 {
         tlb::flush_all();
         return;
-    };
+    }
     // ORDERING: only this sender writes its counter.
     let generation = SENDER_GEN[current]
         .load(Ordering::Relaxed)
@@ -951,8 +1004,8 @@ fn finish_shootdown(scope: MutationScope, caller_had_interrupts: bool) {
     SENDER_GEN[current].store(generation, Ordering::Relaxed);
 
     let mut targets = [false; MAX_SUPPORTED_CPUS];
-    for descriptor in topology.cpus() {
-        let target = usize::from(descriptor.logical_index);
+    let mut target_apic_ids = [0_u32; MAX_SUPPORTED_CPUS];
+    for target in 0..cpu_count {
         // ORDERING: Acquire observes online admission before target selection.
         let eligible = SHOOTDOWN_ELIGIBLE[target].load(Ordering::Acquire);
         // ORDERING: SeqCst pairs with the activation publication above.
@@ -961,6 +1014,9 @@ fn finish_shootdown(scope: MutationScope, caller_had_interrupts: bool) {
         {
             continue;
         }
+        target_apic_ids[target] = super::smp::snapshot(target as u8)
+            .expect("TLB invariant: admitted target lost its lifecycle descriptor")
+            .apic_id;
         assert_ne!(
             active_root, 0,
             "TLB invariant: eligible target has no active root"
@@ -989,13 +1045,13 @@ fn finish_shootdown(scope: MutationScope, caller_had_interrupts: bool) {
         targets[target] = true;
     }
 
-    for descriptor in topology.cpus() {
-        let target = usize::from(descriptor.logical_index);
+    for target in 0..cpu_count {
         if targets[target] {
-            super::msi::send_tlb_shootdown_ipi(descriptor.apic_id).unwrap_or_else(|error| {
+            let apic_id = target_apic_ids[target];
+            super::msi::send_tlb_shootdown_ipi(apic_id).unwrap_or_else(|error| {
                 panic!(
                     "TLB invariant: generation {generation} IPI to logical CPU {} APIC {} failed: {error:?}",
-                    descriptor.logical_index, descriptor.apic_id
+                    target, apic_id
                 )
             });
         }
@@ -1019,11 +1075,11 @@ fn finish_shootdown(scope: MutationScope, caller_had_interrupts: bool) {
     // that target each other cannot deadlock, and opens an interrupt window when
     // the caller had interrupts enabled so the IPI path is live too.
     let mut deadline = super::clock::SpinDeadline::start();
-    for descriptor in topology.cpus() {
-        let target = usize::from(descriptor.logical_index);
+    for target in 0..cpu_count {
         if !targets[target] {
             continue;
         }
+        let apic_id = target_apic_ids[target];
         let mut retry_after = ACK_RETRY_NS;
         loop {
             // ORDERING: Acquire observes the target flush preceding its exact
@@ -1040,13 +1096,13 @@ fn finish_shootdown(scope: MutationScope, caller_had_interrupts: bool) {
                 crate::debug::record_milestone(
                     crate::debug::LogCategory::Sched,
                     "tlb-ack-liveness-timeout",
-                    (u64::from(descriptor.logical_index) << 32) | u64::from(descriptor.apic_id),
+                    ((target as u64) << 32) | u64::from(apic_id),
                     generation,
                 );
                 panic!(
                     "TLB liveness watchdog: generation {generation} retained reclaim quarantine while logical CPU {} APIC {} failed to acknowledge after {}ns",
-                    descriptor.logical_index,
-                    descriptor.apic_id,
+                    target,
+                    apic_id,
                     deadline.exact_elapsed_nanos()
                 );
             }
@@ -1054,10 +1110,10 @@ fn finish_shootdown(scope: MutationScope, caller_had_interrupts: bool) {
                 // The slot remains generation-owned and the frame remains
                 // quarantined behind this guard. A duplicate IPI is only a
                 // notification retry; the exact generation ACK is idempotent.
-                super::msi::send_tlb_shootdown_ipi(descriptor.apic_id).unwrap_or_else(|error| {
+                super::msi::send_tlb_shootdown_ipi(apic_id).unwrap_or_else(|error| {
                     panic!(
                         "TLB invariant: generation {generation} retry IPI to logical CPU {} APIC {} failed: {error:?}",
-                        descriptor.logical_index, descriptor.apic_id
+                        target, apic_id
                     )
                 });
                 retry_after = elapsed.saturating_add(ACK_RETRY_NS);
@@ -1106,28 +1162,40 @@ fn note_wait_under_lock(class: u8) {
 /// pending set empty, so a duplicate IPI is harmless.
 #[cfg(rustos_boot_image)]
 fn service_requests() {
-    let logical_index = current_cpu_index();
-    // ORDERING: Acquire observes each sender's complete slot behind its bit.
-    let mut pending = PENDING[logical_index].swap(0, Ordering::Acquire);
-    while pending != 0 {
-        let sender = pending.trailing_zeros() as usize;
-        pending &= pending - 1;
-        // ORDERING: Acquire pairs with the sender's Release generation.
-        let generation = REQUEST_GENERATION[sender][logical_index].load(Ordering::Acquire);
-        assert_ne!(
-            generation, 0,
-            "TLB invariant: target received an unpublished shootdown"
-        );
-        let request_root = REQUEST_ROOT[sender][logical_index].load(Ordering::Relaxed);
-        assert!(
-            request_root == GLOBAL_SCOPE || request_root.is_multiple_of(PAGE_SIZE),
-            "TLB invariant: runtime shootdown scope is invalid"
-        );
-        let space_generation = REQUEST_SPACE_GEN[sender][logical_index].load(Ordering::Relaxed);
-        invalidate_local(logical_index, request_root, space_generation);
-        // ORDERING: Release publishes flush completion for the exact generation.
-        ACK_GENERATION[sender][logical_index].store(generation, Ordering::Release);
-    }
+    // Acquisition waiters can enter with IRQs enabled. Pin the executing CPU
+    // and its PCID bindings until every claimed request has been acknowledged;
+    // otherwise a timer switch or nested shootdown could replace a binding
+    // between its generation read and INVPCID/applied-generation publication.
+    interrupts::without_interrupts(|| {
+        let logical_index = current_cpu_index();
+        // ORDERING: Acquire observes published requests. A zero is only a
+        // polling fast path: a racing sender retains its bit and sends its IPI.
+        // Avoid a locked exchange on every empty protocol-wait iteration.
+        if PENDING[logical_index].load(Ordering::Acquire) == 0 {
+            return;
+        }
+        // ORDERING: Acquire claims each sender's complete slot behind its bit.
+        let mut pending = PENDING[logical_index].swap(0, Ordering::Acquire);
+        while pending != 0 {
+            let sender = pending.trailing_zeros() as usize;
+            pending &= pending - 1;
+            // ORDERING: Acquire pairs with the sender's Release generation.
+            let generation = REQUEST_GENERATION[sender][logical_index].load(Ordering::Acquire);
+            assert_ne!(
+                generation, 0,
+                "TLB invariant: target received an unpublished shootdown"
+            );
+            let request_root = REQUEST_ROOT[sender][logical_index].load(Ordering::Relaxed);
+            assert!(
+                request_root == GLOBAL_SCOPE || request_root.is_multiple_of(PAGE_SIZE),
+                "TLB invariant: runtime shootdown scope is invalid"
+            );
+            let space_generation = REQUEST_SPACE_GEN[sender][logical_index].load(Ordering::Relaxed);
+            invalidate_local(logical_index, request_root, space_generation);
+            // ORDERING: Release publishes flush completion for the exact generation.
+            ACK_GENERATION[sender][logical_index].store(generation, Ordering::Release);
+        }
+    });
 }
 
 pub(super) fn on_interrupt() {

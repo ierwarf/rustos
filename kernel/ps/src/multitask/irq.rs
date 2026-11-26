@@ -585,15 +585,16 @@ pub(super) fn request_target_reschedule(target: usize) {
 
 #[cfg(not(test))]
 fn send_target_reschedule_ipi(target: usize, generation: u64, sequence: u64) {
-    let descriptor = cpu::topology()
-        .and_then(|topology| {
-            topology
-                .cpus()
-                .iter()
-                .find(|descriptor| usize::from(descriptor.logical_index) == target)
-                .copied()
+    // The lifecycle's descriptor is boot-immutable and directly indexed. Avoid
+    // taking the ACPI topology mutex and copying/scanning every descriptor for
+    // each remote wake, while retaining exact Online-generation admission.
+    let logical_index = u8::try_from(target)
+        .expect("scheduler targeted reschedule CPU exceeds lifecycle identity");
+    let descriptor = cpu::lifecycle_snapshot(logical_index)
+        .filter(|snapshot| {
+            snapshot.state == cpu::CpuLifecycleState::Online && snapshot.generation == generation
         })
-        .expect("scheduler targeted reschedule CPU has no topology descriptor");
+        .expect("scheduler targeted reschedule CPU lost its Online generation");
     super::reschedule_observation::record_notification(target, generation, sequence);
     crate::arch::msi::send_reschedule_ipi(descriptor.apic_id).unwrap_or_else(|error| {
         panic!(
@@ -616,14 +617,20 @@ fn flush_deferred_target_reschedules_with(
     if !scheduler_ready {
         return;
     }
+    // ORDERING: Acquire observes prior notification publication. A racing
+    // publisher retains its bit for its own unlock safe point. The common
+    // empty path must not issue a locked exchange on the global cache line.
+    if TARGET_RESCHEDULE_IPI_PENDING.load(Ordering::Acquire) == 0 {
+        return;
+    }
     // ORDERING: AcqRel claims every target whose mailbox/request became
     // durable while a raw scheduler owner disabled preemption. New target bits
     // racing this swap remain for the next safe point.
     let targeted = TARGET_RESCHEDULE_IPI_PENDING.swap(0, Ordering::AcqRel);
-    for target in 0..nucleus_core::util::lockdep::MAX_TRACKED_CPUS {
-        if targeted & (1_u64 << target) == 0 {
-            continue;
-        }
+    let mut remaining = targeted;
+    while remaining != 0 {
+        let target = remaining.trailing_zeros() as usize;
+        remaining &= remaining - 1;
         if !remote_notification_required(target, current_cpu) {
             // The durable local request is enough. xAPIC fixed self-IPIs are
             // forbidden and the return path is already a safe point.

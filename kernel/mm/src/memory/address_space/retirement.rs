@@ -125,11 +125,20 @@ pub(super) fn reclaim_root(root: u64) {
     let mut frames = RetiredFrameBatcher::new(root_phys);
     if let Err(error) = address_space.walk_pager_fault_ownership(
         |_table| {},
-        |leaf| match phys::release_data_leaf(root_phys, leaf.virtual_address, leaf.physical_address)
-        {
-            Some(phys::DataLeafRelease::FrameReusable) => frames.push(leaf.physical_address),
-            Some(phys::DataLeafRelease::FrameRetained) => {}
-            None => panic!("retired PTE tag disagrees with its data-frame descriptor"),
+        |leaf| {
+            // The first pass already reconciled the deposit with the root's
+            // table ledger. Detach it before returning a huge head to the
+            // allocator; the ordinary table-list drain below owns its free.
+            if leaf.virtual_address.is_multiple_of(ANON_HUGE_BYTES)
+                && leaf.physical_address.is_multiple_of(ANON_HUGE_BYTES)
+            {
+                let _ = phys::take_anon_huge_table(root_phys, leaf.virtual_address, leaf.physical_address);
+            }
+            match phys::release_data_leaf(root_phys, leaf.virtual_address, leaf.physical_address) {
+                Some(phys::DataLeafRelease::FrameReusable) => frames.push(leaf.physical_address),
+                Some(phys::DataLeafRelease::FrameRetained) => {}
+                None => panic!("retired PTE tag disagrees with its data-frame descriptor"),
+            }
         },
     ) {
         panic!(

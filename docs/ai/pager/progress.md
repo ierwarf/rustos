@@ -180,17 +180,19 @@ from one prepared table under the same VMA permit. It publishes the demand
 page first and frees unused frames after admission or CAS loss. Contention,
 fragmentation, a populated leaf, insufficient quota or a disabled policy
 falls back to the existing independent-frame path. Partial `munmap`,
-`mprotect`, COW and exit still operate at 4 KiB granularity; there is no
-hardware 2 MiB user PMD leaf or background collapse worker. The
+`mprotect`, COW and exit still operate at 4 KiB granularity. This is now the
+fallback below the 2 MiB hardware-leaf path described below. The
 `pager-anon-folio-installed` milestone reports successful demand installs
 and the number of additional leaves installed by that attempt.
 
 **Distinguishing a speculative page from a touched one needs no new state.**
 An earlier revision of this file claimed it did, and that was wrong. The CAS
-installs a leaf with the hardware Accessed bit clear, and nothing in this tree
-ever sets or clears it, so `A = 0` on a bit-9 leaf means *populated by
-fault-around and never touched* — exactly the predicate a reclaim policy wants,
-maintained by the CPU for free. What is missing is a **reader**: there is no
+installs a leaf with the hardware Accessed bit clear. On an ordinary fresh
+4 KiB leaf, `A = 0` means *populated by fault-around and never touched*.
+A huge PDE records activity for the entire 2 MiB block; demotion deliberately
+sets A/D on all children because an old huge translation can still write until
+the shootdown completes. A future aging reader must account for this
+conservative split state. What is missing is a **reader**: there is no
 reclaim, no aging sweep, and no swap, so nothing consults it. Add the consumer,
 not the metadata.
 
@@ -200,15 +202,60 @@ number above is sequential first touch. Before raising the run length, measure
 that case; before trusting it under memory pressure, give the run a way to be
 turned down.
 
-**Why 16 and not a 2 MiB huge page.** Linux batches anonymous memory at
-16 KiB–512 KiB (multi-size THP), not at PMD size, because the memory each fault
-must *zero* is what sets its latency spike — and this system's acceptance gate
-is a frame-rate floor, which is a worst-case measure. A 2 MiB page also costs
-~2 MiB per touched byte, needs huge-page PTEs that the user mapping path
-forbids by contract, and would make a sub-2 MiB `munmap` split one PTE into 512
-— a second granularity the range-edit rule in §3 would have to agree with.
-Fault-around is the mechanism a huge-page path would reuse later, so it is the
-right first step rather than a detour.
+### 4.5.1 Anonymous 2 MiB THP (2026-11-27, static review only)
+
+`pagerd` publishes `huge_page_enabled = 1` in anonymous policy ABI v4. The
+96-byte wire retains its first 80 bytes; a separate policy version leaves
+the fault protocol at v3. THP is disabled before publication or if the bounded
+IRQ-off sequence read is unstable. The ordinary `fault_run_pages <= 16`
+limit is independent. The fault reader loads only those two policy fields.
+
+A write first touch can install a real PS=1 PDE only when one committed,
+private, writable, non-executable anonymous VMA completely contains the
+aligned 2 MiB block. Reads, COW/protection faults, file/shared mappings and VMA
+fringes take the existing small-page path. Only the two upper directories are
+prepared before the attempt. An existing PT is never collapsed or replaced.
+
+The physical allocator tries its central lock once and inspects at most 32
+aligned candidates (eight bitmap words each), advancing a dedicated cursor
+on misses. It honors the user watermark and never drains CPU caches or
+compacts memory for this speculative allocation. A failed huge attempt falls
+back to 64 KiB/4 KiB allocation. Every returned constituent remains an ordinary
+4 KiB frame with an exact `(root, va, frame)` descriptor. One batch charge and
+one root census increment replace 512 separate charge/census updates.
+
+The installer reserves a split-table frame and its table charge before the
+PDE CAS. The huge head's otherwise-unused exclusive backing word records this
+deposit; the descriptor size does not grow. After zeroing the whole block and
+claiming all data descriptors, one zero-to-present CAS publishes the mapping.
+The winner publishes the deposit in the root's table list and makes the data
+claims live before dropping its exact VMA permit. A loser detaches the
+deposit, cancels every unpublished claim/charge and returns every frame.
+`pager-anon-huge-installed` counts actual new installs, not competing winners.
+
+Partial protection, unmap, decommit and relocation use the deposited table to
+split without any allocation, including under memory pressure. The 512 PTEs
+preserve physical identities and rights, translate huge PAT bit 12 to PTE
+PAT bit 7, and conservatively retain A/D. The whole old huge translation is
+invalidated before a constituent frame's permissions or lifetime changes.
+Fork demotes under its existing VMA hold before sharing through the established
+4 KiB COW ledger. User-copy and atomic access translate a huge physical base
+plus the full 21-bit offset. Retirement reconciles the deposit and all 512
+claims before detaching/freeing data and draining the root's table list.
+
+This implements demand-time PMD THP with graceful demotion. Background
+collapse/compaction, file-backed THP, huge COW and Linux `MADV_HUGEPAGE` policy
+are not implemented. Sparse writes can commit 2 MiB and zeroing that block
+adds first-fault latency; those tradeoffs remain unmeasured. Source cases cover
+alignment, eligibility, fallback, descriptor rollback/deposit lifetime and
+split flags, but **no compilation, tests, formal execution or KVM measurements
+were run for this batch**. Earlier numbers above do not validate these changes.
+
+Architecture references:
+
+- [Linux THP design and graceful fallback](https://docs.kernel.org/mm/transhuge.html).
+- [Intel SDM Vol. 3A, paging and invalidation](https://cdrdv2-public.intel.com/843856/253668-sdm-vol-3a-dec-24.pdf),
+  sections 5.10.4–5.10.5: new absent entries versus size/permission changes.
 
 ---
 

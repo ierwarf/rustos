@@ -65,24 +65,24 @@ const TABLE_ENTRY_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 /// mapping transaction under its mutation guard, and the exception-time path
 /// under its fault-install permit.  They therefore contend on one atomic
 /// location rather than on a plain store racing a CAS.
-fn with_user_table_entry_atomic<R>(
+pub(super) fn with_user_table_entry_atomic<R>(
     parent_phys: PhysAddr,
     index: usize,
     f: impl FnOnce(&AtomicU64) -> R,
 ) -> R {
-    // SAFETY: the caller owns this root and supplies an in-range index. A
-    // `PageTableEntry` is a `repr(transparent)` `u64` and naturally aligned, and
-    // every writer of an intermediate entry reaches it through this helper.
-    let table = unsafe { kernel_vm::phys_to_table_ref(parent_phys) };
-    let raw = &table[index] as *const PageTableEntry as *mut u64;
-    // SAFETY: `raw` retains the table entry's natural u64 alignment and every
-    // access to this entry is atomic for the duration of this borrowed view.
-    let entry = unsafe { AtomicU64::from_ptr(raw) };
+    assert!(index < ENTRIES_PER_TABLE);
+    let base = kernel_vm::higher_half_addr(parent_phys.as_u64()) as *mut u64;
+    // SAFETY: the caller pins this live page-aligned table and supplied an
+    // in-range index. Derive the atomic view from the raw direct-map pointer,
+    // without first creating a shared non-atomic PageTableEntry reference to
+    // the storage we are about to mutate. All concurrent software writers use
+    // atomic entry publication while fault permits can coexist.
+    let entry = unsafe { AtomicU64::from_ptr(base.add(index)) };
     f(entry)
 }
 
 /// Decides what an observed non-zero intermediate entry authorizes.
-fn classify_user_table_entry(observed: u64) -> Result<PhysAddr, AddressSpaceError> {
+pub(super) fn classify_user_table_entry(observed: u64) -> Result<PhysAddr, AddressSpaceError> {
     let flags = PageTableFlags::from_bits_truncate(observed);
     if flags.contains(PageTableFlags::HUGE_PAGE) {
         return Err(AddressSpaceError::HugePageConflict);
@@ -101,14 +101,18 @@ pub(crate) fn read_user_table_entry(
     parent_phys: PhysAddr,
     index: usize,
 ) -> Result<Option<PhysAddr>, AddressSpaceError> {
+    let observed = read_user_directory_entry(parent_phys, index);
+    if observed == 0 {
+        return Ok(None);
+    }
+    classify_user_table_entry(observed).map(Some)
+}
+
+pub(super) fn read_user_directory_entry(parent_phys: PhysAddr, index: usize) -> u64 {
     with_user_table_entry_atomic(parent_phys, index, |entry| {
-        // ORDERING: Acquire pairs with the installer's release CAS, so a reader
-        // that observes this entry also observes the zeroed table it names.
-        let observed = entry.load(Ordering::Acquire);
-        if observed == 0 {
-            return Ok(None);
-        }
-        classify_user_table_entry(observed).map(Some)
+        // ORDERING: acquire observes the initialized table or huge backing
+        // published by the directory entry's release CAS.
+        entry.load(Ordering::Acquire)
     })
 }
 
@@ -196,9 +200,18 @@ pub fn map_current_prepared_pager_fault_frame_at(
     }
     let page_flags = normalize_user_page_flags(flags)? | ROOT_OWNED_USER_LEAF;
     let root = kernel_vm::current_root_phys();
-    with_prepared_user_leaf_atomic(root, start, |leaf| {
+    let result = with_prepared_user_leaf_atomic(root, start, |leaf| {
         install_prepared_data_leaf(root, start, frame_phys, page_flags, leaf)
-    })
+    });
+    // A concurrent fault in the same VMA may have won the absent PDE with a
+    // huge leaf after our preparation. It already covers this 4 KiB address;
+    // our unpublished frame remains caller-owned just like a lost PTE CAS.
+    if matches!(result, Err(AddressSpaceError::NotMapped))
+        && huge::huge_leaf_at(root, start)?.is_some()
+    {
+        return Ok(false);
+    }
+    result
 }
 
 fn install_prepared_data_leaf(
@@ -448,6 +461,25 @@ fn resolve_cow_write_under_mutation(
 /// reachable from any root.
 pub fn ensure_current_fault_tables_at(
     start: VirtAddr,
+    supply: impl FnMut() -> Option<u64>,
+    release: impl FnMut(u64),
+) -> Result<usize, AddressSpaceError> {
+    ensure_current_fault_levels_at(start, true, supply, release)
+}
+
+/// Prepare only PML4 -> PDPT -> PD so a huge installer can publish directly
+/// into an absent PDE without first allocating an unnecessary hardware PT.
+pub fn ensure_current_fault_directory_at(
+    start: VirtAddr,
+    supply: impl FnMut() -> Option<u64>,
+    release: impl FnMut(u64),
+) -> Result<usize, AddressSpaceError> {
+    ensure_current_fault_levels_at(start, false, supply, release)
+}
+
+fn ensure_current_fault_levels_at(
+    start: VirtAddr,
+    include_leaf_table: bool,
     mut supply: impl FnMut() -> Option<u64>,
     mut release: impl FnMut(u64),
 ) -> Result<usize, AddressSpaceError> {
@@ -456,8 +488,16 @@ pub fn ensure_current_fault_tables_at(
     let mut published = 0;
     let root_phys = kernel_vm::current_root_phys().as_u64();
     let mut parent = PhysAddr::new(root_phys);
-    for index in [p4_index(start), p3_index(start), p2_index(start)] {
-        parent = match read_user_table_entry(parent, index)? {
+    let indices = [p4_index(start), p3_index(start), p2_index(start)];
+    for (level, &index) in indices[..if include_leaf_table { 3 } else { 2 }].iter().enumerate() {
+        let child = match read_user_table_entry(parent, index) {
+            Err(AddressSpaceError::HugePageConflict) if level == 2 => {
+                huge::decode_huge_leaf(read_user_directory_entry(parent, index))?;
+                return Ok(published);
+            }
+            result => result?,
+        };
+        parent = match child {
             Some(child) => child,
             None => {
                 let Some(frame) = supply() else {
@@ -497,6 +537,10 @@ pub fn ensure_current_fault_tables_at(
                     Err(error) => {
                         crate::memory::phys::cancel_lazy_table_record(root_phys, frame);
                         release(frame);
+                        if error == AddressSpaceError::HugePageConflict && level == 2 {
+                            huge::decode_huge_leaf(read_user_directory_entry(parent, index))?;
+                            return Ok(published);
+                        }
                         return Err(error);
                     }
                 }
@@ -736,6 +780,13 @@ impl ProcessAddressSpace {
                 continue;
             };
             for p2 in (0..ENTRIES_PER_TABLE).rev() {
+                let raw = read_user_directory_entry(pd_phys, p2);
+                if raw & PageTableFlags::HUGE_PAGE.bits() != 0 {
+                    huge::decode_huge_leaf(raw)?;
+                    let base = ((USER_PML4_INDEX as u64) << 39)
+                        | ((p3 as u64) << 30) | ((p2 as u64) << 21);
+                    return Ok(Some(base + ANON_HUGE_BYTES));
+                }
                 let Some(pt_phys) = read_user_table_entry(pd_phys, p2)? else {
                     continue;
                 };
@@ -779,41 +830,7 @@ impl ProcessAddressSpace {
         start: VirtAddr,
         page_count: usize,
     ) -> Result<bool, AddressSpaceError> {
-        if page_count == 0 {
-            return Err(AddressSpaceError::ZeroSizedAllocation);
-        }
-        validate_user_page_range(start, page_count)?;
-        let root = self.root_phys();
-        let mut page_index = 0;
-        while page_index < page_count {
-            let virt = page_addr(start, page_index)?;
-            let remaining = page_count - page_index;
-            let Some(pdpt_phys) = read_user_table_entry(root, p4_index(virt))? else {
-                page_index += pages_to_level_boundary(virt, PML4_SHIFT).min(remaining);
-                continue;
-            };
-            let Some(pd_phys) = read_user_table_entry(pdpt_phys, p3_index(virt))? else {
-                page_index += pages_to_level_boundary(virt, PDPT_SHIFT).min(remaining);
-                continue;
-            };
-            let Some(pt_phys) = read_user_table_entry(pd_phys, p2_index(virt))? else {
-                page_index += pages_to_level_boundary(virt, PD_SHIFT).min(remaining);
-                continue;
-            };
-            // SAFETY: every level above resolved to a present non-huge user
-            // table this address space owns, and the caller holds its exact
-            // process state, so no writer can retire it during this read.
-            let table = unsafe { kernel_vm::phys_to_table_ref(pt_phys) };
-            let first_entry = p1_index(virt);
-            let entries_here = (ENTRIES_PER_TABLE - first_entry).min(remaining);
-            for entry in first_entry..first_entry + entries_here {
-                if !table[entry].is_unused() {
-                    return Ok(false);
-                }
-            }
-            page_index += entries_here;
-        }
-        Ok(true)
+        self.first_mapped_user_page(start, page_count).map(|page| page.is_none())
     }
 
     /// Installs one pre-zeroed pager frame at `start`, which must lie inside
@@ -855,7 +872,8 @@ impl ProcessAddressSpace {
         })();
         if let Err(error) = tables {
             phys::cancel_data_leaf(root_phys, virtual_address, frame_phys);
-            drop(mutation);
+            // SAFETY: only absent directories may have been published.
+            unsafe { mutation.finish_without_flush(); }
             return Err(error);
         }
         let installed = with_prepared_user_leaf_mut(root, start, |entry| {
@@ -867,12 +885,15 @@ impl ProcessAddressSpace {
         });
         if let Err(error) = installed {
             phys::cancel_data_leaf(root_phys, virtual_address, frame_phys);
-            drop(mutation);
+            // SAFETY: no leaf was changed and new directories are additive.
+            unsafe { mutation.finish_without_flush(); }
             return Err(error);
         }
 
         phys::publish_data_leaf(root_phys, virtual_address, frame_phys);
-        drop(mutation);
+        // SAFETY: this path only publishes absent directories and one absent
+        // data PTE. It never replaces or releases an old translation.
+        unsafe { mutation.finish_without_flush(); }
         Ok(())
     }
 
@@ -892,6 +913,7 @@ impl ProcessAddressSpace {
         }
         validate_user_page_range(start, page_count)?;
         let page_flags = normalize_user_page_flags(flags)?;
+        self.demote_user_huge_pages(start, page_count)?;
         let root = self.root_phys();
         let mut present = 0_usize;
         for_each_user_pt_chunk_in_range(
@@ -927,13 +949,12 @@ impl ProcessAddressSpace {
         }
 
         let _mutation = begin_address_space_mutation(root);
-        let is_active = Cr3::read().0.start_address() == root;
         for_each_user_pt_chunk_in_range(
             root,
             start,
             page_count,
             read_user_table_entry,
-            |pt_phys, chunk_virt, first_entry, entries_here| {
+            |pt_phys, _chunk_virt, first_entry, entries_here| {
                 // SAFETY: `pt_phys` is a valid present non-huge leaf page table
                 // owned by this address space, and `&mut self` plus the
                 // mutation guard serialize all PTE writers for this root.
@@ -949,11 +970,6 @@ impl ProcessAddressSpace {
                     }
                     let updated = preserve_4k_leaf_pat(entry_flags, page_flags);
                     entry.set_addr(entry.addr(), updated);
-                    if is_active {
-                        tlb::flush(VirtAddr::new(
-                            chunk_virt.as_u64() + (offset as u64) * PAGE_4KIB_U64,
-                        ));
-                    }
                 }
                 Ok(())
             },
@@ -972,6 +988,7 @@ impl ProcessAddressSpace {
             return Err(AddressSpaceError::ZeroSizedAllocation);
         }
         validate_user_page_range(start, page_count)?;
+        self.demote_user_huge_pages(start, page_count)?;
         let range_end = pager_fault_range_end(start, page_count)?;
         let leaves = self.pager_fault_leaves_in_range(start.as_u64(), range_end, page_count)?;
         for leaf in leaves.iter().copied() {
@@ -1018,6 +1035,7 @@ impl ProcessAddressSpace {
             self.immutable_unmap_plan(start.as_u64(), range_end, external_segments)?;
         let external_segments = external_segments.as_slice();
         validate_external_user_segments(external_segments)?;
+        self.demote_user_huge_pages(start, page_count)?;
         let leaves = scan_present_user_leaves_in_range(
             self.root_phys(),
             start.as_u64(),
@@ -1085,6 +1103,7 @@ impl ProcessAddressSpace {
         if !self.user_range_is_unmapped(new_start, page_count)? {
             return Err(AddressSpaceError::AlreadyMapped);
         }
+        self.demote_user_huge_pages(old_start, page_count)?;
         let root_frame = self.pml4_frame_phys;
         let mut leaf_flags: Vec<PageTableFlags> = Vec::new();
         let leaves = scan_present_user_leaves_in_range(
@@ -1286,8 +1305,9 @@ impl ProcessAddressSpace {
     ///
     /// Fork duplication walks the parent one 512-entry page at a time from this
     /// list instead of re-translating every virtual address. The scan applies
-    /// the same validity rules as [`Self::walk_pager_fault_ownership`] (a huge
-    /// directory entry or a non-present owned leaf is corruption), but records
+    /// the post-demotion validity rules (the fork caller first splits every
+    /// huge leaf; a remaining huge directory or non-present owned leaf is a
+    /// violation), but records
     /// only the page, so its allocation is proportional to the number of
     /// page-table pages rather than to the number of resident leaves.
     pub(super) fn owned_leaf_table_pages(
@@ -1353,10 +1373,9 @@ impl ProcessAddressSpace {
     /// normal mapper or a fault published it. This normal-context walk is how
     /// retirement reconciles PTE evidence with the physical descriptor catalog.
     ///
-    /// A non-zero intermediate entry that is not present, or a huge entry in
-    /// the user subtree, is not a reclaim failure but a structural violation:
-    /// nothing in this tree can produce either, so the walk reports it rather
-    /// than guessing what the topology meant.
+    /// A 2 MiB anonymous leaf contributes its deposited table and every 4 KiB
+    /// data claim. Other huge leaves and non-present directory entries remain
+    /// structural violations, never speculative sources of reclaim authority.
     ///
     /// Nothing is collected, so a caller can settle each one as it is found.
     ///
@@ -1386,6 +1405,23 @@ impl ProcessAddressSpace {
             // SAFETY: as above for the next present non-huge owned table.
             let pd = unsafe { kernel_vm::phys_to_table_ref(pd_phys) };
             for p2 in 0..ENTRIES_PER_TABLE {
+                let raw = read_user_directory_entry(pd_phys, p2);
+                if raw & PageTableFlags::HUGE_PAGE.bits() != 0 {
+                    let huge = huge::decode_huge_leaf(raw)?;
+                    let base = ((USER_PML4_INDEX as u64) << 39)
+                        | ((p3 as u64) << 30) | ((p2 as u64) << 21);
+                    let deposit = phys::anon_huge_table(self.pml4_frame_phys, base, huge.head)
+                        .ok_or(AddressSpaceError::InvalidFrameOwnership)?;
+                    on_table(deposit);
+                    for p1 in 0..ENTRIES_PER_TABLE {
+                        let offset = p1 as u64 * PAGE_4KIB_U64;
+                        on_leaf(PagerFaultLeaf {
+                            virtual_address: base + offset,
+                            physical_address: huge.head + offset,
+                        });
+                    }
+                    continue;
+                }
                 let Some(pt_phys) = tagged_child_of(&pd[p2], &mut on_table)? else {
                     continue;
                 };

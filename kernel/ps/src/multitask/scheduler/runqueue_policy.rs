@@ -60,18 +60,10 @@ const fn placement_target_cpu(
 }
 
 pub(in crate::multitask) fn online_affinity_mask(slot: usize) -> u64 {
-    let topology = kernel_hal::api::cpu::topology()
-        .expect("scheduler runqueue placement requires admitted topology");
-    let mut online_mask = 0_u64;
-    for descriptor in topology.cpus() {
-        let Some(snapshot) = kernel_hal::api::cpu::lifecycle_snapshot(descriptor.logical_index)
-        else {
-            continue;
-        };
-        if snapshot.state == kernel_hal::api::cpu::CpuLifecycleState::Online {
-            online_mask |= 1_u64 << descriptor.logical_index;
-        }
-    }
+    // The immutable lifecycle registry owns this observation. Placement no
+    // longer takes the global ACPI lock and copies a topology just to inspect
+    // each CPU's one Online state byte.
+    let online_mask = kernel_hal::api::cpu::online_mask();
     let (task_mask, process_mask, _) = runqueue::affinity_payload::affinity_snapshot(slot);
     let affinity = task_mask & process_mask;
     let eligible = affinity & online_mask;

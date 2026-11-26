@@ -40,7 +40,7 @@ use rustos_svc_runtime::{ipc, pager as pager_rendezvous};
 use rustos_user_abi::pager::{
     pager_pressure_name, PagerAnonymousPolicyWire, PagerFaultDispatchWire, PagerProtectRangeWire,
     PagerReleaseRangeWire, PagerVmRegionWire, MM_BROKER_OP_SET_ANON_POLICY,
-    PAGER_FAULT_ABI_VERSION, PAGER_FAULT_RUN_PAGES_MAX, PAGER_MAX_VMAS_PER_PROCESS,
+    PAGER_ANONYMOUS_POLICY_ABI_VERSION, PAGER_FAULT_RUN_PAGES_MAX, PAGER_MAX_VMAS_PER_PROCESS,
     PAGER_MAX_WIRED_SERVICES,
 };
 use rustos_user_abi::syscall::{
@@ -94,21 +94,6 @@ fn service_main() {
     serve(endpoint as u64, &mut pager);
 }
 
-/// Hands ring0 the anonymous-mapping policy this pager wants enforced.
-///
-/// These are arbitration decisions - how much one fault populates, how many
-/// demand-paged regions a process may hold, which services stay wired - not
-/// mechanism, so they belong here. They lived as ring0 constants only because
-/// the sole transport was a synchronous call on the fault path, which measured
-/// 5.7 ms p99 on `mmap`. Publication stays off the fault path: ring0 reads a
-/// coherent sequence snapshot, and the sole IRQ-off reader falls back to its
-/// compiled-in run length if a concurrent update remains unstable.
-///
-/// Published after the endpoint exists, because ring0 authorizes this by the
-/// caller owning the pager service endpoint rather than by a PID. Ring0 keeps
-/// its own default until this lands, so a failure here leaves the system on
-/// that default rather than half-configured. Later pressure-policy updates use
-/// the same sequence publication instead of mutating fields in place.
 /// Prove the live native supply/withdrawal route before accepting source-backed
 /// work. This is a one-page capability/lifetime check, not file-pager readiness.
 fn source_control_selfcheck(epoch: u64) -> bool {
@@ -124,6 +109,21 @@ fn source_control_selfcheck(epoch: u64) -> bool {
         && pager_rendezvous::source_owner_epoch() == Ok(epoch)
 }
 
+/// Hands ring0 the anonymous-mapping policy this pager wants enforced.
+///
+/// These are arbitration decisions - how much one fault populates, how many
+/// demand-paged regions a process may hold, which services stay wired - not
+/// mechanism, so they belong here. They lived as ring0 constants only because
+/// the sole transport was a synchronous call on the fault path, which measured
+/// 5.7 ms p99 on `mmap`. Publication stays off the fault path: ring0 reads a
+/// coherent sequence snapshot, and the sole IRQ-off reader falls back to its
+/// compiled-in run length with THP disabled if an update remains unstable.
+///
+/// Published after the endpoint exists, because ring0 authorizes this by the
+/// caller owning the pager service endpoint rather than by a PID. Ring0 keeps
+/// its own default until this lands, so a failure here leaves the system on
+/// that default rather than half-configured. Later pressure-policy updates use
+/// the same sequence publication instead of mutating fields in place.
 fn publish_anonymous_policy() {
     let mut wired_services = [0_u64; PAGER_MAX_WIRED_SERVICES];
     // The services the whole system starts through. Ring0 answers anonymous
@@ -136,13 +136,17 @@ fn publish_anonymous_policy() {
     wired_services[3] = IPC_SERVICE_STORAGED;
     wired_services[4] = IPC_SERVICE_LINUX_SYSCALLD;
     let policy = PagerAnonymousPolicyWire {
-        version: PAGER_FAULT_ABI_VERSION,
+        version: PAGER_ANONYMOUS_POLICY_ABI_VERSION,
         reserved0: 0,
         fault_run_pages: PAGER_FAULT_RUN_PAGES_MAX,
         process_vma_ceiling: PAGER_MAX_VMAS_PER_PROCESS as u32,
         demand_enabled: 1,
         wired_services,
-        reserved1: [0; 2],
+        // Try one aligned 2 MiB private anonymous leaf on a write first touch;
+        // fragmentation, quota or an existing PT keeps the 64 KiB/4 KiB path.
+        huge_page_enabled: 1,
+        reserved1: 0,
+        reserved2: 0,
     };
     let args = RustosMmBrokerArgs {
         abi_version: MM_BROKER_ABI_VERSION,

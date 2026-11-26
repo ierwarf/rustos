@@ -8,7 +8,7 @@
 //!   publishes; later pressure-driven publications replace the whole snapshot.
 //! - **Concurrency:** writers publish through an odd/even sequence. Normal
 //!   readers retry; the single IRQ-off reader makes two attempts and falls
-//!   back to the compiled-in run length when a writer is active.
+//!   back to the compiled-in run length with THP disabled while a writer is active.
 //! - **Failure:** malformed policy and bounded writer contention are refused;
 //!   the prior stable snapshot remains authoritative.
 //! - **Forbidden:** no policy widening past the fixed table sizes, no
@@ -39,7 +39,7 @@
 use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 use rustos_user_abi::pager::{
-    PAGER_FAULT_ABI_VERSION, PAGER_FAULT_RUN_PAGES_MAX, PAGER_MAX_VMAS_PER_PROCESS,
+    PAGER_ANONYMOUS_POLICY_ABI_VERSION, PAGER_FAULT_RUN_PAGES_MAX, PAGER_MAX_VMAS_PER_PROCESS,
     PAGER_MAX_WIRED_SERVICES, PagerAnonymousPolicyWire,
 };
 use rustos_user_abi::syscall::{
@@ -51,6 +51,19 @@ use rustos_user_abi::syscall::{
 const UNPUBLISHED: u64 = 0;
 const MAX_PUBLICATION_SEQUENCE: u64 = u64::MAX - 2;
 const POLICY_WRITE_ATTEMPTS: usize = 128;
+
+/// Only the fields a fault needs. Reading admission ceilings and eight wired
+/// service ids on every first touch would add unrelated atomic loads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AnonymousFaultPolicy {
+    pub fault_run_pages: u32,
+    pub huge_page_enabled: u32,
+}
+
+const DEFAULT_FAULT_POLICY: AnonymousFaultPolicy = AnonymousFaultPolicy {
+    fault_run_pages: PAGER_FAULT_RUN_PAGES_MAX,
+    huge_page_enabled: 0,
+};
 
 /// What ring0 applies until a pager publishes.
 ///
@@ -69,13 +82,17 @@ pub(crate) fn default_policy() -> PagerAnonymousPolicyWire {
     wired_services[3] = IPC_SERVICE_STORAGED;
     wired_services[4] = IPC_SERVICE_LINUX_SYSCALLD;
     PagerAnonymousPolicyWire {
-        version: PAGER_FAULT_ABI_VERSION,
+        version: PAGER_ANONYMOUS_POLICY_ABI_VERSION,
         reserved0: 0,
-        fault_run_pages: PAGER_FAULT_RUN_PAGES_MAX,
+        fault_run_pages: DEFAULT_FAULT_POLICY.fault_run_pages,
         process_vma_ceiling: PAGER_MAX_VMAS_PER_PROCESS as u32,
         demand_enabled: 1,
         wired_services,
-        reserved1: [0; 2],
+        // A huge allocation is a distinct pagerd opt-in. Bootstrap and an
+        // unstable IRQ-off snapshot preserve the bounded 4 KiB fallback.
+        huge_page_enabled: DEFAULT_FAULT_POLICY.huge_page_enabled,
+        reserved1: 0,
+        reserved2: 0,
     }
 }
 
@@ -84,6 +101,7 @@ struct PublishedAnonymousPolicy {
     fault_run_pages: AtomicU64,
     process_vma_ceiling: AtomicU64,
     demand_enabled: AtomicU64,
+    huge_page_enabled: AtomicU64,
     wired_services: [AtomicU64; PAGER_MAX_WIRED_SERVICES],
 }
 
@@ -94,6 +112,7 @@ impl PublishedAnonymousPolicy {
             fault_run_pages: AtomicU64::new(0),
             process_vma_ceiling: AtomicU64::new(0),
             demand_enabled: AtomicU64::new(0),
+            huge_page_enabled: AtomicU64::new(0),
             wired_services: [const { AtomicU64::new(0) }; PAGER_MAX_WIRED_SERVICES],
         }
     }
@@ -132,6 +151,8 @@ impl PublishedAnonymousPolicy {
             .store(u64::from(policy.process_vma_ceiling), Ordering::Relaxed);
         self.demand_enabled
             .store(u64::from(policy.demand_enabled), Ordering::Relaxed);
+        self.huge_page_enabled
+            .store(u64::from(policy.huge_page_enabled), Ordering::Relaxed);
         for (slot, service_id) in self
             .wired_services
             .iter()
@@ -146,7 +167,7 @@ impl PublishedAnonymousPolicy {
         true
     }
 
-    fn read(&self) -> Result<Option<PagerAnonymousPolicyWire>, ()> {
+    fn read_payload<T>(&self, mut read_payload: impl FnMut() -> T) -> Result<Option<T>, ()> {
         for _ in 0..2 {
             let before = self.sequence.load(Ordering::Acquire);
             if before == UNPUBLISHED {
@@ -156,19 +177,7 @@ impl PublishedAnonymousPolicy {
                 continue;
             }
 
-            let mut wired_services = [0_u64; PAGER_MAX_WIRED_SERVICES];
-            for (destination, slot) in wired_services.iter_mut().zip(self.wired_services.iter()) {
-                *destination = slot.load(Ordering::Relaxed);
-            }
-            let policy = PagerAnonymousPolicyWire {
-                version: PAGER_FAULT_ABI_VERSION,
-                reserved0: 0,
-                fault_run_pages: self.fault_run_pages.load(Ordering::Relaxed) as u32,
-                process_vma_ceiling: self.process_vma_ceiling.load(Ordering::Relaxed) as u32,
-                demand_enabled: self.demand_enabled.load(Ordering::Relaxed) as u32,
-                wired_services,
-                reserved1: [0; 2],
-            };
+            let payload = read_payload();
 
             // ORDERING: the Acquire fence keeps the Relaxed payload loads above
             // from being reordered after the second sequence load (an Acquire
@@ -178,10 +187,37 @@ impl PublishedAnonymousPolicy {
             fence(Ordering::Acquire);
             let after = self.sequence.load(Ordering::Acquire);
             if before == after {
-                return Ok(Some(policy));
+                return Ok(Some(payload));
             }
         }
         Err(())
+    }
+
+    fn read(&self) -> Result<Option<PagerAnonymousPolicyWire>, ()> {
+        self.read_payload(|| {
+            let mut wired_services = [0_u64; PAGER_MAX_WIRED_SERVICES];
+            for (destination, slot) in wired_services.iter_mut().zip(self.wired_services.iter()) {
+                *destination = slot.load(Ordering::Relaxed);
+            }
+            PagerAnonymousPolicyWire {
+                version: PAGER_ANONYMOUS_POLICY_ABI_VERSION,
+                reserved0: 0,
+                fault_run_pages: self.fault_run_pages.load(Ordering::Relaxed) as u32,
+                process_vma_ceiling: self.process_vma_ceiling.load(Ordering::Relaxed) as u32,
+                demand_enabled: self.demand_enabled.load(Ordering::Relaxed) as u32,
+                wired_services,
+                huge_page_enabled: self.huge_page_enabled.load(Ordering::Relaxed) as u32,
+                reserved1: 0,
+                reserved2: 0,
+            }
+        })
+    }
+
+    fn read_fault(&self) -> Result<Option<AnonymousFaultPolicy>, ()> {
+        self.read_payload(|| AnonymousFaultPolicy {
+            fault_run_pages: self.fault_run_pages.load(Ordering::Relaxed) as u32,
+            huge_page_enabled: self.huge_page_enabled.load(Ordering::Relaxed) as u32,
+        })
     }
 }
 
@@ -203,14 +239,14 @@ pub(crate) fn anonymous_policy() -> PagerAnonymousPolicyWire {
 
 /// The policy in force for the IRQ-off best-effort fault-around reader.
 ///
-/// Two failed sequence attempts change only this fault's speculative run
-/// length, so the compiled-in default is the safe bounded fallback.
-pub(crate) fn anonymous_policy_irq_off() -> PagerAnonymousPolicyWire {
+/// Two failed sequence attempts use the bounded run with THP disabled. An
+/// unstable policy can never grant a speculative huge allocation.
+pub(crate) fn anonymous_fault_policy_irq_off() -> AnonymousFaultPolicy {
     ANONYMOUS_POLICY
-        .read()
+        .read_fault()
         .ok()
         .flatten()
-        .unwrap_or_else(default_policy)
+        .unwrap_or(DEFAULT_FAULT_POLICY)
 }
 
 /// Replaces the policy snapshot. `false` means the prior snapshot stands.
@@ -233,6 +269,7 @@ mod tests {
             PAGER_MAX_VMAS_PER_PROCESS
         );
         assert_eq!(policy.demand_enabled, 1);
+        assert_eq!(policy.huge_page_enabled, 0);
         for service_id in [
             IPC_SERVICE_PAGERD,
             IPC_SERVICE_ROOTD,
@@ -275,24 +312,38 @@ mod tests {
         let mut unknown_toggle = default_policy();
         unknown_toggle.demand_enabled = 2;
         assert!(!unknown_toggle.is_canonical());
+
+        let mut unknown_huge_toggle = default_policy();
+        unknown_huge_toggle.huge_page_enabled = 2;
+        assert!(!unknown_huge_toggle.is_canonical());
     }
 
     #[test]
     fn every_publication_is_a_coherent_replaceable_snapshot() {
         let slot = PublishedAnonymousPolicy::empty();
         assert_eq!(slot.read(), Ok(None));
+        assert_eq!(slot.read_fault(), Ok(None));
 
         let mut first = default_policy();
         first.fault_run_pages = 4;
         first.demand_enabled = 0;
         assert!(slot.publish(first));
         assert_eq!(slot.read(), Ok(Some(first)));
+        assert_eq!(slot.read_fault(), Ok(Some(AnonymousFaultPolicy {
+            fault_run_pages: first.fault_run_pages,
+            huge_page_enabled: first.huge_page_enabled,
+        })));
 
         let mut second = default_policy();
         second.fault_run_pages = 1;
         second.process_vma_ceiling = 7;
+        second.huge_page_enabled = 1;
         assert!(slot.publish(second));
         assert_eq!(slot.read(), Ok(Some(second)));
+        assert_eq!(slot.read_fault(), Ok(Some(AnonymousFaultPolicy {
+            fault_run_pages: second.fault_run_pages,
+            huge_page_enabled: second.huge_page_enabled,
+        })));
     }
 
     #[test]
@@ -310,6 +361,7 @@ mod tests {
         second.fault_run_pages = 1;
         second.process_vma_ceiling = 23;
         second.demand_enabled = 1;
+        second.huge_page_enabled = 1;
 
         let writer_slot = Arc::clone(&slot);
         let writer_done = Arc::clone(&done);
@@ -326,6 +378,18 @@ mod tests {
             if let Ok(Some(observed)) = slot.read() {
                 assert!(observed == first || observed == second);
             }
+            if let Ok(Some(observed)) = slot.read_fault() {
+                assert!(
+                    observed == (AnonymousFaultPolicy {
+                        fault_run_pages: first.fault_run_pages,
+                        huge_page_enabled: first.huge_page_enabled,
+                    })
+                    || observed == (AnonymousFaultPolicy {
+                        fault_run_pages: second.fault_run_pages,
+                        huge_page_enabled: second.huge_page_enabled,
+                    })
+                );
+            }
         }
         writer.join().unwrap();
     }
@@ -335,5 +399,6 @@ mod tests {
         let slot = PublishedAnonymousPolicy::empty();
         slot.sequence.store(1, Ordering::Release);
         assert_eq!(slot.read(), Err(()));
+        assert_eq!(slot.read_fault(), Err(()));
     }
 }

@@ -8,9 +8,17 @@ fn ledger() -> (
     Vec<FrameDescriptorRecord>,
     Vec<CowMappingRecord>,
 ) {
+    ledger_with_frames(16)
+}
+
+fn ledger_with_frames(frames: usize) -> (
+    FrameDescriptorLedger,
+    Vec<FrameDescriptorRecord>,
+    Vec<CowMappingRecord>,
+) {
     let mut records: Vec<FrameDescriptorRecord> =
-        (0..16).map(|_| FrameDescriptorRecord::empty()).collect();
-    let mut mappings: Vec<CowMappingRecord> = (0..16).map(|_| CowMappingRecord::empty()).collect();
+        (0..frames).map(|_| FrameDescriptorRecord::empty()).collect();
+    let mut mappings: Vec<CowMappingRecord> = (0..frames).map(|_| CowMappingRecord::empty()).collect();
     let ledger = FrameDescriptorLedger::empty();
     ledger.install(
         records.as_mut_ptr(),
@@ -19,6 +27,98 @@ fn ledger() -> (
         mappings.len(),
     );
     (ledger, records, mappings)
+}
+
+#[test]
+fn huge_data_run_preserves_split_table_and_independent_leaf_lifetimes() {
+    let (ledger, _records, _mappings) = ledger_with_frames(1024);
+    let root = PAGE_SIZE;
+    let table = PAGE_SIZE * 2;
+    let child = PAGE_SIZE * 3;
+    let first = PAGE_SIZE * 512;
+    let va = 0x8000_0000;
+    ledger.register_root(root);
+    ledger.register_root(child);
+    assert_eq!(ledger.claim_table(root, table), TableClaim::Claimed);
+    ledger.publish_table(root, table);
+    assert_eq!(ledger.claim_exclusive_data_run(root, va, first, 512), DataClaim::Claimed);
+    assert!(!ledger.deposit_anon_huge_table(root, va + PAGE_SIZE, first, table));
+    assert!(ledger.deposit_anon_huge_table(root, va, first, table));
+    assert!(!ledger.deposit_anon_huge_table(root, va, first, table));
+    ledger.publish_exclusive_data_run(root, va, first, 512);
+    assert_eq!(census(&ledger, root), (512, 0, 512));
+    assert_eq!(ledger.anon_huge_table(root, va, first), Some(table));
+    assert_eq!(ledger.anon_huge_table(child, va, first), None);
+    assert_eq!(ledger.release_data(root, va, first), None);
+    assert!(!ledger.rekey_data(root, va, va + PAGE_SIZE, first));
+    assert!(ledger.prepare_shared_alias(root, va, child, va, first, CowFrameKind::AnonymousFork, 0).is_none());
+    assert_eq!(ledger.anon_huge_table(root, va, first), Some(table));
+    assert_eq!(ledger.take_anon_huge_table(root, va, first), Some(table));
+    assert_eq!(ledger.take_anon_huge_table(root, va, first), None);
+    assert!(ledger.table_is_owned(root, table), "taking a deposit does not release table custody");
+    for index in 0..512 {
+        let offset = index * PAGE_SIZE;
+        assert!(ledger.data_is_owned(root, va + offset, first + offset));
+        assert_eq!(ledger.release_data(root, va + offset, first + offset), Some(DataLeafRelease::FrameReusable));
+    }
+    assert_eq!(census(&ledger, root), (0, 0, 0));
+    assert_eq!(ledger.pop_table(root), Some(table));
+    ledger.unregister_root(child);
+    ledger.unregister_root(root);
+}
+
+#[test]
+fn exclusive_run_rolls_back_quota_conflicts_and_cancelled_claims_exactly() {
+    let (ledger, _records, _mappings) = ledger();
+    let root = PAGE_SIZE;
+    let va = 0x8000_0000;
+    let first = PAGE_SIZE * 3;
+    charge::init_group(39, None);
+    ledger.register_root(root);
+    assert!(ledger.bind_charge(root, 39));
+    charge::set_limit(39, 3);
+    assert_eq!(ledger.claim_exclusive_data_run(root, va, first, 4), DataClaim::Quota);
+    assert_eq!(charge::usage(39), 0);
+    charge::set_limit(39, 4);
+    assert_eq!(ledger.claim_exclusive_data_run(root, va, first, 4), DataClaim::Claimed);
+    assert_eq!(charge::usage(39), 4);
+    ledger.cancel_exclusive_data_run(root, va, first, 4);
+    assert_eq!(charge::usage(39), 0);
+    assert_eq!(census(&ledger, root), (0, 0, 0));
+
+    let conflicting = first + 2 * PAGE_SIZE;
+    assert_eq!(ledger.claim_exclusive_data(root, va + 8 * PAGE_SIZE, conflicting, true), DataClaim::Claimed);
+    ledger.publish_exclusive_data(root, va + 8 * PAGE_SIZE, conflicting);
+    charge::set_limit(39, 5);
+    assert_eq!(ledger.claim_exclusive_data_run(root, va, first, 4), DataClaim::Invalid);
+    assert_eq!(charge::usage(39), 1);
+    for index in [0, 1, 3] {
+        assert_eq!(ledger.record(first + index * PAGE_SIZE).unwrap().role.load(DESCRIPTOR_ACQUIRE), ROLE_FREE);
+    }
+    assert!(ledger.data_is_owned(root, va + 8 * PAGE_SIZE, conflicting));
+    assert_eq!(ledger.release_data(root, va + 8 * PAGE_SIZE, conflicting), Some(DataLeafRelease::FrameReusable));
+    assert_eq!(charge::usage(39), 0);
+    ledger.unregister_root(root);
+}
+
+#[test]
+fn exclusive_run_rejects_invalid_ranges_before_claiming_any_frame() {
+    let (ledger, _records, _mappings) = ledger();
+    let root = PAGE_SIZE * 4;
+    let va = 0x8000_0000;
+    ledger.register_root(root);
+    for (va, first, pages) in [
+        (va, PAGE_SIZE * 5, 0),
+        (va, PAGE_SIZE * 5 + 1, 2),
+        (va + 1, PAGE_SIZE * 5, 2),
+        (va, PAGE_SIZE * 3, 3),
+        (va, PAGE_SIZE * 15, 2),
+        (u64::MAX & !(PAGE_SIZE - 1), PAGE_SIZE * 5, 2),
+    ] {
+        assert_eq!(ledger.claim_exclusive_data_run(root, va, first, pages), DataClaim::Invalid);
+    }
+    assert_eq!(census(&ledger, root), (0, 0, 0));
+    ledger.unregister_root(root);
 }
 
 #[test]

@@ -12,9 +12,11 @@
 //!   lock-free `cached` bitmap. Lock order is cache slot -> central allocator,
 //!   one slot at a time. A cached frame is *free*: it counts toward free
 //!   memory, the user watermark and the OOM watchdog (`free = central +
-//!   sum(cache counts)`), is returned to the central set before any contiguous
-//!   search, fixed claim or reported exhaustion, and is rejected as
+//!   sum(cache counts)`), is returned to the central set before a required
+//!   contiguous/fixed claim reports exhaustion, and is rejected as
 //!   `AlreadyFree` if released again.
+//!   Speculative anonymous folio/huge-page probes never drain caches; they
+//!   bound bitmap work and fall back to the ordinary allocator on failure.
 //! - **Failure:** Exhaustion is explicit; invalid, double, partial, and
 //!   reserved-range frees are rejected before mutation.
 //! - **Forbidden:** No fixed 4 KiB policy outside architecture page size, silent
@@ -86,6 +88,8 @@ pub use frame_descriptor_ledger::{
     register_data_leaf_root,
     register_lazy_table_root, rekey_data_leaf, release_data_leaf, rollback_shared_alias, try_claim_cow_mapping,
     unregister_data_leaf_root,
+    anon_huge_table, cancel_data_leaf_run, claim_data_leaf_run, deposit_anon_huge_table,
+    publish_data_leaf_run, take_anon_huge_table,
 };
 use frame_descriptor_ledger::{CowMappingRecord, FRAME_DESCRIPTORS, FrameDescriptorRecord};
 
@@ -136,6 +140,9 @@ struct PhysAllocatorState {
     /// Frames only kernel-class allocation may consume. See [`min_free_for`].
     min_free_frames: usize,
     next_hint: usize,
+    /// Independent scan cursor so a failed huge-page probe does not repeatedly
+    /// rescan the same fragmented prefix or move the ordinary-frame cursor.
+    huge_next_block: usize,
 }
 
 // SAFETY: the state is reachable only through the pool's central lock, whose
@@ -330,6 +337,7 @@ impl PhysAllocatorState {
             free_frames: 0,
             min_free_frames: 0,
             next_hint: 0,
+            huge_next_block: 1,
         }
     }
 
@@ -493,6 +501,42 @@ impl PhysAllocatorState {
         None
     }
 
+    /// Bounded opportunistic 2 MiB allocation. Each candidate is eight bitmap
+    /// words; failure never drains CPU caches or performs compaction. The
+    /// ordinary 4 KiB allocator retains ownership of every constituent frame.
+    fn try_alloc_anon_huge_frame_locked(&mut self) -> Option<PhysAddr> {
+        const SEARCH_BLOCKS: usize = 32;
+        const WORDS_PER_BLOCK: usize = ANON_HUGE_PAGE_COUNT / BITS_PER_WORD;
+        if !self.initialized
+            || self.free_frames.saturating_sub(self.min_free_frames) < ANON_HUGE_PAGE_COUNT
+        {
+            return None;
+        }
+        // Block zero contains physical page zero, which is never a data frame.
+        // Round down so a partial final block is never inspected or returned.
+        let blocks = self.geo.frame_count / ANON_HUGE_PAGE_COUNT;
+        if blocks <= 1 {
+            return None;
+        }
+        let first = self.huge_next_block.clamp(1, blocks - 1);
+        let mut block = first;
+        for _ in 0..(blocks - 1).min(SEARCH_BLOCKS) {
+            self.huge_next_block = if block + 1 == blocks { 1 } else { block + 1 };
+            let first_word = block * WORDS_PER_BLOCK;
+            // Non-usable, reserved and cached frames all remain set in `used`.
+            // The central lock excludes allocation while these words are read.
+            if (first_word..first_word + WORDS_PER_BLOCK)
+                .all(|word| self.geo.used.load_word(word) == 0)
+            {
+                let frame = block * ANON_HUGE_PAGE_COUNT;
+                self.commit_alloc_locked(frame, ANON_HUGE_PAGE_COUNT);
+                return Some(PhysAddr::new(frame as u64 * PAGE_SIZE));
+            }
+            block = self.huge_next_block;
+        }
+        None
+    }
+
     /// Fills `out` with up to `out.len()` single frames under one lock hold,
     /// stopping at the first allocation failure. Unlike
     /// `alloc_contiguous_locked`, frames need not be adjacent — callers that
@@ -541,26 +585,48 @@ impl PhysAllocatorState {
         mut should_fail: impl FnMut() -> bool,
     ) -> usize {
         let mut filled = 0;
+        let mut available = 0_u64;
+        let mut word_index = 0;
+        let mut used_word = 0_u64;
         while filled < out.len() {
             if should_fail() {
                 crate::debug::warn!(memory, "fault injection: alloc.frame failed");
                 break;
             }
-            match self.alloc_single_frame_locked() {
-                Some(addr) => {
-                    out[filled] = addr;
-                    filled += 1;
-                }
-                None => break,
+            if available == 0 {
+                let Some(word) = self.free_word_at_hint_locked() else {
+                    break;
+                };
+                (word_index, used_word, available) = word;
             }
+            // Reuse the loaded word for every free bit in it. The old path
+            // restarted the usable-range walk and loaded this same word for
+            // every frame in a batch. `used` admits only boot-usable frames.
+            let bit = available.trailing_zeros() as usize;
+            available &= available - 1;
+            used_word |= 1_u64 << bit;
+            let frame = word_index * BITS_PER_WORD + bit;
+            self.geo.used.store_word(word_index, used_word);
+            self.free_frames -= 1;
+            self.next_hint = frame + 1;
+            out[filled] = PhysAddr::new(frame as u64 * PAGE_SIZE);
+            filled += 1;
         }
         filled
     }
 
-    fn alloc_single_frame_locked(&mut self) -> Option<PhysAddr> {
-        let start_frame = self.find_alloc_start_locked(1)?;
-        self.commit_alloc_locked(start_frame, 1);
-        Some(PhysAddr::new(start_frame as u64 * PAGE_SIZE))
+    /// Returns the next allocation word and every usable free bit at or after
+    /// its first candidate. Non-usable bits are permanently set in `used`;
+    /// the explicit end mask also excludes padding in the last bitmap word.
+    fn free_word_at_hint_locked(&self) -> Option<(usize, u64, u64)> {
+        let first = self.find_alloc_start_locked(1)?;
+        let word_index = first / BITS_PER_WORD;
+        let used = self.geo.used.load_word(word_index);
+        let word_end = ((word_index + 1) * BITS_PER_WORD).min(self.geo.frame_count);
+        let valid_bits = word_end - word_index * BITS_PER_WORD;
+        let valid = u64::MAX >> (BITS_PER_WORD - valid_bits);
+        let available = !used & valid & (u64::MAX << (first % BITS_PER_WORD));
+        Some((word_index, used, available))
     }
 
     fn commit_alloc_locked(&mut self, start_frame: usize, page_count: usize) {
@@ -611,6 +677,12 @@ impl PhysAllocatorState {
             let mut frame = range_start;
             while let Some(candidate) = self.next_free_frame_in_range(frame, start_limit_end) {
                 scanned = scanned.saturating_add(candidate.saturating_sub(frame) + 1);
+                // The search already proved this bit free. Single-frame
+                // allocation and cache refill need no second bitmap load.
+                if page_count == 1 {
+                    self.record_scan_milestone(scanned);
+                    return Some(candidate);
+                }
                 let run_len = self.free_run_len_from(candidate, range_end, page_count);
 
                 if run_len == page_count {
@@ -707,14 +779,28 @@ impl PhysAllocatorState {
         self.next_hint = self.next_hint.min(frame_index);
     }
 
-    /// Picks a free frame for a CPU cache and publishes it as `cached` before
-    /// it is marked used, so no window shows a used, uncached frame that a
-    /// duplicate release could mistake for an allocation.
-    fn take_frame_for_cache_locked(&mut self) -> Option<usize> {
-        let start = self.find_alloc_start_locked(1)?;
-        self.geo.cached.test_and_set(start);
-        self.commit_alloc_locked(start, 1);
-        Some(start)
+    /// Refills a CPU cache one bitmap word at a time. Publish each cached bit
+    /// before its used bit, so no window shows an uncached allocated frame.
+    fn take_frames_for_cache_locked(&mut self, out: &mut [usize]) -> usize {
+        let mut filled = 0;
+        while filled < out.len() {
+            let Some((word_index, mut used, mut available)) = self.free_word_at_hint_locked() else {
+                break;
+            };
+            while filled < out.len() && available != 0 {
+                let bit = available.trailing_zeros() as usize;
+                available &= available - 1;
+                let frame = word_index * BITS_PER_WORD + bit;
+                self.geo.cached.test_and_set(frame);
+                used |= 1_u64 << bit;
+                self.geo.used.store_word(word_index, used);
+                self.free_frames -= 1;
+                self.next_hint = frame + 1;
+                out[filled] = frame;
+                filled += 1;
+            }
+        }
+        filled
     }
 
     /// Frees every frame in `frames` under one lock hold. Every failure is
@@ -1085,6 +1171,9 @@ pub fn try_free_frame(phys: PhysAddr) -> Result<(), FreeFrameError> {
 /// allocation is naturally aligned and the frames can retire independently.
 pub(crate) const ANON_FOLIO_PAGES: usize = 16;
 
+/// Number of ordinary physical frames backing one hardware 2 MiB user leaf.
+pub(crate) const ANON_HUGE_PAGE_COUNT: usize = 512;
+
 /// A nonblocking user-class allocation for the IRQ-off first-touch path.
 /// Fragmentation or contention simply leaves the ordinary fault path in charge.
 pub(crate) fn try_alloc_anon_folio() -> Option<PhysAddr> {
@@ -1092,6 +1181,16 @@ pub(crate) fn try_alloc_anon_folio() -> Option<PhysAddr> {
         return None;
     }
     irq_safe(|| PHYS_POOL.try_alloc_anon_folio())
+}
+
+/// Tries one naturally aligned, user-class 2 MiB span without waiting on the
+/// central lock. Contention, fragmentation and reserve pressure are ordinary
+/// fallback outcomes; all returned frames remain individually releasable.
+pub(crate) fn try_alloc_anon_huge_frame() -> Option<PhysAddr> {
+    if nucleus_core::util::fault_injection::should_fail("alloc.frame") {
+        return None;
+    }
+    irq_safe(|| PHYS_POOL.try_alloc_anon_huge_frame())
 }
 
 /// Fills `out` with independent (not necessarily adjacent) user-class frames,
@@ -1360,6 +1459,55 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_huge_frame_is_aligned_and_keeps_independent_frame_ownership() {
+        let mut words = [0_u64; 32];
+        let mut state = test_state(&mut words, 2048, 17);
+        state.reserve_phys_range((ANON_HUGE_PAGE_COUNT as u64 + 7) * PAGE_SIZE, PAGE_SIZE);
+        let before = state.free_frames;
+        let head = state.try_alloc_anon_huge_frame_locked().unwrap();
+        assert_eq!(head.as_u64(), 2 * ANON_HUGE_PAGE_COUNT as u64 * PAGE_SIZE);
+        assert_eq!(state.free_frames, before - ANON_HUGE_PAGE_COUNT);
+        let start = (head.as_u64() / PAGE_SIZE) as usize;
+        assert!((start..start + ANON_HUGE_PAGE_COUNT).all(|frame| state.is_used(frame)));
+        state.free_frame_locked(PhysAddr::new(head.as_u64() + 137 * PAGE_SIZE)).unwrap();
+        assert!(!state.is_used(start + 137));
+        assert!(state.is_used(start + 136) && state.is_used(start + 138));
+        assert_eq!(state.free_frames, before - ANON_HUGE_PAGE_COUNT + 1);
+    }
+
+    #[test]
+    fn anonymous_huge_scan_is_bounded_and_advances_past_fragmented_blocks() {
+        let mut words = [0_u64; 35 * 8];
+        let mut state = test_state(&mut words, 35 * ANON_HUGE_PAGE_COUNT, 73);
+        for block in 1..=32 {
+            state.reserve_phys_range((block * ANON_HUGE_PAGE_COUNT) as u64 * PAGE_SIZE, PAGE_SIZE);
+        }
+        let before = state.free_frames;
+        assert_eq!(state.try_alloc_anon_huge_frame_locked(), None);
+        assert_eq!(state.free_frames, before);
+        assert_eq!(state.next_hint, 73, "a failed probe must not disturb small allocations");
+        assert_eq!(state.huge_next_block, 33);
+        assert_eq!(state.try_alloc_anon_huge_frame_locked(),
+            Some(PhysAddr::new(33 * ANON_HUGE_PAGE_COUNT as u64 * PAGE_SIZE)));
+    }
+
+    #[test]
+    fn anonymous_huge_probe_honors_watermark_and_rejects_incomplete_tail() {
+        let mut words = [0_u64; 24];
+        let mut state = test_state(&mut words, 1535, 0);
+        let before = state.free_frames;
+        state.min_free_frames = before - ANON_HUGE_PAGE_COUNT + 1;
+        assert_eq!(state.try_alloc_anon_huge_frame_locked(), None);
+        assert_eq!(state.free_frames, before);
+        state.min_free_frames -= 1;
+        assert_eq!(state.try_alloc_anon_huge_frame_locked(), Some(PhysAddr::new(512 * PAGE_SIZE)));
+        assert_eq!(state.free_frames, state.min_free_frames);
+        state.min_free_frames = 0;
+        assert_eq!(state.try_alloc_anon_huge_frame_locked(), None,
+            "block zero and an incomplete final block are never huge candidates");
+    }
+
+    #[test]
     fn device_aperture_overlap_check_is_fail_closed() {
         let mut words = [0_u64; 4];
         let state = test_state(&mut words, 256, 0);
@@ -1560,6 +1708,29 @@ mod tests {
         seen.dedup();
         assert_eq!(seen.len(), 5, "batch must not repeat a frame");
         assert_eq!(state.free_frames, 3);
+    }
+
+    #[test]
+    fn batch_word_walk_handles_fragmentation_wrap_and_partial_final_word() {
+        let mut bitmap = [0_u64; 3];
+        let mut state = test_state(&mut bitmap, 149, 130);
+        for frame in (0..149).step_by(7) {
+            state.reserve_phys_range(frame as u64 * PAGE_SIZE, PAGE_SIZE);
+        }
+        let expected = state.free_frames;
+        let mut out = [PhysAddr::new(0); 154];
+        assert_eq!(state.alloc_frames_locked_with_fault_gate(&mut out, || false), expected);
+        assert_eq!(state.free_frames, 0);
+        let mut seen = [false; 149];
+        for frame in &out[..expected] {
+            let index = (frame.as_u64() / PAGE_SIZE) as usize;
+            assert!(index < 149 && !index.is_multiple_of(7));
+            assert!(!seen[index], "batch returned one physical frame twice");
+            seen[index] = true;
+        }
+        for (frame, seen) in seen.into_iter().enumerate() {
+            assert_eq!(seen, !frame.is_multiple_of(7));
+        }
     }
 
     #[test]

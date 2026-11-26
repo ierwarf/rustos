@@ -163,7 +163,19 @@ fn install_stack_and_abi(local: &mut SyscallCpuLocal, kernel_stack_top: u64, reg
 }
 
 pub fn prepare_for_context_return(returning_to_user: bool, user_gs_base: u64) {
-    let logical_index = current_logical_index();
+    interrupts::without_interrupts(|| {
+        let logical_index = current_logical_index();
+        prepare_for_context_return_masked(logical_index, returning_to_user, user_gs_base);
+    });
+}
+
+/// Install the GS pair while the caller retains this exact CPU with IRQs
+/// masked. Scheduler architecture receipts already hold that exclusion and
+/// need neither another CPU-index lookup nor another interrupt bracket.
+pub fn prepare_for_context_return_masked(
+    logical_index: usize, returning_to_user: bool, user_gs_base: u64,
+) {
+    debug_assert!(!interrupts::are_enabled());
     assert_cpu_local_live(logical_index);
     // SAFETY: the exact logical CPU slot is live and remains allocated for the
     // kernel lifetime; the value is consumed only as an MSR base address.
@@ -174,15 +186,13 @@ pub fn prepare_for_context_return(returning_to_user: bool, user_gs_base: u64) {
     // `IA32_GS_BASE` is not what this function last wrote there. A cache of the
     // last written pair skipped the rewrite while the pair was swapped and
     // double-faulted on the first GS-relative kernel access that followed.
-    interrupts::without_interrupts(|| {
-        if returning_to_user {
-            GsBase::write(user_gs_base);
-            KernelGsBase::write(kernel_gs_base);
-        } else {
-            GsBase::write(kernel_gs_base);
-            KernelGsBase::write(user_gs_base);
-        }
-    });
+    if returning_to_user {
+        GsBase::write(user_gs_base);
+        KernelGsBase::write(kernel_gs_base);
+    } else {
+        GsBase::write(kernel_gs_base);
+        KernelGsBase::write(user_gs_base);
+    }
 }
 
 fn current_logical_index() -> usize {

@@ -22,6 +22,8 @@ static REJECTED_ANONYMOUS_FAULT_MAPS: AtomicU64 = AtomicU64::new(0);
 /// Pages populated around a fault rather than by a fault of their own.
 static POPULATED_RUN_PAGES: AtomicU64 = AtomicU64::new(0);
 static ANON_FOLIO_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// Newly published hardware 2 MiB leaves, excluding races won by another CPU.
+static ANON_HUGE_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Anonymous faults ring0 could not serve because the wired reserve was empty.
 static RING0_FAULTS_WITHOUT_FRAME: AtomicU64 = AtomicU64::new(0);
 /// Anonymous faults restarted because a VMA writer held the publication.
@@ -409,13 +411,13 @@ pub enum AnonymousFaultOutcome {
 
 /// The IRQ-off body of `serve_anonymous_first_touch`.
 ///
-/// Its permitted work is limited to a lock-free VMA permit, wired-frame
-/// reservation, and one prepared-leaf CAS.  In particular it must not take a
-/// process-state lock, enter the global TLB protocol, allocate, populate a
-/// fault-around run, or enable interrupts.
+/// Its permitted work is a lock-free VMA permit, IRQ-safe frame supply and
+/// zero-to-present table/leaf publications. Huge-page and fault-around work
+/// remain bounded by the published pager policy. It never takes a process-state
+/// lock, enters the global TLB protocol, or enables interrupts.
 fn serve_anonymous_first_touch_enabled(
     request: PagerFaultRequestWire,
-    prot: u32,
+    _prot: u32,
 ) -> AnonymousFaultOutcome {
     // Acquire before taking a reserve frame.  A writer that has withdrawn this
     // exact VMA wins cleanly; no frame is removed from the reserve in that
@@ -453,6 +455,49 @@ fn serve_anonymous_first_touch_enabled(
         }
     };
 
+    // The permit supplies the authoritative protection for every page this
+    // fault may publish. Do not carry an independently supplied protection
+    // value into a speculative 2 MiB install.
+    let prot = region.prot;
+    let policy = crate::pager_policy::anonymous_fault_policy_irq_off();
+    if let Some(start) = anon_huge_start(
+        region,
+        request.virtual_address,
+        request.access,
+        request.fault_flags,
+        policy.huge_page_enabled,
+    ) {
+        // Only prepare the PD: installing a PT here would consume the empty
+        // directory entry that the huge leaf must claim. The mapper reserves
+        // an unpublished PT for future split before exposing any huge leaf.
+        if let Err(outcome) = ensure_fault_tables(request, true) {
+            return outcome;
+        }
+        if let Some(populated) = mm_api::paging::try_map_current_anon_huge_at(
+            VirtAddr::new(start),
+            page_flags(prot),
+            supply_fault_table_frame,
+            release_fault_table_frame,
+        ) {
+            drop(permit);
+            frame_supply_recovered();
+            // Some(0) means a concurrent fault already installed the matching
+            // huge leaf; it resolves this fault without claiming a new install.
+            if populated != 0 {
+                let total = ANON_HUGE_FAULTS.fetch_add(1, Ordering::Relaxed) + 1;
+                if total == 1 || total.is_multiple_of(256) {
+                    nucleus_core::debug::record_milestone(
+                        nucleus_core::debug::LogCategory::Compat,
+                        "pager-anon-huge-installed",
+                        total,
+                        populated,
+                    );
+                }
+            }
+            return complete_anonymous_install(request, Ok(populated != 0), populated, None);
+        }
+    }
+
     // Intermediate tables, before any data frame is drawn.
     //
     // `mmap` reserves address space and nothing else, so the tables that hold
@@ -460,11 +505,11 @@ fn serve_anonymous_first_touch_enabled(
     // not-present-to-present transition as the leaf below and owes no
     // shootdown; what it must not do is consume a data frame first and then
     // discover it has nowhere to put it.
-    if let Err(outcome) = ensure_fault_tables(request) {
+    if let Err(outcome) = ensure_fault_tables(request, false) {
         return outcome;
     }
 
-    let run_pages = crate::pager_policy::anonymous_policy_irq_off().fault_run_pages;
+    let run_pages = policy.fault_run_pages;
     let folio = anon_folio_start(region, request.virtual_address, request.access, run_pages)
     .and_then(|start| {
         mm_api::paging::try_map_current_prepared_anon_folio(
@@ -497,6 +542,39 @@ fn serve_anonymous_first_touch_enabled(
         }
     }
     complete_anonymous_install(request, installed, populated, single_frame)
+}
+
+/// One exact VMA must authorize the entire 2 MiB block. First-touch writes are
+/// the only candidates; reads, protection/COW faults and VMA fringes retain
+/// the ordinary page path. The held VMA permit pins this decision until the
+/// directory publication completes.
+fn anon_huge_start(
+    region: PagerVmRegionWire,
+    fault: u64,
+    access: u16,
+    fault_flags: u16,
+    enabled: u32,
+) -> Option<u64> {
+    use rustos_user_abi::pager::{
+        PAGER_PAGE_BYTES, VM_ACCESS_WRITE, VM_OBJECT_ANONYMOUS, VM_PROT_EXECUTE,
+        VM_PROT_WRITE, VM_SHARING_PRIVATE,
+    };
+
+    const BYTES: u64 = mm_api::paging::ANON_HUGE_BYTES;
+    let start = fault & !(BYTES - 1);
+    let end = start.checked_add(BYTES)?;
+    (enabled == 1
+        && fault_flags == 0
+        && access == VM_ACCESS_WRITE
+        && fault.is_multiple_of(PAGER_PAGE_BYTES)
+        && region.prot & VM_PROT_WRITE != 0
+        && region.prot & VM_PROT_EXECUTE == 0
+        && region.object.object_type == VM_OBJECT_ANONYMOUS
+        && region.sharing == VM_SHARING_PRIVATE
+        && region.is_committed()
+        && region.start <= start
+        && end <= region.end)
+        .then_some(start)
 }
 
 fn anon_folio_start(region: PagerVmRegionWire, fault: u64, access: u16, run_pages: u32) -> Option<u64> {
@@ -599,8 +677,9 @@ fn complete_anonymous_install(
     single_frame: Option<PhysAddr>,
 ) -> AnonymousFaultOutcome {
     if populated != 0 {
-        let total = POPULATED_RUN_PAGES.fetch_add(populated, Ordering::Relaxed) + populated;
-        if total.is_multiple_of(4096) {
+        let before = POPULATED_RUN_PAGES.fetch_add(populated, Ordering::Relaxed);
+        let total = before + populated;
+        if crosses_report_boundary(before, total, 4096) {
             nucleus_core::debug::record_milestone(
                 nucleus_core::debug::LogCategory::Compat,
                 "pager-fault-around-pages",
@@ -697,21 +776,31 @@ fn release_fault_table_frame(frame: u64) {
 /// Ordering it first means a table shortage refuses without also pulling a data
 /// frame out of the reserve, and it leaves the leaf CAS the pure
 /// not-present-to-present transition its contract describes.
-fn ensure_fault_tables(request: PagerFaultRequestWire) -> Result<(), AnonymousFaultOutcome> {
+fn ensure_fault_tables(
+    request: PagerFaultRequestWire,
+    directory_only: bool,
+) -> Result<(), AnonymousFaultOutcome> {
     let mut exhausted = false;
     let mut released = 0_u64;
-    let outcome = mm_api::paging::ensure_current_fault_tables_at(
-        VirtAddr::new(request.virtual_address),
-        || {
-            let frame = supply_fault_table_frame();
-            exhausted |= frame.is_none();
-            frame
-        },
-        |frame| {
-            released += 1;
-            release_fault_table_frame(frame);
-        },
-    );
+    let mut supply = || {
+        let frame = supply_fault_table_frame();
+        exhausted |= frame.is_none();
+        frame
+    };
+    let mut release = |frame| {
+        released += 1;
+        release_fault_table_frame(frame);
+    };
+    let address = VirtAddr::new(if directory_only {
+        request.virtual_address & !(mm_api::paging::ANON_HUGE_BYTES - 1)
+    } else {
+        request.virtual_address
+    });
+    let outcome = if directory_only {
+        mm_api::paging::ensure_current_fault_directory_at(address, &mut supply, &mut release)
+    } else {
+        mm_api::paging::ensure_current_fault_tables_at(address, &mut supply, &mut release)
+    };
     if released != 0 {
         let before = LAZY_TABLE_CAS_LOST.fetch_add(released, Ordering::Relaxed);
         let lost = before + released;
@@ -1213,6 +1302,76 @@ mod tests {
         PAGER_FAULT_ABI_VERSION, PagerEndpointCapabilityWire, PagerFaultRequestWire,
         PagerObjectIdentityWire, VM_ACCESS_READ, VM_OBJECT_ANONYMOUS, VM_PROT_READ,
     };
+
+    #[test]
+    fn anon_huge_requires_one_complete_writable_private_committed_block() {
+        use rustos_user_abi::pager::{
+            PagerVmRegionWire, VM_ACCESS_WRITE, VM_COMMIT_COMMITTED, VM_COMMIT_RESERVED,
+            VM_FAULT_COW, VM_FAULT_PRESENT, VM_FAULT_PROTECTION, VM_OBJECT_FILE_PRIVATE,
+            VM_PROT_EXECUTE, VM_PROT_WRITE, VM_SHARING_PRIVATE, VM_SHARING_SHARED,
+        };
+        const BYTES: u64 = super::mm_api::paging::ANON_HUGE_BYTES;
+        let base = BYTES;
+        let region = PagerVmRegionWire {
+            start: base,
+            end: base + BYTES,
+            object: PagerObjectIdentityWire {
+                object_type: VM_OBJECT_ANONYMOUS,
+                rights: VM_PROT_READ | VM_PROT_WRITE,
+                ..Default::default()
+            },
+            sharing: VM_SHARING_PRIVATE,
+            prot: VM_PROT_READ | VM_PROT_WRITE,
+            commit_state: VM_COMMIT_COMMITTED,
+            ..Default::default()
+        };
+        let check = |r, fault, access, flags, enabled| {
+            super::anon_huge_start(r, fault, access, flags, enabled)
+        };
+        for offset in [0, 4096, BYTES - 4096] {
+            assert_eq!(check(region, base + offset, VM_ACCESS_WRITE, 0, 1), Some(base));
+        }
+        assert_eq!(check(region, base, VM_ACCESS_WRITE, 0, 0), None);
+        assert_eq!(check(region, base, VM_ACCESS_WRITE, 0, 2), None);
+        assert_eq!(check(region, base, VM_ACCESS_READ, 0, 1), None);
+        assert_eq!(check(region, base + 1, VM_ACCESS_WRITE, 0, 1), None);
+        assert_eq!(check(region, base + BYTES, VM_ACCESS_WRITE, 0, 1), None);
+        for flags in [VM_FAULT_PRESENT, VM_FAULT_PROTECTION, VM_FAULT_COW] {
+            assert_eq!(check(region, base, VM_ACCESS_WRITE, flags, 1), None);
+        }
+        for ineligible in [
+            PagerVmRegionWire { start: base + 4096, ..region },
+            PagerVmRegionWire { end: base + BYTES - 4096, ..region },
+            PagerVmRegionWire { sharing: VM_SHARING_SHARED, ..region },
+            PagerVmRegionWire { commit_state: VM_COMMIT_RESERVED, ..region },
+            PagerVmRegionWire { prot: VM_PROT_READ, ..region },
+            PagerVmRegionWire { prot: VM_PROT_WRITE | VM_PROT_EXECUTE, ..region },
+            PagerVmRegionWire {
+                object: PagerObjectIdentityWire {
+                    object_type: VM_OBJECT_FILE_PRIVATE,
+                    ..region.object
+                },
+                ..region
+            },
+        ] {
+            assert_eq!(check(ineligible, base + 4096, VM_ACCESS_WRITE, 0, 1), None);
+        }
+        // An unaligned region may still authorize complete interior blocks.
+        let fringed = PagerVmRegionWire {
+            start: base + 4096,
+            end: base + 3 * BYTES - 4096,
+            ..region
+        };
+        assert_eq!(check(fringed, base + BYTES, VM_ACCESS_WRITE, 0, 1), Some(base + BYTES));
+        assert_eq!(check(fringed, fringed.start, VM_ACCESS_WRITE, 0, 1), None);
+        assert_eq!(check(fringed, fringed.end - 4096, VM_ACCESS_WRITE, 0, 1), None);
+        let overflow = PagerVmRegionWire {
+            start: u64::MAX & !(BYTES - 1),
+            end: u64::MAX,
+            ..region
+        };
+        assert_eq!(check(overflow, overflow.start, VM_ACCESS_WRITE, 0, 1), None);
+    }
 
     #[test]
     fn anon_folio_never_crosses_vma_or_exceeds_policy() {

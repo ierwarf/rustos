@@ -320,7 +320,18 @@ impl PhysPool {
         // Stage 2: the central allocator, under slot -> central order.
         let mut state = self.state.lock();
         let need = out.len() - *filled;
-        let cached = cache.len + self.cached_elsewhere(slot_index);
+        // Most refills have ample central memory. Do not pull every CPU's
+        // cache-count line into this CPU merely to prove a request already
+        // fits without those frames. Only a tight user watermark needs the
+        // advisory remote counts; kernel allocations have no watermark.
+        let cached = if user
+            && state.free_frames.saturating_add(cache.len)
+                < state.min_free_frames.saturating_add(need)
+        {
+            cache.len + self.cached_elsewhere(slot_index)
+        } else {
+            cache.len
+        };
         let faulted = core::cell::Cell::new(false);
         let mut gate = || {
             let hit = should_fail();
@@ -365,14 +376,9 @@ impl PhysPool {
             let room = geo.cache_high.saturating_sub(cache.len);
             let want = geo.cache_batch.min(room);
             if want != 0 && state.free_frames > state.min_free_frames + 2 * geo.cache_batch {
-                let mut taken = 0;
-                while taken < want {
-                    let Some(frame) = state.take_frame_for_cache_locked() else {
-                        break;
-                    };
-                    cache.push(frame);
-                    taken += 1;
-                }
+                let start = cache.len;
+                let taken = state.take_frames_for_cache_locked(&mut cache.frames[start..start + want]);
+                cache.len += taken;
                 if taken != 0 {
                     // ORDERING: Relaxed; diagnostics.
                     self.refills.fetch_add(1, Ordering::Relaxed);
@@ -501,6 +507,14 @@ impl PhysPool {
     pub(super) fn try_alloc_anon_folio(&self) -> Option<PhysAddr> {
         let mut state = self.state.try_lock()?;
         let head = state.try_alloc_anon_folio_locked()?;
+        // ORDERING: Relaxed mirrors the exact count committed under the lock.
+        self.central_free.store(state.free_frames, Ordering::Relaxed);
+        Some(head)
+    }
+
+    pub(super) fn try_alloc_anon_huge_frame(&self) -> Option<PhysAddr> {
+        let mut state = self.state.try_lock()?;
+        let head = state.try_alloc_anon_huge_frame_locked()?;
         // ORDERING: Relaxed mirrors the exact count committed under the lock.
         self.central_free.store(state.free_frames, Ordering::Relaxed);
         Some(head)

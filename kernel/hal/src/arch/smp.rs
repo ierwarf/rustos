@@ -225,12 +225,13 @@ impl CpuLifecycleRegistry {
         let count = self.cpu_count();
         let mut mask = 0_u64;
         for logical_index in 0..count {
-            let logical_index =
-                u8::try_from(logical_index).expect("SMP invariant: logical CPU index overflow");
-            let snapshot = self
-                .snapshot(logical_index)
-                .expect("SMP invariant: published topology lost a CPU lifecycle slot");
-            if snapshot.state == CpuLifecycleState::Online {
+            // ORDERING: Acquire observes Online only after that CPU's complete
+            // admission. The publication/count above already bounds these
+            // immutable slots; placement needs no descriptor or generation
+            // copy for every candidate CPU.
+            if CpuLifecycleState::from_raw(self.slots[logical_index].state.load(Ordering::Acquire))
+                == CpuLifecycleState::Online
+            {
                 mask |= 1_u64 << logical_index;
             }
         }
@@ -298,6 +299,12 @@ pub fn stage_discovered_topology() {
 
 pub fn cpu_count() -> usize {
     CPU_LIFECYCLE.cpu_count()
+}
+
+/// Snapshot of CPUs that have completed Online admission. During startup this
+/// may be a proper subset; placement retains its exact task-affinity checks.
+pub fn online_mask() -> u64 {
+    CPU_LIFECYCLE.online_mask()
 }
 
 /// Returns the exact dense commercial Online set.
@@ -409,7 +416,9 @@ mod tests {
     #[test]
     fn online_mask_contains_exact_dense_online_set() {
         let registry = CpuLifecycleRegistry::new();
+        assert_eq!(registry.online_mask(), 0);
         registry.publish_discovered(test_topology(&[(7, 3, false), (42, 0x1234, true)]));
+        assert_eq!(registry.online_mask(), 0);
         for logical_index in 0..2 {
             registry.transition(
                 logical_index,
@@ -431,6 +440,8 @@ mod tests {
         assert_eq!(registry.online_mask(), 0b01);
         registry.transition(1, FIRST_CPU_GENERATION, CpuLifecycleState::Online);
         assert_eq!(registry.online_mask(), 0b11);
+        registry.transition(0, FIRST_CPU_GENERATION, CpuLifecycleState::Quarantined);
+        assert_eq!(registry.online_mask(), 0b10);
     }
 
     #[test]

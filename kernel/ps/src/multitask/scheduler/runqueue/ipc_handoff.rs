@@ -165,7 +165,7 @@ pub(in crate::multitask::scheduler) fn materialize_direct_handoff_with_generatio
             }
             Err(winner) => {
                 rq.remove(slot, weight);
-                RUN_QUEUES[cpu].publish_load(&rq);
+                RUN_QUEUES[cpu].publish_load(&mut rq);
                 if winner.generation != observed.generation
                     || winner.state != RunOwnerState::DirectHandoff
                 {
@@ -176,7 +176,7 @@ pub(in crate::multitask::scheduler) fn materialize_direct_handoff_with_generatio
         }
     };
     frame_publication::bind_local_owner_generation(slot, next.generation);
-    RUN_QUEUES[cpu].publish_load(&rq);
+    RUN_QUEUES[cpu].publish_load(&mut rq);
     true
 }
 
@@ -314,7 +314,7 @@ pub(in crate::multitask::scheduler) fn drain_remote_wakes(cpu: usize) -> usize {
         if let Some(next) = adopted {
             frame_publication::bind_local_owner_generation(record.slot, next.generation);
         }
-        RUN_QUEUES[cpu].publish_load(&rq);
+        RUN_QUEUES[cpu].publish_load(&mut rq);
     }
     count
 }
@@ -350,7 +350,7 @@ pub(in crate::multitask::scheduler) fn rehome_queued_frame(
     #[cfg(test)]
     let transferred = super::owner(slot);
     source.remove(slot, weight);
-    RUN_QUEUES[source_cpu].publish_load(&source);
+    RUN_QUEUES[source_cpu].publish_load(&mut source);
     drop(source);
     #[cfg(test)]
     record_test_local_migrating_owner(transferred);
@@ -424,7 +424,7 @@ fn rehome_queued_inner(
                 source.remove(slot, weight);
                 #[cfg(test)]
                 record_test_local_migrating_owner(committed.next);
-                RUN_QUEUES[source_cpu].publish_load(&source);
+                RUN_QUEUES[source_cpu].publish_load(&mut source);
                 drop(source);
                 return publish_migration(committed, weight);
             }

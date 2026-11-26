@@ -138,6 +138,13 @@ pub mod cpu {
         crate::arch::smp::admitted_online_mask()
     }
 
+    /// Current Online set, including a partial set during CPU startup.
+    /// Unlike `admitted_online_mask`, this is a placement observation rather
+    /// than proof that the complete commercial topology finished admission.
+    pub fn online_mask() -> u64 {
+        crate::arch::smp::online_mask()
+    }
+
     pub fn lifecycle_snapshot(logical_index: u8) -> Option<CpuLifecycleSnapshot> {
         crate::arch::smp::snapshot(logical_index)
     }

@@ -21,6 +21,15 @@ Migrating(source_cpu, target_cpu, migration_epoch)
 Retired(task_generation)
 ```
 
+The dense runnable mirror is published under its original queue lock.
+Dirty-slot scratch is ordinary mutable lock-owned data, while the mirror and
+its epoch remain atomic for remote readers. An opening AcqRel epoch increment
+makes the sequence odd before payload edits; one closing Release store
+publishes the next checked even sequence. No second writer may update the
+epoch outside that queue lock, and wrap is a fail-stop invariant rather than
+ABA. Queue membership, owner CAS, fair ordering and reader revalidation are
+unchanged by this reduction in locked operations.
+
 The transition and its ownership transfer linearize together. A task cannot
 be current on two CPUs, appear in two queues, or be both queued and current.
 Wake-before-block retains the existing arm/recheck/commit guarantee across
@@ -61,6 +70,18 @@ Per-CPU load balancing is introduced conservatively:
 - preserve existing System/User fairness and donation semantics globally;
 - affinity masks are validated against the admitted online set.
 
+Placement obtains its Online bitmap directly from the lifecycle registry's
+acquire-loaded state bytes. An unpublished registry yields no Online CPU;
+partial startup membership is only a placement observation and is not the
+complete-topology `admitted_online_mask` acceptance proof. Task/process masks
+and exact owner/placement admission still apply. A reschedule IPI addresses a
+directly indexed, generation-checked Online lifecycle descriptor, without
+copying or locking the ACPI topology. Repeated reschedule admission reads the
+immutable admitted generation before falling back to its first-writer CAS.
+Empty deferred-notification drains avoid a global exchange, and nonempty
+drains visit only set target bits; request sequences and 0-to-1 notification
+custody retain the existing protocol.
+
 During the serialized-dispatch transition, the exact last CPU is already
 retained as scheduler policy metadata. Ordinary fair picks may prefer a
 same-class candidate local to the invoking CPU only while its virtual runtime
@@ -85,10 +106,24 @@ when its address-space root differs from the outgoing root; threads in one
 address space retain the already-active translations. SIMD restore remains
 mandatory on both paths because compiler-generated ring0 code may use vector
 registers after the save boundary. Address-space activation separately skips a
-CR3 write when the requested root equals the CPU's release-published active root. This
-does not replace shootdown: every page-table mutation still flushes all exact
-generation targets, and AP Online admission still performs its mandatory CR3
+CR3 write when the requested root equals the CPU's published active root. This
+does not replace shootdown: every invalidating page-table mutation still
+flushes all exact generation targets (additive transactions follow the
+separate no-flush contract in section 8), and AP Online admission still performs its mandatory CR3
 reload to close the parked translation window.
+
+Architecture installation reuses the CPU index retained by the original
+masked return receipt for TSS, syscall stack and GS publication. It does not
+repeat CPU discovery or nested interrupt masking for those writes. The GS
+pair remains unconditional on a full segment install because `swapgs` changes
+its orientation between entries; caching the last written MSR pair is invalid.
+The generic GS wrapper captures its CPU index inside its interrupt exclusion,
+so migration cannot install another CPU's syscall record. Full SIMD restore
+and the original frame/MM/placement checks remain in place.
+
+These 2026-11-27 changes were reviewed statically only. Added and retained test
+sources and updated source-conformance anchors are not executed-test or
+benchmark evidence for the batch.
 
 Idle balancing uses the single-owner transfer protocol. Only an Idle-class CPU
 with no eligible local continuation scans the fixed admitted CPU set; it picks

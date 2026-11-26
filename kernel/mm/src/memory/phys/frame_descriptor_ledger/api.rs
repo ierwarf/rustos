@@ -54,6 +54,32 @@ pub fn cancel_data_leaf(root_phys: u64, virtual_address: u64, frame_phys: u64) {
     FRAME_DESCRIPTORS.cancel_exclusive_data(root_phys, virtual_address, frame_phys, true);
 }
 
+/// Claims at most 512 physically and virtually consecutive 4 KiB leaves with
+/// one charge reservation. On failure no descriptor or charge is retained.
+pub fn claim_data_leaf_run(root_phys: u64, virtual_address: u64, first_frame: u64, page_count: usize) -> DataClaim {
+    FRAME_DESCRIPTORS.claim_exclusive_data_run(root_phys, virtual_address, first_frame, page_count)
+}
+
+pub fn publish_data_leaf_run(root_phys: u64, virtual_address: u64, first_frame: u64, page_count: usize) {
+    FRAME_DESCRIPTORS.publish_exclusive_data_run(root_phys, virtual_address, first_frame, page_count);
+}
+
+pub fn cancel_data_leaf_run(root_phys: u64, virtual_address: u64, first_frame: u64, page_count: usize) {
+    FRAME_DESCRIPTORS.cancel_exclusive_data_run(root_phys, virtual_address, first_frame, page_count);
+}
+
+pub fn deposit_anon_huge_table(root_phys: u64, virtual_address: u64, first_frame: u64, table_phys: u64) -> bool {
+    FRAME_DESCRIPTORS.deposit_anon_huge_table(root_phys, virtual_address, first_frame, table_phys)
+}
+
+pub fn anon_huge_table(root_phys: u64, virtual_address: u64, first_frame: u64) -> Option<u64> {
+    FRAME_DESCRIPTORS.anon_huge_table(root_phys, virtual_address, first_frame)
+}
+
+pub fn take_anon_huge_table(root_phys: u64, virtual_address: u64, first_frame: u64) -> Option<u64> {
+    FRAME_DESCRIPTORS.take_anon_huge_table(root_phys, virtual_address, first_frame)
+}
+
 /// Claim a replacement backed by the locked COW mapping's existing charge.
 pub fn claim_cow_replacement(claim: &CowMappingClaim, frame_phys: u64) -> DataClaim {
     FRAME_DESCRIPTORS.claim_exclusive_data(claim.root_phys, claim.virtual_address, frame_phys, false)

@@ -359,7 +359,7 @@ ordered(body(owner, 'rehome_queued_frame'), ['owner.generation != frame.token.ow
     'RUN_QUEUES[source_cpu].inner.lock()', '!source.contains(slot) || !frame.is_current()',
     'with_rehome_admission(slot, target_cpu, None', 'if !frame.is_current()',
     'transition(slot, owner, OwnerEvent::Rehome, Some(target_cpu))', 'source.remove(slot, weight)',
-    'publish_load(&source)', 'drop(source)',
+    'publish_load(&mut source)', 'drop(source)',
     'publish_migration(committed, weight)'],
     'exact source-generation migration CAS and mailbox')
 # Whole fixed-fault exception producer and resumed Current architecture. Native
@@ -438,8 +438,8 @@ ordered(architecture[architecture.index("impl<'a> CurrentArchitecture"):], [
     'pin.slot(), pin.id(), view', 'Some(Self { current, scope, state })',
     'fn install(self)', 'self.current.cpu()', 'self.scope.is_masked()',
     'load_address_space_phys(PhysAddr::new(self.state.root))',
-    'set_privilege_stack(self.state.stack_top)', 'set_kernel_stack_top(self.state.stack_top, self.state.register_ipc)',
-    'install_segments(self.state, true)'], 'retained Current MM/stack through final registers')
+    'set_privilege_stack_masked(cpu, self.state.stack_top)', 'set_kernel_stack_top_masked(cpu, self.state.stack_top, self.state.register_ipc)',
+    'install_segments(cpu, self.state, true)'], 'retained Current MM/stack through final registers')
 # Native born-resource returns use exactly the production resource qualification
 # and both bank transitions. Only explicitly constructed integer phase models
 # may omit them; an actual successful claim can never enter that projection.
@@ -464,7 +464,7 @@ ordered(body(architecture, 'install_with'), ['self.turn.begin_architecture()',
     'self.turn.mark_architecture_ready()'], 'same architecture state machine through last effect')
 # install has three independently typed owners; restrict to the return owner.
 original_install = architecture[architecture.index("impl<'a> ReturnArchitecture"):architecture.index('/// Scalar descriptions')]
-ordered(body(original_install, 'install'), ['self.install_with(fast_ipc, hardware_effect)'],
+ordered(body(original_install, 'install'), ['self.install_with(fast_ipc, |effect| hardware_effect(cpu, effect))'],
     'production claimed architecture uses shared state machine')
 cpu_source = (base.parent / 'cpu_local.rs').read_text()
 ordered(body(cpu_source, 'publish_before_return'), ['execution::banks::publish(',
@@ -819,8 +819,8 @@ ordered(body(initial_arch, 'capture'), ['turn.original_current()', 'image.assert
     'state.process', 'Some(Self { image, turn, state })'], 'borrowed initial image and active original interval')
 ordered(body(initial_arch, 'install'), ['self.turn.original_current()',
     'self.image.assert_current(cpu)', 'original_initial_is_active(self.turn)',
-    'load_address_space_phys(', 'set_privilege_stack(', 'set_kernel_stack_top(',
-    'install_segments(self.state, false)'], 'original initial turn retains both banks through last register')
+    'load_address_space_phys(', 'set_privilege_stack_masked(cpu,', 'set_kernel_stack_top_masked(cpu,',
+    'install_segments(cpu, self.state, false)'], 'original initial turn retains both banks through last register')
 # Entire Current/target terminal entry family must use original parked units,
 # not a catalog or fresh MM/UID/funding admission after terminal close.
 current_terminal = (base / 'current_terminal.rs').read_text()

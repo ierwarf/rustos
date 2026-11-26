@@ -40,6 +40,18 @@ impl RescheduleObservation {
             generation, 0,
             "reschedule observation requires a live CPU generation"
         );
+        // ORDERING: Acquire observes the one-time admission below. Generation
+        // never resets in the supported no-hot-remove envelope, so an already
+        // admitted request needs only a read, not a failed locked CAS that
+        // dirties the target's line on every wake and notification.
+        let admitted = self.lifecycle_gen.load(Ordering::Acquire);
+        if admitted != 0 {
+            assert_eq!(
+                admitted, generation,
+                "reschedule observation crossed a CPU lifecycle generation"
+            );
+            return;
+        }
         match self.lifecycle_gen.compare_exchange(
             0,
             generation,
@@ -212,6 +224,34 @@ pub(super) fn snapshot(cpu: usize) -> (u64, u64, bool, u64, u64, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_generation_admission_keeps_the_original_epoch() {
+        let observation = RescheduleObservation::new();
+        observation.admit_generation(17);
+        observation.admit_generation(17);
+        let refused = std::panic::catch_unwind(|| observation.admit_generation(18));
+        assert!(refused.is_err());
+        assert_eq!(observation.lifecycle_gen.load(Ordering::Acquire), 17);
+        assert_eq!(observation.request_word.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn concurrent_first_notifications_share_one_exact_lifecycle_epoch() {
+        let observation = RescheduleObservation::new();
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let observation = &observation;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    observation.admit_generation(23);
+                });
+            }
+        });
+        assert_eq!(observation.lifecycle_gen.load(Ordering::Acquire), 23);
+    }
 
     #[test]
     fn notification_may_coalesce_requests_but_consumption_reaches_the_goal() {

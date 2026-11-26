@@ -187,7 +187,7 @@ fn claim_dispatch_inner(
     // A reader can briefly see Running with old published membership; its
     // frame/owner qualification fails closed until this removal is published.
     rq.remove(slot, weight);
-    RUN_QUEUES[cpu].publish_load(&rq);
+    RUN_QUEUES[cpu].publish_load(&mut rq);
     drop(rq);
     if let Some(mut activation) = activation {
         activation.bind_claimed_owner(next);
