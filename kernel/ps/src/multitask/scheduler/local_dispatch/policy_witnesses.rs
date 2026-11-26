@@ -110,6 +110,37 @@ pub(in crate::multitask::scheduler) fn bounded_system_burst_reserves_a_ready_use
     dispatch_policy::store_dispatch_streaks(0, 0, 0);
 }
 
+#[test]
+fn actual_priority_chain_reserves_user_before_overdue_system_and_keeps_system_progress() {
+    let mut observed = None;
+    family(|root, old, user| {
+        system(root);
+        system(old);
+        runqueue::wait::set_ready_since_ticks(old, 1);
+        let entry = crate::multitask::cpu_local::irq_entry::DispatchEntry::from_scope(irq_entry_tests::scope());
+        entry.turn().begin_priority_choice();
+        dispatch_policy::store_dispatch_streaks(0, super::super::MAX_CONSECUTIVE_SYSTEM_DISPATCHES - 1, 0);
+        let before_due = dispatcher::test_policy_choice(entry.turn(), ticks());
+        dispatch_policy::record_completed_choice(0, true, false);
+        let reserved = dispatcher::test_policy_choice(entry.turn(), ticks());
+        modeled_wait(user, true);
+        let no_user = dispatcher::test_policy_choice(entry.turn(), ticks());
+        modeled_wait(user, false);
+        let ready_again = dispatcher::test_policy_choice(entry.turn(), ticks());
+        let no_claim = entry.turn().claimed_return().is_none();
+        observed = Some((old, user, before_due, reserved, no_user, ready_again, no_claim));
+        dispatch_policy::store_dispatch_streaks(0, 0, 0);
+    });
+    // Observe the production priority chain, then assert after the original
+    // physical/MM/UID resources have completed their normal teardown.
+    let (old, user, before_due, reserved, no_user, ready_again, no_claim) = observed.unwrap();
+    assert_eq!(before_due, Some(old), "overdue work retains its initial System turn");
+    assert_eq!(reserved, Some(user), "overdue System work cannot bypass a due User reservation");
+    assert_eq!(no_user, Some(old), "a reservation must not idle eligible System work without a User");
+    assert_eq!(ready_again, Some(user), "a runnable User immediately regains its reserved turn");
+    assert!(no_claim, "a policy observation is not execution authority");
+}
+
 pub(in crate::multitask::scheduler) fn user_reservation_obeys_vruntime_without_a_wall_clock_bypass() {
     family(|root, newer, older| {
         system(root);

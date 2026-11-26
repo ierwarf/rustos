@@ -144,7 +144,7 @@ pub fn request_deferred_reschedule() {
 }
 
 pub use crate::multitask::{
-    housekeeping_kicked, kick_housekeeping, register_housekeeping_task,
+    housekeeping_kicked, kick_housekeeping, kick_service_cleanup, register_housekeeping_task,
     register_service_cleanup_task, service_cleanup_kicked, take_housekeeping_kick,
     take_service_cleanup_kick, task_slot_available,
 };
@@ -155,6 +155,7 @@ pub use crate::multitask::{
     with_fork_parent_vfork_state, LinuxThreadSnapshot,
 };
 pub use crate::multitask::{MemoryAccount, MemoryCensusEntry, memory_account, memory_census};
+pub use crate::multitask::retirement_work_pending;
 pub use crate::multitask::{
     task_capacity_snapshot, CapacityLimit, TaskCapacity, TaskCapacitySnapshot, task_capacity,
 };
@@ -365,6 +366,12 @@ pub mod snapshot {
 
     pub fn user_log_ids_for_task(task_id: u64) -> Option<(u64, u64)> {
         crate::multitask::user_log_ids_for_task(task_id)
+    }
+
+    /// Exact live IPC sender. Kernel tasks use PID zero and their nonzero task
+    /// ID; absent, incomplete, closing, and recycled identities return None.
+    pub fn ipc_sender_ids_for_task(task_id: u64) -> Option<(u64, u64)> {
+        crate::multitask::ipc_sender_ids_for_task(task_id)
     }
 
     pub fn current_user_process_id() -> Option<u64> {

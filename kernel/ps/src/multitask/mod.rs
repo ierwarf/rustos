@@ -10,7 +10,7 @@ pub use self::vfork_wait::{
 };
 mod housekeeping_kick;
 pub use self::housekeeping_kick::{
-    housekeeping_kicked, kick_housekeeping, kick_housekeeping_executor, prioritize_housekeeping,
+    housekeeping_kicked, kick_housekeeping, kick_housekeeping_executor, kick_service_cleanup, prioritize_housekeeping,
     register_housekeeping_task, register_service_cleanup_task, service_cleanup_kicked,
     take_housekeeping_kick, take_service_cleanup_kick, task_slot_available,
 };
@@ -79,10 +79,10 @@ pub use self::current::{
     endpoint_receiver_still_waiting, exec_current_user_process, exec_user_process_by_pid,
     exec_user_process_by_pid_checked, exit_current_user_process, exit_current_user_task,
     halt_current_retired_task, inherit_ipc_priority, inherit_pager_fault_priority,
-    is_user_process_exiting, is_user_task_alive, linux_task_affinity, linux_thread_runnable_by_ids, linux_thread_snapshot_by_ids, set_linux_thread_comm_by_ids,
+    is_user_process_exiting, is_user_task_alive, ipc_sender_ids_for_task, linux_task_affinity, linux_thread_runnable_by_ids, linux_thread_snapshot_by_ids, set_linux_thread_comm_by_ids,
     user_target_abi_if_alive,
     live_user_process_identity_by_pid, live_user_process_identity_with_exact_exec_path,
-    mark_user_process_exiting_once, next_retired_task_cleanup,
+    mark_user_process_exiting_once, next_retired_task_cleanup, retirement_work_pending,
     note_process_exit_status, pager_vma_regions_for_process, parent_process_id_of,
     publish_inherited_pager_vma_for_process,
     publish_pager_vma_for_process, queue_linux_process_sigchld, queue_linux_process_signal, queue_linux_signal,

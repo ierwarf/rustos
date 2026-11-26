@@ -63,6 +63,9 @@ fn actual_target_snapshot_retains_original_uid_and_refuses_foreign_pid_or_closed
         let scope = DispatchPreemption::enter_model(0);
         task_directory::forget(ID);
         assert!(Target::capture(ID).is_some());
+        assert_eq!(ipc_sender_ids(ID), Some((ID, ID)));
+        assert_eq!(ipc_sender_ids(0), None);
+        assert_eq!(ipc_sender_ids(ID + 99), None);
         task_directory::record(ID, slot + 1); // wrong accelerator is not authority
         assert!(Target::capture(ID).is_some());
         assert!(alive_in(ID));
@@ -80,6 +83,7 @@ fn actual_target_snapshot_retains_original_uid_and_refuses_foreign_pid_or_closed
         assert_eq!((snapshot.process_id, snapshot.thread_id), (ID, ID));
         let producer = terminal_quarantine::begin(slot, Some(ID), TaskRetireReason::Exited, false).unwrap();
         assert!(Target::capture(ID).is_none());
+        assert_eq!(ipc_sender_ids(ID), None, "closing user identity is not a kernel principal");
         assert!(alive_in(ID), "pending close is not a committed retired publication");
         assert!(stack_resources::reuse::begin_retired(slot, ID).is_none());
         // Earlier admitted metadata observation still owns the exact old cell;
@@ -90,6 +94,7 @@ fn actual_target_snapshot_retains_original_uid_and_refuses_foreign_pid_or_closed
         // span complete terminal publication or subsequent external fixture ACK.
         unsafe { terminal_publication::guarded(producer, &|_| 1); }
         assert!(!alive_in(ID));
+        assert_eq!(ipc_sender_ids(ID), None, "retired user identity remains unauthenticated");
         drop(scope);
         None
     });

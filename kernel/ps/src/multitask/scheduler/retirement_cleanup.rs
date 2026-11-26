@@ -496,6 +496,12 @@ pub(super) fn take_reap_pending() -> bool {
     // ORDERING: AcqRel consumes the pending flag cleanly without dropping concurrent signals.
     REAP_PENDING.swap(false, Ordering::AcqRel)
 }
+/// Cheap advisory hint for return paths. It grants no claim or cleanup
+/// authority, and a concurrent consumer may already have taken the work.
+pub(in crate::multitask) fn reap_pending() -> bool {
+    // Acquire observes the existing producer's Release work publication.
+    REAP_PENDING.load(Ordering::Acquire)
+}
 pub(in crate::multitask) fn mark_reap_pending() {
     // ORDERING: Release publishes pending retirement work to reaper/housekeeping.
     REAP_PENDING.store(true, Ordering::Release);

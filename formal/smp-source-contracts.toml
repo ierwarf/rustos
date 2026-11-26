@@ -174,7 +174,7 @@ reason = "Fast IPC must publish through original return CAS and carry its receip
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn fair(", "local_dispatch::choose_local_next_with(cpu, current, voluntary, runtime", "runqueue::local_runnable_sequence(cpu)", "donation_ledger::class_publication_sequence()", "local_candidate(slot, cpu, Urgency::Fair)", "selected = Some(candidate)", "Ok((slot, generation))", "current_identity::read_dispatch(slot).and_then(|p| p.task_id).ok_or", "candidate.slot != slot || candidate.generation != generation", "Ok(Some(candidate))", "fn retry_fair(", "local_dispatch::retry_incomplete_policy(|unresolved| fair("]
+tokens = ["fn fair(", "local_dispatch::choose_local_next_with(cpu, current, voluntary, runtime", "runqueue::local_runnable_sequence(cpu)", "donation_ledger::class_publication_sequence()", "admitted_local_candidate(slot, cpu, Urgency::Fair)", "selected = Some(candidate)", "Ok((slot, generation))", "current_identity::read_dispatch(slot).and_then(|p| p.task_id).ok_or", "candidate.slot != slot || candidate.generation != generation", "Ok(Some(candidate))", "fn retry_fair(", "local_dispatch::retry_incomplete_policy(|unresolved| fair("]
 
 # Complete exec image producer owns exact physical fields and unchanged Current return.
 [[forbidden_patterns]]
@@ -1574,7 +1574,7 @@ tokens = ["fn synchronous(", "p.task_id == Some(record.task_id()) && p.lifecycle
 # current/idle owner (or marks an unavailable idle frame stale).
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn choose(", "runqueue::drain_remote_wakes(cpu)", "if class_sequence & 1 != 0 { return Decision::Incomplete; }", "dispatch_policy::atomic_activation_pending(cpu)", "first_turn(turn, cpu, true, class_sequence)", "match synchronous(cpu)", "let overdue = local_dispatch::retry_incomplete_policy(|unresolved| local_dispatch::choose_overdue_system(", "runqueue::local_runnable_sequence(cpu), donation_ledger::class_publication_sequence()", "Err(_) => return Decision::Incomplete", "first_turn(turn, cpu, false, class_sequence)", "match latency(cpu)", "local_dispatch::user_reservation_due(cpu)", "class_sequence & 1 != 0", "match retry_fair(", "donation_ledger::class_publication_sequence() != class_sequence", "Ok(local_dispatch::LocalClass::User) => return Decision::Selected(candidate)", "Err(_) => return Decision::Incomplete", "match hint(cpu, current)", "match retry_fair("]
+tokens = ["fn choose(", "runqueue::drain_remote_wakes(cpu)", "if class_sequence & 1 != 0 { return Decision::Incomplete; }", "dispatch_policy::atomic_activation_pending(cpu)", "first_turn(turn, cpu, true, class_sequence)", "match synchronous(cpu)", "local_dispatch::user_reservation_due(cpu)", "class_sequence & 1 != 0", "match retry_fair(", "donation_ledger::class_publication_sequence() != class_sequence", "Ok(local_dispatch::LocalClass::User) => return Decision::Selected(candidate)", "Err(_) => return Decision::Incomplete", "let overdue = local_dispatch::retry_incomplete_policy(|unresolved| local_dispatch::choose_overdue_system(", "runqueue::local_runnable_sequence(cpu), donation_ledger::class_publication_sequence()", "Err(_) => return Decision::Incomplete", "first_turn(turn, cpu, false, class_sequence)", "match latency(cpu)", "match hint(cpu, current)", "match retry_fair("]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/local_dispatch/fair_retry.rs"

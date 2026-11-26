@@ -351,22 +351,12 @@ fn choose(turn: &crate::multitask::cpu_local::dispatch_turn::CpuDispatchTurn<'st
     }
     match synchronous(cpu) { Decision::Empty => {}, result => return result }
     maintenance::service(turn, cpu, current, voluntary);
-    let overdue = local_dispatch::retry_incomplete_policy(|unresolved| local_dispatch::choose_overdue_system(
-        cpu, current, ticks, selection_now(cpu),
-        runqueue::local_runnable_sequence(cpu), donation_ledger::class_publication_sequence(), unresolved));
-    match overdue {
-        Ok(Some((slot, generation))) => {
-            let Some(id) = current_identity::read_dispatch(slot).and_then(|p| p.task_id) else { return Decision::Incomplete; };
-            return selected_candidate(slot, cpu, id, generation, FrameCustody::Local, Urgency::Overdue);
-        }
-        Err(_) => return Decision::Incomplete,
-        Ok(None) => {},
-    }
-    match first_turn(turn, cpu, false, class_sequence) { Decision::Empty => {}, result => return result }
-    match latency(cpu) { Decision::Empty => {}, result => return result }
-    if runqueue::wait::blocked(current) {
-        match hint(cpu, current) { Decision::Empty => {}, result => return result }
-    }
+    // A due User turn precedes overdue System work as well as ordinary spawn
+    // and IPC hints. Otherwise a rotating backlog of old System tasks could
+    // bypass the two-dispatch reservation forever. Atomic activation and the
+    // separately bounded synchronous FIFO retain their original custody order.
+    // With no eligible User, the complete fair observation falls through to
+    // the overdue arm so System recovery continues.
     if local_dispatch::user_reservation_due(cpu) {
         let class_sequence = donation_ledger::class_publication_sequence();
         if class_sequence & 1 != 0 { return Decision::Incomplete; }
@@ -386,6 +376,19 @@ fn choose(turn: &crate::multitask::cpu_local::dispatch_turn::CpuDispatchTurn<'st
             Ok(None) => {},
         }
     }
+    let overdue = local_dispatch::retry_incomplete_policy(|unresolved| local_dispatch::choose_overdue_system(
+        cpu, current, ticks, selection_now(cpu),
+        runqueue::local_runnable_sequence(cpu), donation_ledger::class_publication_sequence(), unresolved));
+    match overdue {
+        Ok(Some((slot, generation))) => {
+            let Some(id) = current_identity::read_dispatch(slot).and_then(|p| p.task_id) else { return Decision::Incomplete; };
+            return selected_candidate(slot, cpu, id, generation, FrameCustody::Local, Urgency::Overdue);
+        }
+        Err(_) => return Decision::Incomplete,
+        Ok(None) => {},
+    }
+    match first_turn(turn, cpu, false, class_sequence) { Decision::Empty => {}, result => return result }
+    match latency(cpu) { Decision::Empty => {}, result => return result }
     match hint(cpu, current) { Decision::Empty => {}, result => return result }
     match retry_fair(cpu, current, voluntary, runtime) {
         Ok(Some(candidate)) => Decision::Selected(candidate),

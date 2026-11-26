@@ -14,28 +14,25 @@ fn pthread_clone_plan_is_local_and_rejects_nonthread_or_bad_tls_flags() {
 }
 
 #[test]
-fn futex_return_advances_retired_thread_cleanup_before_userspace_join_resumes() {
+fn futex_return_kicks_retirement_without_running_provider_cleanup() {
     let source = include_str!("futex_thread.rs");
     let dispatch = source
         .split("pub fn futex_impl")
         .nth(1)
         .and_then(|rest| rest.split("fn validate_futex_policy_locally").next())
         .expect("futex dispatch");
-    let runtime_cleanup = dispatch
-        .find("service_retired_task_runtime_cleanup(RETIRED_TASK_CLEANUP_BUDGET)")
-        .expect("bounded retired-thread runtime cleanup");
-    let scheduler_reap = dispatch
-        .find("multitask::service_deferred_work()")
-        .expect("scheduler retirement progress");
+    let kick = dispatch.find("multitask::kick_housekeeping()")
+        .expect("retirement workers must be woken before join returns");
     let userspace_return = dispatch
         .find("match result")
         .expect("userspace result publication");
-    assert!(runtime_cleanup < scheduler_reap);
-    assert!(scheduler_reap < userspace_return);
-    assert!(
-        dispatch.contains("process_owns_any_published_service_endpoint"),
-        "published service owners must skip blocking retirement cleanup inside futex"
-    );
+    assert!(kick < userspace_return);
+    assert!(!dispatch.contains("service_retired_task_runtime_cleanup("));
+    assert!(!dispatch.contains("multitask::service_deferred_work()"));
+    assert!(dispatch.contains("should_kick_cleanup && multitask::retirement_work_pending()"),
+        "ordinary mutex wakes must not continually wake both cleanup workers");
+    assert!(!dispatch.contains("process_owns_any_published_service_endpoint"),
+        "service and app callers both use the nonblocking worker kick");
 }
 
 #[test]

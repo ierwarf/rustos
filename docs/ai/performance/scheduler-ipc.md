@@ -24,6 +24,9 @@
   not current authority or a release failure.
 - At most two consecutive System dispatches may run while User work is ready;
   the next ordinary dispatch is reserved for the lowest-vruntime User task.
+  The production priority chain checks that reservation before overdue System
+  work and ordinary spawn/hints. A rotating backlog of old System tasks must
+  not bypass it; with no eligible User, overdue System recovery still proceeds.
   Every ready System task has a 2 ms recovery rail, while User work has no
   unadmitted wall-clock deadline: under overload such a promise is impossible
   and made ready age override weight on nearly every turn. User progress comes
@@ -65,14 +68,31 @@
   measurable share of what it instruments is not free just because it is
   always on.
 
-- **Never render a debug-sink record inside a tracked lock.** A milestone is a
-  port write per byte, which is a VM exit per byte under KVM, and its emitter
-  drains whatever deferred records are parked before it renders. The scheduler
+- **Never render a debug-sink record inside a tracked lock.** Even batched
+  `rep outsb` output is synchronous virtual-device work. The emitter drains at
+  most eight parked records before its own line. The scheduler
   emitted one budget-exhaustion marker from inside the global guard about sixty
   times a second; it cost 5.9-27 microseconds *per dispatch* and 59% of the
   guard's hold total. Latch the event and let the profile drain, which runs
   outside every tracked lock, render it. The ceiling is
   `SCHEDULER_GUARD_MAX_DEBUG_SINK_RECORDS` and it is zero.
+- Debug sink contention makes at most eight acquisition attempts before
+  transferring ordinary/required records to bounded per-CPU deferred storage;
+  scheduler measurements stay one-shot. Ready bitmaps avoid a full empty-slot
+  scan on every line, and each drain is capped at eight records even if other
+  CPUs keep publishing. Sixteen slots per CPU remain reserved for required
+  evidence; ordinary milestones cannot consume them. The sink guard unlocks
+  before restoring IRQs, avoiding same-CPU interrupt reentry while still held.
+  Exhaustion still increments the loss counters. `dropped` reports records
+  that lost output custody, not wrapping of the separate 128-record history.
+  These are static work bounds, not measured latency improvements.
+- User exception diagnostics retain every vector/RIP/RSP/error-code line and
+  Linux PID/TID fault milestone but print only eight recent historical records
+  per trap. The dump header states total and shown counts. Replaying all 128
+  history entries for every user `#BP` could amplify a renderer crash burst inside
+  the IRQ-masked fault path. Fatal kernel and explicit dumps retain the full
+  history. This bounds diagnostic work; it neither ignores the exception nor
+  establishes the cause of a Chrome breakpoint.
 - **Count lock classes before choosing one to split.** `work_budget::take_class_census()`
   and the `kernel-lock-class-0..5` milestones report acquisitions per class per
   window. The class the lane had been splitting was fourth; the global process

@@ -397,23 +397,18 @@ pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, 
         }
         result = dispatch();
     }
-    // A successful pthread join resumes through FUTEX_WAIT after the exiting
-    // child cleared its TID. Advance the same bounded retirement owner used by
-    // wait4 before returning to the joining thread without running cleanup on
-    // uncontended FUTEX_WAKE(0), validation-error fast paths, or inside a
-    // published Ring3 service owner (whose receive thread waking an internal
-    // worker via FUTEX_WAKE would otherwise self-IPC-deadlock on VFS/netd
-    // close).
-    let should_service_cleanup = (matches!(
+    // Joining a retired thread requires eventual slot reclamation, not a
+    // synchronous batch of unrelated process fd closes on this return path.
+    // The dedicated cleanup executor owns provider IPC and wakes the pure
+    // reaper after its exact runtime acknowledgement. This also applies to
+    // service owners: a wake must never call back into that service itself.
+    let should_kick_cleanup = matches!(
         cmd,
         c if c == linux_abi::FUTEX_WAIT || c == linux_abi::FUTEX_WAIT_BITSET
     ) && matches!(result, Ok(_) | Err(LINUX_EAGAIN))
-        || matches!(result, Ok(woken) if woken > 0))
-        && !multitask::current_user_process_id()
-            .map_or(true, ipc_ops::process_owns_any_published_service_endpoint);
-    if should_service_cleanup {
-        let _ = service_retired_task_runtime_cleanup(RETIRED_TASK_CLEANUP_BUDGET);
-        multitask::service_deferred_work();
+        || matches!(result, Ok(woken) if woken > 0);
+    if should_kick_cleanup && multitask::retirement_work_pending() {
+        multitask::kick_housekeeping();
     }
     match result {
         Ok(value) => value,

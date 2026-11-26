@@ -392,6 +392,18 @@ pub fn user_log_ids_for_task(task_id: u64) -> Option<(u64, u64)> {
     super::scheduler::current_observation::log_ids(task_id)
 }
 
+pub fn ipc_sender_ids_for_task(task_id: u64) -> Option<(u64, u64)> {
+    // Preserve the common published user fast path. Kernel qualification uses
+    // the exact lifetime pin below, never a failed user lookup as authority.
+    if let Some(Some((pid, tid))) = interrupts::without_interrupts(||
+        super::scheduler::published_user_log_ids(task_id))
+        && pid != 0 && tid != 0
+    {
+        return Some((pid, tid));
+    }
+    super::scheduler::current_observation::ipc_sender_ids(task_id)
+}
+
 pub fn current_user_process_id() -> Option<u64> {
     current_user_log_ids().map(|(process_id, _)| process_id)
 }
@@ -1163,6 +1175,10 @@ fn complete_retirement_side_effects() {
 
 pub fn next_retired_task_cleanup() -> Option<super::RetiredTaskCleanup> {
     interrupts::without_interrupts(super::scheduler::retirement_cleanup::claim_next)
+}
+
+pub fn retirement_work_pending() -> bool {
+    super::scheduler::retirement_cleanup::reap_pending()
 }
 
 pub fn complete_retired_task_cleanup(cleanup: super::RetiredTaskCleanup) -> bool {

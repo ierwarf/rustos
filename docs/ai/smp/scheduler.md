@@ -316,9 +316,13 @@ Activation is a scheduler transaction, not a replaceable optimization hint:
 - later child activations, loader replies, and ordinary IPC donation cannot
   overwrite an older activation;
 - retirement removes only the exact stale slot and preserves survivor order;
-- the strict-System 2 ms ready-age gate may run before the activation FIFO but
-  does not consume it, so boot handoff cannot suspend admitted recovery;
-- absent an overdue System continuation, the oldest live activation receives
+- a due User reservation runs before the 2 ms overdue-System gate and ordinary
+  activation FIFO; atomic activation and the separately bounded synchronous
+  FIFO retain their custody priority. A backlog of old System work cannot
+  repeatedly bypass the two-System/one-User rule;
+- the strict-System 2 ms ready-age gate may run before the ordinary activation
+  FIFO when no User reservation selects work; it does not consume that FIFO;
+- absent a selected User reservation or overdue System continuation, the oldest live activation receives
   its first turn before unrelated latency or IPC hints. User progress remains
   a bounded-burst plus charged-vruntime property, not an unadmitted deadline;
 - a first-turn record is ordering metadata, never dispatch custody. Activation
@@ -403,7 +407,7 @@ custody for the exact peer needed to advance it:
   one quantum charge once, and after the elapsed-time budget one ordinary
   fairness turn is mandatory without consuming or reordering the FIFO;
 - speculative endpoint wake hints without a live reply capability remain
-  replaceable and below the absolute overdue gate;
+  replaceable and below the User reservation and overdue-System gates;
 - a same-CPU call or reply may skip the FIFO record. `publish_switching`
   keeps the receiver's pinned frame reader from publication, commits the
   `DirectHandoff` owner and hands that reader to `dispatcher::fast_switch` as a

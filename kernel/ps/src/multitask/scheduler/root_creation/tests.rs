@@ -168,6 +168,15 @@ fn kernel(f: impl FnOnce(&Actor, &nucleus_core::util::lockdep::DispatchPreemptio
         })
     });
 }
+
+#[test]
+fn ipc_sender_identity_authenticates_only_the_exact_live_kernel_task() {
+    kernel(|_, _| {
+        assert_eq!(super::super::current_observation::ipc_sender_ids(KID), Some((0, KID)));
+        assert_eq!(super::super::current_observation::ipc_sender_ids(KID + 1), None);
+        assert_eq!(super::super::current_observation::ipc_sender_ids(0), None);
+    });
+}
 fn construct_child(
     actor: &Actor,
     admission: &Admission,

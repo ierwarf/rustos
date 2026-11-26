@@ -128,12 +128,15 @@ ordered(body(original_grant, 'take_exact'), ['targets.is_empty()', 'targets.len(
     'targets[..index].contains(&pid)', 'registry.get(&pid).is_none_or', 'return None',
     'let mut grant', 'registry.remove(pid)', 'Some(grant)'], 'whole batch original grant transfer')
 
-# Atomic first turn and synchronous FIFO must finish/refuse before overdue,
-# spawn and later policy arms; an incomplete arm never authorizes a later peer.
+# Atomic first turn and synchronous FIFO retain custody order. A due User
+# reservation then precedes overdue System/spawn/hints; incomplete evidence
+# never authorizes a later peer.
 choose = body(dispatch, 'choose')
 ordered(choose, ['dispatch_policy::atomic_activation_pending(cpu)',
     'first_turn(turn, cpu, true, class_sequence)', 'result => return result',
     'synchronous(cpu)', 'result => return result',
+    'local_dispatch::user_reservation_due(cpu)',
+    'Ok(local_dispatch::LocalClass::User) => return Decision::Selected(candidate)',
     'local_dispatch::retry_incomplete_policy(|unresolved| local_dispatch::choose_overdue_system(',
     'runqueue::local_runnable_sequence(cpu)', 'donation_ledger::class_publication_sequence()',
     'selected_candidate(slot, cpu, id, generation', 'Err(_) => return Decision::Incomplete',
@@ -145,11 +148,14 @@ ordered(choose, ['local_dispatch::user_reservation_due(cpu)',
     'local_dispatch::observed_class(candidate.slot)',
     'donation_ledger::class_publication_sequence() != class_sequence',
     'return Decision::Incomplete', 'Ok(local_dispatch::LocalClass::User) => return Decision::Selected(candidate)',
-    'Err(_) => return Decision::Incomplete', 'match hint(cpu, current)',
-    'match retry_fair(cpu, current, voluntary, runtime)'], 'due User reservation')
+    'Err(_) => return Decision::Incomplete',
+    'let overdue = local_dispatch::retry_incomplete_policy',
+    'first_turn(turn, cpu, false, class_sequence)', 'match latency(cpu)',
+    'match hint(cpu, current)',
+    'match retry_fair(cpu, current, voluntary, runtime)'], 'due User reservation precedes overdue System')
 ordered(body(dispatch, 'fair'), ['local_dispatch::choose_local_next_with(',
     'runqueue::local_runnable_sequence(cpu)', 'donation_ledger::class_publication_sequence()',
-    'local_candidate(slot, cpu, Urgency::Fair)', 'selected = Some(candidate)',
+    'admitted_local_candidate(slot, cpu, Urgency::Fair)', 'selected = Some(candidate)',
     'Ok((slot, generation))', 'current_identity::read_dispatch(slot)',
     'candidate.slot != slot || candidate.generation != generation',
     'Ok(Some(candidate))'], 'fair winner retains its exact original physical loan')

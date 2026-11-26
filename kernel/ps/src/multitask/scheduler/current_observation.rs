@@ -175,6 +175,34 @@ pub(in crate::multitask) fn log_ids(id: u64) -> Option<(u64, u64)> {
         Some((target.context.process_id?, target.pin.id()))
     })
 }
+
+/// Authenticated IPC sender identity. A kernel sender is `(0, exact_task_id)`;
+/// a missing/retired user must never be promoted to that namespace merely
+/// because its diagnostic user snapshot is no longer available.
+pub(in crate::multitask) fn ipc_sender_ids(id: u64) -> Option<(u64, u64)> {
+    if id == 0 {
+        return None;
+    }
+    without_interrupts(|| {
+        task_directory::candidates(id).find_map(|slot| {
+            let pin = identity::execution::pin_donation(slot, id)?;
+            let context = stack_resources::context::read(slot)?;
+            if stack_resources::task_start::read(slot)?.id != pin.id()
+                || runqueue::owner(slot).state.is_terminal()
+            {
+                return None;
+            }
+            if context.user_mode {
+                context.process_id.filter(|pid| *pid != 0).map(|pid| (pid, pin.id()))
+            } else {
+                // A context with inconsistent user metadata is incomplete,
+                // not a kernel maintenance principal.
+                (context.process_id.is_none() && context.user_abi.is_none())
+                    .then_some((0, pin.id()))
+            }
+        })
+    })
+}
 pub(in crate::multitask) fn linux(pid: u64, id: u64) -> Option<crate::multitask::LinuxThreadSnapshot> {
     without_interrupts(|| Target::capture(id)?.linux(pid))
 }
