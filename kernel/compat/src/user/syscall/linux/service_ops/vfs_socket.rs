@@ -1298,6 +1298,7 @@ fn validate_handle_entry_for_io(
             Ok(())
         }
         multitask::KernelHandle::EventFd(_)
+        | multitask::KernelHandle::TimerFd(_)
         | multitask::KernelHandle::UnixSocket(_)
         | multitask::KernelHandle::InetSocket(_) => {
             if seek {
@@ -1475,6 +1476,7 @@ pub fn syscall_linux_vfs_fsync_mode(fd: u64, datasync: bool) -> u64 {
         let remote = match handle {
             multitask::KernelHandle::Pipe(_)
             | multitask::KernelHandle::EventFd(_)
+            | multitask::KernelHandle::TimerFd(_)
             | multitask::KernelHandle::Epoll(_)
             | multitask::KernelHandle::UnixSocket(_)
             | multitask::KernelHandle::InetSocket(_)
@@ -1524,6 +1526,7 @@ pub fn syscall_linux_vfs_fadvise64(fd: u64, _offset: u64, len: u64, advice: u64)
             handle,
             multitask::KernelHandle::Pipe(_)
                 | multitask::KernelHandle::EventFd(_)
+                | multitask::KernelHandle::TimerFd(_)
                 | multitask::KernelHandle::Epoll(_)
                 | multitask::KernelHandle::UnixSocket(_)
                 | multitask::KernelHandle::InetSocket(_)
@@ -1636,6 +1639,59 @@ pub fn syscall_linux_vfs_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
             return Ok(written as u64);
         }
         validate_vectored_fd(fd, true, false)?;
+        if let Some(local) = super::local_fd::current_local_fd(fd) {
+            match local {
+                super::local_fd::LocalFd::UnixSocket(ref sock) => {
+                    let iovecs = super::vfs_meta::read_current_iovecs_payload(iov_ptr, iovcnt)?;
+                    let total = iovecs_total_len(&iovecs)?;
+                    if sock.socket_type() != kernel_ps::api::UnixSocketType::Stream
+                        && total > super::local_unix::MAX_UNIX_IO_BYTES
+                    {
+                        return Err(LINUX_EMSGSIZE);
+                    }
+                    if total == 0 {
+                        return Ok(0);
+                    }
+                    if total <= 4096 {
+                        let mut stack = [0_u8; 4096];
+                        gather_iovecs_into(&iovecs, &mut stack[..total])?;
+                        return super::local_fd::write_pinned_local(&local, &stack[..total])
+                            .map(|n| n as u64);
+                    }
+                    if total <= super::local_unix::MAX_UNIX_IO_BYTES {
+                        let payload = super::vfs_meta::read_iovec_prefix_with_mode(
+                            &iovecs,
+                            total,
+                            super::vfs_meta::UserCopyMode::AddressSpace,
+                        )?;
+                        return super::local_fd::write_pinned_local(&local, &payload)
+                            .map(|n| n as u64);
+                    }
+                    drop(local);
+                    return vectored_io_with_iovecs(fd, iovecs, None, |f, p, l, _| {
+                        syscall_linux_vfs_write(f, p, l)
+                    });
+                }
+                super::local_fd::LocalFd::Pipe(_) => {
+                    let iovecs = super::vfs_meta::read_current_iovecs_payload(iov_ptr, iovcnt)?;
+                    let total = iovecs_total_len(&iovecs)?;
+                    if total == 0 {
+                        return Ok(0);
+                    }
+                    if total <= kernel_ps::api::PIPE_BUF {
+                        let mut stack = [0_u8; kernel_ps::api::PIPE_BUF];
+                        gather_iovecs_into(&iovecs, &mut stack[..total])?;
+                        return super::local_fd::write_pinned_local(&local, &stack[..total])
+                            .map(|n| n as u64);
+                    }
+                    drop(local);
+                    return vectored_io_with_iovecs(fd, iovecs, None, |f, p, l, _| {
+                        syscall_linux_vfs_write(f, p, l)
+                    });
+                }
+                super::local_fd::LocalFd::EventFd(_) | super::local_fd::LocalFd::TimerFd(_) => {}
+            }
+        }
         vectored_io_at(fd, iov_ptr, iovcnt, None, |f, p, l, _| {
             syscall_linux_vfs_write(f, p, l)
         })
@@ -1670,6 +1726,9 @@ pub(super) fn proc_fd_link_text(target_fd: u64) -> Result<alloc::string::String,
             multitask::KernelHandle::Pipe(pipe) => alloc::format!("pipe:[{}]", pipe.inode()),
             multitask::KernelHandle::EventFd(_) => {
                 alloc::string::String::from("anon_inode:[eventfd]")
+            }
+            multitask::KernelHandle::TimerFd(_) => {
+                alloc::string::String::from("anon_inode:[timerfd]")
             }
             multitask::KernelHandle::Epoll(_) => {
                 alloc::string::String::from("anon_inode:[eventpoll]")
@@ -2008,32 +2067,71 @@ fn write_remote_vfs(
     let remote_id = remote.remote_id();
     let _pin = RemoteVfsRefGuard::acquire(fd, remote_id)?;
     let _cursor = acquire_vfs_cursor_gate(remote_id)?;
-    let chunk_len = user_len.min(VFS_IPC_REQUEST_PAYLOAD_CAPACITY);
     let is_file = remote.kind() == multitask::RemoteVfsHandleKind::File;
-    let observed_epoch = if is_file {
-        ipc_ops::service_endpoint_epoch(IPC_SERVICE_VFSD).unwrap_or(0)
-    } else {
-        0
-    };
-    let mut request = new_vfs_request(VFS_IPC_OP_WRITE);
-    request.fd = fd;
-    request.remote_id = remote_id;
-    request.payload_len = chunk_len as u32;
-    if is_file {
-        request.flags |= VFS_WRITE_FLAG_CURSOR_SYNC;
-        request.arg0 = remote.cursor();
+    let mut written = 0_usize;
+    while written < user_len {
+        let chunk_len = (user_len - written).min(VFS_IPC_REQUEST_PAYLOAD_CAPACITY);
+        let Some(chunk_user_ptr) = user_ptr.checked_add(written as u64) else {
+            return partial_or_err(written, LINUX_EFAULT);
+        };
+        let observed_epoch = if is_file {
+            ipc_ops::service_endpoint_epoch(IPC_SERVICE_VFSD).unwrap_or(0)
+        } else {
+            0
+        };
+        let mut request = new_vfs_request(VFS_IPC_OP_WRITE);
+        request.fd = fd;
+        request.remote_id = remote_id;
+        request.payload_len = chunk_len as u32;
+        if is_file {
+            request.flags |= VFS_WRITE_FLAG_CURSOR_SYNC;
+            request.arg0 = remote.cursor();
+        }
+        if let Err(errno) = read_user_bytes_as(chunk_user_ptr, &mut request.payload[..chunk_len]) {
+            return partial_or_err(written, errno);
+        }
+        let response = match call_vfs_ipc_request(&request).and_then(|response| {
+            ensure_vfs_status(&response)?;
+            Ok(response)
+        }) {
+            Ok(response) => response,
+            Err(errno) => return partial_or_err(written, errno),
+        };
+        // A provider cannot have accepted more than it was offered.
+        let chunk_written = response.value as usize;
+        if chunk_written > chunk_len {
+            return partial_or_err(written, LINUX_EINVAL);
+        }
+        if is_file {
+            remote.set_synced_cursor(response.aux, observed_epoch);
+        }
+        written += chunk_written;
+        if chunk_written == 0 || chunk_written < chunk_len {
+            break;
+        }
+        if written < user_len {
+            multitask::cond_resched();
+        }
     }
-    read_user_bytes_as(user_ptr, &mut request.payload[..chunk_len])?;
-    let response = call_vfs_ipc_request(&request)?;
-    ensure_vfs_status(&response)?;
-    // A provider cannot have accepted more than it was offered.
-    if response.value > chunk_len as u64 {
-        return Err(LINUX_EINVAL);
+    Ok(written as u64)
+}
+
+fn gather_iovecs_into(iovecs: &[linux_abi::LinuxIovec], dest: &mut [u8]) -> LinuxResult<()> {
+    let mut offset = 0usize;
+    for iov in iovecs {
+        if offset >= dest.len() {
+            break;
+        }
+        let len = usize::try_from(iov.iov_len)
+            .map_err(|_| LINUX_EINVAL)?
+            .min(dest.len() - offset);
+        if len == 0 {
+            continue;
+        }
+        read_user_bytes_as(iov.iov_base, &mut dest[offset..offset + len])?;
+        offset += len;
     }
-    if is_file {
-        remote.set_synced_cursor(response.aux, observed_epoch);
-    }
-    Ok(response.value)
+    Ok(())
 }
 
 fn iovecs_total_len(iovecs: &[linux_abi::LinuxIovec]) -> LinuxResult<usize> {
@@ -2051,10 +2149,19 @@ fn vectored_io_at(
     fd: u64,
     iov_ptr: u64,
     iovcnt: u64,
+    current_offset: Option<u64>,
+    step: impl FnMut(u64, u64, u64, Option<u64>) -> u64,
+) -> LinuxResult<u64> {
+    let iovecs = super::vfs_meta::read_current_iovecs_payload(iov_ptr, iovcnt)?;
+    vectored_io_with_iovecs(fd, iovecs, current_offset, step)
+}
+
+fn vectored_io_with_iovecs(
+    fd: u64,
+    iovecs: Vec<linux_abi::LinuxIovec>,
     mut current_offset: Option<u64>,
     mut step: impl FnMut(u64, u64, u64, Option<u64>) -> u64,
 ) -> LinuxResult<u64> {
-    let iovecs = super::vfs_meta::read_current_iovecs_payload(iov_ptr, iovcnt)?;
     if iovecs_total_len(&iovecs)? == 0 {
         return Ok(0);
     }
@@ -2065,8 +2172,7 @@ fn vectored_io_at(
             let Some(chunk_ptr) = iov.iov_base.checked_add(done_for_iov) else {
                 return partial_or_err(total, LINUX_EFAULT);
             };
-            let chunk_len =
-                (iov.iov_len - done_for_iov).min(VFS_IPC_REQUEST_PAYLOAD_CAPACITY as u64);
+            let chunk_len = iov.iov_len - done_for_iov;
             if let Some(pos) = current_offset
                 && pos > i64::MAX as u64
             {
@@ -2390,6 +2496,7 @@ pub enum ServiceHandleRef {
     Input(u64),
     Pipe(multitask::PipeHandle),
     EventFd(multitask::EventFdHandle),
+    TimerFd(multitask::TimerFdHandle),
     UnixSocket(multitask::UnixSocketHandle),
 }
 
@@ -2521,6 +2628,9 @@ fn release_service_handle_refs_inner(refs: &[ServiceHandleRef], bounded: bool) {
             ServiceHandleRef::EventFd(eventfd) => {
                 super::local_fd::release_eventfd(&eventfd, bounded)
             }
+            ServiceHandleRef::TimerFd(timerfd) => {
+                super::local_fd::release_timerfd(&timerfd, bounded)
+            }
             ServiceHandleRef::UnixSocket(sock) => {
                 let (release, drained) = sock.release_descriptor_reference();
                 super::local_fd::settle_release(
@@ -2560,6 +2670,9 @@ pub fn service_handle_ref_for_handle(handle: &multitask::KernelHandle) -> Option
         multitask::KernelHandle::EventFd(eventfd) => {
             Some(ServiceHandleRef::EventFd(eventfd.clone()))
         }
+        multitask::KernelHandle::TimerFd(timerfd) => {
+            Some(ServiceHandleRef::TimerFd(timerfd.clone()))
+        }
         multitask::KernelHandle::UnixSocket(sock) => {
             Some(ServiceHandleRef::UnixSocket(sock.clone()))
         }
@@ -2590,6 +2703,10 @@ pub fn acquire_service_handle_ref(handle_ref: &ServiceHandleRef) -> Result<(), i
             .then_some(())
             .ok_or(LINUX_EBADF),
         ServiceHandleRef::EventFd(eventfd) => eventfd
+            .try_acquire_descriptor_reference()
+            .then_some(())
+            .ok_or(LINUX_EBADF),
+        ServiceHandleRef::TimerFd(timerfd) => timerfd
             .try_acquire_descriptor_reference()
             .then_some(())
             .ok_or(LINUX_EBADF),

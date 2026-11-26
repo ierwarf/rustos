@@ -353,18 +353,33 @@ fn resolve_proc_target_pid(node: Node, number: u64, caller_pid: u64) -> Result<u
     }
 }
 
+fn current_process_startup() -> Result<linux_abi::LinuxStartupLayout, i64> {
+    multitask::with_current_user_process_state(|_, _, state| {
+        state
+            .linux_process_state()
+            .map(|linux| linux.startup)
+            .unwrap_or_default()
+    })
+    .ok_or(LINUX_ESRCH)
+}
+
 /// `/proc/<pid>/smaps_rollup`: only counters Ring0 attests for the whole
 /// process (`Rss`, `Locked`); per-mapping sharing facts do not exist, so the
 /// `Pss`/`Shared_*`/`Private_*`/`Anonymous`/`Swap` keys are omitted.
-fn format_smaps_rollup(process: &snap::ProcessFacts) -> Vec<u8> {
+fn format_smaps_rollup_counters(rss_pages: Option<u64>, locked_bytes: u64) -> Vec<u8> {
     let mut out = String::from(
         "00400000-ffffffff ---p 00000000 00:00 0                          [rollup]\n",
     );
-    if let Some(pages) = process.rss_pages {
+    if let Some(pages) = rss_pages {
         out.push_str(&alloc::format!("Rss:            {:>8} kB\n", pages.saturating_mul(4)));
     }
-    out.push_str(&alloc::format!("Locked:         {:>8} kB\n", process.locked_bytes / 1024));
+    out.push_str(&alloc::format!("Locked:         {:>8} kB\n", locked_bytes / 1024));
     out.into_bytes()
+}
+
+#[cfg(test)]
+fn format_smaps_rollup(process: &snap::ProcessFacts) -> Vec<u8> {
+    format_smaps_rollup_counters(process.rss_pages, process.locked_bytes)
 }
 
 /// Content of the node as of now; oversized snapshots fail rather than truncate.
@@ -373,37 +388,48 @@ fn render(node: Node, number: u64, pid: u64) -> Result<Vec<u8>, i64> {
     let bytes = match node {
         Node::Maps => snap::format_maps(&gather_process(pid)?.regions),
         Node::Smaps => snap::format_smaps(&gather_process(pid)?.regions),
-        Node::SmapsRollup => format_smaps_rollup(&gather_process(pid)?),
+        Node::SmapsRollup => {
+            let (rss_pages, locked_bytes) =
+                multitask::with_current_user_process_state(|_, _, state| {
+                    (
+                        crate::memory::phys::data_leaf_count(
+                            state.address_space().root_phys().as_u64(),
+                        ),
+                        state.memlock().locked_bytes(),
+                    )
+                })
+                .ok_or(LINUX_ESRCH)?;
+            format_smaps_rollup_counters(rss_pages, locked_bytes)
+        }
         Node::Status => snap::format_status(&gather_process(pid)?, &caller_thread(caller_tid)),
         Node::Stat => snap::format_stat(&gather_process(pid)?, &caller_thread(caller_tid)),
         Node::Statm => snap::format_statm(&gather_process(pid)?),
         Node::Comm => snap::format_comm(&caller_thread(caller_tid)),
         Node::OomScoreAdj => {
-            if number != 0 {
-                let adj = multitask::with_process_state_by_pid(pid, |state| {
+            let adj = if number != 0 {
+                multitask::with_process_state_by_pid(pid, |state| {
                     state.security().oom_score_adj()
                 })
-                .ok_or(LINUX_ENOENT)?;
-                alloc::format!("{adj}\n").into_bytes()
+                .ok_or(LINUX_ENOENT)?
             } else {
-                snap::format_oom_score_adj(&gather_process(pid)?)
-            }
+                multitask::with_current_user_process_state(|_, _, state| {
+                    state.security().oom_score_adj()
+                })
+                .ok_or(LINUX_ESRCH)?
+            };
+            alloc::format!("{adj}\n").into_bytes()
         }
         Node::Limits => snap::format_limits(&gather_limits()),
         Node::Cmdline => {
-            let process = gather_process(pid)?;
-            read_user_range(process.arg_start, process.arg_end)?
+            let startup = current_process_startup()?;
+            read_user_range(startup.arg_start, startup.arg_end)?
         }
         Node::Environ => {
-            let process = gather_process(pid)?;
-            read_user_range(process.env_start, process.env_end)?
+            let startup = current_process_startup()?;
+            read_user_range(startup.env_start, startup.env_end)?
         }
         Node::Auxv => {
-            let startup = multitask::with_current_user_process_state(|_, _, state| {
-                state.linux_process_state().map(|linux| linux.startup)
-            })
-            .flatten()
-            .unwrap_or_default();
+            let startup = current_process_startup().unwrap_or_default();
             let bytes = read_user_range(startup.auxv_start, startup.auxv_end)?;
             if bytes.len() % 16 != 0 {
                 return Err(LINUX_EINVAL);
@@ -561,12 +587,20 @@ fn stat_node(node: Node, number: u64, flags: u64, out: StatOut) -> Result<u64, i
         size: 0,
     };
     let (uid, gid) = anon_stat::owner_ids();
-    let (ptr, bytes): (u64, Vec<u8>) = match out {
-        StatOut::Stat { ptr } => (ptr, anon_stat::encode_stat(stat, uid, gid).to_vec()),
-        StatOut::Statx { ptr, .. } => (ptr, anon_stat::encode_statx(stat, uid, gid).to_vec()),
+    let stat_buf;
+    let statx_buf;
+    let (ptr, bytes): (u64, &[u8]) = match out {
+        StatOut::Stat { ptr } => {
+            stat_buf = anon_stat::encode_stat(stat, uid, gid);
+            (ptr, &stat_buf)
+        }
+        StatOut::Statx { ptr, .. } => {
+            statx_buf = anon_stat::encode_statx(stat, uid, gid);
+            (ptr, &statx_buf)
+        }
     };
     validate_user_write(ptr, bytes.len())?;
-    write_user_bytes(ptr, &bytes).map(|()| 0)
+    write_user_bytes(ptr, bytes).map(|()| 0)
 }
 
 /// `access` of a delegated node, `None` when not delegated.

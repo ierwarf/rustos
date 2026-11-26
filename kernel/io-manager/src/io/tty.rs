@@ -39,25 +39,18 @@ pub fn read_input_blocking_for_session(session: ConsoleSessionHandle, dest: &mut
             Armed,
         }
 
-        if current_task_id.is_some() && !crate::multitask::arm_block_current_task() {
-            return 0;
-        }
-
         let disposition = {
             let mut tty = TTY.lock();
             let Some(session_state) = tty.session_mut(session) else {
-                if current_task_id.is_some() {
-                    let _ = crate::multitask::cancel_block_current_task();
-                }
                 return 0;
             };
             let read = session_state.input.pop_into(dest);
             if read != 0 {
-                if current_task_id.is_some() {
-                    let _ = crate::multitask::cancel_block_current_task();
-                }
                 ReadDisposition::Ready(read)
             } else if let Some(task_id) = current_task_id {
+                if !crate::multitask::arm_block_current_task() {
+                    return 0;
+                }
                 session_state.input_waiter = Some(task_id);
                 ReadDisposition::Armed
             } else {

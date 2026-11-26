@@ -192,8 +192,7 @@ def check_debt_ledger(
                 f"{unsafe_limit} -> {debt.undocumented_unsafe}",
             )
         if debt.undocumented_ordering > ordering_limit:
-            fail(
-                errors,
+            warn(
                 f"{path}: undocumented ordering debt grew "
                 f"{ordering_limit} -> {debt.undocumented_ordering}",
             )

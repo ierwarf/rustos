@@ -70,6 +70,11 @@ pub struct LocalWake {
 pub trait LocalWaitable: Send + Sync {
     /// Current readiness, or `None` after the object's final descriptor close.
     fn readiness(&self) -> Option<LocalReadiness>;
+
+    /// Next monotonic expiry instant in nanoseconds for timer descriptors.
+    fn deadline_ns(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Outcome of dropping one descriptor-table reference.
@@ -293,6 +298,12 @@ pub fn lookup(token: u64) -> Option<Arc<dyn LocalWaitable>> {
 pub fn readiness_of(token: u64) -> Option<LocalReadiness> {
     let object = lookup(token)?;
     object.readiness()
+}
+
+/// Active timer deadline of `token` in monotonic nanoseconds, if any.
+pub fn deadline_ns_of(token: u64) -> Option<u64> {
+    let object = lookup(token)?;
+    object.deadline_ns()
 }
 
 #[cfg(test)]

@@ -24,14 +24,14 @@
 use alloc::vec::Vec;
 use kernel_ps::api::{
     EventFdError, EventFdHandle, LocalRelease, PipeCapacityError, PipeError, PipeHandle,
-    PipeReadError, PipeRole, UnixSocketHandle,
+    PipeReadError, PipeRole, TimerFdError, TimerFdHandle, TimerFdSpec, UnixSocketHandle,
 };
 
-use super::*;
 use super::super::broker_ops::waitset_broker_ops::{
-    register_waitset_waiters, remove_waitset_waiters, wake_local_fd_object,
-    waitset_waiters_match, ProviderObservation,
+    ProviderObservation, register_waitset_waiters, remove_waitset_waiters, waitset_waiters_match,
+    wake_local_fd_object,
 };
+use super::*;
 use rustos_user_abi::syscall::WAITSET_PROVIDER_KERNEL;
 
 const LINUX_ENFILE: i64 = 23;
@@ -43,11 +43,16 @@ const PIPE2_ACCEPTED_FLAGS: u64 = linux_abi::O_CLOEXEC | linux_abi::O_NONBLOCK;
 const EFD_ACCEPTED_FLAGS: u64 =
     linux_abi::EFD_SEMAPHORE | linux_abi::EFD_CLOEXEC | linux_abi::EFD_NONBLOCK;
 
+const TFD_ACCEPTED_FLAGS: u64 = linux_abi::TFD_CLOEXEC | linux_abi::TFD_NONBLOCK;
+const TFD_SETTIME_ACCEPTED_FLAGS: u64 =
+    linux_abi::TFD_TIMER_ABSTIME | linux_abi::TFD_TIMER_CANCEL_ON_SET;
+
 /// A kernel-local fd object pinned by an active descriptor reference.
 #[derive(Debug)]
 pub(in crate::user::syscall::linux) enum LocalFd {
     Pipe(PipeHandle),
     EventFd(EventFdHandle),
+    TimerFd(TimerFdHandle),
     UnixSocket(UnixSocketHandle),
 }
 
@@ -56,6 +61,7 @@ impl Drop for LocalFd {
         match self {
             Self::Pipe(pipe) => release_pipe(pipe, true),
             Self::EventFd(eventfd) => release_eventfd(eventfd, true),
+            Self::TimerFd(timerfd) => release_timerfd(timerfd, true),
             Self::UnixSocket(sock) => {
                 release_service_handle_refs_bounded(&[ServiceHandleRef::UnixSocket(sock.clone())]);
             }
@@ -68,6 +74,7 @@ impl LocalFd {
         match self {
             Self::Pipe(pipe) => pipe.token_id(),
             Self::EventFd(eventfd) => eventfd.token_id(),
+            Self::TimerFd(timerfd) => timerfd.token_id(),
             Self::UnixSocket(sock) => sock.token_id(),
         }
     }
@@ -76,6 +83,7 @@ impl LocalFd {
         match self {
             Self::Pipe(pipe) => pipe.status_flags(),
             Self::EventFd(eventfd) => eventfd.status_flags(),
+            Self::TimerFd(timerfd) => timerfd.status_flags(),
             Self::UnixSocket(sock) => sock.status_flags(),
         }
     }
@@ -84,6 +92,7 @@ impl LocalFd {
         match self {
             Self::Pipe(pipe) => pipe.set_nonblocking(value),
             Self::EventFd(eventfd) => eventfd.set_nonblocking(value),
+            Self::TimerFd(timerfd) => timerfd.set_nonblocking(value),
             Self::UnixSocket(sock) => sock.set_nonblocking(value),
         }
     }
@@ -101,6 +110,11 @@ pub(in crate::user::syscall::linux) fn current_local_fd(fd: u64) -> Option<Local
                 if eventfd.try_acquire_descriptor_reference() =>
             {
                 Some(LocalFd::EventFd(eventfd.clone()))
+            }
+            Some(multitask::KernelHandle::TimerFd(timerfd))
+                if timerfd.try_acquire_descriptor_reference() =>
+            {
+                Some(LocalFd::TimerFd(timerfd.clone()))
             }
             Some(multitask::KernelHandle::UnixSocket(sock))
                 if sock.try_acquire_descriptor_reference() =>
@@ -122,7 +136,12 @@ fn publish(wake: Option<kernel_ps::api::LocalWake>) {
 /// Settles the descriptor reference of a pipe end that left a descriptor
 /// table: wakes the peer on a final close and drops any epoll interest.
 pub(super) fn release_pipe(pipe: &PipeHandle, bounded: bool) {
-    settle_release(pipe.release_descriptor_reference(), pipe.epoll_registered(), pipe.token_id(), bounded);
+    settle_release(
+        pipe.release_descriptor_reference(),
+        pipe.epoll_registered(),
+        pipe.token_id(),
+        bounded,
+    );
 }
 
 pub(super) fn release_eventfd(eventfd: &EventFdHandle, bounded: bool) {
@@ -130,6 +149,15 @@ pub(super) fn release_eventfd(eventfd: &EventFdHandle, bounded: bool) {
         eventfd.release_descriptor_reference(),
         eventfd.epoll_registered(),
         eventfd.token_id(),
+        bounded,
+    );
+}
+
+pub(super) fn release_timerfd(timerfd: &TimerFdHandle, bounded: bool) {
+    settle_release(
+        timerfd.release_descriptor_reference(),
+        timerfd.epoll_registered(),
+        timerfd.token_id(),
         bounded,
     );
 }
@@ -156,7 +184,6 @@ fn pipe_error_errno(err: PipeError) -> i64 {
         PipeError::WouldBlock { .. } => LINUX_EAGAIN,
     }
 }
-
 
 /// Queues `SIGPIPE` on the writing thread; procd decides its disposition when
 /// the pending signal is delivered at syscall return.
@@ -283,11 +310,7 @@ pub(super) fn wait_local_wouldblock(
 
 // ---- creation -------------------------------------------------------------
 
-fn install_pair(
-    read: PipeHandle,
-    write: PipeHandle,
-    fd_flags: u32,
-) -> Result<(u64, u64), i64> {
+fn install_pair(read: PipeHandle, write: PipeHandle, fd_flags: u32) -> Result<(u64, u64), i64> {
     let read_entry = multitask::HandleEntry::new(
         multitask::KernelHandle::Pipe(read.clone()),
         fd_flags,
@@ -416,6 +439,168 @@ pub fn syscall_linux_eventfd(initval: u64) -> u64 {
     syscall_linux_eventfd2(initval, 0)
 }
 
+pub fn syscall_linux_timerfd_create(clock_id: u64, flags: u64) -> u64 {
+    linux_result((|| {
+        if flags & !TFD_ACCEPTED_FLAGS != 0 {
+            return Err(LINUX_EINVAL);
+        }
+        let clock = match clock_id {
+            id if id == linux_abi::CLOCK_REALTIME
+                || id == linux_abi::CLOCK_MONOTONIC
+                || id == linux_abi::CLOCK_BOOTTIME =>
+            {
+                id as u32
+            }
+            _ => return Err(LINUX_EINVAL),
+        };
+        let timerfd = TimerFdHandle::new_in_group(
+            clock,
+            flags & linux_abi::TFD_NONBLOCK != 0,
+            multitask::current_user_job_charge_group(),
+        )
+        .map_err(|_| LINUX_ENFILE)?;
+        let fd_flags = if flags & linux_abi::TFD_CLOEXEC != 0 {
+            multitask::FD_CLOEXEC
+        } else {
+            0
+        };
+        let entry = multitask::HandleEntry::new(
+            multitask::KernelHandle::TimerFd(timerfd.clone()),
+            fd_flags,
+            timerfd.status_flags(),
+        );
+        match multitask::with_current_user_process_state_mut(|_, _, process_state| {
+            process_state.handles_mut().install_entry(entry)
+        }) {
+            Some(Some(fd)) => Ok(fd),
+            Some(None) => {
+                release_timerfd(&timerfd, true);
+                Err(LINUX_EMFILE)
+            }
+            None => {
+                release_timerfd(&timerfd, true);
+                Err(LINUX_ENOSYS)
+            }
+        }
+    })())
+}
+
+fn validate_timerfd_timespec(ts: linux_abi::LinuxTimespec) -> Result<u64, i64> {
+    if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+        return Err(LINUX_EINVAL);
+    }
+    Ok((ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64))
+}
+
+fn encode_timerfd_itimerspec(spec: TimerFdSpec) -> linux_abi::LinuxItimerspec {
+    let to_ts = |ns: u64| linux_abi::LinuxTimespec {
+        tv_sec: (ns / 1_000_000_000) as i64,
+        tv_nsec: (ns % 1_000_000_000) as i64,
+    };
+    linux_abi::LinuxItimerspec {
+        it_interval: to_ts(spec.interval_ns),
+        it_value: to_ts(spec.value_ns),
+    }
+}
+
+// Translate an absolute wall-clock deadline without losing the expirations
+// or the phase of a periodic timer whose first deadline has already passed.
+fn realtime_timer_schedule(
+    now_ns: u64,
+    realtime_now: u64,
+    value_ns: u64,
+    interval_ns: u64,
+) -> (u64, u64) {
+    if value_ns > realtime_now {
+        return (now_ns.saturating_add(value_ns - realtime_now), 0);
+    }
+    if interval_ns == 0 {
+        return (0, 1);
+    }
+    let elapsed = realtime_now - value_ns;
+    let remaining = interval_ns - elapsed % interval_ns;
+    (
+        now_ns.checked_add(remaining).unwrap_or(0),
+        1_u64.saturating_add(elapsed / interval_ns),
+    )
+}
+
+fn with_timerfd<T>(fd: u64, f: impl FnOnce(&TimerFdHandle) -> Result<T, i64>) -> Result<T, i64> {
+    match current_local_fd(fd) {
+        Some(local @ LocalFd::TimerFd(_)) => {
+            let LocalFd::TimerFd(ref timerfd) = local else {
+                unreachable!()
+            };
+            f(timerfd)
+        }
+        Some(_) => Err(LINUX_EINVAL),
+        None => {
+            let exists = multitask::with_current_user_process_state(|_, _, state| {
+                state.handles().get_entry(fd).is_some()
+            })
+            .unwrap_or(false);
+            Err(if exists { LINUX_EINVAL } else { LINUX_EBADF })
+        }
+    }
+}
+
+pub fn syscall_linux_timerfd_settime(
+    fd: u64,
+    flags: u64,
+    new_value_ptr: u64,
+    old_value_ptr: u64,
+) -> u64 {
+    linux_unit_result((|| {
+        if flags & !TFD_SETTIME_ACCEPTED_FLAGS != 0 {
+            return Err(LINUX_EINVAL);
+        }
+        with_timerfd(fd, |timerfd| {
+            let new_spec: linux_abi::LinuxItimerspec = read_user_struct(new_value_ptr)?;
+            let value_ns = validate_timerfd_timespec(new_spec.it_value)?;
+            let interval_ns = validate_timerfd_timespec(new_spec.it_interval)?;
+            if old_value_ptr != 0 {
+                validate_user_write(old_value_ptr, size_of::<linux_abi::LinuxItimerspec>())?;
+            }
+            let now_ns = crate::arch::rtc::monotonic_nanos();
+            let (next_expiry_ns, expirations) = if value_ns == 0 {
+                (0, 0)
+            } else if flags & linux_abi::TFD_TIMER_ABSTIME != 0 {
+                if u64::from(timerfd.clock_id()) == linux_abi::CLOCK_REALTIME {
+                    let rt = super::process_time::realtime_timespec();
+                    let realtime_now = validate_timerfd_timespec(linux_abi::LinuxTimespec {
+                        tv_sec: rt.tv_sec,
+                        tv_nsec: rt.tv_nsec,
+                    })?;
+                    realtime_timer_schedule(now_ns, realtime_now, value_ns, interval_ns)
+                } else {
+                    (value_ns, 0)
+                }
+            } else {
+                (now_ns.saturating_add(value_ns), 0)
+            };
+            let (old_spec, wake) =
+                timerfd.settime_at(now_ns, next_expiry_ns, interval_ns, expirations);
+            publish(Some(wake));
+            if old_value_ptr != 0 {
+                write_user_struct(old_value_ptr, &encode_timerfd_itimerspec(old_spec))?;
+            }
+            Ok(())
+        })
+    })())
+}
+
+pub fn syscall_linux_timerfd_gettime(fd: u64, curr_value_ptr: u64) -> u64 {
+    linux_unit_result((|| {
+        with_timerfd(fd, |timerfd| {
+            validate_user_write(curr_value_ptr, size_of::<linux_abi::LinuxItimerspec>())?;
+            let spec = timerfd.gettime_at(crate::arch::rtc::monotonic_nanos());
+            write_user_struct(curr_value_ptr, &encode_timerfd_itimerspec(spec))
+        })
+    })())
+}
+
 // ---- read / write ---------------------------------------------------------
 
 fn completed_or_result(progress: usize, errno: i64) -> LinuxResult<u64> {
@@ -437,6 +622,7 @@ pub(in crate::user::syscall::linux) fn read(fd: u64, user_ptr: u64, user_len: u6
     Some(match &local {
         LocalFd::Pipe(pipe) => pipe_read(pipe, user_ptr, user_len),
         LocalFd::EventFd(eventfd) => eventfd_read(eventfd, user_ptr, user_len),
+        LocalFd::TimerFd(timerfd) => timerfd_read(timerfd, user_ptr, user_len),
         LocalFd::UnixSocket(sock) => super::local_unix::read_unix_socket(sock, user_ptr, user_len),
     })
 }
@@ -447,6 +633,7 @@ pub(in crate::user::syscall::linux) fn write(fd: u64, user_ptr: u64, user_len: u
     Some(match &local {
         LocalFd::Pipe(pipe) => pipe_write(pipe, user_ptr, user_len),
         LocalFd::EventFd(eventfd) => eventfd_write(eventfd, user_ptr, user_len),
+        LocalFd::TimerFd(_) => linux_errno(LINUX_EINVAL),
         LocalFd::UnixSocket(sock) => super::local_unix::write_unix_socket(sock, user_ptr, user_len),
     })
 }
@@ -482,7 +669,9 @@ fn pipe_read(pipe: &PipeHandle, user_ptr: u64, user_len: u64) -> u64 {
                 }
                 &mut heap[..want]
             };
-            let copied = pipe.shared().read_with(scratch, |bytes| write_user_bytes(user_ptr, bytes));
+            let copied = pipe
+                .shared()
+                .read_with(scratch, |bytes| write_user_bytes(user_ptr, bytes));
             match copied {
                 Ok(progress) => {
                     publish(progress.wake);
@@ -555,7 +744,7 @@ pub(in crate::user::syscall::linux) fn write_pinned_local(
             }
         }
         LocalFd::UnixSocket(sock) => super::local_unix::unix_socket_write_bytes_handle(sock, data),
-        LocalFd::EventFd(_) => Err(LINUX_EINVAL),
+        LocalFd::EventFd(_) | LocalFd::TimerFd(_) => Err(LINUX_EINVAL),
     }
 }
 
@@ -628,6 +817,44 @@ fn eventfd_read(eventfd: &EventFdHandle, user_ptr: u64, user_len: u64) -> u64 {
     })())
 }
 
+fn timerfd_read(timerfd: &TimerFdHandle, user_ptr: u64, user_len: u64) -> u64 {
+    linux_result((|| {
+        if user_len < size_of::<u64>() as u64 {
+            return Err(LINUX_EINVAL);
+        }
+        validate_user_write(user_ptr, size_of::<u64>())?;
+        loop {
+            let now_ns = crate::arch::rtc::monotonic_nanos();
+            let (generation, deadline_ns) = match timerfd.peek_read_at(now_ns) {
+                Ok(read) => {
+                    write_user_bytes(user_ptr, &read.count.to_ne_bytes())?;
+                    match timerfd.commit_read(read) {
+                        Ok(wake) => {
+                            publish(Some(wake));
+                            return Ok(size_of::<u64>() as u64);
+                        }
+                        Err(TimerFdError::Retry) => continue,
+                        Err(_) => return Err(LINUX_EINVAL),
+                    }
+                }
+                Err(TimerFdError::WouldBlock {
+                    generation,
+                    deadline_ns,
+                }) => (generation, deadline_ns),
+                Err(_) => return Err(LINUX_EINVAL),
+            };
+            if timerfd.nonblocking() {
+                return Err(LINUX_EAGAIN);
+            }
+            let deadline_tick = deadline_ns.map(super::poll_epoll::monotonic_deadline_tick_from_ns);
+            match wait_for_local_generation(timerfd.token_id(), generation, deadline_tick) {
+                Ok(()) | Err(LINUX_EAGAIN) => {}
+                Err(errno) => return Err(errno),
+            }
+        }
+    })())
+}
+
 fn eventfd_write(eventfd: &EventFdHandle, user_ptr: u64, user_len: u64) -> u64 {
     linux_result((|| {
         if user_len < size_of::<u64>() as u64 {
@@ -692,21 +919,24 @@ pub(in crate::user::syscall::linux) fn fcntl(local: &LocalFd, cmd: u64, arg: u64
         }
         linux_abi::F_GETPIPE_SZ => match local {
             LocalFd::Pipe(pipe) => Ok(pipe.shared().capacity() as u64),
-            LocalFd::EventFd(_) | LocalFd::UnixSocket(_) => Err(LINUX_EBADF),
+            LocalFd::EventFd(_) | LocalFd::TimerFd(_) | LocalFd::UnixSocket(_) => Err(LINUX_EBADF),
         },
         linux_abi::F_SETPIPE_SZ => match local {
             LocalFd::Pipe(pipe) => {
                 let requested = parse_pipe_size_arg(arg)?;
-                let (bytes, wake) = pipe.shared().set_capacity(requested).map_err(|err| match err {
-                    // Above the (64 KiB) system pipe maximum: Linux's EPERM
-                    // for an unprivileged caller past pipe-max-size.
-                    PipeCapacityError::TooLarge => LINUX_EPERM,
-                    PipeCapacityError::Busy => LINUX_EBUSY,
-                })?;
+                let (bytes, wake) =
+                    pipe.shared()
+                        .set_capacity(requested)
+                        .map_err(|err| match err {
+                            // Above the (64 KiB) system pipe maximum: Linux's EPERM
+                            // for an unprivileged caller past pipe-max-size.
+                            PipeCapacityError::TooLarge => LINUX_EPERM,
+                            PipeCapacityError::Busy => LINUX_EBUSY,
+                        })?;
                 publish(wake);
                 Ok(bytes as u64)
             }
-            LocalFd::EventFd(_) | LocalFd::UnixSocket(_) => Err(LINUX_EBADF),
+            LocalFd::EventFd(_) | LocalFd::TimerFd(_) | LocalFd::UnixSocket(_) => Err(LINUX_EBADF),
         },
         _ => Err(LINUX_EINVAL),
     })()))
@@ -723,7 +953,7 @@ pub(in crate::user::syscall::linux) fn ioctl(local: &LocalFd, request: u64, arg:
                 arg,
                 &u32::try_from(sock.bytes_available()).unwrap_or(u32::MAX),
             ),
-            LocalFd::EventFd(_) => Err(LINUX_ENOTTY),
+            LocalFd::EventFd(_) | LocalFd::TimerFd(_) => Err(LINUX_ENOTTY),
         },
         linux_abi::FIONBIO => {
             let value = read_user_struct::<i32>(arg)?;
@@ -780,6 +1010,7 @@ pub(in crate::user::syscall::linux) fn waitset_object(
     match handle {
         multitask::KernelHandle::Pipe(pipe) => Some(pipe.token_id()),
         multitask::KernelHandle::EventFd(eventfd) => Some(eventfd.token_id()),
+        multitask::KernelHandle::TimerFd(timerfd) => Some(timerfd.token_id()),
         multitask::KernelHandle::UnixSocket(sock) => Some(sock.token_id()),
         _ => None,
     }
@@ -791,6 +1022,7 @@ pub(in crate::user::syscall::linux) fn note_epoll_registered(handle: &multitask:
     match handle {
         multitask::KernelHandle::Pipe(pipe) => pipe.mark_epoll_registered(),
         multitask::KernelHandle::EventFd(eventfd) => eventfd.mark_epoll_registered(),
+        multitask::KernelHandle::TimerFd(timerfd) => timerfd.mark_epoll_registered(),
         multitask::KernelHandle::UnixSocket(sock) => sock.mark_epoll_registered(),
         _ => {}
     }
@@ -801,13 +1033,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn absolute_realtime_timer_preserves_elapsed_periods_and_phase() {
+        // The first expiry is even before the monotonic origin; four periods
+        // are already readable and the next is 50 ns in the future.
+        assert_eq!(realtime_timer_schedule(100, 10_000, 9_650, 100), (150, 4));
+        assert_eq!(realtime_timer_schedule(100, 10_000, 9_650, 0), (0, 1));
+        assert_eq!(realtime_timer_schedule(100, 10_000, 10_500, 100), (600, 0));
+        assert_eq!(realtime_timer_schedule(100, 10_000, 10_000, 100), (200, 1));
+    }
+
+    #[test]
     fn pipe2_flag_masks_match_the_documented_contract() {
-        assert_eq!(PIPE2_ACCEPTED_FLAGS & linux_abi::O_DIRECT, 0, "packet mode is rejected");
+        assert_eq!(
+            PIPE2_ACCEPTED_FLAGS & linux_abi::O_DIRECT,
+            0,
+            "packet mode is rejected"
+        );
         assert_eq!(EFD_ACCEPTED_FLAGS & linux_abi::O_DIRECT, 0);
+        assert_eq!(
+            TFD_ACCEPTED_FLAGS,
+            linux_abi::TFD_CLOEXEC | linux_abi::TFD_NONBLOCK
+        );
         assert_eq!(linux_abi::SYS_PIPE, 22);
         assert_eq!(linux_abi::SYS_EVENTFD, 284);
+        assert_eq!(linux_abi::SYS_TIMERFD_CREATE, 283);
+        assert_eq!(linux_abi::SYS_TIMERFD_SETTIME, 286);
+        assert_eq!(linux_abi::SYS_TIMERFD_GETTIME, 287);
         assert_eq!(linux_abi::SYS_EVENTFD2, 290);
         assert_eq!(linux_abi::SYS_PIPE2, 293);
+        assert_eq!(linux_abi::SYS_NAME_TO_HANDLE_AT, 303);
+        assert_eq!(linux_abi::SYS_PKEY_MPROTECT, 329);
+        assert_eq!(linux_abi::SYS_PKEY_ALLOC, 330);
+        assert_eq!(linux_abi::SYS_PKEY_FREE, 331);
+    }
+
+    #[test]
+    fn timerfd_timespec_validation_and_encoding_match_linux_contract() {
+        assert_eq!(
+            validate_timerfd_timespec(linux_abi::LinuxTimespec {
+                tv_sec: 2,
+                tv_nsec: 250_000_000,
+            }),
+            Ok(2_250_000_000)
+        );
+        assert_eq!(
+            validate_timerfd_timespec(linux_abi::LinuxTimespec {
+                tv_sec: -1,
+                tv_nsec: 0,
+            }),
+            Err(LINUX_EINVAL)
+        );
+        assert_eq!(
+            validate_timerfd_timespec(linux_abi::LinuxTimespec {
+                tv_sec: 0,
+                tv_nsec: 1_000_000_000,
+            }),
+            Err(LINUX_EINVAL)
+        );
+        let encoded = encode_timerfd_itimerspec(TimerFdSpec {
+            interval_ns: 1_000_000_050,
+            value_ns: 500_000_000,
+        });
+        assert_eq!(encoded.it_interval.tv_sec, 1);
+        assert_eq!(encoded.it_interval.tv_nsec, 50);
+        assert_eq!(encoded.it_value.tv_sec, 0);
+        assert_eq!(encoded.it_value.tv_nsec, 500_000_000);
     }
 
     #[test]

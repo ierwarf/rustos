@@ -224,6 +224,38 @@ fn linkat_flags(flags: u64) -> Result<(bool, u64), i64> {
     ))
 }
 
+fn name_to_handle_at_flags(flags: u64) -> Result<bool, i64> {
+    let known = linux_abi::AT_SYMLINK_FOLLOW | linux_abi::AT_EMPTY_PATH;
+    if flags & !known != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(flags & linux_abi::AT_EMPTY_PATH != 0)
+}
+
+/// Validates `name_to_handle_at` arguments and reports `EOPNOTSUPP` because
+/// RustOS VFS descriptions do not expose exportable NFS-style file handles.
+pub fn syscall_linux_name_to_handle_at(
+    _dirfd: u64,
+    pathname_ptr: u64,
+    handle_ptr: u64,
+    mount_id_ptr: u64,
+    flags: u64,
+) -> u64 {
+    linux_unit_result((|| {
+        let empty_path_allowed = name_to_handle_at_flags(flags)?;
+        let path = copy_current_user_path_allow_empty(pathname_ptr, VFS_IPC_PATH_CAPACITY)?;
+        if path.is_empty() && !empty_path_allowed {
+            return Err(LINUX_ENOENT);
+        }
+        if handle_ptr == 0 || mount_id_ptr == 0 {
+            return Err(LINUX_EFAULT);
+        }
+        let _handle_bytes = read_user_struct::<u32>(handle_ptr)?;
+        validate_user_write(mount_id_ptr, core::mem::size_of::<i32>())?;
+        Err(LINUX_EOPNOTSUPP)
+    })())
+}
+
 pub fn syscall_linux_vfs_linkat(
     olddirfd: u64,
     oldpath_ptr: u64,
@@ -839,7 +871,8 @@ fn resolve_sendfile_out_end(fd: u64) -> Result<CopyEnd, i64> {
                             Err(LINUX_EBADF)
                         }
                     }
-                    super::local_fd::LocalFd::EventFd(_) => Err(LINUX_EINVAL),
+                    super::local_fd::LocalFd::EventFd(_)
+                    | super::local_fd::LocalFd::TimerFd(_) => Err(LINUX_EINVAL),
                 }
             } else if let Some(snapshot) = snapshot_socket(fd) {
                 if current_fd_allows_write(fd) {
@@ -999,6 +1032,16 @@ mod tests {
         );
         assert_eq!(linkat_flags(linux_abi::AT_SYMLINK_NOFOLLOW), Err(LINUX_EINVAL));
         assert_eq!(linkat_flags(0x4000_0000), Err(LINUX_EINVAL));
+
+        assert_eq!(name_to_handle_at_flags(0), Ok(false));
+        assert_eq!(
+            name_to_handle_at_flags(linux_abi::AT_SYMLINK_FOLLOW | linux_abi::AT_EMPTY_PATH),
+            Ok(true)
+        );
+        assert_eq!(
+            name_to_handle_at_flags(linux_abi::AT_SYMLINK_NOFOLLOW),
+            Err(LINUX_EINVAL)
+        );
     }
 
     #[test]

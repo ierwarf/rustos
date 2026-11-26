@@ -184,6 +184,8 @@ pub struct HandleTable {
     reserved: BTreeMap<u64, u64>,
     next_reservation_id: u64,
     kmem: Option<KmemBinding>,
+    occupied_count: usize,
+    lowest_free_hint: u64,
 }
 
 impl Clone for HandleTable {
@@ -198,15 +200,33 @@ impl Clone for HandleTable {
                 .filter(|entry| acquire_entry_descriptor_reference(entry))
                 .cloned()
         };
+        let standard: [Option<HandleEntry>; FIRST_DYNAMIC_FD as usize] =
+            core::array::from_fn(|index| clone_slot(&self.standard[index]));
+        let entries: Vec<Option<HandleEntry>> = self.entries.iter().map(clone_slot).collect();
+        let occupied_count = standard.iter().filter(|e| e.is_some()).count()
+            + entries.iter().filter(|e| e.is_some()).count();
+        let lowest_free_hint = standard
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| e.is_none().then_some(i as u64))
+            .or_else(|| {
+                entries
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, e)| e.is_none().then_some(FIRST_DYNAMIC_FD as u64 + i as u64))
+            })
+            .unwrap_or(FIRST_DYNAMIC_FD as u64 + entries.len() as u64);
         Self {
-            standard: core::array::from_fn(|index| clone_slot(&self.standard[index])),
-            entries: self.entries.iter().map(clone_slot).collect(),
+            standard,
+            entries,
             // An in-flight receive transaction belongs to the calling
             // process only. Forked children must not inherit invisible slots.
             reserved: BTreeMap::new(),
             next_reservation_id: self.next_reservation_id,
             // A fork child is billed by its own publication into a job.
             kmem: None,
+            occupied_count,
+            lowest_free_hint,
         }
     }
 }
@@ -235,6 +255,8 @@ impl HandleTable {
             reserved: BTreeMap::new(),
             next_reservation_id: 1,
             kmem: None,
+            occupied_count: FIRST_DYNAMIC_FD as usize,
+            lowest_free_hint: FIRST_DYNAMIC_FD as u64,
         }
     }
 
@@ -337,38 +359,46 @@ impl HandleTable {
         let Some(slot) = self.find_slot_min(min_fd) else {
             return Err(entry);
         };
-        match slot {
+        let fd = match slot {
             FreeSlot::Standard(index) => {
                 self.standard[index] = Some(entry);
-                Ok(index as u64)
+                index as u64
             }
             FreeSlot::Dynamic(index) => {
                 if self.grow_entries(index + 1).is_none() {
                     return Err(entry);
                 }
                 self.entries[index] = Some(entry);
-                Ok(FIRST_DYNAMIC_FD as u64 + index as u64)
+                FIRST_DYNAMIC_FD as u64 + index as u64
             }
+        };
+        self.occupied_count += 1;
+        if min_fd <= self.lowest_free_hint {
+            self.lowest_free_hint = fd + 1;
         }
+        Ok(fd)
     }
 
     fn find_slot_min(&self, min_fd: u64) -> Option<FreeSlot> {
-        if min_fd > MAX_DYNAMIC_FD {
+        let start_fd = min_fd.max(self.lowest_free_hint);
+        if start_fd > MAX_DYNAMIC_FD {
             return None;
         }
-        let standard_start = usize::try_from(min_fd.min(FIRST_DYNAMIC_FD as u64)).ok()?;
-        if let Some(index) = self
-            .standard
-            .iter()
-            .enumerate()
-            .skip(standard_start)
-            .find_map(|(index, entry)| {
-                (entry.is_none() && !self.reserved.contains_key(&(index as u64))).then_some(index)
-            })
-        {
-            return Some(FreeSlot::Standard(index));
+        if start_fd < FIRST_DYNAMIC_FD as u64 {
+            let standard_start = usize::try_from(start_fd).ok()?;
+            if let Some(index) = self
+                .standard
+                .iter()
+                .enumerate()
+                .skip(standard_start)
+                .find_map(|(index, entry)| {
+                    (entry.is_none() && !self.reserved.contains_key(&(index as u64))).then_some(index)
+                })
+            {
+                return Some(FreeSlot::Standard(index));
+            }
         }
-        let start_index = dynamic_index(min_fd.max(FIRST_DYNAMIC_FD as u64))?;
+        let start_index = dynamic_index(start_fd.max(FIRST_DYNAMIC_FD as u64))?;
         if let Some(index) =
             self.entries
                 .iter()
@@ -457,11 +487,9 @@ impl HandleTable {
         if injected_failure {
             return None;
         }
-        let occupied = self.standard.iter().filter(|entry| entry.is_some()).count()
-            + self.entries.iter().filter(|entry| entry.is_some()).count();
         let total = (FIRST_DYNAMIC_FD as usize).saturating_add(max_dynamic_entries());
         let free = total
-            .saturating_sub(occupied)
+            .saturating_sub(self.occupied_count)
             .saturating_sub(self.reserved.len());
         if count > free {
             return None;
@@ -469,7 +497,7 @@ impl HandleTable {
 
         let reservation_id = self.allocate_reservation_id()?;
         let mut slots = Vec::with_capacity(count);
-        for fd in 0..=MAX_DYNAMIC_FD {
+        for fd in self.lowest_free_hint..=MAX_DYNAMIC_FD {
             if slots.len() == count {
                 break;
             }
@@ -484,6 +512,9 @@ impl HandleTable {
                 self.reserved.remove(fd);
             }
             return None;
+        }
+        if let Some(&last_fd) = slots.last() {
+            self.lowest_free_hint = last_fd + 1;
         }
         Some((reservation_id, slots))
     }
@@ -503,6 +534,7 @@ impl HandleTable {
         for &fd in slots {
             if self.reserved.get(&fd) == Some(&reservation_id) {
                 self.reserved.remove(&fd);
+                self.lowest_free_hint = self.lowest_free_hint.min(fd);
             }
         }
     }
@@ -556,9 +588,11 @@ impl HandleTable {
         if let Some(index) = standard_index(fd) {
             self.reserved.remove(&fd);
             self.standard[index] = Some(entry);
+            self.occupied_count += 1;
         } else if let Some(index) = dynamic_index(fd).filter(|index| *index < self.entries.len()) {
             self.reserved.remove(&fd);
             self.entries[index] = Some(entry);
+            self.occupied_count += 1;
         } else {
             return false;
         }
@@ -594,6 +628,7 @@ impl HandleTable {
             let index = dynamic_index(fd).expect("validated job descriptor reservation");
             self.entries[index] = Some(entry);
         }
+        self.occupied_count += 1;
         true
     }
 
@@ -643,6 +678,7 @@ impl HandleTable {
                 let index = dynamic_index(fd).expect("validated descriptor reservation");
                 self.entries[index] = Some(transferred.into_entry());
             }
+            self.occupied_count += 1;
         }
         Ok(())
     }
@@ -685,6 +721,10 @@ impl HandleTable {
             let index = dynamic_index(fd)?;
             self.entries.get_mut(index)?.take()?
         };
+        self.occupied_count -= 1;
+        if !self.reserved.contains_key(&fd) {
+            self.lowest_free_hint = self.lowest_free_hint.min(fd);
+        }
         release_entry_descriptor_reference(Some(&entry));
         Some(entry.into_handle())
     }
@@ -692,9 +732,23 @@ impl HandleTable {
     pub fn close_cloexec(&mut self) -> Vec<KernelHandle> {
         // An exec boundary invalidates receive transactions prepared by the
         // old image. Reservation ids prevent stale commit into reused slots.
+        if let Some(&min_reserved) = self.reserved.keys().next() {
+            self.lowest_free_hint = self.lowest_free_hint.min(min_reserved);
+        }
         self.reserved.clear();
         let mut closed = Vec::new();
-        for entry in self.standard.iter_mut().chain(self.entries.iter_mut()) {
+        for (fd, entry) in self
+            .standard
+            .iter_mut()
+            .enumerate()
+            .map(|(i, e)| (i as u64, e))
+            .chain(
+                self.entries
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(i, e)| (FIRST_DYNAMIC_FD as u64 + i as u64, e)),
+            )
+        {
             let Some(current) = entry.as_ref() else {
                 continue;
             };
@@ -704,6 +758,8 @@ impl HandleTable {
 
             release_entry_descriptor_reference(entry.as_ref());
             if let Some(entry) = entry.take() {
+                self.occupied_count -= 1;
+                self.lowest_free_hint = self.lowest_free_hint.min(fd);
                 closed.push(entry.into_handle());
             }
         }
@@ -712,6 +768,8 @@ impl HandleTable {
 
     pub fn close_all(&mut self) -> Vec<KernelHandle> {
         self.reserved.clear();
+        self.occupied_count = 0;
+        self.lowest_free_hint = 0;
         let mut closed = Vec::new();
         for entry in self.standard.iter_mut().chain(self.entries.iter_mut()) {
             if let Some(entry) = entry.take() {
@@ -822,6 +880,12 @@ impl HandleTable {
         }
         if let Some(index) = standard_index(new_fd) {
             let replaced = self.standard[index].replace(entry);
+            if replaced.is_none() {
+                self.occupied_count += 1;
+            }
+            if new_fd == self.lowest_free_hint {
+                self.lowest_free_hint = new_fd + 1;
+            }
             release_entry_descriptor_reference(replaced.as_ref());
             return Some((new_fd, replaced.map(HandleEntry::into_handle)));
         }
@@ -831,6 +895,12 @@ impl HandleTable {
             return None;
         }
         let replaced = self.entries[index].replace(entry);
+        if replaced.is_none() {
+            self.occupied_count += 1;
+        }
+        if new_fd == self.lowest_free_hint {
+            self.lowest_free_hint = new_fd + 1;
+        }
         release_entry_descriptor_reference(replaced.as_ref());
         Some((new_fd, replaced.map(HandleEntry::into_handle)))
     }

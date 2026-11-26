@@ -19,6 +19,7 @@ pub use futex_thread::*;
 pub use ipc_helpers::*;
 pub use local_fd::{
     syscall_linux_eventfd, syscall_linux_eventfd2, syscall_linux_pipe, syscall_linux_pipe2,
+    syscall_linux_timerfd_create, syscall_linux_timerfd_gettime, syscall_linux_timerfd_settime,
 };
 pub use poll_epoll::*;
 pub use process_time::*;

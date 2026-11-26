@@ -42,13 +42,17 @@ fn two_live_job_publications_keep_independent_reservations() {
     // the process-state lock. Model both reverse commit and cancellation.
     for cancel_first in [false, true] {
         let mut table = HandleTable::new();
+        let job = crate::multitask::ROOT_JOB;
+        let earlier_fd = table.install(KernelHandle::Job(job)).unwrap();
         let (first, a) = table.reserve_slots(1).unwrap();
-        let (second, b) = table.reserve_slots(1).unwrap();
-        assert_ne!(a[0], b[0]);
+        // Lower the allocation hint so this reservation scans across `a`.
+        assert!(table.close(earlier_fd).is_some());
+        let (second, b) = table.reserve_slots(2).unwrap();
+        assert_eq!(b, [earlier_fd, a[0] + 1]);
         assert_eq!(table.reserved.get(&a[0]), Some(&first), "a later reserve must not steal an invisible slot");
         assert_eq!(table.reserved.get(&b[0]), Some(&second));
-        let job = crate::multitask::ROOT_JOB;
         assert!(table.commit_reserved_job(second, b[0], job, JobHandleRights::INSPECT));
+        table.cancel_reservations(second, &b[1..]);
         if cancel_first {
             table.cancel_reservations(first, &a);
             assert!(table.get_entry(a[0]).is_none());
@@ -985,4 +989,62 @@ fn remote_vfs_cursor_shared_across_dup_and_transfer_but_not_fresh_open() {
     assert_eq!(primary.durable_cursor(), 512);
     assert!(!primary.is_dirty(8));
     assert_eq!(independent.cursor(), 0);
+}
+
+#[test]
+fn free_hint_and_occupied_count_stay_consistent_across_ops() {
+    let mut table = HandleTable::new();
+    let assert_invariants = |table: &HandleTable| {
+        let actual_occupied = table.standard.iter().filter(|e| e.is_some()).count()
+            + table.entries.iter().filter(|e| e.is_some()).count();
+        assert_eq!(table.occupied_count, actual_occupied);
+        for fd in 0..table.lowest_free_hint {
+            assert!(
+                table.get_entry(fd).is_some() || table.is_reserved(fd),
+                "fd {fd} below lowest_free_hint {} must not be free",
+                table.lowest_free_hint
+            );
+        }
+    };
+
+    assert_invariants(&table);
+    let fd3 = table.install(KernelHandle::Job(crate::multitask::ROOT_JOB)).unwrap();
+    let fd4 = table.install_with_open_flags(
+        KernelHandle::Job(crate::multitask::ROOT_JOB),
+        linux_abi::O_CLOEXEC,
+    ).unwrap();
+    assert_eq!((fd3, fd4), (3, 4));
+    assert_invariants(&table);
+
+    let (res_id, reserved) = table.reserve_slots(2).unwrap();
+    assert_eq!(reserved, vec![5, 6]);
+    assert_invariants(&table);
+
+    assert!(table.close(1).is_some());
+    assert_eq!(table.lowest_free_hint, 1);
+    assert_invariants(&table);
+
+    assert_eq!(table.duplicate_exact(0, 1, false), Some(1));
+    assert_eq!(table.duplicate_exact(0, 7, false), Some(7));
+    assert_invariants(&table);
+
+    table.cancel_reservations(res_id, &reserved[..1]);
+    assert!(table.lowest_free_hint <= 5);
+    assert_invariants(&table);
+
+    assert_eq!(table.install(KernelHandle::Job(crate::multitask::ROOT_JOB)), Some(5));
+    assert_eq!(table.lowest_free_hint, 6);
+    assert_invariants(&table);
+
+    let _ = table.close_cloexec();
+    assert_eq!(table.lowest_free_hint, 4);
+    assert_invariants(&table);
+
+    let cloned = table.clone();
+    assert_invariants(&cloned);
+
+    let _ = table.close_all();
+    assert_eq!(table.occupied_count, 0);
+    assert_eq!(table.lowest_free_hint, 0);
+    assert_invariants(&table);
 }

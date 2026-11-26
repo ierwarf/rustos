@@ -127,19 +127,19 @@ pub fn try_charge(class: Class, index: usize, bytes: u64) -> bool {
     let mut ok = true;
     for _ in 0..MAX_DEPTH {
         let Some(cell) = group(class, cursor) else { break };
-        let Ok(old) = cell.usage.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |usage| {
-            usage.checked_add(bytes)
-        }) else {
-            ok = false;
-            break;
-        };
-        visited[count] = Some(cell);
-        count += 1;
-        let limit = cell.limit.load(Ordering::Relaxed);
-        if limit != UNLIMITED && old.saturating_add(bytes) > limit {
+        let charged = cell
+            .usage
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |usage| {
+                let total = usage.checked_add(bytes)?;
+                let limit = cell.limit.load(Ordering::Relaxed);
+                (limit == UNLIMITED || total <= limit).then_some(total)
+            });
+        if charged.is_err() {
             ok = false;
             break;
         }
+        visited[count] = Some(cell);
+        count += 1;
         let parent = cell.parent.load(Ordering::Relaxed);
         if parent == NO_PARENT {
             break;
@@ -515,5 +515,41 @@ mod mapping_reservation_tests {
         release.wait();
         assert_eq!(tasks.into_iter().map(|t| t.join().unwrap()).filter(|won| *won).count(), 1);
         assert_eq!(usage(Class::Vma, 33), 0);
+    }
+
+    #[test]
+    fn failing_concurrent_try_charge_never_inflates_usage_above_limit() {
+        init_group(40, None);
+        init_group(41, Some(40));
+        const LIMIT: u64 = 128;
+        set_limit(Class::IpcMessage, 40, LIMIT);
+        set_limit(Class::IpcMessage, 41, LIMIT);
+        assert!(try_charge(Class::IpcMessage, 41, 96));
+
+        let start = Arc::new(Barrier::new(5));
+        let mut workers = std::vec::Vec::new();
+        for _ in 0..4 {
+            let start = start.clone();
+            workers.push(thread::spawn(move || {
+                start.wait();
+                for _ in 0..2000 {
+                    // 64 bytes exceeds remaining 32-byte headroom and must never
+                    // transiently push usage above LIMIT.
+                    assert!(!try_charge(Class::IpcMessage, 41, 64));
+                    let leaf = usage(Class::IpcMessage, 41);
+                    let root = usage(Class::IpcMessage, 40);
+                    assert!(leaf <= LIMIT, "leaf usage {leaf} exceeded limit {LIMIT}");
+                    assert!(root <= LIMIT, "root usage {root} exceeded limit {LIMIT}");
+                }
+            }));
+        }
+        start.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(usage(Class::IpcMessage, 41), 96);
+        assert_eq!(usage(Class::IpcMessage, 40), 96);
+        uncharge(Class::IpcMessage, 41, 96);
+        assert_eq!(usage(Class::IpcMessage, 40), 0);
     }
 }

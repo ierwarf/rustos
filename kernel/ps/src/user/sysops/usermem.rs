@@ -95,6 +95,12 @@ pub fn copy_from_current_user_exact(
     user_ptr: u64,
     dest: &mut [u8],
 ) -> Result<(), paging::AddressSpaceError> {
+    if user_access::enabled()
+        && let Ok(start) = user_virt_addr(user_ptr, dest.len())
+        && user_access::copy_from_user(dest, start.as_u64())
+    {
+        return Ok(());
+    }
     let dest_len = dest.len();
     let mut run = || {
         let entry = usermem_profile::now();
@@ -258,6 +264,10 @@ pub struct UserAccess<'a, 'b> {
     /// A direct access faulted; the closure result is discarded and the whole
     /// closure re-runs under the validated bind.
     faulted: core::cell::Cell<bool>,
+    /// First unmapped `(user_ptr, len, is_write)` span observed on the
+    /// validated path so `with_retained_user_access` can populate lazy
+    /// anonymous pages outside `ProcessStateLock` and retry once.
+    unmapped: core::cell::Cell<Option<(u64, usize, bool)>>,
 }
 
 impl UserAccess<'_, '_> {
@@ -273,7 +283,13 @@ impl UserAccess<'_, '_> {
         let mut memo = self.memo.get();
         let proof = space.validate_user_read_memo(start, dest.len(), &mut memo);
         self.memo.set(memo);
-        proof?.copy_into(dest)
+        let result = proof.and_then(|p| p.copy_into(dest));
+        if matches!(result, Err(paging::AddressSpaceError::NotMapped))
+            && self.unmapped.get().is_none()
+        {
+            self.unmapped.set(Some((user_ptr, dest.len(), false)));
+        }
+        result
     }
 
     pub fn read_struct<T: Copy + Default>(&self, user_ptr: u64) -> Result<T, paging::AddressSpaceError> {
@@ -305,7 +321,13 @@ impl UserAccess<'_, '_> {
         let mut memo = self.memo.get();
         let proof = space.validate_user_write_memo(start, len, &mut memo);
         self.memo.set(memo);
-        proof.map(drop)
+        let result = proof.map(drop);
+        if matches!(result, Err(paging::AddressSpaceError::NotMapped))
+            && self.unmapped.get().is_none()
+        {
+            self.unmapped.set(Some((user_ptr, len, true)));
+        }
+        result
     }
 }
 
@@ -323,21 +345,42 @@ pub fn with_retained_user_access<R>(
             space: None,
             memo: core::cell::Cell::new(Default::default()),
             faulted: core::cell::Cell::new(false),
+            unmapped: core::cell::Cell::new(None),
         };
         let result = f(&direct);
         if !direct.faulted.get() {
             return Ok(result);
         }
     }
-    retained
+    let unmapped = core::cell::Cell::new(None);
+    let result = retained
         .try_with_user_copy_address_space(|address_space| {
-            f(&UserAccess {
+            let access = UserAccess {
                 space: Some(address_space),
                 memo: core::cell::Cell::new(Default::default()),
                 faulted: core::cell::Cell::new(false),
-            })
+                unmapped: core::cell::Cell::new(None),
+            };
+            let result = f(&access);
+            unmapped.set(access.unmapped.get());
+            result
         })
-        .ok_or(paging::AddressSpaceError::NotMapped)
+        .ok_or(paging::AddressSpaceError::NotMapped)?;
+    if let Some((user_ptr, len, is_write)) = unmapped.get()
+        && populate_anonymous_range(user_ptr, len, is_write)?
+    {
+        return retained
+            .try_with_user_copy_address_space(|address_space| {
+                f(&UserAccess {
+                    space: Some(address_space),
+                    memo: core::cell::Cell::new(Default::default()),
+                    faulted: core::cell::Cell::new(false),
+                    unmapped: core::cell::Cell::new(None),
+                })
+            })
+            .ok_or(paging::AddressSpaceError::NotMapped);
+    }
+    Ok(result)
 }
 
 pub fn read_current_user_struct<T: Copy + Default>(
@@ -360,6 +403,13 @@ pub fn write_current_user_bytes(
     user_ptr: u64,
     bytes: &[u8],
 ) -> Result<(), paging::AddressSpaceError> {
+    if user_access::enabled()
+        && !bytes.is_empty()
+        && let Ok(start) = user_virt_addr(user_ptr, bytes.len())
+        && user_access::copy_to_user(start.as_u64(), bytes)
+    {
+        return Ok(());
+    }
     let run = || {
         let entry = usermem_profile::now();
         with_current_write_address_space(|address_space| {
@@ -525,6 +575,16 @@ pub fn write_current_user_bytes_batch(
     if writes.iter().all(|(_, bytes)| bytes.is_empty()) {
         return Ok(());
     }
+    if user_access::enabled() {
+        let direct = writes.iter().copied().all(|(user_ptr, bytes)| {
+            bytes.is_empty()
+                || user_virt_addr(user_ptr, bytes.len())
+                    .is_ok_and(|start| user_access::copy_to_user(start.as_u64(), bytes))
+        });
+        if direct {
+            return Ok(());
+        }
+    }
     let attempt = || {
         // As in `validate_current_user_write_buffers`: one bind for the whole
         // batch is the contract, so it is asserted.
@@ -666,13 +726,35 @@ pub fn read_current_user_c_string_bounded(
     user_ptr: u64,
     max_len: usize,
 ) -> Result<Option<alloc::string::String>, paging::AddressSpaceError> {
+    let mut bytes = alloc::vec::Vec::new();
+    let mut chunk = [0_u8; USER_C_STRING_COPY_CHUNK];
+
+    if user_access::enabled() {
+        while bytes.len() < max_len {
+            let ptr = user_ptr
+                .checked_add(bytes.len() as u64)
+                .ok_or(paging::AddressSpaceError::AddressOverflow)?;
+            let page_remaining = USER_PAGE_SIZE - ((ptr as usize) & (USER_PAGE_SIZE - 1));
+            let chunk_len = (max_len - bytes.len()).min(chunk.len()).min(page_remaining);
+            let start = user_virt_addr(ptr, chunk_len)?;
+            if !user_access::copy_from_user(&mut chunk[..chunk_len], start.as_u64()) {
+                break;
+            }
+            if let Some(nul_index) = chunk[..chunk_len].iter().position(|byte| *byte == 0) {
+                bytes.extend_from_slice(&chunk[..nul_index]);
+                return Ok(Some(alloc::string::String::from_utf8_lossy(&bytes).into_owned()));
+            }
+            bytes.extend_from_slice(&chunk[..chunk_len]);
+        }
+        if bytes.len() >= max_len {
+            return Ok(None);
+        }
+    }
+
     let max_pages = max_len.div_ceil(USER_PAGE_SIZE).saturating_add(1);
     for _ in 0..max_pages {
         let mut fault_ptr = None;
         let result = with_current_address_space(|address_space| {
-            let mut bytes = alloc::vec::Vec::new();
-            let mut chunk = [0_u8; USER_C_STRING_COPY_CHUNK];
-
             while bytes.len() < max_len {
                 let ptr = user_ptr
                     .checked_add(bytes.len() as u64)

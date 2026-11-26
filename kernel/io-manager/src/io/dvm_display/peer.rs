@@ -22,6 +22,28 @@ impl Drop for ControlDrainGuard {
     }
 }
 
+static GPU_EPOCH_RESET_LOCK: AtomicBool = AtomicBool::new(false);
+
+struct GpuEpochResetGuard;
+
+impl GpuEpochResetGuard {
+    fn acquire() -> Self {
+        while GPU_EPOCH_RESET_LOCK
+            .compare_exchange_weak(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        Self
+    }
+}
+
+impl Drop for GpuEpochResetGuard {
+    fn drop(&mut self) {
+        GPU_EPOCH_RESET_LOCK.store(false, Ordering::Release);
+    }
+}
+
 /// Handle the DVM's one fixed return record. A guest cannot free a writing
 /// slot, invent a generation, or advance the sequence more than once without
 /// a host acknowledgement. Unsupported focus changes fail closed because the
@@ -30,6 +52,7 @@ pub(super) fn drain_dvm_control() {
     // ORDERING: AcqRel swap claims the offline pending bit exactly once; Release partner is the store in
     // gui_dvm_offline_interrupt. The IRQ leaf carries no data: the DVM's own shared-memory writes are read via volatile accesses.
     if GUI_DVM_OFFLINE_IRQ_PENDING.swap(false, Ordering::AcqRel) {
+        let _reset_guard = GpuEpochResetGuard::acquire();
         GPU_LIFECYCLE.request_drain();
         // ORDERING: drain closes new claims before Release publishes pending
         // reset and peer-unready state.
@@ -51,7 +74,7 @@ pub(super) fn drain_dvm_control() {
             DVM_GPU_ATLAS_PRIME_COMPLETION_OFFSET,
             &[0; DVM_GPU_PRIME_COMPLETION_BYTES],
         );
-        if !service_gpu_epoch_reset() {
+        if !service_gpu_epoch_reset_locked() {
             return;
         }
     }
@@ -173,53 +196,79 @@ pub(super) fn revoke_transport(reason: &str, sequence: u64) {
 }
 
 pub(super) fn service_gpu_epoch_reset() -> bool {
-    // ORDERING: Acquire observes the complete drain request before trying the
-    // zero-claim transition and resetting slot storage.
-    if !GPU_EPOCH_RESET_PENDING.load(Ordering::Acquire) {
+    // ORDERING: Acquire fast-path skips taking the reset guard when no reset
+    // is pending and no reset is actively draining/reactivating.
+    if !GPU_EPOCH_RESET_PENDING.load(Ordering::Acquire)
+        && !GPU_EPOCH_RESET_LOCK.load(Ordering::Acquire)
+    {
         return true;
     }
-    let Some(retired_epoch) = GPU_LIFECYCLE.finish_drain() else {
-        return false;
-    };
-    reset_gpu_slots();
-    let Some(next_epoch) = retired_epoch
-        .checked_add(1)
-        .and_then(|epoch| u32::try_from(epoch).ok())
-        .filter(|epoch| *epoch != 0)
-    else {
-        // ORDERING: epoch exhaustion publishes permanent revoke before clearing
-        // the one-shot reset work item.
-        TRANSPORT_REVOKED.store(true, Ordering::Release);
-        GPU_EPOCH_RESET_PENDING.store(false, Ordering::Release);
-        return false;
-    };
-    // ORDERING: Release publishes the new epoch before shared invitation and
-    // reset-complete publication can make the replacement usable.
-    GPU_CONTEXT_EPOCH.store(next_epoch, Ordering::Release);
-    write_u32(DVM_GPU_ATLAS_CONTEXT_EPOCH_OFFSET, next_epoch);
-    GPU_EPOCH_RESET_PENDING.store(false, Ordering::Release);
-    // ORDERING: Acquire prevents reactivation after a concurrent permanent
-    // revoke publication.
-    if TRANSPORT_REVOKED.load(Ordering::Acquire) {
+    let _reset_guard = GpuEpochResetGuard::acquire();
+    service_gpu_epoch_reset_locked()
+}
+
+fn service_gpu_epoch_reset_locked() -> bool {
+    loop {
+        // ORDERING: AcqRel swap claims the pending reset before finishing drain
+        // and checking/rearming; a concurrent offline IRQ setting true after
+        // this point is observed on the recheck below without being overwritten.
+        if !GPU_EPOCH_RESET_PENDING.swap(false, Ordering::AcqRel) {
+            return true;
+        }
+        let Some(retired_epoch) = GPU_LIFECYCLE.finish_drain() else {
+            // ORDERING: claims are still in flight (or lifecycle not yet Draining);
+            // restore the pending bit so a later turn retries once quiescent.
+            GPU_EPOCH_RESET_PENDING.store(true, Ordering::Release);
+            return false;
+        };
+        reset_gpu_slots();
+        let Some(next_epoch) = retired_epoch
+            .checked_add(1)
+            .and_then(|epoch| u32::try_from(epoch).ok())
+            .filter(|epoch| *epoch != 0)
+        else {
+            // ORDERING: epoch exhaustion publishes permanent revoke; the pending
+            // reset bit was already claimed above.
+            TRANSPORT_REVOKED.store(true, Ordering::Release);
+            return false;
+        };
+        // ORDERING: Release publishes the new epoch before shared invitation and
+        // reset-complete publication can make the replacement usable.
+        GPU_CONTEXT_EPOCH.store(next_epoch, Ordering::Release);
+        write_u32(DVM_GPU_ATLAS_CONTEXT_EPOCH_OFFSET, next_epoch);
+        // ORDERING: Acquire prevents reactivation after a concurrent permanent
+        // revoke publication.
+        if TRANSPORT_REVOKED.load(Ordering::Acquire) {
+            return true;
+        }
+        assert!(
+            GPU_LIFECYCLE.activate(u64::from(next_epoch)),
+            "gui-dvm lifecycle failed to activate replacement epoch"
+        );
+        if TRANSPORT_REVOKED.load(Ordering::Acquire) {
+            GPU_LIFECYCLE.request_drain();
+            let _ = GPU_LIFECYCLE.finish_drain();
+            let _ = GPU_EPOCH_RESET_PENDING.swap(false, Ordering::AcqRel);
+            return true;
+        }
+        if GPU_EPOCH_RESET_PENDING.load(Ordering::Acquire) {
+            GPU_LIFECYCLE.request_drain();
+            continue;
+        }
+        nucleus_core::debug::write_debugcon_only_line(
+            alloc::format!(
+                "gui-dvm: peer offline lease revoked context_epoch={}",
+                next_epoch
+            )
+            .as_bytes(),
+        );
+        // ORDERING: Release clears prior epoch rebind logging before re-inviting
+        // the newest ready slot into the replacement context epoch.
+        GUI_DVM_LOGGED_INVITATION.store(0, Ordering::Release);
+        // Recovery must not depend on unrelated cursor or client damage.
+        reinvite_newest_ready_slot();
         return true;
     }
-    assert!(
-        GPU_LIFECYCLE.activate(u64::from(next_epoch)),
-        "gui-dvm lifecycle failed to activate replacement epoch"
-    );
-    nucleus_core::debug::write_debugcon_only_line(
-        alloc::format!(
-            "gui-dvm: peer offline lease revoked context_epoch={}",
-            next_epoch
-        )
-        .as_bytes(),
-    );
-    // ORDERING: Release clears prior epoch rebind logging before re-inviting
-    // the newest ready slot into the replacement context epoch.
-    GUI_DVM_LOGGED_INVITATION.store(0, Ordering::Release);
-    // Recovery must not depend on unrelated cursor or client damage.
-    reinvite_newest_ready_slot();
-    true
 }
 
 pub(super) fn reset_gpu_slots() {

@@ -26,12 +26,12 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 
 use kernel_ps::api::{
-    LocalWake, PassedHandle, SocketCredentials, UnixAddress, UnixNamespaceKey, UnixSocketError,
-    UnixSocketHandle, UnixSocketType, UNIX_MAX_PATH_LEN, UNIX_MAX_SCM_RIGHTS,
+    LocalWake, PassedHandle, SocketCredentials, UNIX_MAX_PATH_LEN, UNIX_MAX_SCM_RIGHTS,
+    UnixAddress, UnixNamespaceKey, UnixSocketError, UnixSocketHandle, UnixSocketType,
 };
 use rustos_user_abi::syscall::{
-    VFS_IPC_OP_ACCESS, VFS_IPC_OP_MKNOD, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_UNLINKAT, VFS_MKNOD_S_IFMT,
-    VFS_MKNOD_S_IFSOCK,
+    VFS_IPC_OP_ACCESS, VFS_IPC_OP_MKNOD, VFS_IPC_OP_NEWFSTATAT, VFS_IPC_OP_UNLINKAT,
+    VFS_MKNOD_S_IFMT, VFS_MKNOD_S_IFSOCK,
 };
 
 use super::super::broker_ops::waitset_broker_ops::wake_local_fd_object;
@@ -63,7 +63,7 @@ const SO_SNDTIMEO: u64 = 21;
 const MSG_WAITALL: u64 = 0x100;
 const SOCK_TYPE_MASK: u64 = 0xf;
 const SOCK_ACCEPTED_FLAGS: u64 = linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC;
-const MAX_UNIX_IO_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_UNIX_IO_BYTES: usize = 1024 * 1024;
 const MAX_CONTROL_BYTES: usize = 64 * 1024;
 
 struct PinnedUnixSocket(UnixSocketHandle);
@@ -142,7 +142,10 @@ fn deadline_tick_from_us(timeout_us: Option<u64>) -> Option<u64> {
         return None;
     }
     let ticks_per_sec = crate::arch::rtc::ticks_per_second().max(1) as u128;
-    let ticks = ((us as u128).saturating_mul(ticks_per_sec).saturating_add(999_999)) / 1_000_000;
+    let ticks = ((us as u128)
+        .saturating_mul(ticks_per_sec)
+        .saturating_add(999_999))
+        / 1_000_000;
     let delta = u64::try_from(ticks).unwrap_or(u64::MAX).max(1);
     Some(crate::arch::rtc::ticks().saturating_add(delta))
 }
@@ -176,7 +179,10 @@ fn read_user_unix_addr(addr_ptr: u64, addrlen: u64) -> Result<ParsedUnixAddr, i6
     if sun_path[0] == 0 {
         return Ok(ParsedUnixAddr::Abstract(sun_path[1..].to_vec()));
     }
-    let nul_pos = sun_path.iter().position(|&b| b == 0).unwrap_or(sun_path.len());
+    let nul_pos = sun_path
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(sun_path.len());
     if nul_pos == 0 {
         return Err(LINUX_EINVAL);
     }
@@ -191,21 +197,24 @@ fn read_user_unix_addr(addr_ptr: u64, addrlen: u64) -> Result<ParsedUnixAddr, i6
     ))
 }
 
-fn encode_unix_addr(addr: &UnixAddress) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(linux_abi::AF_UNIX as u16).to_ne_bytes());
-    match addr {
-        UnixAddress::Unnamed => {}
+fn encode_unix_addr<'a>(addr: &UnixAddress, out: &'a mut [u8; 2 + UNIX_MAX_PATH_LEN]) -> &'a [u8] {
+    out[..2].copy_from_slice(&(linux_abi::AF_UNIX as u16).to_ne_bytes());
+    let len = match addr {
+        UnixAddress::Unnamed => 2,
         UnixAddress::Abstract(name) => {
-            out.push(0);
-            out.extend_from_slice(name);
+            let name_len = name.len().min(UNIX_MAX_PATH_LEN - 1);
+            out[2] = 0;
+            out[3..3 + name_len].copy_from_slice(&name[..name_len]);
+            3 + name_len
         }
         UnixAddress::Pathname(path) => {
-            out.extend_from_slice(path);
-            out.push(0);
+            let path_len = path.len().min(UNIX_MAX_PATH_LEN - 1);
+            out[2..2 + path_len].copy_from_slice(&path[..path_len]);
+            out[2 + path_len] = 0;
+            3 + path_len
         }
-    }
-    out
+    };
+    &out[..len]
 }
 
 fn vfs_stat_socket_inode(path: &str, follow_symlinks: bool) -> Result<(u64, u64), i64> {
@@ -221,10 +230,21 @@ fn vfs_stat_socket_inode(path: &str, follow_symlinks: bool) -> Result<(u64, u64)
     if response.payload_len as usize != LINUX_STAT_SIZE {
         return Err(LINUX_EINVAL);
     }
-    let st_dev = u64::from_ne_bytes(response.payload[0..8].try_into().map_err(|_| LINUX_EINVAL)?);
-    let st_ino = u64::from_ne_bytes(response.payload[8..16].try_into().map_err(|_| LINUX_EINVAL)?);
-    let st_mode =
-        u32::from_ne_bytes(response.payload[24..28].try_into().map_err(|_| LINUX_EINVAL)?);
+    let st_dev = u64::from_ne_bytes(
+        response.payload[0..8]
+            .try_into()
+            .map_err(|_| LINUX_EINVAL)?,
+    );
+    let st_ino = u64::from_ne_bytes(
+        response.payload[8..16]
+            .try_into()
+            .map_err(|_| LINUX_EINVAL)?,
+    );
+    let st_mode = u32::from_ne_bytes(
+        response.payload[24..28]
+            .try_into()
+            .map_err(|_| LINUX_EINVAL)?,
+    );
     if u64::from(st_mode) & VFS_MKNOD_S_IFMT != VFS_MKNOD_S_IFSOCK {
         return Err(LINUX_ECONNREFUSED);
     }
@@ -276,15 +296,17 @@ fn vfs_unlink_socket_node(path: &str) {
     }
 }
 
+fn resolve_pathname_key(path: &str) -> Result<UnixNamespaceKey, i64> {
+    let (mount_id, node_id) = vfs_stat_socket_inode(path, true)?;
+    vfs_check_socket_write_access(path)?;
+    Ok(UnixNamespaceKey::Inode { mount_id, node_id })
+}
+
 fn resolve_target_key(addr_ptr: u64, addrlen: u64) -> Result<UnixNamespaceKey, i64> {
     match read_user_unix_addr(addr_ptr, addrlen)? {
         ParsedUnixAddr::Unspec => Err(LINUX_EINVAL),
         ParsedUnixAddr::Abstract(name) => Ok(UnixNamespaceKey::Abstract(name)),
-        ParsedUnixAddr::Pathname(path, _) => {
-            let (mount_id, node_id) = vfs_stat_socket_inode(&path, true)?;
-            vfs_check_socket_write_access(&path)?;
-            Ok(UnixNamespaceKey::Inode { mount_id, node_id })
-        }
+        ParsedUnixAddr::Pathname(path, _) => resolve_pathname_key(&path),
     }
 }
 
@@ -346,7 +368,7 @@ pub(in crate::user::syscall::linux) fn syscall_linux_unix_socket(
             current_credentials(),
             multitask::current_user_job_charge_group(),
         )
-            .map_err(unix_error_errno)?;
+        .map_err(unix_error_errno)?;
         install_single_unix_socket(sock, cloexec)
     })())
 }
@@ -360,14 +382,13 @@ pub(in crate::user::syscall::linux) fn syscall_linux_unix_socketpair(
         let (sock_type, nonblocking, cloexec) =
             parse_socket_type_and_flags(type_and_flags, protocol)?;
         validate_user_write(sv_ptr, 2 * size_of::<i32>())?;
-        let (first, second) =
-            UnixSocketHandle::new_pair(
+        let (first, second) = UnixSocketHandle::new_pair(
             sock_type,
             nonblocking,
             current_credentials(),
             multitask::current_user_job_charge_group(),
         )
-                .map_err(unix_error_errno)?;
+        .map_err(unix_error_errno)?;
         let fd_flags = if cloexec { multitask::FD_CLOEXEC } else { 0 };
         let e0 = multitask::HandleEntry::new(
             multitask::KernelHandle::UnixSocket(first.clone()),
@@ -424,8 +445,8 @@ pub(in crate::user::syscall::linux) fn try_bind(
     addrlen: u64,
 ) -> Option<u64> {
     let sock = pin_unix_socket(fd)?;
-    Some(linux_unit_result((|| {
-        match read_user_unix_addr(addr_ptr, addrlen)? {
+    Some(linux_unit_result(
+        (|| match read_user_unix_addr(addr_ptr, addrlen)? {
             ParsedUnixAddr::Unspec => Err(LINUX_EINVAL),
             ParsedUnixAddr::Abstract(name) => {
                 let addr = UnixAddress::Abstract(name.clone());
@@ -443,8 +464,8 @@ pub(in crate::user::syscall::linux) fn try_bind(
                     Ok(())
                 }
             }
-        }
-    })()))
+        })(),
+    ))
 }
 
 pub(in crate::user::syscall::linux) fn try_listen(fd: u64, backlog: u64) -> Option<u64> {
@@ -486,11 +507,12 @@ pub(in crate::user::syscall::linux) fn try_accept4(
                 Ok((accepted, peer_addr, wake)) => {
                     publish_wake(Some(wake));
                     if addr_ptr != 0 {
-                        let encoded = encode_unix_addr(&peer_addr);
+                        let mut storage = [0; 2 + UNIX_MAX_PATH_LEN];
+                        let encoded = encode_unix_addr(&peer_addr, &mut storage);
                         if let Err(errno) = write_sockaddr_payload_with_mode(
                             addr_ptr,
                             addrlen_ptr,
-                            &encoded,
+                            encoded,
                             UserCopyMode::Pointer,
                         ) {
                             release_service_handle_refs_bounded(&[ServiceHandleRef::UnixSocket(
@@ -527,10 +549,7 @@ pub(in crate::user::syscall::linux) fn try_connect(
                 return sock.0.disconnect_dgram().map_err(unix_error_errno);
             }
             ParsedUnixAddr::Abstract(name) => UnixNamespaceKey::Abstract(name),
-            ParsedUnixAddr::Pathname(path, _) => {
-                let (mount_id, node_id) = vfs_stat_socket_inode(&path, true)?;
-                UnixNamespaceKey::Inode { mount_id, node_id }
-            }
+            ParsedUnixAddr::Pathname(path, _) => resolve_pathname_key(&path)?,
         };
         // Linux: a full listener backlog blocks a blocking connector until
         // the listener accepts, a signal, SO_SNDTIMEO (EAGAIN) or listener
@@ -564,8 +583,9 @@ pub(in crate::user::syscall::linux) fn try_getsockname(
         if addr_ptr == 0 || addrlen_ptr == 0 {
             return Err(LINUX_EFAULT);
         }
-        let encoded = encode_unix_addr(&sock.0.sock_name());
-        write_sockaddr_payload_with_mode(addr_ptr, addrlen_ptr, &encoded, UserCopyMode::Pointer)
+        let mut storage = [0; 2 + UNIX_MAX_PATH_LEN];
+        let encoded = encode_unix_addr(&sock.0.sock_name(), &mut storage);
+        write_sockaddr_payload_with_mode(addr_ptr, addrlen_ptr, encoded, UserCopyMode::Pointer)
     })()))
 }
 
@@ -580,8 +600,9 @@ pub(in crate::user::syscall::linux) fn try_getpeername(
             return Err(LINUX_EFAULT);
         }
         let peer_addr = sock.0.peer_name().map_err(unix_error_errno)?;
-        let encoded = encode_unix_addr(&peer_addr);
-        write_sockaddr_payload_with_mode(addr_ptr, addrlen_ptr, &encoded, UserCopyMode::Pointer)
+        let mut storage = [0; 2 + UNIX_MAX_PATH_LEN];
+        let encoded = encode_unix_addr(&peer_addr, &mut storage);
+        write_sockaddr_payload_with_mode(addr_ptr, addrlen_ptr, encoded, UserCopyMode::Pointer)
     })()))
 }
 
@@ -928,7 +949,10 @@ fn parse_send_control(
             return Err(LINUX_EINVAL);
         }
         let step = cmsg_align(cmsg_len);
-        if offset.checked_add(step).is_some_and(|next| next <= buf.len()) {
+        if offset
+            .checked_add(step)
+            .is_some_and(|next| next <= buf.len())
+        {
             offset += step;
         } else {
             offset = end;
@@ -954,7 +978,11 @@ fn write_recv_control(
         release_passed_handles(rights);
         return Ok((
             0,
-            if truncated { linux_abi::MSG_CTRUNC as u32 } else { 0 },
+            if truncated {
+                linux_abi::MSG_CTRUNC as u32
+            } else {
+                0
+            },
             Vec::new(),
         ));
     }
@@ -1084,7 +1112,8 @@ fn send_core_bytes(
             }
             Err((UnixSocketError::PeerWouldBlock { token, generation }, returned_rights)) => {
                 rights.0 = returned_rights;
-                if let Err(errno) = wait_local_wouldblock(token, generation, nonblocking, deadline) {
+                if let Err(errno) = wait_local_wouldblock(token, generation, nonblocking, deadline)
+                {
                     if sent > 0 {
                         return Ok(sent);
                     }
@@ -1235,15 +1264,16 @@ pub(in crate::user::syscall::linux) fn try_recvfrom(
             write_user_bytes(buf_ptr, &msg.data)?;
         }
         if src_addr != 0 {
+            let mut storage = [0; 2 + UNIX_MAX_PATH_LEN];
             let encoded = if msg.sender_addr == UnixAddress::Unnamed {
-                Vec::new()
+                &[][..]
             } else {
-                encode_unix_addr(&msg.sender_addr)
+                encode_unix_addr(&msg.sender_addr, &mut storage)
             };
             write_sockaddr_payload_with_mode(
                 src_addr,
                 addrlen_ptr,
-                &encoded,
+                encoded,
                 UserCopyMode::Pointer,
             )?;
         }
@@ -1276,7 +1306,10 @@ pub(in crate::user::syscall::linux) fn try_sendmsg(
         let (rights, creds) = parse_send_control(hdr.msg_control, control_len, caller_creds)?;
         let mut rights = PassedHandlesGuard(rights);
         let target_key = if hdr.msg_name != 0 && hdr.msg_namelen != 0 {
-            Some(resolve_target_key(hdr.msg_name, u64::from(hdr.msg_namelen))?)
+            Some(resolve_target_key(
+                hdr.msg_name,
+                u64::from(hdr.msg_namelen),
+            )?)
         } else {
             None
         };
@@ -1316,12 +1349,13 @@ pub(in crate::user::syscall::linux) fn try_recvmsg(
             out_flags |= linux_abi::MSG_TRUNC as u32;
         }
 
+        let mut storage = [0; 2 + UNIX_MAX_PATH_LEN];
         let encoded = if msg.sender_addr == UnixAddress::Unnamed {
-            Vec::new()
+            &[][..]
         } else {
-            encode_unix_addr(&msg.sender_addr)
+            encode_unix_addr(&msg.sender_addr, &mut storage)
         };
-        write_msghdr_name(&mut hdr, &encoded, UserCopyMode::Pointer)?;
+        write_msghdr_name(&mut hdr, encoded, UserCopyMode::Pointer)?;
 
         let cloexec = flags & linux_abi::MSG_CMSG_CLOEXEC != 0;
         let (ctrl_written, ctrl_flags, installed_fds) = write_recv_control(
@@ -1356,7 +1390,10 @@ mod tests {
     fn nonblocking_connect_to_full_backlog_is_eagain() {
         // The listener-full condition reaches the syscall layer as
         // `PeerWouldBlock`, which maps to EAGAIN for O_NONBLOCK (no sleep).
-        let full = UnixSocketError::PeerWouldBlock { token: 1, generation: 1 };
+        let full = UnixSocketError::PeerWouldBlock {
+            token: 1,
+            generation: 1,
+        };
         assert_eq!(unix_error_errno(full), LINUX_EAGAIN);
         assert_eq!(wait_local_wouldblock(1, 1, true, None), Err(LINUX_EAGAIN));
     }
@@ -1434,7 +1471,10 @@ mod tests {
     fn validate_sockopt_len_rejects_negative_and_short() {
         assert_eq!(validate_sockopt_len(4, 4), Ok(()));
         assert_eq!(validate_sockopt_len(3, 4), Err(LINUX_EINVAL));
-        assert_eq!(validate_sockopt_len((-1_i32) as u32 as u64, 4), Err(LINUX_EINVAL));
+        assert_eq!(
+            validate_sockopt_len((-1_i32) as u32 as u64, 4),
+            Err(LINUX_EINVAL)
+        );
         assert_eq!(validate_sockopt_len(0x1_0000_0010, 4), Err(LINUX_EINVAL));
     }
 }

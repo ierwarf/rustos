@@ -102,6 +102,28 @@ fn deadline_tick_from_nanos(nanos: u128) -> u64 {
     )
 }
 
+pub(super) fn monotonic_deadline_tick_from_ns(deadline_ns: u64) -> u64 {
+    let now_ns = crate::arch::rtc::monotonic_nanos();
+    let remaining_ns = deadline_ns.saturating_sub(now_ns);
+    deadline_tick_from_nanos(u128::from(remaining_ns))
+}
+
+fn effective_sleep_deadline_tick(
+    caller_deadline: Option<u64>,
+    observations: &[super::super::broker_ops::waitset_broker_ops::ProviderObservation],
+) -> Option<u64> {
+    let mut effective = caller_deadline;
+    for obs in observations {
+        if obs.provider == WAITSET_PROVIDER_KERNEL
+            && let Some(timer_ns) = kernel_ps::api::local_fd_deadline_ns_of(obs.object_id)
+        {
+            let timer_tick = monotonic_deadline_tick_from_ns(timer_ns);
+            effective = Some(effective.map_or(timer_tick, |tick| tick.min(timer_tick)));
+        }
+    }
+    effective
+}
+
 fn wait_until_poll_ready(
     immediate: bool,
     deadline_tick: Option<u64>,
@@ -205,7 +227,7 @@ fn wait_until_poll_ready(
             }
             continue;
         }
-        if let Some(deadline) = deadline_tick
+        if let Some(deadline) = effective_sleep_deadline_tick(deadline_tick, &second.observations)
             && !crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline)
         {
             super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
@@ -539,6 +561,7 @@ fn route_one_poll_fd(
         }
         multitask::KernelHandle::Pipe(_)
         | multitask::KernelHandle::EventFd(_)
+        | multitask::KernelHandle::TimerFd(_)
         | multitask::KernelHandle::UnixSocket(_) => {
             // Kernel-local object: readiness is read directly, with no
             // provider round trip, and its generation arms the waiter.
@@ -1640,7 +1663,7 @@ pub fn syscall_linux_epoll_wait(
                 }
                 continue;
             }
-            if let Some(deadline) = deadline_tick
+            if let Some(deadline) = effective_sleep_deadline_tick(deadline_tick, &armed_observations)
                 && !crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline)
             {
                 super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
@@ -1719,6 +1742,7 @@ fn epoll_interest_target(fd: u64) -> Result<EpollInterestTarget, i64> {
         }
         multitask::KernelHandle::Pipe(_)
         | multitask::KernelHandle::EventFd(_)
+        | multitask::KernelHandle::TimerFd(_)
         | multitask::KernelHandle::UnixSocket(_) => (
             WAITSET_PROVIDER_KERNEL,
             super::local_fd::waitset_object(&handle).ok_or(LINUX_EBADF)?,
@@ -1844,23 +1868,8 @@ fn collect_epoll_readiness(
                 epoll_error_to_linux_errno(err)
             }
         })?;
-    let mut interests = Vec::with_capacity(entries.len());
-    for (record, report) in entries {
-        // A provider restart advances its endpoint epoch. Report the interest
-        // as ERR|HUP, keyed by the new epoch so an edge-triggered consumer
-        // sees the revoke once rather than on every scan.
-        let (revoked, epoch_generation) = match waitset_provider_epoch(record.key.provider) {
-            Ok(current_epoch) => (
-                current_epoch != record.provider_epoch,
-                current_epoch.max(1),
-            ),
-            Err(errno) if provider_revoke_events(errno).is_some() => (true, 1),
-            Err(errno) => return Err(errno),
-        };
-        interests.push((record, report, revoked, epoch_generation));
-    }
 
-    let mut observations = Vec::with_capacity(interests.len().saturating_add(1));
+    let mut observations = Vec::with_capacity(entries.len().saturating_add(1));
     observations.push(
         super::super::broker_ops::waitset_broker_ops::ProviderObservation {
             provider: WAITSET_PROVIDER_KERNEL,
@@ -1869,22 +1878,31 @@ fn collect_epoll_readiness(
         },
     );
     let revoke_events = linux_abi::EPOLLERR | linux_abi::EPOLLHUP;
-    let mut scans = Vec::with_capacity(interests.len());
+    let mut scans = Vec::with_capacity(entries.len());
     let mut netd_slots = Vec::new();
     let mut netd_queries = Vec::new();
     let mut vfs_keyed_slots = Vec::new();
     let mut vfs_keyed_queries = Vec::new();
-    for (index, (record, report, revoked, epoch_generation)) in interests.iter().enumerate() {
+    for (index, (record, report)) in entries.iter().enumerate() {
         if report.disabled {
             // A reported one-shot stays silent until EPOLL_CTL_MOD re-arms it,
             // and that mutation advances the epoll object's own generation.
             scans.push(InterestScan::Skip);
             continue;
         }
-        if *revoked {
+        // A provider restart advances its endpoint epoch. Report the interest
+        // as ERR|HUP, keyed by the new epoch so an edge-triggered consumer
+        // sees the revoke once rather than on every scan.
+        let revoked = match waitset_provider_epoch(record.key.provider) {
+            Ok(current_epoch) if current_epoch != record.provider_epoch => Some(current_epoch.max(1)),
+            Ok(_) => None,
+            Err(errno) if provider_revoke_events(errno).is_some() => Some(1),
+            Err(errno) => return Err(errno),
+        };
+        if let Some(epoch_generation) = revoked {
             scans.push(InterestScan::Ready {
                 revents: revoke_events,
-                generation: *epoch_generation,
+                generation: epoch_generation,
             });
             continue;
         }
@@ -2082,7 +2100,7 @@ fn collect_epoll_readiness(
 
     let mut provider_timed_out = false;
     let mut candidates = Vec::new();
-    for ((record, report, _, _), scan) in interests.iter().zip(scans) {
+    for ((record, report), scan) in entries.iter().zip(scans) {
         let (revents, generation) = match scan {
             InterestScan::Skip | InterestScan::Netd => continue,
             InterestScan::TimedOut => {
@@ -2134,46 +2152,26 @@ fn select_epoll_events(
     maxevents: usize,
     mode: EpollScanMode,
 ) -> Result<Vec<(u32, u64)>, i64> {
-    let mut ready = Vec::new();
-    let mut cursor = 0;
-    while ready.len() < maxevents && cursor < candidates.len() {
-        let take = (maxevents - ready.len()).min(candidates.len() - cursor);
-        let round = &candidates[cursor..cursor + take];
-        cursor += take;
-        let claims = if mode == EpollScanMode::Consume {
-            claim_epoll_reports(epoll_token, round)?
-        } else {
-            alloc::vec![true; round.iter().filter(|candidate| candidate.gated).count()]
-        };
-        let mut claimed = claims.into_iter();
-        for candidate in round {
-            if candidate.gated && !claimed.next().unwrap_or(false) {
+    let mut ready = Vec::with_capacity(candidates.len().min(maxevents));
+    for candidate in candidates {
+        if ready.len() >= maxevents {
+            break;
+        }
+        if candidate.gated && mode == EpollScanMode::Consume {
+            let key = multitask::EpollInterestKey {
+                target_fd: candidate.claim.target_fd,
+                provider: candidate.claim.provider,
+                object_id: candidate.claim.object_id,
+            };
+            let won = multitask::epoll_claim(epoll_token, key, candidate.claim.generation)
+                .map_err(epoll_error_to_linux_errno)?;
+            if !won {
                 continue;
             }
-            ready.push((candidate.events, candidate.data));
         }
+        ready.push((candidate.events, candidate.data));
     }
     Ok(ready)
-}
-
-/// Atomically claims edge-triggered and one-shot candidates in the kernel epoll
-/// registry. The answer is one flag per gated candidate, in order.
-fn claim_epoll_reports(
-    epoll_token: u64,
-    candidates: &[EpollCandidate],
-) -> Result<Vec<bool>, i64> {
-    let mut owned = Vec::new();
-    for candidate in candidates.iter().filter(|candidate| candidate.gated) {
-        let key = multitask::EpollInterestKey {
-            target_fd: candidate.claim.target_fd,
-            provider: candidate.claim.provider,
-            object_id: candidate.claim.object_id,
-        };
-        let won = multitask::epoll_claim(epoll_token, key, candidate.claim.generation)
-            .map_err(epoll_error_to_linux_errno)?;
-        owned.push(won);
-    }
-    Ok(owned)
 }
 
 fn write_epoll_ready_events(events_ptr: u64, ready: &[(u32, u64)]) -> LinuxResult<u64> {

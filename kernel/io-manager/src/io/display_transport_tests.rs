@@ -125,16 +125,33 @@ fn installation_invites_the_gpu_peer_before_publication_without_a_cpu_frame() {
     // The exclusive install transaction must advertise before consumers can
     // publish a competing invitation. Exercise its actual MMIO helper below.
     let installation = include_str!("dvm_display/installation.rs");
-    let invite = installation.find("    signal_gui_dvm(2);").expect("initial prime invitation");
-    let publish = installation.find("    INSTALLED.store(true,").expect("transport publication");
-    assert!(invite < publish, "initial invitation must precede consumer admission");
+    let invite = installation
+        .find("    signal_gui_dvm(2);")
+        .expect("initial prime invitation");
+    let publish = installation
+        .find("    INSTALLED.store(true,")
+        .expect("transport publication");
+    assert!(
+        invite < publish,
+        "initial invitation must precede consumer admission"
+    );
     signal_gui_dvm(2);
-    assert!(gpu_atlas_info().is_none(), "invitation alone is not readiness");
+    assert!(
+        gpu_atlas_info().is_none(),
+        "invitation alone is not readiness"
+    );
     assert_eq!(read_u64(DVM_GUI_SURFACE_POOL_INVITATION_OFFSET), 2);
     assert_eq!(GUI_DVM_EXPECTED_INVITATION.load(Ordering::Acquire), 2);
-    assert_eq!(doorbell[IVSHMEM_DOORBELL_OFFSET / 4], (GUI_DVM_PEER_ID << 16) as u32);
+    assert_eq!(
+        doorbell[IVSHMEM_DOORBELL_OFFSET / 4],
+        (GUI_DVM_PEER_ID << 16) as u32
+    );
     assert_eq!(PUBLISHED_GENERATION.load(Ordering::Acquire), 0);
-    assert!(SLOT_STATE.iter().all(|state| state.load(Ordering::Acquire) == GUI_SLOT_FREE));
+    assert!(
+        SLOT_STATE
+            .iter()
+            .all(|state| state.load(Ordering::Acquire) == GUI_SLOT_FREE)
+    );
     assert_eq!(read_u64(DVM_GUI_SURFACE_POOL_READY_CONFIRMATION_OFFSET), 0);
 
     // A later exact invitation is not rewritten by repeated discovery.
@@ -156,7 +173,9 @@ fn installation_invites_the_gpu_peer_before_publication_without_a_cpu_frame() {
 
 #[test]
 fn missing_gui_dvm_is_unavailable_not_a_fallback_provider() {
-    let _serial = TRANSPORT_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _serial = TRANSPORT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     assert_eq!(
         try_publish_full(core::ptr::null(), 1, 1, 4),
         DvmPresentOutcome::Unavailable
@@ -167,7 +186,9 @@ fn missing_gui_dvm_is_unavailable_not_a_fallback_provider() {
 fn offline_epoch_reset_clears_logged_invitation_when_reinviting_same_generation() {
     use super::*;
 
-    let _serial = TRANSPORT_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let _serial = TRANSPORT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let mut header = alloc::vec![0_u8; 4096];
     let mut doorbell = alloc::vec![0_u32; 4];
     struct Restore;
@@ -210,4 +231,80 @@ fn offline_epoch_reset_clears_logged_invitation_when_reinviting_same_generation(
     assert_eq!(GPU_CONTEXT_EPOCH.load(Ordering::Acquire), 2);
     assert_eq!(GUI_DVM_EXPECTED_INVITATION.load(Ordering::Acquire), 2);
     assert_eq!(GUI_DVM_LOGGED_INVITATION.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn app_buffer_mailbox_clears_pending_on_revoke_and_epoch_change() {
+    use super::*;
+    use kernel_ps::api::handles::{BufferOwner, BufferRights, app_buffer_pool};
+
+    let _serial = TRANSPORT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut header = alloc::vec![0_u8; 4096];
+    let mut doorbell = alloc::vec![0_u32; 4];
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            app_buffer::clear_pending_for_test();
+            INSTALLED.store(false, Ordering::Release);
+            TRANSPORT_REVOKED.store(false, Ordering::Release);
+            SHARED_HEADER_ADDR.store(0, Ordering::Release);
+            SHARED_DOORBELL_ADDR.store(0, Ordering::Release);
+            GUI_DVM_PEER_READY.store(false, Ordering::Release);
+            GPU_EPOCH_RESET_PENDING.store(false, Ordering::Release);
+            GPU_CONTEXT_EPOCH.store(GPU_INITIAL_CONTEXT_EPOCH, Ordering::Release);
+            let _ = GPU_LIFECYCLE.finish_drain();
+            let _ = GPU_LIFECYCLE.activate(u64::from(GPU_INITIAL_CONTEXT_EPOCH));
+        }
+    }
+    let _restore = Restore;
+    SHARED_HEADER_ADDR.store(header.as_mut_ptr() as usize, Ordering::Release);
+    SHARED_DOORBELL_ADDR.store(doorbell.as_mut_ptr() as usize, Ordering::Release);
+    INSTALLED.store(true, Ordering::Release);
+    TRANSPORT_REVOKED.store(false, Ordering::Release);
+    GUI_DVM_PEER_READY.store(true, Ordering::Release);
+    GPU_CONTEXT_EPOCH.store(1, Ordering::Release);
+
+    let owner = BufferOwner {
+        service_id: 901,
+        generation: 1,
+    };
+    let cap = app_buffer_pool()
+        .allocate(owner, 4096, BufferRights::ALL)
+        .expect("allocate test app buffer");
+
+    // Epoch change clears pending and returns Stale rather than wedging Busy.
+    let seq1 = app_buffer::insert_pending_for_test(1, 1, &cap);
+    GPU_CONTEXT_EPOCH.store(2, Ordering::Release);
+    assert!(matches!(
+        take_app_buffer(seq1),
+        Err(AppBufferTransportError::Stale)
+    ));
+    assert!(!app_buffer::has_pending_for_test());
+
+    // Transport revocation clears pending and returns Unavailable.
+    let seq2 = app_buffer::insert_pending_for_test(2, 2, &cap);
+    TRANSPORT_REVOKED.store(true, Ordering::Release);
+    assert!(matches!(
+        take_app_buffer(seq2),
+        Err(AppBufferTransportError::Unavailable)
+    ));
+    assert!(!app_buffer::has_pending_for_test());
+
+    // `begin()` pre-check clears stale pending from an earlier epoch so it does not wedge Busy.
+    TRANSPORT_REVOKED.store(false, Ordering::Release);
+    GPU_CONTEXT_EPOCH.store(3, Ordering::Release);
+    let _seq3 = app_buffer::insert_pending_for_test(3, 2, &cap);
+    app_buffer::clear_stale_pending_for_test();
+    assert!(!app_buffer::has_pending_for_test());
+
+    let id = cap.identity();
+    {
+        let mut pool = app_buffer_pool();
+        let _ = pool.revoke(id);
+        let _ = pool.provider_retired(id);
+    }
+    drop(cap);
+    let _ = app_buffer_pool().reclaim_after_scrub(id);
 }

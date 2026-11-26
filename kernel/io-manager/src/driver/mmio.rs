@@ -53,14 +53,16 @@ struct MmioMapping {
     refcount: usize,
 }
 
-struct DirectMapPageOverride {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectMapOverrideInterval {
     phys_page_base: u64,
+    page_count: usize,
     original_cache_flags: PageTableFlags,
 }
 
 struct MmioRegistry {
     mappings: Vec<MmioMapping>,
-    direct_map_overrides: Vec<DirectMapPageOverride>,
+    direct_map_overrides: Vec<DirectMapOverrideInterval>,
 }
 
 impl MmioRegistry {
@@ -232,30 +234,92 @@ fn direct_map_mapping(phys_start: u64, size: usize) -> Option<(u64, u64, usize)>
     ))
 }
 
+fn direct_map_interval_end(phys_page_base: u64, page_count: usize) -> Option<u64> {
+    let byte_len = u64::try_from(page_count).ok()?.checked_mul(PAGE_4KIB)?;
+    phys_page_base.checked_add(byte_len)
+}
+
+fn direct_map_override_insert_index(
+    overrides: &[DirectMapOverrideInterval],
+    page_base: u64,
+    page_count: usize,
+) -> Option<usize> {
+    let page_end = direct_map_interval_end(page_base, page_count)?;
+    let insert_index = match overrides.binary_search_by_key(&page_base, |entry| entry.phys_page_base)
+    {
+        Ok(_) => return None,
+        Err(index) => index,
+    };
+    if let Some(prev) = insert_index
+        .checked_sub(1)
+        .and_then(|index| overrides.get(index))
+    {
+        let prev_end = direct_map_interval_end(prev.phys_page_base, prev.page_count)?;
+        if prev_end > page_base {
+            return None;
+        }
+    }
+    if let Some(next) = overrides.get(insert_index)
+        && page_end > next.phys_page_base
+    {
+        return None;
+    }
+    Some(insert_index)
+}
+
+fn insert_direct_map_override(
+    overrides: &mut Vec<DirectMapOverrideInterval>,
+    insert_index: usize,
+    interval: DirectMapOverrideInterval,
+) {
+    debug_assert_eq!(
+        direct_map_override_insert_index(overrides, interval.phys_page_base, interval.page_count),
+        Some(insert_index)
+    );
+    overrides.insert(insert_index, interval);
+}
+
+fn find_direct_map_override(
+    overrides: &[DirectMapOverrideInterval],
+    page_base: u64,
+    page_count: usize,
+) -> Option<(usize, DirectMapOverrideInterval)> {
+    if page_count == 0 {
+        return None;
+    }
+    let index = overrides
+        .binary_search_by_key(&page_base, |entry| entry.phys_page_base)
+        .ok()?;
+    let entry = overrides[index];
+    (entry.page_count == page_count).then_some((index, entry))
+}
+
 fn apply_direct_map_cache_mode(
-    overrides: &mut Vec<DirectMapPageOverride>,
+    overrides: &mut Vec<DirectMapOverrideInterval>,
     page_base: u64,
     page_count: usize,
     cache_mode: MmioCacheMode,
 ) -> bool {
     let desired_flags = cache_mode_flags(cache_mode);
-    let mut new_pages = Vec::new();
-    // Both vectors are published after the direct-map PTE transaction. Reserve
-    // their worst-case growth first so no allocation can fail after cache
-    // attributes have changed.
-    if overrides.try_reserve(page_count).is_err() || new_pages.try_reserve(page_count).is_err() {
+    // Reserve the interval record before mutating any direct-map PTE so an
+    // allocation failure leaves page tables and ownership untouched.
+    if overrides.try_reserve(1).is_err() {
         return false;
     }
+    if page_count == 0 {
+        return true;
+    }
+    let Some(range_size) = page_count.checked_mul(PAGE_4KIB as usize) else {
+        return false;
+    };
+    let Some(insert_index) = direct_map_override_insert_index(overrides, page_base, page_count)
+    else {
+        return false;
+    };
 
+    let mut original_cache_flags = None;
     for page_index in 0..page_count {
         let phys_page = page_base + page_index as u64 * PAGE_4KIB;
-        if overrides
-            .binary_search_by_key(&phys_page, |entry| entry.phys_page_base)
-            .is_ok()
-        {
-            return false;
-        }
-
         let Some(flags) = crate::memory::paging::direct_map_cache_flags_for_phys(phys_page) else {
             return false;
         };
@@ -268,18 +332,14 @@ fn apply_direct_map_cache_mode(
         if existing_mode != MmioCacheMode::SharedWriteBack && existing_mode != cache_mode {
             return false;
         }
-        new_pages.push(DirectMapPageOverride {
-            phys_page_base: phys_page,
-            original_cache_flags: flags,
-        });
+        if original_cache_flags.is_some_and(|expected| expected != flags) {
+            return false;
+        }
+        original_cache_flags = Some(flags);
     }
-    if new_pages.first().is_some_and(|first| {
-        new_pages
-            .iter()
-            .any(|page| page.original_cache_flags != first.original_cache_flags)
-    }) {
+    let Some(original_cache_flags) = original_cache_flags else {
         return false;
-    }
+    };
 
     // The paging layer already provides one prepared, globally serialized
     // range transaction and can retain huge leaves for complete 2 MiB spans.
@@ -289,52 +349,34 @@ fn apply_direct_map_cache_mode(
     // retained pages were validated to use this exact cache mode, so applying
     // the desired flags idempotently across the complete requested range is
     // both the rollback-safe and the bounded operation.
-    let range_size = page_count.checked_mul(PAGE_4KIB as usize);
-    if !new_pages.is_empty()
-        && range_size.is_none_or(|range_size| {
-            !crate::memory::paging::update_direct_map_range_flags(
-                page_base,
-                range_size,
-                desired_flags,
-                DIRECT_MAP_CACHE_FLAG_MASK,
-            )
-        })
-    {
+    if !crate::memory::paging::update_direct_map_range_flags(
+        page_base,
+        range_size,
+        desired_flags,
+        DIRECT_MAP_CACHE_FLAG_MASK,
+    ) {
         return false;
     }
 
-    for page in new_pages {
-        let index = overrides
-            .binary_search_by_key(&page.phys_page_base, |entry| entry.phys_page_base)
-            .unwrap_or_else(|index| index);
-        overrides.insert(index, page);
-    }
+    insert_direct_map_override(
+        overrides,
+        insert_index,
+        DirectMapOverrideInterval {
+            phys_page_base: page_base,
+            page_count,
+            original_cache_flags,
+        },
+    );
 
     true
 }
 
 fn restore_direct_map_cache_mode(
-    overrides: &mut Vec<DirectMapPageOverride>,
+    overrides: &mut Vec<DirectMapOverrideInterval>,
     page_base: u64,
     page_count: usize,
 ) -> bool {
-    if page_count == 0 {
-        return false;
-    }
-    let mut original_cache_flags = None;
-    for page_index in 0..page_count {
-        let phys_page = page_base + page_index as u64 * PAGE_4KIB;
-        let Ok(index) = overrides.binary_search_by_key(&phys_page, |entry| entry.phys_page_base)
-        else {
-            return false;
-        };
-        let flags = overrides[index].original_cache_flags;
-        if original_cache_flags.is_some_and(|expected| expected != flags) {
-            return false;
-        }
-        original_cache_flags = Some(flags);
-    }
-    let Some(original_cache_flags) = original_cache_flags else {
+    let Some((index, entry)) = find_direct_map_override(overrides, page_base, page_count) else {
         return false;
     };
     let Some(range_size) = page_count.checked_mul(PAGE_4KIB as usize) else {
@@ -343,19 +385,12 @@ fn restore_direct_map_cache_mode(
     if !crate::memory::paging::update_direct_map_range_flags(
         page_base,
         range_size,
-        original_cache_flags,
+        entry.original_cache_flags,
         DIRECT_MAP_CACHE_FLAG_MASK,
     ) {
         return false;
     }
-    for page_index in (0..page_count).rev() {
-        let phys_page = page_base + page_index as u64 * PAGE_4KIB;
-        let Ok(index) = overrides.binary_search_by_key(&phys_page, |entry| entry.phys_page_base)
-        else {
-            return false;
-        };
-        overrides.remove(index);
-    }
+    overrides.remove(index);
     true
 }
 
@@ -467,7 +502,7 @@ mod tests {
             .expect("direct-map transaction must remain source-visible")
             .1;
         let override_reserve = transaction
-            .find("overrides.try_reserve(page_count)")
+            .find("overrides.try_reserve(1)")
             .expect("override metadata must reserve before mutation");
         let pte_mutation = transaction
             .find("update_direct_map_range_flags(")
@@ -547,5 +582,95 @@ mod tests {
             limit,
             limit + PAGE_4KIB
         ));
+    }
+
+    #[test]
+    fn direct_map_override_intervals_reject_overlaps_and_preserve_sorted_adjacent_restore() {
+        let mut overrides = Vec::new();
+        let wc = cache_mode_flags(MmioCacheMode::WriteCombine);
+        let uc = cache_mode_flags(MmioCacheMode::Uncached);
+
+        let idx = direct_map_override_insert_index(&overrides, 0x2_0000, 4).unwrap();
+        assert_eq!(idx, 0);
+        insert_direct_map_override(
+            &mut overrides,
+            idx,
+            DirectMapOverrideInterval {
+                phys_page_base: 0x2_0000,
+                page_count: 4,
+                original_cache_flags: PageTableFlags::empty(),
+            },
+        );
+
+        // Adjacent intervals immediately before and after are accepted and stay sorted.
+        let before_idx = direct_map_override_insert_index(&overrides, 0x1_0000, 16).unwrap();
+        assert_eq!(before_idx, 0);
+        insert_direct_map_override(
+            &mut overrides,
+            before_idx,
+            DirectMapOverrideInterval {
+                phys_page_base: 0x1_0000,
+                page_count: 16,
+                original_cache_flags: wc,
+            },
+        );
+        let after_idx = direct_map_override_insert_index(&overrides, 0x2_4000, 8).unwrap();
+        assert_eq!(after_idx, 2);
+        insert_direct_map_override(
+            &mut overrides,
+            after_idx,
+            DirectMapOverrideInterval {
+                phys_page_base: 0x2_4000,
+                page_count: 8,
+                original_cache_flags: uc,
+            },
+        );
+        assert_eq!(
+            overrides
+                .iter()
+                .map(|entry| (entry.phys_page_base, entry.page_count))
+                .collect::<Vec<_>>(),
+            alloc::vec![(0x1_0000, 16), (0x2_0000, 4), (0x2_4000, 8)]
+        );
+
+        // Exact base, partial left/right overlap, contained, containing, and overflow reject.
+        assert_eq!(direct_map_override_insert_index(&overrides, 0x2_0000, 1), None);
+        assert_eq!(direct_map_override_insert_index(&overrides, 0x1_f000, 2), None);
+        assert_eq!(direct_map_override_insert_index(&overrides, 0x2_3000, 2), None);
+        assert_eq!(direct_map_override_insert_index(&overrides, 0x2_1000, 1), None);
+        assert_eq!(direct_map_override_insert_index(&overrides, 0x0_8000, 64), None);
+        assert_eq!(
+            direct_map_override_insert_index(&overrides, u64::MAX - PAGE_4KIB + 1, 2),
+            None
+        );
+
+        // Restore requires exact base and page_count, and leaves neighbors intact.
+        assert_eq!(find_direct_map_override(&overrides, 0x2_0000, 0), None);
+        assert_eq!(find_direct_map_override(&overrides, 0x2_0000, 3), None);
+        assert_eq!(find_direct_map_override(&overrides, 0x2_1000, 1), None);
+        let (mid_idx, mid_entry) = find_direct_map_override(&overrides, 0x2_0000, 4).unwrap();
+        assert_eq!(mid_idx, 1);
+        assert_eq!(mid_entry.original_cache_flags, PageTableFlags::empty());
+        overrides.remove(mid_idx);
+
+        // Freed gap can be re-inserted cleanly between its neighbors.
+        let gap_idx = direct_map_override_insert_index(&overrides, 0x2_1000, 2).unwrap();
+        assert_eq!(gap_idx, 1);
+        insert_direct_map_override(
+            &mut overrides,
+            gap_idx,
+            DirectMapOverrideInterval {
+                phys_page_base: 0x2_1000,
+                page_count: 2,
+                original_cache_flags: PageTableFlags::empty(),
+            },
+        );
+        assert_eq!(
+            overrides
+                .iter()
+                .map(|entry| (entry.phys_page_base, entry.page_count))
+                .collect::<Vec<_>>(),
+            alloc::vec![(0x1_0000, 16), (0x2_1000, 2), (0x2_4000, 8)]
+        );
     }
 }

@@ -745,11 +745,13 @@ tokens = [
 [[required_sequences]]
 path = "kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs"
 tokens = [
-    "fn futex_cmp_requeue(",
+    "fn futex_requeue_inner(",
     "let mut waiters = FUTEX_WAITERS.lock();",
     ".atomic_load_user_u32(uaddr)",
-    "waiters.select_requeue_vec(",
-    "wake_selected_futex_tasks(&task_ids, task_ids.len())",
+    "if actual != expected",
+    "if !task_ids.covers(max_wake, bound)",
+    "waiters.select_requeue(",
+    "wake_selected_futex_tasks(task_ids.as_slice(), wake_count)",
 ]
 
 # The BSP publishes one immutable migration profile; APs consume that profile

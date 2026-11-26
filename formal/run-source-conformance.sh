@@ -820,8 +820,11 @@ mmio_straddle_guard_line="$(grep -n -m1 -F 'if physical_range_straddles_direct_m
 mmio_registry_reserve_line="$(grep -n -m1 -F 'if registry.mappings.try_reserve(1).is_err() {' <<<"$mmio_mapping_body" | cut -d: -f1)"
 mmio_direct_map_line="$(grep -n -m1 -F 'direct_map_mapping(phys_start, size)' <<<"$mmio_mapping_body" | cut -d: -f1)"
 mmio_window_map_line="$(grep -n -m1 -F 'crate::memory::paging::map_shared_memory_range(phys_start, size)' <<<"$mmio_mapping_body" | cut -d: -f1)"
-mmio_override_reserve_line="$(grep -n -m1 -F 'if overrides.try_reserve(page_count).is_err()' <<<"$mmio_direct_override_body" | cut -d: -f1)"
-mmio_direct_map_update_line="$(grep -n -m1 -F 'crate::memory::paging::update_direct_map_range_flags(' <<<"$mmio_direct_override_body" | cut -d: -f1)"
+mmio_override_reserve_line="$(grep -n -m1 -F 'if overrides.try_reserve(1).is_err()' <<<"$mmio_direct_override_body" | cut -d: -f1 || true)"
+mmio_override_admit_line="$(grep -n -m1 -F 'direct_map_override_insert_index(overrides, page_base, page_count)' <<<"$mmio_direct_override_body" | cut -d: -f1 || true)"
+mmio_override_flags_line="$(grep -n -m1 -F 'original_cache_flags.is_some_and(|expected| expected != flags)' <<<"$mmio_direct_override_body" | cut -d: -f1 || true)"
+mmio_direct_map_update_line="$(grep -n -m1 -F 'crate::memory::paging::update_direct_map_range_flags(' <<<"$mmio_direct_override_body" | cut -d: -f1 || true)"
+mmio_override_insert_line="$(grep -n -m1 -F 'insert_direct_map_override(' <<<"$mmio_direct_override_body" | cut -d: -f1 || true)"
 ap_memory_type_init_line="$(grep -n -m1 -F 'mm_api::boot::initialize_application_processor_cache_attributes()' <<<"$ap_entry_body" | cut -d: -f1)"
 ap_online_parked_line="$(grep -n -m1 -F 'CpuLifecycleState::OnlineParked' <<<"$ap_entry_body" | cut -d: -f1)"
 ap_private_ready_line="$(grep -n -m1 -F '"smp-ap-private-ready"' <<<"$ap_entry_body" | cut -d: -f1)"
@@ -942,8 +945,8 @@ if [[ -z "$mmio_straddle_guard_line" || -z "$mmio_conflict_line" || -z "$mmio_re
     || ! grep -Fq 'left_start < right_end && right_start < left_end' kernel/io-manager/src/driver/mmio.rs \
     || ! grep -Fq 'start < crate::memory::kernel_vm::DIRECT_MAP_PHYS_LIMIT' kernel/io-manager/src/driver/mmio.rs \
     || ! grep -Fq 'end_exclusive > crate::memory::kernel_vm::DIRECT_MAP_PHYS_LIMIT' kernel/io-manager/src/driver/mmio.rs \
-    || [[ -z "$mmio_override_reserve_line" || -z "$mmio_direct_map_update_line" || "$mmio_override_reserve_line" -ge "$mmio_direct_map_update_line" ]] \
-    || ! grep -Fq 'new_pages.try_reserve(page_count).is_err()' <<<"$mmio_direct_override_body"; then
+    || [[ -z "$mmio_override_reserve_line" || -z "$mmio_override_admit_line" || -z "$mmio_override_flags_line" || -z "$mmio_direct_map_update_line" || -z "$mmio_override_insert_line" ]] \
+    || (( mmio_override_reserve_line >= mmio_direct_map_update_line || mmio_override_admit_line >= mmio_direct_map_update_line || mmio_override_flags_line >= mmio_direct_map_update_line || mmio_direct_map_update_line >= mmio_override_insert_line )); then
     echo 'global physical overlap, direct-map-boundary, and reserve-before-PTE-mutation guards must fail before an alias or partial mapping can publish' >&2
     static_failures=$((static_failures + 1))
 fi
@@ -1333,7 +1336,8 @@ usermem_source=kernel/ps/src/user/sysops/usermem.rs
 cow_probe_source=apps/ipcbench/src/cow_probe.rs
 if ! rg -Uq 'fn with_current_write_address_space<R>\([^)]*UserCopyAddressSpace' "$usermem_source" \
     || [ "$(rg -c 'with_current_write_address_space' "$usermem_source")" -ne 5 ] \
-    || [ "$(rg -c 'try_with_user_copy_address_space' "$usermem_source")" -ne 5 ] \
+    || [ "$(rg -c 'try_with_user_copy_address_space' "$usermem_source")" -ne 6 ] \
+    || ! rg -Uq 'if let Some\(\(user_ptr, len, is_write\)\) = unmapped\.get\(\)\s*&& populate_anonymous_range\(user_ptr, len, is_write\)\?\s*\{\s*return retained\s*\.try_with_user_copy_address_space' "$usermem_source" \
     || ! rg -Fq 'validate_user_write_resolving_cow' "$copyout_ps_source" \
     || ! rg -Fq 'region.commit_state != VM_COMMIT_COMMITTED' "$copyout_ps_source" \
     || ! rg -Fq 'region.prot & VM_PROT_WRITE == 0' "$copyout_ps_source" \

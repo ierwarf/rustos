@@ -168,18 +168,21 @@ const fn slot_state(word: u64) -> u8 {
 const FAULT_FRAME_POOL_COLD: u8 = 0;
 const FAULT_FRAME_POOL_FILLING: u8 = 1;
 const FAULT_FRAME_POOL_READY: u8 = 2;
+const FAULT_FRAME_POOL_WORDS: usize = MAX_PREALLOCATED_PAGER_FAULT_FRAMES / 64;
+const _: () = assert!(MAX_PREALLOCATED_PAGER_FAULT_FRAMES.is_multiple_of(64));
 
 struct FaultFramePool {
     state: AtomicU8,
     frames: [AtomicU64; MAX_PREALLOCATED_PAGER_FAULT_FRAMES],
-    /// Frames currently published in `frames`, maintained incrementally.
-    ///
-    /// This is authority, not a census: a claimer decrements it before it may
-    /// take a slot, so it is what lets an empty pool be rejected in one atomic
-    /// operation instead of a full sweep of the array.
+    /// Each bit grants exactly one claim on its frame slot. A producer may
+    /// reuse a slot only after the successful claimant zeroes it.
+    ready: [AtomicU64; FAULT_FRAME_POOL_WORDS],
+    /// Census for refill and diagnostics, never used to authorize a claim.
     available: AtomicUsize,
-    /// Rotating scan origin, so concurrent claimers start on different slots.
+    /// Rotating scan origin, so concurrent claimers start on different words.
     cursor: AtomicUsize,
+    /// Rotating publish origin, so producers land on empty slots without full scans.
+    publish_cursor: AtomicUsize,
     /// Frames left at the most recent reservation, the lowest depth any
     /// reservation has observed, and reservations refused for want of a frame.
     ///
@@ -197,8 +200,10 @@ impl FaultFramePool {
         Self {
             state: AtomicU8::new(FAULT_FRAME_POOL_COLD),
             frames: [const { AtomicU64::new(0) }; MAX_PREALLOCATED_PAGER_FAULT_FRAMES],
+            ready: [const { AtomicU64::new(0) }; FAULT_FRAME_POOL_WORDS],
             available: AtomicUsize::new(0),
             cursor: AtomicUsize::new(0),
+            publish_cursor: AtomicUsize::new(0),
             depth: AtomicUsize::new(usize::MAX),
             low_watermark: AtomicUsize::new(usize::MAX),
             exhaustions: AtomicU64::new(0),
@@ -234,7 +239,14 @@ impl FaultFramePool {
                 .ok_or(FrameGrantError::Pressure);
         }
         for slot in &self.frames {
-            let Some(frame_phys) = allocate() else {
+            let Some(frame_phys) = allocate().and_then(|frame| {
+                if frame != 0 && frame.is_multiple_of(FRAME_BYTES as u64) {
+                    Some(frame)
+                } else {
+                    release(frame);
+                    None
+                }
+            }) else {
                 for allocated in &self.frames {
                     // ORDERING: withdraw only the private Filling owner's
                     // frames; no reserve operation may consume them yet.
@@ -250,13 +262,12 @@ impl FaultFramePool {
             // ORDERING: Filling excludes consumers; Ready seals these stores.
             slot.store(frame_phys, Ordering::Release);
         }
-        // The boot fill bypasses publish(), so it must also establish the
-        // count that authorizes reservations. Otherwise a full array seals as
-        // Ready with zero claims, permanently stranding every wired frame.
-        // ORDERING: Filling still excludes consumers. Ready's Release store
-        // publishes both the frame slots and this count to reserve's Acquire.
+        for word in &self.ready {
+            word.store(u64::MAX, Ordering::Relaxed);
+        }
         self.available
             .store(MAX_PREALLOCATED_PAGER_FAULT_FRAMES, Ordering::Relaxed);
+        // ORDERING: Ready publishes the complete slot array, bitmap and census.
         self.state.store(FAULT_FRAME_POOL_READY, Ordering::Release);
         Ok(())
     }
@@ -265,16 +276,24 @@ impl FaultFramePool {
         if frame_phys == 0 || !frame_phys.is_multiple_of(FRAME_BYTES as u64) {
             return Err(FrameGrantError::Malformed);
         }
-        for slot in &self.frames {
+        let start = self.publish_cursor.fetch_add(1, Ordering::Relaxed);
+        for offset in 0..MAX_PREALLOCATED_PAGER_FAULT_FRAMES {
+            let index = start.wrapping_add(offset) % MAX_PREALLOCATED_PAGER_FAULT_FRAMES;
+            let slot = &self.frames[index];
+            // This is only a contention filter; the CAS owns the slot.
+            if slot.load(Ordering::Relaxed) != 0 {
+                continue;
+            }
             // ORDERING: a Release publication makes a fully zeroed physical
             // page visible before an exception-time AcqRel reservation reads it.
             if slot
                 .compare_exchange(0, frame_phys, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
             {
-                // ORDERING: Release makes the frame visible in its slot before
-                // the count that authorizes a claimer to go looking for it.
-                self.available.fetch_add(1, Ordering::Release);
+                self.available.fetch_add(1, Ordering::Relaxed);
+                // ORDERING: Release publishes the frame and accounts for it
+                // before a claimant acquires its exact bit.
+                self.ready[index / 64].fetch_or(1 << (index % 64), Ordering::Release);
                 return Ok(());
             }
         }
@@ -283,81 +302,53 @@ impl FaultFramePool {
 
     /// Claims one wired frame, or reports the pool empty.
     ///
-    /// This runs on every anonymous fault with interrupts disabled, so its cost
-    /// is paid by every page the system demand-pages. It used to sweep the
-    /// whole slot array on *every* call - once to find a frame and then again
-    /// to recount the survivors for the depth census - which made the fault
-    /// path O(pool size) and put a hard ceiling on how large the pool could
-    /// usefully be. The available count is now maintained incrementally, so a
-    /// claim reserves its slot before touching the array and an empty pool is
-    /// rejected without touching it at all.
+    /// Runs with interrupts disabled during fault handling. Visit each bitmap
+    /// word at most once; only contend on bits advertised in its snapshot.
     fn reserve(&self) -> Result<u64, FrameGrantError> {
         // ORDERING: Ready acquires the completed boot fill before any fault
         // can observe a slot; a cold or filling pool is not usable authority.
         if self.state.load(Ordering::Acquire) != FAULT_FRAME_POOL_READY {
             return Err(FrameGrantError::Pressure);
         }
-        // Reserve the right to one frame first. Winning this decrement is what
-        // guarantees the scan below finds a slot, so the scan never has to run
-        // to completion to prove the pool is empty.
-        // ORDERING: AcqRel serializes concurrent claims against each other and
-        // against a producer's Release increment.
-        let remaining = match self
-            .available
-            // ORDERING: reserve one unit and observe producer publication.
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
-                available.checked_sub(1)
-            }) {
-            Ok(previous) => previous - 1,
-            Err(_) => {
-                // The exhaustion this counter exists to make legible. Its
-                // previous first symptom was a dead user thread several layers
-                // away.
-                let empty = self.exhaustions.fetch_add(1, Ordering::Relaxed) + 1;
-                if empty.is_multiple_of(1024) || empty == 1 {
-                    crate::debug::record_milestone(
-                        crate::debug::LogCategory::Memory,
-                        "pager-pressure-fault-frame-reserve-empty",
-                        empty,
-                        MAX_PREALLOCATED_PAGER_FAULT_FRAMES as u64,
-                    );
-                }
-                // ORDERING: Release publishes the demand signal for the
-                // producer task; an empty pool is exactly when it must run.
-                PAGER_FAULT_REFILL_REQUESTED.store(true, Ordering::Release);
-                return Err(FrameGrantError::OutOfFrames);
-            }
-        };
-        // A rotating start keeps concurrent claimers off each other's slots
-        // instead of having every CPU contend on index 0.
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
-        let mut reserved = 0;
-        for offset in 0..MAX_PREALLOCATED_PAGER_FAULT_FRAMES {
-            let index = start.wrapping_add(offset) % MAX_PREALLOCATED_PAGER_FAULT_FRAMES;
-            // ORDERING: AcqRel claims one exact wired frame and prevents a
-            // second fault from receiving the same opaque grant backing.
-            let frame_phys = self.frames[index].swap(0, Ordering::AcqRel);
-            if frame_phys != 0 {
-                reserved = frame_phys;
-                break;
+        for offset in 0..FAULT_FRAME_POOL_WORDS {
+            let word_index = start.wrapping_add(offset) % FAULT_FRAME_POOL_WORDS;
+            let word = &self.ready[word_index];
+            let mut snapshot = word.load(Ordering::Relaxed);
+            while snapshot != 0 {
+                let bit = snapshot.trailing_zeros() as usize;
+                let mask = 1_u64 << bit;
+                snapshot &= !mask;
+                // ORDERING: Acquire observes publication of the exact slot;
+                // AcqRel removes its availability before releasing the slot.
+                if word.fetch_and(!mask, Ordering::AcqRel) & mask == 0 {
+                    continue;
+                }
+                let index = word_index * 64 + bit;
+                // ORDERING: Release opens the empty slot to the next producer.
+                let frame = self.frames[index].swap(0, Ordering::AcqRel);
+                assert_ne!(frame, 0, "published fault frame slot must be filled");
+                let remaining = self.available.fetch_sub(1, Ordering::Relaxed) - 1;
+                self.record_depth(remaining);
+                if remaining <= PAGER_FAULT_REFILL_LOW_WATERMARK {
+                    // ORDERING: Publish the demand signal after reservation.
+                    PAGER_FAULT_REFILL_REQUESTED.store(true, Ordering::Release);
+                }
+                return Ok(frame);
             }
         }
-        if reserved == 0 {
-            // The count promised a frame the array did not hold. Give the
-            // reservation back rather than leaving the pool permanently short.
-            // ORDERING: Release restores the count for the next claimer.
-            self.available.fetch_add(1, Ordering::Release);
-            return Err(FrameGrantError::OutOfFrames);
+        let empty = self.exhaustions.fetch_add(1, Ordering::Relaxed) + 1;
+        if empty.is_multiple_of(1024) || empty == 1 {
+            crate::debug::record_milestone(
+                crate::debug::LogCategory::Memory,
+                "pager-pressure-fault-frame-reserve-empty",
+                empty,
+                MAX_PREALLOCATED_PAGER_FAULT_FRAMES as u64,
+            );
         }
-        self.record_depth(remaining);
-        if remaining <= PAGER_FAULT_REFILL_LOW_WATERMARK {
-            // ORDERING: Release publishes the low-water observation after the
-            // exact frame reservation.  The timer only uses this as a reason
-            // to enter a safe scheduler boundary; it never performs refill
-            // allocation in IRQ context.
-            PAGER_FAULT_REFILL_REQUESTED.store(true, Ordering::Release);
-        }
-        Ok(reserved)
+        // ORDERING: Publish the demand signal before returning out of frames.
+        PAGER_FAULT_REFILL_REQUESTED.store(true, Ordering::Release);
+        Err(FrameGrantError::OutOfFrames)
     }
 
     fn has_empty_slot(&self) -> bool {
@@ -591,6 +582,8 @@ pub fn preallocate_pager_fault_frames() -> Result<(), FrameGrantError> {
     )
 }
 
+const REPLENISH_BATCH_CHUNK: usize = 64;
+
 /// Replenishes a bounded number of consumed wired fault frames from normal
 /// housekeeping context. Fault entry remains allocation-free: only this path
 /// allocates and zeroes replacements, then release-publishes them to empty
@@ -601,35 +594,48 @@ pub fn replenish_pager_fault_frames(budget: usize) -> usize {
     if budget == 0 || FAULT_FRAME_POOL.state.load(Ordering::Acquire) != FAULT_FRAME_POOL_READY {
         return 0;
     }
+    // ORDERING: Observe published frames and in-flight claims before sizing a refill.
+    let available = FAULT_FRAME_POOL.available.load(Ordering::Acquire);
+    let mut remaining_want =
+        budget.min(MAX_PREALLOCATED_PAGER_FAULT_FRAMES.saturating_sub(available));
     let mut replenished = 0;
-    for _ in 0..budget.min(MAX_PREALLOCATED_PAGER_FAULT_FRAMES) {
-        if !FAULT_FRAME_POOL
-            .frames
-            .iter()
-            // ORDERING: Acquire pairs with the Release that published a frame
-            // into this slot, so an empty slot is only observed after the
-            // consumer's take has become visible.
-            .any(|slot| slot.load(Ordering::Acquire) == 0)
-        {
+    let mut batch = [PhysAddr::new(0); REPLENISH_BATCH_CHUNK];
+    while remaining_want != 0 {
+        let chunk_want = remaining_want.min(REPLENISH_BATCH_CHUNK);
+        let allocated = phys::alloc_frames_batch_user(&mut batch[..chunk_want]);
+        if allocated == 0 {
             break;
         }
-        let Some(frame) = phys::alloc_frame_user() else {
-            break;
-        };
-        // SAFETY: this normal-time owner holds the fresh physical frame until
-        // `publish` release-publishes its fully zeroed contents.
-        unsafe {
-            ptr::write_bytes(
-                kernel_vm::higher_half_addr(frame.as_u64()) as *mut u8,
-                0,
-                FRAME_BYTES,
-            );
+        let mut pool_full = false;
+        for index in 0..allocated {
+            let frame = batch[index];
+            // SAFETY: this normal-time owner holds the fresh physical frame until
+            // `publish` release-publishes its fully zeroed contents.
+            unsafe {
+                ptr::write_bytes(
+                    kernel_vm::higher_half_addr(frame.as_u64()) as *mut u8,
+                    0,
+                    FRAME_BYTES,
+                );
+            }
+            if FAULT_FRAME_POOL.publish(frame.as_u64()).is_err() {
+                let mut failures =
+                    [(PhysAddr::new(0), phys::FreeFrameError::AlreadyFree); REPLENISH_BATCH_CHUNK];
+                let failed =
+                    phys::try_free_frames_batch(&batch[index..allocated], &mut failures);
+                assert_eq!(failed, 0, "replenish rejected freshly allocated user frames");
+                pool_full = true;
+                break;
+            }
+            replenished += 1;
         }
-        if FAULT_FRAME_POOL.publish(frame.as_u64()).is_err() {
-            phys::free_frame(frame);
+        if pool_full || allocated < chunk_want {
             break;
         }
-        replenished += 1;
+        // ORDERING: Observe concurrent producer and consumer updates between batches.
+        let available = FAULT_FRAME_POOL.available.load(Ordering::Acquire);
+        let room = MAX_PREALLOCATED_PAGER_FAULT_FRAMES.saturating_sub(available);
+        remaining_want = (remaining_want - allocated).min(room);
     }
     if replenished != 0
         && FIRST_FAULT_FRAME_REPLENISHMENT
@@ -1127,5 +1133,33 @@ mod tests {
     fn the_reserve_is_never_smaller_than_the_fault_slot_table() {
         assert!(MAX_PREALLOCATED_PAGER_FAULT_FRAMES >= MAX_PAGER_FRAME_GRANTS);
         assert_eq!(MAX_PREALLOCATED_PAGER_FAULT_FRAMES, 2048);
+    }
+
+    #[test]
+    fn concurrent_reserve_and_publish_never_drops_available_frames() {
+        extern crate std;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let pool = Arc::new(ready_pool(64));
+        let barrier = Arc::new(Barrier::new(4));
+        let mut threads = std::vec::Vec::new();
+        for _ in 0..4 {
+            let pool = pool.clone();
+            let barrier = barrier.clone();
+            threads.push(thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..1000 {
+                    if let Ok(frame) = pool.reserve() {
+                        assert!(pool.publish(frame).is_ok());
+                    }
+                }
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        // Thread joins already synchronize the final counter read.
+        assert_eq!(pool.available.load(Ordering::Relaxed), 64);
     }
 }

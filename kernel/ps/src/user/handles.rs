@@ -4,6 +4,7 @@ use crate::user::eventfd::EventFdHandle;
 use crate::user::linux as linux_abi;
 use crate::user::memfd::MemfdHandle;
 use crate::user::pipe::PipeHandle;
+use crate::user::timerfd::TimerFdHandle;
 use crate::user::unix_socket::UnixSocketHandle;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -191,6 +192,7 @@ pub enum KernelHandle {
     Device(DeviceHandle),
     Epoll(EpollHandle),
     EventFd(EventFdHandle),
+    TimerFd(TimerFdHandle),
     InetSocket(InetSocketHandle),
     Memfd(MemfdHandle),
     Pipe(PipeHandle),
@@ -493,6 +495,11 @@ impl KernelHandle {
                 eventfd.token_id(),
             )
             .expect("eventfd open-description token is nonzero and nonreusable"),
+            Self::TimerFd(timerfd) => HandleToken::from_nonreusable_open_description(
+                HandleOwner::Ps,
+                timerfd.token_id(),
+            )
+            .expect("timerfd open-description token is nonzero and nonreusable"),
             Self::Pipe(pipe) => HandleToken::from_nonreusable_open_description(
                 HandleOwner::Ps,
                 pipe.token_id(),
@@ -562,6 +569,7 @@ impl KernelHandle {
             Self::EventFd(_) => HandleRights::File(
                 FileHandleRights::READ.union(FileHandleRights::WRITE),
             ),
+            Self::TimerFd(_) => HandleRights::File(FileHandleRights::READ),
             Self::Pipe(pipe) => {
                 let access = match pipe.role() {
                     crate::user::pipe::PipeRole::Read => FileHandleRights::READ,

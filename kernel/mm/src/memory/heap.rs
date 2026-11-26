@@ -39,12 +39,12 @@ use x86_64::instructions::interrupts;
 #[cfg(all(not(test), rustos_debug_print_enabled))]
 use x86_64::instructions::port::Port;
 
+use crate::memory::kernel_vm;
 #[cfg(not(test))]
-use crate::memory::{kernel_vm, phys};
+use crate::memory::phys;
 
 #[cfg(not(test))]
 const HEAP_ORDER: usize = 32;
-#[cfg(not(test))]
 const PAGE_SIZE: usize = 4096;
 #[cfg(not(test))]
 const MIN_HEAP_SIZE: usize = 64 * 1024 * 1024;
@@ -53,7 +53,6 @@ const MIN_HEAP_SIZE: usize = 64 * 1024 * 1024;
 /// `BuddyBackend::grow` when task objects, page tables, or IPC state outgrow
 /// the initial pool.
 const INITIAL_BOOT_HEAP_BYTES: usize = 256 * 1024 * 1024;
-#[cfg(not(test))]
 const MIN_GROW_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// Independent tracker shards; a pointer always hashes to the same shard.
 const TRACKER_SHARD_BITS: u32 = 4;
@@ -372,6 +371,30 @@ trait BlockBackend {
     unsafe fn dealloc_batch(&self, layout: Layout, ptrs: &[usize]);
 }
 
+fn try_grow_chunks(min_bytes: usize, mut try_alloc: impl FnMut(usize) -> Option<bool>) -> bool {
+    if min_bytes == 0 || min_bytes > kernel_vm::DIRECT_MAP_PHYS_LIMIT as usize {
+        return false;
+    }
+    let min_pages = min_bytes.max(PAGE_SIZE).div_ceil(PAGE_SIZE);
+    let desired_pages = min_bytes
+        .checked_next_power_of_two()
+        .unwrap_or(min_bytes)
+        .max(MIN_GROW_CHUNK_BYTES)
+        .div_ceil(PAGE_SIZE)
+        .max(min_pages);
+    let mut chunk_pages = desired_pages;
+    while chunk_pages >= min_pages {
+        if let Some(outcome) = try_alloc(chunk_pages) {
+            return outcome;
+        }
+        if chunk_pages == min_pages {
+            break;
+        }
+        chunk_pages = (chunk_pages / 2).max(min_pages);
+    }
+    false
+}
+
 #[cfg(not(test))]
 struct BuddyBackend;
 
@@ -399,41 +422,31 @@ impl BlockBackend for BuddyBackend {
     }
 
     fn grow(&self, min_bytes: usize) -> bool {
-        let _grow_guard = HEAP_GROW_LOCK.lock();
-        let min_pages = min_bytes.max(PAGE_SIZE).div_ceil(PAGE_SIZE);
-        let desired_pages = min_bytes
-            .next_power_of_two()
-            .max(MIN_GROW_CHUNK_BYTES)
-            .div_ceil(PAGE_SIZE)
-            .max(min_pages);
-        let mut chunk_pages = desired_pages;
-        while chunk_pages >= min_pages {
-            if let Some(chunk_phys) = phys::alloc_contiguous(chunk_pages) {
-                let chunk_bytes = chunk_pages * PAGE_SIZE;
-                let end_phys = chunk_phys.as_u64().saturating_add(chunk_bytes as u64);
-                if end_phys > kernel_vm::DIRECT_MAP_PHYS_LIMIT {
-                    for page in 0..chunk_pages {
-                        let _ = phys::try_free_frame(chunk_phys + (page as u64) * (PAGE_SIZE as u64));
-                    }
-                    return false;
-                }
-                let chunk_start = kernel_vm::higher_half_addr(chunk_phys.as_u64()) as usize;
-                let chunk_end = chunk_start + chunk_bytes;
-                let mut heap = HEAP.lock();
-                // SAFETY: `chunk_phys..chunk_phys + chunk_bytes` was uniquely allocated from
-                // `phys::alloc_contiguous` inside `DIRECT_MAP_PHYS_LIMIT`, is direct-mapped RW,
-                // and has not yet been exposed to the buddy allocator.
-                unsafe { heap.add_to_heap(chunk_start, chunk_end) };
-                drop(heap);
-                HEAP_PROVISIONED.fetch_add(chunk_bytes, core::sync::atomic::Ordering::Relaxed);
-                return true;
-            }
-            if chunk_pages == min_pages {
-                break;
-            }
-            chunk_pages = (chunk_pages / 2).max(min_pages);
+        if min_bytes == 0 || min_bytes > kernel_vm::DIRECT_MAP_PHYS_LIMIT as usize {
+            return false;
         }
-        false
+        let _grow_guard = HEAP_GROW_LOCK.lock();
+        try_grow_chunks(min_bytes, |chunk_pages| {
+            let chunk_phys = phys::alloc_contiguous(chunk_pages)?;
+            let chunk_bytes = chunk_pages * PAGE_SIZE;
+            let end_phys = chunk_phys.as_u64().saturating_add(chunk_bytes as u64);
+            if end_phys > kernel_vm::DIRECT_MAP_PHYS_LIMIT {
+                for page in 0..chunk_pages {
+                    let _ = phys::try_free_frame(chunk_phys + (page as u64) * (PAGE_SIZE as u64));
+                }
+                return Some(false);
+            }
+            let chunk_start = kernel_vm::higher_half_addr(chunk_phys.as_u64()) as usize;
+            let chunk_end = chunk_start + chunk_bytes;
+            let mut heap = HEAP.lock();
+            // SAFETY: `chunk_phys..chunk_phys + chunk_bytes` was uniquely allocated from
+            // `phys::alloc_contiguous` inside `DIRECT_MAP_PHYS_LIMIT`, is direct-mapped RW,
+            // and has not yet been exposed to the buddy allocator.
+            unsafe { heap.add_to_heap(chunk_start, chunk_end) };
+            drop(heap);
+            HEAP_PROVISIONED.fetch_add(chunk_bytes, core::sync::atomic::Ordering::Relaxed);
+            Some(true)
+        })
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -680,7 +693,9 @@ impl<B: BlockBackend> HeapCore<B> {
     /// Returns every cached block to the backend, one slot at a time.
     fn drain_all(&self) {
         for slot in &self.caches {
-            let mut cache = slot.lock();
+            let Some(mut cache) = slot.try_lock() else {
+                continue;
+            };
             for (class, magazine) in cache.magazines.iter_mut().enumerate() {
                 if magazine.len == 0 {
                     continue;
@@ -1364,5 +1379,64 @@ mod tests {
             );
             free(core, cpu, ptr as *mut u8, layout);
         }
+    }
+
+    #[test]
+    fn oversized_or_zero_grow_returns_false_without_panicking() {
+        let mut attempts = 0usize;
+        assert!(!try_grow_chunks(0, |_| {
+            attempts += 1;
+            Some(true)
+        }));
+        assert!(!try_grow_chunks(
+            (kernel_vm::DIRECT_MAP_PHYS_LIMIT as usize) + 1,
+            |_| {
+                attempts += 1;
+                Some(true)
+            }
+        ));
+        assert!(!try_grow_chunks(usize::MAX, |_| {
+            attempts += 1;
+            Some(true)
+        }));
+        assert_eq!(attempts, 0);
+
+        // At the exact limit, `checked_next_power_of_two` fits without overflow
+        // and falls back cleanly when the physical allocator has no chunk.
+        let mut seen_pages = std::vec::Vec::new();
+        assert!(!try_grow_chunks(
+            kernel_vm::DIRECT_MAP_PHYS_LIMIT as usize,
+            |pages| {
+                seen_pages.push(pages);
+                None
+            }
+        ));
+        assert_eq!(
+            seen_pages,
+            [(kernel_vm::DIRECT_MAP_PHYS_LIMIT as usize) / PAGE_SIZE]
+        );
+    }
+
+    #[test]
+    fn drain_all_skips_already_locked_cache_slot_without_deadlocking() {
+        let core = core_with_limit(usize::MAX);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let a = core.alloc(0, layout);
+        let b = core.alloc(1, layout);
+        free(core, 0, a, layout);
+        free(core, 1, b, layout);
+
+        let held_slot0 = core.caches[0].lock();
+        core.drain_all();
+        drop(held_slot0);
+
+        // Slot 1 was drained; slot 0 kept its cached magazine until unlocked.
+        assert_eq!(core.caches[1].lock().magazines[2].len, 0);
+        assert_eq!(
+            core.caches[0].lock().magazines[2].len,
+            magazine_capacity(64) / 2
+        );
+        core.drain_all();
+        assert_eq!(core.backend.outstanding.load(Ordering::Relaxed), 0);
     }
 }

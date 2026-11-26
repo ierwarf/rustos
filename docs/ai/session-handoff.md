@@ -91,7 +91,21 @@ and push. Base: `1d489bbd848044ef30f188202c6f2dbe8245b32a` (`master`).
   benchmark, KVM, or formal-run result is claimed. Performance magnitude and
   live Chrome/window-resize/transparent-composition behavior remain unmeasured.
 
-## Current state (2026-11-25, uncommitted on `master`)
+## Non-core Ring0 audit (2026-11-26, PR #10)
+
+- Covers MM, IPC runtime, I/O manager, process management and Linux
+  compatibility. The UI and Ring3 batches above are separate changes from
+  `master`, not part of the Ring0 patch.
+- Bounded the IRQ-off pager frame scan, excluded physical page zero from
+  allocation, and fixed IPC retirement and DVM lifecycle races. Completed the
+  AF_UNIX address-buffer conversion, preserved futex selection across wake
+  buffer growth, and kept elapsed periods for absolute realtime timerfd.
+- On the original Ring0 commit (`cbce01a4`), the focused kernel tests and
+  formal PR gate passed; KVM Chrome compatibility passed 505 checks at both
+  1 and 8 vCPUs. The IPC benchmark was not a controlled A/B and does not
+  establish a speedup. These results do not cover later `master` changes.
+
+## Historical snapshot (2026-11-25, then uncommitted on `master`)
 
 ### Completed in this wave
 

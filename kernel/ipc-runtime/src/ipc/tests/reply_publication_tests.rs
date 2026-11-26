@@ -48,3 +48,49 @@ fn retiring_caller_does_not_panic_when_another_cpu_owns_terminal_reply() {
         drop(super::super::REPLIES.remove(reply_id));
     });
 }
+
+#[test]
+fn retiring_caller_races_concurrent_response_take_without_panicking() {
+    with_isolated_ipc_test(|| {
+        let endpoint = super::super::create_endpoint().expect("endpoint");
+        for round in 0..64_u64 {
+            let task_id = 420 + round;
+            let (reply, _) =
+                super::super::enqueue_endpoint_call(endpoint, task_id, b"request")
+                    .expect("published call");
+            let _ = super::super::recv_endpoint(endpoint)
+                .expect("recv")
+                .expect("message");
+            assert_eq!(
+                super::super::complete_endpoint_reply(reply, b"ok"),
+                Ok(task_id)
+            );
+
+            let barrier = std::sync::Barrier::new(2);
+            let (taken, cancelled) = std::thread::scope(|scope| {
+                let taker = scope.spawn(|| {
+                    barrier.wait();
+                    super::super::take_endpoint_response_detailed(reply, 0)
+                });
+                barrier.wait();
+                let cancelled = super::super::cancel_endpoint_calls_for_task(
+                    task_id,
+                    |_| {},
+                    |_, _| panic!("test call unexpectedly carried scheduling custody"),
+                );
+                (taker.join().unwrap(), cancelled)
+            });
+
+            match taken {
+                Ok(super::super::EndpointResponseTake::Response((bytes, _))) => {
+                    assert_eq!(bytes, b"ok");
+                    assert_eq!(cancelled, 0);
+                }
+                Err(super::super::IpcError::InvalidHandle) => {
+                    assert_eq!(cancelled, 1);
+                }
+                other => panic!("unexpected take outcome: {other:?}"),
+            }
+        }
+    });
+}

@@ -8,6 +8,23 @@ fn descriptor_exhaustion_is_not_reported_as_a_bad_source_fd() {
 }
 
 #[test]
+fn missing_socket_snapshot_distinguishes_open_non_socket_from_bad_fd() {
+    let mut handles = multitask::HandleTable::new();
+    let epoll = multitask::EpollHandle::new();
+    let non_socket_fd = handles
+        .install(multitask::KernelHandle::Epoll(epoll))
+        .expect("epoll fd");
+    assert_eq!(
+        super::vfs_meta::missing_socket_snapshot_errno(&handles, non_socket_fd),
+        LINUX_ENOTSOCK
+    );
+    assert_eq!(
+        super::vfs_meta::missing_socket_snapshot_errno(&handles, 999),
+        LINUX_EBADF
+    );
+}
+
+#[test]
 fn netd_reference_mutation_owns_the_complete_state_mutation_lease() {
     assert_eq!(
         NETD_REF_OPERATION_TIMEOUT_MS,

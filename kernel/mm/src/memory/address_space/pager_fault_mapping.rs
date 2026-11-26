@@ -881,41 +881,72 @@ impl ProcessAddressSpace {
         }
         validate_user_page_range(start, page_count)?;
         let page_flags = normalize_user_page_flags(flags)?;
-        let mut present = 0;
-        for page_index in 0..page_count {
-            let virt = page_addr(start, page_index)?;
-            match self.pager_fault_leaf_at(virt.as_u64()) {
-                Some(leaf) => {
-                    if self.translate_user(virt).map(|phys| phys.as_u64())
-                        != Some(leaf.physical_address)
+        let root = self.root_phys();
+        let mut present = 0_usize;
+        for_each_user_pt_chunk_in_range(
+            root,
+            start,
+            page_count,
+            read_user_table_entry,
+            |pt_phys, _, first_entry, entries_here| {
+                // SAFETY: every upper level resolved to a present non-huge user
+                // table owned by this address space, serialized by `&self`.
+                let pt = unsafe { kernel_vm::phys_to_table_ref(pt_phys) };
+                for idx in first_entry..first_entry + entries_here {
+                    let entry = &pt[idx];
+                    if entry.is_unused() {
+                        continue;
+                    }
+                    let entry_flags = entry.flags();
+                    if !entry_flags.contains(PageTableFlags::PRESENT)
+                        || entry.addr().as_u64() == 0
                     {
                         return Err(AddressSpaceError::InvalidFrameOwnership);
                     }
+                    if !entry_flags.contains(ROOT_OWNED_USER_LEAF) {
+                        return Err(AddressSpaceError::NotMapped);
+                    }
                     present += 1;
                 }
-                None if self.lookup_user_page_state(virt).is_absent() => {}
-                None => return Err(AddressSpaceError::NotMapped),
-            }
+                Ok(())
+            },
+        )?;
+        if present == 0 {
+            return Ok(0);
         }
 
-        let _mutation = begin_address_space_mutation(self.root_phys());
-        for page_index in 0..page_count {
-            let virt = page_addr(start, page_index)?;
-            if self.pager_fault_leaf_at(virt.as_u64()).is_some() {
-                let tagged = self
-                    .translate_user_with_flags(virt)
-                    .is_some_and(|(_, flags)| flags.contains(ROOT_OWNED_USER_LEAF));
-                self.protect_user_page(
-                    virt,
-                    page_flags
-                        | if tagged {
-                            ROOT_OWNED_USER_LEAF
-                        } else {
-                            PageTableFlags::empty()
-                        },
-                )?;
-            }
-        }
+        let _mutation = begin_address_space_mutation(root);
+        let is_active = Cr3::read().0.start_address() == root;
+        for_each_user_pt_chunk_in_range(
+            root,
+            start,
+            page_count,
+            read_user_table_entry,
+            |pt_phys, chunk_virt, first_entry, entries_here| {
+                // SAFETY: `pt_phys` is a valid present non-huge leaf page table
+                // owned by this address space, and `&mut self` plus the
+                // mutation guard serialize all PTE writers for this root.
+                let pt = unsafe { kernel_vm::phys_to_table_mut(pt_phys) };
+                for offset in 0..entries_here {
+                    let entry = &mut pt[first_entry + offset];
+                    if entry.is_unused() {
+                        continue;
+                    }
+                    let entry_flags = entry.flags();
+                    if !entry_flags.contains(ROOT_OWNED_USER_LEAF) {
+                        continue;
+                    }
+                    let updated = preserve_4k_leaf_pat(entry_flags, page_flags);
+                    entry.set_addr(entry.addr(), updated);
+                    if is_active {
+                        tlb::flush(VirtAddr::new(
+                            chunk_virt.as_u64() + (offset as u64) * PAGE_4KIB_U64,
+                        ));
+                    }
+                }
+                Ok(())
+            },
+        )?;
         Ok(present)
     }
 
@@ -1156,10 +1187,6 @@ impl ProcessAddressSpace {
         external_segments: &[(u64, u64)],
     ) -> Result<usize, AddressSpaceError> {
         let unmapped_count = leaves.len();
-        let mut frames = Vec::new();
-        frames
-            .try_reserve_exact(leaves.len())
-            .map_err(|_| AddressSpaceError::OutOfFrames)?;
         let mutation = begin_address_space_mutation(self.root_phys());
         // Leaves are removed in order and a failure stops the loop, so the
         // removed leaves are always a prefix. Whatever was removed is rolled
@@ -1184,6 +1211,9 @@ impl ProcessAddressSpace {
             }
         }
         let _flushed_mutation = mutation.flush_for_reclaim();
+        let mut batch = [PhysAddr::new(0); FRAME_BATCH_CHUNK];
+        let mut failures = [(PhysAddr::new(0), phys::FreeFrameError::AlreadyFree); FRAME_BATCH_CHUNK];
+        let mut batch_len = 0usize;
         for leaf in leaves[..removed].iter().copied() {
             if in_external_user_segment(leaf.virtual_address, external_segments) {
                 continue;
@@ -1194,21 +1224,27 @@ impl ProcessAddressSpace {
                 leaf.physical_address,
             ) {
                 Some(phys::DataLeafRelease::FrameReusable) => {
-                    frames.push(leaf.physical_address);
+                    batch[batch_len] = PhysAddr::new(leaf.physical_address);
+                    batch_len += 1;
+                    if batch_len == FRAME_BATCH_CHUNK {
+                        let failed =
+                            phys::try_free_frames_batch(&batch[..batch_len], &mut failures);
+                        assert_eq!(failed, 0, "unmap rejected an exactly owned frame batch");
+                        batch_len = 0;
+                    }
                 }
                 Some(phys::DataLeafRelease::FrameRetained) => {}
                 None => panic!("unmapped pager leaf lost exact data descriptor"),
             }
         }
-        free_removed_frames_exact(&frames);
+        if batch_len != 0 {
+            let failed = phys::try_free_frames_batch(&batch[..batch_len], &mut failures);
+            assert_eq!(failed, 0, "unmap rejected an exactly owned frame batch");
+        }
         match failure {
             Some(error) => Err(error),
             None => Ok(unmapped_count),
         }
-    }
-
-    fn pager_fault_leaf_at(&self, virtual_address: u64) -> Option<PagerFaultLeaf> {
-        self.irq_off_pager_fault_leaf_at(VirtAddr::new(virtual_address))
     }
 
     fn pager_fault_leaves_in_range(
@@ -1232,16 +1268,6 @@ impl ProcessAddressSpace {
                 }
             },
         )
-    }
-
-    fn irq_off_pager_fault_leaf_at(&self, virt: VirtAddr) -> Option<PagerFaultLeaf> {
-        let (frame, flags) = self.translate_user_with_flags(virt)?;
-        flags
-            .contains(ROOT_OWNED_USER_LEAF)
-            .then_some(PagerFaultLeaf {
-                virtual_address: virt.as_u64(),
-                physical_address: frame.as_u64(),
-            })
     }
 
     /// Lists every leaf-bearing page-table page that holds at least one
@@ -1504,6 +1530,55 @@ fn scan_present_user_leaves_in_range(
             .ok_or(AddressSpaceError::AddressOverflow)?;
     }
     Ok(leaves)
+}
+
+/// Walks each 2 MiB PT chunk inside `[start, start + page_count * 4 KiB)`,
+/// skipping absent upper paging levels in O(1) per absent span.
+fn for_each_user_pt_chunk_in_range(
+    root_phys: PhysAddr,
+    start: VirtAddr,
+    page_count: usize,
+    mut read_table: impl FnMut(PhysAddr, usize) -> Result<Option<PhysAddr>, AddressSpaceError>,
+    mut on_chunk: impl FnMut(PhysAddr, VirtAddr, usize, usize) -> Result<(), AddressSpaceError>,
+) -> Result<(), AddressSpaceError> {
+    let mut page_index = 0_usize;
+    let mut cached_p4 = usize::MAX;
+    let mut cached_pdpt: Option<PhysAddr> = None;
+    let mut cached_p3 = usize::MAX;
+    let mut cached_pd: Option<PhysAddr> = None;
+    while page_index < page_count {
+        let virt = page_addr(start, page_index)?;
+        let remaining = page_count - page_index;
+        let p4 = p4_index(virt);
+        if p4 != cached_p4 {
+            cached_pdpt = read_table(root_phys, p4)?;
+            cached_p4 = p4;
+            cached_p3 = usize::MAX;
+            cached_pd = None;
+        }
+        let Some(pdpt_phys) = cached_pdpt else {
+            page_index += pages_to_level_boundary(virt, PML4_SHIFT).min(remaining);
+            continue;
+        };
+        let p3 = p3_index(virt);
+        if p3 != cached_p3 {
+            cached_pd = read_table(pdpt_phys, p3)?;
+            cached_p3 = p3;
+        }
+        let Some(pd_phys) = cached_pd else {
+            page_index += pages_to_level_boundary(virt, PDPT_SHIFT).min(remaining);
+            continue;
+        };
+        let Some(pt_phys) = read_table(pd_phys, p2_index(virt))? else {
+            page_index += pages_to_level_boundary(virt, PD_SHIFT).min(remaining);
+            continue;
+        };
+        let first_entry = p1_index(virt);
+        let entries_here = (ENTRIES_PER_TABLE - first_entry).min(remaining);
+        on_chunk(pt_phys, virt, first_entry, entries_here)?;
+        page_index += entries_here;
+    }
+    Ok(())
 }
 
 /// First address past the level-`shift` span containing `virtual_address`.
@@ -1973,5 +2048,39 @@ mod tests {
             pager_fault_range_end(start, 3),
             Ok(USER_SPACE_BASE + 4 * PAGE_4KIB_U64)
         );
+    }
+
+    #[test]
+    fn chunked_pt_walk_skips_absent_levels_and_splits_two_mib_chunks() {
+        // Span 2 MiB + 4 pages starting 1 page before a 2 MiB boundary, with the
+        // second 2 MiB PT absent and the third present.
+        let start = VirtAddr::new(USER_SPACE_BASE + (511 * PAGE_4KIB_U64));
+        let page_count = 1 + 512 + 3;
+        let mut table_reads = 0usize;
+        let mut chunks = Vec::new();
+        for_each_user_pt_chunk_in_range(
+            PhysAddr::new(0x1000),
+            start,
+            page_count,
+            |parent, index| {
+                table_reads += 1;
+                if parent.as_u64() == 0x4000 && index == 1 {
+                    return Ok(None);
+                }
+                Ok(Some(PhysAddr::new(parent.as_u64() + PAGE_4KIB_U64 + (index as u64) * PAGE_4KIB_U64)))
+            },
+            |pt_phys, chunk_virt, first_entry, entries_here| {
+                chunks.push((pt_phys.as_u64(), chunk_virt.as_u64(), first_entry, entries_here));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].1, start.as_u64());
+        assert_eq!((chunks[0].2, chunks[0].3), (511, 1));
+        assert_eq!(chunks[1].1, USER_SPACE_BASE + (1024 * PAGE_4KIB_U64));
+        assert_eq!((chunks[1].2, chunks[1].3), (0, 3));
+        // 1 PML4 + 1 PDPT + 3 PD lookups (never per-page).
+        assert_eq!(table_reads, 5);
     }
 }

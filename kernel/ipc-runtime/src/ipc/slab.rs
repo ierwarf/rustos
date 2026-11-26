@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use nucleus_core::util::cache_padded::CachePadded;
 use nucleus_core::util::lockdep::{MAX_TRACKED_CPUS, TrackedSpinLock, current_cpu_index};
@@ -6,6 +6,7 @@ use nucleus_core::util::lockdep::{MAX_TRACKED_CPUS, TrackedSpinLock, current_cpu
 const INDEX_BITS: u32 = 16;
 const INDEX_MASK: u64 = (1_u64 << INDEX_BITS) - 1;
 const MAX_GENERATION: u64 = u64::MAX >> INDEX_BITS;
+const MAX_OCCUPANCY_WORDS: usize = 16;
 
 struct Slot<T> {
     generation: u64,
@@ -45,16 +46,77 @@ impl<T> Slot<T> {
 /// the pool. One shared cursor took a contended RMW on a single cache line for
 /// every insertion from every CPU, and steered concurrent inserters onto the
 /// same slot locks. Every scan still covers the whole pool.
+// Failure snapshots read the leading slot array by linked symbol and stride.
+#[repr(C)]
 pub(super) struct GenerationalSlab<T, const N: usize, const CLASS: u8> {
     slots: [CacheAligned<TrackedSpinLock<Slot<T>, CLASS>>; N],
+    occupied: [AtomicU64; MAX_OCCUPANCY_WORDS],
     next_hint: [CachePadded<AtomicUsize>; MAX_TRACKED_CPUS],
 }
 
 impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
     pub const fn new() -> Self {
+        assert!(
+            N != 0 && N <= MAX_OCCUPANCY_WORDS * 64 && N < INDEX_MASK as usize,
+            "GenerationalSlab capacity out of supported range"
+        );
         Self {
             slots: [const { CacheAligned(TrackedSpinLock::new(Slot::new())) }; N],
+            occupied: [const { AtomicU64::new(0) }; MAX_OCCUPANCY_WORDS],
             next_hint: Self::initial_hints(),
+        }
+    }
+
+    const fn occupancy_words() -> usize {
+        N.div_ceil(64)
+    }
+
+    fn set_occupied(&self, index: usize) {
+        // ORDERING: Release pairs with the Acquire load in occupied-slot scans;
+        // callers hold the slot lock for `index` across this transition.
+        self.occupied[index / 64].fetch_or(1_u64 << (index % 64), Ordering::Release);
+    }
+
+    fn clear_occupied(&self, index: usize) {
+        // ORDERING: Release pairs with the Acquire load in occupied-slot scans;
+        // callers hold the slot lock for `index` across this transition.
+        self.occupied[index / 64].fetch_and(!(1_u64 << (index % 64)), Ordering::Release);
+    }
+
+    pub fn occupied_count(&self) -> usize {
+        let mut count = 0;
+        for word in &self.occupied[..Self::occupancy_words()] {
+            // ORDERING: Acquire pairs with Release bit updates under slot locks.
+            count += word.load(Ordering::Acquire).count_ones() as usize;
+        }
+        count
+    }
+
+    fn for_each_occupied_index_from(&self, start_index: usize, mut f: impl FnMut(usize) -> bool) {
+        if start_index >= N {
+            return;
+        }
+        let words = Self::occupancy_words();
+        let first_word = start_index / 64;
+        let first_bit = start_index % 64;
+        for word_idx in first_word..words {
+            // ORDERING: Acquire pairs with Release bit updates under slot locks;
+            // every candidate still acquires its slot lock and validates `slot.value`.
+            let mut word = self.occupied[word_idx].load(Ordering::Acquire);
+            if word_idx == first_word && first_bit != 0 {
+                word &= !((1_u64 << first_bit) - 1);
+            }
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                word &= word - 1;
+                let index = word_idx * 64 + bit;
+                if index >= N {
+                    return;
+                }
+                if !f(index) {
+                    return;
+                }
+            }
         }
     }
 
@@ -87,6 +149,7 @@ impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
                 }
                 let handle = slot.handle(index);
                 slot.value = value.take();
+                self.set_occupied(index);
                 Some(handle)
             });
             let Some(handle) = inserted else {
@@ -115,6 +178,7 @@ impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
                 }
                 let handle = slot.handle(index);
                 slot.value = value.take();
+                self.set_occupied(index);
                 Some(handle)
             });
             if let Some(handle) = inserted {
@@ -141,6 +205,7 @@ impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
                 }
                 let handle = slot.handle(index);
                 slot.value = Some((build.take()?)());
+                self.set_occupied(index);
                 Some(handle)
             });
             if inserted.is_some() {
@@ -194,6 +259,28 @@ impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
         handle: u64,
         f: impl FnOnce(&mut T) -> (R, bool),
     ) -> Option<(R, Option<T>)> {
+        self.with_mut_retire_if(handle, false, f)
+    }
+
+    /// Runs `f` against a live slot's value and, when `f` returns `true`,
+    /// removes and retires the slot under the same acquisition, always
+    /// returning the removed value for post-lock cleanup.
+    #[track_caller]
+    pub fn with_mut_remove_if<R>(
+        &self,
+        handle: u64,
+        f: impl FnOnce(&mut T) -> (R, bool),
+    ) -> Option<(R, Option<T>)> {
+        self.with_mut_retire_if(handle, true, f)
+    }
+
+    #[track_caller]
+    fn with_mut_retire_if<R>(
+        &self,
+        handle: u64,
+        return_plain: bool,
+        f: impl FnOnce(&mut T) -> (R, bool),
+    ) -> Option<(R, Option<T>)> {
         let (index, generation) = decode_handle::<N>(handle)?;
         self.with_slot(index, |slot| {
             if slot.generation != generation {
@@ -204,15 +291,17 @@ impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
             if !retire {
                 return Some((result, None));
             }
-            // A value with no destructor has nothing to run after the guard, so
-            // it is retired in place instead of being moved out to be dropped.
-            let retired = if core::mem::needs_drop::<T>() {
+            // For `with_mut_take`, a value with no destructor has nothing to
+            // run after the guard, so it is retired in place instead of being
+            // moved out to be dropped. `with_mut_remove_if` always returns it.
+            let retired = if return_plain || core::mem::needs_drop::<T>() {
                 slot.value.take()
             } else {
                 slot.value = None;
                 None
             };
             slot.retire_generation();
+            self.clear_occupied(index);
             Some((result, retired))
         })
     }
@@ -226,13 +315,16 @@ impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
             }
             let value = slot.value.take()?;
             slot.retire_generation();
+            self.clear_occupied(index);
             Some(value)
         })
     }
 
+    #[cfg(test)]
     #[track_caller]
     pub fn take_first_matching(&self, mut predicate: impl FnMut(&T) -> bool) -> Option<(u64, T)> {
-        for index in 0..N {
+        let mut found = None;
+        self.for_each_occupied_index_from(0, |index| {
             let matched = self.with_slot(index, |slot| {
                 if slot.value.as_ref().is_none_or(|value| !predicate(value)) {
                     return None;
@@ -243,31 +335,74 @@ impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
                     .take()
                     .expect("matching slab slot lost its value");
                 slot.retire_generation();
+                self.clear_occupied(index);
                 Some((handle, value))
             });
-            let Some(matched) = matched else {
-                continue;
-            };
-            return Some(matched);
-        }
-        None
+            if matched.is_some() {
+                found = matched;
+                return false;
+            }
+            true
+        });
+        found
+    }
+
+    /// Removes every currently occupied slot matching `predicate` in one pass,
+    /// invoking `on_removed` after the slot lock has been released.
+    #[track_caller]
+    pub fn drain_matching(
+        &self,
+        mut predicate: impl FnMut(&T) -> bool,
+        mut on_removed: impl FnMut(u64, T),
+    ) {
+        self.for_each_occupied_index_from(0, |index| {
+            let matched = self.with_slot(index, |slot| {
+                if slot.value.as_ref().is_none_or(|value| !predicate(value)) {
+                    return None;
+                }
+                let handle = slot.handle(index);
+                let value = slot
+                    .value
+                    .take()
+                    .expect("matching slab slot lost its value");
+                slot.retire_generation();
+                self.clear_occupied(index);
+                Some((handle, value))
+            });
+            if let Some((handle, value)) = matched {
+                on_removed(handle, value);
+            }
+            true
+        });
     }
 
     #[track_caller]
     pub fn visit_mut(&self, mut visitor: impl FnMut(u64, &mut T)) {
-        for index in 0..N {
+        self.for_each_occupied_index_from(0, |index| {
             self.with_slot(index, |slot| {
                 let handle = slot.handle(index);
                 if let Some(value) = slot.value.as_mut() {
                     visitor(handle, value);
                 }
             });
-        }
+            true
+        });
+    }
+
+    #[cfg(test)]
+    #[track_caller]
+    pub fn find_handle(&self, predicate: impl FnMut(&T) -> bool) -> Option<u64> {
+        self.find_handle_from(0, predicate)
     }
 
     #[track_caller]
-    pub fn find_handle(&self, mut predicate: impl FnMut(&T) -> bool) -> Option<u64> {
-        for index in 0..N {
+    pub fn find_handle_from(
+        &self,
+        start_index: usize,
+        mut predicate: impl FnMut(&T) -> bool,
+    ) -> Option<u64> {
+        let mut found = None;
+        self.for_each_occupied_index_from(start_index, |index| {
             let handle = self.with_slot(index, |slot| {
                 slot.value
                     .as_ref()
@@ -275,24 +410,28 @@ impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
                     .then(|| slot.handle(index))
             });
             if handle.is_some() {
-                return handle;
+                found = handle;
+                return false;
             }
-        }
-        None
+            true
+        });
+        found
     }
 
     #[cfg(test)]
     pub fn clear(&self) {
-        for index in 0..N {
+        self.for_each_occupied_index_from(0, |index| {
             let value = self.with_slot(index, |slot| {
                 let value = slot.value.take();
                 if value.is_some() {
                     slot.retire_generation();
+                    self.clear_occupied(index);
                 }
                 value
             });
             drop(value);
-        }
+            true
+        });
         for (cpu, hint) in self.next_hint.iter().enumerate() {
             hint.store(cpu * N / MAX_TRACKED_CPUS, Ordering::Relaxed);
         }
@@ -447,5 +586,55 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn with_mut_remove_if_always_returns_retired_value_even_without_destructor() {
+        let slab = GenerationalSlab::<u64, 4, TEST_CLASS>::new();
+        let handle = slab.insert(42).unwrap();
+        assert_eq!(
+            slab.with_mut_remove_if(handle, |value| {
+                *value += 1;
+                (*value, false)
+            }),
+            Some((43, None))
+        );
+        assert_eq!(slab.occupied_count(), 1);
+        assert_eq!(
+            slab.with_mut_remove_if(handle, |value| (*value, true)),
+            Some((43, Some(43)))
+        );
+        assert_eq!(slab.occupied_count(), 0);
+        assert_eq!(slab.with(handle, |value| *value), None);
+    }
+
+    #[test]
+    fn occupancy_bitset_tracks_multiword_scans_and_drain_matching() {
+        let slab = GenerationalSlab::<u64, 130, TEST_CLASS>::new();
+        let h0 = slab.insert_with_hint(10, 2).unwrap();
+        let h1 = slab.insert_with_hint(20, 64).unwrap();
+        let h2 = slab.insert_with_hint(30, 129).unwrap();
+        assert_eq!(slab.occupied_count(), 3);
+
+        let mut visited = std::vec::Vec::new();
+        slab.visit_mut(|handle, value| visited.push((handle, *value)));
+        assert_eq!(visited, std::vec![(h0, 10), (h1, 20), (h2, 30)]);
+
+        assert_eq!(slab.find_handle_from(0, |value| *value >= 20), Some(h1));
+        assert_eq!(slab.find_handle_from(65, |value| *value >= 20), Some(h2));
+        assert_eq!(slab.find_handle_from(130, |_| true), None);
+
+        assert_eq!(slab.take_first_matching(|value| *value == 20), Some((h1, 20)));
+        assert_eq!(slab.occupied_count(), 2);
+
+        let mut drained = std::vec::Vec::new();
+        slab.drain_matching(
+            |value| *value != 30,
+            |handle, value| drained.push((handle, value)),
+        );
+        assert_eq!(drained, std::vec![(h0, 10)]);
+        assert_eq!(slab.occupied_count(), 1);
+        assert_eq!(slab.remove(h2), Some(30));
+        assert_eq!(slab.occupied_count(), 0);
     }
 }

@@ -84,6 +84,13 @@ pub(super) fn identity_of(handle: &multitask::KernelHandle) -> Option<AnonStat> 
             nlink: 1,
             size: 0,
         },
+        multitask::KernelHandle::TimerFd(timerfd) => AnonStat {
+            dev: DEV_ANON_INODE,
+            ino: timerfd.token_id(),
+            mode: S_IFREG | 0o600,
+            nlink: 1,
+            size: 0,
+        },
         multitask::KernelHandle::Epoll(epoll) => AnonStat {
             dev: DEV_ANON_INODE,
             ino: epoll.token_id(),

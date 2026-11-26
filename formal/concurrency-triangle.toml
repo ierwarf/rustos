@@ -212,13 +212,13 @@ model = "pager-frame-grant-lifecycle/PagerFrameGrantLifecycle"
 source = "kernel/mm/src/memory/frame_capability.rs"
 source_symbol = "reserve"
 source_anchors = [
-  "available.checked_sub(1)",
-  "let frame_phys = self.frames[index].swap(0, Ordering::AcqRel);",
+  "word.fetch_and(!mask, Ordering::AcqRel) & mask == 0",
+  "let frame = self.frames[index].swap(0, Ordering::AcqRel);",
 ]
-invariant = "the availability count authorizes exactly one claimer per frame and a granted claim always finds one"
+invariant = "clearing a published ready bit authorizes exactly one claimer of its already-filled frame slot"
 loom_test = "two_claimers_never_receive_the_same_reserve_frame"
 shuttle_test = "fault_reserve_claims_are_exclusive_and_never_promise_a_missing_frame"
-herd_not_applicable = "the decisive edge is a single-location locked read-modify-write; x86 guarantees its atomicity by construction, so a litmus has no forbidden interleaving to exhibit and would model the array scan rather than the claim"
+herd_not_applicable = "the claim decision is one locked bit-clear RMW; Loom and Shuttle also check that the exact slot is published before the bit and never consumed twice"
 
 [[scenario]]
 id = "pager-fault-install-permit"

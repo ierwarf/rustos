@@ -728,6 +728,10 @@ fn prepared_reply_bind_rejects_foreign_and_duplicate_owner_without_mutation() {
             super::complete_endpoint_reply_for_process(reply, 10, b"ok"),
             Ok(41)
         );
+        assert_eq!(
+            super::take_endpoint_response_with_handle_limit(reply, 0),
+            Err(IpcError::BufferTooSmall)
+        );
         let (bytes, handles) = super::take_endpoint_response_with_handle_limit(reply, 1)
             .expect("take prepared response")
             .expect("completed response");
@@ -1183,5 +1187,50 @@ fn endpoint_queue_bytes_are_billed_to_the_job_group_and_refunded_on_owner_exit()
         let _ = first;
         super::fail_endpoints_owned_by_process(70, IpcError::PeerClosed);
         assert_eq!(kmem_charge::usage(Class::IpcEndpoint, GROUP), 0);
+    });
+}
+
+#[test]
+fn acquire_shared_region_mapping_on_released_region_does_not_underflow() {
+    with_isolated_ipc_test(|| {
+        let region = create_shared_region(4096).expect("create region");
+        release_shared_region(region);
+        assert!(acquire_shared_region_mapping(region).is_none());
+        assert!(acquire_shared_region_mapping(super::KernelSharedRegionHandle::from_raw(0)).is_none());
+        assert_eq!(service_deferred_shared_region_reclaims(64), 1);
+    });
+}
+
+#[test]
+fn prepared_and_reply_handles_merge_preserving_order_and_limits() {
+    with_isolated_ipc_test(|| {
+        let endpoint = super::create_endpoint_for_process(10).expect("create process endpoint");
+        let (reply, _) =
+            super::enqueue_endpoint_call(endpoint, 41, b"request").expect("enqueue call");
+        let prepared = transferable_file_handle(65);
+        let direct = transferable_file_handle(66);
+        assert_eq!(
+            super::bind_prepared_reply_handles_for_process(reply, 10, alloc::vec![prepared]),
+            Ok(())
+        );
+        let completion = super::complete_endpoint_reply_with_handles_for_process_with_custody(
+            reply,
+            10,
+            b"ok",
+            &[direct],
+        )
+        .expect("complete reply with both prepared and direct handles");
+        assert_eq!(completion.caller_task_id, 41);
+        assert_eq!(
+            super::take_endpoint_response_detailed(reply, 1),
+            Err(IpcError::BufferTooSmall)
+        );
+        assert_eq!(
+            super::take_endpoint_response_detailed(reply, 2),
+            Ok(super::EndpointResponseTake::Response((
+                b"ok".to_vec(),
+                alloc::vec![direct, prepared],
+            )))
+        );
     });
 }

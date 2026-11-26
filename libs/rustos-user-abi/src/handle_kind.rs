@@ -21,6 +21,7 @@ pub const HANDLE_KIND_JOB: u64 = 10;
 pub const HANDLE_KIND_DEVICE_BUFFER: u64 = 11;
 pub const HANDLE_KIND_PIPE: u64 = 12;
 pub const HANDLE_KIND_EVENTFD: u64 = 13;
+pub const HANDLE_KIND_TIMERFD: u64 = 14;
 
 /// Codes that were published and then retired. They stay reserved forever.
 pub const RETIRED_HANDLE_KIND_CODES: &[u64] = &[];
@@ -41,6 +42,7 @@ pub const HANDLE_KINDS: &[(&str, u64)] = &[
     ("DEVICE_BUFFER", HANDLE_KIND_DEVICE_BUFFER),
     ("PIPE", HANDLE_KIND_PIPE),
     ("EVENTFD", HANDLE_KIND_EVENTFD),
+    ("TIMERFD", HANDLE_KIND_TIMERFD),
 ];
 
 #[cfg(test)]

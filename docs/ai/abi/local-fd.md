@@ -1,8 +1,8 @@
-# Kernel-local pipe and eventfd (`pipe`/`pipe2`/`eventfd`/`eventfd2`)
+# Kernel-local pipe, eventfd and timerfd
 
-Linux syscalls 22, 293, 284, 290. Modules: `kernel/ps/src/user/{pipe,eventfd,local_wait}.rs`
-(objects), `kernel/compat/src/user/syscall/linux/service_ops/local_fd.rs` (syscalls, blocking, user copy),
-ABI constants in `libs/rustos-user-abi/src/linux/local_fd.rs`.
+Modules: `kernel/ps/src/user/{pipe,eventfd,timerfd,local_wait}.rs` (objects),
+`kernel/compat/src/user/syscall/linux/service_ops/local_fd.rs` (syscalls, blocking, user copy),
+and `libs/rustos-user-abi/src/linux.rs` (Linux ABI).
 
 ## Owner decision
 
@@ -35,13 +35,21 @@ in a ring-3 service"; revisit only if pipes need names (FIFOs) or policy.
 - Readiness: pipe read end `EPOLLIN` (data), `EPOLLHUP` (no writer); write end
   `EPOLLOUT` (free >= `PIPE_BUF`), `EPOLLERR` (no reader). eventfd `EPOLLIN` if
   counter > 0, `EPOLLOUT` if below max.
+- `timerfd_create` supports monotonic, boottime and realtime clocks, with
+  `TFD_CLOEXEC` and `TFD_NONBLOCK`. `timerfd_settime` supports relative and
+  absolute one-shot or periodic timers; a zero initial value disarms the timer.
+  A read returns an 8-byte expiration count, including elapsed intervals, or
+  blocks/returns `EAGAIN`. Only `EPOLLIN` is advertised when expirations are
+  pending. Readers and poll/epoll use the next deadline rather than a background
+  timer thread. Absolute realtime deadlines are translated at `settime`;
+  clock-set cancellation has no effect because userspace cannot step the clock.
 
 ## Mechanism
 
-- Handle kinds `KernelHandle::{Pipe, EventFd}` (`HANDLE_KIND_PIPE=12`,
-  `HANDLE_KIND_EVENTFD=13`). A pipe can be passed via `SCM_RIGHTS`: the
-  transfer retains the exact endpoint, its access mode, and an in-flight
-  descriptor reference. An eventfd remains non-transferable.
+- Handle kinds `KernelHandle::{Pipe, EventFd, TimerFd}` (`HANDLE_KIND_PIPE=12`,
+  `HANDLE_KIND_EVENTFD=13`, `HANDLE_KIND_TIMERFD=14`). A pipe can be passed via
+  `SCM_RIGHTS`: the transfer retains the exact endpoint, its access mode, and
+  an in-flight descriptor reference. Eventfd and timerfd are non-transferable.
 - Descriptor references are explicit (`try_acquire`/`release`); the last release
   closes the end, wakes peers and unregisters from the `local_wait` registry
   (4096 slots, `LockClass::LocalFdObject`, leaf lock; raw sections are bounded,

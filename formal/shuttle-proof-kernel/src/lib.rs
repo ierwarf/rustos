@@ -129,22 +129,25 @@ mod tests {
 
     /// The wired fault reserve under concurrent claimers and its producer.
     ///
-    /// The availability count is authority: a claimer decrements before it
-    /// scans, so the array can never hand the same frame to two faults, and a
-    /// claimer that won the decrement must find one. Sweeping the array to
-    /// recompute depth - the previous shape - cannot state either property.
+    /// The ready bitmap is authority: a claimer owns the exact advertised
+    /// slot only after successfully clearing its bit.
     #[test]
     fn fault_reserve_claims_are_exclusive_and_never_promise_a_missing_frame() {
         shuttle::check_pct(
             || {
                 const SLOTS: usize = 3;
                 struct Reserve {
-                    available: AtomicUsize,
+                    ready: AtomicUsize,
                     slots: Vec<AtomicUsize>,
                 }
                 let reserve = Arc::new(Reserve {
-                    available: AtomicUsize::new(SLOTS),
-                    slots: (1..=SLOTS).map(AtomicUsize::new).collect(),
+                    ready: AtomicUsize::new((1 << (SLOTS - 1)) - 1),
+                    slots: (1..SLOTS).chain([0]).map(AtomicUsize::new).collect(),
+                });
+                let publisher = Arc::clone(&reserve);
+                let publish = thread::spawn(move || {
+                    publisher.slots[SLOTS - 1].store(SLOTS, Ordering::Relaxed);
+                    publisher.ready.fetch_or(1 << (SLOTS - 1), Ordering::Release);
                 });
                 let claimed = Arc::new(Mutex::new(Vec::new()));
 
@@ -153,36 +156,33 @@ mod tests {
                     let reserve = Arc::clone(&reserve);
                     let claimed = Arc::clone(&claimed);
                     claimers.push(thread::spawn(move || {
-                        let granted = reserve
-                            .available
-                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
-                                available.checked_sub(1)
-                            })
-                            .is_ok();
-                        if !granted {
-                            return;
-                        }
-                        let mut taken = 0;
-                        for slot in &reserve.slots {
-                            let frame = slot.swap(0, Ordering::AcqRel);
-                            if frame != 0 {
-                                taken = frame;
-                                break;
+                        let mut snapshot = reserve.ready.load(Ordering::Relaxed);
+                        while snapshot != 0 {
+                            let index = snapshot.trailing_zeros() as usize;
+                            let mask = 1 << index;
+                            snapshot &= !mask;
+                            if reserve.ready.fetch_and(!mask, Ordering::AcqRel) & mask != 0 {
+                                let taken = reserve.slots[index].swap(0, Ordering::AcqRel);
+                                assert_ne!(taken, 0, "a granted bit must have a frame");
+                                claimed.lock().unwrap().push(taken);
+                                return;
                             }
                         }
-                        assert_ne!(taken, 0, "a claim won the count but found no frame");
-                        claimed.lock().unwrap().push(taken);
                     }));
                 }
                 for claimer in claimers {
                     claimer.join().unwrap();
                 }
+                publish.join().unwrap();
                 let mut frames = claimed.lock().unwrap().clone();
-                let handed_out = frames.len();
+                let ready = reserve.ready.load(Ordering::Relaxed);
+                for (index, slot) in reserve.slots.iter().enumerate() {
+                    if ready & (1 << index) != 0 {
+                        frames.push(slot.load(Ordering::Relaxed));
+                    }
+                }
                 frames.sort_unstable();
-                frames.dedup();
-                assert_eq!(frames.len(), handed_out, "one frame was claimed twice");
-                assert!(handed_out <= SLOTS, "more frames were handed out than exist");
+                assert_eq!(frames, (1..=SLOTS).collect::<Vec<_>>());
             },
             iterations(),
             pct_depth(),

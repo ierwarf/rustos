@@ -801,12 +801,11 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
                 owner_apic_id: current_apic_id(),
                 #[cfg(rustos_boot_image)]
                 acquire_site: Some(acquire_site),
-                // ORDERING: Acquire observes completed guard/pending transitions
-                // before the raw depth this guard must match on release is recorded.
                 // Effective depth adds DispatchPreemption and would mismatch drop_full.
                 #[cfg(rustos_boot_image)]
                 acquire_preemption_depth: CPU_LOCK_STATE[acquire_cpu]
                     .preempt_disable_depth
+                    // ORDERING: Observe completed transitions before recording raw depth.
                     .load(Ordering::Acquire),
                 #[cfg(rustos_boot_image)]
                 irqs_masked: false,
