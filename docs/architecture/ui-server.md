@@ -219,6 +219,91 @@ exact generated/runtime atlas pixel and geometry parity, one-shot promotion,
 custom-font preservation and terminal output reflow. Live first-desktop DVM
 readability and combined retained GPU invalidation remain integration gates.
 
+### Retained rendering and copy budget
+
+The 2026-11-26 optimization batch was reviewed statically only, at the user's
+request. The historical FPS and KVM results elsewhere in this document do not
+validate this batch, and no new speedup or frame-time measurement is claimed.
+
+- **Submission storage:** `GpuCompositor` retains layer, source, command,
+  encoded-byte, and submission-damage allocations. Expired damage-history
+  entries return their allocation to the next frame. `compile_into` invalidates
+  the reusable batch before any fallible work; `encode_into` clears previous
+  bytes and still validates every new wire batch. Cursor-only turns reuse the
+  scene/dock signatures. The mixed window-order visitor has the same
+  stack/focus/popup/drag-icon ordering as the collected rendering plan.
+- **Damage and recovery:** differential atlas damage keeps separate scanline
+  bands within the wire descriptor limit. Excess fragmentation collapses to a
+  conservative bounding rectangle. Both exact-predecessor and older-slot
+  submissions normalize overlaps and obey the 64-rectangle limit. Every
+  scratch reservation includes its transparent padding in `used_height`;
+  rebuilds clear the prior scratch extent and compare the maximum of the old
+  and new extents, including cleared storage. A failed build marks the scratch
+  extent full before it can be reused.
+- **Failed publication:** an incremental patch that falls back to rebuilding
+  may already have changed the local atlas. A rejected GPU submit may likewise
+  have changed pixels without creating an accepted epoch. Either condition
+  forces a complete snapshot into both the next transfer and its accepted
+  damage-history entry. Slot epochs, pending fences, and history advance only
+  after successful submit; compiler admission rolls back on transport failure.
+- **Atlas copies:** tightly packed complete rows form one contiguous transfer;
+  partial rows retain bounded scanline copies. The x86-64 streaming copy has a
+  64-byte loop and one publication `sfence` after all writes, including small
+  scalar writes into the write-combining mapping. In-flight slots remain
+  immutable until their exact completion is consumed.
+- **Window rasterization:** undecorated Wayland fragments copy directly from
+  the immutable owned client snapshot. Console fragments copy only visible
+  source rectangles and apply window alpha using original window coordinates.
+  Uncropped decorated windows rasterize into reserved atlas storage instead of
+  an intermediate full-window image. Partial decorated updates recompose the
+  affected chrome/client region and reapply rounded-corner alpha. A window
+  used as an opaque occluder becoming translucent invalidates the fragment
+  layout before it can hide newly visible content. Cropped decorated scenes
+  still rasterize an independent full window before selecting fragments;
+  translucent updates in that path retain that temporary raster while copying
+  and alpha-converting only changed visible fragments.
+- **Cursor and glass:** cursor raster storage is reused, and the strided API
+  writes only the visible cursor texels in its reserved region. Glass blur's
+  vertical passes use row-major sliding column sums, preserving the original
+  integer rounding and replicated-edge behavior while avoiding column-stride
+  image traversal.
+- **Terminal:** VTE consumes complete output suffixes per call. Scrollback is
+  a bounded FIFO with row-allocation reuse; multi-row scrolls move the live
+  grid once and retain at most the final 256 outgoing rows. Terminal painting
+  clips the cell traversal and pins one font atlas for the whole paint.
+  Asset promotion and the font revision in retained caches remain unchanged.
+- **Pixels:** alpha-mask and premultiplied source-over scanlines have scalar
+  and runtime-gated AVX2 implementations. Transparent/opaque endpoints,
+  `div255_round`, malformed-channel saturation, and the unused BGR high byte
+  retain scalar semantics. The existing CPU/OS AVX2 admission and XSAVE
+  context preservation are prerequisites; no stronger ISA is assumed.
+
+Wayland snapshots continue to use the bounded worker pool and positioned reads
+into compositor-owned storage; client SHM is never mapped. Full-buffer damage
+publishes the fresh complete snapshot instead of cloning an old `Arc` frame and
+then overwriting it. Contiguous damage reads directly into its final allocation;
+padded rows initialize spare capacity with fused XRGB conversion. The vector
+length is published only after every byte/element is initialized. Integer
+viewport crops use row copies; transformed resampling precomputes column
+offsets and reuses repeated sampled rows. Admission limits, release/callback
+ordering, deadlines, and per-client worker fairness remain binding contracts.
+
+Snapshot readiness caches the oldest noncancelled submission time. Submission,
+retirement, and cancellation maintain it under the queue lock, including equal
+timestamps. Completion/callback/release vectors retain capacity only when the
+destination queue is still empty, so recycling cannot overwrite newly arrived
+work. Completing one snapshot wakes one worker for the newly available client
+slot. Worker staging storage clears its live length before enforcing its
+existing retention cap.
+
+References for these mechanisms and their contracts:
+
+- [Wayland damage, commit, buffer release and frame callbacks](https://wayland.freedesktop.org/docs/html/apa.html)
+- [Rust vector capacity and initialized/spare storage](https://doc.rust-lang.org/std/vec/struct.Vec.html)
+- [Rust FIFO operations](https://doc.rust-lang.org/std/collections/vec_deque/struct.VecDeque.html)
+- [VTE 0.15 batch parser API](https://docs.rs/vte/0.15.0/vte/struct.Parser.html)
+- [Non-temporal store synchronization](https://doc.rust-lang.org/core/arch/x86_64/fn._mm_sfence.html)
+
 ### Profile Trace
 
 Set `RUSTOS_UI_PROFILE=1` when profiling is needed to enable
@@ -378,6 +463,32 @@ console surface와 terminal layout을 invalidate합니다. `font::asset_revision
 clock은 처음부터 실제 `SystemTime`에 active `clock.utc_offset_minutes`를
 더합니다. override가 준비되기 전에는 packaged offset을 사용하며 임의의 시각을
 만들지 않습니다. timezone database나 자동 DST 전환은 없습니다.
+
+### 2026-11-26 성능 변경과 검토 범위
+
+이번 변경은 사용자 요청에 따라 **정적 검토만 수행**했습니다. 문서의 과거 FPS,
+KVM 결과는 이번 변경의 검증 결과가 아니며 새로운 성능 향상률은 측정하지 않았습니다.
+
+GPU 명령·인코딩·damage 저장소를 프레임 간 재사용하고, 커서만 움직이는 프레임은
+창 제목과 장면 서명을 다시 계산하지 않습니다. 아틀라스의 변경은 분리된 행 구간으로
+유지하고, wire 한도를 넘을 때만 보수적인 경계 사각형으로 합칩니다. 실제 사용 높이는
+투명 padding을 포함하며, 이전 영역을 지우는 작업도 damage에 포함됩니다.
+
+부분 갱신 도중 전체 재구성으로 바뀌거나 GPU 제출이 거절된 경우, 다음 전체 스냅샷을
+전송뿐 아니라 성공한 damage 이력에도 기록합니다. 이전 슬롯을 재사용할 때 미반영
+픽셀이 되살아나지 않게 하는 계약입니다. 겹친 damage는 정확한 직전 슬롯에서도
+정규화하며, 슬롯의 epoch와 fence는 제출 성공 후에만 진행합니다.
+
+창 조각은 필요한 픽셀만 직접 복사하고 장식·모서리 alpha는 원래 창 좌표로 적용합니다.
+커서는 재사용 캐시에서 strided atlas 영역으로 복사하며, blur는 같은 정수 연산을
+행 순서로 처리합니다. 터미널은 VTE 배치 입력, 스크롤백 행 재사용, 한 번의 화면 이동,
+보이는 셀 순회와 paint당 한 번의 폰트 조회를 사용합니다. AVX2 경로는 기존 CPU/OS
+지원 검사를 유지하고 scalar와 같은 반올림·투명도·포화 규칙을 적용합니다.
+
+Wayland 전체 damage는 새 owned snapshot을 그대로 게시하여 이전 프레임의 복제와
+덮어쓰기를 없앱니다. 연속된 부분 읽기와 viewport 행 재사용도 적용하지만, 클라이언트
+SHM 직접 매핑 금지, 완전 초기화 후 게시, bounded worker와 release/callback 순서는
+유지합니다. 상세 소유권·복구 규칙과 근거 자료는 위 영문 절에 함께 기록했습니다.
 
 ### Profile Trace
 

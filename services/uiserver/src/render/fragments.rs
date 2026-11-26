@@ -1,12 +1,13 @@
 //! Occlusion is source selection, not CPU composition: every fragment still
 //! samples exactly one independently rasterized layer, in original draw order.
 use super::{
-    CroppedConsoleBinding, CroppedWaylandBinding, GpuAtlasScene, PlannedWindow, chrome,
+    CroppedConsoleBinding, CroppedWaylandBinding, GpuAtlasScene, PlannedWindow,
+    apply_atlas_window_fragment_alpha, chrome,
     gpu_window_draw_plan, render_dock_gpu_texture, render_wayland_gpu_texture, taskbar_dirty_rect,
-    wayland_window_client_rect_for, wayland_window_outer_rect,
+    update_gpu_cursor_texture, wayland_window_client_rect_for, wayland_window_outer_rect,
 };
 use crate::app::AppState;
-use crate::canvas::{CURSOR_TEXTURE_SIZE, Rect, render_cursor_bgra};
+use crate::canvas::{CURSOR_TEXTURE_SIZE, Rect};
 use crate::gpu_scene::{
     GpuAtlasPacker, GpuLayerKind, GpuLayerTransform, GpuSceneError, GpuSceneLayer,
     GpuTextureCapability, GpuTextureRegion,
@@ -407,16 +408,9 @@ pub(super) fn build_cropped_gpu_atlas_scene(
     });
     let fragments = visible_fragments(&inputs, output)?;
     let mut packer = GpuAtlasPacker::new(atlas_pixels, atlas_width, atlas_height, atlas_stride)?;
-    let mut cursor = vec![0; CURSOR_TEXTURE_SIZE * CURSOR_TEXTURE_SIZE];
-    if !render_cursor_bgra(&mut cursor, state.cursor_motion) {
-        return Err(GpuSceneError::InvalidLayer);
-    }
-    let cursor_source_rect = packer.place_bgra(
-        &cursor,
-        CURSOR_TEXTURE_SIZE,
-        CURSOR_TEXTURE_SIZE,
-        CURSOR_TEXTURE_SIZE,
-    )?;
+    let cursor_source_rect = packer.reserve(CURSOR_TEXTURE_SIZE, CURSOR_TEXTURE_SIZE)?;
+    let (pixels, stride) = packer.pixels_mut();
+    update_gpu_cursor_texture(pixels, stride, cursor_source_rect, state.cursor_motion)?;
     let (fragments, regions) = reserve_fragments(&mut packer, fragments)?;
     write_fragment_layer(
         &mut packer,
@@ -427,27 +421,47 @@ pub(super) fn build_cropped_gpu_atlas_scene(
         state.desktop_cache.width,
         true,
     )?;
-    // Only one full independent window raster is temporary at any time.
-    let mut console_scratch = Vec::new();
-    let mut wayland_scratch = Vec::new();
-    for (index, planned) in plan.iter().enumerate() {
+    // CSD pixels and console rasters are already owned snapshots. Copy only
+    // their visible fragments; a maximized/occluded window must not allocate
+    // another full raster just to discard its hidden pixels afterwards.
+    for (plan_index, planned) in plan.iter().enumerate() {
         if !fragments
             .iter()
-            .any(|fragment| fragment.layer_index == index + 1)
+            .any(|fragment| fragment.layer_index == plan_index + 1)
         {
             continue;
         }
-        let (width, height, focused, server_decoration, is_console) = match *planned {
+        let (width, height, focused, server_decoration) = match *planned {
             PlannedWindow::Wayland { index, focused } => {
                 let window = &state.wayland_windows[index];
                 let outer = wayland_window_outer_rect(window);
-                wayland_scratch = render_wayland_gpu_texture(window, focused)?;
+                if window.server_decoration {
+                    let pixels = render_wayland_gpu_texture(window, focused)?;
+                    write_fragment_layer(
+                        &mut packer,
+                        &fragments,
+                        &regions,
+                        plan_index + 1,
+                        &pixels,
+                        outer.width,
+                        false,
+                    )?;
+                } else {
+                    write_fragment_layer(
+                        &mut packer,
+                        &fragments,
+                        &regions,
+                        plan_index + 1,
+                        &window.pixels,
+                        window.stride_pixels,
+                        false,
+                    )?;
+                }
                 (
                     outer.width,
                     outer.height,
                     focused,
                     window.server_decoration,
-                    false,
                 )
             }
             PlannedWindow::Console { index, focused } => {
@@ -456,34 +470,40 @@ pub(super) fn build_cropped_gpu_atlas_scene(
                 if !window.surface_cache.valid {
                     return Err(GpuSceneError::SceneNotReady);
                 }
-                console_scratch.clear();
-                console_scratch.extend_from_slice(&window.surface_cache.pixels);
+                write_fragment_layer(
+                    &mut packer,
+                    &fragments,
+                    &regions,
+                    plan_index + 1,
+                    &window.surface_cache.pixels,
+                    window.surface_cache.width,
+                    false,
+                )?;
                 (
                     window.surface_cache.width,
                     window.surface_cache.height,
                     focused,
                     true,
-                    true,
                 )
             }
         };
-        let pixels = if is_console {
-            &mut console_scratch
-        } else {
-            &mut wayland_scratch
-        };
         if server_decoration {
-            chrome::apply_window_texture_alpha(pixels, width, width, height, focused);
+            let (pixels, stride) = packer.pixels_mut();
+            for (fragment, &region) in fragments.iter().zip(&regions) {
+                if fragment.layer_index == plan_index + 1 {
+                    apply_atlas_window_fragment_alpha(
+                        pixels,
+                        stride,
+                        region,
+                        fragment.source,
+                        width,
+                        height,
+                        focused,
+                        false,
+                    )?;
+                }
+            }
         }
-        write_fragment_layer(
-            &mut packer,
-            &fragments,
-            &regions,
-            index + 1,
-            pixels,
-            width,
-            false,
-        )?;
     }
     if !dock_destination.is_empty() {
         let (_, dock) = render_dock_gpu_texture(state)?;

@@ -79,6 +79,12 @@ fn with_atlas<R>(role: FontRole, f: impl FnOnce(&GlyphAtlas) -> R) -> R {
     }
 }
 
+/// Pin one asset revision for an entire terminal paint, avoiding an asset
+/// RwLock acquisition and Arc increment for every populated cell.
+pub(crate) fn with_terminal_atlas<R>(f: impl FnOnce(&GlyphAtlas) -> R) -> R {
+    with_atlas(FontRole::Terminal, f)
+}
+
 pub(crate) fn draw_text_clipped(
     canvas: &mut SurfaceCanvas<'_>,
     x: usize,
@@ -128,18 +134,6 @@ pub(crate) fn text_width(text: &str, style: TextStyle) -> usize {
     })
 }
 
-pub(crate) fn draw_terminal_glyph(
-    canvas: &mut SurfaceCanvas<'_>,
-    x: usize,
-    y: usize,
-    byte: u8,
-    color: u32,
-) {
-    with_atlas(FontRole::Terminal, |atlas| {
-        atlas.blit(canvas, atlas.glyph(byte as char), x, y, color);
-    });
-}
-
 /// Draw one character of `style` at `x`, centered in a cell `cell_width` wide.
 pub(crate) fn draw_glyph_centered(
     canvas: &mut SurfaceCanvas<'_>,
@@ -162,6 +156,17 @@ pub(crate) fn glyph_advance(ch: char, style: TextStyle) -> usize {
 }
 
 impl GlyphAtlas {
+    pub(crate) fn draw_terminal_glyph(
+        &self,
+        canvas: &mut SurfaceCanvas<'_>,
+        x: usize,
+        y: usize,
+        byte: u8,
+        color: u32,
+    ) {
+        self.blit(canvas, self.glyph(byte as char), x, y, color);
+    }
+
     fn glyph(&self, ch: char) -> &GlyphMetrics {
         let index = match ch {
             ' '..='~' => ch as usize - ASCII_START as usize,

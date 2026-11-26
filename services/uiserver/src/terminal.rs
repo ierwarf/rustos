@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use vte::{Params, Parser, Perform};
 
 use crate::canvas::{Rect, SurfaceCanvas};
@@ -128,7 +130,7 @@ pub(crate) struct TerminalState {
     cursor_col: usize,
     cursor_row: usize,
     cells: Vec<TerminalCell>,
-    scrollback: Vec<Vec<TerminalCell>>,
+    scrollback: VecDeque<Vec<TerminalCell>>,
     scroll_offset: usize,
     current_fg: u8,
     current_bg: u8,
@@ -154,7 +156,7 @@ impl TerminalState {
             cursor_col: 0,
             cursor_row: 0,
             cells: vec![TerminalCell::BLANK; MAX_CONSOLE_CELLS],
-            scrollback: Vec::new(),
+            scrollback: VecDeque::new(),
             scroll_offset: 0,
             current_fg: 0,
             current_bg: 0,
@@ -182,16 +184,12 @@ impl TerminalState {
         // over the new suffix and update focus.
         if layout_unchanged && bytes.len() >= self.parsed_byte_count {
             self.focused = focused;
-            for &byte in &bytes[self.parsed_byte_count..] {
-                self.advance_parser(byte);
-            }
+            self.advance_parser(&bytes[self.parsed_byte_count..]);
             self.parsed_byte_count = bytes.len();
             return;
         }
         self.reset(layout, focused);
-        for &byte in bytes {
-            self.advance_parser(byte);
-        }
+        self.advance_parser(bytes);
         self.parsed_byte_count = bytes.len();
     }
 
@@ -275,7 +273,9 @@ impl TerminalState {
         if !self.initialized || self.scroll_offset != 0 || self.layout.cols == 0 || self.layout.rows == 0 {
             return;
         }
-        self.render_cell(canvas, self.cursor_row, self.cursor_col, true);
+        font::with_terminal_atlas(|atlas| {
+            self.render_cell(canvas, atlas, self.cursor_row, self.cursor_col, true);
+        });
     }
 
     pub(crate) fn render(&self, canvas: &mut SurfaceCanvas<'_>) {
@@ -285,11 +285,30 @@ impl TerminalState {
 
         canvas.fill_rect(self.layout.bounds, terminal_background_color());
 
-        for row in 0..self.layout.rows {
-            for col in 0..self.layout.cols {
-                self.render_cell(canvas, row, col, false);
-            }
+        let (grid_x, grid_y) = self.layout.cell_origin(0, 0);
+        let grid = Rect {
+            x: grid_x,
+            y: grid_y,
+            width: self.layout.cols * self.layout.cell_width,
+            height: self.layout.rows * self.layout.cell_height,
+        };
+        let visible = grid.intersect(canvas.clip_rect());
+        if visible.is_empty() {
+            return;
         }
+        let start_col = (visible.x - grid_x) / self.layout.cell_width;
+        let start_row = (visible.y - grid_y) / self.layout.cell_height;
+        let end_col = ((visible.x - grid_x + visible.width - 1) / self.layout.cell_width + 1)
+            .min(self.layout.cols);
+        let end_row = ((visible.y - grid_y + visible.height - 1) / self.layout.cell_height + 1)
+            .min(self.layout.rows);
+        font::with_terminal_atlas(|atlas| {
+            for row in start_row..end_row {
+                for col in start_col..end_col {
+                    self.render_cell(canvas, atlas, row, col, false);
+                }
+            }
+        });
     }
 
     fn reset(&mut self, layout: TerminalLayout, focused: bool) {
@@ -310,9 +329,15 @@ impl TerminalState {
         self.parsed_byte_count = 0;
     }
 
-    fn advance_parser(&mut self, byte: u8) {
+    fn advance_parser(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        // VTE 0.15 accepts complete byte slices and preserves partial UTF-8,
+        // CSI and OSC state across calls. Move its sizeable parser state once
+        // per output batch, not once per byte; no Perform callback replaces it.
         let mut parser = core::mem::take(&mut self.parser);
-        parser.advance(self, core::slice::from_ref(&byte));
+        parser.advance(self, bytes);
         self.parser = parser;
     }
 
@@ -357,18 +382,10 @@ impl TerminalState {
             return;
         }
 
-        let mut remaining = count;
-        while remaining != 0 {
-            if self.cursor_col != 0 {
-                self.cursor_col -= 1;
-            } else if self.cursor_row != 0 {
-                self.cursor_row -= 1;
-                self.cursor_col = self.layout.cols - 1;
-            } else {
-                break;
-            }
-            remaining -= 1;
-        }
+        let position = self.cursor_row * self.layout.cols + self.cursor_col;
+        let next = position.saturating_sub(count);
+        self.cursor_row = next / self.layout.cols;
+        self.cursor_col = next % self.layout.cols;
     }
 
     fn move_cursor_forward(&mut self, count: usize) {
@@ -376,18 +393,12 @@ impl TerminalState {
             return;
         }
 
-        let mut remaining = count;
-        while remaining != 0 {
-            if self.cursor_col + 1 < self.layout.cols {
-                self.cursor_col += 1;
-            } else if self.cursor_row + 1 < self.layout.rows {
-                self.cursor_row += 1;
-                self.cursor_col = 0;
-            } else {
-                break;
-            }
-            remaining -= 1;
-        }
+        let position = self.cursor_row * self.layout.cols + self.cursor_col;
+        let next = position
+            .saturating_add(count)
+            .min(self.layout.rows * self.layout.cols - 1);
+        self.cursor_row = next / self.layout.cols;
+        self.cursor_col = next % self.layout.cols;
     }
 
     fn backspace(&mut self) {
@@ -414,40 +425,53 @@ impl TerminalState {
     }
 
     fn scroll_up(&mut self) {
-        if self.layout.rows <= 1 || self.layout.cols == 0 {
-            return;
-        }
-
-        let row_width = self.layout.cols;
-        if row_width > 0 {
-            let line = self.cells[..row_width].to_vec();
-            if self.scrollback.len() >= MAX_SCROLLBACK_LINES {
-                self.scrollback.remove(0);
-            }
-            self.scrollback.push(line);
-        }
-        for row in 1..self.layout.rows {
-            let src = row * row_width;
-            let dst = (row - 1) * row_width;
-            let end = src + row_width;
-            self.cells.copy_within(src..end, dst);
-        }
-
-        let last_row_start = (self.layout.rows - 1) * row_width;
-        self.cells[last_row_start..last_row_start + row_width].fill(TerminalCell::BLANK);
+        self.scroll_up_lines(1);
     }
 
-    fn scroll_down(&mut self) {
-        if self.layout.rows <= 1 || self.layout.cols == 0 {
+    fn scroll_up_lines(&mut self, count: usize) {
+        if self.layout.rows <= 1 || self.layout.cols == 0 || count == 0 {
+            return;
+        }
+
+        let row_width = self.layout.cols;
+        // Once history is full, recycle its oldest allocation in O(1). The
+        // layout reset clears history, so every retained line has this width.
+        // Only the final history-sized suffix can survive a large CSI scroll;
+        // rows leaving beyond the live grid are blank. Capture them before the
+        // single overlapping grid copy rather than moving the grid per row.
+        for row in count.saturating_sub(MAX_SCROLLBACK_LINES)..count {
+            let mut line = if self.scrollback.len() >= MAX_SCROLLBACK_LINES {
+                self.scrollback
+                    .pop_front()
+                    .expect("full scrollback has a first row")
+            } else {
+                Vec::with_capacity(row_width)
+            };
+            line.clear();
+            if row < self.layout.rows {
+                let start = row * row_width;
+                line.extend_from_slice(&self.cells[start..start + row_width]);
+            } else {
+                line.resize(row_width, TerminalCell::BLANK);
+            }
+            self.scrollback.push_back(line);
+        }
+
+        let total = self.layout.rows * row_width;
+        let removed = count.min(self.layout.rows) * row_width;
+        self.cells.copy_within(removed..total, 0);
+        self.cells[total - removed..total].fill(TerminalCell::BLANK);
+    }
+
+    fn scroll_down_lines(&mut self, count: usize) {
+        if self.layout.rows <= 1 || self.layout.cols == 0 || count == 0 {
             return;
         }
         let row_width = self.layout.cols;
-        for row in (1..self.layout.rows).rev() {
-            let src = (row - 1) * row_width;
-            let dst = row * row_width;
-            self.cells.copy_within(src..src + row_width, dst);
-        }
-        self.cells[..row_width].fill(TerminalCell::BLANK);
+        let total = self.layout.rows * row_width;
+        let added = count.min(self.layout.rows) * row_width;
+        self.cells.copy_within(0..total - added, added);
+        self.cells[..added].fill(TerminalCell::BLANK);
     }
 
     fn erase_display(&mut self, mode: usize) {
@@ -554,6 +578,7 @@ impl TerminalState {
     fn render_cell(
         &self,
         canvas: &mut SurfaceCanvas<'_>,
+        atlas: &font::GlyphAtlas,
         row: usize,
         col: usize,
         paint_background: bool,
@@ -569,7 +594,7 @@ impl TerminalState {
 
         if cell.ch != b' ' {
             let fg = cell_color(cell.fg, terminal_foreground());
-            font::draw_terminal_glyph(canvas, cell_rect.x, cell_rect.y, cell.ch, fg);
+            atlas.draw_terminal_glyph(canvas, cell_rect.x, cell_rect.y, cell.ch, fg);
         }
 
         if self.scroll_offset == 0
@@ -645,16 +670,8 @@ impl Perform for TerminalState {
             }
             'J' => self.erase_display(first),
             'K' => self.erase_line(first),
-            'S' => {
-                for _ in 0..count {
-                    self.scroll_up();
-                }
-            }
-            'T' => {
-                for _ in 0..count {
-                    self.scroll_down();
-                }
-            }
+            'S' => self.scroll_up_lines(count),
+            'T' => self.scroll_down_lines(count),
             'm' => self.apply_sgr(params),
             _ => {}
         }
@@ -763,5 +780,154 @@ mod tests {
         assert_eq!(terminal.visible_cell(0, 0).ch, b'o');
         assert_eq!(terminal.visible_cell(0, 1).ch, b'k');
         assert_eq!(terminal.visible_cell(0, 2).ch, b' ');
+    }
+
+    #[test]
+    fn batched_parser_preserves_escape_and_utf8_state_at_every_split() {
+        let layout = TerminalLayout {
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 60,
+            },
+            cols: 8,
+            rows: 3,
+            padding_x: 0,
+            padding_y: 0,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let bytes = b"one\x1b[31mRED\x1b[0m\n\xe2\x82\xac\x1b]0;title\x07two\x1b[2D!\nlast";
+        let mut whole = TerminalState::new();
+        whole.rebuild_with_layout(layout, true, bytes);
+        for split in 0..=bytes.len() {
+            let mut chunks = TerminalState::new();
+            chunks.rebuild_with_layout(layout, true, &bytes[..split]);
+            chunks.rebuild_with_layout(layout, true, bytes);
+            assert_eq!(chunks.cells, whole.cells, "split={split}");
+            assert_eq!(chunks.scrollback, whole.scrollback, "split={split}");
+            assert_eq!(
+                (chunks.cursor_row, chunks.cursor_col, chunks.current_fg),
+                (whole.cursor_row, whole.cursor_col, whole.current_fg),
+                "split={split}",
+            );
+        }
+    }
+
+    #[test]
+    fn full_scrollback_recycles_oldest_row_and_preserves_fifo_order() {
+        let layout = TerminalLayout {
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 40,
+            },
+            cols: 4,
+            rows: 2,
+            padding_x: 0,
+            padding_y: 0,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let mut terminal = TerminalState::new();
+        terminal.reset(layout, true);
+        for i in 0..MAX_SCROLLBACK_LINES {
+            terminal.cells[0].ch = b'A' + (i % 26) as u8;
+            terminal.scroll_up();
+        }
+        let first_allocation = terminal.scrollback.front().unwrap().as_ptr();
+        terminal.cells[0].ch = b'!';
+        terminal.scroll_up();
+        assert_eq!(terminal.scrollback.len(), MAX_SCROLLBACK_LINES);
+        assert_eq!(terminal.scrollback.front().unwrap()[0].ch, b'B');
+        assert_eq!(terminal.scrollback.back().unwrap()[0].ch, b'!');
+        assert_eq!(terminal.scrollback.back().unwrap().as_ptr(), first_allocation);
+        assert!(terminal.cells[..layout.cols * layout.rows]
+            .iter()
+            .all(|cell| *cell == TerminalCell::BLANK));
+    }
+
+    #[test]
+    fn bulk_scroll_keeps_surviving_rows_and_only_retained_history() {
+        let layout = TerminalLayout {
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 80,
+            },
+            cols: 4,
+            rows: 4,
+            padding_x: 0,
+            padding_y: 0,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let mut terminal = TerminalState::new();
+        terminal.reset(layout, true);
+        for row in 0..4 {
+            terminal.cells[row * 4].ch = b'A' + row as u8;
+        }
+        terminal.scroll_up_lines(2);
+        assert_eq!(terminal.scrollback[0][0].ch, b'A');
+        assert_eq!(terminal.scrollback[1][0].ch, b'B');
+        assert_eq!(terminal.cells[0].ch, b'C');
+        assert_eq!(terminal.cells[4].ch, b'D');
+        assert_eq!(terminal.cells[8].ch, b' ');
+        terminal.scroll_down_lines(3);
+        assert_eq!(terminal.cells[0].ch, b' ');
+        assert_eq!(terminal.cells[8].ch, b' ');
+        assert_eq!(terminal.cells[12].ch, b'C');
+        terminal.scroll_up_lines(u16::MAX as usize);
+        assert_eq!(terminal.scrollback.len(), MAX_SCROLLBACK_LINES);
+        assert!(terminal.scrollback.iter().flatten().all(|cell| *cell == TerminalCell::BLANK));
+        assert!(terminal.cells[..16].iter().all(|cell| *cell == TerminalCell::BLANK));
+    }
+
+    #[test]
+    fn clipped_terminal_paint_matches_full_paint_inside_damage() {
+        let width = 300;
+        let height = 160;
+        let layout = TerminalLayout::for_client_rect(Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        });
+        let mut terminal = TerminalState::new();
+        terminal.rebuild_with_layout(layout, true, b"hello\x1b[44mworld\nsecond row");
+        let mut full = vec![0xdead_beef; width * height];
+        terminal.render(&mut SurfaceCanvas::new(
+            &mut full,
+            width as u32,
+            height as u32,
+            width,
+        ));
+        let damage = Rect {
+            x: layout.padding_x + layout.cell_width / 2,
+            y: layout.padding_y + layout.cell_height / 2,
+            width: layout.cell_width * 3 + 1,
+            height: layout.cell_height + 1,
+        };
+        let mut partial = vec![0xdead_beef; width * height];
+        terminal.render(&mut SurfaceCanvas::with_clip(
+            &mut partial,
+            width as u32,
+            height as u32,
+            width,
+            damage,
+        ));
+        for y in 0..height {
+            for x in 0..width {
+                let expected = if damage.contains(x as u32, y as u32) {
+                    full[y * width + x]
+                } else {
+                    0xdead_beef
+                };
+                assert_eq!(partial[y * width + x], expected, "x={x} y={y}");
+            }
+        }
     }
 }

@@ -90,7 +90,37 @@ pub(crate) struct GpuSceneBatch {
 }
 
 impl GpuSceneBatch {
+    /// Reusable staging storage. The zero output/timeline values deliberately
+    /// fail wire validation until a successful compilation replaces them.
+    pub(crate) fn empty() -> Self {
+        Self {
+            header: DvmGpuRenderBatchHeader {
+                command_count: 0,
+                context_id: 0,
+                context_epoch: 0,
+                submit_value: 0,
+                acquire_value: 0,
+                budget_us: 0,
+                source_count: 0,
+                flags: 0,
+            },
+            sources: Vec::new(),
+            commands: Vec::new(),
+            output_width: 0,
+            output_height: 0,
+        }
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>, GpuSceneError> {
+        let mut bytes = Vec::new();
+        self.encode_into(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Preserve the allocation across submissions without weakening the wire
+    /// validation performed for every new batch.
+    pub(crate) fn encode_into(&self, bytes: &mut Vec<u8>) -> Result<(), GpuSceneError> {
+        bytes.clear();
         let expected = self
             .header
             .encoded_batch_len()
@@ -104,7 +134,7 @@ impl GpuSceneBatch {
         ) {
             return Err(GpuSceneError::InvalidContract);
         }
-        let mut bytes = Vec::with_capacity(expected);
+        bytes.reserve(expected);
         bytes.extend_from_slice(&self.header.encode());
         for source in &self.sources {
             bytes.extend_from_slice(&source.encode());
@@ -115,7 +145,7 @@ impl GpuSceneBatch {
         if bytes.len() != expected {
             return Err(GpuSceneError::InvalidContract);
         }
-        Ok(bytes)
+        Ok(())
     }
 }
 
@@ -248,6 +278,7 @@ impl<'a> GpuAtlasPacker<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn place_bgra(
         &mut self,
         source: &[u32],
@@ -588,6 +619,32 @@ impl GpuSceneCompiler {
         clear_rgba: u32,
         layers: &[GpuSceneLayer],
     ) -> Result<GpuSceneBatch, GpuSceneError> {
+        let mut batch = GpuSceneBatch::empty();
+        self.compile_into(
+            output_width,
+            output_height,
+            acquire_value,
+            clear_rgba,
+            layers,
+            &mut batch,
+        )?;
+        Ok(batch)
+    }
+
+    pub(crate) fn compile_into(
+        &mut self,
+        output_width: u32,
+        output_height: u32,
+        acquire_value: u64,
+        clear_rgba: u32,
+        layers: &[GpuSceneLayer],
+        batch: &mut GpuSceneBatch,
+    ) -> Result<(), GpuSceneError> {
+        // A rejected compilation must never leave an older batch encodable.
+        batch.output_width = 0;
+        batch.output_height = 0;
+        batch.sources.clear();
+        batch.commands.clear();
         if output_width == 0 || output_height == 0 || acquire_value == 0 || self.next_submit == 0 {
             return Err(GpuSceneError::InvalidOutput);
         }
@@ -599,8 +656,10 @@ impl GpuSceneCompiler {
             return Err(GpuSceneError::CommandLimit);
         }
 
-        let mut sources = Vec::with_capacity(layers.len().min(DVM_GPU_RENDER_MAX_SOURCES as usize));
-        let mut commands = Vec::with_capacity(command_count);
+        let sources = &mut batch.sources;
+        let commands = &mut batch.commands;
+        sources.reserve(layers.len().min(DVM_GPU_RENDER_MAX_SOURCES as usize));
+        commands.reserve(command_count);
         commands.push(clear_command(clear_rgba));
         for layer in layers {
             // A layer that has been dragged entirely off the output contributes
@@ -619,7 +678,7 @@ impl GpuSceneCompiler {
                     None,
                 )?,
                 GpuLayerKind::Texture { region } => {
-                    let source_index = bind_source(&mut sources, region.atlas, acquire_value)?;
+                    let source_index = bind_source(sources, region.atlas, acquire_value)?;
                     let source_rect = normalized_source_rect(region)?;
                     layer_command(
                         *layer,
@@ -647,7 +706,7 @@ impl GpuSceneCompiler {
             source_count: sources.len() as u32,
             flags: DVM_GPU_RENDER_FLAG_PRESENT_ON_COMPLETE,
         };
-        if !dvm_gpu_render_batch_is_valid(header, &sources, &commands, output_width, output_height)
+        if !dvm_gpu_render_batch_is_valid(header, sources, commands, output_width, output_height)
         {
             return Err(GpuSceneError::InvalidContract);
         }
@@ -657,13 +716,10 @@ impl GpuSceneCompiler {
             .ok_or(GpuSceneError::Timeline(DvmGpuTimelineError::TimelineOrder))?;
         self.timeline.admit(header)?;
         self.next_submit = following_submit;
-        Ok(GpuSceneBatch {
-            header,
-            sources,
-            commands,
-            output_width,
-            output_height,
-        })
+        batch.header = header;
+        batch.output_width = output_width;
+        batch.output_height = output_height;
+        Ok(())
     }
 
     pub(crate) fn checkpoint(&self) -> GpuSceneCheckpoint {
@@ -1123,6 +1179,52 @@ mod tests {
             batch.encode().unwrap().len(),
             batch.header.encoded_batch_len().unwrap()
         );
+    }
+
+    #[test]
+    fn reusable_batches_replace_old_commands_and_invalidate_rejected_encoding() {
+        let mut compiler = ready_compiler();
+        let checkpoint = compiler.checkpoint();
+        let source = texture(0x103, 2);
+        let mut batch = GpuSceneBatch::empty();
+        let mut bytes = Vec::new();
+        compiler
+            .compile_into(
+                1280,
+                720,
+                1,
+                0xff00_0000,
+                &[layer(source, 10), layer(source, 400)],
+                &mut batch,
+            )
+            .unwrap();
+        batch.encode_into(&mut bytes).unwrap();
+        let capacities = (batch.sources.capacity(), batch.commands.capacity(), bytes.capacity());
+
+        // Retrying a rejected submit uses the same serial but a smaller scene.
+        // No command or trailing encoded bytes from the first attempt survive.
+        compiler.restore_rejected_submit(checkpoint);
+        compiler
+            .compile_into(1280, 720, 1, 0xff00_0000, &[layer(source, 10)], &mut batch)
+            .unwrap();
+        batch.encode_into(&mut bytes).unwrap();
+        let reference = ready_compiler()
+            .compile(1280, 720, 1, 0xff00_0000, &[layer(source, 10)])
+            .unwrap();
+        assert_eq!(bytes, reference.encode().unwrap());
+        assert_eq!(batch.commands.len(), 2);
+        assert_eq!(
+            (batch.sources.capacity(), batch.commands.capacity(), bytes.capacity()),
+            capacities,
+        );
+
+        compiler.restore_rejected_submit(checkpoint);
+        assert_eq!(
+            compiler.compile_into(0, 720, 1, 0, &[], &mut batch),
+            Err(GpuSceneError::InvalidOutput),
+        );
+        assert_eq!(batch.encode_into(&mut bytes), Err(GpuSceneError::InvalidContract));
+        assert!(bytes.is_empty(), "a rejected scene cannot reuse a previous wire batch");
     }
 
     #[test]

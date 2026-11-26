@@ -6,6 +6,41 @@ stable repository prefix; use [task router](task-router.md) for owner contracts.
 Historical entries prior to 2026-11-25 live in `git log` (e.g.
 `git show HEAD:docs/ai/session-handoff.md`).
 
+## UI performance batch (2026-11-26, static review only)
+
+User requested aggressive `uiserver` optimization informed by web references,
+static review without compilation/tests/KVM/formal runs, then one final commit
+and push. Base: `1d489bbd848044ef30f188202c6f2dbe8245b32a` (`master`).
+
+- Implemented retained GPU submission/encoding/damage storage; cursor-only
+  signature reuse; allocation-free mixed-order visitation; CPU-only damage
+  strip preparation; actual cropped-atlas extent tracking; bounded differential
+  damage bands; contiguous atlas copies and explicit WC publication fencing.
+- Fixed recovery damage loss: partial-patch-to-rebuild fallback and rejected
+  submissions require full transfer **and full accepted history** before older
+  slots can be reconstructed. Exact-predecessor damage is overlap/count
+  normalized too. Reusable command buffers cannot encode a failed compilation.
+- Removed full-window staging where direct atlas/fragment painting suffices;
+  preserved original rounded-window coordinates and translucent client
+  recomposition. Cursor caches and strided atlas writes retain allocations;
+  glass blur uses row-major sums with unchanged integer semantics.
+- Added exact runtime-gated AVX2 alpha-mask/source-over rows; corrected existing
+  solid-blend high-byte disagreement. Terminal parsing is batched, scrollback
+  allocations recycle, bulk scrolls move once, and clipped painting pins one
+  font atlas per paint.
+- Wayland full damage replaces owned snapshots instead of copying over old
+  frames. Tight reads target final storage; padded conversion initializes spare
+  capacity; viewport sampling reuses row/column work. Completion/callback
+  storage recycles, oldest-job readiness is cached, and scratch caps now apply
+  after clearing live length. Hostile-SHM and worker admission contracts remain.
+- Owner documentation: `docs/architecture/ui-server.md`. Formal source anchors
+  track production conversion/differencing and the new single expiry predicate.
+- Review: independent cross-review of rendering, SIMD/terminal, Wayland worker
+  ownership, GPU rollback/damage history, and stack ordering; source-only
+  regression cases accompany the substantive changes. No compile, test,
+  benchmark, KVM, or formal-run result is claimed. Performance magnitude and
+  live Chrome/window-resize/transparent-composition behavior remain unmeasured.
+
 ## Current state (2026-11-25, uncommitted on `master`)
 
 ### Completed in this wave

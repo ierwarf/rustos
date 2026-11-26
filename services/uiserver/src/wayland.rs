@@ -723,23 +723,39 @@ impl WaylandCompositor {
     }
 }
 
-/// Decode one validated Wayland shm row. RustOS' supported architecture is
-/// little-endian, so ARGB8888 bytes already have the native `u32` layout.
-/// XRGB8888 needs only the alpha byte forced opaque; process four pixels per
-/// iteration without an allocation or per-channel reconstruction.
+#[cfg(test)]
 fn copy_wayland_bgra_row(src: &[u8], dst: &mut [u32], has_alpha: bool) -> bool {
-    if src.len() != dst.len().saturating_mul(4) {
+    // SAFETY: MaybeUninit<u32> has the same layout as u32, and the row helper
+    // either rejects the layout without writing or initializes every slot.
+    let dst = unsafe {
+        std::slice::from_raw_parts_mut(
+            dst.as_mut_ptr().cast::<std::mem::MaybeUninit<u32>>(),
+            dst.len(),
+        )
+    };
+    copy_wayland_bgra_row_uninit(src, dst, has_alpha)
+}
+
+/// Decode directly into uninitialized owned storage. ARGB8888 already has
+/// RustOS' native little-endian layout; XRGB8888 combines the copy and alpha
+/// normalization in one pass, without clearing or rereading the destination.
+fn copy_wayland_bgra_row_uninit(
+    src: &[u8],
+    dst: &mut [std::mem::MaybeUninit<u32>],
+    has_alpha: bool,
+) -> bool {
+    if dst.len().checked_mul(4) != Some(src.len()) {
         return false;
     }
-    // SAFETY: `src.len() == dst.len() * 4` is checked above; `src` and `dst`
-    // are non-overlapping slices and every bit pattern of `u32` is valid on
-    // little-endian RustOS.
-    unsafe {
-        std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<u8>(), src.len());
-    }
-    if !has_alpha {
-        for pixel in dst.iter_mut() {
-            *pixel |= 0xff00_0000;
+    if has_alpha {
+        // SAFETY: the slices are disjoint and the exact byte length was
+        // checked above. This initializes every destination slot.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<u8>(), src.len());
+        }
+    } else {
+        for (bytes, pixel) in src.chunks_exact(4).zip(dst.iter_mut()) {
+            pixel.write(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) | 0xff00_0000);
         }
     }
     true

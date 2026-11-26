@@ -471,22 +471,7 @@ impl<'a> SurfaceCanvas<'a> {
             let Some(dst) = self.pixels.get_mut(dest..dest_end) else {
                 return;
             };
-            for (dst, &pixel) in dst.iter_mut().zip(src_row) {
-                if pixel == 0 {
-                    continue;
-                }
-                let a = pixel >> 24;
-                if a == 255 {
-                    *dst = pixel & 0x00ff_ffff;
-                    continue;
-                }
-                let inv = 255 - a;
-                let dst_pixel = *dst;
-                let out_r = ((pixel >> 16) & 255) + div255_round(((dst_pixel >> 16) & 255) * inv);
-                let out_g = ((pixel >> 8) & 255) + div255_round(((dst_pixel >> 8) & 255) * inv);
-                let out_b = (pixel & 255) + div255_round((dst_pixel & 255) * inv);
-                *dst = (out_r.min(255) << 16) | (out_g.min(255) << 8) | out_b.min(255);
-            }
+            simd::blend_premultiplied_bgr(src_row, dst);
         }
     }
 
@@ -524,11 +509,6 @@ impl<'a> SurfaceCanvas<'a> {
         let src_x = dst_rect.x.saturating_sub(dst_x);
         let src_y = dst_rect.y.saturating_sub(dst_y);
 
-        let src_r = (color >> 16) & 0xff;
-        let src_g = (color >> 8) & 0xff;
-        let src_b = color & 0xff;
-        let opaque_color = color;
-
         // Row-based access: take one slice per row so the inner loop only
         // sees plain index iteration without per-pixel bounds checks. With
         // ~470 k iterations per shadow blit this used to dominate the drag
@@ -553,22 +533,7 @@ impl<'a> SurfaceCanvas<'a> {
             else {
                 return;
             };
-            for (dst_pixel, &alpha_value) in dst_row.iter_mut().zip(src_row.iter()) {
-                if alpha_value == 0 {
-                    continue;
-                }
-                if alpha_value == u8::MAX {
-                    *dst_pixel = opaque_color;
-                    continue;
-                }
-                let a = u32::from(alpha_value);
-                let inv = 255 - a;
-                let dst_v = *dst_pixel;
-                let out_r = div255_round(src_r * a + ((dst_v >> 16) & 0xff) * inv);
-                let out_g = div255_round(src_g * a + ((dst_v >> 8) & 0xff) * inv);
-                let out_b = div255_round(src_b * a + (dst_v & 0xff) * inv);
-                *dst_pixel = (out_r << 16) | (out_g << 8) | out_b;
-            }
+            simd::blend_alpha_mask_bgr(src_row, dst_row, color);
         }
     }
 
@@ -631,35 +596,85 @@ type CursorRasterKey = (usize, i32, i32);
 static CURSOR_RASTER_CACHE: std::sync::Mutex<Option<(CursorRasterKey, Vec<u32>)>> =
     std::sync::Mutex::new(None);
 
+#[cfg(test)]
 pub(crate) fn render_cursor_bgra(pixels: &mut [u32], motion: CursorMotion) -> bool {
     if pixels.len() != CURSOR_TEXTURE_SIZE * CURSOR_TEXTURE_SIZE {
+        return false;
+    }
+    render_cursor_bgra_strided(pixels, CURSOR_TEXTURE_SIZE, motion)
+}
+
+/// Paint into an atlas region without a temporary packed image. Only the
+/// CURSOR_TEXTURE_SIZE visible pixels of each row are touched; padding and
+/// adjacent atlas regions remain intact. The final row need not have padding.
+pub(crate) fn render_cursor_bgra_strided(
+    pixels: &mut [u32],
+    stride_pixels: usize,
+    motion: CursorMotion,
+) -> bool {
+    if stride_pixels < CURSOR_TEXTURE_SIZE {
+        return false;
+    }
+    let Some(required) = stride_pixels
+        .checked_mul(CURSOR_TEXTURE_SIZE - 1)
+        .and_then(|prefix| prefix.checked_add(CURSOR_TEXTURE_SIZE))
+    else {
+        return false;
+    };
+    if pixels.len() < required {
         return false;
     }
     let sprite_index = (motion.sprite_index as usize).min(CURSOR_SPRITE_MAX_DISTANCE as usize);
     let (cos_fp, sin_fp) = cursor_motion_rotation(motion);
     let key = (sprite_index, cos_fp, sin_fp);
-    if let Ok(cache) = CURSOR_RASTER_CACHE.lock() {
-        if let Some((cached_key, cached)) = cache.as_ref() {
-            if *cached_key == key {
-                pixels.copy_from_slice(cached);
-                return true;
+    if let Ok(mut cache) = CURSOR_RASTER_CACHE.lock() {
+        let (cached_key, cached) = cache.get_or_insert_with(|| {
+            (
+                (usize::MAX, 0, 0),
+                vec![0; CURSOR_TEXTURE_SIZE * CURSOR_TEXTURE_SIZE],
+            )
+        });
+        if *cached_key != key {
+            *cached_key = (usize::MAX, 0, 0);
+            if !rasterize_cursor_bgra(cached, CURSOR_TEXTURE_SIZE, motion) {
+                return false;
+            }
+            *cached_key = key;
+        }
+        if stride_pixels == CURSOR_TEXTURE_SIZE {
+            simd::copy_u32s(cached, &mut pixels[..required]);
+        } else {
+            for row in 0..CURSOR_TEXTURE_SIZE {
+                let src = row * CURSOR_TEXTURE_SIZE;
+                let dst = row * stride_pixels;
+                simd::copy_u32s(
+                    &cached[src..src + CURSOR_TEXTURE_SIZE],
+                    &mut pixels[dst..dst + CURSOR_TEXTURE_SIZE],
+                );
             }
         }
+        return true;
     }
-    pixels.fill(0);
+    // Preserve the uncached rendering path if another caller poisoned the cache.
+    rasterize_cursor_bgra(pixels, stride_pixels, motion)
+}
+
+fn rasterize_cursor_bgra(
+    pixels: &mut [u32],
+    stride_pixels: usize,
+    motion: CursorMotion,
+) -> bool {
+    for row in 0..CURSOR_TEXTURE_SIZE {
+        let start = row * stride_pixels;
+        pixels[start..start + CURSOR_TEXTURE_SIZE].fill(0);
+    }
     let radius = CURSOR_VISUAL_RADIUS as i32;
-    let rendered = for_each_cursor_pixel(motion, |local_x, local_y, blue_alpha, white_alpha| {
+    for_each_cursor_pixel(motion, |local_x, local_y, blue_alpha, white_alpha| {
         let index =
-            (local_y + radius) as usize * CURSOR_TEXTURE_SIZE + (local_x + radius) as usize;
+            (local_y + radius) as usize * stride_pixels + (local_x + radius) as usize;
         premultiplied_source_over(&mut pixels[index], COLOR_CURSOR_BLUE, blue_alpha);
         premultiplied_source_over(&mut pixels[index], COLOR_CURSOR_WHITE, white_alpha);
-    });
-    if rendered {
-        if let Ok(mut cache) = CURSOR_RASTER_CACHE.lock() {
-            *cache = Some((key, pixels.to_vec()));
-        }
-    }
-    rendered
+    })
 }
 
 fn for_each_cursor_pixel(
@@ -946,6 +961,33 @@ fn sanitized_surface_geometry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strided_cursor_matches_packed_pixels_without_touching_padding() {
+        let mut packed = vec![0; CURSOR_TEXTURE_SIZE * CURSOR_TEXTURE_SIZE];
+        let motion = CursorMotion::stationary();
+        assert!(render_cursor_bgra(&mut packed, motion));
+        let stride = CURSOR_TEXTURE_SIZE + 19;
+        let required = stride * (CURSOR_TEXTURE_SIZE - 1) + CURSOR_TEXTURE_SIZE;
+        let mut strided = vec![0xdead_beef; required + 11];
+        assert!(render_cursor_bgra_strided(&mut strided, stride, motion));
+        for row in 0..CURSOR_TEXTURE_SIZE {
+            let start = row * stride;
+            assert_eq!(
+                &strided[start..start + CURSOR_TEXTURE_SIZE],
+                &packed[row * CURSOR_TEXTURE_SIZE..(row + 1) * CURSOR_TEXTURE_SIZE],
+            );
+            let padding_end = ((row + 1) * stride).min(strided.len());
+            assert!(strided[start + CURSOR_TEXTURE_SIZE..padding_end]
+                .iter()
+                .all(|pixel| *pixel == 0xdead_beef));
+        }
+        let before = strided.clone();
+        assert!(!render_cursor_bgra_strided(&mut strided[..required - 1], stride, motion));
+        assert_eq!(strided, before);
+        assert!(!render_cursor_bgra_strided(&mut strided, usize::MAX, motion));
+        assert_eq!(strided, before);
+    }
 
     #[test]
     fn cursor_texture_scales_sprite_one_point_five_times_with_navy_and_white_center() {

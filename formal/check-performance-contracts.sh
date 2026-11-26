@@ -465,7 +465,8 @@ rg -Fq '.include_cursor(self.cursor_x, self.cursor_y)' "$wayclick" || {
     echo "WayClick pointer motion lost its bounded damage accumulator" >&2
     exit 1
 }
-rg -Fq 'copy_wayland_bgra_row(' services/uiserver/src/wayland.rs || {
+rg -Fq 'copy_wayland_bgra_row_uninit(src, dst, has_alpha)' \
+    services/uiserver/src/wayland/snapshot.rs || {
     echo "Wayland shm rows regained per-channel scalar reconstruction" >&2
     exit 1
 }
@@ -617,7 +618,8 @@ for witness in \
         exit 1
     }
 done
-rg -Fq 'difference_bounds(' services/uiserver/src/gpu_runtime.rs || {
+rg -Uq 'difference_damage_into\(\s*self\.atlas\.as_slice\(\),' \
+    services/uiserver/src/gpu_runtime.rs || {
     echo "uiserver topology rebuild lost retained-atlas differential damage" >&2
     exit 1
 }

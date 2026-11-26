@@ -95,24 +95,49 @@ pub(super) fn apply_viewport(
     if width == 0 || height == 0 {
         return Err(ViewportError::OutOfBuffer);
     }
+    // Integer, unscaled crops need no sampling table or per-pixel gather.
+    // An explicitly configured identity viewport can keep the same Arc too.
+    if sx.fract() == 0.0 && sy.fract() == 0.0 && sw == dw as f64 && sh == dh as f64 {
+        if sx == 0.0 && sy == 0.0 && dw == width && dh == height {
+            return Ok(None);
+        }
+        let mut out = Vec::new();
+        out.try_reserve_exact(count)
+            .map_err(|_| ViewportError::BadSize)?;
+        for row in sy as usize..sy as usize + dh {
+            let start = row * width + sx as usize;
+            out.extend_from_slice(&pixels[start..start + dw]);
+        }
+        return Ok(Some((out, dw, dh)));
+    }
     let mut out = Vec::new();
     if out.try_reserve_exact(count).is_err() {
         return Err(ViewportError::BadSize);
     }
     // The column mapping is the same for every row; compute it once instead
     // of one f64 divide per output pixel.
-    let columns: Vec<usize> = (0..dw)
-        .map(|dx| {
-            let src_x = (sx + (dx as f64 + 0.5) * sw / dw as f64).floor();
-            (src_x.max(0.0) as usize).min(width - 1)
-        })
-        .collect();
+    let mut columns = Vec::new();
+    columns.try_reserve_exact(dw)
+        .map_err(|_| ViewportError::BadSize)?;
+    for dx in 0..dw {
+        let src_x = (sx + (dx as f64 + 0.5) * sw / dw as f64).floor();
+        columns.push((src_x.max(0.0) as usize).min(width - 1));
+    }
+    let mut previous_row = None;
     for dy in 0..dh {
         // Sample at the centre of each destination pixel.
         let src_y = (sy + (dy as f64 + 0.5) * sh / dh as f64).floor();
         let src_y = (src_y.max(0.0) as usize).min(height - 1);
+        if previous_row == Some(src_y) {
+            // Upscaling frequently repeats an entire sampled row. Its pixels
+            // are already owned and initialized, so copy the finished row.
+            let start = out.len() - dw;
+            out.extend_from_within(start..start + dw);
+            continue;
+        }
         let row = &pixels[src_y * width..(src_y + 1) * width];
         out.extend(columns.iter().map(|&src_x| row[src_x]));
+        previous_row = Some(src_y);
     }
     Ok(Some((out, dw, dh)))
 }
@@ -152,8 +177,11 @@ pub(super) fn map_buffer_for_output(
     // Rejecting them posts a fatal wl_surface.invalid_size that kills the whole
     // client, so a partial trailing pixel column/row is rounded up to one
     // logical unit instead; the sampling clamp below repeats the edge pixel.
-    if scale == 0 {
+    if scale == 0 || mapping.transform > 7 {
         return Err(ViewportError::BufferSize);
+    }
+    if width == 0 || height == 0 || width.checked_mul(height) != Some(pixels.len()) {
+        return Err(ViewportError::OutOfBuffer);
     }
     if mapping.transform == 0
         && scale == output_scale
@@ -164,9 +192,6 @@ pub(super) fn map_buffer_for_output(
     }
     if mapping.transform == 0 && scale == 1 && output_scale == 1 {
         return apply_viewport(pixels, width, height, viewport);
-    }
-    if pixels.len() != width.saturating_mul(height) {
-        return Err(ViewportError::OutOfBuffer);
     }
     let rotated = matches!(mapping.transform, 1 | 3 | 5 | 7);
     let (tw, th) = if rotated {
@@ -204,33 +229,45 @@ pub(super) fn map_buffer_for_output(
     // client; the column mapping is row-invariant, so compute it once instead
     // of two f64 divides per output pixel (8M pixels on a full-screen 2x
     // output).
-    let columns: Vec<usize> = (0..dw)
-        .map(|x| {
-            let tx = ((sx + (x as f64 + 0.5) * cw / dw as f64) * scale as f64)
-                .floor()
-                .max(0.0) as usize;
-            tx.min(tw.saturating_sub(1))
-        })
-        .collect();
+    let mut columns = Vec::new();
+    columns.try_reserve_exact(dw)
+        .map_err(|_| ViewportError::BadSize)?;
+    for x in 0..dw {
+        let tx = ((sx + (x as f64 + 0.5) * cw / dw as f64) * scale as f64)
+            .floor()
+            .max(0.0) as usize;
+        let tx = tx.min(tw - 1);
+        // Each inverse transform separates into a row base plus a column
+        // offset. Resolve it here once per column, rather than branching and
+        // multiplying for every destination pixel.
+        columns.push(match mapping.transform {
+            0 | 6 => tx,
+            1 | 7 => (height - 1 - tx) * width,
+            2 | 4 => width - 1 - tx,
+            3 | 5 => tx * width,
+            _ => unreachable!(),
+        });
+    }
+    let mut previous_row = None;
     for y in 0..dh {
         let ty = ((sy + (y as f64 + 0.5) * ch / dh as f64) * scale as f64)
             .floor()
             .max(0.0) as usize;
-        let ty = ty.min(th.saturating_sub(1));
-        for &tx in &columns {
-            let (bx, by) = match mapping.transform {
-                0 => (tx, ty),
-                1 => (ty, height - 1 - tx),
-                2 => (width - 1 - tx, height - 1 - ty),
-                3 => (width - 1 - ty, tx),
-                4 => (width - 1 - tx, ty),
-                5 => (ty, tx),
-                6 => (tx, height - 1 - ty),
-                7 => (width - 1 - ty, height - 1 - tx),
-                _ => return Err(ViewportError::BufferSize),
-            };
-            out.push(pixels[by * width + bx]);
+        let ty = ty.min(th - 1);
+        if previous_row == Some(ty) {
+            let start = out.len() - dw;
+            out.extend_from_within(start..start + dw);
+            continue;
         }
+        let base = match mapping.transform {
+            0 | 4 => ty * width,
+            1 | 5 => ty,
+            2 | 6 => (height - 1 - ty) * width,
+            3 | 7 => width - 1 - ty,
+            _ => unreachable!(),
+        };
+        out.extend(columns.iter().map(|&offset| pixels[base + offset]));
+        previous_row = Some(ty);
     }
     Ok(Some((out, dw, dh)))
 }

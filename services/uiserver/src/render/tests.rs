@@ -195,6 +195,7 @@ fn translucent_csd_wayland_damage_copies_in_place() {
         &window,
         window.damage,
         true,
+        false,
     )
     .expect("valid damage")
     .expect("csd translucent damage uses partial copy");
@@ -208,6 +209,106 @@ fn translucent_csd_wayland_damage_copies_in_place() {
         }
     );
     assert_eq!(atlas[damage.y * stride + damage.x], 0x7f00_0001);
+}
+
+#[test]
+fn opaque_client_damage_preserves_rounded_corner_alpha() {
+    let (width, height) = (64, 48);
+    let mut window = snapshot(vec![0xff20_3040; width * height], Rect::empty());
+    window.width = width;
+    window.height = height;
+    window.stride_pixels = width;
+    window.frame.width = width;
+    window.frame.height = height;
+    let outer = wayland_window_outer_rect(&window);
+    let mut original = super::render_wayland_gpu_texture(&window, true).unwrap();
+    super::chrome::apply_window_texture_alpha(
+        &mut original, outer.width, outer.width, outer.height, true,
+    );
+    let source_rect = Rect { x: 3, y: 4, width: outer.width, height: outer.height };
+    let stride = outer.width + 10;
+    let mut atlas = vec![0xdead_beef; stride * (outer.height + 8)];
+    for row in 0..outer.height {
+        let start = (source_rect.y + row) * stride + source_rect.x;
+        atlas[start..start + outer.width]
+            .copy_from_slice(&original[row * outer.width..(row + 1) * outer.width]);
+    }
+    let client_damage = Rect { x: 0, y: height - 5, width: 5, height: 5 };
+    let pixels = Arc::make_mut(&mut window.pixels);
+    for y in client_damage.y..client_damage.y + client_damage.height {
+        pixels[y * width..y * width + client_damage.width].fill(0xff90_7050);
+    }
+    let mut expected = super::render_wayland_gpu_texture(&window, true).unwrap();
+    super::chrome::apply_window_texture_alpha(
+        &mut expected, outer.width, outer.width, outer.height, true,
+    );
+    copy_wayland_damage_to_atlas(
+        &mut atlas, stride, source_rect, &window, client_damage, false, true,
+    ).unwrap().expect("opaque client uses a retained patch");
+    for row in 0..outer.height {
+        let start = (source_rect.y + row) * stride + source_rect.x;
+        assert_eq!(
+            &atlas[start..start + outer.width],
+            &expected[row * outer.width..(row + 1) * outer.width],
+            "partial update must exactly match a full raster, row {row}",
+        );
+    }
+}
+
+#[test]
+fn direct_ssd_raster_matches_the_staged_texture_and_preserves_atlas_neighbours() {
+    let (width, height) = (64, 48);
+    let mut window = snapshot(vec![0x7f20_3040; width * height], Rect::empty());
+    window.width = width;
+    window.height = height;
+    window.stride_pixels = width;
+    window.frame.width = width;
+    window.frame.height = height;
+    let outer = wayland_window_outer_rect(&window);
+    let mut expected = super::render_wayland_gpu_texture(&window, true).unwrap();
+    super::chrome::apply_window_texture_alpha(
+        &mut expected, outer.width, outer.width, outer.height, true,
+    );
+    let region = Rect { x: 3, y: 4, width: outer.width, height: outer.height };
+    let stride = outer.width + 10;
+    let mut atlas = vec![0xdead_beef; stride * (outer.height + 8)];
+    super::render_wayland_gpu_texture_at(&mut atlas, stride, region, &window, true).unwrap();
+    for y in 0..atlas.len() / stride {
+        for x in 0..stride {
+            let pixel = atlas[y * stride + x];
+            if region.contains(x as u32, y as u32) {
+                assert_eq!(pixel, expected[(y - region.y) * outer.width + x - region.x]);
+            } else {
+                assert_eq!(pixel, 0xdead_beef, "unrelated atlas pixel ({x}, {y})");
+            }
+        }
+    }
+    let before = atlas.clone();
+    Arc::make_mut(&mut window.pixels)[5 * width + 3] = 0x3010_1010;
+    let client = super::wayland_window_client_rect_for(
+        &window, Rect { x: 0, y: 0, width: outer.width, height: outer.height },
+    );
+    let local_damage = Rect { x: client.x + 3, y: client.y + 5, width: 1, height: 1 };
+    let damage = super::render_wayland_gpu_texture_region_at(
+        &mut atlas, stride, region, &window, true, local_damage,
+    ).unwrap();
+    let mut expected = super::render_wayland_gpu_texture(&window, true).unwrap();
+    super::chrome::apply_window_texture_alpha(
+        &mut expected, outer.width, outer.width, outer.height, true,
+    );
+    assert_eq!(damage, Rect {
+        x: region.x + local_damage.x,
+        y: region.y + local_damage.y,
+        width: 1,
+        height: 1,
+    });
+    for (index, (&new, &old)) in atlas.iter().zip(&before).enumerate() {
+        if index == damage.y * stride + damage.x {
+            assert_eq!(new, expected[local_damage.y * outer.width + local_damage.x]);
+        } else {
+            assert_eq!(new, old, "translucent SSD patch touched an undamaged texel");
+        }
+    }
 }
 
 #[test]

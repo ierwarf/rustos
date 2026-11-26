@@ -864,9 +864,11 @@ impl WaylandState {
     /// One UI-thread turn of snapshot bookkeeping: apply finished reads and
     /// fail the commits whose read outlived its budget.
     pub(super) fn pump_snapshots(&mut self) {
-        for completion in self.snapshots.take_completions() {
+        let mut completions = self.snapshots.take_completions();
+        for completion in completions.drain(..) {
             self.complete_commit(completion);
         }
+        self.snapshots.recycle_completions(completions);
         for expired in self.snapshots.reap_expired() {
             let Some((_, flight)) = self.take_in_flight(expired) else {
                 continue;
@@ -879,7 +881,7 @@ impl WaylandState {
     }
 
     pub(super) fn snapshots_need_service(&self) -> bool {
-        self.snapshots.has_completions() || self.snapshots.expiry_due()
+        self.snapshots.needs_service()
     }
 }
 
