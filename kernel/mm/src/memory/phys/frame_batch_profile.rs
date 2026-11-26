@@ -134,7 +134,7 @@ pub(super) fn drain(now_tick: u64, window_ticks: u64) -> usize {
         "frame-batch-rollback-failure",
         &FRAME_BATCH_PROFILE.rollback_failures,
     );
-    emitted
+    emitted + super::drain_frame_scan_profile()
 }
 
 #[cfg(test)]

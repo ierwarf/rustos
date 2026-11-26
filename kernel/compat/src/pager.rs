@@ -867,7 +867,7 @@ fn populate_run_under_permit(
     region_end: u64,
     run_pages: u32,
 ) -> u64 {
-    use rustos_user_abi::pager::PAGER_PAGE_BYTES;
+    use rustos_user_abi::pager::{PAGER_FAULT_RUN_PAGES_MAX, PAGER_PAGE_BYTES};
 
     // Align the run down to its own size, the way Linux picks an mTHP folio:
     // `ALIGN_DOWN(address, PAGE_SIZE << order)`. Running forward from wherever
@@ -899,55 +899,75 @@ fn populate_run_under_permit(
         return 0;
     }
 
+    // Surplus pages must keep working when the reserve is low, but consuming
+    // that reserve for every neighbour makes a 16-page run drain it sixteen
+    // times faster than demand alone. Supply the same policy-bounded run with
+    // one user-class batch; the wired pool remains for demand and table pages.
+    const MAX: usize = PAGER_FAULT_RUN_PAGES_MAX as usize;
+    let wanted = (((last - first) / PAGER_PAGE_BYTES) as usize).saturating_sub(1).min(MAX - 1);
+    if wanted == 0 {
+        return 0;
+    }
+    let mut frames = [PhysAddr::new(0); MAX];
+    let supplied = mm_api::frame_capability::allocate_zeroed_frames_batch(&mut frames[..wanted]);
+    let mut unused = [PhysAddr::new(0); MAX];
+    let mut unused_len = 0;
     let flags = page_flags(prot);
+    let populated = install_fault_around_batch(
+        first,
+        last,
+        request.virtual_address,
+        &frames[..supplied],
+        |address, frame| {
+            mm_api::paging::map_current_prepared_pager_fault_frame_at(
+                VirtAddr::new(address), frame.as_u64(), flags,
+            ).map_err(|_| ())
+        },
+        |frame| {
+            unused[unused_len] = frame;
+            unused_len += 1;
+        },
+    );
+    if unused_len != 0 {
+        let mut failures = [(PhysAddr::new(0), mm_api::phys::FreeFrameError::AlreadyFree); MAX];
+        assert_eq!(mm_api::phys::try_free_frames_batch(&unused[..unused_len], &mut failures), 0,
+            "anonymous fault-around lost an unpublished frame");
+    }
+    populated
+}
+
+/// Every supplied frame is either installed once or returned once, including
+/// an unattempted suffix after a map refusal. An already-present neighbour is
+/// an ordinary CAS loss, so the rest of the admitted block may still populate.
+fn install_fault_around_batch(
+    first: u64,
+    last: u64,
+    fault: u64,
+    frames: &[PhysAddr],
+    mut install: impl FnMut(u64, PhysAddr) -> Result<bool, ()>,
+    mut release: impl FnMut(PhysAddr),
+) -> u64 {
+    use rustos_user_abi::pager::PAGER_PAGE_BYTES;
+    let mut consumed = 0;
     let mut populated = 0;
     let mut address = first;
-    while address < last {
-        if address == request.virtual_address {
-            address = address.saturating_add(PAGER_PAGE_BYTES);
-            continue;
-        }
-        // Same two-source supply as the faulting page: the reserve is the
-        // lock-free fast path, the allocator is the supply.
-        //
-        // Restricting the run to the reserve alone was tried and reverted. It
-        // reads as the conservative choice - best-effort pages should not take
-        // an allocator lock with interrupts disabled - but it inverts under
-        // load. The reserve is emptiest exactly when the fault rate is highest,
-        // so the run went dead precisely when it was worth most: measured, a
-        // boot fell from 11.3 pages per fault to 0.001, and the faults it
-        // stopped amortizing tripled to 4 059, which drained the reserve
-        // harder still. The run must degrade with supply, not switch off.
-        let Some(frame) = mm_api::frame_capability::take_pager_fault_frame()
-            .or_else(mm_api::frame_capability::allocate_zeroed_frame)
-        else {
-            break;
-        };
-        let installed = mm_api::paging::map_current_prepared_pager_fault_frame_at(
-            VirtAddr::new(address),
-            frame.as_u64(),
-            flags,
-        );
-        match installed {
-            Ok(true) => populated += 1,
-            // Already present. Inside an aligned block that is an ordinary
-            // partially-populated block, not a reason to abandon the rest of
-            // it, so return the frame and keep going.
-            Ok(false) => {
-                if !mm_api::frame_capability::return_pager_fault_frame(frame) {
-                    mm_api::phys::free_frame(frame);
+    while address < last && consumed < frames.len() {
+        if address != fault {
+            let frame = frames[consumed];
+            consumed += 1;
+            match install(address, frame) {
+                Ok(true) => populated += 1,
+                Ok(false) => release(frame),
+                Err(()) => {
+                    release(frame);
+                    break;
                 }
             }
-            // The prepared leaf is gone. This fault has stopped proving
-            // anything about the rest of the block; end the run.
-            Err(_) => {
-                if !mm_api::frame_capability::return_pager_fault_frame(frame) {
-                    mm_api::phys::free_frame(frame);
-                }
-                break;
-            }
         }
-        address = address.saturating_add(PAGER_PAGE_BYTES);
+        address += PAGER_PAGE_BYTES;
+    }
+    for &frame in &frames[consumed..] {
+        release(frame);
     }
     populated
 }
@@ -1302,6 +1322,53 @@ mod tests {
         PAGER_FAULT_ABI_VERSION, PagerEndpointCapabilityWire, PagerFaultRequestWire,
         PagerObjectIdentityWire, VM_ACCESS_READ, VM_OBJECT_ANONYMOUS, VM_PROT_READ,
     };
+
+    #[test]
+    fn fault_around_batch_returns_cas_losers_and_the_unattempted_suffix_once() {
+        use x86_64::PhysAddr;
+        const PAGE: u64 = rustos_user_abi::pager::PAGER_PAGE_BYTES;
+        let frames = [10, 11, 12, 13].map(|frame| PhysAddr::new(frame * PAGE));
+        let mut attempted = alloc::vec::Vec::new();
+        let mut released = alloc::vec::Vec::new();
+        let installed = super::install_fault_around_batch(
+            PAGE, 6 * PAGE, 3 * PAGE, &frames,
+            |address, frame| {
+                attempted.push((address, frame));
+                match attempted.len() {
+                    1 => Ok(true),
+                    2 => Ok(false),
+                    _ => Err(()),
+                }
+            },
+            |frame| released.push(frame),
+        );
+        assert_eq!(installed, 1);
+        assert_eq!(attempted, [(PAGE, frames[0]), (2 * PAGE, frames[1]), (4 * PAGE, frames[2])]);
+        assert_eq!(released, frames[1..]);
+    }
+
+    #[test]
+    fn fault_around_batch_accepts_short_supply_and_skips_the_demand_page() {
+        use x86_64::PhysAddr;
+        const PAGE: u64 = rustos_user_abi::pager::PAGER_PAGE_BYTES;
+        let frames = [PhysAddr::new(10 * PAGE), PhysAddr::new(11 * PAGE)];
+        let mut attempted = alloc::vec::Vec::new();
+        let installed = super::install_fault_around_batch(
+            PAGE, 17 * PAGE, PAGE, &frames,
+            |address, frame| {
+                attempted.push((address, frame));
+                Ok(true)
+            },
+            |_| panic!("an installed frame must not be returned"),
+        );
+        assert_eq!(installed, 2);
+        assert_eq!(attempted, [(2 * PAGE, frames[0]), (3 * PAGE, frames[1])]);
+        assert_eq!(super::install_fault_around_batch(
+            PAGE, 17 * PAGE, PAGE, &[],
+            |_, _| panic!("empty supply cannot install"),
+            |_| panic!("empty supply cannot release"),
+        ), 0);
+    }
 
     #[test]
     fn anon_huge_requires_one_complete_writable_private_committed_block() {

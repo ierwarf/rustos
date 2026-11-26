@@ -571,7 +571,7 @@ impl PhysPool {
 mod tests {
     extern crate std;
     use super::*;
-    use crate::memory::phys::tests::test_state;
+    use crate::memory::phys::tests::{assert_index_matches_bitmap, test_state};
     use crate::memory::phys::{BITS_PER_WORD, BitmapView};
 
     /// A leaked pool over `frames` frames. Leaking keeps the bitmap alive for
@@ -616,6 +616,7 @@ mod tests {
         assert_eq!(pool.free_total(), frames);
         let state = pool.state.lock();
         assert_eq!(state.free_frames, frames);
+        assert_index_matches_bitmap(&state);
         for frame in 0..frames {
             assert!(!state.is_used(frame), "frame {frame} leaked in used bitmap");
             assert!(!state.geo.cached.get(frame), "frame {frame} stuck cached");
@@ -765,6 +766,7 @@ mod tests {
             .expect("cached frames must be reclaimed");
         assert_ne!(run.as_u64(), held.as_u64());
         assert_eq!(pool.free_total(), 0);
+        assert_index_matches_bitmap(&pool.state.lock());
         for offset in 0..63 {
             free_one(pool, 0, PhysAddr::new(run.as_u64() + offset * PAGE_SIZE)).unwrap();
         }

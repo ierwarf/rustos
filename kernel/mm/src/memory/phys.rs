@@ -36,6 +36,49 @@ const PAGE_SIZE: u64 = 4096;
 const BITS_PER_WORD: usize = 64;
 const MAX_USABLE_RANGES: usize = 128;
 const PHYS_ALLOC_SCAN_MILESTONE_FRAMES: usize = 64 * 1024;
+const PHYS_ALLOC_SCAN_MILESTONE_WORDS: usize = PHYS_ALLOC_SCAN_MILESTONE_FRAMES / BITS_PER_WORD;
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum FrameScanKind {
+    Independent = 1,
+    CacheRefill = 2,
+    Contiguous = 3,
+}
+
+#[derive(Default)]
+struct FrameScanWork {
+    bitmap_words: usize,
+    index_words: usize,
+}
+
+#[derive(Clone, Copy)]
+struct FrameScanProfile {
+    scans: u64,
+    distance_sum: u64,
+    bitmap_words: u64,
+    index_words: u64,
+    max_distance: usize,
+    sample_pages: usize,
+    sample_free: usize,
+    sample_bitmap_words: usize,
+    sample_index_words: usize,
+}
+
+impl FrameScanProfile {
+    const EMPTY: Self = Self {
+        scans: 0,
+        distance_sum: 0,
+        bitmap_words: 0,
+        index_words: 0,
+        max_distance: 0,
+        sample_pages: 0,
+        sample_free: 0,
+        sample_bitmap_words: 0,
+        sample_index_words: 0,
+    };
+}
+
 /// Floor and ceiling of the kernel-only reserve: 1 MiB to 64 MiB.
 const MIN_FREE_FLOOR_FRAMES: usize = 256;
 const MIN_FREE_CEILING_FRAMES: usize = 16 * 1024;
@@ -95,7 +138,9 @@ use frame_descriptor_ledger::{CowMappingRecord, FRAME_DESCRIPTORS, FrameDescript
 
 mod frame_batch_profile;
 mod frame_cache;
+mod free_word_index;
 use frame_cache::{FRAME_CACHE_SLOTS, PHYS_POOL, frame_cache_params};
+use free_word_index::FreeWordIndex;
 
 #[inline]
 fn irq_safe<T>(f: impl FnOnce() -> T) -> T {
@@ -143,6 +188,11 @@ struct PhysAllocatorState {
     /// Independent scan cursor so a failed huge-page probe does not repeatedly
     /// rescan the same fragmented prefix or move the ordinary-frame cursor.
     huge_next_block: usize,
+    /// Exact non-full-word hierarchy, mutated only with the central bitmap.
+    free_words: FreeWordIndex,
+    /// Diagnostic-only windows, copied by housekeeping without rendering under
+    /// the allocator lock. One row per FrameScanKind; no hot-path sink calls.
+    scan_profiles: [FrameScanProfile; 3],
 }
 
 // SAFETY: the state is reachable only through the pool's central lock, whose
@@ -256,7 +306,7 @@ struct Geometry {
     usable_ranges: [UsableFrameRange; MAX_USABLE_RANGES],
     usable_range_count: usize,
     bitmap_phys_start: u64,
-    /// Pages of both bitmaps (`used` then `cached`).
+    /// Pages of both bitmaps (`used` then `cached`) and the free-word index.
     bitmap_page_count: usize,
     used: BitmapView,
     cached: BitmapView,
@@ -338,23 +388,32 @@ impl PhysAllocatorState {
             min_free_frames: 0,
             next_hint: 0,
             huge_next_block: 1,
+            free_words: FreeWordIndex::EMPTY,
+            scan_profiles: [FrameScanProfile::EMPTY; 3],
         }
     }
 
     fn set_used(&mut self, frame_index: usize) {
         let word_index = frame_index / BITS_PER_WORD;
         let word = self.geo.used.load_word(word_index);
-        self.geo
-            .used
-            .store_word(word_index, word | (1_u64 << (frame_index % BITS_PER_WORD)));
+        self.store_used_word(word_index, word, word | (1_u64 << (frame_index % BITS_PER_WORD)));
     }
 
     fn set_free(&mut self, frame_index: usize) {
         let word_index = frame_index / BITS_PER_WORD;
         let word = self.geo.used.load_word(word_index);
-        self.geo
-            .used
-            .store_word(word_index, word & !(1_u64 << (frame_index % BITS_PER_WORD)));
+        self.store_used_word(word_index, word, word & !(1_u64 << (frame_index % BITS_PER_WORD)));
+    }
+
+    /// All central bitmap writes pass here, including cache refill/drain and
+    /// fixed/huge claims. Higher levels change only on full/non-full edges,
+    /// so consuming another free bit in the same word adds no index traffic.
+    #[inline]
+    fn store_used_word(&mut self, index: usize, before: u64, after: u64) {
+        self.geo.used.store_word(index, after);
+        if (before == u64::MAX) != (after == u64::MAX) {
+            self.free_words.set_available(index, after != u64::MAX);
+        }
     }
 
     fn is_used(&self, frame_index: usize) -> bool {
@@ -378,7 +437,7 @@ impl PhysAllocatorState {
                 ((1_u64 << bits) - 1) << bit_index
             };
             let word = bitmap.load_word(word_index);
-            bitmap.store_word(word_index, if set { word | mask } else { word & !mask });
+            self.store_used_word(word_index, word, if set { word | mask } else { word & !mask });
             frame += bits;
         }
     }
@@ -467,7 +526,7 @@ impl PhysAllocatorState {
     }
 
     fn alloc_contiguous_locked(&mut self, page_count: usize) -> Option<PhysAddr> {
-        let start_frame = self.find_alloc_start_locked(page_count)?;
+        let start_frame = self.find_alloc_start_locked(page_count, FrameScanKind::Contiguous)?;
         self.commit_alloc_locked(start_frame, page_count);
         Some(PhysAddr::new(start_frame as u64 * PAGE_SIZE))
     }
@@ -594,7 +653,7 @@ impl PhysAllocatorState {
                 break;
             }
             if available == 0 {
-                let Some(word) = self.free_word_at_hint_locked() else {
+                let Some(word) = self.free_word_at_hint_locked(FrameScanKind::Independent) else {
                     break;
                 };
                 (word_index, used_word, available) = word;
@@ -604,9 +663,10 @@ impl PhysAllocatorState {
             // every frame in a batch. `used` admits only boot-usable frames.
             let bit = available.trailing_zeros() as usize;
             available &= available - 1;
+            let before = used_word;
             used_word |= 1_u64 << bit;
             let frame = word_index * BITS_PER_WORD + bit;
-            self.geo.used.store_word(word_index, used_word);
+            self.store_used_word(word_index, before, used_word);
             self.free_frames -= 1;
             self.next_hint = frame + 1;
             out[filled] = PhysAddr::new(frame as u64 * PAGE_SIZE);
@@ -618,8 +678,8 @@ impl PhysAllocatorState {
     /// Returns the next allocation word and every usable free bit at or after
     /// its first candidate. Non-usable bits are permanently set in `used`;
     /// the explicit end mask also excludes padding in the last bitmap word.
-    fn free_word_at_hint_locked(&self) -> Option<(usize, u64, u64)> {
-        let first = self.find_alloc_start_locked(1)?;
+    fn free_word_at_hint_locked(&mut self, kind: FrameScanKind) -> Option<(usize, u64, u64)> {
+        let first = self.find_alloc_start_locked(1, kind)?;
         let word_index = first / BITS_PER_WORD;
         let used = self.geo.used.load_word(word_index);
         let word_end = ((word_index + 1) * BITS_PER_WORD).min(self.geo.frame_count);
@@ -635,7 +695,7 @@ impl PhysAllocatorState {
         self.next_hint = start_frame.saturating_add(page_count);
     }
 
-    fn find_alloc_start_locked(&self, page_count: usize) -> Option<usize> {
+    fn find_alloc_start_locked(&mut self, page_count: usize, kind: FrameScanKind) -> Option<usize> {
         if !self.initialized || page_count == 0 || page_count > self.free_frames {
             return None;
         }
@@ -649,22 +709,25 @@ impl PhysAllocatorState {
             .saturating_add(1);
         let start_hint = self.next_hint.min(last_start_exclusive.saturating_sub(1));
 
-        self.find_contiguous_free_range(start_hint, last_start_exclusive, page_count)
-            .or_else(|| self.find_contiguous_free_range(0, start_hint, page_count))
+        self.find_contiguous_free_range(start_hint, last_start_exclusive, page_count, kind)
+            .or_else(|| self.find_contiguous_free_range(0, start_hint, page_count, kind))
     }
 
     fn find_contiguous_free_range(
-        &self,
+        &mut self,
         start: usize,
         end: usize,
         page_count: usize,
+        kind: FrameScanKind,
     ) -> Option<usize> {
         if start >= end || page_count == 0 {
             return None;
         }
 
         let mut scanned = 0usize;
-        for range in &self.geo.usable_ranges[..self.geo.usable_range_count] {
+        let mut work = FrameScanWork::default();
+        for range_index in 0..self.geo.usable_range_count {
+            let range = self.geo.usable_ranges[range_index];
             let range_start = range.start_frame.max(start);
             let range_end = range
                 .start_frame
@@ -675,18 +738,18 @@ impl PhysAllocatorState {
             }
 
             let mut frame = range_start;
-            while let Some(candidate) = self.next_free_frame_in_range(frame, start_limit_end) {
+            while let Some(candidate) = self.next_free_frame_in_range(frame, start_limit_end, &mut work) {
                 scanned = scanned.saturating_add(candidate.saturating_sub(frame) + 1);
                 // The search already proved this bit free. Single-frame
                 // allocation and cache refill need no second bitmap load.
                 if page_count == 1 {
-                    self.record_scan_milestone(scanned);
+                    self.record_scan_milestone(scanned, page_count, kind, &work);
                     return Some(candidate);
                 }
-                let run_len = self.free_run_len_from(candidate, range_end, page_count);
+                let run_len = self.free_run_len_from(candidate, range_end, page_count, &mut work);
 
                 if run_len == page_count {
-                    self.record_scan_milestone(scanned);
+                    self.record_scan_milestone(scanned, page_count, kind, &work);
                     return Some(candidate);
                 }
 
@@ -694,32 +757,35 @@ impl PhysAllocatorState {
             }
         }
 
-        self.record_scan_milestone(scanned);
+        self.record_scan_milestone(scanned, page_count, kind, &work);
         None
     }
 
-    fn next_free_frame_in_range(&self, mut frame: usize, end: usize) -> Option<usize> {
-        while frame < end {
-            let word_index = frame / BITS_PER_WORD;
-            let bit_index = frame % BITS_PER_WORD;
-            let before_frame_mask = if bit_index == 0 {
-                0
-            } else {
-                (1_u64 << bit_index) - 1
-            };
-            let word = self.geo.used.load_word(word_index) | before_frame_mask;
-            if word != u64::MAX {
-                let candidate = word_index * BITS_PER_WORD + (!word).trailing_zeros() as usize;
-                if candidate < end {
-                    return Some(candidate);
-                }
-            }
-            frame = (word_index + 1) * BITS_PER_WORD;
+    fn next_free_frame_in_range(&self, frame: usize, end: usize, work: &mut FrameScanWork) -> Option<usize> {
+        if frame >= end {
+            return None;
         }
-        None
+        let first_word = frame / BITS_PER_WORD;
+        work.bitmap_words += 1;
+        let available = !self.geo.used.load_word(first_word)
+            & (u64::MAX << (frame % BITS_PER_WORD));
+        let (word_index, available) = if available != 0 {
+            (first_word, available)
+        } else {
+            let next = self.free_words.next_available(first_word + 1, &mut work.index_words)?;
+            if next * BITS_PER_WORD >= end {
+                return None;
+            }
+            work.bitmap_words += 1;
+            let available = !self.geo.used.load_word(next);
+            assert_ne!(available, 0, "free-word index names a full central word");
+            (next, available)
+        };
+        let candidate = word_index * BITS_PER_WORD + available.trailing_zeros() as usize;
+        (candidate < end).then_some(candidate)
     }
 
-    fn free_run_len_from(&self, mut frame: usize, end: usize, limit: usize) -> usize {
+    fn free_run_len_from(&self, mut frame: usize, end: usize, limit: usize, work: &mut FrameScanWork) -> usize {
         let mut run_len = 0usize;
         while frame < end && run_len < limit {
             let word_index = frame / BITS_PER_WORD;
@@ -730,6 +796,7 @@ impl PhysAllocatorState {
             let max_bits = remaining_word_bits
                 .min(remaining_range_bits)
                 .min(remaining_limit_bits);
+            work.bitmap_words += 1;
             let shifted = self.geo.used.load_word(word_index) >> bit_index;
             let free_bits = (!shifted).trailing_ones() as usize;
             let advance = free_bits.min(max_bits);
@@ -742,16 +809,26 @@ impl PhysAllocatorState {
         run_len
     }
 
-    fn record_scan_milestone(&self, scanned_frames: usize) {
-        if scanned_frames < PHYS_ALLOC_SCAN_MILESTONE_FRAMES {
+    fn record_scan_milestone(&mut self, scanned_frames: usize, page_count: usize, kind: FrameScanKind, work: &FrameScanWork) {
+        let long_distance = scanned_frames >= PHYS_ALLOC_SCAN_MILESTONE_FRAMES;
+        if !long_distance && work.bitmap_words + work.index_words < PHYS_ALLOC_SCAN_MILESTONE_WORDS {
             return;
         }
-        crate::debug::record_milestone(
-            crate::debug::LogCategory::Memory,
-            "phys-contig-scan",
-            scanned_frames as u64,
-            self.free_frames as u64,
-        );
+        // Never enter a diagnostic sink while holding the IRQ-off allocator
+        // lock. Preserve all qualifying work in plain, centrally owned counts;
+        // the normal-context profile drain copies these before rendering.
+        let profile = &mut self.scan_profiles[kind as usize - 1];
+        profile.scans = profile.scans.saturating_add(1);
+        profile.distance_sum = profile.distance_sum.saturating_add(scanned_frames as u64);
+        profile.bitmap_words = profile.bitmap_words.saturating_add(work.bitmap_words as u64);
+        profile.index_words = profile.index_words.saturating_add(work.index_words as u64);
+        if scanned_frames >= profile.max_distance {
+            profile.max_distance = scanned_frames;
+            profile.sample_pages = page_count;
+            profile.sample_free = self.free_frames;
+            profile.sample_bitmap_words = work.bitmap_words;
+            profile.sample_index_words = work.index_words;
+        }
     }
 
     fn free_frame_locked(&mut self, phys: PhysAddr) -> Result<(), FreeFrameError> {
@@ -784,7 +861,7 @@ impl PhysAllocatorState {
     fn take_frames_for_cache_locked(&mut self, out: &mut [usize]) -> usize {
         let mut filled = 0;
         while filled < out.len() {
-            let Some((word_index, mut used, mut available)) = self.free_word_at_hint_locked() else {
+            let Some((word_index, mut used, mut available)) = self.free_word_at_hint_locked(FrameScanKind::CacheRefill) else {
                 break;
             };
             while filled < out.len() && available != 0 {
@@ -792,8 +869,9 @@ impl PhysAllocatorState {
                 available &= available - 1;
                 let frame = word_index * BITS_PER_WORD + bit;
                 self.geo.cached.test_and_set(frame);
+                let before = used;
                 used |= 1_u64 << bit;
-                self.geo.used.store_word(word_index, used);
+                self.store_used_word(word_index, before, used);
                 self.free_frames -= 1;
                 self.next_hint = frame + 1;
                 out[filled] = frame;
@@ -853,9 +931,15 @@ pub fn init(boot_info_ptr: *const BootInfo) {
         let used_bitmap_bytes = bitmap_words
             .checked_mul(core::mem::size_of::<u64>())
             .expect("physical allocator bitmap size overflow");
-        // The `used` bitmap is followed by the same-sized `cached` bitmap.
+        // `used`, `cached`, then the exact hierarchy of non-full `used` words.
+        let free_index_words = FreeWordIndex::backing_words(bitmap_words)
+            .expect("physical free-word index exceeds direct-map geometry");
+        let free_index_bytes = free_index_words
+            .checked_mul(core::mem::size_of::<u64>())
+            .expect("physical free-word index size overflow");
         let bitmap_bytes = used_bitmap_bytes
             .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(free_index_bytes))
             .expect("physical allocator bitmap size overflow");
         let bitmap_pages = bitmap_bytes.div_ceil(PAGE_SIZE as usize);
         let frame_descriptor_bytes = frame_count
@@ -976,10 +1060,13 @@ pub fn init(boot_info_ptr: *const BootInfo) {
         let mut new_state = PhysAllocatorState::new();
         new_state.geo.frame_count = frame_count;
         new_state.geo.used = BitmapView::from_raw(bitmap_ptr, bitmap_words);
-        // SAFETY: the allocation spans `2 * bitmap_words` words, so the second
-        // half starts `bitmap_words` words past the base, inside the region.
+        // SAFETY: the allocation spans both bitmaps and the index, all zeroed
+        // above except `used`, whose initially-full words describe no free frames.
         new_state.geo.cached =
             BitmapView::from_raw(unsafe { bitmap_ptr.add(bitmap_words) }, bitmap_words);
+        new_state.free_words = unsafe {
+            FreeWordIndex::from_raw(bitmap_ptr.add(bitmap_words * 2), bitmap_words)
+        };
         new_state.geo.bitmap_phys_start = bitmap_phys;
         new_state.geo.bitmap_page_count = bitmap_pages;
 
@@ -1255,6 +1342,55 @@ pub fn drain_frame_batch_profile(now_tick: u64, window_ticks: u64) -> usize {
     frame_batch_profile::drain(now_tick, window_ticks)
 }
 
+/// Normal-context companion to the batch profile. A contended try-lock leaves
+/// every count pending; only a complete copied window is removed from state.
+fn drain_frame_scan_profile() -> usize {
+    let Some(profiles) = irq_safe(|| {
+        let mut state = PHYS_POOL.state.try_lock()?;
+        Some(core::mem::replace(&mut state.scan_profiles, [FrameScanProfile::EMPTY; 3]))
+    }) else {
+        return 0;
+    };
+    // The central lock is gone and the caller's IRQ state has been restored.
+    let classes = [
+        (FrameScanKind::Independent, "phys-frame-scan-total", "phys-frame-scan-work"),
+        (FrameScanKind::CacheRefill, "phys-cache-scan-total", "phys-cache-scan-work"),
+        (FrameScanKind::Contiguous, "phys-run-scan-total", "phys-run-scan-work"),
+    ];
+    let mut emitted = 0;
+    for (profile, (kind, total_name, work_name)) in profiles.into_iter().zip(classes) {
+        if profile.scans == 0 {
+            continue;
+        }
+        // Keep the old fields for the maximum-distance sample, but no longer
+        // emit a line per scan. The per-class total carries that exact count.
+        if profile.max_distance >= PHYS_ALLOC_SCAN_MILESTONE_FRAMES {
+            crate::debug::record_milestone(
+                crate::debug::LogCategory::Memory, "phys-contig-scan",
+                profile.max_distance as u64, profile.sample_free as u64,
+            );
+            emitted += 1;
+        }
+        // arg0: kind (1 independent, 2 cache refill, 3 required contiguous) in
+        // bits 56..63 and sample request pages in bits 0..55. arg1: this
+        // sample's bitmap/index search reads in the high/low 32 bits.
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Memory, "phys-scan-word-work",
+            ((kind as u64) << 56) | profile.sample_pages as u64,
+            ((profile.sample_bitmap_words.min(u32::MAX as usize) as u64) << 32)
+                | profile.sample_index_words.min(u32::MAX as usize) as u64,
+        );
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Memory, total_name, profile.scans, profile.distance_sum,
+        );
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Memory, work_name, profile.bitmap_words, profile.index_words,
+        );
+        emitted += 3;
+    }
+    emitted
+}
+
 pub fn free_frame(phys: PhysAddr) {
     if let Err(err) = try_free_frame(phys) {
         let phys_addr = phys.as_u64();
@@ -1409,10 +1545,16 @@ mod tests {
     use super::*;
 
     pub(super) fn test_state(bitmap: &mut [u64], page_count: usize, next_hint: usize) -> PhysAllocatorState {
+        bitmap.fill(u64::MAX);
         let mut state = PhysAllocatorState::new();
         state.initialized = true;
         state.geo.frame_count = page_count;
         state.geo.used = BitmapView::from_raw(bitmap.as_mut_ptr(), bitmap.len());
+        let summary = alloc::boxed::Box::leak(
+            alloc::vec![0_u64; FreeWordIndex::backing_words(bitmap.len()).unwrap()].into_boxed_slice(),
+        );
+        // SAFETY: leaked zeroed test backing is exclusively owned by this state.
+        state.free_words = unsafe { FreeWordIndex::from_raw(summary.as_mut_ptr(), bitmap.len()) };
         state.usable_frames = page_count;
         state.free_frames = page_count;
         state.next_hint = next_hint;
@@ -1423,6 +1565,79 @@ mod tests {
         };
         state.mark_range_free(0, page_count);
         state
+    }
+
+    pub(super) fn assert_index_matches_bitmap(state: &PhysAllocatorState) {
+        for first in 0..=state.geo.used.words {
+            let expected = (first..state.geo.used.words)
+                .find(|word| state.geo.used.load_word(*word) != u64::MAX);
+            let mut reads = 0;
+            assert_eq!(state.free_words.next_available(first, &mut reads), expected);
+            assert!(reads <= 7);
+        }
+    }
+
+    #[test]
+    fn freed_island_does_not_rescan_the_intervening_full_bitmap_words() {
+        const FRAMES: usize = 400_129;
+        const LIVE_PREFIX: usize = 380_000;
+        let mut bitmap = alloc::vec![u64::MAX; FRAMES.div_ceil(BITS_PER_WORD)];
+        let mut state = test_state(&mut bitmap, FRAMES, 0);
+        state.claim_fixed_range_locked(0, LIVE_PREFIX as u64 * PAGE_SIZE).unwrap();
+        state.free_frame_locked(PhysAddr::new(7 * PAGE_SIZE)).unwrap();
+        let mut one = [PhysAddr::new(0)];
+        assert_eq!(state.alloc_frames_locked(&mut one), 1);
+        assert_eq!(one[0].as_u64(), 7 * PAGE_SIZE);
+
+        let mut work = FrameScanWork::default();
+        assert_eq!(state.next_free_frame_in_range(8, FRAMES, &mut work), Some(LIVE_PREFIX));
+        assert_eq!(work.bitmap_words, 2);
+        assert!(work.index_words <= 7);
+        assert_eq!(state.alloc_frames_locked(&mut one), 1);
+        assert_eq!(one[0].as_u64(), LIVE_PREFIX as u64 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn indexed_contiguous_search_matches_required_runs_with_fragmentation_and_wrap() {
+        const FRAMES: usize = 137;
+        for pattern in 0..32 {
+            let mut bitmap = [u64::MAX; FRAMES.div_ceil(BITS_PER_WORD)];
+            let mut state = test_state(&mut bitmap, FRAMES, (pattern * 41) % FRAMES);
+            for frame in 0..FRAMES {
+                if (frame * 17 + pattern * 13) % 23 < 7 {
+                    state.reserve_phys_range(frame as u64 * PAGE_SIZE, PAGE_SIZE);
+                }
+            }
+            assert_index_matches_bitmap(&state);
+            for pages in 1..=70 {
+                let last = FRAMES - pages + 1;
+                let hint = state.next_hint.min(last - 1);
+                let expected = (hint..last).chain(0..hint)
+                    .find(|start| (*start..*start + pages).all(|frame| !state.is_used(frame)));
+                assert_eq!(state.find_alloc_start_locked(pages, FrameScanKind::Contiguous), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn scan_profile_keeps_work_totals_and_exact_max_distance_sample_without_rendering() {
+        let mut bitmap = [u64::MAX; 4];
+        let mut state = test_state(&mut bitmap, 256, 0);
+        state.record_scan_milestone(380_000, 1, FrameScanKind::Independent,
+            &FrameScanWork { bitmap_words: 2, index_words: 7 });
+        state.record_scan_milestone(70_000, 1, FrameScanKind::Independent,
+            &FrameScanWork { bitmap_words: 2, index_words: 3 });
+        state.record_scan_milestone(8, 64, FrameScanKind::Contiguous,
+            &FrameScanWork { bitmap_words: 1100, index_words: 2 });
+        let ordinary = state.scan_profiles[FrameScanKind::Independent as usize - 1];
+        assert_eq!((ordinary.scans, ordinary.distance_sum), (2, 450_000));
+        assert_eq!((ordinary.bitmap_words, ordinary.index_words), (4, 10));
+        assert_eq!((ordinary.max_distance, ordinary.sample_free), (380_000, 256));
+        assert_eq!((ordinary.sample_bitmap_words, ordinary.sample_index_words), (2, 7));
+        let contiguous = state.scan_profiles[FrameScanKind::Contiguous as usize - 1];
+        assert_eq!((contiguous.scans, contiguous.sample_pages), (1, 64));
+        assert_eq!((contiguous.bitmap_words, contiguous.index_words), (1100, 2));
+        assert_eq!(state.scan_profiles[FrameScanKind::CacheRefill as usize - 1].scans, 0);
     }
 
     #[test]

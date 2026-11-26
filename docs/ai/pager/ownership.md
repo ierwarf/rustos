@@ -42,9 +42,10 @@ Model: `formal/pager-fault-slot-lifecycle/PagerFaultSlotLifecycle.tla`.
 | Refusal code | `PAGER_PRESSURE_FAULT_FRAME_RESERVE_EMPTY` |
 
 A reserve frame is pre-zeroed at boot, providing a lock-free latency fast
-path. It is not the only anonymous-fault supply: obligatory anonymous pages,
-required intermediate tables, and optional fault-around pages fall back to
-IRQ-safe physical allocation and zeroing when it is empty (§1). Pager-backed
+path. It is not the only anonymous-fault supply: obligatory anonymous pages
+and required intermediate tables fall back to IRQ-safe physical allocation
+and zeroing when it is empty (§1). Optional fault-around uses an independent
+user-frame batch and never consumes this reserve. Pager-backed
 grants retain their separate reserve admission and refusal semantics.
 
 The two paths draw from it differently:
@@ -66,12 +67,14 @@ allocation pressure leaves empty slots. The fault which set the bit has already
 resumed through its CAS, so this is neither fault deferral nor generic
 housekeeping. Allocator fallback may still run in exception context.
 
-Pages populated *around* the fault (§4.5) draw from this pool too, and so do
-the intermediate page tables the fault path publishes (§1c) - a zeroed reserve
-frame is exactly what an empty page table is. Restricting fault-around to the
-reserve alone was tried and reverted: the reserve is emptiest when the fault
-rate is highest, so the run went dead precisely when it was worth most. The run
-must degrade with supply, not switch off.
+The intermediate page tables the fault path publishes (§1c) draw from this
+pool: a zeroed reserve frame is exactly what an empty page table is. Pages
+populated *around* the fault (§4.5) instead use one bounded batch from the
+ordinary user allocator. A 16-page run therefore consumes at most its demand
+page from the reserve, plus any required table pages, instead of all sixteen
+data pages. The existing policy length, user watermark and per-leaf ownership
+remain in force. A short batch reduces optional coverage; every CAS loser and
+unattempted suffix after a refusal returns to the physical allocator once.
 
 ### Immutable supplied-frame custody (not yet a live file pager)
 
@@ -179,7 +182,7 @@ code-derived conclusions turned out to be wrong. They are listed because the
 | "SeqCst on the four operations closes the Loom failure" | Loom under-approximates SeqCst. The fix was right for hardware and still failed the model. | Knowing the checker's limits before reading its verdict as a fact about the code |
 | "Fault-around's speculative pages need a software bit that was not reserved" | The hardware Accessed bit already encodes it. | Checking whether the CPU already maintains the predicate |
 | "Kani can prove the new page-table arithmetic" | Kani harnesses in this tree live only under `libs/`; `kernel/mm` is not in the proof index. | Looking at where the existing `#[kani::proof]` attributes actually are before planning a lane |
-| "Fault-around never draws the wired reserve" (this document, §2.2) | It draws it first, by design, after the allocator-only variant was measured and reverted. | Re-reading the paragraph the code comment contradicts |
+| "Fault-around never draws the wired reserve" (historical version of §2.2) | That version used reserve-first supply; the 2026-11-27 change explicitly moves neighbours to one ordinary allocation batch. The earlier measurements do not measure this new batching/index combination. | Re-reading the current code and separating historical evidence from a new implementation |
 
 Two rules follow, and they are cheap:
 
@@ -280,6 +283,16 @@ for it before Release-publishing its bit. A claimant first clears that exact
 bit with AcqRel, then takes the frame and reopens the slot. The IRQ-off scan
 visits each bitmap word once and never spins on a reservation made solely
 against a count. An empty scan requests refill and returns exhaustion.
+
+Producers now inspect the complement of each ready-word snapshot before
+looking at individual frame slots. A full reserve needs 32 bitmap reads rather
+than 2048 frame-slot reads. A zero ready bit is only a vacancy filter: it may
+belong to a consumer that has not yet extracted its frame, or to a producer
+that has not published readiness. Only the `0 -> frame` slot CAS authorizes
+publication. Count-before-ready ordering and the consumer's clear-before-take
+ordering are unchanged. Reserve capacity and the 128-frame refill pass budget
+are unchanged; this follow-up has source regression cases and static review
+only, with no measured speedup claimed.
 
 ### The writer lock is per process
 

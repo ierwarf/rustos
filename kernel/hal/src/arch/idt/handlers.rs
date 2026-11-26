@@ -166,7 +166,19 @@ fn rustos_default_handler_aligned(
         |vector| crate::debug::println_serialized(format_args!("!EX:{vector:02x}")),
         emergency_exception_marker,
     );
-    crate::debug::dump_recent_trace_locations("exception");
+    if user_mode {
+        // Keep the exact failing instruction/stack for every trap, including
+        // #BP, while bounding repeated historical output in this IRQ-off path.
+        // Linux retirement still emits its PID/TID-bound required milestone.
+        crate::debug::println_serialized(format_args!(
+            "user exception detail: vector={} ec={:?} rip={:#x} rsp={:#x} cr2={:#x}",
+            index, error_code, stack_frame.instruction_pointer.as_u64(),
+            stack_frame.stack_pointer.as_u64(), cr2,
+        ));
+        crate::debug::dump_recent_trace_locations_tail("user-exception", 8);
+    } else {
+        crate::debug::dump_recent_trace_locations("exception");
+    }
     if index == 14 {
         log_page_fault_details(
             error_code.unwrap_or(0),

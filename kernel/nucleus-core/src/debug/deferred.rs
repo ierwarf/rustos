@@ -8,10 +8,12 @@
 //!
 //! This ring is that hand-off for the unsequenced diagnostics: a writer that
 //! cannot take the sink parks its already-rendered line here, and the next
-//! writer that does take the sink emits the parked lines, oldest first, before
-//! its own. Milestone frames are deliberately not routed through it: their
-//! output sequence is allocated while the sink is held, and that order is the
-//! evidence the acceptance harness verifies.
+//! writer that does take the sink emits a bounded batch, oldest ready first,
+//! before its own. Milestones retain their unrendered record: their output
+//! sequence is allocated only while the sink is held, preserving wire order.
+//! Ready bitmaps avoid scanning every empty slot on every diagnostic. A drain
+//! budget prevents concurrent producers from extending one IRQ-masked output
+//! turn indefinitely; records beyond the budget keep their original custody.
 //!
 //! Overflow is still accounted rather than hidden. A full ring means the sink
 //! has been unavailable for longer than the ring is deep, which is a real
@@ -19,7 +21,7 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
-use crate::util::lockdep::MAX_TRACKED_CPUS;
+use crate::util::{cache_padded::CachePadded, lockdep::MAX_TRACKED_CPUS};
 
 use super::{CurrentUserLogContext, MilestoneOutputClass, MilestoneRecord};
 
@@ -87,9 +89,9 @@ impl Slot {
 }
 
 // SAFETY: a slot's buffer is written only by the CPU that moved it from
-// `SLOT_EMPTY` to `SLOT_WRITING`, and read only by the CPU that observes
-// `SLOT_READY` and returns it to `SLOT_EMPTY`. The state transitions are the
-// exclusive-access protocol.
+// `SLOT_EMPTY` to `SLOT_WRITING`. The sole sink drainer reads only records
+// acquired through their ready bitmap bit, clears that bit after emission,
+// then releases `SLOT_EMPTY`. These transitions exclude payload reuse.
 unsafe impl Sync for Slot {}
 
 struct DeferredRing {
@@ -97,6 +99,10 @@ struct DeferredRing {
     /// lets the drainer merge the rings back into the order the records were
     /// parked in, across CPUs.
     cpu_slots: [[Slot; DEFERRED_SLOTS_PER_CPU]; MAX_TRACKED_CPUS],
+    // A bit is the final publication, not just a hint. The sole sink drainer
+    // clears it BEFORE returning the slot to Empty, so a new producer's ready
+    // bit cannot be erased by the preceding record's retirement.
+    ready: [CachePadded<AtomicU64>; MAX_TRACKED_CPUS],
     next_sequence: AtomicU64,
 }
 
@@ -105,20 +111,17 @@ impl DeferredRing {
         Self {
             cpu_slots: [const { [const { Slot::new() }; DEFERRED_SLOTS_PER_CPU] };
                 MAX_TRACKED_CPUS],
+            ready: [const { CachePadded::new(AtomicU64::new(0)) }; MAX_TRACKED_CPUS],
             next_sequence: AtomicU64::new(0),
         }
     }
 
-    /// The parking CPU's own slots. An unknown index would alias another CPU's
-    /// ring, so it is folded to zero rather than trusted.
-    fn local_slots(&self) -> &[Slot; DEFERRED_SLOTS_PER_CPU] {
+    /// A migrated/unknown producer is still safe: slot CAS owns its record.
+    fn local_cpu(&self) -> usize {
         let cpu = crate::util::lockdep::current_cpu_index();
-        &self.cpu_slots[if cpu < MAX_TRACKED_CPUS { cpu } else { 0 }]
+        if cpu < MAX_TRACKED_CPUS { cpu } else { 0 }
     }
 
-    fn every_slot(&self) -> impl Iterator<Item = &Slot> {
-        self.cpu_slots.iter().flat_map(|slots| slots.iter())
-    }
 }
 
 static DEFERRED: DeferredRing = DeferredRing::new();
@@ -129,7 +132,8 @@ pub(super) fn park(bytes: &[u8]) -> bool {
     if bytes.is_empty() || bytes.len() > DEFERRED_LINE_BYTES {
         return false;
     }
-    for slot in DEFERRED.local_slots()[..DEFERRED_GENERAL_SLOTS_PER_CPU].iter() {
+    let cpu = DEFERRED.local_cpu();
+    for (index, slot) in DEFERRED.cpu_slots[cpu][..DEFERRED_GENERAL_SLOTS_PER_CPU].iter().enumerate() {
         // ORDERING: AcqRel claims the slot before any byte is written to it,
         // so no drainer can observe a partially filled record.
         if slot
@@ -144,8 +148,9 @@ pub(super) fn park(bytes: &[u8]) -> bool {
         {
             continue;
         }
-        // Sequence is taken after the claim so parked order matches emission
-        // order even when several CPUs park concurrently.
+        // Sequence is taken after the claim and orders the ready records.
+        // A paused publisher is invisible until its final ready-bit release;
+        // it cannot hold up other CPUs' already-published diagnostics.
         slot.sequence.store(
             DEFERRED.next_sequence.fetch_add(1, Ordering::Relaxed),
             Ordering::Relaxed,
@@ -157,8 +162,10 @@ pub(super) fn park(bytes: &[u8]) -> bool {
         }
         slot.len.store(bytes.len() as u32, Ordering::Relaxed);
         slot.kind.store(KIND_LINE, Ordering::Relaxed);
-        // ORDERING: Release publishes the complete record to the drainer.
         slot.state.store(SLOT_READY, Ordering::Release);
+        // ORDERING: Release publishes this complete record to bitmap readers.
+        // No drainer may inspect a Ready slot before this final publication.
+        DEFERRED.ready[cpu].fetch_or(1_u64 << index, Ordering::Release);
         return true;
     }
     false
@@ -166,7 +173,13 @@ pub(super) fn park(bytes: &[u8]) -> bool {
 
 /// Park one milestone that could not reach the sink.
 pub(super) fn park_milestone(parked: ParkedMilestone) -> bool {
-    for slot in DEFERRED.local_slots().iter() {
+    let cpu = DEFERRED.local_cpu();
+    let capacity = if parked.output_class.must_reach_sink() {
+        DEFERRED_SLOTS_PER_CPU
+    } else {
+        DEFERRED_GENERAL_SLOTS_PER_CPU
+    };
+    for (index, slot) in DEFERRED.cpu_slots[cpu][..capacity].iter().enumerate() {
         // ORDERING: AcqRel claims the slot before it is written, so no drainer
         // can observe a partially published record.
         if slot
@@ -190,51 +203,59 @@ pub(super) fn park_milestone(parked: ParkedMilestone) -> bool {
             *slot.milestone.get() = Some(parked);
         }
         slot.kind.store(KIND_MILESTONE, Ordering::Relaxed);
-        // ORDERING: Release publishes the complete record to the drainer.
         slot.state.store(SLOT_READY, Ordering::Release);
+        // ORDERING: Release publishes this complete record to bitmap readers.
+        // No drainer may inspect a Ready slot before this final publication.
+        DEFERRED.ready[cpu].fetch_or(1_u64 << index, Ordering::Release);
         return true;
     }
     false
 }
 
-/// Emit every parked line, oldest first. The caller must hold the output sink.
+/// Emit at most `limit` ready records, oldest first. The caller holds the
+/// output sink and is the sole drainer. Producers may continue publishing.
 pub(super) fn drain(
+    limit: usize,
     mut emit_line: impl FnMut(&[u8]),
     mut emit_milestone: impl FnMut(ParkedMilestone),
-) {
-    loop {
-        let mut oldest: Option<(u64, &Slot)> = None;
-        for slot in DEFERRED.every_slot() {
-            // ORDERING: Acquire pairs with the parking CPU's Release, so the
-            // bytes are visible before they are read.
-            if slot.state.load(Ordering::Acquire) != SLOT_READY {
-                continue;
-            }
-            let sequence = slot.sequence.load(Ordering::Relaxed);
-            if oldest.is_none_or(|(oldest_sequence, _)| sequence < oldest_sequence) {
-                oldest = Some((sequence, slot));
+) -> usize {
+    let mut emitted = 0;
+    while emitted < limit {
+        let mut oldest: Option<(u64, usize, usize)> = None;
+        for (cpu, ready) in DEFERRED.ready.iter().enumerate() {
+            // ORDERING: Acquire observes complete records published by park.
+            let mut pending = ready.load(Ordering::Acquire);
+            while pending != 0 {
+                let index = pending.trailing_zeros() as usize;
+                pending &= pending - 1;
+                let slot = &DEFERRED.cpu_slots[cpu][index];
+                let sequence = slot.sequence.load(Ordering::Relaxed);
+                if oldest.is_none_or(|(oldest_sequence, _, _)| sequence < oldest_sequence) {
+                    oldest = Some((sequence, cpu, index));
+                }
             }
         }
-        let Some((_, slot)) = oldest else {
-            return;
-        };
-        // SAFETY: the sink is held, so this is the only drainer, and the slot
-        // stays `SLOT_READY` - and therefore untouched by any parker - until
-        // this CPU releases it below.
+        let Some((_, cpu, index)) = oldest else { break; };
+        let slot = &DEFERRED.cpu_slots[cpu][index];
+        // SAFETY: the sink is held, so this is the only drainer. Publication
+        // was acquired above and this slot stays Ready until emission ends.
         if slot.kind.load(Ordering::Relaxed) == KIND_MILESTONE {
             if let Some(parked) = unsafe { *slot.milestone.get() } {
                 emit_milestone(parked);
             }
         } else {
             let len = (slot.len.load(Ordering::Relaxed) as usize).min(DEFERRED_LINE_BYTES);
-            // SAFETY: as above; `len` is clamped to the buffer size.
+            // SAFETY: as above; len is clamped to the buffer size.
             let bytes = unsafe { core::slice::from_raw_parts(slot.bytes.get().cast::<u8>(), len) };
             emit_line(bytes);
         }
-        // ORDERING: Release makes the buffer reusable only after the emit has
-        // consumed it.
+        // ORDERING: clear publication before releasing the slot. A parker
+        // cannot reuse it until Empty, so its next ready bit cannot be lost.
+        DEFERRED.ready[cpu].fetch_and(!(1_u64 << index), Ordering::Relaxed);
         slot.state.store(SLOT_EMPTY, Ordering::Release);
+        emitted += 1;
     }
+    emitted
 }
 
 #[cfg(test)]
@@ -260,7 +281,7 @@ mod tests {
 
     fn drain_all() -> Vec<Vec<u8>> {
         let mut seen = Vec::new();
-        drain(|bytes| seen.push(bytes.to_vec()), |_| {});
+        drain(usize::MAX, |bytes| seen.push(bytes.to_vec()), |_| {});
         seen
     }
 
@@ -277,6 +298,33 @@ mod tests {
         // Draining returns the slots, so the ring accepts the same depth again.
         assert!(park(b"again"));
         assert_eq!(drain_all(), vec![b"again".to_vec()]);
+    }
+
+    #[test]
+    fn drain_budget_retains_records_and_cannot_be_extended_by_new_producers() {
+        let _serial = serialized();
+        assert!(park(b"first"));
+        assert!(park(b"second"));
+        assert!(park(b"third"));
+        let mut seen = Vec::new();
+        let emitted = drain(2, |bytes| {
+            seen.push(bytes.to_vec());
+            assert!(park(b"concurrent"));
+        }, |_| {});
+        assert_eq!(emitted, 2);
+        assert_eq!(seen, vec![b"first".to_vec(), b"second".to_vec()]);
+        assert_eq!(drain_all(), vec![b"third".to_vec(), b"concurrent".to_vec(), b"concurrent".to_vec()]);
+        assert!(DEFERRED.ready.iter().all(|bits| bits.load(core::sync::atomic::Ordering::Acquire) == 0));
+        assert!(park(b"reused"));
+        assert_eq!(drain_all(), vec![b"reused".to_vec()]);
+    }
+
+    #[test]
+    fn zero_budget_does_not_consume_published_custody() {
+        let _serial = serialized();
+        assert!(park(b"retained"));
+        assert_eq!(drain(0, |_| panic!("zero budget emitted a line"), |_| panic!("zero budget emitted a milestone")), 0);
+        assert_eq!(drain_all(), vec![b"retained".to_vec()]);
     }
 
     #[test]
@@ -326,6 +374,36 @@ mod tests {
     }
 
     #[test]
+    fn best_effort_milestones_cannot_consume_required_reserve() {
+        let _serial = serialized();
+        let ordinary = ParkedMilestone {
+            record: super::super::MilestoneRecord::EMPTY,
+            user_context: None,
+            output_class: super::MilestoneOutputClass::BestEffort,
+        };
+        for _ in 0..DEFERRED_GENERAL_SLOTS_PER_CPU {
+            assert!(park_milestone(ordinary));
+        }
+        assert!(!park_milestone(ordinary));
+        let required = ParkedMilestone {
+            output_class: super::MilestoneOutputClass::Required,
+            ..ordinary
+        };
+        for _ in 0..DEFERRED_REQUIRED_RESERVE_PER_CPU {
+            assert!(park_milestone(required));
+        }
+        assert!(!park_milestone(required));
+        let mut ordinary_seen = 0;
+        let mut required_seen = 0;
+        drain(usize::MAX, |_| {}, |record| {
+            if record.output_class.must_reach_sink() { required_seen += 1; }
+            else { ordinary_seen += 1; }
+        });
+        assert_eq!(ordinary_seen, DEFERRED_GENERAL_SLOTS_PER_CPU);
+        assert_eq!(required_seen, DEFERRED_REQUIRED_RESERVE_PER_CPU);
+    }
+
+    #[test]
     fn ordinary_burst_cannot_consume_required_milestone_reserve() {
         let _serial = serialized();
         for _ in 0..DEFERRED_GENERAL_SLOTS_PER_CPU {
@@ -345,7 +423,7 @@ mod tests {
             output_class: super::MilestoneOutputClass::Required,
         }));
         let mut milestones = 0;
-        super::drain(|_| {}, |_| milestones += 1);
+        super::drain(usize::MAX, |_| {}, |_| milestones += 1);
         assert_eq!(milestones, DEFERRED_REQUIRED_RESERVE_PER_CPU);
     }
 }

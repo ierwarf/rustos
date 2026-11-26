@@ -25,6 +25,14 @@ Ring0 cannot compute any of that, and `services/pagerd/src/page_cache.rs` is
 where it lives. Zircon draws the same line — the kernel supplies anonymous VMO
 pages and reserves user pagers for VMOs created by `zx_pager_create_vmo`.
 
+Privileged generic pager control requests bind their header subject to the
+receive-side identity of a live kernel task: `(PID = 0, TID = exact nonzero
+task ID)`. An unavailable sender `(0, 0)` carries no kernel authority. The
+target process remains in the typed region payload, separate from the caller.
+This identity check does not authorize generic fault resolution: actual
+pager-backed faults still require the worker-bound fixed rendezvous, while
+the generic `FAULT_RESOLVE` operation remains `NotManaged`.
+
 Consequences that the rest of this file depends on:
 
 - **Anonymous paging has one map, not two.** `kernel-ps` holds it. §3's whole
@@ -106,9 +114,11 @@ the descriptor catalog rather than trusting either source alone (§1c).
 What is still forbidden regardless of the interrupt flag:
 
 - **No sleepable allocator or shootdown dependency.** Anonymous obligatory
-  pages, required intermediate tables, and optional fault-around pages use
-  reserve-first supply with `allocate_zeroed_frame` fallback. The physical
-  allocator takes an IRQ-safe leaf spinlock, not a lock-free path. Its holders
+  pages and required intermediate tables use reserve-first supply with
+  `allocate_zeroed_frame` fallback. Optional fault-around instead uses one
+  bounded `allocate_zeroed_frames_batch` request, preserving that reserve for
+  demand/table pages. The physical allocator takes an IRQ-safe leaf spinlock,
+  not a lock-free path. Its holders
   reach it after completing TLB reclamation, so they do not wait for a
   shootdown acknowledgement from the IRQ-off faulting CPU while holding it.
   This is the source's lock-order rationale, not hardware qualification.

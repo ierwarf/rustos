@@ -228,6 +228,44 @@ The check is one comparison on counters already inside the allocator lock, so
 it is safe on the IRQ-off fault path.  `pager-anon-census-watermark` reports
 the reserve and the denial count beside `pager-anon-census-supply`.
 
+**Central bitmap search.** `phys/free_word_index.rs` keeps an exact hierarchy
+of non-full central `used` words. Bootstrap reserves its zeroed backing after
+the `used` and `cached` bitmaps; every full/non-full transition updates it
+under the same central lock. Cache-held frames remain used in this index.
+Cache refill still publishes `cached` before setting `used`, and drain clears
+`used` before clearing `cached`. Non-usable frames and final-word padding never
+enter the index. At the 512 GiB direct-map ceiling there are at most four
+levels: skipping a fully used gap takes at most two central-word reads and
+seven index-word reads, regardless of its physical address distance. Required
+multi-page runs still inspect fragmented candidates and retain the complete
+search/cache-drain fallback; an index miss never substitutes a speculative
+allocation budget for physical contiguity.
+
+`phys-contig-scan` historically counted logical distance to candidates, not
+bitmap loads, elapsed time, or the requested contiguous extent. Independent
+frame batches and CPU-cache refills used that search too. The event now reports
+the maximum-distance sample per class in the normal-context batch-profile
+drain, with its original `(distance, central free frames)` fields. It is
+coalesced evidence, so event-line counts are no longer scan counts. The central
+IRQ-off lock only accumulates plain counters; housekeeping copies/resets them
+with a short IRQ-safe try-lock, then renders after releasing it. Contention
+leaves the complete window pending.
+
+| Event | First value | Second value |
+| --- | --- | --- |
+| `phys-scan-word-work` | sample kind in high 8 bits; requested pages in low 56 bits | sample bitmap reads in high 32 bits; index reads in low 32 bits |
+| `phys-frame-scan-total`, `phys-cache-scan-total`, `phys-run-scan-total` | qualifying scan count | summed logical frame distance |
+| `phys-frame-scan-work`, `phys-cache-scan-work`, `phys-run-scan-work` | summed central bitmap search reads | summed index search reads |
+
+Kinds are 1 = independent frames, 2 = cache refill, 3 = required contiguous.
+A scan qualifies at distance >= 65,536 frames or >= 1,024 combined search-word
+reads. Totals retain every qualifying scan in the copied window, while only
+the maximum-distance request is sampled individually; allocation writes and
+the selected-word materialization after search are outside these search
+counts. Sink delivery remains subject to the normal diagnostic-drop counters.
+These structural changes and their regression source cases were reviewed
+statically; they have no new runtime or Chrome latency measurements.
+
 **OOM policy: implemented in `rootd`; ring0 supplies mechanism only.**
 
 *Charge.*  The victim score is what a kill returns, not what a process maps.

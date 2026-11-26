@@ -52,7 +52,11 @@ const SYNTHETIC_WARNING_MODULE_PATH: &str = "nucleus_core::debug";
 #[cfg(rustos_debug_print_enabled)]
 const MILESTONE_CAPACITY: usize = 128;
 #[cfg(rustos_debug_print_enabled)]
-const REQUIRED_MILESTONE_OUTPUT_ATTEMPTS: usize = 1 << 20;
+// Contention transfers custody to the reserved deferred ring promptly; a
+// preempted host vCPU must not make every other guest spin a million times.
+const REQUIRED_MILESTONE_OUTPUT_ATTEMPTS: usize = 8;
+#[cfg(rustos_debug_print_enabled)]
+const DEFERRED_DRAIN_RECORDS: usize = 8;
 // Every regular diagnostic is rendered before it takes DEBUG_LOCK, so one
 // owned buffer can be sent with one debugcon write after the bounded acquire.
 // The existing ordinary call sites below admit substantially less than this;
@@ -390,14 +394,19 @@ fn print_bytes_unlocked(bytes: &[u8]) {
 
 #[cfg(rustos_debug_print_enabled)]
 struct DebugOutputGuard {
-    _guard: spin::MutexGuard<'static, ()>,
+    guard: Option<spin::MutexGuard<'static, ()>>,
     #[cfg(all(rustos_boot_image, not(test)))]
     restore_interrupts: bool,
 }
 
-#[cfg(all(rustos_debug_print_enabled, rustos_boot_image, not(test)))]
+#[cfg(rustos_debug_print_enabled)]
 impl Drop for DebugOutputGuard {
     fn drop(&mut self) {
+        // Unlock before restoring IRQs. Rust drops fields after Drop::drop;
+        // relying on the field destructor reopened interrupts with the sink
+        // still held and made a same-CPU diagnostic contend with itself.
+        drop(self.guard.take());
+        #[cfg(all(rustos_boot_image, not(test)))]
         if self.restore_interrupts {
             x86_64::instructions::interrupts::enable();
         }
@@ -412,7 +421,7 @@ fn try_debug_output_lock() -> Option<DebugOutputGuard> {
         x86_64::instructions::interrupts::disable();
         match DEBUG_LOCK.try_lock() {
             Some(guard) => Some(DebugOutputGuard {
-                _guard: guard,
+                guard: Some(guard),
                 restore_interrupts,
             }),
             None => {
@@ -427,7 +436,7 @@ fn try_debug_output_lock() -> Option<DebugOutputGuard> {
     #[cfg(any(not(rustos_boot_image), test))]
     {
         Some(DebugOutputGuard {
-            _guard: DEBUG_LOCK.lock(),
+            guard: Some(DEBUG_LOCK.lock()),
         })
     }
 }
@@ -735,10 +744,11 @@ fn emit_milestone_debugcon_line(record: MilestoneRecord) {
         }
         spin_loop();
     }
-    // The sink stayed held. A class whose loss the harness reads as a failure
-    // parks its record - not its rendered bytes, so the drainer still
-    // allocates the output sequence under the sink.
-    if output_class.must_reach_sink()
+    // Preserve ordinary diagnostics in general slots and acceptance evidence
+    // in the additional reserved slots. Scheduler measurements remain one-shot
+    // so delayed emission cannot turn contention into measurement overhead.
+    // The drainer allocates the output sequence under the sink, not here.
+    if output_class != MilestoneOutputClass::Measurement
         && deferred::park_milestone(deferred::ParkedMilestone {
             record,
             user_context,
@@ -757,10 +767,11 @@ fn emit_milestone_debugcon_line(record: MilestoneRecord) {
     record_milestone_output_drop(output_class, discarded_bytes);
 }
 
-/// Emit every parked record. The caller must hold the output sink.
+/// Emit a bounded batch. Remaining records retain their slots for the next
+/// sink owner; one diagnostic must not drain an unbounded stream with IRQs off.
 #[cfg(rustos_debug_print_enabled)]
 fn drain_deferred_records() {
-    deferred::drain(print_bytes_unlocked, |parked| {
+    deferred::drain(DEFERRED_DRAIN_RECORDS, print_bytes_unlocked, |parked| {
         let line =
             render_milestone_debugcon_line(parked.record, parked.user_context, parked.output_class);
         print_bytes_unlocked(line.bytes());
@@ -860,6 +871,11 @@ fn milestone_debugcon_visible(name: &str) -> bool {
 
 #[cfg(rustos_debug_print_enabled)]
 pub fn dump_recent_milestones(reason: &str) {
+    dump_recent_milestones_tail(reason, MILESTONE_CAPACITY);
+}
+
+#[cfg(rustos_debug_print_enabled)]
+fn dump_recent_milestones_tail(reason: &str, limit: usize) {
     let count = MILESTONES
         .try_lock()
         .map(|milestones| milestones.snapshot_len())
@@ -870,16 +886,17 @@ pub fn dump_recent_milestones(reason: &str) {
         LogLevel::Warn,
         module_path!(),
         line!(),
-        format_args!("milestone dump requested: {} count={}", reason, count),
+        format_args!("milestone dump requested: {} count={} shown={}", reason, count, count.min(limit)),
     );
 
     const CHUNK_LEN: usize = 16;
     let mut records = [MilestoneRecord::EMPTY; CHUNK_LEN];
-    let mut offset = 0;
+    let mut offset = count.saturating_sub(limit);
     while offset < count {
+        let remaining = (count - offset).min(CHUNK_LEN);
         let copied = MILESTONES
             .try_lock()
-            .map(|milestones| milestones.snapshot_chunk(offset, &mut records))
+            .map(|milestones| milestones.snapshot_chunk(offset, &mut records[..remaining]))
             .unwrap_or(0);
         if copied == 0 {
             break;
@@ -1150,15 +1167,22 @@ pub fn dump_recent_trace_locations(reason: &str) {
 #[cfg(not(rustos_debug_print_enabled))]
 pub fn dump_recent_trace_locations(_reason: &str) {}
 
-/// Bounded retries before a diagnostic hands its line to [`deferred`].
-///
-/// The sink is held with interrupts disabled, so a failed try always means a
-/// different, running CPU holds it. Retrying is therefore safe and one attempt
-/// is not enough: at 8 vCPU the kernel, uiserver, inputd, and the client all
-/// print. Retries bound the loss but cannot remove it on an unfair lock, which
-/// is why exhausting them parks the line instead of discarding it.
+/// Bounded historical context for a recoverable task fault. The full ring is
+/// retained for explicit/fatal dumps; exception handlers must not print all
+/// 128 unrelated historical records with IRQs masked on every user trap.
 #[cfg(rustos_debug_print_enabled)]
-const DEBUG_OUTPUT_ACQUIRE_ATTEMPTS: usize = 4096;
+pub fn dump_recent_trace_locations_tail(reason: &str, limit: usize) {
+    dump_recent_milestones_tail(reason, limit);
+}
+
+#[cfg(not(rustos_debug_print_enabled))]
+pub fn dump_recent_trace_locations_tail(_reason: &str, _limit: usize) {}
+
+/// Brief acquisition retry before handing the complete line to the per-CPU
+/// deferred ring. A vCPU holding the sink may itself be descheduled by the
+/// host, so spinning longer cannot provide a useful guest latency bound.
+#[cfg(rustos_debug_print_enabled)]
+const DEBUG_OUTPUT_ACQUIRE_ATTEMPTS: usize = 8;
 
 #[cfg(rustos_debug_print_enabled)]
 static DEBUG_BYTES_DISCARDED: AtomicU64 = AtomicU64::new(0);

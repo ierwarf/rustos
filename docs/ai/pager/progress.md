@@ -130,17 +130,21 @@ mapping linearly used to pay one per 4 KiB.
   than `map_run_pages_offered`. That split keeps mechanism in ring0 and policy
   in the pager.
 - **Ring0 populates** the surplus pages *after* the faulting page is mapped,
-  using the wired reserve first and the IRQ-safe allocator as fallback.
-  Exhausting both supplies stops the optional run, not the already-answered
-  fault.
+  using one user-class zeroed-frame batch for anonymous fault-around. This
+  preserves the wired reserve for demand pages and intermediate tables instead
+  of making every neighbour consume it. A short batch stops the optional run,
+  not the already-answered fault. Adjacent physical frames share one memset;
+  physical contiguity is never required for this fallback.
 
-Every surplus page is strictly best effort. The run stops at the first page it
-cannot serve — both frame sources empty, a racing unmap, an already-present
-leaf — and no failure is reported, because the fault itself is already answered.
-Each page
-revalidates process, MM, VMA and object generations independently, so a
-concurrent `exec` or `munmap` between two pages of one run ends the run rather
-than mapping into an address space that no longer owns the range.
+Every surplus page is strictly best effort. Anonymous installation retains the
+same VMA permit throughout the policy-bounded block, skips the demand page,
+returns an already-present neighbour's unused frame, and continues after that
+CAS loss. A mapping refusal ends the run and returns every unattempted frame
+in the batch too. The separate pager-reply path revalidates process, MM, VMA
+and object generations for each page. Neither path can publish outside the
+range whose authority it still holds. The batched supply and reserve separation
+are statically reviewed only; the historical measurements below do not measure
+this follow-up or Chrome input latency.
 
 Measured, `mmap` 1024 pages + touch every page + `munmap`, over the pager
 rendezvous:
