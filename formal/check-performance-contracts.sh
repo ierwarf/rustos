@@ -211,10 +211,22 @@ if [[ "$(rg -c 'drain_pending_vfs_mutations\(\)' "$ipc_helpers")" != 2 ]]; then
     exit 1
 fi
 vfs_socket=kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs
-if [[ "$(rg -c 'drain_pending_netd_refs\(\)' "$vfs_socket")" != 2 ]]; then
+if [[ "$(rg -Fc 'netd_refs::service()' "$vfs_socket")" != 1 ]]; then
     echo "netd deferred recovery escaped its sole housekeeping entrypoint" >&2
     exit 1
 fi
+netd_refs=kernel/compat/src/user/syscall/linux/service_ops/vfs_socket/netd_refs.rs
+for custody_anchor in \
+    'const CLOSES_PER_TURN: usize = 8;' \
+    'IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS;' \
+    'ipc_sender_ids_for_task(task) != Some((0, task))' \
+    'registry.confirmed_close(work);' \
+    'failed work retains capacity at the tail'; do
+    rg -Fq "$custody_anchor" "$netd_refs" || {
+        echo "netd reference custody or bounded kernel maintenance contract drifted: $custody_anchor" >&2
+        exit 1
+    }
+done
 
 if rg -Fq 'guest_deadline_reached' tools/xtask/src/kvm/{guest.rs,options.rs}; then
     echo "KVM regained an independent guest boot deadline during the SMP qualification run" >&2

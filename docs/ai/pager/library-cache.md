@@ -23,6 +23,13 @@ file is in the early-system authenticated allowlist. The warm worker reads
 this policy once VFS is available. Allowlist membership alone does not prove
 that a particular library was selected or its contents published.
 
+The warm worker must send the current `VFS_IPC_ABI_VERSION` on every library
+read. A zero-initialized/version-zero request is rejected by vfsd's ordinary
+wire validation with `EINVAL` before the manifest or file is read; retrying
+that request cannot warm the cache. The 2026-11-27 static correction sets the
+shared ABI version while retaining service-owner, identity, length and digest
+validation. Runtime cache residency and hit-rate improvement remain unmeasured.
+
 `libs/rustos-library-cache-policy` is a no_std host/Ring3 dependency, not a
 kernel dependency. Its versioned, bounded parser is shared by the stage producer
 and the pager consumer. Selection defaults are:

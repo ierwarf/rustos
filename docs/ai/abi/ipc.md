@@ -408,7 +408,14 @@ no cell/epoch state to refine.
   match this sender identity. Use the blocking variant only when the supervisor
   has no independent event source that must be polled before the next IPC.
 - Sender binding is mandatory for every published policy-service ingress, not
-  only rootd. Direct requests require a nonzero exact PID/TID match.
+  only rootd. Direct user requests require a nonzero exact PID/TID match.
+  Kernel maintenance uses `(0, exact_live_kernel_task_id)`, obtained only from
+  an exact live task pin with no user process/ABI binding. Ordinary, register
+  and handle-bearing queued receives attest the same identity. A missing,
+  stale or incomplete task remains `(0,0)` and is never kernel authority.
+  Each service explicitly admits its supported kernel operations; netd limits
+  this namespace to CLOSE/ACK/ACK_BATCH, while pagerd admits its region-edit
+  maintenance contract. VFS maintenance stamps the executing kernel task too.
   Service-to-service delegation is explicit: the receiver rechecks
   `SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER` for the kernel-stamped sender PID on
   every delegated request and never caches the result across exit, revoke, or

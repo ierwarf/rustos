@@ -186,9 +186,15 @@
   mutate checkpointed vfsd state and use the 5 s state-mutation lease, not the
   100 ms interactive rail (a short timeout leaves the outcome unknown). The 16 ms rail is reserved for non-consuming readiness queries; using
   it for control can reject a healthy accepted client under SMP contention.
-  The exact target socket reference acquired for ADD is itself a netd DUP
-  mutation and follows the same rule: one complete lease attempt, no retry of
-  a real timeout, and background replay ownership for uncertain completion.
+  The exact INET/netlink socket reference acquired for ADD is now a local
+  kernel count shared with dup/fork/SCM_RIGHTS and other descriptor pins; it
+  issues no netd DUP IPC. Initial socket publication already reserves final
+  CLOSE/ACK custody. The last local release queues one asynchronous close;
+  failed close/ACK work retains that slot, rotates fairly and backs off under
+  a shared 100 ms maintenance turn. Kernel cleanup authenticates its live task
+  identity, so netd does not reject its ACKs as an unavailable `(0,0)` sender.
+  This removes a source-backed reference-maintenance failure and foreground
+  IPC tail; the Chrome stall reduction is unmeasured (static review only).
 - The pre-catalog UI bootstrap reads only the signed Init environment registry.
   Its two service-local defaults are sealed in runtimed and are revalidated
   byte-for-byte against the generated launch catalog when that catalog is

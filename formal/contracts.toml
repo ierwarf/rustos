@@ -3827,3 +3827,47 @@ reason = "Original masked Current interval and target BindingPin survive floor a
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/ordering_publication/tests.rs"
 models = ["bootstrap-activation-handoff/BootstrapActivationHandoff", "lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[risk_surfaces]]
+path = "kernel/mm/src/memory/phys/free_word_index.rs"
+severity = "critical"
+flows = ["physical-frame-lifecycle"]
+reason = "The exact free-word hierarchy must track every central used-bitmap transition, preserve unavailable tail bits, and never select a used or cached frame. It narrows search, not frame ownership authority."
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/phys/free_word_index.rs"
+models = ["physical-frame-lifecycle/PhysicalFrameLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/nucleus-core/src/debug/deferred.rs"
+severity = "low"
+flows = ["smp-ring3-qualification"]
+reason = "Ready-bit publication and bounded draining retain complete records until their sole sink owner emits them; general traffic cannot consume required evidence reserve and overflow remains visible. Models do not establish physical sink delivery or capacity under arbitrary load."
+
+[[source_mappings]]
+path = "kernel/nucleus-core/src/debug/deferred.rs"
+models = ["smp-ring3-qualification/SmpRing3Qualification", "ui-frame-budget/UiFrameBudget"]
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/vfs_socket/netd_refs.rs"
+severity = "critical"
+flows = ["vfs-open-description", "service-restart", "ipc-handle-transfer"]
+reason = "A fixed custody slot must precede initial socket reply binding and conserve all local descriptor/transfer/pin references through final CLOSE and exact ACK. Failure, replay, endpoint epoch change and queue rotation may not lose or duplicate that original provider reference; stable hash slots cannot alias reused work."
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/vfs_socket/netd_refs.rs"
+models = ["service-mutation-recovery/ServiceMutationRecovery", "ipc-handle-transfer/IpcHandleTransfer", "netd-deferred-reply/NetdDeferredReply"]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/service_ops/vfs_socket/netd_refs/tests.rs"
+models = ["service-mutation-recovery/ServiceMutationRecovery", "ipc-handle-transfer/IpcHandleTransfer", "netd-deferred-reply/NetdDeferredReply"]
+
+[[risk_surfaces]]
+path = "services/netd/src/ref_replay.rs"
+severity = "critical"
+flows = ["service-restart", "netd-deferred-reply-lifecycle"]
+reason = "Reference mutation outcomes remain retained until exact acknowledgement. Replay and ACK are scoped to the authenticated sender PID namespace so user traffic cannot preempt or retire kernel maintenance operations; bounded batch validation precedes effects."
+
+[[source_mappings]]
+path = "services/netd/src/ref_replay.rs"
+models = ["service-mutation-recovery/ServiceMutationRecovery", "netd-deferred-reply/NetdDeferredReply"]

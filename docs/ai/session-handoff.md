@@ -6,6 +6,99 @@ stable repository prefix; use [task router](task-router.md) for owner contracts.
 Historical entries prior to 2026-11-25 live in `git log` (e.g.
 `git show HEAD:docs/ai/session-handoff.md`).
 
+## Chrome load and input stalls (2026-11-27, static review only)
+
+- User supplied a live-log analysis for Chrome searching `asdf` with 6 GiB
+  assigned to QEMU, and authorized implementation plus one final publication.
+  Base `4e13ed11` on `master`; the local clone has no original live log files.
+  Reported evidence: frequent `phys-contig-scan`, netd reference ACK queue
+  drops, input-to-present tails up to 7.06 s, repeated console-graph waits,
+  and low output Hz despite about 1 ms GPU render/page-flip averages.
+- Static-only validation remains in force: no compilation, tests, KVM,
+  benchmarks or formal execution. Runtime improvements must not be claimed
+  from these source changes. Numeric evidence above is user-supplied.
+- Physical allocation now maintains an exact hierarchy of non-full used
+  bitmap words, including initialization, allocation, cache custody and free.
+  Finding the next candidate word reads at most seven index words and two
+  used words at the supported maximum memory size; this is not a constant
+  bound for a complete arbitrary contiguous allocation. Required contiguous
+  allocation still searches for a real run. Existing bounded 2 MiB/64 KiB
+  anonymous probes and 4 KiB fallback remain intact. Optional fault-around
+  neighbours use one user-frame batch with coalesced zeroing, preserving the
+  2,048-frame wired reserve for demand and required page tables. Refill finds
+  empty reserve slots from ready-word complements instead of scanning slots.
+- Scan diagnostics are accumulated under the allocator lock and emitted
+  after a periodic try-lock snapshot has released both lock and IRQ masking.
+  `phys-contig-scan` historically included independent/cache refill scans and
+  counted skipped frame address distance, not actual bitmap loads. It now
+  carries a coalesced maximum sample. The new per-kind scan totals/work and
+  `phys-scan-word-work` separate qualifying calls, distances and search reads;
+  old-versus-new log line counts alone are not a performance comparison.
+- Netd socket publication reserves final-release custody before a descriptor
+  can escape. Dup/fork/SCM_RIGHTS and epoll pins share local references; only
+  final release queues CLOSE. The same fixed slot survives CLOSE, uncertain
+  replies and exact ACK, with stable hash chains and a free list instead of
+  fallible post-mutation queue admission or tombstone accumulation. A worker
+  turn processes bounded closes and 32-entry ACK batches under one 100 ms
+  deadline, rotating failed work with backoff. Exact provider epoch binding
+  prevents cleanup from crossing to a replacement provider.
+- IPC receive now identifies a live kernel task as `(0, nonzero exact TID)`;
+  unavailable `(0,0)` is not a kernel principal. Netd previously rejected
+  deferred cleanup's zero identity. Ordinary/register/handle receive, VFS
+  maintenance stamps, vfsd and pagerd admission are reconciled. Netd permits
+  the kernel identity only for CLOSE/ACK, scopes replay records and ACKs to
+  the authenticated sender PID, reserves cleanup log capacity and retains
+  results until exact ACK. NETD wire ABI is 10; mixed old/new service images
+  are not compatible. The SCM_RIGHTS entry gate now admits InetSocket only
+  with its existing attenuated TRANSFER right.
+- A due User-class dispatch reservation precedes overdue System/spawn hints
+  while retaining atomic activation, qualified synchronous handoff and
+  bounded maintenance exceptions. Futex returns no longer execute unrelated
+  provider cleanup; an existing pending-work hint only kicks the dedicated
+  executors. No quantum, CPU affinity or GPU queue-depth change was made.
+- Wayland completed partial snapshots release the UI's pixel Arc aliases
+  before patching and restore every snapshot in the same UI turn, including
+  failed or metadata-unchanged completions. External readers retain COW
+  isolation. Sparse SHM reads skip substantial padding only for at most eight
+  rows; dense/tall patches retain one bulk read. Runtime response framing is
+  coalesced over the existing kernel-local AF_UNIX path, not a netd IPC path.
+- The console's 40 ms graph wait already ran on a background worker; an
+  unchanged deadline alone was not a blocked UI owner. It now re-arms without
+  recollecting all state/sessions. Focus and running-set insertion/removal
+  publish graph edges, initial stored/wire tokens both start at one, and
+  metadata-only accepted refreshes wake the UI. Rootd session admission runs
+  after suspended-PID/cancellation custody acknowledgement on the launch
+  worker; refunds, deferred kills and reap run on the reaper worker. Failed
+  worker creation no longer invokes their blocking receiver-side fallback.
+  Bootstrap manifest reading remains synchronous; the runtime receiver still
+  has other synchronous paths, including explicit terminate and client I/O.
+- `input-to-present` is renamed `input-to-submit`: its endpoint is accepted
+  display submission, not scanout completion or Chrome's key echo. Snapshot
+  elapsed time now includes applying the completed patch. Pager library warm
+  reads now use VFS ABI 5 rather than zero, which the provider rejected with
+  EINVAL before reading a manifest.
+- Diagnostic sink contention uses bounded eight-attempt acquisition and
+  eight-record ready-bitmap draining. Deferred records retain custody and
+  required reserve isolation; sink overflow counters remain visible. Sink
+  guards release the lock before restoring interrupts. Recoverable user
+  exception dumps retain exact markers/registers and eight recent records;
+  kernel/fatal history remains full. Milestone `dropped` counts sink custody
+  failure, not wrapping the recent-history ring. The supplied #BP count does
+  not identify its originating RIP or establish its cause; traps are not
+  suppressed and Chrome console warnings are not claimed resolved.
+- Independent static cross-review covered frame ownership/CAS loss, reserve
+  refill, sender attestation, socket publication rollback, local reference
+  lifetime, epoch/replay custody, graph producers, UI snapshot restoration,
+  scheduler reservation and diagnostic publication/IRQ ordering. Regression
+  source cases and existing source-contract anchors were updated. Whitespace
+  checks and changed Python/TOML/shell syntax parsing are the only executed
+  checks; new Rust regressions remain uncompiled and unexecuted. The generated
+  registry hash/counts were synchronized as text metadata, reproducing the
+  unchanged pre-THP document byte-for-byte before applying current inputs;
+  this also includes the preceding THP commit's two omitted source mappings.
+  No new Chrome input
+  latency, throughput, FPS, allocation time or formal proof result is claimed.
+
 ## SMP futex wake tail trace (2026-11-27)
 
 - Follow-up: `build/smp-followup/detail2-join.log` joins slow user wakes by

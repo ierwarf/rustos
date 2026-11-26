@@ -42,20 +42,25 @@
   selected DRM compatibility description.
 - Linux `openat` installs `KernelHandle::RemoteVfs` for regular files + directories after vfsd registration.
 - Linux `dup`/`dup2`/`dup3` acquire the exact open-description reference before
-  publishing the local duplicate. Socket and input descriptions cross their
-  service boundary; remote VFS and epoll descriptor references are counted
-  locally by the kernel fd substrate. Epoll sends only create and final-retire
+  publishing the local duplicate. Socket, remote VFS and epoll descriptor
+  references are counted locally by the kernel fd substrate; input descriptions
+  retain their service boundary. Epoll sends only create and final-retire
   mutations to vfsd, so a routine `fcntl(F_DUPFD*)` cannot inherit vfsd
   scheduling latency. `close` removes the local descriptor first, then performs
   any token-addressed final provider release; a wedged vfsd/netd cannot retain
-  a reusable numeric fd or block process retirement. Netd socket DUP, final
-  CLOSE, and their exact replay ACK mutate the provider's open-description
-  reference and therefore own one complete bounded 5 s state-mutation lease
-  attempt (a short timeout leaves the provider outcome unknown); only a
-  foreground final CLOSE keeps the 100 ms rail, because its fd is already
-  retired and nobody consumes the result, and housekeeping replays it under
-  the lease. They do not split the deadline or retry a real timeout; exact
-  mutation identity transfers to housekeeping. Checkpointed epoll
+  a reusable numeric fd or block process retirement. Before binding the initial
+  netd socket reply, the kernel reserves one fixed custody slot for the exact
+  provider epoch and token. Dup/fork/SCM_RIGHTS, epoll pins and transferred
+  descriptors share that slot's local reference count; they issue no netd DUP.
+  The last release queues one exact CLOSE without foreground IPC. The same slot
+  survives unknown completion and becomes its ACK, so no committed mutation
+  competes for new queue capacity. One kernel cleanup turn attempts at most
+  eight closes and two batches of at most 32 ACKs under one shared 100 ms end;
+  failed work retains custody, rotates to the tail and backs off from 8 ms to
+  1024 ms. Only confirmed provider retirement discards stale-epoch work;
+  timeouts never authorize retargeting to a replacement netd. A successful
+  CLOSE consumes the kernel's one provider reference even if other explicit
+  provider DUP references remain. Checkpointed epoll
   create/ADD/MOD/DEL/retire and matching purges follow the same control rail.
   `VFS_IPC_OP_CURSOR_SETTLE` (`COMMIT`/`CANCEL`/`SYNC`) and checkpoint visibility
   ACK mutate provider custody and use one full state-mutation lease attempt, not
@@ -247,8 +252,11 @@
   and wakes `nucleus_housekeeping_task` once cleanup completes. Similarly,
   `vfsd`'s `bulk_read_worker` reuses a lock-free cached worker pool with a 2 s
   idle retirement (0 resident threads at rest) instead of spawning a fresh
-  thread via `SYS_CLONE` per bulk-read request, and published Ring3 service
-  owners never run synchronous provider cleanup inside `FUTEX_WAKE`. The
+  thread via `SYS_CLONE` per bulk-read request. No futex-return path performs
+  synchronous retired-process or provider cleanup: successful wait/wake and
+  wait-`EAGAIN` paths only kick the existing housekeeping tasks when the
+  retirement pending bit is set. Retirement producers already wake those
+  tasks; an ordinary mutex wake with no retirement work does not. The
   cleanup pass removes every task-scoped
   futex, wait-set, service-discovery, input, block, bootstrap-TTY, and proc
   broker record; terminal-process cleanup also closes provider references and
