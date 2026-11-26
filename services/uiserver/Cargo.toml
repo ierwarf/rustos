@@ -15,7 +15,7 @@ keyboard-core = { path = "../../drivers/libs/keyboard-core" }
 libc = "0.2"
 runtime-control = { path = "../../libs/runtime-control" }
 vte = { version = "0.15.0", default-features = false }
-wayland-protocols = { version = "0.32.12", features = ["server", "unstable"] }
+wayland-protocols = { version = "0.32.12", features = ["server", "unstable", "staging"] }
 wayland-server = "0.31.13"
 
 [build-dependencies]

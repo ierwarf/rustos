@@ -366,6 +366,37 @@ impl WaylandState {
         has_damage: bool,
         outcome: &mut Outcome,
     ) -> Planned {
+        if let Some(pixel) = source.shared.solid_pixel {
+            let mut present_outcome = Outcome {
+                has_damage: true,
+                release: outcome.release.take(),
+                mapped: false,
+                dirty: true,
+                trigger_initial_configure: false,
+            };
+            if !self.present_original(
+                resource,
+                shared,
+                Arc::new(vec![pixel]),
+                1,
+                1,
+                &mut present_outcome,
+            ) {
+                return Planned::Abort;
+            }
+            if let Ok(mut surface) = shared.lock() {
+                surface.current_buffer = Some(source.clone());
+                surface.last_damage = Rect {
+                    x: 0,
+                    y: 0,
+                    width: surface.width,
+                    height: surface.height,
+                };
+            }
+            *outcome = present_outcome;
+            self.record_buffer_copy(Duration::ZERO, 4);
+            return Planned::Done;
+        }
         let output_scale = self.output_scale.max(1) as usize;
         let viewport_active = shared.lock().is_ok_and(|surface| {
             surface.viewport.is_active()

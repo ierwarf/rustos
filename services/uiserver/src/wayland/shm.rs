@@ -206,7 +206,8 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for WaylandState {
                     id,
                     BufferData {
                         shared: Arc::new(WaylandBufferState {
-                            pool: data.shared.clone(),
+                            pool: Some(data.shared.clone()),
+                            solid_pixel: None,
                             offset,
                             width,
                             height,

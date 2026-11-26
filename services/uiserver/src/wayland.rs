@@ -66,6 +66,7 @@ mod commit;
 mod compositor;
 mod data_device;
 mod dmabuf;
+mod extensions;
 mod input;
 mod keyboard;
 mod output;
@@ -182,6 +183,41 @@ fn create_wayland_globals(handle: &DisplayHandle) {
     // Version 3: format/modifier events only, no feedback objects. No
     // format is advertised because nothing is importable (dmabuf.rs).
     handle.create_global::<WaylandState, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, _>(3, ());
+    handle.create_global::<
+        WaylandState,
+        wayland_protocols::wp::content_type::v1::server::wp_content_type_manager_v1::WpContentTypeManagerV1,
+        _,
+    >(1, ());
+    handle.create_global::<
+        WaylandState,
+        wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+        _,
+    >(1, ());
+    handle.create_global::<
+        WaylandState,
+        wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+        _,
+    >(2, ());
+    handle.create_global::<
+        WaylandState,
+        wayland_protocols::wp::single_pixel_buffer::v1::server::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1,
+        _,
+    >(1, ());
+    handle.create_global::<
+        WaylandState,
+        wayland_protocols::xdg::activation::v1::server::xdg_activation_v1::XdgActivationV1,
+        _,
+    >(1, ());
+    handle.create_global::<
+        WaylandState,
+        wayland_protocols::wp::idle_inhibit::zv1::server::zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
+        _,
+    >(1, ());
+    handle.create_global::<
+        WaylandState,
+        wayland_protocols::ext::idle_notify::v1::server::ext_idle_notifier_v1::ExtIdleNotifierV1,
+        _,
+    >(2, ());
 }
 
 fn post_protocol_error<I: Resource>(resource: &I, message: String) {
@@ -510,6 +546,7 @@ impl WaylandCompositor {
         }
         crate::note_wayland_step(crate::WAYLAND_STEP_POINTER_FLUSH);
         self.state.flush_pointer_motion(false);
+        self.state.update_idle_notifications(Instant::now());
         let flush_started = Instant::now();
         crate::note_wayland_step(crate::WAYLAND_STEP_FLUSH);
         self.flush_clients();
@@ -587,14 +624,17 @@ impl WaylandCompositor {
     }
 
     pub(crate) fn pointer_motion(&mut self, x: u32, y: u32) {
+        self.state.note_input_activity();
         self.state.pointer_motion(x, y);
     }
 
     pub(crate) fn pointer_button(&mut self, button: u32, pressed: bool) -> bool {
+        self.state.note_input_activity();
         self.state.pointer_button(button, pressed)
     }
 
     pub(crate) fn pointer_scroll(&mut self, vertical: i32, horizontal: i32) -> bool {
+        self.state.note_input_activity();
         self.state.pointer_scroll(vertical, horizontal)
     }
 
@@ -617,6 +657,7 @@ impl WaylandCompositor {
     }
 
     pub(crate) fn keyboard_input(&mut self, event: InputEvent) -> bool {
+        self.state.note_input_activity();
         self.state.keyboard_input(event)
     }
 
@@ -1246,6 +1287,12 @@ struct WaylandState {
     pointer_button_down: bool,
     pointer_motion_pending: bool,
     next_pointer_motion_flush: Instant,
+    last_input_activity: Instant,
+    cursor_shape: u32,
+    next_activation_token_seq: u64,
+    activation_tokens: VecDeque<extensions::StoredActivationToken>,
+    idle_notifications: Vec<extensions::IdleNotificationEntry>,
+    idle_inhibitors: Vec<extensions::IdleInhibitorEntry>,
     dirty: bool,
     callback_profile_started: Instant,
     callback_profile_count: u64,
@@ -1396,6 +1443,9 @@ struct WaylandSurfaceState {
     /// Double-buffered viewport: requests write `pending`, commit promotes it.
     pending_viewport: ViewportState,
     viewport: ViewportState,
+    content_type_constructed: bool,
+    content_type: u32,
+    fractional_scale_constructed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1425,7 +1475,8 @@ struct BufferData {
 }
 
 struct WaylandBufferState {
-    pool: Arc<Mutex<WaylandShmPoolState>>,
+    pool: Option<Arc<Mutex<WaylandShmPoolState>>>,
+    solid_pixel: Option<u32>,
     offset: usize,
     width: usize,
     height: usize,

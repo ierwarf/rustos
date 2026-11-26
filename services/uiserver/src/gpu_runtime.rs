@@ -39,10 +39,11 @@ use crate::gpu_scene::{
     GpuLayerKind, GpuSceneCompiler, GpuSceneError, GpuSceneLayer, GpuTextureCapability,
 };
 use crate::render::{
-    ConsoleAtlasBinding, CroppedWaylandBinding, GpuAtlasScene, WaylandAtlasBinding,
-    build_gpu_atlas_scene, gpu_cursor_layer, gpu_dock_reuse_signature, gpu_scene_reuse_signature,
-    update_console_gpu_textures, update_cropped_wayland_textures, update_dock_gpu_texture,
-    update_gpu_cursor_texture, update_gpu_layer_destinations, update_wayland_gpu_textures,
+    ConsoleAtlasBinding, CroppedConsoleBinding, CroppedWaylandBinding, GpuAtlasScene,
+    WaylandAtlasBinding, build_gpu_atlas_scene, gpu_cursor_layer, gpu_dock_reuse_signature,
+    gpu_scene_reuse_signature, update_console_gpu_textures, update_cropped_console_textures,
+    update_cropped_wayland_textures, update_dock_gpu_texture, update_gpu_cursor_texture,
+    update_gpu_layer_destinations, update_wayland_gpu_textures,
 };
 use crate::sys::{
     DisplayGpuInfo, DisplayInfo, DisplaySurfaceCreate, EAGAIN, EINVAL, ENODEV, ESTALE,
@@ -173,6 +174,7 @@ pub(crate) struct GpuCompositor {
     cropped: bool,
     cropped_reusable: bool,
     cropped_wayland_bindings: Vec<CroppedWaylandBinding>,
+    cropped_console_bindings: Vec<CroppedConsoleBinding>,
     capacity_pressure_logged_at: Option<Instant>,
     wayland_bindings: Vec<WaylandAtlasBinding>,
     console_bindings: Vec<ConsoleAtlasBinding>,
@@ -609,6 +611,7 @@ impl GpuCompositor {
                 cropped: false,
                 cropped_reusable: false,
                 cropped_wayland_bindings: Vec::new(),
+                cropped_console_bindings: Vec::new(),
                 capacity_pressure_logged_at: None,
                 wayland_bindings: Vec::new(),
                 console_bindings: Vec::new(),
@@ -708,6 +711,19 @@ impl GpuCompositor {
                     None => full_rebuild = true,
                 }
             }
+            if !full_rebuild && self.cropped {
+                match update_cropped_console_textures(
+                    state,
+                    self.atlas.as_mut_slice(),
+                    stride_pixels,
+                    self.cropped_console_bindings.as_mut_slice(),
+                )
+                .map_err(gpu_scene_errno)?
+                {
+                    Some(changed) => damage.extend(changed.into_iter().map(damage_from_rect)),
+                    None => full_rebuild = true,
+                }
+            }
             if !full_rebuild {
                 match update_console_gpu_textures(
                     state,
@@ -765,6 +781,7 @@ impl GpuCompositor {
                 wayland_bindings,
                 console_bindings,
                 cropped_wayland_bindings,
+                cropped_console_bindings,
                 cropped_reusable,
                 cropped,
                 used_height: next_used_height,
@@ -860,6 +877,7 @@ impl GpuCompositor {
             self.cropped = cropped;
             self.cropped_reusable = cropped_reusable;
             self.cropped_wayland_bindings = cropped_wayland_bindings;
+            self.cropped_console_bindings = cropped_console_bindings;
             // The rebuilt atlas was cut from the current snapshots, which
             // already contain every accepted commit.
             state.wayland_pending_damage.clear();

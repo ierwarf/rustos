@@ -1,8 +1,8 @@
 //! Occlusion is source selection, not CPU composition: every fragment still
 //! samples exactly one independently rasterized layer, in original draw order.
 use super::{
-    CroppedWaylandBinding, GpuAtlasScene, PlannedWindow, chrome, gpu_window_draw_plan,
-    render_dock_gpu_texture, render_wayland_gpu_texture, taskbar_dirty_rect,
+    CroppedConsoleBinding, CroppedWaylandBinding, GpuAtlasScene, PlannedWindow, chrome,
+    gpu_window_draw_plan, render_dock_gpu_texture, render_wayland_gpu_texture, taskbar_dirty_rect,
     wayland_window_client_rect_for, wayland_window_outer_rect,
 };
 use crate::app::AppState;
@@ -497,8 +497,8 @@ pub(super) fn build_cropped_gpu_atlas_scene(
             true,
         )?;
     }
-    let mut cropped_reusable = true;
     let mut cropped_wayland_bindings = Vec::new();
+    let mut cropped_console_bindings = Vec::new();
     for (plan_index, planned) in plan.iter().enumerate() {
         let layer_fragments: Vec<(Rect, Rect)> = fragments
             .iter()
@@ -521,7 +521,16 @@ pub(super) fn build_cropped_gpu_atlas_scene(
                     fragments: layer_fragments,
                 });
             }
-            PlannedWindow::Console { .. } => cropped_reusable = false,
+            PlannedWindow::Console { index, focused } => {
+                let window = &state.console_windows[index];
+                cropped_console_bindings.push(CroppedConsoleBinding {
+                    session_handle: window.session_handle,
+                    content_version: window.surface_cache.content_version,
+                    outer: window.frame,
+                    focused,
+                    fragments: layer_fragments,
+                });
+            }
         }
     }
     let layers = fragments
@@ -545,7 +554,8 @@ pub(super) fn build_cropped_gpu_atlas_scene(
         wayland_bindings: Vec::new(),
         console_bindings: Vec::new(),
         cropped_wayland_bindings,
-        cropped_reusable,
+        cropped_console_bindings,
+        cropped_reusable: true,
         cropped: true,
     })
 }

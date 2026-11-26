@@ -177,8 +177,10 @@ pub(crate) struct GpuAtlasScene {
     /// window, so a client commit patches its fragments instead of
     /// rebuilding the whole atlas.
     pub(crate) cropped_wayland_bindings: Vec<CroppedWaylandBinding>,
-    /// False when a visible fragment belongs to a console window; console
-    /// content has no fragment binding, so such a scene rebuilds on any change.
+    /// Cropped scenes only: retained fragment placement per visible console
+    /// window, so terminal updates patch only that console's fragments instead
+    /// of forcing a full rebuild on every frame.
+    pub(crate) cropped_console_bindings: Vec<CroppedConsoleBinding>,
     pub(crate) cropped_reusable: bool,
 }
 
@@ -194,6 +196,17 @@ pub(crate) struct CroppedWaylandBinding {
     /// layers below it; damage that makes them translucent invalidates the
     /// fragment set.
     pub(crate) pixels_opaque: bool,
+    /// `(source rect in outer-window coordinates, atlas region)`.
+    pub(crate) fragments: Vec<(Rect, Rect)>,
+}
+
+/// One visible console window inside a cropped (occlusion-fragment) scene.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CroppedConsoleBinding {
+    pub(crate) session_handle: u64,
+    pub(crate) content_version: u64,
+    pub(crate) outer: Rect,
+    pub(crate) focused: bool,
     /// `(source rect in outer-window coordinates, atlas region)`.
     pub(crate) fragments: Vec<(Rect, Rect)>,
 }
@@ -418,6 +431,7 @@ fn build_full_gpu_atlas_scene(
         wayland_bindings,
         console_bindings,
         cropped_wayland_bindings: Vec::new(),
+        cropped_console_bindings: Vec::new(),
         cropped_reusable: true,
     })
 }
@@ -536,8 +550,6 @@ pub(crate) fn gpu_scene_reuse_signature(state: &AppState, cropped: bool) -> u64 
         }
         for window in &state.console_windows {
             mix(cropped_scene_position_key(window.frame.x, window.frame.y));
-            mix(window.output_generation);
-            mix(u64::from(window.terminal_dirty));
         }
     }
     signature
@@ -827,6 +839,111 @@ pub(crate) fn update_cropped_wayland_textures(
             return Ok(None);
         }
         binding.content_version = window.content_version;
+    }
+    Ok(Some(damage))
+}
+
+/// Patch the retained fragments of visible console windows in a cropped scene.
+///
+/// Returns `None` when the window moved/resized, changed focus, disappeared, or
+/// has an incompatible surface cache; the caller then falls back to a full rebuild.
+pub(crate) fn update_cropped_console_textures(
+    state: &mut AppState,
+    atlas_pixels: &mut [u32],
+    atlas_stride_pixels: usize,
+    bindings: &mut [CroppedConsoleBinding],
+) -> Result<Option<Vec<Rect>>, GpuSceneError> {
+    update_cropped_console_windows_textures(
+        state.console_windows.as_mut_slice(),
+        state.focused_session_handle,
+        state.focused_wayland_surface_id,
+        atlas_pixels,
+        atlas_stride_pixels,
+        bindings,
+    )
+}
+
+pub(crate) fn update_cropped_console_windows_textures(
+    console_windows: &mut [ConsoleWindow],
+    focused_session: ConsoleSessionHandle,
+    focused_wayland_surface_id: Option<u32>,
+    atlas_pixels: &mut [u32],
+    atlas_stride_pixels: usize,
+    bindings: &mut [CroppedConsoleBinding],
+) -> Result<Option<Vec<Rect>>, GpuSceneError> {
+    let console_focus_active = focused_wayland_surface_id.is_none() && focused_session != 0;
+    if bindings.iter().any(|binding| {
+        console_windows
+            .iter()
+            .find(|window| !window.minimized && window.session_handle == binding.session_handle)
+            .is_none_or(|window| {
+                let focused = console_focus_active && window.session_handle == focused_session;
+                window.frame != binding.outer || focused != binding.focused
+            })
+    }) {
+        return Ok(None);
+    }
+
+    let mut damage = Vec::new();
+    let mut scratch = Vec::new();
+    for binding in bindings.iter_mut() {
+        let Some(window) = console_windows
+            .iter_mut()
+            .find(|window| !window.minimized && window.session_handle == binding.session_handle)
+        else {
+            return Ok(None);
+        };
+        let focused = console_focus_active && window.session_handle == focused_session;
+        chrome::rebuild_console_window_surface(window, focused);
+        if !window.surface_cache.valid
+            || window.surface_cache.width != binding.outer.width
+            || window.surface_cache.height != binding.outer.height
+        {
+            return Ok(None);
+        }
+        if window.surface_cache.content_version == binding.content_version {
+            continue;
+        }
+        scratch.clear();
+        scratch.extend_from_slice(&window.surface_cache.pixels);
+        chrome::apply_window_texture_alpha(
+            scratch.as_mut_slice(),
+            binding.outer.width,
+            binding.outer.width,
+            binding.outer.height,
+            focused,
+        );
+        for &(source, region) in &binding.fragments {
+            if source.width != region.width || source.height != region.height {
+                return Ok(None);
+            }
+            for row in 0..region.height {
+                let source_start = (source.y + row)
+                    .checked_mul(binding.outer.width)
+                    .and_then(|offset| offset.checked_add(source.x))
+                    .ok_or(GpuSceneError::InvalidLayer)?;
+                let source_end = source_start
+                    .checked_add(region.width)
+                    .ok_or(GpuSceneError::InvalidLayer)?;
+                let destination_start = (region.y + row)
+                    .checked_mul(atlas_stride_pixels)
+                    .and_then(|offset| offset.checked_add(region.x))
+                    .ok_or(GpuSceneError::InvalidLayer)?;
+                let destination_end = destination_start
+                    .checked_add(region.width)
+                    .ok_or(GpuSceneError::InvalidLayer)?;
+                atlas_pixels
+                    .get_mut(destination_start..destination_end)
+                    .ok_or(GpuSceneError::InvalidLayer)?
+                    .copy_from_slice(
+                        scratch
+                            .get(source_start..source_end)
+                            .ok_or(GpuSceneError::InvalidLayer)?,
+                    );
+            }
+            damage.push(region);
+        }
+        binding.content_version = window.surface_cache.content_version;
     }
     Ok(Some(damage))
 }

@@ -113,7 +113,7 @@ impl BufferData {
     }
 
     fn pool_handle(&self) -> Option<(Arc<OwnedFd>, usize)> {
-        let pool = self.shared.pool.lock().ok()?;
+        let pool = self.shared.pool.as_ref()?.lock().ok()?;
         Some((Arc::clone(&pool.fd), pool.len))
     }
 }
