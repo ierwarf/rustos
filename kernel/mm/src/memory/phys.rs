@@ -464,6 +464,35 @@ impl PhysAllocatorState {
         Some(PhysAddr::new(start_frame as u64 * PAGE_SIZE))
     }
 
+    /// Speculative 64 KiB allocation: inspect a bounded number of bitmap words
+    /// near the normal cursor, with no cache drain or fallback search.
+    fn try_alloc_anon_folio_locked(&mut self) -> Option<PhysAddr> {
+        const SEARCH_WORDS: usize = 8;
+        let pages = ANON_FOLIO_PAGES;
+        // Do not count cached frames: this path cannot acquire or drain them.
+        if !self.initialized || self.free_frames.saturating_sub(self.min_free_frames) < pages {
+            return None;
+        }
+        let words = self.geo.frame_count.div_ceil(BITS_PER_WORD);
+        let first = (self.next_hint / BITS_PER_WORD).min(words.checked_sub(1)?);
+        for offset in 0..words.min(SEARCH_WORDS) {
+            let word_index = (first + offset) % words;
+            let used = self.geo.used.load_word(word_index);
+            for bit in (0..BITS_PER_WORD).step_by(pages) {
+                let frame = word_index * BITS_PER_WORD + bit;
+                if frame == 0 || frame + pages > self.geo.frame_count {
+                    continue;
+                }
+                let mask = ((1_u64 << pages) - 1) << bit;
+                if used & mask == 0 {
+                    self.commit_alloc_locked(frame, pages);
+                    return Some(PhysAddr::new(frame as u64 * PAGE_SIZE));
+                }
+            }
+        }
+        None
+    }
+
     /// Fills `out` with up to `out.len()` single frames under one lock hold,
     /// stopping at the first allocation failure. Unlike
     /// `alloc_contiguous_locked`, frames need not be adjacent — callers that
@@ -1052,6 +1081,19 @@ pub fn try_free_frame(phys: PhysAddr) -> Result<(), FreeFrameError> {
     }
 }
 
+/// Fixed, small anonymous folio order. The PTEs remain 4 KiB; the physical
+/// allocation is naturally aligned and the frames can retire independently.
+pub(crate) const ANON_FOLIO_PAGES: usize = 16;
+
+/// A nonblocking user-class allocation for the IRQ-off first-touch path.
+/// Fragmentation or contention simply leaves the ordinary fault path in charge.
+pub(crate) fn try_alloc_anon_folio() -> Option<PhysAddr> {
+    if nucleus_core::util::fault_injection::should_fail("alloc.frame") {
+        return None;
+    }
+    irq_safe(|| PHYS_POOL.try_alloc_anon_folio())
+}
+
 /// Fills `out` with independent (not necessarily adjacent) user-class frames,
 /// no more than the frames above the kernel reserve. A short fill means pressure, not only exhaustion.
 pub fn alloc_frames_batch_user(out: &mut [PhysAddr]) -> usize {
@@ -1282,6 +1324,39 @@ mod tests {
         };
         state.mark_range_free(0, page_count);
         state
+    }
+
+    #[test]
+    fn anonymous_folio_is_aligned_owned_and_individually_releasable() {
+        let mut words = [0_u64; 4];
+        let mut state = test_state(&mut words, 256, 17);
+        assert_eq!(state.reserve_phys_range(ANON_FOLIO_PAGES as u64 * PAGE_SIZE, PAGE_SIZE), 1);
+        let head = state.try_alloc_anon_folio_locked().unwrap();
+        let start = (head.as_u64() / PAGE_SIZE) as usize;
+        assert_eq!(start, 32);
+        assert!((start..start + ANON_FOLIO_PAGES).all(|p| state.is_used(p)));
+        state.free_frame_locked(PhysAddr::new(head.as_u64() + PAGE_SIZE)).unwrap();
+        assert!(!state.is_used(start + 1));
+        assert!(state.is_used(start) && state.is_used(start + 2));
+    }
+
+    #[test]
+    fn anonymous_folio_bounds_the_search_and_preserves_the_watermark() {
+        let mut words = [0_u64; 16];
+        let mut state = test_state(&mut words, 1024, 0);
+        for frame in (0..512).step_by(ANON_FOLIO_PAGES) {
+            assert_eq!(state.reserve_phys_range(frame as u64 * PAGE_SIZE, PAGE_SIZE), 1);
+        }
+        let before = state.free_frames;
+        assert!(state.try_alloc_anon_folio_locked().is_none());
+        assert_eq!(state.free_frames, before);
+        state.next_hint = 512;
+        state.min_free_frames = before - ANON_FOLIO_PAGES + 1;
+        assert!(state.try_alloc_anon_folio_locked().is_none());
+        assert_eq!(state.free_frames, before);
+        state.min_free_frames -= 1;
+        assert_eq!(state.try_alloc_anon_folio_locked(), Some(PhysAddr::new(512 * PAGE_SIZE)));
+        assert_eq!(state.free_frames, state.min_free_frames);
     }
 
     #[test]

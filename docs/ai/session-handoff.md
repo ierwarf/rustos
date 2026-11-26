@@ -6,6 +6,23 @@ stable repository prefix; use [task router](task-router.md) for owner contracts.
 Historical entries prior to 2026-11-25 live in `git log` (e.g.
 `git show HEAD:docs/ai/session-handoff.md`).
 
+## Anonymous 64 KiB mTHP (working tree)
+
+- Eligible write first touches can allocate a contiguous 16-frame folio and
+  publish it through a single prepared page table; the VMA permit and 4 KiB
+  frame ownership rules are unchanged. See [pager policy and limits](pager/progress.md#45-fault-around-one-entry-a-run-of-pages).
+- The existing independent-frame path remains the fallback. This does not
+  enable 2 MiB PMD leaves, background collapse, or a new Linux madvise ABI.
+- Verified: `cargo xtask check`, 733 MM/compat unit tests, 23 static formal
+  preflight checks, and `anon_folio_lifecycle` (protection, COW, partial unmap)
+  on KVM at 1 and 8 vCPUs. The KVM logs include folio installs.
+- The 1-vCPU 4 MiB sequential probe measured p50 3.23 ms versus 3.77 ms
+  in the earlier `build/pager-bench.FcAC2x/` run, 16 samples per arm with
+  the same CPUID p50. This is not repeated A/B or Chrome/Dino evidence.
+- Logs: `build/anon-folio/`. A full PR formal run was not performed. The 2 MiB
+  hardware leaf path still needs ownership-aware demotion, clone/COW, user-copy
+  and reclamation coverage before it can be exposed.
+
 ## Ring3 service performance batch (2026-11-26, static review only)
 
 User requested all 13 Ring3 services except `uiserver`, prioritizing net gains,

@@ -171,8 +171,19 @@ most of it was the round trip, not the batching. Do not quote it.
 fault-around covers file-backed pages only: those are already in the page
 cache, so mapping neighbours is nearly free. Anonymous neighbours must be
 allocated and zeroed, so Linux batches them through multi-size THP instead.
-This is mTHP's shape — an aligned block, clipped to the VMA — without its
-folio: a run's pages are 16 independent frames, not one allocation unit.
+RustOS now attempts a **64 KiB PTE-mapped anonymous folio** for write faults
+in private committed anonymous VMAs of at least 2 MiB, only when the
+pagerd policy permits a complete 16-page run inside the VMA. A bounded
+nonblocking allocator attempt gets 16 physically adjacent, naturally
+aligned frames, zeroes the extent once, then publishes ordinary 4 KiB PTEs
+from one prepared table under the same VMA permit. It publishes the demand
+page first and frees unused frames after admission or CAS loss. Contention,
+fragmentation, a populated leaf, insufficient quota or a disabled policy
+falls back to the existing independent-frame path. Partial `munmap`,
+`mprotect`, COW and exit still operate at 4 KiB granularity; there is no
+hardware 2 MiB user PMD leaf or background collapse worker. The
+`pager-anon-folio-installed` milestone reports successful demand installs
+and the number of additional leaves installed by that attempt.
 
 **Distinguishing a speculative page from a touched one needs no new state.**
 An earlier revision of this file claimed it did, and that was wrong. The CAS

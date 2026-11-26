@@ -1171,6 +1171,54 @@ fn run_all_probes(tsc_khz: u64) {
 /// A closed vocabulary rather than a dispatch table keyed by the report name:
 /// an unrecognized filter must not silently fall back to running everything,
 /// which would defeat the isolation this exists for.
+/// Exercise ordinary 4 KiB operations within one populated 64 KiB block.
+fn probe_anon_folio_lifecycle(name: &str, tsc_khz: u64) {
+    const PAGE: usize = 4096;
+    const SPAN: usize = 4 * 1024 * 1024;
+    const FOLIO: usize = 64 * 1024;
+    let samples = measure(1, 0, || unsafe {
+        let mapping = libc::mmap(
+            ptr::null_mut(), SPAN, libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0,
+        );
+        if mapping == libc::MAP_FAILED {
+            return false;
+        }
+        let align_offset = (mapping as usize).wrapping_neg() & (FOLIO - 1);
+        let block = mapping.cast::<u8>().add(align_offset);
+        let left = block.add(PAGE);
+        let middle = block.add(2 * PAGE);
+        let right = block.add(3 * PAGE);
+        ptr::write_volatile(left, 0xa5);
+        let mut resident = [0_u8; FOLIO / PAGE];
+        let ok = libc::mincore(block.cast(), FOLIO, resident.as_mut_ptr()) == 0
+            && resident.iter().all(|value| value & 1 != 0)
+            && ptr::read_volatile(middle) == 0
+            && ptr::read_volatile(right) == 0
+            && libc::mprotect(right.cast(), PAGE, libc::PROT_READ) == 0;
+        let ok = ok && {
+            let child = linux_fork_syscall();
+            if child == 0 {
+                ptr::write_volatile(left, 0x5a);
+                libc::_exit(if ptr::read_volatile(left) == 0x5a { 0 } else { 1 });
+            }
+            let mut status = 0;
+            child > 0 && wait_child(child, &mut status).is_ok()
+                && child_exited_successfully(status) && ptr::read_volatile(left) == 0xa5
+        };
+        let ok = ok && libc::munmap(middle.cast(), PAGE) == 0
+            && libc::mincore(middle.cast(), PAGE, resident.as_mut_ptr()) == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM)
+            && ptr::read_volatile(left) == 0xa5 && ptr::read_volatile(right) == 0;
+        let removed = libc::munmap(mapping, SPAN) == 0;
+        ok && removed
+    });
+    match samples {
+        Some(mut samples) => report(name, &summarize(&mut samples), tsc_khz),
+        None => skip(name, "anonymous-folio-lifecycle-failed"),
+    }
+}
+
 fn run_single_probe(name: &str, tsc_khz: u64) {
     match name {
         component_contract::FILTER => components::run(tsc_khz),
@@ -1211,18 +1259,18 @@ fn run_single_probe(name: &str, tsc_khz: u64) {
             measure_anonymous_mapping(name, 1, MappingTouch::Write, 2_000, tsc_khz)
         }
         "mmap_unmap_64" => measure_anonymous_mapping(name, 64, MappingTouch::Write, 256, tsc_khz),
-        // Reserve 1024 pages, fault exactly one, then unmap. This is the
-        // reservation-and-teardown cost of a large mapping: the unmap walks a
-        // range holding one resident page. It is *not* a fault-path or a
-        // fully-present-unmap measurement, despite the page count in its name.
+        "anon_folio_lifecycle" => probe_anon_folio_lifecycle(name, tsc_khz),
+        // Reserve 1024 pages, write exactly one, then unmap. Fault-around can
+        // make neighboring pages resident, but this does not measure teardown
+        // of a fully populated mapping.
         "mmap_unmap_1024_pages" => {
             measure_anonymous_mapping(name, 1024, MappingTouch::Write, 32, tsc_khz)
         }
         // The same reservation with every page faulted in before teardown.
         // This is the probe that actually exercises the demand-fault path and
         // the fully-present unmap, so it is the only one whose numbers may be
-        // used to justify a change to either. Iterations are lower because one
-        // iteration costs 1024 fault round trips, not one.
+        // used to justify a change to either. Each iteration writes all 1024
+        // pages; batching may combine many writes into one fault.
         "mmap_unmap_1024_faulted_pages" => {
             measure_anonymous_mapping(name, 1024, MappingTouch::WriteEveryPage, 16, tsc_khz)
         }

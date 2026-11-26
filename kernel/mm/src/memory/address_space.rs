@@ -49,8 +49,8 @@ use pager_fault_mapping::{
     read_user_table_entry, without_root_owned_user_leaf_tag,
 };
 pub use pager_fault_mapping::{
-    CowWriteResult, ensure_current_fault_tables_at, map_current_prepared_pager_fault_frame_at,
-    resolve_current_cow_write_at,
+    ANON_FOLIO_BYTES, CowWriteResult, ensure_current_fault_tables_at, map_current_prepared_pager_fault_frame_at,
+    resolve_current_cow_write_at, try_map_current_prepared_anon_folio,
 };
 use rollback::{rollback_external_user_pages, rollback_user_pages};
 pub use user_copy::{UserTranslationMemo, ValidatedUserRead, ValidatedUserWrite};

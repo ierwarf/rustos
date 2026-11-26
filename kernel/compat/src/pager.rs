@@ -10,7 +10,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::memory as mm_api;
 use crate::multitask as ps_api;
-use rustos_user_abi::pager::{PagerFaultDispatchWire, PagerFaultReplyWire, PagerFaultRequestWire};
+use rustos_user_abi::pager::{
+    PagerFaultDispatchWire, PagerFaultReplyWire, PagerFaultRequestWire, PagerVmRegionWire,
+};
 use x86_64::{PhysAddr, VirtAddr, structures::paging::PageTableFlags};
 
 static FIRST_ANONYMOUS_FAULT_COMPLETED: AtomicBool = AtomicBool::new(false);
@@ -19,6 +21,7 @@ static REJECTED_ANONYMOUS_FAULT_GRANTS: AtomicU64 = AtomicU64::new(0);
 static REJECTED_ANONYMOUS_FAULT_MAPS: AtomicU64 = AtomicU64::new(0);
 /// Pages populated around a fault rather than by a fault of their own.
 static POPULATED_RUN_PAGES: AtomicU64 = AtomicU64::new(0);
+static ANON_FOLIO_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Anonymous faults ring0 could not serve because the wired reserve was empty.
 static RING0_FAULTS_WITHOUT_FRAME: AtomicU64 = AtomicU64::new(0);
 /// Anonymous faults restarted because a VMA writer held the publication.
@@ -461,6 +464,71 @@ fn serve_anonymous_first_touch_enabled(
         return outcome;
     }
 
+    let run_pages = crate::pager_policy::anonymous_policy_irq_off().fault_run_pages;
+    let folio = anon_folio_start(region, request.virtual_address, request.access, run_pages)
+    .and_then(|start| {
+        mm_api::paging::try_map_current_prepared_anon_folio(
+            VirtAddr::new(start),
+            VirtAddr::new(request.virtual_address),
+            page_flags(prot),
+        )
+    });
+    let (installed, populated, single_frame) = if let Some(populated) = folio {
+        (Ok(true), populated, None)
+    } else {
+        match install_single_anonymous_fault(request, prot, region, run_pages) {
+            Ok(result) => result,
+            Err(outcome) => return outcome,
+        }
+    };
+    // This is the writer/installer handoff point. Bookkeeping and single-page
+    // rollback must not delay the VMA writer once publication has ended.
+    drop(permit);
+    if folio.is_some() {
+        frame_supply_recovered();
+        let total = ANON_FOLIO_FAULTS.fetch_add(1, Ordering::Relaxed) + 1;
+        if total == 1 || total.is_multiple_of(1024) {
+            nucleus_core::debug::record_milestone(
+                nucleus_core::debug::LogCategory::Compat,
+                "pager-anon-folio-installed",
+                total,
+                populated,
+            );
+        }
+    }
+    complete_anonymous_install(request, installed, populated, single_frame)
+}
+
+fn anon_folio_start(region: PagerVmRegionWire, fault: u64, access: u16, run_pages: u32) -> Option<u64> {
+    use rustos_user_abi::pager::{
+        PAGER_PAGE_BYTES, VM_ACCESS_WRITE, VM_OBJECT_ANONYMOUS, VM_PROT_WRITE, VM_SHARING_PRIVATE,
+    };
+    const BYTES: u64 = mm_api::paging::ANON_FOLIO_BYTES;
+    const MIN_REGION: u64 = 2 * 1024 * 1024;
+    let start = fault & !(BYTES - 1);
+    let end = start.checked_add(BYTES)?;
+    // The pagerd run policy is the upper bound; don't expand small mappings,
+    // reads, shared mappings, or blocks intersecting the VMA fringe.
+    (u64::from(run_pages) * PAGER_PAGE_BYTES == BYTES
+        && access == VM_ACCESS_WRITE
+        && region.prot & VM_PROT_WRITE != 0
+        && region.object.object_type == VM_OBJECT_ANONYMOUS
+        && region.sharing == VM_SHARING_PRIVATE
+        && region.is_committed()
+        && region.end.saturating_sub(region.start) >= MIN_REGION
+        && region.start <= start
+        && end <= region.end)
+        .then_some(start)
+}
+
+type FaultInstall = (Result<bool, mm_api::paging::AddressSpaceError>, u64, Option<PhysAddr>);
+
+fn install_single_anonymous_fault(
+    request: PagerFaultRequestWire,
+    prot: u32,
+    region: PagerVmRegionWire,
+    run_pages: u32,
+) -> Result<FaultInstall, AnonymousFaultOutcome> {
     // Frame supply, fast path first.
     //
     // The wired reserve is a *latency* device, not the supply: it is lock-free
@@ -497,7 +565,7 @@ fn serve_anonymous_first_touch_enabled(
                 // Both sources are empty: memory exhaustion. The governor gets
                 // a bounded window to free the largest holder before this
                 // thread is the one that dies (see `frame_shortage_outcome`).
-                None => return frame_shortage_outcome(),
+                None => return Err(frame_shortage_outcome()),
             }
         }
     };
@@ -518,12 +586,18 @@ fn serve_anonymous_first_touch_enabled(
     // already clipped to this VMA's own extent, so no page outside the region
     // that raised the fault can be touched.
     let populated = match installed {
-        Ok(_) => populate_run_under_permit(request, prot, region.start, region.end),
+        Ok(_) => populate_run_under_permit(request, prot, region.start, region.end, run_pages),
         Err(_) => 0,
     };
-    // This is the writer/installer handoff point.  No subsequent bookkeeping
-    // may keep the VMA writer from starting its ordinary locked mutation.
-    drop(permit);
+    Ok((installed, populated, Some(frame)))
+}
+
+fn complete_anonymous_install(
+    request: PagerFaultRequestWire,
+    installed: Result<bool, mm_api::paging::AddressSpaceError>,
+    populated: u64,
+    single_frame: Option<PhysAddr>,
+) -> AnonymousFaultOutcome {
     if populated != 0 {
         let total = POPULATED_RUN_PAGES.fetch_add(populated, Ordering::Relaxed) + populated;
         if total.is_multiple_of(4096) {
@@ -535,25 +609,15 @@ fn serve_anonymous_first_touch_enabled(
             );
         }
     }
-    let mapped = match installed {
-        Ok(true) => true,
-        Ok(false) => {
-            // Another fault won the one leaf CAS.  That mapping resolves this
-            // fault too; only our unused reserve frame must be returned.
-            if !mm_api::frame_capability::return_pager_fault_frame(frame) {
-                mm_api::phys::free_frame(frame);
-            }
-            true
-        }
-        Err(_) => false,
-    };
-    if !mapped {
-        // The frame was never published into any address space, so it returns
-        // to the reserve it came from. If the reserve will not take it back,
-        // it must still be freed rather than leaked.
-        if !mm_api::frame_capability::return_pager_fault_frame(frame) {
-            mm_api::phys::free_frame(frame);
-        }
+    // The ordinary path may have an unpublished frame after a CAS loss or
+    // rejection. The folio path already returned all unpublished frames.
+    if !matches!(installed, Ok(true))
+        && let Some(frame) = single_frame
+        && !mm_api::frame_capability::return_pager_fault_frame(frame)
+    {
+        mm_api::phys::free_frame(frame);
+    }
+    if installed.is_err() {
         // First occurrence *and* every 16th. A rejected mapping stalls exactly
         // the thread that faulted, so the one that matters most is the first;
         // reporting only every 16th is how this class stayed invisible until a
@@ -712,6 +776,7 @@ fn populate_run_under_permit(
     prot: u32,
     region_start: u64,
     region_end: u64,
+    run_pages: u32,
 ) -> u64 {
     use rustos_user_abi::pager::PAGER_PAGE_BYTES;
 
@@ -729,7 +794,7 @@ fn populate_run_under_permit(
     // IRQ-off reader uses the compiled-in default; that changes only this
     // best-effort fault-around run. The policy validator keeps it a power of
     // two, which is what makes the alignment below tile rather than straddle.
-    let run_pages = u64::from(crate::pager_policy::anonymous_policy_irq_off().fault_run_pages);
+    let run_pages = u64::from(run_pages);
     let block_bytes = run_pages * PAGER_PAGE_BYTES;
     let block_start = (request.virtual_address / block_bytes) * block_bytes;
     let Some(block_end) = block_start.checked_add(block_bytes) else {
@@ -1148,6 +1213,39 @@ mod tests {
         PAGER_FAULT_ABI_VERSION, PagerEndpointCapabilityWire, PagerFaultRequestWire,
         PagerObjectIdentityWire, VM_ACCESS_READ, VM_OBJECT_ANONYMOUS, VM_PROT_READ,
     };
+
+    #[test]
+    fn anon_folio_never_crosses_vma_or_exceeds_policy() {
+        use rustos_user_abi::pager::{
+            PagerVmRegionWire, VM_ACCESS_WRITE, VM_COMMIT_COMMITTED, VM_OBJECT_FILE_PRIVATE,
+            VM_PROT_WRITE, VM_SHARING_PRIVATE, VM_SHARING_SHARED,
+        };
+        let base = 0x20_0000;
+        let mut region = PagerVmRegionWire {
+            start: base + 4096,
+            end: base + 0x20_0000 + 8192,
+            object: PagerObjectIdentityWire {
+                object_type: VM_OBJECT_ANONYMOUS,
+                ..Default::default()
+            },
+            sharing: VM_SHARING_PRIVATE,
+            prot: VM_PROT_READ | VM_PROT_WRITE,
+            commit_state: VM_COMMIT_COMMITTED,
+            ..Default::default()
+        };
+        let interior = base + 0x10000;
+        let check = |r, address, access, pages| super::anon_folio_start(r, address, access, pages);
+        assert_eq!(check(region, interior + 4096, VM_ACCESS_WRITE, 16), Some(interior));
+        assert_eq!(check(region, region.start, VM_ACCESS_WRITE, 16), None);
+        assert_eq!(check(region, region.end - 4096, VM_ACCESS_WRITE, 16), None);
+        assert_eq!(check(region, interior, VM_ACCESS_READ, 16), None);
+        assert_eq!(check(region, interior, VM_ACCESS_WRITE, 4), None);
+        region.sharing = VM_SHARING_SHARED;
+        assert_eq!(check(region, interior, VM_ACCESS_WRITE, 16), None);
+        region.sharing = VM_SHARING_PRIVATE;
+        region.object.object_type = VM_OBJECT_FILE_PRIVATE;
+        assert_eq!(check(region, interior, VM_ACCESS_WRITE, 16), None);
+    }
 
     #[test]
     fn an_empty_frame_supply_is_retried_for_the_grace_and_then_refused() {

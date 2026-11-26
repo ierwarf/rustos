@@ -195,7 +195,20 @@ pub fn map_current_prepared_pager_fault_frame_at(
         return Err(AddressSpaceError::InvalidFrameOwnership);
     }
     let page_flags = normalize_user_page_flags(flags)? | ROOT_OWNED_USER_LEAF;
-    let root_phys = kernel_vm::current_root_phys().as_u64();
+    let root = kernel_vm::current_root_phys();
+    with_prepared_user_leaf_atomic(root, start, |leaf| {
+        install_prepared_data_leaf(root, start, frame_phys, page_flags, leaf)
+    })
+}
+
+fn install_prepared_data_leaf(
+    root: PhysAddr,
+    start: VirtAddr,
+    frame_phys: u64,
+    page_flags: PageTableFlags,
+    leaf: &AtomicU64,
+) -> Result<bool, AddressSpaceError> {
+    let root_phys = root.as_u64();
     let virtual_address = start.as_u64();
     // A job's memory limit refuses here like a watermark denial: the caller
     // returns its unpublished frame and reports no frame. Fault-around stops at
@@ -211,13 +224,11 @@ pub fn map_current_prepared_pager_fault_frame_at(
     let desired = frame_phys | page_flags.bits();
     // ORDERING: success releases descriptor-admitted frame contents before the
     // present leaf; failure acquires any leaf published by a competing fault.
-    let result = with_prepared_user_leaf_atomic(PhysAddr::new(root_phys), start, |leaf| match leaf
-        .compare_exchange(0, desired, Ordering::AcqRel, Ordering::Acquire)
-    {
+    let result = match leaf.compare_exchange(0, desired, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => Ok(true),
         Err(observed) if observed & PageTableFlags::PRESENT.bits() != 0 => Ok(false),
         Err(_) => Err(AddressSpaceError::AlreadyMapped),
-    });
+    };
     match result {
         Ok(true) => {
             phys::publish_data_leaf(root_phys, virtual_address, frame_phys);
@@ -1598,6 +1609,89 @@ fn pager_fault_range_end(start: VirtAddr, page_count: usize) -> Result<u64, Addr
         .ok_or(AddressSpaceError::AddressOverflow)
 }
 
+pub const ANON_FOLIO_BYTES: u64 = phys::ANON_FOLIO_PAGES as u64 * PAGE_4KIB_U64;
+
+/// Attempts one aligned 64 KiB anonymous folio with ordinary 4 KiB PTEs.
+/// The caller holds the exact VMA install permit and has prepared the table.
+/// `Some` means the demand page was installed; the value counts extra pages.
+/// Every unpublished frame is freed, including on a competing PTE install.
+pub fn try_map_current_prepared_anon_folio(
+    start: VirtAddr,
+    fault: VirtAddr,
+    flags: PageTableFlags,
+) -> Option<u64> {
+    const PAGES: usize = phys::ANON_FOLIO_PAGES;
+    const BYTES: u64 = ANON_FOLIO_BYTES;
+    let offset = fault.as_u64().checked_sub(start.as_u64())?;
+    if !start.as_u64().is_multiple_of(BYTES)
+        || offset >= BYTES
+        || !offset.is_multiple_of(PAGE_4KIB_U64)
+    {
+        return None;
+    }
+    validate_user_page_range(start, PAGES).ok()?;
+    let flags = normalize_user_page_flags(flags).ok()? | ROOT_OWNED_USER_LEAF;
+    let root = kernel_vm::current_root_phys();
+    let mut unused = [PhysAddr::new(0); PAGES];
+    let mut unused_len = 0;
+    let result = with_prepared_user_leaf_table(root, start, |table| {
+        let first = p1_index(start);
+        // SAFETY: The aligned block lies in this one live, permit-pinned PT.
+        let leaves = unsafe { prepared_atomic_leaves(table, first, PAGES) };
+        if !phys::root_admits(root.as_u64(), PAGES as u64)
+            // ORDERING: Advisory check only; the publishing CAS arbitrates.
+            || leaves.iter().any(|leaf| leaf.load(Ordering::Relaxed) != 0)
+        {
+            return Ok(None);
+        }
+        let Some(head) = phys::try_alloc_anon_folio() else {
+            return Ok(None);
+        };
+        // SAFETY: the allocator just handed us an exclusive, contiguous
+        // direct-mapped run. All bytes are zeroed before publishing any PTE.
+        unsafe { ptr::write_bytes(higher_half_ptr(head), 0, BYTES as usize) };
+
+        let demand = (offset / PAGE_4KIB_U64) as usize;
+        let frame_at = |i| head.as_u64() + i as u64 * PAGE_4KIB_U64;
+        if install_prepared_data_leaf(root, fault, frame_at(demand), flags, &leaves[demand])
+            != Ok(true)
+        {
+            for (index, frame) in unused.iter_mut().enumerate() {
+                *frame = PhysAddr::new(frame_at(index));
+            }
+            unused_len = PAGES;
+            return Ok(None);
+        }
+        let mut populated = 0;
+        let mut admitted = true;
+        for (index, leaf) in leaves.iter().enumerate() {
+            if index == demand {
+                continue;
+            }
+            let frame = frame_at(index);
+            let addr = VirtAddr::new(start.as_u64() + index as u64 * PAGE_4KIB_U64);
+            if admitted {
+                match install_prepared_data_leaf(root, addr, frame, flags, leaf) {
+                    Ok(true) => {
+                        populated += 1;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(_) => admitted = false,
+                }
+            }
+            unused[unused_len] = PhysAddr::new(frame);
+            unused_len += 1;
+        }
+        Ok(Some(populated))
+    });
+    if unused_len != 0 {
+        let mut failures = [(PhysAddr::new(0), phys::FreeFrameError::AlreadyFree); PAGES];
+        assert_eq!(phys::try_free_frames_batch(&unused[..unused_len], &mut failures), 0);
+    }
+    result.ok().flatten()
+}
+
 /// Calls `f` with the atomic representation of an existing 4 KiB user leaf.
 ///
 /// The VMA publication permit serializes topology changes with this helper.
@@ -1607,6 +1701,33 @@ fn with_prepared_user_leaf_atomic<R>(
     pml4_phys: PhysAddr,
     virt: VirtAddr,
     f: impl FnOnce(&AtomicU64) -> Result<R, AddressSpaceError>,
+) -> Result<R, AddressSpaceError> {
+    with_prepared_user_leaf_table(pml4_phys, virt, |table| {
+        // SAFETY: The permit pins the table and this index names one PTE.
+        let leaves = unsafe { prepared_atomic_leaves(table, p1_index(virt), 1) };
+        f(&leaves[0])
+    })
+}
+
+/// # Safety
+/// `table` is a live user PT pinned for the borrowed lifetime; `first..first + len`
+/// is inside that table. Concurrent fault writers access those leaves atomically.
+unsafe fn prepared_atomic_leaves<'a>(
+    table: PhysAddr,
+    first: usize,
+    len: usize,
+) -> &'a [AtomicU64] {
+    debug_assert!(first + len <= ENTRIES_PER_TABLE);
+    let base = kernel_vm::higher_half_addr(table.as_u64()) as *const AtomicU64;
+    // SAFETY: The table is a page-aligned array of 8-byte PTEs, and the caller
+    // pins its backing memory and guarantees the checked span.
+    unsafe { core::slice::from_raw_parts(base.add(first), len) }
+}
+
+fn with_prepared_user_leaf_table<R>(
+    pml4_phys: PhysAddr,
+    virt: VirtAddr,
+    f: impl FnOnce(PhysAddr) -> Result<R, AddressSpaceError>,
 ) -> Result<R, AddressSpaceError> {
     // SAFETY: the current root is active on this CPU and the publication permit
     // excludes concurrent topology mutation for the target prepared leaf.
@@ -1627,15 +1748,7 @@ fn with_prepared_user_leaf_atomic<R>(
     if pd_entry.is_unused() || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
         return Err(AddressSpaceError::NotMapped);
     }
-    // SAFETY: the prepared PTE is a repr(transparent) `u64` and naturally
-    // aligned.  Only this CAS path accesses it atomically while the permit is
-    // held; normal writers first withdraw and drain that permit.
-    let pt = unsafe { kernel_vm::phys_to_table_ref(pd_entry.addr()) };
-    let raw = &pt[p1_index(virt)] as *const PageTableEntry as *mut u64;
-    // SAFETY: `raw` is the naturally aligned u64 storage of that prepared PTE,
-    // and the permit forces every concurrent fault mutation through atomics.
-    let leaf = unsafe { AtomicU64::from_ptr(raw) };
-    f(leaf)
+    f(pd_entry.addr())
 }
 
 /// Calls `f` with an existing 4 KiB user leaf entry.

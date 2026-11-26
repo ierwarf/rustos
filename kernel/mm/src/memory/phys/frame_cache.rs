@@ -498,6 +498,14 @@ impl PhysPool {
         self.spills.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(super) fn try_alloc_anon_folio(&self) -> Option<PhysAddr> {
+        let mut state = self.state.try_lock()?;
+        let head = state.try_alloc_anon_folio_locked()?;
+        // ORDERING: Relaxed mirrors the exact count committed under the lock.
+        self.central_free.store(state.free_frames, Ordering::Relaxed);
+        Some(head)
+    }
+
     pub(super) fn alloc_contiguous(
         &self,
         slot: usize,

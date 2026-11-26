@@ -1,8 +1,8 @@
 pub use crate::memory::address_space::{
-    AddressSpaceError, CowWriteResult, ImmutableBacking, ProcessAddressSpace, USER_SPACE_BASE,
+    ANON_FOLIO_BYTES, AddressSpaceError, CowWriteResult, ImmutableBacking, ProcessAddressSpace, USER_SPACE_BASE,
     USER_SPACE_END_EXCLUSIVE, UserRegion, ensure_current_fault_tables_at,
     current_user_leaf_is_eof_guard, map_current_prepared_pager_fault_frame_at,
-    resolve_current_cow_write_at,
+    resolve_current_cow_write_at, try_map_current_prepared_anon_folio,
 };
 pub use crate::memory::kernel_vm::{KERNEL_PML4, KERNEL_VIRT_OFFSET, WRITE_COMBINE_BIT};
 
