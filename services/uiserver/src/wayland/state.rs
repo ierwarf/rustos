@@ -25,6 +25,7 @@ impl WaylandState {
             pointer_grab_serial: None,
             drag: None,
             moving_surface: None,
+            resizing_surface: None,
             pointer_focus: None,
             pointer_target: None,
             keyboard_focus: None,
@@ -76,7 +77,7 @@ impl WaylandState {
         let desktop = layout::desktop_bounds(self.display_width, self.display_height);
         let (x, y) = layout::cascade_origin(desktop, index);
 
-        clamp_wayland_frame(
+        layout::clamp_wayland_frame(
             Rect {
                 x,
                 y,
@@ -274,7 +275,7 @@ impl WaylandState {
                 title: surface.title.clone(),
                 frame,
                 minimized: surface.minimized,
-                server_decoration: surface.decoration_server,
+                server_decoration: surface.decoration_server && !surface.fullscreen,
                 drag_icon: surface.drag_icon_active,
                 popup: surface.is_child(),
                 content_version: surface.content_version,
@@ -673,19 +674,53 @@ impl WaylandState {
     }
 
     pub(super) fn send_toplevel_configure(&mut self, surface: &Arc<Mutex<WaylandSurfaceState>>) {
-        let (xdg_surface, toplevel, decoration, decoration_server, width, height) = {
+        let _ = self.send_toplevel_configure_serial(surface);
+    }
+
+    pub(super) fn send_toplevel_configure_serial(
+        &mut self,
+        surface: &Arc<Mutex<WaylandSurfaceState>>,
+    ) -> Option<u32> {
+        let focused_id = self
+            .keyboard_focus
+            .as_ref()
+            .map(|focus| focus.surface.id());
+        let (xdg_surface, toplevel, decoration, decoration_server, width, height, states_bytes) = {
             let Ok(state) = surface.lock() else {
-                return;
+                return None;
             };
             let Some(xdg_surface) = state.xdg_surface.clone() else {
-                return;
+                return None;
             };
             let Some(toplevel) = state.toplevel.clone() else {
-                return;
+                return None;
             };
             let scale = self.output_scale.max(1) as usize;
             let logical_w = (state.frame.width / scale).max(1);
             let logical_h = (state.frame.height / scale).max(1);
+            let activated = focused_id.as_ref().is_some_and(|focused| {
+                state
+                    .resource
+                    .as_ref()
+                    .is_some_and(|resource| resource.id() == *focused)
+            });
+            let mut state_words: Vec<u32> = Vec::with_capacity(4);
+            if state.maximized {
+                state_words.push(xdg_toplevel::State::Maximized as u32);
+            }
+            if state.fullscreen {
+                state_words.push(xdg_toplevel::State::Fullscreen as u32);
+            }
+            if state.resizing {
+                state_words.push(xdg_toplevel::State::Resizing as u32);
+            }
+            if activated {
+                state_words.push(xdg_toplevel::State::Activated as u32);
+            }
+            let states_bytes: Vec<u8> = state_words
+                .into_iter()
+                .flat_map(u32::to_ne_bytes)
+                .collect();
             (
                 xdg_surface,
                 toplevel,
@@ -697,10 +732,11 @@ impl WaylandState {
                 },
                 i32::try_from(logical_w).unwrap_or(0),
                 i32::try_from(logical_h).unwrap_or(0),
+                states_bytes,
             )
         };
 
-        toplevel.configure(width, height, Vec::<u8>::new());
+        toplevel.configure(width, height, states_bytes);
         if let Some(decoration) = decoration {
             decoration.configure(if decoration_server {
                 zxdg_toplevel_decoration_v1::Mode::ServerSide
@@ -725,6 +761,7 @@ impl WaylandState {
             state.outstanding_configures.push(serial);
             state.needs_initial_configure = false;
         }
+        Some(serial)
     }
 
     /// Dynamically updates the Wayland output scale, notifies every bound
@@ -789,19 +826,10 @@ impl WaylandState {
                             state.frame.width = w;
                             state.frame.height = h;
                         } else if !state.drag_icon_role {
-                            let (vis_w, vis_h) = wayland_client_size_for_buffer(
+                            Self::apply_committed_buffer_frame(
+                                &mut state,
                                 w,
                                 h,
-                                self.display_width,
-                                self.display_height,
-                            );
-                            state.frame = clamp_wayland_frame(
-                                Rect {
-                                    x: state.frame.x,
-                                    y: state.frame.y,
-                                    width: vis_w,
-                                    height: vis_h,
-                                },
                                 self.display_width,
                                 self.display_height,
                             );

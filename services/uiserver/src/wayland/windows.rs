@@ -81,6 +81,14 @@ impl WaylandState {
             self.pointer_button_down = false;
             self.pointer_grab_serial = None;
         }
+        if self
+            .resizing_surface
+            .is_some_and(|grab| grab.surface_id == surface_id)
+        {
+            self.resizing_surface = None;
+            self.pointer_button_down = false;
+            self.pointer_grab_serial = None;
+        }
         if let Some(object_id) = object_id.as_ref() {
             self.drag_surface_destroyed(object_id);
             // Only the surface that owns the pointer grab ends it; retiring an
@@ -174,9 +182,17 @@ impl WaylandState {
         };
         state.alive = true;
         state.minimized = false;
+        state.maximized = false;
+        state.fullscreen = false;
+        state.resizing = false;
         // The wl_surface survives, but this is a new toplevel. Keep the
         // placement, not the old role's saved maximize state or preferences.
         state.pre_maximize_frame = None;
+        state.pre_fullscreen_frame = None;
+        state.min_size = (0, 0);
+        state.max_size = (0, 0);
+        state.pending_configure_geometry_serial = None;
+        state.resize_anchor = None;
         state.title.clear();
         state.title.push_str("Wayland App");
         state.decoration_requested_server = true;
@@ -226,6 +242,46 @@ impl WaylandState {
         true
     }
 
+    pub(super) fn effective_server_decoration(state: &WaylandSurfaceState) -> bool {
+        !state.fullscreen
+            && (state.decoration_server
+                || (state.decoration.is_some() && state.decoration_requested_server))
+    }
+
+    pub(super) fn clamp_frame_to_limits(
+        state: &WaylandSurfaceState,
+        frame: Rect,
+        display_width: u32,
+        display_height: u32,
+    ) -> Rect {
+        let server_decoration = Self::effective_server_decoration(state);
+        let (max_disp_w, max_disp_h) =
+            wayland_max_client_size_with_decoration(display_width, display_height, server_decoration);
+        let min_w = state.min_size.0.min(max_disp_w).max(1);
+        let min_h = state.min_size.1.min(max_disp_h).max(1);
+        let max_w = if state.max_size.0 > 0 {
+            state.max_size.0.min(max_disp_w).max(min_w)
+        } else {
+            max_disp_w
+        };
+        let max_h = if state.max_size.1 > 0 {
+            state.max_size.1.min(max_disp_h).max(min_h)
+        } else {
+            max_disp_h
+        };
+        clamp_wayland_frame_with_decoration(
+            Rect {
+                x: frame.x,
+                y: frame.y,
+                width: frame.width.clamp(min_w, max_w),
+                height: frame.height.clamp(min_h, max_h),
+            },
+            display_width,
+            display_height,
+            server_decoration,
+        )
+    }
+
     pub(super) fn move_surface(&mut self, surface_id: u32, x: usize, y: usize) -> bool {
         let Some(shared) = self.find_surface_by_id(surface_id) else {
             return false;
@@ -235,7 +291,8 @@ impl WaylandState {
         let Ok(mut state) = shared.lock() else {
             return false;
         };
-        let clamped = clamp_wayland_frame(
+        let server_decoration = Self::effective_server_decoration(&state);
+        let clamped = clamp_wayland_frame_with_decoration(
             Rect {
                 x,
                 y,
@@ -244,6 +301,7 @@ impl WaylandState {
             },
             display_width,
             display_height,
+            server_decoration,
         );
         if state.frame.x == clamped.x && state.frame.y == clamped.y {
             return false;
@@ -282,63 +340,225 @@ impl WaylandState {
         true
     }
 
+    pub(super) fn set_surface_maximized_shared(
+        &mut self,
+        shared: &Arc<Mutex<WaylandSurfaceState>>,
+        maximized: bool,
+    ) -> bool {
+        let display_width = self.display_width;
+        let display_height = self.display_height;
+        let changed = {
+            let Ok(mut state) = shared.lock() else {
+                return false;
+            };
+            if !state.alive {
+                return false;
+            }
+            let was_maximized = state.maximized || state.pre_maximize_frame.is_some();
+            if was_maximized == maximized && !state.needs_initial_configure {
+                return false;
+            }
+            state.fullscreen = false;
+            state.pre_fullscreen_frame = None;
+            state.resize_anchor = None;
+            let server_decoration = Self::effective_server_decoration(&state);
+            let next_frame = if maximized {
+                if state.pre_maximize_frame.is_none() {
+                    state.pre_maximize_frame = Some(state.frame);
+                }
+                state.maximized = true;
+                maximized_wayland_client_rect(display_width, display_height, server_decoration)
+            } else {
+                state.maximized = false;
+                let saved = state.pre_maximize_frame.take().unwrap_or(state.frame);
+                Self::clamp_frame_to_limits(&state, saved, display_width, display_height)
+            };
+            let frame_changed = state.frame != next_frame;
+            state.frame = next_frame;
+            frame_changed || was_maximized != maximized
+        };
+        if let Some(serial) = self.send_toplevel_configure_serial(shared) {
+            if let Ok(mut state) = shared.lock() {
+                state.pending_configure_geometry_serial = Some(serial);
+            }
+        }
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    pub(super) fn set_surface_fullscreen_shared(
+        &mut self,
+        shared: &Arc<Mutex<WaylandSurfaceState>>,
+        fullscreen: bool,
+    ) -> bool {
+        let display_width = self.display_width;
+        let display_height = self.display_height;
+        let changed = {
+            let Ok(mut state) = shared.lock() else {
+                return false;
+            };
+            if !state.alive {
+                return false;
+            }
+            let was_fullscreen = state.fullscreen;
+            if was_fullscreen == fullscreen && !state.needs_initial_configure {
+                return false;
+            }
+            state.resize_anchor = None;
+            let next_frame = if fullscreen {
+                if state.pre_fullscreen_frame.is_none() {
+                    state.pre_fullscreen_frame = Some(state.frame);
+                }
+                state.fullscreen = true;
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: (display_width as usize).max(1),
+                    height: (display_height as usize).max(1),
+                }
+            } else {
+                state.fullscreen = false;
+                if let Some(saved) = state.pre_fullscreen_frame.take() {
+                    Self::clamp_frame_to_limits(&state, saved, display_width, display_height)
+                } else if state.maximized {
+                    maximized_wayland_client_rect(
+                        display_width,
+                        display_height,
+                        Self::effective_server_decoration(&state),
+                    )
+                } else {
+                    Self::clamp_frame_to_limits(&state, state.frame, display_width, display_height)
+                }
+            };
+            let frame_changed = state.frame != next_frame;
+            state.frame = next_frame;
+            frame_changed || was_fullscreen != fullscreen
+        };
+        if let Some(serial) = self.send_toplevel_configure_serial(shared) {
+            if let Ok(mut state) = shared.lock() {
+                state.pending_configure_geometry_serial = Some(serial);
+            }
+        }
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
     pub(super) fn toggle_surface_maximized(&mut self, surface_id: u32) -> bool {
+        let Some(shared) = self.find_surface_by_id(surface_id) else {
+            return false;
+        };
+        let next_maximized = shared
+            .lock()
+            .ok()
+            .is_some_and(|state| !(state.maximized || state.pre_maximize_frame.is_some()));
+        self.set_surface_maximized_shared(&shared, next_maximized)
+    }
+
+    pub(super) fn begin_surface_resize(&mut self, surface_id: u32, _edge: ResizeEdge) -> bool {
+        let Some(shared) = self.find_surface_by_id(surface_id) else {
+            return false;
+        };
+        let changed = {
+            let Ok(mut state) = shared.lock() else {
+                return false;
+            };
+            if state.resizing {
+                return false;
+            }
+            state.resizing = true;
+            true
+        };
+        self.send_toplevel_configure(&shared);
+        changed
+    }
+
+    pub(super) fn end_surface_resize(&mut self, surface_id: u32) -> bool {
+        let Some(shared) = self.find_surface_by_id(surface_id) else {
+            return false;
+        };
+        let changed = {
+            let Ok(mut state) = shared.lock() else {
+                return false;
+            };
+            let was_resizing = state.resizing || state.resize_anchor.is_some();
+            state.resizing = false;
+            state.resize_anchor = None;
+            was_resizing
+        };
+        if changed {
+            self.send_toplevel_configure(&shared);
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    pub(super) fn resize_surface(
+        &mut self,
+        surface_id: u32,
+        frame: Rect,
+        edge: Option<ResizeEdge>,
+    ) -> bool {
         let Some(shared) = self.find_surface_by_id(surface_id) else {
             return false;
         };
         let display_width = self.display_width;
         let display_height = self.display_height;
-        let Ok(mut state) = shared.lock() else {
-            return false;
+        let changed = {
+            let Ok(mut state) = shared.lock() else {
+                return false;
+            };
+            let clamped = Self::clamp_frame_to_limits(&state, frame, display_width, display_height);
+            let server_decoration = Self::effective_server_decoration(&state);
+            let next_anchor = edge.filter(|e| e.left || e.top).map(|e| {
+                let outer_w = clamped.width + if server_decoration { window_border() * 2 } else { 0 };
+                let outer_h = clamped.height
+                    + if server_decoration {
+                        window_border() * 2 + window_title_height()
+                    } else {
+                        0
+                    };
+                ResizeAnchor {
+                    anchor_right: e.left,
+                    anchor_bottom: e.top,
+                    right_edge: clamped.x + outer_w,
+                    bottom_edge: clamped.y + outer_h,
+                }
+            });
+            if state.frame == clamped && !state.maximized && state.pre_maximize_frame.is_none() {
+                state.resize_anchor = next_anchor;
+                return false;
+            }
+            state.maximized = false;
+            state.fullscreen = false;
+            state.pre_maximize_frame = None;
+            state.pre_fullscreen_frame = None;
+            state.resizing = true;
+            state.resize_anchor = next_anchor;
+            state.frame = clamped;
+            true
         };
-        let next_frame = if let Some(saved) = state.pre_maximize_frame.take() {
-            // Restore: send the saved client size back to the client so it
-            // re-renders at the original dimensions if it respects configure.
-            clamp_wayland_frame(saved, display_width, display_height)
-        } else {
-            state.pre_maximize_frame = Some(state.frame);
-            let bounds = layout::desktop_bounds(display_width, display_height);
-            let border = window_border();
-            clamp_wayland_frame(
-                Rect {
-                    x: bounds.x,
-                    y: bounds.y,
-                    width: bounds.width.saturating_sub(border * 2),
-                    height: bounds
-                        .height
-                        .saturating_sub(border * 2 + window_title_height()),
-                },
-                display_width,
-                display_height,
-            )
-        };
-        if state.frame == next_frame {
-            return false;
+        if changed {
+            if let Some(serial) = self.send_toplevel_configure_serial(&shared) {
+                if let Ok(mut state) = shared.lock() {
+                    state.pending_configure_geometry_serial = Some(serial);
+                }
+            }
+            self.mark_dirty();
         }
-        state.frame = next_frame;
-        drop(state);
-        self.send_toplevel_configure(&shared);
-        self.mark_dirty();
-        true
+        changed
     }
 
-    pub(super) fn resize_surface(&mut self, surface_id: u32, frame: Rect) -> bool {
+    pub(super) fn surface_size_limits(&self, surface_id: u32) -> ((usize, usize), (usize, usize)) {
         let Some(shared) = self.find_surface_by_id(surface_id) else {
-            return false;
+            return ((0, 0), (0, 0));
         };
-        let clamped = clamp_wayland_frame(frame, self.display_width, self.display_height);
-        let Ok(mut state) = shared.lock() else {
-            return false;
-        };
-        if state.frame == clamped {
-            return false;
-        }
-        state.pre_maximize_frame = None;
-        state.frame = clamped;
-        drop(state);
-        self.send_toplevel_configure(&shared);
-        self.mark_dirty();
-        true
+        shared
+            .lock()
+            .map_or(((0, 0), (0, 0)), |state| (state.min_size, state.max_size))
     }
 
     pub(super) fn close_surface(&mut self, surface_id: u32) -> bool {

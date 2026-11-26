@@ -6,13 +6,13 @@ use super::{AppState, DragTarget, VisualUpdate, WindowId};
 use crate::canvas;
 use crate::layout::{
     ResizeEdge, WindowChromeHit, clamp_wayland_frame, desktop_bounds, maximized_window_rect,
-    min_window_height, min_window_width, resized_window_rect, window_border, window_resize_hit,
-    window_title_height,
+    min_window_height, min_window_width, resized_wayland_client_frame, resized_window_rect,
+    window_resize_hit,
 };
 use crate::profile;
 use crate::render::{
     clamp_console_window_rect, console_window_dirty_rect, launcher_button_rect, taskbar_slot_rect,
-    wayland_window_client_rect, wayland_window_dirty_rect, wayland_window_outer_rect,
+    wayland_window_dirty_rect, wayland_window_outer_rect,
 };
 use crate::sys::{
     self, ConsoleSessionHandle, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON,
@@ -88,8 +88,13 @@ impl AppState {
                 }
                 if let Some(wayland) = wayland.as_deref_mut() {
                     let started = Instant::now();
+                    let before_dirty = self.wayland_visual_dirty_rect();
                     self.sync_wayland_pointer_target(wayland);
                     wayland.pointer_motion(self.cursor_x, self.cursor_y);
+                    if wayland.take_dirty() {
+                        let wayland_dirty = self.sync_wayland_windows(wayland.window_snapshots());
+                        cursor_update.absorb(VisualUpdate::partial(before_dirty.union(wayland_dirty)));
+                    }
                     profile::record_wayland_motion(started.elapsed());
                 }
                 Ok(cursor_update)
@@ -118,8 +123,13 @@ impl AppState {
                 }
                 if let Some(wayland) = wayland.as_deref_mut() {
                     let started = Instant::now();
+                    let before_dirty = self.wayland_visual_dirty_rect();
                     self.sync_wayland_pointer_target(wayland);
                     wayland.pointer_motion(self.cursor_x, self.cursor_y);
+                    if wayland.take_dirty() {
+                        let wayland_dirty = self.sync_wayland_windows(wayland.window_snapshots());
+                        cursor_update.absorb(VisualUpdate::partial(before_dirty.union(wayland_dirty)));
+                    }
                     profile::record_wayland_motion(started.elapsed());
                 }
                 Ok(cursor_update)
@@ -130,12 +140,28 @@ impl AppState {
                     return self.handle_left_press(wayland);
                 }
                 if self.dragging_window.is_some() {
-                    let update = self.drag_window_to_cursor(wayland.as_deref_mut());
+                    let ended_resize = match self.dragging_window {
+                        Some(DragTarget::WaylandResize { surface_id, .. }) => Some(surface_id),
+                        _ => None,
+                    };
+                    let mut update = self.drag_window_to_cursor(wayland.as_deref_mut());
                     self.dragging_window = None;
+                    if let (Some(surface_id), Some(wayland)) = (ended_resize, wayland) {
+                        let before_dirty = self.wayland_visual_dirty_rect();
+                        if wayland.end_surface_resize(surface_id) {
+                            let wayland_dirty = self.sync_wayland_windows(wayland.window_snapshots());
+                            update.absorb(VisualUpdate::partial(before_dirty.union(wayland_dirty)));
+                        }
+                    }
                     return Ok(update);
                 }
                 if let Some(wayland) = wayland {
+                    let before_dirty = self.wayland_visual_dirty_rect();
                     wayland.pointer_button(POINTER_BUTTON_LEFT, false);
+                    if wayland.take_dirty() {
+                        let wayland_dirty = self.sync_wayland_windows(wayland.window_snapshots());
+                        return Ok(VisualUpdate::partial(before_dirty.union(wayland_dirty)));
+                    }
                 }
                 Ok(VisualUpdate::default())
             }
@@ -443,7 +469,7 @@ impl AppState {
                                 )
                             })
                         {
-                            self.start_wayland_window_resize(surface_id, edge);
+                            self.start_wayland_window_resize(surface_id, edge, Some(wayland));
                             return Ok(VisualUpdate::partial(before_dirty.union(wayland_dirty)));
                         }
                         self.sync_wayland_pointer_target(wayland);
@@ -510,7 +536,12 @@ impl AppState {
         self.drag_offset_y = self.cursor_y.saturating_sub(outer.y as u32) as usize;
     }
 
-    fn start_wayland_window_resize(&mut self, surface_id: u32, edge: ResizeEdge) {
+    fn start_wayland_window_resize(
+        &mut self,
+        surface_id: u32,
+        edge: ResizeEdge,
+        wayland: Option<&mut WaylandCompositor>,
+    ) {
         self.cancel_wayland_placement(surface_id);
         let Some(window) = self
             .wayland_windows
@@ -520,6 +551,9 @@ impl AppState {
             return;
         };
 
+        if let Some(wayland) = wayland {
+            wayland.begin_surface_resize(surface_id, edge);
+        }
         self.dragging_window = Some(DragTarget::WaylandResize {
             surface_id,
             edge,
@@ -789,31 +823,36 @@ impl AppState {
                 };
 
                 let previous_dirty = wayland_window_dirty_rect(&self.wayland_windows[index]);
-                let bounds = desktop_bounds(self.display.width, self.display.height);
                 let dx = self.cursor_x as i64 - start_x as i64;
                 let dy = self.cursor_y as i64 - start_y as i64;
-                let border = window_border();
-                let min_outer_w = min_window_width().max(border * 2 + 1);
-                let min_outer_h =
-                    min_window_height().max(border * 2 + window_title_height() + 1);
-                let next_outer = resized_window_rect(
-                    start_outer,
+                let server_decoration = self.wayland_windows[index].server_decoration;
+                let ((min_w, min_h), (max_w, max_h)) = wayland
+                    .as_deref()
+                    .map_or(((0, 0), (0, 0)), |w| w.surface_size_limits(surface_id));
+                let start_client = if server_decoration {
+                    let client = crate::render::wayland_window_client_rect(start_outer);
+                    canvas::Rect {
+                        x: start_outer.x,
+                        y: start_outer.y,
+                        width: client.width,
+                        height: client.height,
+                    }
+                } else {
+                    start_outer
+                };
+                let next_client_frame = resized_wayland_client_frame(
+                    start_client,
                     edge,
                     dx,
                     dy,
-                    min_outer_w,
-                    min_outer_h,
-                    bounds,
+                    (min_w, min_h),
+                    (max_w, max_h),
+                    server_decoration,
+                    self.display.width,
+                    self.display.height,
                 );
-                let client = wayland_window_client_rect(next_outer);
-                let next_client_frame = canvas::Rect {
-                    x: next_outer.x,
-                    y: next_outer.y,
-                    width: client.width,
-                    height: client.height,
-                };
                 if let Some(wayland) = wayland {
-                    if !wayland.resize_surface(surface_id, next_client_frame) {
+                    if !wayland.resize_surface_with_edge(surface_id, next_client_frame, Some(edge)) {
                         return VisualUpdate::default();
                     }
                     self.sync_wayland_windows(wayland.window_snapshots());

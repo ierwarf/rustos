@@ -166,9 +166,27 @@ Historical entries prior to 2026-11-25 live in `git log` (e.g.
          and `task-linux-state-pending-hint-foreign-slot` in `formal/implementation-mutations.tsv`; added
          `!pin.matches_exec` assertions in `kernel/ps/src/multitask/scheduler/stack_resources/context/mm_tests.rs`
          for `mm-execution-root-identity-bypass`. Spot-check passed `killed=4/4 warnings=0`.
+     - **`uiserver` Wayland maximize / resize / activation pipeline fixed (CSD + SSD):**
+       - `wayland/state.rs`: `send_toplevel_configure` previously sent empty `states` (`Vec::new()`). Now populates
+         `xdg_toplevel::State::{Maximized, Fullscreen, Resizing, Activated}` (native-endian `u32` array) and
+         `set_keyboard_focus` re-configures transitioning toplevels for `Activated`.
+       - `wayland/xdg.rs` & `wayland/windows.rs`: wired `xdg_toplevel::Request::{SetMaximized, UnsetMaximized,
+         SetFullscreen, UnsetFullscreen, SetMinimized, Resize, SetMinSize, SetMaxSize}`; `Move`/`Resize` grab
+         checks accept subsurface descendants; `toggle_surface_maximized` shares `set_surface_maximized_shared`
+         with full `desktop_bounds` sizing for CSD (`!decoration_server`) vs chrome-subtracted bounds for SSD.
+       - `layout.rs`, `wayland/commit.rs`, `wayland/input.rs`, `app/input.rs`, `wayland.rs`: added `ResizeEdge.top`
+         and `resized_wayland_client_frame` (honouring `min_size`/`max_size` and SSD/CSD differences), raised
+         `MAX_WAYLAND_OUTSTANDING_CONFIGURES` from `16` to `256` to prevent `InvalidSerial` on rapid resize drags,
+         preserved unacked configure geometry against stale buffer commits (`pending_configure_geometry_serial`),
+         anchored opposite edges on left/top resize commits (`resize_anchor`), updated `set_output_scale` to reuse
+         `apply_committed_buffer_frame`, and synced `AppState` / cleared `State::Resizing` on button release.
+       - **Verified:** `cargo test -p uiserver` -> **313 passed, 0 failed** (including new tests
+         `csd_toplevel_maximize_unmaximize_fullscreen_and_minimize_update_geometry_and_states`,
+         `csd_xdg_toplevel_resize_anchors_opposite_edge_respects_min_size_and_keeps_serial_history`, and
+         `keyboard_focus_updates_activated_state_in_toplevel_configure`).
    - **Remaining / Unverified:**
-     - Chrome interactive KVM run (`--launch-desktop chrome.desktop --exercise-input`): peak thread/process measurement
-       and `uiserver` `wl_subcompositor` re-assignment KVM verification left for manual QEMU launch by user.
+     - Chrome interactive KVM run (`--launch-desktop chrome.desktop --exercise-input`): peak thread/process measurement,
+       `uiserver` `wl_subcompositor` re-assignment, and live Chrome maximize/resize verification left for manual QEMU launch by user.
      - Full-tree verification & PR gate seal after the IPC/guard-probe/mutation edits (`cargo xtask check`,
        full crate unit tests including `xtask`, `nucleus-core`, `kernel-ps`, `kernel-executive`, and
        `bash formal/verify-all.sh --profile pr`) need a fresh run to re-seal the tree (current PR seal is

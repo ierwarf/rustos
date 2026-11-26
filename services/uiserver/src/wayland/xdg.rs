@@ -132,6 +132,11 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceData> for WaylandState {
                         {
                             Some(index) if serial != 0 => {
                                 surface.acknowledged_serial = serial;
+                                if let Some(pending) = surface.pending_configure_geometry_serial {
+                                    if surface.outstanding_configures[..=index].contains(&pending) {
+                                        surface.pending_configure_geometry_serial = None;
+                                    }
+                                }
                                 if let Some(pos) = surface
                                     .decoration_configures
                                     .iter()
@@ -169,6 +174,84 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceData> for WaylandState {
     }
 }
 
+fn surface_or_subsurface_belongs_to_toplevel(
+    candidate: &wl_surface::WlSurface,
+    toplevel: &SurfaceData,
+) -> bool {
+    let Ok(toplevel_state) = toplevel.shared.lock() else {
+        return false;
+    };
+    if toplevel_state
+        .resource
+        .as_ref()
+        .is_some_and(|resource| resource.id() == candidate.id())
+    {
+        return true;
+    }
+    let toplevel_id = toplevel_state.surface_id;
+    drop(toplevel_state);
+    candidate.data::<SurfaceData>().is_some_and(|candidate_data| {
+        let mut cursor = candidate_data.shared.lock().ok().and_then(|s| {
+            s.subsurface.as_ref().map(|sub| sub.parent.clone())
+        });
+        let mut depth = 0_usize;
+        while let Some(parent) = cursor {
+            if depth >= 16 {
+                break;
+            }
+            depth += 1;
+            let Ok(parent_state) = parent.lock() else {
+                break;
+            };
+            if parent_state.surface_id == toplevel_id {
+                return true;
+            }
+            cursor = parent_state
+                .subsurface
+                .as_ref()
+                .map(|sub| sub.parent.clone());
+        }
+        false
+    })
+}
+
+fn pointer_grab_matches_surface(
+    state: &WaylandState,
+    client: &Client,
+    serial: u32,
+    data: &SurfaceData,
+) -> bool {
+    state.pointer_button_down
+        && state.pointer_grab_serial == Some(serial)
+        && state.pointer_focus.as_ref().is_some_and(|focus| {
+            focus.client_id == client.id()
+                && surface_or_subsurface_belongs_to_toplevel(&focus.surface, data)
+        })
+}
+
+fn resize_edge_from_xdg(edges: WEnum<xdg_toplevel::ResizeEdge>) -> Option<ResizeEdge> {
+    let WEnum::Value(edge) = edges else {
+        return None;
+    };
+    let (left, right, top, bottom) = match edge {
+        xdg_toplevel::ResizeEdge::Top => (false, false, true, false),
+        xdg_toplevel::ResizeEdge::Bottom => (false, false, false, true),
+        xdg_toplevel::ResizeEdge::Left => (true, false, false, false),
+        xdg_toplevel::ResizeEdge::Right => (false, true, false, false),
+        xdg_toplevel::ResizeEdge::TopLeft => (true, false, true, false),
+        xdg_toplevel::ResizeEdge::TopRight => (false, true, true, false),
+        xdg_toplevel::ResizeEdge::BottomLeft => (true, false, false, true),
+        xdg_toplevel::ResizeEdge::BottomRight => (false, true, false, true),
+        _ => return None,
+    };
+    Some(ResizeEdge {
+        left,
+        right,
+        top,
+        bottom,
+    })
+}
+
 impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceData> for WaylandState {
     fn request(
         state: &mut Self,
@@ -181,18 +264,10 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceData> for WaylandState {
     ) {
         match request {
             xdg_toplevel::Request::Move { serial, .. } => {
-                let valid = state.pointer_button_down
-                    && state.pointer_grab_serial == Some(serial)
-                    && state.pointer_focus.as_ref().is_some_and(|focus| {
-                        focus.client_id == client.id()
-                            && data.shared.lock().is_ok_and(|surface| {
-                                surface
-                                    .resource
-                                    .as_ref()
-                                    .is_some_and(|resource| resource.id() == focus.surface.id())
-                            })
-                    });
-                if valid && state.drag.is_none() {
+                if pointer_grab_matches_surface(state, client, serial, data)
+                    && state.drag.is_none()
+                    && state.resizing_surface.is_none()
+                {
                     if let Ok(surface) = data.shared.lock() {
                         state.moving_surface = Some((
                             surface.surface_id,
@@ -201,6 +276,31 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceData> for WaylandState {
                         ));
                     }
                     state.update_pointer_focus(None);
+                }
+            }
+            xdg_toplevel::Request::Resize { serial, edges, .. } => {
+                if pointer_grab_matches_surface(state, client, serial, data)
+                    && state.drag.is_none()
+                    && state.moving_surface.is_none()
+                {
+                    if let Some(edge) = resize_edge_from_xdg(edges) {
+                        let grab = data.shared.lock().ok().map(|mut surface| {
+                            surface.resizing = true;
+                            WaylandResizeGrab {
+                                surface_id: surface.surface_id,
+                                edge,
+                                start_x: state.pointer_x,
+                                start_y: state.pointer_y,
+                                start_frame: surface.frame,
+                            }
+                        });
+                        if let Some(grab) = grab {
+                            state.resizing_surface = Some(grab);
+                            state.update_pointer_focus(None);
+                            state.send_toplevel_configure(&data.shared);
+                            state.mark_dirty();
+                        }
+                    }
                 }
             }
             xdg_toplevel::Request::SetTitle { title } => {
@@ -217,11 +317,47 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceData> for WaylandState {
                 }
                 state.mark_dirty();
             }
-            xdg_toplevel::Request::SetMaximized
-            | xdg_toplevel::Request::UnsetMaximized
-            | xdg_toplevel::Request::SetFullscreen { .. }
-            | xdg_toplevel::Request::UnsetFullscreen => {
-                state.send_toplevel_configure(&data.shared);
+            xdg_toplevel::Request::SetMaxSize { width, height } => {
+                let scale = state.output_scale.max(1) as usize;
+                let max_w = usize::try_from(width.max(0))
+                    .unwrap_or(0)
+                    .saturating_mul(scale);
+                let max_h = usize::try_from(height.max(0))
+                    .unwrap_or(0)
+                    .saturating_mul(scale);
+                if let Ok(mut surface) = data.shared.lock() {
+                    surface.max_size = (max_w, max_h);
+                }
+            }
+            xdg_toplevel::Request::SetMinSize { width, height } => {
+                let scale = state.output_scale.max(1) as usize;
+                let min_w = usize::try_from(width.max(0))
+                    .unwrap_or(0)
+                    .saturating_mul(scale);
+                let min_h = usize::try_from(height.max(0))
+                    .unwrap_or(0)
+                    .saturating_mul(scale);
+                if let Ok(mut surface) = data.shared.lock() {
+                    surface.min_size = (min_w, min_h);
+                }
+            }
+            xdg_toplevel::Request::SetMaximized => {
+                state.set_surface_maximized_shared(&data.shared, true);
+            }
+            xdg_toplevel::Request::UnsetMaximized => {
+                state.set_surface_maximized_shared(&data.shared, false);
+            }
+            xdg_toplevel::Request::SetFullscreen { .. } => {
+                state.set_surface_fullscreen_shared(&data.shared, true);
+            }
+            xdg_toplevel::Request::UnsetFullscreen => {
+                state.set_surface_fullscreen_shared(&data.shared, false);
+            }
+            xdg_toplevel::Request::SetMinimized => {
+                let surface_id = data.shared.lock().ok().map(|s| s.surface_id);
+                if let Some(surface_id) = surface_id {
+                    state.set_surface_minimized(surface_id, true);
+                }
             }
             xdg_toplevel::Request::Destroy => {
                 if let Some(decoration) = data

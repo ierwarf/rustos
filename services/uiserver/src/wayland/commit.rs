@@ -226,6 +226,13 @@ impl WaylandState {
 
                 let decoration_changed = surface.decoration_server != decoration_server;
                 surface.decoration_server = decoration_server;
+                if decoration_changed && surface.maximized && !surface.fullscreen {
+                    surface.frame = maximized_wayland_client_rect(
+                        self.display_width,
+                        self.display_height,
+                        decoration_server,
+                    );
+                }
 
                 (viewport_changed, icon_offset_changed, decoration_changed)
             });
@@ -260,6 +267,8 @@ impl WaylandState {
                     surface.acknowledged_serial = 0;
                     surface.outstanding_configures.clear();
                     surface.decoration_configures.clear();
+                    surface.pending_configure_geometry_serial = None;
+                    surface.resize_anchor = None;
                     surface.needs_initial_configure = surface.toplevel.is_some();
                     outcome.trigger_initial_configure =
                         surface.needs_initial_configure && surface.toplevel.is_some();
@@ -383,6 +392,16 @@ impl WaylandState {
                         surface.current_buffer = Some(source.clone());
                         surface.last_damage = damage;
                         surface.content_version = next_content_version(surface.content_version);
+                        if surface.width != 0 && surface.height != 0 {
+                            let (w, h) = (surface.width, surface.height);
+                            Self::apply_committed_buffer_frame(
+                                &mut surface,
+                                w,
+                                h,
+                                self.display_width,
+                                self.display_height,
+                            );
+                        }
                         outcome.mapped = true;
                         outcome.dirty = true;
                         outcome.trigger_initial_configure = initial_configure_due(&surface, true);
@@ -625,27 +644,13 @@ impl WaylandState {
             surface.height = height;
             surface.stride_pixels = width;
             surface.content_version = next_content_version(surface.content_version);
-            let (visible_w, visible_h) = wayland_client_size_for_buffer(
+            Self::apply_committed_buffer_frame(
+                &mut surface,
                 width,
                 height,
                 self.display_width,
                 self.display_height,
             );
-            if surface.drag_icon_role || surface.is_child() {
-                surface.frame.width = width;
-                surface.frame.height = height;
-            } else {
-                surface.frame = clamp_wayland_frame(
-                    Rect {
-                        x: surface.frame.x,
-                        y: surface.frame.y,
-                        width: visible_w,
-                        height: visible_h,
-                    },
-                    self.display_width,
-                    self.display_height,
-                );
-            }
             surface.last_damage = Rect {
                 x: 0,
                 y: 0,
@@ -658,6 +663,73 @@ impl WaylandState {
             true
         } else {
             false
+        }
+    }
+
+    pub(super) fn apply_committed_buffer_frame(
+        surface: &mut WaylandSurfaceState,
+        width: usize,
+        height: usize,
+        display_width: u32,
+        display_height: u32,
+    ) {
+        let decoration_server = surface.decoration_server && !surface.fullscreen;
+        let (visible_w, visible_h) = if surface.fullscreen {
+            (
+                width.min((display_width as usize).max(1)),
+                height.min((display_height as usize).max(1)),
+            )
+        } else {
+            wayland_client_size_for_buffer_with_decoration(
+                width,
+                height,
+                display_width,
+                display_height,
+                decoration_server,
+            )
+        };
+        if surface.drag_icon_role || surface.is_child() {
+            surface.frame.width = width;
+            surface.frame.height = height;
+        } else if surface.pending_configure_geometry_serial.is_none() {
+            let mut next_x = surface.frame.x;
+            let mut next_y = surface.frame.y;
+            if let Some(anchor) = surface.resize_anchor {
+                if anchor.anchor_right {
+                    let outer_w =
+                        visible_w + if decoration_server { window_border() * 2 } else { 0 };
+                    next_x = anchor.right_edge.saturating_sub(outer_w);
+                }
+                if anchor.anchor_bottom {
+                    let outer_h = visible_h
+                        + if decoration_server {
+                            window_border() * 2 + window_title_height()
+                        } else {
+                            0
+                        };
+                    next_y = anchor.bottom_edge.saturating_sub(outer_h);
+                }
+            }
+            surface.frame = if surface.fullscreen {
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: visible_w,
+                    height: visible_h,
+                }
+            } else {
+                clamp_wayland_frame_with_decoration(
+                    Rect {
+                        x: next_x,
+                        y: next_y,
+                        width: visible_w,
+                        height: visible_h,
+                    },
+                    display_width,
+                    display_height,
+                    decoration_server,
+                )
+            };
         }
     }
 

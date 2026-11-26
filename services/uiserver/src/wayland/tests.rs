@@ -2810,3 +2810,229 @@ fn keyboard_focus_on_a_destroyed_surface_is_refused() {
     assert!(state.keyboard_focus.is_none());
     assert!(!wire::events(&mut sock).iter().any(|e| e.0 == 6 && e.1 == 1));
 }
+
+fn decode_toplevel_configure(payload: &[u8]) -> (i32, i32, Vec<u32>) {
+    let w = i32::from_ne_bytes(payload[0..4].try_into().unwrap());
+    let h = i32::from_ne_bytes(payload[4..8].try_into().unwrap());
+    let len = u32::from_ne_bytes(payload[8..12].try_into().unwrap()) as usize;
+    let states = payload[12..12 + len]
+        .chunks_exact(4)
+        .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+        .collect();
+    (w, h, states)
+}
+
+#[test]
+fn csd_toplevel_maximize_unmaximize_fullscreen_and_minimize_update_geometry_and_states() {
+    use wayland_protocols::xdg::shell::server::xdg_toplevel;
+    let mut display = test_display();
+    let mut state = super::WaylandState::new(1024, 768);
+    let (mut peer, _file, _names) = client_with_mapped_toplevel(&mut display, &mut state);
+    let _ = wire::events(&mut peer);
+    let scale = state.output_scale.max(1) as usize;
+    let initial_frame = state.surfaces[0].shared.lock().unwrap().frame;
+    let bounds = crate::layout::desktop_bounds(1024, 768);
+
+    // CSD set_maximized fills the entire desktop bounds and advertises State::Maximized.
+    wire::send(&mut peer, &wire::message(8, 9, &[]));
+    pump(&mut display, &mut state);
+    let events = wire::events(&mut peer);
+    let (w, h, states) = events
+        .iter()
+        .find(|(obj, op, _)| *obj == 8 && *op == 0)
+        .map(|(_, _, p)| decode_toplevel_configure(p))
+        .expect("toplevel.configure on set_maximized");
+    assert_eq!(w as usize * scale, bounds.width);
+    assert_eq!(h as usize * scale, bounds.height);
+    assert!(states.contains(&(xdg_toplevel::State::Maximized as u32)));
+    let max_serial = events
+        .iter()
+        .find(|(obj, op, _)| *obj == 7 && *op == 0)
+        .map(|(_, _, p)| u32::from_ne_bytes(p[..4].try_into().unwrap()))
+        .expect("xdg_surface.configure");
+
+    // Stale pre-maximize buffer commit before ack_configure must not shrink frame back.
+    wire::send(&mut peer, &wire::message(6, 1, &wire::u32s(&[10, 0, 0])));
+    wire::send(&mut peer, &wire::message(6, 6, &[]));
+    pump(&mut display, &mut state);
+    wait_for_snapshot(&mut state);
+    assert_eq!(state.surfaces[0].shared.lock().unwrap().frame, bounds);
+
+    // Ack configure then commit unset_maximized restores original frame cleanly.
+    wire::send(&mut peer, &wire::message(7, 4, &wire::u32s(&[max_serial])));
+    wire::send(&mut peer, &wire::message(8, 10, &[]));
+    pump(&mut display, &mut state);
+    let events = wire::events(&mut peer);
+    let (w, h, states) = events
+        .iter()
+        .find(|(obj, op, _)| *obj == 8 && *op == 0)
+        .map(|(_, _, p)| decode_toplevel_configure(p))
+        .expect("toplevel.configure on unset_maximized");
+    assert_eq!((w as usize * scale, h as usize * scale), (initial_frame.width, initial_frame.height));
+    assert!(!states.contains(&(xdg_toplevel::State::Maximized as u32)));
+    assert_eq!(state.surfaces[0].shared.lock().unwrap().frame, initial_frame);
+
+    // SetFullscreen covers display cleanly with State::Fullscreen, then UnsetFullscreen restores.
+    wire::send(&mut peer, &wire::message(8, 11, &wire::u32s(&[0])));
+    pump(&mut display, &mut state);
+    let events = wire::events(&mut peer);
+    let (w, h, states) = events
+        .iter()
+        .find(|(obj, op, _)| *obj == 8 && *op == 0)
+        .map(|(_, _, p)| decode_toplevel_configure(p))
+        .expect("toplevel.configure on set_fullscreen");
+    assert_eq!((w as usize * scale, h as usize * scale), (1024, 768));
+    assert!(states.contains(&(xdg_toplevel::State::Fullscreen as u32)));
+    wire::send(&mut peer, &wire::message(8, 12, &[]));
+    pump(&mut display, &mut state);
+    let _ = wire::events(&mut peer);
+    assert_eq!(state.surfaces[0].shared.lock().unwrap().frame, initial_frame);
+
+    // SetMinimized hides the window.
+    wire::send(&mut peer, &wire::message(8, 13, &[]));
+    pump(&mut display, &mut state);
+    assert!(state.surfaces[0].shared.lock().unwrap().minimized);
+}
+
+#[test]
+fn csd_xdg_toplevel_resize_anchors_opposite_edge_respects_min_size_and_keeps_serial_history() {
+    use wayland_protocols::xdg::shell::server::xdg_toplevel;
+    let mut display = test_display();
+    let mut state = super::WaylandState::new(1600, 1200);
+    let (mut peer, _file, names) = client_with_mapped_toplevel(&mut display, &mut state);
+    bind_global(&mut peer, &names, "wl_seat", 7, 11);
+    wire::send(&mut peer, &wire::message(11, 0, &wire::u32s(&[12])));
+    pump(&mut display, &mut state);
+    let _ = wire::events(&mut peer);
+
+    let scale = state.output_scale.max(1) as usize;
+    let surface_id = {
+        let mut s = state.surfaces[0].shared.lock().unwrap();
+        s.frame = super::Rect {
+            x: 200,
+            y: 100,
+            width: 1000,
+            height: 700,
+        };
+        s.width = 1000;
+        s.height = 700;
+        s.stride_pixels = 1000;
+        s.pixels = Arc::new(vec![0xff00_0000; 1000 * 700]);
+        s.pending_configure_geometry_serial = None;
+        s.surface_id
+    };
+
+    // Set min_size in logical pixels (250x200 -> 500x400 at output_scale=2).
+    let min_logical_w = 250_usize;
+    let min_logical_h = 200_usize;
+    wire::send(
+        &mut peer,
+        &wire::message(8, 8, &wire::u32s(&[min_logical_w as u32, min_logical_h as u32])),
+    );
+    pump(&mut display, &mut state);
+
+    state.pointer_target = Some(surface_id);
+    state.pointer_motion(210, 110);
+    assert!(state.pointer_button(crate::sys::POINTER_BUTTON_LEFT, true));
+    pump(&mut display, &mut state);
+    let _ = wire::events(&mut peer);
+    let grab_serial = state.pointer_grab_serial.unwrap();
+    // xdg_toplevel.resize(seat=11, serial=grab_serial, edges=TOP_LEFT (5))
+    wire::send(&mut peer, &wire::message(8, 6, &wire::u32s(&[11, grab_serial, 5])));
+    pump(&mut display, &mut state);
+    assert!(state.resizing_surface.is_some());
+    let events = wire::events(&mut peer);
+    let (_w, _h, states) = events
+        .iter()
+        .find(|(obj, op, _)| *obj == 8 && *op == 0)
+        .map(|(_, _, p)| decode_toplevel_configure(p))
+        .expect("Resizing configure");
+    assert!(states.contains(&(xdg_toplevel::State::Resizing as u32)));
+    assert!(states.contains(&(xdg_toplevel::State::Activated as u32)));
+
+    // Drag across 40 steps: must clamp at min_size, keep right/bottom anchored, and not overflow configure serials.
+    let mut first_resize_serial = None;
+    for step in 1..=40_u32 {
+        state.pointer_motion(210 + step * 15, 110 + step * 10);
+        pump(&mut display, &mut state);
+        for (obj, op, p) in wire::events(&mut peer) {
+            assert!(!(obj == 1 && op == 0), "unexpected protocol error: {p:?}");
+            if obj == 7 && op == 0 && first_resize_serial.is_none() {
+                first_resize_serial = Some(u32::from_ne_bytes(p[..4].try_into().unwrap()));
+            }
+        }
+    }
+    let frame = state.surfaces[0].shared.lock().unwrap().frame;
+    assert_eq!(frame.x + frame.width, 1200, "right edge stays anchored");
+    assert_eq!(frame.y + frame.height, 800, "bottom edge stays anchored");
+    assert_eq!(frame.width, min_logical_w * scale);
+    assert_eq!(frame.height, min_logical_h * scale);
+
+    // Client can still ack even the earliest resize configure serial (buffer > 16).
+    let serial0 = first_resize_serial.expect("first resize configure serial");
+    wire::send(&mut peer, &wire::message(7, 4, &wire::u32s(&[serial0])));
+    pump(&mut display, &mut state);
+    assert!(
+        !wire::events(&mut peer)
+            .iter()
+            .any(|(obj, op, _)| *obj == 1 && *op == 0),
+        "early serial ack must not trigger InvalidSerial"
+    );
+
+    // Releasing left button clears Resizing state and emits final configure without State::Resizing.
+    assert!(state.pointer_button(crate::sys::POINTER_BUTTON_LEFT, false));
+    pump(&mut display, &mut state);
+    assert!(state.resizing_surface.is_none());
+    let events = wire::events(&mut peer);
+    let (_w, _h, states) = events
+        .iter()
+        .rev()
+        .find(|(obj, op, _)| *obj == 8 && *op == 0)
+        .map(|(_, _, p)| decode_toplevel_configure(p))
+        .expect("final un-resizing configure");
+    assert!(!states.contains(&(xdg_toplevel::State::Resizing as u32)));
+}
+
+#[test]
+fn keyboard_focus_updates_activated_state_in_toplevel_configure() {
+    use wayland_protocols::xdg::shell::server::xdg_toplevel;
+    let mut display = test_display();
+    let mut state = super::WaylandState::new(1024, 768);
+    let (mut peer, _file, _names) = client_with_mapped_toplevel(&mut display, &mut state);
+    let _ = wire::events(&mut peer);
+    let surface_id = state.surfaces[0].shared.lock().unwrap().surface_id;
+    let res = state.surfaces[0]
+        .shared
+        .lock()
+        .unwrap()
+        .resource
+        .clone()
+        .unwrap();
+    let client_id = state.surfaces[0]
+        .shared
+        .lock()
+        .unwrap()
+        .client_id
+        .clone()
+        .unwrap();
+    assert!(state.focus_surface(surface_id));
+    pump(&mut display, &mut state);
+    let events = wire::events(&mut peer);
+    let (_, _, states) = events
+        .iter()
+        .find(|(obj, op, _)| *obj == 8 && *op == 0)
+        .map(|(_, _, p)| decode_toplevel_configure(p))
+        .expect("Activated configure on focus");
+    assert!(states.contains(&(xdg_toplevel::State::Activated as u32)));
+
+    state.set_keyboard_focus(None);
+    pump(&mut display, &mut state);
+    let events = wire::events(&mut peer);
+    let (_, _, states) = events
+        .iter()
+        .find(|(obj, op, _)| *obj == 8 && *op == 0)
+        .map(|(_, _, p)| decode_toplevel_configure(p))
+        .expect("Unactivated configure on focus clear");
+    assert!(!states.contains(&(xdg_toplevel::State::Activated as u32)));
+    let _ = (res, client_id);
+}

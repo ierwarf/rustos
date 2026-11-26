@@ -67,15 +67,11 @@ impl WaylandState {
             let visible_w = surface.width.min(frame.width);
             let visible_h = surface.height.min(frame.height);
             let border = window_border();
+            let decorated = surface.decoration_server && !surface.fullscreen;
             let client_rect = Rect {
-                x: frame.x
-                    + if surface.decoration_server {
-                        border
-                    } else {
-                        0
-                    },
+                x: frame.x + if decorated { border } else { 0 },
                 y: frame.y
-                    + if surface.decoration_server {
+                    + if decorated {
                         window_title_height() + border
                     } else {
                         0
@@ -163,6 +159,35 @@ impl WaylandState {
             let x = (i64::from(self.pointer_x) - dx).max(0) as usize;
             let y = (i64::from(self.pointer_y) - dy).max(0) as usize;
             self.move_surface(id, x, y);
+            return;
+        }
+        if let Some(grab) = self.resizing_surface {
+            let (min_size, max_size, server_decoration) = self
+                .find_surface_by_id(grab.surface_id)
+                .and_then(|shared| {
+                    shared.lock().ok().map(|s| {
+                        (
+                            s.min_size,
+                            s.max_size,
+                            Self::effective_server_decoration(&s),
+                        )
+                    })
+                })
+                .unwrap_or(((0, 0), (0, 0), false));
+            let dx = i64::from(self.pointer_x) - i64::from(grab.start_x);
+            let dy = i64::from(self.pointer_y) - i64::from(grab.start_y);
+            let next_frame = layout::resized_wayland_client_frame(
+                grab.start_frame,
+                grab.edge,
+                dx,
+                dy,
+                min_size,
+                max_size,
+                server_decoration,
+                self.display_width,
+                self.display_height,
+            );
+            self.resize_surface(grab.surface_id, next_frame, Some(grab.edge));
             return;
         }
         let hit = self.hit_test_pointer(self.pointer_x, self.pointer_y);
@@ -254,6 +279,13 @@ impl WaylandState {
             self.invalidate_selection_offers();
             self.input_serials.clear();
         }
+        let old_shared = previous_surface
+            .as_ref()
+            .and_then(|id| self.find_surface_by_object_id(id));
+        let new_shared = next_surface
+            .as_ref()
+            .and_then(|id| self.find_surface_by_object_id(id));
+
         let leave_serial = self.next_configure_serial();
         if let Some(previous) = self.keyboard_focus.take() {
             for keyboard in self
@@ -293,6 +325,31 @@ impl WaylandState {
             }
             self.keyboard_focus = Some(next);
         }
+
+        for shared in [old_shared, new_shared].into_iter().flatten() {
+            let should_configure = shared.lock().is_ok_and(|surface| {
+                surface.alive && surface.toplevel.is_some() && !surface.needs_initial_configure
+            });
+            if should_configure {
+                self.send_toplevel_configure(&shared);
+            }
+        }
+    }
+
+    fn find_surface_by_object_id(&self, object_id: &ObjectId) -> Option<Arc<Mutex<WaylandSurfaceState>>> {
+        self.surfaces.iter().find_map(|entry| {
+            entry
+                .shared
+                .lock()
+                .ok()
+                .is_some_and(|surface| {
+                    surface
+                        .resource
+                        .as_ref()
+                        .is_some_and(|resource| resource.id() == *object_id)
+                })
+                .then(|| Arc::clone(&entry.shared))
+        })
     }
 
     pub(super) fn keyboard_input(&mut self, event: InputEvent) -> bool {

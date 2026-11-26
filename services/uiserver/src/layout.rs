@@ -380,6 +380,7 @@ pub(crate) enum WindowChromeHit {
 pub(crate) struct ResizeEdge {
     pub(crate) left: bool,
     pub(crate) right: bool,
+    pub(crate) top: bool,
     pub(crate) bottom: bool,
 }
 
@@ -407,6 +408,7 @@ pub(crate) fn window_resize_hit(outer: Rect, x: u32, y: u32) -> Option<ResizeEdg
     (left || right || bottom).then_some(ResizeEdge {
         left,
         right,
+        top: false,
         bottom,
     })
 }
@@ -422,38 +424,138 @@ pub(crate) fn resized_window_rect(
     min_h: usize,
     bounds: Rect,
 ) -> Rect {
+    resized_window_rect_bounded(start, edge, dx, dy, min_w, min_h, None, None, bounds)
+}
+
+/// Compute a new window rectangle with optional upper bounds (`max_w`/`max_h`)
+/// declared via `xdg_toplevel.set_max_size`, anchoring opposite edges on left/top
+/// drags.
+pub(crate) fn resized_window_rect_bounded(
+    start: Rect,
+    edge: ResizeEdge,
+    dx: i64,
+    dy: i64,
+    min_w: usize,
+    min_h: usize,
+    max_w: Option<usize>,
+    max_h: Option<usize>,
+    bounds: Rect,
+) -> Rect {
     let start_left = start.x as i64;
     let start_right = (start.x + start.width) as i64;
     let start_top = start.y as i64;
     let start_bottom = (start.y + start.height) as i64;
     let bounds_left = bounds.x as i64;
     let bounds_right = (bounds.x + bounds.width) as i64;
+    let bounds_top = bounds.y as i64;
     let bounds_bottom = (bounds.y + bounds.height) as i64;
-    let min_w = min_w.min(bounds.width) as i64;
-    let min_h = min_h.min(bounds.height) as i64;
+    let max_w_cap = max_w.unwrap_or(bounds.width).min(bounds.width).max(1) as i64;
+    let max_h_cap = max_h.unwrap_or(bounds.height).min(bounds.height).max(1) as i64;
+    let min_w = (min_w.min(bounds.width) as i64).min(max_w_cap);
+    let min_h = (min_h.min(bounds.height) as i64).min(max_h_cap);
 
     let (x, width) = if edge.left {
-        let next_left = (start_left + dx).clamp(bounds_left, start_right - min_w);
+        let min_left = bounds_left.max(start_right - max_w_cap);
+        let max_left = (start_right - min_w).max(min_left);
+        let next_left = (start_left + dx).clamp(min_left, max_left);
         (next_left as usize, (start_right - next_left) as usize)
     } else if edge.right {
-        let next_right = (start_right + dx).clamp(start_left + min_w, bounds_right);
+        let min_right = start_left + min_w;
+        let max_right = bounds_right.min(start_left + max_w_cap).max(min_right);
+        let next_right = (start_right + dx).clamp(min_right, max_right);
         (start.x, (next_right - start_left) as usize)
     } else {
         (start.x, start.width)
     };
 
-    let height = if edge.bottom {
-        let next_bottom = (start_bottom + dy).clamp(start_top + min_h, bounds_bottom);
-        (next_bottom - start_top) as usize
+    let (y, height) = if edge.top {
+        let min_top = bounds_top.max(start_bottom - max_h_cap);
+        let max_top = (start_bottom - min_h).max(min_top);
+        let next_top = (start_top + dy).clamp(min_top, max_top);
+        (next_top as usize, (start_bottom - next_top) as usize)
+    } else if edge.bottom {
+        let min_bottom = start_top + min_h;
+        let max_bottom = bounds_bottom.min(start_top + max_h_cap).max(min_bottom);
+        let next_bottom = (start_bottom + dy).clamp(min_bottom, max_bottom);
+        (start.y, (next_bottom - start_top) as usize)
     } else {
-        start.height
+        (start.y, start.height)
     };
 
     Rect {
         x,
-        y: start.y,
+        y,
         width,
         height,
+    }
+}
+
+/// Computes the next Wayland client `frame` rect (where `(x, y)` is the outer
+/// top-left and `(width, height)` is the client content size) when dragging `edge`
+/// by `(dx, dy)` from `start_frame`, respecting SSD/CSD chrome geometry and
+/// client-declared `min_size`/`max_size`.
+pub(crate) fn resized_wayland_client_frame(
+    start_frame: Rect,
+    edge: ResizeEdge,
+    dx: i64,
+    dy: i64,
+    min_client_size: (usize, usize),
+    max_client_size: (usize, usize),
+    server_decoration: bool,
+    display_width: u32,
+    display_height: u32,
+) -> Rect {
+    let bounds = desktop_bounds(display_width, display_height);
+    let border = if server_decoration { window_border() } else { 0 };
+    let title_h = if server_decoration {
+        window_title_height()
+    } else {
+        0
+    };
+    let chrome_w = border * 2;
+    let chrome_h = border * 2 + title_h;
+    let start_outer = if server_decoration {
+        wayland_outer_rect(start_frame.x, start_frame.y, start_frame.width, start_frame.height)
+    } else {
+        start_frame
+    };
+    let min_outer_w = if !server_decoration && min_client_size.0 > 0 {
+        min_client_size.0.max(1)
+    } else {
+        min_window_width()
+            .max(chrome_w + 1)
+            .max(min_client_size.0.saturating_add(chrome_w))
+    };
+    let min_outer_h = if !server_decoration && min_client_size.1 > 0 {
+        min_client_size.1.max(1)
+    } else {
+        min_window_height()
+            .max(chrome_h + 1)
+            .max(min_client_size.1.saturating_add(chrome_h))
+    };
+    let max_outer_w = (max_client_size.0 > 0).then(|| max_client_size.0.saturating_add(chrome_w));
+    let max_outer_h = (max_client_size.1 > 0).then(|| max_client_size.1.saturating_add(chrome_h));
+    let next_outer = resized_window_rect_bounded(
+        start_outer,
+        edge,
+        dx,
+        dy,
+        min_outer_w,
+        min_outer_h,
+        max_outer_w,
+        max_outer_h,
+        bounds,
+    );
+    if server_decoration {
+        let client = wayland_client_rect(next_outer);
+        Rect {
+            x: next_outer.x,
+            y: next_outer.y,
+            width: client.width,
+            height: client.height,
+        }
+    } else {
+        next_outer
     }
 }
 
@@ -538,7 +640,18 @@ pub(crate) fn cascade_origin(bounds: Rect, index: usize) -> (usize, usize) {
 // configure) cannot spill into the topbar or dock.
 
 pub(crate) fn wayland_max_client_size(display_width: u32, display_height: u32) -> (usize, usize) {
+    wayland_max_client_size_with_decoration(display_width, display_height, true)
+}
+
+pub(crate) fn wayland_max_client_size_with_decoration(
+    display_width: u32,
+    display_height: u32,
+    server_decoration: bool,
+) -> (usize, usize) {
     let bounds = desktop_bounds(display_width, display_height);
+    if !server_decoration {
+        return (bounds.width.max(1), bounds.height.max(1));
+    }
     let border = window_border();
     let max_w = bounds.width.saturating_sub(border * 2);
     let max_h = bounds
@@ -547,26 +660,63 @@ pub(crate) fn wayland_max_client_size(display_width: u32, display_height: u32) -
     (max_w.max(1), max_h.max(1))
 }
 
-pub(crate) fn wayland_client_size_for_buffer(
+pub(crate) fn maximized_wayland_client_rect(
+    display_width: u32,
+    display_height: u32,
+    server_decoration: bool,
+) -> Rect {
+    let bounds = desktop_bounds(display_width, display_height);
+    let (max_w, max_h) =
+        wayland_max_client_size_with_decoration(display_width, display_height, server_decoration);
+    clamp_wayland_frame_with_decoration(
+        Rect {
+            x: bounds.x,
+            y: bounds.y,
+            width: max_w,
+            height: max_h,
+        },
+        display_width,
+        display_height,
+        server_decoration,
+    )
+}
+
+pub(crate) fn wayland_client_size_for_buffer_with_decoration(
     buffer_width: usize,
     buffer_height: usize,
     display_width: u32,
     display_height: u32,
+    server_decoration: bool,
 ) -> (usize, usize) {
-    let (max_w, max_h) = wayland_max_client_size(display_width, display_height);
+    let (max_w, max_h) =
+        wayland_max_client_size_with_decoration(display_width, display_height, server_decoration);
     (buffer_width.min(max_w), buffer_height.min(max_h))
 }
 
 /// Clamp a Wayland surface frame so the title bar stays grabbable.
 pub(crate) fn clamp_wayland_frame(frame: Rect, display_width: u32, display_height: u32) -> Rect {
-    let (max_w, max_h) = wayland_max_client_size(display_width, display_height);
+    clamp_wayland_frame_with_decoration(frame, display_width, display_height, true)
+}
+
+pub(crate) fn clamp_wayland_frame_with_decoration(
+    frame: Rect,
+    display_width: u32,
+    display_height: u32,
+    server_decoration: bool,
+) -> Rect {
+    let (max_w, max_h) =
+        wayland_max_client_size_with_decoration(display_width, display_height, server_decoration);
     let width = frame.width.min(max_w).max(1);
     let height = frame.height.min(max_h).max(1);
     let bounds = desktop_bounds(display_width, display_height);
-    let border = window_border();
+    let border = if server_decoration { window_border() } else { 0 };
     let title_h = window_title_height();
     let outer_w = width.saturating_add(border * 2);
-    let outer_h = height.saturating_add(title_h + border * 2);
+    let outer_h = height.saturating_add(if server_decoration {
+        title_h + border * 2
+    } else {
+        0
+    });
 
     // Horizontal: keep at least `wayland_title_visible_px()` of chrome inside
     // the desktop on either side.
@@ -578,7 +728,7 @@ pub(crate) fn clamp_wayland_frame(frame: Rect, display_width: u32, display_heigh
         .saturating_sub(min_visible)
         .max(min_x);
 
-    // Vertical: title bar must stay below the topbar and above the dock.
+    // Vertical: top strip must stay below top edge and above the dock.
     let min_y = bounds.y;
     let title_strip = title_h.saturating_add(border);
     let max_y = bounds
@@ -973,6 +1123,7 @@ mod tests {
             Some(ResizeEdge {
                 left: true,
                 right: false,
+                top: false,
                 bottom: false,
             })
         );
@@ -981,6 +1132,7 @@ mod tests {
             Some(ResizeEdge {
                 left: false,
                 right: true,
+                top: false,
                 bottom: true,
             })
         );
@@ -992,6 +1144,7 @@ mod tests {
             ResizeEdge {
                 left: true,
                 right: false,
+                top: false,
                 bottom: true,
             },
             500,
@@ -1003,6 +1156,26 @@ mod tests {
         assert_eq!(shrunk.width, min_window_width());
         assert_eq!(shrunk.height, min_window_height());
         assert_eq!(shrunk.x + shrunk.width, outer.x + outer.width);
+
+        let top_shrunk = resized_window_rect_bounded(
+            outer,
+            ResizeEdge {
+                left: true,
+                right: false,
+                top: true,
+                bottom: false,
+            },
+            150,
+            120,
+            min_window_width(),
+            min_window_height(),
+            Some(600),
+            Some(450),
+            bounds,
+        );
+        assert_eq!(top_shrunk.x + top_shrunk.width, outer.x + outer.width);
+        assert_eq!(top_shrunk.y + top_shrunk.height, outer.y + outer.height);
+        assert_eq!((top_shrunk.width, top_shrunk.height), (600, 450));
     }
 
     #[test]

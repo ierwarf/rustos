@@ -51,8 +51,9 @@ use wayland_server::{
 use crate::canvas::Rect;
 use crate::input_loop::UiWakeSender;
 use crate::layout::{
-    self, clamp_wayland_frame, wayland_client_size_for_buffer, wayland_max_client_size,
-    window_border, window_title_height,
+    self, ResizeEdge, clamp_wayland_frame_with_decoration, maximized_wayland_client_rect,
+    wayland_client_size_for_buffer_with_decoration, wayland_max_client_size,
+    wayland_max_client_size_with_decoration, window_border, window_title_height,
 };
 use crate::sys::{
     diag_line, spawn_ui_thread, ui_profile_enabled, InputEvent, UiThreadRole, INPUT_ACTION_PRESSED,
@@ -121,7 +122,7 @@ const MAX_WAYLAND_REGIONS_PER_CLIENT: usize = 64;
 const MAX_WAYLAND_DECORATIONS_PER_CLIENT: usize = 16;
 const MAX_WAYLAND_VIEWPORTS_PER_CLIENT: usize = 64;
 const MAX_WAYLAND_POSITIONERS_PER_CLIENT: usize = 64;
-const MAX_WAYLAND_OUTSTANDING_CONFIGURES: usize = 16;
+const MAX_WAYLAND_OUTSTANDING_CONFIGURES: usize = 256;
 const MAX_WAYLAND_TITLE_BYTES: usize = 256;
 /// Tracked output, pointer or keyboard objects one client may hold at once.
 const MAX_WAYLAND_RESOURCES_PER_CLIENT: usize = 8;
@@ -627,8 +628,29 @@ impl WaylandCompositor {
         self.state.move_surface(surface_id, x, y)
     }
 
-    pub(crate) fn resize_surface(&mut self, surface_id: u32, frame: Rect) -> bool {
-        self.state.resize_surface(surface_id, frame)
+    pub(crate) fn resize_surface_with_edge(
+        &mut self,
+        surface_id: u32,
+        frame: Rect,
+        edge: Option<ResizeEdge>,
+    ) -> bool {
+        self.state.resize_surface(surface_id, frame, edge)
+    }
+
+    pub(crate) fn begin_surface_resize(&mut self, surface_id: u32, edge: ResizeEdge) -> bool {
+        self.state.begin_surface_resize(surface_id, edge)
+    }
+
+    pub(crate) fn end_surface_resize(&mut self, surface_id: u32) -> bool {
+        self.state.end_surface_resize(surface_id)
+    }
+
+    pub(crate) fn surface_size_limits(&self, surface_id: u32) -> ((usize, usize), (usize, usize)) {
+        self.state.surface_size_limits(surface_id)
+    }
+
+    pub(crate) fn take_dirty(&mut self) -> bool {
+        self.state.take_dirty()
     }
 
     pub(crate) fn set_surface_minimized(&mut self, surface_id: u32, minimized: bool) -> bool {
@@ -991,6 +1013,14 @@ impl WaylandState {
             let hit = self.hit_test_pointer(self.pointer_x, self.pointer_y);
             self.update_pointer_focus(hit);
             return true;
+        } else if is_left && self.resizing_surface.is_some() {
+            let grab = self.resizing_surface.take().expect("checked");
+            self.pointer_button_down = false;
+            self.pointer_grab_serial = None;
+            self.end_surface_resize(grab.surface_id);
+            let hit = self.hit_test_pointer(self.pointer_x, self.pointer_y);
+            self.update_pointer_focus(hit);
+            return true;
         } else if is_left && self.drag.is_some() {
             self.pointer_button_down = false;
             self.pointer_grab_serial = None;
@@ -1158,6 +1188,23 @@ impl Drop for LiveObjectTicket {
     }
 }
 
+#[derive(Clone, Copy)]
+struct WaylandResizeGrab {
+    surface_id: u32,
+    edge: ResizeEdge,
+    start_x: u32,
+    start_y: u32,
+    start_frame: Rect,
+}
+
+#[derive(Clone, Copy)]
+struct ResizeAnchor {
+    anchor_right: bool,
+    anchor_bottom: bool,
+    right_edge: usize,
+    bottom_edge: usize,
+}
+
 struct WaylandState {
     display_width: u32,
     display_height: u32,
@@ -1184,6 +1231,7 @@ struct WaylandState {
     pointer_grab_serial: Option<u32>,
     drag: Option<DragState>,
     moving_surface: Option<(u32, i64, i64)>,
+    resizing_surface: Option<WaylandResizeGrab>,
     pointer_focus: Option<PointerFocus>,
     pointer_target: Option<u32>,
     keyboard_focus: Option<KeyboardFocus>,
@@ -1275,9 +1323,20 @@ struct WaylandSurfaceState {
     title: String,
     frame: Rect,
     minimized: bool,
+    maximized: bool,
+    fullscreen: bool,
+    resizing: bool,
     /// `Some(frame)` while the surface is currently maximized; storing the
     /// pre-maximize frame lets the next maximize click restore it.
     pre_maximize_frame: Option<Rect>,
+    pre_fullscreen_frame: Option<Rect>,
+    /// Client-declared logical limits converted to physical output pixels; `0` = unbounded.
+    min_size: (usize, usize),
+    max_size: (usize, usize),
+    /// Configure serial of an active resize/maximize/fullscreen transition not yet acked.
+    pending_configure_geometry_serial: Option<u32>,
+    /// Anchored opposite edges while resizing from left and/or top edges.
+    resize_anchor: Option<ResizeAnchor>,
     resource: Option<wl_surface::WlSurface>,
     client_id: Option<ClientId>,
     xdg_surface: Option<xdg_surface::XdgSurface>,
